@@ -162,7 +162,8 @@ pub const PAY_TXID_ALTER: &str = "ALTER TABLE collected_markers_v2 ADD COLUMN pa
 /// `/utxo-status`'s batch read names both (`networkSeenBy`), so a cold isolate ahead of the overlay must add them;
 /// the table is `NETWORK_SEEN_CREATE`'s, a CREATE catch-up, which runs first.
 pub const NETWORK_SEEN_SOURCE_ALTER: &str = "ALTER TABLE network_seen ADD COLUMN seenSource TEXT";
-pub const NETWORK_SEEN_SOURCE_AT_ALTER: &str = "ALTER TABLE network_seen ADD COLUMN sourceAtMs INTEGER";
+pub const NETWORK_SEEN_SOURCE_AT_ALTER: &str =
+    "ALTER TABLE network_seen ADD COLUMN sourceAtMs INTEGER";
 
 pub const LATCH_COLUMN_ALTERS: &[&str] = &[
     SIG_VALID_ALTER,
@@ -181,6 +182,9 @@ pub const LATCH_COLUMN_ALTERS: &[&str] = &[
     crate::owed::OWED_STATE_SEQ_ALTER,
     NETWORK_SEEN_SOURCE_ALTER,
     NETWORK_SEEN_SOURCE_AT_ALTER,
+    // bsv-low #808: the tip a hop's chain-probe memo was taken at (overlay migration 342). The owed walk's memo read
+    // and write name it (`hops_view::probe_memo_read_sql`, `PROBE_MEMO_UPSERT_SQL`).
+    crate::hops_view::HOP_CHAIN_PROBES_TIP_ALTER,
 ];
 
 /// The bsv-low #371 `network_seen` TABLE, same Rule-24 contract as the
@@ -457,13 +461,14 @@ mod tests {
     fn every_app_layer_alter_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             LATCH_COLUMN_ALTERS.len(),
-            13,
+            14,
             "sigValid (#283), markerValid (#362), firstSpentAt (#217), \
              spenderFinal (#371), claimValid + rowValid (brain-cutover M1), \
              settleSigners (#406), spenderPayASats + spenderPayBSats (#468), \
              payTxid (#492, the held filing's paying transaction), \
              recomputeSeq (#566, the identity's owed recompute sequence), \
-             seenSource + sourceAtMs (#621, the seen latch's broadcaster and time)"
+             seenSource + sourceAtMs (#621, the seen latch's broadcaster and time), \
+             tipHeight (#808, the tip a hop's chain-probe memo was taken at)"
         );
         for stmt in LATCH_COLUMN_ALTERS {
             let column = stmt

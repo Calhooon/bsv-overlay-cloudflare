@@ -1834,7 +1834,8 @@ fn probe_memo_round_trips_on_the_production_schema() {
             1_000_i64,
             0_i64,
             Option::<String>::None,
-            Option::<i64>::None
+            Option::<i64>::None,
+            Some(971_993_i64)
         ],
     )
     .unwrap();
@@ -1845,7 +1846,8 @@ fn probe_memo_round_trips_on_the_production_schema() {
             2_000_i64,
             1_i64,
             Some("e5".repeat(32)),
-            Some(1_i64)
+            Some(1_i64),
+            Some(971_994_i64)
         ],
     )
     .unwrap();
@@ -1857,15 +1859,24 @@ fn probe_memo_round_trips_on_the_production_schema() {
             3_000_i64,
             1_i64,
             Some("f6".repeat(32)),
-            Some(0_i64)
+            Some(0_i64),
+            Option::<i64>::None
         ],
     )
     .unwrap();
     let mut stmt = conn.prepare(&probe_memo_read_sql(3)).unwrap();
-    type MemoRow = (String, i64, i64, Option<String>, Option<i64>);
+    // bsv-low #808: the sixth column is the memo's tip
+    type MemoRow = (String, i64, i64, Option<String>, Option<i64>, Option<i64>);
     let rows: Vec<MemoRow> = stmt
         .query_map(params![op("a1"), op("b2"), op("zz")], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         })
         .unwrap()
         .map(|r| r.unwrap())
@@ -1877,6 +1888,12 @@ fn probe_memo_round_trips_on_the_production_schema() {
         (3_000, 1, Some("f6".repeat(32).as_str()), Some(0)),
         "the re-upsert replaced the row"
     );
+    assert_eq!(
+        a1.5, None,
+        "#808: a rewrite takes the new memo's tip, never the old one's"
+    );
+    let b2 = rows.iter().find(|r| r.0 == op("b2")).unwrap();
+    assert_eq!(b2.5, Some(971_994), "#808: the tip round-trips");
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM hop_chain_probes", [], |r| r.get(0))
         .unwrap();
@@ -2084,6 +2101,8 @@ fn issue_526_a_stranded_hop_with_a_hopparty_row_and_an_unspent_output_is_served_
                 spent_confirmed: spender.map(|_| true),
                 stale: false,
                 age_ms: None,
+                probe_tip: None,
+                predates_tip: false,
             },
         )]
         .into_iter()
@@ -2383,6 +2402,8 @@ mod door_refusals {
                         spent_confirmed: None,
                         stale: false,
                         age_ms: None,
+                        probe_tip: None,
+                        predates_tip: false,
                     },
                 )
             })

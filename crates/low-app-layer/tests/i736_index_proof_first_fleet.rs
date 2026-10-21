@@ -256,6 +256,8 @@ fn owed(
                     spent_confirmed: Some(true),
                     stale: false,
                     age_ms: None,
+                    probe_tip: None,
+                    predates_tip: false,
                 },
             )
         })

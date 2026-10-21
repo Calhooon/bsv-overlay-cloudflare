@@ -4195,14 +4195,17 @@ async fn owed_recompute_inner(
             // first eight of the hops view's rank order every five minutes (both pinned in `hops_view`).
             // Inside the grace after a reorg clear a confirmed memo has the short window (the pass that clears also
             // pushes pot-changed, so this walk can follow it by seconds and ask a courier still behind the reorg).
+            // bsv-low #808: and an UNSPENT memo taken below this walk's tip (a block arrived since the chain said
+            // "unspent") answers for nothing: it is asked again, and past the budget it withholds the sweep.
             let reorg_clear = crate::hops_view::reorg_clear_at(&memos);
-            let (answered, to_probe) = crate::hops_view::split_probe_targets_after_reorg(
+            let (answered, to_probe) = crate::hops_view::split_probe_targets_at_tip(
                 &candidates,
                 &memos,
                 now_ms,
                 crate::hops_view::PROBE_MEMO_MAX_AGE_MS,
                 crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS,
                 reorg_clear,
+                tip,
             );
             let marker_at: HashMap<String, i64> = hops
                 .iter()
@@ -4228,11 +4231,12 @@ async fn owed_recompute_inner(
                     chain_spenders.push(s.to_ascii_lowercase());
                 }
                 // the memo's age rides the word (the gate's L5): the newest memo for the key, as the split judged it
-                let age_ms = memos
+                let newest = memos
                     .iter()
                     .filter(|m| m.outpoint == format!("{t}.{v}"))
-                    .map(|m| now_ms - m.probed_at_ms)
-                    .min();
+                    .max_by_key(|m| m.probed_at_ms);
+                let age_ms = newest.map(|m| now_ms - m.probed_at_ms);
+                let probe_tip = newest.and_then(|m| m.tip_height);
                 if crate::hops_view::confirmed_in_reorg_grace(
                     p.spent_confirmed,
                     now_ms - age_ms.unwrap_or(0),
@@ -4249,6 +4253,8 @@ async fn owed_recompute_inner(
                         spent_confirmed: p.spent_confirmed,
                         stale: false,
                         age_ms,
+                        probe_tip,
+                        predates_tip: false,
                     },
                 );
             }
@@ -4278,7 +4284,7 @@ async fn owed_recompute_inner(
                         }
                         hop_chain.insert(
                             key,
-                            crate::hops_view::stale_memo_word(m, now_ms, reorg_clear),
+                            crate::hops_view::stale_memo_word(m, now_ms, reorg_clear, tip),
                         );
                     }
                     continue;
@@ -4294,7 +4300,8 @@ async fn owed_recompute_inner(
                     spending_txid: row.spending_txid.clone(),
                     spent_confirmed: row.spent_confirmed,
                 };
-                if let Some(m) = crate::hops_view::probe_memo_of(t, *v, &probe, now_ms) {
+                // bsv-low #808: the memo is bound to the tip this walk read before it asked
+                if let Some(m) = crate::hops_view::probe_memo_at_tip(t, *v, &probe, now_ms, tip) {
                     fresh.push(m);
                 }
                 if let Some(s) = row.spending_txid.as_deref() {
@@ -4316,6 +4323,8 @@ async fn owed_recompute_inner(
                         spent_confirmed: row.spent_confirmed,
                         stale: false,
                         age_ms: None,
+                        probe_tip: tip,
+                        predates_tip: false,
                     },
                 );
             }
@@ -5170,6 +5179,7 @@ async fn owed_recompute_inner(
                     spent: true,
                     spending_txid: Some(sweep.to_ascii_lowercase()),
                     spent_confirmed: Some(true),
+                    tip_height: None,
                 })
             })
             .collect();
@@ -5442,6 +5452,8 @@ async fn owed_recompute_inner(
                 JsValue::from_f64(1.0),
                 JsValue::from_str(latch.spending_txid.as_deref().unwrap_or_default()),
                 JsValue::from_f64(1.0),
+                // bsv-low #808: a latch is no probe of a hop; it records no tip
+                JsValue::NULL,
             ])
             .map_err(|e| format!("owed proof latch bind: {e}"))?;
         stmts.insert(stmts.len() - 1, latch_stmt);
@@ -7526,6 +7538,9 @@ struct ProbeMemoRow {
     spending_txid: Option<String>,
     #[serde(rename = "spentConfirmed")]
     spent_confirmed: Option<i64>,
+    /// bsv-low #808 (overlay migration 342); absent from a read that does not select it (the latch reads).
+    #[serde(rename = "tipHeight", default)]
+    tip_height: Option<i64>,
 }
 
 /// The memos for `targets`, read in statements of at most `hops_view::PROBE_MEMO_READ_CHUNK` binds (delta fold 2,
@@ -7576,6 +7591,7 @@ async fn read_probe_memos(
             spent: r.spent != 0,
             spending_txid: r.spending_txid,
             spent_confirmed: r.spent_confirmed.map(|v| v != 0),
+            tip_height: r.tip_height.and_then(|t| u64::try_from(t).ok()),
         })
         .collect()
 }
@@ -7614,6 +7630,9 @@ async fn write_probe_memos(db: &worker::D1Database, memos: &[crate::hops_view::P
                 .unwrap_or(JsValue::NULL),
             m.spent_confirmed
                 .map(|v| JsValue::from_f64(if v { 1.0 } else { 0.0 }))
+                .unwrap_or(JsValue::NULL),
+            m.tip_height
+                .map(|t| JsValue::from_f64(t as f64))
                 .unwrap_or(JsValue::NULL),
         ];
         match db
@@ -7702,6 +7721,7 @@ async fn read_latch_ranges(
             spent: r.spent != 0,
             spending_txid: r.spending_txid,
             spent_confirmed: r.spent_confirmed.map(|v| v != 0),
+            tip_height: r.tip_height.and_then(|t| u64::try_from(t).ok()),
         })
         .collect()
 }

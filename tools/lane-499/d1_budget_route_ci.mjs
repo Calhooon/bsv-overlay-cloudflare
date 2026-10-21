@@ -223,6 +223,9 @@ const measured = {}
 // seed time it outlived its five minutes (`hops_view::PROBE_MEMO_MAX_AGE_MS`) behind the tier's builds on a loaded
 // host; the walk then asked mainnet WoC, which knows this captured hop swept home, and served 0 rows (or 1 when WoC
 // answered 429), at 33 to 35 statements against the offline read's 23 (the "owed surface 35 > 30" row).
+// bsv-low #808: the seed carries no `tipHeight`. That holds only because the tier runs no `rust-chaintracks`, so the
+// walk reads no tip and the memo's tip rule is off (`hops_view::memo_predates_tip`); a tier that serves a tip must
+// seed the memo at it, or the walk asks WoC again.
 {
   const other = '030d9e9fbe045a8130f190b103609c8a6bf13b1887d5c4f15e2f918d68aca8ad67'
   const hop = '9b238eed0177c714b1f9a608243e8f1bf79e35e9597110f83cefa1b658785c62'

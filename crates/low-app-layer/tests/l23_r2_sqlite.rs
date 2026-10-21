@@ -620,6 +620,8 @@ async fn l23_r2_captured_pair13_rows_rebuild_and_tell_spent_elsewhere() {
             spent_confirmed: Some(true),
             stale: false,
             age_ms: None,
+            probe_tip: None,
+            predates_tip: false,
         },
     )]
     .into_iter()

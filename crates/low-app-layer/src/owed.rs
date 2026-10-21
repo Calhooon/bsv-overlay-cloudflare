@@ -435,6 +435,7 @@ pub fn home_word(
                     spent: true,
                     spending_txid: Some(proven_txid),
                     spent_confirmed: probe.spent_confirmed,
+                    tip_height: None,
                 }),
             ))
         }
@@ -494,6 +495,7 @@ pub fn home_cursor_memo(
             next.vout,
         )),
         spent_confirmed: None,
+        tip_height: None,
     }
 }
 
@@ -763,6 +765,12 @@ pub struct HopChainWord {
     /// The memo's age when it answered (the gate's L5, 2026-09-19): `None` for a probe made this recompute; rides the
     /// row as `chainProbeAgeMs` so a two-hour-old confirmed word is not read as this second's.
     pub age_ms: Option<i64>,
+    /// bsv-low #808: the chain tip the walk had read when this word was taken (`hop_chain_probes.tipHeight`; this
+    /// walk's own tip for a probe it made). `None`: a memo written before the column, or by a walk with no tip.
+    pub probe_tip: Option<u64>,
+    /// bsv-low #808: an UNSPENT word taken below this walk's tip ([`crate::hops_view::memo_predates_tip`]), served
+    /// past the probe budget: the derivation withholds the sweep on it (a pending chain-wait), never offers it.
+    pub predates_tip: bool,
 }
 
 /// A VALID filed refund for one pot (`potrefund_records.refundValid = 1`).
@@ -3480,6 +3488,37 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     }
                 }
                 match chain {
+                    // bsv-low #808 (loop 41, pair 13): the chain's "unspent" was taken BELOW this walk's tip and the
+                    // budget left no fresh ask (`hops_view::memo_predates_tip`): a block has arrived since, and it may
+                    // hold the competitor. #669's predating-probe rule, at the derivation: the sweep is withheld as a
+                    // pending chain-wait, never offered on the old word, and never handed to the index-unspent arm
+                    // below (the rung did speak; its word is out of date, and a moved tip withholds). The walk's
+                    // rotation asks the hop again (an open row re-derives within five minutes).
+                    Some(w) if w.looked && w.spent == Some(false) && w.predates_tip => {
+                        facts["claim"] = Value::Null;
+                        facts["claimable"] = json!(false);
+                        facts["chainWait"] = json!("block");
+                        facts["tipMoved"] = json!(true);
+                        facts["chainProbe"] = json!("unspent-predates-tip");
+                        if let Some(age) = w.age_ms {
+                            facts["chainProbeAgeMs"] = json!(age);
+                        }
+                        facts["chainProbeTip"] = json!(w.probe_tip);
+                        if let Some(tn) = i.tip {
+                            facts["servedTip"] = json!(tn);
+                        }
+                        rows.push(OwedRow {
+                            identity: me.clone(),
+                            outpoint,
+                            family: OwedFamily::HopStranded,
+                            game_id: game,
+                            sats: Some(h.hop_sats),
+                            opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
+                            at_height: None,
+                            facts,
+                            reason: Some(SWEEP_TIP_MOVED_REASON.to_string()),
+                        });
+                    }
                     Some(w) if w.looked && w.spent == Some(false) => {
                         facts["claim"] = json!("sweep-hop");
                         facts["claimable"] = json!(true);
@@ -3487,6 +3526,10 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             json!(if w.stale { "unspent-stale" } else { "unspent" });
                         if let Some(age) = w.age_ms {
                             facts["chainProbeAgeMs"] = json!(age);
+                        }
+                        // bsv-low #808: the tip the word was taken at, beside its age (at or above this walk's tip)
+                        if let Some(pt) = w.probe_tip {
+                            facts["chainProbeTip"] = json!(pt);
                         }
                         // the FILED sweep rides the row when this identity filed one (any device presses it as it
                         // is); without one the press signs a sweep on the device that owns the key
@@ -4425,6 +4468,7 @@ pub fn proof_latch_memo(
         spent: true,
         spending_txid: Some(root.to_ascii_lowercase()),
         spent_confirmed: Some(true),
+        tip_height: None,
     })
 }
 
@@ -6271,6 +6315,7 @@ pub(crate) mod tests {
                 spent: r.get::<_, i64>(2)? != 0,
                 spending_txid: r.get(3)?,
                 spent_confirmed: r.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+                tip_height: None,
             })
         })
         .unwrap()
@@ -6654,6 +6699,7 @@ pub(crate) mod tests {
                 spent: true,
                 spending_txid: root.map(str::to_string),
                 spent_confirmed: confirmed,
+                tip_height: None,
             };
         let s = std::slice::from_ref(&sp);
         for bad in [
@@ -7644,6 +7690,7 @@ pub(crate) mod tests {
                 spent,
                 spending_txid: named_spender.then(|| tx(0x99)),
                 spent_confirmed: Some(true),
+                tip_height: None,
             }
         };
         let memos = [
@@ -7747,6 +7794,7 @@ pub(crate) mod tests {
             spent: true,
             spending_txid: Some(tx(0x99)),
             spent_confirmed: Some(true),
+            tip_height: None,
         };
         let named = {
             let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
@@ -7858,6 +7906,8 @@ pub(crate) mod tests {
                 .unwrap(),
         )
         .unwrap();
+        conn.execute_batch(bsv_overlay_cloudflare::d1::HOP_CHAIN_PROBES_TIP_ALTER)
+            .unwrap();
         let (a, b, c) = (tx(0x0a), tx(0x0b), tx(0x0c));
         let wanted = vec![a.clone(), b.clone(), c.clone()];
         let cold = |_: &str| -> Option<i64> { None };
@@ -7876,6 +7926,7 @@ pub(crate) mod tests {
                         spent: r.get::<_, i64>(2)? != 0,
                         spending_txid: r.get(3)?,
                         spent_confirmed: r.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+                        tip_height: None,
                     })
                 })
                 .unwrap()
@@ -8381,6 +8432,8 @@ pub(crate) mod tests {
                 spent_confirmed,
                 stale: false,
                 age_ms,
+                probe_tip: None,
+                predates_tip: false,
             },
         );
         m
@@ -9412,6 +9465,8 @@ pub(crate) mod tests {
                 spent_confirmed: None,
                 stale: false,
                 age_ms: None,
+                probe_tip: None,
+                predates_tip: false,
             },
         );
         let mut i = inputs(&e, &[], &young, &v, &c, &p, Some(900_000));
@@ -9588,6 +9643,8 @@ pub(crate) mod tests {
                 spent_confirmed: None,
                 stale: false,
                 age_ms: None,
+                probe_tip: None,
+                predates_tip: false,
             },
         );
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
@@ -11094,6 +11151,8 @@ pub(crate) mod tests {
                 .unwrap(),
         )
         .unwrap();
+        conn.execute_batch(bsv_overlay_cloudflare::d1::HOP_CHAIN_PROBES_TIP_ALTER)
+            .unwrap();
         let row = |outpoint: &str, family: OwedFamily| OwedRow {
             identity: ME.to_string(),
             outpoint: outpoint.to_string(),
@@ -11578,7 +11637,8 @@ pub(crate) mod tests {
                     m.probed_at_ms,
                     i64::from(m.spent),
                     m.spending_txid,
-                    m.spent_confirmed.map(i64::from)
+                    m.spent_confirmed.map(i64::from),
+                    m.tip_height.map(|t| t as i64)
                 ],
             )
             .unwrap();
@@ -11595,6 +11655,7 @@ pub(crate) mod tests {
                         spent: r.get::<_, i64>(2)? != 0,
                         spending_txid: r.get(3)?,
                         spent_confirmed: r.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+                        tip_height: None,
                     })
                 })
                 .unwrap()
@@ -11713,6 +11774,7 @@ pub(crate) mod tests {
             spent: true,
             spending_txid: Some(named.clone()),
             spent_confirmed: Some(true),
+            tip_height: None,
         });
         // pass 2: the key written is the key read; A is Proven with no ask, B is still a target
         let memos = read(&latch_targets);
@@ -11739,6 +11801,7 @@ pub(crate) mod tests {
             spent: true,
             spending_txid: None,
             spent_confirmed: None,
+            tip_height: None,
         };
         assert!(latched_home_words(&candidates[1..], &[weak]).0.is_empty());
         // the stored-read count sits inside the candidate cap
@@ -11764,6 +11827,8 @@ pub(crate) mod tests {
                 .unwrap(),
         )
         .unwrap();
+        conn.execute_batch(bsv_overlay_cloudflare::d1::HOP_CHAIN_PROBES_TIP_ALTER)
+            .unwrap();
         let row = |outpoint: String, family: OwedFamily| OwedRow {
             identity: ME.to_string(),
             outpoint,
@@ -11899,7 +11964,8 @@ pub(crate) mod tests {
                     m.probed_at_ms,
                     i64::from(m.spent),
                     m.spending_txid,
-                    m.spent_confirmed.map(i64::from)
+                    m.spent_confirmed.map(i64::from),
+                    m.tip_height.map(|t| t as i64)
                 ],
             )
             .unwrap();
@@ -11927,6 +11993,7 @@ pub(crate) mod tests {
                     spent: r.get::<_, i64>(2)? != 0,
                     spending_txid: r.get(3)?,
                     spent_confirmed: r.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+                    tip_height: None,
                 })
             })
             .unwrap()
@@ -12050,7 +12117,7 @@ pub(crate) mod tests {
                     memo.spending_txid.as_deref().map(str::to_ascii_lowercase),
                 );
                 let chain: HashMap<String, HopChainWord> =
-                    [(key.clone(), stale_memo_word(memo, now, Some(clear)))]
+                    [(key.clone(), stale_memo_word(memo, now, Some(clear), None))]
                         .into_iter()
                         .collect();
                 let mut sweeps: HashMap<String, crate::hopsweep::FiledHopSweep> = filed
@@ -12297,6 +12364,7 @@ pub(crate) mod tests {
             spent: true,
             spending_txid: Some(tx(0x5a)),
             spent_confirmed: confirmed,
+            tip_height: None,
         };
         write_memos(
             &conn,
@@ -12403,6 +12471,7 @@ pub(crate) mod tests {
                     spent: true,
                     spending_txid: Some(spender_of(i)),
                     spent_confirmed: Some(true),
+                    tip_height: None,
                 }],
             );
             if i < 8 {
@@ -12583,6 +12652,7 @@ pub(crate) mod tests {
                     spent: true,
                     spending_txid: Some(tx(0x5a)),
                     spent_confirmed: Some(true),
+                    tip_height: None,
                 }],
             );
         }
@@ -12717,6 +12787,8 @@ pub(crate) mod tests {
                 .unwrap(),
         )
         .unwrap();
+        conn.execute_batch(bsv_overlay_cloudflare::d1::HOP_CHAIN_PROBES_TIP_ALTER)
+            .unwrap();
         let row = |n: u8, family: OwedFamily, facts: Value| OwedRow {
             identity: ME.to_string(),
             outpoint: format!("{}:0", tx(n)),
@@ -12865,6 +12937,8 @@ pub(crate) mod tests {
                 .unwrap(),
         )
         .unwrap();
+        conn.execute_batch(bsv_overlay_cloudflare::d1::HOP_CHAIN_PROBES_TIP_ALTER)
+            .unwrap();
         let payout = OwedRow {
             identity: ME.to_string(),
             outpoint: format!("{}:0", tx(0x21)),
@@ -13040,6 +13114,8 @@ pub(crate) mod tests {
                 .unwrap(),
         )
         .unwrap();
+        conn.execute_batch(bsv_overlay_cloudflare::d1::HOP_CHAIN_PROBES_TIP_ALTER)
+            .unwrap();
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let live = [entry(
             Some(false),
@@ -13710,5 +13786,279 @@ pub(crate) mod tests {
             should_recompute(false, 10_000, None, Some(971_132), &rows2),
             "a NULL-tip claimable index-unspent stranded snapshot re-arms (it does not hold past one re-probe cycle)"
         );
+    }
+
+    // ── bsv-low #808: a hop-stranded probe memo is bound to the tip it was taken at ─────────────────────────────────
+    //
+    // Loop 41, pair 13 (`docs/audit/L41-REDS-2026-10-21.md` row 1 in bsv-low): at tip 971994 p2's `/owed` served
+    // `chainProbe unspent, chainProbeAgeMs 277950, claim sweep-hop, claimable true` for a hop whose competitor mined AT
+    // 971994. The walk re-used a memo taken before the block (inside the five-minute window) and stamped its snapshot at
+    // 971994, so `degrade_stale_sweeps` (snapshot tip against present tip) let it through. These pins run the walk's
+    // step 4b in the route's order over the SHIPPED memo statements under real SQLite: the memo written by
+    // `PROBE_MEMO_UPSERT_SQL` with its tip, read back by `probe_memo_read_sql`, split at the walk's tip, the past-budget
+    // word, the derivation, and the read-time gate at a tip-current snapshot.
+
+    /// The walk's step 4b for the one hop of `stranded_sweep_rows` (`tx(0x07):0`), as `routes::owed_recompute_inner`
+    /// runs it: read the memo back, split at `walk_tip`, and either name the hop for a fresh ask (`Err(())`: within the
+    /// budget) or serve the past-budget word (`budget_left == false`). `Ok` is the chain map the derivation reads.
+    fn walk808(
+        conn: &rusqlite::Connection,
+        walk_tip: u64,
+        budget_left: bool,
+        now: i64,
+    ) -> Result<HashMap<String, HopChainWord>, ()> {
+        use crate::hops_view::{
+            probe_memo_read_sql, split_probe_targets_at_tip, stale_memo_word, ProbeMemo,
+            PROBE_MEMO_CONFIRMED_MAX_AGE_MS, PROBE_MEMO_MAX_AGE_MS,
+        };
+        let target = (tx(0x07), 0u32);
+        let mut stmt = conn.prepare(&probe_memo_read_sql(1)).unwrap();
+        let memos: Vec<ProbeMemo> = stmt
+            .query_map([format!("{}.0", tx(0x07))], |r| {
+                Ok(ProbeMemo {
+                    outpoint: r.get(0)?,
+                    probed_at_ms: r.get(1)?,
+                    spent: r.get::<_, i64>(2)? != 0,
+                    spending_txid: r.get(3)?,
+                    spent_confirmed: r.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+                    tip_height: r.get::<_, Option<i64>>(5)?.map(|t| t as u64),
+                })
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let (answered, to_probe) = split_probe_targets_at_tip(
+            std::slice::from_ref(&target),
+            &memos,
+            now,
+            PROBE_MEMO_MAX_AGE_MS,
+            PROBE_MEMO_CONFIRMED_MAX_AGE_MS,
+            None,
+            Some(walk_tip),
+        );
+        let key = format!("{}:0", tx(0x07));
+        let mut out = HashMap::new();
+        for (_, _, p) in answered {
+            let m = memos.iter().max_by_key(|m| m.probed_at_ms).unwrap();
+            out.insert(
+                key.clone(),
+                HopChainWord {
+                    looked: p.known,
+                    spent: p.spent,
+                    spending_txid: p.spending_txid,
+                    spent_confirmed: p.spent_confirmed,
+                    stale: false,
+                    age_ms: Some(now - m.probed_at_ms),
+                    probe_tip: m.tip_height,
+                    predates_tip: false,
+                },
+            );
+        }
+        if !to_probe.is_empty() {
+            if budget_left {
+                return Err(());
+            }
+            if let Some(m) = memos.iter().max_by_key(|m| m.probed_at_ms) {
+                out.insert(key, stale_memo_word(m, now, None, Some(walk_tip)));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The derivation over `chain` at `tip`, then the read-time gate at a TIP-CURRENT snapshot (the loop-41 shape: the
+    /// snapshot was stamped at the served tip, so #669's snapshot-against-present check passes it through).
+    fn served808(chain: &HashMap<String, HopChainWord>, tip: u64) -> Vec<OwedRow> {
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let mut i = inputs(&[], &[], &old, &v, &c, &p, Some(tip));
+        i.hop_chain = chain;
+        let mut rows = derive_owed_rows(&i);
+        degrade_stale_sweeps(&mut rows, Some(tip), Some(tip));
+        rows
+    }
+
+    fn unspent_probe808() -> crate::hops_view::ChainSpendProbe {
+        crate::hops_view::ChainSpendProbe {
+            known: true,
+            spent: Some(false),
+            spending_txid: None,
+            spent_confirmed: None,
+        }
+    }
+
+    /// PIN 808-A (RED on the base's rule: `memo_predates_tip` answering `false`, i.e. no tip rule): the loop-41 memo,
+    /// "unspent" taken at 971993 and 277,950 ms old, read by a walk at 971994. Within the budget it is NOT an answer:
+    /// the hop is asked again. Past the budget its word withholds the sweep: a pending chain-wait, never `claimable`,
+    /// at a snapshot the read-time gate calls tip-current. A fresh probe at the served tip restores the press (still
+    /// unspent) or re-points the hop to the competitor (spent).
+    #[test]
+    fn pin808_a_a_memo_taken_below_the_walks_tip_is_asked_again_and_never_offers_the_sweep() {
+        use crate::hops_view::probe_memo_at_tip;
+        let conn = memo_db();
+        let (h, now) = (971_993u64, 10_000_000i64);
+        let taken = now - 277_950;
+        let memo = probe_memo_at_tip(&tx(0x07), 0, &unspent_probe808(), taken, Some(h)).unwrap();
+        write_memos(&conn, &[memo]);
+        // the same memo at its own tip answers (the five-minute window holds): the precondition of the incident
+        let at_h = walk808(&conn, h, true, now).expect("a memo at the walk's tip answers");
+        assert_eq!(
+            served808(&at_h, h)[0].facts["claimable"],
+            true,
+            "precondition"
+        );
+        // within the budget, at H+1: asked again
+        assert_eq!(
+            walk808(&conn, h + 1, true, now),
+            Err(()),
+            "a memo taken at {h} is no answer at {}: the hop is re-probed within the walk",
+            h + 1
+        );
+        // past the budget, at H+1: the old word withholds
+        let past = walk808(&conn, h + 1, false, now).expect("the past-budget word");
+        let rows = served808(&past, h + 1);
+        assert_eq!(rows[0].family, OwedFamily::HopStranded);
+        assert_eq!(
+            rows[0].facts["claimable"], false,
+            "a memo taken before the block never offers the sweep (loop 41: claimable true on a 278 s old memo)"
+        );
+        assert!(rows[0].facts["claim"].is_null());
+        assert_eq!(rows[0].facts["chainWait"], "block");
+        assert_eq!(rows[0].facts["tipMoved"], true);
+        assert_eq!(rows[0].facts["chainProbe"], "unspent-predates-tip");
+        assert_eq!(rows[0].facts["chainProbeTip"], h);
+        assert_eq!(rows[0].facts["servedTip"], h + 1);
+        assert_eq!(rows[0].facts["chainProbeAgeMs"], 277_950);
+        assert_eq!(rows[0].reason.as_deref(), Some(SWEEP_TIP_MOVED_REASON));
+        assert!(
+            row_is_open(&rows[0]),
+            "an open row: the next cadence re-derives it"
+        );
+        // the fresh probe at the served tip, written back as the route writes it (bound to the walk's tip)
+        let still = probe_memo_at_tip(&tx(0x07), 0, &unspent_probe808(), now, Some(h + 1)).unwrap();
+        write_memos(&conn, &[still]);
+        let fresh = walk808(&conn, h + 1, false, now + 1_000).expect("answered");
+        let rows = served808(&fresh, h + 1);
+        assert_eq!(
+            rows[0].facts["claim"], "sweep-hop",
+            "a fresh probe at the served tip restores the press"
+        );
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["chainProbe"], "unspent");
+        assert_eq!(rows[0].facts["chainProbeTip"], h + 1);
+        let competitor = crate::hops_view::ChainSpendProbe {
+            known: true,
+            spent: Some(true),
+            spending_txid: Some(tx(0x5d)),
+            spent_confirmed: Some(true),
+        };
+        let spent = probe_memo_at_tip(&tx(0x07), 0, &competitor, now + 2_000, Some(h + 1)).unwrap();
+        write_memos(&conn, &[spent]);
+        let rows = served808(&walk808(&conn, h + 1, false, now + 3_000).unwrap(), h + 1);
+        assert_eq!(
+            rows[0].facts["chainProbe"], "spent",
+            "the competitor's word re-points the hop"
+        );
+        assert_ne!(rows[0].facts["claimable"], true);
+    }
+
+    /// PIN 808-B: what the tip rule leaves standing. A memo at the served tip answers and offers; a memo ABOVE the
+    /// walk's tip (another isolate's fresher tip cache) answers; a SPENT memo below the tip answers (it only
+    /// withholds). A memo with NO recorded tip (written before migration 342, or by a tipless writer) is asked again.
+    /// With no walk tip the rule is off (the read-time gate's `Unknown` arm degrades the sweep instead).
+    #[test]
+    fn pin808_b_a_memo_at_or_above_the_tip_answers_and_a_tipless_one_is_asked() {
+        use crate::hops_view::{memo_predates_tip, probe_memo_at_tip, probe_memo_of};
+        let (h, now) = (971_994u64, 10_000_000i64);
+        let conn = memo_db();
+        write_memos(
+            &conn,
+            &[
+                probe_memo_at_tip(&tx(0x07), 0, &unspent_probe808(), now - 60_000, Some(h))
+                    .unwrap(),
+            ],
+        );
+        let rows = served808(&walk808(&conn, h, true, now).expect("answered"), h);
+        assert_eq!(
+            rows[0].facts["claim"], "sweep-hop",
+            "a memo at the served tip offers the press"
+        );
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["chainProbeTip"], h);
+        assert!(
+            walk808(&conn, h - 1, true, now).is_ok(),
+            "a memo above the walk's tip stands"
+        );
+        // a tipless memo (the column NULL), as the shipped upsert writes it
+        let conn = memo_db();
+        write_memos(
+            &conn,
+            &[probe_memo_of(&tx(0x07), 0, &unspent_probe808(), now - 60_000).unwrap()],
+        );
+        assert_eq!(
+            walk808(&conn, h, true, now),
+            Err(()),
+            "a memo with no recorded tip is asked again"
+        );
+        let rows = served808(&walk808(&conn, h, false, now).unwrap(), h);
+        assert_eq!(rows[0].facts["claimable"], false);
+        assert!(rows[0].facts["chainProbeTip"].is_null());
+        // the pure rule
+        let unspent_at =
+            |t: Option<u64>| probe_memo_at_tip(&tx(0x07), 0, &unspent_probe808(), now, t).unwrap();
+        assert!(memo_predates_tip(&unspent_at(Some(h - 1)), Some(h)));
+        assert!(memo_predates_tip(&unspent_at(None), Some(h)));
+        assert!(!memo_predates_tip(&unspent_at(Some(h)), Some(h)));
+        assert!(!memo_predates_tip(&unspent_at(Some(h + 1)), Some(h)));
+        assert!(
+            !memo_predates_tip(&unspent_at(Some(h - 1)), None),
+            "no walk tip: nothing to compare"
+        );
+        let spent = crate::hops_view::ChainSpendProbe {
+            known: true,
+            spent: Some(true),
+            spending_txid: Some(tx(0x5d)),
+            spent_confirmed: None,
+        };
+        let spent_below = probe_memo_at_tip(&tx(0x07), 0, &spent, now, Some(h - 1)).unwrap();
+        assert!(
+            !memo_predates_tip(&spent_below, Some(h)),
+            "a spent word only withholds: never stale by tip"
+        );
+    }
+
+    /// PIN 808-C: #669's narrowing for the owner's own index-unspent stranded hop is unchanged. With NO chain word (no
+    /// memo, the budget spent before it was asked) or a fresh probe that could not look (`looked: false`, a 429), the
+    /// index's own unspent offers the sweep (`chainProbe: "index-unspent"`); the rung's positive spent word still
+    /// downgrades it. Only a word the rung DID give, and gave below the tip, withholds (808-A).
+    #[test]
+    fn pin808_c_the_index_unspent_arm_is_unchanged() {
+        let (h, now) = (971_994u64, 10_000_000i64);
+        let conn = memo_db();
+        assert_eq!(walk808(&conn, h, true, now), Err(()), "never probed: asked");
+        let silent = walk808(&conn, h, false, now).unwrap();
+        assert!(silent.is_empty(), "no memo, no budget: no chain word");
+        let rows = served808(&silent, h);
+        assert_eq!(rows[0].facts["chainProbe"], "index-unspent");
+        assert_eq!(rows[0].facts["claim"], "sweep-hop");
+        assert_eq!(rows[0].facts["claimable"], true);
+        let key = format!("{}:0", tx(0x07));
+        let faulted = chain(&key, false, None, None);
+        let rows = served808(&faulted, h);
+        assert_eq!(
+            rows[0].facts["chainProbe"], "index-unspent",
+            "a fresh ask that could not look"
+        );
+        assert_eq!(rows[0].facts["claimable"], true);
+        let spent = chain(&key, true, Some(true), Some(&tx(0x5d)));
+        let rows = served808(&spent, h);
+        assert_eq!(
+            rows[0].facts["chainProbe"], "spent",
+            "the rung still downgrades"
+        );
+        assert_ne!(rows[0].facts["claimable"], true);
     }
 }

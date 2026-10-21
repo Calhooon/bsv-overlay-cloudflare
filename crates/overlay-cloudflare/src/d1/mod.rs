@@ -602,7 +602,15 @@ pub fn migration_list_fingerprint() -> u32 {
 /// row), `tracker_reasks` (the durable re-ask queue) and its age index, and two partial indexes of `tx_words`' mined
 /// rows (by height, by header hash) that select an event's affected set. The app layer's catch-up carries the two
 /// CREATE TABLEs byte for byte and issues the three indexes on its scheduled path.
-pub const OVERLAY_MIGRATION_COUNT: usize = 341;
+/// 341 to 342 for bsv-low #808 (FIX-808-PROBE-TIP): `hop_chain_probes.tipHeight`, the chain tip the owed walk had
+/// read when it took the probe a memo records (NULL: a memo written before it, or by a writer with no tip). The app
+/// layer reads it (`hops_view::probe_memo_read_sql`), so epoch Rule 24 bites: its `LATCH_COLUMN_ALTERS` carry the
+/// same statement.
+pub const OVERLAY_MIGRATION_COUNT: usize = 342;
+
+/// bsv-low #808: the tip a hop's chain-probe memo was taken at (`low-app-layer` `hops_view::ProbeMemo::tip_height`).
+pub const HOP_CHAIN_PROBES_TIP_ALTER: &str =
+    "ALTER TABLE hop_chain_probes ADD COLUMN tipHeight INTEGER";
 
 /// bsv-low #771 (L1b): the chain-event feed's cursor, one row (`low-app-layer` `tracker_host::chain_events`).
 /// FIX-771-L1: `seed` and `started_at` (the cursor the row was first written at, from `CHAIN_EVENTS_START_CURSOR`
@@ -2249,6 +2257,9 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     TRACKER_REASKS_AGE_INDEX,
     TX_WORDS_MINED_HEIGHT_INDEX,
     TX_WORDS_MINED_HEADER_INDEX,
+    // 342: bsv-low #808, the tip a hop's chain-probe memo was taken at. Additive: a memo written before carries NULL,
+    // which the owed walk reads as "taken before the tip" for an unspent word (asked again, never offered on).
+    HOP_CHAIN_PROBES_TIP_ALTER,
 ];
 
 // =============================================================================
