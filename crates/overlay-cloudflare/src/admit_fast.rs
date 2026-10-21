@@ -2388,7 +2388,9 @@ pub const PENDING_WATCH_SLEEPS_MS: [u64; 7] = [2_000, 2_000, 2_000, 2_000, 3_000
 ///     counted and kept (the callbacks and the passes own it);
 ///   * an ORPHAN look keeps watching (the #413 dual push is feeding the parents
 ///     to the second broadcaster meanwhile); still an orphan at the end → counted;
-///   * unknown / below SEEN → keep watching; silent at the end → counted.
+///   * unknown / below SEEN → keep watching; silent at the end → counted, ONLY while the subject's
+///     `network_seen` is still unlatched (bsv-low #822: a subject the #413 dual push or a callback latched is
+///     `latched-elsewhere`, [`watch_end_counter`]).
 ///
 /// Every look is one GET; the latch is the only write on the happy path.
 pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f64) {
@@ -2538,15 +2540,42 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
         }
     };
     if !confirmed_now {
-        let name = if matches!(last, crate::broadcaster::WitnessLook::Orphan(_)) {
-            crate::ops::COUNTER_SUBMIT_PENDING_ORPHAN
-        } else {
-            crate::ops::COUNTER_SUBMIT_PENDING_SILENT
-        };
+        // bsv-low #822: the subject's OWN latch decides silent, never Arcade's last look alone (the #413 dual push
+        // latches on TAAL's or GorillaPool's SEEN while Arcade's rank sits below it)
+        let latched = crate::ops::network_seen_latched(&db, &txid).await;
+        if let Err(why) = &latched {
+            worker::console_log!(
+                "[admit-fast] {txid} the watch-end latch read faulted ({why}) — counted by Arcade's last look"
+            );
+        }
+        let name = watch_end_counter(&last, latched.as_ref().ok().copied());
         crate::ops::bump_counter(&db, name, 1).await;
-        worker::console_log!(
-            "[admit-fast] {txid} unwitnessed after the pending watch ({last:?}) — the callbacks, the completion and the reconcile passes own it"
-        );
+        if name == crate::ops::COUNTER_SUBMIT_PENDING_LATCHED_ELSEWHERE {
+            worker::console_log!(
+                "[admit-fast] {txid} Arcade unwitnessed after the pending watch ({last:?}) but network_seen is latched elsewhere — not silent"
+            );
+        } else {
+            worker::console_log!(
+                "[admit-fast] {txid} unwitnessed after the pending watch ({last:?}) — the callbacks, the completion and the reconcile passes own it"
+            );
+        }
+    }
+}
+
+/// bsv-low #822: the counter the pending watch's END bumps for a subject it neither latched nor confirmed. `latched`
+/// is the subject's `network_seen` read at the end (`None`: the read faulted). A LATCHED subject (another path said
+/// SEEN: the #413 dual push, a callback) is `latched-elsewhere`, never silent nor orphan; an unlatched one keeps
+/// the look's class (an orphan view, else silent); a faulted read counts by the look, as before #822.
+pub(crate) fn watch_end_counter(
+    last: &crate::broadcaster::WitnessLook,
+    latched: Option<bool>,
+) -> &'static str {
+    if latched == Some(true) {
+        crate::ops::COUNTER_SUBMIT_PENDING_LATCHED_ELSEWHERE
+    } else if matches!(last, crate::broadcaster::WitnessLook::Orphan(_)) {
+        crate::ops::COUNTER_SUBMIT_PENDING_ORPHAN
+    } else {
+        crate::ops::COUNTER_SUBMIT_PENDING_SILENT
     }
 }
 
@@ -2842,6 +2871,72 @@ mod tests {
     /// isolate evicted inside it loses only a confirm the 30-minute backstop
     /// pass still owns (fail-safe), and the silent/orphan counter is bumped only
     /// when the confirm did not confirm.
+    /// bsv-low #822 (loop 42, pair 3): a subject the #413 dual push latched SEEN while Arcade's rank sat at
+    /// ACCEPTED_BY_NETWORK counts `latched-elsewhere` at the watch's end, never silent; an unlatched one stays silent
+    /// (or orphan); a faulted latch read counts by the look.
+    #[test]
+    fn fix822_the_watch_end_over_a_pre_latched_subject_counts_latched_elsewhere_never_silent() {
+        use crate::broadcaster::WitnessLook;
+        let accepted = WitnessLook::Pending("ACCEPTED_BY_NETWORK".into());
+        let orphan = WitnessLook::Orphan("SEEN_IN_ORPHAN_MEMPOOL".into());
+        for look in [&accepted, &orphan, &WitnessLook::Unknown] {
+            assert_eq!(
+                watch_end_counter(look, Some(true)),
+                crate::ops::COUNTER_SUBMIT_PENDING_LATCHED_ELSEWHERE,
+                "{look:?}: a latched subject is never silent"
+            );
+        }
+        assert_eq!(
+            watch_end_counter(&accepted, Some(false)),
+            crate::ops::COUNTER_SUBMIT_PENDING_SILENT
+        );
+        assert_eq!(
+            watch_end_counter(&orphan, Some(false)),
+            crate::ops::COUNTER_SUBMIT_PENDING_ORPHAN
+        );
+        assert_eq!(
+            watch_end_counter(&accepted, None),
+            crate::ops::COUNTER_SUBMIT_PENDING_SILENT,
+            "a faulted latch read counts by the look"
+        );
+        // the job reads the subject's latch before it counts, and counts through this function alone
+        let src = include_str!("admit_fast.rs");
+        let job = &src[src.find("pub async fn pending_watch_job(").unwrap()..];
+        let job = &job[..job.find("\n}\n").unwrap()];
+        let read = job
+            .find("crate::ops::network_seen_latched(&db, &txid).await")
+            .expect("the watch end reads the subject's latch");
+        let count = job
+            .find("let name = watch_end_counter(&last, latched.as_ref().ok().copied());")
+            .expect("the watch end counts through watch_end_counter");
+        assert!(read < count, "the latch is read before the count");
+        assert!(
+            !job.contains("COUNTER_SUBMIT_PENDING_SILENT"),
+            "no direct silent count in the job"
+        );
+    }
+
+    /// bsv-low #822: the latch read is the latch table's own primary key, lowercased as the latch writes it.
+    #[test]
+    fn fix822_the_latch_read_finds_the_latch_under_real_sqlite() {
+        let conn = shipped_conn();
+        let txid = "AB".repeat(32);
+        let read = |conn: &rusqlite::Connection| {
+            conn.query_row(crate::ops::NETWORK_SEEN_LATCHED_SQL, [&txid], |_| Ok(()))
+                .is_ok()
+        };
+        assert!(!read(&conn), "unlatched");
+        conn.execute(
+            crate::ops::NETWORK_SEEN_INSERT_SQL,
+            rusqlite::params![txid, "taal", 1i64],
+        )
+        .unwrap();
+        assert!(
+            read(&conn),
+            "latched by another path (the #413 dual push's TAAL)"
+        );
+    }
+
     #[test]
     fn the_pending_watch_fits_the_post_response_budget_and_looks_early() {
         let total: u64 = PENDING_WATCH_SLEEPS_MS.iter().sum();
