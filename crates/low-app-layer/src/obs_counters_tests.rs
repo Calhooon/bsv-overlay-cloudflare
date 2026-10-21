@@ -152,6 +152,7 @@ fn obs_628_the_owed_health_keys_are_the_old_ones_and_recomputes_this_isolate() {
         "recomputeWalkDeadline",
         "recomputeNoSlice",
         "recomputeWalkHardDeadlineMs",
+        "recomputeDeferredWalkDeadlineMs",
     ];
     assert!(
         !keys.contains(&"recomputeSeq"),
