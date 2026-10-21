@@ -5,9 +5,14 @@ import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 // Use the same Miniflare installed alongside the tier's wrangler, no second runtime/version.
 const wrangler = process.env.NS2_WRANGLER_PACKAGE ?? process.env.PATH.split(delimiter).map(p => resolve(p, '../wrangler/package.json')).find(existsSync)
-assert(wrangler, 'run through npx --package wrangler -c so the tier uses wrangler’s Miniflare')
+assert(wrangler, 'set NS2_WRANGLER_PACKAGE (the tier does) or put the tier’s wrangler on PATH, so the pin uses its Miniflare')
 const require = createRequire(wrangler)
-const { Miniflare, convertV4MiniflareOptions = v => v } = require('miniflare')
+const { Miniflare, convertV4MiniflareOptions } = require('miniflare')
+// Miniflare 5 (wrangler 4.148) takes v4 options only through `convertV4MiniflareOptions`, which DROPS `d1Persist`
+// silently (an empty D1: "no such table"); it persists every resource under `resourcePersistencePath`, the `v3`
+// directory itself. Miniflare 4 (wrangler 4.54) has neither and takes `d1Persist`, the `v3/d1` directory.
+const persist = dir => convertV4MiniflareOptions ? {resourcePersistencePath: dir} : {d1Persist: resolve(dir, 'd1')}
+const asMiniflare = convertV4MiniflareOptions ?? (v => v)
 const root = fileURLToPath(new URL('../../', import.meta.url))
 const compatibilityDate = readFileSync(root + 'crates/low-app-layer/wrangler.toml', 'utf8').match(/^compatibility_date = "([^"]+)"/m)[1]
 assert.equal(compatibilityDate, '2024-12-01', 'NOTE-C compatibility date must match the register evidence')
@@ -18,7 +23,7 @@ assert.equal(compatibilityDate, '2024-12-01', 'NOTE-C compatibility date must ma
 const seedV3 = process.env.D1_BUDGET_SEED_V3
 assert(seedV3 && existsSync(resolve(seedV3, 'd1')), 'D1_BUDGET_SEED_V3 names the copy of the tier\'s loaded v3')
 const overlayDb = readFileSync(root + 'crates/low-app-layer/wrangler.toml', 'utf8').match(/binding = "OVERLAY_DB"[\s\S]*?database_id = "([^"]+)"/)[1]
-const mf = new Miniflare(convertV4MiniflareOptions({name: "pin", d1Persist: resolve(seedV3, 'd1'),
+const mf = new Miniflare(asMiniflare({name: "pin", ...persist(seedV3),
   modules: ['tools/lane-ns2/owed_do_pin_worker.mjs', 'crates/low-app-layer/build/worker/shim.mjs', 'crates/low-app-layer/build/index.js', 'crates/low-app-layer/build/index_bg.wasm'].map(path => ({path: root + path, type: path.endsWith('.wasm') ? 'CompiledWasm' : 'ESModule', contents: readFileSync(root + path)})),
   modulesRoot: root,
   compatibilityDate, compatibilityFlags: ['nodejs_compat'],
