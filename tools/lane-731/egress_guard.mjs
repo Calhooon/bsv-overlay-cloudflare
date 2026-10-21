@@ -9,7 +9,15 @@
  *
  * The tier runs each `wrangler dev` at `--log-level debug`, where wrangler's inspector proxy prints the runtime's
  * `Network.requestWillBeSent` for EVERY subrequest the worker makes (its `fetch`, workers-rs's `Fetch::Url` and
- * `Fetch::Request`), with the request's URL; this guard reads those URLs and reds on any host that is not the
+ * `Fetch::Request`), with the request's URL. Since wrangler 4.148 the proxy enables the Network domain only while
+ * a DevTools client is attached, so the tier attaches `network_tap.mjs` to each session's inspector port; the line
+ * shape is then unchanged from 4.54 (probed on 4.148.0, a worker's `fetch` of a loopback and a network URL):
+ *   [InspectorProxyWorker] RUNTIME INCOMING MESSAGE {
+ *     method: 'Network.requestWillBeSent',
+ *     params: { requestId: '0', loaderId: '', request: { url: 'http://127.0.0.1:48712/loop-probe', method: 'GET', ...
+ * (the same event is echoed as `SEND TO DEVTOOLS {"method":"Network.requestWillBeSent",...}` JSON, which the
+ * pattern below, keyed on the single-quoted form, does not count twice). Without the tap 4.148's log holds no
+ * subrequest at all and the positive control below reds the guard as BLIND. This guard reads those URLs and reds on any host that is not the
  * network. The Network domain also reports the runtime's BINDING calls (`http://d1/...`, an unbound service
  * binding's `https://chaintracks/...`, a Durable Object stub's `https://board-view/...`, an alarm's self-call to
  * `https://tick.invalid/...`): a host with no dot, or under a TLD reserved never to resolve (RFC 2606/6761:

@@ -52,6 +52,12 @@ try {
   assert.equal(r.rc, 1, 'no loopback subrequest at all is a blind guard')
   assert.match(r.out, /BLIND/)
 
+  // wrangler 4.148 with the tap attached: the same event, then its `SEND TO DEVTOOLS` JSON echo (probed); counted once.
+  const echo = (url) => `[InspectorProxyWorker] SEND TO DEVTOOLS {"method":"Network.requestWillBeSent","params":{"requestId":"0","request":{"url":"${url}","method":"GET"}}}\n`
+  r = run(loop + echo('http://127.0.0.1:46782/internal/pot-changed'))
+  assert.equal(r.rc, 0, `the 4.148 shape passes: ${r.out}`)
+  assert.match(r.out, /w 127\.0\.0\.1 x1\)/, 'the echo is not a second subrequest')
+
   r = run('')
   assert.equal(r.rc, 1, 'an empty log is a blind guard')
   console.log('egress guard self-test: ok')

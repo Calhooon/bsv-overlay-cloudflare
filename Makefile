@@ -494,7 +494,8 @@ ci-d1-board:
 # with `MAINNET_FANOUT=false` and the app layer with `COURIER_SINK=http://127.0.0.1:9` (a closed loopback port: every
 # courier ask the same transport fault, "could not look", run after run; the var accepts a loopback origin only). Each
 # `wrangler dev` runs at `--log-level debug` (wrangler prints the runtime's `Network.requestWillBeSent` for every
-# subrequest) and `tools/lane-731/egress_guard.mjs` reds BY NAME on any subrequest whose host is the network (binding
+# subrequest; since wrangler 4.148 only while a DevTools client is attached, so each session's inspector port, B+13
+# to B+15, gets `tools/lane-731/network_tap.mjs`, which attaches and asks `Network.enable`) and `tools/lane-731/egress_guard.mjs` reds BY NAME on any subrequest whose host is the network (binding
 # calls such as `http://d1/`, the absent CHAINTRACKS binding's `https://chaintracks/` 503 and a Durable Object stub's
 # dotless host are not), with a positive control (the e649 cell's loopback post must be seen). On macOS the workers'
 # RUNTIME is also SEALED (`MINIFLARE_WORKERD_PATH` = `tools/lane-731/workerd-sealed.sh`, `sandbox-exec` with
@@ -503,6 +504,7 @@ ci-d1-board:
 ci-d1-budget:
 	@set -e; \
 	B=$${LANE_BASE:-8791}; PA=$$((B+9)); PO=$$((B+10)); PD=$$((B+11)); PM=$$((B+12)); \
+	IA=$$((B+13)); IO=$$((B+14)); ID=$$((B+15)); \
 	app_log=/tmp/lane499-d1-$$B-app.log; ov_log=/tmp/lane499-d1-$$B-overlay.log; seed_log=/tmp/lane499-d1-$$B-seed.log; \
 	dv_log=/tmp/lane499-d1-$$B-delivering.log; \
 	: > "$$app_log"; : > "$$ov_log"; : > "$$dv_log"; \
@@ -537,7 +539,7 @@ ci-d1-budget:
 	}; \
 	trap 'cleanup; exit 130' INT TERM; \
 	trap '_rc=$$?; if [ $$_rc -ne 0 ]; then egress_diag; fi; cleanup' EXIT; \
-	for _pt in $$PA $$PO $$PD $$PM; do \
+	for _pt in $$PA $$PO $$PD $$PM $$IA $$IO $$ID; do \
 	  _held=$$(lsof -nP -tiTCP:$$_pt -sTCP:LISTEN 2>/dev/null || true); \
 	  if [ -n "$$_held" ]; then \
 	    echo "✗ ci-d1-budget: :$$_pt is ALREADY BOUND before we start, refusing to run (a stale worker would answer)."; \
@@ -545,7 +547,7 @@ ci-d1-budget:
 	    exit 1; \
 	  fi; \
 	done; \
-	owned_ports="$$PA $$PO $$PD"; \
+	owned_ports="$$PA $$PO $$PD $$IA $$IO $$ID"; \
 	seal=""; \
 	if [ "$${D1_EGRESS_SEAL:-1}" != 0 ] && command -v sandbox-exec >/dev/null 2>&1; then \
 	  D1_REAL_WORKERD=$$(node tools/lane-731/real_workerd.mjs); export D1_REAL_WORKERD; \
@@ -564,6 +566,12 @@ ci-d1-budget:
 	  cat "$$_log" 2>/dev/null || true; \
 	  return 1; \
 	}; \
+	tap() { \
+	  _tl="/tmp/lane499-d1-$$B-tap-$$2.log"; node tools/lane-731/network_tap.mjs "$$1" "$$2" > "$$_tl" 2>&1 & \
+	  job_pids="$$job_pids $$!"; _i=0; \
+	  while [ $$_i -lt 60 ]; do grep -q "TAP ATTACHED" "$$_tl" && return 0; _i=$$((_i+1)); sleep 1; done; \
+	  echo "✗ ci-d1-budget: the network tap never attached to the $$2 inspector on :$$1"; cat "$$_tl"; return 1; \
+	}; \
 	node tools/lane-731/egress_guard.test.mjs; \
 	echo "→ ci-d1-budget: the fixture D1 (seed + wrangler d1 execute --local)…"; \
 	D1_CURSOR_PIN_SQL="$$state/cursor.sql" cargo run -q $(WORKERS) -p low-app-layer --example d1_budget_seed > "$$state/seed.sql"; \
@@ -572,15 +580,16 @@ ci-d1-budget:
 	node tools/lane-499/cursor_pin.mjs "$$state/cursor.sql.expected.json" "$$state"; \
 	cp -R "$$state/v3/." "$$seed_v3/"; \
 	echo "→ starting wrangler dev :$$PA (the app layer on the fixture D1)…"; \
-	( cd crates/low-app-layer && exec env $$seal npx wrangler dev --local --log-level debug --port $$PA --ip 127.0.0.1 --persist-to "$$state" \
+	( cd crates/low-app-layer && exec env $$seal npx wrangler dev --local --log-level debug --port $$PA --inspector-port $$IA --ip 127.0.0.1 --persist-to "$$state" \
 	    --var AUTH_ENFORCE:false --var SESSION_LANE:false \
 	    --var INTERNAL_TOKEN:ci-internal-tok \
 	    --var COURIER_SINK:http://127.0.0.1:9 \
 	) > "$$app_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PA/health "$$app_log" "app layer"; \
+	tap $$IA app-layer; \
 	echo "→ starting wrangler dev :$$PO (the overlay, tm_collected, ARCADE_URL a closed port)…"; \
-	( cd crates/overlay-cloudflare && exec env $$seal npx wrangler dev --local --log-level debug --port $$PO --ip 127.0.0.1 --persist-to "$$ov_state" \
+	( cd crates/overlay-cloudflare && exec env $$seal npx wrangler dev --local --log-level debug --port $$PO --inspector-port $$IO --ip 127.0.0.1 --persist-to "$$ov_state" \
 	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
 	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
 	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
@@ -592,8 +601,9 @@ ci-d1-budget:
 	) > "$$ov_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PO/listTopicManagers "$$ov_log" "overlay"; \
+	tap $$IO overlay; \
 	echo "→ starting wrangler dev :$$PD (the delivering overlay of the e649 cell, APP_LAYER_URL its mock on :$$PM)…"; \
-	( cd crates/overlay-cloudflare && exec env $$seal npx wrangler dev --local --log-level debug --port $$PD --ip 127.0.0.1 --persist-to "$$dv_state" \
+	( cd crates/overlay-cloudflare && exec env $$seal npx wrangler dev --local --log-level debug --port $$PD --inspector-port $$ID --ip 127.0.0.1 --persist-to "$$dv_state" \
 	    --var ARCADE_URL:http://127.0.0.1:9 \
 	    --var INTERNAL_TOKEN:ci-internal-tok \
 	    --var APP_LAYER_URL:http://127.0.0.1:$$PM \
@@ -602,6 +612,7 @@ ci-d1-budget:
 	) > "$$dv_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PD/listTopicManagers "$$dv_log" "delivering overlay"; \
+	tap $$ID delivering-overlay; \
 	D1_BUDGET_SEED="$$state/seed.sql" D1_BUDGET_STATE="$$state" node tools/lane-499/d1_budget_route_ci.mjs http://127.0.0.1:$$PA http://127.0.0.1:$$PO; \
 	python3 tools/lane-ns2/register_pin.py; \
 	D1_BUDGET_SEED_V3="$$seed_v3" npx --package wrangler -c 'node tools/lane-ns2/owed_do_pins.mjs'; \
