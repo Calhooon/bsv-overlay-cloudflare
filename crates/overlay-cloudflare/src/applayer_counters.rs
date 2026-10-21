@@ -17,7 +17,7 @@ const MEMO_HIT_KINDS: [&str; 6] = [
     "isolate_unconfirmable",
 ];
 const MEMO_WRITE_KINDS: [&str; 2] = ["anchor", "isolate_unconfirmable"];
-const OWED: [&str; 7] = [
+const OWED: [&str; 9] = [
     "applayer_owed_recompute_faults_total",
     "applayer_owed_recompute_shed_total",
     "applayer_owed_recompute_deferred_abandoned_total",
@@ -25,6 +25,8 @@ const OWED: [&str; 7] = [
     "applayer_owed_recompute_arm_failed_total",
     "applayer_owed_recompute_lock_takeovers_total",
     "applayer_owed_sweep_proof_contradictions_total",
+    "applayer_owed_recompute_walk_deadline_total",
+    "applayer_owed_recompute_no_slice_total",
 ];
 const OWED_READ_FAULT_KINDS: [&str; 9] = [
     "spender",

@@ -2122,16 +2122,29 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
             if let Some(wait) = ctx.data.wait.clone() {
                 let env = ctx.env.clone();
                 wait.wait_until(async move {
+                    // bsv-low #800: the filing's refresh has this invocation's 30 s
+                    let invocation_end =
+                        crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64);
                     if let Ok(db) = env.d1("OVERLAY_DB") {
                         crate::routes::owed_recompute_and_push_coalesced(
-                            &env, &db, &id, "filing", None,
+                            &env,
+                            &db,
+                            &id,
+                            "filing",
+                            None,
+                            invocation_end,
                         )
                         .await;
                     }
                 });
             } else {
                 crate::routes::owed_recompute_and_push_coalesced(
-                    &ctx.env, &db, &id, "filing", None,
+                    &ctx.env,
+                    &db,
+                    &id,
+                    "filing",
+                    None,
+                    crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64),
                 )
                 .await;
             }
