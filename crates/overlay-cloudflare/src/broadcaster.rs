@@ -1412,6 +1412,11 @@ fn reached_submit_echo(fast_answer: bool) -> GateStep {
     }
 }
 
+/// The transport fault a STORED echo answers under an OPEN eviction (#612): never an admission. The route reads it
+/// by this name on a resumed run (bsv-low #838, the FIX-838 lens's LOW-1).
+pub(crate) const STORED_ECHO_UNDER_EVICTION: &str =
+    "Arcade stored echo predates eviction or freshness bound";
+
 /// Arcade POST submitResponse carries txid, status and txStatus, no timestamp.
 /// Under an OPEN eviction a stored echo never readmits; only the network
 /// fresh accept on OUR re-present readmits through this POST path (#513).
@@ -3259,9 +3264,7 @@ impl ArcadeBroadcaster {
                             worker::Date::now().as_millis() as i64,
                             self.evicted_at_ms,
                         ) {
-                            return Err(
-                                "Arcade stored echo predates eviction or freshness bound".into()
-                            );
+                            return Err(STORED_ECHO_UNDER_EVICTION.into());
                         }
                         // Witnessed mode still corroborates and can answer 502 on
                         // STORED corroborators: bsv-low #637 (NS2P-L2 / N5).

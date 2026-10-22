@@ -373,6 +373,26 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   }
 }
 
+// ── 3b. bsv-low #838: the harness's settle of /health/invariants on the fleet fixture ─────────────────────
+// Loop 44 lost two cells to this read (each needs two agreeing answers inside 20 s, `settled(.., budgetMs: 20000)`),
+// not to /submit. Its reads are issued together and its own rows-read bump is after the answer, so the answer
+// WRITES nothing (a write put back before the answer reds `writes`), and two answers 250 ms apart, the cells'
+// shape, are held to a wall-time ceiling far under the settle (measured on the fixture plus the margin).
+{
+  const t0 = Date.now()
+  const first = await get(OVERLAY, '/health/invariants')
+  await new Promise((r) => setTimeout(r, 250))
+  const second = await get(OVERLAY, '/health/invariants')
+  const ms = Date.now() - t0
+  if (first.status !== 200 || second.status !== 200) fail('health-invariants: two answers', `${first.status}, ${second.status}`)
+  check('health-invariants', segment(second.timing, 'd1'))
+  const c = CEILINGS.scenarios['health-invariants']
+  if (MEASURE) lines.push(`MEASURE health-invariants settle: two answers in ${ms} ms`)
+  else if (!c?.settleCeilingMs) fail('health-invariants: a settle ceiling', 'no settleCeilingMs in ceilings.json')
+  else if (ms > c.settleCeilingMs) fail('health-invariants: two answers inside the settle ceiling', `${ms} ms > ${c.settleCeilingMs} ms (the harness's settle is 20000)`)
+  else pass(`health-invariants: two answers in ${ms} ms (ceiling ${c.settleCeilingMs}, the harness's settle 20000)`)
+}
+
 // ── 4. the brain's recompute ceiling sheds ─────────────────────────────────
 {
   const h0 = (await appHealth()).owed
