@@ -336,8 +336,11 @@ pub fn release_pot_spends_sql(cols: &[ColumnInfo]) -> String {
             sets.push(format!("{col} = {val}"));
         }
     }
+    // bsv-low #838: the guard's term is UNINDEXED (`+`), so the planner searches `idx_pot_spending` by the
+    // spender. Without it SQLite chose `idx_pot_records_confirmed_height (spentConfirmed=?)` and walked every
+    // unconfirmed pot (loop 44's door answer `maxReads=7895`); the read beside it was planned by the spender.
     let guard = if has("spentConfirmed") {
-        " AND spentConfirmed = 0"
+        " AND +spentConfirmed = 0"
     } else {
         ""
     };
@@ -4808,6 +4811,28 @@ mod tests {
                 .collect();
             assert!(!calls.is_empty(), "{file}: no submit with a report");
             for at in calls {
+                // bsv-low #838: the gated arm's raced write. Done, its report is the route's own (guarded below,
+                // after `match engine_outcome`); past the answer deadline, `finish_past_deadline` guards it
+                let before = &src[at.saturating_sub(120)..at];
+                if file == "routes.rs" && before.contains("Box::pin(async move { write_engine") {
+                    let fin = &src[src.find("async fn finish_past_deadline<").unwrap()..];
+                    let fin = &fin[..fin.find("\n}\n").unwrap()];
+                    assert!(
+                        fin.contains("crate::admit_fast::guard_landed(")
+                            && fin.contains("landed_predecessors"),
+                        "the past-deadline write guards what it landed"
+                    );
+                    let done = &src[src
+                        .find("let (steak, mutation_report) = match engine_outcome {")
+                        .unwrap()..];
+                    let done = &done[..done.len().min(1_500)];
+                    assert!(
+                        done.contains("crate::admit_fast::guard_landed(")
+                            && done.contains("landed_predecessors"),
+                        "the raced write's report is guarded in the request"
+                    );
+                    continue;
+                }
                 let after = &src[at..];
                 let window = &after[..after.len().min(1_500)];
                 assert!(
@@ -5469,9 +5494,11 @@ mod tests {
         }
         let ledger_reason = db
             .conn
-            .query_row("SELECT reason FROM pot_evictions WHERE txid = ?1", [&txid], |r| {
-                r.get::<_, String>(0)
-            })
+            .query_row(
+                "SELECT reason FROM pot_evictions WHERE txid = ?1",
+                [&txid],
+                |r| r.get::<_, String>(0),
+            )
             .optional()
             .unwrap();
         let uncorroborated = db

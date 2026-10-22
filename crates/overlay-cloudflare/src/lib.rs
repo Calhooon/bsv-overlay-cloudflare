@@ -21,6 +21,7 @@ pub mod ban_storage;
 pub mod beef_blob_sweep;
 pub mod broadcaster;
 pub mod chain_tracker;
+pub mod concurrent;
 pub mod change_flush;
 pub mod change_park;
 pub mod d1;
@@ -345,7 +346,9 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
     // DB handle for GET /health/invariants (#192/#193, P4) — the engine build
     // below consumes `db`.
     let ops_db = db.clone();
-    let engine = build_engine_with_storage(
+    // bsv-low #838: shared, so the gated `/submit` can hand a write that outran its answer deadline to
+    // `ctx.wait_until` whole (every other route borrows it as before).
+    let engine = Rc::new(build_engine_with_storage(
         db,
         &env,
         ship_storage.clone(),
@@ -363,7 +366,7 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
         potparty_storage.clone(),
         potrefund_storage.clone(),
         hopparty_storage.clone(),
-    );
+    ));
 
     // Hosting URL for web UI
     let hosting_url = env.var("HOSTING_URL").ok().map(|v| v.to_string());
@@ -385,7 +388,7 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
                 })
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
-            crate::ops::health_invariants(&ops_db, &env, strict).await
+            crate::ops::health_invariants(&ops_db, &env, strict, &ctx).await
         }
         (Method::Get, "/listTopicManagers") => list_topic_managers(&engine).await,
         (Method::Get, "/listLookupServiceProviders") => {
@@ -1820,9 +1823,12 @@ async fn queue_handler(
     use overlay_engine::types::{SubmitMode, TaggedBEEF};
     use worker::MessageExt;
 
-    let engine = build_engine_from_env(&env)
-        .await
-        .map_err(|e| worker::Error::from(format!("Queue engine build failed: {e}")))?;
+    // bsv-low #838: shared, as the request's engine (the deferred job's run takes the gated arm's signature)
+    let engine = Rc::new(
+        build_engine_from_env(&env)
+            .await
+            .map_err(|e| worker::Error::from(format!("Queue engine build failed: {e}")))?,
+    );
 
     // bsv-low #576's lens fold (N4, M1): every message keeps its handle, so nothing is dropped here unseen: a body
     // that does not decode and one whose BEEF is not base64 are handed back like any fault, dead-letter after their
@@ -2412,6 +2418,10 @@ mod beef_door_replay;
 // that reads a D1 export through the Worker's own readers.
 #[cfg(test)]
 mod stored_rows;
+
+// bsv-low #838 (FIX-838-FOLD): the FIX-838 lens's folds, pinned over the shipped sources.
+#[cfg(test)]
+mod fix838_fold;
 
 #[cfg(test)]
 #[path = "../../worker-build-info/src/worker_tests.rs"]

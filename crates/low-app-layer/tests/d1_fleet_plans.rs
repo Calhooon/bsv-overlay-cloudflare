@@ -968,3 +968,84 @@ fn fix831_the_paired_hydration_reads_the_funding_latch_by_key() {
         );
     }
 }
+
+/// bsv-low #838 (FIX-838): the gated door's eviction releases the spend pointers its subject left
+/// (`admit_fast::release_spends_of`). Loop 44's hop sweep 422 answered `maxReads=7895`: the release's UPDATE
+/// was planned on `idx_pot_records_confirmed_height (spentConfirmed=?)`, the index of its CONSTANT term, so it
+/// walked every unconfirmed pot (beta held 7,805 such rows when measured, `rows_read` 7,805 for the predicate;
+/// 0 with the term unindexed). Its SELECT sibling searched `idx_pot_spending` all along. Each statement that
+/// releases or reads a subject's spend pointers searches by the SPENDER, and stays within a per-row bound when run
+/// over the fleet fixture (every pot unconfirmed: beta's shape at its worst).
+#[test]
+fn fix838_the_eviction_release_searches_by_the_spender() {
+    use bsv_overlay_cloudflare::admit_fast::{
+        release_pot_spends_sql, select_pot_spends_sql, ColumnInfo,
+    };
+    use rusqlite::StatementStatus;
+    let db = fixture();
+    let cols: Vec<ColumnInfo> = db
+        .prepare("PRAGMA table_info(pot_records)")
+        .unwrap()
+        .query_map([], |r| {
+            Ok(ColumnInfo {
+                name: r.get(1)?,
+                ty: r.get(2)?,
+                notnull: r.get(3)?,
+                dflt_value: r.get(4)?,
+            })
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let unconfirmed: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM pot_records WHERE spentConfirmed = 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        unconfirmed > 20_000,
+        "the fixture's pots are unconfirmed: {unconfirmed}"
+    );
+    // the spender of fixture hop 3 (`d1_fleet::rows`: hop i spends pot i)
+    let spender = format!("d0{:062x}", 3u32);
+    for (what, sql) in [
+        ("the release", release_pot_spends_sql(&cols)),
+        ("its read", select_pot_spends_sql(&cols)),
+    ] {
+        let detail = plan(&db, &sql);
+        assert!(
+            detail
+                .iter()
+                .any(|d| d.starts_with("SEARCH pot_records USING INDEX idx_pot_spending")),
+            "{what} must search by the spender: {detail:?}"
+        );
+        assert!(
+            !detail
+                .iter()
+                .any(|d| d.contains("idx_pot_records_confirmed_height")
+                    || d.starts_with("SCAN pot_records")),
+            "{what} must never walk the unconfirmed pots: {detail:?}"
+        );
+        db.execute_batch("SAVEPOINT fix838").unwrap();
+        let mut stmt = db.prepare(&sql).unwrap();
+        let mut rows = stmt.query([spender.as_str()]).unwrap();
+        let mut n = 0;
+        while rows.next().unwrap().is_some() {
+            n += 1;
+        }
+        drop(rows);
+        let steps = stmt.get_status(StatementStatus::VmStep);
+        drop(stmt);
+        db.execute_batch("ROLLBACK TO fix838; RELEASE fix838")
+            .unwrap();
+        println!(
+            "fix838 {what}: {n} row(s) back, {steps} VM steps over {unconfirmed} unconfirmed pots"
+        );
+        assert!(
+            steps < 2_000,
+            "{what} runs in steps bounded by the spender's rows, not the fleet's: {steps}"
+        );
+    }
+}
