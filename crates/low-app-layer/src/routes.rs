@@ -3523,6 +3523,9 @@ async fn owed_recompute_inner(
         crate::owed_cursor::party_walk(&selected, OWED_WALK_MAX_PAGES);
     // bsv-low #618 (L2): every page is hydrated first and assembled after the coin words are read (below)
     let mut party_rows = Vec::new();
+    // bsv-low #831: the unspent pots whose funding the hydration found held by nothing (`fundingHeld = 'none'`, read in
+    // the same statement); their funding txids join the coin-word read below, so a CHECKED `mined` word still holds it
+    let mut funding_unheld: HashSet<String> = HashSet::new();
     for page in party_pages {
         let mut result_rows = Vec::new();
         let mut refund_rows = Vec::new();
@@ -3538,6 +3541,14 @@ async fn owed_recompute_inner(
                 .and_then(|r| r.results::<serde_json::Value>())
                 .map_err(|e| format!("owed party hydration: {e}"))?;
             for mut row in rows {
+                if row["fundingHeld"] == crate::owed::FUNDING_HELD_NONE {
+                    if let Some(t) = row["potTxid"]
+                        .as_str()
+                        .filter(|t| crate::logic::valid_txid(t))
+                    {
+                        funding_unheld.insert(t.to_ascii_lowercase());
+                    }
+                }
                 result_rows.push(
                     serde_json::from_value::<ResultsRowD1>(row.clone())
                         .map_err(|e| format!("owed result row: {e}"))?
@@ -3610,7 +3621,8 @@ async fn owed_recompute_inner(
                     .iter()
                     .flatten()
                     .map(|r| r.spending_txid.as_deref()),
-            ),
+            )
+            .chain(funding_unheld.iter().map(|t| Some(t.as_str()))),
     );
     let arm_rows = crate::tracker_host::runtime::read_soft(env, &arm_ids)
         .await
@@ -5042,6 +5054,7 @@ async fn owed_recompute_inner(
                     home_spends: &no_home,
                     retired_spenders: &no_retired,
                     proof_mined_spenders: &proof_mined_spenders,
+                    funding_unheld: &funding_unheld,
                 }));
             durable_unconfirmed
                 .into_iter()
@@ -5125,6 +5138,7 @@ async fn owed_recompute_inner(
         home_spends: &no_home_words,
         retired_spenders: &no_retired,
         proof_mined_spenders: &proof_mined_spenders,
+        funding_unheld: &funding_unheld,
     };
     // 6c. bsv-low #485: the home outputs of the CONFIRMED courier-proven payouts (the candidates are the derivation's
     //     own: `owed::courier_home_outputs`), looked at within a small budget, so such a row can RETIRE on evidence

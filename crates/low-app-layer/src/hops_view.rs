@@ -2887,6 +2887,7 @@ mod tests {
             home_spends: &no_home_words,
             retired_spenders: &none,
             proof_mined_spenders: &none,
+            funding_unheld: &none,
         })
     }
 

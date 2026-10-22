@@ -242,6 +242,7 @@ fn owed(pages: &[Vec<HopsViewRow>], views: &BTreeMap<String, Value>, l2: bool) -
         home_spends: &homes,
         retired_spenders: &none,
         proof_mined_spenders: &none,
+        funding_unheld: &none,
     })
 }
 
