@@ -288,8 +288,10 @@ pub struct RungTally {
     pub ok: u32,
     /// transport / 5xx / 429 / a malformed body
     pub fault: u32,
-    /// not called: the rung's circuit was open
+    /// not called: the rung's circuit was open (or, bsv-low #834, the pass's pacer did not let the ask go)
     pub skipped: u32,
+    /// bsv-low #834: answered "could not look" (pruned Bitails): neither ok nor a fault
+    pub couldnotlook: u32,
 }
 
 /// Consecutive faults that open a rung's circuit for the rest of the tick.
@@ -441,6 +443,16 @@ impl ChainProofFetcher {
             .or_insert(0) += 1;
     }
 
+    /// bsv-low #834: the rung answered a question it cannot answer (pruned Bitails): neither ok nor a fault, and the
+    /// circuit's consecutive count is left where it was.
+    fn rung_could_not_look(&self, name: &'static str) {
+        self.rung_stats
+            .borrow_mut()
+            .entry(name)
+            .or_default()
+            .couldnotlook += 1;
+    }
+
     fn rung_skipped(&self, name: &'static str) {
         self.rung_stats
             .borrow_mut()
@@ -554,10 +566,22 @@ impl ChainProofFetcher {
         arcade_stop: bool,
         exhaustive: &Cell<bool>,
     ) -> Result<Option<String>, String> {
+        let mut unmined_word = false;
         for rung in PROOF_RUNGS {
             let mut probe = ProofProbe::new(rung);
             probe.counters = self.courier_counters.clone();
+            // bsv-low #834: once Arcade has said the subject is held unmined, pruned Bitails cannot look at it (it
+            // does not see the mempool): skipped BY CONSTRUCTION, counted `skipped`; WoC's node still asks.
+            if rung == "bitails" && unmined_word && !self.bitails_base.is_empty() {
+                probe.parse_result = diagnostics::SKIPPED_UNMINED_RESULT;
+                if let Some(c) = &self.courier_counters {
+                    c.note_skip(rung);
+                }
+                self.note_proof_probe(&probe).await;
+                continue;
+            }
             self.diagnose_rung_into(&mut probe, txid).await;
+            unmined_word |= probe.unmined;
             self.note_proof_probe(&probe).await;
             if let Some(RungStep::Abort(error)) = &probe.step {
                 return Err(error.clone());
@@ -867,6 +891,9 @@ impl ChainProofFetcher {
     ) -> RungCall<T> {
         if self.rung_is_open(name) {
             self.rung_skipped(name);
+            if let Some(c) = &self.courier_counters {
+                c.note_skip(name);
+            }
             return RungCall::Fault(format!(
                 "{name}: circuit open ({RUNG_CIRCUIT_TRIP} consecutive faults this tick)"
             ));
@@ -882,6 +909,13 @@ impl ChainProofFetcher {
         let (response, mut observation) =
             http_get_counted(url, hdr, self.courier_counters.as_ref(), name).await;
         match response {
+            // bsv-low #834: the pass's pacer did not let the ask go: no subrequest, so no fault, no circuit step and
+            // no unit of this fetcher's budget; the ladder's next rung takes the ask.
+            Err(e) if is_paced_skip(&e) => {
+                self.budget.set(self.budget.get() + 1);
+                self.rung_skipped(name);
+                RungCall::Fault(format!("{name}: {e}"))
+            }
             Err(e) => {
                 CourierAttempt::set(&mut observation, CourierOutcome::Fault);
                 self.rung_fault(name);
@@ -889,14 +923,25 @@ impl ChainProofFetcher {
             }
             Ok((status, body)) => {
                 let answer = parse(status, &body);
-                let outcome = match &answer {
-                    Err(e) if e == BITAILS_PRUNED_NO_SPEND => CourierOutcome::NotFound,
-                    _ => CourierOutcome::response(
-                        status,
-                        answer.is_ok(),
-                        answer.as_ref().is_ok_and(Option::is_some),
-                    ),
-                };
+                // bsv-low #834: pruned Bitails cannot answer a per-output spend question it keeps no data for (its
+                // `spent: ""`) nor any question about a tx it 404s (an unmined one: it does not see the mempool).
+                // That is "could not look": not a fault, not a clean negative, no circuit step, counted apart.
+                if bitails_could_not_look(name, status, &answer) {
+                    CourierAttempt::set(&mut observation, CourierOutcome::CouldNotLook);
+                    self.rung_could_not_look(name);
+                    if let Some(c) = &self.courier_counters {
+                        c.could_not_look(name);
+                    }
+                    return RungCall::Fault(format!("{name}: could not look ({})", match &answer {
+                        Err(e) => e.as_str(),
+                        Ok(_) => "HTTP 404: pruned Bitails does not hold the tx",
+                    }));
+                }
+                let outcome = CourierOutcome::response(
+                    status,
+                    answer.is_ok(),
+                    answer.as_ref().is_ok_and(Option::is_some),
+                );
                 CourierAttempt::set(&mut observation, outcome);
                 match answer {
                     Ok(answer) => {
@@ -911,6 +956,18 @@ impl ChainProofFetcher {
             }
         }
     }
+}
+
+/// PURE (bsv-low #834): is this Bitails spend answer "could not look"? The pruned node's `spent: ""` for an output
+/// it keeps no spend data for, and its 404 for a tx it does not hold (an unmined one). Only the per-output spend
+/// rung (`bitails_tx`); the history rung's answers are its own.
+pub(crate) fn bitails_could_not_look<T>(rung: &str, status: u16, answer: &Result<Option<T>, String>) -> bool {
+    rung == "bitails_tx"
+        && match answer {
+            Err(e) => e == BITAILS_PRUNED_NO_SPEND,
+            Ok(None) => matches!(status, 404 | 410),
+            Ok(Some(_)) => false,
+        }
 }
 
 /// A clean "no spender" needs this many INDEPENDENT indexes to say so — the
@@ -1489,6 +1546,10 @@ async fn http_get_counted(
     counters: Option<&CourierCounters>,
     rung: &str,
 ) -> (Result<(u16, String), String>, Option<CourierAttempt>) {
+    // bsv-low #834: a paced pass (the janitor's) asks its pacer first; a skip is no subrequest and no attempt.
+    if let Some(Err(skip)) = counters.map(|c| c.pace(rung)) {
+        return (Err(format!("{PACED_SKIP} ({} {})", crate::courier_counters::provider(rung), skip.name())), None);
+    }
     if let Err(error) = overlay_engine::meter::courier_request() {
         return (Err(error.to_string()), None);
     }
@@ -1503,7 +1564,18 @@ async fn http_get_counted(
     } else {
         http_get_inner(url, header).await
     };
+    if let Some(c) = counters {
+        c.pace_result(rung, response.as_ref().ok().map(|(status, _)| *status));
+    }
     (response, observation)
+}
+
+/// bsv-low #834: the error a paced pass's skipped ask answers with (no subrequest was made).
+pub(crate) const PACED_SKIP: &str = "paced: not asked";
+
+/// PURE (bsv-low #834): is this courier error a paced skip (not a fault)?
+pub(crate) fn is_paced_skip(error: &str) -> bool {
+    error.starts_with(PACED_SKIP)
 }
 
 thread_local! {
