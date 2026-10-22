@@ -1429,6 +1429,79 @@ mod fix838 {
         let send = &me[me.find("async fn send_job(").unwrap()..];
         assert!(send[..send.find("\n}\n").unwrap()].contains(".delay_seconds(secs)"));
     }
+
+    /// The FIX-838 lens's MEDIUM-1, driven: a past-deadline write's report takes S2's decision as the request takes
+    /// it. A durable report enqueues nothing; a report with a fault (a real `MutationReport`, an insert that
+    /// faulted) enqueues its replay exactly once and is `Queued`; a queue that refuses is `Refused` with its words
+    /// (the deferred job then the cover). A write the platform cuts has no report and reaches no decision: the job
+    /// put at rest before the 202 is its replay.
+    #[test]
+    fn fix838f_m1_a_past_deadline_report_that_is_not_durable_is_enqueued() {
+        use crate::queue::MutationAck;
+        let durable = overlay_engine::engine::MutationReport::default();
+        let faulted = overlay_engine::engine::MutationReport {
+            faults: vec![overlay_engine::engine::MutationFault {
+                topic: "tm_pot".into(),
+                site: "insert_output",
+                error: "D1_ERROR: the queue".into(),
+            }],
+            ..Default::default()
+        };
+        let sent = Cell::new(0u32);
+        let enqueue = |answer: Result<(), String>| {
+            let sent = &sent;
+            move || {
+                sent.set(sent.get() + 1);
+                std::future::ready(answer)
+            }
+        };
+        let clock = Rc::new(Cell::new(0));
+        let (ack, _) = drive(
+            &clock,
+            past_deadline_ack(durable.is_durable(), enqueue(Ok(()))),
+        );
+        assert_eq!(
+            (ack, sent.get()),
+            (MutationAck::Durable, 0),
+            "a durable write enqueues nothing"
+        );
+        let (ack, _) = drive(
+            &clock,
+            past_deadline_ack(faulted.is_durable(), enqueue(Ok(()))),
+        );
+        assert_eq!(
+            (ack, sent.get()),
+            (MutationAck::Queued, 1),
+            "a faulted write is enqueued once"
+        );
+        let (ack, _) = drive(
+            &clock,
+            past_deadline_ack(
+                faulted.is_durable(),
+                enqueue(Err("MUTATION_QUEUE down".into())),
+            ),
+        );
+        assert_eq!(
+            (ack, sent.get()),
+            (MutationAck::Refused("MUTATION_QUEUE down".into()), 2)
+        );
+        // the request's own derivation, the same answers (ONE derivation)
+        assert_eq!(
+            crate::queue::mutation_ack(false, Some(Ok(()))),
+            MutationAck::Queued
+        );
+    }
+
+    /// The FIX-838 lens's LOW-3, driven: each deferral names its cause in its line.
+    #[test]
+    fn fix838f_l3_each_deferral_names_its_cause() {
+        assert_eq!(DeferralCause::EfWork.word(), "ef-work");
+        assert_eq!(DeferralCause::AnswerDeadline.word(), "answer-deadline");
+        assert_eq!(
+            crate::ops::COUNTER_SUBMIT_DEFERRED_PAST_DEADLINE,
+            "submit_deferred_past_deadline_total"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -2403,6 +2403,10 @@ mod beef_door_replay;
 #[cfg(test)]
 mod stored_rows;
 
+// bsv-low #838 (FIX-838-FOLD): the FIX-838 lens's folds, pinned over the shipped sources.
+#[cfg(test)]
+mod fix838_fold;
+
 #[cfg(test)]
 #[path = "../../worker-build-info/src/worker_tests.rs"]
 mod build_info_tests;
