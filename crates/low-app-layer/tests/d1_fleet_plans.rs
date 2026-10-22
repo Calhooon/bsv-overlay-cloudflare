@@ -119,6 +119,11 @@ fn hot_routes_never_scan_fleet_tables() {
             "owed recompute backups",
             low_app_layer::owed::valid_refunds_sql(16),
         ),
+        // bsv-low #831: the paired hydration carries the funding latch's two PK probes (`fundingHeld`)
+        (
+            "owed recompute paired hydration",
+            low_app_layer::owed_cursor::hydrate_party_pair_sql(),
+        ),
         // bsv-low #642: every statement `/leaderboard:view` runs, at the chunk bound.
         (
             "/leaderboard:view candidates",
@@ -259,6 +264,8 @@ fn hot_routes_never_scan_fleet_tables() {
                     "proof_markers",
                     "pot_beefs",
                     "network_seen",
+                    "fs",
+                    "fb",
                     "hop_pot_links",
                     "pot_hop_seats",
                     "board_wins",
@@ -812,4 +819,96 @@ fn the_board_table_read_and_its_triggers_never_scan() {
         failures.push(format!("ready: the board_era row by its key: {p:?}"));
     }
     assert!(failures.is_empty(), "board plans:\n{}", failures.join("\n"));
+}
+
+/// bsv-low #831: the paired hydration's `fundingHeld` names an UNSPENT pot's funding as `seen` (the pot txid's own
+/// `network_seen` latch), `proof` (a verified `pot_beefs` proof of it) or `none`, and is NULL for a spent pot; both
+/// probes are primary-key searches inside the one statement (no new statement, no scan).
+#[test]
+fn fix831_the_paired_hydration_reads_the_funding_latch_by_key() {
+    let db = Connection::open_in_memory().unwrap();
+    for sql in OVERLAY_MIGRATIONS {
+        if let Err(e) = db.execute_batch(sql) {
+            assert!(e.to_string().contains("duplicate column"), "{e}: {sql}");
+        }
+    }
+    let t = |b: char| b.to_string().repeat(64);
+    let (seen, proof, none, spent, unproven) = (t('a'), t('b'), t('c'), t('d'), t('e'));
+    for (txid, spent_flag) in [
+        (&seen, 0),
+        (&proof, 0),
+        (&none, 0),
+        (&spent, 1),
+        (&unproven, 0),
+    ] {
+        db.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, 0, ?2, 1790000000)",
+            rusqlite::params![txid, spent_flag],
+        )
+        .unwrap();
+    }
+    db.execute("INSERT INTO network_seen (txid) VALUES (?1)", [&seen])
+        .unwrap();
+    db.execute("INSERT INTO network_seen (txid) VALUES (?1)", [&spent])
+        .unwrap();
+    db.execute(
+        "INSERT INTO pot_beefs (txid, beef, proof_verified) VALUES (?1, x'00', 1)",
+        [&proof],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO pot_beefs (txid, beef, proof_verified) VALUES (?1, x'00', 0)",
+        [&unproven],
+    )
+    .unwrap();
+    let page: Vec<serde_json::Value> = [&seen, &proof, &none, &spent, &unproven]
+        .iter()
+        .enumerate()
+        .map(|(i, txid)| {
+            serde_json::json!({"identity": d1_fleet::WHALE, "gameId": t('f'), "potTxid": txid, "potVout": 0,
+                "createdAt": 1790000000, "markerRowid": i, "tier": 0, "potBestSigRank": 2, "finalRank": i + 1})
+        })
+        .collect();
+    let sql = low_app_layer::owed_cursor::hydrate_party_pair_sql();
+    let mut stmt = db.prepare(&sql).unwrap();
+    let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let at = names
+        .iter()
+        .position(|n| n == "fundingHeld")
+        .expect("fundingHeld column");
+    let tx_at = names.iter().position(|n| n == "potTxid").unwrap();
+    let got: std::collections::BTreeMap<String, Option<String>> = stmt
+        .query_map([serde_json::to_string(&page).unwrap()], |r| {
+            Ok((r.get::<_, String>(tx_at)?, r.get::<_, Option<String>>(at)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(got[&seen].as_deref(), Some("seen"));
+    assert_eq!(got[&proof].as_deref(), Some("proof"));
+    assert_eq!(
+        got[&none].as_deref(),
+        Some(low_app_layer::owed::FUNDING_HELD_NONE)
+    );
+    assert_eq!(
+        got[&unproven].as_deref(),
+        Some("none"),
+        "an unverified proof row holds nothing"
+    );
+    assert_eq!(got[&spent], None, "a spent pot is not probed");
+    let details = plan(&db, &sql);
+    for alias in ["fs", "fb"] {
+        assert!(
+            details
+                .iter()
+                .any(|d| d.starts_with(&format!("SEARCH {alias} USING")) && d.contains("INDEX")),
+            "the {alias} probe is a key search: {details:?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|d| d.starts_with(&format!("SCAN {alias}"))),
+            "the {alias} probe never scans: {details:?}"
+        );
+    }
 }

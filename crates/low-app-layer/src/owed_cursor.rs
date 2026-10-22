@@ -471,8 +471,15 @@ pub fn initial_party_sql() -> String {
 
 /// Results and refund projections share one bounded spine read, with separate
 /// proof joins so each production mapper still receives its original proof flag.
+///
+/// bsv-low #831: `fundingHeld` says whether an UNSPENT pot's own funding is held: `seen` (the `network_seen` latch on
+/// the pot txid), else `proof` (a verified index proof, `pot_beefs.proof_verified`), else `none`; NULL for a spent
+/// pot. Each probe is a primary-key read inside this statement, made only for an unspent pot (the CASE gates it) and
+/// the proof probe only when the latch is absent: no new statement, no scan.
+pub const FUNDING_HELD_COLUMN: &str = "CASE WHEN w.spent = 0 THEN CASE WHEN EXISTS(SELECT 1 FROM network_seen fs WHERE fs.txid=lower(w.potTxid)) THEN 'seen' WHEN EXISTS(SELECT 1 FROM pot_beefs fb WHERE fb.txid=lower(w.potTxid) AND fb.proof_verified = 1) THEN 'proof' ELSE 'none' END END AS fundingHeld";
+
 pub fn hydrate_party_pair_sql() -> String {
     let sql = hydrate_sql(&crate::results::results_sql(None, 0));
-    sql.replacen("FROM (SELECT",", w.potCreatedAt AS potAdmittedAt, w.markerCreatedAt AS firstPartyMarkerAt, w.firstSpentAt AS firstSpentAt, EXISTS(SELECT 1 FROM potrefund_records pr WHERE pr.potTxid=w.potTxid AND pr.potVout=w.potVout) AS backupMarkerPresent, refund_sb.proof_verified AS refundSpenderProofVerified FROM (SELECT",1)
+    sql.replacen("FROM (SELECT",&format!(", w.potCreatedAt AS potAdmittedAt, w.markerCreatedAt AS firstPartyMarkerAt, w.firstSpentAt AS firstSpentAt, EXISTS(SELECT 1 FROM potrefund_records pr WHERE pr.potTxid=w.potTxid AND pr.potVout=w.potVout) AS backupMarkerPresent, refund_sb.proof_verified AS refundSpenderProofVerified, {FUNDING_HELD_COLUMN} FROM (SELECT"),1)
         .replace("LEFT JOIN network_seen ns", "LEFT JOIN pot_beefs refund_sb ON w.spendingTxid IS NOT NULL AND refund_sb.txid=lower(w.spendingTxid) LEFT JOIN network_seen ns")
 }

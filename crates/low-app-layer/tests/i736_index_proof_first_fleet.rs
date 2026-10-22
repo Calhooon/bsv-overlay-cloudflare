@@ -296,6 +296,7 @@ fn owed(
         home_spends: &homes,
         retired_spenders: &none,
         proof_mined_spenders: &none,
+        funding_unheld: &none,
     })
 }
 
