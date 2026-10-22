@@ -225,7 +225,12 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // Give stored proof completion its own early slot. Held GASP graphs are
     // not admitted transactions: their roots use hydrate_root during sync.
     // A timeout stamps no success heartbeat; the next tick retries the rows.
-    let courier_counts = crate::courier_counters::Counters::new(crate::courier_counters::Reader::Janitor);
+    // bsv-low #834: the janitor's courier asks are PACED over every fetcher of the pass (one budget per provider,
+    // a back-off at its third 429/5xx/transport fault, a cool-down across passes in this isolate).
+    let courier_counts = crate::courier_counters::Counters::paced(
+        crate::courier_counters::Reader::Janitor,
+        worker::Date::now().as_millis(),
+    );
     let completion_fetcher = transaction_proof_fetcher(env).with_courier_counters(courier_counts.clone());
     let backstop_age = crate::proof_fetcher::PUSH_BACKSTOP_MIN_AGE_SECS;
     crate::d1_ledger::label("tx_completion");
@@ -652,6 +657,11 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // 2026-09-04: each rung's ok/fault/skipped this tick → the lifetime
     // `courier_<rung>_*_total` counters (`/health/invariants`, the monitor).
     crate::ops::record_courier_tallies(&ops_db, &discovery_fetcher.rung_stats()).await;
+    worker::console_log!(
+        "Scheduled: courier pacing ; asks={} providers={}",
+        courier_counts.paced_asks(),
+        courier_counts.pacing_view()
+    );
     courier_counts.flush(&ops_db).await;
     // 2026-09-04: the pass's lifetime counters ride `/health/invariants`
     // (`counters.missing_spend_*`) so the backlog's drain, the couriers'

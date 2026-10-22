@@ -1,0 +1,16 @@
+{
+  "doc": "bsv-low #834 (FIX-834): the courier subrequests of the index janitor's pass (POST /admin/complete-proofs, the tick's run_pot_maintenance on paced counters) over 40 proofless pot BEEFs with the couriers sunk to a loopback stand-in that answers WoC 429 and every other courier 404 (tools/lane-834/janitor_pacing_budget_ci.mjs, make ci-d1-budget). total = every GET the stand-in saw; paced = the pass's own count of the asks its pacer let go. WoC is bounded by the back-off (3), Bitails by its could-not-look cap (3), Arcade by the fixture's 40 candidates (one ask each); total is the measured figure plus 2 for the retire and conflict passes' unpaced reads. Raise one only with a new measurement and its reason. Unpaced (00a5e613) the same pass asks every rung on every candidate: 40 + 40 + 40 = 120 by the ladder's shape (reasoned, not run in the tier).",
+  "measured_at": "2026-10-22T21:39Z, lane/FIX-834 on 00a5e613, wrangler 4.54.0, node v20.19.5: pass 1 total 46 (arcade 40, bitails 3, woc 3); pass 2 total 43 (woc 0, inside the cool-down); re-run 2026-10-22T22:38Z at LANE_BASE 37834 (FIX-834-FINISH), the same figures",
+  "scenarios": {
+    "janitor-pass-woc-429": {
+      "route": "POST /admin/complete-proofs, the first pass over 40 proofless pot BEEFs, WoC answering 429",
+      "measured": { "total": 46, "paced": 46, "arcade": 40, "bitails": 3, "woc": 3, "bananablocks": 0 },
+      "ceiling": { "total": 48, "paced": 46, "arcade": 40, "bitails": 3, "woc": 3, "bananablocks": 0 }
+    },
+    "janitor-pass-woc-cooled": {
+      "route": "POST /admin/complete-proofs, the next pass inside WoC's 1200 s cool-down",
+      "measured": { "total": 43, "paced": 43, "arcade": 40, "bitails": 3, "woc": 0, "bananablocks": 0 },
+      "ceiling": { "total": 45, "paced": 43, "arcade": 40, "bitails": 3, "woc": 0, "bananablocks": 0 }
+    }
+  }
+}

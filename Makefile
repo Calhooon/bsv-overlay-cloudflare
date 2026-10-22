@@ -614,12 +614,13 @@ ci-d1-budget:
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PD/listTopicManagers "$$dv_log" "delivering overlay"; \
 	tap $$ID delivering-overlay; \
-	echo "→ starting wrangler dev :$$PR (the retire overlay of the #831 cell, its couriers sunk to the cell's 404 stand-in on :$$PS)…"; \
+	echo "→ starting wrangler dev :$$PR (the retire overlay of the #831 and #834 cells, its couriers sunk to each cell's stand-in on :$$PS)…"; \
 	( cd crates/overlay-cloudflare && exec env $$seal npx wrangler dev --local --log-level debug --port $$PR --inspector-port $$IR --ip 127.0.0.1 --persist-to "$$rv_state" \
-	    --var ARCADE_URL:http://127.0.0.1:$$PS \
+	    --var ARCADE_URL:http://127.0.0.1:$$PS/arcade \
 	    --var COURIER_SINK:http://127.0.0.1:$$PS \
 	    --var PROOF_SOURCES:arcade,woc,bitails \
 	    --var INTERNAL_TOKEN:ci-internal-tok \
+	    --var ADMIN_TOKEN:ci-admin-tok \
 	    --var MAINNET_FANOUT:false \
 	) > "$$rv_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
@@ -638,6 +639,7 @@ ci-d1-budget:
 	node tools/lane-e649/change_park_budget_ci.mjs http://127.0.0.1:$$PO "$$ov_state" http://127.0.0.1:$$PD "$$dv_state" $$PM; \
 	node tools/lane-831/retire_pass_budget_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
 	node tools/lane-837/join_hop_pass_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
+	node tools/lane-834/janitor_pacing_budget_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
 	guard_ran=1; \
 	node tools/lane-731/egress_guard.mjs "app-layer=$$app_log" "overlay=$$ov_log" "delivering-overlay=$$dv_log" "retire-overlay=$$rv_log"
 
