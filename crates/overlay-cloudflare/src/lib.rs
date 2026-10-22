@@ -1490,7 +1490,12 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
     };
     // 1. Transactions store (engine + ancestor fetcher). Submitted rows give
     //    /arc-ingest its callback window; GASP rows have no callback to await.
-    let courier_counts = crate::courier_counters::Counters::new(crate::courier_counters::Reader::Janitor);
+    // bsv-low #834: the janitor's courier asks are PACED over every fetcher of the pass (one budget per provider,
+    // a back-off at its third 429/5xx/transport fault, a cool-down across passes in this isolate).
+    let courier_counts = crate::courier_counters::Counters::paced(
+        crate::courier_counters::Reader::Janitor,
+        worker::Date::now().as_millis(),
+    );
     let completion_fetcher = transaction_proof_fetcher(env).with_courier_counters(courier_counts.clone());
     let backstop_age = crate::proof_fetcher::PUSH_BACKSTOP_MIN_AGE_SECS;
     let (tx_completed, tx_fetch_failed, tx_early_gasp) =
@@ -1734,6 +1739,12 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
     // bsv-low #649 D3-H1: the shared parked drain's pass (`null`: no app layer configured, nothing read); set apart
     // from the literal above, which sits at `json!`'s recursion limit.
     answer["change_parked"] = change_parked.unwrap_or(serde_json::Value::Null);
+    // bsv-low #834: the pass's courier pacing (per provider: asked, skipped, budget left, backed off, cool-down) and
+    // its courier subrequests, the figures the budget tier's janitor cell reads.
+    answer["courier_pacing"] = serde_json::json!({
+        "asks": courier_counts.paced_asks(),
+        "providers": courier_counts.pacing_view(),
+    });
     // The courier counters ride the answer's `wait_until`, as the door's do: no D1 batch on the answer path.
     ctx.wait_until(async move { courier_counts.flush(&ops_db).await });
     Response::from_json(&answer)

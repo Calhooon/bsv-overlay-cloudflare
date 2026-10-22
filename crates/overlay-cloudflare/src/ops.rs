@@ -633,7 +633,12 @@ pub async fn record_courier_tallies(
     stats: &std::collections::BTreeMap<&'static str, crate::proof_fetcher::RungTally>,
 ) {
     for (rung, t) in stats {
-        for (kind, delta) in [("ok", t.ok), ("fault", t.fault), ("skipped", t.skipped)] {
+        for (kind, delta) in [
+            ("ok", t.ok),
+            ("fault", t.fault),
+            ("skipped", t.skipped),
+            ("couldnotlook", t.couldnotlook),
+        ] {
             if delta > 0 {
                 bump_counter(db, &courier_counter_name(rung, kind), u64::from(delta)).await;
             }
@@ -658,6 +663,48 @@ pub fn couriers_view(counters: &serde_json::Value) -> serde_json::Value {
         );
     }
     serde_json::Value::Object(out)
+}
+
+/// PURE (bsv-low #834): the janitor's courier pacing on the health surface, per third-party provider and Arcade,
+/// from the `courier_janitor_*` rows (absent = 0): `asks` (`ok + notfound + fault + shape`, the asks the rung could
+/// answer, exactly the fleet cell's denominator), `faults` (`fault + shape`, its numerator), `couldNotLook` (pruned
+/// Bitails' non-answers, outside both), `skipped` (not asked: the pacer or by construction), `backoffs`, and
+/// `faultRate` = faults / asks (`null` with no ask), so the cell's threshold compares like with like; and the
+/// pacing's bounds.
+pub fn courier_pacing_view(counters: &serde_json::Value) -> serde_json::Value {
+    let get = |name: String| {
+        counters
+            .get(&name)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let mut providers = serde_json::Map::new();
+    for provider in ["woc", "bananablocks", "bitails", "arcade"] {
+        let c = |o: &str| get(format!("courier_janitor_{provider}_{o}_total"));
+        let asks = c("ok") + c("notfound") + c("fault") + c("shape");
+        let faults = c("fault") + c("shape");
+        providers.insert(
+            provider.to_string(),
+            json!({
+                "asks": asks,
+                "faults": faults,
+                "couldNotLook": c("couldnotlook"),
+                "skipped": c("skipped"),
+                "backoffs": get(crate::courier_counters::backoff_name(provider)),
+                "faultRate": if asks == 0 { serde_json::Value::Null } else { json!(faults as f64 / asks as f64) },
+            }),
+        );
+    }
+    let budget: serde_json::Map<String, serde_json::Value> = crate::courier_counters::COURIER_TICK_BUDGET
+        .iter()
+        .map(|(p, b)| ((*p).to_string(), json!(b)))
+        .collect();
+    json!({
+        "providers": providers,
+        "budgetPerTick": budget,
+        "backoffAfterFaults": crate::courier_counters::COURIER_BACKOFF_FAULTS,
+        "cooldownSecs": crate::courier_counters::COURIER_COOLDOWN_MS / 1000,
+    })
 }
 
 /// bsv-low #668 (the observability bar): a histogram quantile over `(upper_bound_ms, count)` buckets sorted
@@ -1857,6 +1904,8 @@ pub async fn health_invariants(
     let mut index_janitor = index_janitor;
     // 2026-09-04: the courier rungs' lifetime ok/fault/skipped, at a glance.
     index_janitor["couriers"] = couriers_view(&counters);
+    // bsv-low #834: the janitor's pacing and its answerable fault rate, beside the raw counts.
+    index_janitor["courierPacing"] = courier_pacing_view(&counters);
     // bsv-low #668: computed before `counters` is moved into the body; assigned after (the big `json!` is at the
     // macro recursion limit). A UX/observability figure; the money never rests on this push.
     let pots_push = pots_push_view(&counters);
