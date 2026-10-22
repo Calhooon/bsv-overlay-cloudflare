@@ -56,6 +56,11 @@ pub enum CallbackAction {
     EvidenceCheck(String),
     /// A lifecycle status below SEEN (RECEIVED, STORED, ANNOUNCED …): nothing to do.
     Ignore,
+    /// bsv-low #836: a REJECTED whose `extraInfo` names TX_LOCK_TIME (35) ([`crate::door_words::lock_time_not_final`]):
+    /// held, not final. No evidence check, no eviction: a non-final transaction cannot be held by any node yet, so
+    /// its absence proves nothing. Counted (`arc_ingest_lock_time_not_final_total`). A planted text can only delay
+    /// this push's check (the fail-safe direction); Arcade's own later pushes and the passes still read it live.
+    HoldNotFinal(String),
 }
 
 /// P0-2d (bsv-stack-lean #52): through the one reading of Arcade's words
@@ -68,6 +73,15 @@ pub enum CallbackAction {
 /// host's policy over it (`door_words::callback`).
 pub fn callback_action(tx_status: &str) -> CallbackAction {
     crate::door_words::callback(crate::door_words::arcade_hint(tx_status, "", 0).as_ref())
+}
+
+/// bsv-low #836: [`callback_action`] over the push's `extraInfo` too: a REJECTED that names TX_LOCK_TIME (35) is
+/// [`CallbackAction::HoldNotFinal`], never an evidence check; every other push reads exactly as [`callback_action`].
+pub fn callback_action_with(tx_status: &str, extra_info: &str) -> CallbackAction {
+    match crate::door_words::lock_time_not_final(tx_status, extra_info) {
+        Some(_) => CallbackAction::HoldNotFinal(tx_status.trim().to_ascii_uppercase()),
+        None => callback_action(tx_status),
+    }
 }
 
 /// The tables a txid can own rows in, and the columns that key them.
@@ -2031,6 +2045,30 @@ pub(crate) fn refusal_rests_on_absence(arcade: &crate::proof_fetcher::ArcadeLook
     )
 }
 
+/// bsv-low #845: the evidence check's word when Arcade holds the txid below SEEN (RECEIVED, SENT_TO_NETWORK,
+/// ACCEPTED_BY_NETWORK: [`ArcadeLook::Holding`]) and no indexer holds it: a hint that promotes nothing.
+///
+/// [`ArcadeLook::Holding`]: crate::proof_fetcher::ArcadeLook::Holding
+pub const HOLDING_UNCERTAIN_REASON: &str =
+    "arcade holds it below SEEN (a hint that promotes nothing): neither presence nor a refusal; both indexers absent";
+
+/// bsv-low #836: the evidence check's word on Arcade's non-final REJECTED (TX_LOCK_TIME (35)) with no indexer
+/// holding the txid: "not now", never a refusal; the peer's height, when the text names it, rides as a hint.
+pub fn not_final_uncertain_reason(status: &str, extra_info: &str) -> String {
+    let nf = crate::door_words::lock_time_not_final(status, extra_info);
+    let heights = match nf.as_ref() {
+        Some(n) => format!(
+            " (lock height {}, Arcade's peer at {})",
+            n.lock_height.map_or("?".into(), |h| h.to_string()),
+            n.peer_height.map_or("?".into(), |h| h.to_string())
+        ),
+        None => String::new(),
+    };
+    format!(
+        "arcade {status} TX_LOCK_TIME: not final against Arcade's peer's chain view{heights}, a time, never a verdict; held, not final; both indexers absent"
+    )
+}
+
 /// PURE: fold the three couriers' words (pinned). `young`: the admission is younger than
 /// `REFUSAL_ABSENT_MIN_AGE_MS`, or the index holds no admission at all.
 pub fn evidence_verdict(
@@ -2042,6 +2080,18 @@ pub fn evidence_verdict(
     use crate::proof_fetcher::{ArcadeLook, NetworkPresence};
     match arcade {
         ArcadeLook::Present => EvidenceVerdict::Present,
+        // bsv-low #836: Arcade's non-final word, live or recorded, is a time, never a refusal: only the indexers'
+        // presence speaks, and nothing is refused.
+        ArcadeLook::NotFinal(status, extra) => {
+            never_refused(bitails, woc, not_final_uncertain_reason(status, extra))
+        }
+        ArcadeLook::Recorded(status, extra)
+            if crate::door_words::lock_time_not_final(status, extra).is_some() =>
+        {
+            never_refused(bitails, woc, not_final_uncertain_reason(status, extra))
+        }
+        // bsv-low #845: Arcade's rank below SEEN is a hint that promotes nothing: never presence, never a refusal.
+        ArcadeLook::Holding(_) => never_refused(bitails, woc, HOLDING_UNCERTAIN_REASON.to_string()),
         // A refusal needs TWO sources: Arcade's live word (fatal, or not
         // holding it) AND both indexers' definitive absence. One broadcaster's
         // REJECTED is never the network's verdict (#214: Arcade held txs
@@ -2076,6 +2126,22 @@ pub fn evidence_verdict(
                     EvidenceVerdict::Uncertain("a courier faulted".to_string())
                 }
             }
+        }
+    }
+}
+
+/// PURE (bsv-low #836, #845): the verdict on a look that refuses nothing: an indexer that holds the txid is
+/// presence; otherwise `Uncertain` (`why`, or a courier fault), never `Refused`.
+fn never_refused(bitails: Option<bool>, woc: Option<bool>, why: String) -> EvidenceVerdict {
+    use crate::proof_fetcher::NetworkPresence;
+    match crate::proof_fetcher::classify_presence(
+        bitails.map(crate::proof_fetcher::bool_presence),
+        woc.map(crate::proof_fetcher::bool_presence),
+    ) {
+        NetworkPresence::Present { .. } => EvidenceVerdict::Present,
+        NetworkPresence::Absent => EvidenceVerdict::Uncertain(why),
+        NetworkPresence::Inconclusive => {
+            EvidenceVerdict::Uncertain("a courier faulted".to_string())
         }
     }
 }
@@ -2425,6 +2491,8 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
     let arcade = crate::broadcaster::ArcadeBroadcaster::new(env.arcade_base.clone())
         .with_proof_sources(crate::proof_fetcher::ProofSources::from_env(&env.env));
     let mut last = crate::broadcaster::WitnessLook::Unknown;
+    // bsv-low #836: a non-final look is counted once a watch
+    let mut not_final_counted = false;
     for sleep in PENDING_WATCH_SLEEPS_MS {
         crate::broadcaster::sleep_ms(sleep).await;
         last = arcade.witness_look(&txid).await;
@@ -2506,6 +2574,21 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
             crate::broadcaster::WitnessLook::Orphan(_)
             | crate::broadcaster::WitnessLook::Pending(_)
             | crate::broadcaster::WitnessLook::Unknown => {}
+            // bsv-low #836: Arcade's non-final REJECTED (TX_LOCK_TIME (35)): held, not final. No evidence check,
+            // no eviction; the watch keeps looking (a later look may be SEEN) and ends with the subject unlatched;
+            // the callbacks and the passes re-look after the lock height passes.
+            crate::broadcaster::WitnessLook::NotFinal(status, nf) => {
+                if !not_final_counted {
+                    not_final_counted = true;
+                    crate::ops::bump_counter(
+                        &db,
+                        crate::ops::COUNTER_SUBMIT_PENDING_LOCK_TIME_NOT_FINAL,
+                        1,
+                    )
+                    .await;
+                    worker::console_log!("{}", watch_not_final_line(&txid, status, nf));
+                }
+            }
         }
     }
     // fleet loop 15 (2026-09-20, pair 1's refund): a spend that MINED before this index ever saw it — the tower
@@ -2577,6 +2660,22 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
             );
         }
     }
+}
+
+/// PURE (bsv-low #836): the pending watch's line for a non-final look: the word, the lock height and Arcade's
+/// PEER's height (a hint beside the word, never a gate input), Arcade's text scrubbed as #519 does.
+pub(crate) fn watch_not_final_line(
+    txid: &str,
+    status: &str,
+    nf: &crate::door_words::NotFinal,
+) -> String {
+    let height = |h: Option<u64>| h.map_or("?".to_string(), |h| h.to_string());
+    format!(
+        "[admit-fast] {txid} {status} TX_LOCK_TIME (lock height {}, Arcade's peer at {}): held, not final: no evidence check, no eviction; the watch keeps looking ({})",
+        height(nf.lock_height),
+        height(nf.peer_height),
+        nf.reason
+    )
 }
 
 /// bsv-low #822: the counter the pending watch's END bumps for a subject it neither latched nor confirmed. `latched`
@@ -3373,8 +3472,9 @@ mod tests {
         let status_arm = f
             .find("ArcIngestBody::StatusOnly {")
             .expect("the status-only arm");
+        // bsv-low #836: the decision reads the push's extraInfo for the non-final word alone
         let action = f
-            .find("crate::admit_fast::callback_action(&tx_status)")
+            .find("crate::admit_fast::callback_action_with(")
             .expect("the decision");
         let witness = f
             .find("crate::admit_fast::witness_job(")

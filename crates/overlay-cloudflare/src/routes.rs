@@ -2950,7 +2950,11 @@ pub async fn arc_ingest(
             // orphan verdict is corroborated (Arcade live first, then both
             // indexers) in the post-response budget and evicts only then.
             let af_now = worker::Date::now().as_millis();
-            match crate::admit_fast::callback_action(&tx_status) {
+            // bsv-low #836: the push's extraInfo is read for one word only, a non-final REJECTED: held, never a check
+            match crate::admit_fast::callback_action_with(
+                &tx_status,
+                extra_info.as_deref().unwrap_or_default(),
+            ) {
                 crate::admit_fast::CallbackAction::LatchSeen => {
                     let job_txid = txid.clone();
                     let job_env = evidence.clone();
@@ -2967,6 +2971,19 @@ pub async fn arc_ingest(
                         crate::admit_fast::refusal_job(job_env, job_txid, (status, extra), af_now)
                             .await;
                     }));
+                }
+                crate::admit_fast::CallbackAction::HoldNotFinal(status) => {
+                    worker::console_log!(
+                        "POST /arc-ingest txid={txid} {status} TX_LOCK_TIME: held, not final: no evidence check, no eviction (#836)"
+                    );
+                    if let Some(db) = ops_db {
+                        crate::ops::bump_counter(
+                            db,
+                            crate::ops::COUNTER_ARC_INGEST_LOCK_TIME_NOT_FINAL,
+                            1,
+                        )
+                        .await;
+                    }
                 }
                 crate::admit_fast::CallbackAction::Ignore => {}
             }

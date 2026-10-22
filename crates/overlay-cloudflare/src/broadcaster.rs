@@ -95,12 +95,38 @@ pub(crate) enum WitnessLook {
     /// REJECTED / DOUBLE_SPEND_ATTEMPTED (status, extra_info): the evidence
     /// check decides, never this look alone.
     Fatal(String, String),
+    /// bsv-low #836: Arcade's REJECTED that names TX_LOCK_TIME (35): held, not final (the word and what the text
+    /// says, its peer's height a hint). No evidence check, no eviction: the watch keeps looking and ends with the
+    /// subject unlatched; the callbacks and the passes re-look after the lock height passes.
+    NotFinal(String, crate::door_words::NotFinal),
     /// An orphan view: Arcade cannot see the parents; a verdict neither way.
     Orphan(String),
     /// A lifecycle status below SEEN: keep watching.
     Pending(String),
     /// Arcade does not know it, answered about something else, or faulted.
     Unknown,
+}
+
+/// PURE: one live Arcade word (the subject's, its txid already matched) as the pending watch's look. A REJECTED
+/// that names TX_LOCK_TIME (35) is `NotFinal` (bsv-low #836), never `Fatal`: the watch runs no evidence check on it.
+pub(crate) fn witness_look_of(
+    tx_status: String,
+    extra_info: String,
+    timestamp: Option<&str>,
+) -> WitnessLook {
+    match classify_arcade_status(&tx_status) {
+        GateVerdict::Reached => WitnessLook::Seen(
+            tx_status,
+            timestamp.and_then(crate::proof_fetcher::rfc3339_utc_ms),
+        ),
+        GateVerdict::Fatal => match crate::door_words::lock_time_not_final(&tx_status, &extra_info)
+        {
+            Some(nf) => WitnessLook::NotFinal(tx_status, nf),
+            None => WitnessLook::Fatal(tx_status, extra_info),
+        },
+        GateVerdict::Orphan => WitnessLook::Orphan(tx_status),
+        GateVerdict::Pending => WitnessLook::Pending(tx_status),
+    }
 }
 
 /// The classified outcome of one ARC broadcast attempt (broadcast-gated
@@ -310,7 +336,7 @@ fn code_257(t: &str) -> bool {
 /// This function is a character-for-character mirror of the bsv-low client's
 /// `alreadyKnown` (`app/src/lib/broadcast.ts`); the two test suites share one
 /// corpus and both must agree on every case in it.
-fn already_known(s: &str) -> bool {
+pub(crate) fn already_known(s: &str) -> bool {
     let stripped = strip_long_hex_runs(&s.to_lowercase());
     let t = stripped.replace("unknown", " ").replace("unseen", " ");
     t.contains("already")
@@ -2017,6 +2043,16 @@ pub fn terminal_at_arcade_by_presence(
     extra_info: &str,
 ) -> Result<ArcOutcome, String> {
     use crate::proof_fetcher::NetworkPresence;
+    // bsv-low #836: Arcade's non-final word (REJECTED naming TX_LOCK_TIME (35)) is a time, never a verdict: mined
+    // presence admits as for every terminal word; anything else is the retryable answer, never a 422.
+    if let Some(nf) = crate::door_words::lock_time_not_final(arcade_status, extra_info) {
+        return match presence {
+            NetworkPresence::Present { height: Some(_) } => {
+                Ok(ArcOutcome::Accepted(subject_txid.to_string()))
+            }
+            _ => Err(lock_time_not_final_answer(subject_txid, arcade_status, &nf)),
+        };
+    }
     match presence {
         // #602 fold (LOW-3, LOW-5, stated): the courier's `blockheight` is trusted as
         // the chain's word (a mislabelled orphan admits once; a MINED push corrects it),
@@ -2039,6 +2075,23 @@ pub fn terminal_at_arcade_by_presence(
             "Arcade holds {subject_txid} terminal ({arcade_status}) and the indexers are inconclusive (a courier faulted, or this isolate's courier budget for terminal subjects is spent): the network's word is unavailable — retryable, never admitted on a broadcaster's echo (#519)"
         )),
     }
+}
+
+/// PURE (bsv-low #836): the door's retryable answer to Arcade's non-final word (the 502 shape a young subject
+/// gets): Arcade's text scrubbed as #519 scrubs a refusal's, the lock height and Arcade's PEER's height named as
+/// hints (the lag is the courier's, never the chain's; neither is a gate input).
+pub fn lock_time_not_final_answer(
+    subject_txid: &str,
+    arcade_status: &str,
+    nf: &crate::door_words::NotFinal,
+) -> String {
+    let height = |h: Option<u64>| h.map_or("?".to_string(), |h| h.to_string());
+    format!(
+        "Arcade {arcade_status} {subject_txid} TX_LOCK_TIME (lock height {}, Arcade's peer at {}): not final against Arcade's peer's chain view, a time, never a verdict: retryable, present it again after the lock height (#836); {}",
+        height(nf.lock_height),
+        height(nf.peer_height),
+        nf.reason
+    )
 }
 
 /// PURE (the delta-verify's LOW, 2026-09-21): a definitive refusal must rest on a FRESH courier read. A memoised
@@ -2182,6 +2235,9 @@ pub enum TerminalJudgement {
     Inconclusive,
     /// This isolate's terminal-ask cap was spent.
     Capped,
+    /// bsv-low #836: Arcade's word is the non-final REJECTED (TX_LOCK_TIME (35)) and no indexer holds it mined: the
+    /// retryable answer, never a 422, never an eviction.
+    NotFinal,
 }
 
 impl TerminalJudgement {
@@ -2199,6 +2255,24 @@ impl TerminalJudgement {
             NetworkPresence::Inconclusive => TerminalJudgement::Inconclusive,
         }
     }
+    /// [`Self::of`] under Arcade's word (bsv-low #836): a non-final word that no indexer holds mined is
+    /// [`Self::NotFinal`], whatever the indexers or the cap said.
+    pub fn of_word(
+        presence: crate::proof_fetcher::NetworkPresence,
+        young: bool,
+        capped: bool,
+        arcade_status: &str,
+        extra_info: &str,
+    ) -> Self {
+        let judged = Self::of(presence, young, capped);
+        if judged != TerminalJudgement::Present
+            && crate::door_words::lock_time_not_final(arcade_status, extra_info).is_some()
+        {
+            TerminalJudgement::NotFinal
+        } else {
+            judged
+        }
+    }
     /// The ops counter this judgement bumps.
     pub fn counter(self) -> &'static str {
         match self {
@@ -2208,6 +2282,7 @@ impl TerminalJudgement {
             TerminalJudgement::Young => crate::ops::COUNTER_SUBMIT_TERMINAL_YOUNG,
             TerminalJudgement::Inconclusive => crate::ops::COUNTER_SUBMIT_TERMINAL_INCONCLUSIVE,
             TerminalJudgement::Capped => crate::ops::COUNTER_SUBMIT_TERMINAL_CAPPED,
+            TerminalJudgement::NotFinal => crate::ops::COUNTER_SUBMIT_LOCK_TIME_NOT_FINAL,
         }
     }
 }
@@ -2921,7 +2996,13 @@ impl ArcadeBroadcaster {
             if source == "couriers" {
                 self.terminal_remember(subject_txid, presence, young, started);
             }
-            let judgement = TerminalJudgement::of(presence, young, source == "capped");
+            let judgement = TerminalJudgement::of_word(
+                presence,
+                young,
+                source == "capped",
+                probe_status,
+                extra_info,
+            );
             self.terminal_ms
                 .set(self.terminal_ms.get() + (worker::js_sys::Date::now() - started));
             self.terminal_judged.set(Some(judgement));
@@ -3099,6 +3180,19 @@ impl ArcadeBroadcaster {
                         return Ok(reached_submit_echo(self.fast_answer));
                     }
                     GateVerdict::Fatal => {
+                        // bsv-low #836: a non-final word is "not now" at the door: the retryable answer, never a
+                        // resubmit's corroborated 422, never an admission
+                        if let Some(nf) = crate::door_words::lock_time_not_final(
+                            &parsed.tx_status,
+                            &parsed.extra_info,
+                        ) {
+                            self.terminal_judged.set(Some(TerminalJudgement::NotFinal));
+                            return Err(lock_time_not_final_answer(
+                                subject_txid,
+                                &parsed.tx_status,
+                                &nf,
+                            ));
+                        }
                         return Ok(GateStep::AsyncRejected(arcade_fatal_reason(
                             subject_txid,
                             &parsed.tx_status,
@@ -3289,6 +3383,14 @@ impl ArcadeBroadcaster {
                         // #209: fold the captured extra_info into the reason text
                         // (reason ONLY — the gate above already decided on status).
                         stamp(&self.poll_ms);
+                        // bsv-low #836: the one exception, a non-final word: "not now", the retryable answer
+                        if let Some(nf) = crate::door_words::lock_time_not_final(
+                            &resp.tx_status,
+                            &resp.extra_info,
+                        ) {
+                            self.terminal_judged.set(Some(TerminalJudgement::NotFinal));
+                            return Err(lock_time_not_final_answer(txid, &resp.tx_status, &nf));
+                        }
                         return Ok(GateStep::AsyncRejected(arcade_fatal_reason(
                             txid,
                             &resp.tx_status,
@@ -3359,15 +3461,7 @@ impl ArcadeBroadcaster {
     pub(crate) async fn witness_look(&self, txid: &str) -> WitnessLook {
         match self.tx_status(txid).await {
             Some(r) if r.txid.eq_ignore_ascii_case(txid) => {
-                match classify_arcade_status(&r.tx_status) {
-                    GateVerdict::Reached => WitnessLook::Seen(
-                        r.tx_status,
-                        r.timestamp.as_deref().and_then(crate::proof_fetcher::rfc3339_utc_ms),
-                    ),
-                    GateVerdict::Fatal => WitnessLook::Fatal(r.tx_status, r.extra_info),
-                    GateVerdict::Orphan => WitnessLook::Orphan(r.tx_status),
-                    GateVerdict::Pending => WitnessLook::Pending(r.tx_status),
-                }
+                witness_look_of(r.tx_status, r.extra_info, r.timestamp.as_deref())
             }
             _ => WitnessLook::Unknown,
         }

@@ -448,6 +448,47 @@ const L8_MOVED: &[(&str, &str)] = &[
     ),
 ];
 
+/// bsv-low #845 (bsv-wallet-toolbox-rs 0.11.2's Arcade status vectors, `toolbox_status` `unknown` for the three):
+/// Arcade's RECEIVED, SENT_TO_NETWORK and ACCEPTED_BY_NETWORK say Arcade holds it, never that the network does.
+/// A hint that promotes nothing: the live look is `Holding`, never `Present`; the evidence check reads the
+/// indexers and, absent them, answers `Uncertain` (never presence, never a refusal); the retire pass takes its
+/// absence arm (48 h, the memo `retired`), so a pot no broadcaster ever saw SEEN is not kept live by Arcade's rank.
+/// Seven recorded lines per word move; every other line of the three words is unchanged.
+pub(crate) const FIX845_HOLDING_WORDS: [&str; 3] =
+    ["RECEIVED", "SENT_TO_NETWORK", "ACCEPTED_BY_NETWORK"];
+
+fn fix845_moved() -> Vec<(String, String)> {
+    let holding = crate::admit_fast::HOLDING_UNCERTAIN_REASON;
+    let mut moved = Vec::new();
+    for w in FIX845_HOLDING_WORDS {
+        moved.push((
+            format!("live_look\t{w}\tPresent"),
+            format!("live_look\t{w}\tHolding(\"{w}\")"),
+        ));
+        moved.push((
+            format!("live_look_fold_plant\t{w}\tPresent"),
+            format!("live_look_fold_plant\t{w}\tHolding(\"{w}\")"),
+        ));
+        moved.push((
+            format!("retire_absent_49h\t{w}\tNone"),
+            format!(
+                "retire_absent_49h\t{w}\tSome(\"network-absent 176400s: arcade holds it below SEEN ({w}, a hint) + both indexers 404\")"
+            ),
+        ));
+        for young in [true, false] {
+            moved.push((
+                format!("evidence_absent_young_{young}\t{w}\tPresent"),
+                format!("evidence_absent_young_{young}\t{w}\tUncertain(\"{holding}\")"),
+            ));
+            moved.push((
+                format!("evidence_fault_young_{young}\t{w}\tPresent"),
+                format!("evidence_fault_young_{young}\t{w}\tUncertain(\"a courier faulted\")"),
+            ));
+        }
+    }
+    moved
+}
+
 #[test]
 fn the_doors_answers_are_the_recorded_table_save_where_the_tracker_refuses_the_word() {
     let got = table();
@@ -459,13 +500,21 @@ fn the_doors_answers_are_the_recorded_table_save_where_the_tracker_refuses_the_w
         std::fs::write(path, &got).unwrap();
         return;
     }
+    let fix845 = fix845_moved();
     let want: Vec<&str> = FIXTURE
         .lines()
         .map(|line| {
             L8_MOVED
                 .iter()
                 .find(|(recorded, _)| *recorded == line)
-                .map_or(line, |(_, now)| *now)
+                .map(|(_, now)| *now)
+                .or_else(|| {
+                    fix845
+                        .iter()
+                        .find(|(recorded, _)| recorded == line)
+                        .map(|(_, now)| now.as_str())
+                })
+                .unwrap_or(line)
         })
         .collect();
     assert_eq!(
@@ -476,6 +525,14 @@ fn the_doors_answers_are_the_recorded_table_save_where_the_tracker_refuses_the_w
         L8_MOVED.len(),
         "every L8 row names a recorded line"
     );
+    assert_eq!(
+        fix845
+            .iter()
+            .filter(|(recorded, _)| FIXTURE.lines().any(|l| l == recorded))
+            .count(),
+        21,
+        "every #845 row names a recorded line: seven for each of RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK"
+    );
     let have: Vec<&str> = got.lines().collect();
     let changed: Vec<String> = want
         .iter()
@@ -485,7 +542,7 @@ fn the_doors_answers_are_the_recorded_table_save_where_the_tracker_refuses_the_w
         .collect();
     assert!(
         changed.is_empty() && want.len() == have.len(),
-        "the door's answer changed ({} lines recorded, {} now):\n{}",
+        "the door's answer changed ({} lines recorded, {} now; the moved rows are L8's and #845's: RECEIVED, SENT_TO_NETWORK and ACCEPTED_BY_NETWORK are Holding, never Present):\n{}",
         want.len(),
         have.len(),
         changed.join("\n")

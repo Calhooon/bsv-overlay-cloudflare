@@ -18,24 +18,31 @@
 //! vector's `words` classes are replayed there too
 //! (`arcade_vector_replay::every_arcade_word_reads_its_class_through_the_tracker`).
 //!
-//! The copy's source (align-engine-050, 2026-10-10): bsv-wallet-toolbox-rs
-//! 0.7.4 (tag `v0.7.4`, main `623f890`), `tests/vectors/
-//! arcade_status_verdicts.json`, the same bytes bsv-wallet-cli carries at main
-//! `636c6dd` (`tests/vectors/`). The rule is `cmp`: this file is that file
-//! byte for byte (sha256 `80d2ac72112d…`, pinned whole below), never an edit
-//! here. A change is made in the toolbox's copy and copied back.
+//! The copy's source (bsv-low #845, 2026-10-22): bsv-wallet-toolbox-rs 0.11.2
+//! (tag `v0.11.2`, `41da5da`), `tests/vectors/arcade_status_verdicts.json`,
+//! whose three `status_*` rows for RECEIVED, SENT_TO_NETWORK and
+//! ACCEPTED_BY_NETWORK say `toolbox_status: unknown` (a hint that promotes
+//! nothing; the toolbox's `e28acdc`); before it 0.7.4 (tag `v0.7.4`, main
+//! `623f890`, sha256 `80d2ac72112d...`, align-engine-050, 2026-10-10). The rule
+//! is `cmp`: this file is that file byte for byte (sha256 `4a28ff8b5cbe...`,
+//! pinned whole below), never an edit here. A change is made in the toolbox's
+//! copy and copied back.
 
 use bsv_overlay_discovery::pot::reorg::{arcade_reorg_marker, ArcadeReorgMarker};
 
 const VECTOR: &str = include_str!("../vectors/arcade_status_verdicts.json");
 
-/// sha256 of bsv-wallet-toolbox-rs 0.7.4's `tests/vectors/arcade_status_verdicts.json`.
-const TOOLBOX_074_SHA256: &str = "80d2ac72112d0f39d1d5e4512a4ce10bbc71234cc8edc6270b1cebe599f6a954";
+/// sha256 of bsv-wallet-toolbox-rs 0.11.2's `tests/vectors/arcade_status_verdicts.json`.
+const TOOLBOX_0112_SHA256: &str =
+    "4a28ff8b5cbe0c0c56cb36aabbf0012755efd0b1aae783204bc64f118c55b913";
 
 #[test]
-fn the_vector_is_the_toolbox_0_7_4_bytes() {
+fn the_vector_is_the_toolbox_0_11_2_bytes() {
     let got = hex::encode(bsv_rs::primitives::sha256(VECTOR.as_bytes()));
-    assert_eq!(got, TOOLBOX_074_SHA256);
+    assert_eq!(
+        got, TOOLBOX_0112_SHA256,
+        "the vector is not bsv-wallet-toolbox-rs 0.11.2's (#845)"
+    );
 }
 
 #[test]
