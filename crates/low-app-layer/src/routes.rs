@@ -4582,6 +4582,91 @@ async fn owed_recompute_inner(
         }
     }
 
+    // 5b. bsv-low #837, THE BELT: before any index-UNSPENT hop is called stranded, its seat's HELD pot is asked
+    // whether its JOIN spent the hop (the pot's own stored bytes): the index can hold a pot whose hop spend it never
+    // recorded (a JOIN admitted by a road with no `tm_lowfund` judgement). The overlay's `record_join_hop_spends` is the
+    // fix at the write; this read is the belt for the time before it ran. Bounded: the newest index-unspent hops first,
+    // `OWED_JOIN_SEAT_HOPS_PER_RECOMPUTE` seat reads and `OWED_JOIN_POT_READS_PER_RECOMPUTE` pot reads; a fault is no
+    // word (the ladder as before).
+    let mut join_spent_hops: HashMap<String, String> = HashMap::new();
+    {
+        #[derive(Deserialize)]
+        struct SeatPotD1 {
+            #[serde(rename = "potTxid")]
+            pot_txid: String,
+        }
+        #[derive(Deserialize)]
+        struct PotBeefD1 {
+            beef: Option<String>,
+        }
+        let mut asked: Vec<&crate::hops_view::HopEntry> = hops
+            .iter()
+            .filter(|h| h.status == crate::hops_view::HopStatus::Unspent)
+            .collect();
+        asked.sort_by_key(|h| std::cmp::Reverse(h.marker_created_at));
+        let mut beefs: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+        for h in asked
+            .into_iter()
+            .take(crate::owed::OWED_JOIN_SEAT_HOPS_PER_RECOMPUTE)
+        {
+            let binds = [
+                JsValue::from_str(identity_lc),
+                JsValue::from_str(&h.hop_txid.to_ascii_lowercase()),
+                JsValue::from_f64(h.hop_vout as f64),
+            ];
+            let pots = match db.prepare(crate::owed::JOIN_SEAT_POTS_SQL).bind(&binds) {
+                Ok(stmt) => {
+                    match stmt
+                        .counted_all()
+                        .await
+                        .and_then(|r| r.results::<SeatPotD1>())
+                    {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            console_warn!("[owed] #837 seat-pot read failed for {}:{} (no word this pass): {e}", h.hop_txid, h.hop_vout);
+                            continue;
+                        }
+                    }
+                }
+                Err(_) => continue,
+            };
+            for p in pots {
+                let pot = p.pot_txid.to_ascii_lowercase();
+                if !beefs.contains_key(&pot) {
+                    if beefs.len() >= crate::owed::OWED_JOIN_POT_READS_PER_RECOMPUTE {
+                        continue;
+                    }
+                    let bytes = match db
+                        .prepare(crate::owed::JOIN_POT_BEEF_SQL)
+                        .bind(&[JsValue::from_str(&pot)])
+                    {
+                        Ok(stmt) => stmt
+                            .counted_first::<PotBeefD1>()
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|r| r.beef)
+                            .and_then(|h| hex::decode(h).ok()),
+                        Err(_) => None,
+                    };
+                    beefs.insert(pot.clone(), bytes);
+                }
+                if beefs.get(&pot).and_then(|b| b.as_deref()).is_some_and(|b| {
+                    crate::owed::join_spends_outpoint(b, &pot, &h.hop_txid, h.hop_vout)
+                }) {
+                    join_spent_hops.insert(outpoint_key(&h.hop_txid, h.hop_vout), pot);
+                    break;
+                }
+            }
+        }
+        if !join_spent_hops.is_empty() {
+            console_warn!(
+                "[owed] #837 the belt: {} index-unspent hop(s) of {identity_lc} are spent by their held pot's JOIN (the index never recorded the spend)",
+                join_spent_hops.len()
+            );
+        }
+    }
+
     // 6. the hop spenders that ARE LOW pots (the JOIN took the hop: the pot's row tells the story)
     let mut pot_spenders: HashSet<String> = HashSet::new();
     let mut pot_spenders_faulted = false;
@@ -5055,6 +5140,7 @@ async fn owed_recompute_inner(
                     retired_spenders: &no_retired,
                     proof_mined_spenders: &proof_mined_spenders,
                     funding_unheld: &funding_unheld,
+                    join_spent_hops: &join_spent_hops,
                 }));
             durable_unconfirmed
                 .into_iter()
@@ -5139,6 +5225,7 @@ async fn owed_recompute_inner(
         retired_spenders: &no_retired,
         proof_mined_spenders: &proof_mined_spenders,
         funding_unheld: &funding_unheld,
+        join_spent_hops: &join_spent_hops,
     };
     // 6c. bsv-low #485: the home outputs of the CONFIRMED courier-proven payouts (the candidates are the derivation's
     //     own: `owed::courier_home_outputs`), looked at within a small budget, so such a row can RETIRE on evidence
@@ -5376,6 +5463,45 @@ async fn owed_recompute_inner(
         .await;
         budget_cut |= pass.cut;
         crate::owed::mark_pay_vouts(&mut rows, &pass.vouts);
+    }
+
+    // 7b. bsv-low #837 (fix 2): a pass the outward budget CUT never serves fewer rows than the snapshot it replaces
+    // without saying so: each previous row it did not derive is carried, marked `refresh: "shed"` and no press
+    // (`owed::carry_shed_rows`). One read, on a cut pass only; a faulted read leaves the pass's rows as derived.
+    if budget_cut {
+        let previous = match db
+            .prepare(crate::owed::OWED_ROWS_READ_SQL)
+            .bind(&[JsValue::from_str(identity_lc)])
+        {
+            Ok(stmt) => stmt
+                .counted_all()
+                .await
+                .and_then(|r| r.results::<OwedRowD1>())
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match previous {
+            Ok(prev) => {
+                let prev: Vec<(crate::owed::OwedRow, i64)> = prev
+                    .into_iter()
+                    .filter_map(|p| {
+                        let at = p.updated_at_ms.unwrap_or(0.0) as i64;
+                        Some((p.into_row()?, at))
+                    })
+                    .collect();
+                let shed = crate::owed::carry_shed_rows(&inputs, &mut rows, &prev);
+                if shed > 0 {
+                    sort_rows_for_service(&mut rows);
+                    worker::console_log!(
+                        "[owed] recompute {source} {rid} for {}…: {shed} row(s) of the previous snapshot carried as shed (the budget cut this pass before it re-judged them)",
+                        &identity_lc[..12.min(identity_lc.len())]
+                    );
+                }
+            }
+            Err(e) => {
+                console_warn!("[owed] #837 shed carry: the previous snapshot read failed: {e}")
+            }
+        }
     }
 
     // 8. write: the identity's rows replaced and the marker stamped in ONE batch (all or nothing; at most 503
@@ -7006,6 +7132,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
     ))
     .map_err(|e| worker::Error::RustError(e.to_string()))?;
     crate::owed::mark_shed_refresh(&mut body, refresh_retry);
+    crate::owed::mark_shed_rows_refresh(&mut body);
     let progress = served.iter().find(|r| r.facts.get("markerlessCandidates").is_some()).map(|r| serde_json::json!({"candidates": r.facts["markerlessCandidates"], "examined": r.facts["markerlessExamined"], "cursor": r.facts["markerlessCursor"]})).or(progress);
     if let Some(progress) = progress {
         body["markerlessProgress"] = progress;

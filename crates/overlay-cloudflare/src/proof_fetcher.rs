@@ -1946,6 +1946,9 @@ pub struct MissingSpendSummary {
     /// regression signal (the legacy backlog never counts here). The monitor
     /// pages when its lifetime counter grows.
     pub discovered_new_era: usize,
+    /// bsv-low #837: hop rows a POT candidate's own stored bytes marked spent by its JOIN
+    /// (`record_join_hop_spends`): a hop that landed or was readmitted after its JOIN.
+    pub join_hops_marked: usize,
 }
 
 /// Per tick: at most this many stale unspent pots, none younger than an hour
@@ -2039,6 +2042,22 @@ async fn discover_spend_for_row(
     let is_hop = overlay_discovery::pot::storage::is_hop_row(&rec);
     if is_hop {
         summary.hop_rows += 1;
+    } else {
+        // bsv-low #837: a held JOIN whose hops read unspent (a hop admitted or readmitted after it, a road with no
+        // `tm_lowfund` judgement): its own stored bytes name them; no courier is asked for this.
+        let healed = overlay_discovery::pot::lowfund_topic_manager::record_join_hop_spends(
+            pot_storage,
+            &rec.txid,
+        )
+        .await;
+        summary.join_hops_marked += healed.marked.len();
+        if !healed.marked.is_empty() {
+            dlog!(
+                "discover_missing_spends: {}: {} hop spend(s) recorded from the JOIN's stored bytes",
+                rec.txid,
+                healed.marked.len()
+            );
+        }
     }
     let new_era = created_at_secs.is_some_and(|t| t >= MISSING_SPEND_NEW_ERA_CUTOFF_SECS);
     let mut via_script = false;
@@ -10842,6 +10861,71 @@ pub(crate) mod tests {
         // now spent: no longer a candidate
         let s2 = discover_spends_for_outpoints(&store, &fetcher, &[(pot.clone(), 0)]).await;
         assert_eq!(s2.scanned, 0);
+    }
+
+    #[tokio::test]
+    async fn fix837_b_the_discovery_pass_records_a_held_joins_hop_spends_with_no_courier_word() {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{Transaction as Tx, TransactionInput, TransactionOutput};
+        use overlay_discovery::pot::storage::MemoryPotStorage;
+        // bsv-low #837 (loop 44 pair 1): the JOIN is HELD (its pot row and stored bytes), its hop's row was written
+        // AFTER it (spent = 0), and no courier names a spender (the pruned indexers): the pass's pot candidate
+        // records the hop's spend from the JOIN's own bytes, so the owed list never offers that hop's sweep.
+        let mut hop = Tx::new();
+        hop.add_input(TransactionInput::new("41".repeat(32), 0))
+            .unwrap();
+        hop.add_output(TransactionOutput {
+            satoshis: Some(20_000),
+            locking_script: LockingScript::from_binary(&p2pkh_script(&[0x41; 20])).unwrap(),
+            change: false,
+        })
+        .unwrap();
+        let mut join = Tx::new();
+        let mut input = TransactionInput::new(hop.id(), 0);
+        input.source_transaction = Some(Box::new(hop.clone()));
+        join.inputs.push(input);
+        join.outputs.push(TransactionOutput {
+            satoshis: Some(2_500),
+            locking_script: LockingScript::from_binary(&covenant_lock(&backfill_params())).unwrap(),
+            change: false,
+        });
+        let beef = bsv_rs::transaction::Beef::from_binary(&join.to_beef(true).unwrap())
+            .unwrap()
+            .to_binary_atomic(&join.id())
+            .unwrap();
+        let store = MemoryPotStorage::default();
+        store
+            .store_record(&PotRecord {
+                txid: join.id(),
+                output_index: 0,
+                lock_kind: Some("covenant".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .store_record(&PotRecord {
+                txid: hop.id(),
+                output_index: 0,
+                lock_kind: Some("p2pkh".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store.store_beef(&join.id(), &beef).await.unwrap();
+        let fetcher = MockProofFetcher {
+            minable: Default::default(),
+            spender_hints: Default::default(),
+            binding_raw: Default::default(),
+            hint_fault: false,
+            real_bumps: Default::default(),
+        };
+        let s = discover_missing_spends(&store, &fetcher, 1, 0).await;
+        assert_eq!(s.scanned, 1, "the pot goes first");
+        assert_eq!(s.join_hops_marked, 1, "{s:?}");
+        let row = store.get_spent_status(&hop.id(), 0).await.unwrap().unwrap();
+        assert!(row.spent && !row.spent_confirmed, "{row:?}");
+        assert_eq!(row.spending_txid.as_deref(), Some(join.id().as_str()));
     }
 
     #[tokio::test]

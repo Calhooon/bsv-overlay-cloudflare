@@ -1465,6 +1465,34 @@ pub async fn write_refused_verdict(db: &D1Database, txid: &str, now_ms: i64, rea
     }
 }
 
+/// bsv-low #837 (FIX-837): the D1 wiring of [`overlay_discovery::pot::lowfund_topic_manager::record_join_hop_spends`]
+/// for a road that puts a pot in the index without the door's `tm_lowfund` judgement of its JOIN (a readmission, the
+/// operator's `/admin/readmit`, a re-present the engine dedups): the held JOIN's hop rows are marked spent by it from
+/// its own stored bytes. Fail-soft and idempotent (a txid that is no held JOIN reads its stored bytes and stops);
+/// logged only when it marks a hop or faults. The count of hops marked.
+pub async fn record_join_hop_spends_on(db: &D1Database, txid: &str, road: &str) -> usize {
+    use worker::wasm_bindgen::JsCast;
+    // a second handle on the same binding (the store owns an `Rc`; `D1Database` is not `Clone`)
+    let handle = D1Database::unchecked_from_js(db.as_ref().clone());
+    let store = crate::d1_discovery::D1PotStorage::new(std::rc::Rc::new(handle));
+    let got =
+        overlay_discovery::pot::lowfund_topic_manager::record_join_hop_spends(&store, txid).await;
+    if !got.marked.is_empty() || got.faults > 0 {
+        worker::console_log!(
+            "[join-hops] {road} {txid}: {} hop spend(s) recorded from the JOIN's stored bytes ({}), {} already pointed, {} fault(s)",
+            got.marked.len(),
+            got.marked
+                .iter()
+                .map(|o| format!("{}:{}", o.txid, o.output_index))
+                .collect::<Vec<_>>()
+                .join(", "),
+            got.already_spent,
+            got.faults
+        );
+    }
+    got.marked.len()
+}
+
 /// If the txid is in the ledger as evicted and not yet readmitted, move every
 /// twin row back and mark the readmission. `true` when a readmission happened.
 pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> bool {
@@ -1610,6 +1638,9 @@ pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> boo
             }
         }
     }
+    // bsv-low #837: a readmitted JOIN's hops may never have been pointed at it (the twins hold what the eviction
+    // moved, the released list what it had): record them from its own stored bytes, as the door's judgement would
+    record_join_hop_spends_on(db, &txid, "readmit").await;
     worker::console_log!(
         "[admit-fast] READMITTED {txid} on the pushed proof: {restored} row(s) restored (+{again} under the belt), {remarked}/{} spend pointer(s) re-marked (was evicted: {})",
         released.len(),
@@ -2752,6 +2783,50 @@ async fn confirm_spend_now(
 
 #[cfg(test)]
 mod tests {
+    /// bsv-low #837 (FIX-837) pin (a3): every road that puts a pot in the index without the door's `tm_lowfund`
+    /// judgement of its JOIN records its hop spends through the ONE shared function
+    /// (`overlay_discovery::pot::lowfund_topic_manager::record_join_hop_spends`): the readmission (after its rows are
+    /// back, before its closing line), `/admin/readmit` in both arms, the door's re-present of a JOIN deduped under
+    /// `tm_pot`, and the discovery pass's pot candidate. RED with any one call removed.
+    #[test]
+    fn fix837_a3_every_off_door_road_records_the_joins_hop_spends_through_the_one_function() {
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let fast = include_str!("admit_fast.rs");
+        let helper = &fast[fast.find("pub async fn record_join_hop_spends_on(").unwrap()..];
+        let helper = &helper[..helper.find("\n}\n").unwrap()];
+        assert!(squash(helper).contains(&squash(
+            "overlay_discovery::pot::lowfund_topic_manager::record_join_hop_spends(&store, txid)"
+        )));
+        let readmit = &fast[fast.find("pub async fn readmit_if_evicted(").unwrap()..];
+        let readmit = &readmit[..readmit.find("\n}\n").unwrap()];
+        let call = readmit
+            .find("record_join_hop_spends_on(db, &txid, \"readmit\")")
+            .expect("the readmission records its JOIN's hop spends");
+        assert!(call < readmit.find("READMITTED {txid} on the pushed proof").unwrap());
+        assert!(call > readmit.find("let (restored, faults) = restore_twins(db, &txid).await;").unwrap());
+        let routes = include_str!("routes.rs");
+        let admin = &routes[routes.find("POST /admin/readmit txid={txid} topic={topic}").unwrap()..];
+        let admin = &admin[..admin.find("\n}\n").unwrap()];
+        assert_eq!(
+            admin
+                .matches("crate::admit_fast::record_join_hop_spends_on(&db, &txid, \"POST /admin/readmit\")")
+                .count(),
+            2,
+            "both arms of /admin/readmit"
+        );
+        let door = &routes[routes.find("async fn submit_parts(").unwrap()..];
+        let door = &door[..door.find("\n}\n").unwrap()];
+        assert!(squash(door).contains(&squash(
+            "crate::admit_fast::record_join_hop_spends_on(&db, &txid, \"POST /submit re-present\")"
+        )));
+        let fetcher = include_str!("proof_fetcher.rs");
+        let pass = &fetcher[fetcher.find("async fn discover_spend_for_row(").unwrap()..];
+        let pass = &pass[..pass.find("\n}\n").unwrap()];
+        assert!(squash(pass).contains(&squash(
+            "overlay_discovery::pot::lowfund_topic_manager::record_join_hop_spends(pot_storage, &rec.txid"
+        )));
+    }
+
     use super::*;
     use crate::proof_fetcher::ArcadeLook;
     use async_trait::async_trait;

@@ -297,6 +297,7 @@ fn owed(
         retired_spenders: &none,
         proof_mined_spenders: &none,
         funding_unheld: &none,
+        join_spent_hops: &Default::default(),
     })
 }
 

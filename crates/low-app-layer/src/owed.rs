@@ -1143,6 +1143,92 @@ pub struct OwedInputs<'a> {
     /// funding was not read: a spent pot, which is never refund-due). A word-store fault leaves the set's pots withheld
     /// for that pass (the strict rule, latch or proof), never pressed on an unread word.
     pub funding_unheld: &'a HashSet<String>,
+    /// bsv-low #837 (FIX-837), THE BELT: index-UNSPENT hop outpoints (`txid:vout`, lowercase) whose own pot's stored
+    /// JOIN spends them, mapped to that pot's txid (lowercase). The route reads it before any hop is called stranded
+    /// ([`JOIN_SEAT_POTS_SQL`] for the hop's seat, then the pot's stored bytes, [`join_spends_outpoint`]): the index
+    /// held the pot but never recorded the hop's spend (a JOIN admitted by a road with no `tm_lowfund` judgement, the
+    /// overlay's `record_join_hop_spends` not yet run). Such a hop is no sweep: the chain spent it into the pot.
+    pub join_spent_hops: &'a HashMap<String, String>,
+}
+
+/// bsv-low #837: the seat pots of one index-unspent hop of this identity (`?1` identity, `?2` hop txid, `?3` vout):
+/// the pots the hop marker's seat key is committed in (`pot_hop_seats`, the seat-key derivation the links use), held
+/// in the index (`pot_records`, the covenant row at the seat's vout). At most four; one statement per hop.
+pub const JOIN_SEAT_POTS_SQL: &str =
+    "SELECT s.potTxid AS potTxid FROM hopparty_records hp INDEXED BY idx_hopparty_hop \
+     CROSS JOIN pot_hop_seats s ON s.markerRowid = hp.rowid \
+     CROSS JOIN pot_records pot ON pot.txid = s.potTxid AND pot.outputIndex = s.potVout \
+     WHERE hp.txid = ?2 AND hp.hopVout = ?3 AND hp.identity = ?1 LIMIT 4";
+/// bsv-low #837: the pot's own stored bytes, read by the belt (no trust gate: only the JOIN's input list is read).
+pub const JOIN_POT_BEEF_SQL: &str = "SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?1";
+/// bsv-low #837: at most this many index-unspent hops are asked of their seat pots in one recompute (a hop whose JOIN
+/// was admitted normally is index-SPENT and is never asked; an honest stranded hop has no seat pot and costs one
+/// statement), and at most this many pot BEEFs are read for them.
+pub const OWED_JOIN_SEAT_HOPS_PER_RECOMPUTE: usize = 8;
+/// See [`OWED_JOIN_SEAT_HOPS_PER_RECOMPUTE`].
+pub const OWED_JOIN_POT_READS_PER_RECOMPUTE: usize = 4;
+
+/// PURE (bsv-low #837): does the transaction `pot_txid`'s stored `beef` names (its atomic subject, else the one whose
+/// txid is `pot_txid`) spend `hop_txid:hop_vout`? `false` for bytes that do not parse or name another transaction.
+pub fn join_spends_outpoint(beef: &[u8], pot_txid: &str, hop_txid: &str, hop_vout: u32) -> bool {
+    let Ok(parsed) = bsv_rs::transaction::Beef::from_binary(beef) else {
+        return false;
+    };
+    let Some(join) = parsed
+        .find_txid(&pot_txid.to_ascii_lowercase())
+        .and_then(|t| t.tx())
+    else {
+        return false;
+    };
+    join.inputs.iter().any(|input| {
+        input.source_output_index == hop_vout
+            && input
+                .get_source_txid()
+                .is_ok_and(|t| t.eq_ignore_ascii_case(hop_txid))
+    })
+}
+
+/// bsv-low #837: the sentence on a hop whose spender is a HELD pot this identity's results do not carry (the index has
+/// not linked the seat to the pot yet: its hop spend unrecorded, or recorded this moment). The game keeps a row; it is
+/// no press. The pot's own row (its refund or payout) is served once the link lands.
+pub const JOINED_POT_UNLINKED_REASON: &str =
+    "your stake went into this game's pot (the pot's funding transaction spent this hop on chain): nothing to sweep here; the pot's own row appears once the index links your seat to it";
+
+/// PURE (bsv-low #837): is `pot_txid` a pot this pass's results carry (and the index holds)? Only then does "the pot's
+/// own row tells the story" hold for a hop the JOIN took; otherwise the hop keeps a row for its game.
+fn pot_row_served(i: &OwedInputs, pot_txid: &str) -> bool {
+    !i.evicted_pots.contains(&pot_txid.to_ascii_lowercase())
+        && i.results
+            .iter()
+            .any(|e| e.pot_txid.eq_ignore_ascii_case(pot_txid))
+}
+
+/// bsv-low #837: the row of a hop a HELD pot spent while the results carry no row for that pot (never a press).
+fn joined_pot_unlinked_row(
+    me: &str,
+    outpoint: String,
+    game: String,
+    h: &HopEntry,
+    facts_base: &Value,
+    pot_txid: &str,
+    by: &str,
+) -> OwedRow {
+    let mut facts = facts_base.clone();
+    facts["claim"] = Value::Null;
+    facts["claimable"] = json!(false);
+    facts["joinSpent"] = json!(pot_txid.to_ascii_lowercase());
+    facts["joinSpentBy"] = json!(by);
+    OwedRow {
+        identity: me.to_string(),
+        outpoint,
+        family: OwedFamily::Unbound,
+        game_id: game,
+        sats: None,
+        opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
+        at_height: None,
+        facts,
+        reason: Some(JOINED_POT_UNLINKED_REASON.to_string()),
+    }
 }
 
 /// bsv-low #831: the hydration's `fundingHeld` value for an unspent pot whose funding has no SEEN latch and no index
@@ -1686,6 +1772,74 @@ pub fn keep_withheld_elsewhere(
         kept += 1;
     }
     kept
+}
+
+/// bsv-low #837 (FIX-837): the row word of a row a BUDGET-CUT pass did not derive, carried from the previous snapshot.
+pub const OWED_REFRESH_SHED: &str = "shed";
+/// bsv-low #837: the `retryAfterMs` a carried shed row (and the answer serving one) names: the next pass is expected
+/// within the read-aged window's own scale, never sooner than the shed floor of a second.
+pub const OWED_SHED_RETRY_MS: i64 = 30_000;
+
+/// PURE (bsv-low #837, FIX-837 fix 2): a pass the outward budget CUT never serves fewer rows than the snapshot it
+/// replaces without saying so. Each row of `previous` (the identity's stored snapshot, `OWED_ROWS_READ_SQL`) whose
+/// outpoint this pass did not derive is carried into `rows` as it was, marked `refresh: "shed"`, `stale: true`,
+/// `carried: true`, `retryAfterMs`, its first judgement's `judgedAtMs` kept, and made NO PRESS (`claimable: false`,
+/// the old word kept as `claimableBeforeShed`): a cut pass could not re-judge it, so it is shown, never pressed on a
+/// stale word. Not carried: a row judged more than [`OWED_WITHHELD_KEEP_MAX_MS`] ago (a cut every pass cannot hold a
+/// dead row up for good), a row of a game this identity filed verified-collected. Only on a cut pass; an uncut pass's
+/// rows stand as derived (a row it did not derive is retired). The count carried.
+pub fn carry_shed_rows(
+    i: &OwedInputs,
+    rows: &mut Vec<OwedRow>,
+    previous: &[(OwedRow, i64)],
+) -> usize {
+    let current: HashSet<String> = rows.iter().map(|r| r.outpoint.clone()).collect();
+    let mut carried = 0;
+    for (prev, updated_at_ms) in previous {
+        if current.contains(&prev.outpoint) {
+            continue;
+        }
+        let judged_at = prev.facts["judgedAtMs"].as_i64().unwrap_or(*updated_at_ms);
+        if i.now_ms.saturating_sub(judged_at) > OWED_WITHHELD_KEEP_MAX_MS {
+            continue;
+        }
+        if i.collected_verified
+            .contains(&prev.game_id.to_ascii_lowercase())
+        {
+            continue;
+        }
+        let mut row = prev.clone();
+        let before = if prev.facts["refresh"] == OWED_REFRESH_SHED {
+            prev.facts["claimableBeforeShed"].clone()
+        } else {
+            prev.facts["claimable"].clone()
+        };
+        row.facts["claimableBeforeShed"] = before;
+        row.facts["claimable"] = json!(false);
+        row.facts["refresh"] = json!(OWED_REFRESH_SHED);
+        row.facts["stale"] = json!(true);
+        row.facts["carried"] = json!(true);
+        row.facts["judgedAtMs"] = json!(judged_at);
+        row.facts["retryAfterMs"] = json!(OWED_SHED_RETRY_MS);
+        rows.push(row);
+        carried += 1;
+    }
+    carried
+}
+
+/// PURE (bsv-low #837): an answer that serves a carried shed row says so at the top (`refresh: "shed"`,
+/// `retryAfterMs`), as a shed read does; an answer already marked keeps its own word.
+pub fn mark_shed_rows_refresh(body: &mut Value) {
+    if body.get("refresh").is_some_and(|r| !r.is_null()) {
+        return;
+    }
+    let shed = body["rows"].as_array().is_some_and(|rows| {
+        rows.iter()
+            .any(|r| r["facts"]["refresh"] == OWED_REFRESH_SHED)
+    });
+    if shed {
+        mark_shed_refresh(body, Some(OWED_SHED_RETRY_MS));
+    }
 }
 
 /// PURE: the previous row's own spender fact (`chainSpender`, else `spendingTxid`) names `sp` (lowercase compare).
@@ -3612,6 +3766,23 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             });
             continue;
         }
+        // bsv-low #837, THE BELT: an index-UNSPENT hop its own held pot's JOIN spends (read from the pot's stored bytes)
+        // is never stranded: the chain spent it into the pot. The pot's row tells the story when the results carry it;
+        // otherwise the game keeps this row (never a press, never no row).
+        if let Some(pot) = i.join_spent_hops.get(&outpoint) {
+            if !pot_row_served(i, pot) {
+                rows.push(joined_pot_unlinked_row(
+                    &me,
+                    outpoint,
+                    game,
+                    h,
+                    &facts_base,
+                    pot,
+                    "pot-bytes",
+                ));
+            }
+            continue;
+        }
         match h.status {
             HopStatus::Spent => {
                 let spender = h.spending_txid.as_deref().map(str::to_ascii_lowercase);
@@ -3619,7 +3790,10 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     .as_deref()
                     .is_some_and(|s| i.pot_spenders.contains(s));
                 if by_pot {
-                    continue; // the JOIN took it: the pot's own row tells the story
+                    // the JOIN took it: the pot's own row tells the story. bsv-low #837: kept as it was for an
+                    // index-SPENT hop (a pot outside the era's results is a written-off game, no row); the kept row is
+                    // for an index-UNSPENT hop a pot spent (the belt above, the chain arm below)
+                    continue;
                 }
                 // MEDIUM-7: a spender ABSENT from the index is not evidence of a wallet spend (an unindexed or
                 // evicted JOIN is the common honest case); without positive evidence the brain says it could not
@@ -3854,7 +4028,15 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             .as_deref()
                             .is_some_and(|s| i.pot_spenders.contains(s))
                         {
-                            continue; // the JOIN took it after all (the index lagged): the pot's row tells the story
+                            // the JOIN took it after all (the index lagged): the pot's row tells the story, when the
+                            // results carry that pot (#837: after a refused sweep of such a hop the game kept no row)
+                            if let Some(pot) = spender.as_deref().filter(|p| !pot_row_served(i, p))
+                            {
+                                rows.push(joined_pot_unlinked_row(
+                                    &me, outpoint, game, h, &facts, pot, "chain",
+                                ));
+                            }
+                            continue;
                         }
                         facts["claim"] = Value::Null;
                         facts["chainProbe"] = json!("spent");
@@ -8833,6 +9015,7 @@ pub(crate) mod tests {
             retired_spenders: &NONE,
             proof_mined_spenders: &NONE,
             funding_unheld: &NONE,
+            join_spent_hops: &NO_PKHS,
         }
     }
     static NO_SPENDERS: std::sync::LazyLock<HashMap<String, Vec<SpenderOutput>>> =
@@ -9522,9 +9705,22 @@ pub(crate) mod tests {
         let join = tx(0x02);
         let pots: HashSet<String> = [join.clone()].into_iter().collect();
         let by_pot = chain(&key, true, Some(true), Some(&join));
+        let held = [entry(
+            Some(false),
+            None,
+            Outcome::Refund,
+            Some(SeatLetter::A),
+        )];
+        let mut i = inputs(&held, &[], &old, &v, &c, &pots, Some(900_000));
+        i.hop_chain = &by_pot;
+        assert!(derive_owed_rows(&i).iter().all(|r| r.outpoint != key));
+        // bsv-low #837 (amended): the results carrying no row for that pot, the game keeps one row, never a press
         let mut i = inputs(&[], &[], &old, &v, &c, &pots, Some(900_000));
         i.hop_chain = &by_pot;
-        assert!(derive_owed_rows(&i).is_empty());
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].facts["joinSpentBy"], "chain");
+        assert_eq!(rows[0].facts["claimable"], false);
         // spent by something the index does not hold (a KNOWN competitor): could not judge, the spender named
         let elsewhere = chain(&key, true, Some(true), Some(&tx(0x09)));
         let mut i = inputs(&[], &[], &old, &v, &c, &pots, Some(900_000));
@@ -13994,6 +14190,205 @@ pub(crate) mod tests {
         );
         assert_eq!(rows[0].facts["chainWait"], "block");
         assert_eq!(rows[0].facts["tipUnknown"], true);
+    }
+
+    /// bsv-low #837 (FIX-837) pin (a2), THE BELT and the game's row: the loop-44 pair-1 hop, index-UNSPENT and past
+    /// the stranded window with a verified marker and a silent chain rung (the `index-unspent` arm OFFERED its sweep;
+    /// Arcade refused it `UTXO_SPENT`), whose held pot's own JOIN spends it (`join_spent_hops`) is never a press; when
+    /// the results carry no row for that pot the game keeps an unbound row; when they do, the pot's row tells the story.
+    /// The same holds for an index-unspent hop the CHAIN rung says a held pot spent (the refused sweep's eviction
+    /// released it): before the fix it `continue`d with no row, so a game whose pot the results did not carry had none
+    /// ("no owed row for this game"). An index-SPENT hop a pot took is no row, as before (a written-off game).
+    #[test]
+    fn fix837_c_a_hop_its_held_pots_join_spent_is_no_press_and_its_game_keeps_a_row() {
+        let (v, c) = (HashMap::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let pot = tx(0x02);
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let joined: HashMap<String, String> = [(key.clone(), pot.clone())].into_iter().collect();
+        // (1) the belt, the pot not in the results: one unbound row, no claim
+        let none = HashSet::new();
+        let mut i = inputs(&[], &[], &old, &v, &c, &none, Some(972_190));
+        i.join_spent_hops = &joined;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1, "the game keeps a row: {rows:?}");
+        assert_eq!(rows[0].family, OwedFamily::Unbound, "{rows:?}");
+        assert_eq!(rows[0].facts["claimable"], false);
+        assert!(rows[0].facts["claim"].is_null());
+        assert_eq!(rows[0].facts["joinSpent"], pot.as_str());
+        assert_eq!(rows[0].facts["joinSpentBy"], "pot-bytes");
+        assert_eq!(rows[0].reason.as_deref(), Some(JOINED_POT_UNLINKED_REASON));
+        // (1b) the belt with the pot in the results: the pot's own row, no hop row, no sweep
+        let held = [entry(
+            Some(false),
+            None,
+            Outcome::Refund,
+            Some(SeatLetter::A),
+        )];
+        let mut i = inputs(&held, &[], &old, &v, &c, &none, Some(972_190));
+        i.join_spent_hops = &joined;
+        let rows = derive_owed_rows(&i);
+        assert!(rows.iter().all(|r| r.outpoint != key), "{rows:?}");
+        assert!(
+            rows.iter().all(|r| r.facts["claim"] != "sweep-hop"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.outpoint == format!("{pot}:0")),
+            "{rows:?}"
+        );
+        // (2) the INDEX says a held pot spent the hop: no hop row, whatever the results (unchanged: a pot outside the
+        // era's results is a written-off game)
+        let spent = [hop(
+            HopStatus::Spent,
+            Some(&pot),
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let pots: HashSet<String> = [pot.clone()].into_iter().collect();
+        assert!(
+            derive_owed_rows(&inputs(&[], &[], &spent, &v, &c, &pots, Some(972_190))).is_empty()
+        );
+        // (3) the CHAIN rung says a held pot spent the index-unspent hop (the refused sweep's eviction released it):
+        // the game keeps a row, never a press
+        let word = chain_confirmed(&key, true, Some(true), Some(&pot), Some(true));
+        let mut i = inputs(&[], &[], &old, &v, &c, &pots, Some(972_190));
+        i.hop_chain = &word;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].facts["joinSpentBy"], "chain");
+        assert_eq!(rows[0].facts["claimable"], false);
+        // (4) #793: an index-unspent hop whose chain rung holds a CONFIRMED competitor this index does not know reads
+        // unbound (spent elsewhere or could not judge), never a press
+        let word = chain_confirmed(&key, true, Some(true), Some(&tx(0x0a)), Some(true));
+        let mut i = inputs(&[], &[], &old, &v, &c, &none, Some(972_190));
+        i.hop_chain = &word;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].family, OwedFamily::Unbound);
+        assert_ne!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["chainProbe"], "spent");
+    }
+
+    /// bsv-low #837 (FIX-837) pin (e), the route's wiring of (a2) and (c): the recompute reads the belt before it
+    /// derives (each index-unspent hop's seat pots, then the pot's stored bytes, under their two bounds) and hands it to
+    /// BOTH derivations; a CUT pass reads the previous snapshot and carries what it did not derive; the read answer
+    /// names a carried row at the top. RED with any one of them removed.
+    #[test]
+    fn fix837_e_the_recompute_wires_the_belt_and_the_shed_carry() {
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
+        for wired in [
+            "db.prepare(crate::owed::JOIN_SEAT_POTS_SQL)",
+            ".take(crate::owed::OWED_JOIN_SEAT_HOPS_PER_RECOMPUTE)",
+            "ifbeefs.len()>=crate::owed::OWED_JOIN_POT_READS_PER_RECOMPUTE{continue;}",
+            ".prepare(crate::owed::JOIN_POT_BEEF_SQL)",
+            "crate::owed::join_spends_outpoint(b,&pot,&h.hop_txid,h.hop_vout)",
+            "ifbudget_cut{letprevious=matchdb.prepare(crate::owed::OWED_ROWS_READ_SQL)",
+            "letshed=crate::owed::carry_shed_rows(&inputs,&mutrows,&prev);",
+            "crate::owed::mark_shed_rows_refresh(&mutbody);",
+        ] {
+            assert!(routes.contains(wired), "the recompute is wired: {wired}");
+        }
+        assert_eq!(
+            routes.matches("join_spent_hops:&join_spent_hops,").count(),
+            2,
+            "both derivations read the belt"
+        );
+        let belt = routes
+            .find("letmutjoin_spent_hops:HashMap<String,String>=HashMap::new();")
+            .unwrap();
+        let carry = routes
+            .find("letshed=crate::owed::carry_shed_rows(")
+            .unwrap();
+        let write = routes
+            .find("letplan=crate::owed::owed_write_plan(identity_lc,&rows,now_ms,tip,walk_cut);")
+            .unwrap();
+        assert!(
+            belt < routes.find("join_spent_hops:&join_spent_hops,").unwrap(),
+            "the belt is read before it is handed on"
+        );
+        assert!(
+            carry < write,
+            "the carried rows are written with the snapshot"
+        );
+    }
+
+    /// bsv-low #837 (FIX-837) pin (c): a pass the budget CUT never serves fewer rows than the snapshot it replaces
+    /// without marking each missing row shed. Loop 44 pair 1: seven rows served, then every cut pass served six and the
+    /// game's refund row was gone. The carried row is the previous one, `refresh: "shed"`, `stale`, `retryAfterMs`,
+    /// no press (its word kept as `claimableBeforeShed`, through a second cut too); a row judged past the keep window
+    /// or a verified-collected game's row is not carried; the answer serving one says `refresh: "shed"` at the top.
+    #[test]
+    fn fix837_d_a_budget_cut_pass_carries_each_row_it_did_not_derive_as_shed() {
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let i = inputs(&[], &[], &[], &v, &c, &p, Some(972_190));
+        let row = |op: u8, game: u8, family: OwedFamily, claimable: bool| OwedRow {
+            identity: ME.to_string(),
+            outpoint: format!("{}:0", tx(op)),
+            family,
+            game_id: tx(game),
+            sats: Some(19_800),
+            opponent_identity: Some(OPP.to_string()),
+            at_height: None,
+            facts: json!({"claim": "present-refund", "claimable": claimable}),
+            reason: None,
+        };
+        let now = i.now_ms;
+        // the previous snapshot: seven rows, the game's refund row among them
+        let previous: Vec<(OwedRow, i64)> = (0x20..0x27u8)
+            .map(|b| (row(b, b, OwedFamily::RefundDue, true), now - 60_000))
+            .collect();
+        // the cut pass derived six of them (the newest game's refund row, 0x26, missing)
+        let mut rows: Vec<OwedRow> = (0x20..0x26u8)
+            .map(|b| row(b, b, OwedFamily::RefundDue, true))
+            .collect();
+        let carried = carry_shed_rows(&i, &mut rows, &previous);
+        assert_eq!(carried, 1);
+        assert_eq!(
+            rows.len(),
+            previous.len(),
+            "never fewer rows than the last snapshot"
+        );
+        let shed = rows
+            .iter()
+            .find(|r| r.outpoint == format!("{}:0", tx(0x26)))
+            .unwrap();
+        assert_eq!(shed.family, OwedFamily::RefundDue, "the row as it was");
+        assert_eq!(shed.facts["refresh"], OWED_REFRESH_SHED);
+        assert_eq!(shed.facts["stale"], true);
+        assert_eq!(
+            shed.facts["claimable"], false,
+            "a stale word is shown, never pressed"
+        );
+        assert_eq!(shed.facts["claimableBeforeShed"], true);
+        assert_eq!(shed.facts["retryAfterMs"], OWED_SHED_RETRY_MS);
+        assert_eq!(shed.facts["judgedAtMs"], now - 60_000);
+        // a second cut pass carries it again with its first judgement and its first word
+        let again: Vec<(OwedRow, i64)> = vec![(shed.clone(), now)];
+        let mut rows2: Vec<OwedRow> = Vec::new();
+        assert_eq!(carry_shed_rows(&i, &mut rows2, &again), 1);
+        assert_eq!(rows2[0].facts["claimableBeforeShed"], true);
+        assert_eq!(rows2[0].facts["judgedAtMs"], now - 60_000);
+        // the answer says so at the top
+        let mut body = json!({"rows": [{"facts": rows2[0].facts.clone()}]});
+        mark_shed_rows_refresh(&mut body);
+        assert_eq!(body["refresh"], "shed");
+        assert_eq!(body["retryAfterMs"], OWED_SHED_RETRY_MS);
+        // not carried: a row judged past the keep window, a verified-collected game's row
+        let old = vec![(
+            row(0x30, 0x30, OwedFamily::RefundDue, true),
+            now - OWED_WITHHELD_KEEP_MAX_MS - 1,
+        )];
+        assert_eq!(carry_shed_rows(&i, &mut Vec::new(), &old), 0);
+        let collected: HashSet<String> = [tx(0x31)].into_iter().collect();
+        let mut j = inputs(&[], &[], &[], &v, &collected, &p, Some(972_190));
+        j.now_ms = now;
+        let done = vec![(row(0x31, 0x31, OwedFamily::Payout, true), now - 1_000)];
+        assert_eq!(carry_shed_rows(&j, &mut Vec::new(), &done), 0);
     }
 
     /// PIN A3 (RED on the stub): a competitor mined between two reads. Read 1 (tip 971114) is claimable; served

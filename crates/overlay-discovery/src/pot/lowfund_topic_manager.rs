@@ -80,6 +80,132 @@ pub fn join_hop_inputs(beef: &[u8]) -> Vec<Outpoint> {
         .collect()
 }
 
+/// What [`record_join_hop_spends`] did for one pot.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct JoinHopSpends {
+    /// The hop outpoints this call marked spent by the JOIN, in input order.
+    pub marked: Vec<Outpoint>,
+    /// Hop rows that already carried a spend pointer (left as they were).
+    pub already_spent: usize,
+    /// Why nothing was looked at: no stored bytes, no pot covenant output, the pot not held, a read fault.
+    pub skipped: Option<&'static str>,
+    /// A read or write that faulted (the pass converges on the next call).
+    pub faults: usize,
+}
+
+/// bsv-low #837 (FIX-837): record a HELD JOIN's hop spends from its own stored bytes, for a pot that entered the
+/// index by any road other than the door's `tm_lowfund` submit (a readmission of its rows, `/admin/readmit` under
+/// `tm_pot`, a hop that landed or was readmitted AFTER the JOIN, the discovery pass). The door records them through
+/// the engine: the JOIN judged under `tm_lowfund` spends each hop coin the topic holds (and FIX-791-C lands a carried
+/// one first, [`join_hop_inputs`]); every other road wrote the pot and left its hops `spent = 0`, so the owed list
+/// offered a sweep of a hop the chain had spent into the pot (loop 44 pair 1: Arcade `UTXO_SPENT`).
+///
+/// The rule is the door's over the same bytes: the pot's stored BEEF (`pot_beefs`) parsed as the manager parses it
+/// (its atomic subject, else its last transaction), which must BE the pot (its txid) and carry a pot covenant output;
+/// the pot's own row must be held (an evicted pot's rows are in the twins: nothing is written for a JOIN the index
+/// does not hold). Its inputs are the candidates: those [`join_hop_inputs`] names (a carried P2PKH source) and every
+/// other input whose EXISTING row is a hop row (`lockKind = 'p2pkh'`, the shape `tm_lowfund` admitted; the stored
+/// bytes of a mined JOIN can be compacted to the JOIN alone, its inputs still name the hops). Each such row that holds
+/// no spend pointer is marked spent by the JOIN as an UNCONFIRMED pointer (`mark_spent(.., false, ..)`, the discovery
+/// pass's write; the confirmation pass proves it, and an unconfirmed claim never clobbers a confirmed one). A row with
+/// a pointer is left alone (never re-pointed), a row that does not exist is never created (a hop is admitted by its
+/// own submit), and nothing else is written. Idempotent: a second call marks nothing.
+pub async fn record_join_hop_spends(
+    storage: &dyn crate::pot::storage::PotStorage,
+    pot_txid: &str,
+) -> JoinHopSpends {
+    let mut out = JoinHopSpends::default();
+    let pot_txid = pot_txid.to_ascii_lowercase();
+    let beef = match storage.get_beef(&pot_txid).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            out.skipped = Some("no stored bytes");
+            return out;
+        }
+        Err(_) => {
+            out.faults += 1;
+            out.skipped = Some("stored bytes unreadable");
+            return out;
+        }
+    };
+    let Ok(parsed) = beef_limits::parse_beef(&beef, &beef_limits::DISCOVERY_BEEF_LIMITS) else {
+        out.skipped = Some("stored bytes do not parse");
+        return out;
+    };
+    let subject = match parsed.atomic_txid.as_deref() {
+        Some(txid) => parsed.find_txid(txid),
+        None => parsed.txs.last(),
+    };
+    let Some(join) = subject.and_then(|s| s.tx()) else {
+        out.skipped = Some("no subject transaction");
+        return out;
+    };
+    if !join.id().eq_ignore_ascii_case(&pot_txid)
+        || !join
+            .outputs
+            .iter()
+            .any(|o| is_pot_covenant_script(&o.locking_script.to_binary()))
+    {
+        out.skipped = Some("no pot covenant output");
+        return out;
+    }
+    match storage.get_spent_status(&pot_txid, 0).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            out.skipped = Some("the pot is not held");
+            return out;
+        }
+        Err(_) => {
+            out.faults += 1;
+            out.skipped = Some("the pot's row is unreadable");
+            return out;
+        }
+    }
+    let carried: Vec<Outpoint> = join_hop_inputs(&beef);
+    let final_bytes = !(join.lock_time > 0 && join.inputs.iter().any(|i| i.sequence < 0xffff_ffff));
+    for input in &join.inputs {
+        let Ok(source) = input.get_source_txid() else {
+            continue;
+        };
+        let source = source.to_ascii_lowercase();
+        let vout = input.source_output_index;
+        let row = match storage.get_spent_status(&source, vout).await {
+            Ok(Some(r)) => r,
+            Ok(None) => continue,
+            Err(_) => {
+                out.faults += 1;
+                continue;
+            }
+        };
+        let named = carried
+            .iter()
+            .any(|o| o.txid.eq_ignore_ascii_case(&source) && o.output_index == vout);
+        if !(crate::pot::storage::is_hop_row(&row) || named) {
+            continue;
+        }
+        if row.spent || row.spending_txid.is_some() {
+            out.already_spent += 1;
+            continue;
+        }
+        match storage
+            .mark_spent(
+                &source,
+                vout,
+                &pot_txid,
+                false,
+                None,
+                None,
+                Some(final_bytes),
+            )
+            .await
+        {
+            Ok(()) => out.marked.push(Outpoint::new(source, vout)),
+            Err(_) => out.faults += 1,
+        }
+    }
+    out
+}
+
 /// LOWFUND Topic Manager — identifies admissible LOW hop (P2PKH) outputs.
 pub struct LowFundTopicManager;
 
@@ -306,6 +432,148 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(join_hop_inputs(&[0xde, 0xad]).is_empty());
+    }
+
+    /// bsv-low #837 (FIX-837) pin (a): a JOIN held by the index whose hop rows read unspent (it entered by a road
+    /// other than the door's `tm_lowfund` submit) has each hop marked spent by the JOIN, from its own stored bytes
+    /// (carried, and compacted to the JOIN alone); a pointer already there, a row that does not exist, a pot the index
+    /// does not hold and a transaction that is no JOIN are left alone; a second call marks nothing.
+    #[tokio::test]
+    async fn fix837_a_a_held_joins_hop_rows_are_marked_spent_from_its_stored_bytes() {
+        use crate::pot::storage::{MemoryPotStorage, PotRecord, PotStorage};
+        let source = |salt: u8| {
+            let mut tx = Tx::new();
+            tx.add_input(TransactionInput::new(format!("{salt:02x}").repeat(32), 0))
+                .unwrap();
+            tx.add_output(TransactionOutput {
+                satoshis: Some(20_000),
+                locking_script: LockingScript::from_binary(&p2pkh_script(salt)).unwrap(),
+                change: false,
+            })
+            .unwrap();
+            tx
+        };
+        let (hop_a, hop_b, hop_c) = (source(0x41), source(0x42), source(0x43));
+        let join_over = |carry: bool, hops: &[&Tx]| {
+            let mut join = Tx::new();
+            for h in hops {
+                let mut input = TransactionInput::new(h.id(), 0);
+                if carry {
+                    input.source_transaction = Some(Box::new((*h).clone()));
+                }
+                join.inputs.push(input);
+            }
+            join.outputs.push(TransactionOutput {
+                satoshis: Some(39_800),
+                locking_script: LockingScript::from_binary(&covenant_script(&dummy_params()))
+                    .unwrap(),
+                change: false,
+            });
+            join
+        };
+        let atomic = |tx: &Tx| {
+            bsv_rs::transaction::Beef::from_binary(&tx.to_beef(true).unwrap())
+                .unwrap()
+                .to_binary_atomic(&tx.id())
+                .unwrap()
+        };
+        let hop_row = |tx: &Tx, spender: Option<&str>| PotRecord {
+            txid: tx.id(),
+            output_index: 0,
+            spent: spender.is_some(),
+            spending_txid: spender.map(str::to_string),
+            lock_kind: Some("p2pkh".into()),
+            ..Default::default()
+        };
+        let pot_row = |txid: &str| PotRecord {
+            txid: txid.to_string(),
+            output_index: 0,
+            lock_kind: Some("covenant".into()),
+            ..Default::default()
+        };
+
+        // The carried JOIN over hops a and b, b already pointed elsewhere; c has no row at all.
+        let join = join_over(true, &[&hop_a, &hop_b, &hop_c]);
+        let s = MemoryPotStorage::default();
+        s.store_record(&pot_row(&join.id())).await.unwrap();
+        s.store_record(&hop_row(&hop_a, None)).await.unwrap();
+        s.store_record(&hop_row(&hop_b, Some(&"ee".repeat(32))))
+            .await
+            .unwrap();
+        s.store_beef(&join.id(), &atomic(&join)).await.unwrap();
+        let got = record_join_hop_spends(&s, &join.id()).await;
+        assert_eq!(got.marked, vec![Outpoint::new(hop_a.id(), 0)], "{got:?}");
+        assert_eq!(got.already_spent, 1);
+        let a = s.get_spent_status(&hop_a.id(), 0).await.unwrap().unwrap();
+        assert!(
+            a.spent && !a.spent_confirmed,
+            "an unconfirmed pointer: {a:?}"
+        );
+        assert_eq!(a.spending_txid.as_deref(), Some(join.id().as_str()));
+        let b = s.get_spent_status(&hop_b.id(), 0).await.unwrap().unwrap();
+        assert_eq!(b.spending_txid, Some("ee".repeat(32)), "never re-pointed");
+        assert!(
+            s.get_spent_status(&hop_c.id(), 0).await.unwrap().is_none(),
+            "never created"
+        );
+        assert!(
+            record_join_hop_spends(&s, &join.id())
+                .await
+                .marked
+                .is_empty(),
+            "idempotent"
+        );
+
+        // A mined JOIN whose stored bytes were compacted to the JOIN alone: the existing hop rows still name it.
+        let bare = join_over(false, &[&hop_a, &hop_c]);
+        let s = MemoryPotStorage::default();
+        s.store_record(&pot_row(&bare.id())).await.unwrap();
+        s.store_record(&hop_row(&hop_a, None)).await.unwrap();
+        s.store_beef(&bare.id(), &atomic(&bare)).await.unwrap();
+        let got = record_join_hop_spends(&s, &bare.id()).await;
+        assert_eq!(got.marked, vec![Outpoint::new(hop_a.id(), 0)], "{got:?}");
+
+        // The pot not held (its rows evicted): nothing written.
+        let s = MemoryPotStorage::default();
+        s.store_record(&hop_row(&hop_a, None)).await.unwrap();
+        s.store_beef(&join.id(), &atomic(&join)).await.unwrap();
+        let got = record_join_hop_spends(&s, &join.id()).await;
+        assert!(
+            got.marked.is_empty() && got.skipped == Some("the pot is not held"),
+            "{got:?}"
+        );
+        assert!(
+            !s.get_spent_status(&hop_a.id(), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent
+        );
+
+        // No JOIN (no covenant output), and stored bytes of another transaction: nothing written.
+        let mut plain = join_over(true, &[&hop_a]);
+        plain.outputs[0].locking_script = LockingScript::from_binary(&p2pkh_script(0x44)).unwrap();
+        plain.invalidate_caches();
+        let s = MemoryPotStorage::default();
+        s.store_record(&pot_row(&plain.id())).await.unwrap();
+        s.store_record(&hop_row(&hop_a, None)).await.unwrap();
+        s.store_beef(&plain.id(), &atomic(&plain)).await.unwrap();
+        assert_eq!(
+            record_join_hop_spends(&s, &plain.id()).await.skipped,
+            Some("no pot covenant output")
+        );
+        s.store_beef(&join.id(), &atomic(&plain)).await.unwrap();
+        assert_eq!(
+            record_join_hop_spends(&s, &join.id()).await.skipped,
+            Some("no pot covenant output")
+        );
+        assert!(
+            !s.get_spent_status(&hop_a.id(), 0)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent
+        );
     }
 
     #[test]

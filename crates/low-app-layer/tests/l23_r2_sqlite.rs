@@ -386,6 +386,7 @@ fn derive_for_hops(
         retired_spenders: &Default::default(),
         proof_mined_spenders: &Default::default(),
         funding_unheld: &Default::default(),
+        join_spent_hops: &Default::default(),
     })
 }
 
