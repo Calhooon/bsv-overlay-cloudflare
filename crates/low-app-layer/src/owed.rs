@@ -1140,7 +1140,8 @@ pub struct OwedInputs<'a> {
     /// serves no press unless the tracker's CHECKED `mined` word for the funding is in `spender_words`
     /// ([`checked_tracker_mined`]): its pre-signed refund spends an output the network does not hold, so ARC answers
     /// it `SEEN_IN_ORPHAN_MEMPOOL`. Absence from the set is today's judgement (a seen or proven funding, or a pot whose
-    /// funding was not read: a spent pot, which is never refund-due).
+    /// funding was not read: a spent pot, which is never refund-due). A word-store fault leaves the set's pots withheld
+    /// for that pass (the strict rule, latch or proof), never pressed on an unread word.
     pub funding_unheld: &'a HashSet<String>,
 }
 
@@ -1152,7 +1153,21 @@ pub const FUNDING_HELD_NONE: &str = "none";
 pub const FUNDING_NOT_HELD_CLAIM: &str = "funding-not-held";
 /// bsv-low #831: the sentence on that row.
 pub const FUNDING_NOT_HELD_REASON: &str =
-    "the pot's funding is not held by the network: nothing can spend it until it is seen; the stake returns through the sweep if the funding is refused";
+    "the pot's funding is not held by the network: nothing can spend it until the network sees it or the pot is retired";
+/// bsv-low #831 (the FIX-831 lens's L3): the durable `ops_counters` row (via `courier::note_presence_n`, the census
+/// flush; the overlay seeds it at 0), bumped once per pot a recompute judged funding-not-held, so the class a strict
+/// rule withholds for good (a mined funding the index never verified, with no latch and no `tx_words` row) is visible.
+pub const COUNTER_REFUND_FUNDING_UNHELD: &str = "owed_refund_funding_unheld_total";
+/// PURE: how many rows of one derivation are a refund-due pot judged funding-not-held (one row per pot).
+pub fn count_refund_funding_unheld(rows: &[OwedRow]) -> u64 {
+    rows.iter()
+        .filter(|r| r.facts.get("claim").and_then(|v| v.as_str()) == Some(FUNDING_NOT_HELD_CLAIM))
+        .count() as u64
+}
+/// bsv-low #831 (L3): the route counts the pass's funding-not-held pots ([`count_refund_funding_unheld`]).
+pub fn note_refund_funding_unheld(n: u64) {
+    crate::courier::note_presence_n(COUNTER_REFUND_FUNDING_UNHELD, n);
+}
 
 /// The 20-byte pkh of a standard P2PKH locking script (`76 a9 14 <20> 88 ac`), lowercase hex; `None` for any other lock.
 pub fn p2pkh_pkh_hex(lock: &[u8]) -> Option<String> {
@@ -3246,7 +3261,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     && valid.is_some();
                 // bsv-low #831: a refund spends the pot's funding output, so it can land only where the network holds
                 // that funding: the pot's SEEN latch, the index's proof, or the tracker's checked `mined` word. A
-                // funding held by nothing (a JOIN admitted pending, never witnessed, never mined) is no press.
+                // funding held by nothing (a JOIN admitted pending, never witnessed, never mined) is no press. A
+                // word-store fault leaves the set's pots withheld for that pass (the strict rule, latch or proof),
+                // never pressed on an unread word.
                 let funding_unheld = refund_due
                     && i.funding_unheld.contains(&e.pot_txid.to_ascii_lowercase())
                     && checked_tracker_mined(i.spender_words, &e.pot_txid) != Some(true);
@@ -4380,6 +4397,7 @@ pub fn owed_mirrored_counter_names() -> Vec<String> {
         .map(|n| n.to_string())
         .collect();
     names.push(COUNTER_RECOMPUTES.to_string());
+    names.push(COUNTER_REFUND_FUNDING_UNHELD.to_string());
     names.push("applayer_owed_read_faults_total".to_string());
     names.extend(
         OWED_READ_FAULT_KINDS
@@ -9178,6 +9196,59 @@ pub(crate) mod tests {
         let mut k = inputs(&e, &r, &[], &valid, &c, &p, Some(899_990));
         k.funding_unheld = &unheld;
         assert_eq!(derive_owed_rows(&k)[0].facts["claim"], "rejoin");
+    }
+
+    /// bsv-low #831 (the FIX-831 lens's L3): `owed_refund_funding_unheld_total` moves by exactly ONE for fix831_a's
+    /// pot judged funding-not-held, and by ZERO for the same pot with its funding held, through the shipped count and
+    /// the census's pending deltas (`courier::take_pending_if_due`, this test thread's own map).
+    #[test]
+    fn fix831_l3_the_funding_unheld_counter_moves_once_per_withheld_pot() {
+        let drained = || -> HashMap<String, u64> {
+            crate::courier::take_pending_if_due(1_000_000.0)
+                .into_iter()
+                .collect()
+        };
+        let e = [entry(
+            Some(false),
+            None,
+            Outcome::Unresolved,
+            Some(SeatLetter::A),
+        )];
+        let r = [refund_entry(RefundStatus::GateOpen)];
+        let mut valid = HashMap::new();
+        valid.insert(
+            format!("{}:0", tx(0x02)),
+            ValidRefund {
+                raw_hex: "00".into(),
+                my_sats: Some(19_800),
+            },
+        );
+        let (c, p) = (HashSet::new(), HashSet::new());
+        drained();
+        // held: no move
+        let held = derive_owed_rows(&inputs(&e, &r, &[], &valid, &c, &p, Some(900_005)));
+        assert_eq!(count_refund_funding_unheld(&held), 0);
+        note_refund_funding_unheld(count_refund_funding_unheld(&held));
+        assert_eq!(
+            drained().get(COUNTER_REFUND_FUNDING_UNHELD),
+            None,
+            "a held funding moves nothing"
+        );
+        // unheld: exactly one
+        let unheld: HashSet<String> = [tx(0x02)].into_iter().collect();
+        let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(900_005));
+        i.funding_unheld = &unheld;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(count_refund_funding_unheld(&rows), 1);
+        note_refund_funding_unheld(count_refund_funding_unheld(&rows));
+        assert_eq!(
+            drained().get(COUNTER_REFUND_FUNDING_UNHELD),
+            Some(&1),
+            "one pot judged funding-not-held is one increment"
+        );
+        assert!(owed_mirrored_counter_names()
+            .iter()
+            .any(|n| n == COUNTER_REFUND_FUNDING_UNHELD));
     }
 
     #[test]
