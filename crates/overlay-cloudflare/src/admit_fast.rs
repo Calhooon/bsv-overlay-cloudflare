@@ -5475,4 +5475,952 @@ mod tests {
         assert_eq!(run.uncorroborated, 0);
         assert_eq!(run.live_rows, 0);
     }
+
+    // ── bsv-low #831 half 2: the retire pass ENDS a ghost pot (the eviction), and looks again at its backlog ──
+
+    /// The retire pass's world over real SQLite (the shipped schema): the SHIPPED steps (`retire_candidate`,
+    /// `end_retired_pot`, `run_retire_backlog`) run here as the worker runs them. Arcade's live word and the two
+    /// indexers are given per txid (default: Arcade 404, both indexers absent); the look folds the recorded word the
+    /// SHIPPED way (`fold_arcade_look`). The eviction is `evict_txid_everywhere_repointed`'s steps over the same
+    /// connection: the SHIPPED core (`evict_core`: the OPEN marker first, the two passes), the SHIPPED release
+    /// statements (`select_pot_spends_sql`, `release_pot_spends_sql`), the SHIPPED merge and close
+    /// (`merge_released`, `CLOSE_EVICTION_MARKER_SQL`); its notes and counters are the wrapper's D1-only halves.
+    mod i831 {
+        use super::*;
+        use crate::proof_fetcher::{
+            end_retired_pot, fold_arcade_look, retire_backlog_start, retire_candidate,
+            retire_eviction_reason, run_retire_backlog, ArcadeLook, NetworkPresence,
+            RetireBacklogSummary, RetireCandidateRow, RetireEnd, RetirePort, RetireStore,
+            RetireSummary, RETIRE_BACKLOG_CANDIDATES_SQL, RETIRE_BACKLOG_LIMIT,
+            RETIRE_BACKLOG_WINDOW, RETIRE_CANDIDATES_POT_BEEFS_SQL,
+            RETIRE_CANDIDATES_TRANSACTIONS_SQL, RETIRE_LATCH_CLEAR_SQL, RETIRE_POT_BEEFS_SQL,
+            RETIRE_REASON_MARK, RETIRE_TRANSACTIONS_SQL, TX_ANY_VERDICT_DELETE_SQL,
+            TX_ANY_VERDICT_UPSERT_SQL,
+        };
+        use overlay_discovery::pot::storage::eviction_chain_word;
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+
+        pub(super) const NOW: i64 = 1_800_000_000_000;
+        pub(super) const HOUR: i64 = 3_600_000;
+
+        type Word = (ArcadeLook, Option<NetworkPresence>, Option<NetworkPresence>);
+
+        pub(super) struct SqliteRetire {
+            pub(super) db: SqliteShadow,
+            words: RefCell<HashMap<String, Word>>,
+            /// Every courier call, in order: `arcade <txid>`, `bitails <txid>`, `woc <txid>`.
+            pub(super) asked: RefCell<Vec<String>>,
+            pub(super) persisted: RefCell<Vec<(&'static str, u64)>>,
+            /// The backlog read answers this instead of its SQL (the belt's pin).
+            answer_rows: RefCell<Option<Vec<RetireCandidateRow>>>,
+            /// The backlog read's start key (`None`: the shipped one, `retire_backlog_start`).
+            start: RefCell<Option<String>>,
+        }
+
+        impl SqliteRetire {
+            pub(super) fn new() -> Self {
+                Self {
+                    db: SqliteShadow::new(shipped_conn()),
+                    words: RefCell::new(HashMap::new()),
+                    asked: RefCell::new(Vec::new()),
+                    persisted: RefCell::new(Vec::new()),
+                    answer_rows: RefCell::new(None),
+                    start: RefCell::new(None),
+                }
+            }
+            pub(super) fn say(
+                &self,
+                txid: &str,
+                arcade: ArcadeLook,
+                bitails: Option<NetworkPresence>,
+                woc: Option<NetworkPresence>,
+            ) {
+                self.words
+                    .borrow_mut()
+                    .insert(txid.to_string(), (arcade, bitails, woc));
+            }
+            fn word(&self, txid: &str) -> Word {
+                self.words.borrow().get(txid).cloned().unwrap_or((
+                    ArcadeLook::Missing,
+                    Some(NetworkPresence::Absent),
+                    Some(NetworkPresence::Absent),
+                ))
+            }
+            pub(super) fn conn(&self) -> &rusqlite::Connection {
+                &self.db.conn
+            }
+            pub(super) fn total(&self, name: &str) -> u64 {
+                self.persisted
+                    .borrow()
+                    .iter()
+                    .filter(|(n, _)| *n == name)
+                    .map(|(_, d)| d)
+                    .sum()
+            }
+        }
+
+        impl RetirePort for SqliteRetire {
+            async fn arcade(&self, txid: &str, evidence: Option<(String, String)>) -> ArcadeLook {
+                self.asked.borrow_mut().push(format!("arcade {txid}"));
+                fold_arcade_look(self.word(txid).0, evidence)
+            }
+            async fn bitails(&self, txid: &str) -> Option<NetworkPresence> {
+                self.asked.borrow_mut().push(format!("bitails {txid}"));
+                self.word(txid).1
+            }
+            async fn woc(&self, txid: &str) -> Option<NetworkPresence> {
+                self.asked.borrow_mut().push(format!("woc {txid}"));
+                self.word(txid).2
+            }
+            async fn latch(
+                &self,
+                store: RetireStore,
+                txid: &str,
+                reason: &str,
+                now_ms: i64,
+            ) -> Result<(), String> {
+                let r = match store {
+                    RetireStore::Transactions => self.conn().execute(
+                        RETIRE_TRANSACTIONS_SQL,
+                        rusqlite::params![now_ms, reason, txid],
+                    ),
+                    RetireStore::PotBeefs => self.conn().execute(RETIRE_POT_BEEFS_SQL, [txid]),
+                };
+                r.map(|_| ()).map_err(|e| e.to_string())
+            }
+            async fn latched(
+                &self,
+                _store: RetireStore,
+                txid: &str,
+                reason: &str,
+                _look: &ArcadeLook,
+                now_ms: i64,
+            ) {
+                let kind = crate::proof_fetcher::verdict_kind_of_retire_reason(reason);
+                self.conn()
+                    .execute(
+                        TX_ANY_VERDICT_UPSERT_SQL,
+                        rusqlite::params![txid, now_ms, kind, reason],
+                    )
+                    .unwrap();
+            }
+            async fn live_pot_rows(&self, txid: &str) -> Result<u64, String> {
+                ShadowDb::count(&self.db, "pot_records", "txid", txid).await
+            }
+            async fn evict(&self, txid: &str, reason: &str, asked_ms: u64) -> Result<bool, String> {
+                let core = evict_core(&self.db, txid, reason, asked_ms).await;
+                assert!(core.faults.is_empty(), "{:?}", core.faults);
+                if core.yielded_to_readmission.is_some() {
+                    return Ok(false);
+                }
+                let pot_cols = cols(self.conn(), "pot_records");
+                let rows: Vec<(String, i64, i64)> = self
+                    .conn()
+                    .prepare(&select_pot_spends_sql(&pot_cols))
+                    .unwrap()
+                    .query_map([txid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                self.conn()
+                    .execute(&release_pot_spends_sql(&pot_cols), [txid])
+                    .unwrap();
+                let released: Vec<ReleasedSpend> = rows
+                    .into_iter()
+                    .filter(|r| r.2 == 0)
+                    .map(|r| ReleasedSpend {
+                        table: "pot_records".into(),
+                        txid: r.0,
+                        vout: r.1 as u32,
+                    })
+                    .collect();
+                use rusqlite::OptionalExtension;
+                let existing: Option<String> = self
+                    .conn()
+                    .query_row(RELEASED_SPENDS_SQL, [txid], |r| r.get(0))
+                    .optional()
+                    .unwrap()
+                    .flatten();
+                let merged = merge_released(existing.as_deref(), &released);
+                self.conn()
+                    .execute(
+                        CLOSE_EVICTION_MARKER_SQL,
+                        rusqlite::params![
+                            txid,
+                            reason,
+                            asked_ms as i64,
+                            core.moved as i64,
+                            serde_json::to_string(&merged).unwrap()
+                        ],
+                    )
+                    .unwrap();
+                Ok(true)
+            }
+            async fn backlog_candidates(
+                &self,
+                now_ms: i64,
+                start: &str,
+            ) -> Result<Vec<RetireCandidateRow>, String> {
+                if let Some(rows) = self.answer_rows.borrow_mut().take() {
+                    return Ok(rows);
+                }
+                let start = self
+                    .start
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| start.to_string());
+                read_candidates(
+                    self.conn(),
+                    RETIRE_BACKLOG_CANDIDATES_SQL,
+                    rusqlite::params![now_ms, start],
+                )
+            }
+            async fn clear_latch(&self, txid: &str) -> Result<(), String> {
+                self.conn()
+                    .execute(RETIRE_LATCH_CLEAR_SQL, [txid])
+                    .map_err(|e| e.to_string())?;
+                self.conn()
+                    .execute(TX_ANY_VERDICT_DELETE_SQL, [txid])
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            async fn persist(&self, deltas: &[(&'static str, u64)]) {
+                self.persisted.borrow_mut().extend_from_slice(deltas);
+            }
+            fn now_ms(&self) -> i64 {
+                NOW
+            }
+        }
+
+        fn read_candidates(
+            conn: &rusqlite::Connection,
+            sql: &str,
+            params: impl rusqlite::Params,
+        ) -> Result<Vec<RetireCandidateRow>, String> {
+            let mut st = conn.prepare(sql).map_err(|e| e.to_string())?;
+            let rows = st
+                .query_map(params, |r| {
+                    Ok(RetireCandidateRow {
+                        txid: r.get(0)?,
+                        age_secs: r.get::<_, f64>(1)?,
+                        term_status: r.get(2)?,
+                        term_extra: r.get(3)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(rows)
+        }
+
+        /// #831's shape: a JOIN admitted pending (its covenant pot row, its output and two applied rows, its engine
+        /// row, its stored BEEF unproven, `admitted_ago_ms` old on the watch's clock) that spent two hops (their
+        /// rows live, their pointers naming it, unconfirmed). `latched`: the pot_beefs row already latched
+        /// `structurally_unprovable` and off the watch (the backlog's shape).
+        pub(super) fn seed_ghost_join(
+            conn: &rusqlite::Connection,
+            join: &str,
+            hops: &[&str],
+            admitted_ago_ms: i64,
+            latched: bool,
+        ) {
+            let at = NOW - admitted_ago_ms;
+            conn.execute(
+                "INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind, pubA, stakeA) VALUES (?1, 0, 0, ?2, 'covenant', '02aa', 9900)",
+                rusqlite::params![join, at / 1000],
+            )
+            .unwrap();
+            for hop in hops {
+                conn.execute(
+                    "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed, spentAt, createdAt) VALUES (?1, 0, 1, ?2, 0, ?3, ?4)",
+                    rusqlite::params![hop, join, at / 1000, at / 1000 - 60],
+                )
+                .unwrap();
+            }
+            conn.execute("INSERT INTO outputs (txid, outputIndex, outputScript, topic, satoshis, spent) VALUES (?1, 0, X'51', 'tm_pot', 19800, 0)", [join]).unwrap();
+            for topic in ["tm_pot", "tm_lowfund"] {
+                conn.execute(
+                    "INSERT INTO applied_transactions (txid, topic) VALUES (?1, ?2)",
+                    rusqlite::params![join, topic],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO transactions (txid, beef, has_proof, created_at) VALUES (?1, X'00', 0, ?2)",
+                rusqlite::params![join, at / 1000],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pot_beefs (txid, beef, createdAt, has_proof, structurally_unprovable) VALUES (?1, X'0100beef', ?2, 0, ?3)",
+                rusqlite::params![join, at / 1000, if latched { Some(1) } else { None }],
+            )
+            .unwrap();
+            if !latched {
+                conn.execute(
+                    "INSERT INTO proofless_watch (txid, first_seen_ms) VALUES (?1, ?2)",
+                    rusqlite::params![join, at],
+                )
+                .unwrap();
+            }
+        }
+
+        /// The retire pass's pot_beefs arm over the shipped candidate read: every candidate through the shipped step.
+        pub(super) async fn retire_pot_beefs(port: &SqliteRetire) -> RetireSummary {
+            let mut summary = RetireSummary::default();
+            for (sql, store) in [
+                (
+                    RETIRE_CANDIDATES_TRANSACTIONS_SQL,
+                    RetireStore::Transactions,
+                ),
+                (RETIRE_CANDIDATES_POT_BEEFS_SQL, RetireStore::PotBeefs),
+            ] {
+                let rows = read_candidates(port.conn(), sql, rusqlite::params![NOW]).unwrap();
+                for row in rows {
+                    retire_candidate(port, store, &row, &mut summary).await;
+                }
+            }
+            summary
+        }
+
+        pub(super) fn ledger(
+            conn: &rusqlite::Connection,
+            txid: &str,
+        ) -> Option<(String, Option<i64>, Vec<ReleasedSpend>)> {
+            use rusqlite::OptionalExtension;
+            conn.query_row(
+                "SELECT reason, readmittedAt, releasedSpends FROM pot_evictions WHERE txid = ?1",
+                [txid],
+                |r| {
+                    let json: Option<String> = r.get(2)?;
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        json.and_then(|j| serde_json::from_str(&j).ok())
+                            .unwrap_or_default(),
+                    ))
+                },
+            )
+            .optional()
+            .unwrap()
+        }
+
+        pub(super) fn hop(conn: &rusqlite::Connection, txid: &str) -> (i64, Option<String>) {
+            conn.query_row(
+                "SELECT spent, spendingTxid FROM pot_records WHERE txid = ?1",
+                [txid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        }
+
+        fn latch_of(conn: &rusqlite::Connection, txid: &str) -> Option<i64> {
+            conn.query_row(
+                "SELECT structurally_unprovable FROM pot_beefs WHERE txid = ?1",
+                [txid],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        fn memo_kind(conn: &rusqlite::Connection, txid: &str) -> Option<String> {
+            use rusqlite::OptionalExtension;
+            conn.query_row(
+                "SELECT kind FROM tx_any_verdicts WHERE txid = ?1",
+                [txid],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+        }
+
+        /// The ended pot's end state, common to (a) and (b): every row of the JOIN shadow-moved, the pot_beefs bytes
+        /// kept and latched, both hops released into the ledger's list, the ledger OPEN under the retire reason, and
+        /// that reason serving no chain word.
+        fn assert_ended(port: &SqliteRetire, join: &str, hops: &[&str], verdict_head: &str) {
+            let c = port.conn();
+            assert_eq!(
+                count(c, "pot_records", "txid", join),
+                0,
+                "the pot row left the index"
+            );
+            assert_eq!(
+                count(c, "pot_records_evicted", "txid", join),
+                1,
+                "shadow-moved, not deleted"
+            );
+            assert_eq!(count(c, "outputs", "txid", join), 0);
+            assert_eq!(count(c, "applied_transactions", "txid", join), 0);
+            assert_eq!(count(c, "transactions", "txid", join), 0);
+            assert_eq!(
+                count(c, "pot_beefs", "txid", join),
+                1,
+                "the bytes stay: the readmission's source"
+            );
+            assert_eq!(latch_of(c, join), Some(1));
+            for h in hops {
+                assert_eq!(hop(c, h), (0, None), "the JOIN's spend of {h} released");
+            }
+            let (reason, readmitted, released) = ledger(c, join).expect("the ledger row");
+            assert_eq!(readmitted, None, "open");
+            assert!(reason.starts_with(RETIRE_REASON_MARK), "{reason}");
+            assert!(reason.contains(verdict_head), "{reason}");
+            assert_eq!(
+                eviction_chain_word(&reason),
+                None,
+                "a retire eviction serves no chain word: {reason}"
+            );
+            let mut got: Vec<String> = released.iter().map(|r| r.txid.clone()).collect();
+            got.sort();
+            let mut want: Vec<String> = hops.iter().map(|h| h.to_string()).collect();
+            want.sort();
+            assert_eq!(got, want, "releasedSpends names both hops");
+            assert_eq!(port.total(crate::ops::COUNTER_RETIRE_EVICTED), 1);
+        }
+
+        /// (a) A never-held JOIN admitted pending, 49 h proofless, Arcade 404 and both indexers absent: the retire
+        /// pass's absence verdict latches it AND evicts it (where `659e54cc` only latched it). A `pot_beefs` row with
+        /// no pot row (not a pot) and a `transactions`-only row are latched and nothing more.
+        #[tokio::test]
+        async fn i831_a_a_never_held_pot_at_the_48h_absence_verdict_is_evicted_by_the_retire_pass()
+        {
+            let port = SqliteRetire::new();
+            let join = "83".repeat(32);
+            let hops = ["a1".repeat(32), "b1".repeat(32)];
+            let hop_refs: Vec<&str> = hops.iter().map(String::as_str).collect();
+            seed_ghost_join(port.conn(), &join, &hop_refs, 49 * HOUR, false);
+            // the controls: a stored BEEF that keys no pot row, and an engine row alone, both as dead
+            let refund = "e1".repeat(32);
+            port.conn()
+                .execute(
+                    "INSERT INTO pot_beefs (txid, beef, createdAt, has_proof) VALUES (?1, X'00', ?2, 0)",
+                    rusqlite::params![refund, (NOW - 49 * HOUR) / 1000],
+                )
+                .unwrap();
+            port.conn()
+                .execute(
+                    "INSERT INTO proofless_watch (txid, first_seen_ms) VALUES (?1, ?2)",
+                    rusqlite::params![refund, NOW - 49 * HOUR],
+                )
+                .unwrap();
+            let summary = retire_pot_beefs(&port).await;
+            // the JOIN is a candidate of both stores; the refund of pot_beefs only
+            assert_ended(&port, &join, &hop_refs, "network-absent ");
+            assert_eq!(summary.retired, 3, "{summary:?}");
+            assert_eq!(
+                summary.evicted_on_retire, 1,
+                "only the live pot is ended: {summary:?}"
+            );
+            assert_eq!(summary.evict_faults, 0);
+            assert_eq!(
+                memo_kind(port.conn(), &join).as_deref(),
+                Some("retired"),
+                "the retire memo stands"
+            );
+            assert_eq!(latch_of(port.conn(), &refund), Some(1));
+            assert_eq!(ledger(port.conn(), &refund), None, "no pot, no eviction");
+        }
+
+        /// (b) The same pot 2 h proofless with Arcade's LIVE fatal word and both indexers absent: the 1 h arm retires
+        /// and ends it; its reason carries Arcade's word and still serves no chain word.
+        #[tokio::test]
+        async fn i831_b_a_live_fatal_word_at_1h_ends_the_pot_likewise() {
+            let port = SqliteRetire::new();
+            let join = "84".repeat(32);
+            let hops = ["a2".repeat(32), "b2".repeat(32)];
+            let hop_refs: Vec<&str> = hops.iter().map(String::as_str).collect();
+            seed_ghost_join(port.conn(), &join, &hop_refs, 2 * HOUR, false);
+            port.say(
+                &join,
+                ArcadeLook::Fatal(
+                    "REJECTED".into(),
+                    "arcade live REJECTED: missing inputs".into(),
+                ),
+                Some(NetworkPresence::Absent),
+                Some(NetworkPresence::Absent),
+            );
+            let summary = retire_pot_beefs(&port).await;
+            assert_eq!(summary.evicted_on_retire, 1, "{summary:?}");
+            assert_ended(&port, &join, &hop_refs, "arcade REJECTED: ");
+            assert_eq!(memo_kind(port.conn(), &join).as_deref(), Some("refused"));
+            // the same pot under a fault only (no word, no record): kept, never ended
+            let port = SqliteRetire::new();
+            seed_ghost_join(port.conn(), &join, &hop_refs, 2 * HOUR, false);
+            port.say(&join, ArcadeLook::Fault, None, None);
+            let summary = retire_pot_beefs(&port).await;
+            assert_eq!(
+                (summary.retired, summary.evicted_on_retire),
+                (0, 0),
+                "{summary:?}"
+            );
+            assert_eq!(count(port.conn(), "pot_records", "txid", &join), 1);
+        }
+
+        /// (c) The backlog pass leaves a latched pot the fresh look finds HELD: an indexer holds it (in a mempool),
+        /// or WoC names its block, or Arcade's live word is non-terminal. Each is left alone, its latch and memo
+        /// cleared, its rows and its hops' pointers untouched, counted `left`; beside them, a latched pot the look
+        /// finds absent at 49 h is evicted (the pass does evict).
+        #[tokio::test]
+        async fn i831_c_a_latched_pot_the_re_look_finds_mined_or_held_is_left_alone() {
+            let port = SqliteRetire::new();
+            let held = [
+                (
+                    "c1".repeat(32),
+                    ArcadeLook::Missing,
+                    Some(NetworkPresence::Present { height: None }),
+                    None,
+                ),
+                (
+                    "c2".repeat(32),
+                    ArcadeLook::Missing,
+                    Some(NetworkPresence::Absent),
+                    Some(NetworkPresence::Present {
+                        height: Some(918_000),
+                    }),
+                ),
+                ("c3".repeat(32), ArcadeLook::Present, None, None),
+            ];
+            for (i, (pot, arcade, bitails, woc)) in held.iter().enumerate() {
+                let h = format!("{:02x}", 0xd0 + i).repeat(32);
+                seed_ghost_join(port.conn(), pot, &[&h], 49 * HOUR, true);
+                port.conn()
+                    .execute(
+                        TX_ANY_VERDICT_UPSERT_SQL,
+                        rusqlite::params![pot, NOW - HOUR, "retired", "stale"],
+                    )
+                    .unwrap();
+                port.say(pot, arcade.clone(), *bitails, *woc);
+            }
+            let dead = "c9".repeat(32);
+            let dead_hop = "d9".repeat(32);
+            seed_ghost_join(port.conn(), &dead, &[&dead_hop], 49 * HOUR, true);
+            *port.start.borrow_mut() = Some(String::new());
+            let summary = run_retire_backlog(&port).await;
+            assert_eq!(
+                summary,
+                RetireBacklogSummary {
+                    scanned: 4,
+                    evicted: 1,
+                    left: 3,
+                    kept: 0,
+                    faults: 0
+                },
+            );
+            for (i, (pot, ..)) in held.iter().enumerate() {
+                let h = format!("{:02x}", 0xd0 + i).repeat(32);
+                assert_eq!(
+                    count(port.conn(), "pot_records", "txid", pot),
+                    1,
+                    "{pot} left alone"
+                );
+                assert_eq!(
+                    hop(port.conn(), &h),
+                    (1, Some(pot.clone())),
+                    "its hop's pointer stands"
+                );
+                assert_eq!(ledger(port.conn(), pot), None, "no eviction");
+                assert_eq!(
+                    latch_of(port.conn(), pot),
+                    None,
+                    "the latch cleared: the proof machinery takes it back"
+                );
+                assert_eq!(
+                    memo_kind(port.conn(), pot),
+                    None,
+                    "the stale memo goes with the latch"
+                );
+            }
+            assert_eq!(
+                count(port.conn(), "pot_records", "txid", &dead),
+                0,
+                "the absent one is evicted"
+            );
+            assert_eq!(hop(port.conn(), &dead_hop), (0, None));
+            assert_eq!(port.total(crate::ops::COUNTER_RETIRE_BACKLOG_SCANNED), 4);
+            assert_eq!(port.total(crate::ops::COUNTER_RETIRE_BACKLOG_LEFT), 3);
+            assert_eq!(port.total(crate::ops::COUNTER_RETIRE_BACKLOG_EVICTED), 1);
+        }
+
+        /// (d) The backlog pass never evicts on the memo alone (the lens's L-H2-1): a pot latched with a `retired`
+        /// memo 49 h old and an `arc_terminal` REJECTED on record is asked again, Arcade first, then both indexers,
+        /// BEFORE any decision; a fresh mined look leaves it; a look where every courier faults keeps it latched
+        /// and live (the recorded word takes the absence arm, and absence needs both indexers).
+        #[tokio::test]
+        async fn i831_d_the_backlog_pass_never_evicts_on_the_memo_alone() {
+            let port = SqliteRetire::new();
+            let mined = "f1".repeat(32);
+            let blind = "f2".repeat(32);
+            for pot in [&mined, &blind] {
+                seed_ghost_join(port.conn(), pot, &[], 49 * HOUR, true);
+                port.conn()
+                    .execute(
+                        TX_ANY_VERDICT_UPSERT_SQL,
+                        rusqlite::params![pot, NOW - 40 * HOUR, "retired", "network-absent"],
+                    )
+                    .unwrap();
+                port.conn()
+                    .execute(
+                        "INSERT INTO arc_terminal (txid, status, extra, first_ms) VALUES (?1, 'REJECTED', 'recorded', ?2)",
+                        rusqlite::params![pot, NOW - 40 * HOUR],
+                    )
+                    .unwrap();
+            }
+            port.say(
+                &mined,
+                ArcadeLook::Missing,
+                Some(NetworkPresence::Absent),
+                Some(NetworkPresence::Present {
+                    height: Some(918_100),
+                }),
+            );
+            port.say(&blind, ArcadeLook::Fault, None, None);
+            *port.start.borrow_mut() = Some(String::new());
+            let summary = run_retire_backlog(&port).await;
+            assert_eq!(
+                summary,
+                RetireBacklogSummary {
+                    scanned: 2,
+                    evicted: 0,
+                    left: 1,
+                    kept: 1,
+                    faults: 0
+                },
+            );
+            assert_eq!(
+                *port.asked.borrow(),
+                vec![
+                    format!("arcade {mined}"),
+                    format!("bitails {mined}"),
+                    format!("woc {mined}"),
+                    format!("arcade {blind}"),
+                    format!("bitails {blind}"),
+                    format!("woc {blind}"),
+                ],
+                "every candidate is looked at again before any decision"
+            );
+            for pot in [&mined, &blind] {
+                assert_eq!(
+                    count(port.conn(), "pot_records", "txid", pot),
+                    1,
+                    "{pot} stays"
+                );
+                assert_eq!(ledger(port.conn(), pot), None);
+            }
+            assert_eq!(
+                latch_of(port.conn(), &blind),
+                Some(1),
+                "no answer: still latched, looked at again later"
+            );
+            assert_eq!(memo_kind(port.conn(), &blind).as_deref(), Some("retired"));
+            assert_eq!(latch_of(port.conn(), &mined), None);
+        }
+
+        /// (e) A MINED push after the retire eviction readmits the pot byte for byte: the readmission's steps over
+        /// the same connection (the SHIPPED `restore_twins`, the SHIPPED re-mark of the ledger's `releasedSpends`,
+        /// the stamp). Every row the JOIN keyed comes back exactly as it was; each hop's pointer names the JOIN again,
+        /// unconfirmed (the re-mark's stated shape); the ledger is closed; the chain word stays none.
+        #[tokio::test]
+        async fn i831_e_a_mined_push_after_the_retire_eviction_readmits_byte_for_byte() {
+            let port = SqliteRetire::new();
+            let join = "85".repeat(32);
+            let hops = ["a5".repeat(32), "b5".repeat(32)];
+            let hop_refs: Vec<&str> = hops.iter().map(String::as_str).collect();
+            seed_ghost_join(port.conn(), &join, &hop_refs, 49 * HOUR, false);
+            let snapshot =
+                |c: &rusqlite::Connection| -> Vec<(String, Vec<rusqlite::types::Value>)> {
+                    let mut out = Vec::new();
+                    for (table, key) in [
+                        ("pot_records", "txid"),
+                        ("outputs", "txid"),
+                        ("applied_transactions", "txid"),
+                        ("transactions", "txid"),
+                    ] {
+                        let mut st = c
+                            .prepare(&format!(
+                                "SELECT * FROM \"{table}\" WHERE \"{key}\" = ?1 ORDER BY rowid"
+                            ))
+                            .unwrap();
+                        let n = st.column_count();
+                        let rows: Vec<Vec<rusqlite::types::Value>> = st
+                            .query_map([&join], |r| {
+                                (0..n)
+                                    .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                                    .collect()
+                            })
+                            .unwrap()
+                            .map(Result::unwrap)
+                            .collect();
+                        for row in rows {
+                            out.push((table.to_string(), row));
+                        }
+                    }
+                    out.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+                    out
+                };
+            // the pass's transactions arm runs first and latches the JOIN's engine row (`retired_ms`, its reason):
+            // the rows the eviction then finds are the ones it must give back
+            let mut summary = RetireSummary::default();
+            for row in read_candidates(
+                port.conn(),
+                RETIRE_CANDIDATES_TRANSACTIONS_SQL,
+                rusqlite::params![NOW],
+            )
+            .unwrap()
+            {
+                retire_candidate(&port, RetireStore::Transactions, &row, &mut summary).await;
+            }
+            assert_eq!(
+                (summary.retired, summary.evicted_on_retire),
+                (1, 0),
+                "the engine row is latched, never ended"
+            );
+            let before = snapshot(port.conn());
+            assert_eq!(
+                before.len(),
+                5,
+                "the pot row, its output, two applied rows, its engine row"
+            );
+            let summary = retire_pot_beefs(&port).await;
+            assert_eq!(summary.evicted_on_retire, 1);
+            assert!(snapshot(port.conn()).is_empty(), "evicted");
+            // ---- the readmission (`readmit_if_evicted` on a MINED push) ----
+            let (_, _, released) = ledger(port.conn(), &join).expect("the ledger row");
+            let (restored, faults) = restore_twins(&port.db, &join).await;
+            assert!(faults.is_empty(), "{faults:?}");
+            assert_eq!(restored, 5);
+            let (remark, with_at) = remark_pot_spend_sql(&cols(port.conn(), "pot_records"));
+            assert!(with_at);
+            for r in &released {
+                port.conn()
+                    .execute(
+                        &remark,
+                        rusqlite::params![&join, NOW / 1000, &r.txid, r.vout],
+                    )
+                    .unwrap();
+            }
+            port.conn()
+                .execute(
+                    "UPDATE pot_evictions SET readmittedAt = ?1 WHERE txid = ?2 AND readmittedAt IS NULL",
+                    rusqlite::params![NOW + 1, &join],
+                )
+                .unwrap();
+            assert_eq!(
+                snapshot(port.conn()),
+                before,
+                "every row the JOIN keyed, byte for byte"
+            );
+            for h in &hops {
+                assert_eq!(
+                    hop(port.conn(), h),
+                    (1, Some(join.clone())),
+                    "the hop's pointer names the JOIN again"
+                );
+            }
+            for t in [
+                "pot_records_evicted",
+                "outputs_evicted",
+                "applied_transactions_evicted",
+                "transactions_evicted",
+            ] {
+                assert_eq!(count(port.conn(), t, "txid", &join), 0, "{t} empty again");
+            }
+            let (reason, readmitted, _) = ledger(port.conn(), &join).unwrap();
+            assert_eq!(readmitted, Some(NOW + 1));
+            assert_eq!(eviction_chain_word(&reason), None);
+        }
+
+        /// (f) Both arms' retire reasons map to no chain word in `eviction_chain_word`, whatever text Arcade's
+        /// `extraInfo` echoes after the mark (a rejection mark, a conflict mark); and the mark is one of the absence
+        /// marks, read before the rejection marks.
+        #[test]
+        fn i831_f_the_retire_eviction_reason_maps_to_no_chain_word() {
+            use crate::proof_fetcher::{retire_verdict, RETIRE_ABSENT_MIN_AGE_SECS};
+            let absent = Some(false);
+            let arms = [
+                retire_verdict(
+                    &ArcadeLook::Missing,
+                    absent,
+                    absent,
+                    RETIRE_ABSENT_MIN_AGE_SECS,
+                )
+                .unwrap(),
+                retire_verdict(
+                    &ArcadeLook::Recorded("REJECTED".into(), "arcade live REJECTED".into()),
+                    absent,
+                    absent,
+                    RETIRE_ABSENT_MIN_AGE_SECS,
+                )
+                .unwrap(),
+                retire_verdict(
+                    &ArcadeLook::Fatal("REJECTED".into(), "bad".into()),
+                    absent,
+                    absent,
+                    3_600,
+                )
+                .unwrap(),
+                retire_verdict(
+                    &ArcadeLook::Fatal(
+                        "DOUBLE_SPEND_ATTEMPTED".into(),
+                        "arcade live x; re-refused at the ladder)".into(),
+                    ),
+                    absent,
+                    absent,
+                    3_600,
+                )
+                .unwrap(),
+                retire_verdict(
+                    &ArcadeLook::Fatal(
+                        "REJECTED".into(),
+                        "input aa:0 spent by confirmed competitor bb at 1".into(),
+                    ),
+                    absent,
+                    absent,
+                    3_600,
+                )
+                .unwrap(),
+            ];
+            for verdict in arms {
+                let reason = retire_eviction_reason(&verdict);
+                assert!(reason.starts_with(RETIRE_REASON_MARK), "{reason}");
+                assert_eq!(eviction_chain_word(&reason), None, "{reason}");
+            }
+            assert!(
+                overlay_discovery::pot::storage::ABSENCE_REASON_MARKS.contains(&RETIRE_REASON_MARK)
+            );
+            // the other producers' words are unchanged by the mark
+            assert_eq!(
+                eviction_chain_word("REJECTED (arcade live REJECTED: x; both indexers absent)"),
+                Some("rejected")
+            );
+            assert_eq!(
+                eviction_chain_word(&conflict_eviction_reason(
+                    &"aa".repeat(32),
+                    1,
+                    &"bb".repeat(32),
+                    1
+                )),
+                Some("conflicted")
+            );
+        }
+
+        /// (g) The backlog pass's bounds and its counters on the summary line: at most eight candidates a pass (20
+        /// latched live pots drain 8, 8, 4, 0, each pass's deltas persisted per candidate); the read is a window of
+        /// 256 latched txids from a start key that moves (300 latched non-pots below a live pot hide it from a pass
+        /// started at the bottom and not from one started past them); a port answering more than eight is cut at
+        /// eight; the two callers print `end_line` beside the conflict pass's words, and the five counters are seeded.
+        #[tokio::test]
+        async fn i831_g_the_backlog_pass_is_bounded_and_counted_on_the_summary_line() {
+            assert_eq!(RETIRE_BACKLOG_LIMIT, 8);
+            assert_eq!(RETIRE_BACKLOG_WINDOW, 256);
+            assert!(RETIRE_BACKLOG_CANDIDATES_SQL.contains("ORDER BY txid LIMIT 256) s"));
+            assert!(RETIRE_BACKLOG_CANDIDATES_SQL.ends_with("ORDER BY b.txid LIMIT 8"));
+            let port = SqliteRetire::new();
+            for i in 0..20 {
+                let pot = format!("{:064x}", 0x1000 + i);
+                seed_ghost_join(port.conn(), &pot, &[], 49 * HOUR, true);
+            }
+            *port.start.borrow_mut() = Some(String::new());
+            let mut evicted = Vec::new();
+            for _ in 0..4 {
+                evicted.push(run_retire_backlog(&port).await.evicted);
+            }
+            assert_eq!(evicted, vec![8, 8, 4, 0]);
+            assert_eq!(port.total(crate::ops::COUNTER_RETIRE_BACKLOG_SCANNED), 20);
+            assert_eq!(port.total(crate::ops::COUNTER_RETIRE_BACKLOG_EVICTED), 20);
+            assert_eq!(
+                port.persisted.borrow().len(),
+                40,
+                "two deltas a candidate, persisted per candidate"
+            );
+            // the window: 300 latched non-pots below one live pot
+            let port = SqliteRetire::new();
+            for i in 0..300 {
+                port.conn()
+                    .execute(
+                        "INSERT INTO pot_beefs (txid, beef, createdAt, has_proof, structurally_unprovable) VALUES (?1, X'00', 1, 0, 1)",
+                        [format!("{:064x}", i)],
+                    )
+                    .unwrap();
+            }
+            let pot = format!("{:064x}", 0x9999);
+            seed_ghost_join(port.conn(), &pot, &[], 49 * HOUR, true);
+            *port.start.borrow_mut() = Some(String::new());
+            assert_eq!(
+                run_retire_backlog(&port).await.scanned,
+                0,
+                "past the window from the bottom"
+            );
+            *port.start.borrow_mut() = Some(format!("{:064x}", 200));
+            assert_eq!(
+                run_retire_backlog(&port).await.evicted,
+                1,
+                "inside a later window"
+            );
+            // the start key moves with the clock and is a 16-digit hex key
+            let a = retire_backlog_start(NOW);
+            assert_eq!(a.len(), 16);
+            assert!(a
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+            assert_ne!(a, retire_backlog_start(NOW + 60_000));
+            // the belt: a port answering twenty rows is walked for eight
+            let port = SqliteRetire::new();
+            let rows: Vec<RetireCandidateRow> = (0..20)
+                .map(|i| RetireCandidateRow {
+                    txid: format!("{:064x}", 0x5000 + i),
+                    age_secs: 0.0,
+                    term_status: None,
+                    term_extra: None,
+                })
+                .collect();
+            *port.answer_rows.borrow_mut() = Some(rows);
+            let s = run_retire_backlog(&port).await;
+            assert_eq!((s.scanned, s.kept), (8, 8), "{s:?}");
+            // the summary line's words, printed by both callers after the conflict pass's
+            let mut summary = RetireSummary {
+                evicted_on_retire: 2,
+                evict_faults: 1,
+                ..RetireSummary::default()
+            };
+            summary.backlog = RetireBacklogSummary {
+                scanned: 8,
+                evicted: 3,
+                left: 2,
+                kept: 2,
+                faults: 1,
+            };
+            assert_eq!(
+                summary.end_line(),
+                "evicted_on_retire=2 evict_faults=1 backlog: scanned=8 evicted=3 left=2 kept=2 faults=1"
+            );
+            for (name, src) in [
+                ("lib.rs", include_str!("lib.rs")),
+                ("tick.rs", include_str!("tick.rs")),
+            ] {
+                let src: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+                assert!(
+                    src.contains("conflict:scanned={}evicted={}faults={}{}\",")
+                        && src.contains("retire.conflict.faults,retire.end_line(),);"),
+                    "{name} prints the retire pass's end words"
+                );
+            }
+            let ops: String = include_str!("ops.rs")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(ops.contains(
+                "COUNTER_ADMIT_FAST_CONFLICT_FAULTS,//bsv-low#831half2:theretirepass'sevictionsanditsbacklogpassCOUNTER_RETIRE_EVICTED,COUNTER_RETIRE_BACKLOG_SCANNED,COUNTER_RETIRE_BACKLOG_EVICTED,COUNTER_RETIRE_BACKLOG_LEFT,COUNTER_RETIRE_EVICT_FAULTS,"
+            ), "the five counters are served from 0");
+        }
+
+        /// The end step itself: a fault of the live read or of the eviction is a `Fault`, never an eviction.
+        #[tokio::test]
+        async fn i831_the_end_step_answers_no_live_pot_for_a_non_pot() {
+            let port = SqliteRetire::new();
+            assert_eq!(
+                end_retired_pot(&port, &"77".repeat(32), "x", NOW).await,
+                RetireEnd::NoLivePot
+            );
+        }
+    }
 }

@@ -1596,7 +1596,7 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
     )
     .await;
     worker::console_log!(
-        "complete-proofs: retire-pass — scanned={} retired={} kept_present={} kept_uncertain={} conflict: scanned={} evicted={} faults={}",
+        "complete-proofs: retire-pass ; scanned={} retired={} kept_present={} kept_uncertain={} conflict: scanned={} evicted={} faults={} {}",
         retire.scanned,
         retire.retired,
         retire.kept_present,
@@ -1604,6 +1604,7 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
         retire.conflict.scanned,
         retire.conflict.evicted,
         retire.conflict.faults,
+        retire.end_line(),
     );
     // 4b'. bsv-low #649 D3-H1: the parked pot and hop notes (a background flush withheld them), delivered by the
     //    SHARED drain the scheduled handler runs (D4-L1): the `*/15` tick is the observed trigger and this route

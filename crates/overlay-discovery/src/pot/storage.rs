@@ -305,11 +305,21 @@ pub const CONFLICT_REASON_MARK: &str = " spent by confirmed competitor ";
 /// word filled it (a push to the public `/arc-ingest`, or the watch's earlier look), so the eviction rests on that
 /// record and the absence, never on Arcade's live word. It opens that arm's reason, and absence is read before
 /// rejection, so a recorded text carrying a rejection mark is still no word.
-pub const ABSENCE_REASON_MARKS: [&str; 3] = [
+///
+/// The fourth (bsv-low #831 half 2) is the retire pass's: an eviction the retire pass makes when its verdict retires
+/// a pot whose JOIN no courier holds (`proof_fetcher::retire_eviction_reason`, both of its arms: Arcade's live
+/// terminal word at 1 h and absence at 48 h, each with both indexers absent). It ENDS a ghost pot in the index; it is
+/// never a void on the felt, so it serves no chain word, whatever text the verdict's reason carries after it.
+pub const ABSENCE_REASON_MARKS: [&str; 4] = [
     "arcade missing, both indexers absent",
     "arcade faulted, both indexers absent",
     "arcade faulted, recorded ",
+    RETIRE_REASON_MARK,
 ];
+
+/// bsv-low #831 half 2: the mark every retire-pass eviction's ledger reason OPENS with (one of
+/// [`ABSENCE_REASON_MARKS`]).
+pub const RETIRE_REASON_MARK: &str = "retired unprovable: ";
 
 /// bsv-low #621 (L5): the marks of an eviction on Arcade's OWN terminal word (REJECTED / DOUBLE_SPEND_ATTEMPTED,
 /// with both indexers absent): `evidence_verdict`'s Fatal arm, and the door's re-refusal at the ladder

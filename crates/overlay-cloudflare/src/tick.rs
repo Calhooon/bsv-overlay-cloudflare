@@ -767,7 +767,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     )
     .await;
     worker::console_log!(
-        "Scheduled: retire-pass ; scanned={} retired={} kept_present={} kept_uncertain={} conflict: scanned={} evicted={} faults={}",
+        "Scheduled: retire-pass ; scanned={} retired={} kept_present={} kept_uncertain={} conflict: scanned={} evicted={} faults={} {}",
         retire.scanned,
         retire.retired,
         retire.kept_present,
@@ -775,6 +775,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         retire.conflict.scanned,
         retire.conflict.evicted,
         retire.conflict.faults,
+        retire.end_line(),
     );
 
     // 5. Admitted-but-network-absent rebroadcast backstop (bsv-low #273,
