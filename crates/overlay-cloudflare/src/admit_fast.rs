@@ -56,11 +56,6 @@ pub enum CallbackAction {
     EvidenceCheck(String),
     /// A lifecycle status below SEEN (RECEIVED, STORED, ANNOUNCED …): nothing to do.
     Ignore,
-    /// bsv-low #836: a REJECTED whose `extraInfo` names TX_LOCK_TIME (35) ([`crate::door_words::lock_time_not_final`]):
-    /// held, not final. No evidence check, no eviction: a non-final transaction cannot be held by any node yet, so
-    /// its absence proves nothing. Counted (`arc_ingest_lock_time_not_final_total`). A planted text can only delay
-    /// this push's check (the fail-safe direction); Arcade's own later pushes and the passes still read it live.
-    HoldNotFinal(String),
 }
 
 /// P0-2d (bsv-stack-lean #52): through the one reading of Arcade's words
@@ -75,13 +70,12 @@ pub fn callback_action(tx_status: &str) -> CallbackAction {
     crate::door_words::callback(crate::door_words::arcade_hint(tx_status, "", 0).as_ref())
 }
 
-/// bsv-low #836: [`callback_action`] over the push's `extraInfo` too: a REJECTED that names TX_LOCK_TIME (35) is
-/// [`CallbackAction::HoldNotFinal`], never an evidence check; every other push reads exactly as [`callback_action`].
-pub fn callback_action_with(tx_status: &str, extra_info: &str) -> CallbackAction {
-    match crate::door_words::lock_time_not_final(tx_status, extra_info) {
-        Some(_) => CallbackAction::HoldNotFinal(tx_status.trim().to_ascii_uppercase()),
-        None => callback_action(tx_status),
-    }
+/// bsv-low #836 fold (the lens's L1): whether a push names Arcade's non-final word. Counted only
+/// (`arc_ingest_lock_time_not_final_total`): the push itself is [`callback_action`]'s, the evidence check, whose LIVE
+/// look decides (a real non-final word refuses nothing there while the chain's bound holds), so a planted text buys
+/// nothing. The bearer is the public subject txid.
+pub fn push_names_lock_time(tx_status: &str, extra_info: &str) -> bool {
+    crate::door_words::lock_time_not_final(tx_status, extra_info).is_some()
 }
 
 /// The tables a txid can own rows in, and the columns that key them.
@@ -2080,14 +2074,10 @@ pub fn evidence_verdict(
     use crate::proof_fetcher::{ArcadeLook, NetworkPresence};
     match arcade {
         ArcadeLook::Present => EvidenceVerdict::Present,
-        // bsv-low #836: Arcade's non-final word, live or recorded, is a time, never a refusal: only the indexers'
-        // presence speaks, and nothing is refused.
+        // bsv-low #836: Arcade's LIVE non-final word, inside the chain's bound (`door_words::bound_look`), is a time,
+        // never a refusal: only the indexers' presence speaks, and nothing is refused. A RECORDED lock-time word is
+        // the public bearer's and reads as any recorded word (#740's floor; the lens's L1).
         ArcadeLook::NotFinal(status, extra) => {
-            never_refused(bitails, woc, not_final_uncertain_reason(status, extra))
-        }
-        ArcadeLook::Recorded(status, extra)
-            if crate::door_words::lock_time_not_final(status, extra).is_some() =>
-        {
             never_refused(bitails, woc, not_final_uncertain_reason(status, extra))
         }
         // bsv-low #845: Arcade's rank below SEEN is a hint that promotes nothing: never presence, never a refusal.
@@ -2197,9 +2187,22 @@ pub async fn evidence_check(
     webhook: (String, String),
 ) -> EvidenceVerdict {
     let sources = crate::proof_fetcher::ProofSources::from_env(&env.env);
-    let look = sources
+    let mut look = sources
         .arcade_look(&env.arcade_base, txid, Some(webhook))
         .await;
+    // bsv-low #836 fold (the lens's M1): a non-final word past the chain's bound is Arcade's refusal again
+    if matches!(look, crate::proof_fetcher::ArcadeLook::NotFinal(..)) {
+        let tracker = crate::lookup_service_chain_tracker(&env.env);
+        let bound = match env.env.d1("OVERLAY_DB") {
+            Ok(db) => stored_lock_bound(tracker.as_deref(), &db, txid).await,
+            Err(_) => crate::door_words::LockBound {
+                lock: None,
+                tip: crate::door_words::chain_tip(tracker.as_deref()).await,
+                now_secs: crate::door_words::now_secs(),
+            },
+        };
+        look = crate::door_words::bound_look(look, &bound);
+    }
     let indexers = async {
         let b = sources.bitails_presence(txid).await;
         let w = sources.woc_presence(env.woc_api_key.as_deref(), txid).await;
@@ -2239,6 +2242,50 @@ pub(crate) async fn verdict_of_look(
             .await
             .is_none_or(|age| age < REFUSAL_ABSENT_MIN_AGE_MS);
     evidence_verdict(look, bitails, woc, young)
+}
+
+/// bsv-low #836 fold (the lens's M1): where the subject's own bytes are read for its lock, in order: the engine's
+/// store, then the pot store (`?` the txid, lowercase). The first BEEF that carries the subject decides.
+pub(crate) const SUBJECT_BEEF_SQL: [&str; 2] = [
+    "SELECT hex(beef) AS beef FROM transactions WHERE txid = ?",
+    "SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?",
+];
+
+#[derive(serde::Deserialize)]
+struct SubjectBeefRow {
+    beef: Option<String>,
+}
+
+/// bsv-low #836 fold (the lens's M1): what bounds a non-final word's hold for `txid`: its own lock from its stored
+/// bytes ([`SUBJECT_BEEF_SQL`]; `None` when no store holds them or a read faults), the chaintracks tip (`None`: no
+/// tracker, or a fault) and the clock. Asked only of a non-final look (at most two reads and one tip).
+pub async fn stored_lock_bound(
+    tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
+    db: &worker::D1Database,
+    txid: &str,
+) -> crate::door_words::LockBound {
+    let key = txid.to_ascii_lowercase();
+    let mut lock = None;
+    for sql in SUBJECT_BEEF_SQL {
+        let row = crate::d1::Query::new(sql)
+            .bind(key.as_str())
+            .fetch_optional::<SubjectBeefRow>(db)
+            .await;
+        if let Some(found) = row
+            .ok()
+            .flatten()
+            .and_then(|r| crate::d1::beef_of_hex_column(r.beef))
+            .and_then(|beef| crate::door_words::SubjectLock::of_beef(&beef, &key))
+        {
+            lock = Some(found);
+            break;
+        }
+    }
+    crate::door_words::LockBound {
+        lock,
+        tip: crate::door_words::chain_tip(tracker).await,
+        now_secs: crate::door_words::now_secs(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -2493,9 +2540,16 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
     let mut last = crate::broadcaster::WitnessLook::Unknown;
     // bsv-low #836: a non-final look is counted once a watch
     let mut not_final_counted = false;
+    let tracker = crate::lookup_service_chain_tracker(&env.env);
     for sleep in PENDING_WATCH_SLEEPS_MS {
         crate::broadcaster::sleep_ms(sleep).await;
         last = arcade.witness_look(&txid).await;
+        // bsv-low #836 fold (the lens's M1): a non-final look past the chain's bound is Arcade's fatal word again, and
+        // the watch runs its evidence check as for any other
+        if let crate::broadcaster::WitnessLook::NotFinal(..) = &last {
+            let bound = stored_lock_bound(tracker.as_deref(), &db, &txid).await;
+            last = crate::broadcaster::bound_witness_look(last, &bound);
+        }
         match &last {
             crate::broadcaster::WitnessLook::Seen(status, at_ms) => {
                 crate::ops::latch_network_seen(&db, &txid, crate::ops::SeenSource::Arcade, *at_ms).await;
@@ -2577,7 +2631,7 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
             // bsv-low #836: Arcade's non-final REJECTED (TX_LOCK_TIME (35)): held, not final. No evidence check,
             // no eviction; the watch keeps looking (a later look may be SEEN) and ends with the subject unlatched;
             // the callbacks and the passes re-look after the lock height passes.
-            crate::broadcaster::WitnessLook::NotFinal(status, nf) => {
+            crate::broadcaster::WitnessLook::NotFinal(status, _, nf) => {
                 if !not_final_counted {
                     not_final_counted = true;
                     crate::ops::bump_counter(
@@ -3472,9 +3526,9 @@ mod tests {
         let status_arm = f
             .find("ArcIngestBody::StatusOnly {")
             .expect("the status-only arm");
-        // bsv-low #836: the decision reads the push's extraInfo for the non-final word alone
+        // bsv-low #836 fold (the lens's L1): the decision reads the status word alone again
         let action = f
-            .find("crate::admit_fast::callback_action_with(")
+            .find("crate::admit_fast::callback_action(&tx_status)")
             .expect("the decision");
         let witness = f
             .find("crate::admit_fast::witness_job(")
@@ -5644,6 +5698,8 @@ mod tests {
             pub(super) after_look: RefCell<Option<AfterLook>>,
             /// The FIX-831-B lens's LOW-2: the eviction answers incomplete (a release that faulted).
             pub(super) incomplete: std::cell::Cell<bool>,
+            /// bsv-low #836 fold: the chain's bound a non-final look is asked against.
+            pub(super) bound: std::cell::Cell<crate::door_words::LockBound>,
         }
 
         /// The LOW-1 pin's hook: run over the connection and the txid after the courier look.
@@ -5693,6 +5749,7 @@ mod tests {
                     largest_ending: std::cell::Cell::new(0),
                     after_look: RefCell::new(None),
                     incomplete: std::cell::Cell::new(false),
+                    bound: std::cell::Cell::new(crate::door_words::LockBound::default()),
                 }
             }
             fn stmt(&self, n: u64) {
@@ -5736,6 +5793,10 @@ mod tests {
                     hook(self.conn(), txid);
                 }
                 fold_arcade_look(self.word(txid).0, evidence)
+            }
+            async fn lock_bound(&self, txid: &str) -> crate::door_words::LockBound {
+                self.asked.borrow_mut().push(format!("lock_bound {txid}"));
+                self.bound.get()
             }
             async fn bitails(&self, txid: &str) -> Option<NetworkPresence> {
                 self.asked.borrow_mut().push(format!("bitails {txid}"));
@@ -6123,6 +6184,65 @@ mod tests {
                 1,
                 "one ending counted, by the arm or the backlog that made it"
             );
+        }
+
+        /// bsv-low #836 fold (the lens's M1): the retire pass bounds Arcade's non-final word by the chain, through the
+        /// shipped `retire_evidence` over the port: inside the window (the subject's own lock height against the tip,
+        /// plus `NOT_FINAL_LAG_BLOCKS`) it is held and the 1 h arm is not reached; past it the word is Arcade's fatal
+        /// word again and takes the 1 h terminal arm, as any other; a subject FINAL by its bytes is never held; the
+        /// bound is asked of a non-final look only.
+        #[tokio::test]
+        async fn fix836f_m1_the_retire_pass_bounds_a_non_final_look_by_the_chain() {
+            use crate::door_words::{LockBound, SubjectLock};
+            use crate::proof_fetcher::retire_evidence;
+            let port = SqliteRetire::new();
+            let refund = "f8".repeat(32);
+            let extra = "TX_LOCK_TIME (35): lock time (972185) as block height is not less than block height (972172)";
+            port.say(
+                &refund,
+                ArcadeLook::NotFinal("REJECTED".into(), extra.into()),
+                Some(NetworkPresence::Absent),
+                Some(NetworkPresence::Absent),
+            );
+            let at = |tip: u64, lock: SubjectLock| LockBound {
+                lock: Some(lock),
+                tip: Some(tip),
+                now_secs: 0,
+            };
+            port.bound.set(at(972_185, SubjectLock::Height(972_185)));
+            let held = retire_evidence(&port, &refund, None).await;
+            assert!(matches!(held.look, ArcadeLook::NotFinal(..)), "{:?}", held.look);
+            assert_eq!(crate::proof_fetcher::retire_verdict(&held.look, held.bitails, held.woc, 7_200), None);
+            // the last tip inside the window, then the first past it
+            port.bound.set(at(972_208, SubjectLock::Height(972_185)));
+            let edge = retire_evidence(&port, &refund, None).await;
+            assert!(matches!(edge.look, ArcadeLook::NotFinal(..)), "{:?}", edge.look);
+            port.bound.set(at(972_209, SubjectLock::Height(972_185)));
+            let past = retire_evidence(&port, &refund, None).await;
+            assert_eq!(past.look, ArcadeLook::Fatal("REJECTED".into(), extra.into()));
+            let reason = crate::proof_fetcher::retire_verdict(&past.look, past.bitails, past.woc, 7_200)
+                .expect("past the lag the word is Arcade's own: the 1 h terminal arm");
+            assert!(reason.starts_with("arcade REJECTED: TX_LOCK_TIME (35)"), "{reason}");
+            // a subject final by its bytes is never held, even at the loop 44 tip
+            port.bound.set(at(972_185, SubjectLock::Final));
+            let final_ = retire_evidence(&port, &refund, None).await;
+            assert!(matches!(final_.look, ArcadeLook::Fatal(..)), "{:?}", final_.look);
+            // no tip (no tracker, or a fault): held, fail-safe; the 48 h absence arm still ends it
+            port.bound.set(LockBound {
+                lock: Some(SubjectLock::Height(972_185)),
+                tip: None,
+                now_secs: 0,
+            });
+            let blind = retire_evidence(&port, &refund, None).await;
+            assert!(matches!(blind.look, ArcadeLook::NotFinal(..)));
+            assert!(crate::proof_fetcher::retire_verdict(&blind.look, blind.bitails, blind.woc, 49 * 3_600).is_some());
+            // the bound is asked of a non-final look only
+            let other = "f9".repeat(32);
+            port.say(&other, ArcadeLook::Missing, Some(NetworkPresence::Absent), Some(NetworkPresence::Absent));
+            let _ = retire_evidence(&port, &other, None).await;
+            let asked = port.asked.borrow();
+            assert_eq!(asked.iter().filter(|a| a.starts_with("lock_bound")).count(), 5, "{asked:?}");
+            assert!(!asked.iter().any(|a| *a == format!("lock_bound {other}")), "{asked:?}");
         }
 
         /// (a) A never-held JOIN admitted pending, 49 h proofless, Arcade 404 and both indexers absent: the retire

@@ -764,6 +764,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         &arcade_base,
         woc_key.as_deref(),
         crate::proof_fetcher::ProofSources::from_env(env),
+        crate::lookup_service_chain_tracker(env),
     )
     .await;
     worker::console_log!(

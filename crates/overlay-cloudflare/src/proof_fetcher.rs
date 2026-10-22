@@ -4595,6 +4595,9 @@ pub(crate) enum RetireEviction {
 pub(crate) trait RetirePort {
     /// Arcade's live word on the txid, the recorded `arc_terminal` word filling a fault ([`arcade_look`]).
     async fn arcade(&self, txid: &str, evidence: Option<(String, String)>) -> ArcadeLook;
+    /// bsv-low #836 fold (the lens's M1): what bounds a non-final word's hold, the subject's own lock from its stored
+    /// bytes and the chaintracks tip ([`crate::admit_fast::stored_lock_bound`]). Asked only of a `NotFinal` look.
+    async fn lock_bound(&self, txid: &str) -> crate::door_words::LockBound;
     /// Bitails' presence (`None`: could not say).
     async fn bitails(&self, txid: &str) -> Option<NetworkPresence>;
     /// WhatsOnChain's presence (`None`: could not say).
@@ -4729,7 +4732,12 @@ pub(crate) async fn retire_evidence<P: RetirePort>(
     txid: &str,
     evidence: Option<(String, String)>,
 ) -> RetireEvidence {
-    let look = port.arcade(txid, evidence).await;
+    let mut look = port.arcade(txid, evidence).await;
+    // bsv-low #836 fold (the lens's M1): a non-final word past the chain's bound is Arcade's refusal again, judged
+    // as any other (the 1 h terminal arm)
+    if matches!(look, ArcadeLook::NotFinal(..)) {
+        look = crate::door_words::bound_look(look, &port.lock_bound(txid).await);
+    }
     if matches!(look, ArcadeLook::Present) {
         return RetireEvidence {
             look,
@@ -5257,6 +5265,8 @@ struct WorkerRetire<'a> {
     arcade_base: &'a str,
     woc_api_key: Option<&'a str>,
     sources: ProofSources,
+    /// bsv-low #836 fold: the chaintracks tip a non-final word's hold is bounded by.
+    tracker: Option<Rc<dyn ChainTracker>>,
 }
 
 impl RetirePort for WorkerRetire<'_> {
@@ -5264,6 +5274,9 @@ impl RetirePort for WorkerRetire<'_> {
         self.sources
             .arcade_look(self.arcade_base, txid, evidence)
             .await
+    }
+    async fn lock_bound(&self, txid: &str) -> crate::door_words::LockBound {
+        crate::admit_fast::stored_lock_bound(self.tracker.as_deref(), self.db, txid).await
     }
     async fn bitails(&self, txid: &str) -> Option<NetworkPresence> {
         self.sources.bitails_presence(txid).await
@@ -5425,6 +5438,7 @@ pub async fn run_retire_pass(
     arcade_base: &str,
     woc_api_key: Option<&str>,
     sources: ProofSources,
+    tracker: Option<Rc<dyn ChainTracker>>,
 ) -> RetireSummary {
     use crate::d1::Query;
     let port = WorkerRetire {
@@ -5432,6 +5446,7 @@ pub async fn run_retire_pass(
         arcade_base,
         woc_api_key,
         sources,
+        tracker,
     };
     let budget = RetireBudget::begin(&port);
     let conflict = crate::admit_fast::confirmed_conflict_pass(db, woc_api_key, sources).await;
@@ -5561,6 +5576,7 @@ pub async fn internal_retire_pass(
             &arcade_base,
             woc_key.as_deref(),
             ProofSources::from_env(env),
+            crate::lookup_service_chain_tracker(env),
         ),
     )
     .await;
@@ -6811,8 +6827,9 @@ pub(crate) mod tests {
                 "{w:?}"
             );
         }
-        // bsv-low #845: Arcade's ranks below SEEN are a hint, never presence
-        for w in ["RECEIVED", "sent_to_network", "ACCEPTED_BY_NETWORK"] {
+        // bsv-low #845: Arcade's ranks below SEEN are a hint, never presence; the #836 fold's L3: so are its two words
+        // that carry no network verdict
+        for w in ["RECEIVED", "sent_to_network", "ACCEPTED_BY_NETWORK", "PENDING_RETRY", "unknown"] {
             assert_eq!(
                 live_arcade_look(w, x()),
                 ArcadeLook::Holding(w.to_ascii_uppercase()),
@@ -6828,8 +6845,6 @@ pub(crate) mod tests {
             )
         );
         for w in [
-            "PENDING_RETRY",
-            "UNKNOWN",
             "SEEN_ON_NETWORK",
             "STUMP_PROCESSING",
             "immutable",

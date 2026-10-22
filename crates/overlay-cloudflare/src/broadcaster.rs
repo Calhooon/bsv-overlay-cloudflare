@@ -95,10 +95,10 @@ pub(crate) enum WitnessLook {
     /// REJECTED / DOUBLE_SPEND_ATTEMPTED (status, extra_info): the evidence
     /// check decides, never this look alone.
     Fatal(String, String),
-    /// bsv-low #836: Arcade's REJECTED that names TX_LOCK_TIME (35): held, not final (the word and what the text
-    /// says, its peer's height a hint). No evidence check, no eviction: the watch keeps looking and ends with the
-    /// subject unlatched; the callbacks and the passes re-look after the lock height passes.
-    NotFinal(String, crate::door_words::NotFinal),
+    /// bsv-low #836: Arcade's REJECTED that names TX_LOCK_TIME (35): held, not final (the word, Arcade's text and
+    /// what the text says, its peer's height a hint). No evidence check, no eviction while the chain's bound holds
+    /// ([`bound_witness_look`]): the watch keeps looking and ends with the subject unlatched.
+    NotFinal(String, String, crate::door_words::NotFinal),
     /// An orphan view: Arcade cannot see the parents; a verdict neither way.
     Orphan(String),
     /// A lifecycle status below SEEN: keep watching.
@@ -121,11 +121,23 @@ pub(crate) fn witness_look_of(
         ),
         GateVerdict::Fatal => match crate::door_words::lock_time_not_final(&tx_status, &extra_info)
         {
-            Some(nf) => WitnessLook::NotFinal(tx_status, nf),
+            Some(nf) => WitnessLook::NotFinal(tx_status, extra_info, nf),
             None => WitnessLook::Fatal(tx_status, extra_info),
         },
         GateVerdict::Orphan => WitnessLook::Orphan(tx_status),
         GateVerdict::Pending => WitnessLook::Pending(tx_status),
+    }
+}
+
+/// PURE (bsv-low #836 fold, the lens's M1): the watch's look under the chain's bound: a `NotFinal` past it
+/// (`door_words::not_final_holds`) is Arcade's `Fatal` word again, and the watch runs its evidence check; every other
+/// look is itself.
+pub(crate) fn bound_witness_look(look: WitnessLook, bound: &crate::door_words::LockBound) -> WitnessLook {
+    match look {
+        WitnessLook::NotFinal(status, extra, nf) if !crate::door_words::not_final_holds(&nf, bound) => {
+            WitnessLook::Fatal(status, extra)
+        }
+        look => look,
     }
 }
 
@@ -2041,11 +2053,13 @@ pub fn terminal_at_arcade_by_presence(
     subject_txid: &str,
     arcade_status: &str,
     extra_info: &str,
+    bound: &crate::door_words::LockBound,
 ) -> Result<ArcOutcome, String> {
     use crate::proof_fetcher::NetworkPresence;
     // bsv-low #836: Arcade's non-final word (REJECTED naming TX_LOCK_TIME (35)) is a time, never a verdict: mined
-    // presence admits as for every terminal word; anything else is the retryable answer, never a 422.
-    if let Some(nf) = crate::door_words::lock_time_not_final(arcade_status, extra_info) {
+    // presence admits as for every terminal word; anything else is the retryable answer, never a 422. The fold (the
+    // lens's M1): only while the chain's bound holds; past it the word is judged as every terminal word below.
+    if let Some(nf) = crate::door_words::lock_time_not_final_under(arcade_status, extra_info, bound) {
         return match presence {
             NetworkPresence::Present { height: Some(_) } => {
                 Ok(ArcOutcome::Accepted(subject_txid.to_string()))
@@ -2213,6 +2227,23 @@ pub fn terminal_ask_allowed_in(
     true
 }
 
+/// bsv-low #836 fold: the most txids one isolate remembers re-feeding (a bound on the memo, never on a body).
+pub const REFEED_MEMO_CAP: usize = 1_024;
+
+thread_local! {
+    static REFED: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// bsv-low #836 fold (the lens's M1, part 3): `true` the first time this isolate re-feeds `txid` past its lock bound,
+/// `false` after (and once [`REFEED_MEMO_CAP`] txids are held: no re-feed, the judgement stands).
+pub fn refeed_once(txid: &str) -> bool {
+    REFED.with(|r| {
+        let mut r = r.borrow_mut();
+        r.len() < REFEED_MEMO_CAP && r.insert(txid.to_ascii_lowercase())
+    })
+}
+
 thread_local! {
     static TERMINAL_MEMO: std::cell::RefCell<std::collections::HashMap<String, (crate::proof_fetcher::NetworkPresence, f64)>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
@@ -2263,10 +2294,11 @@ impl TerminalJudgement {
         capped: bool,
         arcade_status: &str,
         extra_info: &str,
+        bound: &crate::door_words::LockBound,
     ) -> Self {
         let judged = Self::of(presence, young, capped);
         if judged != TerminalJudgement::Present
-            && crate::door_words::lock_time_not_final(arcade_status, extra_info).is_some()
+            && crate::door_words::lock_time_not_final_under(arcade_status, extra_info, bound).is_some()
         {
             TerminalJudgement::NotFinal
         } else {
@@ -2495,9 +2527,49 @@ pub struct ArcadeBroadcaster {
     /// poll, stored echo or pre-flight probe; a corroborator's accept), with its stamp when its answer carried one.
     /// The route latches `network_seen` under this name ([`Self::witnessed_by`]).
     witnessed_by: std::cell::Cell<Option<(crate::ops::SeenSource, Option<i64>)>>,
+    /// bsv-low #836 fold (the lens's M1): the chaintracks tip a non-final word's hold is bounded by.
+    chain_tracker: Option<std::rc::Rc<dyn bsv_rs::transaction::ChainTracker>>,
+    /// The subject's own lock, read from the bytes the door broadcasts (`broadcast_efs_gated`).
+    subject_lock: std::cell::Cell<Option<crate::door_words::SubjectLock>>,
+    /// The tip, asked once a request and only of a non-final word.
+    lock_tip: std::cell::Cell<Option<Option<u64>>>,
 }
 
 impl ArcadeBroadcaster {
+    /// bsv-low #836 fold: the chaintracks tip that bounds Arcade's non-final word at the door.
+    pub(crate) fn with_chain_tracker(
+        mut self,
+        tracker: Option<std::rc::Rc<dyn bsv_rs::transaction::ChainTracker>>,
+    ) -> Self {
+        self.chain_tracker = tracker;
+        self
+    }
+
+    /// bsv-low #836 fold (the lens's M1): the bound of a non-final word for this request's subject: its bytes' lock,
+    /// the tip (asked once), the clock.
+    async fn lock_bound(&self) -> crate::door_words::LockBound {
+        let tip = match self.lock_tip.get() {
+            Some(tip) => tip,
+            None => {
+                let tip = crate::door_words::chain_tip(self.chain_tracker.as_deref()).await;
+                self.lock_tip.set(Some(tip));
+                tip
+            }
+        };
+        crate::door_words::LockBound {
+            lock: self.subject_lock.get(),
+            tip,
+            now_secs: crate::door_words::now_secs(),
+        }
+    }
+
+    /// bsv-low #836 fold: Arcade's word as the door's non-final answer, under the chain's bound (the tip is asked
+    /// only when the text names TX_LOCK_TIME).
+    async fn not_final_now(&self, tx_status: &str, extra_info: &str) -> Option<crate::door_words::NotFinal> {
+        crate::door_words::lock_time_not_final(tx_status, extra_info)?;
+        crate::door_words::lock_time_not_final_under(tx_status, extra_info, &self.lock_bound().await)
+    }
+
     pub(crate) fn with_courier_counters(
         mut self,
         counters: crate::courier_counters::Counters,
@@ -2544,6 +2616,9 @@ impl ArcadeBroadcaster {
             registration_skipped: std::cell::Cell::new(0),
             legs_paused: std::cell::Cell::new(None),
             witnessed_by: std::cell::Cell::new(None),
+            chain_tracker: None,
+            subject_lock: std::cell::Cell::new(None),
+            lock_tip: std::cell::Cell::new(None),
         }
     }
 
@@ -2929,6 +3004,13 @@ impl ArcadeBroadcaster {
         if !efs.is_empty() && subject_ef.is_none() {
             return Err(format!("subject {subject_txid} not present in EF batch"));
         }
+        // bsv-low #836 fold (the lens's M1): the subject's own lock, from the bytes this door broadcasts
+        self.subject_lock.set(
+            subject_ef
+                .map(|e| e.ef.as_slice())
+                .or(mined_subject_raw)
+                .and_then(crate::door_words::SubjectLock::of_bytes),
+        );
 
         // INCIDENT D1-CALLBACK-FLOOD 2026-09-01 — pre-flight status probe: a
         // RE-PRESENT of a subject Arcade already witnessed ≥SEEN skips the
@@ -2941,7 +3023,14 @@ impl ArcadeBroadcaster {
         // on the echoed txid), so this is the same verdict cheaper, not a
         // weaker one. A probe miss (unknown/orphan/fatal/transport) changes
         // nothing — the ladder runs exactly as before.
-        let probe = self.tx_status(subject_txid).await;
+        let mut probe = self.tx_status(subject_txid).await;
+        // bsv-low #836 fold (the lens's M1, part 3): Arcade stores its peer's TX_LOCK_TIME line as a terminal
+        // REJECTED and never re-validates it ("resubmit after the locktime expires"); past the chain's bound the
+        // door re-feeds the subject ONCE an isolate, subject only, never registering a callback, and reads Arcade
+        // again: a SEEN then takes the pre-flight accept below, anything else is judged as every terminal word
+        if let Some(fresh) = self.refeed_past_lock_bound(&probe, subject_txid, subject_ef).await {
+            probe = Some(fresh);
+        }
         let probe_is_subject = probe
             .as_ref()
             .is_some_and(|r| r.txid.eq_ignore_ascii_case(subject_txid));
@@ -2996,12 +3085,19 @@ impl ArcadeBroadcaster {
             if source == "couriers" {
                 self.terminal_remember(subject_txid, presence, young, started);
             }
+            // bsv-low #836 fold: the chain's bound, asked only when Arcade's text names TX_LOCK_TIME
+            let bound = if crate::door_words::lock_time_not_final(probe_status, extra_info).is_some() {
+                self.lock_bound().await
+            } else {
+                crate::door_words::LockBound::default()
+            };
             let judgement = TerminalJudgement::of_word(
                 presence,
                 young,
                 source == "capped",
                 probe_status,
                 extra_info,
+                &bound,
             );
             self.terminal_ms
                 .set(self.terminal_ms.get() + (worker::js_sys::Date::now() - started));
@@ -3016,6 +3112,7 @@ impl ArcadeBroadcaster {
                 subject_txid,
                 probe_status,
                 extra_info,
+                &bound,
             );
         }
         // REGISTER ONCE PER TXID: a subject Arcade already holds (pending,
@@ -3182,10 +3279,9 @@ impl ArcadeBroadcaster {
                     GateVerdict::Fatal => {
                         // bsv-low #836: a non-final word is "not now" at the door: the retryable answer, never a
                         // resubmit's corroborated 422, never an admission
-                        if let Some(nf) = crate::door_words::lock_time_not_final(
-                            &parsed.tx_status,
-                            &parsed.extra_info,
-                        ) {
+                        if let Some(nf) =
+                            self.not_final_now(&parsed.tx_status, &parsed.extra_info).await
+                        {
                             self.terminal_judged.set(Some(TerminalJudgement::NotFinal));
                             return Err(lock_time_not_final_answer(
                                 subject_txid,
@@ -3384,10 +3480,8 @@ impl ArcadeBroadcaster {
                         // (reason ONLY — the gate above already decided on status).
                         stamp(&self.poll_ms);
                         // bsv-low #836: the one exception, a non-final word: "not now", the retryable answer
-                        if let Some(nf) = crate::door_words::lock_time_not_final(
-                            &resp.tx_status,
-                            &resp.extra_info,
-                        ) {
+                        if let Some(nf) = self.not_final_now(&resp.tx_status, &resp.extra_info).await
+                        {
                             self.terminal_judged.set(Some(TerminalJudgement::NotFinal));
                             return Err(lock_time_not_final_answer(txid, &resp.tx_status, &nf));
                         }
@@ -3458,6 +3552,39 @@ impl ArcadeBroadcaster {
     /// background job behind a fast admission). The echoed txid must match
     /// the asked one (gate L4), else `Unknown` — an upstream answering about
     /// something else never witnesses, never condemns, OUR subject.
+    /// bsv-low #836 fold (the lens's M1, part 3): a probe that reads Arcade's non-final word PAST the chain's bound
+    /// re-feeds the subject once ([`refeed_once`]: one per txid an isolate), subject only and with NO callback
+    /// registration (the D1-CALLBACK-FLOOD rule stands for every other terminal word), bounded at 2 s, then asks
+    /// Arcade again. `Some(look)`: the fresh look, which replaces the probe; `None`: no re-feed (inside the bound, no
+    /// lock-time word, no subject leg, already re-fed here).
+    async fn refeed_past_lock_bound(
+        &self,
+        probe: &Option<ArcadeStatusResponse>,
+        subject_txid: &str,
+        subject_ef: Option<&EfTx>,
+    ) -> Option<ArcadeStatusResponse> {
+        let p = probe.as_ref().filter(|r| r.txid.eq_ignore_ascii_case(subject_txid))?;
+        crate::door_words::lock_time_not_final(&p.tx_status, &p.extra_info)?;
+        if self.not_final_now(&p.tx_status, &p.extra_info).await.is_some() {
+            return None;
+        }
+        let leg = subject_ef?;
+        if !refeed_once(subject_txid) {
+            return None;
+        }
+        gate_log(&format!(
+            "[arcade] {subject_txid} {} TX_LOCK_TIME past the chain's bound (tip {:?}): re-fed once, subject only, no callback (#836)",
+            p.tx_status,
+            self.lock_tip.get().flatten()
+        ));
+        let _ = overlay_engine::gasp::race_or_deadline(
+            self.submit_ef(&self.tx_endpoint(), subject_txid, &leg.ef, false),
+            sleep_ms(2_000),
+        )
+        .await;
+        self.tx_status(subject_txid).await
+    }
+
     pub(crate) async fn witness_look(&self, txid: &str) -> WitnessLook {
         match self.tx_status(txid).await {
             Some(r) if r.txid.eq_ignore_ascii_case(txid) => {
@@ -4610,7 +4737,8 @@ mod tests {
                 false,
                 "subject",
                 "REJECTED",
-                ""
+                "",
+                &crate::door_words::LockBound::default(),
             )
             .unwrap(),
             ArcOutcome::Accepted("subject".into())
@@ -4623,7 +4751,8 @@ mod tests {
                 true,
                 "subject",
                 "REJECTED",
-                ""
+                "",
+                &crate::door_words::LockBound::default(),
             )
             .unwrap(),
             ArcOutcome::Accepted("subject".into()),
@@ -4635,6 +4764,7 @@ mod tests {
             "subject",
             "REJECTED",
             "",
+            &crate::door_words::LockBound::default(),
         )
         .unwrap();
         match refused {
@@ -4654,6 +4784,7 @@ mod tests {
             "subject",
             "REJECTED",
             "",
+            &crate::door_words::LockBound::default(),
         )
         .unwrap_err();
         assert!(
@@ -4666,6 +4797,7 @@ mod tests {
             "subject",
             "DOUBLE_SPEND_ATTEMPTED",
             "",
+            &crate::door_words::LockBound::default(),
         )
         .unwrap_err();
         assert!(
@@ -4757,6 +4889,7 @@ mod tests {
                 "x",
                 "REJECTED",
                 shapes[0],
+                &crate::door_words::LockBound::default(),
             )
             .unwrap_err(),
             terminal_at_arcade_by_presence(
@@ -4765,6 +4898,7 @@ mod tests {
                 "x",
                 "REJECTED",
                 "",
+                &crate::door_words::LockBound::default(),
             )
             .unwrap_err(),
         ] {
