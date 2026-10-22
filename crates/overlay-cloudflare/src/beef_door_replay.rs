@@ -1384,8 +1384,10 @@ mod e592 {
         ));
 
         let routes = include_str!("routes.rs");
+        // bsv-low #838: the synchronous submit's outcome is the gated arm's raced write or the plain await
+        assert!(routes.contains("_ => engine.submit_with_report(&tagged_beef, mode).await,"));
         let submit = routes
-            .find("let (steak, mutation_report) = match engine.submit_with_report(&tagged_beef, mode).await {")
+            .find("let (steak, mutation_report) = match engine_outcome {")
             .expect("the synchronous submit");
         let tail = &routes[submit..];
         assert!(tail.contains(

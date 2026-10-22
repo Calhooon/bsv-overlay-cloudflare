@@ -50,6 +50,9 @@ pub const COUNTER_SUBMIT_MUTATION_QUEUED: &str = "submit_mutation_queued_total";
 /// …of which the replay could NOT be queued and the submit was REFUSED
 /// (502 retryable). Sustained non-zero = the queue itself is unhealthy.
 pub const COUNTER_SUBMIT_MUTATION_REFUSED: &str = "submit_mutation_refused_total";
+/// bsv-low #838 (the FIX-838 lens's LOW-3): gated submissions deferred (the 202) because the engine write passed
+/// the arm's answer deadline, apart from NL-6c's EF-work deferrals (both answer the census reason `queued`).
+pub const COUNTER_SUBMIT_DEFERRED_PAST_DEADLINE: &str = "submit_deferred_past_deadline_total";
 /// Queue consumer: replays whose every write landed (acked).
 pub const COUNTER_QUEUE_MUTATION_APPLIED: &str = "queue_mutation_applied_total";
 /// Queue consumer: replays that still faulted (or errored) and were handed
@@ -1581,6 +1584,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_TERMINAL_INCONCLUSIVE,
         COUNTER_SUBMIT_TERMINAL_CAPPED,
         COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
+        COUNTER_SUBMIT_DEFERRED_PAST_DEADLINE,
         COUNTER_LANDING_REFUSED_EVICTED,
         COUNTER_ADMIT_FAST_EVICT_INCOMPLETE,
         COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,
@@ -1797,15 +1801,46 @@ pub async fn health_invariants(
     db: &D1Database,
     env: &Env,
     strict: bool,
+    ctx: &worker::Context,
 ) -> worker::Result<Response> {
     let now = now_ms();
+    // bsv-low #838: every read of this answer is independent (none writes, none reads another's effect), so they
+    // are issued TOGETHER (`concurrently!`): under the fleet's D1 queue each statement awaited in turn paid the
+    // queue's wait once, 31 of them a request, and loop 44's harness lost two cells to this read's 5 to 20 s
+    // answers (each cell needs two answers inside 20 s). The body is built from the same values in the same order.
+    let count_of = |sql: String| Query::new(sql).fetch_optional::<CountRow>(db);
+    crate::concurrently! {
+        hb = Query::new("SELECT last_tick_ms, tick_count FROM ops_heartbeat WHERE id = 0")
+            .fetch_optional::<HeartbeatRow>(db),
+        counters = read_counters(db),
+        flagged = count_flagged(db, now - PROOFLESS_FLAG_MS),
+        held_by_window = Query::new(crate::proof_window::held_count_sql())
+            .bind(now)
+            .fetch_optional::<CountRow>(db),
+        expired_unproven = count_of(crate::proof_window::EXPIRED_COUNT_SQL.to_string()),
+        census = census_json(db),
+        network_seen_total = count_of(NETWORK_SEEN_TOTAL_SQL.to_string()),
+        retired_unprovable_total = count_of(RETIRED_UNPROVABLE_TOTAL_SQL.to_string()),
+        arc_terminal_total = count_of("SELECT COUNT(*) AS c FROM arc_terminal".to_string()),
+        tx_retired_total = count_of(TX_RETIRED_TOTAL_SQL.to_string()),
+        arcade_reorg = arcade_reorg_view(db),
+        index_janitor = index_janitor_backlog(db),
+        dead_letters = crate::dead_letters::health_json(db, env),
+        change_parked = crate::change_park::health_json(db),
+        queue = crate::beef_blob_sweep::health_json(db, env),
+        tick = crate::tick_alarm::health_json(db, env),
+        deferred_graphs = crate::gasp_deferred::health_json(
+            db,
+            crate::gasp_deferred::graph_budget_limbs_from_env(env),
+        ),
+        gasp_load = crate::gasp_cost::view(db),
+        gasp_speed = crate::gasp_speed::view(db),
+        gasp_fault_memo_rows = crate::gasp_fault_memo::health(db),
+        gasp_peer_absent = crate::gasp_fault_memo::peer_absent_24h(db),
+        gasp_route_faults = crate::gasp_route::view(db),
+    }
 
-    let hb: Option<HeartbeatRow> =
-        Query::new("SELECT last_tick_ms, tick_count FROM ops_heartbeat WHERE id = 0")
-            .fetch_optional(db)
-            .await
-            .ok()
-            .flatten();
+    let hb: Option<HeartbeatRow> = hb.ok().flatten();
     let (last_tick_ms, tick_count) = hb
         .map(|h| (h.last_tick_ms.max(0.0) as i64, h.tick_count.max(0.0) as i64))
         .unwrap_or((0, 0));
@@ -1826,31 +1861,15 @@ pub async fn health_invariants(
     };
     let dead = never_ran || staleness_ms > max_stale_ms;
 
-    let counters = read_counters(db).await;
-    let flagged = count_flagged(db, now - PROOFLESS_FLAG_MS).await;
-    let held_by_window = Query::new(crate::proof_window::held_count_sql())
-        .bind(now)
-        .fetch_optional::<CountRow>(db)
-        .await
-        .ok()
-        .flatten()
-        .map_or(-1, |r| r.c as i64);
-    let expired_unproven = Query::new(crate::proof_window::EXPIRED_COUNT_SQL)
-        .fetch_optional::<CountRow>(db)
-        .await
-        .ok()
-        .flatten()
-        .map_or(-1, |r| r.c as i64);
+    let held_by_window = held_by_window.ok().flatten().map_or(-1, |r| r.c as i64);
+    let expired_unproven = expired_unproven.ok().flatten().map_or(-1, |r| r.c as i64);
 
-    let census = census_json(db).await;
     // #371: total network_seen latches — the observable the ci-route tier
     // asserts a submit MOVES (gate MEDIUM-1: both latch call sites are
     // wasm-route-only, so without a served count the feature could be
     // deleted with every native tier green). -1 = the table is unreadable
     // (pre-migration isolate), distinct from a real 0 (Rule 13).
-    let network_seen_total: i64 = Query::new(NETWORK_SEEN_TOTAL_SQL)
-        .fetch_optional::<CountRow>(db)
-        .await
+    let network_seen_total: i64 = network_seen_total
         .ok()
         .flatten()
         .map_or(-1, |r| r.c.max(0.0) as i64);
@@ -1861,9 +1880,7 @@ pub async fn health_invariants(
     // this is where the residue went — a LIVE count (a reorg-cleared latch
     // honestly decrements), -1 = unreadable (pre-migration isolate),
     // distinct from a real 0.
-    let retired_unprovable_total: i64 = Query::new(RETIRED_UNPROVABLE_TOTAL_SQL)
-        .fetch_optional::<CountRow>(db)
-        .await
+    let retired_unprovable_total: i64 = retired_unprovable_total
         .ok()
         .flatten()
         .map_or(-1, |r| r.c.max(0.0) as i64);
@@ -1873,31 +1890,18 @@ pub async fn health_invariants(
     // `transactions` rows retired on corroborated evidence (where the
     // incident's retry-forever population went). -1 = table unreadable
     // (pre-migration isolate), distinct from a real 0.
-    let arc_terminal_total: i64 = Query::new("SELECT COUNT(*) AS c FROM arc_terminal")
-        .fetch_optional::<CountRow>(db)
-        .await
+    let arc_terminal_total: i64 = arc_terminal_total
         .ok()
         .flatten()
         .map_or(-1, |r| r.c.max(0.0) as i64);
-    let tx_retired_total: i64 = Query::new(TX_RETIRED_TOTAL_SQL)
-        .fetch_optional::<CountRow>(db)
-        .await
+    let tx_retired_total: i64 = tx_retired_total
         .ok()
         .flatten()
         .map_or(-1, |r| r.c.max(0.0) as i64);
 
     let status = if strict && dead { 503 } else { 200 };
-    let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);
-    let mut index_janitor = index_janitor_backlog(db).await;
-    let dead_letters = crate::dead_letters::health_json(db, env).await;
-    let change_parked = crate::change_park::health_json(db).await;
-    let queue = crate::beef_blob_sweep::health_json(db, env).await;
-    let tick = crate::tick_alarm::health_json(db, env).await;
-    let deferred_graphs = crate::gasp_deferred::health_json(
-        db,
-        crate::gasp_deferred::graph_budget_limbs_from_env(env),
-    )
-    .await;
+    let arcade_reorg = with_probe_memos_cleared(arcade_reorg, &counters);
+    let mut index_janitor = index_janitor;
     // 2026-09-04: the courier rungs' lifetime ok/fault/skipped, at a glance.
     index_janitor["couriers"] = couriers_view(&counters);
     // bsv-low #834: the janitor's pacing and its answerable fault rate, beside the raw counts.
@@ -1905,8 +1909,6 @@ pub async fn health_invariants(
     // bsv-low #668: computed before `counters` is moved into the body; assigned after (the big `json!` is at the
     // macro recursion limit). A UX/observability figure; the money never rests on this push.
     let pots_push = pots_push_view(&counters);
-    let gasp_load = crate::gasp_cost::view(db).await;
-    let gasp_speed = crate::gasp_speed::view(db).await;
     let mut body = json!({
         "ok": !dead,
         "service": "low-overlay",
@@ -2004,7 +2006,7 @@ pub async fn health_invariants(
         .get(crate::gasp_deferred::COUNTER_GASP_FAULT_EXPIRED)
         .cloned()
         .unwrap_or(json!(0));
-    match crate::gasp_fault_memo::health(db).await {
+    match gasp_fault_memo_rows {
         Ok(rows) => {
             body["gaspFaultMemoRows"] = json!(rows);
         }
@@ -2014,21 +2016,24 @@ pub async fn health_invariants(
         }
     }
     // Engine 0.1.15 (#56): the absences the peers' word recorded in a day.
-    body["gaspPeerAbsent24h"] = match crate::gasp_fault_memo::peer_absent_24h(db).await {
+    body["gaspPeerAbsent24h"] = match gasp_peer_absent {
         Ok(absent) => absent,
         Err(error) => json!({"fault": error}),
     };
     // Engine 0.2.0 (#57): the route faults of a day, none counted against a peer.
-    body["gaspRouteFaults24h"] = crate::gasp_route::view(db).await;
+    body["gaspRouteFaults24h"] = gasp_route_faults;
     body["gaspFaultMemoFolded"] = counters
         .get("gasp_fault_memo_folded_total")
         .cloned()
         .unwrap_or(json!(0));
     body["d1RowsRead"] = d1_rows_read_view(&body["counters"]);
     // NS-COST-BAR-1: this read's own rows (every statement above), durable, so the fleet can judge the poll's cost
-    // per day. One statement more, not in its own figure.
-    if let Some(t) = crate::d1_ledger::current() {
-        bump_counter(db, &d1_rows_read_counter("health_invariants"), t.reads).await;
+    // per day. One statement more, not in its own figure. bsv-low #838: a WRITE, handed to the runtime after the
+    // answer (it waited in the D1 queue behind the fleet's writes before the answer could leave).
+    if let (Some(t), Ok(db)) = (crate::d1_ledger::current(), env.d1("OVERLAY_DB")) {
+        ctx.wait_until(async move {
+            bump_counter(&db, &d1_rows_read_counter("health_invariants"), t.reads).await;
+        });
     }
     let mut resp = Response::from_json(&body)?.with_status(status);
     crate::routes::add_cors_headers(&mut resp);
@@ -2056,6 +2061,60 @@ pub fn d1_rows_read_view(counters: &serde_json::Value) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    /// bsv-low #838: the two red cells of loop 44 (`admit-fast-refusal.spec.ts:62`, `engine-script-refusal.spec.ts:62`)
+    /// timed out on THIS read, not on `/submit`: the harness needs two answers of `/health/invariants` inside 20 s,
+    /// and each took 5 to 20 s under the fleet's D1 queue (31 statements awaited one after another, 20 to 170 ms of
+    /// CPU). The handler's reads are independent (none writes; none reads another's effect) and are issued
+    /// together in ONE join, so a request pays the queue's wait about once; its own rows-read counter is bumped
+    /// after the answer, never awaited before it.
+    #[test]
+    fn fix838_the_invariants_reads_are_issued_together_and_its_write_is_after_the_answer() {
+        let src = include_str!("ops.rs");
+        let body = &src[src.find("pub async fn health_invariants(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let join = body
+            .find("crate::concurrently! {")
+            .expect("the reads are issued in one join");
+        let join_end = join + body[join..].find("\n    }\n").unwrap();
+        let joined = &body[join..join_end];
+        for read in [
+            "read_counters(db)",
+            "count_flagged(db,",
+            "census_json(db)",
+            "arcade_reorg_view(db)",
+            "index_janitor_backlog(db)",
+            "crate::dead_letters::health_json(db, env)",
+            "crate::change_park::health_json(db)",
+            "crate::beef_blob_sweep::health_json(db, env)",
+            "crate::tick_alarm::health_json(db, env)",
+            "crate::gasp_deferred::health_json(",
+            "crate::gasp_cost::view(db)",
+            "crate::gasp_speed::view(db)",
+            "crate::gasp_fault_memo::health(db)",
+            "crate::gasp_fault_memo::peer_absent_24h(db)",
+            "crate::gasp_route::view(db)",
+            "NETWORK_SEEN_TOTAL_SQL",
+            "RETIRED_UNPROVABLE_TOTAL_SQL",
+            "TX_RETIRED_TOTAL_SQL",
+            "EXPIRED_COUNT_SQL",
+            "held_count_sql()",
+            "FROM arc_terminal",
+            "FROM ops_heartbeat",
+        ] {
+            assert!(joined.contains(read), "{read} is issued in the join");
+        }
+        // nothing is awaited on its own before the answer: outside the join, the one await is the rows-read bump,
+        // inside the job handed to the runtime
+        let outside = [&body[..join], &body[join_end..]].concat();
+        let bump = "ctx.wait_until(async move {\n            bump_counter(&db, &d1_rows_read_counter(\"health_invariants\"), t.reads).await;";
+        assert!(outside.contains(bump), "the bump is after the answer");
+        assert_eq!(
+            outside.replace(bump, "").matches(".await").count(),
+            0,
+            "no read or write is awaited outside the join"
+        );
+    }
+
     /// NS-COST-BAR-1: one tick's per-pass tallies become one delta per family; the view serves the counters.
     #[test]
     fn ns_cost_rows_read_deltas_and_view() {
@@ -2096,7 +2155,7 @@ mod tests {
         let read = &src[src.find("async fn read_counters(").unwrap()..];
         assert!(read[..read.find("\n}\n").unwrap()].contains("for family in D1_ROWS_READ_FAMILIES"));
         assert!(src.contains(
-            "bump_counter(db, &d1_rows_read_counter(\"health_invariants\"), t.reads).await"
+            "bump_counter(&db, &d1_rows_read_counter(\"health_invariants\"), t.reads).await"
         ));
     }
 
