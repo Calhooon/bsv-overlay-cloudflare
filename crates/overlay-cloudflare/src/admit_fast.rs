@@ -1477,9 +1477,9 @@ pub async fn record_join_hop_spends_on(db: &D1Database, txid: &str, road: &str) 
     let store = crate::d1_discovery::D1PotStorage::new(std::rc::Rc::new(handle));
     let got =
         overlay_discovery::pot::lowfund_topic_manager::record_join_hop_spends(&store, txid).await;
-    if !got.marked.is_empty() || got.faults > 0 {
+    if !got.marked.is_empty() || got.faults > 0 || got.deferred > 0 {
         worker::console_log!(
-            "[join-hops] {road} {txid}: {} hop spend(s) recorded from the JOIN's stored bytes ({}), {} already pointed, {} fault(s)",
+            "[join-hops] {road} {txid}: {} hop spend(s) recorded from the JOIN's stored bytes ({}), {} already pointed, {} fault(s), {} input(s) read, {} past the bound left to the discovery pass",
             got.marked.len(),
             got.marked
                 .iter()
@@ -1487,7 +1487,9 @@ pub async fn record_join_hop_spends_on(db: &D1Database, txid: &str, road: &str) 
                 .collect::<Vec<_>>()
                 .join(", "),
             got.already_spent,
-            got.faults
+            got.faults,
+            got.examined,
+            got.deferred
         );
     }
     got.marked.len()
@@ -2823,7 +2825,7 @@ mod tests {
         let pass = &fetcher[fetcher.find("async fn discover_spend_for_row(").unwrap()..];
         let pass = &pass[..pass.find("\n}\n").unwrap()];
         assert!(squash(pass).contains(&squash(
-            "overlay_discovery::pot::lowfund_topic_manager::record_join_hop_spends(pot_storage, &rec.txid"
+            "overlay_discovery::pot::lowfund_topic_manager::record_join_hop_spends_bounded(pot_storage, &rec.txid, allowance, join_hop_rotation()"
         )));
     }
 

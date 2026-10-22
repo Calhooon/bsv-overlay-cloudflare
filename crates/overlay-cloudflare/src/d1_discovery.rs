@@ -2227,6 +2227,19 @@ pub fn displace_spend_cas_sql() -> &'static str {
      RETURNING txid"
 }
 
+/// bsv-low #837 (the FIX-837 lens's LOW-3): the hop-spend write of `record_join_hop_spends`, an UNCONFIRMED pointer
+/// written ONLY on a row that holds none (`spent = 0`, `spendingTxid IS NULL`, `spentConfirmed = 0`): the guard is
+/// in the statement, so a pointer another writer landed after the caller's read is never overwritten (the
+/// readmission's `remark_pot_spend_sql` shape). The anchors as every accepted spend write stamps them (`spentAt`
+/// now, `firstSpentAt` preserve-or-now); `spenderFinal` the incoming value (a new pointer). `RETURNING txid` makes
+/// the hit observable (`fetch_optional`).
+///
+/// Bind order: `spendingTxid, spenderFinal, txid, outputIndex`.
+pub const MARK_SPENT_IF_UNPOINTED_SQL: &str = "UPDATE pot_records SET spent = 1, spendingTxid = ?, \
+     spentAt = unixepoch(), firstSpentAt = COALESCE(firstSpentAt, unixepoch()), spenderFinal = ? \
+     WHERE txid = ? AND outputIndex = ? AND spent = 0 AND spendingTxid IS NULL AND spentConfirmed = 0 \
+     RETURNING txid";
+
 /// The #301 spend-confirmation CAS (the [`verdict_cas_sql`] sibling): the
 /// #186 chaser's confirmed latch, GUARDED on the spender the SPV proof was
 /// verified FOR. If the pointer moved between the chaser's candidate read
@@ -2809,6 +2822,27 @@ impl PotStorage for D1PotStorage {
             self.retire_superseded_best_effort(txid, output_index, to_spender)
                 .await;
         }
+        if hit.is_some() {
+            crate::pot_changes::note(txid, output_index);
+        }
+        Ok(hit.is_some())
+    }
+
+    async fn mark_spent_if_unpointed(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        spender_final: Option<bool>,
+    ) -> Result<bool, PotStorageError> {
+        let hit: Option<serde_json::Value> = Query::new(MARK_SPENT_IF_UNPOINTED_SQL)
+            .bind(spending_txid)
+            .bind(spender_final.map(i64::from))
+            .bind(txid)
+            .bind(output_index)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(pot_err)?;
         if hit.is_some() {
             crate::pot_changes::note(txid, output_index);
         }

@@ -1949,6 +1949,13 @@ pub struct MissingSpendSummary {
     /// bsv-low #837: hop rows a POT candidate's own stored bytes marked spent by its JOIN
     /// (`record_join_hop_spends`): a hop that landed or was readmitted after its JOIN.
     pub join_hops_marked: usize,
+    /// bsv-low #837 (the FIX-837 lens's MEDIUM-1): JOIN input rows the pass read for that write, at most
+    /// `JOIN_HOP_READS_PER_PASS` over the pass.
+    pub join_hop_reads: usize,
+    /// JOIN inputs past a JOIN's own bound (`JOIN_HOP_INPUTS_MAX`), left to the next window (counted, never dropped).
+    pub join_hop_inputs_deferred: usize,
+    /// Pot candidates whose JOIN the pass's read budget left unread this pass (a candidate again after its backoff).
+    pub join_hop_pots_deferred: usize,
 }
 
 /// Per tick: at most this many stale unspent pots, none younger than an hour
@@ -1983,10 +1990,53 @@ pub async fn discover_missing_spends(
             return summary;
         }
     };
+    let mut join_reads = JoinReads::for_candidates(candidates.iter().map(|(rec, _)| rec));
     for (rec, created_at_secs) in candidates {
-        discover_spend_for_row(pot_storage, fetcher, rec, created_at_secs, &mut summary).await;
+        discover_spend_for_row(
+            pot_storage,
+            fetcher,
+            rec,
+            created_at_secs,
+            &mut summary,
+            &mut join_reads,
+        )
+        .await;
     }
     summary
+}
+
+/// bsv-low #837 (the FIX-837 lens's MEDIUM-1): one pass's JOIN input reads: what is left of
+/// `JOIN_HOP_READS_PER_PASS`, and the pot candidates still to come (each holds its reserve).
+struct JoinReads {
+    left: usize,
+    pots_after: usize,
+}
+
+impl JoinReads {
+    fn for_candidates<'a>(
+        candidates: impl Iterator<Item = &'a overlay_discovery::pot::storage::PotRecord>,
+    ) -> Self {
+        JoinReads {
+            left: overlay_discovery::pot::lowfund_topic_manager::JOIN_HOP_READS_PER_PASS,
+            pots_after: candidates
+                .filter(|r| !overlay_discovery::pot::storage::is_hop_row(r))
+                .count(),
+        }
+    }
+}
+
+/// bsv-low #837 (the FIX-837 lens's MEDIUM-1): the window rotation of a wide JOIN's inputs, the hour of the pass. A
+/// candidate is examined at most once per `SPEND_DISCOVERY_BACKOFF_SECS` (an hour), so its successive examinations
+/// read successive windows of [`overlay_discovery::pot::lowfund_topic_manager::JOIN_HOP_INPUTS_MAX`] inputs.
+fn join_hop_rotation() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    let now_secs = (js_sys::Date::now() / 1000.0) as u64;
+    #[cfg(not(target_arch = "wasm32"))]
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now_secs / 3600
 }
 
 /// bsv-low PLAN-PRE-LOOP4 §H4 (2026-09-06): the discovery pass for NAMED
@@ -2009,8 +2059,17 @@ pub async fn discover_spends_for_outpoints(
             return summary;
         }
     };
+    let mut join_reads = JoinReads::for_candidates(candidates.iter().map(|(rec, _)| rec));
     for (rec, _created) in candidates {
-        discover_spend_for_row(pot_storage, fetcher, rec, None, &mut summary).await;
+        discover_spend_for_row(
+            pot_storage,
+            fetcher,
+            rec,
+            None,
+            &mut summary,
+            &mut join_reads,
+        )
+        .await;
     }
     summary
 }
@@ -2025,6 +2084,7 @@ async fn discover_spend_for_row(
     rec: overlay_discovery::pot::storage::PotRecord,
     created_at_secs: Option<u64>,
     summary: &mut MissingSpendSummary,
+    join_reads: &mut JoinReads,
 ) {
     summary.scanned += 1;
     // Examined — whatever happens next (the backoff that keeps a dead
@@ -2044,19 +2104,37 @@ async fn discover_spend_for_row(
         summary.hop_rows += 1;
     } else {
         // bsv-low #837: a held JOIN whose hops read unspent (a hop admitted or readmitted after it, a road with no
-        // `tm_lowfund` judgement): its own stored bytes name them; no courier is asked for this.
-        let healed = overlay_discovery::pot::lowfund_topic_manager::record_join_hop_spends(
-            pot_storage,
-            &rec.txid,
-        )
-        .await;
-        summary.join_hops_marked += healed.marked.len();
-        if !healed.marked.is_empty() {
-            dlog!(
-                "discover_missing_spends: {}: {} hop spend(s) recorded from the JOIN's stored bytes",
-                rec.txid,
-                healed.marked.len()
-            );
+        // `tm_lowfund` judgement): its own stored bytes name them; no courier is asked for this. Bounded per JOIN and
+        // per pass (the FIX-837 lens's MEDIUM-1): what the bound leaves is counted and read by a later pass.
+        join_reads.pots_after = join_reads.pots_after.saturating_sub(1);
+        let allowance = overlay_discovery::pot::lowfund_topic_manager::join_hop_allowance(
+            join_reads.left,
+            join_reads.pots_after,
+        );
+        if allowance == 0 {
+            summary.join_hop_pots_deferred += 1;
+        } else {
+            let healed =
+                overlay_discovery::pot::lowfund_topic_manager::record_join_hop_spends_bounded(
+                    pot_storage,
+                    &rec.txid,
+                    allowance,
+                    join_hop_rotation(),
+                )
+                .await;
+            join_reads.left = join_reads.left.saturating_sub(healed.examined);
+            summary.join_hop_reads += healed.examined;
+            summary.join_hop_inputs_deferred += healed.deferred;
+            summary.join_hops_marked += healed.marked.len();
+            if !healed.marked.is_empty() || healed.deferred > 0 {
+                dlog!(
+                    "discover_missing_spends: {}: {} hop spend(s) recorded from the JOIN's stored bytes, {} input(s) read, {} deferred to a later pass",
+                    rec.txid,
+                    healed.marked.len(),
+                    healed.examined,
+                    healed.deferred
+                );
+            }
         }
     }
     let new_era = created_at_secs.is_some_and(|t| t >= MISSING_SPEND_NEW_ERA_CUTOFF_SECS);
@@ -5583,6 +5661,83 @@ pub async fn internal_retire_pass(
         d1.stmts,
     );
     worker::Response::from_json(&retire_pass_json(&summary, d1))
+}
+
+/// PURE: the discovery lever's JSON answer (`POST /internal/missing-spend-pass`): the pass's summary, its JOIN
+/// hop-spend bounds and what it cost D1 by its own ledger.
+pub fn missing_spend_pass_json(
+    s: &MissingSpendSummary,
+    d1: crate::d1_ledger::Tally,
+) -> serde_json::Value {
+    serde_json::json!({
+        "scanned": s.scanned,
+        "discovered": s.discovered,
+        "noHint": s.no_hint,
+        "faults": s.faults,
+        "hopRows": s.hop_rows,
+        "joinHopsMarked": s.join_hops_marked,
+        "joinHopReads": s.join_hop_reads,
+        "joinHopInputsDeferred": s.join_hop_inputs_deferred,
+        "joinHopPotsDeferred": s.join_hop_pots_deferred,
+        "budget": {
+            "candidates": MISSING_SPEND_PASS_LIMIT,
+            "joinInputsPerJoin": overlay_discovery::pot::lowfund_topic_manager::JOIN_HOP_INPUTS_MAX,
+            "joinReadsPerPass": overlay_discovery::pot::lowfund_topic_manager::JOIN_HOP_READS_PER_PASS,
+        },
+        "d1": { "reads": d1.reads, "writes": d1.writes, "stmts": d1.stmts, "maxReads": d1.max_reads },
+    })
+}
+
+/// bsv-low #837 (the FIX-837 lens's MEDIUM-1): `POST /internal/missing-spend-pass` (bearer `INTERNAL_TOKEN` in fixed
+/// time, as the retire lever; body empty or `{}`, else 400): ONE discovery pass through [`discover_missing_spends`]
+/// under the tick's own limit, age floor and courier budget, answered with its summary and its own D1 figures, so the
+/// budget tier (`tools/lane-837`, `make ci-d1-budget`) measures the JOIN hop-spend write's bound on a populated D1.
+pub async fn internal_missing_spend_pass(
+    mut req: worker::Request,
+    env: &worker::Env,
+) -> worker::Result<worker::Response> {
+    let authorization = req.headers().get("authorization").ok().flatten();
+    let secret = env.secret("INTERNAL_TOKEN").ok().map(|s| s.to_string());
+    if !crate::tip_pass::bearer_ok(authorization.as_deref(), secret.as_deref()) {
+        worker::console_log!("POST /internal/missing-spend-pass -> 401");
+        return worker::Response::error("unauthorized", 401);
+    }
+    let raw = req.bytes().await?;
+    let body = std::str::from_utf8(&raw).unwrap_or("x").trim();
+    if !(body.is_empty() || body == "{}") {
+        return worker::Response::error("body must be empty or {}: a pass takes no argument", 400);
+    }
+    let db = env.d1("OVERLAY_DB")?;
+    crate::d1::ensure_overlay_migrations(&db)
+        .await
+        .map_err(worker::Error::from)?;
+    let pot_storage = crate::d1_discovery::D1PotStorage::new(std::rc::Rc::new(db));
+    let fetcher = crate::courier_fetcher(env, crate::lookup_service_chain_tracker(env))
+        .with_budget(MISSING_SPEND_FETCH_BUDGET);
+    let (summary, by_pass) = crate::d1_ledger::passes(
+        "missing_spends",
+        discover_missing_spends(
+            &pot_storage,
+            &fetcher,
+            MISSING_SPEND_PASS_LIMIT,
+            MISSING_SPEND_MIN_AGE_SECS,
+        ),
+    )
+    .await;
+    let d1 = by_pass.get("missing_spends").copied().unwrap_or_default();
+    worker::console_log!(
+        "POST /internal/missing-spend-pass -> 200: scanned={} discovered={} join_hops_marked={} join_hop_reads={} join_hop_inputs_deferred={} join_hop_pots_deferred={} d1: reads={} writes={} stmts={}",
+        summary.scanned,
+        summary.discovered,
+        summary.join_hops_marked,
+        summary.join_hop_reads,
+        summary.join_hop_inputs_deferred,
+        summary.join_hop_pots_deferred,
+        d1.reads,
+        d1.writes,
+        d1.stmts,
+    );
+    worker::Response::from_json(&missing_spend_pass_json(&summary, d1))
 }
 
 // ============================================================================

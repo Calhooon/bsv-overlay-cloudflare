@@ -1168,10 +1168,42 @@ pub const OWED_JOIN_SEAT_HOPS_PER_RECOMPUTE: usize = 8;
 /// See [`OWED_JOIN_SEAT_HOPS_PER_RECOMPUTE`].
 pub const OWED_JOIN_POT_READS_PER_RECOMPUTE: usize = 4;
 
+/// PURE (bsv-low #837, the FIX-837 lens's LOW-2): the index-unspent hops the belt asks this pass, as indexes into
+/// `hops` (`(outpoint_key, marker_created_at)`): a hop whose chain rung already names a spender is not asked (the
+/// rung has its word), the newest hop keeps the first slot, and the other `OWED_JOIN_SEAT_HOPS_PER_RECOMPUTE - 1`
+/// are taken from the rest (newest first) at the offset `rotate` (the recompute's minute), as
+/// `hops_view::order_probe_targets` rotates the probes, so an identity with more than eight such hops reaches every
+/// one of them over successive passes instead of asking the same newest eight for ever.
+pub fn belt_window(
+    hops: &[(String, Option<i64>)],
+    chain_named: &HashSet<String>,
+    rotate: usize,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..hops.len())
+        .filter(|&i| !chain_named.contains(&hops[i].0))
+        .collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(hops[i].1));
+    if order.is_empty() {
+        return order;
+    }
+    let leader = order.remove(0);
+    let n = order.len();
+    let take = (OWED_JOIN_SEAT_HOPS_PER_RECOMPUTE - 1).min(n);
+    let start = if n == 0 { 0 } else { rotate % n };
+    let mut window = vec![leader];
+    window.extend((0..take).map(|k| order[(start + k) % n]));
+    window
+}
+
 /// PURE (bsv-low #837): does the transaction `pot_txid`'s stored `beef` names (its atomic subject, else the one whose
 /// txid is `pot_txid`) spend `hop_txid:hop_vout`? `false` for bytes that do not parse or name another transaction.
+/// The bytes are read as every production read of stored bytes in the app layer reads them, under
+/// `APP_BEEF_LIMITS` (the FIX-837 lens's LOW-1): a body the limits refuse is no word.
 pub fn join_spends_outpoint(beef: &[u8], pot_txid: &str, hop_txid: &str, hop_vout: u32) -> bool {
-    let Ok(parsed) = bsv_rs::transaction::Beef::from_binary(beef) else {
+    let Ok(parsed) = overlay_engine::beef_limits::parse_beef(
+        beef,
+        &overlay_engine::beef_limits::APP_BEEF_LIMITS,
+    ) else {
         return false;
     };
     let Some(join) = parsed
@@ -1787,7 +1819,10 @@ pub const OWED_SHED_RETRY_MS: i64 = 30_000;
 /// the old word kept as `claimableBeforeShed`): a cut pass could not re-judge it, so it is shown, never pressed on a
 /// stale word. Not carried: a row judged more than [`OWED_WITHHELD_KEEP_MAX_MS`] ago (a cut every pass cannot hold a
 /// dead row up for good), a row of a game this identity filed verified-collected. Only on a cut pass; an uncut pass's
-/// rows stand as derived (a row it did not derive is retired). The count carried.
+/// rows stand as derived (a row it did not derive is retired). The carry never takes `rows` past
+/// [`OWED_MAX_ROWS`] (the FIX-837 lens's LOW-4: it runs after the pass's own truncation, so the write plan's bound,
+/// rows + 3 statements, holds by construction and no carried row is the one the read handler drops). The count
+/// carried.
 pub fn carry_shed_rows(
     i: &OwedInputs,
     rows: &mut Vec<OwedRow>,
@@ -1796,6 +1831,9 @@ pub fn carry_shed_rows(
     let current: HashSet<String> = rows.iter().map(|r| r.outpoint.clone()).collect();
     let mut carried = 0;
     for (prev, updated_at_ms) in previous {
+        if rows.len() >= OWED_MAX_ROWS {
+            break;
+        }
         if current.contains(&prev.outpoint) {
             continue;
         }
@@ -14283,7 +14321,7 @@ pub(crate) mod tests {
         let routes = squash(include_str!("routes.rs"));
         for wired in [
             "db.prepare(crate::owed::JOIN_SEAT_POTS_SQL)",
-            ".take(crate::owed::OWED_JOIN_SEAT_HOPS_PER_RECOMPUTE)",
+            "letwindow=crate::owed::belt_window(&keys,&chain_named,(now_ms/60_000).max(0)asusize);",
             "ifbeefs.len()>=crate::owed::OWED_JOIN_POT_READS_PER_RECOMPUTE{continue;}",
             ".prepare(crate::owed::JOIN_POT_BEEF_SQL)",
             "crate::owed::join_spends_outpoint(b,&pot,&h.hop_txid,h.hop_vout)",

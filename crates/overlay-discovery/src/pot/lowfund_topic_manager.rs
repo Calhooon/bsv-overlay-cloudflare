@@ -80,17 +80,49 @@ pub fn join_hop_inputs(beef: &[u8]) -> Vec<Outpoint> {
         .collect()
 }
 
+/// bsv-low #837 (the FIX-837 lens's MEDIUM-1): the most input rows one call of [`record_join_hop_spends`] reads for one
+/// JOIN. An honest JOIN has two seats' hops (bsv-low `template_tx_sizes.rs`), so 16 is eight times that; a JOIN with
+/// more candidate inputs reads a window of 16 of them, rotated by the caller's `rotation` (the discovery pass's hour),
+/// and the rest are DEFERRED, counted in [`JoinHopSpends::deferred`], never skipped silently: the next pass's window
+/// reads the next 16 (the shape of D17's bounds: a constant, never a walk the body sizes).
+pub const JOIN_HOP_INPUTS_MAX: usize = 16;
+
+/// bsv-low #837 (the FIX-837 lens's MEDIUM-1): the most JOIN input rows the scheduled discovery pass reads over ALL
+/// its pot candidates together (four JOINs at [`JOIN_HOP_INPUTS_MAX`], 32 honest JOINs). A candidate the budget
+/// left is not looked at this pass and is counted; it is a candidate again after its examine backoff (an hour).
+/// Beside these reads each JOIN costs two fixed ones (its stored bytes and its pot row), bounded by the pass's own
+/// candidate limit.
+pub const JOIN_HOP_READS_PER_PASS: usize = 64;
+
+/// bsv-low #837 (the FIX-837 lens's MEDIUM-1): the reads the discovery pass holds back, out of
+/// [`JOIN_HOP_READS_PER_PASS`], for EACH pot candidate still to come: an honest JOIN's two hops. A JOIN is given at
+/// most what is left after that reserve, so a stranger's wide JOINs, however many and wherever they sort, never
+/// leave an honest JOIN later in the pass unread (the pass's 20 candidates reserve at most 38 of the 64).
+pub const JOIN_HOP_READS_RESERVED_PER_JOIN: usize = 2;
+
+/// The read allowance of one JOIN in a pass: what is left of the pass's budget after the reserve of the pot
+/// candidates still to come, at most [`JOIN_HOP_INPUTS_MAX`].
+pub fn join_hop_allowance(reads_left: usize, pots_after: usize) -> usize {
+    reads_left
+        .saturating_sub(pots_after.saturating_mul(JOIN_HOP_READS_RESERVED_PER_JOIN))
+        .min(JOIN_HOP_INPUTS_MAX)
+}
+
 /// What [`record_join_hop_spends`] did for one pot.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct JoinHopSpends {
-    /// The hop outpoints this call marked spent by the JOIN, in input order.
+    /// The hop outpoints this call marked spent by the JOIN, in the order it read them.
     pub marked: Vec<Outpoint>,
-    /// Hop rows that already carried a spend pointer (left as they were).
+    /// Hop rows that already carried a spend pointer, or gained one before the guarded write (left as they were).
     pub already_spent: usize,
     /// Why nothing was looked at: no stored bytes, no pot covenant output, the pot not held, a read fault.
     pub skipped: Option<&'static str>,
     /// A read or write that faulted (the pass converges on the next call).
     pub faults: usize,
+    /// The input rows this call read (at most its bound).
+    pub examined: usize,
+    /// The candidate inputs past the bound, not read this call (the next window reads them).
+    pub deferred: usize,
 }
 
 /// bsv-low #837 (FIX-837): record a HELD JOIN's hop spends from its own stored bytes, for a pot that entered the
@@ -108,11 +140,33 @@ pub struct JoinHopSpends {
 /// bytes of a mined JOIN can be compacted to the JOIN alone, its inputs still name the hops). Each such row that holds
 /// no spend pointer is marked spent by the JOIN as an UNCONFIRMED pointer (`mark_spent(.., false, ..)`, the discovery
 /// pass's write; the confirmation pass proves it, and an unconfirmed claim never clobbers a confirmed one). A row with
-/// a pointer is left alone (never re-pointed), a row that does not exist is never created (a hop is admitted by its
-/// own submit), and nothing else is written. Idempotent: a second call marks nothing.
+/// a pointer is left alone (never re-pointed: the guard is in the write itself,
+/// [`PotStorage::mark_spent_if_unpointed`](crate::pot::storage::PotStorage::mark_spent_if_unpointed), the FIX-837
+/// lens's LOW-3), a row that does not exist is never created (a hop is admitted by its own submit), and nothing else
+/// is written. Idempotent: a second call marks nothing.
+///
+/// THE BOUND (the FIX-837 lens's MEDIUM-1): at most [`JOIN_HOP_INPUTS_MAX`] input rows are read per call, so a
+/// stranger's covenant-shaped JOIN over hundreds of inputs costs the same as sixteen. A carried source whose spent
+/// output is not P2PKH is never a hop and is never read; the inputs read are the named ones first, then those whose
+/// source the bytes do not carry (a compacted JOIN), in input order. The road that passes the call the bounded form
+/// ([`record_join_hop_spends_bounded`]) is the one road that calls it for a stranger's pot unasked, the discovery
+/// pass, under its own per-pass budget ([`JOIN_HOP_READS_PER_PASS`]).
 pub async fn record_join_hop_spends(
     storage: &dyn crate::pot::storage::PotStorage,
     pot_txid: &str,
+) -> JoinHopSpends {
+    record_join_hop_spends_bounded(storage, pot_txid, JOIN_HOP_INPUTS_MAX, 0).await
+}
+
+/// [`record_join_hop_spends`] under a caller's read budget (`max_reads`, clamped to [`JOIN_HOP_INPUTS_MAX`]) and a
+/// window `rotation`: with more candidate inputs than the budget, the window starts at `rotation * budget` (mod the
+/// candidates), so successive rotations read every candidate in turn. A budget of 0 reads no input row and defers
+/// every candidate.
+pub async fn record_join_hop_spends_bounded(
+    storage: &dyn crate::pot::storage::PotStorage,
+    pot_txid: &str,
+    max_reads: usize,
+    rotation: u64,
 ) -> JoinHopSpends {
     let mut out = JoinHopSpends::default();
     let pot_txid = pot_txid.to_ascii_lowercase();
@@ -140,11 +194,14 @@ pub async fn record_join_hop_spends(
         out.skipped = Some("no subject transaction");
         return out;
     };
-    if !join.id().eq_ignore_ascii_case(&pot_txid)
-        || !join
-            .outputs
-            .iter()
-            .any(|o| is_pot_covenant_script(&o.locking_script.to_binary()))
+    if !join.id().eq_ignore_ascii_case(&pot_txid) {
+        out.skipped = Some("the stored subject is another transaction");
+        return out;
+    }
+    if !join
+        .outputs
+        .iter()
+        .any(|o| is_pot_covenant_script(&o.locking_script.to_binary()))
     {
         out.skipped = Some("no pot covenant output");
         return out;
@@ -161,15 +218,45 @@ pub async fn record_join_hop_spends(
             return out;
         }
     }
-    let carried: Vec<Outpoint> = join_hop_inputs(&beef);
-    let final_bytes = !(join.lock_time > 0 && join.inputs.iter().any(|i| i.sequence < 0xffff_ffff));
+    // The candidates, with no read: a NAMED input (its source carried, the spent output P2PKH, `join_hop_inputs`'
+    // rule) is written once its row exists; an input whose source the bytes do not carry is written only if its row is
+    // a hop row; a carried source whose spent output is not P2PKH is never a hop and is never read.
+    let mut named: Vec<(String, u32, bool)> = Vec::new();
+    let mut uncarried: Vec<(String, u32, bool)> = Vec::new();
     for input in &join.inputs {
         let Ok(source) = input.get_source_txid() else {
             continue;
         };
-        let source = source.to_ascii_lowercase();
         let vout = input.source_output_index;
-        let row = match storage.get_spent_status(&source, vout).await {
+        match parsed.find_txid(&source).and_then(|t| t.tx()) {
+            Some(source_tx) => {
+                let p2pkh = source_tx
+                    .outputs
+                    .get(vout as usize)
+                    .is_some_and(|o| is_p2pkh_script(&o.locking_script.to_binary()));
+                if p2pkh {
+                    named.push((source.to_ascii_lowercase(), vout, true));
+                }
+            }
+            None => uncarried.push((source.to_ascii_lowercase(), vout, false)),
+        }
+    }
+    named.extend(uncarried);
+    let candidates = named;
+    let n = candidates.len();
+    let take = n.min(max_reads.min(JOIN_HOP_INPUTS_MAX));
+    out.deferred = n - take;
+    let start = if take < n && take > 0 {
+        ((u128::from(rotation) * take as u128) % n as u128) as usize
+    } else {
+        0
+    };
+    let final_bytes = !(join.lock_time > 0 && join.inputs.iter().any(|i| i.sequence < 0xffff_ffff));
+    for i in 0..take {
+        let (source, vout, is_named) = &candidates[(start + i) % n];
+        let vout = *vout;
+        out.examined += 1;
+        let row = match storage.get_spent_status(source, vout).await {
             Ok(Some(r)) => r,
             Ok(None) => continue,
             Err(_) => {
@@ -177,10 +264,7 @@ pub async fn record_join_hop_spends(
                 continue;
             }
         };
-        let named = carried
-            .iter()
-            .any(|o| o.txid.eq_ignore_ascii_case(&source) && o.output_index == vout);
-        if !(crate::pot::storage::is_hop_row(&row) || named) {
+        if !(*is_named || crate::pot::storage::is_hop_row(&row)) {
             continue;
         }
         if row.spent || row.spending_txid.is_some() {
@@ -188,18 +272,11 @@ pub async fn record_join_hop_spends(
             continue;
         }
         match storage
-            .mark_spent(
-                &source,
-                vout,
-                &pot_txid,
-                false,
-                None,
-                None,
-                Some(final_bytes),
-            )
+            .mark_spent_if_unpointed(source, vout, &pot_txid, Some(final_bytes))
             .await
         {
-            Ok(()) => out.marked.push(Outpoint::new(source, vout)),
+            Ok(true) => out.marked.push(Outpoint::new(source.clone(), vout)),
+            Ok(false) => out.already_spent += 1,
             Err(_) => out.faults += 1,
         }
     }
@@ -565,7 +642,8 @@ mod tests {
         s.store_beef(&join.id(), &atomic(&plain)).await.unwrap();
         assert_eq!(
             record_join_hop_spends(&s, &join.id()).await.skipped,
-            Some("no pot covenant output")
+            Some("the stored subject is another transaction"),
+            "the FIX-837 lens's N5: its own reason"
         );
         assert!(
             !s.get_spent_status(&hop_a.id(), 0)

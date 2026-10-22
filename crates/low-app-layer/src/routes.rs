@@ -4585,9 +4585,9 @@ async fn owed_recompute_inner(
     // 5b. bsv-low #837, THE BELT: before any index-UNSPENT hop is called stranded, its seat's HELD pot is asked
     // whether its JOIN spent the hop (the pot's own stored bytes): the index can hold a pot whose hop spend it never
     // recorded (a JOIN admitted by a road with no `tm_lowfund` judgement). The overlay's `record_join_hop_spends` is the
-    // fix at the write; this read is the belt for the time before it ran. Bounded: the newest index-unspent hops first,
-    // `OWED_JOIN_SEAT_HOPS_PER_RECOMPUTE` seat reads and `OWED_JOIN_POT_READS_PER_RECOMPUTE` pot reads; a fault is no
-    // word (the ladder as before).
+    // fix at the write; this read is the belt for the time before it ran. Bounded: `OWED_JOIN_SEAT_HOPS_PER_RECOMPUTE`
+    // seat reads (the newest index-unspent hop, then a window of the rest rotating by the minute, `belt_window`) and
+    // `OWED_JOIN_POT_READS_PER_RECOMPUTE` pot reads; a fault is no word (the ladder as before).
     let mut join_spent_hops: HashMap<String, String> = HashMap::new();
     {
         #[derive(Deserialize)]
@@ -4599,16 +4599,25 @@ async fn owed_recompute_inner(
         struct PotBeefD1 {
             beef: Option<String>,
         }
-        let mut asked: Vec<&crate::hops_view::HopEntry> = hops
+        let unspent: Vec<&crate::hops_view::HopEntry> = hops
             .iter()
             .filter(|h| h.status == crate::hops_view::HopStatus::Unspent)
             .collect();
-        asked.sort_by_key(|h| std::cmp::Reverse(h.marker_created_at));
+        // the FIX-837 lens's LOW-2: a rotating window (the newest first, the rest by the recompute's minute), and a hop
+        // whose chain rung already names a spender is not asked
+        let chain_named: HashSet<String> = hop_chain
+            .iter()
+            .filter(|(_, w)| w.spending_txid.is_some())
+            .map(|(k, _)| k.clone())
+            .collect();
+        let keys: Vec<(String, Option<i64>)> = unspent
+            .iter()
+            .map(|h| (outpoint_key(&h.hop_txid, h.hop_vout), h.marker_created_at))
+            .collect();
+        let window =
+            crate::owed::belt_window(&keys, &chain_named, (now_ms / 60_000).max(0) as usize);
         let mut beefs: HashMap<String, Option<Vec<u8>>> = HashMap::new();
-        for h in asked
-            .into_iter()
-            .take(crate::owed::OWED_JOIN_SEAT_HOPS_PER_RECOMPUTE)
-        {
+        for h in window.into_iter().map(|i| unspent[i]) {
             let binds = [
                 JsValue::from_str(identity_lc),
                 JsValue::from_str(&h.hop_txid.to_ascii_lowercase()),
