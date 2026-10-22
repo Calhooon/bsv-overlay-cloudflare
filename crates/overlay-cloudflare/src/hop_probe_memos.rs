@@ -567,9 +567,11 @@ mod tests {
         assert_eq!(some["probeMemosCleared"], 7);
         assert_eq!(some["everRan"], true, "the view's own keys stand");
         let ops = include_str!("ops.rs");
-        assert!(ops.contains(
-            "let arcade_reorg = with_probe_memos_cleared(arcade_reorg_view(db).await, &counters);"
-        ));
+        // bsv-low #838: the view is read in the invariants' one join, then merged with the counters
+        assert!(ops.contains("arcade_reorg = arcade_reorg_view(db),"));
+        assert!(
+            ops.contains("let arcade_reorg = with_probe_memos_cleared(arcade_reorg, &counters);")
+        );
         // the merged lens's LOW-3: the app layer's faulted memo reads are a seeded row of the same surface
         assert!(
             ops.contains("crate::hop_probe_memos::COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS,"),

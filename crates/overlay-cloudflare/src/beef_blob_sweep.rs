@@ -1770,7 +1770,8 @@ mod tests {
             "before the GASP step"
         );
         let ops = squash(include_str!("ops.rs"));
-        assert!(ops.contains("letqueue=crate::beef_blob_sweep::health_json(db,env).await;"));
+        // bsv-low #838: read in the invariants' one join
+        assert!(ops.contains("queue=crate::beef_blob_sweep::health_json(db,env),"));
         assert!(ops.contains("\"queue\":queue,"));
         assert!(crate::d1::OVERLAY_MIGRATIONS.contains(&SWEEP_STATE_CREATE));
 

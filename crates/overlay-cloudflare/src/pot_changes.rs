@@ -404,9 +404,11 @@ mod tests {
             "the signers self-heal task moved — re-point this pin"
         );
         assert_eq!(latchers, 2, "the two background latchers capture the env");
+        // bsv-low #838: and once more after a gated write that outran the answer deadline, in its own task
+        // (`routes::finish_past_deadline`), which ships its notes inline
         assert_eq!(
-            guard, 1,
-            "the write-side guard re-evicts once, after the write"
+            guard, 2,
+            "the write-side guard re-evicts after the write, in the request and after a past-deadline write"
         );
         assert_eq!(
             rejected_rerun, 1,

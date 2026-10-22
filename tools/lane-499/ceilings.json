@@ -276,6 +276,24 @@
         "maxReads": 3146
       },
       "censusKey": null
+    },
+    "health-invariants": {
+      "route": "/health/invariants: the overlay's invariants read, the second of two answers 250 ms apart (the harness cells' settle shape, bsv-low #838); its reads issued in one join, its rows-read bump after the answer (writes 0 at the answer). settleCeilingMs: the two answers' wall time on the fixture, measured 325 ms (2026-10-22, LANE_BASE 38380), held far under the harness's 20 s settle; not a production latency (local D1 has no queue).",
+      "measured": {
+        "reads": 52,
+        "writes": 0,
+        "stmts": 29,
+        "maxReads": 8,
+        "settleMs": 325
+      },
+      "ceiling": {
+        "reads": 78,
+        "writes": 0,
+        "stmts": 31,
+        "maxReads": 12
+      },
+      "settleCeilingMs": 5000,
+      "censusKey": "/health/invariants"
     }
   },
   "censusKey": "the d1Budget route a production census holds against this ceiling (advisory there: production rows are not the fixture's); null = the route's maximum is another scenario's",
@@ -293,6 +311,29 @@
       "why": "the same census read 98.5 M rows a day on low-overlay-db-beta (60 listed tags), 88.8 M of them in the statements PR #86 and NS-COST-BAR-1 bound, leaving about 9.7 M, plus 6.4 M on low-identity-db-beta and 0.6 M on the resolver's: about 16.7 M. 60 M is about 3.5x that (the census's 3x margin and the fleet's beta load, which runs ahead of prod), and half the 122 M the environment read that day.",
       "censusBefore": 105450042,
       "expectedAfter": 16682414
+    }
+  },
+  "doorAnswer": {
+    "doc": "bsv-low #838 (FIX-838): the broadcast-gated /submit answers inside the harness's 20 s settle (the door's contract, never raised). The arm stops WAITING on its engine write at answerDeadlineMs from the arm's start (the write goes on in ctx.wait_until), defers the submission as NL-6c does (the 202 and its poll; the job's queue message delayed jobDelaySecs, past the platform's 30 s end of that wait_until) and waits at most deferAtRestCapMs to put it at rest: ceilingMs = answerDeadlineMs + deferAtRestCapMs. Pinned natively over a virtual clock (`ef_deferred::fix838`), not driven by this tier: the gated arm needs Arcade and its background reaches mainnet hosts, which the tier's loopback seal refuses. measured: loop 44 (full-2026-10-22_15-50-41, 33 pairs, beta, 15:49Z to 17:19Z), server-side from the low-overlay-beta logs (694 gated answers) and the client's network leg from 116 harness submits matched to them (docs/audit/FIX-838-door-latency-2026-10-22.md).",
+    "settleMs": 20000,
+    "answerDeadlineMs": 12000,
+    "deferAtRestCapMs": 4000,
+    "jobDelaySecs": 45,
+    "ceilingMs": 16000,
+    "measured": {
+      "answers": 694,
+      "answerP50Ms": 2781,
+      "answerP95Ms": 14649,
+      "answerMaxMs": 42118,
+      "engineWriteP50Ms": 2566,
+      "engineWriteP95Ms": 12903,
+      "engineWriteMaxMs": 23116,
+      "preEngineP95Ms": 1677,
+      "networkLegP95Ms": 1566,
+      "clientP50Ms": 8334,
+      "clientP95Ms": 24390,
+      "clientTimeouts25s": 5,
+      "pastDeadlineShare": "9.4 % (65 of 694)"
     }
   }
 }

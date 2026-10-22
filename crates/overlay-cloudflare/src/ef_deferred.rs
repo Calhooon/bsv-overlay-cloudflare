@@ -109,6 +109,68 @@ pub const JOB_ATTEMPTS: i64 = 5;
 /// would hand a live run to a second consumer.
 pub const JOB_RESUME_AFTER_MS: i64 = 10 * 60 * 1000;
 
+/// bsv-low #838: the gated arm's ANSWER deadline in the request, ms from the arm's start. Loop 44 (33 pairs on
+/// beta) measured the door's answer at p50 2.8 s, p95 14.6 s and up to 42 s server-side, nearly all of it the
+/// engine's write under the fleet's D1 queue; the harness settles a cell in 20 s and the client's gated leg gives
+/// up at 25 s. Past this deadline the request stops WAITING on the engine's write (it is never dropped: the
+/// write goes on after the answer) and the submission is deferred as NL-6c defers its EF work: the bytes at
+/// rest, a job, the 202 with its reference. 9.4 % of loop 44's gated answers were past 12 s.
+pub const IN_REQUEST_ANSWER_MS: u64 = 12_000;
+
+/// bsv-low #838: the most the request waits to put a past-deadline submission's bytes at rest (its R2 or D1
+/// writes and the queue's send, under the same D1 queue). Past it the answer is the deferral's own retryable
+/// 503, so the arm answers within [`IN_REQUEST_ANSWER_MS`] + this, 16 s, under the harness's 20 s.
+pub const DEFER_AT_REST_CAP_MS: u64 = 4_000;
+
+/// bsv-low #838: the delay of a past-deadline job's queue message, seconds. The request's write goes on in
+/// `ctx.wait_until`, which the platform ends at most 30 s after the answer; the job's run (this same arm, its
+/// engine write a dedup when the request's landed) is delivered after that, so the two never write together.
+pub const PAST_DEADLINE_JOB_DELAY_SECS: u32 = 45;
+
+/// PURE. The ms the request still waits on its engine write, from the arm's start: never negative (a deadline
+/// spent before the write began is answered at once).
+pub fn answer_ms_left(arm_started_ms: f64, now_ms: f64) -> u64 {
+    let spent = (now_ms - arm_started_ms).max(0.0);
+    (IN_REQUEST_ANSWER_MS as f64 - spent).max(0.0) as u64
+}
+
+/// What [`within_deadline`] answers: the work's output, or the work itself, unfinished and still pollable.
+pub enum Deadlined<F: std::future::Future> {
+    /// The work finished first (or with the deadline).
+    Done(F::Output),
+    /// The deadline fell due first; the work is handed back NOT dropped, to be finished elsewhere.
+    Past(F),
+}
+
+/// bsv-low #838: race `work` against `deadline`, the work first when both are ready. Unlike a race that drops
+/// the loser (`gasp::race_or_deadline`), a past deadline hands the work BACK unfinished: an engine write is never
+/// cut between two of its statements by the request's deadline.
+pub async fn within_deadline<F, D>(work: F, deadline: D) -> Deadlined<F>
+where
+    F: std::future::Future + Unpin,
+    D: std::future::Future,
+{
+    let mut deadline = std::pin::pin!(deadline);
+    let mut work = Some(work);
+    std::future::poll_fn(move |cx| {
+        let Some(w) = work.as_mut() else {
+            return std::task::Poll::Pending;
+        };
+        if let std::task::Poll::Ready(v) = std::pin::Pin::new(w).poll(cx) {
+            work = None;
+            return std::task::Poll::Ready(Deadlined::Done(v));
+        }
+        if deadline.as_mut().poll(cx).is_ready() {
+            return match work.take() {
+                Some(w) => std::task::Poll::Ready(Deadlined::Past(w)),
+                None => std::task::Poll::Pending,
+            };
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
 /// A settled job's row is kept this long for the caller's poll, then swept
 /// with its bytes.
 pub const JOB_KEEP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -528,7 +590,58 @@ pub async fn defer(
     work: EfWork,
     legs_from: usize,
 ) -> worker::Result<Response> {
-    match put_at_rest(env, tagged, submit_mode, subject_txid, work, legs_from).await {
+    let put = put_at_rest(
+        env,
+        tagged,
+        submit_mode,
+        subject_txid,
+        work,
+        legs_from,
+        None,
+    )
+    .await;
+    deferral_answer(put, subject_txid, work, legs_from)
+}
+
+/// bsv-low #838: the gated arm's engine write outran [`IN_REQUEST_ANSWER_MS`]. The write goes on (the caller
+/// has handed it to `ctx.wait_until`); this puts the submission at rest as [`defer`] does, its job's message
+/// delayed [`PAST_DEADLINE_JOB_DELAY_SECS`] so its run follows the request's write, and answers the same 202. The
+/// put waits at most [`DEFER_AT_REST_CAP_MS`] (`delay_ms` is the caller's timer, the platform's `Delay` on the
+/// Worker); past it the answer is the deferral's own retryable 503 and nothing more is waited on (a job row that
+/// lands after it is handed to the queue by the cron; a re-presentation finds the open job and its reference).
+pub async fn defer_past_deadline<D: std::future::Future>(
+    env: &Env,
+    tagged: &overlay_engine::types::TaggedBEEF,
+    submit_mode: &str,
+    subject_txid: &str,
+    work: EfWork,
+    cap: D,
+) -> worker::Result<Response> {
+    let put = Box::pin(put_at_rest(
+        env,
+        tagged,
+        submit_mode,
+        subject_txid,
+        work,
+        0,
+        Some(PAST_DEADLINE_JOB_DELAY_SECS),
+    ));
+    let put = match within_deadline(put, cap).await {
+        Deadlined::Done(put) => put,
+        Deadlined::Past(_) => Err(format!(
+            "not put at rest within {DEFER_AT_REST_CAP_MS} ms (bsv-low #838)"
+        )),
+    };
+    deferral_answer(put, subject_txid, work, 0)
+}
+
+fn deferral_answer(
+    put: Result<String, String>,
+    subject_txid: &str,
+    work: EfWork,
+    legs_from: usize,
+) -> worker::Result<Response> {
+    match put {
         Ok(reference) => {
             worker::console_log!(
                 "POST /submit(broadcast-gated) -> 202 (NL-6c/NL-6d: EF work {} B subject / {} B batch, {} legs, {legs_from} primed; past the request's budget {IN_REQUEST_SUBJECT_EF_BYTES} / {IN_REQUEST_BATCH_EF_BYTES} B, {IN_REQUEST_CORROBORATION_LEGS} legs; deferred as {reference})",
@@ -570,6 +683,7 @@ async fn put_at_rest(
     subject_txid: &str,
     work: EfWork,
     legs_from: usize,
+    delay_secs: Option<u32>,
 ) -> Result<String, String> {
     let db = env
         .d1("OVERLAY_DB")
@@ -648,7 +762,7 @@ async fn put_at_rest(
         .bind(legs_from as i64)
         .execute(&db)
         .await?;
-    if let Err(e) = send_job(env, &reference).await {
+    if let Err(e) = send_job(env, &reference, delay_secs).await {
         worker::console_log!(
             "NL-6c: deferred job {reference} is at rest but not queued ({e}); the cron hands it to the queue"
         );
@@ -675,12 +789,25 @@ pub async fn pause(
     }
 }
 
-async fn send_job(env: &Env, reference: &str) -> Result<(), String> {
-    env.queue("MUTATION_QUEUE")
-        .map_err(|e| format!("MUTATION_QUEUE binding unavailable: {e}"))?
-        .send(crate::queue::ef_job_message(reference))
-        .await
-        .map_err(|e| format!("mutation queue send failed: {e}"))
+async fn send_job(env: &Env, reference: &str, delay_secs: Option<u32>) -> Result<(), String> {
+    let queue = env
+        .queue("MUTATION_QUEUE")
+        .map_err(|e| format!("MUTATION_QUEUE binding unavailable: {e}"))?;
+    let message = crate::queue::ef_job_message(reference);
+    let sent = match delay_secs {
+        // bsv-low #838: a past-deadline job waits out the request's write (`PAST_DEADLINE_JOB_DELAY_SECS`)
+        Some(secs) => {
+            queue
+                .send(
+                    worker::MessageBuilder::new(message)
+                        .delay_seconds(secs)
+                        .build(),
+                )
+                .await
+        }
+        None => queue.send(message).await,
+    };
+    sent.map_err(|e| format!("mutation queue send failed: {e}"))
 }
 
 /// `GET /submit-deferred/<reference>`: the job's state and, once a run has
@@ -819,7 +946,7 @@ async fn settle_job(db: &D1Database, reference: &str, state: &str, status: u16, 
 pub async fn run_job(
     env: &Env,
     ctx: &Context,
-    engine: &overlay_engine::engine::Engine,
+    engine: &std::rc::Rc<overlay_engine::engine::Engine>,
     reference: &str,
 ) {
     let Ok(db) = env.d1("OVERLAY_DB") else {
@@ -965,7 +1092,7 @@ pub async fn run_job(
                 );
                 return;
             }
-            if let Err(e) = send_job(env, reference).await {
+            if let Err(e) = send_job(env, reference, None).await {
                 worker::console_log!(
                     "NL-6d: job {reference} is at leg {reached} but not queued ({e}); the cron hands it back"
                 );
@@ -1018,7 +1145,7 @@ pub async fn redrive(env: &Env, db: &D1Database) {
     {
         Ok(rows) => {
             for r in rows {
-                match send_job(env, &r.reference).await {
+                match send_job(env, &r.reference, None).await {
                     Ok(()) => {
                         let _ = Query::new(JOB_TOUCH_SQL)
                             .bind(r.reference.as_str())
@@ -1067,6 +1194,200 @@ pub async fn redrive(env: &Env, db: &D1Database) {
             }
         }
         Err(e) => worker::console_log!("Scheduled: NL-6c settled jobs unreadable: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod fix838 {
+    //! bsv-low #838: the gated arm's answer deadline, over a virtual clock (the platform's `Delay` is the
+    //! Worker's; the race and the arithmetic are the shipped ones).
+    use super::*;
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::rc::Rc;
+    use std::task::{Context, Poll};
+
+    /// A future Ready once the virtual clock reaches `at_ms`, with `out`.
+    fn at<T: Copy>(clock: Rc<Cell<u64>>, at_ms: u64, out: T) -> impl Future<Output = T> {
+        std::future::poll_fn(move |_| {
+            if clock.get() >= at_ms {
+                Poll::Ready(out)
+            } else {
+                Poll::Pending
+            }
+        })
+    }
+
+    /// Drive `fut` on the virtual clock, 100 ms a poll, from `clock`'s value; answers the output and the clock.
+    fn drive<F: Future>(clock: &Rc<Cell<u64>>, fut: F) -> (F::Output, u64) {
+        let mut fut = std::pin::pin!(fut);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return (v, clock.get());
+            }
+            clock.set(clock.get() + 100);
+        }
+    }
+
+    /// Loop 44's slow JOIN, on the virtual clock: the arm begins at 0, its pre-engine steps take 1,700 ms (the
+    /// door, the Arcade ladder and the admission decision at their p95 sum), and the engine's write takes 22.7 s
+    /// (the measured 24.4 s answer). The request stops waiting at the arm's 12 s deadline, the put at rest is
+    /// capped at 4 s, so the answer leaves by 16 s, under the harness's 20 s; and the write handed back is NOT
+    /// dropped: driven on (as `ctx.wait_until` drives it) it finishes with its own output at 24.4 s.
+    #[test]
+    fn fix838_a_write_past_the_deadline_is_handed_back_unfinished_and_the_answer_leaves_by_16_s() {
+        let clock = Rc::new(Cell::new(1_700));
+        let left = answer_ms_left(0.0, 1_700.0);
+        assert_eq!(
+            left, 10_300,
+            "the deadline runs from the arm's start, not the write's"
+        );
+        let write = Box::pin(at(clock.clone(), 24_400, "the write's report"));
+        let deadline = at(clock.clone(), 1_700 + left, ());
+        let (raced, t) = drive(&clock, within_deadline(write, deadline));
+        assert_eq!(
+            t, IN_REQUEST_ANSWER_MS,
+            "the request stops waiting at the deadline"
+        );
+        let Deadlined::Past(write) = raced else {
+            panic!("a 22.7 s write is past a 12 s deadline");
+        };
+        // the put at rest, at its cap (the worst the request waits after the deadline)
+        let put = Box::pin(at(clock.clone(), u64::MAX, "never at rest"));
+        let cap = at(clock.clone(), t + DEFER_AT_REST_CAP_MS, ());
+        let (put, answered_at) = drive(&clock, within_deadline(put, cap));
+        assert!(
+            matches!(put, Deadlined::Past(_)),
+            "a put past its cap is not waited on"
+        );
+        assert_eq!(answered_at, 16_000);
+        assert!(
+            answered_at < 20_000,
+            "the answer leaves under the harness's settle"
+        );
+        // the background: the same write, driven to its end
+        let (report, finished) = drive(&clock, write);
+        assert_eq!((report, finished), ("the write's report", 24_400));
+    }
+
+    /// A write that lands inside the deadline is the request's answer, as before; a write and a deadline ready
+    /// together are the write's; a deadline spent before the write began is answered at once (never negative).
+    #[test]
+    fn fix838_a_write_inside_the_deadline_is_the_answer() {
+        let clock = Rc::new(Cell::new(1_700));
+        let write = Box::pin(at(clock.clone(), 9_000, 7));
+        let deadline = at(clock.clone(), 12_000, ());
+        let (raced, t) = drive(&clock, within_deadline(write, deadline));
+        assert!(matches!(raced, Deadlined::Done(7)));
+        assert_eq!(t, 9_000);
+        let clock = Rc::new(Cell::new(12_000));
+        let write = Box::pin(at(clock.clone(), 12_000, 8));
+        let (raced, _) = drive(
+            &clock,
+            within_deadline(write, at(clock.clone(), 12_000, ())),
+        );
+        assert!(
+            matches!(raced, Deadlined::Done(8)),
+            "the write first when both are ready"
+        );
+        assert_eq!(answer_ms_left(0.0, 13_000.0), 0);
+        assert_eq!(
+            answer_ms_left(5_000.0, 4_000.0),
+            IN_REQUEST_ANSWER_MS,
+            "a clock step back is no time spent"
+        );
+    }
+
+    /// The bound's arithmetic, against the harness's contract and the platform's: the answer (deadline plus the
+    /// put's cap) sits under the 20 s settle with the measured network leg; the job's run is delivered after the
+    /// platform's end of the request's `wait_until` (30 s after the answer); and `ceilings.json` names the same
+    /// numbers in its `doorAnswer` row, with loop 44's measured figures.
+    #[test]
+    fn fix838_the_bound_is_the_ceilings_row_and_sits_under_the_settle() {
+        let ceilings: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tools/lane-499/ceilings.json")).unwrap();
+        let row = &ceilings["doorAnswer"];
+        assert_eq!(
+            row["settleMs"], 20_000,
+            "the harness's settle is the door's contract, never raised"
+        );
+        assert_eq!(row["answerDeadlineMs"], IN_REQUEST_ANSWER_MS);
+        assert_eq!(row["deferAtRestCapMs"], DEFER_AT_REST_CAP_MS);
+        assert_eq!(row["jobDelaySecs"], PAST_DEADLINE_JOB_DELAY_SECS);
+        let ceiling = row["ceilingMs"].as_u64().unwrap();
+        assert_eq!(ceiling, IN_REQUEST_ANSWER_MS + DEFER_AT_REST_CAP_MS);
+        let network = row["measured"]["networkLegP95Ms"].as_u64().unwrap();
+        assert!(
+            ceiling + network < 20_000,
+            "{ceiling} + {network} under the settle"
+        );
+        // what the bound cuts: loop 44's tail (its p95 was under it; its maximum and the client's p95, five 25 s
+        // timeouts among them, were not)
+        assert!(row["measured"]["answerMaxMs"].as_u64().unwrap() > ceiling);
+        assert!(row["measured"]["clientP95Ms"].as_u64().unwrap() > 20_000);
+        assert!(u64::from(PAST_DEADLINE_JOB_DELAY_SECS) * 1_000 > 30_000);
+    }
+
+    /// The route's wiring (wasm only, so read from its source): the gated arm's write in the request is raced
+    /// against `answer_ms_left` from the arm's start; past it the write is handed to `ctx.wait_until` BEFORE the
+    /// deferral is answered (never dropped, never awaited); a resumed run (the job) and the ungated arms await
+    /// their write as before; and the job's message is delayed.
+    #[test]
+    fn fix838_the_gated_arm_races_its_write_and_hands_it_on() {
+        let src = include_str!("routes.rs");
+        let parts = &src[src.find("async fn submit_parts(").unwrap()..];
+        let parts = &parts[..parts.find("\n}\n").unwrap()];
+        let start = parts
+            .find("let arm_started_ms = js_sys::Date::now();")
+            .expect("the arm's start");
+        let race = parts
+            .find("crate::ef_deferred::within_deadline(write, deadline).await")
+            .expect("the write is raced");
+        let left = parts
+            .find("crate::ef_deferred::answer_ms_left(arm_started_ms, engine_started)")
+            .expect("what is left of the arm's deadline");
+        assert!(start < left && left < race);
+        let past = &parts[race..];
+        let hand = past
+            .find("ctx.wait_until(finish_past_deadline(")
+            .expect("handed on");
+        let defer = past
+            .find("crate::ef_deferred::defer_past_deadline(")
+            .expect("deferred");
+        assert!(
+            hand < defer,
+            "the write is handed to the runtime before the deferral is awaited"
+        );
+        assert!(
+            parts.contains(
+                "(Some(subject), Some(work), crate::ef_deferred::WorkBudget::InRequest) =>"
+            ),
+            "only the gated arm in the request races"
+        );
+        assert!(parts.contains("_ => engine.submit_with_report(&tagged_beef, mode).await,"));
+        let f = &src[src.find("async fn finish_past_deadline<").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        for step in [
+            "let outcome = write.await;",
+            "crate::admit_fast::guard_landed(",
+            "crate::admit_fast::open_eviction(&db, &subject).await",
+            "crate::admit_fast::evict_txid_everywhere(",
+            "crate::pot_changes::flush_inline(",
+            "crate::lobby_changes::flush(",
+        ] {
+            assert!(
+                f.contains(step),
+                "the background finishes what the request does after its write: {step}"
+            );
+        }
+        let me = include_str!("ef_deferred.rs");
+        let d = &me[me.find("pub async fn defer_past_deadline<").unwrap()..];
+        let d = &d[..d.find("\n}\n").unwrap()];
+        assert!(d.contains("Some(PAST_DEADLINE_JOB_DELAY_SECS)"));
+        assert!(d.contains("within_deadline(put, cap).await"));
+        let send = &me[me.find("async fn send_job(").unwrap()..];
+        assert!(send[..send.find("\n}\n").unwrap()].contains(".delay_seconds(secs)"));
     }
 }
 
