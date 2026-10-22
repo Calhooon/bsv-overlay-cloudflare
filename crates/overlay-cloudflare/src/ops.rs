@@ -404,8 +404,8 @@ pub const COUNTER_ADMIT_FAST_CONFLICT_SCANNED: &str = "admit_fast_conflict_scann
 pub const COUNTER_ADMIT_FAST_CONFLICT_EVICTED: &str = "admit_fast_conflict_evicted_total";
 /// Conflict re-checks that faulted.
 pub const COUNTER_ADMIT_FAST_CONFLICT_FAULTS: &str = "admit_fast_conflict_faults_total";
-/// bsv-low #831 half 2: retired `pot_beefs` rows whose live pot the retire pass then evicted
-/// (`proof_fetcher::end_retired_pot`).
+/// bsv-low #831 half 2: retired rows (either store's arm, since the FIX-831-B lens's MEDIUM-1) whose live pot the
+/// retire pass then evicted (`proof_fetcher::end_retired_pot`).
 pub const COUNTER_RETIRE_EVICTED: &str = "retire_evicted_total";
 /// bsv-low #831 half 2: pots latched unprovable before the retire pass evicted, looked at again by the backlog pass.
 pub const COUNTER_RETIRE_BACKLOG_SCANNED: &str = "retire_backlog_scanned_total";
@@ -413,8 +413,12 @@ pub const COUNTER_RETIRE_BACKLOG_SCANNED: &str = "retire_backlog_scanned_total";
 pub const COUNTER_RETIRE_BACKLOG_EVICTED: &str = "retire_backlog_evicted_total";
 /// Backlog pots the fresh look found held or mined: left alone, their latch cleared.
 pub const COUNTER_RETIRE_BACKLOG_LEFT: &str = "retire_backlog_left_total";
-/// Retire-pass end steps that faulted (a live-pot read, an eviction, a latch clear, the backlog's candidate read).
+/// Retire-pass end steps that faulted (an end-state read, an eviction or one left incomplete, a latch or its clear,
+/// the backlog's candidate read).
 pub const COUNTER_RETIRE_EVICT_FAULTS: &str = "retire_evict_faults_total";
+/// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): endings the retire pass's statement budget did not cover, and
+/// backlog candidates left unlooked for it; each pot is latched and live, ended by a later pass.
+pub const COUNTER_RETIRE_END_DEFERRED: &str = "retire_end_deferred_total";
 /// fleet loop 15 (2026-09-20): the pending watch confirmed a spend by its OWN proof read at its end — a tx that mined
 /// before the index saw it (Arcade's stored echo never says MINED, no callback is registered for an already-known tx).
 pub const COUNTER_SUBMIT_PENDING_CONFIRMED_NOW: &str = "submit_pending_confirmed_now_total";
@@ -1556,6 +1560,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_RETIRE_BACKLOG_EVICTED,
         COUNTER_RETIRE_BACKLOG_LEFT,
         COUNTER_RETIRE_EVICT_FAULTS,
+        COUNTER_RETIRE_END_DEFERRED,
         // bsv-low #484: the probe-memo invalidation reads 0 until a reorg (or the TTL) clears one.
         crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_CLEARED,
         crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_EXPIRED,

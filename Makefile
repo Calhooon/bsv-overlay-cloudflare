@@ -26,7 +26,7 @@ help:
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
 	@echo "  ownership        The storage ownership check (bsv-low #474): every SQL statement against storage-ownership.json (part of ci)"
 	@echo "  ci-route         Route-level /submit + /arc-ingest + /requestForeignGASPNodes cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799, and :LANE_BASE+11, +12 for NL-6c and NL-6d)"
-	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; four ports: :LANE_BASE+9 app layer, +10 overlay, +11 the e649 delivering overlay, +12 its mock app layer)"
+	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; ports: :LANE_BASE+9 app layer, +10 overlay, +11 the e649 delivering overlay, +12 its mock app layer, +13 to +15 their inspectors, +16 the #831 retire overlay, +17 its inspector, +18 its courier stand-in)"
 	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
 
@@ -504,12 +504,13 @@ ci-d1-board:
 ci-d1-budget:
 	@set -e; \
 	B=$${LANE_BASE:-8791}; PA=$$((B+9)); PO=$$((B+10)); PD=$$((B+11)); PM=$$((B+12)); \
-	IA=$$((B+13)); IO=$$((B+14)); ID=$$((B+15)); \
+	IA=$$((B+13)); IO=$$((B+14)); ID=$$((B+15)); PR=$$((B+16)); IR=$$((B+17)); PS=$$((B+18)); \
 	app_log=/tmp/lane499-d1-$$B-app.log; ov_log=/tmp/lane499-d1-$$B-overlay.log; seed_log=/tmp/lane499-d1-$$B-seed.log; \
-	dv_log=/tmp/lane499-d1-$$B-delivering.log; \
-	: > "$$app_log"; : > "$$ov_log"; : > "$$dv_log"; \
+	dv_log=/tmp/lane499-d1-$$B-delivering.log; rv_log=/tmp/lane499-d1-$$B-retire.log; \
+	: > "$$app_log"; : > "$$ov_log"; : > "$$dv_log"; : > "$$rv_log"; \
 	state=$$(mktemp -d /tmp/lane499-d1-state.XXXXXX); ov_state=$$(mktemp -d /tmp/lane499-d1-ovstate.XXXXXX); \
 	dv_state=$$(mktemp -d /tmp/lane499-d1-dvstate.XXXXXX); seed_v3=$$(mktemp -d /tmp/lane499-d1-seedv3.XXXXXX); \
+	rv_state=$$(mktemp -d /tmp/lane499-d1-rvstate.XXXXXX); \
 	job_pids=""; owned_ports=""; \
 	kill_tree() { \
 	  for _c in $$(pgrep -P "$$1" 2>/dev/null); do kill_tree "$$_c"; done; \
@@ -529,17 +530,17 @@ ci-d1-budget:
 	    _n=$$((_n+1)); sleep 1; \
 	  done; \
 	  if [ -n "$$_left" ]; then echo "⚠ ci-d1-budget: could not free$$owned_ports (still held by:$$_left)"; fi; \
-	  rm -rf "$$state" "$$ov_state" "$$dv_state" "$$seed_v3"; \
+	  rm -rf "$$state" "$$ov_state" "$$dv_state" "$$seed_v3" "$$rv_state"; \
 	}; \
 	guard_ran=""; \
 	egress_diag() { \
 	  [ -s "$$app_log" ] && [ -z "$$guard_ran" ] || return 0; \
 	  echo "→ ci-d1-budget: a cell red; the egress guard over the logs so far (a red that rested on mainnet is named here):"; \
-	  node tools/lane-731/egress_guard.mjs "app-layer=$$app_log" "overlay=$$ov_log" "delivering-overlay=$$dv_log" || true; \
+	  node tools/lane-731/egress_guard.mjs "app-layer=$$app_log" "overlay=$$ov_log" "delivering-overlay=$$dv_log" "retire-overlay=$$rv_log" || true; \
 	}; \
 	trap 'cleanup; exit 130' INT TERM; \
 	trap '_rc=$$?; if [ $$_rc -ne 0 ]; then egress_diag; fi; cleanup' EXIT; \
-	for _pt in $$PA $$PO $$PD $$PM $$IA $$IO $$ID; do \
+	for _pt in $$PA $$PO $$PD $$PM $$IA $$IO $$ID $$PR $$IR $$PS; do \
 	  _held=$$(lsof -nP -tiTCP:$$_pt -sTCP:LISTEN 2>/dev/null || true); \
 	  if [ -n "$$_held" ]; then \
 	    echo "✗ ci-d1-budget: :$$_pt is ALREADY BOUND before we start, refusing to run (a stale worker would answer)."; \
@@ -547,7 +548,7 @@ ci-d1-budget:
 	    exit 1; \
 	  fi; \
 	done; \
-	owned_ports="$$PA $$PO $$PD $$IA $$IO $$ID"; \
+	owned_ports="$$PA $$PO $$PD $$IA $$IO $$ID $$PR $$IR"; \
 	seal=""; \
 	if [ "$${D1_EGRESS_SEAL:-1}" != 0 ] && command -v sandbox-exec >/dev/null 2>&1; then \
 	  D1_REAL_WORKERD=$$(node tools/lane-731/real_workerd.mjs); export D1_REAL_WORKERD; \
@@ -613,6 +614,17 @@ ci-d1-budget:
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PD/listTopicManagers "$$dv_log" "delivering overlay"; \
 	tap $$ID delivering-overlay; \
+	echo "→ starting wrangler dev :$$PR (the retire overlay of the #831 cell, its couriers sunk to the cell's 404 stand-in on :$$PS)…"; \
+	( cd crates/overlay-cloudflare && exec env $$seal npx wrangler dev --local --log-level debug --port $$PR --inspector-port $$IR --ip 127.0.0.1 --persist-to "$$rv_state" \
+	    --var ARCADE_URL:http://127.0.0.1:$$PS \
+	    --var COURIER_SINK:http://127.0.0.1:$$PS \
+	    --var PROOF_SOURCES:arcade,woc,bitails \
+	    --var INTERNAL_TOKEN:ci-internal-tok \
+	    --var MAINNET_FANOUT:false \
+	) > "$$rv_log" 2>&1 & \
+	job_pids="$$job_pids $$!"; \
+	wait_up http://127.0.0.1:$$PR/listTopicManagers "$$rv_log" "retire overlay"; \
+	tap $$IR retire-overlay; \
 	D1_BUDGET_SEED="$$state/seed.sql" D1_BUDGET_STATE="$$state" node tools/lane-499/d1_budget_route_ci.mjs http://127.0.0.1:$$PA http://127.0.0.1:$$PO; \
 	python3 tools/lane-ns2/register_pin.py; \
 	D1_BUDGET_SEED_V3="$$seed_v3" npx --package wrangler -c 'node tools/lane-ns2/owed_do_pins.mjs'; \
@@ -624,8 +636,9 @@ ci-d1-budget:
 	node tools/lane-e555/deferred_graphs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
 	node tools/lane-e585/beef_blobs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
 	node tools/lane-e649/change_park_budget_ci.mjs http://127.0.0.1:$$PO "$$ov_state" http://127.0.0.1:$$PD "$$dv_state" $$PM; \
+	node tools/lane-831/retire_pass_budget_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
 	guard_ran=1; \
-	node tools/lane-731/egress_guard.mjs "app-layer=$$app_log" "overlay=$$ov_log" "delivering-overlay=$$dv_log"
+	node tools/lane-731/egress_guard.mjs "app-layer=$$app_log" "overlay=$$ov_log" "delivering-overlay=$$dv_log" "retire-overlay=$$rv_log"
 
 # DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the
 # whole issue: `low-app-layer` was UNDEPLOYABLE for a month while `make ci`

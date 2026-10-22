@@ -1,0 +1,49 @@
+{
+  "doc": "bsv-low #831 (the FIX-831-B lens's MEDIUM-2): the D1 ceilings of the retire pass on a populated overlay D1 (tools/lane-831/retire_pass_budget_ci.mjs, make ci-d1-budget). The pass's statements are bounded by its own budget (480, and its three tail statements past it), and which candidates a pass reaches moves with the clock (both rotations), so the statement ceiling is the budget's bound plus 7, not a measured figure plus 2; reads, writes and the largest statement are the worst measured over the worst tick and the drain, x 1.5. Raise one only with a new measurement and its reason.",
+  "measured_at": "2026-10-22, ef9186df plus the FIX-831-B fold, wrangler 4.148.0, node 22: worst tick reads 1622 writes 253 stmts 400 maxReads 252 (5 ended, 19 deferred); the drain's largest pass reads 1331 writes 178 stmts 454 maxReads 200 (17 passes)",
+  "scenarios": {
+    "retire-pass-empty": {
+      "route": "POST /internal/retire-pass on an empty overlay D1",
+      "measured": {
+        "reads": 5,
+        "writes": 0,
+        "stmts": 5
+      },
+      "ceiling": {
+        "reads": 9,
+        "writes": 0,
+        "stmts": 7
+      }
+    },
+    "retire-pass-worst-tick": {
+      "route": "POST /internal/retire-pass, the first pass over 24 watched ghost JOINs, 16 latched live pots and 8 engine-retired escaped pots, every one absent",
+      "measured": {
+        "reads": 1622,
+        "writes": 253,
+        "stmts": 400,
+        "maxReads": 252
+      },
+      "ceiling": {
+        "reads": 2433,
+        "writes": 380,
+        "stmts": 490,
+        "maxReads": 378
+      }
+    },
+    "retire-pass-drain-max": {
+      "route": "POST /internal/retire-pass, the largest pass of the drain that ends every ghost pot",
+      "measured": {
+        "reads": 1331,
+        "writes": 178,
+        "stmts": 454,
+        "maxReads": 200
+      },
+      "ceiling": {
+        "reads": 2433,
+        "writes": 380,
+        "stmts": 490,
+        "maxReads": 378
+      }
+    }
+  }
+}

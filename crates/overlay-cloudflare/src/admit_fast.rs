@@ -446,12 +446,13 @@ struct PotSpendRow {
 /// Release every UNCONFIRMED spend pointer the txid left on other rows; the
 /// list goes on the ledger row for the readmission. Never fails the eviction:
 /// a faulted read releases nothing (logged), a faulted write leaves the rows
-/// as they were; a confirmed pointer is counted and kept.
-async fn release_spends_of(db: &D1Database, txid: &str) -> Vec<ReleasedSpend> {
+/// as they were; a confirmed pointer is counted and kept. The flag is whether the read or the write faulted
+/// (bsv-low #831, the FIX-831-B lens's LOW-2: `EvictionOutcome::incomplete`).
+async fn release_spends_of(db: &D1Database, txid: &str) -> (Vec<ReleasedSpend>, bool) {
     let mut released = Vec::new();
     let pot_cols = table_columns(db, "pot_records").await;
     if !pot_cols.iter().any(|c| c.name == "spendingTxid") {
-        return released;
+        return (released, false);
     }
     let rows = match Query::new(select_pot_spends_sql(&pot_cols))
         .bind(txid)
@@ -463,7 +464,7 @@ async fn release_spends_of(db: &D1Database, txid: &str) -> Vec<ReleasedSpend> {
             worker::console_log!(
                 "[admit-fast] evict {txid}: reading its pot_records spends failed: {e} — nothing released"
             );
-            return released;
+            return (released, true);
         }
     };
     let (kept, movable): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| r.spent_confirmed != 0);
@@ -474,8 +475,9 @@ async fn release_spends_of(db: &D1Database, txid: &str) -> Vec<ReleasedSpend> {
         );
     }
     if movable.is_empty() {
-        return released;
+        return (released, false);
     }
+    let mut faulted = false;
     match Query::new(release_pot_spends_sql(&pot_cols))
         .bind(txid)
         .execute(db)
@@ -491,11 +493,14 @@ async fn release_spends_of(db: &D1Database, txid: &str) -> Vec<ReleasedSpend> {
                 });
             }
         }
-        Err(e) => worker::console_log!(
-            "[admit-fast] evict {txid}: releasing its pot_records spends failed: {e}"
-        ),
+        Err(e) => {
+            faulted = true;
+            worker::console_log!(
+                "[admit-fast] evict {txid}: releasing its pot_records spends failed: {e}"
+            )
+        }
     }
-    released
+    (released, faulted)
 }
 
 /// Re-mark the spends a readmitted tx had left (the ledger row's list): a
@@ -1210,6 +1215,11 @@ pub struct EvictionOutcome {
     /// The pass yielded to a readmission (the chain's word stands; the pot is served): the callers write no
     /// `refused` memo over it and count no eviction (round 3 of the gate).
     pub yielded: bool,
+    /// bsv-low #831 (the FIX-831-B lens's LOW-2): the pass left work undone, a row the passes could not move or
+    /// read back, or the release of the spend pointers faulted (the hops may still name the evicted txid). Logged
+    /// and counted `admit_fast_evict_incomplete_total` here as before; a caller that counts endings counts this one
+    /// as a fault, never an ending.
+    pub incomplete: bool,
 }
 
 /// The rows the twins still hold for a txid (D1): the re-open gate (round 4 of the gate). `(count, unreadable)`.
@@ -1321,8 +1331,8 @@ pub async fn evict_txid_everywhere_repointed(
     }
     // the spends it left on the rows it consumed (its hops, its pot) — released, and MERGED with the ledger's
     // list; NOT when the pass yielded to a readmission (the readmission re-marked them: they stand)
-    let mut released = if core.yielded_to_readmission.is_some() {
-        Vec::new()
+    let (mut released, release_faulted) = if core.yielded_to_readmission.is_some() {
+        (Vec::new(), false)
     } else {
         release_spends_of(db, &txid).await
     };
@@ -1384,6 +1394,12 @@ pub async fn evict_txid_everywhere_repointed(
             }
         }
     }
+    if release_faulted && core.faults.is_empty() {
+        crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_EVICT_INCOMPLETE, 1).await;
+        worker::console_log!(
+            "[admit-fast] evict {txid} INCOMPLETE (the release of its spend pointers faulted): the row is OPEN; the next accept, proof or eviction converges"
+        );
+    }
     if !core.faults.is_empty() {
         crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_EVICT_INCOMPLETE, 1).await;
         worker::console_log!(
@@ -1414,6 +1430,7 @@ pub async fn evict_txid_everywhere_repointed(
     EvictionOutcome {
         moved,
         yielded: core.yielded_to_readmission.is_some(),
+        incomplete: !core.faults.is_empty() || release_faulted,
     }
 }
 
@@ -5489,13 +5506,15 @@ mod tests {
         use super::*;
         use crate::proof_fetcher::{
             end_retired_pot, fold_arcade_look, retire_backlog_start, retire_candidate,
-            retire_eviction_reason, run_retire_backlog, ArcadeLook, NetworkPresence,
-            RetireBacklogSummary, RetireCandidateRow, RetireEnd, RetirePort, RetireStore,
-            RetireSummary, RETIRE_BACKLOG_CANDIDATES_SQL, RETIRE_BACKLOG_LIMIT,
+            retire_eviction_reason, retire_rotation_key, run_retire_backlog, ArcadeLook,
+            NetworkPresence, RetireBacklogSummary, RetireBudget, RetireCandidateRow, RetireEnd,
+            RetireEndState, RetireEviction, RetirePort, RetireStore, RetireSummary,
+            RETIRE_ARM_ROTATION_SALT, RETIRE_BACKLOG_CANDIDATES_SQL, RETIRE_BACKLOG_LIMIT,
             RETIRE_BACKLOG_WINDOW, RETIRE_CANDIDATES_POT_BEEFS_SQL,
-            RETIRE_CANDIDATES_TRANSACTIONS_SQL, RETIRE_LATCH_CLEAR_SQL, RETIRE_POT_BEEFS_SQL,
-            RETIRE_REASON_MARK, RETIRE_TRANSACTIONS_SQL, TX_ANY_VERDICT_DELETE_SQL,
-            TX_ANY_VERDICT_UPSERT_SQL,
+            RETIRE_CANDIDATES_TRANSACTIONS_SQL, RETIRE_END_RESERVE_STATEMENTS,
+            RETIRE_END_STATE_SQL, RETIRE_ENGINE_LATCH_CLEAR_SQL, RETIRE_LATCH_CLEAR_SQL,
+            RETIRE_PASS_STATEMENT_BUDGET, RETIRE_POT_BEEFS_SQL, RETIRE_REASON_MARK,
+            RETIRE_TRANSACTIONS_SQL, TX_ANY_VERDICT_DELETE_SQL, TX_ANY_VERDICT_UPSERT_SQL,
         };
         use overlay_discovery::pot::storage::eviction_chain_word;
         use std::cell::RefCell;
@@ -5516,6 +5535,49 @@ mod tests {
             answer_rows: RefCell<Option<Vec<RetireCandidateRow>>>,
             /// The backlog read's start key (`None`: the shipped one, `retire_backlog_start`).
             start: RefCell<Option<String>>,
+            /// The FIX-831-B lens's MEDIUM-2: every statement the port issued (the shipped `evict_core`'s through a
+            /// counting `ShadowDb`, the wrapper's and the port's own by their shape), the budget's count.
+            pub(super) stmts: std::cell::Cell<u64>,
+            /// The largest ending in statements (the reserve's pin).
+            pub(super) largest_ending: std::cell::Cell<u64>,
+            /// The FIX-831-B lens's LOW-1: run after the courier look of a txid (a proof landing mid-pass).
+            pub(super) after_look: RefCell<Option<AfterLook>>,
+            /// The FIX-831-B lens's LOW-2: the eviction answers incomplete (a release that faulted).
+            pub(super) incomplete: std::cell::Cell<bool>,
+        }
+
+        /// The LOW-1 pin's hook: run over the connection and the txid after the courier look.
+        pub(super) type AfterLook = Box<dyn Fn(&rusqlite::Connection, &str)>;
+
+        /// A `ShadowDb` that counts every statement it is asked to run (the lens's counting shape).
+        struct Counting<'a>(&'a SqliteShadow, &'a std::cell::Cell<u64>);
+        impl Counting<'_> {
+            fn bump(&self) {
+                self.1.set(self.1.get() + 1);
+            }
+        }
+        #[async_trait(?Send)]
+        impl ShadowDb for Counting<'_> {
+            async fn columns(&self, t: &str) -> Result<Vec<ColumnInfo>, String> {
+                self.bump();
+                self.0.columns(t).await
+            }
+            async fn count(&self, t: &str, k: &str, x: &str) -> Result<u64, String> {
+                self.bump();
+                self.0.count(t, k, x).await
+            }
+            async fn vouts(&self, t: &str, x: &str) -> Result<Vec<u32>, String> {
+                self.bump();
+                self.0.vouts(t, x).await
+            }
+            async fn exec(&self, q: &str, b: Vec<QVal>) -> Result<(), String> {
+                self.bump();
+                self.0.exec(q, b).await
+            }
+            async fn query_i64(&self, q: &str, b: Vec<QVal>) -> Result<Option<i64>, String> {
+                self.bump();
+                self.0.query_i64(q, b).await
+            }
         }
 
         impl SqliteRetire {
@@ -5527,7 +5589,14 @@ mod tests {
                     persisted: RefCell::new(Vec::new()),
                     answer_rows: RefCell::new(None),
                     start: RefCell::new(None),
+                    stmts: std::cell::Cell::new(0),
+                    largest_ending: std::cell::Cell::new(0),
+                    after_look: RefCell::new(None),
+                    incomplete: std::cell::Cell::new(false),
                 }
+            }
+            fn stmt(&self, n: u64) {
+                self.stmts.set(self.stmts.get() + n);
             }
             pub(super) fn say(
                 &self,
@@ -5563,6 +5632,9 @@ mod tests {
         impl RetirePort for SqliteRetire {
             async fn arcade(&self, txid: &str, evidence: Option<(String, String)>) -> ArcadeLook {
                 self.asked.borrow_mut().push(format!("arcade {txid}"));
+                if let Some(hook) = self.after_look.borrow().as_ref() {
+                    hook(self.conn(), txid);
+                }
                 fold_arcade_look(self.word(txid).0, evidence)
             }
             async fn bitails(&self, txid: &str) -> Option<NetworkPresence> {
@@ -5587,6 +5659,7 @@ mod tests {
                     ),
                     RetireStore::PotBeefs => self.conn().execute(RETIRE_POT_BEEFS_SQL, [txid]),
                 };
+                self.stmt(1);
                 r.map(|_| ()).map_err(|e| e.to_string())
             }
             async fn latched(
@@ -5604,15 +5677,37 @@ mod tests {
                         rusqlite::params![txid, now_ms, kind, reason],
                     )
                     .unwrap();
+                // the worker's: the memo upsert and its counter (and `arc_terminal` on a live fatal word)
+                self.stmt(2);
             }
-            async fn live_pot_rows(&self, txid: &str) -> Result<u64, String> {
-                ShadowDb::count(&self.db, "pot_records", "txid", txid).await
+            async fn end_state(&self, txid: &str) -> Result<RetireEndState, String> {
+                self.stmt(1);
+                self.conn()
+                    .query_row(RETIRE_END_STATE_SQL, [txid], |r| {
+                        Ok(RetireEndState {
+                            live: r.get::<_, i64>(0)? as f64,
+                            proven: r.get::<_, i64>(1)? as f64,
+                            latched: r.get::<_, i64>(2)? as f64,
+                        })
+                    })
+                    .map_err(|e| e.to_string())
             }
-            async fn evict(&self, txid: &str, reason: &str, asked_ms: u64) -> Result<bool, String> {
-                let core = evict_core(&self.db, txid, reason, asked_ms).await;
+            async fn evict(
+                &self,
+                txid: &str,
+                reason: &str,
+                asked_ms: u64,
+            ) -> Result<RetireEviction, String> {
+                let before = self.stmts.get();
+                let core =
+                    evict_core(&Counting(&self.db, &self.stmts), txid, reason, asked_ms).await;
                 assert!(core.faults.is_empty(), "{:?}", core.faults);
+                // the D1 wrapper's own statements by its shape (`evict_txid_everywhere_repointed`): `vouts_of` twice
+                // (its columns and its read each), the release's columns, read and write, the released list's read,
+                // the close
+                self.stmt(9);
                 if core.yielded_to_readmission.is_some() {
-                    return Ok(false);
+                    return Ok(RetireEviction::Yielded);
                 }
                 let pot_cols = cols(self.conn(), "pot_records");
                 let rows: Vec<(String, i64, i64)> = self
@@ -5655,7 +5750,13 @@ mod tests {
                         ],
                     )
                     .unwrap();
-                Ok(true)
+                let ending = self.stmts.get() - before;
+                self.largest_ending
+                    .set(self.largest_ending.get().max(ending));
+                if self.incomplete.get() {
+                    return Ok(RetireEviction::Incomplete);
+                }
+                Ok(RetireEviction::Stands)
             }
             async fn backlog_candidates(
                 &self,
@@ -5670,6 +5771,7 @@ mod tests {
                     .borrow()
                     .clone()
                     .unwrap_or_else(|| start.to_string());
+                self.stmt(1);
                 read_candidates(
                     self.conn(),
                     RETIRE_BACKLOG_CANDIDATES_SQL,
@@ -5677,8 +5779,12 @@ mod tests {
                 )
             }
             async fn clear_latch(&self, txid: &str) -> Result<(), String> {
+                self.stmt(3);
                 self.conn()
                     .execute(RETIRE_LATCH_CLEAR_SQL, [txid])
+                    .map_err(|e| e.to_string())?;
+                self.conn()
+                    .execute(RETIRE_ENGINE_LATCH_CLEAR_SQL, [txid])
                     .map_err(|e| e.to_string())?;
                 self.conn()
                     .execute(TX_ANY_VERDICT_DELETE_SQL, [txid])
@@ -5686,7 +5792,11 @@ mod tests {
                 Ok(())
             }
             async fn persist(&self, deltas: &[(&'static str, u64)]) {
+                self.stmt(deltas.iter().filter(|(_, d)| *d > 0).count() as u64);
                 self.persisted.borrow_mut().extend_from_slice(deltas);
+            }
+            fn statements(&self) -> u64 {
+                self.stmts.get()
             }
             fn now_ms(&self) -> i64 {
                 NOW
@@ -5765,22 +5875,54 @@ mod tests {
             }
         }
 
-        /// The retire pass's pot_beefs arm over the shipped candidate read: every candidate through the shipped step.
+        /// The retire pass's two arms over the shipped candidate reads: every candidate through the shipped step,
+        /// under the shipped budget (the `pot_beefs` arm's rotation started at the bottom of the key space).
         pub(super) async fn retire_pot_beefs(port: &SqliteRetire) -> RetireSummary {
+            let budget = RetireBudget::begin(port);
+            retire_arms(port, &budget, "").await
+        }
+
+        /// The two arms under `budget`, the `pot_beefs` arm's rotation from `arm_start` (the pass's own order:
+        /// the engine arm, then the `pot_beefs` arm).
+        pub(super) async fn retire_arms(
+            port: &SqliteRetire,
+            budget: &RetireBudget,
+            arm_start: &str,
+        ) -> RetireSummary {
             let mut summary = RetireSummary::default();
-            for (sql, store) in [
-                (
-                    RETIRE_CANDIDATES_TRANSACTIONS_SQL,
-                    RetireStore::Transactions,
-                ),
-                (RETIRE_CANDIDATES_POT_BEEFS_SQL, RetireStore::PotBeefs),
-            ] {
-                let rows = read_candidates(port.conn(), sql, rusqlite::params![NOW]).unwrap();
-                for row in rows {
-                    retire_candidate(port, store, &row, &mut summary).await;
-                }
+            let rows = read_candidates(
+                port.conn(),
+                RETIRE_CANDIDATES_TRANSACTIONS_SQL,
+                rusqlite::params![NOW],
+            )
+            .unwrap();
+            port.stmt(1);
+            for row in rows {
+                retire_candidate(port, budget, RetireStore::Transactions, &row, &mut summary).await;
+            }
+            let rows = read_candidates(
+                port.conn(),
+                RETIRE_CANDIDATES_POT_BEEFS_SQL,
+                rusqlite::params![NOW, arm_start],
+            )
+            .unwrap();
+            port.stmt(1);
+            for row in rows {
+                retire_candidate(port, budget, RetireStore::PotBeefs, &row, &mut summary).await;
             }
             summary
+        }
+
+        /// One backlog pass under a fresh shipped budget.
+        pub(super) async fn backlog(port: &SqliteRetire) -> RetireBacklogSummary {
+            let budget = RetireBudget::begin(port);
+            run_retire_backlog(port, &budget).await
+        }
+
+        /// One backlog pass with the statement budget lifted (the pins of the page's own bounds).
+        pub(super) async fn backlog_unbounded(port: &SqliteRetire) -> RetireBacklogSummary {
+            let budget = RetireBudget::with_limit(port, u64::MAX);
+            run_retire_backlog(port, &budget).await
         }
 
         pub(super) fn ledger(
@@ -5875,7 +6017,12 @@ mod tests {
             let mut want: Vec<String> = hops.iter().map(|h| h.to_string()).collect();
             want.sort();
             assert_eq!(got, want, "releasedSpends names both hops");
-            assert_eq!(port.total(crate::ops::COUNTER_RETIRE_EVICTED), 1);
+            assert_eq!(
+                port.total(crate::ops::COUNTER_RETIRE_EVICTED)
+                    + port.total(crate::ops::COUNTER_RETIRE_BACKLOG_EVICTED),
+                1,
+                "one ending counted, by the arm or the backlog that made it"
+            );
         }
 
         /// (a) A never-held JOIN admitted pending, 49 h proofless, Arcade 404 and both indexers absent: the retire
@@ -5904,9 +6051,11 @@ mod tests {
                 )
                 .unwrap();
             let summary = retire_pot_beefs(&port).await;
-            // the JOIN is a candidate of both stores; the refund of pot_beefs only
+            // the JOIN is a candidate of both stores: the engine arm retires it first and (the FIX-831-B lens's
+            // MEDIUM-1) latches its stored BEEF and ends it in the same step, so the pot_beefs arm no longer reads
+            // it; the refund is the pot_beefs arm's alone
             assert_ended(&port, &join, &hop_refs, "network-absent ");
-            assert_eq!(summary.retired, 3, "{summary:?}");
+            assert_eq!(summary.retired, 2, "{summary:?}");
             assert_eq!(
                 summary.evicted_on_retire, 1,
                 "only the live pot is ended: {summary:?}"
@@ -5995,7 +6144,7 @@ mod tests {
             let dead_hop = "d9".repeat(32);
             seed_ghost_join(port.conn(), &dead, &[&dead_hop], 49 * HOUR, true);
             *port.start.borrow_mut() = Some(String::new());
-            let summary = run_retire_backlog(&port).await;
+            let summary = backlog(&port).await;
             assert_eq!(
                 summary,
                 RetireBacklogSummary {
@@ -6003,7 +6152,8 @@ mod tests {
                     evicted: 1,
                     left: 3,
                     kept: 0,
-                    faults: 0
+                    faults: 0,
+                    deferred: 0,
                 },
             );
             for (i, (pot, ..)) in held.iter().enumerate() {
@@ -6075,7 +6225,7 @@ mod tests {
             );
             port.say(&blind, ArcadeLook::Fault, None, None);
             *port.start.borrow_mut() = Some(String::new());
-            let summary = run_retire_backlog(&port).await;
+            let summary = backlog(&port).await;
             assert_eq!(
                 summary,
                 RetireBacklogSummary {
@@ -6083,7 +6233,8 @@ mod tests {
                     evicted: 0,
                     left: 1,
                     kept: 1,
-                    faults: 0
+                    faults: 0,
+                    deferred: 0,
                 },
             );
             assert_eq!(
@@ -6157,23 +6308,19 @@ mod tests {
                     out.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
                     out
                 };
-            // the pass's transactions arm runs first and latches the JOIN's engine row (`retired_ms`, its reason):
-            // the rows the eviction then finds are the ones it must give back
-            let mut summary = RetireSummary::default();
-            for row in read_candidates(
-                port.conn(),
-                RETIRE_CANDIDATES_TRANSACTIONS_SQL,
-                rusqlite::params![NOW],
+            // the JOIN's engine row latched (`retired_ms`, its reason) as the transactions arm latches it, so the rows
+            // the eviction then finds are the ones it must give back (since the FIX-831-B lens's MEDIUM-1 that arm
+            // ends the pot in the same step, pinned by `i831_h`; here the pot_beefs arm ends it, the latch held)
+            let reason = crate::proof_fetcher::retire_verdict(
+                &ArcadeLook::Missing,
+                Some(false),
+                Some(false),
+                49 * 3_600,
             )
-            .unwrap()
-            {
-                retire_candidate(&port, RetireStore::Transactions, &row, &mut summary).await;
-            }
-            assert_eq!(
-                (summary.retired, summary.evicted_on_retire),
-                (1, 0),
-                "the engine row is latched, never ended"
-            );
+            .expect("the absence verdict");
+            port.latch(RetireStore::Transactions, &join, &reason, NOW)
+                .await
+                .unwrap();
             let before = snapshot(port.conn());
             assert_eq!(
                 before.len(),
@@ -6305,15 +6452,25 @@ mod tests {
 
         /// (g) The backlog pass's bounds and its counters on the summary line: at most eight candidates a pass (20
         /// latched live pots drain 8, 8, 4, 0, each pass's deltas persisted per candidate); the read is a window of
-        /// 256 latched txids from a start key that moves (300 latched non-pots below a live pot hide it from a pass
-        /// started at the bottom and not from one started past them); a port answering more than eight is cut at
-        /// eight; the two callers print `end_line` beside the conflict pass's words, and the five counters are seeded.
+        /// 32 txids of each set from a start key that moves (the FIX-831-B lens's MEDIUM-2: it was 256; 40 latched
+        /// non-pots below a live pot hide it from a pass started at the bottom and not from one started past them); a
+        /// port answering more than eight is cut at eight; the two callers print `end_line` beside the conflict pass's
+        /// words, and the six counters are seeded. (The statement budget is `i831_l`'s; here it is lifted.)
         #[tokio::test]
         async fn i831_g_the_backlog_pass_is_bounded_and_counted_on_the_summary_line() {
             assert_eq!(RETIRE_BACKLOG_LIMIT, 8);
-            assert_eq!(RETIRE_BACKLOG_WINDOW, 256);
-            assert!(RETIRE_BACKLOG_CANDIDATES_SQL.contains("ORDER BY txid LIMIT 256) s"));
-            assert!(RETIRE_BACKLOG_CANDIDATES_SQL.ends_with("ORDER BY b.txid LIMIT 8"));
+            assert_eq!(RETIRE_BACKLOG_WINDOW, 32);
+            assert!(
+                RETIRE_BACKLOG_CANDIDATES_SQL.contains("ORDER BY (txid < ?2), txid LIMIT 32) s")
+            );
+            assert_eq!(
+                RETIRE_BACKLOG_CANDIDATES_SQL.matches("LIMIT 32").count(),
+                5,
+                "each set's page from the start and from the bottom (the wrap), and the merged page"
+            );
+            assert!(
+                RETIRE_BACKLOG_CANDIDATES_SQL.ends_with("ORDER BY (b.txid < ?2), b.txid LIMIT 8")
+            );
             let port = SqliteRetire::new();
             for i in 0..20 {
                 let pot = format!("{:064x}", 0x1000 + i);
@@ -6322,7 +6479,7 @@ mod tests {
             *port.start.borrow_mut() = Some(String::new());
             let mut evicted = Vec::new();
             for _ in 0..4 {
-                evicted.push(run_retire_backlog(&port).await.evicted);
+                evicted.push(backlog_unbounded(&port).await.evicted);
             }
             assert_eq!(evicted, vec![8, 8, 4, 0]);
             assert_eq!(port.total(crate::ops::COUNTER_RETIRE_BACKLOG_SCANNED), 20);
@@ -6332,9 +6489,9 @@ mod tests {
                 40,
                 "two deltas a candidate, persisted per candidate"
             );
-            // the window: 300 latched non-pots below one live pot
+            // the window: 40 latched non-pots below one live pot
             let port = SqliteRetire::new();
-            for i in 0..300 {
+            for i in 0..40 {
                 port.conn()
                     .execute(
                         "INSERT INTO pot_beefs (txid, beef, createdAt, has_proof, structurally_unprovable) VALUES (?1, X'00', 1, 0, 1)",
@@ -6346,15 +6503,21 @@ mod tests {
             seed_ghost_join(port.conn(), &pot, &[], 49 * HOUR, true);
             *port.start.borrow_mut() = Some(String::new());
             assert_eq!(
-                run_retire_backlog(&port).await.scanned,
+                backlog(&port).await.scanned,
                 0,
                 "past the window from the bottom"
             );
-            *port.start.borrow_mut() = Some(format!("{:064x}", 200));
+            *port.start.borrow_mut() = Some(format!("{:064x}", 10));
+            assert_eq!(backlog(&port).await.evicted, 1, "inside a later window");
+            // the wrap (the lens's NOTE-3): a pot whose txid is BELOW the start is read past the top
+            let port = SqliteRetire::new();
+            let low = format!("{:064x}", 1);
+            seed_ghost_join(port.conn(), &low, &[], 49 * HOUR, true);
+            *port.start.borrow_mut() = Some("f".repeat(16));
             assert_eq!(
-                run_retire_backlog(&port).await.evicted,
+                backlog(&port).await.evicted,
                 1,
-                "inside a later window"
+                "a start above the set wraps to its bottom"
             );
             // the start key moves with the clock and is a 16-digit hex key
             let a = retire_backlog_start(NOW);
@@ -6374,7 +6537,7 @@ mod tests {
                 })
                 .collect();
             *port.answer_rows.borrow_mut() = Some(rows);
-            let s = run_retire_backlog(&port).await;
+            let s = backlog(&port).await;
             assert_eq!((s.scanned, s.kept), (8, 8), "{s:?}");
             // the summary line's words, printed by both callers after the conflict pass's
             let mut summary = RetireSummary {
@@ -6388,10 +6551,11 @@ mod tests {
                 left: 2,
                 kept: 2,
                 faults: 1,
+                deferred: 0,
             };
             assert_eq!(
                 summary.end_line(),
-                "evicted_on_retire=2 evict_faults=1 backlog: scanned=8 evicted=3 left=2 kept=2 faults=1"
+                "evicted_on_retire=2 evict_faults=1 end_deferred=0 statements=0 backlog: scanned=8 evicted=3 left=2 kept=2 faults=1 deferred=0"
             );
             for (name, src) in [
                 ("lib.rs", include_str!("lib.rs")),
@@ -6409,8 +6573,390 @@ mod tests {
                 .filter(|c| !c.is_whitespace())
                 .collect();
             assert!(ops.contains(
-                "COUNTER_ADMIT_FAST_CONFLICT_FAULTS,//bsv-low#831half2:theretirepass'sevictionsanditsbacklogpassCOUNTER_RETIRE_EVICTED,COUNTER_RETIRE_BACKLOG_SCANNED,COUNTER_RETIRE_BACKLOG_EVICTED,COUNTER_RETIRE_BACKLOG_LEFT,COUNTER_RETIRE_EVICT_FAULTS,"
+                "COUNTER_ADMIT_FAST_CONFLICT_FAULTS,//bsv-low#831half2:theretirepass'sevictionsanditsbacklogpassCOUNTER_RETIRE_EVICTED,COUNTER_RETIRE_BACKLOG_SCANNED,COUNTER_RETIRE_BACKLOG_EVICTED,COUNTER_RETIRE_BACKLOG_LEFT,COUNTER_RETIRE_EVICT_FAULTS,COUNTER_RETIRE_END_DEFERRED,"
             ), "the five counters are served from 0");
+        }
+
+        /// The shipped enrolment of both stores and the shipped watch GC, as `refresh_proofless_watch` runs them
+        /// after the retire step.
+        fn watch_refresh(conn: &rusqlite::Connection) {
+            for table in ["pot_beefs", "transactions"] {
+                conn.execute(&crate::ops::proofless_watch_enrol_sql(table), [NOW])
+                    .unwrap();
+            }
+            conn.execute(crate::ops::PROOFLESS_WATCH_GC_SQL, [])
+                .unwrap();
+        }
+
+        /// One whole retire pass as `run_retire_pass` runs it (the arms, the backlog, the deferred count), under
+        /// `budget`, the arm's rotation from `arm_start` and the backlog's from `backlog_start`.
+        async fn retire_pass(
+            port: &SqliteRetire,
+            budget: &RetireBudget,
+            arm_start: &str,
+            backlog_start: &str,
+        ) -> RetireSummary {
+            let mut summary = retire_arms(port, budget, arm_start).await;
+            *port.start.borrow_mut() = Some(backlog_start.to_string());
+            summary.backlog = run_retire_backlog(port, budget).await;
+            crate::proof_fetcher::persist_retire_deferred(port, &summary).await;
+            summary.statements = budget.spent(port);
+            summary
+        }
+
+        /// (h) The FIX-831-B lens's MEDIUM-1, its own repro shape (`lens_repro_the_engine_arm_retires_first_and_the_pot
+        /// _escapes`): eight OLDER uncertain `pot_beefs` rows on the watch and a 49 h ghost JOIN. On `ef9186df` the
+        /// engine arm retired the JOIN's engine row, the pot_beefs arm's eight were the older rows, the watch GC then
+        /// dropped the shared row, and the pot stayed live through every later pass and backlog (`watched after GC:
+        /// 0; latch: None; live pot rows: 1; ledger: None`). Now the engine arm latches the pot's stored BEEF and
+        /// ends it in the same step. And the population that escaped before the fold (engine row retired, stored
+        /// BEEF unlatched, no watch row) is the backlog's: its page reads the engine's retired set too, and it ends
+        /// such a pot (latching it first) or, when the fresh look finds it held, clears BOTH latches so the enrolment
+        /// watches it again.
+        #[tokio::test]
+        async fn i831_h_a_pot_whose_engine_row_the_engine_arm_retires_is_ended_never_escaped() {
+            let port = SqliteRetire::new();
+            for i in 0..8 {
+                let b = format!("{:064x}", 0xaa00 + i);
+                port.conn().execute(
+                    "INSERT INTO pot_beefs (txid, beef, createdAt, has_proof) VALUES (?1, X'00', ?2, 0)",
+                    rusqlite::params![b, (NOW - 60 * HOUR) / 1000]).unwrap();
+                port.conn()
+                    .execute(
+                        "INSERT INTO proofless_watch (txid, first_seen_ms) VALUES (?1, ?2)",
+                        rusqlite::params![b, NOW - 60 * HOUR],
+                    )
+                    .unwrap();
+                port.say(&b, ArcadeLook::Missing, Some(NetworkPresence::Absent), None);
+            }
+            let join = "86".repeat(32);
+            let hop = "a6".repeat(32);
+            seed_ghost_join(port.conn(), &join, &[&hop], 49 * HOUR, false);
+            let s = retire_pot_beefs(&port).await;
+            assert_eq!(
+                (s.retired, s.evicted_on_retire, s.kept_uncertain),
+                (1, 1, 8),
+                "the engine arm retires the JOIN and ends its pot in the same step: {s:?}"
+            );
+            watch_refresh(port.conn());
+            for _ in 0..3 {
+                retire_pot_beefs(&port).await;
+                *port.start.borrow_mut() = Some(String::new());
+                backlog(&port).await;
+                watch_refresh(port.conn());
+            }
+            assert_ended(&port, &join, &[&hop], "network-absent ");
+            assert_eq!(
+                count(port.conn(), "transactions_evicted", "txid", &join),
+                1,
+                "the engine row went with the pot"
+            );
+
+            // the escaped population: the engine row retired by the base's arm, the stored BEEF unlatched, no watch
+            // row (the GC dropped it), the pot live; and one such pot the network holds
+            let port = SqliteRetire::new();
+            let ghost = "87".repeat(32);
+            let held = "88".repeat(32);
+            for (txid, h) in [(&ghost, "a7".repeat(32)), (&held, "b8".repeat(32))] {
+                seed_ghost_join(port.conn(), txid, &[&h], 49 * HOUR, false);
+                port.conn()
+                    .execute(
+                        RETIRE_TRANSACTIONS_SQL,
+                        rusqlite::params![
+                            NOW - HOUR,
+                            "network-absent 172800s: arcade 404 + both indexers 404",
+                            txid
+                        ],
+                    )
+                    .unwrap();
+            }
+            watch_refresh(port.conn());
+            assert_eq!(
+                count(port.conn(), "proofless_watch", "txid", &ghost),
+                0,
+                "off the watch: the escape"
+            );
+            assert_eq!(latch_of(port.conn(), &ghost), None);
+            // the arms cannot reach it (no watch row): the base's state for good
+            let s = retire_pot_beefs(&port).await;
+            assert_eq!(s.scanned, 0, "{s:?}");
+            port.say(
+                &held,
+                ArcadeLook::Missing,
+                Some(NetworkPresence::Absent),
+                Some(NetworkPresence::Present { height: None }),
+            );
+            *port.start.borrow_mut() = Some(String::new());
+            let b = backlog(&port).await;
+            assert_eq!((b.scanned, b.evicted, b.left), (2, 1, 1), "{b:?}");
+            assert_ended(&port, &ghost, &[&"a7".repeat(32)], "network-absent ");
+            let retired: Option<i64> = port
+                .conn()
+                .query_row(
+                    "SELECT retired_ms FROM transactions WHERE txid = ?1",
+                    [&held],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(retired, None, "the held pot's engine latch cleared");
+            assert_eq!(
+                count(port.conn(), "pot_records", "txid", &held),
+                1,
+                "the held pot stays"
+            );
+            assert_eq!(ledger(port.conn(), &held), None);
+            watch_refresh(port.conn());
+            assert_eq!(
+                count(port.conn(), "proofless_watch", "txid", &held),
+                1,
+                "watched again"
+            );
+            // the escaped pots' page reads the engine's retired set
+            assert!(RETIRE_BACKLOG_CANDIDATES_SQL
+                .contains("FROM transactions_retired_set WHERE txid >= ?2"));
+            assert!(RETIRE_ENGINE_LATCH_CLEAR_SQL
+                .contains("EXISTS (SELECT 1 FROM pot_records p WHERE p.txid = ?1)"));
+        }
+
+        /// (i) The FIX-831-B lens's LOW-1: a verified proof that lands after the look and before the eviction wins,
+        /// on both arms and in the backlog. On `ef9186df` the latch was a no-op (`has_proof = 0` guard), the port still
+        /// answered `Ok`, and the pot was evicted: a mined pot shadow-moved with no MINED push coming.
+        #[tokio::test]
+        async fn i831_i_a_proof_landing_mid_pass_wins_over_the_eviction() {
+            for (engine_arm, table) in [
+                (true, "pot_beefs"),
+                (true, "transactions"),
+                (false, "pot_beefs"),
+            ] {
+                let port = SqliteRetire::new();
+                let join = "89".repeat(32);
+                seed_ghost_join(
+                    port.conn(),
+                    &join,
+                    &["a9".repeat(32).as_str()],
+                    49 * HOUR,
+                    false,
+                );
+                if !engine_arm {
+                    // the pot_beefs arm alone: no engine row
+                    port.conn()
+                        .execute("DELETE FROM transactions WHERE txid = ?1", [&join])
+                        .unwrap();
+                }
+                let t = table.to_string();
+                *port.after_look.borrow_mut() = Some(Box::new(move |c, txid| {
+                    c.execute(
+                        &format!("UPDATE {t} SET has_proof = 1 WHERE txid = ?1"),
+                        [txid],
+                    )
+                    .unwrap();
+                }));
+                let s = retire_pot_beefs(&port).await;
+                assert_eq!(s.evicted_on_retire, 0, "{table} proven mid-pass: {s:?}");
+                assert_eq!(count(port.conn(), "pot_records", "txid", &join), 1);
+                assert_eq!(ledger(port.conn(), &join), None, "nothing evicted");
+            }
+            // the backlog: a latched pot whose proof lands during the fresh look
+            let port = SqliteRetire::new();
+            let join = "8a".repeat(32);
+            seed_ghost_join(port.conn(), &join, &[], 49 * HOUR, true);
+            *port.after_look.borrow_mut() = Some(Box::new(|c, txid| {
+                c.execute("UPDATE pot_beefs SET has_proof = 1 WHERE txid = ?1", [txid])
+                    .unwrap();
+            }));
+            *port.start.borrow_mut() = Some(String::new());
+            let b = backlog(&port).await;
+            assert_eq!((b.scanned, b.evicted, b.kept), (1, 0, 1), "{b:?}");
+            assert_eq!(ledger(port.conn(), &join), None);
+            assert_eq!(
+                end_retired_pot(&port, &RetireBudget::begin(&port), &join, "x", NOW).await,
+                RetireEnd::Proven
+            );
+        }
+
+        /// (j) The FIX-831-B lens's LOW-2: an eviction that left work undone (a row not moved, or the release of the
+        /// spend pointers faulted) is a FAULT, never an ending, on both arms and in the backlog. The wrapper answers it
+        /// (`EvictionOutcome::incomplete`, the release's fault included) and the worker's port maps it.
+        #[tokio::test]
+        async fn i831_j_an_incomplete_eviction_is_counted_a_fault_never_an_ending() {
+            let port = SqliteRetire::new();
+            let join = "8b".repeat(32);
+            seed_ghost_join(port.conn(), &join, &[], 49 * HOUR, false);
+            port.incomplete.set(true);
+            let s = retire_pot_beefs(&port).await;
+            assert_eq!((s.evicted_on_retire, s.evict_faults), (0, 1), "{s:?}");
+            assert_eq!(port.total(crate::ops::COUNTER_RETIRE_EVICTED), 0);
+            assert_eq!(port.total(crate::ops::COUNTER_RETIRE_EVICT_FAULTS), 1);
+            let port = SqliteRetire::new();
+            seed_ghost_join(port.conn(), &join, &[], 49 * HOUR, true);
+            port.incomplete.set(true);
+            *port.start.borrow_mut() = Some(String::new());
+            let b = backlog(&port).await;
+            assert_eq!((b.evicted, b.faults), (0, 1), "{b:?}");
+            assert_eq!(port.total(crate::ops::COUNTER_RETIRE_BACKLOG_EVICTED), 0);
+            // the wrapper and the worker's port, by their source
+            let me: String = include_str!("admit_fast.rs")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(me.contains("incomplete:!core.faults.is_empty()||release_faulted,"));
+            assert!(me.contains(
+                "let(mutreleased,release_faulted)=ifcore.yielded_to_readmission.is_some(){"
+            ));
+            let pf: String = include_str!("proof_fetcher.rs")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(pf.contains("}elseifoutcome.incomplete{RetireEviction::Incomplete}else{RetireEviction::Stands})"));
+        }
+
+        /// (k) The FIX-831-B lens's LOW-4: the pot_beefs arm ROTATES. Eight OLDER rows the verdict keeps every pass
+        /// (Arcade holds each at a pre-SEEN rank) sat at the head of the base's oldest-first `LIMIT 8` for good, and a
+        /// younger 49 h ghost pot behind them was never read; now the arm starts at a key that moves every pass and the
+        /// ghost is reached and ended.
+        #[tokio::test]
+        async fn i831_k_eight_kept_rows_never_starve_a_younger_candidate() {
+            let port = SqliteRetire::new();
+            for i in 0..8 {
+                let b = format!("{:064x}", 0xbb00 + i);
+                port.conn().execute(
+                    "INSERT INTO pot_beefs (txid, beef, createdAt, has_proof) VALUES (?1, X'00', ?2, 0)",
+                    rusqlite::params![b, (NOW - 90 * HOUR) / 1000]).unwrap();
+                port.conn()
+                    .execute(
+                        "INSERT INTO proofless_watch (txid, first_seen_ms) VALUES (?1, ?2)",
+                        rusqlite::params![b, NOW - 90 * HOUR],
+                    )
+                    .unwrap();
+                port.say(&b, ArcadeLook::Present, None, None);
+            }
+            let ghost = "8c".repeat(32);
+            seed_ghost_join(port.conn(), &ghost, &[], 49 * HOUR, false);
+            port.conn()
+                .execute("DELETE FROM transactions WHERE txid = ?1", [&ghost])
+                .unwrap();
+            let mut ended_at = None;
+            for k in 0..8 {
+                let budget = RetireBudget::begin(&port);
+                let start = retire_rotation_key(NOW + k * 15 * 60_000, RETIRE_ARM_ROTATION_SALT);
+                let s = retire_arms(&port, &budget, &start).await;
+                if s.evicted_on_retire == 1 {
+                    ended_at = Some(k);
+                    break;
+                }
+                assert_eq!(s.kept_present, 8, "{s:?}");
+            }
+            assert!(
+                ended_at.is_some(),
+                "the younger ghost is reached by a rotating start"
+            );
+            assert_eq!(count(port.conn(), "pot_records", "txid", &ghost), 0);
+            assert!(
+                RETIRE_CANDIDATES_POT_BEEFS_SQL.ends_with("ORDER BY (w.txid < ?2), w.txid LIMIT 8")
+            );
+            assert_ne!(
+                retire_rotation_key(NOW, RETIRE_ARM_ROTATION_SALT),
+                retire_backlog_start(NOW),
+                "the arm and the backlog start apart"
+            );
+            let lib: String = include_str!("proof_fetcher.rs")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(lib.contains("letarm_start=retire_rotation_key(now,RETIRE_ARM_ROTATION_SALT);"));
+            assert!(lib.contains("ifstore==RetireStore::PotBeefs{q=q.bind(arm_start.as_str());}"));
+        }
+
+        /// (l) The FIX-831-B lens's MEDIUM-2: the pass's statement budget. 24 watched ghost JOINs (two hops each, both
+        /// stores) and 16 latched live pots, every one absent at 49 h: the base ended 8 + 8 + 8 of them in one pass,
+        /// about 1,200 statements in the worker. Now one pass spends at most the budget and its three tail statements,
+        /// the largest candidate step stays inside the reserve, the rest is deferred and counted once, and the passes
+        /// that follow end every pot.
+        #[tokio::test]
+        async fn i831_l_one_pass_spends_at_most_its_statement_budget_and_the_rest_follows() {
+            assert_eq!(RETIRE_PASS_STATEMENT_BUDGET, 480);
+            assert_eq!(RETIRE_END_RESERVE_STATEMENTS, 96);
+            assert_eq!(RETIRE_BACKLOG_WINDOW, 32);
+            let port = SqliteRetire::new();
+            // txids spread over the key space (as real ones are), so the rotating starts reach every one
+            let key = |salt: u64, i: i64| {
+                format!("{}{}", retire_rotation_key(i, salt << 32), "0".repeat(48))
+            };
+            let mut pots = Vec::new();
+            for i in 0..24 {
+                let join = key(1, i);
+                let hops = [key(2, i), key(3, i)];
+                seed_ghost_join(port.conn(), &join, &[&hops[0], &hops[1]], 49 * HOUR, false);
+                pots.push(join);
+            }
+            for i in 0..16 {
+                let join = key(4, i);
+                seed_ghost_join(port.conn(), &join, &[&key(5, i)], 49 * HOUR, true);
+                pots.push(join);
+            }
+            let mut passes = Vec::new();
+            for k in 0..60 {
+                let budget = RetireBudget::begin(&port);
+                let before = port.stmts.get();
+                let at = NOW + k * 15 * 60_000;
+                let s = retire_pass(
+                    &port,
+                    &budget,
+                    &retire_rotation_key(at, RETIRE_ARM_ROTATION_SALT),
+                    &retire_backlog_start(at),
+                )
+                .await;
+                let spent = port.stmts.get() - before;
+                assert!(
+                    spent <= RETIRE_PASS_STATEMENT_BUDGET + 3,
+                    "a pass spent {spent} statements: {s:?}"
+                );
+                passes.push((
+                    spent,
+                    s.evicted_on_retire + s.backlog.evicted,
+                    s.end_deferred + s.backlog.deferred,
+                ));
+                watch_refresh(port.conn());
+                if pots
+                    .iter()
+                    .all(|p| count(port.conn(), "pot_records", "txid", p) == 0)
+                {
+                    break;
+                }
+            }
+            eprintln!(
+                "i831_l passes (statements, endings, deferred): {passes:?}; largest ending {}",
+                port.largest_ending.get()
+            );
+            assert!(passes[0].2 > 0, "the first pass defers: {passes:?}");
+            assert!(
+                passes[0].1 < 24,
+                "it ends fewer than the base's 24: {passes:?}"
+            );
+            assert!(
+                port.largest_ending.get() + 8 <= RETIRE_END_RESERVE_STATEMENTS,
+                "the largest ending ({}) and its step's own statements sit inside the reserve",
+                port.largest_ending.get()
+            );
+            for p in &pots {
+                assert_eq!(
+                    count(port.conn(), "pot_records", "txid", p),
+                    0,
+                    "{p} ended by a later pass"
+                );
+                assert!(ledger(port.conn(), p).is_some());
+            }
+            let deferred: u64 = passes.iter().map(|p| p.2 as u64).sum();
+            assert_eq!(
+                port.total(crate::ops::COUNTER_RETIRE_END_DEFERRED),
+                deferred,
+                "counted once a pass"
+            );
+            assert_eq!(
+                port.total(crate::ops::COUNTER_RETIRE_EVICTED)
+                    + port.total(crate::ops::COUNTER_RETIRE_BACKLOG_EVICTED),
+                40
+            );
         }
 
         /// The end step itself: a fault of the live read or of the eviction is a `Fault`, never an eviction.
@@ -6418,7 +6964,14 @@ mod tests {
         async fn i831_the_end_step_answers_no_live_pot_for_a_non_pot() {
             let port = SqliteRetire::new();
             assert_eq!(
-                end_retired_pot(&port, &"77".repeat(32), "x", NOW).await,
+                end_retired_pot(
+                    &port,
+                    &RetireBudget::begin(&port),
+                    &"77".repeat(32),
+                    "x",
+                    NOW
+                )
+                .await,
                 RetireEnd::NoLivePot
             );
         }
