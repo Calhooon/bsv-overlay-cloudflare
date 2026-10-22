@@ -324,7 +324,7 @@ fn table() -> String {
                     &format!("{p:?} young={young} {status} {extra}"),
                     format!(
                         "{:?}",
-                        terminal_at_arcade_by_presence(p, young, TXID, status, extra)
+                        terminal_at_arcade_by_presence(p, young, TXID, status, extra, &crate::door_words::LockBound::default())
                     ),
                 );
             }
@@ -457,32 +457,39 @@ const L8_MOVED: &[(&str, &str)] = &[
 pub(crate) const FIX845_HOLDING_WORDS: [&str; 3] =
     ["RECEIVED", "SENT_TO_NETWORK", "ACCEPTED_BY_NETWORK"];
 
+/// bsv-low #836 fold (the lens's L3): UNKNOWN and PENDING_RETRY carry no network verdict (the toolbox 0.11.2
+/// vector's `toolbox_status: unknown` for both) and read `Holding` too: the same seven lines move for each input the
+/// table spells them by (`pending_retry` in lower case among them), the word upper case in the answer.
+pub(crate) const FIX836_L3_INPUTS: [&str; 3] = ["UNKNOWN", "PENDING_RETRY", "pending_retry"];
+
 fn fix845_moved() -> Vec<(String, String)> {
     let holding = crate::admit_fast::HOLDING_UNCERTAIN_REASON;
     let mut moved = Vec::new();
-    for w in FIX845_HOLDING_WORDS {
+    for input in FIX845_HOLDING_WORDS.into_iter().chain(FIX836_L3_INPUTS) {
+        let w = input.to_ascii_uppercase();
+        let i = input;
         moved.push((
-            format!("live_look\t{w}\tPresent"),
-            format!("live_look\t{w}\tHolding(\"{w}\")"),
+            format!("live_look\t{i}\tPresent"),
+            format!("live_look\t{i}\tHolding(\"{w}\")"),
         ));
         moved.push((
-            format!("live_look_fold_plant\t{w}\tPresent"),
-            format!("live_look_fold_plant\t{w}\tHolding(\"{w}\")"),
+            format!("live_look_fold_plant\t{i}\tPresent"),
+            format!("live_look_fold_plant\t{i}\tHolding(\"{w}\")"),
         ));
         moved.push((
-            format!("retire_absent_49h\t{w}\tNone"),
+            format!("retire_absent_49h\t{i}\tNone"),
             format!(
-                "retire_absent_49h\t{w}\tSome(\"network-absent 176400s: arcade holds it below SEEN ({w}, a hint) + both indexers 404\")"
+                "retire_absent_49h\t{i}\tSome(\"network-absent 176400s: arcade holds it below SEEN ({w}, a hint) + both indexers 404\")"
             ),
         ));
         for young in [true, false] {
             moved.push((
-                format!("evidence_absent_young_{young}\t{w}\tPresent"),
-                format!("evidence_absent_young_{young}\t{w}\tUncertain(\"{holding}\")"),
+                format!("evidence_absent_young_{young}\t{i}\tPresent"),
+                format!("evidence_absent_young_{young}\t{i}\tUncertain(\"{holding}\")"),
             ));
             moved.push((
-                format!("evidence_fault_young_{young}\t{w}\tPresent"),
-                format!("evidence_fault_young_{young}\t{w}\tUncertain(\"a courier faulted\")"),
+                format!("evidence_fault_young_{young}\t{i}\tPresent"),
+                format!("evidence_fault_young_{young}\t{i}\tUncertain(\"a courier faulted\")"),
             ));
         }
     }
@@ -530,8 +537,8 @@ fn the_doors_answers_are_the_recorded_table_save_where_the_tracker_refuses_the_w
             .iter()
             .filter(|(recorded, _)| FIXTURE.lines().any(|l| l == recorded))
             .count(),
-        21,
-        "every #845 row names a recorded line: seven for each of RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK"
+        42,
+        "every #845 row names a recorded line: seven for each of RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK, and (the #836 fold's L3) for UNKNOWN, PENDING_RETRY and pending_retry"
     );
     let have: Vec<&str> = got.lines().collect();
     let changed: Vec<String> = want
@@ -542,7 +549,7 @@ fn the_doors_answers_are_the_recorded_table_save_where_the_tracker_refuses_the_w
         .collect();
     assert!(
         changed.is_empty() && want.len() == have.len(),
-        "the door's answer changed ({} lines recorded, {} now; the moved rows are L8's and #845's: RECEIVED, SENT_TO_NETWORK and ACCEPTED_BY_NETWORK are Holding, never Present):\n{}",
+        "the door's answer changed ({} lines recorded, {} now; the moved rows are L8's and #845's: RECEIVED, SENT_TO_NETWORK and ACCEPTED_BY_NETWORK are Holding, never Present, and the #836 fold's L3: UNKNOWN and PENDING_RETRY too):\n{}",
         want.len(),
         have.len(),
         changed.join("\n")

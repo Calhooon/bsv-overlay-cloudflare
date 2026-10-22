@@ -1,6 +1,8 @@
 {
-  "about": "bsv-low #836 (loop 44, record 1066, 2026-10-22): Arcade's REJECTED for a pre-signed refund presented at its lock height while Arcade's peer answered thirteen blocks behind the chain (the chain's tip 972185, the peer's 972172). Two refunds (pot_evictions 1902ca00afb99f73... at 16:53:08Z and c76c3a09634c316c... at 16:52:58Z) were evicted on it. The bodies are frozen from the ledger's reason (the extraInfo verbatim: 'TX_LOCK_TIME (35): lock time (972185) as block height is not less than block height (972172)') joined to Arcade's own non-final suffix as arcade@85bfe5d writes it (services/propagation/propagator.go:1796-1798, classifyFailureLine: TX_LOCK_TIME maps to 476 StatusNotFinal and gains the retryable hint); the HTTP bytes themselves were not captured. Placeholders: {TXID} the subject txid. Expectations are this overlay's readings (bsv-low #836): a non-final word is 'not now', never a refusal, never an eviction.",
+  "about": "bsv-low #836 (loop 44, record 1066, 2026-10-22): Arcade's REJECTED for a pre-signed refund presented at its lock height while Arcade's peer answered thirteen blocks behind the chain (the chain's tip 972185, the peer's 972172). Two refunds (pot_evictions 1902ca00afb99f73... at 16:53:08Z and c76c3a09634c316c... at 16:52:58Z) were evicted on it. The bodies are frozen from the ledger's reason (the extraInfo verbatim: 'TX_LOCK_TIME (35): lock time (972185) as block height is not less than block height (972172)') joined to Arcade's own non-final suffix as arcade@85bfe5d writes it (services/propagation/propagator.go:1796-1798, classifyFailureLine: TX_LOCK_TIME maps to 476 StatusNotFinal and gains the retryable hint); the HTTP bytes themselves were not captured. Placeholders: {TXID} the subject txid. Expectations are this overlay's readings (bsv-low #836): a non-final word is 'not now', never a refusal, never an eviction. bsv-low #836 fold (the lens's M1, 2026-10-22): every reading runs under the chain's bound, the subject's own lock height from its bytes ('subject_lock_height', the refunds' nLockTime; a case's 'subject_lock: final' is a subject final by its bytes) against the tip: 'expect' at 'chain_tip' (inside the window), 'expect_past_lag' at 'chain_tip_past_lag' (the lock height plus door_words::NOT_FINAL_LAG_BLOCKS, 24, passed: Arcade's fatal word again, judged as any other). The lens's L1: the push is the evidence check's, never held on its text. The first body's 'status': 476 is an assumption about the GET body's shape, read by no check (the lens's N3).",
   "chain_tip": 972185,
+  "chain_tip_past_lag": 972210,
+  "subject_lock_height": 972185,
   "cases": [
     {
       "name": "loop44_status_rejected_tx_lock_time",
@@ -25,7 +27,22 @@
         "door_absent_aged": "retryable",
         "door_mempool_aged": "retryable",
         "door_mined": "accepted",
-        "watch": "not_final"
+        "watch": "not_final",
+        "door_absent_young": "retryable"
+      },
+      "expect_past_lag": {
+        "gate": "fatal",
+        "live_look": "fatal",
+        "lock_height": 972185,
+        "peer_height": 972172,
+        "evidence_absent_aged": "refused",
+        "evidence_absent_young": "refused",
+        "retire_absent_2h": "retire",
+        "door_absent_aged": "rejected",
+        "door_absent_young": "retryable",
+        "door_mempool_aged": "rejected",
+        "door_mined": "accepted",
+        "watch": "fatal"
       }
     },
     {
@@ -50,7 +67,22 @@
         "door_absent_aged": "retryable",
         "door_mempool_aged": "retryable",
         "door_mined": "accepted",
-        "watch": "not_final"
+        "watch": "not_final",
+        "door_absent_young": "retryable"
+      },
+      "expect_past_lag": {
+        "gate": "fatal",
+        "live_look": "fatal",
+        "lock_height": 972185,
+        "peer_height": 972172,
+        "evidence_absent_aged": "refused",
+        "evidence_absent_young": "refused",
+        "retire_absent_2h": "retire",
+        "door_absent_aged": "rejected",
+        "door_absent_young": "retryable",
+        "door_mempool_aged": "rejected",
+        "door_mined": "accepted",
+        "watch": "fatal"
       }
     },
     {
@@ -65,7 +97,11 @@
       },
       "expect": {
         "gate": "fatal",
-        "callback": "hold"
+        "callback": "evidence_check"
+      },
+      "expect_past_lag": {
+        "gate": "fatal",
+        "callback": "evidence_check"
       }
     },
     {
@@ -86,6 +122,46 @@
         "evidence_absent_young": "refused",
         "retire_absent_2h": "retire",
         "door_absent_aged": "rejected",
+        "door_mempool_aged": "rejected",
+        "door_mined": "accepted",
+        "watch": "fatal",
+        "door_absent_young": "retryable"
+      },
+      "expect_past_lag": {
+        "gate": "fatal",
+        "live_look": "fatal",
+        "evidence_absent_aged": "refused",
+        "evidence_absent_young": "refused",
+        "retire_absent_2h": "retire",
+        "door_absent_aged": "rejected",
+        "door_mempool_aged": "rejected",
+        "door_mined": "accepted",
+        "watch": "fatal",
+        "door_absent_young": "retryable"
+      }
+    },
+    {
+      "name": "subject_final_by_its_bytes_named_tx_lock_time",
+      "surface": "status",
+      "http": 200,
+      "subject_lock": "final",
+      "observed": "2026-10-22T16:53:08Z",
+      "body": {
+        "txid": "{TXID}",
+        "txStatus": "REJECTED",
+        "status": 476,
+        "timestamp": "2026-10-22T16:53:08Z",
+        "extraInfo": "TX_LOCK_TIME (35): lock time (972185) as block height is not less than block height (972172) \u2014 retryable: the transaction is not final against this peer's chain view; resubmit after the locktime expires"
+      },
+      "expect": {
+        "gate": "fatal",
+        "live_look": "fatal",
+        "lock_height": 972185,
+        "evidence_absent_aged": "refused",
+        "evidence_absent_young": "refused",
+        "retire_absent_2h": "retire",
+        "door_absent_aged": "rejected",
+        "door_absent_young": "retryable",
         "door_mempool_aged": "rejected",
         "door_mined": "accepted",
         "watch": "fatal"

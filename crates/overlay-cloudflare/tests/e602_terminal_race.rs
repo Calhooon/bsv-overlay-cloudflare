@@ -14,6 +14,7 @@ fn e602_mempool_conflict_never_readmits() {
             "subject",
             "REJECTED",
             "UTXO_SPENT: input already spent by competitor; DOUBLE_SPEND_ATTEMPTED",
+            &bsv_overlay_cloudflare::door_words::LockBound::default(),
         );
         assert!(
             !matches!(answer, Ok(ArcOutcome::Accepted(_))),
@@ -41,7 +42,8 @@ fn e602_confirmation_survives_the_courier_body_and_fold() {
                     young,
                     "subject",
                     "REJECTED",
-                    "UTXO_SPENT"
+                    "UTXO_SPENT",
+                    &bsv_overlay_cloudflare::door_words::LockBound::default()
                 ),
                 Ok(ArcOutcome::Accepted(_))
             ));
@@ -51,10 +53,11 @@ fn e602_confirmation_survives_the_courier_body_and_fold() {
         let presence = presence_response(200, body).unwrap();
         assert_eq!(presence, NetworkPresence::Present { height: None });
         assert!(
-            terminal_at_arcade_by_presence(presence, true, "s", "REJECTED", "UTXO_SPENT").is_err()
+            terminal_at_arcade_by_presence(presence, true, "s", "REJECTED", "UTXO_SPENT", &bsv_overlay_cloudflare::door_words::LockBound::default())
+                .is_err()
         );
         assert!(matches!(
-            terminal_at_arcade_by_presence(presence, false, "s", "REJECTED", "UTXO_SPENT"),
+            terminal_at_arcade_by_presence(presence, false, "s", "REJECTED", "UTXO_SPENT", &bsv_overlay_cloudflare::door_words::LockBound::default()),
             Ok(ArcOutcome::Rejected(_))
         ));
     }
@@ -141,7 +144,8 @@ fn e602_fold_retire_callers_pass_the_woc_key_and_print_the_conflict_summary() {
     // The admin caller remains in lib.rs; cron and alarm share tick.rs.
     let callers =
         (source("lib.rs") + &source("tick.rs")).replace("from_env(&env)", "from_env(env)");
-    let call = "run_retire_pass(&ops_db,&arcade_base,woc_key.as_deref(),crate::proof_fetcher::ProofSources::from_env(env),).await;";
+    // bsv-low #836 fold: the tip a non-final word's hold is bounded by rides as the fifth argument
+    let call = "run_retire_pass(&ops_db,&arcade_base,woc_key.as_deref(),crate::proof_fetcher::ProofSources::from_env(env),crate::lookup_service_chain_tracker(env),).await;";
     assert_eq!(
         callers.matches(call).count(),
         2,
