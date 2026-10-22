@@ -137,6 +137,7 @@ fn main() {
         rows.push(format!("INSERT INTO tx_words (txid,word,tier,height,proof_root,proof_height,proof_hex,header_hash,hint_source,hint_at,updated_at,legacy_body) VALUES ('{id}','{word}','{tier}',{height},{root},{height},{hex},{hash},'woc',123,123,'{legacy}')"));
     }
     rows.extend(e649_hook_rows(now_s));
+    rows.extend(fix837_c_rows(now_s));
     for (i, r) in rows.iter().enumerate() {
         if r.starts_with("UPDATE ") || i >= l23_start {
             conn.execute_batch(r).unwrap();
@@ -188,6 +189,39 @@ fn identity_a_durable_spender_rows(now_s: u64) -> Vec<String> {
         format!("INSERT INTO owed_spender_bytes (txid, bytesJson, createdAtMs) VALUES ('{sweep}', '{bytes}', {})", now_s * 1000),
         format!("INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed) VALUES ('{}{sweep}.900000', {latched_at_ms}, 1, '{}', 1)", low_app_layer::owed::PROOF_MINED_LATCH_PREFIX, "ab".repeat(32)),
     ]
+}
+
+/// bsv-low #837 (FIX-837, fix 2): identity C, an old wallet with 300 results (loop 44 pair 1's A held 264): 300
+/// decoded unspent pots, C seat A in each, each game created one second after the last, so game 299 is the NEWEST.
+/// The cell (`tools/lane-499`, "#837") reads C's owed list and holds the newest game's row served inside the walk's
+/// outward budget. Synthetic keys and txids (`837c…`, `837d…`): no transaction is broadcast, nothing shares A or B.
+pub const ID_C: &str = "02c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+const C_POTS: u32 = 300;
+fn fix837_c_rows(now_s: u64) -> Vec<String> {
+    let mut rows = Vec::new();
+    for i in 0..C_POTS {
+        let txid = format!("837c{i:060x}");
+        let opp = format!("03837c{i:060x}");
+        let game = format!("837d{i:060x}");
+        let at = now_s - u64::from(C_POTS) + u64::from(i);
+        rows.push(format!(
+            "INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind, paramsDecoded, pubA, pubB, pubTower, payPkhA, payPkhB, rakePkh, stakeA, stakeB, feeSats, recoveryHeight, potSats) \
+             VALUES ('{txid}', 0, 0, {at}, 'covenant', 1, '{ID_C}', '{opp}', '{ID_A}', '{}', '{}', '{}', 9900, 9900, 1, 958846, 19800)",
+            "11".repeat(20),
+            "22".repeat(20),
+            "33".repeat(20)
+        ));
+        for (k, (me, them)) in [(ID_C, opp.as_str()), (opp.as_str(), ID_C)]
+            .into_iter()
+            .enumerate()
+        {
+            rows.push(format!(
+                "INSERT INTO potparty_records (identity, opponentIdentity, gameId, potTxid, potVout, recoveryHeight, sigHex, txid, outputIndex, createdAt, seatSettlePubkey, seatSigHex, sigValid) \
+                 VALUES ('{me}', '{them}', '{game}', '{txid}', 0, 958846, '3045ab', '837e{k}{i:059x}', 0, {at}, '{me}', '00', 1)"
+            ));
+        }
+    }
+    rows
 }
 
 // E649 L4 M1: the pot hook's maximum body on the fleet (the review's H2 shape): seven decoded pots with two latched

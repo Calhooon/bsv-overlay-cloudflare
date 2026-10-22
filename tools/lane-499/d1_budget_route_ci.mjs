@@ -373,6 +373,36 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   }
 }
 
+// bsv-low #837 (FIX-837, fix 2): identity C holds 300 results (the seed's `fix837_c_rows`; loop 44 pair 1's A held
+// 264, and every recompute of A ran 12 to 26 s with the budget cut and served one row fewer). C's first owed read
+// (the compute on read) must serve the NEWEST game's row (game 299) inside the walk's outward budget (12 s), and never
+// fewer rows than C's games; the figures are printed for the record. It runs AFTER section 3: its first read writes C's
+// 300 rows in one batch (about 426 statements, under the platform's 1,000), a heavier identity than A's, and the
+// app's `/owed` running maximum that section 3 holds to A's named ceiling (`owed-first-read`) would carry it.
+{
+  const ID_C = '02' + 'c3'.repeat(32)
+  const newestGame = '837d' + (299).toString(16).padStart(60, '0')
+  const t0 = Date.now()
+  const o = await get(APP, `/owed?identity=${ID_C}`)
+  const ms = Date.now() - t0
+  let body = {}
+  try { body = JSON.parse(o.text) } catch {}
+  const rows = body.rows ?? []
+  const games = new Set(rows.map((r) => r.gameId))
+  const d1 = segment(o.timing, 'd1')
+  console.log(`#837 C's first owed read: ${ms} ms, ${rows.length} rows over ${games.size} games, refresh=${body.refresh ?? null}, truncated=${body.truncated ?? null}, d1 ${JSON.stringify(d1)}`)
+  if (o.status === 200 && rows.some((r) => r.gameId === newestGame) && ms < 12_000) pass(`#837 a 300-result identity's newest game is served within the budget (${ms} ms)`)
+  else fail('#837 a 300-result identity\'s newest game is served within the budget', `${o.status} ${ms} ms rows=${rows.length} ${o.text.slice(0, 300)}`)
+  if (games.size >= 300 || body.refresh === 'shed') pass(`#837 C's list holds every game (${games.size}) or names the shed`)
+  else fail('#837 C\'s list holds every game or names the shed', `games=${games.size} refresh=${body.refresh}`)
+  const o2 = await get(APP, `/owed?identity=${ID_C}`)
+  let rows2 = []
+  try { rows2 = JSON.parse(o2.text).rows ?? [] } catch {}
+  console.log(`#837 C's served read: ${rows2.length} rows, d1 ${JSON.stringify(segment(o2.timing, 'd1'))}`)
+  if (o2.status === 200 && rows2.some((r) => r.gameId === newestGame) && rows2.length >= rows.length) pass('#837 C\'s served read keeps every row the first read served')
+  else fail('#837 C\'s served read keeps every row the first read served', `${o2.status} ${rows2.length} < ${rows.length}`)
+}
+
 // ── 4. the brain's recompute ceiling sheds ─────────────────────────────────
 {
   const h0 = (await appHealth()).owed
