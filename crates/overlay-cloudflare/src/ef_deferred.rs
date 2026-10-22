@@ -119,7 +119,10 @@ pub const IN_REQUEST_ANSWER_MS: u64 = 12_000;
 
 /// bsv-low #838: the most the request waits to put a past-deadline submission's bytes at rest (its R2 or D1
 /// writes and the queue's send, under the same D1 queue). Past it the answer is the deferral's own retryable
-/// 503, so the arm answers within [`IN_REQUEST_ANSWER_MS`] + this, 16 s, under the harness's 20 s.
+/// 503, so the request WAITS on its write and the put at most [`IN_REQUEST_ANSWER_MS`] + this, 16 s, from the
+/// arm's start (the FIX-838 lens's MEDIUM-2: that is the race's bound, not the answer's; the pre-engine reads and,
+/// on a write inside the deadline, the post-write guard's statements are awaited outside it, `ceilings.json`
+/// `doorAnswer`).
 pub const DEFER_AT_REST_CAP_MS: u64 = 4_000;
 
 /// bsv-low #838: the delay of a past-deadline job's queue message, seconds. The request's write goes on in
@@ -169,6 +172,40 @@ where
         std::task::Poll::Pending
     })
     .await
+}
+
+/// bsv-low #838 (the FIX-838 lens's MEDIUM-1): S2's decision for a gated engine write that outran the answer
+/// deadline, taken after the answer on the write's own report, exactly as the request takes it: a durable write
+/// enqueues nothing; one that is not durable enqueues its idempotent replay (`enqueue`, called exactly then) and is
+/// `Queued`, or `Refused` when the queue cannot take it (the deferred job is then the cover). ONE derivation:
+/// [`crate::queue::mutation_ack`].
+pub async fn past_deadline_ack<F, Fut>(durable: bool, enqueue: F) -> crate::queue::MutationAck
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let enqueued = if durable { None } else { Some(enqueue().await) };
+    crate::queue::mutation_ack(durable, enqueued)
+}
+
+/// bsv-low #838 (the FIX-838 lens's LOW-3): why a gated submission was deferred, named in the deferral's log line
+/// (the 202's body and its census reason, `queued`, are the same for both).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferralCause {
+    /// NL-6c / NL-6d: the EF work or the corroboration legs past the request's budget.
+    EfWork,
+    /// bsv-low #838: the engine write past the arm's answer deadline ([`IN_REQUEST_ANSWER_MS`]).
+    AnswerDeadline,
+}
+
+impl DeferralCause {
+    /// The word in the log line.
+    pub fn word(self) -> &'static str {
+        match self {
+            DeferralCause::EfWork => "ef-work",
+            DeferralCause::AnswerDeadline => "answer-deadline",
+        }
+    }
 }
 
 /// A settled job's row is kept this long for the caller's poll, then swept
@@ -600,7 +637,7 @@ pub async fn defer(
         None,
     )
     .await;
-    deferral_answer(put, subject_txid, work, legs_from)
+    deferral_answer(put, subject_txid, work, legs_from, DeferralCause::EfWork)
 }
 
 /// bsv-low #838: the gated arm's engine write outran [`IN_REQUEST_ANSWER_MS`]. The write goes on (the caller
@@ -632,7 +669,7 @@ pub async fn defer_past_deadline<D: std::future::Future>(
             "not put at rest within {DEFER_AT_REST_CAP_MS} ms (bsv-low #838)"
         )),
     };
-    deferral_answer(put, subject_txid, work, 0)
+    deferral_answer(put, subject_txid, work, 0, DeferralCause::AnswerDeadline)
 }
 
 fn deferral_answer(
@@ -640,11 +677,13 @@ fn deferral_answer(
     subject_txid: &str,
     work: EfWork,
     legs_from: usize,
+    cause: DeferralCause,
 ) -> worker::Result<Response> {
     match put {
         Ok(reference) => {
             worker::console_log!(
-                "POST /submit(broadcast-gated) -> 202 (NL-6c/NL-6d: EF work {} B subject / {} B batch, {} legs, {legs_from} primed; past the request's budget {IN_REQUEST_SUBJECT_EF_BYTES} / {IN_REQUEST_BATCH_EF_BYTES} B, {IN_REQUEST_CORROBORATION_LEGS} legs; deferred as {reference})",
+                "POST /submit(broadcast-gated) -> 202 (cause {}; NL-6c/NL-6d: EF work {} B subject / {} B batch, {} legs, {legs_from} primed; the request's EF budget {IN_REQUEST_SUBJECT_EF_BYTES} / {IN_REQUEST_BATCH_EF_BYTES} B, {IN_REQUEST_CORROBORATION_LEGS} legs; the arm's answer deadline {IN_REQUEST_ANSWER_MS} ms; deferred as {reference})",
+                cause.word(),
                 work.subject_ef_bytes,
                 work.batch_ef_bytes,
                 work.legs
@@ -1233,10 +1272,11 @@ mod fix838 {
     /// Loop 44's slow JOIN, on the virtual clock: the arm begins at 0, its pre-engine steps take 1,700 ms (the
     /// door, the Arcade ladder and the admission decision at their p95 sum), and the engine's write takes 22.7 s
     /// (the measured 24.4 s answer). The request stops waiting at the arm's 12 s deadline, the put at rest is
-    /// capped at 4 s, so the answer leaves by 16 s, under the harness's 20 s; and the write handed back is NOT
-    /// dropped: driven on (as `ctx.wait_until` drives it) it finishes with its own output at 24.4 s.
+    /// capped at 4 s, so the race ends by 16 s from the arm's start, under the harness's 20 s (the past-deadline
+    /// answer's bound when its pre-engine reads end inside 12 s); and the write handed back is NOT dropped: driven
+    /// on (as `ctx.wait_until` drives it) it finishes with its own output at 24.4 s.
     #[test]
-    fn fix838_a_write_past_the_deadline_is_handed_back_unfinished_and_the_answer_leaves_by_16_s() {
+    fn fix838_a_write_past_the_deadline_is_handed_back_unfinished_and_the_race_ends_by_16_s() {
         let clock = Rc::new(Cell::new(1_700));
         let left = answer_ms_left(0.0, 1_700.0);
         assert_eq!(
@@ -1299,7 +1339,7 @@ mod fix838 {
         );
     }
 
-    /// The bound's arithmetic, against the harness's contract and the platform's: the answer (deadline plus the
+    /// The bound's arithmetic, against the harness's contract and the platform's: the race (deadline plus the
     /// put's cap) sits under the 20 s settle with the measured network leg; the job's run is delivered after the
     /// platform's end of the request's `wait_until` (30 s after the answer); and `ceilings.json` names the same
     /// numbers in its `doorAnswer` row, with loop 44's measured figures.
@@ -1315,7 +1355,7 @@ mod fix838 {
         assert_eq!(row["answerDeadlineMs"], IN_REQUEST_ANSWER_MS);
         assert_eq!(row["deferAtRestCapMs"], DEFER_AT_REST_CAP_MS);
         assert_eq!(row["jobDelaySecs"], PAST_DEADLINE_JOB_DELAY_SECS);
-        let ceiling = row["ceilingMs"].as_u64().unwrap();
+        let ceiling = row["raceBoundMs"].as_u64().unwrap();
         assert_eq!(ceiling, IN_REQUEST_ANSWER_MS + DEFER_AT_REST_CAP_MS);
         let network = row["measured"]["networkLegP95Ms"].as_u64().unwrap();
         assert!(

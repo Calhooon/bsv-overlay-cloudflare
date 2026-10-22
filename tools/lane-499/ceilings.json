@@ -314,12 +314,25 @@
     }
   },
   "doorAnswer": {
-    "doc": "bsv-low #838 (FIX-838): the broadcast-gated /submit answers inside the harness's 20 s settle (the door's contract, never raised). The arm stops WAITING on its engine write at answerDeadlineMs from the arm's start (the write goes on in ctx.wait_until), defers the submission as NL-6c does (the 202 and its poll; the job's queue message delayed jobDelaySecs, past the platform's 30 s end of that wait_until) and waits at most deferAtRestCapMs to put it at rest: ceilingMs = answerDeadlineMs + deferAtRestCapMs. Pinned natively over a virtual clock (`ef_deferred::fix838`), not driven by this tier: the gated arm needs Arcade and its background reaches mainnet hosts, which the tier's loopback seal refuses. measured: loop 44 (full-2026-10-22_15-50-41, 33 pairs, beta, 15:49Z to 17:19Z), server-side from the low-overlay-beta logs (694 gated answers) and the client's network leg from 116 harness submits matched to them (docs/audit/FIX-838-door-latency-2026-10-22.md).",
+    "doc": "bsv-low #838 (FIX-838): what the broadcast-gated /submit's answer deadline bounds, restated by the FIX-838 lens's MEDIUM-2. The race covers the ENGINE WRITE'S WAIT only: the arm stops WAITING on its engine write at answerDeadlineMs from the arm's start (the write goes on in ctx.wait_until), defers the submission as NL-6c does (the 202 and its poll; the job's queue message delayed jobDelaySecs, past the platform's 30 s end of that wait_until) and waits at most deferAtRestCapMs to put it at rest. raceBoundMs = answerDeadlineMs + deferAtRestCapMs is the most the request waits from the arm's start on the write and the put; a past-deadline answer leaves by raceBoundMs when the pre-engine reads end inside answerDeadlineMs (past it, those reads' own time plus deferAtRestCapMs). NOT bounded by it, awaited in the request under the shared D1's queue: the pre-engine steps (preEngineInRequest) and, on a write that lands inside the deadline, every post-write statement before the answer (postWriteInRequest, each named by its call in routes.rs submit_parts, pinned by ef_deferred::fix838f_m2). The answer's whole time is measured by the next loop's per-step table, not by this row. Pinned natively over a virtual clock (`ef_deferred::fix838`), not driven by this tier: the gated arm needs Arcade and its background reaches mainnet hosts, which the tier's loopback seal refuses. measured: loop 44 (full-2026-10-22_15-50-41, 33 pairs, beta, 15:49Z to 17:19Z), server-side from the low-overlay-beta logs (694 gated answers) and the client's network leg from 116 harness submits matched to them (docs/audit/FIX-838-door-latency-2026-10-22.md).",
     "settleMs": 20000,
     "answerDeadlineMs": 12000,
     "deferAtRestCapMs": 4000,
     "jobDelaySecs": 45,
-    "ceilingMs": 16000,
+    "raceBoundMs": 16000,
+    "preEngineInRequest": "the door's script walk, the Arcade ladder and the admission decision (note_held, the eviction ledger, the network_seen latch, a door readmission): awaited before the race starts; loop 44 p95 1,677 ms, max 2,917 + 1,344 + 1,377 ms by step",
+    "postWriteInRequest": [
+      "crate::ops::note_engine_walk(",
+      "crate::admit_fast::guard_landed(",
+      "crate::admit_fast::refused_memo_exists(",
+      "crate::admit_fast::open_eviction(",
+      "crate::admit_fast::readmit_if_evicted(",
+      "crate::admit_fast::evict_txid_everywhere(",
+      "crate::pot_changes::flush_inline(",
+      "crate::queue::enqueue_replay(",
+      "the #413 belt: SELECT 1 AS one FROM transactions WHERE txid = lower(?)",
+      "the #413 belt: SELECT 1 AS one FROM pot_records WHERE txid = lower(?) LIMIT 1"
+    ],
     "measured": {
       "answers": 694,
       "answerP50Ms": 2781,

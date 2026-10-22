@@ -50,6 +50,9 @@ pub const COUNTER_SUBMIT_MUTATION_QUEUED: &str = "submit_mutation_queued_total";
 /// …of which the replay could NOT be queued and the submit was REFUSED
 /// (502 retryable). Sustained non-zero = the queue itself is unhealthy.
 pub const COUNTER_SUBMIT_MUTATION_REFUSED: &str = "submit_mutation_refused_total";
+/// bsv-low #838 (the FIX-838 lens's LOW-3): gated submissions deferred (the 202) because the engine write passed
+/// the arm's answer deadline, apart from NL-6c's EF-work deferrals (both answer the census reason `queued`).
+pub const COUNTER_SUBMIT_DEFERRED_PAST_DEADLINE: &str = "submit_deferred_past_deadline_total";
 /// Queue consumer: replays whose every write landed (acked).
 pub const COUNTER_QUEUE_MUTATION_APPLIED: &str = "queue_mutation_applied_total";
 /// Queue consumer: replays that still faulted (or errored) and were handed
@@ -1534,6 +1537,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_TERMINAL_INCONCLUSIVE,
         COUNTER_SUBMIT_TERMINAL_CAPPED,
         COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
+        COUNTER_SUBMIT_DEFERRED_PAST_DEADLINE,
         COUNTER_LANDING_REFUSED_EVICTED,
         COUNTER_ADMIT_FAST_EVICT_INCOMPLETE,
         COUNTER_ADMIT_FAST_LEDGER_UNREADABLE,

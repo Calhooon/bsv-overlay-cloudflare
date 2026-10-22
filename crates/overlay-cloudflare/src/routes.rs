@@ -756,13 +756,16 @@ async fn submit_inner(
 /// bsv-low #838: the rest of a gated engine write that outran the answer deadline, after the answer (in
 /// `ctx.wait_until`): the write finishes, then what the request does after its write, in its order: a walk the
 /// engine's budget could not hold counted, the carried predecessors guarded (lane E1D), the write-side guard (loop
-/// 18: an eviction that opened while the write ran moves what it wrote again), and the notes this write took
-/// shipped. Nothing is enqueued here: the deferred job is the guarantee (its run is this arm again, after the
-/// platform's end of this task). A door readmission that faulted (`door_readmit_failed`) is left to that run,
-/// whose door asks the network again; this never evicts an accepted subject.
+/// 18: an eviction that opened while the write ran moves what it wrote again; the door's faulted readmission
+/// retried, as the request retries it), the S2 decision (a report that is not durable enqueues its idempotent
+/// replay, marked `gated`, exactly as the request does: the FIX-838 lens's MEDIUM-1), and the notes this write took
+/// shipped. The deferred job is the second cover (its run is this arm again, after the platform's end of this
+/// task): it covers a write the platform cuts and a replay the queue refused. This never evicts an accepted subject.
 async fn finish_past_deadline<F, S>(
     write: F,
     env: Env,
+    tagged: TaggedBEEF,
+    mode: SubmitMode,
     subject: String,
     door_readmit_failed: bool,
     engine_started: f64,
@@ -779,51 +782,121 @@ async fn finish_past_deadline<F, S>(
         );
         return;
     };
-    match &outcome {
+    let report = match &outcome {
         Ok((_, report)) => {
             worker::console_log!(
-                "POST /submit(broadcast-gated): {subject} past-deadline write landed after the answer in {took:.0} ms (durable: {}; {} fault(s){})",
+                "POST /submit(broadcast-gated): {subject} past-deadline write landed after the answer in {took:.0} ms (durable: {}; {} fault(s))",
                 report.is_durable(),
-                report.faults.len(),
-                if report.is_durable() { "" } else { "; the deferred job's run replays it" }
+                report.faults.len()
             );
-            if report.walk_could_not_run.is_some() || !report.landed_walks_could_not_run.is_empty() {
+            if report.walk_could_not_run.is_some() || !report.landed_walks_could_not_run.is_empty()
+            {
                 crate::ops::note_engine_walk(&db, report, "POST /submit").await;
             }
             if !report.landed_predecessors.is_empty() {
-                crate::admit_fast::guard_landed(&db, &report.landed_predecessors, "POST /submit").await;
+                crate::admit_fast::guard_landed(&db, &report.landed_predecessors, "POST /submit")
+                    .await;
+            }
+            Some(report)
+        }
+        Err(e) => {
+            // the request answers an engine error as its own status and queues nothing; here the deferred job's run
+            // submits it again
+            worker::console_log!(
+                "POST /submit(broadcast-gated): {subject} past-deadline write answered an error after {took:.0} ms ({e}); the deferred job's run submits it again"
+            );
+            None
+        }
+    };
+    // the write-side guard, the request's arm for arm (the FIX-838 lens's LOW-2: a faulted door readmission is
+    // retried here as the request retries it, never left over an open row the network had overruled)
+    let fresh_refusal = if door_readmit_failed {
+        match crate::admit_fast::refused_memo_exists(&db, &subject).await {
+            Ok(present) => present,
+            Err(e) => {
+                worker::console_log!("POST /submit(broadcast-gated): the refused memo could not be read for {subject} after its past-deadline write ({e}): read as a fresh refusal");
+                true
             }
         }
-        Err(e) => worker::console_log!(
-            "POST /submit(broadcast-gated): {subject} past-deadline write answered an error after {took:.0} ms ({e}); the deferred job's run submits it again"
-        ),
-    }
-    if !door_readmit_failed {
-        match crate::admit_fast::open_eviction(&db, &subject).await {
-            Ok(Some(ev)) => {
-                let now_ms = worker::Date::now().as_millis();
-                let outcome =
-                    crate::admit_fast::evict_txid_everywhere(&db, &subject, &ev.reason, now_ms)
-                        .await;
+    } else {
+        false
+    };
+    let mut reevicted = false;
+    match crate::admit_fast::open_eviction(&db, &subject).await {
+        Ok(Some(ev)) if door_readmit_failed && !fresh_refusal => {
+            let again = crate::admit_fast::readmit_if_evicted(
+                &db,
+                &subject,
+                worker::Date::now().as_millis(),
+            )
+            .await;
+            if again {
                 crate::ops::bump_counter(
                     &db,
-                    crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
+                    crate::ops::COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT,
                     1,
                 )
                 .await;
+            }
+            worker::console_log!(
+                "POST /submit(broadcast-gated): {subject} past-deadline write under an open eviction the network had overruled (evicted at {} ms: {}): {}",
+                ev.evicted_at_ms,
+                ev.reason,
+                if again { "readmitted on the second try" } else { "its readmission faulted again; the deferred job's run asks the network again" }
+            );
+        }
+        Ok(Some(ev)) => {
+            let now_ms = worker::Date::now().as_millis();
+            let outcome =
+                crate::admit_fast::evict_txid_everywhere(&db, &subject, &ev.reason, now_ms).await;
+            crate::ops::bump_counter(&db, crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1)
+                .await;
+            reevicted = true;
+            worker::console_log!(
+                "POST /submit(broadcast-gated): {subject} past-deadline write outran its eviction (evicted at {} ms: {}): re-evicted {} row(s)",
+                ev.evicted_at_ms,
+                ev.reason,
+                outcome.moved
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            crate::ops::bump_counter(&db, crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1)
+                .await;
+            worker::console_log!(
+                "POST /submit(broadcast-gated): the eviction ledger could not be read for {subject} after its past-deadline write ({e}); the deferred job's run asks again"
+            );
+        }
+    }
+    // S2, the request's decision on the same report (the FIX-838 lens's MEDIUM-1): a write that is not durable is
+    // enqueued for its idempotent replay, marked `gated` (the network accepted these bytes at the door), so it is
+    // replayed without asking the network again; a re-evicted subject's replay would be skipped by the consumer
+    if let Some(report) = report.filter(|_| !reevicted) {
+        let durable = report.is_durable();
+        if !durable {
+            crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_FAULT, 1).await;
+            worker::console_log!(
+                "POST /submit(broadcast-gated): {subject} past-deadline write NOT DURABLE: {} fault(s): {}: enqueueing an idempotent replay (S2)",
+                report.faults.len(),
+                report.summary()
+            );
+        }
+        match crate::ef_deferred::past_deadline_ack(durable, || {
+            crate::queue::enqueue_replay(&env, &tagged.beef, &tagged.topics, mode, true)
+        })
+        .await
+        {
+            crate::queue::MutationAck::Durable => {}
+            crate::queue::MutationAck::Queued => {
+                crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_QUEUED, 1).await;
                 worker::console_log!(
-                    "POST /submit(broadcast-gated): {subject} past-deadline write outran its eviction (evicted at {} ms: {}): re-evicted {} row(s)",
-                    ev.evicted_at_ms,
-                    ev.reason,
-                    outcome.moved
+                    "POST /submit(broadcast-gated): {subject} past-deadline replay QUEUED (S2): the queue is the guarantee"
                 );
             }
-            Ok(None) => {}
-            Err(e) => {
-                crate::ops::bump_counter(&db, crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1)
-                    .await;
+            crate::queue::MutationAck::Refused(reason) => {
+                crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_REFUSED, 1).await;
                 worker::console_log!(
-                    "POST /submit(broadcast-gated): the eviction ledger could not be read for {subject} after its past-deadline write ({e}); the deferred job's run asks again"
+                    "POST /submit(broadcast-gated): {subject} past-deadline write NOT DURABLE and its replay could not be queued ({reason}); the deferred job's run is the cover"
                 );
             }
         }
@@ -1799,6 +1872,40 @@ async fn submit_parts(
                 return Ok(with_server_timing(resp, &gated_timing));
             }
             Err(transport) => {
+                // bsv-low #838 (the FIX-838 lens's LOW-1): a RESUMED run (the deferred job) refused by #612's stored
+                // echo under an OPEN eviction runs the write-side guard's re-evict: the request's write that outran
+                // the deadline may have landed rows after the eviction's table loop and been cut by the platform
+                // before its own guard ran (idempotent; nothing moves when nothing landed)
+                if matches!(budget, crate::ef_deferred::WorkBudget::Resumed { .. })
+                    && transport == crate::broadcaster::STORED_ECHO_UNDER_EVICTION
+                {
+                    if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
+                        if let Ok(Some(ev)) =
+                            crate::admit_fast::open_eviction(&ledger_db, &subject_txid).await
+                        {
+                            let now_ms = worker::Date::now().as_millis();
+                            let outcome = crate::admit_fast::evict_txid_everywhere(
+                                &ledger_db,
+                                &subject_txid,
+                                &ev.reason,
+                                now_ms,
+                            )
+                            .await;
+                            if outcome.moved > 0 {
+                                counters
+                                    .bump(crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1);
+                                // the 502 is an early return: the eviction's notes ship here
+                                crate::pot_changes::flush_inline(env.clone()).await;
+                            }
+                            worker::console_log!(
+                                "POST /submit(broadcast-gated): {subject_txid}'s resumed run met the stored echo under its open eviction (at {} ms: {}): re-evicted {} row(s) a cut write left",
+                                ev.evicted_at_ms,
+                                ev.reason,
+                                outcome.moved
+                            );
+                        }
+                    }
+                }
                 worker::console_log!(
                     "POST /submit(broadcast-gated) -> 502 (broadcast transport: {transport})"
                 );
@@ -1881,12 +1988,14 @@ async fn submit_parts(
                     ctx.wait_until(finish_past_deadline(
                         write,
                         env.clone(),
+                        tagged_beef.clone(),
+                        mode,
                         subject.to_string(),
                         door_readmit_failed,
                         engine_started,
                     ));
                     counters.reason(SubmitReason::Queued);
-                    return crate::ef_deferred::defer_past_deadline(
+                    let answer = crate::ef_deferred::defer_past_deadline(
                         env,
                         &tagged_beef,
                         mode_header.as_deref().unwrap_or_default(),
@@ -1897,6 +2006,11 @@ async fn submit_parts(
                         )),
                     )
                     .await;
+                    // the FIX-838 lens's LOW-3: the 202 of this cause counted apart from NL-6c's
+                    if matches!(&answer, Ok(resp) if resp.status_code() == 202) {
+                        counters.bump(crate::ops::COUNTER_SUBMIT_DEFERRED_PAST_DEADLINE, 1);
+                    }
+                    return answer;
                 }
             }
         }
@@ -6072,8 +6186,12 @@ mod tests {
         );
         // round 2 (NEW-4): the Rejected arm re-runs an open eviction (an incomplete pass converges)
         let rerun = ["crate::admit_fast::evict_txid_", "everywhere("].concat();
+        // bsv-low #838 (the FIX-838 lens's LOW-1): the transport arm after it re-evicts on a resumed run's stored
+        // echo, so the Rejected arm is read up to it
+        let rejected_arm = &arms[rejected..];
+        let rejected_arm = &rejected_arm[..rejected_arm.find("Err(transport) => {").unwrap()];
         assert_eq!(
-            arms[rejected..].matches(&rerun).count(),
+            rejected_arm.matches(&rerun).count(),
             1,
             "the Rejected arm re-runs the eviction once under door_open"
         );
