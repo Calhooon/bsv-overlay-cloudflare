@@ -243,6 +243,19 @@ fn hot_routes_never_scan_fleet_tables() {
             "overlay tick hand relatch census",
             bsv_overlay_cloudflare::d1_discovery::hand_relatch_census_sql(),
         ),
+        // bsv-low #837 (the FIX-837 lens's LOW-5): the owed belt's two reads and the overlay's guarded hop-spend write.
+        (
+            "/owed #837 belt seat pots",
+            low_app_layer::owed::JOIN_SEAT_POTS_SQL.to_string(),
+        ),
+        (
+            "/owed #837 belt pot bytes",
+            low_app_layer::owed::JOIN_POT_BEEF_SQL.to_string(),
+        ),
+        (
+            "overlay #837 guarded hop-spend write",
+            bsv_overlay_cloudflare::d1_discovery::MARK_SPENT_IF_UNPOINTED_SQL.to_string(),
+        ),
     ] {
         for detail in plan(&db, &sql) {
             if detail.contains("SEARCH x USING INDEX idx_potparty_identity") {
@@ -824,6 +837,49 @@ fn the_board_table_read_and_its_triggers_never_scan() {
 /// bsv-low #831: the paired hydration's `fundingHeld` names an UNSPENT pot's funding as `seen` (the pot txid's own
 /// `network_seen` latch), `proof` (a verified `pot_beefs` proof of it) or `none`, and is NULL for a spent pot; both
 /// probes are primary-key searches inside the one statement (no new statement, no scan).
+/// bsv-low #837 (the FIX-837 lens's LOW-5): the owed belt's two hot reads and the overlay's guarded hop-spend write
+/// are each a key search, never a scan of any table: the seat pots by `idx_hopparty_hop`, the seat's
+/// `idx_pot_hop_seats_marker` and the pot's primary key; the pot's bytes by `pot_beefs`' primary key; the write by
+/// `pot_records`' primary key.
+#[test]
+fn fix837f_l5_the_belts_reads_and_the_guarded_write_are_key_searches() {
+    let db = fixture();
+    for (name, sql, wanted) in [
+        (
+            "JOIN_SEAT_POTS_SQL",
+            low_app_layer::owed::JOIN_SEAT_POTS_SQL,
+            &[
+                "SEARCH hp USING INDEX idx_hopparty_hop",
+                "idx_pot_hop_seats_marker",
+                "SEARCH pot USING",
+            ][..],
+        ),
+        (
+            "JOIN_POT_BEEF_SQL",
+            low_app_layer::owed::JOIN_POT_BEEF_SQL,
+            &["SEARCH pot_beefs USING"][..],
+        ),
+        (
+            "MARK_SPENT_IF_UNPOINTED_SQL",
+            bsv_overlay_cloudflare::d1_discovery::MARK_SPENT_IF_UNPOINTED_SQL,
+            &["SEARCH pot_records USING"][..],
+        ),
+    ] {
+        let details = plan(&db, sql);
+        println!("{name}: {details:?}");
+        assert!(
+            details.iter().all(|d| !d.starts_with("SCAN")),
+            "{name} scans: {details:?}"
+        );
+        for w in wanted {
+            assert!(
+                details.iter().any(|d| d.contains(w)),
+                "{name}: {w} in {details:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn fix831_the_paired_hydration_reads_the_funding_latch_by_key() {
     let db = Connection::open_in_memory().unwrap();

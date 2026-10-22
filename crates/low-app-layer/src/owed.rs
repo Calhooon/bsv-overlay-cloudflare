@@ -14355,6 +14355,135 @@ pub(crate) mod tests {
         );
     }
 
+    /// bsv-low #837, the FIX-837 lens's LOW-1: the belt reads the pot's stored bytes under `APP_BEEF_LIMITS`, as
+    /// every production read of stored bytes in the app layer does: a body the stream refuses (a trailing byte) is no
+    /// word. A SOURCE pin: on bsv-rs 0.7.2 `Beef::from_binary` refuses the same bytes the limits' parse does (the
+    /// trailing byte below is refused by both, measured on 9d380f8c), so no body tells the two apart today; the pin
+    /// holds the one reader. RED on 9d380f8c: "the belt parses through the app's limits".
+    #[test]
+    fn fix837f_l1_the_belt_reads_the_stored_bytes_under_the_app_limits() {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{Transaction as Tx, TransactionInput, TransactionOutput};
+        let mut hop = Tx::new();
+        hop.add_input(TransactionInput::new("41".repeat(32), 0))
+            .unwrap();
+        let mut lock = vec![0x76, 0xa9, 0x14];
+        lock.extend_from_slice(&[0x41; 20]);
+        lock.extend_from_slice(&[0x88, 0xac]);
+        hop.add_output(TransactionOutput {
+            satoshis: Some(20_000),
+            locking_script: LockingScript::from_binary(&lock).unwrap(),
+            change: false,
+        })
+        .unwrap();
+        let mut join = Tx::new();
+        let mut input = TransactionInput::new(hop.id(), 0);
+        input.source_transaction = Some(Box::new(hop.clone()));
+        join.inputs.push(input);
+        join.outputs.push(TransactionOutput {
+            satoshis: Some(19_800),
+            locking_script: LockingScript::from_binary(&[0x51]).unwrap(),
+            change: false,
+        });
+        let beef = bsv_rs::transaction::Beef::from_binary(&join.to_beef(true).unwrap())
+            .unwrap()
+            .to_binary_atomic(&join.id())
+            .unwrap();
+        assert!(
+            join_spends_outpoint(&beef, &join.id(), &hop.id(), 0),
+            "the stored JOIN spends its hop"
+        );
+        assert!(
+            !join_spends_outpoint(&beef, &join.id(), &hop.id(), 1),
+            "not another vout"
+        );
+        let mut trailing = beef.clone();
+        trailing.push(0x00);
+        assert!(
+            !join_spends_outpoint(&trailing, &join.id(), &hop.id(), 0),
+            "a body the app's limits refuse is no word"
+        );
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let src = squash(include_str!("owed.rs"));
+        let at = src.find("pubfnjoin_spends_outpoint(").unwrap();
+        let body = &src[at..at + src[at..].find("\n").unwrap_or(600).min(600)];
+        assert!(
+            body.contains("overlay_engine::beef_limits::parse_beef(beef,&overlay_engine::beef_limits::APP_BEEF_LIMITS"),
+            "the belt parses through the app's limits: {body}"
+        );
+        assert!(!body.contains("Beef::from_binary(beef)"), "{body}");
+    }
+
+    /// bsv-low #837, the FIX-837 lens's LOW-2: the belt's window is the newest hop, then the others at a rotating
+    /// offset (the recompute's minute), so an identity with more than eight index-unspent hops reaches every one over
+    /// successive passes; a hop whose chain rung names a spender is never asked. RED on 9d380f8c: the window was the
+    /// newest eight, inline (`belt_window` does not exist; `fix837_e` reds on the route's text).
+    #[test]
+    fn fix837f_l2_the_belts_window_rotates_and_skips_a_hop_the_chain_named() {
+        let hops: Vec<(String, Option<i64>)> = (0..12i64)
+            .map(|k| (format!("{}:0", tx(0x40 + k as u8)), Some(1_000 + k)))
+            .collect();
+        let named: HashSet<String> = [hops[5].0.clone()].into_iter().collect();
+        let mut seen: HashSet<usize> = HashSet::new();
+        for rotate in 0..12usize {
+            let w = belt_window(&hops, &named, rotate);
+            assert_eq!(
+                w.len(),
+                OWED_JOIN_SEAT_HOPS_PER_RECOMPUTE,
+                "rotate {rotate}: {w:?}"
+            );
+            assert_eq!(w[0], 11, "the newest keeps the first slot");
+            assert!(!w.contains(&5), "the chain-named hop is never asked");
+            let distinct: HashSet<usize> = w.iter().copied().collect();
+            assert_eq!(distinct.len(), w.len(), "no hop twice in one window");
+            seen.extend(w);
+        }
+        assert_eq!(
+            seen.len(),
+            11,
+            "every hop the chain did not name is reached: {seen:?}"
+        );
+        // a short list is asked whole, newest first; an empty one asks nothing
+        let few = &hops[..3];
+        assert_eq!(belt_window(few, &HashSet::new(), 0), vec![2, 1, 0]);
+        assert_eq!(
+            belt_window(few, &HashSet::new(), 7),
+            vec![2, 0, 1],
+            "the rest rotate"
+        );
+        assert!(belt_window(&[], &HashSet::new(), 0).is_empty());
+    }
+
+    /// bsv-low #837, the FIX-837 lens's LOW-4: the carry never takes the rows past `OWED_MAX_ROWS` (it runs after the
+    /// pass's truncation), so the write plan's bound holds by construction. RED on 9d380f8c: 499 derived rows and ten
+    /// carried were 509.
+    #[test]
+    fn fix837f_l4_the_carry_stops_at_the_row_cap() {
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let i = inputs(&[], &[], &[], &v, &c, &p, Some(972_190));
+        let row = |k: usize| OwedRow {
+            identity: ME.to_string(),
+            outpoint: format!("{k:064x}:0"),
+            family: OwedFamily::RefundDue,
+            game_id: format!("{k:064x}"),
+            sats: Some(19_800),
+            opponent_identity: Some(OPP.to_string()),
+            at_height: None,
+            facts: json!({"claim": "present-refund", "claimable": true}),
+            reason: None,
+        };
+        let mut rows: Vec<OwedRow> = (0..OWED_MAX_ROWS - 1).map(row).collect();
+        let previous: Vec<(OwedRow, i64)> = (10_000..10_010)
+            .map(|k| (row(k), i.now_ms - 1_000))
+            .collect();
+        let carried = carry_shed_rows(&i, &mut rows, &previous);
+        assert_eq!(rows.len(), OWED_MAX_ROWS, "carried {carried}");
+        assert_eq!(carried, 1);
+        let mut full: Vec<OwedRow> = (0..OWED_MAX_ROWS).map(row).collect();
+        assert_eq!(carry_shed_rows(&i, &mut full, &previous), 0);
+        assert_eq!(full.len(), OWED_MAX_ROWS);
+    }
+
     /// bsv-low #837 (FIX-837) pin (c): a pass the budget CUT never serves fewer rows than the snapshot it replaces
     /// without marking each missing row shed. Loop 44 pair 1: seven rows served, then every cut pass served six and the
     /// game's refund row was gone. The carried row is the previous one, `refresh: "shed"`, `stale`, `retryAfterMs`,

@@ -11083,6 +11083,110 @@ pub(crate) mod tests {
         assert_eq!(row.spending_txid.as_deref(), Some(join.id().as_str()));
     }
 
+    /// bsv-low #837, the FIX-837 lens's MEDIUM-1: the scheduled discovery pass reads at most
+    /// `JOIN_HOP_READS_PER_PASS` JOIN input rows over ALL its pot candidates, whatever a stranger's admitted bodies
+    /// make them: five covenant-shaped JOINs of 64 carried P2PKH inputs each (320 input rows) cost the pass 64 reads;
+    /// each JOIN past its own window and each JOIN the pass's budget left are COUNTED, and read by a later pass. RED
+    /// on 9d380f8c: the pass marked all 320 (one read each).
+    #[tokio::test]
+    async fn fix837f_m1_the_discovery_pass_reads_a_bounded_number_of_join_inputs() {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{Transaction as Tx, TransactionInput, TransactionOutput};
+        use overlay_discovery::pot::lowfund_topic_manager::JOIN_HOP_READS_PER_PASS;
+        use overlay_discovery::pot::storage::MemoryPotStorage;
+        let store = MemoryPotStorage::default();
+        let widths = [64u32, 64, 64, 64, 64, 2, 2, 2];
+        let mut honest = Vec::new();
+        for (j, width) in widths.into_iter().enumerate() {
+            let j = j as u8;
+            let mut funding = Tx::new();
+            funding
+                .add_input(TransactionInput::new(
+                    format!("{:02x}", 0x60 + j).repeat(32),
+                    0,
+                ))
+                .unwrap();
+            for i in 0..width as u8 {
+                funding
+                    .add_output(TransactionOutput {
+                        satoshis: Some(1_000),
+                        locking_script: LockingScript::from_binary(&p2pkh_script(&[i; 20]))
+                            .unwrap(),
+                        change: false,
+                    })
+                    .unwrap();
+            }
+            let mut join = Tx::new();
+            for i in 0..width {
+                let mut input = TransactionInput::new(funding.id(), i);
+                input.source_transaction = Some(Box::new(funding.clone()));
+                join.inputs.push(input);
+            }
+            join.outputs.push(TransactionOutput {
+                satoshis: Some(50_000),
+                locking_script: LockingScript::from_binary(&covenant_lock(&backfill_params()))
+                    .unwrap(),
+                change: false,
+            });
+            let beef = bsv_rs::transaction::Beef::from_binary(&join.to_beef(true).unwrap())
+                .unwrap()
+                .to_binary_atomic(&join.id())
+                .unwrap();
+            store
+                .store_record(&PotRecord {
+                    txid: join.id(),
+                    output_index: 0,
+                    lock_kind: Some("covenant".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            for i in 0..width {
+                store
+                    .store_record(&PotRecord {
+                        txid: funding.id(),
+                        output_index: i,
+                        lock_kind: Some("p2pkh".into()),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+            }
+            store.store_beef(&join.id(), &beef).await.unwrap();
+            if width == 2 {
+                honest.push(funding.id());
+            }
+        }
+        let fetcher = MockProofFetcher {
+            minable: Default::default(),
+            spender_hints: Default::default(),
+            binding_raw: Default::default(),
+            hint_fault: false,
+            real_bumps: Default::default(),
+        };
+        // the eight pots are the pass's first candidates (pots first)
+        let s = discover_missing_spends(&store, &fetcher, 8, 0).await;
+        assert_eq!(s.scanned, 8, "{s:?}");
+        assert!(
+            s.join_hop_reads <= JOIN_HOP_READS_PER_PASS,
+            "the pass's JOIN input reads are bounded: {s:?}"
+        );
+        assert_eq!(s.join_hops_marked, s.join_hop_reads, "{s:?}");
+        assert_eq!(
+            s.join_hop_inputs_deferred,
+            5 * 64 + 3 * 2 - s.join_hop_reads,
+            "every input the pass did not read is counted: {s:?}"
+        );
+        assert_eq!(s.join_hop_pots_deferred, 0, "{s:?}");
+        // the reserve: the honest JOINs are read whole wherever the strangers sort
+        for funding in &honest {
+            for i in 0..2 {
+                let row = store.get_spent_status(funding, i).await.unwrap().unwrap();
+                assert!(row.spent, "honest hop {funding}:{i} marked: {s:?}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn discover_missing_spends_pots_first_and_new_era_counted() {
         use overlay_discovery::pot::storage::MemoryPotStorage;

@@ -654,6 +654,248 @@ mod tests {
         );
     }
 
+    /// The FIX-837 fold's store: a [`MemoryPotStorage`] that counts the row reads, and (when armed) lands ANOTHER
+    /// writer's unconfirmed pointer on a hop row right after the read that saw it unpointed (the conflict pass's
+    /// competitor between the shared write's read and its write, the lens's LOW-3).
+    struct Fix837Store {
+        inner: crate::pot::storage::MemoryPotStorage,
+        reads: std::sync::atomic::AtomicUsize,
+        race_with: Option<String>,
+    }
+
+    #[async_trait(?Send)]
+    impl crate::pot::storage::PotStorage for Fix837Store {
+        async fn store_record(
+            &self,
+            r: &crate::pot::storage::PotRecord,
+        ) -> Result<(), crate::pot::storage::PotStorageError> {
+            self.inner.store_record(r).await
+        }
+        async fn get_spent_status(
+            &self,
+            txid: &str,
+            output_index: u32,
+        ) -> Result<Option<crate::pot::storage::PotRecord>, crate::pot::storage::PotStorageError>
+        {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let row = self.inner.get_spent_status(txid, output_index).await?;
+            if let (Some(r), Some(rival)) = (&row, &self.race_with) {
+                if crate::pot::storage::is_hop_row(r) && !r.spent {
+                    self.inner
+                        .mark_spent(txid, output_index, rival, false, None, None, None)
+                        .await?;
+                }
+            }
+            Ok(row)
+        }
+        #[allow(clippy::too_many_arguments)]
+        async fn mark_spent(
+            &self,
+            txid: &str,
+            output_index: u32,
+            spending_txid: &str,
+            confirmed: bool,
+            verdict: Option<crate::pot::storage::VerdictWrite<'_>>,
+            spent_height: Option<u64>,
+            spender_final: Option<bool>,
+        ) -> Result<(), crate::pot::storage::PotStorageError> {
+            self.inner
+                .mark_spent(
+                    txid,
+                    output_index,
+                    spending_txid,
+                    confirmed,
+                    verdict,
+                    spent_height,
+                    spender_final,
+                )
+                .await
+        }
+        async fn mark_spent_if_unpointed(
+            &self,
+            txid: &str,
+            output_index: u32,
+            spending_txid: &str,
+            spender_final: Option<bool>,
+        ) -> Result<bool, crate::pot::storage::PotStorageError> {
+            self.inner
+                .mark_spent_if_unpointed(txid, output_index, spending_txid, spender_final)
+                .await
+        }
+        async fn store_beef(
+            &self,
+            txid: &str,
+            beef: &[u8],
+        ) -> Result<(), crate::pot::storage::PotStorageError> {
+            self.inner.store_beef(txid, beef).await
+        }
+        async fn get_beef(
+            &self,
+            txid: &str,
+        ) -> Result<Option<Vec<u8>>, crate::pot::storage::PotStorageError> {
+            self.inner.get_beef(txid).await
+        }
+    }
+
+    /// A stranger's covenant-shaped JOIN over `width` carried P2PKH outputs of one funding transaction, its pot row,
+    /// its stored atomic bytes and a hop row for each input, in a [`Fix837Store`].
+    async fn fix837_wide_join(width: u32, race_with: Option<String>) -> (Fix837Store, Tx, Tx) {
+        use crate::pot::storage::{MemoryPotStorage, PotRecord, PotStorage};
+        let mut funding = Tx::new();
+        funding
+            .add_input(TransactionInput::new("5a".repeat(32), 0))
+            .unwrap();
+        for i in 0..width {
+            funding
+                .add_output(TransactionOutput {
+                    satoshis: Some(1_000),
+                    locking_script: LockingScript::from_binary(&p2pkh_script((i % 200) as u8))
+                        .unwrap(),
+                    change: false,
+                })
+                .unwrap();
+        }
+        let mut join = Tx::new();
+        for i in 0..width {
+            let mut input = TransactionInput::new(funding.id(), i);
+            input.source_transaction = Some(Box::new(funding.clone()));
+            join.inputs.push(input);
+        }
+        join.outputs.push(TransactionOutput {
+            satoshis: Some(u64::from(width) * 900),
+            locking_script: LockingScript::from_binary(&covenant_script(&dummy_params())).unwrap(),
+            change: false,
+        });
+        let s = Fix837Store {
+            inner: MemoryPotStorage::default(),
+            reads: Default::default(),
+            race_with,
+        };
+        s.store_record(&PotRecord {
+            txid: join.id(),
+            output_index: 0,
+            lock_kind: Some("covenant".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        for i in 0..width {
+            s.store_record(&PotRecord {
+                txid: funding.id(),
+                output_index: i,
+                lock_kind: Some("p2pkh".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let atomic = bsv_rs::transaction::Beef::from_binary(&join.to_beef(true).unwrap())
+            .unwrap()
+            .to_binary_atomic(&join.id())
+            .unwrap();
+        s.store_beef(&join.id(), &atomic).await.unwrap();
+        (s, funding, join)
+    }
+
+    /// bsv-low #837, the FIX-837 lens's MEDIUM-1: the shared write reads at most `JOIN_HOP_INPUTS_MAX` input rows of
+    /// one JOIN, whatever its width; the rest are DEFERRED and counted, and successive rotations read them in turn.
+    /// An honest two-hop JOIN is read whole. RED on 9d380f8c: one call read every one of the 64 inputs.
+    #[tokio::test]
+    async fn fix837f_m1_the_shared_write_reads_a_bounded_window_of_a_wide_joins_inputs() {
+        use crate::pot::storage::PotStorage;
+        let (s, funding, join) = fix837_wide_join(64, None).await;
+        let got = record_join_hop_spends(&s, &join.id()).await;
+        let reads = s.reads.load(std::sync::atomic::Ordering::SeqCst);
+        // the pot's own row, then at most JOIN_HOP_INPUTS_MAX input rows
+        assert_eq!(reads, 1 + JOIN_HOP_INPUTS_MAX, "one call's row reads");
+        assert_eq!(got.marked.len(), JOIN_HOP_INPUTS_MAX, "{got:?}");
+        assert_eq!((got.examined, got.deferred), (16, 48), "{got:?}");
+        assert_eq!(
+            got.marked,
+            (0..16)
+                .map(|i| Outpoint::new(funding.id(), i))
+                .collect::<Vec<_>>(),
+            "the first window, in input order"
+        );
+        // the next three windows (the discovery pass's successive hours) read the rest, and only once each
+        for rotation in 1..4u64 {
+            let got =
+                record_join_hop_spends_bounded(&s, &join.id(), JOIN_HOP_INPUTS_MAX, rotation).await;
+            assert_eq!(
+                (got.marked.len(), got.examined, got.deferred),
+                (16, 16, 48),
+                "rotation {rotation}: {got:?}"
+            );
+            let lo = rotation as u32 * 16;
+            assert_eq!(
+                got.marked.first(),
+                Some(&Outpoint::new(funding.id(), lo)),
+                "rotation {rotation}"
+            );
+        }
+        for i in 0..64 {
+            let row = s
+                .inner
+                .get_spent_status(&funding.id(), i)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.spending_txid.as_deref(),
+                Some(join.id().as_str()),
+                "input {i}"
+            );
+        }
+        // a caller's smaller budget: fewer reads, the rest counted; a budget of 0 reads no input row
+        let (s, _, join) = fix837_wide_join(40, None).await;
+        let got = record_join_hop_spends_bounded(&s, &join.id(), 5, 0).await;
+        assert_eq!(
+            (got.marked.len(), got.examined, got.deferred),
+            (5, 5, 35),
+            "{got:?}"
+        );
+        let got = record_join_hop_spends_bounded(&s, &join.id(), 0, 0).await;
+        assert_eq!(
+            (got.marked.len(), got.examined, got.deferred),
+            (0, 0, 40),
+            "{got:?}"
+        );
+        // an honest JOIN (two hops) is read whole, nothing deferred
+        let (s, _, join) = fix837_wide_join(2, None).await;
+        let got = record_join_hop_spends(&s, &join.id()).await;
+        assert_eq!(
+            (got.marked.len(), got.examined, got.deferred),
+            (2, 2, 0),
+            "{got:?}"
+        );
+    }
+
+    /// bsv-low #837, the FIX-837 lens's LOW-3: a pointer another writer lands between the shared write's read and its
+    /// write is never overwritten by the JOIN's (the guard is in the write). RED on 9d380f8c: the JOIN's unconfirmed
+    /// `mark_spent` overwrote the rival's pointer.
+    #[tokio::test]
+    async fn fix837f_l3_a_pointer_landed_after_the_read_is_never_overwritten() {
+        use crate::pot::storage::PotStorage;
+        let rival = "cc".repeat(32);
+        let (s, funding, join) = fix837_wide_join(2, Some(rival.clone())).await;
+        let got = record_join_hop_spends(&s, &join.id()).await;
+        for i in 0..2 {
+            let row = s
+                .inner
+                .get_spent_status(&funding.id(), i)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.spending_txid.as_deref(),
+                Some(rival.as_str()),
+                "input {i}: the rival's pointer stands ({got:?})"
+            );
+        }
+        assert!(got.marked.is_empty(), "{got:?}");
+        assert_eq!(got.already_spent, 2, "counted as pointed: {got:?}");
+    }
+
     #[test]
     fn p2pkh_recognizer_is_exact() {
         use crate::pot::is_p2pkh_script;

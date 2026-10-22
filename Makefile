@@ -26,7 +26,7 @@ help:
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
 	@echo "  ownership        The storage ownership check (bsv-low #474): every SQL statement against storage-ownership.json (part of ci)"
 	@echo "  ci-route         Route-level /submit + /arc-ingest + /requestForeignGASPNodes cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799, and :LANE_BASE+11, +12 for NL-6c and NL-6d)"
-	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; ports: :LANE_BASE+9 app layer, +10 overlay, +11 the e649 delivering overlay, +12 its mock app layer, +13 to +15 their inspectors, +16 the #831 retire overlay, +17 its inspector, +18 its courier stand-in)"
+	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; ports: :LANE_BASE+9 app layer, +10 overlay, +11 the e649 delivering overlay, +12 its mock app layer, +13 to +15 their inspectors, +16 the #831 retire overlay (also the #837 discovery-pass cell's), +17 its inspector, +18 its courier stand-in)"
 	@echo "  ci-deploy        Real worker-build/wrangler dry-run of every deployable config (part of ci)"
 	@echo "  clean            Wipe reference volumes + wrangler local state"
 
@@ -637,6 +637,7 @@ ci-d1-budget:
 	node tools/lane-e585/beef_blobs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
 	node tools/lane-e649/change_park_budget_ci.mjs http://127.0.0.1:$$PO "$$ov_state" http://127.0.0.1:$$PD "$$dv_state" $$PM; \
 	node tools/lane-831/retire_pass_budget_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
+	node tools/lane-837/join_hop_pass_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
 	guard_ran=1; \
 	node tools/lane-731/egress_guard.mjs "app-layer=$$app_log" "overlay=$$ov_log" "delivering-overlay=$$dv_log" "retire-overlay=$$rv_log"
 
