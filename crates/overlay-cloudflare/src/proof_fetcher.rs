@@ -1506,6 +1506,46 @@ async fn http_get_counted(
     (response, observation)
 }
 
+thread_local! {
+    /// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): the COURIER SINK (`COURIER_SINK`), set per isolate at every
+    /// entry (the fetch, the scheduled tick, the queue), the app layer's #731 rule on this worker's courier seam.
+    static COURIER_SINK: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// PURE (bsv-low #831, the app layer's #731 rule): the sink a `COURIER_SINK` value names, accepted ONLY as a
+/// plain-http LOOPBACK origin (`http://127.0.0.1:<port>` or `http://localhost:<port>`, no path). Anything else is no
+/// sink: the var can blind this worker's couriers (every read a transport fault, "could not look", the fail-safe
+/// direction) or hand them to a local stand-in, never send them to another host. No deployed config sets it.
+pub fn courier_sink_of(value: Option<&str>) -> Option<String> {
+    let v = value?.trim().trim_end_matches('/');
+    let rest = v.strip_prefix("http://")?;
+    let (host, port) = rest.split_once(':')?;
+    if !matches!(host, "127.0.0.1" | "localhost")
+        || port.is_empty()
+        || !port.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(v.to_string())
+}
+
+/// Install the courier sink for this isolate (idempotent; an unset or refused value clears it).
+pub fn set_courier_sink(value: Option<String>) {
+    COURIER_SINK.with(|s| *s.borrow_mut() = courier_sink_of(value.as_deref()));
+}
+
+/// PURE (bsv-low #831, the app layer's #731 rule): where a courier GET goes. With no sink, the URL itself; with one,
+/// the sink's origin and the URL's own path and query, so the D1 budget tier's retire pass (`tools/lane-831`) asks
+/// a loopback stand-in and never mainnet.
+pub fn courier_target(url: &str, sink: Option<&str>) -> String {
+    let Some(sink) = sink else {
+        return url.to_string();
+    };
+    let after_scheme = url.split_once("://").map_or(url, |(_, r)| r);
+    let path = after_scheme.find('/').map_or("/", |i| &after_scheme[i..]);
+    format!("{sink}{path}")
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 thread_local! {
     static TEST_HTTP_RESPONSES: RefCell<HashMap<String, (u16, String)>> = RefCell::new(HashMap::new());
@@ -1540,8 +1580,9 @@ async fn http_get_inner(url: &str, header: Option<(&str, &str)>) -> Result<(u16,
         }
         init.with_headers(headers);
     }
+    let target = COURIER_SINK.with(|s| courier_target(url, s.borrow().as_deref()));
     let request =
-        worker::Request::new_with_init(url, &init).map_err(|e| format!("req {url}: {e}"))?;
+        worker::Request::new_with_init(&target, &init).map_err(|e| format!("req {url}: {e}"))?;
     let mut response = worker::Fetch::Request(request)
         .send()
         .await
@@ -4376,6 +4417,63 @@ pub struct RetireSummary {
     pub kept_uncertain: usize,
     /// #602 fold (MEDIUM-1): the conflict pass that runs first.
     pub conflict: crate::admit_fast::ConflictPassSummary,
+    /// bsv-low #831 half 2: retired rows (either store's arm) whose LIVE pot the pass then evicted
+    /// ([`end_retired_pot`]).
+    pub evicted_on_retire: usize,
+    /// bsv-low #831 half 2: end steps of a retirement that faulted (the end-state read, the eviction, or an
+    /// eviction that left work undone); such a pot is latched and live, the backlog pass's candidate.
+    pub evict_faults: usize,
+    /// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): endings the pass's statement budget did not cover
+    /// ([`RETIRE_PASS_STATEMENT_BUDGET`]); each pot is latched and live, so the backlog takes it on a later pass.
+    pub end_deferred: usize,
+    /// bsv-low #831 half 2: the bounded backlog pass over pots latched or engine-retired before the pass evicted
+    /// ([`run_retire_backlog`]).
+    pub backlog: RetireBacklogSummary,
+    /// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): the D1 statements the whole pass issued (the conflict pass,
+    /// both arms, the backlog), as the statement budget counted them.
+    pub statements: u64,
+}
+
+/// bsv-low #831 half 2: what one backlog pass did ([`run_retire_backlog`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetireBacklogSummary {
+    /// Latched or engine-retired pots with a live `pot_records` row the pass looked at again (at most
+    /// [`RETIRE_BACKLOG_LIMIT`]).
+    pub scanned: usize,
+    /// Evicted on the fresh look's verdict.
+    pub evicted: usize,
+    /// Left alone: the fresh look found the pot held or mined (Arcade's live non-terminal word, or an indexer holds
+    /// it); its latches and verdict memo cleared, so the proof machinery takes it back.
+    pub left: usize,
+    /// Kept: the fresh look gave no verdict (a courier could not say, or the absence arm is not yet 48 h old), or
+    /// the eviction yielded to a readmission, or the pot was no longer live or had proven; looked at again later.
+    pub kept: usize,
+    /// Faults: the candidate read, an end-state read, an eviction (or one left incomplete), a latch clear.
+    pub faults: usize,
+    /// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): candidates of the page left unlooked because the pass's
+    /// statement budget could not cover one more ending; a later pass reads them again.
+    pub deferred: usize,
+}
+
+impl RetireSummary {
+    /// bsv-low #831 half 2: the retire pass's own words on its summary line (both callers print them after the
+    /// conflict pass's): `evicted_on_retire= evict_faults= end_deferred= statements= backlog: scanned= evicted=
+    /// left= kept= faults= deferred=`.
+    pub fn end_line(&self) -> String {
+        format!(
+            "evicted_on_retire={} evict_faults={} end_deferred={} statements={} backlog: scanned={} evicted={} left={} kept={} faults={} deferred={}",
+            self.evicted_on_retire,
+            self.evict_faults,
+            self.end_deferred,
+            self.statements,
+            self.backlog.scanned,
+            self.backlog.evicted,
+            self.backlog.left,
+            self.backlog.kept,
+            self.backlog.faults,
+            self.backlog.deferred,
+        )
+    }
 }
 
 /// Shipped candidate SQL for the retire pass — the proofless_watch ledger IS
@@ -4391,6 +4489,12 @@ pub(crate) const RETIRE_CANDIDATES_TRANSACTIONS_SQL: &str = "SELECT w.txid AS tx
      WHERE t.has_proof = 0 AND t.retired_ms IS NULL \
        AND w.first_seen_ms <= ?1 - 3600000 \
      ORDER BY w.first_seen_ms ASC LIMIT 8";
+/// The `pot_beefs` arm's candidates. bsv-low #831 (the FIX-831-B lens's LOW-4): the arm ROTATES. It was oldest
+/// first, so eight rows the verdict keeps every pass (a JOIN Arcade holds at a pre-SEEN rank, one a mempool holds
+/// and never mines, one the backlog unlatched with a fresh stamp) pinned its head and starved every younger
+/// candidate. Now the eight are the next txids from a start key that moves every pass (`?2`,
+/// [`retire_rotation_key`]), wrapping past the top, so every candidate is reached in turn. The read is the base's:
+/// the eligible rows are sorted either way (no index serves `first_seen_ms`), so the rotation costs no row more.
 pub(crate) const RETIRE_CANDIDATES_POT_BEEFS_SQL: &str = "SELECT w.txid AS txid, \
         (?1 - w.first_seen_ms) / 1000 AS age_secs, \
         a.status AS term_status, a.extra AS term_extra \
@@ -4399,7 +4503,7 @@ pub(crate) const RETIRE_CANDIDATES_POT_BEEFS_SQL: &str = "SELECT w.txid AS txid,
      LEFT JOIN arc_terminal a ON a.txid = w.txid \
      WHERE p.has_proof = 0 AND p.structurally_unprovable IS NOT 1 \
        AND w.first_seen_ms <= ?1 - 3600000 \
-     ORDER BY w.first_seen_ms ASC LIMIT 8";
+     ORDER BY (w.txid < ?2), w.txid LIMIT 8";
 /// The retire writers. `has_proof = 0` guard: a proof that landed mid-pass
 /// WINS (confirm beats the latch — the #2b doctrine, kept).
 pub(crate) const RETIRE_TRANSACTIONS_SQL: &str =
@@ -4408,19 +4512,898 @@ pub(crate) const RETIRE_TRANSACTIONS_SQL: &str =
 pub(crate) const RETIRE_POT_BEEFS_SQL: &str = "UPDATE pot_beefs SET structurally_unprovable = 1 \
      WHERE txid = ?1 AND has_proof = 0";
 
-#[derive(serde::Deserialize)]
-struct RetireCandidateRow {
-    txid: String,
-    age_secs: f64,
-    term_status: Option<String>,
-    term_extra: Option<String>,
+/// One retire candidate: a proofless row of a store, or (the backlog pass) a latched or engine-retired pot.
+#[derive(serde::Deserialize, Debug, Clone)]
+pub(crate) struct RetireCandidateRow {
+    pub(crate) txid: String,
+    pub(crate) age_secs: f64,
+    pub(crate) term_status: Option<String>,
+    pub(crate) term_extra: Option<String>,
 }
 
-/// One retire pass over both proofless stores. Every decision funnels
-/// through the pure [`retire_verdict`]; a retirement writes the store latch,
-/// records the evidence into `arc_terminal` (when it came from the live
-/// poll), and logs a dead-letter line. The watch GC then drops the row from
-/// `proofless_watch` on its next tick.
+/// The two proofless stores the retire pass latches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetireStore {
+    /// The engine's `transactions` (latch: `retired_ms`, `retired_reason`).
+    Transactions,
+    /// LOW's `pot_beefs` (latch: `structurally_unprovable`). A pot is ended only with this latch held.
+    PotBeefs,
+}
+
+impl RetireStore {
+    fn name(self) -> &'static str {
+        match self {
+            RetireStore::Transactions => "transactions",
+            RetireStore::PotBeefs => "pot_beefs",
+        }
+    }
+}
+
+/// bsv-low #831 (the FIX-831-B lens's LOW-1): what the end step reads of a txid just before it would evict, in ONE
+/// statement ([`RETIRE_END_STATE_SQL`]).
+/// (D1 answers its numbers as JSON numbers, read as `f64`, the shape of the worker's other count rows.)
+#[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct RetireEndState {
+    /// LIVE `pot_records` rows the txid keys (a shadow-moved pot has none: the move deletes them).
+    pub(crate) live: f64,
+    /// A verified proof landed in either store (`has_proof = 1`): confirm beats the latch, nothing is evicted.
+    pub(crate) proven: f64,
+    /// The `pot_beefs` latch holds (`structurally_unprovable = 1`, unproven): the only state a pot is ended from.
+    pub(crate) latched: f64,
+}
+
+/// bsv-low #831 (the FIX-831-B lens's LOW-1): the end step's read, made after the latch and before the eviction
+/// (both arms and the backlog), so a proof landing between the look and the eviction wins: the base read
+/// `has_proof` only at the candidate read and evicted on a latch that had become a no-op. `?1` the txid.
+pub(crate) const RETIRE_END_STATE_SQL: &str = "SELECT \
+        (SELECT COUNT(*) FROM pot_records WHERE txid = ?1) AS live, \
+        (EXISTS (SELECT 1 FROM pot_beefs WHERE txid = ?1 AND has_proof = 1) \
+         OR EXISTS (SELECT 1 FROM transactions WHERE txid = ?1 AND has_proof = 1)) AS proven, \
+        EXISTS (SELECT 1 FROM pot_beefs WHERE txid = ?1 AND structurally_unprovable = 1 AND has_proof = 0) \
+          AS latched";
+
+/// bsv-low #831 (the FIX-831-B lens's LOW-2): what the existing eviction answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetireEviction {
+    /// It stands, whole.
+    Stands,
+    /// It stands but left work undone (`EvictionOutcome::incomplete`: a row not moved, or the release faulted).
+    Incomplete,
+    /// It yielded to a readmission (the chain's word overtook it).
+    Yielded,
+}
+
+/// bsv-low #831 half 2: the retire pass's world, a port so the pins run the SHIPPED steps ([`retire_candidate`],
+/// [`end_retired_pot`], [`run_retire_backlog`]) under real SQLite, the shape of the conflict pass's
+/// `ConflictPassPort`. The worker's is [`WorkerRetire`]: D1, Arcade and the two couriers.
+pub(crate) trait RetirePort {
+    /// Arcade's live word on the txid, the recorded `arc_terminal` word filling a fault ([`arcade_look`]).
+    async fn arcade(&self, txid: &str, evidence: Option<(String, String)>) -> ArcadeLook;
+    /// Bitails' presence (`None`: could not say).
+    async fn bitails(&self, txid: &str) -> Option<NetworkPresence>;
+    /// WhatsOnChain's presence (`None`: could not say).
+    async fn woc(&self, txid: &str) -> Option<NetworkPresence>;
+    /// The store latch: [`RETIRE_TRANSACTIONS_SQL`] or [`RETIRE_POT_BEEFS_SQL`].
+    async fn latch(
+        &self,
+        store: RetireStore,
+        txid: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<(), String>;
+    /// What a latch that landed leaves beside it, fail-soft: the `/tx-any` verdict memo
+    /// ([`TX_ANY_VERDICT_UPSERT_SQL`]), a LIVE fatal word on `arc_terminal`, the dead-letter line.
+    async fn latched(
+        &self,
+        store: RetireStore,
+        txid: &str,
+        reason: &str,
+        look: &ArcadeLook,
+        now_ms: i64,
+    );
+    /// The end step's read ([`RETIRE_END_STATE_SQL`]).
+    async fn end_state(&self, txid: &str) -> Result<RetireEndState, String>;
+    /// The existing reversible eviction (`admit_fast::evict_txid_everywhere`).
+    async fn evict(
+        &self,
+        txid: &str,
+        reason: &str,
+        asked_ms: u64,
+    ) -> Result<RetireEviction, String>;
+    /// The backlog pass's candidates ([`RETIRE_BACKLOG_CANDIDATES_SQL`]).
+    async fn backlog_candidates(
+        &self,
+        now_ms: i64,
+        start: &str,
+    ) -> Result<Vec<RetireCandidateRow>, String>;
+    /// Clear the latches of a pot the fresh look found HELD ([`RETIRE_LATCH_CLEAR_SQL`],
+    /// [`RETIRE_ENGINE_LATCH_CLEAR_SQL`]) and its verdict memo.
+    async fn clear_latch(&self, txid: &str) -> Result<(), String>;
+    /// Persist one step's counter deltas (the durable `ops_counters` rows), each step's before the next step's
+    /// courier calls (the conflict pass's #649 H1 rule: a cancelled task never loses a count already earned).
+    async fn persist(&self, deltas: &[(&'static str, u64)]);
+    /// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): the D1 statements issued so far, monotonic (the worker's:
+    /// `d1_ledger::statements_noted`), read by the pass's statement budget ([`RetireBudget`]).
+    fn statements(&self) -> u64;
+    /// The clock, read where a candidate's evidence begins (the eviction's stamp policy).
+    fn now_ms(&self) -> i64;
+}
+
+/// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): the D1 statements one retire pass may issue, the conflict pass
+/// that opens it, both arms and the backlog together. The lens measured one ending at about 75 statements (64 in
+/// `evict_core` on #831's shape, the wrapper's and the arm's writes beside it); the base could end 16 a tick, about
+/// 1,200 statements, above the per-invocation query ceiling (1,000 on the paid plan as last documented, unverified
+/// in either tree) before the rest of the scheduled tick ran. 480 holds the pass under half of that ceiling with the
+/// tick's other steps beside it; the budget tier measures the pass's worst tick against its own ceiling
+/// (`tools/lane-831`, `make ci-d1-budget`).
+pub const RETIRE_PASS_STATEMENT_BUDGET: u64 = 480;
+/// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): the statements one candidate's whole step is reserved before it
+/// starts (its latch and memo, the end-state read, the eviction whole, the counters). A candidate is looked at, and
+/// an ending started, only while the pass's spent statements plus this stay within [`RETIRE_PASS_STATEMENT_BUDGET`],
+/// so no candidate passes the budget; past it the pass issues at most its two remaining candidate reads and the one
+/// deferred count. The pins measure the largest step against it, the tier the pass.
+pub const RETIRE_END_RESERVE_STATEMENTS: u64 = 96;
+
+/// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): one retire pass's statement budget, read off the port's monotonic
+/// statement count from the pass's start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetireBudget {
+    start: u64,
+    limit: u64,
+}
+
+impl RetireBudget {
+    /// The shipped budget from now.
+    pub(crate) fn begin<P: RetirePort>(port: &P) -> Self {
+        Self::with_limit(port, RETIRE_PASS_STATEMENT_BUDGET)
+    }
+    /// A budget of `limit` statements from now.
+    pub(crate) fn with_limit<P: RetirePort>(port: &P, limit: u64) -> Self {
+        Self {
+            start: port.statements(),
+            limit,
+        }
+    }
+    /// The statements spent since the budget began.
+    pub(crate) fn spent<P: RetirePort>(&self, port: &P) -> u64 {
+        port.statements().saturating_sub(self.start)
+    }
+    /// Whether one more ending fits ([`RETIRE_END_RESERVE_STATEMENTS`]).
+    pub(crate) fn room_for_an_ending<P: RetirePort>(&self, port: &P) -> bool {
+        self.spent(port)
+            .saturating_add(RETIRE_END_RESERVE_STATEMENTS)
+            <= self.limit
+    }
+}
+
+/// bsv-low #831 half 2: the ledger reason of an eviction the retire pass makes. It OPENS with
+/// [`RETIRE_REASON_MARK`], one of `eviction_chain_word`'s absence marks, so it serves NO chain word (`null`) on both
+/// arms of [`retire_verdict`]: the 48 h absence arm exactly as the pending watch's absence refusal, and the 1 h
+/// arm too, although it carries Arcade's live terminal word (the lens's check on `eviction_chain_word`, settled this
+/// way): a retire eviction ENDS a ghost pot in the index, it is never served as a void, and absence is read before
+/// rejection, so no text the verdict's reason carries (Arcade's `extraInfo` is a stranger's text) can make it one.
+pub fn retire_eviction_reason(verdict_reason: &str) -> String {
+    format!("{RETIRE_REASON_MARK}{verdict_reason}")
+}
+
+pub use overlay_discovery::pot::storage::RETIRE_REASON_MARK;
+
+/// What the network said of one retire candidate: Arcade's look and the two indexers' yes or no.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetireEvidence {
+    pub(crate) look: ArcadeLook,
+    pub(crate) bitails: Option<bool>,
+    pub(crate) woc: Option<bool>,
+}
+
+impl RetireEvidence {
+    /// Somebody on the network holds the transaction (mined or in a mempool): Arcade's live non-terminal word, or
+    /// either indexer. The backlog pass leaves such a pot alone.
+    pub(crate) fn held(&self) -> bool {
+        matches!(self.look, ArcadeLook::Present)
+            || self.bitails == Some(true)
+            || self.woc == Some(true)
+    }
+}
+
+/// The retire pass's look, unchanged in what it asks (the courier hosts of the backstop): Arcade first; when Arcade
+/// holds it no indexer is asked; else Bitails, then WoC unless Bitails already holds it.
+pub(crate) async fn retire_evidence<P: RetirePort>(
+    port: &P,
+    txid: &str,
+    evidence: Option<(String, String)>,
+) -> RetireEvidence {
+    let look = port.arcade(txid, evidence).await;
+    if matches!(look, ArcadeLook::Present) {
+        return RetireEvidence {
+            look,
+            bitails: None,
+            woc: None,
+        };
+    }
+    let bitails = port.bitails(txid).await;
+    let woc = if bitails.is_some_and(presence_bool) {
+        bitails
+    } else {
+        port.woc(txid).await
+    };
+    RetireEvidence {
+        look,
+        bitails: bitails.map(presence_bool),
+        woc: woc.map(presence_bool),
+    }
+}
+
+/// bsv-low #831 half 2: what the end of one retired pot did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RetireEnd {
+    /// No live `pot_records` row keys the txid (not a pot, or already shadow-moved): nothing to end.
+    NoLivePot,
+    /// The FIX-831-B lens's LOW-1: a verified proof landed after the look (either store's `has_proof = 1`):
+    /// confirm beats the latch, nothing is evicted.
+    Proven,
+    /// The `pot_beefs` latch does not hold (no stored BEEF, or it did not land): a pot is ended only from it.
+    NotLatched,
+    /// The FIX-831-B lens's MEDIUM-2: the pass's statement budget could not cover the ending; the pot stays latched
+    /// and live, the backlog's candidate on a later pass.
+    Deferred,
+    /// Evicted: the shadow move, the released spends, the ledger row.
+    Evicted,
+    /// The FIX-831-B lens's LOW-2: the eviction stands but left work undone (a row not moved, or the release of the
+    /// spend pointers faulted); counted as a fault, never an ending. The ledger row is OPEN (the existing wrapper's
+    /// rule: the next accept, proof or eviction converges).
+    Incomplete,
+    /// The eviction yielded to a readmission (the chain's word overtook it): the pot stands.
+    Yielded,
+    /// The end-state read or the eviction faulted.
+    Fault(String),
+}
+
+/// bsv-low #831 half 2: END a retired pot. A JOIN admitted pending under admit-fast that no courier ever held and
+/// that recorded no refusal was latched `structurally_unprovable` by this pass and then dropped by the watch GC, the
+/// enrolment and the completion pass, while its `pot_records` row and its hops' spend pointers stayed LIVE: the lobby
+/// and the owed list kept serving a pot the network does not hold (#831's `2e6bcb0d…`). The three originating
+/// evictions (the pending watch's `Fatal`, the refusal webhook's settle, the conflict pass) cannot catch it: no
+/// fatal word within the watch's looks, no refusal pushed, no mined competitor on a direct input (its parent is a
+/// void double-spend loser's descendant). So where [`retire_verdict`] retires a txid whose `pot_beefs` latch holds
+/// and that has a LIVE `pot_records` row, the pass runs the EXISTING eviction (`admit_fast::evict_txid_everywhere`):
+/// the OPEN marker first, the shadow move of every row keyed by the txid, `release_spends_of` into the ledger's
+/// `releasedSpends`, the ledger row under [`retire_eviction_reason`] (no chain word). A MINED push reverses it exactly
+/// as every other eviction (`readmit_if_evicted`: the twins restored, the released spends re-marked where nothing
+/// newer took them). The verdict's two arms are #765's, unchanged: a LIVE fatal word at 1 h, absence (a recorded
+/// word shares it) at 48 h, each with both indexers' definitive absence.
+///
+/// The FIX-831-B lens's LOW-1: the step reads the txid's state ([`RETIRE_END_STATE_SQL`]) AFTER the latch and just
+/// before the eviction: a verified proof that landed since the look wins ([`RetireEnd::Proven`]), and a latch that
+/// did not hold ends nothing ([`RetireEnd::NotLatched`]). The FIX-831-B lens's MEDIUM-2: the eviction starts only
+/// while `budget` has room for one more ending ([`RetireEnd::Deferred`] otherwise).
+///
+/// Its scope, stated (the FIX-831-B lens's LOW-3): "a live `pot_records` row" is ANY row the txid keys, so a HOP is
+/// ended too. `tm_lowfund` writes a `p2pkh` `pot_records` row for the hop and stores the hop's BEEF in `pot_beefs`
+/// under the hop's own txid (`overlay-discovery` `pot/lookup_service.rs`), so a never-held hop is latched and evicted
+/// by the same arm at its own 48 h, the scope of every existing eviction (the hop's outputs leave the index).
+///
+/// What the owed list then serves for each of the pot's hops (the lens's L-H2-2: the outcome per hop, no promise of
+/// a sweep): (1) a released hop whose outpoint the index HOLDS (its `pot_records` row live, its spend pointer now
+/// NULL) is served `sweep-hop` by the existing owed machinery (`owed.rs` keys an evicted game's home on the ledger's
+/// `releasedSpends`); its claimability still rests on the app layer's chain probe (#669) and the marker or
+/// markerless rebuild; (2) a hop NOT in the index (its funding never reached it) stays `unbound`: nothing here gives
+/// the index a row it never had; (3) a hop whose own lineage is void (built on a double-spend loser, #818) is a
+/// retire candidate ITSELF (LOW-3 above): when no courier holds it, the same pass evicts it at its own 48 h and it
+/// serves `unbound`, no press; it is served `sweep-hop` only while it is younger than its floor or a courier holds
+/// it, and that sweep would orphan at the network (`SEEN_IN_ORPHAN_MEMPOOL`) exactly as the ghost pot's refund did:
+/// the toolbox's half, Calhooon/bsv-wallet-toolbox-rs #42. Nothing more is promised.
+///
+/// Cost: an eviction is the existing one's D1 statements (the open marker, two passes over `MOVED_TABLES`, the
+/// release, the close, the notes), reserved [`RETIRE_END_RESERVE_STATEMENTS`] under the pass's statement budget.
+pub(crate) async fn end_retired_pot<P: RetirePort>(
+    port: &P,
+    budget: &RetireBudget,
+    txid: &str,
+    verdict_reason: &str,
+    asked_ms: i64,
+) -> RetireEnd {
+    let state = match port.end_state(txid).await {
+        Ok(s) => s,
+        Err(e) => return RetireEnd::Fault(format!("the end-state read faulted: {e}")),
+    };
+    if state.live <= 0.0 {
+        return RetireEnd::NoLivePot;
+    }
+    if state.proven > 0.0 {
+        return RetireEnd::Proven;
+    }
+    if state.latched <= 0.0 {
+        return RetireEnd::NotLatched;
+    }
+    if !budget.room_for_an_ending(port) {
+        return RetireEnd::Deferred;
+    }
+    match port
+        .evict(
+            txid,
+            &retire_eviction_reason(verdict_reason),
+            asked_ms.max(0) as u64,
+        )
+        .await
+    {
+        Ok(RetireEviction::Stands) => RetireEnd::Evicted,
+        Ok(RetireEviction::Incomplete) => RetireEnd::Incomplete,
+        Ok(RetireEviction::Yielded) => RetireEnd::Yielded,
+        Err(e) => RetireEnd::Fault(e),
+    }
+}
+
+/// One candidate through the retire pass: the look, the verdict, the store latch and its memo, and (bsv-low #831
+/// half 2) for a txid whose pot is live, its END ([`end_retired_pot`]). Every decision funnels through the pure
+/// [`retire_verdict`].
+///
+/// The FIX-831-B lens's MEDIUM-1: the `transactions` arm ends a pot too. A JOIN keys BOTH stores and has ONE watch
+/// row; when the engine arm retired it first and the `pot_beefs` arm did not reach it in the same pass (its eight
+/// were other rows, or the second look met one courier fault), the watch GC dropped the shared row
+/// (`t.retired_ms IS NOT NULL`), the `pot_beefs` row was never latched, and the pot stayed live for good, #831's own
+/// symptom. So when the engine arm retires a txid that keys a LIVE pot (one end-state read, only for a retired row),
+/// it latches that pot's `pot_beefs` row on the same evidence and ends it in the same step. A pot already escaped
+/// this way (on prod before the fold) is the backlog's ([`run_retire_backlog`]: its window reads the engine's
+/// retired set too).
+pub(crate) async fn retire_candidate<P: RetirePort>(
+    port: &P,
+    budget: &RetireBudget,
+    store: RetireStore,
+    row: &RetireCandidateRow,
+    summary: &mut RetireSummary,
+) {
+    // the lens's MEDIUM-2: no look (three courier GETs) and no latch for a candidate whose whole step the budget
+    // could not cover; it stays where it is (on the watch, unlatched) and a later pass reads it again
+    if !budget.room_for_an_ending(port) {
+        summary.end_deferred += 1;
+        return;
+    }
+    summary.scanned += 1;
+    // the evidence's start: the latch's and the memo's stamp, and the eviction's (a readmission stamped after it
+    // overtook the evidence, and the eviction yields to it: `evict_txid_everywhere`'s stamp policy)
+    let asked_ms = port.now_ms();
+    let webhook_evidence = row
+        .term_status
+        .clone()
+        .map(|s| (s, row.term_extra.clone().unwrap_or_default()));
+    let evidence = retire_evidence(port, &row.txid, webhook_evidence).await;
+    // No retire hook: the bounded owed clock ages relevant subjects.
+    if matches!(evidence.look, ArcadeLook::Present) {
+        summary.kept_present += 1;
+        return;
+    }
+    let Some(reason) = retire_verdict(
+        &evidence.look,
+        evidence.bitails,
+        evidence.woc,
+        row.age_secs as i64,
+    ) else {
+        // Present already returned above; everything else that keeps is uncertainty, kept fail-safe.
+        summary.kept_uncertain += 1;
+        return;
+    };
+    if let Err(e) = port.latch(store, &row.txid, &reason, asked_ms).await {
+        push_log(&format!(
+            "[retire] latch failed for {} ({}): {e}",
+            row.txid,
+            store.name()
+        ));
+        return;
+    }
+    summary.retired += 1;
+    port.latched(store, &row.txid, &reason, &evidence.look, asked_ms)
+        .await;
+    if store == RetireStore::Transactions {
+        // the lens's MEDIUM-1: an engine row of a live pot latches the pot's stored BEEF on the same evidence
+        match port.end_state(&row.txid).await {
+            Ok(s) if s.live <= 0.0 => return,
+            Ok(_) => {
+                if let Err(e) = port
+                    .latch(RetireStore::PotBeefs, &row.txid, &reason, asked_ms)
+                    .await
+                {
+                    push_log(&format!(
+                        "[retire] {} (transactions) retired; its pot's pot_beefs latch failed ({e}): the backlog pass looks again",
+                        row.txid
+                    ));
+                    summary.evict_faults += 1;
+                    port.persist(&[(crate::ops::COUNTER_RETIRE_EVICT_FAULTS, 1)])
+                        .await;
+                    return;
+                }
+            }
+            Err(e) => {
+                push_log(&format!(
+                    "[retire] {} (transactions) retired; its end-state read faulted ({e}): the backlog pass looks again",
+                    row.txid
+                ));
+                summary.evict_faults += 1;
+                port.persist(&[(crate::ops::COUNTER_RETIRE_EVICT_FAULTS, 1)])
+                    .await;
+                return;
+            }
+        }
+    }
+    // bsv-low #831 half 2: the latch alone left a ghost pot live for good; end it
+    let end = end_retired_pot(port, budget, &row.txid, &reason, asked_ms).await;
+    let deltas: &[(&'static str, u64)] = match &end {
+        RetireEnd::Evicted => {
+            summary.evicted_on_retire += 1;
+            push_log(&format!(
+                "[retire] {} ({}) retired and its live pot EVICTED: {}",
+                row.txid,
+                store.name(),
+                retire_eviction_reason(&reason)
+            ));
+            &[(crate::ops::COUNTER_RETIRE_EVICTED, 1)]
+        }
+        RetireEnd::Fault(e) => {
+            summary.evict_faults += 1;
+            push_log(&format!(
+                "[retire] {} ({}) retired, its live pot NOT evicted ({e}): the backlog pass looks again",
+                row.txid,
+                store.name()
+            ));
+            &[(crate::ops::COUNTER_RETIRE_EVICT_FAULTS, 1)]
+        }
+        RetireEnd::Incomplete => {
+            summary.evict_faults += 1;
+            push_log(&format!(
+                "[retire] {} ({}) retired, its eviction INCOMPLETE (the ledger row is open): counted a fault, not an ending",
+                row.txid,
+                store.name()
+            ));
+            &[(crate::ops::COUNTER_RETIRE_EVICT_FAULTS, 1)]
+        }
+        RetireEnd::Deferred => {
+            // counted once at the pass's end (`run_retire_pass`), with every candidate the budget left
+            summary.end_deferred += 1;
+            push_log(&format!(
+                "[retire] {} ({}) retired; its ending DEFERRED (the pass's statement budget is spent): the backlog pass ends it later",
+                row.txid,
+                store.name()
+            ));
+            &[]
+        }
+        RetireEnd::Yielded => {
+            push_log(&format!(
+                "[retire] {} ({}) retired; the eviction YIELDED to a readmission (the pot stands)",
+                row.txid,
+                store.name()
+            ));
+            &[]
+        }
+        RetireEnd::Proven => {
+            push_log(&format!(
+                "[retire] {} ({}) retired; a proof landed meanwhile: nothing evicted",
+                row.txid,
+                store.name()
+            ));
+            &[]
+        }
+        RetireEnd::NoLivePot | RetireEnd::NotLatched => &[],
+    };
+    if !deltas.is_empty() {
+        port.persist(deltas).await;
+    }
+}
+
+/// bsv-low #831 half 2: latched pots the backlog pass looks at again per pass (the conflict pass's eight).
+pub const RETIRE_BACKLOG_LIMIT: u64 = 8;
+/// bsv-low #831 half 2, its page bounded by the FIX-831-B lens's MEDIUM-2: the page of each set one backlog pass
+/// reads from its start key. The read is at most this many rows of each set, and the probes run for the merged page
+/// only (at most this many `pot_beefs`, `arc_terminal`, `transactions` and `pot_records` probes a pass), never the
+/// size of the sets (20,839 latched rows on the fleet's fixture: an `ORDER BY RANDOM()` over them would read every
+/// row on every tick, the NS-COST-BAR's shape). It was 256.
+pub const RETIRE_BACKLOG_WINDOW: u64 = 32;
+
+/// bsv-low #831 half 2, the backlog pass's candidates: pots ALREADY latched `structurally_unprovable`, or (the
+/// FIX-831-B lens's MEDIUM-1) whose ENGINE row the `transactions` arm retired, whose stored BEEF is unproven and
+/// whose `pot_records` row is still LIVE. `?1` now (ms), `?2` the start key. The page is the next
+/// [`RETIRE_BACKLOG_WINDOW`] txids of the union of the latched set (`pot_beefs_unprovable_set`) and the engine's
+/// retired set (`transactions_retired_set`), each read on its primary key from a start key that moves every pass
+/// ([`retire_backlog_start`]) and WRAPPING past the top (the FIX-831-B lens's NOTE-3: a start above a low txid read
+/// past it, so the budget tier's 48 pots left two of them live through 80 passes; each set is read at most twice the
+/// page, from the start and from the bottom), so every such row is reached in turn and the read stays flat; of the
+/// page, at most [`RETIRE_BACKLOG_LIMIT`] pots. The age is the pot's admission (`createdAt`, seconds; a row with none is 0, kept
+/// by the verdict's floor), the recorded word the retire pass's own `arc_terminal` join.
+pub(crate) const RETIRE_BACKLOG_CANDIDATES_SQL: &str = "SELECT b.txid AS txid, \
+        COALESCE(?1 / 1000 - b.createdAt, 0) AS age_secs, \
+        a.status AS term_status, a.extra AS term_extra \
+     FROM (SELECT txid FROM ( \
+             SELECT txid FROM (SELECT txid FROM pot_beefs_unprovable_set WHERE txid >= ?2 ORDER BY txid LIMIT 32) \
+             UNION \
+             SELECT txid FROM (SELECT txid FROM pot_beefs_unprovable_set WHERE txid < ?2 ORDER BY txid LIMIT 32) \
+             UNION \
+             SELECT txid FROM (SELECT txid FROM transactions_retired_set WHERE txid >= ?2 ORDER BY txid LIMIT 32) \
+             UNION \
+             SELECT txid FROM (SELECT txid FROM transactions_retired_set WHERE txid < ?2 ORDER BY txid LIMIT 32)) \
+           ORDER BY (txid < ?2), txid LIMIT 32) s \
+     JOIN pot_beefs b ON b.txid = s.txid \
+     LEFT JOIN arc_terminal a ON a.txid = b.txid \
+     LEFT JOIN transactions t ON t.txid = b.txid \
+     WHERE b.has_proof = 0 AND t.has_proof IS NOT 1 \
+       AND (b.structurally_unprovable = 1 OR t.retired_ms IS NOT NULL) \
+       AND EXISTS (SELECT 1 FROM pot_records p WHERE p.txid = b.txid) \
+     ORDER BY (b.txid < ?2), b.txid LIMIT 8";
+
+/// bsv-low #831 half 2: the latch of a pot the backlog's fresh look found HELD is cleared (confirm beats the latch,
+/// the #2b doctrine: the push's verified writes clear it the same way, `POT_BEEF_MARK_PROVEN_SQL`), so the watch's
+/// enrolment, the completion pass and this pass's own retire arm take it back; a proof landed meanwhile is untouched.
+pub(crate) const RETIRE_LATCH_CLEAR_SQL: &str =
+    "UPDATE pot_beefs SET structurally_unprovable = NULL \
+     WHERE txid = ?1 AND structurally_unprovable = 1 AND has_proof = 0";
+/// bsv-low #831 (the FIX-831-B lens's MEDIUM-1): the ENGINE latch of a held pot is cleared beside it, so the
+/// enrolment watches it again (the GC dropped its watch row on `retired_ms`) and a held pot is not read by the
+/// backlog on every pass that reaches it. Only a row that keys a live pot and is unproven (a proof's own write
+/// clears it the same way, `d1_storage.rs`); a later death is the arms' again.
+pub(crate) const RETIRE_ENGINE_LATCH_CLEAR_SQL: &str =
+    "UPDATE transactions SET retired_ms = NULL, retired_reason = NULL \
+     WHERE txid = ?1 AND has_proof = 0 AND retired_ms IS NOT NULL \
+       AND EXISTS (SELECT 1 FROM pot_records p WHERE p.txid = ?1)";
+
+/// PURE: a rotating start key for a pass at `now_ms`: 16 hex digits spread over the key space by splitmix64 (seeded
+/// with `salt`, so two readers of one pass start apart), so successive passes start anywhere and every lowercase hex
+/// txid is in some window. Nothing is persisted: no cursor row, no migration.
+pub fn retire_rotation_key(now_ms: i64, salt: u64) -> String {
+    let mut z = (now_ms as u64)
+        .wrapping_add(salt)
+        .wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    format!("{:016x}", z ^ (z >> 31))
+}
+
+/// PURE: the backlog page's start key for a pass at `now_ms` ([`retire_rotation_key`], salt 0).
+pub fn retire_backlog_start(now_ms: i64) -> String {
+    retire_rotation_key(now_ms, 0)
+}
+
+/// The salt of the `pot_beefs` arm's rotation (the FIX-831-B lens's LOW-4), so it does not start where the backlog
+/// starts.
+pub const RETIRE_ARM_ROTATION_SALT: u64 = 0x0831_b10c;
+
+/// bsv-low #831 half 2: the bounded backlog pass over pots latched `structurally_unprovable` (or, the FIX-831-B
+/// lens's MEDIUM-1, whose engine row was retired) BEFORE the retire pass evicted (#831's live `2e6bcb0d…` among
+/// them), on the retire pass's cadence. The lens's L-H2-1: it LOOKS AGAIN and never trusts the memo. A latched row
+/// has left the watch, the enrolment and the completion pass, so a JOIN mined after its memo is cleared only by a
+/// push; evicting on the stale memo would shadow-move a mined pot, reversible only by a MINED push nobody is now
+/// asking for. So each candidate gets the retire pass's own fresh look ([`retire_evidence`]: Arcade, then both
+/// indexers) and then [`retire_verdict`] over its admission age:
+/// - HELD (Arcade's live non-terminal word, or either indexer holds it, mined or in a mempool): left alone, both
+///   latches and its verdict memo cleared ([`RETIRE_LATCH_CLEAR_SQL`], [`RETIRE_ENGINE_LATCH_CLEAR_SQL`]), so the
+///   proof machinery takes it back;
+/// - a verdict: its `pot_beefs` row latched (a no-op for a latched one; the engine-retired one's first latch), then
+///   ended by [`end_retired_pot`], the same eviction and reason as the retire arm;
+/// - no verdict (a courier could not say, or absence under 48 h): kept, looked at again on a later pass.
+///
+/// Bounded: at most [`RETIRE_BACKLOG_LIMIT`] candidates a pass (three courier GETs each), from a page of
+/// [`RETIRE_BACKLOG_WINDOW`] txids that rotates every pass, and (the lens's MEDIUM-2) only while `budget` has room
+/// for one more ending: the rest of the page is left unlooked, counted `deferred`, read again later. Counted per
+/// candidate.
+///
+/// Stated: a latched pot the #2b supersession wrote (a refund a confirmed spend superseded) that still keys a live
+/// `pot_records` row is a candidate too; the fresh look and the verdict decide it exactly as any other (a loser the
+/// network does not hold is evicted; its confirmed pointers are never released, `release_spends_of`).
+pub(crate) async fn run_retire_backlog<P: RetirePort>(
+    port: &P,
+    budget: &RetireBudget,
+) -> RetireBacklogSummary {
+    let mut summary = RetireBacklogSummary::default();
+    let now_ms = port.now_ms();
+    let rows = match port
+        .backlog_candidates(now_ms, &retire_backlog_start(now_ms))
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            push_log(&format!("[retire] backlog candidate read failed: {e}"));
+            summary.faults += 1;
+            port.persist(&[(crate::ops::COUNTER_RETIRE_EVICT_FAULTS, 1)])
+                .await;
+            return summary;
+        }
+    };
+    // the SQL's LIMIT is the bound; this is the belt (a port that answered more is cut, never walked)
+    let page: Vec<&RetireCandidateRow> = rows.iter().take(RETIRE_BACKLOG_LIMIT as usize).collect();
+    for (i, row) in page.iter().enumerate() {
+        // the lens's MEDIUM-2: no look (three courier GETs) for an ending the budget could not run
+        if !budget.room_for_an_ending(port) {
+            summary.deferred += page.len() - i;
+            push_log(&format!(
+                "[retire] backlog: the pass's statement budget is spent ({} of {}): {} candidate(s) DEFERRED to a later pass",
+                budget.spent(port),
+                RETIRE_PASS_STATEMENT_BUDGET,
+                page.len() - i
+            ));
+            break;
+        }
+        summary.scanned += 1;
+        let asked_ms = port.now_ms();
+        let webhook_evidence = row
+            .term_status
+            .clone()
+            .map(|s| (s, row.term_extra.clone().unwrap_or_default()));
+        let evidence = retire_evidence(port, &row.txid, webhook_evidence).await;
+        let (counter, line) = if evidence.held() {
+            match port.clear_latch(&row.txid).await {
+                Ok(()) => {
+                    summary.left += 1;
+                    (
+                        crate::ops::COUNTER_RETIRE_BACKLOG_LEFT,
+                        format!(
+                            "HELD on the fresh look ({evidence:?}): left alone, its latches cleared"
+                        ),
+                    )
+                }
+                Err(e) => {
+                    summary.faults += 1;
+                    (
+                        crate::ops::COUNTER_RETIRE_EVICT_FAULTS,
+                        format!("HELD on the fresh look, its latch clear faulted ({e}): asked again later"),
+                    )
+                }
+            }
+        } else {
+            match retire_verdict(
+                &evidence.look,
+                evidence.bitails,
+                evidence.woc,
+                row.age_secs as i64,
+            ) {
+                None => {
+                    summary.kept += 1;
+                    (
+                        "",
+                        format!("no verdict on the fresh look ({evidence:?}): kept"),
+                    )
+                }
+                Some(reason) => {
+                    // the engine-retired pot's first latch (the lens's MEDIUM-1); a latched one's is a no-op
+                    let latch = port
+                        .latch(RetireStore::PotBeefs, &row.txid, &reason, asked_ms)
+                        .await;
+                    let end = match latch {
+                        Ok(()) => end_retired_pot(port, budget, &row.txid, &reason, asked_ms).await,
+                        Err(e) => RetireEnd::Fault(format!("the pot_beefs latch faulted: {e}")),
+                    };
+                    match end {
+                        RetireEnd::Evicted => {
+                            summary.evicted += 1;
+                            (
+                                crate::ops::COUNTER_RETIRE_BACKLOG_EVICTED,
+                                format!(
+                                    "EVICTED on the fresh look: {}",
+                                    retire_eviction_reason(&reason)
+                                ),
+                            )
+                        }
+                        RetireEnd::Fault(e) => {
+                            summary.faults += 1;
+                            (
+                                crate::ops::COUNTER_RETIRE_EVICT_FAULTS,
+                                format!("the eviction faulted ({e}): asked again later"),
+                            )
+                        }
+                        RetireEnd::Incomplete => {
+                            summary.faults += 1;
+                            (
+                                crate::ops::COUNTER_RETIRE_EVICT_FAULTS,
+                                "the eviction was INCOMPLETE (the ledger row is open): counted a fault"
+                                    .to_string(),
+                            )
+                        }
+                        RetireEnd::Deferred => {
+                            summary.deferred += 1;
+                            (
+                                "",
+                                "its ending DEFERRED (the pass's statement budget is spent)"
+                                    .to_string(),
+                            )
+                        }
+                        RetireEnd::Yielded => {
+                            summary.kept += 1;
+                            (
+                                "",
+                                "the eviction YIELDED to a readmission: the pot stands".to_string(),
+                            )
+                        }
+                        RetireEnd::Proven => {
+                            summary.kept += 1;
+                            ("", "a proof landed meanwhile: nothing evicted".to_string())
+                        }
+                        RetireEnd::NoLivePot | RetireEnd::NotLatched => {
+                            summary.kept += 1;
+                            (
+                                "",
+                                "no live latched pot left (ended or proven meanwhile): nothing to do"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                }
+            }
+        };
+        push_log(&format!("[retire] backlog {}: {line}", row.txid));
+        let mut deltas = vec![(crate::ops::COUNTER_RETIRE_BACKLOG_SCANNED, 1)];
+        if !counter.is_empty() {
+            deltas.push((counter, 1));
+        }
+        port.persist(&deltas).await;
+    }
+    summary
+}
+
+/// The worker's [`RetirePort`]: D1, Arcade and the two couriers.
+struct WorkerRetire<'a> {
+    db: &'a worker::D1Database,
+    arcade_base: &'a str,
+    woc_api_key: Option<&'a str>,
+    sources: ProofSources,
+}
+
+impl RetirePort for WorkerRetire<'_> {
+    async fn arcade(&self, txid: &str, evidence: Option<(String, String)>) -> ArcadeLook {
+        self.sources
+            .arcade_look(self.arcade_base, txid, evidence)
+            .await
+    }
+    async fn bitails(&self, txid: &str) -> Option<NetworkPresence> {
+        self.sources.bitails_presence(txid).await
+    }
+    async fn woc(&self, txid: &str) -> Option<NetworkPresence> {
+        self.sources.woc_presence(self.woc_api_key, txid).await
+    }
+    async fn latch(
+        &self,
+        store: RetireStore,
+        txid: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        use crate::d1::Query;
+        match store {
+            RetireStore::Transactions => {
+                Query::new(RETIRE_TRANSACTIONS_SQL)
+                    .bind(now_ms)
+                    .bind(reason)
+                    .bind(txid)
+                    .execute(self.db)
+                    .await
+            }
+            RetireStore::PotBeefs => {
+                Query::new(RETIRE_POT_BEEFS_SQL)
+                    .bind(txid)
+                    .execute(self.db)
+                    .await
+            }
+        }
+    }
+    async fn latched(
+        &self,
+        store: RetireStore,
+        txid: &str,
+        reason: &str,
+        look: &ArcadeLook,
+        now_ms: i64,
+    ) {
+        use crate::d1::Query;
+        let db = self.db;
+        // bsv-low #451 slice C (iv): the verdict memo for `/tx-any` (the request path never asks a courier for an
+        // index-held row; this pass did, once, here). Fail-soft.
+        let kind = verdict_kind_of_retire_reason(reason);
+        match Query::new(TX_ANY_VERDICT_UPSERT_SQL)
+            .bind(txid)
+            .bind(now_ms)
+            .bind(kind)
+            .bind(reason)
+            .execute(db)
+            .await
+        {
+            // bsv-low #626: the memo write counted by its kind (the retire pass is bounded per tick).
+            Ok(()) => {
+                crate::ops::bump_counter(db, crate::applayer_counters::memo_write_counter(kind), 1)
+                    .await
+            }
+            Err(e) => {
+                worker::console_log!("[retire] verdict memo write failed for {txid}: {e}")
+            }
+        }
+        // Evidence on record (write-once: a webhook row already present makes this a no-op). Only the live poll's
+        // word: a Recorded look came from that row.
+        if let ArcadeLook::Fatal(status, extra) = look {
+            crate::ops::record_arc_terminal(db, txid, status, Some(&format!("polled: {extra}")))
+                .await;
+        }
+        worker::console_log!(
+            "[retire] dead-letter: {txid} ({}) retired: {reason}",
+            store.name()
+        );
+    }
+    async fn end_state(&self, txid: &str) -> Result<RetireEndState, String> {
+        Ok(crate::d1::Query::new(RETIRE_END_STATE_SQL)
+            .bind(txid)
+            .fetch_optional::<RetireEndState>(self.db)
+            .await?
+            .unwrap_or_default())
+    }
+    async fn evict(
+        &self,
+        txid: &str,
+        reason: &str,
+        asked_ms: u64,
+    ) -> Result<RetireEviction, String> {
+        // the existing eviction, whole: fail-loud inside (an incomplete pass is counted and logged there and the
+        // row stays OPEN for the next accept, proof or eviction to converge); the lens's LOW-2: its incompleteness
+        // is answered, so the arm counts it a fault and never an ending
+        let outcome =
+            crate::admit_fast::evict_txid_everywhere(self.db, txid, reason, asked_ms).await;
+        Ok(if outcome.yielded {
+            RetireEviction::Yielded
+        } else if outcome.incomplete {
+            RetireEviction::Incomplete
+        } else {
+            RetireEviction::Stands
+        })
+    }
+    async fn backlog_candidates(
+        &self,
+        now_ms: i64,
+        start: &str,
+    ) -> Result<Vec<RetireCandidateRow>, String> {
+        crate::d1::Query::new(RETIRE_BACKLOG_CANDIDATES_SQL)
+            .bind(now_ms)
+            .bind(start)
+            .fetch_all(self.db)
+            .await
+    }
+    async fn clear_latch(&self, txid: &str) -> Result<(), String> {
+        use crate::d1::Query;
+        Query::new(RETIRE_LATCH_CLEAR_SQL)
+            .bind(txid)
+            .execute(self.db)
+            .await?;
+        Query::new(RETIRE_ENGINE_LATCH_CLEAR_SQL)
+            .bind(txid)
+            .execute(self.db)
+            .await?;
+        // the memo goes with the latch (the readmission's and the push's rule, the second gate's MEDIUM-3b): a held
+        // pot never answers `present: false` from this pass's old word. Fail-soft: the latch is what moves the pot.
+        if let Err(e) = Query::new(TX_ANY_VERDICT_DELETE_SQL)
+            .bind(txid)
+            .execute(self.db)
+            .await
+        {
+            worker::console_log!("[retire] backlog {txid}: verdict memo delete failed ({e})");
+        }
+        Ok(())
+    }
+    async fn persist(&self, deltas: &[(&'static str, u64)]) {
+        for (name, delta) in deltas {
+            if *delta > 0 {
+                crate::ops::bump_counter(self.db, name, *delta).await;
+            }
+        }
+    }
+    fn statements(&self) -> u64 {
+        crate::d1_ledger::statements_noted()
+    }
+    fn now_ms(&self) -> i64 {
+        js_sys::Date::now() as i64
+    }
+}
+
+/// One retire pass over both proofless stores. Every decision funnels through the pure [`retire_verdict`]
+/// ([`retire_candidate`]); a retirement writes the store latch, records the evidence into `arc_terminal` (when it
+/// came from the live poll), logs a dead-letter line and (bsv-low #831 half 2) ENDS a retired pot that is still
+/// live ([`end_retired_pot`]). The watch GC then drops the row from `proofless_watch` on its next tick. Last, the
+/// bounded backlog pass ([`run_retire_backlog`]) looks again at pots latched or engine-retired before the pass
+/// evicted. The FIX-831-B lens's MEDIUM-2: the whole pass, the conflict pass that opens it included, runs under ONE
+/// statement budget ([`RETIRE_PASS_STATEMENT_BUDGET`]): an ending starts only while it fits, the rest deferred to a
+/// later pass and counted (`retire_end_deferred_total`). Stated: the conflict pass's own cost (its eight evictions
+/// at most) is spent first and is not deferred by this budget; the arms come before the backlog, so a tick whose
+/// arms spend the budget leaves the backlog's page for a later one.
 pub async fn run_retire_pass(
     db: &worker::D1Database,
     arcade_base: &str,
@@ -4428,6 +5411,13 @@ pub async fn run_retire_pass(
     sources: ProofSources,
 ) -> RetireSummary {
     use crate::d1::Query;
+    let port = WorkerRetire {
+        db,
+        arcade_base,
+        woc_api_key,
+        sources,
+    };
+    let budget = RetireBudget::begin(&port);
     let conflict = crate::admit_fast::confirmed_conflict_pass(db, woc_api_key, sources).await;
     let mut summary = RetireSummary {
         conflict,
@@ -4443,124 +5433,137 @@ pub async fn run_retire_pass(
     {
         worker::console_log!("[retire] verdict memo GC failed: {e}");
     }
+    let arm_start = retire_rotation_key(now, RETIRE_ARM_ROTATION_SALT);
     for (candidates_sql, store) in [
-        (RETIRE_CANDIDATES_TRANSACTIONS_SQL, "transactions"),
-        (RETIRE_CANDIDATES_POT_BEEFS_SQL, "pot_beefs"),
+        (
+            RETIRE_CANDIDATES_TRANSACTIONS_SQL,
+            RetireStore::Transactions,
+        ),
+        (RETIRE_CANDIDATES_POT_BEEFS_SQL, RetireStore::PotBeefs),
     ] {
-        let rows: Vec<RetireCandidateRow> =
-            match Query::new(candidates_sql).bind(now).fetch_all(db).await {
-                Ok(r) => r,
-                Err(e) => {
-                    worker::console_log!("[retire] candidate scan ({store}) failed: {e}");
-                    continue;
-                }
-            };
-        for row in rows {
-            summary.scanned += 1;
-            let webhook_evidence = row
-                .term_status
-                .clone()
-                .map(|s| (s, row.term_extra.clone().unwrap_or_default()));
-            let look = sources
-                .arcade_look(arcade_base, &row.txid, webhook_evidence)
-                .await;
-            // No retire hook: the bounded owed clock ages relevant subjects.
-            if matches!(look, ArcadeLook::Present) {
-                summary.kept_present += 1;
+        let mut q = Query::new(candidates_sql).bind(now);
+        if store == RetireStore::PotBeefs {
+            q = q.bind(arm_start.as_str());
+        }
+        let rows: Vec<RetireCandidateRow> = match q.fetch_all(db).await {
+            Ok(r) => r,
+            Err(e) => {
+                worker::console_log!("[retire] candidate scan ({}) failed: {e}", store.name());
                 continue;
             }
-            // Corroboration probes (the same courier hosts as the backstop).
-            let bitails = sources.bitails_presence(&row.txid).await;
-            let woc = if bitails.is_some_and(presence_bool) {
-                bitails
-            } else {
-                sources.woc_presence(woc_api_key, &row.txid).await
-            };
-            match retire_verdict(
-                &look,
-                bitails.map(presence_bool),
-                woc.map(presence_bool),
-                row.age_secs as i64,
-            ) {
-                Some(reason) => {
-                    let write = match store {
-                        "transactions" => {
-                            Query::new(RETIRE_TRANSACTIONS_SQL)
-                                .bind(now)
-                                .bind(reason.as_str())
-                                .bind(row.txid.as_str())
-                                .execute(db)
-                                .await
-                        }
-                        _ => {
-                            Query::new(RETIRE_POT_BEEFS_SQL)
-                                .bind(row.txid.as_str())
-                                .execute(db)
-                                .await
-                        }
-                    };
-                    match write {
-                        Ok(()) => {
-                            summary.retired += 1;
-                            // bsv-low #451 slice C (iv): the verdict memo for `/tx-any` (the request path never
-                            // asks a courier for an index-held row; this pass did, once, here). Fail-soft.
-                            let kind = verdict_kind_of_retire_reason(&reason);
-                            match Query::new(TX_ANY_VERDICT_UPSERT_SQL)
-                                .bind(row.txid.as_str())
-                                .bind(now)
-                                .bind(kind)
-                                .bind(reason.as_str())
-                                .execute(db)
-                                .await
-                            {
-                                // bsv-low #626: the memo write counted by its kind (the retire pass is bounded per tick).
-                                Ok(()) => {
-                                    crate::ops::bump_counter(
-                                        db,
-                                        crate::applayer_counters::memo_write_counter(kind),
-                                        1,
-                                    )
-                                    .await
-                                }
-                                Err(e) => worker::console_log!(
-                                    "[retire] verdict memo write failed for {}: {e}",
-                                    row.txid
-                                ),
-                            }
-                            // Evidence on record (write-once — a webhook row
-                            // already present makes this a no-op). Only the
-                            // live poll's word: a Recorded look came from that row.
-                            if let ArcadeLook::Fatal(status, extra) = &look {
-                                crate::ops::record_arc_terminal(
-                                    db,
-                                    &row.txid,
-                                    status,
-                                    Some(&format!("polled: {extra}")),
-                                )
-                                .await;
-                            }
-                            worker::console_log!(
-                                "[retire] dead-letter: {} ({store}) retired — {reason}",
-                                row.txid
-                            );
-                        }
-                        Err(e) => {
-                            worker::console_log!(
-                                "[retire] latch failed for {} ({store}): {e}",
-                                row.txid
-                            );
-                        }
-                    }
-                }
-                None => {
-                    // Present already `continue`d above; everything else
-                    // that keeps is uncertainty, kept fail-safe.
-                    summary.kept_uncertain += 1;
-                }
-            }
+        };
+        for row in rows {
+            retire_candidate(&port, &budget, store, &row, &mut summary).await;
         }
     }
+    summary.backlog = run_retire_backlog(&port, &budget).await;
+    persist_retire_deferred(&port, &summary).await;
+    summary.statements = budget.spent(&port);
     summary
+}
+
+/// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): the pass's deferred work counted ONCE at its end
+/// (`retire_end_deferred_total`: both arms' candidates and endings the budget left, and the backlog's), one statement.
+pub(crate) async fn persist_retire_deferred<P: RetirePort>(port: &P, summary: &RetireSummary) {
+    let deferred = (summary.end_deferred + summary.backlog.deferred) as u64;
+    if deferred > 0 {
+        port.persist(&[(crate::ops::COUNTER_RETIRE_END_DEFERRED, deferred)])
+            .await;
+    }
+}
+
+/// PURE: the retire lever's JSON answer (`POST /internal/retire-pass`): the pass's summary and what it cost D1 by
+/// its own ledger (`d1_ledger::passes`).
+pub fn retire_pass_json(s: &RetireSummary, d1: crate::d1_ledger::Tally) -> serde_json::Value {
+    serde_json::json!({
+        "scanned": s.scanned,
+        "retired": s.retired,
+        "keptPresent": s.kept_present,
+        "keptUncertain": s.kept_uncertain,
+        "conflict": {
+            "scanned": s.conflict.scanned,
+            "evicted": s.conflict.evicted,
+            "faults": s.conflict.faults,
+        },
+        "evictedOnRetire": s.evicted_on_retire,
+        "evictFaults": s.evict_faults,
+        "endDeferred": s.end_deferred,
+        "statements": s.statements,
+        "backlog": {
+            "scanned": s.backlog.scanned,
+            "evicted": s.backlog.evicted,
+            "left": s.backlog.left,
+            "kept": s.backlog.kept,
+            "faults": s.backlog.faults,
+            "deferred": s.backlog.deferred,
+        },
+        "budget": {
+            "statements": RETIRE_PASS_STATEMENT_BUDGET,
+            "endReserve": RETIRE_END_RESERVE_STATEMENTS,
+            "backlogPage": RETIRE_BACKLOG_WINDOW,
+            "backlogLimit": RETIRE_BACKLOG_LIMIT,
+        },
+        "d1": { "reads": d1.reads, "writes": d1.writes, "stmts": d1.stmts, "maxReads": d1.max_reads },
+    })
+}
+
+/// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): `POST /internal/retire-pass` (bearer `INTERNAL_TOKEN` in fixed
+/// time, as the #576 levers; body empty or `{}`, else 400): ONE retire pass through [`run_retire_pass`], the
+/// function the scheduled tick calls, with the tick's own Arcade base and WoC key, answered with its summary and its
+/// own D1 figures. For the budget tier (`tools/lane-831`, `make ci-d1-budget`), which no longer fires the
+/// production tick, and for an operator draining a backlog.
+pub async fn internal_retire_pass(
+    mut req: worker::Request,
+    env: &worker::Env,
+) -> worker::Result<worker::Response> {
+    let authorization = req.headers().get("authorization").ok().flatten();
+    let secret = env.secret("INTERNAL_TOKEN").ok().map(|s| s.to_string());
+    if !crate::tip_pass::bearer_ok(authorization.as_deref(), secret.as_deref()) {
+        worker::console_log!("POST /internal/retire-pass -> 401");
+        return worker::Response::error("unauthorized", 401);
+    }
+    let raw = req.bytes().await?;
+    let body = std::str::from_utf8(&raw).unwrap_or("x").trim();
+    if !(body.is_empty() || body == "{}") {
+        return worker::Response::error("body must be empty or {}: a pass takes no argument", 400);
+    }
+    let db = env.d1("OVERLAY_DB")?;
+    crate::d1::ensure_overlay_migrations(&db)
+        .await
+        .map_err(worker::Error::from)?;
+    let arcade_base = env
+        .var("ARCADE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| crate::broadcaster::ARCADE_DEFAULT_URL.to_string());
+    let woc_key = env.secret("WOC_API_KEY").ok().map(|k| k.to_string());
+    let (summary, by_pass) = crate::d1_ledger::passes(
+        "retire",
+        run_retire_pass(
+            &db,
+            &arcade_base,
+            woc_key.as_deref(),
+            ProofSources::from_env(env),
+        ),
+    )
+    .await;
+    let d1 = by_pass.get("retire").copied().unwrap_or_default();
+    worker::console_log!(
+        "POST /internal/retire-pass -> 200: retire-pass ; scanned={} retired={} kept_present={} kept_uncertain={} conflict: scanned={} evicted={} faults={} {} d1: reads={} writes={} stmts={}",
+        summary.scanned,
+        summary.retired,
+        summary.kept_present,
+        summary.kept_uncertain,
+        summary.conflict.scanned,
+        summary.conflict.evicted,
+        summary.conflict.faults,
+        summary.end_line(),
+        d1.reads,
+        d1.writes,
+        d1.stmts,
+    );
+    worker::Response::from_json(&retire_pass_json(&summary, d1))
 }
 
 // ============================================================================
@@ -5402,7 +6405,65 @@ pub(crate) mod tests {
     /// pass, read through the pass's own candidate statements under real SQLite and its own verdict. The pass
     /// examines only a STORED row (`transactions` or `pot_beefs`) at least `RETIRE_MIN_AGE_SECS` proofless, so a
     /// subject younger than loop 18's `REFUSAL_ABSENT_MIN_AGE_MS` or never admitted is never read, whatever
-    /// `arc_terminal` holds; and the pass retires (a store latch and a `/tx-any` memo), it opens no eviction.
+    /// `arc_terminal` holds; and the pass retires (a store latch and a `/tx-any` memo). Amended by bsv-low #831 half
+    /// 2: a retired `pot_beefs` row whose pot is live is then ENDED by the existing eviction, through ONE seam
+    /// (`end_retired_pot`, reached only from the `pot_beefs` arm), under a reason that serves no chain word.
+    /// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): the overlay's courier sink is the app layer's #731 rule (a
+    /// loopback origin only, the URL's own path kept), installed at all three entries, and the budget tier's lever runs
+    /// the tick's own pass function.
+    #[test]
+    fn i831_m_the_courier_sink_is_loopback_only_and_the_lever_runs_the_ticks_pass() {
+        assert_eq!(
+            courier_sink_of(Some(" http://127.0.0.1:8809/ ")).as_deref(),
+            Some("http://127.0.0.1:8809")
+        );
+        assert_eq!(
+            courier_sink_of(Some("http://localhost:4000")).as_deref(),
+            Some("http://localhost:4000")
+        );
+        for refused in [
+            "",
+            "https://127.0.0.1:9",
+            "http://127.0.0.1",
+            "http://127.0.0.1:9/path",
+            "http://127.0.0.1:x9",
+            "http://api.whatsonchain.com:80",
+            "http://127.0.0.1.attacker.example:80",
+        ] {
+            assert_eq!(courier_sink_of(Some(refused)), None, "{refused}");
+        }
+        assert_eq!(courier_sink_of(None), None);
+        let woc = format!("{DEFAULT_WOC_BASE}/tx/hash/ab?x=1");
+        assert_eq!(courier_target(&woc, None), woc);
+        assert_eq!(
+            courier_target(&woc, Some("http://127.0.0.1:9")),
+            "http://127.0.0.1:9/v1/bsv/main/tx/hash/ab?x=1"
+        );
+        let me: String = include_str!("proof_fetcher.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(me.contains(
+            "lettarget=COURIER_SINK.with(|s|courier_target(url,s.borrow().as_deref()));letrequest=worker::Request::new_with_init(&target,&init)"
+        ));
+        let lever = &me[me.find("pubasyncfninternal_retire_pass(").unwrap()..];
+        let lever = &lever[..lever.find("pubfn").unwrap_or(lever.len())];
+        assert!(lever
+            .contains("crate::tip_pass::bearer_ok(authorization.as_deref(),secret.as_deref())"));
+        assert!(lever.contains("crate::d1_ledger::passes(\"retire\",run_retire_pass("));
+        let lib: String = include_str!("lib.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            lib.matches("crate::proof_fetcher::set_courier_sink(env.var(\"COURIER_SINK\").ok().map(|v|v.to_string()));")
+                .count(),
+            3,
+            "the fetch, the scheduled tick and the queue install it"
+        );
+        assert!(lib.contains("(Method::Post,\"/internal/retire-pass\")=>{crate::proof_fetcher::internal_retire_pass(req,&env).await}"));
+    }
+
     #[test]
     fn i765_a_recorded_status_reaches_no_young_or_never_admitted_subject_at_the_retire_pass() {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
@@ -5477,10 +6538,14 @@ pub(crate) mod tests {
             RETIRE_CANDIDATES_POT_BEEFS_SQL,
         ] {
             let mut st = conn.prepare(sql).unwrap();
-            let rows: Vec<(String, i64, Option<String>)> = st
-                .query_map(rusqlite::params![now_ms], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })
+            let row = |r: &rusqlite::Row<'_>| Ok((r.get(0)?, r.get(1)?, r.get(2)?));
+            // bsv-low #831 (the FIX-831-B lens's LOW-4): the pot_beefs arm's second bind is its rotation's start
+            let rows: Vec<(String, i64, Option<String>)> =
+                if sql == RETIRE_CANDIDATES_POT_BEEFS_SQL {
+                    st.query_map(rusqlite::params![now_ms, ""], row)
+                } else {
+                    st.query_map(rusqlite::params![now_ms], row)
+                }
                 .unwrap()
                 .map(Result::unwrap)
                 .collect();
@@ -5501,7 +6566,8 @@ pub(crate) mod tests {
                 None
             );
         }
-        // The pass writes a store latch and a memo; it opens no eviction and serves no eviction word.
+        // The pass writes a store latch and a memo, and (bsv-low #831 half 2) ends a retired live pot through ONE
+        // seam: the pass body names no eviction itself; the candidate step names it once, behind the pot_beefs arm.
         let src = include_str!("proof_fetcher.rs");
         let start = src
             .find("pub async fn run_retire_pass(")
@@ -5516,7 +6582,37 @@ pub(crate) mod tests {
         ] {
             assert!(!body.contains(absent), "the retire pass names {absent}");
         }
-        assert!(body.contains("RETIRE_TRANSACTIONS_SQL") && body.contains("RETIRE_POT_BEEFS_SQL"));
+        assert!(
+            body.contains("RetireStore::Transactions") && body.contains("RetireStore::PotBeefs")
+        );
+        let step = &src[src
+            .find("pub(crate) async fn retire_candidate<")
+            .expect("the step")..];
+        let step = &step[..step.find("\n}\n").expect("its end")];
+        // bsv-low #831 (the FIX-831-B lens's MEDIUM-1): the engine arm latches the pot's stored BEEF, then the one
+        // end step runs for both arms; it ends a pot only with that latch held (`RETIRE_END_STATE_SQL`'s `latched`)
+        let arm = step
+            .find("if store == RetireStore::Transactions {")
+            .expect("the engine arm's pot latch");
+        let pot_latch = step
+            .find(".latch(RetireStore::PotBeefs, &row.txid, &reason, asked_ms)")
+            .expect("the pot_beefs latch on the same evidence");
+        assert_eq!(step.matches("end_retired_pot(").count(), 1);
+        assert!(
+            arm < pot_latch && pot_latch < step.find("end_retired_pot(").unwrap(),
+            "the engine arm latches the pot before the one end step"
+        );
+        assert!(RETIRE_END_STATE_SQL.contains("structurally_unprovable = 1 AND has_proof = 0"));
+        let port = &src[src
+            .find("impl RetirePort for WorkerRetire")
+            .expect("the worker's port")..];
+        let port = &port[..port.find("\n}\n").expect("its end")];
+        assert!(port.contains("RETIRE_TRANSACTIONS_SQL") && port.contains("RETIRE_POT_BEEFS_SQL"));
+        assert_eq!(
+            port.matches("crate::admit_fast::evict_txid_everywhere(")
+                .count(),
+            1
+        );
     }
 
     /// bsv-low #765: one candidate through the retire pass's own steps, under real SQLite. The candidate is a

@@ -262,6 +262,7 @@ pub const D1_LEDGER_ROUTES: &[&str] = &[
 /// route's running maxima ride `/health/invariants.d1Budget`.
 #[event(fetch)]
 async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> {
+    crate::proof_fetcher::set_courier_sink(env.var("COURIER_SINK").ok().map(|v| v.to_string()));
     let route = crate::d1_ledger::route_of(req.path().as_str(), D1_LEDGER_ROUTES);
     let (out, tally) = crate::d1_ledger::scoped(dispatch(req, env, ctx)).await;
     crate::d1_ledger::record(route, tally);
@@ -503,6 +504,11 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
         // D1 budget tier measures it on a populated table.
         (Method::Post, "/internal/change-park") => {
             crate::change_park::internal_lever(req, &env).await
+        }
+        // bsv-low #831 (the FIX-831-B lens's MEDIUM-2): ONE retire pass on demand, the tick's own function (bearer
+        // INTERNAL_TOKEN; body empty or {}), so the D1 budget tier measures its worst tick on a populated D1.
+        (Method::Post, "/internal/retire-pass") => {
+            crate::proof_fetcher::internal_retire_pass(req, &env).await
         }
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
         (Method::Post, "/requestForeignGASPNode") => request_foreign_gasp_node(&engine, req).await,
@@ -1318,6 +1324,7 @@ fn transaction_proof_fetcher(env: &Env) -> crate::proof_fetcher::ChainProofFetch
 
 #[event(scheduled)]
 async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::ScheduleContext) {
+    crate::proof_fetcher::set_courier_sink(env.var("COURIER_SINK").ok().map(|v| v.to_string()));
     tick_alarm::arm_from_cron(&env).await;
     tick::run_tick(&env, tick::TickSource::Cron).await;
 }
@@ -1596,7 +1603,7 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
     )
     .await;
     worker::console_log!(
-        "complete-proofs: retire-pass — scanned={} retired={} kept_present={} kept_uncertain={} conflict: scanned={} evicted={} faults={}",
+        "complete-proofs: retire-pass ; scanned={} retired={} kept_present={} kept_uncertain={} conflict: scanned={} evicted={} faults={} {}",
         retire.scanned,
         retire.retired,
         retire.kept_present,
@@ -1604,6 +1611,7 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
         retire.conflict.scanned,
         retire.conflict.evicted,
         retire.conflict.faults,
+        retire.end_line(),
     );
     // 4b'. bsv-low #649 D3-H1: the parked pot and hop notes (a background flush withheld them), delivered by the
     //    SHARED drain the scheduled handler runs (D4-L1): the `*/15` tick is the observed trigger and this route
@@ -1777,6 +1785,7 @@ async fn queue_entry(
     env: Env,
     ctx: worker::Context,
 ) -> worker::Result<()> {
+    crate::proof_fetcher::set_courier_sink(env.var("COURIER_SINK").ok().map(|v| v.to_string()));
     // bsv-low #576: a batch from the dead letter queue is PARKED in D1, never replayed here (the operator's lever
     // re-drives it).
     let name: String = event.queue().map(String::from).unwrap_or_default();

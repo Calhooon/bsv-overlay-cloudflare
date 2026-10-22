@@ -85,11 +85,22 @@ thread_local! {
     static CURRENT: RefCell<Option<Rc<Cell<Tally>>>> = const { RefCell::new(None) };
     static UNSCOPED: Cell<Tally> = const { Cell::new(Tally { reads: 0, writes: 0, stmts: 0, max_reads: 0 }) };
     static ROUTES: RefCell<BTreeMap<&'static str, RouteBudget>> = const { RefCell::new(BTreeMap::new()) };
+    /// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): every statement this isolate noted, scoped or not.
+    static NOTED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): the statements this isolate has noted since it booted, whatever
+/// scope each landed on. A pass that bounds its own D1 cost reads it before and after its work (the retire pass's
+/// statement budget): the difference is its statements, and a concurrent request's in the same isolate, so the
+/// bound errs toward stopping early, never toward running past it.
+pub fn statements_noted() -> u64 {
+    NOTED.with(|n| n.get())
 }
 
 /// Fold one statement into the request in scope, or into `unscoped` when none is (and, NS-COST-BAR-1, into the
 /// pass in scope, if any: the two are independent, so a pass inside a request counts on both).
 pub fn note(reads: u64, writes: u64) {
+    NOTED.with(|n| n.set(n.get().saturating_add(1)));
     if let Some(p) = PASS.with(|c| c.borrow().clone()) {
         let mut p = p.borrow_mut();
         let label = p.label;
