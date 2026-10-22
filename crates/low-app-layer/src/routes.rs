@@ -3523,6 +3523,9 @@ async fn owed_recompute_inner(
         crate::owed_cursor::party_walk(&selected, OWED_WALK_MAX_PAGES);
     // bsv-low #618 (L2): every page is hydrated first and assembled after the coin words are read (below)
     let mut party_rows = Vec::new();
+    // bsv-low #831: the unspent pots whose funding the hydration found held by nothing (`fundingHeld = 'none'`, read in
+    // the same statement); their funding txids join the coin-word read below, so a CHECKED `mined` word still holds it
+    let mut funding_unheld: HashSet<String> = HashSet::new();
     for page in party_pages {
         let mut result_rows = Vec::new();
         let mut refund_rows = Vec::new();
@@ -3538,6 +3541,14 @@ async fn owed_recompute_inner(
                 .and_then(|r| r.results::<serde_json::Value>())
                 .map_err(|e| format!("owed party hydration: {e}"))?;
             for mut row in rows {
+                if row["fundingHeld"] == crate::owed::FUNDING_HELD_NONE {
+                    if let Some(t) = row["potTxid"]
+                        .as_str()
+                        .filter(|t| crate::logic::valid_txid(t))
+                    {
+                        funding_unheld.insert(t.to_ascii_lowercase());
+                    }
+                }
                 result_rows.push(
                     serde_json::from_value::<ResultsRowD1>(row.clone())
                         .map_err(|e| format!("owed result row: {e}"))?
@@ -3610,7 +3621,8 @@ async fn owed_recompute_inner(
                     .iter()
                     .flatten()
                     .map(|r| r.spending_txid.as_deref()),
-            ),
+            )
+            .chain(funding_unheld.iter().map(|t| Some(t.as_str()))),
     );
     let arm_rows = crate::tracker_host::runtime::read_soft(env, &arm_ids)
         .await
@@ -5042,6 +5054,7 @@ async fn owed_recompute_inner(
                     home_spends: &no_home,
                     retired_spenders: &no_retired,
                     proof_mined_spenders: &proof_mined_spenders,
+                    funding_unheld: &funding_unheld,
                 }));
             durable_unconfirmed
                 .into_iter()
@@ -5125,6 +5138,7 @@ async fn owed_recompute_inner(
         home_spends: &no_home_words,
         retired_spenders: &no_retired,
         proof_mined_spenders: &proof_mined_spenders,
+        funding_unheld: &funding_unheld,
     };
     // 6c. bsv-low #485: the home outputs of the CONFIRMED courier-proven payouts (the candidates are the derivation's
     //     own: `owed::courier_home_outputs`), looked at within a small budget, so such a row can RETIRE on evidence
@@ -5161,6 +5175,8 @@ async fn owed_recompute_inner(
     }
     inputs.retired_spenders = &retired;
     let mut rows = derive_owed_rows(&inputs);
+    // bsv-low #831 (the FIX-831 lens's L3): one increment per pot judged funding-not-held, so the withheld class shows
+    crate::owed::note_refund_funding_unheld(crate::owed::count_refund_funding_unheld(&rows));
     // bsv-low #692 (RC-L34): a swept payout that reached "home on chain" from a chaintracks-checked mined PROOF of
     // the sweep (the spent-any ladder's confirming courier WoC `/0/spent` faulted). Counted for the operator, and —
     // for the chain-rung path (an around-the-overlay sweep the index never held, `spent` not the index's word) —
@@ -11684,6 +11700,51 @@ mod tests {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// bsv-low #831 (the FIX-831 lens's L2): the route's wiring of the funding word, read off the route source: a
+    /// hydration row whose `fundingHeld` is `none` puts its pot txid in `funding_unheld`, those txids join the step 3b
+    /// coin-word read (`word_arm_subjects`), both `OwedInputs` (the sweep wait's and the pass's) carry the set, and the
+    /// pass counts what it withheld. A mutant that drops any one compiles and is green on every judgement pin.
+    #[test]
+    fn fix831_l2_the_route_feeds_the_funding_word_into_the_judgement() {
+        let code: String = fix800_code().split_whitespace().collect();
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        for (what, needle) in [
+            (
+                "the insert from the hydration row",
+                "if row[\"fundingHeld\"] == crate::owed::FUNDING_HELD_NONE { if let Some(t) = row[\"potTxid\"] \
+                 .as_str() .filter(|t| crate::logic::valid_txid(t)) { funding_unheld.insert(t.to_ascii_lowercase()); } }",
+            ),
+            (
+                "the chain into the coin-word subjects",
+                ".chain(funding_unheld.iter().map(|t| Some(t.as_str()))), ); \
+                 let arm_rows = crate::tracker_host::runtime::read_soft(env, &arm_ids)",
+            ),
+            (
+                "the count of the withheld pots",
+                "crate::owed::note_refund_funding_unheld(crate::owed::count_refund_funding_unheld(&rows));",
+            ),
+        ] {
+            assert!(code.contains(&squash(needle)), "{what}: missing from the route");
+        }
+        let start = code
+            .find(&squash("let arm_ids = crate::owed::word_arm_subjects("))
+            .expect("the step 3b subjects are word_arm_subjects");
+        let subjects = &code[start..];
+        let subjects = &subjects[..subjects
+            .find(&squash("let arm_rows"))
+            .expect("the arm read")];
+        assert!(
+            subjects.contains(&squash(".chain(funding_unheld.iter()")),
+            "the funding txids are chained into word_arm_subjects"
+        );
+        assert_eq!(
+            code.matches(&squash("funding_unheld: &funding_unheld,"))
+                .count(),
+            2,
+            "both OwedInputs call sites carry the set"
+        );
     }
 
     // ── the second FIX-800 delta lens fold (bsv-low #800): a hook shed during the alarm, the fire time, the line ──
