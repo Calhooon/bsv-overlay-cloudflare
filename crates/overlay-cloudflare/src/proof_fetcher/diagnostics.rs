@@ -4,6 +4,14 @@ use super::*;
 /// and spend hints, and has no BUMP endpoint in this implementation.
 pub(crate) const PROOF_RUNGS: [&str; 3] = ["arcade", "bitails", "woc"];
 
+/// bsv-low #834: a probe's `parseResult` when the pass's pacer did not let its ask go (counted `skipped`).
+pub(crate) const PACED_SKIP_RESULT: &str = "paced-skip";
+/// bsv-low #834: a probe's `parseResult` for pruned Bitails' 404 on a proofless subject (counted `couldnotlook`).
+pub(crate) const COULD_NOT_LOOK_RESULT: &str = "could-not-look";
+/// bsv-low #834: a probe's `parseResult` for the Bitails rung skipped by construction once Arcade has said the
+/// subject is unmined (pruned Bitails cannot look at an unmined subject).
+pub(crate) const SKIPPED_UNMINED_RESULT: &str = "skipped-unmined";
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProofRequest {
@@ -70,8 +78,32 @@ impl ProofProbe {
             http_get_counted(&url, header, self.counters.as_ref(), self.rung).await;
         let (status, body) = match response {
             Ok((status, body)) => (Some(status), Some(body)),
+            // bsv-low #834: the pass's pacer did not let the ask go: no subrequest, no fault; the next rung asks.
+            Err(e) if is_paced_skip(&e) => {
+                if let Some(request) = self.requests.last_mut() {
+                    request.parse_result = PACED_SKIP_RESULT;
+                }
+                self.parse_result = PACED_SKIP_RESULT;
+                return None;
+            }
             Err(_) => (None, None),
         };
+        // bsv-low #834: pruned Bitails does not see the mempool, so its `/tx` 404 for a proofless subject (every
+        // proof-ladder subject is one the index holds unmined) is "could not look": counted apart, never a fault on
+        // either family (it was a legacy fault and a `notfound` ask).
+        if self.rung == "bitails" && matches!(status, Some(404 | 410)) {
+            if let Some(request) = self.requests.last_mut() {
+                request.http_status = status;
+                request.parse_result = COULD_NOT_LOOK_RESULT;
+                request.observation = observation;
+                CourierAttempt::set(&mut request.observation, CourierOutcome::CouldNotLook);
+            }
+            if let Some(c) = &self.counters {
+                c.could_not_look(self.rung);
+            }
+            self.parse_result = COULD_NOT_LOOK_RESULT;
+            return None;
+        }
         let ok = status.is_some_and(|s| (200..300).contains(&s));
         if let Some(request) = self.requests.last_mut() {
             request.http_status = status;
@@ -186,8 +218,9 @@ impl ChainProofFetcher {
             let Some(body) = probe.get(format!("{base}/{path}/{txid}"), header).await else {
                 return;
             };
-            let height = serde_json::from_str::<serde_json::Value>(&body)
-                .ok()
+            let value = serde_json::from_str::<serde_json::Value>(&body).ok();
+            let height = value
+                .as_ref()
                 .and_then(|v| {
                     v.get("blockheight")
                         .or_else(|| v.get("blockHeight"))
@@ -195,6 +228,12 @@ impl ChainProofFetcher {
                 })
                 .and_then(|h| u32::try_from(h).ok());
             let Some(height) = height else {
+                // bsv-low #834 (the #606 rule: a missing field is never a fault): a body that names the asked txid
+                // and carries NO height (absent or null: WoC's mempool body) is the subject present and unmined.
+                if value.as_ref().is_some_and(|v| mempool_body_of(v, txid)) {
+                    probe.parsed("unmined-hint", false);
+                    return;
+                }
                 probe.parsed("invalid-height", true);
                 return;
             };
@@ -236,7 +275,18 @@ impl ChainProofFetcher {
     }
 
     pub(super) async fn note_proof_probe(&self, probe: &ProofProbe) {
-        if probe.parse_result == "disabled" {
+        if probe.parse_result == COULD_NOT_LOOK_RESULT {
+            self.proof_tallies
+                .borrow_mut()
+                .entry(probe.rung)
+                .or_default()
+                .couldnotlook += 1;
+            return;
+        }
+        if matches!(
+            probe.parse_result,
+            "disabled" | PACED_SKIP_RESULT | SKIPPED_UNMINED_RESULT
+        ) {
             self.proof_tallies
                 .borrow_mut()
                 .entry(probe.rung)
@@ -273,4 +323,19 @@ impl ChainProofFetcher {
                 .ok += 1;
         }
     }
+}
+
+/// PURE (bsv-low #834): a tx body for `txid` that carries no block height (the field absent or null): the subject
+/// present and unmined, never a malformed answer. A present height that is not a number stays `invalid-height`.
+pub(crate) fn mempool_body_of(value: &serde_json::Value, txid: &str) -> bool {
+    let names_it = ["txid", "hash"].iter().any(|k| {
+        value
+            .get(*k)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|t| t.eq_ignore_ascii_case(txid))
+    });
+    let no_height = ["blockheight", "blockHeight"]
+        .iter()
+        .all(|k| value.get(*k).is_none_or(serde_json::Value::is_null));
+    names_it && no_height
 }
