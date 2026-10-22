@@ -33,6 +33,8 @@
 //! for the wasm-clean `transaction` surface.
 
 mod diagnostics;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod fix834;
 use crate::courier_counters::{Counters as CourierCounters, Outcome as CourierOutcome, Attempt as CourierAttempt};
 pub(crate) use diagnostics::{ProofProbe, PROOF_RUNGS};
 
@@ -6158,6 +6160,8 @@ pub(crate) mod tests {
         assert_eq!(fetcher.verified_proof_for(&txid).await, Some(hex));
     }
 
+    /// Amended by bsv-low #834: pruned Bitails' `/tx` 404 for a proofless subject is "could not look" on BOTH
+    /// families (it was a legacy fault and a `notfound` ask): never a fault, outside the cell's denominator.
     #[tokio::test]
     async fn obs_625_bitails_unmined_404_is_notfound_in_the_new_family_only() {
         TEST_HTTP_RESPONSES.with(|responses| responses.borrow_mut().clear());
@@ -6167,16 +6171,17 @@ pub(crate) mod tests {
             .with_courier_counters(counts.clone());
         let probe = fetcher.diagnose_rung("bitails", &"ab".repeat(32)).await;
         fetcher.note_proof_probe(&probe).await;
-        // The legacy tally keeps the 404 a fault (the lens's MEDIUM-1).
-        assert!(probe.fault);
-        assert_eq!(fetcher.proof_tallies.borrow()["bitails"].fault, 1);
+        assert!(!probe.fault);
+        assert_eq!(probe.parse_result, "could-not-look");
+        assert_eq!(fetcher.proof_tallies.borrow()["bitails"].fault, 0);
+        assert_eq!(fetcher.proof_tallies.borrow()["bitails"].couldnotlook, 1);
         fetcher
             .fetch_verified_proof(&"ab".repeat(32))
             .await
             .unwrap();
         let rows = counts.take();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows["courier_janitor_bitails_notfound_total"], 1);
+        assert_eq!(rows["courier_janitor_bitails_couldnotlook_total"], 1);
     }
 
     #[tokio::test]
@@ -6187,11 +6192,13 @@ pub(crate) mod tests {
             r#"{{"outputs":[{{"index":0,"spent":true,"spentIn":{{"txid":"{}"}}}}]}}"#,
             "cd".repeat(32)
         );
-        for (status, body, outcome) in [
-            (404, "", "notfound"),
-            (503, "", "fault"),
-            (200, "broken json", "shape"),
-            (200, spent.as_str(), "ok"),
+        // bsv-low #834: the janitor's per-output spend 404 from pruned Bitails is "could not look"; the door's
+        // presence read keeps its 404 `notfound`.
+        for (status, body, outcome, door_outcome) in [
+            (404, "", "couldnotlook", "notfound"),
+            (503, "", "fault", "fault"),
+            (200, "broken json", "shape", "shape"),
+            (200, spent.as_str(), "ok", "ok"),
         ] {
             let counts = CourierCounters::new(Reader::Janitor);
             let fetcher = ChainProofFetcher::new(None)
@@ -6213,7 +6220,7 @@ pub(crate) mod tests {
                 .await;
             let rows = door.take();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[&format!("courier_door_bitails_{outcome}_total")], 1);
+            assert_eq!(rows[&format!("courier_door_bitails_{door_outcome}_total")], 1);
         }
     }
 
@@ -6230,11 +6237,14 @@ pub(crate) mod tests {
         let call = fetcher
             .call_rung("bitails_tx", &url, None, |s, b| parse_bitails_tx_spend_body(s, b, &txid, 0))
             .await;
-        // The ladder keeps "could not look"; only the courier family reads a known absence.
+        // The ladder keeps "could not look"; the courier family counts it apart (bsv-low #834: `couldnotlook`,
+        // outside the cell's asks), and it is no fault on the legacy tally either.
         assert!(matches!(call, RungCall::Fault(_)));
         let rows = counts.take();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows["courier_janitor_bitails_notfound_total"], 1);
+        assert_eq!(rows["courier_janitor_bitails_couldnotlook_total"], 1);
+        assert_eq!(fetcher.rung_stats()["bitails_tx"].fault, 0);
+        assert_eq!(fetcher.rung_stats()["bitails_tx"].couldnotlook, 1);
     }
 
     #[tokio::test]
