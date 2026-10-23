@@ -255,7 +255,8 @@ async fn b_fleet_4_a_header_await_that_never_answers_stops_the_page_at_the_deadl
         runtime::BACKFILL_WALL_MS - runtime::BACKFILL_SAVE_RESERVE_MS,
         "dropped at the wall less the save's reserve"
     );
-    assert!(
+    // a compile-time pin (clippy: an assertion on constants): the backfill and the intake fit inside the drain task's wall
+    const _: () = assert!(
         runtime::BACKFILL_WALL_MS + low_app_layer::tracker_host::chain_events::WALL_MS
             <= low_app_layer::pot_hook::DRAIN_WALL_MS,
         "the backfill and the intake fit inside the drain task's wall"
