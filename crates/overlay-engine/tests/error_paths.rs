@@ -165,7 +165,12 @@ async fn topic_manager_error_doesnt_block_other_topics() {
     assert!(steak["BadTopic"].outputs_to_admit.is_empty());
 }
 
-/// Lookup service admission failure should be logged but not prevent output storage.
+/// A lookup service's admission failure does not fail the submit (the STEAK
+/// is answered, the fault is in the report), but since bsv-low #657 it is a
+/// fault BEFORE the transaction landed: the output is taken out again and no
+/// applied row is written, so the replay re-applies it whole. (Until #657 the
+/// output stayed, as in the reference, and the replay was judged again over
+/// a store that no longer held the stale coins it had deleted.)
 #[tokio::test]
 async fn lookup_service_admission_failure_doesnt_block_submit() {
     let mut mgrs: HashMap<String, Box<dyn TopicManager>> = HashMap::new();
@@ -183,11 +188,19 @@ async fn lookup_service_admission_failure_doesnt_block_submit() {
     );
     let beef = valid_tagged_beef(&["Hello"]);
 
-    // Submit should succeed even though lookup service fails on admission
-    let steak = engine.submit(&beef, SubmitMode::CurrentTx).await.unwrap();
+    // The submit answers even though the lookup service fails on admission
+    let (steak, report) = engine
+        .submit_with_report(&beef, SubmitMode::CurrentTx)
+        .await
+        .unwrap();
     assert_eq!(steak["Hello"].outputs_to_admit, vec![0]);
+    assert_eq!(
+        report.faults.iter().map(|f| f.site).collect::<Vec<_>>(),
+        ["lookup_service.output_admitted_by_topic"]
+    );
+    assert!(report.applied_topics.is_empty());
 
-    // Output should still be in storage
+    // Nothing of it is held (bsv-low #657)
     let output = engine
         .storage()
         .find_output(
@@ -199,7 +212,7 @@ async fn lookup_service_admission_failure_doesnt_block_submit() {
         )
         .await
         .unwrap();
-    assert!(output.is_some());
+    assert!(output.is_none());
 }
 
 /// Lookup service query failure returns EngineError::LookupFailed.
