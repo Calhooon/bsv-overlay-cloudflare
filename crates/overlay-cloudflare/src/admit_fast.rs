@@ -1344,12 +1344,6 @@ pub async fn evict_txid_everywhere_repointed(
     )
     .await;
     let core = evict_core(db, &txid, reason, now_ms).await;
-    // the reference tells its managers `abortAdmissibleOutputs` when a `current-tx` broadcast throws after they
-    // identified their outputs (`Engine.ts:1219-1223` at ts-stack f999e0c1a); this door learns the network's refusal
-    // after the write, here: told once per evicted admission, never when the pass yielded to a readmission
-    if core.yielded_to_readmission.is_none() {
-        crate::admission_abort::tell(&abort).await;
-    }
     let moved = core.moved;
     for v in &core.pot_vouts {
         if !pot_vouts.contains(v) {
@@ -1414,6 +1408,13 @@ pub async fn evict_txid_everywhere_repointed(
         .await
     {
         worker::console_log!("[admit-fast] evict {txid}: the ledger row failed: {e}");
+    }
+    // Finish the ledger close before awaiting a manager (IDENT-ENGINE-LENS LOW-1).
+    // the reference tells its managers `abortAdmissibleOutputs` when a `current-tx` broadcast throws after they
+    // identified their outputs (`Engine.ts:1219-1223` at ts-stack f999e0c1a); this door learns the network's refusal
+    // after the write, here: told once per evicted admission, never when the pass yielded to a readmission
+    if core.yielded_to_readmission.is_none() {
+        crate::admission_abort::tell(&abort).await;
     }
     if let Some(at) = core.yielded_to_readmission {
         crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_EVICT_YIELDED, 1).await;
@@ -4804,6 +4805,20 @@ mod tests {
         async fn get_metadata(&self) -> overlay_engine::types::ServiceMetadata {
             Default::default()
         }
+    }
+
+    #[test]
+    fn ident_fold_l1_the_abort_is_after_the_ledger_close() {
+        let src = include_str!("admit_fast.rs");
+        let wrapper = &src[src.find("pub async fn evict_txid_everywhere_repointed(").unwrap()..];
+        let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap()];
+        let release = wrapper.find("release_spends_of(db, &txid)").unwrap();
+        let merge = wrapper.find("merge_released(").unwrap();
+        let close = wrapper.find("Query::new(CLOSE_EVICTION_MARKER_SQL)").unwrap();
+        let close_finished = close + wrapper[close..].find("\n    }\n").unwrap();
+        let tell = wrapper.find("crate::admission_abort::tell(&abort).await").unwrap();
+        assert!(release < merge && merge < close && close_finished < tell,
+            "release, merge, and finish the ledger close before awaiting the abort");
     }
 
     /// The eviction's sequence (`evict_txid_everywhere_repointed`: the abort's read, `evict_core`, the tell
