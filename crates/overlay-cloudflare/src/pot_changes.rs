@@ -181,12 +181,19 @@ fn settle_noting(
 /// path), then the NEW note-backs parked in the D1 outbox ([`crate::change_park::park_noted_back`], kind `pot`), so an
 /// isolate's end before its next flush, or a retry that fails too, loses no outpoint: the cron's drain delivers it.
 /// [`ship`] runs exactly this over D1; the pins over the shipped statements under SQLite.
-pub(crate) async fn settle_and_park<P: crate::change_park::ParkPort>(
+pub(crate) async fn settle_and_park<P: crate::change_park::ParkPort, A, F>(
     port: &P,
     shipped: &crate::change_flush::Shipped<(String, u32)>,
     now_ms: u64,
-) -> (crate::change_flush::Tally, crate::change_park::Outboxed) {
+    account: A,
+) -> (crate::change_flush::Tally, crate::change_park::Outboxed)
+where
+    A: FnOnce(crate::change_flush::Tally) -> F,
+    F: std::future::Future<Output = ()>,
+{
     let (tally, fresh) = settle_noting(shipped);
+    // the lens's LOW-2: the flush's account FIRST, so a task cancelled during the park's batch keeps its counters
+    account(tally).await;
     let items = fresh
         .iter()
         .map(|(t, v)| crate::change_park::pot_item(t, *v))
@@ -229,15 +236,18 @@ pub async fn ship(env: Env, outpoints: Vec<(String, u32)>, deadline_ms: u64) {
     if !shipped.delivered.is_empty() {
         console_log!("[pot-changes] notified {} outpoint(s) in {} POST(s)", shipped.delivered.len(), shipped.posts);
     }
-    // bsv-low #560: the note-backs into the D1 outbox too (no binding: memory only, as before, logged)
-    let tally = match env.d1("OVERLAY_DB") {
-        Ok(db) => settle_and_park(&crate::change_park::WorkerPark { db: &db }, &shipped, Date::now().as_millis()).await.0,
+    // bsv-low #560: the flush's account, then the note-backs into the D1 outbox too (the lens's LOW-2: the account
+    // before the park's batch; no binding: memory only, as before, logged)
+    let account = |tally| crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, tally);
+    match env.d1("OVERLAY_DB") {
+        Ok(db) => {
+            settle_and_park(&crate::change_park::WorkerPark { db: &db }, &shipped, Date::now().as_millis(), account).await;
+        }
         Err(_) => {
             console_log!("[pot-changes] no OVERLAY_DB: the flush's note-backs stay in the isolate's memory only");
-            settle(&shipped)
+            account(settle(&shipped)).await;
         }
-    };
-    crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, tally).await;
+    }
 }
 
 /// Drain and ship INSIDE a detached task, awaited there (2026-09-04).
@@ -677,12 +687,18 @@ pub(crate) mod tests {
                         .expect("the next fn")],
         ));
         assert!(ship.contains(&squash(r#"let shipped = ship_with( outpoints, |body| crate::change_flush::post_body(&env, &url, &token, "/internal/pot-changed", "pot-changes", body),"#)));
-        // bsv-low #560: the note-backs into the D1 outbox too, the memory's alone without the binding
-        assert!(ship.contains(&squash("Ok(db) => settle_and_park(&crate::change_park::WorkerPark { db: &db }, &shipped, Date::now().as_millis()).await.0,")));
-        assert!(ship.contains(&squash("settle(&shipped)")));
+        // bsv-low #560: the note-backs into the D1 outbox too, the memory's alone without the binding; the lens's
+        // LOW-2: both arms account through the one closure, which `settle_and_park` awaits BEFORE its park
         assert!(ship.contains(&squash(
-            r#"crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, tally).await;"#
+            r#"let account = |tally| crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, tally);"#
         )));
+        assert!(ship.contains(&squash("Ok(db) => { settle_and_park(&crate::change_park::WorkerPark { db: &db }, &shipped, Date::now().as_millis(), account).await; }")));
+        assert!(ship.contains(&squash("account(settle(&shipped)).await;")));
+        assert_eq!(
+            ship.matches("change_flush::account(").count(),
+            1,
+            "one account a flush"
+        );
         assert!(
             !ship.contains("body_json("),
             "ship never builds a body of its own"

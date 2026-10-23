@@ -1459,8 +1459,13 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
                 }
             }
             // bsv-low #581: a held-back "not now" letter given up BEFORE the platform's own last delivery is acked
-            // (handed back it would be delivered again); at the platform's last the retry is its drop, as before
-            if attempts.is_some_and(|a| a <= DLQ_MAX_RETRIES) {
+            // (handed back it would be delivered again); at the platform's last the retry is its drop, as before.
+            // The lens's NOTE-2: the ack names the class it is for, so a fault letter is never acked here whatever
+            // `deferral_plan` answers
+            if deferred
+                && class == LetterClass::NotNow
+                && attempts.is_some_and(|a| a <= DLQ_MAX_RETRIES)
+            {
                 let _ = m.ack();
                 continue;
             }
@@ -2528,9 +2533,10 @@ mod tests {
             .find("let plan = deferral_plan(class, deferred, attempts);")
             .unwrap()..];
         // bsv-low #581: the one ack of the fault path is a held-back not-now letter given up before the platform's
-        // own last delivery (`deferral_plan`), after its LOST line and count
+        // own last delivery (`deferral_plan`), after its LOST line and count; the lens's NOTE-2: gated on the class
+        // condition itself (a deferral of a `not_now` letter), never on the count alone
         let give_up = fault_path
-            .find("if attempts.is_some_and(|a| a <= DLQ_MAX_RETRIES) {\n                let _ = m.ack();")
+            .find("if deferred\n                && class == LetterClass::NotNow\n                && attempts.is_some_and(|a| a <= DLQ_MAX_RETRIES)\n            {\n                let _ = m.ack();")
             .expect("the early give-up acks");
         assert_eq!(
             fault_path.matches(".ack(").count(),
@@ -4586,7 +4592,7 @@ mod tests {
             + lost;
         let delete = f[lost..].find("\"its dead letter is LOST\"").unwrap() + lost;
         let ack = f[lost..]
-            .find("if attempts.is_some_and(|a| a <= DLQ_MAX_RETRIES) {\n                let _ = m.ack();\n                continue;")
+            .find("if deferred\n                && class == LetterClass::NotNow\n                && attempts.is_some_and(|a| a <= DLQ_MAX_RETRIES)\n            {\n                let _ = m.ack();\n                continue;")
             .unwrap()
             + lost;
         assert!(

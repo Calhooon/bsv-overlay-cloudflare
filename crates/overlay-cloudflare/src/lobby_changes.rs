@@ -133,12 +133,19 @@ fn settle_noting(
 
 /// bsv-low #560 (B-COST-1): [`settle`], then the NEW note-backs parked in the D1 outbox (kind `lobby`, item
 /// `txid:vout:kind`; the pot set's `settle_and_park`, the same rule).
-pub(crate) async fn settle_and_park<P: crate::change_park::ParkPort>(
+pub(crate) async fn settle_and_park<P: crate::change_park::ParkPort, A, F>(
     port: &P,
     shipped: &crate::change_flush::Shipped<Change>,
     now_ms: u64,
-) -> (crate::change_flush::Tally, crate::change_park::Outboxed) {
+    account: A,
+) -> (crate::change_flush::Tally, crate::change_park::Outboxed)
+where
+    A: FnOnce(crate::change_flush::Tally) -> F,
+    F: std::future::Future<Output = ()>,
+{
     let (tally, fresh) = settle_noting(shipped);
+    // the lens's LOW-2: the flush's account FIRST, so a task cancelled during the park's batch keeps its counters
+    account(tally).await;
     let items = fresh
         .iter()
         .map(|(t, v, k)| crate::change_park::lobby_item(t, *v, k))
@@ -191,23 +198,25 @@ pub async fn ship(env: Env, changes: Vec<Change>) {
             shipped.posts
         );
     }
-    // bsv-low #560: the note-backs into the D1 outbox too (no binding: memory only, as before, logged)
-    let tally = match env.d1("OVERLAY_DB") {
+    // bsv-low #560: the flush's account, then the note-backs into the D1 outbox too (the lens's LOW-2: the account
+    // before the park's batch; no binding: memory only, as before, logged)
+    let account =
+        |tally| crate::change_flush::account(&env, "lobby-changes", &COUNTERS, total, tally);
+    match env.d1("OVERLAY_DB") {
         Ok(db) => {
             settle_and_park(
                 &crate::change_park::WorkerPark { db: &db },
                 &shipped,
                 Date::now().as_millis(),
+                account,
             )
-            .await
-            .0
+            .await;
         }
         Err(_) => {
             console_log!("[lobby-changes] no OVERLAY_DB: the flush's note-backs stay in the isolate's memory only");
-            settle(&shipped)
+            account(settle(&shipped)).await;
         }
-    };
-    crate::change_flush::account(&env, "lobby-changes", &COUNTERS, total, tally).await;
+    }
 }
 
 /// Drain and ship under the given `wait_until`. One call per unit of work.

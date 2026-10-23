@@ -86,11 +86,19 @@ pub const PARK_SEQ_BUMP_SQL: &str = "INSERT INTO change_parked_seq (id, n) \
 /// its attempts start again and it is eligible at once (an exhausted row comes back). A NEW key is parked only while
 /// the table holds fewer than `?4` rows ([`CHANGE_PARKED_MAX_ROWS`], read by a LIMITed scan: at most `?4` rows), so
 /// the newest are refused when it is full (no row returned: the caller keeps that entry in memory and counts it).
+/// bsv-low #560 (B-COST-1, the lens's LOW-4): a new `lobby` key is parked only while the lobby rows are fewer than
+/// a quarter of `?4` ([`CHANGE_PARKED_LOBBY_MAX_ROWS`], the same LIMITed scan on the drain index's leading `kind`),
+/// so a storm of lobby note-backs (the app layer down) leaves three quarters of the table to the pot, hop and word
+/// parks, as #576 split its classes. The other kinds have no share of their own (the `?1 <> 'lobby'` arm, read
+/// first, skips the count).
 pub const PARK_SQL: &str =
     "INSERT INTO change_parked (kind, item, parked_at_ms, next_attempt_at_ms, generation) \
      SELECT ?1, ?2, ?3, ?3, (SELECT n FROM change_parked_seq WHERE id = 1) \
      WHERE EXISTS (SELECT 1 FROM change_parked WHERE kind = ?1 AND item = ?2) \
-        OR (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked LIMIT ?4)) < ?4 \
+        OR ((SELECT COUNT(*) FROM (SELECT 1 FROM change_parked LIMIT ?4)) < ?4 \
+            AND (?1 <> 'lobby' \
+                 OR (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'lobby' \
+                     LIMIT CAST(?4 / 4 AS INTEGER))) < CAST(?4 / 4 AS INTEGER))) \
      ON CONFLICT(kind, item) DO UPDATE SET \
         generation = excluded.generation, \
         attempts = 0, exhausted = 0, \
@@ -154,6 +162,9 @@ pub const CHANGE_PARK_EXHAUSTED_KEEP_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// N2: the most rows the table holds, both sets and exhausted rows together. Full, a NEW entry is not parked
 /// (kept in the isolate's set, counted `change_park_full_total`); a re-park of a held key always lands.
 pub const CHANGE_PARKED_MAX_ROWS: i64 = 2048;
+/// bsv-low #560 (the lens's LOW-4): the most rows the `lobby` kind holds of [`CHANGE_PARKED_MAX_ROWS`] (a quarter,
+/// [`PARK_SQL`]'s `?4 / 4`); a new lobby key past it is refused and counted [`COUNTER_CHANGE_PARK_FULL`].
+pub const CHANGE_PARKED_LOBBY_MAX_ROWS: i64 = CHANGE_PARKED_MAX_ROWS / 4;
 
 /// PURE (N2): a refusal of a row holding `attempts` at `now_ms`: `(next_attempt_at_ms, exhausted)`. The mirror of
 /// [`REFUSE_SQL`], which is what the drain runs (D2-L3).
@@ -339,7 +350,8 @@ pub const COUNTER_CHANGE_OUTBOX_OVER_BOUND: &str = "change_outbox_over_bound_tot
 pub struct Outboxed {
     /// Parked (a new row, or a held row given a new generation).
     pub parked: u64,
-    /// Refused at the table's ceiling ([`CHANGE_PARKED_MAX_ROWS`]): counted [`COUNTER_CHANGE_PARK_FULL`].
+    /// Refused at the table's ceiling ([`CHANGE_PARKED_MAX_ROWS`]), or a lobby key at the lobby's share
+    /// ([`CHANGE_PARKED_LOBBY_MAX_ROWS`]): counted [`COUNTER_CHANGE_PARK_FULL`].
     pub full: u64,
     /// The park batch faulted: counted [`COUNTER_CHANGE_PARK_FAULTS`].
     pub faulted: u64,
@@ -396,7 +408,7 @@ pub(crate) async fn park_noted_back<P: ParkPort>(
     }
     if out.full + out.over_bound > 0 {
         port.log(format!(
-            "[change-outbox] {} {kind} note-back(s) NOT parked ({} at the table's ceiling of {CHANGE_PARKED_MAX_ROWS} rows, {} past the flush's bound of {OUTBOX_PARK_MAX}); kept in the isolate's memory only",
+            "[change-outbox] {} {kind} note-back(s) NOT parked ({} at the table's ceiling of {CHANGE_PARKED_MAX_ROWS} rows or the lobby's share of {CHANGE_PARKED_LOBBY_MAX_ROWS}, {} past the flush's bound of {OUTBOX_PARK_MAX}); kept in the isolate's memory only, or let go and counted undelivered",
             out.full + out.over_bound,
             out.full,
             out.over_bound
@@ -987,6 +999,7 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
             "outboxParkMax": OUTBOX_PARK_MAX,
             "capped": HEALTH_COUNT_CAP,
             "maxRows": CHANGE_PARKED_MAX_ROWS,
+            "lobbyMaxRows": CHANGE_PARKED_LOBBY_MAX_ROWS,
             "maxAttempts": CHANGE_PARK_MAX_ATTEMPTS,
             "exhaustedKeepMs": CHANGE_PARK_EXHAUSTED_KEEP_MS,
             "drainMaxRows": DRAIN_MAX_ROWS,
@@ -2695,7 +2708,12 @@ mod tests {
             counters: Default::default(),
             fail: false,
         };
-        let (tally, out) = run(crate::pot_changes::settle_and_park(&park, &shipped, 1_000));
+        let (tally, out) = run(crate::pot_changes::settle_and_park(
+            &park,
+            &shipped,
+            1_000,
+            |_| async {},
+        ));
         assert_eq!(
             (tally.retried, tally.deferred),
             (8, 3),
@@ -2728,7 +2746,12 @@ mod tests {
             || 0,
             u64::MAX,
         ));
-        let (tally, out) = run(crate::pot_changes::settle_and_park(&park, &again, 2_000));
+        let (tally, out) = run(crate::pot_changes::settle_and_park(
+            &park,
+            &again,
+            2_000,
+            |_| async {},
+        ));
         assert_eq!(
             (tally.undelivered, tally.retry_failed),
             (8, 8),
@@ -2760,7 +2783,10 @@ mod tests {
             u64::MAX,
         ));
         let (_, out) = run(crate::lobby_changes::settle_and_park(
-            &park, &shipped, 3_000,
+            &park,
+            &shipped,
+            3_000,
+            |_| async {},
         ));
         assert_eq!(out.parked, 2);
         assert_eq!(in_table(KIND_LOBBY), 2);
@@ -2916,14 +2942,172 @@ mod tests {
         ] {
             let flat: String = src.split_whitespace().collect();
             assert!(
-                flat.contains("Ok(db)=>settle_and_park(&crate::change_park::WorkerPark{db:&db},&shipped,Date::now().as_millis()).await.0,")
-                    || flat.contains("Ok(db)=>{settle_and_park(&crate::change_park::WorkerPark{db:&db},&shipped,Date::now().as_millis(),).await.0}"),
-                "the {tag} flush parks its note-backs"
+                flat.contains("Ok(db)=>{settle_and_park(&crate::change_park::WorkerPark{db:&db},&shipped,Date::now().as_millis(),account).await;}")
+                    || flat.contains("Ok(db)=>{settle_and_park(&crate::change_park::WorkerPark{db:&db},&shipped,Date::now().as_millis(),account,).await;}"),
+                "the {tag} flush parks its note-backs, its account handed to the park (the lens's LOW-2)"
+            );
+            assert!(
+                flat.contains("account(settle(&shipped)).await;"),
+                "the {tag} flush accounts without the binding too"
             );
         }
         assert!(
             PARKED_COUNT_SQL.contains("AS lobby,")
                 && PARKED_COUNT_SQL.contains("AS lobby_exhausted")
+        );
+    }
+
+    /// A [`ParkPort`] whose batch never answers: the runtime cancelling the flush's task during the park.
+    struct NeverPark;
+
+    impl ParkPort for NeverPark {
+        async fn park(
+            &self,
+            _rows: &[(&'static str, String)],
+            _now_ms: u64,
+        ) -> std::result::Result<Vec<bool>, String> {
+            std::future::pending().await
+        }
+        async fn bump(&self, _counter: &'static str, _delta: u64) {}
+        fn log(&self, _line: String) {}
+    }
+
+    /// bsv-low #560 (B-COST-1), the lens's LOW-2: the flush's ACCOUNT (its `*_undelivered`, `*_retried`,
+    /// `*_deferred`, `*_resent` counters) is written BEFORE the outbox's batch, through the shipped
+    /// `settle_and_park`: (a) over SQLite the account runs while nothing is parked yet; (b) a park that never
+    /// answers (the task cancelled during the batch) still leaves the account written. RED with the account after
+    /// the park (the fold's base): (b) finds no account.
+    #[test]
+    fn b_cost_1_560f_l2_the_account_is_written_before_the_park_and_survives_its_cancellation() {
+        use std::future::Future as _;
+        let txid = |i: u32| format!("{:064x}", 0x5620_0000u32 + i);
+        let pots: Vec<(String, u32)> = (0..131u32).map(|i| (txid(i), 0)).collect();
+        let flush = || {
+            crate::pot_changes::tests::end_isolate();
+            crate::change_flush::run(crate::pot_changes::ship_with(
+                pots.clone(),
+                failing_on(&[2]),
+                || 0,
+                u64::MAX,
+            ))
+        };
+        // (a) the order, over the shipped statements
+        let conn = parked_db();
+        let park = SqlitePark {
+            conn: &conn,
+            counters: Default::default(),
+            fail: false,
+        };
+        let seen: RefCell<Option<(crate::change_flush::Tally, i64)>> = RefCell::new(None);
+        let shipped = flush();
+        let (_, out) = run(crate::pot_changes::settle_and_park(
+            &park,
+            &shipped,
+            1_000,
+            |tally| {
+                let rows: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM change_parked", [], |r| r.get(0))
+                    .unwrap();
+                *seen.borrow_mut() = Some((tally, rows));
+                async {}
+            },
+        ));
+        let (tally, rows_then) = seen.borrow().expect("accounted");
+        assert_eq!((tally.retried, tally.deferred), (8, 3));
+        assert_eq!(rows_then, 0, "the account precedes the park");
+        assert_eq!(out.parked, 11);
+        // (b) the park never answers: one poll, then the task is dropped
+        let shipped = flush();
+        let accounted: RefCell<Option<crate::change_flush::Tally>> = RefCell::new(None);
+        let mut fut = std::pin::pin!(crate::pot_changes::settle_and_park(
+            &NeverPark,
+            &shipped,
+            1_000,
+            |tally| {
+                *accounted.borrow_mut() = Some(tally);
+                async {}
+            },
+        ));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(fut.as_mut().poll(&mut cx).is_pending(), "the park hangs");
+        let tally = accounted
+            .borrow()
+            .expect("the cancelled flush's account was written");
+        assert_eq!((tally.retried, tally.deferred), (8, 3));
+        crate::pot_changes::tests::end_isolate();
+    }
+
+    /// bsv-low #560 (B-COST-1), the lens's LOW-4: the `lobby` kind holds at most a quarter of `change_parked`
+    /// ([`CHANGE_PARKED_LOBBY_MAX_ROWS`], inside [`PARK_SQL`]), so a lobby storm leaves the rest to the pot, hop
+    /// and word parks; a held lobby key still re-parks at the share; a lobby key past it is counted full. RED with
+    /// the share removed from [`PARK_SQL`]: 640 lobby rows parked.
+    #[test]
+    fn b_cost_1_560f_l4_a_lobby_storm_leaves_the_table_to_the_other_kinds() {
+        assert_eq!(CHANGE_PARKED_LOBBY_MAX_ROWS, 512);
+        let conn = parked_db();
+        let park = SqlitePark {
+            conn: &conn,
+            counters: Default::default(),
+            fail: false,
+        };
+        let lobby = |i: u32| lobby_item(&format!("{:064x}", 0x5640_0000u32 + i), 0, "admitted");
+        let mut total = Outboxed::default();
+        for round in 0..5u32 {
+            let items = (round * 128..(round + 1) * 128).map(lobby).collect();
+            let out = run(park_noted_back(
+                &park,
+                KIND_LOBBY,
+                items,
+                crate::lobby_changes::COUNTER_LOBBY_CHANGED_OUTBOXED,
+                1_000 + u64::from(round),
+            ));
+            total.parked += out.parked;
+            total.full += out.full;
+        }
+        assert_eq!(
+            (total.parked, total.full),
+            (512, 128),
+            "the lobby's share, the rest counted full"
+        );
+        assert_eq!(counted(&park.counters, COUNTER_CHANGE_PARK_FULL), 128);
+        // the other kinds still park
+        let out = run(park_noted_back(
+            &park,
+            KIND_POT,
+            vec![pot_item(&"ab".repeat(32), 1)],
+            crate::pot_changes::COUNTER_POT_CHANGED_OUTBOXED,
+            2_000,
+        ));
+        assert_eq!(
+            out.parked, 1,
+            "a pot note-back parks beside a full lobby share"
+        );
+        // a held lobby key re-parks at the share (a new generation, no new row)
+        let out = run(park_noted_back(
+            &park,
+            KIND_LOBBY,
+            vec![lobby(0)],
+            crate::lobby_changes::COUNTER_LOBBY_CHANGED_OUTBOXED,
+            3_000,
+        ));
+        assert_eq!(out.parked, 1);
+        let lobby_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM change_parked WHERE kind = 'lobby'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lobby_rows, 512);
+        // the park on a full share still reads at most its ceiling
+        let (_, steps) = plan_and_steps(
+            &conn,
+            PARK_SQL,
+            rusqlite::params![KIND_LOBBY, lobby(9_999), 4_000i64, MAX],
+        );
+        assert!(
+            steps < 8 * MAX + 400,
+            "a lobby park reads at most the ceiling: {steps}"
         );
     }
 }
