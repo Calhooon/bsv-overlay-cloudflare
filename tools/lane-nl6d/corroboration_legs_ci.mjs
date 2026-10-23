@@ -55,6 +55,17 @@
  * (90,000 B) cannot be queued and the arm answers 502 "admission not
  * durable". The witness prints that answer as a NOTE; it is not the count.
  *
+ * JUDGED FROM THE JOB'S OWN STATE (bsv-low #763): each deferred job is read
+ * from the worker's D1 file (`../lane-nl6c/job_state.mjs`) until it settles,
+ * and only then is its reference polled, once. Until #763 the witness polled
+ * the route every second for 180 s while the runs were in flight; on the local
+ * tier a request served during a run whose subrequest is slow leaves that
+ * run's queue dispatch never returning, and miniflare's queue then starts no
+ * later job: both jobs sat `queued`, attempts 0, for the whole wait. A job no
+ * run took is now `NOT DISPATCHED` and one that stops moving `STALLED`, each
+ * with its last two reads; the bound follows the job (each run that moves it
+ * restarts the clock), never a total wall.
+ *
  * MODELLING BOUNDARY: `wrangler dev --local` with its local queue and D1; the
  * platform's own limits are not exercised. The fixture answers at once, so the
  * witness measures the leg count, never a host's latency.
@@ -63,9 +74,15 @@
  */
 import { createHash, randomFillSync } from 'node:crypto'
 import { createServer } from 'node:http'
+import { waitRunEnded, waitSettled } from '../lane-nl6c/job_state.mjs'
 
 const BASE = process.argv[2] ?? 'http://127.0.0.1:9812'
 const FIXTURE_PORT = Number(process.env.FIXTURE_PORT ?? '9813')
+const EF_STATE = process.env.EF_STATE
+if (!EF_STATE) {
+  console.error('EF_STATE (the worker\'s --persist-to dir) is required: the witness reads the job from its D1 file')
+  process.exit(2)
+}
 
 const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b }
 const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b }
@@ -213,21 +230,15 @@ async function submit(body) {
   }
 }
 
-async function pollDone(path, timeoutMs = 180_000) {
-  const t0 = Date.now()
-  let last = null
-  for (;;) {
-    const res = await fetch(`${BASE}${path}`)
-    const text = await res.text()
-    try { last = { status: res.status, json: JSON.parse(text) } } catch { last = { status: res.status, text } }
-    const state = last.json?.state
-    if (state === 'done' || state === 'failed') return last
-    // a run's answer that is no progress (not a 202 naming the next leg): the job waits for the cron's hand-back
-    const answered = last.json?.answer?.status
-    if (state === 'queued' && answered !== undefined && answered !== 202) return last
-    if (Date.now() - t0 > timeoutMs) return last
-    await new Promise((r) => setTimeout(r, 1000))
-  }
+/** The job settled (read from its D1 row), then its reference polled ONCE: no request while a run is in flight. */
+async function settleThenPoll(reference, path) {
+  const w = await waitSettled(EF_STATE, reference)
+  if (!w.settled) return { verdict: w.verdict }
+  const ended = await waitRunEnded(process.env.EF_LOG, reference)
+  if (ended) return { verdict: ended }
+  const res = await fetch(`${BASE}${path}`)
+  const text = await res.text()
+  try { return { status: res.status, json: JSON.parse(text) } } catch { return { status: res.status, text } }
 }
 
 let failures = 0
@@ -274,20 +285,20 @@ try {
       `status=${r.status} ${r.text.slice(0, 240)}`,
     )
     if (r.status !== 202 || typeof j.poll !== 'string') continue
-    const done = await pollDone(j.poll)
+    const done = await settleThenPoll(j.reference, j.poll)
     const d = done.json ?? {}
     const answerText = JSON.stringify(d.answer ?? null)
     if (label === '1,000 legs') {
       expect(
         `${label}: the reference reaches done with the arm's own answer (200)`,
         done.status === 200 && d.state === 'done' && d.answer?.status === 200 && d.subjectTxid === built.subject,
-        `status=${done.status} ${JSON.stringify(d).slice(0, 300)}`,
+        done.verdict ?? `status=${done.status} ${JSON.stringify(d).slice(0, 300)}`,
       )
     } else {
       expect(
         `${label}: the job's run answered, and never with the leg count's refusal`,
         done.status === 200 && d.answer && !/leg cap|EF legs >|corroboration/i.test(answerText),
-        `state=${d.state} legsFrom=${d.legsFrom} answer ${answerText.slice(0, 160)}`,
+        done.verdict ?? `state=${d.state} legsFrom=${d.legsFrom} answer ${answerText.slice(0, 160)}`,
       )
       if (d.answer?.status !== 200) {
         console.log(`NOTE  ${label}: the admission after the corroboration answered ${d.answer?.status}: ${answerText.slice(0, 200)} (not the count: the S2 replay's queue message bound, see the header)`)

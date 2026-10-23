@@ -417,7 +417,7 @@ ci-route: ci-d1-budget ci-d1-board
 	node tools/lane-058/node_batch_route_ci.mjs http://127.0.0.1:$$P1; \
 	FIXTURE_PORT=$$P11 EF_STATE="$$ef_state" EF_LOG="$$ef_log" \
 	  node tools/lane-nl6c/ef_work_bound_ci.mjs http://127.0.0.1:$$P10; \
-	FIXTURE_PORT=$$P11 \
+	FIXTURE_PORT=$$P11 EF_STATE="$$ef_state" EF_LOG="$$ef_log" \
 	  node tools/lane-nl6d/corroboration_legs_ci.mjs http://127.0.0.1:$$P10
 
 # bsv-low #642: the /leaderboard:view rows-read ceilings on local D1. The shipped pipeline runs natively over the
