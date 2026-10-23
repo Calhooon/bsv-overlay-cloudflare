@@ -1644,7 +1644,7 @@
    "rebuild_class": "re-askable",
    "never_wipe": false,
    "holds": "the overlay's own cursor on chaintracks' typed chain-event feed, one versioned row: the event in hand, the recorded stop, the released windows (bsv-low #620)",
-   "why": "Deleting stops the overlay's reorg feed until it is re-seeded from CHAIN_EVENTS_START_CURSOR (unset: it reads nothing, and Arcade's orphan listing is the input again) or set by the operator's lever (POST /internal/chain-events-cursor on the overlay); a seed below the journal's head re-judges each selecting event's rows by their own proofs, which demotes nothing that still stands; no authority"
+   "why": "Deleting stops the overlay's reorg feed until it is re-seeded from CHAIN_EVENTS_START_CURSOR (unset: it reads nothing, and Arcade's orphan listing is the input again) or set by the operator's lever (POST /internal/chain-events-cursor on the overlay); while the row holds a recorded stop, or a pass faults, Arcade's listing is the input for that pass too (the W15E-L4 lens fold, MEDIUM-3); a seed below the journal's head re-judges each selecting event's rows by their own proofs, which demotes nothing that still stands; no authority"
   },
   {
    "name": "tracker_chain_events",

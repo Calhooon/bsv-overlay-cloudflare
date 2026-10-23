@@ -507,8 +507,9 @@ async fn e620_c_a_wide_window_is_held_and_a_faulting_one_released_with_its_heal(
 
 /// (d) THE START AND THE 409. With no row and no start cursor the consumer asks the feed nothing, writes nothing and
 /// is not the reorg word (D7 stays the input); with a start it seeds the row there. A 409 `cursorAhead` is a stop
-/// recorded at the stored cursor (counted once), never a reset to 0. An `invalidated` selects the heights below the
-/// tracker's tip.
+/// recorded at the stored cursor (counted once), never a reset to 0, and (the W15E-L4 lens fold, MEDIUM-3) a
+/// STOPPED feed is not the reorg word: D7 is the input while the stop stands. An `invalidated` selects the heights
+/// below the tracker's tip.
 #[tokio::test]
 async fn e620_d_unconfigured_reads_nothing_and_a_409_is_a_stop_not_a_reset() {
     let store = MemoryPotStorage::new();
@@ -550,7 +551,10 @@ async fn e620_d_unconfigured_reads_nothing_and_a_409_is_a_stop_not_a_reset() {
         &Start::At("999".into()),
     )
     .await;
-    assert!(s.cursor_ahead && s.is_reorg_word(), "{s:?}");
+    assert!(
+        s.cursor_ahead && !s.is_reorg_word(),
+        "a recorded stop hands D7 back: {s:?}"
+    );
     let st = row.state();
     assert_eq!(st.cursor, "999", "never reset to 0");
     assert_eq!(
@@ -671,7 +675,8 @@ fn e620_f_the_rows_compare_and_set_under_real_sqlite() {
 
 /// (g) THE WIRING. Both consumers judge through ONE function (`judge_window_legs`: the spenders by their own proof,
 /// re-anchor first, never a blind demotion; the pots' and the hop proofs after). The cron and the block-event pass run
-/// the feed first and run D7's Arcade consumer only where the feed is not the reorg word; the feed's pass bumps its
+/// the feed first and run D7's Arcade consumer only where the feed is not the reorg word, read through ONE gate
+/// function (`arcade_not_an_input`; the lens fold's MEDIUM-3); the feed's pass bumps its
 /// counters and the R2 totals and clears the confirmed probe memos on evidence, as D7's pass does; the operator's
 /// routes and `/health/invariants` serve both.
 #[test]
@@ -720,7 +725,13 @@ fn e620_g_the_feed_is_wired_as_the_reorg_word_and_d7_is_gated() {
     let at_feed = tick
         .find("crate::chain_feed::run_chain_feed_pass(")
         .expect("the cron runs the feed");
-    let at_gate = tick.find("iffeed.is_reorg_word(){").expect("the gate");
+    let at_gate = tick
+        .find("ifletSome(why)=crate::chain_feed::arcade_not_an_input(Some(&feed)){")
+        .expect("the gate: the one function");
+    assert!(
+        !tick.contains("is_reorg_word"),
+        "the cron reads the gate function, never the predicate itself"
+    );
     let at_d7 = tick
         .find("crate::tip_pass::run_arcade_reorg_pass(")
         .unwrap();
@@ -738,8 +749,12 @@ fn e620_g_the_feed_is_wired_as_the_reorg_word_and_d7_is_gated() {
         .find("crate::chain_feed::run_chain_feed_pass(")
         .expect("the block-event pass runs the feed");
     let at_gate = changed
-        .find("is_some_and(crate::chain_feed::FeedPassSummary::is_reorg_word)")
-        .unwrap();
+        .find("ifletSome(why)=crate::chain_feed::arcade_not_an_input(feed.as_ref()){")
+        .expect("the gate: the one function");
+    assert!(
+        !tip.contains("is_reorg_word"),
+        "the block-event pass reads the gate function, never the predicate itself"
+    );
     let at_d7 = changed.find("run_arcade_reorg_pass(").unwrap();
     assert!(at_feed < at_gate && at_gate < at_d7);
     assert!(
@@ -792,19 +807,110 @@ impl FeedStateStore for Contend {
     }
 }
 
-/// The gate as a LIVENESS predicate (the lens's fix shape for L1): the feed is the reorg word only while it is not
-/// resting on a recorded stop and read its page this pass.
+/// The lens's liveness predicate (its fix shape for L1). The fold made `is_reorg_word` THIS predicate, so the two
+/// must agree in every shape below.
 fn feed_is_live(s: &FeedPassSummary) -> bool {
-    s.is_reorg_word() && s.faults == 0 && s.state.as_ref().is_some_and(|st| st.stop.is_none())
+    !s.unconfigured && s.faults == 0 && s.state.as_ref().is_some_and(|st| st.stop.is_none())
 }
 
-/// LENS L1 (permanence): a feed STOPPED at an envelope the crate refuses, at a 409, or faulting at the binding, still
-/// answers `is_reorg_word() == true` whenever its row read, so the cron and the block-event pass skip Arcade's orphan
-/// consumer on every pass of the stop; a reorg BEHIND the stop demotes nothing on any of them. The row's state is the
-/// one `tick.rs` and `tip_pass.rs` consult. The liveness predicate answers false in each stopped shape and true in the
-/// healthy one.
+use crate::arcade_reorg::{
+    consume_arcade_reorg_events, CanonicalHeader, ConsumerStateStore, FeedRead, HeaderSource,
+    OrphanFeed,
+};
+use overlay_discovery::pot::arcade_events::{ConsumerState, OrphanEvent};
+
+/// Arcade's orphan listing with ONE row (the model of D7's feed).
+struct OneOrphan(OrphanEvent);
+impl OrphanFeed for OneOrphan {
+    async fn recent_orphans(&self) -> Result<FeedRead, String> {
+        Ok(FeedRead {
+            events: vec![self.0.clone()],
+            rows: 1,
+            malformed: 0,
+            pages: 1,
+            newest_height: Some(102),
+        })
+    }
+}
+/// The canonical header at 101 (its hash), the tip at 102: D7's corroboration source.
+struct Canon(String);
+impl HeaderSource for Canon {
+    async fn hash_at(&self, height: u64) -> Result<Option<CanonicalHeader>, String> {
+        Ok((height == 101).then(|| CanonicalHeader {
+            hash: self.0.clone(),
+            merkle_root: None,
+        }))
+    }
+    async fn tip(&self) -> Result<u64, String> {
+        Ok(102)
+    }
+}
+/// D7's own cursor row (a compare-and-set document), apart from the feed's.
+#[derive(Default)]
+struct D7Row {
+    doc: RefCell<Option<String>>,
+    version: Cell<Option<u64>>,
+}
+impl ConsumerStateStore for D7Row {
+    async fn read(&self) -> Result<(ConsumerState, Option<u64>), String> {
+        let doc = self.doc.borrow();
+        let state: ConsumerState = serde_json::from_str(doc.as_deref().unwrap_or("{}")).unwrap();
+        Ok((state, self.version.get()))
+    }
+    async fn write(&self, state: &ConsumerState, expected: Option<u64>) -> Result<Option<u64>, String> {
+        if expected != self.version.get() {
+            return Ok(None);
+        }
+        *self.doc.borrow_mut() = Some(serde_json::to_string(state).unwrap());
+        let v = self.version.get().unwrap_or(0) + 1;
+        self.version.set(Some(v));
+        Ok(Some(v))
+    }
+}
+/// Arcade's orphan row at 101 (B1's hash; chaintracks' canonical header there is A1's: corroborated).
+fn arcade_orphan_at_101() -> OneOrphan {
+    OneOrphan(OrphanEvent {
+        orphaned_at: "2026-10-23T18:00:00.000Z".into(),
+        height: 101,
+        hash: "1bcfb203aa391d9680a0a48530cc59aa016ca7421c480605fc88e113036f055b".into(),
+    })
+}
+fn canonical_at_101() -> Canon {
+    Canon("11d40824c809fb901bd1d593fdcae111008d3441abccc2e1c26879a2e5fd1105".into())
+}
+/// ONE pass of D7's consumer (`consume_arcade_reorg_events`, the function `run_arcade_reorg_pass` runs) over Arcade's
+/// orphan row at 101 on `store`, a fresh cursor row of its own: what the cron and the block-event pass run when the
+/// gate hands Arcade's listing back.
+async fn d7_pass(
+    store: &MemoryPotStorage,
+    txs: &MemoryTxStore,
+    tracker: &dyn ChainTracker,
+    ladder: &CourierStub,
+) -> crate::arcade_reorg::ArcadePassSummary {
+    consume_arcade_reorg_events(
+        &arcade_orphan_at_101(),
+        &canonical_at_101(),
+        &D7Row::default(),
+        store,
+        Some(txs),
+        Some(tracker),
+        Some(ladder),
+        PassLimits::cron(),
+        &mut RootMemo::default(),
+        false,
+    )
+    .await
+}
+
+/// LENS L1 (permanence), RE-AIMED by the fold (MEDIUM-3, Rule 6). As built at `40fec4ce` a feed STOPPED at an
+/// envelope the crate refuses, at a 409, or faulting at the binding, answered `is_reorg_word() == true` whenever its
+/// row read, so the cron and the block-event pass skipped Arcade's orphan consumer on every pass of the stop, and a
+/// reorg BEHIND the stop was judged by nothing until the operator's lever (the lens's L1 as written asserted that).
+/// Now the word IS the lens's liveness predicate: false in each stopped shape (the stop still recorded on the row,
+/// the reorg behind it still unreached by the FEED), true in the healthy one. RED before the fold:
+/// "pass 1: a stopped feed is not the reorg word".
 #[tokio::test]
-async fn lens_l1_a_stopped_feed_still_gates_d7_off() {
+async fn lens_l1_a_stopped_feed_is_not_the_reorg_word() {
     // (1) an unreadable envelope with a reorg behind it
     let store = MemoryPotStorage::new();
     let tracker = MockChainTracker::new(102);
@@ -816,33 +922,32 @@ async fn lens_l1_a_stopped_feed_still_gates_d7_off() {
     let start = Start::At("40".into());
     for n in 1..=3 {
         let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &start).await;
-        assert!(s.is_reorg_word(), "pass {n}: the gate reads the stopped feed as the reorg word: {s:?}");
-        assert!(!feed_is_live(&s), "pass {n}: a liveness predicate would hand D7 back");
+        assert!(!s.is_reorg_word(), "pass {n}: a stopped feed is not the reorg word: {s:?}");
+        assert_eq!(feed_is_live(&s), s.is_reorg_word(), "pass {n}: the lens's predicate is the word");
         assert_eq!(s.applied, 0);
         assert!(
             store.pot_beef_proof_verified(&orphaned).await.unwrap(),
-            "pass {n}: the reorg behind the stop demotes nothing; no other consumer ran"
+            "pass {n}: the feed did not reach the reorg behind the stop"
         );
-        assert_eq!(row.state().stop.as_ref().map(|x| x.cursor.as_str()), Some("42"));
+        assert_eq!(row.state().stop.as_ref().map(|x| x.cursor.as_str()), Some("42"), "the stop stays recorded");
     }
-    // (2) a 409 cursorAhead (pin d pins `cursor_ahead && is_reorg_word`; stated here beside the liveness reading)
+    // (2) a 409 cursorAhead (pin d pins it too)
     let row = Row::default();
     let feed = Journal::of(&[(41, TIP)]);
     let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("999".into())).await;
-    assert!(s.cursor_ahead && s.is_reorg_word() && !feed_is_live(&s), "{s:?}");
+    assert!(s.cursor_ahead && !s.is_reorg_word() && !feed_is_live(&s), "{s:?}");
     let again = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
-    assert!(again.is_reorg_word() && !feed_is_live(&again), "{again:?}");
-    // (3) the binding down, the row present
+    assert!(!again.is_reorg_word() && !feed_is_live(&again), "{again:?}");
+    // (3) the binding down, the row present: a fault of THIS pass, no stop recorded
     let row = Row::default();
     let feed = Journal::of(&[(41, TIP)]);
     let seeded = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
     assert!(seeded.is_reorg_word() && feed_is_live(&seeded), "{seeded:?}");
     *feed.answer.borrow_mut() = Some(Err("CHAINTRACKS binding: connection refused".into()));
     let down = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
-    assert_eq!(down.faults, 1, "{down:?}");
-    assert!(down.is_reorg_word(), "a transport fault with a row present still gates D7 off this pass");
-    assert!(!feed_is_live(&down));
-    // (4) the healthy shape (pin a's journal) is live under both readings
+    assert_eq!((down.faults, row.state().stop), (1, None), "{down:?}");
+    assert!(!down.is_reorg_word() && !feed_is_live(&down), "a transport fault hands D7 back this pass");
+    // (4) the healthy shape (pin a's journal) is the word under both readings
     let store = MemoryPotStorage::new();
     let tracker = Roots::at(102);
     let standing = confirmed_pot_with_stored_proof(&store, &pot(1), 101).await;
@@ -912,55 +1017,6 @@ async fn lens_l3_an_invalidation_145_deep_is_not_examined() {
 /// over its own source; neither reads the other's row.
 #[tokio::test]
 async fn lens_l4_two_consumers_one_height_demote_once() {
-    use crate::arcade_reorg::{
-        consume_arcade_reorg_events, CanonicalHeader, ConsumerStateStore, FeedRead, HeaderSource, OrphanFeed,
-    };
-    use overlay_discovery::pot::arcade_events::{ConsumerState, OrphanEvent};
-    struct OneOrphan(OrphanEvent);
-    impl OrphanFeed for OneOrphan {
-        async fn recent_orphans(&self) -> Result<FeedRead, String> {
-            Ok(FeedRead {
-                events: vec![self.0.clone()],
-                rows: 1,
-                malformed: 0,
-                pages: 1,
-                newest_height: Some(102),
-            })
-        }
-    }
-    struct Canon(String);
-    impl HeaderSource for Canon {
-        async fn hash_at(&self, height: u64) -> Result<Option<CanonicalHeader>, String> {
-            Ok((height == 101).then(|| CanonicalHeader {
-                hash: self.0.clone(),
-                merkle_root: None,
-            }))
-        }
-        async fn tip(&self) -> Result<u64, String> {
-            Ok(102)
-        }
-    }
-    #[derive(Default)]
-    struct D7Row {
-        doc: RefCell<Option<String>>,
-        version: Cell<Option<u64>>,
-    }
-    impl ConsumerStateStore for D7Row {
-        async fn read(&self) -> Result<(ConsumerState, Option<u64>), String> {
-            let doc = self.doc.borrow();
-            let state: ConsumerState = serde_json::from_str(doc.as_deref().unwrap_or("{}")).unwrap();
-            Ok((state, self.version.get()))
-        }
-        async fn write(&self, state: &ConsumerState, expected: Option<u64>) -> Result<Option<u64>, String> {
-            if expected != self.version.get() {
-                return Ok(None);
-            }
-            *self.doc.borrow_mut() = Some(serde_json::to_string(state).unwrap());
-            let v = self.version.get().unwrap_or(0) + 1;
-            self.version.set(Some(v));
-            Ok(Some(v))
-        }
-    }
     let store = MemoryPotStorage::new();
     let tracker = Roots::at(102);
     let standing = confirmed_pot_with_stored_proof(&store, &pot(1), 101).await;
@@ -975,12 +1031,8 @@ async fn lens_l4_two_consumers_one_height_demote_once() {
     assert_eq!((s.applied, s.spenders.scanned, s.demoted()), (1, 2, 1), "{s:?}");
     assert!(!store.pot_beef_proof_verified(&orphaned).await.unwrap());
     // then D7 on demand over Arcade's orphan row at 101 (its hash differs from chaintracks': corroborated)
-    let arcade_feed = OneOrphan(OrphanEvent {
-        orphaned_at: "2026-10-23T18:00:00.000Z".into(),
-        height: 101,
-        hash: "1bcfb203aa391d9680a0a48530cc59aa016ca7421c480605fc88e113036f055b".into(),
-    });
-    let headers = Canon("11d40824c809fb901bd1d593fdcae111008d3441abccc2e1c26879a2e5fd1105".into());
+    let arcade_feed = arcade_orphan_at_101();
+    let headers = canonical_at_101();
     let d7_row = D7Row::default();
     let d7 = consume_arcade_reorg_events(
         &arcade_feed,
@@ -1144,4 +1196,117 @@ async fn lens_l7_a_proofless_confirmed_row_is_never_demoted_blind() {
     assert_eq!((s.applied, s.demoted(), s.spenders.demoted_blind), (1, 1, 0), "{s:?}");
     let r = store.get_spent_status(&pot(31), 0).await.unwrap().unwrap();
     assert!(r.spent && !r.spent_confirmed, "demoted on the courier's disagreeing proof");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// W15E-L4-FOLD (2026-10-23): the lens's findings folded.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// MEDIUM-3 (Rule 6: never a self-healing failure traded for a permanent one). The gate both passes read is ONE
+/// function, `arcade_not_an_input` (the cron's `tick.rs`, the block-event pass's `tip_pass.rs`; `e620_g` pins the
+/// call sites): Arcade's orphan listing (register row D7) is an INPUT of the pass, and D7's consumer RUNS and judges,
+/// whenever the feed's pass was not LIVE: a recorded stop (an envelope the crate refuses; a 409 `cursorAhead`), a
+/// fault of this pass (the feed's transport, a page that did not read, an HTTP status, a leg's read fault), or no
+/// feed pass at all. Each shape here: the feed's pass stops, the gate says "run", D7's consumer runs over Arcade's
+/// orphan row at the reorg's height on the same store and DEMOTES the refuted row the feed did not reach. The
+/// healthy journal is the word (D7 not an input); a fault's next healthy pass re-takes the word with no lever; the
+/// lever's clear of a recorded stop does too. As built at `40fec4ce` the word was `state.is_some()` alone, so every
+/// stopped shape here skipped D7 for the stop's whole length. RED with that word: "unreadable envelope: the gate
+/// hands Arcade's listing back".
+#[tokio::test]
+async fn e620f_m3_a_stopped_or_faulting_feed_hands_arcades_listing_back_this_pass() {
+    const WORD: &str = "not an input: the chain-event feed is the reorg word this pass (bsv-low #620)";
+    let txs = MemoryTxStore::default();
+    let ladder = CourierStub::none();
+    /// D7's pass over `store`: the orphan event applied, the refuted row demoted.
+    async fn d7_demotes(
+        store: &MemoryPotStorage,
+        txs: &MemoryTxStore,
+        ladder: &CourierStub,
+        orphaned: &str,
+        what: &str,
+    ) {
+        let d7 = d7_pass(store, txs, &Roots::at(102), ladder).await;
+        assert_eq!(d7.applied, 1, "{what}: D7 ran and applied Arcade's orphan event: {d7:?}");
+        assert!(
+            !store.pot_beef_proof_verified(orphaned).await.unwrap(),
+            "{what}: D7 demoted the refuted row the feed did not reach"
+        );
+    }
+    let tracker = Roots::at(102);
+    // (1) an envelope the crate refuses, a reorg behind it: D7 is the input on every pass of the stop
+    let store = MemoryPotStorage::new();
+    let orphaned = confirmed_pot_with_stored_proof(&store, &pot(3), 101).await;
+    let feed = Journal::of(&[(41, TIP), (42, UNKNOWN_KIND), (43, REORG)]);
+    let row = Row::default();
+    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    assert_eq!(row.state().stop.as_ref().map(|x| x.cursor.as_str()), Some("42"), "the stop stays recorded");
+    assert!(s.unreadable && s.applied == 0, "{s:?}");
+    assert_eq!(
+        arcade_not_an_input(Some(&s)),
+        None,
+        "unreadable envelope: the gate hands Arcade's listing back: {s:?}"
+    );
+    assert!(store.pot_beef_proof_verified(&orphaned).await.unwrap(), "the feed did not reach the reorg");
+    d7_demotes(&store, &txs, &ladder, &orphaned, "unreadable envelope").await;
+    let again = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
+    assert_eq!(arcade_not_an_input(Some(&again)), None, "the stop stands: D7 is the input again: {again:?}");
+    // the lever clears the stop: the next pass consumes the reorg and the feed is the word again
+    assert_eq!(lever(&row, true, br#"{"cursor":"42"}"#, 2).await.status, 200);
+    let on = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
+    assert_eq!((on.applied, arcade_not_an_input(Some(&on))), (1, Some(WORD)), "{on:?}");
+    // (2) a 409 cursorAhead: a recorded stop; D7 is the input
+    let store = MemoryPotStorage::new();
+    let orphaned = confirmed_pot_with_stored_proof(&store, &pot(3), 101).await;
+    let feed = Journal::of(&[(41, TIP)]);
+    let row = Row::default();
+    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("999".into())).await;
+    assert!(s.cursor_ahead, "{s:?}");
+    assert_eq!(arcade_not_an_input(Some(&s)), None, "409: the gate hands Arcade's listing back");
+    d7_demotes(&store, &txs, &ladder, &orphaned, "409").await;
+    // (3) a fault of THIS pass (the binding's transport, a page that does not read, an HTTP status): no stop recorded,
+    // D7 is the input this pass, and the next healthy pass re-takes the word with no lever
+    let faults: [(&str, PageAnswer); 3] = [
+        ("transport fault", Err("CHAINTRACKS binding: connection refused".into())),
+        ("unparseable page", Ok((200, b"not a page".to_vec()))),
+        ("HTTP 503", Ok((503, Vec::new()))),
+    ];
+    for (what, answer) in faults {
+        let store = MemoryPotStorage::new();
+        let orphaned = confirmed_pot_with_stored_proof(&store, &pot(3), 101).await;
+        let feed = Journal::of(&[(41, TIP)]);
+        let row = Row::default();
+        let seeded =
+            pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+        assert_eq!(arcade_not_an_input(Some(&seeded)), Some(WORD), "{what}: a live feed is the word: {seeded:?}");
+        *feed.answer.borrow_mut() = Some(answer);
+        let down = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
+        assert_eq!((down.faults, row.state().stop), (1, None), "{what}: a fault, not a recorded stop: {down:?}");
+        assert_eq!(arcade_not_an_input(Some(&down)), None, "{what}: the gate hands Arcade's listing back");
+        d7_demotes(&store, &txs, &ladder, &orphaned, what).await;
+        *feed.answer.borrow_mut() = None;
+        let back = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
+        assert!(
+            back.idle && arcade_not_an_input(Some(&back)) == Some(WORD),
+            "{what}: the next healthy pass re-takes the word, no lever: {back:?}"
+        );
+    }
+    // (4) a leg's read fault (the header source unreadable while judging): a fault of this pass too
+    let store = MemoryPotStorage::new();
+    let _spender = confirmed_pot_with_stored_proof(&store, &pot(9), 101).await;
+    let feed = Journal::of(&[(41, REORG)]);
+    let row = Row::default();
+    let s = pass(&feed, &row, &store, &txs, &FaultyTracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    assert_eq!(s.faults, 1, "{s:?}");
+    assert_eq!(arcade_not_an_input(Some(&s)), None, "a leg's read fault: D7 is the input this pass");
+    // (5) no feed pass at all (the block-event pass with no D1 handle): D7 runs
+    assert_eq!(arcade_not_an_input(None), None);
+    // (6) the healthy journal (pin a's) is the word; an unconfigured feed is not
+    let store = MemoryPotStorage::new();
+    let feed = Journal::of(&[(41, FORK), (42, REORG), (43, TIP), (44, TIP_AGE)]);
+    let row = Row::default();
+    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    assert_eq!((s.applied, arcade_not_an_input(Some(&s))), (2, Some(WORD)), "{s:?}");
+    let s = pass(&feed, &Row::default(), &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
+    assert!(s.unconfigured && arcade_not_an_input(Some(&s)).is_none());
 }

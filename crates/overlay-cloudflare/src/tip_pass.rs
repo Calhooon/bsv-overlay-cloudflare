@@ -225,7 +225,9 @@ pub async fn internal_tip_changed(
     // seeds it from its corroboration header read and the sweep reuses it.
     let mut memo = crate::reorg_sweep::RootMemo::default();
     // bsv-low #620 (L4): chaintracks' typed chain-event feed first, on its own durable cursor (`chain_feed`); Arcade's
-    // orphan listing is an input only where the feed is not live on this deployment (`is_reorg_word`).
+    // orphan listing is an input only where the feed is not live on this deployment THIS PASS (a recorded stop or a
+    // fault hands it back: `chain_feed::arcade_not_an_input`, the one gate the cron reads too; the W15E-L4 lens
+    // fold's MEDIUM-3).
     let feed = match ops_db {
         Some(db) => Some(
             crate::chain_feed::run_chain_feed_pass(
@@ -240,14 +242,9 @@ pub async fn internal_tip_changed(
         ),
         None => None,
     };
-    let arcade = if feed
-        .as_ref()
-        .is_some_and(crate::chain_feed::FeedPassSummary::is_reorg_word)
-    {
+    let arcade = if let Some(why) = crate::chain_feed::arcade_not_an_input(feed.as_ref()) {
         crate::arcade_reorg::ArcadePassSummary {
-            stopped: Some(
-                "not an input: the chain-event feed is the reorg word (bsv-low #620)".into(),
-            ),
+            stopped: Some(why.into()),
             ..Default::default()
         }
     } else {

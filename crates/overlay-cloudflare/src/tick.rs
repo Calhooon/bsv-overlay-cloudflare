@@ -582,8 +582,10 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // demotes is re-chased in this same tick. Bounded on its own budget.
     // bsv-low #620 (L4): chaintracks' typed chain-event feed is the reorg word (`chain_feed`, its own durable cursor;
     // the reorg family's D1 label), run first; Arcade's orphan listing is an input only where the feed is not live
-    // on this deployment (no row and no start cursor, or its row did not read): `POST /internal/arcade-reorg` still
-    // runs a pass on demand, and its counters and `/health/invariants.arcadeReorg` stay.
+    // on this deployment THIS PASS (no row and no start cursor, its row did not read, a recorded stop, a fault of
+    // the pass: `chain_feed::arcade_not_an_input`, the one gate both passes read; the W15E-L4 lens fold's MEDIUM-3,
+    // Rule 6): `POST /internal/arcade-reorg` still runs a pass on demand, and its counters and
+    // `/health/invariants.arcadeReorg` stay.
     crate::d1_ledger::label("arcade_reorg");
     let mut reorg_memo = crate::reorg_sweep::RootMemo::default();
     let feed = crate::chain_feed::run_chain_feed_pass(
@@ -595,10 +597,8 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         &mut reorg_memo,
     )
     .await;
-    if feed.is_reorg_word() {
-        worker::console_log!(
-            "[arcade-reorg] (cron) not an input: the chain-event feed is the reorg word (bsv-low #620)"
-        );
+    if let Some(why) = crate::chain_feed::arcade_not_an_input(Some(&feed)) {
+        worker::console_log!("[arcade-reorg] (cron) {why}");
     } else {
         let _arcade = crate::tip_pass::run_arcade_reorg_pass(
             env,

@@ -401,11 +401,22 @@ pub struct FeedPassSummary {
 }
 
 impl FeedPassSummary {
-    /// bsv-low #620 (c): the feed is the reorg word on this deployment when this pass read (or seeded) its row: Arcade's
-    /// orphan listing is then no INPUT of the scheduled and block-event passes. Unconfigured (no row, no start cursor),
-    /// no header source, or a row that did not read: false, and the caller runs D7's consumer as before.
+    /// bsv-low #620 (c): the feed is the reorg word on this deployment when THIS PASS was LIVE: its row read (or was
+    /// seeded) AND the pass ended with no recorded stop on the row (an envelope the crate refuses, a 409 `cursorAhead`)
+    /// and no fault of the pass (the feed's transport, a page that did not read, an HTTP status, a tip read for an
+    /// invalidation, a leg's read fault). Arcade's orphan listing is then no INPUT of the scheduled and block-event
+    /// passes ([`arcade_not_an_input`]). Unconfigured (no row, no start cursor), no header source, a row that did not
+    /// read, a stop or a fault: false, and the caller runs D7's consumer as before this module, for that pass; the stop
+    /// stays recorded and served, and a healthy pass (after the operator's lever clears a recorded stop) re-takes the
+    /// word. The W15E-L4 lens fold, MEDIUM-3 (Rule 6: never a self-healing failure traded for a permanent one): as
+    /// built at `40fec4ce` the word was the row's presence alone, so a recorded stop, permanent by the producer's
+    /// contract, switched off the working fallback until the lever. The row's own write fault (`errors`) is not the
+    /// feed's: the rows the pass judged were judged, the cursor is redone next pass, and D7's cursor row shares the
+    /// store; a lost compare-and-set (`contended`) is another isolate running this very pass.
     pub fn is_reorg_word(&self) -> bool {
-        !self.unconfigured && self.state.is_some()
+        !self.unconfigured
+            && self.faults == 0
+            && self.state.as_ref().is_some_and(|st| st.stop.is_none())
     }
 
     /// Confirmed rows whose anchor moved without a demotion.
@@ -501,6 +512,15 @@ impl FeedPassSummary {
         );
         out
     }
+}
+
+/// bsv-low #620 (c), THE GATE both passes read (the cron's `tick.rs`, the block-event pass's `tip_pass.rs`; one
+/// function, the W15E-L4 lens fold's MEDIUM-3): what to do with Arcade's orphan listing (register row D7) after the
+/// feed's pass. `None`: the listing is an INPUT this pass and D7's consumer runs (the feed was not the reorg word this
+/// pass, or did not run at all). `Some(why)`: not an input (the feed was the reorg word this pass).
+pub fn arcade_not_an_input(feed: Option<&FeedPassSummary>) -> Option<&'static str> {
+    feed.is_some_and(FeedPassSummary::is_reorg_word)
+        .then_some("not an input: the chain-event feed is the reorg word this pass (bsv-low #620)")
 }
 
 struct Page {
