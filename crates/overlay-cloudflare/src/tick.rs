@@ -783,6 +783,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         woc_key.as_deref(),
         crate::proof_fetcher::ProofSources::from_env(env),
         crate::lookup_service_chain_tracker(env),
+        Some(courier_counts.clone()),
     )
     .await;
     worker::console_log!(
@@ -815,8 +816,12 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         taal_key.as_deref(),
         None,
         crate::proof_fetcher::ProofSources::from_env(env),
+        Some(&courier_counts),
     )
         .await;
+    // bsv-low #834 (FIX-834-MERGE): the retire, conflict and rebroadcast passes ask through the pass's pacer after its
+    // first flush above; their counts ride this second flush (an empty take writes nothing).
+    courier_counts.flush(&ops_db).await;
     worker::console_log!(
         "Scheduled: rebroadcast-backstop (transactions) ; scanned={} present={} \
          inconclusive={} rebroadcast={} failed={} budget_skipped={} attempted={}",

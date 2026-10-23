@@ -391,3 +391,104 @@ async fn fix834_g_only_the_janitors_pass_is_paced() {
         );
     }
 }
+
+/// FIX-834-MERGE (the merged main's budget tier, `janitor-pass-woc-429` RED on `45b83a32`: the stand-in saw WoC 6 and
+/// Bitails 24 where the pass's pacer let 3 and 3 go). The caller outside the pacer was the #602 CONFLICT PASS inside
+/// the retire pass (`admit_fast::confirmed_conflict_pass`): its own 24-call fetcher and its presence reads carried no
+/// counters, so once #837's JOINs gave it inputs to read its own circuit asked a WoC the pass had backed off three
+/// more times and pruned Bitails on every candidate. Now the pass's fetcher (`admit_fast::conflict_pass_fetcher`) and
+/// its presence (`CourierConflictPresence::counters`) ride the janitor pass's ONE pacer, as the retire pass's own
+/// looks do. RED with `conflict_pass_fetcher` building the base's unpaced fetcher (counters ignored): "every
+/// subrequest of the pass is one the pacer let go ... left: 37, right: 26" (WoC 3 and Bitails 8 past the pacer).
+#[tokio::test]
+async fn fix834m_a_the_conflict_pass_asks_through_the_janitor_pacer() {
+    use crate::admit_fast::ConflictPresence;
+    reset();
+    for n in 1..=20 {
+        loop44_outpoint(&outpoint(n));
+    }
+    let counts = CourierCounters::paced(Reader::Janitor, T0);
+    // The tick's spend chaser first (it backs WoC off at its third 429), then the retire pass's conflict pass.
+    let chaser = fetcher(&counts);
+    for n in 1..=12 {
+        assert!(chaser.resolve_spender(&outpoint(n), 0).await.is_err());
+    }
+    let sources = ProofSources::parse("woc,bananablocks,bitails");
+    let conflict = crate::admit_fast::conflict_pass_fetcher(sources, None, Some(counts.clone()));
+    for n in 13..=20 {
+        // one clean "unspent", a skipped WoC and a "could not look" decide nothing: a negative needs a second provider
+        assert!(conflict.resolve_spender(&outpoint(n), 0).await.is_err());
+    }
+    assert_eq!(calls(), 26, "every subrequest of the pass is one the pacer let go (WoC 3, Bitails 3, BananaBlocks 20)");
+    let view = counts.pacing_view();
+    assert_eq!(view["woc"]["asked"], 3, "the conflict pass asks a backed-off WoC: {view}");
+    assert_eq!(view["bitails"]["asked"], 3, "pruned Bitails skipped by construction over both: {view}");
+    assert_eq!(view["bananablocks"]["asked"], 20, "the healthy rung takes every ask: {view}");
+
+    // The conflict pass's presence reads: WoC backed off is not asked; Bitails' presence is its own rung (the proof
+    // ladder's could-not-look cap does not blind the both-indexer reading the verdicts take), still paced.
+    let presence = crate::admit_fast::CourierConflictPresence {
+        sources,
+        woc_api_key: None,
+        counters: Some(counts.clone()),
+    };
+    TEST_HTTP_CALLS.with(|c| c.set(0));
+    let _ = presence.presence(&outpoint(1)).await;
+    assert_eq!(calls(), 1, "Bitails asked, WoC skipped");
+    let view = counts.pacing_view();
+    assert_eq!(view["woc"]["asked"], 3, "{view}");
+    assert_eq!(view["bitails"]["asked"], 4, "{view}");
+
+    // The retire pass's own looks take the same pacer: WoC's presence skipped, Arcade's look paced and counted.
+    TEST_HTTP_CALLS.with(|c| c.set(0));
+    assert!(sources.woc_presence_counted(None, &outpoint(2), Some(&counts)).await.is_none());
+    assert_eq!(calls(), 0, "a backed-off WoC presence read makes no subrequest");
+    let arcade = "https://arcade.example";
+    answer(format!("{arcade}/tx/{}", outpoint(2)), 404, "not found");
+    let look = ProofSources::parse("arcade")
+        .arcade_look_counted(arcade, &outpoint(2), None, Some(&counts))
+        .await;
+    assert_eq!(look, ArcadeLook::Missing);
+    assert_eq!(counts.pacing_view()["arcade"]["asked"], 1);
+    assert_eq!(counts.take()["courier_janitor_arcade_notfound_total"], 1);
+}
+
+/// FIX-834-MERGE (structural): every courier look of the janitor's retire pass is wired to the pass's counters, at
+/// both entrances (the scheduled tick and `/admin/complete-proofs`), and the rebroadcast backstop's too; the
+/// operator's `/internal/retire-pass` lever alone runs unpaced. RED on `45b83a32` (no counters argument).
+#[test]
+fn fix834m_b_the_retire_pass_and_its_callers_carry_the_pacer() {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let proof = squash(include_str!("../proof_fetcher.rs"));
+    let pass = &proof[proof.find("pub(crate)asyncfnrun_retire_pass(").expect("the pass")..];
+    let pass = &pass[..pass.find("letmutsummary=RetireSummary").expect("its head")];
+    assert!(pass.contains("counters:Option<CourierCounters>,"), "{pass}");
+    assert!(pass.contains("counters:counters.clone(),"), "the retire port");
+    assert!(
+        pass.contains("crate::admit_fast::confirmed_conflict_pass(db,woc_api_key,sources,counters).await;"),
+        "the conflict pass"
+    );
+    let port = &proof[proof.find("implRetirePortforWorkerRetire<'_>{").expect("the port")..];
+    let port = &port[..port.find("asyncfnlatch(").expect("its looks")];
+    for look in [
+        ".arcade_look_counted(self.arcade_base,txid,evidence,self.counters.as_ref())",
+        ".bitails_presence_counted(txid,self.counters.as_ref())",
+        ".woc_presence_counted(self.woc_api_key,txid,self.counters.as_ref())",
+    ] {
+        assert!(port.contains(look), "{look}");
+    }
+    let admit = squash(include_str!("../admit_fast.rs"));
+    assert!(admit.contains("fetcher:conflict_pass_fetcher(sources,woc_api_key,counters.clone()),"));
+    let callers = squash(include_str!("../lib.rs")) + &squash(include_str!("../tick.rs"));
+    assert_eq!(
+        callers.matches("crate::lookup_service_chain_tracker(env),Some(courier_counts.clone()),).await;").count(),
+        2,
+        "both janitor entrances pace the retire pass"
+    );
+    assert_eq!(
+        callers.matches("crate::proof_fetcher::ProofSources::from_env(env),Some(&courier_counts),)").count(),
+        2,
+        "both janitor entrances pace the rebroadcast backstop"
+    );
+    assert!(proof.contains("crate::lookup_service_chain_tracker(env),None,),).await;"), "the lever runs unpaced");
+}

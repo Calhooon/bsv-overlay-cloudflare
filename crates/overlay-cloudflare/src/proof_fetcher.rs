@@ -195,10 +195,13 @@ impl ProofSources {
         if !self.permits("bitails") {
             return None;
         }
+        // bsv-low #834 (FIX-834-MERGE): its own rung, so the proof ladder's pruned-Bitails cap (keyed by rung) never
+        // blinds a presence question the retire and rebroadcast verdicts read; the provider's budget, back-off and
+        // cool-down are still the pass's one pacer.
         presence_counted(
             &format!("{DEFAULT_BITAILS_BASE}/tx/{txid}"),
             None,
-            "bitails",
+            "bitails_presence",
             counters,
         )
         .await
@@ -222,7 +225,7 @@ impl ProofSources {
         presence_counted(
             &format!("{DEFAULT_WOC_BASE}/tx/hash/{txid}"),
             key.map(|k| ("woc-api-key", k)),
-            "woc",
+            "woc_presence",
             counters,
         )
         .await
@@ -233,10 +236,21 @@ impl ProofSources {
         txid: &str,
         evidence: Option<(String, String)>,
     ) -> ArcadeLook {
+        self.arcade_look_counted(base, txid, evidence, None).await
+    }
+    /// bsv-low #834 (FIX-834-MERGE): Arcade's live look through the pass's pacer when one is given (a paced skip is a
+    /// `Fault`: no word, the both-indexer bar decides, the fail-safe direction).
+    pub(crate) async fn arcade_look_counted(
+        self,
+        base: &str,
+        txid: &str,
+        evidence: Option<(String, String)>,
+        counters: Option<&CourierCounters>,
+    ) -> ArcadeLook {
         if !self.permits("arcade") {
             return ArcadeLook::Fault;
         }
-        arcade_look(base, txid, evidence).await
+        arcade_look_counted(base, txid, evidence, counters).await
     }
 }
 
@@ -4170,11 +4184,15 @@ async fn presence_counted(
 /// Fail-safe: probe faults and one-sided 404s act on nothing; a rebroadcast
 /// failure writes nothing and is retried on a later tick; a rebroadcast of
 /// a present tx (should the probes both lie) is idempotent.
-pub async fn rebroadcast_absent_admitted(
+///
+/// bsv-low #834 (FIX-834-MERGE): its presence probes go through the janitor pass's pacer (`counters`, the tick's
+/// and `/admin/complete-proofs`'): a skipped probe is no answer, so the candidate is inconclusive, never rebroadcast.
+pub(crate) async fn rebroadcast_absent_admitted(
     candidates: Vec<overlay_engine::storage::TransactionBeef>,
     taal_api_key: Option<&str>,
     woc_api_key: Option<&str>,
     sources: ProofSources,
+    counters: Option<&CourierCounters>,
 ) -> RebroadcastSummary {
     let mut summary = RebroadcastSummary {
         scanned: candidates.len(),
@@ -4188,12 +4206,12 @@ pub async fn rebroadcast_absent_admitted(
 
         // Presence probe: Bitails first (WoC is the free-tier-429 host — it
         // is only consulted when Bitails did not already prove presence).
-        let bitails = sources.bitails_presence(txid).await;
+        let bitails = sources.bitails_presence_counted(txid, counters).await;
         if bitails.is_some_and(presence_bool) {
             summary.present += 1;
             continue;
         }
-        let woc = sources.woc_presence(woc_api_key, txid).await;
+        let woc = sources.woc_presence_counted(woc_api_key, txid, counters).await;
         match classify_presence(bitails, woc) {
             NetworkPresence::Present { .. } => {
                 summary.present += 1;
@@ -4341,11 +4359,12 @@ pub fn rebroadcast_eligible(attempts: i64, last_ms: i64, now_ms: i64) -> bool {
 /// presence-probe/rebroadcast pass, then record every actual attempt. Both
 /// cron twins (the scheduled tick and `/admin/complete-proofs`) call this
 /// one wrapper so the bound cannot be bypassed by one of them drifting.
-pub async fn run_rebroadcast_backstop(
+pub(crate) async fn run_rebroadcast_backstop(
     storage: &crate::d1_storage::D1Storage,
     taal_api_key: Option<&str>,
     woc_api_key: Option<&str>,
     sources: ProofSources,
+    counters: Option<&CourierCounters>,
 ) -> RebroadcastSummary {
     let now = js_sys::Date::now() as i64;
     let page = match storage
@@ -4393,6 +4412,7 @@ pub async fn run_rebroadcast_backstop(
         taal_api_key,
         woc_api_key,
         sources,
+        counters,
     )
     .await;
     for (txid, outcome) in &summary.attempted {
@@ -4538,13 +4558,18 @@ pub fn retire_verdict(
 /// finding MEDIUM, 2026-09-01). With the live GET first, a plant changes
 /// nothing while Arcade answers, and behind an Arcade outage the
 /// both-indexer absence bar still stands between it and a retire.
-pub(crate) async fn arcade_look(
+///
+/// bsv-low #834 (FIX-834-MERGE): through the pass's courier counters when given (the retire pass's Arcade look is
+/// paced and counted with the janitor's other asks); `None` is the unpaced, uncounted look.
+pub(crate) async fn arcade_look_counted(
     arcade_base: &str,
     txid: &str,
     webhook_evidence: Option<(String, String)>,
+    counters: Option<&CourierCounters>,
 ) -> ArcadeLook {
     let url = format!("{}/tx/{}", arcade_base.trim_end_matches('/'), txid);
-    let live = match http_get(&url, None).await {
+    let (response, mut observation) = http_get_counted(&url, None, counters, "arcade").await;
+    let (live, outcome) = match response {
         Ok((status, body)) if (200..300).contains(&status) => {
             #[derive(serde::Deserialize)]
             struct Look {
@@ -4554,13 +4579,15 @@ pub(crate) async fn arcade_look(
                 extra_info: String,
             }
             match serde_json::from_str::<Look>(&body) {
-                Ok(l) => live_arcade_look(&l.tx_status, l.extra_info),
-                _ => ArcadeLook::Fault,
+                Ok(l) => (live_arcade_look(&l.tx_status, l.extra_info), CourierOutcome::Ok),
+                _ => (ArcadeLook::Fault, CourierOutcome::Shape),
             }
         }
-        Ok((404, _)) => ArcadeLook::Missing,
-        _ => ArcadeLook::Fault,
+        Ok((404, _)) => (ArcadeLook::Missing, CourierOutcome::NotFound),
+        Ok((status, _)) => (ArcadeLook::Fault, CourierOutcome::response(status, false, false)),
+        Err(_) => (ArcadeLook::Fault, CourierOutcome::Fault),
     };
+    CourierAttempt::set(&mut observation, outcome);
     fold_arcade_look(live, webhook_evidence)
 }
 
@@ -5438,22 +5465,29 @@ struct WorkerRetire<'a> {
     sources: ProofSources,
     /// bsv-low #836 fold: the chaintracks tip a non-final word's hold is bounded by.
     tracker: Option<Rc<dyn ChainTracker>>,
+    /// bsv-low #834 (FIX-834-MERGE): the janitor pass's paced courier counters (`None` for the operator's lever):
+    /// every courier look of the retire pass goes through the pass's one pacer.
+    counters: Option<CourierCounters>,
 }
 
 impl RetirePort for WorkerRetire<'_> {
     async fn arcade(&self, txid: &str, evidence: Option<(String, String)>) -> ArcadeLook {
         self.sources
-            .arcade_look(self.arcade_base, txid, evidence)
+            .arcade_look_counted(self.arcade_base, txid, evidence, self.counters.as_ref())
             .await
     }
     async fn lock_bound(&self, txid: &str) -> crate::door_words::LockBound {
         crate::admit_fast::stored_lock_bound(self.tracker.as_deref(), self.db, txid).await
     }
     async fn bitails(&self, txid: &str) -> Option<NetworkPresence> {
-        self.sources.bitails_presence(txid).await
+        self.sources
+            .bitails_presence_counted(txid, self.counters.as_ref())
+            .await
     }
     async fn woc(&self, txid: &str) -> Option<NetworkPresence> {
-        self.sources.woc_presence(self.woc_api_key, txid).await
+        self.sources
+            .woc_presence_counted(self.woc_api_key, txid, self.counters.as_ref())
+            .await
     }
     async fn latch(
         &self,
@@ -5604,12 +5638,13 @@ impl RetirePort for WorkerRetire<'_> {
 /// later pass and counted (`retire_end_deferred_total`). Stated: the conflict pass's own cost (its eight evictions
 /// at most) is spent first and is not deferred by this budget; the arms come before the backlog, so a tick whose
 /// arms spend the budget leaves the backlog's page for a later one.
-pub async fn run_retire_pass(
+pub(crate) async fn run_retire_pass(
     db: &worker::D1Database,
     arcade_base: &str,
     woc_api_key: Option<&str>,
     sources: ProofSources,
     tracker: Option<Rc<dyn ChainTracker>>,
+    counters: Option<CourierCounters>,
 ) -> RetireSummary {
     use crate::d1::Query;
     let port = WorkerRetire {
@@ -5618,9 +5653,10 @@ pub async fn run_retire_pass(
         woc_api_key,
         sources,
         tracker,
+        counters: counters.clone(),
     };
     let budget = RetireBudget::begin(&port);
-    let conflict = crate::admit_fast::confirmed_conflict_pass(db, woc_api_key, sources).await;
+    let conflict = crate::admit_fast::confirmed_conflict_pass(db, woc_api_key, sources, counters).await;
     let mut summary = RetireSummary {
         conflict,
         ..RetireSummary::default()
@@ -5740,6 +5776,8 @@ pub async fn internal_retire_pass(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| crate::broadcaster::ARCADE_DEFAULT_URL.to_string());
     let woc_key = env.secret("WOC_API_KEY").ok().map(|k| k.to_string());
+    // bsv-low #834 (FIX-834-MERGE): the operator's lever is no janitor pass and runs unpaced (`None`), as the door
+    // does: its courier looks never touch the isolate's janitor cool-down.
     let (summary, by_pass) = crate::d1_ledger::passes(
         "retire",
         run_retire_pass(
@@ -5748,6 +5786,7 @@ pub async fn internal_retire_pass(
             woc_key.as_deref(),
             ProofSources::from_env(env),
             crate::lookup_service_chain_tracker(env),
+            None,
         ),
     )
     .await;
@@ -6858,7 +6897,7 @@ pub(crate) mod tests {
         // seam: the pass body names no eviction itself; the candidate step names it once, behind the pot_beefs arm.
         let src = include_str!("proof_fetcher.rs");
         let start = src
-            .find("pub async fn run_retire_pass(")
+            .find("pub(crate) async fn run_retire_pass(")
             .expect("the retire pass");
         let end = start + src[start..].find("\n}\n").expect("its end");
         let body = &src[start..end];

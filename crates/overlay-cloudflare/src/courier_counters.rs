@@ -66,8 +66,8 @@ const PROVIDERS: [&str; 4] = ["arcade", "bitails", "woc", "bananablocks"];
 pub(crate) fn provider(rung: &str) -> &'static str {
     match rung {
         "arcade" => "arcade",
-        "bitails" | "bitails_tx" | "bitails_history" => "bitails",
-        "woc" | "woc_history" => "woc",
+        "bitails" | "bitails_tx" | "bitails_history" | "bitails_presence" => "bitails",
+        "woc" | "woc_history" | "woc_presence" => "woc",
         "bananablocks" | "bananablocks_txo" => "bananablocks",
         _ => "other",
     }
