@@ -140,6 +140,8 @@ pub mod credit_beef;
 /// bsv-low #499: the D1 rows ledger, the overlay's own source compiled here (this crate does not link the overlay).
 #[path = "../../overlay-cloudflare/src/d1_ledger.rs"]
 pub mod d1_ledger;
+/// bsv-low #848 (FAST-C): the four funding-moment filings under one signature per key.
+pub mod handfile;
 pub mod hops_view;
 pub mod hopsweep;
 /// bsv-low #532: the identity views (names and pictures), a proxy to LOW's identity resolver.
@@ -155,8 +157,6 @@ pub mod pot_hook;
 pub mod proof_post;
 pub mod rate;
 pub mod record_post;
-/// bsv-low #848 (FAST-C): the four funding-moment filings under one signature per key.
-pub mod handfile;
 pub mod refund_backups;
 pub mod refund_view;
 pub mod results;
@@ -723,6 +723,6 @@ mod b_cost_1_wiring {
         assert_eq!(crate::d1_ledger::COST_WORKER, "low-app-layer");
     }
 }
-/// FAST-C-LENS (2026-10-23): the lens's negative cases over the handfile family; never shipped (a lens patch).
+/// FAST-C-LENS and FAST-C-FOLD: regression cases over the handfile family.
 #[cfg(test)]
 mod handfile_lens;
