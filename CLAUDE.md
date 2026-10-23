@@ -834,7 +834,7 @@ The pre-flight probe's stored SEEN (Arcade's `GET /tx`, the row's last transitio
 
 ## The reorg word is chaintracks' typed chain-event feed (bsv-low #620, the words map's L4; #777, #778)
 
-The overlay consumes the SAME feed the app layer's intake reads (#771): `GET /events?since=<cursor>` over the CHAINTRACKS binding (`chain_tracker::chaintracks_events_page`), on its OWN durable cursor (`chain_feed`, `overlay_chain_events`, migration 346, one versioned row written by compare-and-set, `chain_feed::STATE_WRITE`). Every envelope passes `bsv_tracker::decode_envelope`; one it refuses (an unknown kind or version, a malformed known shape, the feed's `unreadable`, the Go server's kindless shape) STOPS the pull at its cursor, recorded on the row, counted once (`overlay_chain_events_unreadable_total`). A 409 `cursorAhead` is a recorded stop at the stored cursor, never a reset to 0 (a replay re-judges the journal's bootstrap fork). A fresh row starts at the overlay's own `CHAIN_EVENTS_START_CURSOR` (the journal's head); unset, the feed reads nothing (`overlay_chain_events_unconfigured_total`). The operator's lever `GET`/`POST /internal/chain-events-cursor` (bearer `INTERNAL_TOKEN`) reads the row or sets the cursor; an event in hand is then released and RECORDED, never dropped.
+The overlay consumes the SAME feed the app layer's intake reads (#771): `GET /events?since=<cursor>` over the CHAINTRACKS binding (`chain_tracker::chaintracks_events_page`), on its OWN durable cursor (`chain_feed`, `overlay_chain_events`, migration 347, one versioned row written by compare-and-set, `chain_feed::STATE_WRITE`). Every envelope passes `bsv_tracker::decode_envelope`; one it refuses (an unknown kind or version, a malformed known shape, the feed's `unreadable`, the Go server's kindless shape) STOPS the pull at its cursor, recorded on the row, counted once (`overlay_chain_events_unreadable_total`). A 409 `cursorAhead` is a recorded stop at the stored cursor, never a reset to 0 (a replay re-judges the journal's bootstrap fork). A fresh row starts at the overlay's own `CHAIN_EVENTS_START_CURSOR` (the journal's head); unset, the feed reads nothing (`overlay_chain_events_unconfigured_total`). The operator's lever `GET`/`POST /internal/chain-events-cursor` (bearer `INTERNAL_TOKEN`) reads the row or sets the cursor; an event in hand is then released and RECORDED, never dropped.
 
 The reaction per kind (the crate's `on_chain` set, `chain_feed::selection`): a `reorg` from `forkHeight`, a `fork` from `height` and a `split` from `forkHeight` select the rows anchored in that height up to the highest the event names (deactivated headers, new tip, competing or witness tips); an `invalidated` names no height and its header is no longer served as active, so it selects the last 144 heights below chaintracks' tip (stated: deeper is the operator's `/internal/reorg`; the producer does not emit it live yet, CHAIN-EVENTS.md); `tip`, `tipAge`, `frozen`, `splitResolved` select nothing. The selected rows are judged by D7's judgement, now ONE function both consumers call (`arcade_reorg::judge_window_legs`): each confirmed spender by its OWN stored proof against the active root at its height (the root rule, never the hash), a refuted one re-anchored IN PLACE from a chaintracks-verified courier proof before any demotion, demoted only when none is served, bound to the judged height; the pots' own and the hop proofs unlatched when refuted. No corroboration is asked: the event is the header source's own word. Bounds: two feed pages a pass, `PassLimits` (two selecting events on the cron, one on the block-event pass; a leg page each; a window wider than a page held as `pending` with each leg's cursor), the D7 ladder's budget; a window faulting `fault_ceiling` (12) passes is released unresolved with its heal (`POST /internal/reorg {"fromHeight": lo, "toHeight": hi}`). The pass bumps `overlay_chain_events_*_total` and the R2 lifetime totals (`reorg_*`) and clears the app layer's confirmed probe memos on evidence (`hop_probe_memos::feed_pass_rejudged`), as D7's pass does. Served: `/health/invariants.chainFeed` (one statement more on that read).
 
@@ -882,6 +882,26 @@ fault and logged (`[conflict] <txid prefix>`). The race word applies
 to EVERY Arcade-terminal status, not only a conflict-shaped one: an aged,
 non-conflict REJECTED subject one node still holds is the 422.
 
+
+The one-time historical repair (bsv-low #607) runs from the scheduled tick and
+`POST /internal/repair-conflict-spenders` (empty body or `{}`, `INTERNAL_TOKEN`
+checked before any database setup). `conflict_repair::REPAIR_LIMIT` is 16
+ledger rows per pass, including unrelated reasons, with no courier requests.
+The pass uses at most 39 D1 calls including its counter batch, excluding schema
+boot and notification delivery; a finished pass uses one state read.
+Migration 346 adds `conflict_spender_repair`: the first pass freezes the
+ledger's highest rowid, each pass advances its cursor, and the final pass
+stamps `done_at`. A completed repair performs only its state read, including
+when called by the operator; there is no reset lever. Open conflict reasons
+with valid outpoint, competitor and positive height use #605's existing
+`record_conflict_spender`. Confirmed and foreign pointers are preserved;
+the repaired pointer stays unconfirmed until the chaser verifies its proof.
+A write fault leaves that row for retry. Four `conflict_spender_repair_*_total`
+counters (`scanned`, `repaired`, `skipped`, `faults`) are served from zero on
+`/health/invariants`; the lever returns those pass counts and `done`. Counts
+are best effort: a lost checkpoint may replay a page, and a lost counter
+flush may under-count. The owed judgement is unchanged. Pins: `e607` in
+`--test e602_convergence`.
 
 ## The conflict pass holds a void pot (bsv-low #825, B-FLEET-4, 2026-10-23)
 
@@ -2979,6 +2999,15 @@ answer), and a deferred owed walk's counts are flushed by its actor's isolate, n
 OFF (counters only, the owner's word). Pins: `cargo test --manifest-path workers/Cargo.toml -p low-app-layer
 --lib obs_` (`obs_625_*`, `obs_626_*`, `obs_628_*`, the identity pin in `identity::tests`) and `-p
 bsv-overlay-cloudflare --lib applayer_counters`.
+
+The scheduled drain's courier flush (bsv-low #658) retains its taken batch
+until every D1 result acknowledges success. A deadline during the flush or
+an unacknowledged write merges the batch with any newer increments and makes
+it eligible for the next take, even past the first four flushes. The take
+and write remain inside the drain's one deadline. A remote commit whose
+acknowledgement is lost can be counted twice on retry; an isolate recycle
+still loses its in-memory tail. This affects telemetry only. Pins: `e658`
+and the existing `e649f4_n9` pre-poll expiry pin in the app layer.
 
 ## The hot passes' D1 reads (bsv-low #643, #644, #645, W1.6)
 

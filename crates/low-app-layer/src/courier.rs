@@ -161,6 +161,8 @@ thread_local! {
     static FLUSHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// When the last flush went out (ms).
     static LAST_FLUSH_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    /// An unacknowledged drain batch is eligible for the next take even past the exact head.
+    static RETRY_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The isolate's first flushes go out at once (its first hand is counted exactly).
@@ -259,9 +261,10 @@ pub fn take_pending_if_due(now_ms: f64) -> Vec<(String, u64)> {
         now_ms,
         LAST_FLUSH_MS.with(std::cell::Cell::get),
     );
-    if !due {
+    if !due && !RETRY_PENDING.with(std::cell::Cell::get) {
         return Vec::new();
     }
+    RETRY_PENDING.with(|r| r.set(false));
     FLUSHES.with(|f| f.set(f.get() + 1));
     LAST_FLUSH_MS.with(|t| t.set(now_ms));
     PENDING_CALLS.with(|c| c.set(0));
@@ -271,17 +274,44 @@ pub fn take_pending_if_due(now_ms: f64) -> Vec<(String, u64)> {
         .collect()
 }
 
-/// E649 L4 N9: take the pending deltas when a flush is due and hand them to `flush`, both INSIDE the returned
-/// future, so a caller that races it against a deadline and never polls it (the deadline fell first) leaves the
-/// deltas queued for the next take. Taken outside the race, an expired drain emptied the map and dropped the vector.
+/// #658: retain a taken batch until the write acknowledges. Dropping the future during its
+/// flush merges the batch with newer increments and makes it eligible for the next take.
+/// A remote write can commit after cancellation, so this retry may over-count telemetry.
+struct UnacknowledgedBatch {
+    pending: Vec<(String, u64)>,
+    calls: u64,
+}
+
+impl Drop for UnacknowledgedBatch {
+    fn drop(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        PENDING.with(|p| {
+            let mut p = p.borrow_mut();
+            for (name, count) in self.pending.drain(..) {
+                *p.entry(name).or_insert(0) += count;
+            }
+        });
+        PENDING_CALLS.with(|c| c.set(c.get() + self.calls));
+        RETRY_PENDING.with(|r| r.set(true));
+    }
+}
+
+/// The take and flush both run inside the raced future. No poll leaves the counters queued;
+/// cancellation or a failed acknowledgement returns the taken batch for retry in this isolate.
 pub async fn take_and_flush<F, Fut>(now_ms: f64, flush: F)
 where
     F: FnOnce(Vec<(String, u64)>) -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: std::future::Future<Output = bool>,
 {
-    let pending = take_pending_if_due(now_ms);
-    if !pending.is_empty() {
-        flush(pending).await;
+    let calls = PENDING_CALLS.with(std::cell::Cell::get);
+    let mut batch = UnacknowledgedBatch {
+        pending: take_pending_if_due(now_ms),
+        calls,
+    };
+    if !batch.pending.is_empty() && flush(batch.pending.clone()).await {
+        batch.pending.clear();
     }
 }
 
@@ -289,7 +319,12 @@ where
 /// path (the caller runs it under `wait_until`); a failure is logged, never surfaced — a lost delta is a census
 /// under-count, not a wrong answer.
 pub async fn flush(db: Option<worker::D1Database>, pending: Vec<(String, u64)>) {
-    let Some(db) = db else { return };
+    flush_ack(db, pending).await;
+}
+
+/// Acknowledge only a fully prepared batch whose every D1 result succeeded.
+pub async fn flush_ack(db: Option<worker::D1Database>, pending: Vec<(String, u64)>) -> bool {
+    let Some(db) = db else { return false };
     let mut stmts = Vec::with_capacity(pending.len());
     for (name, delta) in &pending {
         match db.prepare(crate::beef_guard::BUMP_COUNTER_SQL).bind(&[
@@ -297,17 +332,27 @@ pub async fn flush(db: Option<worker::D1Database>, pending: Vec<(String, u64)>) 
             worker::wasm_bindgen::JsValue::from_f64(*delta as f64),
         ]) {
             Ok(s) => stmts.push(s),
-            Err(e) => worker::console_warn!("[courier] counter {name} bind failed: {e}"),
+            Err(e) => {
+                worker::console_warn!("[courier] counter {name} bind failed: {e}");
+                return false;
+            }
         }
     }
     if stmts.is_empty() {
-        return;
+        return true;
     }
-    if let Err(e) = crate::d1_ledger::counted_batch(&db, stmts).await {
-        worker::console_warn!(
-            "[courier] counter flush failed ({} rows): {e}",
-            pending.len()
-        );
+    match crate::d1_ledger::counted_batch(&db, stmts).await {
+        Ok(results) if results.len() == pending.len() && results.iter().all(|r| r.success()) => {
+            true
+        }
+        result => {
+            worker::console_warn!(
+                "[courier] counter flush unacknowledged ({} rows): {:?}",
+                pending.len(),
+                result.err()
+            );
+            false
+        }
     }
 }
 
@@ -342,6 +387,48 @@ pub fn health_json() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn e658_a_failed_flush_retries_immediately_past_the_exact_head() {
+        FLUSHES.with(|f| f.set(COURIER_FLUSH_EXACT_HEAD));
+        note_presence_n("e658_retry_total", 7);
+        take_and_flush(COURIER_FLUSH_INTERVAL_MS, |_| async {
+            note_presence_n("e658_retry_total", 3);
+            false
+        })
+        .await;
+        assert_eq!(PENDING_CALLS.with(std::cell::Cell::get), 2);
+        let next = take_pending_if_due(COURIER_FLUSH_INTERVAL_MS + 1.0);
+        assert_eq!(next, vec![("e658_retry_total".to_string(), 10)]);
+        assert!(take_pending_if_due(COURIER_FLUSH_INTERVAL_MS + 2.0).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn e658_an_acknowledged_flush_keeps_only_newer_increments() {
+        note_presence_n("e658_ack_total", 7);
+        take_and_flush(0.0, |pending| async move {
+            assert_eq!(pending, vec![("e658_ack_total".to_string(), 7)]);
+            note_presence_n("e658_ack_total", 3);
+            true
+        })
+        .await;
+        assert_eq!(PENDING_CALLS.with(std::cell::Cell::get), 1);
+        assert_eq!(
+            take_pending_if_due(1.0),
+            vec![("e658_ack_total".to_string(), 3)]
+        );
+        assert!(take_pending_if_due(2.0).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn e658_a_missing_database_does_not_acknowledge_the_batch() {
+        note_presence("e658_no_db_total");
+        take_and_flush(0.0, |pending| flush_ack(None, pending)).await;
+        assert_eq!(
+            take_pending_if_due(1.0),
+            vec![("e658_no_db_total".to_string(), 1)]
+        );
+    }
 
     #[test]
     fn provider_is_read_off_the_host() {

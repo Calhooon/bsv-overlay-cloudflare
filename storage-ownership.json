@@ -1714,6 +1714,17 @@
    "why": "Memo maintenance only; never evidence for admission"
   },
   {
+   "name": "conflict_spender_repair",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "lost",
+   "never_wipe": true,
+   "holds": "the fixed ledger window, cursor and durable done stamp of the one-time #607 conflict-spender repair",
+   "why": "the completion stamp prevents a finished repair from ever scanning a later window; no deletion or reset is supported"
+  },
+  {
    "name": "conflict_fault_memo",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",

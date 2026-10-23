@@ -619,7 +619,7 @@ async fn e620_e_the_lever_sets_the_cursor_and_records_an_event_in_hand() {
     }
 }
 
-/// (f) THE ROW'S STATEMENTS under real SQLite with the production migrations: the table is migration 346; the first
+/// (f) THE ROW'S STATEMENTS under real SQLite with the production migrations: the table is migration 347; the first
 /// write inserts version 1 and answers it; a write against the version read replaces the document and answers the
 /// next; a write against a stale version, or a first write over a present row, answers no row and changes nothing.
 #[test]

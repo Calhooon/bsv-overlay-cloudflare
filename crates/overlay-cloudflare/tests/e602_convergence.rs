@@ -8,6 +8,28 @@ use overlay_engine::gasp::{AncestorFetcher, FetchedAncestor, GASPError};
 use rusqlite::{Connection, OptionalExtension};
 
 struct Sqlite(Connection);
+#[async_trait(?Send)]
+impl bsv_overlay_cloudflare::conflict_repair::RepairDb for Sqlite {
+    async fn repair_page(
+        &self,
+        after: i64,
+    ) -> Result<Vec<bsv_overlay_cloudflare::conflict_repair::Eviction>, String> {
+        use bsv_overlay_cloudflare::conflict_repair::{Eviction, PAGE_SQL};
+        let mut q = self.0.prepare(PAGE_SQL).map_err(|e| e.to_string())?;
+        let rows = q
+            .query_map([after], |r| {
+                Ok(Eviction {
+                    position: r.get(0)?,
+                    txid: r.get(1)?,
+                    reason: r.get(2)?,
+                    readmitted_at: r.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+}
 fn params(binds: Vec<QVal>) -> Vec<rusqlite::types::Value> {
     binds
         .into_iter()
@@ -572,4 +594,229 @@ async fn e649_m2_a_yielded_conflict_eviction_is_neither_logged_nor_counted() {
         (1, 0, 0),
         "a yielded eviction is scanned, never counted evicted"
     );
+}
+
+mod e607 {
+    use super::*;
+    use bsv_overlay_cloudflare::conflict_repair::*;
+
+    fn database() -> Sqlite {
+        let db = Sqlite(Connection::open_in_memory().unwrap());
+        for sql in OVERLAY_MIGRATIONS {
+            if let Err(e) = db.0.execute_batch(sql) {
+                assert!(e.to_string().contains("duplicate column"), "{e}");
+            }
+        }
+        db
+    }
+
+    fn released(db: &Sqlite, n: u32) -> (String, String, String) {
+        let hop = format!("{n:064x}");
+        let join = format!("{:064x}", 1_000 + n);
+        let competitor = format!("{:064x}", 2_000 + n);
+        db.0.execute("INSERT INTO pot_records(txid, outputIndex, spent, spentConfirmed, createdAt) VALUES (?, 0, 0, 0, 1)", [&hop]).unwrap();
+        db.0.execute(
+            "INSERT INTO pot_evictions(txid, reason, evictedAt) VALUES (?, ?, 1)",
+            rusqlite::params![
+                join,
+                conflict_eviction_reason(&hop, 0, &competitor, 970_710)
+            ],
+        )
+        .unwrap();
+        (hop, join, competitor)
+    }
+
+    fn pointer(db: &Sqlite, hop: &str) -> (i64, Option<String>, i64) {
+        db.0.query_row(
+            "SELECT spent, spendingTxid, spentConfirmed FROM pot_records WHERE txid = ?",
+            [hop],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn e607_pages_sixteen_and_permanently_stops_at_the_original_window() {
+        let db = database();
+        let rows: Vec<_> = (1..=33).map(|n| released(&db, n)).collect();
+        let first = repair_pass(&db, 10).await.unwrap();
+        assert_eq!((first.scanned, first.repaired, first.done), (16, 16, false));
+        let later = released(&db, 34);
+        let second = repair_pass(&db, 20).await.unwrap();
+        assert_eq!(
+            (second.scanned, second.repaired, second.done),
+            (16, 16, false)
+        );
+        let third = repair_pass(&db, 30).await.unwrap();
+        assert_eq!((third.scanned, third.repaired, third.done), (1, 1, true));
+        for (hop, _, competitor) in rows {
+            assert_eq!(pointer(&db, &hop), (1, Some(competitor), 0));
+        }
+        let changes = db.0.total_changes();
+        let again = repair_pass(&db, 40).await.unwrap();
+        assert_eq!((again.scanned, again.repaired, again.done), (0, 0, true));
+        assert_eq!(
+            db.0.total_changes(),
+            changes,
+            "the done stamp leaves even the cursor untouched"
+        );
+        assert_eq!(
+            pointer(&db, &later.0),
+            (0, None, 0),
+            "later evictions are outside the one-time window"
+        );
+        let done: i64 =
+            db.0.query_row("SELECT done_at FROM conflict_spender_repair", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(done, 30);
+    }
+
+    #[tokio::test]
+    async fn e607_only_open_valid_conflicts_move_unconfirmed_evicted_or_empty_pointers() {
+        let db = database();
+        let rows: Vec<_> = (1..=9).map(|n| released(&db, n)).collect();
+        db.0.execute(
+            "UPDATE pot_records SET spent = 1, spendingTxid = ? WHERE txid = ?",
+            rusqlite::params![rows[1].1, rows[1].0],
+        )
+        .unwrap();
+        db.0.execute(
+            "UPDATE pot_records SET spent = 1, spendingTxid = ?, spentConfirmed = 1 WHERE txid = ?",
+            rusqlite::params![rows[2].1, rows[2].0],
+        )
+        .unwrap();
+        let foreign = "ff".repeat(32);
+        db.0.execute(
+            "UPDATE pot_records SET spent = 1, spendingTxid = ? WHERE txid = ?",
+            rusqlite::params![foreign, rows[3].0],
+        )
+        .unwrap();
+        db.0.execute(
+            "UPDATE pot_evictions SET readmittedAt = 2 WHERE txid = ?",
+            [&rows[4].1],
+        )
+        .unwrap();
+        db.0.execute(
+            "UPDATE pot_evictions SET reason = ? WHERE txid = ?",
+            rusqlite::params![
+                conflict_eviction_reason(&rows[5].0, 0, &rows[5].2, 0),
+                rows[5].1
+            ],
+        )
+        .unwrap();
+        db.0.execute("DELETE FROM pot_records WHERE txid = ?", [&rows[6].0])
+            .unwrap();
+        db.0.execute(
+            "UPDATE pot_records SET spent = 1, spendingTxid = ? WHERE txid = ?",
+            rusqlite::params![rows[7].2, rows[7].0],
+        )
+        .unwrap();
+        db.0.execute(
+            "UPDATE pot_evictions SET reason = 'REJECTED' WHERE txid = ?",
+            [&rows[8].1],
+        )
+        .unwrap();
+        let summary = repair_pass(&db, 10).await.unwrap();
+        assert_eq!(
+            (
+                summary.scanned,
+                summary.repaired,
+                summary.skipped,
+                summary.done
+            ),
+            (9, 2, 7, true)
+        );
+        for row in &rows[..2] {
+            assert_eq!(pointer(&db, &row.0), (1, Some(row.2.clone()), 0));
+        }
+        assert_eq!(pointer(&db, &rows[2].0), (1, Some(rows[2].1.clone()), 1));
+        assert_eq!(pointer(&db, &rows[3].0), (1, Some(foreign), 0));
+        for n in [4, 5, 8] {
+            assert_eq!(pointer(&db, &rows[n].0), (0, None, 0));
+        }
+        assert!(
+            recorded_competitor(&conflict_eviction_reason("not-a-txid", 0, &rows[0].2, 1))
+                .is_none()
+        );
+        assert!(recorded_competitor(&format!(
+            "{} trailing",
+            conflict_eviction_reason(&rows[0].0, 0, &rows[0].2, 1)
+        ))
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn e607_a_write_fault_retries_the_failed_row_without_stamping_done() {
+        let db = database();
+        let first = released(&db, 1);
+        let second = released(&db, 2);
+        db.0.execute_batch(&format!("CREATE TRIGGER fail_repair BEFORE UPDATE ON pot_records WHEN OLD.txid = '{}' BEGIN SELECT RAISE(ABORT, 'injected write fault'); END", second.0)).unwrap();
+        let summary = repair_pass(&db, 10).await.unwrap();
+        assert_eq!(
+            (
+                summary.scanned,
+                summary.repaired,
+                summary.faults,
+                summary.done
+            ),
+            (2, 1, 1, false)
+        );
+        assert_eq!(db.query_i64(STATE_SQL, vec![]).await.unwrap(), Some(1));
+        assert_eq!(pointer(&db, &first.0), (1, Some(first.2), 0));
+        assert_eq!(pointer(&db, &second.0), (0, None, 0));
+        db.0.execute_batch("DROP TRIGGER fail_repair").unwrap();
+        let retry = repair_pass(&db, 20).await.unwrap();
+        assert_eq!(
+            (retry.scanned, retry.repaired, retry.faults, retry.done),
+            (1, 1, 0, true)
+        );
+        assert_eq!(pointer(&db, &second.0), (1, Some(second.2), 0));
+    }
+
+    #[test]
+    fn e607_append_only_migration_and_the_page_uses_the_rowid_range() {
+        assert_eq!(OVERLAY_MIGRATIONS.len(), 346);
+        assert_eq!(OVERLAY_MIGRATIONS[345], REPAIR_CREATE);
+        let db = database();
+        db.0.execute_batch(REPAIR_CREATE).unwrap();
+        let plan: Vec<String> =
+            db.0.prepare(&format!("EXPLAIN QUERY PLAN {PAGE_SQL}"))
+                .unwrap()
+                .query_map([0], |r| r.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        assert!(
+            plan.iter().any(|s| s
+                .contains("SEARCH pot_evictions USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|s| s.contains("SCAN pot_evictions")),
+            "{plan:?}"
+        );
+        assert_eq!(REPAIR_LIMIT, 16);
+    }
+
+    #[test]
+    fn e607_the_operator_authenticates_before_any_database_setup_and_the_tick_runs_it() {
+        let lib = include_str!("../src/lib.rs");
+        let dispatch = &lib[lib.find("async fn dispatch(").unwrap()..];
+        let route = dispatch
+            .find("crate::conflict_repair::internal_repair(")
+            .unwrap();
+        assert!(route < dispatch.find("env.d1(").unwrap());
+        let source = include_str!("../src/conflict_repair.rs");
+        let route = &source[source.find("pub async fn internal_repair(").unwrap()..];
+        assert!(route.find("bearer_ok(").unwrap() < route.find("req.bytes()").unwrap());
+        assert!(route.find("bearer_ok(").unwrap() < route.find("env.d1(").unwrap());
+        assert!(route.contains(r#"Response::error("unauthorized", 401)"#));
+        assert!(include_str!("../src/tick.rs")
+            .contains("crate::conflict_repair::run_counted(&ops_db).await"));
+        assert!(
+            include_str!("../src/ops.rs").contains("for name in crate::conflict_repair::COUNTERS")
+        );
+    }
 }

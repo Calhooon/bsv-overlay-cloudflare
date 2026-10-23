@@ -25,6 +25,7 @@ pub mod chain_tracker;
 pub mod concurrent;
 pub mod change_flush;
 pub mod change_park;
+pub mod conflict_repair;
 pub mod d1;
 pub mod d1_discovery;
 pub mod d1_ledger;
@@ -285,6 +286,11 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
     // (the default wasm behaviour). `set_once` makes re-calls across
     // request invocations cheap. Same pattern as `bsv-middleware-cloudflare`.
     bsv_middleware_cloudflare::init_panic_hook();
+
+    // #607: authenticate the operator before shared database setup or any ledger read.
+    if req.method() == Method::Post && req.path() == "/internal/repair-conflict-spenders" {
+        return crate::conflict_repair::internal_repair(req, &env, &ctx).await;
+    }
 
     // bsv-low #635 (B-COST-1): this request counted in the isolate's cost window; the window written so far goes to
     // `worker_cost_daily` after the answer when it is due (one upsert per 64 requests or 60 s, never per request).
