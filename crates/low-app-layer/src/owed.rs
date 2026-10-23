@@ -9718,6 +9718,233 @@ pub(crate) mod tests {
         );
     }
 
+    /// bsv-low #598 (the B-OWED-2 lens's HIGH-1): the word events of the pot's own txid as this tip PRODUCES them,
+    /// stored through the shipped [`crate::tracker_host::stored::UPSERT`] under real SQLite and read back as the
+    /// recompute reads them (`tx_words.*`, [`crate::tracker_host::stored::Row::rechecked`]): the overlay's `seen`
+    /// event (the latch), then each `callback` event with Arcade's live body `bodies[i]` (the producer's own
+    /// `Verdict::from_arc_body`, `into_hint`, `terminal_word`, the step, `stored::project` and `mark_terminal`).
+    pub(crate) fn produced_word_views(
+        txid: &str,
+        bodies: &[&str],
+    ) -> std::collections::BTreeMap<String, Value> {
+        use crate::tracker_host::{runtime, stored, HeaderSnapshot};
+        let empty = || HeaderSnapshot {
+            tip: Ok(0),
+            headers: Default::default(),
+        };
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(stored::CREATE).unwrap();
+        let read = |db: &rusqlite::Connection| -> Option<stored::Row> {
+            db.query_row(
+                "SELECT tx_words.* FROM tx_words WHERE txid = ?1",
+                [txid],
+                |r| {
+                    Ok(stored::Row {
+                        txid: r.get("txid")?,
+                        word: r.get("word")?,
+                        tier: r.get("tier")?,
+                        height: r.get("height")?,
+                        proof_root: r.get("proof_root")?,
+                        proof_height: r.get("proof_height")?,
+                        proof_hex: r.get("proof_hex")?,
+                        header_hash: r.get("header_hash")?,
+                        hint_source: r.get("hint_source")?,
+                        hint_at: r.get("hint_at")?,
+                        updated_at: r.get("updated_at")?,
+                        legacy_body: r.get("legacy_body")?,
+                    })
+                },
+            )
+            .ok()
+        };
+        let write = |db: &rusqlite::Connection, row: &stored::Row| {
+            let binds: Vec<rusqlite::types::Value> = stored::upsert_binds(row)
+                .into_iter()
+                .map(|v| match v {
+                    Value::String(s) => rusqlite::types::Value::Text(s),
+                    Value::Number(n) => rusqlite::types::Value::Real(n.as_f64().unwrap()),
+                    _ => rusqlite::types::Value::Null,
+                })
+                .collect();
+            db.execute(stored::UPSERT, rusqlite::params_from_iter(binds))
+                .unwrap();
+        };
+        let params = bsv_tracker::Params { age_threshold: 60 };
+        let mut now = 1_000;
+        // the overlay's `seen` event: the latch's broadcaster
+        let mut state = stored::seed_hint(None, txid);
+        runtime::event_hints(&mut state, "seen", true, None, now);
+        let mut row = stored::project(None, &state, now, None);
+        runtime::mark_terminal(&mut row, None, None);
+        write(&db, &row);
+        for body in bodies {
+            now += 60;
+            let old = read(&db);
+            let mut state = stored::seed_hint(old.as_ref(), txid);
+            runtime::event_hints(&mut state, "callback", true, None, now);
+            let v = bsv_tracker::Verdict::from_arc_body(txid, body.as_bytes()).unwrap();
+            let hint = v.into_hint("arcade", now);
+            let terminal = runtime::terminal_word(&hint);
+            state
+                .step(&params, &empty(), bsv_tracker::Input::Hint(hint))
+                .unwrap();
+            let mut row = stored::project(old.as_ref(), &state, now, None);
+            runtime::mark_terminal(&mut row, old.as_ref(), terminal);
+            write(&db, &row);
+        }
+        let row = read(&db).unwrap();
+        [(txid.to_string(), row.rechecked(&empty()).unwrap())]
+            .into_iter()
+            .collect()
+    }
+
+    /// bsv-low #598 (the B-OWED-2 lens's HIGH-1, loop 22's p27/p28 shape): a SEEN-latched JOIN that Arcade then
+    /// answers REJECTED (or a double spend) on its callback, its word stored as this tip's producer stores it, takes
+    /// FIX-831's judgement through the real derivation (`unbound`, `funding-not-held`, `fundingHeld: refused`,
+    /// `fundingWord` the hint's refusal); a later SEEN callback does not lift it; a SEEN-only history, or a pot the
+    /// index proved, keeps `present-refund`. RED on bca99893's reading (the chain word alone, the mark unread): the
+    /// produced word is `seen`, the row `refund-due`, `present-refund`, claimable.
+    #[test]
+    fn fix598f_h1_a_refused_joins_produced_word_takes_the_funding_not_held_judgement() {
+        let pot = tx(0x02);
+        let body = |status: &str, extra: &str| {
+            format!(r#"{{"txid":"{pot}","txStatus":"{status}","extraInfo":"{extra}"}}"#)
+        };
+        let rejected = body("REJECTED", "arc error 461: missing inputs");
+        let double = body("DOUBLE_SPEND_ATTEMPTED", "");
+        let seen = body("SEEN_ON_NETWORK", "");
+        let e = [entry(
+            Some(false),
+            None,
+            Outcome::Unresolved,
+            Some(SeatLetter::A),
+        )];
+        let r = [refund_entry(RefundStatus::GateOpen)];
+        let mut valid = HashMap::new();
+        valid.insert(
+            format!("{pot}:0"),
+            ValidRefund {
+                raw_hex: "00".into(),
+                my_sats: Some(19_800),
+            },
+        );
+        let (c, p) = (HashSet::new(), HashSet::new());
+        let seen_only: HashSet<String> = [pot.clone()].into_iter().collect();
+        let judge = |words: &std::collections::BTreeMap<String, Value>, seen: &HashSet<String>| {
+            let unheld = refused_fundings(seen, words);
+            let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(900_005));
+            i.spender_words = Some(words);
+            i.funding_unheld = &unheld;
+            derive_owed_rows(&i)
+        };
+        for (history, want) in [
+            (vec![rejected.as_str()], "rejected"),
+            (vec![double.as_str()], "conflicted"),
+            (vec![rejected.as_str(), seen.as_str()], "rejected"),
+        ] {
+            let words = produced_word_views(&pot, &history);
+            assert_eq!(
+                words[&pot]["word"], "seen",
+                "the tracker keeps the word (NS-3): only the mark says refused"
+            );
+            let rows = judge(&words, &seen_only);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                (
+                    rows[0].family,
+                    &rows[0].facts["claim"],
+                    &rows[0].facts["claimable"]
+                ),
+                (
+                    OwedFamily::Unbound,
+                    &json!(FUNDING_NOT_HELD_CLAIM),
+                    &json!(false)
+                ),
+                "{history:?}: a refund of a funding Arcade refused is never a press"
+            );
+            assert_eq!(rows[0].facts["fundingHeld"], FUNDING_HELD_REFUSED);
+            assert_eq!(rows[0].facts["fundingWord"], want);
+            assert_eq!(rows[0].reason.as_deref(), Some(FUNDING_NOT_HELD_REASON));
+            assert_eq!(count_refund_funding_unheld(&rows), 1);
+            assert_eq!(
+                judge(&words, &HashSet::new())[0].facts["claim"],
+                "present-refund",
+                "the index's proof first"
+            );
+        }
+        let words = produced_word_views(&pot, &[seen.as_str()]);
+        assert!(
+            words[&pot].get("terminalHint").is_none(),
+            "an unmarked view is as before"
+        );
+        assert_eq!(
+            judge(&words, &seen_only)[0].facts["claim"],
+            "present-refund"
+        );
+        assert_eq!(
+            judge(&produced_word_views(&pot, &[]), &seen_only)[0].facts["claim"],
+            "present-refund",
+            "the latch alone"
+        );
+    }
+
+    /// bsv-low #598 (the B-OWED-2 lens's HIGH-1 (c)): the refusal reads a CHAIN-tier word, never a hint-tier word of
+    /// the same name, and a mined view (a checked proof) is never refused whatever its body carries; the producer's
+    /// mark is cleared by a mined word (`mark_terminal`). RED with the tier unread.
+    #[test]
+    fn fix598f_h1_c_the_refusal_reads_the_chain_tier_and_a_mined_word_clears_the_mark() {
+        let pot = tx(0x02);
+        let one = |v: Value| -> std::collections::BTreeMap<String, Value> {
+            [(pot.clone(), v)].into_iter().collect()
+        };
+        for word in ["rejected", "conflicted"] {
+            assert_eq!(
+                funding_refusal_word(Some(&one(json!({"word": word, "tier": "hint"}))), &pot),
+                None,
+                "{word} at the hint tier"
+            );
+            assert_eq!(
+                funding_refusal_word(Some(&one(json!({"word": word, "tier": "chain"}))), &pot),
+                Some(word)
+            );
+        }
+        assert_eq!(
+            funding_refusal_word(
+                Some(&one(
+                    json!({"word": "mined", "tier": "chain", "terminalHint": "rejected"})
+                )),
+                &pot
+            ),
+            None
+        );
+        let mut words = produced_word_views(&pot, &[r#"{"txStatus":"REJECTED"}"#]);
+        assert_eq!(words[&pot]["terminalHint"], "rejected");
+        let marked = crate::tracker_host::stored::Row {
+            txid: pot.clone(),
+            word: "mined".into(),
+            tier: "chain".into(),
+            height: None,
+            proof_root: None,
+            proof_height: None,
+            proof_hex: None,
+            header_hash: None,
+            hint_source: None,
+            hint_at: None,
+            updated_at: 1.0,
+            legacy_body: Some(
+                r#"{"trackerTerminal":true,"trackerTerminalWord":"rejected"}"#.into(),
+            ),
+        };
+        let mut row = marked.clone();
+        crate::tracker_host::runtime::mark_terminal(&mut row, Some(&marked), Some("rejected"));
+        assert_eq!(
+            row.legacy_body.as_deref(),
+            Some(r#"{"trackerTerminal":false}"#)
+        );
+        assert_eq!(row.terminal_hint(), None);
+        words.clear();
+    }
+
     /// bsv-low #831 (the FIX-831 lens's L3): `owed_refund_funding_unheld_total` moves by exactly ONE for fix831_a's
     /// pot judged funding-not-held, and by ZERO for the same pot with its funding held, through the shipped count and
     /// the census's pending deltas (`courier::take_pending_if_due`, this test thread's own map).
@@ -10060,6 +10287,66 @@ pub(crate) mod tests {
             "a story with its bytes waits for the 5-minute rule"
         );
         assert!(at(6 * 60_000, &judged));
+    }
+
+    /// bsv-low #608 (the B-OWED-2 lens's LOW-1): a spender the pass's OWN bound withheld (the courier cap, the clock,
+    /// the stored-read tail) is no absence of bytes: its row's mark comes off ([`unmark_withheld_spenders`]) and the
+    /// read waits for the open list's 5 minutes; a spender looked at with no bytes keeps the minute, and so does every
+    /// row of a pass whose pot-spenders read faulted. The read counts a recompute only the rule asked for
+    /// ([`spender_rejudge_only`], `owed_spender_rejudge_total`, seeded by the overlay). RED with the unmark inert
+    /// ("a withheld spender waits for the open list").
+    #[test]
+    fn fix608f_l1_a_withheld_spender_is_no_unread_bytes_and_a_rejudge_is_counted() {
+        let (v, c) = (HashMap::new(), HashSet::new());
+        let pots: HashSet<String> = HashSet::new();
+        let elsewhere = [hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000))];
+        let at = |age_ms: i64, rows: &[OwedRow]| {
+            should_recompute(false, age_ms, Some(900_000), Some(900_000), rows)
+        };
+        let only = |age_ms: i64, rows: &[OwedRow]| {
+            spender_rejudge_only(false, age_ms, Some(900_000), Some(900_000), rows)
+        };
+        let withheld: HashSet<String> = [tx(0x09)].into_iter().collect();
+        let mut rows =
+            derive_owed_rows(&inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000)));
+        assert!(at(61_000, &rows) && only(61_000, &rows));
+        assert!(
+            !only(59_000, &rows) && !only(6 * 60_000, &rows),
+            "the 5-minute rule asks on its own"
+        );
+        // looked at, no bytes (nothing withheld): the minute stands
+        let mut looked = rows.clone();
+        assert_eq!(
+            unmark_withheld_spenders(&mut looked, &HashSet::new(), false),
+            0
+        );
+        assert!(at(61_000, &looked));
+        // withheld by the pass's bound: the mark comes off, the open list's rule alone
+        assert_eq!(unmark_withheld_spenders(&mut rows, &withheld, false), 1);
+        assert!(
+            !at(61_000, &rows),
+            "a withheld spender waits for the open list"
+        );
+        assert!(at(6 * 60_000, &rows));
+        // a faulted pot-spenders read keeps every mark
+        let mut i = inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000));
+        i.pot_spenders_faulted = true;
+        let mut faulted = derive_owed_rows(&i);
+        assert_eq!(unmark_withheld_spenders(&mut faulted, &withheld, true), 0);
+        assert!(at(61_000, &faulted));
+        // the counter is seeded by the overlay's list (pinned equal by `obs_counters_tests`)
+        assert!(owed_mirrored_counter_names()
+            .iter()
+            .any(|n| n == COUNTER_SPENDER_REJUDGE));
+        // the route's wiring
+        let routes: String = include_str!("routes.rs").split_whitespace().collect();
+        for needle in [
+            "crate::owed::unmark_withheld_spenders(&mut rows, &spenders_withheld, inputs.pot_spenders_faulted); let withheld_outpoints =",
+            "if crate::owed::spender_rejudge_only(stale, age_ms, prev_tip, tip_now, &rows) { crate::owed::note_spender_rejudge(); }",
+        ] {
+            let n: String = needle.split_whitespace().collect();
+            assert!(routes.contains(&n), "the route: {needle}");
+        }
     }
 
     #[test]
