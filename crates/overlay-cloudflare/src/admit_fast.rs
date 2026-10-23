@@ -1190,6 +1190,21 @@ async fn readmitted_after(
 /// permanent). A readmission landing after the second check restores the twins itself, and the close keeps its
 /// stamp: consistent by construction.
 pub async fn evict_core(db: &dyn ShadowDb, txid: &str, reason: &str, now_ms: u64) -> EvictionCore {
+    evict_core_with_abort(db, txid, reason, now_ms, None)
+        .await
+        .0
+}
+
+async fn evict_core_with_abort(
+    db: &dyn ShadowDb,
+    txid: &str,
+    reason: &str,
+    now_ms: u64,
+    abort_rows: Option<(
+        &dyn crate::admission_abort::AbortRows,
+        crate::admission_abort::AbortingManagers,
+    )>,
+) -> (EvictionCore, Option<crate::admission_abort::PendingAbort>) {
     let mut core = EvictionCore::default();
     if let Err(e) = db
         .exec(
@@ -1210,13 +1225,20 @@ pub async fn evict_core(db: &dyn ShadowDb, txid: &str, reason: &str, now_ms: u64
                 "a readmission at {at} ms stands over this pass ({now_ms} ms): nothing moved"
             ));
             core.yielded_to_readmission = Some(at);
-            return core;
+            return (core, None);
         }
         Ok(None) => {}
         Err(e) => core.notes.push(format!(
             "the readmission read faulted before the passes ({e}) — the passes run"
         )),
     }
+    // The marker must stand before the abort snapshots any admission rows.
+    let abort = match abort_rows {
+        Some((rows, managers)) => {
+            Some(crate::admission_abort::read_before_eviction(rows, txid, managers).await)
+        }
+        None => None,
+    };
     let report = shadow_move_passes(db, txid, reason, now_ms, false).await;
     core.moved = report.moved;
     core.faults.extend(report.incomplete);
@@ -1244,7 +1266,7 @@ pub async fn evict_core(db: &dyn ShadowDb, txid: &str, reason: &str, now_ms: u64
             "the readmission read faulted after the passes ({e})"
         )),
     }
-    core
+    (core, abort)
 }
 
 /// What an eviction did, for its callers.
@@ -1336,14 +1358,14 @@ pub async fn evict_txid_everywhere_repointed(
     let now_ms = asked_ms;
     let mut pot_vouts = vouts_of(db, "pot_records", &txid).await;
     let mut advert_vouts = vouts_of(db, "low_records", &txid).await;
-    // bsv-low #558: the managers' abort, read before the passes move the rows (no read while no manager aborts)
-    let abort = crate::admission_abort::read_before_eviction(
+    let (core, abort) = evict_core_with_abort(
         db,
         &txid,
-        crate::admission_abort::managers_that_abort(),
+        reason,
+        now_ms,
+        Some((db, crate::admission_abort::managers_that_abort())),
     )
     .await;
-    let core = evict_core(db, &txid, reason, now_ms).await;
     let moved = core.moved;
     for v in &core.pot_vouts {
         if !pot_vouts.contains(v) {
@@ -1414,7 +1436,13 @@ pub async fn evict_txid_everywhere_repointed(
     // identified their outputs (`Engine.ts:1219-1223` at ts-stack f999e0c1a); this door learns the network's refusal
     // after the write, here: told once per evicted admission, never when the pass yielded to a readmission
     if core.yielded_to_readmission.is_none() {
-        crate::admission_abort::tell(&abort).await;
+        if let Some(abort) = abort.as_ref() {
+            if abort.skipped_empty_beef() {
+                crate::ops::bump_counter(db, crate::ops::COUNTER_ADMISSION_ABORT_EMPTY_BEEF, 1)
+                    .await;
+            }
+            crate::admission_abort::tell(abort).await;
+        }
     }
     if let Some(at) = core.yielded_to_readmission {
         crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_EVICT_YIELDED, 1).await;
@@ -4418,7 +4446,7 @@ mod tests {
     fn the_eviction_marks_first_verifies_after_and_reads_fail_loud() {
         let src = include_str!("admit_fast.rs");
         // the core: the marker → the readmission check → the passes → the readmission check again → the restore
-        let core = &src[src.find("pub async fn evict_core(").unwrap()..];
+        let core = &src[src.find("async fn evict_core_with_abort(").unwrap()..];
         let core = &core[..core.find("\n}\n").unwrap()];
         let marker = core
             .find("OPEN_EVICTION_MARKER_SQL")
@@ -4442,14 +4470,14 @@ mod tests {
             "marker → check → passes → check → restore"
         );
         assert!(
-            core[pre..passes].contains("return core;"),
+            core[pre..passes].contains("return (core, None);"),
             "a readmission found BEFORE the passes: nothing moves"
         );
         // the wrapper: the core → the release unless the pass yielded → the merge → the close → the counters
         let evict = &src[src.find("pub async fn evict_txid_everywhere(").unwrap()..];
         let evict = &evict[..evict.find("struct EvictedRow").unwrap()];
         let c = evict
-            .find("evict_core(db, &txid, reason, now_ms)")
+            .find("evict_core_with_abort(")
             .expect("the core");
         let release = evict
             .find("release_spends_of(db, &txid)")
@@ -4661,6 +4689,7 @@ mod tests {
     struct SqliteShadow {
         conn: rusqlite::Connection,
         late: std::cell::RefCell<Option<LateWrite>>,
+        on_open: std::cell::RefCell<Option<LateWrite>>,
         fail_first_copy_of: std::cell::RefCell<Option<String>>,
     }
     impl SqliteShadow {
@@ -4668,6 +4697,7 @@ mod tests {
             Self {
                 conn,
                 late: std::cell::RefCell::new(None),
+                on_open: std::cell::RefCell::new(None),
                 fail_first_copy_of: std::cell::RefCell::new(None),
             }
         }
@@ -4716,10 +4746,17 @@ mod tests {
                 }
             }
             let params: Vec<rusqlite::types::Value> = binds.iter().map(to_sql).collect();
-            self.conn
+            let result = self
+                .conn
                 .execute(sql, rusqlite::params_from_iter(params.iter()))
                 .map(|_| ())
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string());
+            if sql == OPEN_EVICTION_MARKER_SQL && result.is_ok() {
+                if let Some(write) = self.on_open.borrow_mut().take() {
+                    write(&self.conn);
+                }
+            }
+            result
         }
         async fn query_i64(&self, sql: &str, binds: Vec<QVal>) -> Result<Option<i64>, String> {
             use rusqlite::OptionalExtension;
@@ -4757,15 +4794,16 @@ mod tests {
         }
         async fn stored_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, String> {
             use rusqlite::OptionalExtension;
-            self.conn
-                .query_row(
-                    &crate::admission_abort::STORED_BEEF_SQL.replace('?', "?1"),
-                    [txid],
-                    |r| r.get::<_, Option<String>>(0),
-                )
-                .optional()
-                .map(|beef| crate::d1::beef_of_hex_column(beef.flatten()))
-                .map_err(|e| e.to_string())
+            crate::admission_abort::read_held_beef(|sql| async move {
+                self.conn
+                    .query_row(&sql.replace('?', "?1"), [txid], |r| {
+                        r.get::<_, Option<String>>(0)
+                    })
+                    .optional()
+                    .map(|beef| crate::d1::beef_of_hex_column(beef.flatten()))
+                    .map_err(|e| e.to_string())
+            })
+            .await
         }
     }
 
@@ -4807,6 +4845,126 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn ident_fold_l2_a_row_landing_with_open_is_told() {
+        let db = SqliteShadow::new(shipped_conn());
+        let txid = "c7".repeat(32);
+        let landing = txid.clone();
+        *db.on_open.borrow_mut() = Some(Box::new(move |conn| {
+            conn.execute("INSERT INTO outputs (txid, outputIndex, outputScript, topic, satoshis, spent) VALUES (?1, 7, X'51', 'tm_count', 1000, 0)", [&landing]).unwrap();
+            conn.execute(
+                "INSERT INTO transactions (txid, beef) VALUES (?1, X'0100BEEF')",
+                [&landing],
+            )
+            .unwrap();
+        }));
+        let told = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let managers: crate::admission_abort::AbortingManagers =
+            vec![("tm_count".to_string(), Box::new(I558Counting(told.clone())))];
+        let (core, abort) =
+            evict_core_with_abort(&db, &txid, "REJECTED", 1_000, Some((&db, managers))).await;
+        assert!(core.faults.is_empty(), "{core:?}");
+        assert!(core.yielded_to_readmission.is_none());
+        assert_eq!(count(&db.conn, "outputs", "txid", &txid), 0);
+        assert_eq!(
+            crate::admission_abort::tell(abort.as_ref().unwrap()).await,
+            1
+        );
+        assert_eq!(*told.borrow(), vec![(vec![1, 0, 0xbe, 0xef], vec![7])]);
+    }
+
+    #[test]
+    fn ident_fold_l2_the_abort_read_is_inside_the_open_marker() {
+        let src = include_str!("admit_fast.rs");
+        let core = &src[src.find("async fn evict_core_with_abort(").unwrap()..];
+        let marker = core.find("OPEN_EVICTION_MARKER_SQL").unwrap();
+        let read = core
+            .find("crate::admission_abort::read_before_eviction(")
+            .unwrap();
+        let passes = core
+            .find("shadow_move_passes(db, txid, reason, now_ms, false)")
+            .unwrap();
+        assert!(
+            marker < read && read < passes,
+            "the abort read must follow the OPEN marker and precede the moves"
+        );
+    }
+
+    #[tokio::test]
+    async fn ident_fold_l2_a_twin_beef_still_names_the_admission() {
+        use crate::admission_abort::AbortRows;
+        let db = SqliteShadow::new(shipped_conn());
+        let txid = "a7".repeat(32);
+        db.conn
+            .execute(
+                "INSERT INTO transactions (txid, beef) VALUES (?1, X'0100BEEF')",
+                [&txid],
+            )
+            .unwrap();
+        let core = evict_core(&db, &txid, "REJECTED", 1_000).await;
+        assert!(core.faults.is_empty(), "{core:?}");
+        assert_eq!(
+            db.stored_beef(&txid).await.unwrap(),
+            Some(vec![1, 0, 0xbe, 0xef]),
+            "a half-faulted eviction must read the BEEF from the twin"
+        );
+    }
+
+    #[tokio::test]
+    async fn ident_fold_l2_a_pot_beef_still_names_the_admission() {
+        use crate::admission_abort::AbortRows;
+        let db = SqliteShadow::new(shipped_conn());
+        let txid = "b7".repeat(32);
+        db.conn
+            .execute(
+                "INSERT INTO pot_beefs (txid, beef, createdAt) VALUES (?1, X'0100BEEF', 1)",
+                [&txid],
+            )
+            .unwrap();
+        assert_eq!(
+            db.stored_beef(&txid).await.unwrap(),
+            Some(vec![1, 0, 0xbe, 0xef]),
+            "the abort must also read the BEEF retained in pot_beefs"
+        );
+    }
+
+    #[tokio::test]
+    async fn ident_fold_l2_an_empty_or_faulted_beef_tells_nobody() {
+        struct MissingBeef(bool);
+        #[async_trait(?Send)]
+        impl crate::admission_abort::AbortRows for MissingBeef {
+            async fn admitted_outputs(&self, _: &str) -> Result<Vec<(String, u32)>, String> {
+                Ok(vec![("tm_count".to_string(), 0)])
+            }
+            async fn stored_beef(&self, _: &str) -> Result<Option<Vec<u8>>, String> {
+                if self.0 {
+                    Err("read fault".to_string())
+                } else {
+                    Ok(Some(Vec::new()))
+                }
+            }
+        }
+        for fault in [false, true] {
+            let told = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let abort = crate::admission_abort::read_before_eviction(
+                &MissingBeef(fault),
+                "missing",
+                vec![("tm_count".to_string(), Box::new(I558Counting(told.clone())))],
+            )
+            .await;
+            assert!(
+                abort.skipped_empty_beef(),
+                "the wrapper counts the missing body"
+            );
+            assert_eq!(
+                crate::admission_abort::tell(&abort).await,
+                0,
+                "an empty BEEF names no admission, so no manager is told"
+            );
+            assert!(told.borrow().is_empty());
+        }
+    }
+
     #[test]
     fn ident_fold_l1_the_abort_is_after_the_ledger_close() {
         let src = include_str!("admit_fast.rs");
@@ -4814,15 +4972,19 @@ mod tests {
         let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap()];
         let release = wrapper.find("release_spends_of(db, &txid)").unwrap();
         let merge = wrapper.find("merge_released(").unwrap();
-        let close = wrapper.find("Query::new(CLOSE_EVICTION_MARKER_SQL)").unwrap();
+        let close = wrapper
+            .find("Query::new(CLOSE_EVICTION_MARKER_SQL)")
+            .unwrap();
         let close_finished = close + wrapper[close..].find("\n    }\n").unwrap();
-        let tell = wrapper.find("crate::admission_abort::tell(&abort).await").unwrap();
-        assert!(release < merge && merge < close && close_finished < tell,
-            "release, merge, and finish the ledger close before awaiting the abort");
+        let tell = wrapper.find("crate::admission_abort::tell(").unwrap();
+        assert!(
+            release < merge && merge < close && close_finished < tell,
+            "release, merge, and finish the ledger close before awaiting the abort"
+        );
     }
 
-    /// The eviction's sequence (`evict_txid_everywhere_repointed`: the abort's read, `evict_core`, the tell
-    /// unless the pass yielded) over the shipped schema and passes, a counting manager under `tm_count`. An
+    /// The eviction's sequence (`evict_txid_everywhere_repointed`: OPEN, the abort's read, the passes, the tell
+    /// after the ledger closes unless the pass yielded) over the shipped schema and passes, a counting manager under `tm_count`. An
     /// evicted admission tells it ONCE, with the outputs the index held under its topic (not another topic's) and
     /// the stored BEEF; a second eviction of the same txid finds no live row and tells nothing; a pass that
     /// yields to a readmission tells nothing; an admission never evicted is never told. The wiring's order is
@@ -4838,10 +5000,10 @@ mod tests {
             txid: &str,
             managers: crate::admission_abort::AbortingManagers,
         ) -> u32 {
-            let abort = crate::admission_abort::read_before_eviction(db, txid, managers).await;
-            let core = evict_core(db, txid, "REJECTED", 1_000).await;
+            let (core, abort) =
+                evict_core_with_abort(db, txid, "REJECTED", 1_000, Some((db, managers))).await;
             if core.yielded_to_readmission.is_none() {
-                crate::admission_abort::tell(&abort).await
+                crate::admission_abort::tell(abort.as_ref().unwrap()).await
             } else {
                 0
             }
@@ -4918,23 +5080,29 @@ mod tests {
             crate::admission_abort::read_before_eviction(&Unreadable, &clean, Vec::new()).await;
         assert!(none.admissions().is_empty());
 
-        // the wiring: the read before the passes, the tell after them and only when the pass did not yield
+        // The wrapper calls the ordered core and gates the tell on no readmission.
         let src = include_str!("admit_fast.rs");
         let w = &src[src
             .find("pub async fn evict_txid_everywhere_repointed(")
             .unwrap()..];
         let w = &w[..w.find("\n}\n").unwrap()];
-        let read = w
-            .find("crate::admission_abort::read_before_eviction(")
-            .expect("the abort's read");
-        let core = w
-            .find("evict_core(db, &txid, reason, now_ms)")
-            .expect("the core");
-        let gate = w[core..]
-            .find("if core.yielded_to_readmission.is_none() {\n        crate::admission_abort::tell(&abort).await;")
-            .expect("the tell, gated on the yield");
-        assert!(read < core && gate > 0, "read, core, tell");
+        assert!(w.contains("evict_core_with_abort("));
         assert!(w.contains("crate::admission_abort::managers_that_abort()"));
+        let close = w.find("Query::new(CLOSE_EVICTION_MARKER_SQL)").unwrap();
+        let tell_gate = close
+            + w[close..]
+                .find("if core.yielded_to_readmission.is_none()")
+                .expect("the tell, gated on the yield");
+        let tell = w.find("crate::admission_abort::tell(").unwrap();
+        let after = w
+            .find("if let Some(at) = core.yielded_to_readmission")
+            .unwrap();
+        assert!(
+            tell_gate < tell && tell < after,
+            "the tell stays inside the no-readmission arm"
+        );
+        assert!(w[tell_gate..tell].contains("abort.skipped_empty_beef()"));
+        assert!(w[tell_gate..tell].contains("COUNTER_ADMISSION_ABORT_EMPTY_BEEF"));
     }
 
     /// bsv-low loop 18 (pair 11's JOIN `3b14f0e6…`), pinned under the REAL passes: rows the subject's own

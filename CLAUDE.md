@@ -2255,10 +2255,17 @@ THROWS (`Engine.ts:1219-1223`), only under `throwOnBroadcastFailure = true`
 branch), so `Engine::submit` never calls it: parity with the reference's
 default. This door (D1) broadcasts before it admits; a refusal learned AFTER
 the write always ends in `admit_fast::evict_txid_everywhere_repointed`, which
-reads the txid's live `outputs` rows (and its stored BEEF) before the passes
-and tells each aborting manager its outputs once the pass did not yield to a
-readmission (`admission_abort.rs`). With no aborting manager (today) it reads
-nothing. A refusal before the write asked no manager a real admission. Stated:
+reads the txid's live `outputs` rows AFTER the OPEN marker and before the
+passes, inside the ordered core. Its BEEF is read from `transactions`, then
+`pot_beefs`, then `transactions_evicted`, stopping at the first nonempty
+body. It tells each aborting manager its outputs AFTER the spend release,
+released-list merge and ledger close, only when the pass did not yield to a
+readmission (`admission_abort.rs`). An empty or unreadable BEEF tells nobody:
+logged by txid and counted `admission_abort_empty_beef_total` after the close.
+With no aborting manager (today) it reads nothing; an opted-in manager costs
+two to four key reads. The retire reserve and budget tiers still need the
+captain's land run. A refusal before the write asked no manager a real
+admission. Stated:
 a readmission restores rows without telling the manager; a manager may be told
 twice for one admission after an eviction that faulted half way and ran again
 (idempotent). Pins: engine `--lib i558` (`i558_a`, `i558_b`, and
@@ -2266,7 +2273,7 @@ twice for one admission after an eviction that faulted half way and ran again
 i558` (`i558_every_workspace_manager_keeps_the_default`,
 `admit_fast::tests::i558_the_eviction_tells_an_aborting_manager_once` over the
 shipped schema, with a source pin on the wrapper's order, RED with the tell
-ungated). A consumer's manager compiles unchanged (a default method).
+ungated). A consumer's manager compiles unchanged (two default methods).
 
 ## Progress under the per-peer sync budget (bsv-low #552)
 
