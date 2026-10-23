@@ -15256,6 +15256,143 @@ pub(crate) mod tests {
         assert_eq!(carry_shed_rows(&j, &mut Vec::new(), &done), 0);
     }
 
+    /// bsv-low #859 (FIX-859, loop 46 pair 16), the DERIVATION's half: a hop whose JOIN the index holds (the hop's
+    /// own row spent by the pot, `spentConfirmed` as the admission leaves it: none) with NO `submit_refusals` row
+    /// (the door retires it on the admission) is never a `hop-stranded` row: the JOIN took it, the pot's row tells
+    /// the story. The same for the belt (#837): an index-UNSPENT hop its held pot's stored JOIN spends. Expected
+    /// green on d370d906: the fresh derivation cannot say `door` without the ledger's row; the loop's source is the
+    /// carry, pinned next.
+    #[test]
+    fn fix859_a_a_hop_its_admitted_join_spent_is_never_derived_stranded_without_the_doors_row() {
+        let pot = tx(0x0a);
+        let (v, c) = (HashMap::new(), HashSet::new());
+        let pots: HashSet<String> = [pot.clone()].into_iter().collect();
+        // the index's own word: the hop row spent by the pot, its confirmation unknown (admitted pending)
+        let spent = [hop(HopStatus::Spent, Some(&pot), Some(60_000))];
+        let i = inputs(&[], &[], &spent, &v, &c, &pots, Some(972_190));
+        let rows = derive_owed_rows(&i);
+        assert!(
+            rows.iter().all(|r| r.family != OwedFamily::HopStranded),
+            "{rows:?}"
+        );
+        assert!(rows.is_empty(), "the pot's row tells the story: {rows:?}");
+        // the belt: the index never recorded the spend, the pot's stored JOIN spends the hop
+        let key = format!("{}:0", tx(0x07));
+        let unspent = [hop(HopStatus::Unspent, None, Some(60_000))];
+        let by_bytes: HashMap<String, String> = [(key.clone(), pot.clone())].into_iter().collect();
+        let mut j = inputs(&[], &[], &unspent, &v, &c, &pots, Some(972_190));
+        j.join_spent_hops = &by_bytes;
+        let rows = derive_owed_rows(&j);
+        assert!(
+            rows.iter().all(|r| r.family != OwedFamily::HopStranded),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| r.facts.get("joinRefusedBy").is_none()),
+            "{rows:?}"
+        );
+    }
+
+    /// bsv-low #859 (FIX-859, loop 46 pair 16), THE SOURCE: the good JOIN was admitted at 15:47:09Z, the index held
+    /// the pot and the door's refusal row was retired, and p1's page re-read `/owed` on four pushes to 15:49:16Z,
+    /// each read serving the hop `8662b01a…:0` as `hop-stranded … joinRefusedBy=door`. The fresh derivation cannot
+    /// say `door` without the ledger's row; what could is the BUDGET-CUT pass's carry (#837's `carry_shed_rows`): it
+    /// carried every previous row the pass did not derive, and "no row" for a hop the JOIN spent IS the pass's
+    /// judgement, not a row it could not reach. A previous snapshot's door strand for a hop this pass holds (spent by
+    /// the pot) must be RETIRED by the carry, never served `shed`; a previous row of a subject the cut pass never
+    /// reached (no hop, result or refund entry of that outpoint) is still carried (#837's rule, `fix837_d`).
+    /// RED on d370d906: `carried 1`, the strand served `refresh: "shed"` with `joinRefusedBy: "door"`.
+    #[test]
+    fn fix859_b_a_cut_pass_retires_the_door_strand_of_a_hop_its_admitted_join_spent() {
+        let pot = tx(0x0a);
+        let (v, c) = (HashMap::new(), HashSet::new());
+        let pots: HashSet<String> = [pot.clone()].into_iter().collect();
+        let key = format!("{}:0", tx(0x07));
+        let spent = [hop(HopStatus::Spent, Some(&pot), Some(60_000))];
+        let i = inputs(&[], &[], &spent, &v, &c, &pots, Some(972_190));
+        let now = i.now_ms;
+        // the previous snapshot (before the admission): the door strand, as the derivation served it under the row
+        let strand = OwedRow {
+            identity: ME.to_string(),
+            outpoint: key.clone(),
+            family: OwedFamily::HopStranded,
+            game_id: tx(0x01),
+            sats: Some(20_190),
+            opponent_identity: Some(OPP.to_string()),
+            at_height: None,
+            facts: json!({
+                "claim": "sweep-hop", "claimable": true, "joinRefused": true, "joinRefusedBy": "door",
+                "doorRefusal": "script", "chainProbe": "index-unspent"
+            }),
+            reason: Some(DOOR_SCRIPT_REFUSED_REASON.to_string()),
+        };
+        // an unrelated refund row of a pot this pass's cursor never reached: #837's carry stands for it
+        let unreached = OwedRow {
+            identity: ME.to_string(),
+            outpoint: format!("{}:0", tx(0x20)),
+            family: OwedFamily::RefundDue,
+            game_id: tx(0x20),
+            sats: Some(19_800),
+            opponent_identity: Some(OPP.to_string()),
+            at_height: None,
+            facts: json!({"claim": "present-refund", "claimable": true}),
+            reason: None,
+        };
+        let previous: Vec<(OwedRow, i64)> =
+            vec![(strand.clone(), now - 90_000), (unreached.clone(), now - 90_000)];
+        // the cut pass after the admission: the derivation judged the hop (no row: the pot's row tells the story)
+        let mut rows = derive_owed_rows(&i);
+        assert!(rows.is_empty(), "{rows:?}");
+        let carried = carry_shed_rows(&i, &mut rows, &previous);
+        let left: Vec<&OwedRow> = rows.iter().filter(|r| r.outpoint == key).collect();
+        assert!(
+            left.is_empty(),
+            "a hop the admitted JOIN spent is never a stranded row, carried or not: {left:?}"
+        );
+        assert_eq!(carried, 1, "the unreached pot's row alone: {rows:?}");
+        assert_eq!(rows[0].outpoint, unreached.outpoint);
+        assert_eq!(rows[0].facts["refresh"], OWED_REFRESH_SHED);
+        // the belt's shape (#837): the hop index-unspent, the pot's stored JOIN spending it: judged, not carried
+        let unspent = [hop(HopStatus::Unspent, None, Some(60_000))];
+        let by_bytes: HashMap<String, String> = [(key.clone(), pot.clone())].into_iter().collect();
+        let mut j = inputs(&[], &[], &unspent, &v, &c, &pots, Some(972_190));
+        j.join_spent_hops = &by_bytes;
+        let mut rows = derive_owed_rows(&j);
+        assert!(rows.iter().all(|r| r.family != OwedFamily::HopStranded));
+        let judged_rows = rows.len();
+        let carried = carry_shed_rows(&j, &mut rows, &previous);
+        assert_eq!(carried, 1, "{rows:?}");
+        assert_eq!(rows.len(), judged_rows + 1);
+        assert!(
+            rows.iter().all(|r| r.family != OwedFamily::HopStranded),
+            "{rows:?}"
+        );
+        // a pot this pass's RESULTS hold is judged the same way: its previous refund row is not carried over the
+        // pass's own answer for that pot (settled, spent: no row), where a pot no entry names is still carried
+        let held = [entry(Some(true), None, Outcome::Lost, Some(SeatLetter::A))];
+        let mut k = inputs(&held, &[], &[], &v, &c, &pots, Some(972_190));
+        k.now_ms = now;
+        let held_key = outpoint_key(&held[0].pot_txid, held[0].pot_vout);
+        let mut prev_pot = unreached.clone();
+        prev_pot.outpoint = held_key.clone();
+        prev_pot.game_id = held[0].game_id.clone();
+        let reached: Vec<(OwedRow, i64)> =
+            vec![(prev_pot, now - 1_000), (unreached.clone(), now - 1_000)];
+        let mut rows = derive_owed_rows(&k);
+        let judged_pot = rows.iter().filter(|r| r.outpoint == held_key).count();
+        assert_eq!(carry_shed_rows(&k, &mut rows, &reached), 1, "{rows:?}");
+        assert_eq!(
+            rows.iter().filter(|r| r.outpoint == held_key).count(),
+            judged_pot,
+            "the pass's own answer for a pot it holds stands: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.outpoint != held_key || r.facts["refresh"] != OWED_REFRESH_SHED),
+            "{rows:?}"
+        );
+    }
+
     /// PIN A3 (RED on the stub): a competitor mined between two reads. Read 1 (tip 971114) is claimable; served
     /// across block 971115 it degrades to pending (RED line: the middle assert); the re-probe at the new tip sees
     /// the competitor and re-points the hop to `spent-elsewhere` (Unbound, no claim) — never a dead sweep.
