@@ -723,3 +723,6 @@ mod b_cost_1_wiring {
         assert_eq!(crate::d1_ledger::COST_WORKER, "low-app-layer");
     }
 }
+/// FAST-C-LENS (2026-10-23): the lens's negative cases over the handfile family; never shipped (a lens patch).
+#[cfg(test)]
+mod handfile_lens;
