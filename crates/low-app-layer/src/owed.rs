@@ -1266,6 +1266,60 @@ fn joined_pot_unlinked_row(
 /// bsv-low #831: the hydration's `fundingHeld` value for an unspent pot whose funding has no SEEN latch and no index
 /// proof (the others: `seen`, `proof`; NULL for a spent pot, which the read does not probe).
 pub const FUNDING_HELD_NONE: &str = "none";
+/// bsv-low #598: the hydration's `fundingHeld` value for an unspent pot whose funding the SEEN latch alone holds (no
+/// index proof): a broadcaster's word, which the network's later refusal of those very bytes outranks.
+pub const FUNDING_HELD_SEEN: &str = "seen";
+/// bsv-low #598: the served `fundingHeld` of a refund-due pot whose latched funding the network then REFUSED (the
+/// terminal mark of the pot's own txid, or a chain-tier `rejected` or `conflicted` word: [`funding_refusal_word`]):
+/// the same judgement as
+/// [`FUNDING_HELD_NONE`], named apart.
+pub const FUNDING_HELD_REFUSED: &str = "refused";
+/// PURE (bsv-low #598): the network's refusal of `txid` as the tracker's RECHECKED view states it. Two producers:
+/// (1) the TERMINAL MARK, the one this tip writes (the B-OWED-2 lens's HIGH-1): the word event of the pot's own txid
+/// (`callback`, Arcade's push; `tick`, the scheduled re-ask) read Arcade's REJECTED / INVALID / MALFORMED or a double
+/// spend (`tracker_host::runtime::terminal_word`), `runtime::mark_terminal` stored it in the row, and
+/// `stored::Row::view` serves it as `terminalHint` on any word but `mined` (a checked proof clears it); (2) the
+/// chain-tier word `rejected` or `conflicted` itself (the tier read, never a hint-tier word of the same name), which
+/// only a node verdict or a competitor would produce (none is fed on this tip). Any other view, or no row, is
+/// `None`: never a refusal by absence. The fail direction: a funding Arcade refused that the network still holds (a
+/// readmission by a fresh accept, #513, keeps the mark) has its refund withheld until the pot's block, whose
+/// checked proof clears the mark and whose checked `mined` word rescues first in the arm; the refund is not
+/// pressable before that block.
+pub fn funding_refusal_word(
+    words: Option<&std::collections::BTreeMap<String, Value>>,
+    txid: &str,
+) -> Option<&'static str> {
+    let w = words?.get(&txid.to_ascii_lowercase())?;
+    let chain = w["tier"] == "chain";
+    if chain && w["word"] == "rejected" {
+        return Some("rejected");
+    }
+    if chain && w["word"] == "conflicted" {
+        return Some("conflicted");
+    }
+    if w["word"] == "mined" {
+        return None;
+    }
+    match w["terminalHint"].as_str()? {
+        "rejected" => Some("rejected"),
+        "conflicted" => Some("conflicted"),
+        _ => Some("terminal"),
+    }
+}
+/// PURE (bsv-low #598): of the unspent pots whose funding the SEEN latch alone holds, those whose funding the network
+/// REFUSED since ([`funding_refusal_word`]): the route adds them to `funding_unheld`, so a refused JOIN's refund row
+/// takes FIX-831's judgement (no press, the same word). A pot the index PROVED is never in `seen_only` (the index's
+/// proof first, #736), so no word can withhold it.
+pub fn refused_fundings(
+    seen_only: &HashSet<String>,
+    words: &std::collections::BTreeMap<String, Value>,
+) -> HashSet<String> {
+    seen_only
+        .iter()
+        .filter(|t| funding_refusal_word(Some(words), t).is_some())
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
 /// bsv-low #831: the claim kind of a refund-due pot whose funding the network does not hold. Not a press: the client's
 /// `claimOf` knows no such claim and the `unbound` family offers none.
 pub const FUNDING_NOT_HELD_CLAIM: &str = "funding-not-held";
@@ -2603,6 +2657,60 @@ pub fn mark_pay_vouts(rows: &mut [OwedRow], vouts: &HashMap<String, u32>) -> usi
     marked
 }
 
+/// PURE (bsv-low #492): the HOME OUTPUTS (`payTxid`:`payVout`, lowercase txid) of the payout rows that name one: the
+/// settle's (named by [`mark_pay_vouts`]) and the sweep's (named at the derivation). Sorted, deduplicated.
+pub fn payout_home_outpoints(rows: &[OwedRow]) -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = rows
+        .iter()
+        .filter(|r| r.family == OwedFamily::Payout)
+        .filter_map(|r| {
+            let txid = r.facts.get("payTxid")?.as_str()?;
+            let vout = u32::try_from(r.facts.get("payVout")?.as_u64()?).ok()?;
+            crate::logic::valid_txid(txid).then(|| (txid.to_ascii_lowercase(), vout))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+/// bsv-low #492: the read of the INDEX's own spend word for `n` home outputs (one PK term per outpoint): the outputs
+/// `pot_records` holds SPENT (a `tm_lowfund`-admitted P2PKH home, consumed by an admitted spend: only the home key
+/// signs it). `n` is at most [`crate::logic::D1_CHUNK_OUTPOINTS`] (two binds each).
+pub fn payout_home_spent_sql(n: usize) -> String {
+    let terms = (0..n.max(1))
+        .map(|k| format!("(txid = ?{} AND outputIndex = ?{})", 2 * k + 1, 2 * k + 2))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    format!(
+        "SELECT lower(txid) AS txid, outputIndex FROM pot_records WHERE spent = 1 AND ({terms})"
+    )
+}
+const _: () = assert!(2 * crate::logic::D1_CHUNK_OUTPOINTS <= crate::logic::D1_MAX_BOUND_PARAMS);
+/// PURE (bsv-low #492): a payout row whose home output the INDEX holds spent is not a row: the wallet held the sats
+/// (the live credit landed them) and its own key spent them on (the next stake's hop), so there is nothing to collect
+/// and nothing to press, exactly as a sweep's `output_spent` retires its row and the identity's held filing retires
+/// a payout. `spent` holds [`outpoint_key`]s. Returns how many rows it retired. The writers of that word (the
+/// B-OWED-2 lens's LOW-3): the engine's admitted spend (`d1_discovery` `mark_spent_sql`), the discovery pass's
+/// courier-found pointer bound to a content-addressed raw that consumes the outpoint, the conflict pass's mined
+/// competitor (#605) and FIX-837's guarded hop write; each rests on a transaction that spends a P2PKH home, which
+/// only the home key signs. The fail direction is a hidden row, the sats at the home key, never a false press; a
+/// pointer still UNCONFIRMED (`spentConfirmed = 0`) that the wallet later abandons (#818's class) hides the row
+/// until the pointer is released (the optional `homeSpentConfirmed` is not built).
+pub fn retire_index_spent_homes(rows: &mut Vec<OwedRow>, spent: &HashSet<String>) -> usize {
+    let before = rows.len();
+    rows.retain(|r| {
+        r.family != OwedFamily::Payout
+            || !matches!(
+                (
+                    r.facts.get("payTxid").and_then(Value::as_str),
+                    r.facts.get("payVout").and_then(Value::as_u64),
+                ),
+                (Some(t), Some(v)) if u32::try_from(v).is_ok_and(|v| spent.contains(&outpoint_key(t, v)))
+            )
+    });
+    before - rows.len()
+}
+
 /// The `payVout` read's OWN wall clock, counted from the step's start, never the recompute's (the B3 delta lens
 /// D-L1): the step runs last, so behind the recompute's clock a heavy identity read `null` on every pass. The
 /// first chunk is read whatever any clock says; a later chunk is read while the step is inside this budget.
@@ -3242,7 +3350,11 @@ fn story_reason(
             facts["spendKind"] = json!("spent-elsewhere");
             SPENT_ELSEWHERE_REASON
         }
-        None => unknown,
+        None => {
+            // bsv-low #608: a story that rests on no spender bytes is re-judged on the next read past a minute
+            facts[OWED_FACT_SPENDER_UNREAD] = json!(true);
+            unknown
+        }
     }
 }
 
@@ -3464,7 +3576,14 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     facts["claim"] = json!(FUNDING_NOT_HELD_CLAIM);
                     facts["claimable"] = json!(false);
                     facts["claimReason"] = json!(FUNDING_NOT_HELD_REASON);
-                    facts["fundingHeld"] = json!(FUNDING_HELD_NONE);
+                    // bsv-low #598: a latched funding the network refused since is the same judgement, named apart
+                    match funding_refusal_word(i.spender_words, &e.pot_txid) {
+                        Some(word) => {
+                            facts["fundingHeld"] = json!(FUNDING_HELD_REFUSED);
+                            facts["fundingWord"] = json!(word);
+                        }
+                        None => facts["fundingHeld"] = json!(FUNDING_HELD_NONE),
+                    }
                     facts["tip"] = json!(i.tip);
                     facts["refundStatus"] = json!(refund.map(|r| r.status.as_str()));
                     rows.push(OwedRow {
@@ -3844,6 +3963,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     .filter(|s| !pointer_refuted(i, s, h))
                     .and_then(|s| spender_story(i, s, &game));
                 let reason = if i.pot_spenders_faulted {
+                    facts[OWED_FACT_SPENDER_UNREAD] = json!(true);
                     "could not check the hop's spender against the index this pass (a read faulted)"
                 } else {
                     story_reason(
@@ -4496,11 +4616,96 @@ pub fn row_is_open(r: &OwedRow) -> bool {
         || r.facts[crate::hops_view::OWED_FACT_REORG_GRACE_WORD] == Value::Bool(true)
 }
 
+/// bsv-low #608: the fact a row carries when its "could not judge" sentence rests on NO spender bytes (the spender is
+/// named, its bytes were not read this pass, or the pot-spenders read faulted): the bytes may arrive between passes
+/// (#606 made a courier's mempool body and the chain rung's verified raw readable), so such a row is re-judged on
+/// the next read once [`OWED_SPENDER_REJUDGE_AFTER_MS`] has passed, never waiting for the open list's 5 minutes.
+pub const OWED_FACT_SPENDER_UNREAD: &str = "spenderUnread";
+/// bsv-low #608: the bound of that re-judgement: at most one recompute a minute per identity on its reads (and inside
+/// the identity's #499 ceiling), so a dead courier never makes every read recompute.
+pub const OWED_SPENDER_REJUDGE_AFTER_MS: i64 = 60_000;
+const _: () = assert!(OWED_SPENDER_REJUDGE_AFTER_MS < OWED_RECOMPUTE_OPEN_AFTER_MS);
+
 /// The read's rule (N5, the ONE predicate): recompute when the marker says stale; when the tip advanced past an
 /// in-progress row's recovery height since the compute; when an open list is older than 5 minutes; when any list is
 /// older than 15 minutes (an empty list must not stay "nothing owed" forever; a stranded hop crosses its window with
 /// no other trigger).
 pub fn should_recompute(
+    stale: bool,
+    age_ms: i64,
+    prev_tip: Option<u64>,
+    tip_now: Option<u64>,
+    rows: &[OwedRow],
+) -> bool {
+    recompute_before_unread(stale, age_ms, prev_tip, tip_now, rows)
+        || spender_unread_due(age_ms, rows)
+}
+
+/// bsv-low #608 (the B-OWED-2 lens's LOW-1): a row still marked [`OWED_FACT_SPENDER_UNREAD`] in a snapshot older than
+/// [`OWED_SPENDER_REJUDGE_AFTER_MS`].
+fn spender_unread_due(age_ms: i64, rows: &[OwedRow]) -> bool {
+    age_ms > OWED_SPENDER_REJUDGE_AFTER_MS
+        && rows
+            .iter()
+            .any(|r| r.facts[OWED_FACT_SPENDER_UNREAD] == Value::Bool(true))
+}
+
+/// PURE (bsv-low #608, the B-OWED-2 lens's LOW-1): the read recomputes ONLY because of the unread-spender rule (no
+/// other rule of [`should_recompute`] would have): the re-judgement #608 buys, counted
+/// [`COUNTER_SPENDER_REJUDGE`] by the read.
+pub fn spender_rejudge_only(
+    stale: bool,
+    age_ms: i64,
+    prev_tip: Option<u64>,
+    tip_now: Option<u64>,
+    rows: &[OwedRow],
+) -> bool {
+    !recompute_before_unread(stale, age_ms, prev_tip, tip_now, rows)
+        && spender_unread_due(age_ms, rows)
+}
+
+/// bsv-low #608 (the B-OWED-2 lens's LOW-1): the durable `ops_counters` row (the census flush; the overlay seeds it
+/// at 0), bumped once per read whose recompute only the unread-spender rule asked for.
+pub const COUNTER_SPENDER_REJUDGE: &str = "owed_spender_rejudge_total";
+/// bsv-low #608 (LOW-1): count one re-judgement ([`spender_rejudge_only`]).
+pub fn note_spender_rejudge() {
+    crate::courier::note_presence(COUNTER_SPENDER_REJUDGE);
+}
+
+/// PURE (bsv-low #608, the B-OWED-2 lens's LOW-1): a spender this pass WITHHELD by its own bound (the courier cap,
+/// the clock or the stored-read tail; `withheld`, lowercase, [`SpenderLook::withheld`]) is not an absence of bytes:
+/// the rotation reaches it on a later pass at the open list's cadence, so its row's mark is taken off and the read
+/// does not recompute every minute for it. The mark stays on a spender LOOKED at that gave no bytes (a courier with
+/// nothing, a stored read that missed) and on every row of a pass whose pot-spenders read faulted (`faulted`: a
+/// fault, never a bound). Returns the marks taken off.
+pub fn unmark_withheld_spenders(
+    rows: &mut [OwedRow],
+    withheld: &HashSet<String>,
+    faulted: bool,
+) -> usize {
+    if faulted {
+        return 0;
+    }
+    let mut n = 0;
+    for r in rows.iter_mut() {
+        if r.facts[OWED_FACT_SPENDER_UNREAD] != Value::Bool(true) {
+            continue;
+        }
+        let named = r.facts["chainSpender"]
+            .as_str()
+            .or_else(|| r.facts["spendingTxid"].as_str())
+            .map(str::to_ascii_lowercase);
+        if named.is_some_and(|sp| withheld.contains(&sp)) {
+            if let Some(obj) = r.facts.as_object_mut() {
+                obj.remove(OWED_FACT_SPENDER_UNREAD);
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+fn recompute_before_unread(
     stale: bool,
     age_ms: i64,
     prev_tip: Option<u64>,
@@ -4525,6 +4730,8 @@ pub fn should_recompute(
     if gate_flipped {
         return true;
     }
+    // bsv-low #608: a "could not judge the spender" row whose bytes were not read is asked again past a minute
+    // (`spender_unread_due`, in `should_recompute`)
     let has_open = rows.iter().any(row_is_open);
     (has_open && age_ms > OWED_RECOMPUTE_OPEN_AFTER_MS) || age_ms > OWED_RECOMPUTE_ANY_AFTER_MS
 }
@@ -4618,6 +4825,7 @@ pub fn owed_mirrored_counter_names() -> Vec<String> {
         .collect();
     names.push(COUNTER_RECOMPUTES.to_string());
     names.push(COUNTER_REFUND_FUNDING_UNHELD.to_string());
+    names.push(COUNTER_SPENDER_REJUDGE.to_string());
     names.push("applayer_owed_read_faults_total".to_string());
     names.extend(
         OWED_READ_FAULT_KINDS
@@ -9419,6 +9627,324 @@ pub(crate) mod tests {
         assert_eq!(derive_owed_rows(&k)[0].facts["claim"], "rejoin");
     }
 
+    /// bsv-low #598 (loop 22, p27/p28, the `spec-admit-fast-join-refused` cell's pair): a refund-due pot whose funding
+    /// the SEEN latch held and the network then REFUSED (the tracker's chain-tier `rejected` or `conflicted` word for
+    /// the pot's own txid) serves no press, under FIX-831's word (`funding-not-held`), named `fundingHeld: refused`.
+    /// A latched funding whose word is `seen` or a checked `mined`, and a pot the index PROVED (never in the seen-only
+    /// set: the index's proof first), keep today's `present-refund`. RED with `refused_fundings` answering nothing
+    /// (the latched pot stays `refund-due`, `present-refund`, claimable).
+    #[test]
+    fn fix598_a_refused_joins_latched_funding_takes_the_funding_not_held_judgement() {
+        let e = [entry(
+            Some(false),
+            None,
+            Outcome::Unresolved,
+            Some(SeatLetter::A),
+        )];
+        let r = [refund_entry(RefundStatus::GateOpen)];
+        let mut valid = HashMap::new();
+        valid.insert(
+            format!("{}:0", tx(0x02)),
+            ValidRefund {
+                raw_hex: "00".into(),
+                my_sats: Some(19_800),
+            },
+        );
+        let (c, p) = (HashSet::new(), HashSet::new());
+        let seen_only: HashSet<String> = [tx(0x02)].into_iter().collect();
+        let judge = |words: &std::collections::BTreeMap<String, Value>, seen: &HashSet<String>| {
+            // the route's step: the latched fundings the network refused join the unheld set
+            let unheld = refused_fundings(seen, words);
+            let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(900_005));
+            i.spender_words = Some(words);
+            i.funding_unheld = &unheld;
+            derive_owed_rows(&i)
+        };
+        for word in ["rejected", "conflicted"] {
+            let mut words = std::collections::BTreeMap::new();
+            words.insert(
+                tx(0x02),
+                json!({"word": word, "tier": "chain", "verifyPath": null}),
+            );
+            let rows = judge(&words, &seen_only);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                (
+                    rows[0].family,
+                    &rows[0].facts["claim"],
+                    &rows[0].facts["claimable"]
+                ),
+                (
+                    OwedFamily::Unbound,
+                    &json!(FUNDING_NOT_HELD_CLAIM),
+                    &json!(false)
+                ),
+                "a refund of a funding the network refused ({word}) is never a press"
+            );
+            assert_eq!(rows[0].facts["fundingHeld"], FUNDING_HELD_REFUSED);
+            assert_eq!(rows[0].facts["fundingWord"], word);
+            assert_eq!(rows[0].reason.as_deref(), Some(FUNDING_NOT_HELD_REASON));
+            assert_eq!(
+                count_refund_funding_unheld(&rows),
+                1,
+                "counted with FIX-831's pots"
+            );
+            // the index PROVED the funding (not in the seen-only set): no word withholds it
+            let proven = judge(&words, &HashSet::new());
+            assert_eq!(
+                proven[0].facts["claim"], "present-refund",
+                "the index's proof first"
+            );
+        }
+        for word in [
+            json!({"word": "seen", "tier": "network", "verifyPath": null}),
+            json!({"word": "mined", "tier": "chain", "verifyPath": "header"}),
+            json!({"word": "announced", "verifyPath": null}),
+        ] {
+            let mut words = std::collections::BTreeMap::new();
+            words.insert(tx(0x02), word.clone());
+            let rows = judge(&words, &seen_only);
+            assert_eq!(
+                rows[0].family,
+                OwedFamily::RefundDue,
+                "{word}: no refusal, today's row"
+            );
+            assert_eq!(rows[0].facts["claim"], "present-refund");
+        }
+        // no word row at all: a latched funding is never refused by absence
+        assert_eq!(
+            judge(&std::collections::BTreeMap::new(), &seen_only)[0].facts["claim"],
+            "present-refund"
+        );
+    }
+
+    /// bsv-low #598 (the B-OWED-2 lens's HIGH-1): the word events of the pot's own txid as this tip PRODUCES them,
+    /// stored through the shipped [`crate::tracker_host::stored::UPSERT`] under real SQLite and read back as the
+    /// recompute reads them (`tx_words.*`, [`crate::tracker_host::stored::Row::rechecked`]): the overlay's `seen`
+    /// event (the latch), then each `callback` event with Arcade's live body `bodies[i]` (the producer's own
+    /// `Verdict::from_arc_body`, `into_hint`, `terminal_word`, the step, `stored::project` and `mark_terminal`).
+    pub(crate) fn produced_word_views(
+        txid: &str,
+        bodies: &[&str],
+    ) -> std::collections::BTreeMap<String, Value> {
+        use crate::tracker_host::{runtime, stored, HeaderSnapshot};
+        let empty = || HeaderSnapshot {
+            tip: Ok(0),
+            headers: Default::default(),
+        };
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(stored::CREATE).unwrap();
+        let read = |db: &rusqlite::Connection| -> Option<stored::Row> {
+            db.query_row(
+                "SELECT tx_words.* FROM tx_words WHERE txid = ?1",
+                [txid],
+                |r| {
+                    Ok(stored::Row {
+                        txid: r.get("txid")?,
+                        word: r.get("word")?,
+                        tier: r.get("tier")?,
+                        height: r.get("height")?,
+                        proof_root: r.get("proof_root")?,
+                        proof_height: r.get("proof_height")?,
+                        proof_hex: r.get("proof_hex")?,
+                        header_hash: r.get("header_hash")?,
+                        hint_source: r.get("hint_source")?,
+                        hint_at: r.get("hint_at")?,
+                        updated_at: r.get("updated_at")?,
+                        legacy_body: r.get("legacy_body")?,
+                    })
+                },
+            )
+            .ok()
+        };
+        let write = |db: &rusqlite::Connection, row: &stored::Row| {
+            let binds: Vec<rusqlite::types::Value> = stored::upsert_binds(row)
+                .into_iter()
+                .map(|v| match v {
+                    Value::String(s) => rusqlite::types::Value::Text(s),
+                    Value::Number(n) => rusqlite::types::Value::Real(n.as_f64().unwrap()),
+                    _ => rusqlite::types::Value::Null,
+                })
+                .collect();
+            db.execute(stored::UPSERT, rusqlite::params_from_iter(binds))
+                .unwrap();
+        };
+        let params = bsv_tracker::Params { age_threshold: 60 };
+        let mut now = 1_000;
+        // the overlay's `seen` event: the latch's broadcaster
+        let mut state = stored::seed_hint(None, txid);
+        runtime::event_hints(&mut state, "seen", true, None, now);
+        let mut row = stored::project(None, &state, now, None);
+        runtime::mark_terminal(&mut row, None, None);
+        write(&db, &row);
+        for body in bodies {
+            now += 60;
+            let old = read(&db);
+            let mut state = stored::seed_hint(old.as_ref(), txid);
+            runtime::event_hints(&mut state, "callback", true, None, now);
+            let v = bsv_tracker::Verdict::from_arc_body(txid, body.as_bytes()).unwrap();
+            let hint = v.into_hint("arcade", now);
+            let terminal = runtime::terminal_word(&hint);
+            state
+                .step(&params, &empty(), bsv_tracker::Input::Hint(hint))
+                .unwrap();
+            let mut row = stored::project(old.as_ref(), &state, now, None);
+            runtime::mark_terminal(&mut row, old.as_ref(), terminal);
+            write(&db, &row);
+        }
+        let row = read(&db).unwrap();
+        [(txid.to_string(), row.rechecked(&empty()).unwrap())]
+            .into_iter()
+            .collect()
+    }
+
+    /// bsv-low #598 (the B-OWED-2 lens's HIGH-1, loop 22's p27/p28 shape): a SEEN-latched JOIN that Arcade then
+    /// answers REJECTED (or a double spend) on its callback, its word stored as this tip's producer stores it, takes
+    /// FIX-831's judgement through the real derivation (`unbound`, `funding-not-held`, `fundingHeld: refused`,
+    /// `fundingWord` the hint's refusal); a later SEEN callback does not lift it; a SEEN-only history, or a pot the
+    /// index proved, keeps `present-refund`. RED on bca99893's reading (the chain word alone, the mark unread): the
+    /// produced word is `seen`, the row `refund-due`, `present-refund`, claimable.
+    #[test]
+    fn fix598f_h1_a_refused_joins_produced_word_takes_the_funding_not_held_judgement() {
+        let pot = tx(0x02);
+        let body = |status: &str, extra: &str| {
+            format!(r#"{{"txid":"{pot}","txStatus":"{status}","extraInfo":"{extra}"}}"#)
+        };
+        let rejected = body("REJECTED", "arc error 461: missing inputs");
+        let double = body("DOUBLE_SPEND_ATTEMPTED", "");
+        let seen = body("SEEN_ON_NETWORK", "");
+        let e = [entry(
+            Some(false),
+            None,
+            Outcome::Unresolved,
+            Some(SeatLetter::A),
+        )];
+        let r = [refund_entry(RefundStatus::GateOpen)];
+        let mut valid = HashMap::new();
+        valid.insert(
+            format!("{pot}:0"),
+            ValidRefund {
+                raw_hex: "00".into(),
+                my_sats: Some(19_800),
+            },
+        );
+        let (c, p) = (HashSet::new(), HashSet::new());
+        let seen_only: HashSet<String> = [pot.clone()].into_iter().collect();
+        let judge = |words: &std::collections::BTreeMap<String, Value>, seen: &HashSet<String>| {
+            let unheld = refused_fundings(seen, words);
+            let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(900_005));
+            i.spender_words = Some(words);
+            i.funding_unheld = &unheld;
+            derive_owed_rows(&i)
+        };
+        for (history, want) in [
+            (vec![rejected.as_str()], "rejected"),
+            (vec![double.as_str()], "conflicted"),
+            (vec![rejected.as_str(), seen.as_str()], "rejected"),
+        ] {
+            let words = produced_word_views(&pot, &history);
+            assert_eq!(
+                words[&pot]["word"], "seen",
+                "the tracker keeps the word (NS-3): only the mark says refused"
+            );
+            let rows = judge(&words, &seen_only);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                (
+                    rows[0].family,
+                    &rows[0].facts["claim"],
+                    &rows[0].facts["claimable"]
+                ),
+                (
+                    OwedFamily::Unbound,
+                    &json!(FUNDING_NOT_HELD_CLAIM),
+                    &json!(false)
+                ),
+                "{history:?}: a refund of a funding Arcade refused is never a press"
+            );
+            assert_eq!(rows[0].facts["fundingHeld"], FUNDING_HELD_REFUSED);
+            assert_eq!(rows[0].facts["fundingWord"], want);
+            assert_eq!(rows[0].reason.as_deref(), Some(FUNDING_NOT_HELD_REASON));
+            assert_eq!(count_refund_funding_unheld(&rows), 1);
+            assert_eq!(
+                judge(&words, &HashSet::new())[0].facts["claim"],
+                "present-refund",
+                "the index's proof first"
+            );
+        }
+        let words = produced_word_views(&pot, &[seen.as_str()]);
+        assert!(
+            words[&pot].get("terminalHint").is_none(),
+            "an unmarked view is as before"
+        );
+        assert_eq!(
+            judge(&words, &seen_only)[0].facts["claim"],
+            "present-refund"
+        );
+        assert_eq!(
+            judge(&produced_word_views(&pot, &[]), &seen_only)[0].facts["claim"],
+            "present-refund",
+            "the latch alone"
+        );
+    }
+
+    /// bsv-low #598 (the B-OWED-2 lens's HIGH-1 (c)): the refusal reads a CHAIN-tier word, never a hint-tier word of
+    /// the same name, and a mined view (a checked proof) is never refused whatever its body carries; the producer's
+    /// mark is cleared by a mined word (`mark_terminal`). RED with the tier unread.
+    #[test]
+    fn fix598f_h1_c_the_refusal_reads_the_chain_tier_and_a_mined_word_clears_the_mark() {
+        let pot = tx(0x02);
+        let one = |v: Value| -> std::collections::BTreeMap<String, Value> {
+            [(pot.clone(), v)].into_iter().collect()
+        };
+        for word in ["rejected", "conflicted"] {
+            assert_eq!(
+                funding_refusal_word(Some(&one(json!({"word": word, "tier": "hint"}))), &pot),
+                None,
+                "{word} at the hint tier"
+            );
+            assert_eq!(
+                funding_refusal_word(Some(&one(json!({"word": word, "tier": "chain"}))), &pot),
+                Some(word)
+            );
+        }
+        assert_eq!(
+            funding_refusal_word(
+                Some(&one(
+                    json!({"word": "mined", "tier": "chain", "terminalHint": "rejected"})
+                )),
+                &pot
+            ),
+            None
+        );
+        let mut words = produced_word_views(&pot, &[r#"{"txStatus":"REJECTED"}"#]);
+        assert_eq!(words[&pot]["terminalHint"], "rejected");
+        let marked = crate::tracker_host::stored::Row {
+            txid: pot.clone(),
+            word: "mined".into(),
+            tier: "chain".into(),
+            height: None,
+            proof_root: None,
+            proof_height: None,
+            proof_hex: None,
+            header_hash: None,
+            hint_source: None,
+            hint_at: None,
+            updated_at: 1.0,
+            legacy_body: Some(
+                r#"{"trackerTerminal":true,"trackerTerminalWord":"rejected"}"#.into(),
+            ),
+        };
+        let mut row = marked.clone();
+        crate::tracker_host::runtime::mark_terminal(&mut row, Some(&marked), Some("rejected"));
+        assert_eq!(
+            row.legacy_body.as_deref(),
+            Some(r#"{"trackerTerminal":false}"#)
+        );
+        assert_eq!(row.terminal_hint(), None);
+        words.clear();
+    }
+
     /// bsv-low #831 (the FIX-831 lens's L3): `owed_refund_funding_unheld_total` moves by exactly ONE for fix831_a's
     /// pot judged funding-not-held, and by ZERO for the same pot with its funding held, through the shipped count and
     /// the census's pending deltas (`courier::take_pending_if_due`, this test thread's own map).
@@ -9704,6 +10230,127 @@ pub(crate) mod tests {
             .as_deref()
             .unwrap()
             .contains("could not check"));
+    }
+
+    /// bsv-low #608 (the E606 lens's deferred (a)): a "could not judge the spender" row whose story rests on NO spender
+    /// bytes is re-judged on the NEXT read once a minute has passed (#606 made the bytes readable between passes), not
+    /// only when the open list ages out at 5 minutes; a row whose bytes WERE read (a positive story) keeps the 5-minute
+    /// rule, and inside the minute nothing recomputes (a dead courier never makes every read recompute). Written over
+    /// the shipped API alone, so it runs on 45b83a32: RED there at "a could-not-judge row with no bytes is re-judged
+    /// on the next read past a minute".
+    #[test]
+    fn fix608_a_could_not_judge_row_resting_on_no_spender_bytes_is_rejudged_on_the_next_read() {
+        let (v, c) = (HashMap::new(), HashSet::new());
+        let pots: HashSet<String> = HashSet::new();
+        let elsewhere = [hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000))];
+        let unread = derive_owed_rows(&inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000)));
+        assert_eq!(unread.len(), 1);
+        assert!(unread[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("could not judge"));
+        let at = |age_ms: i64, rows: &[OwedRow]| {
+            should_recompute(false, age_ms, Some(900_000), Some(900_000), rows)
+        };
+        assert!(
+            !at(59_000, &unread),
+            "inside the minute a read serves the snapshot (the bound)"
+        );
+        assert!(
+            at(61_000, &unread),
+            "a could-not-judge row with no bytes is re-judged on the next read past a minute"
+        );
+        // a faulted pot-spenders read is the same mark
+        let mut i = inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000));
+        i.pot_spenders_faulted = true;
+        assert!(
+            at(61_000, &derive_owed_rows(&i)),
+            "a faulted read is re-judged too"
+        );
+        // the spender's BYTES read (they pay no home of mine): a positive story, the open list's 5-minute rule alone
+        let outs = pays(&tx(0x09), &[(0, "ab", 1_000, None)]);
+        let mut j = inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000));
+        j.spender_outputs = &outs;
+        let judged = derive_owed_rows(&j);
+        assert!(
+            !judged[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("could not judge"),
+            "the bytes tell a story: {:?}",
+            judged[0].reason
+        );
+        assert!(
+            !at(61_000, &judged),
+            "a story with its bytes waits for the 5-minute rule"
+        );
+        assert!(at(6 * 60_000, &judged));
+    }
+
+    /// bsv-low #608 (the B-OWED-2 lens's LOW-1): a spender the pass's OWN bound withheld (the courier cap, the clock,
+    /// the stored-read tail) is no absence of bytes: its row's mark comes off ([`unmark_withheld_spenders`]) and the
+    /// read waits for the open list's 5 minutes; a spender looked at with no bytes keeps the minute, and so does every
+    /// row of a pass whose pot-spenders read faulted. The read counts a recompute only the rule asked for
+    /// ([`spender_rejudge_only`], `owed_spender_rejudge_total`, seeded by the overlay). RED with the unmark inert
+    /// ("a withheld spender waits for the open list").
+    #[test]
+    fn fix608f_l1_a_withheld_spender_is_no_unread_bytes_and_a_rejudge_is_counted() {
+        let (v, c) = (HashMap::new(), HashSet::new());
+        let pots: HashSet<String> = HashSet::new();
+        let elsewhere = [hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000))];
+        let at = |age_ms: i64, rows: &[OwedRow]| {
+            should_recompute(false, age_ms, Some(900_000), Some(900_000), rows)
+        };
+        let only = |age_ms: i64, rows: &[OwedRow]| {
+            spender_rejudge_only(false, age_ms, Some(900_000), Some(900_000), rows)
+        };
+        let withheld: HashSet<String> = [tx(0x09)].into_iter().collect();
+        let mut rows =
+            derive_owed_rows(&inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000)));
+        assert!(at(61_000, &rows) && only(61_000, &rows));
+        assert!(
+            !only(59_000, &rows) && !only(6 * 60_000, &rows),
+            "the 5-minute rule asks on its own"
+        );
+        // looked at, no bytes (nothing withheld): the minute stands
+        let mut looked = rows.clone();
+        assert_eq!(
+            unmark_withheld_spenders(&mut looked, &HashSet::new(), false),
+            0
+        );
+        assert!(at(61_000, &looked));
+        // withheld by the pass's bound: the mark comes off, the open list's rule alone
+        assert_eq!(unmark_withheld_spenders(&mut rows, &withheld, false), 1);
+        assert!(
+            !at(61_000, &rows),
+            "a withheld spender waits for the open list"
+        );
+        assert!(at(6 * 60_000, &rows));
+        // a faulted pot-spenders read keeps every mark
+        let mut i = inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000));
+        i.pot_spenders_faulted = true;
+        let mut faulted = derive_owed_rows(&i);
+        assert_eq!(unmark_withheld_spenders(&mut faulted, &withheld, true), 0);
+        assert!(at(61_000, &faulted));
+        // the counter is seeded by the overlay's list (pinned equal by `obs_counters_tests`)
+        assert!(owed_mirrored_counter_names()
+            .iter()
+            .any(|n| n == COUNTER_SPENDER_REJUDGE));
+        // the route's wiring
+        // rustfmt wraps the call and leaves a trailing comma before `)`: the match reads `,)` as `)`
+        let routes: String = include_str!("routes.rs")
+            .split_whitespace()
+            .collect::<String>()
+            .replace(",)", ")");
+        for needle in [
+            "crate::owed::unmark_withheld_spenders(&mut rows, &spenders_withheld, inputs.pot_spenders_faulted); let withheld_outpoints =",
+            "if crate::owed::spender_rejudge_only(stale, age_ms, prev_tip, tip_now, &rows) { crate::owed::note_spender_rejudge(); }",
+        ] {
+            let n: String = needle.split_whitespace().collect();
+            assert!(routes.contains(&n), "the route: {needle}");
+        }
     }
 
     #[test]
@@ -11173,6 +11820,57 @@ pub(crate) mod tests {
         assert!(
             served().is_empty(),
             "filings that name no payout transaction of the game change nothing"
+        );
+    }
+
+    /// bsv-low #492 (the collect pass of 2026-09-20, p3's game `09f991df…`: the wallet held `+39,200 f40fa0d4…` since
+    /// the live credit, the row stayed claimable and the press said "Collected" over sats already held): a payout row
+    /// whose HOME OUTPUT (`payTxid`:`payVout`) the index holds SPENT is not a row (the wallet held it and its own key
+    /// spent it on), by the INDEX's word alone; an unspent or unread home keeps the row byte for byte, and no other
+    /// family is touched. RED with the retirement inert (`retire_index_spent_homes` keeping every row).
+    #[test]
+    fn fix492_a_payout_whose_home_output_the_index_holds_spent_is_not_a_row() {
+        let paid = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        )];
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let derived = derive_owed_rows(&inputs(&paid, &[], &[], &v, &c, &p, Some(900_200)));
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].family, OwedFamily::Payout);
+        assert_eq!(derived[0].facts["claimable"], true, "today: a press");
+        let settle = derived[0].facts["payTxid"].as_str().unwrap().to_string();
+        // no vout named yet: no home to read, nothing retired
+        assert!(payout_home_outpoints(&derived).is_empty());
+        // the route names the vout from the spend's bytes (`mark_pay_vouts`)
+        let mut named = derived.clone();
+        named[0].facts["payVout"] = json!(1);
+        assert_eq!(payout_home_outpoints(&named), vec![(settle.clone(), 1)]);
+        // the index holds the home output UNSPENT (or another output spent): the row stands, byte for byte
+        let other: HashSet<String> = [outpoint_key(&settle, 0)].into_iter().collect();
+        let mut kept = named.clone();
+        assert_eq!(retire_index_spent_homes(&mut kept, &other), 0);
+        assert_eq!(kept, named);
+        // the index holds it SPENT: not a row
+        let spent: HashSet<String> = [outpoint_key(&settle, 1)].into_iter().collect();
+        let mut gone = named.clone();
+        assert_eq!(
+            retire_index_spent_homes(&mut gone, &spent),
+            1,
+            "a payout the wallet already received and spent on is never a press"
+        );
+        assert!(gone.is_empty());
+        // a non-payout row naming the same outpoint is untouched
+        let mut unbound = named.clone();
+        unbound[0].family = OwedFamily::Unbound;
+        assert_eq!(retire_index_spent_homes(&mut unbound, &spent), 0);
+        // the statement: one PK term per outpoint, two binds each, spent rows only
+        assert_eq!(
+            payout_home_spent_sql(2),
+            "SELECT lower(txid) AS txid, outputIndex FROM pot_records WHERE spent = 1 AND \
+             ((txid = ?1 AND outputIndex = ?2) OR (txid = ?3 AND outputIndex = ?4))"
         );
     }
 

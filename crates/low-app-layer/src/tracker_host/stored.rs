@@ -52,7 +52,29 @@ impl Row {
         } else {
             Value::Null
         };
-        json!({"word":self.word,"tier":self.tier,"height":self.height.map(|h| h as u32),"verifyPath":verify,"source":self.hint_source,"at":self.hint_at.map(|t| t as u64)})
+        let mut view = json!({"word":self.word,"tier":self.tier,"height":self.height.map(|h| h as u32),"verifyPath":verify,"source":self.hint_source,"at":self.hint_at.map(|t| t as u64)});
+        if let Some(word) = self.terminal_hint() {
+            view["terminalHint"] = json!(word);
+        }
+        view
+    }
+    /// bsv-low #598 (the B-OWED-2 lens's HIGH-1): the terminal Arcade hint the row's producer marked
+    /// (`runtime::mark_terminal`: `trackerTerminal`, `trackerTerminalWord`), served on [`Row::view`] as the additive
+    /// `terminalHint` (absent on every unmarked row, so those views are byte for byte as before): `rejected`,
+    /// `conflicted`, or `terminal` for a mark written before the word was recorded. Never on a mined row (the mark is
+    /// cleared there).
+    pub fn terminal_hint(&self) -> Option<String> {
+        if self.word == "mined" {
+            return None;
+        }
+        let body: Value = serde_json::from_str(self.legacy_body.as_deref()?).ok()?;
+        if body["trackerTerminal"] != json!(true) {
+            return None;
+        }
+        Some(match body["trackerTerminalWord"].as_str() {
+            Some(w @ ("rejected" | "conflicted")) => w.to_string(),
+            _ => "terminal".to_string(),
+        })
     }
     /// The stored mined row's State: its retained proof stepped against the snapshot it recorded (its own header),
     /// so the word is `mined` with no re-ask. [`Row::rechecked`] and the chain-event intake
@@ -170,29 +192,35 @@ pub async fn read(env: &worker::Env, ids: &[String]) -> worker::Result<BTreeMap<
     }
     Ok(rows)
 }
+/// The [`UPSERT`]'s twelve binds of `row`, in its column order (`write`'s; a native pin binds them under real
+/// SQLite).
+pub fn upsert_binds(row: &Row) -> Vec<Value> {
+    let value = serde_json::to_value(row).expect("a row serializes");
+    UPSERT_COLUMNS.iter().map(|k| value[*k].clone()).collect()
+}
+const UPSERT_COLUMNS: [&str; 12] = [
+    "txid",
+    "word",
+    "tier",
+    "height",
+    "proof_root",
+    "proof_height",
+    "proof_hex",
+    "header_hash",
+    "hint_source",
+    "hint_at",
+    "updated_at",
+    "legacy_body",
+];
 pub async fn write(env: &worker::Env, row: &Row) -> worker::Result<()> {
-    let value = serde_json::to_value(row).map_err(|e| worker::Error::RustError(e.to_string()))?;
-    let binds: Vec<_> = [
-        "txid",
-        "word",
-        "tier",
-        "height",
-        "proof_root",
-        "proof_height",
-        "proof_hex",
-        "header_hash",
-        "hint_source",
-        "hint_at",
-        "updated_at",
-        "legacy_body",
-    ]
-    .iter()
-    .map(|k| match &value[*k] {
-        Value::String(s) => JsValue::from_str(s),
-        Value::Number(n) => JsValue::from_f64(n.as_f64().unwrap()),
-        _ => JsValue::NULL,
-    })
-    .collect();
+    let binds: Vec<_> = upsert_binds(row)
+        .iter()
+        .map(|v| match v {
+            Value::String(s) => JsValue::from_str(s),
+            Value::Number(n) => JsValue::from_f64(n.as_f64().unwrap()),
+            _ => JsValue::NULL,
+        })
+        .collect();
     env.d1("OVERLAY_DB")?
         .prepare(UPSERT)
         .bind(&binds)?
