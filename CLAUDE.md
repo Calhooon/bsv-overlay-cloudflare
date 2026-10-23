@@ -2774,13 +2774,16 @@ slice raced the node in flight, so a request started near the slice's end
 was cut, discarded and fetched again the next pass.
 
 - **Per resume.** Each resume walks under a fresh per-graph slice of its
-  own (`gasp.rs`, the resume arm of `ingest`: `earlier_of(own, share)`).
+  own (`gasp.rs`, the resume arm of `ingest`: the latched own deadline).
   The resumes' share (`with_resume_share`, set by the engine whenever a
-  per-peer budget is) GATES them: it is read before a resume starts (one
-  reached past it is held back, as before) and before each step, beside the
-  resume's own slice; the per-peer deadline (D16) bounds them all. With no
-  share no time bound is shared. The counted limbs (calls, bytes, nodes)
-  stay shared by the resumes of a sync (`resume_left`): they bound what a
+  per-peer budget is) is read ONLY before a resume starts: one reached
+  past it is held back, and a started resume keeps its own slice. The
+  share is 33% of the peer budget, independent of the graph slice (39.6 s
+  on a 120 s peer; LOW's 30 s peer still has 9.9 s). This also folds the
+  lens's counterfactual A: case 3a's three seven-node graphs at 3 s a node
+  all converge on pass two in 27 s. The per-peer deadline (D16) bounds them
+  all. With no share no time bound is shared. The counted limbs (calls,
+  bytes, nodes) stay shared by the resumes of a sync (`resume_left`): they bound what a
   peer's held records cost in requests, and #377 found no graph near its
   100 calls.
 - **Finish the node.** The time limb is read BEFORE a step, as the counted
@@ -2793,23 +2796,33 @@ was cut, discarded and fetched again the next pass.
 - **The default slice.** `DEFAULT_GRAPH_BUDGET_MS` stays 60 s, sized from
   the measured pace (2 to 3 s a node on Zanaadu's cron, 1.2 s on beta: 20
   to 50 nodes). The config is the host's. Stated: `start_gasp_sync` holds
-  any configured slice at most `meter::ROOT_MAX_MS` (15 s, the hard bound of
-  one root's walk), so the 60 s default and any host value above 15 s are in
-  force as 15 s; lifting that bound is the courier budget's call, not made
-  here. LOW's worker keeps its 15 s.
+  any configured slice at most `meter::ROOT_MAX_MS` (15 s, the graph slice
+  clamp), so the 60 s default and any host value above 15 s are in force as
+  15 s. The clamp is unchanged by the fold; the owner's ruling on lifting
+  it is pending. LOW's worker keeps its 15 s.
 
-What it costs: a resume started inside the share can run up to one slice
-past it (one node, finished, is at most a slice; on LOW's worker the share
-9.9 s plus a node in flight), so the page keeps less than 0.1.11's 20.1 s in
-the worst case: the per-peer deadline is the outer bound. The reference has
-no budget. Pins (`-p bsv-overlay-engine --features memory-storage --lib`):
+What it costs: a resume started inside the share can finish its own slice
+and then its last node's slice. The held loop's walk bound is therefore the
+share plus TWO slices, capped by the per-peer deadline, not the lens's
+share plus one slice. The four-graph pin starts its last resume at 37.5 s
+inside the 39.6 s share and finishes at 61.5 s, past share plus one slice.
+LOW's 30 s peer budget remains the outer bound; no page time is guaranteed
+in that worst case. With no peer budget, up to sixteen held records each
+get a walk slice and a finishing-node slice, subject to shared counted
+limbs. Finalize/storage latency is not promised by those walk bounds. The
+reference has no budget. Pins (`-p bsv-overlay-engine --features
+memory-storage --lib`):
 `i590_a` (7 nodes, 2 s a request, a 5 s slice: 3 passes holding 3 then 5
 nodes, each link fetched once, the root once a pass by #555's re-ask; RED on
 `65027163`: `[Some(2), Some(3), Some(4), Some(5), Some(6), None]`), `i590_b`
 (the node started at 4 s ends at 6 s and is kept; RED `Some(2)`), `i590_c`
 (two resumes in one sync, none held back; RED `resumed_graphs` 1 for 2);
-amended: `obligations_0111_*` (the fourth resume finishes its request and
-defers with its root: not stalled, not idle; RED on `65027163` `(1, 1)`) and
+fold pins: `ident_fold_m1_*` (case 3a and a started resume finishing past
+the share); amended: `obligations_0111_*` (the fourth resume finishes its
+walk and strikes the unavailable ancestor, while eleven page roots
+land and the twelfth, cut by the peer deadline, remains held behind the
+earlier faults until their backoff frees its resume share, landing on pass
+ten in this fourteen-fault fixture) and
 `load_0112_call_limit_fallback_keeps_the_root_deadline` (its courier now
 outlasts a whole node slice).
 

@@ -78,32 +78,8 @@ pub fn latched(deadline: crate::engine::SleepFuture) -> crate::engine::SleepFutu
     }))
 }
 
-/// A latched deadline several futures read (bsv-low #590: the resumes'
-/// share, read by each resume beside its own slice).
+/// The latched share deadline, read before each resume starts.
 type SharedDeadline = std::rc::Rc<std::cell::RefCell<crate::engine::SleepFuture>>;
-
-/// Whichever of `own` and `shared` falls due first (bsv-low #590): a
-/// resume's own slice beside the resumes' share. Both are latched, so either
-/// may be polled after it fell due; `shared` stays readable by the next
-/// resume. `None`: `own` alone.
-fn earlier_of(
-    own: crate::engine::SleepFuture,
-    shared: Option<SharedDeadline>,
-) -> crate::engine::SleepFuture {
-    let Some(shared) = shared else {
-        return own;
-    };
-    let mut own = own;
-    Box::pin(std::future::poll_fn(move |cx| {
-        let mine = own.as_mut().poll(cx).is_ready();
-        let theirs = shared.borrow_mut().as_mut().poll(cx).is_ready();
-        if mine || theirs {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
-        }
-    }))
-}
 
 /// What makes a deadline COOPERATIVE around a write (bsv-low #552, the lens
 /// fold's HIGH-1). `Engine::submit` is several storage writes (mark spent,
@@ -441,7 +417,7 @@ pub const DEFAULT_GRAPH_BUDGET_CALLS: u32 = 100;
 /// and is cut only past a whole slice of its own (the finish-the-node
 /// rule). The config is the host's (`Engine::set_graph_budget`). Stated:
 /// `Engine::start_gasp_sync` holds a configured slice at most
-/// [`crate::meter::ROOT_MAX_MS`] (15 s, the hard bound of one root's walk),
+/// [`crate::meter::ROOT_MAX_MS`] (15 s, the graph slice clamp),
 /// so this default and any host value above 15 s are in force as 15 s.
 pub const DEFAULT_GRAPH_BUDGET_MS: u64 = 60_000;
 
@@ -575,37 +551,20 @@ pub const IDLE_RESUMES_BEFORE_BACKOFF: u32 = 3;
 /// four resumes a day instead of 1,440.
 pub const IDLE_RESUME_RETRY_SECS: u64 = UNANCHORABLE_RETRY_SECS;
 
-/// The share of the per-PEER sync budget the resumes of one pass may take
-/// together, in percent (engine 0.1.11): the held records are walked ahead
-/// of the page, so without a share of its own the page got what they left.
-/// The rest of the slice is the page's.
-///
-/// 33: on the stack's worker the per-peer budget is 30,000 ms
-/// (`GASP_PEER_SYNC_BUDGET_MS`) and one graph's own budget 15,000 ms
-/// (`GASP_GRAPH_BUDGET_MS`), which was the resumes' shared deadline (the lens
-/// fold's M1) and started at the opening resume, so the reads and writes of
-/// the storage between resumes (a record read, its save or drop, the
-/// settled read: about five a record) came on top of it, outside any race.
-/// The share is [`resume_share_ms`]: `min(30,000 * 33 / 100, 15,000)` =
-/// 9,900 ms, started when the held loop starts, so those storage calls are
-/// inside it. The page keeps 20,100 ms: one fresh graph's whole 15,000 ms
-/// budget and 5,100 ms for its listing pages, the finalize submits and the
-/// storage. The courier's rungs (bitails, woc, bananablocks, asked in turn)
-/// have no timeout of their own (the worker's `http_get` sets none): a rung
-/// is cut only by the deadline its step races, which inside the held loop is
-/// this share. The worker sizes a courier attempt at 500 ms
-/// (`GASP_PROOF_FETCH_BUDGET`, a planning figure, not a measurement), so the
-/// share holds about 20 attempts: about 6 resumes of fact 3's shape (a root
-/// request, a root proof ask and an ancestor's three rungs), the rest held
-/// back to the next run. A record held back by the share is not resumed, not
-/// a failed UTXO, not a stalled walk and not an idle resume.
+/// The share of the per-peer budget inside which held resumes may START.
+/// The share starts with the held loop and includes its storage calls.
+/// A started resume keeps its own graph slice, including a finishing
+/// node's slice; the per-peer deadline remains the outer bound. The page
+/// gets the time left after those resumes, with no guaranteed reserve.
+/// A held-back record is not resumed, failed, stalled or counted idle.
 pub const RESUMES_SHARE_OF_PEER_BUDGET_PERCENT: u64 = 33;
 
-/// The resumes' share of a pass, ms (engine 0.1.11): the
-/// [`RESUMES_SHARE_OF_PEER_BUDGET_PERCENT`] of the per-peer budget, never
-/// more than one graph's own budget (the shared deadline before 0.1.11).
-pub fn resume_share_ms(peer_budget_ms: u64, graph_budget_ms: u64) -> u64 {
-    (peer_budget_ms.saturating_mul(RESUMES_SHARE_OF_PEER_BUDGET_PERCENT) / 100).min(graph_budget_ms)
+/// The resumes' start window, independent of the graph slice (#590).
+/// The graph argument is retained for source compatibility. The worker's
+/// 30 s peer still gives 9.9 s; a 120 s peer gives 39.6 s even with the
+/// unchanged 15 s graph clamp (IDENT-ENGINE-LENS counterfactual A).
+pub fn resume_share_ms(peer_budget_ms: u64, _graph_budget_ms: u64) -> u64 {
+    peer_budget_ms.saturating_mul(RESUMES_SHARE_OF_PEER_BUDGET_PERCENT) / 100
 }
 
 /// The reason prefix of a root's record while its fault streak is under
@@ -1676,9 +1635,9 @@ pub struct GASPSync<'a> {
     /// sync (keys only; records are read one at a time).
     deferred: std::cell::RefCell<std::collections::HashSet<String>>,
     /// The resumes' share of the pass ([`Self::with_resume_share`]), made
-    /// when the held loop starts: read BEFORE each resume (one started past
-    /// it is held back) and before each step of a resume's walk, beside the
-    /// resume's own slice (bsv-low #590). `None`: no shared time bound.
+    /// when the held loop starts: read only BEFORE each resume (one reached
+    /// past it is held back). A started resume walks under its own slice
+    /// (bsv-low #590). `None`: no shared time bound.
     resume_deadline: std::cell::RefCell<Option<SharedDeadline>>,
     /// What every resume of the sync may still spend together (M1).
     resume_left: std::cell::Cell<PassCap>,
@@ -2488,12 +2447,10 @@ impl<'a> GASPSync<'a> {
     /// saved hold permits cursor progress; an unsaved graph remains a gap.
     /// Bound the resumes of each pass by `share` (engine 0.1.11): ONE
     /// deadline for every held record walked ahead of the page, started when
-    /// the held loop starts, so the page keeps the rest of the per-peer
-    /// slice (see [`RESUMES_SHARE_OF_PEER_BUDGET_PERCENT`]). A record reached
-    /// once it fell due is held back for the next sync. Since bsv-low #590
+    /// the held loop starts (see [`RESUMES_SHARE_OF_PEER_BUDGET_PERCENT`]).
+    /// A record reached once it fell due is held back for the next sync. Since bsv-low #590
     /// the share GATES the resumes and each walks under a slice of its own:
-    /// it is read before a resume starts and before each of its steps, and a
-    /// node in flight finishes (the finish-the-node rule). Without one each
+    /// it is read only before a resume starts, and a node in flight finishes (the finish-the-node rule). Without one each
     /// resume has its own slice and no time bound is shared (until #590 they
     /// shared one per-graph deadline, the lens fold's M1); the per-peer
     /// deadline bounds them.
@@ -3318,7 +3275,7 @@ impl<'a> GASPSync<'a> {
         // walks under a fresh slice of its own (`budget.deadline`), so a
         // deferred graph gets a whole slice each pass; the resumes' share,
         // when one is set, is read before the resume starts (one started
-        // past it is held back) and before each step, and the per-peer
+        // past it is held back), never during a started walk. The per-peer
         // deadline (D16) bounds them all. Until #590 every resume of a sync
         // shared ONE deadline (the lens fold's M1: the share, or the first
         // resume's slice), so a resume that started late in it got what the
@@ -3388,7 +3345,7 @@ impl<'a> GASPSync<'a> {
             self.bytes_fetched.get(),
             self.nodes_appended.get(),
         );
-        let mut deadline = earlier_of(latched((budget.deadline)()), share);
+        let mut deadline = latched((budget.deadline)());
         let ingested = self
             .ingest_budgeted(utxo, outpoint, &mut deadline, cap, true)
             .await;
