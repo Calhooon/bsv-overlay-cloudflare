@@ -2168,6 +2168,28 @@ async fn submit_parts(
     // now redelivered, never vanished. The decision is derived ONCE
     // (`mutation_ack`) and consumed as an enum.
     let applied_before: Vec<String> = mutation_report.deduped_topics.clone();
+    // bsv-low #837: a RE-PRESENT of a JOIN the index already holds under `tm_pot` (deduped there) is the client's
+    // ladder after a door answer that admitted nothing; its hops may never have been judged under `tm_lowfund`
+    // against coins the topic held. Record them from the JOIN's stored bytes, off the request path.
+    if applied_before
+        .iter()
+        .any(|t| overlay_discovery::name_matches(t, "tm_pot"))
+    {
+        if let (Ok(tx), Ok(db)) = (
+            beef_limits::transaction_from_beef(
+                &tagged_beef.beef,
+                None,
+                &beef_limits::EF_BEEF_LIMITS,
+            ),
+            env.d1("OVERLAY_DB"),
+        ) {
+            let txid = tx.id();
+            ctx.wait_until(async move {
+                crate::admit_fast::record_join_hop_spends_on(&db, &txid, "POST /submit re-present")
+                    .await;
+            });
+        }
+    }
     let enqueue_outcome = if mutation_report.is_durable() {
         None
     } else {
@@ -3877,6 +3899,11 @@ pub async fn admin_readmit(
         }
     };
     if renotified.outputs > 0 {
+        // bsv-low #837: a JOIN re-notified (or re-submitted below) under `tm_pot` alone is never judged under
+        // `tm_lowfund`: its hops are recorded from its stored bytes
+        if let Ok(db) = env.d1("OVERLAY_DB") {
+            crate::admit_fast::record_join_hop_spends_on(&db, &txid, "POST /admin/readmit").await;
+        }
         let discovery = readmit_spend_discovery(env, &txid, &renotified.vouts).await;
         worker::console_log!(
             "POST /admin/readmit -> 200 renotified outputs={} notified={} faults={} discovery={discovery}",
@@ -3975,6 +4002,10 @@ pub async fn admin_readmit(
                 .get(&topic)
                 .map(|a| a.outputs_to_admit.clone())
                 .unwrap_or_default();
+            if let Ok(db) = env.d1("OVERLAY_DB") {
+                crate::admit_fast::record_join_hop_spends_on(&db, &txid, "POST /admin/readmit")
+                    .await;
+            }
             let discovery = readmit_spend_discovery(env, &txid, &admitted).await;
             worker::console_log!(
                 "POST /admin/readmit -> 200 resubmitted admitted={admitted:?} deduped={:?} faults={} discovery={discovery}",

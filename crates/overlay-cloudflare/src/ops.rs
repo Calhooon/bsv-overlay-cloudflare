@@ -521,6 +521,14 @@ pub const COUNTER_MISSING_SPEND_DISCOVERED: &str = "missing_spend_discovered_tot
 pub const COUNTER_MISSING_SPEND_FAULTS: &str = "missing_spend_faults_total";
 /// Discoveries on new-era rows.
 pub const COUNTER_MISSING_SPEND_DISCOVERED_NEW_ERA: &str = "missing_spend_discovered_new_era_total";
+/// bsv-low #837 (the FIX-837 lens's MEDIUM-1): JOIN inputs the discovery pass's hop-spend write left past a JOIN's
+/// bound (`JOIN_HOP_INPUTS_MAX`), and pot candidates whose JOIN its per-pass read budget (`JOIN_HOP_READS_PER_PASS`)
+/// left unread: each is read by a later pass, never dropped. A rising value is a JOIN wider than an honest one.
+pub const COUNTER_MISSING_SPEND_JOIN_HOP_INPUTS_DEFERRED: &str =
+    "missing_spend_join_hop_inputs_deferred_total";
+/// Pot candidates whose JOIN the per-pass budget left unread (above).
+pub const COUNTER_MISSING_SPEND_JOIN_HOP_POTS_DEFERRED: &str =
+    "missing_spend_join_hop_pots_deferred_total";
 /// bsv-low (2026-09-04): per-courier-rung lifetime tallies —
 /// `courier_<rung>_{ok,fault,skipped}_total` for every rung in
 /// [`crate::proof_fetcher::COURIER_RUNGS`] ("skipped" = the rung's circuit
@@ -625,12 +633,21 @@ pub async fn record_missing_spend_pass(
     discovered: u64,
     faults: u64,
     discovered_new_era: u64,
+    join_hop_deferred: (u64, u64),
 ) {
     for (name, delta) in [
         (COUNTER_MISSING_SPEND_SCANNED, scanned),
         (COUNTER_MISSING_SPEND_DISCOVERED, discovered),
         (COUNTER_MISSING_SPEND_FAULTS, faults),
         (COUNTER_MISSING_SPEND_DISCOVERED_NEW_ERA, discovered_new_era),
+        (
+            COUNTER_MISSING_SPEND_JOIN_HOP_INPUTS_DEFERRED,
+            join_hop_deferred.0,
+        ),
+        (
+            COUNTER_MISSING_SPEND_JOIN_HOP_POTS_DEFERRED,
+            join_hop_deferred.1,
+        ),
     ] {
         if delta > 0 {
             bump_counter(db, name, delta).await;
@@ -1528,6 +1545,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_MISSING_SPEND_DISCOVERED: 0,
         COUNTER_MISSING_SPEND_FAULTS: 0,
         COUNTER_MISSING_SPEND_DISCOVERED_NEW_ERA: 0,
+        COUNTER_MISSING_SPEND_JOIN_HOP_INPUTS_DEFERRED: 0,
+        COUNTER_MISSING_SPEND_JOIN_HOP_POTS_DEFERRED: 0,
         // bsv-low M19B-G1: the Arcade reorg-event consumer: seeded to 0 so
         // "never ran" reads as an explicit 0, never as an absent key.
         COUNTER_ARCADE_REORG_EVENTS: 0,

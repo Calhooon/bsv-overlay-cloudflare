@@ -513,6 +513,11 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
         (Method::Post, "/internal/retire-pass") => {
             crate::proof_fetcher::internal_retire_pass(req, &env).await
         }
+        // bsv-low #837 (the FIX-837 lens's MEDIUM-1): ONE missing-spend discovery pass on demand, the tick's own
+        // function (bearer INTERNAL_TOKEN; body empty or {}), so the D1 budget tier measures the JOIN hop-spend bound.
+        (Method::Post, "/internal/missing-spend-pass") => {
+            crate::proof_fetcher::internal_missing_spend_pass(req, &env).await
+        }
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
         (Method::Post, "/requestForeignGASPNode") => request_foreign_gasp_node(&engine, req).await,
         (Method::Post, "/requestForeignGASPNodes") => {

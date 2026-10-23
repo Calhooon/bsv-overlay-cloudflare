@@ -638,7 +638,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     )
     .await;
     worker::console_log!(
-        "Scheduled: missing-spend discovery (pot_records) ; scanned={} discovered={} by_script={} no_hint={} unbound={} faults={} write_errors={} hop_rows={} new_era={} couriers={:?}",
+        "Scheduled: missing-spend discovery (pot_records) ; scanned={} discovered={} by_script={} no_hint={} unbound={} faults={} write_errors={} hop_rows={} new_era={} join_hops_marked={} join_hop_reads={} join_hop_inputs_deferred={} join_hop_pots_deferred={} couriers={:?}",
         missing.scanned,
         missing.discovered,
         missing.by_script,
@@ -648,6 +648,10 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         missing.write_errors,
         missing.hop_rows,
         missing.discovered_new_era,
+        missing.join_hops_marked,
+        missing.join_hop_reads,
+        missing.join_hop_inputs_deferred,
+        missing.join_hop_pots_deferred,
         discovery_fetcher.rung_stats()
     );
     // 2026-09-04: each rung's ok/fault/skipped this tick → the lifetime
@@ -669,6 +673,10 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         missing.discovered as u64,
         missing.faults as u64,
         missing.discovered_new_era as u64,
+        (
+            missing.join_hop_inputs_deferred as u64,
+            missing.join_hop_pots_deferred as u64,
+        ),
     )
     .await;
     worker::console_log!(

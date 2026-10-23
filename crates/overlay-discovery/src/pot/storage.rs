@@ -953,6 +953,26 @@ pub trait PotStorage {
         Ok(false)
     }
 
+    /// bsv-low #837 (the FIX-837 lens's LOW-3): mark one row spent by `spending_txid` as an UNCONFIRMED pointer ONLY
+    /// while it holds no pointer at all (`spent = 0`, no `spending_txid`, not confirmed), the guard inside the write
+    /// itself (the readmission's `remark_pot_spend_sql` shape, `AND spendingTxid IS NULL`). The writer of
+    /// [`record_join_hop_spends`](crate::pot::lowfund_topic_manager::record_join_hop_spends): its read and its write
+    /// are separated by awaits, and a pointer another writer lands between them (the conflict pass's competitor, a
+    /// sweep's own admission) is never overwritten by the JOIN's. `spender_final` is the spender's bytes-finality, as
+    /// [`mark_spent`](Self::mark_spent) writes it on a new pointer. `Ok(true)` when it wrote.
+    ///
+    /// Default `Ok(false)`, fail-closed (the CAS idiom of this trait): a backend that cannot guard never writes on
+    /// this road, and the caller counts the row as already pointed.
+    async fn mark_spent_if_unpointed(
+        &self,
+        _txid: &str,
+        _output_index: u32,
+        _spending_txid: &str,
+        _spender_final: Option<bool>,
+    ) -> Result<bool, PotStorageError> {
+        Ok(false)
+    }
+
     /// Latch `spent_confirmed` via GUARDED COMPARE-AND-SET (bsv-low #301,
     /// the [`mark_verdict_for_spender`](Self::mark_verdict_for_spender)
     /// sibling): sets `spent = true, spent_confirmed = true` (and
@@ -1831,6 +1851,40 @@ impl PotStorage for MemoryPotStorage {
             // A confirmed write is a retirement moment (#2b), same as the
             // other two confirmed writers.
             self.retire_superseded_after_confirm(txid, output_index, to_spender);
+        }
+        Ok(hit)
+    }
+
+    async fn mark_spent_if_unpointed(
+        &self,
+        txid: &str,
+        output_index: u32,
+        spending_txid: &str,
+        spender_final: Option<bool>,
+    ) -> Result<bool, PotStorageError> {
+        let now = self.now();
+        let mut hit = false;
+        {
+            let mut records = self.records.lock().unwrap();
+            for r in records.iter_mut() {
+                if r.txid == txid
+                    && r.output_index == output_index
+                    && !r.spent
+                    && r.spending_txid.is_none()
+                    && !r.spent_confirmed
+                {
+                    r.spent = true;
+                    r.spending_txid = Some(spending_txid.to_string());
+                    r.spender_final = spender_final;
+                    hit = true;
+                }
+            }
+        }
+        if hit {
+            self.spent_at
+                .lock()
+                .unwrap()
+                .insert((txid.to_string(), output_index), now);
         }
         Ok(hit)
     }

@@ -1,0 +1,21 @@
+{
+  "doc": "bsv-low #837 (the FIX-837 lens's MEDIUM-1): the D1 ceilings of ONE missing-spend discovery pass under a stranger's flood of wide JOINs (tools/lane-837/join_hop_pass_ci.mjs, make ci-d1-budget, after the #831 cell on its overlay). The JOIN hop-spend write reads at most JOIN_HOP_INPUTS_MAX (16) input rows a JOIN and JOIN_HOP_READS_PER_PASS (64) a pass; each ceiling is the measured figure x 1.5. Raise one only with a new measurement and its reason.",
+  "measured_at": "2026-10-22T22:56Z, lane/FIX-837 plus the FIX-837 fold, wrangler 4.54.0 (the crate's npx), node 20.19.5, a standalone overlay on the cell's own D1: 5 stranger JOINs of 64 carried P2PKH inputs and 8 honest two-hop JOINs; reads 1395 writes 404 stmts 188 maxReads 698 (64 JOIN input reads, 272 inputs deferred and counted, every honest JOIN healed). With the bound lifted (both constants 100,000) the same pass: reads 3591 writes 2036 stmts 732 maxReads 698 (336 input reads), RED on every ceiling but maxReads. The full tier (make ci-d1-budget, LANE_BASE 47410, 2026-10-22T22:59Z to 23:18Z, after the #831 cell on its drained D1): reads 1433 writes 320 stmts 174 maxReads 842 (50 input reads, 286 deferred), every cell green.",
+  "scenarios": {
+    "missing-spend-pass-join-flood": {
+      "route": "POST /internal/missing-spend-pass, one pass over 5 stranger JOINs of 64 inputs and 8 honest two-hop JOINs, every pot held and unspent",
+      "measured": {
+        "reads": 1395,
+        "writes": 404,
+        "stmts": 188,
+        "maxReads": 698
+      },
+      "ceiling": {
+        "reads": 2093,
+        "writes": 606,
+        "stmts": 282,
+        "maxReads": 1047
+      }
+    }
+  }
+}
