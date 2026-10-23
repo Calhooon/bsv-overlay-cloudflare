@@ -3526,6 +3526,9 @@ async fn owed_recompute_inner(
     // bsv-low #831: the unspent pots whose funding the hydration found held by nothing (`fundingHeld = 'none'`, read in
     // the same statement); their funding txids join the coin-word read below, so a CHECKED `mined` word still holds it
     let mut funding_unheld: HashSet<String> = HashSet::new();
+    // bsv-low #598: the unspent pots whose funding the SEEN latch alone holds; their funding txids join the same coin-word
+    // read, and a chain-tier refusal of those very bytes (`rejected`, `conflicted`) puts the pot in `funding_unheld`
+    let mut funding_seen: HashSet<String> = HashSet::new();
     for page in party_pages {
         let mut result_rows = Vec::new();
         let mut refund_rows = Vec::new();
@@ -3547,6 +3550,13 @@ async fn owed_recompute_inner(
                         .filter(|t| crate::logic::valid_txid(t))
                     {
                         funding_unheld.insert(t.to_ascii_lowercase());
+                    }
+                } else if row["fundingHeld"] == crate::owed::FUNDING_HELD_SEEN {
+                    if let Some(t) = row["potTxid"]
+                        .as_str()
+                        .filter(|t| crate::logic::valid_txid(t))
+                    {
+                        funding_seen.insert(t.to_ascii_lowercase());
                     }
                 }
                 result_rows.push(
@@ -3622,7 +3632,8 @@ async fn owed_recompute_inner(
                     .flatten()
                     .map(|r| r.spending_txid.as_deref()),
             )
-            .chain(funding_unheld.iter().map(|t| Some(t.as_str()))),
+            .chain(funding_unheld.iter().map(|t| Some(t.as_str())))
+            .chain(funding_seen.iter().map(|t| Some(t.as_str()))),
     );
     let arm_rows = crate::tracker_host::runtime::read_soft(env, &arm_ids)
         .await
@@ -3632,6 +3643,8 @@ async fn owed_recompute_inner(
         None => None,
     };
     if let Some(views) = &arm_views {
+        // bsv-low #598: a latched funding the network refused since is held by nothing (FIX-831's judgement)
+        funding_unheld.extend(crate::owed::refused_fundings(&funding_seen, views));
         for (result_rows, refund_rows) in &mut party_rows {
             crate::owed::apply_word_arm(result_rows, refund_rows, &mut [], views);
         }
@@ -11854,7 +11867,8 @@ mod tests {
             ),
             (
                 "the chain into the coin-word subjects",
-                ".chain(funding_unheld.iter().map(|t| Some(t.as_str()))), ); \
+                ".chain(funding_unheld.iter().map(|t| Some(t.as_str()))) \
+                 .chain(funding_seen.iter().map(|t| Some(t.as_str()))), ); \
                  let arm_rows = crate::tracker_host::runtime::read_soft(env, &arm_ids)",
             ),
             (
@@ -11881,6 +11895,35 @@ mod tests {
             2,
             "both OwedInputs call sites carry the set"
         );
+    }
+
+    /// bsv-low #598 (loop 22, p27/p28): the route's wiring of a REFUSED funding, read off the route source: a hydration
+    /// row whose `fundingHeld` is `seen` (the latch alone, no index proof) puts its pot txid in `funding_seen`, those
+    /// txids join the step 3b coin-word read, and the pots whose funding the rechecked view says the network refused
+    /// (`owed::refused_fundings`) join `funding_unheld` before any judgement. RED with any one of the three removed.
+    #[test]
+    fn fix598_the_route_reads_a_latched_fundings_refusal_into_the_judgement() {
+        let code: String = fix800_code().split_whitespace().collect();
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        for (what, needle) in [
+            (
+                "the seen-only set from the hydration row",
+                "} else if row[\"fundingHeld\"] == crate::owed::FUNDING_HELD_SEEN { if let Some(t) = row[\"potTxid\"] \
+                 .as_str() .filter(|t| crate::logic::valid_txid(t)) { funding_seen.insert(t.to_ascii_lowercase()); } }",
+            ),
+            (
+                "the seen-only fundings chained into the coin-word subjects",
+                ".chain(funding_seen.iter().map(|t| Some(t.as_str()))), ); \
+                 let arm_rows = crate::tracker_host::runtime::read_soft(env, &arm_ids)",
+            ),
+            (
+                "the refused fundings joining the unheld set before the judgement",
+                "if let Some(views) = &arm_views { \
+                 funding_unheld.extend(crate::owed::refused_fundings(&funding_seen, views));",
+            ),
+        ] {
+            assert!(code.contains(&squash(needle)), "{what}: missing from the route");
+        }
     }
 
     // ── the second FIX-800 delta lens fold (bsv-low #800): a hook shed during the alarm, the fire time, the line ──

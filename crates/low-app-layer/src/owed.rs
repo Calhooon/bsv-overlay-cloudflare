@@ -1266,6 +1266,43 @@ fn joined_pot_unlinked_row(
 /// bsv-low #831: the hydration's `fundingHeld` value for an unspent pot whose funding has no SEEN latch and no index
 /// proof (the others: `seen`, `proof`; NULL for a spent pot, which the read does not probe).
 pub const FUNDING_HELD_NONE: &str = "none";
+/// bsv-low #598: the hydration's `fundingHeld` value for an unspent pot whose funding the SEEN latch alone holds (no
+/// index proof): a broadcaster's word, which the network's later refusal of those very bytes outranks.
+pub const FUNDING_HELD_SEEN: &str = "seen";
+/// bsv-low #598: the served `fundingHeld` of a refund-due pot whose latched funding the network then REFUSED (the
+/// tracker's chain-tier `rejected` or `conflicted` word for the pot's own txid): the same judgement as
+/// [`FUNDING_HELD_NONE`], named apart.
+pub const FUNDING_HELD_REFUSED: &str = "refused";
+/// PURE (bsv-low #598): the network's refusal of `txid` as the tracker's RECHECKED view states it: the chain-tier
+/// `rejected` (the host's trusted node refused the bytes) or `conflicted` (a competing spend of its inputs is mined or
+/// named by that node). Any other word, or no row, is `None`: never a refusal by absence.
+pub fn funding_refusal_word(
+    words: Option<&std::collections::BTreeMap<String, Value>>,
+    txid: &str,
+) -> Option<&'static str> {
+    let w = words?.get(&txid.to_ascii_lowercase())?;
+    if w["word"] == "rejected" {
+        Some("rejected")
+    } else if w["word"] == "conflicted" {
+        Some("conflicted")
+    } else {
+        None
+    }
+}
+/// PURE (bsv-low #598): of the unspent pots whose funding the SEEN latch alone holds, those whose funding the network
+/// REFUSED since ([`funding_refusal_word`]): the route adds them to `funding_unheld`, so a refused JOIN's refund row
+/// takes FIX-831's judgement (no press, the same word). A pot the index PROVED is never in `seen_only` (the index's
+/// proof first, #736), so no word can withhold it.
+pub fn refused_fundings(
+    seen_only: &HashSet<String>,
+    words: &std::collections::BTreeMap<String, Value>,
+) -> HashSet<String> {
+    seen_only
+        .iter()
+        .filter(|t| funding_refusal_word(Some(words), t).is_some())
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
 /// bsv-low #831: the claim kind of a refund-due pot whose funding the network does not hold. Not a press: the client's
 /// `claimOf` knows no such claim and the `unbound` family offers none.
 pub const FUNDING_NOT_HELD_CLAIM: &str = "funding-not-held";
@@ -3464,7 +3501,14 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     facts["claim"] = json!(FUNDING_NOT_HELD_CLAIM);
                     facts["claimable"] = json!(false);
                     facts["claimReason"] = json!(FUNDING_NOT_HELD_REASON);
-                    facts["fundingHeld"] = json!(FUNDING_HELD_NONE);
+                    // bsv-low #598: a latched funding the network refused since is the same judgement, named apart
+                    match funding_refusal_word(i.spender_words, &e.pot_txid) {
+                        Some(word) => {
+                            facts["fundingHeld"] = json!(FUNDING_HELD_REFUSED);
+                            facts["fundingWord"] = json!(word);
+                        }
+                        None => facts["fundingHeld"] = json!(FUNDING_HELD_NONE),
+                    }
                     facts["tip"] = json!(i.tip);
                     facts["refundStatus"] = json!(refund.map(|r| r.status.as_str()));
                     rows.push(OwedRow {
@@ -9417,6 +9461,97 @@ pub(crate) mod tests {
         let mut k = inputs(&e, &r, &[], &valid, &c, &p, Some(899_990));
         k.funding_unheld = &unheld;
         assert_eq!(derive_owed_rows(&k)[0].facts["claim"], "rejoin");
+    }
+
+    /// bsv-low #598 (loop 22, p27/p28, the `spec-admit-fast-join-refused` cell's pair): a refund-due pot whose funding
+    /// the SEEN latch held and the network then REFUSED (the tracker's chain-tier `rejected` or `conflicted` word for
+    /// the pot's own txid) serves no press, under FIX-831's word (`funding-not-held`), named `fundingHeld: refused`.
+    /// A latched funding whose word is `seen` or a checked `mined`, and a pot the index PROVED (never in the seen-only
+    /// set: the index's proof first), keep today's `present-refund`. RED with `refused_fundings` answering nothing
+    /// (the latched pot stays `refund-due`, `present-refund`, claimable).
+    #[test]
+    fn fix598_a_refused_joins_latched_funding_takes_the_funding_not_held_judgement() {
+        let e = [entry(
+            Some(false),
+            None,
+            Outcome::Unresolved,
+            Some(SeatLetter::A),
+        )];
+        let r = [refund_entry(RefundStatus::GateOpen)];
+        let mut valid = HashMap::new();
+        valid.insert(
+            format!("{}:0", tx(0x02)),
+            ValidRefund {
+                raw_hex: "00".into(),
+                my_sats: Some(19_800),
+            },
+        );
+        let (c, p) = (HashSet::new(), HashSet::new());
+        let seen_only: HashSet<String> = [tx(0x02)].into_iter().collect();
+        let judge = |words: &std::collections::BTreeMap<String, Value>, seen: &HashSet<String>| {
+            // the route's step: the latched fundings the network refused join the unheld set
+            let unheld = refused_fundings(seen, words);
+            let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(900_005));
+            i.spender_words = Some(words);
+            i.funding_unheld = &unheld;
+            derive_owed_rows(&i)
+        };
+        for word in ["rejected", "conflicted"] {
+            let mut words = std::collections::BTreeMap::new();
+            words.insert(
+                tx(0x02),
+                json!({"word": word, "tier": "chain", "verifyPath": null}),
+            );
+            let rows = judge(&words, &seen_only);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                (
+                    rows[0].family,
+                    &rows[0].facts["claim"],
+                    &rows[0].facts["claimable"]
+                ),
+                (
+                    OwedFamily::Unbound,
+                    &json!(FUNDING_NOT_HELD_CLAIM),
+                    &json!(false)
+                ),
+                "a refund of a funding the network refused ({word}) is never a press"
+            );
+            assert_eq!(rows[0].facts["fundingHeld"], FUNDING_HELD_REFUSED);
+            assert_eq!(rows[0].facts["fundingWord"], word);
+            assert_eq!(rows[0].reason.as_deref(), Some(FUNDING_NOT_HELD_REASON));
+            assert_eq!(
+                count_refund_funding_unheld(&rows),
+                1,
+                "counted with FIX-831's pots"
+            );
+            // the index PROVED the funding (not in the seen-only set): no word withholds it
+            let proven = judge(&words, &HashSet::new());
+            assert_eq!(
+                proven[0].facts["claim"], "present-refund",
+                "the index's proof first"
+            );
+        }
+        for word in [
+            json!({"word": "seen", "tier": "network", "verifyPath": null}),
+            json!({"word": "mined", "tier": "chain", "verifyPath": "header"}),
+            json!({"word": "announced", "verifyPath": null}),
+        ] {
+            let mut words = std::collections::BTreeMap::new();
+            words.insert(tx(0x02), word.clone());
+            let rows = judge(&words, &seen_only);
+            assert_eq!(
+                rows[0].family,
+                OwedFamily::RefundDue,
+                "{word}: no refusal, today's row"
+            );
+            assert_eq!(rows[0].facts["claim"], "present-refund");
+        }
+        // no word row at all: a latched funding is never refused by absence
+        assert_eq!(
+            judge(&std::collections::BTreeMap::new(), &seen_only)[0].facts["claim"],
+            "present-refund"
+        );
     }
 
     /// bsv-low #831 (the FIX-831 lens's L3): `owed_refund_funding_unheld_total` moves by exactly ONE for fix831_a's
