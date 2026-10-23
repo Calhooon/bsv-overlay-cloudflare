@@ -56,8 +56,23 @@
 //! that was), and the per-isolate memory of note-backs is bounded ([`RETRY_MEMORY_MAX`],
 //! [`DEFER_MEMORY_MAX`]): past it a failed or deferred entry is not noted back, it is let go and counted
 //! undelivered at once. The cost of every one of these is the receiver's own cadence (the owed list's
-//! read-aged recompute, the Lobby's next event), never money. Making the note-back durable needs a store of
-//! its own (a D1 outbox: a migration, a write per flush and a drain); it is filed as its own issue.
+//! read-aged recompute, the Lobby's next event), never money.
+//!
+//! THE OUTBOX (bsv-low #560, B-COST-1). Every NEW note-back ([`settle_noting`]'s `fresh`: a failed POST's entries
+//! and the entries past the bound) is also PARKED in D1 (`change_parked`, under the set's kind, by
+//! `change_park::park_noted_back`, the table #649's skip parks into), counted `*_outboxed_total`; the cron's drain
+//! (`change_park::deliver_parked`, the `*/15` tick and `/admin/complete-proofs`) delivers it, backs it off on a
+//! refusal and counts it exhausted after its last attempt (`change_park_exhausted_total`). The in-memory
+//! note-back stays the FAST path and the figures above still describe it; the outbox is the DURABLE one, so an
+//! entry the memory lets go (an isolate's end, a retry that failed too) is still a row. One that did not reach the
+//! outbox is counted where it missed: `change_park_full_total` (the table's ceiling), `change_park_faults_total`
+//! (the batch faulted), `change_outbox_over_bound_total` (past a flush's batch bound). Left, stated: the park is
+//! the first statement after the flush's POSTs, so a task the runtime cancels after its last POST and before the
+//! park lands keeps that flush's new note-backs in memory only, uncounted by the outbox (the wall budget leaves
+//! 10 s of the 30 s window for it, less a POST in flight); and an entry drained and in flight when the task ends is
+//! the pre-existing loss of a POST in flight (above). Delivery is now proven by the outbox's own figures:
+//! `/health/invariants.changeParked` (rows waiting, by set) and the counters `change_unparked_total` (delivered),
+//! `change_park_exhausted_total` (abandoned).
 use std::collections::BTreeSet;
 use std::future::Future;
 
@@ -257,6 +272,30 @@ pub fn settle<T: Ord + Clone>(memory: &mut NotedBack<T>, shipped: &Shipped<T>) -
     )
 }
 
+/// PURE (bsv-low #560, B-COST-1): [`settle`], answering also the flush's NEW note-backs (`fresh`: entries noted back
+/// by this flush that no earlier flush of this isolate had noted back), the entries the flush parks in its D1 outbox
+/// (`change_park::park_noted_back`). An entry still waiting from an earlier flush was parked by that flush. Returns
+/// `(note back, fresh, account)`.
+pub fn settle_noting<T: Ord + Clone>(
+    memory: &mut NotedBack<T>,
+    shipped: &Shipped<T>,
+) -> (Vec<T>, Vec<T>, Tally) {
+    let held: BTreeSet<T> = shipped
+        .failed
+        .iter()
+        .chain(&shipped.deferred)
+        .filter(|e| memory.retried.contains(*e) || memory.deferred.contains(*e))
+        .cloned()
+        .collect();
+    let (back, tally) = settle(memory, shipped);
+    let fresh = back
+        .iter()
+        .filter(|e| !held.contains(*e))
+        .cloned()
+        .collect();
+    (back, fresh, tally)
+}
+
 /// PURE: the note-backs never re-sent, from the three counters' totals (`/health/invariants` serves it per set
 /// as `*_noted_back_unresent`). Floored at 0: the counters are bumped one statement at a time. Cumulative: read
 /// against a recorded baseline, never against 0 (the module doc, D2-L2).
@@ -365,6 +404,8 @@ pub struct FlushCounters {
     pub resent: &'static str,
     /// Derived on the read, never written: `retried + deferred - resent`.
     pub noted_back_unresent: &'static str,
+    /// bsv-low #560: new note-backs parked in the D1 outbox (`change_parked`, this set's kind).
+    pub outboxed: &'static str,
 }
 
 /// The flush's account, after the POSTs: one log line and the counters, only when something did not go through.

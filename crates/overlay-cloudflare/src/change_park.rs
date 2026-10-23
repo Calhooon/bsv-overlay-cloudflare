@@ -32,7 +32,7 @@
 //! too, FIRST in the same batch ([`KIND_WORD`], the frame's JSON as the item; bsv-low #660, B-OWED-3-FOLD, the lens's
 //! L1: until the fold they stayed in the isolate's memory while the notes were parked, so the cron delivered the
 //! notes before the words, the order every flush otherwise keeps), and the drain delivers the word set FIRST, one
-//! frame a POST to `/internal/tx-word` (at most `change_flush::CHANGE_MAX_CHUNKS` a tick, under the drain's wall). The lobby set has its own flush and is not drained by this one. The cron's
+//! frame a POST to `/internal/tx-word` (at most `change_flush::CHANGE_MAX_CHUNKS` a tick, under the drain's wall). The lobby set has its own flush and the skip never parks it; since bsv-low #560 (B-COST-1) every flush of the three sets parks its NEW note-backs here too ([`park_noted_back`], the lobby set as [`KIND_LOBBY`]), and the drain delivers the lobby rows last. The cron's
 //! delivery runs before the GASP step under its own wall ([`DRAIN_WALL_MS`]) and at most [`DRAIN_MAX_ROWS`] rows
 //! a set a tick; a POST in flight is not raced (as every flush: `change_flush.rs`). A delete that faults after an
 //! accepted POST leaves the row, which is delivered again (over-notification is harmless: the app layer re-reads).
@@ -137,7 +137,9 @@ pub const PARKED_COUNT_SQL: &str = "SELECT \
      (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'pot' AND exhausted = 1 LIMIT ?1)) AS pot_exhausted, \
      (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'hop' AND exhausted = 1 LIMIT ?1)) AS hop_exhausted, \
      (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'word' AND exhausted = 0 LIMIT ?1)) AS word, \
-     (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'word' AND exhausted = 1 LIMIT ?1)) AS word_exhausted";
+     (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'word' AND exhausted = 1 LIMIT ?1)) AS word_exhausted, \
+     (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'lobby' AND exhausted = 0 LIMIT ?1)) AS lobby, \
+     (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'lobby' AND exhausted = 1 LIMIT ?1)) AS lobby_exhausted";
 /// N3: where the gauge stops counting (at most four times this many index entries a read).
 pub const HEALTH_COUNT_CAP: i64 = 256;
 
@@ -173,6 +175,27 @@ pub const KIND_POT: &str = "pot";
 pub const KIND_HOP: &str = "hop";
 /// The tracker word frames' set (bsv-low #660, B-OWED-3-FOLD L1): the item is the frame's JSON, POSTed as it is.
 pub const KIND_WORD: &str = "word";
+/// bsv-low #560 (B-COST-1): the lobby set's rows (`txid:vout:kind`, [`lobby_item`]), parked only by the lobby
+/// flush's outbox ([`park_noted_back`]); the skip never parks them (the lobby set has its own flush).
+pub const KIND_LOBBY: &str = "lobby";
+
+/// A lobby entry's row key (bsv-low #560).
+pub fn lobby_item(txid: &str, vout: u32, kind: &str) -> String {
+    format!("{}:{vout}:{kind}", txid.to_ascii_lowercase())
+}
+
+/// A lobby row key read back (`None`: not one this module wrote; refused by the drain, as a pot row that does not
+/// read).
+pub fn parse_lobby_item(item: &str) -> Option<crate::lobby_changes::Change> {
+    let (rest, kind) = item.rsplit_once(':')?;
+    let kind: &'static str = match kind {
+        "admitted" => "admitted",
+        "evicted" => "evicted",
+        _ => return None,
+    };
+    let (txid, vout) = parse_pot_item(rest)?;
+    Some((txid, vout, kind))
+}
 
 /// The most rows of one set the cron delivers a tick (16 POSTs of 8: one flush's bound).
 pub const DRAIN_MAX_ROWS: usize =
@@ -301,6 +324,85 @@ pub(crate) async fn park_withheld<P: ParkPort>(port: &P, remaining_ms: u64, now_
         crate::pot_changes::FLUSH_WINDOW_FLOOR_MS,
         faulted + full
     ));
+}
+
+/// bsv-low #560 (B-COST-1): the most note-backs ONE flush of one set parks in its outbox batch (one D1 batch of at
+/// most this many statements and the token's). A flush's note-backs past it stay in the isolate's memory only and
+/// are counted [`COUNTER_CHANGE_OUTBOX_OVER_BOUND`]. Equal to what the drain delivers of a set a tick.
+pub const OUTBOX_PARK_MAX: usize = DRAIN_MAX_ROWS;
+/// bsv-low #560: note-backs a flush could not put in the outbox for its batch bound (kept in memory only).
+pub const COUNTER_CHANGE_OUTBOX_OVER_BOUND: &str = "change_outbox_over_bound_total";
+
+/// What a flush's outbox park did with its note-backs, in entries. Every entry handed to it is in exactly one of
+/// the four.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Outboxed {
+    /// Parked (a new row, or a held row given a new generation).
+    pub parked: u64,
+    /// Refused at the table's ceiling ([`CHANGE_PARKED_MAX_ROWS`]): counted [`COUNTER_CHANGE_PARK_FULL`].
+    pub full: u64,
+    /// The park batch faulted: counted [`COUNTER_CHANGE_PARK_FAULTS`].
+    pub faulted: u64,
+    /// Past [`OUTBOX_PARK_MAX`]: counted [`COUNTER_CHANGE_OUTBOX_OVER_BOUND`].
+    pub over_bound: u64,
+}
+
+/// bsv-low #560 (B-COST-1), THE FLUSH'S OUTBOX. A flush's NEW note-backs (the entries of a POST the app layer did
+/// not accept, and the entries past the flush's bound: `change_flush::settle_noting`'s `fresh`) are PARKED in D1
+/// under the set's `kind`, beside the isolate's own note-back (which stays the fast path: the next flush on this
+/// isolate re-sends them in seconds). So an isolate that ends between a deferral and its next flush, or a chunk whose
+/// retry fails too, loses nothing: the cron's drain ([`deliver_parked`]) delivers the row, backs it off on a refusal
+/// and counts it exhausted after [`CHANGE_PARK_MAX_ATTEMPTS`] refusals. An entry delivered from memory first is
+/// delivered again by the drain (over-notification is harmless: the app layer re-reads). Each entry lands in a
+/// counted outbox row (`outboxed`, the set's own counter) or a counted miss (`change_park_full_total`,
+/// `change_park_faults_total`, [`COUNTER_CHANGE_OUTBOX_OVER_BOUND`]), never neither.
+pub(crate) async fn park_noted_back<P: ParkPort>(
+    port: &P,
+    kind: &'static str,
+    items: Vec<String>,
+    outboxed_counter: &'static str,
+    now_ms: u64,
+) -> Outboxed {
+    let mut out = Outboxed::default();
+    if items.is_empty() {
+        return out;
+    }
+    let over = items.len().saturating_sub(OUTBOX_PARK_MAX);
+    out.over_bound = over as u64;
+    let rows: Vec<(&'static str, String)> = items
+        .into_iter()
+        .take(OUTBOX_PARK_MAX)
+        .map(|i| (kind, i))
+        .collect();
+    match port.park(&rows, now_ms).await {
+        Ok(landed) => {
+            out.parked = landed.iter().filter(|l| **l).count() as u64;
+            out.full = rows.len() as u64 - out.parked;
+        }
+        Err(e) => {
+            out.faulted = rows.len() as u64;
+            port.log(format!("[change-outbox] park of {} {kind} note-back(s) FAULTED ({e}); kept in the isolate's memory only", rows.len()));
+        }
+    }
+    for (counter, n) in [
+        (outboxed_counter, out.parked),
+        (COUNTER_CHANGE_PARK_FULL, out.full),
+        (COUNTER_CHANGE_PARK_FAULTS, out.faulted),
+        (COUNTER_CHANGE_OUTBOX_OVER_BOUND, out.over_bound),
+    ] {
+        if n > 0 {
+            port.bump(counter, n).await;
+        }
+    }
+    if out.full + out.over_bound > 0 {
+        port.log(format!(
+            "[change-outbox] {} {kind} note-back(s) NOT parked ({} at the table's ceiling of {CHANGE_PARKED_MAX_ROWS} rows, {} past the flush's bound of {OUTBOX_PARK_MAX}); kept in the isolate's memory only",
+            out.full + out.over_bound,
+            out.full,
+            out.over_bound
+        ));
+    }
+    out
 }
 
 /// The worker's [`ParkPort`]: D1.
@@ -433,7 +535,8 @@ pub(crate) async fn deliver_parked<P: UnparkPort>(port: &P) -> Delivered {
     let now_ms = port.now_ms();
     let deadline_ms = now_ms + DRAIN_WALL_MS;
     // B-OWED-3-FOLD L1: the word frames first (a note triggers the recompute that reads the word)
-    for kind in [KIND_WORD, KIND_HOP, KIND_POT] {
+    // bsv-low #560: the lobby set last (its outbox rows are the lobby flush's note-backs)
+    for kind in [KIND_WORD, KIND_HOP, KIND_POT, KIND_LOBBY] {
         match port
             .sweep(
                 kind,
@@ -505,6 +608,46 @@ pub(crate) async fn deliver_parked<P: UnparkPort>(port: &P) -> Delivered {
             refused.extend(unreadable);
             (
                 delivered.iter().map(|(t, v)| pot_item(t, *v)).collect(),
+                refused,
+            )
+        } else if kind == KIND_LOBBY {
+            let changes: Vec<crate::lobby_changes::Change> =
+                items.iter().filter_map(|i| parse_lobby_item(i)).collect();
+            let unreadable: Vec<String> = items
+                .iter()
+                .filter(|i| parse_lobby_item(i).is_none())
+                .cloned()
+                .collect();
+            if !unreadable.is_empty() {
+                port.log(format!(
+                    "[change-park] {} parked lobby row(s) do not read; refused",
+                    unreadable.len()
+                ));
+            }
+            let (fresh, retry): (Vec<_>, Vec<_>) = changes.into_iter().partition(|(t, v, k)| {
+                by_item
+                    .get(lobby_item(t, *v, k).as_str())
+                    .is_some_and(|r| r.attempts == 0)
+            });
+            let (delivered, failed) = ship_isolating(
+                fresh,
+                retry,
+                crate::lobby_changes::body_json,
+                |body| port.post(kind, body),
+                || port.now_ms(),
+                deadline_ms,
+            )
+            .await;
+            let mut refused: Vec<String> = failed
+                .iter()
+                .map(|(t, v, k)| lobby_item(t, *v, k))
+                .collect();
+            refused.extend(unreadable);
+            (
+                delivered
+                    .iter()
+                    .map(|(t, v, k)| lobby_item(t, *v, k))
+                    .collect(),
                 refused,
             )
         } else {
@@ -650,6 +793,8 @@ impl UnparkPort for WorkerUnpark<'_> {
             "/internal/pot-changed"
         } else if kind == KIND_WORD {
             "/internal/tx-word"
+        } else if kind == KIND_LOBBY {
+            "/internal/lobby-changed"
         } else {
             "/internal/hop-changed"
         };
@@ -822,6 +967,8 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
         hop_exhausted: f64,
         word: f64,
         word_exhausted: f64,
+        lobby: f64,
+        lobby_exhausted: f64,
     }
     match crate::d1::Query::new(PARKED_COUNT_SQL)
         .bind(HEALTH_COUNT_CAP)
@@ -835,6 +982,9 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
             "hopExhausted": r.hop_exhausted as u64,
             "word": r.word as u64,
             "wordExhausted": r.word_exhausted as u64,
+            "lobby": r.lobby as u64,
+            "lobbyExhausted": r.lobby_exhausted as u64,
+            "outboxParkMax": OUTBOX_PARK_MAX,
             "capped": HEALTH_COUNT_CAP,
             "maxRows": CHANGE_PARKED_MAX_ROWS,
             "maxAttempts": CHANGE_PARK_MAX_ATTEMPTS,
@@ -2456,6 +2606,324 @@ mod tests {
         assert!(
             cell.contains("if (process.argv.length < 7) {"),
             "the cell refuses fewer than five arguments with its usage"
+        );
+    }
+
+    /// bsv-low #560 (B-COST-1): a [`ParkPort`] over the SHIPPED park statements under SQLite, as the worker's
+    /// batch runs them (the token, then one [`PARK_SQL`] a row); `fail` faults the batch.
+    struct SqlitePark<'a> {
+        conn: &'a rusqlite::Connection,
+        counters: RefCell<Vec<(&'static str, u64)>>,
+        fail: bool,
+    }
+
+    impl ParkPort for SqlitePark<'_> {
+        async fn park(
+            &self,
+            rows: &[(&'static str, String)],
+            now_ms: u64,
+        ) -> std::result::Result<Vec<bool>, String> {
+            if self.fail {
+                return Err("D1 down".into());
+            }
+            bump_seq(self.conn, now_ms as i64);
+            Ok(rows
+                .iter()
+                .map(|(k, i)| {
+                    exec_returning(
+                        self.conn,
+                        PARK_SQL,
+                        rusqlite::params![k, i, now_ms as i64, MAX],
+                    ) == 1
+                })
+                .collect())
+        }
+        async fn bump(&self, counter: &'static str, delta: u64) {
+            self.counters.borrow_mut().push((counter, delta));
+        }
+        fn log(&self, _line: String) {}
+    }
+
+    fn counted(counters: &RefCell<Vec<(&'static str, u64)>>, name: &str) -> u64 {
+        counters
+            .borrow()
+            .iter()
+            .filter(|(c, _)| *c == name)
+            .map(|(_, n)| n)
+            .sum()
+    }
+
+    /// A transport answering `Err` on the listed POSTs (1 = the first).
+    fn failing_on(
+        fail: &'static [usize],
+    ) -> impl FnMut(String) -> std::future::Ready<std::result::Result<usize, ()>> {
+        let mut n = 0usize;
+        move |_body| {
+            n += 1;
+            std::future::ready(if fail.contains(&n) { Err(()) } else { Ok(0) })
+        }
+    }
+
+    /// bsv-low #560 (B-COST-1), THE OUTBOX, through the shipped flush loop, the shipped `settle_and_park` and the
+    /// shipped drain over the SHIPPED statements under SQLite:
+    /// (a) an isolate END between a deferral and the next flush loses nothing: a flush of 131 pot outpoints whose
+    ///     second POST fails notes back 8 failed and 3 deferred, parks all 11, the isolate ends (its sets and its
+    ///     memory gone), and the cron's drain POSTs exactly those 11 and deletes their rows;
+    /// (b) a chunk that FAILS TWICE is still in the outbox: the memory lets it go (`undelivered`, `retry_failed`)
+    ///     and its 8 rows stay for the drain, parked ONCE (the second flush parks nothing new);
+    /// (c) the COUNTERS MATCH: `pot_changed_outboxed_total` is the rows parked, and the drain unparks as many;
+    /// (d) the lobby set too: a failed lobby POST parks `txid:vout:kind` rows the drain delivers as a lobby body.
+    /// RED with the park in `settle_and_park` removed (the base's note-back to memory alone): the drain reads
+    /// nothing after the isolate's end.
+    #[test]
+    fn b_cost_1_560_every_note_back_lands_in_the_outbox_and_survives_the_isolate() {
+        let conn = parked_db();
+        let txid = |i: u32| format!("{:064x}", 0x5600_0000u32 + i);
+        let pots: Vec<(String, u32)> = (0..131u32).map(|i| (txid(i), i % 3)).collect();
+        crate::pot_changes::tests::end_isolate();
+
+        // (a) 131 outpoints, the second POST answered 503
+        let shipped = crate::change_flush::run(crate::pot_changes::ship_with(
+            pots.clone(),
+            failing_on(&[2]),
+            || 0,
+            u64::MAX,
+        ));
+        assert_eq!((shipped.failed.len(), shipped.deferred.len()), (8, 3));
+        let park = SqlitePark {
+            conn: &conn,
+            counters: Default::default(),
+            fail: false,
+        };
+        let (tally, out) = run(crate::pot_changes::settle_and_park(&park, &shipped, 1_000));
+        assert_eq!(
+            (tally.retried, tally.deferred),
+            (8, 3),
+            "the memory's note-back, as before"
+        );
+        assert_eq!(
+            out,
+            Outboxed {
+                parked: 11,
+                ..Default::default()
+            },
+            "every new note-back is a row"
+        );
+        let in_table = |kind: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM change_parked WHERE kind = ?1 AND exhausted = 0",
+                [kind],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(in_table(KIND_POT), 11);
+
+        // (b) the same isolate's next flush: the 8 fail AGAIN, the 3 arrive
+        let back = crate::pot_changes::drain();
+        assert_eq!(back.len(), 11, "the fast path: the memory re-sends");
+        let again = crate::change_flush::run(crate::pot_changes::ship_with(
+            back,
+            failing_on(&[1]),
+            || 0,
+            u64::MAX,
+        ));
+        let (tally, out) = run(crate::pot_changes::settle_and_park(&park, &again, 2_000));
+        assert_eq!(
+            (tally.undelivered, tally.retry_failed),
+            (8, 8),
+            "the memory lets the twice-failed chunk go"
+        );
+        assert_eq!(out, Outboxed::default(), "nothing new to park");
+        assert_eq!(
+            in_table(KIND_POT),
+            11,
+            "the twice-failed chunk is still in the outbox (and so are the 3 the memory delivered)"
+        );
+        assert_eq!(
+            counted(
+                &park.counters,
+                crate::pot_changes::COUNTER_POT_CHANGED_OUTBOXED
+            ),
+            11,
+            "parked once each"
+        );
+
+        // (d) a lobby POST that fails: its changes are rows of their own kind
+        crate::lobby_changes::tests::end_isolate();
+        let lobby: Vec<crate::lobby_changes::Change> =
+            vec![(txid(900), 1, "admitted"), (txid(901), 0, "evicted")];
+        let shipped = crate::change_flush::run(crate::lobby_changes::ship_with(
+            lobby.clone(),
+            failing_on(&[1]),
+            || 0,
+            u64::MAX,
+        ));
+        let (_, out) = run(crate::lobby_changes::settle_and_park(
+            &park, &shipped, 3_000,
+        ));
+        assert_eq!(out.parked, 2);
+        assert_eq!(in_table(KIND_LOBBY), 2);
+        assert_eq!(
+            counted(
+                &park.counters,
+                crate::lobby_changes::COUNTER_LOBBY_CHANGED_OUTBOXED
+            ),
+            2
+        );
+
+        // the isolate ENDS: its notes and its memory are gone
+        crate::pot_changes::tests::end_isolate();
+        crate::lobby_changes::tests::end_isolate();
+        assert!(crate::pot_changes::drain().is_empty());
+
+        // the cron's drain (another isolate): every parked entry is POSTed and its row deleted
+        let cron = SqlitePort {
+            conn,
+            refuse: Default::default(),
+            clock: std::cell::Cell::new(10_000),
+            posted: Default::default(),
+            refused_posts: RefCell::new(0),
+            repark: false,
+            last_read: Default::default(),
+            stale_read: Default::default(),
+        };
+        let d = run(deliver_parked(&cron));
+        assert_eq!((d.read, d.unparked, d.kept), (13, 13, 0));
+        let posted = cron.posted.borrow().concat();
+        for i in (8..16).chain(128..131) {
+            assert!(
+                posted.contains(&txid(i)),
+                "the noted-back outpoint {i} reached the app layer"
+            );
+        }
+        let lobby_body = cron
+            .posted
+            .borrow()
+            .iter()
+            .find(|b| b.contains("\"changes\""))
+            .cloned()
+            .expect("a lobby body");
+        assert_eq!(lobby_body, crate::lobby_changes::body_json(&lobby));
+        let left: i64 = cron
+            .conn
+            .query_row("SELECT COUNT(*) FROM change_parked", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            left, 0,
+            "(c) the outboxed rows are the delivered rows: none left"
+        );
+    }
+
+    /// bsv-low #560 (B-COST-1): an entry that does NOT reach the outbox is counted where it missed, never neither:
+    /// a faulted batch (`change_park_faults_total`), the table's ceiling (`change_park_full_total`) and the flush's
+    /// batch bound (`change_outbox_over_bound_total`, past [`OUTBOX_PARK_MAX`]). RED with any of the three bumps
+    /// removed from `park_noted_back`.
+    #[test]
+    fn b_cost_1_560_a_note_back_that_misses_the_outbox_is_counted() {
+        let conn = parked_db();
+        let ids: Vec<String> = (0..300u32)
+            .map(|i| format!("02{:064x}", i)[..66].to_string())
+            .collect();
+        // over the bound: 300 new note-backs, 128 parked, 172 counted over the bound
+        let park = SqlitePark {
+            conn: &conn,
+            counters: Default::default(),
+            fail: false,
+        };
+        let out = run(park_noted_back(
+            &park,
+            KIND_HOP,
+            ids.clone(),
+            crate::hop_changes::COUNTER_HOP_CHANGED_OUTBOXED,
+            1_000,
+        ));
+        assert_eq!(
+            out,
+            Outboxed {
+                parked: OUTBOX_PARK_MAX as u64,
+                over_bound: 300 - OUTBOX_PARK_MAX as u64,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            counted(&park.counters, COUNTER_CHANGE_OUTBOX_OVER_BOUND),
+            172
+        );
+        assert_eq!(
+            counted(
+                &park.counters,
+                crate::hop_changes::COUNTER_HOP_CHANGED_OUTBOXED
+            ),
+            128
+        );
+        // a faulted batch: every entry counted a fault
+        let down = SqlitePark {
+            conn: &conn,
+            counters: Default::default(),
+            fail: true,
+        };
+        let out = run(park_noted_back(
+            &down,
+            KIND_HOP,
+            ids[..5].to_vec(),
+            crate::hop_changes::COUNTER_HOP_CHANGED_OUTBOXED,
+            1_000,
+        ));
+        assert_eq!(out.faulted, 5);
+        assert_eq!(counted(&down.counters, COUNTER_CHANGE_PARK_FAULTS), 5);
+        // the ceiling: fill the table, then a new key is refused and counted full
+        for i in 0..(MAX as u32) {
+            park_sql(
+                &conn,
+                rusqlite::params![KIND_POT, pot_item(&format!("{:064x}", i + 7), 0), 1, MAX],
+            )
+            .unwrap();
+        }
+        let full = SqlitePark {
+            conn: &conn,
+            counters: Default::default(),
+            fail: false,
+        };
+        let out = run(park_noted_back(
+            &full,
+            KIND_HOP,
+            vec![ids[299].clone()],
+            crate::hop_changes::COUNTER_HOP_CHANGED_OUTBOXED,
+            1_000,
+        ));
+        assert_eq!(out.full, 1);
+        assert_eq!(counted(&full.counters, COUNTER_CHANGE_PARK_FULL), 1);
+        // the lobby key reads back, and nothing else does
+        assert_eq!(
+            parse_lobby_item(&lobby_item(&"AB".repeat(32), 4, "evicted")),
+            Some(("ab".repeat(32), 4, "evicted"))
+        );
+        assert_eq!(
+            parse_lobby_item(&format!("{}:4:other", "ab".repeat(32))),
+            None
+        );
+    }
+
+    /// bsv-low #560 (B-COST-1), SOURCE: each set's worker flush calls its own `settle_and_park` over D1, and the
+    /// gauge serves the lobby set.
+    #[test]
+    fn b_cost_1_560_every_flush_parks_its_note_backs_and_the_gauge_serves_the_lobby_set() {
+        for (src, tag) in [
+            (include_str!("pot_changes.rs"), "pot"),
+            (include_str!("hop_changes.rs"), "hop"),
+            (include_str!("lobby_changes.rs"), "lobby"),
+        ] {
+            let flat: String = src.split_whitespace().collect();
+            assert!(
+                flat.contains("Ok(db)=>settle_and_park(&crate::change_park::WorkerPark{db:&db},&shipped,Date::now().as_millis()).await.0,")
+                    || flat.contains("Ok(db)=>{settle_and_park(&crate::change_park::WorkerPark{db:&db},&shipped,Date::now().as_millis(),).await.0}"),
+                "the {tag} flush parks its note-backs"
+            );
+        }
+        assert!(
+            PARKED_COUNT_SQL.contains("AS lobby,")
+                && PARKED_COUNT_SQL.contains("AS lobby_exhausted")
         );
     }
 }

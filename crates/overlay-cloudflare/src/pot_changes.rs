@@ -105,6 +105,9 @@ pub const COUNTER_POT_CHANGED_RESENT: &str = "pot_changed_resent_total";
 /// Served on `/health/invariants`, derived on the read: `retried + deferred - resent`, the note-backs never
 /// re-sent (lost with an isolate when it stays above 0; see [`crate::change_flush`]).
 pub const POT_CHANGED_NOTED_BACK_UNRESENT: &str = "pot_changed_noted_back_unresent";
+/// bsv-low #560 (B-COST-1): new note-backs (a failed POST's outpoints, the part past a flush's bound) parked in the
+/// D1 outbox (`change_parked`, kind `pot`) for the cron's drain.
+pub const COUNTER_POT_CHANGED_OUTBOXED: &str = "pot_changed_outboxed_total";
 /// The app layer's own count of the outpoints a body carried past its cap (it writes this row; pinned equal to
 /// its `COUNTER_POT_CHANGED_DROPPED` from its tests, lens N1).
 pub const COUNTER_POT_CHANGED_DROPPED: &str = "pot_changed_dropped_total";
@@ -117,6 +120,7 @@ pub(crate) const COUNTERS: crate::change_flush::FlushCounters =
         retry_failed: COUNTER_POT_CHANGED_RETRY_FAILED,
         resent: COUNTER_POT_CHANGED_RESENT,
         noted_back_unresent: POT_CHANGED_NOTED_BACK_UNRESENT,
+        outboxed: COUNTER_POT_CHANGED_OUTBOXED,
     };
 
 thread_local! {
@@ -158,12 +162,44 @@ where
 /// What a flush owes after its POSTs ([`crate::change_flush::settle`] over this set's memory): the deferred part
 /// and a failed POST's entries (once) are noted back for the next flush. Returns the flush's account.
 pub fn settle(shipped: &crate::change_flush::Shipped<(String, u32)>) -> crate::change_flush::Tally {
-    let (back, tally) =
-        NOTED_BACK.with(|m| crate::change_flush::settle(&mut m.borrow_mut(), shipped));
+    settle_noting(shipped).0
+}
+
+/// [`settle`], answering also the flush's NEW note-backs (bsv-low #560: what [`settle_and_park`] parks).
+fn settle_noting(
+    shipped: &crate::change_flush::Shipped<(String, u32)>,
+) -> (crate::change_flush::Tally, Outpoints) {
+    let (back, fresh, tally) =
+        NOTED_BACK.with(|m| crate::change_flush::settle_noting(&mut m.borrow_mut(), shipped));
     for (txid, vout) in &back {
         note(txid, *vout);
     }
-    tally
+    (tally, fresh)
+}
+
+/// bsv-low #560 (B-COST-1): what a flush owes after its POSTs, DURABLY. [`settle`] (the isolate's note-back, the fast
+/// path), then the NEW note-backs parked in the D1 outbox ([`crate::change_park::park_noted_back`], kind `pot`), so an
+/// isolate's end before its next flush, or a retry that fails too, loses no outpoint: the cron's drain delivers it.
+/// [`ship`] runs exactly this over D1; the pins over the shipped statements under SQLite.
+pub(crate) async fn settle_and_park<P: crate::change_park::ParkPort>(
+    port: &P,
+    shipped: &crate::change_flush::Shipped<(String, u32)>,
+    now_ms: u64,
+) -> (crate::change_flush::Tally, crate::change_park::Outboxed) {
+    let (tally, fresh) = settle_noting(shipped);
+    let items = fresh
+        .iter()
+        .map(|(t, v)| crate::change_park::pot_item(t, *v))
+        .collect();
+    let parked = crate::change_park::park_noted_back(
+        port,
+        crate::change_park::KIND_POT,
+        items,
+        COUNTER_POT_CHANGED_OUTBOXED,
+        now_ms,
+    )
+    .await;
+    (tally, parked)
 }
 
 /// Ship one flush: the outpoints in POSTs of at most [`POT_CHANGED_CHUNK`] (bsv-low #436), one after another,
@@ -193,7 +229,14 @@ pub async fn ship(env: Env, outpoints: Vec<(String, u32)>, deadline_ms: u64) {
     if !shipped.delivered.is_empty() {
         console_log!("[pot-changes] notified {} outpoint(s) in {} POST(s)", shipped.delivered.len(), shipped.posts);
     }
-    let tally = settle(&shipped);
+    // bsv-low #560: the note-backs into the D1 outbox too (no binding: memory only, as before, logged)
+    let tally = match env.d1("OVERLAY_DB") {
+        Ok(db) => settle_and_park(&crate::change_park::WorkerPark { db: &db }, &shipped, Date::now().as_millis()).await.0,
+        Err(_) => {
+            console_log!("[pot-changes] no OVERLAY_DB: the flush's note-backs stay in the isolate's memory only");
+            settle(&shipped)
+        }
+    };
     crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, tally).await;
 }
 
@@ -366,8 +409,16 @@ pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// The pins' isolate END (bsv-low #560): the set's notes and its memory of note-backs are gone, as with an
+    /// evicted isolate.
+    pub(crate) fn end_isolate() {
+        drain();
+        NOTED_BACK.with(|m| m.borrow_mut().clear());
+    }
+
 
     #[test]
     fn note_dedupes_and_drain_empties() {
@@ -626,7 +677,9 @@ mod tests {
                         .expect("the next fn")],
         ));
         assert!(ship.contains(&squash(r#"let shipped = ship_with( outpoints, |body| crate::change_flush::post_body(&env, &url, &token, "/internal/pot-changed", "pot-changes", body),"#)));
-        assert!(ship.contains(&squash("let tally = settle(&shipped);")));
+        // bsv-low #560: the note-backs into the D1 outbox too, the memory's alone without the binding
+        assert!(ship.contains(&squash("Ok(db) => settle_and_park(&crate::change_park::WorkerPark { db: &db }, &shipped, Date::now().as_millis()).await.0,")));
+        assert!(ship.contains(&squash("settle(&shipped)")));
         assert!(ship.contains(&squash(
             r#"crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, tally).await;"#
         )));
