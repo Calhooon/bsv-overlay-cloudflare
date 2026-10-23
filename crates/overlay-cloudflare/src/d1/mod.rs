@@ -612,7 +612,16 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 343 to 345 for bsv-low #825, #781 and #778 (B-FLEET-4): `conflict_fault_memo`, the conflict pass's per-pot fault
 /// memo (`admit_fast::CONFLICT_FAULT_MEMO_CREATE`), and `applayer_scheduled_pass`, the app layer's last scheduled
 /// pass and its phases' walls (the app layer's catch-up carries the CREATE byte for byte, `pass_meter::CREATE`).
-pub const OVERLAY_MIGRATION_COUNT: usize = 345;
+/// 345 to 347 for bsv-low #848 (FAST-C, #461 design C): `handfile_batches` (one row per filed batch: the four
+/// canonical payloads and the two signatures, keyed by the digest) and `handfile_rows` (each exploded row's place in
+/// its batch), the app layer's `/record?kind=handfile`; its catch-up carries both CREATEs byte for byte. Two new
+/// tables: no row is touched.
+pub const OVERLAY_MIGRATION_COUNT: usize = 347;
+
+/// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
+pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
+/// bsv-low #848 (FAST-C): each exploded row's place in its batch (`low-app-layer` `handfile::HANDFILE_ROWS_CREATE`).
+pub const HANDFILE_ROWS_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_rows (family TEXT NOT NULL, rowTxid TEXT NOT NULL, rowVout INTEGER NOT NULL, batchKey TEXT NOT NULL, idx INTEGER NOT NULL, PRIMARY KEY (family, rowTxid, rowVout))";
 
 /// bsv-low #781, #778 (B-FLEET-4): the app layer's last scheduled pass, one row (`low-app-layer` `pass_meter`).
 pub const APPLAYER_SCHEDULED_PASS_CREATE: &str = "CREATE TABLE IF NOT EXISTS applayer_scheduled_pass (id INTEGER PRIMARY KEY CHECK (id = 1), at INTEGER NOT NULL, started_at INTEGER NOT NULL, wall_ms INTEGER NOT NULL, phases TEXT NOT NULL, passes INTEGER NOT NULL DEFAULT 0)";
@@ -2277,6 +2286,10 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::admit_fast::CONFLICT_FAULT_MEMO_CREATE,
     // 345: bsv-low #781, #778 (B-FLEET-4), the app layer's last scheduled pass and its phases' walls, one row.
     APPLAYER_SCHEDULED_PASS_CREATE,
+    // 346, 347: bsv-low #848 (FAST-C), the handfile batches and each exploded row's place in its batch. New tables:
+    // no row is touched.
+    HANDFILE_BATCHES_CREATE,
+    HANDFILE_ROWS_CREATE,
 ];
 
 // =============================================================================
