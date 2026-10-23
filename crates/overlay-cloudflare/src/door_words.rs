@@ -1126,4 +1126,28 @@ mod tests {
             "the evidence check hands each courier's answer to the adapter under its source"
         );
     }
+
+    /// bsv-low #619 (L3), slice 2: the ladder's terminal judgement (#519, #602) asks the couriers afresh in
+    /// `broadcaster::terminal_presence_fresh`; that read hands each answer to the adapter and folds the hints by the
+    /// host's bar. `terminal_at_arcade_by_presence`'s arms (a courier's mined claim admits, mempool presence is the
+    /// race word, aged absence the 422) are the host's policy over that fold, unchanged.
+    #[test]
+    fn l3_slice2_the_ladders_terminal_read_folds_the_couriers_hints() {
+        let src = include_str!("broadcaster.rs");
+        let fresh = prod_slice(
+            src,
+            "async fn terminal_presence_fresh(",
+            "fn terminal_remember(",
+        );
+        assert_reads_the_couriers_hints(
+            "the ladder's terminal read",
+            fresh,
+            "door_words::courier_presence(",
+        );
+        assert!(
+            fresh.contains("courier_hint(BITAILS_SOURCE, bitails, 0)")
+                && fresh.contains("courier_hint(WOC_SOURCE, woc, 0)"),
+            "the ladder's terminal read hands each courier's answer to the adapter under its source"
+        );
+    }
 }

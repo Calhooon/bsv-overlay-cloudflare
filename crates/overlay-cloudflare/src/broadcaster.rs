@@ -2897,8 +2897,14 @@ impl ArcadeBroadcaster {
             .proof_sources
             .woc_presence_counted(self.woc_api_key.as_deref(), txid, self.courier_counters.as_ref())
             .await;
+        // bsv-low #619 (L3): each courier's answer as the tracker's hint from its source, folded by the host's
+        // two-source bar; `terminal_at_arcade_by_presence` is the host's policy over the fold
+        use crate::door_words::{courier_hint, BITAILS_SOURCE, WOC_SOURCE};
         (
-            crate::proof_fetcher::classify_presence(bitails, woc),
+            crate::door_words::courier_presence(
+                &courier_hint(BITAILS_SOURCE, bitails, 0),
+                &courier_hint(WOC_SOURCE, woc, 0),
+            ),
             "couriers",
         )
     }
