@@ -128,6 +128,22 @@ fn every_fixed_query_prepares_against_the_production_schema() {
             low_app_layer::handfile::HOPPARTY_FILED_TODAY_SQL,
         ),
         (
+            "POTPARTY_HANDFILE_ROWS_SQL",
+            low_app_layer::handfile::POTPARTY_HANDFILE_ROWS_SQL,
+        ),
+        (
+            "POTPARTY_HANDFILE_DAY_SQL",
+            low_app_layer::handfile::POTPARTY_HANDFILE_DAY_SQL,
+        ),
+        (
+            "POTREFUND_HANDFILE_DAY_SQL",
+            low_app_layer::handfile::POTREFUND_HANDFILE_DAY_SQL,
+        ),
+        (
+            "HOPPARTY_HANDFILE_DAY_SQL",
+            low_app_layer::handfile::HOPPARTY_HANDFILE_DAY_SQL,
+        ),
+        (
             "HOPPARTY_CHAIN_ROWS_SQL",
             low_app_layer::handfile::HOPPARTY_CHAIN_ROWS_SQL,
         ),
