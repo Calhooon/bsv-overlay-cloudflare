@@ -1104,11 +1104,13 @@ async fn lens_l6_a_pass_dropped_at_a_wall_keeps_the_row() {
     assert_eq!(FEED_TIMEOUT_MS, 10_000);
 }
 
-/// LENS L8 (a contended write is counted twice): the in-loop `write_now!` after an applied window loses its
-/// compare-and-set and the pass breaks; the trailing `write_now!` tries the same stale version again and counts a
-/// second contention. Cosmetic (the counter and the `stopped` text), stated.
+/// LENS L8, RE-AIMED by the fold (LOW-3): the in-loop `write_now!` after an applied window loses its compare-and-set
+/// and the pass breaks; as built the trailing `write_now!` tried the same stale version again and counted a SECOND
+/// contention (`contended` 2 for one lost write; the lens's L8 measured it). A lost compare-and-set is final for the
+/// pass (the version it holds is stale for good), so the trailing write is skipped and the contention counted ONCE; a
+/// write that FAULTED is still retried there once (it may land). RED before the fold: `left: (0, 2) right: (0, 1)`.
 #[tokio::test]
-async fn lens_l8_a_contended_pass_counts_its_contention_twice() {
+async fn lens_l8_a_contended_pass_counts_its_contention_once() {
     let store = MemoryPotStorage::new();
     let tracker = Roots::at(102);
     let standing = confirmed_pot_with_stored_proof(&store, &pot(1), 101).await;
@@ -1130,8 +1132,12 @@ async fn lens_l8_a_contended_pass_counts_its_contention_twice() {
         1,
     )
     .await;
-    assert_eq!((s.applied, s.contended), (0, 2), "{s:?}");
+    assert_eq!((s.applied, s.contended), (0, 1), "{s:?}");
     assert_eq!(s.state.as_ref().map(|st| st.cursor.as_str()), Some("40"), "the summary's state is the read one");
+    assert!(
+        s.stopped.as_deref().unwrap_or("").contains("another isolate owns this pass"),
+        "{s:?}"
+    );
 }
 
 /// LENS L7 (the pin the lane lacks: "never a blind demotion" as BEHAVIOUR). A confirmed spender whose stored BEEF

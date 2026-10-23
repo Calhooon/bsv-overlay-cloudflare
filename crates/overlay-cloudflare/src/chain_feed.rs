@@ -667,11 +667,16 @@ where
     let mut finished = 0u32;
     macro_rules! write_now {
         () => {{
+            // A lost compare-and-set is FINAL for this pass (the version held is stale for good), so nothing is tried
+            // again after it and the contention is counted once (the W15E-L4 lens fold, LOW-3: the trailing write
+            // retried the same stale version and counted a second). A write that FAULTED is retried once by the
+            // trailing write (it may land).
             let landed = state == written
-                || matches!(
-                    persist(store, &state, &mut version, now_ms, &mut out).await,
-                    Persist::Written
-                );
+                || (out.contended == 0
+                    && matches!(
+                        persist(store, &state, &mut version, now_ms, &mut out).await,
+                        Persist::Written
+                    ));
             if landed {
                 written = state.clone();
                 for (kind, n) in std::mem::take(&mut unwritten) {
