@@ -78,6 +78,33 @@ pub fn latched(deadline: crate::engine::SleepFuture) -> crate::engine::SleepFutu
     }))
 }
 
+/// A latched deadline several futures read (bsv-low #590: the resumes'
+/// share, read by each resume beside its own slice).
+type SharedDeadline = std::rc::Rc<std::cell::RefCell<crate::engine::SleepFuture>>;
+
+/// Whichever of `own` and `shared` falls due first (bsv-low #590): a
+/// resume's own slice beside the resumes' share. Both are latched, so either
+/// may be polled after it fell due; `shared` stays readable by the next
+/// resume. `None`: `own` alone.
+fn earlier_of(
+    own: crate::engine::SleepFuture,
+    shared: Option<SharedDeadline>,
+) -> crate::engine::SleepFuture {
+    let Some(shared) = shared else {
+        return own;
+    };
+    let mut own = own;
+    Box::pin(std::future::poll_fn(move |cx| {
+        let mine = own.as_mut().poll(cx).is_ready();
+        let theirs = shared.borrow_mut().as_mut().poll(cx).is_ready();
+        if mine || theirs {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }))
+}
+
 /// What makes a deadline COOPERATIVE around a write (bsv-low #552, the lens
 /// fold's HIGH-1). `Engine::submit` is several storage writes (mark spent,
 /// delete the stale coin, insert the outputs, notify, record applied), each
@@ -404,6 +431,18 @@ pub const DEFAULT_GRAPH_BUDGET_CALLS: u32 = 100;
 /// of its topic's slice and the UTXOs after it keep the other half. A caller
 /// keeps it BELOW its per-peer budget (`Engine::set_peer_sync_budget`); a
 /// graph the per-peer deadline cuts first is deferred all the same.
+///
+/// Sized for a host that fetches a node in seconds (bsv-low #590): at
+/// Zanaadu's measured cron pace of 2 to 3 s a node (#377) a minute walks 20
+/// to 30 nodes, three times its 5 to 7 node graphs; at beta's 1.2 s about
+/// 50. The slice is charged per RESUME (each deferred graph a whole slice
+/// each pass, the resumes' share and the per-peer deadline the outer
+/// bounds) and read before each step: a node started inside it finishes,
+/// and is cut only past a whole slice of its own (the finish-the-node
+/// rule). The config is the host's (`Engine::set_graph_budget`). Stated:
+/// `Engine::start_gasp_sync` holds a configured slice at most
+/// [`crate::meter::ROOT_MAX_MS`] (15 s, the hard bound of one root's walk),
+/// so this default and any host value above 15 s are in force as 15 s.
 pub const DEFAULT_GRAPH_BUDGET_MS: u64 = 60_000;
 
 /// Default per-GRAPH bytes budget (bsv-low #586): the bytes of the nodes ONE
@@ -1636,14 +1675,16 @@ pub struct GASPSync<'a> {
     /// The roots of this (peer, topic)'s records not yet resumed in this
     /// sync (keys only; records are read one at a time).
     deferred: std::cell::RefCell<std::collections::HashSet<String>>,
-    /// ONE deadline for every resume of the sync (the lens fold's M1), made
-    /// at the first resume.
-    resume_deadline: std::cell::RefCell<Option<crate::engine::SleepFuture>>,
+    /// The resumes' share of the pass ([`Self::with_resume_share`]), made
+    /// when the held loop starts: read BEFORE each resume (one started past
+    /// it is held back) and before each step of a resume's walk, beside the
+    /// resume's own slice (bsv-low #590). `None`: no shared time bound.
+    resume_deadline: std::cell::RefCell<Option<SharedDeadline>>,
     /// What every resume of the sync may still spend together (M1).
     resume_left: std::cell::Cell<PassCap>,
     /// A fresh deadline for the resumes' share of a pass (engine 0.1.11,
-    /// [`Self::with_resume_share`]); `None`: the per-graph deadline, made at
-    /// the resume that opens the pass, as before.
+    /// [`Self::with_resume_share`]); `None`: no shared time bound, each
+    /// resume its own slice (bsv-low #590).
     resume_share: Option<Box<dyn Fn() -> crate::engine::SleepFuture + 'a>>,
     /// Calls made by the sync's walks so far.
     calls_made: std::cell::Cell<u64>,
@@ -2449,8 +2490,13 @@ impl<'a> GASPSync<'a> {
     /// deadline for every held record walked ahead of the page, started when
     /// the held loop starts, so the page keeps the rest of the per-peer
     /// slice (see [`RESUMES_SHARE_OF_PEER_BUDGET_PERCENT`]). A record reached
-    /// once it fell due is held back for the next sync. Without one the
-    /// resumes share one per-graph deadline (the lens fold's M1).
+    /// once it fell due is held back for the next sync. Since bsv-low #590
+    /// the share GATES the resumes and each walks under a slice of its own:
+    /// it is read before a resume starts and before each of its steps, and a
+    /// node in flight finishes (the finish-the-node rule). Without one each
+    /// resume has its own slice and no time bound is shared (until #590 they
+    /// shared one per-graph deadline, the lens fold's M1); the per-peer
+    /// deadline bounds them.
     #[must_use]
     pub fn with_resume_share(
         mut self,
@@ -2716,7 +2762,8 @@ impl<'a> GASPSync<'a> {
             if let Some(share) = &self.resume_share {
                 let mut deadline = latched(share());
                 let _ = Self::due(&mut deadline).await;
-                *self.resume_deadline.borrow_mut() = Some(deadline);
+                *self.resume_deadline.borrow_mut() =
+                    Some(std::rc::Rc::new(std::cell::RefCell::new(deadline)));
             }
         }
         let held_scores: std::collections::HashMap<String, u64> = held_keys
@@ -3267,14 +3314,31 @@ impl<'a> GASPSync<'a> {
                 .ingest_budgeted(utxo, outpoint, &mut deadline, budget.pass(), false)
                 .await;
         }
-        let mut deadline = self
-            .resume_deadline
-            .borrow_mut()
-            .take()
-            .unwrap_or_else(|| latched((budget.deadline)()));
+        // bsv-low #590: the time limb is charged per RESUME. Each resume
+        // walks under a fresh slice of its own (`budget.deadline`), so a
+        // deferred graph gets a whole slice each pass; the resumes' share,
+        // when one is set, is read before the resume starts (one started
+        // past it is held back) and before each step, and the per-peer
+        // deadline (D16) bounds them all. Until #590 every resume of a sync
+        // shared ONE deadline (the lens fold's M1: the share, or the first
+        // resume's slice), so a resume that started late in it got what the
+        // earlier ones left and the deferred graphs of one (peer, topic)
+        // resumed one or two a tick (Zanaadu's #377 measurement). The
+        // counted limbs (calls, bytes, nodes) stay SHARED by the resumes of
+        // a sync (`resume_left`): they bound what a peer's held records cost
+        // in requests per sync, and #377 found no graph near its 100 calls.
+        let share = self.resume_deadline.borrow().clone();
         let cap = self.resume_left.get();
-        if cap.spent() || Self::due(&mut deadline).await {
-            *self.resume_deadline.borrow_mut() = Some(deadline);
+        let share_due = match &share {
+            Some(share) => {
+                std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(share.borrow_mut().as_mut().poll(cx).is_ready())
+                })
+                .await
+            }
+            None => false,
+        };
+        if cap.spent() || share_due {
             let record = self.storage.get_deferred_graph(outpoint).await?;
             self.read_record(record.as_ref());
             if self.sweep_expired_record(record.as_ref()).await? {
@@ -3324,6 +3388,7 @@ impl<'a> GASPSync<'a> {
             self.bytes_fetched.get(),
             self.nodes_appended.get(),
         );
+        let mut deadline = earlier_of(latched((budget.deadline)()), share);
         let ingested = self
             .ingest_budgeted(utxo, outpoint, &mut deadline, cap, true)
             .await;
@@ -3357,7 +3422,6 @@ impl<'a> GASPSync<'a> {
                 .nodes
                 .saturating_sub(narrowed(self.nodes_appended.get() - before.2)),
         });
-        *self.resume_deadline.borrow_mut() = Some(deadline);
         ingested
     }
 
@@ -3416,6 +3480,15 @@ impl<'a> GASPSync<'a> {
 
     /// Whether `deadline` has fallen due (polled once, with the task's own
     /// waker).
+    /// A fresh slice for ONE node in flight (bsv-low #590, the
+    /// finish-the-node rule): the per-graph deadline made at the step's
+    /// start. `None` without a per-graph budget.
+    fn node_slice(&self) -> Option<crate::engine::SleepFuture> {
+        self.graph_budget
+            .as_ref()
+            .map(|budget| latched((budget.deadline)()))
+    }
+
     async fn due(deadline: &mut crate::engine::SleepFuture) -> bool {
         std::future::poll_fn(|cx| std::task::Poll::Ready(deadline.as_mut().poll(cx).is_ready()))
             .await
@@ -3597,7 +3670,15 @@ impl<'a> GASPSync<'a> {
                     spent_by: None,
                     parent_proven: false,
                 };
-                match race_or_deadline(self.fetch_root(&root), deadline.as_mut()).await {
+                // The finish-the-node rule (bsv-low #590), as in the walk.
+                if Self::due(deadline).await {
+                    return Ok(WalkEnd::Deferred("time"));
+                }
+                let reasked = match self.node_slice() {
+                    Some(mut own) => race_or_deadline(self.fetch_root(&root), own.as_mut()).await,
+                    None => race_or_deadline(self.fetch_root(&root), deadline.as_mut()).await,
+                };
+                match reasked {
                     None => return Ok(WalkEnd::Deferred("time")),
                     Some(Ok(None)) => return Ok(WalkEnd::Expired),
                     Some(Ok(Some(node))) if node.proof.is_some() => {
@@ -4340,12 +4421,31 @@ impl<'a> GASPSync<'a> {
             if let Some(limb) = over {
                 return Ok(WalkEnd::Deferred(limb));
             }
+            // The finish-the-node rule (bsv-low #590): the time limb is read
+            // BEFORE a step, as the counted limbs are, so no node is started
+            // past the pass's slice; a node started inside it is not cut
+            // when the slice falls due, only past a whole slice of its OWN
+            // from the step's start ([`Self::node_slice`]: a fetch that
+            // hangs is still a `time` cut, the stall rule's case). The
+            // per-peer deadline (D16) is the outer bound and may still drop
+            // the sync mid-fetch.
+            if let Some(deadline) = deadline.as_mut() {
+                if Self::due(deadline).await {
+                    return Ok(self.root_bound("time"));
+                }
+            }
             let step = self.step(&item);
             let out = match deadline.as_mut() {
-                Some(deadline) => match race_or_deadline(step, deadline.as_mut()).await {
-                    Some(out) => out,
-                    None => return Ok(self.root_bound("time")),
-                },
+                Some(deadline) => {
+                    let raced = match self.node_slice() {
+                        Some(mut own) => race_or_deadline(step, own.as_mut()).await,
+                        None => race_or_deadline(step, deadline.as_mut()).await,
+                    };
+                    match raced {
+                        Some(out) => out,
+                        None => return Ok(self.root_bound("time")),
+                    }
+                }
                 None => step.await,
             };
             if crate::meter::root_exhausted() || matches!(out, Err(GASPError::CourierBudget)) {
