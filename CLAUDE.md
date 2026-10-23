@@ -973,10 +973,40 @@ SPENT row beside the new head, no UTXO.)
   consumed by nothing), and the kept stale coin IS marked spent by then, so
   it is not listed as a UTXO until the replay (a state the reference does not
   have: its kept spent rows are retained coins).
-- A fault AFTER them (the spent mark of a stale coin, a lookup notification,
-  the consumed-by update, the applied row) leaves the transaction's outputs
-  and deletes the stale coins all the same, as the reference does. `c9921ee`
-  skipped the delete on any fault and left two unspent heads.
+- A LOOKUP NOTIFICATION that faults is a fault BEFORE the transaction landed
+  (bsv-low #657, lane ENGINE-657; zanaadu-v2 #414), whether it is a stale
+  coin's `output_spent` (nothing is inserted) or an inserted output's
+  `output_admitted_by_topic` (the inserts stop there and are undone, the
+  output whose hook faulted included; no further lookup service is told):
+  the stale coins are kept (marked spent, as on an insert fault) and NEVER
+  deleted, no applied row, so the replay is judged over the coin it was
+  judged with and re-applies the transaction whole, telling the hooks again.
+  A deterministic fault answers the same word on every presentation (the
+  store byte-equal after the first). Until #657 a notification fault was a
+  fault after the inserts: the stale coin was deleted all the same and the
+  applied row withheld, so the replay of the same bytes was judged WITHOUT
+  the coin it deleted (Zanaadu's registry: the retry read as a first
+  deployment and admitted output 0 alone). Option (b), the applied row
+  recorded and a durable "notify owed" row settled by the replay, was not
+  built: it needs a table and four `Storage` methods for every backend, and
+  a deterministic fault would hold an owed row for ever while the topic said
+  "applied"; (a) uses the undo #559 already proves and points where
+  Zanaadu's atomic admission (bsv-low #657's design, open as PRs #41 to #43)
+  goes: a refusal writes nothing. Divergence by addition: the reference
+  (`Engine.submit`, `applyTopicStorageMutation`) deletes first, notifies
+  after with no retraction, and keeps the output a throwing hook was told
+  of. The register gets the sentence (LOW's captain records). Pins
+  `e657_a` (deterministic, three presentations, one word), `e657_b` (once,
+  then the replay whole and the hook told), `e657_c` (the spend's hook, both)
+  in `--test gasp_topic_manager`, each RED on `d370d906`; moved with it:
+  `fold559_f1_a_notification_fault_*`, `delta559_h2_x6_*` (H2 stays pinned
+  by the applied-row fault and X5), `delta2_559_row6_*`, and
+  `error_paths::lookup_service_admission_failure_doesnt_block_submit` (the
+  output is no longer held).
+- A fault AFTER them (the spent mark of a stale coin, the consumed-by update,
+  the applied row) leaves the transaction's outputs and deletes the stale
+  coins all the same, as the reference does. `c9921ee` skipped the delete on
+  any fault and left two unspent heads.
 - A submit that deletes a stale coin FIRST records that coin's transaction as
   applied (the delta fold, H2; `record_spent_coin_applied` in the report when
   that write faults, and the coin is then not deleted). A held coin proves
@@ -1200,14 +1230,18 @@ and one that faults too leaves the inserted output beside the kept coin
 (`undo_insert_output` in the report). A successor that spends it before the
 replay no longer brings a double head back (the replay is a dupe, H2); the
 kept coin's spent row stays behind. (2) A lookup hook that faulted is told
-again only if the manager admits again on the replay: a manager whose rule
-needs the previous coin admits nothing there (the coin is deleted), under
-GASP there is no replay, and since H2 the replay is a dupe once a successor
-spent ANY output of that transaction, so a sibling output whose hook faulted
-is not told again either; the reference tells nobody twice. (3) The lookup
+again on the replay since #657 (the transaction is re-applied whole over the
+coin it kept; under GASP its outputs are not held, so the UTXO fails and the
+walk submits it again), so a lookup service's hooks must be idempotent; the
+reference tells nobody twice. A hook that faults DETERMINISTICALLY holds the
+transaction out for good (three retries and a dead letter at the door, the
+cursor held under GASP) with the stale coin kept and marked spent, so the
+topic lists no UTXO for that head until the hook is fixed: the cost of the
+rule, stated. (3) The lookup
 services are told of a stale coin's spend, and of each inserted output,
 BEFORE the transaction has landed (the mark and `output_spent` run before
-the inserts, as in the reference): on an insert fault the store keeps the old
+the inserts, as in the reference): on an insert fault, or a notification
+fault since #657, the store keeps the old
 head while every lookup service was told it is spent, and an output that was
 inserted and undone was told as admitted, with no retraction. The replay
 heals it; after the dead letter the split stays until the next head. (4) The

@@ -1759,11 +1759,19 @@ impl Engine {
             // ── Mark previous outputs as spent + notify lookup services ──
             // A mark that faults does not skip the notification (the
             // reference skips it): the coin is spent whatever the row says,
-            // a stale one is deleted below and its lookup services must
-            // know. The mark of a RETAINED coin is part of what landed: that
-            // row stays, and left unspent it would be listed as a UTXO
-            // beside the output that consumed it.
+            // and its lookup services must know. The mark of a RETAINED coin
+            // is part of what landed: that row stays, and left unspent it
+            // would be listed as a UTXO beside the output that consumed it.
+            //
+            // A NOTIFICATION that faults is a fault BEFORE the transaction
+            // landed (bsv-low #657): nothing is inserted and no stale coin
+            // is deleted, so the replay is judged over the coin it was
+            // judged with here and re-applies the transaction whole. Until
+            // #657 it was a fault after the inserts and the stale coin was
+            // deleted all the same, so the replay of the same bytes was
+            // judged without it (another word for the same bytes).
             let mut retained_mark_faulted = false;
+            let mut spend_notify_faulted = false;
             for (prev_idx, prev_output) in v.previous_outputs.iter().enumerate() {
                 if let Err(e) = stored(
                     bound,
@@ -1829,6 +1837,7 @@ impl Engine {
                     if let Err(e) = hooked(bound, ls.output_spent(&payload)).await {
                         error!("Error notifying lookup service of spent output: {e}");
                         report.fault(topic, "lookup_service.output_spent", e);
+                        spend_notify_faulted = true;
                     }
                 }
             }
@@ -1840,13 +1849,27 @@ impl Engine {
                 );
                 continue;
             }
+            if spend_notify_faulted {
+                self.hold_unapplied(
+                    &txid,
+                    topic,
+                    &format!(
+                        "a lookup service's spend notification faulted: {} previous coin(s) kept, nothing inserted (bsv-low #657)",
+                        stale_coins.len()
+                    ),
+                );
+                continue;
+            }
 
             // ── Insert admitted outputs ──
-            // The inserts stop at the first one that faults: what follows is
-            // the undo, not the rest of the transaction.
+            // The inserts stop at the first one that faults, and at the first
+            // lookup service's admission notification that faults (bsv-low
+            // #657): what follows is the undo, not the rest of the
+            // transaction.
             let mut new_utxos: Vec<Outpoint> = Vec::new();
             let mut attempted: Vec<u32> = Vec::new();
             let mut insert_faulted = false;
+            let mut admit_notify_faulted = false;
 
             for &output_index in &admittance.outputs_to_admit {
                 let (script_bytes, sats) =
@@ -1917,7 +1940,12 @@ impl Engine {
                     if let Err(e) = hooked(bound, ls.output_admitted_by_topic(&payload)).await {
                         error!("Error notifying lookup service: {e}");
                         report.fault(topic, "lookup_service.output_admitted_by_topic", e);
+                        admit_notify_faulted = true;
+                        break;
                     }
+                }
+                if admit_notify_faulted {
+                    break;
                 }
             }
 
@@ -1931,7 +1959,16 @@ impl Engine {
             // replay, and the replay, which still finds the previous coin,
             // would insert them a second time: a spent head back among the
             // UTXOs for good.
-            if insert_faulted {
+            //
+            // A lookup service's admission notification that faulted takes
+            // the same road (bsv-low #657, zanaadu-v2 #414): no stale coin
+            // has been deleted yet, so the store is put back as it was found
+            // and the replay re-applies the transaction whole over the coin
+            // it still finds. The lookup services told before the fault are
+            // not told to retract (rule (5) of D17, as in the reference); the
+            // replay tells them again, so a lookup service's admission and
+            // spend hooks must be idempotent, as every replay already needs.
+            if insert_faulted || admit_notify_faulted {
                 if let Some(bound) = bound {
                     bound.renew();
                 }
@@ -1941,7 +1978,12 @@ impl Engine {
                     &txid,
                     topic,
                     &format!(
-                        "an insert faulted: {} previous coin(s) kept, nothing of it held",
+                        "{}: {} previous coin(s) kept, nothing of it held",
+                        if insert_faulted {
+                            "an insert faulted"
+                        } else {
+                            "a lookup service's admission notification faulted (bsv-low #657)"
+                        },
                         stale_coins.len()
                     ),
                 );
@@ -1957,8 +1999,9 @@ impl Engine {
             // is ours, an addition. The delete does NOT wait for a clean
             // report (c9921ee did, and one faulted mark or notification
             // after the insert then left the stale coin beside the new
-            // output for good: two unspent heads): a fault of the mark, of
-            // a notification, deletes as the reference does.
+            // output for good: two unspent heads): a fault of the mark of a
+            // stale coin deletes as the reference does. A faulted lookup
+            // notification never reaches here since bsv-low #657 (above).
             //
             // Before a stale coin is deleted its transaction is recorded as
             // applied in the topic (the delta fold of 2026-10-07, H2; an
