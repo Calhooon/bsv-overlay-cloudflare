@@ -3573,6 +3573,19 @@ pub(crate) mod tests {
         )
     }
 
+    /// [`test_deadline_reserving`] on tokio's clock, for a pin run under `start_paused` (bsv-low #767): the deadline's
+    /// clock and timer are the runtime's virtual time, which moves only when every task waits, so a pass's elapsed time
+    /// is what its timers say and nothing the host's scheduler adds.
+    fn paused_deadline_reserving(ms: u64, reserve_ms: u64) -> Deadline {
+        let t0 = tokio::time::Instant::now();
+        Deadline::new(
+            ms,
+            reserve_ms,
+            Box::new(move || t0.elapsed().as_millis() as u64),
+            Box::new(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms)))),
+        )
+    }
+
     /// The shipped store with SLOW (or never answering) D1 round trips: the due read and the write batch each sleep
     /// their delay before the real SQL runs (a dropped call runs none).
     struct SlowStore<'a> {
@@ -3580,7 +3593,12 @@ pub(crate) mod tests {
         read: Option<Duration>,
         write: Option<Duration>,
     }
+    /// A host that stalls on every D1 round trip (a loaded scheduler: bsv-low #767 measured 63 ms against a 60 ms bar
+    /// at a load of 13). The stall blocks the thread, as a descheduled isolate does; the pin's clock is tokio's paused
+    /// one, which a blocked thread does not move, so the pin's verdict is the deadline's arithmetic, never the host's.
+    const HOST_STALL: Duration = Duration::from_millis(25);
     async fn slow(d: Option<Duration>) {
+        std::thread::sleep(HOST_STALL);
         match d {
             Some(d) => tokio::time::sleep(d).await,
             None => std::future::pending::<()>().await,
@@ -3680,8 +3698,10 @@ pub(crate) mod tests {
     /// read too; (c) 24 due rows delivered by a quick relay whose SETTLE is slow return at the deadline with the rows
     /// RETAINED as they were (attempts 0, still parked at their tokens, retried by a later pass); (d) a relay that
     /// never answers is stopped at the reserve and its rows are settled as failed attempts before the deadline. The
-    /// worker's drain task runs its boot and its courier flush under the same deadline.
-    #[tokio::test(flavor = "current_thread")]
+    /// worker's drain task runs its boot and its courier flush under the same deadline. The pass runs on tokio's PAUSED
+    /// clock with every D1 round trip stalling the thread [`HOST_STALL`] (bsv-low #767: on the wall clock a loaded host
+    /// missed the bar by scheduling alone, 63 ms against 60): each bound is the deadline's own arithmetic.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn e649f3_n7_the_drain_task_is_bounded_by_one_deadline() {
         let lib = squash(&code_only(include_str!("lib.rs")));
         let sched = &lib[lib.find(&squash("async fn scheduled(")).expect("scheduled")..];
@@ -3730,20 +3750,20 @@ pub(crate) mod tests {
             read: Some(ms(80)),
             write: Some(ms(80)),
         };
-        let t0 = Instant::now();
-        drain_parked(&s, &Relay::default(), &test_deadline_reserving(40, 10)).await;
+        let t0 = tokio::time::Instant::now();
+        drain_parked(&s, &Relay::default(), &paused_deadline_reserving(40, 10)).await;
         let took = t0.elapsed().as_millis();
-        assert!(took < 60, "the empty pass took {took} ms under 40 ms");
+        assert!(took <= 40, "the empty pass took {took} ms under 40 ms");
         // (b) a never-answering due read
         let s = SlowStore {
             inner: &store,
             read: None,
             write: None,
         };
-        let t0 = Instant::now();
-        let t = drain_parked(&s, &Relay::default(), &test_deadline_reserving(40, 10)).await;
+        let t0 = tokio::time::Instant::now();
+        let t = drain_parked(&s, &Relay::default(), &paused_deadline_reserving(40, 10)).await;
         let took = t0.elapsed().as_millis();
-        assert!(took < 60, "a pending read took {took} ms under 40 ms");
+        assert!(took <= 40, "a pending read took {took} ms under 40 ms");
         assert_eq!(t.rounds, 0);
         // (c) 24 due rows, a quick relay, a slow settle: the rows retained as they were
         let now = store.sql.now.get();
@@ -3765,11 +3785,11 @@ pub(crate) mod tests {
             read: Some(Duration::ZERO),
             write: Some(ms(80)),
         };
-        let t0 = Instant::now();
+        let t0 = tokio::time::Instant::now();
         let quick = Relay::default();
-        drain_parked(&s, &quick, &test_deadline_reserving(40, 10)).await;
+        drain_parked(&s, &quick, &paused_deadline_reserving(40, 10)).await;
         let took = t0.elapsed().as_millis();
-        assert!(took < 60, "the slow settle took {took} ms under 40 ms");
+        assert!(took <= 40, "the slow settle took {took} ms under 40 ms");
         assert_eq!(quick.delivered.borrow().len(), 24, "the relay took them");
         assert_eq!(generations(&store.sql), before, "retained at their tokens");
         let attempts: i64 = store
@@ -3793,10 +3813,10 @@ pub(crate) mod tests {
             write: Some(Duration::ZERO),
         };
         let hung = SlowRelay::new(Duration::from_secs(3600), Delivery::Sent);
-        let t0 = Instant::now();
-        let t = drain_parked(&s, &hung, &test_deadline_reserving(60, 30)).await;
+        let t0 = tokio::time::Instant::now();
+        let t = drain_parked(&s, &hung, &paused_deadline_reserving(60, 30)).await;
         let took = t0.elapsed().as_millis();
-        assert!(took < 60, "the hung relay took {took} ms under 60 ms");
+        assert!(took <= 60, "the hung relay took {took} ms under 60 ms");
         assert_eq!((t.due, t.retry_failed), (24, 24));
         let attempts: i64 = store
             .sql

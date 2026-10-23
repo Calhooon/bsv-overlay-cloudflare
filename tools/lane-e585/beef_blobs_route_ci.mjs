@@ -43,6 +43,7 @@ import { createHash, randomFillSync } from 'node:crypto'
 import { provedBeefV1, blockCoinbaseInput } from '../fixtures/proven_beef.mjs'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { readdirSync, writeFileSync } from 'node:fs'
+import { parkVerdict, redriveVerdict } from './redrive_verdict.mjs'
 import { fileURLToPath } from 'node:url'
 
 const OVERLAY = process.argv[2] ?? 'http://127.0.0.1:8801'
@@ -65,6 +66,22 @@ const expect = (ok, label, why) => {
   lines.push(`FAIL  ${label}`, `      ${why}`)
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+/**
+ * A re-drive leg's expectation (bsv-low #594): when it does not hold, the letter's own row names why. A row still as
+ * the lever claimed it (`redriven`, attempts 0, the same `redriven_at`) was never delivered by the local queue: the
+ * line reads NOT-DELIVERED, never FAIL (`redrive_verdict.mjs`); anything else is a FAIL, a wrong answer.
+ */
+const expectRedrive = (ok, label, why, txid, claimedAt) => {
+  if (ok) return lines.push(`PASS  ${label}`)
+  failures++
+  const row = d1(`SELECT * FROM mutation_dead_letters WHERE txid = '${txid}'`)[0]
+  lines.push(`${redriveVerdict(row, claimedAt)}  ${label}`, `      ${why}`)
+}
+/** The `redriven_at` the lever's claim wrote for `txid` (read right after the call), or null. */
+const claimOf = (txid) => {
+  const r = d1(`SELECT status, redriven_at FROM mutation_dead_letters WHERE txid = '${txid}'`)[0]
+  return r && r.status === 'redriven' ? Number(r.redriven_at) : null
+}
 
 // ── the lane-499 / E1D raw-tx and BEEF builders (as lane E576's) ─────────────
 const varint = (n) => {
@@ -256,7 +273,18 @@ for (const x of [A, B, C, E]) {
     return r && r.status === 'parked' ? r : null
   })
 }
-expect([A, B, C, E].every((x) => !!x.row), `each dead-letters after its replays and PARKS (within ${WAIT_MS / 1000} s)`, [A, B, C, E].map((x) => brief(letter(x.s))).join(' | '))
+{
+  const ok = [A, B, C, E].every((x) => !!x.row)
+  const label = `each dead-letters after its replays and PARKS (within ${WAIT_MS / 1000} s)`
+  const why = [A, B, C, E].map((x) => brief(letter(x.s))).join(' | ')
+  if (ok) lines.push(`PASS  ${label}`)
+  else {
+    // bsv-low #594: a letter still in flight names the local queue, never a FAIL
+    failures++
+    const stuck = [A, B, C, E].find((x) => !x.row && parkVerdict(letter(x.s)) !== 'FAIL')
+    lines.push(`${stuck ? parkVerdict(letter(stuck.s)) : 'FAIL'}  ${label}`, `      ${why}`)
+  }
+}
 for (const x of [A, B, C, E]) {
   if (!x.row) continue
   const m = JSON.parse(x.row.message)
@@ -282,9 +310,10 @@ if (A.row) {
   d1(`DELETE FROM pot_evictions WHERE txid = '${A.p}'`)
   const ra = await lever({ txid: A.s })
   expect(ra.status === 200 && (ra.json?.redriven ?? []).length === 1, 'A: its predecessor readmitted, the lever re-drives the key', ra.text.slice(0, 300))
+  const aClaim = claimOf(A.s)
   const landed = await until(() => (letter(A.s) === undefined ? true : null))
   const applied = d1(`SELECT COUNT(*) AS c FROM applied_transactions WHERE txid = '${A.s}'`)[0]?.c
-  expect(!!landed && Number(applied) >= 1, `A: the consumer re-read R2 and the letter LANDED (row gone, subject applied; within ${WAIT_MS / 1000} s)`, `${brief(letter(A.s))} applied=${applied}`)
+  expectRedrive(!!landed && Number(applied) >= 1, `A: the consumer re-read R2 and the letter LANDED (row gone, subject applied; within ${WAIT_MS / 1000} s)`, `${brief(letter(A.s))} applied=${applied}`, A.s, aClaim)
   const gone = await until(() => (r2get(A.key) === null ? true : null))
   const h2 = await health()
   expect(
@@ -299,16 +328,19 @@ if (B.row) {
   r2del(B.key)
   const rb = await lever({ txid: B.s })
   expect((rb.json?.redriven ?? []).length === 1, 'B: its object deleted out from under it, the lever re-drives the key', rb.text.slice(0, 300))
+  const bClaim = claimOf(B.s)
   const again = await until(() => {
     const r = letter(B.s)
     return r && r.status === 'parked' && Number(r.redrives) === 1 ? r : null
   })
   const h3 = await health()
-  expect(
+  expectRedrive(
     !!again && again.class === 'not_now' && /MISSING/.test(again.fault ?? '') && again.r2_key === B.key &&
       (h3.counters?.beef_blobs_missing_total ?? 0) >= (c0.beef_blobs_missing_total ?? 0) + 1,
     `B: a missing object is the replay's fault, parked again with its key and its class KEPT (not_now; within ${WAIT_MS / 1000} s)`,
     `${brief(letter(B.s))} missing=${h3.counters?.beef_blobs_missing_total}`,
+    B.s,
+    bClaim,
   )
   await lever({ letters: [{ txid: B.s }] }, '/internal/discard-dead-letters')
 }
@@ -339,10 +371,11 @@ if (D.beef.length <= max) {
   if (row) {
     d1(`DELETE FROM pot_evictions WHERE txid = '${D.p}'`)
     const rd = await lever({ txid: D.s })
+    const dClaim = claimOf(D.s)
     const landed = await until(() => (letter(D.s) === undefined ? true : null))
     const applied = d1(`SELECT COUNT(*) AS c FROM applied_transactions WHERE txid = '${D.s}'`)[0]?.c
     const gone = await until(() => (r2get(row.r2_key) === null ? true : null))
-    expect((rd.json?.redriven ?? []).length === 1 && !!landed && Number(applied) >= 1 && !!gone, 're-driven from R2 it LANDS, and its object is gone after the ack', `${rd.text.slice(0, 200)} ${brief(letter(D.s))} applied=${applied}`)
+    expectRedrive((rd.json?.redriven ?? []).length === 1 && !!landed && Number(applied) >= 1 && !!gone, 're-driven from R2 it LANDS, and its object is gone after the ack', `${rd.text.slice(0, 200)} ${brief(letter(D.s))} applied=${applied}`, D.s, dClaim)
   }
 } else {
   expect(false, `a ${D.beef.length} B submission is carried (the door refuses no body for its size, #568)`, `replayMaxBytes is ${max}; ${D.rs.status}: ${D.rs.text.slice(0, 300)}; written0 ${written0}`)
@@ -358,12 +391,15 @@ if (E.row) {
   const twin0 = (await health()).counters?.queue_r2_twin_acked_total ?? 0
   const re = await lever({ txid: E.s })
   expect((re.json?.redriven ?? []).length === 1, 'E: its object deleted, the lever re-drives the key', re.text.slice(0, 300))
+  const eClaim = claimOf(E.s)
   const gone = await until(() => (letter(E.s) === undefined ? true : null))
   const h6 = await health()
-  expect(
+  expectRedrive(
     !!gone && (h6.counters?.queue_r2_twin_acked_total ?? 0) >= twin0 + 1,
     `E: MISSING and landed, the replay is ACKED as a twin: no letter, queue_r2_twin_acked_total moved (within ${WAIT_MS / 1000} s)`,
     `${brief(letter(E.s))}; twin ${twin0} -> ${h6.counters?.queue_r2_twin_acked_total}`,
+    E.s,
+    eClaim,
   )
 }
 

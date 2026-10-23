@@ -36,10 +36,29 @@
  *  2. each over-budget body: never 429, never 413; 202 with `accepted: true`,
  *     `deferred: true`, a `reference` and a `poll` path naming it, and the
  *     subject's txid;
- *  3. each reference polled: the job reaches `done` with the outcome the
- *     request would have answered (200), and the fixture saw the deferred
- *     work's probe for the subject AFTER the 202 (the consumer did the work);
- *  4. the same body sent again while its job is open names the same reference.
+ *  3. each job, read from the worker's D1 file (`job_state.mjs`), reaches
+ *     `done`; then the reference, polled once, answers the outcome the request
+ *     would have answered (200), and the fixture saw the deferred work ask the
+ *     broadcaster for the subject AFTER the 202 (the consumer did the work);
+ *  4. the same body sent again once its job has settled names the same
+ *     reference, re-opens the job, and its run reaches `done` again.
+ *
+ * JUDGED FROM THE JOB'S OWN STATE (bsv-low #776, #763). The witness sends the
+ * worker nothing while a run is in flight (see `job_state.mjs`: on the local
+ * tier a request served during a run whose subrequest is slow leaves the run's
+ * dispatch, or the next request, never completing, and the local queue then
+ * runs no later job). Until #776 it polled the route every second during the
+ * run and sent the body again "while open", which raced the run: a run that
+ * settled first was re-opened by the second presentation (as designed) and the
+ * poll judged that second run; a run the request overlapped never reported.
+ * A job no run took is `NOT DISPATCHED`, one that stops moving `STALLED`, each
+ * with its last two reads: never a bare poll timeout. The fixture holds its
+ * answer to every deferred subject `RUN_PROBE_HOLD_MS` (default 4,000 ms): the
+ * slow subrequest of a loaded host, made deterministic, so this witness pins
+ * that it judges a slow run right. And it serves the corroborator too
+ * (`POST /v1/tx`): a run whose pre-flight probe misses under load takes the
+ * corroborating ladder, which answered 502 against the bare Arcade (#763's
+ * second instance).
  *
  * MODELLING BOUNDARY: the worker is `wrangler dev --local` with its local
  * queue and its local D1. The platform's own limits (the request body, the
@@ -49,9 +68,16 @@
  */
 import { createHash, randomFillSync } from 'node:crypto'
 import { createServer } from 'node:http'
+import { waitRunEnded, waitSettled } from './job_state.mjs'
 
 const BASE = process.argv[2] ?? 'http://127.0.0.1:9612'
 const FIXTURE_PORT = Number(process.env.FIXTURE_PORT ?? '9613')
+const EF_STATE = process.env.EF_STATE
+const RUN_PROBE_HOLD_MS = Number(process.env.RUN_PROBE_HOLD_MS ?? 4000)
+if (!EF_STATE) {
+  console.error('EF_STATE (the worker\'s --persist-to dir) is required: the witness reads the job from its D1 file')
+  process.exit(2)
+}
 const SUBJECT_BUDGET = 256 * 1024
 const BATCH_BUDGET = 2 * 1024 * 1024
 
@@ -107,19 +133,25 @@ function control() {
 
 // ── the fixture Arcade: every probe is SEEN; every request is logged ──────────
 const log = [] // { method, path, at }
+/** The deferred subjects: the fixture holds its answers to their runs (`RUN_PROBE_HOLD_MS`). */
+const held = new Set()
 const fixture = createServer((req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${FIXTURE_PORT}`)
   const chunks = []
   req.on('data', (c) => chunks.push(c))
-  req.on('end', () => {
+  req.on('end', async () => {
     log.push({ method: req.method, path: url.pathname, at: Date.now() })
+    const probed = url.pathname.startsWith('/tx/') ? url.pathname.slice('/tx/'.length).toLowerCase() : null
+    if (held.size > 0 && (probed === null ? req.method === 'POST' : held.has(probed))) {
+      await new Promise((r) => setTimeout(r, RUN_PROBE_HOLD_MS))
+    }
     if (req.method === 'GET' && url.pathname.startsWith('/tx/')) {
       const txid = url.pathname.slice('/tx/'.length).toLowerCase()
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ txid, txStatus: 'SEEN_ON_NETWORK' }))
       return
     }
-    if (req.method === 'POST' && (url.pathname === '/tx' || url.pathname === '/txs')) {
+    if (req.method === 'POST' && (url.pathname === '/tx' || url.pathname === '/txs' || url.pathname === '/v1/tx')) {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ txStatus: 'SEEN_ON_NETWORK' }))
       return
@@ -133,6 +165,8 @@ await new Promise((resolve, reject) => {
   fixture.listen(FIXTURE_PORT, '127.0.0.1', resolve)
 })
 const probedSince = (txid, since) => log.some((e) => e.method === 'GET' && e.path === `/tx/${txid}` && e.at >= since)
+/** The broadcaster asked about the subject after `since`: its probe, or a submit (the cell runs one body at a time). */
+const askedSince = (txid, since) => probedSince(txid, since) || log.some((e) => e.method === 'POST' && e.at >= since)
 
 async function submit(body) {
   const headers = {
@@ -171,18 +205,15 @@ async function submit(body) {
   }
 }
 
-async function pollDone(path, timeoutMs = 90_000) {
-  const t0 = Date.now()
-  let last = null
-  for (;;) {
-    const res = await fetch(`${BASE}${path}`)
-    const text = await res.text()
-    try { last = { status: res.status, json: JSON.parse(text) } } catch { last = { status: res.status, text } }
-    const state = last.json?.state
-    if (state === 'done' || state === 'failed') return last
-    if (Date.now() - t0 > timeoutMs) return last
-    await new Promise((r) => setTimeout(r, 1000))
-  }
+/** The job settled (read from its D1 row), then its reference polled ONCE: no request while a run is in flight. */
+async function settleThenPoll(reference, path) {
+  const w = await waitSettled(EF_STATE, reference)
+  if (!w.settled) return { verdict: w.verdict }
+  const ended = await waitRunEnded(process.env.EF_LOG, reference)
+  if (ended) return { verdict: ended }
+  const res = await fetch(`${BASE}${path}`)
+  const text = await res.text()
+  try { return { status: res.status, json: JSON.parse(text) } } catch { return { status: res.status, text } }
 }
 
 let failures = 0
@@ -207,6 +238,7 @@ try {
     ['over the batch budget', overBatch(), `batch EF > ${BATCH_BUDGET}`],
   ]) {
     // 2. accepted with a reference, never refused for its size
+    held.add(built.subject)
     const r = await submit(built.beef)
     const sentAt = Date.now()
     const j = r.json ?? {}
@@ -219,27 +251,38 @@ try {
     )
     if (r.status !== 202 || typeof j.poll !== 'string') continue
 
-    // 4. the same body again, while its job is open: the same reference
-    const again = await submit(built.beef)
-    expect(
-      `${label}: sent again while open, the same reference`,
-      again.status === 202 && again.json?.reference === j.reference,
-      `status=${again.status} ${again.text.slice(0, 160)}`,
-    )
-
-    // 3. the consumer finishes the work and the reference says so
-    const done = await pollDone(j.poll)
+    // 3. the consumer finishes the work: the job's own state, then its reference
+    const done = await settleThenPoll(j.reference, j.poll)
     const d = done.json ?? {}
     expect(
       `${label}: the reference reaches done with the request's own answer (200)`,
       done.status === 200 && d.state === 'done' && d.answer?.status === 200 && d.subjectTxid === built.subject,
-      `status=${done.status} ${JSON.stringify(d).slice(0, 240)}`,
+      done.verdict ?? `status=${done.status} ${JSON.stringify(d).slice(0, 240)}`,
     )
     expect(
       `${label}: the deferred work asked the broadcaster for the subject after the 202`,
-      probedSince(built.subject, sentAt - 50),
-      `fixture log: ${log.filter((e) => e.path.includes(built.subject)).length} request(s) for the subject`,
+      askedSince(built.subject, sentAt - 50),
+      `fixture log: ${log.filter((e) => e.path.includes(built.subject)).length} probe(s) for the subject`,
     )
+
+    // 4. the same body again, once its job settled: the same reference, the job re-opened and run again
+    const againAt = Date.now()
+    const again = await submit(built.beef)
+    expect(
+      `${label}: sent again once settled, the same reference`,
+      again.status === 202 && again.json?.reference === j.reference,
+      `status=${again.status} ${again.text.slice(0, 160)}`,
+    )
+    if (again.json?.reference === j.reference) {
+      const rerun = await settleThenPoll(j.reference, j.poll)
+      const e = rerun.json ?? {}
+      expect(
+        `${label}: the re-opened job runs again to done (200), the broadcaster asked again`,
+        rerun.status === 200 && e.state === 'done' && e.answer?.status === 200 && askedSince(built.subject, againAt),
+        rerun.verdict ?? `status=${rerun.status} ${JSON.stringify(e).slice(0, 240)}`,
+      )
+    }
+    held.delete(built.subject)
   }
 
   // an unknown reference is 404, never a 5xx
