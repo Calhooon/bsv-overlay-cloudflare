@@ -2235,6 +2235,39 @@ pf_name's replay branch reads `find_admit`. The method stays required, so a mana
 cannot miss the argument on a re-pin. Pins: `cargo test -p bsv-overlay-engine
 --features memory-storage --test gasp_topic_manager dryrun`.
 
+## The managers' abort (bsv-low #558)
+
+`TopicManager::abort_admissible_outputs(beef, outputs_to_abort)`, the
+reference's `abortAdmissibleOutputs` (`TopicManager.ts`, ts-stack
+`f999e0c1a`), DEFAULT a no-op `Ok`, beside `aborts_admissions()` (DEFAULT
+`false`), the Rust form of the reference's OPTIONAL member: a manager that
+implements the abort answers `true`. Every manager of this workspace keeps
+both defaults (pinned over the worker's factory, `lib.rs`
+`WORKSPACE_TOPIC_MANAGERS` / `topic_manager_named`, sixteen). One spelling of
+the reference's `abortProvisionalAdmissions` (`Engine.ts:685-700`):
+`topic_manager::abort_provisional_admissions` (each `(topic, outputs)` with
+outputs and a manager told once, an `Err` logged and the rest still told),
+`Engine::abort_provisional_admissions` over the engine's managers.
+
+Where it is called. The reference calls it when a `current-tx` broadcast
+THROWS (`Engine.ts:1219-1223`), only under `throwOnBroadcastFailure = true`
+(default `false`). This engine's ARC broadcast is never fatal (the default's
+branch), so `Engine::submit` never calls it: parity with the reference's
+default. This door (D1) broadcasts before it admits; a refusal learned AFTER
+the write always ends in `admit_fast::evict_txid_everywhere_repointed`, which
+reads the txid's live `outputs` rows (and its stored BEEF) before the passes
+and tells each aborting manager its outputs once the pass did not yield to a
+readmission (`admission_abort.rs`). With no aborting manager (today) it reads
+nothing. A refusal before the write asked no manager a real admission. Stated:
+a readmission restores rows without telling the manager; a manager may be told
+twice for one admission after an eviction that faulted half way and ran again
+(idempotent). Pins: engine `--lib i558` (`i558_a`, `i558_b`, and
+`topic_manager::tests::i558_the_abort_defaults_to_a_no_op`); worker `--lib
+i558` (`i558_every_workspace_manager_keeps_the_default`,
+`admit_fast::tests::i558_the_eviction_tells_an_aborting_manager_once` over the
+shipped schema, with a source pin on the wrapper's order, RED with the tell
+ungated). A consumer's manager compiles unchanged (a default method).
+
 ## Progress under the per-peer sync budget (bsv-low #552)
 
 `Engine::start_gasp_sync` races each peer's sync against

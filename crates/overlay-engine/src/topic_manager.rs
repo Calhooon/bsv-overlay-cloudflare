@@ -92,6 +92,49 @@ pub trait TopicManager {
         true
     }
 
+    /// Release provisional state this manager made while identifying
+    /// admissible outputs, for an admission the network did not take (bsv-low
+    /// #558): the reference's `abortAdmissibleOutputs(beef, outputsToAbort)`
+    /// (`TopicManager.ts`, ts-stack `f999e0c1a`), called by its
+    /// `Engine.abortProvisionalAdmissions` (`Engine.ts:685-700`) when a
+    /// `current-tx` broadcast throws after `identifyAdmissibleOutputs` ran.
+    /// `outputs_to_abort` are the indices the manager admitted; `beef` is
+    /// the submitted BEEF.
+    ///
+    /// Who calls it here: [`abort_provisional_admissions`], through
+    /// [`crate::engine::Engine::abort_provisional_admissions`] or a host that
+    /// keeps its own managers. The engine's own broadcast is never fatal
+    /// (the reference's default `throwOnBroadcastFailure = false`, under
+    /// which the reference does not abort either), so `Engine::submit` never
+    /// calls it; a host whose door judges the network's word AFTER the write
+    /// (the Cloudflare worker's eviction, register row D1) calls it there.
+    ///
+    /// DEFAULT: a no-op, so every manager that keeps its validation
+    /// read-only (all sixteen of this workspace's) is unchanged. An `Err` is
+    /// logged and dropped, as the reference catches and logs it. A manager
+    /// may be asked again for the same outputs (a host's eviction that
+    /// faulted half way and ran again): it must be idempotent.
+    async fn abort_admissible_outputs(
+        &self,
+        _beef: &[u8],
+        _outputs_to_abort: &[u32],
+    ) -> Result<(), TopicManagerError> {
+        Ok(())
+    }
+
+    /// Whether this manager implements [`Self::abort_admissible_outputs`]:
+    /// the Rust form of the reference's OPTIONAL member
+    /// (`abortAdmissibleOutputs?`, which its engine skips when `undefined`).
+    /// DEFAULT `false`. It is a COST hint for a host that must READ to build
+    /// the call (the worker's eviction reads the admitted rows and the BEEF
+    /// only when some manager answers `true`); the engine's own
+    /// [`abort_provisional_admissions`] asks every manager whatever this
+    /// answers, as it costs nothing there. A manager that overrides the abort
+    /// answers `true` here too.
+    fn aborts_admissions(&self) -> bool {
+        false
+    }
+
     /// Optional advert expiry for a sync root, in Unix seconds. This does
     /// not change submission admission or the treatment of ancestry.
     fn sync_expiry(&self, _script: &bsv_rs::script::LockingScript) -> Option<u64> {
@@ -103,6 +146,37 @@ pub trait TopicManager {
 
     /// Return metadata identifying this topic manager.
     async fn get_metadata(&self) -> ServiceMetadata;
+}
+
+/// The reference's `abortProvisionalAdmissions` (`Engine.ts:685-700` at
+/// ts-stack `f999e0c1a`), one spelling for the engine and for a host that
+/// keeps its own managers (bsv-low #558): each `(topic, outputs)` of
+/// `admissions` whose outputs are not empty and whose topic has a manager in
+/// `manager_of` is told [`TopicManager::abort_admissible_outputs`] once, in
+/// order; an `Err` is logged and the rest are still told. The reference
+/// skips a dupe and a failed topic; a caller passes only the topics whose
+/// outputs it admitted. Answers how many managers were told.
+pub async fn abort_provisional_admissions<'m>(
+    manager_of: impl Fn(&str) -> Option<&'m dyn TopicManager>,
+    beef: &[u8],
+    admissions: &[(String, Vec<u32>)],
+) -> u32 {
+    let mut told = 0;
+    for (topic, outputs) in admissions {
+        if outputs.is_empty() {
+            continue;
+        }
+        let Some(manager) = manager_of(topic) else {
+            continue;
+        };
+        told += 1;
+        if let Err(e) = manager.abort_admissible_outputs(beef, outputs).await {
+            tracing::error!(
+                "Error aborting provisional topic admission: topic={topic} outputs={outputs:?} error={e} (bsv-low #558)"
+            );
+        }
+    }
+    told
 }
 
 /// Errors from TopicManager operations.
@@ -265,5 +339,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.outputs_to_admit.len(), 3);
+    }
+
+    /// bsv-low #558: the abort's DEFAULT is a no-op that answers `Ok`, and a
+    /// manager that does not implement it says so (`aborts_admissions`
+    /// false), so every manager written before the member compiles and
+    /// behaves unchanged. The workspace's sixteen are audited by the
+    /// worker's `i558_every_workspace_manager_keeps_the_default`.
+    #[tokio::test]
+    async fn i558_the_abort_defaults_to_a_no_op() {
+        for mgr in [
+            Box::new(AdmitAllManager) as Box<dyn TopicManager>,
+            Box::new(RejectAllManager),
+        ] {
+            assert!(mgr.abort_admissible_outputs(&[], &[0, 1]).await.is_ok());
+            assert!(!mgr.aborts_admissions());
+        }
     }
 }

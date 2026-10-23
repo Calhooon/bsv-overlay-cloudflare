@@ -1336,7 +1336,20 @@ pub async fn evict_txid_everywhere_repointed(
     let now_ms = asked_ms;
     let mut pot_vouts = vouts_of(db, "pot_records", &txid).await;
     let mut advert_vouts = vouts_of(db, "low_records", &txid).await;
+    // bsv-low #558: the managers' abort, read before the passes move the rows (no read while no manager aborts)
+    let abort = crate::admission_abort::read_before_eviction(
+        db,
+        &txid,
+        crate::admission_abort::managers_that_abort(),
+    )
+    .await;
     let core = evict_core(db, &txid, reason, now_ms).await;
+    // the reference tells its managers `abortAdmissibleOutputs` when a `current-tx` broadcast throws after they
+    // identified their outputs (`Engine.ts:1219-1223` at ts-stack f999e0c1a); this door learns the network's refusal
+    // after the write, here: told once per evicted admission, never when the pass yielded to a readmission
+    if core.yielded_to_readmission.is_none() {
+        crate::admission_abort::tell(&abort).await;
+    }
     let moved = core.moved;
     for v in &core.pot_vouts {
         if !pot_vouts.contains(v) {
@@ -4723,6 +4736,190 @@ mod tests {
                 f(&self.conn);
             }
         }
+    }
+
+    #[async_trait(?Send)]
+    impl crate::admission_abort::AbortRows for SqliteShadow {
+        async fn admitted_outputs(&self, txid: &str) -> Result<Vec<(String, u32)>, String> {
+            let mut st = self
+                .conn
+                .prepare(&crate::admission_abort::ADMITTED_OUTPUTS_SQL.replace('?', "?1"))
+                .map_err(|e| e.to_string())?;
+            let rows = st
+                .query_map([txid], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u32))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string());
+            rows
+        }
+        async fn stored_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, String> {
+            use rusqlite::OptionalExtension;
+            self.conn
+                .query_row(
+                    &crate::admission_abort::STORED_BEEF_SQL.replace('?', "?1"),
+                    [txid],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map(|beef| crate::d1::beef_of_hex_column(beef.flatten()))
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    /// A stateful manager (bsv-low #558): counts each abort and its outputs.
+    /// Each abort a manager was told: the BEEF and the outputs.
+    type I558Told = std::rc::Rc<std::cell::RefCell<Vec<(Vec<u8>, Vec<u32>)>>>;
+    struct I558Counting(I558Told);
+    #[async_trait(?Send)]
+    impl overlay_engine::topic_manager::TopicManager for I558Counting {
+        async fn identify_admissible_outputs(
+            &self,
+            _: &bsv_rs::transaction::Transaction,
+            _: &[u8],
+            _: Option<&[u8]>,
+            _: overlay_engine::types::SubmitMode,
+            _: &overlay_engine::types::TopicAdmittanceContext,
+        ) -> Result<
+            overlay_engine::types::AdmittanceInstructions,
+            overlay_engine::topic_manager::TopicManagerError,
+        > {
+            Ok(Default::default())
+        }
+        async fn abort_admissible_outputs(
+            &self,
+            beef: &[u8],
+            outputs: &[u32],
+        ) -> Result<(), overlay_engine::topic_manager::TopicManagerError> {
+            self.0.borrow_mut().push((beef.to_vec(), outputs.to_vec()));
+            Ok(())
+        }
+        fn aborts_admissions(&self) -> bool {
+            true
+        }
+        async fn get_documentation(&self) -> String {
+            String::new()
+        }
+        async fn get_metadata(&self) -> overlay_engine::types::ServiceMetadata {
+            Default::default()
+        }
+    }
+
+    /// The eviction's sequence (`evict_txid_everywhere_repointed`: the abort's read, `evict_core`, the tell
+    /// unless the pass yielded) over the shipped schema and passes, a counting manager under `tm_count`. An
+    /// evicted admission tells it ONCE, with the outputs the index held under its topic (not another topic's) and
+    /// the stored BEEF; a second eviction of the same txid finds no live row and tells nothing; a pass that
+    /// yields to a readmission tells nothing; an admission never evicted is never told. The wiring's order is
+    /// pinned on the source. Does not compile on the base (65027163): `admission_abort` does not exist there.
+    #[tokio::test]
+    async fn i558_the_eviction_tells_an_aborting_manager_once() {
+        let told = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let managers = || -> crate::admission_abort::AbortingManagers {
+            vec![("tm_count".to_string(), Box::new(I558Counting(told.clone())))]
+        };
+        async fn evict_with(
+            db: &SqliteShadow,
+            txid: &str,
+            managers: crate::admission_abort::AbortingManagers,
+        ) -> u32 {
+            let abort = crate::admission_abort::read_before_eviction(db, txid, managers).await;
+            let core = evict_core(db, txid, "REJECTED", 1_000).await;
+            if core.yielded_to_readmission.is_none() {
+                crate::admission_abort::tell(&abort).await
+            } else {
+                0
+            }
+        }
+        let seed = |conn: &rusqlite::Connection, txid: &str| {
+            for (vout, topic) in [(1, "tm_count"), (0, "tm_count"), (0, "tm_other")] {
+                conn.execute(
+                    "INSERT INTO outputs (txid, outputIndex, outputScript, topic, satoshis, spent) VALUES (?1, ?2, X'51', ?3, 1000, 0)",
+                    rusqlite::params![txid, vout, topic],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO transactions (txid, beef) VALUES (?1, X'0100BEEF')",
+                [txid],
+            )
+            .unwrap();
+        };
+        let db = SqliteShadow::new(shipped_conn());
+        let (evicted, clean, readmitted) = ("a5".repeat(32), "c1".repeat(32), "e7".repeat(32));
+        seed(&db.conn, &evicted);
+        seed(&db.conn, &clean);
+        seed(&db.conn, &readmitted);
+
+        assert_eq!(evict_with(&db, &evicted, managers()).await, 1);
+        assert_eq!(
+            *told.borrow(),
+            vec![(vec![0x01, 0x00, 0xbe, 0xef], vec![0, 1])],
+            "once, its own topic's outputs and the stored BEEF"
+        );
+        assert_eq!(count(&db.conn, "outputs", "txid", &evicted), 0, "evicted");
+        assert_eq!(
+            evict_with(&db, &evicted, managers()).await,
+            0,
+            "evicted again: no live row"
+        );
+
+        db.conn
+            .execute(
+                "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved, releasedSpends) VALUES (?1, 'REJECTED', 500, 2000, 0, '[]')",
+                [&readmitted],
+            )
+            .unwrap();
+        assert_eq!(
+            evict_with(&db, &readmitted, managers()).await,
+            0,
+            "the pass yielded"
+        );
+        assert_eq!(
+            count(&db.conn, "outputs", "txid", &readmitted),
+            3,
+            "nothing moved"
+        );
+
+        assert_eq!(
+            told.borrow().len(),
+            1,
+            "never for the clean or the readmitted"
+        );
+        assert_eq!(count(&db.conn, "outputs", "txid", &clean), 3);
+
+        // no manager that aborts: no read at all
+        struct Unreadable;
+        #[async_trait(?Send)]
+        impl crate::admission_abort::AbortRows for Unreadable {
+            async fn admitted_outputs(&self, _: &str) -> Result<Vec<(String, u32)>, String> {
+                panic!("read with no aborting manager")
+            }
+            async fn stored_beef(&self, _: &str) -> Result<Option<Vec<u8>>, String> {
+                panic!("read with no aborting manager")
+            }
+        }
+        let none =
+            crate::admission_abort::read_before_eviction(&Unreadable, &clean, Vec::new()).await;
+        assert!(none.admissions().is_empty());
+
+        // the wiring: the read before the passes, the tell after them and only when the pass did not yield
+        let src = include_str!("admit_fast.rs");
+        let w = &src[src
+            .find("pub async fn evict_txid_everywhere_repointed(")
+            .unwrap()..];
+        let w = &w[..w.find("\n}\n").unwrap()];
+        let read = w
+            .find("crate::admission_abort::read_before_eviction(")
+            .expect("the abort's read");
+        let core = w
+            .find("evict_core(db, &txid, reason, now_ms)")
+            .expect("the core");
+        let gate = w[core..]
+            .find("if core.yielded_to_readmission.is_none() {\n        crate::admission_abort::tell(&abort).await;")
+            .expect("the tell, gated on the yield");
+        assert!(read < core && gate > 0, "read, core, tell");
+        assert!(w.contains("crate::admission_abort::managers_that_abort()"));
     }
 
     /// bsv-low loop 18 (pair 11's JOIN `3b14f0e6…`), pinned under the REAL passes: rows the subject's own
