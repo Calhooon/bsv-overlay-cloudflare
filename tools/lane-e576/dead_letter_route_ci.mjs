@@ -25,6 +25,10 @@
  * 11. The delta-2 fold (lane E576-f3, D2-M1): the real e1d letters are class `not_now`; the not-now share filled
  *     (1000 seeded, a stranger's flood); `classes` in the health; a REAL "not now" dead letter is deferred at the
  *     share (its own counter, not the ceiling's); the same key as a FAULT letter is then parked, the share still full.
+ * 12. bsv-low #581 (B-COST-1): a held-back "not now" letter is handed back for the configured delay (the tier renders
+ *     `DEAD_LETTER_NOT_NOW_DELAY_S`, served as `classes.notNow.heldBackDelaySecs`) and given up at its 5th DLQ
+ *     delivery: S4, keyed in R2 (past the tier's 4,096-byte inline room), deferred at the full not-now share five
+ *     times, then LOST (`dead_letters_lost_not_now_total`), acked (no 6th delivery), never parked, its R2 object deleted.
  * On the base (`835b80c`) there is no route (the dispatch's 404) and no table: RED. On `f8b5525` legs 6-9: RED.
  * On `28f5d0b` leg 10: RED (no discard route, no `near`, the ceiling never drains). On `66d069f` leg 11: RED (no
  * `class` column: the seeding fails; no `classes`, the not-now letter parks).
@@ -44,6 +48,9 @@ const STATE = process.argv[3]
 const OP_TOKEN = process.env.D1_BUDGET_OP_TOKEN ?? 'ci-submit-tok'
 const INTERNAL = process.env.DEAD_LETTER_INTERNAL_TOKEN ?? 'ci-internal-tok'
 const WAIT_MS = Number(process.env.DEAD_LETTER_WAIT_MS ?? 120_000)
+/** bsv-low #581: the held-back delay the tier renders for the overlay (`--var DEAD_LETTER_NOT_NOW_DELAY_S:15`). */
+const HELD_BACK_S = Number(process.env.DEAD_LETTER_NOT_NOW_DELAY_S ?? 15)
+const BUCKET = process.env.BEEF_BLOBS_BUCKET ?? 'overlay-beefs'
 const CRATE = fileURLToPath(new URL('../../crates/overlay-cloudflare/', import.meta.url))
 if (!STATE) {
   console.error('usage: dead_letter_route_ci.mjs <overlay base> <overlay --persist-to dir>')
@@ -79,6 +86,12 @@ const nonceScript = () => {
   const nonce = Buffer.alloc(8)
   randomFillSync(nonce)
   return Buffer.concat([Buffer.from([0x00, 0x6a, 8]), nonce])
+}
+/** OP_FALSE OP_RETURN PUSHDATA4 <n random bytes>: a nonce that also sets the body's size. */
+const padScript = (n) => {
+  const data = Buffer.alloc(n)
+  randomFillSync(data)
+  return Buffer.concat([Buffer.from([0x00, 0x6a, 0x4e]), u32(n), data])
 }
 const output = (script) => Buffer.concat([u64(0), varint(script.length), script])
 const input = (txid, vout) => Buffer.concat([Buffer.from(txid, 'hex').reverse(), u32(vout), varint(0), u32(0xffffffff)])
@@ -139,6 +152,20 @@ const letter = (txid) => {
     throw e
   }
 }
+/** The local bucket's object under `key`, or null on wrangler's own not-found answer (any other failure throws). */
+function r2get(key) {
+  try {
+    return execFileSync('npx', ['wrangler', 'r2', 'object', 'get', `${BUCKET}/${key}`, '--local', '--persist-to', STATE, '--pipe'], {
+      cwd: CRATE, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+    })
+  } catch (e) {
+    if (/The specified key does not exist/.test(`${e.stdout ?? ''}${e.stderr ?? ''}`)) return null
+    throw e
+  }
+}
+/** `queue::r2_key`: `mutations/<sha256 of the BEEF>/<32 hex of sha256(sorted topics, "\n", mode)>`. */
+const r2Key = (beef, topics, mode) =>
+  `mutations/${createHash('sha256').update(beef).digest('hex')}/${createHash('sha256').update(`${[...topics].sort().join(',')}\n${mode}`).digest('hex').slice(0, 32)}`
 async function until(what, pred) {
   const t0 = Date.now()
   for (;;) {
@@ -352,6 +379,12 @@ expect(
   'dead_letters_discarded_total moved; the ceiling has room for one',
   JSON.stringify({ discarded: hx.counters?.dead_letters_discarded_total, ceiling: hx.deadLetters?.ceiling }),
 )
+expect(
+  hx.deadLetters?.classes?.notNow?.heldBackDelaySecs === HELD_BACK_S && hx.deadLetters?.classes?.notNow?.heldBackDelayDefaultSecs === 43_200 &&
+    hx.deadLetters?.classes?.notNow?.heldBackDelayVar === 'DEAD_LETTER_NOT_NOW_DELAY_S' && hx.deadLetters?.classes?.notNow?.heldBackDeliveries === 5,
+  `the held-back delay in force is the rendered var (${HELD_BACK_S} s; 12 h unset), served beside its default and the 5 deliveries`,
+  JSON.stringify(hx.deadLetters?.classes?.notNow),
+)
 const s2Parked = await until('S2 parked after the discard', () => {
   const r = letter(s2)
   return r && r.status === 'parked' ? r : null
@@ -415,6 +448,49 @@ expect(
   `a fault letter is PARKED while a flood holds the whole not-now share (within ${WAIT_MS / 1000} s)`,
   JSON.stringify({ row: { ...(letter(s3) ?? {}), message: '…' }, classes: hp.deadLetters?.classes }),
 )
+
+// ── bsv-low #581 (B-COST-1) ─────────────────────────────────────────────────
+// 12. A held-back "not now" letter is given up at its 5th DLQ delivery: counted LOST, acked, never parked, its R2
+// object deleted (door 3's deletion rule (2)). The not-now share is still full (the flood), so every delivery of S4
+// is a deferral, `HELD_BACK_S` apart.
+const h12 = await health()
+const nn12 = h12.counters?.dead_letters_not_now_deferrals_total ?? NaN
+const lost12 = h12.counters?.dead_letters_lost_not_now_total ?? NaN
+const lostFault12 = h12.counters?.dead_letters_lost_total ?? NaN
+const G4 = tx([coinbaseInput()], [output(COLLECTED_MARKER), output(nonceScript())])
+const g4 = txidOf(G4)
+const P4 = tx([input(g4, 0)], [output(COLLECTED_MARKER), output(nonceScript())])
+const p4 = txidOf(P4)
+const S4 = tx([input(p4, 0)], [output(padScript(8_000))])
+const s4 = txidOf(S4)
+const rg4 = await submit(beefV1(G4))
+d1(`INSERT INTO pot_evictions (txid, reason, evictedAt) VALUES ('${p4}', 'REJECTED (bsv-low #581, route tier)', ${Date.now()})`)
+const beef4 = beefV1(G4, P4, S4)
+const rs4 = await submit(beef4)
+expect(rg4.status === 200 && rs4.status === 200 && rs4.mutation === 'queued', `S4 (${s4.slice(0, 12)}…, ${beef4.length} B, keyed in R2) is "not now": queued`, `${rg4.status} / ${rs4.status} ${rs4.mutation}`)
+const key4 = ['historical-tx-no-spv', 'historical-tx', 'current-tx'].map((m) => r2Key(beef4, ['tm_collected'], m)).find((k) => r2get(k) !== null) ?? null
+expect(!!key4, "S4's BEEF rides by key: its object is in the local bucket", 'no object under any mode\'s key')
+let h4 = null
+for (const t0 = Date.now(); Date.now() - t0 < WAIT_MS + 5 * HELD_BACK_S * 1000 + 30_000; await sleep(2_000)) {
+  const h = await health()
+  if ((h.counters?.dead_letters_lost_not_now_total ?? 0) > lost12) { h4 = h; break }
+}
+const nnAt = h4?.counters?.dead_letters_not_now_deferrals_total
+expect(
+  !!h4 && h4.counters.dead_letters_lost_not_now_total === lost12 + 1 && nnAt === nn12 + 5 && h4.counters.dead_letters_lost_total === lostFault12 &&
+    (letter(s4)?.status ?? 'none') !== 'parked' && classOf(s4) === 'not_now',
+  'S4 held back at the full share is delivered 5 times, then given up: dead_letters_lost_not_now_total +1 (the fault LOST counter unmoved), 5 deferrals, never parked',
+  JSON.stringify({ lost: [lost12, h4?.counters?.dead_letters_lost_not_now_total], deferrals: [nn12, nnAt], row: { ...(letter(s4) ?? {}), message: '…' } }),
+)
+expect(!!h4 && !!key4 && r2get(key4) === null, "the given-up letter's R2 object is deleted with it", `${key4}`)
+await sleep(2 * HELD_BACK_S * 1000 + 5_000)
+const hAfter = await health()
+expect(
+  !!h4 && hAfter.counters?.dead_letters_not_now_deferrals_total === nnAt && hAfter.counters?.dead_letters_lost_not_now_total === lost12 + 1,
+  'the given-up letter was ACKED: no 6th delivery after two more delays',
+  `${nnAt} -> ${hAfter.counters?.dead_letters_not_now_deferrals_total}; lost ${hAfter.counters?.dead_letters_lost_not_now_total}`,
+)
+d1(`DELETE FROM mutation_dead_letters WHERE txid = '${s4}'`)
 d1(`DELETE FROM mutation_dead_letters WHERE txid LIKE 'e576flood%'`)
 
 } catch (e) {

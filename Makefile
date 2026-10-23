@@ -467,6 +467,8 @@ ci-d1-board:
 # limit, its one-enqueue claim and its ceiling over seeded letters, a re-driven letter parked again with its
 # history, and `/health/invariants.deadLetters`; the lens fold's legs: the new health fields, a stale re-drive
 # returned and re-driven, a forced re-drive of an exhausted letter, a bad-base64 replay dead-lettered and parked.
+# The overlay is given `DEAD_LETTER_NOT_NOW_DELAY_S:15` (bsv-low #581: a held-back "not now" letter's next DLQ
+# delivery, 12 h when unset), so the deferred letters park on a later delivery and one is given up at its 5th in a run.
 # Then bsv-low #585 door 3's cell (`tools/lane-e585`, the overlay given `MUTATION_QUEUE_INLINE_ROOM:4096`, which
 # leaves every other cell's sub-kilobyte messages inline): ~8 KB "not now" letters written to the local R2 bucket,
 # parked by KEY, re-driven from R2 and landed (the object gone after the ack), a missing object parked again with its
@@ -600,6 +602,7 @@ ci-d1-budget:
 	    --var ARCADE_URL:http://127.0.0.1:9 \
 	    --var INTERNAL_TOKEN:ci-internal-tok \
 	    --var MUTATION_QUEUE_INLINE_ROOM:4096 \
+	    --var DEAD_LETTER_NOT_NOW_DELAY_S:15 \
 	    --var MAINNET_FANOUT:false \
 	) > "$$ov_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \

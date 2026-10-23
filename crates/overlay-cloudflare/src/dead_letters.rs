@@ -162,6 +162,32 @@ const _: () = assert!(
 /// last of them gives it up: LOST, counted `dead_letters_lost_not_now_total`, its R2 object deleted, ACKED (never
 /// handed back to the platform's own last delivery).
 pub const NOT_NOW_DEFER_DELIVERIES: u32 = 5;
+/// bsv-low #581 (B-COST-1 tier): the var that sets the held-back delay (a decimal number of seconds, clamped to
+/// [`NOT_NOW_DEFER_DELAY_MIN_S`] ..= [`NOT_NOW_DEFER_DELAY_S`]; unset, empty or not a number is the default, the
+/// platform's longest, 12 h). No deployed config sets it; the route tier sets a few seconds so its cells run the REAL
+/// deferral, the park on a later delivery and the give-up at the 5th, inside a run. Served as
+/// `deadLetters.classes.notNow.heldBackDelaySecs`, the value in force.
+pub const NOT_NOW_DEFER_DELAY_VAR: &str = "DEAD_LETTER_NOT_NOW_DELAY_S";
+/// The least held-back delay the var may set.
+pub const NOT_NOW_DEFER_DELAY_MIN_S: u32 = 1;
+
+/// PURE: the held-back delay in force ([`NOT_NOW_DEFER_DELAY_VAR`]).
+#[must_use]
+pub fn not_now_defer_delay(var: Option<&str>) -> u32 {
+    var.and_then(|v| v.trim().parse::<u32>().ok())
+        .map_or(NOT_NOW_DEFER_DELAY_S, |s| {
+            s.clamp(NOT_NOW_DEFER_DELAY_MIN_S, NOT_NOW_DEFER_DELAY_S)
+        })
+}
+
+fn not_now_defer_delay_of(env: &Env) -> u32 {
+    not_now_defer_delay(
+        env.var(NOT_NOW_DEFER_DELAY_VAR)
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    )
+}
 /// The default retention of a queue's messages (four days; set at `wrangler queues create`, not in a config): the
 /// held-back window must end inside it, or the platform drops the letter with no LOST line.
 pub const QUEUE_RETENTION_S: u32 = 345_600;
@@ -426,15 +452,20 @@ pub fn dlq_retry_plan(attempts: Option<u32>) -> DlqRetry {
 
 /// PURE (bsv-low #581, B-COST-1): the retry of one DLQ delivery that did not park. A "not now" letter HELD BACK
 /// (`deferred`: at its class's bounds or at the whole ceiling, [`lost_deletes_object`]'s deferral) is handed back for
-/// [`NOT_NOW_DEFER_DELAY_S`] and given up at its [`NOT_NOW_DEFER_DELIVERIES`]th delivery (`last`); anything else (a
+/// `not_now_delay_s` (the var's value, [`not_now_defer_delay`]; [`NOT_NOW_DEFER_DELAY_S`] unset) and given up at its [`NOT_NOW_DEFER_DELIVERIES`]th delivery (`last`); anything else (a
 /// fault letter at the ceiling, a park that faulted, a count that cannot be read) takes [`dlq_retry_plan`], as before.
 /// So the one consumer's work per held-back not-now letter is at most 5 deliveries over 48 h (it was 101 over the
 /// same 48 h), and a fault letter is never behind more than that per not-now letter in the queue.
 #[must_use]
-pub fn deferral_plan(class: LetterClass, deferred: bool, attempts: Option<u32>) -> DlqRetry {
+pub fn deferral_plan(
+    class: LetterClass,
+    deferred: bool,
+    attempts: Option<u32>,
+    not_now_delay_s: u32,
+) -> DlqRetry {
     match attempts.filter(|a| *a >= 1) {
         Some(a) if deferred && class == LetterClass::NotNow => DlqRetry {
-            delay_s: NOT_NOW_DEFER_DELAY_S,
+            delay_s: not_now_delay_s,
             last: a >= NOT_NOW_DEFER_DELIVERIES,
         },
         _ => dlq_retry_plan(attempts),
@@ -1255,7 +1286,12 @@ pub fn ceiling_deferral_counts(attempts: Option<u32>) -> (u64, u64) {
 /// PURE (the delta-2 fold, D2-M1 (d)): the health block's `classes`: the letters with bytes of each class apart, the
 /// not-now share's bounds and its last 24 h, and the places kept for fault letters.
 #[must_use]
-pub fn classes_json(fault_held: u64, not_now_held: u64, not_now_day: u64) -> serde_json::Value {
+pub fn classes_json(
+    fault_held: u64,
+    not_now_held: u64,
+    not_now_day: u64,
+    not_now_delay_s: u32,
+) -> serde_json::Value {
     serde_json::json!({
         "fault": {
             "held": fault_held,
@@ -1273,7 +1309,9 @@ pub fn classes_json(fault_held: u64, not_now_held: u64, not_now_day: u64) -> ser
             // bsv-low #581: a held-back letter's DLQ deliveries and their spacing; past them it is LOST (counted
             // `dead_letters_lost_not_now_total`)
             "heldBackDeliveries": NOT_NOW_DEFER_DELIVERIES,
-            "heldBackDelaySecs": NOT_NOW_DEFER_DELAY_S,
+            "heldBackDelaySecs": not_now_delay_s,
+            "heldBackDelayVar": NOT_NOW_DEFER_DELAY_VAR,
+            "heldBackDelayDefaultSecs": NOT_NOW_DEFER_DELAY_S,
         },
     })
 }
@@ -1330,6 +1368,7 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
     let messages = batch
         .messages()
         .map_err(|e| worker::Error::from(format!("the DLQ batch's messages: {e:?}")))?;
+    let not_now_delay_s = not_now_defer_delay_of(env);
     let db: std::result::Result<D1Database, String> = match env.d1("OVERLAY_DB") {
         Ok(db) => match crate::d1::ensure_overlay_migrations(&db).await {
             Ok(()) => Ok(db),
@@ -1430,7 +1469,7 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
             Err(e) => e,
         };
         // bsv-low #581: a held-back "not now" letter on its own plan (12 h apart, given up at its 5th delivery)
-        let plan = deferral_plan(class, deferred, attempts);
+        let plan = deferral_plan(class, deferred, attempts, not_now_delay_s);
         if plan.last {
             let h = bsv_rs::primitives::hash::sha256(letter.message.as_bytes());
             worker::console_log!(
@@ -1893,7 +1932,7 @@ pub async fn health_json(db: &D1Database, env: &Env) -> serde_json::Value {
         "oldestRedriven": oldest_redriven.as_ref().map(key_at),
         "parkedLast24h": counts.iter().map(|r| n(r.recent)).sum::<u64>(),
         "ceiling": ceiling_json(held),
-        "classes": classes_json(fault_held, not_now_held, not_now_day),
+        "classes": classes_json(fault_held, not_now_held, not_now_day, not_now_defer_delay_of(env)),
         "r2": r2_json(
             r2.as_ref().map(|r| (r.c.max(0.0) as u64, r.b.max(0.0) as u64)),
             env.bucket(crate::queue::BEEF_BLOBS_BINDING).is_ok(),
@@ -2530,7 +2569,7 @@ mod tests {
         let start = src.find("pub async fn park_batch(").unwrap();
         let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
         let fault_path = &body[body
-            .find("let plan = deferral_plan(class, deferred, attempts);")
+            .find("let plan = deferral_plan(class, deferred, attempts, not_now_delay_s);")
             .unwrap()..];
         // bsv-low #581: the one ack of the fault path is a held-back not-now letter given up before the platform's
         // own last delivery (`deferral_plan`), after its LOST line and count; the lens's NOTE-2: gated on the class
@@ -3399,14 +3438,14 @@ mod tests {
                 .map(|r| r[1].parse::<u64>().unwrap())
                 .unwrap_or(0)
         };
-        let j = classes_json(c("fault"), c("not_now"), 0);
+        let j = classes_json(c("fault"), c("not_now"), 0, NOT_NOW_DEFER_DELAY_S);
         assert_eq!(j["fault"]["held"], 1000);
         assert_eq!(j["fault"]["kept"], 1000);
         assert_eq!(j["fault"]["room"], 0);
         assert_eq!(j["notNow"]["held"], 1000);
         assert_eq!(j["notNow"]["full"], true);
         assert_eq!(
-            classes_json(0, 0, NOT_NOW_PER_DAY)["notNow"]["dayFull"],
+            classes_json(0, 0, NOT_NOW_PER_DAY, NOT_NOW_DEFER_DELAY_S)["notNow"]["dayFull"],
             true
         );
         let plan: Vec<String> = {
@@ -4006,7 +4045,7 @@ mod tests {
             .collect();
         assert_eq!(class_counts(&read), (7, 8, 3));
         assert_eq!(class_counts(&[]), (0, 0, 0));
-        let j = classes_json(7, 8, 3);
+        let j = classes_json(7, 8, 3, NOT_NOW_DEFER_DELAY_S);
         assert_eq!(
             (
                 j["fault"]["held"].clone(),
@@ -4022,7 +4061,7 @@ mod tests {
         let h = &h[..h.find("\n}\n").unwrap()];
         assert_eq!(h.matches(".bind(day_cutoff(now))").count(), 2);
         assert!(h.contains("let (fault_held, not_now_held, not_now_day) = class_counts(&classes);"));
-        assert!(h.contains("\"classes\": classes_json(fault_held, not_now_held, not_now_day),"));
+        assert!(h.contains("\"classes\": classes_json(fault_held, not_now_held, not_now_day, not_now_defer_delay_of(env)),"));
         // ... and so do the park and its ceiling read
         let park = &src[src.find("async fn park_one(").unwrap()..];
         let park = &park[..park.find("\n}\n").unwrap()];
@@ -4144,7 +4183,7 @@ mod tests {
         let body = &body[..body.find("\n}\n").unwrap()];
         assert!(body.contains("let mut class = LetterClass::Fault;"));
         let fault_path = &body[body
-            .find("let plan = deferral_plan(class, deferred, attempts);")
+            .find("let plan = deferral_plan(class, deferred, attempts, not_now_delay_s);")
             .unwrap()..];
         assert!(
             fault_path.contains("sha256={} class={}") && fault_path.contains("class.as_str(),")
@@ -4517,7 +4556,7 @@ mod tests {
             let (mut deliveries, mut waited) = (0u32, 0u64);
             for a in 1..=DLQ_MAX_RETRIES + 1 {
                 deliveries = a;
-                let plan = deferral_plan(class, deferred, Some(a));
+                let plan = deferral_plan(class, deferred, Some(a), NOT_NOW_DEFER_DELAY_S);
                 if plan.last {
                     break;
                 }
@@ -4548,7 +4587,7 @@ mod tests {
         assert_eq!(walk(LetterClass::NotNow, false).0, DLQ_MAX_RETRIES + 1);
         // an unreadable count: the configured delay, never called last (as before)
         assert_eq!(
-            deferral_plan(LetterClass::NotNow, true, None),
+            deferral_plan(LetterClass::NotNow, true, None, NOT_NOW_DEFER_DELAY_S),
             dlq_retry_plan(None)
         );
         // the consumer's load: a flood of N held-back letters is at most 5 N deliveries (it was 101 N)
@@ -4560,9 +4599,65 @@ mod tests {
         );
         assert!(load * 20 <= base_load);
         // the health block names the bound
-        let j = classes_json(0, 0, 0);
+        let j = classes_json(0, 0, 0, NOT_NOW_DEFER_DELAY_S);
         assert_eq!(j["notNow"]["heldBackDeliveries"], 5);
         assert_eq!(j["notNow"]["heldBackDelaySecs"], 43_200);
+    }
+
+    /// bsv-low #581 (B-COST-1 tier): THE HELD-BACK DELAY IS A VAR, DEFAULT 12 H. Unset, empty or not a number is the
+    /// platform's longest per-message delay (what PR 145 shipped as a constant); a set value is clamped to 1 s ..=
+    /// 12 h; the consumer reads the var ONCE per batch and hands it to `deferral_plan`, and the health block serves
+    /// the value in force (the tier renders a few seconds, so its cells see the real path). RED with the var unread
+    /// (the consumer or the health block passing the constant).
+    #[test]
+    fn b_cost_1_581_tier_the_held_back_delay_is_a_var_defaulting_to_12_h() {
+        assert_eq!(NOT_NOW_DEFER_DELAY_S, 43_200);
+        assert_eq!(NOT_NOW_DEFER_DELAY_VAR, "DEAD_LETTER_NOT_NOW_DELAY_S");
+        for unset in [None, Some(""), Some("soon"), Some("-5")] {
+            assert_eq!(
+                not_now_defer_delay(unset),
+                43_200,
+                "{unset:?} is the default"
+            );
+        }
+        assert_eq!(not_now_defer_delay(Some(" 15 ")), 15);
+        assert_eq!(not_now_defer_delay(Some("0")), NOT_NOW_DEFER_DELAY_MIN_S);
+        assert_eq!(not_now_defer_delay(Some("999999")), NOT_NOW_DEFER_DELAY_S);
+        // the plan takes the value given, deliveries unchanged
+        let p = deferral_plan(LetterClass::NotNow, true, Some(2), 15);
+        assert_eq!(
+            p,
+            DlqRetry {
+                delay_s: 15,
+                last: false
+            }
+        );
+        assert!(deferral_plan(LetterClass::NotNow, true, Some(5), 15).last);
+        assert_eq!(
+            deferral_plan(LetterClass::Fault, true, Some(2), 15),
+            dlq_retry_plan(Some(2)),
+            "a fault letter never takes the not-now delay"
+        );
+        let j = classes_json(0, 0, 0, 15);
+        assert_eq!(j["notNow"]["heldBackDelaySecs"], 15);
+        assert_eq!(j["notNow"]["heldBackDelayDefaultSecs"], 43_200);
+        assert_eq!(j["notNow"]["heldBackDelayVar"], NOT_NOW_DEFER_DELAY_VAR);
+        // the wiring: the consumer and the health block read the var, never the constant
+        let src = include_str!("dead_letters.rs");
+        let f = &src[src.find("pub async fn park_batch(").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        let read = f
+            .find("let not_now_delay_s = not_now_defer_delay_of(env);")
+            .unwrap();
+        let plan = f
+            .find("let plan = deferral_plan(class, deferred, attempts, not_now_delay_s);")
+            .unwrap();
+        assert!(read < plan);
+        let h = &src[src.find("pub async fn health_json(").unwrap()..];
+        let h = &h[..h.find("\n}\n").unwrap()];
+        assert!(h.contains("not_now_defer_delay_of(env)),"));
+        let of = &src[src.find("fn not_now_defer_delay_of(").unwrap()..];
+        assert!(of[..of.find("\n}\n").unwrap()].contains("env.var(NOT_NOW_DEFER_DELAY_VAR)"));
     }
 
     /// bsv-low #581, SOURCE (the consumer runs only in wasm): `park_batch` takes `deferral_plan` over the park's
@@ -4578,7 +4673,7 @@ mod tests {
             .find("let deferred = lost_deletes_object(&outcome);")
             .unwrap();
         let plan = f
-            .find("let plan = deferral_plan(class, deferred, attempts);")
+            .find("let plan = deferral_plan(class, deferred, attempts, not_now_delay_s);")
             .unwrap();
         assert!(deferred < plan);
         assert!(
