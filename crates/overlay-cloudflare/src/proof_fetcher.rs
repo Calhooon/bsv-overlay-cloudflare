@@ -4010,26 +4010,13 @@ pub fn classify_presence(
     bitails: Option<NetworkPresence>,
     woc: Option<NetworkPresence>,
 ) -> NetworkPresence {
-    use NetworkPresence::{Absent, Inconclusive, Present};
-    match (bitails, woc) {
-        (
-            Some(Present {
-                height: Some(height),
-            }),
-            _,
-        )
-        | (
-            _,
-            Some(Present {
-                height: Some(height),
-            }),
-        ) => Present {
-            height: Some(height),
-        },
-        (Some(Present { .. }), _) | (_, Some(Present { .. })) => Present { height: None },
-        (Some(Absent), Some(Absent)) => Absent,
-        _ => Inconclusive,
-    }
+    // bsv-low #619 (L3): the couriers' answers as the tracker's hints (`door_words::courier_hint`), folded by the
+    // host's two-source bar (`door_words::courier_presence`, pinned equal to the fold this function held before)
+    use crate::door_words::{courier_hint, BITAILS_SOURCE, WOC_SOURCE};
+    crate::door_words::courier_presence(
+        &courier_hint(BITAILS_SOURCE, bitails, 0),
+        &courier_hint(WOC_SOURCE, woc, 0),
+    )
 }
 
 /// Courier HTTP evidence. A height of zero is mempool, never confirmation.
@@ -4206,13 +4193,25 @@ pub(crate) async fn rebroadcast_absent_admitted(
 
         // Presence probe: Bitails first (WoC is the free-tier-429 host — it
         // is only consulted when Bitails did not already prove presence).
-        let bitails = sources.bitails_presence_counted(txid, counters).await;
-        if bitails.is_some_and(presence_bool) {
+        // bsv-low #619 (L3): each answer as the tracker's hint from its source, folded by the host's bar
+        use crate::door_words::{courier_hint, CourierWord, BITAILS_SOURCE, WOC_SOURCE};
+        let bitails = courier_hint(
+            BITAILS_SOURCE,
+            sources.bitails_presence_counted(txid, counters).await,
+            0,
+        );
+        if matches!(bitails, CourierWord::Holds(_)) {
             summary.present += 1;
             continue;
         }
-        let woc = sources.woc_presence_counted(woc_api_key, txid, counters).await;
-        match classify_presence(bitails, woc) {
+        let woc = courier_hint(
+            WOC_SOURCE,
+            sources
+                .woc_presence_counted(woc_api_key, txid, counters)
+                .await,
+            0,
+        );
+        match crate::door_words::courier_presence(&bitails, &woc) {
             NetworkPresence::Present { .. } => {
                 summary.present += 1;
                 continue;
@@ -4510,15 +4509,31 @@ pub fn retire_verdict(
     woc: Option<bool>,
     age_secs: i64,
 ) -> Option<String> {
+    use crate::door_words::{courier_of_bool, BITAILS_SOURCE, WOC_SOURCE};
+    retire_verdict_of(
+        arcade,
+        &courier_of_bool(BITAILS_SOURCE, bitails),
+        &courier_of_bool(WOC_SOURCE, woc),
+        age_secs,
+    )
+}
+
+/// PURE (bsv-low #619, L3): [`retire_verdict`] over the two indexers' words as the tracker's hints
+/// (`door_words::courier_hint`), folded by the host's two-source bar (`door_words::courier_presence`); the arms are
+/// the host's policy, unchanged.
+pub fn retire_verdict_of(
+    arcade: &ArcadeLook,
+    bitails: &crate::door_words::CourierWord,
+    woc: &crate::door_words::CourierWord,
+    age_secs: i64,
+) -> Option<String> {
     if age_secs < RETIRE_MIN_AGE_SECS {
         return None;
     }
     if matches!(arcade, ArcadeLook::Present) {
         return None;
     }
-    if classify_presence(bitails.map(bool_presence), woc.map(bool_presence))
-        != NetworkPresence::Absent
-    {
+    if crate::door_words::courier_presence(bitails, woc) != NetworkPresence::Absent {
         return None;
     }
     match arcade {
@@ -4909,17 +4924,20 @@ pub use overlay_discovery::pot::storage::RETIRE_REASON_MARK;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RetireEvidence {
     pub(crate) look: ArcadeLook,
-    pub(crate) bitails: Option<bool>,
-    pub(crate) woc: Option<bool>,
+    /// bsv-low #619 (L3): Bitails' word as the tracker's hint (`door_words::courier_hint`).
+    pub(crate) bitails: crate::door_words::CourierWord,
+    /// WoC's word likewise; not asked (a `Fault`, no input) when Bitails already holds it.
+    pub(crate) woc: crate::door_words::CourierWord,
 }
 
 impl RetireEvidence {
     /// Somebody on the network holds the transaction (mined or in a mempool): Arcade's live non-terminal word, or
     /// either indexer. The backlog pass leaves such a pot alone.
     pub(crate) fn held(&self) -> bool {
+        use crate::door_words::CourierWord;
         matches!(self.look, ArcadeLook::Present)
-            || self.bitails == Some(true)
-            || self.woc == Some(true)
+            || matches!(self.bitails, CourierWord::Holds(_))
+            || matches!(self.woc, CourierWord::Holds(_))
     }
 }
 
@@ -4936,24 +4954,22 @@ pub(crate) async fn retire_evidence<P: RetirePort>(
     if matches!(look, ArcadeLook::NotFinal(..)) {
         look = crate::door_words::bound_look(look, &port.lock_bound(txid).await);
     }
+    use crate::door_words::{courier_hint, CourierWord, BITAILS_SOURCE, WOC_SOURCE};
     if matches!(look, ArcadeLook::Present) {
         return RetireEvidence {
             look,
-            bitails: None,
-            woc: None,
+            bitails: CourierWord::Fault,
+            woc: CourierWord::Fault,
         };
     }
-    let bitails = port.bitails(txid).await;
-    let woc = if bitails.is_some_and(presence_bool) {
-        bitails
+    // bsv-low #619 (L3): each answer as the tracker's hint from its source; WoC is not asked when Bitails holds it
+    let bitails = courier_hint(BITAILS_SOURCE, port.bitails(txid).await, 0);
+    let woc = if matches!(bitails, CourierWord::Holds(_)) {
+        CourierWord::Fault
     } else {
-        port.woc(txid).await
+        courier_hint(WOC_SOURCE, port.woc(txid).await, 0)
     };
-    RetireEvidence {
-        look,
-        bitails: bitails.map(presence_bool),
-        woc: woc.map(presence_bool),
-    }
+    RetireEvidence { look, bitails, woc }
 }
 
 /// bsv-low #831 half 2: what the end of one retired pot did.
@@ -5095,10 +5111,10 @@ pub(crate) async fn retire_candidate<P: RetirePort>(
         summary.kept_present += 1;
         return;
     }
-    let Some(reason) = retire_verdict(
+    let Some(reason) = retire_verdict_of(
         &evidence.look,
-        evidence.bitails,
-        evidence.woc,
+        &evidence.bitails,
+        &evidence.woc,
         row.age_secs as i64,
     ) else {
         // Present already returned above; everything else that keeps is uncertainty, kept fail-safe.
@@ -5368,10 +5384,10 @@ pub(crate) async fn run_retire_backlog<P: RetirePort>(
                 }
             }
         } else {
-            match retire_verdict(
+            match retire_verdict_of(
                 &evidence.look,
-                evidence.bitails,
-                evidence.woc,
+                &evidence.bitails,
+                &evidence.woc,
                 row.age_secs as i64,
             ) {
                 None => {

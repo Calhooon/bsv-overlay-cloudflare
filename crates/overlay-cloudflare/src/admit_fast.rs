@@ -1710,7 +1710,7 @@ pub struct CourierConflictPresence {
 #[async_trait(?Send)]
 impl ConflictPresence for CourierConflictPresence {
     async fn presence(&self, txid: &str) -> Option<crate::proof_fetcher::NetworkPresence> {
-        use crate::proof_fetcher::*;
+        use crate::door_words::{courier_hint, BITAILS_SOURCE, WOC_SOURCE};
         let b = self
             .sources
             .bitails_presence_counted(txid, self.counters.as_ref())
@@ -1719,7 +1719,12 @@ impl ConflictPresence for CourierConflictPresence {
             .sources
             .woc_presence_counted(self.woc_api_key.as_deref(), txid, self.counters.as_ref())
             .await;
-        Some(classify_presence(b, w))
+        // bsv-low #619 (L3): the competitor's courier words as the tracker's hints, folded by the host's bar (a
+        // courier's mined claim is #602's confirmation, D1's stated trust)
+        Some(crate::door_words::courier_presence(
+            &courier_hint(BITAILS_SOURCE, b, 0),
+            &courier_hint(WOC_SOURCE, w, 0),
+        ))
     }
 }
 
@@ -6729,7 +6734,7 @@ mod tests {
             port.bound.set(at(972_185, SubjectLock::Height(972_185)));
             let held = retire_evidence(&port, &refund, None).await;
             assert!(matches!(held.look, ArcadeLook::NotFinal(..)), "{:?}", held.look);
-            assert_eq!(crate::proof_fetcher::retire_verdict(&held.look, held.bitails, held.woc, 7_200), None);
+            assert_eq!(crate::proof_fetcher::retire_verdict_of(&held.look, &held.bitails, &held.woc, 7_200), None);
             // the last tip inside the window, then the first past it
             port.bound.set(at(972_208, SubjectLock::Height(972_185)));
             let edge = retire_evidence(&port, &refund, None).await;
@@ -6737,7 +6742,7 @@ mod tests {
             port.bound.set(at(972_209, SubjectLock::Height(972_185)));
             let past = retire_evidence(&port, &refund, None).await;
             assert_eq!(past.look, ArcadeLook::Fatal("REJECTED".into(), extra.into()));
-            let reason = crate::proof_fetcher::retire_verdict(&past.look, past.bitails, past.woc, 7_200)
+            let reason = crate::proof_fetcher::retire_verdict_of(&past.look, &past.bitails, &past.woc, 7_200)
                 .expect("past the lag the word is Arcade's own: the 1 h terminal arm");
             assert!(reason.starts_with("arcade REJECTED: TX_LOCK_TIME (35)"), "{reason}");
             // a subject final by its bytes is never held, even at the loop 44 tip
@@ -6752,7 +6757,7 @@ mod tests {
             });
             let blind = retire_evidence(&port, &refund, None).await;
             assert!(matches!(blind.look, ArcadeLook::NotFinal(..)));
-            assert!(crate::proof_fetcher::retire_verdict(&blind.look, blind.bitails, blind.woc, 49 * 3_600).is_some());
+            assert!(crate::proof_fetcher::retire_verdict_of(&blind.look, &blind.bitails, &blind.woc, 49 * 3_600).is_some());
             // the bound is asked of a non-final look only
             let other = "f9".repeat(32);
             port.say(&other, ArcadeLook::Missing, Some(NetworkPresence::Absent), Some(NetworkPresence::Absent));
