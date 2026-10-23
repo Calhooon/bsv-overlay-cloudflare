@@ -41,6 +41,28 @@ pub fn note(txid: &str, kind: &str, body: Option<Value>) {
         json!({"txid":txid.to_ascii_lowercase(),"kind":kind,"body":body.unwrap_or(Value::Null)}),
     );
 }
+/// bsv-low #660 (B-OWED-3-FOLD, the lens's M1): the `seen` frame of a `network_seen` latch, its body exactly the
+/// latch's own (`ops::latch_network_seen`): the broadcaster that said SEEN and its stamp in ms.
+pub fn seen_body(source: &str, at_ms: i64) -> Value {
+    json!({"source": source, "at": at_ms})
+}
+
+/// bsv-low #660 (B-OWED-3-FOLD M1): RE-NOTE a latch that beat the engine's mark. The dual push and the pending
+/// watch are spawned before the engine write and run beside it, so a settle's `seen` can be latched, shipped and
+/// DROPPED as unheld at the app layer (no `pot_records.spendingTxid` names it yet) before `mark_spent` lands; nothing
+/// re-sent it, and the winner's owed row read `built` (Withheld) until the block. The submit route calls this after
+/// the engine write, for a consuming submit, with the subject's latched pair (`ops::NETWORK_SEEN_PAIR_SQL`): the
+/// request's first flush then ships the `seen` before the pot note the mark made, and the hold now exists. A row
+/// latched before #621 carries no source and is not re-noted (the latch's body needs one). Answers whether it noted.
+pub fn note_latched_seen(txid: &str, latched: Option<(&str, i64)>) -> bool {
+    match latched {
+        Some((source, at_ms)) => {
+            note(txid, "seen", Some(seen_body(source, at_ms)));
+            true
+        }
+        None => false,
+    }
+}
 /// Submit hook admission boundary, shared by the route and native pin.
 pub fn note_submit(txid: &str, gated: bool, admitted_any: bool) {
     if gated && admitted_any {
