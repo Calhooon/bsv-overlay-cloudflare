@@ -2381,7 +2381,7 @@ pub(crate) mod tests {
             recovery_height: 900_000,
         }
     }
-    fn pot_ctx() -> PotContext {
+    pub(crate) fn pot_ctx() -> PotContext {
         PotContext {
             params: pot_params(),
             pot_sats: POT_SATS,
