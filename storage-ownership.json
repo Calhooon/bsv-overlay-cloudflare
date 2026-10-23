@@ -552,11 +552,34 @@
    "why": "the seat's pre-signed sweep of its own funding hop, never on chain: the one claim path for a stranded hop from a new device (#470 section 3 item 5)"
   },
   {
+   "name": "handfile_batches",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {},
+   "readers": ["overlay-cloudflare"],
+   "rebuild_class": "filings",
+   "never_wipe": true,
+   "holds": "the filed handfile batches: the four canonical payloads (hopparty, potparty v1, potparty v2, potrefund), the identity signature and the settle-key signature over the batch digest, keyed `handfile:<digest>`",
+   "why": "bsv-low #848 (FAST-C): the one signature per key the four funding-moment filings share; a reader re-verifies any exploded row against it (the served `batch`), so it cannot be rebuilt from the chain"
+  },
+  {
+   "name": "handfile_rows",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {},
+   "readers": ["overlay-cloudflare"],
+   "rebuild_class": "filings",
+   "never_wipe": true,
+   "holds": "each exploded row's place in its batch: (family, rowTxid, rowVout) to batchKey and index",
+   "why": "bsv-low #848 (FAST-C): the join a served row's `batch` is read through; filings, never on chain"
+  },
+  {
    "name": "hopparty_records",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",
    "writers": {
     "low-app-layer": [
+     "INSERT",
      "ALTER"
     ]
    },
@@ -565,8 +588,8 @@
    ],
    "rebuild_class": "chain",
    "never_wipe": true,
-   "holds": "the hop-in-flight marker (identity, opponent, gameId, the hop's lock and sats, markerValid)",
-   "why": "money evidence: `/hops-view` and `/owed`'s hop-stranded / in-progress families read it; chain in principle, nothing re-scans for it (#470 section 3 item 6)"
+   "holds": "the hop-in-flight marker (identity, opponent, gameId, the hop's lock and sats, markerValid); since bsv-low #848 also the handfile's exploded hop rows (outputIndex at or above 2^31, under the hop's txid)",
+   "why": "money evidence: `/hops-view` and `/owed`'s hop-stranded / in-progress families read it; chain in principle, nothing re-scans for it (#470 section 3 item 6); the handfile rows are filings"
   },
   {
    "name": "result_markers_v2",

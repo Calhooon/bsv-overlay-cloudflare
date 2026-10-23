@@ -13,6 +13,8 @@ pub mod collected;
 pub mod dm_delegation;
 pub mod env_name;
 pub mod hand;
+/// bsv-low #848 (FAST-C): the served `batch` of a row the app layer's handfile family exploded.
+pub mod handfile;
 pub mod hopparty;
 pub mod low;
 pub mod pot;

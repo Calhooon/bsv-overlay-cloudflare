@@ -8147,7 +8147,9 @@ pub async fn refund_backups(req: Request, ctx: RouteContext<AuthState>) -> Resul
     };
     let truncated = rows.len() > crate::refund_backups::REFUND_BACKUPS_MAX_ROWS;
     rows.truncate(crate::refund_backups::REFUND_BACKUPS_MAX_ROWS);
-    let backups = crate::refund_backups::assemble_refund_backups(rows);
+    let mut backups = crate::refund_backups::assemble_refund_backups(rows);
+    // bsv-low #848: an exploded (handfile) row carries its batch; a chain row never (its bytes unchanged).
+    crate::handfile::attach_refund_batches(&db, &mut backups).await;
     json_response(
         crate::refund_backups::refund_backups_body(&identity_lc, &backups, truncated),
         200,
@@ -8362,7 +8364,9 @@ pub async fn hops_view(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         }
     };
 
-    let (entries, truncated) = crate::hops_view::assemble_hops_view(rows);
+    let (mut entries, truncated) = crate::hops_view::assemble_hops_view(rows);
+    // bsv-low #848: an exploded (handfile) marker carries its batch; a chain marker never (its bytes unchanged).
+    crate::handfile::attach_hop_batches(&db, &mut entries).await;
     // B2.1 (bsv-low, 2026-09-02): the index's `unspent` is a non-observation;
     // re-check a bounded number of them against the chain rung (the same
     // corroborated WoC + Bitails read `/spent-any` serves, cached) so a hop

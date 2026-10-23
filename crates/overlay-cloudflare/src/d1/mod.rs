@@ -3019,6 +3019,8 @@ mod tests {
             "proof_markers",
             "potparty_records",
             "potrefund_records",
+            "handfile_batches",
+            "handfile_rows",
         ] {
             assert!(
                 joined.contains(table),
