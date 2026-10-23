@@ -242,13 +242,19 @@ pub fn peer_absent_memo_hit() {
 }
 
 /// Twelve courier HTTP attempts at at most 1,000 ms each fit in a 15,000 ms
-/// graph slice, leaving 3,000 ms for peer/storage work. With the 30,000 ms
-/// peer slice and 9,900 ms resume share, the page retains 20,100 ms. These
-/// are stop bounds, not promises about finalize/storage latency.
+/// graph slice, leaving 3,000 ms for peer/storage work inside that slice.
+/// A walk may finish a node started inside its slice under another slice
+/// of that node's own, so its walk can take up to two slices. A resume
+/// started inside the share can do the same: the held loop's walk time is
+/// bounded by the share plus two slices, capped by the per-peer deadline.
+/// With a 30,000 ms peer budget that leaves no guaranteed page time.
+/// Without a per-peer budget there is no shared time bound: up to sixteen
+/// held records can each use two slices, subject to the shared counted
+/// limbs. None of these bounds promises finalize/storage latency.
 pub const ROOT_MAX_COURIER_RUNGS: u32 = 12;
 /// The most one courier HTTP attempt may take, in milliseconds.
 pub const COURIER_RUNG_TIMEOUT_MS: u64 = 1_000;
-/// The most one root's graph walk may take, in milliseconds.
+/// The graph slice clamp, in milliseconds, excluding a finishing node's slice.
 pub const ROOT_MAX_MS: u64 = 15_000;
 #[derive(Default)]
 struct RootLimit {
