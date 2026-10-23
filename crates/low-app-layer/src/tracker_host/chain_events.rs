@@ -1272,6 +1272,44 @@ pub async fn health_read<S: SqlPort>(sql: &S) -> Value {
     v
 }
 
+/// The public `/health`'s memo of the durable read: how long one answer is served again (the W15E-L4 lens fold, LOW-2).
+pub const HEALTH_MEMO_TTL_MS: u64 = 10_000;
+
+thread_local! {
+    static HEALTH_MEMO: RefCell<Option<(u64, Value)>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn health_memo_reset() {
+    HEALTH_MEMO.with(|m| *m.borrow_mut() = None);
+}
+
+/// What the public `/health` serves (bsv-low #777 and the W15E-L4 lens fold, LOW-2): [`health_read`] behind THIS
+/// isolate's memo. Until the fold the route made one D1 batch (two statements) per read of an unauthenticated route
+/// the census lists, uncached, where before #777 it touched no D1: a stranger's flood paid two statements a read and
+/// a D1 queue slowed the liveness probe. A read inside [`HEALTH_MEMO_TTL_MS`] of the last durable read serves that
+/// object again (`source` still `"d1"`: it IS the durable read's answer; `memoAgeMs` its age; `isolateCounters` this
+/// isolate's current tally); one past it reads D1 again (`memoAgeMs` 0). A faulted read is served as the isolate
+/// memo for that read alone and never memoized, and a stale memo is not served over a fault (the fault is the news).
+/// Bound: one D1 batch per isolate per 10 s whatever the read rate (the cost bar counts it). The clock is the port's.
+pub async fn health_served<S: SqlPort>(sql: &S) -> Value {
+    let now = sql.now_ms();
+    if let Some((at, mut v)) = HEALTH_MEMO.with(|m| m.borrow().clone()) {
+        let age = now.saturating_sub(at);
+        if age < HEALTH_MEMO_TTL_MS {
+            v["memoAgeMs"] = json!(age);
+            v["isolateCounters"] = COUNTS.with(|c| json!(*c.borrow()));
+            return v;
+        }
+    }
+    let mut v = health_read(sql).await;
+    if v["source"] == json!("d1") {
+        v["memoAgeMs"] = json!(0);
+        HEALTH_MEMO.with(|m| *m.borrow_mut() = Some((now, v.clone())));
+    }
+    v
+}
+
 fn empty_health() -> Value {
     json!({"cursor": null, "lastKind": null, "lastAt": null, "tipHeight": null, "tipAgeSeconds": null, "seed": null, "startedAt": null})
 }
@@ -2078,7 +2116,8 @@ mod pins {
     /// The wiring (amended in the W15E-L4-LENS worktree for #777 and #778, PR 154): the scheduled pass runs the intake
     /// in ITS OWN task, handed before the tracker task's boot, board era, backfill and tick; no fetch handler and no
     /// read route runs it (NS-3: no read writes a word); the feed is the CHAINTRACKS binding, never a URL fetch;
-    /// `/health` serves `chainEvents` through `health_read` (one D1 batch), the isolate memo only on a fault.
+    /// `/health` serves `chainEvents` through `health_served` (the durable read behind a 10 s isolate memo), the
+    /// isolate memo only on a fault.
     #[test]
     fn i771_the_scheduled_pass_alone_runs_the_intake_over_the_binding() {
         let lib = include_str!("../lib.rs");
@@ -2098,8 +2137,9 @@ mod pins {
         }
         let health = &routes[routes.find("pub async fn health(").unwrap()..];
         let health = &health[..health.find("\n}\n").unwrap()];
-        assert!(health.contains("chain_events::health_read(&sql).await"));
+        assert!(health.contains("chain_events::health_served(&sql).await"));
         assert!(!health.contains("chain_events::health_json()"));
+        assert!(!health.contains("chain_events::health_read("), "the route reads through the memo");
         let src = include_str!("chain_events.rs");
         let feed = &src[src.find("impl Feed for BindingFeed").unwrap()
             ..src.find("pub struct WorkerReasks").unwrap()];
@@ -2530,10 +2570,79 @@ mod pins {
             .find("pubasyncfnhealth(_req:Request,ctx:RouteContext<AuthState>)")
             .expect("the async /health")..];
         let health = &health[..health.find("json_response(body.to_string(),200)").unwrap()];
-        assert!(health.contains("crate::tracker_host::chain_events::health_read(&sql).await"));
+        assert!(health.contains("crate::tracker_host::chain_events::health_served(&sql).await"));
         assert!(!health.contains("chain_events::health_json()"));
         let lib: String = include_str!("../lib.rs").split_whitespace().collect();
         assert!(lib.contains(r#".get_async("/health",routes::health)"#));
+    }
+
+    /// The W15E-L4 lens fold (LOW-2): the public `/health` reads D1 through THIS isolate's memo of the durable read.
+    /// A second read inside `HEALTH_MEMO_TTL_MS` is served from the memo (one D1 batch in all; `source` still `"d1"`,
+    /// it IS the durable read's answer; `memoAgeMs` its age); a read past it asks D1 again (`memoAgeMs` 0). A faulted
+    /// read is served as the isolate memo (`source: "isolate"`) and never memoized, so the read after it asks D1 again.
+    /// RED with `health_served` a pass-through to `health_read`: at the first read `left: (String("d1"),
+    /// String("20084"), Null) right: (.., Number(0))` (no age served), and the batch count after it.
+    #[test]
+    fn i777f_l2_the_public_health_is_served_from_a_ten_second_memo() {
+        health_memo_reset();
+        let db = SqliteSql::migrated();
+        let set = block(lever(
+            &db,
+            true,
+            true,
+            br#"{"cursor":"20084"}"#,
+            1_792_504_017,
+        ));
+        assert_eq!(set.status, 200, "{}", set.body);
+        let before = db.batches.get();
+        db.now.set(1_000_000);
+        let a = block(health_served(&db));
+        assert_eq!(
+            (a["source"].clone(), a["cursor"].clone(), a["memoAgeMs"].clone()),
+            (json!("d1"), json!("20084"), json!(0)),
+            "{a}"
+        );
+        db.now.set(1_005_000);
+        let b = block(health_served(&db));
+        assert_eq!(
+            db.batches.get() - before,
+            1,
+            "two reads inside the TTL: one D1 batch"
+        );
+        assert_eq!(
+            (b["source"].clone(), b["cursor"].clone(), b["memoAgeMs"].clone()),
+            (json!("d1"), json!("20084"), json!(5_000)),
+            "{b}"
+        );
+        db.now.set(1_000_000 + HEALTH_MEMO_TTL_MS);
+        let c = block(health_served(&db));
+        assert_eq!(db.batches.get() - before, 2, "past the TTL: D1 again");
+        assert_eq!(c["memoAgeMs"], json!(0));
+        // a faulted read past the TTL: the isolate memo, not memoized; the next read asks D1 again
+        db.now.set(1_000_000 + 2 * HEALTH_MEMO_TTL_MS);
+        db.conn
+            .execute_batch("ALTER TABLE ops_counters RENAME TO ops_counters_away")
+            .unwrap();
+        let faulted = block(health_served(&db));
+        assert_eq!(db.batches.get() - before, 3);
+        assert_eq!(faulted["source"], json!("isolate"), "{faulted}");
+        assert!(faulted["readFault"].is_string());
+        assert!(faulted.get("memoAgeMs").is_none());
+        db.conn
+            .execute_batch("ALTER TABLE ops_counters_away RENAME TO ops_counters")
+            .unwrap();
+        db.now.set(1_000_000 + 2 * HEALTH_MEMO_TTL_MS + 1_000);
+        let d = block(health_served(&db));
+        assert_eq!(db.batches.get() - before, 4, "a fault is never memoized");
+        assert_eq!(
+            (d["source"].clone(), d["memoAgeMs"].clone()),
+            (json!("d1"), json!(0))
+        );
+        db.now.set(1_000_000 + 2 * HEALTH_MEMO_TTL_MS + 2_000);
+        let e = block(health_served(&db));
+        assert_eq!(db.batches.get() - before, 4, "served from the memo again");
+        assert_eq!(e["memoAgeMs"], json!(1_000));
+        assert_eq!(HEALTH_MEMO_TTL_MS, 10_000);
     }
 
     /// bsv-low #778 (a): the pass's durable witness. Each pass that reaches the intake reads the previous stamp and
