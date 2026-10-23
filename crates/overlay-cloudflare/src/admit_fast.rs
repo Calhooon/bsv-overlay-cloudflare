@@ -1905,9 +1905,104 @@ pub async fn converge_confirmed_conflict(
 
 /// Includes already-retired and readmitted pots: proof retirement must not
 /// remove an unconfirmed live pot from the conflict re-check population.
+///
+/// bsv-low #825 (B-FLEET-4): a pot the fault memo HOLDS ([`CONFLICT_FAULT_MEMO_PUT_SQL`]: at least
+/// [`CONFLICT_FAULT_MEMO_BOUND`] consecutive faulted re-checks, held [`CONFLICT_FAULT_MEMO_HOLD_MS`] from the last)
+/// is not drawn while its hold runs, so the eight places go to pots the couriers can answer. A hold never keeps out a
+/// pot the index holds SEEN (`network_seen`) or funded (a proof in `pot_beefs` or `transactions`, `has_proof = 1`),
+/// read here at the draw, whatever the memo says. `?1` now, in ms.
 pub const CONFLICT_CANDIDATES_SQL: &str = "SELECT b.txid, hex(b.beef) AS beef FROM pot_beefs b \
      WHERE b.proof_verified = 0 AND EXISTS (SELECT 1 FROM pot_records p WHERE p.txid = b.txid) \
+     AND NOT EXISTS (SELECT 1 FROM conflict_fault_memo m WHERE m.txid = b.txid AND m.held_until > ?1 \
+       AND b.has_proof = 0 \
+       AND NOT EXISTS (SELECT 1 FROM network_seen s WHERE s.txid = b.txid) \
+       AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.txid = b.txid AND t.has_proof = 1)) \
      ORDER BY RANDOM() LIMIT 8";
+
+/// bsv-low #825 (B-FLEET-4): the conflict pass's per-pot fault memo, one row per pot whose LAST re-check faulted:
+/// its consecutive faults, the first and last fault's time (ms), the hold's end (`held_until`, ms; NULL until the
+/// bound is met), how many holds were armed, and the last fault's words (at most 160 characters). Transient: a lost
+/// row costs the pot [`CONFLICT_FAULT_MEMO_BOUND`] more faulted draws before it is held again.
+pub const CONFLICT_FAULT_MEMO_CREATE: &str = "CREATE TABLE IF NOT EXISTS conflict_fault_memo (txid TEXT PRIMARY KEY, faults INTEGER NOT NULL, first_fault_at INTEGER NOT NULL, last_fault_at INTEGER NOT NULL, held_until INTEGER, holds INTEGER NOT NULL DEFAULT 0, last_fault TEXT)";
+
+/// bsv-low #825: consecutive faulted re-checks after which a pot is held out of the draw. A clean re-check (no
+/// fault, evicted or not) deletes the row, so the count is CONSECUTIVE.
+pub const CONFLICT_FAULT_MEMO_BOUND: i64 = 3;
+
+/// bsv-low #825: how long a hold keeps a pot out of the draw, from the fault that armed it: 24 h. Past it the pot is
+/// drawn again; a fault there re-arms the hold at once (the count is past the bound), a clean re-check ends it. So a
+/// void pot costs one courier re-check a day after its first three, where it cost one every few ticks.
+pub const CONFLICT_FAULT_MEMO_HOLD_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// bsv-low #825: a row whose last fault is older than this and whose hold has ended is swept (7 days): the pot left
+/// the candidate set (proven, evicted) or stopped faulting without a clean re-check deleting its row.
+pub const CONFLICT_FAULT_MEMO_SWEEP_AFTER_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// bsv-low #825: rows the sweep deletes at most a pass.
+pub const CONFLICT_FAULT_MEMO_SWEEP_LIMIT: i64 = 64;
+
+/// bsv-low #825: one faulted re-check noted. `?1` txid, `?2` now (ms), `?3` [`CONFLICT_FAULT_MEMO_BOUND`], `?4`
+/// [`CONFLICT_FAULT_MEMO_HOLD_MS`], `?5` the fault's words. The hold is armed when the consecutive count meets the
+/// bound AND the index holds the pot neither SEEN nor funded (the draw reads the same again). Returns the row.
+pub const CONFLICT_FAULT_MEMO_PUT_SQL: &str = "INSERT INTO conflict_fault_memo \
+     (txid, faults, first_fault_at, last_fault_at, held_until, holds, last_fault) \
+     VALUES (?1, 1, ?2, ?2, \
+       CASE WHEN 1 >= ?3 \
+         AND NOT EXISTS (SELECT 1 FROM network_seen WHERE txid = ?1) \
+         AND NOT EXISTS (SELECT 1 FROM pot_beefs WHERE txid = ?1 AND has_proof = 1) \
+         AND NOT EXISTS (SELECT 1 FROM transactions WHERE txid = ?1 AND has_proof = 1) \
+       THEN ?2 + ?4 END, \
+       CASE WHEN 1 >= ?3 \
+         AND NOT EXISTS (SELECT 1 FROM network_seen WHERE txid = ?1) \
+         AND NOT EXISTS (SELECT 1 FROM pot_beefs WHERE txid = ?1 AND has_proof = 1) \
+         AND NOT EXISTS (SELECT 1 FROM transactions WHERE txid = ?1 AND has_proof = 1) \
+       THEN 1 ELSE 0 END, ?5) \
+     ON CONFLICT(txid) DO UPDATE SET \
+       faults = conflict_fault_memo.faults + 1, \
+       last_fault_at = excluded.last_fault_at, \
+       last_fault = excluded.last_fault, \
+       held_until = CASE WHEN conflict_fault_memo.faults + 1 >= ?3 \
+         AND NOT EXISTS (SELECT 1 FROM network_seen WHERE txid = ?1) \
+         AND NOT EXISTS (SELECT 1 FROM pot_beefs WHERE txid = ?1 AND has_proof = 1) \
+         AND NOT EXISTS (SELECT 1 FROM transactions WHERE txid = ?1 AND has_proof = 1) \
+       THEN ?2 + ?4 ELSE conflict_fault_memo.held_until END, \
+       holds = conflict_fault_memo.holds + CASE WHEN conflict_fault_memo.faults + 1 >= ?3 \
+         AND NOT EXISTS (SELECT 1 FROM network_seen WHERE txid = ?1) \
+         AND NOT EXISTS (SELECT 1 FROM pot_beefs WHERE txid = ?1 AND has_proof = 1) \
+         AND NOT EXISTS (SELECT 1 FROM transactions WHERE txid = ?1 AND has_proof = 1) \
+       THEN 1 ELSE 0 END \
+     RETURNING faults, held_until";
+
+/// bsv-low #825: a clean re-check ends the pot's run of faults. `?1` txid. The memo's row only: never the pot.
+pub const CONFLICT_FAULT_MEMO_CLEAR_SQL: &str = "DELETE FROM conflict_fault_memo WHERE txid = ?1";
+
+/// bsv-low #825: the memo's bounded sweep, at most [`CONFLICT_FAULT_MEMO_SWEEP_LIMIT`] rows a pass. `?1` now less
+/// [`CONFLICT_FAULT_MEMO_SWEEP_AFTER_MS`], `?2` now, `?3` the limit. The memo's rows only: never a pot.
+pub const CONFLICT_FAULT_MEMO_SWEEP_SQL: &str = "DELETE FROM conflict_fault_memo WHERE txid IN \
+     (SELECT txid FROM conflict_fault_memo WHERE last_fault_at < ?1 \
+       AND (held_until IS NULL OR held_until <= ?2) LIMIT ?3)";
+
+/// bsv-low #825: the memo on `/health/invariants.conflictPass.faultMemo`. `?1` now (ms). `held` counts the rows
+/// whose hold runs and that the draw keeps out (neither SEEN nor funded), `nextReleaseAt` the soonest hold's end.
+pub const CONFLICT_FAULT_MEMO_HEALTH_SQL: &str = "SELECT COUNT(*) AS rows, \
+     COALESCE(SUM(CASE WHEN m.held_until > ?1 \
+       AND NOT EXISTS (SELECT 1 FROM network_seen s WHERE s.txid = m.txid) \
+       AND NOT EXISTS (SELECT 1 FROM pot_beefs b WHERE b.txid = m.txid AND b.has_proof = 1) \
+       AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.txid = m.txid AND t.has_proof = 1) \
+       THEN 1 ELSE 0 END), 0) AS held, \
+     MIN(CASE WHEN m.held_until > ?1 THEN m.held_until END) AS next_release_at, \
+     COALESCE(MAX(m.faults), 0) AS max_faults \
+     FROM conflict_fault_memo m";
+
+/// bsv-low #825: what one faulted re-check's memo write answered: `Some(held_until)` when this write ARMED a hold.
+pub fn conflict_hold_armed(now_ms: i64, held_until: Option<i64>) -> Option<i64> {
+    held_until.filter(|h| *h == now_ms + CONFLICT_FAULT_MEMO_HOLD_MS)
+}
+
+/// bsv-low #825: the fault's words as the memo keeps them (at most 160 characters, on a char boundary).
+pub fn conflict_fault_words(fault: &str) -> String {
+    fault.chars().take(160).collect()
+}
 
 /// #602 fold (MEDIUM-1): what one conflict pass did, counted and on the tick's line.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1952,6 +2047,9 @@ impl ConflictPassSummary {
 pub(crate) trait ConflictPassPort {
     /// Re-check one candidate (its stored BEEF read, then [`converge_confirmed_conflict`]): `Ok(true)` evicted.
     async fn check(&self, txid: &str, beef: Option<String>) -> Result<bool, String>;
+    /// bsv-low #825: note the re-check's outcome in the pot's fault memo ([`CONFLICT_FAULT_MEMO_PUT_SQL`] on a
+    /// fault, [`CONFLICT_FAULT_MEMO_CLEAR_SQL`] on a clean re-check), before its counters are persisted.
+    async fn memo(&self, _txid: &str, _result: &Result<bool, String>) {}
     /// Persist one candidate's counter deltas (the durable `ops_counters` rows).
     async fn persist(&self, deltas: &ConflictPassSummary);
     /// bsv-low #649 L1 (the delta lens): the pass's DELIVERY of the notes its evictions made, its one delivery
@@ -1972,6 +2070,7 @@ pub(crate) async fn run_conflict_candidates<P: ConflictPassPort>(
     let mut summary = ConflictPassSummary::default();
     for (txid, beef) in rows {
         let result = port.check(&txid, beef).await;
+        port.memo(&txid, &result).await;
         let mut one = ConflictPassSummary::default();
         one.note(&result);
         port.persist(&one).await;
@@ -2016,6 +2115,15 @@ impl ConflictPassPort for WorkerConflictPass<'_> {
         }
         result
     }
+    async fn memo(&self, txid: &str, result: &Result<bool, String>) {
+        note_conflict_fault_memo(
+            self.db,
+            txid,
+            result,
+            worker::Date::now().as_millis() as i64,
+        )
+        .await;
+    }
     async fn persist(&self, deltas: &ConflictPassSummary) {
         bump_conflict_counters(self.db, deltas).await;
     }
@@ -2057,7 +2165,19 @@ pub(crate) async fn confirmed_conflict_pass(
         txid: String,
         beef: Option<String>,
     }
+    let now = worker::Date::now().as_millis() as i64;
+    // bsv-low #825: the memo's bounded sweep, then the draw that leaves the held pots out
+    if let Err(e) = Query::new(CONFLICT_FAULT_MEMO_SWEEP_SQL)
+        .bind(now - CONFLICT_FAULT_MEMO_SWEEP_AFTER_MS)
+        .bind(now)
+        .bind(CONFLICT_FAULT_MEMO_SWEEP_LIMIT)
+        .execute(db)
+        .await
+    {
+        worker::console_log!("[conflict] fault memo sweep deferred: {e}");
+    }
     let rows = match Query::new(CONFLICT_CANDIDATES_SQL)
+        .bind(now)
         .fetch_all::<Candidate>(db)
         .await
     {
@@ -2082,6 +2202,104 @@ pub(crate) async fn confirmed_conflict_pass(
         },
     };
     run_conflict_candidates(&port, rows.into_iter().map(|r| (r.txid, r.beef)).collect()).await
+}
+
+/// bsv-low #825: one re-check noted in the pot's fault memo. A fault adds one to the pot's consecutive count and
+/// arms the hold at the bound (counted `admit_fast_conflict_held_total`, logged once an arming); a clean re-check
+/// deletes the memo's row. A memo fault is logged and swallowed: the pot is drawn as before.
+async fn note_conflict_fault_memo(
+    db: &D1Database,
+    txid: &str,
+    result: &Result<bool, String>,
+    now: i64,
+) {
+    #[derive(serde::Deserialize)]
+    struct Put {
+        faults: f64,
+        held_until: Option<f64>,
+    }
+    match result {
+        Ok(_) => {
+            if let Err(e) = Query::new(CONFLICT_FAULT_MEMO_CLEAR_SQL)
+                .bind(txid)
+                .execute(db)
+                .await
+            {
+                worker::console_log!("[conflict] {txid} fault memo clear failed: {e}");
+            }
+        }
+        Err(fault) => {
+            let put = Query::new(CONFLICT_FAULT_MEMO_PUT_SQL)
+                .bind(txid)
+                .bind(now)
+                .bind(CONFLICT_FAULT_MEMO_BOUND)
+                .bind(CONFLICT_FAULT_MEMO_HOLD_MS)
+                .bind(conflict_fault_words(fault))
+                .fetch_optional::<Put>(db)
+                .await;
+            match put {
+                Ok(Some(row)) => {
+                    if let Some(until) = conflict_hold_armed(now, row.held_until.map(|h| h as i64))
+                    {
+                        crate::ops::bump_counter(
+                            db,
+                            crate::ops::COUNTER_ADMIT_FAST_CONFLICT_HELD,
+                            1,
+                        )
+                        .await;
+                        worker::console_log!(
+                            "[conflict] {txid} HELD out of the draw until {until}: {} consecutive faulted re-checks (bound {CONFLICT_FAULT_MEMO_BOUND})",
+                            row.faults as i64
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => worker::console_log!("[conflict] {txid} fault memo write failed: {e}"),
+            }
+        }
+    }
+}
+
+/// bsv-low #825: `/health/invariants.conflictPass.faultMemo`: the memo's rows, the pots it holds out of the draw now,
+/// the soonest hold's end, the longest run of faults, and its bounds. `readable: false` = the table is unreadable.
+pub(crate) async fn conflict_fault_memo_health(db: &D1Database, now: i64) -> serde_json::Value {
+    #[derive(serde::Deserialize)]
+    struct Health {
+        rows: f64,
+        held: f64,
+        next_release_at: Option<f64>,
+        max_faults: f64,
+    }
+    let bounds = serde_json::json!({
+        "faultsBeforeHold": CONFLICT_FAULT_MEMO_BOUND,
+        "holdMs": CONFLICT_FAULT_MEMO_HOLD_MS,
+        "sweepAfterMs": CONFLICT_FAULT_MEMO_SWEEP_AFTER_MS,
+        "sweepLimit": CONFLICT_FAULT_MEMO_SWEEP_LIMIT,
+        "neverHeld": "a pot the index holds SEEN (network_seen) or funded (has_proof)",
+    });
+    match Query::new(CONFLICT_FAULT_MEMO_HEALTH_SQL)
+        .bind(now)
+        .fetch_optional::<Health>(db)
+        .await
+    {
+        Ok(h) => {
+            let h = h.unwrap_or(Health {
+                rows: 0.0,
+                held: 0.0,
+                next_release_at: None,
+                max_faults: 0.0,
+            });
+            serde_json::json!({
+                "readable": true,
+                "rows": h.rows as i64,
+                "held": h.held as i64,
+                "nextReleaseAt": h.next_release_at.map(|v| v as i64),
+                "maxConsecutiveFaults": h.max_faults as i64,
+                "bounds": bounds,
+            })
+        }
+        Err(e) => serde_json::json!({ "readable": false, "fault": e, "bounds": bounds }),
+    }
 }
 
 /// The pass's counters, a zero delta skipped (bsv-low #649 H1: written once per candidate, so a write per counter
@@ -5405,6 +5623,110 @@ mod tests {
             after,
             "summary.scanned+=one.scanned;summary.evicted+=one.evicted;summary.faults+=one.faults;}",
             "an iteration ends with pure additions after its persist"
+        );
+    }
+
+    /// bsv-low #825 (B-FLEET-4): the conflict pass's world where each candidate's outcome is noted in the fault memo.
+    struct MemoRecorder {
+        events: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl ConflictPassPort for MemoRecorder {
+        async fn check(&self, txid: &str, _beef: Option<String>) -> Result<bool, String> {
+            match txid {
+                "void" => Err("courier exhausted".into()),
+                "gone" => Ok(true),
+                _ => Ok(false),
+            }
+        }
+        async fn memo(&self, txid: &str, result: &Result<bool, String>) {
+            self.events.borrow_mut().push(format!(
+                "memo {txid} {}",
+                if result.is_err() { "fault" } else { "clean" }
+            ));
+        }
+        async fn persist(&self, d: &ConflictPassSummary) {
+            self.events
+                .borrow_mut()
+                .push(format!("persist {}/{}/{}", d.scanned, d.evicted, d.faults));
+        }
+        async fn flush(&self) {}
+    }
+
+    /// bsv-low #825 (B-FLEET-4): the shipped pass notes EVERY candidate's outcome in the fault memo, the fault and the
+    /// clean re-checks alike (a clean one ends the pot's run), before that candidate's counters; and the worker's
+    /// port writes the shipped memo statements, its pass sweeps the memo and binds the draw's time. RED with the
+    /// loop's memo call removed: no `memo` event.
+    #[test]
+    fn b_fleet_4_the_pass_notes_each_outcome_in_the_fault_memo() {
+        let port = MemoRecorder {
+            events: Default::default(),
+        };
+        let rows = vec![
+            ("void".to_string(), None),
+            ("quiet".to_string(), None),
+            ("gone".to_string(), None),
+        ];
+        let mut fut = std::pin::pin!(run_conflict_candidates(&port, rows));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(summary) = std::future::Future::poll(fut.as_mut(), &mut cx)
+        else {
+            panic!("the fake answers at once")
+        };
+        assert_eq!(
+            (summary.scanned, summary.evicted, summary.faults),
+            (3, 1, 1),
+            "scanned stays the denominator: one a re-check"
+        );
+        assert_eq!(
+            *port.events.borrow(),
+            vec![
+                "memo void fault",
+                "persist 1/0/1",
+                "memo quiet clean",
+                "persist 1/0/0",
+                "memo gone clean",
+                "persist 1/1/0",
+            ]
+        );
+        let src = include_str!("admit_fast.rs");
+        let code = squashed(&src[..src.find("#[cfg(test)]").unwrap()]);
+        let port_impl = &code[code
+            .find("implConflictPassPortforWorkerConflictPass<'_>{")
+            .expect("the worker's port")..];
+        let port_impl = &port_impl[..port_impl
+            .find("pub(crate)fnconflict_pass_fetcher(")
+            .unwrap()];
+        assert!(
+            port_impl.contains(
+                "asyncfnmemo(&self,txid:&str,result:&Result<bool,String>){note_conflict_fault_memo(self.db,txid,result,"
+            ),
+            "the worker's port writes the memo"
+        );
+        let note = &code[code
+            .find("asyncfnnote_conflict_fault_memo(")
+            .expect("the memo's writer")..];
+        let note = &note[..note
+            .find("pub(crate)asyncfnconflict_fault_memo_health(")
+            .unwrap()];
+        for step in [
+            "Query::new(CONFLICT_FAULT_MEMO_CLEAR_SQL).bind(txid)",
+            "Query::new(CONFLICT_FAULT_MEMO_PUT_SQL).bind(txid).bind(now).bind(CONFLICT_FAULT_MEMO_BOUND).bind(CONFLICT_FAULT_MEMO_HOLD_MS).bind(conflict_fault_words(fault))",
+            "crate::ops::bump_counter(db,crate::ops::COUNTER_ADMIT_FAST_CONFLICT_HELD,1,)",
+        ] {
+            assert!(note.contains(step), "the memo's writer: {step}");
+        }
+        let pass = &code[code
+            .find("pub(crate)asyncfnconfirmed_conflict_pass(")
+            .expect("the pass")..];
+        assert!(pass.contains(
+            "Query::new(CONFLICT_FAULT_MEMO_SWEEP_SQL).bind(now-CONFLICT_FAULT_MEMO_SWEEP_AFTER_MS).bind(now).bind(CONFLICT_FAULT_MEMO_SWEEP_LIMIT)"
+        ));
+        assert!(pass
+            .contains("Query::new(CONFLICT_CANDIDATES_SQL).bind(now).fetch_all::<Candidate>(db)"));
+        assert!(
+            crate::d1::OVERLAY_MIGRATIONS.contains(&CONFLICT_FAULT_MEMO_CREATE),
+            "the memo's table is migrated"
         );
     }
 

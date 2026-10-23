@@ -609,7 +609,13 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 342 to 343 for bsv-low #635 (B-COST-1): `worker_cost_daily`, the cost bar's rows. The app layer WRITES it (the
 /// shared `d1_ledger` source) and carries no catch-up: a write that finds no table is restored into its isolate's
 /// window and written by a later take, once the overlay has migrated.
-pub const OVERLAY_MIGRATION_COUNT: usize = 343;
+/// 343 to 345 for bsv-low #825, #781 and #778 (B-FLEET-4): `conflict_fault_memo`, the conflict pass's per-pot fault
+/// memo (`admit_fast::CONFLICT_FAULT_MEMO_CREATE`), and `applayer_scheduled_pass`, the app layer's last scheduled
+/// pass and its phases' walls (the app layer's catch-up carries the CREATE byte for byte, `pass_meter::CREATE`).
+pub const OVERLAY_MIGRATION_COUNT: usize = 345;
+
+/// bsv-low #781, #778 (B-FLEET-4): the app layer's last scheduled pass, one row (`low-app-layer` `pass_meter`).
+pub const APPLAYER_SCHEDULED_PASS_CREATE: &str = "CREATE TABLE IF NOT EXISTS applayer_scheduled_pass (id INTEGER PRIMARY KEY CHECK (id = 1), at INTEGER NOT NULL, started_at INTEGER NOT NULL, wall_ms INTEGER NOT NULL, phases TEXT NOT NULL, passes INTEGER NOT NULL DEFAULT 0)";
 
 /// bsv-low #808: the tip a hop's chain-probe memo was taken at (`low-app-layer` `hops_view::ProbeMemo::tip_height`).
 pub const HOP_CHAIN_PROBES_TIP_ALTER: &str =
@@ -2266,6 +2272,11 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // 343: bsv-low #635 (B-COST-1), the cost bar's daily rows (one per UTC day and Worker), written by both Workers
     // through `d1_ledger`'s cost window and served on `/health/invariants.costBar`. A new table: no row is touched.
     crate::d1_ledger::COST_DAILY_CREATE,
+    // 344: bsv-low #825 (B-FLEET-4), the conflict pass's per-pot fault memo: a pot past three consecutive faulted
+    // re-checks is held out of the draw for 24 h (never one the index holds SEEN or funded).
+    crate::admit_fast::CONFLICT_FAULT_MEMO_CREATE,
+    // 345: bsv-low #781, #778 (B-FLEET-4), the app layer's last scheduled pass and its phases' walls, one row.
+    APPLAYER_SCHEDULED_PASS_CREATE,
 ];
 
 // =============================================================================

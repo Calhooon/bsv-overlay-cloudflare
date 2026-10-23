@@ -232,7 +232,8 @@ async fn e602_readmitted_pot_converges_only_on_a_bound_confirmed_competitor() {
     beef.merge_raw_tx(raw.clone(), None);
     db.0.execute("INSERT INTO pot_beefs(txid,beef,createdAt,has_proof,proof_verified,structurally_unprovable) VALUES (?, ?, 1, 0, 0, 1)", rusqlite::params![txid, beef.to_binary()]).unwrap();
     let (selected, hex_beef): (String, String) =
-        db.0.query_row(CONFLICT_CANDIDATES_SQL, [], |r| Ok((r.get(0)?, r.get(1)?)))
+        // bsv-low #825: the draw binds its time (the fault memo's hold)
+        db.0.query_row(CONFLICT_CANDIDATES_SQL, [3000], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
     assert_eq!(
         selected, txid,
