@@ -20,8 +20,10 @@
 //! What it costs: nothing while no registered manager answers
 //! `TopicManager::aborts_admissions` (all sixteen of this workspace's today,
 //! pinned by `i558_every_workspace_manager_keeps_the_default`): no read is
-//! made. Otherwise two reads an eviction: the txid's live `outputs` rows, and
-//! its stored BEEF when one of them is under an aborting manager.
+//! made. Otherwise two to four key reads: the txid's live `outputs` rows,
+//! then its BEEF in `transactions`, `pot_beefs`, or `transactions_evicted`,
+//! stopping at the first nonempty body. The OPEN marker precedes these
+//! reads; the ledger close precedes the tell. An empty BEEF tells nobody.
 //!
 //! Stated: a READMISSION restores the rows without asking the manager again
 //! (the reference has no readmission), so a stateful manager told of an
@@ -39,6 +41,23 @@ pub const ADMITTED_OUTPUTS_SQL: &str =
 
 /// The stored BEEF of a txid, read back as hex ([`crate::d1::beef_of_hex_column`]).
 pub const STORED_BEEF_SQL: &str = "SELECT hex(beef) AS beef FROM transactions WHERE txid = ?";
+const POT_BEEF_SQL: &str = "SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?";
+const EVICTED_BEEF_SQL: &str = "SELECT hex(beef) AS beef FROM transactions_evicted WHERE txid = ?";
+
+/// Read each store only if the earlier store held no body. Shared by the
+/// D1 adapter and the SQLite pins, including partially completed evictions.
+pub(crate) async fn read_held_beef<F, Fut>(mut read: F) -> Result<Option<Vec<u8>>, String>
+where
+    F: FnMut(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Vec<u8>>, String>>,
+{
+    for sql in [STORED_BEEF_SQL, POT_BEEF_SQL, EVICTED_BEEF_SQL] {
+        if let Some(beef) = read(sql).await?.filter(|beef| !beef.is_empty()) {
+            return Ok(Some(beef));
+        }
+    }
+    Ok(None)
+}
 
 /// What the abort reads before the eviction moves the rows.
 #[async_trait(?Send)]
@@ -73,11 +92,14 @@ impl AbortRows for D1Database {
             .collect())
     }
     async fn stored_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, String> {
-        Ok(Query::new(STORED_BEEF_SQL)
-            .bind(txid)
-            .fetch_optional::<BeefRow>(self)
-            .await?
-            .and_then(|r| crate::d1::beef_of_hex_column(r.beef)))
+        read_held_beef(|sql| async move {
+            Ok(Query::new(sql)
+                .bind(txid)
+                .fetch_optional::<BeefRow>(self)
+                .await?
+                .and_then(|r| crate::d1::beef_of_hex_column(r.beef)))
+        })
+        .await
     }
 }
 
@@ -106,9 +128,15 @@ impl PendingAbort {
     pub fn admissions(&self) -> &[(String, Vec<u32>)] {
         &self.admissions
     }
+
+    /// An abort was needed but no body identifies the admission. The
+    /// eviction wrapper counts this once, after closing the ledger.
+    pub fn skipped_empty_beef(&self) -> bool {
+        !self.admissions.is_empty() && self.beef.is_empty()
+    }
 }
 
-/// Read what the abort of `txid` needs before its eviction: the live rows of
+/// Read what the abort of `txid` needs after OPEN and before the moves: the live rows of
 /// each topic an aborting manager holds, and the stored BEEF. No manager that
 /// aborts: no read. A read that faults is logged and aborts nothing (the
 /// eviction goes on: the abort never stands in its way).
@@ -149,8 +177,13 @@ pub async fn read_before_eviction(
     match rows.stored_beef(txid).await {
         Ok(beef) => pending.beef = beef.unwrap_or_default(),
         Err(e) => crate::proof_fetcher::push_log(&format!(
-            "[admit-fast] evict {txid}: the managers' abort could not read the stored BEEF ({e}): told with none (bsv-low #558)"
+            "[admit-fast] evict {txid}: the managers' abort could not read the stored BEEF ({e}): none told (bsv-low #558)"
         )),
+    }
+    if pending.skipped_empty_beef() {
+        crate::proof_fetcher::push_log(&format!(
+            "[admit-fast] evict {txid}: managers' abort skipped: no nonempty BEEF identifies the admission (bsv-low #558)"
+        ));
     }
     pending
 }
@@ -158,6 +191,9 @@ pub async fn read_before_eviction(
 /// Tell each aborting manager its evicted outputs (the engine's
 /// `abort_provisional_admissions`, one spelling). Answers how many were told.
 pub async fn tell(pending: &PendingAbort) -> u32 {
+    if pending.beef.is_empty() {
+        return 0;
+    }
     overlay_engine::topic_manager::abort_provisional_admissions(
         |topic| {
             pending

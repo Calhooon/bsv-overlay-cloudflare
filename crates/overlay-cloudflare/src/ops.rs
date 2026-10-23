@@ -390,6 +390,8 @@ pub const COUNTER_QUEUE_R2_ORPHAN_SWEEP_UNREADABLE: &str = "queue_r2_orphan_swee
 /// loop 18: an eviction pass that could not prove every table clean (a faulted read, a survivor after the
 /// second move) — the open marker stands; the write-side guard and the next eviction converge.
 pub const COUNTER_ADMIT_FAST_EVICT_INCOMPLETE: &str = "admit_fast_evict_incomplete_total";
+/// An eviction's manager notification skipped because no nonempty BEEF identifies the admission.
+pub const COUNTER_ADMISSION_ABORT_EMPTY_BEEF: &str = "admission_abort_empty_beef_total";
 /// loop 18: the eviction ledger could not be read where a guard asked (named, never a silent "none").
 pub const COUNTER_ADMIT_FAST_LEDGER_UNREADABLE: &str = "admit_fast_ledger_unreadable_total";
 /// loop 18: a queued replay skipped because its subject is under an open eviction (a replay never
