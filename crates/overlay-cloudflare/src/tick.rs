@@ -761,13 +761,22 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         crate::relatch::log_relatch_summary(&summary);
     }
 
+    // #607: one bounded page of the historical ledger, permanently inert once stamped done.
+    crate::d1_ledger::label("retire");
+    match crate::conflict_repair::run_counted(&ops_db).await {
+        Ok(summary) if summary.scanned > 0 => {
+            worker::console_log!("Scheduled: conflict-spender-repair {summary:?}");
+        }
+        Err(e) => worker::console_warn!("Scheduled: conflict-spender-repair failed: {e}"),
+        _ => {}
+    }
+
     // 4b. Terminal-retire classifier (INCIDENT D1-CALLBACK-FLOOD 2026-09-01).
     //    Runs BEFORE the rebroadcast backstop on purpose: a row it retires
     //    this tick (corroborated network-dead ; Arcade terminal verdict or
     //    48h+ absence, PLUS both indexers' definitive 404) must not be
     //    re-presented by the very next step. Bounded: ≤8 candidates per
     //    store, ≤3 courier GETs each; every uncertainty keeps (fail-safe).
-    crate::d1_ledger::label("retire");
     let arcade_base = env
         .var("ARCADE_URL")
         .ok()

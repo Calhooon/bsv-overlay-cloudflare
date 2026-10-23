@@ -873,6 +873,26 @@ to EVERY Arcade-terminal status, not only a conflict-shaped one: an aged,
 non-conflict REJECTED subject one node still holds is the 422.
 
 
+The one-time historical repair (bsv-low #607) runs from the scheduled tick and
+`POST /internal/repair-conflict-spenders` (empty body or `{}`, `INTERNAL_TOKEN`
+checked before any database setup). `conflict_repair::REPAIR_LIMIT` is 16
+ledger rows per pass, including unrelated reasons, with no courier requests.
+The pass uses at most 39 D1 calls including its counter batch, excluding schema
+boot and notification delivery; a finished pass uses one state read.
+Migration 346 adds `conflict_spender_repair`: the first pass freezes the
+ledger's highest rowid, each pass advances its cursor, and the final pass
+stamps `done_at`. A completed repair performs only its state read, including
+when called by the operator; there is no reset lever. Open conflict reasons
+with valid outpoint, competitor and positive height use #605's existing
+`record_conflict_spender`. Confirmed and foreign pointers are preserved;
+the repaired pointer stays unconfirmed until the chaser verifies its proof.
+A write fault leaves that row for retry. Four `conflict_spender_repair_*_total`
+counters (`scanned`, `repaired`, `skipped`, `faults`) are served from zero on
+`/health/invariants`; the lever returns those pass counts and `done`. Counts
+are best effort: a lost checkpoint may replay a page, and a lost counter
+flush may under-count. The owed judgement is unchanged. Pins: `e607` in
+`--test e602_convergence`.
+
 ## The conflict pass holds a void pot (bsv-low #825, B-FLEET-4, 2026-10-23)
 
 The conflict pass draws eight unverified live pots a pass (`CONFLICT_CANDIDATES_SQL`, `ORDER BY RANDOM()`); a pot whose JOIN never reached the network answers nothing at the couriers, so it was re-drawn every few ticks and each re-check was a counted fault (`admit_fast_conflict_faults_total` climbing on nothing new). Now each re-check's outcome is noted in the fault memo `conflict_fault_memo` (migration 343, transient, one row per pot whose last re-check faulted; `ConflictPassPort::memo`, called by the shipped loop before the candidate's counters): a fault adds one to the pot's CONSECUTIVE count (`CONFLICT_FAULT_MEMO_PUT_SQL`), a clean re-check (evicted or not) deletes the memo's row. At `CONFLICT_FAULT_MEMO_BOUND` (3) the hold is armed, `CONFLICT_FAULT_MEMO_HOLD_MS` (24 h) from that fault, counted `admit_fast_conflict_held_total` and logged `[conflict] <txid> HELD`; while it runs the draw leaves the pot out, so the eight places go to pots the couriers can answer. At its end the pot is drawn again; a fault re-arms the hold at once, so a void pot costs one re-check a day after its first three. NEVER HELD: a pot the index holds SEEN (`network_seen`) or funded (`has_proof = 1` in `pot_beefs` or `transactions`), checked at the write AND at the draw, so a latch landing during a hold puts the pot back in the next draw. Never a delete of a pot: the memo's rows only (the clear, and a bounded sweep each pass of rows whose last fault is 7 days old and whose hold ended, at most 64). `admit_fast_conflict_scanned_total` is unchanged, one a re-check, the denominator the monitor's rate rule reads (faults <= scanned). Served: `/health/invariants.conflictPass` {`scanned`, `evicted`, `faults`, `held`, `faultMemo` {`rows`, `held` (holding now and neither SEEN nor funded), `nextReleaseAt`, `maxConsecutiveFaults`, `bounds`}}. Stated: a lost row (transient table) costs the pot three more faulted draws; a pot held for a reason the couriers will later answer waits up to 24 h for its re-check (its #602 conflict eviction too; the retire pass and the MINED push are unaffected). Pins `--test b_fleet_4_conflict_fault_memo` (the shipped statements under real SQLite: RED with the draw's exclusion removed) and `--lib b_fleet_4` (the loop's memo call and the worker's wiring; RED with the call removed).
@@ -2969,6 +2989,15 @@ answer), and a deferred owed walk's counts are flushed by its actor's isolate, n
 OFF (counters only, the owner's word). Pins: `cargo test --manifest-path workers/Cargo.toml -p low-app-layer
 --lib obs_` (`obs_625_*`, `obs_626_*`, `obs_628_*`, the identity pin in `identity::tests`) and `-p
 bsv-overlay-cloudflare --lib applayer_counters`.
+
+The scheduled drain's courier flush (bsv-low #658) retains its taken batch
+until every D1 result acknowledges success. A deadline during the flush or
+an unacknowledged write merges the batch with any newer increments and makes
+it eligible for the next take, even past the first four flushes. The take
+and write remain inside the drain's one deadline. A remote commit whose
+acknowledgement is lost can be counted twice on retry; an isolate recycle
+still loses its in-memory tail. This affects telemetry only. Pins: `e658`
+and the existing `e649f4_n9` pre-poll expiry pin in the app layer.
 
 ## The hot passes' D1 reads (bsv-low #643, #644, #645, W1.6)
 
