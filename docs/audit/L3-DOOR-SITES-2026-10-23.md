@@ -82,3 +82,40 @@ they stay hand-written, named here for the C2 lens: `bc:392`, `bc:549`, `bc:1169
 - The conflict pass (#602, #825): the competitor's courier `Mined { height }` hint evicts, as before (S9's H).
 - The ghost pot's end (#831) and the retire pass's arms (#765): `pf::retire_verdict`'s arms, unchanged.
 - The non-final word (#836) and the ranks below SEEN (#845): `dw::live_look`, `dw::bound_look`, untouched.
+
+## What this lane landed (three slices, each RED before GREEN)
+
+The adapter (`door_words.rs`): `CourierWord` (`Holds(Hint)`, `Absent`, `Fault`), `courier_hint(source, presence,
+observed)` (a courier's mined claim `HintStatus::Mined { height }`, held unmined `HintStatus::MempoolPresent
+{ source }`, a clean 404 and a fault no input), `courier_of_bool` (the pinned tables' bare yes or no), and the
+host's two-source fold `courier_presence`, pinned equal to the hand-written `classify_presence` (kept verbatim in
+the test) over all 36 pairs of answers. A pin steps a bsv-tracker `State` on the courier hints: a mempool presence
+is `announced` over `built`, a mined claim is never `mined`.
+
+1. The evidence check (S6, S7): `admit_fast::evidence_check`, `verdict_of_look`, `evidence_verdict_of`,
+   `never_refused` read the couriers' hints; `evidence_verdict` stays the tables' bool entrance. Pin
+   `l3_slice1_the_evidence_check_reads_the_couriers_hints`.
+2. The ladder's terminal judgement (S4): `broadcaster::terminal_presence_fresh`. Pin
+   `l3_slice2_the_ladders_terminal_read_folds_the_couriers_hints`.
+3. The retire pass (S9, S12, S13): `retire_evidence` (`RetireEvidence`'s fields are `CourierWord`s),
+   `retire_verdict_of`, `CourierConflictPresence`, `rebroadcast_absent_admitted`; `classify_presence` delegates to
+   the host's fold. Pin `l3_slice3_the_retire_pass_reads_the_couriers_hints`, which also holds that no production
+   fold of the couriers in `proof_fetcher.rs`, `admit_fast.rs` or `broadcaster.rs` calls `classify_presence`.
+
+No recorded answer moved: `door_answer_table`, `arcade_vector_replay`, the #513 / #519 / #602 / #740 / #765 / #831 /
+#836 / #845 pins pass unchanged. One log line's text moves (the retire backlog's `no verdict on the fresh look
+({evidence:?})`: its courier fields print as `CourierWord`s, where they printed `Some(true)` / `Some(false)`).
+
+## Left, with file and line (this tip)
+
+- S2 (ARC) and S3: `broadcaster.rs:392 arc_verdict`, `:549 corroborator_verdict`, `:1169 arcade_status_rank` (the
+  finding above: five recorded answers would move).
+- S2 (Arcade's HTTP 400 body): `broadcaster.rs:1569 classify_submit_response`: no tracker type carries an HTTP code.
+- S4, S6, S9, S12 as the design writes them (an eviction only on `conflicted` / `rejected`, a mined height only from
+  `Headers::check`): each changes an admission or eviction outcome and a D1 row; C2's own lens.
+- S16 to S19: wire or served-state changes (`proof_fetcher.rs:2169`, `arcade_reorg.rs:380`, `reorg_sweep.rs`,
+  `tip_pass.rs:31`).
+- The pin is bsv-tracker `=0.7.0`. 0.8.0 is bsv-rs 0.8.0 and nothing else ("no verdict, no word and no re-ask
+  moves", its CHANGELOG); both workspaces are on bsv-rs `=0.7.2` with the middleware's floor `^0.7.0`, so the move is
+  a repin lane of its own (bsv-rs, the middleware, both locks), not this one. `diff -r` of the two crates' `src/`
+  is empty: every type and rule used here is 0.8.0's.
