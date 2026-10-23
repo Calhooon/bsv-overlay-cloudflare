@@ -254,6 +254,7 @@ ci-route: ci-d1-budget ci-d1-board
 	door_log=/tmp/lane-script-route-$$B-door.log; \
 	door_off_log=/tmp/lane-script-route-$$B-door-off.log; \
 	ef_log=/tmp/lane-nl6c-route-$$B-ef.log; \
+	ef_state=$$(mktemp -d /tmp/lane-nl6c-route-$$B-state.XXXXXX); \
 	job_pids=""; owned_ports=""; \
 	kill_tree() { \
 	  for _c in $$(pgrep -P "$$1" 2>/dev/null); do kill_tree "$$_c"; done; \
@@ -275,6 +276,7 @@ ci-route: ci-d1-budget ci-d1-board
 	  if [ -n "$$_left" ]; then \
 	    echo "⚠ ci-route: could not free$$owned_ports (still held by:$$_left)"; \
 	  fi; \
+	  rm -rf "$$ef_state"; \
 	}; \
 	trap 'cleanup; exit 130' INT TERM; \
 	trap cleanup EXIT; \
@@ -388,7 +390,7 @@ ci-route: ci-d1-budget ci-d1-board
 	job_pids="$$job_pids $$!"; \
 	wait_up $$P9 "$$door_off_log" "script door (kill switch)"; \
 	echo "→ starting wrangler dev :$$P10 (NL-6c, the EF work bound, and NL-6d, the corroboration legs: ARCADE_URL and CORROBORATOR_URL → the fixture on :$$P11, DUAL_BROADCAST=off)…"; \
-	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$P10 --ip 127.0.0.1 \
+	( cd crates/overlay-cloudflare && exec npx wrangler dev --local --port $$P10 --ip 127.0.0.1 --persist-to "$$ef_state" \
 	    --var TOPIC_MANAGERS:tm_collected,tm_potparty \
 	    --var LOOKUP_SERVICES:ls_collected,ls_potparty \
 	    --var SUBMIT_OPERATOR_TOKEN:ci-submit-tok \
@@ -413,9 +415,9 @@ ci-route: ci-d1-budget ci-d1-board
 	  node tools/lane-script/script_refusal_route_ci.mjs http://127.0.0.1:$$P9; \
 	node tools/lane-nl6/submit_any_size_ci.mjs http://127.0.0.1:$$P1; \
 	node tools/lane-058/node_batch_route_ci.mjs http://127.0.0.1:$$P1; \
-	FIXTURE_PORT=$$P11 \
+	FIXTURE_PORT=$$P11 EF_STATE="$$ef_state" EF_LOG="$$ef_log" \
 	  node tools/lane-nl6c/ef_work_bound_ci.mjs http://127.0.0.1:$$P10; \
-	FIXTURE_PORT=$$P11 \
+	FIXTURE_PORT=$$P11 EF_STATE="$$ef_state" EF_LOG="$$ef_log" \
 	  node tools/lane-nl6d/corroboration_legs_ci.mjs http://127.0.0.1:$$P10
 
 # bsv-low #642: the /leaderboard:view rows-read ceilings on local D1. The shipped pipeline runs natively over the
@@ -635,6 +637,7 @@ ci-d1-budget:
 	node tools/lane-e1d/landing_guard_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
 	node tools/lane-e576/dead_letter_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
 	node tools/lane-e555/deferred_graphs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
+	node tools/lane-e585/redrive_verdict_test.mjs; \
 	node tools/lane-e585/beef_blobs_route_ci.mjs http://127.0.0.1:$$PO "$$ov_state"; \
 	node tools/lane-e649/change_park_budget_ci.mjs http://127.0.0.1:$$PO "$$ov_state" http://127.0.0.1:$$PD "$$dv_state" $$PM; \
 	node tools/lane-831/retire_pass_budget_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \

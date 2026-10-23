@@ -37,6 +37,7 @@ import { createHash, randomFillSync } from 'node:crypto'
 import { provedBeefV1, blockCoinbaseInput } from '../fixtures/proven_beef.mjs'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { parkVerdict } from '../lane-e585/redrive_verdict.mjs'
 
 const OVERLAY = process.argv[2] ?? 'http://127.0.0.1:8801'
 const STATE = process.argv[3]
@@ -57,6 +58,12 @@ const expect = (ok, label, why) => {
   lines.push(`FAIL  ${label}`, `      ${why}`)
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+/** A leg waiting for a park (bsv-low #594): a letter still in flight names the local queue, never a FAIL. */
+const expectParked = (ok, label, why, txid) => {
+  if (ok) return lines.push(`PASS  ${label}`)
+  failures++
+  lines.push(`${parkVerdict(letter(txid))}  ${label}`, `      ${why}`)
+}
 
 // ── the lane-499 / E1D raw-tx and BEEF builders ──────────────────────────────
 const varint = (n) => (n < 0xfd ? Buffer.from([n]) : Buffer.from([0xfd, n & 0xff, n >> 8]))
@@ -166,7 +173,7 @@ const sParked = await until('S parked', () => {
   const r = letter(s)
   return r && r.status === 'parked' ? r : null
 })
-expect(!!sParked, `S was dead-lettered after its replays and PARKED (within ${WAIT_MS / 1000} s)`, JSON.stringify(letter(s) ?? 'no row'))
+expectParked(!!sParked, `S was dead-lettered after its replays and PARKED (within ${WAIT_MS / 1000} s)`, JSON.stringify(letter(s) ?? 'no row'), s)
 if (sParked) {
   const hist = JSON.parse(sParked.history)
   expect(
@@ -213,7 +220,7 @@ const reparked = await until('e576a parked again', () => {
   const r = letter('e576a')
   return r && r.status === 'parked' ? r : null
 })
-expect(!!reparked, `a re-driven letter that fails again parks AGAIN on its own row (within ${WAIT_MS / 1000} s)`, JSON.stringify(letter('e576a') ?? 'no row'))
+expectParked(!!reparked, `a re-driven letter that fails again parks AGAIN on its own row (within ${WAIT_MS / 1000} s)`, JSON.stringify(letter('e576a') ?? 'no row'), 'e576a')
 if (reparked) {
   const hist = JSON.parse(reparked.history)
   expect(
@@ -277,7 +284,7 @@ const nbParked = await until('e576n parked again', () => {
   const r = letter('e576n')
   return r && r.status === 'parked' && /invalid base64/.test(r.fault ?? '') ? r : null
 })
-expect(!!nbParked, `a bad-base64 replay is handed back, dead-letters and parks again with its fault (within ${WAIT_MS / 1000} s)`, JSON.stringify({ ...(letter('e576n') ?? {}), message: '…' }))
+expectParked(!!nbParked, `a bad-base64 replay is handed back, dead-letters and parks again with its fault (within ${WAIT_MS / 1000} s)`, JSON.stringify({ ...(letter('e576n') ?? {}), message: '…' }), 'e576n')
 
 // ── bsv-low #576's delta fold (lane E576-f2) ────────────────────────────────
 // 10. D-M1: the ceiling drains by the operator's discard.
