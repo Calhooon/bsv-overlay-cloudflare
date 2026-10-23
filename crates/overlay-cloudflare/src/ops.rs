@@ -418,6 +418,10 @@ pub const COUNTER_ADMIT_FAST_CONFLICT_SCANNED: &str = "admit_fast_conflict_scann
 pub const COUNTER_ADMIT_FAST_CONFLICT_EVICTED: &str = "admit_fast_conflict_evicted_total";
 /// Conflict re-checks that faulted.
 pub const COUNTER_ADMIT_FAST_CONFLICT_FAULTS: &str = "admit_fast_conflict_faults_total";
+/// bsv-low #825 (B-FLEET-4): holds the conflict pass's fault memo armed (a pot past
+/// `admit_fast::CONFLICT_FAULT_MEMO_BOUND` consecutive faulted re-checks, kept out of the draw for
+/// `admit_fast::CONFLICT_FAULT_MEMO_HOLD_MS`; a re-armed hold counts again).
+pub const COUNTER_ADMIT_FAST_CONFLICT_HELD: &str = "admit_fast_conflict_held_total";
 /// bsv-low #831 half 2: retired rows (either store's arm, since the FIX-831-B lens's MEDIUM-1) whose live pot the
 /// retire pass then evicted (`proof_fetcher::end_retired_pot`).
 pub const COUNTER_RETIRE_EVICTED: &str = "retire_evicted_total";
@@ -1686,6 +1690,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_RETIRE_BACKLOG_LEFT,
         COUNTER_RETIRE_EVICT_FAULTS,
         COUNTER_RETIRE_END_DEFERRED,
+        // bsv-low #825: the holds the conflict pass's fault memo armed
+        COUNTER_ADMIT_FAST_CONFLICT_HELD,
         // bsv-low #484: the probe-memo invalidation reads 0 until a reorg (or the TTL) clears one.
         crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_CLEARED,
         crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_EXPIRED,
@@ -1859,6 +1865,38 @@ pub async fn census_json(db: &D1Database) -> serde_json::Value {
     })
 }
 
+/// bsv-low #781, #778 (B-FLEET-4): the app layer's last scheduled pass, one row it writes at the pass's end
+/// (`low-app-layer` `pass_meter::PASS_UPSERT_SQL`). `null` before its first pass; `readable: false` = unreadable.
+pub const APPLAYER_SCHEDULED_PASS_READ_SQL: &str =
+    "SELECT at, started_at, wall_ms, phases, passes FROM applayer_scheduled_pass WHERE id = 1";
+
+async fn applayer_scheduled_pass_view(db: &D1Database) -> serde_json::Value {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        at: f64,
+        started_at: f64,
+        wall_ms: f64,
+        phases: String,
+        passes: f64,
+    }
+    match Query::new(APPLAYER_SCHEDULED_PASS_READ_SQL)
+        .fetch_optional::<Row>(db)
+        .await
+    {
+        Ok(None) => serde_json::Value::Null,
+        Ok(Some(r)) => json!({
+            "readable": true,
+            "at": r.at as i64,
+            "startedAt": r.started_at as i64,
+            "wallMs": r.wall_ms as i64,
+            "phasesMs": serde_json::from_str::<serde_json::Value>(&r.phases)
+                .unwrap_or(serde_json::Value::Null),
+            "passes": r.passes as i64,
+        }),
+        Err(e) => json!({ "readable": false, "fault": e }),
+    }
+}
+
 /// `GET /health/invariants[?strict=1]` — the proof-completion liveness surface.
 ///
 /// Reports the heartbeat (last tick wall-clock + monotonic count), the
@@ -1913,6 +1951,8 @@ pub async fn health_invariants(
         gasp_peer_absent = crate::gasp_fault_memo::peer_absent_24h(db),
         gasp_route_faults = crate::gasp_route::view(db),
         cost_rows = crate::cost_bar::read(db, now),
+        conflict_memo = crate::admit_fast::conflict_fault_memo_health(db, now),
+        applayer_pass = applayer_scheduled_pass_view(db),
     }
 
     let hb: Option<HeartbeatRow> = hb.ok().flatten();
@@ -1984,6 +2024,21 @@ pub async fn health_invariants(
     // bsv-low #668: computed before `counters` is moved into the body; assigned after (the big `json!` is at the
     // macro recursion limit). A UX/observability figure; the money never rests on this push.
     let pots_push = pots_push_view(&counters);
+    // bsv-low #825 (B-FLEET-4): the conflict pass's totals beside its fault memo. `scanned` is the denominator the
+    // monitor's rate rule reads (faults <= scanned by construction: each re-check counts once, its fault at most once).
+    let counter_of = |name: &str| {
+        counters
+            .get(name)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let conflict_pass = json!({
+        "scanned": counter_of(COUNTER_ADMIT_FAST_CONFLICT_SCANNED),
+        "evicted": counter_of(COUNTER_ADMIT_FAST_CONFLICT_EVICTED),
+        "faults": counter_of(COUNTER_ADMIT_FAST_CONFLICT_FAULTS),
+        "held": counter_of(COUNTER_ADMIT_FAST_CONFLICT_HELD),
+        "faultMemo": conflict_memo,
+    });
     let mut body = json!({
         "ok": !dead,
         "service": "low-overlay",
@@ -2067,6 +2122,10 @@ pub async fn health_invariants(
         "gasp": { "deferredGraphs": deferred_graphs },
     });
 
+    body["conflictPass"] = conflict_pass;
+    // bsv-low #781, #778 (B-FLEET-4): the app layer's last scheduled pass, its wall and each phase's wall, as the
+    // app layer wrote them at the pass's end (`low-app-layer` `pass_meter`).
+    body["appLayerScheduledPass"] = applayer_pass;
     body["gaspLastSync"] = gasp_speed["lastSync"].clone();
     body["gaspWalk24h"] = gasp_speed["totals24h"].clone();
     body["gaspWalkByTopicPeer24h"] = gasp_speed["byTopicPeer24h"].clone();
