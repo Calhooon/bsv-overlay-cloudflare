@@ -403,7 +403,7 @@ pub const COUNTER_ADMIT_FAST_EVICT_YIELDED: &str = "admit_fast_evict_yielded_tot
 /// window was left, counted per job. Its pot and hop notes are PARKED in D1 for the cron (`change_park.rs`): a
 /// successful park takes them out of the isolate's sets (`change_parked_total`); a failed park
 /// (`change_park_faults_total`) or a full table (`change_park_full_total`) leaves them in the sets for the
-/// isolate's next flush. The tracker frames it withheld stay in the isolate's memory.
+/// isolate's next flush. The tracker frames it withheld are parked first in the same batch (B-OWED-3-FOLD L1).
 pub const COUNTER_ADMIT_FAST_FLUSH_SKIPPED_NO_WINDOW: &str =
     "admit_fast_flush_skipped_no_window_total";
 /// loop 18, round 2 (NEW-2): a readmission whose restore faulted on a table — the row left OPEN (never a
@@ -1091,6 +1091,43 @@ pub async fn network_seen_latched(db: &D1Database, txid: &str) -> Result<bool, S
         .await
         .map(|row| row.is_some())
         .map_err(|e| e.to_string())
+}
+
+/// bsv-low #660 (B-OWED-3-FOLD M1): the latch's own pair for `txid` (`seenSource`, `sourceAtMs`, #621), one
+/// primary-key read, for the re-note of a latch that beat the engine's mark ([`renote_latched_seen`]).
+pub const NETWORK_SEEN_PAIR_SQL: &str =
+    "SELECT seenSource, sourceAtMs FROM network_seen WHERE txid = lower(?1)";
+
+/// bsv-low #660 (B-OWED-3-FOLD M1): read `txid`'s latched pair ([`NETWORK_SEEN_PAIR_SQL`]) and, when latched with a
+/// source, queue its `seen` frame again (`tracker_events::note_latched_seen`) for the caller's next flush. Called by
+/// the submit route after the engine write of a consuming submit: a latch made before the mark landed was dropped as
+/// unheld at the app layer, and this frame, shipped after the mark, is held. Idempotent at the app layer (the word
+/// stays `seen`). Best effort: a faulted read notes nothing and logs one line.
+pub async fn renote_latched_seen(db: &D1Database, txid: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Pair {
+        #[serde(rename = "seenSource")]
+        seen_source: Option<String>,
+        #[serde(rename = "sourceAtMs")]
+        source_at_ms: Option<f64>,
+    }
+    match Query::new(NETWORK_SEEN_PAIR_SQL)
+        .bind(txid)
+        .fetch_optional::<Pair>(db)
+        .await
+    {
+        Ok(row) => {
+            let pair = row.and_then(|p| Some((p.seen_source?, p.source_at_ms? as i64)));
+            crate::tracker_events::note_latched_seen(
+                txid,
+                pair.as_ref().map(|(s, at)| (s.as_str(), *at)),
+            )
+        }
+        Err(e) => {
+            worker::console_log!("[#660] latched-seen read failed for {txid}: {e}");
+            false
+        }
+    }
 }
 
 /// Latch [`NETWORK_SEEN_INSERT_SQL`] for `txid`. Best-effort: the latch only

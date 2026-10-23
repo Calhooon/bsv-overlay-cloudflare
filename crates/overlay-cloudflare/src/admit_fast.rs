@@ -5248,7 +5248,7 @@ mod tests {
             "a skip starts no POST and parks its notes (bsv-low #649 M1), never left in the isolate's sets alone"
         );
         assert!(
-            within.contains("tracker_events::ship_until(&env,tracker_events,deadline_ms)")
+            within.contains("tracker_events::ship_then(&env,tracker_events,")
                 && !within.contains("tracker_events::ship(&"),
             "the tracker events share the one deadline, not 20 s of their own on top"
         );

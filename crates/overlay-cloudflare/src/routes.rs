@@ -2185,6 +2185,23 @@ async fn submit_parts(
         }
     }
 
+    // bsv-low #660 (B-OWED-3-FOLD M1): a consuming submit (a settle, refund or sweep) whose `seen` was LATCHED before
+    // the engine's mark landed (the dual push and the pending watch run beside the write) had that frame dropped as
+    // unheld at the app layer. The mark has landed now: re-note the latched pair so the request's FIRST flush (the
+    // settle's `total_admitted == 0` flush below, or the dispatch's exit) ships the `seen` before the pot note.
+    // One primary-key read per consuming submit; idempotent at the app layer.
+    if steak
+        .values()
+        .any(|a| !a.coins_to_retain.is_empty() || a.coins_removed.as_ref().is_some_and(|c| !c.is_empty()))
+    {
+        if let (Some(subject), Ok(seen_db)) = (
+            gated_subject.as_deref().or(ungated_subject.as_deref()),
+            env.d1("OVERLAY_DB"),
+        ) {
+            crate::ops::renote_latched_seen(&seen_db, subject).await;
+        }
+    }
+
     // ── S2 QUEUE-DURABLE ADMISSION (ARCHITECTURE v2 principle 1, bsv-low
     // 2026-08-29): AN ACK IS DURABLE. The write-through above is the fast
     // path; the engine now REPORTS every Phase-3 write (or validation read)

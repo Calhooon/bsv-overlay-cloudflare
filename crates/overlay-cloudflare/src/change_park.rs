@@ -28,8 +28,11 @@
 //! `/health/invariants.changeParked`, by set, active and exhausted, each count capped), read from D1, never an
 //! isolate's.
 //!
-//! Stated: the tracker frames (`tracker_events`, telemetry, no money view) withheld by a skip are NOT parked: they
-//! stay in the isolate's memory as before. The lobby set has its own flush and is not drained by this one. The cron's
+//! The tracker frames (`tracker_events`, the spenders' words the owed recompute reads) withheld by a skip are PARKED
+//! too, FIRST in the same batch ([`KIND_WORD`], the frame's JSON as the item; bsv-low #660, B-OWED-3-FOLD, the lens's
+//! L1: until the fold they stayed in the isolate's memory while the notes were parked, so the cron delivered the
+//! notes before the words, the order every flush otherwise keeps), and the drain delivers the word set FIRST, one
+//! frame a POST to `/internal/tx-word` (at most `change_flush::CHANGE_MAX_CHUNKS` a tick, under the drain's wall). The lobby set has its own flush and is not drained by this one. The cron's
 //! delivery runs before the GASP step under its own wall ([`DRAIN_WALL_MS`]) and at most [`DRAIN_MAX_ROWS`] rows
 //! a set a tick; a POST in flight is not raced (as every flush: `change_flush.rs`). A delete that faults after an
 //! accepted POST leaves the row, which is delivered again (over-notification is harmless: the app layer re-reads).
@@ -132,7 +135,9 @@ pub const PARKED_COUNT_SQL: &str = "SELECT \
      (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'pot' AND exhausted = 0 LIMIT ?1)) AS pot, \
      (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'hop' AND exhausted = 0 LIMIT ?1)) AS hop, \
      (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'pot' AND exhausted = 1 LIMIT ?1)) AS pot_exhausted, \
-     (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'hop' AND exhausted = 1 LIMIT ?1)) AS hop_exhausted";
+     (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'hop' AND exhausted = 1 LIMIT ?1)) AS hop_exhausted, \
+     (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'word' AND exhausted = 0 LIMIT ?1)) AS word, \
+     (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'word' AND exhausted = 1 LIMIT ?1)) AS word_exhausted";
 /// N3: where the gauge stops counting (at most four times this many index entries a read).
 pub const HEALTH_COUNT_CAP: i64 = 256;
 
@@ -166,6 +171,8 @@ pub fn refusal_backoff(attempts: i64, now_ms: u64) -> (u64, bool) {
 pub const KIND_POT: &str = "pot";
 /// The hop set's rows (an identity key).
 pub const KIND_HOP: &str = "hop";
+/// The tracker word frames' set (bsv-low #660, B-OWED-3-FOLD L1): the item is the frame's JSON, POSTed as it is.
+pub const KIND_WORD: &str = "word";
 
 /// The most rows of one set the cron delivers a tick (16 POSTs of 8: one flush's bound).
 pub const DRAIN_MAX_ROWS: usize =
@@ -224,12 +231,15 @@ pub(crate) trait ParkPort {
 /// await leaves every note in memory, in D1, or in both (a note in both is delivered twice: harmless, the app
 /// layer re-reads). A park that faults takes nothing out of memory, counted and logged.
 pub(crate) async fn park_withheld<P: ParkPort>(port: &P, remaining_ms: u64, now_ms: u64) {
+    // B-OWED-3-FOLD L1: the word frames first, then the pot and hop notes, one batch
+    let words = crate::tracker_events::snapshot();
     let pots = crate::pot_changes::snapshot();
     let hops = crate::hop_changes::snapshot();
-    let mut rows: Vec<(&'static str, String)> = pots
+    let mut rows: Vec<(&'static str, String)> = words
         .iter()
-        .map(|((t, v), _)| (KIND_POT, pot_item(t, *v)))
+        .map(|(_, frame)| (KIND_WORD, frame.to_string()))
         .collect();
+    rows.extend(pots.iter().map(|((t, v), _)| (KIND_POT, pot_item(t, *v))));
     rows.extend(hops.iter().map(|(h, _)| (KIND_HOP, h.clone())));
     let withheld = rows.len() as u64;
     let (mut parked, mut faulted, mut full) = (0u64, 0u64, 0u64);
@@ -237,21 +247,28 @@ pub(crate) async fn park_withheld<P: ParkPort>(port: &P, remaining_ms: u64, now_
         match port.park(&rows, now_ms).await {
             Ok(landed) => {
                 let landed_at = |i: usize| landed.get(i).copied().unwrap_or(false);
-                let parked_pots: Vec<((String, u32), u64)> = pots
+                let parked_words: Vec<((String, String), serde_json::Value)> = words
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| landed_at(*i))
+                    .map(|(_, w)| w.clone())
+                    .collect();
+                let parked_pots: Vec<((String, u32), u64)> = pots
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| landed_at(words.len() + *i))
                     .map(|(_, p)| p.clone())
                     .collect();
                 let parked_hops: Vec<(String, u64)> = hops
                     .iter()
                     .enumerate()
-                    .filter(|(i, _)| landed_at(pots.len() + *i))
+                    .filter(|(i, _)| landed_at(words.len() + pots.len() + *i))
                     .map(|(_, h)| h.clone())
                     .collect();
+                crate::tracker_events::forget(&parked_words);
                 crate::pot_changes::forget(&parked_pots);
                 crate::hop_changes::forget(&parked_hops);
-                parked = (parked_pots.len() + parked_hops.len()) as u64;
+                parked = (parked_words.len() + parked_pots.len() + parked_hops.len()) as u64;
                 full = withheld - parked;
                 if full > 0 {
                     port.log(format!("[pot-changes] {full} entr(ies) NOT parked: the parked table is full ({CHANGE_PARKED_MAX_ROWS} rows); kept in the isolate's sets"));
@@ -415,7 +432,8 @@ pub(crate) async fn deliver_parked<P: UnparkPort>(port: &P) -> Delivered {
     let mut out = Delivered::default();
     let now_ms = port.now_ms();
     let deadline_ms = now_ms + DRAIN_WALL_MS;
-    for kind in [KIND_HOP, KIND_POT] {
+    // B-OWED-3-FOLD L1: the word frames first (a note triggers the recompute that reads the word)
+    for kind in [KIND_WORD, KIND_HOP, KIND_POT] {
         match port
             .sweep(
                 kind,
@@ -445,7 +463,18 @@ pub(crate) async fn deliver_parked<P: UnparkPort>(port: &P) -> Delivered {
             read.iter().map(|r| (r.item.as_str(), r)).collect();
         out.read += read.len() as u64;
         let items: Vec<String> = read.iter().map(|r| r.item.clone()).collect();
-        let (delivered, mut refused): (Vec<String>, Vec<String>) = if kind == KIND_POT {
+        let (delivered, mut refused): (Vec<String>, Vec<String>) = if kind == KIND_WORD {
+            // one frame a POST (the handler takes one frame), each alone through the retry loop's bound
+            ship_isolating(
+                Vec::new(),
+                items.clone(),
+                |rows: &[String]| rows.first().cloned().unwrap_or_default(),
+                |body| port.post(kind, body),
+                || port.now_ms(),
+                deadline_ms,
+            )
+            .await
+        } else if kind == KIND_POT {
             let pots: Vec<(String, u32)> = items.iter().filter_map(|i| parse_pot_item(i)).collect();
             let unreadable: Vec<String> = items
                 .iter()
@@ -619,6 +648,8 @@ impl UnparkPort for WorkerUnpark<'_> {
     async fn post(&self, kind: &'static str, body: String) -> std::result::Result<usize, ()> {
         let path = if kind == KIND_POT {
             "/internal/pot-changed"
+        } else if kind == KIND_WORD {
+            "/internal/tx-word"
         } else {
             "/internal/hop-changed"
         };
@@ -789,6 +820,8 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
         hop: f64,
         pot_exhausted: f64,
         hop_exhausted: f64,
+        word: f64,
+        word_exhausted: f64,
     }
     match crate::d1::Query::new(PARKED_COUNT_SQL)
         .bind(HEALTH_COUNT_CAP)
@@ -800,6 +833,8 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
             "hop": r.hop as u64,
             "potExhausted": r.pot_exhausted as u64,
             "hopExhausted": r.hop_exhausted as u64,
+            "word": r.word as u64,
+            "wordExhausted": r.word_exhausted as u64,
             "capped": HEALTH_COUNT_CAP,
             "maxRows": CHANGE_PARKED_MAX_ROWS,
             "maxAttempts": CHANGE_PARK_MAX_ATTEMPTS,
@@ -1056,6 +1091,54 @@ mod tests {
             .contains(&(COUNTER_CHANGE_PARK_FAULTS, 1)));
     }
 
+    /// bsv-low #660 (B-OWED-3-FOLD, the lens's L1): a skipped flush parks the WORD frames beside the pot and hop
+    /// notes, first in the batch, takes them out of memory, and the cron's drain POSTs them FIRST, one frame a POST
+    /// to `/internal/tx-word`, so the recompute a parked note triggers reads the word. On b29b684c the frames stayed
+    /// in the isolate's memory and the cron delivered the notes alone (RED with the words left out of the park: the
+    /// rows hold no word frame; with the drain's order put back: the first POST is the hop note's).
+    #[test]
+    fn b_owed_3_l1_a_skip_parks_the_words_and_the_drain_ships_them_first() {
+        crate::tracker_events::drain();
+        let settle = "cd".repeat(32);
+        crate::tracker_events::note(
+            &settle,
+            "seen",
+            Some(crate::tracker_events::seen_body("arcade", 7)),
+        );
+        let frame = crate::tracker_events::snapshot()[0].1.to_string();
+        crate::pot_changes::note(&"ab".repeat(32), 0);
+        crate::hop_changes::note(ID, ID);
+        let port = ModelPark::default();
+        run(park_withheld(&port, 2_000, 1_000));
+        assert_eq!(
+            *port.rows.borrow(),
+            vec![
+                (KIND_WORD.to_string(), frame.clone()),
+                (KIND_POT.to_string(), format!("{}:0", "ab".repeat(32))),
+                (KIND_HOP.to_string(), ID.to_string()),
+            ],
+            "the word frame is parked first, beside the notes"
+        );
+        assert!(
+            crate::tracker_events::drain().is_empty(),
+            "and taken out of the isolate's memory"
+        );
+        assert!(port.counters.borrow().contains(&(COUNTER_CHANGE_PARKED, 3)));
+        let cron = ModelUnpark {
+            rows: RefCell::new(port.rows.borrow().clone()),
+            posts: RefCell::new(Vec::new()),
+            fail_pot_chunk: None,
+            pot_posts: RefCell::new(0),
+            unparked: RefCell::new(0),
+        };
+        let delivered = run(deliver_parked(&cron));
+        let kinds: Vec<String> = cron.posts.borrow().iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(kinds, vec![KIND_WORD, KIND_HOP, KIND_POT], "the words are delivered first");
+        assert_eq!(cron.posts.borrow()[0].1, frame, "the frame is POSTed as it was queued");
+        assert_eq!(delivered.unparked, 3);
+        assert!(cron.rows.borrow().is_empty());
+    }
+
     /// The skip's world with ONE await that never answers: `hang` names it (`park`, or the n-th counter bump).
     struct HangingPark {
         rows: RefCell<Vec<(String, String)>>,
@@ -1147,10 +1230,10 @@ mod tests {
             .expect("the park");
         let ok = body.find("Ok(landed)=>{").expect("the park's Ok arm");
         let forget = body
-            .find("crate::pot_changes::forget(&parked_pots);crate::hop_changes::forget(&parked_hops);")
+            .find("crate::tracker_events::forget(&parked_words);crate::pot_changes::forget(&parked_pots);crate::hop_changes::forget(&parked_hops);")
             .expect("forgotten only once parked");
         assert!(
-            ok < forget && body.matches("forget(").count() == 2,
+            ok < forget && body.matches("forget(").count() == 3,
             "the sets are cleared only in the park's Ok arm, of what it landed"
         );
         let first_bump = body.find("port.bump(").unwrap();
@@ -1778,6 +1861,14 @@ mod tests {
             })
             .unwrap();
         assert_eq!(counts, (2, 1, 0, 0));
+        // B-OWED-3-FOLD L1: the gauge counts the word set too
+        park_sql(&conn, rusqlite::params![KIND_WORD, "{\"txid\":\"aa\"}", 5, MAX]).unwrap();
+        let words: (i64, i64) = conn
+            .query_row(PARKED_COUNT_SQL, rusqlite::params![HEALTH_COUNT_CAP], |r| {
+                Ok((r.get("word")?, r.get("word_exhausted")?))
+            })
+            .unwrap();
+        assert_eq!(words, (1, 0));
         let t = "EF".repeat(32);
         assert_eq!(parse_pot_item(&pot_item(&t, 7)), Some(("ef".repeat(32), 7)));
         assert_eq!(parse_pot_item("zz:1"), None);
