@@ -3526,6 +3526,9 @@ async fn owed_recompute_inner(
     // bsv-low #831: the unspent pots whose funding the hydration found held by nothing (`fundingHeld = 'none'`, read in
     // the same statement); their funding txids join the coin-word read below, so a CHECKED `mined` word still holds it
     let mut funding_unheld: HashSet<String> = HashSet::new();
+    // bsv-low #598: the unspent pots whose funding the SEEN latch alone holds; their funding txids join the same coin-word
+    // read, and a chain-tier refusal of those very bytes (`rejected`, `conflicted`) puts the pot in `funding_unheld`
+    let mut funding_seen: HashSet<String> = HashSet::new();
     for page in party_pages {
         let mut result_rows = Vec::new();
         let mut refund_rows = Vec::new();
@@ -3547,6 +3550,13 @@ async fn owed_recompute_inner(
                         .filter(|t| crate::logic::valid_txid(t))
                     {
                         funding_unheld.insert(t.to_ascii_lowercase());
+                    }
+                } else if row["fundingHeld"] == crate::owed::FUNDING_HELD_SEEN {
+                    if let Some(t) = row["potTxid"]
+                        .as_str()
+                        .filter(|t| crate::logic::valid_txid(t))
+                    {
+                        funding_seen.insert(t.to_ascii_lowercase());
                     }
                 }
                 result_rows.push(
@@ -3622,7 +3632,8 @@ async fn owed_recompute_inner(
                     .flatten()
                     .map(|r| r.spending_txid.as_deref()),
             )
-            .chain(funding_unheld.iter().map(|t| Some(t.as_str()))),
+            .chain(funding_unheld.iter().map(|t| Some(t.as_str())))
+            .chain(funding_seen.iter().map(|t| Some(t.as_str()))),
     );
     let arm_rows = crate::tracker_host::runtime::read_soft(env, &arm_ids)
         .await
@@ -3632,6 +3643,8 @@ async fn owed_recompute_inner(
         None => None,
     };
     if let Some(views) = &arm_views {
+        // bsv-low #598: a latched funding the network refused since is held by nothing (FIX-831's judgement)
+        funding_unheld.extend(crate::owed::refused_fundings(&funding_seen, views));
         for (result_rows, refund_rows) in &mut party_rows {
             crate::owed::apply_word_arm(result_rows, refund_rows, &mut [], views);
         }
@@ -5347,6 +5360,12 @@ async fn owed_recompute_inner(
     // the clock) keeps its previous row, marked `refresh: "withheld"`, never "could not judge"; a faulted read is
     // never withheld and keeps its fault row. One PK read, made only when such a row exists.
     let spenders_withheld = spender_look.withheld();
+    // bsv-low #608 (the B-OWED-2 lens's LOW-1): a spender the pass's own bound withheld is no absence of bytes
+    crate::owed::unmark_withheld_spenders(
+        &mut rows,
+        &spenders_withheld,
+        inputs.pot_spenders_faulted,
+    );
     let withheld_outpoints =
         crate::owed::withheld_hop_outpoints(&inputs, &rows, &spenders_withheld);
     if !withheld_outpoints.is_empty() {
@@ -5510,6 +5529,57 @@ async fn owed_recompute_inner(
             Err(e) => {
                 console_warn!("[owed] #837 shed carry: the previous snapshot read failed: {e}")
             }
+        }
+    }
+
+    // 7c. bsv-low #492: a payout whose HOME OUTPUT the index holds spent (the live credit landed it in the wallet and
+    //     the wallet's own key spent it on) is not a row: no press reads "Collected" over sats already held. One PK
+    //     read per 45 home outputs, none when no payout row names its output; a faulted read retires nothing (the
+    //     rows stand as derived). After the shed carry, so a carried row is judged by the same word. The statement
+    //     arithmetic (the B-OWED-2 lens's LOW-4): ceil(n / 45) statements for n payout rows naming their vout, so 0
+    //     for none, 1 up to 45, 2 from 46 to 90, 3 from 91; the tier's `owed-first-read` cell holds one such read
+    //     against its named `stmts` ceiling (`tools/lane-499/ceilings.json`).
+    let homes = crate::owed::payout_home_outpoints(&rows);
+    if !homes.is_empty() {
+        #[derive(Deserialize)]
+        struct HomeSpentD1 {
+            txid: String,
+            #[serde(rename = "outputIndex")]
+            output_index: f64,
+        }
+        let mut spent: HashSet<String> = HashSet::new();
+        for chunk in homes.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+            let binds: Vec<JsValue> = chunk
+                .iter()
+                .flat_map(|(t, v)| [JsValue::from_str(t), JsValue::from_f64(*v as f64)])
+                .collect();
+            match db
+                .prepare(crate::owed::payout_home_spent_sql(chunk.len()))
+                .bind(&binds)
+            {
+                Ok(stmt) => match stmt
+                    .counted_all()
+                    .await
+                    .and_then(|r| r.results::<HomeSpentD1>())
+                {
+                    Ok(found) => spent.extend(
+                        found
+                            .into_iter()
+                            .map(|r| crate::owed::outpoint_key(&r.txid, r.output_index as u32)),
+                    ),
+                    Err(e) => console_warn!(
+                        "[owed] #492 home spent read failed (the payout rows stand): {e}"
+                    ),
+                },
+                Err(e) => console_warn!("[owed] #492 home spent bind failed: {e}"),
+            }
+        }
+        let retired = crate::owed::retire_index_spent_homes(&mut rows, &spent);
+        if retired > 0 {
+            worker::console_log!(
+                "[owed] recompute {source} {rid} for {}…: {retired} payout row(s) retired, the home output spent in the index",
+                &identity_lc[..12.min(identity_lc.len())]
+            );
         }
     }
 
@@ -5949,6 +6019,102 @@ where
         Either::Left((out, _)) => Some(out),
         Either::Right(((), _)) => None,
     }
+}
+
+/// bsv-low #567: how long a read-aged (or read-stale) `/owed` waits for its OWN recompute before it answers. A walk
+/// that lands inside it (loop 22's census: 0 rows in 244 ms) is the answer; one that does not keeps running in the
+/// `wait_until` exactly as before and the stored snapshot answers (serve then refresh, `owed-changed` after). Far
+/// under the page's 8 s read bound, so a read still never waits on a slow courier for long.
+pub(crate) const OWED_READ_INLINE_WAIT_MS: u64 = 2_000;
+const _: () = assert!(OWED_READ_INLINE_WAIT_MS <= 2_000); // far under the page's 8 s read bound
+
+/// bsv-low #567: a future raced against a timer, KEPT when the timer wins (never dropped, unlike
+/// `owed_with_deadline_on`): `Done` with its output, or `Pending` with the future, polled once already, for the caller
+/// to hand on (`wait_until`).
+pub(crate) enum OwedInlineRace<F: core::future::Future> {
+    Done(F::Output),
+    Pending(core::pin::Pin<Box<F>>),
+}
+
+/// bsv-low #567: the race itself, over any timer (pinned with a virtual clock, `fix567_a`).
+async fn owed_inline_race_on<F, T>(fut: F, timer: T) -> OwedInlineRace<F>
+where
+    F: core::future::Future,
+    T: core::future::Future<Output = ()>,
+{
+    use futures_util::future::Either;
+    let mut fut = Box::pin(fut);
+    futures_util::pin_mut!(timer);
+    let first = match futures_util::future::select(fut.as_mut(), timer).await {
+        Either::Left((out, _)) => Some(out),
+        Either::Right(((), _)) => None,
+    };
+    match first {
+        Some(out) => OwedInlineRace::Done(out),
+        None => OwedInlineRace::Pending(fut),
+    }
+}
+
+/// bsv-low #567: `fut` raced against [`OWED_READ_INLINE_WAIT_MS`] of the worker's clock.
+async fn owed_inline_race<F: core::future::Future>(fut: F) -> OwedInlineRace<F> {
+    owed_inline_race_on(
+        fut,
+        worker::Delay::from(core::time::Duration::from_millis(OWED_READ_INLINE_WAIT_MS)),
+    )
+    .await
+}
+
+thread_local! {
+    /// bsv-low #567: the claims a READ is waiting on (by claim token) and the first snapshot each one's walk landed.
+    /// An entry exists only between the read's `owed_inline_expect` and its `owed_inline_take`, so a walk that lands
+    /// after the read answered leaves nothing behind.
+    static OWED_INLINE_LANDED: std::cell::RefCell<std::collections::HashMap<i64, Option<crate::owed::OwedSnapshot>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+/// bsv-low #567: a read will wait (bounded) for claim `token`'s first landed walk.
+fn owed_inline_expect(token: i64) {
+    OWED_INLINE_LANDED.with(|m| m.borrow_mut().insert(token, None));
+}
+/// bsv-low #567: the claim's walk ended; a read waiting on `token` takes its snapshot when it is one to answer with
+/// ([`owed_inline_snapshot`]). The first such walk only.
+fn owed_inline_offer(token: i64, walked: &Option<std::result::Result<OwedComputed, String>>) {
+    OWED_INLINE_LANDED.with(|m| {
+        if let Some(slot @ None) = m.borrow_mut().get_mut(&token) {
+            *slot = walked
+                .as_ref()
+                .and_then(|w| w.as_ref().ok())
+                .and_then(owed_inline_snapshot);
+        }
+    });
+}
+/// bsv-low #567: the read's answer from its own claim, and the expectation ended.
+fn owed_inline_take(token: i64) -> Option<crate::owed::OwedSnapshot> {
+    OWED_INLINE_LANDED.with(|m| m.borrow_mut().remove(&token).flatten())
+}
+/// PURE (bsv-low #567): what a refreshing read answers: its own landed walk's snapshot when it has one (fresh, at the
+/// present tip: never degraded), else the stored one it read (serve then refresh).
+fn owed_read_answer(
+    inline: Option<crate::owed::OwedSnapshot>,
+    stored: crate::owed::OwedSnapshot,
+) -> (crate::owed::OwedSnapshot, bool) {
+    match inline {
+        Some(fresh) => (fresh, true),
+        None => (stored, false),
+    }
+}
+/// PURE (bsv-low #567): the snapshot a read answers with from its own walk: a walk whose write LANDED whole. A
+/// superseded one (#487: a newer snapshot stands, the stored read serves it) and one cut at its outward budget (a
+/// partial snapshot, its shed rows carried) are not: the stored snapshot answers, as before.
+fn owed_inline_snapshot(c: &OwedComputed) -> Option<crate::owed::OwedSnapshot> {
+    (!c.superseded && !c.budget_cut).then(|| {
+        (
+            c.rows.clone(),
+            c.tip,
+            c.computed_at_ms,
+            c.truncated,
+            c.recompute_seq,
+        )
+    })
 }
 
 /// How a claim's walk went: shed by the ceiling (#499: the CLAIM re-marks the identity and arms its deferred walk
@@ -6520,7 +6686,11 @@ pub(crate) async fn owed_recompute_claimed(
                 return;
             }
             OwedClaimWalk::NoSlice => (crate::owed::OwedWalkEnd::NoSlice, String::new(), None),
-            OwedClaimWalk::Ran { rid, walked } => (owed_walk_end(&walked), rid, walked),
+            OwedClaimWalk::Ran { rid, walked } => {
+                // bsv-low #567: a read waiting on this claim answers with its landed walk
+                owed_inline_offer(token, &walked);
+                (owed_walk_end(&walked), rid, walked)
+            }
         };
         if !owed_refresh_touch(identity_lc, token) {
             // the delta-verify's LOW-4: a takeover DURING this walk owns the rerun map now — this claim must neither
@@ -6981,6 +7151,9 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             let cut = st.truncated.unwrap_or(0.0) != 0.0;
             if crate::owed::should_recompute(stale, age_ms, prev_tip, tip_now, &rows) {
                 let source: &'static str = if stale { "read-stale" } else { "read-aged" };
+                if crate::owed::spender_rejudge_only(stale, age_ms, prev_tip, tip_now, &rows) {
+                    crate::owed::note_spender_rejudge();
+                }
                 match ctx.data.wait.clone() {
                     // SERVE THEN REFRESH (the stranded cell's run 3, 2026-09-19): the rows in hand answer NOW; the
                     // recompute (the walks, the chain rung's couriers, the spenders' bytes) runs after the answer
@@ -6988,6 +7161,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                     // is bounded (8 s) and a pass that outlives it leaves the page with "could not load" and the
                     // door with a refused fallback. One refresh per identity per isolate at a time.
                     Some(wait) => {
+                        let mut inline: Option<crate::owed::OwedSnapshot> = None;
                         if let Some((retry, deferred)) = owed_read_shed(&identity, source) {
                             refresh_retry = Some(retry);
                             let env = ctx.env.clone();
@@ -7016,7 +7190,11 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                                     let id = identity.clone();
                                     let src = source.to_string();
                                     if admitted {
-                                        wait.wait_until(async move {
+                                        // bsv-low #567: the read waits for its own walk, bounded
+                                        // (`OWED_READ_INLINE_WAIT_MS`); a walk that lands inside it is the
+                                        // answer, one that does not runs on in the `wait_until` as before
+                                        owed_inline_expect(token);
+                                        let refresh = async move {
                                             if let Ok(db) = env.d1("OVERLAY_DB") {
                                                 owed_recompute_claimed(
                                                     &env,
@@ -7032,7 +7210,13 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                                             } else {
                                                 owed_refresh_end(&id, token);
                                             }
-                                        });
+                                        };
+                                        if let OwedInlineRace::Pending(rest) =
+                                            owed_inline_race(refresh).await
+                                        {
+                                            wait.wait_until(rest);
+                                        }
+                                        inline = owed_inline_take(token);
                                     } else {
                                         owed_refresh_end(&identity, token);
                                         refresh_retry = Some(
@@ -7068,7 +7252,13 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                                 }
                             }
                         }
-                        (rows, served_tip, st.computed_at_ms as i64, cut, stored_seq)
+                        // bsv-low #567: the read's own walk landed inside its wait: the fresh rows answer
+                        let (answer, fresh) = owed_read_answer(
+                            inline,
+                            (rows, served_tip, st.computed_at_ms as i64, cut, stored_seq),
+                        );
+                        served_snapshot_is_fresh |= fresh;
+                        answer
                     }
                     // no fetch context (a test harness): the inline compute, as before
                     None => {
@@ -11334,6 +11524,143 @@ mod tests {
             }
         }
     }
+    fn fix567_row(n: u8) -> crate::owed::OwedRow {
+        crate::owed::OwedRow {
+            identity: "02".repeat(33),
+            outpoint: format!("{}:0", format!("{n:02x}").repeat(32)),
+            family: crate::owed::OwedFamily::Payout,
+            game_id: format!("{n:02x}").repeat(32),
+            sats: Some(19_800),
+            opponent_identity: None,
+            at_height: Some(900_000),
+            facts: serde_json::json!({"claim": "internalize", "claimable": true}),
+            reason: None,
+        }
+    }
+    fn fix567_computed(rows: usize, budget_cut: bool, superseded: bool) -> OwedComputed {
+        OwedComputed {
+            rows: (0..rows as u8).map(fix567_row).collect(),
+            tip: Some(900_010),
+            computed_at_ms: 1_800_000_000_000,
+            truncated: false,
+            superseded,
+            recompute_seq: Some(9),
+            budget_cut,
+        }
+    }
+
+    /// bsv-low #567 (loop 22's first census after idle: 8 stored rows served while the log said the read's own
+    /// recompute found 0 rows in 244 ms): a refreshing read waits for its OWN walk, bounded by
+    /// `OWED_READ_INLINE_WAIT_MS`. Through the shipped race over a virtual clock: a walk that lands at 244 ms answers its
+    /// 0 rows (fresh), never the stored 8; one still running at the bound is KEPT (handed on, it lands after) and the
+    /// stored 8 answer; a walk cut at its budget or superseded is no answer (the stored rows, as before).
+    #[test]
+    fn fix567_a_read_answers_its_own_recompute_when_it_lands_inside_the_wait() {
+        let stored: crate::owed::OwedSnapshot = (
+            (0..8u8).map(fix567_row).collect(),
+            Some(900_000),
+            1_700_000_000_000,
+            false,
+            Some(8),
+        );
+        let run = |token: i64, walk_ms: i64, computed: OwedComputed| {
+            let clock = std::rc::Rc::new(std::cell::Cell::new(0i64));
+            owed_inline_expect(token);
+            let walk = {
+                let c = clock.clone();
+                async move {
+                    At {
+                        clock: c.clone(),
+                        at: walk_ms,
+                    }
+                    .await;
+                    owed_inline_offer(token, &Some(Ok(computed)));
+                }
+            };
+            let timer = At {
+                clock: clock.clone(),
+                at: OWED_READ_INLINE_WAIT_MS as i64,
+            };
+            let race = owed_inline_race_on(walk, timer);
+            let mut race = std::pin::pin!(race);
+            let waker = futures_util::task::noop_waker();
+            let mut cx = core::task::Context::from_waker(&waker);
+            let outcome = loop {
+                if let core::task::Poll::Ready(o) =
+                    core::future::Future::poll(race.as_mut(), &mut cx)
+                {
+                    break o;
+                }
+                clock.set(clock.get() + 1);
+            };
+            let answered_at = clock.get();
+            let inline = owed_inline_take(token);
+            let kept = match outcome {
+                OwedInlineRace::Done(()) => None,
+                OwedInlineRace::Pending(mut rest) => {
+                    // the walk runs on in the `wait_until`: it lands, and leaves nothing behind for a read
+                    let landed = loop {
+                        if core::future::Future::poll(rest.as_mut(), &mut cx).is_ready() {
+                            break clock.get();
+                        }
+                        clock.set(clock.get() + 1);
+                    };
+                    assert!(
+                        owed_inline_take(token).is_none(),
+                        "nothing left once the read answered"
+                    );
+                    Some(landed)
+                }
+            };
+            (owed_read_answer(inline, stored.clone()), answered_at, kept)
+        };
+        // the 244 ms walk of 0 rows: the answer is ITS 0 rows, fresh, at 244 ms
+        let ((answer, fresh), at, kept) = run(1, 244, fix567_computed(0, false, false));
+        assert_eq!(
+            (answer.0.len(), fresh, at, kept),
+            (0, true, 244, None),
+            "a recompute that finished inside the request answers, never the old snapshot"
+        );
+        assert_eq!((answer.1, answer.4), (Some(900_010), Some(9)));
+        // a walk past the wait: the stored 8 answer at the bound, the walk kept and landed after
+        let ((answer, fresh), at, kept) = run(2, 5_000, fix567_computed(0, false, false));
+        assert_eq!(
+            (answer.0.len(), fresh, at, kept),
+            (8, false, OWED_READ_INLINE_WAIT_MS as i64, Some(5_000))
+        );
+        // cut at its budget, or superseded: no answer from it
+        for (cut, sup) in [(true, false), (false, true)] {
+            let ((answer, fresh), _, _) = run(3, 100, fix567_computed(0, cut, sup));
+            assert_eq!(
+                (answer.0.len(), fresh),
+                (8, false),
+                "cut {cut} superseded {sup}"
+            );
+        }
+    }
+
+    /// bsv-low #567: the refreshing read's wiring, read off the route source: the admitted arm expects its claim,
+    /// races the claimed recompute (`owed_inline_race`), hands a walk still running to the `wait_until` (kept, never
+    /// dropped), takes its landed snapshot and answers through `owed_read_answer`; the claim offers each walk it ran.
+    /// Over the source alone, so it runs on 45b83a32: RED there at "the read expects its own claim".
+    #[test]
+    fn fix567_b_the_refreshing_read_waits_for_its_own_walk_bounded() {
+        let code: String = fix800_code().split_whitespace().collect();
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        for (what, needle) in [
+            ("the read expects its own claim", "owed_inline_expect(token); let refresh = async move {"),
+            (
+                "the race, the rest handed on",
+                "if let OwedInlineRace::Pending(rest) = owed_inline_race(refresh).await { wait.wait_until(rest); } \
+                 inline = owed_inline_take(token);",
+            ),
+            ("the answer", "let (answer, fresh) = owed_read_answer( inline,"),
+            ("the claim offers its walk", "owed_inline_offer(token, &walked);"),
+        ] {
+            assert!(code.contains(&squash(needle)), "{what}: missing from the route");
+        }
+    }
+
     /// Run a walk of `walk_ms` against a timer of `deadline_ms` through the SHIPPED race (`owed_with_deadline_on`),
     /// the clock moved 100 ms a poll: `Some(ended_at)` when the walk landed, `None` when the race dropped it (and the
     /// clock at the drop).
@@ -11854,7 +12181,8 @@ mod tests {
             ),
             (
                 "the chain into the coin-word subjects",
-                ".chain(funding_unheld.iter().map(|t| Some(t.as_str()))), ); \
+                ".chain(funding_unheld.iter().map(|t| Some(t.as_str()))) \
+                 .chain(funding_seen.iter().map(|t| Some(t.as_str()))), ); \
                  let arm_rows = crate::tracker_host::runtime::read_soft(env, &arm_ids)",
             ),
             (
@@ -11880,6 +12208,72 @@ mod tests {
                 .count(),
             2,
             "both OwedInputs call sites carry the set"
+        );
+    }
+
+    /// bsv-low #598 (loop 22, p27/p28): the route's wiring of a REFUSED funding, read off the route source: a hydration
+    /// row whose `fundingHeld` is `seen` (the latch alone, no index proof) puts its pot txid in `funding_seen`, those
+    /// txids join the step 3b coin-word read, and the pots whose funding the rechecked view says the network refused
+    /// (`owed::refused_fundings`) join `funding_unheld` before any judgement. RED with any one of the three removed.
+    #[test]
+    fn fix598_the_route_reads_a_latched_fundings_refusal_into_the_judgement() {
+        let code: String = fix800_code().split_whitespace().collect();
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        for (what, needle) in [
+            (
+                "the seen-only set from the hydration row",
+                "} else if row[\"fundingHeld\"] == crate::owed::FUNDING_HELD_SEEN { if let Some(t) = row[\"potTxid\"] \
+                 .as_str() .filter(|t| crate::logic::valid_txid(t)) { funding_seen.insert(t.to_ascii_lowercase()); } }",
+            ),
+            (
+                "the seen-only fundings chained into the coin-word subjects",
+                ".chain(funding_seen.iter().map(|t| Some(t.as_str()))), ); \
+                 let arm_rows = crate::tracker_host::runtime::read_soft(env, &arm_ids)",
+            ),
+            (
+                "the refused fundings joining the unheld set before the judgement",
+                "if let Some(views) = &arm_views { \
+                 funding_unheld.extend(crate::owed::refused_fundings(&funding_seen, views));",
+            ),
+        ] {
+            assert!(code.contains(&squash(needle)), "{what}: missing from the route");
+        }
+    }
+
+    /// bsv-low #492: the recompute's wiring of the home-spent word, read off the route source: the payout rows' home
+    /// outputs are read AFTER the shed carry and BEFORE the write plan, and the spent ones retire their rows. Over the
+    /// source alone, so it runs on 45b83a32: RED there at "the home outputs of the payout rows".
+    #[test]
+    fn fix492_b_the_recompute_retires_a_payout_by_its_home_outputs_index_word() {
+        let code: String = fix800_code().split_whitespace().collect();
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let at = |needle: &str, what: &str| {
+            code.find(&squash(needle))
+                .unwrap_or_else(|| panic!("{what}: missing from the route"))
+        };
+        let homes = at(
+            "let homes = crate::owed::payout_home_outpoints(&rows);",
+            "the home outputs of the payout rows",
+        );
+        let retire = at(
+            "let retired = crate::owed::retire_index_spent_homes(&mut rows, &spent);",
+            "the retirement",
+        );
+        let carry = at(
+            "let shed = crate::owed::carry_shed_rows(&inputs, &mut rows, &prev);",
+            "the shed carry",
+        );
+        let plan = at(
+            "let plan = crate::owed::owed_write_plan(identity_lc, &rows, now_ms, tip, walk_cut);",
+            "the write plan",
+        );
+        assert!(
+            carry < homes && homes < retire && retire < plan,
+            "after the carry, before the write"
+        );
+        at(
+            ".prepare(crate::owed::payout_home_spent_sql(chunk.len()))",
+            "the shipped statement",
         );
     }
 
