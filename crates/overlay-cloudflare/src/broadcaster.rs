@@ -6668,6 +6668,120 @@ mod tests {
         assert!(read.contains("Err(_) => return false,"));
     }
 
+    /// B-DOOR-3 fold (the lens's L4, its M1 row and L2): the probe arm's WHOLE answer is `probe_answer` over Arcade's
+    /// real `GET /tx` body, and the arm takes it through `take_probe`, which marks the probe a stored Reached echo
+    /// (the duplicate flag, so the fast mode counts it `fast-echo`, never a fresh accept).
+    #[test]
+    fn bdoor3_l4_the_probe_answer_is_the_arms_decision() {
+        let now = crate::proof_fetcher::rfc3339_utc_ms("2026-10-23T02:00:00Z").unwrap();
+        let evicted = now - 600_000;
+        let body = |txid: &str, status: &str, stamp: Option<&str>| -> ArcadeStatusResponse {
+            let stamp = stamp.map(|s| format!(r#","timestamp":"{s}""#)).unwrap_or_default();
+            serde_json::from_str(&format!(r#"{{"txid":"{txid}","txStatus":"{status}"{stamp}}}"#)).unwrap()
+        };
+        let stored = Err(STORED_ECHO_UNDER_EVICTION.to_string());
+        let pending = Ok(ArcOutcome::AcceptedPending("subject".into()));
+        let seen = |stamp| body("subject", "SEEN_ON_NETWORK", stamp);
+        // a stored SEEN before the eviction: the stored echo's 502
+        assert_eq!(probe_answer(Some(&seen(Some("2026-10-23T01:40:00Z"))), "subject", now, Some(evicted)), Some(stored.clone()));
+        // after it, inside the bound: pending
+        assert_eq!(probe_answer(Some(&seen(Some("2026-10-23T01:55:00Z"))), "subject", now, Some(evicted)), Some(pending.clone()));
+        // the lens's M1 row: after the eviction but past the 30 minute bound is the 502 too
+        let early = now - 3_600_000;
+        assert_eq!(probe_answer(Some(&seen(Some("2026-10-23T01:20:00Z"))), "subject", now, Some(early)), Some(stored.clone()));
+        // no eviction, no stamp: pending; a MINED word: pending; the subject in upper case: its own
+        assert_eq!(probe_answer(Some(&seen(None)), "subject", now, None), Some(pending.clone()));
+        assert_eq!(probe_answer(Some(&body("subject", "MINED", None)), "subject", now, None), Some(pending.clone()));
+        assert_eq!(probe_answer(Some(&body("SUBJECT", "SEEN_ON_NETWORK", None)), "subject", now, None), Some(pending));
+        // another txid's echo, a word below SEEN, no probe: not the probe's arm
+        assert_eq!(probe_answer(Some(&body("other", "SEEN_ON_NETWORK", None)), "subject", now, None), None);
+        assert_eq!(probe_answer(Some(&body("subject", "RECEIVED", None)), "subject", now, None), None);
+        assert_eq!(probe_answer(None, "subject", now, None), None);
+
+        // L2: the arm's own step marks the duplicate, in both answers, and nothing when it is not the probe's arm
+        for (fast, counter) in [
+            (true, crate::ops::COUNTER_SUBMIT_FAST_ADMITTED_ECHO),
+            (false, crate::ops::COUNTER_SUBMIT_PENDING_ADMITTED),
+        ] {
+            let b = ArcadeBroadcaster::new("").with_fast_answer(fast);
+            assert_eq!(b.take_probe(Some(&seen(None)), "subject", now), Some(Ok(ArcOutcome::AcceptedPending("subject".into()))));
+            assert!(b.duplicate_echo(), "the probe is a stored Reached echo");
+            assert!(!b.duplicate_echo_unconfirmed(), "no corroboration ran: #637's shape untouched");
+            assert_eq!(crate::ops::pending_admission_counter(fast, b.duplicate_echo()), counter);
+        }
+        let b = ArcadeBroadcaster::new("").with_evicted_at_ms(Some(evicted));
+        assert_eq!(b.take_probe(Some(&seen(None)), "subject", now), Some(stored));
+        assert!(b.duplicate_echo());
+        let b = ArcadeBroadcaster::new("");
+        assert_eq!(b.take_probe(Some(&body("subject", "RECEIVED", None)), "subject", now), None);
+        assert!(!b.duplicate_echo());
+        assert_ne!(pending_admission_words(false, true), pending_admission_words(false, false));
+
+        // the shipped arm returns the step's answer and decides nothing of its own
+        let src = include_str!("broadcaster.rs");
+        let gated = &src[src.find("pub async fn broadcast_efs_gated<Y>(").unwrap()..];
+        let arm = &gated[gated.find("let mut probe = self.tx_status(subject_txid).await;").unwrap()
+            ..gated.find("// TERMINAL AT ARCADE").unwrap()];
+        assert!(arm.contains("self.take_probe(probe.as_ref(), subject_txid, worker::Date::now().as_millis() as i64)"));
+        assert!(arm.contains("return answer;"));
+        assert!(!arm.contains("probe_seen("), "the arm decides through `probe_answer` alone");
+        assert!(!arm.contains("ArcOutcome::"), "the arm builds no answer of its own");
+    }
+
+    /// B-DOOR-3 fold (the lens's L3): only the SUBJECT's own Reached echo is the duplicate #637 reads. The two-leg
+    /// shape: the full-batch rung registers an ancestor whose echo is SEEN, the subject's is not: no duplicate, so
+    /// no inconclusive corroboration after it is a standing duplicate's claim.
+    #[test]
+    fn bdoor3_l3_only_the_subjects_own_echo_marks_the_duplicate() {
+        let b = ArcadeBroadcaster::new("");
+        b.begin_request("subject");
+        b.note_reached_echo("ancestor");
+        assert!(!b.duplicate_echo(), "an ancestor leg's stored SEEN is not the subject's");
+        assert!(!b.duplicate_echo_unconfirmed());
+        b.note_reached_echo("SUBJECT");
+        assert!(b.duplicate_echo(), "the subject's own echo, any letter case");
+        let src = include_str!("broadcaster.rs");
+        let submit = &src[src.find("async fn submit_once_and_gate(").unwrap()..];
+        let submit = &submit[..submit.find("async fn submit_ef(").unwrap()];
+        assert!(submit.contains("self.note_reached_echo(subject_txid);"));
+        assert!(!submit.contains("self.duplicate_echo.set(true)"), "the flag is set through the subject's check alone");
+        let gated = &src[src.find("pub async fn broadcast_efs_gated<Y>(").unwrap()..];
+        let head = &gated[..gated.find("let mut probe = self.tx_status(subject_txid).await;").unwrap()];
+        assert!(head.contains("self.begin_request(subject_txid);"));
+    }
+
+    /// B-DOOR-3 fold (the lens's L4): the #637 transform is `standing_duplicate_answer` over real `ArcOutcome`
+    /// values, and the route calls it.
+    #[test]
+    fn bdoor3_l4_the_standing_duplicate_answer_is_the_routes_decision() {
+        let shape = DuplicateShape { duplicate_unconfirmed: true, fast_answer: false, open_eviction: false };
+        let refused: Result<ArcOutcome, String> = Err("inconclusive".into());
+        assert!(shape.asks_the_index(&refused));
+        assert_eq!(
+            standing_duplicate_answer(refused.clone(), "subject", shape, true),
+            Ok(ArcOutcome::AcceptedPending("subject".into()))
+        );
+        assert_eq!(standing_duplicate_answer(refused.clone(), "subject", shape, false), refused, "not standing");
+        for other in [
+            DuplicateShape { open_eviction: true, ..shape },
+            DuplicateShape { fast_answer: true, ..shape },
+            DuplicateShape { duplicate_unconfirmed: false, ..shape },
+        ] {
+            assert!(!other.asks_the_index(&refused));
+            assert_eq!(standing_duplicate_answer(refused.clone(), "subject", other, true), refused);
+        }
+        for stood in [Ok(ArcOutcome::Rejected("conflict".into())), Ok(ArcOutcome::AcceptedPending("subject".into()))] {
+            assert!(!shape.asks_the_index(&stood));
+            assert_eq!(standing_duplicate_answer(stood.clone(), "subject", shape, true), stood);
+        }
+        let route = include_str!("routes.rs");
+        let arm = &route[route.find("let duplicate_echo = arcade.duplicate_echo();").unwrap()
+            ..route.find("corroborate_ms = arcade.corroborate_ms();").unwrap()];
+        assert!(arm.contains("if shape.asks_the_index(&arcade_outcome) {"));
+        assert!(arm.contains("crate::broadcaster::standing_duplicate_answer(arcade_outcome, &subject_txid, shape, standing)"));
+        assert!(!arm.contains("ArcOutcome::AcceptedPending("), "the route builds no answer of its own");
+    }
+
     #[test]
     fn ns2_m2_reached_echo_decision() {
         assert_eq!(reached_submit_echo(false), GateStep::Accepted);

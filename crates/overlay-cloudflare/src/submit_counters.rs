@@ -243,6 +243,22 @@ mod tests {
         }
     }
 
+    /// B-DOOR-3 fold (the lens's M1 (b)): the stored echo's 502 under an OPEN eviction (#612's POST echo and #636's
+    /// probe, the probe's 30 minute arm included) is its own reason, never the generic broadcast fault.
+    #[test]
+    fn bdoor3_m1_the_stored_echo_under_eviction_is_its_own_reason() {
+        assert_eq!(
+            Reason::broadcast(crate::broadcaster::STORED_ECHO_UNDER_EVICTION),
+            Reason::StoredEchoUnderEviction
+        );
+        assert!(all_names()
+            .contains(&"submit_answer_reason_stored_echo_under_eviction_total".to_string()));
+        assert_eq!(
+            Reason::broadcast("provider timeout"),
+            Reason::BroadcastFault
+        );
+    }
+
     #[test]
     fn submit_612_reason_is_named_without_provider_detail() {
         let message = "Arcade claims abcd accepted but the corroborating broadcaster could not confirm it; arbitrary provider detail";
