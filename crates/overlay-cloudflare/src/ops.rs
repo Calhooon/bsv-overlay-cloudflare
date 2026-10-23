@@ -1504,7 +1504,8 @@ async fn count_flagged(db: &D1Database, cutoff_ms: i64) -> u64 {
     row.map(|r| r.c.max(0.0) as u64).unwrap_or(0)
 }
 
-/// The three change webhooks' flush accounts (bsv-low #436): each set's five counters are seeded 0.
+/// The three change webhooks' flush accounts (bsv-low #436): each set's six counters are seeded 0 (the sixth,
+/// `*_outboxed_total`, since bsv-low #560).
 pub const CHANGE_FLUSH_SETS: [&crate::change_flush::FlushCounters; 3] = [
     &crate::pot_changes::COUNTERS,
     &crate::hop_changes::COUNTERS,
@@ -1672,6 +1673,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         crate::change_park::COUNTER_CHANGE_PARK_SWEPT,
         crate::change_park::COUNTER_CHANGE_PARK_DRAIN_TICK,
         crate::change_park::COUNTER_CHANGE_PARK_DRAIN_COMPLETE_PROOFS,
+        // bsv-low #560 (B-COST-1): a flush's note-backs past its outbox batch bound
+        crate::change_park::COUNTER_CHANGE_OUTBOX_OVER_BOUND,
         COUNTER_ADMIT_FAST_READMIT_INCOMPLETE,
         COUNTER_ADMIT_FAST_CONFLICT_SCANNED,
         COUNTER_ADMIT_FAST_CONFLICT_EVICTED,
@@ -1716,7 +1719,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         }
     }
     for set in CHANGE_FLUSH_SETS {
-        for name in [set.undelivered, set.retry_failed, set.deferred, set.retried, set.resent] {
+        for name in [set.undelivered, set.retry_failed, set.deferred, set.retried, set.resent, set.outboxed] {
             obj[name] = json!(0);
         }
     }
@@ -2821,6 +2824,7 @@ mod tests {
                     s.deferred,
                     s.retried,
                     s.resent,
+                    s.outboxed,
                 ]
             })
             .collect();
@@ -2832,16 +2836,19 @@ mod tests {
                 "pot_changed_deferred_total",
                 "pot_changed_retried_total",
                 "pot_changed_resent_total",
+                "pot_changed_outboxed_total",
                 "hop_changed_undelivered_total",
                 "hop_changed_retry_failed_total",
                 "hop_changed_deferred_total",
                 "hop_changed_retried_total",
                 "hop_changed_resent_total",
+                "hop_changed_outboxed_total",
                 "lobby_changed_undelivered_total",
                 "lobby_changed_retry_failed_total",
                 "lobby_changed_deferred_total",
                 "lobby_changed_retried_total",
                 "lobby_changed_resent_total",
+                "lobby_changed_outboxed_total",
             ]
         );
         // the read seeds every one at 0 and derives the figure after the rows (source)
@@ -2849,7 +2856,7 @@ mod tests {
         let src = include_str!("ops.rs");
         let start = src.find("async fn read_counters(").expect("read_counters");
         let body = squash(&src[start..start + src[start..].find("\n}\n").expect("its end")]);
-        assert!(body.contains(&squash("for set in CHANGE_FLUSH_SETS { for name in [set.undelivered, set.retry_failed, set.deferred, set.retried, set.resent] { obj[name] = json!(0); } }")));
+        assert!(body.contains(&squash("for set in CHANGE_FLUSH_SETS { for name in [set.undelivered, set.retry_failed, set.deferred, set.retried, set.resent, set.outboxed] { obj[name] = json!(0); } }")));
         let rows_at = body.find(&squash("for r in rows {")).expect("the rows");
         let derive_at = body
             .find(&squash(

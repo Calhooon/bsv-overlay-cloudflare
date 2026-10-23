@@ -56,8 +56,28 @@
 //! that was), and the per-isolate memory of note-backs is bounded ([`RETRY_MEMORY_MAX`],
 //! [`DEFER_MEMORY_MAX`]): past it a failed or deferred entry is not noted back, it is let go and counted
 //! undelivered at once. The cost of every one of these is the receiver's own cadence (the owed list's
-//! read-aged recompute, the Lobby's next event), never money. Making the note-back durable needs a store of
-//! its own (a D1 outbox: a migration, a write per flush and a drain); it is filed as its own issue.
+//! read-aged recompute, the Lobby's next event), never money.
+//!
+//! THE OUTBOX (bsv-low #560, B-COST-1). Every NEW note-back ([`settle_noting`]'s `fresh`: a failed POST's entries
+//! and the entries past the bound) is also PARKED in D1 (`change_parked`, under the set's kind, by
+//! `change_park::park_noted_back`, the table #649's skip parks into), counted `*_outboxed_total`; the cron's drain
+//! (`change_park::deliver_parked`, the `*/15` tick and `/admin/complete-proofs`) delivers it, backs it off on a
+//! refusal and counts it exhausted after its last attempt (`change_park_exhausted_total`). The in-memory
+//! note-back stays the FAST path and the figures above still describe it; the outbox is the DURABLE one, so an
+//! entry the memory lets go (an isolate's end, a retry that failed too, and since the lens's LOW-3 an entry the FULL
+//! memory could not hold, [`RETRY_MEMORY_MAX`] / [`DEFER_MEMORY_MAX`], parked first under the same bound and still
+//! counted undelivered by the memory's account) is still a row. An entry REFUSED by the receiver (`dropped` in its
+//! answer) is not a note-back and is not parked. One that did not reach the
+//! outbox is counted where it missed: `change_park_full_total` (the table's ceiling), `change_park_faults_total`
+//! (the batch faulted), `change_outbox_over_bound_total` (past a flush's batch bound). The flush's account
+//! ([`account`], the five counters above) is written BEFORE the park's batch (the lens's LOW-2: a cancellation
+//! during the batch keeps the counters the flush wrote before the outbox existed). Left, stated: the park follows
+//! the account, so a task the runtime cancels after its last POST and before the park lands keeps that flush's new
+//! note-backs in memory only, uncounted by the outbox (the wall budget leaves
+//! 10 s of the 30 s window for it, less a POST in flight); and an entry drained and in flight when the task ends is
+//! the pre-existing loss of a POST in flight (above). Delivery is now proven by the outbox's own figures:
+//! `/health/invariants.changeParked` (rows waiting, by set) and the counters `change_unparked_total` (delivered),
+//! `change_park_exhausted_total` (abandoned).
 use std::collections::BTreeSet;
 use std::future::Future;
 
@@ -147,20 +167,34 @@ pub fn settle_failed<T: Ord + Clone>(
     delivered: &[T],
     failed: Vec<T>,
 ) -> (Vec<T>, usize) {
+    let (again, lost, let_go) = settle_failed_splitting(retried, delivered, failed);
+    (again, lost + let_go.len())
+}
+
+/// [`settle_failed`], answering apart the FIRST failures the full memory could not hold (`let_go`: never noted back,
+/// so never parked by an earlier flush; the lens's LOW-3 parks them). Returns `(note back, lost on the retry, let go)`.
+fn settle_failed_splitting<T: Ord + Clone>(
+    retried: &mut BTreeSet<T>,
+    delivered: &[T],
+    failed: Vec<T>,
+) -> (Vec<T>, usize, Vec<T>) {
     for d in delivered {
         retried.remove(d);
     }
     let mut again = Vec::new();
     let mut lost = 0usize;
+    let mut let_go = Vec::new();
     for f in failed {
-        if retried.remove(&f) || retried.len() >= RETRY_MEMORY_MAX {
+        if retried.remove(&f) {
             lost += 1;
+        } else if retried.len() >= RETRY_MEMORY_MAX {
+            let_go.push(f);
         } else {
             retried.insert(f.clone());
             again.push(f);
         }
     }
-    (again, lost)
+    (again, lost, let_go)
 }
 
 /// One isolate's memory of the entries of one set it noted back and has not POSTed again since: the entries
@@ -216,6 +250,17 @@ pub struct Tally {
 /// counted `resent`, so the note-backs made (`retried`, `deferred`: counted ONCE each, an entry deferred again
 /// while it waits is not a new note-back) and the note-backs re-sent meet when nothing was lost with an isolate.
 pub fn settle<T: Ord + Clone>(memory: &mut NotedBack<T>, shipped: &Shipped<T>) -> (Vec<T>, Tally) {
+    let (back, _, tally) = settle_splitting(memory, shipped);
+    (back, tally)
+}
+
+/// [`settle`], answering also the entries the FULL memory let go (a first failure past [`RETRY_MEMORY_MAX`], a
+/// deferral past [`DEFER_MEMORY_MAX`]): counted `undelivered` as before, and handed to the outbox by
+/// [`settle_noting`] (the lens's LOW-3). Returns `(note back, let go, account)`.
+fn settle_splitting<T: Ord + Clone>(
+    memory: &mut NotedBack<T>,
+    shipped: &Shipped<T>,
+) -> (Vec<T>, Vec<T>, Tally) {
     let mut resent = 0usize;
     for posted in shipped.delivered.iter().chain(&shipped.failed) {
         if memory.deferred.remove(posted) || memory.retried.contains(posted) {
@@ -227,13 +272,13 @@ pub fn settle<T: Ord + Clone>(memory: &mut NotedBack<T>, shipped: &Shipped<T>) -
         .iter()
         .filter(|f| memory.retried.contains(*f))
         .count();
-    let (mut back, lost) = settle_failed(
+    let (mut back, lost, mut let_go) = settle_failed_splitting(
         &mut memory.retried,
         &shipped.delivered,
         shipped.failed.clone(),
     );
     let retried = back.len();
-    let (mut deferred, mut let_go) = (0usize, 0usize);
+    let mut deferred = 0usize;
     for d in &shipped.deferred {
         if memory.retried.contains(d) || memory.deferred.contains(d) {
             back.push(d.clone()); // still waiting: the same note-back, not a new one
@@ -242,19 +287,46 @@ pub fn settle<T: Ord + Clone>(memory: &mut NotedBack<T>, shipped: &Shipped<T>) -
             deferred += 1;
             back.push(d.clone());
         } else {
-            let_go += 1;
+            let_go.push(d.clone());
         }
     }
+    let undelivered = shipped.refused + lost + let_go.len();
     (
         back,
+        let_go,
         Tally {
-            undelivered: shipped.refused + lost + let_go,
+            undelivered,
             retry_failed,
             retried,
             deferred,
             resent,
         },
     )
+}
+
+/// PURE (bsv-low #560, B-COST-1): [`settle`], answering also the flush's NEW note-backs (`fresh`: entries noted back
+/// by this flush that no earlier flush of this isolate had noted back), the entries the flush parks in its D1 outbox
+/// (`change_park::park_noted_back`). An entry still waiting from an earlier flush was parked by that flush. The
+/// lens's LOW-3: an entry the FULL memory let go (a first failure past [`RETRY_MEMORY_MAX`], a deferral past
+/// [`DEFER_MEMORY_MAX`]) is fresh too, and FIRST, so the outbox's bound ([`crate::change_park::OUTBOX_PARK_MAX`])
+/// takes those that have no memory to fall back on before those that do. Returns `(note back, fresh, account)`.
+pub fn settle_noting<T: Ord + Clone>(
+    memory: &mut NotedBack<T>,
+    shipped: &Shipped<T>,
+) -> (Vec<T>, Vec<T>, Tally) {
+    let held: BTreeSet<T> = shipped
+        .failed
+        .iter()
+        .chain(&shipped.deferred)
+        .filter(|e| memory.retried.contains(*e) || memory.deferred.contains(*e))
+        .cloned()
+        .collect();
+    let (back, let_go, tally) = settle_splitting(memory, shipped);
+    let fresh = let_go
+        .into_iter()
+        .chain(back.iter().filter(|e| !held.contains(*e)).cloned())
+        .collect();
+    (back, fresh, tally)
 }
 
 /// PURE: the note-backs never re-sent, from the three counters' totals (`/health/invariants` serves it per set
@@ -365,6 +437,8 @@ pub struct FlushCounters {
     pub resent: &'static str,
     /// Derived on the read, never written: `retried + deferred - resent`.
     pub noted_back_unresent: &'static str,
+    /// bsv-low #560: new note-backs parked in the D1 outbox (`change_parked`, this set's kind).
+    pub outboxed: &'static str,
 }
 
 /// The flush's account, after the POSTs: one log line and the counters, only when something did not go through.
@@ -690,6 +764,51 @@ mod tests {
             0,
             "floored: the counters are bumped one statement at a time"
         );
+    }
+
+    /// bsv-low #560 (B-COST-1), the lens's LOW-3: an entry the FULL note-back memory lets go (a first failure past
+    /// [`RETRY_MEMORY_MAX`], a deferral past [`DEFER_MEMORY_MAX`]) is a NEW note-back for the outbox, handed to it
+    /// FIRST (it has no memory to fall back on), and still counted undelivered by the memory's account; a second
+    /// failure (parked by the flush that noted it back) and a refusal are not. RED with the let-go entries kept out
+    /// of `fresh` (the fold's base): `left: []`.
+    #[test]
+    fn b_cost_1_560f_l3_an_entry_the_full_memory_lets_go_is_parked_first() {
+        let shipped = |failed: Vec<u32>, deferred: Vec<u32>| Shipped {
+            posts: 1,
+            delivered: vec![],
+            refused: 2,
+            failed,
+            deferred,
+        };
+        // both memories full: the failed chunk and the deferred tail are let go, and every one is fresh
+        let mut full: NotedBack<u32> = NotedBack::new();
+        full.retried = (1_000_000..1_000_000 + RETRY_MEMORY_MAX as u32).collect();
+        full.deferred = (2_000_000..2_000_000 + DEFER_MEMORY_MAX as u32).collect();
+        let (back, fresh, t) = settle_noting(&mut full, &shipped(vec![1, 2], vec![3]));
+        assert!(back.is_empty(), "the memory holds none of them");
+        assert_eq!(
+            fresh,
+            vec![1, 2, 3],
+            "every let-go entry goes to the outbox"
+        );
+        assert_eq!(
+            t,
+            Tally {
+                undelivered: 2 + 3,
+                ..Tally::default()
+            },
+            "the memory's account is unchanged: let go, counted undelivered"
+        );
+        // a second failure is lost from memory and NOT fresh (its first failure was parked by that flush)
+        let (_, fresh, t) = settle_noting(&mut full, &shipped(vec![1_000_000], vec![]));
+        assert!(fresh.is_empty());
+        assert_eq!((t.undelivered, t.retry_failed), (2 + 1, 1));
+        // room in the memory: a let-go deferral comes BEFORE the memory's own new note-backs
+        let mut half: NotedBack<u32> = NotedBack::new();
+        half.deferred = (2_000_000..2_000_000 + DEFER_MEMORY_MAX as u32).collect();
+        let (back, fresh, _) = settle_noting(&mut half, &shipped(vec![7, 8], vec![9]));
+        assert_eq!(back, vec![7, 8]);
+        assert_eq!(fresh, vec![9, 7, 8], "the entry with no memory first");
     }
 
     /// Lens L4, THE WORST CASE FLUSH MEASURED: 128 pot outpoints (and three more) in one flush. Sixteen

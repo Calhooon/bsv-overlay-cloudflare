@@ -146,6 +146,29 @@ pub const DLQ_RETRY_DELAY_S: u32 = 300;
 pub const DLQ_BACKOFF_BASE_S: u32 = 60;
 /// The longest backoff of a failed park, in seconds.
 pub const DLQ_BACKOFF_CAP_S: u32 = 1800;
+/// bsv-low #581 (B-COST-1; the E576 delta-4 lens's D4-L1): the delay a "not now" letter HELD BACK (at its class's
+/// bounds or at the whole ceiling) is handed back with: the platform's longest per-message delay (Cloudflare Queues
+/// limits: "Per-message delay: 12 hours", 43,200 s). Until #581 it took [`dlq_retry_plan`]'s 60 s doubling to 30
+/// min, so each held-back letter was delivered up to 101 times on the ONE consumer ([`DLQ_MAX_RETRIES`],
+/// `max_concurrency = 1`), and a stranger's flood of them multiplied the consumer's work by 101 while honest fault
+/// letters waited in the same queue, toward its retention.
+pub const NOT_NOW_DEFER_DELAY_S: u32 = 43_200;
+const _: () = assert!(
+    NOT_NOW_DEFER_DELAY_S <= 43_200,
+    "Cloudflare Queues limits: per-message delay 12 hours"
+);
+/// bsv-low #581: the DLQ deliveries a held-back "not now" letter gets: the first and four more, 12 h apart, so the
+/// 48 h #576 gave it to find room is kept (its per-day bound frees in 24 h) in 5 deliveries where it took 101. The
+/// last of them gives it up: LOST, counted `dead_letters_lost_not_now_total`, its R2 object deleted, ACKED (never
+/// handed back to the platform's own last delivery).
+pub const NOT_NOW_DEFER_DELIVERIES: u32 = 5;
+/// The default retention of a queue's messages (four days; set at `wrangler queues create`, not in a config): the
+/// held-back window must end inside it, or the platform drops the letter with no LOST line.
+pub const QUEUE_RETENTION_S: u32 = 345_600;
+const _: () = assert!(
+    NOT_NOW_DEFER_DELAY_S * (NOT_NOW_DEFER_DELIVERIES - 1) < QUEUE_RETENTION_S,
+    "a held-back not-now letter is given up, counted, inside the queue's retention"
+);
 
 /// Migration: the dead letters. Times are unix ms; `topics` is the sorted, comma-joined topic set; `history` is a
 /// JSON array with one entry per park (`parkedAt`, `fault`, `attempts`, `redrive`, `kind`).
@@ -398,6 +421,23 @@ pub fn dlq_retry_plan(attempts: Option<u32>) -> DlqRetry {
     DlqRetry {
         delay_s,
         last: a > DLQ_MAX_RETRIES,
+    }
+}
+
+/// PURE (bsv-low #581, B-COST-1): the retry of one DLQ delivery that did not park. A "not now" letter HELD BACK
+/// (`deferred`: at its class's bounds or at the whole ceiling, [`lost_deletes_object`]'s deferral) is handed back for
+/// [`NOT_NOW_DEFER_DELAY_S`] and given up at its [`NOT_NOW_DEFER_DELIVERIES`]th delivery (`last`); anything else (a
+/// fault letter at the ceiling, a park that faulted, a count that cannot be read) takes [`dlq_retry_plan`], as before.
+/// So the one consumer's work per held-back not-now letter is at most 5 deliveries over 48 h (it was 101 over the
+/// same 48 h), and a fault letter is never behind more than that per not-now letter in the queue.
+#[must_use]
+pub fn deferral_plan(class: LetterClass, deferred: bool, attempts: Option<u32>) -> DlqRetry {
+    match attempts.filter(|a| *a >= 1) {
+        Some(a) if deferred && class == LetterClass::NotNow => DlqRetry {
+            delay_s: NOT_NOW_DEFER_DELAY_S,
+            last: a >= NOT_NOW_DEFER_DELIVERIES,
+        },
+        _ => dlq_retry_plan(attempts),
     }
 }
 
@@ -1230,6 +1270,10 @@ pub fn classes_json(fault_held: u64, not_now_held: u64, not_now_day: u64) -> ser
             "perDay": NOT_NOW_PER_DAY,
             "parkedLast24h": not_now_day,
             "dayFull": not_now_day >= NOT_NOW_PER_DAY,
+            // bsv-low #581: a held-back letter's DLQ deliveries and their spacing; past them it is LOST (counted
+            // `dead_letters_lost_not_now_total`)
+            "heldBackDeliveries": NOT_NOW_DEFER_DELIVERIES,
+            "heldBackDelaySecs": NOT_NOW_DEFER_DELAY_S,
         },
     })
 }
@@ -1385,11 +1429,12 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
             }
             Err(e) => e,
         };
-        let plan = dlq_retry_plan(attempts);
+        // bsv-low #581: a held-back "not now" letter on its own plan (12 h apart, given up at its 5th delivery)
+        let plan = deferral_plan(class, deferred, attempts);
         if plan.last {
             let h = bsv_rs::primitives::hash::sha256(letter.message.as_bytes());
             worker::console_log!(
-                "[dead-letters] LOST {txid} [{topics}] sha256={} class={} after {} DLQ deliveries ({fault}): the platform drops it now and its bytes are NOT in D1",
+                "[dead-letters] LOST {txid} [{topics}] sha256={} class={} after {} DLQ deliveries ({fault}): given up now and its bytes are NOT in D1",
                 hex::encode(h),
                 class.as_str(),
                 attempts.unwrap_or(0)
@@ -1412,6 +1457,17 @@ pub async fn park_batch(batch: &worker::worker_sys::MessageBatch, env: &Env) -> 
                 } else {
                     worker::console_log!("[dead-letters] LOST {txid} [{topics}]: its BEEF ({bytes} B) is the R2 object {key}, LEFT to the orphan sweep (the park faulted and may have landed)");
                 }
+            }
+            // bsv-low #581: a held-back "not now" letter given up BEFORE the platform's own last delivery is acked
+            // (handed back it would be delivered again); at the platform's last the retry is its drop, as before.
+            // The lens's NOTE-2: the ack names the class it is for, so a fault letter is never acked here whatever
+            // `deferral_plan` answers
+            if deferred
+                && class == LetterClass::NotNow
+                && attempts.is_some_and(|a| a <= DLQ_MAX_RETRIES)
+            {
+                let _ = m.ack();
+                continue;
             }
         } else {
             worker::console_log!(
@@ -2473,8 +2529,21 @@ mod tests {
         let src = include_str!("dead_letters.rs");
         let start = src.find("pub async fn park_batch(").unwrap();
         let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
-        let fault_path = &body[body.find("let plan = dlq_retry_plan(attempts);").unwrap()..];
-        assert!(!fault_path.contains(".ack("), "the fault path never acks");
+        let fault_path = &body[body
+            .find("let plan = deferral_plan(class, deferred, attempts);")
+            .unwrap()..];
+        // bsv-low #581: the one ack of the fault path is a held-back not-now letter given up before the platform's
+        // own last delivery (`deferral_plan`), after its LOST line and count; the lens's NOTE-2: gated on the class
+        // condition itself (a deferral of a `not_now` letter), never on the count alone
+        let give_up = fault_path
+            .find("if deferred\n                && class == LetterClass::NotNow\n                && attempts.is_some_and(|a| a <= DLQ_MAX_RETRIES)\n            {\n                let _ = m.ack();")
+            .expect("the early give-up acks");
+        assert_eq!(
+            fault_path.matches(".ack(").count(),
+            1,
+            "the fault path acks only the give-up"
+        );
+        assert!(fault_path[..give_up].contains("bump_counter(db, class.lost_counter(), 1)"));
         assert!(
             fault_path.contains("[dead-letters] LOST")
                 && fault_path.contains("bump_counter(db, class.lost_counter(), 1)")
@@ -2482,8 +2551,8 @@ mod tests {
         assert!(fault_path.contains("retry_after(&m, plan.delay_s)"));
         assert_eq!(
             body.matches("m.ack()").count(),
-            3,
-            "parked, a copy kept, a redelivery: each after its park answered"
+            4,
+            "parked, a copy kept, a redelivery: each after its park answered; and #581's give-up"
         );
         let ceiling = &body[body.find("Ok(Parked::Ceiling(held)) => {").unwrap()
             ..body.find("Err(e) => e,").unwrap()];
@@ -4074,7 +4143,9 @@ mod tests {
         let body = &src[src.find("pub async fn park_batch(").unwrap()..];
         let body = &body[..body.find("\n}\n").unwrap()];
         assert!(body.contains("let mut class = LetterClass::Fault;"));
-        let fault_path = &body[body.find("let plan = dlq_retry_plan(attempts);").unwrap()..];
+        let fault_path = &body[body
+            .find("let plan = deferral_plan(class, deferred, attempts);")
+            .unwrap()..];
         assert!(
             fault_path.contains("sha256={} class={}") && fault_path.contains("class.as_str(),")
         );
@@ -4431,5 +4502,107 @@ mod tests {
             Some(beef_limits::QUEUE_BEEF_LIMITS.max_bytes as u64)
         );
         assert!(r2_json(None, false, 1)["bytes"].is_null());
+    }
+
+    /// bsv-low #581 (B-COST-1; the E576 delta-4 lens's D4-L1): A HELD-BACK "NOT NOW" LETTER COSTS THE ONE CONSUMER
+    /// AT MOST FIVE DELIVERIES, over the 48 h #576 gave it, and is given up COUNTED inside the queue's retention. The
+    /// shipped plan run delivery by delivery as the platform would: a letter held back at every delivery. On
+    /// `4d533a24` every deferral took `dlq_retry_plan` (60 s doubling to 30 min): 101 deliveries, so a flood of N such
+    /// letters was 101 N deliveries ahead of an honest fault letter on the single consumer. RED with the not-now arm
+    /// of `deferral_plan` removed: `left: 101, right: 5`.
+    #[test]
+    fn b_cost_1_581_a_held_back_not_now_letter_costs_five_deliveries_and_is_counted_lost() {
+        // the platform's view: deliveries until the plan says last, and the time they span
+        let walk = |class: LetterClass, deferred: bool| -> (u32, u64) {
+            let (mut deliveries, mut waited) = (0u32, 0u64);
+            for a in 1..=DLQ_MAX_RETRIES + 1 {
+                deliveries = a;
+                let plan = deferral_plan(class, deferred, Some(a));
+                if plan.last {
+                    break;
+                }
+                waited += u64::from(plan.delay_s);
+            }
+            (deliveries, waited)
+        };
+        let (n, waited) = walk(LetterClass::NotNow, true);
+        assert_eq!(
+            n, NOT_NOW_DEFER_DELIVERIES,
+            "a held-back not-now letter is delivered at most five times"
+        );
+        assert_eq!(n, 5);
+        assert_eq!(
+            waited,
+            48 * 3_600,
+            "the 48 h #576 gave it to find room are kept"
+        );
+        assert!(
+            waited < u64::from(QUEUE_RETENTION_S),
+            "given up, counted, inside the queue's retention"
+        );
+        // a FAULT letter keeps every delivery the platform allows (it is the letter the queue exists to save)
+        let (fault_n, fault_waited) = walk(LetterClass::Fault, true);
+        assert_eq!(fault_n, DLQ_MAX_RETRIES + 1);
+        assert!(fault_waited >= 48 * 3_600);
+        // a not-now letter whose PARK FAULTED (not held back) keeps the fault plan: D1 down is not its class's bound
+        assert_eq!(walk(LetterClass::NotNow, false).0, DLQ_MAX_RETRIES + 1);
+        // an unreadable count: the configured delay, never called last (as before)
+        assert_eq!(
+            deferral_plan(LetterClass::NotNow, true, None),
+            dlq_retry_plan(None)
+        );
+        // the consumer's load: a flood of N held-back letters is at most 5 N deliveries (it was 101 N)
+        let flood = 10_000u64;
+        let base_load: u64 = flood * u64::from(DLQ_MAX_RETRIES + 1);
+        let load: u64 = flood * u64::from(n);
+        println!(
+            "a flood of {flood} held-back not-now letters: {load} DLQ deliveries (was {base_load})"
+        );
+        assert!(load * 20 <= base_load);
+        // the health block names the bound
+        let j = classes_json(0, 0, 0);
+        assert_eq!(j["notNow"]["heldBackDeliveries"], 5);
+        assert_eq!(j["notNow"]["heldBackDelaySecs"], 43_200);
+    }
+
+    /// bsv-low #581, SOURCE (the consumer runs only in wasm): `park_batch` takes `deferral_plan` over the park's
+    /// own outcome and class, and a letter given up before the platform's last delivery is counted LOST by class,
+    /// its R2 object deleted under the deferral, then ACKED (never handed back); every other give-up is the
+    /// platform's own last delivery, as before. RED on `4d533a24` (`dlq_retry_plan(attempts)` for every outcome).
+    #[test]
+    fn b_cost_1_581_the_consumer_gives_a_held_back_letter_up_counted_and_acked() {
+        let src = include_str!("dead_letters.rs");
+        let f = &src[src.find("pub async fn park_batch(").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        let deferred = f
+            .find("let deferred = lost_deletes_object(&outcome);")
+            .unwrap();
+        let plan = f
+            .find("let plan = deferral_plan(class, deferred, attempts);")
+            .unwrap();
+        assert!(deferred < plan);
+        assert!(
+            !f.contains("dlq_retry_plan("),
+            "every outcome goes through deferral_plan"
+        );
+        let lost = f[plan..].find("if plan.last {").unwrap() + plan;
+        let count = f[lost..]
+            .find("bump_counter(db, class.lost_counter(), 1)")
+            .unwrap()
+            + lost;
+        let delete = f[lost..].find("\"its dead letter is LOST\"").unwrap() + lost;
+        let ack = f[lost..]
+            .find("if deferred\n                && class == LetterClass::NotNow\n                && attempts.is_some_and(|a| a <= DLQ_MAX_RETRIES)\n            {\n                let _ = m.ack();\n                continue;")
+            .unwrap()
+            + lost;
+        assert!(
+            count < ack && delete < ack,
+            "counted and its object deleted, then acked"
+        );
+        let ops = include_str!("ops.rs");
+        assert!(
+            ops.contains("        COUNTER_DEAD_LETTERS_LOST_NOT_NOW,\n"),
+            "served from 0"
+        );
     }
 }
