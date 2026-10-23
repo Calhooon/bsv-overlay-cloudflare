@@ -10339,7 +10339,11 @@ pub(crate) mod tests {
             .iter()
             .any(|n| n == COUNTER_SPENDER_REJUDGE));
         // the route's wiring
-        let routes: String = include_str!("routes.rs").split_whitespace().collect();
+        // rustfmt wraps the call and leaves a trailing comma before `)`: the match reads `,)` as `)`
+        let routes: String = include_str!("routes.rs")
+            .split_whitespace()
+            .collect::<String>()
+            .replace(",)", ")");
         for needle in [
             "crate::owed::unmark_withheld_spenders(&mut rows, &spenders_withheld, inputs.pot_spenders_faulted); let withheld_outpoints =",
             "if crate::owed::spender_rejudge_only(stale, age_ms, prev_tip, tip_now, &rows) { crate::owed::note_spender_rejudge(); }",
