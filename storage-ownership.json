@@ -1033,7 +1033,9 @@
      "INSERT"
     ]
    },
-   "readers": [],
+   "readers": [
+    "low-app-layer (bsv-low #777, #778: the chain-event intake's own rows, `tracker_chain_events_*`, for /health.chainEvents and the pass witness)"
+   ],
    "rebuild_class": "transient",
    "never_wipe": false,
    "holds": "named counters (the app layer bumps its own rows)",
@@ -1632,6 +1634,17 @@
    "never_wipe": false,
    "holds": "bounded deploy proof backfill cursor",
    "why": "Deleting restarts a bounded proof-only pass; no authority"
+  },
+  {
+   "name": "overlay_chain_events",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "re-askable",
+   "never_wipe": false,
+   "holds": "the overlay's own cursor on chaintracks' typed chain-event feed, one versioned row: the event in hand, the recorded stop, the released windows (bsv-low #620)",
+   "why": "Deleting stops the overlay's reorg feed until it is re-seeded from CHAIN_EVENTS_START_CURSOR (unset: it reads nothing, and Arcade's orphan listing is the input again) or set by the operator's lever (POST /internal/chain-events-cursor on the overlay); a seed below the journal's head re-judges each selecting event's rows by their own proofs, which demotes nothing that still stands; no authority"
   },
   {
    "name": "tracker_chain_events",

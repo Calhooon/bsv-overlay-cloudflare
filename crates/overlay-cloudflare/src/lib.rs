@@ -20,6 +20,7 @@ pub mod arcade_reorg;
 pub mod ban_storage;
 pub mod beef_blob_sweep;
 pub mod broadcaster;
+pub mod chain_feed;
 pub mod chain_tracker;
 pub mod concurrent;
 pub mod change_flush;
@@ -504,6 +505,11 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
                 Some(&ops_db),
             )
             .await
+        }
+        // bsv-low #620: the chain-event feed's cursor row, read (GET) or set (POST {"cursor": "<decimal>"}) by the
+        // operator (bearer INTERNAL_TOKEN, 401 before any read).
+        (Method::Get | Method::Post, "/internal/chain-events-cursor") => {
+            crate::chain_feed::internal_cursor(req, &env, Some(&ops_db)).await
         }
         // bsv-low #576: the operator's bounded re-drive of the parked dead letters (bearer INTERNAL_TOKEN).
         (Method::Post, "/internal/redrive-dead-letters") => {

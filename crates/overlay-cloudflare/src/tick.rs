@@ -580,17 +580,37 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // block-event pass is its fast path; this is the drought fallback and
     // the initial catch-up), BEFORE the confirmation chaser so a row it
     // demotes is re-chased in this same tick. Bounded on its own budget.
+    // bsv-low #620 (L4): chaintracks' typed chain-event feed is the reorg word (`chain_feed`, its own durable cursor;
+    // the reorg family's D1 label), run first; Arcade's orphan listing is an input only where the feed is not live
+    // on this deployment (no row and no start cursor, or its row did not read): `POST /internal/arcade-reorg` still
+    // runs a pass on demand, and its counters and `/health/invariants.arcadeReorg` stay.
     crate::d1_ledger::label("arcade_reorg");
-    let _arcade = crate::tip_pass::run_arcade_reorg_pass(
+    let mut reorg_memo = crate::reorg_sweep::RootMemo::default();
+    let feed = crate::chain_feed::run_chain_feed_pass(
         env,
         pot_storage.as_ref(),
-        Some(&ops_db),
+        &ops_db,
         "cron",
         crate::arcade_reorg::PassLimits::cron(),
-        &mut crate::reorg_sweep::RootMemo::default(),
-        false,
+        &mut reorg_memo,
     )
     .await;
+    if feed.is_reorg_word() {
+        worker::console_log!(
+            "[arcade-reorg] (cron) not an input: the chain-event feed is the reorg word (bsv-low #620)"
+        );
+    } else {
+        let _arcade = crate::tip_pass::run_arcade_reorg_pass(
+            env,
+            pot_storage.as_ref(),
+            Some(&ops_db),
+            "cron",
+            crate::arcade_reorg::PassLimits::cron(),
+            &mut reorg_memo,
+            false,
+        )
+        .await;
+    }
     crate::d1_ledger::label("pot_maintenance");
     let spend_fetcher = courier_fetcher(env, lookup_service_chain_tracker(env)).with_budget(20)
         .with_courier_counters(courier_counts.clone());

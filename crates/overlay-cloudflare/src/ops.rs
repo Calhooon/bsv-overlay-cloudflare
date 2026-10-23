@@ -1606,6 +1606,16 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
     // unknown, never as fine) — added here rather than in the literal above,
     // which is at serde_json's `json!` recursion limit.
     for name in [
+        // bsv-low #620: the chain-event feed, served from 0
+        "overlay_chain_events_pass_total",
+        "overlay_chain_events_total",
+        "overlay_chain_events_applied_total",
+        "overlay_chain_events_released_total",
+        "overlay_chain_events_reanchored_total",
+        "overlay_chain_events_demoted_total",
+        "overlay_chain_events_faults_total",
+        "overlay_chain_events_unreadable_total",
+        "overlay_chain_events_unconfigured_total",
         COUNTER_DEAD_LETTERS_PARKED,
         COUNTER_DEAD_LETTERS_REDRIVEN,
         COUNTER_DEAD_LETTERS_STILL_FAILING,
@@ -1953,6 +1963,7 @@ pub async fn health_invariants(
         cost_rows = crate::cost_bar::read(db, now),
         conflict_memo = crate::admit_fast::conflict_fault_memo_health(db, now),
         applayer_pass = applayer_scheduled_pass_view(db),
+        chain_feed = crate::chain_feed::health_json(db),
     }
 
     let hb: Option<HeartbeatRow> = hb.ok().flatten();
@@ -2126,6 +2137,8 @@ pub async fn health_invariants(
     // bsv-low #781, #778 (B-FLEET-4): the app layer's last scheduled pass, its wall and each phase's wall, as the
     // app layer wrote them at the pass's end (`low-app-layer` `pass_meter`).
     body["appLayerScheduledPass"] = applayer_pass;
+    // bsv-low #620 (L4): the chain-event feed's cursor row (the overlay's reorg word), beside D7's `arcadeReorg`.
+    body["chainFeed"] = chain_feed;
     body["gaspLastSync"] = gasp_speed["lastSync"].clone();
     body["gaspWalk24h"] = gasp_speed["totals24h"].clone();
     body["gaspWalkByTopicPeer24h"] = gasp_speed["byTopicPeer24h"].clone();
@@ -2233,6 +2246,7 @@ mod tests {
             "crate::gasp_fault_memo::health(db)",
             "crate::gasp_fault_memo::peer_absent_24h(db)",
             "crate::gasp_route::view(db)",
+            "crate::chain_feed::health_json(db)",
             "NETWORK_SEEN_TOTAL_SQL",
             "RETIRED_UNPROVABLE_TOTAL_SQL",
             "TX_RETIRED_TOTAL_SQL",
