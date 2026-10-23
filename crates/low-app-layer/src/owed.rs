@@ -3279,7 +3279,11 @@ fn story_reason(
             facts["spendKind"] = json!("spent-elsewhere");
             SPENT_ELSEWHERE_REASON
         }
-        None => unknown,
+        None => {
+            // bsv-low #608: a story that rests on no spender bytes is re-judged on the next read past a minute
+            facts[OWED_FACT_SPENDER_UNREAD] = json!(true);
+            unknown
+        }
     }
 }
 
@@ -3888,6 +3892,7 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     .filter(|s| !pointer_refuted(i, s, h))
                     .and_then(|s| spender_story(i, s, &game));
                 let reason = if i.pot_spenders_faulted {
+                    facts[OWED_FACT_SPENDER_UNREAD] = json!(true);
                     "could not check the hop's spender against the index this pass (a read faulted)"
                 } else {
                     story_reason(
@@ -4540,6 +4545,16 @@ pub fn row_is_open(r: &OwedRow) -> bool {
         || r.facts[crate::hops_view::OWED_FACT_REORG_GRACE_WORD] == Value::Bool(true)
 }
 
+/// bsv-low #608: the fact a row carries when its "could not judge" sentence rests on NO spender bytes (the spender is
+/// named, its bytes were not read this pass, or the pot-spenders read faulted): the bytes may arrive between passes
+/// (#606 made a courier's mempool body and the chain rung's verified raw readable), so such a row is re-judged on
+/// the next read once [`OWED_SPENDER_REJUDGE_AFTER_MS`] has passed, never waiting for the open list's 5 minutes.
+pub const OWED_FACT_SPENDER_UNREAD: &str = "spenderUnread";
+/// bsv-low #608: the bound of that re-judgement: at most one recompute a minute per identity on its reads (and inside
+/// the identity's #499 ceiling), so a dead courier never makes every read recompute.
+pub const OWED_SPENDER_REJUDGE_AFTER_MS: i64 = 60_000;
+const _: () = assert!(OWED_SPENDER_REJUDGE_AFTER_MS < OWED_RECOMPUTE_OPEN_AFTER_MS);
+
 /// The read's rule (N5, the ONE predicate): recompute when the marker says stale; when the tip advanced past an
 /// in-progress row's recovery height since the compute; when an open list is older than 5 minutes; when any list is
 /// older than 15 minutes (an empty list must not stay "nothing owed" forever; a stranded hop crosses its window with
@@ -4567,6 +4582,13 @@ pub fn should_recompute(
         _ => false,
     };
     if gate_flipped {
+        return true;
+    }
+    // bsv-low #608: a "could not judge the spender" row whose bytes were not read is asked again past a minute
+    let spender_unread = rows
+        .iter()
+        .any(|r| r.facts[OWED_FACT_SPENDER_UNREAD] == Value::Bool(true));
+    if spender_unread && age_ms > OWED_SPENDER_REJUDGE_AFTER_MS {
         return true;
     }
     let has_open = rows.iter().any(row_is_open);
@@ -9839,6 +9861,63 @@ pub(crate) mod tests {
             .as_deref()
             .unwrap()
             .contains("could not check"));
+    }
+
+    /// bsv-low #608 (the E606 lens's deferred (a)): a "could not judge the spender" row whose story rests on NO spender
+    /// bytes is re-judged on the NEXT read once a minute has passed (#606 made the bytes readable between passes), not
+    /// only when the open list ages out at 5 minutes; a row whose bytes WERE read (a positive story) keeps the 5-minute
+    /// rule, and inside the minute nothing recomputes (a dead courier never makes every read recompute). Written over
+    /// the shipped API alone, so it runs on 45b83a32: RED there at "a could-not-judge row with no bytes is re-judged
+    /// on the next read past a minute".
+    #[test]
+    fn fix608_a_could_not_judge_row_resting_on_no_spender_bytes_is_rejudged_on_the_next_read() {
+        let (v, c) = (HashMap::new(), HashSet::new());
+        let pots: HashSet<String> = HashSet::new();
+        let elsewhere = [hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000))];
+        let unread = derive_owed_rows(&inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000)));
+        assert_eq!(unread.len(), 1);
+        assert!(unread[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("could not judge"));
+        let at = |age_ms: i64, rows: &[OwedRow]| {
+            should_recompute(false, age_ms, Some(900_000), Some(900_000), rows)
+        };
+        assert!(
+            !at(59_000, &unread),
+            "inside the minute a read serves the snapshot (the bound)"
+        );
+        assert!(
+            at(61_000, &unread),
+            "a could-not-judge row with no bytes is re-judged on the next read past a minute"
+        );
+        // a faulted pot-spenders read is the same mark
+        let mut i = inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000));
+        i.pot_spenders_faulted = true;
+        assert!(
+            at(61_000, &derive_owed_rows(&i)),
+            "a faulted read is re-judged too"
+        );
+        // the spender's BYTES read (they pay no home of mine): a positive story, the open list's 5-minute rule alone
+        let outs = pays(&tx(0x09), &[(0, "ab", 1_000, None)]);
+        let mut j = inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000));
+        j.spender_outputs = &outs;
+        let judged = derive_owed_rows(&j);
+        assert!(
+            !judged[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("could not judge"),
+            "the bytes tell a story: {:?}",
+            judged[0].reason
+        );
+        assert!(
+            !at(61_000, &judged),
+            "a story with its bytes waits for the 5-minute rule"
+        );
+        assert!(at(6 * 60_000, &judged));
     }
 
     #[test]
