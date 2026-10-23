@@ -105,6 +105,39 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     assert_prepares(&conn, "POTREFUND_FILE_SQL", POTREFUND_FILE_SQL);
     assert_prepares(&conn, "RESULT_FILE_SQL", RESULT_FILE_SQL);
     assert_prepares(&conn, "COLLECTED_FILE_SQL", COLLECTED_FILE_SQL);
+    // bsv-low #848 (FAST-C): the handfile's own statements and its hopparty row's.
+    for (name, sql) in [
+        (
+            "HANDFILE_BATCH_FILE_SQL",
+            low_app_layer::handfile::HANDFILE_BATCH_FILE_SQL,
+        ),
+        (
+            "HANDFILE_ROW_FILE_SQL",
+            low_app_layer::handfile::HANDFILE_ROW_FILE_SQL,
+        ),
+        (
+            "HOPPARTY_HANDFILE_FILE_SQL",
+            low_app_layer::handfile::HOPPARTY_HANDFILE_FILE_SQL,
+        ),
+        (
+            "HOPPARTY_FILED_ROWS_SQL",
+            low_app_layer::handfile::HOPPARTY_FILED_ROWS_SQL,
+        ),
+        (
+            "HOPPARTY_FILED_TODAY_SQL",
+            low_app_layer::handfile::HOPPARTY_FILED_TODAY_SQL,
+        ),
+        (
+            "HOPPARTY_CHAIN_ROWS_SQL",
+            low_app_layer::handfile::HOPPARTY_CHAIN_ROWS_SQL,
+        ),
+        (
+            "HANDFILE_BATCH_FOR_ROW_SQL",
+            low_app_layer::handfile::HANDFILE_BATCH_FOR_ROW_SQL,
+        ),
+    ] {
+        assert_prepares(&conn, name, sql);
+    }
     // bsv-low #469: the owed list's statements (the gate's MEDIUM-12)
     assert_prepares(
         &conn,

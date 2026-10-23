@@ -349,9 +349,6 @@ pub fn verify_handfile(
     body: &HandfileBody,
     poster_lc: &str,
 ) -> std::result::Result<VerifiedHandfile, RecordRefusal> {
-    if !body.payloads.is_empty() {
-        todo!("FAST-C: the handfile door is not built yet (RED-first)");
-    }
     let hop_txid_lc = body.hop_txid.trim().to_ascii_lowercase();
     let hop_txid = hex32(&hop_txid_lc).ok_or(RecordRefusal::HandfileShape)?;
     if body.payloads.len() != HANDFILE_PAYLOADS {
@@ -498,9 +495,6 @@ pub struct HopFacts {
 /// The facts of output `hop_vout` of transaction `hop_txid` inside the stored BEEF, or `None` when the bytes do
 /// not read, do not carry that transaction, or it has no such output.
 pub fn hop_facts_of_beef(beef: &[u8], hop_txid: &str, hop_vout: u32) -> Option<HopFacts> {
-    if !beef.is_empty() {
-        todo!("FAST-C: the hop's container facts are not read yet (RED-first)");
-    }
     let parsed = overlay_engine::beef_limits::parse_beef(
         beef,
         &overlay_engine::beef_limits::APP_BEEF_LIMITS,
@@ -561,63 +555,17 @@ pub const HANDFILE_BATCH_FOR_ROW_SQL: &str =
 
 const _: () = assert!(HANDFILE_MARKER_VOUT_BASE == 2_147_483_648);
 
-/// The served `batch` of an exploded row (the one wire delta): the client verifies the row's inclusion at `index`
-/// and the two signatures over the recomputed digest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HandfileBatchRef {
-    pub key: String,
-    pub hop_txid: String,
-    pub payloads_hex: Vec<String>,
-    pub identity_sig_hex: String,
-    pub settle_sig_hex: String,
-    pub index: u32,
-}
-
-impl HandfileBatchRef {
-    /// `{key, hopTxid, payloads, sigs: {identity, settle}, index}`.
-    pub fn json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "key": self.key,
-            "hopTxid": self.hop_txid,
-            "payloads": self.payloads_hex,
-            "sigs": { "identity": self.identity_sig_hex, "settle": self.settle_sig_hex },
-            "index": self.index,
-        })
-    }
-    /// A stored batch row's `payloadsHex` (a JSON array of four hex strings) and the row's place, as the reader
-    /// decodes them; `None` when the stored column does not read (never a wrong batch).
-    pub fn of_stored(
-        key: &str,
-        hop_txid: &str,
-        payloads_json: &str,
-        identity_sig_hex: &str,
-        settle_sig_hex: &str,
-        index: u32,
-    ) -> Option<Self> {
-        let payloads: Vec<String> = serde_json::from_str(payloads_json).ok()?;
-        if payloads.len() != HANDFILE_PAYLOADS {
-            return None;
-        }
-        Some(Self {
-            key: key.to_string(),
-            hop_txid: hop_txid.to_string(),
-            payloads_hex: payloads,
-            identity_sig_hex: identity_sig_hex.to_string(),
-            settle_sig_hex: settle_sig_hex.to_string(),
-            index,
-        })
-    }
-}
+/// The served `batch` of an exploded row (the one wire delta): one type and one JSON for every reader, the
+/// discovery crate's (`overlay_discovery::handfile::HandfileBatch`), so the overlay's lookup services and the app
+/// layer's views serve the same bytes.
+pub use overlay_discovery::handfile::HandfileBatch as HandfileBatchRef;
 
 /// The stored form of the payloads column: a JSON array of the four hex strings.
 pub fn payloads_column(payloads_hex: &[String; HANDFILE_PAYLOADS]) -> String {
     serde_json::json!(payloads_hex).to_string()
 }
 
-/// Is this row key a door-filed one (a `filed:` content key)?
-pub fn is_filed_key(txid: &str) -> bool {
-    txid.starts_with("filed:")
-}
+pub use overlay_discovery::handfile::is_filed_key;
 
 // ── the route ──────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -991,6 +939,49 @@ pub async fn batch_for_row(
         .ok()
         .flatten()
         .and_then(HandfileBatchRowD1::into_ref)
+}
+
+/// The batches one view read asks for at most: one statement per exploded row, never per chain row.
+pub const HANDFILE_BATCH_READS_PER_VIEW: usize = 16;
+
+/// `/hops-view`: attach the batch of each handfile marker (a handfile vout), at most
+/// [`HANDFILE_BATCH_READS_PER_VIEW`] reads; a chain marker is left as it was.
+pub async fn attach_hop_batches(
+    db: &worker::D1Database,
+    entries: &mut [crate::hops_view::HopEntry],
+) {
+    let mut reads = 0usize;
+    for e in entries.iter_mut() {
+        if !overlay_discovery::hopparty::is_handfile_marker_vout(e.marker_vout) {
+            continue;
+        }
+        if reads >= HANDFILE_BATCH_READS_PER_VIEW {
+            break;
+        }
+        reads += 1;
+        e.batch = batch_for_row(db, HANDFILE_FAMILY_HOPPARTY, &e.marker_txid, e.marker_vout).await;
+    }
+}
+
+/// `/refund-backups`: attach the batch of each exploded (`filed:`) row, at most
+/// [`HANDFILE_BATCH_READS_PER_VIEW`] reads; a chain row is left as it was.
+pub async fn attach_refund_batches(
+    db: &worker::D1Database,
+    backups: &mut [crate::refund_backups::PotBackups],
+) {
+    let mut reads = 0usize;
+    for p in backups.iter_mut() {
+        for r in p.rows.iter_mut() {
+            if !is_filed_key(&r.txid) {
+                continue;
+            }
+            if reads >= HANDFILE_BATCH_READS_PER_VIEW {
+                return;
+            }
+            reads += 1;
+            r.batch = batch_for_row(db, HANDFILE_FAMILY_POTREFUND, &r.txid, r.output_index).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1567,7 +1558,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(b.key, v.key);
             assert_eq!(b.index, slot as u32);
-            assert_eq!(b.payloads_hex, v.payloads_hex.to_vec());
+            assert_eq!(b.payloads, v.payloads_hex.to_vec());
             let j = b.json();
             assert_eq!(j["sigs"]["identity"], v.identity_sig_hex);
             assert_eq!(j["sigs"]["settle"], v.settle_sig_hex);
@@ -1689,7 +1680,7 @@ pub(crate) mod tests {
         let r = HandfileBatchRef {
             key: "handfile:ab".into(),
             hop_txid: "77".repeat(32),
-            payloads_hex: vec!["00".into(), "01".into(), "02".into(), "03".into()],
+            payloads: vec!["00".into(), "01".into(), "02".into(), "03".into()],
             identity_sig_hex: "30".into(),
             settle_sig_hex: "31".into(),
             index: 2,
