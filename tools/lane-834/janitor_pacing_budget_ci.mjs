@@ -38,6 +38,9 @@ const SINK_PORT = Number(process.argv[4])
 const ADMIN = process.env.D1_BUDGET_ADMIN_TOKEN ?? 'ci-admin-tok'
 const MEASURE = process.env.D1_BUDGET_MEASURE === '1'
 const CRATE = fileURLToPath(new URL('../../crates/overlay-cloudflare/', import.meta.url))
+// The pruned-Bitails questions the pass can ask on this overlay (FIX-834-MERGE): the proof ladder's and the conflict
+// pass's per-output spend.
+const BITAILS_QUESTIONS = 2
 const CEILINGS = JSON.parse(readFileSync(new URL('./ceilings.json', import.meta.url), 'utf8'))
 if (!OVERLAY || !STATE || !SINK_PORT) {
   console.error('usage: janitor_pacing_budget_ci.mjs <retire overlay base> <its --persist-to dir> <stand-in port>')
@@ -122,10 +125,17 @@ try {
   expect(p1.status === 200, 'the janitor pass answers 200', `${p1.status} ${p1.text.slice(0, 300)}`)
   expect(p1.asked.woc === 3, 'WoC is asked exactly 3 times (its third 429 backs it off)', JSON.stringify(p1.asked))
   expect(v1.providers?.woc?.backedOff === true && v1.providers?.woc?.skipped > 0, 'WoC is backed off and SKIPPED for the rest of the pass', JSON.stringify(v1.providers?.woc))
-  expect(p1.asked.bitails <= 3 && v1.providers?.bitails?.couldNotLook >= 1, "pruned Bitails' 404s are could-not-look, skipped by construction after 3", JSON.stringify(v1.providers?.bitails))
+  // FIX-834-MERGE: the cap is per QUESTION (rung), not per provider, so Bitails stays every other ladder's fallback. On
+  // this overlay (the #837 cell's JOINs before this cell) the pass asks pruned Bitails two questions: the proof
+  // ladder's (`bitails`, its proofless pots) and the retire pass's conflict pass's per-output spend (`bitails_tx`,
+  // the JOINs' inputs), each skipped by construction after its 3rd non-answer.
+  expect(p1.asked.bitails <= 3 * BITAILS_QUESTIONS && v1.providers?.bitails?.couldNotLook === p1.asked.bitails,
+    "pruned Bitails' 404s are could-not-look, skipped by construction after 3 per question", JSON.stringify(v1.providers?.bitails))
   expect(p1.asked.arcade >= 37, 'Arcade (the next rung) keeps asking', JSON.stringify(p1.asked))
-  expect(Number.isInteger(v1.asks) && v1.asks > 0 && v1.asks <= p1.total,
-    "the pass's own count of its paced asks is inside the stand-in's (which also sees the retire pass's unpaced reads)", `${v1.asks} vs ${p1.total}`)
+  // FIX-834-MERGE: EVERY courier GET of the pass goes through its one pacer (on 45b83a32 the retire pass's conflict
+  // pass asked past it: stand-in 70, paced 46).
+  expect(Number.isInteger(v1.asks) && v1.asks > 0 && v1.asks === p1.total,
+    "every subrequest the stand-in saw is one the pass's pacer let go (no unpaced caller)", `${v1.asks} vs ${p1.total}`)
   check('janitor-pass-woc-429', { total: p1.total, paced: v1.asks ?? null, ...p1.asked })
 
   // 3. The second pass inside the cool-down.
@@ -133,6 +143,7 @@ try {
   const v2 = p2.json?.courier_pacing ?? {}
   lines.push(`INFO  pass 2: ${JSON.stringify({ status: p2.status, asked: p2.asked, total: p2.total, woc: v2.providers?.woc })}`)
   expect(p2.status === 200 && p2.asked.woc === 0, 'inside the cool-down WoC is not asked at all', JSON.stringify(p2.asked))
+  expect(v2.asks === p2.total, 'the cooled pass makes no unpaced subrequest either', `${v2.asks} vs ${p2.total}`)
   expect(Number.isFinite(v2.providers?.woc?.cooledUntilMs), 'the pass names the cool-down it started under', JSON.stringify(v2.providers?.woc))
   check('janitor-pass-woc-cooled', { total: p2.total, paced: v2.asks ?? null, ...p2.asked })
 
