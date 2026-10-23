@@ -1444,6 +1444,24 @@ pub(crate) enum ProbeSeen {
     StoredUnderEviction,
 }
 
+/// PURE (bsv-low #637): the witnessed mode's duplicate of a STANDING admission. A re-present Arcade echoes at its
+/// stored SEEN is corroborated as an accept claim (#267), and a corroborator that holds the bytes STORED is
+/// inconclusive, so the duplicate answered 502 while the first admission stood. The policy: such a duplicate is the
+/// PENDING ACK of the admission the index already holds (no latch, the pending watch owning the witness), exactly
+/// where (1) the ladder answered `Err`, (2) the echo was a duplicate's stored SEEN whose claim's corroboration was
+/// INCONCLUSIVE (a conflict, a corroborator's refusal, stays the 502), (3) the witnessed mode (the fast mode admits
+/// the echo pending already), (4) no OPEN eviction (#612: a stored word never readmits), and (5) the index holds the
+/// subject's admission now. Anything else keeps today's answer: a first presentation keeps the #267 two-witness bar.
+pub(crate) fn duplicate_of_a_standing_admission(
+    ladder_failed: bool,
+    duplicate_unconfirmed: bool,
+    fast_answer: bool,
+    open_eviction: bool,
+    standing: bool,
+) -> bool {
+    ladder_failed && duplicate_unconfirmed && !fast_answer && !open_eviction && standing
+}
+
 /// PURE (bsv-low #636): the probe's stored SEEN, judged by its stamp against the open eviction, if any.
 pub(crate) fn probe_seen(stamp: Option<&str>, now_ms: i64, evicted_at_ms: Option<i64>) -> ProbeSeen {
     if submit_echo_is_fresh(stamp, now_ms, evicted_at_ms) {
@@ -2535,6 +2553,9 @@ pub struct ArcadeBroadcaster {
     /// derived `AdmitPolicy` (`ADMIT_FAST`).
     fast_answer: bool,
     duplicate_echo: std::cell::Cell<bool>,
+    /// bsv-low #637: the corroboration asked after a duplicate echo answered inconclusive (a corroborator STORED, an
+    /// orphan view, a transport fault), never a conflict.
+    claim_unconfirmed: std::cell::Cell<bool>,
     evicted_at_ms: Option<i64>,
     /// #519: the wall-clock of the indexers' judgement of an Arcade-terminal subject (its own Server-Timing segment).
     terminal_ms: std::cell::Cell<f64>,
@@ -2611,6 +2632,12 @@ impl ArcadeBroadcaster {
         self.duplicate_echo.get()
     }
 
+    /// bsv-low #637: the submit's echo was a duplicate's stored SEEN and the corroboration its accept claim asked
+    /// answered INCONCLUSIVE (never a conflict): the shape [`duplicate_of_a_standing_admission`] reads.
+    pub fn duplicate_echo_unconfirmed(&self) -> bool {
+        self.duplicate_echo.get() && self.claim_unconfirmed.get()
+    }
+
     /// Mark the subject evicted at `at` milliseconds (the ledger's open eviction), if any.
     pub fn with_evicted_at_ms(mut self, at: Option<i64>) -> Self {
         self.evicted_at_ms = at;
@@ -2634,6 +2661,7 @@ impl ArcadeBroadcaster {
             poll_ms: std::cell::Cell::new(0.0),
             fast_answer: false,
             duplicate_echo: std::cell::Cell::new(false),
+            claim_unconfirmed: std::cell::Cell::new(false),
             evicted_at_ms: None,
             terminal_ms: std::cell::Cell::new(0.0),
             terminal_judged: std::cell::Cell::new(None),
@@ -3245,6 +3273,10 @@ impl ArcadeBroadcaster {
                         )),
                     },
                 };
+                // bsv-low #637: after a duplicate echo, the corroboration is its accept claim's
+                if self.duplicate_echo.get() && answer.is_err() {
+                    self.claim_unconfirmed.set(true);
+                }
                 match self.legs_paused.get() {
                     Some(reached) => LegWalk::Paused { reached },
                     None => LegWalk::Decided(answer),
@@ -3299,8 +3331,8 @@ impl ArcadeBroadcaster {
                         ) {
                             return Err(STORED_ECHO_UNDER_EVICTION.into());
                         }
-                        // Witnessed mode still corroborates and can answer 502 on
-                        // STORED corroborators: bsv-low #637 (NS2P-L2 / N5).
+                        // Witnessed mode still corroborates; a duplicate of a STANDING admission whose
+                        // corroborator is inconclusive is the route's pending ack (bsv-low #637).
                         worker::console_log!(
                             "[arcade] {subject_txid} accepted at {} (no poll needed)",
                             parsed.tx_status
@@ -6454,6 +6486,59 @@ mod tests {
         let pending = &pending[..pending.find("Ok(crate::broadcaster::ArcOutcome::Rejected(reason))").unwrap()];
         assert!(!pending.contains("latch_network_seen"), "a pending admission latches nothing");
         assert!(pending.contains("pending_watch_job("));
+    }
+
+    /// bsv-low #637: the witnessed mode's duplicate stored SEEN echo, its claim's corroborator STORED (inconclusive),
+    /// answered 502 while the first admission stood. The duplicate of a STANDING admission is the pending ack; a
+    /// conflict, the fast mode, an open eviction or a subject the index does not hold keep today's answer.
+    #[tokio::test]
+    async fn i637_the_witnessed_duplicate_of_a_standing_admission_is_the_pending_ack() {
+        // the issue's shape through the shipped ladder: the stored SEEN echo, the corroborator STORED
+        for legs in [1, 2] {
+            let out = broadcast_efs_gated_with(
+                legs,
+                "subject",
+                |_| async { Ok(reached_submit_echo(false)) },
+                |_| async {
+                    corroborator_verdict(200, r#"{"txid":"subject","txStatus":"STORED"}"#)
+                },
+            )
+            .await;
+            assert!(out.is_err(), "the ladder's own answer is unchanged: {out:?}");
+        }
+        // the decision
+        assert!(duplicate_of_a_standing_admission(true, true, false, false, true));
+        assert!(!duplicate_of_a_standing_admission(true, true, false, false, false), "not standing: the #267 bar");
+        assert!(!duplicate_of_a_standing_admission(true, true, false, true, true), "an open eviction: #612");
+        assert!(!duplicate_of_a_standing_admission(true, true, true, false, true), "the fast mode");
+        assert!(!duplicate_of_a_standing_admission(true, false, false, false, true), "a conflict or no duplicate");
+        assert!(!duplicate_of_a_standing_admission(false, true, false, false, true), "an answer that stood");
+
+        let src = include_str!("broadcaster.rs");
+        let gated = &src[src.find("pub async fn broadcast_efs_gated<Y>(").unwrap()..];
+        let closure = &gated[gated.find("CorroborationKind::MinedClaim => match mined_subject_raw").unwrap()
+            ..gated.find("self.legs_paused.set(paused);").unwrap()];
+        assert!(
+            closure.contains("if self.duplicate_echo.get() && answer.is_err() {")
+                && closure.contains("self.claim_unconfirmed.set(true);"),
+            "only an inconclusive corroboration after a duplicate echo marks the claim unconfirmed"
+        );
+        let route = include_str!("routes.rs");
+        let arm = &route[route.find("let duplicate_echo = arcade.duplicate_echo();").unwrap()
+            ..route.find("corroborate_ms = arcade.corroborate_ms();").unwrap()];
+        assert!(arm.contains("crate::broadcaster::duplicate_of_a_standing_admission("));
+        assert!(arm.contains("arcade.duplicate_echo_unconfirmed(),"));
+        assert!(arm.contains("door_open.is_some(),") && arm.contains("admit_fast,"));
+        assert!(arm.contains("crate::admit_fast::index_holds_admission(&db, &subject_txid).await"));
+        assert!(arm.contains("Ok(crate::broadcaster::ArcOutcome::AcceptedPending(subject_txid.clone()))"));
+        assert!(!arm.contains("latch_network_seen"), "the ack latches nothing");
+        // the read is the #413 belt's two statements, a fault being "no"
+        let jobs = include_str!("admit_fast.rs");
+        assert!(route.contains(crate::admit_fast::STANDING_ADMISSION_SQL[0]));
+        assert!(route.contains(crate::admit_fast::STANDING_ADMISSION_SQL[1]));
+        let read = &jobs[jobs.find("pub(crate) async fn index_holds_admission(").unwrap()..];
+        let read = &read[..read.find("\n}\n").unwrap()];
+        assert!(read.contains("Err(_) => return false,"));
     }
 
     #[test]

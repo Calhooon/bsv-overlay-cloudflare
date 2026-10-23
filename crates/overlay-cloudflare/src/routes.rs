@@ -1632,6 +1632,39 @@ async fn submit_parts(
         if duplicate_echo {
             counters.bump(crate::ops::COUNTER_SUBMIT_DUPLICATE_IN_FLIGHT, 1);
         }
+        // bsv-low #637: the witnessed mode's duplicate of a STANDING admission (Arcade's stored SEEN echoed, the
+        // claim's corroborator inconclusive, no open eviction, the index holding the subject) is the pending ack of
+        // the admission that stands, never the 502; a first presentation keeps the #267 bar. The index is read only
+        // on that shape.
+        let arcade_outcome = if crate::broadcaster::duplicate_of_a_standing_admission(
+            arcade_outcome.is_err(),
+            arcade.duplicate_echo_unconfirmed(),
+            admit_fast,
+            door_open.is_some(),
+            true,
+        ) {
+            let standing = match env.d1("OVERLAY_DB") {
+                Ok(db) => crate::admit_fast::index_holds_admission(&db, &subject_txid).await,
+                Err(_) => false,
+            };
+            if crate::broadcaster::duplicate_of_a_standing_admission(
+                arcade_outcome.is_err(),
+                arcade.duplicate_echo_unconfirmed(),
+                admit_fast,
+                door_open.is_some(),
+                standing,
+            ) {
+                worker::console_log!(
+                    "broadcast-gated(arcade): {subject_txid} is a duplicate of a STANDING admission (Arcade's stored SEEN echoed, the corroborator inconclusive: {}) — the pending ack, no latch (#637)",
+                    arcade_outcome.as_ref().err().map(|e| e.chars().take(120).collect::<String>()).unwrap_or_default()
+                );
+                Ok(crate::broadcaster::ArcOutcome::AcceptedPending(subject_txid.clone()))
+            } else {
+                arcade_outcome
+            }
+        } else {
+            arcade_outcome
+        };
         // #195: keep segments DISJOINT and attributable — the corroborate leg
         // runs inside the gated broadcast's wall-clock, so it is carved out of
         // `arcade-broadcast` and reported as its own `corroborate` segment
