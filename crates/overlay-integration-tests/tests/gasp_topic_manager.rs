@@ -4582,11 +4582,14 @@ impl bsv_overlay_engine::lookup_service::LookupService for ToldLookup {
 // F1, the notification variant the lens read but did not run (its NIT: "F1
 // lives in exactly that gap"). The lookup hook faults on the admission of
 // head 1, after its insert. On c9921ee that kept the genesis beside head 1
-// and the replay after head 2 put head 1 back. Now the store is complete at
-// the fault (the genesis deleted, the spent mark told), and the replay finds
-// no coin. The limit this pins too: a manager whose rule needs the previous
-// coin admits nothing on that replay, so the hook that faulted is NOT told of
-// head 1 again (the reference tells nobody twice either).
+// and the replay after head 2 put head 1 back. From the fold to #657 the
+// store was complete at the fault (the genesis deleted) and the replay found
+// no coin, so it admitted nothing and the hook was never told of head 1
+// again. Since bsv-low #657 the notification fault is a fault BEFORE head 1
+// landed: head 1 taken out again, the genesis kept (marked spent), no
+// applied row. Head 2 meanwhile is "not now" (its predecessor has not
+// landed), the replay of head 1 re-applies it whole and the hook is told of
+// it, then head 2 lands. One head throughout.
 #[tokio::test]
 async fn fold559_f1_a_notification_fault_after_the_insert_leaves_one_head() {
     let (_logs, _guard) = capture_logs();
@@ -4634,19 +4637,26 @@ async fn fold559_f1_a_notification_fault_after_the_insert_leaves_one_head() {
     );
     assert_eq!(
         rows(&store, &nodes).await,
-        ["1:spent=false"],
-        "the store is complete at the fault: head 1 in, the genesis deleted"
+        ["0:spent=true"],
+        "nothing of head 1 held at the fault: the genesis kept (marked spent)"
     );
     assert_eq!(applied_rows(&store, &nodes).await, [true, false, false]);
 
-    // Head 2 lands in a later invocation, then the queue replays head 1.
+    // Head 2 comes first in a later invocation: its predecessor has not
+    // landed, so it waits and writes nothing.
+    let early = submitted(&invocation(None), &proven_beef(&nodes[2])).await;
+    assert!(!early.is_durable(), "{}", early.summary());
+    assert_eq!(rows(&store, &nodes).await, ["0:spent=true"]);
+    // The queue replays head 1, then head 2's replay lands.
+    let replay = submitted(&invocation(None), &proven_beef(&nodes[1])).await;
+    assert!(replay.is_durable(), "{}", replay.summary());
+    assert_eq!(rows(&store, &nodes).await, ["1:spent=false"]);
     assert!(submitted(&invocation(None), &proven_beef(&nodes[2]))
         .await
         .is_durable());
-    let replay = submitted(&invocation(None), &proven_beef(&nodes[1])).await;
-    assert!(replay.is_durable(), "{}", replay.summary());
     println!(
-        "#559 F1 notify: rows {:?} applied {:?}; the hook was told of {} admission(s) and {} spend(s)",
+        "#559 F1 notify (#657): head 2 first {:?}; rows {:?} applied {:?}; the hook was told of {} admission(s) and {} spend(s)",
+        e657_sites(&early),
         rows(&store, &nodes).await,
         applied_rows(&store, &nodes).await,
         admitted.borrow().len(),
@@ -4656,10 +4666,14 @@ async fn fold559_f1_a_notification_fault_after_the_insert_leaves_one_head() {
     assert_eq!(applied_rows(&store, &nodes).await, [true; 3]);
     assert_eq!(
         *admitted.borrow(),
-        txids(&nodes, &[0, 2]),
-        "the limit: the admission that faulted is not told again"
+        txids(&nodes, &[0, 1, 2]),
+        "the admission that faulted is told on the replay (#657)"
     );
-    assert_eq!(*spent.borrow(), txids(&nodes, &[0, 1]));
+    assert_eq!(
+        *spent.borrow(),
+        txids(&nodes, &[0, 0, 1]),
+        "the genesis's spend is told at the fault and again on the replay (no retraction, D17 rule 5)"
+    );
 }
 
 // F1: an insert that faults after another output of the same transaction
@@ -5215,11 +5229,15 @@ fn told_door(store: &Rc<MemoryStorage>, told: &Told, faults_on: Option<String>) 
 
 // H2, the delta lens's X6: one fault, no model. The admission hook of the
 // chain-OPENING transaction (the manager admits it with no previous coin)
-// faults once after its insert: no applied row, the replay is queued. Head 1
-// lands in another invocation and deletes the genesis. On 33e78fb the replay
-// of the genesis then admitted it AGAIN, unspent, beside the real tip, for
-// good. Now head 1's submit recorded the genesis as applied before deleting
-// its coin, so the replay is a dupe.
+// faults once after its insert: no applied row, the replay is queued. Until
+// bsv-low #657 the genesis stayed held, head 1 landed in another invocation
+// and deleted it (on 33e78fb the replay of the genesis then admitted it
+// AGAIN, unspent, beside the real tip, for good; H2's record made it a dupe).
+// Since #657 a notification fault holds nothing of the transaction, so that
+// road no longer opens from a hook: head 1 waits for the genesis, the replay
+// lands it, then head 1 and head 2. H2 itself stays pinned on the road a hook
+// fault no longer takes, the faulted APPLIED-ROW write (row 13, below) and
+// X5.
 #[tokio::test]
 async fn delta559_h2_x6_a_replayed_opener_is_not_inserted_again_after_its_successor() {
     let (_logs, _guard) = capture_logs();
@@ -5233,28 +5251,34 @@ async fn delta559_h2_x6_a_replayed_opener_is_not_inserted_again_after_its_succes
     )
     .await;
     assert!(!faulted.is_durable());
-    assert_eq!(rows(&store, &nodes).await, ["0:spent=false"]);
+    assert_eq!(
+        rows(&store, &nodes).await,
+        Vec::<String>::new(),
+        "nothing of the opener held (#657)"
+    );
     assert_eq!(applied_rows(&store, &nodes).await, [false; 3]);
 
     let successor = submitted(&told_door(&store, &told, None), &proven_beef(&nodes[1])).await;
-    assert!(successor.is_durable(), "{}", successor.summary());
-    assert_eq!(rows(&store, &nodes).await, ["1:spent=false"]);
+    assert!(!successor.is_durable(), "{}", successor.summary());
+    assert_eq!(rows(&store, &nodes).await, Vec::<String>::new());
 
     let replay = submitted(&told_door(&store, &told, None), &proven_beef(&nodes[0])).await;
     println!(
-        "#559 H2 X6: after the replay of the genesis: durable {} deduped {:?} rows {:?} applied {:?}",
+        "#559 H2 X6 (#657): successor first {:?}; after the replay of the genesis: durable {} rows {:?} applied {:?}",
+        e657_sites(&successor),
         replay.is_durable(),
-        replay.deduped_topics,
         rows(&store, &nodes).await,
         applied_rows(&store, &nodes).await
     );
-    assert_eq!(
-        rows(&store, &nodes).await,
-        ["1:spent=false"],
-        "the spent opener is not back beside the tip"
+    assert!(replay.is_durable(), "{}", replay.summary());
+    assert_eq!(replay.applied_topics, vec![TOPIC.to_string()]);
+    assert_eq!(rows(&store, &nodes).await, ["0:spent=false"]);
+    assert!(
+        submitted(&told_door(&store, &told, None), &proven_beef(&nodes[1]))
+            .await
+            .is_durable()
     );
-    assert!(replay.is_durable());
-    assert_eq!(replay.deduped_topics, vec![TOPIC.to_string()]);
+    assert_eq!(rows(&store, &nodes).await, ["1:spent=false"]);
 
     assert!(
         submitted(&told_door(&store, &told, None), &proven_beef(&nodes[2]))
@@ -6324,11 +6348,13 @@ async fn delta2_559_row2_a_previous_coin_read_fault_writes_nothing_and_keeps_the
 }
 
 // Row 6 of the one-head table: the lookup service's `output_spent` hook
-// faults on the spend of the old head. The fault is reported and the submit
-// carries on: the new head in, the old one deleted, no applied row. The
-// replay finds no coin, admits nothing and is recorded; or, when a successor
-// came first, it is a dupe (H2). One head either way. The limit this pins
-// too: the hook that faulted is not told of that spend again.
+// faults on the spend of the old head. Until bsv-low #657 the submit carried
+// on (the new head in, the old one deleted, no applied row) and the replay
+// found no coin. Since #657 the fault is before the transaction landed:
+// nothing of the new head inserted, the old one kept (marked spent), no
+// applied row. A successor that comes first waits (its predecessor has not
+// landed); the replay re-applies whole and the hook is told of the spend
+// again. One head either way.
 #[tokio::test]
 async fn delta2_559_row6_a_spend_notification_fault_leaves_the_new_head_and_no_applied_row() {
     let (_logs, _guard) = capture_logs();
@@ -6375,32 +6401,29 @@ async fn delta2_559_row6_a_spend_notification_fault_leaves_the_new_head_and_no_a
         );
         assert_eq!(
             rows(&store, &nodes).await,
-            ["1:spent=false"],
-            "successor first {successor_first}: the new head in, the old one deleted"
+            ["0:spent=true"],
+            "successor first {successor_first}: nothing of the new head, the old one kept"
         );
         assert_eq!(applied_rows(&store, &nodes).await, [true, false, false]);
 
         if successor_first {
-            assert!(submitted(&invocation(None), &proven_beef(&nodes[2]))
-                .await
-                .is_durable());
+            let early = submitted(&invocation(None), &proven_beef(&nodes[2])).await;
+            assert!(!early.is_durable(), "{}", early.summary());
+            assert_eq!(rows(&store, &nodes).await, ["0:spent=true"]);
         }
         let replay = submitted(&invocation(None), &proven_beef(&nodes[1])).await;
         assert!(replay.is_durable(), "{}", replay.summary());
-        if successor_first {
-            assert_eq!(replay.deduped_topics, vec![TOPIC.to_string()]);
-        } else {
-            assert_eq!(replay.applied_topics, vec![TOPIC.to_string()]);
-            assert!(submitted(&invocation(None), &proven_beef(&nodes[2]))
-                .await
-                .is_durable());
-        }
+        assert_eq!(replay.applied_topics, vec![TOPIC.to_string()]);
+        assert_eq!(rows(&store, &nodes).await, ["1:spent=false"]);
+        assert!(submitted(&invocation(None), &proven_beef(&nodes[2]))
+            .await
+            .is_durable());
         assert_eq!(rows(&store, &nodes).await, ["2:spent=false"], "one head");
         assert_eq!(applied_rows(&store, &nodes).await, [true; 3]);
         assert_eq!(
             *told.1.borrow(),
-            txids(&nodes, &[1]),
-            "the limit: the spend that faulted is not told again"
+            txids(&nodes, &[0, 1]),
+            "the spend that faulted is told on the replay (#657)"
         );
     }
 }
@@ -12091,4 +12114,350 @@ async fn fix791c_f_a_join_whose_named_hop_is_evicted_waits_in_tm_lowfund_alone()
             .any(|(t, topic)| *t == evicted && topic == "tm_lowfund"),
         "the guard is asked of the evicted hop"
     );
+}
+
+// ============================================================================
+// bsv-low #657 (lane ENGINE-657; zanaadu-v2 #414): a lookup service's
+// notification that FAULTS is a fault BEFORE the transaction landed. The
+// inserts are taken out again, the stale coin is kept (marked spent, as on an
+// insert fault) and is never deleted, and nothing is recorded: the replay
+// re-applies the transaction whole over the coin it still finds. Until #657 a
+// notification fault was a fault AFTER the inserts: the stale coin was deleted
+// all the same and the applied row withheld, so the replay was judged again
+// WITHOUT the coin (the Zanaadu witness: the same bytes then read as a first
+// deployment and admitted output 0 alone). Each pin below is RED on
+// `d370d906`.
+// ============================================================================
+
+// A lookup service that faults `faults` times (u32::MAX: every time) on the
+// admission of (txid, output index) `admit_faults_on`, or on the spend of the
+// txid `spend_faults_on`, and records what it is told.
+#[derive(Default)]
+struct NotifyFaults {
+    admit_faults_on: Option<(String, u32)>,
+    spend_faults_on: Option<String>,
+    faults: std::cell::Cell<u32>,
+    admitted: Rc<RefCell<Vec<(String, u32)>>>,
+    spent: Rc<RefCell<Vec<String>>>,
+}
+
+impl NotifyFaults {
+    fn fault(&self) -> bool {
+        let left = self.faults.get();
+        if left == 0 {
+            return false;
+        }
+        if left != u32::MAX {
+            self.faults.set(left - 1);
+        }
+        true
+    }
+}
+
+#[async_trait(?Send)]
+impl bsv_overlay_engine::lookup_service::LookupService for NotifyFaults {
+    fn reads_off_chain_values(&self, _topic: &str) -> bool {
+        false
+    }
+    fn admission_mode(&self) -> AdmissionMode {
+        AdmissionMode::LockingScript
+    }
+    fn spend_notification_mode(&self) -> SpendNotificationMode {
+        SpendNotificationMode::Txid
+    }
+    async fn output_admitted_by_topic(
+        &self,
+        payload: &OutputAdmittedByTopic,
+    ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
+        let OutputAdmittedByTopic::LockingScript {
+            txid, output_index, ..
+        } = payload
+        else {
+            unreachable!("the mode is the locking script");
+        };
+        if self.admit_faults_on.as_ref() == Some(&(txid.clone(), *output_index)) && self.fault() {
+            return Err(
+                bsv_overlay_engine::lookup_service::LookupServiceError::Other(
+                    "the service parsed a foreign output".into(),
+                ),
+            );
+        }
+        self.admitted
+            .borrow_mut()
+            .push((txid.clone(), *output_index));
+        Ok(())
+    }
+    async fn output_spent(
+        &self,
+        payload: &OutputSpent,
+    ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
+        let OutputSpent::Txid { txid, .. } = payload else {
+            unreachable!("the mode is the txid");
+        };
+        if self.spend_faults_on.as_ref() == Some(txid) && self.fault() {
+            return Err(
+                bsv_overlay_engine::lookup_service::LookupServiceError::Other(
+                    "the service parsed a foreign spend".into(),
+                ),
+            );
+        }
+        self.spent.borrow_mut().push(txid.clone());
+        Ok(())
+    }
+    async fn output_evicted(
+        &self,
+        _txid: &str,
+        _output_index: u32,
+    ) -> Result<(), bsv_overlay_engine::lookup_service::LookupServiceError> {
+        Ok(())
+    }
+    async fn lookup(
+        &self,
+        _question: &LookupQuestion,
+    ) -> Result<LookupResult, bsv_overlay_engine::lookup_service::LookupServiceError> {
+        Ok(LookupResult::OutputList(Vec::new()))
+    }
+    async fn get_documentation(&self) -> String {
+        String::new()
+    }
+    async fn get_metadata(&self) -> ServiceMetadata {
+        ServiceMetadata::default()
+    }
+}
+
+// One invocation of the door: the recorded head manager (it admits every
+// output of a head, as the registry admits the Registry and UserProof
+// outputs) and the faulting lookup service.
+fn e657_door(store: &Rc<MemoryStorage>, lookup: NotifyFaults) -> Engine {
+    Engine::new(
+        HashMap::from([(
+            TOPIC.to_string(),
+            Box::new(RecordedHeadManager(Rc::new(RefCell::new(
+                HeadState::default(),
+            )))) as Box<dyn TopicManager>,
+        )]),
+        HashMap::from([(
+            "ls_e657".to_string(),
+            Box::new(lookup) as Box<dyn bsv_overlay_engine::lookup_service::LookupService>,
+        )]),
+        Box::new(ScriptedStore::plain(store)),
+        None,
+        EngineConfig::default(),
+    )
+}
+
+// Every row of the topic for `nodes`, both outputs, with its spent flag.
+async fn e657_rows(store: &MemoryStorage, nodes: &[GASPNode]) -> Vec<String> {
+    let mut rows = Vec::new();
+    for (i, n) in nodes.iter().enumerate() {
+        for vout in 0..2 {
+            if let Some(o) = store
+                .find_output(&node_txid(n), vout, Some(TOPIC), None, false)
+                .await
+                .unwrap()
+            {
+                rows.push(format!("{i}.{vout}:spent={}", o.spent));
+            }
+        }
+    }
+    rows
+}
+
+fn e657_sites(report: &bsv_overlay_engine::engine::MutationReport) -> Vec<&'static str> {
+    report.faults.iter().map(|f| f.site).collect()
+}
+
+// The Zanaadu witness: a head of TWO admitted outputs whose second output's
+// notification faults DETERMINISTICALLY. Every presentation of the same bytes
+// meets the same store and answers the same word: the old head kept, nothing
+// of the new one held, no applied row. On `d370d906` the first presentation
+// deleted the old head, left both new outputs and no applied row, and the
+// second was judged without the coin (it admitted nothing: another word).
+#[tokio::test]
+async fn e657_a_a_deterministic_admission_notify_fault_keeps_the_coin_on_every_presentation() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = recorded_chain(2, &[1]);
+    let store = Rc::new(MemoryStorage::new());
+    assert!(submitted(
+        &e657_door(&store, NotifyFaults::default()),
+        &proven_beef(&nodes[0])
+    )
+    .await
+    .is_durable());
+    let mut words = Vec::new();
+    for presentation in 0..3 {
+        let lookup = NotifyFaults {
+            admit_faults_on: Some((node_txid(&nodes[1]), 1)),
+            faults: std::cell::Cell::new(u32::MAX),
+            ..Default::default()
+        };
+        let report = submitted(&e657_door(&store, lookup), &proven_beef(&nodes[1])).await;
+        println!(
+            "#657 a, presentation {presentation}: sites {:?} applied {:?} rows {:?} applied rows {:?}",
+            e657_sites(&report),
+            report.applied_topics,
+            e657_rows(&store, &nodes).await,
+            applied_rows(&store, &nodes).await
+        );
+        assert!(!report.is_durable(), "{}", report.summary());
+        assert_eq!(
+            e657_rows(&store, &nodes).await,
+            ["0.0:spent=true"],
+            "presentation {presentation}: the old head kept (marked spent), nothing of the new one held"
+        );
+        assert_eq!(
+            applied_rows(&store, &nodes).await,
+            [true, false],
+            "presentation {presentation}: the refused head is not recorded"
+        );
+        words.push((e657_sites(&report), report.applied_topics.clone()));
+    }
+    assert_eq!(
+        words[0],
+        (vec!["lookup_service.output_admitted_by_topic"], vec![]),
+        "the word names the notification"
+    );
+    assert!(
+        words.iter().all(|w| *w == words[0]),
+        "the same bytes, the same word: {words:?}"
+    );
+}
+
+// The same fault ONCE (a transient index fault), then the replay: the replay
+// finds the coin it was judged with, re-applies the transaction whole, tells
+// the service of both outputs, deletes the old head and is recorded.
+#[tokio::test]
+async fn e657_b_an_admission_notify_fault_once_then_the_replay_reapplies_whole() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = recorded_chain(3, &[1]);
+    let store = Rc::new(MemoryStorage::new());
+    assert!(submitted(
+        &e657_door(&store, NotifyFaults::default()),
+        &proven_beef(&nodes[0])
+    )
+    .await
+    .is_durable());
+    let admitted = Rc::new(RefCell::new(Vec::new()));
+    let faulted = submitted(
+        &e657_door(
+            &store,
+            NotifyFaults {
+                admit_faults_on: Some((node_txid(&nodes[1]), 1)),
+                faults: std::cell::Cell::new(1),
+                admitted: admitted.clone(),
+                ..Default::default()
+            },
+        ),
+        &proven_beef(&nodes[1]),
+    )
+    .await;
+    assert_eq!(
+        e657_sites(&faulted),
+        ["lookup_service.output_admitted_by_topic"]
+    );
+    assert_eq!(e657_rows(&store, &nodes).await, ["0.0:spent=true"]);
+    assert_eq!(applied_rows(&store, &nodes).await, [true, false, false]);
+
+    let replay = submitted(
+        &e657_door(
+            &store,
+            NotifyFaults {
+                admitted: admitted.clone(),
+                ..Default::default()
+            },
+        ),
+        &proven_beef(&nodes[1]),
+    )
+    .await;
+    println!(
+        "#657 b: replay sites {:?} applied {:?} rows {:?} told {:?}",
+        e657_sites(&replay),
+        replay.applied_topics,
+        e657_rows(&store, &nodes).await,
+        admitted.borrow()
+    );
+    assert!(replay.is_durable(), "{}", replay.summary());
+    assert_eq!(replay.applied_topics, vec![TOPIC.to_string()]);
+    assert_eq!(
+        e657_rows(&store, &nodes).await,
+        ["1.0:spent=false", "1.1:spent=false"],
+        "the whole transaction, the old head deleted"
+    );
+    assert_eq!(applied_rows(&store, &nodes).await, [true, true, false]);
+    let told: Vec<(String, u32)> = admitted.borrow().clone();
+    assert!(
+        told.contains(&(node_txid(&nodes[1]), 1)),
+        "the output whose notification faulted is told on the replay: {told:?}"
+    );
+    // And the chain goes on from it.
+    assert!(submitted(
+        &e657_door(&store, NotifyFaults::default()),
+        &proven_beef(&nodes[2])
+    )
+    .await
+    .is_durable());
+    assert_eq!(
+        e657_rows(&store, &nodes).await,
+        ["1.1:spent=false", "2.0:spent=false"]
+    );
+    assert_eq!(applied_rows(&store, &nodes).await, [true; 3]);
+}
+
+// The spend's notification: the same rule. Deterministic, every
+// presentation keeps the old head and holds nothing of the new one; once,
+// the replay re-applies whole and the spend is told on it.
+#[tokio::test]
+async fn e657_c_a_spend_notify_fault_keeps_the_coin_and_the_replay_reapplies_whole() {
+    let (_logs, _guard) = capture_logs();
+    let nodes = recorded_chain(2, &[]);
+    for faults in [u32::MAX, 1] {
+        let store = Rc::new(MemoryStorage::new());
+        assert!(submitted(
+            &e657_door(&store, NotifyFaults::default()),
+            &proven_beef(&nodes[0])
+        )
+        .await
+        .is_durable());
+        let spent = Rc::new(RefCell::new(Vec::new()));
+        let lookup = NotifyFaults {
+            spend_faults_on: Some(node_txid(&nodes[0])),
+            faults: std::cell::Cell::new(faults),
+            spent: spent.clone(),
+            ..Default::default()
+        };
+        let faulted = submitted(&e657_door(&store, lookup), &proven_beef(&nodes[1])).await;
+        assert_eq!(
+            e657_sites(&faulted),
+            ["lookup_service.output_spent"],
+            "faults {faults}"
+        );
+        assert_eq!(
+            e657_rows(&store, &nodes).await,
+            ["0.0:spent=true"],
+            "faults {faults}: nothing of the new head inserted, the old one kept"
+        );
+        assert_eq!(applied_rows(&store, &nodes).await, [true, false]);
+
+        let lookup = NotifyFaults {
+            spend_faults_on: Some(node_txid(&nodes[0])),
+            faults: std::cell::Cell::new(if faults == 1 { 0 } else { faults }),
+            spent: spent.clone(),
+            ..Default::default()
+        };
+        let again = submitted(&e657_door(&store, lookup), &proven_beef(&nodes[1])).await;
+        if faults == 1 {
+            assert!(again.is_durable(), "{}", again.summary());
+            assert_eq!(e657_rows(&store, &nodes).await, ["1.0:spent=false"]);
+            assert_eq!(applied_rows(&store, &nodes).await, [true, true]);
+            assert_eq!(
+                *spent.borrow(),
+                txids(&nodes, &[0]),
+                "the spend is told on the replay"
+            );
+        } else {
+            assert_eq!(e657_sites(&again), e657_sites(&faulted), "the same word");
+            assert_eq!(e657_rows(&store, &nodes).await, ["0.0:spent=true"]);
+            assert_eq!(applied_rows(&store, &nodes).await, [true, false]);
+        }
+    }
 }
