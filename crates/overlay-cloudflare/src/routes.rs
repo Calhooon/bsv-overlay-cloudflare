@@ -1632,6 +1632,36 @@ async fn submit_parts(
         if duplicate_echo {
             counters.bump(crate::ops::COUNTER_SUBMIT_DUPLICATE_IN_FLIGHT, 1);
         }
+        // bsv-low #637: the witnessed mode's duplicate of a STANDING admission (Arcade's stored SEEN echoed, the
+        // claim's corroborator inconclusive, no open eviction, the index holding the subject) is the pending ack of
+        // the admission that stands, never the 502; a first presentation keeps the #267 bar. The index is read only
+        // on that shape.
+        let shape = crate::broadcaster::DuplicateShape {
+            duplicate_unconfirmed: arcade.duplicate_echo_unconfirmed(),
+            fast_answer: admit_fast,
+            open_eviction: door_open.is_some(),
+        };
+        let arcade_outcome = if shape.asks_the_index(&arcade_outcome) {
+            let standing = match env.d1("OVERLAY_DB") {
+                Ok(db) => crate::admit_fast::index_holds_admission(&db, &subject_txid).await,
+                Err(_) => false,
+            };
+            let refused = arcade_outcome
+                .as_ref()
+                .err()
+                .map(|e| e.chars().take(120).collect::<String>())
+                .unwrap_or_default();
+            let answer =
+                crate::broadcaster::standing_duplicate_answer(arcade_outcome, &subject_txid, shape, standing);
+            if answer.is_ok() {
+                worker::console_log!(
+                    "broadcast-gated(arcade): {subject_txid} is a duplicate of a STANDING admission (Arcade's stored SEEN echoed, the corroborator inconclusive: {refused}): the pending ack, no latch (#637)"
+                );
+            }
+            answer
+        } else {
+            arcade_outcome
+        };
         // #195: keep segments DISJOINT and attributable — the corroborate leg
         // runs inside the gated broadcast's wall-clock, so it is carved out of
         // `arcade-broadcast` and reported as its own `corroborate` segment
@@ -1701,7 +1731,8 @@ async fn submit_parts(
                 }
                 // #602: a courier's mined admission is not a broadcaster SEEN word.
                 // bsv-low #621: the latch names the broadcaster that said SEEN in this request (Arcade's poll, stored
-                // echo or probe; a corroborator's accept) at its stamp; an accept no broadcaster named latches nothing
+                // echo; a corroborator's accept; never the pre-flight probe's stored word, bsv-low #636) at its stamp; an
+                // accept no broadcaster named latches nothing
                 if arcade.admission_is_witnessed() {
                     match (env.d1("OVERLAY_DB"), arcade.witnessed_by()) {
                         (Ok(db), Some((by, at_ms))) => {
@@ -1769,7 +1800,9 @@ async fn submit_parts(
                 // mode) only for a proven-ancestry single leg whose tracker
                 // lagged and whose corroborator was inconclusive (the
                 // broadcaster never pends an unproven-ancestry subject there,
-                // #267). Either way: ADMIT, do NOT latch `network_seen`
+                // #267), or, in either mode, a re-present the pre-flight
+                // probe found stored at SEEN (bsv-low #636: a stored word
+                // admits pending, never latched). Either way: ADMIT, do NOT latch `network_seen`
                 // (nothing witnessed it), and hand the witness to the PENDING
                 // WATCH in the background (`admit_fast::pending_watch_job`):
                 // Arcade is looked at 2..18 s after the admission — SEEN
@@ -1785,11 +1818,7 @@ async fn submit_parts(
                 // a refusal).
                 worker::console_log!(
                     "broadcast-gated(arcade): {subject_txid} admitted PENDING ({pending}; {}) — SEEN unwitnessed; the pending watch owns the witness",
-                    if admit_fast {
-                        "the fast answer"
-                    } else {
-                        "tracker lagging, corroborator inconclusive (#397)"
-                    }
+                    crate::broadcaster::pending_admission_words(admit_fast, duplicate_echo)
                 );
                 // loop 18 (the gate's HIGH-2): the network holds these bytes NOW — an open eviction is stale.
                 if let Some(ev) = door_open.take() {
