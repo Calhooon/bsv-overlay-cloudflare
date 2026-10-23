@@ -3000,10 +3000,14 @@ impl PotStorage for D1PotStorage {
         }
         // bsv-low #621: the same primary-key read as `network_seen_for`, with the witness pair; chunks of 90.
         const CHUNK: usize = 90;
-        let mut seen: std::collections::HashMap<String, overlay_discovery::pot::storage::SeenWitness> =
-            std::collections::HashMap::new();
+        let mut seen: std::collections::HashMap<
+            String,
+            overlay_discovery::pot::storage::SeenWitness,
+        > = std::collections::HashMap::new();
         for chunk in txids.chunks(CHUNK) {
-            let mut q = Query::new(overlay_discovery::pot::storage::network_seen_by_batch_sql(chunk.len()));
+            let mut q = Query::new(overlay_discovery::pot::storage::network_seen_by_batch_sql(
+                chunk.len(),
+            ));
             for txid in chunk {
                 q = q.bind(txid.to_ascii_lowercase());
             }
@@ -5920,8 +5924,119 @@ pub mod potparty_write {
     }
 }
 
+// ── bsv-low #848 (FAST-C): the handfile batches beside a served row ─────────────────────────────────────────────
+
+/// The batches of the given rows of one family: `handfile_rows` joined to `handfile_batches`, at most
+/// [`HANDFILE_BATCH_KEYS_PER_READ`] row txids a statement (a lookup page is bounded by its own limit).
+pub const HANDFILE_BATCH_KEYS_PER_READ: usize = 64;
+
+/// `handfile_rows` joined to its batch, the row txids an `IN` list (`?2` onward), the family `?1`.
+pub fn handfile_batches_sql(keys: usize) -> String {
+    let placeholders = (2..keys + 2)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT r.rowTxid AS rowTxid, r.rowVout AS rowVout, r.idx AS idx, b.batchKey AS batchKey, \
+                b.hopTxid AS hopTxid, b.payloadsHex AS payloadsHex, b.identitySigHex AS identitySigHex, \
+                b.settleSigHex AS settleSigHex \
+         FROM handfile_rows r JOIN handfile_batches b ON b.batchKey = r.batchKey \
+         WHERE r.family = ?1 AND r.rowTxid IN ({placeholders})"
+    )
+}
+
+/// One joined row as D1 returns it.
+#[derive(Deserialize)]
+struct HandfileBatchDbRow {
+    #[serde(rename = "rowTxid")]
+    row_txid: String,
+    #[serde(rename = "rowVout")]
+    row_vout: f64,
+    idx: f64,
+    #[serde(rename = "batchKey")]
+    batch_key: String,
+    #[serde(rename = "hopTxid")]
+    hop_txid: String,
+    #[serde(rename = "payloadsHex")]
+    payloads_hex: String,
+    #[serde(rename = "identitySigHex")]
+    identity_sig_hex: String,
+    #[serde(rename = "settleSigHex")]
+    settle_sig_hex: String,
+}
+
+impl HandfileBatchDbRow {
+    fn into_pair(self) -> Option<((String, u32), overlay_discovery::handfile::HandfileBatch)> {
+        let b = overlay_discovery::handfile::HandfileBatch::of_stored(
+            &self.batch_key,
+            &self.hop_txid,
+            &self.payloads_hex,
+            &self.identity_sig_hex,
+            &self.settle_sig_hex,
+            self.idx as u32,
+        )?;
+        Some(((self.row_txid, self.row_vout as u32), b))
+    }
+}
+
+/// The statements of one read: the keys chunked, each chunk one `Query` (the family bound first), and the rows
+/// a chunk answers kept only when their `(txid, outputIndex)` is among the asked keys.
+pub fn handfile_batches_queries(family: &str, keys: &[(String, u32)]) -> Vec<Query> {
+    let mut txids: Vec<&str> = keys.iter().map(|(t, _)| t.as_str()).collect();
+    txids.sort_unstable();
+    txids.dedup();
+    txids
+        .chunks(HANDFILE_BATCH_KEYS_PER_READ)
+        .map(|chunk| {
+            let mut q = Query::new(handfile_batches_sql(chunk.len())).bind(family);
+            for t in chunk {
+                q = q.bind(*t);
+            }
+            q
+        })
+        .collect()
+}
+
+async fn handfile_batches_with<F, Fut>(
+    family: &str,
+    keys: &[(String, u32)],
+    fetch: F,
+) -> Result<Vec<((String, u32), overlay_discovery::handfile::HandfileBatch)>, String>
+where
+    F: Fn(Query) -> Fut,
+    Fut: core::future::Future<Output = Result<Vec<HandfileBatchDbRow>, String>>,
+{
+    let mut out = Vec::new();
+    for q in handfile_batches_queries(family, keys) {
+        for row in fetch(q).await? {
+            if let Some(pair) = row.into_pair() {
+                if keys.contains(&pair.0) {
+                    out.push(pair);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[async_trait(?Send)]
 impl PotpartyStorage for D1PotpartyStorage {
+    async fn handfile_batches(
+        &self,
+        keys: &[(String, u32)],
+    ) -> Result<
+        Vec<((String, u32), overlay_discovery::handfile::HandfileBatch)>,
+        PotpartyStorageError,
+    > {
+        handfile_batches_with(
+            overlay_discovery::handfile::HANDFILE_FAMILY_POTPARTY,
+            keys,
+            |q| self.db.fetch_all::<HandfileBatchDbRow>(q),
+        )
+        .await
+        .map_err(potparty_err)
+    }
+
     async fn store_record(&self, record: &PotpartyRecord) -> Result<(), PotpartyStorageError> {
         let insert = potparty_insert_query(record, current_unix_seconds_i64());
         // TELEMETRY, not a decision (bsv-low #283, gate M5). The golden cells
@@ -6138,6 +6253,9 @@ impl crate::relatch::RelatchTable for D1PotpartyStorage {
         // ONE evaluation of the predicate, inside the capability-typed UPDATE,
         // and the compare reads it off that value — never a second derivation
         // (the #283 gate's LOW-2 finding, avoided rather than repeated).
+        if crate::relatch::door_filed_row(&row.record.txid, row.record.output_index) {
+            return Ok(None); // bsv-low #848: a door-filed row keeps its write-time verdict
+        }
         let update = potparty_relatch_query(&row.record);
         let verdict = update.sig_valid();
         if row.stored == Some(verdict) {
@@ -6237,6 +6355,22 @@ const POTREFUND_SELECT: &str = "SELECT identity, gameId, potTxid, potVout, refun
 
 #[async_trait(?Send)]
 impl PotrefundStorage for D1PotrefundStorage {
+    async fn handfile_batches(
+        &self,
+        keys: &[(String, u32)],
+    ) -> Result<
+        Vec<((String, u32), overlay_discovery::handfile::HandfileBatch)>,
+        PotrefundStorageError,
+    > {
+        handfile_batches_with(
+            overlay_discovery::handfile::HANDFILE_FAMILY_POTREFUND,
+            keys,
+            |q| q.fetch_all::<HandfileBatchDbRow>(&self.db),
+        )
+        .await
+        .map_err(potrefund_err)
+    }
+
     async fn store_record(&self, record: &PotrefundRecord) -> Result<(), PotrefundStorageError> {
         // INSERT OR IGNORE on the (txid, outputIndex) primary key — a
         // replayed submit of the same output is a no-op; markers for the
@@ -6773,6 +6907,22 @@ pub fn hopparty_list_for_hop_sql() -> String {
 
 #[async_trait(?Send)]
 impl HoppartyStorage for D1HoppartyStorage {
+    async fn handfile_batches(
+        &self,
+        keys: &[(String, u32)],
+    ) -> Result<
+        Vec<((String, u32), overlay_discovery::handfile::HandfileBatch)>,
+        HoppartyStorageError,
+    > {
+        handfile_batches_with(
+            overlay_discovery::handfile::HANDFILE_FAMILY_HOPPARTY,
+            keys,
+            |q| self.db.fetch_all::<HandfileBatchDbRow>(q),
+        )
+        .await
+        .map_err(hopparty_err)
+    }
+
     async fn store_record(&self, record: &HoppartyRecord) -> Result<(), HoppartyStorageError> {
         let insert = hopparty_insert_query(record, current_unix_seconds_i64());
         // TELEMETRY, not a decision (the #283 gate-M5 posture). The frozen
@@ -6985,6 +7135,9 @@ impl crate::relatch::RelatchTable for D1HoppartyStorage {
 
     async fn relatch_if_changed(&self, row: &Self::Row) -> Result<Option<bool>, String> {
         // ONE evaluation — see the potparty twin.
+        if crate::relatch::door_filed_row(&row.record.txid, row.record.output_index) {
+            return Ok(None); // bsv-low #848: a handfile row keeps its write-time verdict
+        }
         let update = hopparty_relatch_query(&row.record);
         let verdict = update.marker_valid();
         if row.stored == Some(verdict) {
@@ -8920,13 +9073,19 @@ mod tests {
         let conn = production_schema_db();
         conn.execute(
             crate::ops::NETWORK_SEEN_INSERT_SQL,
-            rusqlite::params!["ABCDEF01", crate::ops::SeenSource::Taal.wire(), 1_760_000_000_123_i64],
+            rusqlite::params![
+                "ABCDEF01",
+                crate::ops::SeenSource::Taal.wire(),
+                1_760_000_000_123_i64
+            ],
         )
         .expect("latch executes");
         let (txid, seen_at, by, by_at): (String, i64, String, i64) = conn
-            .query_row("SELECT txid, seenAt, seenSource, sourceAtMs FROM network_seen", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })
+            .query_row(
+                "SELECT txid, seenAt, seenSource, sourceAtMs FROM network_seen",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
             .expect("one row");
         assert_eq!(txid, "abcdef01", "keyed lowercase");
         assert!(seen_at > 0, "stamped by unixepoch()");
@@ -8944,11 +9103,17 @@ mod tests {
         )
         .expect("re-latch executes");
         let kept_by: (String, i64) = conn
-            .query_row("SELECT seenSource, sourceAtMs FROM network_seen WHERE txid = 'abcdef01'", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT seenSource, sourceAtMs FROM network_seen WHERE txid = 'abcdef01'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .expect("kept by");
-        assert_eq!(kept_by, ("taal".to_string(), 1_760_000_000_123), "the first witness's pair stands");
+        assert_eq!(
+            kept_by,
+            ("taal".to_string(), 1_760_000_000_123),
+            "the first witness's pair stands"
+        );
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM network_seen", [], |r| r.get(0))
             .expect("count");
@@ -11170,6 +11335,9 @@ mod tests {
             )
         }
         async fn relatch_if_changed(&self, row: &Self::Row) -> Result<Option<bool>, String> {
+            if crate::relatch::door_filed_row(&row.record.txid, row.record.output_index) {
+                return Ok(None); // bsv-low #848, as the shipped impl
+            }
             let update = potparty_relatch_query(&row.record);
             let verdict = update.sig_valid();
             if row.stored == Some(verdict) {
@@ -11220,6 +11388,9 @@ mod tests {
             )
         }
         async fn relatch_if_changed(&self, row: &Self::Row) -> Result<Option<bool>, String> {
+            if crate::relatch::door_filed_row(&row.record.txid, row.record.output_index) {
+                return Ok(None); // bsv-low #848, as the shipped impl
+            }
             let update = hopparty_relatch_query(&row.record);
             let verdict = update.marker_valid();
             if row.stored == Some(verdict) {
@@ -11741,6 +11912,89 @@ mod tests {
         let s2 = crate::relatch::relatch_pass(&table, &cursors, 100).await;
         assert_eq!((s2.promoted, s2.latched, s2.demoted), (1, 0, 0));
         assert_eq!(read("txHOPRELATCH"), Some(1));
+    }
+
+    /// bsv-low #848 (FAST-C): a row the app layer's record door filed keeps its write-time verdict through a
+    /// relatch sweep. A handfile row's signature columns hold the BATCH's two signatures, which the per-row
+    /// recompute refuses: without the skip the sweep demoted every exploded row to 0 (RED with `door_filed_row`
+    /// answering false: `demoted` 2, both rows at 0).
+    #[tokio::test]
+    async fn fastc_a_door_filed_row_keeps_its_verdict_through_the_relatch_sweep() {
+        let conn = production_schema_db();
+        // a potparty row filed by the door: a `filed:` key, junk signatures, sigValid latched 1 at the write
+        let mut filed = golden_potparty_record(&format!("filed:{}", "ab".repeat(28)));
+        filed.sig_hex = "3044".into();
+        exec_query(&conn, potparty_insert_query(&filed, 30).query());
+        conn.execute(
+            "UPDATE potparty_records SET sigValid = 1 WHERE txid LIKE 'filed:%'",
+            [],
+        )
+        .unwrap();
+        // a chain row beside it, scanned as before
+        let chain = golden_potparty_record("txPPCHAIN");
+        exec_query(&conn, potparty_insert_query(&chain, 31).query());
+        conn.execute(
+            "UPDATE potparty_records SET sigValid = NULL WHERE txid = 'txPPCHAIN'",
+            [],
+        )
+        .unwrap();
+        let table = SqliteRelatchPotparty(&conn);
+        let cursors = SqliteCursors(&conn);
+        let s = crate::relatch::relatch_pass(&table, &cursors, 100).await;
+        assert_eq!(
+            (s.scanned, s.latched, s.demoted),
+            (2, 1, 0),
+            "the filed row is left alone"
+        );
+        let read = |sql: &str| -> Option<i64> { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            read("SELECT sigValid FROM potparty_records WHERE txid LIKE 'filed:%'"),
+            Some(1)
+        );
+        assert_eq!(
+            read("SELECT sigValid FROM potparty_records WHERE txid = 'txPPCHAIN'"),
+            Some(1)
+        );
+
+        // a hopparty row at a handfile vout: the batch's signatures in its columns, markerValid 1 at the write
+        let conn = production_schema_db();
+        let mut hop = golden_hopparty_record("txHOPHANDFILE", true);
+        hop.output_index = overlay_discovery::hopparty::HANDFILE_MARKER_VOUT_BASE | 7;
+        hop.seat_sig_hex = "3044".into();
+        hop.identity_sig_hex = "3045".into();
+        exec_query(&conn, hopparty_insert_query(&hop, 40).query());
+        conn.execute(
+            "UPDATE hopparty_records SET markerValid = 1 WHERE txid = 'txHOPHANDFILE'",
+            [],
+        )
+        .unwrap();
+        let honest = golden_hopparty_record("txHOPCHAIN", true);
+        exec_query(&conn, hopparty_insert_query(&honest, 41).query());
+        conn.execute(
+            "UPDATE hopparty_records SET markerValid = NULL WHERE txid = 'txHOPCHAIN'",
+            [],
+        )
+        .unwrap();
+        let table = SqliteRelatchHopparty(&conn);
+        let cursors = SqliteCursors(&conn);
+        let s = crate::relatch::relatch_pass(&table, &cursors, 100).await;
+        assert_eq!((s.scanned, s.latched, s.demoted), (2, 1, 0));
+        let read = |sql: &str| -> Option<i64> { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            read("SELECT markerValid FROM hopparty_records WHERE txid = 'txHOPHANDFILE'"),
+            Some(1),
+            "the handfile row keeps its verdict"
+        );
+        assert_eq!(
+            read("SELECT markerValid FROM hopparty_records WHERE txid = 'txHOPCHAIN'"),
+            Some(1)
+        );
+        assert!(crate::relatch::door_filed_row("filed:x", 0));
+        assert!(crate::relatch::door_filed_row(
+            &"ab".repeat(32),
+            0x8000_0000
+        ));
+        assert!(!crate::relatch::door_filed_row(&"ab".repeat(32), 1));
     }
 
     /// The CURSOR is durable in the production table and the sweep WRAPS —

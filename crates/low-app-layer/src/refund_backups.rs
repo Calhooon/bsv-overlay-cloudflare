@@ -120,6 +120,7 @@ impl RefundBackupRowD1 {
             output_index: self.output_index.max(0.0) as u32,
             created_at: self.created_at.map(|v| v as i64),
             refund_valid: self.refund_valid.map(|v| v as i64),
+            batch: None,
         }
     }
 }
@@ -140,6 +141,9 @@ pub struct RefundBackupRow {
     /// operator (and a probe) can see which backups carry the committed-key
     /// verdict. No client money path reads it.
     pub refund_valid: Option<i64>,
+    /// bsv-low #848 (FAST-C): the batch an exploded (handfile) row belongs to; `None` for every other row, whose
+    /// bytes are therefore unchanged.
+    pub batch: Option<crate::handfile::HandfileBatchRef>,
 }
 
 /// One pot's served backups (rows newest first, ≤ `REFUND_BACKUPS_ROWS_PER_POT`).
@@ -189,15 +193,20 @@ pub fn refund_backups_body(identity: &str, backups: &[PotBackups], truncated: bo
                 "potTxid": p.pot_txid,
                 "potVout": p.pot_vout,
                 "gameId": p.game_id,
-                "rows": p.rows.iter().map(|r| serde_json::json!({
-                    "identity": r.identity,
-                    "refundRawHex": r.refund_raw_hex,
-                    "sigHex": r.sig_hex,
-                    "txid": r.txid,
-                    "refundValid": r.refund_valid,
-                    "outputIndex": r.output_index,
-                    "createdAt": r.created_at,
-                })).collect::<Vec<_>>(),
+                "rows": p.rows.iter().map(|r| {
+                    let mut row = serde_json::json!({
+                        "identity": r.identity,
+                        "refundRawHex": r.refund_raw_hex,
+                        "sigHex": r.sig_hex,
+                        "txid": r.txid,
+                        "refundValid": r.refund_valid,
+                        "outputIndex": r.output_index,
+                        "createdAt": r.created_at,
+                    });
+                    // bsv-low #848: the batch of an exploded row, absent on every other row (the bytes unchanged)
+                    overlay_discovery::handfile::attach_batch(&mut row, r.batch.as_ref());
+                    row
+                }).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -213,6 +222,45 @@ pub fn refund_backups_body(identity: &str, backups: &[PotBackups], truncated: bo
 mod tests {
     use super::*;
 
+    /// bsv-low #848 (FAST-C): a row without a batch is served byte for byte as before (no `batch` key); an
+    /// exploded row carries its batch.
+    #[test]
+    fn fastc_a_row_without_a_batch_is_unchanged_and_one_with_it_carries_it() {
+        let plain = row("aa", 0, "02aa", Some("00"), 5);
+        let before: serde_json::Value = serde_json::from_str(&refund_backups_body(
+            "02aa",
+            &assemble_refund_backups(vec![plain.clone()]),
+            false,
+        ))
+        .unwrap();
+        assert!(before["backups"][0]["rows"][0].get("batch").is_none());
+        let mut exploded = row("bb", 0, "02aa", Some("00"), 6);
+        exploded.txid = "filed:x".into();
+        exploded.batch = crate::handfile::HandfileBatchRef::of_stored(
+            "handfile:k",
+            &"77".repeat(32),
+            "[\"00\",\"01\",\"02\",\"03\"]",
+            "30",
+            "31",
+            3,
+        );
+        let both: serde_json::Value = serde_json::from_str(&refund_backups_body(
+            "02aa",
+            &assemble_refund_backups(vec![plain, exploded]),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            both["backups"][0]["rows"][0],
+            before["backups"][0]["rows"][0]
+        );
+        assert_eq!(both["backups"][1]["rows"][0]["batch"]["index"], 3);
+        assert_eq!(
+            both["backups"][1]["rows"][0]["batch"]["sigs"]["settle"],
+            "31"
+        );
+    }
+
     fn row(pot: &str, vout: u32, who: &str, raw: Option<&str>, at: i64) -> RefundBackupRow {
         RefundBackupRow {
             pot_txid: pot.repeat(32),
@@ -225,6 +273,7 @@ mod tests {
             output_index: 0,
             created_at: Some(at),
             refund_valid: None,
+            batch: None,
         }
     }
 

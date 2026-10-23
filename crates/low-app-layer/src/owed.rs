@@ -2509,6 +2509,7 @@ pub fn markerless_released_hops(
                 status_source: None,
                 marker_verified: MarkerVerification::Verified,
                 marker_created_at: None,
+                batch: None,
             };
             out.entry(key)
                 .and_modify(|held| {
@@ -10179,6 +10180,7 @@ pub(crate) mod tests {
             status_source: Some("index"),
             marker_verified: MarkerVerification::Verified,
             marker_created_at: created_ms_ago.map(|a| 1_800_000_000_000 - a),
+            batch: None,
         }
     }
 
