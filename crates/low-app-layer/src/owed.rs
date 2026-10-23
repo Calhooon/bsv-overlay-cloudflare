@@ -1270,23 +1270,40 @@ pub const FUNDING_HELD_NONE: &str = "none";
 /// index proof): a broadcaster's word, which the network's later refusal of those very bytes outranks.
 pub const FUNDING_HELD_SEEN: &str = "seen";
 /// bsv-low #598: the served `fundingHeld` of a refund-due pot whose latched funding the network then REFUSED (the
-/// tracker's chain-tier `rejected` or `conflicted` word for the pot's own txid): the same judgement as
+/// terminal mark of the pot's own txid, or a chain-tier `rejected` or `conflicted` word: [`funding_refusal_word`]):
+/// the same judgement as
 /// [`FUNDING_HELD_NONE`], named apart.
 pub const FUNDING_HELD_REFUSED: &str = "refused";
-/// PURE (bsv-low #598): the network's refusal of `txid` as the tracker's RECHECKED view states it: the chain-tier
-/// `rejected` (the host's trusted node refused the bytes) or `conflicted` (a competing spend of its inputs is mined or
-/// named by that node). Any other word, or no row, is `None`: never a refusal by absence.
+/// PURE (bsv-low #598): the network's refusal of `txid` as the tracker's RECHECKED view states it. Two producers:
+/// (1) the TERMINAL MARK, the one this tip writes (the B-OWED-2 lens's HIGH-1): the word event of the pot's own txid
+/// (`callback`, Arcade's push; `tick`, the scheduled re-ask) read Arcade's REJECTED / INVALID / MALFORMED or a double
+/// spend (`tracker_host::runtime::terminal_word`), `runtime::mark_terminal` stored it in the row, and
+/// `stored::Row::view` serves it as `terminalHint` on any word but `mined` (a checked proof clears it); (2) the
+/// chain-tier word `rejected` or `conflicted` itself (the tier read, never a hint-tier word of the same name), which
+/// only a node verdict or a competitor would produce (none is fed on this tip). Any other view, or no row, is
+/// `None`: never a refusal by absence. The fail direction: a funding Arcade refused that the network still holds (a
+/// readmission by a fresh accept, #513, keeps the mark) has its refund withheld until the pot's block, whose
+/// checked proof clears the mark and whose checked `mined` word rescues first in the arm; the refund is not
+/// pressable before that block.
 pub fn funding_refusal_word(
     words: Option<&std::collections::BTreeMap<String, Value>>,
     txid: &str,
 ) -> Option<&'static str> {
     let w = words?.get(&txid.to_ascii_lowercase())?;
-    if w["word"] == "rejected" {
-        Some("rejected")
-    } else if w["word"] == "conflicted" {
-        Some("conflicted")
-    } else {
-        None
+    let chain = w["tier"] == "chain";
+    if chain && w["word"] == "rejected" {
+        return Some("rejected");
+    }
+    if chain && w["word"] == "conflicted" {
+        return Some("conflicted");
+    }
+    if w["word"] == "mined" {
+        return None;
+    }
+    match w["terminalHint"].as_str()? {
+        "rejected" => Some("rejected"),
+        "conflicted" => Some("conflicted"),
+        _ => Some("terminal"),
     }
 }
 /// PURE (bsv-low #598): of the unspent pots whose funding the SEEN latch alone holds, those whose funding the network
@@ -2672,7 +2689,13 @@ const _: () = assert!(2 * crate::logic::D1_CHUNK_OUTPOINTS <= crate::logic::D1_M
 /// PURE (bsv-low #492): a payout row whose home output the INDEX holds spent is not a row: the wallet held the sats
 /// (the live credit landed them) and its own key spent them on (the next stake's hop), so there is nothing to collect
 /// and nothing to press, exactly as a sweep's `output_spent` retires its row and the identity's held filing retires
-/// a payout. `spent` holds [`outpoint_key`]s. Returns how many rows it retired.
+/// a payout. `spent` holds [`outpoint_key`]s. Returns how many rows it retired. The writers of that word (the
+/// B-OWED-2 lens's LOW-3): the engine's admitted spend (`d1_discovery` `mark_spent_sql`), the discovery pass's
+/// courier-found pointer bound to a content-addressed raw that consumes the outpoint, the conflict pass's mined
+/// competitor (#605) and FIX-837's guarded hop write; each rests on a transaction that spends a P2PKH home, which
+/// only the home key signs. The fail direction is a hidden row, the sats at the home key, never a false press; a
+/// pointer still UNCONFIRMED (`spentConfirmed = 0`) that the wallet later abandons (#818's class) hides the row
+/// until the pointer is released (the optional `homeSpentConfirmed` is not built).
 pub fn retire_index_spent_homes(rows: &mut Vec<OwedRow>, spent: &HashSet<String>) -> usize {
     let before = rows.len();
     rows.retain(|r| {
@@ -4614,6 +4637,81 @@ pub fn should_recompute(
     tip_now: Option<u64>,
     rows: &[OwedRow],
 ) -> bool {
+    recompute_before_unread(stale, age_ms, prev_tip, tip_now, rows)
+        || spender_unread_due(age_ms, rows)
+}
+
+/// bsv-low #608 (the B-OWED-2 lens's LOW-1): a row still marked [`OWED_FACT_SPENDER_UNREAD`] in a snapshot older than
+/// [`OWED_SPENDER_REJUDGE_AFTER_MS`].
+fn spender_unread_due(age_ms: i64, rows: &[OwedRow]) -> bool {
+    age_ms > OWED_SPENDER_REJUDGE_AFTER_MS
+        && rows
+            .iter()
+            .any(|r| r.facts[OWED_FACT_SPENDER_UNREAD] == Value::Bool(true))
+}
+
+/// PURE (bsv-low #608, the B-OWED-2 lens's LOW-1): the read recomputes ONLY because of the unread-spender rule (no
+/// other rule of [`should_recompute`] would have): the re-judgement #608 buys, counted
+/// [`COUNTER_SPENDER_REJUDGE`] by the read.
+pub fn spender_rejudge_only(
+    stale: bool,
+    age_ms: i64,
+    prev_tip: Option<u64>,
+    tip_now: Option<u64>,
+    rows: &[OwedRow],
+) -> bool {
+    !recompute_before_unread(stale, age_ms, prev_tip, tip_now, rows)
+        && spender_unread_due(age_ms, rows)
+}
+
+/// bsv-low #608 (the B-OWED-2 lens's LOW-1): the durable `ops_counters` row (the census flush; the overlay seeds it
+/// at 0), bumped once per read whose recompute only the unread-spender rule asked for.
+pub const COUNTER_SPENDER_REJUDGE: &str = "owed_spender_rejudge_total";
+/// bsv-low #608 (LOW-1): count one re-judgement ([`spender_rejudge_only`]).
+pub fn note_spender_rejudge() {
+    crate::courier::note_presence(COUNTER_SPENDER_REJUDGE);
+}
+
+/// PURE (bsv-low #608, the B-OWED-2 lens's LOW-1): a spender this pass WITHHELD by its own bound (the courier cap,
+/// the clock or the stored-read tail; `withheld`, lowercase, [`SpenderLook::withheld`]) is not an absence of bytes:
+/// the rotation reaches it on a later pass at the open list's cadence, so its row's mark is taken off and the read
+/// does not recompute every minute for it. The mark stays on a spender LOOKED at that gave no bytes (a courier with
+/// nothing, a stored read that missed) and on every row of a pass whose pot-spenders read faulted (`faulted`: a
+/// fault, never a bound). Returns the marks taken off.
+pub fn unmark_withheld_spenders(
+    rows: &mut [OwedRow],
+    withheld: &HashSet<String>,
+    faulted: bool,
+) -> usize {
+    if faulted {
+        return 0;
+    }
+    let mut n = 0;
+    for r in rows.iter_mut() {
+        if r.facts[OWED_FACT_SPENDER_UNREAD] != Value::Bool(true) {
+            continue;
+        }
+        let named = r.facts["chainSpender"]
+            .as_str()
+            .or_else(|| r.facts["spendingTxid"].as_str())
+            .map(str::to_ascii_lowercase);
+        if named.is_some_and(|sp| withheld.contains(&sp)) {
+            if let Some(obj) = r.facts.as_object_mut() {
+                obj.remove(OWED_FACT_SPENDER_UNREAD);
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+fn recompute_before_unread(
+    stale: bool,
+    age_ms: i64,
+    prev_tip: Option<u64>,
+    tip_now: Option<u64>,
+    rows: &[OwedRow],
+) -> bool {
     if stale {
         return true;
     }
@@ -4633,12 +4731,7 @@ pub fn should_recompute(
         return true;
     }
     // bsv-low #608: a "could not judge the spender" row whose bytes were not read is asked again past a minute
-    let spender_unread = rows
-        .iter()
-        .any(|r| r.facts[OWED_FACT_SPENDER_UNREAD] == Value::Bool(true));
-    if spender_unread && age_ms > OWED_SPENDER_REJUDGE_AFTER_MS {
-        return true;
-    }
+    // (`spender_unread_due`, in `should_recompute`)
     let has_open = rows.iter().any(row_is_open);
     (has_open && age_ms > OWED_RECOMPUTE_OPEN_AFTER_MS) || age_ms > OWED_RECOMPUTE_ANY_AFTER_MS
 }
@@ -4732,6 +4825,7 @@ pub fn owed_mirrored_counter_names() -> Vec<String> {
         .collect();
     names.push(COUNTER_RECOMPUTES.to_string());
     names.push(COUNTER_REFUND_FUNDING_UNHELD.to_string());
+    names.push(COUNTER_SPENDER_REJUDGE.to_string());
     names.push("applayer_owed_read_faults_total".to_string());
     names.extend(
         OWED_READ_FAULT_KINDS

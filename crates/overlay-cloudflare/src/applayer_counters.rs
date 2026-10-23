@@ -125,6 +125,8 @@ pub fn names() -> Vec<String> {
     v.push("applayer_owed_recomputes_total".to_string());
     // bsv-low #831 (the FIX-831 lens's L3): the refund-due pots the owed judgement found funding-not-held
     v.push("owed_refund_funding_unheld_total".to_string());
+    // bsv-low #608 (the B-OWED-2 lens's LOW-1): the reads whose recompute only the unread-spender rule asked for
+    v.push("owed_spender_rejudge_total".to_string());
     v.push("applayer_owed_read_faults_total".to_string());
     v.extend(
         OWED_READ_FAULT_KINDS

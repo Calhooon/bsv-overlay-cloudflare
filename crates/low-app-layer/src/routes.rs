@@ -5360,6 +5360,12 @@ async fn owed_recompute_inner(
     // the clock) keeps its previous row, marked `refresh: "withheld"`, never "could not judge"; a faulted read is
     // never withheld and keeps its fault row. One PK read, made only when such a row exists.
     let spenders_withheld = spender_look.withheld();
+    // bsv-low #608 (the B-OWED-2 lens's LOW-1): a spender the pass's own bound withheld is no absence of bytes
+    crate::owed::unmark_withheld_spenders(
+        &mut rows,
+        &spenders_withheld,
+        inputs.pot_spenders_faulted,
+    );
     let withheld_outpoints =
         crate::owed::withheld_hop_outpoints(&inputs, &rows, &spenders_withheld);
     if !withheld_outpoints.is_empty() {
@@ -5529,7 +5535,10 @@ async fn owed_recompute_inner(
     // 7c. bsv-low #492: a payout whose HOME OUTPUT the index holds spent (the live credit landed it in the wallet and
     //     the wallet's own key spent it on) is not a row: no press reads "Collected" over sats already held. One PK
     //     read per 45 home outputs, none when no payout row names its output; a faulted read retires nothing (the
-    //     rows stand as derived). After the shed carry, so a carried row is judged by the same word.
+    //     rows stand as derived). After the shed carry, so a carried row is judged by the same word. The statement
+    //     arithmetic (the B-OWED-2 lens's LOW-4): ceil(n / 45) statements for n payout rows naming their vout, so 0
+    //     for none, 1 up to 45, 2 from 46 to 90, 3 from 91; the tier's `owed-first-read` cell holds one such read
+    //     against its named `stmts` ceiling (`tools/lane-499/ceilings.json`).
     let homes = crate::owed::payout_home_outpoints(&rows);
     if !homes.is_empty() {
         #[derive(Deserialize)]
@@ -7142,6 +7151,9 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             let cut = st.truncated.unwrap_or(0.0) != 0.0;
             if crate::owed::should_recompute(stale, age_ms, prev_tip, tip_now, &rows) {
                 let source: &'static str = if stale { "read-stale" } else { "read-aged" };
+                if crate::owed::spender_rejudge_only(stale, age_ms, prev_tip, tip_now, &rows) {
+                    crate::owed::note_spender_rejudge();
+                }
                 match ctx.data.wait.clone() {
                     // SERVE THEN REFRESH (the stranded cell's run 3, 2026-09-19): the rows in hand answer NOW; the
                     // recompute (the walks, the chain rung's couriers, the spenders' bytes) runs after the answer

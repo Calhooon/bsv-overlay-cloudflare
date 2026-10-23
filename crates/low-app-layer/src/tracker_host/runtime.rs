@@ -598,7 +598,7 @@ async fn event_held(
         held_proof(env, txid).await?
     };
     let first_party = live || kind == "submit";
-    let terminal = std::cell::Cell::new(false);
+    let terminal = std::cell::Cell::new(None);
     if matches!(kind, "fallback" | "tick") && !first_party && legacy.is_none() {
         let (observation, absence, claimed_height) =
             crate::routes::tx_any_external_leg(txid, "tracker-write", env).await;
@@ -621,7 +621,7 @@ async fn event_held(
         {
             if let Ok(v) = Verdict::from_arc_body(txid, &bytes) {
                 let hint = v.into_hint("arcade", now);
-                terminal.set(terminal_hint(&hint));
+                terminal.set(terminal_word(&hint));
                 state
                     .step(&params, &empty, Input::Hint(hint))
                     .expect("hint input");
@@ -667,7 +667,7 @@ async fn event_held(
                     if url.starts_with(arc) {
                         if let Some((200, bytes)) = &response {
                             if let Ok(v) = Verdict::from_arc_body(txid, bytes) {
-                                terminal.set(terminal_hint(&v.into_hint("arcade", now)));
+                                terminal.set(terminal_word(&v.into_hint("arcade", now)));
                             }
                         }
                     }
@@ -685,16 +685,7 @@ async fn event_held(
         }
     }
     let mut row = stored::project(old.as_ref(), &state, now, legacy);
-    if terminal.get() || row.word == "mined" {
-        let mut body = row
-            .legacy_body
-            .as_deref()
-            .or_else(|| old.as_ref().and_then(|r| r.legacy_body.as_deref()))
-            .and_then(|s| serde_json::from_str::<Value>(s).ok())
-            .unwrap_or_else(|| json!({}));
-        body["trackerTerminal"] = json!(terminal.get() && row.word != "mined");
-        row.legacy_body = Some(body.to_string());
-    }
+    mark_terminal(&mut row, old.as_ref(), terminal.get());
     stored::write(env, &row).await?;
     Ok(row)
 }
@@ -935,10 +926,45 @@ pub fn hook_may_reask(kind: &str, has_reask: bool) -> bool {
 }
 
 pub fn terminal_hint(hint: &Hint) -> bool {
-    matches!(
-        hint.status,
-        HintStatus::Rejected { .. } | HintStatus::DoubleSpend { .. }
-    )
+    terminal_word(hint).is_some()
+}
+
+/// PURE (bsv-low #598, the B-OWED-2 lens's HIGH-1): the refusal a terminal Arcade hint names, `rejected` (REJECTED,
+/// INVALID, MALFORMED) or `conflicted` (DOUBLE_SPEND_ATTEMPTED, UTXO_SPENT, or a competitor named beside an accepting
+/// word); `None` for every other hint. A hint, never a chain word: the tracker keeps the word (NS-3).
+pub fn terminal_word(hint: &Hint) -> Option<&'static str> {
+    match hint.status {
+        HintStatus::Rejected { .. } => Some("rejected"),
+        HintStatus::DoubleSpend { .. } => Some("conflicted"),
+        _ => None,
+    }
+}
+
+/// PURE (bsv-low #757; #598): the terminal mark of the stored row, the producer `/owed` reads for a latched funding
+/// the network refused. A terminal Arcade hint (`terminal`) on a word that is not mined sets `trackerTerminal: true`
+/// and `trackerTerminalWord` ([`terminal_word`]) in the row's legacy body (the old row's body kept otherwise, as the
+/// UPSERT's `COALESCE` keeps it); a mined word clears both. A later non-terminal hint leaves the mark as it stands
+/// (the body is not rewritten), so the mark ends only at a checked proof. [`stored::Row::view`] serves it.
+pub fn mark_terminal(row: &mut Row, old: Option<&Row>, terminal: Option<&'static str>) {
+    if terminal.is_none() && row.word != "mined" {
+        return;
+    }
+    let mut body = row
+        .legacy_body
+        .as_deref()
+        .or_else(|| old.and_then(|r| r.legacy_body.as_deref()))
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or_else(|| json!({}));
+    let marked = terminal.filter(|_| row.word != "mined");
+    body["trackerTerminal"] = json!(marked.is_some());
+    match (marked, body.as_object_mut()) {
+        (Some(word), _) => body["trackerTerminalWord"] = json!(word),
+        (None, Some(obj)) => {
+            obj.remove("trackerTerminalWord");
+        }
+        (None, None) => {}
+    }
+    row.legacy_body = Some(body.to_string());
 }
 
 #[cfg(test)]
