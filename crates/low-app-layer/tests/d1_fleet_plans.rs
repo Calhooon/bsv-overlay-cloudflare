@@ -1049,3 +1049,46 @@ fn fix838_the_eviction_release_searches_by_the_spender() {
         );
     }
 }
+
+/// bsv-low #492: the home-spent read of the owed recompute runs on every pass with a payout row naming its output;
+/// over the shipped migrations it answers the SPENT home outputs only and every OR'd term searches the primary key
+/// (never a scan of `pot_records`), at every arity up to the chunk bound.
+#[test]
+fn fix492_the_home_spent_read_answers_by_key() {
+    let db = Connection::open_in_memory().unwrap();
+    for sql in OVERLAY_MIGRATIONS {
+        if let Err(e) = db.execute_batch(sql) {
+            assert!(e.to_string().contains("duplicate column"), "{e}: {sql}");
+        }
+    }
+    let t = |b: char| b.to_string().repeat(64);
+    for (txid, vout, spent) in [
+        (t('a'), 0, 0),
+        (t('a'), 1, 1),
+        (t('b'), 0, 1),
+        (t('c'), 2, 0),
+    ] {
+        db.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?1, ?2, ?3, 1790000000)",
+            rusqlite::params![txid, vout, spent],
+        )
+        .unwrap();
+    }
+    let sql = low_app_layer::owed::payout_home_spent_sql(3);
+    let mut stmt = db.prepare(&sql).unwrap();
+    let got: Vec<(String, i64)> = stmt
+        .query_map(rusqlite::params![t('a'), 1, t('b'), 0, t('c'), 2], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(got, vec![(t('a'), 1), (t('b'), 0)]);
+    for n in [1, 2, 45] {
+        let details = plan(&db, &low_app_layer::owed::payout_home_spent_sql(n));
+        assert!(
+            details.iter().all(|d| !d.starts_with("SCAN")),
+            "arity {n} scans: {details:?}"
+        );
+    }
+}

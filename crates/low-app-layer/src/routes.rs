@@ -5526,6 +5526,54 @@ async fn owed_recompute_inner(
         }
     }
 
+    // 7c. bsv-low #492: a payout whose HOME OUTPUT the index holds spent (the live credit landed it in the wallet and
+    //     the wallet's own key spent it on) is not a row: no press reads "Collected" over sats already held. One PK
+    //     read per 45 home outputs, none when no payout row names its output; a faulted read retires nothing (the
+    //     rows stand as derived). After the shed carry, so a carried row is judged by the same word.
+    let homes = crate::owed::payout_home_outpoints(&rows);
+    if !homes.is_empty() {
+        #[derive(Deserialize)]
+        struct HomeSpentD1 {
+            txid: String,
+            #[serde(rename = "outputIndex")]
+            output_index: f64,
+        }
+        let mut spent: HashSet<String> = HashSet::new();
+        for chunk in homes.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
+            let binds: Vec<JsValue> = chunk
+                .iter()
+                .flat_map(|(t, v)| [JsValue::from_str(t), JsValue::from_f64(*v as f64)])
+                .collect();
+            match db
+                .prepare(crate::owed::payout_home_spent_sql(chunk.len()))
+                .bind(&binds)
+            {
+                Ok(stmt) => match stmt
+                    .counted_all()
+                    .await
+                    .and_then(|r| r.results::<HomeSpentD1>())
+                {
+                    Ok(found) => spent.extend(
+                        found
+                            .into_iter()
+                            .map(|r| crate::owed::outpoint_key(&r.txid, r.output_index as u32)),
+                    ),
+                    Err(e) => console_warn!(
+                        "[owed] #492 home spent read failed (the payout rows stand): {e}"
+                    ),
+                },
+                Err(e) => console_warn!("[owed] #492 home spent bind failed: {e}"),
+            }
+        }
+        let retired = crate::owed::retire_index_spent_homes(&mut rows, &spent);
+        if retired > 0 {
+            worker::console_log!(
+                "[owed] recompute {source} {rid} for {}…: {retired} payout row(s) retired, the home output spent in the index",
+                &identity_lc[..12.min(identity_lc.len())]
+            );
+        }
+    }
+
     // 8. write: the identity's rows replaced and the marker stamped in ONE batch (all or nothing; at most 503
     //    statements: `owed::owed_write_plan`, the same statements the real-SQLite pin runs)
     let plan = crate::owed::owed_write_plan(identity_lc, &rows, now_ms, tip, walk_cut);
@@ -12178,6 +12226,43 @@ mod tests {
         ] {
             assert!(code.contains(&squash(needle)), "{what}: missing from the route");
         }
+    }
+
+    /// bsv-low #492: the recompute's wiring of the home-spent word, read off the route source: the payout rows' home
+    /// outputs are read AFTER the shed carry and BEFORE the write plan, and the spent ones retire their rows. Over the
+    /// source alone, so it runs on 45b83a32: RED there at "the home outputs of the payout rows".
+    #[test]
+    fn fix492_b_the_recompute_retires_a_payout_by_its_home_outputs_index_word() {
+        let code: String = fix800_code().split_whitespace().collect();
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let at = |needle: &str, what: &str| {
+            code.find(&squash(needle))
+                .unwrap_or_else(|| panic!("{what}: missing from the route"))
+        };
+        let homes = at(
+            "let homes = crate::owed::payout_home_outpoints(&rows);",
+            "the home outputs of the payout rows",
+        );
+        let retire = at(
+            "let retired = crate::owed::retire_index_spent_homes(&mut rows, &spent);",
+            "the retirement",
+        );
+        let carry = at(
+            "let shed = crate::owed::carry_shed_rows(&inputs, &mut rows, &prev);",
+            "the shed carry",
+        );
+        let plan = at(
+            "let plan = crate::owed::owed_write_plan(identity_lc, &rows, now_ms, tip, walk_cut);",
+            "the write plan",
+        );
+        assert!(
+            carry < homes && homes < retire && retire < plan,
+            "after the carry, before the write"
+        );
+        at(
+            ".prepare(crate::owed::payout_home_spent_sql(chunk.len()))",
+            "the shipped statement",
+        );
     }
 
     // ── the second FIX-800 delta lens fold (bsv-low #800): a hook shed during the alarm, the fire time, the line ──

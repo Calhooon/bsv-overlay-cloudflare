@@ -2640,6 +2640,54 @@ pub fn mark_pay_vouts(rows: &mut [OwedRow], vouts: &HashMap<String, u32>) -> usi
     marked
 }
 
+/// PURE (bsv-low #492): the HOME OUTPUTS (`payTxid`:`payVout`, lowercase txid) of the payout rows that name one: the
+/// settle's (named by [`mark_pay_vouts`]) and the sweep's (named at the derivation). Sorted, deduplicated.
+pub fn payout_home_outpoints(rows: &[OwedRow]) -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = rows
+        .iter()
+        .filter(|r| r.family == OwedFamily::Payout)
+        .filter_map(|r| {
+            let txid = r.facts.get("payTxid")?.as_str()?;
+            let vout = u32::try_from(r.facts.get("payVout")?.as_u64()?).ok()?;
+            crate::logic::valid_txid(txid).then(|| (txid.to_ascii_lowercase(), vout))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+/// bsv-low #492: the read of the INDEX's own spend word for `n` home outputs (one PK term per outpoint): the outputs
+/// `pot_records` holds SPENT (a `tm_lowfund`-admitted P2PKH home, consumed by an admitted spend: only the home key
+/// signs it). `n` is at most [`crate::logic::D1_CHUNK_OUTPOINTS`] (two binds each).
+pub fn payout_home_spent_sql(n: usize) -> String {
+    let terms = (0..n.max(1))
+        .map(|k| format!("(txid = ?{} AND outputIndex = ?{})", 2 * k + 1, 2 * k + 2))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    format!(
+        "SELECT lower(txid) AS txid, outputIndex FROM pot_records WHERE spent = 1 AND ({terms})"
+    )
+}
+const _: () = assert!(2 * crate::logic::D1_CHUNK_OUTPOINTS <= crate::logic::D1_MAX_BOUND_PARAMS);
+/// PURE (bsv-low #492): a payout row whose home output the INDEX holds spent is not a row: the wallet held the sats
+/// (the live credit landed them) and its own key spent them on (the next stake's hop), so there is nothing to collect
+/// and nothing to press, exactly as a sweep's `output_spent` retires its row and the identity's held filing retires
+/// a payout. `spent` holds [`outpoint_key`]s. Returns how many rows it retired.
+pub fn retire_index_spent_homes(rows: &mut Vec<OwedRow>, spent: &HashSet<String>) -> usize {
+    let before = rows.len();
+    rows.retain(|r| {
+        r.family != OwedFamily::Payout
+            || !matches!(
+                (
+                    r.facts.get("payTxid").and_then(Value::as_str),
+                    r.facts.get("payVout").and_then(Value::as_u64),
+                ),
+                (Some(t), Some(v)) if u32::try_from(v).is_ok_and(|v| spent.contains(&outpoint_key(t, v)))
+            )
+    });
+    before - rows.len()
+}
+
 /// The `payVout` read's OWN wall clock, counted from the step's start, never the recompute's (the B3 delta lens
 /// D-L1): the step runs last, so behind the recompute's clock a heavy identity read `null` on every pass. The
 /// first chunk is read whatever any clock says; a later chunk is read while the step is inside this budget.
@@ -11387,6 +11435,57 @@ pub(crate) mod tests {
         assert!(
             served().is_empty(),
             "filings that name no payout transaction of the game change nothing"
+        );
+    }
+
+    /// bsv-low #492 (the collect pass of 2026-09-20, p3's game `09f991df…`: the wallet held `+39,200 f40fa0d4…` since
+    /// the live credit, the row stayed claimable and the press said "Collected" over sats already held): a payout row
+    /// whose HOME OUTPUT (`payTxid`:`payVout`) the index holds SPENT is not a row (the wallet held it and its own key
+    /// spent it on), by the INDEX's word alone; an unspent or unread home keeps the row byte for byte, and no other
+    /// family is touched. RED with the retirement inert (`retire_index_spent_homes` keeping every row).
+    #[test]
+    fn fix492_a_payout_whose_home_output_the_index_holds_spent_is_not_a_row() {
+        let paid = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        )];
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let derived = derive_owed_rows(&inputs(&paid, &[], &[], &v, &c, &p, Some(900_200)));
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].family, OwedFamily::Payout);
+        assert_eq!(derived[0].facts["claimable"], true, "today: a press");
+        let settle = derived[0].facts["payTxid"].as_str().unwrap().to_string();
+        // no vout named yet: no home to read, nothing retired
+        assert!(payout_home_outpoints(&derived).is_empty());
+        // the route names the vout from the spend's bytes (`mark_pay_vouts`)
+        let mut named = derived.clone();
+        named[0].facts["payVout"] = json!(1);
+        assert_eq!(payout_home_outpoints(&named), vec![(settle.clone(), 1)]);
+        // the index holds the home output UNSPENT (or another output spent): the row stands, byte for byte
+        let other: HashSet<String> = [outpoint_key(&settle, 0)].into_iter().collect();
+        let mut kept = named.clone();
+        assert_eq!(retire_index_spent_homes(&mut kept, &other), 0);
+        assert_eq!(kept, named);
+        // the index holds it SPENT: not a row
+        let spent: HashSet<String> = [outpoint_key(&settle, 1)].into_iter().collect();
+        let mut gone = named.clone();
+        assert_eq!(
+            retire_index_spent_homes(&mut gone, &spent),
+            1,
+            "a payout the wallet already received and spent on is never a press"
+        );
+        assert!(gone.is_empty());
+        // a non-payout row naming the same outpoint is untouched
+        let mut unbound = named.clone();
+        unbound[0].family = OwedFamily::Unbound;
+        assert_eq!(retire_index_spent_homes(&mut unbound, &spent), 0);
+        // the statement: one PK term per outpoint, two binds each, spent rows only
+        assert_eq!(
+            payout_home_spent_sql(2),
+            "SELECT lower(txid) AS txid, outputIndex FROM pot_records WHERE spent = 1 AND \
+             ((txid = ?1 AND outputIndex = ?2) OR (txid = ?3 AND outputIndex = ?4))"
         );
     }
 
