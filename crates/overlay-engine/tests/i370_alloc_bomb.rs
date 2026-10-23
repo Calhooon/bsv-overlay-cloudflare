@@ -154,15 +154,29 @@ fn bombs() -> Vec<(&'static str, Vec<u8>)> {
         ("V1 BUMP count 2^32-1", cat(&[&V1, &HUGE_U32])),
         ("V1 transaction count 2^64-1", cat(&[&V1, &[0], &HUGE_U64])),
         ("V2 transaction count 2^32-1", cat(&[&V2, &[0], &HUGE_U32])),
-        ("V1 input count 2^32-1", cat(&[&V1, &[0], &[1], &[1, 0, 0, 0], &HUGE_U32])),
-        ("V2 raw-tx input count 2^64-1", cat(&[&V2, &[0], &[1], &[0], &[1, 0, 0, 0], &HUGE_U64])),
+        (
+            "V1 input count 2^32-1",
+            cat(&[&V1, &[0], &[1], &[1, 0, 0, 0], &HUGE_U32]),
+        ),
+        (
+            "V2 raw-tx input count 2^64-1",
+            cat(&[&V2, &[0], &[1], &[0], &[1, 0, 0, 0], &HUGE_U64]),
+        ),
         (
             "V1 unlocking script length 2^64-1",
             cat(&[&V1, &[0], &[1], &tx_head_one_input(), &HUGE_U64]),
         ),
         (
             "V1 output count 2^32-1",
-            cat(&[&V1, &[0], &[1], &tx_head_one_input(), &[0], &[0xff; 4], &HUGE_U32]),
+            cat(&[
+                &V1,
+                &[0],
+                &[1],
+                &tx_head_one_input(),
+                &[0],
+                &[0xff; 4],
+                &HUGE_U32,
+            ]),
         ),
         (
             "V1 locking script length 2^32-1",
@@ -179,9 +193,18 @@ fn bombs() -> Vec<(&'static str, Vec<u8>)> {
             ]),
         ),
         // a BUMP: block height 1, tree height 1, level 0 declaring 2^32-1 leaves
-        ("V1 BUMP leaf count 2^32-1", cat(&[&V1, &[1], &[1], &[1], &HUGE_U32])),
-        ("V1 BUMP tree height 255", cat(&[&V1, &[1], &[1], &[0xff], &HUGE_U32])),
-        ("atomic V1 transaction count 2^64-1", atomic(cat(&[&V1, &[0], &HUGE_U64]))),
+        (
+            "V1 BUMP leaf count 2^32-1",
+            cat(&[&V1, &[1], &[1], &[1], &HUGE_U32]),
+        ),
+        (
+            "V1 BUMP tree height 255",
+            cat(&[&V1, &[1], &[1], &[0xff], &HUGE_U32]),
+        ),
+        (
+            "atomic V1 transaction count 2^64-1",
+            atomic(cat(&[&V1, &[0], &HUGE_U64])),
+        ),
         // the same declarations after a run of padding the bytes do hold (a body that is not tiny)
         (
             "V1 transaction count 2^32-1, 64 KiB of tail",
@@ -212,7 +235,10 @@ fn i370_a_declared_huge_count_is_refused_before_anything_is_sized() {
         for mode in [SubmitMode::CurrentTx, SubmitMode::HistoricalTx] {
             let tagged = TaggedBEEF::new(body.clone(), vec![TOPIC.to_string()]);
             let (answer, submit_peak) = peak_of(|| runtime.block_on(engine.submit(&tagged, mode)));
-            assert!(answer.is_err(), "{name}: the ungated submit ({mode:?}) refuses it: {answer:?}");
+            assert!(
+                answer.is_err(),
+                "{name}: the ungated submit ({mode:?}) refuses it: {answer:?}"
+            );
             assert!(
                 submit_peak <= BOMB_HEAP_BOUND + body.len(),
                 "{name}: the submit ({mode:?}) held {submit_peak} bytes, past {BOMB_HEAP_BOUND} beside the body"
@@ -226,6 +252,8 @@ fn i370_a_declared_huge_count_is_refused_before_anything_is_sized() {
         }
         let took = started.elapsed();
         assert!(took < BOMB_TIME_BOUND, "{name}: answered in {took:?}");
-        println!("{name}: refused, peaks read {read_peak} parse {parse_peak} sdk {sdk_peak}, {took:?}");
+        println!(
+            "{name}: refused, peaks read {read_peak} parse {parse_peak} sdk {sdk_peak}, {took:?}"
+        );
     }
 }
