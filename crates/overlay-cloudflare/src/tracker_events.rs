@@ -117,14 +117,26 @@ fn failed(mut frame: Value) {
         enqueue(frame);
     }
 }
-/// The production POST boundary, also used by the refusal/recovery pin.
+/// PURE (bsv-low #660, B-OWED-3-FOLD L2): whether `/internal/tx-word`'s 2xx answer says the frame was HELD (written).
+/// An app layer before the fold answers `{"ok":true}` alone: held, as it was counted.
+pub fn answered_held(answer: &str) -> bool {
+    serde_json::from_str::<Value>(answer)
+        .ok()
+        .and_then(|v| v.get("held").and_then(Value::as_bool))
+        .unwrap_or(true)
+}
+
+/// The production POST boundary, also used by the refusal/recovery pin. The post answers `Ok(held)`: a frame the
+/// app layer held is counted `shipped`; one it dropped as unheld (B-OWED-3-FOLD L2) `unheld`, never `shipped`; a
+/// refused POST is retried once.
 pub async fn deliver<F, Fut>(frame: Value, post: F)
 where
     F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = Result<(), String>>,
+    Fut: std::future::Future<Output = Result<bool, String>>,
 {
     match post(frame.to_string()).await {
-        Ok(()) => count(&frame, "shipped"),
+        Ok(true) => count(&frame, "shipped"),
+        Ok(false) => count(&frame, "unheld"),
         Err(_) => failed(frame),
     }
 }
@@ -154,9 +166,9 @@ pub async fn ship_until(env: &worker::Env, events: Vec<Value>, deadline: u64) {
             continue;
         };
         deliver(frame, |body| async {
-            crate::change_flush::post_body(env, url, token, "/internal/tx-word", "tx-word", body)
+            crate::change_flush::post_body_answer(env, url, token, "/internal/tx-word", "tx-word", body)
                 .await
-                .map(|_| ())
+                .map(|answer| answered_held(&answer))
                 .map_err(|_| "undelivered".to_string())
         })
         .await;
@@ -183,7 +195,7 @@ mod tests {
         let retry = drain();
         assert_eq!(retry.len(), 1);
         assert_eq!(retry[0]["body"]["merklePath"], "00");
-        deliver(retry.into_iter().next().unwrap(), |_| async { Ok(()) }).await;
+        deliver(retry.into_iter().next().unwrap(), |_| async { Ok(true) }).await;
         assert!(drain().is_empty());
         assert_eq!(health_json()["tracker_events_index_shipped_total"], 1);
     }

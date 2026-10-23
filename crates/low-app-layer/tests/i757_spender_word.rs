@@ -197,7 +197,7 @@ fn headers_for(proof: &Proof) -> HeaderSnapshot {
 /// `raw_bytes` is false), a pushed proof then the held one checked against our header, the projection, the mined
 /// marker and the guarded upsert. Not modelled: the Arcade GETs of `callback` and a tick's re-ask (`hook_may_reask`,
 /// reached only when no proof checked), and a stranger tick's courier leg (a held subject is first party).
-async fn tx_word(db: &Connection, hold_sql: &str, body: String, now: u64) -> Result<(), String> {
+async fn tx_word(db: &Connection, hold_sql: &str, body: String, now: u64) -> Result<bool, String> {
     let frame: Value = serde_json::from_str(&body).unwrap();
     let txid = frame["txid"].as_str().unwrap().to_ascii_lowercase();
     let kind = frame["kind"].as_str().unwrap_or("refresh").to_string();
@@ -248,10 +248,14 @@ async fn tx_word(db: &Connection, hold_sql: &str, body: String, now: u64) -> Res
     })
     .await
     .map_err(|e| e.to_string())?;
+    let held = row.is_some();
     if let Some(row) = row {
         write(db, &row);
     }
-    Ok(())
+    // the handler's answer, as the overlay reads it (B-OWED-3-FOLD L2)
+    Ok(tracker_events::answered_held(
+        &runtime::ingest_answer(held).to_string(),
+    ))
 }
 
 /// Ship what the overlay noted, through its real `drain` and `deliver`, into the handler.
@@ -784,4 +788,57 @@ fn b_owed_3_m1_the_route_renotes_after_the_write_before_the_first_flush() {
         tracker_events::seen_body(SeenSource::Arcade.wire(), 7),
         json!({"source": SeenSource::Arcade.wire(), "at": 7})
     );
+}
+
+/// bsv-low #660 (B-OWED-3-FOLD, the lens's L2): a frame the app layer drops as unheld is NAMED on both sides: the
+/// handler answers `held: false` (and counts `applayer_tracker_event_unheld_total`, mirrored, seeded by the
+/// overlay) and the overlay counts it `tracker_events_<source>_unheld_total`, never `shipped`. RED on b29b684c's
+/// `deliver` (no answer read): the unheld frame counted `shipped`.
+#[tokio::test]
+async fn b_owed_3_l2_an_unheld_frame_is_counted_unheld_on_both_sides() {
+    let db = db();
+    let count = |name: &str| tracker_events::health_json()[name].as_u64().unwrap_or(0);
+    let (shipped, unheld) = (
+        count("tracker_events_arcade_shipped_total"),
+        count("tracker_events_arcade_unheld_total"),
+    );
+    // a settle whose mark has not landed: the latch's seen is dropped
+    let (settle, beef) = settle_tx(30, None);
+    retain(&db, &settle, &beef);
+    seed_built(&db, &settle, 1_000);
+    tracker_events::drain();
+    latch_seen(&settle, 1_000_500);
+    ship(&db, stored::LIVE_HOLD, 1_001).await;
+    assert_eq!(read(&db, &settle).unwrap().word, "built");
+    assert_eq!(
+        (
+            count("tracker_events_arcade_shipped_total") - shipped,
+            count("tracker_events_arcade_unheld_total") - unheld
+        ),
+        (0, 1),
+        "the unheld drop is named, never counted shipped"
+    );
+    // held: shipped
+    pot_spent_by(&db, &pot(31), 0, &settle);
+    latch_seen(&settle, 1_000_600);
+    ship(&db, stored::LIVE_HOLD, 1_002).await;
+    assert_eq!(read(&db, &settle).unwrap().word, "seen");
+    assert_eq!(count("tracker_events_arcade_shipped_total") - shipped, 1);
+    // the answer's words, and an app layer before the fold (no `held`) read as held
+    assert!(!tracker_events::answered_held(r#"{"ok":true,"held":false}"#));
+    assert!(tracker_events::answered_held(r#"{"ok":true,"held":true}"#));
+    assert!(tracker_events::answered_held(r#"{"ok":true}"#));
+    // the handler counts the drop and answers it; the route takes the counters on its answer
+    let runtime_src: String = include_str!("../src/tracker_host/runtime.rs")
+        .split_whitespace()
+        .collect();
+    let ingest = &runtime_src[runtime_src.find("pubasyncfningest(").unwrap()..];
+    let ingest = &ingest[..ingest.find("pubconstCOUNTER_TRACKER_EVENT_UNHELD").unwrap()];
+    assert!(ingest.contains("if!held{note_unheld();}"));
+    assert!(ingest.contains("Response::from_json(&ingest_answer(held))"));
+    let lib: String = include_str!("../src/lib.rs").split_whitespace().collect();
+    let door = &lib[lib.find("req.path()==\"/internal/tx-word\"{").unwrap()..];
+    assert!(door[..door.find("returnresp;").unwrap()].contains("flush_counters_if_due(&ctx,&env);"));
+    assert!(bsv_overlay_cloudflare::applayer_counters::names()
+        .contains(&runtime::COUNTER_TRACKER_EVENT_UNHELD.to_string()));
 }
