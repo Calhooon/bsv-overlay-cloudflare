@@ -278,18 +278,18 @@
       "censusKey": null
     },
     "health-invariants": {
-      "route": "/health/invariants: the overlay's invariants read, the second of two answers 250 ms apart (the harness cells' settle shape, bsv-low #838); its reads issued in one join, its rows-read bump after the answer (writes 0 at the answer). settleCeilingMs: the two answers' wall time on the fixture, measured 325 ms (2026-10-22, LANE_BASE 38380), held far under the harness's 20 s settle; not a production latency (local D1 has no queue).",
+      "route": "/health/invariants: the overlay's invariants read, the second of two answers 250 ms apart (the harness cells' settle shape, bsv-low #838); its reads issued in one join, its rows-read bump after the answer (writes 0 at the answer). settleCeilingMs: the two answers' wall time on the fixture, measured 325 ms (2026-10-22, LANE_BASE 38380), held far under the harness's 20 s settle; not a production latency (local D1 has no queue). Re-measured 2026-10-23 12:19Z on the merged main 35ddb423 (LANE_BASE 47800): stmts 32 (29 at b1ad9a1; 30 after PR 146's cost bar read; 32 after PR 147's conflict-memo health and scheduled-pass view, one statement each), reads within 78 (the tier named stmts alone); the ceiling stmts 34 keeps the file's +2 margin.",
       "measured": {
         "reads": 52,
         "writes": 0,
-        "stmts": 29,
+        "stmts": 32,
         "maxReads": 8,
         "settleMs": 325
       },
       "ceiling": {
         "reads": 78,
         "writes": 0,
-        "stmts": 31,
+        "stmts": 34,
         "maxReads": 12
       },
       "settleCeilingMs": 5000,
