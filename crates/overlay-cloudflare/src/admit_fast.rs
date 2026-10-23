@@ -2371,11 +2371,31 @@ pub fn not_final_uncertain_reason(status: &str, extra_info: &str) -> String {
 }
 
 /// PURE: fold the three couriers' words (pinned). `young`: the admission is younger than
-/// `REFUSAL_ABSENT_MIN_AGE_MS`, or the index holds no admission at all.
+/// `REFUSAL_ABSENT_MIN_AGE_MS`, or the index holds no admission at all. The pinned tables' entrance: each indexer as
+/// a bare yes or no (`door_words::courier_of_bool`), judged by [`evidence_verdict_of`].
 pub fn evidence_verdict(
     arcade: &crate::proof_fetcher::ArcadeLook,
     bitails: Option<bool>,
     woc: Option<bool>,
+    young: bool,
+) -> EvidenceVerdict {
+    use crate::door_words::{courier_of_bool, BITAILS_SOURCE, WOC_SOURCE};
+    evidence_verdict_of(
+        arcade,
+        &courier_of_bool(BITAILS_SOURCE, bitails),
+        &courier_of_bool(WOC_SOURCE, woc),
+        young,
+    )
+}
+
+/// PURE (bsv-low #619, L3): the evidence check's verdict over Arcade's look (the host's policy over Arcade's hint,
+/// `door_words::live_look`) and the two indexers' words as the tracker's hints (`door_words::courier_hint`), folded
+/// by the host's two-source bar (`door_words::courier_presence`). The policy is the host's, unchanged: a refusal
+/// needs two sources, an absence-based one the age floor.
+pub fn evidence_verdict_of(
+    arcade: &crate::proof_fetcher::ArcadeLook,
+    bitails: &crate::door_words::CourierWord,
+    woc: &crate::door_words::CourierWord,
     young: bool,
 ) -> EvidenceVerdict {
     use crate::proof_fetcher::{ArcadeLook, NetworkPresence};
@@ -2394,8 +2414,11 @@ pub fn evidence_verdict(
         // REJECTED is never the network's verdict (#214: Arcade held txs
         // MINED in 958776 at a sticky REJECTED), and an indexer that holds
         // the tx is a witness against the refusal.
-        ArcadeLook::Fatal(..) | ArcadeLook::Recorded(..) | ArcadeLook::Missing | ArcadeLook::Fault => {
-            match crate::proof_fetcher::classify_presence(bitails.map(crate::proof_fetcher::bool_presence), woc.map(crate::proof_fetcher::bool_presence)) {
+        ArcadeLook::Fatal(..)
+        | ArcadeLook::Recorded(..)
+        | ArcadeLook::Missing
+        | ArcadeLook::Fault => {
+            match crate::door_words::courier_presence(bitails, woc) {
                 NetworkPresence::Present { .. } => EvidenceVerdict::Present,
                 // Absence-based (Arcade missing or faulted, its recorded word included: not its own fatal word):
                 // a young or never-admitted txid is UNCERTAIN (counted), never refused (the gate's HIGH-2; #740).
@@ -2429,12 +2452,13 @@ pub fn evidence_verdict(
 
 /// PURE (bsv-low #836, #845): the verdict on a look that refuses nothing: an indexer that holds the txid is
 /// presence; otherwise `Uncertain` (`why`, or a courier fault), never `Refused`.
-fn never_refused(bitails: Option<bool>, woc: Option<bool>, why: String) -> EvidenceVerdict {
+fn never_refused(
+    bitails: &crate::door_words::CourierWord,
+    woc: &crate::door_words::CourierWord,
+    why: String,
+) -> EvidenceVerdict {
     use crate::proof_fetcher::NetworkPresence;
-    match crate::proof_fetcher::classify_presence(
-        bitails.map(crate::proof_fetcher::bool_presence),
-        woc.map(crate::proof_fetcher::bool_presence),
-    ) {
+    match crate::door_words::courier_presence(bitails, woc) {
         NetworkPresence::Present { .. } => EvidenceVerdict::Present,
         NetworkPresence::Absent => EvidenceVerdict::Uncertain(why),
         NetworkPresence::Inconclusive => {
@@ -2510,12 +2534,15 @@ pub async fn evidence_check(
         };
         look = crate::door_words::bound_look(look, &bound);
     }
+    // bsv-low #619 (L3): each indexer's answer as the tracker's hint from its source (its mined height kept on the
+    // hint, where the bare yes or no dropped it; the verdict reads presence either way)
     let indexers = async {
+        use crate::door_words::{courier_hint, BITAILS_SOURCE, WOC_SOURCE};
         let b = sources.bitails_presence(txid).await;
         let w = sources.woc_presence(env.woc_api_key.as_deref(), txid).await;
         (
-            b.map(crate::proof_fetcher::presence_bool),
-            w.map(crate::proof_fetcher::presence_bool),
+            courier_hint(BITAILS_SOURCE, b, 0),
+            courier_hint(WOC_SOURCE, w, 0),
         )
     };
     let age = async {
@@ -2535,20 +2562,26 @@ pub async fn evidence_check(
 /// only when the refusal would rest on absence. An unknown age (no admission, no ledger) is young.
 pub(crate) async fn verdict_of_look(
     look: &crate::proof_fetcher::ArcadeLook,
-    indexers: impl std::future::Future<Output = (Option<bool>, Option<bool>)>,
+    indexers: impl std::future::Future<
+        Output = (
+            crate::door_words::CourierWord,
+            crate::door_words::CourierWord,
+        ),
+    >,
     admission_age: impl std::future::Future<Output = Option<u64>>,
 ) -> EvidenceVerdict {
+    use crate::door_words::CourierWord;
     let (bitails, woc) = match look {
         // Arcade holds it: nothing to corroborate. Every other word (fatal,
         // missing, a fault) is one source; the indexers are the second.
-        crate::proof_fetcher::ArcadeLook::Present => (None, None),
+        crate::proof_fetcher::ArcadeLook::Present => (CourierWord::Fault, CourierWord::Fault),
         _ => indexers.await,
     };
     let young = refusal_rests_on_absence(look)
         && admission_age
             .await
             .is_none_or(|age| age < REFUSAL_ABSENT_MIN_AGE_MS);
-    evidence_verdict(look, bitails, woc, young)
+    evidence_verdict_of(look, &bitails, &woc, young)
 }
 
 /// bsv-low #836 fold (the lens's M1): where the subject's own bytes are read for its lock, in order: the engine's
@@ -5993,7 +6026,12 @@ mod tests {
         let db = SqliteShadow::new(conn);
         let pushed = ("REJECTED".to_string(), "pushed extra".to_string());
         let look = crate::proof_fetcher::fold_arcade_look(live, Some(pushed.clone()));
-        let indexers = async { (Some(false), Some(false)) };
+        let indexers = async {
+            (
+                crate::door_words::CourierWord::Absent,
+                crate::door_words::CourierWord::Absent,
+            )
+        };
         let conn = &db.conn;
         let txid_ref = txid.as_str();
         let age = admission_age_over(

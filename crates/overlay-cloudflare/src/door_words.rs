@@ -406,6 +406,96 @@ fn word_of(hint: &Hint) -> String {
     word_of_hint(hint).unwrap_or_default().to_string()
 }
 
+/// The hint sources the door names the two indexers by (the words map's S11 couriers).
+pub const BITAILS_SOURCE: &str = "bitails";
+/// See [`BITAILS_SOURCE`].
+pub const WOC_SOURCE: &str = "woc";
+
+/// bsv-low #619 (L3, the words map's S11): one courier's answer about a transaction, as the door hosts it. A
+/// courier that holds the bytes speaks the tracker's own value, a [`Hint`] from its source; a clean 404 and a
+/// fault are no input to the tracker (a provider error is no input, and absence is never evidence), and they stay
+/// apart here because the host's two-source bar ([`courier_presence`]) reads a clean absence and never a fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CourierWord {
+    /// The courier holds the transaction: `HintStatus::Mined { height }` (its blockheight, a mined CLAIM the tracker
+    /// never writes as a chain word) or `HintStatus::MempoolPresent { source }` (held unmined: `announced` in the
+    /// tracker, never `seen`, the captain's ruling under D1 / #602 of 2026-10-12).
+    Holds(Hint),
+    /// A definitive 404 from this courier: no input to the tracker; one half of the host's absence bar.
+    Absent,
+    /// The courier could not say (a transport or HTTP fault, a body that does not read, a disabled or paced
+    /// source): no input, and never absence.
+    Fault,
+}
+
+/// bsv-low #619 (L3): the adapter, a courier's presence answer (`proof_fetcher::presence_response`, the HTTP reader
+/// in front of it) as the tracker's hint. A height of zero is already mempool there. `Some(Inconclusive)` is no answer
+/// `presence_response` gives; it is a fault here, the fail-safe reading. The pure classifiers pass `observed = 0`:
+/// the door stores no hint.
+pub fn courier_hint(
+    source: &str,
+    presence: Option<crate::proof_fetcher::NetworkPresence>,
+    observed: Timestamp,
+) -> CourierWord {
+    use crate::proof_fetcher::NetworkPresence;
+    match presence {
+        Some(NetworkPresence::Present {
+            height: Some(height),
+        }) => CourierWord::Holds(Hint::new(source, HintStatus::Mined { height }, observed)),
+        Some(NetworkPresence::Present { height: None }) => CourierWord::Holds(Hint::new(
+            source,
+            HintStatus::MempoolPresent {
+                source: source.to_string(),
+            },
+            observed,
+        )),
+        Some(NetworkPresence::Absent) => CourierWord::Absent,
+        Some(NetworkPresence::Inconclusive) | None => CourierWord::Fault,
+    }
+}
+
+/// bsv-low #619 (L3): the bare yes or no the pinned tables speak (`Some(true)` held unmined, `Some(false)` a clean
+/// absence, `None` a fault) as a courier word, the entrance of the evidence check's and the retire pass's pinned
+/// signatures.
+pub fn courier_of_bool(source: &str, present: Option<bool>) -> CourierWord {
+    courier_hint(source, present.map(crate::proof_fetcher::bool_presence), 0)
+}
+
+/// The courier's mined claim, when its hint is one.
+fn mined_claim(word: &CourierWord) -> Option<u32> {
+    match word {
+        CourierWord::Holds(Hint {
+            status: HintStatus::Mined { height },
+            ..
+        }) => Some(*height),
+        _ => None,
+    }
+}
+
+/// bsv-low #619 (L3): the HOST'S two-source fold over the two indexers' words (#212, #213, #214 made mechanical): any
+/// courier that holds it is presence, a mined claim taken first from Bitails then from WoC (a claim the host admits
+/// on where D1 says so, never the tracker's `mined`); absence needs BOTH clean 404s; anything else (a fault, one 404
+/// beside a fault) could not say. Byte-identical to the fold it replaces (`proof_fetcher::classify_presence`,
+/// pinned over every pair of answers).
+pub fn courier_presence(
+    bitails: &CourierWord,
+    woc: &CourierWord,
+) -> crate::proof_fetcher::NetworkPresence {
+    use crate::proof_fetcher::NetworkPresence;
+    if let Some(height) = mined_claim(bitails).or_else(|| mined_claim(woc)) {
+        return NetworkPresence::Present {
+            height: Some(height),
+        };
+    }
+    match (bitails, woc) {
+        (CourierWord::Holds(_), _) | (_, CourierWord::Holds(_)) => {
+            NetworkPresence::Present { height: None }
+        }
+        (CourierWord::Absent, CourierWord::Absent) => NetworkPresence::Absent,
+        _ => NetworkPresence::Inconclusive,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,5 +897,233 @@ mod tests {
             )
             .unwrap();
         assert!(state.word().chain().is_none(), "{:?}", state.word());
+    }
+
+    /// The headers the tracker is asked nothing of: a hint never reads a header.
+    struct NoHeaders;
+    impl bsv_tracker::Headers for NoHeaders {
+        fn header_at(
+            &self,
+            _: bsv_tracker::Height,
+        ) -> Result<Option<bsv_tracker::Header>, bsv_tracker::HeaderError> {
+            Ok(None)
+        }
+        fn tip_height(&self) -> Result<bsv_tracker::Height, bsv_tracker::HeaderError> {
+            Ok(0)
+        }
+    }
+
+    /// The fold the host's [`courier_presence`] replaces (`proof_fetcher::classify_presence` at `d370d906`), kept
+    /// verbatim so the equivalence below is against the base's own text.
+    fn base_classify_presence(
+        bitails: Option<crate::proof_fetcher::NetworkPresence>,
+        woc: Option<crate::proof_fetcher::NetworkPresence>,
+    ) -> crate::proof_fetcher::NetworkPresence {
+        use crate::proof_fetcher::NetworkPresence::{Absent, Inconclusive, Present};
+        match (bitails, woc) {
+            (
+                Some(Present {
+                    height: Some(height),
+                }),
+                _,
+            )
+            | (
+                _,
+                Some(Present {
+                    height: Some(height),
+                }),
+            ) => Present {
+                height: Some(height),
+            },
+            (Some(Present { .. }), _) | (_, Some(Present { .. })) => Present { height: None },
+            (Some(Absent), Some(Absent)) => Absent,
+            _ => Inconclusive,
+        }
+    }
+
+    /// Every answer one courier can give, and two it cannot (a second height, `Inconclusive`).
+    fn courier_answers() -> Vec<Option<crate::proof_fetcher::NetworkPresence>> {
+        use crate::proof_fetcher::NetworkPresence::{Absent, Inconclusive, Present};
+        vec![
+            None,
+            Some(Absent),
+            Some(Inconclusive),
+            Some(Present { height: None }),
+            Some(Present { height: Some(1) }),
+            Some(Present {
+                height: Some(970_710),
+            }),
+        ]
+    }
+
+    /// bsv-low #619 (L3, S11): a courier's answer enters as the tracker's own hint, from its source, and the tracker
+    /// writes no chain word on it: a mempool presence is `announced` over `built` (bsv-tracker 0.7.0's ruling (2)),
+    /// a mined claim is no `mined`; a clean 404 and a fault are no input.
+    #[test]
+    fn l3_s11_a_couriers_word_is_the_trackers_hint_and_writes_no_chain_word() {
+        use crate::proof_fetcher::NetworkPresence;
+        let held = courier_hint(
+            WOC_SOURCE,
+            Some(NetworkPresence::Present { height: None }),
+            7,
+        );
+        assert_eq!(
+            held,
+            CourierWord::Holds(Hint::new(
+                "woc",
+                HintStatus::MempoolPresent {
+                    source: "woc".into()
+                },
+                7
+            ))
+        );
+        let mined = courier_hint(
+            BITAILS_SOURCE,
+            Some(NetworkPresence::Present {
+                height: Some(970_710),
+            }),
+            9,
+        );
+        assert_eq!(
+            mined,
+            CourierWord::Holds(Hint::new(
+                "bitails",
+                HintStatus::Mined { height: 970_710 },
+                9
+            ))
+        );
+        assert_eq!(
+            courier_hint(WOC_SOURCE, Some(NetworkPresence::Absent), 0),
+            CourierWord::Absent
+        );
+        assert_eq!(courier_hint(WOC_SOURCE, None, 0), CourierWord::Fault);
+        assert_eq!(
+            courier_hint(WOC_SOURCE, Some(NetworkPresence::Inconclusive), 0),
+            CourierWord::Fault
+        );
+        let params = bsv_tracker::Params { age_threshold: 0 };
+        let mut state = bsv_tracker::State::new(TXID);
+        state
+            .step(
+                &params,
+                &NoHeaders,
+                bsv_tracker::Input::Host(bsv_tracker::HostAction::Build),
+            )
+            .unwrap();
+        let CourierWord::Holds(held) = held else {
+            unreachable!()
+        };
+        state
+            .step(&params, &NoHeaders, bsv_tracker::Input::Hint(held))
+            .unwrap();
+        assert_eq!(state.word(), &bsv_tracker::Word::Announced);
+        let CourierWord::Holds(mined) = mined else {
+            unreachable!()
+        };
+        state
+            .step(&params, &NoHeaders, bsv_tracker::Input::Hint(mined))
+            .unwrap();
+        assert!(
+            !matches!(state.word(), bsv_tracker::Word::Mined(_)),
+            "a courier's height is a claim, never the tracker's mined: {:?}",
+            state.word()
+        );
+    }
+
+    /// bsv-low #619 (L3, S11): the host's fold over the couriers' hints answers what the base's hand-written fold
+    /// answered, for every pair of answers (36), and the tables' bare yes or no enters as the base's `bool_presence`.
+    #[test]
+    fn l3_s11_the_hosts_fold_over_the_hints_is_the_fold_it_replaces() {
+        let answers = courier_answers();
+        for b in &answers {
+            for w in &answers {
+                assert_eq!(
+                    courier_presence(
+                        &courier_hint(BITAILS_SOURCE, *b, 0),
+                        &courier_hint(WOC_SOURCE, *w, 0)
+                    ),
+                    base_classify_presence(*b, *w),
+                    "bitails {b:?}, woc {w:?}"
+                );
+            }
+        }
+        let bools = [None, Some(false), Some(true)];
+        for b in bools {
+            for w in bools {
+                assert_eq!(
+                    courier_presence(
+                        &courier_of_bool(BITAILS_SOURCE, b),
+                        &courier_of_bool(WOC_SOURCE, w)
+                    ),
+                    base_classify_presence(
+                        b.map(crate::proof_fetcher::bool_presence),
+                        w.map(crate::proof_fetcher::bool_presence)
+                    ),
+                    "bitails {b:?}, woc {w:?}"
+                );
+            }
+        }
+    }
+
+    /// A production function's text: from `start` to the next `end`, comments and all.
+    fn prod_slice<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+        let prod = &src[..src.find("#[cfg(test)]").expect("the test module")];
+        let from = prod
+            .find(start)
+            .unwrap_or_else(|| panic!("{start} in production"));
+        let to = from
+            + prod[from..]
+                .find(end)
+                .unwrap_or_else(|| panic!("{end} after {start}"));
+        &prod[from..to]
+    }
+
+    /// The source of a decision reads the couriers through the adapter and the host's fold, and never through the
+    /// hand-written one.
+    fn assert_reads_the_couriers_hints(what: &str, text: &str, through: &str) {
+        let code: String = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("classify_presence("),
+            "{what} folds the couriers by the hand-written classify_presence"
+        );
+        assert!(
+            !code.contains("presence_bool"),
+            "{what} drops a courier's word to a bare bool"
+        );
+        assert!(
+            code.contains(through),
+            "{what} reads the couriers' hints through {through}"
+        );
+    }
+
+    /// bsv-low #619 (L3), slice 1: the pending watch's and the refusal callback's evidence check (both reach it through
+    /// `admit_fast::evidence_check`) read the couriers' words as the tracker's hints.
+    #[test]
+    fn l3_slice1_the_evidence_check_reads_the_couriers_hints() {
+        let src = include_str!("admit_fast.rs");
+        assert_reads_the_couriers_hints(
+            "the evidence verdict",
+            prod_slice(
+                src,
+                "pub fn evidence_verdict(",
+                "pub fn conflict_eviction_reason(",
+            ),
+            "door_words::courier_presence(",
+        );
+        let check = prod_slice(
+            src,
+            "pub async fn evidence_check(",
+            "pub(crate) const SUBJECT_BEEF_SQL",
+        );
+        assert_reads_the_couriers_hints("the evidence check", check, "evidence_verdict_of(");
+        assert!(
+            check.contains("courier_hint(BITAILS_SOURCE, b, 0)")
+                && check.contains("courier_hint(WOC_SOURCE, w, 0)"),
+            "the evidence check hands each courier's answer to the adapter under its source"
+        );
     }
 }
