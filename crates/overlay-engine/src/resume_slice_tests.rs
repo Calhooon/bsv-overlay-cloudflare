@@ -174,3 +174,78 @@ async fn i590_c_each_resume_of_a_sync_walks_its_own_slice() {
         assert_eq!(i590_record_nodes(&engine, root).await, Some(5), "{root}");
     }
 }
+/// IDENT-ENGINE-LENS case 3a: three seven-node graphs at 3 s per node,
+/// with a 120 s peer budget and the unchanged 15 s graph clamp. Pass two
+/// must converge all three, the lens's counterfactual A.
+#[tokio::test]
+async fn ident_fold_m1_three_resumes_converge_with_a_peer_budget() {
+    let (mut engine, remote, chains) = i590_chain_engine(3, 6, 3_000);
+    let sleep = i590_virtual_sleep(&remote);
+    engine.set_peer_sync_budget(sleep.clone(), 120_000);
+    engine.set_graph_budget(sleep, 100, 15_000);
+    engine.set_gasp_remote_factory(Box::new(remote.clone()));
+    let first = engine.start_gasp_sync().await.unwrap();
+    assert_eq!(first.topics_synced["tm_test"].deferred_graphs, 3);
+    for chain in &chains {
+        assert_eq!(
+            i590_record_nodes(&engine, &format!("{}.0", chain[0])).await,
+            Some(5)
+        );
+    }
+    let before = remote.elapsed.get();
+    let second = engine.start_gasp_sync().await.unwrap();
+    let topic = &second.topics_synced["tm_test"];
+    assert_eq!(
+        (
+            topic.resumed_graphs,
+            topic.converged_graphs,
+            topic.held_back_graphs
+        ),
+        (3, 3, 0),
+        "case 3a: every resume converges under its own slice"
+    );
+    assert_eq!(remote.elapsed.get() - before, 27_000);
+    for chain in &chains {
+        assert_eq!(
+            i590_record_nodes(&engine, &format!("{}.0", chain[0])).await,
+            None
+        );
+    }
+}
+
+/// A resume started inside the share keeps its own walk slice and its
+/// last node's slice. The fourth resume starts at 37.5 s, before the
+/// 39.6 s share, and finishes at 61.5 s after a 14 s final request.
+#[tokio::test]
+async fn ident_fold_m1_a_started_resume_finishes_past_the_share() {
+    let (mut engine, remote, chains) = i590_chain_engine(4, 9, 2_500);
+    let sleep = i590_virtual_sleep(&remote);
+    engine.set_peer_sync_budget(sleep.clone(), 120_000);
+    engine.set_graph_budget(sleep, 100, 15_000);
+    engine.set_gasp_remote_factory(Box::new(remote.clone()));
+    let first = engine.start_gasp_sync().await.unwrap();
+    assert_eq!(first.topics_synced["tm_test"].deferred_graphs, 4);
+    *remote.slow_once.borrow_mut() = Some((chains[3][9].clone(), 11_500));
+    let before = remote.elapsed.get();
+    let second = engine.start_gasp_sync().await.unwrap();
+    let topic = &second.topics_synced["tm_test"];
+    assert_eq!(
+        (
+            topic.resumed_graphs,
+            topic.converged_graphs,
+            topic.held_back_graphs
+        ),
+        (4, 4, 0),
+        "a started resume keeps its own slice and finishes its last node"
+    );
+    let elapsed = remote.elapsed.get() - before;
+    assert_eq!(elapsed, 61_500);
+    assert!(
+        elapsed > 39_600 + 15_000,
+        "share plus one slice is not a bound"
+    );
+    assert!(
+        elapsed < 39_600 + 2 * 15_000,
+        "share plus two slices bounds the walks"
+    );
+}

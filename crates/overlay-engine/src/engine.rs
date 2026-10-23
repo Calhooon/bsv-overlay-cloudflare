@@ -5549,8 +5549,8 @@ impl Engine {
                             deadline: Box::new(move || sleep(budget_ms)),
                             half_deadline: Some(Box::new(move || half_sleep(budget_ms / 2))),
                         });
-                        // Engine 0.1.11: the resumes take a named share of
-                        // the per-peer slice, the rest is the page's.
+                        // The share gates resume starts only. A started
+                        // resume keeps its own slice; the peer bounds all.
                         if let Some((_, peer_ms)) = &self.peer_sync_budget {
                             let share_ms = crate::gasp::resume_share_ms(*peer_ms, budget_ms);
                             sync = sync.with_resume_share(Box::new(move || share_sleep(share_ms)));
@@ -11478,10 +11478,11 @@ mod tests {
     /// 0.1.11 (the page's share): fourteen obligations of fact 3's shape
     /// ahead of a page of twelve fresh roots, every request 1,500 ms of a
     /// virtual 30,000 ms per-peer slice and a 15,000 ms graph budget. The
-    /// resumes take at most `resume_share_ms(30_000, 15_000)` = 9,900 ms
-    /// together; those reached after it are held back (not resumed, not a
+    /// resumes start inside `resume_share_ms(30_000, 15_000)` = 9,900 ms;
+    /// those reached after it are held back (not resumed, not a
     /// failure, not stalled, not idle, their records as they were) and the
-    /// page's twelve roots are all walked and finalized in the same run.
+    /// page's first eleven roots finalize; the twelfth is held behind the
+    /// earlier faulted records until their backoff frees its resume share.
     /// On 0.1.10 the resumes shared one graph budget (15,000 ms): ten of
     /// them ran, and the per-peer deadline dropped the sync at nine of the
     /// page's twelve roots (fact 4: the page got what the resumes left).
@@ -11513,23 +11514,23 @@ mod tests {
         assert_eq!(crate::gasp::resume_share_ms(30_000, 15_000), 9_900);
         let result = engine.start_gasp_sync().await.unwrap();
         let topic = &result.topics_synced["tm_test"];
-        assert!(topic.errors.is_empty(), "inside the slice: {topic:?}");
-        assert_eq!(topic.finalized_graphs, 12, "the page's share: {topic:?}");
+        assert_eq!(
+            topic.errors.len(),
+            1,
+            "the peer bounds the last page root: {topic:?}"
+        );
+        assert!(topic.errors[0].contains("per-peer sync budget"));
+        assert_eq!(topic.deadline_dropped_graphs, 1);
+        assert_eq!(topic.finalized_graphs, 11, "the page's share: {topic:?}");
         assert_eq!(topic.cursor_moves[0].to, 120);
-        // Three resumes struck; the fourth deferred by the share (`time`);
-        // the other ten held back. Since bsv-low #590 (the finish-the-node
-        // rule) the fourth's request in flight when the share fell due
-        // FINISHES and the share is read before its next step: it appends
-        // its root and is deferred with it (progress: not stalled, not
-        // idle). Until #590 the share cut that request in flight, the
-        // resume appended nothing and was counted idle and stalled. Engine 0.1.15:
-        // each resume asks the peer for the parent the courier cannot serve
-        // (#56), two requests of 1,500 ms, so the 9,900 ms share holds three
-        // (six on 0.1.11 to 0.1.14, one request each).
+        // Four resumes start inside the 9,900 ms share. The fourth now
+        // finishes its own walk too, so all four strike the unavailable
+        // ancestor and the other ten stay untouched. Eleven page roots
+        // land; the peer deadline defers the twelfth.
         assert_eq!(topic.resumed_graphs, 4, "{topic:?}");
         assert_eq!(topic.held_back_graphs, 10, "{topic:?}");
-        assert_eq!(topic.faulted_roots.len(), 3, "{topic:?}");
-        assert_eq!((topic.stalled_graphs, topic.idle_counted), (0, 0));
+        assert_eq!(topic.faulted_roots.len(), 4, "{topic:?}");
+        assert_eq!((topic.stalled_graphs, topic.idle_counted), (1, 0));
         assert_eq!(topic.deferred_graphs, 1, "{topic:?}");
         assert!(topic.cursor_held_by.is_empty());
         let host = "https://budget.example";
@@ -11552,9 +11553,40 @@ mod tests {
             reasons,
             std::collections::BTreeMap::from([
                 ("retry".to_string(), 10),
-                ("retry:fault:courier".to_string(), 3),
-                ("time".to_string(), 1),
+                ("retry:fault:courier".to_string(), 4),
             ])
+        );
+        let last = &remote.outputs.last().unwrap().txid;
+        assert!(engine
+            .storage
+            .find_output(last, 0, Some("tm_test"), None, true)
+            .await
+            .unwrap()
+            .is_none());
+        let mut passes = 1;
+        while engine
+            .storage
+            .find_output(last, 0, Some("tm_test"), None, true)
+            .await
+            .unwrap()
+            .is_none()
+            && passes < 12
+        {
+            engine.start_gasp_sync().await.unwrap();
+            passes += 1;
+        }
+        assert!(
+            engine
+                .storage
+                .find_output(last, 0, Some("tm_test"), None, true)
+                .await
+                .unwrap()
+                .is_some(),
+            "the page root remains resumable behind the earlier faulted records"
+        );
+        assert_eq!(
+            passes, 10,
+            "the fourteen older faults reach backoff in four cohorts"
         );
     }
 
