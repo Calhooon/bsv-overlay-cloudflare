@@ -1383,6 +1383,13 @@ impl Engine {
     /// the write (the Cloudflare worker's eviction, register row D1, calls
     /// the shared function with its own managers). Nothing here touches
     /// storage: the host's own eviction removes the rows.
+    ///
+    /// Library consumers, including Zanaadu's pf managers, must call this
+    /// method themselves after learning a refusal, with the admission's
+    /// BEEF and the outputs each topic admitted. There is no automatic
+    /// abort trigger or `throwOnBroadcastFailure` switch in this engine.
+    /// If that refusal is later reversed, the host must reconcile the
+    /// manager's provisional state as well as its stored rows.
     pub async fn abort_provisional_admissions(
         &self,
         beef: &[u8],
