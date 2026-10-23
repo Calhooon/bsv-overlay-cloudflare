@@ -28,6 +28,7 @@ reasons! {
     TerminalYoung => "terminal_judged_young",
     TerminalInconclusive => "terminal_judged_inconclusive",
     TerminalCapped => "terminal_judged_capped",
+    TerminalNotFinal => "terminal_judged_not_final",
     CorroboratorUnconfirmed => "corroborating_broadcaster_could_not_confirm",
     BroadcastFault => "broadcast_fault",
     NetworkRejected => "network_rejected",
@@ -75,6 +76,7 @@ impl Reason {
             TerminalJudgement::Young => Self::TerminalYoung,
             TerminalJudgement::Inconclusive => Self::TerminalInconclusive,
             TerminalJudgement::Capped => Self::TerminalCapped,
+            TerminalJudgement::NotFinal => Self::TerminalNotFinal,
         }
     }
 

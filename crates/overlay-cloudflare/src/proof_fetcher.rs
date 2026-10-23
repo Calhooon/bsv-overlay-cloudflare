@@ -4329,6 +4329,14 @@ pub enum ArcadeLook {
     /// or never-admitted txid is uncertain under it (`admit_fast::refusal_rests_on_absence`). The retire pass's
     /// verdict reads it as its absence arm (bsv-low #765: 48 h, the absence reason, the `retired` memo).
     Recorded(String, String),
+    /// bsv-low #836: Arcade's LIVE REJECTED that names TX_LOCK_TIME (35) (`door_words::lock_time_not_final`), with
+    /// its word and reason text: not final against Arcade's peer's chain view, a time, never a verdict. The evidence
+    /// check never refuses on it; the retire pass reads it as its absence arm (48 h), never its 1 h terminal arm.
+    NotFinal(String, String),
+    /// bsv-low #845: Arcade holds it below SEEN (RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK; the word): a hint
+    /// that promotes nothing. Never presence (the indexers are asked), never a refusal (the evidence check answers
+    /// `Uncertain` without an indexer); the retire pass takes its absence arm (48 h).
+    Holding(String),
 }
 
 /// bsv-low #451 slice C (iv): the verdict memo the dead-letter pass leaves for `/tx-any` (the app layer's
@@ -4410,6 +4418,14 @@ pub fn retire_verdict(
                 "network-absent {age_secs}s: arcade 404 + both indexers 404"
             ))
         }
+        // bsv-low #845: Arcade's rank below SEEN is a hint, never presence: the absence arm, its own words
+        ArcadeLook::Holding(word) if age_secs >= RETIRE_ABSENT_MIN_AGE_SECS => Some(format!(
+            "network-absent {age_secs}s: arcade holds it below SEEN ({word}, a hint) + both indexers 404"
+        )),
+        // bsv-low #836: a non-final word is a time, never Arcade's terminal word: the absence arm, never the 1 h arm
+        ArcadeLook::NotFinal(word, _) if age_secs >= RETIRE_ABSENT_MIN_AGE_SECS => Some(format!(
+            "network-absent {age_secs}s: arcade {word} not final (TX_LOCK_TIME, a time, never a verdict) + both indexers 404"
+        )),
         _ => None,
     }
 }
@@ -4653,6 +4669,9 @@ pub(crate) enum RetireEviction {
 pub(crate) trait RetirePort {
     /// Arcade's live word on the txid, the recorded `arc_terminal` word filling a fault ([`arcade_look`]).
     async fn arcade(&self, txid: &str, evidence: Option<(String, String)>) -> ArcadeLook;
+    /// bsv-low #836 fold (the lens's M1): what bounds a non-final word's hold, the subject's own lock from its stored
+    /// bytes and the chaintracks tip ([`crate::admit_fast::stored_lock_bound`]). Asked only of a `NotFinal` look.
+    async fn lock_bound(&self, txid: &str) -> crate::door_words::LockBound;
     /// Bitails' presence (`None`: could not say).
     async fn bitails(&self, txid: &str) -> Option<NetworkPresence>;
     /// WhatsOnChain's presence (`None`: could not say).
@@ -4787,7 +4806,12 @@ pub(crate) async fn retire_evidence<P: RetirePort>(
     txid: &str,
     evidence: Option<(String, String)>,
 ) -> RetireEvidence {
-    let look = port.arcade(txid, evidence).await;
+    let mut look = port.arcade(txid, evidence).await;
+    // bsv-low #836 fold (the lens's M1): a non-final word past the chain's bound is Arcade's refusal again, judged
+    // as any other (the 1 h terminal arm)
+    if matches!(look, ArcadeLook::NotFinal(..)) {
+        look = crate::door_words::bound_look(look, &port.lock_bound(txid).await);
+    }
     if matches!(look, ArcadeLook::Present) {
         return RetireEvidence {
             look,
@@ -5315,6 +5339,8 @@ struct WorkerRetire<'a> {
     arcade_base: &'a str,
     woc_api_key: Option<&'a str>,
     sources: ProofSources,
+    /// bsv-low #836 fold: the chaintracks tip a non-final word's hold is bounded by.
+    tracker: Option<Rc<dyn ChainTracker>>,
 }
 
 impl RetirePort for WorkerRetire<'_> {
@@ -5322,6 +5348,9 @@ impl RetirePort for WorkerRetire<'_> {
         self.sources
             .arcade_look(self.arcade_base, txid, evidence)
             .await
+    }
+    async fn lock_bound(&self, txid: &str) -> crate::door_words::LockBound {
+        crate::admit_fast::stored_lock_bound(self.tracker.as_deref(), self.db, txid).await
     }
     async fn bitails(&self, txid: &str) -> Option<NetworkPresence> {
         self.sources.bitails_presence(txid).await
@@ -5483,6 +5512,7 @@ pub async fn run_retire_pass(
     arcade_base: &str,
     woc_api_key: Option<&str>,
     sources: ProofSources,
+    tracker: Option<Rc<dyn ChainTracker>>,
 ) -> RetireSummary {
     use crate::d1::Query;
     let port = WorkerRetire {
@@ -5490,6 +5520,7 @@ pub async fn run_retire_pass(
         arcade_base,
         woc_api_key,
         sources,
+        tracker,
     };
     let budget = RetireBudget::begin(&port);
     let conflict = crate::admit_fast::confirmed_conflict_pass(db, woc_api_key, sources).await;
@@ -5619,6 +5650,7 @@ pub async fn internal_retire_pass(
             &arcade_base,
             woc_key.as_deref(),
             ProofSources::from_env(env),
+            crate::lookup_service_chain_tracker(env),
         ),
     )
     .await;
@@ -6877,10 +6909,24 @@ pub(crate) mod tests {
                 "{w:?}"
             );
         }
+        // bsv-low #845: Arcade's ranks below SEEN are a hint, never presence; the #836 fold's L3: so are its two words
+        // that carry no network verdict
+        for w in ["RECEIVED", "sent_to_network", "ACCEPTED_BY_NETWORK", "PENDING_RETRY", "unknown"] {
+            assert_eq!(
+                live_arcade_look(w, x()),
+                ArcadeLook::Holding(w.to_ascii_uppercase()),
+                "{w:?}"
+            );
+        }
+        // bsv-low #836: the non-final REJECTED is a time, never Arcade's terminal word
+        assert_eq!(
+            live_arcade_look("REJECTED", "TX_LOCK_TIME (35): lock time (9) as block height is not less than block height (8)".into()),
+            ArcadeLook::NotFinal(
+                "REJECTED".into(),
+                "TX_LOCK_TIME (35): lock time (9) as block height is not less than block height (8)".into()
+            )
+        );
         for w in [
-            "RECEIVED",
-            "PENDING_RETRY",
-            "UNKNOWN",
             "SEEN_ON_NETWORK",
             "STUMP_PROCESSING",
             "immutable",

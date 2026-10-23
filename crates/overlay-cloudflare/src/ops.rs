@@ -310,6 +310,17 @@ pub const COUNTER_SUBMIT_TERMINAL_YOUNG: &str = "submit_terminal_judged_young_to
 pub const COUNTER_SUBMIT_TERMINAL_INCONCLUSIVE: &str = "submit_terminal_judged_inconclusive_total";
 /// Judged: this isolate's courier budget spent.
 pub const COUNTER_SUBMIT_TERMINAL_CAPPED: &str = "submit_terminal_judged_capped_total";
+/// bsv-low #836: the door met Arcade's non-final REJECTED (TX_LOCK_TIME (35), its peer's chain view behind the
+/// lock height) and answered the retryable 502: the pre-flight probe's terminal judgement, the submit echo, or the
+/// SEEN poll. Never a 422, never an eviction.
+pub const COUNTER_SUBMIT_LOCK_TIME_NOT_FINAL: &str = "submit_lock_time_not_final_total";
+/// bsv-low #836, the watch's twin: the pending watch looked and Arcade said non-final: held, not final, no evidence
+/// check, no eviction (once per watch).
+pub const COUNTER_SUBMIT_PENDING_LOCK_TIME_NOT_FINAL: &str =
+    "submit_pending_lock_time_not_final_total";
+/// bsv-low #836, the refusal callback's twin: an `/arc-ingest` push of the non-final REJECTED, held, not final: no
+/// evidence check, no eviction.
+pub const COUNTER_ARC_INGEST_LOCK_TIME_NOT_FINAL: &str = "arc_ingest_lock_time_not_final_total";
 /// loop 18: an admission write that outran its own eviction's table loop — re-evicted after the write, the
 /// submit answered as the refusal it is.
 pub const COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE: &str = "admit_fast_reevicted_after_write_total";
@@ -1583,6 +1594,10 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_SUBMIT_TERMINAL_YOUNG,
         COUNTER_SUBMIT_TERMINAL_INCONCLUSIVE,
         COUNTER_SUBMIT_TERMINAL_CAPPED,
+        // bsv-low #836: the non-final word at the door, the pending watch and the refusal callback.
+        COUNTER_SUBMIT_LOCK_TIME_NOT_FINAL,
+        COUNTER_SUBMIT_PENDING_LOCK_TIME_NOT_FINAL,
+        COUNTER_ARC_INGEST_LOCK_TIME_NOT_FINAL,
         COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
         COUNTER_SUBMIT_DEFERRED_PAST_DEADLINE,
         COUNTER_LANDING_REFUSED_EVICTED,

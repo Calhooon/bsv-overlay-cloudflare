@@ -1474,6 +1474,8 @@ async fn submit_parts(
                 .with_evicted_at_ms(evicted_at_ms)
                 // #519: the terminal judgement's WoC read carries the same key the evidence check reads
                 .with_woc_api_key(env.secret("WOC_API_KEY").ok().map(|s| s.to_string()))
+                // bsv-low #836 fold: the chaintracks tip that bounds Arcade's non-final word
+                .with_chain_tracker(crate::lookup_service_chain_tracker(env))
                 // NL-6d: `CORROBORATOR_URL` routes both corroborating hosts to one base (the route tier's local
                 // fixture); unset in production.
                 .with_corroborator_url(env.var("CORROBORATOR_URL").ok().map(|v| v.to_string()))
@@ -3199,6 +3201,16 @@ pub async fn arc_ingest(
             // orphan verdict is corroborated (Arcade live first, then both
             // indexers) in the post-response budget and evicts only then.
             let af_now = worker::Date::now().as_millis();
+            // bsv-low #836 fold (the lens's L1): a push naming the non-final word is counted, then read as any other
+            // push: the evidence check's LIVE look decides (the public bearer's text buys nothing)
+            if crate::admit_fast::push_names_lock_time(&tx_status, extra_info.as_deref().unwrap_or_default()) {
+                worker::console_log!(
+                    "POST /arc-ingest txid={txid} {tx_status} names TX_LOCK_TIME: the evidence check's live look decides (#836)"
+                );
+                if let Some(db) = ops_db {
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_LOCK_TIME_NOT_FINAL, 1).await;
+                }
+            }
             match crate::admit_fast::callback_action(&tx_status) {
                 crate::admit_fast::CallbackAction::LatchSeen => {
                     let job_txid = txid.clone();
