@@ -226,13 +226,13 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                 worker::console_warn!("[pot-changed] drain deferred: {e}");
             }
             if let Ok(db) = env_drain.d1("OVERLAY_DB") {
-                // N9: the take is inside the raced future: an expired deadline leaves the deltas queued.
+                // #658: the take stays inside the race; an unacknowledged batch returns on cancellation.
                 let now = worker::Date::now().as_millis() as f64;
                 if meter
                     .phase(
                         "drain.flush",
                         deadline.run(courier::take_and_flush(now, |pending| {
-                            courier::flush(Some(db), pending)
+                            courier::flush_ack(Some(db), pending)
                         })),
                     )
                     .await

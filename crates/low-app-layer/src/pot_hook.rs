@@ -3652,7 +3652,7 @@ pub(crate) mod tests {
         );
         assert!(
             task.contains(&squash(
-                "deadline.run(courier::take_and_flush(now, |pending| { courier::flush(Some(db), pending) }))"
+                "deadline.run(courier::take_and_flush(now, |pending| { courier::flush_ack(Some(db), pending) }))"
             )),
             "the drain task races the take and the flush as one future"
         );
@@ -3664,7 +3664,7 @@ pub(crate) mod tests {
         let out = expired
             .run(crate::courier::take_and_flush(0.0, |p| {
                 flushed.borrow_mut().extend(p);
-                async {}
+                async { true }
             }))
             .await;
         assert!(out.is_none(), "the deadline had fallen");
@@ -3676,7 +3676,7 @@ pub(crate) mod tests {
         let out = live
             .run(crate::courier::take_and_flush(0.0, |p| {
                 flushed.borrow_mut().extend(p);
-                async {}
+                async { true }
             }))
             .await;
         assert!(out.is_some());
@@ -3688,6 +3688,32 @@ pub(crate) mod tests {
         assert!(
             crate::courier::take_pending_if_due(1.0e12).is_empty(),
             "flushed once, not twice"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn e658_expiry_during_the_courier_flush_leaves_the_batch_for_the_next_take() {
+        let name = "e658_cancelled_flush_total";
+        crate::courier::note_presence_n(name, 7);
+        let entered = std::cell::Cell::new(false);
+        let out = paused_deadline_reserving(40, 0)
+            .run(crate::courier::take_and_flush(0.0, |pending| {
+                assert!(pending.iter().any(|(n, count)| n == name && *count == 7));
+                entered.set(true);
+                // New increments during the await must survive alongside the returned batch.
+                crate::courier::note_presence_n(name, 3);
+                std::future::pending()
+            }))
+            .await;
+        assert!(entered.get(), "the deadline must expire after the take");
+        assert!(out.is_none());
+        let next = crate::courier::take_pending_if_due(1.0e12);
+        assert_eq!(
+            next.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, count)| *count),
+            Some(10),
+            "cancellation must return the taken batch without replacing newer increments"
         );
     }
 
@@ -3715,7 +3741,7 @@ pub(crate) mod tests {
             "let deadline = routes::worker_deadline(pot_hook::DRAIN_WALL_MS, pot_hook::DRAIN_SETTLE_RESERVE_MS);",
             ".run(d1_ledger::boot(schema::ensure_latch_columns(&env_drain)))",
             "routes::drain_pot_announce(&env_drain, &deadline)",
-            "deadline.run(courier::take_and_flush(now, |pending| { courier::flush(Some(db), pending) }))",
+            "deadline.run(courier::take_and_flush(now, |pending| { courier::flush_ack(Some(db), pending) }))",
         ] {
             assert!(task.contains(&squash(step)), "the drain task: {step}");
         }

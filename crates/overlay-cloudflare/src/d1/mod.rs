@@ -612,7 +612,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 343 to 345 for bsv-low #825, #781 and #778 (B-FLEET-4): `conflict_fault_memo`, the conflict pass's per-pot fault
 /// memo (`admit_fast::CONFLICT_FAULT_MEMO_CREATE`), and `applayer_scheduled_pass`, the app layer's last scheduled
 /// pass and its phases' walls (the app layer's catch-up carries the CREATE byte for byte, `pass_meter::CREATE`).
-pub const OVERLAY_MIGRATION_COUNT: usize = 345;
+/// 345 to 346 for bsv-low #607: the one-time conflict-spender repair cursor and done stamp.
+pub const OVERLAY_MIGRATION_COUNT: usize = 346;
 
 /// bsv-low #781, #778 (B-FLEET-4): the app layer's last scheduled pass, one row (`low-app-layer` `pass_meter`).
 pub const APPLAYER_SCHEDULED_PASS_CREATE: &str = "CREATE TABLE IF NOT EXISTS applayer_scheduled_pass (id INTEGER PRIMARY KEY CHECK (id = 1), at INTEGER NOT NULL, started_at INTEGER NOT NULL, wall_ms INTEGER NOT NULL, phases TEXT NOT NULL, passes INTEGER NOT NULL DEFAULT 0)";
@@ -2277,6 +2278,8 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::admit_fast::CONFLICT_FAULT_MEMO_CREATE,
     // 345: bsv-low #781, #778 (B-FLEET-4), the app layer's last scheduled pass and its phases' walls, one row.
     APPLAYER_SCHEDULED_PASS_CREATE,
+    // 346: bsv-low #607, a fixed historical window and its durable completion stamp.
+    crate::conflict_repair::REPAIR_CREATE,
 ];
 
 // =============================================================================
