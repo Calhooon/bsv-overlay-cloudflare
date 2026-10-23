@@ -1150,4 +1150,76 @@ mod tests {
             "the ladder's terminal read hands each courier's answer to the adapter under its source"
         );
     }
+
+    /// bsv-low #619 (L3), slice 3: the retire pass reads the couriers' words as the tracker's hints at each of its
+    /// three reads (the retire look, its #602 conflict pass's competitor presence, its #273 rebroadcast backstop), and
+    /// the retire verdict's arms (#765: 1 h on Arcade's live fatal word, 48 h on absence, the recorded word as absence;
+    /// #831's ghost pot ends on the same verdict) are the host's policy over the host's fold.
+    #[test]
+    fn l3_slice3_the_retire_pass_reads_the_couriers_hints() {
+        let pf = include_str!("proof_fetcher.rs");
+        assert_reads_the_couriers_hints(
+            "the retire verdict",
+            prod_slice(
+                pf,
+                "pub fn retire_verdict(",
+                "/// Ask Arcade about a retire candidate",
+            ),
+            "door_words::courier_presence(",
+        );
+        let look = prod_slice(
+            pf,
+            "pub(crate) async fn retire_evidence<",
+            "/// bsv-low #831 half 2: what the end of one retired pot did.",
+        );
+        assert_reads_the_couriers_hints("the retire look", look, "courier_hint(BITAILS_SOURCE");
+        assert!(
+            look.contains("courier_hint(WOC_SOURCE"),
+            "the retire look hands WoC's answer to the adapter"
+        );
+        assert_reads_the_couriers_hints(
+            "the rebroadcast backstop",
+            prod_slice(
+                pf,
+                "pub(crate) async fn rebroadcast_absent_admitted(",
+                "pub fn rebroadcast_eligible(",
+            ),
+            "door_words::courier_presence(",
+        );
+        let af = include_str!("admit_fast.rs");
+        assert_reads_the_couriers_hints(
+            "the conflict pass's competitor presence",
+            prod_slice(
+                af,
+                "impl ConflictPresence for CourierConflictPresence",
+                "pub enum ConflictEvictOutcome",
+            ),
+            "door_words::courier_presence(",
+        );
+        // after the three slices no production fold of the couriers is hand-written: `classify_presence` is the
+        // host's fold over the hints, kept for its callers' pins
+        for (name, src) in [
+            ("proof_fetcher.rs", pf),
+            ("admit_fast.rs", af),
+            ("broadcaster.rs", include_str!("broadcaster.rs")),
+        ] {
+            let prod = &src[..src.find("#[cfg(test)]").expect("the test module")];
+            let calls = prod
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| {
+                    l.contains("classify_presence(") && !l.contains("pub fn classify_presence(")
+                })
+                .count();
+            assert_eq!(
+                calls, 0,
+                "{name} still folds the couriers by classify_presence"
+            );
+        }
+        let def = prod_slice(pf, "pub fn classify_presence(", "pub fn presence_response(");
+        assert!(
+            def.contains("door_words::courier_presence(") && def.contains("courier_hint("),
+            "classify_presence is the host's fold over the adapter's hints"
+        );
+    }
 }
