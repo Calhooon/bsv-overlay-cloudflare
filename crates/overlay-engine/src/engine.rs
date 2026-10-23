@@ -10460,7 +10460,12 @@ mod tests {
         #[async_trait(?Send)]
         impl AncestorFetcher for DelayedCourier {
             async fn fetch_ancestor(&self, txid: &str) -> Result<FetchedAncestor, GASPError> {
-                self.clock.set(self.clock.get() + 8_000);
+                // bsv-low #590 (the finish-the-node rule): the courier step
+                // starts at 8 s, inside the 15 s root deadline, so it is cut
+                // only past a whole slice of its own (8 + 15 = 23 s): it
+                // takes 16 s. At 8 s it finished at 16 s and the graph
+                // completed, the node in flight no longer cut at 15 s.
+                self.clock.set(self.clock.get() + 16_000);
                 tokio::task::yield_now().await;
                 self.inner.fetch_ancestor(txid).await
             }
@@ -11427,16 +11432,21 @@ mod tests {
         assert!(topic.errors.is_empty(), "inside the slice: {topic:?}");
         assert_eq!(topic.finalized_graphs, 12, "the page's share: {topic:?}");
         assert_eq!(topic.cursor_moves[0].to, 120);
-        // Three resumes struck; the fourth cut in flight by the share, having
-        // asked and appended nothing (counted idle and stalled, as 0.1.10
-        // counts a deadline's cut); the other ten held back. Engine 0.1.15:
+        // Three resumes struck; the fourth deferred by the share (`time`);
+        // the other ten held back. Since bsv-low #590 (the finish-the-node
+        // rule) the fourth's request in flight when the share fell due
+        // FINISHES and the share is read before its next step: it appends
+        // its root and is deferred with it (progress: not stalled, not
+        // idle). Until #590 the share cut that request in flight, the
+        // resume appended nothing and was counted idle and stalled. Engine 0.1.15:
         // each resume asks the peer for the parent the courier cannot serve
         // (#56), two requests of 1,500 ms, so the 9,900 ms share holds three
         // (six on 0.1.11 to 0.1.14, one request each).
         assert_eq!(topic.resumed_graphs, 4, "{topic:?}");
         assert_eq!(topic.held_back_graphs, 10, "{topic:?}");
         assert_eq!(topic.faulted_roots.len(), 3, "{topic:?}");
-        assert_eq!((topic.stalled_graphs, topic.idle_counted), (1, 1));
+        assert_eq!((topic.stalled_graphs, topic.idle_counted), (0, 0));
+        assert_eq!(topic.deferred_graphs, 1, "{topic:?}");
         assert!(topic.cursor_held_by.is_empty());
         let host = "https://budget.example";
         let mut reasons = std::collections::BTreeMap::new();
@@ -14033,4 +14043,5 @@ mod tests {
     include!("route_fault_tests.rs");
     include!("batch_tests.rs");
     include!("page_batch_tests.rs");
+    include!("resume_slice_tests.rs");
 }
