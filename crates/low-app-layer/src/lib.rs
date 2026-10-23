@@ -150,6 +150,7 @@ pub mod live_view;
 pub mod logic;
 pub mod owed;
 pub mod owed_cursor;
+pub mod pass_meter;
 pub mod pot_hook;
 pub mod proof_post;
 pub mod rate;
@@ -189,60 +190,105 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     if let (Some(window), Ok(db)) = (d1_ledger::take_cost_if_due(now), env.d1("OVERLAY_DB")) {
         ctx.wait_until(async move { d1_ledger::flush_cost(&db, window, now).await });
     }
+    // bsv-low #781, #778 (B-FLEET-4): the pass's clock: each phase of both tasks timed, the task that ends last
+    // logs one `[scheduled-pass]` line and writes the row the overlay serves on `/health/invariants`.
+    let meter = std::rc::Rc::new(pass_meter::PassMeter::worker());
+    let meter_drain = meter.clone();
     // E649 L4 N4: the pot hook's drain is its OWN task, handed first, under its own wall: the tracker's backfill
-    // awaits CHAINTRACKS with no timeout, so it no longer holds the drain behind it. N7: ONE deadline for the whole
-    // task: the boot, the pass (its every read, relay call, settle and counter) and the courier flush run under it.
+    // awaits CHAINTRACKS (bounded since B-FLEET-4, `runtime::BACKFILL_WALL_MS`), so it never holds the drain behind
+    // it. N7: ONE deadline for the whole task: the boot, the pass (its every read, relay call, settle and counter)
+    // and the courier flush run under it.
     let env_drain = env.clone();
     let drain: pot_hook::Detached = Box::pin(async move {
-        let deadline =
-            routes::worker_deadline(pot_hook::DRAIN_WALL_MS, pot_hook::DRAIN_SETTLE_RESERVE_MS);
-        if deadline
-            .run(d1_ledger::boot(schema::ensure_latch_columns(&env_drain)))
-            .await
-            .is_none()
-        {
-            worker::console_warn!("[pot-changed] drain: boot not done at the deadline");
-            return;
-        }
-        // E649 L4 H1: one bounded pass over the pot hook's parked wake-ups
-        if let Err(e) = routes::drain_pot_announce(&env_drain, &deadline).await {
-            worker::console_warn!("[pot-changed] drain deferred: {e}");
-        }
-        if let Ok(db) = env_drain.d1("OVERLAY_DB") {
-            // N9: the take is inside the raced future: an expired deadline leaves the deltas queued.
-            let now = worker::Date::now().as_millis() as f64;
-            if deadline
-                .run(courier::take_and_flush(now, |pending| {
-                    courier::flush(Some(db), pending)
-                }))
+        let meter = meter_drain;
+        let task = async {
+            let deadline =
+                routes::worker_deadline(pot_hook::DRAIN_WALL_MS, pot_hook::DRAIN_SETTLE_RESERVE_MS);
+            if meter
+                .phase(
+                    "drain.boot",
+                    deadline.run(d1_ledger::boot(schema::ensure_latch_columns(&env_drain))),
+                )
                 .await
                 .is_none()
             {
-                worker::console_warn!(
-                    "[pot-changed] drain: courier flush not done at the deadline"
-                );
+                worker::console_warn!("[pot-changed] drain: boot not done at the deadline");
+                return;
             }
-        }
+            // E649 L4 H1: one bounded pass over the pot hook's parked wake-ups
+            if let Err(e) = meter
+                .phase(
+                    "drain.pass",
+                    routes::drain_pot_announce(&env_drain, &deadline),
+                )
+                .await
+            {
+                worker::console_warn!("[pot-changed] drain deferred: {e}");
+            }
+            if let Ok(db) = env_drain.d1("OVERLAY_DB") {
+                // N9: the take is inside the raced future: an expired deadline leaves the deltas queued.
+                let now = worker::Date::now().as_millis() as f64;
+                if meter
+                    .phase(
+                        "drain.flush",
+                        deadline.run(courier::take_and_flush(now, |pending| {
+                            courier::flush(Some(db), pending)
+                        })),
+                    )
+                    .await
+                    .is_none()
+                {
+                    worker::console_warn!(
+                        "[pot-changed] drain: courier flush not done at the deadline"
+                    );
+                }
+            }
+        };
+        task.await;
+        pass_meter::end_task(&meter, routes::D1Sql::of(&env_drain).ok().as_ref()).await;
     });
     let tracker: pot_hook::Detached = Box::pin(async move {
-        d1_ledger::boot(schema::ensure_latch_columns(&env)).await;
+        meter
+            .phase(
+                "tracker.boot",
+                d1_ledger::boot(schema::ensure_latch_columns(&env)),
+            )
+            .await;
         // bsv-low #674, the cutoff: the era cutoff stamped into the board's derivation (a no-op once it is; the
-        // re-derivation once when it moves). Before the tracker's backfill, which awaits CHAINTRACKS unbounded.
-        routes::sync_board_era_env(&env).await;
-        if let Err(e) = tracker_host::runtime::backfill(&env).await {
+        // re-derivation once when it moves). Before the tracker's backfill.
+        meter
+            .phase("tracker.board_era", routes::sync_board_era_env(&env))
+            .await;
+        // bsv-low #778 (B-FLEET-4): the backfill's every CHAINTRACKS await is raced against its own wall
+        // (`runtime::BACKFILL_WALL_MS`), so it can no longer hold the intake behind it.
+        if let Err(e) = meter
+            .phase("tracker.backfill", tracker_host::runtime::backfill(&env))
+            .await
+        {
             courier::note_presence("tracker_backfill_faulted_total");
             worker::console_warn!("[tracker-backfill] deferred: {e}");
         }
         // bsv-low #771 (L1b): the chain-event intake, after the backfill, under its own one deadline: the feed pulled
         // over the CHAINTRACKS binding on its durable cursor, each event's affected mined rows queued in the cursor's
         // batch, then eight queued re-asks drained.
-        tracker_host::chain_events::run(&env).await;
-        if let Err(e) = tracker_host::runtime::tick(&env).await {
+        meter
+            .phase(
+                "tracker.chain_events",
+                tracker_host::chain_events::run(&env),
+            )
+            .await;
+        if let Err(e) = meter
+            .phase("tracker.tick", tracker_host::runtime::tick(&env))
+            .await
+        {
             worker::console_warn!("[tracker-tick] deferred: {e}");
         }
         // bsv-low #672 (RC-L30): the durable spender-bytes store's bounded age + row-cap sweep (the janitor's shape),
         // best-effort on the scheduled path, never on a read.
-        routes::sweep_owed_spender_bytes(&env).await;
+        meter
+            .phase("tracker.sweep", routes::sweep_owed_spender_bytes(&env))
+            .await;
+        pass_meter::end_task(&meter, routes::D1Sql::of(&env).ok().as_ref()).await;
     });
     pot_hook::schedule_tick(&|f| ctx.wait_until(f), drain, tracker);
 }

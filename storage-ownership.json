@@ -1664,6 +1664,21 @@
    "why": "A lost entry is a stored mined row not rechecked until the next event or read; the cursor reset replays it"
   },
   {
+   "name": "applayer_scheduled_pass",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {
+    "low-app-layer": [
+     "CREATE"
+    ]
+   },
+   "readers": ["overlay-cloudflare"],
+   "rebuild_class": "re-askable",
+   "never_wipe": false,
+   "holds": "the app layer's last scheduled pass, one row (bsv-low #781, #778): when it ended and began, its wall and each phase's wall, and the passes counted",
+   "why": "the next scheduled pass writes it again; a lost row is null on /health/invariants.appLayerScheduledPass until then; no authority"
+  },
+  {
    "name": "gasp_fault_memo",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",
@@ -1684,6 +1699,17 @@
    "never_wipe": false,
    "holds": "transactional row counts used only to bound the fault memo without scanning it on each insert",
    "why": "Memo maintenance only; never evidence for admission"
+  },
+  {
+   "name": "conflict_fault_memo",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the conflict pass's per-pot fault memo (bsv-low #825): a pot's consecutive faulted re-checks, its first and last fault, the hold's end and the last fault's words; a pot past three consecutive faults is held out of the draw for 24 h, never one the index holds SEEN or funded",
+   "why": "a clean re-check deletes the pot's row and a bounded sweep (64 a pass) the rows whose last fault is a week old and whose hold ended; a lost row costs the pot three more faulted draws before it is held again; no admission authority, transient"
   }
  ],
  "other_stores_owners_only": {

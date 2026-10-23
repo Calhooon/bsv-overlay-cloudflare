@@ -878,6 +878,65 @@ where
     Ok(after)
 }
 
+/// bsv-low #778, #781 (B-FLEET-4): the backfill's wall inside the scheduled pass. Every CHAINTRACKS await of a page
+/// is raced against it (less [`BACKFILL_SAVE_RESERVE_MS`], kept for the cursor's save), so no header answer can hold
+/// the tracker task past it: before, `super::headers` was awaited with no timeout, ahead of the chain-event intake's
+/// own 25 s (`chain_events::WALL_MS`), and a pass could skip the intake silently (#778, beta 14:15:47Z, wall 66 s).
+/// 20 s: the backfill plus the intake's 25 s stay inside the drain task's 60 s (`pot_hook::DRAIN_WALL_MS`).
+pub const BACKFILL_WALL_MS: u64 = 20_000;
+
+/// bsv-low #778 (B-FLEET-4): what the backfill's wall leaves after its last CHAINTRACKS await, for the cursor's save.
+pub const BACKFILL_SAVE_RESERVE_MS: u64 = 3_000;
+
+/// bsv-low #778 (B-FLEET-4): the snapshot a header await the deadline dropped answers: no tip, so the page stops at
+/// that subject exactly as on a CHAINTRACKS fault (`tracker_backfill_header_faults_total`) and resumes there next pass.
+pub fn deadline_snapshot() -> HeaderSnapshot {
+    HeaderSnapshot {
+        tip: Err(bsv_tracker::HeaderError(
+            "the backfill's deadline fell before CHAINTRACKS answered".into(),
+        )),
+        headers: std::collections::BTreeMap::new(),
+    }
+}
+
+/// bsv-low #778 (B-FLEET-4): [`walk_backfill_page`] with each CHAINTRACKS await raced against `deadline` (less its
+/// reserve). A dropped await is counted `tracker_backfill_header_deadline_total` and answers [`deadline_snapshot`]:
+/// the page stops at that subject, its cursor is the one before it, and the save runs in the reserve.
+pub async fn walk_backfill_page_within<H, HF, W, WF>(
+    rows: Vec<BackfillSubject>,
+    after: String,
+    now: u64,
+    deadline: &crate::pot_hook::Deadline,
+    mut headers: H,
+    write: W,
+) -> Result<String, String>
+where
+    H: FnMut(u32) -> HF,
+    HF: std::future::Future<Output = HeaderSnapshot>,
+    W: FnMut(Row) -> WF,
+    WF: std::future::Future<Output = Result<(), String>>,
+{
+    walk_backfill_page(
+        rows,
+        after,
+        now,
+        |height| {
+            let answer = headers(height);
+            async move {
+                match deadline.run_reserving(answer).await {
+                    Some(snapshot) => snapshot,
+                    None => {
+                        crate::courier::note_presence("tracker_backfill_header_deadline_total");
+                        deadline_snapshot()
+                    }
+                }
+            }
+        },
+        write,
+    )
+    .await
+}
+
 thread_local! { static BACKFILL_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 /// Proof-only deploy convergence: one 64-subject indexed page per scheduled pass.
 /// The page plus its tx_words PK join reads at most 64 + 64 rows.
@@ -903,6 +962,7 @@ pub async fn backfill(env: &worker::Env) -> worker::Result<()> {
     let saved = cursor.map_or_else(|| "0:".into(), |c| c.cursor);
     let pots = saved.starts_with("1:");
     let mut after = saved[2..].to_string();
+    let deadline = crate::routes::worker_deadline(BACKFILL_WALL_MS, BACKFILL_SAVE_RESERVE_MS);
     let rows = db
         .prepare(if pots {
             stored::BACKFILL_POT_PAGE
@@ -917,10 +977,11 @@ pub async fn backfill(env: &worker::Env) -> worker::Result<()> {
     let page_end = rows
         .last()
         .map_or_else(|| after.clone(), |row| row.txid.clone());
-    after = walk_backfill_page(
+    after = walk_backfill_page_within(
         rows,
         after,
         super::WorkerClock.now(),
+        &deadline,
         |height| async move { super::headers(env, &[height]).await },
         |row| async move { stored::write(env, &row).await.map_err(|e| e.to_string()) },
     )
