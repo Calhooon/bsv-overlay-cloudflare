@@ -325,7 +325,9 @@ fn code_257(t: &str) -> bool {
 /// "The network already has this exact tx" — a redundant re-broadcast is
 /// SUCCESS, whatever HTTP dress it arrives in (mirrors the bsv-low client's
 /// `alreadyKnown`, incl. the literal 257 txn-already-known node code).
-/// NEGATED forms are stripped first: "unknown"/"unseen" are failures.
+/// NEGATED forms are stripped first: "unknown"/"unseen"/"not seen" are failures.
+/// An ORPHAN dress is never already-known (bsv-low #652): `SEEN_IN_ORPHAN_MEMPOOL` carries `seen`, and an orphan
+/// view says the network does NOT hold the parents (the client's `isOrphanDress`, #267).
 ///
 /// bsv-low #212, belt AND braces on a money path — a false positive here turns
 /// a DEFINITIVE network rejection into `ArcOutcome::Accepted`, which admits the
@@ -350,6 +352,22 @@ fn code_257(t: &str) -> bool {
 /// corpus and both must agree on every case in it.
 pub(crate) fn already_known(s: &str) -> bool {
     let stripped = strip_long_hex_runs(&s.to_lowercase());
+    // bsv-low #652: the orphan guard, then the `not seen` neutralization (the non-2xx arm had neither)
+    if stripped.contains("orphan") {
+        return false;
+    }
+    known_needle(&stripped.replace("not seen", " "))
+}
+
+/// The belt before bsv-low #652 (no orphan guard, no `not seen`): what a client mirror not yet carrying #652 reads
+/// as already-known. [`terminal_refusal_reason`] keeps a detail only when THIS reads false, so no mirror version
+/// can read the refusal it carries as a success.
+fn already_known_without_the_652_guards(s: &str) -> bool {
+    known_needle(&strip_long_hex_runs(&s.to_lowercase()))
+}
+
+/// The needles over lowercased, hex-stripped text, its negated forms neutralized.
+fn known_needle(stripped: &str) -> bool {
     let t = stripped.replace("unknown", " ").replace("unseen", " ");
     t.contains("already")
         || t.contains("known")
@@ -2185,7 +2203,7 @@ pub fn terminal_refusal_reason(
     let detail = scrub_already_known_tokens(extra_info);
     if !detail.is_empty() {
         let with_detail = format!("Arcade {arcade_status} {detail} {tail}");
-        if !already_known(&with_detail) {
+        if !already_known(&with_detail) && !already_known_without_the_652_guards(&with_detail) {
             return with_detail;
         }
     }
@@ -6947,6 +6965,16 @@ mod tests {
     // / `CODE_257_PROSE_FALSE`). The two implementations must agree on every
     // entry — that equivalence is the whole point of the shared list.
 
+    /// bsv-low #652: bodies that NAME a seen word but say the network does NOT hold the tx (an orphan view, a "not
+    /// seen yet"): never already-known, in any dress. Shared with the client mirror as `ALREADY_KNOWN_NOT_HELD_FALSE`.
+    const ALREADY_KNOWN_NOT_HELD_FALSE: &[&str] = &[
+        "SEEN_IN_ORPHAN_MEMPOOL",
+        "not seen yet",
+        "transaction not seen yet by the network",
+        r#"{"txStatus":"SEEN_IN_ORPHAN_MEMPOOL","extraInfo":"orphan: missing parent"}"#,
+        "Orphan transaction: parents not seen",
+    ];
+
     const CODE_257_TRUE: &[&str] = &[
         "txn-already-known",
         "257: txn-already-known",
@@ -7003,6 +7031,39 @@ mod tests {
     /// `routes.rs::json_error(&format!("network rejected: {reason}"), 422)`.
     fn overlay_422(reason: &str) -> String {
         format!(r#"{{"status":"error","message":"network rejected: {reason}"}}"#)
+    }
+
+    /// bsv-low #652: the non-2xx arm (ARC's 460-class answer) read `SEEN_IN_ORPHAN_MEMPOOL` and `not seen yet` as
+    /// already-known (`Accepted`). Bare, in ARC's non-2xx body echoing a txid, and in the overlay's 422 wrapper:
+    /// never already-known, and neither verdict ever `Accepted`.
+    #[test]
+    fn i652_an_orphan_or_not_seen_body_is_never_already_known() {
+        let txid = REAL_LEDGER_TXIDS_CONTAINING_257[0];
+        for body in ALREADY_KNOWN_NOT_HELD_FALSE {
+            assert!(!already_known(body), "bare: {body}");
+            let dressed = [
+                arc_error_body(460, "Transaction is not valid", body, txid),
+                arc_error_body(465, "Fee too low", body, txid),
+                overlay_422(body),
+            ];
+            for d in dressed {
+                assert!(!already_known(&d), "dressed: {d}");
+                for status in [460u16, 465, 473, 500] {
+                    assert!(
+                        !matches!(arc_verdict(status, &d), Ok(ArcOutcome::Accepted(_))),
+                        "arc_verdict({status}) accepted {d}"
+                    );
+                    assert!(
+                        !matches!(corroborator_verdict(status, &d), Ok(ArcOutcome::Accepted(_))),
+                        "corroborator_verdict({status}) accepted {d}"
+                    );
+                }
+            }
+        }
+        // the true dresses, `SEEN_ON_NETWORK` among them, still read already-known
+        for s in CODE_257_TRUE {
+            assert!(already_known(s), "code dress lost: {s}");
+        }
     }
 
     #[test]
