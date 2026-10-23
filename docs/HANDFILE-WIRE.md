@@ -37,8 +37,10 @@ every payload names).
 | 2 | potparty v2 | the v1 layout under `"LOW/potparty/v2"` plus `seatSettlePubkey(33)` (`potPartyV2Challenge`) | 186 |
 | 3 | potrefund | `"LOW/potrefund/v1" ‖ identity(33) ‖ gameId(32) ‖ potTxid(32) ‖ potVout(4 LE) ‖ refundRaw` (`potRefundChallenge`; the raw is the pre-signed refund transaction, 1 to 100,000 bytes) | 118 and up |
 
-The txids are the 32 bytes of the display hex, as the markers carry them. The body size cap is the door's
-(`RECORD_POST_MAX_BODY_BYTES`, the refund raw's 100 KB as hex plus the frame).
+The txids are the 32 bytes of the display hex, as the markers carry them. The body size cap is the shared door's
+`RECORD_POST_MAX_BODY_BYTES`: `RECORD_POST_MAX_SCRIPT_BYTES * 2 + 2_048`, or 203,072 bytes. It accommodates the
+refund raw's full 100,000 bytes as hex, the other three payloads, both signatures, the hop txid and the JSON frame.
+The refund raw's own 100,000-byte limit is unchanged.
 
 ## 3. The digest and the two signatures
 
@@ -61,24 +63,38 @@ high-S twin is refused. Signatures are excluded from the batch key, so a re-sign
 
 ## 4. What the door checks, and the refusal codes
 
-In order; the first refusal answers and nothing is written.
+In order; the first refusal answers and nothing is written. The raw body cap precedes JSON parsing. Within the
+decoded body, shape and payload-size checks precede the canonical-DER gate; the four parsers, consistency check
+and poster check precede either ECDSA verification. The code column names the refusal's counter class.
 
 | status | code (`applayer_record_refused_<code>_total`) | when |
 |---|---|---|
+| 413 | `body_too_large` | the raw body exceeds `RECORD_POST_MAX_BODY_BYTES` |
 | 400 | `bad_body` | the body is not the JSON above |
-| 400 | `handfile_shape` | `hopTxid` is not 64 hex, `payloads` is not four hex strings, a signature is not hex |
-| 413 | `body_too_large`, `script_too_large` | the body or a payload past the door's cap |
-| 422 | `signature_invalid` | the identity signature is not canonical DER or does not verify under the poster's identity over the digest (the hop txid and the four payloads are what it binds) |
-| 422 | `settle_signature_invalid` | the settle-key signature is not canonical DER or does not verify under the v2 payload's settle key |
+| 400 / 413 | `handfile_shape`, `script_too_large` | check `hopTxid` and the four-slot shape, then each payload's size and hex in order, then both signatures' hex |
+| 422 | `signature_invalid` | the identity signature is not canonical DER |
+| 422 | `settle_signature_invalid` | the settle-key signature is not canonical DER |
 | 400 | `handfile_payload_not_a_marker` | a payload is not its family's canonical bytes: the family's own parser refuses it (a self-paired hopparty or potparty, a wrong length or tag, a v1 payload in the v2 slot, an empty refund raw) or the family's challenge builder does not give the payload back |
 | 422 | `handfile_inconsistent` | the four payloads do not name one seat's one hand: identity, opponent, game, pot outpoint, recovery height and settle key must agree across them |
 | 403 | `poster_mismatch` | the poster is not the identity the payloads name |
+| 422 | `signature_invalid` | the identity signature does not verify under the poster's identity over the digest (the hop txid and the four payloads are what it binds) |
+| 422 | `settle_signature_invalid` | the settle-key signature does not verify under the v2 payload's settle key |
 | 422 | `refund_does_not_spend_the_pot` | the refund raw's first input is not the pot outpoint it names |
 | 422 | `refund_not_the_presigned_spend` | the index holds the pot and the raw is not its pre-signed 2-of-2 spend in the template's unlock shape (`settle_signers_for_spend == Coop`), exactly the direct `potrefund` rule; an unindexed pot files at `refundValid: 0`, as today |
 | 425 | `hop_not_indexed` | the index does not hold the hop's bytes yet (`pot_beefs` under the hop txid): file again once the hop is admitted, the outbox's rule for `hopsweep` |
 | 422 | `hop_marker_refuted` | the hop's output at `hopVout` is not the P2PKH of the batch's settle key paying `hopSats` |
-| 409 | `too_many_filed` | a family's per-(poster, game, pot) cap: potparty 2 (v1 and v2), potrefund 1, hopparty 1 per hop outpoint; another content past it |
-| 429 | `daily_cap_reached` | a family's 200 filed rows per poster per day |
+| 409 / 429 | `too_many_filed`, `daily_cap_reached` | for each active family in order (hopparty, potparty, potrefund), check its content cap, then its daily cap |
+
+The content caps are potparty 2 (v1 and v2) and potrefund 1 per (poster, game, pot), and hopparty 1 per
+(poster, hop outpoint), across games. The potparty pair is counted together with both active keys excluded;
+existing copies of either content do not consume a second place. The daily cap is 200 filed rows per poster and
+family: only missing rows add to the day's count. Chain-covered slots reserve no new place.
+
+A cap refusal retains its `error` text and adds `family`: `hopparty`, `potparty` or `potrefund`. For example:
+
+```json
+{ "error": "this identity already holds its filed rows for this family, game and pot", "family": "potparty" }
+```
 
 ## 5. What is written
 
@@ -101,7 +117,7 @@ filing and a handfile of one marker are one row and a re-filing is a no-op:
 A family whose verified chain marker the index already holds for this identity, game and pot writes nothing for
 that family (the direct door's `alreadyIndexed` rule), the rest is written. The write is one D1 batch.
 
-The answer, the same on the first filing and on every re-filing of the same content:
+The answer on a filing that changes the stored rows:
 
 ```json
 {
@@ -117,6 +133,11 @@ The answer, the same on the first filing and on every re-filing of the same cont
   "refundValid": 0
 }
 ```
+
+A re-filing that changes nothing returns the same `kind`, `key`, `rows` and `refundValid` fields with
+`filed: false` and `alreadyFiled: true`, as the direct door does. It marks nothing stale and recomputes nothing.
+A re-filing that promotes an existing refund from rank 0 to rank 1 is a change: it returns `filed: true` and
+recomputes the affected view. An unreadable write count is treated as a change, matching the direct door.
 
 The write-time verdicts are what every reader of the K binding reads: the owed list's evidence rule
 (`sigValid = 1 AND seatSettlePubkey IS NOT NULL` on a potparty row) reads an exploded v2 row exactly as a directly

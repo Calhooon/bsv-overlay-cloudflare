@@ -135,11 +135,12 @@ use overlay_discovery::result::{
 pub const RECORD_POST_MAX_SCRIPT_BYTES: usize =
     overlay_discovery::potrefund::POTREFUND_REFUND_MAX_LEN + 512;
 
-/// The largest request BODY read at all: the script as hex plus the JSON
-/// frame. Checked on the raw bytes before the JSON parse, then on the hex
+/// The largest request BODY read at all: the script as hex plus 2 KiB for
+/// the handfile's other three payloads, two signatures, hop txid and JSON frame.
+/// Shared by the direct and handfile doors. Checked before the JSON parse, then on the hex
 /// string before the decode, then on the script (the gate's MED-3: the old
 /// order materialised ~60 MB of a 40 MB body before refusing it).
-pub const RECORD_POST_MAX_BODY_BYTES: usize = RECORD_POST_MAX_SCRIPT_BYTES * 2 + 64;
+pub const RECORD_POST_MAX_BODY_BYTES: usize = RECORD_POST_MAX_SCRIPT_BYTES * 2 + 2_048;
 const _: () = assert!(RECORD_POST_MAX_BODY_BYTES > RECORD_POST_MAX_SCRIPT_BYTES * 2);
 
 /// One identity's filing budget per family per day (the honest need is a
@@ -1864,11 +1865,27 @@ pub(crate) async fn count(
 }
 
 pub(crate) fn refuse(kind: Option<RecordKind>, r: RecordRefusal) -> Result<Response> {
+    refuse_with_family(kind, r, None)
+}
+
+pub(crate) fn record_refusal_body(r: RecordRefusal, family: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::json!({ "error": r.as_str() });
+    if let Some(family) = family {
+        body["family"] = serde_json::json!(family);
+    }
+    body
+}
+
+pub(crate) fn refuse_with_family(
+    kind: Option<RecordKind>,
+    r: RecordRefusal,
+    family: Option<&str>,
+) -> Result<Response> {
     if let Some(k) = kind {
         bump(&REFUSED_BY_KIND, k);
     }
     mirror_refused(r.class());
-    crate::routes::json_error(r.as_str(), r.status())
+    crate::routes::json_response(record_refusal_body(r, family).to_string(), r.status())
 }
 
 /// `POST /record?kind=<family>&identity=<poster>` with `{ "scriptHex": … }`.
