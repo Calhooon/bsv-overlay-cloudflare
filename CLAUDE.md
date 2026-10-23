@@ -2508,7 +2508,9 @@ call count, so the resumes take at most one graph's budget and the first new
 UTXO keeps its own. A record served once that budget is spent is HELD BACK
 untouched (no read, no pass counted; `held_back_graphs`) for the next sync,
 oldest score first. The limit, stated: a record held back behind another's
-resumes waits for that one's convergence or its 60 passes.
+resumes waits for that one's convergence or its 60 passes. (Since bsv-low
+#590 the TIME of that budget is no longer shared: below. The counted limbs
+still are.)
 
 A walk with nothing pending is completed as any graph is: D15's anchor check
 over the WHOLE graph (the resumed nodes included), the finalize submits
@@ -2729,6 +2731,54 @@ put back in place, the tests over them):
 
 The worker's sources did not change: the three shipped peer-health statements
 are `2c8ab50`'s, and the rule is the engine's (a call it does not make).
+
+### The time limb per resume, and the finish-the-node rule (bsv-low #590)
+
+Zanaadu's measurement (zanaadu-v2 #377): the binding limb was TIME, the
+resumes of one (peer, topic) shared one deadline (M1 above, then engine
+0.1.11's share), so its deferred graphs resumed one or two a tick, and the
+slice raced the node in flight, so a request started near the slice's end
+was cut, discarded and fetched again the next pass.
+
+- **Per resume.** Each resume walks under a fresh per-graph slice of its
+  own (`gasp.rs`, the resume arm of `ingest`: `earlier_of(own, share)`).
+  The resumes' share (`with_resume_share`, set by the engine whenever a
+  per-peer budget is) GATES them: it is read before a resume starts (one
+  reached past it is held back, as before) and before each step, beside the
+  resume's own slice; the per-peer deadline (D16) bounds them all. With no
+  share no time bound is shared. The counted limbs (calls, bytes, nodes)
+  stay shared by the resumes of a sync (`resume_left`): they bound what a
+  peer's held records cost in requests, and #377 found no graph near its
+  100 calls.
+- **Finish the node.** The time limb is read BEFORE a step, as the counted
+  limbs always were (`walk_graph`, and the resume's root re-ask): no node is
+  started past the slice, and a node started inside it is not cut when the
+  slice falls due. It is raced only against a fresh slice of its OWN from
+  the step's start (`node_slice`), so a fetch that hangs is still a `time`
+  cut (the stall rule, `DEADLINE_STALL_DEFERRAL_RUNS`, unchanged) and the
+  per-peer deadline may still drop the sync mid-fetch.
+- **The default slice.** `DEFAULT_GRAPH_BUDGET_MS` stays 60 s, sized from
+  the measured pace (2 to 3 s a node on Zanaadu's cron, 1.2 s on beta: 20
+  to 50 nodes). The config is the host's. Stated: `start_gasp_sync` holds
+  any configured slice at most `meter::ROOT_MAX_MS` (15 s, the hard bound of
+  one root's walk), so the 60 s default and any host value above 15 s are in
+  force as 15 s; lifting that bound is the courier budget's call, not made
+  here. LOW's worker keeps its 15 s.
+
+What it costs: a resume started inside the share can run up to one slice
+past it (one node, finished, is at most a slice; on LOW's worker the share
+9.9 s plus a node in flight), so the page keeps less than 0.1.11's 20.1 s in
+the worst case: the per-peer deadline is the outer bound. The reference has
+no budget. Pins (`-p bsv-overlay-engine --features memory-storage --lib`):
+`i590_a` (7 nodes, 2 s a request, a 5 s slice: 3 passes holding 3 then 5
+nodes, each link fetched once, the root once a pass by #555's re-ask; RED on
+`65027163`: `[Some(2), Some(3), Some(4), Some(5), Some(6), None]`), `i590_b`
+(the node started at 4 s ends at 6 s and is kept; RED `Some(2)`), `i590_c`
+(two resumes in one sync, none held back; RED `resumed_graphs` 1 for 2);
+amended: `obligations_0111_*` (the fourth resume finishes its request and
+defers with its root: not stalled, not idle; RED on `65027163` `(1, 1)`) and
+`load_0112_call_limit_fallback_keeps_the_root_deadline` (its courier now
+outlasts a whole node slice).
 
 ### The assembly and the two limbs (bsv-low #586, zanaadu-v2 #377)
 
