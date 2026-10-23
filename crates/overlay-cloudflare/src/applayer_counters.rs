@@ -150,6 +150,8 @@ pub fn names() -> Vec<String> {
             .iter()
             .map(move |o| format!("applayer_identity_{r}_{o}_total"))
     }));
+    // bsv-low #660 (B-OWED-3-FOLD L2): a word frame `/internal/tx-word` dropped as unheld
+    v.push("applayer_tracker_event_unheld_total".to_string());
     v
 }
 

@@ -883,6 +883,34 @@ pub struct OpenEviction {
     pub evicted_at_ms: u64,
 }
 
+/// bsv-low #637: the index's two words that it holds a subject's admission NOW (the #413 belt's statements in
+/// `routes.rs`): its `transactions` row, else its `pot_records` row (a pot whose last output a spend consumed keeps
+/// its pot row and loses its `transactions` row, the engine's `delete_output`).
+pub(crate) const STANDING_ADMISSION_SQL: [&str; 2] = [
+    "SELECT 1 AS one FROM transactions WHERE txid = lower(?)",
+    "SELECT 1 AS one FROM pot_records WHERE txid = lower(?) LIMIT 1",
+];
+
+#[derive(serde::Deserialize)]
+struct StandingRow {
+    #[allow(dead_code)]
+    one: f64,
+}
+
+/// bsv-low #637: does the index hold `txid`'s admission now? Asked only by the witnessed mode's duplicate echo
+/// whose claim's corroboration was inconclusive ([`crate::broadcaster::duplicate_of_a_standing_admission`]), at most
+/// two key reads; a read that faults is "no" (the 502 stands, the conservative answer).
+pub(crate) async fn index_holds_admission(db: &D1Database, txid: &str) -> bool {
+    for sql in STANDING_ADMISSION_SQL {
+        match Query::new(sql).bind(txid).fetch_optional::<StandingRow>(db).await {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 #[derive(serde::Deserialize)]
 struct OpenEvictionRow {
     reason: String,
@@ -5220,7 +5248,7 @@ mod tests {
             "a skip starts no POST and parks its notes (bsv-low #649 M1), never left in the isolate's sets alone"
         );
         assert!(
-            within.contains("tracker_events::ship_until(&env,tracker_events,deadline_ms)")
+            within.contains("tracker_events::ship_then(&env,tracker_events,")
                 && !within.contains("tracker_events::ship(&"),
             "the tracker events share the one deadline, not 20 s of their own on top"
         );

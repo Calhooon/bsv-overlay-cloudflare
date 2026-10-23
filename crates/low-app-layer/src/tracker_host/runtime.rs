@@ -703,8 +703,34 @@ pub async fn ingest(
         .ok_or_else(|| worker::Error::RustError("invalid tracker event txid".into()))?
         .to_ascii_lowercase();
     let kind = frame["kind"].as_str().unwrap_or("refresh");
-    event(env, &id, kind, frame.get("body"), None).await?;
-    worker::Response::from_json(&json!({"ok":true}))
+    let held = event(env, &id, kind, frame.get("body"), None)
+        .await?
+        .is_some();
+    if !held {
+        note_unheld();
+    }
+    worker::Response::from_json(&ingest_answer(held))
+}
+
+/// bsv-low #660 (B-OWED-3-FOLD, the lens's L2): a frame whose subject the live hold does not name (and that is not
+/// the gated `submit`) writes nothing. It was answered `{"ok":true}` and counted `shipped` at the overlay, so no side
+/// named the drop. Now counted here (mirrored on the overlay's `ops_counters`) and answered `held: false`, which the
+/// overlay counts `tracker_events_<source>_unheld_total`.
+pub const COUNTER_TRACKER_EVENT_UNHELD: &str = "applayer_tracker_event_unheld_total";
+
+/// The mirrored counter names of the word events (the observability bar's seed list).
+pub fn tracker_mirrored_counter_names() -> Vec<String> {
+    vec![COUNTER_TRACKER_EVENT_UNHELD.to_string()]
+}
+
+/// Count one unheld frame (B-OWED-3-FOLD L2).
+pub fn note_unheld() {
+    crate::courier::note_presence(COUNTER_TRACKER_EVENT_UNHELD);
+}
+
+/// PURE (B-OWED-3-FOLD L2): `/internal/tx-word`'s answer, `held` whether the frame was applied (written).
+pub fn ingest_answer(held: bool) -> Value {
+    json!({"ok": true, "held": held})
 }
 
 /// Batch reads include stored foreign words even after the byte index has

@@ -325,7 +325,9 @@ fn code_257(t: &str) -> bool {
 /// "The network already has this exact tx" — a redundant re-broadcast is
 /// SUCCESS, whatever HTTP dress it arrives in (mirrors the bsv-low client's
 /// `alreadyKnown`, incl. the literal 257 txn-already-known node code).
-/// NEGATED forms are stripped first: "unknown"/"unseen" are failures.
+/// NEGATED forms are stripped first: "unknown"/"unseen"/"not seen" are failures.
+/// An ORPHAN dress is never already-known (bsv-low #652): `SEEN_IN_ORPHAN_MEMPOOL` carries `seen`, and an orphan
+/// view says the network does NOT hold the parents (the client's `isOrphanDress`, #267).
 ///
 /// bsv-low #212, belt AND braces on a money path — a false positive here turns
 /// a DEFINITIVE network rejection into `ArcOutcome::Accepted`, which admits the
@@ -350,6 +352,22 @@ fn code_257(t: &str) -> bool {
 /// corpus and both must agree on every case in it.
 pub(crate) fn already_known(s: &str) -> bool {
     let stripped = strip_long_hex_runs(&s.to_lowercase());
+    // bsv-low #652: the orphan guard, then the `not seen` neutralization (the non-2xx arm had neither)
+    if stripped.contains("orphan") {
+        return false;
+    }
+    known_needle(&stripped.replace("not seen", " "))
+}
+
+/// The belt before bsv-low #652 (no orphan guard, no `not seen`): what a client mirror not yet carrying #652 reads
+/// as already-known. [`terminal_refusal_reason`] keeps a detail only when THIS reads false, so no mirror version
+/// can read the refusal it carries as a success.
+fn already_known_without_the_652_guards(s: &str) -> bool {
+    known_needle(&strip_long_hex_runs(&s.to_lowercase()))
+}
+
+/// The needles over lowercased, hex-stripped text, its negated forms neutralized.
+fn known_needle(stripped: &str) -> bool {
     let t = stripped.replace("unknown", " ").replace("unseen", " ");
     t.contains("already")
         || t.contains("known")
@@ -1229,7 +1247,7 @@ pub(crate) async fn sleep_ms(ms: u64) {
 /// Arcade `GET /tx/{txid}` / `POST /tx` JSON envelope (single submit).
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ArcadeStatusResponse {
+pub(crate) struct ArcadeStatusResponse {
     #[serde(default)]
     txid: String,
     #[serde(default)]
@@ -1429,6 +1447,122 @@ fn submit_echo_is_fresh(stamp: Option<&str>, now_ms: i64, evicted_at_ms: Option<
     let Some(stamp) = stamp else { return false };
     crate::proof_fetcher::rfc3339_utc_ms(stamp)
         .is_some_and(|at| at <= now_ms + 60_000 && now_ms - at < 30 * 60_000 && at > evicted)
+}
+
+/// What the pre-flight probe's stored SEEN answers (bsv-low #636). The probe's `GET /tx` is Arcade's STORED status,
+/// as the POST echo is (#612): never fresh evidence. So it never latches `network_seen` and never readmits an OPEN
+/// eviction on its own word: under an open eviction only a stamp after the eviction, inside the freshness bound
+/// ([`submit_echo_is_fresh`], 30 minutes, live on the probe though defensive on the stampless POST echo), goes on; a
+/// stamp after the eviction but past the bound is refused too (the B-DOOR-3 lens's M1: Arcade never re-validates a row
+/// it holds at SEEN, so such a subject waits for its MINED push or the operator). Every probe that goes on admits
+/// PENDING in both modes; the pending watch owns the latch, reading the SAME store 2 to 18 s later (the lens's L1:
+/// "never latches" holds at the door, the latch is Arcade's stored word read again, not the network's live word).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeSeen {
+    /// `AcceptedPending`: admitted (an open eviction readmitted by the route), `network_seen` unlatched.
+    Pending,
+    /// [`STORED_ECHO_UNDER_EVICTION`]: under the open eviction, a stored SEEN that predates it, carries no readable
+    /// stamp, or is past the 30 minute bound: the retryable 502.
+    StoredUnderEviction,
+}
+
+/// PURE (bsv-low #637): the witnessed mode's duplicate of a STANDING admission. A re-present Arcade echoes at its
+/// stored SEEN is corroborated as an accept claim (#267), and a corroborator that holds the bytes STORED is
+/// inconclusive, so the duplicate answered 502 while the first admission stood. The policy: such a duplicate is the
+/// PENDING ACK of the admission the index already holds (no latch, the pending watch owning the witness), exactly
+/// where (1) the ladder answered `Err`, (2) the echo was a duplicate's stored SEEN whose claim's corroboration was
+/// INCONCLUSIVE (a conflict, a corroborator's refusal, stays the 502), (3) the witnessed mode (the fast mode admits
+/// the echo pending already), (4) no OPEN eviction (#612: a stored word never readmits), and (5) the index holds the
+/// subject's admission now. Anything else keeps today's answer: a first presentation keeps the #267 two-witness bar.
+pub(crate) fn duplicate_of_a_standing_admission(
+    ladder_failed: bool,
+    duplicate_unconfirmed: bool,
+    fast_answer: bool,
+    open_eviction: bool,
+    standing: bool,
+) -> bool {
+    ladder_failed && duplicate_unconfirmed && !fast_answer && !open_eviction && standing
+}
+
+/// The B-DOOR-3 lens's L4: the shape of a duplicate the route asks the index about (the flags of
+/// [`duplicate_of_a_standing_admission`] the broadcaster and the door know before the read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DuplicateShape {
+    pub(crate) duplicate_unconfirmed: bool,
+    pub(crate) fast_answer: bool,
+    pub(crate) open_eviction: bool,
+}
+
+impl DuplicateShape {
+    /// Whether the ladder's answer has the shape whose standing the index decides (the read is made only then).
+    pub(crate) fn asks_the_index(self, outcome: &Result<ArcOutcome, String>) -> bool {
+        duplicate_of_a_standing_admission(
+            outcome.is_err(),
+            self.duplicate_unconfirmed,
+            self.fast_answer,
+            self.open_eviction,
+            true,
+        )
+    }
+}
+
+/// PURE (bsv-low #637, the B-DOOR-3 lens's L4): the route's answer after the ladder: the pending ack of a STANDING
+/// admission's duplicate, else the ladder's own answer unchanged.
+pub(crate) fn standing_duplicate_answer(
+    outcome: Result<ArcOutcome, String>,
+    subject_txid: &str,
+    shape: DuplicateShape,
+    standing: bool,
+) -> Result<ArcOutcome, String> {
+    if duplicate_of_a_standing_admission(
+        outcome.is_err(),
+        shape.duplicate_unconfirmed,
+        shape.fast_answer,
+        shape.open_eviction,
+        standing,
+    ) {
+        Ok(ArcOutcome::AcceptedPending(subject_txid.to_string()))
+    } else {
+        outcome
+    }
+}
+
+/// PURE (bsv-low #636, the B-DOOR-3 lens's L4): the probe arm's whole answer, or `None` when the probe is not the
+/// subject's (another txid, none) or its stored word is below SEEN. MINED and IMMUTABLE are Reached too.
+pub(crate) fn probe_answer(
+    probe: Option<&ArcadeStatusResponse>,
+    subject_txid: &str,
+    now_ms: i64,
+    evicted_at_ms: Option<i64>,
+) -> Option<Result<ArcOutcome, String>> {
+    let p = probe.filter(|r| r.txid.eq_ignore_ascii_case(subject_txid))?;
+    if !matches!(classify_arcade_status(&p.tx_status), GateVerdict::Reached) {
+        return None;
+    }
+    Some(match probe_seen(p.timestamp.as_deref(), now_ms, evicted_at_ms) {
+        ProbeSeen::Pending => Ok(ArcOutcome::AcceptedPending(subject_txid.to_string())),
+        ProbeSeen::StoredUnderEviction => Err(STORED_ECHO_UNDER_EVICTION.into()),
+    })
+}
+
+/// The pending arm's log words (the B-DOOR-3 lens's L2): a witnessed-mode pending admission on a stored Reached echo
+/// (#636's probe, #637's standing duplicate) is not #397's lagging tracker.
+pub(crate) fn pending_admission_words(fast_answer: bool, duplicate_echo: bool) -> &'static str {
+    match (fast_answer, duplicate_echo) {
+        (true, true) => "the fast answer on a stored Reached echo",
+        (true, false) => "the fast answer",
+        (false, true) => "a stored Reached echo: the pre-flight probe (#636) or a standing duplicate (#637)",
+        (false, false) => "tracker lagging, corroborator inconclusive (#397)",
+    }
+}
+
+/// PURE (bsv-low #636): the probe's stored SEEN, judged by its stamp against the open eviction, if any.
+pub(crate) fn probe_seen(stamp: Option<&str>, now_ms: i64, evicted_at_ms: Option<i64>) -> ProbeSeen {
+    if submit_echo_is_fresh(stamp, now_ms, evicted_at_ms) {
+        ProbeSeen::Pending
+    } else {
+        ProbeSeen::StoredUnderEviction
+    }
 }
 
 /// Classify one Arcade submit HTTP response (#213). PURE — unit-tested.
@@ -2145,7 +2279,7 @@ pub fn terminal_refusal_reason(
     let detail = scrub_already_known_tokens(extra_info);
     if !detail.is_empty() {
         let with_detail = format!("Arcade {arcade_status} {detail} {tail}");
-        if !already_known(&with_detail) {
+        if !already_known(&with_detail) && !already_known_without_the_652_guards(&with_detail) {
             return with_detail;
         }
     }
@@ -2513,6 +2647,11 @@ pub struct ArcadeBroadcaster {
     /// derived `AdmitPolicy` (`ADMIT_FAST`).
     fast_answer: bool,
     duplicate_echo: std::cell::Cell<bool>,
+    /// The B-DOOR-3 lens's L3: the request's subject, so a full-batch ancestor leg's echo never marks the duplicate.
+    request_subject: std::cell::RefCell<String>,
+    /// bsv-low #637: the corroboration asked after a duplicate echo answered inconclusive (a corroborator STORED, an
+    /// orphan view, a transport fault), never a conflict.
+    claim_unconfirmed: std::cell::Cell<bool>,
     evicted_at_ms: Option<i64>,
     /// #519: the wall-clock of the indexers' judgement of an Arcade-terminal subject (its own Server-Timing segment).
     terminal_ms: std::cell::Cell<f64>,
@@ -2529,7 +2668,8 @@ pub struct ArcadeBroadcaster {
     /// NL-6d: set when a corroboration's walk paused at this many primed ancestors (the caller defers the rest).
     legs_paused: std::cell::Cell<Option<usize>>,
     /// bsv-low #621 (L5): the FIRST broadcaster this request saw say SEEN or better for the subject (Arcade's
-    /// poll, stored echo or pre-flight probe; a corroborator's accept), with its stamp when its answer carried one.
+    /// poll or witnessed-mode stored echo; a corroborator's accept), with its stamp when its answer carried one. The
+    /// pre-flight probe names none since bsv-low #636 (it admits pending).
     /// The route latches `network_seen` under this name ([`Self::witnessed_by`]).
     witnessed_by: std::cell::Cell<Option<(crate::ops::SeenSource, Option<i64>)>>,
     /// bsv-low #836 fold (the lens's M1): the chaintracks tip a non-final word's hold is bounded by.
@@ -2588,6 +2728,39 @@ impl ArcadeBroadcaster {
         self.duplicate_echo.get()
     }
 
+    /// bsv-low #637: the submit's echo was a duplicate's stored SEEN and the corroboration its accept claim asked
+    /// answered INCONCLUSIVE (never a conflict): the shape [`duplicate_of_a_standing_admission`] reads.
+    pub fn duplicate_echo_unconfirmed(&self) -> bool {
+        self.duplicate_echo.get() && self.claim_unconfirmed.get()
+    }
+
+    /// The B-DOOR-3 lens's L3: the subject of this request, the one txid whose Reached echo is the duplicate.
+    pub(crate) fn begin_request(&self, subject_txid: &str) {
+        self.request_subject.replace(subject_txid.to_string());
+    }
+
+    /// A single-body POST echoed Reached for `echo_txid`: the duplicate #637 reads only when it is the request's
+    /// subject (the full-batch rung registers each ancestor leg under its own txid; the lens's L3).
+    pub(crate) fn note_reached_echo(&self, echo_txid: &str) {
+        if echo_txid.eq_ignore_ascii_case(&self.request_subject.borrow()) {
+            self.duplicate_echo.set(true);
+        }
+    }
+
+    /// The probe arm's step (bsv-low #636, the B-DOOR-3 lens's L4 and L2): [`probe_answer`], and a probe that answers
+    /// is a stored Reached echo of a known txid, so it marks the duplicate (the fast mode counts it `fast-echo`, the
+    /// witnessed mode `submit_duplicate_in_flight_total`; no corroboration runs, so #637's claim stays unmarked).
+    pub(crate) fn take_probe(
+        &self,
+        probe: Option<&ArcadeStatusResponse>,
+        subject_txid: &str,
+        now_ms: i64,
+    ) -> Option<Result<ArcOutcome, String>> {
+        let answer = probe_answer(probe, subject_txid, now_ms, self.evicted_at_ms)?;
+        self.duplicate_echo.set(true);
+        Some(answer)
+    }
+
     /// Mark the subject evicted at `at` milliseconds (the ledger's open eviction), if any.
     pub fn with_evicted_at_ms(mut self, at: Option<i64>) -> Self {
         self.evicted_at_ms = at;
@@ -2611,6 +2784,8 @@ impl ArcadeBroadcaster {
             poll_ms: std::cell::Cell::new(0.0),
             fast_answer: false,
             duplicate_echo: std::cell::Cell::new(false),
+            request_subject: std::cell::RefCell::new(String::new()),
+            claim_unconfirmed: std::cell::Cell::new(false),
             evicted_at_ms: None,
             terminal_ms: std::cell::Cell::new(0.0),
             terminal_judged: std::cell::Cell::new(None),
@@ -3001,6 +3176,7 @@ impl ArcadeBroadcaster {
     where
         Y: std::future::Future<Output = bool>,
     {
+        self.begin_request(subject_txid);
         // The subject's own EF is what we broadcast first (subject-only).
         // `None` ONLY on the #268 mined-claim path (efs empty), where no
         // submit rung ever runs — the pure control flow corroborates the
@@ -3040,18 +3216,25 @@ impl ArcadeBroadcaster {
             .as_ref()
             .is_some_and(|r| r.txid.eq_ignore_ascii_case(subject_txid));
         let probe_status = probe.as_ref().map(|r| r.tx_status.as_str()).unwrap_or("");
-        if probe_is_subject && matches!(classify_arcade_status(probe_status), GateVerdict::Reached)
+        // bsv-low #636: the probe reads Arcade's STORED status (the row's last transition at its stamp), never fresh
+        // evidence: it latches nothing at the door (the pending watch reads the same store 2 to 18 s later and owns
+        // the latch) and, under an OPEN eviction, goes on only on a stamp after the eviction AND inside #612's 30
+        // minute bound: a stored SEEN older than the eviction, unstamped, or stamped after it but past the bound is
+        // the stored echo's 502 (the B-DOOR-3 lens's M1: for the last no door path readmits until its MINED push or
+        // the operator; counted `stored_echo_under_eviction`)
+        if let Some(answer) =
+            self.take_probe(probe.as_ref(), subject_txid, worker::Date::now().as_millis() as i64)
         {
-            gate_log(&format!(
-                "[arcade] {subject_txid} already >= {ARCADE_GATE_STATUS} (pre-flight probe) — ladder + callback re-registration skipped"
-            ));
-            // bsv-low #621: Arcade's stored SEEN names the latch, at its own stamp
-            self.note_witness(
-                Some(crate::ops::SeenSource::Arcade),
-                probe.as_ref().and_then(|r| r.timestamp.as_deref()).and_then(crate::proof_fetcher::rfc3339_utc_ms),
-            );
-            // Payload contract: `Accepted` carries the txid.
-            return Ok(ArcOutcome::Accepted(subject_txid.to_string()));
+            let stamp = probe.as_ref().and_then(|r| r.timestamp.as_deref()).unwrap_or("no stamp");
+            gate_log(&match &answer {
+                Ok(_) => format!(
+                    "[arcade] {subject_txid} already >= {ARCADE_GATE_STATUS} (pre-flight probe, stored at {stamp}): ladder + callback re-registration skipped; admitted PENDING, the pending watch owns the latch (#636)"
+                ),
+                Err(_) => format!(
+                    "[arcade] {subject_txid} already >= {ARCADE_GATE_STATUS} (pre-flight probe, stored at {stamp}) under an OPEN eviction: a stored word before the eviction or past the 30 min bound never readmits (#636)"
+                ),
+            });
+            return answer;
         }
         // TERMINAL AT ARCADE → NEVER RE-FEED IT (INCIDENT D1-CALLBACK-FLOOD
         // 2026-09-01, the wedge): a subject Arcade holds at REJECTED /
@@ -3212,6 +3395,10 @@ impl ArcadeBroadcaster {
                         )),
                     },
                 };
+                // bsv-low #637: after a duplicate echo, the corroboration is its accept claim's
+                if self.duplicate_echo.get() && answer.is_err() {
+                    self.claim_unconfirmed.set(true);
+                }
                 match self.legs_paused.get() {
                     Some(reached) => LegWalk::Paused { reached },
                     None => LegWalk::Decided(answer),
@@ -3258,7 +3445,7 @@ impl ArcadeBroadcaster {
                 }
                 match classify_arcade_status(&parsed.tx_status) {
                     GateVerdict::Reached => {
-                        self.duplicate_echo.set(true);
+                        self.note_reached_echo(subject_txid);
                         if !submit_echo_is_fresh(
                             parsed.timestamp.as_deref(),
                             worker::Date::now().as_millis() as i64,
@@ -3266,8 +3453,8 @@ impl ArcadeBroadcaster {
                         ) {
                             return Err(STORED_ECHO_UNDER_EVICTION.into());
                         }
-                        // Witnessed mode still corroborates and can answer 502 on
-                        // STORED corroborators: bsv-low #637 (NS2P-L2 / N5).
+                        // Witnessed mode still corroborates; a duplicate of a STANDING admission whose
+                        // corroborator is inconclusive is the route's pending ack (bsv-low #637).
                         worker::console_log!(
                             "[arcade] {subject_txid} accepted at {} (no poll needed)",
                             parsed.tx_status
@@ -6377,6 +6564,224 @@ mod tests {
         );
     }
 
+    /// bsv-low #636: the pre-flight probe's stored SEEN (`GET /tx`, Arcade's stored status at its stamp) neither
+    /// latches nor readmits a stale eviction: under an OPEN eviction only a stamp after it, inside the bound, goes on;
+    /// every probe that goes on is the pending admission, the pending watch owning the latch.
+    #[test]
+    fn i636_the_probes_stored_seen_never_latches_and_never_readmits_a_stale_eviction() {
+        let now = crate::proof_fetcher::rfc3339_utc_ms("2026-10-23T02:00:00Z").unwrap();
+        let evicted = now - 600_000;
+        // stored SEEN before the eviction (the issue's shape): not a readmission
+        assert_eq!(
+            probe_seen(Some("2026-10-23T01:40:00Z"), now, Some(evicted)),
+            ProbeSeen::StoredUnderEviction
+        );
+        // unstamped, or an unreadable stamp, under an eviction: not a readmission
+        assert_eq!(probe_seen(None, now, Some(evicted)), ProbeSeen::StoredUnderEviction);
+        assert_eq!(probe_seen(Some("bad"), now, Some(evicted)), ProbeSeen::StoredUnderEviction);
+        // stamped after the eviction, inside the bound: goes on, pending
+        assert_eq!(
+            probe_seen(Some("2026-10-23T01:55:00Z"), now, Some(evicted)),
+            ProbeSeen::Pending
+        );
+        // no eviction: the stored SEEN admits pending however old
+        assert_eq!(probe_seen(Some("2026-10-22T01:00:00Z"), now, None), ProbeSeen::Pending);
+        assert_eq!(probe_seen(None, now, None), ProbeSeen::Pending);
+
+        // the shipped probe arm: judged by `probe_seen` over the open eviction, answering pending or the stored
+        // echo's 502, never `Accepted` and never naming a latch
+        let src = include_str!("broadcaster.rs");
+        let gated = &src[src.find("pub async fn broadcast_efs_gated<Y>(").unwrap()..];
+        let arm = &gated[gated.find("let mut probe = self.tx_status(subject_txid).await;").unwrap()
+            ..gated.find("// TERMINAL AT ARCADE").unwrap()];
+        let decide = &src[src.find("pub(crate) fn probe_answer(").unwrap()..];
+        let decide = &decide[..decide.find("\n}\n").unwrap()];
+        let step = &src[src.find("pub(crate) fn take_probe(").unwrap()..];
+        let step = &step[..step.find("\n    }\n").unwrap()];
+        assert!(decide.contains("probe_seen(p.timestamp.as_deref(), now_ms, evicted_at_ms)"));
+        assert!(step.contains("probe_answer(probe, subject_txid, now_ms, self.evicted_at_ms)"));
+        assert!(decide.contains("Ok(ArcOutcome::AcceptedPending(subject_txid.to_string()))"));
+        assert!(decide.contains("Err(STORED_ECHO_UNDER_EVICTION.into())"));
+        for text in [arm, decide, step] {
+            assert!(!text.contains("note_witness("), "the probe's stored SEEN names no latch");
+            assert!(!text.contains("ArcOutcome::Accepted("), "the probe's stored SEEN is never a witnessed accept");
+        }
+        // the route: a pending answer starts the watch and readmits only through the open eviction it read
+        let route = include_str!("routes.rs");
+        let pending = &route[route
+            .find("Ok(crate::broadcaster::ArcOutcome::AcceptedPending(pending)) =>")
+            .unwrap()..];
+        let pending = &pending[..pending.find("Ok(crate::broadcaster::ArcOutcome::Rejected(reason))").unwrap()];
+        assert!(!pending.contains("latch_network_seen"), "a pending admission latches nothing");
+        assert!(pending.contains("pending_watch_job("));
+    }
+
+    /// bsv-low #637: the witnessed mode's duplicate stored SEEN echo, its claim's corroborator STORED (inconclusive),
+    /// answered 502 while the first admission stood. The duplicate of a STANDING admission is the pending ack; a
+    /// conflict, the fast mode, an open eviction or a subject the index does not hold keep today's answer.
+    #[tokio::test]
+    async fn i637_the_witnessed_duplicate_of_a_standing_admission_is_the_pending_ack() {
+        // the issue's shape through the shipped ladder: the stored SEEN echo, the corroborator STORED
+        for legs in [1, 2] {
+            let out = broadcast_efs_gated_with(
+                legs,
+                "subject",
+                |_| async { Ok(reached_submit_echo(false)) },
+                |_| async {
+                    corroborator_verdict(200, r#"{"txid":"subject","txStatus":"STORED"}"#)
+                },
+            )
+            .await;
+            assert!(out.is_err(), "the ladder's own answer is unchanged: {out:?}");
+        }
+        // the decision
+        assert!(duplicate_of_a_standing_admission(true, true, false, false, true));
+        assert!(!duplicate_of_a_standing_admission(true, true, false, false, false), "not standing: the #267 bar");
+        assert!(!duplicate_of_a_standing_admission(true, true, false, true, true), "an open eviction: #612");
+        assert!(!duplicate_of_a_standing_admission(true, true, true, false, true), "the fast mode");
+        assert!(!duplicate_of_a_standing_admission(true, false, false, false, true), "a conflict or no duplicate");
+        assert!(!duplicate_of_a_standing_admission(false, true, false, false, true), "an answer that stood");
+
+        let src = include_str!("broadcaster.rs");
+        let gated = &src[src.find("pub async fn broadcast_efs_gated<Y>(").unwrap()..];
+        let closure = &gated[gated.find("CorroborationKind::MinedClaim => match mined_subject_raw").unwrap()
+            ..gated.find("self.legs_paused.set(paused);").unwrap()];
+        assert!(
+            closure.contains("if self.duplicate_echo.get() && answer.is_err() {")
+                && closure.contains("self.claim_unconfirmed.set(true);"),
+            "only an inconclusive corroboration after a duplicate echo marks the claim unconfirmed"
+        );
+        let route = include_str!("routes.rs");
+        let arm = &route[route.find("let duplicate_echo = arcade.duplicate_echo();").unwrap()
+            ..route.find("corroborate_ms = arcade.corroborate_ms();").unwrap()];
+        assert!(arm.contains("crate::broadcaster::standing_duplicate_answer("));
+        assert!(arm.contains("duplicate_unconfirmed: arcade.duplicate_echo_unconfirmed(),"));
+        assert!(arm.contains("open_eviction: door_open.is_some(),") && arm.contains("fast_answer: admit_fast,"));
+        assert!(arm.contains("crate::admit_fast::index_holds_admission(&db, &subject_txid).await"));
+        assert!(!arm.contains("latch_network_seen"), "the ack latches nothing");
+        // the read is the #413 belt's two statements, a fault being "no"
+        let jobs = include_str!("admit_fast.rs");
+        assert!(route.contains(crate::admit_fast::STANDING_ADMISSION_SQL[0]));
+        assert!(route.contains(crate::admit_fast::STANDING_ADMISSION_SQL[1]));
+        let read = &jobs[jobs.find("pub(crate) async fn index_holds_admission(").unwrap()..];
+        let read = &read[..read.find("\n}\n").unwrap()];
+        assert!(read.contains("Err(_) => return false,"));
+    }
+
+    /// B-DOOR-3 fold (the lens's L4, its M1 row and L2): the probe arm's WHOLE answer is `probe_answer` over Arcade's
+    /// real `GET /tx` body, and the arm takes it through `take_probe`, which marks the probe a stored Reached echo
+    /// (the duplicate flag, so the fast mode counts it `fast-echo`, never a fresh accept).
+    #[test]
+    fn bdoor3_l4_the_probe_answer_is_the_arms_decision() {
+        let now = crate::proof_fetcher::rfc3339_utc_ms("2026-10-23T02:00:00Z").unwrap();
+        let evicted = now - 600_000;
+        let body = |txid: &str, status: &str, stamp: Option<&str>| -> ArcadeStatusResponse {
+            let stamp = stamp.map(|s| format!(r#","timestamp":"{s}""#)).unwrap_or_default();
+            serde_json::from_str(&format!(r#"{{"txid":"{txid}","txStatus":"{status}"{stamp}}}"#)).unwrap()
+        };
+        let stored = Err(STORED_ECHO_UNDER_EVICTION.to_string());
+        let pending = Ok(ArcOutcome::AcceptedPending("subject".into()));
+        let seen = |stamp| body("subject", "SEEN_ON_NETWORK", stamp);
+        // a stored SEEN before the eviction: the stored echo's 502
+        assert_eq!(probe_answer(Some(&seen(Some("2026-10-23T01:40:00Z"))), "subject", now, Some(evicted)), Some(stored.clone()));
+        // after it, inside the bound: pending
+        assert_eq!(probe_answer(Some(&seen(Some("2026-10-23T01:55:00Z"))), "subject", now, Some(evicted)), Some(pending.clone()));
+        // the lens's M1 row: after the eviction but past the 30 minute bound is the 502 too
+        let early = now - 3_600_000;
+        assert_eq!(probe_answer(Some(&seen(Some("2026-10-23T01:20:00Z"))), "subject", now, Some(early)), Some(stored.clone()));
+        // no eviction, no stamp: pending; a MINED word: pending; the subject in upper case: its own
+        assert_eq!(probe_answer(Some(&seen(None)), "subject", now, None), Some(pending.clone()));
+        assert_eq!(probe_answer(Some(&body("subject", "MINED", None)), "subject", now, None), Some(pending.clone()));
+        assert_eq!(probe_answer(Some(&body("SUBJECT", "SEEN_ON_NETWORK", None)), "subject", now, None), Some(pending));
+        // another txid's echo, a word below SEEN, no probe: not the probe's arm
+        assert_eq!(probe_answer(Some(&body("other", "SEEN_ON_NETWORK", None)), "subject", now, None), None);
+        assert_eq!(probe_answer(Some(&body("subject", "RECEIVED", None)), "subject", now, None), None);
+        assert_eq!(probe_answer(None, "subject", now, None), None);
+
+        // L2: the arm's own step marks the duplicate, in both answers, and nothing when it is not the probe's arm
+        for (fast, counter) in [
+            (true, crate::ops::COUNTER_SUBMIT_FAST_ADMITTED_ECHO),
+            (false, crate::ops::COUNTER_SUBMIT_PENDING_ADMITTED),
+        ] {
+            let b = ArcadeBroadcaster::new("").with_fast_answer(fast);
+            assert_eq!(b.take_probe(Some(&seen(None)), "subject", now), Some(Ok(ArcOutcome::AcceptedPending("subject".into()))));
+            assert!(b.duplicate_echo(), "the probe is a stored Reached echo");
+            assert!(!b.duplicate_echo_unconfirmed(), "no corroboration ran: #637's shape untouched");
+            assert_eq!(crate::ops::pending_admission_counter(fast, b.duplicate_echo()), counter);
+        }
+        let b = ArcadeBroadcaster::new("").with_evicted_at_ms(Some(evicted));
+        assert_eq!(b.take_probe(Some(&seen(None)), "subject", now), Some(stored));
+        assert!(b.duplicate_echo());
+        let b = ArcadeBroadcaster::new("");
+        assert_eq!(b.take_probe(Some(&body("subject", "RECEIVED", None)), "subject", now), None);
+        assert!(!b.duplicate_echo());
+        assert_ne!(pending_admission_words(false, true), pending_admission_words(false, false));
+
+        // the shipped arm returns the step's answer and decides nothing of its own
+        let src = include_str!("broadcaster.rs");
+        let gated = &src[src.find("pub async fn broadcast_efs_gated<Y>(").unwrap()..];
+        let arm = &gated[gated.find("let mut probe = self.tx_status(subject_txid).await;").unwrap()
+            ..gated.find("// TERMINAL AT ARCADE").unwrap()];
+        assert!(arm.contains("self.take_probe(probe.as_ref(), subject_txid, worker::Date::now().as_millis() as i64)"));
+        assert!(arm.contains("return answer;"));
+        assert!(!arm.contains("probe_seen("), "the arm decides through `probe_answer` alone");
+        assert!(!arm.contains("ArcOutcome::"), "the arm builds no answer of its own");
+    }
+
+    /// B-DOOR-3 fold (the lens's L3): only the SUBJECT's own Reached echo is the duplicate #637 reads. The two-leg
+    /// shape: the full-batch rung registers an ancestor whose echo is SEEN, the subject's is not: no duplicate, so
+    /// no inconclusive corroboration after it is a standing duplicate's claim.
+    #[test]
+    fn bdoor3_l3_only_the_subjects_own_echo_marks_the_duplicate() {
+        let b = ArcadeBroadcaster::new("");
+        b.begin_request("subject");
+        b.note_reached_echo("ancestor");
+        assert!(!b.duplicate_echo(), "an ancestor leg's stored SEEN is not the subject's");
+        assert!(!b.duplicate_echo_unconfirmed());
+        b.note_reached_echo("SUBJECT");
+        assert!(b.duplicate_echo(), "the subject's own echo, any letter case");
+        let src = include_str!("broadcaster.rs");
+        let submit = &src[src.find("async fn submit_once_and_gate(").unwrap()..];
+        let submit = &submit[..submit.find("async fn submit_ef(").unwrap()];
+        assert!(submit.contains("self.note_reached_echo(subject_txid);"));
+        assert!(!submit.contains("self.duplicate_echo.set(true)"), "the flag is set through the subject's check alone");
+        let gated = &src[src.find("pub async fn broadcast_efs_gated<Y>(").unwrap()..];
+        let head = &gated[..gated.find("let mut probe = self.tx_status(subject_txid).await;").unwrap()];
+        assert!(head.contains("self.begin_request(subject_txid);"));
+    }
+
+    /// B-DOOR-3 fold (the lens's L4): the #637 transform is `standing_duplicate_answer` over real `ArcOutcome`
+    /// values, and the route calls it.
+    #[test]
+    fn bdoor3_l4_the_standing_duplicate_answer_is_the_routes_decision() {
+        let shape = DuplicateShape { duplicate_unconfirmed: true, fast_answer: false, open_eviction: false };
+        let refused: Result<ArcOutcome, String> = Err("inconclusive".into());
+        assert!(shape.asks_the_index(&refused));
+        assert_eq!(
+            standing_duplicate_answer(refused.clone(), "subject", shape, true),
+            Ok(ArcOutcome::AcceptedPending("subject".into()))
+        );
+        assert_eq!(standing_duplicate_answer(refused.clone(), "subject", shape, false), refused, "not standing");
+        for other in [
+            DuplicateShape { open_eviction: true, ..shape },
+            DuplicateShape { fast_answer: true, ..shape },
+            DuplicateShape { duplicate_unconfirmed: false, ..shape },
+        ] {
+            assert!(!other.asks_the_index(&refused));
+            assert_eq!(standing_duplicate_answer(refused.clone(), "subject", other, true), refused);
+        }
+        for stood in [Ok(ArcOutcome::Rejected("conflict".into())), Ok(ArcOutcome::AcceptedPending("subject".into()))] {
+            assert!(!shape.asks_the_index(&stood));
+            assert_eq!(standing_duplicate_answer(stood.clone(), "subject", shape, true), stood);
+        }
+        let route = include_str!("routes.rs");
+        let arm = &route[route.find("let duplicate_echo = arcade.duplicate_echo();").unwrap()
+            ..route.find("corroborate_ms = arcade.corroborate_ms();").unwrap()];
+        assert!(arm.contains("if shape.asks_the_index(&arcade_outcome) {"));
+        assert!(arm.contains("crate::broadcaster::standing_duplicate_answer(arcade_outcome, &subject_txid, shape, standing)"));
+        assert!(!arm.contains("ArcOutcome::AcceptedPending("), "the route builds no answer of its own");
+    }
+
     #[test]
     fn ns2_m2_reached_echo_decision() {
         assert_eq!(reached_submit_echo(false), GateStep::Accepted);
@@ -6783,6 +7188,16 @@ mod tests {
     // / `CODE_257_PROSE_FALSE`). The two implementations must agree on every
     // entry — that equivalence is the whole point of the shared list.
 
+    /// bsv-low #652: bodies that NAME a seen word but say the network does NOT hold the tx (an orphan view, a "not
+    /// seen yet"): never already-known, in any dress. Shared with the client mirror as `ALREADY_KNOWN_NOT_HELD_FALSE`.
+    const ALREADY_KNOWN_NOT_HELD_FALSE: &[&str] = &[
+        "SEEN_IN_ORPHAN_MEMPOOL",
+        "not seen yet",
+        "transaction not seen yet by the network",
+        r#"{"txStatus":"SEEN_IN_ORPHAN_MEMPOOL","extraInfo":"orphan: missing parent"}"#,
+        "Orphan transaction: parents not seen",
+    ];
+
     const CODE_257_TRUE: &[&str] = &[
         "txn-already-known",
         "257: txn-already-known",
@@ -6839,6 +7254,39 @@ mod tests {
     /// `routes.rs::json_error(&format!("network rejected: {reason}"), 422)`.
     fn overlay_422(reason: &str) -> String {
         format!(r#"{{"status":"error","message":"network rejected: {reason}"}}"#)
+    }
+
+    /// bsv-low #652: the non-2xx arm (ARC's 460-class answer) read `SEEN_IN_ORPHAN_MEMPOOL` and `not seen yet` as
+    /// already-known (`Accepted`). Bare, in ARC's non-2xx body echoing a txid, and in the overlay's 422 wrapper:
+    /// never already-known, and neither verdict ever `Accepted`.
+    #[test]
+    fn i652_an_orphan_or_not_seen_body_is_never_already_known() {
+        let txid = REAL_LEDGER_TXIDS_CONTAINING_257[0];
+        for body in ALREADY_KNOWN_NOT_HELD_FALSE {
+            assert!(!already_known(body), "bare: {body}");
+            let dressed = [
+                arc_error_body(460, "Transaction is not valid", body, txid),
+                arc_error_body(465, "Fee too low", body, txid),
+                overlay_422(body),
+            ];
+            for d in dressed {
+                assert!(!already_known(&d), "dressed: {d}");
+                for status in [460u16, 465, 473, 500] {
+                    assert!(
+                        !matches!(arc_verdict(status, &d), Ok(ArcOutcome::Accepted(_))),
+                        "arc_verdict({status}) accepted {d}"
+                    );
+                    assert!(
+                        !matches!(corroborator_verdict(status, &d), Ok(ArcOutcome::Accepted(_))),
+                        "corroborator_verdict({status}) accepted {d}"
+                    );
+                }
+            }
+        }
+        // the true dresses, `SEEN_ON_NETWORK` among them, still read already-known
+        for s in CODE_257_TRUE {
+            assert!(already_known(s), "code dress lost: {s}");
+        }
     }
 
     #[test]
