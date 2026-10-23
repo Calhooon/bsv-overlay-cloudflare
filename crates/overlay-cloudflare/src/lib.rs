@@ -1606,7 +1606,8 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
         .map(|v| v.to_string())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| crate::broadcaster::ARCADE_DEFAULT_URL.to_string());
-    // #602 fold (MEDIUM-2): the conflict pass's GETs ride the WoC key when one is installed.
+    // #602 fold (MEDIUM-2): the conflict pass's GETs ride the WoC key when one is installed. bsv-low #834
+    // (FIX-834-MERGE): the retire pass, its conflict pass included, asks through the pass's one pacer.
     let woc_key = env.secret("WOC_API_KEY").ok().map(|k| k.to_string());
     let retire = crate::proof_fetcher::run_retire_pass(
         &ops_db,
@@ -1614,6 +1615,7 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
         woc_key.as_deref(),
         crate::proof_fetcher::ProofSources::from_env(env),
         crate::lookup_service_chain_tracker(env),
+        Some(courier_counts.clone()),
     )
     .await;
     worker::console_log!(
@@ -1657,6 +1659,7 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
         taal_key.as_deref(),
         None,
         crate::proof_fetcher::ProofSources::from_env(env),
+        Some(&courier_counts),
     )
     .await;
     // 5. observability heartbeat + counters (same as the cron would stamp).

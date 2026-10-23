@@ -1675,16 +1675,21 @@ pub struct CourierConflictPresence {
     pub sources: crate::proof_fetcher::ProofSources,
     /// The WhatsOnChain API key, if one is configured.
     pub woc_api_key: Option<String>,
+    /// bsv-low #834 (FIX-834-MERGE): the janitor pass's paced courier counters, when the pass runs in the janitor.
+    pub(crate) counters: Option<crate::courier_counters::Counters>,
 }
 
 #[async_trait(?Send)]
 impl ConflictPresence for CourierConflictPresence {
     async fn presence(&self, txid: &str) -> Option<crate::proof_fetcher::NetworkPresence> {
         use crate::proof_fetcher::*;
-        let b = self.sources.bitails_presence(txid).await;
+        let b = self
+            .sources
+            .bitails_presence_counted(txid, self.counters.as_ref())
+            .await;
         let w = self
             .sources
-            .woc_presence(self.woc_api_key.as_deref(), txid)
+            .woc_presence_counted(self.woc_api_key.as_deref(), txid, self.counters.as_ref())
             .await;
         Some(classify_presence(b, w))
     }
@@ -1992,10 +1997,32 @@ impl ConflictPassPort for WorkerConflictPass<'_> {
 }
 
 /// One confirmed-conflict pass over up to eight unconfirmed live pots ([`CONFLICT_CANDIDATES_SQL`]): each re-checked against the couriers and evicted when a confirmed competitor conflicts with it.
-pub async fn confirmed_conflict_pass(
+/// bsv-low #834 (FIX-834-MERGE): the conflict pass's courier fetcher, its own 24-call budget and circuit, its asks
+/// through the janitor pass's ONE pacer when `counters` is given (the scheduled tick and `/admin/complete-proofs`):
+/// before it the pass built an unpaced fetcher, so on the merged main (#837's JOINs giving it inputs to read) a WoC
+/// answering 429 was asked three more times by this fetcher's own circuit after the pass had backed WoC off, and
+/// pruned Bitails' per-output non-answers were asked for every candidate (the budget tier's `janitor-pass-woc-429`:
+/// 24 asks past the pacer, WoC 6 and Bitails 24 where the paced pass makes 3 and 3).
+pub(crate) fn conflict_pass_fetcher(
+    sources: crate::proof_fetcher::ProofSources,
+    woc_api_key: Option<&str>,
+    counters: Option<crate::courier_counters::Counters>,
+) -> crate::proof_fetcher::ChainProofFetcher {
+    let fetcher = crate::proof_fetcher::ChainProofFetcher::new(None)
+        .with_sources(sources)
+        .with_woc_api_key(woc_api_key.map(str::to_owned))
+        .with_budget(24);
+    match counters {
+        Some(counters) => fetcher.with_courier_counters(counters),
+        None => fetcher,
+    }
+}
+
+pub(crate) async fn confirmed_conflict_pass(
     db: &D1Database,
     woc_api_key: Option<&str>,
     sources: crate::proof_fetcher::ProofSources,
+    counters: Option<crate::courier_counters::Counters>,
 ) -> ConflictPassSummary {
     #[derive(serde::Deserialize)]
     struct Candidate {
@@ -2019,13 +2046,11 @@ pub async fn confirmed_conflict_pass(
     };
     let port = WorkerConflictPass {
         db,
-        fetcher: crate::proof_fetcher::ChainProofFetcher::new(None)
-            .with_sources(sources)
-            .with_woc_api_key(woc_api_key.map(str::to_owned))
-            .with_budget(24),
+        fetcher: conflict_pass_fetcher(sources, woc_api_key, counters.clone()),
         presence: CourierConflictPresence {
             sources,
             woc_api_key: woc_api_key.map(str::to_owned),
+            counters,
         },
     };
     run_conflict_candidates(&port, rows.into_iter().map(|r| (r.txid, r.beef)).collect()).await
@@ -5387,7 +5412,7 @@ mod tests {
     #[test]
     fn e649_h1_the_pass_runs_the_shipped_loop() {
         let src = include_str!("admit_fast.rs");
-        let pass = &src[src.find("pub async fn confirmed_conflict_pass(").unwrap()..];
+        let pass = &src[src.find("pub(crate) async fn confirmed_conflict_pass(").unwrap()..];
         let pass = &pass[..pass.find("\n}\n").unwrap()];
         assert!(
             pass.contains("run_conflict_candidates(&port,"),

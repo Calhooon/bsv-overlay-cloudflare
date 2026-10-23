@@ -92,11 +92,11 @@ fn e602_readmission_latch_requires_broadcaster_witness() {
 #[test]
 fn e602_retire_pass_rechecks_live_pots_for_confirmed_competitors() {
     let proof = source("proof_fetcher.rs");
-    let pass = &proof[proof.find("pubasyncfnrun_retire_pass(").unwrap()..];
+    let pass = &proof[proof.find("pub(crate)asyncfnrun_retire_pass(").unwrap()..];
     let pass = &pass[..pass.find("letmutsummary=RetireSummary").unwrap()];
     assert_eq!(
         pass.matches(
-            "letconflict=crate::admit_fast::confirmed_conflict_pass(db,woc_api_key,sources).await;"
+            "letconflict=crate::admit_fast::confirmed_conflict_pass(db,woc_api_key,sources,counters).await;"
         )
         .count(),
         1
@@ -145,7 +145,8 @@ fn e602_fold_retire_callers_pass_the_woc_key_and_print_the_conflict_summary() {
     let callers =
         (source("lib.rs") + &source("tick.rs")).replace("from_env(&env)", "from_env(env)");
     // bsv-low #836 fold: the tip a non-final word's hold is bounded by rides as the fifth argument
-    let call = "run_retire_pass(&ops_db,&arcade_base,woc_key.as_deref(),crate::proof_fetcher::ProofSources::from_env(env),crate::lookup_service_chain_tracker(env),).await;";
+    // bsv-low #834 (FIX-834-MERGE): and the janitor pass's paced counters as the sixth
+    let call = "run_retire_pass(&ops_db,&arcade_base,woc_key.as_deref(),crate::proof_fetcher::ProofSources::from_env(env),crate::lookup_service_chain_tracker(env),Some(courier_counts.clone()),).await;";
     assert_eq!(
         callers.matches(call).count(),
         2,
@@ -181,7 +182,7 @@ fn e602_fold_a_witnessed_accept_starts_no_watch() {
 fn e602_delta_the_conflict_pass_bumps_its_counters_on_both_exits() {
     let admit_fast = source("admit_fast.rs");
     let start = admit_fast
-        .find("pubasyncfnconfirmed_conflict_pass(")
+        .find("pub(crate)asyncfnconfirmed_conflict_pass(")
         .unwrap();
     let end = admit_fast[start..]
         .find("asyncfnbump_conflict_counters(")
