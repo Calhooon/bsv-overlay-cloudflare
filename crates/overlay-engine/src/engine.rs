@@ -1367,6 +1367,35 @@ impl Engine {
     // Submit — 3-phase pipeline
     // ========================================================================
 
+    /// Tell this engine's managers that an admission the network did not
+    /// take is aborted (bsv-low #558): [`TopicManager::abort_admissible_outputs`]
+    /// once per `(topic, outputs)` whose outputs are not empty and whose
+    /// topic this engine manages, an `Err` logged, the rest still told
+    /// ([`crate::topic_manager::abort_provisional_admissions`], the
+    /// reference's `abortProvisionalAdmissions`, `Engine.ts:685-700` at
+    /// `f999e0c1a`). Answers how many managers were told.
+    ///
+    /// The reference calls it from `submit` when a `current-tx` broadcast
+    /// THROWS (`Engine.ts:1219-1223`), which it does only under
+    /// `throwOnBroadcastFailure = true` (default `false`). This engine's
+    /// broadcast is never fatal (the default's branch), so `submit` never
+    /// calls it; it is for a host that learns the network's refusal after
+    /// the write (the Cloudflare worker's eviction, register row D1, calls
+    /// the shared function with its own managers). Nothing here touches
+    /// storage: the host's own eviction removes the rows.
+    pub async fn abort_provisional_admissions(
+        &self,
+        beef: &[u8],
+        admissions: &[(String, Vec<u32>)],
+    ) -> u32 {
+        crate::topic_manager::abort_provisional_admissions(
+            |topic| self.managers.get(topic).map(AsRef::as_ref),
+            beef,
+            admissions,
+        )
+        .await
+    }
+
     /// Validate a tagged BEEF without applying mutations.
     ///
     /// Runs Phase 1 (topic validation) and Phase 2 (broadcast) but NOT Phase 3
@@ -3651,6 +3680,11 @@ impl Engine {
                             info!("ARC broadcast succeeded: txid={arc_txid}");
                         }
                         Err(e) => {
+                            // Non-fatal, the reference's default
+                            // (`throwOnBroadcastFailure = false`): it does
+                            // not abort the managers on this branch either
+                            // (`Engine.ts:1219-1223`, bsv-low #558), so no
+                            // `abort_provisional_admissions` here.
                             error!("ARC broadcast failed (non-fatal): {e}");
                         }
                     }
@@ -14044,4 +14078,5 @@ mod tests {
     include!("batch_tests.rs");
     include!("page_batch_tests.rs");
     include!("resume_slice_tests.rs");
+    include!("abort_tests.rs");
 }

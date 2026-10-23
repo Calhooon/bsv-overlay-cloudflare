@@ -12,6 +12,7 @@
 // with its `// SAFETY:` reason.
 #![deny(missing_docs)]
 
+pub mod admission_abort;
 pub mod admit_fast;
 pub mod advert_lifecycle;
 pub mod advertiser;
@@ -747,6 +748,55 @@ pub(crate) fn lookup_service_chain_tracker(
     }
 }
 
+/// Every topic manager this worker can register, by its `TOPIC_MANAGERS`
+/// name (bsv-low #558: the one list, read by [`build_engine_with_storage`]
+/// and by the eviction's abort, `admission_abort::managers_that_abort`).
+pub(crate) const WORKSPACE_TOPIC_MANAGERS: [&str; 16] = [
+    "tm_ship",
+    "tm_slap",
+    "tm_uhrp",
+    "tm_agent",
+    "tm_dm_delegation",
+    "tm_low",
+    "tm_reveal",
+    "tm_pot",
+    "tm_lowfund",
+    "tm_collected",
+    "tm_hand",
+    "tm_result",
+    "tm_proof",
+    "tm_potparty",
+    "tm_potrefund",
+    "tm_hopparty",
+];
+
+/// The topic manager registered under `name`, or `None` for a name this
+/// worker does not know. Every one is stateless (`new()`), so building one
+/// costs nothing and reads nothing.
+pub(crate) fn topic_manager_named(name: &str) -> Option<Box<dyn TopicManager>> {
+    Some(match name {
+        "tm_ship" => Box::new(SHIPTopicManager::new()),
+        "tm_slap" => Box::new(SLAPTopicManager::new()),
+        "tm_uhrp" => Box::new(UHRPTopicManager::new()),
+        "tm_agent" => Box::new(AgentTopicManager::new()),
+        "tm_dm_delegation" => Box::new(DmDelegationTopicManager::new()),
+        "tm_low" => Box::new(LowTopicManager::new()),
+        "tm_reveal" => Box::new(RevealTopicManager::new()),
+        "tm_pot" => Box::new(PotTopicManager::new()),
+        "tm_lowfund" => {
+            Box::new(overlay_discovery::pot::lowfund_topic_manager::LowFundTopicManager::new())
+        }
+        "tm_collected" => Box::new(CollectedTopicManager::new()),
+        "tm_hand" => Box::new(HandTopicManager::new()),
+        "tm_result" => Box::new(ResultTopicManager::new()),
+        "tm_proof" => Box::new(ProofTopicManager::new()),
+        "tm_potparty" => Box::new(PotpartyTopicManager::new()),
+        "tm_potrefund" => Box::new(PotrefundTopicManager::new()),
+        "tm_hopparty" => Box::new(HoppartyTopicManager::new()),
+        _ => return None,
+    })
+}
+
 /// Build the overlay Engine with D1-backed storage and pre-built SHIP/SLAP/Agent storage.
 ///
 /// The discovery storage references are passed in so they can be shared with
@@ -806,70 +856,11 @@ fn build_engine_with_storage(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        match t {
-            "tm_ship" => {
-                managers.insert("tm_ship".into(), Box::new(SHIPTopicManager::new()));
+        match topic_manager_named(t) {
+            Some(manager) => {
+                managers.insert(t.into(), manager);
             }
-            "tm_slap" => {
-                managers.insert("tm_slap".into(), Box::new(SLAPTopicManager::new()));
-            }
-            "tm_uhrp" => {
-                managers.insert("tm_uhrp".into(), Box::new(UHRPTopicManager::new()));
-            }
-            "tm_agent" => {
-                managers.insert("tm_agent".into(), Box::new(AgentTopicManager::new()));
-            }
-            "tm_dm_delegation" => {
-                managers.insert(
-                    "tm_dm_delegation".into(),
-                    Box::new(DmDelegationTopicManager::new()),
-                );
-            }
-            "tm_low" => {
-                managers.insert("tm_low".into(), Box::new(LowTopicManager::new()));
-            }
-            "tm_reveal" => {
-                managers.insert("tm_reveal".into(), Box::new(RevealTopicManager::new()));
-            }
-            "tm_pot" => {
-                managers.insert("tm_pot".into(), Box::new(PotTopicManager::new()));
-            }
-            "tm_lowfund" => {
-                managers.insert(
-                    "tm_lowfund".into(),
-                    Box::new(
-                        overlay_discovery::pot::lowfund_topic_manager::LowFundTopicManager::new(),
-                    ),
-                );
-            }
-            "tm_collected" => {
-                managers.insert(
-                    "tm_collected".into(),
-                    Box::new(CollectedTopicManager::new()),
-                );
-            }
-            "tm_hand" => {
-                managers.insert("tm_hand".into(), Box::new(HandTopicManager::new()));
-            }
-            "tm_result" => {
-                managers.insert("tm_result".into(), Box::new(ResultTopicManager::new()));
-            }
-            "tm_proof" => {
-                managers.insert("tm_proof".into(), Box::new(ProofTopicManager::new()));
-            }
-            "tm_potparty" => {
-                managers.insert("tm_potparty".into(), Box::new(PotpartyTopicManager::new()));
-            }
-            "tm_potrefund" => {
-                managers.insert(
-                    "tm_potrefund".into(),
-                    Box::new(PotrefundTopicManager::new()),
-                );
-            }
-            "tm_hopparty" => {
-                managers.insert("tm_hopparty".into(), Box::new(HoppartyTopicManager::new()));
-            }
-            other => worker::console_warn!("TOPIC_MANAGERS: unknown entry '{other}' — skipped"),
+            None => worker::console_warn!("TOPIC_MANAGERS: unknown entry '{t}', skipped"),
         }
     }
 
