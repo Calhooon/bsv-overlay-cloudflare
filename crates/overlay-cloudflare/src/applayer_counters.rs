@@ -39,7 +39,7 @@ const OWED_READ_FAULT_KINDS: [&str; 9] = [
     "sweep_proofs",
     "markerless",
 ];
-const RECORD_REFUSAL_CLASSES: [&str; 17] = [
+const RECORD_REFUSAL_CLASSES: [&str; 22] = [
     "bad_kind",
     "bad_script_hex",
     "body_too_large",
@@ -56,6 +56,12 @@ const RECORD_REFUSAL_CLASSES: [&str; 17] = [
     "hop_marker_unverified",
     "sweep_does_not_spend_the_hop",
     "sweep_not_the_seats_spend",
+    // bsv-low #848 (FAST-C): the handfile arm's refusals
+    "handfile_shape",
+    "handfile_payload_not_a_marker",
+    "handfile_inconsistent",
+    "settle_signature_invalid",
+    "hop_marker_refuted",
     "bad_body",
 ];
 const AUTH_REFUSAL_REASONS: [&str; 19] = [

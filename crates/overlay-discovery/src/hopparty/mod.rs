@@ -200,6 +200,20 @@ pub const HOPPARTY_SIG_MIN_LEN: usize = 67;
 /// Maximum sig push length (bytes) — a DER ECDSA signature.
 pub const HOPPARTY_SIG_MAX_LEN: usize = 74;
 
+/// bsv-low #848 (FAST-C, #461 design C): a hop marker FILED through the app layer's `handfile` family lives in
+/// `hopparty_records` under the HOP's txid (the links and seats the triggers derive join on it) at an
+/// `outputIndex` at or above this base, an index no transaction has (a vout is at most 2^31 - 1 in any tx the
+/// SDK serializes; the chain's markers sit at their real vout). The low 31 bits are the row's content hash, so two
+/// identities' filings for one hop are two rows (the stranger's row never takes the honest row's key). A reader
+/// that re-verifies a hopparty row's OWN signatures (the overlay's relatch pass) leaves such a row alone: its
+/// signature columns hold the BATCH's two signatures, verified once at the door over the batch digest.
+pub const HANDFILE_MARKER_VOUT_BASE: u32 = 0x8000_0000;
+
+/// Is this `hopparty_records.outputIndex` a handfile row's (bsv-low #848)?
+pub const fn is_handfile_marker_vout(output_index: u32) -> bool {
+    output_index >= HANDFILE_MARKER_VOUT_BASE
+}
+
 /// A decoded hopparty marker — one seat's "my funding hop for game G is
 /// outpoint (T,v)" claim, published at hop time so `/hops-view` can
 /// enumerate hops-in-flight for an identity.

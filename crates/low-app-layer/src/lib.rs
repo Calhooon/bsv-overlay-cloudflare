@@ -155,6 +155,8 @@ pub mod pot_hook;
 pub mod proof_post;
 pub mod rate;
 pub mod record_post;
+/// bsv-low #848 (FAST-C): the four funding-moment filings under one signature per key.
+pub mod handfile;
 pub mod refund_backups;
 pub mod refund_view;
 pub mod results;
