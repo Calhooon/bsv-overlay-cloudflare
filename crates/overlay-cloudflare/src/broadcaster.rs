@@ -1431,6 +1431,28 @@ fn submit_echo_is_fresh(stamp: Option<&str>, now_ms: i64, evicted_at_ms: Option<
         .is_some_and(|at| at <= now_ms + 60_000 && now_ms - at < 30 * 60_000 && at > evicted)
 }
 
+/// What the pre-flight probe's stored SEEN answers (bsv-low #636). The probe's `GET /tx` is Arcade's STORED status,
+/// as the POST echo is (#612): never fresh evidence. So it never latches `network_seen` and never readmits an OPEN
+/// eviction on its own word: under an open eviction only a stamp after the eviction, inside the freshness bound
+/// ([`submit_echo_is_fresh`]), goes on; every probe that goes on admits PENDING, the pending watch's live look owning
+/// the latch, in both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeSeen {
+    /// `AcceptedPending`: admitted (an open eviction readmitted by the route), `network_seen` unlatched.
+    Pending,
+    /// [`STORED_ECHO_UNDER_EVICTION`]: a stored SEEN that predates the open eviction, the retryable 502.
+    StoredUnderEviction,
+}
+
+/// PURE (bsv-low #636): the probe's stored SEEN, judged by its stamp against the open eviction, if any.
+pub(crate) fn probe_seen(stamp: Option<&str>, now_ms: i64, evicted_at_ms: Option<i64>) -> ProbeSeen {
+    if submit_echo_is_fresh(stamp, now_ms, evicted_at_ms) {
+        ProbeSeen::Pending
+    } else {
+        ProbeSeen::StoredUnderEviction
+    }
+}
+
 /// Classify one Arcade submit HTTP response (#213). PURE — unit-tested.
 pub(crate) fn classify_submit_response(status: u16, body: &str) -> SubmitOutcome {
     if (200..300).contains(&status) {
@@ -2529,7 +2551,8 @@ pub struct ArcadeBroadcaster {
     /// NL-6d: set when a corroboration's walk paused at this many primed ancestors (the caller defers the rest).
     legs_paused: std::cell::Cell<Option<usize>>,
     /// bsv-low #621 (L5): the FIRST broadcaster this request saw say SEEN or better for the subject (Arcade's
-    /// poll, stored echo or pre-flight probe; a corroborator's accept), with its stamp when its answer carried one.
+    /// poll or witnessed-mode stored echo; a corroborator's accept), with its stamp when its answer carried one. The
+    /// pre-flight probe names none since bsv-low #636 (it admits pending).
     /// The route latches `network_seen` under this name ([`Self::witnessed_by`]).
     witnessed_by: std::cell::Cell<Option<(crate::ops::SeenSource, Option<i64>)>>,
     /// bsv-low #836 fold (the lens's M1): the chaintracks tip a non-final word's hold is bounded by.
@@ -3042,16 +3065,26 @@ impl ArcadeBroadcaster {
         let probe_status = probe.as_ref().map(|r| r.tx_status.as_str()).unwrap_or("");
         if probe_is_subject && matches!(classify_arcade_status(probe_status), GateVerdict::Reached)
         {
-            gate_log(&format!(
-                "[arcade] {subject_txid} already >= {ARCADE_GATE_STATUS} (pre-flight probe) — ladder + callback re-registration skipped"
-            ));
-            // bsv-low #621: Arcade's stored SEEN names the latch, at its own stamp
-            self.note_witness(
-                Some(crate::ops::SeenSource::Arcade),
-                probe.as_ref().and_then(|r| r.timestamp.as_deref()).and_then(crate::proof_fetcher::rfc3339_utc_ms),
-            );
-            // Payload contract: `Accepted` carries the txid.
-            return Ok(ArcOutcome::Accepted(subject_txid.to_string()));
+            // bsv-low #636: the probe reads Arcade's STORED status, never fresh evidence: it latches nothing (the
+            // pending watch's live look does) and readmits an open eviction only on a stamp after it (#612's rule)
+            let stamp = probe.as_ref().and_then(|r| r.timestamp.as_deref());
+            match probe_seen(stamp, worker::Date::now().as_millis() as i64, self.evicted_at_ms) {
+                ProbeSeen::Pending => {
+                    gate_log(&format!(
+                        "[arcade] {subject_txid} already >= {ARCADE_GATE_STATUS} (pre-flight probe, stored at {}) — ladder + callback re-registration skipped; admitted PENDING, the pending watch owns the latch (#636)",
+                        stamp.unwrap_or("no stamp")
+                    ));
+                    // Payload contract: `AcceptedPending` carries the txid.
+                    return Ok(ArcOutcome::AcceptedPending(subject_txid.to_string()));
+                }
+                ProbeSeen::StoredUnderEviction => {
+                    gate_log(&format!(
+                        "[arcade] {subject_txid} already >= {ARCADE_GATE_STATUS} (pre-flight probe, stored at {}) under an OPEN eviction — a stored word never readmits (#636)",
+                        stamp.unwrap_or("no stamp")
+                    ));
+                    return Err(STORED_ECHO_UNDER_EVICTION.into());
+                }
+            }
         }
         // TERMINAL AT ARCADE → NEVER RE-FEED IT (INCIDENT D1-CALLBACK-FLOOD
         // 2026-09-01, the wedge): a subject Arcade holds at REJECTED /
@@ -6375,6 +6408,52 @@ mod tests {
             ladder_step(GateStep::SyncAccepted, "subject"),
             Ladder::Return(ArcOutcome::AcceptedPending("subject".into()))
         );
+    }
+
+    /// bsv-low #636: the pre-flight probe's stored SEEN (`GET /tx`, Arcade's stored status at its stamp) neither
+    /// latches nor readmits a stale eviction: under an OPEN eviction only a stamp after it, inside the bound, goes on;
+    /// every probe that goes on is the pending admission, the pending watch owning the latch.
+    #[test]
+    fn i636_the_probes_stored_seen_never_latches_and_never_readmits_a_stale_eviction() {
+        let now = crate::proof_fetcher::rfc3339_utc_ms("2026-10-23T02:00:00Z").unwrap();
+        let evicted = now - 600_000;
+        // stored SEEN before the eviction (the issue's shape): not a readmission
+        assert_eq!(
+            probe_seen(Some("2026-10-23T01:40:00Z"), now, Some(evicted)),
+            ProbeSeen::StoredUnderEviction
+        );
+        // unstamped, or an unreadable stamp, under an eviction: not a readmission
+        assert_eq!(probe_seen(None, now, Some(evicted)), ProbeSeen::StoredUnderEviction);
+        assert_eq!(probe_seen(Some("bad"), now, Some(evicted)), ProbeSeen::StoredUnderEviction);
+        // stamped after the eviction, inside the bound: goes on, pending
+        assert_eq!(
+            probe_seen(Some("2026-10-23T01:55:00Z"), now, Some(evicted)),
+            ProbeSeen::Pending
+        );
+        // no eviction: the stored SEEN admits pending however old
+        assert_eq!(probe_seen(Some("2026-10-22T01:00:00Z"), now, None), ProbeSeen::Pending);
+        assert_eq!(probe_seen(None, now, None), ProbeSeen::Pending);
+
+        // the shipped probe arm: judged by `probe_seen` over the open eviction, answering pending or the stored
+        // echo's 502, never `Accepted` and never naming a latch
+        let src = include_str!("broadcaster.rs");
+        let gated = &src[src.find("pub async fn broadcast_efs_gated<Y>(").unwrap()..];
+        let arm = &gated[gated
+            .find("if probe_is_subject && matches!(classify_arcade_status(probe_status), GateVerdict::Reached)")
+            .unwrap()..gated.find("// TERMINAL AT ARCADE").unwrap()];
+        assert!(arm.contains("probe_seen(stamp,") && arm.contains("self.evicted_at_ms"));
+        assert!(arm.contains("return Ok(ArcOutcome::AcceptedPending(subject_txid.to_string()))"));
+        assert!(arm.contains("return Err(STORED_ECHO_UNDER_EVICTION.into())"));
+        assert!(!arm.contains("note_witness("), "the probe's stored SEEN names no latch");
+        assert!(!arm.contains("ArcOutcome::Accepted("), "the probe's stored SEEN is never a witnessed accept");
+        // the route: a pending answer starts the watch and readmits only through the open eviction it read
+        let route = include_str!("routes.rs");
+        let pending = &route[route
+            .find("Ok(crate::broadcaster::ArcOutcome::AcceptedPending(pending)) =>")
+            .unwrap()..];
+        let pending = &pending[..pending.find("Ok(crate::broadcaster::ArcOutcome::Rejected(reason))").unwrap()];
+        assert!(!pending.contains("latch_network_seen"), "a pending admission latches nothing");
+        assert!(pending.contains("pending_watch_job("));
     }
 
     #[test]

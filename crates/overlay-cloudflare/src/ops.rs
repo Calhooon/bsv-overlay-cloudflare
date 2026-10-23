@@ -2946,7 +2946,7 @@ mod tests {
         let census: [(&str, &str, usize); 4] = [
             // the #413 dual push: the corroborator whose answer accepted the subject (TAAL, else GorillaPool)
             (routes.as_str(), "crate::ops::latch_network_seen(&dual_db,&dual_txid,by,None)", 1),
-            // the gated accept: the broadcaster that said SEEN in this request (Arcade's poll, echo or probe; a corroborator)
+            // the gated accept: the broadcaster that said SEEN in this request (Arcade's poll or echo; a corroborator)
             (routes.as_str(), "(Ok(db),Some((by,at_ms)))=>{crate::ops::latch_network_seen(&db,&subject_txid,by,at_ms).await}", 1),
             // the ungated arm's background look: Arcade's live GET, at its stamp
             (routes.as_str(), "crate::ops::latch_network_seen(&seen_db,&subject,crate::ops::SeenSource::Arcade,at_ms)", 1),
@@ -2959,9 +2959,10 @@ mod tests {
         let calls = routes.matches("crate::ops::latch_network_seen(").count()
             + jobs.matches("crate::ops::latch_network_seen(").count();
         assert_eq!(calls, 5, "five writers: three in routes.rs, two in admit_fast.rs");
-        // the gated accept's witness is noted at every Accepted origin (poll, stored echo, probe, corroborators)
+        // the gated accept's witness is noted at every Accepted origin (poll, stored echo, corroborators); the
+        // pre-flight probe's stored SEEN admits pending and names none (bsv-low #636)
         let b = squash(include_str!("broadcaster.rs"));
-        assert_eq!(b.matches("self.note_witness(Some(crate::ops::SeenSource::Arcade),").count(), 3);
+        assert_eq!(b.matches("self.note_witness(Some(crate::ops::SeenSource::Arcade),").count(), 2);
         assert_eq!(b.matches("self.note_witness(by,None);").count(), 2);
         assert_eq!(b.matches("self.note_witness(last_by.get(),None);").count(), 1);
         // broadcasters only, by name

@@ -1701,7 +1701,8 @@ async fn submit_parts(
                 }
                 // #602: a courier's mined admission is not a broadcaster SEEN word.
                 // bsv-low #621: the latch names the broadcaster that said SEEN in this request (Arcade's poll, stored
-                // echo or probe; a corroborator's accept) at its stamp; an accept no broadcaster named latches nothing
+                // echo; a corroborator's accept; never the pre-flight probe's stored word, bsv-low #636) at its stamp; an
+                // accept no broadcaster named latches nothing
                 if arcade.admission_is_witnessed() {
                     match (env.d1("OVERLAY_DB"), arcade.witnessed_by()) {
                         (Ok(db), Some((by, at_ms))) => {
@@ -1769,7 +1770,9 @@ async fn submit_parts(
                 // mode) only for a proven-ancestry single leg whose tracker
                 // lagged and whose corroborator was inconclusive (the
                 // broadcaster never pends an unproven-ancestry subject there,
-                // #267). Either way: ADMIT, do NOT latch `network_seen`
+                // #267), or, in either mode, a re-present the pre-flight
+                // probe found stored at SEEN (bsv-low #636: a stored word
+                // admits pending, never latched). Either way: ADMIT, do NOT latch `network_seen`
                 // (nothing witnessed it), and hand the witness to the PENDING
                 // WATCH in the background (`admit_fast::pending_watch_job`):
                 // Arcade is looked at 2..18 s after the admission — SEEN
