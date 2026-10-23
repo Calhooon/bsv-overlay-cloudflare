@@ -777,7 +777,8 @@ mod e607 {
 
     #[test]
     fn e607_append_only_migration_and_the_page_uses_the_rowid_range() {
-        assert_eq!(OVERLAY_MIGRATIONS.len(), 346);
+        // FAST-C appends handfile migrations 347 and 348 after PR 152's repair at 346.
+        assert_eq!(OVERLAY_MIGRATIONS.len(), 348);
         assert_eq!(OVERLAY_MIGRATIONS[345], REPAIR_CREATE);
         let db = database();
         db.0.execute_batch(REPAIR_CREATE).unwrap();
