@@ -10,14 +10,15 @@
 //! `sha256(preimage)` where [`handfile_preimage`] is `"low/handfile/v1" || hopTxid || len || p0 || .. || len || p3`.
 //!
 //! This door:
-//!   1. verifies the two signatures ONCE through the one canonical-DER gate the four families use
+//!   1. checks the two signatures' encoding through the one canonical-DER gate the four families use
 //!      (`potparty::validity::canonical_der`): a padded or high-S twin of an honest batch is not a second batch;
 //!   2. parses every payload with its FAMILY'S OWN PARSER: the payload's fields are laid out as the family's marker
 //!      script with the batch's signatures in the signature pushes and run through `parse_hopparty_marker`,
 //!      `parse_potparty_marker` and `parse_potrefund_marker`, then the family's own challenge builder must give the
 //!      payload back byte for byte; a payload any of them refuses refuses the WHOLE batch and nothing is written;
 //!   3. holds the batch to ONE seat's ONE hand: one identity (the poster), one opponent, one game, one pot
-//!      outpoint, one recovery height, one settle key, or the whole batch is refused;
+//!      outpoint, one recovery height, one settle key, or the whole batch is refused; after the consistency and
+//!      poster checks, verifies the identity signature and then the settle-key signature over the batch;
 //!   4. binds the refund exactly as the direct door does (`bind_refund_backup`: the pot's pre-signed spend by both
 //!      committed settle keys in the template's unlock shape, `settle_signers_for_spend == Coop`; an unindexed pot
 //!      files at rank 0, as today);
@@ -34,8 +35,8 @@
 //!      because both batch signatures verified (and, for the hop, the container facts agreed), the write-time
 //!      verdict every reader of the K binding (`/owed`'s `sigValid = 1 AND seatSettlePubkey IS NOT NULL`) reads
 //!      off the row, so an exploded row reads exactly as a directly filed one;
-//!   7. applies EVERY cap per family before any write (per poster, family, game and pot: potparty's 2, potrefund's
-//!      1, hopparty's 1 per hop; and the day's 200 per poster and family), and the chain no-op per family (a
+//!   7. applies EVERY cap per family before any write (per poster, game and pot: potparty's 2, potrefund's
+//!      1; per poster and hop outpoint: hopparty's 1; and the day's 200 per poster and family), and the chain no-op per family (a
 //!      verified chain marker already indexed for this identity, game and pot writes nothing for that family);
 //!   8. stores the batch itself (`handfile_batches`, keyed `handfile:<sha256 of the preimage>`) and each exploded
 //!      row's place in it (`handfile_rows`), so a reader can re-verify any one row: a served row may carry the
@@ -43,7 +44,8 @@
 //!      a row filed directly never carries it, so an old row's bytes are unchanged.
 //!
 //! Idempotent by CONTENT: the same four payloads under the same hop txid make the same digest, so a re-signed or
-//! re-posted batch is the no-op the direct door's re-file is, with the SAME answer.
+//! re-posted batch that changes nothing answers `filed: false, alreadyFiled: true`, with the same key and rows.
+//! It marks nothing stale and recomputes nothing. A later refund-verdict promotion is a change.
 //!
 //! What the batch does NOT change, stated: the client's existing direct filings keep working (the door's other
 //! kinds are untouched); the chain's own markers are read as before; the owed list's evidence rule reads the
@@ -82,7 +84,7 @@ pub const HANDFILE_KEY_PREFIX: &str = "handfile:";
 pub const HANDFILE_FAMILY_HOPPARTY: &str = "hopparty";
 pub const HANDFILE_FAMILY_POTPARTY: &str = "potparty";
 pub const HANDFILE_FAMILY_POTREFUND: &str = "potrefund";
-/// FILED hopparty rows one poster may hold per (game, hop outpoint): the honest need is one.
+/// FILED hopparty rows one poster may hold per hop outpoint, across games: the honest need is one.
 pub const HOPPARTY_FILED_ROWS_CAP: i64 = 1;
 
 /// The hopparty identity challenge's fixed length: tag 15, identity 33, opponent 33, gameId 32, hopVout 4,
@@ -536,12 +538,27 @@ pub const HOPPARTY_HANDFILE_FILE_SQL: &str = "INSERT OR IGNORE INTO hopparty_rec
      (identity, opponentIdentity, gameId, hopVout, hopSats, seatSettlePubkey, seatSigHex, identitySigHex, \
       hopLockHex, hopSatsOnChain, containerOutputs, txid, outputIndex, createdAt, markerValid) \
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-/// The poster's FILED hopparty rows for this game and hop outpoint, another content than this one's.
+/// The poster's FILED hopparty rows for this hop outpoint, across games, another content than this one's.
 pub const HOPPARTY_FILED_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM hopparty_records \
-     WHERE identity = ?1 AND gameId = ?2 AND txid = ?3 AND hopVout = ?4 AND outputIndex >= 2147483648 AND outputIndex <> ?5";
+     WHERE identity = ?1 AND txid = ?2 AND hopVout = ?3 AND outputIndex >= 2147483648 AND outputIndex <> ?4";
 /// The poster's FILED hopparty rows of the day.
 pub const HOPPARTY_FILED_TODAY_SQL: &str = "SELECT COUNT(*) AS n FROM hopparty_records \
      WHERE identity = ?1 AND outputIndex >= 2147483648 AND createdAt >= ?2";
+/// Count the pair once, excluding both contents the batch intends to file.
+pub const POTPARTY_HANDFILE_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM potparty_records \
+     WHERE identity = ?1 AND gameId = ?2 AND potTxid = ?3 AND txid LIKE 'filed:%' AND txid NOT IN (?4, ?5)";
+/// Project the day's count after the write: landed rows count once, only absent contents add a row.
+/// An empty key is a slot skipped by the chain no-op. A landed row older than the day adds nothing.
+pub const POTPARTY_HANDFILE_DAY_SQL: &str = "SELECT COUNT(*) \
+     + (?3 <> '' AND NOT EXISTS (SELECT 1 FROM potparty_records WHERE txid = ?3 AND outputIndex = 0)) \
+     + (?4 <> '' AND NOT EXISTS (SELECT 1 FROM potparty_records WHERE txid = ?4 AND outputIndex = 0)) AS n \
+     FROM potparty_records WHERE identity = ?1 AND txid LIKE 'filed:%' AND createdAt >= ?2";
+pub const POTREFUND_HANDFILE_DAY_SQL: &str = "SELECT COUNT(*) \
+     + NOT EXISTS (SELECT 1 FROM potrefund_records WHERE txid = ?3 AND outputIndex = 0) AS n \
+     FROM potrefund_records WHERE identity = ?1 AND txid LIKE 'filed:%' AND createdAt >= ?2";
+pub const HOPPARTY_HANDFILE_DAY_SQL: &str = "SELECT COUNT(*) \
+     + NOT EXISTS (SELECT 1 FROM hopparty_records WHERE txid = ?3 AND outputIndex = ?4) AS n \
+     FROM hopparty_records WHERE identity = ?1 AND outputIndex >= 2147483648 AND createdAt >= ?2";
 /// A CHAIN hop marker of this identity for this hop, verified: the handfile's hopparty row is then nothing to add.
 pub const HOPPARTY_CHAIN_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM hopparty_records \
      WHERE txid = ?1 AND hopVout = ?2 AND identity = ?3 AND outputIndex < 2147483648 AND markerValid = 1";
@@ -594,10 +611,126 @@ impl HandfileSlot {
     }
 }
 
-/// The handfile's answer body (the same on a first filing and on its no-op re-filing: idempotent by content).
-pub fn handfile_answer(v: &VerifiedHandfile, refund_valid: bool) -> serde_json::Value {
-    serde_json::json!({
-        "filed": true,
+/// One family's cap reads, shared by the route and the SQLite regression cases.
+pub(crate) struct HandfileCapQuery {
+    pub family: &'static str,
+    cap: i64,
+    contents: i64,
+    pub rows: (&'static str, Vec<String>),
+    pub day: (&'static str, Vec<String>),
+}
+
+impl HandfileCapQuery {
+    pub fn refusal(&self, other_rows: i64, day_after_write: i64) -> Option<RecordRefusal> {
+        if other_rows + self.contents > self.cap {
+            Some(RecordRefusal::TooManyFiled)
+        } else if day_after_write > crate::record_post::RECORD_FILINGS_PER_IDENTITY_PER_DAY {
+            Some(RecordRefusal::DailyCapReached)
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) fn handfile_cap_queries(
+    v: &VerifiedHandfile,
+    write: &[bool; HANDFILE_PAYLOADS],
+    day_floor: i64,
+) -> Vec<HandfileCapQuery> {
+    use crate::record_post::{filed_rows_cap, RecordKind, POTREFUND_FILED_ROWS_SQL};
+    let mut queries = Vec::with_capacity(3);
+    let day_floor = day_floor.to_string();
+    if write[HandfileSlot::Hopparty as usize] {
+        queries.push(HandfileCapQuery {
+            family: HANDFILE_FAMILY_HOPPARTY,
+            cap: HOPPARTY_FILED_ROWS_CAP,
+            contents: 1,
+            rows: (
+                HOPPARTY_FILED_ROWS_SQL,
+                vec![
+                    v.identity.clone(),
+                    v.hop_txid.clone(),
+                    v.hopparty.hop_vout.to_string(),
+                    v.hop_row_vout.to_string(),
+                ],
+            ),
+            day: (
+                HOPPARTY_HANDFILE_DAY_SQL,
+                vec![
+                    v.identity.clone(),
+                    day_floor.clone(),
+                    v.hop_txid.clone(),
+                    v.hop_row_vout.to_string(),
+                ],
+            ),
+        });
+    }
+    let party_keys = [
+        if write[HandfileSlot::PotpartyV1 as usize] {
+            v.potparty_v1.txid.clone()
+        } else {
+            String::new()
+        },
+        if write[HandfileSlot::PotpartyV2 as usize] {
+            v.potparty_v2.txid.clone()
+        } else {
+            String::new()
+        },
+    ];
+    let contents = party_keys.iter().filter(|key| !key.is_empty()).count() as i64;
+    if contents > 0 {
+        queries.push(HandfileCapQuery {
+            family: HANDFILE_FAMILY_POTPARTY,
+            cap: filed_rows_cap(RecordKind::Potparty),
+            contents,
+            rows: (
+                POTPARTY_HANDFILE_ROWS_SQL,
+                vec![
+                    v.identity.clone(),
+                    v.game_id.clone(),
+                    v.potparty_v1.pot_txid.clone(),
+                    party_keys[0].clone(),
+                    party_keys[1].clone(),
+                ],
+            ),
+            day: (
+                POTPARTY_HANDFILE_DAY_SQL,
+                vec![
+                    v.identity.clone(),
+                    day_floor.clone(),
+                    party_keys[0].clone(),
+                    party_keys[1].clone(),
+                ],
+            ),
+        });
+    }
+    if write[HandfileSlot::Potrefund as usize] {
+        queries.push(HandfileCapQuery {
+            family: HANDFILE_FAMILY_POTREFUND,
+            cap: filed_rows_cap(RecordKind::Potrefund),
+            contents: 1,
+            rows: (
+                POTREFUND_FILED_ROWS_SQL,
+                vec![
+                    v.identity.clone(),
+                    v.game_id.clone(),
+                    v.potrefund.pot_txid.clone(),
+                    v.potrefund.txid.clone(),
+                ],
+            ),
+            day: (
+                POTREFUND_HANDFILE_DAY_SQL,
+                vec![v.identity.clone(), day_floor, v.potrefund.txid.clone()],
+            ),
+        });
+    }
+    queries
+}
+
+/// The handfile's answer, retaining the same content keys on a no-op re-filing.
+pub fn handfile_answer(v: &VerifiedHandfile, refund_valid: bool, wrote: bool) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "filed": wrote,
         "kind": "handfile",
         "key": v.key,
         "rows": {
@@ -607,7 +740,11 @@ pub fn handfile_answer(v: &VerifiedHandfile, refund_valid: bool) -> serde_json::
             "potrefund": v.potrefund.txid,
         },
         "refundValid": i64::from(refund_valid),
-    })
+    });
+    if !wrote {
+        body["alreadyFiled"] = serde_json::json!(true);
+    }
+    body
 }
 
 /// The row keys an exploded batch writes into `handfile_rows`, in slot order.
@@ -629,7 +766,7 @@ pub async fn handfile_post(
 ) -> worker::Result<worker::Response> {
     use crate::d1_ledger::Counted;
     use crate::record_post::{
-        bind_refund_backup, cap_queries, cap_refusal_for, chain_rows_query, js, js_num, js_opt,
+        bind_refund_backup, chain_rows_query, insert_wrote_a_row, js, js_num, js_opt,
         note_cap_refused, note_filed, read_pot_context, refuse, RecordKind, VerifiedRecord,
         POTPARTY_FILE_SQL, POTREFUND_FILE_SQL, POTREFUND_LATCH_SQL, RECORD_DAY_SECS,
     };
@@ -705,70 +842,25 @@ pub async fn handfile_post(
             write[slot as usize] = n == 0;
         }
     }
-    if write[HandfileSlot::Hopparty as usize] {
-        let rows_for_hop = crate::record_post::count(
+    // Count each family once. For potparty both active keys are excluded, then the pair's two
+    // contents are reserved together. A landed v1 or v2 is never counted again as pending.
+    // The day query counts existing rows once and adds only contents absent from the table.
+    for query in handfile_cap_queries(&verified, &write, now - RECORD_DAY_SECS) {
+        let other_rows = crate::record_post::count(
             &db,
-            HOPPARTY_FILED_ROWS_SQL,
-            &[
-                js(&verified.identity),
-                js(&verified.game_id),
-                js(&verified.hop_txid),
-                js_num(i64::from(verified.hopparty.hop_vout)),
-                js_num(i64::from(verified.hop_row_vout)),
-            ],
+            query.rows.0,
+            &query.rows.1.iter().map(|s| js(s)).collect::<Vec<_>>(),
         )
         .await?;
-        let rows_today = crate::record_post::count(
+        let day_after_write = crate::record_post::count(
             &db,
-            HOPPARTY_FILED_TODAY_SQL,
-            &[js(&verified.identity), js_num(now - RECORD_DAY_SECS)],
+            query.day.0,
+            &query.day.1.iter().map(|s| js(s)).collect::<Vec<_>>(),
         )
         .await?;
-        if let Some(r) =
-            crate::record_post::cap_refusal_at(HOPPARTY_FILED_ROWS_CAP, rows_for_hop, rows_today)
-        {
+        if let Some(r) = query.refusal(other_rows, day_after_write) {
             note_cap_refused(r, kind);
-            return refuse(Some(kind), r);
-        }
-    }
-    // potparty: v1 and v2 share the table and its cap of 2; the batch's own two rows are each other's company,
-    // so the FIRST filing counts 0 then 1 and a re-filing 1 then 1 (the same key is excluded by the statement).
-    let mut potparty_pending = 0i64;
-    for (slot, v) in [
-        (HandfileSlot::PotpartyV1, &v1),
-        (HandfileSlot::PotpartyV2, &v2),
-        (HandfileSlot::Potrefund, &refund),
-    ] {
-        if !write[slot as usize] {
-            continue;
-        }
-        let (rows_sql, rows_binds, day_sql, day_identity) = cap_queries(v);
-        let rows_for_pot = crate::record_post::count(
-            &db,
-            rows_sql,
-            &rows_binds.iter().map(|s| js(s)).collect::<Vec<_>>(),
-        )
-        .await?;
-        let rows_today = crate::record_post::count(
-            &db,
-            day_sql,
-            &[js(&day_identity), js_num(now - RECORD_DAY_SECS)],
-        )
-        .await?;
-        let (rows_for_pot, rows_today) = if slot == HandfileSlot::Potrefund {
-            (rows_for_pot, rows_today)
-        } else {
-            (
-                rows_for_pot + potparty_pending,
-                rows_today + potparty_pending,
-            )
-        };
-        if let Some(r) = cap_refusal_for(v, rows_for_pot, rows_today) {
-            note_cap_refused(r, kind);
-            return refuse(Some(kind), r);
-        }
-        if slot != HandfileSlot::Potrefund {
-            potparty_pending += 1;
+            return crate::record_post::refuse_with_family(Some(kind), r, Some(query.family));
         }
     }
     // 6 and 8. one batch: the batch row, the family rows, their places, the refund latch
@@ -856,16 +948,20 @@ pub async fn handfile_post(
         ])?);
     }
     let results = crate::d1_ledger::counted_batch(&db, stmts).await?;
-    let batch_written = results
-        .first()
-        .and_then(|r| r.meta().ok().flatten())
-        .and_then(|m| m.changes)
-        .is_none_or(|c| c > 0);
-    if batch_written {
-        note_filed(kind, anonymous);
-    } else {
+    // A retry can still promote a rank-0 refund or add a previously chain-covered row.
+    // Only a batch with zero changes in EVERY statement is a no-op. Unreadable metadata
+    // is treated as a write, as at the direct door, so it cannot suppress a needed recompute.
+    let wrote = results
+        .iter()
+        .any(|r| insert_wrote_a_row(r.meta().ok().flatten().and_then(|m| m.changes)));
+    if !wrote {
         crate::record_post::note_already_filed(kind);
+        return crate::routes::json_response(
+            handfile_answer(&verified, refund_valid, false).to_string(),
+            200,
+        );
     }
+    note_filed(kind, anonymous);
     crate::record_post::note_filing_and_recompute(
         ctx,
         &db,
@@ -876,7 +972,10 @@ pub async fn handfile_post(
         )),
     )
     .await;
-    crate::routes::json_response(handfile_answer(&verified, refund_valid).to_string(), 200)
+    crate::routes::json_response(
+        handfile_answer(&verified, refund_valid, true).to_string(),
+        200,
+    )
 }
 
 #[derive(Deserialize)]
@@ -1493,7 +1592,6 @@ pub(crate) mod tests {
                 HOPPARTY_FILED_ROWS_SQL,
                 rusqlite::params![
                     hand.poster(),
-                    hex::encode(hand.game_id),
                     hex::encode(HOP_TXID),
                     HOP_VOUT,
                     v.hop_row_vout + 1
@@ -1511,7 +1609,6 @@ pub(crate) mod tests {
                 HOPPARTY_FILED_ROWS_SQL,
                 rusqlite::params![
                     hand.poster(),
-                    hex::encode(hand.game_id),
                     hex::encode(HOP_TXID),
                     HOP_VOUT,
                     v.hop_row_vout
@@ -1574,10 +1671,11 @@ pub(crate) mod tests {
             .is_err());
         // the answer is the same both times (idempotent by content)
         assert_eq!(
-            handfile_answer(&v, false),
+            handfile_answer(&v, false, true),
             handfile_answer(
                 &verify_handfile(&hand.body(), &hand.poster()).unwrap(),
-                false
+                false,
+                true,
             )
         );
     }
@@ -1588,7 +1686,8 @@ pub(crate) mod tests {
         v: &VerifiedHandfile,
         facts: &HopFacts,
         refund_valid: bool,
-    ) {
+    ) -> u64 {
+        let before = conn.total_changes();
         let now = 1_000i64;
         conn.execute(
             HANDFILE_BATCH_FILE_SQL,
@@ -1664,6 +1763,10 @@ pub(crate) mod tests {
             ],
         )
         .unwrap();
+        if refund_valid {
+            conn.execute(crate::record_post::POTREFUND_LATCH_SQL, [&r.txid])
+                .unwrap();
+        }
         for (slot, txid, vout) in handfile_row_keys(v) {
             conn.execute(
                 HANDFILE_ROW_FILE_SQL,
@@ -1671,6 +1774,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         }
+        conn.total_changes() - before
     }
 
     /// An old row's bytes: a directly filed v2 row is served without `batch`, byte for byte as before, and the

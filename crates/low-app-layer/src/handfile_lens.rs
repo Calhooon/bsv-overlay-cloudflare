@@ -1,5 +1,5 @@
 //! FAST-C-LENS (2026-10-23): the lens's negative cases over PR 151's `handfile` family (bsv-low #848, #461
-//! design C). A lens patch in the lens's worktree, never pushed to the lane's branch; the audit file carries it.
+//! design C). The original lens cases, with regression coverage for the FAST-C-FOLD fixes.
 //!
 //! The questions a forger asks (the lane's brief), each a test below:
 //!   a. can a batch signed by identity X explode a row that names identity Y, or bind Y's settle key to X?
@@ -9,16 +9,15 @@
 //!   d. can a poster exceed a family's cap by batching?
 //!   e. is the served `batch` absent for a direct filing, and consistent when a direct filing and a batch share
 //!      a row?
-//!   f. the body cap a maximal refund meets at the handfile door (a stated limit).
+//!   f. a maximal refund admitted by the direct door also fits the handfile body cap.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use crate::handfile::tests::{explode_under_sqlite, Hand, HOP_SATS, HOP_TXID, HOP_VOUT};
 use crate::handfile::*;
 use crate::record_post::tests::{junk_refund_raw, pot_ctx, sign, w25c_db};
 use crate::record_post::{
-    bind_refund_backup, cap_queries, cap_refusal_for, RecordKind, RecordRefusal, VerifiedRecord,
-    POTPARTY_FILE_SQL, POTREFUND_FILE_SQL, RECORD_FILINGS_PER_IDENTITY_PER_DAY,
-    RECORD_POST_MAX_BODY_BYTES,
+    bind_refund_backup, RecordKind, RecordRefusal, VerifiedRecord, POTPARTY_FILE_SQL,
+    POTREFUND_FILE_SQL, RECORD_FILINGS_PER_IDENTITY_PER_DAY, RECORD_POST_MAX_BODY_BYTES,
 };
 use overlay_discovery::hopparty::validity::expected_hop_lock_hex;
 use overlay_discovery::potparty::validity::{potparty_protocol, potparty_v2_challenge};
@@ -29,39 +28,29 @@ fn settle_key(scalar: u8) -> bsv_rs::primitives::ec::PrivateKey {
     bsv_rs::primitives::ec::PrivateKey::from_bytes(&b).unwrap()
 }
 
-/// The route's potparty cap arithmetic (`handfile_post`, the loop over the three non-hop slots), transcribed as
-/// the route runs it over the SHIPPED statements under real SQLite: the counts the route would bind, the
-/// `potparty_pending` carry, and `cap_refusal_for` on each. Every slot is written (no chain marker present).
-fn route_cap_verdict(conn: &rusqlite::Connection, v: &VerifiedHandfile) -> Option<RecordRefusal> {
-    let v1 = VerifiedRecord::Potparty(v.potparty_v1.clone(), true);
-    let v2 = VerifiedRecord::Potparty(v.potparty_v2.clone(), true);
-    let refund = VerifiedRecord::Potrefund(v.potrefund.clone(), false);
-    let mut potparty_pending = 0i64;
-    for (slot, rec) in [
-        (HandfileSlot::PotpartyV1, &v1),
-        (HandfileSlot::PotpartyV2, &v2),
-        (HandfileSlot::Potrefund, &refund),
-    ] {
-        let (rows_sql, rows_binds, day_sql, day_identity) = cap_queries(rec);
-        let rows_for_pot: i64 = conn
-            .query_row(rows_sql, rusqlite::params_from_iter(rows_binds.iter()), |r| r.get(0))
-            .unwrap();
-        let rows_today: i64 = conn
-            .query_row(day_sql, rusqlite::params![day_identity, 0i64], |r| r.get(0))
-            .unwrap();
-        let (rows_for_pot, rows_today) = if slot == HandfileSlot::Potrefund {
-            (rows_for_pot, rows_today)
-        } else {
-            (rows_for_pot + potparty_pending, rows_today + potparty_pending)
+/// Execute the route's own cap queries and decision, with the exact binds, against real SQLite.
+fn route_cap_failure(
+    conn: &rusqlite::Connection,
+    v: &VerifiedHandfile,
+    write: &[bool; HANDFILE_PAYLOADS],
+    day_floor: i64,
+) -> Option<(&'static str, RecordRefusal)> {
+    for query in handfile_cap_queries(v, write, day_floor) {
+        let count = |(sql, binds): (&str, Vec<String>)| -> i64 {
+            conn.query_row(sql, rusqlite::params_from_iter(binds.iter()), |r| r.get(0))
+                .unwrap()
         };
-        if let Some(r) = cap_refusal_for(rec, rows_for_pot, rows_today) {
-            return Some(r);
-        }
-        if slot != HandfileSlot::Potrefund {
-            potparty_pending += 1;
+        let rows = count(query.rows.clone());
+        let day = count(query.day.clone());
+        if let Some(r) = query.refusal(rows, day) {
+            return Some((query.family, r));
         }
     }
     None
+}
+
+fn route_cap_verdict(conn: &rusqlite::Connection, v: &VerifiedHandfile) -> Option<RecordRefusal> {
+    route_cap_failure(conn, v, &[true; HANDFILE_PAYLOADS], 0).map(|(_, r)| r)
 }
 
 fn hop_facts(hand: &Hand) -> HopFacts {
@@ -70,6 +59,212 @@ fn hop_facts(hand: &Hand) -> HopFacts {
         sats: HOP_SATS,
         outputs: 2,
     }
+}
+
+fn file_party(
+    conn: &rusqlite::Connection,
+    r: &overlay_discovery::potparty::storage::PotpartyRecord,
+) {
+    conn.execute(
+        POTPARTY_FILE_SQL,
+        rusqlite::params![
+            r.identity,
+            r.opponent_identity,
+            r.game_id,
+            r.pot_txid,
+            r.pot_vout,
+            r.recovery_height,
+            r.sig_hex,
+            r.seat_settle_pubkey,
+            r.seat_sig_hex,
+            r.txid,
+            0,
+            1_000i64,
+            1,
+        ],
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn fold_m1_direct_versions_and_daily_boundary_count_each_content_once() {
+    let hand = Hand::new(28);
+    let v = verify_handfile(&hand.body(), &hand.poster()).unwrap();
+    for first in [&v.potparty_v1, &v.potparty_v2] {
+        let conn = w25c_db();
+        file_party(&conn, first);
+        assert_eq!(
+            route_cap_verdict(&conn, &v),
+            None,
+            "either direct version may land first"
+        );
+    }
+    let conn = w25c_db();
+    for i in 0..198 {
+        let mut row = v.potparty_v1.clone();
+        row.txid = format!("filed:day-party-{i}");
+        row.game_id = "another-game".into();
+        file_party(&conn, &row);
+    }
+    assert_eq!(
+        route_cap_verdict(&conn, &v),
+        None,
+        "198 plus the pair is exactly 200"
+    );
+    let mut extra = v.potparty_v1.clone();
+    extra.txid = "filed:one-more".into();
+    extra.game_id = "another-game".into();
+    file_party(&conn, &extra);
+    assert_eq!(
+        route_cap_failure(&conn, &v, &[true; HANDFILE_PAYLOADS], 0),
+        Some((HANDFILE_FAMILY_POTPARTY, RecordRefusal::DailyCapReached)),
+        "199 plus the pair exceeds 200",
+    );
+    conn.execute(
+        "DELETE FROM potparty_records WHERE txid = ?1",
+        [&extra.txid],
+    )
+    .unwrap();
+    file_party(&conn, &v.potparty_v1);
+    assert_eq!(
+        route_cap_verdict(&conn, &v),
+        None,
+        "199 plus the missing v2 is exactly 200"
+    );
+    file_party(&conn, &v.potparty_v2);
+    assert_eq!(
+        route_cap_verdict(&conn, &v),
+        None,
+        "a re-file adds nothing to the full day"
+    );
+    // An older landed row is neither charged as new nor counted in today's window.
+    let queries = handfile_cap_queries(&v, &[true; HANDFILE_PAYLOADS], 1_001);
+    let party = queries
+        .iter()
+        .find(|q| q.family == HANDFILE_FAMILY_POTPARTY)
+        .unwrap();
+    let day: i64 = conn
+        .query_row(party.day.0, rusqlite::params_from_iter(&party.day.1), |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(day, 0);
+}
+
+#[test]
+fn fold_m1_chain_noops_reserve_only_active_slots_and_count_other_landed_rows() {
+    let conn = w25c_db();
+    let hand = Hand::new(29);
+    let v = verify_handfile(&hand.body(), &hand.poster()).unwrap();
+    let mut other = v.potparty_v1.clone();
+    other.txid = "filed:other-content".into();
+    file_party(&conn, &other);
+    let only_v2 = [false, false, true, false];
+    assert_eq!(route_cap_failure(&conn, &v, &only_v2, 0), None);
+    // Even if the chain now covers v1, its older filed row still occupies a place.
+    file_party(&conn, &v.potparty_v1);
+    assert_eq!(
+        route_cap_failure(&conn, &v, &only_v2, 0),
+        Some((HANDFILE_FAMILY_POTPARTY, RecordRefusal::TooManyFiled)),
+    );
+    assert!(handfile_cap_queries(&v, &[false; HANDFILE_PAYLOADS], 0).is_empty());
+}
+
+#[test]
+fn fold_l2_noop_refile_and_refund_promotion_have_different_write_outcomes() {
+    let conn = w25c_db();
+    let hand = Hand::new(30);
+    let v = verify_handfile(&hand.body(), &hand.poster()).unwrap();
+    assert!(explode_under_sqlite(&conn, &v, &hop_facts(&hand), false) > 0);
+    let changes = explode_under_sqlite(&conn, &v, &hop_facts(&hand), false);
+    assert_eq!(changes, 0, "an identical re-file changes no row or trigger");
+    let first = handfile_answer(&v, false, true);
+    let retry = handfile_answer(&v, false, changes > 0);
+    assert_eq!(retry["filed"], false);
+    assert_eq!(retry["alreadyFiled"], true);
+    assert_eq!(retry["key"], first["key"]);
+    assert_eq!(retry["rows"], first["rows"]);
+    assert!(
+        explode_under_sqlite(&conn, &v, &hop_facts(&hand), true) > 0,
+        "a refund promotion is a real change"
+    );
+    let rank: i64 = conn
+        .query_row(
+            "SELECT refundValid FROM potrefund_records WHERE txid = ?1",
+            [&v.potrefund.txid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rank, 1);
+    assert_eq!(explode_under_sqlite(&conn, &v, &hop_facts(&hand), true), 0);
+}
+
+#[test]
+fn fold_l5_cap_bodies_name_each_family_and_keep_the_direct_error_shape() {
+    for family in [
+        HANDFILE_FAMILY_HOPPARTY,
+        HANDFILE_FAMILY_POTPARTY,
+        HANDFILE_FAMILY_POTREFUND,
+    ] {
+        for refusal in [RecordRefusal::TooManyFiled, RecordRefusal::DailyCapReached] {
+            let body = crate::record_post::record_refusal_body(refusal, Some(family));
+            assert_eq!(body["family"], family);
+            assert_eq!(body["error"], refusal.as_str());
+            assert_eq!(
+                crate::record_post::record_refusal_body(refusal, None),
+                serde_json::json!({ "error": refusal.as_str() }),
+            );
+        }
+    }
+}
+
+#[test]
+fn fold_l1_der_then_parsers_then_consistency_then_poster_then_signatures() {
+    let hand = Hand::new(31);
+    let mut body = hand.body();
+    body.payloads[0] = "00".into();
+    body.identity_sig_hex = "00".into();
+    assert_eq!(
+        verify_handfile(&body, &hand.poster()).unwrap_err(),
+        RecordRefusal::SignatureInvalid
+    );
+    body.identity_sig_hex = hand.body().identity_sig_hex;
+    body.settle_sig_hex = "00".into();
+    assert_eq!(
+        verify_handfile(&body, &hand.poster()).unwrap_err(),
+        RecordRefusal::SettleSignatureInvalid
+    );
+    body.settle_sig_hex = hand.body().settle_sig_hex;
+    assert_eq!(
+        verify_handfile(&body, "stranger").unwrap_err(),
+        RecordRefusal::HandfilePayloadNotAMarker
+    );
+    let mut p = hand.payloads();
+    p[1][15 + 98] ^= 0xff;
+    body = hand.body_of(&p);
+    assert_eq!(
+        verify_handfile(&body, "stranger").unwrap_err(),
+        RecordRefusal::HandfileInconsistent
+    );
+    body = hand.body();
+    assert_eq!(
+        verify_handfile(&body, "stranger").unwrap_err(),
+        RecordRefusal::PosterMismatch
+    );
+    // Canonical signatures over another digest reach ECDSA only after the earlier checks pass.
+    let other = Hand::new(32).body();
+    body.identity_sig_hex = other.identity_sig_hex;
+    body.settle_sig_hex = other.settle_sig_hex;
+    assert_eq!(
+        verify_handfile(&body, &hand.poster()).unwrap_err(),
+        RecordRefusal::SignatureInvalid
+    );
+    body.identity_sig_hex = hand.body().identity_sig_hex;
+    assert_eq!(
+        verify_handfile(&body, &hand.poster()).unwrap_err(),
+        RecordRefusal::SettleSignatureInvalid
+    );
 }
 
 /// (a) A batch binds ONE identity to ONE settle key, and only the holder of both can file it.
@@ -160,7 +355,10 @@ fn lens_b_one_marker_under_two_batches_is_one_row_and_a_refile_is_not_refused() 
     p[3].extend_from_slice(&junk_refund_raw(&hand.pot_txid, hand.pot_vout));
     let second = verify_handfile(&hand.body_of(&p), &hand.poster()).unwrap();
     assert_ne!(second.key, first.key);
-    assert_eq!(second.potparty_v2.txid, first.potparty_v2.txid, "one marker, one key");
+    assert_eq!(
+        second.potparty_v2.txid, first.potparty_v2.txid,
+        "one marker, one key"
+    );
     assert_eq!(second.potparty_v1.txid, first.potparty_v1.txid);
     assert_ne!(second.potrefund.txid, first.potrefund.txid);
     // the second batch's refund is another content for the pot: the potrefund cap (1) refuses the whole batch,
@@ -169,6 +367,10 @@ fn lens_b_one_marker_under_two_batches_is_one_row_and_a_refile_is_not_refused() 
         route_cap_verdict(&conn, &second),
         Some(RecordRefusal::TooManyFiled),
         "a second refund content is refused by the refund family's cap"
+    );
+    assert_eq!(
+        route_cap_failure(&conn, &second, &[true; HANDFILE_PAYLOADS], 0),
+        Some((HANDFILE_FAMILY_POTREFUND, RecordRefusal::TooManyFiled)),
     );
     // were it written (the statements alone), the shared rows stay one row each and point at the FIRST batch
     explode_under_sqlite(&conn, &second, &hop_facts(&hand), false);
@@ -187,7 +389,11 @@ fn lens_b_one_marker_under_two_batches_is_one_row_and_a_refile_is_not_refused() 
         .unwrap();
     assert_eq!(batch_key, first.key, "the row's batch is the first batch");
     let payloads: Vec<String> = serde_json::from_str(&payloads_json).unwrap();
-    assert_eq!(payloads[idx as usize], hex::encode(&hand.payloads()[2]), "inclusion holds");
+    assert_eq!(
+        payloads[idx as usize],
+        hex::encode(&hand.payloads()[2]),
+        "inclusion holds"
+    );
 
     // THE RE-FILING. A fresh database: the batch landed once; the client's outbox re-files it (a retry after a
     // timeout, a second device). The wire doc: "a re-filing is a no-op", "the same answer". The route's cap
@@ -220,7 +426,10 @@ fn lens_c_one_bad_payload_refuses_the_whole_batch_before_any_write() {
     assert_eq!(bind_refund_backup(&v.potrefund, None), Ok(false));
     // the honest refund over the indexed pot binds at rank 1
     let honest = verify_handfile(&hand.body(), &hand.poster()).unwrap();
-    assert_eq!(bind_refund_backup(&honest.potrefund, Some(&pot_ctx())), Ok(true));
+    assert_eq!(
+        bind_refund_backup(&honest.potrefund, Some(&pot_ctx())),
+        Ok(true)
+    );
     // the hop: a BEEF that does not carry the hop txid reads as no facts (the route's 425)
     let other = {
         let mut tx = bsv_rs::transaction::Transaction::new();
@@ -251,6 +460,7 @@ fn lens_c_one_bad_payload_refuses_the_whole_batch_before_any_write() {
 }
 
 /// (d) A poster cannot exceed a family's cap by batching: the exploded rows are counted exactly as direct rows.
+#[cfg(test)]
 #[test]
 fn lens_d_a_poster_cannot_exceed_a_family_cap_by_batching() {
     let conn = w25c_db();
@@ -306,7 +516,10 @@ fn lens_d_a_poster_cannot_exceed_a_family_cap_by_batching() {
         ],
     )
     .unwrap();
-    assert_eq!(route_cap_verdict(&conn, &v), Some(RecordRefusal::TooManyFiled));
+    assert_eq!(
+        route_cap_verdict(&conn, &v),
+        Some(RecordRefusal::TooManyFiled)
+    );
     // the day cap: 200 filed refund rows of the poster today, then the batch's refund slot is refused
     let conn = w25c_db();
     for i in 0..RECORD_FILINGS_PER_IDENTITY_PER_DAY {
@@ -333,7 +546,27 @@ fn lens_d_a_poster_cannot_exceed_a_family_cap_by_batching() {
         Some(RecordRefusal::DailyCapReached),
         "the day's 200 per family counts the batch's refund row"
     );
-    // the hop row's cap is per (poster, game, hop outpoint): a second game names the same hop freely (stated)
+    assert_eq!(
+        route_cap_failure(&conn, &v, &[true; HANDFILE_PAYLOADS], 0),
+        Some((HANDFILE_FAMILY_POTREFUND, RecordRefusal::DailyCapReached)),
+    );
+    conn.execute(
+        "DELETE FROM potrefund_records WHERE txid = ?1",
+        ["filed:day-199"],
+    )
+    .unwrap();
+    assert_eq!(
+        route_cap_verdict(&conn, &v),
+        None,
+        "199 refunds leave room for one"
+    );
+    explode_under_sqlite(&conn, &v, &hop_facts(&hand), false);
+    assert_eq!(
+        route_cap_verdict(&conn, &v),
+        None,
+        "the 200th refund can be re-filed"
+    );
+    // The hop cap is per (poster, hop outpoint): a second game cannot add another row for that hop.
     let conn = w25c_db();
     explode_under_sqlite(&conn, &v, &hop_facts(&hand), false);
     let mut other_game = Hand::new(25);
@@ -342,17 +575,15 @@ fn lens_d_a_poster_cannot_exceed_a_family_cap_by_batching() {
     let n: i64 = conn
         .query_row(
             HOPPARTY_FILED_ROWS_SQL,
-            rusqlite::params![
-                v2.identity,
-                v2.game_id,
-                v2.hop_txid,
-                HOP_VOUT,
-                v2.hop_row_vout
-            ],
+            rusqlite::params![v2.identity, v2.hop_txid, HOP_VOUT, v2.hop_row_vout],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(n, 0, "another game's hop row for the same hop is not counted (per game, as the direct caps)");
+    assert_eq!(n, 1, "another game's row for the same hop is counted");
+    assert_eq!(
+        route_cap_failure(&conn, &v2, &[true; HANDFILE_PAYLOADS], 0),
+        Some((HANDFILE_FAMILY_HOPPARTY, RecordRefusal::TooManyFiled)),
+    );
     let n: i64 = conn
         .query_row(
             HOPPARTY_FILED_TODAY_SQL,
@@ -418,7 +649,14 @@ fn lens_e_a_direct_row_has_no_batch_and_a_shared_row_serves_a_consistent_one() {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .unwrap();
-    assert_eq!((sig_hex.as_str(), seat_sig_hex.as_str(), sig_valid), (direct.sig_hex.as_str(), direct.seat_sig_hex.as_deref().unwrap(), 1));
+    assert_eq!(
+        (sig_hex.as_str(), seat_sig_hex.as_str(), sig_valid),
+        (
+            direct.sig_hex.as_str(),
+            direct.seat_sig_hex.as_deref().unwrap(),
+            1
+        )
+    );
     let (batch_key, idx, payloads_json): (String, i64, String) = conn
         .query_row(
             HANDFILE_BATCH_FOR_ROW_SQL,
@@ -447,11 +685,10 @@ fn lens_e_a_direct_row_has_no_batch_and_a_shared_row_serves_a_consistent_one() {
     assert_eq!(n, 2);
 }
 
-/// (f) The handfile door's body cap (the direct door's `RECORD_POST_MAX_BODY_BYTES`, read on the raw body before
-/// the dispatch) is met by a refund raw the direct door's script cap admits: a stated limit, no honest refund is
-/// near it. The signatures' hex is a fixed width, so the body is built once with placeholder signatures.
+/// (f) The shared body cap admits the direct door's maximum refund raw in a handfile too.
+/// Use maximum DER lengths for the JSON size bound, then verify a real signed maximal payload.
 #[test]
-fn lens_f_the_body_cap_meets_a_near_maximal_refund_the_direct_door_admits() {
+fn lens_f_the_body_cap_admits_a_maximal_refund_the_direct_door_admits() {
     let hand = Hand::new(27);
     let body_len = |n: usize| {
         let mut p = hand.payloads();
@@ -468,16 +705,38 @@ fn lens_f_the_body_cap_meets_a_near_maximal_refund_the_direct_door_admits() {
     };
     let max = overlay_discovery::potrefund::POTREFUND_REFUND_MAX_LEN;
     let at_max = body_len(max);
-    assert!(at_max > RECORD_POST_MAX_BODY_BYTES, "{at_max} <= {RECORD_POST_MAX_BODY_BYTES}");
-    // two bytes of body per raw byte: the smallest refused raw
-    let smallest_refused = max - (at_max - RECORD_POST_MAX_BODY_BYTES - 1) / 2;
-    assert!(body_len(smallest_refused) > RECORD_POST_MAX_BODY_BYTES);
-    assert!(body_len(smallest_refused - 1) <= RECORD_POST_MAX_BODY_BYTES);
     assert!(
-        smallest_refused > 99_000,
-        "the handfile body cap is met only by a refund raw of {smallest_refused} bytes and up; an honest refund is a few hundred"
+        at_max <= RECORD_POST_MAX_BODY_BYTES,
+        "{at_max} > {RECORD_POST_MAX_BODY_BYTES}"
     );
+    assert!(body_len(RECORD_POST_MAX_BODY_BYTES) > RECORD_POST_MAX_BODY_BYTES);
     let honest = body_len(hand.refund_raw.len());
     assert!(honest < 16_384, "{honest}");
-    eprintln!("lens_f: a refund raw of {smallest_refused} bytes and up is refused at the handfile door ({at_max} at {max}); the honest body ({} byte raw) is {honest}", hand.refund_raw.len());
+
+    // A well-formed transaction that spends the named pot; an unindexed pot admits it at rank 0.
+    let mut tx = bsv_rs::transaction::Transaction::from_binary(&junk_refund_raw(
+        &hand.pot_txid,
+        hand.pot_vout,
+    ))
+    .unwrap();
+    let mut script_len = max - tx.to_binary().len() + 1;
+    tx.inputs[0].unlocking_script =
+        Some(bsv_rs::script::UnlockingScript::from_binary(&vec![0; script_len]).unwrap());
+    tx.invalidate_caches();
+    script_len -= tx.to_binary().len() - max;
+    tx.inputs[0].unlocking_script =
+        Some(bsv_rs::script::UnlockingScript::from_binary(&vec![0; script_len]).unwrap());
+    tx.invalidate_caches();
+    let raw = tx.to_binary();
+    assert_eq!(raw.len(), max);
+    let mut p = hand.payloads();
+    p[3].truncate(POTREFUND_PAYLOAD_HEAD);
+    p[3].extend_from_slice(&raw);
+    let v = verify_handfile(&hand.body_of(&p), &hand.poster()).unwrap();
+    assert_eq!(hex::decode(v.potrefund.refund_raw_hex).unwrap().len(), max);
+    p[3].push(0);
+    assert_eq!(
+        verify_handfile(&hand.body_of(&p), &hand.poster()).unwrap_err(),
+        RecordRefusal::HandfilePayloadNotAMarker,
+    );
 }
