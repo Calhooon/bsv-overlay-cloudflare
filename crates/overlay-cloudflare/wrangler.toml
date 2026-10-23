@@ -25,6 +25,14 @@ database_name = "<your-d1-name>"
 database_id = "<your-d1-id>"
 
 [vars]
+# bsv-low #635 (B-COST-1): the plan's INCLUDED quotas per day that `/health/invariants.costBar` serves its ratio and
+# `overQuota` against (configuration, never a constant in the code; unset or 0 = no quota, the flag null). The figures
+# are the Workers Paid plan's monthly inclusions over 30 days (10M requests, 25B D1 rows read, 50M D1 rows written);
+# they are the ACCOUNT's, shared with every other Worker and D1 of it, so the operator lowers each to this
+# environment's share.
+COST_QUOTA_REQUESTS_PER_DAY = "333333"
+COST_QUOTA_D1_ROWS_READ_PER_DAY = "833333333"
+COST_QUOTA_D1_ROWS_WRITTEN_PER_DAY = "1666666"
 ENVIRONMENT = "production"
 CHAIN_TRACKER_URL = "https://<your-chain-tracker-api>"
 HOSTING_URL = "https://<your-overlay>.workers.dev"

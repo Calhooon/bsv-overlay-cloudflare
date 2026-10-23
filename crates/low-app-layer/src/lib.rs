@@ -184,6 +184,11 @@ use worker::{event, Context, Env, Request, Response, Result, Router};
 #[event(scheduled)]
 async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::ScheduleContext) {
     routes::set_courier_sink(env.var("COURIER_SINK").ok().map(|v| v.to_string()));
+    // bsv-low #635: the cost window this isolate holds (its last tick's statements included), written when due.
+    let now = worker::Date::now().as_millis() as f64;
+    if let (Some(window), Ok(db)) = (d1_ledger::take_cost_if_due(now), env.d1("OVERLAY_DB")) {
+        ctx.wait_until(async move { d1_ledger::flush_cost(&db, window, now).await });
+    }
     // E649 L4 N4: the pot hook's drain is its OWN task, handed first, under its own wall: the tracker's backfill
     // awaits CHAINTRACKS with no timeout, so it no longer holds the drain behind it. N7: ONE deadline for the whole
     // task: the boot, the pass (its every read, relay call, settle and counter) and the courier flush run under it.
@@ -279,6 +284,15 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     routes::set_courier_sink(env.var("COURIER_SINK").ok().map(|v| v.to_string()));
     // Readable wasm panics in `wrangler tail` (set_once → cheap on re-entry).
     console_error_panic_hook::set_once();
+    // bsv-low #635 (B-COST-1): this request counted in the isolate's cost window; the window written so far goes to
+    // the overlay's `worker_cost_daily` after the answer when it is due (one upsert per 64 requests or 60 s).
+    if let Some(window) = d1_ledger::cost_on_request(worker::Date::now().as_millis() as f64) {
+        if let Ok(db) = env.d1("OVERLAY_DB") {
+            ctx.wait_until(async move {
+                d1_ledger::flush_cost(&db, window, worker::Date::now().as_millis() as f64).await;
+            });
+        }
+    }
 
     // bsv-low #532: the identity views answer CORS to the app origins only; decided before the request moves.
     let identity_cors = identity::IdentityCors::for_request(&req, &env);
@@ -621,3 +635,43 @@ mod obs_counters_tests;
 #[cfg(test)]
 #[path = "../../worker-build-info/src/worker_tests.rs"]
 mod build_info_tests;
+
+/// bsv-low #635 (B-COST-1): the app layer's doors write the shared cost window into the overlay's
+/// `worker_cost_daily` (the table the overlay migrates and serves on `/health/invariants.costBar`).
+#[cfg(test)]
+mod b_cost_1_wiring {
+    fn squash(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn b_cost_1_every_app_layer_door_counts_and_writes_the_window() {
+        let lib = squash(include_str!("lib.rs"));
+        let serve = &lib[lib
+            .find("async fn serve(req: Request, env: Env, ctx: Context)")
+            .unwrap()..];
+        let serve = &serve[..serve.find("identity::IdentityCors::for_request").unwrap()];
+        assert!(
+            serve.contains("d1_ledger::cost_on_request(")
+                && serve.contains("ctx.wait_until(async move { d1_ledger::flush_cost(&db, window,"),
+            "the fetch door counts the request and hands a due window to wait_until, before any route answers"
+        );
+        let cron = &lib[lib.find("async fn scheduled(").unwrap()..];
+        let cron = &cron[..cron.find("let env_drain").unwrap()];
+        assert!(
+            cron.contains("d1_ledger::take_cost_if_due(now)")
+                && cron.contains("d1_ledger::flush_cost(&db, window, now)")
+        );
+        let actor = squash(include_str!("board_view.rs"));
+        let flush = &actor[actor.find("fn flush_counters_if_due(&self)").unwrap()..];
+        let flush = &flush[..flush.find("async fn serve_fetch(").unwrap()];
+        assert!(
+            flush.contains("crate::d1_ledger::take_cost_if_due(now)"),
+            "the actor writes its walks' window"
+        );
+        // The overlay's table, created by its migration; this crate writes the same upsert through the shared source.
+        assert!(bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
+            .contains(&crate::d1_ledger::COST_DAILY_CREATE));
+        assert_eq!(crate::d1_ledger::COST_WORKER, "low-app-layer");
+    }
+}

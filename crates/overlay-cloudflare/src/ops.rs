@@ -1912,6 +1912,7 @@ pub async fn health_invariants(
         gasp_fault_memo_rows = crate::gasp_fault_memo::health(db),
         gasp_peer_absent = crate::gasp_fault_memo::peer_absent_24h(db),
         gasp_route_faults = crate::gasp_route::view(db),
+        cost_rows = crate::cost_bar::read(db, now),
     }
 
     let hb: Option<HeartbeatRow> = hb.ok().flatten();
@@ -2101,6 +2102,12 @@ pub async fn health_invariants(
         .cloned()
         .unwrap_or(json!(0));
     body["d1RowsRead"] = d1_rows_read_view(&body["counters"]);
+    // bsv-low #635 (B-COST-1): requests and D1 rows per UTC day and Worker against the plan's included quotas (vars).
+    body["costBar"] = crate::cost_bar::view(
+        cost_rows.as_deref().map_err(String::as_str),
+        &crate::cost_bar::quotas_from_env(env),
+        now,
+    );
     // NS-COST-BAR-1: this read's own rows (every statement above), durable, so the fleet can judge the poll's cost
     // per day. One statement more, not in its own figure. bsv-low #838: a WRITE, handed to the runtime after the
     // answer (it waited in the D1 queue behind the fleet's writes before the answer could leave).

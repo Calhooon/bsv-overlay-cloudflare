@@ -2988,6 +2988,28 @@ partial index of their NULL tier. The tick and `/health/invariants` count their 
 headers and its split trigger are its own (`docs/D1-BUDGETS.md`, the ask). Pins `d1_hot_bounds.rs` `ns_cost_*`, the
 writers under `recursive_triggers` off and on in `ops::tests::ns_cost_*`.
 
+THE COST BAR (bsv-low #635, B-COST-1). Each Worker of the shared D1 (the overlay and the app layer) sums what its
+isolate cost the plan in a WINDOW (`d1_ledger.rs`, the shared source: every fetch request at the door,
+`cost_on_request`, and every statement the ledger notes, scoped or not, the cron's, the queue's and the Durable
+Object's walks included) and adds it to `worker_cost_daily` (migration 343: one row per UTC day and Worker, the
+crate's package name) with ONE upsert (`COST_DAILY_UPSERT_SQL`) when the window holds 64 requests, 60 s have passed
+since the isolate's last take, or the UTC day moved: at most `ceil(R / 64) + 1` writes per isolate per minute, never
+one per request; the write is handed to `wait_until` at the fetch door and awaited after the cron and each queue
+batch; a faulted write is restored into the window (a table not yet migrated, D1 overloaded: a delay, not a loss).
+`/health/invariants.costBar` serves the last 7 UTC days, each Worker's figures and their total (requests, D1 rows
+read, rows written, statements), beside the plan's included quotas per day, which are VARS
+(`COST_QUOTA_REQUESTS_PER_DAY`, `COST_QUOTA_D1_ROWS_READ_PER_DAY`, `COST_QUOTA_D1_ROWS_WRITTEN_PER_DAY`, set in the
+three overlay configs to the Workers Paid inclusions over 30 days, the ACCOUNT's, for the operator to lower to this
+environment's share; unset or 0 is no quota), the ratio per measure and `overQuota` (today's; `true` past any
+configured quota, `false` within all, `null` with none configured or the table unreadable), `overQuotaDays`, and the
+flush bound. Stated: an isolate's unwritten tail is lost (an under-count); a statement awaited through the bare
+`worker` API is not counted (the ledger's seam); a window straddling midnight lands on its first request's day;
+cron, queue and Durable Object invocations are not counted as requests (their D1 rows are). No rate limiting is
+built (the recommended rule is in the PR, the owner's). Pins `--lib b_cost_1` in both crates (`d1_ledger::b_cost_1`,
+`cost_bar::tests`, the two wiring pins); RED against four revert mutants (a statement not costed: the window pin and the
+overlay's wiring pin; the 64-request rule dropped; the upsert replacing instead of adding; the over-quota comparison
+moved); the app layer's wiring pin is a source pin and was not run against a mutant.
+
 ## Storage ownership (bsv-low #474)
 
 The overlay and the app layer share ONE D1 per environment (`OVERLAY_DB`).

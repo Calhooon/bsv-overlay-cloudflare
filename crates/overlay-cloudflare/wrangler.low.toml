@@ -34,6 +34,14 @@ database_id = "__LOW_APPLAYER_DEFAULT_D1_LOW_OVERLAY_DB_ID__"  # the same prod D
 # BY NAME at deploy by bsv-low's scripts/runner/patterns/render-wrangler.sh beside the `__LOW_..._ID__` ids; a name it
 # does not know refuses the render, so a literal `__HOST_` never reaches a deployed [vars].
 [vars]
+# bsv-low #635 (B-COST-1): the plan's INCLUDED quotas per day that `/health/invariants.costBar` serves its ratio and
+# `overQuota` against (configuration, never a constant in the code; unset or 0 = no quota, the flag null). The figures
+# are the Workers Paid plan's monthly inclusions over 30 days (10M requests, 25B D1 rows read, 50M D1 rows written);
+# they are the ACCOUNT's, shared with every other Worker and D1 of it, so the operator lowers each to this
+# environment's share.
+COST_QUOTA_REQUESTS_PER_DAY = "333333"
+COST_QUOTA_D1_ROWS_READ_PER_DAY = "833333333"
+COST_QUOTA_D1_ROWS_WRITTEN_PER_DAY = "1666666"
 # W2-P4: the app-layer told which pot rows changed (bearer secret INTERNAL_TOKEN),
 # reached through the APP_LAYER service binding; no-ops without the secret.
 APP_LAYER_URL = "https://__HOST_APP_LAYER__"
@@ -228,6 +236,14 @@ head_sampling_rate = 1
 name = "low-overlay-beta"
 
 [env.beta.vars]
+# bsv-low #635 (B-COST-1): the plan's INCLUDED quotas per day that `/health/invariants.costBar` serves its ratio and
+# `overQuota` against (configuration, never a constant in the code; unset or 0 = no quota, the flag null). The figures
+# are the Workers Paid plan's monthly inclusions over 30 days (10M requests, 25B D1 rows read, 50M D1 rows written);
+# they are the ACCOUNT's, shared with every other Worker and D1 of it, so the operator lowers each to this
+# environment's share.
+COST_QUOTA_REQUESTS_PER_DAY = "333333"
+COST_QUOTA_D1_ROWS_READ_PER_DAY = "833333333"
+COST_QUOTA_D1_ROWS_WRITTEN_PER_DAY = "1666666"
 # W2-P4: the app-layer told which pot rows changed (bearer secret INTERNAL_TOKEN).
 APP_LAYER_URL = "https://__HOST_APP_LAYER_BETA__"
 ENVIRONMENT = "production"
