@@ -250,7 +250,7 @@ pub enum BackgroundFlush {
     /// Less than [`FLUSH_WINDOW_FLOOR_MS`] left: nothing POSTed, counted. The pot and hop notes are PARKED in D1
     /// for the cron (`change_park::park_withheld`): a successful park takes them out of the isolate's sets; a park
     /// that faults (or a table at its ceiling) leaves them in the sets for this isolate's next flush. The tracker
-    /// frames are not parked: they stay in the isolate's memory.
+    /// frames are parked FIRST in the same batch and delivered first by the cron (B-OWED-3-FOLD L1).
     Skip {
         /// What was left of the window, in milliseconds.
         remaining_ms: u64,

@@ -403,7 +403,7 @@ pub const COUNTER_ADMIT_FAST_EVICT_YIELDED: &str = "admit_fast_evict_yielded_tot
 /// window was left, counted per job. Its pot and hop notes are PARKED in D1 for the cron (`change_park.rs`): a
 /// successful park takes them out of the isolate's sets (`change_parked_total`); a failed park
 /// (`change_park_faults_total`) or a full table (`change_park_full_total`) leaves them in the sets for the
-/// isolate's next flush. The tracker frames it withheld stay in the isolate's memory.
+/// isolate's next flush. The tracker frames it withheld are parked first in the same batch (B-OWED-3-FOLD L1).
 pub const COUNTER_ADMIT_FAST_FLUSH_SKIPPED_NO_WINDOW: &str =
     "admit_fast_flush_skipped_no_window_total";
 /// loop 18, round 2 (NEW-2): a readmission whose restore faulted on a table — the row left OPEN (never a

@@ -105,6 +105,30 @@ pub async fn note_held(
     }
 }
 
+/// bsv-low #660 (B-OWED-3-FOLD, the lens's L1): a COPY of every queued frame under its key, the set left as it is
+/// (a background flush's skip parks the copy beside the pot and hop notes and [`forget`]s only what its park landed).
+pub fn snapshot() -> Vec<((String, String), Value)> {
+    EVENTS.with(|e| {
+        e.borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    })
+}
+
+/// B-OWED-3-FOLD L1: take `parked` out of the queue, each ONLY while it holds the frame the snapshot read (a frame of
+/// the same key queued since stays; the queue keeps the first frame of a key, so in practice that is a retry flag).
+pub fn forget(parked: &[((String, String), Value)]) {
+    EVENTS.with(|e| {
+        let mut events = e.borrow_mut();
+        for (key, frame) in parked {
+            if events.get(key) == Some(frame) {
+                events.remove(key);
+            }
+        }
+    });
+}
+
 /// Take every queued event.
 pub fn drain() -> Vec<Value> {
     EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()).into_values().collect())
