@@ -106,7 +106,7 @@ async-trait = "0.1"
 # is linked into the wasm32 Worker build.
 rusqlite = { version = "0.32", features = ["bundled"] }
 bsv-overlay-cloudflare = { version = "0.3.1", path = "../overlay-cloudflare" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }
 
 # bsv-low #670 (the lens's HIGH-3): `tests/door_wasm.rs` drives the door's real
 # middleware path on wasm32 under Node, where a `worker::Request` exists.
