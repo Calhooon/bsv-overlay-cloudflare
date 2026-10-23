@@ -157,10 +157,12 @@ pub enum RecordKind {
     Collected,
     /// bsv-low #469: the seat's pre-signed hop sweep (`hopsweep.rs`); never bought on chain.
     Hopsweep,
+    /// bsv-low #848 (FAST-C): the four funding-moment filings under one signature per key (`handfile.rs`).
+    Handfile,
 }
 
 /// The families, as the counters are sized.
-pub const RECORD_KINDS: usize = 5;
+pub const RECORD_KINDS: usize = 6;
 
 impl RecordKind {
     pub const ALL: [RecordKind; RECORD_KINDS] = [
@@ -169,6 +171,7 @@ impl RecordKind {
         RecordKind::Result,
         RecordKind::Collected,
         RecordKind::Hopsweep,
+        RecordKind::Handfile,
     ];
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -177,6 +180,7 @@ impl RecordKind {
             "result" => Some(Self::Result),
             "collected" => Some(Self::Collected),
             "hopsweep" => Some(Self::Hopsweep),
+            "handfile" => Some(Self::Handfile),
             _ => None,
         }
     }
@@ -187,6 +191,7 @@ impl RecordKind {
             Self::Result => "result",
             Self::Collected => "collected",
             Self::Hopsweep => "hopsweep",
+            Self::Handfile => "handfile",
         }
     }
     fn index(self) -> usize {
@@ -196,6 +201,7 @@ impl RecordKind {
             Self::Result => 2,
             Self::Collected => 3,
             Self::Hopsweep => 4,
+            Self::Handfile => 5,
         }
     }
 }
@@ -213,6 +219,9 @@ pub const fn filed_rows_cap(kind: RecordKind) -> i64 {
         // `collected` is the v1 marker's cap: one per game. The held filings of the same door share the table and
         // are counted APART ([`filed_rows_cap_of`], [`HELD_FILED_ROWS_SQL`]).
         RecordKind::Potrefund | RecordKind::Collected => 1,
+        // bsv-low #848: a handfile is capped PER FAMILY it explodes into (potparty's 2, potrefund's 1, and its own
+        // hopparty row's `HOPPARTY_FILED_ROWS_CAP`, 1 per hop); this is the hop row's.
+        RecordKind::Handfile => crate::handfile::HOPPARTY_FILED_ROWS_CAP,
     }
 }
 
@@ -279,6 +288,17 @@ pub enum RecordRefusal {
     SweepDoesNotSpendTheHop,
     /// bsv-low #469: the sweep is not the seat's spend of the hop (`hopsweep::bind_hop_sweep`).
     SweepNotTheSeatsSpend,
+    /// bsv-low #848: the handfile body is not a 64-hex hop txid, four hex payloads and two hex signatures.
+    HandfileShape,
+    /// bsv-low #848: a handfile payload is not its family's canonical bytes (the family's own parser refuses it).
+    HandfilePayloadNotAMarker,
+    /// bsv-low #848: the four payloads do not name one seat's one hand (identity, opponent, game, pot, height,
+    /// settle key).
+    HandfileInconsistent,
+    /// bsv-low #848: the handfile's settle-key signature does not verify under the batch's settle key.
+    SettleSignatureInvalid,
+    /// bsv-low #848: the hop the index holds does not pay the batch's settle key the sats the payload names.
+    HopMarkerRefuted,
 }
 
 impl From<crate::hopsweep::SweepRefusal> for RecordRefusal {
@@ -296,7 +316,9 @@ impl From<crate::hopsweep::SweepRefusal> for RecordRefusal {
 impl RecordRefusal {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::BadKind => "kind must be one of potparty | potrefund | result | collected | hopsweep",
+            Self::BadKind => {
+                "kind must be one of potparty | potrefund | result | collected | hopsweep | handfile"
+            }
             Self::BadScriptHex => "scriptHex must be hex",
             Self::BodyTooLarge => "request body too large for a marker",
             Self::ScriptTooLarge => "script too large",
@@ -326,11 +348,31 @@ impl RecordRefusal {
             Self::SweepNotTheSeatsSpend => {
                 "the hop sweep is not the seat's spend of the hop (the unlock must be the seat's canonical signature over the hop's own lock and value, then the seat's settle key)"
             }
+            Self::HandfileShape => {
+                "a handfile is {hopTxid: 64 hex, payloads: [4 hex], identitySigHex, settleSigHex}"
+            }
+            Self::HandfilePayloadNotAMarker => {
+                "a handfile payload is not its family's canonical bytes (hopparty, potparty v1, potparty v2, potrefund, in that order)"
+            }
+            Self::HandfileInconsistent => {
+                "the handfile's payloads must name one seat's one hand: one identity, opponent, game, pot outpoint, recovery height and settle key"
+            }
+            Self::SettleSignatureInvalid => {
+                "the handfile's settle-key signature does not verify under the batch's settle key (canonical low-S DER required)"
+            }
+            Self::HopMarkerRefuted => {
+                "the hop the index holds does not pay the batch's settle key the sats the payload names"
+            }
         }
     }
     pub fn status(self) -> u16 {
         match self {
-            Self::BadKind | Self::BadScriptHex | Self::NotCanonical | Self::NotAMarker => 400,
+            Self::BadKind
+            | Self::BadScriptHex
+            | Self::NotCanonical
+            | Self::NotAMarker
+            | Self::HandfileShape
+            | Self::HandfilePayloadNotAMarker => 400,
             Self::BodyTooLarge | Self::ScriptTooLarge => 413,
             Self::PosterMismatch => 403,
             Self::TooManyFiled => 409,
@@ -338,7 +380,10 @@ impl RecordRefusal {
             | Self::RefundDoesNotSpendThePot
             | Self::RefundNotThePresignedSpend
             | Self::SweepDoesNotSpendTheHop
-            | Self::SweepNotTheSeatsSpend => 422,
+            | Self::SweepNotTheSeatsSpend
+            | Self::HandfileInconsistent
+            | Self::SettleSignatureInvalid
+            | Self::HopMarkerRefuted => 422,
             Self::HopNotIndexed | Self::HopMarkerUnverified => 425,
             Self::DailyCapReached => 429,
         }
@@ -362,10 +407,15 @@ impl RecordRefusal {
             Self::HopMarkerUnverified => "hop_marker_unverified",
             Self::SweepDoesNotSpendTheHop => "sweep_does_not_spend_the_hop",
             Self::SweepNotTheSeatsSpend => "sweep_not_the_seats_spend",
+            Self::HandfileShape => "handfile_shape",
+            Self::HandfilePayloadNotAMarker => "handfile_payload_not_a_marker",
+            Self::HandfileInconsistent => "handfile_inconsistent",
+            Self::SettleSignatureInvalid => "settle_signature_invalid",
+            Self::HopMarkerRefuted => "hop_marker_refuted",
         }
     }
     /// Every refusal, in declaration order (the durable names' list).
-    pub const ALL: [RecordRefusal; 16] = [
+    pub const ALL: [RecordRefusal; 21] = [
         Self::BadKind,
         Self::BadScriptHex,
         Self::BodyTooLarge,
@@ -382,6 +432,11 @@ impl RecordRefusal {
         Self::HopMarkerUnverified,
         Self::SweepDoesNotSpendTheHop,
         Self::SweepNotTheSeatsSpend,
+        Self::HandfileShape,
+        Self::HandfilePayloadNotAMarker,
+        Self::HandfileInconsistent,
+        Self::SettleSignatureInvalid,
+        Self::HopMarkerRefuted,
     ];
 }
 
@@ -1254,6 +1309,8 @@ pub fn verify_record_post(
                 pay_txid: None,
             }))
         }
+        // bsv-low #848: a handfile is a batch body, not a script; the door dispatches it before this walk.
+        RecordKind::Handfile => Err(RecordRefusal::BadKind),
         RecordKind::Hopsweep => {
             let m =
                 crate::hopsweep::parse_hopsweep_marker(script).ok_or(RecordRefusal::NotAMarker)?;
@@ -1533,7 +1590,11 @@ pub fn cap_refusal_for(
     cap_refusal_at(filed_rows_cap_of(v), rows_for_pot, rows_today)
 }
 
-fn cap_refusal_at(cap: i64, rows_for_pot: i64, rows_today: i64) -> Option<RecordRefusal> {
+pub(crate) fn cap_refusal_at(
+    cap: i64,
+    rows_for_pot: i64,
+    rows_today: i64,
+) -> Option<RecordRefusal> {
     if rows_for_pot >= cap {
         return Some(RecordRefusal::TooManyFiled);
     }
@@ -1584,6 +1645,31 @@ fn bump(c: &[AtomicU64; RECORD_KINDS], kind: RecordKind) {
     c[kind.index()].fetch_add(1, Ordering::Relaxed);
 }
 
+/// bsv-low #848: the handfile arm's counters, the door's own (`handfile.rs` runs the same ledger).
+pub(crate) fn note_filed(kind: RecordKind, anonymous: bool) {
+    bump(&FILED_BY_KIND, kind);
+    if anonymous {
+        bump(&ANONYMOUS_FILED_BY_KIND, kind);
+    }
+}
+pub(crate) fn note_already_filed(kind: RecordKind) {
+    bump(&ALREADY_FILED_BY_KIND, kind);
+}
+pub(crate) fn note_cap_refused(r: RecordRefusal, kind: RecordKind) {
+    bump(
+        if r == RecordRefusal::TooManyFiled {
+            &TOO_MANY_FILED_BY_KIND
+        } else {
+            &DAILY_CAP_BY_KIND
+        },
+        kind,
+    );
+}
+pub(crate) fn note_bad_body(kind: RecordKind) {
+    bump(&REFUSED_BY_KIND, kind);
+    mirror_refused(REFUSED_BAD_BODY_CLASS);
+}
+
 fn by_kind(c: &[AtomicU64; RECORD_KINDS]) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     for k in RecordKind::ALL {
@@ -1617,6 +1703,7 @@ pub fn record_health_json() -> serde_json::Value {
             "collected": filed_rows_cap(RecordKind::Collected),
             "collectedHeld": HELD_FILINGS_PER_GAME,
             "hopsweep": filed_rows_cap(RecordKind::Hopsweep),
+            "handfileHopparty": filed_rows_cap(RecordKind::Handfile),
         },
         "filingsPerIdentityPerDay": RECORD_FILINGS_PER_IDENTITY_PER_DAY,
     })
@@ -1624,13 +1711,13 @@ pub fn record_health_json() -> serde_json::Value {
 
 // ── the route ───────────────────────────────────────────────────────────────
 
-fn js(s: &str) -> worker::wasm_bindgen::JsValue {
+pub(crate) fn js(s: &str) -> worker::wasm_bindgen::JsValue {
     s.into()
 }
-fn js_opt(s: Option<&str>) -> worker::wasm_bindgen::JsValue {
+pub(crate) fn js_opt(s: Option<&str>) -> worker::wasm_bindgen::JsValue {
     s.map_or(worker::wasm_bindgen::JsValue::NULL, |v| v.into())
 }
-fn js_num(n: i64) -> worker::wasm_bindgen::JsValue {
+pub(crate) fn js_num(n: i64) -> worker::wasm_bindgen::JsValue {
     (n as f64).into()
 }
 
@@ -1701,7 +1788,7 @@ impl PotRowD1 {
     }
 }
 
-async fn read_pot_context(
+pub(crate) async fn read_pot_context(
     db: &worker::D1Database,
     pot_txid_lc: &str,
     pot_vout: u32,
@@ -1763,7 +1850,7 @@ async fn read_hop_context(
     }))
 }
 
-async fn count(
+pub(crate) async fn count(
     db: &worker::D1Database,
     sql: &str,
     binds: &[worker::wasm_bindgen::JsValue],
@@ -1776,7 +1863,7 @@ async fn count(
     Ok(row.and_then(|r| r.n).map_or(0, |n| n as i64))
 }
 
-fn refuse(kind: Option<RecordKind>, r: RecordRefusal) -> Result<Response> {
+pub(crate) fn refuse(kind: Option<RecordKind>, r: RecordRefusal) -> Result<Response> {
     if let Some(k) = kind {
         bump(&REFUSED_BY_KIND, k);
     }
@@ -1785,6 +1872,69 @@ fn refuse(kind: Option<RecordKind>, r: RecordRefusal) -> Result<Response> {
 }
 
 /// `POST /record?kind=<family>&identity=<poster>` with `{ "scriptHex": … }`.
+/// After a row landed: the pot's parties and the filer marked stale, then the filer's owed recompute (in
+/// `wait_until` where the platform gives one). Shared by every kind, the handfile arm included (bsv-low #848).
+pub(crate) async fn note_filing_and_recompute(
+    ctx: &RouteContext<AuthState>,
+    db: &worker::D1Database,
+    identity: Option<String>,
+    pot: Option<(String, u32)>,
+) {
+    use worker::wasm_bindgen::JsValue;
+    if let Some((pot_txid, pot_vout)) = &pot {
+        crate::routes::owed_mark_stale(
+            db,
+            crate::owed::OWED_STALE_FOR_POT_SQL,
+            &[
+                JsValue::from_str(pot_txid),
+                JsValue::from_f64(f64::from(*pot_vout)),
+            ],
+            "filing: the pot's parties",
+        )
+        .await;
+    }
+    if let Some(id) = &identity {
+        crate::routes::owed_mark_stale(
+            db,
+            crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
+            &[JsValue::from_str(id)],
+            "filing: the filer",
+        )
+        .await;
+    }
+    if let Some(id) = identity {
+        if let Some(wait) = ctx.data.wait.clone() {
+            let env = ctx.env.clone();
+            wait.wait_until(async move {
+                // bsv-low #800: the filing's refresh has this invocation's 30 s
+                let invocation_end =
+                    crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64);
+                if let Ok(db) = env.d1("OVERLAY_DB") {
+                    crate::routes::owed_recompute_and_push_coalesced(
+                        &env,
+                        &db,
+                        &id,
+                        "filing",
+                        None,
+                        invocation_end,
+                    )
+                    .await;
+                }
+            });
+        } else {
+            crate::routes::owed_recompute_and_push_coalesced(
+                &ctx.env,
+                db,
+                &id,
+                "filing",
+                None,
+                crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64),
+            )
+            .await;
+        }
+    }
+}
+
 pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let identity = match crate::routes::view_identity(&req, &ctx) {
         crate::routes::ViewIdentity::Identity(id) => id.to_ascii_lowercase(),
@@ -1812,6 +1962,10 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
     // Sizes BEFORE any decode (MED-3): the body, the hex, then the script.
     if raw.len() > RECORD_POST_MAX_BODY_BYTES {
         return refuse(Some(kind), RecordRefusal::BodyTooLarge);
+    }
+    if kind == RecordKind::Handfile {
+        // bsv-low #848: the batch arm, its own body shape, the same ledger, caps and tables.
+        return crate::handfile::handfile_post(&ctx, &raw, &identity, anonymous).await;
     }
     let body: RecordPostBody = match serde_json::from_slice(&raw) {
         Ok(b) => b,
@@ -2081,7 +2235,6 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
         return crate::routes::json_response(already_filed_body(&verified).to_string(), 200);
     }
     {
-        use worker::wasm_bindgen::JsValue;
         let (identity, pot): (Option<String>, Option<(String, u32)>) = match &verified {
             VerifiedRecord::Potparty(r, _) => (
                 Some(r.identity.to_ascii_lowercase()),
@@ -2097,64 +2250,10 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
             VerifiedRecord::Hopsweep(_, r) => (Some(r.identity.to_ascii_lowercase()), None),
             VerifiedRecord::Result(..) => (None, None),
         };
-        if let Some((pot_txid, pot_vout)) = &pot {
-            crate::routes::owed_mark_stale(
-                &db,
-                crate::owed::OWED_STALE_FOR_POT_SQL,
-                &[
-                    JsValue::from_str(pot_txid),
-                    JsValue::from_f64(f64::from(*pot_vout)),
-                ],
-                "filing: the pot's parties",
-            )
-            .await;
-        }
-        if let Some(id) = &identity {
-            crate::routes::owed_mark_stale(
-                &db,
-                crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
-                &[JsValue::from_str(id)],
-                "filing: the filer",
-            )
-            .await;
-        }
-        if let Some(id) = identity {
-            if let Some(wait) = ctx.data.wait.clone() {
-                let env = ctx.env.clone();
-                wait.wait_until(async move {
-                    // bsv-low #800: the filing's refresh has this invocation's 30 s
-                    let invocation_end =
-                        crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64);
-                    if let Ok(db) = env.d1("OVERLAY_DB") {
-                        crate::routes::owed_recompute_and_push_coalesced(
-                            &env,
-                            &db,
-                            &id,
-                            "filing",
-                            None,
-                            invocation_end,
-                        )
-                        .await;
-                    }
-                });
-            } else {
-                crate::routes::owed_recompute_and_push_coalesced(
-                    &ctx.env,
-                    &db,
-                    &id,
-                    "filing",
-                    None,
-                    crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64),
-                )
-                .await;
-            }
-        }
+        note_filing_and_recompute(&ctx, &db, identity, pot).await;
     }
 
-    bump(&FILED_BY_KIND, kind);
-    if anonymous {
-        bump(&ANONYMOUS_FILED_BY_KIND, kind);
-    }
+    note_filed(kind, anonymous);
     let mut body =
         serde_json::json!({ "filed": true, "kind": kind.as_str(), "key": verified.key() });
     if let VerifiedRecord::Potrefund(_, refund_valid) = &verified {
@@ -2235,7 +2334,7 @@ pub(crate) mod tests {
     }
     /// A one-input tx spending `pot:vout` — the OLD test's junk shape (input 0
     /// names the pot and nothing else is true of it).
-    fn junk_refund_raw(pot_txid: &[u8; 32], vout: u32) -> Vec<u8> {
+    pub(crate) fn junk_refund_raw(pot_txid: &[u8; 32], vout: u32) -> Vec<u8> {
         let mut tx = bsv_rs::transaction::Transaction::new();
         tx.add_input(bsv_rs::transaction::TransactionInput {
             source_txid: Some(hex::encode(pot_txid)),
@@ -2257,7 +2356,7 @@ pub(crate) mod tests {
     // ── a real covenant pot and its pre-signed refund (the HIGH-1 fixtures) ──
     // A symmetric pot txid ([0x55; 32]) so the raw's internal byte order and
     // the marker's display order agree without a reversal in the fixture.
-    const POT_TXID: [u8; 32] = [0x55u8; 32];
+    pub(crate) const POT_TXID: [u8; 32] = [0x55u8; 32];
     const POT_SATS: u64 = 1000;
     fn skey(scalar: u8) -> bsv_rs::primitives::ec::PrivateKey {
         let mut b = [0u8; 32];
@@ -2395,7 +2494,7 @@ pub(crate) mod tests {
     ) -> Vec<u8> {
         template_spend(first, second, sequence, lock_time, &[])
     }
-    fn presigned_refund() -> Vec<u8> {
+    pub(crate) fn presigned_refund() -> Vec<u8> {
         let k = pot_keys();
         spend_signed_by(&k[0], &k[1], 0xffff_fffe, 900_000)
     }
@@ -3523,7 +3622,7 @@ pub(crate) mod tests {
     // ── W25C: the chain no-op (bsv-low #564, #565), over the SHIPPED statements under real SQLite ──
 
     /// A fresh SQLite carrying the production schema (the overlay's migrations, as `tests/sql_prepares_sqlite.rs`).
-    fn w25c_db() -> rusqlite::Connection {
+    pub(crate) fn w25c_db() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
             if let Err(e) = conn.execute_batch(sql) {
