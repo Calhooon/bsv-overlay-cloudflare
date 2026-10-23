@@ -165,6 +165,16 @@ pub enum HoppartyQuery {
 /// Backend-agnostic storage for hopparty-marker records.
 #[async_trait(?Send)]
 pub trait HoppartyStorage {
+    /// bsv-low #848 (FAST-C): the handfile batches the given rows (by `(txid, outputIndex)`) were exploded from,
+    /// read beside a served row so the client can re-verify it. A backend that keeps no batches answers none
+    /// (the default): the rows are served without one, as before the family.
+    async fn handfile_batches(
+        &self,
+        _keys: &[(String, u32)],
+    ) -> Result<Vec<((String, u32), crate::handfile::HandfileBatch)>, HoppartyStorageError> {
+        Ok(Vec::new())
+    }
+
     /// Store a record keyed by its OUTPOINT `(txid, outputIndex)` —
     /// insert-if-absent: a replayed / duplicate SUBMIT of the same output
     /// is a no-op, but markers for the same identity from DIFFERENT txs are

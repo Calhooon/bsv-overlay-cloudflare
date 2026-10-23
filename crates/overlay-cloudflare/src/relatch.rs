@@ -172,6 +172,16 @@ impl RelatchSummary {
     }
 }
 
+/// bsv-low #848 (FAST-C): a row the app layer's record door FILED (a `filed:` content key in `potparty_records`;
+/// a `hopparty_records` row at a handfile vout) was verified at the door, and since the `handfile` family its
+/// signature columns may hold a BATCH's two signatures (one identity signature and one settle-key signature over
+/// the batch digest), which a per-row recompute of the family's own challenge refuses. The passes leave such a row
+/// alone: its write-time verdict stands. A chain row (a 64-hex txid at its real vout) is scanned as before.
+pub fn door_filed_row(txid: &str, output_index: u32) -> bool {
+    overlay_discovery::handfile::is_filed_key(txid)
+        || overlay_discovery::hopparty::is_handfile_marker_vout(output_index)
+}
+
 /// One re-latchable table.
 ///
 /// `Row` carries the stored verdict AND the record, because the decision "does

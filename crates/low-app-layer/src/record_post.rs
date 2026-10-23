@@ -1872,69 +1872,6 @@ pub(crate) fn refuse(kind: Option<RecordKind>, r: RecordRefusal) -> Result<Respo
 }
 
 /// `POST /record?kind=<family>&identity=<poster>` with `{ "scriptHex": … }`.
-/// After a row landed: the pot's parties and the filer marked stale, then the filer's owed recompute (in
-/// `wait_until` where the platform gives one). Shared by every kind, the handfile arm included (bsv-low #848).
-pub(crate) async fn note_filing_and_recompute(
-    ctx: &RouteContext<AuthState>,
-    db: &worker::D1Database,
-    identity: Option<String>,
-    pot: Option<(String, u32)>,
-) {
-    use worker::wasm_bindgen::JsValue;
-    if let Some((pot_txid, pot_vout)) = &pot {
-        crate::routes::owed_mark_stale(
-            db,
-            crate::owed::OWED_STALE_FOR_POT_SQL,
-            &[
-                JsValue::from_str(pot_txid),
-                JsValue::from_f64(f64::from(*pot_vout)),
-            ],
-            "filing: the pot's parties",
-        )
-        .await;
-    }
-    if let Some(id) = &identity {
-        crate::routes::owed_mark_stale(
-            db,
-            crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
-            &[JsValue::from_str(id)],
-            "filing: the filer",
-        )
-        .await;
-    }
-    if let Some(id) = identity {
-        if let Some(wait) = ctx.data.wait.clone() {
-            let env = ctx.env.clone();
-            wait.wait_until(async move {
-                // bsv-low #800: the filing's refresh has this invocation's 30 s
-                let invocation_end =
-                    crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64);
-                if let Ok(db) = env.d1("OVERLAY_DB") {
-                    crate::routes::owed_recompute_and_push_coalesced(
-                        &env,
-                        &db,
-                        &id,
-                        "filing",
-                        None,
-                        invocation_end,
-                    )
-                    .await;
-                }
-            });
-        } else {
-            crate::routes::owed_recompute_and_push_coalesced(
-                &ctx.env,
-                db,
-                &id,
-                "filing",
-                None,
-                crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64),
-            )
-            .await;
-        }
-    }
-}
-
 pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let identity = match crate::routes::view_identity(&req, &ctx) {
         crate::routes::ViewIdentity::Identity(id) => id.to_ascii_lowercase(),
@@ -2263,6 +2200,69 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
         body["heldTxid"] = serde_json::json!(pay_txid);
     }
     crate::routes::json_response(body.to_string(), 200)
+}
+
+/// After a row landed: the pot's parties and the filer marked stale, then the filer's owed recompute (in
+/// `wait_until` where the platform gives one). Shared by every kind, the handfile arm included (bsv-low #848).
+pub(crate) async fn note_filing_and_recompute(
+    ctx: &RouteContext<AuthState>,
+    db: &worker::D1Database,
+    identity: Option<String>,
+    pot: Option<(String, u32)>,
+) {
+    use worker::wasm_bindgen::JsValue;
+    if let Some((pot_txid, pot_vout)) = &pot {
+        crate::routes::owed_mark_stale(
+            db,
+            crate::owed::OWED_STALE_FOR_POT_SQL,
+            &[
+                JsValue::from_str(pot_txid),
+                JsValue::from_f64(f64::from(*pot_vout)),
+            ],
+            "filing: the pot's parties",
+        )
+        .await;
+    }
+    if let Some(id) = &identity {
+        crate::routes::owed_mark_stale(
+            db,
+            crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
+            &[JsValue::from_str(id)],
+            "filing: the filer",
+        )
+        .await;
+    }
+    if let Some(id) = identity {
+        if let Some(wait) = ctx.data.wait.clone() {
+            let env = ctx.env.clone();
+            wait.wait_until(async move {
+                // bsv-low #800: the filing's refresh has this invocation's 30 s
+                let invocation_end =
+                    crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64);
+                if let Ok(db) = env.d1("OVERLAY_DB") {
+                    crate::routes::owed_recompute_and_push_coalesced(
+                        &env,
+                        &db,
+                        &id,
+                        "filing",
+                        None,
+                        invocation_end,
+                    )
+                    .await;
+                }
+            });
+        } else {
+            crate::routes::owed_recompute_and_push_coalesced(
+                &ctx.env,
+                db,
+                &id,
+                "filing",
+                None,
+                crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64),
+            )
+            .await;
+        }
+    }
 }
 
 #[cfg(test)]

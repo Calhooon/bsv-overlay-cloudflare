@@ -206,6 +206,15 @@ impl LookupService for PotpartyLookupService {
             })
             .collect();
 
+        // bsv-low #848 (FAST-C): an exploded (handfile) row carries its batch, the one additive field; every
+        // other row's bytes are unchanged, and a batch read that faults serves the rows without one.
+        let entries = crate::handfile::attach_batches(
+            entries,
+            crate::handfile::filed_row_key,
+            |keys| async move { self.storage.handfile_batches(&keys).await.ok() },
+        )
+        .await;
+
         Ok(LookupResult::Answer(LookupAnswer::Freeform {
             result: serde_json::Value::Array(entries),
         }))

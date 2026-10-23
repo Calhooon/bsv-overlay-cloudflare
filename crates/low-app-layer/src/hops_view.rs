@@ -1348,6 +1348,9 @@ pub struct HopEntry {
     /// bsv-low #469: the hop marker's filing time in MILLISECONDS, when the row carried it (the marker table
     /// stamps unix seconds; the D1 mapper converts).
     pub marker_created_at: Option<i64>,
+    /// bsv-low #848 (FAST-C): the batch an exploded (handfile) marker belongs to; `None` for a chain marker and
+    /// for every row filed before the family, whose bytes are therefore unchanged.
+    pub batch: Option<crate::handfile::HandfileBatchRef>,
 }
 
 /// Assemble the joined rows into response entries + the one honesty bit:
@@ -1455,6 +1458,7 @@ pub fn assemble_hops_view(rows: Vec<HopsViewRow>) -> (Vec<HopEntry>, bool) {
                 status_source,
                 marker_verified,
                 marker_created_at: r.marker_created_at,
+                batch: None,
             }
         })
         .collect();
@@ -1483,7 +1487,7 @@ pub fn hops_view_body(
     let arr: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
-            json!({
+            let mut row = json!({
                 "gameId": e.game_id,
                 "hopTxid": e.hop_txid,
                 "hopVout": e.hop_vout,
@@ -1500,7 +1504,10 @@ pub fn hops_view_body(
                 "status": e.status.as_str(),
                 "statusSource": e.status_source,
                 "markerVerified": e.marker_verified.as_str(),
-            })
+            });
+            // bsv-low #848: the batch of an exploded marker, absent on every other entry (the bytes unchanged)
+            overlay_discovery::handfile::attach_batch(&mut row, e.batch.as_ref());
+            row
         })
         .collect();
     json!({
@@ -2348,6 +2355,53 @@ mod tests {
             "the scope is exactly that clause and nothing else"
         );
     }
+    /// bsv-low #848 (FAST-C): an entry without a batch (every chain marker, every row filed before the family)
+    /// is served byte for byte as before: no `batch` key; an exploded marker's entry carries its batch.
+    #[test]
+    fn fastc_an_entry_without_a_batch_is_unchanged_and_one_with_it_carries_it() {
+        let plain = index_unspent(&"aa".repeat(32), 0);
+        let body: serde_json::Value = serde_json::from_str(&hops_view_body(
+            "id",
+            Some(1),
+            std::slice::from_ref(&plain),
+            false,
+            0,
+        ))
+        .unwrap();
+        let e0 = &body["hops"][0];
+        assert!(
+            e0.get("batch").is_none(),
+            "no batch key on a plain entry: {e0}"
+        );
+        let mut exploded = index_unspent(&"bb".repeat(32), 0);
+        exploded.marker_vout = overlay_discovery::hopparty::HANDFILE_MARKER_VOUT_BASE | 5;
+        exploded.batch = crate::handfile::HandfileBatchRef::of_stored(
+            "handfile:k",
+            &"77".repeat(32),
+            "[\"00\",\"01\",\"02\",\"03\"]",
+            "30",
+            "31",
+            0,
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&hops_view_body("id", Some(1), &[plain, exploded], false, 0))
+                .unwrap();
+        assert!(body["hops"][0].get("batch").is_none());
+        assert_eq!(body["hops"][1]["batch"]["key"], "handfile:k");
+        assert_eq!(body["hops"][1]["batch"]["index"], 0);
+        assert_eq!(body["hops"][1]["markerVout"], 2147483653u64);
+        // the plain entry's bytes: the same object with and without the exploded neighbour
+        let alone: serde_json::Value = serde_json::from_str(&hops_view_body(
+            "id",
+            Some(1),
+            &[index_unspent(&"aa".repeat(32), 0)],
+            false,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(alone["hops"][0], body["hops"][0]);
+    }
+
     fn index_unspent(txid: &str, vout: u32) -> HopEntry {
         HopEntry {
             game_id: "aa".repeat(32),
@@ -2367,6 +2421,7 @@ mod tests {
             status_source: Some("index"),
             marker_verified: MarkerVerification::Verified,
             marker_created_at: None,
+            batch: None,
         }
     }
 
