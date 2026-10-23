@@ -1618,11 +1618,18 @@ where
     outcome
 }
 
-/// N4: the scheduled tick's two units of work, each its OWN `wait_until` task, the drain handed FIRST: the tracker's
-/// backfill and tick await CHAINTRACKS with no timeout of their own, so a pending header answer no longer holds the
-/// drain behind it. The worker's `scheduled` calls this with `ctx.wait_until`.
-pub fn schedule_tick(spawn: &dyn Fn(Detached), drain: Detached, tracker: Detached) {
+/// N4: the scheduled tick's units of work, each its OWN `wait_until` task, the drain handed FIRST: the tracker's
+/// boot, board era, backfill and tick await D1 and CHAINTRACKS, so a pending answer there no longer holds the drain
+/// behind it. bsv-low #778: the chain-event intake is the second task, out of reach of the tracker's awaits too. The
+/// worker's `scheduled` calls this with `ctx.wait_until`.
+pub fn schedule_tick(
+    spawn: &dyn Fn(Detached),
+    drain: Detached,
+    intake: Detached,
+    tracker: Detached,
+) {
     spawn(drain);
+    spawn(intake);
     spawn(tracker);
 }
 
@@ -3025,9 +3032,9 @@ pub(crate) mod tests {
             .unwrap_or(sched.len())];
         assert!(
             sched.contains(&squash(
-                "pot_hook::schedule_tick(&|f| ctx.wait_until(f), drain, tracker);"
+                "pot_hook::schedule_tick(&|f| ctx.wait_until(f), drain, intake, tracker);"
             )),
-            "the drain is its own task, scheduled before the tracker work"
+            "the drain is its own task, scheduled before the intake and the tracker work"
         );
         let drain_at = sched
             .find(&squash("let drain: pot_hook::Detached"))
@@ -3072,9 +3079,10 @@ pub(crate) mod tests {
             drain_parked(&*s2, &*r2, &test_deadline(5_000)).await;
         });
         let tracker: Detached = Box::pin(std::future::pending::<()>());
+        let intake: Detached = Box::pin(std::future::pending::<()>());
         let rec = Recorded::default();
-        schedule_tick(&|f| rec.0.borrow_mut().push(f), drain, tracker);
-        assert_eq!(rec.0.borrow().len(), 2, "two tasks");
+        schedule_tick(&|f| rec.0.borrow_mut().push(f), drain, intake, tracker);
+        assert_eq!(rec.0.borrow().len(), 3, "three tasks");
         let _ = tokio::time::timeout(Duration::from_secs(2), rec.run_all()).await;
         assert_eq!(
             relay.delivered.borrow().len(),

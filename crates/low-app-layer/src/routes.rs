@@ -11022,8 +11022,9 @@ pub async fn tx_any_batch(req: Request, ctx: RouteContext<AuthState>) -> Result<
     )
 }
 
-/// `GET /health` — liveness only (no DB touch).
-pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
+/// `GET /health`: liveness, the isolate's tallies, and (bsv-low #777) ONE D1 batch, the chain-event intake's durable
+/// row and counters (`chainEvents`).
+pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     // #318 (Rule 13 — surface, don't consume): the auth mode + per-isolate
     // counters ride the health body, so "unauthenticated but accepted" is a
     // number the operator watches during the lenient soak, never a silent
@@ -11051,8 +11052,12 @@ pub fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     // bsv-low #451 slice B: the isolate's courier tally (the durable one is the overlay's /health/invariants).
     body["couriers"] = crate::courier::health_json();
     body["trackerReask"] = crate::tracker_host::pacing::health_json();
-    // bsv-low #771 (L1b): the chain-event intake as this isolate's last scheduled pass left it (no D1 read here).
-    body["chainEvents"] = crate::tracker_host::chain_events::health_json();
+    // bsv-low #771 (L1b), #777: the chain-event intake from its DURABLE row and counters (one batch; a fault serves
+    // this isolate's memo, marked `source: "isolate"`).
+    body["chainEvents"] = match D1Sql::of(&ctx.env) {
+        Ok(sql) => crate::tracker_host::chain_events::health_read(&sql).await,
+        Err(e) => crate::tracker_host::chain_events::isolate_health(format!("no OVERLAY_DB: {e}")),
+    };
     // bsv-low #497: the exchange rate's sample, its age and every rung's counts (this isolate's).
     body["rate"] = crate::rate::health_json(worker::Date::now().as_millis() as f64);
     // bsv-low #532: the identity views' outcomes per route and the budget (this isolate's).

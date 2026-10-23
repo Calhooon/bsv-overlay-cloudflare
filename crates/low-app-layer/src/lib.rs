@@ -247,6 +247,24 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         task.await;
         pass_meter::end_task(&meter, routes::D1Sql::of(&env_drain).ok().as_ref()).await;
     });
+    // bsv-low #771 (L1b), #778: the chain-event intake is its OWN task, handed second, under its own one deadline
+    // (`chain_events::WALL_MS`): the feed pulled over the CHAINTRACKS binding on its durable cursor, each event's
+    // affected mined rows queued in the cursor's batch, then eight queued re-asks drained. Until #778 it ran after the
+    // tracker's boot, board era and backfill in one task, so any await there that never answered (the 14:15:47Z pass
+    // of 2026-10-20) skipped it silently; its first statement is now the pass's durable witness
+    // (`chain_events::witness`), so a pass that never reaches it is counted by the next one that does.
+    let env_intake = env.clone();
+    let meter_intake = meter.clone();
+    let intake: pot_hook::Detached = Box::pin(async move {
+        let meter = meter_intake;
+        meter
+            .phase(
+                "tracker.chain_events",
+                tracker_host::chain_events::run(&env_intake),
+            )
+            .await;
+        pass_meter::end_task(&meter, routes::D1Sql::of(&env_intake).ok().as_ref()).await;
+    });
     let tracker: pot_hook::Detached = Box::pin(async move {
         meter
             .phase(
@@ -268,15 +286,6 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
             courier::note_presence("tracker_backfill_faulted_total");
             worker::console_warn!("[tracker-backfill] deferred: {e}");
         }
-        // bsv-low #771 (L1b): the chain-event intake, after the backfill, under its own one deadline: the feed pulled
-        // over the CHAINTRACKS binding on its durable cursor, each event's affected mined rows queued in the cursor's
-        // batch, then eight queued re-asks drained.
-        meter
-            .phase(
-                "tracker.chain_events",
-                tracker_host::chain_events::run(&env),
-            )
-            .await;
         if let Err(e) = meter
             .phase("tracker.tick", tracker_host::runtime::tick(&env))
             .await
@@ -290,7 +299,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
             .await;
         pass_meter::end_task(&meter, routes::D1Sql::of(&env).ok().as_ref()).await;
     });
-    pot_hook::schedule_tick(&|f| ctx.wait_until(f), drain, tracker);
+    pot_hook::schedule_tick(&|f| ctx.wait_until(f), drain, intake, tracker);
 }
 
 #[event(fetch)]
@@ -581,7 +590,7 @@ fn router(
         .get_async(identity::BATCH_ROUTE, identity::get_batch)
         .get_async("/identity/*rest", identity::get_identity)
         .get("/epoch", routes::epoch)
-        .get("/health", routes::health)
+        .get_async("/health", routes::health)
         .or_else_any_method("/", routes::not_found)
         .or_else_any_method("/*catchall", routes::not_found)
 }
