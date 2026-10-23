@@ -5496,6 +5496,9 @@ async fn owed_recompute_inner(
     // 7b. bsv-low #837 (fix 2): a pass the outward budget CUT never serves fewer rows than the snapshot it replaces
     // without saying so: each previous row it did not derive is carried, marked `refresh: "shed"` and no press
     // (`owed::carry_shed_rows`). One read, on a cut pass only; a faulted read leaves the pass's rows as derived.
+    // bsv-low #859: a previous row of a subject this pass HOLDS (a hop, result or refund entry of that outpoint) is
+    // the pass's judgement, not carried: the admitted JOIN's hop loses its door strand in the recompute that admits
+    // the pot, cut or not (loop 46 pair 16 carried it for three minutes past the admission).
     if budget_cut {
         let previous = match db
             .prepare(crate::owed::OWED_ROWS_READ_SQL)
