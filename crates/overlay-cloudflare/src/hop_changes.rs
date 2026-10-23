@@ -95,6 +95,8 @@ pub const COUNTER_HOP_CHANGED_RESENT: &str = "hop_changed_resent_total";
 /// Served on `/health/invariants`, derived on the read: `retried + deferred - resent`, the note-backs never
 /// re-sent (lost with an isolate when it stays above 0; see [`crate::change_flush`]).
 pub const HOP_CHANGED_NOTED_BACK_UNRESENT: &str = "hop_changed_noted_back_unresent";
+/// bsv-low #560 (B-COST-1): new note-backs parked in the D1 outbox (`change_parked`, kind `hop`).
+pub const COUNTER_HOP_CHANGED_OUTBOXED: &str = "hop_changed_outboxed_total";
 /// The app layer's own count of the identities a body carried past its cap (it writes this row; pinned equal
 /// to its `COUNTER_HOP_CHANGED_DROPPED` from its tests).
 pub const COUNTER_HOP_CHANGED_DROPPED: &str = "hop_changed_dropped_total";
@@ -107,6 +109,7 @@ pub(crate) const COUNTERS: crate::change_flush::FlushCounters =
         retry_failed: COUNTER_HOP_CHANGED_RETRY_FAILED,
         resent: COUNTER_HOP_CHANGED_RESENT,
         noted_back_unresent: HOP_CHANGED_NOTED_BACK_UNRESENT,
+        outboxed: COUNTER_HOP_CHANGED_OUTBOXED,
     };
 
 thread_local! {
@@ -135,12 +138,45 @@ where
 /// What a flush owes after its POSTs ([`crate::change_flush::settle`] over this set's memory): the deferred part
 /// and a failed POST's entries (once) are noted back for the next flush. Returns the flush's account.
 pub fn settle(shipped: &crate::change_flush::Shipped<String>) -> crate::change_flush::Tally {
-    let (back, tally) =
-        NOTED_BACK.with(|m| crate::change_flush::settle(&mut m.borrow_mut(), shipped));
+    settle_noting(shipped).0
+}
+
+/// [`settle`], answering also the flush's NEW note-backs (bsv-low #560: what [`settle_and_park`] parks).
+fn settle_noting(
+    shipped: &crate::change_flush::Shipped<String>,
+) -> (crate::change_flush::Tally, Vec<String>) {
+    let (back, fresh, tally) =
+        NOTED_BACK.with(|m| crate::change_flush::settle_noting(&mut m.borrow_mut(), shipped));
     for id in back {
         insert(id);
     }
-    tally
+    (tally, fresh)
+}
+
+/// bsv-low #560 (B-COST-1): [`settle`], then the NEW note-backs parked in the D1 outbox (kind `hop`; the pot set's
+/// `settle_and_park`, the same rule).
+pub(crate) async fn settle_and_park<P: crate::change_park::ParkPort, A, F>(
+    port: &P,
+    shipped: &crate::change_flush::Shipped<String>,
+    now_ms: u64,
+    account: A,
+) -> (crate::change_flush::Tally, crate::change_park::Outboxed)
+where
+    A: FnOnce(crate::change_flush::Tally) -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let (tally, fresh) = settle_noting(shipped);
+    // the lens's LOW-2: the flush's account FIRST, so a task cancelled during the park's batch keeps its counters
+    account(tally).await;
+    let parked = crate::change_park::park_noted_back(
+        port,
+        crate::change_park::KIND_HOP,
+        fresh,
+        COUNTER_HOP_CHANGED_OUTBOXED,
+        now_ms,
+    )
+    .await;
+    (tally, parked)
 }
 
 /// Ship one flush: the identities in POSTs of at most [`HOP_CHANGED_CHUNK`], one after another, no POST started
@@ -179,8 +215,25 @@ pub async fn ship(env: Env, identities: Vec<String>, deadline_ms: u64) {
             shipped.posts
         );
     }
-    let tally = settle(&shipped);
-    crate::change_flush::account(&env, "hop-changes", &COUNTERS, total, tally).await;
+    // bsv-low #560: the flush's account, then the note-backs into the D1 outbox too (the lens's LOW-2: the account
+    // before the park's batch; no binding: memory only, as before, logged)
+    let account =
+        |tally| crate::change_flush::account(&env, "hop-changes", &COUNTERS, total, tally);
+    match env.d1("OVERLAY_DB") {
+        Ok(db) => {
+            settle_and_park(
+                &crate::change_park::WorkerPark { db: &db },
+                &shipped,
+                Date::now().as_millis(),
+                account,
+            )
+            .await;
+        }
+        Err(_) => {
+            console_log!("[hop-changes] no OVERLAY_DB: the flush's note-backs stay in the isolate's memory only");
+            account(settle(&shipped)).await;
+        }
+    }
 }
 
 #[cfg(test)]

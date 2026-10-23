@@ -999,7 +999,7 @@
    "readers": [],
    "rebuild_class": "transient",
    "never_wipe": false,
-   "holds": "the pot and hop change notes a background flush of an admit-fast job withheld for want of its waitUntil window (bsv-low #649 M1), one row per (set, entry) with its first park stamp; the cron delivers the oldest 128 a set a tick through the change flush and deletes only the rows of POSTs the app layer accepted",
+   "holds": "the pot and hop change notes a background flush of an admit-fast job withheld for want of its waitUntil window (bsv-low #649 M1), and every flush's new note-backs of the pot, hop and lobby sets (bsv-low #560, the outbox), one row per (set, entry) with its first park stamp; the cron delivers the oldest 128 a set a tick through the change flush and deletes only the rows of POSTs the app layer accepted",
    "why": "a skipped flush's notes were in one isolate's memory only and a lone eviction could lose its push for good; a lost row costs one push the felt's own reads recover; transient"
   },
   {

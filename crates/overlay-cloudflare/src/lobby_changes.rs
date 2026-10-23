@@ -73,6 +73,8 @@ pub const COUNTER_LOBBY_CHANGED_RESENT: &str = "lobby_changed_resent_total";
 /// Served on `/health/invariants`, derived on the read: `retried + deferred - resent`, the note-backs never
 /// re-sent (lost with an isolate when it stays above 0; see [`crate::change_flush`]).
 pub const LOBBY_CHANGED_NOTED_BACK_UNRESENT: &str = "lobby_changed_noted_back_unresent";
+/// bsv-low #560 (B-COST-1): new note-backs parked in the D1 outbox (`change_parked`, kind `lobby`).
+pub const COUNTER_LOBBY_CHANGED_OUTBOXED: &str = "lobby_changed_outboxed_total";
 /// The app layer's own count of the changes a body carried past its cap (it writes this row; pinned equal to
 /// its `COUNTER_LOBBY_CHANGED_DROPPED` from its tests).
 pub const COUNTER_LOBBY_CHANGED_DROPPED: &str = "lobby_changed_dropped_total";
@@ -85,6 +87,7 @@ pub(crate) const COUNTERS: crate::change_flush::FlushCounters =
         retry_failed: COUNTER_LOBBY_CHANGED_RETRY_FAILED,
         resent: COUNTER_LOBBY_CHANGED_RESENT,
         noted_back_unresent: LOBBY_CHANGED_NOTED_BACK_UNRESENT,
+        outboxed: COUNTER_LOBBY_CHANGED_OUTBOXED,
     };
 
 thread_local! {
@@ -113,12 +116,49 @@ where
 /// What a flush owes after its POSTs ([`crate::change_flush::settle`] over this set's memory): the deferred part
 /// and a failed POST's entries (once) are noted back for the next flush. Returns the flush's account.
 pub fn settle(shipped: &crate::change_flush::Shipped<Change>) -> crate::change_flush::Tally {
-    let (back, tally) =
-        NOTED_BACK.with(|m| crate::change_flush::settle(&mut m.borrow_mut(), shipped));
+    settle_noting(shipped).0
+}
+
+/// [`settle`], answering also the flush's NEW note-backs (bsv-low #560: what [`settle_and_park`] parks).
+fn settle_noting(
+    shipped: &crate::change_flush::Shipped<Change>,
+) -> (crate::change_flush::Tally, Vec<Change>) {
+    let (back, fresh, tally) =
+        NOTED_BACK.with(|m| crate::change_flush::settle_noting(&mut m.borrow_mut(), shipped));
     for (txid, vout, kind) in &back {
         note(txid, *vout, kind);
     }
-    tally
+    (tally, fresh)
+}
+
+/// bsv-low #560 (B-COST-1): [`settle`], then the NEW note-backs parked in the D1 outbox (kind `lobby`, item
+/// `txid:vout:kind`; the pot set's `settle_and_park`, the same rule).
+pub(crate) async fn settle_and_park<P: crate::change_park::ParkPort, A, F>(
+    port: &P,
+    shipped: &crate::change_flush::Shipped<Change>,
+    now_ms: u64,
+    account: A,
+) -> (crate::change_flush::Tally, crate::change_park::Outboxed)
+where
+    A: FnOnce(crate::change_flush::Tally) -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let (tally, fresh) = settle_noting(shipped);
+    // the lens's LOW-2: the flush's account FIRST, so a task cancelled during the park's batch keeps its counters
+    account(tally).await;
+    let items = fresh
+        .iter()
+        .map(|(t, v, k)| crate::change_park::lobby_item(t, *v, k))
+        .collect();
+    let parked = crate::change_park::park_noted_back(
+        port,
+        crate::change_park::KIND_LOBBY,
+        items,
+        COUNTER_LOBBY_CHANGED_OUTBOXED,
+        now_ms,
+    )
+    .await;
+    (tally, parked)
 }
 
 /// Ship one flush through the APP_LAYER service binding (a plain fetch between two Workers on one zone is
@@ -158,8 +198,25 @@ pub async fn ship(env: Env, changes: Vec<Change>) {
             shipped.posts
         );
     }
-    let tally = settle(&shipped);
-    crate::change_flush::account(&env, "lobby-changes", &COUNTERS, total, tally).await;
+    // bsv-low #560: the flush's account, then the note-backs into the D1 outbox too (the lens's LOW-2: the account
+    // before the park's batch; no binding: memory only, as before, logged)
+    let account =
+        |tally| crate::change_flush::account(&env, "lobby-changes", &COUNTERS, total, tally);
+    match env.d1("OVERLAY_DB") {
+        Ok(db) => {
+            settle_and_park(
+                &crate::change_park::WorkerPark { db: &db },
+                &shipped,
+                Date::now().as_millis(),
+                account,
+            )
+            .await;
+        }
+        Err(_) => {
+            console_log!("[lobby-changes] no OVERLAY_DB: the flush's note-backs stay in the isolate's memory only");
+            account(settle(&shipped)).await;
+        }
+    }
 }
 
 /// Drain and ship under the given `wait_until`. One call per unit of work.
@@ -175,8 +232,16 @@ pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// The pins' isolate END (bsv-low #560): the set's notes and its memory of note-backs are gone, as with an
+    /// evicted isolate.
+    pub(crate) fn end_isolate() {
+        drain();
+        NOTED_BACK.with(|m| m.borrow_mut().clear());
+    }
+
 
     #[test]
     fn note_dedupes_by_outpoint_and_kind_and_drain_empties() {
