@@ -330,6 +330,7 @@
       "crate::admit_fast::evict_txid_everywhere(",
       "crate::pot_changes::flush_inline(",
       "crate::queue::enqueue_replay(",
+      "crate::ops::renote_latched_seen(",
       "the #413 belt: SELECT 1 AS one FROM transactions WHERE txid = lower(?)",
       "the #413 belt: SELECT 1 AS one FROM pot_records WHERE txid = lower(?) LIMIT 1"
     ],

@@ -197,7 +197,7 @@ fn headers_for(proof: &Proof) -> HeaderSnapshot {
 /// `raw_bytes` is false), a pushed proof then the held one checked against our header, the projection, the mined
 /// marker and the guarded upsert. Not modelled: the Arcade GETs of `callback` and a tick's re-ask (`hook_may_reask`,
 /// reached only when no proof checked), and a stranger tick's courier leg (a held subject is first party).
-async fn tx_word(db: &Connection, hold_sql: &str, body: String, now: u64) -> Result<(), String> {
+async fn tx_word(db: &Connection, hold_sql: &str, body: String, now: u64) -> Result<bool, String> {
     let frame: Value = serde_json::from_str(&body).unwrap();
     let txid = frame["txid"].as_str().unwrap().to_ascii_lowercase();
     let kind = frame["kind"].as_str().unwrap_or("refresh").to_string();
@@ -248,10 +248,14 @@ async fn tx_word(db: &Connection, hold_sql: &str, body: String, now: u64) -> Res
     })
     .await
     .map_err(|e| e.to_string())?;
+    let held = row.is_some();
     if let Some(row) = row {
         write(db, &row);
     }
-    Ok(())
+    // the handler's answer, as the overlay reads it (B-OWED-3-FOLD L2)
+    Ok(tracker_events::answered_held(
+        &runtime::ingest_answer(held).to_string(),
+    ))
 }
 
 /// Ship what the overlay noted, through its real `drain` and `deliver`, into the handler.
@@ -691,4 +695,242 @@ fn i757_the_live_hold_is_two_index_probes() {
         "{plan:?}"
     );
     assert!(!plan.iter().any(|p| p.starts_with("SCAN")), "{plan:?}");
+}
+
+/// bsv-low #660 (B-OWED-3-FOLD, the lens's M1): a settle's `seen` LATCHED BEFORE the engine's mark lands (the dual
+/// push and the pending watch are spawned before the write and run beside it) is dropped as unheld at the app layer;
+/// the submit route then RE-NOTES the latched pair after the write (`ops::renote_latched_seen`, the shipped
+/// `NETWORK_SEEN_PAIR_SQL` here), so the request's first flush ships the `seen` before the pot note, now held, and
+/// the request's own `built` (a later flush) does not undo it. RED with `note_latched_seen` inert: `built`.
+#[tokio::test]
+async fn b_owed_3_m1_a_seen_latched_before_the_mark_is_renoted_once_the_mark_lands() {
+    let db = db();
+    let funding = pot(20);
+    let (settle, beef) = settle_tx(20, None);
+    retain(&db, &settle, &beef);
+    seed_built(&db, &settle, 1_000);
+    // the dual push latches first: the latch's row (its shipped insert) and its frame
+    db.execute(
+        bsv_overlay_cloudflare::ops::NETWORK_SEEN_INSERT_SQL,
+        params![settle, SeenSource::Arcade.wire(), 1_000_500_i64],
+    )
+    .unwrap();
+    tracker_events::drain();
+    latch_seen(&settle, 1_000_500);
+    ship(&db, stored::LIVE_HOLD, 1_001).await;
+    assert_eq!(
+        read(&db, &settle).unwrap().word,
+        "built",
+        "a latch that beat the mark is dropped as unheld (the lens's M1, made visible)"
+    );
+    // the engine's mark lands, then the route's re-note from the latched pair
+    pot_spent_by(&db, &funding, 0, &settle);
+    let pair: Option<(Option<String>, Option<i64>)> = db
+        .query_row(
+            bsv_overlay_cloudflare::ops::NETWORK_SEEN_PAIR_SQL,
+            [&settle],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .unwrap();
+    let pair = pair.and_then(|(s, at)| Some((s?, at?)));
+    assert_eq!(pair, Some(("arcade".to_string(), 1_000_500)));
+    tracker_events::note_latched_seen(&settle, pair.as_ref().map(|(s, at)| (s.as_str(), *at)));
+    ship(&db, stored::LIVE_HOLD, 1_002).await;
+    let row = read(&db, &settle).unwrap();
+    assert_eq!(
+        (row.word.as_str(), row.hint_source.as_deref(), row.hint_at),
+        ("seen", Some("arcade"), Some(1_000.0)),
+        "the re-noted seen is held once the mark landed"
+    );
+    let w = BTreeMap::from([(settle.clone(), row.view())]);
+    assert_eq!(coin_landing(w.get(&settle), Some(true)), CoinLanding::Awaiting);
+    // the request's `built` rides the dispatch's later flush: the word stays `seen`
+    tracker_events::note_submit(&settle, true, true);
+    ship(&db, stored::LIVE_HOLD, 1_003).await;
+    assert_eq!(read(&db, &settle).unwrap().word, "seen", "a later built undid the seen");
+    // a row latched before #621 has no source: nothing re-noted
+    assert!(!tracker_events::note_latched_seen(&settle, None));
+    assert!(tracker_events::drain().is_empty());
+}
+
+/// The route's half of M1, by source: the re-note is made after the engine write and before the request's first
+/// flush (the settle's `total_admitted == 0` flush) and `note_submit`, for a consuming submit only; the re-note reads
+/// the latch's pair and queues the latch's own body. RED on b29b684c: no re-note.
+#[test]
+fn b_owed_3_m1_the_route_renotes_after_the_write_before_the_first_flush() {
+    let routes = include_str!("../../overlay-cloudflare/src/routes.rs");
+    let at = |needle: &str, from: usize| -> usize {
+        from + routes[from..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("routes.rs: {needle}"))
+    };
+    let write = at("engine.submit_with_report(&tagged_beef, mode).await", 0);
+    let renote = at("crate::ops::renote_latched_seen(&seen_db, subject).await;", write);
+    let flush = at("crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));", write);
+    let submit = at("crate::tracker_events::note_submit(", write);
+    assert!(
+        renote < flush && renote < submit,
+        "the re-note precedes the first flush ({renote} vs {flush}) and note_submit ({submit})"
+    );
+    let guard = &routes[renote.saturating_sub(600)..renote];
+    assert!(
+        guard.contains("!a.coins_to_retain.is_empty()") && guard.contains("a.coins_removed"),
+        "the re-note is for a consuming submit"
+    );
+    let ops = include_str!("../../overlay-cloudflare/src/ops.rs");
+    let f = &ops[ops.find("pub async fn renote_latched_seen(").unwrap()..];
+    let f = &f[..f.find("\n}\n").unwrap()];
+    assert!(f.contains("Query::new(NETWORK_SEEN_PAIR_SQL)"));
+    assert!(f.contains("crate::tracker_events::note_latched_seen("));
+    // the re-noted body is the latch's own
+    assert_eq!(
+        tracker_events::seen_body(SeenSource::Arcade.wire(), 7),
+        json!({"source": SeenSource::Arcade.wire(), "at": 7})
+    );
+}
+
+/// bsv-low #660 (B-OWED-3-FOLD, the lens's L2): a frame the app layer drops as unheld is NAMED on both sides: the
+/// handler answers `held: false` (and counts `applayer_tracker_event_unheld_total`, mirrored, seeded by the
+/// overlay) and the overlay counts it `tracker_events_<source>_unheld_total`, never `shipped`. RED on b29b684c's
+/// `deliver` (no answer read): the unheld frame counted `shipped`.
+#[tokio::test]
+async fn b_owed_3_l2_an_unheld_frame_is_counted_unheld_on_both_sides() {
+    let db = db();
+    let count = |name: &str| tracker_events::health_json()[name].as_u64().unwrap_or(0);
+    let (shipped, unheld) = (
+        count("tracker_events_arcade_shipped_total"),
+        count("tracker_events_arcade_unheld_total"),
+    );
+    // a settle whose mark has not landed: the latch's seen is dropped
+    let (settle, beef) = settle_tx(30, None);
+    retain(&db, &settle, &beef);
+    seed_built(&db, &settle, 1_000);
+    tracker_events::drain();
+    latch_seen(&settle, 1_000_500);
+    ship(&db, stored::LIVE_HOLD, 1_001).await;
+    assert_eq!(read(&db, &settle).unwrap().word, "built");
+    assert_eq!(
+        (
+            count("tracker_events_arcade_shipped_total") - shipped,
+            count("tracker_events_arcade_unheld_total") - unheld
+        ),
+        (0, 1),
+        "the unheld drop is named, never counted shipped"
+    );
+    // held: shipped
+    pot_spent_by(&db, &pot(31), 0, &settle);
+    latch_seen(&settle, 1_000_600);
+    ship(&db, stored::LIVE_HOLD, 1_002).await;
+    assert_eq!(read(&db, &settle).unwrap().word, "seen");
+    assert_eq!(count("tracker_events_arcade_shipped_total") - shipped, 1);
+    // the answer's words, and an app layer before the fold (no `held`) read as held
+    assert!(!tracker_events::answered_held(r#"{"ok":true,"held":false}"#));
+    assert!(tracker_events::answered_held(r#"{"ok":true,"held":true}"#));
+    assert!(tracker_events::answered_held(r#"{"ok":true}"#));
+    // the handler counts the drop and answers it; the route takes the counters on its answer
+    let runtime_src: String = include_str!("../src/tracker_host/runtime.rs")
+        .split_whitespace()
+        .collect();
+    let ingest = &runtime_src[runtime_src.find("pubasyncfningest(").unwrap()..];
+    let ingest = &ingest[..ingest.find("pubconstCOUNTER_TRACKER_EVENT_UNHELD").unwrap()];
+    assert!(ingest.contains("if!held{note_unheld();}"));
+    assert!(ingest.contains("Response::from_json(&ingest_answer(held))"));
+    let lib: String = include_str!("../src/lib.rs").split_whitespace().collect();
+    let door = &lib[lib.find("req.path()==\"/internal/tx-word\"{").unwrap()..];
+    assert!(door[..door.find("returnresp;").unwrap()].contains("flush_counters_if_due(&ctx,&env);"));
+    assert!(bsv_overlay_cloudflare::applayer_counters::names()
+        .contains(&runtime::COUNTER_TRACKER_EVENT_UNHELD.to_string()));
+}
+
+/// bsv-low #660 (B-OWED-3-FOLD, the lens's L4, its F5): the BEHAVIOURAL pin of the flush's order, through the ONE
+/// function the three flushes call (`tracker_events::ship_in_order`, reached by `ship_then`). (1) The words' transport
+/// is the `/internal/tx-word` handler's steps (which write before they answer); the notes' step, when it runs, does
+/// what the pot hook's recompute does with the settle's word (`coin_landing` over the stored view): the settle's `seen`
+/// is already written, `Awaiting`. RED with the notes run before the words: `Withheld` (the word still `built`).
+/// (2) The deadline (L3's slice) over a fake clock: 25 frames at 1 s each under a 20 s wall: 10 before the notes, the
+/// notes run at 10 s (before the deadline, so they ship), 10 after, 5 walled and retried once. RED with no slice
+/// (the words under the whole wall): the notes run AT the deadline and every note is deferred.
+#[tokio::test]
+async fn b_owed_3_l4_f5_the_flush_ships_the_words_then_the_notes_under_one_deadline() {
+    use std::cell::{Cell, RefCell};
+    // (1) the order, through the handler's steps
+    let db = db();
+    let (funding, settle) = (pot(40), pot(41));
+    pot_spent_by(&db, &funding, 0, &settle);
+    seed_built(&db, &settle, 1_000);
+    tracker_events::drain();
+    latch_seen(&settle, 1_000_500);
+    let landing = RefCell::new(None);
+    let shipped = tracker_events::ship_in_order(
+        tracker_events::drain(),
+        |body| tx_word(&db, stored::LIVE_HOLD, body, 1_001),
+        |_deadline| async {
+            let w = BTreeMap::from([(settle.clone(), read(&db, &settle).unwrap().view())]);
+            *landing.borrow_mut() = Some(coin_landing(w.get(&settle), Some(true)));
+        },
+        || 0,
+        20_000,
+    )
+    .await;
+    assert_eq!(
+        *landing.borrow(),
+        Some(CoinLanding::Awaiting),
+        "the note's recompute reads the word the same flush shipped"
+    );
+    assert_eq!(
+        shipped,
+        tracker_events::WordsShipped {
+            before_notes: 1,
+            after_notes: 0,
+            walled: 0
+        }
+    );
+    // (2) the deadline: 25 frames at 1 s each, a 20 s wall
+    tracker_events::drain();
+    let clock = Cell::new(0_u64);
+    let notes_at = Cell::new(None);
+    for n in 0..25u8 {
+        tracker_events::note(&pot(100 + n), "seen", Some(json!({"source": "arcade", "at": 1})));
+    }
+    let shipped = tracker_events::ship_in_order(
+        tracker_events::drain(),
+        |_body| {
+            clock.set(clock.get() + 1_000);
+            async { Ok(true) }
+        },
+        |deadline| {
+            notes_at.set(Some((clock.get(), deadline)));
+            async {}
+        },
+        || clock.get(),
+        20_000,
+    )
+    .await;
+    let (at, deadline) = notes_at.get().unwrap();
+    assert!(
+        at < deadline,
+        "the notes start before the deadline under a word flood (at {at} of {deadline})"
+    );
+    assert_eq!(at, tracker_events::WORDS_SHARE_MS);
+    assert_eq!(
+        shipped,
+        tracker_events::WordsShipped {
+            before_notes: 10,
+            after_notes: 10,
+            walled: 5
+        }
+    );
+    let retry = tracker_events::drain();
+    assert_eq!(retry.len(), 5, "the walled frames are retried once");
+    assert!(retry.iter().all(|f| f["retry"] == true));
+    // the app layer answers after its write (the handler's source)
+    let runtime_src: String = include_str!("../src/tracker_host/runtime.rs")
+        .split_whitespace()
+        .collect();
+    let ingest = &runtime_src[runtime_src.find("pubasyncfningest(").unwrap()..];
+    assert!(
+        ingest.find("event(env,&id,kind,").unwrap() < ingest.find("Response::from_json(").unwrap(),
+        "the handler writes before it answers"
+    );
 }

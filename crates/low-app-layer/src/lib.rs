@@ -304,7 +304,10 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let schema_ready = d1_ledger::boot(schema::ensure_latch_columns(&env)).await;
 
     if req.method() == worker::Method::Post && req.path() == "/internal/tx-word" {
-        return tracker_host::runtime::ingest(req, &env).await;
+        // bsv-low #660 (B-OWED-3-FOLD L2): the answer takes the counters, so an unheld drop reaches `ops_counters`
+        let resp = tracker_host::runtime::ingest(req, &env).await;
+        flush_counters_if_due(&ctx, &env);
+        return resp;
     }
     // bsv-low #771 FIX-771-L1: the operator's chain-event cursor lever (POST sets, GET reads; bearer INTERNAL_TOKEN).
     if req.path() == "/internal/chain-events-cursor" {

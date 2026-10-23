@@ -41,6 +41,28 @@ pub fn note(txid: &str, kind: &str, body: Option<Value>) {
         json!({"txid":txid.to_ascii_lowercase(),"kind":kind,"body":body.unwrap_or(Value::Null)}),
     );
 }
+/// bsv-low #660 (B-OWED-3-FOLD, the lens's M1): the `seen` frame of a `network_seen` latch, its body exactly the
+/// latch's own (`ops::latch_network_seen`): the broadcaster that said SEEN and its stamp in ms.
+pub fn seen_body(source: &str, at_ms: i64) -> Value {
+    json!({"source": source, "at": at_ms})
+}
+
+/// bsv-low #660 (B-OWED-3-FOLD M1): RE-NOTE a latch that beat the engine's mark. The dual push and the pending
+/// watch are spawned before the engine write and run beside it, so a settle's `seen` can be latched, shipped and
+/// DROPPED as unheld at the app layer (no `pot_records.spendingTxid` names it yet) before `mark_spent` lands; nothing
+/// re-sent it, and the winner's owed row read `built` (Withheld) until the block. The submit route calls this after
+/// the engine write, for a consuming submit, with the subject's latched pair (`ops::NETWORK_SEEN_PAIR_SQL`): the
+/// request's first flush then ships the `seen` before the pot note the mark made, and the hold now exists. A row
+/// latched before #621 carries no source and is not re-noted (the latch's body needs one). Answers whether it noted.
+pub fn note_latched_seen(txid: &str, latched: Option<(&str, i64)>) -> bool {
+    match latched {
+        Some((source, at_ms)) => {
+            note(txid, "seen", Some(seen_body(source, at_ms)));
+            true
+        }
+        None => false,
+    }
+}
 /// Submit hook admission boundary, shared by the route and native pin.
 pub fn note_submit(txid: &str, gated: bool, admitted_any: bool) {
     if gated && admitted_any {
@@ -83,6 +105,30 @@ pub async fn note_held(
     }
 }
 
+/// bsv-low #660 (B-OWED-3-FOLD, the lens's L1): a COPY of every queued frame under its key, the set left as it is
+/// (a background flush's skip parks the copy beside the pot and hop notes and [`forget`]s only what its park landed).
+pub fn snapshot() -> Vec<((String, String), Value)> {
+    EVENTS.with(|e| {
+        e.borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    })
+}
+
+/// B-OWED-3-FOLD L1: take `parked` out of the queue, each ONLY while it holds the frame the snapshot read (a frame of
+/// the same key queued since stays; the queue keeps the first frame of a key, so in practice that is a retry flag).
+pub fn forget(parked: &[((String, String), Value)]) {
+    EVENTS.with(|e| {
+        let mut events = e.borrow_mut();
+        for (key, frame) in parked {
+            if events.get(key) == Some(frame) {
+                events.remove(key);
+            }
+        }
+    });
+}
+
 /// Take every queued event.
 pub fn drain() -> Vec<Value> {
     EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()).into_values().collect())
@@ -95,14 +141,26 @@ fn failed(mut frame: Value) {
         enqueue(frame);
     }
 }
-/// The production POST boundary, also used by the refusal/recovery pin.
+/// PURE (bsv-low #660, B-OWED-3-FOLD L2): whether `/internal/tx-word`'s 2xx answer says the frame was HELD (written).
+/// An app layer before the fold answers `{"ok":true}` alone: held, as it was counted.
+pub fn answered_held(answer: &str) -> bool {
+    serde_json::from_str::<Value>(answer)
+        .ok()
+        .and_then(|v| v.get("held").and_then(Value::as_bool))
+        .unwrap_or(true)
+}
+
+/// The production POST boundary, also used by the refusal/recovery pin. The post answers `Ok(held)`: a frame the
+/// app layer held is counted `shipped`; one it dropped as unheld (B-OWED-3-FOLD L2) `unheld`, never `shipped`; a
+/// refused POST is retried once.
 pub async fn deliver<F, Fut>(frame: Value, post: F)
 where
     F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = Result<(), String>>,
+    Fut: std::future::Future<Output = Result<bool, String>>,
 {
     match post(frame.to_string()).await {
-        Ok(()) => count(&frame, "shipped"),
+        Ok(true) => count(&frame, "shipped"),
+        Ok(false) => count(&frame, "unheld"),
         Err(_) => failed(frame),
     }
 }
@@ -110,35 +168,115 @@ where
 pub fn health_json() -> Value {
     COUNTS.with(|c| json!(*c.borrow()))
 }
-/// Ship `events` under a 20 s deadline of their own ([`ship_until`]).
-pub async fn ship(env: &worker::Env, events: Vec<Value>) {
-    ship_until(env, events, worker::Date::now().as_millis() + 20_000).await;
+/// bsv-low #660 (B-OWED-3-FOLD, the lens's L3): the words' reserved SLICE of a flush's one wall. The words go first
+/// (a note triggers the owed recompute, which reads the spender's word), but a word flood (the tip pass, the cron, a
+/// queue batch: N `proof` frames beside N pot notes at a block) took the whole wall and deferred EVERY note of the
+/// flush to the isolate's next one. So the words start under `min(deadline, start + WORDS_SHARE_MS)`, then the hop
+/// and pot notes under the deadline, then the words left under the deadline (a frame the wall stops keeps its once
+/// retry). Stated: a frame past the slice reaches the app layer after the notes of its flush.
+pub const WORDS_SHARE_MS: u64 = 10_000;
+
+/// What one ordered flush did with its word frames ([`ship_in_order`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WordsShipped {
+    /// Frames POSTed before the notes (inside the slice).
+    pub before_notes: usize,
+    /// Frames POSTed after the notes (past the slice, before the deadline).
+    pub after_notes: usize,
+    /// Frames the deadline stopped (counted `walled`, retried once on the next flush).
+    pub walled: usize,
 }
-/// bsv-low #649: [`ship`] under a deadline the caller holds (a background flush's one window, shared with
-/// the pot and hop sets, never a 20 s of its own on top).
-pub async fn ship_until(env: &worker::Env, events: Vec<Value>, deadline: u64) {
-    if events.is_empty() {
-        return;
-    }
-    let configured = crate::change_flush::configured(env);
-    for frame in events {
-        if worker::Date::now().as_millis() >= deadline {
-            count(&frame, "walled");
-            failed(frame);
+
+async fn post_frames<P, Fut, C>(
+    frames: Vec<Value>,
+    post: &mut P,
+    now_ms: &C,
+    until_ms: u64,
+    last: bool,
+) -> (usize, Vec<Value>)
+where
+    P: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+    C: Fn() -> u64,
+{
+    let (mut posted, mut left) = (0, Vec::new());
+    for frame in frames {
+        if now_ms() >= until_ms {
+            if last {
+                count(&frame, "walled");
+                failed(frame.clone());
+            }
+            left.push(frame);
             continue;
         }
-        let Some((url, token)) = &configured else {
-            count(&frame, "dropped");
-            continue;
-        };
-        deliver(frame, |body| async {
-            crate::change_flush::post_body(env, url, token, "/internal/tx-word", "tx-word", body)
-                .await
-                .map(|_| ())
-                .map_err(|_| "undelivered".to_string())
-        })
-        .await;
+        posted += 1;
+        deliver(frame, &mut *post).await;
     }
+    (posted, left)
+}
+
+/// THE ONE ORDER of a flush (bsv-low #660 under #618; B-OWED-3-FOLD L3 and L4), over any transport: the word frames,
+/// each POST awaited, under the words' slice ([`WORDS_SHARE_MS`]); then `notes(deadline_ms)` (the hop and pot sets,
+/// which start no POST at or past the deadline); then the frames left under the deadline. The app layer writes a
+/// frame before it answers, so a note shipped after a word's answer triggers a recompute that reads that word.
+pub async fn ship_in_order<P, Fut, N, NFut, C>(
+    words: Vec<Value>,
+    mut post: P,
+    notes: N,
+    now_ms: C,
+    deadline_ms: u64,
+) -> WordsShipped
+where
+    P: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+    N: FnOnce(u64) -> NFut,
+    NFut: std::future::Future<Output = ()>,
+    C: Fn() -> u64,
+{
+    let slice_ms = deadline_ms.min(now_ms().saturating_add(WORDS_SHARE_MS));
+    let (before_notes, left) = post_frames(words, &mut post, &now_ms, slice_ms, false).await;
+    notes(deadline_ms).await;
+    let (after_notes, walled) = post_frames(left, &mut post, &now_ms, deadline_ms, true).await;
+    WordsShipped {
+        before_notes,
+        after_notes,
+        walled: walled.len(),
+    }
+}
+
+/// [`ship_in_order`] on the Worker: the frames to the app layer's `/internal/tx-word` (each answer read for `held`,
+/// L2), then `notes`, under the flush's ONE deadline (bsv-low #649: never a 20 s of the words' own on top). An
+/// unconfigured deploy drops the frames (counted) and still runs the notes (which log their own refusal).
+pub async fn ship_then<N, NFut>(env: &worker::Env, events: Vec<Value>, notes: N, deadline_ms: u64)
+where
+    N: FnOnce(u64) -> NFut,
+    NFut: std::future::Future<Output = ()>,
+{
+    let configured = crate::change_flush::configured(env);
+    let words = match configured {
+        Some(_) => events,
+        None => {
+            for frame in &events {
+                count(frame, "dropped");
+            }
+            Vec::new()
+        }
+    };
+    let (url, token) = configured.unwrap_or_default();
+    let (url, token) = (url.as_str(), token.as_str());
+    ship_in_order(
+        words,
+        |body| async move {
+            crate::change_flush::post_body_answer(env, url, token, "/internal/tx-word", "tx-word", body)
+                .await
+                .map(|answer| answered_held(&answer))
+                .map_err(|_| "undelivered".to_string())
+        },
+        notes,
+        || worker::Date::now().as_millis(),
+        deadline_ms,
+    )
+    .await;
     let pending = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
     if let Ok(db) = env.d1("OVERLAY_DB") {
         for (name, n) in pending {
@@ -161,7 +299,7 @@ mod tests {
         let retry = drain();
         assert_eq!(retry.len(), 1);
         assert_eq!(retry[0]["body"]["merklePath"], "00");
-        deliver(retry.into_iter().next().unwrap(), |_| async { Ok(()) }).await;
+        deliver(retry.into_iter().next().unwrap(), |_| async { Ok(true) }).await;
         assert!(drain().is_empty());
         assert_eq!(health_json()["tracker_events_index_shipped_total"], 1);
     }

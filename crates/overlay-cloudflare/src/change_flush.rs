@@ -294,6 +294,21 @@ pub async fn post_body(
     tag: &str,
     body: String,
 ) -> std::result::Result<usize, ()> {
+    post_body_answer(env, url, token, path, tag, body)
+        .await
+        .map(|answer| answered_dropped(&answer))
+}
+
+/// [`post_body`], answering the app layer's 2xx body itself (bsv-low #660, B-OWED-3-FOLD L2: `/internal/tx-word`
+/// answers whether the frame was held).
+pub async fn post_body_answer(
+    env: &Env,
+    url: &str,
+    token: &str,
+    path: &str,
+    tag: &str,
+    body: String,
+) -> std::result::Result<String, ()> {
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
     let headers = Headers::new();
@@ -316,9 +331,7 @@ pub async fn post_body(
         Err(_) => Fetch::Request(req).send().await,
     };
     match sent {
-        Ok(mut r) if (200..300).contains(&r.status_code()) => {
-            Ok(answered_dropped(&r.text().await.unwrap_or_default()))
-        }
+        Ok(mut r) if (200..300).contains(&r.status_code()) => Ok(r.text().await.unwrap_or_default()),
         Ok(mut r) => {
             let status = r.status_code();
             let body = r.text().await.unwrap_or_default();
