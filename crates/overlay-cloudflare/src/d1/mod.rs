@@ -606,7 +606,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// read when it took the probe a memo records (NULL: a memo written before it, or by a writer with no tip). The app
 /// layer reads it (`hops_view::probe_memo_read_sql`), so epoch Rule 24 bites: its `LATCH_COLUMN_ALTERS` carry the
 /// same statement.
-pub const OVERLAY_MIGRATION_COUNT: usize = 342;
+/// 342 to 343 for bsv-low #635 (B-COST-1): `worker_cost_daily`, the cost bar's rows. The app layer WRITES it (the
+/// shared `d1_ledger` source) and carries no catch-up: a write that finds no table is restored into its isolate's
+/// window and written by a later take, once the overlay has migrated.
+pub const OVERLAY_MIGRATION_COUNT: usize = 343;
 
 /// bsv-low #808: the tip a hop's chain-probe memo was taken at (`low-app-layer` `hops_view::ProbeMemo::tip_height`).
 pub const HOP_CHAIN_PROBES_TIP_ALTER: &str =
@@ -2260,6 +2263,9 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // 342: bsv-low #808, the tip a hop's chain-probe memo was taken at. Additive: a memo written before carries NULL,
     // which the owed walk reads as "taken before the tip" for an unspent word (asked again, never offered on).
     HOP_CHAIN_PROBES_TIP_ALTER,
+    // 343: bsv-low #635 (B-COST-1), the cost bar's daily rows (one per UTC day and Worker), written by both Workers
+    // through `d1_ledger`'s cost window and served on `/health/invariants.costBar`. A new table: no row is touched.
+    crate::d1_ledger::COST_DAILY_CREATE,
 ];
 
 // =============================================================================

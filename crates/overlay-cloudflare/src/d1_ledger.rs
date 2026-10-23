@@ -101,6 +101,7 @@ pub fn statements_noted() -> u64 {
 /// pass in scope, if any: the two are independent, so a pass inside a request counts on both).
 pub fn note(reads: u64, writes: u64) {
     NOTED.with(|n| n.set(n.get().saturating_add(1)));
+    note_cost(reads, writes);
     if let Some(p) = PASS.with(|c| c.borrow().clone()) {
         let mut p = p.borrow_mut();
         let label = p.label;
@@ -454,6 +455,187 @@ pub async fn counted_page_batch(
     Ok(out)
 }
 
+// bsv-low #635 (B-COST-1): THE COST BAR. What this isolate cost the plan (fetch requests, D1 rows read, rows
+// written, statements), summed in a WINDOW and written durably to `worker_cost_daily` (one row per UTC day and
+// Worker, an additive upsert), so `/health/invariants.costBar` serves each Worker's day against the plan's included
+// quotas. The window is written ONE statement at a time: when it holds `COST_FLUSH_REQUESTS` requests, when
+// `COST_FLUSH_MS` have passed since this isolate's last take, or when the UTC day moved; never one write per
+// request. Per isolate and minute that is at most `ceil(R / 64) + 1` writes for R requests (the first take of a
+// fresh isolate is due at once). The window counts every statement this ledger notes ([`note`]: scoped or not, the
+// cron's and the queue's included), and the flush's own write lands in the next window. Stated: an isolate that
+// ends with a window unwritten loses it (an UNDER-count, never a wrong answer); a statement awaited through the bare
+// `worker` API is not noted (the ledger's seam, above); a window lands on the UTC day of its first request (or, with
+// no request, of its take), so one straddling midnight puts at most one window (60 s or 64 requests) on its first day.
+
+/// bsv-low #635: a window is written once it holds this many requests.
+pub const COST_FLUSH_REQUESTS: u64 = 64;
+/// bsv-low #635: a window is written once this long has passed since the isolate's last take.
+pub const COST_FLUSH_MS: f64 = 60_000.0;
+const DAY_MS: f64 = 86_400_000.0;
+
+/// bsv-low #635: the daily cost rows, one per UTC day and Worker (`worker` is the crate's package name: the overlay
+/// and the app layer share one D1). Both Workers write it through this one source; the overlay creates it.
+pub const COST_DAILY_CREATE: &str = "CREATE TABLE IF NOT EXISTS worker_cost_daily (day TEXT NOT NULL, worker TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0, rowsRead INTEGER NOT NULL DEFAULT 0, rowsWritten INTEGER NOT NULL DEFAULT 0, statements INTEGER NOT NULL DEFAULT 0, updatedAt INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, worker))";
+
+/// bsv-low #635: one window added to its day's row (a key search on the primary key; one row written).
+pub const COST_DAILY_UPSERT_SQL: &str = "INSERT INTO worker_cost_daily (day, worker, requests, rowsRead, rowsWritten, statements, updatedAt) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(day, worker) DO UPDATE SET requests = requests + excluded.requests, rowsRead = rowsRead + excluded.rowsRead, rowsWritten = rowsWritten + excluded.rowsWritten, statements = statements + excluded.statements, updatedAt = excluded.updatedAt";
+
+/// bsv-low #635: the name this Worker writes its rows under.
+pub const COST_WORKER: &str = env!("CARGO_PKG_NAME");
+
+/// bsv-low #635: one window of this isolate's cost, not yet written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CostWindow {
+    /// The UTC day (days since the epoch) of the window's first request; `None` when no request opened it.
+    pub day: Option<i64>,
+    /// Fetch requests.
+    pub requests: u64,
+    /// D1 rows read.
+    pub reads: u64,
+    /// D1 rows written.
+    pub writes: u64,
+    /// D1 statements.
+    pub stmts: u64,
+}
+
+impl CostWindow {
+    /// Nothing to write.
+    pub fn is_empty(&self) -> bool {
+        self.requests == 0 && self.stmts == 0
+    }
+}
+
+/// bsv-low #635: one window taken for its write, under the UTC day it lands on (`YYYY-MM-DD`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CostFlush {
+    /// The UTC day, `YYYY-MM-DD`.
+    pub day: String,
+    /// The window's figures.
+    pub window: CostWindow,
+}
+
+thread_local! {
+    static COST: Cell<CostWindow> = const { Cell::new(CostWindow { day: None, requests: 0, reads: 0, writes: 0, stmts: 0 }) };
+    static COST_LAST_TAKE_MS: Cell<f64> = const { Cell::new(f64::NEG_INFINITY) };
+}
+
+/// PURE: the UTC day (days since the epoch) of a unix-ms instant.
+pub fn utc_day(now_ms: f64) -> i64 {
+    (now_ms / DAY_MS).floor() as i64
+}
+
+/// PURE: a day since the epoch as `YYYY-MM-DD` (the proleptic Gregorian calendar, H. Hinnant's `civil_from_days`).
+pub fn utc_date(day: i64) -> String {
+    let z = day + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// PURE (bsv-low #635): is the window due for its write?
+pub fn cost_due(w: &CostWindow, now_ms: f64, last_take_ms: f64) -> bool {
+    if w.is_empty() {
+        return false;
+    }
+    w.requests >= COST_FLUSH_REQUESTS
+        || now_ms - last_take_ms >= COST_FLUSH_MS
+        || w.day.is_some_and(|d| d != utc_day(now_ms))
+}
+
+/// bsv-low #635: fold one statement into the isolate's cost window (called by [`note`]).
+fn note_cost(reads: u64, writes: u64) {
+    COST.with(|c| {
+        let mut w = c.get();
+        w.reads = w.reads.saturating_add(reads);
+        w.writes = w.writes.saturating_add(writes);
+        w.stmts = w.stmts.saturating_add(1);
+        c.set(w);
+    });
+}
+
+/// bsv-low #635: count one fetch request in the window (it opens the window's day when it is the first).
+pub fn note_request(now_ms: f64) {
+    COST.with(|c| {
+        let mut w = c.get();
+        if w.requests == 0 && w.day.is_none() {
+            w.day = Some(utc_day(now_ms));
+        }
+        w.requests = w.requests.saturating_add(1);
+        c.set(w);
+    });
+}
+
+/// bsv-low #635: take the window when it is due ([`cost_due`]), leaving an empty one; else `None`.
+pub fn take_cost_if_due(now_ms: f64) -> Option<CostFlush> {
+    let last = COST_LAST_TAKE_MS.with(Cell::get);
+    let w = COST.with(Cell::get);
+    if !cost_due(&w, now_ms, last) {
+        return None;
+    }
+    COST_LAST_TAKE_MS.with(|t| t.set(now_ms));
+    COST.with(|c| c.set(CostWindow::default()));
+    Some(CostFlush {
+        day: utc_date(w.day.unwrap_or_else(|| utc_day(now_ms))),
+        window: w,
+    })
+}
+
+/// bsv-low #635: the one call at a fetch's door: take the window written so far when it is due, then count this
+/// request in the window that follows (so a day's first request opens its own day's window).
+pub fn cost_on_request(now_ms: f64) -> Option<CostFlush> {
+    let taken = take_cost_if_due(now_ms);
+    note_request(now_ms);
+    taken
+}
+
+/// bsv-low #635: a window whose write faulted goes back into the isolate's window (a later take writes it), so a
+/// D1 fault or a table not yet migrated is a delay, not a loss. It joins the current window's day when that has one.
+pub fn restore_cost(f: &CostFlush) {
+    COST.with(|c| {
+        let mut w = c.get();
+        w.day = w.day.or(f.window.day);
+        w.requests = w.requests.saturating_add(f.window.requests);
+        w.reads = w.reads.saturating_add(f.window.reads);
+        w.writes = w.writes.saturating_add(f.window.writes);
+        w.stmts = w.stmts.saturating_add(f.window.stmts);
+        c.set(w);
+    });
+}
+
+/// bsv-low #635: the window not yet written (`/health.costWindow`, and the pins).
+pub fn cost_window() -> CostWindow {
+    COST.with(Cell::get)
+}
+
+/// bsv-low #635: write one taken window: ONE statement ([`COST_DAILY_UPSERT_SQL`]), counted like any other. A fault
+/// is logged and the window restored ([`restore_cost`]).
+pub async fn flush_cost(db: &worker::D1Database, f: CostFlush, now_ms: f64) {
+    use worker::wasm_bindgen::JsValue;
+    let bound = db.prepare(COST_DAILY_UPSERT_SQL).bind(&[
+        JsValue::from_str(&f.day),
+        JsValue::from_str(COST_WORKER),
+        JsValue::from_f64(f.window.requests as f64),
+        JsValue::from_f64(f.window.reads as f64),
+        JsValue::from_f64(f.window.writes as f64),
+        JsValue::from_f64(f.window.stmts as f64),
+        JsValue::from_f64(now_ms.floor()),
+    ]);
+    let result = match bound {
+        Ok(stmt) => stmt.counted_run().await.map(|_| ()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
+        worker::console_log!("[cost] the window of {} could not be written: {e}", f.day);
+        restore_cost(&f);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,5 +945,128 @@ mod tests {
         assert_eq!(j["routes"]["/owed"]["max"]["reads"], 12);
         assert_eq!(j["routes"]["/owed"]["requests"], 1);
         assert_eq!(j["unscoped"]["stmts"], 0);
+    }
+}
+
+/// bsv-low #635 (B-COST-1): the cost window's pins. Each runs on its own test thread, so its thread-local window is
+/// its own.
+#[cfg(test)]
+mod b_cost_1 {
+    use super::*;
+
+    #[test]
+    fn b_cost_1_every_statement_scoped_or_not_and_every_request_lands_in_the_window() {
+        assert_eq!(cost_window(), CostWindow::default());
+        // A statement of a request in scope, one outside any (the cron's, `wait_until`'s), and a request.
+        let mut fut = Box::pin(scoped(async { note(7, 2) }));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(fut.as_mut().poll(&mut cx).is_ready());
+        note(3, 0);
+        note_request(1_792_799_999_000.0);
+        assert_eq!(
+            cost_window(),
+            CostWindow {
+                day: Some(20_749),
+                requests: 1,
+                reads: 10,
+                writes: 2,
+                stmts: 2
+            },
+            "the window holds every noted statement and the request"
+        );
+    }
+
+    #[test]
+    fn b_cost_1_the_window_is_written_per_64_requests_or_minute_never_per_request_and_nothing_is_lost(
+    ) {
+        let t0 = 1_792_756_800_000.0; // 2026-10-23T12:00:00Z
+        let mut takes = Vec::new();
+        for i in 0..1_000u64 {
+            note(4, 1); // the request's own statement
+            if let Some(f) = cost_on_request(t0 + i as f64) {
+                takes.push(f);
+            }
+        }
+        // 1,000 requests in one second: the isolate's first take (due at once), then one per 64 requests.
+        assert!(
+            takes.len() as u64 <= 1_000u64.div_ceil(COST_FLUSH_REQUESTS) + 1,
+            "{} writes",
+            takes.len()
+        );
+        assert!(takes.len() >= 15, "{} writes", takes.len());
+        let rest = cost_window();
+        let requests: u64 = takes.iter().map(|f| f.window.requests).sum::<u64>() + rest.requests;
+        let reads: u64 = takes.iter().map(|f| f.window.reads).sum::<u64>() + rest.reads;
+        assert_eq!(
+            (requests, reads),
+            (1_000, 4_000),
+            "every request and row is in a write or the window"
+        );
+        assert!(takes.iter().all(|f| f.day == "2026-10-23"));
+        // The minute: one request after the last take is not due before 60 s, and is at 60 s.
+        let last = t0 + 999.0 + 10.0;
+        let _ = take_cost_if_due(last + COST_FLUSH_MS); // drain whatever is left
+        note_request(last + COST_FLUSH_MS + 1.0);
+        assert_eq!(
+            take_cost_if_due(last + 2.0 * COST_FLUSH_MS - 1.0),
+            None,
+            "59,999 ms after the last take"
+        );
+        assert!(
+            take_cost_if_due(last + 2.0 * COST_FLUSH_MS).is_some(),
+            "60,000 ms after the last take"
+        );
+        // An empty window is never written.
+        assert_eq!(take_cost_if_due(last + 10.0 * COST_FLUSH_MS), None);
+    }
+
+    #[test]
+    fn b_cost_1_a_window_lands_on_its_first_requests_day_and_a_new_day_is_due_at_once() {
+        let before_midnight = 1_792_799_999_000.0; // 2026-10-23T23:59:59Z
+        let _ = take_cost_if_due(before_midnight - 10.0 * COST_FLUSH_MS);
+        let _ = cost_on_request(before_midnight - 1_000.0);
+        assert_eq!(
+            cost_on_request(before_midnight),
+            Some(CostFlush {
+                day: "2026-10-23".into(),
+                window: CostWindow {
+                    day: Some(20_749),
+                    requests: 1,
+                    ..Default::default()
+                },
+            })
+        );
+        // 1.5 s later it is the next UTC day: the window (opened yesterday) is due though the minute is not up.
+        let taken = cost_on_request(before_midnight + 1_500.0).expect("a new day is due");
+        assert_eq!(
+            (taken.day.as_str(), taken.window.requests),
+            ("2026-10-23", 1)
+        );
+        assert_eq!(
+            cost_window().day,
+            Some(20_750),
+            "today's first request opens today's window"
+        );
+    }
+
+    #[test]
+    fn b_cost_1_a_faulted_write_is_restored_not_lost() {
+        let t = 1_792_756_800_000.0;
+        note(9, 3);
+        note_request(t);
+        let f = take_cost_if_due(t).expect("the isolate's first take is due");
+        assert!(cost_window().is_empty());
+        restore_cost(&f);
+        assert_eq!(cost_window(), f.window);
+    }
+
+    #[test]
+    fn b_cost_1_utc_dates() {
+        assert_eq!(utc_date(0), "1970-01-01");
+        assert_eq!(utc_date(-1), "1969-12-31");
+        assert_eq!(utc_date(11_016), "2000-02-29");
+        assert_eq!(utc_date(20_749), "2026-10-23");
+        assert_eq!(utc_day(1_792_799_999_000.0), 20_749);
+        assert_eq!(COST_WORKER, env!("CARGO_PKG_NAME"));
     }
 }

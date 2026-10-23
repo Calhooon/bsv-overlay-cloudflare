@@ -27,6 +27,8 @@ pub mod change_park;
 pub mod d1;
 pub mod d1_discovery;
 pub mod d1_ledger;
+/// bsv-low #635 (B-COST-1): the cost bar served on `/health/invariants.costBar`.
+pub mod cost_bar;
 pub mod d1_storage;
 pub mod door_words;
 pub mod dead_letters;
@@ -282,6 +284,18 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
     // (the default wasm behaviour). `set_once` makes re-calls across
     // request invocations cheap. Same pattern as `bsv-middleware-cloudflare`.
     bsv_middleware_cloudflare::init_panic_hook();
+
+    // bsv-low #635 (B-COST-1): this request counted in the isolate's cost window; the window written so far goes to
+    // `worker_cost_daily` after the answer when it is due (one upsert per 64 requests or 60 s, never per request).
+    let at_door = worker::Date::now().as_millis() as f64;
+    if let Some(window) = crate::d1_ledger::cost_on_request(at_door) {
+        if let Ok(db) = env.d1("OVERLAY_DB") {
+            ctx.wait_until(async move {
+                let now = worker::Date::now().as_millis() as f64;
+                crate::d1_ledger::flush_cost(&db, window, now).await;
+            });
+        }
+    }
 
     // CORS preflight
     if req.method() == Method::Options {
@@ -1335,6 +1349,21 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::Sched
     crate::proof_fetcher::set_courier_sink(env.var("COURIER_SINK").ok().map(|v| v.to_string()));
     tick_alarm::arm_from_cron(&env).await;
     tick::run_tick(&env, tick::TickSource::Cron).await;
+    // bsv-low #635: the tick's statements are in the cost window; written when due (an isolate that serves no fetch
+    // writes its window here).
+    flush_cost_if_due(&env).await;
+}
+
+/// bsv-low #635: write the isolate's cost window when it is due, awaited (the cron's and the queue's paths, which
+/// answer nobody).
+async fn flush_cost_if_due(env: &Env) {
+    let now = worker::Date::now().as_millis() as f64;
+    if let (Some(window), Ok(db)) = (
+        crate::d1_ledger::take_cost_if_due(now),
+        env.d1("OVERLAY_DB"),
+    ) {
+        crate::d1_ledger::flush_cost(&db, window, now).await;
+    }
 }
 
 /// POST /admin/complete-proofs (#192/#193) — run the BEEF proof-completion passes
@@ -1813,9 +1842,15 @@ async fn queue_entry(
     // re-drives it).
     let name: String = event.queue().map(String::from).unwrap_or_default();
     if crate::dead_letters::is_dead_letter_queue(&name) {
-        return crate::dead_letters::park_batch(&event, &env).await;
+        let parked = crate::dead_letters::park_batch(&event, &env).await;
+        flush_cost_if_due(&env).await;
+        return parked;
     }
-    queue_handler(worker::MessageBatch::from(event), env, ctx).await
+    let cost_env = env.clone();
+    let out = queue_handler(worker::MessageBatch::from(event), env, ctx).await;
+    // bsv-low #635: the batch's statements are in the cost window; written when due, one upsert per batch at most.
+    flush_cost_if_due(&cost_env).await;
+    out
 }
 
 #[rustfmt::skip] // Preserve main's exact queue wiring pins.

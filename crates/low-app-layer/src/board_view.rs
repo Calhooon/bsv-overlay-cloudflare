@@ -113,6 +113,16 @@ impl BoardView {
             self.state
                 .wait_until(async move { crate::courier::flush(db, pending).await });
         }
+        // bsv-low #635: the actor's D1 statements (its walks) in the cost window, written when due. Its fetches are
+        // Durable Object requests, not the Worker's, so none is counted as a request.
+        let now = Date::now().as_millis() as f64;
+        if let (Some(window), Ok(db)) = (
+            crate::d1_ledger::take_cost_if_due(now),
+            self.env.d1("OVERLAY_DB"),
+        ) {
+            self.state
+                .wait_until(async move { crate::d1_ledger::flush_cost(&db, window, now).await });
+        }
     }
 
     async fn serve_fetch(&self, req: Request) -> Result<Response> {
