@@ -2075,21 +2075,18 @@ mod pins {
             .any(|d| d.contains("SEARCH w USING INDEX sqlite_autoindex_tx_words_1")));
     }
 
-    /// The wiring: the scheduled pass runs the intake after the backfill and before the tick; no fetch handler and
-    /// no read route runs it (NS-3: no read writes a word); the feed is the CHAINTRACKS binding, never a URL fetch;
-    /// `/health` serves `chainEvents` from this isolate's memory, no D1 read.
+    /// The wiring (amended in the W15E-L4-LENS worktree for #777 and #778, PR 154): the scheduled pass runs the intake
+    /// in ITS OWN task, handed before the tracker task's boot, board era, backfill and tick; no fetch handler and no
+    /// read route runs it (NS-3: no read writes a word); the feed is the CHAINTRACKS binding, never a URL fetch;
+    /// `/health` serves `chainEvents` through `health_read` (one D1 batch), the isolate memo only on a fault.
     #[test]
     fn i771_the_scheduled_pass_alone_runs_the_intake_over_the_binding() {
         let lib = include_str!("../lib.rs");
         let at = |needle: &str| lib.find(needle).unwrap_or_else(|| panic!("{needle}"));
-        assert!(
-            at("tracker_host::runtime::backfill(&env)")
-                < at("tracker_host::chain_events::run(&env)")
-        );
-        assert!(
-            at("tracker_host::chain_events::run(&env)") < at("tracker_host::runtime::tick(&env)")
-        );
-        assert!(at("tracker_host::chain_events::run(&env)") < at("pub async fn fetch("));
+        let intake = at("tracker_host::chain_events::run(&env_intake)");
+        assert!(at("async fn scheduled(") < intake && intake < at("pub async fn fetch("));
+        assert!(intake < at("tracker_host::runtime::backfill(&env)"));
+        assert!(intake < at("tracker_host::runtime::tick(&env)"));
         assert_eq!(lib.matches("chain_events::run(").count(), 1);
         let routes = include_str!("../routes.rs");
         for call in [
@@ -2099,9 +2096,10 @@ mod pins {
         ] {
             assert!(!routes.contains(call), "a route runs {call}");
         }
-        let health = &routes[routes.find("pub fn health(").unwrap()..];
+        let health = &routes[routes.find("pub async fn health(").unwrap()..];
         let health = &health[..health.find("\n}\n").unwrap()];
-        assert!(health.contains("chain_events::health_json()"));
+        assert!(health.contains("chain_events::health_read(&sql).await"));
+        assert!(!health.contains("chain_events::health_json()"));
         let src = include_str!("chain_events.rs");
         let feed = &src[src.find("impl Feed for BindingFeed").unwrap()
             ..src.find("pub struct WorkerReasks").unwrap()];

@@ -67,12 +67,15 @@ fn decode(s: &str) -> ChainEvent {
     decode_envelope(s.as_bytes()).unwrap()
 }
 
+/// One page as the transport answers it (status, body), or its fault.
+type PageAnswer = Result<(u16, Vec<u8>), String>;
+
 /// The feed as `GET /events?since=` serves it: pages of at most 100 in cursor order after `since`, `hasMore`, a 409
 /// past its head; or a fixed answer.
 struct Journal {
     events: RefCell<Vec<(u64, Value)>>,
     calls: RefCell<Vec<String>>,
-    answer: RefCell<Option<Result<(u16, Vec<u8>), String>>>,
+    answer: RefCell<Option<PageAnswer>>,
 }
 impl Journal {
     fn of(events: &[(u64, &str)]) -> Self {
@@ -109,7 +112,7 @@ impl EventFeed for Journal {
         let cursor = after
             .iter()
             .take(100)
-            .last()
+            .next_back()
             .map_or(since_n, |e| e.0)
             .to_string();
         Ok((
@@ -757,4 +760,388 @@ fn e620_g_the_feed_is_wired_as_the_reorg_word_and_d7_is_gated() {
         ops.contains("\"arcadeReorg\":arcade_reorg,"),
         "D7's health kept"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// W15E-L4-LENS (2026-10-23): the lens's own cases, built in the lens worktree against PR 154's head. Not the lane's
+// pins; each documents a behaviour the lens examined. They reuse this file's fixtures.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A feed whose page never answers (the binding hung): the model of a pass dropped at a wall.
+struct Hang;
+impl EventFeed for Hang {
+    async fn page(&self, _since: &str) -> Result<(u16, Vec<u8>), String> {
+        std::future::pending::<()>().await;
+        unreachable!()
+    }
+}
+
+/// A row whose every write loses its compare-and-set (another isolate owns the pass).
+struct Contend(FeedState);
+impl FeedStateStore for Contend {
+    async fn read(&self) -> Result<Option<(FeedState, u64)>, String> {
+        Ok(Some((self.0.clone(), 1)))
+    }
+    async fn write(
+        &self,
+        _state: &FeedState,
+        _expected_version: Option<u64>,
+        _now_ms: u64,
+    ) -> Result<Option<u64>, String> {
+        Ok(None)
+    }
+}
+
+/// The gate as a LIVENESS predicate (the lens's fix shape for L1): the feed is the reorg word only while it is not
+/// resting on a recorded stop and read its page this pass.
+fn feed_is_live(s: &FeedPassSummary) -> bool {
+    s.is_reorg_word() && s.faults == 0 && s.state.as_ref().is_some_and(|st| st.stop.is_none())
+}
+
+/// LENS L1 (permanence): a feed STOPPED at an envelope the crate refuses, at a 409, or faulting at the binding, still
+/// answers `is_reorg_word() == true` whenever its row read, so the cron and the block-event pass skip Arcade's orphan
+/// consumer on every pass of the stop; a reorg BEHIND the stop demotes nothing on any of them. The row's state is the
+/// one `tick.rs` and `tip_pass.rs` consult. The liveness predicate answers false in each stopped shape and true in the
+/// healthy one.
+#[tokio::test]
+async fn lens_l1_a_stopped_feed_still_gates_d7_off() {
+    // (1) an unreadable envelope with a reorg behind it
+    let store = MemoryPotStorage::new();
+    let tracker = MockChainTracker::new(102);
+    let orphaned = confirmed_pot_with_stored_proof(&store, &pot(3), 101).await;
+    let feed = Journal::of(&[(41, TIP), (42, UNKNOWN_KIND), (43, REORG)]);
+    let row = Row::default();
+    let txs = MemoryTxStore::default();
+    let ladder = CourierStub::none();
+    let start = Start::At("40".into());
+    for n in 1..=3 {
+        let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &start).await;
+        assert!(s.is_reorg_word(), "pass {n}: the gate reads the stopped feed as the reorg word: {s:?}");
+        assert!(!feed_is_live(&s), "pass {n}: a liveness predicate would hand D7 back");
+        assert_eq!(s.applied, 0);
+        assert!(
+            store.pot_beef_proof_verified(&orphaned).await.unwrap(),
+            "pass {n}: the reorg behind the stop demotes nothing; no other consumer ran"
+        );
+        assert_eq!(row.state().stop.as_ref().map(|x| x.cursor.as_str()), Some("42"));
+    }
+    // (2) a 409 cursorAhead (pin d pins `cursor_ahead && is_reorg_word`; stated here beside the liveness reading)
+    let row = Row::default();
+    let feed = Journal::of(&[(41, TIP)]);
+    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("999".into())).await;
+    assert!(s.cursor_ahead && s.is_reorg_word() && !feed_is_live(&s), "{s:?}");
+    let again = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
+    assert!(again.is_reorg_word() && !feed_is_live(&again), "{again:?}");
+    // (3) the binding down, the row present
+    let row = Row::default();
+    let feed = Journal::of(&[(41, TIP)]);
+    let seeded = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    assert!(seeded.is_reorg_word() && feed_is_live(&seeded), "{seeded:?}");
+    *feed.answer.borrow_mut() = Some(Err("CHAINTRACKS binding: connection refused".into()));
+    let down = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
+    assert_eq!(down.faults, 1, "{down:?}");
+    assert!(down.is_reorg_word(), "a transport fault with a row present still gates D7 off this pass");
+    assert!(!feed_is_live(&down));
+    // (4) the healthy shape (pin a's journal) is live under both readings
+    let store = MemoryPotStorage::new();
+    let tracker = Roots::at(102);
+    let standing = confirmed_pot_with_stored_proof(&store, &pot(1), 101).await;
+    tracker.add_root(101, standing);
+    let feed = Journal::of(&[(41, FORK), (42, REORG), (43, TIP), (44, TIP_AGE)]);
+    let row = Row::default();
+    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    assert_eq!(s.applied, 2, "{s:?}");
+    assert!(s.is_reorg_word() && feed_is_live(&s));
+}
+
+/// LENS L2 (selection edges): a reorg `forkHeight` 101, deactivated [101], newTip 102 selects exactly 101..=102. A
+/// refuted row at 100 (the common ancestor's height) and a refuted row at 103 (above the new tip) are not examined;
+/// the refuted row at 101 is demoted; the standing row at 102 stands. The spenders leg scanned two rows.
+#[tokio::test]
+async fn lens_l2_the_reorg_window_is_exact_at_both_edges() {
+    let store = MemoryPotStorage::new();
+    let tracker = Roots::at(103);
+    let below = confirmed_pot_with_stored_proof(&store, &pot(10), 100).await; // refuted, below lo
+    let at_lo = confirmed_pot_with_stored_proof(&store, &pot(11), 101).await; // refuted, at lo
+    let at_hi = confirmed_pot_with_stored_proof(&store, &pot(12), 102).await; // standing, at hi
+    tracker.add_root(102, at_hi.clone());
+    let above = confirmed_pot_with_stored_proof(&store, &pot(13), 103).await; // refuted, above hi
+    let feed = Journal::of(&[(41, REORG)]);
+    let row = Row::default();
+    let txs = MemoryTxStore::default();
+    let ladder = CourierStub::none();
+    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    assert_eq!((s.applied, s.spenders.scanned, s.demoted()), (1, 2, 1), "{s:?}");
+    let verified = |t: &str| {
+        let store = &store;
+        let t = t.to_string();
+        async move { store.pot_beef_proof_verified(&t).await.unwrap() }
+    };
+    assert!(verified(&below).await, "100 is the ancestor's height: never examined");
+    assert!(!verified(&at_lo).await, "101 is the lowest affected height: judged and demoted");
+    assert!(verified(&at_hi).await, "102 stands by its own proof");
+    assert!(verified(&above).await, "103 is above the new tip: not this event's (a later reorg names it)");
+    assert_eq!(row.state().cursor, "41");
+}
+
+/// LENS L3 (the invalidated window): with chaintracks' tip at 1000 an `invalidated` selects 856..=1000. A refuted row
+/// at 856 is demoted; a refuted row at 855, one deeper than `INVALIDATED_DEPTH`, is not examined and keeps its
+/// confirmation (the stated limit: deeper is the operator's `/internal/reorg`, or the `reorg` event that follows an
+/// invalidation that moves the tip).
+#[tokio::test]
+async fn lens_l3_an_invalidation_145_deep_is_not_examined() {
+    let store = MemoryPotStorage::new();
+    let tracker = Roots::at(1000);
+    let inside = confirmed_pot_with_stored_proof(&store, &pot(20), 856).await;
+    let deeper = confirmed_pot_with_stored_proof(&store, &pot(21), 855).await;
+    let feed = Journal::of(&[(41, INVALIDATED)]);
+    let row = Row::default();
+    let txs = MemoryTxStore::default();
+    let ladder = CourierStub::none();
+    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    assert_eq!((s.applied, s.spenders.scanned, s.demoted()), (1, 1, 1), "{s:?}");
+    assert!(!store.pot_beef_proof_verified(&inside).await.unwrap(), "856 = tip - 144: judged, demoted");
+    assert!(store.pot_beef_proof_verified(&deeper).await.unwrap(), "855 = tip - 145: not examined");
+    assert_eq!(INVALIDATED_DEPTH, 144);
+}
+
+/// LENS L4 (both consumers on one deployment in one tick): the feed applies the reorg at 101 (the refuted row
+/// demoted); D7's consumer, run on demand over an Arcade orphan event at the same height (`POST
+/// /internal/arcade-reorg` is kept), judges the same height through the same function and demotes nothing a second
+/// time: the demoted row is no longer a confirmed row, the standing one stands. Each consumer keeps its own cursor
+/// over its own source; neither reads the other's row.
+#[tokio::test]
+async fn lens_l4_two_consumers_one_height_demote_once() {
+    use crate::arcade_reorg::{
+        consume_arcade_reorg_events, CanonicalHeader, ConsumerStateStore, FeedRead, HeaderSource, OrphanFeed,
+    };
+    use overlay_discovery::pot::arcade_events::{ConsumerState, OrphanEvent};
+    struct OneOrphan(OrphanEvent);
+    impl OrphanFeed for OneOrphan {
+        async fn recent_orphans(&self) -> Result<FeedRead, String> {
+            Ok(FeedRead {
+                events: vec![self.0.clone()],
+                rows: 1,
+                malformed: 0,
+                pages: 1,
+                newest_height: Some(102),
+            })
+        }
+    }
+    struct Canon(String);
+    impl HeaderSource for Canon {
+        async fn hash_at(&self, height: u64) -> Result<Option<CanonicalHeader>, String> {
+            Ok((height == 101).then(|| CanonicalHeader {
+                hash: self.0.clone(),
+                merkle_root: None,
+            }))
+        }
+        async fn tip(&self) -> Result<u64, String> {
+            Ok(102)
+        }
+    }
+    #[derive(Default)]
+    struct D7Row {
+        doc: RefCell<Option<String>>,
+        version: Cell<Option<u64>>,
+    }
+    impl ConsumerStateStore for D7Row {
+        async fn read(&self) -> Result<(ConsumerState, Option<u64>), String> {
+            let doc = self.doc.borrow();
+            let state: ConsumerState = serde_json::from_str(doc.as_deref().unwrap_or("{}")).unwrap();
+            Ok((state, self.version.get()))
+        }
+        async fn write(&self, state: &ConsumerState, expected: Option<u64>) -> Result<Option<u64>, String> {
+            if expected != self.version.get() {
+                return Ok(None);
+            }
+            *self.doc.borrow_mut() = Some(serde_json::to_string(state).unwrap());
+            let v = self.version.get().unwrap_or(0) + 1;
+            self.version.set(Some(v));
+            Ok(Some(v))
+        }
+    }
+    let store = MemoryPotStorage::new();
+    let tracker = Roots::at(102);
+    let standing = confirmed_pot_with_stored_proof(&store, &pot(1), 101).await;
+    tracker.add_root(101, standing.clone());
+    let orphaned = confirmed_pot_with_stored_proof(&store, &pot(3), 101).await;
+    let txs = MemoryTxStore::default();
+    let ladder = CourierStub::none();
+    // the feed first, as the cron and the block-event pass run it
+    let feed = Journal::of(&[(41, REORG)]);
+    let row = Row::default();
+    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    assert_eq!((s.applied, s.spenders.scanned, s.demoted()), (1, 2, 1), "{s:?}");
+    assert!(!store.pot_beef_proof_verified(&orphaned).await.unwrap());
+    // then D7 on demand over Arcade's orphan row at 101 (its hash differs from chaintracks': corroborated)
+    let arcade_feed = OneOrphan(OrphanEvent {
+        orphaned_at: "2026-10-23T18:00:00.000Z".into(),
+        height: 101,
+        hash: "1bcfb203aa391d9680a0a48530cc59aa016ca7421c480605fc88e113036f055b".into(),
+    });
+    let headers = Canon("11d40824c809fb901bd1d593fdcae111008d3441abccc2e1c26879a2e5fd1105".into());
+    let d7_row = D7Row::default();
+    let d7 = consume_arcade_reorg_events(
+        &arcade_feed,
+        &headers,
+        &d7_row,
+        &store,
+        Some(&txs),
+        Some(&tracker),
+        Some(&ladder),
+        PassLimits::cron(),
+        &mut RootMemo::default(),
+        false,
+    )
+    .await;
+    assert_eq!(d7.applied, 1, "{d7:?}");
+    assert_eq!((d7.spenders.scanned, d7.spenders.stale, d7.spenders.standing), (1, 0, 1), "{d7:?}");
+    assert_eq!(ladder.calls.get(), 1, "the ladder was asked once, by the feed's pass, for the one refuted row");
+    assert!(store.pot_beef_proof_verified(&standing).await.unwrap());
+    let r = store.get_spent_status(&pot(3), 0).await.unwrap().unwrap();
+    assert!(r.spent && !r.spent_confirmed, "demoted once, still demoted");
+    assert_eq!(row.state().cursor, "41", "the feed's cursor is its own");
+    assert!(d7_row.doc.borrow().as_deref().unwrap().contains("2026-10-23T18:00:00.000Z"), "D7's cursor is its own");
+}
+
+/// LENS L5 (the invariants read): `chain_feed::health_json` is ONE statement (`STATE_READ`), issued inside the
+/// handler's one join (the fix838 pin lists it), so `/health/invariants` carries one statement more than the tier's
+/// measured 32 on main `35ddb423`: 33 of the ceiling's 34 (arithmetic, not a tier run).
+#[test]
+fn lens_l5_the_health_read_is_one_statement() {
+    let src = include_str!("chain_feed.rs");
+    let body = &src[src.find("pub async fn health_json(").unwrap()..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert_eq!(body.matches("Query::new(").count(), 1, "one statement");
+    assert!(body.contains("Query::new(STATE_READ)"));
+}
+
+/// LENS L6 (the wall inside the feed): a pass whose feed page never answers, dropped by the caller's race, leaves the
+/// row where the seed put it (nothing judged, nothing written after the seed) and the next pass continues from it. In
+/// production the page GET is raced at `FEED_TIMEOUT_MS` and the cron's whole step list at `TICK_BUDGET_MS`; the
+/// block-event handler has no wall of its own around the feed.
+#[tokio::test]
+async fn lens_l6_a_pass_dropped_at_a_wall_keeps_the_row() {
+    let store = MemoryPotStorage::new();
+    let tracker = MockChainTracker::new(102);
+    let txs = MemoryTxStore::default();
+    let ladder = CourierStub::none();
+    let row = Row::default();
+    let dropped = overlay_engine::gasp::race_or_deadline(
+        consume_chain_feed(
+            &Hang,
+            &row,
+            &store,
+            Some(&txs),
+            Some(&tracker),
+            Some(&ladder),
+            limits(2, 50, 12),
+            &mut RootMemo::default(),
+            &Start::At("40".into()),
+            1,
+        ),
+        tokio::time::sleep(std::time::Duration::from_millis(50)),
+    )
+    .await;
+    assert!(dropped.is_none(), "the pass was dropped at the wall");
+    assert_eq!((row.state().cursor.as_str(), row.writes.get()), ("40", 1), "the seed landed, nothing after it");
+    let feed = Journal::of(&[(41, TIP)]);
+    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
+    assert_eq!((row.state().cursor.as_str(), s.consumed.get("tip").copied()), ("41", Some(1)));
+    assert_eq!(FEED_TIMEOUT_MS, 10_000);
+}
+
+/// LENS L8 (a contended write is counted twice): the in-loop `write_now!` after an applied window loses its
+/// compare-and-set and the pass breaks; the trailing `write_now!` tries the same stale version again and counts a
+/// second contention. Cosmetic (the counter and the `stopped` text), stated.
+#[tokio::test]
+async fn lens_l8_a_contended_pass_counts_its_contention_twice() {
+    let store = MemoryPotStorage::new();
+    let tracker = Roots::at(102);
+    let standing = confirmed_pot_with_stored_proof(&store, &pot(1), 101).await;
+    tracker.add_root(101, standing);
+    let txs = MemoryTxStore::default();
+    let ladder = CourierStub::none();
+    let feed = Journal::of(&[(41, REORG)]);
+    let contend = Contend(FeedState::seeded("40", 1));
+    let s = consume_chain_feed(
+        &feed,
+        &contend,
+        &store,
+        Some(&txs),
+        Some(&tracker),
+        Some(&ladder),
+        limits(2, 50, 12),
+        &mut RootMemo::default(),
+        &Start::Unset,
+        1,
+    )
+    .await;
+    assert_eq!((s.applied, s.contended), (0, 2), "{s:?}");
+    assert_eq!(s.state.as_ref().map(|st| st.cursor.as_str()), Some("40"), "the summary's state is the read one");
+}
+
+/// LENS L7 (the pin the lane lacks: "never a blind demotion" as BEHAVIOUR). A confirmed spender whose stored BEEF
+/// carries NO bump (a courier-confirmed row the routine sweep has not healed) sits at the reorg's height. The feed's
+/// judgement runs `demote_proofless: false`: with no courier proof the row is left alone and counted
+/// `no_stored_proof`; only a courier proof naming ANOTHER block demotes it (evidence). Under the mutant
+/// `demote_proofless: true` in `judge_window_legs` the first arm demotes blind and this case is RED; the lane's e620
+/// pins catch that mutant by source text alone (`e620_g`).
+#[tokio::test]
+async fn lens_l7_a_proofless_confirmed_row_is_never_demoted_blind() {
+    use crate::proof_fetcher::tests::real_spender_raw;
+    use bsv_rs::transaction::{Beef, Transaction};
+    use overlay_discovery::pot::storage::PotRecord;
+    async fn proofless_confirmed(store: &MemoryPotStorage, pot: &str, height: u32) -> String {
+        let raw = real_spender_raw(pot, 0);
+        let spender = Transaction::from_hex(&raw).unwrap().id();
+        store
+            .store_record(&PotRecord {
+                txid: pot.into(),
+                output_index: 0,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .mark_spent(pot, 0, &spender, true, None, Some(u64::from(height)), Some(true))
+            .await
+            .unwrap();
+        let mut beef = Beef::new();
+        beef.merge_raw_tx(hex::decode(&raw).unwrap(), None);
+        store.store_beef(&spender, &beef.to_binary()).await.unwrap();
+        spender
+    }
+    let txs = MemoryTxStore::default();
+    let tracker = Roots::at(102);
+    // (a) no courier proof: left alone
+    let store = MemoryPotStorage::new();
+    let _spender = proofless_confirmed(&store, &pot(30), 101).await;
+    let feed = Journal::of(&[(41, REORG)]);
+    let row = Row::default();
+    let ladder = CourierStub::none();
+    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    assert_eq!((s.applied, s.spenders.scanned), (1, 1), "{s:?}");
+    assert_eq!(
+        (s.spenders.no_stored_proof, s.spenders.demoted_blind, s.demoted()),
+        (1, 0, 0),
+        "no proof to refute and no courier word: nothing demoted: {s:?}"
+    );
+    assert_eq!(ladder.calls.get(), 1, "the courier was asked once");
+    let r = store.get_spent_status(&pot(30), 0).await.unwrap().unwrap();
+    assert!(r.spent_confirmed && r.spent_height == Some(101), "still confirmed");
+    // (b) a courier proof naming another block: demoted on that evidence
+    let store = MemoryPotStorage::new();
+    let spender = proofless_confirmed(&store, &pot(31), 101).await;
+    let ladder = CourierStub::with(
+        [(spender.clone(), Ok(Some(single_tx_bump(&spender, 102).to_hex())))]
+            .into_iter()
+            .collect(),
+    );
+    let row = Row::default();
+    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    assert_eq!((s.applied, s.demoted(), s.spenders.demoted_blind), (1, 1, 0), "{s:?}");
+    let r = store.get_spent_status(&pot(31), 0).await.unwrap().unwrap();
+    assert!(r.spent && !r.spent_confirmed, "demoted on the courier's disagreeing proof");
 }
