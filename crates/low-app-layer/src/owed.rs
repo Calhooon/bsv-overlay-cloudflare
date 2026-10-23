@@ -1877,18 +1877,27 @@ pub const OWED_SHED_RETRY_MS: i64 = 30_000;
 /// [`OWED_MAX_ROWS`] (the FIX-837 lens's LOW-4: it runs after the pass's own truncation, so the write plan's bound,
 /// rows + 3 statements, holds by construction and no carried row is the one the read handler drops). The count
 /// carried.
+///
+/// bsv-low #859 (FIX-859, loop 46 pair 16): a row the pass JUDGED is never carried. The derivation answers every
+/// hop, result and refund entry the pass holds, and "no row" is one of its answers (a hop its admitted JOIN spent:
+/// the pot's row tells the story; a pot settled and spent): the carry is for the subjects the cut pass never
+/// REACHED (a cursor page the budget left), never for one it read and retired ([`judged_outpoints`]). Before: the
+/// good JOIN was admitted, the index marked its hop spent and the door retired the refusal row, and every cut pass of
+/// that identity carried the previous snapshot's door strand (`hop-stranded`, `joinRefusedBy: "door"`, served
+/// `shed`) for that hop, three minutes past the admission, until the keep window or an uncut pass.
 pub fn carry_shed_rows(
     i: &OwedInputs,
     rows: &mut Vec<OwedRow>,
     previous: &[(OwedRow, i64)],
 ) -> usize {
     let current: HashSet<String> = rows.iter().map(|r| r.outpoint.clone()).collect();
+    let judged = judged_outpoints(i);
     let mut carried = 0;
     for (prev, updated_at_ms) in previous {
         if rows.len() >= OWED_MAX_ROWS {
             break;
         }
-        if current.contains(&prev.outpoint) {
+        if current.contains(&prev.outpoint) || judged.contains(&prev.outpoint) {
             continue;
         }
         let judged_at = prev.facts["judgedAtMs"].as_i64().unwrap_or(*updated_at_ms);
@@ -1917,6 +1926,26 @@ pub fn carry_shed_rows(
         carried += 1;
     }
     carried
+}
+
+/// PURE (bsv-low #859): the outpoints (`txid:vout`, lowercase) this pass's derivation JUDGED: every hop entry's
+/// hop outpoint and every result and refund entry's pot outpoint the inputs hold. [`derive_owed_rows`] answers each
+/// of them, a row or no row; a previous row of one is the pass's to retire, never the carry's to keep.
+pub fn judged_outpoints(i: &OwedInputs) -> HashSet<String> {
+    i.hops
+        .iter()
+        .map(|h| outpoint_key(&h.hop_txid, h.hop_vout))
+        .chain(
+            i.results
+                .iter()
+                .map(|e| outpoint_key(&e.pot_txid, e.pot_vout)),
+        )
+        .chain(
+            i.refunds
+                .iter()
+                .map(|r| outpoint_key(&r.pot_txid, r.pot_vout)),
+        )
+        .collect()
 }
 
 /// PURE (bsv-low #837): an answer that serves a carried shed row says so at the top (`refresh: "shed"`,
@@ -15338,8 +15367,10 @@ pub(crate) mod tests {
             facts: json!({"claim": "present-refund", "claimable": true}),
             reason: None,
         };
-        let previous: Vec<(OwedRow, i64)> =
-            vec![(strand.clone(), now - 90_000), (unreached.clone(), now - 90_000)];
+        let previous: Vec<(OwedRow, i64)> = vec![
+            (strand.clone(), now - 90_000),
+            (unreached.clone(), now - 90_000),
+        ];
         // the cut pass after the admission: the derivation judged the hop (no row: the pot's row tells the story)
         let mut rows = derive_owed_rows(&i);
         assert!(rows.is_empty(), "{rows:?}");
