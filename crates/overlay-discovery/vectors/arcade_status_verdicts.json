@@ -65,9 +65,9 @@
     { "name": "submit_503_backpressure", "surface": "submit", "http": 503, "cite": "services/api_server/handlers.go:994-1001", "body": { "error": "service overloaded, retry shortly" }, "expect": { "toolbox_arcade_submit": "service_error", "engine_submit": "transport" } },
 
     { "name": "status_unknown", "surface": "status", "http": 200, "body": { "txid": "{TXID}", "txStatus": "UNKNOWN", "timestamp": "{NOW}" }, "expect": { "toolbox_status": "unknown", "engine_proof": "unknown" } },
-    { "name": "status_received", "surface": "status", "http": 200, "body": { "txid": "{TXID}", "txStatus": "RECEIVED", "timestamp": "{NOW}" }, "expect": { "toolbox_status": "known", "engine_proof": "unknown" } },
-    { "name": "status_sent_to_network", "surface": "status", "http": 200, "body": { "txid": "{TXID}", "txStatus": "SENT_TO_NETWORK", "timestamp": "{NOW}" }, "expect": { "toolbox_status": "known", "engine_proof": "unknown" } },
-    { "name": "status_accepted_by_network", "surface": "status", "http": 200, "body": { "txid": "{TXID}", "txStatus": "ACCEPTED_BY_NETWORK", "timestamp": "{NOW}" }, "expect": { "toolbox_status": "known", "engine_proof": "unknown" } },
+    { "name": "status_received", "surface": "status", "http": 200, "body": { "txid": "{TXID}", "txStatus": "RECEIVED", "timestamp": "{NOW}" }, "expect": { "toolbox_status": "unknown", "engine_proof": "unknown" } },
+    { "name": "status_sent_to_network", "surface": "status", "http": 200, "body": { "txid": "{TXID}", "txStatus": "SENT_TO_NETWORK", "timestamp": "{NOW}" }, "expect": { "toolbox_status": "unknown", "engine_proof": "unknown" } },
+    { "name": "status_accepted_by_network", "surface": "status", "http": 200, "body": { "txid": "{TXID}", "txStatus": "ACCEPTED_BY_NETWORK", "timestamp": "{NOW}" }, "expect": { "toolbox_status": "unknown", "engine_proof": "unknown" } },
     { "name": "status_seen_on_network", "surface": "status", "http": 200, "body": { "txid": "{TXID}", "txStatus": "SEEN_ON_NETWORK", "timestamp": "{NOW}" }, "expect": { "toolbox_status": "known", "engine_proof": "known_unmined" } },
     { "name": "status_seen_multiple_nodes", "surface": "status", "http": 200, "body": { "txid": "{TXID}", "txStatus": "SEEN_MULTIPLE_NODES", "timestamp": "{NOW}" }, "expect": { "toolbox_status": "known", "engine_proof": "known_unmined" } },
     { "name": "status_double_spend_attempted", "surface": "status", "http": 200, "body": { "txid": "{TXID}", "txStatus": "DOUBLE_SPEND_ATTEMPTED", "timestamp": "{NOW}" }, "expect": { "toolbox_status": "unknown", "engine_proof": "unknown" } },

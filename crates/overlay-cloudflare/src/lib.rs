@@ -1613,6 +1613,7 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
         &arcade_base,
         woc_key.as_deref(),
         crate::proof_fetcher::ProofSources::from_env(env),
+        crate::lookup_service_chain_tracker(env),
     )
     .await;
     worker::console_log!(
