@@ -842,3 +842,95 @@ async fn b_owed_3_l2_an_unheld_frame_is_counted_unheld_on_both_sides() {
     assert!(bsv_overlay_cloudflare::applayer_counters::names()
         .contains(&runtime::COUNTER_TRACKER_EVENT_UNHELD.to_string()));
 }
+
+/// bsv-low #660 (B-OWED-3-FOLD, the lens's L4, its F5): the BEHAVIOURAL pin of the flush's order, through the ONE
+/// function the three flushes call (`tracker_events::ship_in_order`, reached by `ship_then`). (1) The words' transport
+/// is the `/internal/tx-word` handler's steps (which write before they answer); the notes' step, when it runs, does
+/// what the pot hook's recompute does with the settle's word (`coin_landing` over the stored view): the settle's `seen`
+/// is already written, `Awaiting`. RED with the notes run before the words: `Withheld` (the word still `built`).
+/// (2) The deadline (L3's slice) over a fake clock: 25 frames at 1 s each under a 20 s wall: 10 before the notes, the
+/// notes run at 10 s (before the deadline, so they ship), 10 after, 5 walled and retried once. RED with no slice
+/// (the words under the whole wall): the notes run AT the deadline and every note is deferred.
+#[tokio::test]
+async fn b_owed_3_l4_f5_the_flush_ships_the_words_then_the_notes_under_one_deadline() {
+    use std::cell::{Cell, RefCell};
+    // (1) the order, through the handler's steps
+    let db = db();
+    let (funding, settle) = (pot(40), pot(41));
+    pot_spent_by(&db, &funding, 0, &settle);
+    seed_built(&db, &settle, 1_000);
+    tracker_events::drain();
+    latch_seen(&settle, 1_000_500);
+    let landing = RefCell::new(None);
+    let shipped = tracker_events::ship_in_order(
+        tracker_events::drain(),
+        |body| tx_word(&db, stored::LIVE_HOLD, body, 1_001),
+        |_deadline| async {
+            let w = BTreeMap::from([(settle.clone(), read(&db, &settle).unwrap().view())]);
+            *landing.borrow_mut() = Some(coin_landing(w.get(&settle), Some(true)));
+        },
+        || 0,
+        20_000,
+    )
+    .await;
+    assert_eq!(
+        *landing.borrow(),
+        Some(CoinLanding::Awaiting),
+        "the note's recompute reads the word the same flush shipped"
+    );
+    assert_eq!(
+        shipped,
+        tracker_events::WordsShipped {
+            before_notes: 1,
+            after_notes: 0,
+            walled: 0
+        }
+    );
+    // (2) the deadline: 25 frames at 1 s each, a 20 s wall
+    tracker_events::drain();
+    let clock = Cell::new(0_u64);
+    let notes_at = Cell::new(None);
+    for n in 0..25u8 {
+        tracker_events::note(&pot(100 + n), "seen", Some(json!({"source": "arcade", "at": 1})));
+    }
+    let shipped = tracker_events::ship_in_order(
+        tracker_events::drain(),
+        |_body| {
+            clock.set(clock.get() + 1_000);
+            async { Ok(true) }
+        },
+        |deadline| {
+            notes_at.set(Some((clock.get(), deadline)));
+            async {}
+        },
+        || clock.get(),
+        20_000,
+    )
+    .await;
+    let (at, deadline) = notes_at.get().unwrap();
+    assert!(
+        at < deadline,
+        "the notes start before the deadline under a word flood (at {at} of {deadline})"
+    );
+    assert_eq!(at, tracker_events::WORDS_SHARE_MS);
+    assert_eq!(
+        shipped,
+        tracker_events::WordsShipped {
+            before_notes: 10,
+            after_notes: 10,
+            walled: 5
+        }
+    );
+    let retry = tracker_events::drain();
+    assert_eq!(retry.len(), 5, "the walled frames are retried once");
+    assert!(retry.iter().all(|f| f["retry"] == true));
+    // the app layer answers after its write (the handler's source)
+    let runtime_src: String = include_str!("../src/tracker_host/runtime.rs")
+        .split_whitespace()
+        .collect();
+    let ingest = &runtime_src[runtime_src.find("pubasyncfningest(").unwrap()..];
+    assert!(
+        ingest.find("event(env,&id,kind,").unwrap() < ingest.find("Response::from_json(").unwrap(),
+        "the handler writes before it answers"
+    );
+}

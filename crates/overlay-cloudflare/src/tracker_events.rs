@@ -144,35 +144,115 @@ where
 pub fn health_json() -> Value {
     COUNTS.with(|c| json!(*c.borrow()))
 }
-/// Ship `events` under a 20 s deadline of their own ([`ship_until`]).
-pub async fn ship(env: &worker::Env, events: Vec<Value>) {
-    ship_until(env, events, worker::Date::now().as_millis() + 20_000).await;
+/// bsv-low #660 (B-OWED-3-FOLD, the lens's L3): the words' reserved SLICE of a flush's one wall. The words go first
+/// (a note triggers the owed recompute, which reads the spender's word), but a word flood (the tip pass, the cron, a
+/// queue batch: N `proof` frames beside N pot notes at a block) took the whole wall and deferred EVERY note of the
+/// flush to the isolate's next one. So the words start under `min(deadline, start + WORDS_SHARE_MS)`, then the hop
+/// and pot notes under the deadline, then the words left under the deadline (a frame the wall stops keeps its once
+/// retry). Stated: a frame past the slice reaches the app layer after the notes of its flush.
+pub const WORDS_SHARE_MS: u64 = 10_000;
+
+/// What one ordered flush did with its word frames ([`ship_in_order`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WordsShipped {
+    /// Frames POSTed before the notes (inside the slice).
+    pub before_notes: usize,
+    /// Frames POSTed after the notes (past the slice, before the deadline).
+    pub after_notes: usize,
+    /// Frames the deadline stopped (counted `walled`, retried once on the next flush).
+    pub walled: usize,
 }
-/// bsv-low #649: [`ship`] under a deadline the caller holds (a background flush's one window, shared with
-/// the pot and hop sets, never a 20 s of its own on top).
-pub async fn ship_until(env: &worker::Env, events: Vec<Value>, deadline: u64) {
-    if events.is_empty() {
-        return;
-    }
-    let configured = crate::change_flush::configured(env);
-    for frame in events {
-        if worker::Date::now().as_millis() >= deadline {
-            count(&frame, "walled");
-            failed(frame);
+
+async fn post_frames<P, Fut, C>(
+    frames: Vec<Value>,
+    post: &mut P,
+    now_ms: &C,
+    until_ms: u64,
+    last: bool,
+) -> (usize, Vec<Value>)
+where
+    P: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+    C: Fn() -> u64,
+{
+    let (mut posted, mut left) = (0, Vec::new());
+    for frame in frames {
+        if now_ms() >= until_ms {
+            if last {
+                count(&frame, "walled");
+                failed(frame.clone());
+            }
+            left.push(frame);
             continue;
         }
-        let Some((url, token)) = &configured else {
-            count(&frame, "dropped");
-            continue;
-        };
-        deliver(frame, |body| async {
+        posted += 1;
+        deliver(frame, &mut *post).await;
+    }
+    (posted, left)
+}
+
+/// THE ONE ORDER of a flush (bsv-low #660 under #618; B-OWED-3-FOLD L3 and L4), over any transport: the word frames,
+/// each POST awaited, under the words' slice ([`WORDS_SHARE_MS`]); then `notes(deadline_ms)` (the hop and pot sets,
+/// which start no POST at or past the deadline); then the frames left under the deadline. The app layer writes a
+/// frame before it answers, so a note shipped after a word's answer triggers a recompute that reads that word.
+pub async fn ship_in_order<P, Fut, N, NFut, C>(
+    words: Vec<Value>,
+    mut post: P,
+    notes: N,
+    now_ms: C,
+    deadline_ms: u64,
+) -> WordsShipped
+where
+    P: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+    N: FnOnce(u64) -> NFut,
+    NFut: std::future::Future<Output = ()>,
+    C: Fn() -> u64,
+{
+    let slice_ms = deadline_ms.min(now_ms().saturating_add(WORDS_SHARE_MS));
+    let (before_notes, left) = post_frames(words, &mut post, &now_ms, slice_ms, false).await;
+    notes(deadline_ms).await;
+    let (after_notes, walled) = post_frames(left, &mut post, &now_ms, deadline_ms, true).await;
+    WordsShipped {
+        before_notes,
+        after_notes,
+        walled: walled.len(),
+    }
+}
+
+/// [`ship_in_order`] on the Worker: the frames to the app layer's `/internal/tx-word` (each answer read for `held`,
+/// L2), then `notes`, under the flush's ONE deadline (bsv-low #649: never a 20 s of the words' own on top). An
+/// unconfigured deploy drops the frames (counted) and still runs the notes (which log their own refusal).
+pub async fn ship_then<N, NFut>(env: &worker::Env, events: Vec<Value>, notes: N, deadline_ms: u64)
+where
+    N: FnOnce(u64) -> NFut,
+    NFut: std::future::Future<Output = ()>,
+{
+    let configured = crate::change_flush::configured(env);
+    let words = match configured {
+        Some(_) => events,
+        None => {
+            for frame in &events {
+                count(frame, "dropped");
+            }
+            Vec::new()
+        }
+    };
+    let (url, token) = configured.unwrap_or_default();
+    let (url, token) = (url.as_str(), token.as_str());
+    ship_in_order(
+        words,
+        |body| async move {
             crate::change_flush::post_body_answer(env, url, token, "/internal/tx-word", "tx-word", body)
                 .await
                 .map(|answer| answered_held(&answer))
                 .map_err(|_| "undelivered".to_string())
-        })
-        .await;
-    }
+        },
+        notes,
+        || worker::Date::now().as_millis(),
+        deadline_ms,
+    )
+    .await;
     let pending = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
     if let Ok(db) = env.d1("OVERLAY_DB") {
         for (name, n) in pending {

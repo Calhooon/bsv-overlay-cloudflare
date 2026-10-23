@@ -214,13 +214,21 @@ pub async fn flush_inline(env: Env) {
     // one wall for the three sets: the words first (bsv-low #660 under #618, [`flush`]), then the hop set (the owed
     // list's hop rows), then the pot set
     let deadline_ms = Date::now().as_millis() + crate::change_flush::FLUSH_WALL_BUDGET_MS;
-    crate::tracker_events::ship_until(&env, tracker_events, deadline_ms).await;
-    if !hops.is_empty() {
-        crate::hop_changes::ship(env.clone(), hops, deadline_ms).await;
-    }
-    if !changed.is_empty() {
-        ship(env.clone(), changed, deadline_ms).await;
-    }
+    let notes_env = env.clone();
+    crate::tracker_events::ship_then(
+        &env,
+        tracker_events,
+        |deadline_ms| async move {
+            if !hops.is_empty() {
+                crate::hop_changes::ship(notes_env.clone(), hops, deadline_ms).await;
+            }
+            if !changed.is_empty() {
+                ship(notes_env, changed, deadline_ms).await;
+            }
+        },
+        deadline_ms,
+    )
+    .await;
 }
 
 /// bsv-low #649: the wall `wait_until` holds a task for after the invocation ends (the runtime's own
@@ -288,14 +296,22 @@ pub async fn flush_inline_within(env: Env, started_ms: u64) {
             let tracker_events = crate::tracker_events::drain();
             let changed = drain();
             let hops = crate::hop_changes::drain();
-            // the words first (bsv-low #660 under #618, [`flush`])
-            crate::tracker_events::ship_until(&env, tracker_events, deadline_ms).await;
-            if !hops.is_empty() {
-                crate::hop_changes::ship(env.clone(), hops, deadline_ms).await;
-            }
-            if !changed.is_empty() {
-                ship(env.clone(), changed, deadline_ms).await;
-            }
+            // the words first (bsv-low #660 under #618, [`flush`]), in the one order
+            let notes_env = env.clone();
+            crate::tracker_events::ship_then(
+                &env,
+                tracker_events,
+                |deadline_ms| async move {
+                    if !hops.is_empty() {
+                        crate::hop_changes::ship(notes_env.clone(), hops, deadline_ms).await;
+                    }
+                    if !changed.is_empty() {
+                        ship(notes_env, changed, deadline_ms).await;
+                    }
+                },
+                deadline_ms,
+            )
+            .await;
         }
     }
 }
@@ -312,7 +328,9 @@ pub async fn flush_inline_within(env: Env, started_ms: u64) {
 /// `built`, withholding the payout row until the next unrelated hook (the MINED callback, a block later). The
 /// `/internal/tx-word` ingest answers after its write, and each frame is awaited, so the words are durable before the
 /// first note leaves. A word frame the wall stops is retried once on the next flush (as before); a hop or pot note
-/// the wall stops is deferred and noted back (as before).
+/// the wall stops is deferred and noted back (as before). The words take at most their slice of the wall before the
+/// notes start (`tracker_events::WORDS_SHARE_MS`, B-OWED-3-FOLD L3); the order is ONE function,
+/// `tracker_events::ship_in_order`, which the three flushes reach through `tracker_events::ship_then`.
 pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)>(
     env: &Env,
     wait_until: F,
@@ -329,13 +347,21 @@ pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
         // one wall for the three sets, read when the task starts: the words first (bsv-low #660 under #618), then
         // the hop set (the owed list's hop rows), then the pot set
         let deadline_ms = Date::now().as_millis() + crate::change_flush::FLUSH_WALL_BUDGET_MS;
-        crate::tracker_events::ship_until(&env2, tracker_events, deadline_ms).await;
-        if !hops.is_empty() {
-            crate::hop_changes::ship(env2.clone(), hops, deadline_ms).await;
-        }
-        if !changed.is_empty() {
-            ship(env2.clone(), changed, deadline_ms).await;
-        }
+        let notes_env = env2.clone();
+        crate::tracker_events::ship_then(
+            &env2,
+            tracker_events,
+            |deadline_ms| async move {
+                if !hops.is_empty() {
+                    crate::hop_changes::ship(notes_env.clone(), hops, deadline_ms).await;
+                }
+                if !changed.is_empty() {
+                    ship(notes_env, changed, deadline_ms).await;
+                }
+            },
+            deadline_ms,
+        )
+        .await;
     }));
 }
 
@@ -654,7 +680,7 @@ mod tests {
             ),
         ] {
             let words = f
-                .find("crate::tracker_events::ship_until(")
+                .find("crate::tracker_events::ship_then(")
                 .unwrap_or_else(|| panic!("{name}: the words ship under the flush's one deadline"));
             let hops = f
                 .find("crate::hop_changes::ship(")
@@ -670,6 +696,11 @@ mod tests {
             assert!(
                 !f.contains("crate::tracker_events::ship(&"),
                 "{name}: the words share the flush's one wall, never 20 s of their own"
+            );
+            // B-OWED-3-FOLD L4: the notes are the ordered shipper's `notes` step, under the deadline it hands them
+            assert!(
+                f[words..].contains("|deadline_ms|asyncmove{if!hops.is_empty(){crate::hop_changes::ship(notes_env.clone(),hops,deadline_ms).await;}if!changed.is_empty(){ship(notes_env,changed,deadline_ms).await;}},deadline_ms,).await;"),
+                "{name}: the hop and pot notes run inside ship_then, after the words' slice"
             );
         }
     }
