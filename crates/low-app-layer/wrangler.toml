@@ -108,6 +108,12 @@ WRITTEN_OFF_BEFORE_MS = "1789998267000"
 # = no rescue belt (stamps alone decide — the pre-#375 posture).
 WRITTEN_OFF_BEFORE_HEIGHT = "967732"
 
+# bsv-low #862 (L7-DEPTH): the host's SPEND DEPTH, the confirmations a wallet needs before it credits a coin on a
+# served chain word (R3 of the wallet charter), served as `spendDepth` beside `tracker` on /tx-any and beside `lock`
+# on /utxo-status and /spent-any, and on /health.spendDepth. An integer, 1 the floor; missing or malformed serves 1
+# and counts spend_depth_var_malformed_total once per isolate. The value at risk per R3(b) is the owner's later word.
+SPEND_DEPTH = "1"
+
 # BRC-103/104 session store for the auth middleware (`process_auth`'s
 # `AUTH_SESSIONS` binding — same shape the low-watchtower uses). id is a
 # placeholder by repo convention — the real namespace id is injected at
@@ -282,6 +288,8 @@ STORAGE_EPOCH = "beta-2026-08-12-1"
 # (the fleet loops 11 to 21 written off from every view; the collect pass ran first, 14/18 pressed green, 4 #512 already-held).
 WRITTEN_OFF_BEFORE_MS = "1789995861000"
 WRITTEN_OFF_BEFORE_HEIGHT = "967727"
+# bsv-low #862 (L7-DEPTH): the host's spend depth (see the prod vars).
+SPEND_DEPTH = "1"
 
 # Beta's OWN session store. AUTH_SESSIONS and SERVER_PRIVATE_KEY are all-or-
 # nothing: the front door computes `configured = key AND kv`, and an
