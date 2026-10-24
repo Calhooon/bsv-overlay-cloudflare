@@ -9729,13 +9729,12 @@ where
             get(format!("{WOC_BASE}/tx/hash/{txid_lc}")).await,
             Some((404, _))
         );
-    // bsv-low #723: a spend a FALLBACK rung named (WoC faulted) carries no confirmation word: `null`, never `false`
-    let st = crate::results::spent_confirmed_unknown_after_fault(
-        crate::results::sharpen_unmined_absence(
-            crate::results::decide_spent_any(&woc, spender_raw_ok, bitails),
-            woc_node_absent,
-        ),
-        primary == "woc",
+    // bsv-low #723 / #868: a spend's confirmation word is the naming rung's own (`SpentObservation::Spent`): WoC's
+    // `status`, BananaBlocks' `spendScope`; a rung that did not say (pruned Bitails, a BananaBlocks answer without the
+    // scope) is `null`, never `false`
+    let st = crate::results::sharpen_unmined_absence(
+        crate::results::decide_spent_any(&woc, spender_raw_ok, bitails),
+        woc_node_absent,
     );
     let row = SpentAnyCached {
         known: st.known,
@@ -10494,7 +10493,8 @@ where
         };
         ARCADE_ROUTE_HEALTHY.with(|c| c.set(Some((now_ms, healthy))));
     }
-    let (mut observation, absence, claimed_height) = tx_any_courier_leg_via(txid, &get).await;
+    let (mut observation, absence, claimed_height, source) =
+        tx_any_courier_leg_via(txid, &get).await;
     if let TxObservation::Present { confirmed, raw_hex } = observation {
         if confirmed {
             let proven = if let Some(height) = claimed_height {
@@ -10517,23 +10517,23 @@ where
                 crate::courier::note_presence("tx_any_courier_proof_fault_total");
                 TxObservation::CourierHint {
                     raw_hex,
-                    source: "woc",
+                    source,
                     observed_at_ms: now_ms,
                 }
             };
         } else {
             observation = TxObservation::CourierHint {
                 raw_hex,
-                source: "woc",
+                source,
                 observed_at_ms: now_ms,
             };
         }
     }
-    if observation == TxObservation::Absent {
-        // WoC's node is one capable source. BananaBlocks is the convention's
-        // second candidate; its mempool capability is unprobed. Bitails is
-        // pruned and Arcade is a submitted-bytes store, so neither supplies
-        // the missing vote. UNKNOWN, counted, no request-time Absent memo.
+    if observation == TxObservation::Absent && absence == AbsenceCorroboration::Unknown {
+        // WoC's node is one capable source. BananaBlocks' native view is the second (bsv-low #868, probed
+        // 2026-10-24); when it did not answer its clean not-found the absence has one vote. Bitails is a
+        // positive-only witness and Arcade a submitted-bytes store, so neither supplies it. UNKNOWN, counted, no
+        // request-time Absent memo.
         crate::courier::note_presence("tx_any_one_capable_source_unknown_total");
     }
     (observation, absence, claimed_height)
@@ -10554,8 +10554,17 @@ where
             return Some(raw);
         }
     }
-    match get(format!("{BITAILS_BASE}/download/tx/{txid}")).await {
-        Some((200, body)) => crate::txany::verify_raw_bytes(&body, txid),
+    if let Some((200, body)) = get(format!("{BITAILS_BASE}/download/tx/{txid}")).await {
+        if let Some(raw) = crate::txany::verify_raw_bytes(&body, txid) {
+            return Some(raw);
+        }
+    }
+    // bsv-low #868: the third raw source, BananaBlocks' native `/tx/{txid}/hex` (probed 2026-10-24, `text/plain`)
+    match get(format!("{BANANABLOCKS_BASE}/tx/{txid}/hex")).await {
+        Some((200, body)) => std::str::from_utf8(&body)
+            .ok()
+            .and_then(|h| hex::decode(h.trim()).ok())
+            .and_then(|raw| crate::txany::verify_raw_bytes(&raw, txid)),
         _ => None,
     }
 }
@@ -10573,11 +10582,21 @@ where
     G: Fn(String) -> F,
     F: std::future::Future<Output = Option<(u16, Vec<u8>)>>,
 {
-    tx_any_courier_leg_via(txid, get).await
+    let (observation, absence, claimed_height, _) = tx_any_courier_leg_via(txid, get).await;
+    (observation, absence, claimed_height)
 }
 
 /// The external leg over a courier GET port (`get(url)` answers `provider_get`'s `(status, body)`): production passes
 /// `provider_get`, the pins a captured body (bsv-low #606).
+///
+/// bsv-low #868 (lane COURIER-RUNG, the probe `docs/audit/COURIER-CAPABILITY-2026-10-24.md`): the line goes down the
+/// couriers. WoC's `/tx/hash/{txid}` first; when it holds no positive, BananaBlocks' NATIVE `/tx/{txid}` (a capable
+/// mempool source: `confirmed`, `block_height`); when neither does, Bitails' `/tx/{txid}`, a POSITIVE-ONLY witness
+/// (its `confirmations: 0` is presence, its 404 "could not look"). The first positive answers, with its source (the
+/// hint's `hintSource`) and its claimed height (a mined claim is proven by the caller exactly as WoC's is). ABSENCE
+/// needs TWO capable sources: WoC's clean 404 behind its healthy route AND BananaBlocks' recorded not-found
+/// (`txany::bananablocks_tx_not_found`); one of them alone is the honest unknown. The WoC-style mirror of
+/// BananaBlocks is never asked. Each rung's answer is counted `tx_any_courier_<rung>_<outcome>_total`.
 async fn tx_any_courier_leg_via<G, F>(
     txid_lc: &str,
     get: G,
@@ -10586,6 +10605,8 @@ async fn tx_any_courier_leg_via<G, F>(
     crate::txany::AbsenceCorroboration,
     // bsv-low 2026-09-21: the courier's CLAIMED mined height (WoC's `blockheight`), for `TxAnyAnswer::claimed_height`
     Option<u64>,
+    // bsv-low #868: the rung whose answer this is (`woc`, `bananablocks`, `bitails`)
+    &'static str,
 )
 where
     G: Fn(String) -> F,
@@ -10601,32 +10622,17 @@ where
             // bsv-low #606: WoC's MEMPOOL body carries no `confirmations` field (probed live 2026-10-12: `hash,
             // locktime, size, txid, version, vin, vout`); a body of that shape for the asked txid IS a claim, present
             // and unconfirmed (`parse_woc_tx_claim`), and its raw is fetched and hash-verified below as a mined one's
-            Ok(v) if crate::txany::parse_woc_tx_claim(&v, txid_lc).is_none() => {
-                TxObservation::Fault
-            }
-            Ok(v) => {
-                let confirmed = crate::txany::parse_woc_tx_claim(&v, txid_lc).unwrap_or(false);
-                if confirmed {
-                    claimed_height = crate::txany::parse_woc_blockheight(&v);
+            Ok(v) => match crate::txany::parse_woc_tx_claim(&v, txid_lc) {
+                None => TxObservation::Fault,
+                Some(confirmed) => {
+                    if confirmed {
+                        claimed_height = crate::txany::parse_woc_blockheight(&v);
+                    }
+                    // Positive presence requires the raw in hand, hash-verified.
+                    let raw_hex = tx_any_courier_raw_via(txid_lc, &get).await;
+                    TxObservation::Present { confirmed, raw_hex }
                 }
-                // Positive presence requires the raw in hand, hash-verified
-                // (WoC hex first, Bitails binary fallback).
-                let raw = match get(format!("{WOC_BASE}/tx/{txid_lc}/hex")).await {
-                    Some((200, body)) => std::str::from_utf8(&body)
-                        .ok()
-                        .and_then(|h| hex::decode(h.trim()).ok()),
-                    _ => None,
-                };
-                let raw = match raw {
-                    Some(r) => Some(r),
-                    None => match get(format!("{BITAILS_BASE}/download/tx/{txid_lc}")).await {
-                        Some((200, body)) if !body.is_empty() => Some(body),
-                        _ => None,
-                    },
-                };
-                let raw_hex = raw.and_then(|r| crate::txany::verify_raw_bytes(&r, txid_lc));
-                TxObservation::Present { confirmed, raw_hex }
-            }
+            },
             Err(_) => TxObservation::Fault,
         },
         Some((404, _)) => {
@@ -10652,10 +10658,103 @@ where
         }
         _ => TxObservation::Fault,
     };
+    crate::courier::note_presence(&crate::txany::courier_rung_counter(
+        "woc",
+        crate::txany::CourierRungOutcome::of(&woc),
+    ));
+    if matches!(woc, TxObservation::Present { .. }) {
+        return (woc, AbsenceCorroboration::Unknown, claimed_height, "woc");
+    }
 
-    // No second general mempool-capable source has been established.
-    let absence = AbsenceCorroboration::Unknown;
-    (woc, absence, claimed_height)
+    // bsv-low #868: BananaBlocks' native view, the second capable mempool source
+    let mut banana_not_found = false;
+    let banana = match get(format!("{BANANABLOCKS_BASE}/tx/{txid_lc}")).await {
+        Some((200, body)) => match serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| crate::txany::parse_bananablocks_tx_claim(&v, txid_lc))
+        {
+            Some((confirmed, height)) => {
+                claimed_height = height;
+                let raw_hex = tx_any_courier_raw_via(txid_lc, &get).await;
+                TxObservation::Present { confirmed, raw_hex }
+            }
+            None => TxObservation::Fault,
+        },
+        Some((status, body)) if crate::txany::bananablocks_tx_not_found(status, &body) => {
+            banana_not_found = true;
+            TxObservation::Absent
+        }
+        _ => TxObservation::Fault,
+    };
+    crate::courier::note_presence(&crate::txany::courier_rung_counter(
+        "bananablocks",
+        crate::txany::CourierRungOutcome::of(&banana),
+    ));
+    if matches!(banana, TxObservation::Present { .. }) {
+        return (
+            banana,
+            AbsenceCorroboration::Unknown,
+            claimed_height,
+            "bananablocks",
+        );
+    }
+
+    // bsv-low #868: Bitails, a positive-only witness (its 404 is "could not look", never an absence)
+    let bitails = match get(format!("{BITAILS_BASE}/tx/{txid_lc}")).await {
+        Some((200, body)) => match serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| crate::txany::parse_bitails_tx_presence(&v, txid_lc))
+        {
+            Some((confirmed, height)) => {
+                claimed_height = height;
+                let raw_hex = tx_any_courier_raw_via(txid_lc, &get).await;
+                Some(TxObservation::Present { confirmed, raw_hex })
+            }
+            None => Some(TxObservation::Fault),
+        },
+        Some((404, _)) => None,
+        _ => Some(TxObservation::Fault),
+    };
+    crate::courier::note_presence(&crate::txany::courier_rung_counter(
+        "bitails",
+        bitails.as_ref().map_or(
+            crate::txany::CourierRungOutcome::CouldNotLook,
+            crate::txany::CourierRungOutcome::of,
+        ),
+    ));
+    if let Some(present @ TxObservation::Present { .. }) = bitails {
+        return (
+            present,
+            AbsenceCorroboration::Unknown,
+            claimed_height,
+            "bitails",
+        );
+    }
+
+    // No positive anywhere: WoC's clean 404 and BananaBlocks' clean not-found are two capable sources.
+    match woc {
+        TxObservation::Absent if banana_not_found => {
+            crate::courier::note_presence("tx_any_two_capable_sources_absent_total");
+            (
+                TxObservation::Absent,
+                AbsenceCorroboration::CorroboratedAbsent,
+                None,
+                "woc",
+            )
+        }
+        TxObservation::Absent => (
+            TxObservation::Absent,
+            AbsenceCorroboration::Unknown,
+            None,
+            "woc",
+        ),
+        _ => (
+            TxObservation::Fault,
+            AbsenceCorroboration::Unknown,
+            None,
+            "woc",
+        ),
+    }
 }
 
 /// The in-isolate `/tx-any` cache hit for `key`, if still inside its TTL.
@@ -13963,8 +14062,7 @@ mod e606_tests {
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let src = squash(include_str!("routes.rs"));
         for wired in [
-            "crate::results::spent_confirmed_unknown_after_fault(",
-            "primary==\"woc\",",
+            "crate::results::decide_spent_any(&woc,spender_raw_ok,bitails),",
             "letindex_proven=spent_any_index_proven(&ctx.env,&spenders).await;",
             "crate::results::spent_confirmed_word(e.spent_confirmed,index_proven.contains(&sp),crate::owed::checked_tracker_mined(views.as_ref(),&sp)==Some(true),tx_any_cached(&sp,now_f).is_some_and(|a|crate::txany::proof_mined_word(&a)),);",
             "crate::txany::spent_any_body_sourced(&entries,&terminals,&sources,)",
@@ -14042,6 +14140,285 @@ mod e606_tests {
         };
         assert_eq!(e723_body(&fault, true, true, true), frozen_fault);
         assert_eq!(e723_body(&unspent, true, true, true), frozen_unspent);
+    }
+
+    // ---- bsv-low #868 (lane COURIER-RUNG): BananaBlocks a capable second rung on the two reads where WoC stood
+    // alone. Every body below is one the probe recorded (`tests/fixtures/courier_probe_868.json`, verbatim from
+    // `COURIER-PROBE/requests.jsonl`, 2026-10-24), its identifiers rewritten only where the ladder must verify a
+    // spender's raw (the harness's `competitor()`), its keys and words untouched.
+    fn c868_recorded(key: &str) -> (u16, Vec<u8>, String) {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/courier_probe_868.json")).unwrap();
+        let b = &v["bodies"][key];
+        let url = b["url"].as_str().unwrap();
+        (
+            u16::try_from(b["status"].as_u64().unwrap()).unwrap(),
+            b["body"].as_str().unwrap().as_bytes().to_vec(),
+            url.to_string(),
+        )
+    }
+    /// The subject a recorded `GET .../tx/{txid}` asked about: its url's last segment.
+    fn c868_subject(key: &str) -> String {
+        let (_, _, url) = c868_recorded(key);
+        url.rsplit('/').next().unwrap().to_string()
+    }
+    /// A recorded spend body for the harness's outpoint `tx(0x07):0` and its verifiable spender.
+    fn c868_spend_body(key: &str, drop_scope: bool) -> Vec<u8> {
+        let (sp, _) = competitor();
+        let (status, body, _) = c868_recorded(key);
+        assert_eq!(status, 200, "{key}");
+        let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        v["spentTxid"] = serde_json::json!(sp);
+        v["txid"] = serde_json::json!(tx(0x07));
+        v["vout"] = serde_json::json!(0);
+        if drop_scope {
+            v.as_object_mut().unwrap().remove("spendScope");
+        }
+        v.to_string().into_bytes()
+    }
+
+    /// bsv-low #868 (a): THE SPENDER'S MINED WORD has two capable rungs. BananaBlocks' `GET /txo/{txid}/{vout}/spend`
+    /// answers `spendScope: "confirmed"` or `"unconfirmed"` (probed 2026-10-24, watched flipping at block 972477); a
+    /// spent answer without the scope is unknown (its docs: "read a spent output without `spendScope` as scope
+    /// unknown, not as confirmed"). Under a WoC `/spent` fault the ladder's `spentConfirmed` is BananaBlocks' word:
+    /// `true`, `false`, `null`. RED on `db3a0931`: `null` for every body (`parse_bananablocks_spent` hard-coded
+    /// `confirmed: false` and #723 nulled it).
+    #[test]
+    fn c868_a_bananablocks_spend_scope_is_the_mined_word_under_a_woc_fault() {
+        let (sp, raw) = competitor();
+        let t = tx(0x07);
+        for (label, body, want) in [
+            (
+                "confirmed",
+                c868_spend_body("bb_spend_confirmed", false),
+                Some(true),
+            ),
+            (
+                "unconfirmed",
+                c868_spend_body("bb_spend_unconfirmed", false),
+                Some(false),
+            ),
+            (
+                "the flip, before 972477",
+                c868_spend_body("bb_spend_flip_unconfirmed", false),
+                Some(false),
+            ),
+            (
+                "the flip, after 972477",
+                c868_spend_body("bb_spend_flip_confirmed", false),
+                Some(true),
+            ),
+            (
+                "no scope",
+                c868_spend_body("bb_spend_confirmed", true),
+                None,
+            ),
+        ] {
+            for woc in [Some((429u16, Vec::new())), Some((503, Vec::new())), None] {
+                let mut m = HashMap::new();
+                if let Some(w) = woc.clone() {
+                    m.insert(format!("{WOC_BASE}/tx/{t}/0/spent"), w);
+                }
+                m.insert(
+                    format!("{BANANABLOCKS_BASE}/txo/{t}/0/spend"),
+                    (200, body.clone()),
+                );
+                m.insert(
+                    format!("{WOC_BASE}/tx/{sp}/hex"),
+                    (200, hex::encode(&raw).into_bytes()),
+                );
+                let (row, _) = run(spent_any_resolve_via(&t, 0, courier(m)));
+                assert_eq!(
+                    (row.known, row.spent, row.spending_txid.as_deref()),
+                    (true, Some(true), Some(sp.as_str())),
+                    "{label}"
+                );
+                assert_eq!(row.spent_confirmed, want, "{label} under WoC {woc:?}");
+            }
+        }
+        // WoC's own word is unchanged, and still first (the ladder's order is not touched)
+        let mut m = HashMap::new();
+        m.insert(
+            format!("{WOC_BASE}/tx/{t}/0/spent"),
+            (
+                200,
+                serde_json::json!({"txid": sp, "vin": 0, "status": "unconfirmed"})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
+        m.insert(
+            format!("{BANANABLOCKS_BASE}/txo/{t}/0/spend"),
+            (200, c868_spend_body("bb_spend_confirmed", false)),
+        );
+        m.insert(
+            format!("{WOC_BASE}/tx/{sp}/hex"),
+            (200, hex::encode(&raw).into_bytes()),
+        );
+        let (row, _) = run(spent_any_resolve_via(&t, 0, courier(m)));
+        assert_eq!(row.spent_confirmed, Some(false), "WoC answered: its word");
+    }
+
+    /// The `/tx-any` presence leg for a FOREIGN subject over a courier map (WoC's route already known healthy).
+    fn c868_leg(
+        txid: &str,
+        m: HashMap<String, (u16, Vec<u8>)>,
+    ) -> (
+        crate::txany::TxAnyAnswer,
+        AbsenceCorroboration,
+        Option<u64>,
+        Vec<String>,
+    ) {
+        WOC_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
+        let asked = std::cell::RefCell::new(Vec::new());
+        let get = |url: String| {
+            asked.borrow_mut().push(url.clone());
+            std::future::ready(m.get(&url).cloned())
+        };
+        let now = crate::txany::rfc3339_utc_ms("2026-10-24T14:40:00Z").unwrap();
+        let (obs, absence, height) = run(tx_any_presence_leg_via(
+            txid,
+            now,
+            false,
+            None,
+            get,
+            |_, _| async { false },
+        ));
+        let mut a = decide_tx_any(None, None, Some(&obs), absence);
+        apply_external_height(&mut a, &obs, height);
+        let asked = asked.into_inner();
+        (a, absence, height, asked)
+    }
+
+    /// bsv-low #868 (b): AN UNMINED SUBJECT'S PRESENCE has a capable second rung, BananaBlocks' native
+    /// `GET /tx/{txid}` (probed 2026-10-24: `confirmed: false`, `block_height: 0` unmined; `confirmed: true` and
+    /// `block_height` mined, `confirmations` omitted at one confirmation; `confirmation_unknown: true` is "could not
+    /// look", by its docs, never seen live). Under a WoC fault its unmined answer is the courier HINT (`present:
+    /// null`, `hintSource: "bananablocks"`), its mined answer a CLAIM that is served `confirmed` only through the
+    /// checked proof (none here: a hint with `claimedHeight`), its `confirmation_unknown` no word. Bitails' 200 with
+    /// `confirmations: 0` is presence; its 404 (it dropped `e3340463...` while WoC and BananaBlocks held it) is
+    /// "could not look". ABSENCE needs WoC's node AND BananaBlocks' native view, each a clean 404. The WoC-style
+    /// mirror is never asked. RED on `db3a0931`: every arm read only WoC (`left: (None, None, None)`, the
+    /// two-404 absence `present: None`).
+    #[test]
+    fn c868_b_bananablocks_native_tx_is_a_capable_presence_rung() {
+        let unmined = c868_subject("bb_tx_unmined");
+        let (s, b, _) = c868_recorded("bb_tx_unmined");
+        // (1) WoC 429, BananaBlocks unmined: a hint from BananaBlocks
+        let mut m = HashMap::new();
+        m.insert(format!("{WOC_BASE}/tx/hash/{unmined}"), (429, Vec::new()));
+        m.insert(format!("{BANANABLOCKS_BASE}/tx/{unmined}"), (s, b.clone()));
+        let (a, absence, _, asked) = c868_leg(&unmined, m);
+        assert_eq!(
+            (a.present, a.confirmed, a.hint_source),
+            (None, None, Some("bananablocks")),
+            "unmined under a WoC fault"
+        );
+        assert_eq!(absence, AbsenceCorroboration::Unknown);
+        assert!(
+            !asked
+                .iter()
+                .any(|u| u.contains("/bsv/main/tx/hash/") && u.contains("bananablocks")),
+            "never the WoC-style mirror: {asked:?}"
+        );
+        // (2) WoC 429, BananaBlocks mined (the recorded body has no `confirmations`): a claim, no proof served, so a
+        // hint carrying the claimed height, never `confirmed`
+        let mined = c868_subject("bb_tx_mined");
+        let (s, b, _) = c868_recorded("bb_tx_mined");
+        let mut m = HashMap::new();
+        m.insert(format!("{WOC_BASE}/tx/hash/{mined}"), (429, Vec::new()));
+        m.insert(format!("{BANANABLOCKS_BASE}/tx/{mined}"), (s, b.clone()));
+        let (a, _, height, _) = c868_leg(&mined, m);
+        assert_eq!(
+            (a.present, a.confirmed, a.height, a.hint_source, height),
+            (None, None, None, Some("bananablocks"), Some(972_476)),
+            "a mined claim without a checked proof"
+        );
+        assert_eq!(a.claimed_height, Some(972_476));
+        // (3) `confirmation_unknown: true` (the docs' shape over the recorded body): could not look
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&c868_recorded("bb_tx_unmined").1).unwrap();
+        v["confirmation_unknown"] = serde_json::json!(true);
+        v["partial"] = serde_json::json!(true);
+        let mut m = HashMap::new();
+        m.insert(format!("{WOC_BASE}/tx/hash/{unmined}"), (429, Vec::new()));
+        m.insert(
+            format!("{BANANABLOCKS_BASE}/tx/{unmined}"),
+            (200, v.to_string().into_bytes()),
+        );
+        let (a, _, _, _) = c868_leg(&unmined, m);
+        assert_eq!(
+            (a.present, a.confirmed, a.hint_source),
+            (None, None, None),
+            "confirmation_unknown is no word"
+        );
+        // (4) WoC's 404 and BananaBlocks' recorded 404: two capable sources, a corroborated absence
+        let invented = c868_subject("bb_tx_not_found");
+        let (s, b, _) = c868_recorded("bb_tx_not_found");
+        let (bs, bb, _) = c868_recorded("bitails_tx_not_found");
+        let mut m = HashMap::new();
+        m.insert(format!("{WOC_BASE}/tx/hash/{invented}"), (404, Vec::new()));
+        m.insert(format!("{BANANABLOCKS_BASE}/tx/{invented}"), (s, b.clone()));
+        m.insert(format!("{BITAILS_BASE}/tx/{invented}"), (bs, bb.clone()));
+        let (a, absence, _, _) = c868_leg(&invented, m);
+        assert_eq!(absence, AbsenceCorroboration::CorroboratedAbsent);
+        assert_eq!((a.present, a.hint_source), (Some(false), None));
+        // (5) WoC's 404 beside a BananaBlocks fault, and a BananaBlocks 404 beside a WoC fault: one source, unknown
+        for (woc, banana) in [
+            ((404u16, Vec::new()), (429u16, Vec::new())),
+            ((429, Vec::new()), (s, b.clone())),
+            // a 404 that is not BananaBlocks' recorded not-found body is no word either
+            ((404, Vec::new()), (404, Vec::new())),
+        ] {
+            let mut m = HashMap::new();
+            m.insert(format!("{WOC_BASE}/tx/hash/{invented}"), woc.clone());
+            m.insert(format!("{BANANABLOCKS_BASE}/tx/{invented}"), banana.clone());
+            let (a, absence, _, _) = c868_leg(&invented, m);
+            assert_eq!(absence, AbsenceCorroboration::Unknown, "{woc:?} {banana:?}");
+            assert_eq!(a.present, None, "{woc:?} {banana:?}");
+        }
+        // (6) Bitails' 200 with `confirmations: 0` is presence (WoC and BananaBlocks could not look)
+        let dropped = c868_subject("bitails_tx_unmined");
+        let (s, b, _) = c868_recorded("bitails_tx_unmined");
+        let mut m = HashMap::new();
+        m.insert(format!("{WOC_BASE}/tx/hash/{dropped}"), (429, Vec::new()));
+        m.insert(
+            format!("{BANANABLOCKS_BASE}/tx/{dropped}"),
+            (429, Vec::new()),
+        );
+        m.insert(format!("{BITAILS_BASE}/tx/{dropped}"), (s, b.clone()));
+        let (a, _, _, _) = c868_leg(&dropped, m);
+        assert_eq!(
+            (a.present, a.confirmed, a.hint_source),
+            (None, None, Some("bitails")),
+            "Bitails' positive"
+        );
+        // ... and outranks the two clean 404s
+        let (ns, nb, _) = c868_recorded("bb_tx_not_found");
+        let mut m = HashMap::new();
+        m.insert(format!("{WOC_BASE}/tx/hash/{dropped}"), (404, Vec::new()));
+        m.insert(
+            format!("{BANANABLOCKS_BASE}/tx/{dropped}"),
+            (ns, nb.clone()),
+        );
+        m.insert(format!("{BITAILS_BASE}/tx/{dropped}"), (s, b.clone()));
+        let (a, _, _, _) = c868_leg(&dropped, m);
+        assert_eq!(
+            a.hint_source,
+            Some("bitails"),
+            "a positive outranks negatives"
+        );
+        // (7) Bitails' recorded 404 for that same subject (it dropped it) is "could not look", never absence
+        let (s, b, _) = c868_recorded("bitails_tx_dropped_404");
+        let mut m = HashMap::new();
+        m.insert(format!("{WOC_BASE}/tx/hash/{dropped}"), (404, Vec::new()));
+        m.insert(
+            format!("{BANANABLOCKS_BASE}/tx/{dropped}"),
+            (429, Vec::new()),
+        );
+        m.insert(format!("{BITAILS_BASE}/tx/{dropped}"), (s, b.clone()));
+        let (a, absence, _, _) = c868_leg(&dropped, m);
+        assert_eq!((a.present, absence), (None, AbsenceCorroboration::Unknown));
     }
 
     /// The E606 lens's L4: the spender memo is bounded by bytes beside its count. Entries of many outputs fill the

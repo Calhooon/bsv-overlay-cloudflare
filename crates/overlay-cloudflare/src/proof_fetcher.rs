@@ -184,9 +184,6 @@ impl ProofSources {
         }
         enabled
     }
-    pub(crate) async fn bitails_presence(self, txid: &str) -> Option<NetworkPresence> {
-        self.bitails_presence_counted(txid, None).await
-    }
     pub(crate) async fn bitails_presence_counted(
         self,
         txid: &str,
@@ -203,8 +200,49 @@ impl ProofSources {
             None,
             "bitails_presence",
             counters,
+            bitails_presence_response,
         )
         .await
+    }
+    /// bsv-low #868: BananaBlocks' NATIVE `GET /api/v1/tx/{txid}`, a capable mempool source
+    /// ([`bananablocks_presence_response`]), on its own rung (`bananablocks_presence`, the provider's pacer). Never
+    /// its WoC-style mirror (`/bsv/main/tx/hash/{txid}`): that mined body carries no `confirmations`.
+    pub(crate) async fn bananablocks_presence_counted(
+        self,
+        txid: &str,
+        counters: Option<&CourierCounters>,
+    ) -> Option<NetworkPresence> {
+        if !self.permits("bananablocks") {
+            return None;
+        }
+        presence_counted(
+            &format!("{DEFAULT_BANANABLOCKS_BASE}/tx/{txid}"),
+            None,
+            "bananablocks_presence",
+            counters,
+            |status, body| bananablocks_presence_response(status, body, txid),
+        )
+        .await
+    }
+    /// bsv-low #868: THE MEMPOOL SOURCE BESIDE WoC's NODE in the host's two-source fold (`door_words::courier_presence`,
+    /// whose first slot this answers; the fold itself is unchanged): Bitails first (a positive-only witness: its 200
+    /// is presence, its 404 "could not look"), then, when Bitails holds no positive, BananaBlocks' native view, whose
+    /// clean not-found is the slot's only ABSENCE. So an absence still needs two capable sources, WoC's node and
+    /// BananaBlocks, each a clean 404; Bitails' 404 can no longer be one of them (probed 2026-10-24: it dropped a
+    /// below-floor transaction WoC's node and BananaBlocks still held). Answers the source whose word it is.
+    pub(crate) async fn mempool_witness_presence_counted(
+        self,
+        txid: &str,
+        counters: Option<&CourierCounters>,
+    ) -> (&'static str, Option<NetworkPresence>) {
+        let bitails = self.bitails_presence_counted(txid, counters).await;
+        if matches!(bitails, Some(NetworkPresence::Present { .. })) {
+            return (crate::door_words::BITAILS_SOURCE, bitails);
+        }
+        (
+            crate::door_words::BANANABLOCKS_SOURCE,
+            self.bananablocks_presence_counted(txid, counters).await,
+        )
     }
     pub(crate) async fn woc_presence(
         self,
@@ -227,6 +265,7 @@ impl ProofSources {
             key.map(|k| ("woc-api-key", k)),
             "woc_presence",
             counters,
+            presence_response,
         )
         .await
     }
@@ -4041,6 +4080,59 @@ pub fn presence_response(status: u16, body: &str) -> Option<NetworkPresence> {
     Some(NetworkPresence::Present { height })
 }
 
+/// bsv-low #868: Bitails' `GET /tx/{txid}` as presence evidence: a POSITIVE-only witness. Its 200 (`confirmations: 0`
+/// unmined on five of five subjects, `blockheight` mined; probed 2026-10-24) is read as [`presence_response`] reads
+/// it; its 404 is "could not look" (`None`), never an absence: it dropped `e3340463...`, a below-floor transaction it
+/// had served, while WoC's node and BananaBlocks still held it.
+pub fn bitails_presence_response(status: u16, body: &str) -> Option<NetworkPresence> {
+    if status == 404 {
+        return None;
+    }
+    presence_response(status, body)
+}
+
+/// bsv-low #868: BananaBlocks' NATIVE `GET /api/v1/tx/{txid}` as presence evidence for the asked `txid` (probed
+/// 2026-10-24, bsv-low `docs/audit/COURIER-CAPABILITY-2026-10-24.md`): its `confirmed: false` (`block_height: 0`) is
+/// mempool presence, `confirmed: true` with a positive `block_height` presence at that height (`confirmations` is
+/// omitted at one confirmation and never read), its recorded not-found (`404 {"error":"Transaction not found"}`)
+/// the clean absence; `confirmation_unknown: true` (documented: the block read failed), another txid's body, any
+/// other 404 and any other answer are "could not look" (`None`).
+pub fn bananablocks_presence_response(
+    status: u16,
+    body: &str,
+    txid: &str,
+) -> Option<NetworkPresence> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    if status == 404 {
+        return (value.get("error").and_then(|e| e.as_str()) == Some("Transaction not found"))
+            .then_some(NetworkPresence::Absent);
+    }
+    if !(200..300).contains(&status)
+        || !value
+            .get("txid")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.eq_ignore_ascii_case(txid))
+        || value
+            .get("confirmation_unknown")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        return None;
+    }
+    let height = value
+        .get("block_height")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|h| u32::try_from(h).ok())
+        .filter(|h| *h > 0);
+    match value
+        .get("confirmed")
+        .and_then(serde_json::Value::as_bool)?
+    {
+        false => Some(NetworkPresence::Present { height: None }),
+        true => height.map(|h| NetworkPresence::Present { height: Some(h) }),
+    }
+}
+
 /// Presence-only consumers retain their existing absence bar.
 pub fn presence_bool(presence: NetworkPresence) -> bool {
     matches!(presence, NetworkPresence::Present { .. })
@@ -4131,11 +4223,12 @@ async fn presence_counted(
     header: Option<(&str, &str)>,
     provider: &str,
     counters: Option<&CourierCounters>,
+    read: impl Fn(u16, &str) -> Option<NetworkPresence>,
 ) -> Option<NetworkPresence> {
     let (response, mut observation) = http_get_counted(url, header, counters, provider).await;
     let (presence, outcome) = match response {
         Ok((status, body)) => {
-            let presence = presence_response(status, &body);
+            let presence = read(status, &body);
             let outcome = CourierOutcome::response(
                 status,
                 presence.is_some(),
@@ -4194,12 +4287,12 @@ pub(crate) async fn rebroadcast_absent_admitted(
         // Presence probe: Bitails first (WoC is the free-tier-429 host — it
         // is only consulted when Bitails did not already prove presence).
         // bsv-low #619 (L3): each answer as the tracker's hint from its source, folded by the host's bar
-        use crate::door_words::{courier_hint, CourierWord, BITAILS_SOURCE, WOC_SOURCE};
-        let bitails = courier_hint(
-            BITAILS_SOURCE,
-            sources.bitails_presence_counted(txid, counters).await,
-            0,
-        );
+        // bsv-low #868: the slot beside WoC's node is Bitails' positive, else BananaBlocks' native view
+        use crate::door_words::{courier_hint, CourierWord, WOC_SOURCE};
+        let (source, witness) = sources
+            .mempool_witness_presence_counted(txid, counters)
+            .await;
+        let bitails = courier_hint(source, witness, 0);
         if matches!(bitails, CourierWord::Holds(_)) {
             summary.present += 1;
             continue;
@@ -5495,10 +5588,12 @@ impl RetirePort for WorkerRetire<'_> {
     async fn lock_bound(&self, txid: &str) -> crate::door_words::LockBound {
         crate::admit_fast::stored_lock_bound(self.tracker.as_deref(), self.db, txid).await
     }
+    /// bsv-low #868: the mempool witness beside WoC's node (Bitails' positive, else BananaBlocks' native view).
     async fn bitails(&self, txid: &str) -> Option<NetworkPresence> {
         self.sources
-            .bitails_presence_counted(txid, self.counters.as_ref())
+            .mempool_witness_presence_counted(txid, self.counters.as_ref())
             .await
+            .1
     }
     async fn woc(&self, txid: &str) -> Option<NetworkPresence> {
         self.sources
@@ -10699,7 +10794,7 @@ pub(crate) mod tests {
         assert!(fetcher.output_script_from_courier("aa", 0).await.is_err());
         assert!(fetcher.scripthash_history_ladder("aa", "bb").await.is_err());
         let sources = ProofSources::default();
-        assert!(sources.bitails_presence("aa").await.is_none());
+        assert!(sources.bitails_presence_counted("aa", None).await.is_none());
         assert!(sources.woc_presence(None, "aa").await.is_none());
         assert_eq!(
             sources

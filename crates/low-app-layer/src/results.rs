@@ -3288,9 +3288,13 @@ pub fn spent_any_cache_fresh(written_at_ms: f64, now_ms: f64, max_age_ms: f64) -
 /// route glue. The pure decision logic below is what unit tests pin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpentObservation {
-    /// WoC 200: a spender txid (lowercase hex) + whether WoC reports the
-    /// spend confirmed.
-    Spent { txid: String, confirmed: bool },
+    /// A spender txid (lowercase hex) + the rung's word on whether the spend is mined: `Some(true)` mined,
+    /// `Some(false)` in the mempool, `None` the rung did not say (bsv-low #868: Bitails' tx body never says,
+    /// BananaBlocks says only through `spendScope`; neither is ever read as `false`).
+    Spent {
+        txid: String,
+        confirmed: Option<bool>,
+    },
     /// WoC 404/410: "unspent or not yet indexed" — a real, if weak, answer.
     NotSpent,
     /// Transport / 5xx / rate-limit / auth / malformed body — we could not
@@ -3345,7 +3349,16 @@ pub fn decide_spent_any(
     match woc {
         SpentObservation::Spent { txid, confirmed } => {
             if spender_raw_ok {
-                crate::logic::OutpointStatus::known(&op, true, Some(txid.clone()), *confirmed)
+                // bsv-low #868: the rung's word, `None` (wire `null`, "could not look") where it gave none
+                crate::logic::OutpointStatus {
+                    spent_confirmed: *confirmed,
+                    ..crate::logic::OutpointStatus::known(
+                        &op,
+                        true,
+                        Some(txid.clone()),
+                        confirmed.unwrap_or(false),
+                    )
+                }
             } else {
                 // Unverifiable pointer → honest unknown, never a bare claim.
                 // #323 defect 2: say WHY. A CONFIRMED spend whose raw could
@@ -3391,20 +3404,6 @@ pub fn sharpen_unmined_absence(
 ) -> crate::logic::OutpointStatus {
     if woc_node_absent && st.reason == Some(crate::logic::SPENT_ANY_REASON_PROVIDER_FAULT) {
         st.reason = Some(crate::logic::SPENT_ANY_REASON_UNCORROBORATED);
-    }
-    st
-}
-
-/// bsv-low #723: the ladder's confirmation word of a KNOWN spend is a courier's: WoC `/0/spent`'s `status`. When WoC
-/// faulted and a fallback rung named the spender (BananaBlocks, Bitails' tx body), that rung cannot say whether the
-/// spend is mined (its `confirmed: false` is a placeholder, not a word), so the row's `spentConfirmed` is `None`
-/// (wire `null`, "could not look"), never `false`. Every other row is unchanged.
-pub fn spent_confirmed_unknown_after_fault(
-    mut st: crate::logic::OutpointStatus,
-    woc_was_primary: bool,
-) -> crate::logic::OutpointStatus {
-    if !woc_was_primary && st.known && st.spent == Some(true) {
-        st.spent_confirmed = None;
     }
     st
 }
@@ -3468,7 +3467,7 @@ pub fn parse_woc_spent_body(v: &serde_json::Value) -> SpentObservation {
     let confirmed = v.get("status").and_then(|s| s.as_str()) == Some("confirmed");
     SpentObservation::Spent {
         txid: txid.to_ascii_lowercase(),
-        confirmed,
+        confirmed: Some(confirmed),
     }
 }
 
@@ -3499,6 +3498,8 @@ pub fn parse_bananablocks_unspent(
 /// observation — `{"spent":true,"spentTxid"}` names a spender, `{"spent":
 /// false}` is NotSpent, everything else (404 = never indexed, 429, 5xx,
 /// malformed) is Fault ("could not look").
+///
+/// bsv-low #868: the spend's MINED word is `spendScope` ([`bananablocks_spend_scope`]).
 pub fn parse_bananablocks_spent(status: u16, v: Option<&serde_json::Value>) -> SpentObservation {
     if status != 200 {
         return SpentObservation::Fault;
@@ -3512,14 +3513,25 @@ pub fn parse_bananablocks_spent(status: u16, v: Option<&serde_json::Value>) -> S
             Some(t) if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) => {
                 SpentObservation::Spent {
                     txid: t.to_ascii_lowercase(),
-                    // BananaBlocks does not say whether the spend is mined; the
-                    // raw-verification + the caller's confirmation reads decide.
-                    confirmed: false,
+                    confirmed: bananablocks_spend_scope(val),
                 }
             }
             _ => SpentObservation::Fault,
         },
         None => SpentObservation::Fault,
+    }
+}
+
+/// PURE (bsv-low #868): the mined word of a BananaBlocks spent answer, its `spendScope` (probed 2026-10-24 on six
+/// outpoints, watched flipping at block 972477): `"confirmed"` is a spend in a block (`Some(true)`), `"unconfirmed"`
+/// one in the mempool (`Some(false)`), and an ABSENT scope (its docs: the spender's block status could not be
+/// checked; "read a spent output without `spendScope` as scope unknown, not as confirmed") or any other value is
+/// `None`, never confirmed and never unconfirmed. The body carries no height; the ladder's word is mined or not.
+pub fn bananablocks_spend_scope(v: &serde_json::Value) -> Option<bool> {
+    match v.get("spendScope").and_then(serde_json::Value::as_str) {
+        Some("confirmed") => Some(true),
+        Some("unconfirmed") => Some(false),
+        _ => None,
     }
 }
 
@@ -3555,7 +3567,8 @@ pub fn parse_bitails_tx_spent(
             Some(t) if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) => {
                 SpentObservation::Spent {
                     txid: t.to_ascii_lowercase(),
-                    confirmed: false,
+                    // pruned Bitails' tx body says nothing of the spender's block
+                    confirmed: None,
                 }
             }
             _ => SpentObservation::Fault,
@@ -5415,7 +5428,7 @@ mod tests {
         let unverified = decide_spent_any(
             &SpentObservation::Spent {
                 txid: spender.clone(),
-                confirmed: true,
+                confirmed: Some(true),
             },
             false,
             UnspentCorroboration::Unknown,
@@ -7027,6 +7040,67 @@ mod courier_ladder_2026_09_04 {
             parse_bananablocks_unspent(200, Some(&spent)),
             UnspentCorroboration::Unknown,
             "a contradiction is unknown"
+        );
+    }
+
+    /// bsv-low #868: `parse_bananablocks_spent` reads `spendScope`, over the probe's recorded bodies verbatim.
+    #[test]
+    fn c868_bananablocks_spent_reads_the_spend_scope() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/courier_probe_868.json")).unwrap();
+        let rec = |k: &str| -> serde_json::Value {
+            serde_json::from_str(v["bodies"][k]["body"].as_str().unwrap()).unwrap()
+        };
+        for (k, spender, want) in [
+            (
+                "bb_spend_confirmed",
+                "95f02029a85f3766b20bcb3d6a3b4393f5055232ef6458ec614bcdd63d7eac6b",
+                Some(true),
+            ),
+            (
+                "bb_spend_unconfirmed",
+                "e3340463baaceb6943dec5d82f612a247d2d1227f1b64f6e5c1438e5ff4e8d58",
+                Some(false),
+            ),
+            (
+                "bb_spend_flip_unconfirmed",
+                "ce1e6ac2bbe583770e9c1d5cb31b55bacbcbea69cc0c9810ea62538837792f81",
+                Some(false),
+            ),
+            (
+                "bb_spend_flip_confirmed",
+                "ce1e6ac2bbe583770e9c1d5cb31b55bacbcbea69cc0c9810ea62538837792f81",
+                Some(true),
+            ),
+        ] {
+            let body = rec(k);
+            assert_eq!(
+                parse_bananablocks_spent(200, Some(&body)),
+                SpentObservation::Spent {
+                    txid: spender.to_string(),
+                    confirmed: want
+                },
+                "{k}"
+            );
+            let mut no_scope = body.clone();
+            no_scope.as_object_mut().unwrap().remove("spendScope");
+            assert_eq!(
+                parse_bananablocks_spent(200, Some(&no_scope)),
+                SpentObservation::Spent {
+                    txid: spender.to_string(),
+                    confirmed: None
+                },
+                "{k} without its scope: unknown, never confirmed"
+            );
+        }
+        assert_eq!(
+            parse_bananablocks_spent(200, Some(&rec("bb_spend_unspent"))),
+            SpentObservation::NotSpent
+        );
+        let not_found = rec("bb_spend_not_found");
+        assert_eq!(
+            parse_bananablocks_spent(404, Some(&not_found)),
+            SpentObservation::Fault
         );
     }
 

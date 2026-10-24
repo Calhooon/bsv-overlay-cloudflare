@@ -685,7 +685,7 @@ fn spender_raw_verification_uses_real_bytes() {
 fn spent_any_decision_table_is_fail_safe() {
     let spent = SpentObservation::Spent {
         txid: REFUND_TXID.to_string(),
-        confirmed: true,
+        confirmed: Some(true),
     };
     // Positive + verified raw → known spent with the spender.
     let st = decide_spent_any(&spent, true, UnspentCorroboration::Unknown);
@@ -733,7 +733,7 @@ fn provider_body_parsers_are_strict() {
         parse_woc_spent_body(&woc),
         SpentObservation::Spent {
             txid: ENFORCED_SETTLE_TXID.to_string(),
-            confirmed: true
+            confirmed: Some(true)
         }
     );
     // Unconfirmed / missing status → spent but not confirmed.
@@ -741,7 +741,7 @@ fn provider_body_parsers_are_strict() {
     assert!(matches!(
         parse_woc_spent_body(&woc),
         SpentObservation::Spent {
-            confirmed: false,
+            confirmed: Some(false),
             ..
         }
     ));

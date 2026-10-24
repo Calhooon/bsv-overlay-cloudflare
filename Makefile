@@ -623,7 +623,7 @@ ci-d1-budget:
 	( cd crates/overlay-cloudflare && exec env $$seal npx wrangler dev --local --log-level debug --port $$PR --inspector-port $$IR --ip 127.0.0.1 --persist-to "$$rv_state" \
 	    --var ARCADE_URL:http://127.0.0.1:$$PS/arcade \
 	    --var COURIER_SINK:http://127.0.0.1:$$PS \
-	    --var PROOF_SOURCES:arcade,woc,bitails \
+	    --var PROOF_SOURCES:arcade,bananablocks,woc,bitails \
 	    --var INTERNAL_TOKEN:ci-internal-tok \
 	    --var ADMIN_TOKEN:ci-admin-tok \
 	    --var MAINNET_FANOUT:false \

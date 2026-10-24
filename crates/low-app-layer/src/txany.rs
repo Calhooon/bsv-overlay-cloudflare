@@ -764,6 +764,128 @@ pub fn parse_woc_tx_claim(v: &serde_json::Value, txid_lc: &str) -> Option<bool> 
     (txid_ok && shaped && !mined_keys).then_some(false)
 }
 
+/// bsv-low #868: the outcome of ONE courier rung's presence ask on `/tx-any`'s external leg, the last word of its
+/// counter `tx_any_courier_<rung>_<outcome>_total` (the family beside `tx_any_courier_proof_fault_total`, extended,
+/// never renamed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CourierRungOutcome {
+    /// present and unconfirmed
+    Present,
+    /// a mined claim (proven or not: the proof's fault keeps its own counter)
+    Mined,
+    /// the rung's clean "not held" (WoC behind its healthy route, BananaBlocks' recorded not-found)
+    Absent,
+    /// the rung cannot answer this question (Bitails' 404)
+    CouldNotLook,
+    /// transport, rate limit, 5xx, a body that is no claim
+    Fault,
+}
+
+impl CourierRungOutcome {
+    /// The outcome of a rung's observation (a `Present` by its `confirmed`).
+    pub fn of(observation: &TxObservation) -> Self {
+        match observation {
+            TxObservation::Present {
+                confirmed: true, ..
+            } => Self::Mined,
+            TxObservation::Present { .. } => Self::Present,
+            TxObservation::Absent => Self::Absent,
+            _ => Self::Fault,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Mined => "mined",
+            Self::Absent => "absent",
+            Self::CouldNotLook => "couldnotlook",
+            Self::Fault => "fault",
+        }
+    }
+}
+
+/// bsv-low #868: the courier rungs of `/tx-any`'s external leg, in the order they are asked.
+pub const COURIER_PRESENCE_RUNGS: [&str; 3] = ["woc", "bananablocks", "bitails"];
+
+/// bsv-low #868: `tx_any_courier_<rung>_<outcome>_total`.
+pub fn courier_rung_counter(rung: &str, outcome: CourierRungOutcome) -> String {
+    format!("tx_any_courier_{rung}_{}_total", outcome.name())
+}
+
+/// PURE (bsv-low #868): BananaBlocks' NATIVE `GET /api/v1/tx/{txid}` 200 body as a presence claim for the asked
+/// `txid_lc`: `Some((false, None))` present and UNCONFIRMED, `Some((true, Some(height)))` a MINED claim, `None` no
+/// word (the leg's fault). Probed 2026-10-24 on five unmined subjects and their block (bsv-low
+/// `docs/audit/COURIER-CAPABILITY-2026-10-24.md`): an unmined body is `confirmed: false`, `block_height: 0`,
+/// `block_time: 0`, no `block_hash`, no `confirmations`; a mined one `confirmed: true`, `block_height`, `block_hash`
+/// and `confirmations` (omitted at one confirmation: block 972476's subjects). Read, as its docs say, by the
+/// always-present `confirmed` boolean and `block_height`, never by `confirmations` (a missing field is never a
+/// fault). `confirmation_unknown: true` ("the block read failed, so `confirmed: false` is not a verdict that the
+/// transaction is unmined", documented, never seen live) is no word; so is a body for another txid, a `confirmed`
+/// that is not a boolean, and a mined body without a positive height. The WoC-style mirror
+/// (`/api/v1/bsv/main/tx/hash/{txid}`) is never read for presence: its mined body carries no `confirmations`.
+pub fn parse_bananablocks_tx_claim(
+    v: &serde_json::Value,
+    txid_lc: &str,
+) -> Option<(bool, Option<u64>)> {
+    let txid_ok = v
+        .get("txid")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|t| t.eq_ignore_ascii_case(txid_lc));
+    if !txid_ok
+        || v.get("confirmation_unknown")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        return None;
+    }
+    let height = v
+        .get("block_height")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|h| *h > 0);
+    match v.get("confirmed").and_then(serde_json::Value::as_bool)? {
+        false => Some((false, None)),
+        true => height.map(|h| (true, Some(h))),
+    }
+}
+
+/// PURE (bsv-low #868): is this BananaBlocks native `/tx/{txid}` answer its CLEAN "not held"? A 404 whose body is
+/// the recorded `{"error":"Transaction not found"}` (probed 2026-10-24 on an invented txid). Any other 404 (an empty
+/// body, a proxy's page) is no word. Never an absence by itself: the leg needs WoC's node to say so too.
+pub fn bananablocks_tx_not_found(status: u16, body: &[u8]) -> bool {
+    status == 404
+        && serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+            .as_deref()
+            == Some("Transaction not found")
+}
+
+/// PURE (bsv-low #868): Bitails' `GET /tx/{txid}` 200 body as a POSITIVE presence witness for the asked `txid_lc`:
+/// `confirmations: 0` is present and UNCONFIRMED (five of five unmined subjects, probed 2026-10-24); a positive
+/// `confirmations` with a positive `blockheight` a MINED claim; anything else no word. Its 404 is never read here: it is
+/// "could not look" (it dropped `e3340463...`, a below-floor transaction it had served, while WoC's node and
+/// BananaBlocks still held it), never an absence.
+pub fn parse_bitails_tx_presence(
+    v: &serde_json::Value,
+    txid_lc: &str,
+) -> Option<(bool, Option<u64>)> {
+    let txid_ok = v
+        .get("txid")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|t| t.eq_ignore_ascii_case(txid_lc));
+    if !txid_ok {
+        return None;
+    }
+    match v.get("confirmations").and_then(serde_json::Value::as_u64)? {
+        0 => Some((false, None)),
+        _ => v
+            .get("blockheight")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|h| *h > 0)
+            .map(|h| (true, Some(h))),
+    }
+}
+
 /// Verify externally-fetched raw bytes: they must parse AND hash to `txid`.
 /// Returns the lowercase hex, or `None` (a lying/garbled provider byte never
 /// leaves the server).
@@ -1978,5 +2100,77 @@ mod tests {
         assert!(sql.contains("FROM pot_beefs"));
         assert!(tx_any_index_leg_batch_sql("transactions", "has_proof", 1)
             .contains("has_proof AS proofVerified"));
+    }
+
+    /// bsv-low #868: the three new readers over the probe's recorded bodies, verbatim
+    /// (`tests/fixtures/courier_probe_868.json`).
+    #[test]
+    fn c868_the_presence_readers_read_the_recorded_bodies() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/courier_probe_868.json")).unwrap();
+        let rec = |k: &str| {
+            let b = &v["bodies"][k];
+            let url = b["url"].as_str().unwrap();
+            (
+                u16::try_from(b["status"].as_u64().unwrap()).unwrap(),
+                b["body"].as_str().unwrap().to_string(),
+                url.rsplit('/').next().unwrap().to_string(),
+            )
+        };
+        let json = |b: &str| serde_json::from_str::<serde_json::Value>(b).unwrap();
+        for (k, want) in [
+            ("bb_tx_unmined", Some((false, None))),
+            ("bb_tx_flip_unmined", Some((false, None))),
+            ("bb_tx_mined", Some((true, Some(972_476)))),
+            (
+                "bb_tx_mined_with_confirmations",
+                Some((true, Some(972_341))),
+            ),
+            ("bb_tx_flip_mined", Some((true, Some(972_477)))),
+        ] {
+            let (status, body, txid) = rec(k);
+            assert_eq!(status, 200);
+            assert_eq!(
+                parse_bananablocks_tx_claim(&json(&body), &txid),
+                want,
+                "{k}"
+            );
+            assert_eq!(
+                parse_bananablocks_tx_claim(&json(&body), &"00".repeat(32)),
+                None,
+                "{k}: another txid's body"
+            );
+            let mut unknown = json(&body);
+            unknown["confirmation_unknown"] = serde_json::json!(true);
+            assert_eq!(parse_bananablocks_tx_claim(&unknown, &txid), None, "{k}");
+        }
+        let (status, body, _) = rec("bb_tx_not_found");
+        assert!(bananablocks_tx_not_found(status, body.as_bytes()));
+        assert!(!bananablocks_tx_not_found(404, b""));
+        assert!(!bananablocks_tx_not_found(429, body.as_bytes()));
+        let (status, body, _) = rec("bitails_tx_not_found");
+        assert!(
+            !bananablocks_tx_not_found(status, body.as_bytes()),
+            "Bitails' 404 body"
+        );
+        for (k, want) in [
+            ("bitails_tx_unmined", Some((false, None))),
+            ("bitails_tx_mined", Some((true, Some(972_476)))),
+        ] {
+            let (_, body, txid) = rec(k);
+            assert_eq!(parse_bitails_tx_presence(&json(&body), &txid), want, "{k}");
+        }
+        // the WoC-style mirror is not this reader's body: WoC's own claim reader is (its keys, no `confirmed`)
+        assert_eq!(
+            parse_bananablocks_tx_claim(
+                &serde_json::json!({"txid": "ab".repeat(32), "vin": [], "vout": []}),
+                &"ab".repeat(32)
+            ),
+            None
+        );
+        assert_eq!(
+            courier_rung_counter("bananablocks", CourierRungOutcome::Present),
+            "tx_any_courier_bananablocks_present_total"
+        );
     }
 }
