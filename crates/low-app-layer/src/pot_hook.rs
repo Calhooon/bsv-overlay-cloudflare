@@ -469,10 +469,12 @@ impl Stmt {
 }
 
 /// What one statement of a batch answered: its rows (JSON objects by column name) and the rows it changed.
+/// `changes` is `None` when the platform's answer carries no count (D1's `meta.changes` is optional): never read as
+/// zero rows written (bsv-low #798, the MONEY-DOOR lens's LOW-2).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StmtOut {
     pub rows: Vec<Value>,
-    pub changes: u64,
+    pub changes: Option<u64>,
 }
 
 /// The SQL under [`HookD1`]: ONE `run_batch` is one D1 round trip (the worker's `D1Sql` runs `counted_batch`), atomic
@@ -770,7 +772,7 @@ impl<P: SqlPort> HookStore for HookD1<P> {
             .iter()
             .zip(ops)
             .map(|(o, op)| OpOut {
-                changes: o.changes,
+                changes: o.changes.unwrap_or(0),
                 generation: match op {
                     ParkOp::Park { .. } => o
                         .rows
@@ -1749,7 +1751,7 @@ pub(crate) mod tests {
             }
             Ok(StmtOut {
                 rows,
-                changes: self.conn.changes(),
+                changes: Some(self.conn.changes()),
             })
         }
     }

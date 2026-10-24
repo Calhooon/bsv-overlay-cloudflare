@@ -3160,7 +3160,12 @@ impl crate::pot_hook::SqlPort for D1Sql {
                 let rows = r
                     .results::<serde_json::Value>()
                     .map_err(|e| e.to_string())?;
-                let changes = r.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) as u64;
+                let changes = r
+                    .meta()
+                    .ok()
+                    .flatten()
+                    .and_then(|m| m.changes)
+                    .map(|n| n as u64);
                 Ok(crate::pot_hook::StmtOut { rows, changes })
             })
             .collect()
