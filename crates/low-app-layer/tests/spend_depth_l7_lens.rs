@@ -46,7 +46,8 @@ fn lens_the_vars_edge_values() {
         ("006", (6, true)),
         ("\t2\n", (2, true)),
         ("144", (144, true)),
-        ("4294967295", (4_294_967_295, true)),
+        ("145", (1, false)),
+        ("4294967295", (1, false)),
         ("4294967296", (1, false)),
         ("\u{ff12}", (1, false)),
         ("1 2", (1, false)),
@@ -58,21 +59,23 @@ fn lens_the_vars_edge_values() {
     }
 }
 
-/// FINDING (the lens's MEDIUM-1): the server serves a well-formed depth past the client's bound
-/// (`SERVED_SPEND_DEPTH_MAX` 144 in bsv-low `chainReads.ts`), which the client reads as NOT SERVED, the floor 1.
-/// Pinned as it stands: a var of 145 is served 145, `source: "var"`, while the client credits at 1.
+/// The lens's MEDIUM-1, FOLDED (lane L7-DEPTH-FOLD): a well-formed depth past the client's bound
+/// (`SERVED_SPEND_DEPTH_MAX` 144 in bsv-low `chainReads.ts`, the server's `SPEND_DEPTH_MAX`) is malformed on the
+/// server too: the floor 1 is served, `source: "floor"`, so the host never serves what the client reads as the floor.
+/// (As the lens wrote it, this pinned 145 served as 145, `source: "var"`.)
 #[test]
-fn lens_m1_a_depth_past_the_clients_bound_is_served_unclamped() {
+fn lens_m1_a_depth_past_the_clients_bound_is_the_floor() {
     const CLIENT_MAX: u64 = 144;
+    assert_eq!(runtime::SPEND_DEPTH_MAX, CLIENT_MAX);
     for raw in ["145", "1000", "4294967295"] {
         let d = runtime::spend_depth_of(Some(raw));
-        assert!(d.from_var && d.depth > CLIENT_MAX, "{raw}: {d:?}");
+        assert_eq!((d.depth, d.from_var), (1, false), "{raw}: {d:?}");
         let h = runtime::spend_depth_health_json(Some(raw));
-        assert_eq!(h["source"], "var", "{h}");
+        assert_eq!(h["source"], "floor", "{h}");
         let mut body: Value = serde_json::from_str(&txany::tx_any_body(&tx(1), &answer())).unwrap();
         runtime::decorate(&mut body, Some(&tx(1)), &BTreeMap::new());
         runtime::stamp_spend_depth(&mut body, d.depth);
-        assert_eq!(body["spendDepth"], json!(d.depth));
+        assert_eq!(body["spendDepth"], json!(1));
     }
 }
 

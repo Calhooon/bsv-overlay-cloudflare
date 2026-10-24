@@ -317,9 +317,15 @@ pub async fn outpoint_body(env: &worker::Env, raw: &str) -> worker::Result<Strin
 /// coin on a served chain word (a refund, a hop sweep, a concede payout read off `lock`, `spenderWord` or `tracker`;
 /// R3 of the wallet charter). 1 is the floor: a checked `mined` word at any height.
 pub const SPEND_DEPTH_FLOOR: u64 = 1;
+/// The largest depth this host serves (the L7-DEPTH lens's MEDIUM-1): ONE bound shared with the client, whose
+/// `SERVED_SPEND_DEPTH_MAX` (bsv-low `app/src/lib/chainReads.ts`, `parseServedSpendDepth`) bounds a served depth to
+/// 1 ..= 144 and reads a value past it as not served, the floor. A var past it is MALFORMED here too: the floor is
+/// served and counted, so the host never serves a depth the client would read as 1 while `/health` said more.
+pub const SPEND_DEPTH_MAX: u64 = 144;
 /// The render var the depth is read from (`[vars]` and `[env.beta.vars]` of `wrangler.toml`).
 pub const SPEND_DEPTH_VAR: &str = "SPEND_DEPTH";
-/// Counted once per isolate when the var is missing or malformed (the depth served is then the floor).
+/// Counted once per isolate when the var is missing or malformed, past [`SPEND_DEPTH_MAX`] included (the depth served
+/// is then the floor).
 pub const SPEND_DEPTH_MALFORMED_COUNTER: &str = "spend_depth_var_malformed_total";
 
 /// The depth in force and whether a well-formed var gave it (`false`: the floor, the var missing or malformed).
@@ -329,14 +335,14 @@ pub struct SpendDepth {
     pub from_var: bool,
 }
 
-/// The var's value: plain decimal digits (surrounding whitespace allowed), at least the floor and inside `u32`.
-/// Anything else (absent, empty, `0`, a sign, a fraction, a hex form, past `u32`) is the floor.
+/// The var's value: plain decimal digits (surrounding whitespace allowed), from the floor to [`SPEND_DEPTH_MAX`].
+/// Anything else (absent, empty, `0`, a sign, a fraction, a hex form, past 144) is the floor.
 pub fn spend_depth_of(raw: Option<&str>) -> SpendDepth {
     raw.map(str::trim)
         .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|s| s.parse::<u32>().ok())
         .map(u64::from)
-        .filter(|d| *d >= SPEND_DEPTH_FLOOR)
+        .filter(|d| (SPEND_DEPTH_FLOOR..=SPEND_DEPTH_MAX).contains(d))
         .map(|depth| SpendDepth {
             depth,
             from_var: true,

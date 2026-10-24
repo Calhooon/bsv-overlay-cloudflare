@@ -1,7 +1,8 @@
 //! bsv-low #862 (L7-DEPTH, the L6 app-layer half): the host's SPEND DEPTH rides beside every served chain word, an
 //! additive integer `spendDepth` beside `tracker` on `/tx-any` (the subject and every `answers[id]`) and beside `lock`
 //! on every `/utxo-status` and `/spent-any` entry, read from the render's `SPEND_DEPTH` var; a missing or malformed
-//! var serves the floor (1) and counts `spend_depth_var_malformed_total` once per isolate; a body the decoration did
+//! var (past `SPEND_DEPTH_MAX` 144 included, the L7-DEPTH lens's MEDIUM-1)
+//! serves the floor (1) and counts `spend_depth_var_malformed_total` once per isolate; a body the decoration did
 //! not reach (a word-store fault) is byte-identical, and a decorated body is its old shape plus exactly one key.
 use bsv_tracker::{Hint, HintStatus, HostAction, Input, Params, State};
 use low_app_layer::tracker_host::{runtime, served};
@@ -349,4 +350,55 @@ fn l7_the_overlay_seeds_the_malformed_count() {
         "the overlay's /health/invariants does not seed {name}"
     );
     assert!(runtime::tracker_mirrored_counter_names().contains(&name));
+}
+
+/// The L7-DEPTH lens's MEDIUM-1 (lane L7-DEPTH-FOLD): ONE shared bound, `SPEND_DEPTH_MAX` 144, the client's
+/// `SERVED_SPEND_DEPTH_MAX` (bsv-low `chainReads.ts`). A var past it is MALFORMED: the floor served, counted once per
+/// isolate, `/health.spendDepth.source` `floor`; 144 is served and never counted; 1 is served and never counted.
+#[test]
+fn l7f_m1_a_var_past_the_shared_bound_is_malformed_the_floor_counted() {
+    assert_eq!(runtime::SPEND_DEPTH_MAX, 144);
+    for raw in ["145", "1000", "4294967295"] {
+        let d = runtime::spend_depth_of(Some(raw));
+        assert_eq!((d.depth, d.from_var), (1, false), "SPEND_DEPTH={raw:?}");
+        let h = runtime::spend_depth_health_json(Some(raw));
+        assert_eq!(
+            (h["depth"].clone(), h["source"].clone(), h["var"].clone()),
+            (json!(1), json!("floor"), json!(raw)),
+            "{h}"
+        );
+    }
+    for _ in 0..3 {
+        assert_eq!(runtime::spend_depth_noted(Some("145")).depth, 1);
+    }
+    let pending = courier::take_pending_if_due(0.0);
+    let count = pending
+        .iter()
+        .find(|(k, _)| k == runtime::SPEND_DEPTH_MALFORMED_COUNTER)
+        .map(|(_, n)| *n);
+    assert_eq!(count, Some(1), "145 counted once per isolate: {pending:?}");
+}
+
+#[test]
+fn l7f_m1_the_bound_and_the_floor_are_served_uncounted() {
+    for (raw, want) in [("144", 144u64), ("1", 1)] {
+        let d = runtime::spend_depth_of(Some(raw));
+        assert_eq!((d.depth, d.from_var), (want, true), "SPEND_DEPTH={raw:?}");
+        let h = runtime::spend_depth_health_json(Some(raw));
+        assert_eq!(
+            (h["depth"].clone(), h["source"].clone()),
+            (json!(want), json!("var")),
+            "{h}"
+        );
+        for _ in 0..3 {
+            assert_eq!(runtime::spend_depth_noted(Some(raw)).depth, want);
+        }
+    }
+    let pending = courier::take_pending_if_due(0.0);
+    assert!(
+        !pending
+            .iter()
+            .any(|(k, _)| k == runtime::SPEND_DEPTH_MALFORMED_COUNTER),
+        "144 and 1 are never counted: {pending:?}"
+    );
 }
