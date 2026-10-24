@@ -68,7 +68,7 @@ pub(crate) fn provider(rung: &str) -> &'static str {
         "arcade" => "arcade",
         "bitails" | "bitails_tx" | "bitails_history" | "bitails_presence" => "bitails",
         "woc" | "woc_history" | "woc_presence" => "woc",
-        "bananablocks" | "bananablocks_txo" => "bananablocks",
+        "bananablocks" | "bananablocks_txo" | "bananablocks_presence" => "bananablocks",
         _ => "other",
     }
 }

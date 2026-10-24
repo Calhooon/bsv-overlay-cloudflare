@@ -1752,10 +1752,11 @@ pub struct CourierConflictPresence {
 #[async_trait(?Send)]
 impl ConflictPresence for CourierConflictPresence {
     async fn presence(&self, txid: &str) -> Option<crate::proof_fetcher::NetworkPresence> {
-        use crate::door_words::{courier_hint, BITAILS_SOURCE, WOC_SOURCE};
-        let b = self
+        // bsv-low #868: the slot beside WoC's node is Bitails' positive, else BananaBlocks' native view
+        use crate::door_words::{courier_hint, WOC_SOURCE};
+        let (source, b) = self
             .sources
-            .bitails_presence_counted(txid, self.counters.as_ref())
+            .mempool_witness_presence_counted(txid, self.counters.as_ref())
             .await;
         let w = self
             .sources
@@ -1764,7 +1765,7 @@ impl ConflictPresence for CourierConflictPresence {
         // bsv-low #619 (L3): the competitor's courier words as the tracker's hints, folded by the host's bar (a
         // courier's mined claim is #602's confirmation, D1's stated trust)
         Some(crate::door_words::courier_presence(
-            &courier_hint(BITAILS_SOURCE, b, 0),
+            &courier_hint(source, b, 0),
             &courier_hint(WOC_SOURCE, w, 0),
         ))
     }
@@ -2584,13 +2585,11 @@ pub async fn evidence_check(
     // bsv-low #619 (L3): each indexer's answer as the tracker's hint from its source (its mined height kept on the
     // hint, where the bare yes or no dropped it; the verdict reads presence either way)
     let indexers = async {
-        use crate::door_words::{courier_hint, BITAILS_SOURCE, WOC_SOURCE};
-        let b = sources.bitails_presence(txid).await;
+        // bsv-low #868: the slot beside WoC's node is Bitails' positive, else BananaBlocks' native view
+        use crate::door_words::{courier_hint, WOC_SOURCE};
+        let (source, b) = sources.mempool_witness_presence_counted(txid, None).await;
         let w = sources.woc_presence(env.woc_api_key.as_deref(), txid).await;
-        (
-            courier_hint(BITAILS_SOURCE, b, 0),
-            courier_hint(WOC_SOURCE, w, 0),
-        )
+        (courier_hint(source, b, 0), courier_hint(WOC_SOURCE, w, 0))
     };
     let age = async {
         match env.env.d1("OVERLAY_DB") {

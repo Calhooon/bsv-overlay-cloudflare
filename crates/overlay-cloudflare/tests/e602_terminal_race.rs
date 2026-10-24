@@ -126,17 +126,26 @@ fn e602_only_broadcaster_admissions_carry_a_witness() {
 
 #[test]
 fn e602_courier_functions_keep_the_response_body() {
-    // bsv-low #625: both presence reads go through the one counted reader.
+    // bsv-low #625: every presence read goes through the one counted reader; bsv-low #868: each hands it its own
+    // body reader (Bitails' 404 is "could not look", BananaBlocks' native body its own shape, WoC's unchanged).
     let proof = source("proof_fetcher.rs");
-    for name in ["bitails_presence_counted", "woc_presence_counted"] {
+    for (name, reader) in [
+        ("bitails_presence_counted", "bitails_presence_response,"),
+        ("woc_presence_counted", "presence_response,"),
+        (
+            "bananablocks_presence_counted",
+            "|status,body|bananablocks_presence_response(status,body,txid),",
+        ),
+    ] {
         let head = format!("asyncfn{name}(");
         let body = &proof[proof.find(&head).unwrap() + head.len()..];
         let body = &body[..body.find(".await").unwrap()];
         assert_eq!(body.matches("presence_counted(").count(), 1, "{name}");
+        assert!(body.contains(reader), "{name} reads with {reader}");
     }
     let body = &proof[proof.find("asyncfnpresence_counted(").unwrap()..];
     let body = &body[..body.find("CourierAttempt::set").unwrap()];
-    assert_eq!(body.matches("presence_response(status,&body)").count(), 1);
+    assert_eq!(body.matches("read(status,&body)").count(), 1);
 }
 
 #[test]

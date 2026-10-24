@@ -2892,17 +2892,21 @@ impl ArcadeBroadcaster {
         if !allowed {
             return (NetworkPresence::Inconclusive, "capped");
         }
-        let bitails = self.proof_sources.bitails_presence_counted(txid, self.courier_counters.as_ref()).await;
+        // bsv-low #868: the slot beside WoC's node is Bitails' positive, else BananaBlocks' native view
+        let (source, bitails) = self
+            .proof_sources
+            .mempool_witness_presence_counted(txid, self.courier_counters.as_ref())
+            .await;
         let woc = self
             .proof_sources
             .woc_presence_counted(self.woc_api_key.as_deref(), txid, self.courier_counters.as_ref())
             .await;
         // bsv-low #619 (L3): each courier's answer as the tracker's hint from its source, folded by the host's
         // two-source bar; `terminal_at_arcade_by_presence` is the host's policy over the fold
-        use crate::door_words::{courier_hint, BITAILS_SOURCE, WOC_SOURCE};
+        use crate::door_words::{courier_hint, WOC_SOURCE};
         (
             crate::door_words::courier_presence(
-                &courier_hint(BITAILS_SOURCE, bitails, 0),
+                &courier_hint(source, bitails, 0),
                 &courier_hint(WOC_SOURCE, woc, 0),
             ),
             "couriers",
