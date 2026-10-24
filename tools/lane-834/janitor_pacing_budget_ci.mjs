@@ -60,9 +60,16 @@ const expect = (ok, label, why) => {
 const providerOf = (url) =>
   url.startsWith('/v1/bsv/main/') ? 'woc' : url.startsWith('/arcade/') ? 'arcade' : url.startsWith('/api/v1/') ? 'bananablocks' : 'bitails'
 let asked = []
+// The COURIER-RUNG lens fold: the BananaBlocks routes asked, by shape (a hex id replaced by `{id}`), so the cell names
+// which rung its BananaBlocks asks are.
+let bananaRoutes = {}
 const sink = createServer((req, res) => {
   const provider = providerOf(req.url)
   asked.push(provider)
+  if (provider === 'bananablocks') {
+    const shape = req.url.replace(/[0-9a-f]{64}/g, '{id}')
+    bananaRoutes[shape] = (bananaRoutes[shape] ?? 0) + 1
+  }
   if (provider === 'woc') {
     res.writeHead(429, { 'content-type': 'text/plain' })
     return res.end('Too Many Requests')
@@ -95,6 +102,7 @@ function d1(sql) {
 
 async function pass() {
   asked = []
+  bananaRoutes = {}
   const r = await fetch(OVERLAY + '/admin/complete-proofs', {
     method: 'POST',
     headers: { authorization: `Bearer ${ADMIN}`, Connection: 'close' },
@@ -104,7 +112,7 @@ async function pass() {
   try {
     json = JSON.parse(text)
   } catch {}
-  return { status: r.status, json, text, asked: tally(), total: asked.length }
+  return { status: r.status, json, text, asked: tally(), total: asked.length, bananaRoutes }
 }
 
 const measured = {}
@@ -127,6 +135,7 @@ try {
   const p1 = await pass()
   const v1 = p1.json?.courier_pacing ?? {}
   lines.push(`INFO  pass 1: ${JSON.stringify({ status: p1.status, asked: p1.asked, total: p1.total, pacing: v1 })}`)
+  lines.push(`INFO  pass 1 BananaBlocks routes: ${JSON.stringify(p1.bananaRoutes)}`)
   expect(p1.status === 200, 'the janitor pass answers 200', `${p1.status} ${p1.text.slice(0, 300)}`)
   expect(p1.asked.woc === 3, 'WoC is asked exactly 3 times (its third 429 backs it off)', JSON.stringify(p1.asked))
   expect(v1.providers?.woc?.backedOff === true && v1.providers?.woc?.skipped > 0, 'WoC is backed off and SKIPPED for the rest of the pass', JSON.stringify(v1.providers?.woc))
@@ -147,6 +156,7 @@ try {
   const p2 = await pass()
   const v2 = p2.json?.courier_pacing ?? {}
   lines.push(`INFO  pass 2: ${JSON.stringify({ status: p2.status, asked: p2.asked, total: p2.total, woc: v2.providers?.woc })}`)
+  lines.push(`INFO  pass 2 BananaBlocks routes: ${JSON.stringify(p2.bananaRoutes)}`)
   expect(p2.status === 200 && p2.asked.woc === 0, 'inside the cool-down WoC is not asked at all', JSON.stringify(p2.asked))
   expect(v2.asks === p2.total, 'the cooled pass makes no unpaced subrequest either', `${v2.asks} vs ${p2.total}`)
   expect(Number.isFinite(v2.providers?.woc?.cooledUntilMs), 'the pass names the cool-down it started under', JSON.stringify(v2.providers?.woc))
