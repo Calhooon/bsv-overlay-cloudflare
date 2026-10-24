@@ -1963,6 +1963,44 @@ pub fn mark_shed_rows_refresh(body: &mut Value) {
     }
 }
 
+/// bsv-low #861 (the FIX-859 lens's LOW-1): the `claimReason` of a press a SHED read withholds.
+pub const OWED_SHED_PRESS_REASON: &str =
+    "the list could not be re-judged against the index this read (the recompute was shed): the press waits for the next recompute";
+
+/// PURE (bsv-low #861, the FIX-859 lens's LOW-1): a SHED read serves the STORED snapshot (its refresh was refused by
+/// #648's bound), and a stored row's press rests on the facts the index held when it was judged: a door strand of a
+/// hop whose JOIN the index admitted since, a refund of a pot the index has since seen spent, a payout whose spend
+/// the index has since evicted. The read cannot re-judge the rows (that is the walk it was refused), so every
+/// served row whose `claimable` is `true` is DEMOTED, in the served body only, the way #837's carry demotes a row a
+/// cut pass did not reach: `claimable: false`, its word kept as `claimableBeforeShed`, `refresh: "shed"`,
+/// `stale: true`, `retryAfterMs` the shed's delay (at least 1 s) and `claimReason` [`OWED_SHED_PRESS_REASON`]. The
+/// row's family, claim, sats and reason are untouched (the outcome is still told), a row that offers no press is
+/// untouched, and a row already marked `shed` (a carried row) keeps its own word. Applied only when the read was
+/// shed (`refresh_retry` is `Some`) and the rows served are not a fresh compute. The stored snapshot is not
+/// changed: the next recompute writes the judged rows. The count demoted.
+pub fn demote_shed_presses(rows: &mut [OwedRow], refresh_retry: Option<i64>, fresh: bool) -> usize {
+    let Some(retry) = refresh_retry else {
+        return 0;
+    };
+    if fresh {
+        return 0;
+    }
+    let mut demoted = 0;
+    for r in rows.iter_mut() {
+        if r.facts["refresh"] == OWED_REFRESH_SHED || r.facts["claimable"] != Value::Bool(true) {
+            continue;
+        }
+        r.facts["claimableBeforeShed"] = json!(true);
+        r.facts["claimable"] = json!(false);
+        r.facts["refresh"] = json!(OWED_REFRESH_SHED);
+        r.facts["stale"] = json!(true);
+        r.facts["retryAfterMs"] = json!(retry.max(1_000));
+        r.facts["claimReason"] = json!(OWED_SHED_PRESS_REASON);
+        demoted += 1;
+    }
+    demoted
+}
+
 /// PURE: the previous row's own spender fact (`chainSpender`, else `spendingTxid`) names `sp` (lowercase compare).
 fn prev_names_spender(p: &OwedRow, sp: &str) -> bool {
     p.facts["chainSpender"]
@@ -2841,6 +2879,21 @@ fn index_proven_or_spender_mined(
 ) -> bool {
     index_proven || spender_mined(i, txid, legacy)
 }
+/// bsv-low #770 (the FIX-736 lens's pre-existing note): the settle payout's confirmation, the ONE rule its two
+/// sites read (the payout's `claimable` and the unclassified spend's `awaiting_block`). It is the hop arms' rule for
+/// a spender the index's own pointer names ([`non_pot_spender`]'s index arm, the filed sweep the hop row names):
+/// the INDEX's proof of this outpoint's spend first (`pot_records.spentConfirmed`, or the SPV-verified height
+/// `at_height`, the settle's own verified bump), never vetoed by a word; else the spender's CHECKED `mined` word;
+/// with no word row the index's proof alone. A courier never reaches it: the pot has no chain rung, and the latch
+/// is written only by a verified proof. The filed sweep's `!contradicted` guard has no input here: when the index's
+/// pointer names the payout's spender, the guard's only other name is the chain rung's (a courier naming another
+/// spender), and a pot has none; a rival cannot displace a confirmed latch (the displacement CAS guards
+/// `spentConfirmed = 0`). Pinned equal to the filed-sweep arm over every evidence the pass holds
+/// (`fix770_a_*`).
+fn settle_spend_confirmed(i: &OwedInputs, e: &ResultEntry) -> bool {
+    let index_proven = e.at_height.is_some() || e.spent_confirmed == Some(true);
+    index_proven_or_spender_mined(i, e.settle_txid.as_deref(), index_proven, index_proven)
+}
 /// PURE (bsv-low #693 fold, the W1-OWED-693 lens's MEDIUM-1): the tracker's word for `txid` as the RECHECKED view
 /// reads it, the one rule [`spender_mined`] and the re-ask's candidate predicate share: `None` when there are no
 /// views or no row, else `word == "mined"` AND a non-null `verifyPath` (a stored `mined` row whose recheck could not
@@ -3502,14 +3555,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     // NOTE-22: the press is offered only once the spend is CONFIRMED (the credit path's landing bar).
                     // the review's LOW-1 (2026-09-20): a spend with a VERIFIED proof height is mined whatever the flag says
                     // (the landing bar's third arm, the unbound arm's L1 rule) — never a chain wait said by machine on a mined tx
-                    // bsv-low #736: `spentConfirmed` is the index's latch, a proof with or without its height
-                    let confirmed = e.at_height.is_some()
-                        || index_proven_or_spender_mined(
-                            i,
-                            e.settle_txid.as_deref(),
-                            e.spent_confirmed == Some(true),
-                            e.spent_confirmed == Some(true) || e.at_height.is_some(),
-                        );
+                    // bsv-low #736: `spentConfirmed` is the index's latch, a proof with or without its height;
+                    // bsv-low #770: the one rule of the settle's two sites, the hop pointer arm's
+                    let confirmed = settle_spend_confirmed(i, e);
                     facts["claimable"] = json!(confirmed);
                     if !confirmed {
                         facts["claimReason"] = json!(UNCONFIRMED_PAYOUT_REASON);
@@ -3552,15 +3600,10 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     let mut facts = base_facts.clone();
                     // the gate's L1: a spend with a VERIFIED proof height is mined (the landing bar's third arm),
                     // whatever `spentConfirmed` says — a classification gap on a mined tx is not a block wait
+                    // bsv-low #770: the claimable arm's rule, so the two sentences never disagree
                     let awaiting_block = e.verdict.is_none()
                         && e.settle_txid.is_some()
-                        && e.at_height.is_none()
-                        && !index_proven_or_spender_mined(
-                            i,
-                            e.settle_txid.as_deref(),
-                            e.spent_confirmed == Some(true),
-                            e.spent_confirmed == Some(true) || e.at_height.is_some(),
-                        );
+                        && !settle_spend_confirmed(i, e);
                     let reason = if awaiting_block {
                         // the index holds the spend (the results view names it) and the chain has not confirmed it:
                         // the verdict is computed at the landing bar, so the row is an honest chain wait
@@ -15423,6 +15466,294 @@ pub(crate) mod tests {
             rows.iter()
                 .all(|r| r.outpoint != held_key || r.facts["refresh"] != OWED_REFRESH_SHED),
             "{rows:?}"
+        );
+    }
+
+    /// bsv-low #861 (the FIX-859 lens's LOW-1): a SHED read serves the stored snapshot, and its door strand's press
+    /// must not stand once the index holds the hop spent by the admitted JOIN. The snapshot is the derivation's own
+    /// row before the admission, written and read back through the shipped statements on real SQLite
+    /// (`owed_write_plan`, `OWED_ROWS_READ_SQL`, the route's `facts` parse); the index's present fact is the
+    /// derivation after it (no row: the pot tells the story); the read is the route's served steps in its order
+    /// (`degrade_stale_sweeps` at an unmoved tip, `demote_shed_presses`, `owed_body`, both shed marks). RED with
+    /// `demote_shed_presses` inert (main's read: the stored facts served as they are): `claimable` `true`.
+    #[test]
+    fn fix861_a_a_shed_read_never_serves_a_stored_press_the_index_no_longer_holds() {
+        let hop_txid = tx(0x07);
+        let pot = tx(0x0a);
+        let key = format!("{hop_txid}:0");
+        let young = [hop(HopStatus::Unspent, None, Some(60_000))];
+        let script = door_refused_hops(
+            &[(hop_txid.clone(), 0u32, "script-refused".to_string())],
+            &young,
+        );
+        let unspent = chain(&key, true, Some(false), None);
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        // the snapshot, judged BEFORE the admission: the door strand, its press offered
+        let mut before = inputs(&[], &[], &young, &v, &c, &p, Some(972_190));
+        before.hop_chain = &unspent;
+        before.door_refused_hop_outpoints = &script;
+        let judged = derive_owed_rows(&before);
+        assert_eq!(judged.len(), 1, "{judged:?}");
+        assert_eq!(
+            (
+                judged[0].family,
+                judged[0].facts["claimable"].clone(),
+                judged[0].facts["joinRefusedBy"].clone()
+            ),
+            (OwedFamily::HopStranded, json!(true), json!("door"))
+        );
+        // the index SINCE: the JOIN admitted, the hop spent by the pot; the present judgement holds no row for it
+        let pots: HashSet<String> = [pot.clone()].into_iter().collect();
+        let spent = [hop(HopStatus::Spent, Some(&pot), Some(60_000))];
+        let after = inputs(&[], &[], &spent, &v, &c, &pots, Some(972_190));
+        assert!(derive_owed_rows(&after).is_empty());
+        // the stored snapshot through the shipped write and read statements
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(OWED_ROWS_CREATE).unwrap();
+        conn.execute_batch(OWED_STATE_CREATE).unwrap();
+        conn.execute_batch(OWED_STATE_SEQ_ALTER).unwrap();
+        assert!(owed_write_landed(
+            run_owed_write(
+                &mut conn,
+                &owed_write_plan(ME, &judged, 1_000, Some(972_190), false),
+            ),
+            1_000,
+        ));
+        let stored: Vec<OwedRow> = conn
+            .prepare(OWED_ROWS_READ_SQL)
+            .unwrap()
+            .query_map([ME], |r| {
+                let family: String = r.get(2)?;
+                let facts: String = r.get(7)?;
+                Ok(OwedRow {
+                    identity: r.get(0)?,
+                    outpoint: r.get(1)?,
+                    family: OwedFamily::parse(&family).unwrap(),
+                    game_id: r.get(3)?,
+                    sats: r.get::<_, Option<i64>>(4)?.map(|s| s as u64),
+                    opponent_identity: r.get(5)?,
+                    at_height: r.get::<_, Option<i64>>(6)?.map(|h| h as u64),
+                    facts: serde_json::from_str(&facts).unwrap(),
+                    reason: r.get(9)?,
+                })
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].facts["claimable"], true, "the stored press");
+        // the read's served steps, in the route's order (the tip has not moved: #669 degrades nothing)
+        let serve = |retry: Option<i64>, fresh: bool| -> Value {
+            let mut served = stored.clone();
+            degrade_stale_sweeps(&mut served, Some(972_190), Some(972_190));
+            demote_shed_presses(&mut served, retry, fresh);
+            let mut body: Value =
+                serde_json::from_str(&owed_body(ME, Some(972_190), &served, 1_000, false, None))
+                    .unwrap();
+            mark_shed_refresh(&mut body, retry);
+            mark_shed_rows_refresh(&mut body);
+            body
+        };
+        let shed = serve(Some(41_000), false);
+        assert_eq!(shed["refresh"], "shed");
+        let row = &shed["rows"][0]["facts"];
+        assert_eq!(
+            row["claimable"], false,
+            "a shed read never offers the stored press of a hop the index holds spent: {row}"
+        );
+        assert_eq!(row["claimableBeforeShed"], true);
+        assert_eq!(row["refresh"], OWED_REFRESH_SHED);
+        assert_eq!(row["stale"], true);
+        assert_eq!(row["retryAfterMs"], 41_000);
+        assert_eq!(row["claimReason"], OWED_SHED_PRESS_REASON);
+        // the outcome is still told: the family, the claim, the sats and the door's sentence are the stored row's
+        assert_eq!(shed["rows"][0]["family"], "hop-stranded");
+        assert_eq!(row["claim"], "sweep-hop");
+        assert_eq!(row["joinRefusedBy"], "door");
+        assert_eq!(shed["rows"][0]["reason"], DOOR_SCRIPT_REFUSED_REASON);
+        // a shed delay under a second is served as one
+        assert_eq!(
+            serve(Some(0), false)["rows"][0]["facts"]["retryAfterMs"],
+            1_000
+        );
+        // the honest controls: an unshed read of the same snapshot and a fresh compute serve the row as stored
+        let plain = serve(None, false);
+        assert!(plain.get("refresh").is_none());
+        assert_eq!(plain["rows"][0]["facts"], stored[0].facts);
+        assert_eq!(
+            serve(Some(41_000), true)["rows"][0]["facts"],
+            stored[0].facts
+        );
+    }
+
+    /// bsv-low #861: the demotion's scope. Every claimable family is withheld under a shed (a refund, a payout, a
+    /// sweep); a row that offers no press is served as stored; a row already `shed` (a carried row, #837) keeps its
+    /// own `claimableBeforeShed` through the read; the read handler applies it after #669's gate and before the body.
+    /// RED with the demotion inert (`left: 0 right: 2`), or with its call removed from the read.
+    #[test]
+    fn fix861_b_the_demotion_takes_every_press_and_nothing_else_and_the_read_calls_it() {
+        let row = |outpoint: &str, family: OwedFamily, facts: Value| OwedRow {
+            identity: ME.to_string(),
+            outpoint: outpoint.to_string(),
+            family,
+            game_id: tx(0x01),
+            sats: Some(19_800),
+            opponent_identity: Some(OPP.to_string()),
+            at_height: None,
+            facts,
+            reason: None,
+        };
+        let rows = vec![
+            row(
+                "a:0",
+                OwedFamily::RefundDue,
+                json!({"claim": "present-refund", "claimable": true}),
+            ),
+            row(
+                "b:0",
+                OwedFamily::Payout,
+                json!({"claim": "internalize", "claimable": true}),
+            ),
+            row(
+                "c:0",
+                OwedFamily::Payout,
+                json!({"claim": "internalize", "claimable": false, "claimReason": UNCONFIRMED_PAYOUT_REASON}),
+            ),
+            row("d:0", OwedFamily::InProgress, json!({"claim": "rejoin"})),
+            row(
+                "e:0",
+                OwedFamily::RefundDue,
+                json!({"claim": "present-refund", "claimable": false, "claimableBeforeShed": true,
+                       "refresh": "shed", "carried": true, "retryAfterMs": OWED_SHED_RETRY_MS}),
+            ),
+        ];
+        let mut served = rows.clone();
+        assert_eq!(demote_shed_presses(&mut served, Some(5_000), false), 2);
+        for r in &served[..2] {
+            assert_eq!(r.facts["claimable"], false, "{r:?}");
+            assert_eq!(r.facts["claimableBeforeShed"], true);
+            assert_eq!(r.facts["claimReason"], OWED_SHED_PRESS_REASON);
+        }
+        assert_eq!(
+            &served[2..],
+            &rows[2..],
+            "no press, or already shed: as stored"
+        );
+        let mut unshed = rows.clone();
+        assert_eq!(demote_shed_presses(&mut unshed, None, false), 0);
+        assert_eq!(unshed, rows);
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let routes = squash(include_str!("routes.rs"));
+        let degrade = routes
+            .find("crate::owed::degrade_stale_sweeps(")
+            .expect("the read's #669 gate");
+        let demote = routes
+            .find("crate::owed::demote_shed_presses(&mutserved,refresh_retry,served_snapshot_is_fresh);")
+            .expect("the read demotes a shed snapshot's presses");
+        let body = routes[demote..]
+            .find("crate::owed::owed_body(")
+            .expect("before the body");
+        assert!(degrade < demote && body > 0);
+    }
+
+    /// bsv-low #770 (the FIX-736 lens's pre-existing note): the settle payout arm judges `claimable` and
+    /// `awaiting_block` exactly as the hop arm judges a payout whose spender the index's own pointer names (the hop
+    /// row naming my filed sweep), over every evidence the pass holds for it: the index's proof (none, the latch, a
+    /// verified height: the settle's `at_height`, the filed sweep's `transactions.has_proof`) against every word
+    /// (no word map, no row, a checked `mined`, an unchecked `mined`, `stale`, `cannotCheck`, a final `seen`,
+    /// `rejected`). The two arms already agreed on main (no reachable row differs: the filed sweep's `!contradicted`
+    /// guard reads another spender's name, which for an index-named spender only the chain rung carries, and a pot
+    /// has no chain rung); the fold makes the settle's two sites one function. RED against the pre-#736 settle rule
+    /// (the word first, `spender_mined(i, settle, proof)`): the latch under an unchecked `mined` claims on the hop and
+    /// not on the settle; RED against `awaiting_block` reading its own rule (the latch dropped from it): the latched spend
+    /// under a final `seen` is a block wait beside a claimable payout.
+    #[test]
+    fn fix770_a_the_settle_arm_judges_as_the_index_named_hop_arm_over_every_evidence() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        let settle = tx(0x03);
+        let words = [
+            None,
+            Some(json!({"word":"mined","verifyPath":{"height":900_100,"root":tx(0x04)}})),
+            Some(json!({"word":"mined","verifyPath":null})),
+            Some(json!({"word":"mined","verifyPath":null,"cannotCheck":"header snapshot changed"})),
+            Some(json!({"word":"stale","verifyPath":null})),
+            Some(json!({"word":"seen","verifyPath":null})),
+            Some(json!({"word":"rejected","verifyPath":null})),
+        ];
+        // (the settle's latch, the settle's verified height) beside (the hop row's latch, the filed sweep's proof)
+        let proofs: [(Option<bool>, Option<u64>, &str); 4] = [
+            (Some(false), None, "no index proof"),
+            (None, None, "no latch read"),
+            (Some(true), None, "the latch, heightless"),
+            (Some(false), Some(900_100), "a verified height"),
+        ];
+        let mut judged = 0;
+        for (latch, height, proof) in proofs {
+            for word in &words {
+                for map in [false, true] {
+                    if !map && word.is_some() {
+                        continue;
+                    }
+                    let settle_words: std::collections::BTreeMap<String, Value> =
+                        word.iter().map(|w| (settle.clone(), w.clone())).collect();
+                    let sweep_words: std::collections::BTreeMap<String, Value> =
+                        word.iter().map(|w| (sweep.clone(), w.clone())).collect();
+                    // the hop arm: the hop row's pointer names my filed sweep
+                    let sweeps = if height.is_some() {
+                        filed_proven(&key, &sweep, height)
+                    } else {
+                        filed(&key, &sweep)
+                    };
+                    let mut spent = hop(HopStatus::Spent, Some(&sweep), Some(10_000_000));
+                    spent.spent_confirmed = latch;
+                    let hops = [spent];
+                    let mut h = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_200));
+                    h.hop_sweeps = &sweeps;
+                    h.spender_words = map.then_some(&sweep_words);
+                    let hop_rows = derive_owed_rows(&h);
+                    assert_eq!(hop_rows[0].family, OwedFamily::Payout, "{proof} {word:?}");
+                    let hop_claimable = hop_rows[0].facts["claimable"].clone();
+                    // the settle arm: a won pot (the payout) and an unclassified one (the block-wait sentence)
+                    let mut won = entry(
+                        Some(true),
+                        Some(PotVerdict::WinnerA),
+                        Outcome::Won,
+                        Some(SeatLetter::A),
+                    );
+                    won.spent_confirmed = latch;
+                    won.at_height = height;
+                    let mut unclassified = won.clone();
+                    unclassified.verdict = None;
+                    unclassified.outcome = Outcome::Unresolved;
+                    let judge = |e: &ResultEntry| {
+                        let entries = [e.clone()];
+                        let mut s = inputs(&entries, &[], &[], &v, &c, &no_pots, Some(900_200));
+                        s.spender_words = map.then_some(&settle_words);
+                        derive_owed_rows(&s).remove(0)
+                    };
+                    let payout = judge(&won);
+                    assert_eq!(payout.family, OwedFamily::Payout);
+                    assert_eq!(
+                        payout.facts["claimable"], hop_claimable,
+                        "{proof}, word {word:?} (map {map}): the settle's press is the hop's"
+                    );
+                    let wait = judge(&unclassified);
+                    assert_eq!(
+                        wait.reason.as_deref() == Some(SPEND_AWAITING_BLOCK_REASON),
+                        hop_claimable == json!(false),
+                        "{proof}, word {word:?} (map {map}): the settle is a block wait exactly where the hop's \
+                         payout waits: {wait:?}"
+                    );
+                    judged += 1;
+                }
+            }
+        }
+        assert_eq!(
+            judged,
+            4 * 8,
+            "every evidence judged: seven words with a map, and no map"
         );
     }
 
