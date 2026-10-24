@@ -188,11 +188,15 @@ pub async fn body_loaded(
     subject: Option<&str>,
     rows: Option<BTreeMap<String, Row>>,
 ) -> worker::Result<String> {
-    let views = match rows {
-        Some(rows) => Some(views(env, &rows).await),
-        None => None,
+    let mut value = value;
+    let Some(rows) = rows else {
+        return Ok(value.to_string());
     };
-    Ok(decorate_lookup(value, subject, views.as_ref()))
+    let views = views(env, &rows).await;
+    decorate(&mut value, subject, &views);
+    // bsv-low #862 (L7-DEPTH): the host's spend depth beside each `tracker` the decoration served.
+    stamp_spend_depth(&mut value, spend_depth(env).depth);
+    Ok(value.to_string())
 }
 /// bsv-low #617 (L1): the outpoint routes' (`/utxo-status`, `/spent-any`) txids to read words for: every entry's
 /// own creating txid (its `fundingWord`) beside the spender subjects [`body`] reads.
@@ -304,7 +308,102 @@ pub async fn outpoint_body(env: &worker::Env, raw: &str) -> worker::Result<Strin
     let views = views(env, &rows).await;
     decorate(&mut value, None, &views);
     decorate_outpoints(&mut value, &views, "free", "host");
+    // bsv-low #862 (L7-DEPTH): the host's spend depth beside each entry's `lock`.
+    stamp_spend_depth(&mut value, spend_depth(env).depth);
     Ok(value.to_string())
+}
+
+/// bsv-low #862 (L7-DEPTH, the L6 app-layer half): the confirmations this host requires before a wallet credits a
+/// coin on a served chain word (a refund, a hop sweep, a concede payout read off `lock`, `spenderWord` or `tracker`;
+/// R3 of the wallet charter). 1 is the floor: a checked `mined` word at any height.
+pub const SPEND_DEPTH_FLOOR: u64 = 1;
+/// The render var the depth is read from (`[vars]` and `[env.beta.vars]` of `wrangler.toml`).
+pub const SPEND_DEPTH_VAR: &str = "SPEND_DEPTH";
+/// Counted once per isolate when the var is missing or malformed (the depth served is then the floor).
+pub const SPEND_DEPTH_MALFORMED_COUNTER: &str = "spend_depth_var_malformed_total";
+
+/// The depth in force and whether a well-formed var gave it (`false`: the floor, the var missing or malformed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpendDepth {
+    pub depth: u64,
+    pub from_var: bool,
+}
+
+/// The var's value: plain decimal digits (surrounding whitespace allowed), at least the floor and inside `u32`.
+/// Anything else (absent, empty, `0`, a sign, a fraction, a hex form, past `u32`) is the floor.
+pub fn spend_depth_of(raw: Option<&str>) -> SpendDepth {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(u64::from)
+        .filter(|d| *d >= SPEND_DEPTH_FLOOR)
+        .map(|depth| SpendDepth {
+            depth,
+            from_var: true,
+        })
+        .unwrap_or(SpendDepth {
+            depth: SPEND_DEPTH_FLOOR,
+            from_var: false,
+        })
+}
+
+thread_local! {
+    static SPEND_DEPTH_MALFORMED_NOTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`spend_depth_of`], counting [`SPEND_DEPTH_MALFORMED_COUNTER`] the first time this isolate meets a missing or
+/// malformed var (never again in it, whatever the read rate).
+pub fn spend_depth_noted(raw: Option<&str>) -> SpendDepth {
+    let d = spend_depth_of(raw);
+    if !d.from_var && !SPEND_DEPTH_MALFORMED_NOTED.with(|n| n.replace(true)) {
+        crate::courier::note_presence(SPEND_DEPTH_MALFORMED_COUNTER);
+    }
+    d
+}
+
+/// The render's depth (a missing binding of the var is the floor, counted).
+pub fn spend_depth(env: &worker::Env) -> SpendDepth {
+    let raw = env.var(SPEND_DEPTH_VAR).ok().map(|v| v.to_string());
+    spend_depth_noted(raw.as_deref())
+}
+
+/// The additive field: `spendDepth` beside `tracker` on the subject and on every `answers[id]` that carries one
+/// (`/tx-any`), and beside `lock` on every outpoint entry that carries one (`/utxo-status`, `/spent-any`). An object
+/// the word decoration did not reach gains nothing, so a legacy body served on a word-store fault is byte-identical,
+/// and a decorated one is its old shape plus exactly this one key.
+pub fn stamp_spend_depth(value: &mut Value, depth: u64) {
+    fn beside(obj: &mut serde_json::Map<String, Value>, key: &str, depth: u64) {
+        if obj.contains_key(key) {
+            obj.insert("spendDepth".into(), json!(depth));
+        }
+    }
+    match value {
+        Value::Object(obj) => {
+            if let Some(answers) = obj.get_mut("answers").and_then(Value::as_object_mut) {
+                for answer in answers.values_mut().filter_map(Value::as_object_mut) {
+                    beside(answer, "tracker", depth);
+                }
+            }
+            beside(obj, "tracker", depth);
+        }
+        Value::Array(entries) => {
+            for entry in entries.iter_mut().filter_map(Value::as_object_mut) {
+                beside(entry, "lock", depth);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `/health.spendDepth`: the depth in force, where it came from (`var` or `floor`), the floor and the var as set.
+pub fn spend_depth_health_json(raw: Option<&str>) -> Value {
+    let d = spend_depth_of(raw);
+    json!({
+        "depth": d.depth,
+        "source": if d.from_var { "var" } else { "floor" },
+        "floor": SPEND_DEPTH_FLOOR,
+        "var": raw,
+    })
 }
 
 /// Owed snapshots already persist their word tuples in facts. Recheck those
@@ -720,7 +819,10 @@ pub const COUNTER_TRACKER_EVENT_UNHELD: &str = "applayer_tracker_event_unheld_to
 
 /// The mirrored counter names of the word events (the observability bar's seed list).
 pub fn tracker_mirrored_counter_names() -> Vec<String> {
-    vec![COUNTER_TRACKER_EVENT_UNHELD.to_string()]
+    vec![
+        COUNTER_TRACKER_EVENT_UNHELD.to_string(),
+        SPEND_DEPTH_MALFORMED_COUNTER.to_string(),
+    ]
 }
 
 /// Count one unheld frame (B-OWED-3-FOLD L2).
