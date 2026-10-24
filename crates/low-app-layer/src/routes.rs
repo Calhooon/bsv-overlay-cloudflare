@@ -14464,6 +14464,376 @@ mod e606_tests {
         );
         assert_eq!(held(), (1, w));
     }
+
+    /// Lane COURIER-RUNG-LENS (the one lens on PR 170, bsv-low #868): the negative cases the PR's pins leave out.
+    mod courier_rung_lens {
+        use super::*;
+
+        /// The presence leg over a courier map with the route health and the proof check chosen by the case.
+        fn lens_leg(
+            txid: &str,
+            m: HashMap<String, (u16, Vec<u8>)>,
+            woc_route: Option<bool>,
+            proof_ok: bool,
+        ) -> (crate::txany::TxAnyAnswer, AbsenceCorroboration, Vec<String>) {
+            WOC_ROUTE_HEALTHY.with(|c| c.set(woc_route));
+            let asked = std::cell::RefCell::new(Vec::new());
+            let get = |url: String| {
+                asked.borrow_mut().push(url.clone());
+                std::future::ready(m.get(&url).cloned())
+            };
+            let now = crate::txany::rfc3339_utc_ms("2026-10-24T14:40:00Z").unwrap();
+            let (obs, absence, height) = run(tx_any_presence_leg_via(
+                txid,
+                now,
+                false,
+                None,
+                get,
+                move |_, _| async move { proof_ok },
+            ));
+            let mut a = decide_tx_any(None, None, Some(&obs), absence);
+            apply_external_height(&mut a, &obs, height);
+            (a, absence, asked.into_inner())
+        }
+
+        fn nf() -> (u16, Vec<u8>) {
+            let (s, b, _) = c868_recorded("bb_tx_not_found");
+            (s, b)
+        }
+
+        /// (a) A `spendScope: "confirmed"` whose spender's raw no rung serves (or serves bytes that do not spend the
+        /// outpoint) is never a confirmed word: the honest unknown, `spentConfirmed: null`.
+        #[test]
+        fn lens868_a_a_confirmed_scope_never_survives_an_unverified_spender() {
+            let t = tx(0x07);
+            let (sp, _) = competitor();
+            for raw in [None, Some(vec![0u8; 10])] {
+                let mut m = HashMap::new();
+                m.insert(format!("{WOC_BASE}/tx/{t}/0/spent"), (503, Vec::new()));
+                m.insert(
+                    format!("{BANANABLOCKS_BASE}/txo/{t}/0/spend"),
+                    (200, c868_spend_body("bb_spend_confirmed", false)),
+                );
+                if let Some(r) = raw.clone() {
+                    m.insert(
+                        format!("{WOC_BASE}/tx/{sp}/hex"),
+                        (200, hex::encode(r).into_bytes()),
+                    );
+                }
+                let (row, verified) = run(spent_any_resolve_via(&t, 0, courier(m)));
+                assert_eq!(
+                    (
+                        row.known,
+                        row.spent,
+                        row.spent_confirmed,
+                        verified.is_some()
+                    ),
+                    (false, None, None, false),
+                    "raw {raw:?}"
+                );
+                assert_eq!(
+                    row.reason,
+                    Some(crate::logic::SPENT_ANY_REASON_UNVERIFIED_SPENDER)
+                );
+            }
+        }
+
+        /// (b) Only the two documented words are a scope; any other spelling is unknown, and a scope beside
+        /// `spent: false` (or a spend naming no spender) is no mined word at all.
+        #[test]
+        fn lens868_b_scope_words_outside_the_two_are_unknown() {
+            use crate::results::{
+                bananablocks_spend_scope, parse_bananablocks_spent, SpentObservation,
+            };
+            let sp = "ab".repeat(32);
+            for scope in [
+                serde_json::json!("CONFIRMED"),
+                serde_json::json!("Confirmed"),
+                serde_json::json!("mined"),
+                serde_json::json!(""),
+                serde_json::json!(true),
+                serde_json::json!(1),
+                serde_json::Value::Null,
+            ] {
+                let body = serde_json::json!({"spent": true, "spentTxid": sp, "spendScope": scope});
+                assert_eq!(bananablocks_spend_scope(&body), None, "{scope}");
+                assert_eq!(
+                    parse_bananablocks_spent(200, Some(&body)),
+                    SpentObservation::Spent {
+                        txid: sp.clone(),
+                        confirmed: None
+                    },
+                    "{scope}"
+                );
+            }
+            assert_eq!(
+                parse_bananablocks_spent(
+                    200,
+                    Some(&serde_json::json!({"spent": false, "spendScope": "confirmed"}))
+                ),
+                SpentObservation::NotSpent
+            );
+            assert_eq!(
+                parse_bananablocks_spent(
+                    200,
+                    Some(&serde_json::json!({"spent": true, "spendScope": "confirmed"}))
+                ),
+                SpentObservation::Fault
+            );
+            // a 5xx or a 429 that happens to carry a scope is never read
+            assert_eq!(
+                parse_bananablocks_spent(
+                    503,
+                    Some(
+                        &serde_json::json!({"spent": true, "spentTxid": sp, "spendScope": "confirmed"})
+                    )
+                ),
+                SpentObservation::Fault
+            );
+        }
+
+        /// (c) BananaBlocks' native `/tx` bodies that are no word: a mined claim with no positive height, a
+        /// `confirmed` that is not a boolean, `confirmation_unknown` beside `confirmed: true`, a body with no txid,
+        /// the WoC-style mirror's MINED body (recorded shape: no `confirmed`, no `confirmations`).
+        #[test]
+        fn lens868_c_native_tx_bodies_that_are_no_word() {
+            use crate::txany::parse_bananablocks_tx_claim;
+            let t = "cd".repeat(32);
+            for (label, body) in [
+                (
+                    "mined, height 0",
+                    serde_json::json!({"txid": t, "confirmed": true, "block_height": 0}),
+                ),
+                (
+                    "mined, no height",
+                    serde_json::json!({"txid": t, "confirmed": true}),
+                ),
+                (
+                    "mined, height a string",
+                    serde_json::json!({"txid": t, "confirmed": true, "block_height": "972476"}),
+                ),
+                (
+                    "confirmed a string",
+                    serde_json::json!({"txid": t, "confirmed": "false", "block_height": 0}),
+                ),
+                (
+                    "confirmed null",
+                    serde_json::json!({"txid": t, "confirmed": null}),
+                ),
+                (
+                    "unknown beside a mined claim",
+                    serde_json::json!({"txid": t, "confirmed": true, "block_height": 972_476,
+                        "confirmation_unknown": true, "partial": true}),
+                ),
+                (
+                    "no txid",
+                    serde_json::json!({"confirmed": false, "block_height": 0}),
+                ),
+                (
+                    "the mirror's mined body",
+                    serde_json::json!({"txid": t, "hash": t, "version": 1, "size": 200, "locktime": 0,
+                        "vin": [], "vout": [], "blockhash": "00".repeat(32), "time": 1,
+                        "blocktime": 1, "blockheight": 972_476}),
+                ),
+                (
+                    "the not-found body under a 200",
+                    serde_json::json!({"error": "Transaction not found"}),
+                ),
+            ] {
+                assert_eq!(parse_bananablocks_tx_claim(&body, &t), None, "{label}");
+            }
+            // the not-found reader needs the 404 AND the recorded body, exactly
+            let nf_body = br#"{"error":"Transaction not found"}"#;
+            assert!(!crate::txany::bananablocks_tx_not_found(200, nf_body));
+            assert!(!crate::txany::bananablocks_tx_not_found(410, nf_body));
+            assert!(!crate::txany::bananablocks_tx_not_found(
+                404,
+                br#"{"error":"transaction not found"}"#
+            ));
+            assert!(!crate::txany::bananablocks_tx_not_found(
+                404,
+                b"Transaction not found"
+            ));
+            // observed, not a defect: `confirmed: false` beside a positive height reads unmined (a hint, never an
+            // absence and never a mined fact)
+            assert_eq!(
+                parse_bananablocks_tx_claim(
+                    &serde_json::json!({"txid": t, "confirmed": false, "block_height": 972_476}),
+                    &t
+                ),
+                Some((false, None))
+            );
+        }
+
+        /// (d) BananaBlocks' not-found never completes an absence when WoC's 404 is not behind a healthy route (the
+        /// anchor read faulted): the leg stays unknown.
+        #[test]
+        fn lens868_d_no_absence_without_wocs_healthy_route() {
+            let t = c868_subject("bb_tx_not_found");
+            let mut m = HashMap::new();
+            m.insert(format!("{WOC_BASE}/tx/hash/{t}"), (404, Vec::new()));
+            m.insert(
+                format!("{WOC_BASE}/tx/hash/{}", crate::txany::KNOWN_MINED_TXID),
+                (503, Vec::new()),
+            );
+            m.insert(format!("{BANANABLOCKS_BASE}/tx/{t}"), nf());
+            let (a, absence, _) = lens_leg(&t, m, None, false);
+            assert_eq!((a.present, absence), (None, AbsenceCorroboration::Unknown));
+        }
+
+        /// (e) Beside WoC's healthy 404, every BananaBlocks answer that is not its recorded 404 is no vote: its
+        /// `confirmation_unknown`, a mined claim with no height, its not-found body under 200 or 410, a 429, a
+        /// transport fault.
+        #[test]
+        fn lens868_e_no_bananablocks_word_beside_wocs_404_is_never_an_absence() {
+            let t = c868_subject("bb_tx_unmined");
+            let (_, unmined, _) = c868_recorded("bb_tx_unmined");
+            let mut unknown: serde_json::Value = serde_json::from_slice(&unmined).unwrap();
+            unknown["confirmation_unknown"] = serde_json::json!(true);
+            let (_, nf_body) = nf();
+            for (label, banana) in [
+                (
+                    "confirmation_unknown",
+                    Some((200u16, unknown.to_string().into_bytes())),
+                ),
+                (
+                    "mined, no height",
+                    Some((
+                        200,
+                        serde_json::json!({"txid": t, "confirmed": true})
+                            .to_string()
+                            .into_bytes(),
+                    )),
+                ),
+                ("not-found under 200", Some((200, nf_body.clone()))),
+                ("not-found under 410", Some((410, nf_body.clone()))),
+                ("429", Some((429, Vec::new()))),
+                ("transport", None),
+            ] {
+                let mut m = HashMap::new();
+                m.insert(format!("{WOC_BASE}/tx/hash/{t}"), (404, Vec::new()));
+                if let Some(b) = banana {
+                    m.insert(format!("{BANANABLOCKS_BASE}/tx/{t}"), b);
+                }
+                let (a, absence, _) = lens_leg(&t, m, Some(true), false);
+                assert_eq!(
+                    (a.present, a.hint_source, absence),
+                    (None, None, AbsenceCorroboration::Unknown),
+                    "{label}"
+                );
+            }
+        }
+
+        /// (f) A positive outranks WoC's healthy 404: BananaBlocks' unmined body beside it is the hint, no absence.
+        #[test]
+        fn lens868_f_bananablocks_presence_outranks_wocs_404() {
+            let t = c868_subject("bb_tx_unmined");
+            let (s, b, _) = c868_recorded("bb_tx_unmined");
+            let mut m = HashMap::new();
+            m.insert(format!("{WOC_BASE}/tx/hash/{t}"), (404, Vec::new()));
+            m.insert(format!("{BANANABLOCKS_BASE}/tx/{t}"), (s, b));
+            let (a, absence, asked) = lens_leg(&t, m, Some(true), false);
+            assert_eq!(
+                (a.present, a.hint_source, absence),
+                (None, Some("bananablocks"), AbsenceCorroboration::Unknown)
+            );
+            assert!(
+                !asked
+                    .iter()
+                    .any(|u| u.starts_with(BITAILS_BASE) && !u.contains("/download/")),
+                "a BananaBlocks positive asks Bitails' presence no further: {asked:?}"
+            );
+        }
+
+        /// (h) THE LENS'S M1, reproduced as behaviour: WoC's 404 counts only behind its proven route (the anchor
+        /// `KNOWN_MINED_TXID` served), BananaBlocks' recorded not-found counts with NO such check. A BananaBlocks that
+        /// answers its not-found for EVERY txid, the known-mined anchor included (an index that lost history, a
+        /// partial node behind its balancer), still completes the corroborated absence (`present: false`).
+        #[test]
+        fn lens868_h_bananablocks_not_found_needs_no_route_anchor() {
+            let t = c868_subject("bb_tx_not_found");
+            let mut m = HashMap::new();
+            m.insert(format!("{WOC_BASE}/tx/hash/{t}"), (404, Vec::new()));
+            m.insert(
+                format!("{WOC_BASE}/tx/hash/{}", crate::txany::KNOWN_MINED_TXID),
+                (200, b"{}".to_vec()),
+            );
+            m.insert(format!("{BANANABLOCKS_BASE}/tx/{t}"), nf());
+            m.insert(
+                format!("{BANANABLOCKS_BASE}/tx/{}", crate::txany::KNOWN_MINED_TXID),
+                nf(),
+            );
+            let (a, absence, asked) = lens_leg(&t, m, None, false);
+            assert_eq!(
+                (a.present, absence),
+                (Some(false), AbsenceCorroboration::CorroboratedAbsent)
+            );
+            assert!(
+                asked.iter().any(|u| u.ends_with(crate::txany::KNOWN_MINED_TXID) && u.starts_with(WOC_BASE)),
+                "WoC's route is proven: {asked:?}"
+            );
+            assert!(
+                !asked
+                    .iter()
+                    .any(|u| u.ends_with(crate::txany::KNOWN_MINED_TXID)
+                        && u.starts_with(BANANABLOCKS_BASE)),
+                "BananaBlocks' route is never proven: {asked:?}"
+            );
+        }
+
+        /// (g) A BananaBlocks MINED claim is served `confirmed` only through WoC's `/proof/tsc` checked against
+        /// chaintracks at the CLAIMED height; with the check refusing it is the hint with `claimedHeight`, and with
+        /// no proof route answering likewise. Never BananaBlocks' own proof route.
+        #[test]
+        fn lens868_g_a_bananablocks_mined_claim_needs_the_checked_proof() {
+            // the recorded mined body (no `confirmations`), re-keyed to the harness's spender so its raw verifies
+            let (t, raw) = competitor();
+            let (s, b, _) = c868_recorded("bb_tx_mined");
+            let mut v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            v["txid"] = serde_json::json!(t);
+            let b = v.to_string().into_bytes();
+            let tsc = serde_json::json!({"txOrId": t, "index": 0, "nodes": ["*"]})
+                .to_string()
+                .into_bytes();
+            for (label, proof, check, want_confirmed) in [
+                ("proof checked", Some(tsc.clone()), true, Some(true)),
+                ("proof refused", Some(tsc.clone()), false, None),
+                ("no proof", None, true, None),
+            ] {
+                let mut m = HashMap::new();
+                m.insert(format!("{WOC_BASE}/tx/hash/{t}"), (429, Vec::new()));
+                m.insert(format!("{BANANABLOCKS_BASE}/tx/{t}"), (s, b.clone()));
+                m.insert(
+                    format!("{WOC_BASE}/tx/{t}/hex"),
+                    (200, hex::encode(&raw).into_bytes()),
+                );
+                if let Some(p) = proof {
+                    m.insert(format!("{WOC_BASE}/tx/{t}/proof/tsc"), (200, p));
+                }
+                let (a, _, asked) = lens_leg(&t, m, Some(true), check);
+                assert_eq!(a.confirmed, want_confirmed, "{label}");
+                // the height is served only where the proof was checked at it
+                assert_eq!(
+                    a.height,
+                    want_confirmed.map(|_| 972_476),
+                    "{label}: a height only behind the checked proof"
+                );
+                if want_confirmed.is_none() {
+                    assert_eq!(
+                        (a.present, a.hint_source, a.claimed_height),
+                        (None, Some("bananablocks"), Some(972_476)),
+                        "{label}"
+                    );
+                }
+                assert!(
+                    !asked
+                        .iter()
+                        .any(|u| u.starts_with(BANANABLOCKS_BASE) && u.contains("proof")),
+                    "{label}: {asked:?}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

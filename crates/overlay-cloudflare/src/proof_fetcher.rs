@@ -35,6 +35,13 @@
 mod diagnostics;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod fix834;
+// Lane COURIER-RUNG-LENS: PR 170 adds `proof_fetcher/c868.rs` but never declares it, so its pins are not compiled.
+// It also fails the crate's `clippy::unwrap_used` deny once compiled; the test allowance below is this file's own.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used, reason = "test code")]
+mod c868;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lens868;
 use crate::courier_counters::{Counters as CourierCounters, Outcome as CourierOutcome, Attempt as CourierAttempt};
 pub(crate) use diagnostics::{ProofProbe, PROOF_RUNGS};
 
