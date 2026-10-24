@@ -338,3 +338,15 @@ fn l7_both_renders_set_spend_depth_1() {
         );
     }
 }
+
+/// `/health/invariants` (the overlay's) serves the malformed-var count from 0: the overlay seeds the name, and the
+/// app layer lists it among its mirrored names (so `obs_628_every_name_is_seeded_by_the_overlay` holds both sides).
+#[test]
+fn l7_the_overlay_seeds_the_malformed_count() {
+    let name = runtime::SPEND_DEPTH_MALFORMED_COUNTER.to_string();
+    assert!(
+        bsv_overlay_cloudflare::applayer_counters::names().contains(&name),
+        "the overlay's /health/invariants does not seed {name}"
+    );
+    assert!(runtime::tracker_mirrored_counter_names().contains(&name));
+}

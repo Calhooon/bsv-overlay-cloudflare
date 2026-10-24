@@ -158,6 +158,8 @@ pub fn names() -> Vec<String> {
     }));
     // bsv-low #660 (B-OWED-3-FOLD L2): a word frame `/internal/tx-word` dropped as unheld
     v.push("applayer_tracker_event_unheld_total".to_string());
+    // bsv-low #862 (L7-DEPTH): a missing or malformed SPEND_DEPTH var (the floor served), once per isolate
+    v.push("spend_depth_var_malformed_total".to_string());
     v
 }
 

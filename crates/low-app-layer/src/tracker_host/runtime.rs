@@ -819,7 +819,10 @@ pub const COUNTER_TRACKER_EVENT_UNHELD: &str = "applayer_tracker_event_unheld_to
 
 /// The mirrored counter names of the word events (the observability bar's seed list).
 pub fn tracker_mirrored_counter_names() -> Vec<String> {
-    vec![COUNTER_TRACKER_EVENT_UNHELD.to_string()]
+    vec![
+        COUNTER_TRACKER_EVENT_UNHELD.to_string(),
+        SPEND_DEPTH_MALFORMED_COUNTER.to_string(),
+    ]
 }
 
 /// Count one unheld frame (B-OWED-3-FOLD L2).
