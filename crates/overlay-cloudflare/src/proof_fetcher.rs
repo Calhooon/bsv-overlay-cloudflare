@@ -35,6 +35,15 @@
 mod diagnostics;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod fix834;
+// bsv-low #868 (the COURIER-RUNG lens's M2): the PR's own pins, declared so they compile and run (they were not).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod c868;
+// The COURIER-RUNG lens's cases (lane COURIER-RUNG-LENS, taken as written; (d) re-aimed by the fold's L1 statement).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lens868;
+// The lens fold's own pins (lane COURIER-RUNG-FOLD).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod c868f;
 use crate::courier_counters::{Counters as CourierCounters, Outcome as CourierOutcome, Attempt as CourierAttempt};
 pub(crate) use diagnostics::{ProofProbe, PROOF_RUNGS};
 
@@ -4229,11 +4238,17 @@ async fn presence_counted(
     let (presence, outcome) = match response {
         Ok((status, body)) => {
             let presence = read(status, &body);
-            let outcome = CourierOutcome::response(
-                status,
-                presence.is_some(),
-                matches!(presence, Some(NetworkPresence::Present { .. })),
-            );
+            // the COURIER-RUNG lens fold (M1): BananaBlocks' 404 is a look only as its recorded not-found (its reader
+            // answers `Absent`); any other 404 is a fault, never the `notfound` row a clean look is counted under
+            let outcome = if provider == "bananablocks_presence" && status == 404 && presence.is_none() {
+                CourierOutcome::Fault
+            } else {
+                CourierOutcome::response(
+                    status,
+                    presence.is_some(),
+                    matches!(presence, Some(NetworkPresence::Present { .. })),
+                )
+            };
             (presence, outcome)
         }
         Err(_) => (None, CourierOutcome::Fault),

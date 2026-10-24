@@ -10,14 +10,22 @@ use crate::courier_counters::{Counters as CourierCounters, Reader};
 const FIXTURE: &str = include_str!("../../../low-app-layer/tests/fixtures/courier_probe_868.json");
 
 /// A recorded answer: (status, body, the subject its url asked about).
+/// A key the fixture lacks reads as status 0, an empty body and an empty subject, which every case's assertion
+/// refuses (no unwrap: the crate denies `clippy::unwrap_used`, test helpers included).
 fn recorded(key: &str) -> (u16, String, String) {
-    let v: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    let v: serde_json::Value = serde_json::from_str(FIXTURE).unwrap_or_default();
     let b = &v["bodies"][key];
-    let url = b["url"].as_str().unwrap();
+    let subject = b["url"]
+        .as_str()
+        .and_then(|url| url.rsplit('/').next())
+        .unwrap_or_default();
     (
-        u16::try_from(b["status"].as_u64().unwrap()).unwrap(),
-        b["body"].as_str().unwrap().to_string(),
-        url.rsplit('/').next().unwrap().to_string(),
+        b["status"]
+            .as_u64()
+            .and_then(|s| u16::try_from(s).ok())
+            .unwrap_or_default(),
+        b["body"].as_str().unwrap_or_default().to_string(),
+        subject.to_string(),
     )
 }
 
