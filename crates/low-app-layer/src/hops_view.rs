@@ -3134,14 +3134,16 @@ mod tests {
             crate::owed::UNCONFIRMED_PAYOUT_REASON
         );
         assert!(row.facts[OWED_FACT_CHAIN_WORD_AWAITS_PROBE].is_null());
-        // and a memo read past the grace keeps its word and its row: claimable, unnamed
+        // and a memo read past the grace keeps its word and its row, unnamed; since the COURIER-RUNG lens fold (L2) a
+        // courier's confirmed word presses nothing, so the row is the pending wait with the hint (it was claimable)
         let (row, _) = walk(
             &memo_naming(&sweep, t0 + PROBE_MEMO_REORG_GRACE_MS),
             t0 + 3 * 60 * min,
             Some(t0),
             false,
         );
-        assert_eq!(row.facts["claimable"], true);
+        assert_eq!(row.facts["claimable"], false);
+        assert_eq!(row.facts["spenderPresence"]["source"], "courier");
         assert!(row.facts[OWED_FACT_CHAIN_WORD_AWAITS_PROBE].is_null());
 
         // THE WALK RUNS THESE (source), in this order: the refusal remembered, the set-aside after the proof read
@@ -3358,6 +3360,11 @@ mod tests {
     /// 3. past the grace a confirmed word is the normal rule again: a closed row, fifteen minutes, and a stale
     ///    memo keeps its word; the index's own proof outranks the refused word throughout.
     ///
+    /// Amended by the COURIER-RUNG lens fold (L2): a courier's "confirmed" is a hint and never a press, inside the
+    /// grace or past it, so every courier-only row below is `claimable: false` (an OPEN row, re-derived by the
+    /// five-minute rule until a checked word or the index's proof lands); the grace's mark, the memo's refused
+    /// confirmation and the index proof's precedence are unchanged.
+    ///
     /// To red: drop the grace clause from `owed::row_is_open`, or serve `m.spent_confirmed` in `stale_memo_word`.
     #[test]
     fn inside_the_reorg_grace_a_lagging_confirmed_word_is_claimable_for_one_five_minute_recompute()
@@ -3432,8 +3439,8 @@ mod tests {
         let row = derive(w1, fresh(true), &grace_of(Some(true), w1), false);
         assert_eq!(
             (row.family, row.facts["claimable"].as_bool()),
-            (OwedFamily::Payout, Some(true)),
-            "the lagging word is served, as it always was"
+            (OwedFamily::Payout, Some(false)),
+            "the lagging word is served as the hint, never a press (L2)"
         );
         assert_eq!(row.facts[OWED_FACT_REORG_GRACE_WORD], true);
         assert!(!recompute(4 * min, &row));
@@ -3501,7 +3508,7 @@ mod tests {
         assert_eq!(row.facts["claimable"], false);
         // still behind: the same one-recompute word, never a longer one
         let row = derive(w2, fresh(true), &grace_of(Some(true), w2), false);
-        assert!(row.facts["claimable"] == true && recompute(5 * min + 1, &row));
+        assert!(row.facts["claimable"] == false && recompute(5 * min + 1, &row));
         // a memo answering inside its short window (a recompute a push triggered two minutes on) is the same word
         let (answered, _) = split_probe_targets_after_reorg(
             &target,
@@ -3534,9 +3541,12 @@ mod tests {
                 && !in_reorg_grace(w1, None)
         );
         let row = derive(w3, fresh(true), &grace_of(Some(true), w3), false);
-        assert_eq!(row.facts["claimable"], true);
+        assert_eq!(row.facts["claimable"], false, "a courier's word presses nothing (L2)");
         assert!(row.facts[OWED_FACT_REORG_GRACE_WORD].is_null());
-        assert!(!recompute(5 * min + 1, &row), "a closed row again");
+        assert!(
+            recompute(5 * min + 1, &row),
+            "an open row, waiting for a checked word (L2; it was a closed row)"
+        );
         assert!(recompute(15 * min + 1, &row), "the fifteen-minute rule");
         let late = ProbeMemo {
             probed_at_ms: w3,
