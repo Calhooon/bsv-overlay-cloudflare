@@ -7324,6 +7324,8 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             present_tip_for_degrade,
         );
     }
+    // bsv-low #861: a SHED read serves the stored rows unjudged, so no stored press is offered on it
+    crate::owed::demote_shed_presses(&mut served, refresh_retry, served_snapshot_is_fresh);
     let mut body: serde_json::Value = serde_json::from_str(&crate::owed::owed_body(
         &identity,
         tip,
