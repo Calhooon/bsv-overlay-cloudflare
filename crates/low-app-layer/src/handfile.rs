@@ -814,7 +814,6 @@ pub async fn handfile_post(
     // 7. the chain no-op and the caps, per family, before any write
     let v1 = VerifiedRecord::Potparty(verified.potparty_v1.clone(), true);
     let v2 = VerifiedRecord::Potparty(verified.potparty_v2.clone(), true);
-    let refund = VerifiedRecord::Potrefund(verified.potrefund.clone(), refund_valid);
     let mut write = [true; HANDFILE_PAYLOADS];
     let hop_chain = crate::record_post::count(
         &db,
@@ -827,10 +826,17 @@ pub async fn handfile_post(
     )
     .await?;
     write[HandfileSlot::Hopparty as usize] = hop_chain == 0;
+    // bsv-low #798: the refund's chain no-op is the direct door's, row by row (a junk-signed chain row naming this
+    // identity is never a no-op; an own row is latched before the batch)
+    let port = crate::routes::D1Sql::of(&ctx.env)?;
+    let own_refund_rows =
+        crate::record_post::potrefund_chain_noop(&port, &verified.potrefund, pot.as_ref())
+            .await
+            .map_err(worker::Error::RustError)?;
+    write[HandfileSlot::Potrefund as usize] = own_refund_rows == 0;
     for (slot, v) in [
         (HandfileSlot::PotpartyV1, &v1),
         (HandfileSlot::PotpartyV2, &v2),
-        (HandfileSlot::Potrefund, &refund),
     ] {
         if let Some((sql, binds)) = chain_rows_query(v) {
             let n = crate::record_post::count(
