@@ -3541,7 +3541,10 @@ mod tests {
                 && !in_reorg_grace(w1, None)
         );
         let row = derive(w3, fresh(true), &grace_of(Some(true), w3), false);
-        assert_eq!(row.facts["claimable"], false, "a courier's word presses nothing (L2)");
+        assert_eq!(
+            row.facts["claimable"], false,
+            "a courier's word presses nothing (L2)"
+        );
         assert!(row.facts[OWED_FACT_REORG_GRACE_WORD].is_null());
         assert!(
             recompute(5 * min + 1, &row),

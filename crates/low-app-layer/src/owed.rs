@@ -12715,7 +12715,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_filed_sweep_the_index_names_but_never_confirmed_is_claimable_once_a_checked_word_confirms_it() {
+    fn a_filed_sweep_the_index_names_but_never_confirmed_is_claimable_once_a_checked_word_confirms_it(
+    ) {
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let sweep = tx(0x0c);
         let key = format!("{}:0", tx(0x07));
@@ -12735,8 +12736,8 @@ pub(crate) mod tests {
         let rows = derive_owed_rows(&i);
         assert_eq!(rows[0].family, OwedFamily::Payout);
         assert_eq!(rows[0].facts["claimable"], false); // the index's word alone: not yet
-        // the COURIER-RUNG lens fold (L2): the courier's word (the same spender, confirmed) no longer heals the press;
-        // it is the row's hint (it healed it before the fold)
+                                                       // the COURIER-RUNG lens fold (L2): the courier's word (the same spender, confirmed) no longer heals the press;
+                                                       // it is the row's hint (it healed it before the fold)
         let word = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
         i.hop_chain = &word;
         let rows = derive_owed_rows(&i);

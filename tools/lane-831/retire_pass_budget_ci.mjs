@@ -18,6 +18,8 @@
  *     and the rest DEFERRED.
  *  3. the drain: passes until every ghost pot is ended (each pass under the same ceiling), each ended pot under the
  *     retire reason in the ledger, its rows shadow-moved, its hops released.
+ *  4. the COURIER-RUNG lens fold (M1): one more ghost pot under a NON-STANDARD BananaBlocks 404 survives three passes
+ *     (a fault, never a look), then ends under the recorded not-found (the control).
  * On `ef9186df` there is no lever (404): RED. With the budget lifted (the base's endings) the worst tick reds on
  * the ceiling.
  *
@@ -57,12 +59,15 @@ const expect = (ok, label, why) => {
 // The couriers' stand-in: every GET is 404 (Arcade's "not carried", both indexers' "not known"), counted by path.
 // bsv-low #868: BananaBlocks' native `/api/v1/tx/{txid}` answers its recorded not-found body (probed 2026-10-24), the
 // second capable source's clean absence beside WoC's 404 (Bitails' 404 is "could not look" since #868).
+// The COURIER-RUNG lens fold (M1, leg 4): `bananaNotFound` switches that answer to a NON-STANDARD 404 (a body that is
+// not BananaBlocks' own not-found), which is a fault and never a look: a ghost pot under it is never ended.
 const asked = []
+let bananaNotFound = '{"error":"Transaction not found"}'
 const sink = createServer((req, res) => {
   asked.push(`${req.method} ${req.url}`)
   if (/^\/api\/v1\/tx\/[0-9a-f]{64}$/.test(req.url)) {
     res.writeHead(404, { 'content-type': 'application/json' })
-    return res.end('{"error":"Transaction not found"}')
+    return res.end(bananaNotFound)
   }
   res.writeHead(404, { 'content-type': 'text/plain' })
   res.end('not found')
@@ -199,6 +204,27 @@ try {
   const pointing = Number(d1(`SELECT COUNT(*) AS n FROM pot_records WHERE spendingTxid IN (${all.map((t) => `'${t}'`).join(',')})`)[0]?.n)
   expect(pointing === 0, "no hop names an ended pot (the spends released)", `${pointing}`)
   expect(asked.length > 0 && asked.every((a) => a.startsWith('GET /')), 'the couriers asked the loopback stand-in only', asked.slice(0, 3).join(' | '))
+
+  // 4. The COURIER-RUNG lens fold (M1): a ghost pot whose BananaBlocks answers a NON-STANDARD 404 is never ended (the
+  // absence needs WoC's 404 AND BananaBlocks' recorded not-found; any other 404 is a fault), however many passes run;
+  // the same pot ends once BananaBlocks answers its recorded body (the control: the leg would have seen an ending).
+  ghosts.watched.length = 0
+  sql.length = 0
+  seed(hex(), 'watched')
+  d1(sql.join('\n'), true)
+  const sentinel = ghosts.watched[0]
+  const alive = () => Number(d1(`SELECT COUNT(*) AS n FROM pot_records WHERE txid = '${sentinel}'`)[0]?.n)
+  const evicted = () => d1(`SELECT reason FROM pot_evictions WHERE txid = '${sentinel}'`).length
+  bananaNotFound = '{"error":"Not Found"}'
+  const nsBefore = asked.length
+  for (let i = 0; i < 3; i++) await lever()
+  const nsAsked = asked.slice(nsBefore).filter((a) => a.includes(`/api/v1/tx/${sentinel}`)).length
+  lines.push(`INFO  non-standard 404: BananaBlocks asked ${nsAsked} time(s) for the sentinel over 3 passes`)
+  expect(nsAsked > 0, 'the leg asked BananaBlocks about the sentinel (the look was made)', `${nsAsked}`)
+  expect(alive() === 1 && evicted() === 0, "a non-standard BananaBlocks 404 leaves the ghost pot ALIVE (no eviction)", `live ${alive()}, ledger ${evicted()}`)
+  bananaNotFound = '{"error":"Transaction not found"}'
+  for (let i = 0; i < 3 && alive() > 0; i++) await lever()
+  expect(alive() === 0 && evicted() === 1, 'the control: with its recorded not-found the same pot is ended', `live ${alive()}, ledger ${evicted()}`)
 } catch (e) {
   expect(false, 'the cell ran', e.stack ?? String(e))
 } finally {
