@@ -370,6 +370,35 @@ pub(crate) async fn chaintracks_header_detailed(
     }))
 }
 
+/// bsv-low #620: one page of chaintracks' chain-event feed, `GET /events?since=<since>` over the CHAINTRACKS binding
+/// (or `CHAIN_TRACKER_URL`): its status and body, or the transport's fault. The body is the consumer's to read
+/// (`chain_feed`), never interpreted here.
+pub(crate) async fn chaintracks_events_page(
+    env: &worker::Env,
+    since: &str,
+) -> Result<(u16, Vec<u8>), String> {
+    let base_url = env
+        .var("CHAIN_TRACKER_URL")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| "https://chaintracks.invalid".to_string());
+    let service = env.service("CHAINTRACKS").ok();
+    if service.is_none() && env.var("CHAIN_TRACKER_URL").is_err() {
+        return Err(
+            "no header source configured (CHAINTRACKS binding / CHAIN_TRACKER_URL)".to_string(),
+        );
+    }
+    let url = format!("{}/events?since={since}", base_url.trim_end_matches('/'));
+    let mut response = ct_get(url, &service, "events")
+        .await
+        .map_err(|e| format!("chaintracks events at {since}: {e}"))?;
+    let status = response.status_code();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| format!("chaintracks events at {since}: body: {e}"))?;
+    Ok((status, body))
+}
+
 /// bsv-low #470 PRE557: the confirming block's time from OUR header source, never a courier: the header
 /// chaintracks holds at the bump's height, accepted only when its merkle root is the root the bump
 /// computes (so the time is the time of the block the proof binds to).

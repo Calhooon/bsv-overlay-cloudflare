@@ -121,6 +121,81 @@ pub const DRAIN_DELETE: &str = "DELETE FROM tracker_reasks WHERE txid = ?1 AND e
 pub const DRAIN_RETRY: &str =
     "UPDATE tracker_reasks SET attempts = attempts + 1 WHERE txid = ?1 AND event_cursor = ?2";
 
+/// bsv-low #778: the intake's durable per-pass witness, one `ops_counters` row holding the stamp (seconds) of the last
+/// pass that reached the intake ([`WITNESS_TOUCH`], the first statement of [`run`]'s pass, before any feed read). A pass
+/// that never reaches the intake (its task cancelled, an await before it that never answers) leaves the stamp where the
+/// previous pass put it, and the next pass that reaches the intake counts the gap ([`skipped_passes`]).
+pub const WITNESS_NAME: &str = "tracker_chain_events_last_pull_at";
+
+/// The witness's read and its touch, in ONE batch: the stamp the previous pass left, then this pass's, never moved
+/// back (a late or concurrent pass keeps the newer stamp).
+pub const WITNESS_READ: &str =
+    "SELECT value FROM ops_counters WHERE name = 'tracker_chain_events_last_pull_at'";
+pub const WITNESS_TOUCH: &str = "INSERT INTO ops_counters (name, value) VALUES ('tracker_chain_events_last_pull_at', ?1) ON CONFLICT(name) DO UPDATE SET value = MAX(ops_counters.value, excluded.value)";
+
+/// The scheduled pass's interval, seconds: the app layer's cron `*/15` in every config (pinned against them).
+pub const PASS_INTERVAL_S: u64 = 900;
+
+/// bsv-low #777: the health read's counters, the intake's durable rows of `ops_counters` (its `tracker_chain_events_*`
+/// names, a primary-key range: '`' is the byte after '_').
+pub const HEALTH_COUNTERS_READ: &str = "SELECT name, value FROM ops_counters WHERE name >= 'tracker_chain_events_' AND name < 'tracker_chain_events`' ORDER BY name";
+
+/// The scheduled passes a witness gap says did not reach the intake: none while the gap is under one and a half
+/// intervals (a pass's own jitter), else the intervals the gap spans, rounded, less the pass that is running.
+pub fn skipped_passes(previous: Option<u64>, now: u64) -> u64 {
+    let Some(previous) = previous.filter(|p| *p > 0) else {
+        return 0;
+    };
+    let gap = now.saturating_sub(previous);
+    if gap < PASS_INTERVAL_S + PASS_INTERVAL_S / 2 {
+        return 0;
+    }
+    (gap + PASS_INTERVAL_S / 2) / PASS_INTERVAL_S - 1
+}
+
+/// THE WITNESS (bsv-low #778): read the previous pass's stamp and write this one's in one batch, then count this pass
+/// (`tracker_chain_events_pass_total`) and every pass the gap says never reached the intake
+/// (`tracker_chain_events_skipped_passes_total`, logged `[chain-events] SKIPPED` with both stamps). A fault is counted
+/// and logged; the pull goes on.
+pub async fn witness<S: SqlPort>(sql: &S, now: u64) -> Vec<(String, u64)> {
+    let mut out = vec![("tracker_chain_events_pass_total".to_string(), 1)];
+    match sql
+        .run_batch(vec![
+            stmt(WITNESS_READ, vec![]),
+            stmt(WITNESS_TOUCH, vec![Bind::Int(now as i64)]),
+        ])
+        .await
+    {
+        Ok(rows) => {
+            let previous = rows
+                .into_iter()
+                .next()
+                .and_then(|o| o.rows.into_iter().next())
+                .and_then(|r| r["value"].as_f64())
+                .map(|v| v as u64);
+            let skipped = skipped_passes(previous, now);
+            if skipped > 0 {
+                sql.log(&format!(
+                    "[chain-events] SKIPPED: the last pass to reach the intake was at {} ({} s ago); {skipped} scheduled pass(es) since never reached it",
+                    previous.unwrap_or(0),
+                    now.saturating_sub(previous.unwrap_or(0))
+                ));
+                out.push((
+                    "tracker_chain_events_skipped_passes_total".to_string(),
+                    skipped,
+                ));
+            }
+        }
+        Err(e) => {
+            sql.log(&format!(
+                "[chain-events] the pass witness was not written: {e}"
+            ));
+            out.push(("tracker_chain_events_witness_faults_total".to_string(), 1));
+        }
+    }
+    out
+}
+
 /// The stored row, as read back. D1 answers numbers; a cursor is the feed's decimal string.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Cursor {
@@ -982,6 +1057,8 @@ pub async fn run(env: &worker::Env) {
     let deadline = crate::routes::worker_deadline(WALL_MS, 0);
     let now = super::WorkerClock.now();
     let pass = async {
+        // bsv-low #778: the pass's witness first, before anything that awaits the feed or CHAINTRACKS.
+        note(&witness(&sql, now).await);
         for index in INDEXES {
             if let Err(e) = sql.run_batch(vec![stmt(index, vec![])]).await {
                 sql.log(&format!("[chain-events] index deferred: {e}"));
@@ -1147,12 +1224,111 @@ pub fn note(counters: &[(String, u64)]) {
     }
 }
 
-/// `/health.chainEvents`: the cursor row as this isolate's last pass (or its lever) left it, `seed` and `startedAt`
-/// included (no read route touches D1 for it), and this isolate's counters.
+/// bsv-low #777: `/health.chainEvents` from the DURABLE row and counters: ONE batch, the cursor row ([`STATE_READ`])
+/// and the intake's `ops_counters` rows ([`HEALTH_COUNTERS_READ`]): `counters` is the fleet's durable totals (the
+/// witness's stamp served apart as `lastPullAt`), `isolateCounters` this isolate's tally, `source` `"d1"`. Until #777
+/// the object was a per-isolate memo only a scheduled pass (or the lever) in the SAME isolate filled, so a fetch
+/// isolate served nulls and an empty map while the row advanced. A read fault serves the memo, `source` `"isolate"`
+/// and the fault as `readFault`.
+pub async fn health_read<S: SqlPort>(sql: &S) -> Value {
+    let read = sql
+        .run_batch(vec![
+            stmt(STATE_READ, vec![]),
+            stmt(HEALTH_COUNTERS_READ, vec![]),
+        ])
+        .await;
+    let (row, counter_rows) = match read {
+        Ok(out) => {
+            let mut out = out.into_iter();
+            let row = row_of(out.next());
+            let counter_rows = out.next().map(|o| o.rows).unwrap_or_default();
+            match row {
+                Ok(row) => (row, counter_rows),
+                Err(e) => return isolate_health(e),
+            }
+        }
+        Err(e) => return isolate_health(e),
+    };
+    let mut v = row
+        .as_ref()
+        .map(Cursor::health)
+        .unwrap_or_else(empty_health);
+    let mut counters = serde_json::Map::new();
+    let mut last_pull = Value::Null;
+    for r in counter_rows {
+        let (Some(name), Some(value)) = (r["name"].as_str(), r["value"].as_f64()) else {
+            continue;
+        };
+        if name == WITNESS_NAME {
+            last_pull = json!(value as u64);
+        } else {
+            counters.insert(name.to_string(), json!(value as u64));
+        }
+    }
+    v["lastPullAt"] = last_pull;
+    v["counters"] = Value::Object(counters);
+    v["isolateCounters"] = COUNTS.with(|c| json!(*c.borrow()));
+    v["source"] = json!("d1");
+    v
+}
+
+/// The public `/health`'s memo of the durable read: how long one answer is served again (the W15E-L4 lens fold, LOW-2).
+pub const HEALTH_MEMO_TTL_MS: u64 = 10_000;
+
+thread_local! {
+    static HEALTH_MEMO: RefCell<Option<(u64, Value)>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn health_memo_reset() {
+    HEALTH_MEMO.with(|m| *m.borrow_mut() = None);
+}
+
+/// What the public `/health` serves (bsv-low #777 and the W15E-L4 lens fold, LOW-2): [`health_read`] behind THIS
+/// isolate's memo. Until the fold the route made one D1 batch (two statements) per read of an unauthenticated route
+/// the census lists, uncached, where before #777 it touched no D1: a stranger's flood paid two statements a read and
+/// a D1 queue slowed the liveness probe. A read inside [`HEALTH_MEMO_TTL_MS`] of the last durable read serves that
+/// object again (`source` still `"d1"`: it IS the durable read's answer; `memoAgeMs` its age; `isolateCounters` this
+/// isolate's current tally); one past it reads D1 again (`memoAgeMs` 0). A faulted read is served as the isolate
+/// memo for that read alone and never memoized, and a stale memo is not served over a fault (the fault is the news).
+/// Bound: one D1 batch per isolate per 10 s whatever the read rate (the cost bar counts it). The clock is the port's.
+pub async fn health_served<S: SqlPort>(sql: &S) -> Value {
+    let now = sql.now_ms();
+    if let Some((at, mut v)) = HEALTH_MEMO.with(|m| m.borrow().clone()) {
+        let age = now.saturating_sub(at);
+        if age < HEALTH_MEMO_TTL_MS {
+            v["memoAgeMs"] = json!(age);
+            v["isolateCounters"] = COUNTS.with(|c| json!(*c.borrow()));
+            return v;
+        }
+    }
+    let mut v = health_read(sql).await;
+    if v["source"] == json!("d1") {
+        v["memoAgeMs"] = json!(0);
+        HEALTH_MEMO.with(|m| *m.borrow_mut() = Some((now, v.clone())));
+    }
+    v
+}
+
+fn empty_health() -> Value {
+    json!({"cursor": null, "lastKind": null, "lastAt": null, "tipHeight": null, "tipAgeSeconds": null, "seed": null, "startedAt": null})
+}
+
+/// The memo's object when the durable read could not be made (`source` `"isolate"`, the fault as `readFault`).
+pub fn isolate_health(fault: impl Into<String>) -> Value {
+    let mut v = health_json();
+    v["isolateCounters"] = v["counters"].clone();
+    v["source"] = json!("isolate");
+    v["readFault"] = json!(fault.into());
+    v
+}
+
+/// The cursor row as this isolate's last pass (or its lever) left it, `seed` and `startedAt` included, and this
+/// isolate's counters: the fallback of [`health_read`] (bsv-low #777).
 pub fn health_json() -> Value {
-    let mut v = LAST.with(|l| l.borrow().as_ref().map(Cursor::health)).unwrap_or_else(|| {
-        json!({"cursor": null, "lastKind": null, "lastAt": null, "tipHeight": null, "tipAgeSeconds": null, "seed": null, "startedAt": null})
-    });
+    let mut v = LAST
+        .with(|l| l.borrow().as_ref().map(Cursor::health))
+        .unwrap_or_else(empty_health);
     v["counters"] = COUNTS.with(|c| json!(*c.borrow()));
     v
 }
@@ -1937,21 +2113,19 @@ mod pins {
             .any(|d| d.contains("SEARCH w USING INDEX sqlite_autoindex_tx_words_1")));
     }
 
-    /// The wiring: the scheduled pass runs the intake after the backfill and before the tick; no fetch handler and
-    /// no read route runs it (NS-3: no read writes a word); the feed is the CHAINTRACKS binding, never a URL fetch;
-    /// `/health` serves `chainEvents` from this isolate's memory, no D1 read.
+    /// The wiring (amended in the W15E-L4-LENS worktree for #777 and #778, PR 154): the scheduled pass runs the intake
+    /// in ITS OWN task, handed before the tracker task's boot, board era, backfill and tick; no fetch handler and no
+    /// read route runs it (NS-3: no read writes a word); the feed is the CHAINTRACKS binding, never a URL fetch;
+    /// `/health` serves `chainEvents` through `health_served` (the durable read behind a 10 s isolate memo), the
+    /// isolate memo only on a fault.
     #[test]
     fn i771_the_scheduled_pass_alone_runs_the_intake_over_the_binding() {
         let lib = include_str!("../lib.rs");
         let at = |needle: &str| lib.find(needle).unwrap_or_else(|| panic!("{needle}"));
-        assert!(
-            at("tracker_host::runtime::backfill(&env)")
-                < at("tracker_host::chain_events::run(&env)")
-        );
-        assert!(
-            at("tracker_host::chain_events::run(&env)") < at("tracker_host::runtime::tick(&env)")
-        );
-        assert!(at("tracker_host::chain_events::run(&env)") < at("pub async fn fetch("));
+        let intake = at("tracker_host::chain_events::run(&env_intake)");
+        assert!(at("async fn scheduled(") < intake && intake < at("pub async fn fetch("));
+        assert!(intake < at("tracker_host::runtime::backfill(&env)"));
+        assert!(intake < at("tracker_host::runtime::tick(&env)"));
         assert_eq!(lib.matches("chain_events::run(").count(), 1);
         let routes = include_str!("../routes.rs");
         for call in [
@@ -1961,9 +2135,11 @@ mod pins {
         ] {
             assert!(!routes.contains(call), "a route runs {call}");
         }
-        let health = &routes[routes.find("pub fn health(").unwrap()..];
+        let health = &routes[routes.find("pub async fn health(").unwrap()..];
         let health = &health[..health.find("\n}\n").unwrap()];
-        assert!(health.contains("chain_events::health_json()"));
+        assert!(health.contains("chain_events::health_served(&sql).await"));
+        assert!(!health.contains("chain_events::health_json()"));
+        assert!(!health.contains("chain_events::health_read("), "the route reads through the memo");
         let src = include_str!("chain_events.rs");
         let feed = &src[src.find("impl Feed for BindingFeed").unwrap()
             ..src.find("pub struct WorkerReasks").unwrap()];
@@ -2336,5 +2512,257 @@ mod pins {
         assert!(read.counters.is_empty(), "a read counts nothing");
         let none = block(lever(&fixture(), true, false, b"", 2_100));
         assert_eq!((none.status, none.body["row"].clone()), (200, Value::Null));
+    }
+
+    /// bsv-low #777: `/health.chainEvents` serves the DURABLE row and counters. The row is written as the lever writes
+    /// it and the counters as the census flushes them (`ops_counters` rows), the witness's stamp beside them; the
+    /// health read answers the row's fields, the durable counters (the stamp apart, as `lastPullAt`) and
+    /// `source: "d1"`. The memo it replaced, read on a fresh thread (a fetch isolate whose scheduled pass never ran),
+    /// is the issue's body: nulls and an empty map while the row stands. And the route serves this read.
+    #[test]
+    fn i777_the_health_object_reads_the_durable_row_and_counters() {
+        let db = SqliteSql::migrated();
+        let set = block(lever(
+            &db,
+            true,
+            true,
+            br#"{"cursor":"20084"}"#,
+            1_792_504_017,
+        ));
+        assert_eq!(set.status, 200, "{}", set.body);
+        db.conn
+            .execute_batch(
+                "INSERT INTO ops_counters (name, value) VALUES ('tracker_chain_events_total', 52), ('tracker_chain_events_tip_age_total', 40), ('tracker_chain_events_last_pull_at', 1792505400), ('tracker_backfill_faulted_total', 3)",
+            )
+            .unwrap();
+        let v = block(health_read(&db));
+        assert_eq!(v["source"], json!("d1"), "{v}");
+        assert_eq!(v["cursor"], json!("20084"), "{v}");
+        assert_eq!(v["seed"], json!("20084"));
+        assert_eq!(v["startedAt"], json!(1_792_504_017u64));
+        assert_eq!(v["lastPullAt"], json!(1_792_505_400u64));
+        assert_eq!(
+            v["counters"],
+            json!({"tracker_chain_events_total": 52, "tracker_chain_events_tip_age_total": 40}),
+            "the intake's durable rows, the stamp apart, no other family"
+        );
+        assert!(v["isolateCounters"].is_object());
+        // the memo the route served before: a fresh isolate's, whatever the row says
+        let memo = std::thread::spawn(health_json).join().unwrap();
+        assert_eq!(
+            (
+                memo["cursor"].clone(),
+                memo["seed"].clone(),
+                memo["counters"].clone()
+            ),
+            (Value::Null, Value::Null, json!({})),
+            "the #777 body: the memo a fetch isolate holds"
+        );
+        // no row yet: the null shape, still from D1
+        let fresh = block(health_read(&SqliteSql::migrated()));
+        assert_eq!(
+            (fresh["source"].clone(), fresh["cursor"].clone()),
+            (json!("d1"), Value::Null)
+        );
+        // the route serves the durable read, the memo only on a fault
+        let routes: String = include_str!("../routes.rs").split_whitespace().collect();
+        let health = &routes[routes
+            .find("pubasyncfnhealth(_req:Request,ctx:RouteContext<AuthState>)")
+            .expect("the async /health")..];
+        let health = &health[..health.find("json_response(body.to_string(),200)").unwrap()];
+        assert!(health.contains("crate::tracker_host::chain_events::health_served(&sql).await"));
+        assert!(!health.contains("chain_events::health_json()"));
+        let lib: String = include_str!("../lib.rs").split_whitespace().collect();
+        assert!(lib.contains(r#".get_async("/health",routes::health)"#));
+    }
+
+    /// The W15E-L4 lens fold (LOW-2): the public `/health` reads D1 through THIS isolate's memo of the durable read.
+    /// A second read inside `HEALTH_MEMO_TTL_MS` is served from the memo (one D1 batch in all; `source` still `"d1"`,
+    /// it IS the durable read's answer; `memoAgeMs` its age); a read past it asks D1 again (`memoAgeMs` 0). A faulted
+    /// read is served as the isolate memo (`source: "isolate"`) and never memoized, so the read after it asks D1 again.
+    /// RED with `health_served` a pass-through to `health_read`: at the first read `left: (String("d1"),
+    /// String("20084"), Null) right: (.., Number(0))` (no age served), and the batch count after it.
+    #[test]
+    fn i777f_l2_the_public_health_is_served_from_a_ten_second_memo() {
+        health_memo_reset();
+        let db = SqliteSql::migrated();
+        let set = block(lever(
+            &db,
+            true,
+            true,
+            br#"{"cursor":"20084"}"#,
+            1_792_504_017,
+        ));
+        assert_eq!(set.status, 200, "{}", set.body);
+        let before = db.batches.get();
+        db.now.set(1_000_000);
+        let a = block(health_served(&db));
+        assert_eq!(
+            (a["source"].clone(), a["cursor"].clone(), a["memoAgeMs"].clone()),
+            (json!("d1"), json!("20084"), json!(0)),
+            "{a}"
+        );
+        db.now.set(1_005_000);
+        let b = block(health_served(&db));
+        assert_eq!(
+            db.batches.get() - before,
+            1,
+            "two reads inside the TTL: one D1 batch"
+        );
+        assert_eq!(
+            (b["source"].clone(), b["cursor"].clone(), b["memoAgeMs"].clone()),
+            (json!("d1"), json!("20084"), json!(5_000)),
+            "{b}"
+        );
+        db.now.set(1_000_000 + HEALTH_MEMO_TTL_MS);
+        let c = block(health_served(&db));
+        assert_eq!(db.batches.get() - before, 2, "past the TTL: D1 again");
+        assert_eq!(c["memoAgeMs"], json!(0));
+        // a faulted read past the TTL: the isolate memo, not memoized; the next read asks D1 again
+        db.now.set(1_000_000 + 2 * HEALTH_MEMO_TTL_MS);
+        db.conn
+            .execute_batch("ALTER TABLE ops_counters RENAME TO ops_counters_away")
+            .unwrap();
+        let faulted = block(health_served(&db));
+        assert_eq!(db.batches.get() - before, 3);
+        assert_eq!(faulted["source"], json!("isolate"), "{faulted}");
+        assert!(faulted["readFault"].is_string());
+        assert!(faulted.get("memoAgeMs").is_none());
+        db.conn
+            .execute_batch("ALTER TABLE ops_counters_away RENAME TO ops_counters")
+            .unwrap();
+        db.now.set(1_000_000 + 2 * HEALTH_MEMO_TTL_MS + 1_000);
+        let d = block(health_served(&db));
+        assert_eq!(db.batches.get() - before, 4, "a fault is never memoized");
+        assert_eq!(
+            (d["source"].clone(), d["memoAgeMs"].clone()),
+            (json!("d1"), json!(0))
+        );
+        db.now.set(1_000_000 + 2 * HEALTH_MEMO_TTL_MS + 2_000);
+        let e = block(health_served(&db));
+        assert_eq!(db.batches.get() - before, 4, "served from the memo again");
+        assert_eq!(e["memoAgeMs"], json!(1_000));
+        assert_eq!(HEALTH_MEMO_TTL_MS, 10_000);
+    }
+
+    /// bsv-low #778 (a): the pass's durable witness. Each pass that reaches the intake reads the previous stamp and
+    /// writes its own in one batch over the shipped statements; a pass 15 minutes after the last counts no skip; a pass
+    /// 45 minutes after it counts the two passes that never reached the intake, logged by name; the stamp is never
+    /// moved back by a late pass; a fault counts itself and the pull goes on.
+    #[test]
+    fn i778_a_a_pass_that_never_reached_the_intake_is_counted_by_the_next() {
+        let db = SqliteSql::migrated();
+        let t0 = 1_792_504_000u64;
+        let first = block(witness(&db, t0));
+        assert_eq!(counter(&first, "tracker_chain_events_pass_total"), 1);
+        assert_eq!(
+            counter(&first, "tracker_chain_events_skipped_passes_total"),
+            0
+        );
+        let next = block(witness(&db, t0 + 900));
+        assert_eq!(
+            counter(&next, "tracker_chain_events_skipped_passes_total"),
+            0
+        );
+        assert!(db.lines.borrow().is_empty(), "{:?}", db.lines.borrow());
+        // the 14:15:47Z shape: the 14:15 pass never reached the intake, nor did the 14:30 one
+        let late = block(witness(&db, t0 + 900 + 2_700));
+        assert_eq!(
+            counter(&late, "tracker_chain_events_skipped_passes_total"),
+            2
+        );
+        assert!(
+            db.lines
+                .borrow()
+                .iter()
+                .any(|l| l.starts_with("[chain-events] SKIPPED:")
+                    && l.contains("2 scheduled pass(es)")),
+            "{:?}",
+            db.lines.borrow()
+        );
+        let stamp =
+            |db: &SqliteSql| -> i64 { db.conn.query_row(WITNESS_READ, [], |r| r.get(0)).unwrap() };
+        assert_eq!(stamp(&db), (t0 + 3_600) as i64);
+        block(witness(&db, t0 + 100));
+        assert_eq!(stamp(&db), (t0 + 3_600) as i64, "never moved back");
+        assert_eq!(skipped_passes(None, t0), 0);
+        assert_eq!(skipped_passes(Some(t0), t0 + 1_349), 0);
+        assert_eq!(skipped_passes(Some(t0), t0 + 1_350), 1);
+        assert_eq!(skipped_passes(Some(t0), t0 + 1_800), 1);
+        assert_eq!(skipped_passes(Some(t0), t0 + 86_400), 95);
+        db.conn.execute_batch("DROP TABLE ops_counters").unwrap();
+        let faulted = block(witness(&db, t0 + 4_500));
+        assert_eq!(
+            (
+                counter(&faulted, "tracker_chain_events_pass_total"),
+                counter(&faulted, "tracker_chain_events_witness_faults_total")
+            ),
+            (1, 1)
+        );
+    }
+
+    /// bsv-low #778 (b): the intake is its OWN scheduled task, its witness the first thing it awaits. The worker's
+    /// `scheduled` hands three tasks to `wait_until` (the drain, the intake, the tracker); the intake's task runs
+    /// `chain_events::run` and nothing of the tracker's (no boot, board era or backfill before it); `run` notes the
+    /// witness before the indexes and the pull; the interval the witness counts in is every config's cron.
+    #[test]
+    fn i778_b_the_intake_is_its_own_task_and_its_witness_comes_first() {
+        let code = |s: &str| -> String {
+            s.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<String>()
+                .split_whitespace()
+                .collect()
+        };
+        let lib = code(include_str!("../lib.rs"));
+        let sched = &lib[lib.find("asyncfnscheduled(").expect("scheduled")..];
+        let sched = &sched[..sched.find("#[event(fetch)]").unwrap_or(sched.len())];
+        assert!(
+            sched.contains("pot_hook::schedule_tick(&|f|ctx.wait_until(f),drain,intake,tracker);")
+        );
+        let intake_at = sched
+            .find("letintake:pot_hook::Detached")
+            .expect("the intake task");
+        let tracker_at = sched
+            .find("lettracker:pot_hook::Detached")
+            .expect("the tracker task");
+        assert!(intake_at < tracker_at);
+        let intake = &sched[intake_at..tracker_at];
+        assert!(intake.contains("tracker_host::chain_events::run(&env_intake)"));
+        for theirs in [
+            "ensure_latch_columns",
+            "sync_board_era_env",
+            "backfill(",
+            "runtime::tick(",
+        ] {
+            assert!(!intake.contains(theirs), "the intake task awaits {theirs}");
+        }
+        assert!(
+            !sched[tracker_at..].contains("chain_events::run("),
+            "the tracker task no longer runs the intake"
+        );
+        assert_eq!(crate::pass_meter::SCHEDULED_TASKS, 3);
+        let this = code(include_str!("chain_events.rs"));
+        let run = &this[this.find("pubasyncfnrun(env:&worker::Env)").expect("run")..];
+        let pass = &run[run.find("letpass=async{").unwrap()..];
+        assert!(
+            pass.starts_with("letpass=async{note(&witness(&sql,now).await);forindexinINDEXES"),
+            "the witness first: {}",
+            &pass[..120.min(pass.len())]
+        );
+        let cfg = include_str!("../../wrangler.toml");
+        let crons: Vec<&str> = cfg
+            .lines()
+            .filter(|l| l.trim_start().starts_with("crons"))
+            .collect();
+        assert!(!crons.is_empty());
+        for line in crons {
+            assert_eq!(
+                line.trim(),
+                r#"crons = ["*/15 * * * *"]"#,
+                "PASS_INTERVAL_S is 900"
+            );
+        }
+        assert_eq!(PASS_INTERVAL_S, 900);
     }
 }

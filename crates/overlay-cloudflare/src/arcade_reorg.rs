@@ -599,102 +599,33 @@ where
                 // ── the three legs at the orphaned height, each one bounded page ──
                 let mut progress = pending;
                 let h = ev.height;
-                let mut faulted = false;
-                let mut budget_stop = false;
-                if !progress.spenders.exhausted {
-                    let s = reverify_window_with(
-                        pot_storage,
-                        Some(tracker),
-                        fetcher,
-                        h,
-                        h,
-                        progress.spenders.after,
-                        limits.leg_limit,
-                        ReverifyMode {
-                            demote_proofless: false,
-                            reanchor_first: true,
-                        },
-                        memo,
-                    )
-                    .await;
-                    add_spenders(&mut out.spenders, &s);
-                    if s.faults > 0 || s.errors > 0 {
-                        faulted = true;
-                        out.stopped = Some(format!(
-                            "spenders leg at {h}: faults={} errors={}",
-                            s.faults, s.errors
-                        ));
-                    } else {
-                        progress.spenders = LegProgress {
-                            after: s.next_cursor,
-                            exhausted: s.exhausted,
-                        };
-                        if s.budget_exhausted {
-                            budget_stop = true;
-                        }
+                let legs = judge_window_legs(
+                    pot_storage,
+                    tx_store,
+                    tracker,
+                    fetcher,
+                    h,
+                    h,
+                    [
+                        &mut progress.spenders,
+                        &mut progress.pot_beefs,
+                        &mut progress.transactions,
+                    ],
+                    limits.leg_limit,
+                    memo,
+                    &mut out.spenders,
+                    &mut out.pot_beefs,
+                    &mut out.transactions,
+                )
+                .await;
+                let faulted = match &legs {
+                    WindowLegs::Faulted(why) => {
+                        out.stopped = Some(why.clone());
+                        true
                     }
-                }
-                if !faulted && !budget_stop && !progress.pot_beefs.exhausted {
-                    let s = reverify_pot_beefs_window_with(
-                        pot_storage,
-                        Some(tracker),
-                        h,
-                        h,
-                        progress.pot_beefs.after,
-                        limits.leg_limit,
-                        memo,
-                    )
-                    .await;
-                    add_leg(&mut out.pot_beefs, &s);
-                    if s.faults > 0 || s.errors > 0 {
-                        faulted = true;
-                        out.stopped = Some(format!(
-                            "pot_beefs leg at {h}: faults={} errors={}",
-                            s.faults, s.errors
-                        ));
-                    } else {
-                        progress.pot_beefs = LegProgress {
-                            after: s.next_cursor,
-                            exhausted: s.exhausted,
-                        };
-                    }
-                }
-                if !faulted && !budget_stop && !progress.transactions.exhausted {
-                    match tx_store {
-                        Some(store) => {
-                            let s = reverify_transactions_window_with(
-                                store,
-                                Some(tracker),
-                                h,
-                                h,
-                                progress.transactions.after,
-                                limits.leg_limit,
-                                memo,
-                            )
-                            .await;
-                            add_leg(&mut out.transactions, &s);
-                            if s.faults > 0 || s.errors > 0 {
-                                faulted = true;
-                                out.stopped = Some(format!(
-                                    "transactions leg at {h}: faults={} errors={}",
-                                    s.faults, s.errors
-                                ));
-                            } else {
-                                progress.transactions = LegProgress {
-                                    after: s.next_cursor,
-                                    exhausted: s.exhausted,
-                                };
-                            }
-                        }
-                        // round 2 (review LOW-4): a missing transactions store is
-                        // a fault, never "that leg is done"
-                        None => {
-                            faulted = true;
-                            out.stopped =
-                                Some("no transactions store: the hop-proof leg cannot run".into());
-                        }
-                    }
-                }
+                    _ => false,
+                };
+                let budget_stop = legs == WindowLegs::BudgetStop;
                 // the legs' progress persists (a faulted leg keeps its previous cursor)
                 state.pending = Some(progress.clone());
                 if faulted {
@@ -764,6 +695,141 @@ where
     out.unresolved = state.unresolved.clone();
     out.memo_reads = memo.reads();
     out
+}
+
+/// How one pass over a window's three legs ended ([`judge_window_legs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowLegs {
+    /// A leg faulted (a header, tracker or storage read): its cursor kept, the window replayed.
+    Faulted(String),
+    /// The spenders leg stopped its page on the ladder's spent budget (nothing judged blind of the couriers).
+    BudgetStop,
+    /// Every leg ran its page without a fault; [`LegProgress::exhausted`] on each says whether the window is done.
+    Ran,
+}
+
+/// THE JUDGEMENT OF A WINDOW, one bounded page per leg, shared by Arcade's orphan events (D7, a window of one
+/// height) and chaintracks' typed chain events (bsv-low #620, `crate::chain_feed`): the confirmed spenders in
+/// `lo..=hi` judged by their OWN stored proof against the header source, a refuted one re-anchored first from a
+/// chaintracks-verified courier proof and demoted only when none is served, bound to the judged height
+/// (`reorg_sweep::reverify_window_with`, `reanchor_first`); then the pots' own proofs and the hop proofs by their
+/// `proofHeight` (`reverify_pot_beefs_window_with`, `reverify_transactions_window_with`). A leg already exhausted is
+/// not run; a faulted or budget-stopped leg keeps its cursor and the legs after it are not run this pass; a missing
+/// transactions store is a fault (round 2, review LOW-4). Each leg's summary is added to the caller's.
+#[allow(clippy::too_many_arguments)] // the stores, the two chain sources, the window, the legs, the bound, the memo, the sums
+pub async fn judge_window_legs<S: ProvenTxStore>(
+    pot_storage: &dyn PotStorage,
+    tx_store: Option<&S>,
+    tracker: &dyn ChainTracker,
+    fetcher: Option<&dyn AncestorFetcher>,
+    lo: u64,
+    hi: u64,
+    legs: [&mut LegProgress; 3],
+    leg_limit: u64,
+    memo: &mut RootMemo,
+    spenders_sum: &mut ReverifyPassSummary,
+    pot_beefs_sum: &mut ProofLegSummary,
+    transactions_sum: &mut ProofLegSummary,
+) -> WindowLegs {
+    let [spenders, pot_beefs, transactions] = legs;
+    if !spenders.exhausted {
+        let s = reverify_window_with(
+            pot_storage,
+            Some(tracker),
+            fetcher,
+            lo,
+            hi,
+            spenders.after,
+            leg_limit,
+            ReverifyMode {
+                demote_proofless: false,
+                reanchor_first: true,
+            },
+            memo,
+        )
+        .await;
+        add_spenders(spenders_sum, &s);
+        if s.faults > 0 || s.errors > 0 {
+            return WindowLegs::Faulted(format!(
+                "spenders leg at {}: faults={} errors={}",
+                window_name(lo, hi),
+                s.faults,
+                s.errors
+            ));
+        }
+        *spenders = LegProgress {
+            after: s.next_cursor,
+            exhausted: s.exhausted,
+        };
+        if s.budget_exhausted {
+            return WindowLegs::BudgetStop;
+        }
+    }
+    if !pot_beefs.exhausted {
+        let s = reverify_pot_beefs_window_with(
+            pot_storage,
+            Some(tracker),
+            lo,
+            hi,
+            pot_beefs.after,
+            leg_limit,
+            memo,
+        )
+        .await;
+        add_leg(pot_beefs_sum, &s);
+        if s.faults > 0 || s.errors > 0 {
+            return WindowLegs::Faulted(format!(
+                "pot_beefs leg at {}: faults={} errors={}",
+                window_name(lo, hi),
+                s.faults,
+                s.errors
+            ));
+        }
+        *pot_beefs = LegProgress {
+            after: s.next_cursor,
+            exhausted: s.exhausted,
+        };
+    }
+    if !transactions.exhausted {
+        let Some(store) = tx_store else {
+            return WindowLegs::Faulted(
+                "no transactions store: the hop-proof leg cannot run".into(),
+            );
+        };
+        let s = reverify_transactions_window_with(
+            store,
+            Some(tracker),
+            lo,
+            hi,
+            transactions.after,
+            leg_limit,
+            memo,
+        )
+        .await;
+        add_leg(transactions_sum, &s);
+        if s.faults > 0 || s.errors > 0 {
+            return WindowLegs::Faulted(format!(
+                "transactions leg at {}: faults={} errors={}",
+                window_name(lo, hi),
+                s.faults,
+                s.errors
+            ));
+        }
+        *transactions = LegProgress {
+            after: s.next_cursor,
+            exhausted: s.exhausted,
+        };
+    }
+    WindowLegs::Ran
+}
+
+/// A window in the legs' fault words: one height as D7 always named it, else `lo..=hi`.
+fn window_name(lo: u64, hi: u64) -> String {
+    if lo == hi {
+        lo.to_string()
+    } else {
+        format!("{lo}..={hi}")
+    }
 }
 
 // ── the production sources ──────────────────────────────────────────────
@@ -913,7 +979,7 @@ impl ConsumerStateStore for D1ConsumerState<'_> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "test code")]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::proof_fetcher::tests::{real_spender_raw, single_tx_bump};
     use crate::reorg_sweep::stored_bump_anchor;
@@ -1100,7 +1166,7 @@ mod tests {
     }
 
     /// A tracker whose header source cannot be read.
-    struct FaultyTracker;
+    pub(crate) struct FaultyTracker;
     #[async_trait::async_trait]
     impl ChainTracker for FaultyTracker {
         async fn is_valid_root_for_height(
@@ -1140,20 +1206,20 @@ mod tests {
     /// (`Ok(Some(hex))` = a chaintracks-verified proof, as the real ladder
     /// only ever answers); counts its calls; an optional budget it spends
     /// one unit per ask and reports through `budget_remaining`.
-    struct CourierStub {
+    pub(crate) struct CourierStub {
         answers: HashMap<String, Result<Option<String>, String>>,
-        calls: Cell<usize>,
-        budget: Cell<Option<u32>>,
+        pub(crate) calls: Cell<usize>,
+        pub(crate) budget: Cell<Option<u32>>,
     }
     impl CourierStub {
-        fn none() -> Self {
+        pub(crate) fn none() -> Self {
             Self {
                 answers: HashMap::new(),
                 calls: Cell::new(0),
                 budget: Cell::new(None),
             }
         }
-        fn with(answers: HashMap<String, Result<Option<String>, String>>) -> Self {
+        pub(crate) fn with(answers: HashMap<String, Result<Option<String>, String>>) -> Self {
             Self {
                 answers,
                 calls: Cell::new(0),
@@ -1226,16 +1292,16 @@ mod tests {
 
     /// A memory twin of the transactions leg store (the sweep's shape).
     #[derive(Default)]
-    struct MemoryTxStore {
+    pub(crate) struct MemoryTxStore {
         rows: Mutex<Vec<TxRow>>,
     }
     impl MemoryTxStore {
-        fn insert(&self, txid: &str, beef: Vec<u8>, height: Option<u64>, proven: bool) {
+        pub(crate) fn insert(&self, txid: &str, beef: Vec<u8>, height: Option<u64>, proven: bool) {
             let mut rows = self.rows.lock().unwrap();
             let rowid = rows.len() as i64 + 1;
             rows.push((rowid, txid.to_string(), beef, height, proven));
         }
-        fn proven(&self, txid: &str) -> bool {
+        pub(crate) fn proven(&self, txid: &str) -> bool {
             self.rows.lock().unwrap().iter().any(|r| r.1 == txid && r.4)
         }
     }
@@ -1283,14 +1349,14 @@ mod tests {
         }
     }
 
-    fn pot(n: u32) -> String {
+    pub(crate) fn pot(n: u32) -> String {
         format!("{n:064x}")
     }
 
     /// A pot CONFIRMED at `height` by a spender whose stored pot BEEF carries
     /// a single-leaf bump at that height (root = the spender txid), latched
     /// verified with its anchor. Returns the spender txid.
-    async fn confirmed_pot_with_stored_proof(
+    pub(crate) async fn confirmed_pot_with_stored_proof(
         store: &MemoryPotStorage,
         pot: &str,
         height: u32,

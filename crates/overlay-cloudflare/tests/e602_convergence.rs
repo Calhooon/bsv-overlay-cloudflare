@@ -777,8 +777,9 @@ mod e607 {
 
     #[test]
     fn e607_append_only_migration_and_the_page_uses_the_rowid_range() {
-        // FAST-C appends handfile migrations 347 and 348 after PR 152's repair at 346.
-        assert_eq!(OVERLAY_MIGRATIONS.len(), 348);
+        // 346 at PR 152's land; lane W15E-L4 appended `overlay_chain_events` as 349 (the count itself is
+        // `OVERLAY_MIGRATION_COUNT`'s to pin, `d1::tests`). Append-only: the repair's CREATE stays the 346th.
+        assert!(OVERLAY_MIGRATIONS.len() >= 346);
         assert_eq!(OVERLAY_MIGRATIONS[345], REPAIR_CREATE);
         let db = database();
         db.0.execute_batch(REPAIR_CREATE).unwrap();

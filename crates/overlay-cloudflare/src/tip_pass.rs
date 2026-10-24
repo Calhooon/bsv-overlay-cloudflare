@@ -224,16 +224,41 @@ pub async fn internal_tip_changed(
     // One root memo for the whole pass (round 2, review MED-5): the consumer
     // seeds it from its corroboration header read and the sweep reuses it.
     let mut memo = crate::reorg_sweep::RootMemo::default();
-    let arcade = run_arcade_reorg_pass(
-        env,
-        pot_storage,
-        ops_db,
-        "tip-changed",
-        crate::arcade_reorg::PassLimits::block_event(),
-        &mut memo,
-        false,
-    )
-    .await;
+    // bsv-low #620 (L4): chaintracks' typed chain-event feed first, on its own durable cursor (`chain_feed`); Arcade's
+    // orphan listing is an input only where the feed is not live on this deployment THIS PASS (a recorded stop or a
+    // fault hands it back: `chain_feed::arcade_not_an_input`, the one gate the cron reads too; the W15E-L4 lens
+    // fold's MEDIUM-3).
+    let feed = match ops_db {
+        Some(db) => Some(
+            crate::chain_feed::run_chain_feed_pass(
+                env,
+                pot_storage,
+                db,
+                "tip-changed",
+                crate::arcade_reorg::PassLimits::block_event(),
+                &mut memo,
+            )
+            .await,
+        ),
+        None => None,
+    };
+    let arcade = if let Some(why) = crate::chain_feed::arcade_not_an_input(feed.as_ref()) {
+        crate::arcade_reorg::ArcadePassSummary {
+            stopped: Some(why.into()),
+            ..Default::default()
+        }
+    } else {
+        run_arcade_reorg_pass(
+            env,
+            pot_storage,
+            ops_db,
+            "tip-changed",
+            crate::arcade_reorg::PassLimits::block_event(),
+            &mut memo,
+            false,
+        )
+        .await
+    };
     // ── the revalidation sweep (reference: the fallback for trackers without
     // a reorg stream; here the PRIMARY path, every block): three cursor-walked
     // legs (spenders, the pots' own proofs, the engine's hop proofs). It runs

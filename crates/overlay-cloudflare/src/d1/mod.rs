@@ -617,7 +617,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// canonical payloads and the two signatures, keyed by the digest) and `handfile_rows` (each exploded row's place in
 /// its batch), the app layer's `/record?kind=handfile`; its catch-up carries both CREATEs byte for byte. Two new
 /// tables: no row is touched.
-pub const OVERLAY_MIGRATION_COUNT: usize = 348;
+/// 348 to 349 for bsv-low #620 (L4): `overlay_chain_events`, the overlay's own cursor row on chaintracks' typed
+/// chain-event feed (`chain_feed::CREATE`). Overlay-only: no other service reads it. Follows PR 151's 347 and 348.
+pub const OVERLAY_MIGRATION_COUNT: usize = 349;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2293,6 +2295,9 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // no row is touched.
     HANDFILE_BATCHES_CREATE,
     HANDFILE_ROWS_CREATE,
+    // 349: bsv-low #620 (L4), the overlay's own cursor on chaintracks' typed chain-event feed (its reorg word), one
+    // versioned row. A new table: no row is touched.
+    crate::chain_feed::CREATE,
 ];
 
 // =============================================================================
