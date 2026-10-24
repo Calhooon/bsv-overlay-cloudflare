@@ -35,7 +35,11 @@ fn served() -> Value {
     // the shipped writer names TAAL; the second pot's latch is a row of before the pair (the writer of its day)
     db.execute(
         bsv_overlay_cloudflare::ops::NETWORK_SEEN_INSERT_SQL,
-        params![p(0), bsv_overlay_cloudflare::ops::SeenSource::Taal.wire(), 1_790_000_000_123_i64],
+        params![
+            p(0),
+            bsv_overlay_cloudflare::ops::SeenSource::Taal.wire(),
+            1_790_000_000_123_i64
+        ],
     )
     .unwrap();
     db.execute(
@@ -44,7 +48,10 @@ fn served() -> Value {
     )
     .unwrap();
     for (i, reason) in [
-        (1, "REJECTED (arcade live REJECTED: bad; both indexers absent)"),
+        (
+            1,
+            "REJECTED (arcade live REJECTED: bad; both indexers absent)",
+        ),
         (2, "SEEN_ON_NETWORK (arcade missing, both indexers absent)"),
     ] {
         db.execute(
@@ -127,19 +134,39 @@ fn i621_the_old_fields_are_mains_bytes_and_the_witness_names_its_source() {
         e.as_object_mut().unwrap().remove("networkSeenBy");
     }
     let mut main: Value = serde_json::from_str(MAIN_BODY).unwrap();
-    assert_eq!(main[7]["evicted"]["word"], "rejected", "main voided on an absence");
+    assert_eq!(
+        main[7]["evicted"]["word"], "rejected",
+        "main voided on an absence"
+    );
     main[7]["evicted"]["word"] = Value::Null;
     assert_eq!(old.to_string(), main.to_string());
     // (2) the witness: named, legacy, unwitnessed (pot and hop), and omitted where `networkSeen` was not read
-    let by: Vec<Option<&Value>> = body.as_array().unwrap().iter().map(|e| e.get("networkSeenBy")).collect();
-    assert_eq!(by[0], Some(&json!({"word": "seen", "tier": "hint", "source": "taal", "at": 1_790_000_000_123_i64})));
+    let by: Vec<Option<&Value>> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.get("networkSeenBy"))
+        .collect();
+    assert_eq!(
+        by[0],
+        Some(
+            &json!({"word": "seen", "tier": "hint", "source": "taal", "at": 1_790_000_000_123_i64})
+        )
+    );
     assert_eq!(
         by[1],
         Some(&json!({"word": "seen", "tier": "hint", "source": null, "at": NOW * 1000})),
         "a latch of before the pair names no source; its time is its seenAt"
     );
-    assert_eq!((by[2], by[3], by[4]), (Some(&Value::Null), Some(&Value::Null), Some(&Value::Null)));
-    assert_eq!((by[5], by[6], by[7]), (None, None, None), "unknown outpoints: not read, not served");
+    assert_eq!(
+        (by[2], by[3], by[4]),
+        (Some(&Value::Null), Some(&Value::Null), Some(&Value::Null))
+    );
+    assert_eq!(
+        (by[5], by[6], by[7]),
+        (None, None, None),
+        "unknown outpoints: not read, not served"
+    );
     // (3) the chain words: a node's verdict voids, an absence does not
     assert_eq!(body[6]["evicted"]["word"], "rejected");
     assert!(body[7]["evicted"]["word"].is_null() && body[7]["evicted"]["readmittedAt"].is_null());

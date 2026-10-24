@@ -605,7 +605,14 @@ pub async fn submit(
 ) -> worker::Result<Response> {
     let counters = SubmitCounters::new();
     let out = submit_inner(
-        engine, req, hosting_url, arcade_url, taal_api_key, ctx, env, &counters,
+        engine,
+        req,
+        hosting_url,
+        arcade_url,
+        taal_api_key,
+        ctx,
+        env,
+        &counters,
     )
     .await;
     if out.is_err() {
@@ -1651,8 +1658,12 @@ async fn submit_parts(
                 .err()
                 .map(|e| e.chars().take(120).collect::<String>())
                 .unwrap_or_default();
-            let answer =
-                crate::broadcaster::standing_duplicate_answer(arcade_outcome, &subject_txid, shape, standing);
+            let answer = crate::broadcaster::standing_duplicate_answer(
+                arcade_outcome,
+                &subject_txid,
+                shape,
+                standing,
+            );
             if answer.is_ok() {
                 worker::console_log!(
                     "broadcast-gated(arcade): {subject_txid} is a duplicate of a STANDING admission (Arcade's stored SEEN echoed, the corroborator inconclusive: {refused}): the pending ack, no latch (#637)"
@@ -1842,7 +1853,10 @@ async fn submit_parts(
                         );
                     }
                 }
-                counters.bump(crate::ops::pending_admission_counter(admit_fast, duplicate_echo), 1);
+                counters.bump(
+                    crate::ops::pending_admission_counter(admit_fast, duplicate_echo),
+                    1,
+                );
                 if admit_fast && duplicate_echo {
                     counters.reason(SubmitReason::AdmitFastEcho);
                 }
@@ -2190,10 +2204,9 @@ async fn submit_parts(
     // unheld at the app layer. The mark has landed now: re-note the latched pair so the request's FIRST flush (the
     // settle's `total_admitted == 0` flush below, or the dispatch's exit) ships the `seen` before the pot note.
     // One primary-key read per consuming submit; idempotent at the app layer.
-    if steak
-        .values()
-        .any(|a| !a.coins_to_retain.is_empty() || a.coins_removed.as_ref().is_some_and(|c| !c.is_empty()))
-    {
+    if steak.values().any(|a| {
+        !a.coins_to_retain.is_empty() || a.coins_removed.as_ref().is_some_and(|c| !c.is_empty())
+    }) {
         if let (Some(subject), Ok(seen_db)) = (
             gated_subject.as_deref().or(ungated_subject.as_deref()),
             env.d1("OVERLAY_DB"),
@@ -2614,7 +2627,13 @@ async fn submit_parts(
                 .map(|t| t.id());
                 if let Ok(subject) = subject {
                     if let Some(at_ms) = seen_arcade.network_seen_stamp(&subject).await {
-                        crate::ops::latch_network_seen(&seen_db, &subject, crate::ops::SeenSource::Arcade, at_ms).await;
+                        crate::ops::latch_network_seen(
+                            &seen_db,
+                            &subject,
+                            crate::ops::SeenSource::Arcade,
+                            at_ms,
+                        )
+                        .await;
                         // step 4: a background latch ships its own push.
                         crate::pot_changes::flush_inline(seen_env).await;
                     }
@@ -3125,8 +3144,17 @@ fn arc_ingest_refusal_log(
     bearer: ArcBearerShape,
 ) -> String {
     let txid = if is_hex_txid(txid) { txid } else { "other" };
-    let tx_status: String = tx_status.chars().take(80).flat_map(char::escape_default).collect();
-    let ua: String = user_agent.unwrap_or("").chars().take(64).flat_map(char::escape_default).collect();
+    let tx_status: String = tx_status
+        .chars()
+        .take(80)
+        .flat_map(char::escape_default)
+        .collect();
+    let ua: String = user_agent
+        .unwrap_or("")
+        .chars()
+        .take(64)
+        .flat_map(char::escape_default)
+        .collect();
     // Escaping keeps untrusted fields on one bounded line; no credential enters here.
     format!(
         "POST /arc-ingest txid={txid} txStatus={tx_status} ua={ua} -> 401 ({why}: bearer {}, {} bytes)",
@@ -3188,14 +3216,10 @@ pub async fn arc_ingest(
         ArcCallbackAuth::Authorized => {}
         refused => {
             let (counter, why) = match refused {
-                ArcCallbackAuth::NoToken => (
-                    crate::ops::COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN,
-                    "no token",
-                ),
-                _ => (
-                    crate::ops::COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN,
-                    "bad token",
-                ),
+                ArcCallbackAuth::NoToken => {
+                    (crate::ops::COUNTER_ARC_INGEST_UNAUTH_NO_TOKEN, "no token")
+                }
+                _ => (crate::ops::COUNTER_ARC_INGEST_UNAUTH_BAD_TOKEN, "bad token"),
             };
             let tx_status = match &body {
                 ArcIngestBody::Proof { tx_status, .. }
@@ -3271,12 +3295,20 @@ pub async fn arc_ingest(
             let af_now = worker::Date::now().as_millis();
             // bsv-low #836 fold (the lens's L1): a push naming the non-final word is counted, then read as any other
             // push: the evidence check's LIVE look decides (the public bearer's text buys nothing)
-            if crate::admit_fast::push_names_lock_time(&tx_status, extra_info.as_deref().unwrap_or_default()) {
+            if crate::admit_fast::push_names_lock_time(
+                &tx_status,
+                extra_info.as_deref().unwrap_or_default(),
+            ) {
                 worker::console_log!(
                     "POST /arc-ingest txid={txid} {tx_status} names TX_LOCK_TIME: the evidence check's live look decides (#836)"
                 );
                 if let Some(db) = ops_db {
-                    crate::ops::bump_counter(db, crate::ops::COUNTER_ARC_INGEST_LOCK_TIME_NOT_FINAL, 1).await;
+                    crate::ops::bump_counter(
+                        db,
+                        crate::ops::COUNTER_ARC_INGEST_LOCK_TIME_NOT_FINAL,
+                        1,
+                    )
+                    .await;
                 }
             }
             match crate::admit_fast::callback_action(&tx_status) {
@@ -6025,7 +6057,8 @@ mod tests {
             }
             // The return's own block: back to the line that opened it.
             let mut j = i;
-            while j > 0 && (lines[j - 1].trim().is_empty() || indent(lines[j - 1]) >= indent(line)) {
+            while j > 0 && (lines[j - 1].trim().is_empty() || indent(lines[j - 1]) >= indent(line))
+            {
                 j -= 1;
             }
             let block = lines[j..i].join("\n");
@@ -6041,8 +6074,10 @@ mod tests {
         assert!(!parts.contains("counters.reason(SubmitReason::Admit)"));
         assert_eq!(parts.matches("counters.admitted()").count(), 1);
         let durable = &parts[parts.find("crate::queue::MutationAck::Durable =>").unwrap()..];
-        assert!(durable[..durable.find("crate::queue::MutationAck::Queued").unwrap()]
-            .contains("counters.admitted()"));
+        assert!(
+            durable[..durable.find("crate::queue::MutationAck::Queued").unwrap()]
+                .contains("counters.admitted()")
+        );
         let counters = SubmitCounters::new().finish_answer(200);
         let names = counters.take_deltas();
         assert_eq!(names["submit_answer_reason_unclassified_total"], 1);
@@ -6073,7 +6108,10 @@ mod tests {
             );
         }
         let line = arc_ingest_refusal_log(
-            CB_TXID, "MINED", Some("arcade-test/640"), "bad token",
+            CB_TXID,
+            "MINED",
+            Some("arcade-test/640"),
+            "bad token",
             arc_bearer_shape(Some(&format!("Bearer {wrong}")), None),
         );
         assert_eq!(line, format!("POST /arc-ingest txid={CB_TXID} txStatus=MINED ua=arcade-test/640 -> 401 (bad token: bearer 64-hex, 64 bytes)"));
@@ -6156,7 +6194,10 @@ mod tests {
             arc_bearer_shape(Some(bad_header), None),
         );
         assert!(line.contains("txid=other txStatus=MINED"));
-        assert!(line.contains(&format!("ua={} -> 401 (no token: bearer other, 0 bytes)", "u".repeat(64))));
+        assert!(line.contains(&format!(
+            "ua={} -> 401 (no token: bearer other, 0 bytes)",
+            "u".repeat(64)
+        )));
         assert!(line.len() < 256);
         assert!(!line.contains(bad_header));
         let wrong = "sensitive-credential-value";

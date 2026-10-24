@@ -1245,8 +1245,9 @@ fn localhost_is_a_beta_origin_only() {
 /// views in BOTH envs, reflected exactly; nothing else widens.
 #[test]
 fn e597_a_dev_server_origin_reads_the_identity_views_in_both_envs() {
-    let prod =
-        parse_origins("https://bsvarcade.com,https://www.bsvarcade.com,https://app.example.invalid");
+    let prod = parse_origins(
+        "https://bsvarcade.com,https://www.bsvarcade.com,https://app.example.invalid",
+    );
     let beta = parse_origins(
         "https://app-beta.example.invalid,https://harness.example.invalid,http://localhost:5173",
     );

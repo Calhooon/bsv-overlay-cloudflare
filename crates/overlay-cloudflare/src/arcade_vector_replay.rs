@@ -221,7 +221,10 @@ fn lock_time_replay() -> (Vec<String>, usize) {
             Some("final") => SubjectLock::Final,
             _ => SubjectLock::Height(lock_height),
         };
-        for (column_set, tip) in [("expect", "chain_tip"), ("expect_past_lag", "chain_tip_past_lag")] {
+        for (column_set, tip) in [
+            ("expect", "chain_tip"),
+            ("expect_past_lag", "chain_tip_past_lag"),
+        ] {
             let Some(expect) = case.get(column_set) else {
                 continue;
             };
@@ -238,7 +241,9 @@ fn lock_time_replay() -> (Vec<String>, usize) {
                         .map(str::to_string)
                         .unwrap_or_else(|| want.to_string());
                     if got != want {
-                        wrong.push(format!("{name} ({column_set}): {column} expected {want}, got {got}"));
+                        wrong.push(format!(
+                            "{name} ({column_set}): {column} expected {want}, got {got}"
+                        ));
                     }
                 }
             };
@@ -271,7 +276,11 @@ fn lock_time_replay() -> (Vec<String>, usize) {
             check(
                 "watch",
                 match bound_witness_look(
-                    crate::broadcaster::witness_look_of(status.to_string(), extra.to_string(), None),
+                    crate::broadcaster::witness_look_of(
+                        status.to_string(),
+                        extra.to_string(),
+                        None,
+                    ),
                     &bound,
                 ) {
                     crate::broadcaster::WitnessLook::NotFinal(..) => "not_final".to_string(),

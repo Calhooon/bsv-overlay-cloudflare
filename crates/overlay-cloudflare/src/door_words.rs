@@ -327,7 +327,11 @@ pub struct LockBound {
 /// bound the hold (Arcade's report of those bytes: it can end the hold, and with no height it cannot lengthen it past
 /// the retire pass's 48 h absence arm). An unknown tip holds (fail-safe; the 48 h arm still ends it).
 pub fn not_final_holds(nf: &NotFinal, bound: &LockBound) -> bool {
-    let by_height = |lock: u64| bound.tip.is_none_or(|tip| tip < lock + NOT_FINAL_LAG_BLOCKS);
+    let by_height = |lock: u64| {
+        bound
+            .tip
+            .is_none_or(|tip| tip < lock + NOT_FINAL_LAG_BLOCKS)
+    };
     match bound.lock {
         Some(SubjectLock::Final) => false,
         Some(SubjectLock::Height(h)) => by_height(u64::from(h)),
@@ -516,10 +520,19 @@ mod tests {
             ("UNKNOWN", r#"{"txStatus":"UNKNOWN"}"#),
             ("RECEIVED", r#"{"txStatus":"RECEIVED"}"#),
             ("SENT_TO_NETWORK", r#"{"txStatus":"SENT_TO_NETWORK"}"#),
-            ("ACCEPTED_BY_NETWORK", r#"{"txStatus":"ACCEPTED_BY_NETWORK"}"#),
+            (
+                "ACCEPTED_BY_NETWORK",
+                r#"{"txStatus":"ACCEPTED_BY_NETWORK"}"#,
+            ),
             ("SEEN_ON_NETWORK", r#"{"txStatus":"SEEN_ON_NETWORK"}"#),
-            ("SEEN_MULTIPLE_NODES", r#"{"txStatus":"SEEN_MULTIPLE_NODES"}"#),
-            ("DOUBLE_SPEND_ATTEMPTED", r#"{"txStatus":"DOUBLE_SPEND_ATTEMPTED"}"#),
+            (
+                "SEEN_MULTIPLE_NODES",
+                r#"{"txStatus":"SEEN_MULTIPLE_NODES"}"#,
+            ),
+            (
+                "DOUBLE_SPEND_ATTEMPTED",
+                r#"{"txStatus":"DOUBLE_SPEND_ATTEMPTED"}"#,
+            ),
             ("REJECTED", r#"{"txStatus":"REJECTED"}"#),
             ("PENDING_RETRY", r#"{"txStatus":"PENDING_RETRY"}"#),
             ("STUMP_PROCESSING", r#"{"txStatus":"STUMP_PROCESSING"}"#),
@@ -541,7 +554,10 @@ mod tests {
             ),
             ("INVALID", r#"{"txStatus":"INVALID"}"#),
             ("UTXO_SPENT", r#"{"txStatus":"UTXO_SPENT"}"#),
-            ("CONFIRMED", r#"{"txStatus":"CONFIRMED","blockHeight":970710}"#),
+            (
+                "CONFIRMED",
+                r#"{"txStatus":"CONFIRMED","blockHeight":970710}"#,
+            ),
         ];
         fn bare(hint: Option<&Hint>) -> GateVerdict {
             match hint.map(|h| &h.status) {
@@ -649,7 +665,10 @@ mod tests {
     #[test]
     fn fix845_the_holding_words_promote_nothing() {
         // the #836 fold's L3: the two words that carry no network verdict read the same way
-        for w in ARCADE_HOLDING_WORDS.into_iter().chain(ARCADE_NO_VERDICT_WORDS) {
+        for w in ARCADE_HOLDING_WORDS
+            .into_iter()
+            .chain(ARCADE_NO_VERDICT_WORDS)
+        {
             for spelled in [w.to_string(), w.to_ascii_lowercase()] {
                 let h = arcade_hint(&spelled, "", 0);
                 assert_eq!(gate(h.as_ref()), GateVerdict::Pending, "{spelled}");
@@ -717,8 +736,14 @@ mod tests {
             SubjectLock::of_bytes(&raw_tx(972_185, 0xffff_fffe)),
             Some(SubjectLock::Height(972_185))
         );
-        assert_eq!(SubjectLock::of_bytes(&raw_tx(972_185, u32::MAX)), Some(SubjectLock::Final));
-        assert_eq!(SubjectLock::of_bytes(&raw_tx(0, 0)), Some(SubjectLock::Final));
+        assert_eq!(
+            SubjectLock::of_bytes(&raw_tx(972_185, u32::MAX)),
+            Some(SubjectLock::Final)
+        );
+        assert_eq!(
+            SubjectLock::of_bytes(&raw_tx(0, 0)),
+            Some(SubjectLock::Final)
+        );
         assert_eq!(
             SubjectLock::of_bytes(&raw_tx(1_761_000_000, 0)),
             Some(SubjectLock::Time(1_761_000_000))
@@ -750,8 +775,14 @@ mod tests {
             tip: Some(972_185),
             now_secs,
         };
-        assert!(not_final_holds(&nf, &time(1_761_000_000 + NOT_FINAL_LAG_SECS)));
-        assert!(!not_final_holds(&nf, &time(1_761_000_000 + NOT_FINAL_LAG_SECS + 1)));
+        assert!(not_final_holds(
+            &nf,
+            &time(1_761_000_000 + NOT_FINAL_LAG_SECS)
+        ));
+        assert!(!not_final_holds(
+            &nf,
+            &time(1_761_000_000 + NOT_FINAL_LAG_SECS + 1)
+        ));
         // the bytes not held here: the text's height bounds it; with no height in the text, held
         let bytes_absent = |tip| LockBound {
             lock: None,
@@ -763,7 +794,8 @@ mod tests {
         let bare = lock_time_not_final("REJECTED", "TX_LOCK_TIME (35)").unwrap();
         assert!(not_final_holds(&bare, &bytes_absent(2_000_000)));
         // the bytes decide over the text: a text naming a far lock height over bytes locked lower ends at the bytes'
-        let far = lock_time_not_final("REJECTED", "TX_LOCK_TIME (35): lock time (999999999)").unwrap();
+        let far =
+            lock_time_not_final("REJECTED", "TX_LOCK_TIME (35): lock time (999999999)").unwrap();
         assert!(!not_final_holds(&far, &height(Some(972_209))));
         // the decision and the look under the bound
         assert!(lock_time_not_final_under("REJECTED", loop44, &height(Some(972_209))).is_none());
@@ -774,7 +806,10 @@ mod tests {
             ArcadeLook::Fatal("REJECTED".into(), loop44.into())
         );
         assert_eq!(bound_look(live.clone(), &height(Some(972_185))), live);
-        assert_eq!(bound_look(ArcadeLook::Missing, &final_), ArcadeLook::Missing);
+        assert_eq!(
+            bound_look(ArcadeLook::Missing, &final_),
+            ArcadeLook::Missing
+        );
     }
 
     /// bsv-low #836 fold (the lens's M1, part 3): the door re-feeds a subject past its bound once an isolate.
@@ -809,16 +844,23 @@ mod tests {
             assert!(broadcaster.contains(needle), "broadcaster: {needle}");
         }
         assert!(!broadcaster.contains("ifletSome(nf)=crate::door_words::lock_time_not_final("));
-        assert!(admit.contains("look=crate::door_words::bound_look(look,&bound);"), "the evidence check");
+        assert!(
+            admit.contains("look=crate::door_words::bound_look(look,&bound);"),
+            "the evidence check"
+        );
         assert!(
             admit.contains("last=crate::broadcaster::bound_witness_look(last,&bound);"),
             "the pending watch"
         );
         assert!(
-            proof.contains("look=crate::door_words::bound_look(look,&port.lock_bound(txid).await);"),
+            proof
+                .contains("look=crate::door_words::bound_look(look,&port.lock_bound(txid).await);"),
             "the retire pass"
         );
-        assert!(routes.contains("matchcrate::admit_fast::callback_action(&tx_status){"), "the push");
+        assert!(
+            routes.contains("matchcrate::admit_fast::callback_action(&tx_status){"),
+            "the push"
+        );
         assert!(!routes.contains("HoldNotFinal") && !admit.contains("HoldNotFinal"));
     }
 

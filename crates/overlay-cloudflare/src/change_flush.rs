@@ -403,7 +403,9 @@ pub async fn post_body_answer(
         Err(_) => Fetch::Request(req).send().await,
     };
     match sent {
-        Ok(mut r) if (200..300).contains(&r.status_code()) => Ok(r.text().await.unwrap_or_default()),
+        Ok(mut r) if (200..300).contains(&r.status_code()) => {
+            Ok(r.text().await.unwrap_or_default())
+        }
         Ok(mut r) => {
             let status = r.status_code();
             let body = r.text().await.unwrap_or_default();

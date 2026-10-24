@@ -412,7 +412,9 @@ pub fn utxo_status_body(entries: &[OutpointStatus]) -> String {
             // other producer's bytes stand. A hint, never evidence: no money view reads it.
             if e.funding_seen.is_some() {
                 row["networkSeenBy"] = overlay_discovery::pot::storage::served_seen_by_value(
-                    e.funding_seen_by.as_ref().filter(|_| e.funding_seen == Some(true)),
+                    e.funding_seen_by
+                        .as_ref()
+                        .filter(|_| e.funding_seen == Some(true)),
                 );
             }
             row

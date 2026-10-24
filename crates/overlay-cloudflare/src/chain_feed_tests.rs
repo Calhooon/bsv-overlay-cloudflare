@@ -862,7 +862,11 @@ impl ConsumerStateStore for D7Row {
         let state: ConsumerState = serde_json::from_str(doc.as_deref().unwrap_or("{}")).unwrap();
         Ok((state, self.version.get()))
     }
-    async fn write(&self, state: &ConsumerState, expected: Option<u64>) -> Result<Option<u64>, String> {
+    async fn write(
+        &self,
+        state: &ConsumerState,
+        expected: Option<u64>,
+    ) -> Result<Option<u64>, String> {
         if expected != self.version.get() {
             return Ok(None);
         }
@@ -926,32 +930,102 @@ async fn lens_l1_a_stopped_feed_is_not_the_reorg_word() {
     let ladder = CourierStub::none();
     let start = Start::At("40".into());
     for n in 1..=3 {
-        let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &start).await;
-        assert!(!s.is_reorg_word(), "pass {n}: a stopped feed is not the reorg word: {s:?}");
-        assert_eq!(feed_is_live(&s), s.is_reorg_word(), "pass {n}: the lens's predicate is the word");
+        let s = pass(
+            &feed,
+            &row,
+            &store,
+            &txs,
+            &tracker,
+            &ladder,
+            limits(2, 50, 12),
+            &start,
+        )
+        .await;
+        assert!(
+            !s.is_reorg_word(),
+            "pass {n}: a stopped feed is not the reorg word: {s:?}"
+        );
+        assert_eq!(
+            feed_is_live(&s),
+            s.is_reorg_word(),
+            "pass {n}: the lens's predicate is the word"
+        );
         assert_eq!(s.applied, 0);
         assert!(
             store.pot_beef_proof_verified(&orphaned).await.unwrap(),
             "pass {n}: the feed did not reach the reorg behind the stop"
         );
-        assert_eq!(row.state().stop.as_ref().map(|x| x.cursor.as_str()), Some("42"), "the stop stays recorded");
+        assert_eq!(
+            row.state().stop.as_ref().map(|x| x.cursor.as_str()),
+            Some("42"),
+            "the stop stays recorded"
+        );
     }
     // (2) a 409 cursorAhead (pin d pins it too)
     let row = Row::default();
     let feed = Journal::of(&[(41, TIP)]);
-    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("999".into())).await;
-    assert!(s.cursor_ahead && !s.is_reorg_word() && !feed_is_live(&s), "{s:?}");
-    let again = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
+    let s = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("999".into()),
+    )
+    .await;
+    assert!(
+        s.cursor_ahead && !s.is_reorg_word() && !feed_is_live(&s),
+        "{s:?}"
+    );
+    let again = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::Unset,
+    )
+    .await;
     assert!(!again.is_reorg_word() && !feed_is_live(&again), "{again:?}");
     // (3) the binding down, the row present: a fault of THIS pass, no stop recorded
     let row = Row::default();
     let feed = Journal::of(&[(41, TIP)]);
-    let seeded = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
-    assert!(seeded.is_reorg_word() && feed_is_live(&seeded), "{seeded:?}");
+    let seeded = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("40".into()),
+    )
+    .await;
+    assert!(
+        seeded.is_reorg_word() && feed_is_live(&seeded),
+        "{seeded:?}"
+    );
     *feed.answer.borrow_mut() = Some(Err("CHAINTRACKS binding: connection refused".into()));
-    let down = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
+    let down = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::Unset,
+    )
+    .await;
     assert_eq!((down.faults, row.state().stop), (1, None), "{down:?}");
-    assert!(!down.is_reorg_word() && !feed_is_live(&down), "a transport fault hands D7 back this pass");
+    assert!(
+        !down.is_reorg_word() && !feed_is_live(&down),
+        "a transport fault hands D7 back this pass"
+    );
     // (4) the healthy shape (pin a's journal) is the word under both readings
     let store = MemoryPotStorage::new();
     let tracker = Roots::at(102);
@@ -959,7 +1033,17 @@ async fn lens_l1_a_stopped_feed_is_not_the_reorg_word() {
     tracker.add_root(101, standing);
     let feed = Journal::of(&[(41, FORK), (42, REORG), (43, TIP), (44, TIP_AGE)]);
     let row = Row::default();
-    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    let s = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("40".into()),
+    )
+    .await;
     assert_eq!(s.applied, 2, "{s:?}");
     assert!(s.is_reorg_word() && feed_is_live(&s));
 }
@@ -980,17 +1064,40 @@ async fn lens_l2_the_reorg_window_is_exact_at_both_edges() {
     let row = Row::default();
     let txs = MemoryTxStore::default();
     let ladder = CourierStub::none();
-    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
-    assert_eq!((s.applied, s.spenders.scanned, s.demoted()), (1, 2, 1), "{s:?}");
+    let s = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("40".into()),
+    )
+    .await;
+    assert_eq!(
+        (s.applied, s.spenders.scanned, s.demoted()),
+        (1, 2, 1),
+        "{s:?}"
+    );
     let verified = |t: &str| {
         let store = &store;
         let t = t.to_string();
         async move { store.pot_beef_proof_verified(&t).await.unwrap() }
     };
-    assert!(verified(&below).await, "100 is the ancestor's height: never examined");
-    assert!(!verified(&at_lo).await, "101 is the lowest affected height: judged and demoted");
+    assert!(
+        verified(&below).await,
+        "100 is the ancestor's height: never examined"
+    );
+    assert!(
+        !verified(&at_lo).await,
+        "101 is the lowest affected height: judged and demoted"
+    );
     assert!(verified(&at_hi).await, "102 stands by its own proof");
-    assert!(verified(&above).await, "103 is above the new tip: not this event's (a later reorg names it)");
+    assert!(
+        verified(&above).await,
+        "103 is above the new tip: not this event's (a later reorg names it)"
+    );
     assert_eq!(row.state().cursor, "41");
 }
 
@@ -1008,10 +1115,30 @@ async fn lens_l3_an_invalidation_145_deep_is_not_examined() {
     let row = Row::default();
     let txs = MemoryTxStore::default();
     let ladder = CourierStub::none();
-    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
-    assert_eq!((s.applied, s.spenders.scanned, s.demoted()), (1, 1, 1), "{s:?}");
-    assert!(!store.pot_beef_proof_verified(&inside).await.unwrap(), "856 = tip - 144: judged, demoted");
-    assert!(store.pot_beef_proof_verified(&deeper).await.unwrap(), "855 = tip - 145: not examined");
+    let s = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("40".into()),
+    )
+    .await;
+    assert_eq!(
+        (s.applied, s.spenders.scanned, s.demoted()),
+        (1, 1, 1),
+        "{s:?}"
+    );
+    assert!(
+        !store.pot_beef_proof_verified(&inside).await.unwrap(),
+        "856 = tip - 144: judged, demoted"
+    );
+    assert!(
+        store.pot_beef_proof_verified(&deeper).await.unwrap(),
+        "855 = tip - 145: not examined"
+    );
     assert_eq!(INVALIDATED_DEPTH, 144);
 }
 
@@ -1032,8 +1159,22 @@ async fn lens_l4_two_consumers_one_height_demote_once() {
     // the feed first, as the cron and the block-event pass run it
     let feed = Journal::of(&[(41, REORG)]);
     let row = Row::default();
-    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
-    assert_eq!((s.applied, s.spenders.scanned, s.demoted()), (1, 2, 1), "{s:?}");
+    let s = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("40".into()),
+    )
+    .await;
+    assert_eq!(
+        (s.applied, s.spenders.scanned, s.demoted()),
+        (1, 2, 1),
+        "{s:?}"
+    );
     assert!(!store.pot_beef_proof_verified(&orphaned).await.unwrap());
     // then D7 on demand over Arcade's orphan row at 101 (its hash differs from chaintracks': corroborated)
     let arcade_feed = arcade_orphan_at_101();
@@ -1053,13 +1194,29 @@ async fn lens_l4_two_consumers_one_height_demote_once() {
     )
     .await;
     assert_eq!(d7.applied, 1, "{d7:?}");
-    assert_eq!((d7.spenders.scanned, d7.spenders.stale, d7.spenders.standing), (1, 0, 1), "{d7:?}");
-    assert_eq!(ladder.calls.get(), 1, "the ladder was asked once, by the feed's pass, for the one refuted row");
+    assert_eq!(
+        (d7.spenders.scanned, d7.spenders.stale, d7.spenders.standing),
+        (1, 0, 1),
+        "{d7:?}"
+    );
+    assert_eq!(
+        ladder.calls.get(),
+        1,
+        "the ladder was asked once, by the feed's pass, for the one refuted row"
+    );
     assert!(store.pot_beef_proof_verified(&standing).await.unwrap());
     let r = store.get_spent_status(&pot(3), 0).await.unwrap().unwrap();
     assert!(r.spent && !r.spent_confirmed, "demoted once, still demoted");
     assert_eq!(row.state().cursor, "41", "the feed's cursor is its own");
-    assert!(d7_row.doc.borrow().as_deref().unwrap().contains("2026-10-23T18:00:00.000Z"), "D7's cursor is its own");
+    assert!(
+        d7_row
+            .doc
+            .borrow()
+            .as_deref()
+            .unwrap()
+            .contains("2026-10-23T18:00:00.000Z"),
+        "D7's cursor is its own"
+    );
 }
 
 /// LENS L5 (the invariants read): `chain_feed::health_json` is ONE statement (`STATE_READ`), issued inside the
@@ -1102,10 +1259,27 @@ async fn lens_l6_a_pass_dropped_at_a_wall_keeps_the_row() {
     )
     .await;
     assert!(dropped.is_none(), "the pass was dropped at the wall");
-    assert_eq!((row.state().cursor.as_str(), row.writes.get()), ("40", 1), "the seed landed, nothing after it");
+    assert_eq!(
+        (row.state().cursor.as_str(), row.writes.get()),
+        ("40", 1),
+        "the seed landed, nothing after it"
+    );
     let feed = Journal::of(&[(41, TIP)]);
-    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
-    assert_eq!((row.state().cursor.as_str(), s.consumed.get("tip").copied()), ("41", Some(1)));
+    let s = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::Unset,
+    )
+    .await;
+    assert_eq!(
+        (row.state().cursor.as_str(), s.consumed.get("tip").copied()),
+        ("41", Some(1))
+    );
     assert_eq!(FEED_TIMEOUT_MS, 10_000);
 }
 
@@ -1138,9 +1312,16 @@ async fn lens_l8_a_contended_pass_counts_its_contention_once() {
     )
     .await;
     assert_eq!((s.applied, s.contended), (0, 1), "{s:?}");
-    assert_eq!(s.state.as_ref().map(|st| st.cursor.as_str()), Some("40"), "the summary's state is the read one");
+    assert_eq!(
+        s.state.as_ref().map(|st| st.cursor.as_str()),
+        Some("40"),
+        "the summary's state is the read one"
+    );
     assert!(
-        s.stopped.as_deref().unwrap_or("").contains("another isolate owns this pass"),
+        s.stopped
+            .as_deref()
+            .unwrap_or("")
+            .contains("another isolate owns this pass"),
         "{s:?}"
     );
 }
@@ -1168,7 +1349,15 @@ async fn lens_l7_a_proofless_confirmed_row_is_never_demoted_blind() {
             .await
             .unwrap();
         store
-            .mark_spent(pot, 0, &spender, true, None, Some(u64::from(height)), Some(true))
+            .mark_spent(
+                pot,
+                0,
+                &spender,
+                true,
+                None,
+                Some(u64::from(height)),
+                Some(true),
+            )
             .await
             .unwrap();
         let mut beef = Beef::new();
@@ -1184,29 +1373,66 @@ async fn lens_l7_a_proofless_confirmed_row_is_never_demoted_blind() {
     let feed = Journal::of(&[(41, REORG)]);
     let row = Row::default();
     let ladder = CourierStub::none();
-    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    let s = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("40".into()),
+    )
+    .await;
     assert_eq!((s.applied, s.spenders.scanned), (1, 1), "{s:?}");
     assert_eq!(
-        (s.spenders.no_stored_proof, s.spenders.demoted_blind, s.demoted()),
+        (
+            s.spenders.no_stored_proof,
+            s.spenders.demoted_blind,
+            s.demoted()
+        ),
         (1, 0, 0),
         "no proof to refute and no courier word: nothing demoted: {s:?}"
     );
     assert_eq!(ladder.calls.get(), 1, "the courier was asked once");
     let r = store.get_spent_status(&pot(30), 0).await.unwrap().unwrap();
-    assert!(r.spent_confirmed && r.spent_height == Some(101), "still confirmed");
+    assert!(
+        r.spent_confirmed && r.spent_height == Some(101),
+        "still confirmed"
+    );
     // (b) a courier proof naming another block: demoted on that evidence
     let store = MemoryPotStorage::new();
     let spender = proofless_confirmed(&store, &pot(31), 101).await;
     let ladder = CourierStub::with(
-        [(spender.clone(), Ok(Some(single_tx_bump(&spender, 102).to_hex())))]
-            .into_iter()
-            .collect(),
+        [(
+            spender.clone(),
+            Ok(Some(single_tx_bump(&spender, 102).to_hex())),
+        )]
+        .into_iter()
+        .collect(),
     );
     let row = Row::default();
-    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
-    assert_eq!((s.applied, s.demoted(), s.spenders.demoted_blind), (1, 1, 0), "{s:?}");
+    let s = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("40".into()),
+    )
+    .await;
+    assert_eq!(
+        (s.applied, s.demoted(), s.spenders.demoted_blind),
+        (1, 1, 0),
+        "{s:?}"
+    );
     let r = store.get_spent_status(&pot(31), 0).await.unwrap().unwrap();
-    assert!(r.spent && !r.spent_confirmed, "demoted on the courier's disagreeing proof");
+    assert!(
+        r.spent && !r.spent_confirmed,
+        "demoted on the courier's disagreeing proof"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1226,7 +1452,8 @@ async fn lens_l7_a_proofless_confirmed_row_is_never_demoted_blind() {
 /// hands Arcade's listing back".
 #[tokio::test]
 async fn e620f_m3_a_stopped_or_faulting_feed_hands_arcades_listing_back_this_pass() {
-    const WORD: &str = "not an input: the chain-event feed is the reorg word this pass (bsv-low #620)";
+    const WORD: &str =
+        "not an input: the chain-event feed is the reorg word this pass (bsv-low #620)";
     let txs = MemoryTxStore::default();
     let ladder = CourierStub::none();
     /// D7's pass over `store`: the orphan event applied, the refuted row demoted.
@@ -1238,7 +1465,10 @@ async fn e620f_m3_a_stopped_or_faulting_feed_hands_arcades_listing_back_this_pas
         what: &str,
     ) {
         let d7 = d7_pass(store, txs, &Roots::at(102), ladder).await;
-        assert_eq!(d7.applied, 1, "{what}: D7 ran and applied Arcade's orphan event: {d7:?}");
+        assert_eq!(
+            d7.applied, 1,
+            "{what}: D7 ran and applied Arcade's orphan event: {d7:?}"
+        );
         assert!(
             !store.pot_beef_proof_verified(orphaned).await.unwrap(),
             "{what}: D7 demoted the refuted row the feed did not reach"
@@ -1250,35 +1480,100 @@ async fn e620f_m3_a_stopped_or_faulting_feed_hands_arcades_listing_back_this_pas
     let orphaned = confirmed_pot_with_stored_proof(&store, &pot(3), 101).await;
     let feed = Journal::of(&[(41, TIP), (42, UNKNOWN_KIND), (43, REORG)]);
     let row = Row::default();
-    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
-    assert_eq!(row.state().stop.as_ref().map(|x| x.cursor.as_str()), Some("42"), "the stop stays recorded");
+    let s = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("40".into()),
+    )
+    .await;
+    assert_eq!(
+        row.state().stop.as_ref().map(|x| x.cursor.as_str()),
+        Some("42"),
+        "the stop stays recorded"
+    );
     assert!(s.unreadable && s.applied == 0, "{s:?}");
     assert_eq!(
         arcade_not_an_input(Some(&s)),
         None,
         "unreadable envelope: the gate hands Arcade's listing back: {s:?}"
     );
-    assert!(store.pot_beef_proof_verified(&orphaned).await.unwrap(), "the feed did not reach the reorg");
+    assert!(
+        store.pot_beef_proof_verified(&orphaned).await.unwrap(),
+        "the feed did not reach the reorg"
+    );
     d7_demotes(&store, &txs, &ladder, &orphaned, "unreadable envelope").await;
-    let again = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
-    assert_eq!(arcade_not_an_input(Some(&again)), None, "the stop stands: D7 is the input again: {again:?}");
+    let again = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::Unset,
+    )
+    .await;
+    assert_eq!(
+        arcade_not_an_input(Some(&again)),
+        None,
+        "the stop stands: D7 is the input again: {again:?}"
+    );
     // the lever clears the stop: the next pass consumes the reorg and the feed is the word again
-    assert_eq!(lever(&row, true, br#"{"cursor":"42"}"#, 2).await.status, 200);
-    let on = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
-    assert_eq!((on.applied, arcade_not_an_input(Some(&on))), (1, Some(WORD)), "{on:?}");
+    assert_eq!(
+        lever(&row, true, br#"{"cursor":"42"}"#, 2).await.status,
+        200
+    );
+    let on = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::Unset,
+    )
+    .await;
+    assert_eq!(
+        (on.applied, arcade_not_an_input(Some(&on))),
+        (1, Some(WORD)),
+        "{on:?}"
+    );
     // (2) a 409 cursorAhead: a recorded stop; D7 is the input
     let store = MemoryPotStorage::new();
     let orphaned = confirmed_pot_with_stored_proof(&store, &pot(3), 101).await;
     let feed = Journal::of(&[(41, TIP)]);
     let row = Row::default();
-    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("999".into())).await;
+    let s = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("999".into()),
+    )
+    .await;
     assert!(s.cursor_ahead, "{s:?}");
-    assert_eq!(arcade_not_an_input(Some(&s)), None, "409: the gate hands Arcade's listing back");
+    assert_eq!(
+        arcade_not_an_input(Some(&s)),
+        None,
+        "409: the gate hands Arcade's listing back"
+    );
     d7_demotes(&store, &txs, &ladder, &orphaned, "409").await;
     // (3) a fault of THIS pass (the binding's transport, a page that does not read, an HTTP status): no stop recorded,
     // D7 is the input this pass, and the next healthy pass re-takes the word with no lever
     let faults: [(&str, PageAnswer); 3] = [
-        ("transport fault", Err("CHAINTRACKS binding: connection refused".into())),
+        (
+            "transport fault",
+            Err("CHAINTRACKS binding: connection refused".into()),
+        ),
         ("unparseable page", Ok((200, b"not a page".to_vec()))),
         ("HTTP 503", Ok((503, Vec::new()))),
     ];
@@ -1287,16 +1582,57 @@ async fn e620f_m3_a_stopped_or_faulting_feed_hands_arcades_listing_back_this_pas
         let orphaned = confirmed_pot_with_stored_proof(&store, &pot(3), 101).await;
         let feed = Journal::of(&[(41, TIP)]);
         let row = Row::default();
-        let seeded =
-            pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
-        assert_eq!(arcade_not_an_input(Some(&seeded)), Some(WORD), "{what}: a live feed is the word: {seeded:?}");
+        let seeded = pass(
+            &feed,
+            &row,
+            &store,
+            &txs,
+            &tracker,
+            &ladder,
+            limits(2, 50, 12),
+            &Start::At("40".into()),
+        )
+        .await;
+        assert_eq!(
+            arcade_not_an_input(Some(&seeded)),
+            Some(WORD),
+            "{what}: a live feed is the word: {seeded:?}"
+        );
         *feed.answer.borrow_mut() = Some(answer);
-        let down = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
-        assert_eq!((down.faults, row.state().stop), (1, None), "{what}: a fault, not a recorded stop: {down:?}");
-        assert_eq!(arcade_not_an_input(Some(&down)), None, "{what}: the gate hands Arcade's listing back");
+        let down = pass(
+            &feed,
+            &row,
+            &store,
+            &txs,
+            &tracker,
+            &ladder,
+            limits(2, 50, 12),
+            &Start::Unset,
+        )
+        .await;
+        assert_eq!(
+            (down.faults, row.state().stop),
+            (1, None),
+            "{what}: a fault, not a recorded stop: {down:?}"
+        );
+        assert_eq!(
+            arcade_not_an_input(Some(&down)),
+            None,
+            "{what}: the gate hands Arcade's listing back"
+        );
         d7_demotes(&store, &txs, &ladder, &orphaned, what).await;
         *feed.answer.borrow_mut() = None;
-        let back = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
+        let back = pass(
+            &feed,
+            &row,
+            &store,
+            &txs,
+            &tracker,
+            &ladder,
+            limits(2, 50, 12),
+            &Start::Unset,
+        )
+        .await;
         assert!(
             back.idle && arcade_not_an_input(Some(&back)) == Some(WORD),
             "{what}: the next healthy pass re-takes the word, no lever: {back:?}"
@@ -1307,18 +1643,56 @@ async fn e620f_m3_a_stopped_or_faulting_feed_hands_arcades_listing_back_this_pas
     let _spender = confirmed_pot_with_stored_proof(&store, &pot(9), 101).await;
     let feed = Journal::of(&[(41, REORG)]);
     let row = Row::default();
-    let s = pass(&feed, &row, &store, &txs, &FaultyTracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    let s = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &FaultyTracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("40".into()),
+    )
+    .await;
     assert_eq!(s.faults, 1, "{s:?}");
-    assert_eq!(arcade_not_an_input(Some(&s)), None, "a leg's read fault: D7 is the input this pass");
+    assert_eq!(
+        arcade_not_an_input(Some(&s)),
+        None,
+        "a leg's read fault: D7 is the input this pass"
+    );
     // (5) no feed pass at all (the block-event pass with no D1 handle): D7 runs
     assert_eq!(arcade_not_an_input(None), None);
     // (6) the healthy journal (pin a's) is the word; an unconfigured feed is not
     let store = MemoryPotStorage::new();
     let feed = Journal::of(&[(41, FORK), (42, REORG), (43, TIP), (44, TIP_AGE)]);
     let row = Row::default();
-    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
-    assert_eq!((s.applied, arcade_not_an_input(Some(&s))), (2, Some(WORD)), "{s:?}");
-    let s = pass(&feed, &Row::default(), &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::Unset).await;
+    let s = pass(
+        &feed,
+        &row,
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("40".into()),
+    )
+    .await;
+    assert_eq!(
+        (s.applied, arcade_not_an_input(Some(&s))),
+        (2, Some(WORD)),
+        "{s:?}"
+    );
+    let s = pass(
+        &feed,
+        &Row::default(),
+        &store,
+        &txs,
+        &tracker,
+        &ladder,
+        limits(2, 50, 12),
+        &Start::Unset,
+    )
+    .await;
     assert!(s.unconfigured && arcade_not_an_input(Some(&s)).is_none());
 }
 

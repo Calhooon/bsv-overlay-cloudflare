@@ -902,7 +902,11 @@ struct StandingRow {
 /// two key reads; a read that faults is "no" (the 502 stands, the conservative answer).
 pub(crate) async fn index_holds_admission(db: &D1Database, txid: &str) -> bool {
     for sql in STANDING_ADMISSION_SQL {
-        match Query::new(sql).bind(txid).fetch_optional::<StandingRow>(db).await {
+        match Query::new(sql)
+            .bind(txid)
+            .fetch_optional::<StandingRow>(db)
+            .await
+        {
             Ok(Some(_)) => return true,
             Ok(None) => {}
             Err(_) => return false,
@@ -2687,9 +2691,18 @@ struct AgeRow {
 /// (seconds; a settle, a refund, a sweep admits no output and holds no pot row: the gate's NEW-6).
 pub(crate) const ADMISSION_AGE_RUNGS: [(&str, f64); 4] = [
     ("SELECT MIN(score) AS s FROM outputs WHERE txid = ?", 1.0),
-    ("SELECT MIN(score) AS s FROM outputs_evicted WHERE txid = ?", 1.0),
-    ("SELECT MIN(createdAt) AS s FROM pot_records WHERE txid = ?", 1000.0),
-    ("SELECT createdAt AS s FROM pot_beefs WHERE txid = ?", 1000.0),
+    (
+        "SELECT MIN(score) AS s FROM outputs_evicted WHERE txid = ?",
+        1.0,
+    ),
+    (
+        "SELECT MIN(createdAt) AS s FROM pot_records WHERE txid = ?",
+        1000.0,
+    ),
+    (
+        "SELECT createdAt AS s FROM pot_beefs WHERE txid = ?",
+        1000.0,
+    ),
 ];
 
 /// How long ago the index admitted this txid (ms), from the first rung of [`ADMISSION_AGE_RUNGS`] that holds a
@@ -2716,7 +2729,11 @@ pub async fn admission_age_ms(db: &D1Database, txid: &str, now_ms: u64) -> Optio
     let txid = txid.as_str();
     admission_age_over(
         |sql| async move {
-            match Query::new(sql).bind(txid).fetch_optional::<AgeRow>(db).await {
+            match Query::new(sql)
+                .bind(txid)
+                .fetch_optional::<AgeRow>(db)
+                .await
+            {
                 Ok(Some(AgeRow { s })) => s,
                 _ => None,
             }
@@ -2939,7 +2956,8 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
         }
         match &last {
             crate::broadcaster::WitnessLook::Seen(status, at_ms) => {
-                crate::ops::latch_network_seen(&db, &txid, crate::ops::SeenSource::Arcade, *at_ms).await;
+                crate::ops::latch_network_seen(&db, &txid, crate::ops::SeenSource::Arcade, *at_ms)
+                    .await;
                 let ms = (worker::js_sys::Date::now() - admitted_at_ms).max(0.0) as u64;
                 crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_SEEN_LATCHED, 1)
                     .await;
@@ -3301,7 +3319,9 @@ mod tests {
     fn fix837_a3_every_off_door_road_records_the_joins_hop_spends_through_the_one_function() {
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let fast = include_str!("admit_fast.rs");
-        let helper = &fast[fast.find("pub async fn record_join_hop_spends_on(").unwrap()..];
+        let helper = &fast[fast
+            .find("pub async fn record_join_hop_spends_on(")
+            .unwrap()..];
         let helper = &helper[..helper.find("\n}\n").unwrap()];
         assert!(squash(helper).contains(&squash(
             "overlay_discovery::pot::lowfund_topic_manager::record_join_hop_spends(&store, txid)"
@@ -3311,10 +3331,20 @@ mod tests {
         let call = readmit
             .find("record_join_hop_spends_on(db, &txid, \"readmit\")")
             .expect("the readmission records its JOIN's hop spends");
-        assert!(call < readmit.find("READMITTED {txid} on the pushed proof").unwrap());
-        assert!(call > readmit.find("let (restored, faults) = restore_twins(db, &txid).await;").unwrap());
+        assert!(
+            call < readmit
+                .find("READMITTED {txid} on the pushed proof")
+                .unwrap()
+        );
+        assert!(
+            call > readmit
+                .find("let (restored, faults) = restore_twins(db, &txid).await;")
+                .unwrap()
+        );
         let routes = include_str!("routes.rs");
-        let admin = &routes[routes.find("POST /admin/readmit txid={txid} topic={topic}").unwrap()..];
+        let admin = &routes[routes
+            .find("POST /admin/readmit txid={txid} topic={topic}")
+            .unwrap()..];
         let admin = &admin[..admin.find("\n}\n").unwrap()];
         assert_eq!(
             admin
@@ -3594,34 +3624,67 @@ mod tests {
     #[test]
     fn i621_every_eviction_reason_serves_the_chain_word_it_rests_on_never_an_absence() {
         use overlay_discovery::pot::storage::eviction_chain_word;
-        let refused = |look: ArcadeLook| match evidence_verdict(&look, Some(false), Some(false), false) {
-            EvidenceVerdict::Refused(r) => r,
-            other => panic!("a refusal: {other:?}"),
-        };
-        let fatal = refused(ArcadeLook::Fatal("DOUBLE_SPEND_ATTEMPTED".into(), "utxo spent by tx".into()));
+        let refused =
+            |look: ArcadeLook| match evidence_verdict(&look, Some(false), Some(false), false) {
+                EvidenceVerdict::Refused(r) => r,
+                other => panic!("a refusal: {other:?}"),
+            };
+        let fatal = refused(ArcadeLook::Fatal(
+            "DOUBLE_SPEND_ATTEMPTED".into(),
+            "utxo spent by tx".into(),
+        ));
         let missing = refused(ArcadeLook::Missing);
         let faulted = refused(ArcadeLook::Fault);
         // the W2-WORDS-L5 lens, MEDIUM-1: Arcade faulted and the recorded (pushed) word filled it: no chain word,
         // even when the recorded text carries Arcade's live mark
-        let recorded = refused(ArcadeLook::Recorded("REJECTED".into(), "arcade live REJECTED: x".into()));
+        let recorded = refused(ArcadeLook::Recorded(
+            "REJECTED".into(),
+            "arcade live REJECTED: x".into(),
+        ));
         // the callback's and the watch's wrap (`refusal_job`, `pending_watch_job`)
         for status in ["REJECTED", "DOUBLE_SPEND_ATTEMPTED", "SEEN_ON_NETWORK"] {
-            assert_eq!(eviction_chain_word(&format!("{status} ({recorded})")), None, "a recorded word behind a fault: no word");
-            assert_eq!(eviction_chain_word(&format!("{status} ({fatal})")), Some("rejected"));
-            assert_eq!(eviction_chain_word(&format!("{status} ({missing})")), None, "absence alone: no word");
-            assert_eq!(eviction_chain_word(&format!("{status} ({faulted})")), None, "absence alone: no word");
+            assert_eq!(
+                eviction_chain_word(&format!("{status} ({recorded})")),
+                None,
+                "a recorded word behind a fault: no word"
+            );
+            assert_eq!(
+                eviction_chain_word(&format!("{status} ({fatal})")),
+                Some("rejected")
+            );
+            assert_eq!(
+                eviction_chain_word(&format!("{status} ({missing})")),
+                None,
+                "absence alone: no word"
+            );
+            assert_eq!(
+                eviction_chain_word(&format!("{status} ({faulted})")),
+                None,
+                "absence alone: no word"
+            );
         }
         assert_eq!(
             eviction_chain_word(&ladder_rerefusal_reason("Arcade REJECTED bad script")),
             Some("rejected")
         );
         assert_eq!(
-            eviction_chain_word(&conflict_eviction_reason(&"aa".repeat(32), 1, &"bb".repeat(32), 967_673_u64)),
+            eviction_chain_word(&conflict_eviction_reason(
+                &"aa".repeat(32),
+                1,
+                &"bb".repeat(32),
+                967_673_u64
+            )),
             Some("conflicted")
         );
         // a broadcaster's text inside another reason never reads as a conflict; an unknown reason is no word
         assert_eq!(
-            eviction_chain_word(&format!("REJECTED ({})", refused(ArcadeLook::Fatal("REJECTED".into(), "input x:0 spent by confirmed competitor y at 1".into())))),
+            eviction_chain_word(&format!(
+                "REJECTED ({})",
+                refused(ArcadeLook::Fatal(
+                    "REJECTED".into(),
+                    "input x:0 spent by confirmed competitor y at 1".into()
+                ))
+            )),
             Some("rejected")
         );
         assert_eq!(eviction_chain_word("fixture"), None);
@@ -3629,7 +3692,8 @@ mod tests {
         // the producers' sources use the pure formats (a reformat cannot slip past the classifier)
         let src = include_str!("admit_fast.rs");
         assert!(src.contains("&conflict_eviction_reason(parent, vout, &competitor, height),"));
-        assert!(include_str!("routes.rs").contains("&crate::admit_fast::ladder_rerefusal_reason(&reason),"));
+        assert!(include_str!("routes.rs")
+            .contains("&crate::admit_fast::ladder_rerefusal_reason(&reason),"));
         assert!(src.contains("&format!(\"{} ({reason})\", webhook.0)"));
         assert!(src.contains("&format!(\"{status} ({reason})\")"));
     }
@@ -4476,9 +4540,7 @@ mod tests {
         // the wrapper: the core → the release unless the pass yielded → the merge → the close → the counters
         let evict = &src[src.find("pub async fn evict_txid_everywhere(").unwrap()..];
         let evict = &evict[..evict.find("struct EvictedRow").unwrap()];
-        let c = evict
-            .find("evict_core_with_abort(")
-            .expect("the core");
+        let c = evict.find("evict_core_with_abort(").expect("the core");
         let release = evict
             .find("release_spends_of(db, &txid)")
             .expect("the release");
@@ -4968,7 +5030,9 @@ mod tests {
     #[test]
     fn ident_fold_l1_the_abort_is_after_the_ledger_close() {
         let src = include_str!("admit_fast.rs");
-        let wrapper = &src[src.find("pub async fn evict_txid_everywhere_repointed(").unwrap()..];
+        let wrapper = &src[src
+            .find("pub async fn evict_txid_everywhere_repointed(")
+            .unwrap()..];
         let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap()];
         let release = wrapper.find("release_spends_of(db, &txid)").unwrap();
         let merge = wrapper.find("merge_released(").unwrap();
@@ -6180,7 +6244,9 @@ mod tests {
     #[test]
     fn e649_h1_the_pass_runs_the_shipped_loop() {
         let src = include_str!("admit_fast.rs");
-        let pass = &src[src.find("pub(crate) async fn confirmed_conflict_pass(").unwrap()..];
+        let pass = &src[src
+            .find("pub(crate) async fn confirmed_conflict_pass(")
+            .unwrap()..];
         let pass = &pass[..pass.find("\n}\n").unwrap()];
         assert!(
             pass.contains("run_conflict_candidates(&port,"),
@@ -6432,14 +6498,18 @@ mod tests {
         let verdict = verdict_of_look(&look, indexers, age).await;
         match &verdict {
             EvidenceVerdict::Refused(reason) => {
-                let core = evict_core(&db, &txid, &format!("{} ({reason})", pushed.0), now_ms).await;
+                let core =
+                    evict_core(&db, &txid, &format!("{} ({reason})", pushed.0), now_ms).await;
                 assert!(core.faults.is_empty(), "{:?}", core.faults);
             }
             EvidenceVerdict::Present | EvidenceVerdict::Uncertain(_) => {
                 db.conn
                     .execute(
                         crate::ops::BUMP_COUNTER_SQL,
-                        rusqlite::params![crate::ops::COUNTER_ARC_INGEST_REFUSAL_UNCORROBORATED, 1i64],
+                        rusqlite::params![
+                            crate::ops::COUNTER_ARC_INGEST_REFUSAL_UNCORROBORATED,
+                            1i64
+                        ],
                     )
                     .unwrap();
             }
@@ -6491,12 +6561,16 @@ mod tests {
         );
         assert_eq!(run.ledger_reason, None, "no eviction opened");
         assert_eq!(run.uncorroborated, 1);
-        assert_eq!(run.live_rows, 2, "the subject's output and applied row stay live");
+        assert_eq!(
+            run.live_rows, 2,
+            "the subject's output and applied row stay live"
+        );
     }
 
     /// bsv-low #740 (2): the same with a subject the index never admitted: nothing evicted, counted, no ledger row.
     #[tokio::test]
-    async fn i740_b_a_pushed_status_under_a_faulted_look_on_a_never_admitted_subject_opens_no_eviction() {
+    async fn i740_b_a_pushed_status_under_a_faulted_look_on_a_never_admitted_subject_opens_no_eviction(
+    ) {
         let run = i740_run(ArcadeLook::Fault, None).await;
         assert!(
             matches!(run.verdict, EvidenceVerdict::Uncertain(_)),
@@ -6511,15 +6585,26 @@ mod tests {
     /// faulted look with no pushed word yields it, and the ledger reason serves the ABSENCE shape (no chain word),
     /// never Arcade's `rejected`.
     #[tokio::test]
-    async fn i740_c_a_pushed_status_under_a_faulted_look_on_an_aged_admission_is_the_absence_refusal() {
+    async fn i740_c_a_pushed_status_under_a_faulted_look_on_an_aged_admission_is_the_absence_refusal(
+    ) {
         let run = i740_run(ArcadeLook::Fault, Some(REFUSAL_ABSENT_MIN_AGE_MS + 60_000)).await;
         let EvidenceVerdict::Refused(reason) = &run.verdict else {
-            panic!("an aged admission keeps the absence refusal: {:?}", run.verdict);
+            panic!(
+                "an aged admission keeps the absence refusal: {:?}",
+                run.verdict
+            );
         };
-        assert!(reason.starts_with("arcade faulted, recorded REJECTED: "), "{reason}");
+        assert!(
+            reason.starts_with("arcade faulted, recorded REJECTED: "),
+            "{reason}"
+        );
         let ledger = run.ledger_reason.expect("the eviction is opened");
         assert_eq!(ledger, format!("REJECTED ({reason})"));
-        assert_eq!(i740_word(&ledger), None, "an eviction on absence serves no chain word");
+        assert_eq!(
+            i740_word(&ledger),
+            None,
+            "an eviction on absence serves no chain word"
+        );
         assert_eq!(run.uncorroborated, 0);
         assert_eq!(run.live_rows, 0, "the shadow move took the subject's rows");
         // the same aged subject under a faulted look with NO pushed word: the same decision, the same served word
@@ -6542,7 +6627,10 @@ mod tests {
         let EvidenceVerdict::Refused(reason) = &run.verdict else {
             panic!("Arcade's own word needs no age: {:?}", run.verdict);
         };
-        assert_eq!(reason, "arcade live REJECTED: live extra; both indexers absent");
+        assert_eq!(
+            reason,
+            "arcade live REJECTED: live extra; both indexers absent"
+        );
         let ledger = run.ledger_reason.expect("the eviction is opened");
         assert_eq!(i740_word(&ledger), Some("rejected"));
         assert_eq!(run.uncorroborated, 0);
@@ -7113,22 +7201,53 @@ mod tests {
             };
             port.bound.set(at(972_185, SubjectLock::Height(972_185)));
             let held = retire_evidence(&port, &refund, None).await;
-            assert!(matches!(held.look, ArcadeLook::NotFinal(..)), "{:?}", held.look);
-            assert_eq!(crate::proof_fetcher::retire_verdict_of(&held.look, &held.bitails, &held.woc, 7_200), None);
+            assert!(
+                matches!(held.look, ArcadeLook::NotFinal(..)),
+                "{:?}",
+                held.look
+            );
+            assert_eq!(
+                crate::proof_fetcher::retire_verdict_of(
+                    &held.look,
+                    &held.bitails,
+                    &held.woc,
+                    7_200
+                ),
+                None
+            );
             // the last tip inside the window, then the first past it
             port.bound.set(at(972_208, SubjectLock::Height(972_185)));
             let edge = retire_evidence(&port, &refund, None).await;
-            assert!(matches!(edge.look, ArcadeLook::NotFinal(..)), "{:?}", edge.look);
+            assert!(
+                matches!(edge.look, ArcadeLook::NotFinal(..)),
+                "{:?}",
+                edge.look
+            );
             port.bound.set(at(972_209, SubjectLock::Height(972_185)));
             let past = retire_evidence(&port, &refund, None).await;
-            assert_eq!(past.look, ArcadeLook::Fatal("REJECTED".into(), extra.into()));
-            let reason = crate::proof_fetcher::retire_verdict_of(&past.look, &past.bitails, &past.woc, 7_200)
-                .expect("past the lag the word is Arcade's own: the 1 h terminal arm");
-            assert!(reason.starts_with("arcade REJECTED: TX_LOCK_TIME (35)"), "{reason}");
+            assert_eq!(
+                past.look,
+                ArcadeLook::Fatal("REJECTED".into(), extra.into())
+            );
+            let reason = crate::proof_fetcher::retire_verdict_of(
+                &past.look,
+                &past.bitails,
+                &past.woc,
+                7_200,
+            )
+            .expect("past the lag the word is Arcade's own: the 1 h terminal arm");
+            assert!(
+                reason.starts_with("arcade REJECTED: TX_LOCK_TIME (35)"),
+                "{reason}"
+            );
             // a subject final by its bytes is never held, even at the loop 44 tip
             port.bound.set(at(972_185, SubjectLock::Final));
             let final_ = retire_evidence(&port, &refund, None).await;
-            assert!(matches!(final_.look, ArcadeLook::Fatal(..)), "{:?}", final_.look);
+            assert!(
+                matches!(final_.look, ArcadeLook::Fatal(..)),
+                "{:?}",
+                final_.look
+            );
             // no tip (no tracker, or a fault): held, fail-safe; the 48 h absence arm still ends it
             port.bound.set(LockBound {
                 lock: Some(SubjectLock::Height(972_185)),
@@ -7137,14 +7256,32 @@ mod tests {
             });
             let blind = retire_evidence(&port, &refund, None).await;
             assert!(matches!(blind.look, ArcadeLook::NotFinal(..)));
-            assert!(crate::proof_fetcher::retire_verdict_of(&blind.look, &blind.bitails, &blind.woc, 49 * 3_600).is_some());
+            assert!(crate::proof_fetcher::retire_verdict_of(
+                &blind.look,
+                &blind.bitails,
+                &blind.woc,
+                49 * 3_600
+            )
+            .is_some());
             // the bound is asked of a non-final look only
             let other = "f9".repeat(32);
-            port.say(&other, ArcadeLook::Missing, Some(NetworkPresence::Absent), Some(NetworkPresence::Absent));
+            port.say(
+                &other,
+                ArcadeLook::Missing,
+                Some(NetworkPresence::Absent),
+                Some(NetworkPresence::Absent),
+            );
             let _ = retire_evidence(&port, &other, None).await;
             let asked = port.asked.borrow();
-            assert_eq!(asked.iter().filter(|a| a.starts_with("lock_bound")).count(), 5, "{asked:?}");
-            assert!(!asked.iter().any(|a| *a == format!("lock_bound {other}")), "{asked:?}");
+            assert_eq!(
+                asked.iter().filter(|a| a.starts_with("lock_bound")).count(),
+                5,
+                "{asked:?}"
+            );
+            assert!(
+                !asked.iter().any(|a| *a == format!("lock_bound {other}")),
+                "{asked:?}"
+            );
         }
 
         /// (a) A never-held JOIN admitted pending, 49 h proofless, Arcade 404 and both indexers absent: the retire

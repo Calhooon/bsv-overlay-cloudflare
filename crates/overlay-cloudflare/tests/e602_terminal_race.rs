@@ -52,12 +52,24 @@ fn e602_confirmation_survives_the_courier_body_and_fold() {
     for body in [r#"{}"#, r#"{"blockheight":0}"#] {
         let presence = presence_response(200, body).unwrap();
         assert_eq!(presence, NetworkPresence::Present { height: None });
-        assert!(
-            terminal_at_arcade_by_presence(presence, true, "s", "REJECTED", "UTXO_SPENT", &bsv_overlay_cloudflare::door_words::LockBound::default())
-                .is_err()
-        );
+        assert!(terminal_at_arcade_by_presence(
+            presence,
+            true,
+            "s",
+            "REJECTED",
+            "UTXO_SPENT",
+            &bsv_overlay_cloudflare::door_words::LockBound::default()
+        )
+        .is_err());
         assert!(matches!(
-            terminal_at_arcade_by_presence(presence, false, "s", "REJECTED", "UTXO_SPENT", &bsv_overlay_cloudflare::door_words::LockBound::default()),
+            terminal_at_arcade_by_presence(
+                presence,
+                false,
+                "s",
+                "REJECTED",
+                "UTXO_SPENT",
+                &bsv_overlay_cloudflare::door_words::LockBound::default()
+            ),
             Ok(ArcOutcome::Rejected(_))
         ));
     }
@@ -85,7 +97,9 @@ fn e602_readmission_latch_requires_broadcaster_witness() {
         .unwrap()];
     assert_eq!(arm.matches("latch_network_seen(").count(), 1);
     // bsv-low #621: the latch names the broadcaster that witnessed it in this request
-    assert!(arm.contains("ifarcade.admission_is_witnessed(){match(env.d1(\"OVERLAY_DB\"),arcade.witnessed_by()){"));
+    assert!(arm.contains(
+        "ifarcade.admission_is_witnessed(){match(env.d1(\"OVERLAY_DB\"),arcade.witnessed_by()){"
+    ));
     assert!(arm.contains("ctx.wait_until(crate::admit_fast::pending_watch_job("));
 }
 

@@ -419,11 +419,24 @@ async fn fix834m_a_the_conflict_pass_asks_through_the_janitor_pacer() {
         // one clean "unspent", a skipped WoC and a "could not look" decide nothing: a negative needs a second provider
         assert!(conflict.resolve_spender(&outpoint(n), 0).await.is_err());
     }
-    assert_eq!(calls(), 26, "every subrequest of the pass is one the pacer let go (WoC 3, Bitails 3, BananaBlocks 20)");
+    assert_eq!(
+        calls(),
+        26,
+        "every subrequest of the pass is one the pacer let go (WoC 3, Bitails 3, BananaBlocks 20)"
+    );
     let view = counts.pacing_view();
-    assert_eq!(view["woc"]["asked"], 3, "the conflict pass asks a backed-off WoC: {view}");
-    assert_eq!(view["bitails"]["asked"], 3, "pruned Bitails skipped by construction over both: {view}");
-    assert_eq!(view["bananablocks"]["asked"], 20, "the healthy rung takes every ask: {view}");
+    assert_eq!(
+        view["woc"]["asked"], 3,
+        "the conflict pass asks a backed-off WoC: {view}"
+    );
+    assert_eq!(
+        view["bitails"]["asked"], 3,
+        "pruned Bitails skipped by construction over both: {view}"
+    );
+    assert_eq!(
+        view["bananablocks"]["asked"], 20,
+        "the healthy rung takes every ask: {view}"
+    );
 
     // The conflict pass's presence reads: WoC backed off is not asked; Bitails' presence is its own rung (the proof
     // ladder's could-not-look cap does not blind the both-indexer reading the verdicts take), still paced.
@@ -441,8 +454,15 @@ async fn fix834m_a_the_conflict_pass_asks_through_the_janitor_pacer() {
 
     // The retire pass's own looks take the same pacer: WoC's presence skipped, Arcade's look paced and counted.
     TEST_HTTP_CALLS.with(|c| c.set(0));
-    assert!(sources.woc_presence_counted(None, &outpoint(2), Some(&counts)).await.is_none());
-    assert_eq!(calls(), 0, "a backed-off WoC presence read makes no subrequest");
+    assert!(sources
+        .woc_presence_counted(None, &outpoint(2), Some(&counts))
+        .await
+        .is_none());
+    assert_eq!(
+        calls(),
+        0,
+        "a backed-off WoC presence read makes no subrequest"
+    );
     let arcade = "https://arcade.example";
     answer(format!("{arcade}/tx/{}", outpoint(2)), 404, "not found");
     let look = ProofSources::parse("arcade")
@@ -460,15 +480,24 @@ async fn fix834m_a_the_conflict_pass_asks_through_the_janitor_pacer() {
 fn fix834m_b_the_retire_pass_and_its_callers_carry_the_pacer() {
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     let proof = squash(include_str!("../proof_fetcher.rs"));
-    let pass = &proof[proof.find("pub(crate)asyncfnrun_retire_pass(").expect("the pass")..];
+    let pass = &proof[proof
+        .find("pub(crate)asyncfnrun_retire_pass(")
+        .expect("the pass")..];
     let pass = &pass[..pass.find("letmutsummary=RetireSummary").expect("its head")];
     assert!(pass.contains("counters:Option<CourierCounters>,"), "{pass}");
-    assert!(pass.contains("counters:counters.clone(),"), "the retire port");
     assert!(
-        pass.contains("crate::admit_fast::confirmed_conflict_pass(db,woc_api_key,sources,counters).await;"),
+        pass.contains("counters:counters.clone(),"),
+        "the retire port"
+    );
+    assert!(
+        pass.contains(
+            "crate::admit_fast::confirmed_conflict_pass(db,woc_api_key,sources,counters).await;"
+        ),
         "the conflict pass"
     );
-    let port = &proof[proof.find("implRetirePortforWorkerRetire<'_>{").expect("the port")..];
+    let port = &proof[proof
+        .find("implRetirePortforWorkerRetire<'_>{")
+        .expect("the port")..];
     let port = &port[..port.find("asyncfnlatch(").expect("its looks")];
     for look in [
         ".arcade_look_counted(self.arcade_base,txid,evidence,self.counters.as_ref())",
@@ -481,14 +510,23 @@ fn fix834m_b_the_retire_pass_and_its_callers_carry_the_pacer() {
     assert!(admit.contains("fetcher:conflict_pass_fetcher(sources,woc_api_key,counters.clone()),"));
     let callers = squash(include_str!("../lib.rs")) + &squash(include_str!("../tick.rs"));
     assert_eq!(
-        callers.matches("crate::lookup_service_chain_tracker(env),Some(courier_counts.clone()),).await;").count(),
+        callers
+            .matches(
+                "crate::lookup_service_chain_tracker(env),Some(courier_counts.clone()),).await;"
+            )
+            .count(),
         2,
         "both janitor entrances pace the retire pass"
     );
     assert_eq!(
-        callers.matches("crate::proof_fetcher::ProofSources::from_env(env),Some(&courier_counts),)").count(),
+        callers
+            .matches("crate::proof_fetcher::ProofSources::from_env(env),Some(&courier_counts),)")
+            .count(),
         2,
         "both janitor entrances pace the rebroadcast backstop"
     );
-    assert!(proof.contains("crate::lookup_service_chain_tracker(env),None,),).await;"), "the lever runs unpaced");
+    assert!(
+        proof.contains("crate::lookup_service_chain_tracker(env),None,),).await;"),
+        "the lever runs unpaced"
+    );
 }

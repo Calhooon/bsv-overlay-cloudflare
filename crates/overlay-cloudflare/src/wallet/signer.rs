@@ -781,7 +781,11 @@ mod tests {
         };
         let digest = compute_sighash_dispatched_for_signing(&params);
         assert_eq!(digest, compute_sighash_for_signing(&params));
-        assert_eq!(hex_encode(&digest), PINNED_DIGEST, "the admin signer's digest moved");
+        assert_eq!(
+            hex_encode(&digest),
+            PINNED_DIGEST,
+            "the admin signer's digest moved"
+        );
 
         // The signer signs that digest: its signature verifies over it.
         let signed = sign_transaction(&template, &key).unwrap();
@@ -803,8 +807,14 @@ mod tests {
             work_limit: None,
         });
         spend.set_flags(ScriptFlags::block(ProtocolEra::PostChronicle));
-        assert!(matches!(spend.validate(), Ok(true)), "the node word refuses the signature");
-        assert_eq!(signed.txid, PINNED_TXID, "the admin signer's transaction moved");
+        assert!(
+            matches!(spend.validate(), Ok(true)),
+            "the node word refuses the signature"
+        );
+        assert_eq!(
+            signed.txid, PINNED_TXID,
+            "the admin signer's transaction moved"
+        );
     }
 
     const PINNED_DIGEST: &str = "85f5575efe26ac91a90e320829381117a936e965b39f69886e30d402b881f824";

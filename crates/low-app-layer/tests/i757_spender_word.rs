@@ -744,11 +744,18 @@ async fn b_owed_3_m1_a_seen_latched_before_the_mark_is_renoted_once_the_mark_lan
         "the re-noted seen is held once the mark landed"
     );
     let w = BTreeMap::from([(settle.clone(), row.view())]);
-    assert_eq!(coin_landing(w.get(&settle), Some(true)), CoinLanding::Awaiting);
+    assert_eq!(
+        coin_landing(w.get(&settle), Some(true)),
+        CoinLanding::Awaiting
+    );
     // the request's `built` rides the dispatch's later flush: the word stays `seen`
     tracker_events::note_submit(&settle, true, true);
     ship(&db, stored::LIVE_HOLD, 1_003).await;
-    assert_eq!(read(&db, &settle).unwrap().word, "seen", "a later built undid the seen");
+    assert_eq!(
+        read(&db, &settle).unwrap().word,
+        "seen",
+        "a later built undid the seen"
+    );
     // a row latched before #621 has no source: nothing re-noted
     assert!(!tracker_events::note_latched_seen(&settle, None));
     assert!(tracker_events::drain().is_empty());
@@ -766,8 +773,14 @@ fn b_owed_3_m1_the_route_renotes_after_the_write_before_the_first_flush() {
             .unwrap_or_else(|| panic!("routes.rs: {needle}"))
     };
     let write = at("engine.submit_with_report(&tagged_beef, mode).await", 0);
-    let renote = at("crate::ops::renote_latched_seen(&seen_db, subject).await;", write);
-    let flush = at("crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));", write);
+    let renote = at(
+        "crate::ops::renote_latched_seen(&seen_db, subject).await;",
+        write,
+    );
+    let flush = at(
+        "crate::pot_changes::flush(env, |fut| ctx.wait_until(fut));",
+        write,
+    );
     let submit = at("crate::tracker_events::note_submit(", write);
     assert!(
         renote < flush && renote < submit,
@@ -825,7 +838,9 @@ async fn b_owed_3_l2_an_unheld_frame_is_counted_unheld_on_both_sides() {
     assert_eq!(read(&db, &settle).unwrap().word, "seen");
     assert_eq!(count("tracker_events_arcade_shipped_total") - shipped, 1);
     // the answer's words, and an app layer before the fold (no `held`) read as held
-    assert!(!tracker_events::answered_held(r#"{"ok":true,"held":false}"#));
+    assert!(!tracker_events::answered_held(
+        r#"{"ok":true,"held":false}"#
+    ));
     assert!(tracker_events::answered_held(r#"{"ok":true,"held":true}"#));
     assert!(tracker_events::answered_held(r#"{"ok":true}"#));
     // the handler counts the drop and answers it; the route takes the counters on its answer
@@ -891,7 +906,11 @@ async fn b_owed_3_l4_f5_the_flush_ships_the_words_then_the_notes_under_one_deadl
     let clock = Cell::new(0_u64);
     let notes_at = Cell::new(None);
     for n in 0..25u8 {
-        tracker_events::note(&pot(100 + n), "seen", Some(json!({"source": "arcade", "at": 1})));
+        tracker_events::note(
+            &pot(100 + n),
+            "seen",
+            Some(json!({"source": "arcade", "at": 1})),
+        );
     }
     let shipped = tracker_events::ship_in_order(
         tracker_events::drain(),
