@@ -55,9 +55,15 @@ const expect = (ok, label, why) => {
 }
 
 // The couriers' stand-in: every GET is 404 (Arcade's "not carried", both indexers' "not known"), counted by path.
+// bsv-low #868: BananaBlocks' native `/api/v1/tx/{txid}` answers its recorded not-found body (probed 2026-10-24), the
+// second capable source's clean absence beside WoC's 404 (Bitails' 404 is "could not look" since #868).
 const asked = []
 const sink = createServer((req, res) => {
   asked.push(`${req.method} ${req.url}`)
+  if (/^\/api\/v1\/tx\/[0-9a-f]{64}$/.test(req.url)) {
+    res.writeHead(404, { 'content-type': 'application/json' })
+    return res.end('{"error":"Transaction not found"}')
+  }
   res.writeHead(404, { 'content-type': 'text/plain' })
   res.end('not found')
 })

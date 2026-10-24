@@ -410,6 +410,8 @@ fn word_of(hint: &Hint) -> String {
 pub const BITAILS_SOURCE: &str = "bitails";
 /// See [`BITAILS_SOURCE`].
 pub const WOC_SOURCE: &str = "woc";
+/// bsv-low #868: BananaBlocks' native view, the second capable mempool source beside WoC's node.
+pub const BANANABLOCKS_SOURCE: &str = "bananablocks";
 
 /// bsv-low #619 (L3, the words map's S11): one courier's answer about a transaction, as the door hosts it. A
 /// courier that holds the bytes speaks the tracker's own value, a [`Hint`] from its source; a clean 404 and a
@@ -1121,7 +1123,7 @@ mod tests {
         );
         assert_reads_the_couriers_hints("the evidence check", check, "evidence_verdict_of(");
         assert!(
-            check.contains("courier_hint(BITAILS_SOURCE, b, 0)")
+            check.contains("courier_hint(source, b, 0)")
                 && check.contains("courier_hint(WOC_SOURCE, w, 0)"),
             "the evidence check hands each courier's answer to the adapter under its source"
         );
@@ -1145,7 +1147,7 @@ mod tests {
             "door_words::courier_presence(",
         );
         assert!(
-            fresh.contains("courier_hint(BITAILS_SOURCE, bitails, 0)")
+            fresh.contains("courier_hint(source, bitails, 0)")
                 && fresh.contains("courier_hint(WOC_SOURCE, woc, 0)"),
             "the ladder's terminal read hands each courier's answer to the adapter under its source"
         );

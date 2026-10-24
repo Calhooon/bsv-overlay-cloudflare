@@ -472,7 +472,8 @@ fn fix834m_b_the_retire_pass_and_its_callers_carry_the_pacer() {
     let port = &port[..port.find("asyncfnlatch(").expect("its looks")];
     for look in [
         ".arcade_look_counted(self.arcade_base,txid,evidence,self.counters.as_ref())",
-        ".bitails_presence_counted(txid,self.counters.as_ref())",
+        // bsv-low #868: the mempool witness beside WoC's node (Bitails, else BananaBlocks), paced the same way
+        ".mempool_witness_presence_counted(txid,self.counters.as_ref())",
         ".woc_presence_counted(self.woc_api_key,txid,self.counters.as_ref())",
     ] {
         assert!(port.contains(look), "{look}");
