@@ -17,6 +17,8 @@
 //!      identity signature verifies (the latched `markerValid`, else the
 //!      replay) — the unforgeable binding of the lock's key to the identity;
 //!      no row yet is 425 (the JOIN-time race: the client's outbox re-files);
+//!      the filing's game id is that row's own, in every arm (bsv-low #663:
+//!      another is refused by name, `sweep-game-mismatch`, 422);
 //!   2. the raw's FIRST input spends the hop outpoint the marker names;
 //!   3. its unlock is exactly `[sig ‖ 0x41, seatSettlePubkey]`, the signature
 //!      canonical low-S DER, verifying over the BIP-143 `SIGHASH_ALL|FORKID`
@@ -178,6 +180,8 @@ pub enum SweepRefusal {
     /// The raw is not the seat's spend of the hop (the unlock shape, the key, or the signature over the hop's lock
     /// and value fails).
     SweepNotTheSeatsSpend,
+    /// bsv-low #663: the filing names another game than the hop's own (verified) marker row.
+    SweepGameMismatch,
 }
 
 /// The sighash-type byte every LOW spend signs with.
@@ -204,20 +208,33 @@ pub fn bind_hop_sweep(
     ) else {
         return Err(SweepRefusal::HopMarkerUnverified);
     };
+    // bsv-low #663: the replay runs over the ROW's own game (the row is the hop's own only if its signature verifies
+    // under it), so a row that does not verify is 425 as before whatever the filing names
+    let Ok(row_game) =
+        <[u8; 32]>::try_from(hex::decode(&hop.game_id).unwrap_or_default().as_slice())
+    else {
+        return Err(SweepRefusal::HopMarkerUnverified);
+    };
     if hop.marker_valid != Some(true) {
         let Some(challenge) = hopparty_identity_challenge(
             &m.identity,
             &opponent,
-            &m.game_id,
+            &row_game,
             hop.hop_vout,
             hop.hop_sats,
             &seat_pub,
         ) else {
             return Err(SweepRefusal::HopMarkerUnverified);
         };
-        if !verify_identity_sig(&m.identity, &m.game_id, &challenge, &identity_sig) {
+        if !verify_identity_sig(&m.identity, &row_game, &challenge, &identity_sig) {
             return Err(SweepRefusal::HopMarkerUnverified);
         }
+    }
+    // bsv-low #663: in EVERY arm (the overlay's latch and the replay alike) the filing's game is the hop's own row's;
+    // another is refused by name, never written and never corrected (the per-(poster, game, hop) cap and every
+    // reader keyed by the game would otherwise take the filing's word)
+    if row_game != m.game_id {
+        return Err(SweepRefusal::SweepGameMismatch);
     }
     // 2. the raw spends the hop
     if !sweep_spends_hop(&m.sweep_raw, &m.hop_txid, m.hop_vout) {
@@ -367,22 +384,22 @@ pub fn pick_filed_sweep(newest: FiledHopSweep, older: Vec<FiledHopSweep>) -> Fil
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bsv_rs::primitives::ec::PrivateKey;
     use bsv_rs::wallet::{Counterparty, CreateSignatureArgs, GetPublicKeyArgs, ProtoWallet};
 
-    fn skey(scalar: u8) -> PrivateKey {
+    pub(crate) fn skey(scalar: u8) -> PrivateKey {
         let mut b = [0u8; 32];
         b[31] = scalar;
         PrivateKey::from_bytes(&b).expect("nonzero scalar")
     }
-    fn wallet(seed: u8) -> ProtoWallet {
+    pub(crate) fn wallet(seed: u8) -> ProtoWallet {
         ProtoWallet::new(Some(
             PrivateKey::from_hex(&hex::encode([seed; 32])).unwrap(),
         ))
     }
-    fn identity(w: &ProtoWallet) -> Vec<u8> {
+    pub(crate) fn identity(w: &ProtoWallet) -> Vec<u8> {
         hex::decode(
             w.get_public_key(GetPublicKeyArgs {
                 identity_key: true,
@@ -409,16 +426,16 @@ mod tests {
         }
         out.extend_from_slice(data);
     }
-    fn script(pushes: &[&[u8]]) -> Vec<u8> {
+    pub(crate) fn script(pushes: &[&[u8]]) -> Vec<u8> {
         let mut out = vec![0x00, 0x6a];
         for p in pushes {
             push(&mut out, p);
         }
         out
     }
-    const GID: [u8; 32] = [0x31; 32];
-    const HOP: [u8; 32] = [0x51; 32];
-    const HOP_SATS: u64 = 20_190;
+    pub(crate) const GID: [u8; 32] = [0x31; 32];
+    pub(crate) const HOP: [u8; 32] = [0x51; 32];
+    pub(crate) const HOP_SATS: u64 = 20_190;
     /// A 1-in/1-out raw: input `prev:vout` with `unlock`, one output of `out_sats` to `out_lock`.
     fn raw_1in_1out(
         prev: &[u8; 32],
@@ -448,7 +465,7 @@ mod tests {
     }
     /// The seat's sweep of `HOP:vout` (value `sats`, lock = P2PKH(seat)) to `dest`, signed by `signer` (the honest
     /// case: `signer` == the seat key).
-    fn sweep_raw(
+    pub(crate) fn sweep_raw(
         seat: &PrivateKey,
         signer: &PrivateKey,
         vout: u32,
@@ -486,7 +503,7 @@ mod tests {
         }
     }
     /// The hop's admitted marker for the wallet: a REAL identity signature over the hopparty challenge.
-    fn hop_ctx(w: &ProtoWallet, seat: &PrivateKey, on_chain: bool) -> HopContext {
+    pub(crate) fn hop_ctx(w: &ProtoWallet, seat: &PrivateKey, on_chain: bool) -> HopContext {
         let id = identity(w);
         let opp = vec![0x03; 33];
         let seat_pub = seat.public_key().to_compressed();
@@ -522,7 +539,7 @@ mod tests {
             marker_valid: None,
         }
     }
-    const DEST: [u8; 25] = [
+    pub(crate) const DEST: [u8; 25] = [
         0x76, 0xa9, 0x14, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
         0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x88, 0xac,
     ];

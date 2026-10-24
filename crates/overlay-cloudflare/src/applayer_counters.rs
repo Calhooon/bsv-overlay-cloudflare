@@ -39,7 +39,7 @@ const OWED_READ_FAULT_KINDS: [&str; 9] = [
     "sweep_proofs",
     "markerless",
 ];
-const RECORD_REFUSAL_CLASSES: [&str; 22] = [
+const RECORD_REFUSAL_CLASSES: [&str; 23] = [
     "bad_kind",
     "bad_script_hex",
     "body_too_large",
@@ -62,6 +62,8 @@ const RECORD_REFUSAL_CLASSES: [&str; 22] = [
     "handfile_inconsistent",
     "settle_signature_invalid",
     "hop_marker_refuted",
+    // bsv-low #663: a hop sweep filed under another game than its hop's
+    "sweep_game_mismatch",
     "bad_body",
 ];
 const AUTH_REFUSAL_REASONS: [&str; 19] = [

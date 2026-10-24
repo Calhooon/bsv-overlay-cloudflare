@@ -300,6 +300,8 @@ pub enum RecordRefusal {
     SettleSignatureInvalid,
     /// bsv-low #848: the hop the index holds does not pay the batch's settle key the sats the payload names.
     HopMarkerRefuted,
+    /// bsv-low #663: the hop sweep names another game than the hop's own verified marker row.
+    SweepGameMismatch,
 }
 
 impl From<crate::hopsweep::SweepRefusal> for RecordRefusal {
@@ -310,6 +312,7 @@ impl From<crate::hopsweep::SweepRefusal> for RecordRefusal {
             S::HopMarkerUnverified => Self::HopMarkerUnverified,
             S::SweepDoesNotSpendTheHop => Self::SweepDoesNotSpendTheHop,
             S::SweepNotTheSeatsSpend => Self::SweepNotTheSeatsSpend,
+            S::SweepGameMismatch => Self::SweepGameMismatch,
         }
     }
 }
@@ -349,6 +352,9 @@ impl RecordRefusal {
             Self::SweepNotTheSeatsSpend => {
                 "the hop sweep is not the seat's spend of the hop (the unlock must be the seat's canonical signature over the hop's own lock and value, then the seat's settle key)"
             }
+            Self::SweepGameMismatch => {
+                "the hop sweep names another game than the hop's own marker (the filing's gameId must be the hop's)"
+            }
             Self::HandfileShape => {
                 "a handfile is {hopTxid: 64 hex, payloads: [4 hex], identitySigHex, settleSigHex}"
             }
@@ -382,6 +388,7 @@ impl RecordRefusal {
             | Self::RefundNotThePresignedSpend
             | Self::SweepDoesNotSpendTheHop
             | Self::SweepNotTheSeatsSpend
+            | Self::SweepGameMismatch
             | Self::HandfileInconsistent
             | Self::SettleSignatureInvalid
             | Self::HopMarkerRefuted => 422,
@@ -408,6 +415,7 @@ impl RecordRefusal {
             Self::HopMarkerUnverified => "hop_marker_unverified",
             Self::SweepDoesNotSpendTheHop => "sweep_does_not_spend_the_hop",
             Self::SweepNotTheSeatsSpend => "sweep_not_the_seats_spend",
+            Self::SweepGameMismatch => "sweep_game_mismatch",
             Self::HandfileShape => "handfile_shape",
             Self::HandfilePayloadNotAMarker => "handfile_payload_not_a_marker",
             Self::HandfileInconsistent => "handfile_inconsistent",
@@ -416,7 +424,7 @@ impl RecordRefusal {
         }
     }
     /// Every refusal, in declaration order (the durable names' list).
-    pub const ALL: [RecordRefusal; 21] = [
+    pub const ALL: [RecordRefusal; 22] = [
         Self::BadKind,
         Self::BadScriptHex,
         Self::BodyTooLarge,
@@ -438,6 +446,7 @@ impl RecordRefusal {
         Self::HandfileInconsistent,
         Self::SettleSignatureInvalid,
         Self::HopMarkerRefuted,
+        Self::SweepGameMismatch,
     ];
 }
 
@@ -1424,13 +1433,30 @@ pub const POTREFUND_LATCH_SQL: &str = "UPDATE potrefund_records SET refundValid 
 // claim, 2 for the countersigned), collected by the door re-running the filed
 // path's signature check over each chain row's `sigHex`
 // ([`own_collected_chain_rows`], at most `COLLECTED_CHAIN_SIGS_READ` rows: past
-// them the filing proceeds, never a no-op on rows not checked). A row that does
-// not verify is no no-op: the filing goes on to the caps and writes its own.
+// them the filing proceeds, never a no-op on rows not checked), and potrefund
+// (bsv-low #798) by the filed path's WHOLE bar over each chain row of the
+// filing's pot outpoint: the marker signature under the identity AND the raw
+// bound to the pot as its pre-signed spend by both committed settle keys
+// ([`potrefund_chain_row_is_own`]; with the pot not indexed no chain row is
+// valid, so a rank-0 filing writes), each such row latched `refundValid = 1`
+// before the no-op answers. A row that does not verify is no no-op: the filing
+// goes on to the caps and writes its own. Hopsweep rows have no chain writer.
 pub const POTPARTY_CHAIN_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM potparty_records \
      WHERE identity = ?1 AND gameId = ?2 AND potTxid = ?3 AND txid NOT LIKE 'filed:%' \
        AND (seatSettlePubkey IS NULL) = CAST(?4 AS INTEGER) AND sigValid = 1";
-pub const POTREFUND_CHAIN_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM potrefund_records \
-     WHERE identity = ?1 AND gameId = ?2 AND potTxid = ?3 AND txid NOT LIKE 'filed:%'";
+/// The potrefund chain rows themselves, not a count (bsv-low #798): the door verifies each
+/// ([`potrefund_chain_row_is_own`]). BINDS: (poster, gameId, potTxid, potVout).
+pub const POTREFUND_CHAIN_ROWS_SQL: &str =
+    "SELECT txid, outputIndex, refundRawHex, sigHex FROM potrefund_records \
+     WHERE identity = ?1 AND gameId = ?2 AND potTxid = ?3 AND potVout = CAST(?4 AS INTEGER) \
+       AND txid NOT LIKE 'filed:%' LIMIT 16";
+/// The `LIMIT` of [`POTREFUND_CHAIN_ROWS_SQL`]: the most chain rows one filing verifies (past them the filing
+/// proceeds, never a no-op on rows not checked).
+pub const POTREFUND_CHAIN_ROWS_READ: usize = 16;
+/// bsv-low #798: a potrefund CHAIN row the door verified as the poster's own pre-signed refund takes the verdict a
+/// filed row takes ([`POTREFUND_LATCH_SQL`]'s), keyed by its own outpoint, before the no-op answers. Never demotes.
+pub const POTREFUND_CHAIN_LATCH_SQL: &str = "UPDATE potrefund_records SET refundValid = 1 \
+     WHERE txid = ?1 AND outputIndex = CAST(?2 AS INTEGER) AND COALESCE(refundValid, 0) = 0";
 pub const RESULT_CHAIN_ROWS_SQL: &str = "SELECT COUNT(*) AS n FROM result_markers_v2 \
      WHERE winner = ?1 AND gameId = ?2 AND potTxid = ?3 AND txid NOT LIKE 'filed:%' \
        AND (loserSigHex IS NULL) = CAST(?4 AS INTEGER) \
@@ -1457,6 +1483,121 @@ pub fn own_collected_chain_rows(
         .count() as i64
 }
 
+/// One potrefund chain row as [`POTREFUND_CHAIN_ROWS_SQL`] reads it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PotrefundChainRow {
+    pub txid: String,
+    #[serde(rename = "outputIndex")]
+    pub output_index: f64,
+    #[serde(rename = "refundRawHex", default)]
+    pub refund_raw_hex: Option<String>,
+    #[serde(rename = "sigHex", default)]
+    pub sig_hex: Option<String>,
+}
+
+/// bsv-low #798: is this chain row (of the filing's identity, game and pot outpoint) VALID for the filing's own
+/// binding? The filed path's whole bar over the row's stored bytes: its marker signature verifies under the
+/// identity (canonical DER, over `potrefund_challenge` of the row's refund raw) AND its raw is the pot's pre-signed
+/// spend by both committed settle keys ([`bind_refund_backup`] = rank 1). With the pot not indexed nothing is rank
+/// 1, so no chain row is valid and the filing writes its own (rank 0). A presence-only row (`tm_potrefund` admits by
+/// byte format) is never valid.
+pub fn potrefund_chain_row_is_own(
+    filing: &PotrefundRecord,
+    row: &PotrefundChainRow,
+    pot: Option<&PotContext>,
+) -> bool {
+    let (Some(raw_hex), Some(sig_hex)) = (&row.refund_raw_hex, &row.sig_hex) else {
+        return false;
+    };
+    let raw_hex = raw_hex.to_ascii_lowercase();
+    let (Ok(raw), Ok(sig), Ok(id), Ok(gid), Ok(pot_txid)) = (
+        hex::decode(&raw_hex),
+        hex::decode(sig_hex),
+        hex::decode(&filing.identity),
+        hex::decode(&filing.game_id),
+        hex::decode(&filing.pot_txid),
+    ) else {
+        return false;
+    };
+    let (Ok(gid), Ok(pot_txid)) = (
+        <[u8; 32]>::try_from(gid.as_slice()),
+        <[u8; 32]>::try_from(pot_txid.as_slice()),
+    ) else {
+        return false;
+    };
+    let challenge = potrefund_challenge(&id, &gid, &pot_txid, filing.pot_vout, &raw);
+    if !canonical_anyone_sig_verifies(
+        &filing.identity,
+        &filing.game_id,
+        &challenge,
+        &sig,
+        potrefund_protocol(),
+    ) {
+        return false;
+    }
+    let as_filed = PotrefundRecord {
+        refund_raw_hex: raw_hex,
+        ..filing.clone()
+    };
+    bind_refund_backup(&as_filed, pot) == Ok(true)
+}
+
+/// bsv-low #798: the chain rows read for a refund filing split into the poster's own (their outpoints, to latch) and
+/// how many did not verify (counted). At most [`POTREFUND_CHAIN_ROWS_READ`] rows are judged.
+pub fn own_potrefund_chain_rows(
+    filing: &PotrefundRecord,
+    rows: &[PotrefundChainRow],
+    pot: Option<&PotContext>,
+) -> (Vec<(String, u32)>, u64) {
+    let mut own = Vec::new();
+    let mut unverified = 0u64;
+    for row in rows.iter().take(POTREFUND_CHAIN_ROWS_READ) {
+        if potrefund_chain_row_is_own(filing, row, pot) {
+            own.push((row.txid.clone(), row.output_index.max(0.0) as u32));
+        } else {
+            unverified += 1;
+        }
+    }
+    (own, unverified)
+}
+
+/// bsv-low #798: the potrefund chain no-op through the port, shared by the direct door and the handfile arm. Reads
+/// the chain rows of the filing's (identity, game, pot outpoint), judges each by the filed path's bar, LATCHES every
+/// own row `refundValid = 1` (one batch) and counts the rest; answers how many own rows there are (`> 0` = the
+/// no-op). The latch runs before the caller answers.
+pub(crate) async fn potrefund_chain_noop<P: crate::pot_hook::SqlPort>(
+    port: &P,
+    filing: &PotrefundRecord,
+    pot: Option<&PotContext>,
+) -> std::result::Result<i64, String> {
+    let (sql, binds) = chain_rows_query(&VerifiedRecord::Potrefund(filing.clone(), false))
+        .expect("a refund backup has a chain no-op");
+    let out = port_one(port, stmt(sql, binds.iter().map(|s| text(s)).collect())).await?;
+    let rows: Vec<PotrefundChainRow> = out
+        .rows
+        .into_iter()
+        .filter_map(|r| serde_json::from_value(r).ok())
+        .collect();
+    let (own, unverified) = own_potrefund_chain_rows(filing, &rows, pot);
+    if unverified > 0 {
+        POTREFUND_CHAIN_ROWS_UNVERIFIED.fetch_add(unverified, Ordering::Relaxed);
+    }
+    if !own.is_empty() {
+        port.run_batch(
+            own.iter()
+                .map(|(txid, vout)| {
+                    stmt(
+                        POTREFUND_CHAIN_LATCH_SQL,
+                        vec![text(txid), int(i64::from(*vout))],
+                    )
+                })
+                .collect(),
+        )
+        .await?;
+    }
+    Ok(own.len() as i64)
+}
+
 /// The chain no-op statement and its binds for a verified record (a pure
 /// value, for the same reason as [`cap_queries`]). `None` for a held filing
 /// (bsv-low #492): the chain never holds one, and the v1 marker a chain row
@@ -1480,7 +1621,12 @@ pub fn chain_rows_query(v: &VerifiedRecord) -> Option<(&'static str, Vec<String>
         ),
         VerifiedRecord::Potrefund(r, _) => (
             POTREFUND_CHAIN_ROWS_SQL,
-            vec![r.identity.clone(), r.game_id.clone(), r.pot_txid.clone()],
+            vec![
+                r.identity.clone(),
+                r.game_id.clone(),
+                r.pot_txid.clone(),
+                r.pot_vout.to_string(),
+            ],
         ),
         VerifiedRecord::Result(r, _) => (
             RESULT_CHAIN_ROWS_SQL,
@@ -1639,6 +1785,8 @@ static ALREADY_FILED_BY_KIND: [AtomicU64; RECORD_KINDS] =
 static REFUNDS_FILED_UNBOUND: AtomicU64 = AtomicU64::new(0);
 /// Rank-0 refund rows latched to rank 1 by a later re-file.
 static REFUNDS_LATCHED_LATER: AtomicU64 = AtomicU64::new(0);
+/// bsv-low #798: potrefund chain rows a refund filing read that did not verify as the poster's own (never a no-op).
+static POTREFUND_CHAIN_ROWS_UNVERIFIED: AtomicU64 = AtomicU64::new(0);
 static ANONYMOUS_FILED_BY_KIND: [AtomicU64; RECORD_KINDS] =
     [const { AtomicU64::new(0) }; RECORD_KINDS];
 
@@ -1697,6 +1845,7 @@ pub fn record_health_json() -> serde_json::Value {
         "anonymousFiledByKind": by_kind(&ANONYMOUS_FILED_BY_KIND),
         "refundsFiledUnbound": REFUNDS_FILED_UNBOUND.load(Ordering::Relaxed),
         "refundsLatchedLater": REFUNDS_LATCHED_LATER.load(Ordering::Relaxed),
+        "potrefundChainRowsUnverified": POTREFUND_CHAIN_ROWS_UNVERIFIED.load(Ordering::Relaxed),
         "filedRowsCap": {
             "potparty": filed_rows_cap(RecordKind::Potparty),
             "potrefund": filed_rows_cap(RecordKind::Potrefund),
@@ -2003,8 +2152,9 @@ pub(crate) async fn file_verified<P: crate::pot_hook::SqlPort>(
     // marker's own signature verified (no free read for a stranger): the
     // bind is rank 1 (the pre-signed spend), rank 0 (the pot not indexed
     // yet), or a refusal.
+    let mut pot = None;
     if let VerifiedRecord::Potrefund(r, refund_valid) = verified {
-        let pot = port_pot_context(port, &r.pot_txid, r.pot_vout).await?;
+        pot = port_pot_context(port, &r.pot_txid, r.pot_vout).await?;
         *refund_valid = match bind_refund_backup(r, pot.as_ref()) {
             Ok(v) => v,
             Err(refusal) => return Ok(DoorOutcome::Refused(refusal)),
@@ -2024,6 +2174,9 @@ pub(crate) async fn file_verified<P: crate::pot_hook::SqlPort>(
     // identity — nothing to add, nothing written, nothing counted.
     // A chain row counts only when it verifies as the poster's own (#564).
     let chain_rows = match (chain_rows_query(verified), verified) {
+        (Some(_), VerifiedRecord::Potrefund(r, _)) => {
+            potrefund_chain_noop(port, r, pot.as_ref()).await?
+        }
         (Some((chain_sql, chain_binds)), VerifiedRecord::Collected(r)) => {
             let out = port_one(
                 port,
@@ -4116,5 +4269,433 @@ pub(crate) mod tests {
             &conn,
             &VerifiedRecord::Result(w25c_result(Some("3045"), "filed:r2"), 2)
         ));
+    }
+
+    // ── MONEY-DOOR (bsv-low #798, #663): real filings through the SHIPPED door core over real SQLite ──
+
+    /// The overlay's own chain writer for `potrefund_records` (`d1_discovery.rs`, `store_record`), verbatim.
+    const OVERLAY_POTREFUND_STORE_SQL: &str = "INSERT OR IGNORE INTO potrefund_records \
+             (identity, gameId, potTxid, potVout, refundRawHex, \
+              sigHex, txid, outputIndex, createdAt) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    /// A statement's words, whether read from a literal or from its Rust source (line continuations dropped).
+    fn md_flat(s: &str) -> String {
+        s.replace('\\', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The fixture's covenant pot, held by the index as the overlay decodes it (`paramsDecoded = 1`).
+    fn md_index_the_pot(db: &crate::pot_hook::tests::SqliteSql) {
+        let p = pot_params();
+        db.conn
+            .execute(
+                "INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind, paramsDecoded, pubA, pubB, \
+                 pubTower, payPkhA, payPkhB, rakePkh, stakeA, stakeB, feeSats, recoveryHeight, potSats) \
+                 VALUES (?1, 0, 0, 1, 'covenant', 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    hex::encode(POT_TXID),
+                    hex::encode(p.pub_a),
+                    hex::encode(p.pub_b),
+                    hex::encode(p.pub_tower),
+                    hex::encode(p.pay_pkh_a),
+                    hex::encode(p.pay_pkh_b),
+                    hex::encode(p.rake_pkh),
+                    p.stake_a as i64,
+                    p.stake_b as i64,
+                    p.fee_sats as i64,
+                    p.recovery_height as i64,
+                    POT_SATS as i64
+                ],
+            )
+            .unwrap();
+    }
+
+    /// The victim's seat on the pot (the party window `/refund-backups` is driven from).
+    fn md_seat(db: &crate::pot_hook::tests::SqliteSql, id_lc: &str, gid: &[u8; 32]) {
+        db.conn
+            .execute(
+                POTPARTY_FILE_SQL,
+                rusqlite::params![
+                    id_lc,
+                    "02".to_string() + &"bb".repeat(32),
+                    hex::encode(gid),
+                    hex::encode(POT_TXID),
+                    0,
+                    900_000,
+                    "3044",
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    "filed:seat",
+                    0,
+                    1_000,
+                    1
+                ],
+            )
+            .unwrap();
+    }
+
+    /// A chain marker admitted the way the overlay admits one: `tm_potrefund`'s byte-format check, then the
+    /// overlay's own `store_record` statement, at `created_at`.
+    fn md_chain_admit(
+        db: &crate::pot_hook::tests::SqliteSql,
+        script: &[u8],
+        txid: &str,
+        created_at: i64,
+    ) {
+        let out = bsv_rs::transaction::TransactionOutput {
+            satoshis: Some(0),
+            locking_script: bsv_rs::script::LockingScript::from_binary(script).unwrap(),
+            change: false,
+        };
+        assert!(
+            overlay_discovery::potrefund::topic_manager::PotrefundTopicManager::validate_potrefund_output(&out),
+            "tm_potrefund admits the marker by its bytes"
+        );
+        let m = parse_potrefund_marker(script).unwrap();
+        db.conn
+            .execute(
+                OVERLAY_POTREFUND_STORE_SQL,
+                rusqlite::params![
+                    hex::encode(&m.identity),
+                    hex::encode(m.game_id),
+                    hex::encode(m.pot_txid),
+                    m.pot_vout,
+                    hex::encode(&m.refund_raw),
+                    hex::encode(&m.sig),
+                    txid,
+                    0,
+                    created_at
+                ],
+            )
+            .unwrap();
+    }
+
+    /// A stranger's `LOW/potrefund`-shaped marker naming the victim's identity, game and pot: a junk signature
+    /// (DER-ranged, never the victim's) over a junk refund raw.
+    fn md_junk_marker(victim_id: &[u8], gid: &[u8; 32]) -> Vec<u8> {
+        let mut junk_sig = vec![0x30, 0x44, 0x02, 0x20];
+        junk_sig.extend_from_slice(&[0x11; 32]);
+        junk_sig.extend_from_slice(&[0x02, 0x20]);
+        junk_sig.extend_from_slice(&[0x22; 32]);
+        script(&[
+            b"LOW/potrefund/v1",
+            victim_id,
+            gid,
+            &POT_TXID,
+            &0u32.to_le_bytes(),
+            &junk_refund_raw(&POT_TXID, 0),
+            &junk_sig,
+        ])
+    }
+
+    async fn md_file(
+        db: &crate::pot_hook::tests::SqliteSql,
+        kind: RecordKind,
+        script: &[u8],
+        poster: &str,
+    ) -> (DoorOutcome, VerifiedRecord) {
+        let mut v = verify_record_post(kind, script, poster).expect("the marker verifies");
+        let out = file_verified(db, &mut v, poster, 2_000).await.unwrap();
+        (out, v)
+    }
+
+    fn md_refund_rows(db: &crate::pot_hook::tests::SqliteSql) -> Vec<(String, Option<i64>)> {
+        let mut q = db
+            .conn
+            .prepare("SELECT txid, refundValid FROM potrefund_records ORDER BY rowid")
+            .unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .collect()
+    }
+
+    /// `/refund-backups`' shipped read for the identity: (txid, refundValid) in its served order.
+    fn md_served(
+        db: &crate::pot_hook::tests::SqliteSql,
+        id_lc: &str,
+    ) -> Vec<(String, Option<i64>)> {
+        let mut q = db
+            .conn
+            .prepare(&crate::refund_backups::refund_backups_sql(None))
+            .unwrap();
+        q.query_map([id_lc], |r| {
+            Ok((
+                r.get::<_, String>("txid")?,
+                r.get::<_, Option<i64>>("refundValid")?,
+            ))
+        })
+        .unwrap()
+        .map(|x| x.unwrap())
+        .collect()
+    }
+
+    fn md_unverified_seen() -> u64 {
+        record_health_json()["potrefundChainRowsUnverified"]
+            .as_u64()
+            .unwrap_or(0)
+    }
+
+    /// #798: a stranger's junk-signed `LOW/potrefund` chain marker naming the victim never makes the victim's own
+    /// VALID refund backup a no-op: the valid filing is written, latched `refundValid = 1` and served first by
+    /// `/refund-backups`; the planted row is counted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn money_door_798_a_junk_chain_marker_never_swallows_the_victims_valid_backup() {
+        assert!(
+            md_flat(include_str!("../../overlay-cloudflare/src/d1_discovery.rs"))
+                .contains(&md_flat(OVERLAY_POTREFUND_STORE_SQL)),
+            "the planted row is written by the overlay's own chain statement"
+        );
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        let victim = wallet(0x41);
+        let id = identity(&victim);
+        let id_lc = hex::encode(&id);
+        let gid = [0x7au8; 32];
+        md_index_the_pot(&db);
+        md_seat(&db, &id_lc, &gid);
+        let planted_txid = "a1".repeat(32);
+        md_chain_admit(&db, &md_junk_marker(&id, &gid), &planted_txid, 5_000);
+        let seen_before = md_unverified_seen();
+        let filing = potrefund_script(&victim, &gid, &presigned_refund());
+        let (out, v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        assert_eq!(
+            (out, matches!(v, VerifiedRecord::Potrefund(_, true))),
+            (DoorOutcome::Written { row_written: true }, true),
+            "the victim's valid backup is written at rank 1, never the chain no-op"
+        );
+        let rows = md_refund_rows(&db);
+        assert_eq!(
+            rows,
+            vec![(planted_txid.clone(), None), (v.key().to_string(), Some(1))],
+            "the filed row latched refundValid = 1 beside the planted row"
+        );
+        let served = md_served(&db, &id_lc);
+        assert_eq!(
+            served.first(),
+            Some(&(v.key().to_string(), Some(1))),
+            "/refund-backups serves the victim's valid backup first: {served:?}"
+        );
+        assert!(
+            md_unverified_seen() > seen_before,
+            "the planted row is counted"
+        );
+        // the cap counts honest need only: a second valid content of the same (poster, game, pot) is refused,
+        // the planted chain row never counted
+        let k = pot_keys();
+        let other = spend_signed_by(&k[0], &k[1], 0xffff_fffd, 900_000);
+        let (out, _) = md_file(
+            &db,
+            RecordKind::Potrefund,
+            &potrefund_script(&victim, &gid, &other),
+            &id_lc,
+        )
+        .await;
+        assert_eq!(out, DoorOutcome::Refused(RecordRefusal::TooManyFiled));
+    }
+
+    /// #798's controls: the identity's own VALID chain row is still the no-op (and is latched before the answer),
+    /// a second filing of the same content is the idempotent write, a valid-signed chain row whose raw is not the
+    /// pot's pre-signed spend is no no-op, and a rank-0 filing latches when the pot lands.
+    #[tokio::test(flavor = "current_thread")]
+    async fn money_door_798_b_a_valid_existing_row_is_still_the_no_op() {
+        let victim = wallet(0x42);
+        let id = identity(&victim);
+        let id_lc = hex::encode(&id);
+        let gid = [0x7bu8; 32];
+        let filing = potrefund_script(&victim, &gid, &presigned_refund());
+
+        // the identity's own chain marker (the same bytes, bought on chain), the pot indexed
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        md_index_the_pot(&db);
+        md_seat(&db, &id_lc, &gid);
+        let own_txid = "b1".repeat(32);
+        md_chain_admit(&db, &md_junk_marker(&id, &gid), &"b0".repeat(32), 6_000);
+        md_chain_admit(&db, &filing, &own_txid, 1_500);
+        let (out, _) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        assert_eq!(
+            out,
+            DoorOutcome::AlreadyIndexed,
+            "the valid chain row is the no-op"
+        );
+        assert_eq!(
+            md_refund_rows(&db),
+            vec![("b0".repeat(32), None), (own_txid.clone(), Some(1))],
+            "no filed row beside it; the verified chain row is latched before the answer"
+        );
+        assert_eq!(
+            md_served(&db, &id_lc).first(),
+            Some(&(own_txid.clone(), Some(1))),
+            "the latched chain row is served first"
+        );
+
+        // the same content filed twice: one row, rank 1 (idempotent by content)
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        md_index_the_pot(&db);
+        let (first, v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        let (second, _) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        assert_eq!(first, DoorOutcome::Written { row_written: true });
+        assert_eq!(second, DoorOutcome::Written { row_written: true });
+        assert_eq!(md_refund_rows(&db), vec![(v.key().to_string(), Some(1))]);
+
+        // a chain row the victim signed whose raw is NOT the pot's pre-signed spend: no no-op
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        md_index_the_pot(&db);
+        md_chain_admit(
+            &db,
+            &potrefund_script(&victim, &gid, &junk_refund_raw(&POT_TXID, 0)),
+            &"c1".repeat(32),
+            1_500,
+        );
+        let (out, v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        assert_eq!(out, DoorOutcome::Written { row_written: true });
+        assert_eq!(
+            md_refund_rows(&db),
+            vec![("c1".repeat(32), None), (v.key().to_string(), Some(1))]
+        );
+
+        // the pot not indexed: the filing is rank 0 (a junk row beside it no no-op either), then latched by the
+        // re-file once the pot lands
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        md_chain_admit(&db, &md_junk_marker(&id, &gid), &"d1".repeat(32), 1_500);
+        let (out, v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        assert_eq!(out, DoorOutcome::Written { row_written: true });
+        assert_eq!(
+            md_refund_rows(&db),
+            vec![("d1".repeat(32), None), (v.key().to_string(), Some(0))]
+        );
+        md_index_the_pot(&db);
+        let (out, _) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        assert_eq!(out, DoorOutcome::Written { row_written: true });
+        assert_eq!(
+            md_refund_rows(&db),
+            vec![("d1".repeat(32), None), (v.key().to_string(), Some(1))]
+        );
+        // the handfile arm takes the same chain decision (no presence-only count of its own)
+        let handfile: String = include_str!("handfile.rs").split_whitespace().collect();
+        assert!(handfile.contains(
+            "crate::record_post::potrefund_chain_noop(&port,&verified.potrefund,pot.as_ref())"
+        ));
+        assert!(!handfile.contains("(HandfileSlot::Potrefund,&refund)"));
+    }
+
+    /// The hop's marker row as the index holds it (the shipped hopparty write), `markerValid` as given.
+    fn md_index_the_hop(
+        db: &crate::pot_hook::tests::SqliteSql,
+        hop: &crate::hopsweep::HopContext,
+        marker_valid: Option<i64>,
+    ) {
+        db.conn
+            .execute(
+                crate::handfile::HOPPARTY_HANDFILE_FILE_SQL,
+                rusqlite::params![
+                    hop.identity,
+                    hop.opponent_identity,
+                    hop.game_id,
+                    hop.hop_vout,
+                    hop.hop_sats as i64,
+                    hop.seat_settle_pubkey,
+                    "3044",
+                    hop.identity_sig_hex,
+                    hop.hop_lock_hex,
+                    hop.hop_sats_on_chain.map(|v| v as i64),
+                    2,
+                    hex::encode(crate::hopsweep::tests::HOP),
+                    1,
+                    1_000,
+                    marker_valid
+                ],
+            )
+            .unwrap();
+    }
+
+    fn md_sweep_script(id: &[u8], gid: &[u8; 32], raw: &[u8]) -> Vec<u8> {
+        crate::hopsweep::tests::script(&[
+            crate::hopsweep::HOPSWEEP_TAG,
+            id,
+            gid,
+            &crate::hopsweep::tests::HOP,
+            &0u32.to_le_bytes(),
+            raw,
+        ])
+    }
+
+    /// #663: a hop sweep filing's gameId is compared to the hop's own row in EVERY arm (the overlay's latched
+    /// `markerValid` and the replay alike): a verified sweep filed under another game is refused by name, never
+    /// written (it was written, so the per-(poster, game, hop) cap of 2 was bought again under every game id).
+    #[tokio::test(flavor = "current_thread")]
+    async fn money_door_663_a_sweep_filed_under_another_game_is_refused_by_name() {
+        use crate::hopsweep::tests as hs;
+        let w = hs::wallet(0x43);
+        let id = hs::identity(&w);
+        let id_lc = hex::encode(&id);
+        let seat = hs::skey(12);
+        let raw = hs::sweep_raw(&seat, &seat, 0, hs::HOP_SATS, &hs::DEST);
+        // three of the seat's sweeps of the one hop, to three homes (three contents)
+        let (mut dest2, mut dest3) = (hs::DEST, hs::DEST);
+        dest2[3] = 0x12;
+        dest3[3] = 0x13;
+        let other = hs::sweep_raw(&seat, &seat, 0, hs::HOP_SATS, &dest2);
+        let third = hs::sweep_raw(&seat, &seat, 0, hs::HOP_SATS, &dest3);
+        let wrong_game = [0x99u8; 32];
+        for latch in [Some(1i64), None] {
+            let db = crate::pot_hook::tests::SqliteSql::migrated();
+            md_index_the_hop(&db, &hs::hop_ctx(&w, &seat, true), latch);
+            let (out, _) = md_file(
+                &db,
+                RecordKind::Hopsweep,
+                &md_sweep_script(&id, &wrong_game, &raw),
+                &id_lc,
+            )
+            .await;
+            assert_eq!(
+                format!("{out:?}"),
+                "Refused(SweepGameMismatch)",
+                "markerValid {latch:?}: the wrong game is refused by name"
+            );
+            let n: i64 = db
+                .conn
+                .query_row("SELECT COUNT(*) FROM hopsweep_records", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "markerValid {latch:?}: nothing written");
+            // the honest control: the hop's own game files, twice (its cap), and the third is the cap
+            for (k, r) in [&raw, &other].into_iter().enumerate() {
+                let (out, _) = md_file(
+                    &db,
+                    RecordKind::Hopsweep,
+                    &md_sweep_script(&id, &hs::GID, r),
+                    &id_lc,
+                )
+                .await;
+                assert_eq!(
+                    out,
+                    DoorOutcome::Written { row_written: true },
+                    "{latch:?} {k}"
+                );
+            }
+            let (out, _) = md_file(
+                &db,
+                RecordKind::Hopsweep,
+                &md_sweep_script(&id, &hs::GID, &third),
+                &id_lc,
+            )
+            .await;
+            assert_eq!(out, DoorOutcome::Refused(RecordRefusal::TooManyFiled));
+            // ... and no other game id buys the cap again
+            let (out, _) = md_file(
+                &db,
+                RecordKind::Hopsweep,
+                &md_sweep_script(&id, &wrong_game, &third),
+                &id_lc,
+            )
+            .await;
+            assert_eq!(
+                format!("{out:?}"),
+                "Refused(SweepGameMismatch)",
+                "markerValid {latch:?}: past the cap under another game"
+            );
+        }
     }
 }
