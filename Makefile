@@ -11,7 +11,7 @@
 ADMIN_TOKEN ?= parity-harness-token
 export ADMIN_TOKEN
 
-.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ci-d1-board ownership app-layer-door \
+.PHONY: parity reference-up reference-down reference-logs fmt-check ci-route ci-deploy ci-d1-budget ci-d1-board ownership app-layer-door \
         wrangler-dev harness test e2e-bsv-storage clean help
 
 help:
@@ -24,6 +24,7 @@ help:
 	@echo "  harness          Run parity-harness once (assumes services are up)"
 	@echo "  test             cargo test of BOTH workspaces (root: engine crates + harness; workers/: the LOW workers)"
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
+	@echo "  fmt-check        cargo fmt --check over BOTH workspaces, the root and workers/Cargo.toml (the first leg of ci; bsv-low #664)"
 	@echo "  ownership        The storage ownership check (bsv-low #474): every SQL statement against storage-ownership.json (part of ci)"
 	@echo "  ci-route         Route-level /submit + /arc-ingest + /requestForeignGASPNodes cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799, and :LANE_BASE+11, +12 for NL-6c and NL-6d)"
 	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; ports: :LANE_BASE+9 app layer, +10 overlay, +11 the e649 delivering overlay, +12 its mock app layer, +13 to +15 their inspectors, +16 the #831 retire overlay (also the #837 discovery-pass cell's), +17 its inspector, +18 its courier stand-in)"
@@ -120,6 +121,7 @@ test:
 # exit code, never the build's.
 ci:
 	@set -e; \
+	$(MAKE) fmt-check; \
 	bash scripts/check-config-ids.sh --self-test; \
 	bash scripts/check-config-ids.sh; \
 	python3 scripts/check-storage-ownership.py --self-test; \
@@ -151,6 +153,21 @@ app-layer-door:
 ownership:
 	@python3 scripts/check-storage-ownership.py --self-test
 	@python3 scripts/check-storage-ownership.py
+
+# bsv-low #664: the fmt gate over BOTH workspaces, the FIRST leg of `ci`. The
+# root's `cargo fmt --all --check` never reaches `workers/Cargo.toml` (its own
+# workspace, its own lock), so the workers' drift came back after the fmt-only
+# commit of 2026-10-14 (192 hunks on db3a0931 by 2026-10-24) while the gate
+# stayed green. Both checks run before the leg refuses, so one run names every
+# file of both workspaces that `cargo fmt --all` (with and without $(WORKERS))
+# would rewrite: rustfmt's `-l` prints the file list in place of the hunks; for
+# the hunks run `cargo fmt --all --check` and `cargo fmt --all --check $(WORKERS)`.
+fmt-check:
+	@red=0; \
+	cargo fmt --all --check -- -l || { echo "fmt-check: the ROOT workspace is not rustfmt-clean (the files above); run: cargo fmt --all"; red=1; }; \
+	cargo fmt --all --check $(WORKERS) -- -l || { echo "fmt-check: the WORKERS workspace is not rustfmt-clean (the files above); run: cargo fmt --all $(WORKERS)"; red=1; }; \
+	[ "$$red" = 0 ] || exit 1; \
+	echo "fmt-check: both workspaces rustfmt-clean"
 
 # ROUTE-LEVEL coverage for the #347 submit gate AND `/arc-ingest` bearer-auth
 # (Rule 22). PART OF `ci`.
