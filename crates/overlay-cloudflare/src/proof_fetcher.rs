@@ -35,7 +35,9 @@
 mod diagnostics;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod fix834;
-use crate::courier_counters::{Counters as CourierCounters, Outcome as CourierOutcome, Attempt as CourierAttempt};
+use crate::courier_counters::{
+    Attempt as CourierAttempt, Counters as CourierCounters, Outcome as CourierOutcome,
+};
 pub(crate) use diagnostics::{ProofProbe, PROOF_RUNGS};
 
 use overlay_engine::beef_limits;
@@ -948,10 +950,13 @@ impl ChainProofFetcher {
                     if let Some(c) = &self.courier_counters {
                         c.could_not_look(name);
                     }
-                    return RungCall::Fault(format!("{name}: could not look ({})", match &answer {
-                        Err(e) => e.as_str(),
-                        Ok(_) => "HTTP 404: pruned Bitails does not hold the tx",
-                    }));
+                    return RungCall::Fault(format!(
+                        "{name}: could not look ({})",
+                        match &answer {
+                            Err(e) => e.as_str(),
+                            Ok(_) => "HTTP 404: pruned Bitails does not hold the tx",
+                        }
+                    ));
                 }
                 let outcome = CourierOutcome::response(
                     status,
@@ -977,7 +982,11 @@ impl ChainProofFetcher {
 /// PURE (bsv-low #834): is this Bitails spend answer "could not look"? The pruned node's `spent: ""` for an output
 /// it keeps no spend data for, and its 404 for a tx it does not hold (an unmined one). Only the per-output spend
 /// rung (`bitails_tx`); the history rung's answers are its own.
-pub(crate) fn bitails_could_not_look<T>(rung: &str, status: u16, answer: &Result<Option<T>, String>) -> bool {
+pub(crate) fn bitails_could_not_look<T>(
+    rung: &str,
+    status: u16,
+    answer: &Result<Option<T>, String>,
+) -> bool {
     rung == "bitails_tx"
         && match answer {
             Err(e) => e == BITAILS_PRUNED_NO_SPEND,
@@ -1366,7 +1375,8 @@ pub fn parse_arcade_proof_look(status: u16, body: &str, now_ms: i64) -> ArcadePr
         .unwrap_or("")
         .trim()
         .to_ascii_uppercase();
-    match crate::door_words::proof_class(crate::door_words::arcade_hint(&tx_status, "", 0).as_ref()) {
+    match crate::door_words::proof_class(crate::door_words::arcade_hint(&tx_status, "", 0).as_ref())
+    {
         crate::door_words::ProofClass::Mined => {
             return match parse_arcade_merklepath(body) {
                 Some(bump_hex) => ArcadeProofLook::Mined(bump_hex),
@@ -1564,7 +1574,14 @@ async fn http_get_counted(
 ) -> (Result<(u16, String), String>, Option<CourierAttempt>) {
     // bsv-low #834: a paced pass (the janitor's) asks its pacer first; a skip is no subrequest and no attempt.
     if let Some(Err(skip)) = counters.map(|c| c.pace(rung)) {
-        return (Err(format!("{PACED_SKIP} ({} {})", crate::courier_counters::provider(rung), skip.name())), None);
+        return (
+            Err(format!(
+                "{PACED_SKIP} ({} {})",
+                crate::courier_counters::provider(rung),
+                skip.name()
+            )),
+            None,
+        );
     }
     if let Err(error) = overlay_engine::meter::courier_request() {
         return (Err(error.to_string()), None);
@@ -4594,12 +4611,18 @@ pub(crate) async fn arcade_look_counted(
                 extra_info: String,
             }
             match serde_json::from_str::<Look>(&body) {
-                Ok(l) => (live_arcade_look(&l.tx_status, l.extra_info), CourierOutcome::Ok),
+                Ok(l) => (
+                    live_arcade_look(&l.tx_status, l.extra_info),
+                    CourierOutcome::Ok,
+                ),
                 _ => (ArcadeLook::Fault, CourierOutcome::Shape),
             }
         }
         Ok((404, _)) => (ArcadeLook::Missing, CourierOutcome::NotFound),
-        Ok((status, _)) => (ArcadeLook::Fault, CourierOutcome::response(status, false, false)),
+        Ok((status, _)) => (
+            ArcadeLook::Fault,
+            CourierOutcome::response(status, false, false),
+        ),
         Err(_) => (ArcadeLook::Fault, CourierOutcome::Fault),
     };
     CourierAttempt::set(&mut observation, outcome);
@@ -4615,7 +4638,10 @@ pub(crate) async fn arcade_look_counted(
 /// bsv-low #619 (L3): the word as the tracker's hint, the look the host's
 /// policy over it (`door_words::live_look`).
 pub fn live_arcade_look(tx_status: &str, extra_info: String) -> ArcadeLook {
-    crate::door_words::live_look(crate::door_words::arcade_hint(tx_status, "", 0).as_ref(), extra_info)
+    crate::door_words::live_look(
+        crate::door_words::arcade_hint(tx_status, "", 0).as_ref(),
+        extra_info,
+    )
 }
 
 /// PURE: the live Arcade answer wins; webhook evidence only fills a FAULT, as [`ArcadeLook::Recorded`] (its own
@@ -5672,7 +5698,8 @@ pub(crate) async fn run_retire_pass(
         counters: counters.clone(),
     };
     let budget = RetireBudget::begin(&port);
-    let conflict = crate::admit_fast::confirmed_conflict_pass(db, woc_api_key, sources, counters).await;
+    let conflict =
+        crate::admit_fast::confirmed_conflict_pass(db, woc_api_key, sources, counters).await;
     let mut summary = RetireSummary {
         conflict,
         ..RetireSummary::default()
@@ -6481,7 +6508,10 @@ pub(crate) mod tests {
                 .await;
             let rows = door.take();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[&format!("courier_door_bitails_{door_outcome}_total")], 1);
+            assert_eq!(
+                rows[&format!("courier_door_bitails_{door_outcome}_total")],
+                1
+            );
         }
     }
 
@@ -6496,7 +6526,9 @@ pub(crate) mod tests {
         let pruned = r#"{"outputs":[{"index":0,"spent":""}]}"#;
         TEST_HTTP_RESPONSES.with(|r| r.borrow_mut().insert(url.clone(), (200, pruned.into())));
         let call = fetcher
-            .call_rung("bitails_tx", &url, None, |s, b| parse_bitails_tx_spend_body(s, b, &txid, 0))
+            .call_rung("bitails_tx", &url, None, |s, b| {
+                parse_bitails_tx_spend_body(s, b, &txid, 0)
+            })
             .await;
         // The ladder keeps "could not look"; the courier family counts it apart (bsv-low #834: `couldnotlook`,
         // outside the cell's asks), and it is no fault on the legacy tally either.
@@ -7140,7 +7172,13 @@ pub(crate) mod tests {
         }
         // bsv-low #845: Arcade's ranks below SEEN are a hint, never presence; the #836 fold's L3: so are its two words
         // that carry no network verdict
-        for w in ["RECEIVED", "sent_to_network", "ACCEPTED_BY_NETWORK", "PENDING_RETRY", "unknown"] {
+        for w in [
+            "RECEIVED",
+            "sent_to_network",
+            "ACCEPTED_BY_NETWORK",
+            "PENDING_RETRY",
+            "unknown",
+        ] {
             assert_eq!(
                 live_arcade_look(w, x()),
                 ArcadeLook::Holding(w.to_ascii_uppercase()),

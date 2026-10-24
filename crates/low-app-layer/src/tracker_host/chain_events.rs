@@ -1637,9 +1637,20 @@ mod pins {
                 tip: Ok(0),
                 headers: BTreeMap::new(),
             };
-            let _ = raw.step(&PARAMS, &none, Input::Evidence(Evidence::Chain(event.clone())));
-            assert_eq!(raw.reask(), Some(&Reask::Recheck), "{envelope}: the crate's 0.7.0 answer");
-            assert!(matches!(raw.word(), Word::Mined(_)), "{envelope}: no stale mark without a header");
+            let _ = raw.step(
+                &PARAMS,
+                &none,
+                Input::Evidence(Evidence::Chain(event.clone())),
+            );
+            assert_eq!(
+                raw.reask(),
+                Some(&Reask::Recheck),
+                "{envelope}: the crate's 0.7.0 answer"
+            );
+            assert!(
+                matches!(raw.word(), Word::Mined(_)),
+                "{envelope}: no stale mark without a header"
+            );
             assert_eq!(
                 reask_of(&row, &event),
                 Some(Reask::Reorg { fork_height: 101 }),
@@ -1658,13 +1669,21 @@ mod pins {
             )]),
         };
         let mut same = row.restored_state().unwrap();
-        same.step(&PARAMS, &at(&txid(101)), Input::Evidence(Evidence::Chain(event.clone())))
-            .unwrap();
+        same.step(
+            &PARAMS,
+            &at(&txid(101)),
+            Input::Evidence(Evidence::Chain(event.clone())),
+        )
+        .unwrap();
         assert!(matches!(same.word(), Word::Mined(_)), "the same root holds");
         assert_eq!(same.reask(), None, "the same root: the marks clear");
         let mut moved = row.restored_state().unwrap();
         moved
-            .step(&PARAMS, &at(&txid(9_999)), Input::Evidence(Evidence::Chain(event)))
+            .step(
+                &PARAMS,
+                &at(&txid(9_999)),
+                Input::Evidence(Evidence::Chain(event)),
+            )
             .unwrap();
         assert!(matches!(moved.word(), Word::Stale), "a moved root is stale");
         assert_eq!(moved.reask(), Some(&Reask::Reorg { fork_height: 101 }));
@@ -2139,7 +2158,10 @@ mod pins {
         let health = &health[..health.find("\n}\n").unwrap()];
         assert!(health.contains("chain_events::health_served(&sql).await"));
         assert!(!health.contains("chain_events::health_json()"));
-        assert!(!health.contains("chain_events::health_read("), "the route reads through the memo");
+        assert!(
+            !health.contains("chain_events::health_read("),
+            "the route reads through the memo"
+        );
         let src = include_str!("chain_events.rs");
         let feed = &src[src.find("impl Feed for BindingFeed").unwrap()
             ..src.find("pub struct WorkerReasks").unwrap()];
@@ -2598,7 +2620,11 @@ mod pins {
         db.now.set(1_000_000);
         let a = block(health_served(&db));
         assert_eq!(
-            (a["source"].clone(), a["cursor"].clone(), a["memoAgeMs"].clone()),
+            (
+                a["source"].clone(),
+                a["cursor"].clone(),
+                a["memoAgeMs"].clone()
+            ),
             (json!("d1"), json!("20084"), json!(0)),
             "{a}"
         );
@@ -2610,7 +2636,11 @@ mod pins {
             "two reads inside the TTL: one D1 batch"
         );
         assert_eq!(
-            (b["source"].clone(), b["cursor"].clone(), b["memoAgeMs"].clone()),
+            (
+                b["source"].clone(),
+                b["cursor"].clone(),
+                b["memoAgeMs"].clone()
+            ),
             (json!("d1"), json!("20084"), json!(5_000)),
             "{b}"
         );

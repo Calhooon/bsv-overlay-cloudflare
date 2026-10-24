@@ -23,20 +23,20 @@ pub mod beef_blob_sweep;
 pub mod broadcaster;
 pub mod chain_feed;
 pub mod chain_tracker;
-pub mod concurrent;
 pub mod change_flush;
 pub mod change_park;
+pub mod concurrent;
 pub mod conflict_repair;
+/// bsv-low #635 (B-COST-1): the cost bar served on `/health/invariants.costBar`.
+pub mod cost_bar;
 pub mod d1;
 pub mod d1_discovery;
 pub mod d1_ledger;
-/// bsv-low #635 (B-COST-1): the cost bar served on `/health/invariants.costBar`.
-pub mod cost_bar;
 pub mod d1_storage;
-pub mod door_words;
 pub mod dead_letters;
 pub mod derived_board;
 pub mod derived_hops;
+pub mod door_words;
 pub mod ef;
 pub mod ef_deferred;
 pub mod error;
@@ -56,6 +56,7 @@ pub mod mainnet_fanout;
 // out-of-band migration emitter. NEVER part of the wasm32 Worker build — it
 // is host tooling (std::fs, the example `emit-migrations`), gated off wasm32
 // so `worker-build` and the wasm32 gate never see it.
+mod courier_counters;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod migration_emitter;
 pub mod ops;
@@ -71,7 +72,6 @@ pub mod routes;
 pub mod ship_lookup;
 pub mod submit_census;
 mod submit_counters;
-mod courier_counters;
 pub mod submit_gate;
 pub mod submit_refusals;
 mod tick;
@@ -1533,7 +1533,8 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
         crate::courier_counters::Reader::Janitor,
         worker::Date::now().as_millis(),
     );
-    let completion_fetcher = transaction_proof_fetcher(env).with_courier_counters(courier_counts.clone());
+    let completion_fetcher =
+        transaction_proof_fetcher(env).with_courier_counters(courier_counts.clone());
     let backstop_age = crate::proof_fetcher::PUSH_BACKSTOP_MIN_AGE_SECS;
     let (tx_completed, tx_fetch_failed, tx_early_gasp) =
         match overlay_engine::gasp::race_or_deadline(
@@ -1565,10 +1566,12 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
     // 2+3. Pot-store maintenance — chaser BEFORE the pot-beef bulk drain,
     //    encoded once in run_pot_maintenance (bsv-low#304 gate M-5; same
     //    order as the scheduled tick). Own fetchers, own budget cells.
-    let spend_fetcher = courier_fetcher(env, lookup_service_chain_tracker(env)).with_budget(20)
+    let spend_fetcher = courier_fetcher(env, lookup_service_chain_tracker(env))
+        .with_budget(20)
         .with_courier_counters(courier_counts.clone());
     let pot_tracker = lookup_service_chain_tracker(env);
-    let pot_fetcher = courier_fetcher(env, pot_tracker).with_courier_counters(courier_counts.clone());
+    let pot_fetcher =
+        courier_fetcher(env, pot_tracker).with_courier_counters(courier_counts.clone());
     let (ss, ps) = crate::proof_fetcher::run_pot_maintenance(
         pot_storage.as_ref(),
         &spend_fetcher,
@@ -2190,15 +2193,25 @@ mod tests {
     #[test]
     fn obs_625_fold_l3_complete_proofs_flushes_its_couriers_after_the_answer() {
         let src = include_str!("lib.rs");
-        let prod = &src[..src.find("#[cfg(test)]\n#[allow(clippy::unwrap_used, clippy::expect_used)]\nmod tests").unwrap()];
-        assert!(prod.contains("\"/admin/complete-proofs\" => admin_complete_proofs(&env, &ctx).await,"));
+        let prod = &src[..src
+            .find("#[cfg(test)]\n#[allow(clippy::unwrap_used, clippy::expect_used)]\nmod tests")
+            .unwrap()];
+        assert!(
+            prod.contains("\"/admin/complete-proofs\" => admin_complete_proofs(&env, &ctx).await,")
+        );
         let body = &prod[prod.find("async fn admin_complete_proofs(").unwrap()..];
         let body = &body[..body.find("\n}\n").unwrap()];
-        assert!(!body.contains("\n    courier_counts.flush(&ops_db).await;"), "no inline flush");
+        assert!(
+            !body.contains("\n    courier_counts.flush(&ops_db).await;"),
+            "no inline flush"
+        );
         let flush = body
             .find("ctx.wait_until(async move { courier_counts.flush(&ops_db).await });")
             .expect("the flush rides wait_until");
-        assert!(flush > body.find("answer[\"change_parked\"]").unwrap(), "after the answer is built");
+        assert!(
+            flush > body.find("answer[\"change_parked\"]").unwrap(),
+            "after the answer is built"
+        );
     }
 
     struct RegisteredTopicRemote;

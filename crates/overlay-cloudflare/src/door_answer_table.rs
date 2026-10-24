@@ -126,7 +126,10 @@ fn table() -> String {
             row(
                 &format!("evidence_woc_holds_young_{young}"),
                 w,
-                format!("{:?}", evidence_verdict(&live, Some(false), Some(true), young)),
+                format!(
+                    "{:?}",
+                    evidence_verdict(&live, Some(false), Some(true), young)
+                ),
             );
             row(
                 &format!("evidence_fault_young_{young}"),
@@ -155,7 +158,10 @@ fn table() -> String {
             row(
                 &format!("proof_look_{shape}"),
                 w,
-                format!("{:?}", parse_arcade_proof_look(200, &body.to_string(), now_ms)),
+                format!(
+                    "{:?}",
+                    parse_arcade_proof_look(200, &body.to_string(), now_ms)
+                ),
             );
         }
         let push = serde_json::json!({"txid": TXID, "txStatus": w}).to_string();
@@ -175,9 +181,11 @@ fn table() -> String {
             let outcome = classify_submit_response(http as u16, &raw);
             row("vector_submit", name, format!("{outcome:?}"));
             match submit_entry(outcome) {
-                SubmitEntry::Step(step) => {
-                    row("vector_submit_ladder", name, format!("{:?}", ladder_step(step, TXID)))
-                }
+                SubmitEntry::Step(step) => row(
+                    "vector_submit_ladder",
+                    name,
+                    format!("{:?}", ladder_step(step, TXID)),
+                ),
                 other => row("vector_submit_entry", name, format!("{other:?}")),
             }
         }
@@ -192,8 +200,16 @@ fn table() -> String {
             format!("{:?}", classify_arc_ingest_body(&raw)),
         );
         if let Some(word) = case["body"]["txStatus"].as_str() {
-            row("vector_gate", name, format!("{:?}", classify_arcade_status(word)));
-            row("vector_callback", name, format!("{:?}", callback_action(word)));
+            row(
+                "vector_gate",
+                name,
+                format!("{:?}", classify_arcade_status(word)),
+            );
+            row(
+                "vector_callback",
+                name,
+                format!("{:?}", callback_action(word)),
+            );
         }
     }
 
@@ -230,7 +246,11 @@ fn table() -> String {
         let input = format!("{http} {body}");
         row("submit", &input, format!("{outcome:?}"));
         if let SubmitEntry::Step(step) = submit_entry(outcome) {
-            row("submit_ladder", &input, format!("{:?}", ladder_step(step, TXID)));
+            row(
+                "submit_ladder",
+                &input,
+                format!("{:?}", ladder_step(step, TXID)),
+            );
         }
     }
     for step in [
@@ -324,7 +344,14 @@ fn table() -> String {
                     &format!("{p:?} young={young} {status} {extra}"),
                     format!(
                         "{:?}",
-                        terminal_at_arcade_by_presence(p, young, TXID, status, extra, &crate::door_words::LockBound::default())
+                        terminal_at_arcade_by_presence(
+                            p,
+                            young,
+                            TXID,
+                            status,
+                            extra,
+                            &crate::door_words::LockBound::default()
+                        )
                     ),
                 );
             }

@@ -1393,7 +1393,10 @@ mod tests {
         let lib = strip(&lib[..lib.find("#[cfg(test)]").unwrap_or(lib.len())]);
         let reply = &lib[lib.find("auth::FrontDoor::Reply(mutresp)=>{").unwrap()..];
         let reply = &reply[..reply.find("returnOk(resp);").unwrap()];
-        assert!(reply.contains("flush_counters_if_due(&ctx,&env);"), "{reply}");
+        assert!(
+            reply.contains("flush_counters_if_due(&ctx,&env);"),
+            "{reply}"
+        );
         assert!(lib.contains("courier::take_pending_if_due("));
     }
 

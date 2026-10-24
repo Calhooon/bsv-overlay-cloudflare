@@ -347,7 +347,11 @@ fn w16_645_the_seen_total_is_the_count_and_the_read_counts_nothing() {
         "aa".repeat(32),
         "bb".repeat(32),
     ] {
-        db.execute(NETWORK_SEEN_INSERT_SQL, rusqlite::params![txid, "arcade", 1_i64]).unwrap();
+        db.execute(
+            NETWORK_SEEN_INSERT_SQL,
+            rusqlite::params![txid, "arcade", 1_i64],
+        )
+        .unwrap();
         assert_eq!(served(&db), count(&db));
     }
     assert_eq!(

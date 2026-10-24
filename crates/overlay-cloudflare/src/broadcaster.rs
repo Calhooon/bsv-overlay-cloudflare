@@ -132,9 +132,14 @@ pub(crate) fn witness_look_of(
 /// PURE (bsv-low #836 fold, the lens's M1): the watch's look under the chain's bound: a `NotFinal` past it
 /// (`door_words::not_final_holds`) is Arcade's `Fatal` word again, and the watch runs its evidence check; every other
 /// look is itself.
-pub(crate) fn bound_witness_look(look: WitnessLook, bound: &crate::door_words::LockBound) -> WitnessLook {
+pub(crate) fn bound_witness_look(
+    look: WitnessLook,
+    bound: &crate::door_words::LockBound,
+) -> WitnessLook {
     match look {
-        WitnessLook::NotFinal(status, extra, nf) if !crate::door_words::not_final_holds(&nf, bound) => {
+        WitnessLook::NotFinal(status, extra, nf)
+            if !crate::door_words::not_final_holds(&nf, bound) =>
+        {
             WitnessLook::Fatal(status, extra)
         }
         look => look,
@@ -888,8 +893,9 @@ fn accepting_corroborator(
     taal: &Result<ArcOutcome, String>,
     gorillapool: Option<&Result<ArcOutcome, String>>,
 ) -> Option<crate::ops::SeenSource> {
-    named_accept(taal, crate::ops::SeenSource::Taal)
-        .or_else(|| gorillapool.and_then(|gp| named_accept(gp, crate::ops::SeenSource::GorillaPool)))
+    named_accept(taal, crate::ops::SeenSource::Taal).or_else(|| {
+        gorillapool.and_then(|gp| named_accept(gp, crate::ops::SeenSource::GorillaPool))
+    })
 }
 
 /// PURE (#216): corroborate a subject WITH its ancestry. Feed each ANCESTOR ef
@@ -1539,10 +1545,12 @@ pub(crate) fn probe_answer(
     if !matches!(classify_arcade_status(&p.tx_status), GateVerdict::Reached) {
         return None;
     }
-    Some(match probe_seen(p.timestamp.as_deref(), now_ms, evicted_at_ms) {
-        ProbeSeen::Pending => Ok(ArcOutcome::AcceptedPending(subject_txid.to_string())),
-        ProbeSeen::StoredUnderEviction => Err(STORED_ECHO_UNDER_EVICTION.into()),
-    })
+    Some(
+        match probe_seen(p.timestamp.as_deref(), now_ms, evicted_at_ms) {
+            ProbeSeen::Pending => Ok(ArcOutcome::AcceptedPending(subject_txid.to_string())),
+            ProbeSeen::StoredUnderEviction => Err(STORED_ECHO_UNDER_EVICTION.into()),
+        },
+    )
 }
 
 /// The pending arm's log words (the B-DOOR-3 lens's L2): a witnessed-mode pending admission on a stored Reached echo
@@ -1551,13 +1559,19 @@ pub(crate) fn pending_admission_words(fast_answer: bool, duplicate_echo: bool) -
     match (fast_answer, duplicate_echo) {
         (true, true) => "the fast answer on a stored Reached echo",
         (true, false) => "the fast answer",
-        (false, true) => "a stored Reached echo: the pre-flight probe (#636) or a standing duplicate (#637)",
+        (false, true) => {
+            "a stored Reached echo: the pre-flight probe (#636) or a standing duplicate (#637)"
+        }
         (false, false) => "tracker lagging, corroborator inconclusive (#397)",
     }
 }
 
 /// PURE (bsv-low #636): the probe's stored SEEN, judged by its stamp against the open eviction, if any.
-pub(crate) fn probe_seen(stamp: Option<&str>, now_ms: i64, evicted_at_ms: Option<i64>) -> ProbeSeen {
+pub(crate) fn probe_seen(
+    stamp: Option<&str>,
+    now_ms: i64,
+    evicted_at_ms: Option<i64>,
+) -> ProbeSeen {
     if submit_echo_is_fresh(stamp, now_ms, evicted_at_ms) {
         ProbeSeen::Pending
     } else {
@@ -2198,7 +2212,8 @@ pub fn terminal_at_arcade_by_presence(
     // bsv-low #836: Arcade's non-final word (REJECTED naming TX_LOCK_TIME (35)) is a time, never a verdict: mined
     // presence admits as for every terminal word; anything else is the retryable answer, never a 422. The fold (the
     // lens's M1): only while the chain's bound holds; past it the word is judged as every terminal word below.
-    if let Some(nf) = crate::door_words::lock_time_not_final_under(arcade_status, extra_info, bound) {
+    if let Some(nf) = crate::door_words::lock_time_not_final_under(arcade_status, extra_info, bound)
+    {
         return match presence {
             NetworkPresence::Present { height: Some(_) } => {
                 Ok(ArcOutcome::Accepted(subject_txid.to_string()))
@@ -2437,7 +2452,8 @@ impl TerminalJudgement {
     ) -> Self {
         let judged = Self::of(presence, young, capped);
         if judged != TerminalJudgement::Present
-            && crate::door_words::lock_time_not_final_under(arcade_status, extra_info, bound).is_some()
+            && crate::door_words::lock_time_not_final_under(arcade_status, extra_info, bound)
+                .is_some()
         {
             TerminalJudgement::NotFinal
         } else {
@@ -2710,9 +2726,17 @@ impl ArcadeBroadcaster {
 
     /// bsv-low #836 fold: Arcade's word as the door's non-final answer, under the chain's bound (the tip is asked
     /// only when the text names TX_LOCK_TIME).
-    async fn not_final_now(&self, tx_status: &str, extra_info: &str) -> Option<crate::door_words::NotFinal> {
+    async fn not_final_now(
+        &self,
+        tx_status: &str,
+        extra_info: &str,
+    ) -> Option<crate::door_words::NotFinal> {
         crate::door_words::lock_time_not_final(tx_status, extra_info)?;
-        crate::door_words::lock_time_not_final_under(tx_status, extra_info, &self.lock_bound().await)
+        crate::door_words::lock_time_not_final_under(
+            tx_status,
+            extra_info,
+            &self.lock_bound().await,
+        )
     }
 
     pub(crate) fn with_courier_counters(
@@ -2892,10 +2916,17 @@ impl ArcadeBroadcaster {
         if !allowed {
             return (NetworkPresence::Inconclusive, "capped");
         }
-        let bitails = self.proof_sources.bitails_presence_counted(txid, self.courier_counters.as_ref()).await;
+        let bitails = self
+            .proof_sources
+            .bitails_presence_counted(txid, self.courier_counters.as_ref())
+            .await;
         let woc = self
             .proof_sources
-            .woc_presence_counted(self.woc_api_key.as_deref(), txid, self.courier_counters.as_ref())
+            .woc_presence_counted(
+                self.woc_api_key.as_deref(),
+                txid,
+                self.courier_counters.as_ref(),
+            )
             .await;
         // bsv-low #619 (L3): each courier's answer as the tracker's hint from its source, folded by the host's
         // two-source bar; `terminal_at_arcade_by_presence` is the host's policy over the fold
@@ -3044,7 +3075,8 @@ impl ArcadeBroadcaster {
         let host = self.corroborator_url.clone();
         // bsv-low #621: the LAST call's accepting broadcaster; the subject's verdict is always the last call
         // (subject-first's accept returns at once; otherwise the primed subject closes the walk)
-        let last_by: std::rc::Rc<std::cell::Cell<Option<crate::ops::SeenSource>>> = Default::default();
+        let last_by: std::rc::Rc<std::cell::Cell<Option<crate::ops::SeenSource>>> =
+            Default::default();
         let walk = corroborate_batch_with(efs, subject_txid, self.legs, |tx_hex| {
             let key = key.clone();
             let host = host.clone();
@@ -3215,7 +3247,10 @@ impl ArcadeBroadcaster {
         // REJECTED and never re-validates it ("resubmit after the locktime expires"); past the chain's bound the
         // door re-feeds the subject ONCE an isolate, subject only, never registering a callback, and reads Arcade
         // again: a SEEN then takes the pre-flight accept below, anything else is judged as every terminal word
-        if let Some(fresh) = self.refeed_past_lock_bound(&probe, subject_txid, subject_ef).await {
+        if let Some(fresh) = self
+            .refeed_past_lock_bound(&probe, subject_txid, subject_ef)
+            .await
+        {
             probe = Some(fresh);
         }
         let probe_is_subject = probe
@@ -3228,10 +3263,15 @@ impl ArcadeBroadcaster {
         // minute bound: a stored SEEN older than the eviction, unstamped, or stamped after it but past the bound is
         // the stored echo's 502 (the B-DOOR-3 lens's M1: for the last no door path readmits until its MINED push or
         // the operator; counted `stored_echo_under_eviction`)
-        if let Some(answer) =
-            self.take_probe(probe.as_ref(), subject_txid, worker::Date::now().as_millis() as i64)
-        {
-            let stamp = probe.as_ref().and_then(|r| r.timestamp.as_deref()).unwrap_or("no stamp");
+        if let Some(answer) = self.take_probe(
+            probe.as_ref(),
+            subject_txid,
+            worker::Date::now().as_millis() as i64,
+        ) {
+            let stamp = probe
+                .as_ref()
+                .and_then(|r| r.timestamp.as_deref())
+                .unwrap_or("no stamp");
             gate_log(&match &answer {
                 Ok(_) => format!(
                     "[arcade] {subject_txid} already >= {ARCADE_GATE_STATUS} (pre-flight probe, stored at {stamp}): ladder + callback re-registration skipped; admitted PENDING, the pending watch owns the latch (#636)"
@@ -3280,11 +3320,12 @@ impl ArcadeBroadcaster {
                 self.terminal_remember(subject_txid, presence, young, started);
             }
             // bsv-low #836 fold: the chain's bound, asked only when Arcade's text names TX_LOCK_TIME
-            let bound = if crate::door_words::lock_time_not_final(probe_status, extra_info).is_some() {
-                self.lock_bound().await
-            } else {
-                crate::door_words::LockBound::default()
-            };
+            let bound =
+                if crate::door_words::lock_time_not_final(probe_status, extra_info).is_some() {
+                    self.lock_bound().await
+                } else {
+                    crate::door_words::LockBound::default()
+                };
             let judgement = TerminalJudgement::of_word(
                 presence,
                 young,
@@ -3475,8 +3516,9 @@ impl ArcadeBroadcaster {
                     GateVerdict::Fatal => {
                         // bsv-low #836: a non-final word is "not now" at the door: the retryable answer, never a
                         // resubmit's corroborated 422, never an admission
-                        if let Some(nf) =
-                            self.not_final_now(&parsed.tx_status, &parsed.extra_info).await
+                        if let Some(nf) = self
+                            .not_final_now(&parsed.tx_status, &parsed.extra_info)
+                            .await
                         {
                             self.terminal_judged.set(Some(TerminalJudgement::NotFinal));
                             return Err(lock_time_not_final_answer(
@@ -3667,7 +3709,9 @@ impl ArcadeBroadcaster {
                         // bsv-low #621: Arcade's polled SEEN names the latch, at its own stamp
                         self.note_witness(
                             Some(crate::ops::SeenSource::Arcade),
-                            resp.timestamp.as_deref().and_then(crate::proof_fetcher::rfc3339_utc_ms),
+                            resp.timestamp
+                                .as_deref()
+                                .and_then(crate::proof_fetcher::rfc3339_utc_ms),
                         );
                         return Ok(GateStep::Accepted);
                     }
@@ -3676,7 +3720,8 @@ impl ArcadeBroadcaster {
                         // (reason ONLY — the gate above already decided on status).
                         stamp(&self.poll_ms);
                         // bsv-low #836: the one exception, a non-final word: "not now", the retryable answer
-                        if let Some(nf) = self.not_final_now(&resp.tx_status, &resp.extra_info).await
+                        if let Some(nf) =
+                            self.not_final_now(&resp.tx_status, &resp.extra_info).await
                         {
                             self.terminal_judged.set(Some(TerminalJudgement::NotFinal));
                             return Err(lock_time_not_final_answer(txid, &resp.tx_status, &nf));
@@ -3738,7 +3783,11 @@ impl ArcadeBroadcaster {
                 if r.txid.eq_ignore_ascii_case(txid)
                     && matches!(classify_arcade_status(&r.tx_status), GateVerdict::Reached) =>
             {
-                Some(r.timestamp.as_deref().and_then(crate::proof_fetcher::rfc3339_utc_ms))
+                Some(
+                    r.timestamp
+                        .as_deref()
+                        .and_then(crate::proof_fetcher::rfc3339_utc_ms),
+                )
             }
             _ => None,
         }
@@ -3759,9 +3808,15 @@ impl ArcadeBroadcaster {
         subject_txid: &str,
         subject_ef: Option<&EfTx>,
     ) -> Option<ArcadeStatusResponse> {
-        let p = probe.as_ref().filter(|r| r.txid.eq_ignore_ascii_case(subject_txid))?;
+        let p = probe
+            .as_ref()
+            .filter(|r| r.txid.eq_ignore_ascii_case(subject_txid))?;
         crate::door_words::lock_time_not_final(&p.tx_status, &p.extra_info)?;
-        if self.not_final_now(&p.tx_status, &p.extra_info).await.is_some() {
+        if self
+            .not_final_now(&p.tx_status, &p.extra_info)
+            .await
+            .is_some()
+        {
             return None;
         }
         let leg = subject_ef?;
@@ -5830,9 +5885,20 @@ mod tests {
             }
         }
         let guarded = &post[open..close.expect("the guard's end")];
-        for header in ["headers.set(\"X-CallbackToken\",token)", "headers.set(\"X-CallbackUrl\",cb)"] {
-            assert_eq!(guarded.matches(header).count(), 1, "{header} under the guard");
-            assert_eq!(post.matches(header).count(), 1, "{header} only under the guard");
+        for header in [
+            "headers.set(\"X-CallbackToken\",token)",
+            "headers.set(\"X-CallbackUrl\",cb)",
+        ] {
+            assert_eq!(
+                guarded.matches(header).count(),
+                1,
+                "{header} under the guard"
+            );
+            assert_eq!(
+                post.matches(header).count(),
+                1,
+                "{header} only under the guard"
+            );
         }
         assert_eq!(post.matches("X-Callback").count(), 2);
         assert_eq!(batch.matches("self.post_ef_raw(").count(), 1);
@@ -5854,7 +5920,9 @@ mod tests {
             1,
         );
         assert_ne!(source, mutant);
-        assert!(std::panic::catch_unwind(|| assert_registering_posts_are_single_tx(&mutant)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| assert_registering_posts_are_single_tx(&mutant)).is_err()
+        );
     }
 
     /// The W1-OBS lens's LOW-4: a mutant that drops `post_ef_raw`'s
@@ -5880,8 +5948,8 @@ mod tests {
 
     #[test]
     fn submit_612_corroboration_failure_has_a_fixed_answer_reason() {
-        let error = corroborated_accept_claim(Err("provider detail".into()), "subject")
-            .unwrap_err();
+        let error =
+            corroborated_accept_claim(Err("provider detail".into()), "subject").unwrap_err();
         assert_eq!(
             crate::submit_counters::Reason::broadcast(&error),
             crate::submit_counters::Reason::CorroboratorUnconfirmed,
@@ -6583,23 +6651,33 @@ mod tests {
             ProbeSeen::StoredUnderEviction
         );
         // unstamped, or an unreadable stamp, under an eviction: not a readmission
-        assert_eq!(probe_seen(None, now, Some(evicted)), ProbeSeen::StoredUnderEviction);
-        assert_eq!(probe_seen(Some("bad"), now, Some(evicted)), ProbeSeen::StoredUnderEviction);
+        assert_eq!(
+            probe_seen(None, now, Some(evicted)),
+            ProbeSeen::StoredUnderEviction
+        );
+        assert_eq!(
+            probe_seen(Some("bad"), now, Some(evicted)),
+            ProbeSeen::StoredUnderEviction
+        );
         // stamped after the eviction, inside the bound: goes on, pending
         assert_eq!(
             probe_seen(Some("2026-10-23T01:55:00Z"), now, Some(evicted)),
             ProbeSeen::Pending
         );
         // no eviction: the stored SEEN admits pending however old
-        assert_eq!(probe_seen(Some("2026-10-22T01:00:00Z"), now, None), ProbeSeen::Pending);
+        assert_eq!(
+            probe_seen(Some("2026-10-22T01:00:00Z"), now, None),
+            ProbeSeen::Pending
+        );
         assert_eq!(probe_seen(None, now, None), ProbeSeen::Pending);
 
         // the shipped probe arm: judged by `probe_seen` over the open eviction, answering pending or the stored
         // echo's 502, never `Accepted` and never naming a latch
         let src = include_str!("broadcaster.rs");
         let gated = &src[src.find("pub async fn broadcast_efs_gated<Y>(").unwrap()..];
-        let arm = &gated[gated.find("let mut probe = self.tx_status(subject_txid).await;").unwrap()
-            ..gated.find("// TERMINAL AT ARCADE").unwrap()];
+        let arm = &gated[gated
+            .find("let mut probe = self.tx_status(subject_txid).await;")
+            .unwrap()..gated.find("// TERMINAL AT ARCADE").unwrap()];
         let decide = &src[src.find("pub(crate) fn probe_answer(").unwrap()..];
         let decide = &decide[..decide.find("\n}\n").unwrap()];
         let step = &src[src.find("pub(crate) fn take_probe(").unwrap()..];
@@ -6609,16 +6687,27 @@ mod tests {
         assert!(decide.contains("Ok(ArcOutcome::AcceptedPending(subject_txid.to_string()))"));
         assert!(decide.contains("Err(STORED_ECHO_UNDER_EVICTION.into())"));
         for text in [arm, decide, step] {
-            assert!(!text.contains("note_witness("), "the probe's stored SEEN names no latch");
-            assert!(!text.contains("ArcOutcome::Accepted("), "the probe's stored SEEN is never a witnessed accept");
+            assert!(
+                !text.contains("note_witness("),
+                "the probe's stored SEEN names no latch"
+            );
+            assert!(
+                !text.contains("ArcOutcome::Accepted("),
+                "the probe's stored SEEN is never a witnessed accept"
+            );
         }
         // the route: a pending answer starts the watch and readmits only through the open eviction it read
         let route = include_str!("routes.rs");
         let pending = &route[route
             .find("Ok(crate::broadcaster::ArcOutcome::AcceptedPending(pending)) =>")
             .unwrap()..];
-        let pending = &pending[..pending.find("Ok(crate::broadcaster::ArcOutcome::Rejected(reason))").unwrap()];
-        assert!(!pending.contains("latch_network_seen"), "a pending admission latches nothing");
+        let pending = &pending[..pending
+            .find("Ok(crate::broadcaster::ArcOutcome::Rejected(reason))")
+            .unwrap()];
+        assert!(
+            !pending.contains("latch_network_seen"),
+            "a pending admission latches nothing"
+        );
         assert!(pending.contains("pending_watch_job("));
     }
 
@@ -6638,19 +6727,41 @@ mod tests {
                 },
             )
             .await;
-            assert!(out.is_err(), "the ladder's own answer is unchanged: {out:?}");
+            assert!(
+                out.is_err(),
+                "the ladder's own answer is unchanged: {out:?}"
+            );
         }
         // the decision
-        assert!(duplicate_of_a_standing_admission(true, true, false, false, true));
-        assert!(!duplicate_of_a_standing_admission(true, true, false, false, false), "not standing: the #267 bar");
-        assert!(!duplicate_of_a_standing_admission(true, true, false, true, true), "an open eviction: #612");
-        assert!(!duplicate_of_a_standing_admission(true, true, true, false, true), "the fast mode");
-        assert!(!duplicate_of_a_standing_admission(true, false, false, false, true), "a conflict or no duplicate");
-        assert!(!duplicate_of_a_standing_admission(false, true, false, false, true), "an answer that stood");
+        assert!(duplicate_of_a_standing_admission(
+            true, true, false, false, true
+        ));
+        assert!(
+            !duplicate_of_a_standing_admission(true, true, false, false, false),
+            "not standing: the #267 bar"
+        );
+        assert!(
+            !duplicate_of_a_standing_admission(true, true, false, true, true),
+            "an open eviction: #612"
+        );
+        assert!(
+            !duplicate_of_a_standing_admission(true, true, true, false, true),
+            "the fast mode"
+        );
+        assert!(
+            !duplicate_of_a_standing_admission(true, false, false, false, true),
+            "a conflict or no duplicate"
+        );
+        assert!(
+            !duplicate_of_a_standing_admission(false, true, false, false, true),
+            "an answer that stood"
+        );
 
         let src = include_str!("broadcaster.rs");
         let gated = &src[src.find("pub async fn broadcast_efs_gated<Y>(").unwrap()..];
-        let closure = &gated[gated.find("CorroborationKind::MinedClaim => match mined_subject_raw").unwrap()
+        let closure = &gated[gated
+            .find("CorroborationKind::MinedClaim => match mined_subject_raw")
+            .unwrap()
             ..gated.find("self.legs_paused.set(paused);").unwrap()];
         assert!(
             closure.contains("if self.duplicate_echo.get() && answer.is_err() {")
@@ -6658,18 +6769,30 @@ mod tests {
             "only an inconclusive corroboration after a duplicate echo marks the claim unconfirmed"
         );
         let route = include_str!("routes.rs");
-        let arm = &route[route.find("let duplicate_echo = arcade.duplicate_echo();").unwrap()
-            ..route.find("corroborate_ms = arcade.corroborate_ms();").unwrap()];
+        let arm = &route[route
+            .find("let duplicate_echo = arcade.duplicate_echo();")
+            .unwrap()
+            ..route
+                .find("corroborate_ms = arcade.corroborate_ms();")
+                .unwrap()];
         assert!(arm.contains("crate::broadcaster::standing_duplicate_answer("));
         assert!(arm.contains("duplicate_unconfirmed: arcade.duplicate_echo_unconfirmed(),"));
-        assert!(arm.contains("open_eviction: door_open.is_some(),") && arm.contains("fast_answer: admit_fast,"));
+        assert!(
+            arm.contains("open_eviction: door_open.is_some(),")
+                && arm.contains("fast_answer: admit_fast,")
+        );
         assert!(arm.contains("crate::admit_fast::index_holds_admission(&db, &subject_txid).await"));
-        assert!(!arm.contains("latch_network_seen"), "the ack latches nothing");
+        assert!(
+            !arm.contains("latch_network_seen"),
+            "the ack latches nothing"
+        );
         // the read is the #413 belt's two statements, a fault being "no"
         let jobs = include_str!("admit_fast.rs");
         assert!(route.contains(crate::admit_fast::STANDING_ADMISSION_SQL[0]));
         assert!(route.contains(crate::admit_fast::STANDING_ADMISSION_SQL[1]));
-        let read = &jobs[jobs.find("pub(crate) async fn index_holds_admission(").unwrap()..];
+        let read = &jobs[jobs
+            .find("pub(crate) async fn index_holds_admission(")
+            .unwrap()..];
         let read = &read[..read.find("\n}\n").unwrap()];
         assert!(read.contains("Err(_) => return false,"));
     }
@@ -6682,26 +6805,85 @@ mod tests {
         let now = crate::proof_fetcher::rfc3339_utc_ms("2026-10-23T02:00:00Z").unwrap();
         let evicted = now - 600_000;
         let body = |txid: &str, status: &str, stamp: Option<&str>| -> ArcadeStatusResponse {
-            let stamp = stamp.map(|s| format!(r#","timestamp":"{s}""#)).unwrap_or_default();
-            serde_json::from_str(&format!(r#"{{"txid":"{txid}","txStatus":"{status}"{stamp}}}"#)).unwrap()
+            let stamp = stamp
+                .map(|s| format!(r#","timestamp":"{s}""#))
+                .unwrap_or_default();
+            serde_json::from_str(&format!(
+                r#"{{"txid":"{txid}","txStatus":"{status}"{stamp}}}"#
+            ))
+            .unwrap()
         };
         let stored = Err(STORED_ECHO_UNDER_EVICTION.to_string());
         let pending = Ok(ArcOutcome::AcceptedPending("subject".into()));
         let seen = |stamp| body("subject", "SEEN_ON_NETWORK", stamp);
         // a stored SEEN before the eviction: the stored echo's 502
-        assert_eq!(probe_answer(Some(&seen(Some("2026-10-23T01:40:00Z"))), "subject", now, Some(evicted)), Some(stored.clone()));
+        assert_eq!(
+            probe_answer(
+                Some(&seen(Some("2026-10-23T01:40:00Z"))),
+                "subject",
+                now,
+                Some(evicted)
+            ),
+            Some(stored.clone())
+        );
         // after it, inside the bound: pending
-        assert_eq!(probe_answer(Some(&seen(Some("2026-10-23T01:55:00Z"))), "subject", now, Some(evicted)), Some(pending.clone()));
+        assert_eq!(
+            probe_answer(
+                Some(&seen(Some("2026-10-23T01:55:00Z"))),
+                "subject",
+                now,
+                Some(evicted)
+            ),
+            Some(pending.clone())
+        );
         // the lens's M1 row: after the eviction but past the 30 minute bound is the 502 too
         let early = now - 3_600_000;
-        assert_eq!(probe_answer(Some(&seen(Some("2026-10-23T01:20:00Z"))), "subject", now, Some(early)), Some(stored.clone()));
+        assert_eq!(
+            probe_answer(
+                Some(&seen(Some("2026-10-23T01:20:00Z"))),
+                "subject",
+                now,
+                Some(early)
+            ),
+            Some(stored.clone())
+        );
         // no eviction, no stamp: pending; a MINED word: pending; the subject in upper case: its own
-        assert_eq!(probe_answer(Some(&seen(None)), "subject", now, None), Some(pending.clone()));
-        assert_eq!(probe_answer(Some(&body("subject", "MINED", None)), "subject", now, None), Some(pending.clone()));
-        assert_eq!(probe_answer(Some(&body("SUBJECT", "SEEN_ON_NETWORK", None)), "subject", now, None), Some(pending));
+        assert_eq!(
+            probe_answer(Some(&seen(None)), "subject", now, None),
+            Some(pending.clone())
+        );
+        assert_eq!(
+            probe_answer(Some(&body("subject", "MINED", None)), "subject", now, None),
+            Some(pending.clone())
+        );
+        assert_eq!(
+            probe_answer(
+                Some(&body("SUBJECT", "SEEN_ON_NETWORK", None)),
+                "subject",
+                now,
+                None
+            ),
+            Some(pending)
+        );
         // another txid's echo, a word below SEEN, no probe: not the probe's arm
-        assert_eq!(probe_answer(Some(&body("other", "SEEN_ON_NETWORK", None)), "subject", now, None), None);
-        assert_eq!(probe_answer(Some(&body("subject", "RECEIVED", None)), "subject", now, None), None);
+        assert_eq!(
+            probe_answer(
+                Some(&body("other", "SEEN_ON_NETWORK", None)),
+                "subject",
+                now,
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            probe_answer(
+                Some(&body("subject", "RECEIVED", None)),
+                "subject",
+                now,
+                None
+            ),
+            None
+        );
         assert_eq!(probe_answer(None, "subject", now, None), None);
 
         // L2: the arm's own step marks the duplicate, in both answers, and nothing when it is not the probe's arm
@@ -6710,28 +6892,55 @@ mod tests {
             (false, crate::ops::COUNTER_SUBMIT_PENDING_ADMITTED),
         ] {
             let b = ArcadeBroadcaster::new("").with_fast_answer(fast);
-            assert_eq!(b.take_probe(Some(&seen(None)), "subject", now), Some(Ok(ArcOutcome::AcceptedPending("subject".into()))));
+            assert_eq!(
+                b.take_probe(Some(&seen(None)), "subject", now),
+                Some(Ok(ArcOutcome::AcceptedPending("subject".into())))
+            );
             assert!(b.duplicate_echo(), "the probe is a stored Reached echo");
-            assert!(!b.duplicate_echo_unconfirmed(), "no corroboration ran: #637's shape untouched");
-            assert_eq!(crate::ops::pending_admission_counter(fast, b.duplicate_echo()), counter);
+            assert!(
+                !b.duplicate_echo_unconfirmed(),
+                "no corroboration ran: #637's shape untouched"
+            );
+            assert_eq!(
+                crate::ops::pending_admission_counter(fast, b.duplicate_echo()),
+                counter
+            );
         }
         let b = ArcadeBroadcaster::new("").with_evicted_at_ms(Some(evicted));
-        assert_eq!(b.take_probe(Some(&seen(None)), "subject", now), Some(stored));
+        assert_eq!(
+            b.take_probe(Some(&seen(None)), "subject", now),
+            Some(stored)
+        );
         assert!(b.duplicate_echo());
         let b = ArcadeBroadcaster::new("");
-        assert_eq!(b.take_probe(Some(&body("subject", "RECEIVED", None)), "subject", now), None);
+        assert_eq!(
+            b.take_probe(Some(&body("subject", "RECEIVED", None)), "subject", now),
+            None
+        );
         assert!(!b.duplicate_echo());
-        assert_ne!(pending_admission_words(false, true), pending_admission_words(false, false));
+        assert_ne!(
+            pending_admission_words(false, true),
+            pending_admission_words(false, false)
+        );
 
         // the shipped arm returns the step's answer and decides nothing of its own
         let src = include_str!("broadcaster.rs");
         let gated = &src[src.find("pub async fn broadcast_efs_gated<Y>(").unwrap()..];
-        let arm = &gated[gated.find("let mut probe = self.tx_status(subject_txid).await;").unwrap()
-            ..gated.find("// TERMINAL AT ARCADE").unwrap()];
-        assert!(arm.contains("self.take_probe(probe.as_ref(), subject_txid, worker::Date::now().as_millis() as i64)"));
+        let arm = &gated[gated
+            .find("let mut probe = self.tx_status(subject_txid).await;")
+            .unwrap()..gated.find("// TERMINAL AT ARCADE").unwrap()];
+        assert!(arm.contains(
+            "self.take_probe(probe.as_ref(), subject_txid, worker::Date::now().as_millis() as i64)"
+        ));
         assert!(arm.contains("return answer;"));
-        assert!(!arm.contains("probe_seen("), "the arm decides through `probe_answer` alone");
-        assert!(!arm.contains("ArcOutcome::"), "the arm builds no answer of its own");
+        assert!(
+            !arm.contains("probe_seen("),
+            "the arm decides through `probe_answer` alone"
+        );
+        assert!(
+            !arm.contains("ArcOutcome::"),
+            "the arm builds no answer of its own"
+        );
     }
 
     /// B-DOOR-3 fold (the lens's L3): only the SUBJECT's own Reached echo is the duplicate #637 reads. The two-leg
@@ -6742,17 +6951,28 @@ mod tests {
         let b = ArcadeBroadcaster::new("");
         b.begin_request("subject");
         b.note_reached_echo("ancestor");
-        assert!(!b.duplicate_echo(), "an ancestor leg's stored SEEN is not the subject's");
+        assert!(
+            !b.duplicate_echo(),
+            "an ancestor leg's stored SEEN is not the subject's"
+        );
         assert!(!b.duplicate_echo_unconfirmed());
         b.note_reached_echo("SUBJECT");
-        assert!(b.duplicate_echo(), "the subject's own echo, any letter case");
+        assert!(
+            b.duplicate_echo(),
+            "the subject's own echo, any letter case"
+        );
         let src = include_str!("broadcaster.rs");
         let submit = &src[src.find("async fn submit_once_and_gate(").unwrap()..];
         let submit = &submit[..submit.find("async fn submit_ef(").unwrap()];
         assert!(submit.contains("self.note_reached_echo(subject_txid);"));
-        assert!(!submit.contains("self.duplicate_echo.set(true)"), "the flag is set through the subject's check alone");
+        assert!(
+            !submit.contains("self.duplicate_echo.set(true)"),
+            "the flag is set through the subject's check alone"
+        );
         let gated = &src[src.find("pub async fn broadcast_efs_gated<Y>(").unwrap()..];
-        let head = &gated[..gated.find("let mut probe = self.tx_status(subject_txid).await;").unwrap()];
+        let head = &gated[..gated
+            .find("let mut probe = self.tx_status(subject_txid).await;")
+            .unwrap()];
         assert!(head.contains("self.begin_request(subject_txid);"));
     }
 
@@ -6760,32 +6980,65 @@ mod tests {
     /// values, and the route calls it.
     #[test]
     fn bdoor3_l4_the_standing_duplicate_answer_is_the_routes_decision() {
-        let shape = DuplicateShape { duplicate_unconfirmed: true, fast_answer: false, open_eviction: false };
+        let shape = DuplicateShape {
+            duplicate_unconfirmed: true,
+            fast_answer: false,
+            open_eviction: false,
+        };
         let refused: Result<ArcOutcome, String> = Err("inconclusive".into());
         assert!(shape.asks_the_index(&refused));
         assert_eq!(
             standing_duplicate_answer(refused.clone(), "subject", shape, true),
             Ok(ArcOutcome::AcceptedPending("subject".into()))
         );
-        assert_eq!(standing_duplicate_answer(refused.clone(), "subject", shape, false), refused, "not standing");
+        assert_eq!(
+            standing_duplicate_answer(refused.clone(), "subject", shape, false),
+            refused,
+            "not standing"
+        );
         for other in [
-            DuplicateShape { open_eviction: true, ..shape },
-            DuplicateShape { fast_answer: true, ..shape },
-            DuplicateShape { duplicate_unconfirmed: false, ..shape },
+            DuplicateShape {
+                open_eviction: true,
+                ..shape
+            },
+            DuplicateShape {
+                fast_answer: true,
+                ..shape
+            },
+            DuplicateShape {
+                duplicate_unconfirmed: false,
+                ..shape
+            },
         ] {
             assert!(!other.asks_the_index(&refused));
-            assert_eq!(standing_duplicate_answer(refused.clone(), "subject", other, true), refused);
+            assert_eq!(
+                standing_duplicate_answer(refused.clone(), "subject", other, true),
+                refused
+            );
         }
-        for stood in [Ok(ArcOutcome::Rejected("conflict".into())), Ok(ArcOutcome::AcceptedPending("subject".into()))] {
+        for stood in [
+            Ok(ArcOutcome::Rejected("conflict".into())),
+            Ok(ArcOutcome::AcceptedPending("subject".into())),
+        ] {
             assert!(!shape.asks_the_index(&stood));
-            assert_eq!(standing_duplicate_answer(stood.clone(), "subject", shape, true), stood);
+            assert_eq!(
+                standing_duplicate_answer(stood.clone(), "subject", shape, true),
+                stood
+            );
         }
         let route = include_str!("routes.rs");
-        let arm = &route[route.find("let duplicate_echo = arcade.duplicate_echo();").unwrap()
-            ..route.find("corroborate_ms = arcade.corroborate_ms();").unwrap()];
+        let arm = &route[route
+            .find("let duplicate_echo = arcade.duplicate_echo();")
+            .unwrap()
+            ..route
+                .find("corroborate_ms = arcade.corroborate_ms();")
+                .unwrap()];
         assert!(arm.contains("if shape.asks_the_index(&arcade_outcome) {"));
         assert!(arm.contains("crate::broadcaster::standing_duplicate_answer(arcade_outcome, &subject_txid, shape, standing)"));
-        assert!(!arm.contains("ArcOutcome::AcceptedPending("), "the route builds no answer of its own");
+        assert!(
+            !arm.contains("ArcOutcome::AcceptedPending("),
+            "the route builds no answer of its own"
+        );
     }
 
     #[test]
@@ -7283,7 +7536,10 @@ mod tests {
                         "arc_verdict({status}) accepted {d}"
                     );
                     assert!(
-                        !matches!(corroborator_verdict(status, &d), Ok(ArcOutcome::Accepted(_))),
+                        !matches!(
+                            corroborator_verdict(status, &d),
+                            Ok(ArcOutcome::Accepted(_))
+                        ),
                         "corroborator_verdict({status}) accepted {d}"
                     );
                 }
@@ -7511,10 +7767,23 @@ mod tests {
         let acc = || -> Result<ArcOutcome, String> { Ok(ArcOutcome::Accepted("ok".into())) };
         let rej = || -> Result<ArcOutcome, String> { Ok(ArcOutcome::Rejected("no".into())) };
         let err = || -> Result<ArcOutcome, String> { Err("down".into()) };
-        assert_eq!(accepting_corroborator(&acc(), None), Some(SeenSource::Taal), "TAAL's short-circuit accept");
-        assert_eq!(accepting_corroborator(&acc(), Some(&rej())), Some(SeenSource::Taal));
-        assert_eq!(accepting_corroborator(&rej(), Some(&acc())), Some(SeenSource::GorillaPool));
-        assert_eq!(accepting_corroborator(&err(), Some(&acc())), Some(SeenSource::GorillaPool));
+        assert_eq!(
+            accepting_corroborator(&acc(), None),
+            Some(SeenSource::Taal),
+            "TAAL's short-circuit accept"
+        );
+        assert_eq!(
+            accepting_corroborator(&acc(), Some(&rej())),
+            Some(SeenSource::Taal)
+        );
+        assert_eq!(
+            accepting_corroborator(&rej(), Some(&acc())),
+            Some(SeenSource::GorillaPool)
+        );
+        assert_eq!(
+            accepting_corroborator(&err(), Some(&acc())),
+            Some(SeenSource::GorillaPool)
+        );
         assert_eq!(accepting_corroborator(&rej(), Some(&rej())), None);
         assert_eq!(accepting_corroborator(&err(), Some(&err())), None);
         assert_eq!(accepting_corroborator(&rej(), None), None);
@@ -7524,9 +7793,21 @@ mod tests {
         let src = include_str!("broadcaster.rs");
         let at = src.find("pub(crate) async fn corroborate_tx_hex(").unwrap();
         let body = &src[at..at + src[at..].find("\n}\n").unwrap()];
-        assert_eq!(body.matches("accepting_corroborator(&taal, None)").count(), 1, "the TAAL short-circuit");
-        assert_eq!(body.matches("accepting_corroborator(&taal, Some(&gp))").count(), 1, "the GorillaPool return");
-        assert!(!body.contains("SeenSource::"), "no literal source in corroborate_tx_hex");
+        assert_eq!(
+            body.matches("accepting_corroborator(&taal, None)").count(),
+            1,
+            "the TAAL short-circuit"
+        );
+        assert_eq!(
+            body.matches("accepting_corroborator(&taal, Some(&gp))")
+                .count(),
+            1,
+            "the GorillaPool return"
+        );
+        assert!(
+            !body.contains("SeenSource::"),
+            "no literal source in corroborate_tx_hex"
+        );
     }
 }
 

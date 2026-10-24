@@ -729,10 +729,11 @@ pub fn courier_pacing_view(counters: &serde_json::Value) -> serde_json::Value {
             }),
         );
     }
-    let budget: serde_json::Map<String, serde_json::Value> = crate::courier_counters::COURIER_TICK_BUDGET
-        .iter()
-        .map(|(p, b)| ((*p).to_string(), json!(b)))
-        .collect();
+    let budget: serde_json::Map<String, serde_json::Value> =
+        crate::courier_counters::COURIER_TICK_BUDGET
+            .iter()
+            .map(|(p, b)| ((*p).to_string(), json!(b)))
+            .collect();
     json!({
         "providers": providers,
         "budgetPerTick": budget,
@@ -1143,7 +1144,12 @@ pub async fn renote_latched_seen(db: &D1Database, txid: &str) -> bool {
 ///
 /// bsv-low #621 (L5): `source` names the broadcaster that said SEEN and `at_ms` its own stamp when its answer
 /// carried one (`None`: the overlay's clock now). The tracker's `seen` hint carries the same pair.
-pub async fn latch_network_seen(db: &D1Database, txid: &str, source: SeenSource, at_ms: Option<i64>) {
+pub async fn latch_network_seen(
+    db: &D1Database,
+    txid: &str,
+    source: SeenSource,
+    at_ms: Option<i64>,
+) {
     let at_ms = at_ms.unwrap_or_else(|| worker::Date::now().as_millis() as i64);
     let q = Query::new(NETWORK_SEEN_INSERT_SQL)
         .bind(txid)
@@ -1239,7 +1245,12 @@ pub(crate) async fn bump_counters(
     let statements = deltas
         .into_iter()
         .filter(|(_, delta)| *delta > 0)
-        .map(|(name, delta)| Query::new(BUMP_COUNTER_SQL).bind(name).bind(delta).prepare(db))
+        .map(|(name, delta)| {
+            Query::new(BUMP_COUNTER_SQL)
+                .bind(name)
+                .bind(delta)
+                .prepare(db)
+        })
         .collect::<Result<Vec<_>, _>>();
     match statements {
         Ok(statements) if statements.is_empty() => {}
@@ -3087,15 +3098,29 @@ mod tests {
         }
         let calls = routes.matches("crate::ops::latch_network_seen(").count()
             + jobs.matches("crate::ops::latch_network_seen(").count();
-        assert_eq!(calls, 5, "five writers: three in routes.rs, two in admit_fast.rs");
+        assert_eq!(
+            calls, 5,
+            "five writers: three in routes.rs, two in admit_fast.rs"
+        );
         // the gated accept's witness is noted at every Accepted origin (poll, stored echo, corroborators); the
         // pre-flight probe's stored SEEN admits pending and names none (bsv-low #636)
         let b = squash(include_str!("broadcaster.rs"));
-        assert_eq!(b.matches("self.note_witness(Some(crate::ops::SeenSource::Arcade),").count(), 2);
+        assert_eq!(
+            b.matches("self.note_witness(Some(crate::ops::SeenSource::Arcade),")
+                .count(),
+            2
+        );
         assert_eq!(b.matches("self.note_witness(by,None);").count(), 2);
-        assert_eq!(b.matches("self.note_witness(last_by.get(),None);").count(), 1);
+        assert_eq!(
+            b.matches("self.note_witness(last_by.get(),None);").count(),
+            1
+        );
         // broadcasters only, by name
-        let all = [SeenSource::Arcade, SeenSource::Taal, SeenSource::GorillaPool];
+        let all = [
+            SeenSource::Arcade,
+            SeenSource::Taal,
+            SeenSource::GorillaPool,
+        ];
         assert_eq!(all.map(SeenSource::wire), ["arcade", "taal", "gorillapool"]);
         for s in all {
             match s {

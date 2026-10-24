@@ -1296,8 +1296,16 @@ mod tests {
         };
         let delivered = run(deliver_parked(&cron));
         let kinds: Vec<String> = cron.posts.borrow().iter().map(|(k, _)| k.clone()).collect();
-        assert_eq!(kinds, vec![KIND_WORD, KIND_HOP, KIND_POT], "the words are delivered first");
-        assert_eq!(cron.posts.borrow()[0].1, frame, "the frame is POSTed as it was queued");
+        assert_eq!(
+            kinds,
+            vec![KIND_WORD, KIND_HOP, KIND_POT],
+            "the words are delivered first"
+        );
+        assert_eq!(
+            cron.posts.borrow()[0].1,
+            frame,
+            "the frame is POSTed as it was queued"
+        );
         assert_eq!(delivered.unparked, 3);
         assert!(cron.rows.borrow().is_empty());
     }
@@ -2025,7 +2033,11 @@ mod tests {
             .unwrap();
         assert_eq!(counts, (2, 1, 0, 0));
         // B-OWED-3-FOLD L1: the gauge counts the word set too
-        park_sql(&conn, rusqlite::params![KIND_WORD, "{\"txid\":\"aa\"}", 5, MAX]).unwrap();
+        park_sql(
+            &conn,
+            rusqlite::params![KIND_WORD, "{\"txid\":\"aa\"}", 5, MAX],
+        )
+        .unwrap();
         let words: (i64, i64) = conn
             .query_row(PARKED_COUNT_SQL, rusqlite::params![HEALTH_COUNT_CAP], |r| {
                 Ok((r.get("word")?, r.get("word_exhausted")?))

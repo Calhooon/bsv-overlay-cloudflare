@@ -429,7 +429,6 @@ pub(crate) mod tests {
         NOTED_BACK.with(|m| m.borrow_mut().clear());
     }
 
-
     #[test]
     fn note_dedupes_and_drain_empties() {
         drain();

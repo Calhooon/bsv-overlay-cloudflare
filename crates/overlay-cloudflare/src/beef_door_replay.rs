@@ -1310,15 +1310,23 @@ mod e592 {
         let routes = include_str!("routes.rs");
         let start = routes.find("async fn walk_not_now(").expect("walk_not_now");
         let body = &routes[start..start + routes[start..].find("\n}\n").expect("its end")];
-        let some_arm = &body[body.find("if let Some(counters) = counters {").expect("the batched arm")
-            ..body.find("} else if let Ok(db)").expect("the unbatched arm")];
+        let some_arm = &body[body
+            .find("if let Some(counters) = counters {")
+            .expect("the batched arm")
+            ..body
+                .find("} else if let Ok(db)")
+                .expect("the unbatched arm")];
         assert!(
             some_arm.contains("crate::ops::engine_walk_not_now_line(stop, door)"),
             "the batched arm logs the detail line: {some_arm}"
         );
         let ops = include_str!("ops.rs");
-        let note = &ops[ops.find("pub async fn note_engine_walk_not_now(").expect("note")..];
-        assert!(note[..note.find("\n}\n").unwrap()].contains("engine_walk_not_now_line(stop, door)"));
+        let note = &ops[ops
+            .find("pub async fn note_engine_walk_not_now(")
+            .expect("note")..];
+        assert!(
+            note[..note.find("\n}\n").unwrap()].contains("engine_walk_not_now_line(stop, door)")
+        );
     }
 
     #[test]
@@ -1390,9 +1398,8 @@ mod e592 {
             .find("let (steak, mutation_report) = match engine_outcome {")
             .expect("the synchronous submit");
         let tail = &routes[submit..];
-        assert!(tail.contains(
-            "return walk_not_now(env, &stop, \"POST /submit\", Some(counters)).await;"
-        ));
+        assert!(tail
+            .contains("return walk_not_now(env, &stop, \"POST /submit\", Some(counters)).await;"));
         assert!(tail.contains("counters.reason(SubmitReason::WalkCouldNotRun);"));
         assert!(
             tail.contains("crate::ops::note_engine_walk(&db, &mutation_report, \"POST /submit\")")

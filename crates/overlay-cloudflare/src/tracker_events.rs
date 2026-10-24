@@ -267,10 +267,17 @@ where
     ship_in_order(
         words,
         |body| async move {
-            crate::change_flush::post_body_answer(env, url, token, "/internal/tx-word", "tx-word", body)
-                .await
-                .map(|answer| answered_held(&answer))
-                .map_err(|_| "undelivered".to_string())
+            crate::change_flush::post_body_answer(
+                env,
+                url,
+                token,
+                "/internal/tx-word",
+                "tx-word",
+                body,
+            )
+            .await
+            .map(|answer| answered_held(&answer))
+            .map_err(|_| "undelivered".to_string())
         },
         notes,
         || worker::Date::now().as_millis(),

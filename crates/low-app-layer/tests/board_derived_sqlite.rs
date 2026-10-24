@@ -120,7 +120,12 @@ fn frag_and_card_drift(db: &Connection, label: &str) -> Result<(), String> {
         let mut status = jrows(db, &l::batch_where_sql(1), &[&lower, &0]);
         status.iter_mut().for_each(|r| {
             // the funding witness (and, bsv-low #621, its pair) is the felt's, never the board's
-            for k in ["fundingSeen", "fundingSeenAt", "fundingSeenBy", "fundingSeenByAt"] {
+            for k in [
+                "fundingSeen",
+                "fundingSeenAt",
+                "fundingSeenBy",
+                "fundingSeenByAt",
+            ] {
                 r.as_object_mut().unwrap().remove(k);
             }
         });
