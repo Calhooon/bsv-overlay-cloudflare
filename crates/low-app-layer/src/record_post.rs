@@ -1561,15 +1561,24 @@ pub fn own_potrefund_chain_rows(
     (own, unverified)
 }
 
+/// bsv-low #798: what the potrefund chain no-op found: how many own rows (`> 0` = the no-op) and whether its latch
+/// moved one (`refundValid` 0 / NULL to 1, or a latch whose count the platform did not answer): a latch that moved a
+/// row changes what is owed (the MONEY-DOOR lens's LOW-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChainNoop {
+    pub own: i64,
+    pub latched: bool,
+}
+
 /// bsv-low #798: the potrefund chain no-op through the port, shared by the direct door and the handfile arm. Reads
 /// the chain rows of the filing's (identity, game, pot outpoint), judges each by the filed path's bar, LATCHES every
-/// own row `refundValid = 1` (one batch) and counts the rest; answers how many own rows there are (`> 0` = the
-/// no-op). The latch runs before the caller answers.
+/// own row `refundValid = 1` (one batch) and counts the rest; answers how many own rows there are and whether the
+/// latch moved one. The latch runs before the caller answers.
 pub(crate) async fn potrefund_chain_noop<P: crate::pot_hook::SqlPort>(
     port: &P,
     filing: &PotrefundRecord,
     pot: Option<&PotContext>,
-) -> std::result::Result<i64, String> {
+) -> std::result::Result<ChainNoop, String> {
     let (sql, binds) = chain_rows_query(&VerifiedRecord::Potrefund(filing.clone(), false))
         .expect("a refund backup has a chain no-op");
     let out = port_one(port, stmt(sql, binds.iter().map(|s| text(s)).collect())).await?;
@@ -1582,20 +1591,28 @@ pub(crate) async fn potrefund_chain_noop<P: crate::pot_hook::SqlPort>(
     if unverified > 0 {
         POTREFUND_CHAIN_ROWS_UNVERIFIED.fetch_add(unverified, Ordering::Relaxed);
     }
+    let mut latched = false;
     if !own.is_empty() {
-        port.run_batch(
-            own.iter()
-                .map(|(txid, vout)| {
-                    stmt(
-                        POTREFUND_CHAIN_LATCH_SQL,
-                        vec![text(txid), int(i64::from(*vout))],
-                    )
-                })
-                .collect(),
-        )
-        .await?;
+        let outs = port
+            .run_batch(
+                own.iter()
+                    .map(|(txid, vout)| {
+                        stmt(
+                            POTREFUND_CHAIN_LATCH_SQL,
+                            vec![text(txid), int(i64::from(*vout))],
+                        )
+                    })
+                    .collect(),
+            )
+            .await?;
+        latched = outs
+            .iter()
+            .any(|o| insert_wrote_a_row(o.changes.map(|n| n as usize)));
     }
-    Ok(own.len() as i64)
+    Ok(ChainNoop {
+        own: own.len() as i64,
+        latched,
+    })
 }
 
 /// The chain no-op statement and its binds for a verified record (a pure
@@ -1756,6 +1773,26 @@ pub(crate) fn cap_refusal_at(
 /// (the stale mark and the push run, as before the fold): a missed recompute would be the worse error.
 pub fn insert_wrote_a_row(changes: Option<usize>) -> bool {
     changes != Some(0)
+}
+
+/// The `collected` row of one content key, re-read (the MONEY-DOOR lens's LOW-2).
+pub const COLLECTED_ROW_STAMP_SQL: &str =
+    "SELECT createdAt FROM collected_markers_v2 WHERE txid = ?1 AND outputIndex = 0";
+
+/// The MONEY-DOOR lens's LOW-2: the `collected` insert answered with NO change count. The row is re-read by its
+/// key: stamped by THIS request (`createdAt` = `now`) is a write; stamped earlier is the re-file (nothing written).
+/// A row not found, or a stamp that does not read, is read as written: a missed recompute is the worse error. A
+/// re-file inside the same second as its first filing reads as a write (one extra stale mark).
+pub(crate) async fn collected_written_now<P: crate::pot_hook::SqlPort>(
+    port: &P,
+    content_key: &str,
+    now: i64,
+) -> std::result::Result<bool, String> {
+    let out = port_one(port, stmt(COLLECTED_ROW_STAMP_SQL, vec![text(content_key)])).await?;
+    Ok(match out.rows.first().and_then(|r| r.get("createdAt")) {
+        Some(stamp) => stamp.as_f64().is_none_or(|t| t as i64 == now),
+        None => true,
+    })
 }
 
 /// PURE (the B3 lens fold L2): the door's answer to a re-file that wrote nothing. 200 with the EXISTING key (the
@@ -2036,8 +2073,9 @@ pub(crate) fn refuse_with_family(
 pub(crate) enum DoorOutcome {
     /// Refused (the bind, the hop, a cap): nothing written.
     Refused(RecordRefusal),
-    /// The chain no-op: nothing written, nothing counted.
-    AlreadyIndexed,
+    /// The chain no-op: nothing written, nothing counted. `latched`: the potrefund no-op's latch moved its own chain
+    /// row to `refundValid = 1` (the MONEY-DOOR lens's LOW-1: that moves what is owed).
+    AlreadyIndexed { latched: bool },
     /// The family's write ran; `row_written` is false only when the `collected` door's insert wrote nothing.
     Written { row_written: bool },
 }
@@ -2170,12 +2208,15 @@ pub(crate) async fn file_verified<P: crate::pot_hook::SqlPort>(
         }
     }
     let verified = &*verified;
+    let mut chain_latched = false;
     // The chain no-op (step 6): the chain already holds this marker for this
     // identity — nothing to add, nothing written, nothing counted.
     // A chain row counts only when it verifies as the poster's own (#564).
     let chain_rows = match (chain_rows_query(verified), verified) {
         (Some(_), VerifiedRecord::Potrefund(r, _)) => {
-            potrefund_chain_noop(port, r, pot.as_ref()).await?
+            let noop = potrefund_chain_noop(port, r, pot.as_ref()).await?;
+            chain_latched = noop.latched;
+            noop.own
         }
         (Some((chain_sql, chain_binds)), VerifiedRecord::Collected(r)) => {
             let out = port_one(
@@ -2205,7 +2246,9 @@ pub(crate) async fn file_verified<P: crate::pot_hook::SqlPort>(
         (None, _) => 0,
     };
     if chain_rows > 0 {
-        return Ok(DoorOutcome::AlreadyIndexed);
+        return Ok(DoorOutcome::AlreadyIndexed {
+            latched: chain_latched,
+        });
     }
     // The caps (step 6): the poster's rows for this (family, game, pot) —
     // this content excluded — and its day.
@@ -2272,7 +2315,7 @@ pub(crate) async fn file_verified<P: crate::pot_hook::SqlPort>(
                 // content — the INSERT above was ignored) takes its verdict.
                 let latched =
                     port_one(port, stmt(POTREFUND_LATCH_SQL, vec![text(&r.txid)])).await?;
-                if latched.changes > 0 {
+                if latched.changes.unwrap_or(0) > 0 {
                     REFUNDS_LATCHED_LATER.fetch_add(1, Ordering::Relaxed);
                 }
             } else {
@@ -2359,10 +2402,14 @@ pub(crate) async fn file_verified<P: crate::pot_hook::SqlPort>(
             // The B3 lens fold L2: the INSERT is `OR IGNORE`, so a re-file of content already on file writes
             // nothing. Then nothing changed in what is owed: no stale mark, no `owed-changed` push, no `filed`
             // count (a stranger replaying a victim's public filing, or a client re-filing on every read, bought a
-            // recompute and a push per request). `changes` unreadable is read as written (the pre-fold behavior).
-            // NOT lossless (the B3 delta lens D-L3): a first filing whose stale mark faulted or died is no
-            // longer repaired by a re-file; that missed mark heals at the read's 15 minute age rule.
-            row_written = insert_wrote_a_row(Some(done.changes as usize));
+            // recompute and a push per request). NOT lossless (the B3 delta lens D-L3): a first filing whose stale
+            // mark faulted or died is no longer repaired by a re-file; that missed mark heals at the read's 15 minute
+            // age rule. The MONEY-DOOR lens's LOW-2: D1's count is optional, and an answer that carries none is never
+            // read as zero rows: the row is re-read by its key (`collected_written_now`).
+            row_written = match done.changes {
+                Some(n) => insert_wrote_a_row(Some(n as usize)),
+                None => collected_written_now(port, &r.txid, now).await?,
+            };
         }
         VerifiedRecord::Hopsweep(_, r) => {
             port_one(
@@ -2445,10 +2492,18 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
     // The overlay stamps every one of these tables in unix SECONDS.
     let now = (worker::Date::now().as_millis() / 1000) as i64;
     let port = crate::routes::D1Sql::of(&ctx.env)?;
-    let row_written = match file_verified(&port, &mut verified, &identity, now)
+    let outcome = file_verified(&port, &mut verified, &identity, now)
         .await
-        .map_err(worker::Error::RustError)?
-    {
+        .map_err(worker::Error::RustError)?;
+    // bsv-low #469: a filing changes what is owed (a refund backup makes a gate-open pot claimable for BOTH seats; a
+    // `collected` retires a payout row; a party marker binds a seat). The gate's HIGH-4 + MEDIUM-11: mark every
+    // party of the pot STALE for its own next read; schedule only the FILER's coalesced walk. Announce the computed
+    // snapshot: a bare filing trigger makes every mounted device spend another read-stale walk (#648). Which
+    // answers move it: [`owed_marks_after`].
+    if let Some((identity, pot)) = owed_marks_after(&outcome, &verified) {
+        note_filing_and_recompute(&ctx, &db, identity, pot).await;
+    }
+    let row_written = match outcome {
         DoorOutcome::Refused(r) => {
             if matches!(
                 r,
@@ -2465,37 +2520,15 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
             }
             return refuse(Some(kind), r);
         }
-        DoorOutcome::AlreadyIndexed => {
+        DoorOutcome::AlreadyIndexed { .. } => {
             bump(&ALREADY_INDEXED_BY_KIND, kind);
             return crate::routes::json_response(already_indexed_body(&verified).to_string(), 200);
         }
         DoorOutcome::Written { row_written } => row_written,
     };
-    // bsv-low #469: a filing changes what is owed (a refund backup makes a gate-open pot claimable for BOTH seats; a
-    // `collected` retires a payout row; a party marker binds a seat). The gate's HIGH-4 + MEDIUM-11: mark every
-    // party of the pot STALE for its own next read; schedule only the FILER's coalesced walk. Announce the computed
-    // snapshot: a bare filing trigger makes every mounted device spend another read-stale walk (#648).
     if !row_written {
         bump(&ALREADY_FILED_BY_KIND, kind);
         return crate::routes::json_response(already_filed_body(&verified).to_string(), 200);
-    }
-    {
-        let (identity, pot): (Option<String>, Option<(String, u32)>) = match &verified {
-            VerifiedRecord::Potparty(r, _) => (
-                Some(r.identity.to_ascii_lowercase()),
-                Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout)),
-            ),
-            VerifiedRecord::Potrefund(r, _) => (
-                Some(r.identity.to_ascii_lowercase()),
-                Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout)),
-            ),
-            VerifiedRecord::Collected(r) | VerifiedRecord::Held(r, _) => {
-                (Some(r.identity.to_ascii_lowercase()), None)
-            }
-            VerifiedRecord::Hopsweep(_, r) => (Some(r.identity.to_ascii_lowercase()), None),
-            VerifiedRecord::Result(..) => (None, None),
-        };
-        note_filing_and_recompute(&ctx, &db, identity, pot).await;
     }
 
     note_filed(kind, anonymous);
@@ -2510,6 +2543,66 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
     crate::routes::json_response(body.to_string(), 200)
 }
 
+/// The filer to mark and walk, and the pot whose parties to mark.
+pub(crate) type OwedMarks = (Option<String>, Option<(String, u32)>);
+
+/// PURE: which of the door's answers move what is owed, and what they mark: a written row, and (the MONEY-DOOR
+/// lens's LOW-1) the chain no-op whose latch moved the poster's own chain row to `refundValid = 1` (the owed list
+/// reads that row as the pot's valid refund). A refusal, a quiet no-op and a re-file that wrote nothing move nothing.
+pub(crate) fn owed_marks_after(
+    outcome: &DoorOutcome,
+    verified: &VerifiedRecord,
+) -> Option<OwedMarks> {
+    match outcome {
+        DoorOutcome::Written { row_written: true }
+        | DoorOutcome::AlreadyIndexed { latched: true } => {}
+        _ => return None,
+    }
+    Some(match verified {
+        VerifiedRecord::Potparty(r, _) => (
+            Some(r.identity.to_ascii_lowercase()),
+            Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout)),
+        ),
+        VerifiedRecord::Potrefund(r, _) => (
+            Some(r.identity.to_ascii_lowercase()),
+            Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout)),
+        ),
+        VerifiedRecord::Collected(r) | VerifiedRecord::Held(r, _) => {
+            (Some(r.identity.to_ascii_lowercase()), None)
+        }
+        VerifiedRecord::Hopsweep(_, r) => (Some(r.identity.to_ascii_lowercase()), None),
+        VerifiedRecord::Result(..) => (None, None),
+    })
+}
+
+/// The filing's stale marks through the port: the pot's parties (`OWED_STALE_FOR_POT_SQL`), then the filer
+/// (`OWED_STALE_FOR_IDENTITY_SQL`), each its own statement; a fault is logged and the next mark still runs.
+pub(crate) async fn mark_filing_stale<P: crate::pot_hook::SqlPort>(
+    port: &P,
+    identity: Option<&str>,
+    pot: Option<(&str, u32)>,
+) {
+    if let Some((pot_txid, pot_vout)) = pot {
+        let mark = stmt(
+            crate::owed::OWED_STALE_FOR_POT_SQL,
+            vec![text(pot_txid), int(i64::from(pot_vout))],
+        );
+        if let Err(e) = port_one(port, mark).await {
+            port.log(&format!(
+                "[owed] stale mark (filing: the pot's parties) failed: {e}"
+            ));
+        }
+    }
+    if let Some(id) = identity {
+        let mark = stmt(crate::owed::OWED_STALE_FOR_IDENTITY_SQL, vec![text(id)]);
+        if let Err(e) = port_one(port, mark).await {
+            port.log(&format!(
+                "[owed] stale mark (filing: the filer) failed: {e}"
+            ));
+        }
+    }
+}
+
 /// After a row landed: the pot's parties and the filer marked stale, then the filer's owed recompute (in
 /// `wait_until` where the platform gives one). Shared by every kind, the handfile arm included (bsv-low #848).
 pub(crate) async fn note_filing_and_recompute(
@@ -2518,27 +2611,16 @@ pub(crate) async fn note_filing_and_recompute(
     identity: Option<String>,
     pot: Option<(String, u32)>,
 ) {
-    use worker::wasm_bindgen::JsValue;
-    if let Some((pot_txid, pot_vout)) = &pot {
-        crate::routes::owed_mark_stale(
-            db,
-            crate::owed::OWED_STALE_FOR_POT_SQL,
-            &[
-                JsValue::from_str(pot_txid),
-                JsValue::from_f64(f64::from(*pot_vout)),
-            ],
-            "filing: the pot's parties",
-        )
-        .await;
-    }
-    if let Some(id) = &identity {
-        crate::routes::owed_mark_stale(
-            db,
-            crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
-            &[JsValue::from_str(id)],
-            "filing: the filer",
-        )
-        .await;
+    match crate::routes::D1Sql::of(&ctx.env) {
+        Ok(port) => {
+            mark_filing_stale(
+                &port,
+                identity.as_deref(),
+                pot.as_ref().map(|(t, v)| (t.as_str(), *v)),
+            )
+            .await
+        }
+        Err(e) => worker::console_warn!("[owed] stale marks (filing) skipped: {e}"),
     }
     if let Some(id) = identity {
         if let Some(wait) = ctx.data.wait.clone() {
@@ -4517,7 +4599,7 @@ pub(crate) mod tests {
         let (out, _) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
         assert_eq!(
             out,
-            DoorOutcome::AlreadyIndexed,
+            DoorOutcome::AlreadyIndexed { latched: true },
             "the valid chain row is the no-op"
         );
         assert_eq!(
@@ -4697,5 +4779,436 @@ pub(crate) mod tests {
                 "markerValid {latch:?}: past the cap under another game"
             );
         }
+    }
+
+    // ── MONEY-DOOR-LENS: the lens's negative cases (not part of PR 169) ──
+
+    /// The lens: a VALID row first, then a stranger's junk chain row at the same (identity, game, pot): the valid
+    /// row is never demoted, the victim's re-file stays idempotent, and the valid row leads `/refund-backups`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lens_798_a_valid_row_then_junk_never_demotes() {
+        let victim = wallet(0x51);
+        let id = identity(&victim);
+        let id_lc = hex::encode(&id);
+        let gid = [0x5au8; 32];
+        let filing = potrefund_script(&victim, &gid, &presigned_refund());
+        // (1) a FILED rank-1 row, then junk planted after it, then the victim's re-file
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        md_index_the_pot(&db);
+        md_seat(&db, &id_lc, &gid);
+        let (out, v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        assert_eq!(out, DoorOutcome::Written { row_written: true });
+        md_chain_admit(&db, &md_junk_marker(&id, &gid), &"e1".repeat(32), 9_000);
+        let (out, _) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        assert_eq!(
+            out,
+            DoorOutcome::Written { row_written: true },
+            "re-file: the idempotent write"
+        );
+        assert_eq!(
+            md_refund_rows(&db),
+            vec![(v.key().to_string(), Some(1)), ("e1".repeat(32), None)],
+            "the filed row keeps refundValid = 1; one filed row"
+        );
+        assert_eq!(
+            md_served(&db, &id_lc).first(),
+            Some(&(v.key().to_string(), Some(1)))
+        );
+        // (2) the victim's own valid CHAIN row latched, then junk planted, then a re-file: still the no-op, latch kept
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        md_index_the_pot(&db);
+        md_seat(&db, &id_lc, &gid);
+        md_chain_admit(&db, &filing, &"f1".repeat(32), 1_500);
+        let (out, _) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        assert_eq!(out, DoorOutcome::AlreadyIndexed { latched: true });
+        md_chain_admit(&db, &md_junk_marker(&id, &gid), &"f2".repeat(32), 9_000);
+        let (out, _) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        assert_eq!(
+            out,
+            DoorOutcome::AlreadyIndexed { latched: false },
+            "the own row is still the no-op over the junk"
+        );
+        assert_eq!(
+            md_refund_rows(&db),
+            vec![("f1".repeat(32), Some(1)), ("f2".repeat(32), None)]
+        );
+        assert_eq!(
+            md_served(&db, &id_lc).first(),
+            Some(&("f1".repeat(32), Some(1)))
+        );
+    }
+
+    /// The lens: the forger cannot reach the door as the victim (poster mismatch, junk signature), and a stranger's
+    /// OWN-identity filing of a junk raw naming the victim's indexed pot is refused at the bind.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lens_798_b_the_forger_cannot_file_at_the_door() {
+        let victim = wallet(0x52);
+        let id = identity(&victim);
+        let id_lc = hex::encode(&id);
+        let gid = [0x5bu8; 32];
+        let stranger = wallet(0x53);
+        let s_lc = hex::encode(identity(&stranger));
+        assert_eq!(
+            verify_record_post(RecordKind::Potrefund, &md_junk_marker(&id, &gid), &id_lc).err(),
+            Some(RecordRefusal::SignatureInvalid),
+            "a junk-signed marker naming the victim is refused at the door"
+        );
+        assert_eq!(
+            verify_record_post(
+                RecordKind::Potrefund,
+                &potrefund_script(&victim, &gid, &presigned_refund()),
+                &s_lc
+            )
+            .err(),
+            Some(RecordRefusal::PosterMismatch)
+        );
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        md_index_the_pot(&db);
+        let junk = potrefund_script(&stranger, &gid, &junk_refund_raw(&POT_TXID, 0));
+        let (out, _) = md_file(&db, RecordKind::Potrefund, &junk, &s_lc).await;
+        assert!(
+            matches!(out, DoorOutcome::Refused(_)),
+            "a stranger's junk raw on an indexed pot is refused: {out:?}"
+        );
+        assert!(md_refund_rows(&db).is_empty());
+    }
+
+    /// The lens: the read bound. Twenty junk chain rows naming the victim never spend the victim's cap and never
+    /// make the filing a no-op; past the 16 rows read, an own chain row may go unseen, and the filing then WRITES
+    /// its own rank-1 row (the safe direction), never a junk no-op.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lens_798_c_junk_flood_spends_no_cap_and_is_never_the_noop() {
+        let victim = wallet(0x54);
+        let id = identity(&victim);
+        let id_lc = hex::encode(&id);
+        let gid = [0x5cu8; 32];
+        let filing = potrefund_script(&victim, &gid, &presigned_refund());
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        md_index_the_pot(&db);
+        md_seat(&db, &id_lc, &gid);
+        for i in 0..20u8 {
+            md_chain_admit(
+                &db,
+                &md_junk_marker(&id, &gid),
+                &format!("{:02x}", i).repeat(32),
+                100 + i64::from(i),
+            );
+        }
+        // the victim's own valid chain row, the 21st by rowid
+        md_chain_admit(&db, &filing, &"fe".repeat(32), 50);
+        let (out, v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        let latched: Vec<_> = md_refund_rows(&db)
+            .into_iter()
+            .filter(|(_, r)| *r == Some(1))
+            .collect();
+        match out {
+            DoorOutcome::AlreadyIndexed { .. } => {
+                assert_eq!(latched, vec![("fe".repeat(32), Some(1))])
+            }
+            DoorOutcome::Written { row_written: true } => {
+                assert_eq!(
+                    latched,
+                    vec![(v.key().to_string(), Some(1))],
+                    "the filing's own rank-1 row"
+                )
+            }
+            other => panic!("never a refusal under a junk flood: {other:?}"),
+        }
+        eprintln!("lens_798_c: past 16 junk rows the door answered {out:?}");
+        assert_eq!(
+            md_served(&db, &id_lc).first().map(|r| r.1),
+            Some(Some(1)),
+            "a valid row leads"
+        );
+        // the junk rows spent no cap: a DIFFERENT valid content is refused only by the victim's own filed row, if any
+        let k = pot_keys();
+        let other = spend_signed_by(&k[0], &k[1], 0xffff_fffd, 900_000);
+        let (out2, _) = md_file(
+            &db,
+            RecordKind::Potrefund,
+            &potrefund_script(&victim, &gid, &other),
+            &id_lc,
+        )
+        .await;
+        if matches!(out, DoorOutcome::AlreadyIndexed { .. }) {
+            assert_eq!(
+                out2,
+                DoorOutcome::Written { row_written: true },
+                "no filed row yet: the cap is untouched"
+            );
+        } else {
+            assert_eq!(
+                out2,
+                DoorOutcome::Refused(RecordRefusal::TooManyFiled),
+                "only the victim's own filed row counts"
+            );
+        }
+    }
+
+    /// The lens: #663's hop row choice. A stranger-shaped hopparty row of the victim's hop under ANOTHER game: when
+    /// the victim's own row is latched it leads and the honest sweep files; when neither is latched the older row
+    /// is read and the filing is 425 (as on the base); with no hop row the filing is 425 (unchanged).
+    #[tokio::test(flavor = "current_thread")]
+    async fn lens_663_b_the_hop_row_read_and_the_absent_hop() {
+        use crate::hopsweep::tests as hs;
+        let w = hs::wallet(0x55);
+        let id = hs::identity(&w);
+        let id_lc = hex::encode(&id);
+        let seat = hs::skey(13);
+        let raw = hs::sweep_raw(&seat, &seat, 0, hs::HOP_SATS, &hs::DEST);
+        let honest = md_sweep_script(&id, &hs::GID, &raw);
+        // no hop row
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        let (out, _) = md_file(&db, RecordKind::Hopsweep, &honest, &id_lc).await;
+        assert_eq!(format!("{out:?}"), "Refused(HopNotIndexed)");
+        let plant = |db: &crate::pot_hook::tests::SqliteSql, valid: Option<i64>| {
+            let h = hs::hop_ctx(&w, &seat, true);
+            db.conn
+                .execute(
+                    crate::handfile::HOPPARTY_HANDFILE_FILE_SQL,
+                    rusqlite::params![
+                        h.identity,
+                        h.opponent_identity,
+                        hex::encode([0x98u8; 32]),
+                        h.hop_vout,
+                        h.hop_sats as i64,
+                        h.seat_settle_pubkey,
+                        "3044",
+                        "3044",
+                        h.hop_lock_hex,
+                        h.hop_sats_on_chain.map(|v| v as i64),
+                        2,
+                        hex::encode(hs::HOP),
+                        7,
+                        500,
+                        valid
+                    ],
+                )
+                .unwrap();
+        };
+        for (own, junk, want) in [
+            (Some(1i64), None, "Written { row_written: true }"),
+            (Some(1), Some(0), "Written { row_written: true }"),
+            (None, Some(0), "Refused(HopMarkerUnverified)"),
+            (None, None, "Refused(HopMarkerUnverified)"),
+        ] {
+            let db = crate::pot_hook::tests::SqliteSql::migrated();
+            md_index_the_hop(&db, &hs::hop_ctx(&w, &seat, true), own);
+            plant(&db, junk);
+            let (out, _) = md_file(&db, RecordKind::Hopsweep, &honest, &id_lc).await;
+            assert_eq!(format!("{out:?}"), want, "own {own:?} junk {junk:?}");
+            // the wrong game is never written in any row state
+            let (out, _) = md_file(
+                &db,
+                RecordKind::Hopsweep,
+                &md_sweep_script(&id, &[0x98u8; 32], &raw),
+                &id_lc,
+            )
+            .await;
+            assert!(
+                matches!(out, DoorOutcome::Refused(_)),
+                "own {own:?} junk {junk:?}: {out:?}"
+            );
+        }
+    }
+
+    // ── MONEY-DOOR-FOLD: the lens's LOW-1 and LOW-2 ──
+
+    fn md_owed_state(db: &crate::pot_hook::tests::SqliteSql, id_lc: &str, stale: i64) {
+        db.conn
+            .execute(
+                "INSERT OR REPLACE INTO owed_state (identity, computedAtMs, tip, rows, stale) VALUES (?1, 1, 900000, 1, ?2)",
+                rusqlite::params![id_lc, stale],
+            )
+            .unwrap();
+    }
+
+    fn md_stale(db: &crate::pot_hook::tests::SqliteSql, id_lc: &str) -> i64 {
+        db.conn
+            .query_row(
+                "SELECT stale FROM owed_state WHERE identity = ?1",
+                [id_lc],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The route's composition after the core, over the port: which answers mark, then the marks.
+    async fn md_after(
+        db: &crate::pot_hook::tests::SqliteSql,
+        out: &DoorOutcome,
+        v: &VerifiedRecord,
+    ) {
+        if let Some((id, pot)) = owed_marks_after(out, v) {
+            mark_filing_stale(
+                db,
+                id.as_deref(),
+                pot.as_ref().map(|(t, n)| (t.as_str(), *n)),
+            )
+            .await;
+        }
+    }
+
+    /// LOW-1 (direct arm): the identity's own valid chain row is the no-op, and its latch moves it to
+    /// `refundValid = 1`, which the owed list reads as the pot's valid refund: the pot's parties and the filer are
+    /// marked stale as on a written row. A repeat whose latch moves nothing marks nothing; a non-party is never marked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn money_door_fold_l1_a_latching_no_op_marks_the_pot_stale() {
+        let victim = wallet(0x61);
+        let id = identity(&victim);
+        let id_lc = hex::encode(&id);
+        let gid = [0x6au8; 32];
+        let filing = potrefund_script(&victim, &gid, &presigned_refund());
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        md_index_the_pot(&db);
+        md_seat(&db, &id_lc, &gid);
+        let bystander = "03".to_string() + &"cc".repeat(32);
+        md_owed_state(&db, &id_lc, 0);
+        md_owed_state(&db, &bystander, 0);
+        md_chain_admit(&db, &filing, &"a7".repeat(32), 1_500);
+        let (out, v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        assert_eq!(out, DoorOutcome::AlreadyIndexed { latched: true });
+        md_after(&db, &out, &v).await;
+        assert_eq!(
+            (md_stale(&db, &id_lc), md_stale(&db, &bystander)),
+            (1, 0),
+            "the latching no-op marks the pot's parties stale, never a non-party"
+        );
+        // the repeat: the row is already latched, nothing moves, nothing is marked
+        md_owed_state(&db, &id_lc, 0);
+        let (out, v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        assert_eq!(out, DoorOutcome::AlreadyIndexed { latched: false });
+        md_after(&db, &out, &v).await;
+        assert_eq!(md_stale(&db, &id_lc), 0, "a quiet no-op marks nothing");
+        // a written row still marks (the control)
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        md_index_the_pot(&db);
+        md_seat(&db, &id_lc, &gid);
+        md_owed_state(&db, &id_lc, 0);
+        let (out, v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        assert_eq!(out, DoorOutcome::Written { row_written: true });
+        md_after(&db, &out, &v).await;
+        assert_eq!(md_stale(&db, &id_lc), 1);
+        // the route marks through `owed_marks_after` before it answers the no-op
+        let route: String = include_str!("record_post.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        let at = |needle: &str| route.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(
+            at("ifletSome((identity,pot))=owed_marks_after(&outcome,&verified)")
+                < at("DoorOutcome::AlreadyIndexed{..}=>{bump(&ALREADY_INDEXED_BY_KIND,kind);"),
+            "the route marks before it answers the no-op"
+        );
+    }
+
+    /// LOW-1 (handfile arm): a batch that wrote no row is marked when the refund's chain no-op latched, and only
+    /// then; the handfile route calls the decision with the latch and marks before its re-file answer.
+    #[test]
+    fn money_door_fold_l1_b_the_handfile_noop_latch_marks() {
+        use crate::handfile::handfile_noop_moves_owed as moves;
+        assert_eq!(
+            (moves(false, true), moves(false, false), moves(true, true), moves(true, false)),
+            (true, false, false, false),
+            "a no-op batch moves what is owed only when the latch moved a row (a written batch marks on its own path)"
+        );
+        let hf: String = include_str!("handfile.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        let call = hf
+            .find("ifhandfile_noop_moves_owed(wrote,refund_chain.latched){crate::record_post::note_filing_and_recompute(")
+            .expect("the handfile arm marks on a latching no-op");
+        assert!(
+            hf[call..].contains("if!wrote{crate::record_post::note_already_filed(kind);"),
+            "the latching no-op is marked before the re-file answer"
+        );
+    }
+
+    /// A port whose answers carry NO change count for the statements it names (D1's `meta.changes` is optional).
+    struct NoCount<'a>(&'a crate::pot_hook::tests::SqliteSql, &'static str);
+    impl crate::pot_hook::SqlPort for NoCount<'_> {
+        async fn run_batch(
+            &self,
+            stmts: Vec<crate::pot_hook::Stmt>,
+        ) -> std::result::Result<Vec<crate::pot_hook::StmtOut>, String> {
+            let named: Vec<bool> = stmts.iter().map(|s| s.sql == self.1).collect();
+            let mut outs = self.0.run_batch(stmts).await?;
+            for (o, n) in outs.iter_mut().zip(named) {
+                if n {
+                    o.changes = None;
+                }
+            }
+            Ok(outs)
+        }
+        async fn counters(&self, d: Vec<(String, u64)>) {
+            self.0.counters(d).await
+        }
+        fn now_ms(&self) -> u64 {
+            self.0.now_ms()
+        }
+        fn log(&self, l: &str) {
+            self.0.log(l)
+        }
+    }
+
+    /// LOW-2: an answer with no change count is never read as zero rows written. The `collected` door re-reads its
+    /// row by key: written by this request (its stamp is this request's) is a write, marked; on file before is the
+    /// re-file. The chain latch with no count is read as moved (it marks: the safe direction).
+    #[tokio::test(flavor = "current_thread")]
+    async fn money_door_fold_l2_an_absent_change_count_is_never_zero_rows() {
+        let w = wallet(0x62);
+        let id = identity(&w);
+        let id_lc = hex::encode(&id);
+        let gid = [0x6bu8; 32];
+        let sig = sign(
+            &w,
+            collected_protocol(),
+            &hex::encode(gid),
+            &collected_challenge(&hex::encode(gid), &id_lc),
+        );
+        let marker = script(&[b"LOW/collected/v1", &gid, &id, &sig]);
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        let port = NoCount(&db, COLLECTED_FILE_SQL);
+        let mut v = verify_record_post(RecordKind::Collected, &marker, &id_lc).unwrap();
+        let first = file_verified(&port, &mut v, &id_lc, 2_000).await.unwrap();
+        assert_eq!(
+            first,
+            DoorOutcome::Written { row_written: true },
+            "a first filing whose answer carries no count is a write"
+        );
+        md_owed_state(&db, &id_lc, 0);
+        md_after(&db, &first, &v).await;
+        assert_eq!(md_stale(&db, &id_lc), 1, "and it marks the filer");
+        let mut v = verify_record_post(RecordKind::Collected, &marker, &id_lc).unwrap();
+        let again = file_verified(&port, &mut v, &id_lc, 2_500).await.unwrap();
+        assert_eq!(
+            again,
+            DoorOutcome::Written { row_written: false },
+            "a re-file with no count: the row re-read by key was on file before"
+        );
+        // the potrefund chain latch with no count
+        let victim = wallet(0x63);
+        let rid = identity(&victim);
+        let rid_lc = hex::encode(&rid);
+        let filing = potrefund_script(&victim, &gid, &presigned_refund());
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        md_index_the_pot(&db);
+        md_seat(&db, &rid_lc, &gid);
+        md_chain_admit(&db, &filing, &"a8".repeat(32), 1_500);
+        let port = NoCount(&db, POTREFUND_CHAIN_LATCH_SQL);
+        let mut v = verify_record_post(RecordKind::Potrefund, &filing, &rid_lc).unwrap();
+        assert_eq!(
+            file_verified(&port, &mut v, &rid_lc, 2_000).await.unwrap(),
+            DoorOutcome::AlreadyIndexed { latched: true }
+        );
+        // the worker's port carries the count as D1 answers it, never defaulting an absent one to 0
+        let routes: String = include_str!("routes.rs").split_whitespace().collect();
+        assert!(routes
+            .contains("letchanges=r.meta().ok().flatten().and_then(|m|m.changes).map(|n|nasu64);"));
     }
 }

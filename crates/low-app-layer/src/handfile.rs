@@ -757,6 +757,13 @@ pub fn handfile_row_keys(v: &VerifiedHandfile) -> [(HandfileSlot, String, u32); 
     ]
 }
 
+/// PURE (the MONEY-DOOR lens's LOW-1): a handfile batch that wrote no row still moves what is owed when the refund's
+/// chain no-op latched the poster's own chain row; then the pot's parties and the filer are marked as on a write,
+/// and the answer stays the re-file's (`filed: false`). A batch that wrote is marked on its own path.
+pub(crate) fn handfile_noop_moves_owed(wrote: bool, refund_latched: bool) -> bool {
+    !wrote && refund_latched
+}
+
 /// The door's handfile arm, after the kind and the raw body are read (`record_post` dispatches here).
 pub async fn handfile_post(
     ctx: &worker::RouteContext<crate::auth::AuthState>,
@@ -829,11 +836,11 @@ pub async fn handfile_post(
     // bsv-low #798: the refund's chain no-op is the direct door's, row by row (a junk-signed chain row naming this
     // identity is never a no-op; an own row is latched before the batch)
     let port = crate::routes::D1Sql::of(&ctx.env)?;
-    let own_refund_rows =
+    let refund_chain =
         crate::record_post::potrefund_chain_noop(&port, &verified.potrefund, pot.as_ref())
             .await
             .map_err(worker::Error::RustError)?;
-    write[HandfileSlot::Potrefund as usize] = own_refund_rows == 0;
+    write[HandfileSlot::Potrefund as usize] = refund_chain.own == 0;
     for (slot, v) in [
         (HandfileSlot::PotpartyV1, &v1),
         (HandfileSlot::PotpartyV2, &v2),
@@ -960,6 +967,20 @@ pub async fn handfile_post(
     let wrote = results
         .iter()
         .any(|r| insert_wrote_a_row(r.meta().ok().flatten().and_then(|m| m.changes)));
+    // the MONEY-DOOR lens's LOW-1: the batch wrote nothing, but the refund's chain no-op latched the poster's own
+    // chain row `refundValid = 1`, which the owed list reads as the pot's valid refund
+    if handfile_noop_moves_owed(wrote, refund_chain.latched) {
+        crate::record_post::note_filing_and_recompute(
+            ctx,
+            &db,
+            Some(verified.identity.clone()),
+            Some((
+                verified.potrefund.pot_txid.to_ascii_lowercase(),
+                verified.potrefund.pot_vout,
+            )),
+        )
+        .await;
+    }
     if !wrote {
         crate::record_post::note_already_filed(kind);
         return crate::routes::json_response(
