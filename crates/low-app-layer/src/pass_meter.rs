@@ -7,7 +7,7 @@
 //! serves as `/health/invariants.appLayerScheduledPass`, so a beta window can read whether `/tip`'s latency rides the
 //! pass.
 //!
-//! The pass is two `wait_until` tasks (`pot_hook::schedule_tick`: the drain, then the tracker). Each phase is timed by
+//! The pass is three `wait_until` tasks (`pot_hook::schedule_tick`: the drain, the chain-event intake, the tracker). Each phase is timed by
 //! [`PassMeter::phase`] and each task tells the meter it ended ([`PassMeter::task_done`]); the task that ends LAST
 //! writes the line and the row. Stated: a task the platform cancels never ends, so its pass writes nothing (the row's
 //! `at` then stays at the previous pass, which is the signal); a phase a deadline dropped is timed to the drop.
@@ -26,8 +26,8 @@ pub const PASS_UPSERT_SQL: &str = "INSERT INTO applayer_scheduled_pass (id, at, 
      ON CONFLICT(id) DO UPDATE SET at = excluded.at, started_at = excluded.started_at, \
      wall_ms = excluded.wall_ms, phases = excluded.phases, passes = applayer_scheduled_pass.passes + 1";
 
-/// The two tasks of a scheduled pass (the drain and the tracker).
-pub const SCHEDULED_TASKS: u32 = 2;
+/// The three tasks of a scheduled pass (the drain, the chain-event intake since bsv-low #778, and the tracker).
+pub const SCHEDULED_TASKS: u32 = 3;
 
 /// One scheduled pass's clock: its start, each phase's wall, the tasks still running.
 pub struct PassMeter {
@@ -199,6 +199,12 @@ mod tests {
             "the first task to end writes nothing: {:?}",
             sql.lines.borrow()
         );
+        // bsv-low #778: the third task (the chain-event intake, its own since)
+        end_task(&meter, Some(&sql)).await;
+        assert!(
+            sql.lines.borrow().is_empty(),
+            "the second task to end writes nothing"
+        );
         meter.phase("tracker.chain_events", step(25_000)).await;
         end_task(&meter, Some(&sql)).await;
         assert_eq!(
@@ -267,8 +273,8 @@ mod tests {
         }
         assert_eq!(
             sched.matches("pass_meter::end_task(").count(),
-            2,
-            "each of the two tasks ends through the meter"
+            3,
+            "each of the three tasks ends through the meter"
         );
     }
 }

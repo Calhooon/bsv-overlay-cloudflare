@@ -142,6 +142,16 @@ pub fn arcade_pass_rejudged(s: &crate::arcade_reorg::ArcadePassSummary) -> bool 
         || proof_leg_rejudged(&s.transactions)
 }
 
+/// PURE (bsv-low #620): the chain-event feed's pass has reorg evidence, D7's rule over the header source's own word: a
+/// selecting event (a reorg, a fork, a split, an invalidation) finished with its window judged, one released
+/// unresolved (the conservative side), or any row re-judged on the way. A pass of tips and tip ages alone is none.
+pub fn feed_pass_rejudged(s: &crate::chain_feed::FeedPassSummary) -> bool {
+    s.applied + s.released > 0
+        || reverify_rejudged(&s.spenders)
+        || proof_leg_rejudged(&s.pot_beefs)
+        || proof_leg_rejudged(&s.transactions)
+}
+
 async fn delete(db: &D1Database, sql: &str, binds: &[JsValue]) -> Result<u64, String> {
     let stmt = db.prepare(sql);
     let stmt = if binds.is_empty() {
