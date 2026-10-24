@@ -10242,6 +10242,9 @@ thread_local! {
     /// an absence (and never a memo).
     static ARCADE_ROUTE_HEALTHY: std::cell::Cell<Option<(i64, bool)>> = const { std::cell::Cell::new(None) };
     static WOC_ROUTE_HEALTHY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The COURIER-RUNG lens fold (M1): BananaBlocks' native tx route, proven by its anchor (`KNOWN_MINED_TXID` served
+    /// as a mined claim) at `(ms, healthy)`; both outcomes held for [`ARCADE_ANCHOR_PROBE_TTL_MS`], as Arcade's.
+    static BANANABLOCKS_ROUTE_HEALTHY: std::cell::Cell<Option<(i64, bool)>> = const { std::cell::Cell::new(None) };
 }
 
 /// SHIPPED trusted-BEEF reads shared by `/tx-any`'s index leg and `/beef`
@@ -10317,6 +10320,45 @@ async fn tx_any_index_leg(
 }
 
 const ARCADE_ANCHOR_PROBE_TTL_MS: i64 = 30_000;
+
+/// The COURIER-RUNG lens fold (M1): BananaBlocks' route memo when it is inside [`ARCADE_ANCHOR_PROBE_TTL_MS`].
+fn bananablocks_route_fresh(now_ms: i64) -> Option<bool> {
+    BANANABLOCKS_ROUTE_HEALTHY.with(|c| {
+        c.get()
+            .filter(|(at, _)| now_ms >= *at && now_ms - at < ARCADE_ANCHOR_PROBE_TTL_MS)
+            .map(|(_, healthy)| healthy)
+    })
+}
+
+/// The COURIER-RUNG lens fold (M1, #614): is BananaBlocks' native tx route PROVEN? It is when the same route serves
+/// the known-mined anchor (`txany::KNOWN_MINED_TXID`) as a mined claim (`confirmed: true`, a positive `block_height`,
+/// the anchor's own txid, no `confirmation_unknown`: `txany::parse_bananablocks_tx_claim`). One GET per isolate per
+/// [`ARCADE_ANCHOR_PROBE_TTL_MS`], both outcomes memoised (Arcade's shape: an unproven route is not asked again on
+/// every request); counted `tx_any_bananablocks_anchor_{ok,unknown}_total` when asked.
+async fn bananablocks_route_healthy<G, F>(now_ms: i64, get: &G) -> bool
+where
+    G: Fn(String) -> F,
+    F: std::future::Future<Output = Option<(u16, Vec<u8>)>>,
+{
+    if let Some(healthy) = bananablocks_route_fresh(now_ms) {
+        return healthy;
+    }
+    let anchor = crate::txany::KNOWN_MINED_TXID;
+    let healthy = match get(format!("{BANANABLOCKS_BASE}/tx/{anchor}")).await {
+        Some((200, body)) => serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| crate::txany::parse_bananablocks_tx_claim(&v, anchor))
+            .is_some_and(|(confirmed, height)| confirmed && height.is_some_and(|h| h > 0)),
+        _ => false,
+    };
+    crate::courier::note_presence(if healthy {
+        "tx_any_bananablocks_anchor_ok_total"
+    } else {
+        "tx_any_bananablocks_anchor_unknown_total"
+    });
+    BANANABLOCKS_ROUTE_HEALTHY.with(|c| c.set(Some((now_ms, healthy))));
+    healthy
+}
 fn arcade_anchor_probe_due(now_ms: i64) -> bool {
     ARCADE_ROUTE_HEALTHY.with(|c| {
         c.get()
@@ -10482,7 +10524,7 @@ where
         ARCADE_ROUTE_HEALTHY.with(|c| c.set(Some((now_ms, healthy))));
     }
     let (mut observation, absence, claimed_height, source) =
-        tx_any_courier_leg_via(txid, &get).await;
+        tx_any_courier_leg_via(txid, now_ms, &get).await;
     if let TxObservation::Present { confirmed, raw_hex } = observation {
         if confirmed {
             let proven = if let Some(height) = claimed_height {
@@ -10570,7 +10612,7 @@ where
     G: Fn(String) -> F,
     F: std::future::Future<Output = Option<(u16, Vec<u8>)>>,
 {
-    let (observation, absence, claimed_height, _) = tx_any_courier_leg_via(txid, get).await;
+    let (observation, absence, claimed_height, _) = tx_any_courier_leg_via(txid, 0, get).await;
     (observation, absence, claimed_height)
 }
 
@@ -10585,8 +10627,16 @@ where
 /// needs TWO capable sources: WoC's clean 404 behind its healthy route AND BananaBlocks' recorded not-found
 /// (`txany::bananablocks_tx_not_found`); one of them alone is the honest unknown. The WoC-style mirror of
 /// BananaBlocks is never asked. Each rung's answer is counted `tx_any_courier_<rung>_<outcome>_total`.
+///
+/// The COURIER-RUNG lens fold (M1, #614's rule: absence needs two capable sources that both LOOKED): BananaBlocks'
+/// not-found is a look only behind a PROVEN route, as WoC's 404 and Arcade's held 404 are
+/// ([`bananablocks_route_healthy`]: its native route serves the known-mined anchor as a mined claim, memoised per
+/// isolate for the Arcade anchor's TTL); behind an unproven route it is "could not look"
+/// (`tx_any_courier_bananablocks_couldnotlook_total`). Any other BananaBlocks 404 is a fault. The anchor is asked only
+/// when the not-found could vote, i.e. beside WoC's own look.
 async fn tx_any_courier_leg_via<G, F>(
     txid_lc: &str,
+    now_ms: i64,
     get: G,
 ) -> (
     crate::txany::TxObservation,
@@ -10656,6 +10706,7 @@ where
 
     // bsv-low #868: BananaBlocks' native view, the second capable mempool source
     let mut banana_not_found = false;
+    let mut banana_unproven = false;
     let banana = match get(format!("{BANANABLOCKS_BASE}/tx/{txid_lc}")).await {
         Some((200, body)) => match serde_json::from_slice::<serde_json::Value>(&body)
             .ok()
@@ -10669,14 +10720,25 @@ where
             None => TxObservation::Fault,
         },
         Some((status, body)) if crate::txany::bananablocks_tx_not_found(status, &body) => {
-            banana_not_found = true;
-            TxObservation::Absent
+            // the lens fold's M1: a look only behind a proven route, asked only where it could vote (WoC looked)
+            banana_not_found = bananablocks_route_fresh(now_ms) == Some(true)
+                || (woc == TxObservation::Absent && bananablocks_route_healthy(now_ms, &get).await);
+            banana_unproven = !banana_not_found;
+            if banana_not_found {
+                TxObservation::Absent
+            } else {
+                TxObservation::Fault
+            }
         }
         _ => TxObservation::Fault,
     };
     crate::courier::note_presence(&crate::txany::courier_rung_counter(
         "bananablocks",
-        crate::txany::CourierRungOutcome::of(&banana),
+        if banana_unproven {
+            crate::txany::CourierRungOutcome::CouldNotLook
+        } else {
+            crate::txany::CourierRungOutcome::of(&banana)
+        },
     ));
     if matches!(banana, TxObservation::Present { .. }) {
         return (
@@ -14250,6 +14312,7 @@ mod e606_tests {
         Vec<String>,
     ) {
         WOC_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
+        BANANABLOCKS_ROUTE_HEALTHY.with(|c| c.set(None));
         let asked = std::cell::RefCell::new(Vec::new());
         let get = |url: String| {
             asked.borrow_mut().push(url.clone());
@@ -14332,11 +14395,19 @@ mod e606_tests {
             (None, None, None),
             "confirmation_unknown is no word"
         );
-        // (4) WoC's 404 and BananaBlocks' recorded 404: two capable sources, a corroborated absence
+        // (4) WoC's 404 and BananaBlocks' recorded 404, each behind its proven route (the lens fold's M1: BananaBlocks'
+        // anchor, `KNOWN_MINED_TXID`, served as the recorded mined body): two capable sources, a corroborated absence
         let invented = c868_subject("bb_tx_not_found");
         let (s, b, _) = c868_recorded("bb_tx_not_found");
         let (bs, bb, _) = c868_recorded("bitails_tx_not_found");
+        let (ms, mb, _) = c868_recorded("bb_tx_mined");
+        let mut anchor: serde_json::Value = serde_json::from_slice(&mb).unwrap();
+        anchor["txid"] = serde_json::json!(crate::txany::KNOWN_MINED_TXID);
         let mut m = HashMap::new();
+        m.insert(
+            format!("{BANANABLOCKS_BASE}/tx/{}", crate::txany::KNOWN_MINED_TXID),
+            (ms, anchor.to_string().into_bytes()),
+        );
         m.insert(format!("{WOC_BASE}/tx/hash/{invented}"), (404, Vec::new()));
         m.insert(format!("{BANANABLOCKS_BASE}/tx/{invented}"), (s, b.clone()));
         m.insert(format!("{BITAILS_BASE}/tx/{invented}"), (bs, bb.clone()));
@@ -14745,12 +14816,17 @@ mod e606_tests {
             );
         }
 
-        /// (h) THE LENS'S M1, reproduced as behaviour: WoC's 404 counts only behind its proven route (the anchor
-        /// `KNOWN_MINED_TXID` served), BananaBlocks' recorded not-found counts with NO such check. A BananaBlocks that
-        /// answers its not-found for EVERY txid, the known-mined anchor included (an index that lost history, a
-        /// partial node behind its balancer), still completes the corroborated absence (`present: false`).
+        /// (h) THE LENS'S M1, re-aimed by the fold (lane COURIER-RUNG-FOLD): WoC's 404 counts only behind its proven
+        /// route, and so, since the fold, does BananaBlocks' recorded not-found (its anchor: `KNOWN_MINED_TXID` served
+        /// `confirmed: true` with a positive `block_height` on the same native route, memoised per isolate for the
+        /// Arcade anchor's TTL). A BananaBlocks that answers its not-found for EVERY txid, the known-mined anchor
+        /// included (an index that lost history, a partial node behind its balancer), proves no route: the leg is the
+        /// honest unknown (`present: null`), counted `tx_any_one_capable_source_unknown_total`, never `false`. RED on
+        /// `f5d2d700`: `left: (Some(false), CorroboratedAbsent)`.
         #[test]
-        fn lens868_h_bananablocks_not_found_needs_no_route_anchor() {
+        fn lens868_h_bananablocks_not_found_needs_its_route_anchor() {
+            let _ = crate::courier::take_pending_if_due(0.0);
+            BANANABLOCKS_ROUTE_HEALTHY.with(|c| c.set(None));
             let t = c868_subject("bb_tx_not_found");
             let mut m = HashMap::new();
             m.insert(format!("{WOC_BASE}/tx/hash/{t}"), (404, Vec::new()));
@@ -14764,20 +14840,30 @@ mod e606_tests {
                 nf(),
             );
             let (a, absence, asked) = lens_leg(&t, m, None, false);
-            assert_eq!(
-                (a.present, absence),
-                (Some(false), AbsenceCorroboration::CorroboratedAbsent)
-            );
+            assert_eq!((a.present, absence), (None, AbsenceCorroboration::Unknown));
             assert!(
                 asked.iter().any(|u| u.ends_with(crate::txany::KNOWN_MINED_TXID) && u.starts_with(WOC_BASE)),
                 "WoC's route is proven: {asked:?}"
             );
             assert!(
-                !asked
+                asked
                     .iter()
                     .any(|u| u.ends_with(crate::txany::KNOWN_MINED_TXID)
                         && u.starts_with(BANANABLOCKS_BASE)),
-                "BananaBlocks' route is never proven: {asked:?}"
+                "BananaBlocks' route is asked its anchor: {asked:?}"
+            );
+            let d: std::collections::BTreeMap<String, u64> =
+                crate::courier::take_pending_if_due(0.0).into_iter().collect();
+            assert_eq!(
+                d.get("tx_any_one_capable_source_unknown_total"),
+                Some(&1),
+                "{d:?}"
+            );
+            assert_eq!(d.get("tx_any_two_capable_sources_absent_total"), None, "{d:?}");
+            assert_eq!(
+                d.get("tx_any_courier_bananablocks_couldnotlook_total"),
+                Some(&1),
+                "an unproven route's not-found is could-not-look: {d:?}"
             );
         }
 
@@ -14830,6 +14916,155 @@ mod e606_tests {
                         .iter()
                         .any(|u| u.starts_with(BANANABLOCKS_BASE) && u.contains("proof")),
                     "{label}: {asked:?}"
+                );
+            }
+        }
+
+        /// BananaBlocks' anchor body for `KNOWN_MINED_TXID`: the recorded mined shape, re-keyed.
+        fn anchor_mined() -> (u16, Vec<u8>) {
+            let (s, b, _) = c868_recorded("bb_tx_mined");
+            let mut v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            v["txid"] = serde_json::json!(crate::txany::KNOWN_MINED_TXID);
+            (s, v.to_string().into_bytes())
+        }
+
+        fn two_404s(t: &str, anchor: Option<(u16, Vec<u8>)>) -> HashMap<String, (u16, Vec<u8>)> {
+            let mut m = HashMap::new();
+            m.insert(format!("{WOC_BASE}/tx/hash/{t}"), (404, Vec::new()));
+            m.insert(format!("{BANANABLOCKS_BASE}/tx/{t}"), nf());
+            if let Some(a) = anchor {
+                m.insert(
+                    format!("{BANANABLOCKS_BASE}/tx/{}", crate::txany::KNOWN_MINED_TXID),
+                    a,
+                );
+            }
+            m
+        }
+
+        fn anchor_asks(asked: &[String]) -> usize {
+            asked
+                .iter()
+                .filter(|u| {
+                    u.starts_with(BANANABLOCKS_BASE) && u.ends_with(crate::txany::KNOWN_MINED_TXID)
+                })
+                .count()
+        }
+
+        /// The fold's M1 (lane COURIER-RUNG-FOLD): BOTH capable sources LOOKED (WoC behind its anchor, BananaBlocks
+        /// behind its own: `KNOWN_MINED_TXID` served mined on its native route) and both answered their clean
+        /// not-found: `present: false`, as #614 allows, counted `tx_any_two_capable_sources_absent_total`. The anchor is
+        /// asked once and memoised for `ARCADE_ANCHOR_PROBE_TTL_MS` (both outcomes); a stale memo is asked again; an
+        /// anchor that does not answer mined (a 404, its not-found, `confirmation_unknown`, a 5xx, another txid's body,
+        /// silence) proves nothing and the leg is unknown. RED on `f5d2d700`: the anchor is never asked (`left: 0
+        /// right: 1`), and every unproven arm answers `Some(false)`.
+        #[test]
+        fn c868f_m1_b_an_absence_needs_both_routes_proven_and_the_anchor_is_memoised() {
+            let t = c868_subject("bb_tx_not_found");
+            let run_at = |m: HashMap<String, (u16, Vec<u8>)>, now: i64| {
+                WOC_ROUTE_HEALTHY.with(|c| c.set(Some(true)));
+                let asked = std::cell::RefCell::new(Vec::new());
+                let get = |url: String| {
+                    asked.borrow_mut().push(url.clone());
+                    std::future::ready(m.get(&url).cloned())
+                };
+                let (obs, absence, height) = run(tx_any_presence_leg_via(
+                    &t,
+                    now,
+                    false,
+                    None,
+                    get,
+                    |_, _| async { false },
+                ));
+                let mut a = decide_tx_any(None, None, Some(&obs), absence);
+                apply_external_height(&mut a, &obs, height);
+                (a, absence, asked.into_inner())
+            };
+            let t0 = 1_800_000_000_000_i64;
+            let _ = crate::courier::take_pending_if_due(0.0);
+            BANANABLOCKS_ROUTE_HEALTHY.with(|c| c.set(None));
+            let (a, absence, asked) = run_at(two_404s(&t, Some(anchor_mined())), t0);
+            assert_eq!(anchor_asks(&asked), 1, "{asked:?}");
+            assert_eq!(
+                (a.present, absence),
+                (Some(false), AbsenceCorroboration::CorroboratedAbsent)
+            );
+            let d: std::collections::BTreeMap<String, u64> =
+                crate::courier::take_pending_if_due(0.0).into_iter().collect();
+            assert_eq!(d.get("tx_any_two_capable_sources_absent_total"), Some(&1), "{d:?}");
+            assert_eq!(d.get("tx_any_bananablocks_anchor_ok_total"), Some(&1), "{d:?}");
+            // inside the TTL the memo answers (the anchor's map entry is gone: it is not asked)
+            let (a, _, asked) = run_at(two_404s(&t, None), t0 + ARCADE_ANCHOR_PROBE_TTL_MS - 1);
+            assert_eq!((anchor_asks(&asked), a.present), (0, Some(false)), "{asked:?}");
+            // past it the anchor is asked again; now it answers its not-found, so the leg is unknown, and that
+            // outcome is memoised too
+            let (a, _, asked) = run_at(two_404s(&t, Some(nf())), t0 + ARCADE_ANCHOR_PROBE_TTL_MS);
+            assert_eq!((anchor_asks(&asked), a.present), (1, None), "{asked:?}");
+            let (a, _, asked) =
+                run_at(two_404s(&t, Some(anchor_mined())), t0 + ARCADE_ANCHOR_PROBE_TTL_MS + 1);
+            assert_eq!(
+                (anchor_asks(&asked), a.present),
+                (0, None),
+                "an unhealthy memo holds its TTL: {asked:?}"
+            );
+            // every anchor answer that is not a mined claim for the anchor proves nothing
+            let (_, unmined, _) = c868_recorded("bb_tx_unmined");
+            let mut unknown: serde_json::Value = serde_json::from_slice(&anchor_mined().1).unwrap();
+            unknown["confirmation_unknown"] = serde_json::json!(true);
+            let mut other: serde_json::Value = serde_json::from_slice(&anchor_mined().1).unwrap();
+            other["txid"] = serde_json::json!("00".repeat(32));
+            let mut unmined_anchor: serde_json::Value = serde_json::from_slice(&unmined).unwrap();
+            unmined_anchor["txid"] = serde_json::json!(crate::txany::KNOWN_MINED_TXID);
+            for (label, anchor) in [
+                ("its not-found", Some(nf())),
+                ("an empty 404", Some((404u16, Vec::new()))),
+                ("a 503", Some((503, Vec::new()))),
+                ("a 429", Some((429, Vec::new()))),
+                ("confirmation_unknown", Some((200, unknown.to_string().into_bytes()))),
+                ("another txid's body", Some((200, other.to_string().into_bytes()))),
+                ("unmined", Some((200, unmined_anchor.to_string().into_bytes()))),
+                ("silence", None),
+            ] {
+                BANANABLOCKS_ROUTE_HEALTHY.with(|c| c.set(None));
+                let (a, absence, asked) = run_at(two_404s(&t, anchor), t0);
+                assert_eq!(anchor_asks(&asked), 1, "{label}: {asked:?}");
+                assert_eq!(
+                    (a.present, absence),
+                    (None, AbsenceCorroboration::Unknown),
+                    "{label}"
+                );
+            }
+        }
+
+        /// The fold's M1: a BananaBlocks 404 that is not its recorded not-found body is a FAULT
+        /// (`tx_any_courier_bananablocks_fault_total`), never a look: it votes toward no absence, even beside WoC's
+        /// healthy 404 and BananaBlocks' proven route, and asks no anchor. (Green on `f5d2d700` in this layer: the
+        /// rung already read it a fault; the overlay's twin, `proof_fetcher::c868f`, was RED.)
+        #[test]
+        fn c868f_m1_c_a_non_standard_bananablocks_404_is_a_fault() {
+            let t = c868_subject("bb_tx_not_found");
+            for body in [
+                br#"{"error":"transaction not found"}"#.to_vec(),
+                br#"{"error":"Not Found"}"#.to_vec(),
+                b"Transaction not found".to_vec(),
+                Vec::new(),
+            ] {
+                let _ = crate::courier::take_pending_if_due(0.0);
+                BANANABLOCKS_ROUTE_HEALTHY.with(|c| c.set(Some((0, true))));
+                let mut m = HashMap::new();
+                m.insert(format!("{WOC_BASE}/tx/hash/{t}"), (404, Vec::new()));
+                m.insert(format!("{BANANABLOCKS_BASE}/tx/{t}"), (404, body.clone()));
+                let (a, absence, asked) = lens_leg(&t, m, Some(true), false);
+                assert_eq!(
+                    (a.present, absence, anchor_asks(&asked)),
+                    (None, AbsenceCorroboration::Unknown, 0),
+                    "{body:?}"
+                );
+                let d: std::collections::BTreeMap<String, u64> =
+                    crate::courier::take_pending_if_due(0.0).into_iter().collect();
+                assert_eq!(
+                    d.get("tx_any_courier_bananablocks_fault_total"),
+                    Some(&1),
+                    "{body:?}: {d:?}"
                 );
             }
         }
