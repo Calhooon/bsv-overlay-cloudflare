@@ -826,6 +826,10 @@ pub struct SweptHome {
     pub output_spent: bool,
     /// The sweep's outputs to the seat's home (vout, sats), when its bytes were read and the home is known.
     pub home_outputs: Vec<(u32, u64)>,
+    /// The COURIER-RUNG lens fold (L2): a courier's word alone said the sweep is confirmed (WoC's `/spent` status,
+    /// BananaBlocks' `spendScope`), which presses nothing: `confirmed` is false on a filed or index-bytes sweep and the
+    /// row serves this as its `spenderPresence` hint. Always false where `confirmed` holds.
+    pub courier_confirmed: bool,
 }
 
 /// Spenders whose stored bytes one recompute reads to classify a hop's spend (bounded: a lived-in identity's
@@ -2996,7 +3000,9 @@ fn tracker_confirmed_by_other(
     .any(|id| !id.eq_ignore_ascii_case(sweep) && spender_mined(i, Some(id), false))
 }
 
-fn non_pot_spender(i: &OwedInputs, h: &HopEntry, outpoint: &str) -> Option<(String, bool)> {
+/// Answers (spender, confirmed, courier_only): `courier_only` is the COURIER-RUNG lens fold's (L2) flag, set when
+/// `confirmed` rests on the chain rung's courier word alone (no checked tracker word, no checked mined proof).
+fn non_pot_spender(i: &OwedInputs, h: &HopEntry, outpoint: &str) -> Option<(String, bool, bool)> {
     if h.spent == Some(true) {
         if let Some(s) = h.spending_txid.as_deref() {
             let s = s.to_ascii_lowercase();
@@ -3008,7 +3014,7 @@ fn non_pot_spender(i: &OwedInputs, h: &HopEntry, outpoint: &str) -> Option<(Stri
                 let confirmed =
                     index_proven_or_spender_mined(i, Some(&s), index_proven, index_proven)
                         || i.proof_mined_spenders.contains(&s);
-                Some((s.clone(), confirmed))
+                Some((s.clone(), confirmed, false))
             };
         }
     }
@@ -3022,9 +3028,9 @@ fn non_pot_spender(i: &OwedInputs, h: &HopEntry, outpoint: &str) -> Option<(Stri
     }
     // bsv-low #692 (RC-L34): the spent-any ladder's `spent_confirmed` OR a chaintracks-checked mined proof of the
     // sweep this pass holds (the only confirming courier, WoC `/0/spent`, can fault; the proof is the fallback).
-    let confirmed = spender_mined(i, Some(&s), w.spent_confirmed == Some(true))
-        || i.proof_mined_spenders.contains(&s);
-    Some((s.clone(), confirmed))
+    let checked = spender_mined(i, Some(&s), false) || i.proof_mined_spenders.contains(&s);
+    let confirmed = checked || spender_mined(i, Some(&s), w.spent_confirmed == Some(true));
+    Some((s.clone(), confirmed, confirmed && !checked))
 }
 
 /// The games whose `collected` filings the recompute must read: every SPENT pot the results name AND every hop the
@@ -3215,16 +3221,21 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
             // bsv-low #736: the hop row's latch naming the filed sweep is the index's proof (never vetoed by the
             // sweep's word, still yielding to a contradicting confirmed spender); the chain rung's is a courier's
             let index_latched = named_by_index && h.spent_confirmed == Some(true) && !contradicted;
+            // the COURIER-RUNG lens fold (L2, NS-3, #692): the chain rung's `spent_confirmed` (WoC's status, or
+            // BananaBlocks' scope under a WoC fault) is a courier's word, never a press: it is no longer `legacy` here.
+            // What presses is the index (its proof, its hop-row latch), a CHECKED tracker `mined` word, or a
+            // chaintracks-checked mined proof of the sweep; a courier's confirmed alone is the pending wait's hint.
             let confirmed = index_word
                 || tracker_word
                 || index_proven_or_spender_mined(
                     i,
                     Some(&filed.sweep_txid),
                     index_latched,
-                    index_word
-                        || (named_by_index && h.spent_confirmed == Some(true))
-                        || by_chain.and_then(|w| w.spent_confirmed) == Some(true),
-                );
+                    index_word || (named_by_index && h.spent_confirmed == Some(true)),
+                )
+                || i.proof_mined_spenders.contains(&filed.sweep_txid);
+            let courier_confirmed =
+                !confirmed && by_chain.and_then(|w| w.spent_confirmed) == Some(true);
             return Some(SweptHome {
                 sweep_txid: filed.sweep_txid.clone(),
                 raw_hex: Some(filed.raw_hex.clone()),
@@ -3242,11 +3253,12 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
                     .iter()
                     .map(|o| (o.vout, o.sats))
                     .collect(),
+                courier_confirmed,
             });
         }
     }
     // an UNFILED sweep (a device before the filing existed, a recovery tool): the spender's stored bytes pay MY home
-    let (spender, confirmed) = non_pot_spender(i, h, &outpoint)?;
+    let (spender, confirmed, courier_only) = non_pot_spender(i, h, &outpoint)?;
     let outs = i.spender_outputs.get(&spender)?;
     if outs.iter().any(|o| o.pot_lock) {
         return None; // a transaction that CREATES a pot is a JOIN, never a sweep (the delta-verify's NEW-3)
@@ -3272,10 +3284,15 @@ fn swept_home(i: &OwedInputs, h: &HopEntry) -> Option<SweptHome> {
     } else {
         "index-bytes"
     };
+    // the COURIER-RUNG lens fold (L2): an index-bytes sweep is a press, so a courier's confirmed alone is its hint; a
+    // courier-bytes sweep is never claimable (the gate's M3) and keeps the courier's word for its home look (#485)
+    let courier_confirmed = source == "index-bytes" && courier_only;
+    let confirmed = confirmed && !courier_confirmed;
     Some(SweptHome {
         raw_hex: None,
         pays_sats: Some(sum),
         confirmed,
+        courier_confirmed,
         index_proven: false,
         index_proof_height: None,
         source,
@@ -3821,6 +3838,12 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 facts["claimReason"] = json!(UNCONFIRMED_PAYOUT_REASON);
                 facts["chainWait"] = json!("block");
             }
+            if swept.courier_confirmed {
+                // the COURIER-RUNG lens fold (L2): the courier's confirmed is served, as a hint, never a press (the
+                // route's `mark_pending_spender` may name the courier's rung where it holds that answer)
+                facts["spenderPresence"] =
+                    json!({"word": "spent", "tier": "pending", "source": "courier"});
+            }
             if swept.source == "courier-bytes" {
                 // the gate's M3 (2026-09-20): the index holds no bytes and no proof for this transaction, so
                 // `/credit-beef` cannot assemble the credit; the row tells the truth instead of a press that pends
@@ -3879,6 +3902,11 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     "tracker-proof"
                 } else if by_index {
                     "index"
+                } else if swept.source != "courier-bytes"
+                    && i.proof_mined_spenders.contains(&swept.sweep_txid)
+                {
+                    // the COURIER-RUNG lens fold (L2): on a press the chain rung's word confirmed nothing; the proof did
+                    "proof"
                 } else if chain_rung_confirmed {
                     if word.and_then(|w| w.age_ms).is_some() {
                         "chain-memo"
@@ -10516,7 +10544,9 @@ pub(crate) mod tests {
             Some(HOP_STRANDED_AFTER_MS + 1),
         )];
         let by_chain = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
-        for (words, claimable) in [(&none, true), (&unchecked, false)] {
+        // the COURIER-RUNG lens fold (L2): with no word row the courier's confirmation no longer presses either
+        // (it was `(&none, true)`): a courier's word is a hint, never a press
+        for (words, claimable) in [(&none, false), (&unchecked, false)] {
             let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
             i.hop_sweeps = &sweeps;
             i.hop_chain = &by_chain;
@@ -10560,7 +10590,8 @@ pub(crate) mod tests {
         i.hop_sweeps = &sweeps;
         let rows = derive_owed_rows(&i);
         assert_eq!(rows[0].facts["claimable"], true);
-        // the CHAIN rung naming my sweep on an index-unspent hop is the same payout (a sweep broadcast direct to ARC)
+        // the CHAIN rung naming my sweep on an index-unspent hop is the same payout (a sweep broadcast direct to ARC);
+        // the COURIER-RUNG lens fold (L2): the courier's confirmation is its hint, the press waits for a checked word
         let old = [hop(
             HopStatus::Unspent,
             None,
@@ -10573,13 +10604,74 @@ pub(crate) mod tests {
         let rows = derive_owed_rows(&i);
         assert_eq!(
             (rows[0].family, rows[0].facts["claimable"].as_bool()),
-            (OwedFamily::Payout, Some(true))
+            (OwedFamily::Payout, Some(false))
         );
+        assert_eq!(rows[0].facts["spenderPresence"]["source"], "courier");
         // a spender that is NOT my filing (another tx) stays could-not-judge, as before
         let other = [hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000))];
         let mut i = inputs(&[], &[], &other, &v, &c, &no_pots, Some(900_000));
         i.hop_sweeps = &sweeps;
         assert_eq!(derive_owed_rows(&i)[0].family, OwedFamily::Unbound);
+    }
+
+    /// The COURIER-RUNG lens fold (L2, NS-3 and #692's rule): a courier's "confirmed" is a HINT, never a press. A
+    /// filed sweep whose only confirming word is the chain rung's (WoC's `/spent` status, or since #868 BananaBlocks'
+    /// `spendScope: "confirmed"` under a WoC fault) and that the tracker holds no row for is the pending chain-wait,
+    /// never `claimable`, the courier's word served as the row's `spenderPresence` hint; the index's proof, a CHECKED
+    /// tracker `mined` word or a chaintracks-checked mined proof of the sweep (`proof_mined_spenders`) presses it.
+    /// RED on `f5d2d700`: `left: (Payout, Some(true)) right: (Payout, Some(false))`.
+    #[test]
+    fn c868f_l2_a_couriers_confirmed_is_never_a_press_by_itself() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        let hops = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let filing = filed(&key, &sweep);
+        let by_chain = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_sweeps = &filing;
+        i.hop_chain = &by_chain;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(
+            (rows[0].family, rows[0].facts["claimable"].as_bool()),
+            (OwedFamily::Payout, Some(false))
+        );
+        assert_eq!(rows[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON);
+        assert_eq!(rows[0].facts["chainWait"], "block");
+        assert_eq!(
+            rows[0].facts["spenderPresence"],
+            json!({"word": "spent", "tier": "pending", "source": "courier"}),
+            "the courier's confirmed is served as the hint"
+        );
+        assert!(rows[0].facts.get("confirmedSource").is_none());
+        // a chaintracks-checked mined proof of the sweep presses it ("proof"), the hint gone
+        let proofs = HashSet::from([sweep.clone()]);
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_sweeps = &filing;
+        i.hop_chain = &by_chain;
+        i.proof_mined_spenders = &proofs;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["claimable"], true);
+        assert_eq!(rows[0].facts["confirmedSource"], "proof");
+        assert!(rows[0].facts.get("spenderPresence").is_none());
+        // the index's proof presses it, whatever the courier says
+        let proven = filed_proven(&key, &sweep, Some(899_990));
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_sweeps = &proven;
+        i.hop_chain = &by_chain;
+        assert_eq!(derive_owed_rows(&i)[0].facts["claimable"], true);
+        // a courier that says "unconfirmed" is no hint of a confirmation: the plain wait, no `spenderPresence` here
+        let lagging = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(false));
+        let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
+        i.hop_sweeps = &filing;
+        i.hop_chain = &lagging;
+        let rows = derive_owed_rows(&i);
+        assert_eq!(rows[0].facts["claimable"], false);
+        assert!(rows[0].facts.get("spenderPresence").is_none());
     }
 
     #[test]
@@ -10885,7 +10977,12 @@ pub(crate) mod tests {
         assert_eq!(rows[0].facts["sweepSource"], "index-bytes");
         assert_eq!(rows[0].facts["sweepTxid"], sweep);
         assert!(rows[0].facts["sweepRawHex"].is_null());
-        assert_eq!(rows[0].facts["claimable"], true);
+        // the COURIER-RUNG lens fold (L2): the chain rung's courier confirmation alone is the hint (it was claimable);
+        // the sweep's checked mined proof presses it
+        assert_eq!(rows[0].facts["claimable"], false);
+        let proofs = HashSet::from([sweep.clone()]);
+        i.proof_mined_spenders = &proofs;
+        assert_eq!(derive_owed_rows(&i)[0].facts["claimable"], true);
         // 2. the home output already SPENT (collected and moved on) → not a row
         let moved = pays(&sweep, &[(0, &my_pkh, 20_000, Some(true))]);
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
@@ -11201,9 +11298,18 @@ pub(crate) mod tests {
             payout.facts["claimable"], false,
             "a different spender's confirmation is not the sweep's"
         );
-        // the chain naming the sweep, confirmed → claimable
+        // the chain naming the sweep, confirmed: the COURIER-RUNG lens fold (L2) makes that a hint, not a press (it
+        // was claimable); with the sweep's checked mined proof → claimable
         let by_sweep = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
         i.hop_chain = &by_sweep;
+        let rows = derive_owed_rows(&i);
+        let payout = rows
+            .iter()
+            .find(|r| r.family == OwedFamily::Payout)
+            .expect("the sweep's payout row");
+        assert_eq!(payout.facts["claimable"], false);
+        let proofs = HashSet::from([sweep.clone()]);
+        i.proof_mined_spenders = &proofs;
         let rows = derive_owed_rows(&i);
         let payout = rows
             .iter()
@@ -12609,8 +12715,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_filed_sweep_the_index_names_but_never_confirmed_is_claimable_once_the_chain_rung_confirms_it(
-    ) {
+    fn a_filed_sweep_the_index_names_but_never_confirmed_is_claimable_once_a_checked_word_confirms_it() {
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let sweep = tx(0x0c);
         let key = format!("{}:0", tx(0x07));
@@ -12630,11 +12735,18 @@ pub(crate) mod tests {
         let rows = derive_owed_rows(&i);
         assert_eq!(rows[0].family, OwedFamily::Payout);
         assert_eq!(rows[0].facts["claimable"], false); // the index's word alone: not yet
-                                                       // the courier's word heals it: the same spender, confirmed
+        // the COURIER-RUNG lens fold (L2): the courier's word (the same spender, confirmed) no longer heals the press;
+        // it is the row's hint (it healed it before the fold)
         let word = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
         i.hop_chain = &word;
         let rows = derive_owed_rows(&i);
         assert_eq!(rows[0].family, OwedFamily::Payout);
+        assert_eq!(rows[0].facts["claimable"], false);
+        assert_eq!(rows[0].facts["spenderPresence"]["source"], "courier");
+        // a chaintracks-checked mined proof of the sweep heals it
+        let proofs = HashSet::from([sweep.clone()]);
+        i.proof_mined_spenders = &proofs;
+        let rows = derive_owed_rows(&i);
         assert_eq!(rows[0].facts["claimable"], true);
         assert_eq!(rows[0].facts["sweepSource"], "hopsweep-filing");
     }

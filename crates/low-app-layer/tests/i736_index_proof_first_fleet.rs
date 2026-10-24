@@ -411,10 +411,12 @@ fn i736_pin4_a_couriers_bare_confirmation_still_yields_to_the_word() {
     ] {
         let with_word = owed(&pages, &db, &words_for(COURIER, shape));
         for i in COURIER {
-            // with no word row the courier's claim stands, as before #736
+            // with no word row the courier's claim stood before the COURIER-RUNG lens fold (L2: a courier's
+            // "confirmed" is a hint, never a press): it is now the pending wait, the courier's word its hint
             let baseline = row_without_words(&no_row, i);
-            assert_eq!(baseline["facts"]["claimable"], true);
-            assert_eq!(baseline["facts"]["confirmedSource"], "chain-probe");
+            assert_eq!(baseline["facts"]["claimable"], false);
+            assert_eq!(baseline["facts"]["chainWait"], "block");
+            assert_eq!(baseline["facts"]["spenderPresence"]["source"], "courier");
             // a word that is not a checked mined word still holds the courier's bare claim back
             let judged = row_without_words(&with_word, i);
             assert_eq!(
