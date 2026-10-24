@@ -14873,13 +14873,19 @@ mod e606_tests {
                 "BananaBlocks' route is asked its anchor: {asked:?}"
             );
             let d: std::collections::BTreeMap<String, u64> =
-                crate::courier::take_pending_if_due(0.0).into_iter().collect();
+                crate::courier::take_pending_if_due(0.0)
+                    .into_iter()
+                    .collect();
             assert_eq!(
                 d.get("tx_any_one_capable_source_unknown_total"),
                 Some(&1),
                 "{d:?}"
             );
-            assert_eq!(d.get("tx_any_two_capable_sources_absent_total"), None, "{d:?}");
+            assert_eq!(
+                d.get("tx_any_two_capable_sources_absent_total"),
+                None,
+                "{d:?}"
+            );
             assert_eq!(
                 d.get("tx_any_courier_bananablocks_couldnotlook_total"),
                 Some(&1),
@@ -15009,18 +15015,34 @@ mod e606_tests {
                 (Some(false), AbsenceCorroboration::CorroboratedAbsent)
             );
             let d: std::collections::BTreeMap<String, u64> =
-                crate::courier::take_pending_if_due(0.0).into_iter().collect();
-            assert_eq!(d.get("tx_any_two_capable_sources_absent_total"), Some(&1), "{d:?}");
-            assert_eq!(d.get("tx_any_bananablocks_anchor_ok_total"), Some(&1), "{d:?}");
+                crate::courier::take_pending_if_due(0.0)
+                    .into_iter()
+                    .collect();
+            assert_eq!(
+                d.get("tx_any_two_capable_sources_absent_total"),
+                Some(&1),
+                "{d:?}"
+            );
+            assert_eq!(
+                d.get("tx_any_bananablocks_anchor_ok_total"),
+                Some(&1),
+                "{d:?}"
+            );
             // inside the TTL the memo answers (the anchor's map entry is gone: it is not asked)
             let (a, _, asked) = run_at(two_404s(&t, None), t0 + ARCADE_ANCHOR_PROBE_TTL_MS - 1);
-            assert_eq!((anchor_asks(&asked), a.present), (0, Some(false)), "{asked:?}");
+            assert_eq!(
+                (anchor_asks(&asked), a.present),
+                (0, Some(false)),
+                "{asked:?}"
+            );
             // past it the anchor is asked again; now it answers its not-found, so the leg is unknown, and that
             // outcome is memoised too
             let (a, _, asked) = run_at(two_404s(&t, Some(nf())), t0 + ARCADE_ANCHOR_PROBE_TTL_MS);
             assert_eq!((anchor_asks(&asked), a.present), (1, None), "{asked:?}");
-            let (a, _, asked) =
-                run_at(two_404s(&t, Some(anchor_mined())), t0 + ARCADE_ANCHOR_PROBE_TTL_MS + 1);
+            let (a, _, asked) = run_at(
+                two_404s(&t, Some(anchor_mined())),
+                t0 + ARCADE_ANCHOR_PROBE_TTL_MS + 1,
+            );
             assert_eq!(
                 (anchor_asks(&asked), a.present),
                 (0, None),
@@ -15039,9 +15061,18 @@ mod e606_tests {
                 ("an empty 404", Some((404u16, Vec::new()))),
                 ("a 503", Some((503, Vec::new()))),
                 ("a 429", Some((429, Vec::new()))),
-                ("confirmation_unknown", Some((200, unknown.to_string().into_bytes()))),
-                ("another txid's body", Some((200, other.to_string().into_bytes()))),
-                ("unmined", Some((200, unmined_anchor.to_string().into_bytes()))),
+                (
+                    "confirmation_unknown",
+                    Some((200, unknown.to_string().into_bytes())),
+                ),
+                (
+                    "another txid's body",
+                    Some((200, other.to_string().into_bytes())),
+                ),
+                (
+                    "unmined",
+                    Some((200, unmined_anchor.to_string().into_bytes())),
+                ),
                 ("silence", None),
             ] {
                 BANANABLOCKS_ROUTE_HEALTHY.with(|c| c.set(None));
@@ -15080,7 +15111,9 @@ mod e606_tests {
                     "{body:?}"
                 );
                 let d: std::collections::BTreeMap<String, u64> =
-                    crate::courier::take_pending_if_due(0.0).into_iter().collect();
+                    crate::courier::take_pending_if_due(0.0)
+                        .into_iter()
+                        .collect();
                 assert_eq!(
                     d.get("tx_any_courier_bananablocks_fault_total"),
                     Some(&1),

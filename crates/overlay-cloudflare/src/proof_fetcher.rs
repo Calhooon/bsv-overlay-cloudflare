@@ -4240,15 +4240,16 @@ async fn presence_counted(
             let presence = read(status, &body);
             // the COURIER-RUNG lens fold (M1): BananaBlocks' 404 is a look only as its recorded not-found (its reader
             // answers `Absent`); any other 404 is a fault, never the `notfound` row a clean look is counted under
-            let outcome = if provider == "bananablocks_presence" && status == 404 && presence.is_none() {
-                CourierOutcome::Fault
-            } else {
-                CourierOutcome::response(
-                    status,
-                    presence.is_some(),
-                    matches!(presence, Some(NetworkPresence::Present { .. })),
-                )
-            };
+            let outcome =
+                if provider == "bananablocks_presence" && status == 404 && presence.is_none() {
+                    CourierOutcome::Fault
+                } else {
+                    CourierOutcome::response(
+                        status,
+                        presence.is_some(),
+                        matches!(presence, Some(NetworkPresence::Present { .. })),
+                    )
+                };
             (presence, outcome)
         }
         Err(_) => (None, CourierOutcome::Fault),
