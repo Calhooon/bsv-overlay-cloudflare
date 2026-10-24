@@ -9929,6 +9929,11 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
             "unspentAsFarAsAsked",
             "hint",
         );
+        // bsv-low #862 (L7-DEPTH): the host's spend depth beside each entry's `lock`.
+        crate::tracker_host::runtime::stamp_spend_depth(
+            &mut value,
+            crate::tracker_host::runtime::spend_depth(&ctx.env).depth,
+        );
     }
     // Read-only decoration; missing words remain unknown until the scheduled pass.
     json_response(
@@ -11059,6 +11064,14 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     // bsv-low #451 slice B: the isolate's courier tally (the durable one is the overlay's /health/invariants).
     body["couriers"] = crate::courier::health_json();
     body["trackerReask"] = crate::tracker_host::pacing::health_json();
+    // bsv-low #862 (L7-DEPTH): the spend depth the served words carry (`spendDepth`), its source and the var as set.
+    body["spendDepth"] = crate::tracker_host::runtime::spend_depth_health_json(
+        ctx.env
+            .var(crate::tracker_host::runtime::SPEND_DEPTH_VAR)
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    );
     // bsv-low #771 (L1b), #777: the chain-event intake from its DURABLE row and counters (one batch; a fault serves
     // this isolate's memo, marked `source: "isolate"`), behind this isolate's 10 s memo of that read (the W15E-L4 lens
     // fold's LOW-2: one D1 batch per isolate per 10 s whatever the read rate).
