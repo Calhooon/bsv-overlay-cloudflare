@@ -1971,8 +1971,12 @@ pub const OWED_SHED_PRESS_REASON: &str =
 /// #648's bound), and a stored row's press rests on the facts the index held when it was judged: a door strand of a
 /// hop whose JOIN the index admitted since, a refund of a pot the index has since seen spent, a payout whose spend
 /// the index has since evicted. The read cannot re-judge the rows (that is the walk it was refused), so every
-/// served row whose `claimable` is `true` is DEMOTED, in the served body only, the way #837's carry demotes a row a
-/// cut pass did not reach: `claimable: false`, its word kept as `claimableBeforeShed`, `refresh: "shed"`,
+/// served row whose `claimable` is `true`, and every row with a non-null `claim` whose `claimable` is not a boolean
+/// (ABSENT: the client parses `facts.claimable !== false`, `app/src/lib/owed.ts`, so it reads that row as a press;
+/// the MONEY-OWED lens's LOW-2), is
+/// DEMOTED, in the served body only, the way #837's carry demotes a row a
+/// cut pass did not reach: `claimable: false`, its prior reading kept as `claimableBeforeShed` (`true`, or `null`
+/// when it was absent), `refresh: "shed"`,
 /// `stale: true`, `retryAfterMs` the shed's delay (at least 1 s) and `claimReason` [`OWED_SHED_PRESS_REASON`]. The
 /// row's family, claim, sats and reason are untouched (the outcome is still told), a row that offers no press is
 /// untouched, and a row already marked `shed` (a carried row) keeps its own word. Applied only when the read was
@@ -1987,10 +1991,17 @@ pub fn demote_shed_presses(rows: &mut [OwedRow], refresh_retry: Option<i64>, fre
     }
     let mut demoted = 0;
     for r in rows.iter_mut() {
-        if r.facts["refresh"] == OWED_REFRESH_SHED || r.facts["claimable"] != Value::Bool(true) {
+        let press = match &r.facts["claimable"] {
+            Value::Bool(b) => *b,
+            _ => !r.facts["claim"].is_null(),
+        };
+        if r.facts["refresh"] == OWED_REFRESH_SHED || !press {
             continue;
         }
-        r.facts["claimableBeforeShed"] = json!(true);
+        r.facts["claimableBeforeShed"] = match r.facts.get("claimable") {
+            Some(Value::Bool(true)) => json!(true),
+            _ => Value::Null,
+        };
         r.facts["claimable"] = json!(false);
         r.facts["refresh"] = json!(OWED_REFRESH_SHED);
         r.facts["stale"] = json!(true);
@@ -15587,9 +15598,10 @@ pub(crate) mod tests {
     }
 
     /// bsv-low #861: the demotion's scope. Every claimable family is withheld under a shed (a refund, a payout, a
-    /// sweep); a row that offers no press is served as stored; a row already `shed` (a carried row, #837) keeps its
+    /// sweep, a live seat's rejoin, `claimable: true` as the derivation writes it: the lens's LOW-1); a row that
+    /// offers no press (no claim, or `claimable: false`) is served as stored; a row already `shed` (a carried row, #837) keeps its
     /// own `claimableBeforeShed` through the read; the read handler applies it after #669's gate and before the body.
-    /// RED with the demotion inert (`left: 0 right: 2`), or with its call removed from the read.
+    /// RED with the demotion inert (`left: 0 right: 3`), or with its call removed from the read.
     #[test]
     fn fix861_b_the_demotion_takes_every_press_and_nothing_else_and_the_read_calls_it() {
         let row = |outpoint: &str, family: OwedFamily, facts: Value| OwedRow {
@@ -15619,7 +15631,12 @@ pub(crate) mod tests {
                 OwedFamily::Payout,
                 json!({"claim": "internalize", "claimable": false, "claimReason": UNCONFIRMED_PAYOUT_REASON}),
             ),
-            row("d:0", OwedFamily::InProgress, json!({"claim": "rejoin"})),
+            row(
+                "d:0",
+                OwedFamily::InProgress,
+                json!({"claim": "rejoin", "claimable": true}),
+            ),
+            row("f:0", OwedFamily::Unbound, json!({"claim": null})),
             row(
                 "e:0",
                 OwedFamily::RefundDue,
@@ -15628,17 +15645,17 @@ pub(crate) mod tests {
             ),
         ];
         let mut served = rows.clone();
-        assert_eq!(demote_shed_presses(&mut served, Some(5_000), false), 2);
-        for r in &served[..2] {
+        assert_eq!(demote_shed_presses(&mut served, Some(5_000), false), 3);
+        for i in [0, 1, 3] {
+            let r = &served[i];
             assert_eq!(r.facts["claimable"], false, "{r:?}");
             assert_eq!(r.facts["claimableBeforeShed"], true);
             assert_eq!(r.facts["claimReason"], OWED_SHED_PRESS_REASON);
+            assert_eq!(r.facts["claim"], rows[i].facts["claim"]);
         }
-        assert_eq!(
-            &served[2..],
-            &rows[2..],
-            "no press, or already shed: as stored"
-        );
+        for i in [2, 4, 5] {
+            assert_eq!(served[i], rows[i], "no press, or already shed: as stored");
+        }
         let mut unshed = rows.clone();
         assert_eq!(demote_shed_presses(&mut unshed, None, false), 0);
         assert_eq!(unshed, rows);
@@ -15755,6 +15772,292 @@ pub(crate) mod tests {
             4 * 8,
             "every evidence judged: seven words with a map, and no map"
         );
+    }
+
+    // ---- MONEY-OWED-LENS (2026-10-24): the lens's five cases on PR 168, folded by MONEY-OWED-FOLD ----
+
+    /// The lens's derived rows: one of every press family the derivation emits (a payout, a refund, a rejoin, a
+    /// door strand), each `claimable: true` as the derivation writes it.
+    fn lens_derived_presses() -> Vec<OwedRow> {
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let mut rows = Vec::new();
+        let won = [entry(
+            Some(true),
+            Some(PotVerdict::WinnerA),
+            Outcome::Won,
+            Some(SeatLetter::A),
+        )];
+        rows.extend(derive_owed_rows(&inputs(
+            &won,
+            &[],
+            &[],
+            &v,
+            &c,
+            &p,
+            Some(900_200),
+        )));
+        let open = [entry(
+            Some(false),
+            None,
+            Outcome::Unresolved,
+            Some(SeatLetter::A),
+        )];
+        let r = [refund_entry(RefundStatus::GateOpen)];
+        let mut valid = HashMap::new();
+        valid.insert(
+            format!("{}:0", tx(0x02)),
+            ValidRefund {
+                raw_hex: "00".into(),
+                my_sats: Some(19_800),
+            },
+        );
+        rows.extend(derive_owed_rows(&inputs(
+            &open,
+            &r,
+            &[],
+            &valid,
+            &c,
+            &p,
+            Some(900_005),
+        )));
+        rows.extend(derive_owed_rows(&inputs(
+            &open,
+            &r,
+            &[],
+            &valid,
+            &c,
+            &p,
+            Some(899_990),
+        )));
+        let hop_txid = tx(0x07);
+        let key = format!("{hop_txid}:0");
+        let young = [hop(HopStatus::Unspent, None, Some(60_000))];
+        let script = door_refused_hops(
+            &[(hop_txid.clone(), 0u32, "script-refused".to_string())],
+            &young,
+        );
+        let unspent = chain(&key, true, Some(false), None);
+        let mut h = inputs(&[], &[], &young, &v, &c, &p, Some(972_190));
+        h.hop_chain = &unspent;
+        h.door_refused_hop_outpoints = &script;
+        rows.extend(derive_owed_rows(&h));
+        rows
+    }
+
+    /// LENS-1: every press family the derivation emits is withheld under a shed, the rejoin of a live seat
+    /// included (the derivation writes `claimable: true` on it; `fix861_b` carries that shape since the fold).
+    #[test]
+    fn money_owed_lens_1_every_derived_press_family_is_withheld_under_a_shed() {
+        let rows = lens_derived_presses();
+        let families: Vec<OwedFamily> = rows.iter().map(|r| r.family).collect();
+        assert_eq!(
+            families,
+            vec![
+                OwedFamily::Payout,
+                OwedFamily::RefundDue,
+                OwedFamily::InProgress,
+                OwedFamily::HopStranded
+            ]
+        );
+        assert!(
+            rows.iter().all(|r| r.facts["claimable"] == true),
+            "{rows:?}"
+        );
+        assert_eq!(rows[2].facts["claim"], "rejoin");
+        let mut served = rows.clone();
+        assert_eq!(demote_shed_presses(&mut served, Some(5_000), false), 4);
+        for r in &served {
+            assert_eq!(r.facts["claimable"], false, "{:?}", r.family);
+            assert_eq!(r.facts["claimableBeforeShed"], true);
+            assert_eq!(r.facts["retryAfterMs"], 5_000);
+            assert_eq!(r.facts["claimReason"], OWED_SHED_PRESS_REASON);
+        }
+    }
+
+    /// LENS-2 (the lens's LOW-2, folded): the client (`app/src/lib/owed.ts`) reads an ABSENT `claimable` as a
+    /// press (`facts.claimable !== false`); as built the demotion took only a literal `true`. A stored row with a
+    /// claim and no `claimable` is withheld under a shed as the client reads it, its prior reading kept as
+    /// `claimableBeforeShed: null` (absent). No derivation writes such a row today (every non-null claim sets
+    /// `claimable`): the robustness of the parse. The control: a fresh read and an unshed read of the same row
+    /// serve it as stored. RED on f6c0b017: "the client still reads a press: Object {"claim":
+    /// String("internalize")}".
+    #[test]
+    fn money_owed_lens_2_a_claim_with_no_claimable_word_is_withheld_as_the_client_reads_it() {
+        let stored = vec![OwedRow {
+            identity: ME.to_string(),
+            outpoint: "a:0".into(),
+            family: OwedFamily::Payout,
+            game_id: tx(0x01),
+            sats: Some(19_800),
+            opponent_identity: Some(OPP.to_string()),
+            at_height: None,
+            facts: json!({"claim": "internalize"}),
+            reason: None,
+        }];
+        for (retry, fresh) in [(None, false), (Some(5_000), true)] {
+            let mut honest = stored.clone();
+            assert_eq!(demote_shed_presses(&mut honest, retry, fresh), 0);
+            assert_eq!(honest, stored, "{retry:?} fresh {fresh}: served as stored");
+        }
+        let mut rows = stored.clone();
+        demote_shed_presses(&mut rows, Some(5_000), false);
+        let client_press = !rows[0].facts["claim"].is_null() && rows[0].facts["claimable"] != false;
+        assert!(
+            !client_press,
+            "the client still reads a press: {:?}",
+            rows[0].facts
+        );
+        assert_eq!(rows[0].facts["claimable"], false);
+        assert!(
+            rows[0].facts.get("claimableBeforeShed") == Some(&Value::Null),
+            "{:?}",
+            rows[0].facts
+        );
+        assert_eq!(rows[0].facts["refresh"], OWED_REFRESH_SHED);
+        assert_eq!(rows[0].facts["retryAfterMs"], 5_000);
+        assert_eq!(rows[0].facts["claimReason"], OWED_SHED_PRESS_REASON);
+        assert_eq!(rows[0].facts["claim"], "internalize");
+    }
+
+    /// LENS-3: a fresh compute and an unshed read serve bodies BYTE-identical to the read without the call
+    /// (main's body), and a shed read changes the press rows' facts and nothing else of the body.
+    #[test]
+    fn money_owed_lens_3_fresh_and_unshed_bodies_are_byte_identical_to_main() {
+        let rows = lens_derived_presses();
+        let body = |rs: &[OwedRow]| owed_body(ME, Some(900_200), rs, 1_000, false, Some(7));
+        let main = body(&rows);
+        for (retry, fresh) in [(None, false), (None, true), (Some(41_000), true)] {
+            let mut served = rows.clone();
+            assert_eq!(demote_shed_presses(&mut served, retry, fresh), 0);
+            assert_eq!(body(&served), main, "{retry:?} fresh {fresh}");
+        }
+        let mut shed = rows.clone();
+        demote_shed_presses(&mut shed, Some(41_000), false);
+        let (a, b): (Value, Value) = (
+            serde_json::from_str(&main).unwrap(),
+            serde_json::from_str(&body(&shed)).unwrap(),
+        );
+        for k in a.as_object().unwrap().keys() {
+            if k != "rows" {
+                assert_eq!(a[k], b[k], "{k}");
+            }
+        }
+        for (x, y) in a["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(b["rows"].as_array().unwrap())
+        {
+            for k in x.as_object().unwrap().keys() {
+                if k != "facts" {
+                    assert_eq!(x[k], y[k], "{k}");
+                }
+            }
+            for (fk, fv) in x["facts"].as_object().unwrap() {
+                if ![
+                    "claimable",
+                    "claimReason",
+                    "stale",
+                    "refresh",
+                    "retryAfterMs",
+                ]
+                .contains(&fk.as_str())
+                {
+                    assert_eq!(&y["facts"][fk], fv, "{fk}");
+                }
+            }
+        }
+    }
+
+    /// LENS-4: #669's degrade runs first; a sweep it degraded to a chain wait is no press and is not marked shed
+    /// (its own words stand), and a `withheld` row is untouched.
+    #[test]
+    fn money_owed_lens_4_a_degraded_sweep_and_a_withheld_row_keep_their_own_words() {
+        let mut rows: Vec<OwedRow> = lens_derived_presses()
+            .into_iter()
+            .filter(|r| r.family == OwedFamily::HopStranded)
+            .collect();
+        let mut withheld = rows[0].clone();
+        withheld.outpoint = "w:0".into();
+        withheld.facts["claimable"] = json!(false);
+        withheld.facts["refresh"] = json!(OWED_REFRESH_WITHHELD);
+        rows.push(withheld.clone());
+        degrade_stale_sweeps(&mut rows, Some(972_190), Some(972_191));
+        let degraded = rows[0].clone();
+        assert_eq!(degraded.facts["chainWait"], "block");
+        assert_eq!(demote_shed_presses(&mut rows, Some(5_000), false), 0);
+        assert_eq!(rows[0], degraded);
+        assert_eq!(rows[1], withheld);
+    }
+
+    /// LENS-5 (#770): `settle_spend_confirmed` IS main's two expressions, over every evidence the settle arm can
+    /// hold: the latch (unread, false, true), the verified height (none, some), the settle txid (none, some) and
+    /// every word (no map; a map with no row; a checked `mined`; an unchecked `mined`; `cannotCheck`; `stale`;
+    /// `seen`; `rejected`). This is the refactor's own parity, RED against any change of the function; `fix770_a`
+    /// is the cross-arm parity.
+    #[test]
+    fn money_owed_lens_5_the_settle_rule_is_mains_two_expressions_over_every_evidence() {
+        let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let settle = tx(0x03);
+        let words = [
+            None,
+            Some(json!({"word":"mined","verifyPath":{"height":900_100,"root":tx(0x04)}})),
+            Some(json!({"word":"mined","verifyPath":null})),
+            Some(json!({"word":"mined","verifyPath":null,"cannotCheck":"header snapshot changed"})),
+            Some(json!({"word":"stale","verifyPath":null})),
+            Some(json!({"word":"seen","verifyPath":null})),
+            Some(json!({"word":"rejected","verifyPath":null})),
+        ];
+        let mut judged = 0;
+        for latch in [None, Some(false), Some(true)] {
+            for height in [None, Some(900_100u64)] {
+                for settle_txid in [None, Some(settle.clone())] {
+                    for word in &words {
+                        for map in [false, true] {
+                            if !map && word.is_some() {
+                                continue;
+                            }
+                            let m: std::collections::BTreeMap<String, Value> =
+                                word.iter().map(|w| (settle.clone(), w.clone())).collect();
+                            let mut i = inputs(&[], &[], &[], &v, &c, &p, Some(900_200));
+                            i.spender_words = map.then_some(&m);
+                            let mut e =
+                                entry(Some(true), None, Outcome::Unresolved, Some(SeatLetter::A));
+                            e.spent_confirmed = latch;
+                            e.at_height = height;
+                            e.settle_txid = settle_txid.clone();
+                            // main's claimable (f6c0b017^, the settle payout arm)
+                            let main_confirmed = e.at_height.is_some()
+                                || index_proven_or_spender_mined(
+                                    &i,
+                                    e.settle_txid.as_deref(),
+                                    e.spent_confirmed == Some(true),
+                                    e.spent_confirmed == Some(true) || e.at_height.is_some(),
+                                );
+                            // main's awaiting_block, its evidence half
+                            let main_awaiting = e.at_height.is_none()
+                                && !index_proven_or_spender_mined(
+                                    &i,
+                                    e.settle_txid.as_deref(),
+                                    e.spent_confirmed == Some(true),
+                                    e.spent_confirmed == Some(true) || e.at_height.is_some(),
+                                );
+                            let now = settle_spend_confirmed(&i, &e);
+                            assert_eq!(
+                                now, main_confirmed,
+                                "{latch:?} {height:?} {settle_txid:?} {word:?} {map}"
+                            );
+                            assert_eq!(
+                                !now, main_awaiting,
+                                "{latch:?} {height:?} {settle_txid:?} {word:?} {map}"
+                            );
+                            judged += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(judged, 3 * 2 * 2 * 8);
     }
 
     /// PIN A3 (RED on the stub): a competitor mined between two reads. Read 1 (tip 971114) is claimable; served
