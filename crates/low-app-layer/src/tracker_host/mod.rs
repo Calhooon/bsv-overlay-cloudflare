@@ -13,11 +13,12 @@ use std::collections::{BTreeMap, VecDeque};
 pub struct VerifiedTip {
     pub height: u32,
     pub hash: String,
+    pub merkle_root: String,
     pub at: u64,
-    /// Last successful chaintracks sync, in milliseconds. This ages the snapshot.
-    pub synced_at: u64,
-    /// Highest height reported by chaintracks' most recent courier poll.
-    pub last_seen_height: u32,
+    /// Route-only diagnostic: last successful cron pass, absent before chaintracks 0.7.1.
+    pub last_pass_at: Option<u64>,
+    /// Route-only diagnostic: highest height reported by the most recent courier poll.
+    pub last_seen_height: Option<u32>,
 }
 
 thread_local! {
@@ -29,10 +30,9 @@ pub(crate) fn last_verified_tip() -> Option<VerifiedTip> {
     LAST_VERIFIED_TIP.with(|last| last.borrow().clone())
 }
 
-/// The one tip reader for the proof snapshot and the app layer's height reads.
+/// One request for the proof snapshot and the app layer's direct height reads.
 /// Chaintracks serves this header under the same validation ceiling as its proof headers.
-/// Its height must agree with /getInfo's serving ceiling, and its hash, root and
-/// time must agree with the active header fetched independently at that height.
+/// Freshness is checked only by the /tip route's `tip_snapshot_with` reader.
 pub(crate) async fn verified_tip_with<G, F>(get: G) -> Result<VerifiedTip, HeaderError>
 where
     G: Fn(String) -> F,
@@ -49,31 +49,45 @@ where
         .as_u64()
         .and_then(|t| u32::try_from(t).ok())
         .ok_or_else(malformed)?;
+    Ok(VerifiedTip {
+        height,
+        hash: header.hash,
+        merkle_root: header.merkle_root,
+        at: u64::from(time) * 1_000,
+        last_pass_at: None,
+        last_seen_height: None,
+    })
+}
+
+/// /tip alone pays for the pass diagnostic and independent active-header check.
+/// Only a fully checked route snapshot replaces the last-known diagnostics.
+pub(crate) async fn tip_snapshot_with<G, F>(get: G) -> Result<VerifiedTip, HeaderError>
+where
+    G: Fn(String) -> F,
+    F: std::future::Future<Output = Result<(u16, Value), HeaderError>>,
+{
+    let mut tip = verified_tip_with(&get).await?;
     let (status, info) = get("getInfo".into()).await?;
-    let (served_height, synced_at, last_seen_height) = sync_info_response(status, &info)?;
-    if served_height != height {
+    let (served_height, last_pass_at, last_seen_height) = sync_info_response(status, &info)?;
+    if served_height != tip.height {
         return Err(HeaderError("tip and sync snapshot heights disagree".into()));
     }
-    let (status, active) = get(format!("findHeaderHexForHeight?height={height}")).await?;
-    let active_header = header_response(height, status, &active)?.ok_or_else(malformed)?;
-    if active_header.hash != header.hash
-        || active_header.merkle_root != header.merkle_root
-        || active["value"]["time"].as_u64() != Some(u64::from(time))
+    let (status, active) = get(format!("findHeaderHexForHeight?height={}", tip.height)).await?;
+    let active_header = header_response(tip.height, status, &active)?
+        .ok_or_else(|| HeaderError("active tip header unavailable".into()))?;
+    if active_header.hash != tip.hash
+        || active_header.merkle_root != tip.merkle_root
+        || active["value"]["time"].as_u64() != Some(tip.at / 1_000)
     {
         return Err(HeaderError("tip and active header disagree".into()));
     }
-    let tip = VerifiedTip {
-        height,
-        hash: header.hash,
-        at: u64::from(time) * 1_000,
-        synced_at,
-        last_seen_height,
-    };
+    tip.last_pass_at = last_pass_at;
+    tip.last_seen_height = Some(last_seen_height);
     LAST_VERIFIED_TIP.with(|last| *last.borrow_mut() = Some(tip.clone()));
     Ok(tip)
 }
 
-fn sync_info_response(status: u16, frame: &Value) -> Result<(u32, u64, u32), HeaderError> {
+fn sync_info_response(status: u16, frame: &Value) -> Result<(u32, Option<u64>, u32), HeaderError> {
     let malformed = || HeaderError("unavailable or malformed sync snapshot".into());
     if !(200..300).contains(&status) || frame["status"] != "success" {
         return Err(malformed());
@@ -92,15 +106,17 @@ fn sync_info_response(status: u16, frame: &Value) -> Result<(u32, u64, u32), Hea
         Some(false) => live.min(height("validatedHeight")?),
         None => return Err(malformed()),
     };
-    let synced_at = info["lastSyncedAt"]
-        .as_str()
-        .and_then(sync_stamp_ms)
-        .ok_or_else(malformed)?;
-    Ok((served, synced_at, height("lastSeenHeight")?))
+    // Only absence means an older producer. A present but unusable stamp is
+    // a failed diagnostic, never a reason to trust lastSyncedAt or lastSeenAt.
+    let last_pass_at = info
+        .get("lastPassAt")
+        .map(|stamp| stamp.as_str().and_then(pass_stamp_ms).ok_or_else(malformed))
+        .transpose()?;
+    Ok((served, last_pass_at, height("lastSeenHeight")?))
 }
 
-fn sync_stamp_ms(stamp: &str) -> Option<u64> {
-    // chaintracks' sync_state uses SQLite UTC datetime; also accept its
+fn pass_stamp_ms(stamp: &str) -> Option<u64> {
+    // chaintracks' pass stamp uses SQLite UTC datetime; also accept its
     // documented RFC3339 UTC form through the existing strict parser.
     let normalized;
     let stamp = if let Some((date, time)) = stamp.trim().split_once(' ') {
@@ -201,9 +217,9 @@ where
             rows.insert(*height, row);
         }
         let after = verified_tip_with(&get).await;
-        // A sync may refresh between reads without changing the proof snapshot.
         let unchanged = matches!((&before, &after), (Ok(a), Ok(b))
-            if a.height == b.height && a.hash == b.hash && a.at == b.at);
+            if a.height == b.height && a.hash == b.hash
+                && a.merkle_root == b.merkle_root && a.at == b.at);
         let tip = if unchanged {
             after.map(|tip| tip.height)
         } else {

@@ -17,9 +17,10 @@ fn tip() -> VerifiedTip {
     VerifiedTip {
         height: VERIFIED_HEIGHT,
         hash: "02".repeat(32),
+        merkle_root: "01".repeat(32),
         at: AT,
-        synced_at: AT,
-        last_seen_height: VERIFIED_HEIGHT,
+        last_pass_at: Some(AT),
+        last_seen_height: Some(VERIFIED_HEIGHT),
     }
 }
 
@@ -39,18 +40,21 @@ fn info() -> Value {
         "validatedHeight": VERIFIED_HEIGHT,
         "lastSyncedHeight": VERIFIED_HEIGHT,
         "lastSyncedAt": "2026-09-21T14:13:20Z",
+        "lastPassAt": "2026-09-21T14:13:20Z",
         "lastSeenHeight": VERIFIED_HEIGHT
     }})
 }
 
 #[tokio::test]
-async fn tip877_fold_a_ninety_minute_old_header_with_a_fresh_sync_is_200() {
+async fn tip877_fold2_a_ninety_minute_old_header_with_a_fresh_pass_is_200() {
     let mut quiet = header();
     quiet["value"]["time"] = json!(AT / 1_000 - 90 * 60);
+    let mut sync = info();
+    sync["value"]["lastSyncedAt"] = json!("2026-01-01T00:00:00Z");
     let reply = tip_reply_with(
         |route| {
             ready(match route.as_str() {
-                "getInfo" => Ok((200, info())),
+                "getInfo" => Ok((200, sync.clone())),
                 _ => response(route, quiet.clone()),
             })
         },
@@ -61,16 +65,20 @@ async fn tip877_fold_a_ninety_minute_old_header_with_a_fresh_sync_is_200() {
     assert_eq!(reply.status, 200, "a quiet chain is a healthy snapshot");
     assert_eq!(reply.body["at"], AT - 90 * 60_000);
     assert_eq!(reply.body["ageMs"], 20_000);
+    assert_eq!(reply.body["freshness"], "fresh");
+    assert_eq!(reply.body["lastPassAt"], AT);
 }
 
 #[tokio::test]
-async fn tip877_fold_a_five_minute_old_header_with_a_forty_minute_old_sync_is_503() {
+async fn tip877_fold2_a_five_minute_old_header_with_a_forty_minute_old_pass_is_503() {
     let mut young = header();
     young["value"]["time"] = json!(AT / 1_000 + 35 * 60);
+    let mut sync = info();
+    sync["value"]["lastSyncedAt"] = json!("2026-09-21T14:53:20Z");
     let reply = tip_reply_with(
         |route| {
             ready(match route.as_str() {
-                "getInfo" => Ok((200, info())),
+                "getInfo" => Ok((200, sync.clone())),
                 _ => response(route, young.clone()),
             })
         },
@@ -80,9 +88,132 @@ async fn tip877_fold_a_five_minute_old_header_with_a_forty_minute_old_sync_is_50
     .await;
     assert_eq!(
         reply.status, 503,
-        "a young block cannot freshen a stale sync"
+        "a young block or new tip cannot freshen a stale pass"
     );
     assert_eq!(reply.body["ageMs"], 40 * 60_000);
+    assert_eq!(reply.body["freshness"], "stale");
+    assert_eq!(reply.body["code"], "ERR_TIP_UNAVAILABLE");
+}
+
+#[tokio::test]
+async fn tip877_fold2_absent_last_pass_on_a_quiet_chain_is_200_unknown() {
+    let mut quiet = header();
+    quiet["value"]["time"] = json!(AT / 1_000 - 90 * 60);
+    let mut sync = info();
+    sync["value"].as_object_mut().unwrap().remove("lastPassAt");
+    let reply = tip_reply_with(
+        |route| {
+            ready(if route == "getInfo" {
+                Ok((200, sync.clone()))
+            } else {
+                response(route, quiet.clone())
+            })
+        },
+        || None,
+        || AT + 90 * 60_000,
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body["height"], VERIFIED_HEIGHT);
+    assert_eq!(reply.body["at"], AT - 90 * 60_000);
+    assert_eq!(reply.body["freshness"], "unknown");
+    assert!(reply.body["lastPassAt"].is_null());
+    assert!(reply.body["ageMs"].is_null());
+    assert!(reply.body.get("code").is_none());
+    assert_eq!(reply.retry_after, None);
+}
+
+#[tokio::test]
+async fn tip877_fold2_legacy_stamps_are_never_liveness_inputs() {
+    for pass_present in [false, true] {
+        for legacy in [
+            None,
+            Some(Value::Null),
+            Some(json!("not a timestamp")),
+            Some(json!("2026-01-01T00:00:00Z")),
+        ] {
+            let mut sync = info();
+            if !pass_present {
+                sync["value"].as_object_mut().unwrap().remove("lastPassAt");
+            }
+            for key in ["lastSyncedAt", "lastSeenAt"] {
+                match &legacy {
+                    Some(value) => sync["value"][key] = value.clone(),
+                    None => {
+                        sync["value"].as_object_mut().unwrap().remove(key);
+                    }
+                }
+            }
+            let reply = tip_reply_with(
+                |route| {
+                    ready(if route == "getInfo" {
+                        Ok((200, sync.clone()))
+                    } else {
+                        response(route, header())
+                    })
+                },
+                || Some(tip()),
+                || AT + 123,
+            )
+            .await;
+            assert_eq!(reply.status, 200);
+            assert_eq!(
+                reply.body["freshness"],
+                if pass_present { "fresh" } else { "unknown" }
+            );
+            assert_eq!(
+                reply.body["lastPassAt"],
+                if pass_present { json!(AT) } else { Value::Null }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tip877_fold2_proof_snapshot_keeps_two_plus_n_requests_without_info() {
+    for moving in [false, true] {
+        let calls = RefCell::new(Vec::new());
+        let reads = Cell::new(0);
+        let snapshot = headers_with(
+            |route| {
+                calls.borrow_mut().push(route.clone());
+                if route == "findChainTipHeaderHex" {
+                    let n = reads.get();
+                    reads.set(n + 1);
+                    let mut frame = header();
+                    if moving && n % 2 != 0 {
+                        frame["value"]["hash"] = json!("03".repeat(32));
+                    }
+                    ready(response(route, frame))
+                } else {
+                    ready(tracker_response(route))
+                }
+            },
+            &[VERIFIED_HEIGHT - 1, VERIFIED_HEIGHT],
+        )
+        .await;
+        assert_eq!(snapshot.tip_height().is_err(), moving);
+        let calls = calls.into_inner();
+        assert!(!calls.iter().any(|r| r == "getInfo"), "{calls:?}");
+        assert_eq!(
+            calls.len(),
+            if moving { 8 } else { 4 },
+            "2 + N, once or twice"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tip877_fold2_direct_verified_height_is_one_request_without_info() {
+    let calls = RefCell::new(Vec::new());
+    let height = super::chaintracks_present_height_with(|route| {
+        calls.borrow_mut().push(route.clone());
+        ready(tracker_response(route))
+    })
+    .await
+    .unwrap();
+    assert_eq!(height, u64::from(VERIFIED_HEIGHT));
+    assert_eq!(calls.into_inner(), ["findChainTipHeaderHex"]);
 }
 
 fn response(route: impl AsRef<str>, verified: Value) -> Result<(u16, Value), HeaderError> {
@@ -138,7 +269,7 @@ async fn tip877_route_serves_verified_header_not_courier_max() {
 }
 
 #[tokio::test]
-async fn tip877_age_is_the_last_successful_sync_age_not_the_fetch_age() {
+async fn tip877_age_is_the_last_successful_pass_age_not_the_fetch_age() {
     for age in [45_123, 46_789] {
         let reply = tip_reply_with(
             |route| ready(response(route, header())),
@@ -178,7 +309,7 @@ async fn tip877_unavailable_is_named_503_with_and_without_last_known_tip() {
 }
 
 #[tokio::test]
-async fn tip877_stale_sync_is_503_past_thirty_minutes() {
+async fn tip877_stale_pass_is_503_past_thirty_minutes() {
     for age in [FRESHNESS_MS, FRESHNESS_MS + 1] {
         let reply = tip_reply_with(
             |route| ready(response(route, header())),
@@ -286,7 +417,7 @@ async fn tip877_a_same_height_reorg_cannot_pass_the_snapshot_bracket() {
 }
 
 #[tokio::test]
-async fn tip877_last_known_follows_a_lower_verified_tip_and_keeps_its_sync_age() {
+async fn tip877_last_known_follows_a_lower_verified_tip_and_keeps_its_pass_age() {
     let mut lower = header();
     lower["value"]["height"] = json!(VERIFIED_HEIGHT - 2);
     lower["value"]["hash"] = json!("03".repeat(32));
@@ -355,9 +486,15 @@ async fn tip877_failure_reads_last_known_after_the_await() {
 
 #[tokio::test]
 async fn tip877_fold_seen_height_is_bounded_by_the_reorg_margin() {
-    for lead in [0, 1, 2, 3] {
+    for (lead, pass_present) in [0, 1, 2, 3]
+        .into_iter()
+        .flat_map(|lead| [false, true].map(|present| (lead, present)))
+    {
         let mut sync = info();
         sync["value"]["lastSeenHeight"] = json!(VERIFIED_HEIGHT + lead);
+        if !pass_present {
+            sync["value"].as_object_mut().unwrap().remove("lastPassAt");
+        }
         let reply = tip_reply_with(
             |route| {
                 ready(if route == "getInfo" {
@@ -376,22 +513,43 @@ async fn tip877_fold_seen_height_is_bounded_by_the_reorg_margin() {
             "lead {lead}"
         );
         assert_eq!(reply.body["height"], VERIFIED_HEIGHT);
-        assert_eq!(reply.body["ageMs"], 20_000);
+        assert_eq!(
+            reply.body["ageMs"],
+            if pass_present {
+                json!(20_000)
+            } else {
+                Value::Null
+            }
+        );
+        assert_eq!(
+            reply.body["freshness"],
+            if lead > 1 {
+                "stale"
+            } else if pass_present {
+                "fresh"
+            } else {
+                "unknown"
+            }
+        );
+        if lead > 1 {
+            assert_eq!(reply.body["code"], "ERR_TIP_UNAVAILABLE");
+            assert_eq!(reply.retry_after, Some("60"));
+        }
     }
 }
 
 #[tokio::test]
-async fn tip877_fold_sync_frames_and_their_timestamps_must_be_usable() {
+async fn tip877_fold_pass_frames_and_their_timestamps_must_be_usable() {
     let mut frames = vec![
         (503, info()),
         (404, Value::Null),
         (200, json!({"status":"error"})),
     ];
     for (key, value) in [
-        ("lastSyncedAt", Value::Null),
-        ("lastSyncedAt", json!("2026-09-21 14:13:20 garbage")),
-        ("lastSyncedAt", json!("not a timestamp")),
-        ("lastSyncedAt", json!("4294967295-09-21T14:13:20Z")),
+        ("lastPassAt", Value::Null),
+        ("lastPassAt", json!("2026-09-21 14:13:20 garbage")),
+        ("lastPassAt", json!("not a timestamp")),
+        ("lastPassAt", json!("4294967295-09-21T14:13:20Z")),
         ("lastSeenHeight", Value::Null),
         ("lastSeenHeight", json!(u64::from(u32::MAX) + 1)),
         ("heightLive", Value::Null),
@@ -424,7 +582,7 @@ async fn tip877_fold_sync_frames_and_their_timestamps_must_be_usable() {
         "2026-09-21T14:13:20.000+00:00",
     ] {
         let mut sync = info();
-        sync["value"]["lastSyncedAt"] = json!(stamp);
+        sync["value"]["lastPassAt"] = json!(stamp);
         let reply = tip_reply_with(
             |route| {
                 ready(if route == "getInfo" {
@@ -495,13 +653,13 @@ async fn tip877_fold_info_and_tip_must_agree_under_the_validation_ceiling() {
 }
 
 #[tokio::test]
-async fn tip877_fold_a_sync_refresh_does_not_change_the_proof_snapshot() {
+async fn tip877_fold_a_pass_refresh_is_not_read_by_the_proof_snapshot() {
     let reads = Cell::new(0);
     let snapshot = headers_with(
         |route| {
             ready(if route == "getInfo" {
                 let mut sync = info();
-                sync["value"]["lastSyncedAt"] = json!(if reads.get() == 0 {
+                sync["value"]["lastPassAt"] = json!(if reads.get() == 0 {
                     "2026-09-21T14:13:20Z"
                 } else {
                     "2026-09-21T14:13:21Z"
@@ -516,7 +674,7 @@ async fn tip877_fold_a_sync_refresh_does_not_change_the_proof_snapshot() {
     )
     .await;
     assert_eq!(snapshot.tip_height().unwrap(), VERIFIED_HEIGHT);
-    assert_eq!(reads.get(), 2);
+    assert_eq!(reads.get(), 0);
 }
 
 #[tokio::test]

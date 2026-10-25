@@ -157,7 +157,8 @@ database_name = "low-overlay-db"
 database_id = "__LOW_APPLAYER_DEFAULT_D1_LOW_OVERLAY_DB_ID__"  # injected at deploy time from the private secrets store by name
 
 # CHAINTRACKS binds rust-chaintracks in both renders. /tip reads its verified
-# header and /getInfo sync snapshot. TIP_MAX_AGE_MS, TIP_REORG_MARGIN and
+# header and /getInfo.lastPassAt (chaintracks 0.7.1); absent means unknown.
+# Only /tip reads /getInfo. TIP_MAX_AGE_MS, TIP_REORG_MARGIN and
 # TIP_RETRY_AFTER_SECS are code constants, not vars. A plain workers.dev fetch to a
 # same-account worker loops back to this worker (returns our own 404), so the
 # binding is required for the fetch to reach ChainTracks. `service` is a
