@@ -32,7 +32,7 @@
 //! too, FIRST in the same batch ([`KIND_WORD`], the frame's JSON as the item; bsv-low #660, B-OWED-3-FOLD, the lens's
 //! L1: until the fold they stayed in the isolate's memory while the notes were parked, so the cron delivered the
 //! notes before the words, the order every flush otherwise keeps), and the drain delivers the word set FIRST, one
-//! frame a POST to `/internal/tx-word` (at most `change_flush::CHANGE_MAX_CHUNKS` a tick, under the drain's wall). The lobby set has its own flush and the skip never parks it; since bsv-low #560 (B-COST-1) every flush of the three sets parks its NEW note-backs here too ([`park_noted_back`], the lobby set as [`KIND_LOBBY`]), and the drain delivers the lobby rows last. The cron's
+//! frame a POST to `/internal/tx-word` (at most `change_flush::CHANGE_MAX_CHUNKS` a tick, under the drain's wall). The lobby set has its own flush and the skip never parks it; since bsv-low #560 (B-COST-1) every flush of the three sets parks its NEW note-backs here too ([`crate::change_flush::FlushBatch`], the lobby set as [`KIND_LOBBY`]), and the drain delivers the lobby rows last. The cron's
 //! delivery runs before the GASP step under its own wall ([`DRAIN_WALL_MS`]) and at most [`DRAIN_MAX_ROWS`] rows
 //! a set a tick; the drain's POST in flight is not raced. A delete that faults after an
 //! accepted POST leaves the row, which is delivered again (over-notification is harmless: the app layer re-reads).
@@ -187,7 +187,7 @@ pub const KIND_HOP: &str = "hop";
 /// The tracker word frames' set (bsv-low #660, B-OWED-3-FOLD L1): the item is the frame's JSON, POSTed as it is.
 pub const KIND_WORD: &str = "word";
 /// bsv-low #560 (B-COST-1): the lobby set's rows (`txid:vout:kind`, [`lobby_item`]), parked only by the lobby
-/// flush's outbox ([`park_noted_back`]); the skip never parks them (the lobby set has its own flush).
+/// flush's outbox ([`crate::change_flush::FlushBatch`]); the skip never parks them (the lobby set has its own flush).
 pub const KIND_LOBBY: &str = "lobby";
 
 /// A lobby entry's row key (bsv-low #560).
@@ -357,64 +357,6 @@ pub struct Outboxed {
     pub faulted: u64,
     /// Past [`OUTBOX_PARK_MAX`]: counted [`COUNTER_CHANGE_OUTBOX_OVER_BOUND`].
     pub over_bound: u64,
-}
-
-/// bsv-low #560 (B-COST-1), THE FLUSH'S OUTBOX. A flush's NEW note-backs (the entries of a POST the app layer did
-/// not accept, and the entries past the flush's bound: `change_flush::settle_noting`'s `fresh`) are PARKED in D1
-/// under the set's `kind`, beside the isolate's own note-back (which stays the fast path: the next flush on this
-/// isolate re-sends them in seconds). So an isolate that ends between a deferral and its next flush, or a chunk whose
-/// retry fails too, loses nothing: the cron's drain ([`deliver_parked`]) delivers the row, backs it off on a refusal
-/// and counts it exhausted after [`CHANGE_PARK_MAX_ATTEMPTS`] refusals. An entry delivered from memory first is
-/// delivered again by the drain (over-notification is harmless: the app layer re-reads). Each entry lands in a
-/// counted outbox row (`outboxed`, the set's own counter) or a counted miss (`change_park_full_total`,
-/// `change_park_faults_total`, [`COUNTER_CHANGE_OUTBOX_OVER_BOUND`]), never neither.
-pub(crate) async fn park_noted_back<P: ParkPort>(
-    port: &P,
-    kind: &'static str,
-    items: Vec<String>,
-    outboxed_counter: &'static str,
-    now_ms: u64,
-) -> Outboxed {
-    let mut out = Outboxed::default();
-    if items.is_empty() {
-        return out;
-    }
-    let over = items.len().saturating_sub(OUTBOX_PARK_MAX);
-    out.over_bound = over as u64;
-    let rows: Vec<(&'static str, String)> = items
-        .into_iter()
-        .take(OUTBOX_PARK_MAX)
-        .map(|i| (kind, i))
-        .collect();
-    match port.park(&rows, now_ms).await {
-        Ok(landed) => {
-            out.parked = landed.iter().filter(|l| **l).count() as u64;
-            out.full = rows.len() as u64 - out.parked;
-        }
-        Err(e) => {
-            out.faulted = rows.len() as u64;
-            port.log(format!("[change-outbox] park of {} {kind} note-back(s) FAULTED ({e}); kept in the isolate's memory only", rows.len()));
-        }
-    }
-    for (counter, n) in [
-        (outboxed_counter, out.parked),
-        (COUNTER_CHANGE_PARK_FULL, out.full),
-        (COUNTER_CHANGE_PARK_FAULTS, out.faulted),
-        (COUNTER_CHANGE_OUTBOX_OVER_BOUND, out.over_bound),
-    ] {
-        if n > 0 {
-            port.bump(counter, n).await;
-        }
-    }
-    if out.full + out.over_bound > 0 {
-        port.log(format!(
-            "[change-outbox] {} {kind} note-back(s) NOT parked ({} at the table's ceiling of {CHANGE_PARKED_MAX_ROWS} rows or the lobby's share of {CHANGE_PARKED_LOBBY_MAX_ROWS}, {} past the flush's bound of {OUTBOX_PARK_MAX}); kept in the isolate's memory only, or let go and counted undelivered",
-            out.full + out.over_bound,
-            out.full,
-            out.over_bound
-        ));
-    }
-    out
 }
 
 /// The worker's [`ParkPort`]: D1.
@@ -1599,7 +1541,9 @@ mod tests {
         let mine: Vec<&str> = crate::d1::OVERLAY_MIGRATIONS
             .iter()
             .copied()
-            .filter(|m| m.contains("change_parked"))
+            .filter(|m| {
+                m.contains("change_parked") || m.contains("CREATE TABLE IF NOT EXISTS ops_counters")
+            })
             .collect();
         assert!(mine.contains(&CHANGE_PARKED_CREATE) && mine.len() >= 5);
         for m in mine {
@@ -2622,48 +2566,71 @@ mod tests {
         );
     }
 
-    /// bsv-low #560 (B-COST-1): a [`ParkPort`] over the SHIPPED park statements under SQLite, as the worker's
-    /// batch runs them (the token, then one [`PARK_SQL`] a row); `fail` faults the batch.
+    /// The flush batch over the shipped SQL under SQLite; `fail` faults the batch.
     struct SqlitePark<'a> {
         conn: &'a rusqlite::Connection,
-        counters: RefCell<Vec<(&'static str, u64)>>,
         fail: bool,
     }
 
-    impl ParkPort for SqlitePark<'_> {
-        async fn park(
-            &self,
-            rows: &[(&'static str, String)],
-            now_ms: u64,
-        ) -> std::result::Result<Vec<bool>, String> {
+    impl crate::change_flush::FlushPort for SqlitePark<'_> {
+        async fn commit(&self, queries: Vec<crate::d1::Query>) -> std::result::Result<(), String> {
             if self.fail {
                 return Err("D1 down".into());
             }
-            bump_seq(self.conn, now_ms as i64);
-            Ok(rows
-                .iter()
-                .map(|(k, i)| {
-                    exec_returning(
-                        self.conn,
-                        PARK_SQL,
-                        rusqlite::params![k, i, now_ms as i64, MAX],
-                    ) == 1
-                })
-                .collect())
+            crate::change_flush::tests::commit_queries(self.conn, queries)
         }
-        async fn bump(&self, counter: &'static str, delta: u64) {
-            self.counters.borrow_mut().push((counter, delta));
-        }
-        fn log(&self, _line: String) {}
+        fn log(&self, _: String) {}
     }
 
-    fn counted(counters: &RefCell<Vec<(&'static str, u64)>>, name: &str) -> u64 {
-        counters
-            .borrow()
-            .iter()
-            .filter(|(c, _)| *c == name)
-            .map(|(_, n)| n)
-            .sum()
+    fn db_counter(conn: &rusqlite::Connection, name: &str) -> u64 {
+        conn.query_row(
+            "SELECT value FROM ops_counters WHERE name = ?",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    fn flush_notes(
+        port: &SqlitePark<'_>,
+        now_ms: u64,
+        outboxed: &str,
+        settle: impl FnOnce(&mut crate::change_flush::FlushBatch) -> crate::change_flush::Tally,
+    ) -> (crate::change_flush::Tally, Outboxed) {
+        let names = [
+            outboxed,
+            COUNTER_CHANGE_PARK_FULL,
+            COUNTER_CHANGE_PARK_FAULTS,
+            COUNTER_CHANGE_OUTBOX_OVER_BOUND,
+        ];
+        let before = names.map(|name| db_counter(port.conn, name));
+        let mut batch = crate::change_flush::FlushBatch::default();
+        let tally = settle(&mut batch);
+        run(batch.flush_with(port, now_ms));
+        let delta = std::array::from_fn::<_, 4, _>(|i| db_counter(port.conn, names[i]) - before[i]);
+        (
+            tally,
+            Outboxed {
+                parked: delta[0],
+                full: delta[1],
+                faulted: delta[2],
+                over_bound: delta[3],
+            },
+        )
+    }
+
+    fn park_notes(
+        port: &SqlitePark<'_>,
+        kind: &'static str,
+        items: Vec<String>,
+        counter: &'static str,
+        now_ms: u64,
+    ) -> Outboxed {
+        flush_notes(port, now_ms, counter, |batch| {
+            batch.park(kind, items, counter);
+            crate::change_flush::Tally::default()
+        })
+        .1
     }
 
     /// A transport answering `Err` on the listed POSTs (1 = the first).
@@ -2705,15 +2672,14 @@ mod tests {
         assert_eq!((shipped.failed.len(), shipped.deferred.len()), (8, 3));
         let park = SqlitePark {
             conn: &conn,
-            counters: Default::default(),
             fail: false,
         };
-        let (tally, out) = run(crate::pot_changes::settle_and_park(
+        let (tally, out) = flush_notes(
             &park,
-            &shipped,
             1_000,
-            |_| async {},
-        ));
+            crate::pot_changes::COUNTER_POT_CHANGED_OUTBOXED,
+            |batch| crate::pot_changes::settle_and_park(batch, &shipped),
+        );
         assert_eq!(
             (tally.retried, tally.deferred),
             (8, 3),
@@ -2746,12 +2712,12 @@ mod tests {
             || 0,
             u64::MAX,
         ));
-        let (tally, out) = run(crate::pot_changes::settle_and_park(
+        let (tally, out) = flush_notes(
             &park,
-            &again,
             2_000,
-            |_| async {},
-        ));
+            crate::pot_changes::COUNTER_POT_CHANGED_OUTBOXED,
+            |batch| crate::pot_changes::settle_and_park(batch, &again),
+        );
         assert_eq!(
             (tally.undelivered, tally.retry_failed),
             (8, 8),
@@ -2764,10 +2730,7 @@ mod tests {
             "the twice-failed chunk is still in the outbox (and so are the 3 the memory delivered)"
         );
         assert_eq!(
-            counted(
-                &park.counters,
-                crate::pot_changes::COUNTER_POT_CHANGED_OUTBOXED
-            ),
+            db_counter(&conn, crate::pot_changes::COUNTER_POT_CHANGED_OUTBOXED),
             11,
             "parked once each"
         );
@@ -2782,19 +2745,16 @@ mod tests {
             || 0,
             u64::MAX,
         ));
-        let (_, out) = run(crate::lobby_changes::settle_and_park(
+        let (_, out) = flush_notes(
             &park,
-            &shipped,
             3_000,
-            |_| async {},
-        ));
+            crate::lobby_changes::COUNTER_LOBBY_CHANGED_OUTBOXED,
+            |batch| crate::lobby_changes::settle_and_park(batch, &shipped),
+        );
         assert_eq!(out.parked, 2);
         assert_eq!(in_table(KIND_LOBBY), 2);
         assert_eq!(
-            counted(
-                &park.counters,
-                crate::lobby_changes::COUNTER_LOBBY_CHANGED_OUTBOXED
-            ),
+            db_counter(&conn, crate::lobby_changes::COUNTER_LOBBY_CHANGED_OUTBOXED),
             2
         );
 
@@ -2844,7 +2804,7 @@ mod tests {
     /// bsv-low #560 (B-COST-1): an entry that does NOT reach the outbox is counted where it missed, never neither:
     /// a faulted batch (`change_park_faults_total`), the table's ceiling (`change_park_full_total`) and the flush's
     /// batch bound (`change_outbox_over_bound_total`, past [`OUTBOX_PARK_MAX`]). RED with any of the three bumps
-    /// removed from `park_noted_back`.
+    /// removed from the flush batch.
     #[test]
     fn b_cost_1_560_a_note_back_that_misses_the_outbox_is_counted() {
         let conn = parked_db();
@@ -2854,16 +2814,15 @@ mod tests {
         // over the bound: 300 new note-backs, 128 parked, 172 counted over the bound
         let park = SqlitePark {
             conn: &conn,
-            counters: Default::default(),
             fail: false,
         };
-        let out = run(park_noted_back(
+        let out = park_notes(
             &park,
             KIND_HOP,
             ids.clone(),
             crate::hop_changes::COUNTER_HOP_CHANGED_OUTBOXED,
             1_000,
-        ));
+        );
         assert_eq!(
             out,
             Outboxed {
@@ -2872,32 +2831,31 @@ mod tests {
                 ..Default::default()
             }
         );
+        assert_eq!(db_counter(&conn, COUNTER_CHANGE_OUTBOX_OVER_BOUND), 172);
         assert_eq!(
-            counted(&park.counters, COUNTER_CHANGE_OUTBOX_OVER_BOUND),
-            172
-        );
-        assert_eq!(
-            counted(
-                &park.counters,
-                crate::hop_changes::COUNTER_HOP_CHANGED_OUTBOXED
-            ),
+            db_counter(&conn, crate::hop_changes::COUNTER_HOP_CHANGED_OUTBOXED),
             128
         );
         // a faulted batch: every entry counted a fault
         let down = SqlitePark {
             conn: &conn,
-            counters: Default::default(),
             fail: true,
         };
-        let out = run(park_noted_back(
+        let out = park_notes(
             &down,
             KIND_HOP,
             ids[..5].to_vec(),
             crate::hop_changes::COUNTER_HOP_CHANGED_OUTBOXED,
             1_000,
-        ));
-        assert_eq!(out.faulted, 5);
-        assert_eq!(counted(&down.counters, COUNTER_CHANGE_PARK_FAULTS), 5);
+        );
+        assert_eq!(
+            out,
+            Outboxed::default(),
+            "faulted batch commits no counts or parks"
+        );
+        assert_eq!(db_counter(&conn, COUNTER_CHANGE_PARK_FAULTS), 0);
+        run(crate::change_flush::FlushBatch::default().flush_with(&park, 1_001));
+        assert_eq!(db_counter(&conn, COUNTER_CHANGE_PARK_FAULTS), 5);
         // the ceiling: fill the table, then a new key is refused and counted full
         for i in 0..(MAX as u32) {
             park_sql(
@@ -2908,18 +2866,17 @@ mod tests {
         }
         let full = SqlitePark {
             conn: &conn,
-            counters: Default::default(),
             fail: false,
         };
-        let out = run(park_noted_back(
+        let out = park_notes(
             &full,
             KIND_HOP,
             vec![ids[299].clone()],
             crate::hop_changes::COUNTER_HOP_CHANGED_OUTBOXED,
             1_000,
-        ));
+        );
         assert_eq!(out.full, 1);
-        assert_eq!(counted(&full.counters, COUNTER_CHANGE_PARK_FULL), 1);
+        assert_eq!(db_counter(&conn, COUNTER_CHANGE_PARK_FULL), 1);
         // the lobby key reads back, and nothing else does
         assert_eq!(
             parse_lobby_item(&lobby_item(&"AB".repeat(32), 4, "evicted")),
@@ -2942,13 +2899,16 @@ mod tests {
         ] {
             let flat: String = src.split_whitespace().collect();
             assert!(
-                flat.contains("Ok(db)=>{settle_and_park(&crate::change_park::WorkerPark{db:&db},&shipped,Date::now().as_millis(),account).await;}")
-                    || flat.contains("Ok(db)=>{settle_and_park(&crate::change_park::WorkerPark{db:&db},&shipped,Date::now().as_millis(),account,).await;}"),
-                "the {tag} flush parks its note-backs, its account handed to the park (the lens's LOW-2)"
+                flat.contains("settle_and_park(&mut"),
+                "the {tag} flush collects its note-backs"
             );
             assert!(
-                flat.contains("account(settle(&shipped)).await;"),
-                "the {tag} flush accounts without the binding too"
+                flat.contains("batch.tally(&COUNTERS,tally);"),
+                "the {tag} flush collects its counters"
+            );
+            assert!(
+                flat.contains("batch.park("),
+                "the {tag} flush collects its parks"
             );
         }
         assert!(
@@ -2957,83 +2917,50 @@ mod tests {
         );
     }
 
-    /// A [`ParkPort`] whose batch never answers: the runtime cancelling the flush's task during the park.
-    struct NeverPark;
-
-    impl ParkPort for NeverPark {
-        async fn park(
-            &self,
-            _rows: &[(&'static str, String)],
-            _now_ms: u64,
-        ) -> std::result::Result<Vec<bool>, String> {
-            std::future::pending().await
-        }
-        async fn bump(&self, _counter: &'static str, _delta: u64) {}
-        fn log(&self, _line: String) {}
-    }
-
-    /// bsv-low #560 (B-COST-1), the lens's LOW-2: the flush's ACCOUNT (its `*_undelivered`, `*_retried`,
-    /// `*_deferred`, `*_resent` counters) is written BEFORE the outbox's batch, through the shipped
-    /// `settle_and_park`: (a) over SQLite the account runs while nothing is parked yet; (b) a park that never
-    /// answers (the task cancelled during the batch) still leaves the account written. RED with the account after
-    /// the park (the fold's base): (b) finds no account.
+    /// The flush account and outbox now commit together (OVERLAY-D2 LOW-2).
     #[test]
-    fn b_cost_1_560f_l2_the_account_is_written_before_the_park_and_survives_its_cancellation() {
-        use std::future::Future as _;
-        let txid = |i: u32| format!("{:064x}", 0x5620_0000u32 + i);
-        let pots: Vec<(String, u32)> = (0..131u32).map(|i| (txid(i), 0)).collect();
-        let flush = || {
-            crate::pot_changes::tests::end_isolate();
-            crate::change_flush::run(crate::pot_changes::ship_with(
-                pots.clone(),
-                failing_on(&[2]),
-                || 0,
-                u64::MAX,
-            ))
-        };
-        // (a) the order, over the shipped statements
+    fn b_cost_1_560f_l2_the_account_and_park_commit_together() {
+        crate::pot_changes::tests::end_isolate();
         let conn = parked_db();
         let park = SqlitePark {
             conn: &conn,
-            counters: Default::default(),
             fail: false,
         };
-        let seen: RefCell<Option<(crate::change_flush::Tally, i64)>> = RefCell::new(None);
-        let shipped = flush();
-        let (_, out) = run(crate::pot_changes::settle_and_park(
-            &park,
-            &shipped,
-            1_000,
-            |tally| {
-                let rows: i64 = conn
-                    .query_row("SELECT COUNT(*) FROM change_parked", [], |r| r.get(0))
-                    .unwrap();
-                *seen.borrow_mut() = Some((tally, rows));
-                async {}
-            },
+        let pots = (0..131u32).map(|n| (format!("{n:064x}"), 0)).collect();
+        let shipped = run(crate::pot_changes::ship_with(
+            pots,
+            failing_on(&[2]),
+            || 0,
+            u64::MAX,
         ));
-        let (tally, rows_then) = seen.borrow().expect("accounted");
+        let mut batch = crate::change_flush::FlushBatch::default();
+        let tally = crate::pot_changes::settle_and_park(&mut batch, &shipped);
         assert_eq!((tally.retried, tally.deferred), (8, 3));
-        assert_eq!(rows_then, 0, "the account precedes the park");
-        assert_eq!(out.parked, 11);
-        // (b) the park never answers: one poll, then the task is dropped
-        let shipped = flush();
-        let accounted: RefCell<Option<crate::change_flush::Tally>> = RefCell::new(None);
-        let mut fut = std::pin::pin!(crate::pot_changes::settle_and_park(
-            &NeverPark,
-            &shipped,
-            1_000,
-            |tally| {
-                *accounted.borrow_mut() = Some(tally);
-                async {}
-            },
-        ));
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(fut.as_mut().poll(&mut cx).is_pending(), "the park hangs");
-        let tally = accounted
-            .borrow()
-            .expect("the cancelled flush's account was written");
-        assert_eq!((tally.retried, tally.deferred), (8, 3));
+        assert_eq!(
+            db_counter(&conn, crate::pot_changes::COUNTER_POT_CHANGED_RETRIED),
+            0
+        );
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM change_parked", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 0);
+        run(batch.flush_with(&park, 1_000));
+        assert_eq!(
+            db_counter(&conn, crate::pot_changes::COUNTER_POT_CHANGED_RETRIED),
+            8
+        );
+        assert_eq!(
+            db_counter(&conn, crate::pot_changes::COUNTER_POT_CHANGED_DEFERRED),
+            3
+        );
+        assert_eq!(
+            db_counter(&conn, crate::pot_changes::COUNTER_POT_CHANGED_OUTBOXED),
+            11
+        );
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM change_parked", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 11);
         crate::pot_changes::tests::end_isolate();
     }
 
@@ -3047,20 +2974,19 @@ mod tests {
         let conn = parked_db();
         let park = SqlitePark {
             conn: &conn,
-            counters: Default::default(),
             fail: false,
         };
         let lobby = |i: u32| lobby_item(&format!("{:064x}", 0x5640_0000u32 + i), 0, "admitted");
         let mut total = Outboxed::default();
         for round in 0..5u32 {
             let items = (round * 128..(round + 1) * 128).map(lobby).collect();
-            let out = run(park_noted_back(
+            let out = park_notes(
                 &park,
                 KIND_LOBBY,
                 items,
                 crate::lobby_changes::COUNTER_LOBBY_CHANGED_OUTBOXED,
                 1_000 + u64::from(round),
-            ));
+            );
             total.parked += out.parked;
             total.full += out.full;
         }
@@ -3069,27 +2995,27 @@ mod tests {
             (512, 128),
             "the lobby's share, the rest counted full"
         );
-        assert_eq!(counted(&park.counters, COUNTER_CHANGE_PARK_FULL), 128);
+        assert_eq!(db_counter(&conn, COUNTER_CHANGE_PARK_FULL), 128);
         // the other kinds still park
-        let out = run(park_noted_back(
+        let out = park_notes(
             &park,
             KIND_POT,
             vec![pot_item(&"ab".repeat(32), 1)],
             crate::pot_changes::COUNTER_POT_CHANGED_OUTBOXED,
             2_000,
-        ));
+        );
         assert_eq!(
             out.parked, 1,
             "a pot note-back parks beside a full lobby share"
         );
         // a held lobby key re-parks at the share (a new generation, no new row)
-        let out = run(park_noted_back(
+        let out = park_notes(
             &park,
             KIND_LOBBY,
             vec![lobby(0)],
             crate::lobby_changes::COUNTER_LOBBY_CHANGED_OUTBOXED,
             3_000,
-        ));
+        );
         assert_eq!(out.parked, 1);
         let lobby_rows: i64 = conn
             .query_row(

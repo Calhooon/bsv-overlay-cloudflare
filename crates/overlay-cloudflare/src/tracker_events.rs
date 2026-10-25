@@ -1,6 +1,6 @@
-//! Bounded first-party write events; one resend on the next foreground flush.
+//! Bounded first-party write events; one resend after a failed POST, no retry consumed by the wall.
 use serde_json::{json, Value};
-use std::{cell::RefCell, collections::BTreeMap};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 thread_local! {
     static EVENTS: RefCell<BTreeMap<(String,String),Value>> = const {RefCell::new(BTreeMap::new())};
     static COUNTS: RefCell<BTreeMap<String,u64>> = const {RefCell::new(BTreeMap::new())};
@@ -152,7 +152,8 @@ pub fn answered_held(answer: &str) -> bool {
 
 /// The production POST boundary, also used by the refusal/recovery pin. The post answers `Ok(held)`: a frame the
 /// app layer held is counted `shipped`; one it dropped as unheld (B-OWED-3-FOLD L2) `unheld`, never `shipped`; a
-/// refused POST is retried once.
+/// refused POST is retried once. This unraced helper awaits its POST; the ordered flush races each POST
+/// against the flush wall and defers a timed-out frame without consuming that retry.
 pub async fn deliver<F, Fut>(frame: Value, post: F)
 where
     F: FnOnce(String) -> Fut,
@@ -177,14 +178,15 @@ pub fn health_json() -> Value {
 /// (a note triggers the owed recompute, which reads the spender's word), but a word flood (the tip pass, the cron, a
 /// queue batch: N `proof` frames beside N pot notes at a block) took the whole wall and deferred EVERY note of the
 /// flush to the isolate's next one. So the words start under `min(deadline, start + WORDS_SHARE_MS)`, then the hop
-/// and pot notes under the deadline, then the words left under the deadline (a frame the wall stops keeps its once
-/// retry). Stated: a frame past the slice reaches the app layer after the notes of its flush.
+/// and pot notes under the deadline, then the words left under the deadline. The slice bounds only a POST's
+/// start: an in-flight frame is awaited up to the flush wall. A frame the wall stops is deferred without
+/// consuming its retry. Stated: a frame not started within the slice reaches the app layer after the notes.
 pub const WORDS_SHARE_MS: u64 = 10_000;
 
 /// What one ordered flush did with its word frames ([`ship_in_order`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WordsShipped {
-    /// Frames POSTed before the notes (inside the slice).
+    /// Frames POSTed before the notes (started inside the slice, awaited under the full wall).
     pub before_notes: usize,
     /// Frames POSTed after the notes (past the slice, before the deadline).
     pub after_notes: usize,
@@ -197,6 +199,7 @@ async fn post_frames<P, Fut, C, S, Sleep>(
     post: &mut P,
     now_ms: &C,
     until_ms: u64,
+    deadline_ms: u64,
     last: bool,
     sleep: &S,
 ) -> (usize, Vec<Value>)
@@ -220,7 +223,7 @@ where
         posted += 1;
         match crate::race_or_deadline(
             post(frame.to_string()),
-            sleep(until_ms.saturating_sub(now_ms())),
+            sleep(deadline_ms.saturating_sub(now_ms())),
         )
         .await
         {
@@ -238,7 +241,7 @@ where
 }
 
 /// THE ONE ORDER of a flush (bsv-low #660 under #618; B-OWED-3-FOLD L3 and L4), over any transport: the word frames,
-/// each POST awaited, under the words' slice ([`WORDS_SHARE_MS`]); then `notes(deadline_ms)` (the hop and pot sets,
+/// each POST started under the words' slice ([`WORDS_SHARE_MS`]) and awaited under the full wall; then `notes(deadline_ms)` (the hop and pot sets,
 /// which start no POST at or past the deadline); then the frames left under the deadline. The app layer writes a
 /// frame before it answers, so a note shipped after a word's answer triggers a recompute that reads that word.
 pub async fn ship_in_order<P, Fut, N, NFut, C>(
@@ -285,11 +288,27 @@ where
     Sleep: std::future::Future<Output = ()>,
 {
     let slice_ms = deadline_ms.min(now_ms().saturating_add(WORDS_SHARE_MS));
-    let (before_notes, left) =
-        post_frames(words, &mut post, &now_ms, slice_ms, false, &sleep).await;
+    let (before_notes, left) = post_frames(
+        words,
+        &mut post,
+        &now_ms,
+        slice_ms,
+        deadline_ms,
+        false,
+        &sleep,
+    )
+    .await;
     notes(deadline_ms).await;
-    let (after_notes, walled) =
-        post_frames(left, &mut post, &now_ms, deadline_ms, true, &sleep).await;
+    let (after_notes, walled) = post_frames(
+        left,
+        &mut post,
+        &now_ms,
+        deadline_ms,
+        deadline_ms,
+        true,
+        &sleep,
+    )
+    .await;
     let summary = WordsShipped {
         before_notes,
         after_notes,
@@ -298,20 +317,13 @@ where
     (summary, walled)
 }
 
-/// Retain timed-out word frames in the existing outbox as well as the isolate queue.
-pub(crate) async fn park_walled<P: crate::change_park::ParkPort>(
-    port: &P,
-    frames: Vec<Value>,
-    now_ms: u64,
-) {
-    crate::change_park::park_noted_back(
-        port,
+/// Retain timed-out word frames in the flush's atomic outbox batch as well as the isolate queue.
+pub(crate) fn park_walled(batch: &mut crate::change_flush::FlushBatch, frames: Vec<Value>) {
+    batch.park(
         crate::change_park::KIND_WORD,
         frames.into_iter().map(|frame| frame.to_string()).collect(),
         crate::change_park::COUNTER_CHANGE_PARKED,
-        now_ms,
-    )
-    .await;
+    );
 }
 
 /// [`ship_in_order`] on the Worker: the frames to the app layer's `/internal/tx-word` (each answer read for `held`,
@@ -319,7 +331,7 @@ pub(crate) async fn park_walled<P: crate::change_park::ParkPort>(
 /// unconfigured deploy drops the frames (counted) and still runs the notes (which log their own refusal).
 pub async fn ship_then<N, NFut>(env: &worker::Env, events: Vec<Value>, notes: N, deadline_ms: u64)
 where
-    N: FnOnce(u64) -> NFut,
+    N: FnOnce(u64, Rc<RefCell<crate::change_flush::FlushBatch>>) -> NFut,
     NFut: std::future::Future<Output = ()>,
 {
     let configured = crate::change_flush::configured(env);
@@ -334,6 +346,8 @@ where
     };
     let (url, token) = configured.unwrap_or_default();
     let (url, token) = (url.as_str(), token.as_str());
+    let batch = Rc::new(RefCell::new(crate::change_flush::FlushBatch::default()));
+    let notes_batch = Rc::clone(&batch);
     let (_, walled) = ship_in_order_with(
         words,
         |body| async move {
@@ -349,28 +363,84 @@ where
             .map(|answer| answered_held(&answer))
             .map_err(|_| "undelivered".to_string())
         },
-        notes,
+        |deadline| notes(deadline, notes_batch),
         || worker::Date::now().as_millis(),
         deadline_ms,
         crate::broadcaster::sleep_ms,
     )
     .await;
     let pending = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
-    if let Ok(db) = env.d1("OVERLAY_DB") {
+    let mut batch = std::mem::take(&mut *batch.borrow_mut());
+    {
         for (name, n) in pending {
-            crate::ops::bump_counter(&db, &name, n).await;
+            batch.bump(name, n);
         }
-        park_walled(
-            &crate::change_park::WorkerPark { db: &db },
-            walled,
-            worker::Date::now().as_millis(),
-        )
-        .await;
+        park_walled(&mut batch, walled);
     }
+    batch.flush(env, worker::Date::now().as_millis()).await;
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn d2_low1_word_started_in_slice_finishes_before_notes_under_the_wall() {
+        use std::cell::Cell;
+        drain();
+        let clock = Cell::new(0);
+        let notes_at = Cell::new(None);
+        let word_held = Cell::new(false);
+        let sleep_until = Cell::new(None);
+        let (summary, walled) = crate::change_flush::run(ship_in_order_with(
+            vec![json!({"txid": "ac".repeat(32), "kind": "seen"})],
+            |_| {
+                std::future::poll_fn(|_| {
+                    if clock.get() == 0 {
+                        clock.set(WORDS_SHARE_MS + 1_000);
+                        std::task::Poll::Pending
+                    } else {
+                        word_held.set(true);
+                        std::task::Poll::Ready(Ok(true))
+                    }
+                })
+            },
+            |_| async {
+                assert!(word_held.get(), "notes recomputed before the word was held");
+                notes_at.set(Some(clock.get()));
+            },
+            || clock.get(),
+            20_000,
+            |ms| {
+                let until = clock.get() + ms;
+                sleep_until.set(Some(until));
+                let clock = &clock;
+                std::future::poll_fn(move |cx| {
+                    if clock.get() >= until {
+                        std::task::Poll::Ready(())
+                    } else {
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+            },
+        ));
+        assert_eq!(
+            sleep_until.get(),
+            Some(20_000),
+            "race uses the wall, not the slice"
+        );
+        assert_eq!(notes_at.get(), Some(WORDS_SHARE_MS + 1_000));
+        assert_eq!(
+            summary,
+            WordsShipped {
+                before_notes: 1,
+                after_notes: 0,
+                walled: 0
+            }
+        );
+        assert!(walled.is_empty());
+        assert!(drain().is_empty());
+    }
+
     #[test]
     fn d2_649_hung_word_yields_to_notes_and_is_counted_at_the_wall() {
         use std::cell::Cell;
@@ -403,7 +473,7 @@ mod tests {
             done.is_some(),
             "hung word consumed the platform window before notes or deferral"
         );
-        assert_eq!(notes_at.get(), Some(WORDS_SHARE_MS));
+        assert_eq!(notes_at.get(), Some(20_000));
         let (summary, frames) = done.unwrap();
         assert_eq!(summary.walled, 1);
         assert_eq!(frames.len(), 1);

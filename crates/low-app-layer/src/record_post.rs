@@ -4847,6 +4847,52 @@ pub(crate) mod tests {
         }
     }
 
+    /// A wrong signature must have the same refusal under either game, across every latch state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn d2_note3_wrong_signature_never_answers_the_game_comparison() {
+        use crate::hopsweep::tests as hs;
+        let wallet = hs::wallet(0x46);
+        let identity = hs::identity(&wallet);
+        let poster = hex::encode(&identity);
+        let seat = hs::skey(14);
+        let forged = hs::sweep_raw(&seat, &hs::skey(15), 0, hs::HOP_SATS, &hs::DEST);
+        for latch in [Some(1), Some(0), None] {
+            for game in [hs::GID, [0x99; 32]] {
+                let db = crate::pot_hook::tests::SqliteSql::migrated();
+                md_index_the_hop(&db, &hs::hop_ctx(&wallet, &seat, true), latch);
+                let (outcome, _) = md_file(
+                    &db,
+                    RecordKind::Hopsweep,
+                    &md_sweep_script(&identity, &game, &forged),
+                    &poster,
+                )
+                .await;
+                assert_eq!(
+                    outcome,
+                    DoorOutcome::Refused(RecordRefusal::SweepNotTheSeatsSpend),
+                    "latch {latch:?}, game {}",
+                    hex::encode(game)
+                );
+                let (status, body) = record_refusal_reply(
+                    Some(RecordKind::Hopsweep),
+                    RecordRefusal::SweepNotTheSeatsSpend,
+                    None,
+                );
+                assert_eq!(status, 422);
+                assert_eq!(body["error"], RecordRefusal::SweepNotTheSeatsSpend.as_str());
+                assert!(
+                    body.get("code").is_none(),
+                    "the game refusal leaked through"
+                );
+                let rows: i64 = db
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM hopsweep_records", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(rows, 0);
+            }
+        }
+    }
+
     // ── MONEY-DOOR-LENS: the lens's negative cases (not part of PR 169) ──
 
     /// The lens: a VALID row first, then a stranger's junk chain row at the same (identity, game, pot): the valid
