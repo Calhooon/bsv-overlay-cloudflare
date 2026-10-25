@@ -165,6 +165,22 @@ pub const NETWORK_SEEN_SOURCE_ALTER: &str = "ALTER TABLE network_seen ADD COLUMN
 pub const NETWORK_SEEN_SOURCE_AT_ALTER: &str =
     "ALTER TABLE network_seen ADD COLUMN sourceAtMs INTEGER";
 
+/// #893: additive query keys for rows judged at the write. NULL keeps old-worker rows readable.
+pub const OWED_JUDGED_AT_ALTER: &str = "ALTER TABLE owed_rows ADD COLUMN judgedAtMs INTEGER";
+pub const OWED_CLAIMABLE_ALTER: &str = "ALTER TABLE owed_rows ADD COLUMN claimable INTEGER";
+pub const OWED_GATE_HEIGHT_ALTER: &str = "ALTER TABLE owed_rows ADD COLUMN gateHeight INTEGER";
+pub const OWED_BELT_DUE_AT_ALTER: &str = "ALTER TABLE owed_rows ADD COLUMN beltDueAtMs INTEGER";
+pub const OWED_PROBE_TIP_ALTER: &str = "ALTER TABLE owed_rows ADD COLUMN probeTip INTEGER";
+
+/// #893: the read's word joins, inverted by txid at the word write.
+pub const OWED_ROW_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_row_words (identity TEXT, outpoint TEXT, role TEXT, txid TEXT, PRIMARY KEY (identity, outpoint, role))";
+/// #893: subjects the source statements mark for judgement, in the source transaction.
+pub const OWED_DIRTY_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_dirty (identity TEXT NOT NULL, gameId TEXT NOT NULL, source TEXT NOT NULL, sourceKey TEXT NOT NULL, markedAtMs INTEGER NOT NULL, UNIQUE (identity, gameId, source, sourceKey))";
+/// #893: the eviction's released-hop evidence, read by identity and game or hop outpoint.
+pub const RELEASED_HOP_EVIDENCE_CREATE: &str = "CREATE TABLE IF NOT EXISTS released_hop_evidence (hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, identity TEXT NOT NULL, gameId TEXT NOT NULL, potTxid TEXT NOT NULL, seatSettlePubkey TEXT NOT NULL, hopSats INTEGER NOT NULL, evictedAt INTEGER NOT NULL, PRIMARY KEY (hopTxid, hopVout, identity))";
+/// #893: independent belt and backfill cursors; the backfill stamp remains in view_derivation_state.
+pub const OWED_BELT_STATE_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_belt_state (name TEXT PRIMARY KEY, cursor TEXT, tickedAtMs INTEGER)";
+
 pub const LATCH_COLUMN_ALTERS: &[&str] = &[
     SIG_VALID_ALTER,
     MARKER_VALID_ALTER,
@@ -185,6 +201,11 @@ pub const LATCH_COLUMN_ALTERS: &[&str] = &[
     // bsv-low #808: the tip a hop's chain-probe memo was taken at (overlay migration 342). The owed walk's memo read
     // and write name it (`hops_view::probe_memo_read_sql`, `PROBE_MEMO_UPSERT_SQL`).
     crate::hops_view::HOP_CHAIN_PROBES_TIP_ALTER,
+    OWED_JUDGED_AT_ALTER,
+    OWED_CLAIMABLE_ALTER,
+    OWED_GATE_HEIGHT_ALTER,
+    OWED_BELT_DUE_AT_ALTER,
+    OWED_PROBE_TIP_ALTER,
 ];
 
 /// The bsv-low #371 `network_seen` TABLE, same Rule-24 contract as the
@@ -296,6 +317,10 @@ pub const CREATE_TABLE_CATCHUPS: &[&str] = &[
     // of the overlay must create them.
     crate::handfile::HANDFILE_BATCHES_CREATE,
     crate::handfile::HANDFILE_ROWS_CREATE,
+    OWED_ROW_WORDS_CREATE,
+    OWED_DIRTY_CREATE,
+    RELEASED_HOP_EVIDENCE_CREATE,
+    OWED_BELT_STATE_CREATE,
 ];
 
 /// Set once THIS isolate has issued (or knowingly skipped) EVERY statement.
@@ -466,14 +491,15 @@ mod tests {
     fn every_app_layer_alter_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             LATCH_COLUMN_ALTERS.len(),
-            14,
+            19,
             "sigValid (#283), markerValid (#362), firstSpentAt (#217), \
              spenderFinal (#371), claimValid + rowValid (brain-cutover M1), \
              settleSigners (#406), spenderPayASats + spenderPayBSats (#468), \
              payTxid (#492, the held filing's paying transaction), \
              recomputeSeq (#566, the identity's owed recompute sequence), \
              seenSource + sourceAtMs (#621, the seen latch's broadcaster and time), \
-             tipHeight (#808, the tip a hop's chain-probe memo was taken at)"
+             tipHeight (#808, the tip a hop's chain-probe memo was taken at), \
+             judgedAtMs, claimable, gateHeight, beltDueAtMs, probeTip (#893, the owed write's query keys)"
         );
         for stmt in LATCH_COLUMN_ALTERS {
             let column = stmt
@@ -538,7 +564,7 @@ mod tests {
     fn every_create_table_catchup_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             CREATE_TABLE_CATCHUPS.len(),
-            16,
+            20,
             "tx_words and tracker_backfill (NS-3), network_seen (#371), collected_markers_v2 (#252 stage A), \
              hand_markers (#382, mirrored for the brain-cutover M2 join), \
              proof_posts (bsv-low P1.1 proof-in-DB, owner GO 2026-09-02), \
@@ -548,7 +574,8 @@ mod tests {
              pot_announce_seq (E649 L4 N1, the park's tokens), \
              owed_spender_bytes (bsv-low #672, RC-L30, the durable spender-bytes store), \
              tracker_chain_events + tracker_reasks (bsv-low #771, the chain-event intake), \
-             handfile_batches + handfile_rows (bsv-low #848, the handfile batches and their rows)"
+             handfile_batches + handfile_rows (bsv-low #848, the handfile batches and their rows), \
+             owed_row_words + owed_dirty + released_hop_evidence + owed_belt_state (#893)"
         );
         for stmt in CREATE_TABLE_CATCHUPS {
             assert!(stmt.starts_with("CREATE TABLE IF NOT EXISTS "), "{stmt}");

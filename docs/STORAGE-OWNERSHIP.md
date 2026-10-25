@@ -70,6 +70,10 @@ The app layer's write set (the comment in `crates/low-app-layer/wrangler.toml` r
 | `pot_evictions` | overlay-cloudflare | none | low-app-layer, overlay-discovery | lost | **yes** | admit-fast's eviction ledger: a readmission re-marks released spends FROM this row; nothing else holds it (#470 section 3 item 8) |
 | `tx_words` | low-app-layer | low-app-layer: CREATE | none | re-askable | no | compact tracker projection; eight-day stranger sweep; public reads create zero rows |
 | `owed_rows` | low-app-layer | none | none | transient | no | a pure derivation over the money tables; the next read recomputes |
+| `owed_row_words` | low-app-layer | overlay-cloudflare DELETE (orphan trigger) | none | derived | no | txid roles replaced with each judged row; an old-worker delete removes its joins in the same statement |
+| `owed_dirty` | low-app-layer | none | none | derived | no | identity/game subjects marked in the source write, coalesced by source and source key |
+| `released_hop_evidence` | overlay-cloudflare | low-app-layer CREATE (catch-up) | none | derived | no | released-hop evidence derived from retained eviction, party and JOIN inputs |
+| `owed_belt_state` | low-app-layer | none | none | transient | no | named cursors for the belt and backfill; completion stays in view_derivation_state |
 | `owed_state` | low-app-layer | none | none | transient | no | recomputed on the next read |
 | `owed_spender_bytes` | low-app-layer | none | none | transient | no | bsv-low #672 (RC-L30): a cache of a hop spender's immutable outputs + input outpoints, content-addressed by spender txid, read before the owed recompute's budget so a budget cut never clobbers a judged spent-elsewhere row; a sweep ages it and a lost row is re-fetched from a courier when its spender is asked again |
 | `pot_announce_parked` | low-app-layer | none | none | transient | no | a wake-up signal only (E649 L4 H1): the seat's own read serves every fact, and the next pot change announces again |
