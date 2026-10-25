@@ -399,6 +399,38 @@
         "calls": 4
       },
       "censusKey": null
+    },
+    "owed-backfill-pass": {
+      "route": "POST /internal/owed-backfill-pass: the owed-v2 backfill over the READ lane's fleet seed turned back into an old worker's rows (no keys, no state, no marks): two identities, the lived-in seat's 270 games in 17 judge batches of 16 and the one-game wanted identity in one, the cursor saved after each, the stamp with the last save, one pass (bsv-low #893 section 6.1). About 2,970 rows a batch: the judge's commit over a 500-row identity (the cap DELETE, the per-game DELETE, the owed_state COUNT) and its hydration",
+      "measured": {
+        "reads": 53424,
+        "writes": 5575,
+        "stmts": 3062,
+        "maxReads": 1291
+      },
+      "ceiling": {
+        "reads": 80136,
+        "writes": 8363,
+        "stmts": 4593,
+        "maxReads": 1937
+      },
+      "censusKey": null
+    },
+    "owed-backfill-stamped": {
+      "route": "POST /internal/owed-backfill-pass once owed-v2 is stamped: the one primary-key read of view_derivation_state (pin 7.5), on the same populated seed",
+      "measured": {
+        "reads": 1,
+        "writes": 0,
+        "stmts": 1,
+        "maxReads": 1
+      },
+      "ceiling": {
+        "reads": 1,
+        "writes": 0,
+        "stmts": 1,
+        "maxReads": 1
+      },
+      "censusKey": null
     }
   },
   "censusKey": "the d1Budget route a production census holds against this ceiling (advisory there: production rows are not the fixture's); null = the route's maximum is another scenario's",
