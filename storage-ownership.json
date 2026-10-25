@@ -784,6 +784,58 @@
    "why": "a pure derivation over the money tables; the next read recomputes"
   },
   {
+   "name": "owed_row_words",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {
+    "overlay-cloudflare": [
+     "DELETE"
+    ]
+   },
+   "readers": [],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "the txid roles used to serve and invalidate each owed row",
+   "why": "the judge replaces these joins with its rows; the overlay orphan trigger follows an old-worker row delete"
+  },
+  {
+   "name": "owed_dirty",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "the identity and game subjects awaiting judgement, coalesced by source and source key",
+   "why": "source-statement triggers mark the affected game; the judge consumes only observed marks"
+  },
+  {
+   "name": "released_hop_evidence",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {
+    "low-app-layer": [
+     "CREATE"
+    ]
+   },
+   "readers": [],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "the eviction-derived evidence of each released hop and identity",
+   "why": "derived from the retained eviction ledger, party twin and JOIN bytes; the app layer carries the additive table catch-up"
+  },
+  {
+   "name": "owed_belt_state",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "independent named cursors for the owed belt and backfill",
+   "why": "a lost cursor restarts bounded work; the backfill completion stamp remains in view_derivation_state"
+  },
+  {
    "name": "owed_state",
    "database": "low-overlay-db",
    "owner": "low-app-layer",
