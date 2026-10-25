@@ -145,6 +145,18 @@ margin rule gives 17 / 9 / 8. Its detached filer walk retains the `owed-recomput
 
 Owed first read re-measured 2026-10-12 after the #610 fold rebased onto main `13f0e66`: 363 reads / 18 writes / 28 statements (`make ci-d1-budget`, local fixture D1). The markerless cursor and candidates reads, #610, account for the two additional statements. The existing 28-statement ceiling is retained: zero statement margin; it is a bar, not a knob. Other scenario baselines above remain the 2026-10-07 measurements.
 
+D2-OWED-READ-FOLD (2026-10-25, ruling 1, bsv-low record 1277): the focused
+`OWED_READ_ONLY=1 make ci-d1-budget` pin serves 500 stored rows judged from 250 results and 270 hops.
+The backfilled read measures 2000 reads / 0 writes / 3 statements, maxReads 1999;
+its ceiling remains 3000 / 0 / 3, maxReads 2006, with zero courier calls and background tasks.
+An unbackfilled read writes one wanted mark: exactly one INSERT, at most five physical D1 rows
+(the row, its indexes and the AUTOINCREMENT sequence). D1 measures five, so ruling 1 replaces
+the former one-physical-write ceiling with five. The full request's four reads plus that INSERT
+remain recorded separately in `requestMeasured`; the wanted ceiling counts the INSERT alone.
+The pin checks D1 statement metadata, the single application mark, zero courier calls and zero
+background task registrations. The additional 500-row, 750-word-role stress measurement
+(3250 reads, maxReads 3249) remains separate from the backfilled ceiling.
+
 A ceiling is raised only with a new measurement (`D1_BUDGET_MEASURE=1 make ci-d1-budget` prints the table and
 enforces nothing) and its reason written here. Not in this tier: the tower's case reads (`low-watchtower` lives in
 bsv-low, its D1 is its own: a bsv-low follow-up, filed by CAP, for `GET /case/:gameId/:potTxid/:vout` and the
