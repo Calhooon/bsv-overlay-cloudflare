@@ -67,6 +67,15 @@ pub const DIRTY_IDENTITY_MARKED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_ow
 /// The D2-OWED lens's MEDIUM-5: an old worker's keyless row (`judgedAtMs` NULL: the deploy window, or a rollback to
 /// the old walk and forward again) is re-marked by the drain's age repair, bounded, over its own partial index.
 pub const UNJUDGED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_unjudged ON owed_rows(judgedAtMs,identity,gameId) WHERE judgedAtMs IS NULL";
+/// The D2-OWED lens's LOW-2: the judge's per-game delete reads one game's rows, never the identity's whole list.
+pub const ROWS_GAME_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_owed_rows_identity_game ON owed_rows(identity,gameId)";
+/// The D2-OWED lens's LOW-2: `owed_state.rows` is kept by the row writes themselves, so the judge's state write and
+/// the stored ceiling's guard read one row, never COUNT the identity's list. An old worker's whole-identity write sets
+/// the figure explicitly after its rows, so it stays exact through the window.
+pub const ROWS_COUNT_INSERT: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_count_insert AFTER INSERT ON owed_rows BEGIN UPDATE owed_state SET rows=rows+1 WHERE identity=NEW.identity; END";
+/// The count's other half: a judge's per-game delete, the stored ceiling, an old worker's whole-identity delete.
+pub const ROWS_COUNT_DELETE: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_count_delete AFTER DELETE ON owed_rows BEGIN UPDATE owed_state SET rows=MAX(rows-1,0) WHERE identity=OLD.identity; END";
 /// Old workers delete an identity's rows whole; their word joins must disappear in that statement too.
 pub const ROW_DELETE: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_delete_words AFTER DELETE ON owed_rows BEGIN DELETE FROM owed_row_words WHERE identity=OLD.identity AND outpoint=OLD.outpoint; END";
 

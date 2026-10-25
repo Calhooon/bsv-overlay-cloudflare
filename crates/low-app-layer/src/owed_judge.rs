@@ -130,6 +130,15 @@ pub const OWED_WANTED_GAMES: usize = 32;
 pub const REQUIRED_GAME_INDEX_NAMES: [&str; 2] =
     ["idx_potparty_game_identity", "idx_evicted_party_identity_game"];
 pub const MARK_WANTED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,'','wanted',?1,?2) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
+/// A judge's per-game delete, over `idx_owed_rows_identity_game` (the D2-OWED lens's LOW-2).
+pub const GAME_DELETE_SQL: &str = "DELETE FROM owed_rows WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))";
+/// The identity's state row, created once with its rows counted; the row triggers keep `rows` from then on.
+pub const STATE_CREATE_SQL: &str = "INSERT INTO owed_state(identity,computedAtMs,tip,rows,stale,truncated,recomputeSeq) SELECT ?1,?2,NULL,(SELECT COUNT(*) FROM owed_rows WHERE identity=?1),0,0,0 WHERE NOT EXISTS (SELECT 1 FROM owed_state WHERE identity=?1)";
+/// The stored ceiling, read only when the kept count is past it: the state row is the outer loop, so under the
+/// ceiling the identity's rows are never visited, and the delete is driven by the list's rowids.
+pub const CEILING_DELETE_SQL: &str = "DELETE FROM owed_rows WHERE rowid IN (SELECT r.rowid FROM owed_state s CROSS JOIN owed_rows r WHERE s.identity=?1 AND s.rows>500 AND r.identity=?1 ORDER BY CASE r.family WHEN 'payout' THEN 0 WHEN 'refund-due' THEN 1 WHEN 'hop-stranded' THEN 2 WHEN 'in-progress' THEN 3 ELSE 4 END,COALESCE(r.atHeight,0) DESC,r.outpoint LIMIT -1 OFFSET 500)";
+/// The judge's stamp on the state row; `changes()` is the ceiling delete's, just before it.
+pub const STATE_UPDATE_SQL: &str = "UPDATE owed_state SET computedAtMs=MAX(computedAtMs,?2),tip=?3,stale=0,truncated=(truncated OR ?4 OR changes()>0),recomputeSeq=COALESCE(recomputeSeq,0)+1 WHERE identity=?1";
 /// The judge's acknowledgement: the marks at or below the generation it read (amendment 1), and the marks its own
 /// source statements raised, ?4 a JSON list of `[source, sourceKey]`.
 pub const ACK_DIRTY_SQL: &str = "DELETE FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2)) AND (generation<=?3 OR EXISTS (SELECT 1 FROM json_each(?4) m WHERE json_extract(m.value,'$[0]')=owed_dirty.source AND json_extract(m.value,'$[1]')=owed_dirty.sourceKey))";
@@ -434,7 +443,7 @@ pub async fn judge_with_write(
         crate::owed::sort_rows_for_service(&mut rows);
         let cut = rows.len() > crate::owed::OWED_MAX_ROWS;
         rows.truncate(crate::owed::OWED_MAX_ROWS);
-        plan.push(Stmt{sql:"DELETE FROM owed_rows WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))".into(),binds:vec![Bind::Text(id.clone()),Bind::Text(json!(games).to_string())]});
+        plan.push(Stmt{sql:GAME_DELETE_SQL.into(),binds:vec![Bind::Text(id.clone()),Bind::Text(json!(games).to_string())]});
         for row in &rows {
             plan.extend(row_statements(row, i.now_ms, i.tip, Some(i)));
         }
@@ -444,11 +453,28 @@ pub async fn judge_with_write(
                 binds: vec![Bind::Text(moved)],
             });
         }
+        // The identity's first state row counts its rows ONCE; from then on the row triggers keep the figure (the
+        // D2-OWED lens's LOW-2), so neither the ceiling's guard nor the state write reads the identity's list.
+        plan.push(Stmt {
+            sql: STATE_CREATE_SQL.into(),
+            binds: vec![Bind::Text(id.clone()), Bind::Int(i.now_ms)],
+        });
         // Rank at the shared ceiling inside the transaction, so two different games cannot overfill it.
-        plan.push(Stmt{sql:format!("DELETE FROM owed_rows WHERE identity=?1 AND outpoint IN (SELECT outpoint FROM owed_rows WHERE identity=?1 ORDER BY CASE family WHEN 'payout' THEN 0 WHEN 'refund-due' THEN 1 WHEN 'hop-stranded' THEN 2 WHEN 'in-progress' THEN 3 ELSE 4 END,COALESCE(atHeight,0) DESC,outpoint LIMIT -1 OFFSET {})",crate::owed::OWED_MAX_ROWS),binds:vec![Bind::Text(id.clone())]});
+        plan.push(Stmt {
+            sql: CEILING_DELETE_SQL.into(),
+            binds: vec![Bind::Text(id.clone())],
+        });
         // A partial judge cannot prove that other games' omitted rows were rebuilt.
-        // Preserve an earlier overflow flag until a complete backfill resets it.
-        plan.push(Stmt{sql:"INSERT INTO owed_state(identity,computedAtMs,tip,rows,stale,truncated,recomputeSeq) SELECT ?1,?2,?3,COUNT(*),0,(?4 OR changes()>0),1 FROM owed_rows WHERE identity=?1 ON CONFLICT(identity) DO UPDATE SET computedAtMs=MAX(owed_state.computedAtMs,excluded.computedAtMs),tip=excluded.tip,rows=excluded.rows,stale=0,truncated=(owed_state.truncated OR excluded.truncated),recomputeSeq=COALESCE(owed_state.recomputeSeq,0)+1".into(),binds:vec![Bind::Text(id.clone()),Bind::Int(i.now_ms),i.tip.map_or(Bind::Null,|n|Bind::Int(n as i64)),Bind::Int(i64::from(cut))]});
+        // Preserve an earlier overflow flag until a complete backfill resets it; `changes()` is the ceiling's.
+        plan.push(Stmt {
+            sql: STATE_UPDATE_SQL.into(),
+            binds: vec![
+                Bind::Text(id.clone()),
+                Bind::Int(i.now_ms),
+                i.tip.map_or(Bind::Null, |n| Bind::Int(n as i64)),
+                Bind::Int(i64::from(cut)),
+            ],
+        });
         let owned: Vec<[&str; 2]> = owned_marks
             .iter()
             .map(|m| [m.source.as_str(), m.source_key.as_str()])
