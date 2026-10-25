@@ -117,13 +117,32 @@ pub use hydrate::{
 
 pub const OWED_JUDGE_SUBJECTS_PER_INVOCATION: usize = 16;
 pub const OWED_DIRTY_SUBJECTS_PER_PASS: usize = 64;
+/// A wanted envelope expands to the identity's newest games only (the design's section 4.1 bound, the D2-OWED lens's
+/// MEDIUM-1); the rest are marked `backfill` and wait their identity's turn like any other mark.
+pub const OWED_WANTED_GAMES: usize = 32;
 /// Required source-table access paths, by index name: the overlay ships both (the native pin holds it).
 pub const REQUIRED_GAME_INDEX_NAMES: [&str; 2] =
     ["idx_potparty_game_identity", "idx_evicted_party_identity_game"];
 pub const MARK_WANTED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,'','wanted',?1,?2) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
+/// The judge's acknowledgement: the marks at or below the generation it read (amendment 1), and the marks its own
+/// source statements raised, ?4 a JSON list of `[source, sourceKey]`.
+pub const ACK_DIRTY_SQL: &str = "DELETE FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2)) AND (generation<=?3 OR EXISTS (SELECT 1 FROM json_each(?4) m WHERE json_extract(m.value,'$[0]')=owed_dirty.source AND json_extract(m.value,'$[1]')=owed_dirty.sourceKey))";
 pub const MARKS_SQL: &str = "SELECT generation,source,sourceKey FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))";
-/// Wanted first; a subject marked only by the daily age repair last (`owed_backfill::AGE_MARK_SQL`).
-pub const SUBJECTS_SQL: &str = "SELECT identity,gameId FROM owed_dirty GROUP BY identity,gameId ORDER BY MAX(source='wanted') DESC,MIN(source='age'),MIN(markedAtMs),MIN(generation) LIMIT ?1";
+/// The wanted envelopes, oldest first, by (source, age).
+pub const WANTED_ENVELOPES_SQL: &str = "SELECT identity,generation FROM owed_dirty INDEXED BY idx_owed_dirty_source_marked WHERE source='wanted' AND gameId='' ORDER BY markedAtMs,generation LIMIT ?1";
+/// The drain's round-robin walk (the D2-OWED lens's MEDIUM-1): up to ?2 distinct identities holding a mark, ascending
+/// past the cursor ?1, one covering-index search each; the caller wraps to the start for the rest.
+pub const DRAIN_IDENTITIES_SQL: &str = "WITH RECURSIVE walk(identity,n) AS (SELECT (SELECT MIN(identity) FROM owed_dirty INDEXED BY idx_owed_dirty_identity WHERE identity>?1),1 UNION ALL SELECT (SELECT MIN(identity) FROM owed_dirty INDEXED BY idx_owed_dirty_identity WHERE identity>walk.identity),n+1 FROM walk WHERE walk.identity IS NOT NULL AND n<?2) SELECT identity FROM walk WHERE identity IS NOT NULL";
+/// One identity's oldest marks, a bounded few (the drain groups them by game): ?3 = 0 its source marks, ?3 = 1 its
+/// age repair's (read only when the source marks leave room; at most 128 age marks are ever pending fleet-wide).
+pub const DRAIN_MARKS_SQL: &str = "SELECT gameId,source,markedAtMs,generation FROM owed_dirty INDEXED BY idx_owed_dirty_identity_marked WHERE identity=?1 AND (source='age')=?3 ORDER BY markedAtMs,generation LIMIT ?2";
+/// The drain's cursor: the last identity a pass gave a turn.
+pub const DRAIN_CURSOR_NAME: &str = "drain";
+pub const DRAIN_CURSOR_READ_SQL: &str = "SELECT cursor FROM owed_belt_state WHERE name='drain'";
+pub const DRAIN_CURSOR_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('drain',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+/// A hook's subjects: the identities or source keys its change note carries (two index searches), oldest first, the
+/// age repair's last.
+pub const CHANGED_SQL: &str = "SELECT identity,gameId FROM owed_dirty WHERE gameId<>'' AND (identity IN (SELECT value FROM json_each(?1)) OR sourceKey IN (SELECT value FROM json_each(?2))) GROUP BY identity,gameId ORDER BY MIN(source='age'),MIN(markedAtMs),MIN(generation) LIMIT ?3";
 pub const ROWS_READ_SQL: &str = "SELECT r.identity,r.outpoint,r.family,r.gameId,r.sats,r.opponentIdentity,r.atHeight,r.facts,r.reason,r.judgedAtMs,r.claimable,r.probeTip,w.role,t.txid,t.word,t.tier,t.height,t.proof_root,t.header_hash,t.hint_source,t.hint_at,t.updated_at FROM owed_rows r LEFT JOIN owed_row_words w ON w.identity=r.identity AND w.outpoint=r.outpoint LEFT JOIN tx_words t ON t.txid=w.txid WHERE r.identity=?1 ORDER BY r.outpoint,w.role LIMIT 2004";
 
 /// Only the SQL port and the already obtained chain context surround the pure judgement.
@@ -407,24 +426,19 @@ pub async fn judge_with_write(
         // A partial judge cannot prove that other games' omitted rows were rebuilt.
         // Preserve an earlier overflow flag until a complete backfill resets it.
         plan.push(Stmt{sql:"INSERT INTO owed_state(identity,computedAtMs,tip,rows,stale,truncated,recomputeSeq) SELECT ?1,?2,?3,COUNT(*),0,(?4 OR changes()>0),1 FROM owed_rows WHERE identity=?1 ON CONFLICT(identity) DO UPDATE SET computedAtMs=MAX(owed_state.computedAtMs,excluded.computedAtMs),tip=excluded.tip,rows=excluded.rows,stale=0,truncated=(owed_state.truncated OR excluded.truncated),recomputeSeq=COALESCE(owed_state.recomputeSeq,0)+1".into(),binds:vec![Bind::Text(id.clone()),Bind::Int(i.now_ms),i.tip.map_or(Bind::Null,|n|Bind::Int(n as i64)),Bind::Int(i64::from(cut))]});
-        let mut predicate = "generation <= ?3".to_owned();
-        let mut binds = vec![
-            Bind::Text(id.clone()),
-            Bind::Text(json!(games).to_string()),
-            Bind::Int(seen[idx]),
-        ];
-        for mark in owned_marks {
-            predicate.push_str(&format!(
-                " OR (source=?{} AND sourceKey=?{})",
-                binds.len() + 1,
-                binds.len() + 2
-            ));
-            binds.extend([
-                Bind::Text(mark.source.clone()),
-                Bind::Text(mark.source_key.clone()),
-            ]);
-        }
-        plan.push(Stmt{sql:format!("DELETE FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2)) AND ({predicate})"),binds});
+        let owned: Vec<[&str; 2]> = owned_marks
+            .iter()
+            .map(|m| [m.source.as_str(), m.source_key.as_str()])
+            .collect();
+        plan.push(Stmt {
+            sql: ACK_DIRTY_SQL.into(),
+            binds: vec![
+                Bind::Text(id.clone()),
+                Bind::Text(json!(games).to_string()),
+                Bind::Int(seen[idx]),
+                Bind::Text(json!(owned).to_string()),
+            ],
+        });
         state_positions.push((plan.len(), id.clone(), i.now_ms));
         plan.push(Stmt {
             sql: "SELECT rows,truncated FROM owed_state WHERE identity=?1".into(),
@@ -619,8 +633,41 @@ pub async fn refund_subjects(
         .collect())
 }
 
-/// Expand the one wanted envelope to durable game marks. An interrupted drain leaves all remaining games marked.
-pub const EXPAND_WANTED_SQL:&str="INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,gameId,'wanted',?1,?2 FROM (SELECT gameId FROM potparty_records WHERE identity=?1 UNION SELECT gameId FROM hopparty_records WHERE identity=?1 UNION SELECT gameId FROM released_hop_evidence WHERE identity=?1 UNION SELECT gameId FROM owed_rows WHERE identity=?1) WHERE gameId<>'' ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
+macro_rules! identity_games {
+    () => {
+        "SELECT gameId,MAX(at) AS at FROM (SELECT gameId,createdAt AS at FROM potparty_records WHERE identity=?1 UNION ALL SELECT gameId,createdAt FROM hopparty_records WHERE identity=?1 UNION ALL SELECT gameId,evictedAt FROM released_hop_evidence WHERE identity=?1 UNION ALL SELECT gameId,updatedAtMs/1000 FROM owed_rows WHERE identity=?1) WHERE gameId<>'' GROUP BY gameId ORDER BY at DESC,gameId"
+    };
+}
+/// Expand the one wanted envelope to durable game marks: the newest [`OWED_WANTED_GAMES`] games `wanted`, the rest
+/// `backfill` ([`EXPAND_BACKFILL_SQL`]). An interrupted drain leaves all remaining games marked.
+pub const EXPAND_WANTED_SQL: &str = concat!("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,gameId,'wanted',?1,?2 FROM (", identity_games!(), " LIMIT 32) WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs");
+/// The wanted identity's older games, as the backfill marks them (`owed_backfill::MARK_SQL`'s source and key).
+pub const EXPAND_BACKFILL_SQL: &str = concat!("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,gameId,'backfill','owed-v2',?2 FROM (", identity_games!(), " LIMIT -1 OFFSET 32) WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs");
+
+/// One identity's subjects in its turn order: oldest mark first, a `wanted` mark the tie-break.
+fn identity_subjects(marks: &[Value]) -> Vec<String> {
+    let mut games: BTreeMap<String, (i64, bool, i64)> = BTreeMap::new();
+    for m in marks {
+        let Some(game) = m["gameId"].as_str().filter(|g| !g.is_empty()) else {
+            continue;
+        };
+        let at = m["markedAtMs"].as_i64().unwrap_or_default();
+        let generation = m["generation"].as_i64().unwrap_or_default();
+        let g = games
+            .entry(game.to_owned())
+            .or_insert((at, true, generation));
+        g.0 = g.0.min(at);
+        g.1 &= m["source"] != "wanted";
+        g.2 = g.2.min(generation);
+    }
+    let mut ordered: Vec<_> = games.into_iter().collect();
+    ordered.sort_by_key(|(_, key)| *key);
+    ordered.into_iter().map(|(game, _)| game).collect()
+}
+
+/// The scheduled drain (the D2-OWED lens's MEDIUM-1): expand the wanted envelopes, then take up to `limit` subjects
+/// round-robin across identities, each identity's oldest first, from the identity after the last pass's; a subject
+/// marked only by the age repair after every other subject. No statement scans `owed_dirty`.
 pub async fn drain_dirty(db: &impl JudgeDb, limit: usize) -> Result<DrainReport, String> {
     let limit = limit.min(OWED_DIRTY_SUBJECTS_PER_PASS);
     let mut report = DrainReport::default();
@@ -628,7 +675,8 @@ pub async fn drain_dirty(db: &impl JudgeDb, limit: usize) -> Result<DrainReport,
         return Ok(report);
     }
     // Empty game IDs belong only to wanted envelopes, not derivable subjects.
-    let wanted:Vec<Value>=hydrate::read(db,"SELECT identity,generation FROM owed_dirty WHERE source='wanted' AND gameId='' ORDER BY markedAtMs,generation LIMIT ?1",vec![Bind::Int(limit as i64)]).await?;
+    let wanted: Vec<Value> =
+        hydrate::read(db, WANTED_ENVELOPES_SQL, vec![Bind::Int(limit as i64)]).await?;
     for r in wanted {
         let id = r["identity"]
             .as_str()
@@ -637,18 +685,114 @@ pub async fn drain_dirty(db: &impl JudgeDb, limit: usize) -> Result<DrainReport,
         let generation = r["generation"]
             .as_i64()
             .ok_or("wanted generation missing")?;
-        db.run_batch(vec![Stmt{sql:EXPAND_WANTED_SQL.into(),binds:vec![Bind::Text(id.clone()),Bind::Int(db.now_ms() as i64)]},Stmt{sql:"DELETE FROM owed_dirty WHERE identity=?1 AND gameId='' AND source='wanted' AND generation<=?2".into(),binds:vec![Bind::Text(id),Bind::Int(generation)]}]).await?;
+        let now = Bind::Int(db.now_ms() as i64);
+        db.run_batch(vec![
+            Stmt {
+                sql: EXPAND_WANTED_SQL.into(),
+                binds: vec![Bind::Text(id.clone()), now.clone()],
+            },
+            Stmt {
+                sql: EXPAND_BACKFILL_SQL.into(),
+                binds: vec![Bind::Text(id.clone()), now],
+            },
+            Stmt {
+                sql: "DELETE FROM owed_dirty WHERE identity=?1 AND gameId='' AND source='wanted' AND generation<=?2".into(),
+                binds: vec![Bind::Text(id), Bind::Int(generation)],
+            },
+        ])
+        .await?;
     }
-    let candidates: Vec<Value> =
-        hydrate::read(db, SUBJECTS_SQL, vec![Bind::Int(limit as i64)]).await?;
-    for r in candidates {
-        let subject = Subject {
-            identity: r["identity"]
-                .as_str()
-                .ok_or("dirty identity missing")?
-                .to_owned(),
-            game_id: r["gameId"].as_str().ok_or("dirty game missing")?.to_owned(),
-        };
+    let cursor: Vec<Value> = hydrate::read(db, DRAIN_CURSOR_READ_SQL, vec![]).await?;
+    let cursor = cursor
+        .first()
+        .and_then(|r| r["cursor"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let walk = |after: String, n: usize| async move {
+        hydrate::read::<Value>(
+            db,
+            DRAIN_IDENTITIES_SQL,
+            vec![Bind::Text(after), Bind::Int(n as i64)],
+        )
+        .await
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r["identity"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+    };
+    // The walk reads a full pass's identities whatever `limit` is, so the age repair waits behind every walked source
+    // mark, not only the ones a short pass reached.
+    let span = OWED_DIRTY_SUBJECTS_PER_PASS;
+    let mut identities = walk(cursor.clone(), span).await?;
+    if identities.len() < span && !cursor.is_empty() {
+        for id in walk(String::new(), span - identities.len()).await? {
+            if id > cursor || identities.contains(&id) {
+                break;
+            }
+            identities.push(id);
+        }
+    }
+    let per = limit.div_ceil(identities.len().max(1));
+    let mut chosen: Vec<Subject> = Vec::new();
+    let mut turned = vec![false; identities.len()];
+    // Every source mark's turn before any subject marked only by the age repair (its idle room). One D1 batch reads
+    // every walked identity's few oldest marks.
+    for aged in [false, true] {
+        if chosen.len() >= limit || identities.is_empty() {
+            break;
+        }
+        let reads = identities
+            .iter()
+            .map(|id| Stmt {
+                sql: DRAIN_MARKS_SQL.into(),
+                binds: vec![
+                    Bind::Text(id.clone()),
+                    Bind::Int((per * 4) as i64),
+                    Bind::Int(i64::from(aged)),
+                ],
+            })
+            .collect();
+        let lists: Vec<Vec<String>> = db
+            .run_batch(reads)
+            .await?
+            .into_iter()
+            .map(|out| identity_subjects(&out.rows))
+            .collect();
+        for round in 0..per {
+            for (at, (id, games)) in identities.iter().zip(&lists).enumerate() {
+                let Some(game) = games.get(round) else {
+                    continue;
+                };
+                let subject = Subject {
+                    identity: id.clone(),
+                    game_id: game.clone(),
+                };
+                if chosen.len() < limit && !chosen.contains(&subject) {
+                    chosen.push(subject);
+                    turned[at] = true;
+                }
+            }
+        }
+    }
+    db.log(&format!(
+        "[owed] drain: {} identities walked, {} subjects chosen",
+        identities.len(),
+        chosen.len()
+    ));
+    // The next pass starts after the last identity this one gave a turn (every walked one when none was chosen).
+    let last = turned
+        .iter()
+        .rposition(|t| *t)
+        .map_or_else(|| identities.last(), |at| identities.get(at));
+    if let Some(last) = last {
+        db.run_batch(vec![Stmt {
+            sql: DRAIN_CURSOR_SQL.into(),
+            binds: vec![Bind::Text(last.clone()), Bind::Int(db.now_ms() as i64)],
+        }])
+        .await?;
+    }
+    for subject in chosen {
         match judge_subjects(
             db,
             &subject.identity,

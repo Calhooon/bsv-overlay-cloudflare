@@ -325,3 +325,84 @@ async fn d2fold_high3_c_a_look_that_changed_nothing_doubles_its_period_to_a_ceil
     }
     assert_eq!(period, belt::OWED_BELT_BACKOFF_MAX_MS);
 }
+
+fn plant_parties(db: &Db, identity: &str, games: usize) {
+    let conn = db.conn.borrow();
+    let tx = conn.unchecked_transaction().unwrap();
+    for n in 0..games {
+        tx.execute("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,sigValid) VALUES (?1,'other',?2,?3,0,1,'00',?3,1,?4,0)", rusqlite::params![identity, format!("s{n:05}"), format!("{:064x}", 0x5000_0000u64 + n as u64), 1_000 + n as i64]).unwrap();
+    }
+    tx.commit().unwrap();
+}
+
+/// MEDIUM-1: one stranger's planted games and one read of `/owed` no longer buy the fleet's drain. The wanted
+/// envelope expands to the identity's newest 32 games (the rest marked `backfill`), and the drain takes its subjects
+/// round-robin across identities by age, so an honest residual is judged in the first pass.
+#[tokio::test]
+async fn d2fold_medium1_a_a_planted_identity_does_not_preempt_the_drain() {
+    let db = Db::new();
+    plant_parties(&db, "stranger", 300);
+    db.exec("DELETE FROM owed_dirty");
+    seed_stranded_hop(&db, "owner", "g00", &hop(0));
+    // the stranger's one read: no snapshot, the identity probe, one wanted envelope
+    let _ = served(&db, "stranger", Some(900_000)).await;
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_dirty WHERE source='wanted' AND gameId=''"),
+        1
+    );
+    let r = judge::drain_dirty(&db, judge::OWED_DIRTY_SUBJECTS_PER_PASS)
+        .await
+        .unwrap();
+    assert!(r.faults.is_empty(), "{:?}", r.faults);
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_rows WHERE identity='owner'"),
+        1,
+        "the honest residual is judged in the first pass"
+    );
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_dirty WHERE identity='owner'"),
+        0
+    );
+    let wanted = db.int(
+        "SELECT COUNT(DISTINCT gameId) FROM owed_dirty WHERE identity='stranger' AND source='wanted'",
+    ) + db.int("SELECT COUNT(*) FROM owed_rows WHERE identity='stranger' AND gameId>='s00268'");
+    assert!(wanted <= judge::OWED_WANTED_GAMES as i64, "{wanted}");
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_dirty WHERE identity='stranger' AND source='wanted' AND gameId<'s00268'"),
+        0,
+        "only the newest 32 are wanted"
+    );
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_dirty WHERE identity='stranger' AND source='backfill'"),
+        300 - judge::OWED_WANTED_GAMES as i64,
+        "the rest wait as backfill marks"
+    );
+}
+
+/// MEDIUM-1: the SHIPPED drain statements, never proxies: none scans `owed_dirty`.
+#[test]
+fn d2fold_medium1_b_the_shipped_drain_statements_never_scan_owed_dirty() {
+    assert!(judge::EXPAND_WANTED_SQL.contains(&format!(" LIMIT {})", judge::OWED_WANTED_GAMES)));
+    assert!(judge::EXPAND_BACKFILL_SQL.contains(&format!(" OFFSET {})", judge::OWED_WANTED_GAMES)));
+    let db = Db::new();
+    let int = SqlValue::Integer;
+    let text = |s: &str| SqlValue::Text(s.into());
+    for (name, sql, binds) in [
+        ("wanted envelopes", judge::WANTED_ENVELOPES_SQL, vec![int(64)]),
+        ("identity walk", judge::DRAIN_IDENTITIES_SQL, vec![text(""), int(64)]),
+        ("identity marks", judge::DRAIN_MARKS_SQL, vec![text("owner"), int(64), int(0)]),
+        ("identity age marks", judge::DRAIN_MARKS_SQL, vec![text("owner"), int(64), int(1)]),
+        ("hook subjects", judge::CHANGED_SQL, vec![text("[\"owner\"]"), text("[\"gate\"]"), int(16)]),
+        ("judge marks", judge::MARKS_SQL, vec![text("owner"), text("[\"g\"]")]),
+        ("expand wanted", judge::EXPAND_WANTED_SQL, vec![text("owner"), int(1)]),
+        ("expand backfill", judge::EXPAND_BACKFILL_SQL, vec![text("owner"), int(1)]),
+        ("age marks", low_app_layer::owed_backfill::AGE_MARK_SQL, vec![int(1), int(2), int(3)]),
+        ("read pending", low_app_layer::owed_read::PENDING_SQL, vec![text("owner")]),
+    ] {
+        let plan = db.plan(sql, &binds);
+        assert!(
+            !plan.iter().any(|d| d.starts_with("SCAN owed_dirty") || d.starts_with("SCAN d ") || d == "SCAN d"),
+            "{name}: {plan:?}"
+        );
+    }
+}
