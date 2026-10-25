@@ -310,6 +310,49 @@
       },
       "settleCeilingMs": 5000,
       "censusKey": "/health/invariants"
+    },
+    "owed-fleet-read": {
+      "route": "/owed?identity=OWED_SEAT: unchanged 250 results and 270 hops, written through the per-game judge into 500 stored rows",
+      "measured": {
+        "reads": 2000,
+        "writes": 0,
+        "stmts": 3,
+        "maxReads": 1999
+      },
+      "ceiling": {
+        "reads": 3000,
+        "writes": 0,
+        "stmts": 3,
+        "maxReads": 2006
+      },
+      "censusKey": "/owed",
+      "stressMeasured": {
+        "note": "Additional dense-word stress measurement: 500 active rows and 750 word roles. Kept separately from the committed source fixture written through the real judge.",
+        "reads": 3250,
+        "writes": 0,
+        "stmts": 3,
+        "maxReads": 3249
+      },
+      "statementReads": {
+        "rowsAndWords": 1999,
+        "identityMarker": 1,
+        "pendingCount": 0
+      }
+    },
+    "owed-wanted-read": {
+      "route": "/owed: no identity marker, one party row; one mark_wanted statement after the indexed probe",
+      "measured": {
+        "reads": 3,
+        "writes": 5,
+        "stmts": 5,
+        "maxReads": 1
+      },
+      "ceiling": {
+        "writes": 1,
+        "stmts": 5
+      },
+      "note": "The requested one-write ceiling remains RED: D1 reports 5 physical row/index/counter writes for the single application-row insert.",
+      "censusKey": null
     }
   },
   "censusKey": "the d1Budget route a production census holds against this ceiling (advisory there: production rows are not the fixture's); null = the route's maximum is another scenario's",

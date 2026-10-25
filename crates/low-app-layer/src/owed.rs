@@ -10566,7 +10566,7 @@ pub(crate) mod tests {
             .replace(",)", ")");
         for needle in [
             "crate::owed::unmark_withheld_spenders(&mut rows, &spenders_withheld, inputs.pot_spenders_faulted); let withheld_outpoints =",
-            "if crate::owed::spender_rejudge_only(stale, age_ms, prev_tip, tip_now, &rows) { crate::owed::note_spender_rejudge(); }",
+            "crate::owed_read::read(&db, &identity).await",
         ] {
             let n: String = needle.split_whitespace().collect();
             assert!(routes.contains(&n), "the route: {needle}");
@@ -14908,10 +14908,15 @@ pub(crate) mod tests {
             ask < walk,
             "owed_recompute_and_push must ask the ceiling before it walks"
         );
-        assert!(routes.contains(&squash(
-            "if owed_recompute_admit(&identity, \"read-first\", false) {"
-        )));
-        assert!(routes.contains(&squash("if !owed_recompute_admit(&identity, source, true) { refresh_retry = Some(OWED_RATE.with(|r| { r.borrow().retry_after_ms(&identity, worker::Date::now().as_millis() as i64) }).unwrap_or(0)); let deferred = owed_deferred_deadline(&identity); owed_shed_remark(&db, &identity).await; owed_schedule_deferred(&ctx.env, &identity, deferred).await; (rows, prev_tip, st.computed_at_ms as i64, cut, stored_seq) } else { match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)")));
+        let read = routes
+            .split("pubasyncfnowed(req:")
+            .nth(1)
+            .unwrap()
+            .split("asyncfngather_result_entries(")
+            .next()
+            .unwrap();
+        assert!(!read.contains("owed_recompute_admit"));
+        assert!(read.contains("crate::owed_read::read"));
         assert_eq!(
             routes
                 .matches(&squash("owed_recompute(env, db, identity_lc,"))
@@ -14997,7 +15002,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ns2_shed_read_names_the_refresh_and_window_remainder() {
+    fn ns2_legacy_shed_names_the_window_but_the_indexed_read_never_uses_it() {
         let mut rate = RecomputeRate::default();
         for n in 0..12 {
             assert!(rate.admit(ME, 1_000 + n, true));
@@ -15017,8 +15022,8 @@ pub(crate) mod tests {
         assert_eq!(body["computedAtMs"], 1_000);
         let code = include_str!("routes.rs");
         assert!(
-            code.contains("crate::owed::mark_shed_refresh(&mut body, refresh_retry)"),
-            "a shed read must mark its served snapshot"
+            !code.contains("crate::owed::mark_shed_refresh(&mut body, refresh_retry)"),
+            "the indexed read cannot serve a shed answer"
         );
     }
 
@@ -15110,15 +15115,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ns2_read_reserves_its_admission_before_sending_the_answer() {
+    fn ns2_read_uses_no_admission_or_detached_walk() {
         let code = include_str!("routes.rs");
-        let read = &code[code.find("pub async fn owed(req:").unwrap()..];
-        let claimed = &read[read.find("Some(token) => {").unwrap()..];
-        let ask = claimed
-            .find("owed_recompute_admit(&identity, source, true)")
+        let read = code
+            .split("pub async fn owed(req:")
+            .nth(1)
+            .unwrap()
+            .split("async fn gather_result_entries(")
+            .next()
             .unwrap();
-        let detached = claimed.find("wait.wait_until").unwrap();
-        assert!(ask < detached, "a later ask cannot turn the read's accepted refresh into an unmarked shed after its answer");
+        assert!(read.contains("crate::owed_read::read"));
+        assert!(!read.contains("owed_recompute_admit"));
+        assert!(!read.contains("wait_until"));
     }
 
     #[test]
@@ -15309,7 +15317,7 @@ pub(crate) mod tests {
             "crate::owed::join_spends_outpoint(b,&pot,&h.hop_txid,h.hop_vout)",
             "ifbudget_cut{letprevious=matchdb.prepare(crate::owed::OWED_ROWS_READ_SQL)",
             "letshed=crate::owed::carry_shed_rows(&inputs,&mutrows,&prev);",
-            "crate::owed::mark_shed_rows_refresh(&mutbody);",
+            "crate::owed_read::read(&db,&identity).await",
         ] {
             assert!(routes.contains(wired), "the recompute is wired: {wired}");
         }
@@ -15802,7 +15810,7 @@ pub(crate) mod tests {
     /// own `claimableBeforeShed` through the read; the read handler applies it after #669's gate and before the body.
     /// RED with the demotion inert (`left: 0 right: 3`), or with its call removed from the read.
     #[test]
-    fn fix861_b_the_demotion_takes_every_press_and_nothing_else_and_the_read_calls_it() {
+    fn fix861_b_the_legacy_demotion_takes_every_press_and_the_read_does_not_call_it() {
         let row = |outpoint: &str, family: OwedFamily, facts: Value| OwedRow {
             identity: ME.to_string(),
             outpoint: outpoint.to_string(),
@@ -15860,16 +15868,16 @@ pub(crate) mod tests {
         assert_eq!(unshed, rows);
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let routes = squash(include_str!("routes.rs"));
-        let degrade = routes
-            .find("crate::owed::degrade_stale_sweeps(")
-            .expect("the read's #669 gate");
-        let demote = routes
-            .find("crate::owed::demote_shed_presses(&mutserved,refresh_retry,served_snapshot_is_fresh);")
-            .expect("the read demotes a shed snapshot's presses");
-        let body = routes[demote..]
-            .find("crate::owed::owed_body(")
-            .expect("before the body");
-        assert!(degrade < demote && body > 0);
+        let read = routes
+            .split("pubasyncfnowed(req:")
+            .nth(1)
+            .unwrap()
+            .split("asyncfngather_result_entries(")
+            .next()
+            .unwrap();
+        assert!(!read.contains("demote_shed_presses"));
+        assert!(!read.contains("degrade_stale_sweeps"));
+        assert!(read.contains("crate::owed_read::read"));
     }
 
     /// bsv-low #770 (the FIX-736 lens's pre-existing note): the settle payout arm judges `claimable` and
@@ -16370,8 +16378,8 @@ pub(crate) mod tests {
             "the owed read's tip must be the 30-s isolate cache, not the uncached chaintracks_present_height"
         );
         assert!(
-            read.contains("OwedFamily::HopStranded"),
-            "the read must read the tip for a claimable hop-stranded row (needs_tip), to gate its sweep"
+            read.contains("snapshot.needs_tip()"),
+            "the read checks the stored gate and probe keys before asking for a tip"
         );
     }
 

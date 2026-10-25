@@ -506,7 +506,8 @@ ci-d1-board:
 # `loopback-only.sb`): a missed ask fails closed instead of reaching mainnet; `D1_EGRESS_SEAL=0` runs unsealed (the
 # guard still reds). A red cell prints the guard's verdict over the logs so far.
 ci-d1-budget:
-	@set -e; \
+	@if [ "$${OWED_READ_ONLY:-0}" = "1" ]; then exec bash tools/lane-499/owed_read_budget.sh; fi; \
+	set -e; \
 	B=$${LANE_BASE:-8791}; PA=$$((B+9)); PO=$$((B+10)); PD=$$((B+11)); PM=$$((B+12)); \
 	IA=$$((B+13)); IO=$$((B+14)); ID=$$((B+15)); PR=$$((B+16)); IR=$$((B+17)); PS=$$((B+18)); \
 	app_log=/tmp/lane499-d1-$$B-app.log; ov_log=/tmp/lane499-d1-$$B-overlay.log; seed_log=/tmp/lane499-d1-$$B-seed.log; \
