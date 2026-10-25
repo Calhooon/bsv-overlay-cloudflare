@@ -273,6 +273,8 @@ async fn owed893_judges_sixteen_subjects_and_leaves_the_rest_marked() {
 
 #[tokio::test]
 async fn owed893_wanted_drains_first_and_expands_to_durable_game_marks() {
+    // The D2-OWED lens's MEDIUM-1, amended: a wanted envelope is expanded to durable marks at once, but it no longer
+    // jumps the fleet's queue; identities take turns, so the older residual ('later') is judged first.
     let db = Db::new();
     db.seed_game("game", "pot");
     db.exec("UPDATE owed_dirty SET identity='later';");
@@ -280,14 +282,22 @@ async fn owed893_wanted_drains_first_and_expands_to_durable_game_marks() {
     let r = judge::drain_dirty(&db, 1).await.unwrap();
     assert!(r.faults.is_empty(), "{:?}", r.faults);
     assert_eq!(r.subjects, 1);
+    assert_eq!(db.count("owed_rows"), 0, "'later' names no party: nothing derived");
+    assert_eq!(
+        db.count("owed_dirty WHERE identity='owner' AND gameId='game' AND source='wanted'"),
+        1,
+        "the envelope is a durable game mark"
+    );
+    let r = judge::drain_dirty(&db, 1).await.unwrap();
+    assert!(r.faults.is_empty(), "{:?}", r.faults);
     assert_eq!(db.count("owed_rows"), 1);
     let id: String = db
         .conn
         .borrow()
         .query_row("SELECT identity FROM owed_rows", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(id, "owner");
-    assert_eq!(db.count("owed_dirty"), 1);
+    assert_eq!(id, "owner", "the next identity's turn");
+    assert_eq!(db.count("owed_dirty"), 0);
 }
 
 #[tokio::test]

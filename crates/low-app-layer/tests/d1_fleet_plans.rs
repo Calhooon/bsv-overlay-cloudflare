@@ -313,12 +313,20 @@ const OWED_893_PLANS: &[(&str, &str, &[&str])] = &[
     ),
     ("owed identity marker", low_app_layer::owed_read::STATE_SQL, &["sqlite_autoindex_owed_state_1"]),
     ("owed pending count", low_app_layer::owed_read::PENDING_SQL, &["idx_owed_dirty_identity"]),
-    ("owed seen generation", "SELECT MAX(generation) FROM owed_dirty WHERE identity=?1 AND gameId=?2", &["idx_owed_dirty_identity"]),
-    ("owed acknowledge seen generation", "DELETE FROM owed_dirty WHERE identity=?1 AND gameId=?2 AND generation<=?3", &["idx_owed_dirty_identity"]),
+    // The D2-OWED lens's MEDIUM-1: the SHIPPED drain, tip, belt and repair statements, never proxies.
+    ("owed judge marks", low_app_layer::owed_judge::MARKS_SQL, &["sqlite_autoindex_owed_dirty_1"]),
+    ("owed acknowledge seen generation", low_app_layer::owed_judge::ACK_DIRTY_SQL, &["sqlite_autoindex_owed_dirty_1"]),
     ("owed word invalidation", "SELECT identity,outpoint FROM owed_row_words WHERE txid=?1", &["idx_owed_row_words_txid"]),
-    ("owed oldest mark", "SELECT generation,identity,gameId FROM owed_dirty WHERE markedAtMs<=?1 ORDER BY markedAtMs LIMIT 64", &["idx_owed_dirty_marked"]),
-    ("owed tip range", "SELECT identity,gameId FROM owed_rows WHERE gateHeight BETWEEN ?1 AND ?2", &["idx_owed_rows_gate"]),
-    ("owed due belt", "SELECT identity,outpoint FROM owed_rows WHERE beltDueAtMs<=?1 ORDER BY beltDueAtMs LIMIT 8", &["idx_owed_rows_belt"]),
+    ("owed wanted envelopes", low_app_layer::owed_judge::WANTED_ENVELOPES_SQL, &["idx_owed_dirty_source_marked"]),
+    ("owed drain walk", low_app_layer::owed_judge::DRAIN_IDENTITIES_SQL, &["idx_owed_dirty_identity"]),
+    ("owed drain marks", low_app_layer::owed_judge::DRAIN_MARKS_SQL, &["idx_owed_dirty_identity_marked"]),
+    ("owed hook subjects", low_app_layer::owed_judge::CHANGED_SQL, &["idx_owed_dirty_identity", "idx_owed_dirty_source_key"]),
+    ("owed tip range", low_app_layer::owed_judge::MARK_TIP_SQL, &["idx_owed_rows_gate"]),
+    ("owed tip sweeps", low_app_layer::owed_judge::DATE_SWEEPS_SQL, &["idx_owed_rows_sweep"]),
+    ("owed tipless rows", low_app_layer::owed_judge::MARK_UNTIPPED_SQL, &["idx_owed_rows_untipped"]),
+    ("owed due belt", low_app_layer::owed_belt::CANDIDATES_SQL, &["idx_owed_rows_belt_turn"]),
+    ("owed belt gauge", low_app_layer::owed_belt::DUE_GAUGE_SQL, &["idx_owed_rows_belt"]),
+    ("owed age repair", low_app_layer::owed_backfill::AGE_MARK_SQL, &["idx_owed_rows_judged", "idx_owed_dirty_source_marked"]),
     ("owed released hop", "SELECT identity,gameId FROM released_hop_evidence WHERE hopTxid=?1 AND hopVout=?2", &["sqlite_autoindex_released_hop_evidence_1"]),
     ("owed released game", "SELECT hopTxid,hopVout FROM released_hop_evidence WHERE identity=?1 AND gameId=?2", &["idx_released_hop_evidence_identity_game"]),
     ("owed belt cursor", "SELECT cursor,tickedAtMs FROM owed_belt_state WHERE name=?1", &["sqlite_autoindex_owed_belt_state_1"]),
@@ -327,13 +335,30 @@ const OWED_893_PLANS: &[(&str, &str, &[&str])] = &[
 
 fn owed_893_plans(db: &Connection) -> Result<(), String> {
     for (label, sql, indexes) in OWED_893_PLANS {
-        let details = plan(db, sql);
+        // a shipped statement naming its index (`INDEXED BY`) does not prepare without it: that is RED too
+        let mut stmt = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .map_err(|e| format!("{label}: {e}"))?;
+        let binds = vec![""; stmt.parameter_count()];
+        let details: Vec<String> = stmt
+            .query_map(params_from_iter(binds), |r| r.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         for index in *indexes {
             if !details.iter().any(|d| d.contains(index)) {
                 return Err(format!("{label}: missing {index}: {details:?}"));
             }
         }
-        if details.iter().any(|d| d.starts_with("SCAN ")) {
+        // A table-valued `json_each`, a CTE's rows (`walk`) and a derived table (`d`, a subquery) are not fleet scans.
+        let fleet_scan = |d: &str| {
+            d.strip_prefix("SCAN ").is_some_and(|rest| {
+                !["json_each ", "walk", "d", "m ", "(subquery-", "CONSTANT ROW"]
+                    .iter()
+                    .any(|ok| rest.starts_with(ok) && (ok.ends_with(' ') || ok.ends_with('-') || rest == *ok))
+            })
+        };
+        if details.iter().any(|d| fleet_scan(d)) {
             return Err(format!("{label}: {details:?}"));
         }
     }
@@ -348,7 +373,7 @@ fn owed893_each_owed_lookup_index_removed_alone_turns_the_hot_plan_pin_red() {
         .flat_map(|(_, _, indexes)| indexes.iter().copied())
         .filter(|index| !index.starts_with("sqlite_autoindex_"))
         .collect();
-    assert_eq!(indexes.len(), 7);
+    assert_eq!(indexes.len(), 13);
     for index in indexes {
         db.execute_batch("SAVEPOINT missing_index").unwrap();
         db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
