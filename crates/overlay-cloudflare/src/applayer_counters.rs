@@ -95,6 +95,42 @@ const IDENTITY_OUTCOMES: [&str; 4] = [
     "kill_list_fault",
 ];
 
+/// bsv-low #893 section 5: the app layer's owed belt (`low_app_layer::owed_belt::counter_names`, pinned equal there).
+/// The backlog `owed_belt_due_total` is a gauge the tick SETS; the rest are totals it adds.
+pub const OWED_BELT: [&str; 8] = [
+    "owed_belt_ticks_total",
+    "owed_belt_asked_total",
+    "owed_belt_found_total",
+    "owed_belt_due_total",
+    "owed_belt_faults_woc_total",
+    "owed_belt_faults_bitails_total",
+    "owed_belt_faults_bananablocks_total",
+    "owed_belt_faults_other_total",
+];
+
+/// `/health/invariants.owedBelt`: the belt's durable totals and its backlog, from the counters read.
+pub fn owed_belt_view(counters: &serde_json::Value) -> serde_json::Value {
+    let n = |k: &str| {
+        counters
+            .get(k)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    serde_json::json!({
+        "ticks": n("owed_belt_ticks_total"),
+        "asked": n("owed_belt_asked_total"),
+        "found": n("owed_belt_found_total"),
+        "due": n("owed_belt_due_total"),
+        "faults": {
+            "woc": n("owed_belt_faults_woc_total"),
+            "bitails": n("owed_belt_faults_bitails_total"),
+            "bananablocks": n("owed_belt_faults_bananablocks_total"),
+            "other": n("owed_belt_faults_other_total"),
+        },
+        "bounds": {"tickMs": 120_000, "outpointsPerTick": 8, "callsPerTick": 24, "callsPerOutpoint": 3, "unansweredRetryMs": 300_000},
+    })
+}
+
 /// bsv-low #626: this worker's durable verdict memo writes (`tx_any_verdicts`), by the kind written: the retire
 /// pass's `refused` / `retired` and the eviction's `refused`. The app layer only reads these rows.
 pub const COUNTER_TXANY_MEMO_WRITE_REFUSED: &str = "txany_memo_write_refused_total";
@@ -133,6 +169,7 @@ pub fn names() -> Vec<String> {
     v.push("applayer_owed_recomputes_total".to_string());
     // bsv-low #831 (the FIX-831 lens's L3): the refund-due pots the owed judgement found funding-not-held
     v.push("owed_refund_funding_unheld_total".to_string());
+    v.extend(OWED_BELT.iter().map(|n| n.to_string()));
     // bsv-low #608 (the B-OWED-2 lens's LOW-1): the reads whose recompute only the unread-spender rule asked for
     v.push("owed_spender_rejudge_total".to_string());
     v.push("applayer_owed_read_faults_total".to_string());
