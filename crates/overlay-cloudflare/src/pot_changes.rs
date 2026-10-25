@@ -288,8 +288,8 @@ pub async fn flush_inline(env: Env) {
 /// "did not complete within the allowed time after invocation end and have been cancelled", 30 s).
 pub const WAIT_UNTIL_WINDOW_MS: u64 = 30_000;
 
-/// bsv-low #649: under this much left of the window a background flush is SKIPPED (and counted): no POST is
-/// started that the runtime is about to cancel, and no drained note is lost with it.
+/// Time reserved for accounting and durable parking after delivery. With no more than this left, the
+/// background flush skips delivery and parks its notes.
 pub const FLUSH_WINDOW_FLOOR_MS: u64 = 3_000;
 
 /// What a background flush may spend (bsv-low #649).
@@ -311,13 +311,15 @@ pub enum BackgroundFlush {
 }
 
 /// PURE (bsv-low #649): the budget of a flush made by a `wait_until` job that started at `started_ms`, read at
-/// `now_ms`: `min(FLUSH_WALL_BUDGET_MS, what is left of the window)`, or a skip under the floor. The job's own
+/// `now_ms`: `min(FLUSH_WALL_BUDGET_MS, time left minus the accounting reserve)`, or a skip at the floor. The job's own
 /// start stands in for the invocation's end: the job is spawned before the answer, so the window it reads is
 /// never longer than the runtime's.
 pub fn background_flush_plan(started_ms: u64, now_ms: u64) -> BackgroundFlush {
     let remaining_ms = WAIT_UNTIL_WINDOW_MS.saturating_sub(now_ms.saturating_sub(started_ms));
-    let budget = remaining_ms.min(crate::change_flush::FLUSH_WALL_BUDGET_MS);
-    if budget < FLUSH_WINDOW_FLOOR_MS {
+    let budget = remaining_ms
+        .saturating_sub(FLUSH_WINDOW_FLOOR_MS)
+        .min(crate::change_flush::FLUSH_WALL_BUDGET_MS);
+    if budget == 0 {
         BackgroundFlush::Skip { remaining_ms }
     } else {
         BackgroundFlush::Ship {
@@ -331,7 +333,8 @@ pub fn background_flush_plan(started_ms: u64, now_ms: u64) -> BackgroundFlush {
 /// events (whose own 20 s no longer stacks on top). Under the floor no POST is started: the pot and hop notes are
 /// PARKED in D1 (bsv-low #649 M1, `crate::change_park::park_withheld`) for the cron to deliver, the skip and the
 /// withheld entries counted (`admit_fast_flush_skipped_no_window_total`, `admit_fast_flush_withheld_total`). A POST
-/// already in flight is not raced: the deadline only stops the flush from STARTING one it cannot afford.
+/// in flight is raced against the deadline too; an unacknowledged chunk is deferred and parked, with the
+/// reserve left for that accounting before the platform cancels the job.
 pub async fn flush_inline_within(env: Env, started_ms: u64) {
     match background_flush_plan(started_ms, Date::now().as_millis()) {
         BackgroundFlush::Skip { remaining_ms } => {
@@ -428,7 +431,6 @@ pub(crate) mod tests {
         drain();
         NOTED_BACK.with(|m| m.borrow_mut().clear());
     }
-
 
     #[test]
     fn note_dedupes_and_drain_empties() {

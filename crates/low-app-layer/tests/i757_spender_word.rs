@@ -844,12 +844,12 @@ async fn b_owed_3_l2_an_unheld_frame_is_counted_unheld_on_both_sides() {
 }
 
 /// bsv-low #660 (B-OWED-3-FOLD, the lens's L4, its F5): the BEHAVIOURAL pin of the flush's order, through the ONE
-/// function the three flushes call (`tracker_events::ship_in_order`, reached by `ship_then`). (1) The words' transport
+/// ordered loop (`ship_in_order_with`, exposed by `ship_in_order` and used by `ship_then`). (1) The words' transport
 /// is the `/internal/tx-word` handler's steps (which write before they answer); the notes' step, when it runs, does
 /// what the pot hook's recompute does with the settle's word (`coin_landing` over the stored view): the settle's `seen`
 /// is already written, `Awaiting`. RED with the notes run before the words: `Withheld` (the word still `built`).
 /// (2) The deadline (L3's slice) over a fake clock: 25 frames at 1 s each under a 20 s wall: 10 before the notes, the
-/// notes run at 10 s (before the deadline, so they ship), 10 after, 5 walled and retried once. RED with no slice
+/// notes run at 10 s (before the deadline, so they ship), 10 after, 5 deferred with their retry allowance. RED with no slice
 /// (the words under the whole wall): the notes run AT the deadline and every note is deferred.
 #[tokio::test]
 async fn b_owed_3_l4_f5_the_flush_ships_the_words_then_the_notes_under_one_deadline() {
@@ -922,8 +922,11 @@ async fn b_owed_3_l4_f5_the_flush_ships_the_words_then_the_notes_under_one_deadl
         }
     );
     let retry = tracker_events::drain();
-    assert_eq!(retry.len(), 5, "the walled frames are retried once");
-    assert!(retry.iter().all(|f| f["retry"] == true));
+    assert_eq!(retry.len(), 5, "the walled frames are deferred");
+    assert!(
+        retry.iter().all(|f| f.get("retry").is_none()),
+        "a wall does not consume a delivery retry"
+    );
     // the app layer answers after its write (the handler's source)
     let runtime_src: String = include_str!("../src/tracker_host/runtime.rs")
         .split_whitespace()

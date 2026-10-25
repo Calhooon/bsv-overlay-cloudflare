@@ -29,9 +29,9 @@
 //! body of eight (one broadcast push per outpoint, the attribution reads, the per-seat filings), which no native
 //! pin can measure: it is beta's figure. The wall budget makes the bound hold whatever that figure is: at a
 //! modelled 2 s per POST a flush of 128 gets 10 POSTs out in its 20 s and DEFERS the other 48 entries, counted,
-//! where it used to lose them with the task, uncounted (the pin runs 131 entries: 80 delivered, 51 deferred). One POST that hangs past the runtime's wall is still
-//! lost with the task (no timeout races it); the budget only stops the flush from starting a POST it cannot
-//! afford.
+//! where it used to lose them with the task, uncounted (the pin runs 131 entries: 80 delivered, 51 deferred).
+//! Each POST is raced against that same deadline. An unacknowledged chunk is deferred, counted and parked;
+//! a background flush reserves three seconds of its platform window for accounting and parking.
 //!
 //! THE NOTE-BACK IS NOT DURABLE (lens L3; the delta lens's D-L2 states what that costs the counters). A
 //! deferred or retried entry is noted back into the isolate's set from inside the detached task, after the
@@ -90,8 +90,8 @@ pub const CHANGE_CHUNK: usize = 8;
 /// The most POSTs one flush of one set makes (128 entries).
 pub const CHANGE_MAX_CHUNKS: usize = 16;
 
-/// The wall one detached flush task may spend STARTING POSTs, from its own start. `wait_until` holds a task for
-/// about thirty seconds after the answer; the rest is left for a POST in flight, the note-back and the counters.
+/// One flush's delivery wall, including in-flight POSTs. Background callers also reserve time for
+/// the note-back, durable parking and counters inside the platform window.
 pub const FLUSH_WALL_BUDGET_MS: u64 = 20_000;
 
 /// The most entries one isolate remembers as "retried once" per set. Past it a failed entry is not retried
@@ -113,17 +113,18 @@ pub struct Shipped<T> {
     pub refused: usize,
     /// Entries of the POSTs it did not accept.
     pub failed: Vec<T>,
-    /// Entries past the flush's bound (the chunk count, or the wall): not POSTed.
+    /// Entries past the chunk or wall bound, including a POST whose acknowledgement timed out.
     pub deferred: Vec<T>,
 }
 
 /// THE FLUSH LOOP, transport injected. `post` gets one chunk's body and answers `Ok(dropped)` on a 2xx (what
 /// the receiver answered it refused) or `Err(())`; `now_ms` is the clock the wall is read on; no POST is
-/// STARTED at or past `deadline_ms`. Sequential: one POST in flight at a time.
+/// started at or past `deadline_ms`. An unacknowledged POST is deferred at that wall.
+/// Sequential: one POST in flight at a time.
 pub async fn ship_chunks<T, B, P, Fut, C>(
     items: Vec<T>,
     body: B,
-    mut post: P,
+    post: P,
     now_ms: C,
     deadline_ms: u64,
 ) -> Shipped<T>
@@ -133,6 +134,34 @@ where
     P: FnMut(String) -> Fut,
     Fut: Future<Output = std::result::Result<usize, ()>>,
     C: Fn() -> u64,
+{
+    ship_chunks_with(
+        items,
+        body,
+        post,
+        now_ms,
+        deadline_ms,
+        crate::broadcaster::sleep_ms,
+    )
+    .await
+}
+
+pub(crate) async fn ship_chunks_with<T, B, P, Fut, C, S, Sleep>(
+    items: Vec<T>,
+    body: B,
+    mut post: P,
+    now_ms: C,
+    deadline_ms: u64,
+    sleep: S,
+) -> Shipped<T>
+where
+    T: Clone,
+    B: Fn(&[T]) -> String,
+    P: FnMut(String) -> Fut,
+    Fut: Future<Output = std::result::Result<usize, ()>>,
+    C: Fn() -> u64,
+    S: Fn(u64) -> Sleep,
+    Sleep: Future<Output = ()>,
 {
     let mut out = Shipped {
         posts: 0,
@@ -147,12 +176,18 @@ where
             continue;
         }
         out.posts += 1;
-        match post(body(chunk)).await {
-            Ok(dropped) => {
+        match crate::race_or_deadline(
+            post(body(chunk)),
+            sleep(deadline_ms.saturating_sub(now_ms())),
+        )
+        .await
+        {
+            Some(Ok(dropped)) => {
                 out.refused += dropped;
                 out.delivered.extend_from_slice(chunk);
             }
-            Err(()) => out.failed.extend_from_slice(chunk),
+            Some(Err(())) => out.failed.extend_from_slice(chunk),
+            None => out.deferred.extend_from_slice(chunk),
         }
     }
     out
@@ -403,7 +438,9 @@ pub async fn post_body_answer(
         Err(_) => Fetch::Request(req).send().await,
     };
     match sent {
-        Ok(mut r) if (200..300).contains(&r.status_code()) => Ok(r.text().await.unwrap_or_default()),
+        Ok(mut r) if (200..300).contains(&r.status_code()) => {
+            Ok(r.text().await.unwrap_or_default())
+        }
         Ok(mut r) => {
             let status = r.status_code();
             let body = r.text().await.unwrap_or_default();
