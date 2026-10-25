@@ -37,6 +37,7 @@ pub mod door_words;
 pub mod dead_letters;
 pub mod derived_board;
 pub mod derived_hops;
+pub mod derived_owed;
 pub mod ef;
 pub mod ef_deferred;
 pub mod error;

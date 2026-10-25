@@ -619,7 +619,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// tables: no row is touched.
 /// 348 to 349 for bsv-low #620 (L4): `overlay_chain_events`, the overlay's own cursor row on chaintracks' typed
 /// chain-event feed (`chain_feed::CREATE`). Overlay-only: no other service reads it. Follows PR 151's 347 and 348.
-pub const OVERLAY_MIGRATION_COUNT: usize = 349;
+/// 349 to 365 for #893: owed query keys, dirty subjects, word joins, released-hop evidence and belt cursors.
+pub const OVERLAY_MIGRATION_COUNT: usize = 365;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2298,6 +2299,25 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // 349: bsv-low #620 (L4), the overlay's own cursor on chaintracks' typed chain-event feed (its reorg word), one
     // versioned row. A new table: no row is touched.
     crate::chain_feed::CREATE,
+    // #893: additive owed write-time keys and tables. The app-layer judge owns their contents;
+    // the backfill alone writes its owed-v2 stamp, never this migration list.
+    // A shipped trigger is immutable: change it by appending DROP TRIGGER IF EXISTS + CREATE (#638).
+    crate::derived_owed::JUDGED_AT_ALTER,
+    crate::derived_owed::CLAIMABLE_ALTER,
+    crate::derived_owed::GATE_HEIGHT_ALTER,
+    crate::derived_owed::BELT_DUE_AT_ALTER,
+    crate::derived_owed::PROBE_TIP_ALTER,
+    crate::derived_owed::ROW_WORDS_CREATE,
+    crate::derived_owed::DIRTY_CREATE,
+    crate::derived_owed::RELEASED_HOP_EVIDENCE_CREATE,
+    crate::derived_owed::BELT_STATE_CREATE,
+    crate::derived_owed::ROW_WORDS_TXID_INDEX,
+    crate::derived_owed::DIRTY_IDENTITY_INDEX,
+    crate::derived_owed::DIRTY_MARKED_INDEX,
+    crate::derived_owed::RELEASED_HOP_IDENTITY_INDEX,
+    crate::derived_owed::GATE_INDEX,
+    crate::derived_owed::BELT_INDEX,
+    crate::derived_owed::ROW_DELETE,
 ];
 
 // =============================================================================
