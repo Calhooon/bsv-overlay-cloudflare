@@ -99,6 +99,10 @@ pub(crate) async fn subjects(
     })
 }
 
+/// The filing's source statements and its subjects' judgement in ONE batch. A judge that cannot run (a hydration
+/// read, the batch's own fault) never refuses the filing (the D2-OWED lens's MEDIUM-2): the source statements land
+/// ALONE, their triggers' marks stand for the drain, and the fault is counted (`owed_judge_filing_faults_total`).
+/// Only a fault of that lone write refuses the filing.
 pub(crate) async fn judge_filings(
     db: &impl JudgeDb,
     filings: &[VerifiedRecord],
@@ -107,32 +111,56 @@ pub(crate) async fn judge_filings(
     writes: Vec<Stmt>,
     extra_marks: &[FilingMark],
 ) -> std::result::Result<judge::JudgeReport, String> {
-    let mut selected = Vec::new();
-    for filing in filings {
-        selected.extend(subjects(db, filing).await?);
-    }
-    let adapter = FilingJudge {
-        db,
-        filings,
-        hops,
-        stamp,
-    };
-    judge::judge_with_write(
-        &adapter,
-        &selected,
-        "filing",
-        writes,
-        extra_marks,
-        |inputs| {
-            for i in inputs {
-                for filing in filings {
-                    apply(i, filing);
+    let alone = writes.clone();
+    let judged = async {
+        let mut selected = Vec::new();
+        for filing in filings {
+            selected.extend(subjects(db, filing).await?);
+        }
+        let adapter = FilingJudge {
+            db,
+            filings,
+            hops,
+            stamp,
+        };
+        judge::judge_with_write(
+            &adapter,
+            &selected,
+            "filing",
+            writes,
+            extra_marks,
+            |inputs| {
+                for i in inputs {
+                    for filing in filings {
+                        apply(i, filing);
+                    }
                 }
-            }
-            Ok(())
-        },
-    )
-    .await
+                Ok(())
+            },
+        )
+        .await
+    }
+    .await;
+    match judged {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            db.log(&format!(
+                "[owed] a filing's judge faulted; the filing lands alone and its marks wait for the drain: {error}"
+            ));
+            let landed = if alone.is_empty() {
+                Vec::new()
+            } else {
+                db.run_batch(alone).await?
+            };
+            db.counters(vec![(judge::COUNTER_FILING_FAULTS.to_owned(), 1)])
+                .await;
+            Ok(judge::JudgeReport {
+                source_changes: landed.iter().map(|r| r.changes).collect(),
+                judge_fault: Some(error),
+                ..Default::default()
+            })
+        }
+    }
 }
 
 fn apply(i: &mut JudgeInputs, filing: &VerifiedRecord) {

@@ -406,3 +406,15 @@ fn d2fold_medium1_b_the_shipped_drain_statements_never_scan_owed_dirty() {
         );
     }
 }
+
+/// MEDIUM-2: the filing-fault counter is the overlay's seeded name, served from 0.
+#[test]
+fn d2fold_medium2_c_the_filing_fault_counter_is_seeded_by_the_overlay() {
+    let names: Vec<String> = bsv_overlay_cloudflare::applayer_counters::OWED_JUDGE
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
+    assert_eq!(judge::counter_names(), names);
+    let seeded = bsv_overlay_cloudflare::applayer_counters::seeded_names();
+    assert!(names.iter().all(|n| seeded.contains(n)));
+}

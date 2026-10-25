@@ -329,6 +329,8 @@ async fn owed893_refund_judges_both_seats_in_the_filing_batch_and_acknowledges_o
     let db = Db::new();
     db.seed_game("game", "pot");
     db.exec("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt) VALUES ('other','owner','game','pot',0,1,'00','peer',0,1); DELETE FROM owed_dirty;");
+    // the D2-OWED lens's MEDIUM-2: only a verified seat is a refund's subject; the other seat's row verifies here
+    db.exec("UPDATE potparty_records SET sigValid=1 WHERE identity='other'");
     let subjects = judge::refund_subjects(&db, "pot", 0, "owner", "game")
         .await
         .unwrap();
