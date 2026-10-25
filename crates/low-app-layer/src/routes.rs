@@ -30,16 +30,10 @@ use crate::auth::{AuthState, IdentityDecision};
 use crate::logic::{
     assemble_pots_view, assemble_recovery_view, assemble_statuses, attach_evictions,
     batch_where_sql, beef_body, chunk_outpoints, decode_beef_hex, distinct_db_txids,
-    evictions_by_txid_sql, health_body, parse_outpoints, parse_present_height, pots_view_body,
-    pots_view_join_sql, recovery_view_body, recovery_view_sql, tip_body, utxo_status_body,
-    valid_identity, valid_txid, EvictionLedgerRow, Outpoint, PotRecordRow, PotsViewRow,
-    RecoveryRow, ResultMarkerRow,
+    evictions_by_txid_sql, health_body, parse_outpoints, pots_view_body, pots_view_join_sql,
+    recovery_view_body, recovery_view_sql, tip_body, utxo_status_body, valid_identity, valid_txid,
+    EvictionLedgerRow, Outpoint, PotRecordRow, PotsViewRow, RecoveryRow, ResultMarkerRow,
 };
-
-/// The chaintracks present-height endpoint, fetched through the service
-/// binding (`overlay-cloudflare/src/chain_tracker.rs` calls the same route).
-/// Only the PATH matters — the host is resolved by the binding.
-const CHAINTRACKS_TIP_URL: &str = "https://chaintracks/getPresentHeight";
 
 /// Build a JSON response (always `no-store` — see the module note).
 pub(crate) fn json_response(body: String, status: u16) -> Result<Response> {
@@ -620,10 +614,9 @@ pub async fn beef(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respons
     }
 }
 
-/// Fetch the present chain height through the `CHAINTRACKS` service binding.
-/// `Err((msg, status))` carries the exact error mapping `/tip` has always
-/// served (binding 503, upstream 502); `/pots-view` maps any error to a
-/// `tip: null` body instead (the D1 facts are still worth serving).
+/// The same fresh, verified height `/tip` serves. Embedded view tips must
+/// agree: `/pots-view` primes the client's tip cache. A fault is `tip: null`
+/// on those views so their other facts still serve.
 async fn chaintracks_present_height(
     ctx: &RouteContext<AuthState>,
     tag: &str,
@@ -637,53 +630,70 @@ pub(crate) async fn chaintracks_present_height_env(
     env: &worker::Env,
     tag: &str,
 ) -> std::result::Result<u64, (&'static str, u16)> {
-    let svc = match env.service("CHAINTRACKS") {
-        Ok(svc) => svc,
-        Err(e) => {
-            console_warn!("[{tag}] CHAINTRACKS binding unavailable: {e}");
-            return Err(("chaintracks binding unavailable", 503));
-        }
-    };
-    let mut init = RequestInit::new();
-    init.with_method(Method::Get);
-    let headers = Headers::new();
-    let _ = headers.set("Accept", "application/json");
-    init.with_headers(headers);
-
-    let mut resp = match svc.fetch(CHAINTRACKS_TIP_URL, Some(init)).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            console_warn!("[{tag}] chaintracks fetch failed: {e}");
-            return Err(("chaintracks fetch failed", 502));
-        }
-    };
-    if !(200..300).contains(&resp.status_code()) {
-        console_warn!("[{tag}] chaintracks returned HTTP {}", resp.status_code());
-        return Err(("chaintracks returned an error", 502));
-    }
-    let frame: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            console_warn!("[{tag}] chaintracks response not JSON: {e}");
-            return Err(("chaintracks returned malformed JSON", 502));
-        }
-    };
-    match parse_present_height(&frame) {
-        Some(height) => Ok(height),
-        None => {
-            console_warn!("[{tag}] chaintracks frame not a success/height: {frame}");
-            Err(("chaintracks returned an unexpected frame", 502))
+    let reply = tip_reply_env(env).await;
+    match (reply.status, reply.body["height"].as_u64()) {
+        (200, Some(height)) => Ok(height),
+        _ => {
+            console_warn!("[{tag}] verified header tip unavailable");
+            Err(("verified header tip unavailable", 503))
         }
     }
 }
 
-/// `GET /tip` — present chain height via the `CHAINTRACKS` service binding
-/// (`GET /getPresentHeight`, the same route the overlay's chain tracker
-/// calls). A binding fault is 503, an upstream fault 502.
+/// `GET /tip`: the proof tracker's verified header tip and its age.
+/// An unavailable or over-age snapshot is a named 503, with diagnostics only.
 pub async fn tip(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
-    match chaintracks_present_height(&ctx, "tip").await {
-        Ok(height) => json_response(tip_body(height), 200),
-        Err((msg, status)) => json_error(msg, status),
+    let reply = tip_reply_env(&ctx.env).await;
+    let mut response = json_response(reply.body.to_string(), reply.status)?;
+    if let Some(retry_after) = reply.retry_after {
+        response.headers_mut().set("Retry-After", retry_after)?;
+    }
+    Ok(response)
+}
+
+async fn tip_reply_env(env: &worker::Env) -> TipReply {
+    tip_reply_with(
+        |route| crate::tracker_host::chaintracks_get(env, route),
+        crate::tracker_host::last_verified_tip,
+        || worker::Date::now().as_millis(),
+    )
+    .await
+}
+
+const TIP_MAX_AGE_MS: u64 = 30 * 60 * 1_000;
+const TIP_RETRY_AFTER_SECS: &str = "60";
+
+struct TipReply {
+    status: u16,
+    body: serde_json::Value,
+    retry_after: Option<&'static str>,
+}
+
+async fn tip_reply_with<G, F, L, N>(get: G, last_known: L, now_ms: N) -> TipReply
+where
+    G: FnOnce(&'static str) -> F,
+    F: std::future::Future<
+        Output = std::result::Result<(u16, serde_json::Value), bsv_tracker::HeaderError>,
+    >,
+    L: FnOnce() -> Option<crate::tracker_host::VerifiedTip>,
+    N: FnOnce() -> u64,
+{
+    let current = crate::tracker_host::verified_tip_with(get).await.ok();
+    let last_known = last_known();
+    let now = now_ms();
+    let fresh = current
+        .as_ref()
+        .is_some_and(|tip| now.saturating_sub(tip.at) <= TIP_MAX_AGE_MS);
+    let mut body = tip_body(current.as_ref().or(last_known.as_ref()), now);
+    if !fresh {
+        body["code"] = serde_json::json!("ERR_TIP_UNAVAILABLE");
+        body["error"] = serde_json::json!("verified header tip unavailable");
+        body["stale"] = serde_json::json!(true);
+    }
+    TipReply {
+        status: if fresh { 200 } else { 503 },
+        body,
+        retry_after: (!fresh).then_some(TIP_RETRY_AFTER_SECS),
     }
 }
 
@@ -15134,3 +15144,7 @@ mod leaderboard_642;
 #[cfg(test)]
 #[path = "../tests/support/leaderboard_674.rs"]
 mod leaderboard_674;
+
+#[cfg(test)]
+#[path = "tip_tests.rs"]
+mod tip_tests;

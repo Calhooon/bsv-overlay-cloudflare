@@ -5,7 +5,71 @@ use bsv_tracker::{
     Clock, Header, HeaderError, Headers, Hint, HintSource, Proof, ProofFetcher, Reask, Verdict,
 };
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
+
+/// Chaintracks' served, verified header tip. `at` is the header's time in milliseconds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedTip {
+    pub height: u32,
+    pub hash: String,
+    pub at: u64,
+}
+
+thread_local! {
+    // Diagnostics only: a failed current read never serves this as a fresh tip.
+    static LAST_VERIFIED_TIP: RefCell<Option<VerifiedTip>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn last_verified_tip() -> Option<VerifiedTip> {
+    LAST_VERIFIED_TIP.with(|last| last.borrow().clone())
+}
+
+/// The one tip reader for the proof snapshot and the app layer's height reads.
+/// Chaintracks serves this header under the same validation ceiling as its proof headers.
+pub(crate) async fn verified_tip_with<G, F>(get: G) -> Result<VerifiedTip, HeaderError>
+where
+    G: FnOnce(&'static str) -> F,
+    F: std::future::Future<Output = Result<(u16, Value), HeaderError>>,
+{
+    let (status, frame) = get("findChainTipHeaderHex").await?;
+    let malformed = || HeaderError("unverified or malformed tip frame".into());
+    let height = frame["value"]["height"]
+        .as_u64()
+        .and_then(|h| u32::try_from(h).ok())
+        .ok_or_else(malformed)?;
+    let header = header_response(height, status, &frame)?.ok_or_else(malformed)?;
+    let time = frame["value"]["time"]
+        .as_u64()
+        .and_then(|t| u32::try_from(t).ok())
+        .ok_or_else(malformed)?;
+    let tip = VerifiedTip {
+        height,
+        hash: header.hash,
+        at: u64::from(time) * 1_000,
+    };
+    LAST_VERIFIED_TIP.with(|last| *last.borrow_mut() = Some(tip.clone()));
+    Ok(tip)
+}
+
+pub(crate) async fn chaintracks_get(
+    env: &worker::Env,
+    route: &str,
+) -> Result<(u16, Value), HeaderError> {
+    let svc = env
+        .service("CHAINTRACKS")
+        .map_err(|e| HeaderError(e.to_string()))?;
+    let mut resp = svc
+        .fetch(format!("https://chaintracks/{route}"), None)
+        .await
+        .map_err(|e| HeaderError(e.to_string()))?;
+    let status = resp.status_code();
+    if status == 404 {
+        return Ok((status, Value::Null));
+    }
+    let frame = resp.json().await.map_err(|e| HeaderError(e.to_string()))?;
+    Ok((status, frame))
+}
 
 /// Only the named heights fetched from CHAINTRACKS, with the answering tip.
 #[derive(Clone, Debug)]
@@ -49,43 +113,31 @@ pub fn header_response(
 /// Fetch named heights only. The tip brackets the header fetches; a changing
 /// tip is an unanswerable snapshot and is retried by the host, never trusted.
 pub async fn headers(env: &worker::Env, heights: &[u32]) -> HeaderSnapshot {
-    async fn get(env: &worker::Env, route: &str) -> Result<(u16, Value), HeaderError> {
-        let svc = env
-            .service("CHAINTRACKS")
-            .map_err(|e| HeaderError(e.to_string()))?;
-        let mut resp = svc
-            .fetch(format!("https://chaintracks/{route}"), None)
-            .await
-            .map_err(|e| HeaderError(e.to_string()))?;
-        let status = resp.status_code();
-        if status == 404 {
-            return Ok((status, Value::Null));
-        }
-        let frame = resp.json().await.map_err(|e| HeaderError(e.to_string()))?;
-        Ok((status, frame))
-    }
-    async fn tip(env: &worker::Env) -> Result<u32, HeaderError> {
-        let (status, frame) = get(env, "getPresentHeight").await?;
-        if !(200..300).contains(&status) {
-            return Err(HeaderError(format!("tip HTTP {status}")));
-        }
-        crate::logic::parse_present_height(&frame)
-            .and_then(|h| u32::try_from(h).ok())
-            .ok_or_else(|| HeaderError("unavailable tip".into()))
-    }
+    headers_with(
+        |route| async move { chaintracks_get(env, &route).await },
+        heights,
+    )
+    .await
+}
+
+pub(crate) async fn headers_with<G, F>(get: G, heights: &[u32]) -> HeaderSnapshot
+where
+    G: Fn(String) -> F,
+    F: std::future::Future<Output = Result<(u16, Value), HeaderError>>,
+{
     retry_snapshot(|| async {
-        let before = tip(env).await;
+        let before = verified_tip_with(|route| get(route.to_owned())).await;
         let mut rows = BTreeMap::new();
         for height in heights {
-            let row = match get(env, &format!("findHeaderHexForHeight?height={height}")).await {
+            let row = match get(format!("findHeaderHexForHeight?height={height}")).await {
                 Ok((status, frame)) => header_response(*height, status, &frame),
                 Err(e) => Err(e),
             };
             rows.insert(*height, row);
         }
-        let after = tip(env).await;
+        let after = verified_tip_with(|route| get(route.to_owned())).await;
         let tip = if before == after {
-            after
+            after.map(|tip| tip.height)
         } else {
             Err(HeaderError("header snapshot changed".into()))
         };

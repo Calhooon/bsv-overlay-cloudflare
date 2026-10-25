@@ -742,7 +742,7 @@ pub const HOP_CHAIN_PROBES_TIP_ALTER: &str =
 /// cache) is newer than this walk's view and stands. With no walk tip there is nothing to compare: the age rule alone
 /// (the served body then degrades every sweep on its NULL snapshot tip, `owed::degrade_stale_sweeps`).
 ///
-/// What the memo's tip MEANS (the stated residual): the height chaintracks' `getPresentHeight` answered the walk before
+/// What the memo's tip MEANS (the stated residual): the verified header height chaintracks answered the walk before
 /// it asked, which is the same 30 s cross-isolate tip cache the served tip comes from. So the binding is to the tip as
 /// that cache saw it, not to the chain: a memo taken in the first seconds after a block, before the cache moved, is
 /// stamped one below and asked once more (harmless); and a memo taken before a block, read inside the 30 s before the

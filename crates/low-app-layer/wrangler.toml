@@ -157,7 +157,7 @@ database_name = "low-overlay-db"
 database_id = "__LOW_APPLAYER_DEFAULT_D1_LOW_OVERLAY_DB_ID__"  # injected at deploy time from the private secrets store by name
 
 # Service binding to the ChainTracks worker (same account). /tip uses this to
-# resolve the present chain height: a plain workers.dev URL fetch to a
+# read the verified header tip: a plain workers.dev URL fetch to a
 # same-account worker loops back to this worker (returns our own 404), so the
 # binding is required for the fetch to reach ChainTracks. `service` is a
 # worker name, not a secret.
