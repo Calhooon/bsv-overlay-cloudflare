@@ -52,7 +52,7 @@ pub async fn drain_changed(
     source: &str,
 ) -> Result<DrainReport, String> {
     let candidates: Vec<Value> = hydrate::read(db,
-        "SELECT identity,gameId FROM owed_dirty WHERE gameId<>'' AND (identity IN (SELECT value FROM json_each(?1)) OR sourceKey IN (SELECT value FROM json_each(?2))) GROUP BY identity,gameId ORDER BY MAX(source='wanted') DESC,MIN(markedAtMs),MIN(generation) LIMIT ?3",
+        CHANGED_SQL,
         vec![Bind::Text(json!(identities).to_string()),Bind::Text(json!(keys).to_string()),Bind::Int(OWED_JUDGE_SUBJECTS_PER_INVOCATION as i64)]).await?;
     let mut report = DrainReport::default();
     for row in candidates {
