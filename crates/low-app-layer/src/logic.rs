@@ -412,7 +412,9 @@ pub fn utxo_status_body(entries: &[OutpointStatus]) -> String {
             // other producer's bytes stand. A hint, never evidence: no money view reads it.
             if e.funding_seen.is_some() {
                 row["networkSeenBy"] = overlay_discovery::pot::storage::served_seen_by_value(
-                    e.funding_seen_by.as_ref().filter(|_| e.funding_seen == Some(true)),
+                    e.funding_seen_by
+                        .as_ref()
+                        .filter(|_| e.funding_seen == Some(true)),
                 );
             }
             row
@@ -1262,13 +1264,13 @@ pub fn beef_body(txid: &str, beef: &[u8]) -> String {
 }
 
 /// The verified header snapshot on `/tip`; absent facts stay null on a 503.
-/// The age uses the header's timestamp, never the time it was fetched.
+/// The age uses chaintracks' last successful sync, never the block or fetch time.
 pub fn tip_body(tip: Option<&crate::tracker_host::VerifiedTip>, now_ms: u64) -> serde_json::Value {
     json!({
         "height": tip.map(|t| t.height),
         "hash": tip.map(|t| t.hash.as_str()),
         "at": tip.map(|t| t.at),
-        "ageMs": tip.map(|t| now_ms.saturating_sub(t.at)),
+        "ageMs": tip.map(|t| now_ms.saturating_sub(t.synced_at)),
         "source": "verified-header",
     })
 }
@@ -3933,12 +3935,14 @@ mod tests {
             height: 812_345,
             hash: "01".repeat(32),
             at: 123_000,
+            synced_at: 123_500,
+            last_seen_height: 812_345,
         };
         let v = tip_body(Some(&tip), 124_001);
         assert_eq!(v["height"], 812_345);
         assert_eq!(v["hash"], tip.hash);
         assert_eq!(v["at"], tip.at);
-        assert_eq!(v["ageMs"], 1_001);
+        assert_eq!(v["ageMs"], 501);
         assert_eq!(v["source"], "verified-header");
         let h: serde_json::Value = serde_json::from_str(&health_body()).unwrap();
         assert_eq!(h["ok"], true);
