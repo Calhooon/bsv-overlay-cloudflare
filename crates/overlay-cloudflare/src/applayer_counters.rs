@@ -108,6 +108,14 @@ pub const OWED_BELT: [&str; 8] = [
     "owed_belt_faults_other_total",
 ];
 
+/// bsv-low #893 section 6.1 (lane D2-OWED-BACKFILL): the app layer's one-time `owed-v2` backfill and the daily age
+/// re-mark (`low_app_layer::owed_backfill::counter_names`, pinned equal there). Totals the pass adds.
+pub const OWED_BACKFILL: [&str; 3] = [
+    "owed_backfill_identities_total",
+    "owed_backfill_rows_total",
+    "owed_age_remarked_total",
+];
+
 /// `/health/invariants.owedBelt`: the belt's durable totals and its backlog, from the counters read.
 pub fn owed_belt_view(counters: &serde_json::Value) -> serde_json::Value {
     let n = |k: &str| {
@@ -170,6 +178,7 @@ pub fn names() -> Vec<String> {
     // bsv-low #831 (the FIX-831 lens's L3): the refund-due pots the owed judgement found funding-not-held
     v.push("owed_refund_funding_unheld_total".to_string());
     v.extend(OWED_BELT.iter().map(|n| n.to_string()));
+    v.extend(OWED_BACKFILL.iter().map(|n| n.to_string()));
     // bsv-low #608 (the B-OWED-2 lens's LOW-1): the reads whose recompute only the unread-spender rule asked for
     v.push("owed_spender_rejudge_total".to_string());
     v.push("applayer_owed_read_faults_total".to_string());

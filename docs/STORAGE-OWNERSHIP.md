@@ -72,7 +72,7 @@ The app layer's write set (the comment in `crates/low-app-layer/wrangler.toml` r
 | `owed_rows` | low-app-layer | none | overlay-cloudflare | transient | no | a pure derivation over the money tables; the next read recomputes |
 | `owed_row_words` | low-app-layer | overlay-cloudflare DELETE (orphan trigger) | none | derived | no | txid roles replaced with each judged row; an old-worker delete removes its joins in the same statement |
 | `owed_dirty` | low-app-layer | overlay-cloudflare INSERT (source triggers) | none | derived | no | identity/game subjects marked in the source write, coalesced by source and source key |
-| `released_hop_evidence` | overlay-cloudflare | low-app-layer CREATE (catch-up) | none | derived | no | released-hop evidence derived from retained eviction, party and JOIN inputs |
+| `released_hop_evidence` | overlay-cloudflare | low-app-layer CREATE (catch-up) | low-app-layer (the judge's hydration, the wanted and backfill marks) | derived | no | released-hop evidence derived from retained eviction, party and JOIN inputs |
 | `owed_belt_state` | low-app-layer | none | none | transient | no | named cursors for the belt and backfill; completion stays in view_derivation_state |
 | `owed_state` | low-app-layer | none | none | transient | no | recomputed on the next read |
 | `owed_spender_bytes` | low-app-layer | none | none | transient | no | bsv-low #672 (RC-L30): a cache of a hop spender's immutable outputs + input outpoints, content-addressed by spender txid, read before the owed recompute's budget so a budget cut never clobbers a judged spent-elsewhere row; a sweep ages it and a lost row is re-fetched from a courier when its spender is asked again |
@@ -224,7 +224,7 @@ A new table: its CREATE in `OVERLAY_MIGRATIONS`, its row in `storage-ownership.j
 
 | `hop_pot_links` | overlay-cloudflare | derived | no | App-layer identity lookup, source-write triggers. |
 | `pot_hop_seats` | overlay-cloudflare | derived | no | App-layer outpoint lookup, source-write triggers. |
-| `view_derivation_state` | overlay-cloudflare | derived | no | Guarded one-time legacy backfill. |
+| `view_derivation_state` | overlay-cloudflare | derived | no | Guarded one-time legacy backfill. The app layer INSERTs the `owed-v2` stamp when its owed backfill's cursor passes the last identity (#893 section 6.1). |
 | `count_network_seen` | overlay-cloudflare | derived | no | bsv-low #645: one row, the count of `network_seen` kept by its insert and delete triggers; guarded one-time backfill. |
 | `pot_beefs_unprovable_set` | overlay-cloudflare | derived | no | NS-COST-BAR-1: the txids of the latched `structurally_unprovable = 1` rows, kept by `pot_beefs`' triggers (idempotent under `INSERT OR REPLACE`); wiped only with its count row. |
 | `count_pot_beefs_unprovable` | overlay-cloudflare | derived | no | NS-COST-BAR-1: one row, the count of `pot_beefs_unprovable_set` kept by its insert and delete triggers; guarded one-time backfill. |

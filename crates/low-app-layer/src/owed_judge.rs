@@ -114,12 +114,9 @@ pub use hydrate::{
 
 pub const OWED_JUDGE_SUBJECTS_PER_INVOCATION: usize = 16;
 pub const OWED_DIRTY_SUBJECTS_PER_PASS: usize = 64;
-/// Required source-table access paths. The overlay must append these additive migrations.
-/// The native migration pin deliberately stays red until that prerequisite lands.
-pub const REQUIRED_GAME_INDEXES: [&str;2] = [
-    "CREATE INDEX IF NOT EXISTS idx_potparty_game_identity ON potparty_records(gameId,identity)",
-    "CREATE INDEX IF NOT EXISTS idx_evicted_party_identity_game ON potparty_records_evicted(identity,gameId,potTxid)",
-];
+/// Required source-table access paths, by index name: the overlay ships both (the native pin holds it).
+pub const REQUIRED_GAME_INDEX_NAMES: [&str; 2] =
+    ["idx_potparty_game_identity", "idx_evicted_party_identity_game"];
 pub const MARK_WANTED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,'','wanted',?1,?2) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
 pub const MARKS_SQL: &str = "SELECT generation,source,sourceKey FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))";
 pub const SUBJECTS_SQL: &str = "SELECT identity,gameId FROM owed_dirty GROUP BY identity,gameId ORDER BY MAX(source='wanted') DESC,MIN(markedAtMs),MIN(generation) LIMIT ?1";

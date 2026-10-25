@@ -35,10 +35,6 @@ impl Db {
                 );
             }
         }
-        // Exercise the rest of the judge while the separate migration pin remains red.
-        for sql in judge::REQUIRED_GAME_INDEXES {
-            conn.execute_batch(sql).unwrap();
-        }
         Self {
             conn: RefCell::new(conn),
             reads: RefCell::new(Vec::new()),
@@ -587,10 +583,12 @@ async fn owed893_judge_readback_equals_the_walk_through_both_read_statements() {
 
 #[test]
 fn owed893_judge_game_indexes_are_shipped_by_the_overlay() {
-    for sql in judge::REQUIRED_GAME_INDEXES {
+    for name in judge::REQUIRED_GAME_INDEX_NAMES {
         assert!(
-            bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS.contains(&sql),
-            "missing required game index in overlay migrations: {sql}"
+            bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
+                .iter()
+                .any(|sql| sql.starts_with(&format!("CREATE INDEX IF NOT EXISTS {name} ON "))),
+            "missing required game index in overlay migrations: {name}"
         );
     }
 }

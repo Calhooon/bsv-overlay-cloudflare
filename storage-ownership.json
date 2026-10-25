@@ -99,6 +99,29 @@
  },
  "dynamic_sites": [
   {
+   "file": "crates/overlay-cloudflare/src/eviction_write.rs",
+   "op": "SELECT",
+   "count": 1,
+   "crate": "overlay-cloudflare",
+   "statements": [
+    "SELECT COUNT(*) AS n FROM \"{table}\" WHERE {predicate}"
+   ],
+   "tables": [
+    "pot_records",
+    "outputs",
+    "applied_transactions",
+    "transactions",
+    "low_records",
+    "potparty_records",
+    "potrefund_records",
+    "result_markers",
+    "result_markers_v2",
+    "hand_markers",
+    "lb_marker_rows"
+   ],
+   "why": "snapshot: the eviction's per-table row count over MOVED_TABLES, keyed by the txid columns each table holds (#893 section 2.2)"
+  },
+  {
    "file": "crates/overlay-cloudflare/src/derived_board.rs",
    "op": "SELECT",
    "count": 1,
@@ -818,7 +841,7 @@
      "CREATE"
     ]
    },
-   "readers": [],
+   "readers": ["low-app-layer"],
    "rebuild_class": "derived",
    "never_wipe": false,
    "holds": "the eviction-derived evidence of each released hop and identity",
@@ -1548,11 +1571,11 @@
    "name": "view_derivation_state",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",
-   "writers": {},
+   "writers": {"low-app-layer": ["INSERT"]},
    "readers": ["low-app-layer"],
    "rebuild_class": "derived",
    "never_wipe": false,
-   "holds": "transactional hop view derivation",
+   "holds": "transactional hop view derivation; the app layer's owed-v2 backfill stamp (#893 section 6.1, owed_backfill::STAMP_WRITE_SQL)",
    "why": "rebuild from admitted hop markers, pot columns and party rows"
    },
    {

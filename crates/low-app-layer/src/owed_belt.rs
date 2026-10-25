@@ -34,7 +34,7 @@ pub const OWED_BELT_STATE_NAME: &str = "belt";
 /// The rungs, by courier host. `other` is any host the ladders reach that is none of the three.
 pub const RUNGS: [&str; 4] = ["woc", "bitails", "bananablocks", "other"];
 
-pub const CANDIDATES_SQL: &str = "SELECT identity,outpoint,gameId,family,facts FROM owed_rows INDEXED BY idx_owed_rows_belt WHERE beltDueAtMs<=?1 ORDER BY beltDueAtMs,outpoint LIMIT ?2";
+pub const CANDIDATES_SQL: &str = "SELECT identity,outpoint,gameId,family,facts,COALESCE(claimable, CASE json_type(facts,'$.claimable') WHEN 'true' THEN 1 WHEN 'false' THEN 0 END) AS claimable FROM owed_rows INDEXED BY idx_owed_rows_belt WHERE beltDueAtMs<=?1 ORDER BY beltDueAtMs,outpoint LIMIT ?2";
 /// A candidate no rung answered: its row and facts untouched, its next look dated once (never pushed further by a
 /// second fault in the same tick: the statement sets, it does not add).
 pub const REARM_SQL: &str = "UPDATE owed_rows SET beltDueAtMs=?3 WHERE identity=?1 AND outpoint=?2 AND beltDueAtMs IS NOT NULL";
@@ -152,6 +152,9 @@ pub struct Candidate {
     pub game_id: String,
     pub family: String,
     pub facts: Value,
+    /// The stored `claimable` column, or the row's `facts.claimable` where an old worker's row left it NULL during the
+    /// deploy window (risk 8.4): the candidate never reads a judgement from a column the old worker could not write.
+    pub claimable: Option<bool>,
 }
 
 /// What the row owes the chain (section 5's list), read off the row the judge stored.
@@ -435,6 +438,7 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
                 .as_str()
                 .and_then(|f| serde_json::from_str(f).ok())
                 .unwrap_or(Value::Null),
+            claimable: r["claimable"].as_i64().map(|n| n != 0),
         };
         if gate.spent() {
             report.left += 1;
