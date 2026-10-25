@@ -46,6 +46,12 @@ pub const BELT_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_belt ON o
 /// The scheduled drain's daily re-judge of rows older than 24 h (risk 8.2's third repair); NULL is an old worker's row,
 /// which the backfill rewrites.
 pub const JUDGED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_judged ON owed_rows(judgedAtMs) WHERE judgedAtMs IS NOT NULL";
+/// The D2-OWED lens's HIGH-1: on a tip, the claimable sweeps judged below it are dated due now; this is that
+/// statement's whole access path (`probeTip` is the tip the row was judged at, NULL = judged with no tip).
+pub const SWEEP_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_sweep ON owed_rows(probeTip) WHERE family='hop-stranded' AND claimable=1";
+/// The D2-OWED lens's HIGH-1 and MEDIUM-2: a row judged with no chain tip (TIP-877's tipless judgement) is re-marked
+/// on the next tip; an old worker's keyless row is in it too.
+pub const UNTIPPED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_untipped ON owed_rows(identity,gameId) WHERE probeTip IS NULL";
 /// Old workers delete an identity's rows whole; their word joins must disappear in that statement too.
 pub const ROW_DELETE: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_delete_words AFTER DELETE ON owed_rows BEGIN DELETE FROM owed_row_words WHERE identity=OLD.identity AND outpoint=OLD.outpoint; END";
 

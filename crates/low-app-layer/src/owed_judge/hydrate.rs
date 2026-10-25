@@ -80,17 +80,9 @@ pub(crate) async fn hydrate_filings(
         now_ms: db.now_ms() as i64,
         ..Default::default()
     };
-    if i.tip.is_none() {
-        let state: Vec<Value> = read(
-            db,
-            "SELECT tip FROM owed_state WHERE identity=?1",
-            vec![Bind::Text(identity.into())],
-        )
-        .await?;
-        if state.iter().any(|r| !r["tip"].is_null()) {
-            return Err("chain tip unavailable; previous judgement stands".into());
-        }
-    }
+    // TIP-877 (main's rule, the D2-OWED lens's MEDIUM-2): no tip is no refusal. The derivation withholds every
+    // tip-dependent claim (`tipUnknown`), proof-decided rows advance, the rows store `probeTip` NULL, and the next tip
+    // re-marks them (`MARK_UNTIPPED_SQL`).
     let bound = vec![Bind::Text(identity.into()), json_bind(&games)];
     let mut parties: Vec<Value> = read(db, PARTIES_SQL, bound.clone()).await?;
     parties.extend(read::<Value>(db, LINKS_SQL, bound.clone()).await?);

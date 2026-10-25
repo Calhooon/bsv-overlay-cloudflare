@@ -398,8 +398,9 @@ pub struct TickReport {
 
 pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickReport, String> {
     let now = db.now_ms() as i64;
-    // The judge refuses every subject without a chain tip ("previous judgement stands"), so a find could never land:
-    // ask nothing, spend no courier call, leave every date as it is (the next tick with a tip asks them first).
+    // Without a chain tip a find's memo carries no tip and its judgement withholds every tip-dependent claim (TIP-877),
+    // so the look buys nothing a press could rest on: ask nothing, spend no courier call, leave every date as it is
+    // (the next tick with a tip asks them first).
     if db.tip().is_none() {
         db.counters(vec![(COUNTER_TICKS.to_owned(), 1)]).await;
         db.log("[owed-belt] tick: no chain tip, nothing asked");

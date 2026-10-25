@@ -690,14 +690,16 @@ async fn owed893_tip_marks_seek_gate_index_and_judge_is_bounded() {
         let game = format!("g{n:02}");
         let pot = format!("{n:064x}");
         db.seed_game(&game, &pot);
+        // the D2-OWED lens's HIGH-2, the fixture re-cut: forty gates over the ten blocks below the tip, seven of them
+        // (28 rows) inside the window `[tip - 6, tip]`; every row judged at a tip (no tipless re-mark)
         let gate = if n < 40 {
-            Some(900_000)
+            Some(900_000 - (n % 10))
         } else if n == 40 {
             Some(900_001)
         } else {
             None
         };
-        db.conn.borrow().execute("INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs,gateHeight) VALUES('owner',?1,'unbound',?2,'{}',0,?3)", rusqlite::params![format!("{pot}:0"), game, gate]).unwrap();
+        db.conn.borrow().execute("INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs,gateHeight,probeTip) VALUES('owner',?1,'unbound',?2,'{}',0,?3,899999)", rusqlite::params![format!("{pot}:0"), game, gate]).unwrap();
     }
     db.exec("DELETE FROM owed_dirty");
     {
@@ -725,7 +727,7 @@ async fn owed893_tip_marks_seek_gate_index_and_judge_is_bounded() {
     let report = judge::mark_tip(&db, 900_000).await.unwrap();
     assert!(report.faults.is_empty(), "{:?}", report.faults);
     assert_eq!(report.subjects, 16);
-    assert_eq!(db.count("owed_dirty"), 24);
+    assert_eq!(db.count("owed_dirty"), 12, "28 in the window, 16 judged");
     let outside: i64 = db
         .conn
         .borrow()
@@ -736,6 +738,16 @@ async fn owed893_tip_marks_seek_gate_index_and_judge_is_bounded() {
         )
         .unwrap();
     assert_eq!(outside, 0, "future and absent gates are not marked");
+    let below: i64 = db
+        .conn
+        .borrow()
+        .query_row(
+            "SELECT COUNT(*) FROM owed_dirty d JOIN owed_rows r ON r.identity=d.identity AND r.gameId=d.gameId WHERE r.gateHeight<899994",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(below, 0, "a gate more than six blocks below the tip is not re-marked");
 }
 
 #[tokio::test]
