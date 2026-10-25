@@ -146,7 +146,10 @@ async fn owed_read_joins_words_once_and_preserves_stored_claims() {
     let body = snapshot.body("owner", Some(101), &words).unwrap();
     assert_eq!(body["rows"].as_array().unwrap().len(), 1);
     assert_eq!(body["rows"][0]["facts"]["coinWord"]["word"], "pending");
-    assert_eq!(body["rows"][0]["facts"]["claimable"], true);
+    // the D2-OWED lens's HIGH-1: judged at 100, served at 101, the stored press degrades to a chain-wait
+    assert_eq!(body["rows"][0]["facts"]["claimable"], false);
+    assert_eq!(body["rows"][0]["facts"]["claim"], Value::Null);
+    assert_eq!(body["rows"][0]["facts"]["chainWait"], "block");
     assert_eq!(body["rows"][0]["facts"]["tipMoved"], true);
     assert_eq!(body["rows"][0]["facts"]["servedTip"], 101);
     assert_eq!(body["rows"][0]["facts"]["beltNextAtMs"], Value::Null);

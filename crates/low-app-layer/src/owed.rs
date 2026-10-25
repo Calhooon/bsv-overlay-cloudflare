@@ -15877,7 +15877,8 @@ pub(crate) mod tests {
             .next()
             .unwrap();
         assert!(!read.contains("demote_shed_presses"));
-        assert!(!read.contains("degrade_stale_sweeps"));
+        // the D2-OWED lens's HIGH-1: the #669 gate runs at the read, per stored row, in the projection the route serves
+        assert!(squash(include_str!("owed_read.rs")).contains("owed::degrade_stale_sweeps(&mutone,number(&joined[\"probeTip\"]),present_tip)"));
         assert!(read.contains("crate::owed_read::read"));
     }
 

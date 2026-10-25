@@ -90,10 +90,14 @@ pub async fn read(db: &impl SqlPort, identity: &str) -> Result<Snapshot, String>
 }
 
 impl Snapshot {
+    /// A claimable sweep always needs the present tip: without it the read withholds the press (HIGH-1).
     pub fn needs_tip(&self) -> bool {
-        self.joined
-            .iter()
-            .any(|r| number(&r["gateHeight"]).is_some() || number(&r["probeTip"]).is_some())
+        self.joined.iter().any(|r| {
+            number(&r["gateHeight"]).is_some()
+                || number(&r["probeTip"]).is_some()
+                || (r["family"] == owed::OwedFamily::HopStranded.as_str()
+                    && r["claimable"].as_i64() == Some(1))
+        })
     }
 
     /// All tracker inputs came from the first statement, including proof bytes.
@@ -153,24 +157,39 @@ impl Snapshot {
                     "supersededFallback",
                     "judgedAtMs",
                     "spenderUnread",
-                    "tipMoved",
-                    "servedTip",
                 ] {
                     object.remove(key);
                 }
                 // bsv-low #893 section 5: the belt's next look at this row, as the judge or the belt dated it (null:
                 // the index or a checked word decides the row, nothing is owed the chain).
                 object.insert("beltNextAtMs".into(), json!(number(&joined["beltDueAtMs"])));
-                if let (Some(probe), Some(served)) = (number(&joined["probeTip"]), tip) {
-                    if served > probe {
-                        object.insert("tipMoved".into(), json!(true));
-                        object.insert("servedTip".into(), json!(served));
-                    }
+                // bsv-low #669 (the D2-OWED lens's HIGH-1): the read-time freshness gate, per row. A claimable sweep
+                // rests on the tip it was judged at (`probeTip`; NULL is unknown); a block since, or a present tip that
+                // cannot be read, degrades it IN THE SERVED BODY to a pending chain-wait, never a dead sweep.
+                let mut reason = joined["reason"].as_str().map(str::to_owned);
+                if joined["family"] == owed::OwedFamily::HopStranded.as_str()
+                    && facts["claimable"] == Value::Bool(true)
+                {
+                    let mut one = [owed::OwedRow {
+                        identity: identity.into(),
+                        outpoint: outpoint.into(),
+                        family: owed::OwedFamily::HopStranded,
+                        game_id: String::new(),
+                        sats: None,
+                        opponent_identity: None,
+                        at_height: None,
+                        facts,
+                        reason,
+                    }];
+                    owed::degrade_stale_sweeps(&mut one, number(&joined["probeTip"]), present_tip);
+                    let [row] = one;
+                    facts = row.facts;
+                    reason = row.reason;
                 }
                 let position = rows.len();
                 positions.insert(outpoint.into(), position);
                 roles.push(BTreeMap::new());
-                rows.push(json!({"outpoint":outpoint,"family":joined["family"],"gameId":joined["gameId"],"sats":number(&joined["sats"]),"opponentIdentity":joined["opponentIdentity"],"atHeight":number(&joined["atHeight"]),"facts":facts,"reason":joined["reason"]}));
+                rows.push(json!({"outpoint":outpoint,"family":joined["family"],"gameId":joined["gameId"],"sats":number(&joined["sats"]),"opponentIdentity":joined["opponentIdentity"],"atHeight":number(&joined["atHeight"]),"facts":facts,"reason":reason}));
                 position
             };
             if let (Some(role), Some(txid)) = (joined["role"].as_str(), joined["wordTxid"].as_str())
