@@ -717,4 +717,98 @@ pub(crate) fn assert_fixture_roundtrip(i: &OwedInputs<'_>) {
         rows(&new, ROWS_READ_SQL, i.identity_lc),
         "the judge's stored rows must equal the walk's on every input fixture"
     );
+    let mut stmt = new.prepare(crate::owed_read::ROWS_SQL).unwrap();
+    let names: Vec<_> = stmt.column_names().into_iter().map(str::to_owned).collect();
+    let joined = stmt
+        .query_map([i.identity_lc], |row| {
+            let mut out = serde_json::Map::new();
+            for (index, name) in names.iter().enumerate() {
+                use rusqlite::types::ValueRef;
+                let value = match row.get_ref(index)? {
+                    ValueRef::Null => Value::Null,
+                    ValueRef::Integer(n) => json!(n),
+                    ValueRef::Real(n) => json!(n),
+                    ValueRef::Text(s) => json!(std::str::from_utf8(s).unwrap()),
+                    ValueRef::Blob(_) => unreachable!("the read joins decoded columns"),
+                };
+                out.insert(name.clone(), value);
+            }
+            Ok(Value::Object(out))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let snapshot = crate::owed_read::Snapshot {
+        joined,
+        state: Some(json!({"computedAtMs":i.now_ms,"tip":i.tip,"truncated":0})),
+        pending: 0,
+        wanted: false,
+    };
+    let empty = BTreeMap::new();
+    let mut served = snapshot
+        .body(i.identity_lc, i.tip, i.spender_words.unwrap_or(&empty))
+        .unwrap();
+    let mut previous_rows = derived.clone();
+    crate::owed::sort_rows_for_service(&mut previous_rows);
+    let truncated = previous_rows.len() > crate::owed::OWED_MAX_ROWS;
+    previous_rows.truncate(crate::owed::OWED_MAX_ROWS);
+    let mut previous: Value = serde_json::from_str(&crate::owed::owed_body(
+        i.identity_lc,
+        i.tip,
+        &previous_rows,
+        i.now_ms,
+        truncated,
+        None,
+    ))
+    .unwrap();
+    if truncated {
+        previous["judgement"] =
+            json!("could not judge the complete list this pass: bounded or faulted evidence read");
+    }
+    // Compare every committed input fixture through the production read. The
+    // new projection fields are checked separately; the stable body is bytes.
+    for (row, old) in served["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(previous["rows"].as_array().unwrap())
+    {
+        assert_eq!(row["outpoint"], old["outpoint"]);
+        for key in ["coinWord", "spenderWord", "fundingWord", "tracker"] {
+            if let Some(word) = old["facts"].get(key) {
+                assert_eq!(
+                    &row["facts"][key], word,
+                    "the joined {key} must preserve its served bytes"
+                );
+            }
+        }
+    }
+    for body in [&mut served, &mut previous] {
+        body.as_object_mut().unwrap().remove("pending");
+        body.as_object_mut().unwrap().remove("markerlessProgress");
+        for row in body["rows"].as_array_mut().unwrap() {
+            for key in [
+                "coinWord",
+                "spenderWord",
+                "fundingWord",
+                "tracker",
+                "refresh",
+                "carried",
+                "claimableBeforeShed",
+                "supersededFallback",
+                "judgedAtMs",
+                "spenderUnread",
+                "tipMoved",
+                "servedTip",
+                "beltNextAtMs",
+            ] {
+                row["facts"].as_object_mut().unwrap().remove(key);
+            }
+        }
+    }
+    assert_eq!(
+        served.to_string(),
+        previous.to_string(),
+        "the stable owed body bytes must survive the joined read"
+    );
 }

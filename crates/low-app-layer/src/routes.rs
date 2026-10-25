@@ -3345,14 +3345,11 @@ struct OwedStateD1 {
     #[serde(rename = "computedAtMs")]
     computed_at_ms: f64,
     tip: Option<f64>,
-    stale: Option<f64>,
     #[serde(default)]
     truncated: Option<f64>,
     /// bsv-low #566: the identity's recompute sequence (NULL on a row no snapshot wrote since the column).
     #[serde(rename = "recomputeSeq", default)]
     recompute_seq: Option<f64>,
-    #[serde(rename = "markerlessProgress", default)]
-    markerless_progress: Option<String>,
 }
 
 async fn owed_party_cursor(
@@ -6033,18 +6030,22 @@ where
 /// that lands inside it (loop 22's census: 0 rows in 244 ms) is the answer; one that does not keeps running in the
 /// `wait_until` exactly as before and the stored snapshot answers (serve then refresh, `owed-changed` after). Far
 /// under the page's 8 s read bound, so a read still never waits on a slow courier for long.
+#[allow(dead_code)]
 pub(crate) const OWED_READ_INLINE_WAIT_MS: u64 = 2_000;
+#[allow(dead_code)]
 const _: () = assert!(OWED_READ_INLINE_WAIT_MS <= 2_000); // far under the page's 8 s read bound
 
 /// bsv-low #567: a future raced against a timer, KEPT when the timer wins (never dropped, unlike
 /// `owed_with_deadline_on`): `Done` with its output, or `Pending` with the future, polled once already, for the caller
 /// to hand on (`wait_until`).
+#[allow(dead_code)]
 pub(crate) enum OwedInlineRace<F: core::future::Future> {
     Done(F::Output),
     Pending(core::pin::Pin<Box<F>>),
 }
 
 /// bsv-low #567: the race itself, over any timer (pinned with a virtual clock, `fix567_a`).
+#[allow(dead_code)]
 async fn owed_inline_race_on<F, T>(fut: F, timer: T) -> OwedInlineRace<F>
 where
     F: core::future::Future,
@@ -6063,15 +6064,6 @@ where
     }
 }
 
-/// bsv-low #567: `fut` raced against [`OWED_READ_INLINE_WAIT_MS`] of the worker's clock.
-async fn owed_inline_race<F: core::future::Future>(fut: F) -> OwedInlineRace<F> {
-    owed_inline_race_on(
-        fut,
-        worker::Delay::from(core::time::Duration::from_millis(OWED_READ_INLINE_WAIT_MS)),
-    )
-    .await
-}
-
 thread_local! {
     /// bsv-low #567: the claims a READ is waiting on (by claim token) and the first snapshot each one's walk landed.
     /// An entry exists only between the read's `owed_inline_expect` and its `owed_inline_take`, so a walk that lands
@@ -6080,6 +6072,7 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 /// bsv-low #567: a read will wait (bounded) for claim `token`'s first landed walk.
+#[allow(dead_code)]
 fn owed_inline_expect(token: i64) {
     OWED_INLINE_LANDED.with(|m| m.borrow_mut().insert(token, None));
 }
@@ -6096,11 +6089,13 @@ fn owed_inline_offer(token: i64, walked: &Option<std::result::Result<OwedCompute
     });
 }
 /// bsv-low #567: the read's answer from its own claim, and the expectation ended.
+#[allow(dead_code)]
 fn owed_inline_take(token: i64) -> Option<crate::owed::OwedSnapshot> {
     OWED_INLINE_LANDED.with(|m| m.borrow_mut().remove(&token).flatten())
 }
 /// PURE (bsv-low #567): what a refreshing read answers: its own landed walk's snapshot when it has one (fresh, at the
 /// present tip: never degraded), else the stored one it read (serve then refresh).
+#[allow(dead_code)]
 fn owed_read_answer(
     inline: Option<crate::owed::OwedSnapshot>,
     stored: crate::owed::OwedSnapshot,
@@ -6387,21 +6382,6 @@ pub(crate) fn owed_recompute_admit(identity_lc: &str, source: &str, sheddable: b
         );
     }
     run
-}
-/// Persist a timer on the existing actor binding: HTTP wait_until expires after 30 seconds, less than our window.
-/// Inspect, count and reserve a shed read with ONE clock sample and one borrow; the boundary cannot split them.
-fn owed_read_shed(identity_lc: &str, source: &str) -> Option<(i64, Option<i64>)> {
-    let now = worker::Date::now().as_millis() as i64;
-    let decision = OWED_RATE.with(|r| {
-        let mut rate = r.borrow_mut();
-        let retry = rate.retry_after_ms(identity_lc, now)?;
-        Some((retry, rate.arm_deferred(identity_lc, now)))
-    });
-    if decision.is_some() {
-        crate::owed::note_recompute_shed();
-        console_warn!("[owed] recompute ({source}) for {}… shed: {} recomputes inside {} ms already (refresh delayed)", &identity_lc[..12.min(identity_lc.len())], crate::owed::OWED_RECOMPUTES_PER_IDENTITY_PER_WINDOW, crate::owed::OWED_RECOMPUTE_RATE_WINDOW_MS);
-    }
-    decision
 }
 fn owed_deferred_deadline(identity_lc: &str) -> Option<i64> {
     OWED_RATE.with(|r| {
@@ -6873,6 +6853,7 @@ impl OwedAnnounceable for OwedComputed {
 /// `stale = 0`; the read on this isolate then still refreshes while the ask waits (the next walk takes the entry as it
 /// starts). Another isolate's read sees only the D1 mark: there the folded evidence waits for the open-row age (5 min)
 /// or the next trigger, as before.
+#[allow(dead_code)]
 fn owed_folded_waiting(identity_lc: &str) -> bool {
     OWED_RERUN.with(|m| m.borrow().contains_key(identity_lc))
 }
@@ -6965,393 +6946,36 @@ pub(crate) async fn owed_compute_on_read(
     }
 }
 
-/// First reads and the alarm share the SAME durable claim, so neither can buy a fourteenth walk.
-async fn owed_first_read_reserved(
-    env: &worker::Env,
-    db: &worker::D1Database,
-    identity: &str,
-) -> std::result::Result<crate::owed::OwedSnapshot, Result<Response>> {
-    let end = OWED_RATE
-        .with(|r| r.borrow().window_end(identity))
-        .unwrap_or(0);
-    if end <= worker::Date::now().as_millis() as i64 {
-        // The clock crossed the window during admission. This is now an ordinary next-window walk.
-        if owed_recompute_admit(identity, "read-first", false) {
-            return owed_compute_on_read(env, db, identity, "read-first", None).await;
-        }
-    }
-    let result = async {
-        let ns = env.durable_object("BOARD_VIEW")?;
-        let name = OWED_ISOLATE.with(|isolate| format!("owed-deferred:{isolate}:{identity}"));
-        let stub = ns.id_from_name(&name)?.get_stub()?;
-        let mut response = stub
-            .fetch_with_str(&format!(
-                "https://board-view/owed-deferred?identity={identity}&due={end}&read=1"
-            ))
-            .await?;
-        if response.status_code() != 200 {
-            return Err(worker::Error::RustError(response.text().await?));
-        }
-        response.json::<crate::owed::OwedSnapshot>().await
-    }
-    .await;
-    result.map_err(|e| {
-        console_warn!("[owed] reserved first read failed: {e}");
-        json_error("the owed list could not be computed", 503)
-    })
-}
-
-/// `GET /owed?identity=` — the owed list, served from `owed_rows`; computed on the first read of an identity and
-/// on a stale one (the marker's `stale`, or the tip reaching an in-progress row's recovery height since the
-/// compute). A first read that cannot compute is a 503, never "nothing owed".
+/// `GET /owed?identity=` serves the write-derived rows and their current words.
 pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let identity = match view_identity(&req, &ctx) {
         ViewIdentity::Identity(id) => id.to_ascii_lowercase(),
         ViewIdentity::Refuse(resp) => return resp,
     };
-    let now_ms = worker::Date::now().as_millis() as i64;
-    let mut refresh_retry = None;
     if !crate::logic::valid_identity(&identity) {
-        return json_response(
-            crate::owed::owed_body(&identity, None, &[], now_ms, false, None),
-            200,
-        );
+        let body = crate::owed_read::Snapshot::default()
+            .body(&identity, None, &Default::default())
+            .map_err(worker::Error::RustError)?;
+        return json_response(body.to_string(), 200);
     }
-    let db = match ctx.env.d1("OVERLAY_DB") {
-        Ok(db) => db,
-        Err(e) => {
-            console_warn!("[owed] OVERLAY_DB binding unavailable: {e}");
-            return json_error("database unavailable", 503);
-        }
-    };
-    let state: Option<OwedStateD1> = match db
-        .prepare(crate::owed::OWED_STATE_READ_SQL)
-        .bind(&[JsValue::from_str(&identity)])
-    {
-        Ok(stmt) => match stmt.counted_first::<OwedStateD1>().await {
-            Ok(v) => v,
-            Err(e) => {
-                console_warn!("[owed] state read failed: {e}");
-                return json_error("database query failed", 503);
-            }
-        },
-        Err(e) => {
-            console_warn!("[owed] state bind failed: {e}");
+    let db = D1Sql::of(&ctx.env)?;
+    let snapshot = match crate::owed_read::read(&db, &identity).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            console_warn!("[owed] stored read failed: {error}");
             return json_error("database query failed", 503);
         }
     };
-    let progress = state
-        .as_ref()
-        .and_then(|s| s.markerless_progress.as_deref())
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
-    // bsv-low #669: the read-side freshness gate for a hop-stranded sweep. `present_tip_for_degrade` is the present
-    // tip this request read (the 30-s isolate cache); `snapshot_tip_for_degrade` is the TRUE tip the served
-    // snapshot's chain probe was taken at (the stored `owed_state.tip`, possibly None) — the gate's snapshot tip,
-    // MEDIUM-1 (the FIX-669 lens): it is carried end to end separately from the body's display `tip`
-    // (`owed_served_tips`), so a NULL stored tip reaches the gate as None (fail-safe) instead of collapsing to the
-    // present tip and reading tip-current. `served_snapshot_is_fresh` is set when the rows were (re)computed at the
-    // present tip this request, so the degrade (applied once, after the match) skips a just-computed snapshot.
-    let mut present_tip_for_degrade: Option<u64> = None;
-    let mut snapshot_tip_for_degrade: Option<u64> = None;
-    let mut served_snapshot_is_fresh = false;
-    let (rows, tip, computed_at_ms, walk_cut, recompute_seq) = match state {
-        None => {
-            // a first read computes the snapshot at the present tip: it is fresh, never degraded.
-            served_snapshot_is_fresh = true;
-            // MEDIUM-5: a public read must not WRITE state keyed on a claimable name — an identity with no party row
-            // and no hop row has nothing to derive: an empty body, nothing computed, nothing written.
-            #[derive(Deserialize)]
-            struct PresentD1 {
-                #[allow(dead_code)]
-                present: Option<f64>,
-            }
-            let known = match db
-                .prepare(crate::owed::OWED_IDENTITY_PROBE_SQL)
-                .bind(&[JsValue::from_str(&identity)])
-            {
-                Ok(stmt) => match stmt.counted_first::<PresentD1>().await {
-                    Ok(v) => v.is_some(),
-                    Err(e) => {
-                        console_warn!("[owed] identity probe failed: {e}");
-                        return json_error("database query failed", 503);
-                    }
-                },
-                Err(e) => {
-                    console_warn!("[owed] identity probe bind failed: {e}");
-                    return json_error("database query failed", 503);
-                }
-            };
-            if !known {
-                return json_response(
-                    crate::owed::owed_body(&identity, None, &[], now_ms, false, None),
-                    200,
-                );
-            }
-            // No snapshot: spend the shared durable reservation once if ordinary admissions are exhausted.
-            if owed_recompute_admit(&identity, "read-first", false) {
-                match owed_compute_on_read(&ctx.env, &db, &identity, "read-first", None).await {
-                    Ok(v) => v,
-                    Err(resp) => return resp,
-                }
-            } else {
-                match owed_first_read_reserved(&ctx.env, &db, &identity).await {
-                    Ok(v) => v,
-                    Err(resp) => return resp,
-                }
-            }
-        }
-        Some(st) => {
-            let stored_seq = st.recompute_seq.map(|q| q as i64);
-            let rows: Vec<crate::owed::OwedRow> = match db
-                .prepare(crate::owed::OWED_ROWS_READ_SQL)
-                .bind(&[JsValue::from_str(&identity)])
-            {
-                Ok(stmt) => match stmt
-                    .counted_all()
-                    .await
-                    .and_then(|r| r.results::<OwedRowD1>())
-                {
-                    Ok(rows) => rows.into_iter().filter_map(OwedRowD1::into_row).collect(),
-                    Err(e) => {
-                        console_warn!("[owed] rows read failed: {e}");
-                        return json_error("database query failed", 503);
-                    }
-                },
-                Err(e) => {
-                    console_warn!("[owed] rows bind failed: {e}");
-                    return json_error("database query failed", 503);
-                }
-            };
-            // The read's rule (N5, `should_recompute`): the marker's stale flag; the tip reaching an in-progress
-            // row's recovery height since the compute; an OPEN list older than 5 minutes; any list older than 15.
-            // N7: the tip is read only when a row could flip on it (or a recompute is about to need it).
-            // the FIX-800 lens's LOW-1: an ask folded on this isolate and still waiting reads as the mark
-            let stale = st.stale.unwrap_or(0.0) != 0.0 || owed_folded_waiting(&identity);
-            let prev_tip = st.tip.map(|t| t as u64);
-            let age_ms = now_ms.saturating_sub(st.computed_at_ms as i64);
-            // N7: the tip is read only when a row could flip on it. bsv-low #669: a claimable hop-stranded sweep
-            // flips on the tip too (a block re-probes the chain and may re-point the hop to spent-elsewhere), so it
-            // needs the tip exactly as the in-progress refund gate does.
-            let needs_tip = rows.iter().any(|r| {
-                r.family == crate::owed::OwedFamily::InProgress
-                    || (r.family == crate::owed::OwedFamily::HopStranded
-                        && r.facts["claimable"] == serde_json::Value::Bool(true))
-            });
-            // bsv-low #469/#669: the present tip is the 30-s isolate cache (`beef_guard::present_tip`): at most one
-            // chaintracks call per 30 s per isolate, self-healed from CHAINTRACKS, never a per-request uncached read.
-            // DELIBERATE (the FIX-669 lens's NOTE-4): #669 routed the #469 in-progress REFUND gate through this cache
-            // too (it was the uncached `chaintracks_present_height` before). The cached tip is always <= the real tip
-            // (`latch_present_tip` holds `height.max(held)`, and the cold/expired self-heal fetches the real height),
-            // so the refund gate can only open up to ~30 s LATE, never early — fail-safe (a refund is never shown
-            // claimable before its recovery height). Do not revert this to the uncached read to shave that window.
-            let mut tip_now: Option<u64> = if needs_tip {
-                crate::beef_guard::present_tip(&ctx.env).await
-            } else {
-                None
-            };
-            present_tip_for_degrade = tip_now;
-            // bsv-low #669 MEDIUM-1: the body's display tip (`served_tip = prev_tip.or(tip_now)`, unchanged) and the
-            // freshness gate's snapshot tip (`snapshot_tip_for_degrade = prev_tip`, possibly None) are decoupled, so a
-            // NULL stored tip degrades fail-safe instead of reading tip-current. Computed before the recompute branch
-            // (`tip_now` is not reassigned on the serve-stored arms that reach the gate).
-            let (served_tip, gate_tip) = crate::owed::owed_served_tips(prev_tip, tip_now);
-            snapshot_tip_for_degrade = gate_tip;
-            let cut = st.truncated.unwrap_or(0.0) != 0.0;
-            if crate::owed::should_recompute(stale, age_ms, prev_tip, tip_now, &rows) {
-                let source: &'static str = if stale { "read-stale" } else { "read-aged" };
-                if crate::owed::spender_rejudge_only(stale, age_ms, prev_tip, tip_now, &rows) {
-                    crate::owed::note_spender_rejudge();
-                }
-                match ctx.data.wait.clone() {
-                    // SERVE THEN REFRESH (the stranded cell's run 3, 2026-09-19): the rows in hand answer NOW; the
-                    // recompute (the walks, the chain rung's couriers, the spenders' bytes) runs after the answer
-                    // and tells the page with `owed-changed`. A read must never wait on a courier: the page's read
-                    // is bounded (8 s) and a pass that outlives it leaves the page with "could not load" and the
-                    // door with a refused fallback. One refresh per identity per isolate at a time.
-                    Some(wait) => {
-                        let mut inline: Option<crate::owed::OwedSnapshot> = None;
-                        if let Some((retry, deferred)) = owed_read_shed(&identity, source) {
-                            refresh_retry = Some(retry);
-                            let env = ctx.env.clone();
-                            let id = identity.clone();
-                            wait.wait_until(async move {
-                                if let Ok(db) = env.d1("OVERLAY_DB") {
-                                    owed_shed_remark(&db, &id).await;
-                                    owed_schedule_deferred(&env, &id, deferred).await;
-                                }
-                            });
-                        } else {
-                            let claim = owed_refresh_begin(
-                                &identity,
-                                worker::Date::now().as_millis() as i64,
-                            );
-                            crate::owed::note_read_refresh(claim.is_some());
-                            match claim {
-                                Some(token) => {
-                                    // bsv-low #800: the refresh's `wait_until` starts as this answer leaves
-                                    let invocation_end = crate::owed::owed_invocation_end(
-                                        worker::Date::now().as_millis() as i64,
-                                    );
-                                    // Reserve before the answer: another ask cannot shed this read's accepted refresh later.
-                                    let admitted = owed_recompute_admit(&identity, source, true);
-                                    let env = ctx.env.clone();
-                                    let id = identity.clone();
-                                    let src = source.to_string();
-                                    if admitted {
-                                        // bsv-low #567: the read waits for its own walk, bounded
-                                        // (`OWED_READ_INLINE_WAIT_MS`); a walk that lands inside it is the
-                                        // answer, one that does not runs on in the `wait_until` as before
-                                        owed_inline_expect(token);
-                                        let refresh = async move {
-                                            if let Ok(db) = env.d1("OVERLAY_DB") {
-                                                owed_recompute_claimed(
-                                                    &env,
-                                                    &db,
-                                                    &id,
-                                                    &src,
-                                                    None,
-                                                    token,
-                                                    true,
-                                                    invocation_end,
-                                                )
-                                                .await;
-                                            } else {
-                                                owed_refresh_end(&id, token);
-                                            }
-                                        };
-                                        if let OwedInlineRace::Pending(rest) =
-                                            owed_inline_race(refresh).await
-                                        {
-                                            wait.wait_until(rest);
-                                        }
-                                        inline = owed_inline_take(token);
-                                    } else {
-                                        owed_refresh_end(&identity, token);
-                                        refresh_retry = Some(
-                                            OWED_RATE
-                                                .with(|r| {
-                                                    r.borrow().retry_after_ms(
-                                                        &identity,
-                                                        worker::Date::now().as_millis() as i64,
-                                                    )
-                                                })
-                                                .unwrap_or(0),
-                                        );
-                                        let deferred = owed_deferred_deadline(&identity);
-                                        wait.wait_until(async move {
-                                            if let Ok(db) = env.d1("OVERLAY_DB") {
-                                                owed_shed_remark(&db, &id).await;
-                                                owed_schedule_deferred(&env, &id, deferred).await;
-                                            }
-                                        });
-                                    }
-                                }
-                                None => {
-                                    // the delta-verify's LOW-B: a stale read that cannot kick is REMEMBERED — the holder of
-                                    // the lock runs it once more (a filing that marked stale during an in-flight walk)
-                                    OWED_RERUN.with(|m| {
-                                        crate::owed::owed_rerun_note(
-                                            &mut m.borrow_mut(),
-                                            &identity,
-                                            source,
-                                        )
-                                    });
-                                    crate::owed::note_recompute_coalesced();
-                                }
-                            }
-                        }
-                        // bsv-low #567: the read's own walk landed inside its wait: the fresh rows answer
-                        let (answer, fresh) = owed_read_answer(
-                            inline,
-                            (rows, served_tip, st.computed_at_ms as i64, cut, stored_seq),
-                        );
-                        served_snapshot_is_fresh |= fresh;
-                        answer
-                    }
-                    // no fetch context (a test harness): the inline compute, as before
-                    None => {
-                        if tip_now.is_none() {
-                            tip_now = chaintracks_present_height(&ctx, "owed").await.ok();
-                        }
-                        // N4: whichever arm asked for it, a compute that faults leaves the rows in hand standing;
-                        // bsv-low #499: so does one the identity's ceiling sheds
-                        if !owed_recompute_admit(&identity, source, true) {
-                            refresh_retry = Some(
-                                OWED_RATE
-                                    .with(|r| {
-                                        r.borrow().retry_after_ms(
-                                            &identity,
-                                            worker::Date::now().as_millis() as i64,
-                                        )
-                                    })
-                                    .unwrap_or(0),
-                            );
-                            let deferred = owed_deferred_deadline(&identity);
-                            owed_shed_remark(&db, &identity).await;
-                            owed_schedule_deferred(&ctx.env, &identity, deferred).await;
-                            (rows, prev_tip, st.computed_at_ms as i64, cut, stored_seq)
-                        } else {
-                            match owed_compute_on_read(&ctx.env, &db, &identity, source, tip_now)
-                                .await
-                            {
-                                Ok(v) => {
-                                    // recomputed at the present tip: the snapshot is fresh, never degraded.
-                                    served_snapshot_is_fresh = true;
-                                    v
-                                }
-                                Err(_) => (
-                                    crate::owed::markerless_faulted_rows(rows),
-                                    prev_tip,
-                                    st.computed_at_ms as i64,
-                                    true,
-                                    stored_seq,
-                                ),
-                            }
-                        }
-                    }
-                }
-            } else {
-                (rows, served_tip, st.computed_at_ms as i64, cut, stored_seq)
-            }
-        }
+    let tip = if snapshot.needs_tip() {
+        crate::beef_guard::present_tip(&ctx.env).await
+    } else {
+        None
     };
-    let truncated = walk_cut || rows.len() > crate::owed::OWED_MAX_ROWS;
-    let mut served: Vec<crate::owed::OwedRow> =
-        rows.into_iter().take(crate::owed::OWED_MAX_ROWS).collect();
-    // bsv-low #669: the ONE place the freshness rule lives. A STORED snapshot's hop-stranded sweep claim rests on a
-    // chain probe taken at `snapshot_tip_for_degrade` (the TRUE stored `owed_state.tip`, possibly None — NOT the
-    // body's display `tip`, MEDIUM-1); if the chain has moved on since (or the present/snapshot tip cannot be read),
-    // the served row degrades to a `pending` chain-wait — never a dead sweep. A fresh compute is tip-current, skipped.
-    if !served_snapshot_is_fresh {
-        crate::owed::degrade_stale_sweeps(
-            &mut served,
-            snapshot_tip_for_degrade,
-            present_tip_for_degrade,
-        );
-    }
-    // bsv-low #861: a SHED read serves the stored rows unjudged, so no stored press is offered on it
-    crate::owed::demote_shed_presses(&mut served, refresh_retry, served_snapshot_is_fresh);
-    let mut body: serde_json::Value = serde_json::from_str(&crate::owed::owed_body(
-        &identity,
-        tip,
-        &served,
-        computed_at_ms,
-        truncated,
-        recompute_seq,
-    ))
-    .map_err(|e| worker::Error::RustError(e.to_string()))?;
-    crate::owed::mark_shed_refresh(&mut body, refresh_retry);
-    crate::owed::mark_shed_rows_refresh(&mut body);
-    let progress = served.iter().find(|r| r.facts.get("markerlessCandidates").is_some()).map(|r| serde_json::json!({"candidates": r.facts["markerlessCandidates"], "examined": r.facts["markerlessExamined"], "cursor": r.facts["markerlessCursor"]})).or(progress);
-    if let Some(progress) = progress {
-        body["markerlessProgress"] = progress;
-    }
-    if truncated {
-        body["judgement"] = serde_json::json!(
-            "could not judge the complete list this pass: bounded or faulted evidence read"
-        );
-    }
-    crate::tracker_host::runtime::owed_body(&ctx.env, &mut body).await;
+    let stored_words = snapshot.word_rows().map_err(worker::Error::RustError)?;
+    let words = crate::tracker_host::runtime::views(&ctx.env, &stored_words).await;
+    let body = snapshot
+        .body(&identity, tip, &words)
+        .map_err(worker::Error::RustError)?;
     json_response(body.to_string(), 200)
 }
 
@@ -10070,7 +9694,9 @@ pub async fn sweep_owed_spender_bytes(env: &worker::Env) {
     crate::owed::note_spender_store_sweep_pass();
 }
 
-pub(crate) fn spender_outputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<crate::owed::SpenderOutput> {
+pub(crate) fn spender_outputs_of(
+    tx: &bsv_rs::transaction::Transaction,
+) -> Vec<crate::owed::SpenderOutput> {
     tx.outputs
         .iter()
         .enumerate()
@@ -11833,26 +11459,22 @@ mod tests {
         }
     }
 
-    /// bsv-low #567: the refreshing read's wiring, read off the route source: the admitted arm expects its claim,
-    /// races the claimed recompute (`owed_inline_race`), hands a walk still running to the `wait_until` (kept, never
-    /// dropped), takes its landed snapshot and answers through `owed_read_answer`; the claim offers each walk it ran.
-    /// Over the source alone, so it runs on 45b83a32: RED there at "the read expects its own claim".
+    /// The indexed read has no inline race or detached refresh. Legacy scheduled
+    /// walks still offer their snapshots to the retained walk machinery.
     #[test]
-    fn fix567_b_the_refreshing_read_waits_for_its_own_walk_bounded() {
-        let code: String = fix800_code().split_whitespace().collect();
-        let squash = |s: &str| s.split_whitespace().collect::<String>();
-        for (what, needle) in [
-            ("the read expects its own claim", "owed_inline_expect(token); let refresh = async move {"),
-            (
-                "the race, the rest handed on",
-                "if let OwedInlineRace::Pending(rest) = owed_inline_race(refresh).await { wait.wait_until(rest); } \
-                 inline = owed_inline_take(token);",
-            ),
-            ("the answer", "let (answer, fresh) = owed_read_answer( inline,"),
-            ("the claim offers its walk", "owed_inline_offer(token, &walked);"),
-        ] {
-            assert!(code.contains(&squash(needle)), "{what}: missing from the route");
-        }
+    fn fix567_b_the_indexed_read_never_waits_for_a_walk() {
+        let code = fix800_code();
+        let read = code
+            .split("pub async fn owed(req:")
+            .nth(1)
+            .unwrap()
+            .split("async fn gather_result_entries(")
+            .next()
+            .unwrap();
+        assert!(!read.contains("owed_inline_"));
+        assert!(!read.contains("wait_until"));
+        assert!(read.contains("crate::owed_read::read"));
+        assert!(code.contains("owed_inline_offer(token, &walked);"));
     }
 
     /// Run a walk of `walk_ms` against a timer of `deadline_ms` through the SHIPPED race (`owed_with_deadline_on`),
@@ -12112,9 +11734,14 @@ mod tests {
             .expect("the walk takes the asks it serves");
         let walk = push_body.find("owed_walk_bounded(").expect("the walk");
         assert!(take < walk);
-        assert!(r.contains(&squash(
-            "let stale = st.stale.unwrap_or(0.0) != 0.0 || owed_folded_waiting(&identity);"
-        )));
+        let read = r
+            .split("pubasyncfnowed(req:")
+            .nth(1)
+            .unwrap()
+            .split("asyncfngather_result_entries(")
+            .next()
+            .unwrap();
+        assert!(!read.contains("owed_folded_waiting"));
         // the read's rule over the isolate's map
         let id = "02aa00000000000000000000000000000000000000000000000000000000fix800h";
         assert!(!super::owed_folded_waiting(id));

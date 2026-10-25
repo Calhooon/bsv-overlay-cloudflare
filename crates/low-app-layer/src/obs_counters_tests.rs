@@ -373,9 +373,7 @@ fn obs_566_recompute_seq_is_per_identity_and_rides_the_snapshot_row() {
     let routes = include_str!("routes.rs");
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     assert!(
-        squash(routes).contains(&squash(
-            "crate::owed::owed_body( &identity, tip, &served, computed_at_ms, truncated, recompute_seq, )"
-        )),
+        squash(routes).contains(&squash("snapshot.body(&identity, tip, &words)")),
         "the /owed answer serves the snapshot's recomputeSeq"
     );
 }
