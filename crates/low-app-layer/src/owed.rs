@@ -7271,7 +7271,7 @@ pub(crate) mod tests {
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         let routes = squash(include_str!("routes.rs"));
         // bsv-low #618: the arm's subjects' views (3b) are merged into the rest's, both before phase 2b
-        let views = "letmutspender_words=crate::tracker_host::runtime::views(env,&extra_rows).await;spender_words.extend(arm_views.unwrap_or_default());";
+        let views = "letmutspender_words=walk_views(env,&extra_rows).await;spender_words.extend(arm_views.unwrap_or_default());";
         let input = "lettracker=crate::owed::checked_tracker_mined(word_lookup_available.then_some(&spender_words),sp,);crate::owed::durable_spender_needs_proof(sp,&hops,&hop_chain,&hop_sweeps,tracker,)";
         let reask = "crate::owed::durable_reasks(candidates,room,&over_budget,";
         for wired in [views, input, reask] {
@@ -9095,7 +9095,7 @@ pub(crate) mod tests {
             .unwrap();
         let written = routes
             .find(&squash(
-                "let written = crate::d1_ledger::counted_batch(db, stmts)",
+                "let written = walk_counted_batch(db, stmts)",
             ))
             .unwrap();
         assert!(
@@ -9358,13 +9358,13 @@ pub(crate) mod tests {
     fn l2_fold_a_word_store_fault_keeps_the_legacy_pair() {
         let routes = include_str!("routes.rs");
         let body = &routes[routes
-            .find("let arm_rows = crate::tracker_host::runtime::read_soft(")
+            .find("let arm_rows = walk_read_soft(")
             .unwrap()..];
         let body = &body[..body.find("let mut results = Vec::new();").unwrap()];
         let compact: String = body.split_whitespace().collect();
         assert!(
             compact.contains(
-                "letarm_views=match&arm_rows{Some(rows)=>Some(crate::tracker_host::runtime::views(env,rows).await),None=>None,};"
+                "letarm_views=match&arm_rows{Some(rows)=>Some(walk_views(env,rows).await),None=>None,};"
             ),
             "a word-store fault must leave the arm's views None"
         );
