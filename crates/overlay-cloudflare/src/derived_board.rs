@@ -663,7 +663,7 @@ mod tests {
             .copied()
             .filter(|s| s.starts_with("CREATE TRIGGER IF NOT EXISTS owed_dirty_"))
             .collect();
-        assert_eq!(dirty.len(), 26);
+        assert_eq!(dirty.len(), 28);
         for sql in dirty {
             let file = crate::migration_emitter::part_body(&[sql]);
             assert_eq!(split_wrangler_454(&file), [sql], "{sql}");

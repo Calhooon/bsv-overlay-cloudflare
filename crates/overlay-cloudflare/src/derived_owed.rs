@@ -327,7 +327,14 @@ macro_rules! word_subjects {
             tx_parties!(),
             " UNION ALL SELECT hp.identity,hp.gameId FROM pot_records p CROSS JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=p.txid AND hp.hopVout=p.outputIndex WHERE p.txid=NEW.txid ",
             "UNION ALL SELECT hp.identity,hp.gameId FROM pot_records p INDEXED BY idx_pot_spending CROSS JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=p.txid AND hp.hopVout=p.outputIndex WHERE p.spendingTxid=NEW.txid ",
-            "UNION ALL SELECT hp.identity,hp.gameId FROM pot_records p CROSS JOIN hop_pot_links l INDEXED BY idx_hop_pot_links_pot ON l.potTxid=p.txid AND l.potVout=p.outputIndex CROSS JOIN hopparty_records hp ON hp.rowid=l.markerRowid WHERE p.txid=NEW.txid ",
+        )
+    };
+}
+
+macro_rules! word_link_subjects {
+    () => {
+        concat!(
+            "SELECT hp.identity,hp.gameId FROM pot_records p CROSS JOIN hop_pot_links l INDEXED BY idx_hop_pot_links_pot ON l.potTxid=p.txid AND l.potVout=p.outputIndex CROSS JOIN hopparty_records hp ON hp.rowid=l.markerRowid WHERE p.txid=NEW.txid ",
             "UNION ALL SELECT hp.identity,hp.gameId FROM pot_records p INDEXED BY idx_pot_spending CROSS JOIN hop_pot_links l INDEXED BY idx_hop_pot_links_pot ON l.potTxid=p.txid AND l.potVout=p.outputIndex CROSS JOIN hopparty_records hp ON hp.rowid=l.markerRowid WHERE p.spendingTxid=NEW.txid"
         )
     };
@@ -345,6 +352,20 @@ pub const WORD_UPDATE: &str = trigger!(
     update,
     "UPDATE OF word,height,proof_root,header_hash",
     mark!("word", "NEW.txid", "NEW.updated_at", word_subjects!())
+);
+/// The first word's linked hop subjects, split from the five direct arms for D1's compound limit.
+pub const WORD_LINK_INSERT: &str = trigger!(
+    "tx_words",
+    insert_links,
+    INSERT,
+    mark!("word", "NEW.txid", "NEW.updated_at", word_link_subjects!())
+);
+/// A changed word's linked hop subjects, in the same source transaction as the direct arms.
+pub const WORD_LINK_UPDATE: &str = trigger!(
+    "tx_words",
+    update_links,
+    "UPDATE OF word,height,proof_root,header_hash",
+    mark!("word", "NEW.txid", "NEW.updated_at", word_link_subjects!())
 );
 
 macro_rules! beef_subjects {

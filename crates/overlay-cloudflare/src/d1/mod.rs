@@ -619,8 +619,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// tables: no row is touched.
 /// 348 to 349 for bsv-low #620 (L4): `overlay_chain_events`, the overlay's own cursor row on chaintracks' typed
 /// chain-event feed (`chain_feed::CREATE`). Overlay-only: no other service reads it. Follows PR 151's 347 and 348.
-/// 349 to 391 for #893: owed query keys, word joins, released-hop evidence, belt cursors and dirty triggers.
-pub const OVERLAY_MIGRATION_COUNT: usize = 391;
+/// 349 to 395 for #893: owed query keys, word joins, released-hop evidence, belt cursors, dirty triggers
+/// (word subjects split for D1's compound limit) and the two game-bounded hydration indexes.
+pub const OVERLAY_MIGRATION_COUNT: usize = 395;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2319,7 +2320,11 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::derived_owed::GATE_INDEX,
     crate::derived_owed::BELT_INDEX,
     crate::derived_owed::ROW_DELETE,
-    // Fourteen source tables, one trigger per verb, including both branches of the refusal UPSERT.
+    // Fourteen source tables, including both branches of the refusal UPSERT.
+    // Local D1 (wrangler 4.148.0, Node 22.18.0) allows at most FIVE terms per compound SELECT;
+    // six and seven fail at CREATE TRIGGER. Treat production D1 as having the same SQLite limit
+    // until proven otherwise. tx_words uses five direct arms and two linked arms per verb,
+    // in separate triggers inside the source statement's transaction, each advancing generation.
     // #638: future trigger changes are DROP TRIGGER IF EXISTS + CREATE appended, never edits here.
     crate::derived_owed::POT_INSERT,
     crate::derived_owed::POT_UPDATE,
@@ -2347,6 +2352,11 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::derived_owed::REFUSAL_DELETE,
     crate::derived_owed::RELEASED_HOP_INSERT,
     crate::derived_owed::SPENDER_BYTES_INSERT,
+    crate::derived_owed::WORD_LINK_INSERT,
+    crate::derived_owed::WORD_LINK_UPDATE,
+    // #893: game-bounded hydration, appended as independent migrations to the unshipped block.
+    "CREATE INDEX IF NOT EXISTS idx_potparty_game_identity ON potparty_records(gameId,identity)",
+    "CREATE INDEX IF NOT EXISTS idx_evicted_party_identity_game ON potparty_records_evicted(identity,gameId,potTxid)",
 ];
 
 // =============================================================================
