@@ -1261,19 +1261,16 @@ pub fn beef_body(txid: &str, beef: &[u8]) -> String {
     json!({ "txid": txid, "beef": beef }).to_string()
 }
 
-/// Parse a rust-chaintracks `GET /getPresentHeight` response frame:
-/// `{"status":"success","value":<height>}` → the height. Anything else
-/// (error frame, missing/negative value) → `None`.
-pub fn parse_present_height(v: &serde_json::Value) -> Option<u64> {
-    if v.get("status")?.as_str()? != "success" {
-        return None;
-    }
-    v.get("value")?.as_u64()
-}
-
-/// Assemble the `/tip` wire body: `{"height":<n>}`.
-pub fn tip_body(height: u64) -> String {
-    json!({ "height": height }).to_string()
+/// The verified header snapshot on `/tip`; absent facts stay null on a 503.
+/// The age uses the header's timestamp, never the time it was fetched.
+pub fn tip_body(tip: Option<&crate::tracker_host::VerifiedTip>, now_ms: u64) -> serde_json::Value {
+    json!({
+        "height": tip.map(|t| t.height),
+        "hash": tip.map(|t| t.hash.as_str()),
+        "at": tip.map(|t| t.at),
+        "ageMs": tip.map(|t| now_ms.saturating_sub(t.at)),
+        "source": "verified-header",
+    })
 }
 
 /// Assemble the `/health` wire body.
@@ -3687,27 +3684,6 @@ mod tests {
         assert_eq!(v["beef"], serde_json::json!([0, 1, 255]));
     }
 
-    // ── tip ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn present_height_parse() {
-        // rust-chaintracks success frame → the height.
-        let ok = serde_json::json!({"status": "success", "value": 812_345});
-        assert_eq!(parse_present_height(&ok), Some(812_345));
-        // Error frame / missing value / wrong types → None.
-        let err = serde_json::json!({"status": "error", "code": "ERR"});
-        assert_eq!(parse_present_height(&err), None);
-        assert_eq!(
-            parse_present_height(&serde_json::json!({"status": "success"})),
-            None
-        );
-        assert_eq!(parse_present_height(&serde_json::json!({})), None);
-        assert_eq!(
-            parse_present_height(&serde_json::json!({"status": "success", "value": -1})),
-            None
-        );
-    }
-
     // ── /pots-view ─────────────────────────────────────────────────────
 
     /// A minimal real tx (1 input, 1 output) + its BEEF bytes + txid, built
@@ -3953,8 +3929,17 @@ mod tests {
 
     #[test]
     fn tip_and_health_bodies() {
-        let v: serde_json::Value = serde_json::from_str(&tip_body(812_345)).unwrap();
+        let tip = crate::tracker_host::VerifiedTip {
+            height: 812_345,
+            hash: "01".repeat(32),
+            at: 123_000,
+        };
+        let v = tip_body(Some(&tip), 124_001);
         assert_eq!(v["height"], 812_345);
+        assert_eq!(v["hash"], tip.hash);
+        assert_eq!(v["at"], tip.at);
+        assert_eq!(v["ageMs"], 1_001);
+        assert_eq!(v["source"], "verified-header");
         let h: serde_json::Value = serde_json::from_str(&health_body()).unwrap();
         assert_eq!(h["ok"], true);
         assert_eq!(h["service"], "low-app-layer");

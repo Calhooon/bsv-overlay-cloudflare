@@ -111,7 +111,7 @@
 //!   corroboration; provider faults are an honest `known:false`). Short
 //!   in-isolate cache; same row shape as `/utxo-status`.
 //! - `GET /beef/:txid` — the admitted BEEF bytes from `transactions`.
-//! - `GET /tip` — present chain height via the CHAINTRACKS service binding.
+//! - `GET /tip`: verified header height, hash, timestamp and age via CHAINTRACKS; unavailable or stale is 503.
 //! - `GET /health` — liveness.
 //! - `GET /identities?ik=`, `GET /identity/:ik`, `GET /identity/verify/:ik`,
 //!   `GET /identity/pic/:imageHash`, `POST /internal/identity/kill`: the
