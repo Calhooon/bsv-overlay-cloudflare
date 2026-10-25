@@ -647,10 +647,10 @@ fn e620_f_the_rows_compare_and_set_under_real_sqlite() {
     for sql in crate::d1::OVERLAY_MIGRATIONS {
         conn.execute_batch(sql).unwrap();
     }
-    assert_eq!(crate::d1::OVERLAY_MIGRATIONS.last(), Some(&CREATE));
+    // Later additive migrations follow this table; its shipped position stays fixed.
     assert_eq!(
-        crate::d1::OVERLAY_MIGRATIONS[348],
-        CREATE,
+        crate::d1::OVERLAY_MIGRATIONS.get(348),
+        Some(&CREATE),
         "the feed's table is migration 349, after PR 151's 347 and 348"
     );
     assert_eq!(

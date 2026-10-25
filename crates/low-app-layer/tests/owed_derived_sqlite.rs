@@ -41,6 +41,62 @@ fn schema() -> Connection {
     db
 }
 
+fn fingerprint(list: &[&str]) -> u32 {
+    list.iter().fold(0u32, |total, sql| {
+        total.wrapping_add(sql.as_bytes().iter().fold(0x811c_9dc5u32, |hash, byte| {
+            (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+        }))
+    })
+}
+
+#[test]
+fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
+    assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..349]), 428_073_086);
+    assert_eq!(OVERLAY_MIGRATIONS.len(), 391);
+    assert_eq!(d1::OVERLAY_MIGRATION_COUNT, 391);
+    const FINGERPRINT: u32 = 3_134_139_822;
+    assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT);
+    assert_eq!(fingerprint(OVERLAY_MIGRATIONS), FINGERPRINT);
+    for missing in 349..OVERLAY_MIGRATIONS.len() {
+        let mut without = OVERLAY_MIGRATIONS.to_vec();
+        without.remove(missing);
+        assert_ne!(
+            fingerprint(&without),
+            FINGERPRINT,
+            "missing migration {} must not certify",
+            missing + 1
+        );
+    }
+    assert!(d1::migration_count_matches(391.0));
+    assert!(!d1::migration_count_matches(349.0));
+    assert!(!d1::migration_count_matches(393.0));
+    assert_eq!(bsv_overlay_cloudflare::derived_owed::OWED_MAX_ROWS, 500);
+    assert_eq!(
+        bsv_overlay_cloudflare::derived_owed::OWED_MAX_ROWS,
+        low_app_layer::owed::OWED_MAX_ROWS
+    );
+    let db = schema();
+    db.execute(
+        d1::MIGRATION_CERTIFY_SQL,
+        rusqlite::params![391, FINGERPRINT],
+    )
+    .unwrap();
+    for (name, expected) in [
+        ("overlay_migration_count", 391.0),
+        ("overlay_migration_fp", f64::from(FINGERPRINT)),
+    ] {
+        assert_eq!(
+            db.query_row(
+                "SELECT value FROM ops_counters WHERE name=?1",
+                [name],
+                |r| r.get::<_, f64>(0)
+            )
+            .unwrap(),
+            expected
+        );
+    }
+}
+
 #[test]
 fn owed893_schema_is_additive_replayable_and_keeps_the_old_walks_rows() {
     println!(
@@ -72,13 +128,10 @@ fn owed893_schema_is_additive_replayable_and_keeps_the_old_walks_rows() {
     )
     .unwrap();
     migrate(&db, OVERLAY_MIGRATIONS);
-    let old: (String, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>) = db.query_row(
+    let old: (String, [Option<i64>; 5]) = db.query_row(
         "SELECT facts, judgedAtMs, claimable, gateHeight, beltDueAtMs, probeTip FROM owed_rows WHERE identity='owner' AND outpoint='pot:0'", [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).unwrap();
-    assert_eq!(
-        old,
-        ("{\"claimable\":true}".into(), None, None, None, None, None)
-    );
+        |r| Ok((r.get(0)?, [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?]))).unwrap();
+    assert_eq!(old, ("{\"claimable\":true}".into(), [None; 5]));
     let backfill: i64 = db
         .query_row(
             "SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-v2'",
