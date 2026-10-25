@@ -2301,6 +2301,7 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::chain_feed::CREATE,
     // #893: additive owed write-time keys and tables. The app-layer judge owns their contents;
     // the backfill alone writes its owed-v2 stamp, never this migration list.
+    // This unshipped block is corrected in place for the generation rule (design section 3.7).
     // A shipped trigger is immutable: change it by appending DROP TRIGGER IF EXISTS + CREATE (#638).
     crate::derived_owed::JUDGED_AT_ALTER,
     crate::derived_owed::CLAIMABLE_ALTER,

@@ -20,8 +20,9 @@ pub const PROBE_TIP_ALTER: &str = "ALTER TABLE owed_rows ADD COLUMN probeTip INT
 
 /// Word roles (`settle`, `spender`, `funding`, `pay`) joined at the read and inverted at a word write.
 pub const ROW_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_row_words (identity TEXT, outpoint TEXT, role TEXT, txid TEXT, PRIMARY KEY (identity, outpoint, role))";
-/// Coalesced dirty subjects. SQLite rowid orders pending rows; repeat writes coalesce by the unique key.
-pub const DIRTY_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_dirty (identity TEXT NOT NULL, gameId TEXT NOT NULL, source TEXT NOT NULL, sourceKey TEXT NOT NULL, markedAtMs INTEGER NOT NULL, UNIQUE (identity, gameId, source, sourceKey))";
+/// Coalesced dirty subjects. Generation aliases an AUTOINCREMENT rowid that is never reused after a drain.
+/// A re-mark advances it, so a judge acknowledging `generation <= seen` leaves newer work pending.
+pub const DIRTY_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_dirty (generation INTEGER PRIMARY KEY AUTOINCREMENT, identity TEXT NOT NULL, gameId TEXT NOT NULL, source TEXT NOT NULL, sourceKey TEXT NOT NULL, markedAtMs INTEGER NOT NULL, UNIQUE (identity, gameId, source, sourceKey))";
 /// Evidence written beside an eviction's released spends, one identity per released hop.
 pub const RELEASED_HOP_EVIDENCE_CREATE: &str = "CREATE TABLE IF NOT EXISTS released_hop_evidence (hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, identity TEXT NOT NULL, gameId TEXT NOT NULL, potTxid TEXT NOT NULL, seatSettlePubkey TEXT NOT NULL, hopSats INTEGER NOT NULL, evictedAt INTEGER NOT NULL, PRIMARY KEY (hopTxid, hopVout, identity))";
 /// The belt's rotation cursor and the backfill's identity cursor, each under its own name.
@@ -50,6 +51,8 @@ pub const ROW_DELETE: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_delete_word
 // Keep every CASE preceded by whitespace, including after a comma, for wrangler 4.54's splitter.
 // A source UPSERT's DO UPDATE overrides a trigger's OR IGNORE with ABORT. The explicit conflict
 // clause below preserves coalescing there too, including a subject reached through several indexes.
+// SQLite assigns the attempted insert a fresh AUTOINCREMENT value before checking the unique key;
+// keep excluded.generation and the newest mark's fields so an in-flight judge cannot erase the re-mark.
 macro_rules! mark {
     ($source:literal, $key:expr, $at:expr, $subjects:expr) => {
         mark!($source, $key, $at, $subjects, " WHERE 1")
@@ -57,7 +60,7 @@ macro_rules! mark {
     ($source:literal, $key:expr, $at:expr, $subjects:expr, $guard:literal) => {
         concat!("INSERT OR IGNORE INTO owed_dirty (identity,gameId,source,sourceKey,markedAtMs) SELECT s.identity,s.gameId,'",
             $source, "',", $key, ",", $at, " FROM (", $subjects, ") s", $guard,
-            " ON CONFLICT(identity,gameId,source,sourceKey) DO NOTHING; ")
+            " ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,source=excluded.source,sourceKey=excluded.sourceKey,markedAtMs=excluded.markedAtMs; ")
     };
 }
 
