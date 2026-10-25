@@ -619,8 +619,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// tables: no row is touched.
 /// 348 to 349 for bsv-low #620 (L4): `overlay_chain_events`, the overlay's own cursor row on chaintracks' typed
 /// chain-event feed (`chain_feed::CREATE`). Overlay-only: no other service reads it. Follows PR 151's 347 and 348.
-/// 349 to 365 for #893: owed query keys, dirty subjects, word joins, released-hop evidence and belt cursors.
-pub const OVERLAY_MIGRATION_COUNT: usize = 365;
+/// 349 to 391 for #893: owed query keys, word joins, released-hop evidence, belt cursors and dirty triggers.
+pub const OVERLAY_MIGRATION_COUNT: usize = 391;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2318,6 +2318,34 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::derived_owed::GATE_INDEX,
     crate::derived_owed::BELT_INDEX,
     crate::derived_owed::ROW_DELETE,
+    // Fourteen source tables, one trigger per verb, including both branches of the refusal UPSERT.
+    // #638: future trigger changes are DROP TRIGGER IF EXISTS + CREATE appended, never edits here.
+    crate::derived_owed::POT_INSERT,
+    crate::derived_owed::POT_UPDATE,
+    crate::derived_owed::POT_DELETE,
+    crate::derived_owed::PARTY_INSERT,
+    crate::derived_owed::PARTY_UPDATE,
+    crate::derived_owed::PARTY_DELETE,
+    crate::derived_owed::HOP_INSERT,
+    crate::derived_owed::HOP_UPDATE,
+    crate::derived_owed::HOP_DELETE,
+    crate::derived_owed::REFUND_INSERT,
+    crate::derived_owed::REFUND_UPDATE,
+    crate::derived_owed::RESULT_INSERT,
+    crate::derived_owed::COLLECTED_INSERT,
+    crate::derived_owed::SWEEP_INSERT,
+    crate::derived_owed::EVICTION_INSERT,
+    crate::derived_owed::EVICTION_UPDATE,
+    crate::derived_owed::SEEN_INSERT,
+    crate::derived_owed::WORD_INSERT,
+    crate::derived_owed::WORD_UPDATE,
+    crate::derived_owed::BEEF_INSERT,
+    crate::derived_owed::BEEF_UPDATE,
+    crate::derived_owed::REFUSAL_INSERT,
+    crate::derived_owed::REFUSAL_UPDATE,
+    crate::derived_owed::REFUSAL_DELETE,
+    crate::derived_owed::RELEASED_HOP_INSERT,
+    crate::derived_owed::SPENDER_BYTES_INSERT,
 ];
 
 // =============================================================================
