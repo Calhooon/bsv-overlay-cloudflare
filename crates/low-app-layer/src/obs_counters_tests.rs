@@ -225,6 +225,7 @@ fn observability_counter_names() -> Vec<String> {
     names.extend(crate::identity::identity_mirrored_counter_names());
     names.extend(crate::tracker_host::runtime::tracker_mirrored_counter_names());
     names.extend(crate::owed_belt::counter_names());
+    names.extend(crate::owed_backfill::counter_names());
     names
 }
 

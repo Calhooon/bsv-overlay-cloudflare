@@ -151,6 +151,7 @@ pub mod lane_attest;
 pub mod live_view;
 pub mod logic;
 pub mod owed;
+pub mod owed_backfill;
 pub mod owed_belt;
 pub mod owed_cursor;
 pub mod owed_judge;
@@ -284,6 +285,10 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
                 tip,
                 routes::written_off_before_ms_env(&env_owed),
             )?;
+            // bsv-low #893 risk 8.2's third repair: the rows judged over a day ago re-marked, once a day each.
+            if let Err(error) = owed_backfill::mark_aged(&judge).await {
+                worker::console_warn!("[owed] age re-mark deferred: {error}");
+            }
             let report = owed_judge::drain_dirty(&judge, owed_judge::OWED_DIRTY_SUBJECTS_PER_PASS)
                 .await
                 .map_err(worker::Error::RustError)?;
@@ -309,6 +314,34 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
             worker::console_warn!("[owed-belt] watchdog arm failed: {error}");
         }
         pass_meter::end_task(&meter_owed, routes::D1Sql::of(&env_owed).ok().as_ref()).await;
+    });
+    // bsv-low #893 section 6.1: the one-time `owed-v2` backfill, its own task under its own 20 s wall (3 s for the
+    // cursor's save), handed after the tracker's: one indexed read once stamped, never a read path's work.
+    let env_backfill = env.clone();
+    let meter_backfill = meter.clone();
+    let backfill: pot_hook::Detached = Box::pin(async move {
+        match meter_backfill
+            .phase("owed.backfill", owed_backfill::run_env(&env_backfill))
+            .await
+        {
+            Ok(r) if r.identities > 0 || r.stop != owed_backfill::Stop::Stamped => {
+                worker::console_log!(
+                    "[owed-backfill] {:?}: {} identities, {} rows, {} batches, cursor {:?}",
+                    r.stop,
+                    r.identities,
+                    r.rows,
+                    r.batches,
+                    r.cursor
+                )
+            }
+            Ok(_) => {}
+            Err(error) => worker::console_warn!("[owed-backfill] deferred: {error}"),
+        }
+        pass_meter::end_task(
+            &meter_backfill,
+            routes::D1Sql::of(&env_backfill).ok().as_ref(),
+        )
+        .await;
     });
     let tracker: pot_hook::Detached = Box::pin(async move {
         meter
@@ -345,6 +378,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         pass_meter::end_task(&meter, routes::D1Sql::of(&env).ok().as_ref()).await;
     });
     pot_hook::schedule_tick(&|f| ctx.wait_until(f), drain, intake, tracker);
+    ctx.wait_until(backfill);
 }
 
 #[event(fetch)]
@@ -452,6 +486,10 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
     // bsv-low #893 section 5: the operator's (and the budget tier's) one belt tick on demand, bearer INTERNAL_TOKEN;
     // the same `owed_belt::tick` the alarm runs, under this request's D1 ledger.
+    // bsv-low #893 section 6.1: one backfill pass on demand (bearer `INTERNAL_TOKEN`), the scheduled task's function.
+    if req.method() == worker::Method::Post && req.path() == "/internal/owed-backfill-pass" {
+        return owed_backfill::lever(req, &env).await;
+    }
     if req.method() == worker::Method::Post && req.path() == "/internal/owed-belt-tick" {
         return owed_belt::lever(req, &env).await;
     }

@@ -26,8 +26,8 @@ pub const PASS_UPSERT_SQL: &str = "INSERT INTO applayer_scheduled_pass (id, at, 
      ON CONFLICT(id) DO UPDATE SET at = excluded.at, started_at = excluded.started_at, \
      wall_ms = excluded.wall_ms, phases = excluded.phases, passes = applayer_scheduled_pass.passes + 1";
 
-/// The four tasks of a scheduled pass: pot drain, chain-event intake, tracker, and owed drain.
-pub const SCHEDULED_TASKS: u32 = 4;
+/// The five tasks of a scheduled pass: pot drain, chain-event intake, tracker, owed drain and owed backfill.
+pub const SCHEDULED_TASKS: u32 = 5;
 
 /// One scheduled pass's clock: its start, each phase's wall, the tasks still running.
 pub struct PassMeter {
@@ -185,7 +185,8 @@ mod tests {
             Box::new(move || now.get())
         };
         let meter = PassMeter::new(clock, SCHEDULED_TASKS);
-        // The owed drain is the fourth independently bounded task.
+        // The owed drain and the owed backfill are the fourth and fifth independently bounded tasks.
+        end_task::<SqliteSql>(&meter, None).await;
         end_task::<SqliteSql>(&meter, None).await;
         let sql = SqliteSql::migrated();
         let step = |ms: u64| {
@@ -275,8 +276,8 @@ mod tests {
         }
         assert_eq!(
             sched.matches("pass_meter::end_task(").count(),
-            4,
-            "each of the four tasks ends through the meter"
+            5,
+            "each of the five tasks ends through the meter"
         );
     }
 }
