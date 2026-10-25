@@ -515,3 +515,10 @@ The ask, as the captain may file it on the keeper's repository:
 > (1 row read). (2) `chain_split_detect` recomputes the 400-deep rung ancestry on every rung poll (14,472 rows per
 > `UPDATE chain_split_signal`, 13.2 M a day on beta): bump `tick` only when a rung tip changed, or bound the walk to
 > the split depth window.
+
+
+## Owed filing at the write (D2-OWED-WRITERS-A)
+
+`owed-judge-filing` measures `record_post::file_verified` on local D1: a verified potrefund INSERT, its trigger marks, and both seats' derived rows commit in one batch. The fixture includes the shared fleet and the 250-result/270-hop history; setup is excluded from the request figures. Measured 2026-10-25T18:38:14Z with Rust 1.95.0, Node 22.18.0 and Wrangler 4.148.0: **118 reads, 36 writes, 59 statements, maxReads 7**. The ceiling is 177 reads, 38 writes, 61 statements and maxReads 11: a 1.5x read margin rounded up, plus two writes and two statements.
+
+The native export runs the production filing core and records every SQL batch, including preflight reads. Set `OWED_FILING_BUDGET_OUT` to a JSON path under `/Volumes/Lanes/out/bsv-low/` (or `$TMPDIR` when the volume is absent), then run `cargo +1.95.0 test --manifest-path workers/Cargo.toml -p low-app-layer --lib owed893_export_filing_budget -- --ignored` with a lane-private `CARGO_TARGET_DIR`. Run `node tools/lane-499/owed_judge_filing.mjs "$OWED_FILING_BUDGET_OUT"` with Node 22, `D1_BUDGET_WRANGLER_PACKAGE` pointing to the installed Wrangler package.json, and `D1_BUDGET_STATE` pointing to a fresh local D1 directory under the same output root. It loads the production schema and fixture, replays the captured batches, checks both owed rows, and holds D1's row accounting against `ceilings.json`. `D1_BUDGET_MEASURE=1` records a new measurement without applying the ceiling. Use fresh state for each run.

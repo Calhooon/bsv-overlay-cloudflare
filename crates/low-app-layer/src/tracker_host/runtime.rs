@@ -791,7 +791,17 @@ async fn event_held(
     }
     let mut row = stored::project(old.as_ref(), &state, now, legacy);
     mark_terminal(&mut row, old.as_ref(), terminal.get());
-    stored::write(env, &row).await?;
+    let tip = crate::routes::chaintracks_present_height_env(env, "owed")
+        .await
+        .ok();
+    let judge =
+        crate::owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))?;
+    let report = crate::owed_judge::judge_word_write(&judge, &row)
+        .await
+        .map_err(worker::Error::RustError)?;
+    for (_, error) in report.faults {
+        worker::console_warn!("[owed] word judgement deferred: {error}");
+    }
     Ok(row)
 }
 pub async fn ingest(

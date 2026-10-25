@@ -268,6 +268,38 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
             .await;
         pass_meter::end_task(&meter, routes::D1Sql::of(&env_intake).ok().as_ref()).await;
     });
+    let env_owed = env.clone();
+    let meter_owed = meter.clone();
+    ctx.wait_until(async move {
+        let deadline = routes::worker_deadline(20_000, 3_000);
+        let work = async {
+            schema::ensure_latch_columns(&env_owed).await;
+            let tip = routes::chaintracks_present_height_env(&env_owed, "owed")
+                .await
+                .ok();
+            let judge = owed_judge::D1Judge::new(
+                &env_owed,
+                tip,
+                routes::written_off_before_ms_env(&env_owed),
+            )?;
+            let report = owed_judge::drain_dirty(&judge, owed_judge::OWED_DIRTY_SUBJECTS_PER_PASS)
+                .await
+                .map_err(worker::Error::RustError)?;
+            for (_, error) in report.faults {
+                worker::console_warn!("[owed] scheduled judgement deferred: {error}");
+            }
+            Ok::<(), worker::Error>(())
+        };
+        match meter_owed
+            .phase("owed.drain", deadline.run_reserving(work))
+            .await
+        {
+            Some(Ok(())) => {}
+            Some(Err(error)) => worker::console_warn!("[owed] scheduled drain failed: {error}"),
+            None => worker::console_warn!("[owed] scheduled drain reached its wall"),
+        }
+        pass_meter::end_task(&meter_owed, routes::D1Sql::of(&env_owed).ok().as_ref()).await;
+    });
     let tracker: pot_hook::Detached = Box::pin(async move {
         meter
             .phase(

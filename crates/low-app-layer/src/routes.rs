@@ -3010,32 +3010,13 @@ pub(crate) async fn internal_pot_changed(
     if let Some(e) = &outcome.stale_fault {
         console_warn!("[pot-changed] write batch (stale marks and parks) failed: {e}");
     }
-    // bsv-low #469 (the gate's MEDIUM-11): the owed recompute runs AFTER this answer (`wait_until`), once per identity
-    // this call attributed, never inline and never per outpoint × identity; #648 sheds it per identity.
-    let owed_identities = outcome.owed_identities.clone();
-    if !owed_identities.is_empty() {
-        let env2 = env.clone();
-        ctx.wait_until(async move {
-            // bsv-low #800: the identities share ONE invocation's 30 s; each walk takes the slice left
-            let invocation_end =
-                crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64);
-            let Ok(db) = env2.d1("OVERLAY_DB") else {
-                return;
-            };
-            // N7: ONE tip read for every identity this call recomputes
-            let tip = chaintracks_present_height_env(&env2, "owed").await.ok();
-            for id in owed_identities {
-                owed_recompute_and_push_coalesced(
-                    &env2,
-                    &db,
-                    &id,
-                    "pot-changed",
-                    tip,
-                    invocation_end,
-                )
-                .await;
-            }
-        });
+    // The overlay source transaction already marked every affected game.
+    let tip = chaintracks_present_height_env(env, "owed").await.ok();
+    let judge = crate::owed_judge::D1Judge::new(env, tip, written_off_before_ms_env(env))?;
+    let keys: Vec<String> = outpoints.iter().flat_map(|(txid, vout)| [txid.clone(), format!("{txid}:{vout}")]).collect();
+    match crate::owed_judge::drain_changed(&judge, &outcome.owed_identities, &keys, "pot-changed").await {
+        Ok(report) => for (_, error) in report.faults { console_warn!("[owed] pot judgement deferred: {error}"); },
+        Err(error) => console_warn!("[owed] pot drain failed: {error}"),
     }
     let ms = worker::Date::now().as_millis().saturating_sub(t0);
     worker::console_log!(
@@ -3181,12 +3162,9 @@ impl crate::pot_hook::SqlPort for D1Sql {
     }
 }
 
-/// bsv-low #469 (2026-09-19) — `POST /internal/hop-changed` (bearer `INTERNAL_TOKEN`; the overlay's hop-marker
-/// admission through the `APP_LAYER` binding): `{"identities":[…]}` — every identity a just-admitted hop marker names
-/// has its owed rows marked STALE and re-derived after the answer (`wait_until`), the page told by `owed-changed`.
-/// The device-switch unit's hop branch read "nothing owed" for 90 s over a verified marker because only the cadence
-/// re-derived a hop-only identity; a hop funded IS a write the list is computed on. E649 L4: the stale marks are
-/// ONE batch (`pot_hook::apply_hop_changed`), the recompute stays after the answer.
+/// The overlay has committed the source write and its dirty marks before sending this note.
+/// Judge at most sixteen affected subjects before answering; remaining marks belong to the pass.
+/// Each committed judge batch sends its own owed-changed push.
 pub(crate) async fn internal_hop_changed(
     mut req: Request,
     env: &worker::Env,
@@ -3221,30 +3199,15 @@ pub(crate) async fn internal_hop_changed(
             .await;
         });
     }
-    let store = crate::pot_hook::HookD1 {
-        sql: D1Sql::of(env)?,
-    };
-    if let Err(e) = crate::pot_hook::apply_hop_changed(&store, &identities).await {
-        console_warn!("[owed] stale mark (hop-changed) failed: {e}");
+    let tip = chaintracks_present_height_env(env, "owed").await.ok();
+    let judge = crate::owed_judge::D1Judge::new(env, tip, written_off_before_ms_env(env))?;
+    match crate::owed_judge::drain_identities(&judge, &identities, "hop-changed").await {
+        Ok(report) => for (_, error) in report.faults { console_warn!("[owed] hop judgement deferred: {error}"); },
+        Err(error) => console_warn!("[owed] hop drain failed: {error}"),
     }
-    let env2 = env.clone();
-    let ids = identities.clone();
-    ctx.wait_until(async move {
-        // bsv-low #800: the identities share ONE invocation's 30 s; each walk takes the slice left
-        let invocation_end =
-            crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64);
-        let Ok(db) = env2.d1("OVERLAY_DB") else {
-            return;
-        };
-        let tip = chaintracks_present_height_env(&env2, "owed").await.ok();
-        for id in ids {
-            owed_recompute_and_push_coalesced(&env2, &db, &id, "hop-changed", tip, invocation_end)
-                .await;
-        }
-    });
     let ms = worker::Date::now().as_millis().saturating_sub(t0);
     worker::console_log!(
-        "[hop-changed] answered in {ms} ms, recompute detached ({} identities)",
+        "[hop-changed] answered in {ms} ms, bounded judgement ({} identities)",
         identities.len()
     );
     let mut resp = json_response(
@@ -6595,36 +6558,6 @@ pub(crate) fn owed_in_flight_snapshot(now_ms: i64) -> serde_json::Value {
         let oldest = m.values().map(|(_, progress)| now_ms.saturating_sub(*progress)).max();
         serde_json::json!({ "count": m.len(), "oldestAgeMs": oldest, "staleAfterMs": OWED_IN_FLIGHT_STALE_MS })
     })
-}
-
-/// The hooks' and the read path's ONE entry: recompute for an identity unless one is in flight on this isolate, in
-/// which case the ask is remembered and served by one more run after it (see `OWED_RERUN`).
-pub(crate) async fn owed_recompute_and_push_coalesced(
-    env: &worker::Env,
-    db: &worker::D1Database,
-    identity_lc: &str,
-    source: &str,
-    tip_hint: Option<u64>,
-    // bsv-low #800: when the invocation this runs in must be done (`owed::owed_invocation_end` of its start)
-    invocation_end_ms: i64,
-) {
-    let now_ms = worker::Date::now().as_millis() as i64;
-    let Some(token) = owed_refresh_begin(identity_lc, now_ms) else {
-        OWED_RERUN.with(|m| crate::owed::owed_rerun_note(&mut m.borrow_mut(), identity_lc, source));
-        crate::owed::note_recompute_coalesced();
-        return;
-    };
-    owed_recompute_claimed(
-        env,
-        db,
-        identity_lc,
-        source,
-        tip_hint,
-        token,
-        false,
-        invocation_end_ms,
-    )
-    .await;
 }
 
 /// The run behind a CLAIMED lock (`owed_refresh_begin` returned `Some(token)` to the caller, synchronously — the read path
@@ -11670,32 +11603,9 @@ mod tests {
             "let walked = owed_walk_bounded(env, db, identity_lc, source, tip_hint, &walk).await;"
         )));
         assert!(r.contains(&squash("crate::owed::note_recompute_lock_takeover(age);")));
-        assert_eq!(
-            r.matches(&squash("owed_recompute_and_push_coalesced("))
-                .count(),
-            3,
-            "the definition and the two hooks"
-        );
-        assert_eq!(
-            r.matches(&squash("\"pot-changed\", tip, invocation_end,"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            r.matches(&squash("\"hop-changed\", tip, invocation_end)"))
-                .count(),
-            1
-        );
-        let rp = squash(include_str!("record_post.rs"));
-        assert_eq!(
-            rp.matches(&squash("\"filing\", None, invocation_end,"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            rp.matches(&squash("\"filing\", None, crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64),")).count(),
-            1
-        );
+        assert!(!r.contains("owed_recompute_and_push_coalesced"));
+        assert!(r.contains("crate::owed_judge::drain_changed"));
+        assert!(r.contains("crate::owed_judge::drain_identities"));
     }
 
     // ── the FIX-800 lens fold (bsv-low #800): the deadline's derivation, the race, the alarm, the nudge ──

@@ -1,5 +1,4 @@
 //! Local D1 executes these exact native-pinned cursor pages and reports rows_read for each.
-use low_app_layer::owed;
 use low_app_layer::owed_cursor::{self, Source, PAGE};
 use rusqlite::{
     types::{Value, ValueRef},
@@ -260,8 +259,8 @@ pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
     }
     // bsv-low #643, #644, #645 (W1.6): the hot passes' reads on the fleet fixture, each under its own ceiling
     // (docs/D1-BUDGETS.md). The tip mark is its UPDATE's subquery at a block whose window holds no pot.
-    let tip_at = owed::OWED_STALE_ON_TIP_SQL.find("IN (SELECT").unwrap() + 4;
-    let tip_select = &owed::OWED_STALE_ON_TIP_SQL[tip_at..owed::OWED_STALE_ON_TIP_SQL.len() - 1];
+    let tip_sql = low_app_layer::owed_judge::MARK_TIP_SQL;
+    let tip_select = &tip_sql[tip_sql.find("SELECT identity").unwrap()..tip_sql.find(" ON CONFLICT").unwrap()];
     for (name, statement, binds, ceiling, unordered) in [
         (
             "#644 signers-backfill candidates",
@@ -280,7 +279,7 @@ pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
         (
             "#643 tip mark at a block reaching no pot",
             tip_select.to_string(),
-            vec![Value::Integer(958_900)],
+            vec![Value::Integer(958_900),Value::Integer(0)],
             TIP_MARK_READ_CEILING,
             false,
         ),

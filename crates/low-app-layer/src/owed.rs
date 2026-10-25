@@ -191,7 +191,7 @@ pub fn released_hop_outpoints(evictions: &[(String, Option<String>)]) -> HashSet
 }
 
 /// PURE (pinned): what a coalesced recompute ask leaves behind — the latest source, replacing an earlier one
-/// (`routes::owed_recompute_and_push_coalesced`).
+/// (`owed_judge::judge_with_write`).
 pub fn owed_rerun_note(map: &mut HashMap<String, String>, identity_lc: &str, source: &str) {
     map.insert(identity_lc.to_string(), source.to_string());
 }
@@ -4672,21 +4672,6 @@ pub fn superseded_read_snapshot(stored: Option<OwedSnapshot>, own: OwedSnapshot)
 
 pub const OWED_STATE_READ_SQL: &str = "SELECT s.identity, s.computedAtMs, s.tip, s.rows, s.stale, s.truncated, c.spendingTxid AS markerlessProgress, s.recomputeSeq FROM owed_state s LEFT JOIN hop_chain_probes c ON c.outpoint = 'homecursor:markerless:' || s.identity || '.0' WHERE s.identity = ?1";
 pub const OWED_ROWS_READ_SQL: &str = "SELECT identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason FROM owed_rows WHERE identity = ?1 ORDER BY CASE family WHEN 'payout' THEN 0 WHEN 'refund-due' THEN 1 WHEN 'hop-stranded' THEN 2 WHEN 'in-progress' THEN 3 ELSE 4 END, COALESCE(atHeight, 0) DESC, outpoint ASC LIMIT 501";
-/// HIGH-4: the tip flips the gate — every identity party to an UNSPENT pot whose recovery height the new tip has
-/// reached (a small band below it, so a missed block still lands) is marked STALE; its next read recomputes.
-pub const OWED_STALE_ON_TIP_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE identity IN (SELECT DISTINCT pp.identity FROM potparty_records pp JOIN pot_records p ON p.txid = pp.potTxid AND p.outputIndex = pp.potVout WHERE p.spent = 0 AND p.recoveryHeight IS NOT NULL AND p.recoveryHeight <= ?1 AND p.recoveryHeight >= ?1 - 6)";
-/// bsv-low #669: the twin of [`OWED_STALE_ON_TIP_SQL`] for HOP-STRANDED rows. A non-LOW competitor's confirming
-/// block fires no `pot-changed` / `hop-changed` / `/internal/tx-word` hook (LOW's door never saw the spend), so the
-/// #469 pot gate above never names a stranded-hop identity and the sweep claim stays frozen at the compute tip. This
-/// marks STALE exactly the identities that currently hold a LIVE claimable stranded-hop row (keyed on the derived
-/// row, itself keyed on the hop OUTPOINT — never a name): the next read / the #648 deferred alarm re-probes the chain
-/// at the new tip and re-points the hop to `spent-elsewhere` (or restores the claim if the hop is genuinely unspent).
-/// It takes NO bind (the set is the derived rows, not a height band), and marks nothing but claimable stranded hops.
-/// N (parity with the #469 twin's own notes): `family = 'hop-stranded'` is an exact match on the derived row's own
-/// column (no `lower()` scan); `json_extract(facts, '$.claimable') = 1` is the same read the markerless fault path
-/// already runs (`routes.rs` `markerlessEvidence`); the set is bounded by the rare stranded-hop case, never the
-/// population, and the per-identity recompute ceiling + the shed/deferred mechanism cap the fan-out on a storm.
-pub const OWED_STALE_ON_TIP_HOPS_SQL: &str = "UPDATE owed_state SET stale = 1 WHERE identity IN (SELECT DISTINCT identity FROM owed_rows WHERE family = 'hop-stranded' AND json_extract(facts, '$.claimable') = 1)";
 /// HIGH-4: a filing on a pot marks BOTH parties stale (the counterparty's valid refund makes MY pot claimable).
 /// The gate's MEDIUM-1 (2026-09-19): an outpoint the pot-changed hook cannot attribute through decoded params (an
 /// EVICTED pot's row is gone; a released HOP is a P2PKH row) is attributed through the seats' OWN markers — the
@@ -14942,29 +14927,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ns2_filing_runs_a_coalesced_walk_instead_of_amplifying_device_reads() {
-        let code = include_str!("record_post.rs");
-        let hook = &code[code.find("if !row_written {").unwrap()..];
-        assert!(
-            hook.contains("owed_recompute_and_push_coalesced"),
-            "a filing must walk once before announcing its snapshot"
-        );
-        assert!(
-            !hook.contains("owed_changed_event_body(id, \"filing\", 0"),
-            "no bare trigger to every device"
-        );
-        assert!(
-            !hook.contains("owed_identities_by_marker"),
-            "SHED-M1: stranger filing must run no victim walk or push"
-        );
-        assert!(
-            hook.contains("OWED_STALE_FOR_POT_SQL"),
-            "the victim stays stale for its own read"
-        );
-        assert!(
-            hook.contains("if let Some(id) = identity"),
-            "only the filer owns the filing refresh"
-        );
+    fn ns2_filing_judges_its_source_batch_before_the_push() {
+        let source = include_str!("record_post/owed_write.rs");
+        assert!(source.contains("judge::judge_with_write"));
+        assert!(source.contains("judge::refund_subjects"));
+        let door = include_str!("record_post.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(!door.contains("OWED_STALE_FOR_POT_SQL"));
+        assert!(!door.contains("owed_recompute_and_push_coalesced"));
     }
 
     #[test]

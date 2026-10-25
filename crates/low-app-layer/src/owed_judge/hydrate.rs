@@ -10,7 +10,7 @@ pub const LINKS_SQL: &str = "SELECT hp.identity,hp.opponentIdentity,hp.gameId,l.
 /// This is the same rank and oldest-marker rule as `owed_cursor::select`.
 pub const REPRESENTATIVES_SQL: &str = "SELECT pp.identity,pp.opponentIdentity,pp.gameId,pp.potTxid,pp.potVout,pp.recoveryHeight,pp.seatSettlePubkey,pp.seatSigHex,pp.sigHex,pp.createdAt,pp.txid,pp.outputIndex,pp.sigValid,pp.rowid AS markerRowid,r.createdAt AS potCreatedAt,r.txid IS NULL AS unknownPot FROM json_each(?2) k CROSS JOIN potparty_records pp INDEXED BY idx_potparty_pot ON pp.potTxid=json_extract(k.value,'$[0]') AND pp.potVout=json_extract(k.value,'$[1]') LEFT JOIN pot_records r ON r.txid=pp.potTxid AND r.outputIndex=pp.potVout WHERE pp.identity=?1 UNION ALL SELECT hp.identity,hp.opponentIdentity,hp.gameId,l.potTxid,l.potVout,p.recoveryHeight,hp.seatSettlePubkey,hp.seatSigHex,hp.identitySigHex AS sigHex,hp.createdAt,hp.txid,hp.outputIndex,hp.markerValid AS sigValid,hp.rowid AS markerRowid,p.createdAt AS potCreatedAt,0 AS unknownPot FROM json_each(?2) k CROSS JOIN hop_pot_links l INDEXED BY idx_hop_pot_links_pot ON l.potTxid=json_extract(k.value,'$[0]') AND l.potVout=json_extract(k.value,'$[1]') CROSS JOIN hopparty_records hp ON hp.rowid=l.markerRowid CROSS JOIN pot_records p ON p.txid=l.potTxid AND p.outputIndex=l.potVout WHERE l.identity=?1";
 pub const HOPS_SQL: &str = "SELECT hp.*,hp.txid AS hopTxid,hp.txid AS markerTxid,hp.outputIndex AS markerVout,hp.createdAt AS markerCreatedAt,hp.rowid AS markerRowid,r.createdAt AS potCreatedAt,r.txid IS NULL AS unknownHop,r.spent,r.spendingTxid,r.spentConfirmed,r.spenderFinal,CASE WHEN hp.hopLockHex IS NOT NULL AND hp.hopSatsOnChain=hp.hopSats THEN 0 ELSE 1 END AS paidTier FROM hopparty_records hp INDEXED BY idx_hopparty_game LEFT JOIN pot_records r ON r.txid=hp.txid AND r.outputIndex=hp.hopVout WHERE hp.identity=?1 AND hp.gameId IN (SELECT value FROM json_each(?2))";
-pub const RELEASED_SQL: &str = "SELECT e.*,r.spent,r.spendingTxid,r.spentConfirmed,r.spenderFinal,p.pubA,p.pubB,p.payPkhA,p.payPkhB FROM released_hop_evidence e INDEXED BY idx_released_hop_evidence_identity_game CROSS JOIN pot_evictions v ON v.txid=e.potTxid LEFT JOIN pot_records r ON r.txid=e.hopTxid AND r.outputIndex=e.hopVout LEFT JOIN pot_records_evicted p ON p.txid=e.potTxid AND p.lockKind='covenant' AND p.paramsDecoded=1 AND (p.pubA=e.seatSettlePubkey OR p.pubB=e.seatSettlePubkey) WHERE e.identity=?1 AND e.gameId IN (SELECT value FROM json_each(?2)) AND v.readmittedAt IS NULL";
+pub const RELEASED_SQL: &str = "SELECT h.* FROM released_hop_evidence h JOIN pot_evictions e ON e.txid = h.potTxid WHERE h.hopTxid = ?1 AND h.hopVout = ?2 AND e.readmittedAt IS NULL AND h.evictedAt = e.evictedAt";
 
 pub(super) async fn read<T: DeserializeOwned>(
     db: &impl SqlPort,
@@ -62,6 +62,18 @@ pub async fn hydrate_inputs(
     identity: &str,
     games: &[String],
 ) -> Result<JudgeInputs, String> {
+    hydrate_filings(db, identity, games, &[], &[], 0).await
+}
+
+/// Pending markers enter the existing projections before assembly, while their INSERTs remain uncommitted.
+pub(crate) async fn hydrate_filings(
+    db: &impl JudgeDb,
+    identity: &str,
+    games: &[String],
+    filings: &[crate::record_post::VerifiedRecord],
+    pending_hops: &[Value],
+    stamp: i64,
+) -> Result<JudgeInputs, String> {
     let mut i = JudgeInputs {
         identity: identity.into(),
         tip: db.tip(),
@@ -82,17 +94,33 @@ pub async fn hydrate_inputs(
     let bound = vec![Bind::Text(identity.into()), json_bind(&games)];
     let mut parties: Vec<Value> = read(db, PARTIES_SQL, bound.clone()).await?;
     parties.extend(read::<Value>(db, LINKS_SQL, bound.clone()).await?);
+    let mut pending_parties = Vec::new();
+    for filing in filings {
+        if let crate::record_post::VerifiedRecord::Potparty(r, valid) = filing {
+            if r.identity == identity && games.contains(&r.game_id) {
+                pending_parties.push(json!({"identity":r.identity,"opponentIdentity":r.opponent_identity,"gameId":r.game_id,"potTxid":r.pot_txid,"potVout":r.pot_vout,"recoveryHeight":r.recovery_height,"seatSettlePubkey":r.seat_settle_pubkey,"seatSigHex":r.seat_sig_hex,"sigHex":r.sig_hex,"createdAt":stamp,"markerRowid":i64::MAX,"txid":r.txid,"outputIndex":0,"sigValid":i64::from(*valid)}));
+            }
+        }
+    }
+    parties.extend(pending_parties.clone());
     let pots: BTreeSet<_> = parties
         .iter()
         .map(|p| (text(p, "potTxid"), num(p, "potVout") as u32))
         .collect();
     if !pots.is_empty() {
-        let representatives: Vec<Value> = read(
+        let mut representatives: Vec<Value> = read(
             db,
             REPRESENTATIVES_SQL,
             vec![Bind::Text(identity.into()), json_bind(&pots)],
         )
         .await?;
+        for mut pending in pending_parties {
+            if representatives.iter().any(|r| r["txid"] == pending["txid"] && r["outputIndex"] == pending["outputIndex"]) { continue; }
+            let pot: Vec<Value> = read(db,"SELECT createdAt FROM pot_records WHERE txid=?1 AND outputIndex=?2",vec![Bind::Text(text(&pending,"potTxid")),Bind::Int(num(&pending,"potVout") as i64)]).await?;
+            pending["unknownPot"] = json!(i64::from(pot.is_empty()));
+            pending["potCreatedAt"] = pot.first().map_or(Value::Null, |p| p["createdAt"].clone());
+            representatives.push(pending);
+        }
         parties = crate::owed_cursor::select(representatives, db.era_ms(), usize::MAX);
         // Keep a representative outside the requested games as bounded pot
         // context for JOIN retirement; judge_with_write emits only its subjects.
@@ -107,6 +135,9 @@ pub async fn hydrate_inputs(
         )
         .await?;
         for mut v in values {
+            if filings.iter().any(|f| matches!(f, crate::record_post::VerifiedRecord::Potrefund(r, _) if r.pot_txid == text(&v,"potTxid") && u64::from(r.pot_vout) == num(&v,"potVout"))) {
+                v["backupMarkerPresent"] = json!(1);
+            }
             if v["fundingHeld"] == owed::FUNDING_HELD_NONE {
                 i.funding_unheld.insert(text(&v, "potTxid"));
             }
@@ -126,7 +157,18 @@ pub async fn hydrate_inputs(
             );
         }
     }
-    let hop_candidates: Vec<Value> = read(db, HOPS_SQL, bound.clone()).await?;
+    let mut hop_candidates: Vec<Value> = read(db, HOPS_SQL, bound.clone()).await?;
+    for hop in pending_hops.iter().filter(|h| text(h,"identity") == identity && games.contains(&text(h,"gameId"))) {
+        if !hop_candidates.iter().any(|r| r["txid"] == hop["txid"] && r["outputIndex"] == hop["outputIndex"]) {
+            let mut hop = hop.clone();
+            let rows: Vec<Value> = read(db,"SELECT createdAt AS potCreatedAt,spent,spendingTxid,spentConfirmed,spenderFinal FROM pot_records WHERE txid=?1 AND outputIndex=?2",vec![Bind::Text(text(&hop,"hopTxid")),Bind::Int(num(&hop,"hopVout") as i64)]).await?;
+            hop["unknownHop"] = json!(i64::from(rows.is_empty()));
+            if let Some(row) = rows.first().and_then(Value::as_object) {
+                hop.as_object_mut().ok_or("pending hop is not an object")?.extend(row.clone());
+            }
+            hop_candidates.push(hop);
+        }
+    }
     let hop_candidates =
         crate::owed_cursor::select_hops(hop_candidates, db.era_ms(), i.now_ms / 1000);
     let mut hop_rows = Vec::new();
@@ -155,7 +197,7 @@ pub async fn hydrate_inputs(
         &mut hop_rows,
         &i.spender_words,
     );
-    i.results = assemble_results(db, identity, result_rows, games).await?;
+    i.results = assemble_results(db, identity, result_rows, games, filings, stamp).await?;
     i.refunds = crate::refund_view::assemble_refund_view(refund_rows, i.tip);
     // The view assembler's page limit belongs to reads, not a game's judgement.
     for chunk in hop_rows.chunks(crate::hops_view::HOPS_VIEW_MAX_OUTPOINTS) {
@@ -168,7 +210,19 @@ pub async fn hydrate_inputs(
         }
     }
     // The eviction writer already verified identity, seat commitment, and the P2PKH output.
-    for r in read::<Value>(db, RELEASED_SQL, bound.clone()).await? {
+    let released: Vec<Value> = read(db,"SELECT DISTINCT hopTxid,hopVout FROM released_hop_evidence INDEXED BY idx_released_hop_evidence_identity_game WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))",bound.clone()).await?;
+    let mut released_rows = Vec::new();
+    for key in released {
+        for mut r in read::<Value>(db,RELEASED_SQL,vec![Bind::Text(text(&key,"hopTxid")),Bind::Int(num(&key,"hopVout") as i64)]).await? {
+            if text(&r,"identity") != identity || !games.contains(&text(&r,"gameId")) { continue; }
+            let context: Vec<Value> = read(db,"SELECT h.spent,h.spendingTxid,h.spentConfirmed,h.spenderFinal,p.pubA,p.pubB,p.payPkhA,p.payPkhB FROM (SELECT 1) LEFT JOIN pot_records h ON h.txid=?1 AND h.outputIndex=?2 LEFT JOIN pot_records_evicted p ON p.txid=?3 AND p.lockKind='covenant' AND p.paramsDecoded=1 AND (p.pubA=?4 OR p.pubB=?4)",vec![Bind::Text(text(&r,"hopTxid")),Bind::Int(num(&r,"hopVout") as i64),Bind::Text(text(&r,"potTxid")),Bind::Text(text(&r,"seatSettlePubkey"))]).await?;
+            if let Some(context) = context.first().and_then(Value::as_object) {
+                r.as_object_mut().ok_or("released hop is not an object")?.extend(context.clone());
+            }
+            released_rows.push(r);
+        }
+    }
+    for r in released_rows {
         let hop = text(&r, "hopTxid");
         let vout = num(&r, "hopVout") as u32;
         let key = owed::outpoint_key(&hop, vout);
@@ -225,7 +279,7 @@ pub async fn hydrate_inputs(
         let rows:Vec<Value> = read(db,"SELECT txid FROM pot_evictions WHERE readmittedAt IS NULL AND txid IN (SELECT value FROM json_each(?1))",vec![json_bind(&unknown)]).await?;
         i.evicted_pots.extend(rows.iter().map(|r| text(r, "txid")));
     }
-    hydrate_evidence(db, &mut i, games).await?;
+    hydrate_evidence(db, &mut i, games, filings).await?;
     Ok(i)
 }
 
@@ -246,6 +300,8 @@ async fn assemble_results(
     identity: &str,
     mut rows: Vec<results::ResultsRow>,
     games: &[String],
+    filings: &[crate::record_post::VerifiedRecord],
+    stamp: i64,
 ) -> Result<Vec<results::ResultEntry>, String> {
     let pairs: Vec<_> = rows
         .iter()
@@ -284,6 +340,18 @@ async fn assemble_results(
         )
         .await?;
         routes::note_seat_marker_rows(&mut seats, fetched);
+    }
+    for filing in filings {
+        if let crate::record_post::VerifiedRecord::Potparty(r, valid) = filing {
+            if let (Some(key), Some(sig)) = (&r.seat_settle_pubkey, &r.seat_sig_hex) {
+                seats.entry((r.pot_txid.clone(), r.pot_vout)).or_default().push(results::SeatMarkerRow {
+                    identity:r.identity.clone(), opponent_identity:r.opponent_identity.clone(),
+                    game_id:r.game_id.clone(), pot_txid:r.pot_txid.clone(), pot_vout:r.pot_vout,
+                    recovery_height:r.recovery_height, seat_settle_pubkey:key.clone(),
+                    seat_sig_hex:sig.clone(), identity_sig_hex:r.sig_hex.clone(), sig_valid:Some(*valid),
+                });
+            }
+        }
     }
     let mut hop_seats = HashMap::new();
     for (key, p) in &params {
@@ -326,12 +394,23 @@ async fn assemble_results(
         strings(games.iter().cloned()),
     )
     .await?;
-    let claims = results::claims_by_game(
-        &claim_rows
+    let mut claim_rows: Vec<_> = claim_rows
             .into_iter()
             .filter_map(routes::ResultRowD1::into_marker)
-            .collect::<Vec<_>>(),
-    );
+            .collect();
+    for filing in filings {
+        if let crate::record_post::VerifiedRecord::Result(r, tier) = filing {
+            if games.contains(&r.game_id) && !claim_rows.iter().any(|row| row.txid == r.txid) {
+                claim_rows.push(crate::logic::ResultMarkerRow {
+                    game_id:r.game_id.clone(),winner:r.winner.clone(),loser:r.loser.clone(),
+                    pot_txid:r.pot_txid.clone(),settle_txid:r.settle_txid.clone(),winner_sig_hex:r.winner_sig_hex.clone(),
+                    loser_sig_hex:r.loser_sig_hex.clone(),cards_hex:r.cards_hex.clone(),txid:r.txid.clone(),
+                    created_at:Some(stamp),claim_valid:Some(*tier),
+                });
+            }
+        }
+    }
+    let claims = results::claims_by_game(&claim_rows);
     let mut hands: HashMap<String, Vec<results::HandMarkerFact>> = HashMap::new();
     for r in read::<Value>(
         db,
@@ -425,6 +504,7 @@ async fn hydrate_evidence(
     db: &impl JudgeDb,
     i: &mut JudgeInputs,
     games: &[String],
+    filings: &[crate::record_post::VerifiedRecord],
 ) -> Result<(), String> {
     let bound = vec![Bind::Text(i.identity.clone()), json_bind(&games)];
     for r in read::<Value>(db,"SELECT gameId,sigHex,txid,payTxid FROM collected_markers_v2 WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))",bound).await? {
@@ -555,6 +635,22 @@ async fn hydrate_evidence(
                     .insert(owed::outpoint_key(hop, *vout), pot);
                 break;
             }
+        }
+    }
+    for filing in filings {
+        if let crate::record_post::VerifiedRecord::Hopsweep(_, r) = filing {
+            if r.identity != i.identity || !hop_pairs.contains(&(r.hop_txid.clone(),r.hop_vout)) { continue; }
+            let key = owed::outpoint_key(&r.hop_txid,r.hop_vout);
+            let sweeps = all_sweeps.entry(key).or_default();
+            if sweeps.iter().any(|s| s.sweep_txid == r.sweep_txid) { continue; }
+            let proof: Vec<Value> = read(db,"SELECT has_proof,proofHeight FROM transactions WHERE txid=?1",vec![Bind::Text(r.sweep_txid.clone())]).await?;
+            let proof = proof.first();
+            sweeps.insert(0,crate::hopsweep::FiledHopSweep {
+                sweep_txid:r.sweep_txid.clone(),raw_hex:r.sweep_raw_hex.clone(),
+                pays_sats:crate::hopsweep::sweep_output_sats(&r.sweep_raw_hex),
+                index_proven:proof.is_some_and(|p|flag(p,"has_proof")==Some(true)),
+                index_proof_height:proof.and_then(|p|p["proofHeight"].as_u64()),
+            });
         }
     }
     for (key, mut sweeps) in all_sweeps {

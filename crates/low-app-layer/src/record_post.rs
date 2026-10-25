@@ -107,6 +107,8 @@
 //! pot, none of them rank-1 on the refund window, none of them a committed
 //! seat, none of them a chain win; the per-IP rate rule at the edge is the
 //! operator's step at the promotion (the same residual as `/cases`).
+pub(crate) mod owed_write;
+
 use crate::d1_ledger::Counted;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1572,9 +1574,9 @@ pub(crate) struct ChainNoop {
 
 /// bsv-low #798: the potrefund chain no-op through the port, shared by the direct door and the handfile arm. Reads
 /// the chain rows of the filing's (identity, game, pot outpoint), judges each by the filed path's bar, LATCHES every
-/// own row `refundValid = 1` (one batch) and counts the rest; answers how many own rows there are and whether the
-/// latch moved one. The latch runs before the caller answers.
-pub(crate) async fn potrefund_chain_noop<P: crate::pot_hook::SqlPort>(
+/// own row `refundValid = 1` and judges both seats in one batch; answers how many own rows there are and whether
+/// the latch moved one. The batch runs before the caller answers.
+pub(crate) async fn potrefund_chain_noop<P: crate::owed_judge::JudgeDb>(
     port: &P,
     filing: &PotrefundRecord,
     pot: Option<&PotContext>,
@@ -1593,21 +1595,36 @@ pub(crate) async fn potrefund_chain_noop<P: crate::pot_hook::SqlPort>(
     }
     let mut latched = false;
     if !own.is_empty() {
-        let outs = port
-            .run_batch(
-                own.iter()
-                    .map(|(txid, vout)| {
-                        stmt(
-                            POTREFUND_CHAIN_LATCH_SQL,
-                            vec![text(txid), int(i64::from(*vout))],
-                        )
-                    })
-                    .collect(),
-            )
-            .await?;
-        latched = outs
+        let writes = own
             .iter()
-            .any(|o| insert_wrote_a_row(o.changes.map(|n| n as usize)));
+            .map(|(txid, vout)| {
+                stmt(
+                    POTREFUND_CHAIN_LATCH_SQL,
+                    vec![text(txid), int(i64::from(*vout))],
+                )
+            })
+            .collect();
+        let marks: Vec<_> = own
+            .iter()
+            .map(|(txid, _)| crate::owed_judge::FilingMark {
+                source: "refund".into(),
+                source_key: txid.clone(),
+            })
+            .collect();
+        let verified = VerifiedRecord::Potrefund(filing.clone(), true);
+        let report = owed_write::judge_filings(
+            port,
+            &[verified],
+            &[],
+            (port.now_ms() / 1000) as i64,
+            writes,
+            &marks,
+        )
+        .await?;
+        latched = report
+            .source_changes
+            .iter()
+            .any(|n| insert_wrote_a_row(n.map(|n| n as usize)));
     }
     Ok(ChainNoop {
         own: own.len() as i64,
@@ -1901,9 +1918,6 @@ pub fn record_health_json() -> serde_json::Value {
 pub(crate) fn js(s: &str) -> worker::wasm_bindgen::JsValue {
     s.into()
 }
-pub(crate) fn js_opt(s: Option<&str>) -> worker::wasm_bindgen::JsValue {
-    s.map_or(worker::wasm_bindgen::JsValue::NULL, |v| v.into())
-}
 pub(crate) fn js_num(n: i64) -> worker::wasm_bindgen::JsValue {
     (n as f64).into()
 }
@@ -2090,13 +2104,13 @@ pub(crate) fn already_indexed_body(v: &VerifiedRecord) -> serde_json::Value {
     })
 }
 
-fn text(s: &str) -> crate::pot_hook::Bind {
+pub(crate) fn text(s: &str) -> crate::pot_hook::Bind {
     crate::pot_hook::Bind::Text(s.to_string())
 }
-fn int(n: i64) -> crate::pot_hook::Bind {
+pub(crate) fn int(n: i64) -> crate::pot_hook::Bind {
     crate::pot_hook::Bind::Int(n)
 }
-fn text_opt(s: Option<&str>) -> crate::pot_hook::Bind {
+pub(crate) fn text_opt(s: Option<&str>) -> crate::pot_hook::Bind {
     s.map_or(crate::pot_hook::Bind::Null, text)
 }
 fn stmt(sql: &str, binds: Vec<crate::pot_hook::Bind>) -> crate::pot_hook::Stmt {
@@ -2180,7 +2194,7 @@ async fn port_hop_context<P: crate::pot_hook::SqlPort>(
 /// THE DOOR'S CORE, after the marker verified (`verify_record_post`): a refund backup bound to its pot, a hop
 /// sweep bound to its hop, the chain no-op, the caps, the family's write and the refund's late latch, in that
 /// order. The route runs it over D1 (`routes::D1Sql`); the pins run it as shipped over real SQLite.
-pub(crate) async fn file_verified<P: crate::pot_hook::SqlPort>(
+pub(crate) async fn file_verified<P: crate::owed_judge::JudgeDb>(
     port: &P,
     verified: &mut VerifiedRecord,
     identity: &str,
@@ -2252,7 +2266,6 @@ pub(crate) async fn file_verified<P: crate::pot_hook::SqlPort>(
     }
     // The caps (step 6): the poster's rows for this (family, game, pot) —
     // this content excluded — and its day.
-    let mut row_written = true;
     let (rows_sql, rows_binds, day_sql, day_identity) = cap_queries(verified);
     let rows_for_pot =
         port_count(port, rows_sql, rows_binds.iter().map(|s| text(s)).collect()).await?;
@@ -2265,172 +2278,32 @@ pub(crate) async fn file_verified<P: crate::pot_hook::SqlPort>(
     if let Some(r) = cap_refusal_for(verified, rows_for_pot, rows_today) {
         return Ok(DoorOutcome::Refused(r));
     }
+    let writes = owed_write::statements(verified, now);
+    let report = owed_write::judge_filings(
+        port,
+        std::slice::from_ref(verified),
+        &[],
+        now,
+        writes,
+        &[owed_write::mark(verified)],
+    )
+    .await?;
+    let mut row_written = true;
     match verified {
-        VerifiedRecord::Potparty(r, sig_valid) => {
-            port_one(
-                port,
-                stmt(
-                    POTPARTY_FILE_SQL,
-                    vec![
-                        text(&r.identity),
-                        text(&r.opponent_identity),
-                        text(&r.game_id),
-                        text(&r.pot_txid),
-                        int(i64::from(r.pot_vout)),
-                        int(i64::from(r.recovery_height)),
-                        text(&r.sig_hex),
-                        text_opt(r.seat_settle_pubkey.as_deref()),
-                        text_opt(r.seat_sig_hex.as_deref()),
-                        text(&r.txid),
-                        int(0),
-                        int(now),
-                        int(i64::from(*sig_valid)),
-                    ],
-                ),
-            )
-            .await?;
-        }
-        VerifiedRecord::Potrefund(r, refund_valid) => {
-            port_one(
-                port,
-                stmt(
-                    POTREFUND_FILE_SQL,
-                    vec![
-                        text(&r.identity),
-                        text(&r.game_id),
-                        text(&r.pot_txid),
-                        int(i64::from(r.pot_vout)),
-                        text(&r.refund_raw_hex),
-                        text(&r.sig_hex),
-                        text(&r.txid),
-                        int(0),
-                        int(now),
-                        int(i64::from(*refund_valid)),
-                    ],
-                ),
-            )
-            .await?;
-            if *refund_valid {
-                // The late latch: a row filed at rank 0 earlier (the same
-                // content — the INSERT above was ignored) takes its verdict.
-                let latched =
-                    port_one(port, stmt(POTREFUND_LATCH_SQL, vec![text(&r.txid)])).await?;
-                if latched.changes.unwrap_or(0) > 0 {
-                    REFUNDS_LATCHED_LATER.fetch_add(1, Ordering::Relaxed);
-                }
-            } else {
-                REFUNDS_FILED_UNBOUND.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        VerifiedRecord::Result(r, tier) => {
-            port_one(
-                port,
-                stmt(
-                    RESULT_FILE_SQL,
-                    vec![
-                        text(&r.game_id),
-                        text(&r.winner),
-                        text(&r.loser),
-                        text(&r.pot_txid),
-                        text(&r.settle_txid),
-                        text(&r.winner_sig_hex),
-                        text_opt(r.loser_sig_hex.as_deref()),
-                        text_opt(r.cards_hex.as_deref()),
-                        text(&r.txid),
-                        int(0),
-                        int(now),
-                        int(*tier),
-                    ],
-                ),
-            )
-            .await?;
-            let pot = r.pot_txid.as_str();
-            let per_pot = overlay_discovery::result::storage::RESULT_ROWS_PER_POT as i64;
-            port_one(
-                port,
-                stmt(
-                    lb_row_file_sql(),
-                    vec![
-                        text(&r.txid),
-                        int(0),
-                        text(&r.game_id),
-                        text(&r.winner),
-                        text(&r.loser),
-                        text(pot),
-                        text(&r.settle_txid),
-                        text(&r.winner_sig_hex),
-                        text_opt(r.loser_sig_hex.as_deref()),
-                        text_opt(r.cards_hex.as_deref()),
-                        int(now),
-                        int(*tier),
-                        text(pot),
-                        text(pot),
-                        text(pot),
-                        int(now),
-                        text(pot),
-                        text(pot),
-                        int(now),
-                        text(pot),
-                        text(pot),
-                        int(per_pot),
-                    ],
-                ),
-            )
-            .await?;
-        }
         VerifiedRecord::Collected(r) | VerifiedRecord::Held(r, _) => {
-            let pay_txid = match verified {
-                VerifiedRecord::Held(_, t) => Some(t.as_str()),
-                _ => None,
-            };
-            let done = port_one(
-                port,
-                stmt(
-                    COLLECTED_FILE_SQL,
-                    vec![
-                        text(&r.identity),
-                        text(&r.game_id),
-                        text(&r.txid),
-                        int(0),
-                        text_opt(r.sig_hex.as_deref()),
-                        int(now),
-                        text_opt(pay_txid),
-                    ],
-                ),
-            )
-            .await?;
-            // The B3 lens fold L2: the INSERT is `OR IGNORE`, so a re-file of content already on file writes
-            // nothing. Then nothing changed in what is owed: no stale mark, no `owed-changed` push, no `filed`
-            // count (a stranger replaying a victim's public filing, or a client re-filing on every read, bought a
-            // recompute and a push per request). NOT lossless (the B3 delta lens D-L3): a first filing whose stale
-            // mark faulted or died is no longer repaired by a re-file; that missed mark heals at the read's 15 minute
-            // age rule. The MONEY-DOOR lens's LOW-2: D1's count is optional, and an answer that carries none is never
-            // read as zero rows: the row is re-read by its key (`collected_written_now`).
-            row_written = match done.changes {
+            row_written = match report.source_changes.first().copied().flatten() {
                 Some(n) => insert_wrote_a_row(Some(n as usize)),
                 None => collected_written_now(port, &r.txid, now).await?,
             };
         }
-        VerifiedRecord::Hopsweep(_, r) => {
-            port_one(
-                port,
-                stmt(
-                    crate::hopsweep::HOPSWEEP_FILE_SQL,
-                    vec![
-                        text(&r.identity),
-                        text(&r.game_id),
-                        text(&r.hop_txid),
-                        int(i64::from(r.hop_vout)),
-                        text(&r.sweep_txid),
-                        text(&r.sweep_raw_hex),
-                        text(&r.txid),
-                        int(0),
-                        int(now),
-                    ],
-                ),
-            )
-            .await?;
+        VerifiedRecord::Potrefund(_, valid) => {
+            if *valid && report.source_changes.get(1).copied().flatten().unwrap_or(0) > 0 {
+                REFUNDS_LATCHED_LATER.fetch_add(1, Ordering::Relaxed);
+            } else if !valid {
+                REFUNDS_FILED_UNBOUND.fetch_add(1, Ordering::Relaxed);
+            }
         }
+        _ => {}
     }
     Ok(DoorOutcome::Written { row_written })
 }
@@ -2484,25 +2357,23 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
         Ok(s) => s,
         Err(_) => return refuse(Some(kind), RecordRefusal::BadScriptHex),
     };
-    let db = ctx.env.d1("OVERLAY_DB")?;
     let mut verified = match verify_record_post(kind, &script, &identity) {
         Ok(v) => v,
         Err(r) => return refuse(Some(kind), r),
     };
     // The overlay stamps every one of these tables in unix SECONDS.
     let now = (worker::Date::now().as_millis() / 1000) as i64;
-    let port = crate::routes::D1Sql::of(&ctx.env)?;
+    let tip = crate::routes::chaintracks_present_height_env(&ctx.env, "owed")
+        .await
+        .ok();
+    let port = crate::owed_judge::D1Judge::new(
+        &ctx.env,
+        tip,
+        crate::routes::written_off_before_ms_env(&ctx.env),
+    )?;
     let outcome = file_verified(&port, &mut verified, &identity, now)
         .await
         .map_err(worker::Error::RustError)?;
-    // bsv-low #469: a filing changes what is owed (a refund backup makes a gate-open pot claimable for BOTH seats; a
-    // `collected` retires a payout row; a party marker binds a seat). The gate's HIGH-4 + MEDIUM-11: mark every
-    // party of the pot STALE for its own next read; schedule only the FILER's coalesced walk. Announce the computed
-    // snapshot: a bare filing trigger makes every mounted device spend another read-stale walk (#648). Which
-    // answers move it: [`owed_marks_after`].
-    if let Some((identity, pot)) = owed_marks_after(&outcome, &verified) {
-        note_filing_and_recompute(&ctx, &db, identity, pot).await;
-    }
     let row_written = match outcome {
         DoorOutcome::Refused(r) => {
             if matches!(
@@ -2543,122 +2414,83 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
     crate::routes::json_response(body.to_string(), 200)
 }
 
-/// The filer to mark and walk, and the pot whose parties to mark.
-pub(crate) type OwedMarks = (Option<String>, Option<(String, u32)>);
-
-/// PURE: which of the door's answers move what is owed, and what they mark: a written row, and (the MONEY-DOOR
-/// lens's LOW-1) the chain no-op whose latch moved the poster's own chain row to `refundValid = 1` (the owed list
-/// reads that row as the pot's valid refund). A refusal, a quiet no-op and a re-file that wrote nothing move nothing.
-pub(crate) fn owed_marks_after(
-    outcome: &DoorOutcome,
-    verified: &VerifiedRecord,
-) -> Option<OwedMarks> {
-    match outcome {
-        DoorOutcome::Written { row_written: true }
-        | DoorOutcome::AlreadyIndexed { latched: true } => {}
-        _ => return None,
-    }
-    Some(match verified {
-        VerifiedRecord::Potparty(r, _) => (
-            Some(r.identity.to_ascii_lowercase()),
-            Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout)),
-        ),
-        VerifiedRecord::Potrefund(r, _) => (
-            Some(r.identity.to_ascii_lowercase()),
-            Some((r.pot_txid.to_ascii_lowercase(), r.pot_vout)),
-        ),
-        VerifiedRecord::Collected(r) | VerifiedRecord::Held(r, _) => {
-            (Some(r.identity.to_ascii_lowercase()), None)
-        }
-        VerifiedRecord::Hopsweep(_, r) => (Some(r.identity.to_ascii_lowercase()), None),
-        VerifiedRecord::Result(..) => (None, None),
-    })
-}
-
-/// The filing's stale marks through the port: the pot's parties (`OWED_STALE_FOR_POT_SQL`), then the filer
-/// (`OWED_STALE_FOR_IDENTITY_SQL`), each its own statement; a fault is logged and the next mark still runs.
-pub(crate) async fn mark_filing_stale<P: crate::pot_hook::SqlPort>(
-    port: &P,
-    identity: Option<&str>,
-    pot: Option<(&str, u32)>,
-) {
-    if let Some((pot_txid, pot_vout)) = pot {
-        let mark = stmt(
-            crate::owed::OWED_STALE_FOR_POT_SQL,
-            vec![text(pot_txid), int(i64::from(pot_vout))],
-        );
-        if let Err(e) = port_one(port, mark).await {
-            port.log(&format!(
-                "[owed] stale mark (filing: the pot's parties) failed: {e}"
-            ));
-        }
-    }
-    if let Some(id) = identity {
-        let mark = stmt(crate::owed::OWED_STALE_FOR_IDENTITY_SQL, vec![text(id)]);
-        if let Err(e) = port_one(port, mark).await {
-            port.log(&format!(
-                "[owed] stale mark (filing: the filer) failed: {e}"
-            ));
-        }
-    }
-}
-
-/// After a row landed: the pot's parties and the filer marked stale, then the filer's owed recompute (in
-/// `wait_until` where the platform gives one). Shared by every kind, the handfile arm included (bsv-low #848).
-pub(crate) async fn note_filing_and_recompute(
-    ctx: &RouteContext<AuthState>,
-    db: &worker::D1Database,
-    identity: Option<String>,
-    pot: Option<(String, u32)>,
-) {
-    match crate::routes::D1Sql::of(&ctx.env) {
-        Ok(port) => {
-            mark_filing_stale(
-                &port,
-                identity.as_deref(),
-                pot.as_ref().map(|(t, v)| (t.as_str(), *v)),
-            )
-            .await
-        }
-        Err(e) => worker::console_warn!("[owed] stale marks (filing) skipped: {e}"),
-    }
-    if let Some(id) = identity {
-        if let Some(wait) = ctx.data.wait.clone() {
-            let env = ctx.env.clone();
-            wait.wait_until(async move {
-                // bsv-low #800: the filing's refresh has this invocation's 30 s
-                let invocation_end =
-                    crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64);
-                if let Ok(db) = env.d1("OVERLAY_DB") {
-                    crate::routes::owed_recompute_and_push_coalesced(
-                        &env,
-                        &db,
-                        &id,
-                        "filing",
-                        None,
-                        invocation_end,
-                    )
-                    .await;
-                }
-            });
-        } else {
-            crate::routes::owed_recompute_and_push_coalesced(
-                &ctx.env,
-                db,
-                &id,
-                "filing",
-                None,
-                crate::owed::owed_invocation_end(worker::Date::now().as_millis() as i64),
-            )
-            .await;
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 pub(crate) mod tests {
     use super::*;
+
+    mod budget_fleet {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/d1_fleet.rs"
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "exports the production filing plan for the local D1 budget gate"]
+    async fn owed893_export_filing_budget() {
+        use crate::pot_hook::Bind;
+        let path = std::env::var("OWED_FILING_BUDGET_OUT").expect("fixture destination");
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        let victim = wallet(0x41);
+        let id = hex::encode(identity(&victim));
+        let game = [0x7a; 32];
+        md_index_the_pot(&db);
+        md_seat(&db, &id, &game);
+        let partner = hex::encode(identity(&wallet(0x42)));
+        db.conn.execute("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,sigValid) SELECT ?1,identity,gameId,potTxid,potVout,recoveryHeight,sigHex,'filed:other-seat',0,createdAt,sigValid FROM potparty_records WHERE identity=?2",rusqlite::params![partner,id]).unwrap();
+        let schema: Vec<String> = db.conn.prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid").unwrap().query_map([],|r|r.get(0)).unwrap().map(Result::unwrap).collect();
+        let mut seed = Vec::new();
+        for table in ["pot_records", "potparty_records"] {
+            let cols: Vec<String> = db
+                .conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |r| r.get(1))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let values = cols
+                .iter()
+                .map(|c| format!("quote(\"{c}\")"))
+                .collect::<Vec<_>>()
+                .join(" || ',' || ");
+            let sql =
+                format!("SELECT 'INSERT INTO {table} VALUES (' || {values} || ')' FROM {table}");
+            seed.extend(
+                db.conn
+                    .prepare(&sql)
+                    .unwrap()
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .map(Result::unwrap),
+            );
+        }
+        for sql in budget_fleet::rows(2_000)
+            .into_iter()
+            .chain(budget_fleet::owed_rows(2_000))
+        {
+            budget_fleet::execute_row(&db.conn, &sql);
+            seed.push(sql);
+        }
+        db.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        seed.push("DELETE FROM owed_dirty".into());
+        db.recorded.borrow_mut().clear();
+        let marker = potrefund_script(&victim, &game, &presigned_refund());
+        let mut filing = verify_record_post(RecordKind::Potrefund, &marker, &id).unwrap();
+        file_verified(&db, &mut filing, &id, 2_000).await.unwrap();
+        let batches: Vec<_> = db.recorded.borrow().iter().map(|batch|batch.iter().map(|s|serde_json::json!({"sql":s.sql,"binds":s.binds.iter().map(|b|match b {Bind::Text(t)=>serde_json::json!(t),Bind::Int(n)=>serde_json::json!(n),Bind::Null=>serde_json::Value::Null}).collect::<Vec<_>>() })).collect::<Vec<_>>()).collect();
+        let expected_rows: i64 = db.conn.query_row("SELECT COUNT(*) FROM owed_rows", [], |r| r.get(0)).unwrap();
+        assert_eq!(expected_rows, 2);
+        std::fs::write(
+            path,
+            serde_json::to_vec(
+                &serde_json::json!({"schema":schema,"seed":seed,"batches":batches,"identity":id,"expectedRows":expected_rows}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn owed893_app_filing_atomic_on_row_fault() {
@@ -2668,32 +2500,78 @@ pub(crate) mod tests {
         let game = [0x7a; 32];
         md_index_the_pot(&db);
         md_seat(&db, &id, &game);
-        db.conn.execute_batch("DELETE FROM owed_dirty; CREATE TRIGGER fail_owed BEFORE INSERT ON owed_rows BEGIN SELECT RAISE(ABORT,'owed row fault'); END;").unwrap();
+        db.conn.execute("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,sigValid) SELECT ?1,identity,gameId,potTxid,potVout,recoveryHeight,sigHex,'filed:other-seat',0,createdAt,sigValid FROM potparty_records WHERE identity=?2",rusqlite::params![hex::encode(identity(&wallet(0x42))),id]).unwrap();
+        db.conn.execute_batch("DELETE FROM owed_dirty; CREATE TEMP TABLE observed_marks(identity TEXT); CREATE TEMP TRIGGER observe_dirty AFTER INSERT ON owed_dirty BEGIN INSERT INTO observed_marks(identity) VALUES (NEW.identity); END; CREATE TRIGGER fail_owed BEFORE INSERT ON owed_rows BEGIN SELECT RAISE(ABORT,'owed row fault'); END;").unwrap();
         let script = potrefund_script(&victim, &game, &presigned_refund());
         let mut filing = verify_record_post(RecordKind::Potrefund, &script, &id).unwrap();
         let result = file_verified(&db, &mut filing, &id, 2_000).await;
-        assert!(result.is_err(), "a failed judgement must fail its filing: {result:?}");
-        for table in ["potrefund_records", "owed_rows", "owed_dirty"] {
-            let n: i64 = db.conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+        assert!(
+            result.is_err(),
+            "a failed judgement must fail its filing: {result:?}"
+        );
+        for table in [
+            "potrefund_records",
+            "owed_rows",
+            "owed_dirty",
+            "observed_marks",
+        ] {
+            let n: i64 = db
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
             assert_eq!(n, 0, "atomic rollback: {table}");
         }
         db.conn.execute_batch("DROP TRIGGER fail_owed;").unwrap();
         file_verified(&db, &mut filing, &id, 2_000).await.unwrap();
         for table in ["potrefund_records", "owed_rows", "owed_row_words"] {
-            let n: i64 = db.conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+            let n: i64 = db
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
             assert!(n > 0, "committed filing and judgement: {table}");
         }
-        let n: i64 = db.conn.query_row("SELECT COUNT(*) FROM owed_dirty", [], |r| r.get(0)).unwrap();
+        let n: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM observed_marks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "both seats were marked in the source transaction");
+        let n: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM owed_rows", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "both seats were judged in the filing batch");
+        let n: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM owed_dirty", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 0, "the owned mark is acknowledged in the same batch");
     }
 
     #[test]
     fn owed893_writers_use_the_judge() {
         let runtime = include_str!("tracker_host/runtime.rs");
-        let held = runtime.split("async fn event_held(").nth(1).unwrap().split("pub async fn ingest(").next().unwrap();
-        assert!(held.contains("judge_word_write"), "the word hook must judge its own marked subjects");
-        let tip = include_str!("internal_events.rs").split("pub async fn tip_changed(").nth(1).unwrap().split("#[cfg(test)]").next().unwrap();
-        assert!(tip.contains("mark_tip"), "the tip must use the indexed gate marks");
+        let held = runtime
+            .split("async fn event_held(")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn ingest(")
+            .next()
+            .unwrap();
+        assert!(
+            held.contains("judge_word_write"),
+            "the word hook must judge its own marked subjects"
+        );
+        let tip = include_str!("internal_events.rs")
+            .split("pub async fn tip_changed(")
+            .nth(1)
+            .unwrap()
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(
+            tip.contains("mark_tip"),
+            "the tip must use the indexed gate marks"
+        );
         assert!(!tip.contains("OWED_STALE_ON_TIP"));
     }
     use bsv_rs::primitives::bsv::sighash::{
@@ -4022,17 +3900,18 @@ pub(crate) mod tests {
                 && COLLECTED_FILE_SQL.contains("payTxid")
         );
         let door = &files.iter().find(|(f, _)| f == "record_post.rs").unwrap().1;
-        let uses: Vec<usize> = door
-            .match_indices("COLLECTED_FILE_SQL")
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(uses.len(), 2, "the const and ONE statement");
-        // MONEY-DOOR: the door's writes run in its core (`file_verified`, over the SQL port), which the route
-        // calls after the signature check; the core is the insert's only site.
-        let core = door
-            .find("pub(crate) async fn file_verified<")
-            .expect("the door's core");
-        assert!(core < uses[1], "the one insert is in the core");
+        assert_eq!(
+            door.matches("COLLECTED_FILE_SQL").count(),
+            1,
+            "one SQL definition"
+        );
+        let builder = &files.iter().find(|(f, _)| f == "owed_write.rs").unwrap().1;
+        assert_eq!(
+            builder.matches("COLLECTED_FILE_SQL").count(),
+            1,
+            "one source statement builder"
+        );
+        assert!(door.contains("owed_write::judge_filings"));
         let route = door.find("pub async fn record_post(").expect("the door");
         let verify = door[route..]
             .find("verify_record_post(kind, &script, &identity)")
@@ -5070,27 +4949,11 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    /// The route's composition after the core, over the port: which answers mark, then the marks.
-    async fn md_after(
-        db: &crate::pot_hook::tests::SqliteSql,
-        out: &DoorOutcome,
-        v: &VerifiedRecord,
-    ) {
-        if let Some((id, pot)) = owed_marks_after(out, v) {
-            mark_filing_stale(
-                db,
-                id.as_deref(),
-                pot.as_ref().map(|(t, n)| (t.as_str(), *n)),
-            )
-            .await;
-        }
-    }
-
     /// LOW-1 (direct arm): the identity's own valid chain row is the no-op, and its latch moves it to
     /// `refundValid = 1`, which the owed list reads as the pot's valid refund: the pot's parties and the filer are
     /// marked stale as on a written row. A repeat whose latch moves nothing marks nothing; a non-party is never marked.
     #[tokio::test(flavor = "current_thread")]
-    async fn money_door_fold_l1_a_latching_no_op_marks_the_pot_stale() {
+    async fn money_door_fold_l1_a_latching_no_op_judges_the_pot() {
         let victim = wallet(0x61);
         let id = identity(&victim);
         let id_lc = hex::encode(&id);
@@ -5103,70 +4966,71 @@ pub(crate) mod tests {
         md_owed_state(&db, &id_lc, 0);
         md_owed_state(&db, &bystander, 0);
         md_chain_admit(&db, &filing, &"a7".repeat(32), 1_500);
-        let (out, v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        let (out, _v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
         assert_eq!(out, DoorOutcome::AlreadyIndexed { latched: true });
-        md_after(&db, &out, &v).await;
+
         assert_eq!(
             (md_stale(&db, &id_lc), md_stale(&db, &bystander)),
-            (1, 0),
-            "the latching no-op marks the pot's parties stale, never a non-party"
+            (0, 0),
+            "the latching no-op judges the pot, never a non-party"
         );
         // the repeat: the row is already latched, nothing moves, nothing is marked
         md_owed_state(&db, &id_lc, 0);
-        let (out, v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        let (out, _v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
         assert_eq!(out, DoorOutcome::AlreadyIndexed { latched: false });
-        md_after(&db, &out, &v).await;
+
         assert_eq!(md_stale(&db, &id_lc), 0, "a quiet no-op marks nothing");
         // a written row still marks (the control)
         let db = crate::pot_hook::tests::SqliteSql::migrated();
         md_index_the_pot(&db);
         md_seat(&db, &id_lc, &gid);
         md_owed_state(&db, &id_lc, 0);
-        let (out, v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        let (out, _v) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
         assert_eq!(out, DoorOutcome::Written { row_written: true });
-        md_after(&db, &out, &v).await;
-        assert_eq!(md_stale(&db, &id_lc), 1);
-        // the route marks through `owed_marks_after` before it answers the no-op
-        let route: String = include_str!("record_post.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap()
-            .split_whitespace()
-            .collect();
-        let at = |needle: &str| route.find(needle).unwrap_or_else(|| panic!("{needle}"));
-        assert!(
-            at("ifletSome((identity,pot))=owed_marks_after(&outcome,&verified)")
-                < at("DoorOutcome::AlreadyIndexed{..}=>{bump(&ALREADY_INDEXED_BY_KIND,kind);"),
-            "the route marks before it answers the no-op"
-        );
+
+        assert_eq!(md_stale(&db, &id_lc), 0);
+        let n: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM owed_rows WHERE identity=?1",
+                [&id_lc],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the filing judged its row before returning");
     }
 
-    /// LOW-1 (handfile arm): a batch that wrote no row is marked when the refund's chain no-op latched, and only
-    /// then; the handfile route calls the decision with the latch and marks before its re-file answer.
     #[test]
-    fn money_door_fold_l1_b_the_handfile_noop_latch_marks() {
-        use crate::handfile::handfile_noop_moves_owed as moves;
-        assert_eq!(
-            (moves(false, true), moves(false, false), moves(true, true), moves(true, false)),
-            (true, false, false, false),
-            "a no-op batch moves what is owed only when the latch moved a row (a written batch marks on its own path)"
-        );
-        let hf: String = include_str!("handfile.rs")
-            .split("#[cfg(test)]")
-            .next()
+    fn money_door_fold_l1_b_handfile_judges_in_its_batch() {
+        let source = include_str!("handfile.rs");
+        let body = source
+            .split("pub(crate) async fn judge_handfile(")
+            .nth(1)
             .unwrap()
-            .split_whitespace()
-            .collect();
-        let call = hf
-            .find("ifhandfile_noop_moves_owed(wrote,refund_chain.latched){crate::record_post::note_filing_and_recompute(")
-            .expect("the handfile arm marks on a latching no-op");
-        assert!(
-            hf[call..].contains("if!wrote{crate::record_post::note_already_filed(kind);"),
-            "the latching no-op is marked before the re-file answer"
-        );
+            .split("/// The door's handfile arm")
+            .next()
+            .unwrap();
+        assert!(body.contains("owed_write::judge_filings"));
+        assert!(!source.contains("note_filing_and_recompute"));
     }
 
     /// A port whose answers carry NO change count for the statements it names (D1's `meta.changes` is optional).
+    impl crate::owed_judge::JudgeDb for NoCount<'_> {
+        fn tip(&self) -> Option<u64> {
+            Some(900_000)
+        }
+        async fn word_views(
+            &self,
+            rows: &std::collections::BTreeMap<String, crate::tracker_host::stored::Row>,
+        ) -> std::result::Result<std::collections::BTreeMap<String, serde_json::Value>, String>
+        {
+            Ok(rows.iter().map(|(k, v)| (k.clone(), v.view())).collect())
+        }
+        async fn canonical_root(&self, _: u64) -> Option<String> {
+            None
+        }
+        async fn push(&self, _: &str, _: serde_json::Value) {}
+    }
     struct NoCount<'a>(&'a crate::pot_hook::tests::SqliteSql, &'static str);
     impl crate::pot_hook::SqlPort for NoCount<'_> {
         async fn run_batch(
@@ -5219,8 +5083,11 @@ pub(crate) mod tests {
             "a first filing whose answer carries no count is a write"
         );
         md_owed_state(&db, &id_lc, 0);
-        md_after(&db, &first, &v).await;
-        assert_eq!(md_stale(&db, &id_lc), 1, "and it marks the filer");
+        assert_eq!(
+            md_stale(&db, &id_lc),
+            0,
+            "the judgement needs no stale read"
+        );
         let mut v = verify_record_post(RecordKind::Collected, &marker, &id_lc).unwrap();
         let again = file_verified(&port, &mut v, &id_lc, 2_500).await.unwrap();
         assert_eq!(
