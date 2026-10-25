@@ -513,6 +513,30 @@ async fn owed893_backfill_f_the_age_remark_is_bounded_once_a_day_and_indexed() {
         "a day later, again"
     );
     assert_eq!(db.counters.borrow()[backfill::COUNTER_AGED], 128 + 22 + 128);
+    // At most 128 age marks are ever pending, and a source's mark marked after them is judged first.
+    db.exec("DELETE FROM owed_dirty");
+    db.now
+        .set(db.now.get() + backfill::OWED_AGE_REMARK_AFTER_MS as u64 + 1);
+    assert_eq!(backfill::mark_aged(&db).await.unwrap(), 128);
+    db.exec("DELETE FROM owed_dirty WHERE rowid IN (SELECT rowid FROM owed_dirty WHERE source='age' LIMIT 28)");
+    assert_eq!(
+        backfill::mark_aged(&db).await.unwrap(),
+        28,
+        "the room left under the pending bound"
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM owed_dirty WHERE source='age'"),
+        128
+    );
+    db.exec(&format!("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('aged','g149','party','k',{})", db.now.get() + 1));
+    db.exec("DELETE FROM owed_dirty WHERE source='age' AND gameId='g149'");
+    let r = judge::drain_dirty(&db, 1).await.unwrap();
+    assert_eq!(r.subjects, 1);
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM owed_dirty WHERE gameId='g149'"),
+        0,
+        "the source's mark is judged before the older age marks"
+    );
     let plan: Vec<String> = db
         .conn
         .borrow()
