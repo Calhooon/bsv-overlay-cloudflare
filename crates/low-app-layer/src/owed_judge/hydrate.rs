@@ -10,6 +10,10 @@ pub const LINKS_SQL: &str = "SELECT hp.identity,hp.opponentIdentity,hp.gameId,l.
 /// This is the same rank and oldest-marker rule as `owed_cursor::select`.
 pub const REPRESENTATIVES_SQL: &str = "SELECT pp.identity,pp.opponentIdentity,pp.gameId,pp.potTxid,pp.potVout,pp.recoveryHeight,pp.seatSettlePubkey,pp.seatSigHex,pp.sigHex,pp.createdAt,pp.txid,pp.outputIndex,pp.sigValid,pp.rowid AS markerRowid,r.createdAt AS potCreatedAt,r.txid IS NULL AS unknownPot FROM json_each(?2) k CROSS JOIN potparty_records pp INDEXED BY idx_potparty_pot ON pp.potTxid=json_extract(k.value,'$[0]') AND pp.potVout=json_extract(k.value,'$[1]') LEFT JOIN pot_records r ON r.txid=pp.potTxid AND r.outputIndex=pp.potVout WHERE pp.identity=?1 UNION ALL SELECT hp.identity,hp.opponentIdentity,hp.gameId,l.potTxid,l.potVout,p.recoveryHeight,hp.seatSettlePubkey,hp.seatSigHex,hp.identitySigHex AS sigHex,hp.createdAt,hp.txid,hp.outputIndex,hp.markerValid AS sigValid,hp.rowid AS markerRowid,p.createdAt AS potCreatedAt,0 AS unknownPot FROM json_each(?2) k CROSS JOIN hop_pot_links l INDEXED BY idx_hop_pot_links_pot ON l.potTxid=json_extract(k.value,'$[0]') AND l.potVout=json_extract(k.value,'$[1]') CROSS JOIN hopparty_records hp ON hp.rowid=l.markerRowid CROSS JOIN pot_records p ON p.txid=l.potTxid AND p.outputIndex=l.potVout WHERE l.identity=?1";
 pub const HOPS_SQL: &str = "SELECT hp.*,hp.txid AS hopTxid,hp.txid AS markerTxid,hp.outputIndex AS markerVout,hp.createdAt AS markerCreatedAt,hp.rowid AS markerRowid,r.createdAt AS potCreatedAt,r.txid IS NULL AS unknownHop,r.spent,r.spendingTxid,r.spentConfirmed,r.spenderFinal,CASE WHEN hp.hopLockHex IS NOT NULL AND hp.hopSatsOnChain=hp.hopSats THEN 0 ELSE 1 END AS paidTier FROM hopparty_records hp INDEXED BY idx_hopparty_game LEFT JOIN pot_records r ON r.txid=hp.txid AND r.outputIndex=hp.hopVout WHERE hp.identity=?1 AND hp.gameId IN (SELECT value FROM json_each(?2))";
+/// The identity's OTHER markers naming the selected games' hop outputs (the D2-OWED lens's MEDIUM-3): a hop output
+/// its author named under two games is ONE row, the walk's (`owed_cursor::select_hops`, the oldest marker); the
+/// projection is [`HOPS_SQL`]'s.
+pub const HOP_COMPETITORS_SQL: &str = "SELECT hp.*,hp.txid AS hopTxid,hp.txid AS markerTxid,hp.outputIndex AS markerVout,hp.createdAt AS markerCreatedAt,hp.rowid AS markerRowid,r.createdAt AS potCreatedAt,r.txid IS NULL AS unknownHop,r.spent,r.spendingTxid,r.spentConfirmed,r.spenderFinal,CASE WHEN hp.hopLockHex IS NOT NULL AND hp.hopSatsOnChain=hp.hopSats THEN 0 ELSE 1 END AS paidTier FROM json_each(?2) k CROSS JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=json_extract(k.value,'$[0]') AND hp.hopVout=json_extract(k.value,'$[1]') LEFT JOIN pot_records r ON r.txid=hp.txid AND r.outputIndex=hp.hopVout WHERE hp.identity=?1";
 pub const RELEASED_SQL: &str = "SELECT h.* FROM released_hop_evidence h JOIN pot_evictions e ON e.txid = h.potTxid WHERE h.hopTxid = ?1 AND h.hopVout = ?2 AND e.readmittedAt IS NULL AND h.evictedAt = e.evictedAt";
 
 pub(super) async fn read<T: DeserializeOwned>(
@@ -156,6 +160,23 @@ pub(crate) async fn hydrate_filings(
         }
     }
     let mut hop_candidates: Vec<Value> = read(db, HOPS_SQL, bound.clone()).await?;
+    let outputs: BTreeSet<(String, u64)> = hop_candidates
+        .iter()
+        .map(|h| (text(h, "hopTxid"), num(h, "hopVout")))
+        .collect();
+    if !outputs.is_empty() {
+        for c in read::<Value>(
+            db,
+            HOP_COMPETITORS_SQL,
+            vec![Bind::Text(identity.into()), json_bind(&outputs)],
+        )
+        .await?
+        {
+            if !hop_candidates.iter().any(|h| h["txid"] == c["txid"] && h["outputIndex"] == c["outputIndex"]) {
+                hop_candidates.push(c);
+            }
+        }
+    }
     for hop in pending_hops.iter().filter(|h| text(h,"identity") == identity && games.contains(&text(h,"gameId"))) {
         if !hop_candidates.iter().any(|r| r["txid"] == hop["txid"] && r["outputIndex"] == hop["outputIndex"]) {
             let mut hop = hop.clone();
@@ -213,7 +234,8 @@ pub(crate) async fn hydrate_filings(
     for key in released {
         for mut r in read::<Value>(db,RELEASED_SQL,vec![Bind::Text(text(&key,"hopTxid")),Bind::Int(num(&key,"hopVout") as i64)]).await? {
             if text(&r,"identity") != identity || !games.contains(&text(&r,"gameId")) { continue; }
-            let context: Vec<Value> = read(db,"SELECT h.spent,h.spendingTxid,h.spentConfirmed,h.spenderFinal,p.pubA,p.pubB,p.payPkhA,p.payPkhB FROM (SELECT 1) LEFT JOIN pot_records h ON h.txid=?1 AND h.outputIndex=?2 LEFT JOIN pot_records_evicted p ON p.txid=?3 AND p.lockKind='covenant' AND p.paramsDecoded=1 AND (p.pubA=?4 OR p.pubB=?4)",vec![Bind::Text(text(&r,"hopTxid")),Bind::Int(num(&r,"hopVout") as i64),Bind::Text(text(&r,"potTxid")),Bind::Text(text(&r,"seatSettlePubkey"))]).await?;
+            // the opponent the twin party names, as the old walk's ring served it (the walk-against-judge pin)
+            let context: Vec<Value> = read(db,"SELECT h.spent,h.spendingTxid,h.spentConfirmed,h.spenderFinal,p.pubA,p.pubB,p.payPkhA,p.payPkhB,(SELECT lower(pp.opponentIdentity) FROM potparty_records_evicted pp INDEXED BY idx_evicted_party_identity_game WHERE pp.identity=?5 AND pp.gameId=?6 AND pp.potTxid=?3 AND pp.sigValid=1 ORDER BY pp.createdAt,pp.rowid LIMIT 1) AS opponentIdentity FROM (SELECT 1) LEFT JOIN pot_records h ON h.txid=?1 AND h.outputIndex=?2 LEFT JOIN pot_records_evicted p ON p.txid=?3 AND p.lockKind='covenant' AND p.paramsDecoded=1 AND (p.pubA=?4 OR p.pubB=?4)",vec![Bind::Text(text(&r,"hopTxid")),Bind::Int(num(&r,"hopVout") as i64),Bind::Text(text(&r,"potTxid")),Bind::Text(text(&r,"seatSettlePubkey")),Bind::Text(text(&r,"identity")),Bind::Text(text(&r,"gameId"))]).await?;
             if let Some(context) = context.first().and_then(Value::as_object) {
                 r.as_object_mut().ok_or("released hop is not an object")?.extend(context.clone());
             }
@@ -250,7 +272,7 @@ pub(crate) async fn hydrate_filings(
             hop_txid: hop.clone(),
             hop_vout: vout,
             hop_sats: num(&r, "hopSats"),
-            opponent_identity: String::new(),
+            opponent_identity: text(&r, "opponentIdentity"),
             seat_settle_pubkey: seat,
             seat_sig_hex: String::new(),
             identity_sig_hex: String::new(),
@@ -576,9 +598,14 @@ async fn hydrate_evidence(
                 if hop_pairs.contains(&(t.to_string(), v)) {
                     let mut word = hops_view::stale_memo_word(m, i.now_ms, clear, i.tip);
                     // The memo is the most recent chain evidence. Its freshness is told, never an outward probe.
-                    word.stale = !fresh_keys.contains(&owed::outpoint_key(t, v));
+                    let fresh = fresh_keys.contains(&owed::outpoint_key(t, v));
+                    word.stale = !fresh;
                     if hops_view::confirmation_refused(m, clear) {
                         refused.insert(owed::outpoint_key(t, v), m.spending_txid.clone());
+                    }
+                    // the walk's grace word: a fresh memo's confirmation taken inside the reorg grace
+                    if fresh && hops_view::confirmed_in_reorg_grace(m.spent_confirmed, m.probed_at_ms, clear) {
+                        i.grace_words.insert(owed::outpoint_key(t, v));
                     }
                     i.hop_chain.insert(owed::outpoint_key(t, v), word);
                 }
@@ -656,7 +683,9 @@ async fn hydrate_evidence(
         i.hop_sweeps
             .insert(key, crate::hopsweep::pick_filed_sweep(newest, sweeps));
     }
-    hops_view::set_aside_proofs_a_refused_word_contradicts(&mut i.hop_sweeps, &refused);
+    i.proofs_set_aside =
+        hops_view::set_aside_proofs_a_refused_word_contradicts(&mut i.hop_sweeps, &refused);
+    i.refused_words = refused;
     let mut named: BTreeSet<String> = i
         .hops
         .iter()
