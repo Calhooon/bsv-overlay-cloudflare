@@ -33,6 +33,9 @@ fn hot_routes_never_scan_fleet_tables() {
     let db = fixture();
     println!("shipped migrations: {}", OVERLAY_MIGRATIONS.len());
     let mut failures = Vec::new();
+    // #893 section 4.1: these are the next read lane's three statement shapes.
+    // The other lookups pin the new tables' write, drain, tip and belt indexes.
+    owed_893_plans(&db).unwrap();
     for arity in [1, 24, 100] {
         for detail in plan(
             &db,
@@ -300,6 +303,59 @@ fn hot_routes_never_scan_fleet_tables() {
     }
     println!("hot route fleet SCAN list: {failures:?}");
     assert!(failures.is_empty(), "fleet scans:\n{}", failures.join("\n"));
+}
+
+const OWED_893_PLANS: &[(&str, &str, &[&str])] = &[
+    (
+        "owed rows and words",
+        "SELECT r.identity,r.outpoint,r.family,r.gameId,r.sats,r.opponentIdentity,r.atHeight,r.facts,r.reason,r.judgedAtMs,r.claimable,r.probeTip,w.role,t.txid,t.word,t.tier,t.height,t.proof_root,t.header_hash,t.hint_source,t.hint_at,t.updated_at FROM owed_rows r LEFT JOIN owed_row_words w ON w.identity=r.identity AND w.outpoint=r.outpoint LEFT JOIN tx_words t ON t.txid=w.txid WHERE r.identity=?1 ORDER BY CASE r.family WHEN 'payout' THEN 0 WHEN 'refund-due' THEN 1 WHEN 'hop-stranded' THEN 2 WHEN 'in-progress' THEN 3 ELSE 4 END,COALESCE(r.atHeight,0) DESC,r.outpoint,w.role LIMIT 2004",
+        &["sqlite_autoindex_owed_rows_1", "sqlite_autoindex_owed_row_words_1", "sqlite_autoindex_tx_words_1"],
+    ),
+    ("owed identity marker", "SELECT computedAtMs,rows,truncated,recomputeSeq FROM owed_state WHERE identity=?1", &["sqlite_autoindex_owed_state_1"]),
+    ("owed pending count", "SELECT COUNT(*) FROM owed_dirty WHERE identity=?1", &["idx_owed_dirty_identity"]),
+    ("owed word invalidation", "SELECT identity,outpoint FROM owed_row_words WHERE txid=?1", &["idx_owed_row_words_txid"]),
+    ("owed oldest mark", "SELECT rowid,identity,gameId FROM owed_dirty WHERE markedAtMs<=?1 ORDER BY markedAtMs LIMIT 64", &["idx_owed_dirty_marked"]),
+    ("owed tip range", "SELECT identity,gameId FROM owed_rows WHERE gateHeight BETWEEN ?1 AND ?2", &["idx_owed_rows_gate"]),
+    ("owed due belt", "SELECT identity,outpoint FROM owed_rows WHERE beltDueAtMs<=?1 ORDER BY beltDueAtMs LIMIT 8", &["idx_owed_rows_belt"]),
+    ("owed released hop", "SELECT identity,gameId FROM released_hop_evidence WHERE hopTxid=?1 AND hopVout=?2", &["sqlite_autoindex_released_hop_evidence_1"]),
+    ("owed released game", "SELECT hopTxid,hopVout FROM released_hop_evidence WHERE identity=?1 AND gameId=?2", &["idx_released_hop_evidence_identity_game"]),
+    ("owed belt cursor", "SELECT cursor,tickedAtMs FROM owed_belt_state WHERE name=?1", &["sqlite_autoindex_owed_belt_state_1"]),
+    ("owed eviction parties", "SELECT identity,gameId FROM potparty_records_evicted WHERE potTxid=?1 AND potVout=?2", &["idx_evicted_party_pot"]),
+];
+
+fn owed_893_plans(db: &Connection) -> Result<(), String> {
+    for (label, sql, indexes) in OWED_893_PLANS {
+        let details = plan(db, sql);
+        for index in *indexes {
+            if !details.iter().any(|d| d.contains(index)) {
+                return Err(format!("{label}: missing {index}: {details:?}"));
+            }
+        }
+        if details.iter().any(|d| d.starts_with("SCAN ")) {
+            return Err(format!("{label}: {details:?}"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn owed893_each_owed_lookup_index_removed_alone_turns_the_hot_plan_pin_red() {
+    let db = fixture();
+    let indexes: std::collections::BTreeSet<_> = OWED_893_PLANS
+        .iter()
+        .flat_map(|(_, _, indexes)| indexes.iter().copied())
+        .filter(|index| !index.starts_with("sqlite_autoindex_"))
+        .collect();
+    assert_eq!(indexes.len(), 7);
+    for index in indexes {
+        db.execute_batch("SAVEPOINT missing_index").unwrap();
+        db.execute_batch(&format!("DROP INDEX {index}")).unwrap();
+        let red = owed_893_plans(&db).expect_err("the hot-plan pin must reject a missing index");
+        println!("RED {index}: {red}");
+        db.execute_batch("ROLLBACK TO missing_index; RELEASE missing_index")
+            .unwrap();
+    }
+    owed_893_plans(&db).unwrap();
 }
 
 #[test]
