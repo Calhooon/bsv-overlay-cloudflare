@@ -7,7 +7,7 @@
 //! serves as `/health/invariants.appLayerScheduledPass`, so a beta window can read whether `/tip`'s latency rides the
 //! pass.
 //!
-//! The pass is three `wait_until` tasks (`pot_hook::schedule_tick`: the drain, the chain-event intake, the tracker). Each phase is timed by
+//! The pass has four `wait_until` tasks: the pot drain, chain-event intake, tracker, and owed drain. Each phase is timed by
 //! [`PassMeter::phase`] and each task tells the meter it ended ([`PassMeter::task_done`]); the task that ends LAST
 //! writes the line and the row. Stated: a task the platform cancels never ends, so its pass writes nothing (the row's
 //! `at` then stays at the previous pass, which is the signal); a phase a deadline dropped is timed to the drop.
@@ -26,8 +26,8 @@ pub const PASS_UPSERT_SQL: &str = "INSERT INTO applayer_scheduled_pass (id, at, 
      ON CONFLICT(id) DO UPDATE SET at = excluded.at, started_at = excluded.started_at, \
      wall_ms = excluded.wall_ms, phases = excluded.phases, passes = applayer_scheduled_pass.passes + 1";
 
-/// The three tasks of a scheduled pass (the drain, the chain-event intake since bsv-low #778, and the tracker).
-pub const SCHEDULED_TASKS: u32 = 3;
+/// The four tasks of a scheduled pass: pot drain, chain-event intake, tracker, and owed drain.
+pub const SCHEDULED_TASKS: u32 = 4;
 
 /// One scheduled pass's clock: its start, each phase's wall, the tasks still running.
 pub struct PassMeter {
@@ -185,6 +185,8 @@ mod tests {
             Box::new(move || now.get())
         };
         let meter = PassMeter::new(clock, SCHEDULED_TASKS);
+        // The owed drain is the fourth independently bounded task.
+        end_task::<SqliteSql>(&meter, None).await;
         let sql = SqliteSql::migrated();
         let step = |ms: u64| {
             let now = now.clone();
@@ -273,8 +275,8 @@ mod tests {
         }
         assert_eq!(
             sched.matches("pass_meter::end_task(").count(),
-            3,
-            "each of the three tasks ends through the meter"
+            4,
+            "each of the four tasks ends through the meter"
         );
     }
 }
