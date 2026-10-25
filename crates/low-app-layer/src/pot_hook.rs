@@ -1686,6 +1686,7 @@ pub(crate) mod tests {
         pub recorded: RefCell<Vec<Vec<Stmt>>>,
         pub counted: RefCell<Vec<(String, u64)>>,
         pub lines: RefCell<Vec<String>>,
+        pub tip: Cell<Option<u64>>,
     }
 
     impl SqliteSql {
@@ -1709,6 +1710,7 @@ pub(crate) mod tests {
                 recorded: RefCell::default(),
                 counted: RefCell::default(),
                 lines: RefCell::default(),
+                tip: Cell::new(Some(900_000)),
             }
         }
         pub(crate) fn counter(&self, name: &str) -> u64 {
@@ -1759,7 +1761,7 @@ pub(crate) mod tests {
     }
 
     impl crate::owed_judge::JudgeDb for SqliteSql {
-        fn tip(&self) -> Option<u64> { Some(900_000) }
+        fn tip(&self) -> Option<u64> { self.tip.get() }
         async fn word_views(&self, rows: &std::collections::BTreeMap<String, crate::tracker_host::stored::Row>) -> Result<std::collections::BTreeMap<String, Value>, String> { Ok(rows.iter().map(|(k,v)|(k.clone(),v.view())).collect()) }
         async fn canonical_root(&self, _: u64) -> Option<String> { None }
         async fn push(&self, identity: &str, _: Value) { self.lines.borrow_mut().push(format!("owed-changed {identity}")); }

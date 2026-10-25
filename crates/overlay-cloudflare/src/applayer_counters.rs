@@ -116,6 +116,10 @@ pub const OWED_BACKFILL: [&str; 3] = [
     "owed_age_remarked_total",
 ];
 
+/// The D2-OWED lens's MEDIUM-2: a filing whose owed judge could not run and landed alone, its marks left to the drain
+/// (`low_app_layer::owed_judge::counter_names`, pinned equal there).
+pub const OWED_JUDGE: [&str; 1] = ["owed_judge_filing_faults_total"];
+
 /// `/health/invariants.owedBelt`: the belt's durable totals and its backlog, from the counters read.
 pub fn owed_belt_view(counters: &serde_json::Value) -> serde_json::Value {
     let n = |k: &str| {
@@ -179,6 +183,7 @@ pub fn names() -> Vec<String> {
     v.push("owed_refund_funding_unheld_total".to_string());
     v.extend(OWED_BELT.iter().map(|n| n.to_string()));
     v.extend(OWED_BACKFILL.iter().map(|n| n.to_string()));
+    v.extend(OWED_JUDGE.iter().map(|n| n.to_string()));
     // bsv-low #608 (the B-OWED-2 lens's LOW-1): the reads whose recompute only the unread-spender rule asked for
     v.push("owed_spender_rejudge_total".to_string());
     v.push("applayer_owed_read_faults_total".to_string());
