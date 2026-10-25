@@ -82,6 +82,13 @@
   }
  ],
  "not_tables": {
+  "walk": {
+   "crate": "low-app-layer",
+   "ops": [
+    "SELECT"
+   ],
+   "why": "the owed drain's recursive CTE over owed_dirty's identities (owed_judge.rs DRAIN_IDENTITIES_SQL, the D2-OWED lens's MEDIUM-1)"
+  },
   "funding": {
    "crate": "overlay-discovery",
    "ops": [
