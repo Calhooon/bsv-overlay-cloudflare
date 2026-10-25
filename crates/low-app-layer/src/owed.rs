@@ -694,6 +694,9 @@ pub const SPENT_ELSEWHERE_REASON: &str =
 /// claim (still unspent) or to `spent-elsewhere` (a competitor took it).
 pub const SWEEP_TIP_MOVED_REASON: &str =
     "the chain moved since this was judged; re-checking the hop against the new block";
+/// A missing tip cannot establish whether a hop probe is still current.
+pub const SWEEP_TIP_UNKNOWN_REASON: &str =
+    "the chain tip is unavailable; the hop probe's freshness is unknown";
 
 /// The families, in the order the page lists them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -3722,6 +3725,26 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                         facts,
                         reason: None,
                     });
+                } else if i.tip.is_none() {
+                    let mut facts = base_facts.clone();
+                    facts["claim"] = Value::Null;
+                    facts["claimable"] = json!(false);
+                    facts["tip"] = Value::Null;
+                    facts["tipUnknown"] = json!(true);
+                    facts["blocksToGate"] = Value::Null;
+                    rows.push(OwedRow {
+                        identity: me.clone(),
+                        outpoint,
+                        family: OwedFamily::Unbound,
+                        game_id: game,
+                        sats: e.stake_sats,
+                        opponent_identity: Some(e.opponent_identity.to_ascii_lowercase()),
+                        at_height: None,
+                        facts,
+                        reason: Some(
+                            "the chain tip is unavailable; the recovery gate is unknown".into(),
+                        ),
+                    });
                 } else if !gate_open {
                     // The rejoin row carries the served recovery gate as the `recoveryHeight` FACT (inherited
                     // from `base_facts` above, == `served_recovery_height`). It is DISPLAY-TIER: the bsv-low #469
@@ -4416,6 +4439,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             }
         }
     }
+    // A compute without a tip cannot assert that a hop probe is current.
+    // Proof-decided payouts survive; tip-dependent presses wait for a tip.
+    degrade_stale_sweeps(&mut rows, i.tip, i.tip);
     rows
 }
 
@@ -4479,14 +4505,13 @@ pub fn owed_served_tips(prev_tip: Option<u64>, tip_now: Option<u64>) -> (Option<
     (prev_tip.or(tip_now), prev_tip)
 }
 
-/// bsv-low #669: the READ-TIME freshness gate for a `hop-stranded` sweep claim (the design's §2a). The claimable
+/// bsv-low #669: the freshness gate for a `hop-stranded` sweep claim (the design's §2a). The claimable
 /// verdict in a served row rests on a chain probe taken when its snapshot was computed, at `snapshot_tip`. If the
 /// chain has moved on since (`present_tip > snapshot_tip`), or the present tip cannot be read at all, that verdict
-/// is no longer provably current and the row degrades, IN THE SERVED BODY ONLY, to a `pending` chain-wait:
+/// is no longer provably current and the row degrades to a `pending` chain-wait:
 /// `claim:null`, `claimable:false`, `chainWait:"block"`, so the client offers no press and the harness reads a block
-/// wait. The write path still stores the honest probe-current verdict; this is read-time provenance, not stored
-/// state, and the ONE place the rule lives. Fail-safe: an uncertain read never offers a dead sweep. A fresh compute
-/// (snapshot_tip == present_tip) never degrades; the tip-triggered recompute re-points the row at the new tip.
+/// wait. Computation without a tip stores the same unknown verdict; cached reads also apply this one rule.
+/// A compute with a readable tip is current; a later tip-triggered recompute re-points the row at the new tip.
 pub fn degrade_stale_sweeps(
     rows: &mut [OwedRow],
     snapshot_tip: Option<u64>,
@@ -4528,7 +4553,14 @@ pub fn degrade_stale_sweeps(
         if let Some(tn) = present_tip {
             r.facts["servedTip"] = json!(tn);
         }
-        r.reason = Some(SWEEP_TIP_MOVED_REASON.to_string());
+        r.reason = Some(
+            if tip_unknown {
+                SWEEP_TIP_UNKNOWN_REASON
+            } else {
+                SWEEP_TIP_MOVED_REASON
+            }
+            .to_string(),
+        );
     }
 }
 
@@ -4832,8 +4864,9 @@ fn recompute_before_unread(
             // the refund gate opens when the tip reaches an in-progress row's recovery height; bsv-low #669: a
             // claimable hop-stranded sweep's chain probe is no longer tip-current, so a moved tip must re-probe it
             // (a non-LOW competitor's block fires no other hook) — the serve-then-refresh runs now, not in 5 minutes.
-            (r.family == OwedFamily::InProgress
-                && r.facts["recoveryHeight"].as_u64().is_some_and(|h| t >= h))
+            r.facts["tipUnknown"] == Value::Bool(true)
+                || (r.family == OwedFamily::InProgress
+                    && r.facts["recoveryHeight"].as_u64().is_some_and(|h| t >= h))
                 || (r.family == OwedFamily::HopStranded
                     && r.facts["claimable"] == Value::Bool(true))
         }),
@@ -5985,7 +6018,7 @@ pub(crate) mod tests {
         hex::encode([b; 32])
     }
 
-    fn entry(
+    pub(crate) fn entry(
         spent: Option<bool>,
         verdict: Option<PotVerdict>,
         outcome: Outcome,
@@ -10197,9 +10230,11 @@ pub(crate) mod tests {
         let rows = derive_owed_rows(&inputs(&e, &r, &[], &none, &c, &p, Some(900_005)));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert!(rows[0].reason.as_deref().unwrap().contains("dead-man"));
-        // an unknown tip cannot open the gate: in-progress with no blocks figure, never refund-due
+        // An unknown tip decides no recovery gate or rejoin claim.
         let rows = derive_owed_rows(&inputs(&e, &r, &[], &valid, &c, &p, None));
-        assert_eq!(rows[0].family, OwedFamily::InProgress);
+        assert_eq!(rows[0].family, OwedFamily::Unbound);
+        assert_eq!(rows[0].facts["tipUnknown"], true);
+        assert_eq!(rows[0].facts["claimable"], false);
         assert!(rows[0].facts["blocksToGate"].is_null());
         // MEDIUM-9: the gate height is the ONE shared predicate — a committed 0 falls back to the marker's height
         // (`/refund-view` serves gate-open for the same pot), a timestamp-range value is no height at all
@@ -16377,16 +16412,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// PIN M1b (characterization of the self-heal rule MEDIUM-1 leans on; GREEN on the pre-fold tip — it states the
-    /// EXISTING recompute/write behavior, unchanged by this fold). A recompute STORES the tip it computed at:
-    ///   - chaintracks answered -> `owed_write_plan` binds `Some(height)` into `OWED_STATE_UPSERT_SQL` (the gate then
-    ///     serves it tip-current, or degrades it on the next block);
-    ///   - chaintracks did not answer AND a prior tip existed -> `owed_recompute_inner` bails BEFORE the write
-    ///     (`routes.rs`: "the previous rows stand"), so a good tip is never overwritten with NULL;
-    ///   - chaintracks did not answer AND no prior tip (a FIRST compute under a blip) -> the snapshot stores NULL,
-    ///     which (a) the read-side gate degrades fail-safe (MEDIUM-1), and (b) `should_recompute` re-arms on the NEXT
-    ///     readable tip (`gate_flipped` fires for a claimable hop-stranded row when `prev_tip` is None < `tip_now`),
-    ///     so the next read with chaintracks back up stores a real tip. The NULL state is gone after one such read.
+    /// PIN M1b: a recompute stores the tip it computed at, including NULL when chaintracks is unavailable.
+    /// TIP-877's fold permits the write after any previous snapshot: proof-decided rows advance, while
+    /// tip-dependent rows carry tipUnknown and re-arm on the next readable tip. This pin checks the write
+    /// plan's binds; tip_tests drives the 503 through the recompute, derivation and actual SQLite write.
     #[test]
     fn pin669_m1b_a_recompute_stores_the_tip_it_computed_at_and_a_null_tip_self_heals() {
         let rows = stranded_sweep_rows(971_115);
@@ -16402,7 +16431,7 @@ pub(crate) mod tests {
             OwedBind::Int(971_115),
             "a recompute stores the tip chaintracks answered"
         );
-        // chaintracks did not answer on a first compute: the upsert binds NULL (fail-safe at read, re-armed next tip).
+        // Chaintracks did not answer: the upsert binds NULL, even after a previous compute.
         let plan = owed_write_plan(ME, &rows, 1_792_000_000_000, None, false);
         let binds = &plan
             .iter()
@@ -16412,7 +16441,7 @@ pub(crate) mod tests {
         assert_eq!(
             binds[2],
             OwedBind::Null,
-            "a tip-less first compute stores NULL (the degrade + the re-arm self-heal it)"
+            "a tip-less compute stores NULL (the degrade + the re-arm self-heal it)"
         );
         // the re-arm: a NULL prev_tip claimable hop-stranded snapshot recomputes the moment a tip is readable.
         assert!(

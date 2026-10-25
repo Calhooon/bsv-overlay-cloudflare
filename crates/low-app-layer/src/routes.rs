@@ -628,19 +628,17 @@ async fn chaintracks_present_height(
 /// guard has no route context; bsv-low M19 R2).
 pub(crate) async fn chaintracks_present_height_env(
     env: &worker::Env,
-    tag: &str,
+    _tag: &str,
 ) -> std::result::Result<u64, (&'static str, u16)> {
     let reply = tip_reply_env(env).await;
     match (reply.status, reply.body["height"].as_u64()) {
         (200, Some(height)) => Ok(height),
-        _ => {
-            console_warn!("[{tag}] verified header tip unavailable");
-            Err(("verified header tip unavailable", 503))
-        }
+        // Callers own the fault's context; do not log the same 503 at both layers.
+        _ => Err(("verified header tip unavailable", 503)),
     }
 }
 
-/// `GET /tip`: the proof tracker's verified header tip and its age.
+/// `GET /tip`: the proof tracker's verified header tip and its sync age.
 /// An unavailable or over-age snapshot is a named 503, with diagnostics only.
 pub async fn tip(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let reply = tip_reply_env(&ctx.env).await;
@@ -653,7 +651,7 @@ pub async fn tip(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response
 
 async fn tip_reply_env(env: &worker::Env) -> TipReply {
     tip_reply_with(
-        |route| crate::tracker_host::chaintracks_get(env, route),
+        |route| async move { crate::tracker_host::chaintracks_get(env, &route).await },
         crate::tracker_host::last_verified_tip,
         || worker::Date::now().as_millis(),
     )
@@ -661,6 +659,7 @@ async fn tip_reply_env(env: &worker::Env) -> TipReply {
 }
 
 const TIP_MAX_AGE_MS: u64 = 30 * 60 * 1_000;
+const TIP_REORG_MARGIN: u32 = 1;
 const TIP_RETRY_AFTER_SECS: &str = "60";
 
 struct TipReply {
@@ -671,7 +670,7 @@ struct TipReply {
 
 async fn tip_reply_with<G, F, L, N>(get: G, last_known: L, now_ms: N) -> TipReply
 where
-    G: FnOnce(&'static str) -> F,
+    G: Fn(String) -> F,
     F: std::future::Future<
         Output = std::result::Result<(u16, serde_json::Value), bsv_tracker::HeaderError>,
     >,
@@ -681,9 +680,10 @@ where
     let current = crate::tracker_host::verified_tip_with(get).await.ok();
     let last_known = last_known();
     let now = now_ms();
-    let fresh = current
-        .as_ref()
-        .is_some_and(|tip| now.saturating_sub(tip.at) <= TIP_MAX_AGE_MS);
+    let fresh = current.as_ref().is_some_and(|tip| {
+        now.saturating_sub(tip.synced_at) <= TIP_MAX_AGE_MS
+            && tip.last_seen_height <= tip.height.saturating_add(TIP_REORG_MARGIN)
+    });
     let mut body = tip_body(current.as_ref().or(last_known.as_ref()), now);
     if !fresh {
         body["code"] = serde_json::json!("ERR_TIP_UNAVAILABLE");
@@ -3477,6 +3477,41 @@ async fn owed_recompute_inner(
     // bsv-low #800: the walk's clock (its outward budget inside its slice) and its id for the log lines (#566)
     walk: &OwedWalk,
 ) -> std::result::Result<OwedComputed, String> {
+    owed_recompute_with(
+        tip_hint,
+        async { chaintracks_present_height_env(env, "owed").await.ok() },
+        |tip| owed_recompute_at_tip(env, db, identity_lc, source, tip, walk),
+    )
+    .await
+}
+
+/// A tip fault removes only tip-dependent judgements. The index's proof is
+/// still read and the recomputed rows are written and pushed during the fault.
+async fn owed_recompute_with<T, R, C, F>(
+    tip_hint: Option<u64>,
+    read_tip: R,
+    compute: C,
+) -> std::result::Result<T, String>
+where
+    R: std::future::Future<Output = Option<u64>>,
+    C: FnOnce(Option<u64>) -> F,
+    F: std::future::Future<Output = std::result::Result<T, String>>,
+{
+    let tip = match tip_hint {
+        Some(t) => Some(t),
+        None => read_tip.await,
+    };
+    compute(tip).await
+}
+
+async fn owed_recompute_at_tip(
+    env: &worker::Env,
+    db: &worker::D1Database,
+    identity_lc: &str,
+    source: &str,
+    tip: Option<u64>,
+    walk: &OwedWalk,
+) -> std::result::Result<OwedComputed, String> {
     use crate::owed::{
         derive_owed_rows, outpoint_key, refund_output_sats, sort_rows_for_service, OwedInputs,
         ValidRefund,
@@ -3485,30 +3520,6 @@ async fn owed_recompute_inner(
     use std::collections::{HashMap, HashSet};
 
     let era = written_off_before_ms_env(env);
-    let tip = match tip_hint {
-        Some(t) => Some(t),
-        None => chaintracks_present_height_env(env, "owed").await.ok(),
-    };
-    if tip.is_none() {
-        // MEDIUM-8: a chaintracks blip must never rewrite the gate rows (refund-due → in-progress); when a previous
-        // compute had a tip, the previous rows STAND and the fault is counted. A first compute proceeds without a
-        // gate (the staleness rule re-derives it minutes later).
-        let prev = match db
-            .prepare(crate::owed::OWED_STATE_READ_SQL)
-            .bind(&[JsValue::from_str(identity_lc)])
-        {
-            Ok(stmt) => stmt
-                .counted_first::<OwedStateD1>()
-                .await
-                .ok()
-                .flatten()
-                .and_then(|s| s.tip),
-            Err(_) => None,
-        };
-        if prev.is_some() {
-            return Err("chaintracks tip unavailable; the previous rows stand".to_string());
-        }
-    }
     let now_ms = worker::Date::now().as_millis() as i64;
     let started_ms = now_ms;
     let rid = walk.rid.as_str();
@@ -7066,7 +7077,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
     let mut served_snapshot_is_fresh = false;
     let (rows, tip, computed_at_ms, walk_cut, recompute_seq) = match state {
         None => {
-            // a first read computes the snapshot at the present tip: it is fresh, never degraded.
+            // The derivation already gates tip-dependent rows when this read has no tip.
             served_snapshot_is_fresh = true;
             // MEDIUM-5: a public read must not WRITE state keyed on a claimable name — an identity with no party row
             // and no hop row has nothing to derive: an empty body, nothing computed, nothing written.
@@ -7144,6 +7155,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             // needs the tip exactly as the in-progress refund gate does.
             let needs_tip = rows.iter().any(|r| {
                 r.family == crate::owed::OwedFamily::InProgress
+                    || r.facts["tipUnknown"] == serde_json::Value::Bool(true)
                     || (r.family == crate::owed::OwedFamily::HopStranded
                         && r.facts["claimable"] == serde_json::Value::Bool(true))
             });
@@ -7155,7 +7167,13 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             // so the refund gate can only open up to ~30 s LATE, never early — fail-safe (a refund is never shown
             // claimable before its recovery height). Do not revert this to the uncached read to shave that window.
             let mut tip_now: Option<u64> = if needs_tip {
-                crate::beef_guard::present_tip(&ctx.env).await
+                if prev_tip.is_none() {
+                    // A faulted compute must re-arm on a current answer, not a
+                    // stale held height that would immediately repeat the fault.
+                    chaintracks_present_height(&ctx, "owed-unknown").await.ok()
+                } else {
+                    crate::beef_guard::present_tip(&ctx.env).await
+                }
             } else {
                 None
             };
@@ -7305,7 +7323,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
                                 .await
                             {
                                 Ok(v) => {
-                                    // recomputed at the present tip: the snapshot is fresh, never degraded.
+                                    // The derivation already gates any unknown-tip rows.
                                     served_snapshot_is_fresh = true;
                                     v
                                 }
@@ -7331,7 +7349,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
     // bsv-low #669: the ONE place the freshness rule lives. A STORED snapshot's hop-stranded sweep claim rests on a
     // chain probe taken at `snapshot_tip_for_degrade` (the TRUE stored `owed_state.tip`, possibly None — NOT the
     // body's display `tip`, MEDIUM-1); if the chain has moved on since (or the present/snapshot tip cannot be read),
-    // the served row degrades to a `pending` chain-wait — never a dead sweep. A fresh compute is tip-current, skipped.
+    // the served row degrades to a pending chain-wait. A new compute already applied the same gate.
     if !served_snapshot_is_fresh {
         crate::owed::degrade_stale_sweeps(
             &mut served,
