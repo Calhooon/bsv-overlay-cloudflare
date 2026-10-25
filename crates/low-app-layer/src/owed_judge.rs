@@ -112,7 +112,8 @@ pub use writers::{
 };
 pub(crate) use hydrate::hydrate_filings;
 pub use hydrate::{
-    hydrate_inputs, HOPS_SQL, LINKS_SQL, PARTIES_SQL, RELEASED_SQL, REPRESENTATIVES_SQL,
+    hydrate_inputs, HOPS_SQL, HOP_COMPETITORS_SQL, LINKS_SQL, PARTIES_SQL, RELEASED_SQL,
+    REPRESENTATIVES_SQL,
 };
 
 pub const OWED_JUDGE_SUBJECTS_PER_INVOCATION: usize = 16;
@@ -253,6 +254,12 @@ pub struct JudgeInputs {
     funding_seen: HashSet<String>,
     word_rows: BTreeMap<String, crate::tracker_host::stored::Row>,
     moved_latches: Vec<(String, String)>,
+    /// The walk's post-derivation inputs (the D2-OWED lens's MEDIUM-3): the hops whose confirmed chain word was taken
+    /// inside the reorg grace (`hops_view::mark_reorg_grace_rows`), the words served without their confirmation and
+    /// the filed sweeps' proofs such a word set aside (`hops_view::mark_refused_word_rows`).
+    pub(crate) grace_words: HashSet<String>,
+    pub(crate) refused_words: HashMap<String, Option<String>>,
+    pub(crate) proofs_set_aside: HashSet<String>,
 }
 impl JudgeInputs {
     pub fn as_inputs(&self) -> OwedInputs<'_> {
@@ -417,6 +424,12 @@ pub async fn judge_with_write(
         }
         let mut rows = derive_owed_rows(&i.as_inputs());
         rows.retain(|r| games.contains(&r.game_id));
+        // The old walk's display marks after its derivation, in its order (the walk-against-judge pin holds them).
+        for row in &mut rows {
+            crate::routes::mark_pending_spender(row, None, i.now_ms);
+        }
+        crate::hops_view::mark_refused_word_rows(&mut rows, &i.refused_words, &i.proofs_set_aside);
+        crate::hops_view::mark_reorg_grace_rows(&mut rows, &i.grace_words);
         hydrate::finish_rows(db, &mut rows).await?;
         crate::owed::sort_rows_for_service(&mut rows);
         let cut = rows.len() > crate::owed::OWED_MAX_ROWS;
