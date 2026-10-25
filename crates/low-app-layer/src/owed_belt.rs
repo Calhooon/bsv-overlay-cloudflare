@@ -4,14 +4,16 @@
 //! A Durable Object alarm (the `BOARD_VIEW` actor named [`OWED_BELT_ACTOR`]; the deferred walk's alarm is gone) runs
 //! one [`tick`] every [`OWED_BELT_TICK_MS`], and the scheduled pass re-arms it ([`arm`], the watchdog: a lost alarm
 //! costs at most one 15 minute cron). A tick reads the [`OWED_BELT_OUTPOINTS_PER_TICK`] rows whose `beltDueAtMs` is
-//! past ([`CANDIDATES_SQL`] over `idx_owed_rows_belt`; the judge sets that column for exactly the rows that owe the
-//! chain a question, `owed_judge::row_statements`) and asks each through the existing ladders behind ONE gate
+//! past ([`CANDIDATES_SQL`] over `idx_owed_rows_belt_turn`, round-robin by identity: one row of each due identity
+//! before a second of any, the D2-OWED lens's HIGH-3; the judge sets that column for exactly the rows that owe the
+//! chain a question it can answer, `owed_judge::row_statements`) and asks each through the existing ladders behind ONE gate
 //! ([`Gate`]): at most [`OWED_BELT_CALLS_PER_OUTPOINT`] courier calls an outpoint and [`OWED_BELT_CALLS_PER_TICK`] a
 //! tick, the three-fault circuit per rung per tick, a rung's 429 ending that rung's turn (never the tick). Every find
 //! is ONE batch (`owed_judge::judge_with_write`): the probe memo with the tip it was taken at, the spender's bytes
 //! (content-addressed, DO NOTHING), a `proofmined:` or `homeproof:` latch when it checked, then the judge's rows for
 //! that subject, judged over the same facts supplied in memory. A fault rolls all of it back. A candidate no rung
-//! answered keeps its row and facts and is re-armed once at `now +` [`OWED_BELT_UNANSWERED_RETRY_MS`].
+//! answered keeps its row and facts and is re-armed once at `now +` [`OWED_BELT_UNANSWERED_RETRY_MS`]; a find that
+//! changed nothing the row says doubles the row's period, to [`OWED_BELT_BACKOFF_MAX_MS`].
 use crate::hops_view::{ChainSpendProbe, ProbeMemo};
 use crate::owed::{self, HomeSpendWord, HopChainWord, StoredSpenderBytes};
 use crate::owed_judge::{self, JudgeDb, Subject};
@@ -25,6 +27,9 @@ pub const OWED_BELT_CALLS_PER_TICK: usize = 24;
 pub const OWED_BELT_CALLS_PER_OUTPOINT: usize = 3;
 /// A candidate no rung answered (every rung faulted, rate-limited or closed) is looked at again this much later.
 pub const OWED_BELT_UNANSWERED_RETRY_MS: i64 = 300_000;
+/// A look that changed nothing (the D2-OWED lens's HIGH-3) doubles its row's period, to this ceiling (6 h). The
+/// judge's own dating (a source write, a tip) starts it again at the family's base period.
+pub const OWED_BELT_BACKOFF_MAX_MS: i64 = 6 * 3_600_000;
 /// The rung's circuit: this many faults in one tick close it for the rest of the tick (`tracker_host::pacing`'s 3).
 pub const OWED_BELT_RUNG_FAULTS: u8 = 3;
 /// The singleton actor's name in `BOARD_VIEW` (fleet-wide: one belt whatever the number of readers or isolates).
@@ -34,7 +39,14 @@ pub const OWED_BELT_STATE_NAME: &str = "belt";
 /// The rungs, by courier host. `other` is any host the ladders reach that is none of the three.
 pub const RUNGS: [&str; 4] = ["woc", "bitails", "bananablocks", "other"];
 
-pub const CANDIDATES_SQL: &str = "SELECT identity,outpoint,gameId,family,facts,COALESCE(claimable, CASE json_type(facts,'$.claimable') WHEN 'true' THEN 1 WHEN 'false' THEN 0 END) AS claimable FROM owed_rows INDEXED BY idx_owed_rows_belt WHERE beltDueAtMs<=?1 ORDER BY beltDueAtMs,outpoint LIMIT ?2";
+/// The due rows, every identity's oldest first, then each identity's second, and so on (the D2-OWED lens's HIGH-3: a
+/// stranger's thousand due rows take one place a tick, not the tick). The inner read is the covering partial index's
+/// due range; the outer read is one primary-key read per chosen row.
+pub const CANDIDATES_SQL: &str = "SELECT r.identity,r.outpoint,r.gameId,r.family,r.facts,r.reason,r.probeTip,r.beltDueAtMs,r.judgedAtMs,COALESCE(r.claimable, CASE json_type(r.facts,'$.claimable') WHEN 'true' THEN 1 WHEN 'false' THEN 0 END) AS claimable FROM (SELECT identity,outpoint,beltDueAtMs,ROW_NUMBER() OVER (PARTITION BY identity ORDER BY beltDueAtMs,outpoint) AS turn FROM owed_rows INDEXED BY idx_owed_rows_belt_turn WHERE beltDueAtMs<=?1) d CROSS JOIN owed_rows r ON r.identity=d.identity AND r.outpoint=d.outpoint ORDER BY d.turn,d.beltDueAtMs,d.outpoint LIMIT ?2";
+/// The row as the find's judge left it, for the backoff's comparison.
+pub const AFTER_FIND_SQL: &str = "SELECT family,facts,reason,probeTip,beltDueAtMs FROM owed_rows WHERE identity=?1 AND outpoint=?2";
+/// The backoff: a dated row whose look changed nothing.
+pub const BACKOFF_SQL: &str = "UPDATE owed_rows SET beltDueAtMs=?3 WHERE identity=?1 AND outpoint=?2 AND beltDueAtMs IS NOT NULL";
 /// A candidate no rung answered: its row and facts untouched, its next look dated once (never pushed further by a
 /// second fault in the same tick: the statement sets, it does not add).
 pub const REARM_SQL: &str = "UPDATE owed_rows SET beltDueAtMs=?3 WHERE identity=?1 AND outpoint=?2 AND beltDueAtMs IS NOT NULL";
@@ -155,6 +167,11 @@ pub struct Candidate {
     /// The stored `claimable` column, or the row's `facts.claimable` where an old worker's row left it NULL during the
     /// deploy window (risk 8.4): the candidate never reads a judgement from a column the old worker could not write.
     pub claimable: Option<bool>,
+    /// The row as the tick read it, for the backoff's comparison and its period.
+    pub reason: Option<String>,
+    pub probe_tip: Option<i64>,
+    pub due_at_ms: Option<i64>,
+    pub judged_at_ms: Option<i64>,
 }
 
 /// What the row owes the chain (section 5's list), read off the row the judge stored.
@@ -387,6 +404,8 @@ pub struct TickReport {
     pub asked: usize,
     pub found: usize,
     pub rearmed: usize,
+    /// Finds whose row read as before the look: their period doubled (HIGH-3).
+    pub backed_off: usize,
     /// Candidates the tick's call budget left untouched (still due, first by due time next tick).
     pub left: usize,
     pub calls: usize,
@@ -440,6 +459,10 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
                 .and_then(|f| serde_json::from_str(f).ok())
                 .unwrap_or(Value::Null),
             claimable: r["claimable"].as_i64().map(|n| n != 0),
+            reason: r["reason"].as_str().map(str::to_owned),
+            probe_tip: r["probeTip"].as_i64(),
+            due_at_ms: r["beltDueAtMs"].as_i64(),
+            judged_at_ms: r["judgedAtMs"].as_i64(),
         };
         if gate.spent() {
             report.left += 1;
@@ -469,7 +492,10 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
                     })
                     .await;
                 match judged {
-                    Ok(_) => report.found += 1,
+                    Ok(_) => {
+                        report.found += 1;
+                        backoff(db, &c, now, &mut report).await;
+                    }
                     Err(e) => {
                         db.log(&format!("[owed-belt] {} find's write faulted: {e}", c.outpoint));
                         report.write_faults.push((c.outpoint.clone(), e));
@@ -530,6 +556,82 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
         report.write_faults.len()
     ));
     Ok(report)
+}
+
+/// What a look can change about a row: its family, its words of the claim, the chain's word, the tip it was judged at.
+fn look_shape(family: &str, facts: &Value, reason: Option<&str>, probe_tip: Option<i64>) -> Value {
+    serde_json::json!([
+        family,
+        reason,
+        probe_tip,
+        facts["claim"],
+        facts["claimable"],
+        facts["chainProbe"],
+        facts["chainSpender"],
+        facts["spentConfirmed"],
+        facts["creditKind"],
+        facts["homeOnChain"],
+    ])
+}
+
+/// The next period of a row whose find changed nothing: twice its last (`beltDueAtMs - judgedAtMs`), to the ceiling.
+pub fn backoff_period(due_at_ms: Option<i64>, judged_at_ms: Option<i64>, base_ms: i64) -> i64 {
+    let last = match (due_at_ms, judged_at_ms) {
+        (Some(due), Some(judged)) if due > judged => due - judged,
+        _ => base_ms,
+    };
+    last.max(base_ms)
+        .saturating_mul(2)
+        .min(OWED_BELT_BACKOFF_MAX_MS)
+}
+
+/// After a find landed: when the row it judged reads as it did before the look, the look bought nothing, so the row's
+/// next look waits twice as long (the D2-OWED lens's HIGH-3). A row that changed keeps the judge's base date.
+async fn backoff(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickReport) {
+    let binds = vec![Bind::Text(c.identity.clone()), Bind::Text(c.outpoint.clone())];
+    let after = db
+        .run_batch(vec![Stmt {
+            sql: AFTER_FIND_SQL.into(),
+            binds: binds.clone(),
+        }])
+        .await;
+    let Some(row) = after
+        .ok()
+        .and_then(|o| o.into_iter().next())
+        .and_then(|o| o.rows.into_iter().next())
+    else {
+        return;
+    };
+    let Some(base_due) = row["beltDueAtMs"].as_i64() else {
+        return;
+    };
+    let facts: Value = row["facts"]
+        .as_str()
+        .and_then(|f| serde_json::from_str(f).ok())
+        .unwrap_or(Value::Null);
+    let before = look_shape(&c.family, &c.facts, c.reason.as_deref(), c.probe_tip);
+    let now_shape = look_shape(
+        row["family"].as_str().unwrap_or_default(),
+        &facts,
+        row["reason"].as_str(),
+        row["probeTip"].as_i64(),
+    );
+    if before != now_shape {
+        return;
+    }
+    let period = backoff_period(c.due_at_ms, c.judged_at_ms, (base_due - now).max(1));
+    let mut binds = binds;
+    binds.push(Bind::Int(now + period));
+    match db
+        .run_batch(vec![Stmt {
+            sql: BACKOFF_SQL.into(),
+            binds,
+        }])
+        .await
+    {
+        Ok(_) => report.backed_off += 1,
+        Err(e) => db.log(&format!("[owed-belt] backoff of {} faulted: {e}", c.outpoint)),
+    }
 }
 
 async fn rearm(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickReport) {
