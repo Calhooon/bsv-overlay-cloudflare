@@ -323,7 +323,9 @@
         "reads": 3000,
         "writes": 0,
         "stmts": 3,
-        "maxReads": 2006
+        "maxReads": 2006,
+        "courierCalls": 0,
+        "backgroundTasks": 0
       },
       "censusKey": "/owed",
       "stressMeasured": {
@@ -342,16 +344,24 @@
     "owed-wanted-read": {
       "route": "/owed: no identity marker, one party row; one mark_wanted statement after the indexed probe",
       "measured": {
+        "reads": 1,
+        "writes": 5,
+        "stmts": 1,
+        "maxReads": 1
+      },
+      "requestMeasured": {
         "reads": 3,
         "writes": 5,
         "stmts": 5,
         "maxReads": 1
       },
       "ceiling": {
-        "writes": 1,
-        "stmts": 5
+        "writes": 5,
+        "stmts": 1,
+        "courierCalls": 0,
+        "backgroundTasks": 0
       },
-      "note": "The requested one-write ceiling remains RED: D1 reports 5 physical row/index/counter writes for the single application-row insert.",
+      "note": "Ruling 1 (bsv-low record 1277): the ceiling counts the single wanted INSERT, including its row, indexes and AUTOINCREMENT sequence. requestMeasured retains the complete request's four reads plus that INSERT.",
       "censusKey": null
     },
     "owed-belt-tick": {
