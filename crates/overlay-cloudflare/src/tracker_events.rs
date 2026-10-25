@@ -158,7 +158,12 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<bool, String>>,
 {
-    match post(frame.to_string()).await {
+    let result = post(frame.to_string()).await;
+    record_delivery(frame, result);
+}
+
+fn record_delivery(frame: Value, result: Result<bool, String>) {
+    match result {
         Ok(true) => count(&frame, "shipped"),
         Ok(false) => count(&frame, "unheld"),
         Err(_) => failed(frame),
@@ -183,34 +188,51 @@ pub struct WordsShipped {
     pub before_notes: usize,
     /// Frames POSTed after the notes (past the slice, before the deadline).
     pub after_notes: usize,
-    /// Frames the deadline stopped (counted `walled`, retried once on the next flush).
+    /// Frames the deadline stopped, counted `walled` without consuming a delivery retry.
     pub walled: usize,
 }
 
-async fn post_frames<P, Fut, C>(
+async fn post_frames<P, Fut, C, S, Sleep>(
     frames: Vec<Value>,
     post: &mut P,
     now_ms: &C,
     until_ms: u64,
     last: bool,
+    sleep: &S,
 ) -> (usize, Vec<Value>)
 where
     P: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Result<bool, String>>,
     C: Fn() -> u64,
+    S: Fn(u64) -> Sleep,
+    Sleep: std::future::Future<Output = ()>,
 {
     let (mut posted, mut left) = (0, Vec::new());
     for frame in frames {
         if now_ms() >= until_ms {
             if last {
                 count(&frame, "walled");
-                failed(frame.clone());
+                enqueue(frame.clone());
             }
             left.push(frame);
             continue;
         }
         posted += 1;
-        deliver(frame, &mut *post).await;
+        match crate::race_or_deadline(
+            post(frame.to_string()),
+            sleep(until_ms.saturating_sub(now_ms())),
+        )
+        .await
+        {
+            Some(result) => record_delivery(frame, result),
+            None => {
+                if last {
+                    count(&frame, "walled");
+                    enqueue(frame.clone());
+                }
+                left.push(frame);
+            }
+        }
     }
     (posted, left)
 }
@@ -221,7 +243,7 @@ where
 /// frame before it answers, so a note shipped after a word's answer triggers a recompute that reads that word.
 pub async fn ship_in_order<P, Fut, N, NFut, C>(
     words: Vec<Value>,
-    mut post: P,
+    post: P,
     notes: N,
     now_ms: C,
     deadline_ms: u64,
@@ -233,15 +255,63 @@ where
     NFut: std::future::Future<Output = ()>,
     C: Fn() -> u64,
 {
+    ship_in_order_with(
+        words,
+        post,
+        notes,
+        now_ms,
+        deadline_ms,
+        crate::broadcaster::sleep_ms,
+    )
+    .await
+    .0
+}
+
+pub(crate) async fn ship_in_order_with<P, Fut, N, NFut, C, S, Sleep>(
+    words: Vec<Value>,
+    mut post: P,
+    notes: N,
+    now_ms: C,
+    deadline_ms: u64,
+    sleep: S,
+) -> (WordsShipped, Vec<Value>)
+where
+    P: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+    N: FnOnce(u64) -> NFut,
+    NFut: std::future::Future<Output = ()>,
+    C: Fn() -> u64,
+    S: Fn(u64) -> Sleep,
+    Sleep: std::future::Future<Output = ()>,
+{
     let slice_ms = deadline_ms.min(now_ms().saturating_add(WORDS_SHARE_MS));
-    let (before_notes, left) = post_frames(words, &mut post, &now_ms, slice_ms, false).await;
+    let (before_notes, left) =
+        post_frames(words, &mut post, &now_ms, slice_ms, false, &sleep).await;
     notes(deadline_ms).await;
-    let (after_notes, walled) = post_frames(left, &mut post, &now_ms, deadline_ms, true).await;
-    WordsShipped {
+    let (after_notes, walled) =
+        post_frames(left, &mut post, &now_ms, deadline_ms, true, &sleep).await;
+    let summary = WordsShipped {
         before_notes,
         after_notes,
         walled: walled.len(),
-    }
+    };
+    (summary, walled)
+}
+
+/// Retain timed-out word frames in the existing outbox as well as the isolate queue.
+pub(crate) async fn park_walled<P: crate::change_park::ParkPort>(
+    port: &P,
+    frames: Vec<Value>,
+    now_ms: u64,
+) {
+    crate::change_park::park_noted_back(
+        port,
+        crate::change_park::KIND_WORD,
+        frames.into_iter().map(|frame| frame.to_string()).collect(),
+        crate::change_park::COUNTER_CHANGE_PARKED,
+        now_ms,
+    )
+    .await;
 }
 
 /// [`ship_in_order`] on the Worker: the frames to the app layer's `/internal/tx-word` (each answer read for `held`,
@@ -264,17 +334,25 @@ where
     };
     let (url, token) = configured.unwrap_or_default();
     let (url, token) = (url.as_str(), token.as_str());
-    ship_in_order(
+    let (_, walled) = ship_in_order_with(
         words,
         |body| async move {
-            crate::change_flush::post_body_answer(env, url, token, "/internal/tx-word", "tx-word", body)
-                .await
-                .map(|answer| answered_held(&answer))
-                .map_err(|_| "undelivered".to_string())
+            crate::change_flush::post_body_answer(
+                env,
+                url,
+                token,
+                "/internal/tx-word",
+                "tx-word",
+                body,
+            )
+            .await
+            .map(|answer| answered_held(&answer))
+            .map_err(|_| "undelivered".to_string())
         },
         notes,
         || worker::Date::now().as_millis(),
         deadline_ms,
+        crate::broadcaster::sleep_ms,
     )
     .await;
     let pending = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
@@ -282,11 +360,59 @@ where
         for (name, n) in pending {
             crate::ops::bump_counter(&db, &name, n).await;
         }
+        park_walled(
+            &crate::change_park::WorkerPark { db: &db },
+            walled,
+            worker::Date::now().as_millis(),
+        )
+        .await;
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn d2_649_hung_word_yields_to_notes_and_is_counted_at_the_wall() {
+        use std::cell::Cell;
+        drain();
+        let clock = Cell::new(0);
+        let notes_at = Cell::new(None);
+        let before = health_json()["tracker_events_arcade_walled_total"]
+            .as_u64()
+            .unwrap_or(0);
+        let work = ship_in_order_with(
+            vec![json!({"txid": "ab".repeat(32), "kind": "seen", "retry": true})],
+            |_| std::future::pending::<Result<bool, String>>(),
+            |_| async {
+                notes_at.set(Some(clock.get()));
+            },
+            || clock.get(),
+            20_000,
+            |ms| {
+                let until = clock.get() + ms;
+                let clock = &clock;
+                async move {
+                    clock.set(until);
+                }
+            },
+        );
+        let done = crate::change_flush::run(crate::race_or_deadline(work, async {
+            clock.set(30_000);
+        }));
+        assert!(
+            done.is_some(),
+            "hung word consumed the platform window before notes or deferral"
+        );
+        assert_eq!(notes_at.get(), Some(WORDS_SHARE_MS));
+        let (summary, frames) = done.unwrap();
+        assert_eq!(summary.walled, 1);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            health_json()["tracker_events_arcade_walled_total"].as_u64(),
+            Some(before + 1)
+        );
+        assert_eq!(drain().len(), 1, "the timed-out frame remains queued");
+    }
     #[tokio::test]
     async fn ns3_m3_refused_frame_is_shipped_on_next_flush() {
         drain();

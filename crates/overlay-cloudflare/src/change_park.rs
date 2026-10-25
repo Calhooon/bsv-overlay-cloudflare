@@ -34,7 +34,7 @@
 //! notes before the words, the order every flush otherwise keeps), and the drain delivers the word set FIRST, one
 //! frame a POST to `/internal/tx-word` (at most `change_flush::CHANGE_MAX_CHUNKS` a tick, under the drain's wall). The lobby set has its own flush and the skip never parks it; since bsv-low #560 (B-COST-1) every flush of the three sets parks its NEW note-backs here too ([`park_noted_back`], the lobby set as [`KIND_LOBBY`]), and the drain delivers the lobby rows last. The cron's
 //! delivery runs before the GASP step under its own wall ([`DRAIN_WALL_MS`]) and at most [`DRAIN_MAX_ROWS`] rows
-//! a set a tick; a POST in flight is not raced (as every flush: `change_flush.rs`). A delete that faults after an
+//! a set a tick; the drain's POST in flight is not raced. A delete that faults after an
 //! accepted POST leaves the row, which is delivered again (over-notification is harmless: the app layer re-reads).
 use worker::*;
 

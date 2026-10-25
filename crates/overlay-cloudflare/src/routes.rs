@@ -5379,24 +5379,42 @@ mod tests {
         // AFTER the Seen look that guards it; the eviction strictly after the
         // evidence check.
         let job_src = code_only(include_str!("admit_fast.rs"));
-        let job = &job_src[job_src
-            .find("pub async fn pending_watch_job(")
-            .expect("the watch job exists")..];
-        let job = &job[..job.find("\n}\n").expect("the job ends")];
+        let wrapper = &job_src[job_src.find("pub async fn pending_watch_job(").unwrap()..];
+        let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap()];
+        assert!(wrapper.contains("pending_watch_job_with(&port, admitted_at_ms).await"));
+        let job = &job_src[job_src.find("async fn pending_watch_job_with<").unwrap()..];
+        let job: String = job[..job.find("\n}\n").unwrap()]
+            .split_whitespace()
+            .collect();
         assert_eq!(
-            job.matches(&needle).count(),
+            job.matches("port.seen(").count(),
             1,
-            "exactly ONE latch producer inside the pending watch"
+            "one latch call in the watch loop"
         );
-        let seen_at = job.find("WitnessLook::Seen(").expect("the Seen look");
-        let latch_at = job.find(&needle).expect("counted above");
-        let fatal_at = job.find("WitnessLook::Fatal(").expect("the Fatal look");
-        let evidence_at = job.find("evidence_check(").expect("the evidence check");
-        let evict_at = job.find("evict_txid_everywhere(").expect("the eviction");
+        let seen_at = job.find("WitnessLook::Seen(").unwrap();
+        let latch_at = job.find("port.seen(").unwrap();
+        let fatal_at = job.find("WitnessLook::Fatal(").unwrap();
+        let evidence_at = job.find("port.evidence(").unwrap();
+        let evict_at = job.find("port.evict(").unwrap();
         assert!(
-            seen_at < latch_at && fatal_at < evidence_at && evidence_at < evict_at,
-            "latch after the Seen look (seen@{seen_at} latch@{latch_at}); eviction after the evidence check (fatal@{fatal_at} evidence@{evidence_at} evict@{evict_at})"
+            seen_at < latch_at
+                && latch_at < fatal_at
+                && fatal_at < evidence_at
+                && evidence_at < evict_at
         );
+        let adapter = &job_src[job_src.find("impl PendingWatch for WorkerWatch").unwrap()..];
+        let adapter: String = adapter[..adapter.find("\n}\n").unwrap()]
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            adapter.matches(&needle).count(),
+            1,
+            "one real latch in the adapter"
+        );
+        assert!(adapter.contains("evidence_check(self.env,self.txid,webhook).await"));
+        assert!(adapter.contains(
+            "evict_txid_everywhere(self.db,self.txid,reason,self.refusal_ms.get()).await"
+        ));
     }
 
     /// admit-fast step 4: every BACKGROUND latch producer ships its own
@@ -5443,29 +5461,39 @@ mod tests {
         );
         // And in admit_fast.rs: both jobs flush right after their latch, through the WINDOWED flush, after the
         // latch's counts and log (bsv-low #649: a flush the waitUntil window cancels takes nothing after it).
-        let flush = "crate::pot_changes::flush_inline_within(";
         let jobs = code_only(include_str!("admit_fast.rs"));
         let jobs = &jobs[..jobs.find("#[cfg(test)]").unwrap_or(jobs.len())];
-        let mut from = 0;
-        let mut n = 0;
-        while let Some(i) = jobs[from..].find(&needle) {
-            let at = from + i;
-            let tail = &jobs[at..];
-            let fl = tail
-                .find(flush)
-                .expect("a job latch is followed by a flush");
+        assert_eq!(
+            jobs.matches(&needle).count(),
+            2,
+            "the witness job and the watch adapter"
+        );
+        let witness = &jobs[jobs.find("pub async fn witness_job(").unwrap()..];
+        let witness = &witness[..witness.find("\n}\n").unwrap()];
+        let adapter = &jobs[jobs.find("impl PendingWatch for WorkerWatch").unwrap()..];
+        let adapter = &adapter[..adapter.find("\n}\n").unwrap()];
+        let seen = &adapter[adapter.find("async fn seen(").unwrap()..];
+        for (body, flush) in [
+            (witness, "crate::pot_changes::flush_inline_within("),
+            (seen, "self.flush().await"),
+        ] {
+            let body: String = body.split_whitespace().collect();
+            let latch = body.find(&needle).unwrap();
+            let delivery = body.find(flush).unwrap();
+            assert!(latch < delivery && delivery - latch < 900);
             assert!(
-                fl < 900,
-                "the flush sits right after the latch and its counts (at {fl})"
+                body[latch..delivery].contains("bump_counter("),
+                "count before delivery"
             );
-            assert!(
-                tail[..fl].contains("bump_counter("),
-                "the latch is counted BEFORE its flush (bsv-low #649)"
-            );
-            n += 1;
-            from = at + needle.len();
         }
-        assert_eq!(n, 2, "the callback witness job and the pending watch");
+        let delegate = &jobs[jobs.find("impl RefusalSettle for WorkerWatch").unwrap()..];
+        let delegate: String = delegate[..delegate.find("\n}\n").unwrap()]
+            .split_whitespace()
+            .collect();
+        assert!(delegate.contains("self.settle().flush().await"));
+        let settle = &jobs[jobs.find("impl RefusalSettle for WorkerSettle").unwrap()..];
+        let settle = &settle[..settle.find("\n}\n").unwrap()];
+        assert!(settle.contains("crate::pot_changes::flush_inline_within("));
         // The latch itself notes every pot row of the txid (the push's key).
         let ops = code_only(include_str!("ops.rs"));
         let latch_fn = &ops[ops.find("pub async fn latch_network_seen(").unwrap()..];

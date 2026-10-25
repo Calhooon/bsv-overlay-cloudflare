@@ -2728,9 +2728,9 @@ pub async fn admission_age_ms(db: &D1Database, txid: &str, now_ms: u64) -> Optio
 /// What a corroborated refusal's settle does to the world, after the shadow move (bsv-low #649). A port so the
 /// pins run the shipped [`settle_corroborated_refusal`] over a fake whose flush never answers.
 pub(crate) trait RefusalSettle {
-    /// The refused-verdict memo (`write_refused_verdict`).
-    async fn write_memo(&self, reason: &str);
-    /// One bump of the eviction counter.
+    /// Persist the verdict memo and both counters in one batch before delivery.
+    async fn record(&self, counter: &'static str, reason: &str) -> Result<(), String>;
+    /// One watch counter outside the atomic refusal record.
     async fn bump(&self, counter: &'static str);
     /// The background flush of the pot / hop / tracker notes the eviction queued.
     async fn flush(&self);
@@ -2748,8 +2748,8 @@ pub(crate) struct SettleLines {
 }
 
 /// THE SETTLE of a corroborated refusal, after `evict_txid_everywhere` (the pending watch and the `/arc-ingest`
-/// refusal job). Unless the pass yielded to a readmission: the refused-verdict memo, then the eviction COUNTED
-/// and LOGGED; only then the flush (bsv-low #649). The flush waits on the app layer, which can outlast the
+/// refusal job). Unless the pass yielded to a readmission: the refused-verdict memo and counters in ONE batch,
+/// then the log; only then the flush (bsv-low #649). The flush waits on the app layer, which can outlast the
 /// `waitUntil` window (beta, 2026-10-13: `/internal/pot-changed` at 12 to 34.6 s a call); a count placed after
 /// it was cancelled with the task, and an eviction not counted reads as none (Rule 13).
 pub(crate) async fn settle_corroborated_refusal<P: RefusalSettle>(
@@ -2761,16 +2761,38 @@ pub(crate) async fn settle_corroborated_refusal<P: RefusalSettle>(
 ) {
     if yielded {
         port.log(lines.no_memo);
-    } else {
-        port.write_memo(memo_reason).await;
-    }
-    if yielded {
         port.log(lines.yielded);
     } else {
-        port.bump(counter).await;
-        port.log(lines.evicted);
+        match port.record(counter, memo_reason).await {
+            Ok(()) => port.log(lines.evicted),
+            Err(error) => port.log(format!(
+                "[admit-fast] refusal facts for {counter} failed: {error}"
+            )),
+        }
     }
     port.flush().await;
+}
+
+// The smallest batch that retains the existing memo-write tally: the memo and the two counter rows.
+fn refusal_fact_queries(
+    txid: &str,
+    now_ms: u64,
+    counter: &'static str,
+    reason: &str,
+) -> [Query; 3] {
+    [
+        Query::new(crate::proof_fetcher::TX_ANY_VERDICT_UPSERT_SQL)
+            .bind(txid)
+            .bind(now_ms)
+            .bind("refused")
+            .bind(reason),
+        Query::new(crate::ops::BUMP_COUNTER_SQL)
+            .bind(counter)
+            .bind(1),
+        Query::new(crate::ops::BUMP_COUNTER_SQL)
+            .bind(crate::applayer_counters::COUNTER_TXANY_MEMO_WRITE_REFUSED)
+            .bind(1),
+    ]
 }
 
 /// The Worker's [`RefusalSettle`]: D1, the console, and the windowed background flush.
@@ -2784,8 +2806,15 @@ struct WorkerSettle<'a> {
 }
 
 impl RefusalSettle for WorkerSettle<'_> {
-    async fn write_memo(&self, reason: &str) {
-        write_refused_verdict(self.db, self.txid, self.now_ms as i64, reason).await;
+    async fn record(&self, counter: &'static str, reason: &str) -> Result<(), String> {
+        let statements = refusal_fact_queries(self.txid, self.now_ms, counter, reason)
+            .iter()
+            .map(|query| query.prepare(self.db))
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::d1_ledger::counted_batch(self.db, statements)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
     async fn bump(&self, counter: &'static str) {
         crate::ops::bump_counter(self.db, counter, 1).await;
@@ -2894,7 +2923,161 @@ pub async fn refusal_job(env: EvidenceEnv, txid: String, webhook: (String, Strin
 /// ceiling; the old wire poll saw SEEN on its 4th 2-s look, we22).
 pub const PENDING_WATCH_SLEEPS_MS: [u64; 7] = [2_000, 2_000, 2_000, 2_000, 3_000, 3_000, 4_000];
 
-/// The PENDING WATCH behind a fast (or #397 pending) admission — the witness
+/// External boundaries of the pending watch. The production job and the cancellation pin run one loop.
+trait PendingWatch: RefusalSettle {
+    fn txid(&self) -> &str;
+    async fn sleep(&self, ms: u64);
+    async fn look(&self) -> crate::broadcaster::WitnessLook;
+    async fn evidence(&self, webhook: (String, String)) -> EvidenceVerdict;
+    async fn evict(&self, reason: &str) -> EvictionOutcome;
+    async fn seen(&self, status: &str, at_ms: Option<i64>, admitted_at_ms: f64);
+}
+
+struct WorkerWatch<'a> {
+    env: &'a EvidenceEnv,
+    db: &'a D1Database,
+    txid: &'a str,
+    started_ms: u64,
+    refusal_ms: std::cell::Cell<u64>,
+    arcade: crate::broadcaster::ArcadeBroadcaster,
+    tracker: Option<std::rc::Rc<dyn bsv_rs::transaction::ChainTracker>>,
+}
+
+impl WorkerWatch<'_> {
+    fn settle(&self) -> WorkerSettle<'_> {
+        WorkerSettle {
+            db: self.db,
+            env: &self.env.env,
+            txid: self.txid,
+            now_ms: self.refusal_ms.get(),
+            started_ms: self.started_ms,
+        }
+    }
+}
+
+impl RefusalSettle for WorkerWatch<'_> {
+    async fn record(&self, counter: &'static str, reason: &str) -> Result<(), String> {
+        self.settle().record(counter, reason).await
+    }
+    async fn bump(&self, counter: &'static str) {
+        self.settle().bump(counter).await;
+    }
+    async fn flush(&self) {
+        self.settle().flush().await;
+    }
+    fn log(&self, line: String) {
+        self.settle().log(line);
+    }
+}
+
+impl PendingWatch for WorkerWatch<'_> {
+    fn txid(&self) -> &str {
+        self.txid
+    }
+    async fn sleep(&self, ms: u64) {
+        crate::broadcaster::sleep_ms(ms).await;
+    }
+    async fn look(&self) -> crate::broadcaster::WitnessLook {
+        let mut last = self.arcade.witness_look(self.txid).await;
+        if let crate::broadcaster::WitnessLook::NotFinal(..) = &last {
+            let bound = stored_lock_bound(self.tracker.as_deref(), self.db, self.txid).await;
+            last = crate::broadcaster::bound_witness_look(last, &bound);
+        }
+        last
+    }
+    async fn evidence(&self, webhook: (String, String)) -> EvidenceVerdict {
+        self.refusal_ms.set(worker::Date::now().as_millis());
+        evidence_check(self.env, self.txid, webhook).await
+    }
+    async fn evict(&self, reason: &str) -> EvictionOutcome {
+        evict_txid_everywhere(self.db, self.txid, reason, self.refusal_ms.get()).await
+    }
+    async fn seen(&self, status: &str, at_ms: Option<i64>, admitted_at_ms: f64) {
+        crate::ops::latch_network_seen(self.db, self.txid, crate::ops::SeenSource::Arcade, at_ms)
+            .await;
+        let ms = (worker::js_sys::Date::now() - admitted_at_ms).max(0.0) as u64;
+        crate::ops::bump_counter(self.db, crate::ops::COUNTER_SUBMIT_PENDING_SEEN_LATCHED, 1).await;
+        crate::ops::bump_counter(self.db, crate::ops::COUNTER_SUBMIT_PENDING_SEEN_MS, ms).await;
+        self.log(format!("[admit-fast] {} {status} {ms} ms after the admission; network_seen latched by the pending watch", self.txid));
+        self.flush().await;
+    }
+}
+
+async fn pending_watch_job_with<P: PendingWatch>(
+    port: &P,
+    admitted_at_ms: f64,
+) -> Option<crate::broadcaster::WitnessLook> {
+    let txid = port.txid();
+    let mut last = crate::broadcaster::WitnessLook::Unknown;
+    // bsv-low #836: a non-final look is counted once a watch
+    let mut not_final_counted = false;
+    for sleep in PENDING_WATCH_SLEEPS_MS {
+        port.sleep(sleep).await;
+        last = port.look().await;
+        match &last {
+            crate::broadcaster::WitnessLook::Seen(status, at_ms) => {
+                port.seen(status, *at_ms, admitted_at_ms).await;
+                return None;
+            }
+            crate::broadcaster::WitnessLook::Fatal(status, extra) => {
+                match port.evidence((status.clone(), extra.clone())).await {
+                    EvidenceVerdict::Refused(reason) => {
+                        let outcome = port.evict(&format!("{status} ({reason})")).await;
+                        let moved = outcome.moved;
+                        // the second gate's HIGH-1: the verdict memo, written where the evidence is; never
+                        // over a pass that yielded to a readmission (round 3 of the loop-18 gate). The eviction
+                        // is the event the felt voids on: the settle ships its notes (the route's flush drained
+                        // before the watch), AFTER the memo and the count (bsv-low #649).
+                        settle_corroborated_refusal(
+                            port,
+                            outcome.yielded,
+                            crate::ops::COUNTER_SUBMIT_PENDING_EVICTED,
+                            &format!("{status} ({reason})"),
+                            SettleLines {
+                                no_memo: format!("[admit-fast] {txid} {status}: the eviction yielded to a readmission; no refused memo"),
+                                yielded: format!("[admit-fast] {txid} {status} CORROBORATED ({reason}); the pass YIELDED to a readmission; nothing evicted by the pending watch"),
+                                evicted: format!("[admit-fast] {txid} {status} CORROBORATED ({reason}); evicted {moved} row(s) by the pending watch"),
+                            },
+                        )
+                        .await;
+                    }
+                    EvidenceVerdict::Present => {
+                        port.bump(crate::ops::COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED)
+                            .await;
+                        port.log(format!(
+                            "[admit-fast] {txid} {status} NOT corroborated: a courier still holds it; kept (the #214 class)"
+                        ));
+                    }
+                    EvidenceVerdict::Uncertain(why) => {
+                        port.bump(crate::ops::COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED)
+                            .await;
+                        port.log(format!(
+                            "[admit-fast] {txid} {status} UNCERTAIN ({why}); kept, counted"
+                        ));
+                    }
+                }
+                return None;
+            }
+            crate::broadcaster::WitnessLook::Orphan(_)
+            | crate::broadcaster::WitnessLook::Pending(_)
+            | crate::broadcaster::WitnessLook::Unknown => {}
+            // bsv-low #836: Arcade's non-final REJECTED (TX_LOCK_TIME (35)): held, not final. No evidence check,
+            // no eviction; the watch keeps looking (a later look may be SEEN) and ends with the subject unlatched;
+            // the callbacks and the passes re-look after the lock height passes.
+            crate::broadcaster::WitnessLook::NotFinal(status, _, nf) => {
+                if !not_final_counted {
+                    not_final_counted = true;
+                    port.bump(crate::ops::COUNTER_SUBMIT_PENDING_LOCK_TIME_NOT_FINAL)
+                        .await;
+                    port.log(watch_not_final_line(txid, status, nf));
+                }
+            }
+        }
+    }
+    Some(last)
+}
+
+/// The PENDING WATCH behind a fast (or #397 pending) admission: the witness
 /// that used to be polled on the wire, in the background:
 ///   * SEEN or better → `network_seen` latched, counted with its latency
 ///     (`submit_pending_seen_ms_total / submit_pending_seen_latched_total`);
@@ -2923,114 +3106,18 @@ pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f
     let db = std::rc::Rc::new(db);
     let arcade = crate::broadcaster::ArcadeBroadcaster::new(env.arcade_base.clone())
         .with_proof_sources(crate::proof_fetcher::ProofSources::from_env(&env.env));
-    let mut last = crate::broadcaster::WitnessLook::Unknown;
-    // bsv-low #836: a non-final look is counted once a watch
-    let mut not_final_counted = false;
-    let tracker = crate::lookup_service_chain_tracker(&env.env);
-    for sleep in PENDING_WATCH_SLEEPS_MS {
-        crate::broadcaster::sleep_ms(sleep).await;
-        last = arcade.witness_look(&txid).await;
-        // bsv-low #836 fold (the lens's M1): a non-final look past the chain's bound is Arcade's fatal word again, and
-        // the watch runs its evidence check as for any other
-        if let crate::broadcaster::WitnessLook::NotFinal(..) = &last {
-            let bound = stored_lock_bound(tracker.as_deref(), &db, &txid).await;
-            last = crate::broadcaster::bound_witness_look(last, &bound);
-        }
-        match &last {
-            crate::broadcaster::WitnessLook::Seen(status, at_ms) => {
-                crate::ops::latch_network_seen(&db, &txid, crate::ops::SeenSource::Arcade, *at_ms).await;
-                let ms = (worker::js_sys::Date::now() - admitted_at_ms).max(0.0) as u64;
-                crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_SEEN_LATCHED, 1)
-                    .await;
-                crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_PENDING_SEEN_MS, ms).await;
-                worker::console_log!(
-                    "[admit-fast] {txid} {status} {ms} ms after the admission — network_seen latched by the pending watch"
-                );
-                // step 4: a background latch ships its own pots-room push, AFTER its counts (bsv-low #649)
-                crate::pot_changes::flush_inline_within(env.env.clone(), started_ms).await;
-                return;
-            }
-            crate::broadcaster::WitnessLook::Fatal(status, extra) => {
-                let now_ms = worker::Date::now().as_millis();
-                match evidence_check(&env, &txid, (status.clone(), extra.clone())).await {
-                    EvidenceVerdict::Refused(reason) => {
-                        let outcome = evict_txid_everywhere(
-                            &db,
-                            &txid,
-                            &format!("{status} ({reason})"),
-                            now_ms,
-                        )
-                        .await;
-                        let moved = outcome.moved;
-                        // the second gate's HIGH-1: the verdict memo, written where the evidence is — never
-                        // over a pass that yielded to a readmission (round 3 of the loop-18 gate). The eviction
-                        // is the event the felt voids on: the settle ships its notes (the route's flush drained
-                        // before the watch), AFTER the memo and the count (bsv-low #649).
-                        let port = WorkerSettle {
-                            db: &db,
-                            env: &env.env,
-                            txid: &txid,
-                            now_ms,
-                            started_ms,
-                        };
-                        settle_corroborated_refusal(
-                            &port,
-                            outcome.yielded,
-                            crate::ops::COUNTER_SUBMIT_PENDING_EVICTED,
-                            &format!("{status} ({reason})"),
-                            SettleLines {
-                                no_memo: format!("[admit-fast] {txid} {status}: the eviction yielded to a readmission — no refused memo"),
-                                yielded: format!("[admit-fast] {txid} {status} CORROBORATED ({reason}) — the pass YIELDED to a readmission; nothing evicted by the pending watch"),
-                                evicted: format!("[admit-fast] {txid} {status} CORROBORATED ({reason}) — evicted {moved} row(s) by the pending watch"),
-                            },
-                        )
-                        .await;
-                    }
-                    EvidenceVerdict::Present => {
-                        crate::ops::bump_counter(
-                            &db,
-                            crate::ops::COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED,
-                            1,
-                        )
-                        .await;
-                        worker::console_log!(
-                            "[admit-fast] {txid} {status} NOT corroborated: a courier still holds it — kept (the #214 class)"
-                        );
-                    }
-                    EvidenceVerdict::Uncertain(why) => {
-                        crate::ops::bump_counter(
-                            &db,
-                            crate::ops::COUNTER_SUBMIT_PENDING_REFUSAL_UNCORROBORATED,
-                            1,
-                        )
-                        .await;
-                        worker::console_log!(
-                            "[admit-fast] {txid} {status} UNCERTAIN ({why}) — kept, counted"
-                        );
-                    }
-                }
-                return;
-            }
-            crate::broadcaster::WitnessLook::Orphan(_)
-            | crate::broadcaster::WitnessLook::Pending(_)
-            | crate::broadcaster::WitnessLook::Unknown => {}
-            // bsv-low #836: Arcade's non-final REJECTED (TX_LOCK_TIME (35)): held, not final. No evidence check,
-            // no eviction; the watch keeps looking (a later look may be SEEN) and ends with the subject unlatched;
-            // the callbacks and the passes re-look after the lock height passes.
-            crate::broadcaster::WitnessLook::NotFinal(status, _, nf) => {
-                if !not_final_counted {
-                    not_final_counted = true;
-                    crate::ops::bump_counter(
-                        &db,
-                        crate::ops::COUNTER_SUBMIT_PENDING_LOCK_TIME_NOT_FINAL,
-                        1,
-                    )
-                    .await;
-                    worker::console_log!("{}", watch_not_final_line(&txid, status, nf));
-                }
-            }
-        }
-    }
+    let port = WorkerWatch {
+        env: &env,
+        db: &db,
+        txid: &txid,
+        started_ms,
+        refusal_ms: std::cell::Cell::new(started_ms),
+        arcade,
+        tracker: crate::lookup_service_chain_tracker(&env.env),
+    };
+    let Some(last) = pending_watch_job_with(&port, admitted_at_ms).await else {
+        return;
+    };
     // fleet loop 15 (2026-09-20, pair 1's refund): a spend that MINED before this index ever saw it — the tower
     // parked it at arm time through TAAL, the node promoted it at H, the client re-presented it after the block —
     // gets Arcade's STORED ECHO (ACCEPTED_BY_NETWORK, never MINED: its status froze at the first presentation)
@@ -4195,26 +4282,25 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let jobs = squash(&code_only(
-            &src[src.find("pub async fn refusal_job(").unwrap()..src.find("#[cfg(test)]").unwrap()],
-        ));
-        let mut from = 0;
-        let mut evictions = 0;
-        while let Some(i) = jobs[from..].find("evict_txid_everywhere(") {
-            let at = from + i;
-            // bsv-low #649: the flush is the shipped settle's last step (after the memo and the count), pinned
-            // by `e649_a_c_*`; here the settle sits right after the eviction
-            let fl = jobs[at..]
+        for (name, eviction) in [
+            ("pub async fn refusal_job(", "evict_txid_everywhere("),
+            ("async fn pending_watch_job_with<", "port.evict("),
+        ] {
+            let job = &src[src.find(name).unwrap()..];
+            let job = &job[..job.find("\n}\n").unwrap()];
+            let job = squash(&code_only(job));
+            let at = job.find(eviction).expect("the eviction");
+            let settle = job[at..]
                 .find("settle_corroborated_refusal(")
-                .expect("the settle (memo, count, flush) after the eviction");
+                .expect("the settle after the eviction");
             assert!(
-                fl < 700,
-                "the flush sits right after the eviction (at +{fl}, squashed)"
+                settle < 700,
+                "{name}: the settle sits after the eviction at +{settle}"
             );
-            evictions += 1;
-            from = at + 1;
         }
-        assert_eq!(evictions, 2, "the refusal job and the pending watch");
+        let adapter = &src[src.find("impl PendingWatch for WorkerWatch").unwrap()..];
+        assert!(squash(adapter)
+            .contains("evict_txid_everywhere(self.db,self.txid,reason,self.refusal_ms.get())"));
     }
 
     /// bsv-low loop 18 (2026-09-21, pair 11): the OPEN marker under real SQLite — written first, the FIRST open
@@ -4524,7 +4610,7 @@ mod tests {
                 "crate::ops::COUNTER_ARC_INGEST_EVICTED",
             ),
             (
-                "pub async fn pending_watch_job(",
+                "async fn pending_watch_job_with<",
                 "crate::ops::COUNTER_SUBMIT_PENDING_EVICTED",
             ),
         ] {
@@ -4537,7 +4623,12 @@ mod tests {
                 "{job_name}: the settle's five arguments: {args:?}"
             );
             assert_eq!(
-                args[0], "&port",
+                args[0],
+                if job_name.contains("_with<") {
+                    "port"
+                } else {
+                    "&port"
+                },
                 "{job_name}: the settle runs over the job's port"
             );
             assert_eq!(
@@ -4556,7 +4647,11 @@ mod tests {
                 .find("let outcome =")
                 .expect("the eviction's outcome is bound");
             assert!(
-                self::squashed(&job[evict..]).starts_with("letoutcome=evict_txid_everywhere("),
+                self::squashed(&job[evict..]).starts_with(if job_name.contains("_with<") {
+                    "letoutcome=port.evict("
+                } else {
+                    "letoutcome=evict_txid_everywhere("
+                }),
                 "{job_name}: `outcome` is the eviction's"
             );
             assert!(
@@ -4571,24 +4666,13 @@ mod tests {
         }
         {
             let job_name = "pub(crate) async fn settle_corroborated_refusal<";
-            let counter = "port.bump(counter)";
             let job = &src[src.find(job_name).unwrap()..];
-            let job = &job[..job.find("\n}\n").unwrap()];
-            let guard = job.find("if yielded {").expect("the yield guard");
-            let memo = job[guard..].find("port.write_memo(").expect("the memo") + guard;
-            assert!(
-                job[guard..memo].contains("} else {"),
-                "{job_name}: the memo sits in the else of the yield guard"
-            );
-            let cnt = job.find(counter).expect("the eviction counter");
-            let cnt_guard = job[..cnt]
-                .rfind("if yielded {")
-                .expect("the counter's yield guard");
-            let between = &job[cnt_guard..cnt];
-            assert!(
-                between.matches("} else {").count() == 1 && !between.contains("port.write_memo("),
-                "{job_name}: the eviction counter sits in the else of ITS OWN yield guard (round 5, N8: the memo's guard is not it)"
-            );
+            let job = self::squashed(&job[..job.find("\n}\n").unwrap()]);
+            let guard = job.find("ifyielded{").expect("the yield guard");
+            let facts = job.find("port.record(counter,memo_reason)").expect("the atomic facts");
+            assert!(job[guard..facts].contains("}else{match"), "a yielded pass records neither fact");
+            assert_eq!(job.matches("port.record(").count(), 1, "one batch under the yield guard");
+            assert!(!job.contains("port.bump(") && !job.contains("port.write_memo("));
         }
         // the passes never touch the console and read through the shadow storage only
         let passes_src = &src[src.find("pub async fn shadow_move_passes(").unwrap()..];
@@ -5704,6 +5788,274 @@ mod tests {
         );
     }
 
+    struct D2Watch {
+        store: SqliteShadow,
+        clock: std::cell::Cell<u64>,
+        posts: std::cell::Cell<usize>,
+        batches: std::cell::RefCell<Vec<usize>>,
+        pending: std::cell::RefCell<Vec<(String, u32)>>,
+    }
+
+    impl D2Watch {
+        fn delay(&self, ms: u64) -> impl std::future::Future<Output = ()> + '_ {
+            let until = self.clock.get() + ms;
+            async move {
+                self.clock.set(until);
+            }
+        }
+
+        fn execute(&self, query: Query) {
+            let params: Vec<_> = query.params().iter().map(to_sql).collect();
+            self.store
+                .conn
+                .execute(query.sql(), rusqlite::params_from_iter(params))
+                .unwrap();
+        }
+
+        fn bump_value(&self, name: &str, delta: u64) {
+            self.execute(
+                Query::new(crate::ops::BUMP_COUNTER_SQL)
+                    .bind(name)
+                    .bind(delta),
+            );
+        }
+
+        fn total(&self, name: &str) -> u64 {
+            self.store
+                .conn
+                .query_row(
+                    "SELECT value FROM ops_counters WHERE name = ?",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0)
+        }
+    }
+
+    impl RefusalSettle for D2Watch {
+        async fn record(&self, counter: &'static str, reason: &str) -> Result<(), String> {
+            let queries = refusal_fact_queries(self.txid(), self.clock.get(), counter, reason);
+            let tx = self.store.conn.unchecked_transaction().unwrap();
+            for query in &queries {
+                let params: Vec<_> = query.params().iter().map(to_sql).collect();
+                tx.execute(query.sql(), rusqlite::params_from_iter(params))
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+            self.batches.borrow_mut().push(queries.len());
+            Ok(())
+        }
+        async fn bump(&self, counter: &'static str) {
+            self.bump_value(counter, 1);
+        }
+        async fn flush(&self) {
+            let crate::pot_changes::BackgroundFlush::Ship { deadline_ms } =
+                crate::pot_changes::background_flush_plan(0, self.clock.get())
+            else {
+                panic!("the fixture leaves time for delivery");
+            };
+            let items = self.pending.take();
+            let shipped = crate::change_flush::ship_chunks_with(
+                items,
+                |chunk| serde_json::to_string(chunk).unwrap(),
+                |_| async {
+                    self.posts.set(self.posts.get() + 1);
+                    if self.posts.get() == 1 {
+                        self.clock.set(self.clock.get() + 100);
+                        Ok(0)
+                    } else {
+                        std::future::pending().await
+                    }
+                },
+                || self.clock.get(),
+                deadline_ms,
+                |ms| self.delay(ms),
+            )
+            .await;
+            crate::pot_changes::settle_and_park(
+                self,
+                &shipped,
+                self.clock.get(),
+                |tally| async move {
+                    self.bump_value(
+                        crate::pot_changes::COUNTER_POT_CHANGED_DEFERRED,
+                        tally.deferred as u64,
+                    );
+                },
+            )
+            .await;
+        }
+        fn log(&self, _: String) {}
+    }
+
+    impl crate::change_park::ParkPort for D2Watch {
+        async fn park(
+            &self,
+            rows: &[(&'static str, String)],
+            now_ms: u64,
+        ) -> Result<Vec<bool>, String> {
+            use rusqlite::OptionalExtension;
+            let tx = self.store.conn.unchecked_transaction().unwrap();
+            tx.query_row(
+                crate::change_park::PARK_SEQ_BUMP_SQL,
+                [now_ms as i64],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+            let results = rows
+                .iter()
+                .map(|(kind, item)| {
+                    tx.query_row(
+                        crate::change_park::PARK_SQL,
+                        rusqlite::params![
+                            kind,
+                            item,
+                            now_ms as i64,
+                            crate::change_park::CHANGE_PARKED_MAX_ROWS
+                        ],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .unwrap()
+                    .is_some()
+                })
+                .collect();
+            tx.commit().unwrap();
+            Ok(results)
+        }
+        async fn bump(&self, counter: &'static str, delta: u64) {
+            self.bump_value(counter, delta);
+        }
+        fn log(&self, _: String) {}
+    }
+
+    impl PendingWatch for D2Watch {
+        fn txid(&self) -> &str {
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+        async fn sleep(&self, ms: u64) {
+            self.delay(ms).await;
+        }
+        async fn look(&self) -> crate::broadcaster::WitnessLook {
+            crate::broadcaster::WitnessLook::Fatal("REJECTED".into(), "spent".into())
+        }
+        async fn evidence(&self, _: (String, String)) -> EvidenceVerdict {
+            self.clock.set(25_000);
+            evidence_verdict(
+                &ArcadeLook::Fatal("REJECTED".into(), "spent".into()),
+                Some(false),
+                Some(false),
+                false,
+            )
+        }
+        async fn evict(&self, reason: &str) -> EvictionOutcome {
+            let core = evict_core(&self.store, self.txid(), reason, self.clock.get()).await;
+            assert!(core.faults.is_empty(), "{:?}", core.faults);
+            self.pending.replace(
+                core.pot_vouts
+                    .iter()
+                    .map(|v| (self.txid().to_string(), *v))
+                    .collect(),
+            );
+            EvictionOutcome {
+                moved: core.moved,
+                yielded: core.yielded_to_readmission.is_some(),
+                incomplete: false,
+            }
+        }
+        async fn seen(&self, _: &str, _: Option<i64>, _: f64) {
+            panic!("the fixture's broadcaster refuses");
+        }
+    }
+
+    /// The production watch loop, eviction SQL and delivery loop under a clock that kills the job at 30 s.
+    /// One chunk lands, the next POST hangs: all nine remaining outpoints must be counted and parked first.
+    #[test]
+    fn d2_649_pending_watch_keeps_facts_and_defers_a_hung_flush_before_platform_cancel() {
+        let port = D2Watch {
+            store: SqliteShadow::new(shipped_conn()),
+            clock: std::cell::Cell::new(0),
+            posts: std::cell::Cell::new(0),
+            batches: Default::default(),
+            pending: Default::default(),
+        };
+        for vout in 0..17 {
+            port.store.conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt) VALUES (?, ?, 0, 1)",
+                rusqlite::params![port.txid(), vout]).unwrap();
+        }
+        let completed = crate::change_flush::run(crate::race_or_deadline(
+            pending_watch_job_with(&port, 0.0),
+            port.delay(crate::pot_changes::WAIT_UNTIL_WINDOW_MS),
+        ));
+        let memo: (String, String) = port
+            .store
+            .conn
+            .query_row(
+                "SELECT kind, evidence FROM tx_any_verdicts WHERE txid = ?",
+                [port.txid()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(memo.0, "refused");
+        assert!(memo.1.contains("spent"));
+        assert_eq!(port.total(crate::ops::COUNTER_SUBMIT_PENDING_EVICTED), 1);
+        assert_eq!(
+            port.total(crate::applayer_counters::COUNTER_TXANY_MEMO_WRITE_REFUSED),
+            1
+        );
+        assert_eq!(*port.batches.borrow(), vec![3], "one batch before delivery");
+        assert!(
+            completed.is_some(),
+            "the pending watch was cancelled at {} ms before accounting for its flush",
+            port.clock.get()
+        );
+        assert!(port.clock.get() < crate::pot_changes::WAIT_UNTIL_WINDOW_MS);
+        assert_eq!(port.posts.get(), 2);
+        assert_eq!(
+            port.total(crate::pot_changes::COUNTER_POT_CHANGED_DEFERRED),
+            9
+        );
+        let parked: i64 = port
+            .store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM change_parked WHERE kind = 'pot'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parked, 9);
+        let word_deadline = port.clock.get() + 20_000;
+        let (_, frames) = crate::change_flush::run(crate::race_or_deadline(
+            crate::tracker_events::ship_in_order_with(
+                vec![serde_json::json!({"txid": port.txid(), "kind": "seen", "retry": true})],
+                |_| std::future::pending::<Result<bool, String>>(),
+                |_| async {},
+                || port.clock.get(),
+                word_deadline,
+                |ms| port.delay(ms),
+            ),
+            port.delay(crate::pot_changes::WAIT_UNTIL_WINDOW_MS),
+        ))
+        .expect("the word deadline also precedes platform cancellation");
+        assert_eq!(frames.len(), 1);
+        crate::change_flush::run(crate::tracker_events::park_walled(
+            &port,
+            frames,
+            port.clock.get(),
+        ));
+        let words: i64 = port
+            .store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM change_parked WHERE kind = 'word'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(words, 1, "a timed-out retry is parked, never discarded");
+    }
+
     /// bsv-low #649: the settle's world, recorded; its flush HANGS (never answers), as the app layer's
     /// `/internal/pot-changed` did past the `waitUntil` window on beta (12 to 34.6 s a call).
     struct HangingFlush {
@@ -5711,8 +6063,10 @@ mod tests {
     }
 
     impl RefusalSettle for HangingFlush {
-        async fn write_memo(&self, reason: &str) {
+        async fn record(&self, counter: &'static str, reason: &str) -> Result<(), String> {
             self.events.borrow_mut().push(format!("memo {reason}"));
+            self.events.borrow_mut().push(format!("bump {counter}"));
+            Ok(())
         }
         async fn bump(&self, counter: &'static str) {
             self.events.borrow_mut().push(format!("bump {counter}"));
@@ -5789,7 +6143,7 @@ mod tests {
         let src = include_str!("admit_fast.rs");
         for (job_name, counter) in [
             (
-                "pub async fn pending_watch_job(",
+                "async fn pending_watch_job_with<",
                 "crate::ops::COUNTER_SUBMIT_PENDING_EVICTED,",
             ),
             (
@@ -5800,10 +6154,19 @@ mod tests {
             let job = &src[src.find(job_name).expect("the job")..];
             let job = &job[..job.find("\n}\n").expect("the job ends")];
             assert!(
-                job.contains("let started_ms = worker::Date::now().as_millis();"),
+                if job_name.contains("_with<") {
+                    src.contains(
+                        "let Some(last) = pending_watch_job_with(&port, admitted_at_ms).await",
+                    ) && src.contains("let started_ms = worker::Date::now().as_millis();")
+                } else {
+                    job.contains("let started_ms = worker::Date::now().as_millis();")
+                },
                 "{job_name}: the job records its start"
             );
-            let evict = job.find("evict_txid_everywhere(").expect("the eviction");
+            let evict = job
+                .find("evict_txid_everywhere(")
+                .or_else(|| job.find("port.evict("))
+                .expect("the eviction");
             let settle = job
                 .find("settle_corroborated_refusal(")
                 .expect("the shipped settle");
@@ -5896,8 +6259,8 @@ mod tests {
         );
         assert_eq!(
             code.matches("pot_changes::flush_inline_within(").count(),
-            4,
-            "the settle's port, the witness job, the watch's SEEN latch and its proof read"
+            3,
+            "the settle's port (also the watch's SEEN latch), the witness job and the watch's proof read"
         );
     }
 
@@ -6212,8 +6575,10 @@ mod tests {
     }
 
     impl RefusalSettle for CompletingFlush {
-        async fn write_memo(&self, reason: &str) {
+        async fn record(&self, counter: &'static str, reason: &str) -> Result<(), String> {
             self.events.borrow_mut().push(format!("memo {reason}"));
+            self.events.borrow_mut().push(format!("bump {counter}"));
+            Ok(())
         }
         async fn bump(&self, counter: &'static str) {
             self.events.borrow_mut().push(format!("bump {counter}"));
@@ -6328,7 +6693,7 @@ mod tests {
         // both jobs: the settled arm ends at the settle's call
         for (job_name, tail_after_match) in [
             ("pub async fn refusal_job(", "}}"),
-            ("pub async fn pending_watch_job(", ""),
+            ("async fn pending_watch_job_with<", ""),
         ] {
             let job = &src[src.find(job_name).expect("the job")..];
             let job = squashed(&job[..job.find("\n}\n").expect("the job ends")]);
@@ -6366,7 +6731,7 @@ mod tests {
                     .unwrap()
                     + uncertain;
                 assert!(
-                    job[uncertain..orphan].ends_with("}}return;}"),
+                    job[uncertain..orphan].ends_with("}}returnNone;}"),
                     "the watch returns right after the evidence match: its settled path reaches no later count or log"
                 );
             }
