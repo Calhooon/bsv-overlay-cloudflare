@@ -153,6 +153,7 @@ pub mod logic;
 pub mod owed;
 pub mod owed_cursor;
 pub mod owed_judge;
+pub mod owed_read;
 pub mod pass_meter;
 pub mod pot_hook;
 pub mod proof_post;
@@ -366,6 +367,7 @@ fn flush_counters_if_due(ctx: &Context, env: &Env) {
 
 /// The fetch body, under the ledger [`fetch`] scopes.
 async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    let stored_owed = req.method() == worker::Method::Get && req.path() == "/owed";
     // 2026-09-04: the WoC api key for this isolate's provider reads (see routes::provider_get).
     routes::set_woc_api_key(env.secret("WOC_API_KEY").ok().map(|k| k.to_string()));
     // bsv-low #451 slice B: the Arcade endpoint for `/tx-any`'s first external witness (`routes::arcade_url`).
@@ -376,7 +378,10 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
     // bsv-low #635 (B-COST-1): this request counted in the isolate's cost window; the window written so far goes to
     // the overlay's `worker_cost_daily` after the answer when it is due (one upsert per 64 requests or 60 s).
-    if let Some(window) = d1_ledger::cost_on_request(worker::Date::now().as_millis() as f64) {
+    if stored_owed {
+        d1_ledger::note_deferred_request();
+    } else if let Some(window) = d1_ledger::cost_on_request(worker::Date::now().as_millis() as f64)
+    {
         if let Ok(db) = env.d1("OVERLAY_DB") {
             ctx.wait_until(async move {
                 d1_ledger::flush_cost(&db, window, worker::Date::now().as_millis() as f64).await;
@@ -462,14 +467,15 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
         auth::FrontDoor::Proceed(req, state) => (req, state),
         auth::FrontDoor::Reply(mut resp) => {
             stamp_cors(&mut resp, &identity_cors);
-            flush_counters_if_due(&ctx, &env);
+            if !stored_owed {
+                flush_counters_if_due(&ctx, &env);
+            }
             return Ok(resp);
         }
     };
-    // bsv-low #469: the fetch context rides the state so a route can finish work AFTER its answer (`/owed` refreshes
-    // a stale list in the background instead of making the page wait for the couriers).
+    // Stored owed reads cannot schedule work, including shared counter flushes.
     let ctx = std::rc::Rc::new(ctx);
-    state.wait = Some(ctx.clone());
+    state.wait = (!stored_owed).then(|| ctx.clone());
     // Keep the session for reply-signing; the state moves into the router.
     let session = state.session.clone();
     let lane = state.lane.clone();
@@ -481,9 +487,11 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // bsv-low #499: the figures ride the answer's `Server-Timing` (stamped by `fetch`, after this body signed or
     // sealed the response) and `/health.d1Budget`.
     let mut resp = router(state, schema_ready).run(req, env).await?;
-    let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
-    if !pending.is_empty() {
-        ctx.wait_until(async move { courier::flush(counters_db, pending).await });
+    if !stored_owed {
+        let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
+        if !pending.is_empty() {
+            ctx.wait_until(async move { courier::flush(counters_db, pending).await });
+        }
     }
 
     // Sign the terminal JSON for an AUTHENTICATED caller (the tower's
