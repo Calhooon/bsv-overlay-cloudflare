@@ -868,7 +868,218 @@ fn paths(f: &Fixture) -> Result<(), String> {
         vec!["hop".to_string().into()],
         marks("hop", "hop:0", &["alice"]),
     )?;
+    word_paths(f)?;
     Ok(())
+}
+
+/// Each word arm has an exclusive subject, so another arm cannot hide its loss.
+/// Both UPSERT verbs run with empty and pending marks through `paths`.
+fn word_paths(f: &Fixture) -> Result<(), String> {
+    for arm in [
+        "row",
+        "party-funding",
+        "party-spender",
+        "hop-funding",
+        "hop-spender",
+        "link-funding",
+        "link-spender",
+    ] {
+        let identity = format!("word-arm-{arm}");
+        let funding = format!("word-funding-{arm}");
+        let spender = format!("word-spender-{arm}");
+        let txid = if arm.ends_with("spender") {
+            &spender
+        } else {
+            &funding
+        };
+        if arm == "row" {
+            f.db.execute(
+                "INSERT INTO owed_rows (identity,outpoint,family,gameId,facts,updatedAtMs) VALUES (?1,?2,'payout','game','{}',1)",
+                [&identity, &funding],
+            ).unwrap();
+            f.db.execute(
+                "INSERT INTO owed_row_words (identity,outpoint,role,txid) VALUES (?1,?2,'funding',?2)",
+                [&identity, &funding],
+            ).unwrap();
+        } else {
+            f.execute(
+                discovery::store_record_sql(),
+                pot_binds(&funding, "covenant"),
+            );
+            f.db.execute(
+                "UPDATE pot_records SET spent=1, spendingTxid=?1 WHERE txid=?2",
+                [&spender, &funding],
+            )
+            .unwrap();
+            if arm.starts_with("party") {
+                let mut party = seat(&identity, &format!("word-party-{arm}"));
+                party.pot_txid.clone_from(&funding);
+                f.query(discovery::potparty_write::potparty_insert_query(&party, 1).query());
+            } else {
+                let mut marker = hop();
+                marker.identity.clone_from(&identity);
+                marker.txid = if arm.starts_with("link") {
+                    format!("word-hop-{arm}")
+                } else {
+                    funding.clone()
+                };
+                f.query(discovery::hopparty_write::hopparty_insert_query(&marker, 1).query());
+                if arm.starts_with("link") {
+                    // Seed the link without a hop pot: the direct spender arm would otherwise
+                    // reach this subject too and hide removal of the linked funding arm.
+                    f.db.execute(
+                        "INSERT INTO hop_pot_links (identity,createdAt,potTxid,potVout,markerRowid) SELECT identity,createdAt,?1,0,rowid FROM hopparty_records WHERE txid=?2",
+                        [&funding, &marker.txid],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        for (word, at) in [("seen", 1), ("mined", 2)] {
+            f.check(
+                &format!("word {arm} {word}"),
+                low_app_layer::tracker_host::stored::UPSERT,
+                vec![
+                    txid.clone().into(),
+                    word.to_string().into(),
+                    "chain".to_string().into(),
+                    10.into(),
+                    "root".to_string().into(),
+                    10.into(),
+                    "00".to_string().into(),
+                    "header".to_string().into(),
+                    Value::Null,
+                    Value::Null,
+                    at.into(),
+                    Value::Null,
+                ],
+                marks("word", txid, &[&identity]),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn owed893_every_word_arm_marks_and_advances_its_exclusive_subject() {
+    word_paths(&Fixture::new(None)).unwrap();
+    let mut pending = Fixture::new(None);
+    pending.seed_pending = true;
+    word_paths(&pending).unwrap();
+}
+
+#[test]
+fn owed893_word_compound_selects_fit_d1s_five_term_limit() {
+    for sql in OVERLAY_MIGRATIONS
+        .iter()
+        .filter(|s| s.starts_with("CREATE TRIGGER IF NOT EXISTS owed_dirty_tx_words_"))
+    {
+        let name = sql.split_whitespace().nth(5).unwrap();
+        for statement in sql.split(';') {
+            let terms = statement.matches("UNION ALL").count() + 1;
+            assert!(
+                terms <= 5,
+                "{name}: {terms} terms exceed D1's five-term limit"
+            );
+        }
+    }
+}
+
+#[test]
+fn owed893_each_word_arm_removed_alone_turns_its_source_write_red() {
+    let schema = Fixture::new(None);
+    let triggers: Vec<(String, String)> = schema.db.prepare(
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'owed_dirty_tx_words_%' ORDER BY name"
+    ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect();
+    assert_eq!(triggers.len(), 4);
+    for (name, sql) in triggers {
+        let (head, tail) = sql.split_once(" FROM (").unwrap();
+        let (subjects, tail) = tail.split_once(") s WHERE").unwrap();
+        let arms: Vec<_> = subjects.split(" UNION ALL ").collect();
+        for removed in 0..arms.len() {
+            let mut mutant: Vec<String> = arms.iter().map(|s| (*s).into()).collect();
+            mutant[removed].push_str(" AND 0");
+            let f = Fixture::new(None);
+            f.db.execute_batch(&format!(
+                "DROP TRIGGER {name}; {head} FROM ({}) s WHERE{tail}",
+                mutant.join(" UNION ALL ")
+            ))
+            .unwrap();
+            let err = word_paths(&f).expect_err(&format!(
+                "{name} arm {removed} removed but every word stayed green"
+            ));
+            assert!(err.contains("dirty marks"), "{err}");
+            println!("RED {name} arm {removed}: {err}");
+        }
+    }
+}
+
+#[test]
+fn owed893_split_word_triggers_roll_back_together_with_the_source() {
+    use low_app_layer::tracker_host::stored;
+    for existing in [false, true] {
+        let mut f = Fixture::new(None);
+        word_paths(&f).unwrap();
+        let txid = "word-funding-link-funding";
+        f.db.execute("INSERT INTO owed_rows (identity,outpoint,family,gameId,facts,updatedAtMs) VALUES ('direct-word',?1,'payout','game','{}',1)", [txid]).unwrap();
+        f.db.execute("INSERT INTO owed_row_words (identity,outpoint,role,txid) VALUES ('direct-word',?1,'funding',?1)", [txid]).unwrap();
+        if !existing {
+            f.db.execute("DELETE FROM tx_words WHERE txid=?1", [txid])
+                .unwrap();
+        }
+        f.clear();
+        f.seed_pending = true;
+        let want = marks("word", txid, &["direct-word", "word-arm-link-funding"]);
+        let seen = f.seed_marks(&want);
+        let generations = || -> Vec<(String, i64)> {
+            f.db.prepare("SELECT identity,generation FROM owed_dirty ORDER BY identity")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let before = generations();
+        let binds: Vec<Value> = vec![
+            txid.to_string().into(),
+            "stale".to_string().into(),
+            "chain".to_string().into(),
+            10.into(),
+            "root".to_string().into(),
+            10.into(),
+            "00".to_string().into(),
+            "header".to_string().into(),
+            Value::Null,
+            Value::Null,
+            3.into(),
+            Value::Null,
+        ];
+        for fail_identity in ["direct-word", "word-arm-link-funding"] {
+            f.db.execute_batch(&format!("CREATE TEMP TRIGGER fail_split_word AFTER UPDATE ON owed_dirty WHEN NEW.identity='{fail_identity}' BEGIN SELECT RAISE(ABORT,'split word fault'); END")).unwrap();
+            let err =
+                f.db.execute(stored::UPSERT, params_from_iter(&binds))
+                    .unwrap_err();
+            assert!(err.to_string().contains("split word fault"), "{err}");
+            assert_eq!(
+                generations(),
+                before,
+                "both triggers' generations must roll back"
+            );
+            let word: Option<(String, i64)> =
+                f.db.query_row(
+                    "SELECT word,updated_at FROM tx_words WHERE txid=?1",
+                    [txid],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .unwrap();
+            assert_eq!(word, existing.then(|| ("mined".into(), 2)));
+            f.db.execute_batch("DROP TRIGGER fail_split_word").unwrap();
+        }
+        f.execute(stored::UPSERT, binds);
+        f.check_marks("both split triggers commit", &want, seen)
+            .unwrap();
+    }
 }
 
 struct Shadow<'a>(&'a Fixture);
@@ -1209,8 +1420,8 @@ fn owed893_each_source_trigger_removed_or_not_advanced_alone_turns_the_productio
         .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
     assert_eq!(
         names.len(),
-        26,
-        "fourteen source tables, one trigger per listed verb plus the refusal UPSERT's UPDATE"
+        28,
+        "fourteen source tables, refusal UPSERT's UPDATE and two word triggers per verb"
     );
     for name in names {
         let err = paths(&Fixture::new(Some(&name)))
@@ -1442,7 +1653,7 @@ fn owed893_a_moved_pot_key_marks_both_old_and_new_subjects() {
 /// Includes every existing trigger, the production UPSERT's two programs and the shadow move.
 /// The fleet has 14,719 pots, 7,549 hop markers and 27,000 network witnesses.
 #[test]
-fn owed893_trigger_programs_measured_365328_bytes_stay_below_384_kib() {
+fn owed893_five_plus_two_word_triggers_keep_source_programs_below_384_kib() {
     const PREPARED_MAX: i32 = 384 * 1024;
     const VM_MAX: i32 = 4096;
     const SCAN_MAX: i32 = 8; // Small shadow twins; source-table lookups take zero fullscan steps.
@@ -1484,9 +1695,10 @@ fn owed893_trigger_programs_measured_365328_bytes_stay_below_384_kib() {
         println!("{label}: {memory} prepared bytes, {steps} VM steps, {scans} fullscan steps");
     }
     let peak = measured.iter().map(|m| m.2).max().unwrap();
+    let peak_label = &measured.iter().max_by_key(|m| m.2).unwrap().0;
     let vm_peak = measured.iter().map(|m| m.3).max().unwrap();
     let scan_peak = measured.iter().map(|m| m.4).max().unwrap();
-    println!("PEAK: {peak} prepared bytes, {vm_peak} VM steps, {scan_peak} fullscan steps");
+    println!("PEAK: {peak} prepared bytes at {peak_label}, {vm_peak} VM steps, {scan_peak} fullscan steps");
     assert!(
         peak <= PREPARED_MAX,
         "{peak} prepared bytes, ceiling {PREPARED_MAX}"
