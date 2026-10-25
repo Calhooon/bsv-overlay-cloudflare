@@ -78,14 +78,7 @@ fn discovery_bound(name: &str) -> usize {
 fn marks(source: &str, key: &str, identities: &[&str]) -> Vec<Mark> {
     let mut out: Vec<_> = identities
         .iter()
-        .map(|id| {
-            (
-                (*id).into(),
-                "game".into(),
-                source.into(),
-                key.into(),
-            )
-        })
+        .map(|id| ((*id).into(), "game".into(), source.into(), key.into()))
         .collect();
     out.sort();
     out
@@ -94,6 +87,7 @@ fn marks(source: &str, key: &str, identities: &[&str]) -> Vec<Mark> {
 struct Fixture {
     db: Connection,
     programs: RefCell<Vec<Program>>,
+    seed_pending: bool,
 }
 
 impl Fixture {
@@ -115,6 +109,7 @@ impl Fixture {
         Self {
             db,
             programs: RefCell::new(Vec::new()),
+            seed_pending: false,
         }
     }
 
@@ -151,6 +146,49 @@ impl Fixture {
         self.db.execute("DELETE FROM owed_dirty", []).unwrap();
     }
 
+    fn seed_marks(&self, want: &[Mark]) -> i64 {
+        if self.seed_pending {
+            for (identity, game, source, key) in want {
+                self.db.execute(
+                    "INSERT INTO owed_dirty (identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,?2,?3,?4,0)",
+                    rusqlite::params![identity, game, source, key],
+                ).unwrap();
+            }
+            self.db
+                .query_row(
+                    "SELECT COALESCE(MAX(generation),0) FROM owed_dirty",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        } else {
+            0
+        }
+    }
+
+    fn check_marks(&self, label: &str, want: &[Mark], seen: i64) -> Result<(), String> {
+        let got = self.got();
+        if got != want {
+            return Err(format!("{label}: dirty marks {got:?}, expected {want:?}"));
+        }
+        if self.seed_pending {
+            let stale: i64 = self
+                .db
+                .query_row(
+                    "SELECT COUNT(*) FROM owed_dirty WHERE generation<=?1",
+                    [seen],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if stale != 0 {
+                return Err(format!(
+                    "{label}: {stale} dirty marks kept generation <= {seen}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn check(
         &self,
         label: &str,
@@ -159,6 +197,7 @@ impl Fixture {
         want: Vec<Mark>,
     ) -> Result<(), String> {
         self.clear();
+        let seen = self.seed_marks(&want);
         let mut stmt = self
             .db
             .prepare(sql)
@@ -172,17 +211,17 @@ impl Fixture {
         {}
         drop(rows);
         self.programs.borrow_mut().push((
-            label.into(),
+            if self.seed_pending {
+                format!("{label} (pending marks)")
+            } else {
+                label.into()
+            },
             sql.into(),
             memory,
             stmt.get_status(rusqlite::StatementStatus::VmStep),
             stmt.get_status(rusqlite::StatementStatus::FullscanStep),
         ));
-        let got = self.got();
-        if got != want {
-            return Err(format!("{label}: dirty marks {got:?}, expected {want:?}"));
-        }
-        Ok(())
+        self.check_marks(label, &want, seen)
     }
 
     fn check_query(&self, label: &str, q: &Query, want: Vec<Mark>) -> Result<(), String> {
@@ -921,7 +960,13 @@ fn eviction_paths(f: &Fixture) -> Result<(), String> {
         ],
         marks("eviction", "pot", &["alice", "bob"]),
     )?;
+    let mut want = marks("pot", "pot:0", &["alice", "bob"]);
+    want.extend(marks("party", "party-a", &["alice"]));
+    want.extend(marks("party", "party-b", &["bob"]));
+    want.extend(marks("party", "filed:party", &["alice"]));
+    want.sort();
     f.clear();
+    let seen = f.seed_marks(&want);
     let moved = run(admit_fast::shadow_move_passes(
         &Shadow(f),
         "pot",
@@ -930,17 +975,7 @@ fn eviction_paths(f: &Fixture) -> Result<(), String> {
         false,
     ));
     assert!(moved.incomplete.is_empty(), "{:?}", moved.incomplete);
-    let mut want = marks("pot", "pot:0", &["alice", "bob"]);
-    want.extend(marks("party", "party-a", &["alice"]));
-    want.extend(marks("party", "party-b", &["bob"]));
-    want.extend(marks("party", "filed:party", &["alice"]));
-    want.sort();
-    if f.got() != want {
-        return Err(format!(
-            "eviction shadow move: dirty marks {:?}, expected {want:?}",
-            f.got()
-        ));
-    }
+    f.check_marks("eviction shadow move", &want, seen)?;
     let columns = run(Shadow(f).columns("pot_records")).unwrap();
     f.check(
         "eviction releases hops",
@@ -966,9 +1001,6 @@ fn eviction_paths(f: &Fixture) -> Result<(), String> {
         ],
         marks("eviction", "pot", &["alice", "bob"]),
     )?;
-    f.clear();
-    let (_, faults) = run(admit_fast::restore_twins(&Shadow(f), "pot"));
-    assert!(faults.is_empty(), "{faults:?}");
     // The restored pot precedes its parties, so those INSERTs are independently responsible for their marks.
     let mut restored = marks("party", "party-a", &["alice"]);
     restored.extend(marks("party", "party-b", &["bob"]));
@@ -978,12 +1010,11 @@ fn eviction_paths(f: &Fixture) -> Result<(), String> {
     restored.extend(marks("result", "result", &["alice", "bob"]));
     restored.extend(marks("result", "filed:result", &["alice", "bob"]));
     restored.sort();
-    if f.got() != restored {
-        return Err(format!(
-            "readmission restore: dirty marks {:?}, expected {restored:?}",
-            f.got()
-        ));
-    }
+    f.clear();
+    let seen = f.seed_marks(&restored);
+    let (_, faults) = run(admit_fast::restore_twins(&Shadow(f), "pot"));
+    assert!(faults.is_empty(), "{faults:?}");
+    f.check_marks("readmission restore", &restored, seen)?;
     let (remark, at) = admit_fast::remark_pot_spend_sql(&columns);
     assert!(at);
     f.check(
@@ -1123,6 +1154,13 @@ fn owed893_every_production_source_statement_marks_only_its_subjects() {
 }
 
 #[test]
+fn owed893_every_source_statement_advances_its_pending_marks() {
+    let mut f = Fixture::new(None);
+    f.seed_pending = true;
+    paths(&f).unwrap();
+}
+
+#[test]
 fn owed893_a_pot_arriving_after_its_hops_marks_the_linked_subject_without_trigger_ordering() {
     let f = Fixture::new(None);
     let mut hp = hop();
@@ -1165,7 +1203,7 @@ fn owed893_a_pot_arriving_after_its_hops_marks_the_linked_subject_without_trigge
 }
 
 #[test]
-fn owed893_each_source_trigger_removed_alone_turns_the_production_writes_red() {
+fn owed893_each_source_trigger_removed_or_not_advanced_alone_turns_the_production_writes_red() {
     let f = Fixture::new(None);
     let names: Vec<String> = f.db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'owed_dirty_%' ORDER BY name").unwrap()
         .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
@@ -1182,6 +1220,28 @@ fn owed893_each_source_trigger_removed_alone_turns_the_production_writes_red() {
             "the missing trigger must lose a mark: {err}"
         );
         println!("RED {name}: {err}");
+
+        let mut f = Fixture::new(None);
+        f.seed_pending = true;
+        let trigger: String =
+            f.db.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                [&name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(trigger.contains("generation=excluded.generation"));
+        let stuck = trigger.replace(
+            "generation=excluded.generation",
+            "generation=owed_dirty.generation",
+        );
+        f.db.execute_batch(&format!("DROP TRIGGER {name}; {stuck}"))
+            .unwrap();
+        let err = paths(&f).expect_err(&format!(
+            "{name} stopped advancing but every write stayed green"
+        ));
+        assert!(err.contains("dirty marks kept generation"), "{err}");
+        println!("RED non-advancing {name}: {err}");
     }
 }
 
@@ -1222,11 +1282,63 @@ fn owed893_a_faulted_source_statement_leaves_neither_its_write_nor_a_dirty_mark(
 }
 
 #[test]
-fn owed893_a_word_upsert_coalesces_a_mark_already_waiting_for_the_judge() {
+fn owed893_a_faulted_remark_rolls_back_the_source_and_generation() {
+    let f = Fixture::new(None);
+    let party = seat("alice", "party-a");
+    f.query(discovery::potparty_write::potparty_insert_query(&party, 1).query());
+    let before: (i64, i64) =
+        f.db.query_row("SELECT generation,markedAtMs FROM owed_dirty", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    f.db.execute_batch("CREATE TEMP TRIGGER fail_remark AFTER UPDATE ON owed_dirty BEGIN SELECT RAISE(ABORT,'remark fault'); END;").unwrap();
+    let err =
+        f.db.execute(
+            "UPDATE potparty_records SET createdAt=2 WHERE txid='party-a'",
+            [],
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("remark fault"), "{err}");
+    assert_eq!(
+        f.db.query_row(
+            "SELECT createdAt FROM potparty_records WHERE txid='party-a'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    let after: (i64, i64) =
+        f.db.query_row("SELECT generation,markedAtMs FROM owed_dirty", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "the failed source write must leave the old mark intact"
+    );
+    f.db.execute_batch("DROP TRIGGER fail_remark").unwrap();
+    f.db.execute(
+        "UPDATE potparty_records SET createdAt=2 WHERE txid='party-a'",
+        [],
+    )
+    .unwrap();
+    let after: (i64, i64) =
+        f.db.query_row("SELECT generation,markedAtMs FROM owed_dirty", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert!(after.0 > before.0);
+    assert_eq!(after.1, 2_000);
+}
+
+#[test]
+fn owed893_a_word_upsert_advances_a_coalesced_generation() {
     let f = Fixture::new(None);
     f.query(discovery::potparty_write::potparty_insert_query(&seat("alice", "party-a"), 1).query());
     f.execute(discovery::store_record_sql(), pot_binds("pot", "covenant"));
     f.clear();
+    let mut seen = 0;
     for (word, at) in [("seen", 1), ("mined", 2), ("stale", 3)] {
         f.execute(
             low_app_layer::tracker_host::stored::UPSERT,
@@ -1246,12 +1358,61 @@ fn owed893_a_word_upsert_coalesces_a_mark_already_waiting_for_the_judge() {
             ],
         );
         assert_eq!(f.got(), marks("word", "pot", &["alice"]));
+        let (generation, marked_at): (i64, i64) =
+            f.db.query_row("SELECT generation,markedAtMs FROM owed_dirty", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert!(
+            generation > seen,
+            "re-mark generation {generation} must be newer than {seen}"
+        );
+        assert_eq!(marked_at, at, "keep the newest mark's time");
+        seen = generation;
     }
+}
+
+#[test]
+fn owed893_a_judges_seen_generation_delete_leaves_the_newer_mark() {
+    let f = Fixture::new(None);
+    let party = seat("alice", "party-a");
+    f.query(discovery::potparty_write::potparty_insert_query(&party, 1).query());
+    let seen: i64 =
+        f.db.query_row(
+            "SELECT MAX(generation) FROM owed_dirty WHERE identity='alice' AND gameId='game'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    f.query(discovery::potparty_write::potparty_relatch_query(&party).query());
+    f.db.execute(
+        "DELETE FROM owed_dirty WHERE identity=?1 AND gameId=?2 AND generation<=?3",
+        rusqlite::params!["alice", "game", seen],
+    )
+    .unwrap();
     assert_eq!(
-        f.db.query_row("SELECT markedAtMs FROM owed_dirty", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        1
+        f.got(),
+        marks("party", "party-a", &["alice"]),
+        "the judge must leave the concurrent re-mark pending"
+    );
+}
+
+#[test]
+fn owed893_a_drained_queue_never_reuses_a_generation() {
+    let f = Fixture::new(None);
+    let party = seat("alice", "party-a");
+    f.query(discovery::potparty_write::potparty_insert_query(&party, 1).query());
+    let seen: i64 =
+        f.db.query_row("SELECT MAX(generation) FROM owed_dirty", [], |r| r.get(0))
+            .unwrap();
+    f.clear();
+    f.query(discovery::potparty_write::potparty_relatch_query(&party).query());
+    let generation: i64 =
+        f.db.query_row("SELECT MAX(generation) FROM owed_dirty", [], |r| r.get(0))
+            .unwrap();
+    assert!(
+        generation > seen,
+        "drained generation {seen} must never be reused: {generation}"
     );
 }
 
@@ -1281,7 +1442,7 @@ fn owed893_a_moved_pot_key_marks_both_old_and_new_subjects() {
 /// Includes every existing trigger, the production UPSERT's two programs and the shadow move.
 /// The fleet has 14,719 pots, 7,549 hop markers and 27,000 network witnesses.
 #[test]
-fn owed893_trigger_programs_measured_358144_bytes_stay_below_384_kib() {
+fn owed893_trigger_programs_measured_365328_bytes_stay_below_384_kib() {
     const PREPARED_MAX: i32 = 384 * 1024;
     const VM_MAX: i32 = 4096;
     const SCAN_MAX: i32 = 8; // Small shadow twins; source-table lookups take zero fullscan steps.
@@ -1304,7 +1465,21 @@ fn owed893_trigger_programs_measured_358144_bytes_stay_below_384_kib() {
     }
     f.db.execute_batch("COMMIT").unwrap();
     paths(&f).unwrap();
-    let measured = f.programs.borrow();
+    let mut pending = Fixture::new(None);
+    pending.seed_pending = true;
+    pending.db.execute_batch("BEGIN").unwrap();
+    for row in d1_fleet::rows(1_790_000_000) {
+        d1_fleet::execute_row(&pending.db, &row);
+    }
+    pending.db.execute_batch("COMMIT").unwrap();
+    paths(&pending).unwrap();
+    let measured: Vec<_> = f
+        .programs
+        .borrow()
+        .iter()
+        .chain(pending.programs.borrow().iter())
+        .cloned()
+        .collect();
     for (label, _, memory, steps, scans) in measured.iter() {
         println!("{label}: {memory} prepared bytes, {steps} VM steps, {scans} fullscan steps");
     }
