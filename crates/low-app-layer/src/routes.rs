@@ -1092,7 +1092,7 @@ async fn collected_games_for(
 /// cannot be anchored or counted, dropped in [`ResultRowD1::into_marker`].
 /// `createdAt` is nullable (mirrors the client's `createdAt: number | null`).
 #[derive(Deserialize)]
-struct ResultRowD1 {
+pub(crate) struct ResultRowD1 {
     #[serde(rename = "gameId")]
     game_id: String,
     winner: String,
@@ -1117,7 +1117,7 @@ struct ResultRowD1 {
 impl ResultRowD1 {
     /// Host row, or `None` when a required byte field is NULL (a malformed
     /// marker that could never anchor or count — never fabricated).
-    fn into_marker(self) -> Option<ResultMarkerRow> {
+    pub(crate) fn into_marker(self) -> Option<ResultMarkerRow> {
         Some(ResultMarkerRow {
             game_id: self.game_id,
             winner: self.winner,
@@ -2706,7 +2706,7 @@ struct HopSeatRowD1 {
 /// `/results` joined row as D1 returns it (the `results_sql` shape): the
 /// caller's potparty facts + spend pointer + BOTH stored BEEFs as hex.
 #[derive(Deserialize)]
-struct ResultsRowD1 {
+pub(crate) struct ResultsRowD1 {
     identity: String,
     #[serde(rename = "gameId")]
     game_id: String,
@@ -2798,7 +2798,7 @@ struct ResultsRowD1 {
 }
 
 impl ResultsRowD1 {
-    fn into_row(self) -> crate::results::ResultsRow {
+    pub(crate) fn into_row(self) -> crate::results::ResultsRow {
         crate::results::ResultsRow {
             settle_signers: self.settle_signers,
             identity: self.identity,
@@ -8003,7 +8003,7 @@ pub(crate) fn note_seat_marker_rows(
 /// fault is never shaped like an answer). The defaults only cover NULL/
 /// absent VALUES on a migrated schema; no default can manufacture a fact.
 #[derive(Deserialize)]
-struct RefundViewRowD1 {
+pub(crate) struct RefundViewRowD1 {
     #[serde(rename = "gameId")]
     game_id: String,
     #[serde(rename = "potTxid")]
@@ -8049,7 +8049,7 @@ struct RefundViewRowD1 {
 }
 
 impl RefundViewRowD1 {
-    fn into_row(self) -> crate::refund_view::RefundViewRow {
+    pub(crate) fn into_row(self) -> crate::refund_view::RefundViewRow {
         crate::refund_view::RefundViewRow {
             game_id: self.game_id,
             pot_txid: self.pot_txid,
@@ -8233,7 +8233,7 @@ pub async fn refund_backups(req: Request, ctx: RouteContext<AuthState>) -> Resul
 /// pre-migration schema the whole query faults and the route answers 503
 /// for everyone (a fault is never shaped like an answer).
 #[derive(Deserialize)]
-struct HopsViewRowD1 {
+pub(crate) struct HopsViewRowD1 {
     identity: String,
     #[serde(rename = "gameId")]
     game_id: String,
@@ -8283,7 +8283,7 @@ struct HopsViewRowD1 {
 }
 
 impl HopsViewRowD1 {
-    fn into_row(self) -> crate::hops_view::HopsViewRow {
+    pub(crate) fn into_row(self) -> crate::hops_view::HopsViewRow {
         crate::hops_view::HopsViewRow {
             identity: self.identity,
             game_id: self.game_id,
@@ -10122,7 +10122,7 @@ pub async fn sweep_owed_spender_bytes(env: &worker::Env) {
     crate::owed::note_spender_store_sweep_pass();
 }
 
-fn spender_outputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<crate::owed::SpenderOutput> {
+pub(crate) fn spender_outputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<crate::owed::SpenderOutput> {
     tx.outputs
         .iter()
         .enumerate()
@@ -10140,7 +10140,7 @@ fn spender_outputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<crate::owed:
         })
         .collect()
 }
-fn spender_inputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<(String, u32)> {
+pub(crate) fn spender_inputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<(String, u32)> {
     tx.inputs
         .iter()
         .filter_map(|inp| {
