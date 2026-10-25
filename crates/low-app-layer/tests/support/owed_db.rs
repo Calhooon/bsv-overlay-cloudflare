@@ -26,6 +26,8 @@ pub struct Db {
     pub tip: Cell<Option<u64>>,
     /// Fail every batch whose statements contain this text (a judge fault on demand).
     pub fail_on: RefCell<Option<String>>,
+    /// Each statement run and its SQLite VM steps (the cost pins).
+    pub steps: RefCell<Vec<(String, i64)>>,
 }
 impl Db {
     pub fn new() -> Self {
@@ -46,6 +48,7 @@ impl Db {
             now: Cell::new(NOW),
             tip: Cell::new(Some(900_000)),
             fail_on: RefCell::new(None),
+            steps: RefCell::new(Vec::new()),
         }
     }
     pub fn exec(&self, sql: &str) {
@@ -114,6 +117,8 @@ impl SqlPort for Db {
                 got.push(Value::Object(value));
             }
             drop(rows);
+            let steps = s.get_status(rusqlite::StatementStatus::VmStep);
+            self.steps.borrow_mut().push((st.sql.clone(), i64::from(steps)));
             out.push(StmtOut {
                 rows: got,
                 changes: Some(tx.changes()),

@@ -309,13 +309,17 @@ const OWED_893_PLANS: &[(&str, &str, &[&str])] = &[
     (
         "owed rows and words",
         low_app_layer::owed_read::ROWS_SQL,
-        &["sqlite_autoindex_owed_rows_1", "sqlite_autoindex_owed_row_words_1", "sqlite_autoindex_tx_words_1"],
+        &["idx_owed_rows_identity_game", "sqlite_autoindex_owed_row_words_1", "sqlite_autoindex_tx_words_1"],
     ),
     ("owed identity marker", low_app_layer::owed_read::STATE_SQL, &["sqlite_autoindex_owed_state_1"]),
     ("owed pending count", low_app_layer::owed_read::PENDING_SQL, &["idx_owed_dirty_identity"]),
     // The D2-OWED lens's MEDIUM-1: the SHIPPED drain, tip, belt and repair statements, never proxies.
     ("owed judge marks", low_app_layer::owed_judge::MARKS_SQL, &["sqlite_autoindex_owed_dirty_1"]),
     ("owed hop competitors", low_app_layer::owed_judge::HOP_COMPETITORS_SQL, &["idx_hopparty_hop"]),
+    // the D2-OWED lens's LOW-2: one game's rows, one state row; the ceiling reads the list only past 500 rows
+    ("owed judge game delete", low_app_layer::owed_judge::GAME_DELETE_SQL, &["idx_owed_rows_identity_game"]),
+    ("owed judge state create", low_app_layer::owed_judge::STATE_CREATE_SQL, &["sqlite_autoindex_owed_state_1"]),
+    ("owed judge state stamp", low_app_layer::owed_judge::STATE_UPDATE_SQL, &["sqlite_autoindex_owed_state_1"]),
     ("owed acknowledge seen generation", low_app_layer::owed_judge::ACK_DIRTY_SQL, &["sqlite_autoindex_owed_dirty_1"]),
     ("owed word invalidation", "SELECT identity,outpoint FROM owed_row_words WHERE txid=?1", &["idx_owed_row_words_txid"]),
     ("owed wanted envelopes", low_app_layer::owed_judge::WANTED_ENVELOPES_SQL, &["idx_owed_dirty_source_marked"]),
@@ -378,7 +382,7 @@ fn owed893_each_owed_lookup_index_removed_alone_turns_the_hot_plan_pin_red() {
         .flat_map(|(_, _, indexes)| indexes.iter().copied())
         .filter(|index| !index.starts_with("sqlite_autoindex_"))
         .collect();
-    assert_eq!(indexes.len(), 15);
+    assert_eq!(indexes.len(), 16);
     for index in indexes {
         db.execute_batch("SAVEPOINT missing_index").unwrap();
         db.execute_batch(&format!("DROP INDEX {index}")).unwrap();

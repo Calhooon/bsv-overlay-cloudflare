@@ -869,7 +869,7 @@
    "name": "owed_state",
    "database": "low-overlay-db",
    "owner": "low-app-layer",
-   "writers": {},
+   "writers": {"overlay-cloudflare": ["UPDATE"]},
    "readers": [],
    "rebuild_class": "transient",
    "never_wipe": false,
