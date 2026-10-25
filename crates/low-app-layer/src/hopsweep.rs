@@ -230,12 +230,6 @@ pub fn bind_hop_sweep(
             return Err(SweepRefusal::HopMarkerUnverified);
         }
     }
-    // bsv-low #663: in EVERY arm (the overlay's latch and the replay alike) the filing's game is the hop's own row's;
-    // another is refused by name, never written and never corrected (the per-(poster, game, hop) cap and every
-    // reader keyed by the game would otherwise take the filing's word)
-    if row_game != m.game_id {
-        return Err(SweepRefusal::SweepGameMismatch);
-    }
     // 2. the raw spends the hop
     if !sweep_spends_hop(&m.sweep_raw, &m.hop_txid, m.hop_vout) {
         return Err(SweepRefusal::SweepDoesNotSpendTheHop);
@@ -291,6 +285,11 @@ pub fn bind_hop_sweep(
     });
     if !sig.verify(&digest, &pk) {
         return Err(SweepRefusal::SweepNotTheSeatsSpend);
+    }
+    // bsv-low #663: compare only after the seat signed this spend. An unsigned or wrongly signed filing
+    // gets the signature's refusal regardless of its game. The latch and replay arms share this check.
+    if row_game != m.game_id {
+        return Err(SweepRefusal::SweepGameMismatch);
     }
     Ok(())
 }

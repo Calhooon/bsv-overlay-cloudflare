@@ -178,35 +178,24 @@ fn settle_noting(
 }
 
 /// bsv-low #560 (B-COST-1): what a flush owes after its POSTs, DURABLY. [`settle`] (the isolate's note-back, the fast
-/// path), then the NEW note-backs parked in the D1 outbox ([`crate::change_park::park_noted_back`], kind `pot`), so an
+/// path), then the NEW note-backs collected with the counters in the flush's atomic D1 batch (kind `pot`), so an
 /// isolate's end before its next flush, or a retry that fails too, loses no outpoint: the cron's drain delivers it.
-/// [`ship`] runs exactly this over D1; the pins over the shipped statements under SQLite.
-pub(crate) async fn settle_and_park<P: crate::change_park::ParkPort, A, F>(
-    port: &P,
+/// [`ship`] collects this account and park in the shared flush batch; the pins commit its SQL under SQLite.
+pub(crate) fn settle_and_park(
+    batch: &mut crate::change_flush::FlushBatch,
     shipped: &crate::change_flush::Shipped<(String, u32)>,
-    now_ms: u64,
-    account: A,
-) -> (crate::change_flush::Tally, crate::change_park::Outboxed)
-where
-    A: FnOnce(crate::change_flush::Tally) -> F,
-    F: std::future::Future<Output = ()>,
-{
+) -> crate::change_flush::Tally {
     let (tally, fresh) = settle_noting(shipped);
-    // the lens's LOW-2: the flush's account FIRST, so a task cancelled during the park's batch keeps its counters
-    account(tally).await;
-    let items = fresh
-        .iter()
-        .map(|(t, v)| crate::change_park::pot_item(t, *v))
-        .collect();
-    let parked = crate::change_park::park_noted_back(
-        port,
+    batch.tally(&COUNTERS, tally);
+    batch.park(
         crate::change_park::KIND_POT,
-        items,
+        fresh
+            .iter()
+            .map(|(t, v)| crate::change_park::pot_item(t, *v))
+            .collect(),
         COUNTER_POT_CHANGED_OUTBOXED,
-        now_ms,
-    )
-    .await;
-    (tally, parked)
+    );
+    tally
 }
 
 /// Ship one flush: the outpoints in POSTs of at most [`POT_CHANGED_CHUNK`] (bsv-low #436), one after another,
@@ -216,8 +205,12 @@ where
 /// POST's outpoints are noted back once (`pot_changed_retried_total`); the part of a flood past the flush's
 /// bound is noted back for the next flush (`pot_changed_deferred_total`). The note-back is not durable: the
 /// hole and its bound are named in [`crate::change_flush`].
-#[rustfmt::skip] // Preserve main's strict producer wiring pin.
-pub async fn ship(env: Env, outpoints: Vec<(String, u32)>, deadline_ms: u64) {
+pub async fn ship(
+    env: Env,
+    outpoints: Vec<(String, u32)>,
+    deadline_ms: u64,
+    batch: &std::cell::RefCell<crate::change_flush::FlushBatch>,
+) {
     if outpoints.is_empty() {
         return;
     }
@@ -228,7 +221,16 @@ pub async fn ship(env: Env, outpoints: Vec<(String, u32)>, deadline_ms: u64) {
     let total = outpoints.len();
     let shipped = ship_with(
         outpoints,
-        |body| crate::change_flush::post_body(&env, &url, &token, "/internal/pot-changed", "pot-changes", body),
+        |body| {
+            crate::change_flush::post_body(
+                &env,
+                &url,
+                &token,
+                "/internal/pot-changed",
+                "pot-changes",
+                body,
+            )
+        },
         || Date::now().as_millis(),
         deadline_ms,
     )
@@ -236,18 +238,8 @@ pub async fn ship(env: Env, outpoints: Vec<(String, u32)>, deadline_ms: u64) {
     if !shipped.delivered.is_empty() {
         console_log!("[pot-changes] notified {} outpoint(s) in {} POST(s)", shipped.delivered.len(), shipped.posts);
     }
-    // bsv-low #560: the flush's account, then the note-backs into the D1 outbox too (the lens's LOW-2: the account
-    // before the park's batch; no binding: memory only, as before, logged)
-    let account = |tally| crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, tally);
-    match env.d1("OVERLAY_DB") {
-        Ok(db) => {
-            settle_and_park(&crate::change_park::WorkerPark { db: &db }, &shipped, Date::now().as_millis(), account).await;
-        }
-        Err(_) => {
-            console_log!("[pot-changes] no OVERLAY_DB: the flush's note-backs stay in the isolate's memory only");
-            account(settle(&shipped)).await;
-        }
-    }
+    let tally = settle_and_park(&mut batch.borrow_mut(), &shipped);
+    crate::change_flush::log_account("pot-changes", total, tally);
 }
 
 /// Drain and ship INSIDE a detached task, awaited there (2026-09-04).
@@ -271,12 +263,12 @@ pub async fn flush_inline(env: Env) {
     crate::tracker_events::ship_then(
         &env,
         tracker_events,
-        |deadline_ms| async move {
+        |deadline_ms, batch| async move {
             if !hops.is_empty() {
-                crate::hop_changes::ship(notes_env.clone(), hops, deadline_ms).await;
+                crate::hop_changes::ship(notes_env.clone(), hops, deadline_ms, &batch).await;
             }
             if !changed.is_empty() {
-                ship(notes_env, changed, deadline_ms).await;
+                ship(notes_env, changed, deadline_ms, &batch).await;
             }
         },
         deadline_ms,
@@ -288,8 +280,9 @@ pub async fn flush_inline(env: Env) {
 /// "did not complete within the allowed time after invocation end and have been cancelled", 30 s).
 pub const WAIT_UNTIL_WINDOW_MS: u64 = 30_000;
 
-/// Time reserved for accounting and durable parking after delivery. With no more than this left, the
-/// background flush skips delivery and parks its notes.
+/// Time reserved for the ONE atomic accounting and parking round trip after delivery ([`crate::change_flush::FlushBatch`]).
+/// No per-counter D1 calls follow it. With no more than this left, the background flush skips delivery.
+/// The native pin exercises 384 parks and 25 counters with a 2.9 s round trip inside this reserve.
 pub const FLUSH_WINDOW_FLOOR_MS: u64 = 3_000;
 
 /// What a background flush may spend (bsv-low #649).
@@ -357,12 +350,13 @@ pub async fn flush_inline_within(env: Env, started_ms: u64) {
             crate::tracker_events::ship_then(
                 &env,
                 tracker_events,
-                |deadline_ms| async move {
+                |deadline_ms, batch| async move {
                     if !hops.is_empty() {
-                        crate::hop_changes::ship(notes_env.clone(), hops, deadline_ms).await;
+                        crate::hop_changes::ship(notes_env.clone(), hops, deadline_ms, &batch)
+                            .await;
                     }
                     if !changed.is_empty() {
-                        ship(notes_env, changed, deadline_ms).await;
+                        ship(notes_env, changed, deadline_ms, &batch).await;
                     }
                 },
                 deadline_ms,
@@ -383,9 +377,10 @@ pub async fn flush_inline_within(env: Env, started_ms: u64) {
 /// word event into the same flush: shipped pots first, the winner's recompute raced the word's write and could read
 /// `built`, withholding the payout row until the next unrelated hook (the MINED callback, a block later). The
 /// `/internal/tx-word` ingest answers after its write, and each frame is awaited, so the words are durable before the
-/// first note leaves. A word frame the wall stops is retried once on the next flush (as before); a hop or pot note
-/// the wall stops is deferred and noted back (as before). The words take at most their slice of the wall before the
-/// notes start (`tracker_events::WORDS_SHARE_MS`, B-OWED-3-FOLD L3); the order is ONE function,
+/// first note leaves. A frame the wall stops is deferred and parked without consuming its delivery retry;
+/// a hop or pot note the wall stops is deferred and parked too. The words' slice bounds only POST starts
+/// (`tracker_events::WORDS_SHARE_MS`, B-OWED-3-FOLD L3): an in-flight word keeps the full flush wall before
+/// the notes start. Frames not started in the slice run after the notes. The order is ONE function,
 /// `tracker_events::ship_in_order`, which the three flushes reach through `tracker_events::ship_then`.
 pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)>(
     env: &Env,
@@ -407,12 +402,12 @@ pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
         crate::tracker_events::ship_then(
             &env2,
             tracker_events,
-            |deadline_ms| async move {
+            |deadline_ms, batch| async move {
                 if !hops.is_empty() {
-                    crate::hop_changes::ship(notes_env.clone(), hops, deadline_ms).await;
+                    crate::hop_changes::ship(notes_env.clone(), hops, deadline_ms, &batch).await;
                 }
                 if !changed.is_empty() {
-                    ship(notes_env, changed, deadline_ms).await;
+                    ship(notes_env, changed, deadline_ms, &batch).await;
                 }
             },
             deadline_ms,
@@ -688,18 +683,17 @@ pub(crate) mod tests {
                         .find("\npub async fn flush_inline(")
                         .expect("the next fn")],
         ));
-        assert!(ship.contains(&squash(r#"let shipped = ship_with( outpoints, |body| crate::change_flush::post_body(&env, &url, &token, "/internal/pot-changed", "pot-changes", body),"#)));
-        // bsv-low #560: the note-backs into the D1 outbox too, the memory's alone without the binding; the lens's
-        // LOW-2: both arms account through the one closure, which `settle_and_park` awaits BEFORE its park
-        assert!(ship.contains(&squash(
-            r#"let account = |tally| crate::change_flush::account(&env, "pot-changes", &COUNTERS, total, tally);"#
-        )));
-        assert!(ship.contains(&squash("Ok(db) => { settle_and_park(&crate::change_park::WorkerPark { db: &db }, &shipped, Date::now().as_millis(), account).await; }")));
-        assert!(ship.contains(&squash("account(settle(&shipped)).await;")));
+        assert!(ship.contains("letshipped=ship_with(outpoints,"));
+        assert!(ship.contains(&squash(r#"crate::change_flush::post_body(&env, &url, &token, "/internal/pot-changed", "pot-changes", body,"#)));
+        assert!(ship.contains("settle_and_park(&mutbatch.borrow_mut(),&shipped)"));
         assert_eq!(
-            ship.matches("change_flush::account(").count(),
+            ship.matches("settle_and_park(").count(),
             1,
-            "one account a flush"
+            "one account per set"
+        );
+        assert!(
+            !ship.contains(".flush("),
+            "the outer word/hop/pot flush owns the one batch"
         );
         assert!(
             !ship.contains("body_json("),
@@ -757,7 +751,7 @@ pub(crate) mod tests {
                 .find("crate::hop_changes::ship(")
                 .unwrap_or_else(|| panic!("{name}: hops"));
             let pots = f
-                .find(",changed,deadline_ms)")
+                .find(",changed,deadline_ms,&batch)")
                 .unwrap_or_else(|| panic!("{name}: pots"));
             assert!(
                 words < hops && words < pots,
@@ -770,7 +764,7 @@ pub(crate) mod tests {
             );
             // B-OWED-3-FOLD L4: the notes are the ordered shipper's `notes` step, under the deadline it hands them
             assert!(
-                f[words..].contains("|deadline_ms|asyncmove{if!hops.is_empty(){crate::hop_changes::ship(notes_env.clone(),hops,deadline_ms).await;}if!changed.is_empty(){ship(notes_env,changed,deadline_ms).await;}},deadline_ms,).await;"),
+                f[words..].contains("|deadline_ms,batch|asyncmove{if!hops.is_empty(){crate::hop_changes::ship(notes_env.clone(),hops,deadline_ms,&batch).await;}if!changed.is_empty(){ship(notes_env,changed,deadline_ms,&batch).await;}},deadline_ms,).await;"),
                 "{name}: the hop and pot notes run inside ship_then, after the words' slice"
             );
         }

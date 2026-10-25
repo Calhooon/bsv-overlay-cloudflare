@@ -25,13 +25,13 @@
 //! worst case flush of one set is 16 sequential POSTs of 8 entries (128 entries; a pot body of 8 is at most 767
 //! bytes, 12.3 kB over the flush). The request's detached task ships the hop set and then the pot set under ONE
 //! deadline, so at most 32 POSTs there, and the lobby set's own task at most 16: 48 subrequests in the worst
-//! request, plus one D1 write per counter that moved. The time one POST takes is the app layer's handling of a
+//! request. Counters and parks commit in one D1 batch per flush. The time one POST takes is the app layer's handling of a
 //! body of eight (one broadcast push per outpoint, the attribution reads, the per-seat filings), which no native
 //! pin can measure: it is beta's figure. The wall budget makes the bound hold whatever that figure is: at a
 //! modelled 2 s per POST a flush of 128 gets 10 POSTs out in its 20 s and DEFERS the other 48 entries, counted,
 //! where it used to lose them with the task, uncounted (the pin runs 131 entries: 80 delivered, 51 deferred).
 //! Each POST is raced against that same deadline. An unacknowledged chunk is deferred, counted and parked;
-//! a background flush reserves three seconds of its platform window for accounting and parking.
+//! a background flush reserves three seconds for its one accounting and parking batch, with no later D1 await.
 //!
 //! THE NOTE-BACK IS NOT DURABLE (lens L3; the delta lens's D-L2 states what that costs the counters). A
 //! deferred or retried entry is noted back into the isolate's set from inside the detached task, after the
@@ -60,7 +60,7 @@
 //!
 //! THE OUTBOX (bsv-low #560, B-COST-1). Every NEW note-back ([`settle_noting`]'s `fresh`: a failed POST's entries
 //! and the entries past the bound) is also PARKED in D1 (`change_parked`, under the set's kind, by
-//! `change_park::park_noted_back`, the table #649's skip parks into), counted `*_outboxed_total`; the cron's drain
+//! `FlushBatch`, in the table #649's skip parks into), counted `*_outboxed_total`; the cron's drain
 //! (`change_park::deliver_parked`, the `*/15` tick and `/admin/complete-proofs`) delivers it, backs it off on a
 //! refusal and counts it exhausted after its last attempt (`change_park_exhausted_total`). The in-memory
 //! note-back stays the FAST path and the figures above still describe it; the outbox is the DURABLE one, so an
@@ -69,16 +69,17 @@
 //! counted undelivered by the memory's account) is still a row. An entry REFUSED by the receiver (`dropped` in its
 //! answer) is not a note-back and is not parked. One that did not reach the
 //! outbox is counted where it missed: `change_park_full_total` (the table's ceiling), `change_park_faults_total`
-//! (the batch faulted), `change_outbox_over_bound_total` (past a flush's batch bound). The flush's account
-//! ([`account`], the five counters above) is written BEFORE the park's batch (the lens's LOW-2: a cancellation
-//! during the batch keeps the counters the flush wrote before the outbox existed). Left, stated: the park follows
-//! the account, so a task the runtime cancels after its last POST and before the park lands keeps that flush's new
-//! note-backs in memory only, uncounted by the outbox (the wall budget leaves
-//! 10 s of the 30 s window for it, less a POST in flight); and an entry drained and in flight when the task ends is
-//! the pre-existing loss of a POST in flight (above). Delivery is now proven by the outbox's own figures:
+//! (the batch faulted), `change_outbox_over_bound_total` (past a flush's batch bound). The flush's account and
+//! all hop, pot and word parks commit atomically in ONE `counted_batch` (`FlushBatch`, OVERLAY-D2 LOW-2).
+//! The reserve therefore covers one round trip rather than a variable sequence of counter writes. A failed
+//! batch leaves notes in memory, logs the fault and queues its counter deltas, including park faults, for the
+//! next flush; no further D1 await spends the reserve. A runtime cancellation before commit can still leave
+//! notes in memory only, with no partial account, and an isolate lost then loses those notes. The #649 refusal
+//! facts are already durable before this flush. Delivery is proven by the outbox's own figures:
 //! `/health/invariants.changeParked` (rows waiting, by set) and the counters `change_unparked_total` (delivered),
 //! `change_park_exhausted_total` (abandoned).
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
 use worker::*;
@@ -341,7 +342,7 @@ fn settle_splitting<T: Ord + Clone>(
 
 /// PURE (bsv-low #560, B-COST-1): [`settle`], answering also the flush's NEW note-backs (`fresh`: entries noted back
 /// by this flush that no earlier flush of this isolate had noted back), the entries the flush parks in its D1 outbox
-/// (`change_park::park_noted_back`). An entry still waiting from an earlier flush was parked by that flush. The
+/// ([`FlushBatch`]). An entry still waiting from an earlier flush was parked by that flush. The
 /// lens's LOW-3: an entry the FULL memory let go (a first failure past [`RETRY_MEMORY_MAX`], a deferral past
 /// [`DEFER_MEMORY_MAX`]) is fresh too, and FIRST, so the outbox's bound ([`crate::change_park::OUTBOX_PARK_MAX`])
 /// takes those that have no memory to fall back on before those that do. Returns `(note back, fresh, account)`.
@@ -365,7 +366,7 @@ pub fn settle_noting<T: Ord + Clone>(
 }
 
 /// PURE: the note-backs never re-sent, from the three counters' totals (`/health/invariants` serves it per set
-/// as `*_noted_back_unresent`). Floored at 0: the counters are bumped one statement at a time. Cumulative: read
+/// as `*_noted_back_unresent`). Floored at 0 for historical partial accounts; a flush now batches its counters. Read
 /// against a recorded baseline, never against 0 (the module doc, D2-L2).
 pub fn noted_back_unresent(retried_total: u64, deferred_total: u64, resent_total: u64) -> u64 {
     (retried_total + deferred_total).saturating_sub(resent_total)
@@ -478,8 +479,8 @@ pub struct FlushCounters {
     pub outboxed: &'static str,
 }
 
-/// The flush's account, after the POSTs: one log line and the counters, only when something did not go through.
-pub async fn account(env: &Env, tag: &str, counters: &FlushCounters, shipped: usize, tally: Tally) {
+/// Log the flush's delivery misses; the counters are collected with its outbox rows by [`FlushBatch`].
+pub fn log_account(tag: &str, shipped: usize, tally: Tally) {
     let Tally {
         undelivered,
         retry_failed,
@@ -495,12 +496,188 @@ pub async fn account(env: &Env, tag: &str, counters: &FlushCounters, shipped: us
             "[{tag}] flush of {shipped} entry(ies): {undelivered} NOT delivered (refused by the app layer, the POST failed twice: {retry_failed} after a retry, or let go past the isolate's bounded memory of note-backs), {retried} noted back to retry once, {deferred} deferred to the next flush"
         );
     }
-    if let Ok(db) = env.d1("OVERLAY_DB") {
-        crate::ops::bump_counter(&db, counters.undelivered, undelivered as u64).await;
-        crate::ops::bump_counter(&db, counters.retry_failed, retry_failed as u64).await;
-        crate::ops::bump_counter(&db, counters.retried, retried as u64).await;
-        crate::ops::bump_counter(&db, counters.deferred, deferred as u64).await;
-        crate::ops::bump_counter(&db, counters.resent, resent as u64).await;
+}
+
+thread_local! {
+    // A failed atomic batch has written none of its counters. Retry those deltas with the next flush.
+    static PENDING_ACCOUNT: RefCell<BTreeMap<String, u64>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+struct ParkSet {
+    kind: &'static str,
+    counter: &'static str,
+    items: Vec<String>,
+}
+
+/// All counters and new outbox rows of one flush, committed in one D1 round trip after delivery.
+/// The fixed three-second reserve covers this one round trip, regardless of the counter or frame count.
+/// A database fault leaves the notes in memory and retries the counter deltas on the next flush.
+#[derive(Default)]
+pub struct FlushBatch {
+    counters: BTreeMap<String, u64>,
+    parks: Vec<ParkSet>,
+}
+
+// The generation is minted in this transaction and belongs only to its parks. Counting that generation
+// derives both successes and capacity refusals inside the same batch, without a follow-up D1 call.
+const PARK_ACCOUNT_SQL: &str = "INSERT INTO ops_counters (name, value) \
+    SELECT ?1, CASE WHEN ?4 = 1 THEN ?3 - COUNT(*) ELSE COUNT(*) END \
+    FROM change_parked WHERE kind = ?2 \
+        AND generation = (SELECT n FROM change_parked_seq WHERE id = 1) \
+    HAVING CASE WHEN ?4 = 1 THEN ?3 - COUNT(*) ELSE COUNT(*) END > 0 \
+    ON CONFLICT(name) DO UPDATE SET value = ops_counters.value + excluded.value";
+
+impl FlushBatch {
+    pub(crate) fn bump(&mut self, name: impl Into<String>, delta: u64) {
+        if delta > 0 {
+            *self.counters.entry(name.into()).or_default() += delta;
+        }
+    }
+
+    pub(crate) fn tally(&mut self, counters: &FlushCounters, tally: Tally) {
+        for (name, n) in [
+            (counters.undelivered, tally.undelivered),
+            (counters.retry_failed, tally.retry_failed),
+            (counters.retried, tally.retried),
+            (counters.deferred, tally.deferred),
+            (counters.resent, tally.resent),
+        ] {
+            self.bump(name, n as u64);
+        }
+    }
+
+    pub(crate) fn park(&mut self, kind: &'static str, items: Vec<String>, counter: &'static str) {
+        if items.is_empty() {
+            return;
+        }
+        let at = self
+            .parks
+            .iter()
+            .position(|set| set.kind == kind)
+            .unwrap_or_else(|| {
+                self.parks.push(ParkSet {
+                    kind,
+                    counter,
+                    items: Vec::new(),
+                });
+                self.parks.len() - 1
+            });
+        let set = &mut self.parks[at];
+        let mut over = 0;
+        for item in items {
+            if set.items.contains(&item) {
+                continue;
+            }
+            if set.items.len() < crate::change_park::OUTBOX_PARK_MAX {
+                set.items.push(item);
+            } else {
+                over += 1;
+            }
+        }
+        self.bump(crate::change_park::COUNTER_CHANGE_OUTBOX_OVER_BOUND, over);
+    }
+
+    fn queries(&self, now_ms: u64) -> Vec<crate::d1::Query> {
+        use crate::{change_park, d1::Query};
+        let mut queries: Vec<_> = self
+            .counters
+            .iter()
+            .map(|(name, n)| {
+                Query::new(crate::ops::BUMP_COUNTER_SQL)
+                    .bind(name.as_str())
+                    .bind(*n)
+            })
+            .collect();
+        if !self.parks.is_empty() {
+            queries.push(Query::new(change_park::PARK_SEQ_BUMP_SQL).bind(now_ms));
+        }
+        for set in &self.parks {
+            for item in &set.items {
+                queries.push(
+                    Query::new(change_park::PARK_SQL)
+                        .bind(set.kind)
+                        .bind(item.as_str())
+                        .bind(now_ms)
+                        .bind(change_park::CHANGE_PARKED_MAX_ROWS),
+                );
+            }
+            for (counter, full) in [(set.counter, 0), (change_park::COUNTER_CHANGE_PARK_FULL, 1)] {
+                queries.push(
+                    Query::new(PARK_ACCOUNT_SQL)
+                        .bind(counter)
+                        .bind(set.kind)
+                        .bind(set.items.len() as u64)
+                        .bind(full),
+                );
+            }
+        }
+        queries
+    }
+
+    fn failed(mut self) {
+        let rows: usize = self.parks.iter().map(|set| set.items.len()).sum();
+        self.bump(crate::change_park::COUNTER_CHANGE_PARK_FAULTS, rows as u64);
+        PENDING_ACCOUNT.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            for (name, n) in self.counters {
+                *pending.entry(name).or_default() += n;
+            }
+        });
+        // No further database await spends the reserve after a failed batch.
+    }
+
+    pub(crate) async fn flush_with<P: FlushPort>(mut self, port: &P, now_ms: u64) {
+        for (name, n) in PENDING_ACCOUNT.with(|pending| std::mem::take(&mut *pending.borrow_mut()))
+        {
+            self.bump(name, n);
+        }
+        let queries = self.queries(now_ms);
+        if queries.is_empty() {
+            return;
+        }
+        if let Err(error) = port.commit(queries).await {
+            port.log(format!("[change-outbox] flush accounting batch FAULTED ({error}); notes stay in memory, counters await the next flush"));
+            self.failed();
+        }
+    }
+
+    pub(crate) async fn flush(self, env: &Env, now_ms: u64) {
+        match env.d1("OVERLAY_DB") {
+            Ok(db) => self.flush_with(&WorkerFlush { db: &db }, now_ms).await,
+            Err(error) => {
+                console_log!(
+                    "[change-outbox] no OVERLAY_DB: notes and counters stay in memory ({error})"
+                );
+                self.failed();
+            }
+        }
+    }
+}
+
+/// The one post-delivery round trip, shared by D1 and the real-SQLite pins.
+pub(crate) trait FlushPort {
+    async fn commit(&self, queries: Vec<crate::d1::Query>) -> std::result::Result<(), String>;
+    fn log(&self, line: String);
+}
+
+struct WorkerFlush<'a> {
+    db: &'a D1Database,
+}
+
+impl FlushPort for WorkerFlush<'_> {
+    async fn commit(&self, queries: Vec<crate::d1::Query>) -> std::result::Result<(), String> {
+        let statements = queries
+            .iter()
+            .map(|query| query.prepare(self.db))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        crate::d1_ledger::counted_batch(self.db, statements)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn log(&self, line: String) {
+        console_log!("{line}");
     }
 }
 
@@ -515,9 +692,218 @@ pub(crate) fn run<F: Future>(fut: F) -> F::Output {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    pub(crate) fn commit_queries(
+        conn: &rusqlite::Connection,
+        queries: Vec<crate::d1::Query>,
+    ) -> std::result::Result<(), String> {
+        use crate::d1::QVal;
+        use rusqlite::types::Value;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        for query in queries {
+            let params = query.params().iter().map(|v| match v {
+                QVal::Null => Value::Null,
+                QVal::Int(i) => Value::Integer(*i),
+                QVal::Text(t) => Value::Text(t.clone()),
+                QVal::Bool(b) => Value::Integer(i64::from(*b)),
+                QVal::Blob(b) => Value::Blob(b.clone()),
+                QVal::Float(f) => Value::Real(*f),
+            });
+            let mut stmt = tx.prepare(query.sql()).map_err(|e| e.to_string())?;
+            let mut rows = stmt
+                .query(rusqlite::params_from_iter(params))
+                .map_err(|e| e.to_string())?;
+            while rows.next().map_err(|e| e.to_string())?.is_some() {}
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    struct ClockedFlush<'a> {
+        conn: rusqlite::Connection,
+        clock: &'a Cell<u64>,
+        calls: Cell<usize>,
+        fail: Cell<bool>,
+    }
+
+    impl FlushPort for ClockedFlush<'_> {
+        async fn commit(
+            &self,
+            mut queries: Vec<crate::d1::Query>,
+        ) -> std::result::Result<(), String> {
+            self.calls.set(self.calls.get() + 1);
+            self.clock.set(self.clock.get() + 2_900);
+            if self.fail.get() {
+                // A failure after both counter and park statements must roll back the whole batch.
+                queries.push(crate::d1::Query::new(
+                    "INSERT INTO missing_flush_table VALUES (1)",
+                ));
+            }
+            commit_queries(&self.conn, queries)
+        }
+        fn log(&self, _: String) {}
+    }
+
+    fn flush_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in crate::d1::OVERLAY_MIGRATIONS {
+            if let Err(error) = conn.execute_batch(sql) {
+                assert!(
+                    error.to_string().contains("duplicate column"),
+                    "{error}: {sql}"
+                );
+            }
+        }
+        conn
+    }
+
+    fn counter(conn: &rusqlite::Connection, name: &str) -> u64 {
+        conn.query_row(
+            "SELECT value FROM ops_counters WHERE name = ?",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    #[test]
+    fn d2_low2_full_flush_accounts_and_parks_in_one_reserved_round_trip() {
+        use crate::change_park::{KIND_HOP, KIND_POT, KIND_WORD, OUTBOX_PARK_MAX};
+        PENDING_ACCOUNT.with(|p| p.borrow_mut().clear());
+        let clock = Cell::new(25_000);
+        let crate::pot_changes::BackgroundFlush::Ship { deadline_ms } =
+            crate::pot_changes::background_flush_plan(0, clock.get())
+        else {
+            panic!("delivery fits")
+        };
+        assert_eq!(deadline_ms, 27_000);
+        let mut batch = FlushBatch::default();
+        for (kind, name) in [
+            (KIND_HOP, crate::hop_changes::COUNTER_HOP_CHANGED_OUTBOXED),
+            (KIND_POT, crate::pot_changes::COUNTER_POT_CHANGED_OUTBOXED),
+            (KIND_WORD, crate::change_park::COUNTER_CHANGE_PARKED),
+        ] {
+            batch.park(
+                kind,
+                (0..OUTBOX_PARK_MAX)
+                    .map(|n| format!("{kind}-{n}"))
+                    .collect(),
+                name,
+            );
+        }
+        for n in 0..25 {
+            batch.bump(format!("flush-pin-{n}"), n + 1);
+        }
+        clock.set(deadline_ms);
+        let port = ClockedFlush {
+            conn: flush_db(),
+            clock: &clock,
+            calls: Cell::new(0),
+            fail: Cell::new(false),
+        };
+        run(batch.flush_with(&port, clock.get()));
+        assert_eq!(
+            port.calls.get(),
+            1,
+            "the reserve covers one database round trip"
+        );
+        assert_eq!(clock.get(), 29_900);
+        assert!(clock.get() < crate::pot_changes::WAIT_UNTIL_WINDOW_MS);
+        let rows: usize = port
+            .conn
+            .query_row("SELECT COUNT(*) FROM change_parked", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 3 * OUTBOX_PARK_MAX);
+        for name in [
+            crate::hop_changes::COUNTER_HOP_CHANGED_OUTBOXED,
+            crate::pot_changes::COUNTER_POT_CHANGED_OUTBOXED,
+            crate::change_park::COUNTER_CHANGE_PARKED,
+        ] {
+            assert_eq!(counter(&port.conn, name), OUTBOX_PARK_MAX as u64);
+        }
+        assert_eq!(counter(&port.conn, "flush-pin-24"), 25);
+        assert_eq!(
+            counter(&port.conn, crate::change_park::COUNTER_CHANGE_PARK_FULL),
+            0
+        );
+        let src = include_str!("change_flush.rs");
+        let worker = &src[src.find("impl FlushPort for WorkerFlush").unwrap()
+            ..src.find("/// Run a future").unwrap()];
+        assert_eq!(worker.matches("counted_batch(").count(), 1);
+        assert!(!worker.contains("bump_counter("));
+    }
+
+    #[test]
+    fn d2_low2_batch_counts_full_and_over_bound_and_rolls_back_on_a_fault() {
+        use crate::change_park::*;
+        PENDING_ACCOUNT.with(|p| p.borrow_mut().clear());
+        let clock = Cell::new(0);
+        let port = ClockedFlush {
+            conn: flush_db(),
+            clock: &clock,
+            calls: Cell::new(0),
+            fail: Cell::new(false),
+        };
+        for n in 0..CHANGE_PARKED_MAX_ROWS - 1 {
+            port.conn.execute("INSERT INTO change_parked (kind, item, parked_at_ms, generation) VALUES ('pot', ?, 0, 1)", [format!("held-{n}")]).unwrap();
+        }
+        let mut batch = FlushBatch::default();
+        batch.park(
+            KIND_POT,
+            (0..OUTBOX_PARK_MAX + 1)
+                .map(|n| format!("new-{n}"))
+                .collect(),
+            crate::pot_changes::COUNTER_POT_CHANGED_OUTBOXED,
+        );
+        run(batch.flush_with(&port, 1_000));
+        assert_eq!(
+            counter(&port.conn, crate::pot_changes::COUNTER_POT_CHANGED_OUTBOXED),
+            1
+        );
+        assert_eq!(counter(&port.conn, COUNTER_CHANGE_PARK_FULL), 127);
+        assert_eq!(counter(&port.conn, COUNTER_CHANGE_OUTBOX_OVER_BOUND), 1);
+        // Re-parking a held row still succeeds at the ceiling, under a new generation.
+        let mut batch = FlushBatch::default();
+        batch.park(
+            KIND_POT,
+            vec!["new-0".into()],
+            crate::pot_changes::COUNTER_POT_CHANGED_OUTBOXED,
+        );
+        run(batch.flush_with(&port, 1_000));
+        assert_eq!(
+            counter(&port.conn, crate::pot_changes::COUNTER_POT_CHANGED_OUTBOXED),
+            2
+        );
+        port.conn
+            .execute(
+                "DELETE FROM change_parked WHERE kind = 'pot' AND item = 'held-0'",
+                [],
+            )
+            .unwrap();
+        port.fail.set(true);
+        let mut batch = FlushBatch::default();
+        batch.bump("fault-pin", 5);
+        batch.park(KIND_WORD, vec!["word".into()], COUNTER_CHANGE_PARKED);
+        run(batch.flush_with(&port, 2_000));
+        assert_eq!(counter(&port.conn, "fault-pin"), 0);
+        let words: usize = port
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM change_parked WHERE kind = 'word'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(words, 0, "the park rolled back with its counter");
+        port.fail.set(false);
+        run(FlushBatch::default().flush_with(&port, 3_000));
+        assert_eq!(counter(&port.conn, "fault-pin"), 5);
+        assert_eq!(counter(&port.conn, COUNTER_CHANGE_PARK_FAULTS), 1);
+        assert_eq!(counter(&port.conn, COUNTER_CHANGE_PARKED), 0);
+        assert!(PENDING_ACCOUNT.with(|p| p.borrow().is_empty()));
+    }
 
     fn items(n: usize) -> Vec<u32> {
         (0..n as u32).collect()
@@ -799,7 +1185,7 @@ mod tests {
         assert_eq!(
             noted_back_unresent(1, 1, 5),
             0,
-            "floored: the counters are bumped one statement at a time"
+            "floored for historical partial counter writes"
         );
     }
 

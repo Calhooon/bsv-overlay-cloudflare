@@ -5872,59 +5872,18 @@ mod tests {
                 |ms| self.delay(ms),
             )
             .await;
-            crate::pot_changes::settle_and_park(
-                self,
-                &shipped,
-                self.clock.get(),
-                |tally| async move {
-                    self.bump_value(
-                        crate::pot_changes::COUNTER_POT_CHANGED_DEFERRED,
-                        tally.deferred as u64,
-                    );
-                },
-            )
-            .await;
+            let mut batch = crate::change_flush::FlushBatch::default();
+            crate::pot_changes::settle_and_park(&mut batch, &shipped);
+            batch.flush_with(self, self.clock.get()).await;
         }
         fn log(&self, _: String) {}
     }
 
-    impl crate::change_park::ParkPort for D2Watch {
-        async fn park(
-            &self,
-            rows: &[(&'static str, String)],
-            now_ms: u64,
-        ) -> Result<Vec<bool>, String> {
-            use rusqlite::OptionalExtension;
-            let tx = self.store.conn.unchecked_transaction().unwrap();
-            tx.query_row(
-                crate::change_park::PARK_SEQ_BUMP_SQL,
-                [now_ms as i64],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap();
-            let results = rows
-                .iter()
-                .map(|(kind, item)| {
-                    tx.query_row(
-                        crate::change_park::PARK_SQL,
-                        rusqlite::params![
-                            kind,
-                            item,
-                            now_ms as i64,
-                            crate::change_park::CHANGE_PARKED_MAX_ROWS
-                        ],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .optional()
-                    .unwrap()
-                    .is_some()
-                })
-                .collect();
-            tx.commit().unwrap();
-            Ok(results)
-        }
-        async fn bump(&self, counter: &'static str, delta: u64) {
-            self.bump_value(counter, delta);
+    impl crate::change_flush::FlushPort for D2Watch {
+        async fn commit(&self, queries: Vec<Query>) -> Result<(), String> {
+            self.batches.borrow_mut().push(queries.len());
+            self.clock.set(self.clock.get() + 2_900);
+            crate::change_flush::tests::commit_queries(&self.store.conn, queries)
         }
         fn log(&self, _: String) {}
     }
@@ -6003,7 +5962,11 @@ mod tests {
             port.total(crate::applayer_counters::COUNTER_TXANY_MEMO_WRITE_REFUSED),
             1
         );
-        assert_eq!(*port.batches.borrow(), vec![3], "one batch before delivery");
+        assert_eq!(
+            *port.batches.borrow(),
+            vec![3, 13],
+            "one facts batch before delivery, one accounting batch after"
+        );
         assert!(
             completed.is_some(),
             "the pending watch was cancelled at {} ms before accounting for its flush",
@@ -6039,11 +6002,9 @@ mod tests {
         ))
         .expect("the word deadline also precedes platform cancellation");
         assert_eq!(frames.len(), 1);
-        crate::change_flush::run(crate::tracker_events::park_walled(
-            &port,
-            frames,
-            port.clock.get(),
-        ));
+        let mut batch = crate::change_flush::FlushBatch::default();
+        crate::tracker_events::park_walled(&mut batch, frames);
+        crate::change_flush::run(batch.flush_with(&port, port.clock.get()));
         let words: i64 = port
             .store
             .conn
