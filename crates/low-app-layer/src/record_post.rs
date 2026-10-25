@@ -2048,6 +2048,9 @@ pub(crate) fn refuse(kind: Option<RecordKind>, r: RecordRefusal) -> Result<Respo
 
 pub(crate) fn record_refusal_body(r: RecordRefusal, family: Option<&str>) -> serde_json::Value {
     let mut body = serde_json::json!({ "error": r.as_str() });
+    if r == RecordRefusal::SweepGameMismatch {
+        body["code"] = serde_json::json!(r.class());
+    }
     if let Some(family) = family {
         body["family"] = serde_json::json!(family);
     }
@@ -2059,11 +2062,20 @@ pub(crate) fn refuse_with_family(
     r: RecordRefusal,
     family: Option<&str>,
 ) -> Result<Response> {
+    let (status, body) = record_refusal_reply(kind, r, family);
+    crate::routes::json_response(body.to_string(), status)
+}
+
+fn record_refusal_reply(
+    kind: Option<RecordKind>,
+    r: RecordRefusal,
+    family: Option<&str>,
+) -> (u16, serde_json::Value) {
     if let Some(k) = kind {
         bump(&REFUSED_BY_KIND, k);
     }
     mirror_refused(r.class());
-    crate::routes::json_response(record_refusal_body(r, family).to_string(), r.status())
+    (r.status(), record_refusal_body(r, family))
 }
 
 // ── the door's core, over the SQL port (the route's D1, the pins' real SQLite) ──
@@ -4778,6 +4790,60 @@ pub(crate) mod tests {
                 "Refused(SweepGameMismatch)",
                 "markerValid {latch:?}: past the cap under another game"
             );
+        }
+    }
+
+    /// The signed sweep goes through the same parser, hop lookup, binding and reply preparation as the route.
+    /// A latched hop still refuses another game's filing, with a stable code and the durable counter delta.
+    #[tokio::test(flavor = "current_thread")]
+    async fn d2_663_wrong_game_signed_filing_has_a_counted_422_code() {
+        use crate::hopsweep::tests as hs;
+        let wallet = hs::wallet(0x45);
+        let identity = hs::identity(&wallet);
+        let poster = hex::encode(&identity);
+        let seat = hs::skey(14);
+        let raw = hs::sweep_raw(&seat, &seat, 0, hs::HOP_SATS, &hs::DEST);
+        let start_ms = 1_000_000_000_000.0;
+        crate::courier::take_pending_if_due(start_ms);
+        for (i, latch) in [Some(1), Some(0), None].into_iter().enumerate() {
+            let db = crate::pot_hook::tests::SqliteSql::migrated();
+            md_index_the_hop(&db, &hs::hop_ctx(&wallet, &seat, true), latch);
+            let (outcome, _) = md_file(
+                &db,
+                RecordKind::Hopsweep,
+                &md_sweep_script(&identity, &[0x99; 32], &raw),
+                &poster,
+            )
+            .await;
+            let DoorOutcome::Refused(refusal) = outcome else {
+                panic!("wrong-game filing was accepted: {outcome:?}");
+            };
+            let (status, body) = record_refusal_reply(Some(RecordKind::Hopsweep), refusal, None);
+            let counters: std::collections::BTreeMap<_, _> =
+                crate::courier::take_pending_if_due(start_ms + (i + 1) as f64 * 60_001.0)
+                    .into_iter()
+                    .collect();
+            assert_eq!(counters.get("applayer_record_refused_total"), Some(&1));
+            assert_eq!(
+                counters.get("applayer_record_refused_sweep_game_mismatch_total"),
+                Some(&1)
+            );
+            assert_eq!(status, 422);
+            assert_eq!(body["code"], "sweep_game_mismatch", "latch {latch:?}");
+            assert_eq!(body["error"], RecordRefusal::SweepGameMismatch.as_str());
+            let rows: i64 = db
+                .conn
+                .query_row("SELECT COUNT(*) FROM hopsweep_records", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0);
+            let (own_game, _) = md_file(
+                &db,
+                RecordKind::Hopsweep,
+                &md_sweep_script(&identity, &hs::GID, &raw),
+                &poster,
+            )
+            .await;
+            assert_eq!(own_game, DoorOutcome::Written { row_written: true });
         }
     }
 
