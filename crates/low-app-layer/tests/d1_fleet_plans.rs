@@ -328,6 +328,7 @@ const OWED_893_PLANS: &[(&str, &str, &[&str])] = &[
     ("owed due belt", low_app_layer::owed_belt::CANDIDATES_SQL, &["idx_owed_rows_belt_turn"]),
     ("owed belt gauge", low_app_layer::owed_belt::DUE_GAUGE_SQL, &["idx_owed_rows_belt"]),
     ("owed age repair", low_app_layer::owed_backfill::AGE_MARK_SQL, &["idx_owed_rows_judged", "idx_owed_dirty_source_marked"]),
+    ("owed keyless repair", low_app_layer::owed_backfill::AGE_MARK_UNJUDGED_SQL, &["idx_owed_rows_unjudged", "idx_owed_dirty_source_marked"]),
     ("owed released hop", "SELECT identity,gameId FROM released_hop_evidence WHERE hopTxid=?1 AND hopVout=?2", &["sqlite_autoindex_released_hop_evidence_1"]),
     ("owed released game", "SELECT hopTxid,hopVout FROM released_hop_evidence WHERE identity=?1 AND gameId=?2", &["idx_released_hop_evidence_identity_game"]),
     ("owed belt cursor", "SELECT cursor,tickedAtMs FROM owed_belt_state WHERE name=?1", &["sqlite_autoindex_owed_belt_state_1"]),
@@ -377,7 +378,7 @@ fn owed893_each_owed_lookup_index_removed_alone_turns_the_hot_plan_pin_red() {
         .flat_map(|(_, _, indexes)| indexes.iter().copied())
         .filter(|index| !index.starts_with("sqlite_autoindex_"))
         .collect();
-    assert_eq!(indexes.len(), 14);
+    assert_eq!(indexes.len(), 15);
     for index in indexes {
         db.execute_batch("SAVEPOINT missing_index").unwrap();
         db.execute_batch(&format!("DROP INDEX {index}")).unwrap();

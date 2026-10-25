@@ -627,7 +627,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 398 to 399 for #893 (lane D2-OWED-FOLD, HIGH-3): `idx_owed_rows_belt_turn`, the belt's round-robin by identity.
 /// 399 to 402 for #893 (lane D2-OWED-FOLD, MEDIUM-1): `owed_dirty` by source key, by (source, age) and by (identity,
 /// age), so no drain statement scans the fleet's marks.
-pub const OVERLAY_MIGRATION_COUNT: usize = 402;
+/// 402 to 403 for #893 (lane D2-OWED-FOLD, MEDIUM-5): `idx_owed_rows_unjudged`, the age repair's keyless rows.
+pub const OVERLAY_MIGRATION_COUNT: usize = 403;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2372,6 +2373,7 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::derived_owed::DIRTY_SOURCE_KEY_INDEX,
     crate::derived_owed::DIRTY_SOURCE_MARKED_INDEX,
     crate::derived_owed::DIRTY_IDENTITY_MARKED_INDEX,
+    crate::derived_owed::UNJUDGED_INDEX,
 ];
 
 // =============================================================================
