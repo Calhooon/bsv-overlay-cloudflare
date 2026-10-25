@@ -105,11 +105,15 @@ use crate::pot_hook::{Bind, SqlPort, Stmt, StmtOut};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 mod hydrate;
+mod writers;
+pub use writers::{drain_changed, drain_identities, judge_word_write, mark_tip, MARK_TIP_SQL};
+pub(crate) use hydrate::hydrate_filings;
 pub use hydrate::{
     hydrate_inputs, HOPS_SQL, LINKS_SQL, PARTIES_SQL, RELEASED_SQL, REPRESENTATIVES_SQL,
 };
 
 pub const OWED_JUDGE_SUBJECTS_PER_INVOCATION: usize = 16;
+pub const OWED_DIRTY_SUBJECTS_PER_PASS: usize = 64;
 /// Required source-table access paths. The overlay must append these additive migrations.
 /// The native migration pin deliberately stays red until that prerequisite lands.
 pub const REQUIRED_GAME_INDEXES: [&str;2] = [
@@ -134,6 +138,10 @@ pub trait JudgeDb: SqlPort {
     ) -> Result<BTreeMap<String, Value>, String>;
     async fn canonical_root(&self, height: u64) -> Option<String>;
     async fn push(&self, identity: &str, body: Value);
+    async fn hydrate(&self, identity: &str, games: &[String]) -> Result<JudgeInputs, String>
+    where Self: Sized {
+        hydrate_inputs(self, identity, games).await
+    }
 }
 
 /// Production adapter. All SQL, including the final write, uses the counted D1 port.
@@ -264,6 +272,8 @@ pub struct JudgeReport {
     pub deferred: usize,
     pub rows: usize,
     pub truncated: bool,
+    /// Changes from the source statements at the front of the committed batch.
+    pub source_changes: Vec<Option<u64>>,
 }
 #[derive(Debug, Default)]
 pub struct DrainReport {
@@ -356,9 +366,10 @@ pub async fn judge_with_write(
                 .unwrap_or(0),
         );
         groups.push((id.clone(), games.clone()));
-        inputs.push(hydrate_inputs(db, &id, &games).await?);
+        inputs.push(db.hydrate(&id, &games).await?);
     }
     apply(&mut inputs)?;
+    let source_count = writes.len();
     let mut plan = writes;
     let mut state_positions = Vec::new();
     let mut report = JudgeReport {
@@ -421,6 +432,7 @@ pub async fn judge_with_write(
         return Ok(report);
     }
     let landed = db.run_batch(plan).await?;
+    report.source_changes = landed.iter().take(source_count).map(|r| r.changes).collect();
     for (pos, id, stamp) in state_positions {
         let state = landed
             .get(pos)
@@ -573,7 +585,7 @@ pub async fn refund_subjects(
 /// Expand the one wanted envelope to durable game marks. An interrupted drain leaves all remaining games marked.
 pub const EXPAND_WANTED_SQL:&str="INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,gameId,'wanted',?1,?2 FROM (SELECT gameId FROM potparty_records WHERE identity=?1 UNION SELECT gameId FROM hopparty_records WHERE identity=?1 UNION SELECT gameId FROM released_hop_evidence WHERE identity=?1 UNION SELECT gameId FROM owed_rows WHERE identity=?1) WHERE gameId<>'' ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
 pub async fn drain_dirty(db: &impl JudgeDb, limit: usize) -> Result<DrainReport, String> {
-    let limit = limit.min(OWED_JUDGE_SUBJECTS_PER_INVOCATION);
+    let limit = limit.min(OWED_DIRTY_SUBJECTS_PER_PASS);
     let mut report = DrainReport::default();
     if limit == 0 {
         return Ok(report);

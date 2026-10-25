@@ -757,11 +757,167 @@ pub fn handfile_row_keys(v: &VerifiedHandfile) -> [(HandfileSlot, String, u32); 
     ]
 }
 
-/// PURE (the MONEY-DOOR lens's LOW-1): a handfile batch that wrote no row still moves what is owed when the refund's
-/// chain no-op latched the poster's own chain row; then the pot's parties and the filer are marked as on a write,
-/// and the answer stays the re-file's (`filed: false`). A batch that wrote is marked on its own path.
-pub(crate) fn handfile_noop_moves_owed(wrote: bool, refund_latched: bool) -> bool {
-    !wrote && refund_latched
+/// The handfile source rows and both seats' judgements commit together.
+pub(crate) async fn judge_handfile(
+    db: &impl crate::owed_judge::JudgeDb,
+    verified: &VerifiedHandfile,
+    facts: &HopFacts,
+    refund_valid: bool,
+    write: &[bool; HANDFILE_PAYLOADS],
+    now: i64,
+) -> Result<bool, String> {
+    use crate::record_post::{
+        int as js_num, text as js, text_opt as js_opt, VerifiedRecord, POTPARTY_FILE_SQL,
+        POTREFUND_FILE_SQL, POTREFUND_LATCH_SQL,
+    };
+    let mut stmts = vec![crate::pot_hook::Stmt::new(
+        HANDFILE_BATCH_FILE_SQL,
+        vec![
+            js(&verified.key),
+            js(&verified.identity),
+            js(&verified.game_id),
+            js(&verified.hop_txid),
+            js(&payloads_column(&verified.payloads_hex)),
+            js(&verified.identity_sig_hex),
+            js(&verified.settle_sig_hex),
+            js_num(now),
+        ],
+    )];
+    if write[HandfileSlot::Hopparty as usize] {
+        let m = &verified.hopparty;
+        stmts.push(crate::pot_hook::Stmt::new(
+            HOPPARTY_HANDFILE_FILE_SQL,
+            vec![
+                js(&verified.identity),
+                js(&hex::encode(&m.opponent)),
+                js(&verified.game_id),
+                js_num(i64::from(m.hop_vout)),
+                js_num(m.hop_sats as i64),
+                js(&hex::encode(&m.seat_settle_pubkey)),
+                js(&verified.settle_sig_hex),
+                js(&verified.identity_sig_hex),
+                js(&facts.lock_hex),
+                js_num(facts.sats as i64),
+                js_num(i64::from(facts.outputs)),
+                js(&verified.hop_txid),
+                js_num(i64::from(verified.hop_row_vout)),
+                js_num(now),
+                js_num(1),
+            ],
+        ));
+    }
+    for (slot, r) in [
+        (HandfileSlot::PotpartyV1, &verified.potparty_v1),
+        (HandfileSlot::PotpartyV2, &verified.potparty_v2),
+    ] {
+        if !write[slot as usize] {
+            continue;
+        }
+        stmts.push(crate::pot_hook::Stmt::new(
+            POTPARTY_FILE_SQL,
+            vec![
+                js(&r.identity),
+                js(&r.opponent_identity),
+                js(&r.game_id),
+                js(&r.pot_txid),
+                js_num(i64::from(r.pot_vout)),
+                js_num(i64::from(r.recovery_height)),
+                js(&r.sig_hex),
+                js_opt(r.seat_settle_pubkey.as_deref()),
+                js_opt(r.seat_sig_hex.as_deref()),
+                js(&r.txid),
+                js_num(0),
+                js_num(now),
+                js_num(1),
+            ],
+        ));
+    }
+    if write[HandfileSlot::Potrefund as usize] {
+        let r = &verified.potrefund;
+        stmts.push(crate::pot_hook::Stmt::new(
+            POTREFUND_FILE_SQL,
+            vec![
+                js(&r.identity),
+                js(&r.game_id),
+                js(&r.pot_txid),
+                js_num(i64::from(r.pot_vout)),
+                js(&r.refund_raw_hex),
+                js(&r.sig_hex),
+                js(&r.txid),
+                js_num(0),
+                js_num(now),
+                js_num(i64::from(refund_valid)),
+            ],
+        ));
+        if refund_valid {
+            stmts.push(crate::pot_hook::Stmt::new(
+                POTREFUND_LATCH_SQL,
+                vec![js(&r.txid)],
+            ));
+        }
+    }
+    for (slot, row_txid, row_vout) in handfile_row_keys(verified) {
+        if !write[slot as usize] {
+            continue;
+        }
+        stmts.push(crate::pot_hook::Stmt::new(
+            HANDFILE_ROW_FILE_SQL,
+            vec![
+                js(slot.family()),
+                js(&row_txid),
+                js_num(i64::from(row_vout)),
+                js(&verified.key),
+                js_num(slot as i64),
+            ],
+        ));
+    }
+
+    let mut filings = Vec::new();
+    if write[HandfileSlot::PotpartyV1 as usize] {
+        filings.push(VerifiedRecord::Potparty(verified.potparty_v1.clone(), true));
+    }
+    if write[HandfileSlot::PotpartyV2 as usize] {
+        filings.push(VerifiedRecord::Potparty(verified.potparty_v2.clone(), true));
+    }
+    // Include the refund subject on a chain-covered row too, so a new hand judges both seats.
+    filings.push(VerifiedRecord::Potrefund(
+        verified.potrefund.clone(),
+        refund_valid,
+    ));
+    let m = &verified.hopparty;
+    let hops = if write[HandfileSlot::Hopparty as usize] {
+        vec![serde_json::json!({
+            "identity":verified.identity,"opponentIdentity":hex::encode(&m.opponent),"gameId":verified.game_id,
+            "txid":verified.hop_txid,"hopTxid":verified.hop_txid,"hopVout":m.hop_vout,"hopSats":m.hop_sats,
+            "seatSettlePubkey":hex::encode(&m.seat_settle_pubkey),"seatSigHex":verified.settle_sig_hex,
+            "identitySigHex":verified.identity_sig_hex,"hopLockHex":facts.lock_hex,"hopSatsOnChain":facts.sats,"containerOutputs":facts.outputs,
+            "outputIndex":verified.hop_row_vout,"markerTxid":verified.hop_txid,"markerVout":verified.hop_row_vout,
+            "createdAt":now,"markerCreatedAt":now,"markerRowid":i64::MAX,"markerValid":1,"paidTier":0,"unknownHop":0
+        })]
+    } else {
+        vec![]
+    };
+    let mut marks: Vec<_> = filings
+        .iter()
+        .filter(|filing| {
+            !matches!(filing, VerifiedRecord::Potrefund(..))
+                || write[HandfileSlot::Potrefund as usize]
+        })
+        .map(crate::record_post::owed_write::mark)
+        .collect();
+    if write[HandfileSlot::Hopparty as usize] {
+        marks.push(crate::owed_judge::FilingMark {
+            source: "hop".into(),
+            source_key: format!("{}:{}", verified.hop_txid, m.hop_vout),
+        });
+    }
+    let report =
+        crate::record_post::owed_write::judge_filings(db, &filings, &hops, now, stmts, &marks)
+            .await?;
+    Ok(report
+        .source_changes
+        .iter()
+        .any(|n| crate::record_post::insert_wrote_a_row(n.map(|n| n as usize))))
 }
 
 /// The door's handfile arm, after the kind and the raw body are read (`record_post` dispatches here).
@@ -773,9 +929,8 @@ pub async fn handfile_post(
 ) -> worker::Result<worker::Response> {
     use crate::d1_ledger::Counted;
     use crate::record_post::{
-        bind_refund_backup, chain_rows_query, insert_wrote_a_row, js, js_num, js_opt,
-        note_cap_refused, note_filed, read_pot_context, refuse, RecordKind, VerifiedRecord,
-        POTPARTY_FILE_SQL, POTREFUND_FILE_SQL, POTREFUND_LATCH_SQL, RECORD_DAY_SECS,
+        bind_refund_backup, chain_rows_query, js, js_num, note_cap_refused, note_filed,
+        read_pot_context, refuse, RecordKind, VerifiedRecord, RECORD_DAY_SECS,
     };
     let kind = RecordKind::Handfile;
     let body: HandfileBody = match serde_json::from_slice(raw) {
@@ -835,7 +990,14 @@ pub async fn handfile_post(
     write[HandfileSlot::Hopparty as usize] = hop_chain == 0;
     // bsv-low #798: the refund's chain no-op is the direct door's, row by row (a junk-signed chain row naming this
     // identity is never a no-op; an own row is latched before the batch)
-    let port = crate::routes::D1Sql::of(&ctx.env)?;
+    let tip = crate::routes::chaintracks_present_height_env(&ctx.env, "owed")
+        .await
+        .ok();
+    let port = crate::owed_judge::D1Judge::new(
+        &ctx.env,
+        tip,
+        crate::routes::written_off_before_ms_env(&ctx.env),
+    )?;
     let refund_chain =
         crate::record_post::potrefund_chain_noop(&port, &verified.potrefund, pot.as_ref())
             .await
@@ -876,111 +1038,9 @@ pub async fn handfile_post(
             return crate::record_post::refuse_with_family(Some(kind), r, Some(query.family));
         }
     }
-    // 6 and 8. one batch: the batch row, the family rows, their places, the refund latch
-    let mut stmts = vec![db.prepare(HANDFILE_BATCH_FILE_SQL).bind(&[
-        js(&verified.key),
-        js(&verified.identity),
-        js(&verified.game_id),
-        js(&verified.hop_txid),
-        js(&payloads_column(&verified.payloads_hex)),
-        js(&verified.identity_sig_hex),
-        js(&verified.settle_sig_hex),
-        js_num(now),
-    ])?];
-    if write[HandfileSlot::Hopparty as usize] {
-        let m = &verified.hopparty;
-        stmts.push(db.prepare(HOPPARTY_HANDFILE_FILE_SQL).bind(&[
-            js(&verified.identity),
-            js(&hex::encode(&m.opponent)),
-            js(&verified.game_id),
-            js_num(i64::from(m.hop_vout)),
-            js_num(m.hop_sats as i64),
-            js(&hex::encode(&m.seat_settle_pubkey)),
-            js(&verified.settle_sig_hex),
-            js(&verified.identity_sig_hex),
-            js(&facts.lock_hex),
-            js_num(facts.sats as i64),
-            js_num(i64::from(facts.outputs)),
-            js(&verified.hop_txid),
-            js_num(i64::from(verified.hop_row_vout)),
-            js_num(now),
-            js_num(1),
-        ])?);
-    }
-    for (slot, r) in [
-        (HandfileSlot::PotpartyV1, &verified.potparty_v1),
-        (HandfileSlot::PotpartyV2, &verified.potparty_v2),
-    ] {
-        if !write[slot as usize] {
-            continue;
-        }
-        stmts.push(db.prepare(POTPARTY_FILE_SQL).bind(&[
-            js(&r.identity),
-            js(&r.opponent_identity),
-            js(&r.game_id),
-            js(&r.pot_txid),
-            js_num(i64::from(r.pot_vout)),
-            js_num(i64::from(r.recovery_height)),
-            js(&r.sig_hex),
-            js_opt(r.seat_settle_pubkey.as_deref()),
-            js_opt(r.seat_sig_hex.as_deref()),
-            js(&r.txid),
-            js_num(0),
-            js_num(now),
-            js_num(1),
-        ])?);
-    }
-    if write[HandfileSlot::Potrefund as usize] {
-        let r = &verified.potrefund;
-        stmts.push(db.prepare(POTREFUND_FILE_SQL).bind(&[
-            js(&r.identity),
-            js(&r.game_id),
-            js(&r.pot_txid),
-            js_num(i64::from(r.pot_vout)),
-            js(&r.refund_raw_hex),
-            js(&r.sig_hex),
-            js(&r.txid),
-            js_num(0),
-            js_num(now),
-            js_num(i64::from(refund_valid)),
-        ])?);
-        if refund_valid {
-            stmts.push(db.prepare(POTREFUND_LATCH_SQL).bind(&[js(&r.txid)])?);
-        }
-    }
-    for (slot, row_txid, row_vout) in handfile_row_keys(&verified) {
-        if !write[slot as usize] {
-            continue;
-        }
-        stmts.push(db.prepare(HANDFILE_ROW_FILE_SQL).bind(&[
-            js(slot.family()),
-            js(&row_txid),
-            js_num(i64::from(row_vout)),
-            js(&verified.key),
-            js_num(slot as i64),
-        ])?);
-    }
-    let results = crate::d1_ledger::counted_batch(&db, stmts).await?;
-    // A retry can still promote a rank-0 refund or add a previously chain-covered row.
-    // Only a batch with zero changes in EVERY statement is a no-op. Unreadable metadata
-    // is treated as a write, as at the direct door, so it cannot suppress a needed recompute.
-    let wrote = results
-        .iter()
-        .any(|r| insert_wrote_a_row(r.meta().ok().flatten().and_then(|m| m.changes)));
-    // the MONEY-DOOR lens's LOW-1: the batch wrote nothing, but the refund's chain no-op latched the poster's own
-    // chain row `refundValid = 1`, which the owed list reads as the pot's valid refund
-    if handfile_noop_moves_owed(wrote, refund_chain.latched) {
-        crate::record_post::note_filing_and_recompute(
-            ctx,
-            &db,
-            Some(verified.identity.clone()),
-            Some((
-                verified.potrefund.pot_txid.to_ascii_lowercase(),
-                verified.potrefund.pot_vout,
-            )),
-        )
-        .await;
-    }
+    let wrote = judge_handfile(&port, &verified, &facts, refund_valid, &write, now)
+        .await
+        .map_err(worker::Error::RustError)?;
     if !wrote {
         crate::record_post::note_already_filed(kind);
         return crate::routes::json_response(
@@ -989,16 +1049,6 @@ pub async fn handfile_post(
         );
     }
     note_filed(kind, anonymous);
-    crate::record_post::note_filing_and_recompute(
-        ctx,
-        &db,
-        Some(verified.identity.clone()),
-        Some((
-            verified.potrefund.pot_txid.to_ascii_lowercase(),
-            verified.potrefund.pot_vout,
-        )),
-    )
-    .await;
     crate::routes::json_response(
         handfile_answer(&verified, refund_valid, true).to_string(),
         200,
@@ -1140,6 +1190,124 @@ pub(crate) mod tests {
         pub recovery_height: u32,
         pub refund_raw: Vec<u8>,
         pub hop_txid: [u8; 32],
+    }
+
+    #[tokio::test]
+    async fn owed893_handfile_sources_and_rows_are_one_transaction() {
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        let hand = Hand::new(15);
+        let verified = verify_handfile(&hand.body(), &hand.poster()).unwrap();
+        let facts = HopFacts {
+            lock_hex: expected_hop_lock_hex(&hand.settle_pub()).unwrap(),
+            sats: HOP_SATS,
+            outputs: 2,
+        };
+        db.conn
+            .execute(
+                "INSERT INTO pot_records(txid,outputIndex,spent,createdAt) VALUES(?1,0,0,1)",
+                [hex::encode(HOP_TXID)],
+            )
+            .unwrap();
+        db.conn.execute_batch("DELETE FROM owed_dirty; CREATE TRIGGER fail_owed BEFORE INSERT ON owed_rows BEGIN SELECT RAISE(ABORT,'owed row fault'); END;").unwrap();
+        assert!(
+            judge_handfile(&db, &verified, &facts, false, &[true; 4], 2_000)
+                .await
+                .is_err()
+        );
+        for table in [
+            "handfile_batches",
+            "handfile_rows",
+            "potparty_records",
+            "potrefund_records",
+            "hopparty_records",
+            "owed_rows",
+            "owed_dirty",
+        ] {
+            let n: i64 = db
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "rollback {table}");
+        }
+        db.conn.execute_batch("DROP TRIGGER fail_owed").unwrap();
+        assert!(
+            judge_handfile(&db, &verified, &facts, false, &[true; 4], 2_000)
+                .await
+                .unwrap()
+        );
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM owed_rows", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            rows, 2,
+            "the new pot and hop are judged from the pending markers"
+        );
+        let marks: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM owed_dirty", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(marks, 0, "owned marks are acknowledged atomically");
+        // A chain-covered hop is not this batch's source. A mark raised during hydration must survive.
+        struct ReMark<'a> {
+            db: &'a crate::pot_hook::tests::SqliteSql,
+            id: String,
+            game: String,
+            hop: String,
+        }
+        impl crate::pot_hook::SqlPort for ReMark<'_> {
+            async fn run_batch(
+                &self,
+                stmts: Vec<crate::pot_hook::Stmt>,
+            ) -> Result<Vec<crate::pot_hook::StmtOut>, String> {
+                if stmts
+                    .first()
+                    .is_some_and(|s| s.sql == HANDFILE_BATCH_FILE_SQL)
+                {
+                    self.db.conn.execute("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES(?1,?2,'hop',?3,1)",rusqlite::params![self.id,self.game,self.hop]).unwrap();
+                }
+                crate::pot_hook::SqlPort::run_batch(self.db, stmts).await
+            }
+            async fn counters(&self, _: Vec<(String, u64)>) {}
+            fn now_ms(&self) -> u64 {
+                self.db.now.get()
+            }
+            fn log(&self, _: &str) {}
+        }
+        impl crate::owed_judge::JudgeDb for ReMark<'_> {
+            fn tip(&self) -> Option<u64> {
+                Some(900_000)
+            }
+            async fn word_views(
+                &self,
+                rows: &std::collections::BTreeMap<String, crate::tracker_host::stored::Row>,
+            ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, String> {
+                Ok(rows.iter().map(|(k, v)| (k.clone(), v.view())).collect())
+            }
+            async fn canonical_root(&self, _: u64) -> Option<String> {
+                None
+            }
+            async fn push(&self, _: &str, _: serde_json::Value) {}
+        }
+        let racing = ReMark {
+            db: &db,
+            id: verified.identity.clone(),
+            game: verified.game_id.clone(),
+            hop: format!("{}:{}", verified.hop_txid, verified.hopparty.hop_vout),
+        };
+        assert!(
+            !judge_handfile(&racing, &verified, &facts, false, &[false; 4], 2_001)
+                .await
+                .unwrap()
+        );
+        let remaining: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM owed_dirty", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            remaining, 1,
+            "a no-op handfile cannot acknowledge another writer's new hop mark"
+        );
     }
 
     impl Hand {

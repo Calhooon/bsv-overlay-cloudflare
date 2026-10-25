@@ -192,8 +192,8 @@ fn every_fixed_query_prepares_against_the_production_schema() {
     );
     assert_prepares(
         &conn,
-        "OWED_STALE_ON_TIP_SQL",
-        low_app_layer::owed::OWED_STALE_ON_TIP_SQL,
+        "MARK_TIP_SQL",
+        low_app_layer::owed_judge::MARK_TIP_SQL,
     );
     assert_prepares(
         &conn,
