@@ -61,8 +61,10 @@ pub const GAMES_SQL: &str = "SELECT gameId FROM owed_dirty WHERE identity=?1 AND
 pub const CURSOR_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 pub const STAMP_WRITE_SQL: &str =
     "INSERT OR IGNORE INTO view_derivation_state (name) VALUES ('owed-v2')";
-/// Risk 8.2's third repair: the oldest judged rows' subjects, by the judged index, coalesced on the dirty key.
-pub const AGE_MARK_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'age',identity,?2 FROM owed_rows INDEXED BY idx_owed_rows_judged WHERE judgedAtMs<?1 AND gameId<>'' ORDER BY judgedAtMs LIMIT ?3 ON CONFLICT(identity,gameId,source,sourceKey) DO NOTHING";
+/// Risk 8.2's third repair: the oldest judged rows' subjects, by the judged index, coalesced on the dirty key. At most
+/// [`OWED_AGE_REMARKS_PER_PASS`] age marks are ever pending, and the drain judges them after every other mark
+/// (`owed_judge::SUBJECTS_SQL`), so the repair fills the drain's idle room and never delays a source's mark.
+pub const AGE_MARK_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'age',identity,?2 FROM owed_rows r INDEXED BY idx_owed_rows_judged WHERE judgedAtMs<?1 AND gameId<>'' AND NOT EXISTS (SELECT 1 FROM owed_dirty d WHERE d.identity=r.identity AND d.gameId=r.gameId AND d.source='age') ORDER BY judgedAtMs LIMIT max(0,?3-(SELECT COUNT(*) FROM owed_dirty WHERE source='age')) ON CONFLICT(identity,gameId,source,sourceKey) DO NOTHING";
 
 /// Where a pass stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
