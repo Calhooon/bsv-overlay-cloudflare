@@ -146,6 +146,23 @@ fn filing() -> Stmt {
 }
 
 #[tokio::test]
+async fn owed893_scheduled_drain_wanted_first_and_sixty_four_bound() {
+    let db = Db::new();
+    for n in 0..80 {
+        db.seed_game(&format!("g{n:02}"), &format!("p{n}"));
+    }
+    db.exec("UPDATE owed_dirty SET markedAtMs=1; INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES('owner','g79','wanted','owner',9999);");
+    let r = judge::drain_dirty(&db, 64).await.unwrap();
+    assert!(r.faults.is_empty(), "{:?}", r.faults);
+    assert_eq!(r.subjects, 64);
+    assert_eq!(db.count("owed_rows"), 64);
+    let wanted: i64 = db.conn.borrow().query_row("SELECT COUNT(*) FROM owed_rows WHERE gameId='g79'", [], |r| r.get(0)).unwrap();
+    assert_eq!(wanted, 1, "wanted must precede old ordinary work");
+    let left: i64 = db.conn.borrow().query_row("SELECT COUNT(DISTINCT gameId) FROM owed_dirty", [], |r| r.get(0)).unwrap();
+    assert_eq!(left, 16);
+}
+
+#[tokio::test]
 async fn owed893_filing_row_and_dirty_mark_are_atomic_on_fault_and_success() {
     let db = Db::new();
     db.seed_game("game", "pot");
