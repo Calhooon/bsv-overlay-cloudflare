@@ -62,13 +62,26 @@ fn sql_literal(source: &str, prefix: &str) -> String {
     literal(&source[start..], "")
 }
 
+fn discovery_bound(name: &str) -> usize {
+    DISCOVERY
+        .split_once(&format!("const {name}: usize = "))
+        .unwrap()
+        .1
+        .split(';')
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
 fn marks(source: &str, key: &str, identities: &[&str]) -> Vec<Mark> {
     let mut out: Vec<_> = identities
         .iter()
         .map(|id| {
             (
                 (*id).into(),
-                "game".to_string().into(),
+                "game".into(),
                 source.into(),
                 key.into(),
             )
@@ -714,6 +727,44 @@ fn paths(f: &Fixture) -> Result<(), String> {
         vec!["pot".to_string().into()],
         marks("beef", "pot", &["alice", "bob"]),
     )?;
+    let batch_source = &DISCOVERY[DISCOVERY
+        .find("pub(crate) fn pot_beef_mark_proven_batch_sql(")
+        .unwrap()..];
+    let bound = discovery_bound("POT_BEEF_MARK_PROVEN_CHUNK");
+    let batch = sql_literal(batch_source, "UPDATE pot_beefs SET proof_verified")
+        .replace("{placeholders}", &vec!["?"; bound].join(", "));
+    f.check(
+        "beef batch latch at its production chunk bound",
+        &batch,
+        vec!["pot".to_string().into(); bound],
+        marks("beef", "pot", &["alice", "bob"]),
+    )?;
+    let anchored = literal(DISCOVERY, "pub(crate) const POT_BEEF_MARK_PROVEN_AT_SQL:");
+    f.check(
+        "beef anchored latch",
+        &anchored,
+        vec![10.into(), "pot".to_string().into()],
+        marks("beef", "pot", &["alice", "bob"]),
+    )?;
+    let batch_source = &DISCOVERY[DISCOVERY
+        .find("pub(crate) fn pot_beef_mark_proven_at_batch_sql(")
+        .unwrap()..];
+    let arms = literal(batch_source, "let arms = vec![");
+    let bound = discovery_bound("POT_BEEF_MARK_PROVEN_AT_CHUNK");
+    let batch = sql_literal(batch_source, "UPDATE pot_beefs SET proof_verified")
+        .replace("{arms}", &vec![arms; bound].join(" "))
+        .replace("{placeholders}", &vec!["?"; bound].join(", "));
+    let mut bindings = Vec::new();
+    for _ in 0..bound {
+        bindings.extend(["pot".to_string().into(), 10.into()]);
+    }
+    bindings.extend(vec!["pot".to_string().into(); bound]);
+    f.check(
+        "beef anchored batch latch at its production chunk bound",
+        &batch,
+        bindings,
+        marks("beef", "pot", &["alice", "bob"]),
+    )?;
     f.check(
         "beef reorg",
         discovery::unlatch_pot_beef_sql(),
@@ -749,6 +800,22 @@ fn paths(f: &Fixture) -> Result<(), String> {
         "refusal aged out",
         refusal::SUBMIT_REFUSALS_GC_SQL,
         vec![3.into()],
+        marks("refusal", "hop:0", &["alice"]),
+    )?;
+    f.execute(
+        refusal::SUBMIT_REFUSAL_UPSERT_SQL,
+        vec![
+            "hop".to_string().into(),
+            0.into(),
+            "refused".to_string().into(),
+            "rejected".to_string().into(),
+            4.into(),
+        ],
+    );
+    f.check(
+        "refusal retired by admission",
+        refusal::SUBMIT_REFUSALS_RETIRE_SQL,
+        vec!["pot".to_string().into()],
         marks("refusal", "hop:0", &["alice"]),
     )?;
     eviction_paths(f)?;
@@ -882,8 +949,8 @@ fn eviction_paths(f: &Fixture) -> Result<(), String> {
         marks("pot", "hop:0", &["alice"]),
     )?;
     let released = serde_json::to_string(&vec![admit_fast::ReleasedSpend {
-        table: "pot_records".to_string().into(),
-        txid: "hop".to_string().into(),
+        table: "pot_records".into(),
+        txid: "hop".into(),
         vout: 0,
     }])
     .unwrap();
@@ -939,6 +1006,22 @@ fn eviction_paths(f: &Fixture) -> Result<(), String> {
         "readmission stamp",
         &stamp,
         vec![5000.into(), "pot".to_string().into()],
+        marks("eviction", "pot", &["alice", "bob"]),
+    )?;
+    let clear = sql_literal(
+        include_str!("../../overlay-cloudflare/src/admit_fast.rs"),
+        "UPDATE pot_evictions SET readmittedAt = NULL WHERE txid = ?",
+    );
+    f.check(
+        "readmission reversal",
+        &clear,
+        vec!["pot".to_string().into()],
+        marks("eviction", "pot", &["alice", "bob"]),
+    )?;
+    f.check(
+        "readmission stamp restored",
+        &stamp,
+        vec![6000.into(), "pot".to_string().into()],
         marks("eviction", "pot", &["alice", "bob"]),
     )?;
     Ok(())
