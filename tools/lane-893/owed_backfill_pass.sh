@@ -58,7 +58,7 @@ UPDATE owed_rows SET judgedAtMs = NULL, claimable = NULL, gateHeight = NULL, bel
 DELETE FROM owed_row_words;
 DELETE FROM owed_state;
 DELETE FROM owed_dirty;
-INSERT INTO ops_counters(name, value) VALUES ('overlay_migration_count', 396) ON CONFLICT(name) DO UPDATE SET value = excluded.value;
+INSERT INTO ops_counters(name, value) VALUES ('overlay_migration_count', 406) ON CONFLICT(name) DO UPDATE SET value = excluded.value;
 EOF
 python3 scripts/d1-load-chunked.py "$out" low-overlay-db "$state" "$out/seed.sql" 80 > "$out/seed.log" 2>&1
 jobs=()

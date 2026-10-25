@@ -126,10 +126,12 @@ async fn read(db: &impl SqlPort, sql: &str, binds: Vec<Bind>) -> Result<Vec<Valu
     )
 }
 
-/// The overlay's migration count through the #893 block (its dirty triggers and `idx_owed_rows_judged`). The list is
-/// append-only, so a certified count at or past it holds them; pinned against the overlay's list (the app layer does
-/// not link the overlay, so the figure is this crate's).
-pub const OWED_TRIGGERS_MIGRATION_COUNT: u32 = 396;
+/// The overlay's migration count through the #893 block (its dirty triggers, `idx_owed_rows_judged`, and the D2-OWED
+/// fold's indexes and row-count triggers, which this layer's statements name by `INDEXED BY`). The list is append-only,
+/// so a certified count at or past it holds them; pinned against the overlay's list (the app layer does not link the
+/// overlay, so the figure is this crate's). The deploy order is the window's (the D2-OWED lens's LOW-5): the overlay
+/// first, its certified count read on `/health` at or past this figure, then the app layer.
+pub const OWED_TRIGGERS_MIGRATION_COUNT: u32 = 406;
 
 /// The gate: the overlay certified a migration list that holds the triggers (the rows' marks) and the age index.
 pub fn gate_open(count: Option<f64>) -> bool {
