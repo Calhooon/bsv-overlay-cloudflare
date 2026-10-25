@@ -353,6 +353,42 @@
       },
       "note": "The requested one-write ceiling remains RED: D1 reports 5 physical row/index/counter writes for the single application-row insert.",
       "censusKey": null
+    },
+    "owed-belt-tick": {
+      "route": "POST /internal/owed-belt-tick: one belt tick over the READ lane's fleet seed (the lived-in identity, 500 judged rows) with every belt date an hour back; WoC 404, BananaBlocks unspent: 8 finds, each one judge batch (bsv-low #893 section 5). The rows are the judge's commit over a 500-row identity (the 500-row cap DELETE, the per-game DELETE, the owed_state COUNT), about 2,100 a find",
+      "measured": {
+        "reads": 17223,
+        "writes": 162,
+        "stmts": 270,
+        "maxReads": 1001,
+        "calls": 16
+      },
+      "ceiling": {
+        "reads": 25835,
+        "writes": 243,
+        "stmts": 405,
+        "maxReads": 1502,
+        "calls": 24
+      },
+      "censusKey": null
+    },
+    "owed-belt-tick-429": {
+      "route": "POST /internal/owed-belt-tick: every courier answers 429; each rung closed after its first call, 8 candidates re-armed once at now + 300 s, no find",
+      "measured": {
+        "reads": 709,
+        "writes": 27,
+        "stmts": 17,
+        "maxReads": 469,
+        "calls": 3
+      },
+      "ceiling": {
+        "reads": 1064,
+        "writes": 41,
+        "stmts": 26,
+        "maxReads": 704,
+        "calls": 4
+      },
+      "censusKey": null
     }
   },
   "censusKey": "the d1Budget route a production census holds against this ceiling (advisory there: production rows are not the fixture's); null = the route's maximum is another scenario's",
