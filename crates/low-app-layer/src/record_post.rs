@@ -2659,6 +2659,43 @@ pub(crate) async fn note_filing_and_recompute(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn owed893_app_filing_atomic_on_row_fault() {
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        let victim = wallet(0x41);
+        let id = hex::encode(identity(&victim));
+        let game = [0x7a; 32];
+        md_index_the_pot(&db);
+        md_seat(&db, &id, &game);
+        db.conn.execute_batch("DELETE FROM owed_dirty; CREATE TRIGGER fail_owed BEFORE INSERT ON owed_rows BEGIN SELECT RAISE(ABORT,'owed row fault'); END;").unwrap();
+        let script = potrefund_script(&victim, &game, &presigned_refund());
+        let mut filing = verify_record_post(RecordKind::Potrefund, &script, &id).unwrap();
+        let result = file_verified(&db, &mut filing, &id, 2_000).await;
+        assert!(result.is_err(), "a failed judgement must fail its filing: {result:?}");
+        for table in ["potrefund_records", "owed_rows", "owed_dirty"] {
+            let n: i64 = db.conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "atomic rollback: {table}");
+        }
+        db.conn.execute_batch("DROP TRIGGER fail_owed;").unwrap();
+        file_verified(&db, &mut filing, &id, 2_000).await.unwrap();
+        for table in ["potrefund_records", "owed_rows", "owed_row_words"] {
+            let n: i64 = db.conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+            assert!(n > 0, "committed filing and judgement: {table}");
+        }
+        let n: i64 = db.conn.query_row("SELECT COUNT(*) FROM owed_dirty", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "the owned mark is acknowledged in the same batch");
+    }
+
+    #[test]
+    fn owed893_writers_use_the_judge() {
+        let runtime = include_str!("tracker_host/runtime.rs");
+        let held = runtime.split("async fn event_held(").nth(1).unwrap().split("pub async fn ingest(").next().unwrap();
+        assert!(held.contains("judge_word_write"), "the word hook must judge its own marked subjects");
+        let tip = include_str!("internal_events.rs").split("pub async fn tip_changed(").nth(1).unwrap().split("#[cfg(test)]").next().unwrap();
+        assert!(tip.contains("mark_tip"), "the tip must use the indexed gate marks");
+        assert!(!tip.contains("OWED_STALE_ON_TIP"));
+    }
     use bsv_rs::primitives::bsv::sighash::{
         build_sighash_preimage, compute_sighash_for_signing, parse_transaction, SighashParams,
         SIGHASH_ALL, SIGHASH_FORKID,
