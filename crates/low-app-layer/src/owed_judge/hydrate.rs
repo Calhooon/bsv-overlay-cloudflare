@@ -114,6 +114,12 @@ pub(crate) async fn hydrate_filings(
             representatives.push(pending);
         }
         parties = crate::owed_cursor::select(representatives, db.era_ms(), usize::MAX);
+        for p in &parties {
+            if text(p, "identity") == identity && flag(p, "sigValid") == Some(true) {
+                i.verified_pots
+                    .insert(owed::outpoint_key(&text(p, "potTxid"), num(p, "potVout") as u32));
+            }
+        }
         // Keep a representative outside the requested games as bounded pot
         // context for JOIN retirement; judge_with_write emits only its subjects.
     }

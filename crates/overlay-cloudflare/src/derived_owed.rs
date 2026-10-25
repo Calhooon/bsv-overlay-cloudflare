@@ -52,6 +52,9 @@ pub const SWEEP_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_sweep ON
 /// The D2-OWED lens's HIGH-1 and MEDIUM-2: a row judged with no chain tip (TIP-877's tipless judgement) is re-marked
 /// on the next tip; an old worker's keyless row is in it too.
 pub const UNTIPPED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_untipped ON owed_rows(identity,gameId) WHERE probeTip IS NULL";
+/// The D2-OWED lens's HIGH-3: the belt's due rows read in due order with their identity, covering, so the tick takes
+/// its eight round-robin by identity without a table read per due row.
+pub const BELT_TURN_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_belt_turn ON owed_rows(beltDueAtMs,identity,outpoint) WHERE beltDueAtMs IS NOT NULL";
 /// Old workers delete an identity's rows whole; their word joins must disappear in that statement too.
 pub const ROW_DELETE: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_delete_words AFTER DELETE ON owed_rows BEGIN DELETE FROM owed_row_words WHERE identity=OLD.identity AND outpoint=OLD.outpoint; END";
 
