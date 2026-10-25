@@ -614,9 +614,9 @@ pub async fn beef(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respons
     }
 }
 
-/// The same fresh, verified height `/tip` serves. Embedded view tips must
+/// The same verified header height `/tip` serves. Embedded view tips must
 /// agree: `/pots-view` primes the client's tip cache. A fault is `tip: null`
-/// on those views so their other facts still serve.
+/// on those views so their other facts still serve. Freshness is /tip-only.
 async fn chaintracks_present_height(
     ctx: &RouteContext<AuthState>,
     tag: &str,
@@ -630,15 +630,29 @@ pub(crate) async fn chaintracks_present_height_env(
     env: &worker::Env,
     _tag: &str,
 ) -> std::result::Result<u64, (&'static str, u16)> {
-    let reply = tip_reply_env(env).await;
-    match (reply.status, reply.body["height"].as_u64()) {
-        (200, Some(height)) => Ok(height),
-        // Callers own the fault's context; do not log the same 503 at both layers.
-        _ => Err(("verified header tip unavailable", 503)),
-    }
+    chaintracks_present_height_with(|route| async move {
+        crate::tracker_host::chaintracks_get(env, &route).await
+    })
+    .await
 }
 
-/// `GET /tip`: the proof tracker's verified header tip and its sync age.
+async fn chaintracks_present_height_with<G, F>(
+    get: G,
+) -> std::result::Result<u64, (&'static str, u16)>
+where
+    G: Fn(String) -> F,
+    F: std::future::Future<
+        Output = std::result::Result<(u16, serde_json::Value), bsv_tracker::HeaderError>,
+    >,
+{
+    crate::tracker_host::verified_tip_with(get)
+        .await
+        .map(|tip| u64::from(tip.height))
+        // Callers own the fault's context.
+        .map_err(|_| ("verified header tip unavailable", 503))
+}
+
+/// `GET /tip`: the proof tracker's verified header tip and its pass age.
 /// An unavailable or over-age snapshot is a named 503, with diagnostics only.
 pub async fn tip(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let reply = tip_reply_env(&ctx.env).await;
@@ -677,23 +691,33 @@ where
     L: FnOnce() -> Option<crate::tracker_host::VerifiedTip>,
     N: FnOnce() -> u64,
 {
-    let current = crate::tracker_host::verified_tip_with(get).await.ok();
+    let current = crate::tracker_host::tip_snapshot_with(get).await.ok();
     let last_known = last_known();
     let now = now_ms();
-    let fresh = current.as_ref().is_some_and(|tip| {
-        now.saturating_sub(tip.synced_at) <= TIP_MAX_AGE_MS
-            && tip.last_seen_height <= tip.height.saturating_add(TIP_REORG_MARGIN)
+    let available = current.as_ref().is_some_and(|tip| {
+        tip.last_pass_at
+            .is_none_or(|at| now.saturating_sub(at) <= TIP_MAX_AGE_MS)
+            && tip
+                .last_seen_height
+                .is_none_or(|height| height <= tip.height.saturating_add(TIP_REORG_MARGIN))
     });
     let mut body = tip_body(current.as_ref().or(last_known.as_ref()), now);
-    if !fresh {
+    body["freshness"] = serde_json::json!(if !available {
+        "stale"
+    } else if current.as_ref().and_then(|tip| tip.last_pass_at).is_some() {
+        "fresh"
+    } else {
+        "unknown"
+    });
+    if !available {
         body["code"] = serde_json::json!("ERR_TIP_UNAVAILABLE");
         body["error"] = serde_json::json!("verified header tip unavailable");
         body["stale"] = serde_json::json!(true);
     }
     TipReply {
-        status: if fresh { 200 } else { 503 },
+        status: if available { 200 } else { 503 },
         body,
-        retry_after: (!fresh).then_some(TIP_RETRY_AFTER_SECS),
+        retry_after: (!available).then_some(TIP_RETRY_AFTER_SECS),
     }
 }
 

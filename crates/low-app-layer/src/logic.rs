@@ -1264,13 +1264,14 @@ pub fn beef_body(txid: &str, beef: &[u8]) -> String {
 }
 
 /// The verified header snapshot on `/tip`; absent facts stay null on a 503.
-/// The age uses chaintracks' last successful sync, never the block or fetch time.
+/// The age uses the last successful cron pass, never the block, sync or fetch time.
 pub fn tip_body(tip: Option<&crate::tracker_host::VerifiedTip>, now_ms: u64) -> serde_json::Value {
     json!({
         "height": tip.map(|t| t.height),
         "hash": tip.map(|t| t.hash.as_str()),
         "at": tip.map(|t| t.at),
-        "ageMs": tip.map(|t| now_ms.saturating_sub(t.synced_at)),
+        "lastPassAt": tip.and_then(|t| t.last_pass_at),
+        "ageMs": tip.and_then(|t| t.last_pass_at.map(|at| now_ms.saturating_sub(at))),
         "source": "verified-header",
     })
 }
@@ -3934,9 +3935,10 @@ mod tests {
         let tip = crate::tracker_host::VerifiedTip {
             height: 812_345,
             hash: "01".repeat(32),
+            merkle_root: "02".repeat(32),
             at: 123_000,
-            synced_at: 123_500,
-            last_seen_height: 812_345,
+            last_pass_at: Some(123_500),
+            last_seen_height: Some(812_345),
         };
         let v = tip_body(Some(&tip), 124_001);
         assert_eq!(v["height"], 812_345);

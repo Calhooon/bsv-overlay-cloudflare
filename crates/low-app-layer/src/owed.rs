@@ -3726,6 +3726,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                         reason: None,
                     });
                 } else if i.tip.is_none() {
+                    // TIP-877-FOLD-2 / NEW-LOW-2: deliberately withhold both
+                    // rejoin and previously due refunds until a current tip
+                    // is readable. An earlier tip is not a gate floor here.
                     let mut facts = base_facts.clone();
                     facts["claim"] = Value::Null;
                     facts["claimable"] = json!(false);
@@ -9700,6 +9703,64 @@ pub(crate) mod tests {
             first_party_marker_at: None,
             first_spent_at: None,
             seat_anchor: None,
+        }
+    }
+
+    #[test]
+    fn tip877_fold2_tipless_rejoin_and_refund_due_are_withheld_then_rearmed() {
+        let entries = [entry(
+            Some(false),
+            None,
+            Outcome::Unresolved,
+            Some(SeatLetter::A),
+        )];
+        let (collected, pots) = (HashSet::new(), HashSet::new());
+        let valid = HashMap::from([(
+            outpoint_key(&tx(2), 0),
+            ValidRefund {
+                raw_hex: "00".into(),
+                my_sats: Some(19_800),
+            },
+        )]);
+        for (tip, status, family, claim) in [
+            (
+                899_999,
+                RefundStatus::Armed,
+                OwedFamily::InProgress,
+                "rejoin",
+            ),
+            (
+                900_005,
+                RefundStatus::GateOpen,
+                OwedFamily::RefundDue,
+                "present-refund",
+            ),
+        ] {
+            let refunds = [refund_entry(status)];
+            let derive = |tip| {
+                derive_owed_rows(&inputs(
+                    &entries,
+                    &refunds,
+                    &[],
+                    &valid,
+                    &collected,
+                    &pots,
+                    tip,
+                ))
+            };
+            let before = derive(Some(tip));
+            assert_eq!(before[0].family, family);
+            assert_eq!(before[0].facts["claim"], claim);
+            assert_eq!(before[0].facts["claimable"], true);
+
+            let unknown = derive(None);
+            assert_eq!(unknown[0].family, OwedFamily::Unbound);
+            assert_eq!(unknown[0].facts["tipUnknown"], true);
+            assert_eq!(unknown[0].facts["claimable"], false);
+            assert!(unknown[0].facts["claim"].is_null());
+            assert!(unknown[0].facts["blocksToGate"].is_null());
+            assert!(should_recompute(false, 100, None, Some(tip), &unknown));
+            assert_eq!(derive(Some(tip)), before);
         }
     }
 
