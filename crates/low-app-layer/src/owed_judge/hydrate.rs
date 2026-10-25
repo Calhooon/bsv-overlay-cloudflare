@@ -54,7 +54,9 @@ fn json_bind<T: serde::Serialize>(v: &T) -> Bind {
     Bind::Text(serde_json::to_string(v).expect("serializable query keys"))
 }
 
-/// Hydrate exactly these games. No cursor, history walk, or courier request is used.
+/// Hydrate the selected games and the canonical representatives of their pots.
+/// An outside representative is JOIN-retirement context, never an emitted row.
+/// No cursor, identity-history walk, or courier request is used.
 pub async fn hydrate_inputs(
     db: &impl JudgeDb,
     identity: &str,
