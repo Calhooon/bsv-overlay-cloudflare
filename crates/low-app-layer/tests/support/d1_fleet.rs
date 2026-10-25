@@ -119,3 +119,24 @@ pub fn execute_row(db: &rusqlite::Connection, sql: &str) {
         .execute(rusqlite::params_from_iter(binds))
         .unwrap_or_else(|e| panic!("{e}: {sql}"));
 }
+
+/// The owed judge's lived-in seat: 250 result pots and 270 hops, one of each per game.
+/// Kept separate from the shared route seed's whale so its existing cardinalities stay pinned.
+#[allow(dead_code)]
+pub const OWED_SEAT: &str = "02eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+#[allow(dead_code)]
+pub fn owed_rows(now: u64) -> Vec<String> {
+    let mut rows = Vec::new();
+    for n in 0..270 {
+        let game = format!("a1{n:062x}");
+        let pot = format!("a2{n:062x}");
+        let hop = format!("a3{n:062x}");
+        if n < 250 {
+            rows.push(format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind,paramsDecoded,recoveryHeight) VALUES ('{pot}',0,0,{now},'covenant',1,900100)"));
+            rows.push(format!("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,sigValid) VALUES ('{OWED_SEAT}','{OWED_SEAT}','{game}','{pot}',0,900100,'00','{pot}',1,{now},1)"));
+        }
+        rows.push(format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{hop}',0,0,{now},'p2pkh')"));
+        rows.push(format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('{OWED_SEAT}','{OWED_SEAT}','{game}',0,20190,'{OWED_SEAT}','00','00',2,'{hop}',1,{now},1)"));
+    }
+    rows
+}

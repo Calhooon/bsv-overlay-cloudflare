@@ -216,7 +216,7 @@ fn owed(pages: &[Vec<HopsViewRow>], views: &BTreeMap<String, Value>, l2: bool) -
         HashMap::new(),
         HashMap::new(),
     );
-    derive_owed_rows(&OwedInputs {
+    let inputs = OwedInputs {
         spender_words: Some(views),
         identity_lc: d1_fleet::WHALE,
         tip: Some(958_900),
@@ -244,7 +244,9 @@ fn owed(pages: &[Vec<HopsViewRow>], views: &BTreeMap<String, Value>, l2: bool) -
         proof_mined_spenders: &none,
         funding_unheld: &none,
         join_spent_hops: &Default::default(),
-    })
+    };
+    low_app_layer::owed_judge::assert_decomposition(&inputs);
+    derive_owed_rows(&inputs)
 }
 
 #[test]

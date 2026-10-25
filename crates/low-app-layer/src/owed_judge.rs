@@ -117,7 +117,7 @@ pub const REQUIRED_GAME_INDEXES: [&str;2] = [
     "CREATE INDEX IF NOT EXISTS idx_evicted_party_identity_game ON potparty_records_evicted(identity,gameId,potTxid)",
 ];
 pub const MARK_WANTED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,'','wanted',?1,?2) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
-pub const MARKS_SQL: &str = "SELECT generation,source,sourceKey FROM owed_dirty INDEXED BY idx_owed_dirty_identity WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))";
+pub const MARKS_SQL: &str = "SELECT generation,source,sourceKey FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))";
 pub const SUBJECTS_SQL: &str = "SELECT identity,gameId FROM owed_dirty GROUP BY identity,gameId ORDER BY MAX(source='wanted') DESC,MIN(markedAtMs),MIN(generation) LIMIT ?1";
 pub const ROWS_READ_SQL: &str = "SELECT r.identity,r.outpoint,r.family,r.gameId,r.sats,r.opponentIdentity,r.atHeight,r.facts,r.reason,r.judgedAtMs,r.claimable,r.probeTip,w.role,t.txid,t.word,t.tier,t.height,t.proof_root,t.header_hash,t.hint_source,t.hint_at,t.updated_at FROM owed_rows r LEFT JOIN owed_row_words w ON w.identity=r.identity AND w.outpoint=r.outpoint LEFT JOIN tx_words t ON t.txid=w.txid WHERE r.identity=?1 ORDER BY r.outpoint,w.role LIMIT 2004";
 
