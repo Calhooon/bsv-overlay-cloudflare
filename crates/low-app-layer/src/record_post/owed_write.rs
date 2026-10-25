@@ -182,15 +182,17 @@ fn apply(i: &mut JudgeInputs, filing: &VerifiedRecord) {
                         crate::results::SeatLetter::A => &keys.pay_pkh_a,
                         crate::results::SeatLetter::B => &keys.pay_pkh_b,
                     });
-                // The read keeps the first valid backup in its existing order.
-                i.valid_refunds
-                    .entry(key)
-                    .or_insert_with(|| crate::owed::ValidRefund {
+                // The filed backup is the NEWEST valid one, which every later judge reads first (`valid_refunds_sql`,
+                // `createdAt DESC`; the D2-OWED lens's LOW-4): it replaces the hydrated one, never yields to it.
+                i.valid_refunds.insert(
+                    key,
+                    crate::owed::ValidRefund {
                         raw_hex: r.refund_raw_hex.clone(),
                         my_sats: home.and_then(|pkh| {
                             crate::owed::refund_output_sats(&r.refund_raw_hex, pkh)
                         }),
-                    });
+                    },
+                );
             }
         }
         VerifiedRecord::Collected(r) | VerifiedRecord::Held(r, _) if i.identity == r.identity => {
@@ -336,4 +338,37 @@ pub(crate) fn statements(v: &VerifiedRecord, now: i64) -> Vec<Stmt> {
         )),
     }
     writes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The D2-OWED lens's LOW-4: the filed valid backup REPLACES the hydrated one in the filing's judgement, as every
+    /// later judge reads the newest (`valid_refunds_sql`, `createdAt DESC`), so the press bytes never flip.
+    #[test]
+    fn d2fold_low4_the_filed_backup_replaces_the_hydrated_one() {
+        let filing = overlay_discovery::potrefund::storage::PotrefundRecord {
+            identity: "owner".into(),
+            game_id: "game".into(),
+            pot_txid: "aa".repeat(32),
+            pot_vout: 0,
+            refund_raw_hex: "newer".into(),
+            sig_hex: "00".into(),
+            txid: "filed".into(),
+            output_index: 0,
+            created_at: 2,
+        };
+        let key = crate::owed::outpoint_key(&filing.pot_txid, 0);
+        let mut i = JudgeInputs::default();
+        i.valid_refunds.insert(
+            key.clone(),
+            crate::owed::ValidRefund {
+                raw_hex: "older".into(),
+                my_sats: None,
+            },
+        );
+        apply(&mut i, &VerifiedRecord::Potrefund(filing, true));
+        assert_eq!(i.valid_refunds[&key].raw_hex, "newer");
+    }
 }
