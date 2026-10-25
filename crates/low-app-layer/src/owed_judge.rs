@@ -116,6 +116,11 @@ pub use hydrate::{
 };
 
 pub const OWED_JUDGE_SUBJECTS_PER_INVOCATION: usize = 16;
+/// A filing whose judge could not run and landed alone (the D2-OWED lens's MEDIUM-2).
+pub const COUNTER_FILING_FAULTS: &str = "owed_judge_filing_faults_total";
+pub fn counter_names() -> Vec<String> {
+    vec![COUNTER_FILING_FAULTS.to_owned()]
+}
 pub const OWED_DIRTY_SUBJECTS_PER_PASS: usize = 64;
 /// A wanted envelope expands to the identity's newest games only (the design's section 4.1 bound, the D2-OWED lens's
 /// MEDIUM-1); the rest are marked `backfill` and wait their identity's turn like any other mark.
@@ -296,6 +301,8 @@ pub struct JudgeReport {
     pub truncated: bool,
     /// Changes from the source statements at the front of the committed batch.
     pub source_changes: Vec<Option<u64>>,
+    /// The judge could not run: the source statements landed alone (`record_post::owed_write::judge_filings`).
+    pub judge_fault: Option<String>,
 }
 #[derive(Debug, Default)]
 pub struct DrainReport {
@@ -351,15 +358,18 @@ pub async fn judge_with_write(
     if subjects.is_empty() && !writes.is_empty() {
         return Err("a source write requires an owed subject".into());
     }
-    let subjects: BTreeSet<_> = subjects
-        .iter()
-        .map(|s| {
-            (
-                s.identity.to_ascii_lowercase(),
-                s.game_id.to_ascii_lowercase(),
-            )
-        })
-        .collect();
+    // The caller's order decides who is judged inside the bound (a refund's filer first, the D2-OWED lens's MEDIUM-2).
+    let mut ordered: Vec<(String, String)> = Vec::new();
+    for s in subjects {
+        let key = (
+            s.identity.to_ascii_lowercase(),
+            s.game_id.to_ascii_lowercase(),
+        );
+        if !ordered.contains(&key) {
+            ordered.push(key);
+        }
+    }
+    let subjects = ordered;
     let deferred = subjects
         .len()
         .saturating_sub(OWED_JUDGE_SUBJECTS_PER_INVOCATION);
@@ -450,12 +460,18 @@ pub async fn judge_with_write(
     }
     let landed = db.run_batch(plan).await?;
     report.source_changes = landed.iter().take(source_count).map(|r| r.changes).collect();
+    // The batch committed: nothing below may fail the call (a filing would land its source statements twice).
     for (pos, id, stamp) in state_positions {
-        let state = landed
+        let Some(count) = landed
             .get(pos)
             .and_then(|s| s.rows.first())
-            .ok_or("judge state readback missing")?;
-        let count = state["rows"].as_u64().ok_or("judge state count missing")? as usize;
+            .and_then(|s| s["rows"].as_u64())
+        else {
+            db.log(&format!("[owed] judge state readback missing for {id}"));
+            continue;
+        };
+        let count = count as usize;
+        let state = &landed[pos].rows[0];
         report.rows += count;
         report.truncated |= state["truncated"].as_i64().unwrap_or(0) != 0;
         db.push(
@@ -608,7 +624,13 @@ fn row_statements(
     out
 }
 
-/// Both pot seats, including the filing's subject before its new party row exists.
+/// The pot's VERIFIED seats (a party row whose `sigValid = 1`, a hop marker whose `markerValid = 1`): anyone's
+/// byte-format row is no subject of another identity's filing (the D2-OWED lens's MEDIUM-2; its trigger mark still
+/// stands for the drain).
+pub const REFUND_SUBJECTS_SQL: &str = "SELECT identity,gameId FROM potparty_records INDEXED BY idx_potparty_pot WHERE potTxid=?1 AND potVout=?2 AND sigValid=1 UNION SELECT hp.identity,hp.gameId FROM hop_pot_links l INDEXED BY idx_hop_pot_links_pot JOIN hopparty_records hp ON hp.rowid=l.markerRowid WHERE l.potTxid=?1 AND l.potVout=?2 AND hp.markerValid=1";
+
+/// The filer FIRST (its own subject is judged inside the bound whatever else names the pot), then the pot's verified
+/// seats, including the filing's subject before its new party row exists.
 pub async fn refund_subjects(
     db: &impl SqlPort,
     pot: &str,
@@ -616,8 +638,14 @@ pub async fn refund_subjects(
     filer: &str,
     game: &str,
 ) -> Result<Vec<Subject>, String> {
-    let rows:Vec<Value>=hydrate::read(db,"SELECT identity,gameId FROM potparty_records INDEXED BY idx_potparty_pot WHERE potTxid=?1 AND potVout=?2 UNION SELECT hp.identity,hp.gameId FROM hop_pot_links l INDEXED BY idx_hop_pot_links_pot JOIN hopparty_records hp ON hp.rowid=l.markerRowid WHERE l.potTxid=?1 AND l.potVout=?2",vec![Bind::Text(pot.to_ascii_lowercase()),Bind::Int(i64::from(vout))]).await?;
-    let mut subjects: BTreeSet<_> = rows
+    let rows: Vec<Value> = hydrate::read(
+        db,
+        REFUND_SUBJECTS_SQL,
+        vec![Bind::Text(pot.to_ascii_lowercase()), Bind::Int(i64::from(vout))],
+    )
+    .await?;
+    let filer = (filer.to_ascii_lowercase(), game.to_ascii_lowercase());
+    let seats: BTreeSet<_> = rows
         .iter()
         .filter_map(|r| {
             Some((
@@ -625,10 +653,10 @@ pub async fn refund_subjects(
                 r["gameId"].as_str()?.to_ascii_lowercase(),
             ))
         })
+        .filter(|s| *s != filer)
         .collect();
-    subjects.insert((filer.to_ascii_lowercase(), game.to_ascii_lowercase()));
-    Ok(subjects
-        .into_iter()
+    Ok(std::iter::once(filer)
+        .chain(seats)
         .map(|(identity, game_id)| Subject { identity, game_id })
         .collect())
 }

@@ -1209,32 +1209,33 @@ pub(crate) mod tests {
             )
             .unwrap();
         db.conn.execute_batch("DELETE FROM owed_dirty; CREATE TRIGGER fail_owed BEFORE INSERT ON owed_rows BEGIN SELECT RAISE(ABORT,'owed row fault'); END;").unwrap();
+        // the D2-OWED lens's MEDIUM-2: a judge fault lands the batch's sources ALONE (one transaction still), its
+        // marks left for the drain, counted; the filing is never refused for the judge's sake
         assert!(
             judge_handfile(&db, &verified, &facts, false, &[true; 4], 2_000)
                 .await
-                .is_err()
+                .unwrap(),
+            "the sources landed"
         );
+        let count = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
         for table in [
             "handfile_batches",
             "handfile_rows",
             "potparty_records",
             "potrefund_records",
             "hopparty_records",
-            "owed_rows",
-            "owed_dirty",
         ] {
-            let n: i64 = db
-                .conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(n, 0, "rollback {table}");
+            assert!(count(table) > 0, "the batch's sources landed: {table}");
         }
+        assert_eq!(count("owed_rows"), 0);
+        assert!(count("owed_dirty") > 0, "the marks stand for the drain");
+        assert_eq!(db.counter(crate::owed_judge::COUNTER_FILING_FAULTS), 1);
         db.conn.execute_batch("DROP TRIGGER fail_owed").unwrap();
-        assert!(
-            judge_handfile(&db, &verified, &facts, false, &[true; 4], 2_000)
-                .await
-                .unwrap()
-        );
+        crate::owed_judge::drain_dirty(&db, 64).await.unwrap();
         let rows: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM owed_rows", [], |r| r.get(0))

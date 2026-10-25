@@ -2504,6 +2504,8 @@ pub(crate) mod tests {
         .unwrap();
     }
 
+    /// The D2-OWED lens's MEDIUM-2 (this pin inverted): a judge that cannot run never refuses the filing. The filing
+    /// lands ALONE with its trigger marks for the drain, the fault is counted, and the drain judges both seats later.
     #[tokio::test]
     async fn owed893_app_filing_atomic_on_row_fault() {
         let db = crate::pot_hook::tests::SqliteSql::migrated();
@@ -2518,45 +2520,92 @@ pub(crate) mod tests {
         let mut filing = verify_record_post(RecordKind::Potrefund, &script, &id).unwrap();
         let result = file_verified(&db, &mut filing, &id, 2_000).await;
         assert!(
-            result.is_err(),
-            "a failed judgement must fail its filing: {result:?}"
+            matches!(result, Ok(DoorOutcome::Written { row_written: true })),
+            "a judge fault lands the filing alone: {result:?}"
         );
-        for table in [
-            "potrefund_records",
-            "owed_rows",
-            "owed_dirty",
-            "observed_marks",
-        ] {
-            let n: i64 = db
-                .conn
+        let count = |table: &str| -> i64 {
+            db.conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(n, 0, "atomic rollback: {table}");
-        }
+                .unwrap()
+        };
+        assert_eq!(count("potrefund_records"), 1, "the filing landed");
+        assert_eq!(count("owed_rows"), 0, "nothing judged");
+        assert_eq!(count("observed_marks"), 2, "both seats marked in the source transaction");
+        assert_eq!(count("owed_dirty"), 2, "the marks stand for the drain");
+        assert_eq!(db.counter(crate::owed_judge::COUNTER_FILING_FAULTS), 1);
         db.conn.execute_batch("DROP TRIGGER fail_owed;").unwrap();
-        file_verified(&db, &mut filing, &id, 2_000).await.unwrap();
-        for table in ["potrefund_records", "owed_rows", "owed_row_words"] {
-            let n: i64 = db
-                .conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-                .unwrap();
-            assert!(n > 0, "committed filing and judgement: {table}");
+        crate::owed_judge::drain_dirty(&db, 64).await.unwrap();
+        assert_eq!(count("owed_rows"), 2, "the drain judged both seats");
+        assert!(count("owed_row_words") > 0);
+        assert_eq!(count("owed_dirty"), 0);
+    }
+
+    /// The D2-OWED lens's MEDIUM-2: no chain tip is no refusal of a filing (TIP-877's rule, as main judges): the filing
+    /// is written and judged with its tip-dependent claims withheld, `probeTip` NULL for the next tip to re-mark.
+    #[tokio::test]
+    async fn d2fold_medium2_a_tipless_filing_is_written_and_judged() {
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        let victim = wallet(0x41);
+        let id = hex::encode(identity(&victim));
+        let game = [0x7a; 32];
+        md_index_the_pot(&db);
+        md_seat(&db, &id, &game);
+        db.conn.execute_batch("DELETE FROM owed_dirty;").unwrap();
+        // an earlier judgement at a tip, then chaintracks goes dark
+        crate::owed_judge::judge_subjects(&db, &id, &[hex::encode(game)], "test")
+            .await
+            .unwrap();
+        db.tip.set(None);
+        let script = potrefund_script(&victim, &game, &presigned_refund());
+        let mut filing = verify_record_post(RecordKind::Potrefund, &script, &id).unwrap();
+        let result = file_verified(&db, &mut filing, &id, 2_000).await;
+        assert!(
+            matches!(result, Ok(DoorOutcome::Written { row_written: true })),
+            "{result:?}"
+        );
+        assert_eq!(db.counter(crate::owed_judge::COUNTER_FILING_FAULTS), 0, "judged, not faulted");
+        let (claimable, probe): (Option<i64>, Option<i64>) = db
+            .conn
+            .query_row(
+                "SELECT claimable,probeTip FROM owed_rows WHERE identity=?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(probe, None, "judged with no tip");
+        assert_ne!(claimable, Some(1), "no tip-dependent press");
+    }
+
+    /// The D2-OWED lens's MEDIUM-2: a refund filing's subjects are the filer FIRST, then the pot's verified seats.
+    /// Byte-format party rows naming the pot (anyone's, sorting before the filer) are no subject: they can neither
+    /// push the filer's judgement past the bound nor fault the victim's filing with their hydration.
+    #[tokio::test]
+    async fn d2fold_medium2_b_refund_subjects_are_the_filer_then_verified_seats() {
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        let victim = wallet(0x41);
+        let id = hex::encode(identity(&victim));
+        let game = [0x7a; 32];
+        md_index_the_pot(&db);
+        md_seat(&db, &id, &game);
+        for n in 0..20 {
+            db.conn.execute("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,sigValid) VALUES (?1,'00',?2,?3,0,900000,'00',?4,0,1,0)", rusqlite::params![format!("00{n:064x}"), hex::encode([n as u8; 32]), hex::encode(POT_TXID), format!("planted:{n}")]).unwrap();
         }
+        let subjects =
+            crate::owed_judge::refund_subjects(&db, &hex::encode(POT_TXID), 0, &id, &hex::encode(game))
+                .await
+                .unwrap();
+        assert_eq!(subjects[0].identity, id, "the filer first");
+        assert_eq!(subjects.len(), 1, "no planted subject: {subjects:?}");
+        db.conn.execute_batch("DELETE FROM owed_dirty; CREATE TRIGGER fail_planted BEFORE INSERT ON owed_rows WHEN NEW.identity LIKE '00%' BEGIN SELECT RAISE(ABORT,'planted'); END;").unwrap();
+        let script = potrefund_script(&victim, &game, &presigned_refund());
+        let mut filing = verify_record_post(RecordKind::Potrefund, &script, &id).unwrap();
+        file_verified(&db, &mut filing, &id, 2_000).await.unwrap();
+        assert_eq!(db.counter(crate::owed_judge::COUNTER_FILING_FAULTS), 0);
         let n: i64 = db
             .conn
-            .query_row("SELECT COUNT(*) FROM observed_marks", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM owed_rows WHERE identity=?1", [&id], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 2, "both seats were marked in the source transaction");
-        let n: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM owed_rows", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 2, "both seats were judged in the filing batch");
-        let n: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM owed_dirty", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 0, "the owned mark is acknowledged in the same batch");
+        assert_eq!(n, 1, "the filer's own subject judged in its filing batch");
     }
 
     #[test]
