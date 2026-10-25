@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 
 /// The extra proof columns keep the existing served-word header recheck intact.
-pub const ROWS_SQL: &str = "SELECT r.identity,r.outpoint,r.family,r.gameId,r.sats,r.opponentIdentity,r.atHeight,r.facts,r.reason,r.judgedAtMs,r.claimable,r.probeTip,r.gateHeight,w.role,w.txid AS wordTxid,t.word,t.tier,t.height,t.proof_root,t.proof_height,t.proof_hex,t.header_hash,t.hint_source,t.hint_at,t.updated_at,CASE WHEN json_valid(t.legacy_body) THEN json_type(t.legacy_body,'$.trackerTerminal')='true' END AS trackerTerminal,CASE WHEN json_valid(t.legacy_body) THEN json_extract(t.legacy_body,'$.trackerTerminalWord') END AS trackerTerminalWord FROM owed_rows r LEFT JOIN owed_row_words w ON w.identity=r.identity AND w.outpoint=r.outpoint LEFT JOIN tx_words t ON t.txid=w.txid WHERE r.identity=?1 ORDER BY CASE r.family WHEN 'payout' THEN 0 WHEN 'refund-due' THEN 1 WHEN 'hop-stranded' THEN 2 WHEN 'in-progress' THEN 3 ELSE 4 END,COALESCE(r.atHeight,0) DESC,r.outpoint,w.role LIMIT 2004";
+pub const ROWS_SQL: &str = "SELECT r.identity,r.outpoint,r.family,r.gameId,r.sats,r.opponentIdentity,r.atHeight,r.facts,r.reason,r.judgedAtMs,r.claimable,r.probeTip,r.gateHeight,r.beltDueAtMs,w.role,w.txid AS wordTxid,t.word,t.tier,t.height,t.proof_root,t.proof_height,t.proof_hex,t.header_hash,t.hint_source,t.hint_at,t.updated_at,CASE WHEN json_valid(t.legacy_body) THEN json_type(t.legacy_body,'$.trackerTerminal')='true' END AS trackerTerminal,CASE WHEN json_valid(t.legacy_body) THEN json_extract(t.legacy_body,'$.trackerTerminalWord') END AS trackerTerminalWord FROM owed_rows r LEFT JOIN owed_row_words w ON w.identity=r.identity AND w.outpoint=r.outpoint LEFT JOIN tx_words t ON t.txid=w.txid WHERE r.identity=?1 ORDER BY CASE r.family WHEN 'payout' THEN 0 WHEN 'refund-due' THEN 1 WHEN 'hop-stranded' THEN 2 WHEN 'in-progress' THEN 3 ELSE 4 END,COALESCE(r.atHeight,0) DESC,r.outpoint,w.role LIMIT 2004";
 pub const STATE_SQL: &str =
     "SELECT computedAtMs,rows,truncated,recomputeSeq,tip FROM owed_state WHERE identity=?1";
 pub const PENDING_SQL: &str = "SELECT COUNT(*) AS pending FROM owed_dirty WHERE identity=?1";
@@ -158,8 +158,9 @@ impl Snapshot {
                 ] {
                     object.remove(key);
                 }
-                // Lane 5 will supply this field from the belt's schedule.
-                object.insert("beltNextAtMs".into(), Value::Null);
+                // bsv-low #893 section 5: the belt's next look at this row, as the judge or the belt dated it (null:
+                // the index or a checked word decides the row, nothing is owed the chain).
+                object.insert("beltNextAtMs".into(), json!(number(&joined["beltDueAtMs"])));
                 if let (Some(probe), Some(served)) = (number(&joined["probeTip"]), tip) {
                     if served > probe {
                         object.insert("tipMoved".into(), json!(true));

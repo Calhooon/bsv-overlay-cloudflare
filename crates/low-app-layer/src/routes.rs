@@ -3255,6 +3255,7 @@ pub(crate) async fn internal_hop_changed(
 
 /// HIGH-4: mark the identities a change concerns STALE (their next read recomputes) and tell their pages. The
 /// filing route has no background context, so it never recomputes inline (MEDIUM-11): one cheap UPDATE + a push.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) async fn owed_mark_stale(
     db: &worker::D1Database,
     sql: &str,
@@ -3285,8 +3286,10 @@ pub(crate) async fn owed_mark_stale(
 
 /// The walk bound per view per recompute (100 rows a page): 2,000 pots or hops per identity before the derivation
 /// stops reading — far past any identity on the fleet; a stop is counted as a truncated list, never a silent cut.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 const OWED_WALK_MAX_PAGES: usize = 20;
 
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) struct OwedComputed {
     pub rows: Vec<crate::owed::OwedRow>,
     pub tip: Option<u64>,
@@ -3304,6 +3307,7 @@ pub(crate) struct OwedComputed {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 struct OwedRowD1 {
     identity: String,
     outpoint: String,
@@ -3322,6 +3326,7 @@ struct OwedRowD1 {
 }
 
 impl OwedRowD1 {
+    #[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
     fn into_row(self) -> Option<crate::owed::OwedRow> {
         Some(crate::owed::OwedRow {
             identity: self.identity,
@@ -3338,6 +3343,7 @@ impl OwedRowD1 {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 struct OwedStateD1 {
     #[serde(rename = "computedAtMs")]
     computed_at_ms: f64,
@@ -3349,6 +3355,7 @@ struct OwedStateD1 {
     recompute_seq: Option<f64>,
 }
 
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_party_cursor(
     db: &worker::D1Database,
     identity: &str,
@@ -3419,6 +3426,7 @@ async fn owed_party_cursor(
     Ok(candidates)
 }
 
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) async fn owed_recompute(
     env: &worker::Env,
     db: &worker::D1Database,
@@ -3450,6 +3458,7 @@ pub(crate) async fn owed_recompute(
     result
 }
 
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_recompute_inner(
     env: &worker::Env,
     db: &worker::D1Database,
@@ -5811,6 +5820,7 @@ async fn owed_recompute_at_tip(
 /// `OWED_HOME_WINDOW` candidates, and one batch of upserts (the fresh memos, the latches, the cursor). The one
 /// read is two STATEMENTS at exactly `OWED_HOME_WINDOW` candidates (the merged lens's N4: `1 + 2 * 45` keys is
 /// one over `PROBE_MEMO_READ_CHUNK`); it stays all or nothing.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_home_spend_walk(
     env: &worker::Env,
     db: &worker::D1Database,
@@ -5883,6 +5893,7 @@ async fn owed_home_spend_walk(
 
 /// The Worker behind `owed::PayVoutWorld`: the step's own clock, the isolate's memo and `pot_beefs`. Reads only;
 /// every decision is `owed::pay_vout_pass`'s.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 struct PayVoutReads<'a> {
     db: &'a worker::D1Database,
     started_ms: i64,
@@ -5932,6 +5943,7 @@ impl crate::owed::PayVoutWorld for PayVoutReads<'_> {
 }
 /// The Worker behind `owed::HomeWalkWorld`: the recompute's clock, the `/spent-any` ladder, the stored BEEF and
 /// the tx-any resolver. Fetches only; every decision is `owed::home_walk_pass`'s.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 struct HomeWalkCouriers<'a> {
     env: &'a worker::Env,
     db: &'a worker::D1Database,
@@ -5976,11 +5988,13 @@ impl crate::owed::HomeWalkWorld for HomeWalkCouriers<'_> {
 }
 
 /// bsv-low #800: one walk's id (#566's ask: every log line of one walk carries it) and its clock.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) struct OwedWalk {
     pub rid: String,
     pub slice: crate::owed::OwedWalkSlice,
 }
 impl OwedWalk {
+    #[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
     fn new(token: i64, slice: crate::owed::OwedWalkSlice) -> Self {
         let mut b = [0u8; 4];
         let nonce = getrandom::getrandom(&mut b)
@@ -6011,6 +6025,7 @@ impl OwedWalk {
 }
 
 /// bsv-low #800: `fut` unless `ms` pass first (`None`: dropped, as the platform would drop it at its ceiling).
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_with_deadline<F: core::future::Future>(fut: F, ms: u64) -> Option<F::Output> {
     owed_with_deadline_on(
         fut,
@@ -6021,6 +6036,7 @@ async fn owed_with_deadline<F: core::future::Future>(fut: F, ms: u64) -> Option<
 
 /// The race itself, over any timer (the FIX-800 lens's LOW-3: pinned with a virtual clock, `fix800_e`): `fut` unless
 /// `timer` is ready first, in which case `fut` is DROPPED (`None`).
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_with_deadline_on<F, T>(fut: F, timer: T) -> Option<F::Output>
 where
     F: core::future::Future,
@@ -6086,6 +6102,7 @@ fn owed_inline_expect(token: i64) {
 }
 /// bsv-low #567: the claim's walk ended; a read waiting on `token` takes its snapshot when it is one to answer with
 /// ([`owed_inline_snapshot`]). The first such walk only.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_inline_offer(token: i64, walked: &Option<std::result::Result<OwedComputed, String>>) {
     OWED_INLINE_LANDED.with(|m| {
         if let Some(slot @ None) = m.borrow_mut().get_mut(&token) {
@@ -6116,6 +6133,7 @@ fn owed_read_answer(
 /// PURE (bsv-low #567): the snapshot a read answers with from its own walk: a walk whose write LANDED whole. A
 /// superseded one (#487: a newer snapshot stands, the stored read serves it) and one cut at its outward budget (a
 /// partial snapshot, its shed rows carried) are not: the stored snapshot answers, as before.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_inline_snapshot(c: &OwedComputed) -> Option<crate::owed::OwedSnapshot> {
     (!c.superseded && !c.budget_cut).then(|| {
         (
@@ -6131,6 +6149,7 @@ fn owed_inline_snapshot(c: &OwedComputed) -> Option<crate::owed::OwedSnapshot> {
 /// How a claim's walk went: shed by the ceiling (#499: the CLAIM re-marks the identity and arms its deferred walk
 /// for `deferred`, captured before any await, once it released its lock), not started for want of a slice (#800),
 /// or run under its slice (`walked` is `None` when the claim dropped it at its hard deadline).
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) enum OwedClaimWalk {
     Shed {
         deferred: Option<i64>,
@@ -6148,6 +6167,7 @@ pub(crate) enum OwedClaimWalk {
 /// (`owed_recompute_claimed`), then re-marks a shed, marks a dropped walk stale and tells the page (the FIX-800 lens's
 /// LOW-2: the shed's two awaits ran under the lock).
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) async fn owed_recompute_and_push(
     env: &worker::Env,
     db: &worker::D1Database,
@@ -6192,6 +6212,7 @@ pub(crate) async fn owed_recompute_and_push(
 /// `owed-recompute` in `d1Budget`; the tally is kept for a dropped walk too). `None`: the walk was dropped at its
 /// hard deadline, counted and logged; nothing of it is known written (its one write batch is all or nothing and
 /// monotonic in its stamp, #487, so a batch that lands after the drop changes nothing a newer walk wrote).
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_walk_bounded(
     env: &worker::Env,
     db: &worker::D1Database,
@@ -6219,6 +6240,7 @@ async fn owed_walk_bounded(
 }
 
 /// The walk's end as the claim's step reads it (bsv-low #800).
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_walk_end(
     walked: &Option<std::result::Result<OwedComputed, String>>,
 ) -> crate::owed::OwedWalkEnd {
@@ -6233,6 +6255,7 @@ fn owed_walk_end(
 
 /// A walk that ended, told: the page pushed `owed-changed` on a landed snapshot (bsv-low #487: a snapshot the write
 /// refused is not announced, the newer walk's own push stands); a fault counted and logged.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_walk_told(
     env: &worker::Env,
     identity_lc: &str,
@@ -6274,6 +6297,7 @@ async fn owed_walk_told(
 /// lens's MEDIUM-A: the re-read claimed another walk dropped the same way, a loop under #499's ceiling that never
 /// reached the alarm): it hands the identity to the alarm (`owed_hand_to_alarm`) and nudges only when that arm
 /// failed. The alarm's own walk nudges once on its drop, and pushes the rows when it lands.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_stale_nudge(env: &worker::Env, identity_lc: &str, source: &str) {
     crate::internal_events::first_party_push(
         env,
@@ -6292,6 +6316,7 @@ async fn owed_stale_nudge(env: &worker::Env, identity_lc: &str, source: &str) {
 /// The second FIX-800 delta lens's MEDIUM-B: `noted` reads the actor's `owed-dirty` (a hook SHED during this walk's
 /// flight noted it, `owed_note_alarm`). A landed walk that was noted marks the identity stale AGAIN after its write
 /// (stamped at its start, it cleared the hook's mark) and before its push, so the page's re-read walks the evidence.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) async fn owed_deferred_walk_and_push<F, Fut>(
     env: &worker::Env,
     identity_lc: &str,
@@ -6330,6 +6355,7 @@ where
 
 /// The second FIX-800 delta lens's MEDIUM-B: the shipped stale mark, made by an alarm walk (or the actor's first-read
 /// walk) that a shed hook noted during its flight, after its write.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) async fn owed_remark_after_alarm(db: &worker::D1Database, identity_lc: &str) {
     owed_mark_stale(
         db,
@@ -6342,10 +6368,12 @@ pub(crate) async fn owed_remark_after_alarm(db: &worker::D1Database, identity_lc
 
 /// bsv-low #499 (lens fold M3): the `d1Budget` key of one detached recompute (the hooks', the claims' and the stale
 /// read's refresh; the first read's compute is the `/owed` request's own).
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) const OWED_RECOMPUTE_LEDGER_KEY: &str = "owed-recompute";
 
 /// bsv-low #499 (lens fold M1): what a shed writes, `owed::owed_shed_plan` (the identity marked stale again). A fault
 /// is logged: the age rules still recompute the list later.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_shed_remark(db: &worker::D1Database, identity_lc: &str) {
     let (sql, bind) = crate::owed::owed_shed_plan(identity_lc);
     owed_mark_stale(db, sql, &[JsValue::from_str(&bind)], "shed").await;
@@ -6377,6 +6405,7 @@ thread_local! {
 /// bsv-low #499: may this recompute run? Every walk asks here first: the hooks' and the claims' through
 /// `owed_recompute_and_push`, the read's inline arm, and the first read. An exhausted first read consumes the
 /// shared durable reservation; other sheds schedule its alarm and serve the snapshot they hold.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) fn owed_recompute_admit(identity_lc: &str, source: &str, sheddable: bool) -> bool {
     let now_ms = worker::Date::now().as_millis() as i64;
     let run = OWED_RATE.with(|r| r.borrow_mut().admit(identity_lc, now_ms, sheddable));
@@ -6391,6 +6420,7 @@ pub(crate) fn owed_recompute_admit(identity_lc: &str, source: &str, sheddable: b
     }
     run
 }
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_deferred_deadline(identity_lc: &str) -> Option<i64> {
     OWED_RATE.with(|r| {
         r.borrow_mut()
@@ -6400,6 +6430,7 @@ fn owed_deferred_deadline(identity_lc: &str) -> Option<i64> {
 /// The FIX-800 delta lens's MEDIUM-A: a dropped walk hands its identity to the window's deferred alarm walk
 /// (`owed::RecomputeRate::hand_to_alarm`), captured synchronously as the claim releases: `arm: Some(end)` to arm (it
 /// fires at the drop, the second delta lens's LOW-C), `None` when the window's alarm is armed already.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_hand_to_alarm(identity_lc: &str) -> crate::owed::OwedHandOff {
     OWED_RATE.with(|r| {
         r.borrow_mut()
@@ -6407,6 +6438,7 @@ fn owed_hand_to_alarm(identity_lc: &str) -> crate::owed::OwedHandOff {
     })
 }
 /// `false` only when an alarm was to be armed and could not be (the reservation and any hand-off are lifted).
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_schedule_deferred(
     env: &worker::Env,
     identity_lc: &str,
@@ -6415,6 +6447,7 @@ async fn owed_schedule_deferred(
     owed_schedule_deferred_at(env, identity_lc, deadline, None).await
 }
 /// The identity's deferred actor on THIS isolate (one per identity/isolate, #648).
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_deferred_stub(env: &worker::Env, identity_lc: &str) -> worker::Result<worker::Stub> {
     let ns = env.durable_object("BOARD_VIEW")?;
     let name = OWED_ISOLATE.with(|isolate| format!("owed-deferred:{isolate}:{identity_lc}"));
@@ -6422,6 +6455,7 @@ fn owed_deferred_stub(env: &worker::Env, identity_lc: &str) -> worker::Result<wo
 }
 /// `owed_schedule_deferred`, with the alarm's FIRE time apart from its reservation's key (`due`, the window's end):
 /// a dropped walk's alarm fires at the drop (the second FIX-800 delta lens's LOW-C). `None` fires at `due`.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_schedule_deferred_at(
     env: &worker::Env,
     identity_lc: &str,
@@ -6457,6 +6491,7 @@ async fn owed_schedule_deferred_at(
 /// The second FIX-800 delta lens's MEDIUM-B: a hook SHED while this isolate's alarm of the identity is armed tells
 /// that actor (`/owed-deferred-note`), which answers whether its walk is still to start (`Pending`), in flight
 /// (`Noted`: the walk marks the identity stale again after its write) or not there (`Idle`). `None` on a fault.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_note_alarm(
     env: &worker::Env,
     identity_lc: &str,
@@ -6496,12 +6531,14 @@ pub(crate) fn owed_rate_at_ceiling(now_ms: i64) -> usize {
 /// over at once instead of 30 s later.
 pub(crate) const OWED_IN_FLIGHT_STALE_MS: i64 = crate::owed::OWED_PLATFORM_WAIT_UNTIL_MS;
 /// PURE: may an ask claim the lock now? (no mark, or a mark whose progress is older than the stale bound: a takeover)
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) fn owed_lock_free(mark: Option<(i64, i64)>, now_ms: i64) -> bool {
     mark.is_none_or(|(_, progress)| now_ms.saturating_sub(progress) >= OWED_IN_FLIGHT_STALE_MS)
 }
 /// Claim the identity's recompute lock: `Some(token)` (the mark's own stamp, which `owed_refresh_end` needs — the
 /// delta-verify's LOW-A: an original run that outlived a takeover must not free the takeover's mark), `None` when
 /// a live mark holds it.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_refresh_begin(identity_lc: &str, now_ms: i64) -> Option<i64> {
     OWED_REFRESHING.with(|s| {
         let (token, taken_over) = owed_lock_claim(&mut s.borrow_mut(), identity_lc, now_ms)?;
@@ -6519,6 +6556,7 @@ fn owed_refresh_begin(identity_lc: &str, now_ms: i64) -> Option<i64> {
 }
 /// PURE (pinned): claim the mark. `Some((token, Some(age)))` when an abandoned mark (silent `age` ms) was taken over,
 /// `Some((token, None))` on a free lock, `None` while a live mark holds it.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) fn owed_lock_claim(
     map: &mut std::collections::HashMap<String, (i64, i64)>,
     identity_lc: &str,
@@ -6537,6 +6575,7 @@ pub(crate) fn owed_lock_claim(
     ))
 }
 /// PURE (pinned): release the mark only when it is still OURS.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) fn owed_lock_release(
     map: &mut std::collections::HashMap<String, (i64, i64)>,
     identity_lc: &str,
@@ -6550,6 +6589,7 @@ pub(crate) fn owed_lock_release(
     }
 }
 /// PURE (pinned): a live claim re-stamps its progress (only while the mark is still its own).
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) fn owed_lock_touch(
     map: &mut std::collections::HashMap<String, (i64, i64)>,
     identity_lc: &str,
@@ -6564,17 +6604,20 @@ pub(crate) fn owed_lock_touch(
         _ => false,
     }
 }
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_refresh_end(identity_lc: &str, token: i64) {
     OWED_REFRESHING.with(|s| {
         owed_lock_release(&mut s.borrow_mut(), identity_lc, token);
     });
 }
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_refresh_touch(identity_lc: &str, token: i64) -> bool {
     let now_ms = worker::Date::now().as_millis() as i64;
     OWED_REFRESHING.with(|s| owed_lock_touch(&mut s.borrow_mut(), identity_lc, token, now_ms))
 }
 /// The delta-verify's N-7: how many folded asks one claim serves after its own run (anything further is the stale
 /// mark the read path already honours).
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) const OWED_RERUNS_PER_CLAIM: usize = 2;
 /// The isolate's in-flight recomputes, for `/health` (the gate's MEDIUM-2: a wedged isolate must be visible).
 pub(crate) fn owed_in_flight_snapshot(now_ms: i64) -> serde_json::Value {
@@ -6590,6 +6633,7 @@ pub(crate) fn owed_in_flight_snapshot(now_ms: i64) -> serde_json::Value {
 /// folded meanwhile, once each, then the lock released. A rerun keeps the caller's tip hint (the gate's LOW-2: a
 /// re-read that blips would compute nothing; a tip a moment old is conservative — a gate reads "not open yet").
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) async fn owed_recompute_claimed(
     env: &worker::Env,
     db: &worker::D1Database,
@@ -6748,6 +6792,7 @@ pub(crate) async fn owed_recompute_claimed(
 /// The second FIX-800 delta lens's NOTE-3: ONE line at a dropped walk's hand-off, the identity, the drop's age (from
 /// the walk's start), the alarm's fire time and the hand-off's end (the alarm walk's deadline), so loop 43's tail
 /// (identityNone, owedDoorStrand) reads the arm directly between the drop's line and `[owed] deferred walk`.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_log_hand_off(
     src: &str,
     rid: &str,
@@ -6762,6 +6807,7 @@ fn owed_log_hand_off(
     );
 }
 /// PURE (pinned): the hand-off's line.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_hand_off_line(
     src: &str,
     rid: &str,
@@ -6788,6 +6834,7 @@ fn owed_hand_off_line(
 /// ONE push, the LAST landed walk's (the page re-reads `/owed` on any `owed-changed`, so an earlier walk's push adds
 /// nothing the last one's does not, and each push was one more actor fetch in the 3 s reserve); every fault is still
 /// counted and logged, and a superseded snapshot is still not announced.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_tell_all(
     env: &worker::Env,
     identity_lc: &str,
@@ -6800,6 +6847,7 @@ async fn owed_tell_all(
 
 /// PURE (pinned): of the walks a claim ran, the faults (each counted and logged by `owed_walk_told`) and the LAST
 /// landed, announceable walk (not superseded), in their order.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_told_last<T>(
     told: Vec<(String, String, std::result::Result<T, String>)>,
 ) -> Vec<(String, String, std::result::Result<T, String>)>
@@ -6817,6 +6865,7 @@ where
 }
 
 /// A walk's snapshot that `owed_walk_told` pushes (a landed one the write did not refuse, #487).
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 trait OwedAnnounceable {
     fn announceable(&self) -> bool;
 }
@@ -6838,6 +6887,7 @@ fn owed_folded_waiting(identity_lc: &str) -> bool {
 
 /// The snapshot the table holds for `identity_lc` (the marker, then its rows): what a superseded read serves.
 /// `None` on any fault or a missing marker.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_read_stored(
     db: &worker::D1Database,
     identity_lc: &str,
@@ -6868,6 +6918,7 @@ async fn owed_read_stored(
 }
 
 /// The read's compute: a fault is counted, logged and answered as a 503 (never "nothing owed").
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 pub(crate) async fn owed_compute_on_read(
     env: &worker::Env,
     db: &worker::D1Database,
@@ -8131,6 +8182,7 @@ async fn write_probe_memos(db: &worker::D1Database, memos: &[crate::hops_view::P
 /// retired whatever THIS pass's spender courier cap withheld. One INDEXED range read of the `hop_chain_probes`
 /// PRIMARY KEY per spender, OR'd into one statement (chunked under D1's bound limit); never a scan. A read fault
 /// returns no latch: the pass then judges as it did before (the honest could-not-judge row or #662's keep).
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn read_home_latches(
     db: &worker::D1Database,
     spenders: &[String],
@@ -8141,6 +8193,7 @@ async fn read_home_latches(
 /// bsv-low #693 fold (HIGH-1): the durable `proofmined:` latches of the named spenders, BYTE-FREE, through the same
 /// indexed PK range read as the home latches (`owed::proof_latch_range_binds`). A read fault returns no latch: the
 /// pass judges on its own answers, as before the latch.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn read_proof_latches(
     db: &worker::D1Database,
     spenders: &[String],
@@ -8148,6 +8201,7 @@ async fn read_proof_latches(
     read_latch_ranges(db, spenders, crate::owed::proof_latch_range_binds).await
 }
 
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn read_latch_ranges(
     db: &worker::D1Database,
     spenders: &[String],
@@ -9604,6 +9658,7 @@ type TxAnyCached = crate::txany::TxAnyAnswer;
 /// PRIMARY KEY (the txids as a JSON array). A fault is an `Err` (the caller judges as before, the belt still holds);
 /// a row whose stored JSON will not parse is skipped (never a wrong word). The hits are content-addressed: the bytes
 /// were hash-verified against the txid before they were ever written.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 async fn owed_spender_store_read(
     db: &worker::D1Database,
     spenders: &std::collections::HashSet<String>,
@@ -9707,6 +9762,7 @@ pub(crate) fn spender_inputs_of(tx: &bsv_rs::transaction::Transaction) -> Vec<(S
 /// its input outpoints, the owed brain's spender bytes. One reader for the tx-any answer and the chain rung's verified
 /// raw (bsv-low #606).
 /// A tx-any answer's raw, parsed and re-checked against the txid it was asked for (content-addressed).
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn parse_spender_answer(a: &TxAnyCached, sp: &str) -> Option<CourierSpenderBytes> {
     courier_spender_bytes_of_raw(
         &hex::decode(crate::txany::fact_reader_raw_hex(a)?).ok()?,
@@ -9715,6 +9771,7 @@ fn parse_spender_answer(a: &TxAnyCached, sp: &str) -> Option<CourierSpenderBytes
 }
 
 /// Display evidence only: finality still comes from the chain spend word.
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn mark_pending_spender(row: &mut crate::owed::OwedRow, answer: Option<&TxAnyCached>, now_ms: i64) {
     if row.facts["spentConfirmed"] == true || row.at_height.is_some() {
         return;
@@ -9791,10 +9848,13 @@ thread_local! {
     static OWED_COURIER_ASKED_AT: std::cell::RefCell<std::collections::HashMap<String, f64>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 const OWED_COURIER_ASKED_MAX: usize = 1024;
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_courier_asked_at(txid_lc: &str) -> Option<f64> {
     OWED_COURIER_ASKED_AT.with(|m| m.borrow().get(txid_lc).copied())
 }
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_courier_note_asked(txid_lc: &str, now: f64) {
     OWED_COURIER_ASKED_AT.with(|m| {
         let mut m = m.borrow_mut();
@@ -9811,10 +9871,13 @@ thread_local! {
     static OWED_PAY_VOUT_MEMO: std::cell::RefCell<std::collections::HashMap<String, u32>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 const OWED_PAY_VOUT_MEMO_MAX: usize = 4096;
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_pay_vout_memo_get(key: &str) -> Option<u32> {
     OWED_PAY_VOUT_MEMO.with(|m| m.borrow().get(key).copied())
 }
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_pay_vout_memo_put(key: &str, vout: u32) {
     OWED_PAY_VOUT_MEMO.with(|m| {
         let mut m = m.borrow_mut();
@@ -9824,6 +9887,7 @@ fn owed_pay_vout_memo_put(key: &str, vout: u32) {
         m.insert(key.to_string(), vout);
     });
 }
+#[allow(dead_code)] // bsv-low #893: the retired owed walk (the belt replaced its alarm); lane 6 deletes it
 fn owed_spender_outputs_memo_get(txid_lc: &str) -> Option<CourierSpenderBytes> {
     OWED_SPENDER_OUTPUTS_MEMO.with(|m| m.borrow().0.get(txid_lc).cloned())
 }
@@ -10183,6 +10247,56 @@ where
         crate::courier::note_presence("tx_any_one_capable_source_unknown_total");
     }
     (observation, absence, claimed_height)
+}
+
+/// bsv-low #893 section 5 (the owed belt): the spent-any ladder over the belt's gated courier port. The probe, and the
+/// spender's raw when the ladder read it and it verified (it hashes to the named spender and spends this outpoint).
+pub(crate) async fn belt_spent_any_via<G, F>(
+    txid_lc: &str,
+    vout: u32,
+    get: G,
+) -> (crate::hops_view::ChainSpendProbe, Option<Vec<u8>>)
+where
+    G: Fn(String) -> F,
+    F: std::future::Future<Output = Option<(u16, Vec<u8>)>>,
+{
+    let (row, raw) = spent_any_resolve_via(txid_lc, vout, get).await;
+    (
+        crate::hops_view::ChainSpendProbe {
+            known: row.known,
+            spent: row.spent,
+            spending_txid: row.spending_txid,
+            spent_confirmed: row.spent_confirmed,
+        },
+        raw,
+    )
+}
+
+/// bsv-low #893 section 5: a named spender's hash-verified raw over the belt's gated port (WoC's `/tx/hash` for its
+/// claim, the raw from the first courier whose bytes hash to the txid), and the courier's CLAIMED mined height,
+/// which the belt binds through WoC's `/proof/tsc` before it is evidence.
+pub(crate) async fn belt_spender_via<G, F>(
+    txid_lc: &str,
+    now_ms: i64,
+    get: G,
+) -> (Option<Vec<u8>>, Option<u64>)
+where
+    G: Fn(String) -> F,
+    F: std::future::Future<Output = Option<(u16, Vec<u8>)>>,
+{
+    let (observation, _, claimed_height, _) = tx_any_courier_leg_via(txid_lc, now_ms, &get).await;
+    let raw = match observation {
+        crate::txany::TxObservation::Present { raw_hex, .. }
+        | crate::txany::TxObservation::FirstPartyPresent { raw_hex, .. }
+        | crate::txany::TxObservation::CourierHint { raw_hex, .. } => raw_hex,
+        _ => None,
+    };
+    (raw.and_then(|h| hex::decode(h).ok()), claimed_height)
+}
+
+/// bsv-low #893 section 5: WoC's TSC proof route, the one proof source the belt asks.
+pub(crate) fn belt_proof_url(txid_lc: &str) -> String {
+    format!("{WOC_BASE}/tx/{txid_lc}/proof/tsc")
 }
 
 /// The raw body is optional for a first-party hint, and always hash checked.
@@ -12234,19 +12348,12 @@ mod tests {
         assert!(r.contains(&squash(
             "crate::owed::OWED_STALE_FOR_IDENTITY_SQL, &[JsValue::from_str(identity_lc)], \"evidence during the alarm\","
         )));
-        // the actor: a walk in flight keeps the note; the alarm and the first read read it
+        // bsv-low #893 section 5: the actor's deferred walk is retired (its alarm is the belt's tick), so the
+        // actor no longer carries the note or the walk; the old routes answer 410
         let b = squash(include_str!("board_view.rs"));
+        assert!(!b.contains("owed_deferred_walk_and_push"));
         assert!(b.contains(&squash(
-            "if note == crate::owed::OwedAlarmNote::Noted { storage.put(\"owed-dirty\", true).await?; }"
-        )));
-        assert!(b.contains(&squash(
-            "held.as_deref() == Some(identity.as_str()) && due.is_some(), started,"
-        )));
-        assert!(b.contains(&squash(
-            "crate::routes::owed_deferred_walk_and_push(&self.env, &identity, || async { self.state .storage() .get::<bool>(\"owed-dirty\")"
-        )));
-        assert!(b.contains(&squash(
-            "if storage.get::<bool>(\"owed-dirty\").await?.unwrap_or(false) { crate::routes::owed_remark_after_alarm(&db, &identity).await; }"
+            "Response::error(\"the deferred owed walk is retired\", 410)"
         )));
     }
 
@@ -12302,17 +12409,8 @@ mod tests {
             d + OWED_DEFERRED_WALK_DEADLINE_MS,
             "60 s past a drop past the end"
         );
-        // the actor and the arm carry the fire time apart from `due`
-        let b = include_str!("board_view.rs");
+        // the arm carries the fire time apart from `due` (the actor that served it is retired, bsv-low #893)
         let sq = |x: &str| x.split_whitespace().collect::<String>();
-        let b = sq(b);
-        assert!(b.contains(&sq(
-            ".find(|(k, _)| k == \"fire\") .and_then(|(_, v)| v.parse::<i64>().ok()) .map_or(due, |f| f.min(due));"
-        )));
-        assert!(b.contains(&sq(
-            "retry: false, fire, }) .await?; storage .set_alarm((fire - Date::now().as_millis() as i64).max(0))"
-        )));
-        assert!(b.contains(&sq("Some(due) => fire.map_or(due, |f| f.min(due)),")));
         let r = sq(&fix800_code());
         assert!(r.contains(&sq(
             "\"https://board-view/owed-deferred?identity={identity_lc}&due={end}{fire}\""
