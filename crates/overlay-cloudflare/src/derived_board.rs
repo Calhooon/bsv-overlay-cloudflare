@@ -656,6 +656,35 @@ mod tests {
         assert_eq!(split_sqlite_complete(bad).len(), 1);
     }
 
+    #[test]
+    fn owed893_every_dirty_trigger_survives_both_splitters_and_comma_case_is_red() {
+        let dirty: Vec<_> = crate::d1::OVERLAY_MIGRATIONS
+            .iter()
+            .copied()
+            .filter(|s| s.starts_with("CREATE TRIGGER IF NOT EXISTS owed_dirty_"))
+            .collect();
+        assert_eq!(dirty.len(), 26);
+        for sql in dirty {
+            let file = crate::migration_emitter::part_body(&[sql]);
+            assert_eq!(split_wrangler_454(&file), [sql], "{sql}");
+            assert_eq!(split_sqlite_complete(&file), [sql], "{sql}");
+            let bad = sql.replacen(",s.gameId", ",CASE WHEN 1 THEN s.gameId END ", 1);
+            assert_ne!(bad, sql, "the mutant must change this trigger");
+            let file = crate::migration_emitter::part_body(&[&bad]);
+            let bad = [bad];
+            assert_ne!(
+                split_wrangler_454(&file).as_slice(),
+                bad.as_slice(),
+                "comma-CASE must split the trigger"
+            );
+            assert_eq!(
+                split_sqlite_complete(&file).as_slice(),
+                bad.as_slice(),
+                "SQLite alone accepts the unsafe splitter text"
+            );
+        }
+    }
+
     /// The #674 block, in the list's order.
     fn block() -> &'static [&'static str] {
         let list = crate::d1::OVERLAY_MIGRATIONS;
