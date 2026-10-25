@@ -389,10 +389,22 @@ pub struct TickReport {
     pub calls: usize,
     pub faults: [u64; 4],
     pub write_faults: Vec<(String, String)>,
+    /// The tick had no chain tip: nothing was asked.
+    pub no_tip: bool,
 }
 
 pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickReport, String> {
     let now = db.now_ms() as i64;
+    // The judge refuses every subject without a chain tip ("previous judgement stands"), so a find could never land:
+    // ask nothing, spend no courier call, leave every date as it is (the next tick with a tip asks them first).
+    if db.tip().is_none() {
+        db.counters(vec![(COUNTER_TICKS.to_owned(), 1)]).await;
+        db.log("[owed-belt] tick: no chain tip, nothing asked");
+        return Ok(TickReport {
+            no_tip: true,
+            ..Default::default()
+        });
+    }
     let rows = db
         .run_batch(vec![Stmt {
             sql: CANDIDATES_SQL.into(),
@@ -454,6 +466,7 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
                 match judged {
                     Ok(_) => report.found += 1,
                     Err(e) => {
+                        db.log(&format!("[owed-belt] {} find's write faulted: {e}", c.outpoint));
                         report.write_faults.push((c.outpoint.clone(), e));
                         rearm(db, &c, now, &mut report).await;
                     }
@@ -461,6 +474,7 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
             }
             Ok(None) => rearm(db, &c, now, &mut report).await,
             Err(e) => {
+                db.log(&format!("[owed-belt] {} ask faulted: {e}", c.outpoint));
                 report.write_faults.push((c.outpoint.clone(), e));
                 rearm(db, &c, now, &mut report).await;
             }
@@ -580,6 +594,7 @@ pub async fn lever(req: worker::Request, env: &worker::Env) -> worker::Result<wo
             "calls": r.calls,
             "faults": {"woc": r.faults[0], "bitails": r.faults[1], "bananablocks": r.faults[2], "other": r.faults[3]},
             "writeFaults": r.write_faults.len(),
+            "noTip": r.no_tip,
         })),
         Err(e) => worker::Response::error(format!("owed belt tick faulted: {e}"), 503),
     }
