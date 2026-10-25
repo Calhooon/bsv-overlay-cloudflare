@@ -505,3 +505,126 @@ async fn d2fold_low1_a_wedged_identity_is_recorded_and_passed_after_three_passes
     assert_eq!(db.counters.borrow()[backfill::COUNTER_SKIPPED], 1);
     assert_eq!(db.int("SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-v2'"), 1);
 }
+
+#[allow(dead_code)]
+#[path = "support/d1_fleet.rs"]
+mod d1_fleet;
+
+/// LOW-2, measured: on the lived-in seat (250 pots, 270 hops, 500 stored rows) one subject's commit reads one game's
+/// rows and one state row. The base's per-game delete read the identity by its primary key and its state write
+/// COUNTed every row; both are run here beside the shipped statements, on the same data, and printed.
+#[tokio::test]
+async fn d2fold_low2_one_subjects_commit_reads_its_game_not_the_identity() {
+    let db = Db::new();
+    {
+        let conn = db.conn.borrow();
+        conn.execute_batch("BEGIN").unwrap();
+        for row in d1_fleet::owed_rows(NOW / 1000) {
+            d1_fleet::execute_row(&conn, &row);
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+    let seat = d1_fleet::OWED_SEAT;
+    let games: Vec<String> = {
+        let conn = db.conn.borrow();
+        let mut s = conn
+            .prepare("SELECT DISTINCT gameId FROM hopparty_records WHERE identity=?1 ORDER BY gameId")
+            .unwrap();
+        s.query_map([seat], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    for chunk in games.chunks(16) {
+        judge::judge_subjects(&db, seat, chunk, "measure").await.unwrap();
+    }
+    assert_eq!(db.int(&format!("SELECT COUNT(*) FROM owed_rows WHERE identity='{seat}'")), 500);
+    assert_eq!(
+        db.int(&format!("SELECT rows FROM owed_state WHERE identity='{seat}'")),
+        500,
+        "the kept count equals the rows"
+    );
+    db.steps.borrow_mut().clear();
+    judge::judge_subjects(&db, seat, &games[..1], "measure").await.unwrap();
+    let step = |needle: &str| -> i64 {
+        db.steps
+            .borrow()
+            .iter()
+            .filter(|(sql, _)| sql == needle)
+            .map(|(_, n)| *n)
+            .sum()
+    };
+    let now: i64 = [
+        judge::GAME_DELETE_SQL,
+        judge::STATE_CREATE_SQL,
+        judge::CEILING_DELETE_SQL,
+        judge::STATE_UPDATE_SQL,
+    ]
+    .iter()
+    .map(|s| step(s))
+    .sum();
+    // the base's statements on the same 500 rows, run in a rolled-back transaction
+    let base: i64 = {
+        let conn = db.conn.borrow();
+        conn.execute_batch("BEGIN").unwrap();
+        let mut total = 0;
+        for sql in [
+            "DELETE FROM owed_rows INDEXED BY sqlite_autoindex_owed_rows_1 WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))",
+            "DELETE FROM owed_rows WHERE identity=?1 AND outpoint IN (SELECT outpoint FROM owed_rows WHERE identity=?1 ORDER BY CASE family WHEN 'payout' THEN 0 WHEN 'refund-due' THEN 1 WHEN 'hop-stranded' THEN 2 WHEN 'in-progress' THEN 3 ELSE 4 END,COALESCE(atHeight,0) DESC,outpoint LIMIT -1 OFFSET 500)",
+            "INSERT INTO owed_state(identity,computedAtMs,tip,rows,stale,truncated,recomputeSeq) SELECT ?1,1,1,COUNT(*),0,0,1 FROM owed_rows WHERE identity=?1 ON CONFLICT(identity) DO UPDATE SET rows=excluded.rows",
+        ] {
+            let mut s = conn.prepare(sql).unwrap();
+            let n = s.parameter_count();
+            let binds: Vec<SqlValue> = [SqlValue::Text(seat.into()), SqlValue::Text(format!("[\"{}\"]", games[0]))]
+                .into_iter()
+                .take(n)
+                .collect();
+            s.execute(rusqlite::params_from_iter(binds)).unwrap();
+            total += i64::from(s.get_status(rusqlite::StatementStatus::VmStep));
+        }
+        conn.execute_batch("ROLLBACK").unwrap();
+        total
+    };
+    for (sql, n) in db.steps.borrow().iter() {
+        eprintln!("  {n:>6} {}", &sql[..sql.len().min(90)]);
+    }
+    eprintln!("LOW-2: one subject's commit statements on a 500-row identity: {now} VM steps (the base's: {base})");
+    assert!(now * 5 < base, "{now} against {base}");
+    // the old worker's whole-identity write (the deploy window) sets the figure explicitly: still exact after it
+    let rows: Vec<low_app_layer::owed::OwedRow> = (0..3)
+        .map(|n| low_app_layer::owed::OwedRow {
+            identity: seat.into(),
+            outpoint: format!("{}:0", hop(30_000 + n)),
+            family: low_app_layer::owed::OwedFamily::Unbound,
+            game_id: "g".into(),
+            sats: None,
+            opponent_identity: None,
+            at_height: None,
+            facts: serde_json::json!({}),
+            reason: None,
+        })
+        .collect();
+    {
+        let conn = db.conn.borrow();
+        let tx = conn.unchecked_transaction().unwrap();
+        for (sql, binds) in low_app_layer::owed::owed_write_plan(seat, &rows, NOW as i64 + 1, Some(900_000), false) {
+            let values = binds.into_iter().map(|b| match b {
+                low_app_layer::owed::OwedBind::Text(s) => SqlValue::Text(s),
+                low_app_layer::owed::OwedBind::Int(n) => SqlValue::Integer(n),
+                low_app_layer::owed::OwedBind::Null => SqlValue::Null,
+            });
+            let mut st = tx.prepare(sql).unwrap();
+            let mut q = st.query(rusqlite::params_from_iter(values)).unwrap();
+            while q.next().unwrap().is_some() {}
+        }
+        tx.commit().unwrap();
+    }
+    assert_eq!(
+        db.int(&format!("SELECT rows FROM owed_state WHERE identity='{seat}'")),
+        db.int(&format!("SELECT COUNT(*) FROM owed_rows WHERE identity='{seat}'")),
+        "the kept count through an old worker's write"
+    );
+    judge::judge_subjects(&db, seat, &games[..2], "measure").await.unwrap();
+    assert_eq!(
+        db.int(&format!("SELECT rows FROM owed_state WHERE identity='{seat}'")),
+        db.int(&format!("SELECT COUNT(*) FROM owed_rows WHERE identity='{seat}'")),
+        "and through the next judge"
+    );
+}
