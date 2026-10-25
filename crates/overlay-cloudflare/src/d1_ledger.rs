@@ -571,6 +571,16 @@ pub fn note_request(now_ms: f64) {
     });
 }
 
+/// Count a read without sampling a clock or scheduling a flush. The next
+/// writer or scheduled pass dates an as-yet undated window when taking it.
+pub fn note_deferred_request() {
+    COST.with(|c| {
+        let mut window = c.get();
+        window.requests = window.requests.saturating_add(1);
+        c.set(window);
+    });
+}
+
 /// bsv-low #635: take the window when it is due ([`cost_due`]), leaving an empty one; else `None`.
 pub fn take_cost_if_due(now_ms: f64) -> Option<CostFlush> {
     let last = COST_LAST_TAKE_MS.with(Cell::get);
