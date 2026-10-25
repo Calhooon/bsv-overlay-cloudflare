@@ -40,6 +40,7 @@ pub mod derived_hops;
 pub mod derived_owed;
 pub mod ef;
 pub mod ef_deferred;
+mod eviction_write;
 pub mod error;
 mod gasp_cost;
 pub mod gasp_deferred;
