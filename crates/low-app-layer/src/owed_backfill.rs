@@ -33,12 +33,18 @@ pub const OWED_BACKFILL_SAVE_RESERVE_MS: u64 = 3_000;
 /// A row judged longer ago than this is re-marked by the drain (once a day, since its judge restamps it).
 pub const OWED_AGE_REMARK_AFTER_MS: i64 = 86_400_000;
 pub const OWED_AGE_REMARKS_PER_PASS: usize = 128;
+/// The passes one identity's judge may fault before the backfill records it, leaves its marks for the drain and moves
+/// its cursor past it (the D2-OWED lens's LOW-1: one wedged identity held the stamp and every later identity back).
+pub const OWED_BACKFILL_IDENTITY_FAULTS_MAX: usize = 3;
+/// The `owed_belt_state` row counting the open identity's consecutive faulted passes (`{"identity":..,"faults":n}`).
+pub const OWED_BACKFILL_FAULTS: &str = "backfill:owed-v2:faults";
 
 pub const COUNTER_IDENTITIES: &str = "owed_backfill_identities_total";
 pub const COUNTER_ROWS: &str = "owed_backfill_rows_total";
 pub const COUNTER_AGED: &str = "owed_age_remarked_total";
+pub const COUNTER_SKIPPED: &str = "owed_backfill_skipped_identities_total";
 pub fn counter_names() -> Vec<String> {
-    [COUNTER_IDENTITIES, COUNTER_ROWS, COUNTER_AGED]
+    [COUNTER_IDENTITIES, COUNTER_ROWS, COUNTER_AGED, COUNTER_SKIPPED]
         .map(str::to_owned)
         .to_vec()
 }
@@ -46,7 +52,11 @@ pub fn counter_names() -> Vec<String> {
 /// The stamped replay's one statement: a primary-key read of one row.
 pub const STAMP_SQL: &str = "SELECT 1 AS stamped FROM view_derivation_state WHERE name='owed-v2'";
 /// The gate (the overlay's certified migration list) and both cursor rows, each a primary-key read.
-pub const GATE_SQL: &str = "SELECT (SELECT value FROM ops_counters WHERE name='overlay_migration_count') AS count,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2') AS cursor,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:open') AS open";
+pub const GATE_SQL: &str = "SELECT (SELECT value FROM ops_counters WHERE name='overlay_migration_count') AS count,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2') AS cursor,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:open') AS open,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:faults') AS faults";
+/// The open identity's fault count, written by a faulted pass and cleared ('{}') by its identity's save.
+pub const FAULTS_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:faults',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+/// An identity passed by after its faults: its row names the last fault (bounded), its marks stay for the drain.
+pub const SKIPPED_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:skipped:'||?1,?2,?3) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// Arm the cursor; a pass that finds it armed begins.
 pub const ARM_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2','',?1) ON CONFLICT(name) DO NOTHING";
 /// The identities past the cursor, distinct and ascending, each side bounded on its own identity index.
@@ -222,6 +232,10 @@ pub async fn backfill_pass(
         return Ok(report);
     };
     let open = gate["open"].as_str().map(str::to_owned);
+    let faults: Value = gate["faults"]
+        .as_str()
+        .and_then(|f| serde_json::from_str(f).ok())
+        .unwrap_or_default();
     report.cursor = Some(cursor.clone());
     let page = read(
         db,
@@ -250,16 +264,58 @@ pub async fn backfill_pass(
     let result = async {
         for (n, identity) in identities.iter().enumerate() {
             let resume = open.as_deref() == Some(identity.as_str());
-            let Some(rows) = backfill_identity(db, deadline, identity, resume, &mut report).await?
-            else {
-                report.stop = Stop::Wall;
-                return Ok::<(), String>(());
-            };
-            let finished = last_page && n + 1 == identities.len();
             let mut save = vec![Stmt {
                 sql: CURSOR_SQL.into(),
                 binds: vec![Bind::Text(identity.clone()), Bind::Int(db.now_ms() as i64)],
             }];
+            let rows = match backfill_identity(db, deadline, identity, resume, &mut report).await {
+                Ok(Some(rows)) => rows,
+                Ok(None) => {
+                    report.stop = Stop::Wall;
+                    return Ok::<(), String>(());
+                }
+                Err(error) => {
+                    // The D2-OWED lens's LOW-1: counted per identity across passes; at the bound the identity is
+                    // recorded, its marks left for the drain, and the cursor moves past it.
+                    let seen = if faults["identity"] == identity.as_str() {
+                        faults["faults"].as_u64().unwrap_or(0) as usize
+                    } else {
+                        0
+                    } + 1;
+                    let now = db.now_ms() as i64;
+                    if seen < OWED_BACKFILL_IDENTITY_FAULTS_MAX {
+                        db.run_batch(vec![Stmt {
+                            sql: FAULTS_SQL.into(),
+                            binds: vec![
+                                Bind::Text(
+                                    serde_json::json!({"identity": identity, "faults": seen})
+                                        .to_string(),
+                                ),
+                                Bind::Int(now),
+                            ],
+                        }])
+                        .await?;
+                        return Err(error);
+                    }
+                    db.log(&format!(
+                        "[owed-backfill] {identity}: the judge faulted on {seen} passes ({error}); recorded, its marks left for the drain, passed"
+                    ));
+                    let reason: String = error.chars().take(200).collect();
+                    save.push(Stmt {
+                        sql: SKIPPED_SQL.into(),
+                        binds: vec![Bind::Text(identity.clone()), Bind::Text(reason), Bind::Int(now)],
+                    });
+                    db.counters(vec![(COUNTER_SKIPPED.into(), 1)]).await;
+                    0
+                }
+            };
+            let finished = last_page && n + 1 == identities.len();
+            if faults["identity"] == identity.as_str() {
+                save.push(Stmt {
+                    sql: FAULTS_SQL.into(),
+                    binds: vec![Bind::Text("{}".into()), Bind::Int(db.now_ms() as i64)],
+                });
+            }
             if finished {
                 save.push(Stmt {
                     sql: STAMP_WRITE_SQL.into(),

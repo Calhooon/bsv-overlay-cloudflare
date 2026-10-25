@@ -458,3 +458,50 @@ async fn d2fold_medium5_the_age_repair_reaches_keyless_rows() {
     );
     assert!(!plan.iter().any(|d| d.starts_with("SCAN owed_rows") || d.starts_with("SCAN owed_dirty")), "{plan:?}");
 }
+
+fn open_deadline() -> low_app_layer::pot_hook::Deadline {
+    low_app_layer::pot_hook::Deadline::new(
+        low_app_layer::owed_backfill::OWED_BACKFILL_WALL_MS,
+        low_app_layer::owed_backfill::OWED_BACKFILL_SAVE_RESERVE_MS,
+        Box::new(|| 0),
+        Box::new(|_| Box::pin(std::future::pending())),
+    )
+}
+
+/// LOW-1: a judge that faults on the backfill's open identity for three passes is recorded, its marks left for the
+/// drain, and the cursor moves past it, so one identity cannot hold the stamp (and every later identity) back.
+#[tokio::test]
+async fn d2fold_low1_a_wedged_identity_is_recorded_and_passed_after_three_passes() {
+    use low_app_layer::owed_backfill::{self as backfill, Stop};
+    let db = Db::new();
+    seed_stranded_hop(&db, "a-wedged", "g00", &hop(1));
+    seed_stranded_hop(&db, "b-honest", "g00", &hop(2));
+    db.exec("DELETE FROM owed_dirty");
+    db.exec(&format!("INSERT INTO ops_counters(name,value) VALUES ('overlay_migration_count',{})", backfill::OWED_TRIGGERS_MIGRATION_COUNT));
+    db.exec("CREATE TRIGGER wedge BEFORE INSERT ON owed_rows WHEN NEW.identity='a-wedged' BEGIN SELECT RAISE(ABORT,'wedged'); END;");
+    assert_eq!(backfill::backfill_pass(&db, &open_deadline()).await.unwrap().stop, Stop::Armed);
+    for pass in 1..backfill::OWED_BACKFILL_IDENTITY_FAULTS_MAX {
+        assert!(
+            backfill::backfill_pass(&db, &open_deadline()).await.is_err(),
+            "pass {pass}: the fault is the pass's"
+        );
+    }
+    let report = backfill::backfill_pass(&db, &open_deadline()).await.unwrap();
+    assert_eq!(report.stop, Stop::Finished, "{report:?}");
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_rows WHERE identity='b-honest'"),
+        1,
+        "the identities after it are backfilled"
+    );
+    assert!(
+        db.int("SELECT COUNT(*) FROM owed_dirty WHERE identity='a-wedged'") > 0,
+        "its marks stand for the drain"
+    );
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_belt_state WHERE name='backfill:owed-v2:skipped:a-wedged'"),
+        1,
+        "recorded"
+    );
+    assert_eq!(db.counters.borrow()[backfill::COUNTER_SKIPPED], 1);
+    assert_eq!(db.int("SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-v2'"), 1);
+}
