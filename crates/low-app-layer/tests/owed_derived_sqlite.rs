@@ -41,6 +41,20 @@ fn schema() -> Connection {
     db
 }
 
+#[test]
+fn owed893_judge_game_indexes_are_shipped_by_the_overlay() {
+    let required = [
+        "CREATE INDEX IF NOT EXISTS idx_potparty_game_identity ON potparty_records(gameId,identity)",
+        "CREATE INDEX IF NOT EXISTS idx_evicted_party_identity_game ON potparty_records_evicted(identity,gameId,potTxid)",
+    ];
+    for sql in required {
+        assert!(
+            OVERLAY_MIGRATIONS.contains(&sql),
+            "missing migration: {sql}"
+        );
+    }
+}
+
 fn fingerprint(list: &[&str]) -> u32 {
     list.iter().fold(0u32, |total, sql| {
         total.wrapping_add(sql.as_bytes().iter().fold(0x811c_9dc5u32, |hash, byte| {
@@ -52,9 +66,9 @@ fn fingerprint(list: &[&str]) -> u32 {
 #[test]
 fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..349]), 428_073_086);
-    assert_eq!(OVERLAY_MIGRATIONS.len(), 391);
-    assert_eq!(d1::OVERLAY_MIGRATION_COUNT, 391);
-    const FINGERPRINT: u32 = 1_681_083_823;
+    assert_eq!(OVERLAY_MIGRATIONS.len(), 395);
+    assert_eq!(d1::OVERLAY_MIGRATION_COUNT, 395);
+    const FINGERPRINT: u32 = 3_324_543_731;
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT);
     assert_eq!(fingerprint(OVERLAY_MIGRATIONS), FINGERPRINT);
     for missing in 349..OVERLAY_MIGRATIONS.len() {
@@ -67,7 +81,8 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
             missing + 1
         );
     }
-    assert!(d1::migration_count_matches(391.0));
+    assert!(d1::migration_count_matches(395.0));
+    assert!(!d1::migration_count_matches(391.0));
     assert!(!d1::migration_count_matches(349.0));
     assert!(!d1::migration_count_matches(393.0));
     assert_eq!(bsv_overlay_cloudflare::derived_owed::OWED_MAX_ROWS, 500);
@@ -78,11 +93,11 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     let db = schema();
     db.execute(
         d1::MIGRATION_CERTIFY_SQL,
-        rusqlite::params![391, FINGERPRINT],
+        rusqlite::params![395, FINGERPRINT],
     )
     .unwrap();
     for (name, expected) in [
-        ("overlay_migration_count", 391.0),
+        ("overlay_migration_count", 395.0),
         ("overlay_migration_fp", f64::from(FINGERPRINT)),
     ] {
         assert_eq!(
