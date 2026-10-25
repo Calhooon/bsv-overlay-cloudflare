@@ -630,13 +630,22 @@ fn owed893_backfill_i_the_gate_and_the_counters_are_the_overlays() {
         o::WORD_INSERT,
         o::REFUSAL_DELETE,
         o::WORD_LINK_UPDATE,
+        o::SWEEP_INDEX,
+        o::UNTIPPED_INDEX,
+        o::BELT_TURN_INDEX,
+        o::DIRTY_SOURCE_KEY_INDEX,
+        o::DIRTY_SOURCE_MARKED_INDEX,
+        o::DIRTY_IDENTITY_MARKED_INDEX,
+        o::UNJUDGED_INDEX,
+        o::ROWS_GAME_INDEX,
+        o::ROWS_COUNT_INSERT,
     ] {
         assert!(held.contains(&sql), "the gate's list holds {sql}");
     }
     assert_eq!(
         list[n - 1],
-        o::JUDGED_INDEX,
-        "the figure is the block's end"
+        o::ROWS_COUNT_DELETE,
+        "the figure is the block's end (the D2-OWED fold's last migration)"
     );
     assert_eq!(
         backfill::counter_names(),
