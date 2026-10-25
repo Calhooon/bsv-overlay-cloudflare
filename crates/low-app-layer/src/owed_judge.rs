@@ -106,7 +106,10 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 mod hydrate;
 mod writers;
-pub use writers::{drain_changed, drain_identities, judge_word_write, mark_tip, MARK_TIP_SQL};
+pub use writers::{
+    drain_changed, drain_identities, judge_word_write, mark_tip, DATE_SWEEPS_SQL, MARK_TIP_SQL,
+    MARK_UNTIPPED_SQL, UNTIPPED_MARKS_PER_TIP,
+};
 pub(crate) use hydrate::hydrate_filings;
 pub use hydrate::{
     hydrate_inputs, HOPS_SQL, LINKS_SQL, PARTIES_SQL, RELEASED_SQL, REPRESENTATIVES_SQL,
@@ -389,7 +392,7 @@ pub async fn judge_with_write(
         rows.truncate(crate::owed::OWED_MAX_ROWS);
         plan.push(Stmt{sql:"DELETE FROM owed_rows WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))".into(),binds:vec![Bind::Text(id.clone()),Bind::Text(json!(games).to_string())]});
         for row in &rows {
-            plan.extend(row_statements(row, i.now_ms));
+            plan.extend(row_statements(row, i.now_ms, i.tip));
         }
         if let Some(moved) = crate::owed::moved_proof_latch_delete_bind(&i.moved_latches) {
             plan.push(Stmt {
@@ -448,7 +451,10 @@ pub async fn judge_with_write(
     Ok(report)
 }
 
-fn row_statements(row: &OwedRow, stamp: i64) -> Vec<Stmt> {
+/// `probeTip` is the tip the row was JUDGED at (NULL: judged with no tip, or an old worker's row): the reference the
+/// read's #669 freshness gate degrades a claimable sweep against (`owed_read::Snapshot::body`), as the old walk's
+/// snapshot tip (`owed_state.tip`) was; the probe's own tip stays in `facts.chainProbeTip`.
+fn row_statements(row: &OwedRow, stamp: i64, judged_tip: Option<u64>) -> Vec<Stmt> {
     let mut row = row.clone();
     let mut words = BTreeMap::new();
     for (role, key) in [
@@ -491,7 +497,7 @@ fn row_statements(row: &OwedRow, stamp: i64) -> Vec<Stmt> {
     }
     let claimable = row.facts["claimable"].as_bool().map(i64::from);
     let gate = row.facts["recoveryHeight"].as_i64();
-    let probe = row.facts["chainProbeTip"].as_i64();
+    let probe = judged_tip.map(|t| t as i64);
     let due = match row.family {
         crate::owed::OwedFamily::HopStranded => Some(stamp + 600_000),
         crate::owed::OwedFamily::Unbound
@@ -522,8 +528,6 @@ fn row_statements(row: &OwedRow, stamp: i64) -> Vec<Stmt> {
             "supersededFallback",
             "judgedAtMs",
             "spenderUnread",
-            "tipMoved",
-            "servedTip",
         ] {
             facts.remove(k);
         }
@@ -713,7 +717,7 @@ pub(crate) fn assert_fixture_roundtrip(i: &OwedInputs<'_>) {
     tx.commit().unwrap();
     let tx = new.transaction().unwrap();
     for r in &derived {
-        for stmt in row_statements(r, i.now_ms) {
+        for stmt in row_statements(r, i.now_ms, i.tip) {
             tx.execute(
                 &stmt.sql,
                 rusqlite::params_from_iter(stmt.binds.into_iter().map(bind)),
