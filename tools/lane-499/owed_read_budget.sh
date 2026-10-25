@@ -24,9 +24,28 @@ build=${OWED_READ_BUILD:-$CARGO_TARGET_DIR/owed-read-worker}
 if [ -z "${OWED_READ_BUILD:-}" ]; then
   worker-build crates/low-app-layer --release --out-dir "$build" > "$out/build.log" 2>&1
 fi
+cat > "$out/worker.mjs" <<EOF
+import worker from '$build/worker/shim.mjs'
+export default {
+  ...worker,
+  async fetch(request, env, ctx) {
+    let backgroundTasks = 0
+    const context = new Proxy(ctx, { get(target, key) {
+      if (key === 'waitUntil') return task => { backgroundTasks++; target.waitUntil(task) }
+      const value = Reflect.get(target, key, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    } })
+    const entry = typeof worker === 'function' ? new worker(context, env) : worker
+    const response = await entry.fetch(request, env, context)
+    const headers = new Headers(response.headers)
+    headers.set('x-owed-background-tasks', String(backgroundTasks))
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+  }
+}
+EOF
 cat > "$out/wrangler.toml" <<EOF
 name = "owed-read-budget"
-main = "$build/worker/shim.mjs"
+main = "$out/worker.mjs"
 compatibility_date = "2024-12-01"
 [vars]
 AUTH_ENFORCE = "false"
@@ -77,15 +96,11 @@ for ((n=0; n<120; n++)); do
   if curl --silent --fail "http://127.0.0.1:$port/health" > "$out/health.json"; then break; fi
   sleep 1
 done
-node tools/lane-731/network_tap.mjs "$inspector" owed-read > "$out/tap.log" 2>&1 &
-jobs+=("$!")
-for ((n=0; n<60; n++)); do
-  if rg -q 'TAP ATTACHED' "$out/tap.log"; then break; fi
-  sleep 1
-done
+# The budget client owns the inspector connection and enables network events;
+# the proxy accepts only one attached client at a time.
 result=0
-node tools/lane-499/owed_read_budget.mjs "http://127.0.0.1:$port" "http://127.0.0.1:$probe" | tee "$out/measurements.log" || result=$?
-# This focused tier has no courier control request. The attached inspector and
+node --experimental-websocket tools/lane-499/owed_read_budget.mjs "http://127.0.0.1:$port" "http://127.0.0.1:$probe" "$inspector" | tee "$out/measurements.log" || result=$?
+# This focused tier has no courier control request. The client's inspector and
 # D1 requests provide the positive control; any courier host is still refused.
 D1_EGRESS_MIN_SEEN=0 node tools/lane-731/egress_guard.mjs "owed-read=$out/worker.log" | tee "$out/egress.log"
 node --input-type=module - "$out/worker.log" <<'JS'
