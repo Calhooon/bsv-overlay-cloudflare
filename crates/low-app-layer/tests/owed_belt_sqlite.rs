@@ -471,7 +471,7 @@ fn owed893_belt_candidates_ride_the_belt_index() {
     assert!(
         details
             .iter()
-            .any(|d| d.contains("SEARCH owed_rows USING INDEX idx_owed_rows_belt (beltDueAtMs<?)")),
+            .any(|d| d.contains("SEARCH owed_rows USING COVERING INDEX idx_owed_rows_belt_turn (beltDueAtMs<?)")),
         "{details:?}"
     );
     assert!(

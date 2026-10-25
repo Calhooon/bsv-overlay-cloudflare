@@ -224,6 +224,8 @@ pub struct JudgeInputs {
     pub funding_unheld: HashSet<String>,
     pub join_spent_hops: HashMap<String, String>,
     pub spender_words: BTreeMap<String, Value>,
+    /// Pot outpoints whose chosen party row verifies (`sigValid = 1`): the only pot rows the belt dates (HIGH-3).
+    pub verified_pots: HashSet<String>,
     funding_seen: HashSet<String>,
     word_rows: BTreeMap<String, crate::tracker_host::stored::Row>,
     moved_latches: Vec<(String, String)>,
@@ -392,7 +394,7 @@ pub async fn judge_with_write(
         rows.truncate(crate::owed::OWED_MAX_ROWS);
         plan.push(Stmt{sql:"DELETE FROM owed_rows WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))".into(),binds:vec![Bind::Text(id.clone()),Bind::Text(json!(games).to_string())]});
         for row in &rows {
-            plan.extend(row_statements(row, i.now_ms, i.tip));
+            plan.extend(row_statements(row, i.now_ms, i.tip, Some(i)));
         }
         if let Some(moved) = crate::owed::moved_proof_latch_delete_bind(&i.moved_latches) {
             plan.push(Stmt {
@@ -451,10 +453,63 @@ pub async fn judge_with_write(
     Ok(report)
 }
 
+/// The spender a row names, in the belt's order (`owed_belt::ask_of`).
+fn named_spender(row: &OwedRow) -> Option<String> {
+    ["chainSpender", "spendingTxid", "settleTxid"]
+        .into_iter()
+        .find_map(|k| {
+            row.facts[k]
+                .as_str()
+                .filter(|t| crate::logic::valid_txid(t))
+                .map(str::to_ascii_lowercase)
+        })
+}
+
+/// When the belt may next ask the chain about this row (section 5), NULL when nothing is owed. The D2-OWED lens's
+/// HIGH-3: a row rests on VERIFIED evidence before it costs a look (a hop row on its marker's signature, a pot row on
+/// its party's `sigValid`; anyone's byte-format row is never dated), and an `unbound` row is dated only while its
+/// named spender's bytes are NOT held (held bytes are a judgement, not a question). `evidence` is the judge's inputs;
+/// `None` (the fixtures' storage round trip) reads every row as verified with nothing held.
+fn belt_due(row: &OwedRow, stamp: i64, evidence: Option<&JudgeInputs>) -> Option<i64> {
+    use crate::owed::OwedFamily;
+    let verified = if row.facts["hopTxid"].is_string() {
+        row.facts["markerVerified"] == crate::hops_view::MarkerVerification::Verified.as_str()
+    } else if row.facts["potTxid"].is_string() {
+        evidence.is_none_or(|i| i.verified_pots.contains(&row.outpoint))
+    } else {
+        true
+    };
+    if !verified {
+        return None;
+    }
+    match row.family {
+        OwedFamily::HopStranded => Some(stamp + 600_000),
+        OwedFamily::Unbound => {
+            let spender = named_spender(row)?;
+            let held = evidence.is_some_and(|i| i.spender_outputs.contains_key(&spender));
+            (!held).then_some(stamp + 300_000)
+        }
+        OwedFamily::Payout if row.facts["creditKind"] == "courier-bytes" => Some(stamp + 600_000),
+        OwedFamily::InProgress if row.facts["hopTxid"].is_string() => Some(
+            row.facts["markerCreatedAtMs"]
+                .as_i64()
+                .unwrap_or(stamp)
+                .saturating_add(crate::owed::HOP_STRANDED_AFTER_MS)
+                .max(stamp),
+        ),
+        _ => None,
+    }
+}
+
 /// `probeTip` is the tip the row was JUDGED at (NULL: judged with no tip, or an old worker's row): the reference the
 /// read's #669 freshness gate degrades a claimable sweep against (`owed_read::Snapshot::body`), as the old walk's
 /// snapshot tip (`owed_state.tip`) was; the probe's own tip stays in `facts.chainProbeTip`.
-fn row_statements(row: &OwedRow, stamp: i64, judged_tip: Option<u64>) -> Vec<Stmt> {
+fn row_statements(
+    row: &OwedRow,
+    stamp: i64,
+    judged_tip: Option<u64>,
+    evidence: Option<&JudgeInputs>,
+) -> Vec<Stmt> {
     let mut row = row.clone();
     let mut words = BTreeMap::new();
     for (role, key) in [
@@ -498,27 +553,7 @@ fn row_statements(row: &OwedRow, stamp: i64, judged_tip: Option<u64>) -> Vec<Stm
     let claimable = row.facts["claimable"].as_bool().map(i64::from);
     let gate = row.facts["recoveryHeight"].as_i64();
     let probe = judged_tip.map(|t| t as i64);
-    let due = match row.family {
-        crate::owed::OwedFamily::HopStranded => Some(stamp + 600_000),
-        crate::owed::OwedFamily::Unbound
-            if row.facts["spendingTxid"].is_string()
-                || row.facts["settleTxid"].is_string()
-                || row.facts["chainSpender"].is_string() =>
-        {
-            Some(stamp + 300_000)
-        }
-        crate::owed::OwedFamily::Payout if row.facts["creditKind"] == "courier-bytes" => {
-            Some(stamp + 600_000)
-        }
-        crate::owed::OwedFamily::InProgress if row.facts["hopTxid"].is_string() => Some(
-            row.facts["markerCreatedAtMs"]
-                .as_i64()
-                .unwrap_or(stamp)
-                .saturating_add(crate::owed::HOP_STRANDED_AFTER_MS)
-                .max(stamp),
-        ),
-        _ => None,
-    };
+    let due = belt_due(&row, stamp, evidence);
     strip_words(&mut row);
     if let Some(facts) = row.facts.as_object_mut() {
         for k in [
@@ -717,7 +752,7 @@ pub(crate) fn assert_fixture_roundtrip(i: &OwedInputs<'_>) {
     tx.commit().unwrap();
     let tx = new.transaction().unwrap();
     for r in &derived {
-        for stmt in row_statements(r, i.now_ms, i.tip) {
+        for stmt in row_statements(r, i.now_ms, i.tip, None) {
             tx.execute(
                 &stmt.sql,
                 rusqlite::params_from_iter(stmt.binds.into_iter().map(bind)),

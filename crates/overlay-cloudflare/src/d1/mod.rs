@@ -624,7 +624,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 395 to 396 for #893 (lane D2-OWED-BACKFILL): `idx_owed_rows_judged`, the scheduled drain's daily age re-mark.
 /// 396 to 398 for #893 (lane D2-OWED-FOLD, the money lens's HIGH-1): `idx_owed_rows_sweep` (a tip dates the
 /// claimable sweeps judged below it) and `idx_owed_rows_untipped` (a tipless judgement re-marked on the next tip).
-pub const OVERLAY_MIGRATION_COUNT: usize = 398;
+/// 398 to 399 for #893 (lane D2-OWED-FOLD, HIGH-3): `idx_owed_rows_belt_turn`, the belt's round-robin by identity.
+pub const OVERLAY_MIGRATION_COUNT: usize = 399;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2365,6 +2366,7 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // #893 (lane D2-OWED-FOLD): the money lens's folds, appended.
     crate::derived_owed::SWEEP_INDEX,
     crate::derived_owed::UNTIPPED_INDEX,
+    crate::derived_owed::BELT_TURN_INDEX,
 ];
 
 // =============================================================================
