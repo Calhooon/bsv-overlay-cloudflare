@@ -14937,8 +14937,9 @@ pub(crate) mod tests {
                 .contains("owed_schedule_deferred(env, identity_lc, deferred).await"),
             "spent-pot pot-changed must schedule a later walk and push"
         );
+        // bsv-low #893 section 5: the actor's alarm is the belt's tick; the deferred walk is retired
         assert!(include_str!("board_view.rs").contains("async fn alarm(&self)"));
-        assert!(include_str!("board_view.rs").contains("owed_deferred_walk_and_push"));
+        assert!(include_str!("board_view.rs").contains("crate::owed_belt::tick_env(&self.env)"));
     }
 
     #[test]

@@ -35,22 +35,6 @@ const FRESH_MS: u64 = 10_000;
 const CURSOR_KEY_BASE: u32 = 2_000_000;
 const CURSOR_SLOTS: usize = 32;
 
-/// Storage::put_multiple serializes a STRUCT as an object; a serde_json map becomes a JS Map
-/// whose properties the storage API does not store.
-#[derive(serde::Serialize)]
-struct OwedDeferredArm<'a> {
-    #[serde(rename = "owed-identity")]
-    identity: &'a str,
-    #[serde(rename = "owed-due")]
-    due: i64,
-    #[serde(rename = "owed-retry")]
-    retry: bool,
-    /// When the alarm fires: `due` (the reservation's key, the window's end) unless a dropped walk's hand-off asked
-    /// for the drop itself (the second FIX-800 delta lens's LOW-C).
-    #[serde(rename = "owed-fire")]
-    fire: i64,
-}
-
 #[durable_object]
 pub struct BoardView {
     state: State,
@@ -127,149 +111,21 @@ impl BoardView {
 
     async fn serve_fetch(&self, req: Request) -> Result<Response> {
         let url = req.url()?;
-        // The second FIX-800 delta lens's MEDIUM-B: a hook shed while this actor's alarm is armed. A walk in flight
-        // keeps the note (`owed-dirty`, read by the walk after its write); the answer tells the hook whether to nudge.
-        if req.path() == "/owed-deferred-note" {
-            let identity = url
-                .query_pairs()
-                .find(|(k, _)| k == "identity")
-                .map(|(_, v)| v.to_string())
-                .unwrap_or_default();
-            if !crate::logic::valid_identity(&identity) {
-                return Response::error("invalid owed note", 400);
-            }
+        // bsv-low #893 section 5: the belt's singleton actor (`owed_belt::OWED_BELT_ACTOR`). The scheduled pass asks
+        // it on every cron (the watchdog): an alarm already set is kept, a lost one is set to fire at once.
+        if req.path() == "/owed-belt-arm" {
             let storage = self.state.storage();
-            let held = storage.get::<String>("owed-identity").await?;
-            let due = storage.get::<i64>("owed-due").await?;
-            let started = storage.get::<bool>("owed-started").await?.unwrap_or(false);
-            let note = crate::owed::owed_alarm_note(
-                held.as_deref() == Some(identity.as_str()) && due.is_some(),
-                started,
-            );
-            if note == crate::owed::OwedAlarmNote::Noted {
-                storage.put("owed-dirty", true).await?;
-            }
-            return Response::ok(note.word());
-        }
-        // Separate object names from the board/results actors; no cache or polling path reaches this arm.
-        if req.path() == "/owed-deferred" {
-            let identity = url
-                .query_pairs()
-                .find(|(k, _)| k == "identity")
-                .map(|(_, v)| v.to_string())
-                .unwrap_or_default();
-            let due = url
-                .query_pairs()
-                .find(|(k, _)| k == "due")
-                .and_then(|(_, v)| v.parse::<i64>().ok())
-                .unwrap_or(0);
-            // the alarm's fire time, never later than its reservation's key
-            let fire = url
-                .query_pairs()
-                .find(|(k, _)| k == "fire")
-                .and_then(|(_, v)| v.parse::<i64>().ok())
-                .map_or(due, |f| f.min(due));
-            if !crate::logic::valid_identity(&identity)
-                || due
-                    <= (Date::now().as_millis() as i64)
-                        .saturating_sub(crate::owed::OWED_RECOMPUTE_RATE_WINDOW_MS)
-            {
-                return Response::error("invalid owed alarm", 400);
-            }
-            let storage = self.state.storage();
-            let previous = storage.get::<i64>("owed-due").await?;
-            let consumed = storage.get::<i64>("owed-consumed-due").await?.unwrap_or(0);
-            if due <= consumed
-                || previous.is_some_and(|old| due < old)
-                || (previous == Some(due)
-                    && storage.get::<bool>("owed-started").await?.unwrap_or(false))
-            {
-                if url.query_pairs().any(|(k, v)| k == "read" && v == "1") {
-                    return Response::error("first read reservation already consumed", 503);
-                }
-                return Response::ok("already run");
-            }
-            if previous != Some(due) {
-                // One actor per identity/isolate: a newer window replaces a carried arm, never stacks it.
-                storage.delete_all().await?;
-                storage
-                    .put("owed-consumed-due", consumed.max(previous.unwrap_or(0)))
-                    .await?;
-                storage
-                    .put_multiple(OwedDeferredArm {
-                        identity: &identity,
-                        due,
-                        retry: false,
-                        fire,
-                    })
-                    .await?;
-                storage
-                    .set_alarm((fire - Date::now().as_millis() as i64).max(0))
-                    .await?;
-            }
-            let retry = storage.get::<bool>("owed-retry").await?.unwrap_or(false);
-            if url.query_pairs().any(|(k, v)| k == "read" && v == "1") {
-                // The first read consumes the alarm's reservation. Keep the claim until the deadline alarm
-                // clears it; repeated faults and a concurrently delivered alarm cannot run it twice.
-                if storage.get::<i64>("owed-due").await? != Some(due) {
-                    return Response::error("first read reservation already consumed", 503);
-                }
-                storage
-                    .set_alarm((due - Date::now().as_millis() as i64).max(0))
-                    .await?;
-                storage.put("owed-started", true).await?;
-                crate::owed::note_recompute_deferred();
-                let db = self.env.d1("OVERLAY_DB")?;
-                let (walked, d1) = crate::d1_ledger::scoped(crate::routes::owed_compute_on_read(
-                    &self.env,
-                    &db,
-                    &identity,
-                    "read-first",
-                    None,
-                ))
-                .await;
-                crate::d1_ledger::record(crate::routes::OWED_RECOMPUTE_LEDGER_KEY, d1);
-                match walked {
-                    Ok(snapshot) => {
-                        // the second FIX-800 delta lens's MEDIUM-B: a hook shed during this walk is marked again
-                        if storage.get::<bool>("owed-dirty").await?.unwrap_or(false) {
-                            crate::routes::owed_remark_after_alarm(&db, &identity).await;
-                        }
-                        // Consuming the alarm's slot must retain its push to the identity's other devices.
-                        let env = self.env.clone();
-                        let id = identity.clone();
-                        let event = crate::owed::owed_changed_event_body(
-                            &identity,
-                            "read-first",
-                            snapshot.0.len(),
-                            snapshot.2,
-                        );
-                        self.state.wait_until(async move {
-                            crate::internal_events::first_party_push(&env, &id, event).await;
-                        });
-                        return Response::from_json(&snapshot);
-                    }
-                    Err(response) => {
-                        crate::owed::note_recompute_deferred_faulted();
-                        self.owed_clear_consumed_arm().await?;
-                        if let Err(e) = self
-                            .owed_rearm_faulted_deferred(&identity, due, retry)
-                            .await
-                        {
-                            crate::owed::note_recompute_arm_failed();
-                            return Err(e);
-                        }
-                        return response;
-                    }
-                }
-            }
+            storage.put("owed-belt", true).await?;
             if storage.get_alarm().await?.is_none() {
-                let fire_at = storage.get::<i64>("owed-fire").await?.unwrap_or(due);
-                storage
-                    .set_alarm((fire_at - Date::now().as_millis() as i64).max(0))
-                    .await?;
+                storage.set_alarm(0).await?;
+                return Response::ok("armed");
             }
-            return Response::ok("armed");
+            return Response::ok("held");
+        }
+        // The deferred owed walk is retired (#893: the read is one lookup, the belt asks the chain); a stale caller
+        // is answered, never served the board.
+        if req.path() == "/owed-deferred" || req.path() == "/owed-deferred-note" {
+            return Response::error("the deferred owed walk is retired", 410);
         }
         // S3 second iteration: ONE actor class, two view kinds. `/results`
         // instances are NAMED `results:<identity>` (the route resolves the
@@ -337,131 +193,35 @@ impl BoardView {
         })
         .await
     }
+    /// bsv-low #893 section 5: this actor's alarm is the belt's tick. The next alarm is set BEFORE the tick runs, so
+    /// a tick that faults or throws still leaves the belt armed; the scheduled pass's arm is the watchdog behind it.
+    /// Any other actor's alarm (a deferred walk armed before the retirement) clears its storage and ends.
     async fn serve_alarm(&self) -> Result<Response> {
-        if self.owed_alarm_not_due().await? {
-            return Response::ok("owed retry not due");
-        }
         let storage = self.state.storage();
-        if storage.get::<bool>("owed-started").await?.unwrap_or(false) {
-            self.owed_clear_consumed_arm().await?;
-            return Response::ok("already run");
-        }
-        let Some(identity) = storage.get::<String>("owed-identity").await? else {
+        if !storage.get::<bool>("owed-belt").await?.unwrap_or(false) {
             storage.delete_all().await?;
-            return Response::ok("no owed alarm");
-        };
-        // Claim durably BEFORE walking: an alarm retry must not buy another recompute past ceiling + one.
-        let due = storage.get::<i64>("owed-due").await?.unwrap_or(0);
-        let retry = storage.get::<bool>("owed-retry").await?.unwrap_or(false);
-        storage.put("owed-started", true).await?;
-        // the second FIX-800 delta lens's MEDIUM-B: the walk reads `owed-dirty` after its write, before its push
-        let walked = crate::routes::owed_deferred_walk_and_push(&self.env, &identity, || async {
-            self.state
-                .storage()
-                .get::<bool>("owed-dirty")
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or(false)
-        })
-        .await;
-        if walked.is_err() {
-            crate::owed::note_recompute_deferred_faulted();
+            return Response::ok("retired deferred owed alarm");
         }
-        self.owed_clear_consumed_arm().await?;
-        if let Err(e) = walked {
-            console_warn!("[owed] deferred walk faulted: {e}");
-            if let Err(e) = self
-                .owed_rearm_faulted_deferred(&identity, due, retry)
-                .await
-            {
-                crate::owed::note_recompute_arm_failed();
-                return Err(e);
+        storage
+            .set_alarm(crate::owed_belt::OWED_BELT_TICK_MS)
+            .await?;
+        match crate::owed_belt::tick_env(&self.env).await {
+            Ok(report) => Response::from_json(&serde_json::json!({
+                "candidates": report.candidates,
+                "asked": report.asked,
+                "found": report.found,
+                "rearmed": report.rearmed,
+                "calls": report.calls,
+            })),
+            Err(e) => {
+                console_warn!("[owed-belt] tick faulted: {e}");
+                Response::ok("owed belt tick faulted")
             }
-            return Response::ok(if retry {
-                "owed retry abandoned"
-            } else {
-                "owed retry armed for next window"
-            });
         }
-        Response::ok("owed refreshed")
     }
 }
 
 impl BoardView {
-    async fn owed_clear_consumed_arm(&self) -> Result<()> {
-        let storage = self.state.storage();
-        // Retain the consumed deadline until it can no longer be accepted; set the cleanup alarm after delete_all.
-        let now = Date::now().as_millis() as i64;
-        let due = storage.get::<i64>("owed-due").await?.unwrap_or(now);
-        let expiry = due
-            .max(now)
-            .saturating_add(crate::owed::OWED_RECOMPUTE_RATE_WINDOW_MS);
-        storage.delete_all().await?;
-        // Retain only the consumed deadline so a late request cannot reclaim it; a newer window may arm.
-        storage.put("owed-consumed-due", due).await?;
-        if let Err(e) = storage.set_alarm(expiry.saturating_sub(now)).await {
-            crate::owed::note_recompute_arm_failed();
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    async fn owed_alarm_not_due(&self) -> Result<bool> {
-        let storage = self.state.storage();
-        // the alarm's fire time (a hand-off's drop, LOW-C), else its reservation's `due`
-        let fire = storage.get::<i64>("owed-fire").await?;
-        let due = match storage.get::<i64>("owed-due").await? {
-            Some(due) => fire.map_or(due, |f| f.min(due)),
-            // A duplicate old alarm cannot erase the tombstone while its consumed deadline is still valid.
-            None => storage
-                .get::<i64>("owed-consumed-due")
-                .await?
-                .unwrap_or(0)
-                .saturating_add(crate::owed::OWED_RECOMPUTE_RATE_WINDOW_MS),
-        };
-        let now = Date::now().as_millis() as i64;
-        if due > now {
-            // A duplicate delivery of the old alarm must not consume its later-window retry.
-            storage.set_alarm(due - now).await?;
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    async fn owed_rearm_faulted_deferred(
-        &self,
-        identity: &str,
-        due: i64,
-        retry: bool,
-    ) -> Result<()> {
-        if retry {
-            crate::owed::note_recompute_deferred_abandoned();
-            return Ok(());
-        }
-        let next = crate::owed::owed_fault_retry_due(due, Date::now().as_millis() as i64);
-        let storage = self.state.storage();
-        let armed = async {
-            storage
-                .put_multiple(OwedDeferredArm {
-                    identity,
-                    due: next,
-                    retry: true,
-                    fire: next,
-                })
-                .await?;
-            storage
-                .set_alarm((next - Date::now().as_millis() as i64).max(0))
-                .await?;
-            Ok(())
-        }
-        .await;
-        if armed.is_err() {
-            storage.delete_all().await?;
-        }
-        armed
-    }
-
     /// S3 — per-identity `/results` with the same SWR contract as the board
     /// (fresh ≤10 s from memory; stale serves instantly while one arrival
     /// refreshes; failed refresh serves held). Keyed by `after` page.

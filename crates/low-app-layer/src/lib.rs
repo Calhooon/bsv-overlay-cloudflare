@@ -151,6 +151,7 @@ pub mod lane_attest;
 pub mod live_view;
 pub mod logic;
 pub mod owed;
+pub mod owed_belt;
 pub mod owed_cursor;
 pub mod owed_judge;
 pub mod owed_read;
@@ -299,6 +300,14 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
             Some(Err(error)) => worker::console_warn!("[owed] scheduled drain failed: {error}"),
             None => worker::console_warn!("[owed] scheduled drain reached its wall"),
         }
+        // bsv-low #893 section 5: the belt's watchdog. Every cron asks the belt actor, which sets its alarm when none
+        // is set, so an alarm the platform lost costs at most one cron.
+        if let Err(error) = meter_owed
+            .phase("owed.belt_arm", owed_belt::arm(&env_owed))
+            .await
+        {
+            worker::console_warn!("[owed-belt] watchdog arm failed: {error}");
+        }
         pass_meter::end_task(&meter_owed, routes::D1Sql::of(&env_owed).ok().as_ref()).await;
     });
     let tracker: pot_hook::Detached = Box::pin(async move {
@@ -440,6 +449,11 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
     if req.method() == worker::Method::Post && req.path() == "/internal/lobby-changed" {
         return internal_events::lobby_changed(req, &env).await;
+    }
+    // bsv-low #893 section 5: the operator's (and the budget tier's) one belt tick on demand, bearer INTERNAL_TOKEN;
+    // the same `owed_belt::tick` the alarm runs, under this request's D1 ledger.
+    if req.method() == worker::Method::Post && req.path() == "/internal/owed-belt-tick" {
+        return owed_belt::lever(req, &env).await;
     }
     // bsv-low W4 (2026-09-03): the tower watchdog's population — unspent pots
     // with an admitted refund-backup marker, bearer-gated like the webhooks.
