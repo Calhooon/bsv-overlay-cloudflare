@@ -66,9 +66,9 @@ fn fingerprint(list: &[&str]) -> u32 {
 #[test]
 fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..349]), 428_073_086);
-    assert_eq!(OVERLAY_MIGRATIONS.len(), 395);
-    assert_eq!(d1::OVERLAY_MIGRATION_COUNT, 395);
-    const FINGERPRINT: u32 = 3_324_543_731;
+    assert_eq!(OVERLAY_MIGRATIONS.len(), 396);
+    assert_eq!(d1::OVERLAY_MIGRATION_COUNT, 396);
+    const FINGERPRINT: u32 = 2_429_627_563;
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT);
     assert_eq!(fingerprint(OVERLAY_MIGRATIONS), FINGERPRINT);
     for missing in 349..OVERLAY_MIGRATIONS.len() {
@@ -81,7 +81,8 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
             missing + 1
         );
     }
-    assert!(d1::migration_count_matches(395.0));
+    assert!(d1::migration_count_matches(396.0));
+    assert!(!d1::migration_count_matches(395.0));
     assert!(!d1::migration_count_matches(391.0));
     assert!(!d1::migration_count_matches(349.0));
     assert!(!d1::migration_count_matches(393.0));

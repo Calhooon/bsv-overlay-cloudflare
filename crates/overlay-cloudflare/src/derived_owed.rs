@@ -43,6 +43,9 @@ pub const RELEASED_HOP_IDENTITY_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_re
 pub const GATE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_gate ON owed_rows(gateHeight) WHERE gateHeight IS NOT NULL";
 /// The belt visits only rows that owe the chain a dated question.
 pub const BELT_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_belt ON owed_rows(beltDueAtMs) WHERE beltDueAtMs IS NOT NULL";
+/// The scheduled drain's daily re-judge of rows older than 24 h (risk 8.2's third repair); NULL is an old worker's row,
+/// which the backfill rewrites.
+pub const JUDGED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_judged ON owed_rows(judgedAtMs) WHERE judgedAtMs IS NOT NULL";
 /// Old workers delete an identity's rows whole; their word joins must disappear in that statement too.
 pub const ROW_DELETE: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_delete_words AFTER DELETE ON owed_rows BEGIN DELETE FROM owed_row_words WHERE identity=OLD.identity AND outpoint=OLD.outpoint; END";
 

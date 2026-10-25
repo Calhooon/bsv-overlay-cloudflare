@@ -621,7 +621,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// chain-event feed (`chain_feed::CREATE`). Overlay-only: no other service reads it. Follows PR 151's 347 and 348.
 /// 349 to 395 for #893: owed query keys, word joins, released-hop evidence, belt cursors, dirty triggers
 /// (word subjects split for D1's compound limit) and the two game-bounded hydration indexes.
-pub const OVERLAY_MIGRATION_COUNT: usize = 395;
+/// 395 to 396 for #893 (lane D2-OWED-BACKFILL): `idx_owed_rows_judged`, the scheduled drain's daily age re-mark.
+pub const OVERLAY_MIGRATION_COUNT: usize = 396;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2357,6 +2358,8 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // #893: game-bounded hydration, appended as independent migrations to the unshipped block.
     "CREATE INDEX IF NOT EXISTS idx_potparty_game_identity ON potparty_records(gameId,identity)",
     "CREATE INDEX IF NOT EXISTS idx_evicted_party_identity_game ON potparty_records_evicted(identity,gameId,potTxid)",
+    // #893 (lane D2-OWED-BACKFILL): the daily age re-mark's range over judged rows.
+    crate::derived_owed::JUDGED_INDEX,
 ];
 
 // =============================================================================

@@ -38,9 +38,6 @@ impl Db {
                 );
             }
         }
-        for sql in judge::REQUIRED_GAME_INDEXES {
-            conn.execute_batch(sql).unwrap();
-        }
         Self {
             conn: RefCell::new(conn),
             batches: RefCell::new(Vec::new()),

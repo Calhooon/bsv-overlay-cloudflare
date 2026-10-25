@@ -508,6 +508,7 @@ ci-d1-board:
 ci-d1-budget:
 	@if [ "$${OWED_READ_ONLY:-0}" = "1" ]; then exec bash tools/lane-499/owed_read_budget.sh; fi; \
 	if [ "$${OWED_BELT_ONLY:-0}" = "1" ]; then exec bash tools/lane-893/owed_belt_tick.sh; fi; \
+	if [ "$${OWED_BACKFILL_ONLY:-0}" = "1" ]; then exec bash tools/lane-893/owed_backfill_pass.sh; fi; \
 	set -e; \
 	B=$${LANE_BASE:-8791}; PA=$$((B+9)); PO=$$((B+10)); PD=$$((B+11)); PM=$$((B+12)); \
 	IA=$$((B+13)); IO=$$((B+14)); ID=$$((B+15)); PR=$$((B+16)); IR=$$((B+17)); PS=$$((B+18)); \

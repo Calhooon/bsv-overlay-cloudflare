@@ -2744,7 +2744,7 @@ mod pins {
             !sched[tracker_at..].contains("chain_events::run("),
             "the tracker task no longer runs the intake"
         );
-        assert_eq!(crate::pass_meter::SCHEDULED_TASKS, 4);
+        assert_eq!(crate::pass_meter::SCHEDULED_TASKS, 5);
         let this = code(include_str!("chain_events.rs"));
         let run = &this[this.find("pubasyncfnrun(env:&worker::Env)").expect("run")..];
         let pass = &run[run.find("letpass=async{").unwrap()..];
