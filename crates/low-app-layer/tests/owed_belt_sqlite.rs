@@ -25,6 +25,7 @@ struct Db {
     batches: RefCell<Vec<Vec<Stmt>>>,
     counters: RefCell<BTreeMap<String, u64>>,
     now: Cell<u64>,
+    tip: Cell<Option<u64>>,
 }
 impl Db {
     fn new() -> Self {
@@ -45,6 +46,7 @@ impl Db {
             batches: RefCell::new(Vec::new()),
             counters: RefCell::new(BTreeMap::new()),
             now: Cell::new(NOW),
+            tip: Cell::new(Some(900_000)),
         }
     }
     fn exec(&self, sql: &str) {
@@ -116,7 +118,7 @@ impl SqlPort for Db {
 }
 impl JudgeDb for Db {
     fn tip(&self) -> Option<u64> {
-        Some(900_000)
+        self.tip.get()
     }
     async fn word_views(
         &self,
@@ -566,4 +568,33 @@ fn owed893_belt_counters_are_seeded_and_served_by_the_overlay() {
         view["bounds"]["tickMs"].as_i64(),
         Some(belt::OWED_BELT_TICK_MS)
     );
+}
+
+#[tokio::test]
+async fn owed893_belt_a_tick_without_a_chain_tip_asks_nothing_and_moves_no_date() {
+    let db = seeded().await;
+    let fake = Fake::default();
+    *fake.default_spent.borrow_mut() = Some((404, b"{}".to_vec()));
+    db.tip.set(None);
+    let report = belt::tick(&db, &fake).await.unwrap();
+    assert!(report.no_tip, "{report:?}");
+    assert_eq!(
+        fake.calls.borrow().len(),
+        0,
+        "the judge refuses every find without a tip: no courier call is spent on one"
+    );
+    for n in 0..64 {
+        assert_eq!(
+            due_of(&db, n),
+            Some(NOW as i64 - 100_000 + n as i64),
+            "hop {n}: still due"
+        );
+        assert_eq!(memo_of(&db, n), 0);
+    }
+    db.tip.set(Some(900_000));
+    let next = belt::tick(&db, &fake).await.unwrap();
+    assert_eq!((next.asked, next.found), (8, 8), "{next:?}");
+    for n in 0..8 {
+        assert_eq!(memo_of(&db, n), 1, "the first eight by due time");
+    }
 }
