@@ -671,34 +671,19 @@ pub async fn tip_changed(mut req: Request, env: &Env, ctx: &Context) -> Result<R
     // the overlay's block-event pass, off the critical path (the webhook answers now)
     let env2 = env.clone();
     ctx.wait_until(async move { forward_tip_to_overlay(env2, height, announced_hash).await });
-    // bsv-low #469 (the gate's HIGH-4): the tip flips the recovery gate — every identity party to an unspent pot
-    // whose recovery height this tip has reached is marked STALE; its next read of `/owed` recomputes (the page
-    // re-reads on the tip event it receives on the same room).
-    let env3 = env.clone();
-    ctx.wait_until(async move {
-        let Ok(db) = env3.d1("OVERLAY_DB") else {
-            return;
-        };
-        crate::routes::owed_mark_stale(
-            &db,
-            crate::owed::OWED_STALE_ON_TIP_SQL,
-            &[worker::wasm_bindgen::JsValue::from_f64(height as f64)],
-            "tip",
-        )
-        .await;
-        // bsv-low #669: the twin for HOP-STRANDED rows. A non-LOW competitor's confirming block fires no
-        // pot-changed / hop-changed / tx-word hook, so the pot gate above names no stranded-hop identity and its
-        // sweep claim stays frozen at the compute tip. This marks stale exactly the identities holding a live
-        // claimable stranded hop (no bind: the set is the derived rows), so the next read / the #648 deferred alarm
-        // re-probes the chain at the new tip and re-points the hop to spent-elsewhere.
-        crate::routes::owed_mark_stale(
-            &db,
-            crate::owed::OWED_STALE_ON_TIP_HOPS_SQL,
-            &[],
-            "tip-hops",
-        )
-        .await;
-    });
+    let judge = crate::owed_judge::D1Judge::new(
+        env,
+        Some(height),
+        crate::routes::written_off_before_ms_env(env),
+    )?;
+    match crate::owed_judge::mark_tip(&judge, height).await {
+        Ok(report) => {
+            for (_, error) in report.faults {
+                console_log!("[owed] tip judgement deferred: {error}");
+            }
+        }
+        Err(error) => console_log!("[owed] tip marking failed: {error}"),
+    }
     Response::from_json(&json!({ "ok": true, "room": TIP_ROOM, "height": height }))
 }
 
@@ -1002,7 +987,7 @@ mod tests {
     /// log line, no count: eleven identities kept their owed rows until the read cadence.
     /// To red: ship one body from `hop_changes`, or `break` at the cap again.
     #[test]
-    fn nineteen_identities_in_one_hop_flush_all_reach_the_owed_recompute() {
+    fn nineteen_identities_in_one_hop_flush_reach_the_bounded_judge() {
         use bsv_overlay_cloudflare::hop_changes;
         assert_eq!(
             hop_changes::HOP_CHANGED_CHUNK,
@@ -1087,13 +1072,13 @@ mod tests {
         )));
         assert!(
             handler.contains(&squash(
-                "crate::pot_hook::apply_hop_changed(&store, &identities)"
+                "crate::owed_judge::drain_identities(&judge, &identities, \"hop-changed\")"
             )),
-            "the stale mark runs over every parsed identity (one batch, E649 L4)"
+            "the handler drains marks of the parsed identities"
         );
         assert!(
-            handler.contains(&squash("for id in ids {")),
-            "and so does the recompute"
+            !handler.contains("owed_recompute"),
+            "the hook has no identity-wide walk"
         );
         assert!(
             handler.contains(&squash(

@@ -656,7 +656,7 @@ fn i757_the_handler_runs_these_steps() {
         "event_hints(&mut state, kind, held || raw_bytes, callback, now);",
         "let pushed = pushed_proof(txid, callback);",
         "stored::project(old.as_ref(), &state, now, legacy)",
-        "stored::write(env, &row)",
+        "crate::owed_judge::judge_word_write(&judge, &row)",
     ] {
         assert!(held.contains(call), "event_held lost {call}");
     }

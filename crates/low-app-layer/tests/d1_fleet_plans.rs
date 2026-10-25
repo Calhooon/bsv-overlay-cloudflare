@@ -173,7 +173,7 @@ fn hot_routes_never_scan_fleet_tables() {
         ),
         (
             "/internal/tip-changed tip mark",
-            low_app_layer::owed::OWED_STALE_ON_TIP_SQL.to_string(),
+            low_app_layer::owed_judge::MARK_TIP_SQL.to_string(),
         ),
         (
             "/health/invariants networkSeenTotal",

@@ -460,7 +460,7 @@ pub struct Stmt {
 }
 
 impl Stmt {
-    fn new(sql: impl Into<String>, binds: Vec<Bind>) -> Self {
+    pub(crate) fn new(sql: impl Into<String>, binds: Vec<Bind>) -> Self {
         Stmt {
             sql: sql.into(),
             binds,
@@ -1683,6 +1683,7 @@ pub(crate) mod tests {
         pub batches: Cell<u32>,
         pub stmts: Cell<u32>,
         pub now: Cell<u64>,
+        pub recorded: RefCell<Vec<Vec<Stmt>>>,
         pub counted: RefCell<Vec<(String, u64)>>,
         pub lines: RefCell<Vec<String>>,
     }
@@ -1705,6 +1706,7 @@ pub(crate) mod tests {
                 batches: Cell::new(0),
                 stmts: Cell::new(0),
                 now: Cell::new(1_000_000),
+                recorded: RefCell::default(),
                 counted: RefCell::default(),
                 lines: RefCell::default(),
             }
@@ -1756,8 +1758,15 @@ pub(crate) mod tests {
         }
     }
 
+    impl crate::owed_judge::JudgeDb for SqliteSql {
+        fn tip(&self) -> Option<u64> { Some(900_000) }
+        async fn word_views(&self, rows: &std::collections::BTreeMap<String, crate::tracker_host::stored::Row>) -> Result<std::collections::BTreeMap<String, Value>, String> { Ok(rows.iter().map(|(k,v)|(k.clone(),v.view())).collect()) }
+        async fn canonical_root(&self, _: u64) -> Option<String> { None }
+        async fn push(&self, identity: &str, _: Value) { self.lines.borrow_mut().push(format!("owed-changed {identity}")); }
+    }
     impl SqlPort for SqliteSql {
         async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+            self.recorded.borrow_mut().push(stmts.clone());
             if stmts.is_empty() {
                 return Ok(Vec::new());
             }
@@ -2604,7 +2613,7 @@ pub(crate) mod tests {
             ),
             (
                 "internal_hop_changed",
-                "\"[hop-changed] answered in {ms} ms, recompute detached ({} identities)\"",
+                "\"[hop-changed] answered in {ms} ms, bounded judgement ({} identities)\"",
             ),
         ] {
             let h = routes_item(&format!("pub(crate) async fn {name}("));

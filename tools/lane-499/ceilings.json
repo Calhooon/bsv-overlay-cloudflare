@@ -75,6 +75,22 @@
       },
       "censusKey": "/owed"
     },
+    "owed-judge-filing": {
+      "route": "POST /record?kind=potrefund: the verified filing core, with both seats judged in the source batch on the shared fleet plus the 250-result/270-hop fixture",
+      "measured": {
+        "reads": 118,
+        "writes": 36,
+        "stmts": 59,
+        "maxReads": 7
+      },
+      "ceiling": {
+        "reads": 177,
+        "writes": 38,
+        "stmts": 61,
+        "maxReads": 11
+      },
+      "censusKey": null
+    },
     "owed-served-read": {
       "route": "/owed?identity=A: a served read",
       "measured": {

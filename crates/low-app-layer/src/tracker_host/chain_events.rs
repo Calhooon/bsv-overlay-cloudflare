@@ -2727,7 +2727,10 @@ mod pins {
             .find("lettracker:pot_hook::Detached")
             .expect("the tracker task");
         assert!(intake_at < tracker_at);
-        let intake = &sched[intake_at..tracker_at];
+        let intake_end = sched[intake_at..]
+            .find("letenv_owed=")
+            .map_or(tracker_at, |at| intake_at + at);
+        let intake = &sched[intake_at..intake_end];
         assert!(intake.contains("tracker_host::chain_events::run(&env_intake)"));
         for theirs in [
             "ensure_latch_columns",
@@ -2741,7 +2744,7 @@ mod pins {
             !sched[tracker_at..].contains("chain_events::run("),
             "the tracker task no longer runs the intake"
         );
-        assert_eq!(crate::pass_meter::SCHEDULED_TASKS, 3);
+        assert_eq!(crate::pass_meter::SCHEDULED_TASKS, 4);
         let this = code(include_str!("chain_events.rs"));
         let run = &this[this.find("pubasyncfnrun(env:&worker::Env)").expect("run")..];
         let pass = &run[run.find("letpass=async{").unwrap()..];

@@ -152,13 +152,27 @@ async fn owed893_scheduled_drain_wanted_first_and_sixty_four_bound() {
         db.seed_game(&format!("g{n:02}"), &format!("p{n}"));
     }
     db.exec("UPDATE owed_dirty SET markedAtMs=1; INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES('owner','g79','wanted','owner',9999);");
-    let r = judge::drain_dirty(&db, 64).await.unwrap();
+    let r = judge::drain_dirty(&db, usize::MAX).await.unwrap();
     assert!(r.faults.is_empty(), "{:?}", r.faults);
     assert_eq!(r.subjects, 64);
     assert_eq!(db.count("owed_rows"), 64);
-    let wanted: i64 = db.conn.borrow().query_row("SELECT COUNT(*) FROM owed_rows WHERE gameId='g79'", [], |r| r.get(0)).unwrap();
+    let wanted: i64 = db
+        .conn
+        .borrow()
+        .query_row(
+            "SELECT COUNT(*) FROM owed_rows WHERE gameId='g79'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(wanted, 1, "wanted must precede old ordinary work");
-    let left: i64 = db.conn.borrow().query_row("SELECT COUNT(DISTINCT gameId) FROM owed_dirty", [], |r| r.get(0)).unwrap();
+    let left: i64 = db
+        .conn
+        .borrow()
+        .query_row("SELECT COUNT(DISTINCT gameId) FROM owed_dirty", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
     assert_eq!(left, 16);
 }
 
@@ -631,4 +645,117 @@ async fn owed893_rows_store_query_keys_and_word_references_without_duplicating_w
             ("spender".into(), pay)
         ]
     );
+}
+
+#[tokio::test]
+async fn owed893_word_event_judges_sixteen_of_forty_marked_subjects() {
+    let db = Db::new();
+    let word_txid = "ab".repeat(32);
+    for n in 0..40 {
+        let game = format!("g{n:02}");
+        let pot = format!("{n:064x}");
+        db.seed_game(&game, &pot);
+        db.conn.borrow().execute("INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs) VALUES('owner',?1,'unbound',?2,'{}',0)", rusqlite::params![format!("{pot}:0"), game]).unwrap();
+        db.conn.borrow().execute("INSERT INTO owed_row_words(identity,outpoint,role,txid) VALUES('owner',?1,'settle',?2)", rusqlite::params![format!("{pot}:0"), word_txid]).unwrap();
+    }
+    db.exec("DELETE FROM owed_dirty");
+    let row = serde_json::from_value(
+        json!({"txid":word_txid,"word":"seen","tier":"courier","updated_at":1_790_000_000}),
+    )
+    .unwrap();
+    let report = judge::judge_word_write(&db, &row).await.unwrap();
+    assert!(report.faults.is_empty(), "{:?}", report.faults);
+    assert_eq!(report.subjects, 16);
+    assert_eq!(db.pushes.borrow().len(), 16);
+    assert_eq!(db.count("owed_dirty"), 24);
+    let word: String = db
+        .conn
+        .borrow()
+        .query_row(
+            "SELECT word FROM tx_words WHERE txid=?1",
+            [&word_txid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(word, "seen");
+    assert!(db
+        .batches
+        .borrow()
+        .iter()
+        .any(|b| b[0].sql == low_app_layer::tracker_host::stored::UPSERT));
+}
+
+#[tokio::test]
+async fn owed893_tip_marks_seek_gate_index_and_judge_is_bounded() {
+    let db = Db::new();
+    for n in 0..42 {
+        let game = format!("g{n:02}");
+        let pot = format!("{n:064x}");
+        db.seed_game(&game, &pot);
+        let gate = if n < 40 {
+            Some(900_000)
+        } else if n == 40 {
+            Some(900_001)
+        } else {
+            None
+        };
+        db.conn.borrow().execute("INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs,gateHeight) VALUES('owner',?1,'unbound',?2,'{}',0,?3)", rusqlite::params![format!("{pot}:0"), game, gate]).unwrap();
+    }
+    db.exec("DELETE FROM owed_dirty");
+    {
+        let conn = db.conn.borrow();
+        let mut plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", judge::MARK_TIP_SQL))
+            .unwrap();
+        let details: Vec<String> = plan
+            .query_map(rusqlite::params![900_000, 1], |r| r.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            details
+                .iter()
+                .any(|r| r.contains("SEARCH owed_rows USING INDEX idx_owed_rows_gate")),
+            "{details:?}"
+        );
+        assert!(
+            !details.iter().any(|r| r.contains("SCAN owed_rows")),
+            "{details:?}"
+        );
+        assert!(!judge::MARK_TIP_SQL.contains("json_extract"));
+    }
+    let report = judge::mark_tip(&db, 900_000).await.unwrap();
+    assert!(report.faults.is_empty(), "{:?}", report.faults);
+    assert_eq!(report.subjects, 16);
+    assert_eq!(db.count("owed_dirty"), 24);
+    let outside: i64 = db
+        .conn
+        .borrow()
+        .query_row(
+            "SELECT COUNT(*) FROM owed_dirty WHERE gameId IN ('g40','g41')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(outside, 0, "future and absent gates are not marked");
+}
+
+#[tokio::test]
+async fn owed893_released_hop_requires_the_current_eviction_epoch() {
+    let db = Db::new();
+    db.exec("INSERT INTO pot_evictions(txid,evictedAt,reason,releasedSpends) VALUES('join',100,'test','[]'); INSERT INTO released_hop_evidence(hopTxid,hopVout,identity,gameId,potTxid,seatSettlePubkey,hopSats,evictedAt) VALUES('hop',0,'owner','game','join','seat',100,99);");
+    let before = judge::hydrate_inputs(&db, "owner", &["game".into()])
+        .await
+        .unwrap();
+    assert!(before.hops.is_empty());
+    db.exec("UPDATE released_hop_evidence SET evictedAt=100");
+    let current = judge::hydrate_inputs(&db, "owner", &["game".into()])
+        .await
+        .unwrap();
+    assert_eq!(current.hops.len(), 1);
+    db.exec("UPDATE pot_evictions SET readmittedAt=101");
+    let readmitted = judge::hydrate_inputs(&db, "owner", &["game".into()])
+        .await
+        .unwrap();
+    assert!(readmitted.hops.is_empty());
 }
