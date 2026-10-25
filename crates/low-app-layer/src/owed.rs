@@ -5974,6 +5974,36 @@ pub fn valid_refunds_sql(n: usize) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    fn derive_and_pin(i: &OwedInputs<'_>) -> Vec<OwedRow> {
+        crate::owed_judge::assert_decomposition(i);
+        crate::owed_judge::assert_fixture_roundtrip(i);
+        super::derive_owed_rows(i)
+    }
+
+    #[test]
+    fn owed893_decomposition_a_pot_named_by_two_games_has_one_representative() {
+        let first = entry(Some(false), None, Outcome::Unresolved, None);
+        let mut second = first.clone();
+        second.game_id = tx(0x77);
+        let entries = [first, second];
+        let i = inputs(&entries, &[], &[], &NO_REFUNDS, &NONE, &NONE, Some(900_200));
+        crate::owed_judge::assert_decomposition(&i);
+    }
+    #[test]
+    fn owed893_decomposition_keeps_a_linked_pots_representative_as_context() {
+        let e = [entry(Some(false), None, Outcome::Unresolved, None)];
+        let mut h = hop(crate::hops_view::HopStatus::Unspent, None, Some(1));
+        h.game_id = tx(0x77);
+        let links = HashMap::from([(outpoint_key(&h.hop_txid, h.hop_vout), e[0].pot_txid.clone())]);
+        let hops = [h];
+        let mut i = inputs(&e, &[], &hops, &NO_REFUNDS, &NONE, &NONE, Some(900_200));
+        i.join_spent_hops = &links;
+        crate::owed_judge::assert_decomposition(&i);
+    }
+
+    static NO_REFUNDS: std::sync::LazyLock<HashMap<String, ValidRefund>> =
+        std::sync::LazyLock::new(HashMap::new);
+
     use crate::hops_view::MarkerVerification;
     use crate::refund_view::RefundStatus;
     use crate::results::{MoneyFacts, PotBinding, TxMoneyFacts};
@@ -6059,7 +6089,7 @@ pub(crate) mod tests {
             let entries = [e.clone()];
             let mut i = inputs(&entries, &[], &[], &v, &c, &p, Some(900_200));
             i.spender_words = Some(words);
-            let mut row = serde_json::to_value(&derive_owed_rows(&i)[0]).unwrap();
+            let mut row = serde_json::to_value(&derive_and_pin(&i)[0]).unwrap();
             let facts = row["facts"].as_object_mut().unwrap();
             facts.remove("coinWord");
             facts.remove("spenderWord");
@@ -6118,7 +6148,7 @@ pub(crate) mod tests {
             let mut i = inputs(&entries, &[], &[], &v, &c, &p, Some(900_200));
             i.spender_words = Some(&words);
             assert_eq!(
-                derive_owed_rows(&i)[0].facts["claimable"],
+                derive_and_pin(&i)[0].facts["claimable"],
                 true,
                 "index verified proof first"
             );
@@ -6143,7 +6173,7 @@ pub(crate) mod tests {
             let entries = [e.clone()];
             let mut i = inputs(&entries, &[], &[], &v, &c, &p, Some(900_200));
             i.spender_words = Some(words);
-            derive_owed_rows(&i)[0].facts.clone()
+            derive_and_pin(&i)[0].facts.clone()
         };
         let mut state = bsv_tracker::State::new(tx(3));
         let headers = crate::tracker_host::HeaderSnapshot {
@@ -6268,7 +6298,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.spender_outputs = &m;
         i.my_pkh_by_game = &pkhs;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert_eq!(rows[0].facts["spendKind"], "pot-unindexed");
         assert_eq!(rows[0].reason.as_deref(), Some(POT_UNINDEXED_REASON));
@@ -6286,7 +6316,7 @@ pub(crate) mod tests {
         i.hop_chain = &by_chain;
         i.spender_outputs = &m;
         i.my_pkh_by_game = &pkhs;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["spendKind"], "pot-unindexed");
         assert_eq!(rows[0].reason.as_deref(), Some(POT_UNINDEXED_REASON));
     }
@@ -6333,7 +6363,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.spender_outputs = &elsewhere;
         i.my_pkh_by_game = &pkhs;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].facts["spendKind"], "spent-elsewhere");
         assert_eq!(rows[0].reason.as_deref(), Some(SPENT_ELSEWHERE_REASON));
@@ -6342,7 +6372,7 @@ pub(crate) mod tests {
         let none: HashMap<String, String> = HashMap::new();
         i.my_pkh_by_game = &none;
         assert_eq!(
-            derive_owed_rows(&i)[0].reason.as_deref(),
+            derive_and_pin(&i)[0].reason.as_deref(),
             Some(HOME_UNKNOWN_REASON)
         );
         // THE KEY IS THE RELEASED HOP UTXO, never a name: an eviction that released a stranger's hop names nothing,
@@ -6479,7 +6509,7 @@ pub(crate) mod tests {
         let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
 
         // the captured shape, before the fix: no hop entry, so no row at all (the story hidden)
-        let before = derive_owed_rows(&inputs(&[], &[], &[], &v, &c, &no_pots, Some(970_754)));
+        let before = derive_and_pin(&inputs(&[], &[], &[], &v, &c, &no_pots, Some(970_754)));
         assert!(before.iter().all(|r| r.game_id != tx(0x01)), "{before:?}");
 
         // the fix: the ledger + my twin party row + the JOIN's own bytes rebuild MY hop only
@@ -6510,7 +6540,7 @@ pub(crate) mod tests {
         i.hop_chain = &mined;
         i.spender_outputs = &elsewhere;
         i.my_pkh_by_game = &pkhs;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].game_id, tx(0x01));
         assert_eq!(rows[0].facts["spendKind"], "spent-elsewhere");
@@ -6625,7 +6655,7 @@ pub(crate) mod tests {
             let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
             i.spender_outputs = &elsewhere;
             i.my_pkh_by_game = &homes;
-            let rows = derive_owed_rows(&i);
+            let rows = derive_and_pin(&i);
             assert_eq!(rows.len(), 1, "{rows:?}");
             (
                 rows[0].reason.clone(),
@@ -6666,7 +6696,7 @@ pub(crate) mod tests {
         // home UNKNOWN (no results entry for the game): the addresses, no custody story
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.spender_outputs = &elsewhere;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert_eq!(rows[0].reason.as_deref(), Some(HOME_UNKNOWN_REASON));
         assert!(rows[0].facts.get("spendKind").is_none());
@@ -6680,7 +6710,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.spender_outputs = &elsewhere;
         i.my_pkh_by_game = &pkhs;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["spendKind"], "spent-elsewhere");
         assert_eq!(rows[0].reason.as_deref(), Some(SPENT_ELSEWHERE_REASON));
     }
@@ -6707,7 +6737,7 @@ pub(crate) mod tests {
         i.spender_inputs = &spends_it;
         i.my_pkh_by_game = &pkhs;
         i.courier_spenders = &courier;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(
             (rows[0].family, rows[0].sats),
             (OwedFamily::Payout, Some(20_000))
@@ -6725,7 +6755,7 @@ pub(crate) mod tests {
         i.spender_inputs = &spends_it;
         i.my_pkh_by_game = &pkhs;
         i.courier_spenders = &courier;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["claimable"], false);
         assert_eq!(rows[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON);
         assert_eq!(rows[0].facts["creditKind"], "courier-bytes");
@@ -6741,7 +6771,7 @@ pub(crate) mod tests {
             if courier_sourced {
                 i.courier_spenders = &courier;
             }
-            let rows = derive_owed_rows(&i);
+            let rows = derive_and_pin(&i);
             assert_eq!(
                 rows[0].family,
                 OwedFamily::Unbound,
@@ -6762,7 +6792,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.spender_outputs = &mine;
         i.my_pkh_by_game = &pkhs;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["sweepSource"], "index-bytes");
         assert_eq!(rows[0].facts["claimable"], true);
     }
@@ -6804,7 +6834,7 @@ pub(crate) mod tests {
         i.my_pkh_by_game = &pkhs;
         i.courier_spenders = &courier;
         i.proof_mined_spenders = &proof;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].family, OwedFamily::Payout);
         assert_eq!(rows[0].facts["sweepSource"], "courier-bytes");
@@ -6846,7 +6876,7 @@ pub(crate) mod tests {
         i.my_pkh_by_game = &pkhs;
         i.courier_spenders = &courier;
         i.proof_mined_spenders = &no_proof;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].family, OwedFamily::Payout);
         assert_eq!(rows[0].facts["sweepSource"], "courier-bytes");
@@ -6944,7 +6974,7 @@ pub(crate) mod tests {
         i.my_pkh_by_game = &pkhs;
         i.courier_spenders = &courier;
         i.proof_mined_spenders = &proof;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].facts["sweepSource"], "courier-bytes");
         assert_eq!(
@@ -7122,7 +7152,7 @@ pub(crate) mod tests {
         i.my_pkh_by_game = &pkhs;
         i.courier_spenders = &courier;
         i.proof_mined_spenders = &no_proof;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["spent"], true, "the index-hop-row arm");
         assert_eq!(
             rows[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON,
@@ -7139,7 +7169,7 @@ pub(crate) mod tests {
         i.my_pkh_by_game = &pkhs;
         i.courier_spenders = &courier;
         i.proof_mined_spenders = &proof;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["claimReason"], COURIER_BYTES_NO_CREDIT_REASON);
         assert_eq!(rows[0].facts["confirmedSource"], "proof");
         let routes = include_str!("routes.rs");
@@ -7193,7 +7223,7 @@ pub(crate) mod tests {
             i.spender_inputs = &spends;
             i.my_pkh_by_game = &pkhs;
             i.courier_spenders = &courier;
-            derive_owed_rows(&i)[0].facts["claimReason"].clone()
+            derive_and_pin(&i)[0].facts["claimReason"].clone()
         };
         let s = std::slice::from_ref(&sweep);
         // the stored row says mined; the recheck could not check it: unconfirmed, and re-asked
@@ -7273,7 +7303,7 @@ pub(crate) mod tests {
             i.spender_inputs = inputs_of;
             i.my_pkh_by_game = &pkhs;
             i.courier_spenders = &courier;
-            sweeps_waiting_for_the_block(&derive_owed_rows(&i)).contains(&sweep)
+            sweeps_waiting_for_the_block(&derive_and_pin(&i)).contains(&sweep)
         };
         assert!(
             waiting(&none, &none, &spends_hop, &unspent_home),
@@ -7460,7 +7490,7 @@ pub(crate) mod tests {
             i.my_pkh_by_game = &pkhs;
             i.courier_spenders = &courier;
             i.proof_mined_spenders = proof;
-            let rows = derive_owed_rows(&i);
+            let rows = derive_and_pin(&i);
             let r = rows
                 .into_iter()
                 .find(|r| r.facts["sweepTxid"] == sweep_a.as_str())
@@ -7602,7 +7632,7 @@ pub(crate) mod tests {
             i.my_pkh_by_game = &pkhs;
             i.courier_spenders = &courier;
             i.proof_mined_spenders = proof;
-            derive_owed_rows(&i)[0].facts["claimReason"].clone()
+            derive_and_pin(&i)[0].facts["claimReason"].clone()
         };
         let checked: HashMap<u64, Option<String>> =
             [(900_000u64, Some(E693F_ROOT.to_string()))].into();
@@ -8162,7 +8192,7 @@ pub(crate) mod tests {
         i.spender_inputs = &spends_it;
         i.my_pkh_by_game = &pkhs;
         i.courier_spenders = &courier;
-        let judged = derive_owed_rows(&i);
+        let judged = derive_and_pin(&i);
         assert_eq!(judged.len(), 1);
         assert_eq!(judged[0].outpoint, key);
         assert_eq!(judged[0].family, OwedFamily::Payout);
@@ -8176,7 +8206,7 @@ pub(crate) mod tests {
         i.spender_outputs = &no_bytes;
         i.spender_inputs = &no_inputs;
         i.my_pkh_by_game = &pkhs;
-        let derived = derive_owed_rows(&i);
+        let derived = derive_and_pin(&i);
         assert_eq!(derived[0].family, OwedFamily::Unbound);
         assert!(derived[0]
             .reason
@@ -8280,7 +8310,7 @@ pub(crate) mod tests {
         i2.hop_chain = &chain_other;
         i2.spender_outputs = &no_bytes;
         i2.my_pkh_by_game = &pkhs;
-        let derived_other = derive_owed_rows(&i2);
+        let derived_other = derive_and_pin(&i2);
         let mut rows = derived_other.clone();
         let mut withheld_other: HashSet<String> = HashSet::new();
         withheld_other.insert(other.clone());
@@ -8316,7 +8346,7 @@ pub(crate) mod tests {
         i4.spender_inputs = &spends_it;
         i4.my_pkh_by_game = &pkhs;
         i4.courier_spenders = &courier;
-        let mut rows = derive_owed_rows(&i4);
+        let mut rows = derive_and_pin(&i4);
         assert_eq!(
             keep_withheld_payouts(&i4, &mut rows, &previous, &withheld),
             0
@@ -8359,7 +8389,7 @@ pub(crate) mod tests {
         i.spender_outputs = &elsewhere;
         i.spender_inputs = &spends_it;
         i.my_pkh_by_game = &pkhs;
-        let judged = derive_owed_rows(&i);
+        let judged = derive_and_pin(&i);
         assert_eq!(judged.len(), 1);
         assert_eq!(judged[0].outpoint, key);
         assert_eq!(judged[0].family, OwedFamily::Unbound);
@@ -8373,7 +8403,7 @@ pub(crate) mod tests {
         i.spender_outputs = &no_bytes;
         i.spender_inputs = &no_inputs;
         i.my_pkh_by_game = &pkhs;
-        let derived = derive_owed_rows(&i);
+        let derived = derive_and_pin(&i);
         // the regression, in one line: derive alone serves the clobbered word (pass B's `9c422cba…` body)
         assert_eq!(derived[0].family, OwedFamily::Unbound);
         assert!(derived[0]
@@ -8441,7 +8471,7 @@ pub(crate) mod tests {
         i3.spender_outputs = &elsewhere;
         i3.spender_inputs = &spends_it;
         i3.my_pkh_by_game = &pkhs;
-        let mut rows4 = derive_owed_rows(&i3);
+        let mut rows4 = derive_and_pin(&i3);
         assert_eq!(
             keep_withheld_elsewhere(&i3, &mut rows4, &previous, &withheld),
             0
@@ -8470,7 +8500,7 @@ pub(crate) mod tests {
         i.hop_chain = &chain;
         i.spender_outputs = &no_bytes;
         i.my_pkh_by_game = &pkhs;
-        let derived = derive_owed_rows(&i);
+        let derived = derive_and_pin(&i);
         assert!(derived[0]
             .reason
             .as_deref()
@@ -8500,7 +8530,7 @@ pub(crate) mod tests {
         ij.spender_outputs = &elsewhere;
         ij.spender_inputs = &spends_it;
         ij.my_pkh_by_game = &pkhs;
-        let judged = derive_owed_rows(&ij);
+        let judged = derive_and_pin(&ij);
         let previous = vec![(judged[0].clone(), judged_at)];
         let none: HashSet<String> = HashSet::new();
         let mut rows3 = derived.clone();
@@ -8537,7 +8567,7 @@ pub(crate) mod tests {
         ix.spender_outputs = &elsewhere_x;
         ix.spender_inputs = &spends_it;
         ix.my_pkh_by_game = &pkhs;
-        let judged_x = derive_owed_rows(&ix);
+        let judged_x = derive_and_pin(&ix);
         assert_eq!(judged_x[0].facts["chainSpender"], x);
         let previous_x = vec![(judged_x[0].clone(), 1_800_000_000_000i64 - 10 * 60_000)];
         // this pass: the chain names Y, Y withheld, no bytes
@@ -8547,7 +8577,7 @@ pub(crate) mod tests {
         iy.hop_chain = &chain_y;
         iy.spender_outputs = &no_bytes;
         iy.my_pkh_by_game = &pkhs;
-        let derived_y = derive_owed_rows(&iy);
+        let derived_y = derive_and_pin(&iy);
         let mut withheld_y: HashSet<String> = HashSet::new();
         withheld_y.insert(y.clone());
         let mut rows = derived_y.clone();
@@ -8606,7 +8636,7 @@ pub(crate) mod tests {
         i.spender_outputs = &from_store;
         i.spender_inputs = &spends_it;
         i.my_pkh_by_game = &pkhs;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["spendKind"], "spent-elsewhere");
         assert_eq!(rows[0].reason.as_deref(), Some(SPENT_ELSEWHERE_REASON));
         // the spender is marked withheld this pass, but the store already filled its bytes: not withheld, no carry
@@ -8677,7 +8707,7 @@ pub(crate) mod tests {
             i.courier_spenders = &courier;
             i.home_spends = &home_spends;
             i.retired_spenders = retired;
-            derive_owed_rows(&i)
+            derive_and_pin(&i)
         };
         // the pure byte-free read: every hop's named spender, and every spender's durable Proven `homeproof:`
         // latch, matched against them. A latch for a stranger's sweep, and a non-proven memo, retire nothing.
@@ -8794,7 +8824,7 @@ pub(crate) mod tests {
             i.courier_spenders = &courier;
             i.home_spends = home;
             i.retired_spenders = retired;
-            derive_owed_rows(&i)
+            derive_and_pin(&i)
         };
         // the byte-free latch of the SOLE home output
         let (t, vv) = home_latch_target(&sweep, 0);
@@ -9075,7 +9105,7 @@ pub(crate) mod tests {
             &pots,
             Some(900_200),
         );
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(
             rows[0].reason.as_deref(),
             Some("the spend is not classified yet (no verdict)")
@@ -9108,7 +9138,7 @@ pub(crate) mod tests {
             &pots,
             Some(900_200),
         );
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1, "one story row");
         let r = &rows[0];
         assert_eq!(r.family, OwedFamily::Unbound);
@@ -9139,7 +9169,7 @@ pub(crate) mod tests {
             &pots,
             Some(900_200),
         );
-        let rows_w = derive_owed_rows(&i_w);
+        let rows_w = derive_and_pin(&i_w);
         assert_eq!(rows_w.len(), 1);
         assert_eq!(rows_w[0].family, OwedFamily::Payout);
         assert_eq!(rows_w[0].facts["claimable"], false);
@@ -9158,7 +9188,7 @@ pub(crate) mod tests {
             &pots,
             Some(900_200),
         );
-        let rows2 = derive_owed_rows(&i2);
+        let rows2 = derive_and_pin(&i2);
         assert_eq!(rows2.len(), 1);
         assert_eq!(
             rows2[0].reason.as_deref(),
@@ -9487,7 +9517,7 @@ pub(crate) mod tests {
             Some(SeatLetter::A),
         )];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let rows = derive_owed_rows(&inputs(&e, &[], &[], &v, &c, &p, Some(900_200)));
+        let rows = derive_and_pin(&inputs(&e, &[], &[], &v, &c, &p, Some(900_200)));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].family, OwedFamily::Payout);
         assert_eq!(rows[0].sats, Some(39_200));
@@ -9510,7 +9540,7 @@ pub(crate) mod tests {
             Some(SeatLetter::A),
         )];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        assert!(derive_owed_rows(&inputs(&lost, &[], &[], &v, &c, &p, Some(900_200))).is_empty());
+        assert!(derive_and_pin(&inputs(&lost, &[], &[], &v, &c, &p, Some(900_200))).is_empty());
         let won = [entry(
             Some(true),
             Some(PotVerdict::WinnerA),
@@ -9520,14 +9550,14 @@ pub(crate) mod tests {
         // the identity's OWN collected filing (signature verified under it): retired
         let verified: HashSet<String> = [tx(0x01)].into_iter().collect();
         assert!(
-            derive_owed_rows(&inputs(&won, &[], &[], &v, &verified, &p, Some(900_200))).is_empty()
+            derive_and_pin(&inputs(&won, &[], &[], &v, &verified, &p, Some(900_200))).is_empty()
         );
         // the gate's HIGH-1: a PRESENT collected row nobody verified (a stranger's dust marker naming the winner)
         // retires NOTHING — the row stays, with the presence named as provenance
         let present: HashSet<String> = [tx(0x01)].into_iter().collect();
         let mut i = inputs(&won, &[], &[], &v, &c, &p, Some(900_200));
         i.collected_present = &present;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].family, OwedFamily::Payout);
         assert_eq!(rows[0].facts["collectedMarkerPresent"], true);
@@ -9546,7 +9576,7 @@ pub(crate) mod tests {
         e.spent_confirmed = Some(false);
         e.at_height = None; // unconfirmed: no verified mined height (the review's LOW-1 bar)
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let rows = derive_owed_rows(&inputs(
+        let rows = derive_and_pin(&inputs(
             std::slice::from_ref(&e),
             &[],
             &[],
@@ -9570,7 +9600,7 @@ pub(crate) mod tests {
             Some(SeatLetter::B),
         );
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let rows = derive_owed_rows(&inputs(
+        let rows = derive_and_pin(&inputs(
             std::slice::from_ref(&e),
             &[],
             &[],
@@ -9593,7 +9623,7 @@ pub(crate) mod tests {
         e.money.settle.as_mut().unwrap().pay_a_sats = Some(19_600);
         e.money.settle.as_mut().unwrap().pay_b_sats = Some(19_600);
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let rows = derive_owed_rows(&inputs(
+        let rows = derive_and_pin(&inputs(
             std::slice::from_ref(&e),
             &[],
             &[],
@@ -9608,7 +9638,7 @@ pub(crate) mod tests {
         );
         // the same tie with the seat unknown: a payout the brain cannot size, never a guess
         let unknown = entry(Some(true), Some(PotVerdict::Tie), Outcome::Tie, None);
-        let rows = derive_owed_rows(&inputs(
+        let rows = derive_and_pin(&inputs(
             std::slice::from_ref(&unknown),
             &[],
             &[],
@@ -9629,7 +9659,7 @@ pub(crate) mod tests {
             Some(SeatLetter::A),
         )];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let rows = derive_owed_rows(&inputs(&no_verdict, &[], &[], &v, &c, &p, Some(900_200)));
+        let rows = derive_and_pin(&inputs(&no_verdict, &[], &[], &v, &c, &p, Some(900_200)));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert!(rows[0].reason.as_deref().unwrap().contains("no verdict"));
         let no_seat = [entry(
@@ -9638,11 +9668,11 @@ pub(crate) mod tests {
             Outcome::Unresolved,
             None,
         )];
-        let rows = derive_owed_rows(&inputs(&no_seat, &[], &[], &v, &c, &p, Some(900_200)));
+        let rows = derive_and_pin(&inputs(&no_seat, &[], &[], &v, &c, &p, Some(900_200)));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert!(rows[0].reason.as_deref().unwrap().contains("seat binding"));
         let no_word = [entry(None, None, Outcome::Unresolved, Some(SeatLetter::A))];
-        let rows = derive_owed_rows(&inputs(&no_word, &[], &[], &v, &c, &p, Some(900_200)));
+        let rows = derive_and_pin(&inputs(&no_word, &[], &[], &v, &c, &p, Some(900_200)));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert!(rows[0].reason.as_deref().unwrap().contains("no spend word"));
     }
@@ -9693,7 +9723,7 @@ pub(crate) mod tests {
         );
         let (c, p) = (HashSet::new(), HashSet::new());
         // the funding latched (absent from the unheld set): today's row, byte for byte
-        let held = derive_owed_rows(&inputs(&e, &r, &[], &valid, &c, &p, Some(900_005)));
+        let held = derive_and_pin(&inputs(&e, &r, &[], &valid, &c, &p, Some(900_005)));
         assert_eq!(held[0].family, OwedFamily::RefundDue);
         assert_eq!(held[0].facts["claim"], "present-refund");
         assert_eq!(held[0].facts["claimable"], true);
@@ -9702,7 +9732,7 @@ pub(crate) mod tests {
         let unheld: HashSet<String> = [tx(0x02)].into_iter().collect();
         let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(900_005));
         i.funding_unheld = &unheld;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].family,
@@ -9720,13 +9750,13 @@ pub(crate) mod tests {
         let mut words = std::collections::BTreeMap::new();
         words.insert(tx(0x02), json!({"word": "mined", "verifyPath": null}));
         i.spender_words = Some(&words);
-        assert_eq!(derive_owed_rows(&i)[0].family, OwedFamily::Unbound);
+        assert_eq!(derive_and_pin(&i)[0].family, OwedFamily::Unbound);
         // the tracker's CHECKED mined word for the funding: the network holds it, today's row byte for byte
         let mut checked = std::collections::BTreeMap::new();
         checked.insert(tx(0x02), json!({"word": "mined", "verifyPath": "header"}));
         i.spender_words = Some(&checked);
-        let mined = derive_owed_rows(&i);
-        let today = derive_owed_rows(&{
+        let mined = derive_and_pin(&i);
+        let today = derive_and_pin(&{
             let mut j = inputs(&e, &r, &[], &valid, &c, &p, Some(900_005));
             j.spender_words = Some(&checked);
             j
@@ -9736,7 +9766,7 @@ pub(crate) mod tests {
         // the gate not open yet: the rejoin row is unchanged by the funding word (not a refund claim)
         let mut k = inputs(&e, &r, &[], &valid, &c, &p, Some(899_990));
         k.funding_unheld = &unheld;
-        assert_eq!(derive_owed_rows(&k)[0].facts["claim"], "rejoin");
+        assert_eq!(derive_and_pin(&k)[0].facts["claim"], "rejoin");
     }
 
     /// bsv-low #598 (loop 22, p27/p28, the `spec-admit-fast-join-refused` cell's pair): a refund-due pot whose funding
@@ -9770,7 +9800,7 @@ pub(crate) mod tests {
             let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(900_005));
             i.spender_words = Some(words);
             i.funding_unheld = &unheld;
-            derive_owed_rows(&i)
+            derive_and_pin(&i)
         };
         for word in ["rejected", "conflicted"] {
             let mut words = std::collections::BTreeMap::new();
@@ -9947,7 +9977,7 @@ pub(crate) mod tests {
             let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(900_005));
             i.spender_words = Some(words);
             i.funding_unheld = &unheld;
-            derive_owed_rows(&i)
+            derive_and_pin(&i)
         };
         for (history, want) in [
             (vec![rejected.as_str()], "rejected"),
@@ -10085,7 +10115,7 @@ pub(crate) mod tests {
         let (c, p) = (HashSet::new(), HashSet::new());
         drained();
         // held: no move
-        let held = derive_owed_rows(&inputs(&e, &r, &[], &valid, &c, &p, Some(900_005)));
+        let held = derive_and_pin(&inputs(&e, &r, &[], &valid, &c, &p, Some(900_005)));
         assert_eq!(count_refund_funding_unheld(&held), 0);
         note_refund_funding_unheld(count_refund_funding_unheld(&held));
         assert_eq!(
@@ -10097,7 +10127,7 @@ pub(crate) mod tests {
         let unheld: HashSet<String> = [tx(0x02)].into_iter().collect();
         let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(900_005));
         i.funding_unheld = &unheld;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(count_refund_funding_unheld(&rows), 1);
         note_refund_funding_unheld(count_refund_funding_unheld(&rows));
         assert_eq!(
@@ -10129,7 +10159,7 @@ pub(crate) mod tests {
             },
         );
         let (c, p) = (HashSet::new(), HashSet::new());
-        let rows = derive_owed_rows(&inputs(&e, &r, &[], &valid, &c, &p, Some(900_005)));
+        let rows = derive_and_pin(&inputs(&e, &r, &[], &valid, &c, &p, Some(900_005)));
         assert_eq!(
             (rows[0].family, rows[0].sats),
             (OwedFamily::RefundDue, Some(19_800))
@@ -10145,7 +10175,7 @@ pub(crate) mod tests {
                 my_sats: Some(0),
             },
         );
-        let rows = derive_owed_rows(&inputs(&e, &r, &[], &zero, &c, &p, Some(900_005)));
+        let rows = derive_and_pin(&inputs(&e, &r, &[], &zero, &c, &p, Some(900_005)));
         assert_eq!(
             (rows[0].family, rows[0].sats),
             (OwedFamily::RefundDue, None)
@@ -10155,7 +10185,7 @@ pub(crate) mod tests {
             .unwrap()
             .starts_with("zero"));
         // the gate NOT open yet: the hand's window, a rejoin row sized by my stake
-        let rows = derive_owed_rows(&inputs(&e, &r, &[], &valid, &c, &p, Some(899_990)));
+        let rows = derive_and_pin(&inputs(&e, &r, &[], &valid, &c, &p, Some(899_990)));
         assert_eq!(
             (rows[0].family, rows[0].sats),
             (OwedFamily::InProgress, Some(20_000))
@@ -10169,7 +10199,7 @@ pub(crate) mod tests {
         evicted.insert(tx(0x02));
         let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(900_005));
         i.evicted_pots = &evicted;
-        let rows_ev = derive_owed_rows(&i);
+        let rows_ev = derive_and_pin(&i);
         assert!(
             rows_ev
                 .iter()
@@ -10179,7 +10209,7 @@ pub(crate) mod tests {
         );
         let mut i = inputs(&e, &r, &[], &valid, &c, &p, Some(899_990));
         i.evicted_pots = &evicted;
-        let rows_ev = derive_owed_rows(&i);
+        let rows_ev = derive_and_pin(&i);
         assert!(rows_ev.is_empty(), "{rows_ev:?}");
         assert_eq!(rows[0].facts["blocksToGate"], 10);
         // bsv-low #469 / fleet-loop-16 R1: the rejoin row CARRIES the served recovery gate as the
@@ -10194,18 +10224,18 @@ pub(crate) mod tests {
         );
         // the gate open and NO valid filed refund: unbound, with the tower named as the path
         let none = HashMap::new();
-        let rows = derive_owed_rows(&inputs(&e, &r, &[], &none, &c, &p, Some(900_005)));
+        let rows = derive_and_pin(&inputs(&e, &r, &[], &none, &c, &p, Some(900_005)));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert!(rows[0].reason.as_deref().unwrap().contains("dead-man"));
         // an unknown tip cannot open the gate: in-progress with no blocks figure, never refund-due
-        let rows = derive_owed_rows(&inputs(&e, &r, &[], &valid, &c, &p, None));
+        let rows = derive_and_pin(&inputs(&e, &r, &[], &valid, &c, &p, None));
         assert_eq!(rows[0].family, OwedFamily::InProgress);
         assert!(rows[0].facts["blocksToGate"].is_null());
         // MEDIUM-9: the gate height is the ONE shared predicate — a committed 0 falls back to the marker's height
         // (`/refund-view` serves gate-open for the same pot), a timestamp-range value is no height at all
         let mut cov_zero = entry(Some(false), None, Outcome::Unresolved, Some(SeatLetter::A));
         cov_zero.cov_recovery_height = Some(0);
-        let rows = derive_owed_rows(&inputs(
+        let rows = derive_and_pin(&inputs(
             std::slice::from_ref(&cov_zero),
             &r,
             &[],
@@ -10223,7 +10253,7 @@ pub(crate) mod tests {
         let mut stamp = entry(Some(false), None, Outcome::Unresolved, Some(SeatLetter::A));
         stamp.cov_recovery_height = Some(1_800_000_000);
         stamp.recovery_height = 0;
-        let rows = derive_owed_rows(&inputs(
+        let rows = derive_and_pin(&inputs(
             std::slice::from_ref(&stamp),
             &[],
             &[],
@@ -10279,7 +10309,7 @@ pub(crate) mod tests {
         let unspent = chain(&key, true, Some(false), None);
         let mut i = inputs(&[], &[], &old, &v, &c, &p, Some(900_000));
         i.hop_chain = &unspent;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(
             (rows[0].family, rows[0].sats),
             (OwedFamily::HopStranded, Some(20_190))
@@ -10289,7 +10319,7 @@ pub(crate) mod tests {
         // a YOUNG unspent hop is an `in-progress` row with the felt's rejoin (the stake is funded, the hand has not
         // started), sized by the hop, never a sweep claim before the window
         let young = [hop(HopStatus::Unspent, None, Some(60_000))];
-        let rows = derive_owed_rows(&inputs(&[], &[], &young, &v, &c, &p, Some(900_000)));
+        let rows = derive_and_pin(&inputs(&[], &[], &young, &v, &c, &p, Some(900_000)));
         assert_eq!(
             (rows[0].family, rows[0].sats),
             (OwedFamily::InProgress, Some(20_190))
@@ -10302,14 +10332,11 @@ pub(crate) mod tests {
         assert!(rows[0].facts.get("sweepRawHex").is_none());
         // an age the brain cannot say, or a marker not yet verified: no row
         let ageless = [hop(HopStatus::Unspent, None, None)];
-        assert!(
-            derive_owed_rows(&inputs(&[], &[], &ageless, &v, &c, &p, Some(900_000))).is_empty()
-        );
+        assert!(derive_and_pin(&inputs(&[], &[], &ageless, &v, &c, &p, Some(900_000))).is_empty());
         let mut unverified = hop(HopStatus::Unspent, None, Some(60_000));
         unverified.marker_verified = MarkerVerification::Unknown;
         assert!(
-            derive_owed_rows(&inputs(&[], &[], &[unverified], &v, &c, &p, Some(900_000)))
-                .is_empty()
+            derive_and_pin(&inputs(&[], &[], &[unverified], &v, &c, &p, Some(900_000))).is_empty()
         );
     }
 
@@ -10321,12 +10348,12 @@ pub(crate) mod tests {
         let by_pot = [hop(HopStatus::Spent, Some(&join), Some(10_000_000))];
         let pots: HashSet<String> = [join.clone()].into_iter().collect();
         assert!(
-            derive_owed_rows(&inputs(&[], &[], &by_pot, &v, &c, &pots, Some(900_000))).is_empty()
+            derive_and_pin(&inputs(&[], &[], &by_pot, &v, &c, &pots, Some(900_000))).is_empty()
         );
         // MEDIUM-7: a spender absent from the index is NOT evidence of a wallet spend (an unindexed JOIN is the common
         // honest case): a sentence, no claim, never "spent elsewhere"
         let elsewhere = [hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000))];
-        let rows = derive_owed_rows(&inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000)));
+        let rows = derive_and_pin(&inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000)));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert!(rows[0].facts["claim"].is_null());
         assert!(rows[0]
@@ -10337,7 +10364,7 @@ pub(crate) mod tests {
         // a FAULTED spender check says so
         let mut i = inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000));
         i.pot_spenders_faulted = true;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert!(rows[0]
             .reason
             .as_deref()
@@ -10356,7 +10383,7 @@ pub(crate) mod tests {
         let (v, c) = (HashMap::new(), HashSet::new());
         let pots: HashSet<String> = HashSet::new();
         let elsewhere = [hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000))];
-        let unread = derive_owed_rows(&inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000)));
+        let unread = derive_and_pin(&inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000)));
         assert_eq!(unread.len(), 1);
         assert!(unread[0]
             .reason
@@ -10378,14 +10405,14 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000));
         i.pot_spenders_faulted = true;
         assert!(
-            at(61_000, &derive_owed_rows(&i)),
+            at(61_000, &derive_and_pin(&i)),
             "a faulted read is re-judged too"
         );
         // the spender's BYTES read (they pay no home of mine): a positive story, the open list's 5-minute rule alone
         let outs = pays(&tx(0x09), &[(0, "ab", 1_000, None)]);
         let mut j = inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000));
         j.spender_outputs = &outs;
-        let judged = derive_owed_rows(&j);
+        let judged = derive_and_pin(&j);
         assert!(
             !judged[0]
                 .reason
@@ -10420,8 +10447,7 @@ pub(crate) mod tests {
             spender_rejudge_only(false, age_ms, Some(900_000), Some(900_000), rows)
         };
         let withheld: HashSet<String> = [tx(0x09)].into_iter().collect();
-        let mut rows =
-            derive_owed_rows(&inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000)));
+        let mut rows = derive_and_pin(&inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000)));
         assert!(at(61_000, &rows) && only(61_000, &rows));
         assert!(
             !only(59_000, &rows) && !only(6 * 60_000, &rows),
@@ -10444,7 +10470,7 @@ pub(crate) mod tests {
         // a faulted pot-spenders read keeps every mark
         let mut i = inputs(&[], &[], &elsewhere, &v, &c, &pots, Some(900_000));
         i.pot_spenders_faulted = true;
-        let mut faulted = derive_owed_rows(&i);
+        let mut faulted = derive_and_pin(&i);
         assert_eq!(unmark_withheld_spenders(&mut faulted, &withheld, true), 0);
         assert!(at(61_000, &faulted));
         // the counter is seeded by the overlay's list (pinned equal by `obs_counters_tests`)
@@ -10480,7 +10506,7 @@ pub(crate) mod tests {
         )];
         let key = format!("{}:0", tx(0x07));
         // no chain word yet: the index's unspent offers the sweep (index-unspent), no competitor known
-        let rows = derive_owed_rows(&inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000)));
+        let rows = derive_and_pin(&inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000)));
         assert_eq!(rows[0].family, OwedFamily::HopStranded);
         assert_eq!(rows[0].facts["claim"], "sweep-hop");
         assert_eq!(rows[0].facts["claimable"], true);
@@ -10489,14 +10515,14 @@ pub(crate) mod tests {
         let not_looked = chain(&key, false, None, None);
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
         i.hop_chain = &not_looked;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].family, OwedFamily::HopStranded);
         assert_eq!(rows[0].facts["chainProbe"], "index-unspent");
         // the chain's UNSPENT word corroborates: the claim, with the courier-corroborated provenance
         let looked_unspent = chain(&key, true, Some(false), None);
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
         i.hop_chain = &looked_unspent;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["claim"], "sweep-hop");
         assert_eq!(rows[0].facts["chainProbe"], "unspent");
         // spent by a POT the index holds (the index lagged): no row
@@ -10511,11 +10537,11 @@ pub(crate) mod tests {
         )];
         let mut i = inputs(&held, &[], &old, &v, &c, &pots, Some(900_000));
         i.hop_chain = &by_pot;
-        assert!(derive_owed_rows(&i).iter().all(|r| r.outpoint != key));
+        assert!(derive_and_pin(&i).iter().all(|r| r.outpoint != key));
         // bsv-low #837 (amended): the results carrying no row for that pot, the game keeps one row, never a press
         let mut i = inputs(&[], &[], &old, &v, &c, &pots, Some(900_000));
         i.hop_chain = &by_pot;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].facts["joinSpentBy"], "chain");
         assert_eq!(rows[0].facts["claimable"], false);
@@ -10523,7 +10549,7 @@ pub(crate) mod tests {
         let elsewhere = chain(&key, true, Some(true), Some(&tx(0x09)));
         let mut i = inputs(&[], &[], &old, &v, &c, &pots, Some(900_000));
         i.hop_chain = &elsewhere;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert_eq!(rows[0].facts["chainProbe"], "spent");
         assert_eq!(rows[0].facts["chainSpender"], tx(0x09));
@@ -10535,7 +10561,7 @@ pub(crate) mod tests {
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let mut planted = hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1));
         planted.marker_verified = MarkerVerification::Unverified;
-        let rows = derive_owed_rows(&inputs(
+        let rows = derive_and_pin(&inputs(
             &[],
             &[],
             std::slice::from_ref(&planted),
@@ -10553,7 +10579,7 @@ pub(crate) mod tests {
             .contains("does not verify"));
         let mut pending = hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1));
         pending.marker_verified = MarkerVerification::Unknown;
-        let rows = derive_owed_rows(&inputs(
+        let rows = derive_and_pin(&inputs(
             &[],
             &[],
             std::slice::from_ref(&pending),
@@ -10590,7 +10616,7 @@ pub(crate) mod tests {
             let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
             i.hop_sweeps = &sweeps;
             i.spender_words = Some(words);
-            assert_eq!(derive_owed_rows(&i)[0].facts["claimable"], true);
+            assert_eq!(derive_and_pin(&i)[0].facts["claimable"], true);
         }
         let old = [hop(
             HopStatus::Unspent,
@@ -10605,7 +10631,7 @@ pub(crate) mod tests {
             i.hop_sweeps = &sweeps;
             i.hop_chain = &by_chain;
             i.spender_words = Some(words);
-            assert_eq!(derive_owed_rows(&i)[0].facts["claimable"], claimable);
+            assert_eq!(derive_and_pin(&i)[0].facts["claimable"], claimable);
         }
     }
 
@@ -10621,7 +10647,7 @@ pub(crate) mod tests {
         let hops = [spent];
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.hop_sweeps = &sweeps;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(
             (rows[0].family, rows[0].sats),
             (OwedFamily::Payout, Some(20_000))
@@ -10642,7 +10668,7 @@ pub(crate) mod tests {
         let hops = [mined];
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.hop_sweeps = &sweeps;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["claimable"], true);
         // the CHAIN rung naming my sweep on an index-unspent hop is the same payout (a sweep broadcast direct to ARC);
         // the COURIER-RUNG lens fold (L2): the courier's confirmation is its hint, the press waits for a checked word
@@ -10655,7 +10681,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
         i.hop_sweeps = &sweeps;
         i.hop_chain = &by_chain;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(
             (rows[0].family, rows[0].facts["claimable"].as_bool()),
             (OwedFamily::Payout, Some(false))
@@ -10665,7 +10691,7 @@ pub(crate) mod tests {
         let other = [hop(HopStatus::Spent, Some(&tx(0x09)), Some(10_000_000))];
         let mut i = inputs(&[], &[], &other, &v, &c, &no_pots, Some(900_000));
         i.hop_sweeps = &sweeps;
-        assert_eq!(derive_owed_rows(&i)[0].family, OwedFamily::Unbound);
+        assert_eq!(derive_and_pin(&i)[0].family, OwedFamily::Unbound);
     }
 
     /// The COURIER-RUNG lens fold (L2, NS-3 and #692's rule): a courier's "confirmed" is a HINT, never a press. A
@@ -10689,7 +10715,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.hop_sweeps = &filing;
         i.hop_chain = &by_chain;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(
             (rows[0].family, rows[0].facts["claimable"].as_bool()),
             (OwedFamily::Payout, Some(false))
@@ -10708,7 +10734,7 @@ pub(crate) mod tests {
         i.hop_sweeps = &filing;
         i.hop_chain = &by_chain;
         i.proof_mined_spenders = &proofs;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["claimable"], true);
         assert_eq!(rows[0].facts["confirmedSource"], "proof");
         assert!(rows[0].facts.get("spenderPresence").is_none());
@@ -10717,13 +10743,13 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.hop_sweeps = &proven;
         i.hop_chain = &by_chain;
-        assert_eq!(derive_owed_rows(&i)[0].facts["claimable"], true);
+        assert_eq!(derive_and_pin(&i)[0].facts["claimable"], true);
         // a courier that says "unconfirmed" is no hint of a confirmation: the plain wait, no `spenderPresence` here
         let lagging = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(false));
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.hop_sweeps = &filing;
         i.hop_chain = &lagging;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["claimable"], false);
         assert!(rows[0].facts.get("spenderPresence").is_none());
     }
@@ -10769,7 +10795,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.hop_sweeps = &filing;
         i.spender_words = Some(&words);
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["claimable"], true);
         assert_eq!(
             rows[0].facts["confirmedSource"], "tracker-proof",
@@ -10799,7 +10825,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &proven;
         i.hop_chain = &lagging;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(
             (rows[0].family, rows[0].sats),
             (OwedFamily::Payout, Some(20_000))
@@ -10814,7 +10840,7 @@ pub(crate) mod tests {
         // no courier word at all (never probed): the proof alone names the spender and confirms it
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &proven;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(
             (rows[0].family, rows[0].facts["claimable"].as_bool()),
             (OwedFamily::Payout, Some(true))
@@ -10825,7 +10851,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &unproven;
         i.hop_chain = &lagging;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["claimable"], false);
         assert_eq!(rows[0].facts["claimReason"], UNCONFIRMED_PAYOUT_REASON);
         // the proof is keyed on the FILED sweep: a hop the index names spent+confirmed by ANOTHER tx never turns an
@@ -10835,18 +10861,18 @@ pub(crate) mod tests {
         let hops_o = [other];
         let mut i = inputs(&[], &[], &hops_o, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &unproven;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_ne!(rows[0].family, OwedFamily::Payout);
         // the row carries the sweep's proven block as its height (the gate's NIT-3)
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &proven;
-        assert_eq!(derive_owed_rows(&i)[0].at_height, Some(967_696));
+        assert_eq!(derive_and_pin(&i)[0].at_height, Some(967_696));
         // an old latch without a recorded height (the gate's NIT-5): proven is proven, no height on the row
         let proven_no_height = filed_proven(&key, &sweep, None);
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &proven_no_height;
         i.hop_chain = &lagging;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(
             (rows[0].facts["claimable"].as_bool(), rows[0].at_height),
             (Some(true), None)
@@ -10859,7 +10885,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops_n, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &proven;
         assert_eq!(
-            derive_owed_rows(&i)[0].facts["confirmedSource"],
+            derive_and_pin(&i)[0].facts["confirmedSource"],
             "index-proof"
         );
     }
@@ -10880,7 +10906,7 @@ pub(crate) mod tests {
         let hops_o = [other];
         let mut i = inputs(&[], &[], &hops_o, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &proven;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_ne!(
             rows[0].family,
             OwedFamily::Payout,
@@ -10910,7 +10936,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &unspent, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &proven;
         i.hop_chain = &chain_other;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_ne!(rows[0].family, OwedFamily::Payout);
         assert_eq!(rows[0].facts["sweepProofContradicted"], true);
         assert_eq!(count_sweep_proof_contradictions(&rows), 1);
@@ -10920,7 +10946,7 @@ pub(crate) mod tests {
         let hops_s = [stale];
         let mut i = inputs(&[], &[], &hops_s, &v, &c, &no_pots, Some(967_699));
         i.hop_sweeps = &proven;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(
             (rows[0].family, rows[0].facts["confirmedSource"].as_str()),
             (OwedFamily::Payout, Some("index-proof"))
@@ -10943,7 +10969,7 @@ pub(crate) mod tests {
         // without a filing: the press signs on the owning device
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
         i.hop_chain = &unspent;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["claim"], "sweep-hop");
         assert_eq!(rows[0].facts["sweepSource"], "sign-here");
         assert!(rows[0].facts["sweepRawHex"].is_null());
@@ -10956,7 +10982,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
         i.hop_chain = &unspent;
         i.hop_sweeps = &sweeps;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["sweepSource"], "hopsweep-filing");
         assert_eq!(rows[0].facts["sweepTxid"], tx(0x0c));
         assert_eq!(rows[0].facts["sweepRawHex"], "0100".repeat(20));
@@ -10966,7 +10992,7 @@ pub(crate) mod tests {
         let hops = [unknown];
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.hop_chain = &unspent;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(
             (rows[0].family, rows[0].facts["claim"].as_str()),
             (OwedFamily::HopStranded, Some("sweep-hop"))
@@ -10975,7 +11001,7 @@ pub(crate) mod tests {
         let mut unknown = hop(HopStatus::Unknown, None, Some(HOP_STRANDED_AFTER_MS + 1));
         unknown.spent = None;
         let hops = [unknown];
-        let rows = derive_owed_rows(&inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000)));
+        let rows = derive_and_pin(&inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000)));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert!(rows[0]
             .reason
@@ -10990,7 +11016,7 @@ pub(crate) mod tests {
         );
         recorded.spent = Some(true);
         let hops = [recorded];
-        let rows = derive_owed_rows(&inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000)));
+        let rows = derive_and_pin(&inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000)));
         assert!(rows[0]
             .reason
             .as_deref()
@@ -11023,7 +11049,7 @@ pub(crate) mod tests {
         i.hop_chain = &by_chain;
         i.spender_outputs = &mine;
         i.my_pkh_by_game = &pkhs;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(
             (rows[0].family, rows[0].sats),
             (OwedFamily::Payout, Some(20_000))
@@ -11036,21 +11062,21 @@ pub(crate) mod tests {
         assert_eq!(rows[0].facts["claimable"], false);
         let proofs = HashSet::from([sweep.clone()]);
         i.proof_mined_spenders = &proofs;
-        assert_eq!(derive_owed_rows(&i)[0].facts["claimable"], true);
+        assert_eq!(derive_and_pin(&i)[0].facts["claimable"], true);
         // 2. the home output already SPENT (collected and moved on) → not a row
         let moved = pays(&sweep, &[(0, &my_pkh, 20_000, Some(true))]);
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
         i.hop_chain = &by_chain;
         i.spender_outputs = &moved;
         i.my_pkh_by_game = &pkhs;
-        assert!(derive_owed_rows(&i).is_empty());
+        assert!(derive_and_pin(&i).is_empty());
         // 3. the bytes pay ELSEWHERE → the spent-elsewhere story, no claim
         let elsewhere = pays(&sweep, &[(0, &"99".repeat(20), 20_000, Some(false))]);
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
         i.hop_chain = &by_chain;
         i.spender_outputs = &elsewhere;
         i.my_pkh_by_game = &pkhs;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert_eq!(rows[0].facts["spendKind"], "spent-elsewhere");
         assert_eq!(rows[0].reason.as_deref(), Some(SPENT_ELSEWHERE_REASON));
@@ -11058,7 +11084,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
         i.hop_chain = &by_chain;
         i.my_pkh_by_game = &pkhs;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert!(rows[0]
             .reason
             .as_deref()
@@ -11071,7 +11097,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.spender_outputs = &mine;
         i.my_pkh_by_game = &pkhs;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(
             (rows[0].family, rows[0].facts["claimable"].as_bool()),
             (OwedFamily::Payout, Some(true))
@@ -11079,10 +11105,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_000));
         i.spender_outputs = &elsewhere;
         i.my_pkh_by_game = &pkhs;
-        assert_eq!(
-            derive_owed_rows(&i)[0].facts["spendKind"],
-            "spent-elsewhere"
-        );
+        assert_eq!(derive_and_pin(&i)[0].facts["spendKind"], "spent-elsewhere");
     }
 
     #[test]
@@ -11127,7 +11150,7 @@ pub(crate) mod tests {
         );
         let mut i = inputs(&e, &[], &young, &v, &c, &p, Some(900_000));
         i.hop_chain = &chain;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert!(
             rows.iter()
                 .any(|r| r.family == OwedFamily::InProgress && r.facts["claim"] == "rejoin"),
@@ -11145,7 +11168,7 @@ pub(crate) mod tests {
         let evicted: HashSet<String> = [tx(0x02)].into_iter().collect();
         i.evicted_pots = &evicted;
         i.evicted_hop_outpoints = &refused;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1, "the pot is no row; the hop is the one row");
         assert_eq!(rows[0].family, OwedFamily::HopStranded);
         assert_eq!(rows[0].facts["claim"], "sweep-hop");
@@ -11160,7 +11183,7 @@ pub(crate) mod tests {
         );
         let strangers = released_hop_outpoints(&[(tx(0x02), Some(planted))]);
         i.evicted_hop_outpoints = &strangers;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert!(
             rows.iter()
                 .any(|r| r.family == OwedFamily::InProgress && r.facts["claim"] == "rejoin"),
@@ -11307,7 +11330,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &young, &v, &c, &p, Some(900_000));
         i.hop_chain = &chain;
         i.evicted_hop_outpoints = &refused;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].family, OwedFamily::HopStranded);
         assert_eq!(rows[0].facts["joinRefused"], true);
@@ -11343,7 +11366,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &verified, &no_pots, Some(900_000));
         i.hop_sweeps = &sweeps;
         i.hop_chain = &by_other;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         let payout = rows
             .iter()
             .find(|r| r.family == OwedFamily::Payout)
@@ -11356,7 +11379,7 @@ pub(crate) mod tests {
         // was claimable); with the sweep's checked mined proof → claimable
         let by_sweep = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
         i.hop_chain = &by_sweep;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         let payout = rows
             .iter()
             .find(|r| r.family == OwedFamily::Payout)
@@ -11364,7 +11387,7 @@ pub(crate) mod tests {
         assert_eq!(payout.facts["claimable"], false);
         let proofs = HashSet::from([sweep.clone()]);
         i.proof_mined_spenders = &proofs;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         let payout = rows
             .iter()
             .find(|r| r.family == OwedFamily::Payout)
@@ -11393,13 +11416,13 @@ pub(crate) mod tests {
         // eviction ledger names it; an unadmitted pot without an eviction record keeps its sentence
         let e = [entry(None, None, Outcome::Unresolved, Some(SeatLetter::A))];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let rows = derive_owed_rows(&inputs(&e, &[], &[], &v, &c, &p, Some(900_000)));
+        let rows = derive_and_pin(&inputs(&e, &[], &[], &v, &c, &p, Some(900_000)));
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert!(rows[0].reason.as_deref().unwrap().contains("no spend word"));
         let evicted: HashSet<String> = [tx(0x02)].into_iter().collect();
         let mut i = inputs(&e, &[], &[], &v, &c, &p, Some(900_000));
         i.evicted_pots = &evicted;
-        assert!(derive_owed_rows(&i).is_empty());
+        assert!(derive_and_pin(&i).is_empty());
     }
 
     #[test]
@@ -11415,7 +11438,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &verified, &no_pots, Some(900_000));
         i.hop_sweeps = &sweeps;
         assert!(
-            derive_owed_rows(&i).is_empty(),
+            derive_and_pin(&i).is_empty(),
             "collected: the sweep's credit is in the wallet"
         );
         // the same game ALSO has a paid pot: two candidates, the marker cannot say which; both rows stay
@@ -11427,7 +11450,7 @@ pub(crate) mod tests {
         )];
         let mut i = inputs(&paid, &[], &hops, &v, &verified, &no_pots, Some(900_200));
         i.hop_sweeps = &sweeps;
-        assert_eq!(derive_owed_rows(&i).len(), 2);
+        assert_eq!(derive_and_pin(&i).len(), 2);
     }
 
     /// bsv-low #492 / #512 (the collect pass's class: "collected N but the wallet read X to X"): a payout whose
@@ -11444,7 +11467,7 @@ pub(crate) mod tests {
         )];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         // before any filing: the row is served claimable, and it names what a device asks its wallet about
-        let rows = derive_owed_rows(&inputs(&won, &[], &[], &v, &c, &p, Some(900_200)));
+        let rows = derive_and_pin(&inputs(&won, &[], &[], &v, &c, &p, Some(900_200)));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].facts["claimable"], true);
         assert_eq!(rows[0].facts["payTxid"], tx(0x03));
@@ -11454,7 +11477,7 @@ pub(crate) mod tests {
         let mut i = inputs(&won, &[], &[], &v, &c, &p, Some(900_200));
         i.held_verified = &held;
         assert!(
-            derive_owed_rows(&i).is_empty(),
+            derive_and_pin(&i).is_empty(),
             "held: nothing to collect, nothing to press"
         );
         // a filing naming ANOTHER transaction (a spend of the pot that was replaced, another game's) retires nothing
@@ -11465,7 +11488,7 @@ pub(crate) mod tests {
             let held: HashSet<String> = [other].into_iter().collect();
             let mut i = inputs(&won, &[], &[], &v, &c, &p, Some(900_200));
             i.held_verified = &held;
-            let rows = derive_owed_rows(&i);
+            let rows = derive_and_pin(&i);
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].facts["claimable"], true);
         }
@@ -11478,7 +11501,7 @@ pub(crate) mod tests {
         )];
         let mut i = inputs(&open, &[], &[], &v, &c, &p, Some(899_000));
         i.held_verified = &held;
-        assert_eq!(derive_owed_rows(&i).len(), 1);
+        assert_eq!(derive_and_pin(&i).len(), 1);
     }
 
     /// N10 closed for a device that says WHICH: two payouts under one game (the pot paid AND a hop's sweep came
@@ -11504,7 +11527,7 @@ pub(crate) mod tests {
             let mut i = inputs(&paid, &[], &hops, &v, &v1, &no_pots, Some(900_200));
             i.hop_sweeps = &sweeps;
             i.held_verified = held;
-            derive_owed_rows(&i)
+            derive_and_pin(&i)
         };
         assert_eq!(
             rows_with(&HashSet::new()).len(),
@@ -11534,7 +11557,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &NONE, &no_pots, Some(900_000));
         i.hop_sweeps = &sweeps;
         i.held_verified = &held_sweep;
-        assert!(derive_owed_rows(&i).is_empty());
+        assert!(derive_and_pin(&i).is_empty());
     }
 
     /// The production schema on real SQLite (every overlay migration, the re-run "duplicate column" ignored).
@@ -11674,7 +11697,7 @@ pub(crate) mod tests {
             i.identity_lc = &me;
             i.collected_present = &fold.present;
             i.held_verified = &fold.held;
-            derive_owed_rows(&i)
+            derive_and_pin(&i)
         };
         assert_eq!(served().len(), N, "nothing filed: every payout is served");
         for k in 0..N {
@@ -11718,7 +11741,7 @@ pub(crate) mod tests {
         );
         i.identity_lc = &me;
         i.held_verified = &fold.held;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].game_id, games[N - 1]);
     }
@@ -11752,7 +11775,7 @@ pub(crate) mod tests {
             i.identity_lc = &me;
             i.collected_present = &fold.present;
             i.held_verified = &fold.held;
-            (derive_owed_rows(&i), fold)
+            (derive_and_pin(&i), fold)
         };
         // five planted chain rows naming (me, the game), read BEFORE any real filing (lower rowids)
         for b in 0..5u8 {
@@ -11853,7 +11876,7 @@ pub(crate) mod tests {
             i.collected_present = &fold.present;
             i.held_verified = &fold.held;
             i.hop_sweeps = &sweeps;
-            derive_owed_rows(&i)
+            derive_and_pin(&i)
         };
         // RED's shape: nothing filed, both payouts served claimable (the press that said "Collected")
         let rows = served();
@@ -12028,7 +12051,7 @@ pub(crate) mod tests {
             Some(SeatLetter::A),
         )];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let derived = derive_owed_rows(&inputs(&paid, &[], &[], &v, &c, &p, Some(900_200)));
+        let derived = derive_and_pin(&inputs(&paid, &[], &[], &v, &c, &p, Some(900_200)));
         assert_eq!(derived.len(), 1);
         assert_eq!(derived[0].family, OwedFamily::Payout);
         assert_eq!(derived[0].facts["claimable"], true, "today: a press");
@@ -12288,7 +12311,7 @@ pub(crate) mod tests {
         });
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let paid = [won.clone()];
-        let mut rows = derive_owed_rows(&inputs(&paid, &[], &[], &v, &c, &p, Some(900_200)));
+        let mut rows = derive_and_pin(&inputs(&paid, &[], &[], &v, &c, &p, Some(900_200)));
         assert_eq!(rows.len(), 1);
         assert_eq!(
             (&rows[0].facts["payTxid"], &rows[0].facts["payPkh"]),
@@ -12320,12 +12343,12 @@ pub(crate) mod tests {
         (tied.verdict, tied.outcome, tied.my_seat) =
             (Some(PotVerdict::Tie), Outcome::Tie, Some(SeatLetter::B));
         let tied = [tied];
-        let rows_b = derive_owed_rows(&inputs(&tied, &[], &[], &v, &c, &p, Some(900_200)));
+        let rows_b = derive_and_pin(&inputs(&tied, &[], &[], &v, &c, &p, Some(900_200)));
         assert_eq!(rows_b[0].facts["payPkh"], hex::encode(other));
         let mut keyless = won.clone();
         keyless.committed_keys = None;
         let keyless = [keyless];
-        let rows_k = derive_owed_rows(&inputs(&keyless, &[], &[], &v, &c, &p, Some(900_200)));
+        let rows_k = derive_and_pin(&inputs(&keyless, &[], &[], &v, &c, &p, Some(900_200)));
         assert!(rows_k[0].facts["payPkh"].is_null() && rows_k[0].facts["payVout"].is_null());
         assert!(
             rows_k[0].facts.get("payPkhSource").is_none(),
@@ -12345,7 +12368,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &hops, &v, &NONE, &p, Some(900_000));
         i.hop_sweeps = &sweeps;
         i.my_pkh_by_game = &pkhs;
-        let rows_s = derive_owed_rows(&i);
+        let rows_s = derive_and_pin(&i);
         assert_eq!(rows_s.len(), 1);
         assert_eq!(
             (
@@ -12360,7 +12383,7 @@ pub(crate) mod tests {
         // `l25_a_*`), and the route is not asked (a sweep is not in `pot_beefs`' contract)
         let mut i = inputs(&[], &[], &hops, &v, &NONE, &p, Some(900_000));
         i.hop_sweeps = &sweeps;
-        let rows_n = derive_owed_rows(&i);
+        let rows_n = derive_and_pin(&i);
         assert_eq!(
             (&rows_n[0].facts["payPkh"], &rows_n[0].facts["payVout"]),
             (&json!(home_hex), &json!(0))
@@ -12426,7 +12449,7 @@ pub(crate) mod tests {
             let hops = [mined];
             let mut i = inputs(&[], &[], &hops, &v, &NONE, &p, Some(900_000));
             i.hop_sweeps = &sweeps;
-            let mut rows = derive_owed_rows(&i);
+            let mut rows = derive_and_pin(&i);
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].facts["sweepSource"], "hopsweep-filing");
             rows.remove(0)
@@ -12504,7 +12527,7 @@ pub(crate) mod tests {
         let both = [a, b];
         let verified: HashSet<String> = [tx(0x01)].into_iter().collect();
         let (v, p) = (HashMap::new(), HashSet::new());
-        let rows = derive_owed_rows(&inputs(&both, &[], &[], &v, &verified, &p, Some(900_200)));
+        let rows = derive_and_pin(&inputs(&both, &[], &[], &v, &verified, &p, Some(900_200)));
         assert_eq!(
             rows.len(),
             2,
@@ -12525,7 +12548,7 @@ pub(crate) mod tests {
             Some(SeatLetter::A),
         )];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let in_progress = derive_owed_rows(&inputs(&e, &[], &[], &v, &c, &p, Some(899_990)));
+        let in_progress = derive_and_pin(&inputs(&e, &[], &[], &v, &c, &p, Some(899_990)));
         assert_eq!(in_progress[0].family, OwedFamily::InProgress);
         let paid = [entry(
             Some(true),
@@ -12533,7 +12556,7 @@ pub(crate) mod tests {
             Outcome::Won,
             Some(SeatLetter::A),
         )];
-        let payout = derive_owed_rows(&inputs(&paid, &[], &[], &v, &c, &p, Some(900_200)));
+        let payout = derive_and_pin(&inputs(&paid, &[], &[], &v, &c, &p, Some(900_200)));
         // stale wins whatever else
         assert!(should_recompute(true, 0, Some(1), Some(1), &[]));
         // the gate flip: the tip reached the in-progress row's recovery height since the compute
@@ -12654,7 +12677,7 @@ pub(crate) mod tests {
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
         let mut unknown = hop(HopStatus::Unknown, None, Some(10_000_000));
         unknown.spent = None;
-        let rows = derive_owed_rows(&inputs(
+        let rows = derive_and_pin(&inputs(
             &[],
             &[],
             std::slice::from_ref(&unknown),
@@ -12672,7 +12695,7 @@ pub(crate) mod tests {
         assert_eq!(rows[0].sats, Some(20_190));
         let mut pending = hop(HopStatus::Unknown, Some(&tx(0x09)), Some(10_000_000));
         pending.spent = Some(true);
-        let rows = derive_owed_rows(&inputs(
+        let rows = derive_and_pin(&inputs(
             &[],
             &[],
             std::slice::from_ref(&pending),
@@ -12693,7 +12716,7 @@ pub(crate) mod tests {
             Some(SeatLetter::A),
         )];
         let (v, c, p) = (HashMap::new(), HashSet::new(), HashSet::new());
-        let rows = derive_owed_rows(&inputs(&e, &[], &[], &v, &c, &p, Some(900_200)));
+        let rows = derive_and_pin(&inputs(&e, &[], &[], &v, &c, &p, Some(900_200)));
         let body: Value = serde_json::from_str(&owed_body(
             ME,
             Some(900_200),
@@ -12787,21 +12810,21 @@ pub(crate) mod tests {
             Some(900_000),
         );
         i.hop_sweeps = &filed_sweeps;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].family, OwedFamily::Payout);
         assert_eq!(rows[0].facts["claimable"], false); // the index's word alone: not yet
                                                        // the COURIER-RUNG lens fold (L2): the courier's word (the same spender, confirmed) no longer heals the press;
                                                        // it is the row's hint (it healed it before the fold)
         let word = chain_confirmed(&key, true, Some(true), Some(&sweep), Some(true));
         i.hop_chain = &word;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].family, OwedFamily::Payout);
         assert_eq!(rows[0].facts["claimable"], false);
         assert_eq!(rows[0].facts["spenderPresence"]["source"], "courier");
         // a chaintracks-checked mined proof of the sweep heals it
         let proofs = HashSet::from([sweep.clone()]);
         i.proof_mined_spenders = &proofs;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["claimable"], true);
         assert_eq!(rows[0].facts["sweepSource"], "hopsweep-filing");
     }
@@ -13135,7 +13158,7 @@ pub(crate) mod tests {
             i.my_pkh_by_game = &pkhs;
             i.courier_spenders = courier;
             i.home_spends = words;
-            (derive_owed_rows(&i), courier_home_outputs(&i))
+            (derive_and_pin(&i), courier_home_outputs(&i))
         };
         // not looked yet: the row of 2026-09-20, unchanged, and the walk's one candidate
         let (rows, candidates) = derive(&mine, &word(None), &courier);
@@ -13208,7 +13231,7 @@ pub(crate) mod tests {
         i.courier_spenders = &courier;
         assert!(courier_home_outputs(&i).is_empty());
         assert_eq!(
-            derive_owed_rows(&i)[0].facts["claimReason"],
+            derive_and_pin(&i)[0].facts["claimReason"],
             UNCONFIRMED_PAYOUT_REASON
         );
         // the index's own bytes are not this walk's business (the index's spend word retires those, as before)
@@ -13248,7 +13271,7 @@ pub(crate) mod tests {
             let mut i = inputs(&[], &[], &young, &v, &c, &p, Some(900_000));
             i.hop_chain = chain_word;
             i.door_refused_hop_outpoints = refused;
-            derive_owed_rows(&i)
+            derive_and_pin(&i)
         };
         // THE FIX: stranded now, the sweep press (the Collect on a stranded hop), never the felt's rejoin
         let rows = derive(&script, &unspent);
@@ -13319,7 +13342,7 @@ pub(crate) mod tests {
         i.hop_chain = &unspent;
         i.door_refused_hop_outpoints = &script;
         i.evicted_hop_outpoints = &evicted;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(
             (
                 rows[0].facts["joinRefusedBy"].clone(),
@@ -13877,7 +13900,7 @@ pub(crate) mod tests {
                 i.spender_inputs = &ins;
                 i.my_pkh_by_game = &pkhs;
                 i.courier_spenders = &couriers;
-                let mut rows = derive_owed_rows(&i);
+                let mut rows = derive_and_pin(&i);
                 assert_eq!(rows.len(), 1);
                 assert_eq!(
                     (
@@ -13919,7 +13942,7 @@ pub(crate) mod tests {
         i.my_pkh_by_game = &pkhs;
         i.courier_spenders = &couriers;
         assert_eq!(
-            derive_owed_rows(&i)[0].facts["claimReason"],
+            derive_and_pin(&i)[0].facts["claimReason"],
             COURIER_BYTES_NO_CREDIT_REASON
         );
         // 2. THE PROOF SET ASIDE: a proven filing, a refused word naming a rival whose bytes pay this home
@@ -14855,7 +14878,7 @@ pub(crate) mod tests {
             Outcome::Unresolved,
             Some(SeatLetter::A),
         )];
-        let before = derive_owed_rows(&inputs(&live, &[], &[], &v, &c, &p, Some(899_990)));
+        let before = derive_and_pin(&inputs(&live, &[], &[], &v, &c, &p, Some(899_990)));
         assert_eq!(before[0].family, OwedFamily::InProgress);
         run_owed_write(
             &mut conn,
@@ -14878,7 +14901,7 @@ pub(crate) mod tests {
             Outcome::Won,
             Some(SeatLetter::A),
         )];
-        let after = derive_owed_rows(&inputs(&spent, &[], &[], &v, &c, &p, Some(900_200)));
+        let after = derive_and_pin(&inputs(&spent, &[], &[], &v, &c, &p, Some(900_200)));
         run_owed_write(
             &mut conn,
             &owed_write_plan(ME, &after, end, Some(900_200), false),
@@ -15074,7 +15097,7 @@ pub(crate) mod tests {
         let unspent = chain(&key, true, Some(false), None);
         let mut i = inputs(&[], &[], &old, &v, &c, &p, Some(snapshot_tip));
         i.hop_chain = &unspent;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows[0].family, OwedFamily::HopStranded, "precondition");
         assert_eq!(rows[0].facts["claim"], "sweep-hop", "precondition");
         assert_eq!(rows[0].facts["claimable"], true, "precondition");
@@ -15148,7 +15171,7 @@ pub(crate) mod tests {
         let none = HashSet::new();
         let mut i = inputs(&[], &[], &old, &v, &c, &none, Some(972_190));
         i.join_spent_hops = &joined;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1, "the game keeps a row: {rows:?}");
         assert_eq!(rows[0].family, OwedFamily::Unbound, "{rows:?}");
         assert_eq!(rows[0].facts["claimable"], false);
@@ -15165,7 +15188,7 @@ pub(crate) mod tests {
         )];
         let mut i = inputs(&held, &[], &old, &v, &c, &none, Some(972_190));
         i.join_spent_hops = &joined;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert!(rows.iter().all(|r| r.outpoint != key), "{rows:?}");
         assert!(
             rows.iter().all(|r| r.facts["claim"] != "sweep-hop"),
@@ -15183,15 +15206,13 @@ pub(crate) mod tests {
             Some(HOP_STRANDED_AFTER_MS + 1),
         )];
         let pots: HashSet<String> = [pot.clone()].into_iter().collect();
-        assert!(
-            derive_owed_rows(&inputs(&[], &[], &spent, &v, &c, &pots, Some(972_190))).is_empty()
-        );
+        assert!(derive_and_pin(&inputs(&[], &[], &spent, &v, &c, &pots, Some(972_190))).is_empty());
         // (3) the CHAIN rung says a held pot spent the index-unspent hop (the refused sweep's eviction released it):
         // the game keeps a row, never a press
         let word = chain_confirmed(&key, true, Some(true), Some(&pot), Some(true));
         let mut i = inputs(&[], &[], &old, &v, &c, &pots, Some(972_190));
         i.hop_chain = &word;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].facts["joinSpentBy"], "chain");
         assert_eq!(rows[0].facts["claimable"], false);
@@ -15200,7 +15221,7 @@ pub(crate) mod tests {
         let word = chain_confirmed(&key, true, Some(true), Some(&tx(0x0a)), Some(true));
         let mut i = inputs(&[], &[], &old, &v, &c, &none, Some(972_190));
         i.hop_chain = &word;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert_ne!(rows[0].facts["claimable"], true);
@@ -15468,7 +15489,7 @@ pub(crate) mod tests {
         // the index's own word: the hop row spent by the pot, its confirmation unknown (admitted pending)
         let spent = [hop(HopStatus::Spent, Some(&pot), Some(60_000))];
         let i = inputs(&[], &[], &spent, &v, &c, &pots, Some(972_190));
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert!(
             rows.iter().all(|r| r.family != OwedFamily::HopStranded),
             "{rows:?}"
@@ -15480,7 +15501,7 @@ pub(crate) mod tests {
         let by_bytes: HashMap<String, String> = [(key.clone(), pot.clone())].into_iter().collect();
         let mut j = inputs(&[], &[], &unspent, &v, &c, &pots, Some(972_190));
         j.join_spent_hops = &by_bytes;
-        let rows = derive_owed_rows(&j);
+        let rows = derive_and_pin(&j);
         assert!(
             rows.iter().all(|r| r.family != OwedFamily::HopStranded),
             "{rows:?}"
@@ -15541,7 +15562,7 @@ pub(crate) mod tests {
             (unreached.clone(), now - 90_000),
         ];
         // the cut pass after the admission: the derivation judged the hop (no row: the pot's row tells the story)
-        let mut rows = derive_owed_rows(&i);
+        let mut rows = derive_and_pin(&i);
         assert!(rows.is_empty(), "{rows:?}");
         let carried = carry_shed_rows(&i, &mut rows, &previous);
         let left: Vec<&OwedRow> = rows.iter().filter(|r| r.outpoint == key).collect();
@@ -15557,7 +15578,7 @@ pub(crate) mod tests {
         let by_bytes: HashMap<String, String> = [(key.clone(), pot.clone())].into_iter().collect();
         let mut j = inputs(&[], &[], &unspent, &v, &c, &pots, Some(972_190));
         j.join_spent_hops = &by_bytes;
-        let mut rows = derive_owed_rows(&j);
+        let mut rows = derive_and_pin(&j);
         assert!(rows.iter().all(|r| r.family != OwedFamily::HopStranded));
         let judged_rows = rows.len();
         let carried = carry_shed_rows(&j, &mut rows, &previous);
@@ -15578,7 +15599,7 @@ pub(crate) mod tests {
         prev_pot.game_id = held[0].game_id.clone();
         let reached: Vec<(OwedRow, i64)> =
             vec![(prev_pot, now - 1_000), (unreached.clone(), now - 1_000)];
-        let mut rows = derive_owed_rows(&k);
+        let mut rows = derive_and_pin(&k);
         let judged_pot = rows.iter().filter(|r| r.outpoint == held_key).count();
         assert_eq!(carry_shed_rows(&k, &mut rows, &reached), 1, "{rows:?}");
         assert_eq!(
@@ -15616,7 +15637,7 @@ pub(crate) mod tests {
         let mut before = inputs(&[], &[], &young, &v, &c, &p, Some(972_190));
         before.hop_chain = &unspent;
         before.door_refused_hop_outpoints = &script;
-        let judged = derive_owed_rows(&before);
+        let judged = derive_and_pin(&before);
         assert_eq!(judged.len(), 1, "{judged:?}");
         assert_eq!(
             (
@@ -15630,7 +15651,7 @@ pub(crate) mod tests {
         let pots: HashSet<String> = [pot.clone()].into_iter().collect();
         let spent = [hop(HopStatus::Spent, Some(&pot), Some(60_000))];
         let after = inputs(&[], &[], &spent, &v, &c, &pots, Some(972_190));
-        assert!(derive_owed_rows(&after).is_empty());
+        assert!(derive_and_pin(&after).is_empty());
         // the stored snapshot through the shipped write and read statements
         let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
         conn.execute_batch(OWED_ROWS_CREATE).unwrap();
@@ -15842,7 +15863,7 @@ pub(crate) mod tests {
                     let mut h = inputs(&[], &[], &hops, &v, &c, &no_pots, Some(900_200));
                     h.hop_sweeps = &sweeps;
                     h.spender_words = map.then_some(&sweep_words);
-                    let hop_rows = derive_owed_rows(&h);
+                    let hop_rows = derive_and_pin(&h);
                     assert_eq!(hop_rows[0].family, OwedFamily::Payout, "{proof} {word:?}");
                     let hop_claimable = hop_rows[0].facts["claimable"].clone();
                     // the settle arm: a won pot (the payout) and an unclassified one (the block-wait sentence)
@@ -15861,7 +15882,7 @@ pub(crate) mod tests {
                         let entries = [e.clone()];
                         let mut s = inputs(&entries, &[], &[], &v, &c, &no_pots, Some(900_200));
                         s.spender_words = map.then_some(&settle_words);
-                        derive_owed_rows(&s).remove(0)
+                        derive_and_pin(&s).remove(0)
                     };
                     let payout = judge(&won);
                     assert_eq!(payout.family, OwedFamily::Payout);
@@ -15900,7 +15921,7 @@ pub(crate) mod tests {
             Outcome::Won,
             Some(SeatLetter::A),
         )];
-        rows.extend(derive_owed_rows(&inputs(
+        rows.extend(derive_and_pin(&inputs(
             &won,
             &[],
             &[],
@@ -15924,7 +15945,7 @@ pub(crate) mod tests {
                 my_sats: Some(19_800),
             },
         );
-        rows.extend(derive_owed_rows(&inputs(
+        rows.extend(derive_and_pin(&inputs(
             &open,
             &r,
             &[],
@@ -15933,7 +15954,7 @@ pub(crate) mod tests {
             &p,
             Some(900_005),
         )));
-        rows.extend(derive_owed_rows(&inputs(
+        rows.extend(derive_and_pin(&inputs(
             &open,
             &r,
             &[],
@@ -15953,7 +15974,7 @@ pub(crate) mod tests {
         let mut h = inputs(&[], &[], &young, &v, &c, &p, Some(972_190));
         h.hop_chain = &unspent;
         h.door_refused_hop_outpoints = &script;
-        rows.extend(derive_owed_rows(&h));
+        rows.extend(derive_and_pin(&h));
         rows
     }
 
@@ -16199,7 +16220,7 @@ pub(crate) mod tests {
         let spent = chain_confirmed(&key, true, Some(true), Some(&competitor), Some(true));
         let mut i2 = inputs(&[], &[], &old, &v, &c, &p, Some(971_115));
         i2.hop_chain = &spent;
-        let read2 = derive_owed_rows(&i2);
+        let read2 = derive_and_pin(&i2);
         assert_eq!(read2[0].family, OwedFamily::Unbound);
         assert!(read2[0].facts["claim"].is_null());
         assert_eq!(read2[0].facts["chainProbe"], "spent");
@@ -16446,7 +16467,7 @@ pub(crate) mod tests {
         let evicted: HashSet<String> = [key].into_iter().collect();
         let mut i = inputs(&[], &[], &old, &v, &c, &p, Some(tip));
         i.evicted_hop_outpoints = &evicted; // the JOIN was evicted: the hop is stranded now
-        derive_owed_rows(&i)
+        derive_and_pin(&i)
     }
 
     /// PIN 669b-A (RED on `9330dbe6`): the deploy's served shape is now claimable on the index's own unspent word.
@@ -16487,7 +16508,7 @@ pub(crate) mod tests {
         let evicted: HashSet<String> = [key].into_iter().collect();
         let mut i = inputs(&[], &[], &old, &v, &c, &p, Some(971_132));
         i.evicted_hop_outpoints = &evicted;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1);
         assert!(
             rows[0].facts["claim"].is_null(),
@@ -16514,7 +16535,7 @@ pub(crate) mod tests {
         let mut i = inputs(&[], &[], &old, &v, &c, &p, Some(971_132));
         i.evicted_hop_outpoints = &evicted;
         i.hop_chain = &spent;
-        let rows = derive_owed_rows(&i);
+        let rows = derive_and_pin(&i);
         assert_eq!(rows.len(), 1);
         assert!(
             rows[0].facts["claim"].is_null(),
@@ -16668,7 +16689,7 @@ pub(crate) mod tests {
         }
         let mut i = inputs(&[], &[], &old, &v, &c, &p, Some(tip));
         i.hop_chain = chain;
-        let mut rows = derive_owed_rows(&i);
+        let mut rows = derive_and_pin(&i);
         degrade_stale_sweeps(&mut rows, Some(tip), Some(tip));
         rows
     }
@@ -16951,7 +16972,7 @@ pub(crate) mod tests {
                 .collect();
             let mut i = inputs(&[], &[], &hops, &v, &c, &p, Some(h + 1));
             i.hop_chain = chain;
-            let mut rows = derive_owed_rows(&i);
+            let mut rows = derive_and_pin(&i);
             degrade_stale_sweeps(&mut rows, Some(h + 1), Some(h + 1));
             rows
         };
