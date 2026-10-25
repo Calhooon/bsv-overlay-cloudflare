@@ -64,6 +64,9 @@ pub const DIRTY_SOURCE_MARKED_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_owed_dirty_source_marked ON owed_dirty(source,markedAtMs)";
 /// The drain's round-robin: an identity's marks oldest first, read a bounded few at a time.
 pub const DIRTY_IDENTITY_MARKED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_dirty_identity_marked ON owed_dirty(identity,markedAtMs)";
+/// The D2-OWED lens's MEDIUM-5: an old worker's keyless row (`judgedAtMs` NULL: the deploy window, or a rollback to
+/// the old walk and forward again) is re-marked by the drain's age repair, bounded, over its own partial index.
+pub const UNJUDGED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_unjudged ON owed_rows(judgedAtMs,identity,gameId) WHERE judgedAtMs IS NULL";
 /// Old workers delete an identity's rows whole; their word joins must disappear in that statement too.
 pub const ROW_DELETE: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_delete_words AFTER DELETE ON owed_rows BEGIN DELETE FROM owed_row_words WHERE identity=OLD.identity AND outpoint=OLD.outpoint; END";
 

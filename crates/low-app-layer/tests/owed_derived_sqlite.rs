@@ -67,10 +67,10 @@ fn fingerprint(list: &[&str]) -> u32 {
 fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..349]), 428_073_086);
     // The count and fingerprint the overlay certifies (moved by lane D2-OWED-FOLD's appended indexes).
-    const COUNT: usize = 402;
+    const COUNT: usize = 403;
     assert_eq!(OVERLAY_MIGRATIONS.len(), COUNT);
     assert_eq!(d1::OVERLAY_MIGRATION_COUNT, COUNT);
-    const FINGERPRINT: u32 = 874_525_499;
+    const FINGERPRINT: u32 = 3_256_348_092;
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT, "the certified fingerprint");
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT);
     assert_eq!(fingerprint(OVERLAY_MIGRATIONS), FINGERPRINT);

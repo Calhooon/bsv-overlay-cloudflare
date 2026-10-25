@@ -418,3 +418,43 @@ fn d2fold_medium2_c_the_filing_fault_counter_is_seeded_by_the_overlay() {
     let seeded = bsv_overlay_cloudflare::applayer_counters::seeded_names();
     assert!(names.iter().all(|n| seeded.contains(n)));
 }
+
+/// MEDIUM-5: a keyless row (an old worker's write, or a rollback's: `judgedAtMs` NULL) is repaired by the age re-mark
+/// after the stamp too, bounded by the same 128 pending age marks, over its own partial index.
+#[tokio::test]
+async fn d2fold_medium5_the_age_repair_reaches_keyless_rows() {
+    let db = Db::new();
+    for n in 0..200usize {
+        seed_stranded_hop(&db, "legacy", &format!("k{n:03}"), &hop(20_000 + n));
+    }
+    db.exec("DELETE FROM owed_dirty");
+    // the old walk's whole-identity write: every row keyless
+    db.exec("INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs) SELECT identity,txid||':0','hop-stranded',gameId,'{\"claim\":\"sweep-hop\",\"claimable\":true}',1 FROM hopparty_records WHERE identity='legacy'");
+    assert_eq!(
+        low_app_layer::owed_backfill::mark_aged(&db).await.unwrap(),
+        128,
+        "the bound holds"
+    );
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_dirty WHERE source='age' AND identity='legacy'"),
+        128
+    );
+    drain_all(&db).await;
+    assert_eq!(low_app_layer::owed_backfill::mark_aged(&db).await.unwrap(), 72);
+    drain_all(&db).await;
+    assert_eq!(low_app_layer::owed_backfill::mark_aged(&db).await.unwrap(), 0);
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_rows WHERE identity='legacy' AND judgedAtMs IS NULL"),
+        0,
+        "every keyless row rewritten with its keys"
+    );
+    let plan = db.plan(
+        low_app_layer::owed_backfill::AGE_MARK_UNJUDGED_SQL,
+        &[SqlValue::Integer(1), SqlValue::Integer(128)],
+    );
+    assert!(
+        plan.iter().any(|d| d.contains("idx_owed_rows_unjudged")),
+        "{plan:?}"
+    );
+    assert!(!plan.iter().any(|d| d.starts_with("SCAN owed_rows") || d.starts_with("SCAN owed_dirty")), "{plan:?}");
+}

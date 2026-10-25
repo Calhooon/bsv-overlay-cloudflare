@@ -66,6 +66,12 @@ pub const STAMP_WRITE_SQL: &str =
 /// (`owed_judge::drain_dirty`), so the repair fills the drain's idle room and never delays a source's mark.
 pub const AGE_MARK_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'age',identity,?2 FROM owed_rows r INDEXED BY idx_owed_rows_judged WHERE judgedAtMs<?1 AND gameId<>'' AND NOT EXISTS (SELECT 1 FROM owed_dirty d WHERE d.identity=r.identity AND d.gameId=r.gameId AND d.source='age') ORDER BY judgedAtMs LIMIT max(0,?3-(SELECT COUNT(*) FROM owed_dirty INDEXED BY idx_owed_dirty_source_marked WHERE source='age')) ON CONFLICT(identity,gameId,source,sourceKey) DO NOTHING";
 
+/// The D2-OWED lens's MEDIUM-5: the subjects of KEYLESS rows (`judgedAtMs` NULL: an old worker's write in the deploy
+/// window, or a rollback to the old walk and forward again), marked `age` in the same room as [`AGE_MARK_SQL`]: run
+/// first in one batch, the two together never past [`OWED_AGE_REMARKS_PER_PASS`] pending. The judge rewrites each
+/// with its keys, so the set drains; a game no source names any more is judged away.
+pub const AGE_MARK_UNJUDGED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'age',identity,?1 FROM (SELECT DISTINCT r.identity,r.gameId FROM owed_rows r INDEXED BY idx_owed_rows_unjudged WHERE r.judgedAtMs IS NULL AND r.gameId<>'' AND NOT EXISTS (SELECT 1 FROM owed_dirty d WHERE d.identity=r.identity AND d.gameId=r.gameId AND d.source='age') LIMIT max(0,?2-(SELECT COUNT(*) FROM owed_dirty INDEXED BY idx_owed_dirty_source_marked WHERE source='age'))) WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO NOTHING";
+
 /// Where a pass stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Stop {
@@ -294,16 +300,22 @@ pub async fn backfill_pass(
 pub async fn mark_aged(db: &impl SqlPort) -> Result<u64, String> {
     let now = db.now_ms() as i64;
     let out = db
-        .run_batch(vec![Stmt {
-            sql: AGE_MARK_SQL.into(),
-            binds: vec![
-                Bind::Int(now - OWED_AGE_REMARK_AFTER_MS),
-                Bind::Int(now),
-                Bind::Int(OWED_AGE_REMARKS_PER_PASS as i64),
-            ],
-        }])
+        .run_batch(vec![
+            Stmt {
+                sql: AGE_MARK_UNJUDGED_SQL.into(),
+                binds: vec![Bind::Int(now), Bind::Int(OWED_AGE_REMARKS_PER_PASS as i64)],
+            },
+            Stmt {
+                sql: AGE_MARK_SQL.into(),
+                binds: vec![
+                    Bind::Int(now - OWED_AGE_REMARK_AFTER_MS),
+                    Bind::Int(now),
+                    Bind::Int(OWED_AGE_REMARKS_PER_PASS as i64),
+                ],
+            },
+        ])
         .await?;
-    let marked = out.first().and_then(|o| o.changes).unwrap_or(0);
+    let marked = out.iter().filter_map(|o| o.changes).sum::<u64>();
     if marked > 0 {
         db.counters(vec![(COUNTER_AGED.into(), marked)]).await;
     }

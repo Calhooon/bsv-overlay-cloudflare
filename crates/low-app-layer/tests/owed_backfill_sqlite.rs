@@ -485,8 +485,13 @@ async fn owed893_backfill_f_the_age_remark_is_bounded_once_a_day_and_indexed() {
         128
     );
     assert_eq!(
-        db.count("SELECT COUNT(*) FROM owed_dirty WHERE identity IN ('fresh','legacy')"),
+        db.count("SELECT COUNT(*) FROM owed_dirty WHERE identity='fresh'"),
         0
+    );
+    // the D2-OWED lens's MEDIUM-5: the keyless (legacy) row is repaired too, first, inside the same 128
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM owed_dirty WHERE identity='legacy'"),
+        1
     );
     let gen: i64 = db.count("SELECT MAX(generation) FROM owed_dirty");
     assert_eq!(
@@ -495,12 +500,13 @@ async fn owed893_backfill_f_the_age_remark_is_bounded_once_a_day_and_indexed() {
         "a pending age mark is not rewritten"
     );
     assert_eq!(db.count("SELECT MAX(generation) FROM owed_dirty"), gen);
-    // The drain judges them (restamping judgedAtMs); the next marks are the remaining 22, then none for a day.
+    // The drain judges them (restamping judgedAtMs; the legacy row names no source and is judged away); the next
+    // marks are the remaining 23, then none for a day.
     while db.count("SELECT COUNT(*) FROM owed_dirty") > 0 {
         let r = judge::drain_dirty(&db, 64).await.unwrap();
         assert!(r.faults.is_empty(), "{:?}", r.faults);
     }
-    assert_eq!(backfill::mark_aged(&db).await.unwrap(), 22);
+    assert_eq!(backfill::mark_aged(&db).await.unwrap(), 23);
     while db.count("SELECT COUNT(*) FROM owed_dirty") > 0 {
         judge::drain_dirty(&db, 64).await.unwrap();
     }
@@ -512,7 +518,7 @@ async fn owed893_backfill_f_the_age_remark_is_bounded_once_a_day_and_indexed() {
         128,
         "a day later, again"
     );
-    assert_eq!(db.counters.borrow()[backfill::COUNTER_AGED], 128 + 22 + 128);
+    assert_eq!(db.counters.borrow()[backfill::COUNTER_AGED], 128 + 23 + 128);
     // At most 128 age marks are ever pending, and a source's mark marked after them is judged first.
     db.exec("DELETE FROM owed_dirty");
     db.now
