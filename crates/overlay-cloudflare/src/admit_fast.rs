@@ -44,6 +44,8 @@ use crate::d1::{QVal, Query};
 use async_trait::async_trait;
 use worker::D1Database;
 
+pub use crate::eviction_write::{RELEASED_GAME_READ_SQL, RELEASED_HOP_READ_SQL};
+
 /// What a status-only callback means for the index (PURE; pinned).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallbackAction {
@@ -248,7 +250,11 @@ pub async fn table_columns(db: &D1Database, table: &str) -> Vec<ColumnInfo> {
 
 /// Make sure the twin exists and carries every column the source has now (over the shadow storage: D1 in
 /// production, SQLite under the pins).
-async fn ensure_shadow(db: &dyn ShadowDb, table: &str, cols: &[ColumnInfo]) -> Result<(), String> {
+pub(crate) async fn ensure_shadow(
+    db: &dyn ShadowDb,
+    table: &str,
+    cols: &[ColumnInfo],
+) -> Result<(), String> {
     let twin = shadow_table(table);
     let have = db.columns(&twin).await?;
     if have.is_empty() {
@@ -443,75 +449,6 @@ pub async fn record_conflict_spender(
         crate::pot_changes::note(&outpoint_txid, vout);
     }
     Ok(hit)
-}
-
-#[derive(serde::Deserialize)]
-struct PotSpendRow {
-    txid: String,
-    #[serde(rename = "outputIndex")]
-    output_index: i64,
-    #[serde(rename = "spentConfirmed", default)]
-    spent_confirmed: i64,
-}
-
-/// Release every UNCONFIRMED spend pointer the txid left on other rows; the
-/// list goes on the ledger row for the readmission. Never fails the eviction:
-/// a faulted read releases nothing (logged), a faulted write leaves the rows
-/// as they were; a confirmed pointer is counted and kept. The flag is whether the read or the write faulted
-/// (bsv-low #831, the FIX-831-B lens's LOW-2: `EvictionOutcome::incomplete`).
-async fn release_spends_of(db: &D1Database, txid: &str) -> (Vec<ReleasedSpend>, bool) {
-    let mut released = Vec::new();
-    let pot_cols = table_columns(db, "pot_records").await;
-    if !pot_cols.iter().any(|c| c.name == "spendingTxid") {
-        return (released, false);
-    }
-    let rows = match Query::new(select_pot_spends_sql(&pot_cols))
-        .bind(txid)
-        .fetch_all::<PotSpendRow>(db)
-        .await
-    {
-        Ok(rows) => rows,
-        Err(e) => {
-            worker::console_log!(
-                "[admit-fast] evict {txid}: reading its pot_records spends failed: {e} — nothing released"
-            );
-            return (released, true);
-        }
-    };
-    let (kept, movable): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| r.spent_confirmed != 0);
-    if !kept.is_empty() {
-        worker::console_log!(
-            "[admit-fast] evict {txid}: {} CONFIRMED spend pointer(s) kept (a proven spend is never released on a courier's word)",
-            kept.len()
-        );
-    }
-    if movable.is_empty() {
-        return (released, false);
-    }
-    let mut faulted = false;
-    match Query::new(release_pot_spends_sql(&pot_cols))
-        .bind(txid)
-        .execute(db)
-        .await
-    {
-        Ok(()) => {
-            for r in movable {
-                crate::pot_changes::note(&r.txid, r.output_index.max(0) as u32);
-                released.push(ReleasedSpend {
-                    table: "pot_records".into(),
-                    txid: r.txid.to_ascii_lowercase(),
-                    vout: r.output_index.max(0) as u32,
-                });
-            }
-        }
-        Err(e) => {
-            faulted = true;
-            worker::console_log!(
-                "[admit-fast] evict {txid}: releasing its pot_records spends failed: {e}"
-            )
-        }
-    }
-    (released, faulted)
 }
 
 /// Re-mark the spends a readmitted tx had left (the ledger row's list): a
@@ -874,6 +811,10 @@ pub const READMITTED_AFTER_SQL: &str =
 /// The ledger's released list for the merge (the gate's LOW-1).
 pub const RELEASED_SPENDS_SQL: &str = "SELECT releasedSpends FROM pot_evictions WHERE txid = ?";
 
+/// A clean readmission supersedes released-hop evidence through the ledger, preserving every evidence row.
+pub const READMIT_EVICTION_SQL: &str =
+    "UPDATE pot_evictions SET readmittedAt = ? WHERE txid = ? AND readmittedAt IS NULL";
+
 /// An eviction the ledger holds OPEN (not readmitted): what every admission writer must honour.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenEviction {
@@ -1169,7 +1110,7 @@ pub struct EvictionCore {
 }
 
 /// The ledger's readmission stamp newer than a pass's own (the gate's LOW-4 / NEW-1), over the shadow storage.
-async fn readmitted_after(
+pub(crate) async fn readmitted_after(
     db: &dyn ShadowDb,
     txid: &str,
     now_ms: u64,
@@ -1358,14 +1299,8 @@ pub async fn evict_txid_everywhere_repointed(
     let now_ms = asked_ms;
     let mut pot_vouts = vouts_of(db, "pot_records", &txid).await;
     let mut advert_vouts = vouts_of(db, "low_records", &txid).await;
-    let (core, abort) = evict_core_with_abort(
-        db,
-        &txid,
-        reason,
-        now_ms,
-        Some((db, crate::admission_abort::managers_that_abort())),
-    )
-    .await;
+    let (core, abort, released) =
+        crate::eviction_write::evict(db, &txid, reason, now_ms, repointed).await;
     let moved = core.moved;
     for v in &core.pot_vouts {
         if !pot_vouts.contains(v) {
@@ -1397,40 +1332,7 @@ pub async fn evict_txid_everywhere_repointed(
             crate::lobby_changes::note_admitted(&txid, *v);
         }
     }
-    // the spends it left on the rows it consumed (its hops, its pot) — released, and MERGED with the ledger's
-    // list; NOT when the pass yielded to a readmission (the readmission re-marked them: they stand)
-    let (mut released, release_faulted) = if core.yielded_to_readmission.is_some() {
-        (Vec::new(), false)
-    } else {
-        release_spends_of(db, &txid).await
-    };
-    released.extend(repointed.iter().cloned());
-    let existing_json = match Query::new(RELEASED_SPENDS_SQL)
-        .bind(txid.as_str())
-        .fetch_optional::<ReleasedJsonRow>(db)
-        .await
-    {
-        Ok(row) => row.and_then(|r| r.released_spends),
-        Err(e) => {
-            worker::console_log!("[admit-fast] evict {txid}: the ledger's released list could not be read ({e}) — this pass's list is written");
-            None
-        }
-    };
-    let merged = merge_released(existing_json.as_deref(), &released);
-    let released_json = serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into());
-    // THE CLOSE: the pass's rows added to the open row (an upsert: a faulted marker still leaves the row); a
-    // readmission stamped after this pass's stamp is kept (the pass yielded to it above)
-    if let Err(e) = Query::new(CLOSE_EVICTION_MARKER_SQL)
-        .bind(txid.as_str())
-        .bind(reason)
-        .bind(QVal::Int(now_ms as i64))
-        .bind(QVal::Int(moved as i64))
-        .bind(released_json.as_str())
-        .execute(db)
-        .await
-    {
-        worker::console_log!("[admit-fast] evict {txid}: the ledger row failed: {e}");
-    }
+    // The move, releasedSpends, close and evidence have committed together before any manager is told.
     // Finish the ledger close before awaiting a manager (IDENT-ENGINE-LENS LOW-1).
     // the reference tells its managers `abortAdmissibleOutputs` when a `current-tx` broadcast throws after they
     // identified their outputs (`Engine.ts:1219-1223` at ts-stack f999e0c1a); this door learns the network's refusal
@@ -1475,12 +1377,6 @@ pub async fn evict_txid_everywhere_repointed(
             }
         }
     }
-    if release_faulted && core.faults.is_empty() {
-        crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_EVICT_INCOMPLETE, 1).await;
-        worker::console_log!(
-            "[admit-fast] evict {txid} INCOMPLETE (the release of its spend pointers faulted): the row is OPEN; the next accept, proof or eviction converges"
-        );
-    }
     if !core.faults.is_empty() {
         crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_EVICT_INCOMPLETE, 1).await;
         worker::console_log!(
@@ -1511,7 +1407,7 @@ pub async fn evict_txid_everywhere_repointed(
     EvictionOutcome {
         moved,
         yielded: core.yielded_to_readmission.is_some(),
-        incomplete: !core.faults.is_empty() || release_faulted,
+        incomplete: !core.faults.is_empty(),
     }
 }
 
@@ -1638,13 +1534,11 @@ pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> boo
     // the stamp is THIS moment's clock (round 3, residual A): a pass whose clock read predates this restore but
     // whose marker lands after it must read the readmission as newer
     let stamp_ms = worker::Date::now().as_millis();
-    if let Err(e) = Query::new(
-        "UPDATE pot_evictions SET readmittedAt = ? WHERE txid = ? AND readmittedAt IS NULL",
-    )
-    .bind(QVal::Int(stamp_ms as i64))
-    .bind(txid.as_str())
-    .execute(db)
-    .await
+    if let Err(e) = Query::new(READMIT_EVICTION_SQL)
+        .bind(QVal::Int(stamp_ms as i64))
+        .bind(txid.as_str())
+        .execute(db)
+        .await
     {
         worker::console_log!("[admit-fast] readmit {txid}: the stamp failed ({e}) — the row stays open (the rows are back; the next accept or proof stamps it)");
         crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_READMIT_INCOMPLETE, 1).await;
@@ -4156,10 +4050,11 @@ mod tests {
     #[test]
     fn the_eviction_releases_and_the_readmission_re_marks_the_consumed_spends() {
         let src = include_str!("admit_fast.rs");
-        let evict = &src[src.find("pub async fn evict_txid_everywhere(").unwrap()..];
-        let evict = &evict[..evict.find("struct EvictedRow").unwrap()];
+        let write = include_str!("eviction_write.rs");
+        let evict = &write[write.find("pub(crate) fn plan(").unwrap()..];
+        let evict = &evict[..evict.find("\n}\n").unwrap()];
         let release = evict
-            .find("release_spends_of(db, &txid)")
+            .find("release_pot_spends_sql(cols)")
             .expect("the eviction releases");
         let ledger = evict
             .find("Query::new(CLOSE_EVICTION_MARKER_SQL)")
@@ -4414,17 +4309,24 @@ mod tests {
             .find("pub async fn evict_txid_everywhere_repointed(")
             .unwrap()..];
         let w = &w[..w.find("struct EvictedRow").unwrap()];
-        let release = w.find("release_spends_of(db, &txid)").expect("the release");
-        let add = w
-            .find("released.extend(repointed.iter().cloned())")
+        assert!(w.contains("crate::eviction_write::evict(db, &txid, reason, now_ms, repointed)"));
+        let write = include_str!("eviction_write.rs");
+        let snapshot = &write[write.find("async fn snapshot(").unwrap()..];
+        let release = snapshot
+            .find("select_pot_spends_sql(cols)")
+            .expect("the spends read");
+        let add = snapshot
+            .find("out.released.extend(repointed.iter().cloned())")
             .expect("the re-pointed added");
-        let merge = w.find("merge_released(").expect("the merge");
-        let close = w
-            .find("Query::new(CLOSE_EVICTION_MARKER_SQL)")
-            .expect("the close");
+        let merge = snapshot.find("merge_released(").expect("the merge");
         assert!(
-            release < add && add < merge && merge < close,
-            "release, add, merge, close"
+            release < add && add < merge,
+            "read the spends, add the re-pointed ones, merge"
+        );
+        let plan = &write[write.find("pub(crate) fn plan(").unwrap()..];
+        assert!(
+            plan.find("merge_releases_sql(cols)").unwrap()
+                < plan.find("Query::new(CLOSE_EVICTION_MARKER_SQL)").unwrap()
         );
         let pass = &src[src
             .find("pub async fn converge_confirmed_conflict(")
@@ -4472,28 +4374,25 @@ mod tests {
             core[pre..passes].contains("return (core, None);"),
             "a readmission found BEFORE the passes: nothing moves"
         );
-        // the wrapper: the core → the release unless the pass yielded → the merge → the close → the counters
+        // The wrapper awaits the atomic move and close before the counters and notifications.
         let evict = &src[src.find("pub async fn evict_txid_everywhere(").unwrap()..];
         let evict = &evict[..evict.find("struct EvictedRow").unwrap()];
         let c = evict
-            .find("evict_core_with_abort(")
-            .expect("the core");
-        let release = evict
-            .find("release_spends_of(db, &txid)")
-            .expect("the release");
-        let merge = evict
-            .find("merge_released(")
-            .expect("the released list merged");
-        let close = evict
-            .find("Query::new(CLOSE_EVICTION_MARKER_SQL)")
-            .expect("the close");
+            .find("crate::eviction_write::evict(")
+            .expect("the atomic core");
+        let atomic = include_str!("eviction_write.rs");
+        let plan = &atomic[atomic.find("pub(crate) fn plan(").unwrap()..];
         assert!(
-            c < release && release < merge && merge < close,
-            "core → release → merge → close"
+            plan.find("merge_releases_sql(cols)").unwrap()
+                < plan.find("release_pot_spends_sql(cols)").unwrap()
+                && plan.find("release_pot_spends_sql(cols)").unwrap()
+                    < plan.find("Query::new(CLOSE_EVICTION_MARKER_SQL)").unwrap(),
+            "merge the current release list, release, close in one batch"
         );
         assert!(
-            evict[..release].contains("core.yielded_to_readmission.is_some()"),
-            "no release when the pass yielded to a readmission (the readmission re-marked them)"
+            c < evict.find("COUNTER_ADMIT_FAST_EVICT_INCOMPLETE").unwrap()
+                && plan.find("READMISSION_FENCE_SQL").unwrap() < plan.find("move_sql(").unwrap(),
+            "a readmission fences the batch before any move or release"
         );
         assert!(
             evict.contains("COUNTER_ADMIT_FAST_EVICT_INCOMPLETE"),
@@ -4630,9 +4529,7 @@ mod tests {
             .find("COUNTER_ADMIT_FAST_READMIT_INCOMPLETE")
             .expect("the incomplete counter");
         let stamp = readmit
-            .find(
-                "UPDATE pot_evictions SET readmittedAt = ? WHERE txid = ? AND readmittedAt IS NULL",
-            )
+            .find("Query::new(READMIT_EVICTION_SQL)")
             .expect("the stamp");
         assert!(
             restore_at < incomplete && incomplete < stamp,
@@ -4969,16 +4866,12 @@ mod tests {
         let src = include_str!("admit_fast.rs");
         let wrapper = &src[src.find("pub async fn evict_txid_everywhere_repointed(").unwrap()..];
         let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap()];
-        let release = wrapper.find("release_spends_of(db, &txid)").unwrap();
-        let merge = wrapper.find("merge_released(").unwrap();
-        let close = wrapper
-            .find("Query::new(CLOSE_EVICTION_MARKER_SQL)")
-            .unwrap();
-        let close_finished = close + wrapper[close..].find("\n    }\n").unwrap();
+        let close = wrapper.find("crate::eviction_write::evict(").unwrap();
+        let close_finished = close + wrapper[close..].find(".await;").unwrap();
         let tell = wrapper.find("crate::admission_abort::tell(").unwrap();
         assert!(
-            release < merge && merge < close && close_finished < tell,
-            "release, merge, and finish the ledger close before awaiting the abort"
+            close_finished < tell,
+            "finish the atomic move, release and ledger close before awaiting the abort"
         );
     }
 
@@ -5085,9 +4978,10 @@ mod tests {
             .find("pub async fn evict_txid_everywhere_repointed(")
             .unwrap()..];
         let w = &w[..w.find("\n}\n").unwrap()];
-        assert!(w.contains("evict_core_with_abort("));
-        assert!(w.contains("crate::admission_abort::managers_that_abort()"));
-        let close = w.find("Query::new(CLOSE_EVICTION_MARKER_SQL)").unwrap();
+        assert!(w.contains("crate::eviction_write::evict("));
+        let atomic = include_str!("eviction_write.rs");
+        assert!(atomic.contains("crate::admission_abort::managers_that_abort()"));
+        let close = w.find("crate::eviction_write::evict(").unwrap();
         let tell_gate = close
             + w[close..]
                 .find("if core.yielded_to_readmission.is_none()")
