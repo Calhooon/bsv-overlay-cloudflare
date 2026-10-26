@@ -44,6 +44,10 @@ export class OwedPin {
   }
   async fetch(req) {
     const url = new URL(req.url)
+    if (url.pathname === '/pin/belt-alarm') {
+      await this.state.storage.put('owed-belt', true)
+      return this.inner.alarm()
+    }
     if (url.pathname === '/pin/state') return Response.json({keys: Object.fromEntries(await this.state.storage.list()), alarm: await this.state.storage.getAlarm()})
     if (url.pathname === '/pin/duplicate-alarm') {
       await this.inner.alarm()

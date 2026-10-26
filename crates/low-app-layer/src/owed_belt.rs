@@ -26,6 +26,11 @@ use serde_json::Value;
 use std::cell::RefCell;
 
 pub const OWED_BELT_TICK_MS: i64 = 120_000;
+/// A drain gets the same 17 s working wall on the alarm and scheduled pass. The alarm reserves the rest of its
+/// 27 s working wall for the courier tick; slow couriers cannot consume the dirty drain's reservation.
+pub const OWED_DRAIN_WALL_MS: u64 = 20_000;
+pub const OWED_DRAIN_RESERVE_MS: u64 = 3_000;
+pub const OWED_ALARM_WALL_MS: u64 = 30_000;
 pub const OWED_BELT_OUTPOINTS_PER_TICK: usize = 8;
 pub const OWED_BELT_CALLS_PER_TICK: usize = 24;
 pub const OWED_BELT_CALLS_PER_OUTPOINT: usize = 3;
@@ -912,6 +917,84 @@ pub async fn arm(env: &worker::Env) -> worker::Result<()> {
     Ok(())
 }
 
+/// The scheduled pass's drain runs in the very same actor as the alarm's. The actor serializes both turns.
+pub async fn drain(env: &worker::Env) -> worker::Result<()> {
+    let mut response = env
+        .durable_object("BOARD_VIEW")?
+        .id_from_name(OWED_BELT_ACTOR)?
+        .get_stub()?
+        .fetch_with_str("https://board-view/owed-drain")
+        .await?;
+    if response.status_code() != 200 {
+        return Err(worker::Error::RustError(format!(
+            "owed drain refused ({}): {}", response.status_code(), response.text().await?
+        )));
+    }
+    Ok(())
+}
+
+/// Called only while the belt actor holds its turn. A fault or wall leaves the unacknowledged marks for the next
+/// turn. The daily age repair stays on the scheduled pass; both triggers drain at most 64 subjects.
+pub async fn drain_env(env: &worker::Env, repair_age: bool) -> worker::Result<owed_judge::DrainReport> {
+    let deadline = crate::routes::worker_deadline(OWED_DRAIN_WALL_MS, OWED_DRAIN_RESERVE_MS);
+    let work = async {
+        crate::schema::ensure_latch_columns(env).await;
+        let tip = crate::routes::chaintracks_present_height_env(env, "owed").await.ok();
+        let judge = owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))?;
+        if repair_age {
+            if let Err(error) = crate::owed_backfill::mark_aged(&judge).await {
+                worker::console_warn!("[owed] age re-mark deferred: {error}");
+            }
+        }
+        owed_judge::drain_dirty(&judge, owed_judge::OWED_DIRTY_SUBJECTS_PER_PASS)
+            .await.map_err(worker::Error::RustError)
+    };
+    match deadline.run_reserving(work).await {
+        Some(Ok(report)) => {
+            for (_, error) in &report.faults {
+                worker::console_warn!("[owed] {} judgement deferred: {error}", if repair_age { "scheduled" } else { "alarm" });
+            }
+            Ok(report)
+        }
+        Some(Err(error)) => Err(error),
+        None => Err(worker::Error::RustError("owed drain reached its wall".into())),
+    }
+}
+
+/// The 120 s alarm: drain first under its own reservation, then give the courier tick the remaining wall. Its
+/// meter is returned and logged separately from the scheduled pass's durable row.
+pub async fn alarm_env(env: &worker::Env) -> worker::Result<worker::Response> {
+    let deadline = crate::routes::worker_deadline(OWED_ALARM_WALL_MS, OWED_DRAIN_RESERVE_MS);
+    let meter = crate::pass_meter::PassMeter::new(Box::new(|| worker::Date::now().as_millis()), 1);
+    let drain = match meter.phase("owed.drain", drain_env(env, false)).await {
+        Ok(report) => serde_json::json!({"subjects": report.subjects, "faults": report.faults.len()}),
+        Err(error) => {
+            worker::console_warn!("[owed] alarm drain deferred: {error}");
+            serde_json::json!({"error": error.to_string()})
+        }
+    };
+    let tick = match meter.phase("owed.belt_tick", deadline.run_reserving(tick_env(env))).await {
+        Some(Ok(report)) => serde_json::json!({
+            "candidates": report.candidates, "asked": report.asked, "found": report.found,
+            "rearmed": report.rearmed, "calls": report.calls,
+        }),
+        Some(Err(error)) => {
+            worker::console_warn!("[owed-belt] tick faulted: {error}");
+            serde_json::json!({"error": error})
+        }
+        None => {
+            worker::console_warn!("[owed-belt] tick reached its wall");
+            serde_json::json!({"error": "owed belt tick reached its wall"})
+        }
+    };
+    let walls = meter.task_done().expect("one alarm task");
+    worker::console_log!("{}", walls.line().replace("[scheduled-pass]", "[owed-alarm]"));
+    worker::Response::from_json(&serde_json::json!({
+        "drain": drain, "tick": tick, "wallMs": walls.wall_ms(),
+        "phases": serde_json::from_str::<Value>(&walls.phases_json()).unwrap_or_default(),
+    }))
+}
+
 /// The alarm's tick (in the actor): the tip, the era, the judge's production port and the production courier.
 pub async fn tick_env(env: &worker::Env) -> Result<TickReport, String> {
     crate::schema::ensure_latch_columns(env).await;
@@ -958,7 +1041,7 @@ mod tests {
             .find("storage.set_alarm(crate::owed_belt::OWED_BELT_TICK_MS).await?;")
             .expect("the alarm re-arms");
         let tick = alarm
-            .find("crate::owed_belt::tick_env(&self.env).await")
+            .find("crate::owed_belt::alarm_env(&self.env).await")
             .expect("the alarm ticks");
         assert!(rearm < tick, "re-armed before the tick runs");
         assert!(actor.contains(&squash(

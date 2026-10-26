@@ -52,6 +52,8 @@ pub struct BoardView {
     /// #642: slot `i` holds the `(cursor, limit)` cached under
     /// `CURSOR_KEY_BASE + i`.
     cursor_slots: RefCell<Vec<(String, u32)>>,
+    /// The alarm and scheduled drain share one actor and never select the same dirty generation concurrently.
+    owed_turn: futures_util::lock::Mutex<()>,
 }
 
 impl DurableObject for BoardView {
@@ -63,6 +65,7 @@ impl DurableObject for BoardView {
             computed: Rc::new(RefCell::new(HashMap::new())),
             refreshing: Rc::new(RefCell::new(HashSet::new())),
             cursor_slots: RefCell::new(Vec::new()),
+            owed_turn: futures_util::lock::Mutex::new(()),
         }
     }
 
@@ -111,6 +114,16 @@ impl BoardView {
 
     async fn serve_fetch(&self, req: Request) -> Result<Response> {
         let url = req.url()?;
+        if req.path() == "/owed-drain" {
+            let _turn = self.owed_turn.lock().await;
+            return match crate::owed_belt::drain_env(&self.env, true).await {
+                Ok(report) => Response::from_json(&serde_json::json!({
+                    "subjects": report.subjects,
+                    "faults": report.faults.len(),
+                })),
+                Err(error) => Response::error(error.to_string(), 503),
+            };
+        }
         // bsv-low #893 section 5: the belt's singleton actor (`owed_belt::OWED_BELT_ACTOR`). The scheduled pass asks
         // it on every cron (the watchdog): an alarm already set is kept, a lost one is set to fire at once.
         if req.path() == "/owed-belt-arm" {
@@ -205,19 +218,8 @@ impl BoardView {
         storage
             .set_alarm(crate::owed_belt::OWED_BELT_TICK_MS)
             .await?;
-        match crate::owed_belt::tick_env(&self.env).await {
-            Ok(report) => Response::from_json(&serde_json::json!({
-                "candidates": report.candidates,
-                "asked": report.asked,
-                "found": report.found,
-                "rearmed": report.rearmed,
-                "calls": report.calls,
-            })),
-            Err(e) => {
-                console_warn!("[owed-belt] tick faulted: {e}");
-                Response::ok("owed belt tick faulted")
-            }
-        }
+        let _turn = self.owed_turn.lock().await;
+        crate::owed_belt::alarm_env(&self.env).await
     }
 }
 

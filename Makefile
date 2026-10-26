@@ -637,6 +637,7 @@ ci-d1-budget:
 	D1_BUDGET_SEED="$$state/seed.sql" D1_BUDGET_STATE="$$state" node tools/lane-499/d1_budget_route_ci.mjs http://127.0.0.1:$$PA http://127.0.0.1:$$PO; \
 	python3 tools/lane-ns2/register_pin.py; \
 	D1_BUDGET_SEED_V3="$$seed_v3" npx --package wrangler -c 'node tools/lane-ns2/owed_do_pins.mjs'; \
+	D1_BUDGET_SEED_V3="$$seed_v3" npx --package wrangler -c 'node tools/lane-906/owed_cadence.mjs'; \
 	node tools/lane-499/tracker_fault_route_ci.mjs http://127.0.0.1:$$PA "$$state"; \
 	python3 scripts/d1-census.py --self-test; \
 	python3 scripts/d1-census.py --app http://127.0.0.1:$$PA --overlay http://127.0.0.1:$$PO; \

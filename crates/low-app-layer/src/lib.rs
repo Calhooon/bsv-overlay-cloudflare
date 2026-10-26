@@ -274,28 +274,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     let meter_owed = meter.clone();
     ctx.wait_until(async move {
         let deadline = routes::worker_deadline(20_000, 3_000);
-        let work = async {
-            schema::ensure_latch_columns(&env_owed).await;
-            let tip = routes::chaintracks_present_height_env(&env_owed, "owed")
-                .await
-                .ok();
-            let judge = owed_judge::D1Judge::new(
-                &env_owed,
-                tip,
-                routes::written_off_before_ms_env(&env_owed),
-            )?;
-            // bsv-low #893 risk 8.2's third repair: the rows judged over a day ago re-marked, once a day each.
-            if let Err(error) = owed_backfill::mark_aged(&judge).await {
-                worker::console_warn!("[owed] age re-mark deferred: {error}");
-            }
-            let report = owed_judge::drain_dirty(&judge, owed_judge::OWED_DIRTY_SUBJECTS_PER_PASS)
-                .await
-                .map_err(worker::Error::RustError)?;
-            for (_, error) in report.faults {
-                worker::console_warn!("[owed] scheduled judgement deferred: {error}");
-            }
-            Ok::<(), worker::Error>(())
-        };
+        let work = owed_belt::drain(&env_owed);
         match meter_owed
             .phase("owed.drain", deadline.run_reserving(work))
             .await

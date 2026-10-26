@@ -2142,6 +2142,8 @@ pub async fn health_invariants(
     });
 
     body["conflictPass"] = conflict_pass;
+    // #906: frame age beside the existing counts; keep changeParked for readers of the original surface.
+    body["changePark"] = body["changeParked"].clone();
     // bsv-low #893 section 5: the app layer's owed belt, the one place the owed list asks the chain explorers.
     body["owedBelt"] = crate::applayer_counters::owed_belt_view(&counters);
     // bsv-low #781, #778 (B-FLEET-4): the app layer's last scheduled pass, its wall and each phase's wall, as the

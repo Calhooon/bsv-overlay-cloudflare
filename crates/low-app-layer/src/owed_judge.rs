@@ -124,6 +124,22 @@ pub fn counter_names() -> Vec<String> {
     vec![COUNTER_FILING_FAULTS.to_owned()]
 }
 pub const OWED_DIRTY_SUBJECTS_PER_PASS: usize = 64;
+/// The live backlog, including wanted envelopes. NULL oldest means there are no marks.
+pub const DIRTY_HEALTH_SQL: &str =
+    "SELECT COUNT(*) AS count, MIN(markedAtMs) AS oldest FROM owed_dirty";
+
+pub async fn dirty_health(db: &impl SqlPort) -> Value {
+    match db.run_batch(vec![Stmt { sql: DIRTY_HEALTH_SQL.into(), binds: vec![] }]).await {
+        Ok(rows) => match rows.first().and_then(|out| out.rows.first()) {
+            Some(row) => json!({
+                "count": row["count"],
+                "oldestMarkAgeMs": row["oldest"].as_u64().map(|at| db.now_ms().saturating_sub(at)),
+            }),
+            None => Value::Null,
+        },
+        Err(_) => Value::Null,
+    }
+}
 /// A wanted envelope expands to the identity's newest games only (the design's section 4.1 bound, the D2-OWED lens's
 /// MEDIUM-1); the rest are marked `backfill` and wait their identity's turn like any other mark.
 pub const OWED_WANTED_GAMES: usize = 32;
@@ -1083,4 +1099,21 @@ pub(crate) fn assert_fixture_roundtrip(i: &OwedInputs<'_>) {
         previous.to_string(),
         "the stable owed body bytes must survive the joined read"
     );
+}
+
+#[cfg(test)]
+mod cadence_health_tests {
+    use super::*;
+    #[tokio::test]
+    async fn owed906_dirty_age_is_live_and_unreadable_is_not_empty() {
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        db.now.set(900_000);
+        assert_eq!(dirty_health(&db).await, json!({"count":0,"oldestMarkAgeMs":null}));
+        db.conn.execute("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('seat','game','pot','pot:0',1000),('seat','other','word','word',800000)", []).unwrap();
+        assert_eq!(dirty_health(&db).await, json!({"count":2,"oldestMarkAgeMs":899000}));
+        db.conn.execute("DELETE FROM owed_dirty WHERE gameId='game'", []).unwrap();
+        assert_eq!(dirty_health(&db).await, json!({"count":1,"oldestMarkAgeMs":100000}));
+        db.conn.execute("DROP TABLE owed_dirty", []).unwrap();
+        assert_eq!(dirty_health(&db).await, Value::Null);
+    }
 }
