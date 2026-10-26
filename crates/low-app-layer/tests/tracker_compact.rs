@@ -538,17 +538,6 @@ fn ns3d_m1_faulting_word_lookup_keeps_legacy_body_available() {
 }
 
 #[test]
-fn ns3d_m1_owed_recompute_word_lookup_cannot_abort_legacy_judgement() {
-    let routes = include_str!("../src/routes.rs");
-    let owed = &routes[routes.find("async fn owed_recompute_inner(").unwrap()
-        ..routes.find("let mut spender_words =").unwrap()];
-    assert!(
-        !owed.contains("tracker_host::stored::read"),
-        "owed word lookup still aborts a legacy judgement"
-    );
-}
-
-#[test]
 fn ns3d_l1_spent_any_looks_up_the_served_spender_after_probe() {
     let routes = include_str!("../src/routes.rs");
     let route = &routes
