@@ -845,14 +845,31 @@
    "owner": "overlay-cloudflare",
    "writers": {
     "low-app-layer": [
-     "CREATE"
+     "CREATE",
+     "INSERT"
     ]
    },
    "readers": ["low-app-layer"],
    "rebuild_class": "derived",
    "never_wipe": false,
    "holds": "the eviction-derived evidence of each released hop and identity",
-   "why": "derived from the retained eviction ledger, party twin and JOIN bytes; the app layer carries the additive table catch-up"
+   "why": "derived from the retained eviction ledger, party twin and JOIN bytes; the app layer carries the additive table catch-up, and its one-time owed-v2 backfill INSERTs it through the eviction writer's own statement for an open eviction made before that writer existed (D2-OWED-FOLD-8)"
+  },
+  {
+   "name": "released_hop_evidence_missing",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {
+    "low-app-layer": [
+     "CREATE",
+     "INSERT"
+    ]
+   },
+   "readers": ["low-app-layer"],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "the released outpoints of an evicted JOIN whose stored bytes do not read, per verified seat (D2-OWED-FOLD-8)",
+   "why": "derived from the retained eviction ledger, party twin and the JOIN's unreadable bytes; the judge serves each as the old walk's could-not-judge row; the app layer carries the additive table catch-up, and its owed-v2 backfill writes it for an open eviction made before the eviction writer"
   },
   {
    "name": "owed_belt_state",
@@ -1399,7 +1416,7 @@
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",
    "writers": {},
-   "readers": [],
+   "readers": ["low-app-layer"],
    "rebuild_class": "lost",
    "never_wipe": true,
    "holds": "rows of `transactions` evicted by admit_fast, with af_evictedAt / af_reason",

@@ -44,7 +44,10 @@ use crate::d1::{QVal, Query};
 use async_trait::async_trait;
 use worker::D1Database;
 
-pub use crate::eviction_write::{RELEASED_GAME_READ_SQL, RELEASED_HOP_READ_SQL};
+pub use crate::eviction_write::{
+    EVIDENCE_INSERT_SQL, MISSING_INSERT_SQL, RELEASED_GAME_READ_SQL, RELEASED_HOP_READ_SQL,
+    SEAT_KEYS_SQL,
+};
 
 /// What a status-only callback means for the index (PURE; pinned).
 #[derive(Debug, Clone, PartialEq, Eq)]

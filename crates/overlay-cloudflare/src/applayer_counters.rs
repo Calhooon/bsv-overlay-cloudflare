@@ -109,12 +109,17 @@ pub const OWED_BELT: [&str; 8] = [
 ];
 
 /// bsv-low #893 section 6.1 (lane D2-OWED-BACKFILL): the app layer's one-time `owed-v2` backfill and the daily age
-/// re-mark (`low_app_layer::owed_backfill::counter_names`, pinned equal there). Totals the pass adds.
-pub const OWED_BACKFILL: [&str; 4] = [
+/// re-mark (`low_app_layer::owed_backfill::counter_names`, pinned equal there). Totals the pass adds. The last three
+/// (D2-OWED-FOLD-8): the open evictions made before the eviction writer the pass examined, and the evidence and
+/// missing-evidence rows it wrote for them.
+pub const OWED_BACKFILL: [&str; 7] = [
     "owed_backfill_identities_total",
     "owed_backfill_rows_total",
     "owed_age_remarked_total",
     "owed_backfill_skipped_identities_total",
+    "owed_backfill_evictions_total",
+    "owed_backfill_evidence_rows_total",
+    "owed_backfill_evidence_missing_total",
 ];
 
 /// The D2-OWED lens's MEDIUM-2: a filing whose owed judge could not run and landed alone, its marks left to the drain

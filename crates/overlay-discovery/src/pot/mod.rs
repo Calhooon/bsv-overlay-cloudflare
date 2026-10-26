@@ -97,6 +97,7 @@ pub mod arcade_events;
 pub mod covenant;
 pub mod lookup_service;
 pub mod lowfund_topic_manager;
+pub mod released_evidence;
 pub mod reorg;
 pub mod spend_signers;
 pub mod storage;

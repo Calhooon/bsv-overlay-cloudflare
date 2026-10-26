@@ -964,4 +964,150 @@ mod pins {
         eprintln!("walk {w:#?}\njudge {j:#?}");
         assert_eq!(w, j);
     }
+
+    mod l23 {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/l23_pair13.rs"
+        ));
+    }
+
+    /// The tip the fold-7 finding judged the captured pair at (its seats' recovery height is 970,758).
+    const FOLD8_TIP: u64 = 971_000;
+    /// The finding's three identities, and the cached-press seat of the synthetic missing-bytes JOIN beside them.
+    const FOLD8_TWIN_ONLY: &str =
+        "030d9e9fbe045a8130f190b103609c8a6bf13b1887d5c4f15e2f918d68aca8ad67";
+    const FOLD8_P28: &str = "02f9f80a92a92677d97fce5bb0a03d0321425b918868b3ef5773120d9cf5364e49";
+    fn fold8_identities() -> Vec<String> {
+        vec![
+            FOLD8_TWIN_ONLY.into(),
+            FOLD8_P28.into(),
+            format!("02{}", "f1".repeat(32)),
+            format!("02{}", "f2".repeat(32)),
+        ]
+    }
+
+    /// Every pass of the shipped `owed-v2` backfill to its stamp, then the shipped drain to empty.
+    pub(super) async fn backfill_to_the_stamp(
+        judge: &SqliteSql,
+    ) -> Vec<crate::owed_backfill::BackfillReport> {
+        judge.conn.execute_batch(&format!(
+            "INSERT INTO ops_counters(name,value) VALUES ('overlay_migration_count',{}) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+            crate::owed_backfill::OWED_TRIGGERS_MIGRATION_COUNT
+        )).unwrap();
+        let mut reports = Vec::new();
+        for _ in 0..20 {
+            let deadline = crate::pot_hook::Deadline::new(
+                crate::owed_backfill::OWED_BACKFILL_WALL_MS,
+                crate::owed_backfill::OWED_BACKFILL_SAVE_RESERVE_MS,
+                Box::new(|| 0),
+                Box::new(|_| Box::pin(std::future::pending())),
+            );
+            let r = crate::owed_backfill::backfill_pass(judge, &deadline)
+                .await
+                .unwrap();
+            let done = r.stop == crate::owed_backfill::Stop::Finished;
+            reports.push(r);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(
+            reports.last().map(|r| r.stop),
+            Some(crate::owed_backfill::Stop::Finished),
+            "{reports:?}"
+        );
+        for _ in 0..100 {
+            let r = crate::owed_judge::drain_dirty(judge, 64).await.unwrap();
+            assert!(r.faults.is_empty(), "{:?}", r.faults);
+            if r.subjects == 0 {
+                break;
+            }
+        }
+        reports
+    }
+
+    /// D2-OWED-FOLD-8 (bsv-low `docs/audit/D2-OWED-FOLD-7-FINDING-2026-10-26.md`): an eviction made BEFORE the eviction
+    /// writer existed has no `released_hop_evidence` row, and the judge's only markerless source is that row. Over the
+    /// tier's captured beta pair 13 (cfce07ce..., evicted 25 h before the clock, its JOIN's bytes stored) and the
+    /// synthetic JOIN whose bytes are absent (dddd...), after the `owed-v2` backfill and the drain the judge stores the
+    /// OLD walk's rows for the twin-only seat 030d9e9f... (the 20,190 sat hop sweep), p28 (its planted unverified
+    /// marker replaced by the twin's verified evidence: spent elsewhere), f1 (the could-not-judge row beside its
+    /// healthy game) and f2 (its cached press replaced by the could-not-judge rows), field by field, the word facts
+    /// and the old ring's cursor facts stripped.
+    #[tokio::test]
+    async fn fold8_a_pre_writer_eviction_is_judged_as_the_old_walk_served_it() {
+        let f = Fixture {
+            name: "pre-writer eviction",
+            seed: l23::l23_r2_route_rows(NOW_MS / 1000),
+            identities: fold8_identities(),
+        };
+        let (judge, walk_db) = seeded(&f);
+        judge.tip.set(Some(FOLD8_TIP));
+        // the captured rows were written before the dirty triggers existed: they carry no mark
+        judge.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        backfill_to_the_stamp(&judge).await;
+        let mut diffs = Vec::new();
+        for id in &f.identities {
+            run_old_walk(walk_db.clone(), id, Some(FOLD8_TIP), None, NOW_MS)
+                .await
+                .unwrap_or_else(|e| panic!("{id}: the walk faulted: {e}"));
+            let w = stored(&walk_db.conn.borrow(), id);
+            let j = stored(&judge.conn, id);
+            eprintln!("{id}:\n  walk  {w:#?}\n  judge {j:#?}");
+            assert!(!w.is_empty(), "{id}: the walk serves a row");
+            if w != j {
+                diffs.push(format!("{id}\n  walk  {w:?}\n  judge {j:?}"));
+            }
+        }
+        assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+        // A game judged alone (a later source mark) never lays the missing JOIN's could-not-judge row over the row
+        // the seat's own pot is judged from: f1's healthy game keeps its outpoint.
+        let f1 = format!("02{}", "f1".repeat(32));
+        let game = "9d88aaaa348acae127efd08e133822201ecae56513831c37124837f3ef9ae17f".to_string();
+        crate::owed_judge::judge_subjects(&judge, &f1, &[game], "fold8")
+            .await
+            .unwrap();
+        let j = stored(&judge.conn, &f1);
+        let fresh = format!("{}:0", "ee".repeat(32));
+        assert!(j[&fresh].contains("healthy-game"), "{}", j[&fresh]);
+        let w = stored(&walk_db.conn.borrow(), &f1);
+        assert_eq!(w, j);
+    }
+
+    /// D2-OWED-FOLD-8: the backfill visits a seat whose only party row the eviction moved (the evicted twin of an
+    /// open eviction, the #610 rule), so an old worker's row of that seat is judged as the old walk judges it (here:
+    /// no source names it, so no row), never served on as it stood.
+    #[tokio::test]
+    async fn fold8_b_the_backfill_visits_a_twin_only_seat() {
+        let id = format!("02{}", "c7".repeat(32));
+        let join = "c8".repeat(32);
+        let game = "c9".repeat(32);
+        let at = NOW_MS - 3_600_000;
+        let f = Fixture {
+            name: "twin-only seat",
+            seed: vec![
+                format!("INSERT INTO potparty_records_evicted(identity,potTxid,gameId,opponentIdentity,seatSettlePubkey,sigValid,af_evictedAt) VALUES ('{id}','{join}','{game}','opponent','{}',1,{at})", "03".repeat(33)),
+                format!("INSERT INTO pot_evictions(txid,reason,evictedAt,releasedSpends) VALUES ('{join}','REJECTED',{at},'[]')"),
+                format!("INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs) VALUES ('{id}','{}:0','hop-stranded','{game}','{{\"claim\":\"sweep-hop\",\"claimable\":true}}',{at})", "ca".repeat(32)),
+            ],
+            identities: vec![id.clone()],
+        };
+        let (judge, walk_db) = seeded(&f);
+        // rows written before the dirty triggers existed carry no mark
+        judge.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        assert_eq!(
+            stored(&judge.conn, &id).len(),
+            1,
+            "the old worker's press stands before the backfill"
+        );
+        backfill_to_the_stamp(&judge).await;
+        run_old_walk(walk_db.clone(), &id, Some(TIP), None, NOW_MS)
+            .await
+            .unwrap();
+        let w = stored(&walk_db.conn.borrow(), &id);
+        let j = stored(&judge.conn, &id);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(j, w, "the old worker's press is judged away");
+    }
 }
