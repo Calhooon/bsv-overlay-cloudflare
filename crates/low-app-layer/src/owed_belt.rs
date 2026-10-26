@@ -962,9 +962,14 @@ pub async fn drain_env(env: &worker::Env, repair_age: bool) -> worker::Result<ow
 
 /// The 120 s alarm: drain under its own reservation, then run the existing courier tick. Its meter is returned
 /// and logged separately from the scheduled pass's durable row.
-pub async fn alarm_env(env: &worker::Env) -> worker::Result<worker::Response> {
+pub async fn alarm_env(env: &worker::Env, turn: &futures_util::lock::Mutex<()>) -> worker::Result<worker::Response> {
     let meter = crate::pass_meter::PassMeter::new(Box::new(|| worker::Date::now().as_millis()), 1);
-    let drain = match meter.phase("owed.drain", drain_env(env, false)).await {
+    // Serialize the two drains only. A slow courier must not hold a scheduled drain behind the belt's work.
+    let drained = {
+        let _turn = turn.lock().await;
+        meter.phase("owed.drain", drain_env(env, false)).await
+    };
+    let drain = match drained {
         Ok(report) => serde_json::json!({"subjects": report.subjects, "faults": report.faults.len()}),
         Err(error) => {
             worker::console_warn!("[owed] alarm drain deferred: {error}");
@@ -1035,7 +1040,7 @@ mod tests {
             .find("storage.set_alarm(crate::owed_belt::OWED_BELT_TICK_MS).await?;")
             .expect("the alarm re-arms");
         let tick = alarm
-            .find("crate::owed_belt::alarm_env(&self.env).await")
+            .find("crate::owed_belt::alarm_env(&self.env,&self.owed_turn).await")
             .expect("the alarm ticks");
         assert!(rearm < tick, "re-armed before the tick runs");
         assert!(actor.contains(&squash(
