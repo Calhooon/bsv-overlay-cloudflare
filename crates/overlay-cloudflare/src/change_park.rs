@@ -32,7 +32,7 @@
 //! too, FIRST in the same batch ([`KIND_WORD`], the frame's JSON as the item; bsv-low #660, B-OWED-3-FOLD, the lens's
 //! L1: until the fold they stayed in the isolate's memory while the notes were parked, so the cron delivered the
 //! notes before the words, the order every flush otherwise keeps), and the drain delivers the word set FIRST, one
-//! frame a POST to `/internal/tx-word` (at most `change_flush::CHANGE_MAX_CHUNKS` a tick, under the drain's wall). The lobby set has its own flush and the skip never parks it; since bsv-low #560 (B-COST-1) every flush of the three sets parks its NEW note-backs here too ([`crate::change_flush::FlushBatch`], the lobby set as [`KIND_LOBBY`]), and the drain delivers the lobby rows last. The cron's
+//! frame a POST to `/internal/tx-word` (at most `DRAIN_MAX_ROWS` concurrent attempts under the drain's wall). The lobby set has its own flush and the skip never parks it; since bsv-low #560 (B-COST-1) every flush of the three sets parks its NEW note-backs here too ([`crate::change_flush::FlushBatch`], the lobby set as [`KIND_LOBBY`]), and the drain delivers the lobby rows last. The cron's
 //! delivery runs before the GASP step under its own wall ([`DRAIN_WALL_MS`]) and at most [`DRAIN_MAX_ROWS`] rows
 //! a set a tick; the drain's POST in flight is not raced. A delete that faults after an
 //! accepted POST leaves the row, which is delivered again (over-notification is harmless: the app layer re-reads).
@@ -125,7 +125,7 @@ pub const REFUSE_SQL: &str = "UPDATE change_parked \
      SET attempts = attempts + 1, \
         exhausted = (attempts + 1 >= ?5), \
         next_attempt_at_ms = CASE WHEN attempts + 1 >= ?5 THEN ?4 \
-           ELSE ?4 + MIN(?6 << MIN(MAX(attempts, 0), 20), ?7) END \
+           WHEN ?1 = 'word' THEN ?4 ELSE ?4 + MIN(?6 << MIN(MAX(attempts, 0), 20), ?7) END \
      WHERE kind = ?1 AND item = ?2 AND generation = ?3 AND exhausted = 0 RETURNING exhausted";
 /// The sweep of one set (N2): exhausted rows older than `?2`, at most `?3` a tick.
 pub const SWEEP_EXHAUSTED_SQL: &str = "DELETE FROM change_parked WHERE rowid IN (\
@@ -137,6 +137,9 @@ pub const SWEEP_EXHAUSTED_SQL: &str = "DELETE FROM change_parked WHERE rowid IN 
 /// `next_attempt_at_ms, item`), [`SWEEP_EXHAUSTED_SQL`] and the gauge's bounded counts. Appended (#638).
 pub const CHANGE_PARKED_DRAIN_INDEX: &str = "CREATE INDEX IF NOT EXISTS change_parked_drain \
      ON change_parked(kind, exhausted, next_attempt_at_ms, item)";
+/// The oldest active/exhausted word is an index seek, not a scan of every parked frame.
+pub const CHANGE_PARKED_AGE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS change_parked_age ON change_parked(kind,exhausted,parked_at_ms)";
 /// The gauge (N3: BOUNDED): each set's eligible-or-backing-off and exhausted rows, each count read through the
 /// drain's index and stopped at `?1` ([`HEALTH_COUNT_CAP`]); a count equal to the cap reads "at least".
 pub const PARKED_COUNT_SQL: &str = "SELECT \
@@ -148,7 +151,8 @@ pub const PARKED_COUNT_SQL: &str = "SELECT \
      (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'word' AND exhausted = 1 LIMIT ?1)) AS word_exhausted, \
      (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'lobby' AND exhausted = 0 LIMIT ?1)) AS lobby, \
      (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'lobby' AND exhausted = 1 LIMIT ?1)) AS lobby_exhausted, \
-     (SELECT MIN(parked_at_ms) FROM change_parked WHERE kind = 'word') AS oldest_word";
+     (SELECT MIN(parked_at_ms) FROM change_parked WHERE kind = 'word' AND exhausted = 0) AS oldest_word, \
+     (SELECT MIN(parked_at_ms) FROM change_parked WHERE kind = 'word' AND exhausted = 1) AS oldest_exhausted_word";
 /// N3: where the gauge stops counting (at most four times this many index entries a read).
 pub const HEALTH_COUNT_CAP: i64 = 256;
 
@@ -168,7 +172,7 @@ pub const CHANGE_PARKED_MAX_ROWS: i64 = 2048;
 pub const CHANGE_PARKED_LOBBY_MAX_ROWS: i64 = CHANGE_PARKED_MAX_ROWS / 4;
 
 /// PURE (N2): a refusal of a row holding `attempts` at `now_ms`: `(next_attempt_at_ms, exhausted)`. The mirror of
-/// [`REFUSE_SQL`], which is what the drain runs (D2-L3).
+/// [`REFUSE_SQL`] for notes. Word frames retry on the next drain tick without exponential backoff.
 pub fn refusal_backoff(attempts: i64, now_ms: u64) -> (u64, bool) {
     let after = attempts.saturating_add(1);
     if after >= CHANGE_PARK_MAX_ATTEMPTS {
@@ -457,6 +461,10 @@ pub(crate) trait UnparkPort {
         limit: usize,
     ) -> std::result::Result<u64, String>;
     fn now_ms(&self) -> u64;
+    /// Deadline for an attempted word POST. Injected by the throughput pins.
+    async fn wait(&self, ms: u64) {
+        crate::broadcaster::sleep_ms(ms).await;
+    }
     async fn bump(&self, counter: &'static str, delta: u64);
     fn log(&self, line: String);
 }
@@ -481,30 +489,18 @@ pub struct Delivered {
 }
 
 /// THE DELIVERY of the parked set (bsv-low #649 M1; N2): per set, the exhausted rows past
-/// [`CHANGE_PARK_EXHAUSTED_KEEP_MS`] are swept, then the ELIGIBLE rows (due, not exhausted, most overdue first)
+/// [`CHANGE_PARK_EXHAUSTED_KEEP_MS`] are swept after delivery. The ELIGIBLE rows (due, not exhausted, most overdue first)
 /// go through the one flush loop (`change_flush::ship_chunks`, the set's own body); the rows of ACCEPTED POSTs
 /// are deleted at the generation read, the rows of REFUSED POSTs (and a pot row that does not read) are backed
-/// off ([`refusal_backoff`]) and leave the drain at their last attempt, the rows past the wall are untouched.
+/// off ([`refusal_backoff`]) and leave the drain at their last attempt. Selected word frames run concurrently
+/// after selection and count unacknowledged attempts at the wall; deferred notes remain untouched.
 pub(crate) async fn deliver_parked<P: UnparkPort>(port: &P) -> Delivered {
     let mut out = Delivered::default();
     let now_ms = port.now_ms();
-    let deadline_ms = now_ms + DRAIN_WALL_MS;
+    let mut deadline_ms = now_ms + DRAIN_WALL_MS;
     // B-OWED-3-FOLD L1: the word frames first (a note triggers the recompute that reads the word)
     // bsv-low #560: the lobby set last (its outbox rows are the lobby flush's note-backs)
     for kind in [KIND_WORD, KIND_HOP, KIND_POT, KIND_LOBBY] {
-        match port
-            .sweep(
-                kind,
-                now_ms.saturating_sub(CHANGE_PARK_EXHAUSTED_KEEP_MS),
-                DRAIN_MAX_ROWS,
-            )
-            .await
-        {
-            Ok(n) => out.swept += n,
-            Err(e) => port.log(format!(
-                "[change-park] sweep of the exhausted {kind} rows faulted ({e}); next tick"
-            )),
-        }
         let read = match port.read(kind, now_ms, DRAIN_MAX_ROWS).await {
             Ok(read) => read,
             Err(e) => {
@@ -522,16 +518,26 @@ pub(crate) async fn deliver_parked<P: UnparkPort>(port: &P) -> Delivered {
         out.read += read.len() as u64;
         let items: Vec<String> = read.iter().map(|r| r.item.clone()).collect();
         let (delivered, mut refused): (Vec<String>, Vec<String>) = if kind == KIND_WORD {
-            // one frame a POST (the handler takes one frame), each alone through the retry loop's bound
-            ship_isolating(
-                Vec::new(),
-                items.clone(),
-                |rows: &[String]| rows.first().cloned().unwrap_or_default(),
-                |body| port.post(kind, body),
-                || port.now_ms(),
-                deadline_ms,
+            // D1's read can itself spend ten seconds under load. Start the delivery wall AFTER
+            // selection, and start each selected frame together: one slow judgement cannot hold
+            // every other due frame behind it. At most DRAIN_MAX_ROWS POSTs, all under one wall.
+            deadline_ms = port.now_ms() + DRAIN_WALL_MS;
+            let results = futures_util::future::join_all(items.iter().map(|item| async {
+                let result = crate::race_or_deadline(
+                    port.post(kind, item.clone()),
+                    port.wait(DRAIN_WALL_MS),
+                )
+                .await;
+                // A 2xx with dropped > 0 refused the frame too. A timeout is an attempted
+                // delivery, not an untouched deferral: reserve its retry/exhaustion below.
+                (item.clone(), matches!(result, Some(Ok(0))))
+            }))
+            .await;
+            let (accepted, failed): (Vec<_>, Vec<_>) = results.into_iter().partition(|(_, ok)| *ok);
+            (
+                accepted.into_iter().map(|(item, _)| item).collect(),
+                failed.into_iter().map(|(item, _)| item).collect(),
             )
-            .await
         } else if kind == KIND_POT {
             let pots: Vec<(String, u32)> = items.iter().filter_map(|i| parse_pot_item(i)).collect();
             let unreadable: Vec<String> = items
@@ -653,6 +659,23 @@ pub(crate) async fn deliver_parked<P: UnparkPort>(port: &P) -> Delivered {
         }
         out.kept += kept;
     }
+    // Cleanup cannot consume the word frames' delivery window. Exhausted rows retain their
+    // operator evidence for the existing keep period, then leave even on an otherwise idle tick.
+    for kind in [KIND_WORD, KIND_HOP, KIND_POT, KIND_LOBBY] {
+        match port
+            .sweep(
+                kind,
+                now_ms.saturating_sub(CHANGE_PARK_EXHAUSTED_KEEP_MS),
+                DRAIN_MAX_ROWS,
+            )
+            .await
+        {
+            Ok(n) => out.swept += n,
+            Err(e) => port.log(format!(
+                "[change-park] sweep of the exhausted {kind} rows faulted ({e}); next tick"
+            )),
+        }
+    }
     for (counter, n) in [
         (COUNTER_CHANGE_UNPARKED, out.unparked),
         (COUNTER_CHANGE_PARK_REFUSED, out.refused),
@@ -753,8 +776,11 @@ impl UnparkPort for WorkerUnpark<'_> {
         } else {
             "/internal/hop-changed"
         };
-        crate::change_flush::post_body(self.env, &self.url, &self.token, path, "change-park", body)
-            .await
+        let answer = crate::change_flush::post_body_answer(self.env, &self.url, &self.token, path, "change-park", body).await?;
+        if kind == KIND_WORD && !crate::tracker_events::answered_held(&answer) {
+            return Err(());
+        }
+        Ok(crate::change_flush::answered_dropped(&answer))
     }
     async fn unpark(
         &self,
@@ -859,7 +885,7 @@ impl UnparkPort for WorkerUnpark<'_> {
 pub enum DrainTrigger {
     /// The scheduled handler (`*/15`, the observed trigger).
     Tick,
-    /// The authenticated `POST /admin/complete-proofs` (the external cron's fetch), after its retire pass.
+    /// The authenticated `POST /admin/complete-proofs` (the external cron's fetch), before proof and retire work.
     CompleteProofs,
 }
 
@@ -882,7 +908,7 @@ impl DrainTrigger {
 
 /// D3-H1: drain passes run by the scheduled handler.
 pub const COUNTER_CHANGE_PARK_DRAIN_TICK: &str = "change_park_drain_tick_total";
-/// D3-H1: drain passes run by `POST /admin/complete-proofs`.
+/// D3-H1: drain passes run by `POST /admin/complete-proofs`, before proof and retire work.
 pub const COUNTER_CHANGE_PARK_DRAIN_COMPLETE_PROOFS: &str =
     "change_park_drain_complete_proofs_total";
 
@@ -925,6 +951,7 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
         lobby: f64,
         lobby_exhausted: f64,
         oldest_word: Option<f64>,
+        oldest_exhausted_word: Option<f64>,
     }
     match crate::d1::Query::new(PARKED_COUNT_SQL)
         .bind(HEALTH_COUNT_CAP)
@@ -939,6 +966,7 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
             "word": r.word as u64,
             "wordExhausted": r.word_exhausted as u64,
             "oldestParkedFrameAgeMs": r.oldest_word.map(|at| Date::now().as_millis().saturating_sub(at as u64)),
+            "oldestExhaustedFrameAgeMs": r.oldest_exhausted_word.map(|at| Date::now().as_millis().saturating_sub(at as u64)),
             "lobby": r.lobby as u64,
             "lobbyExhausted": r.lobby_exhausted as u64,
             "outboxParkMax": OUTBOX_PARK_MAX,
@@ -1972,7 +2000,11 @@ mod tests {
             .unwrap();
         assert_eq!(counts, (2, 1, 0, 0));
         // B-OWED-3-FOLD L1: the gauge counts the word set too
-        park_sql(&conn, rusqlite::params![KIND_WORD, "{\"txid\":\"aa\"}", 5, MAX]).unwrap();
+        park_sql(
+            &conn,
+            rusqlite::params![KIND_WORD, "{\"txid\":\"aa\"}", 5, MAX],
+        )
+        .unwrap();
         let words: (i64, i64) = conn
             .query_row(PARKED_COUNT_SQL, rusqlite::params![HEALTH_COUNT_CAP], |r| {
                 Ok((r.get("word")?, r.get("word_exhausted")?))
@@ -2429,8 +2461,8 @@ mod tests {
             .find("answer[\"change_parked\"]=change_parked.unwrap_or(serde_json::Value::Null);")
             .expect("its answer carries the drain's pass");
         assert!(
-            retire < drain && drain < answer,
-            "after the retire pass, before the answer"
+            drain < retire && drain < answer,
+            "before proof and retire work, before the answer"
         );
         let tick_src = sq(include_str!("tick.rs"));
         let tick = &tick_src[tick_src.find("asyncfnrun_tick(").unwrap()..];
@@ -3040,14 +3072,144 @@ mod tests {
         );
     }
     #[test]
-    fn owed906_oldest_frame_includes_exhausted_words_and_excludes_notes() {
+    fn cadence_oldest_active_frame_excludes_exhausted_words_and_notes() {
         let db = parked_db();
-        let oldest = || db.query_row(PARKED_COUNT_SQL, [HEALTH_COUNT_CAP], |row| row.get::<_, Option<i64>>("oldest_word")).unwrap();
+        let oldest = || {
+            db.query_row(PARKED_COUNT_SQL, [HEALTH_COUNT_CAP], |row| {
+                row.get::<_, Option<i64>>("oldest_word")
+            })
+            .unwrap()
+        };
         assert_eq!(oldest(), None);
         db.execute("INSERT INTO change_parked(kind,item,parked_at_ms,exhausted) VALUES ('pot','a',1,0),('word','b',2000,0),('word','c',1000,1)", []).unwrap();
-        assert_eq!(oldest(), Some(1000));
-        db.execute("DELETE FROM change_parked WHERE item='c'", []).unwrap();
+        assert_eq!(oldest(), Some(2000));
+        assert_eq!(
+            db.query_row(PARKED_COUNT_SQL, [HEALTH_COUNT_CAP], |row| row
+                .get::<_, Option<i64>>("oldest_exhausted_word"))
+                .unwrap(),
+            Some(1000)
+        );
+        db.execute("DELETE FROM change_parked WHERE item='c'", [])
+            .unwrap();
         assert_eq!(oldest(), Some(2000));
     }
 
+    /// Real drain + shipped SQLite retry statements, with slow selection and refused/dropped/timed-out POSTs.
+    /// A frame gets one attempt per turn; all 500 leave the active set in <= 4 * 8 ticks.
+    #[test]
+    fn cadence_500_word_frames_deliver_in_four_ticks_or_exhaust_in_thirty_two() {
+        struct Words<'a> {
+            db: &'a SqlitePort,
+            outcome: u8,
+            posts: std::cell::Cell<u64>,
+        }
+        impl UnparkPort for Words<'_> {
+            async fn read(
+                &self,
+                kind: &'static str,
+                now: u64,
+                limit: usize,
+            ) -> std::result::Result<Vec<ParkedRow>, String> {
+                let rows = self.db.read(kind, now, limit).await?;
+                if kind == KIND_WORD {
+                    self.db.clock.set(self.db.clock.get() + 11_000);
+                }
+                Ok(rows)
+            }
+            async fn post(
+                &self,
+                _kind: &'static str,
+                _body: String,
+            ) -> std::result::Result<usize, ()> {
+                self.posts.set(self.posts.get() + 1);
+                match self.outcome {
+                    0 => Ok(0),
+                    1 => Err(()),
+                    2 => Ok(1),
+                    _ => std::future::pending().await,
+                }
+            }
+            async fn wait(&self, _ms: u64) {} // the unanswered transport's deadline, no wall-clock sleep
+            async fn unpark(
+                &self,
+                k: &'static str,
+                rows: &[(String, i64)],
+            ) -> std::result::Result<u64, String> {
+                self.db.unpark(k, rows).await
+            }
+            async fn refuse(
+                &self,
+                k: &'static str,
+                rows: &[(String, i64)],
+                now: u64,
+            ) -> std::result::Result<(u64, u64), String> {
+                self.db.refuse(k, rows, now).await
+            }
+            async fn sweep(
+                &self,
+                k: &'static str,
+                before: u64,
+                limit: usize,
+            ) -> std::result::Result<u64, String> {
+                self.db.sweep(k, before, limit).await
+            }
+            fn now_ms(&self) -> u64 {
+                self.db.now_ms()
+            }
+            async fn bump(&self, _counter: &'static str, _n: u64) {}
+            fn log(&self, _line: String) {}
+        }
+        for outcome in 0..4 {
+            let db = SqlitePort {
+                conn: parked_db(),
+                refuse: Default::default(),
+                clock: std::cell::Cell::new(100_000),
+                posted: Default::default(),
+                refused_posts: Default::default(),
+                repark: false,
+                last_read: Default::default(),
+                stale_read: Default::default(),
+            };
+            db.conn.execute_batch("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<500) INSERT INTO change_parked(kind,item,parked_at_ms,next_attempt_at_ms) SELECT 'word',printf('frame%04d',i),1000,1000 FROM n").unwrap();
+            let port = Words {
+                db: &db,
+                outcome,
+                posts: std::cell::Cell::new(0),
+            };
+            let ticks = if outcome == 0 { 4 } else { 32 };
+            let mut delivered = 0;
+            for tick in 0..ticks {
+                db.clock.set(100_000 + tick * TICK_MS);
+                let d = run(deliver_parked(&port));
+                assert!(d.read <= 128);
+                delivered += d.unparked;
+            }
+            assert_eq!(
+                rows_of(
+                    &db.conn,
+                    "SELECT COUNT(*) FROM change_parked WHERE exhausted=0"
+                ),
+                0,
+                "outcome {outcome}"
+            );
+            assert_eq!(port.posts.get(), if outcome == 0 { 500 } else { 4000 });
+            assert_eq!(delivered, if outcome == 0 { 500 } else { 0 });
+            println!("cadence throughput: outcome={outcome}, frames=500, ticks={ticks}, attempted={}, delivered={delivered}", port.posts.get());
+            if outcome != 0 {
+                assert_eq!(
+                    rows_of(
+                        &db.conn,
+                        "SELECT COUNT(*) FROM change_parked WHERE attempts=8 AND exhausted=1"
+                    ),
+                    500
+                );
+                db.clock
+                    .set(db.clock.get() + CHANGE_PARK_EXHAUSTED_KEEP_MS + 1);
+                for _ in 0..4 {
+                    run(deliver_parked(&port));
+                }
+                assert_eq!(rows_of(&db.conn, "SELECT COUNT(*) FROM change_parked"), 0);
+            }
+        }
+    }
 }

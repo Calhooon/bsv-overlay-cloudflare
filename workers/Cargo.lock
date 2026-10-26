@@ -208,6 +208,7 @@ dependencies = [
  "bsv-rs",
  "bsv-tracker",
  "bsv-worker-build-info",
+ "futures-util",
  "hex",
  "js-sys",
  "rusqlite",

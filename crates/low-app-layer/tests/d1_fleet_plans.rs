@@ -79,6 +79,7 @@ fn hot_routes_never_scan_fleet_tables() {
         "the moved latches' delete must never scan: {moved:?}"
     );
     for (route, sql) in [
+        ("/health", low_app_layer::owed_judge::DIRTY_HEALTH_SQL.to_string()),
         (
             "/results:view",
             low_app_layer::results::results_sql(None, 0),
@@ -267,6 +268,10 @@ fn hot_routes_never_scan_fleet_tables() {
             if name.is_some_and(|n| {
                 [
                     "pot_records",
+                    "owed_dirty",
+                    "owed_belt_state",
+                    "owed_dirty",
+                    "owed_belt_state",
                     "potparty_records",
                     "hopparty_records",
                     "potrefund_records",

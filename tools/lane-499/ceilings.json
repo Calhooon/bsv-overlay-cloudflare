@@ -521,6 +521,22 @@
         "maxReads": 398
       },
       "censusKey": null
+    },
+    "health-dirty-snapshot": {
+      "route": "GET /health: one backlog:dirty snapshot lookup plus the existing chain-event health reads; fleet populated, chain-event memo may expire. FIX-CADENCE-GAUGES; measured by the Linux budget tier.",
+      "measured": {
+        "reads": 1,
+        "writes": 0,
+        "stmts": 1,
+        "maxReads": 1
+      },
+      "ceiling": {
+        "reads": 36,
+        "writes": 0,
+        "stmts": 8,
+        "maxReads": 24
+      },
+      "censusKey": "/health"
     }
   },
   "censusKey": "the d1Budget route a production census holds against this ceiling (advisory there: production rows are not the fixture's); null = the route's maximum is another scenario's",

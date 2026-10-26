@@ -820,7 +820,10 @@ pub fn backoff_period(due_at_ms: Option<i64>, judged_at_ms: Option<i64>, base_ms
 /// After a find landed: when the row it judged reads as it did before the look, the look bought nothing, so the row's
 /// next look waits twice as long (the D2-OWED lens's HIGH-3). A row that changed keeps the judge's base date.
 async fn backoff(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickReport) {
-    let binds = vec![Bind::Text(c.identity.clone()), Bind::Text(c.outpoint.clone())];
+    let binds = vec![
+        Bind::Text(c.identity.clone()),
+        Bind::Text(c.outpoint.clone()),
+    ];
     let after = db
         .run_batch(vec![Stmt {
             sql: AFTER_FIND_SQL.into(),
@@ -934,7 +937,10 @@ pub async fn drain(env: &worker::Env) -> worker::Result<()> {
 
 /// Called only while the belt actor holds its turn. A fault or wall leaves the unacknowledged marks for the next
 /// turn. The daily age repair stays on the scheduled pass; both triggers drain at most 64 subjects.
-pub async fn drain_env(env: &worker::Env, repair_age: bool) -> worker::Result<owed_judge::DrainReport> {
+pub async fn drain_env(
+    env: &worker::Env,
+    repair_age: bool,
+) -> worker::Result<owed_judge::DrainReport> {
     let deadline = crate::routes::worker_deadline(OWED_DRAIN_WALL_MS, OWED_DRAIN_RESERVE_MS);
     let work = async {
         crate::schema::ensure_latch_columns(env).await;
@@ -948,7 +954,14 @@ pub async fn drain_env(env: &worker::Env, repair_age: bool) -> worker::Result<ow
         owed_judge::drain_dirty(&judge, owed_judge::OWED_DIRTY_SUBJECTS_PER_PASS)
             .await.map_err(worker::Error::RustError)
     };
-    match deadline.run_reserving(work).await {
+    let result = deadline.run_reserving(work).await;
+    // Outside the judge's wall: even a timed-out drain must publish its remaining backlog.
+    // This is a single bounded count, never work delegated to /health.
+    let sql = crate::routes::D1Sql::of(env)?;
+    if let Err(error) = owed_judge::snapshot_dirty(&sql).await {
+        worker::console_warn!("[owed] backlog snapshot deferred: {error}");
+    }
+    match result {
         Some(Ok(report)) => {
             for (_, error) in &report.faults {
                 worker::console_warn!("[owed] {} judgement deferred: {error}", if repair_age { "scheduled" } else { "alarm" });
@@ -956,13 +969,18 @@ pub async fn drain_env(env: &worker::Env, repair_age: bool) -> worker::Result<ow
             Ok(report)
         }
         Some(Err(error)) => Err(error),
-        None => Err(worker::Error::RustError("owed drain reached its wall".into())),
+        None => Err(worker::Error::RustError(
+            "owed drain reached its wall".into(),
+        )),
     }
 }
 
 /// The 120 s alarm: drain under its own reservation, then run the existing courier tick. Its meter is returned
 /// and logged separately from the scheduled pass's durable row.
-pub async fn alarm_env(env: &worker::Env, turn: &futures_util::lock::Mutex<()>) -> worker::Result<worker::Response> {
+pub async fn alarm_env(
+    env: &worker::Env,
+    turn: &futures_util::lock::Mutex<()>,
+) -> worker::Result<worker::Response> {
     let meter = crate::pass_meter::PassMeter::new(Box::new(|| worker::Date::now().as_millis()), 1);
     // Serialize the two drains only. A slow courier must not hold a scheduled drain behind the belt's work.
     let drained = {
@@ -970,7 +988,9 @@ pub async fn alarm_env(env: &worker::Env, turn: &futures_util::lock::Mutex<()>) 
         meter.phase("owed.drain", drain_env(env, false)).await
     };
     let drain = match drained {
-        Ok(report) => serde_json::json!({"subjects": report.subjects, "faults": report.faults.len()}),
+        Ok(report) => {
+            serde_json::json!({"subjects": report.subjects, "faults": report.faults.len()})
+        }
         Err(error) => {
             worker::console_warn!("[owed] alarm drain deferred: {error}");
             serde_json::json!({"error": error.to_string()})

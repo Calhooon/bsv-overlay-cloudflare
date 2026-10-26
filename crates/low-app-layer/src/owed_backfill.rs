@@ -237,7 +237,7 @@ pub const ARM_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) V
 /// D2-OWED-FOLD-8: and the verified seats of the evicted twin of an OPEN eviction (the #610 rule), by its identity index.
 pub const IDENTITIES_SQL: &str = "SELECT identity FROM (SELECT identity FROM (SELECT DISTINCT identity FROM potparty_records INDEXED BY idx_potparty_identity WHERE identity>?1 ORDER BY identity LIMIT ?2) UNION SELECT identity FROM (SELECT DISTINCT identity FROM hopparty_records INDEXED BY idx_hopparty_identity WHERE identity>?1 ORDER BY identity LIMIT ?2) UNION SELECT identity FROM (SELECT DISTINCT p.identity FROM potparty_records_evicted p INDEXED BY idx_evicted_party_identity_game WHERE p.identity>?1 AND p.sigValid=1 AND p.seatSettlePubkey IS NOT NULL AND EXISTS (SELECT 1 FROM pot_evictions e WHERE e.txid=p.potTxid AND e.readmittedAt IS NULL) ORDER BY p.identity LIMIT ?2)) ORDER BY identity LIMIT ?2";
 /// Every game of the identity the judge's wanted expansion names, marked `backfill`.
-pub const MARK_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,gameId,'backfill','owed-v2',?2 FROM (SELECT gameId FROM potparty_records WHERE identity=?1 UNION SELECT gameId FROM hopparty_records WHERE identity=?1 UNION SELECT gameId FROM released_hop_evidence WHERE identity=?1 UNION SELECT gameId FROM released_hop_evidence_missing WHERE identity=?1 UNION SELECT gameId FROM owed_rows WHERE identity=?1) WHERE gameId<>'' ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
+pub const MARK_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,gameId,'backfill','owed-v2',strftime('%s','now') * 1000 FROM (SELECT gameId FROM potparty_records WHERE identity=?1 UNION SELECT gameId FROM hopparty_records WHERE identity=?1 UNION SELECT gameId FROM released_hop_evidence WHERE identity=?1 UNION SELECT gameId FROM released_hop_evidence_missing WHERE identity=?1 UNION SELECT gameId FROM owed_rows WHERE identity=?1) WHERE gameId<>'' ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
 pub const OPEN_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:open',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// The whole identity is rebuilt by this backfill, so its earlier overflow flag is judged again (the judge ORs it).
 pub const TRUNCATED_RESET_SQL: &str = "UPDATE owed_state SET truncated=0 WHERE identity=?1";
@@ -249,13 +249,13 @@ pub const STAMP_WRITE_SQL: &str =
 /// Risk 8.2's third repair: the oldest judged rows' subjects, by the judged index, coalesced on the dirty key. At most
 /// [`OWED_AGE_REMARKS_PER_PASS`] age marks are ever pending, and the drain judges them after every other mark
 /// (`owed_judge::drain_dirty`), so the repair fills the drain's idle room and never delays a source's mark.
-pub const AGE_MARK_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'age','age',?2 FROM owed_rows r INDEXED BY idx_owed_rows_judged WHERE judgedAtMs<?1 AND gameId<>'' AND NOT EXISTS (SELECT 1 FROM owed_dirty d WHERE d.identity=r.identity AND d.gameId=r.gameId AND d.source='age') ORDER BY judgedAtMs LIMIT max(0,?3-(SELECT COUNT(*) FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey='age' AND source='age')) ON CONFLICT(identity,gameId,source,sourceKey) DO NOTHING";
+pub const AGE_MARK_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'age','age',strftime('%s','now') * 1000 FROM owed_rows r INDEXED BY idx_owed_rows_judged WHERE judgedAtMs<?1 AND gameId<>'' AND NOT EXISTS (SELECT 1 FROM owed_dirty d WHERE d.identity=r.identity AND d.gameId=r.gameId AND d.source='age') ORDER BY judgedAtMs LIMIT max(0,?2-(SELECT COUNT(*) FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey='age' AND source='age')) ON CONFLICT(identity,gameId,source,sourceKey) DO NOTHING";
 
 /// The D2-OWED lens's MEDIUM-5: the subjects of KEYLESS rows (`judgedAtMs` NULL: an old worker's write in the deploy
 /// window, or a rollback to the old walk and forward again), marked `age` in the same room as [`AGE_MARK_SQL`]: run
 /// first in one batch, the two together never past [`OWED_AGE_REMARKS_PER_PASS`] pending. The judge rewrites each
 /// with its keys, so the set drains; a game no source names any more is judged away.
-pub const AGE_MARK_UNJUDGED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'age','age',?1 FROM (SELECT DISTINCT r.identity,r.gameId FROM owed_rows r INDEXED BY idx_owed_rows_unjudged WHERE r.judgedAtMs IS NULL AND r.gameId<>'' AND NOT EXISTS (SELECT 1 FROM owed_dirty d WHERE d.identity=r.identity AND d.gameId=r.gameId AND d.source='age') LIMIT max(0,?2-(SELECT COUNT(*) FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey='age' AND source='age'))) WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO NOTHING";
+pub const AGE_MARK_UNJUDGED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'age','age',strftime('%s','now') * 1000 FROM (SELECT DISTINCT r.identity,r.gameId FROM owed_rows r INDEXED BY idx_owed_rows_unjudged WHERE r.judgedAtMs IS NULL AND r.gameId<>'' AND NOT EXISTS (SELECT 1 FROM owed_dirty d WHERE d.identity=r.identity AND d.gameId=r.gameId AND d.source='age') LIMIT max(0,?1-(SELECT COUNT(*) FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey='age' AND source='age'))) WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO NOTHING";
 
 /// Where a pass stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -340,7 +340,7 @@ async fn backfill_identity(
             .run_reserving(db.run_batch(vec![
                 Stmt {
                     sql: MARK_SQL.into(),
-                    binds: vec![Bind::Text(identity.into()), Bind::Int(now)],
+                    binds: vec![Bind::Text(identity.into())],
                 },
                 Stmt {
                     sql: OPEN_SQL.into(),
@@ -1196,13 +1196,12 @@ async fn age_marks(db: &impl SqlPort) -> Result<u64, String> {
         .run_batch(vec![
             Stmt {
                 sql: AGE_MARK_UNJUDGED_SQL.into(),
-                binds: vec![Bind::Int(now), Bind::Int(OWED_AGE_REMARKS_PER_PASS as i64)],
+                binds: vec![Bind::Int(OWED_AGE_REMARKS_PER_PASS as i64)],
             },
             Stmt {
                 sql: AGE_MARK_SQL.into(),
                 binds: vec![
                     Bind::Int(now - OWED_AGE_REMARK_AFTER_MS),
-                    Bind::Int(now),
                     Bind::Int(OWED_AGE_REMARKS_PER_PASS as i64),
                 ],
             },
@@ -1316,7 +1315,9 @@ mod tests {
         assert!(actor.contains(&squash("crate::owed_belt::drain_env(&self.env, true).await")));
         let belt = squash(include_str!("owed_belt.rs"));
         let aged = belt
-            .find(&squash("if repair_age { if let Err(error) = crate::owed_backfill::mark_aged(&judge).await"))
+            .find(&squash(
+                "if repair_age { if let Err(error) = crate::owed_backfill::mark_aged(&judge).await",
+            ))
             .unwrap();
         let drain = belt
             .find(&squash("owed_judge::drain_dirty(&judge,"))

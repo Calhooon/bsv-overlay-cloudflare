@@ -183,6 +183,14 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // Keep a DB handle for the observability writes (#192/#193, P4) ; the
     // engine build below consumes `db`.
     let ops_db = db.clone();
+    // bsv-low #649 M1: the pot and hop notes a background flush withheld (too little of its `waitUntil` window
+    // left) are parked in D1; every tick delivers the oldest of them and deletes only what the app layer accepted.
+    // D3-H1, D4-L1: this `*/15` tick is the observed trigger, and `/admin/complete-proofs` (the authenticated admin
+    // path) runs the same drain when invoked. An eligible fresh parked note within the next 128 rows of its set
+    // reaches the app layer within one scheduled tick, about 16 minutes in the normal worst case, plus the app
+    // layer's own delivery. The authenticated admin maintenance call can also drain it when invoked.
+    crate::d1_ledger::label("change_park");
+    crate::change_park::drain_parked(env, &ops_db, crate::change_park::DrainTrigger::Tick).await;
     let mut engine = build_engine_with_storage(
         db,
         env,
@@ -314,14 +322,6 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     // R2 objects (`ef-deferred/`), counted for the health figure; an object no
     // job row names, past the keep, is deleted (L1 (b)).
     crate::beef_blob_sweep::run_ef_deferred_pass(env, &ops_db).await;
-    // bsv-low #649 M1: the pot and hop notes a background flush withheld (too little of its `waitUntil` window
-    // left) are parked in D1; every tick delivers the oldest of them and deletes only what the app layer accepted.
-    // D3-H1, D4-L1: this `*/15` tick is the observed trigger, and `/admin/complete-proofs` (the authenticated admin
-    // path) runs the same drain when invoked. An eligible fresh parked note within the next 128 rows of its set
-    // reaches the app layer within one scheduled tick, about 16 minutes in the normal worst case, plus the app
-    // layer's own delivery. The authenticated admin maintenance call can also drain it when invoked.
-    crate::d1_ledger::label("change_park");
-    crate::change_park::drain_parked(env, &ops_db, crate::change_park::DrainTrigger::Tick).await;
     // The order (bsv-low #585 land2): the sweep's pass (its own 30 s race),
     // the stale graphs, the EF jobs' hand-back and keep sweep (no race of its
     // own: two D1 reads, up to 20 quiet jobs re-sent and touched, up to 50

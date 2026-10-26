@@ -58,6 +58,7 @@ bsv-tracker = "=0.7.0"
 # `ERR_PAYMENT_UNAVAILABLE`, `PrefixGate::Refuse` gains `headers`); this crate links no payment door, unchanged.
 bsv-middleware-cloudflare = "=0.7.1"
 async-trait.workspace = true
+futures-util = "0.3"
 base64 = "0.22"
 hex.workspace = true
 serde.workspace = true

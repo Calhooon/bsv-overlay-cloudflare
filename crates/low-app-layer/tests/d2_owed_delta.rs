@@ -416,7 +416,7 @@ async fn d2delta_l3_the_wanted_envelope_orders_its_games_in_one_unit() {
     for sql in [judge::EXPAND_WANTED_SQL, judge::EXPAND_BACKFILL_SQL] {
         db.run_batch(vec![Stmt {
             sql: sql.into(),
-            binds: vec![Bind::Text("owner".into()), Bind::Int(now)],
+            binds: vec![Bind::Text("owner".into())],
         }])
         .await
         .unwrap();

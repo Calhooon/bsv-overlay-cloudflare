@@ -144,7 +144,7 @@ impl MarkOnly for Db {
         use low_app_layer::pot_hook::{Bind, SqlPort, Stmt};
         self.run_batch(vec![Stmt {
             sql: judge::MARK_TIP_SQL.into(),
-            binds: vec![Bind::Int(tip as i64), Bind::Int(1)],
+            binds: vec![Bind::Int(tip as i64)],
         }])
         .await
         .unwrap();
@@ -409,9 +409,9 @@ fn d2fold_medium1_b_the_shipped_drain_statements_never_scan_owed_dirty() {
         ("identity age marks", judge::DRAIN_MARKS_SQL, vec![text("owner"), int(64), int(1)]),
         ("hook subjects", judge::CHANGED_SQL, vec![text("[\"owner\"]"), text("[\"gate\"]"), int(16)]),
         ("judge marks", judge::MARKS_SQL, vec![text("owner"), text("[\"g\"]")]),
-        ("expand wanted", judge::EXPAND_WANTED_SQL, vec![text("owner"), int(1)]),
-        ("expand backfill", judge::EXPAND_BACKFILL_SQL, vec![text("owner"), int(1)]),
-        ("age marks", low_app_layer::owed_backfill::AGE_MARK_SQL, vec![int(1), int(2), int(3)]),
+        ("expand wanted", judge::EXPAND_WANTED_SQL, vec![text("owner")]),
+        ("expand backfill", judge::EXPAND_BACKFILL_SQL, vec![text("owner")]),
+        ("age marks", low_app_layer::owed_backfill::AGE_MARK_SQL, vec![int(1), int(3)]),
         ("read pending", low_app_layer::owed_read::PENDING_SQL, vec![text("owner")]),
     ] {
         let plan = db.plan(sql, &binds);
@@ -465,7 +465,7 @@ async fn d2fold_medium5_the_age_repair_reaches_keyless_rows() {
     );
     let plan = db.plan(
         low_app_layer::owed_backfill::AGE_MARK_UNJUDGED_SQL,
-        &[SqlValue::Integer(1), SqlValue::Integer(128)],
+        &[SqlValue::Integer(128)],
     );
     assert!(
         plan.iter().any(|d| d.contains("idx_owed_rows_unjudged")),

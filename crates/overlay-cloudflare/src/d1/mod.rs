@@ -635,7 +635,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// since MEDIUM-1; each cost every mark a write).
 /// 407 to 409 for #893 (lane D2-OWED-FOLD-8): `released_hop_evidence_missing` and its dirty trigger (an evicted JOIN
 /// whose bytes do not read names its released hops per verified seat: the judge's could-not-judge row).
-pub const OVERLAY_MIGRATION_COUNT: usize = 409;
+// 410..469: 29 write-time dirty triggers (DROP + CREATE), and the two gauge indexes.
+pub const OVERLAY_MIGRATION_COUNT: usize = 469;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2389,6 +2390,69 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // made before it) cannot read names its released outpoints per verified seat, and marks each seat's game.
     crate::derived_owed::RELEASED_HOP_EVIDENCE_MISSING_CREATE,
     crate::derived_owed::RELEASED_HOP_MISSING_INSERT,
+    // FIX-CADENCE-GAUGES: shipped triggers are replaced only by appended DROP + CREATE pairs.
+    "DROP TRIGGER IF EXISTS owed_dirty_pot_records_insert",
+    crate::derived_owed::write_time::POT_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_pot_records_update",
+    crate::derived_owed::write_time::POT_UPDATE,
+    "DROP TRIGGER IF EXISTS owed_dirty_pot_records_delete",
+    crate::derived_owed::write_time::POT_DELETE,
+    "DROP TRIGGER IF EXISTS owed_dirty_potparty_records_insert",
+    crate::derived_owed::write_time::PARTY_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_potparty_records_update",
+    crate::derived_owed::write_time::PARTY_UPDATE,
+    "DROP TRIGGER IF EXISTS owed_dirty_potparty_records_delete",
+    crate::derived_owed::write_time::PARTY_DELETE,
+    "DROP TRIGGER IF EXISTS owed_dirty_hopparty_records_insert",
+    crate::derived_owed::write_time::HOP_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_hopparty_records_update",
+    crate::derived_owed::write_time::HOP_UPDATE,
+    "DROP TRIGGER IF EXISTS owed_dirty_hopparty_records_delete",
+    crate::derived_owed::write_time::HOP_DELETE,
+    "DROP TRIGGER IF EXISTS owed_dirty_potrefund_records_insert",
+    crate::derived_owed::write_time::REFUND_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_potrefund_records_update",
+    crate::derived_owed::write_time::REFUND_UPDATE,
+    "DROP TRIGGER IF EXISTS owed_dirty_result_markers_v2_insert",
+    crate::derived_owed::write_time::RESULT_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_collected_markers_v2_insert",
+    crate::derived_owed::write_time::COLLECTED_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_hopsweep_records_insert",
+    crate::derived_owed::write_time::SWEEP_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_pot_evictions_insert",
+    crate::derived_owed::write_time::EVICTION_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_pot_evictions_update",
+    crate::derived_owed::write_time::EVICTION_UPDATE,
+    "DROP TRIGGER IF EXISTS owed_dirty_network_seen_insert",
+    crate::derived_owed::write_time::SEEN_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_tx_words_insert",
+    crate::derived_owed::write_time::WORD_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_tx_words_update",
+    crate::derived_owed::write_time::WORD_UPDATE,
+    "DROP TRIGGER IF EXISTS owed_dirty_tx_words_insert_links",
+    crate::derived_owed::write_time::WORD_LINK_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_tx_words_update_links",
+    crate::derived_owed::write_time::WORD_LINK_UPDATE,
+    "DROP TRIGGER IF EXISTS owed_dirty_pot_beefs_insert",
+    crate::derived_owed::write_time::BEEF_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_pot_beefs_update",
+    crate::derived_owed::write_time::BEEF_UPDATE,
+    "DROP TRIGGER IF EXISTS owed_dirty_submit_refusals_insert",
+    crate::derived_owed::write_time::REFUSAL_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_submit_refusals_update",
+    crate::derived_owed::write_time::REFUSAL_UPDATE,
+    "DROP TRIGGER IF EXISTS owed_dirty_submit_refusals_delete",
+    crate::derived_owed::write_time::REFUSAL_DELETE,
+    "DROP TRIGGER IF EXISTS owed_dirty_released_hop_evidence_insert",
+    crate::derived_owed::write_time::RELEASED_HOP_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_released_hop_evidence_missing_insert",
+    crate::derived_owed::write_time::RELEASED_HOP_MISSING_INSERT,
+    "DROP TRIGGER IF EXISTS owed_dirty_owed_spender_bytes_insert",
+    crate::derived_owed::write_time::SPENDER_BYTES_INSERT,
+    crate::change_park::CHANGE_PARKED_AGE_INDEX,
+    // The drain's bounded backlog count and oldest mark share this covering index.
+    crate::derived_owed::DIRTY_MARKED_INDEX,
+
 ];
 
 // =============================================================================
