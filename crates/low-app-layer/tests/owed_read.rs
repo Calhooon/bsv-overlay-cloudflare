@@ -246,9 +246,7 @@ async fn owed_read_body_byte_compatibility_except_named_d2_fields() {
         .map(|(id, row)| (id, row.view()))
         .collect();
     let mut body = snapshot.body("owner", Some(100), &words).unwrap();
-    for key in ["pending"] {
-        body.as_object_mut().unwrap().remove(key);
-    }
+    body.as_object_mut().unwrap().remove("pending");
     body["rows"][0]["facts"]
         .as_object_mut()
         .unwrap()
