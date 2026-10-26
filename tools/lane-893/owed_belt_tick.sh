@@ -7,7 +7,8 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
-: "${TMPDIR:?external scratch directory required}"
+# The scratch root: the host's TMPDIR (every Mac sets it), else /tmp (the Linux tier host sets none: the land of PR 174 refused here).
+TMPDIR=${TMPDIR:-/tmp}; export TMPDIR
 export npm_config_cache="${TMPDIR%/}/d2-owed-belt-npm-cache"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HOME/bsv/targets/d2-owed-belt}
 out_root=${TMPDIR%/}
