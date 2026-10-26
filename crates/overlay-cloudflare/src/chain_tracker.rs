@@ -28,7 +28,7 @@ use serde::Deserialize;
 ///
 /// Endpoints used:
 /// - `GET /findHeaderHexForHeight?height={N}` — returns block header with merkle root
-/// - `GET /findChainTipHeaderHex` — the served, VERIFIED header tip (its height, hash and
+/// - `GET /findChainTipHeaderHex`: the served, VERIFIED header tip (its height, hash and
 ///   merkle root): the engine's chain tip (bsv-low #896), the reader the app layer's `/tip` uses
 pub struct WorkerChainTracker {
     base_url: String,
