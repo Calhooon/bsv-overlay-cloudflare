@@ -60,7 +60,7 @@
       "censusKey": "/results"
     },
     "owed-first-read": {
-      "route": "/owed?identity=A: the first read (the compute on read and its write); A's swept hop's sweep is a DURABLE spender with a proofmined: latch, so the recompute makes the latch range read (bsv-low #693 fold-2)",
+      "route": "/owed?identity=A: the first read (the compute on read and its write); A's swept hop's sweep is a DURABLE spender with a proofmined: latch, so the recompute makes the latch range read (bsv-low #693 fold-2). D2-OWED-FOLD-8: no longer the /owed census key (two scenarios named it and the later won silently); the census holds /owed to owed-fleet-read, the read's own ceiling since the READ lane",
       "measured": {
         "reads": 382,
         "writes": 20,
@@ -73,7 +73,7 @@
         "stmts": 41,
         "maxReads": 573
       },
-      "censusKey": "/owed"
+      "censusKey": null
     },
     "owed-judge-filing": {
       "route": "POST /record?kind=potrefund: the verified filing core, with both seats judged in the source batch on the shared fleet plus the 250-result/270-hop fixture. Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 118 to 126, writes 36 to 42, statements 59 to 61 (the fold's owed_rows indexes on each row written; the state row created once and stamped, LOW-2)",
@@ -92,16 +92,34 @@
       "censusKey": null
     },
     "owed-served-read": {
-      "route": "/owed?identity=A: a served read",
+      "route": "/owed?identity=A: a served read. Re-measured by D2-OWED-FOLD-8: the served read AFTER the targeted judge (POST /internal/hop-changed for A), three statements of stored rows (the judged rows joined to their words, the state, the dirty count), no write; the old ceiling (26 reads) was the retired walk's snapshot read",
       "measured": {
-        "reads": 20,
+        "reads": 44,
         "writes": 0,
-        "stmts": 2
+        "stmts": 3,
+        "maxReads": 41
       },
       "ceiling": {
-        "reads": 26,
+        "reads": 66,
         "writes": 0,
-        "stmts": 4
+        "stmts": 5,
+        "maxReads": 62
+      },
+      "censusKey": null
+    },
+    "owed-read-c": {
+      "route": "GET /owed?identity=C (lane D2-OWED-FOLD-8, re-pointing bsv-low #837's cell): identity C's 300 games judged natively by the seed (d1_budget_seed, the shipped judge 16 games a batch, its writes replayed), the read serving 300 stored rows in three statements and writing nothing; the read never computes",
+      "measured": {
+        "reads": 1202,
+        "writes": 0,
+        "stmts": 3,
+        "maxReads": 1201
+      },
+      "ceiling": {
+        "reads": 1803,
+        "writes": 0,
+        "stmts": 5,
+        "maxReads": 1802
       },
       "censusKey": null
     },
@@ -122,94 +140,98 @@
       "censusKey": "/spent-any"
     },
     "submit-admit-1": {
-      "route": "/submit: an operator historical-tx-no-spv submit admitting one tm_collected output",
+      "route": "/submit: an operator historical-tx-no-spv submit admitting one tm_collected output. Re-measured by D2-OWED-FOLD-8: the admission's writes now include the owed dirty triggers' marks in the same statements (bsv-low #893, the design's cost at the write): writes 15 to 18",
       "measured": {
-        "reads": 0,
-        "writes": 13,
-        "stmts": 7
+        "reads": 2,
+        "writes": 18,
+        "stmts": 8,
+        "maxReads": 1
       },
       "ceiling": {
         "reads": 4,
-        "writes": 15,
-        "stmts": 9
+        "writes": 27,
+        "stmts": 12,
+        "maxReads": 2
       },
       "censusKey": "/submit"
     },
     "record-potparty-filing": {
-      "route": "/record?kind=potparty: a signed stranger filing naming A's pot; all inline filing reads and marks",
+      "route": "/record?kind=potparty: a signed stranger filing naming A's pot; all inline filing reads and marks. Re-measured by D2-OWED-FOLD-8: the filing's own statements AND the filer's judgement in the same batch (record_post::owed_write, bsv-low #893: the design's cost at the write); the old ceiling (17/9/8) measured the filing with the walk deferred",
       "measured": {
-        "reads": 11,
-        "writes": 7,
-        "stmts": 6
+        "reads": 65,
+        "writes": 25,
+        "stmts": 33,
+        "maxReads": 9
       },
       "ceiling": {
-        "reads": 17,
-        "writes": 9,
-        "stmts": 8
+        "reads": 98,
+        "writes": 38,
+        "stmts": 50,
+        "maxReads": 14
       },
       "censusKey": "/record"
     },
     "pot-changed-hook-1": {
-      "route": "/internal/pot-changed: B's pot, one outpoint, no decoded params, its two marker-named seats marked stale (E649 L4: the required read, the marker arms one batch each, ONE write batch of the stale marks and the outpoint's parked wake-up (H1); no walk, no relay call on the answer path; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
+      "route": "/internal/pot-changed: B's pot, one outpoint, no decoded params, its two marker-named seats marked stale (E649 L4: the required read, the marker arms one batch each, ONE write batch of the stale marks and the outpoint's parked wake-up (H1); no walk, no relay call on the answer path; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1)). Re-measured by D2-OWED-FOLD-8: the hook now judges its marked identities inside the request (owed_judge::drain_changed, bsv-low #893: the design's cost at the write); the old ceiling measured the attribution and stale marks alone, the walk after the answer",
       "measured": {
-        "reads": 143,
-        "writes": 4,
-        "stmts": 10,
+        "reads": 402,
+        "writes": 55,
+        "stmts": 117,
         "maxReads": 128
       },
       "ceiling": {
-        "reads": 207,
-        "writes": 6,
-        "stmts": 10,
-        "maxReads": 191
+        "reads": 603,
+        "writes": 83,
+        "stmts": 176,
+        "maxReads": 192
       },
       "censusKey": null
     },
     "pot-changed-hook-decoded-8": {
-      "route": "/internal/pot-changed: A's eight decoded pots, one latched seat each (E649 L4 M1, the decoded maximum body: one required batch of 8, the seat markers' batch, ONE write batch of 16 parked wake-ups; no marker arm is read; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
+      "route": "/internal/pot-changed: A's eight decoded pots, one latched seat each (E649 L4 M1, the decoded maximum body: one required batch of 8, the seat markers' batch, ONE write batch of 16 parked wake-ups; no marker arm is read; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1)). Re-measured by D2-OWED-FOLD-8: the hook's attribution, parks AND the judge of its marked identities inside the request (bsv-low #893)",
       "measured": {
-        "reads": 270,
-        "writes": 49,
-        "stmts": 28,
+        "reads": 810,
+        "writes": 147,
+        "stmts": 225,
         "maxReads": 143
       },
       "ceiling": {
-        "reads": 398,
-        "writes": 51,
-        "stmts": 28,
-        "maxReads": 191
+        "reads": 1215,
+        "writes": 221,
+        "stmts": 338,
+        "maxReads": 215
       },
       "censusKey": null
     },
     "pot-changed-hook-marker": {
-      "route": "/internal/pot-changed: the fixture's undecoded pot whose party and refund-backup markers name five identities with owed-state rows (E649 L4 M1, the marker fallback: the required read, three arm batches, ONE write batch of five stale marks and one park; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
+      "route": "/internal/pot-changed: the fixture's undecoded pot whose party and refund-backup markers name five identities with owed-state rows (E649 L4 M1, the marker fallback: the required read, three arm batches, ONE write batch of five stale marks and one park; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1)). Re-measured by D2-OWED-FOLD-8: the hook's attribution, parks AND the judge of its five marker-named identities inside the request (bsv-low #893)",
       "measured": {
-        "reads": 159,
-        "writes": 9,
-        "stmts": 13,
+        "reads": 582,
+        "writes": 84,
+        "stmts": 144,
         "maxReads": 128
       },
       "ceiling": {
-        "reads": 231,
-        "writes": 11,
-        "stmts": 13,
-        "maxReads": 191
+        "reads": 873,
+        "writes": 126,
+        "stmts": 216,
+        "maxReads": 192
       },
       "censusKey": null
     },
     "pot-changed-hook-8x19": {
-      "route": "/internal/pot-changed: seven decoded pots with two latched seats each and the marker pot naming five, 19 identities each with an owed-state row (E649 L4 M1, the review's H2 body: required batch of 8, seat markers, three arm batches over the one marker outpoint, ONE write batch of 5 stale marks and 22 parks; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1))",
+      "route": "/internal/pot-changed: seven decoded pots with two latched seats each and the marker pot naming five, 19 identities each with an owed-state row (E649 L4 M1, the review's H2 body: required batch of 8, seat markers, three arm batches over the one marker outpoint, ONE write batch of 5 stale marks and 22 parks; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1)). Re-measured by D2-OWED-FOLD-8: the hook's attribution, parks AND the judge of its 19 identities inside the request (bsv-low #893); the heaviest request of the tier (435 statements: about 4,700 loopback connections on wrangler dev's local D1 for a few seconds)",
       "measured": {
-        "reads": 342,
-        "writes": 72,
-        "stmts": 42,
+        "reads": 1416,
+        "writes": 240,
+        "stmts": 435,
         "maxReads": 149
       },
       "ceiling": {
-        "reads": 506,
-        "writes": 74,
-        "stmts": 42,
-        "maxReads": 191
+        "reads": 2124,
+        "writes": 360,
+        "stmts": 653,
+        "maxReads": 224
       },
       "censusKey": null
     },
@@ -246,18 +268,18 @@
       "censusKey": null
     },
     "pot-changed-hook-full-refused": {
-      "route": "/internal/pot-changed: eight new rooms at a FULL table of 2,048 live rows none of which may be displaced (E649 L4 N6, fold-3: the batch's eight parks, the counter's one LIMITed scan of at most 2,056 rows, the guard over the rows that may make room (none), which faults and rolls the batch back; answered 503. D1 answers a FAILED batch with no meta, so the ledger counts the reads before it only. NOT the refusal's total (N10, the third delta review): the batch's counter scan (up to 2,056 rows) and its guard, which with no eligible row visits EVERY row (2,059 by the review's D1 binding), are real and unreported; the total is about 16 + 2,057 + 2,059 = 4,132 rows, stated in docs/D1-BUDGETS.md, each scan bounded by the tail scenario's measured maxReads)",
+      "route": "/internal/pot-changed: eight new rooms at a FULL table of 2,048 live rows none of which may be displaced (E649 L4 N6, fold-3: the batch's eight parks, the counter's one LIMITed scan of at most 2,056 rows, the guard over the rows that may make room (none), which faults and rolls the batch back; answered 503. D1 answers a FAILED batch with no meta, so the ledger counts the reads before it only. NOT the refusal's total (N10, the third delta review): the batch's counter scan (up to 2,056 rows) and its guard, which with no eligible row visits EVERY row (2,059 by the review's D1 binding), are real and unreported; the total is about 16 + 2,057 + 2,059 = 4,132 rows, stated in docs/D1-BUDGETS.md, each scan bounded by the tail scenario's measured maxReads). Re-measured by D2-OWED-FOLD-8: re-measured (red on f3d78557 too): the refused hook's reads before its refusal, the largest one statement of 35 rows",
       "measured": {
-        "reads": 16,
+        "reads": 43,
         "writes": 2,
-        "stmts": 33,
-        "maxReads": 2
+        "stmts": 34,
+        "maxReads": 35
       },
       "ceiling": {
-        "reads": 24,
+        "reads": 65,
         "writes": 4,
-        "stmts": 35,
-        "maxReads": 3
+        "stmts": 51,
+        "maxReads": 53
       },
       "censusKey": null
     },
