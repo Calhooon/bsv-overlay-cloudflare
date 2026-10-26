@@ -703,11 +703,8 @@ async fn fold8_c_the_evidence_phase_visits_each_open_eviction_once_and_ends() {
         2,
         "the missing JOIN's two released hops, one with no table field"
     );
-    assert_eq!(
-        r.missing_rows,
-        2 + db.count("SELECT COUNT(*) FROM released_hop_evidence_missing WHERE identity<>'seat'")
-            as u64
-    );
+    assert_eq!(r.evidence_candidates, 0, "no fleet JOIN's bytes are stored");
+    assert!(r.missing_outpoints >= 2, "{r:?}");
     assert_eq!(
         db.counters.borrow()["owed_backfill_evictions_total"] as i64,
         open

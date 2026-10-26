@@ -18,8 +18,23 @@ const armed = await pass()
 console.log('owed-backfill-arm', JSON.stringify(armed))
 assert.equal(armed.report.stop, 'Armed')
 assert.equal(armed.report.identities, 0)
-// The backfill: two identities (the lived-in seat, 270 games, and the one-game wanted identity). A pass the wall cuts
-// resumes; the cost is summed over the passes it took.
+// D2-OWED-FOLD-8: the evidence phase alone (`?evidence=1`), over the seed's ten open evictions, none the writer's: the
+// captured pair 13 (its JOIN's bytes stored: two evidence rows), the synthetic JOIN with no bytes (two released hops
+// for two verified seats: four missing rows) and eight noise evictions with no verified seat (nothing written).
+const evidence = await pass('?evidence=1')
+console.log('owed-backfill-evidence', JSON.stringify(evidence))
+assert.equal(evidence.report.stop, 'Page')
+assert.equal(evidence.report.evictions, 10)
+assert.equal(evidence.report.evidenceCandidates, 2, 'the two hops paying a seat key')
+assert.equal(evidence.report.missingOutpoints, 10, 'the bytes-less JOIN\'s two released hops and the noise evictions\' one each (no seat: no row)')
+const rowsOf = q => Number(execFileSync('sqlite3', [d1File, q]).toString().trim())
+assert.equal(rowsOf('SELECT COUNT(*) FROM released_hop_evidence'), 2)
+assert.equal(rowsOf('SELECT COUNT(*) FROM released_hop_evidence_missing'), 4, 'per verified seat')
+console.log('owed-backfill-evidence-per-eviction', JSON.stringify({ reads: evidence.cost.reads / 10, writes: evidence.cost.writes / 10, stmts: evidence.cost.stmts / 10 }))
+const again = await pass('?evidence=1')
+assert.equal(again.report.evictions, 0, 'the phase is done once')
+// The backfill: six identities (the lived-in seat, 270 games, the one-game wanted identity, and pair 13's four: the
+// twin-only seat, p28, f1 and f2). A pass the wall cuts resumes; the cost is summed over the passes it took.
 const work = { reads: 0, writes: 0, stmts: 0, maxReads: 0 }
 let identities = 0, rows = 0, batches = 0, passes = 0, last
 do {
@@ -31,8 +46,8 @@ do {
   identities += last.report.identities; rows += last.report.rows; batches += last.report.batches
 } while (last.report.stop === 'Wall' && passes < 8)
 assert.equal(last.report.stop, 'Finished')
-assert.equal(identities, 2)
-assert.equal(batches, 18, '270 games in 17 batches of 16, one game in one')
+assert.equal(identities, 6)
+assert.equal(batches, 22, '270 games in 17 batches of 16, one game in one, pair 13\'s four identities one each')
 assert.ok(rows >= 500, `rows ${rows}: the seat at its 500-row ceiling and the wanted identity`)
 const perBatch = Math.round(work.reads / batches)
 console.log('owed-backfill-pass-total', JSON.stringify({ ...work, passes, identities, rows, batches, readsPerBatch: perBatch }))
@@ -59,7 +74,7 @@ assert.ok(pending <= 128, `never more than 128 age marks pending: ${pending}`)
 console.log('owed-age-pending', pending)
 const calls = await (await fetch(`${standin}/__calls`)).json()
 assert.equal(calls.length, 0, 'the backfill asks no courier')
-for (const [name, run] of [['owed-backfill-pass', { cost: work }], ['owed-backfill-stamped', stamped], ['owed-age-remark', aged]]) {
+for (const [name, run] of [['owed-backfill-evidence', evidence], ['owed-backfill-pass', { cost: work }], ['owed-backfill-stamped', stamped], ['owed-age-remark', aged]]) {
   const c = ceilings[name]?.ceiling
   if (!c) { console.log(`NO CEILING ${name} (measure first)`); continue }
   for (const key of ['reads', 'writes', 'stmts', 'maxReads']) assert.ok(run.cost[key] <= c[key], `${name} ${key}: ${run.cost[key]} > ${c[key]}`)

@@ -51,7 +51,8 @@ name = "owed-backfill-chaintracks"
 main = "$root/tools/lane-893/chaintracks_standin.mjs"
 compatibility_date = "2024-12-01"
 EOF
-cargo run --quiet --manifest-path workers/Cargo.toml -p low-app-layer --example owed_read_seed > "$out/seed.sql"
+# D2-OWED-FOLD-8: with the captured pair-13 eviction (made before the eviction writer) for the evidence phase
+OWED_SEED_PAIR13=1 cargo run --quiet --manifest-path workers/Cargo.toml -p low-app-layer --example owed_read_seed > "$out/seed.sql"
 # an old worker's rows: no keys, no judgement stamp, no state, no marks; the overlay certified at the gate's figure
 cat >> "$out/seed.sql" <<'EOF'
 UPDATE owed_rows SET judgedAtMs = NULL, claimable = NULL, gateHeight = NULL, beltDueAtMs = NULL, probeTip = NULL;
