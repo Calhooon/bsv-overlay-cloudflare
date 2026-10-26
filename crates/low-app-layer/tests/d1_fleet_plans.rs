@@ -312,7 +312,8 @@ const OWED_893_PLANS: &[(&str, &str, &[&str])] = &[
         &["idx_owed_rows_identity_game", "sqlite_autoindex_owed_row_words_1", "sqlite_autoindex_tx_words_1"],
     ),
     ("owed identity marker", low_app_layer::owed_read::STATE_SQL, &["sqlite_autoindex_owed_state_1"]),
-    ("owed pending count", low_app_layer::owed_read::PENDING_SQL, &["idx_owed_dirty_identity_marked"]),
+    // the second delta lens's D2-L1: the count names the pending downgrade marks on the covering UNIQUE index
+    ("owed pending count", low_app_layer::owed_read::PENDING_SQL, &["sqlite_autoindex_owed_dirty_1"]),
     // The D2-OWED lens's MEDIUM-1: the SHIPPED drain, tip, belt and repair statements, never proxies.
     ("owed judge marks", low_app_layer::owed_judge::MARKS_SQL, &["sqlite_autoindex_owed_dirty_1"]),
     ("owed hop competitors", low_app_layer::owed_judge::HOP_COMPETITORS_SQL, &["idx_hopparty_hop"]),

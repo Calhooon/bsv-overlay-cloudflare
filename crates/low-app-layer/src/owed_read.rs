@@ -11,7 +11,17 @@ use std::collections::{BTreeMap, HashMap};
 pub const ROWS_SQL: &str = "SELECT r.identity,r.outpoint,r.family,r.gameId,r.sats,r.opponentIdentity,r.atHeight,r.facts,r.reason,r.judgedAtMs,r.claimable,r.probeTip,r.gateHeight,r.beltDueAtMs,w.role,w.txid AS wordTxid,t.word,t.tier,t.height,t.proof_root,t.proof_height,t.proof_hex,t.header_hash,t.hint_source,t.hint_at,t.updated_at,CASE WHEN json_valid(t.legacy_body) THEN json_type(t.legacy_body,'$.trackerTerminal')='true' END AS trackerTerminal,CASE WHEN json_valid(t.legacy_body) THEN json_extract(t.legacy_body,'$.trackerTerminalWord') END AS trackerTerminalWord FROM owed_rows r LEFT JOIN owed_row_words w ON w.identity=r.identity AND w.outpoint=r.outpoint LEFT JOIN tx_words t ON t.txid=w.txid WHERE r.identity=?1 ORDER BY CASE r.family WHEN 'payout' THEN 0 WHEN 'refund-due' THEN 1 WHEN 'hop-stranded' THEN 2 WHEN 'in-progress' THEN 3 ELSE 4 END,COALESCE(r.atHeight,0) DESC,r.outpoint,w.role LIMIT 2004";
 pub const STATE_SQL: &str =
     "SELECT computedAtMs,rows,truncated,recomputeSeq,tip FROM owed_state WHERE identity=?1";
-pub const PENDING_SQL: &str = "SELECT COUNT(*) AS pending FROM owed_dirty WHERE identity=?1";
+/// The identity's pending marks: their count, and (the second delta lens's D2-L1) the games holding an undrained mark
+/// of a DOWNGRADE-class source, the index's spend or admission (`pot`) and the eviction (`eviction`), over the
+/// covering UNIQUE index's identity prefix. The count already visits every pending mark of the identity, so naming
+/// them adds no row and no statement. A mark still in `owed_dirty` is one no judge has acknowledged since it was
+/// written (the judge deletes `generation <= seen` for each subject it judges), so its presence is what "newer than the
+/// row's judgement" means; `markedAtMs` cannot say it (a `pot` mark carries the pot row's `createdAt`). A filing's, a
+/// tip's, a wanted or an age mark is not a downgrade; a belt find is judged in its own batch and leaves no mark.
+pub const PENDING_SQL: &str = "SELECT COUNT(*) AS pending,json_group_array(CASE WHEN source IN ('pot','eviction') THEN json_array(gameId,source) END) AS downgrades FROM owed_dirty WHERE identity=?1";
+/// The served reason of a press withheld over a pending downgrade (D2-L1).
+pub const PENDING_DOWNGRADE_REASON: &str =
+    "re-judging: a downgrade of this game is recorded and not yet judged; the press waits for the judgement";
 
 #[derive(Debug, Default)]
 pub struct Snapshot {
@@ -19,6 +29,8 @@ pub struct Snapshot {
     pub state: Option<Value>,
     pub pending: u64,
     pub wanted: bool,
+    /// The games holding an undrained downgrade-class mark, each with its source (D2-L1).
+    pub downgrades: BTreeMap<String, String>,
 }
 
 fn number(value: &Value) -> Option<u64> {
@@ -59,19 +71,33 @@ pub async fn read(db: &impl SqlPort, identity: &str) -> Result<Snapshot, String>
     if batch.len() != 3 {
         return Err("incomplete owed read batch".into());
     }
-    let pending = batch
-        .pop()
-        .unwrap()
-        .rows
-        .first()
+    let marks = batch.pop().unwrap().rows.into_iter().next();
+    let pending = marks
+        .as_ref()
         .and_then(|r| number(&r["pending"]))
         .ok_or("invalid owed pending count")?;
+    let mut downgrades = BTreeMap::new();
+    let named: Value = marks
+        .as_ref()
+        .and_then(|r| r["downgrades"].as_str())
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|e| format!("owed pending downgrades: {e}"))?
+        .unwrap_or(Value::Null);
+    for mark in named.as_array().into_iter().flatten() {
+        if let (Some(game), Some(source)) = (mark[0].as_str(), mark[1].as_str()) {
+            downgrades
+                .entry(game.to_owned())
+                .or_insert_with(|| source.to_owned());
+        }
+    }
     let state = batch.pop().unwrap().rows.into_iter().next();
     let mut snapshot = Snapshot {
         joined: batch.pop().unwrap().rows,
         state,
         pending,
         wanted: false,
+        downgrades,
     };
     if snapshot.state.is_none() {
         snapshot.joined.clear();
@@ -193,6 +219,23 @@ impl Snapshot {
                     let [row] = one;
                     facts = row.facts;
                     reason = row.reason;
+                }
+                // The second delta lens's D2-L1 (the captain's ruling): a read never does work, but never serves a
+                // press over a pending downgrade. A game holding an undrained downgrade-class mark serves its press
+                // withheld as re-judging; the drain's judgement lifts it.
+                if facts["claimable"] == Value::Bool(true) {
+                    if let Some(source) = joined["gameId"]
+                        .as_str()
+                        .and_then(|game| self.downgrades.get(game))
+                    {
+                        facts["claimable"] = json!(false);
+                        facts["claimableBeforePending"] = json!(true);
+                        facts["refresh"] = json!("pending");
+                        facts["pendingSource"] = json!(source);
+                        facts["stale"] = json!(true);
+                        facts["retryAfterMs"] = json!(1500);
+                        facts["claimReason"] = json!(PENDING_DOWNGRADE_REASON);
+                    }
                 }
                 let position = rows.len();
                 positions.insert(outpoint.into(), position);
