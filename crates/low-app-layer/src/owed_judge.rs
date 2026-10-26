@@ -112,8 +112,8 @@ pub use writers::{
 };
 pub(crate) use hydrate::hydrate_filings;
 pub use hydrate::{
-    hydrate_inputs, HOPS_SQL, HOP_COMPETITORS_SQL, LINKS_SQL, PARTIES_SQL, RELEASED_SQL,
-    REPRESENTATIVES_SQL,
+    hydrate_inputs, HOPS_SQL, HOP_COMPETITORS_SQL, LINKS_SQL, MISSING_SQL, PARTIES_SQL,
+    RELEASED_SQL, REPRESENTATIVES_SQL,
 };
 
 pub const OWED_JUDGE_SUBJECTS_PER_INVOCATION: usize = 16;
