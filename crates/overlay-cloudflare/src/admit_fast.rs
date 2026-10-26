@@ -2540,7 +2540,7 @@ struct SubjectBeefRow {
 }
 
 /// bsv-low #836 fold (the lens's M1): what bounds a non-final word's hold for `txid`: its own lock from its stored
-/// bytes ([`SUBJECT_BEEF_SQL`]; `None` when no store holds them or a read faults), the chaintracks tip (`None`: no
+/// bytes (`SUBJECT_BEEF_SQL`; `None` when no store holds them or a read faults), the chaintracks tip (`None`: no
 /// tracker, or a fault) and the clock. Asked only of a non-final look (at most two reads and one tip).
 pub async fn stored_lock_bound(
     tracker: Option<&dyn bsv_rs::transaction::ChainTracker>,
@@ -2986,7 +2986,7 @@ async fn pending_watch_job_with<P: PendingWatch>(
 ///     to the second broadcaster meanwhile); still an orphan at the end → counted;
 ///   * unknown / below SEEN → keep watching; silent at the end → counted, ONLY while the subject's
 ///     `network_seen` is still unlatched (bsv-low #822: a subject the #413 dual push or a callback latched is
-///     `latched-elsewhere`, [`watch_end_counter`]).
+///     `latched-elsewhere`, `watch_end_counter`).
 ///
 /// Every look is one GET; the latch is the only write on the happy path.
 pub async fn pending_watch_job(env: EvidenceEnv, txid: String, admitted_at_ms: f64) {

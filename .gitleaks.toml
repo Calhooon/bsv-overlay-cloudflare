@@ -11,3 +11,8 @@ useDefault = true
 description = "compressed secp256k1 public keys"
 regexTarget = "secret"
 regexes = ['''^0[23][0-9a-fA-F]{64}$''']
+
+[[allowlists]]
+description = "SQLite UPSERT assignments (`col=excluded.col`) inside SQL strings: the generic-api-key rule read the owed triggers' ON CONFLICT clause as a key (bsv-low #893's branch, 2026-10-26)"
+regexTarget = "line"
+regexes = ['''=excluded\.[A-Za-z_]+''']
