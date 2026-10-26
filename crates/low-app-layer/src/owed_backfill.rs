@@ -206,9 +206,9 @@ pub const MARKER_REPAIR_CURSOR_SQL: &str =
     "SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:marker-evictions'";
 /// The window: every ledger txid past the cursor (at most `?2`), each with its row when it is a candidate.
 pub const MARKER_REPAIR_SQL: &str = concat!(
-    "SELECT w.txid AS seen,e.txid AS txid,e.releasedSpends AS releasedSpends FROM (SELECT txid FROM pot_evictions WHERE txid>?1 ORDER BY txid LIMIT ?2) w LEFT JOIN pot_evictions e ON e.txid=w.txid AND e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL AND ",
+    "SELECT d.txid AS seen,e.txid AS txid,e.releasedSpends AS releasedSpends FROM (SELECT txid FROM pot_evictions WHERE txid>?1 ORDER BY txid LIMIT ?2) d LEFT JOIN pot_evictions e ON e.txid=d.txid AND e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL AND ",
     marker_unwritten!(),
-    " ORDER BY w.txid"
+    " ORDER BY d.txid"
 );
 pub const MARKER_REPAIR_SAVE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:marker-evictions',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// Arm the cursor; a pass that finds it armed begins.
