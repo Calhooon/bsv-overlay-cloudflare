@@ -884,3 +884,40 @@ fn fold10_n1_the_honoured_evidence_is_one_predicate_both_reads_use() {
     );
     assert!(!plan.iter().any(|d| d.starts_with("SCAN")), "{plan:?}");
 }
+
+/// D2-OWED-FOLD-10, the sixth delta lens's NOTE-3: the evidence phase's fault-count write is raced by the pass's
+/// deadline, as the cursor's save is: a count write the wall has fallen on is not made (the pass is still the fault's,
+/// the count is not bumped, so the bound can only come later, never earlier), and nothing past the wall is awaited.
+/// The virtual clock costs 3,350 ms a batch: the eviction's write batch runs inside the wall less its reserve, the
+/// count write would start past the whole wall. RED on 237ae72b (the write unraced): the count row is written.
+#[tokio::test]
+async fn fold10_n3_the_fault_count_write_is_raced_by_the_deadline() {
+    let wedged = "aa00000000000000000000000000000000000000000000000000000000000000";
+    let db = Db::new();
+    db.exec(&format!("INSERT INTO potparty_records_evicted(identity,potTxid,gameId,opponentIdentity,seatSettlePubkey,sigValid) VALUES ('seat-a','{wedged}','g-a','o','02aa',1)"));
+    db.exec(&format!("INSERT INTO pot_evictions(txid,reason,evictedAt,releasedSpends) VALUES ('{wedged}','R',5,'[{{\"table\":\"pot_records\",\"txid\":\"a1{}\",\"vout\":0}}]')", "0".repeat(62)));
+    db.exec(&format!("CREATE TRIGGER wedge BEFORE INSERT ON released_hop_evidence_missing WHEN NEW.potTxid='{wedged}' BEGIN SELECT RAISE(ABORT,'wedged'); END;"));
+    db.certify(backfill::OWED_TRIGGERS_MIGRATION_COUNT);
+    backfill::backfill_pass(&db, &open_deadline(&db))
+        .await
+        .unwrap(); // armed
+    db.batch_ms.set(3_350);
+    let r = backfill::backfill_pass(&db, &open_deadline(&db)).await;
+    assert!(
+        r.as_ref().is_err_and(|e| e.contains("wedged")),
+        "the pass is the fault's: {r:?}"
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM owed_belt_state WHERE name='backfill:owed-v2:eviction-faults' AND cursor<>'{}'"),
+        0,
+        "the count write the wall fell on is not made"
+    );
+    // with time left the count is written, as before
+    db.batch_ms.set(0);
+    let r = backfill::backfill_pass(&db, &open_deadline(&db)).await;
+    assert!(r.is_err());
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM owed_belt_state WHERE name='backfill:owed-v2:eviction-faults' AND json_extract(cursor,'$.faults')=1"),
+        1
+    );
+}
