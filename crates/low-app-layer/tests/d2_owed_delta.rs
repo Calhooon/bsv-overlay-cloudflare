@@ -66,51 +66,50 @@ fn spender_paying_elsewhere(spent: &str) -> (String, Vec<u8>) {
     (tx.id(), tx.to_binary())
 }
 
-/// D-H1 (the captain's ruling): the owner's own index-UNSPENT stranded hop is pressable on the index's word, so a
-/// block neither withholds it at the read nor dates it due at the belt; only a claimable sweep that rests on a courier
-/// probe alone (index status not `unspent`) is withheld at the block and re-dated for its look. K strangers' own
-/// index-unspent sweeps therefore buy no place ahead of anyone after a block. RED on d521888f: the honest press is
-/// withheld at the moved read and every one of the K + 2 sweeps is dated due now.
-#[tokio::test]
-async fn d2delta_h1_an_index_unspent_sweep_keeps_its_press_across_a_block_and_no_stranger_is_dated() {
+/// D-H1's shape: the owner's own index-UNSPENT stranded hop, a courier-only sweep (index status unknown, a courier said
+/// unspent) of another identity, and K = 64 strangers' own index-unspent sweeps, all judged at 900,000; then a block
+/// (the tip handler at 900,001, no belt tick). Answers the honest and the courier-only outpoints and the block's time.
+async fn d_h1_block(db: &Db) -> (String, String, i64) {
     const K: usize = 64;
-    let db = Db::new();
-    seed_stranded_hop(&db, "owner", "g00", &hop(0));
-    seed_courier_unspent_hop(&db, "courier", "c00", &hop(1), 900_000);
+    seed_stranded_hop(db, "owner", "g00", &hop(0));
+    seed_courier_unspent_hop(db, "courier", "c00", &hop(1), 900_000);
     for n in 0..K {
-        seed_stranded_hop(&db, &format!("stranger{n:03}"), &format!("s{n}"), &hop(1_000 + n));
+        seed_stranded_hop(
+            db,
+            &format!("stranger{n:03}"),
+            &format!("s{n}"),
+            &hop(1_000 + n),
+        );
     }
-    drain_all(&db).await;
+    drain_all(db).await;
     let honest = format!("{}:0", hop(0));
     let leaning = format!("{}:0", hop(1));
-    let at_tip = served(&db, "owner", Some(900_000)).await;
+    let at_tip = served(db, "owner", Some(900_000)).await;
     let row = row_of(&at_tip, &honest);
     assert_eq!(row["facts"]["claimable"], true, "{row}");
     assert_eq!(row["facts"]["chainProbe"], "index-unspent", "{row}");
-    assert_eq!(row["facts"]["status"], "unspent", "the index's word is a stored fact");
-    let row = row_of(&served(&db, "courier", Some(900_000)).await, &leaning).clone();
+    assert_eq!(
+        row["facts"]["status"], "unspent",
+        "the index's word is a stored fact"
+    );
+    let row = row_of(&served(db, "courier", Some(900_000)).await, &leaning).clone();
     assert_eq!(row["facts"]["claimable"], true, "{row}");
     assert_eq!(row["facts"]["chainProbe"], "unspent", "{row}");
     assert_ne!(row["facts"]["status"], "unspent", "{row}");
-
-    // a block: the tip handler runs, no belt tick runs
-    let before: Vec<Option<i64>> = (0..K).map(|n| due(&db, &format!("{}:0", hop(1_000 + n)))).collect();
-    let honest_due = due(&db, &honest);
     db.now.set(db.now.get() + 1_000);
     db.tip.set(Some(900_001));
-    judge::mark_tip(&db, 900_001).await.unwrap();
-    let now = db.now.get() as i64;
-    assert_eq!(
-        db.int(&format!("SELECT COUNT(*) FROM owed_rows WHERE beltDueAtMs={now}")),
-        1,
-        "the block dates the courier-dependent sweep alone"
-    );
-    assert_eq!(due(&db, &leaning), Some(now));
-    assert_eq!(due(&db, &honest), honest_due, "the index-unspent sweep keeps its own cadence");
-    let after: Vec<Option<i64>> = (0..K).map(|n| due(&db, &format!("{}:0", hop(1_000 + n)))).collect();
-    assert_eq!(before, after, "no stranger's sweep is dated by the block");
+    judge::mark_tip(db, 900_001).await.unwrap();
+    (honest, leaning, db.now.get() as i64)
+}
 
-    // the read: the honest press stands with the move stated; the courier-only press is withheld until its look
+/// D-H1 (a), the captain's ruling: the owner's own index-UNSPENT stranded hop is pressable on the index's word, so a
+/// block does not withhold it at the read: served OFFERED with the move stated (`tipMoved`, `snapshotTip`,
+/// `chainProbeTip`, `servedTip`; `tipUnknown` at an unreadable tip), no belt look between. RED on d521888f: the read
+/// degraded every claimable sweep at the block (`claimable: false`, `chainWait: "block"`).
+#[tokio::test]
+async fn d2delta_h1_a_an_index_unspent_press_stays_offered_across_a_block_with_tip_moved() {
+    let db = Db::new();
+    let (honest, _, _) = d_h1_block(&db).await;
     let moved = served(&db, "owner", Some(900_001)).await;
     let row = row_of(&moved, &honest);
     assert_eq!(row["facts"]["claim"], "sweep-hop", "{row}");
@@ -125,23 +124,79 @@ async fn d2delta_h1_an_index_unspent_sweep_keeps_its_press_across_a_block_and_no
     let row = row_of(&unknown, &honest);
     assert_eq!(row["facts"]["claimable"], true, "{row}");
     assert_eq!(row["facts"]["tipUnknown"], true, "{row}");
-    let row = row_of(&served(&db, "courier", Some(900_001)).await, &leaning).clone();
-    assert_eq!(row["facts"]["claimable"], false, "{row}");
-    assert_eq!(row["facts"]["chainWait"], "block");
-    assert_eq!(row["facts"]["tipMoved"], true);
+}
 
-    // the belt's tick: the courier-dependent row is the one due; its look (still unspent) restores its press
+/// D-H1 (b): the block dates due now the courier-dependent sweep alone; the honest index-unspent row keeps its own
+/// cadence and no stranger's row is dated, so the belt's due set grows by the courier-dependent rows only and its first
+/// tick has the one candidate. RED on d521888f: `left: 66 right: 1` (every one of the K + 2 sweeps dated).
+#[tokio::test]
+async fn d2delta_h1_b_the_block_dates_the_courier_dependent_rows_only() {
+    const K: usize = 64;
+    let db = Db::new();
+    seed_stranded_hop(&db, "owner", "g00", &hop(0));
+    seed_courier_unspent_hop(&db, "courier", "c00", &hop(1), 900_000);
+    for n in 0..K {
+        seed_stranded_hop(
+            &db,
+            &format!("stranger{n:03}"),
+            &format!("s{n}"),
+            &hop(1_000 + n),
+        );
+    }
+    drain_all(&db).await;
+    let honest = format!("{}:0", hop(0));
+    let leaning = format!("{}:0", hop(1));
+    let before: Vec<Option<i64>> = (0..K)
+        .map(|n| due(&db, &format!("{}:0", hop(1_000 + n))))
+        .collect();
+    let honest_due = due(&db, &honest);
+    db.now.set(db.now.get() + 1_000);
+    db.tip.set(Some(900_001));
+    judge::mark_tip(&db, 900_001).await.unwrap();
+    let now = db.now.get() as i64;
+    assert_eq!(
+        db.int(&format!(
+            "SELECT COUNT(*) FROM owed_rows WHERE beltDueAtMs={now}"
+        )),
+        1,
+        "the block dates the courier-dependent sweep alone"
+    );
+    assert_eq!(due(&db, &leaning), Some(now));
+    assert_eq!(
+        due(&db, &honest),
+        honest_due,
+        "the index-unspent sweep keeps its own cadence"
+    );
+    let after: Vec<Option<i64>> = (0..K)
+        .map(|n| due(&db, &format!("{}:0", hop(1_000 + n))))
+        .collect();
+    assert_eq!(before, after, "no stranger's sweep is dated by the block");
     let fake = Fake::default();
     let report = belt::tick(&db, &fake).await.unwrap();
     assert_eq!(report.candidates, 1, "{report:?}");
-    assert!(fake.calls.borrow().iter().all(|u| u.contains(&hop(1))), "{:?}", fake.calls.borrow());
-    let row = row_of(&served(&db, "courier", Some(900_001)).await, &leaning).clone();
-    assert_eq!(row["facts"]["claimable"], true, "after its look: {row}");
+    assert!(
+        fake.calls.borrow().iter().all(|u| u.contains(&hop(1))),
+        "{:?}",
+        fake.calls.borrow()
+    );
+}
 
-    // a KNOWN competitor the belt finds on the honest hop downgrades it at the write
+/// D-H1 (c): a KNOWN competitor the belt finds on the honest index-unspent hop downgrades it AT THE WRITE (the find's
+/// own judge batch, nothing left dirty): the next read serves no claimable sweep. Green on d521888f (the write path
+/// already downgraded; the second delta lens's D2-N1 asked it proven on its own): RED against `judge_with_write` with
+/// the find's facts not applied (`apply(&mut inputs)?` replaced by `let _ = apply;`): `left: String("hop-stranded")`,
+/// the press `claimable: true` served over the found spender.
+#[tokio::test]
+async fn d2delta_h1_c_a_belt_find_of_a_competitor_downgrades_at_the_write() {
+    let db = Db::new();
+    let (honest, _, now) = d_h1_block(&db).await;
     db.exec(&format!(
         "UPDATE owed_rows SET beltDueAtMs={} WHERE outpoint='{honest}'",
         now - 1
+    ));
+    db.exec(&format!(
+        "UPDATE owed_rows SET beltDueAtMs={} WHERE outpoint<>'{honest}'",
+        now + HOUR
     ));
     let (spender, raw) = spender_paying_elsewhere(&hop(0));
     let fake = Fake::default();
@@ -154,12 +209,43 @@ async fn d2delta_h1_an_index_unspent_sweep_keeps_its_press_across_a_block_and_no
                 .into_bytes(),
         )),
     );
-    fake.on(&format!("tx/{spender}/hex"), Some((200, hex::encode(&raw).into_bytes())));
+    fake.on(
+        &format!("tx/{spender}/hex"),
+        Some((200, hex::encode(&raw).into_bytes())),
+    );
     let report = belt::tick(&db, &fake).await.unwrap();
     assert_eq!(report.found, 1, "{report:?}");
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_dirty WHERE identity='owner'"),
+        0,
+        "judged in its own batch"
+    );
     let row = row_of(&served(&db, "owner", Some(900_001)).await, &honest).clone();
     assert_ne!(row["family"], "hop-stranded", "{row}");
     assert_ne!(row["facts"]["claimable"], true, "{row}");
+}
+
+/// D-H1 (d): an index-UNKNOWN sweep whose press rests on a courier probe alone degrades at the block to the pending
+/// chain-wait, and is claimable again after its look (still unspent). Green on d521888f (which degraded every
+/// claimable sweep at a block): RED against `owed::state_index_unspent_sweep` widened to every claimable sweep (its
+/// `status` test removed): `left: Bool(true) right: false`, the courier-only press served across the block.
+#[tokio::test]
+async fn d2delta_h1_d_an_index_unknown_courier_press_degrades_at_the_block_until_its_look() {
+    let db = Db::new();
+    let (_, leaning, _) = d_h1_block(&db).await;
+    let row = row_of(&served(&db, "courier", Some(900_001)).await, &leaning).clone();
+    assert_eq!(row["facts"]["claimable"], false, "{row}");
+    assert_eq!(row["facts"]["chainWait"], "block");
+    assert_eq!(row["facts"]["tipMoved"], true);
+    let fake = Fake::default();
+    belt::tick(&db, &fake).await.unwrap();
+    assert!(
+        fake.calls.borrow().iter().any(|u| u.contains(&hop(1))),
+        "{:?}",
+        fake.calls.borrow()
+    );
+    let row = row_of(&served(&db, "courier", Some(900_001)).await, &leaning).clone();
+    assert_eq!(row["facts"]["claimable"], true, "after its look: {row}");
 }
 
 /// The outpoints the fake was asked about, by hop index, in first-asked order.
@@ -189,8 +275,15 @@ async fn d2delta_l1_the_belt_cursor_passes_no_identity_it_did_not_serve() {
     drain_all(&db).await;
     let now = db.now.get() as i64;
     for n in 0..80 {
-        let at = if n % 4 == 0 { now - 1_000 - n as i64 } else { now + 3 * HOUR };
-        db.exec(&format!("UPDATE owed_rows SET beltDueAtMs={at} WHERE outpoint='{}:0'", hop(n)));
+        let at = if n % 4 == 0 {
+            now - 1_000 - n as i64
+        } else {
+            now + 3 * HOUR
+        };
+        db.exec(&format!(
+            "UPDATE owed_rows SET beltDueAtMs={at} WHERE outpoint='{}:0'",
+            hop(n)
+        ));
     }
     let mut served_by_tick = Vec::new();
     for _ in 0..3 {
@@ -198,11 +291,16 @@ async fn d2delta_l1_the_belt_cursor_passes_no_identity_it_did_not_serve() {
         belt::tick(&db, &fake).await.unwrap();
         served_by_tick.push(asked(&fake, 0..80));
     }
-    assert_eq!(served_by_tick[0], [0, 4, 8, 12, 16, 20, 24, 28], "the first eight due, in walk order");
+    assert_eq!(
+        served_by_tick[0],
+        [0, 4, 8, 12, 16, 20, 24, 28],
+        "the first eight due, in walk order"
+    );
     assert_eq!(served_by_tick[1], [32, 36, 40, 44, 48, 52, 56, 60]);
     assert_eq!(served_by_tick[2], [64, 68, 72, 76]);
     assert_eq!(
-        db.text("SELECT cursor FROM owed_belt_state WHERE name='belt:identities'").as_deref(),
+        db.text("SELECT cursor FROM owed_belt_state WHERE name='belt:identities'")
+            .as_deref(),
         Some("id076"),
         "the cursor rests on the last identity given a turn"
     );
@@ -228,12 +326,19 @@ async fn d2delta_l2_a_moving_tip_does_not_reset_the_backoff() {
     };
     look(at).await.unwrap();
     let mut period = due(&db, &op).unwrap() - at as i64;
-    assert_eq!(period, 600_000, "the first look changed the probe: the base period");
+    assert_eq!(
+        period, 600_000,
+        "the first look changed the probe: the base period"
+    );
     for _ in 0..8 {
         at += period as u64;
         look(at).await.unwrap();
         let next = due(&db, &op).unwrap() - at as i64;
-        assert_eq!(next, (2 * period).min(belt::OWED_BELT_BACKOFF_MAX_MS), "a block is not a change");
+        assert_eq!(
+            next,
+            (2 * period).min(belt::OWED_BELT_BACKOFF_MAX_MS),
+            "a block is not a change"
+        );
         period = next;
     }
     assert_eq!(period, belt::OWED_BELT_BACKOFF_MAX_MS);
@@ -244,16 +349,28 @@ async fn d2delta_l2_a_moving_tip_does_not_reset_the_backoff() {
 /// d521888f: `left: 300000 right: 600000`.
 #[tokio::test]
 async fn d2delta_l2_an_unanswered_look_doubles_from_its_floor_to_the_ceiling() {
-    assert_eq!(belt::unanswered_period(1_000, Some(1_000)), belt::OWED_BELT_UNANSWERED_RETRY_MS);
-    assert_eq!(belt::unanswered_period(1_000, None), belt::OWED_BELT_UNANSWERED_RETRY_MS);
+    assert_eq!(
+        belt::unanswered_period(1_000, Some(1_000)),
+        belt::OWED_BELT_UNANSWERED_RETRY_MS
+    );
+    assert_eq!(
+        belt::unanswered_period(1_000, None),
+        belt::OWED_BELT_UNANSWERED_RETRY_MS
+    );
     let db = Db::new();
     seed_stranded_hop(&db, "owner", "g00", &hop(0));
     drain_all(&db).await;
     let op = format!("{}:0", hop(0));
-    let facts = db.text(&format!("SELECT facts FROM owed_rows WHERE outpoint='{op}'"));
+    let facts = db.text(&format!(
+        "SELECT facts FROM owed_rows WHERE outpoint='{op}'"
+    ));
     let fake = Fake::default();
     fake.on("", Some((429, b"{}".to_vec())));
-    let judged = db.opt(&format!("SELECT judgedAtMs FROM owed_rows WHERE outpoint='{op}'")).unwrap();
+    let judged = db
+        .opt(&format!(
+            "SELECT judgedAtMs FROM owed_rows WHERE outpoint='{op}'"
+        ))
+        .unwrap();
     let mut at = due(&db, &op).unwrap();
     let mut periods = Vec::new();
     for _ in 0..8 {
@@ -261,14 +378,23 @@ async fn d2delta_l2_an_unanswered_look_doubles_from_its_floor_to_the_ceiling() {
         let report = belt::tick(&db, &fake).await.unwrap();
         assert_eq!(report.rearmed, 1, "{report:?}");
         let next = due(&db, &op).unwrap() - at;
-        assert_eq!(next, (at - judged).min(belt::OWED_BELT_BACKOFF_MAX_MS), "as long again as since its judgement");
+        assert_eq!(
+            next,
+            (at - judged).min(belt::OWED_BELT_BACKOFF_MAX_MS),
+            "as long again as since its judgement"
+        );
         periods.push(next);
         at += next;
     }
     let period = *periods.last().unwrap();
     assert_eq!(periods[..3], [600_000, 1_200_000, 2_400_000], "{periods:?}");
     assert_eq!(period, belt::OWED_BELT_BACKOFF_MAX_MS);
-    assert_eq!(db.text(&format!("SELECT facts FROM owed_rows WHERE outpoint='{op}'")), facts);
+    assert_eq!(
+        db.text(&format!(
+            "SELECT facts FROM owed_rows WHERE outpoint='{op}'"
+        )),
+        facts
+    );
 }
 
 /// D-L3: the wanted envelope's "newest 32 games" orders by ONE unit, milliseconds: `potparty_records` and
@@ -305,7 +431,11 @@ async fn d2delta_l3_the_wanted_envelope_orders_its_games_in_one_unit() {
             .map(Result::unwrap)
             .collect::<Vec<_>>()
     };
-    assert_eq!(marked("backfill"), ["old"], "the ten-day-old game is the oldest");
+    assert_eq!(
+        marked("backfill"),
+        ["old"],
+        "the ten-day-old game is the oldest"
+    );
     let wanted = marked("wanted");
     assert_eq!(wanted.len(), 32);
     assert!(wanted.iter().all(|g| g.starts_with('g')), "{wanted:?}");
