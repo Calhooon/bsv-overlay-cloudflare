@@ -844,3 +844,43 @@ fn fold9_b_a_readmitted_evictions_evidence_hides_no_missing_row() {
     db.exec(&format!("UPDATE released_hop_evidence SET potTxid='{b}',evictedAt=7"));
     assert!(served(&db).is_empty(), "the seat's own evidence names the outpoint");
 }
+
+/// D2-OWED-FOLD-10, the sixth delta lens's NOTE-1: the evidence the judge honours is ONE predicate. `RELEASED_SQL` (the
+/// judge's evidence read) and `MISSING_SQL`'s exclusion read the same text, once each, so an edit to one is an edit to
+/// both. RED on 237ae72b (the rule written twice, in two spellings): `RELEASED_SQL` names no shared predicate.
+#[test]
+fn fold10_n1_the_honoured_evidence_is_one_predicate_both_reads_use() {
+    let released = judge::RELEASED_SQL;
+    let predicate = released
+        .strip_prefix("SELECT h.* FROM ")
+        .and_then(|rest| rest.strip_suffix(" AND h.hopTxid=?1 AND h.hopVout=?2"))
+        .unwrap_or_else(|| panic!("RELEASED_SQL is the shared predicate and its key: {released}"));
+    assert!(
+        predicate.contains("he.readmittedAt IS NULL AND h.evictedAt=he.evictedAt"),
+        "{predicate}"
+    );
+    assert_eq!(
+        judge::MISSING_SQL.matches(predicate).count(),
+        1,
+        "MISSING_SQL's exclusion reads the same predicate: {}",
+        judge::MISSING_SQL
+    );
+    assert_eq!(released.matches(predicate).count(), 1);
+    // the judge's evidence read stays a key search
+    let db = Db::new();
+    let plan: Vec<String> = db
+        .conn
+        .borrow()
+        .prepare(&format!("EXPLAIN QUERY PLAN {released}"))
+        .unwrap()
+        .query_map(rusqlite::params!["", 0], |r| r.get(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        plan.iter()
+            .any(|d| d.starts_with("SEARCH h USING INDEX sqlite_autoindex_released_hop_evidence")),
+        "{plan:?}"
+    );
+    assert!(!plan.iter().any(|d| d.starts_with("SCAN")), "{plan:?}");
+}
