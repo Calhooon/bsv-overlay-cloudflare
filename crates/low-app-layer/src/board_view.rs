@@ -218,8 +218,7 @@ impl BoardView {
         storage
             .set_alarm(crate::owed_belt::OWED_BELT_TICK_MS)
             .await?;
-        let _turn = self.owed_turn.lock().await;
-        crate::owed_belt::alarm_env(&self.env).await
+        crate::owed_belt::alarm_env(&self.env, &self.owed_turn).await
     }
 }
 
