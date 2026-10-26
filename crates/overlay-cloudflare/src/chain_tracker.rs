@@ -127,11 +127,6 @@ impl WorkerChainTracker {
             tip_cache: TipCache::default(),
         }
     }
-
-    /// bsv-low #896: the verified header tip, its height and hash, from the tracker's 30 s memo or one request.
-    pub async fn verified_tip(&self) -> Result<EngineTip, ChainTrackerError> {
-        cached_verified_tip(&self.base_url, &self.service, &self.tip_cache).await
-    }
 }
 
 /// Send a GET either through a service binding (no same-account loopback) or a
