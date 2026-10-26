@@ -17,12 +17,14 @@ fn row_of<'a>(body: &'a Value, outpoint: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no row {outpoint} in {body}"))
 }
 
-/// HIGH-1: the #669 freshness gate at the read. A sweep the judge found claimable at tip T is served claimable at T,
-/// degraded to a pending chain-wait at T+1, and withheld when the present tip cannot be read.
+/// HIGH-1: the #669 freshness gate at the read. A sweep the judge found claimable at tip T on a COURIER probe alone
+/// (the index does not hold the hop) is served claimable at T, degraded to a pending chain-wait at T+1, and withheld
+/// when the present tip cannot be read. Re-aimed by the delta lens's D-H1: an index-UNSPENT sweep keeps its press
+/// across a block (`d2_owed_delta.rs`, `d2delta_h1_*`), so the gate is pinned where it still applies.
 #[tokio::test]
 async fn d2fold_high1_a_stored_sweep_degrades_at_the_read_across_a_block() {
     let db = Db::new();
-    seed_stranded_hop(&db, "owner", "g00", &hop(0));
+    seed_courier_unspent_hop(&db, "owner", "g00", &hop(0), 900_000);
     drain_all(&db).await;
     let op = format!("{}:0", hop(0));
     let fresh = served(&db, "owner", Some(900_000)).await;
@@ -67,13 +69,14 @@ async fn d2fold_high1_a_stored_sweep_degrades_at_the_read_across_a_block() {
     }
 }
 
-/// HIGH-1: on a tip the claimable sweeps judged below it are dated due now (the design's tip row), over a partial
-/// index, so the belt re-probes them first; a sweep judged at the new tip, and every other row, keep their date.
+/// HIGH-1: on a tip the courier-dependent claimable sweeps judged below it are dated due now (the design's tip row,
+/// narrowed by the delta lens's D-H1), over a partial index, so the belt re-probes them first; a sweep judged at the
+/// new tip, and every other row, keep their date.
 #[tokio::test]
 async fn d2fold_high1_b_a_tip_dates_the_claimable_sweeps_due_now() {
     let db = Db::new();
-    seed_stranded_hop(&db, "owner", "g00", &hop(0));
-    seed_stranded_hop(&db, "owner", "g01", &hop(1));
+    seed_courier_unspent_hop(&db, "owner", "g00", &hop(0), 900_000);
+    seed_courier_unspent_hop(&db, "owner", "g01", &hop(1), 900_000);
     drain_all(&db).await;
     let later = db.now.get() as i64 + 3 * HOUR;
     db.exec(&format!("UPDATE owed_rows SET beltDueAtMs={later}"));
