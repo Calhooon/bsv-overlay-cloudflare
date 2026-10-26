@@ -514,17 +514,9 @@ async fn evidence_phase(
                     } + 1;
                     let now = db.now_ms() as i64;
                     if seen < OWED_BACKFILL_IDENTITY_FAULTS_MAX {
-                        db.run_batch(vec![Stmt {
-                            sql: EVICTION_FAULTS_SQL.into(),
-                            binds: vec![
-                                Bind::Text(
-                                    serde_json::json!({"txid": txid, "faults": seen}).to_string(),
-                                ),
-                                Bind::Int(now),
-                            ],
-                        }])
-                        .await?;
-                        return Err(error);
+                        let count = serde_json::json!({"txid": txid, "faults": seen});
+                        return note_fault(db, deadline, EVICTION_FAULTS_SQL, count, now, error)
+                            .await;
                     }
                     db.log(&format!(
                         "[owed-backfill] eviction {txid}: the evidence phase faulted on {seen} passes ({error}); recorded, no evidence written, passed"
@@ -578,6 +570,33 @@ async fn evidence_phase(
             return Ok(true);
         }
     }
+}
+
+/// A faulted pass's count write (the identity's [`FAULTS_SQL`], the eviction's [`EVICTION_FAULTS_SQL`]), raced by the
+/// pass's whole deadline as the cursor's save is (D2-OWED-FOLD-10, the sixth delta lens's NOTE-3): a write the wall has
+/// fallen on is not made, so the count can only lag and the bound come later, never earlier. The pass answers the
+/// fault either way; a count write that faults answers its own fault, as before.
+async fn note_fault<T>(
+    db: &impl SqlPort,
+    deadline: &Deadline,
+    sql: &str,
+    count: Value,
+    now: i64,
+    error: String,
+) -> Result<T, String> {
+    let write = db.run_batch(vec![Stmt {
+        sql: sql.into(),
+        binds: vec![Bind::Text(count.to_string()), Bind::Int(now)],
+    }]);
+    match deadline.run(write).await {
+        Some(out) => {
+            out?;
+        }
+        None => db.log(&format!(
+            "[owed-backfill] the wall fell before the fault's count was written ({count}); the next fault counts again"
+        )),
+    }
+    Err(error)
 }
 
 /// The faulted eviction's count as the gate read it (`Null` when none).
@@ -693,18 +712,8 @@ pub async fn backfill_pass(
                     } + 1;
                     let now = db.now_ms() as i64;
                     if seen < OWED_BACKFILL_IDENTITY_FAULTS_MAX {
-                        db.run_batch(vec![Stmt {
-                            sql: FAULTS_SQL.into(),
-                            binds: vec![
-                                Bind::Text(
-                                    serde_json::json!({"identity": identity, "faults": seen})
-                                        .to_string(),
-                                ),
-                                Bind::Int(now),
-                            ],
-                        }])
-                        .await?;
-                        return Err(error);
+                        let count = serde_json::json!({"identity": identity, "faults": seen});
+                        return note_fault(db, deadline, FAULTS_SQL, count, now, error).await;
                     }
                     db.log(&format!(
                         "[owed-backfill] {identity}: the judge faulted on {seen} passes ({error}); recorded, its marks left for the drain, passed"
