@@ -435,25 +435,41 @@ pub(crate) fn header_time_for_root(
     facts.time.filter(|t| *t > 0)
 }
 
-/// Fetch the current chain height from ChainTracks.
-async fn fetch_current_height(
-    base_url: String,
-    service: Option<worker::Fetcher>,
-) -> Result<u32, ChainTrackerError> {
-    let url = format!("{}/getPresentHeight", base_url.trim_end_matches('/'));
-
-    let mut response = ct_get(url, &service, "getPresentHeight").await?;
-
+/// One chaintracks GET over the binding (or the URL): its status and its JSON body (`Null` for a non-2xx answer,
+/// whose body is not read). A transport fault is the fault it is.
+async fn ct_get_json(
+    base_url: &str,
+    service: &Option<worker::Fetcher>,
+    path: String,
+) -> Result<(u16, serde_json::Value), ChainTrackerError> {
+    let url = format!("{}/{path}", base_url.trim_end_matches('/'));
+    let ctx = path.split('?').next().unwrap_or_default().to_string();
+    let mut response = ct_get(url, service, &ctx).await?;
     let status = response.status_code();
+    if !(200..300).contains(&status) {
+        return Ok((status, serde_json::Value::Null));
+    }
+    let body = response
+        .json()
+        .await
+        .map_err(|e| ChainTrackerError::InvalidResponse(format!("ChainTracks parse error: {e}")))?;
+    Ok((status, body))
+}
+
+/// The engine's chain tip from chaintracks, through `get` (a route and its answer): the Worker's binding in
+/// production, a fixture in the pins.
+pub(crate) async fn current_height_with<G, F>(get: G) -> Result<u32, ChainTrackerError>
+where
+    G: Fn(String) -> F,
+    F: Future<Output = Result<(u16, serde_json::Value), ChainTrackerError>>,
+{
+    let (status, body) = get("getPresentHeight".into()).await?;
     if !(200..300).contains(&status) {
         return Err(ChainTrackerError::InvalidResponse(format!(
             "ChainTracks getPresentHeight returned HTTP {status}"
         )));
     }
-
-    let frame: ResponseFrame<u32> = response
-        .json()
-        .await
+    let frame: ResponseFrame<u32> = serde_json::from_value(body)
         .map_err(|e| ChainTrackerError::InvalidResponse(format!("ChainTracks parse error: {e}")))?;
 
     if !frame.is_success() {
@@ -511,7 +527,7 @@ impl ChainTracker for WorkerChainTracker {
             if let Some(height) = tip_cache_read(tip_cache.get(), now_ms(), TIP_CACHE_TTL_MS) {
                 return Ok(height);
             }
-            let height = fetch_current_height(base_url, service).await?;
+            let height = current_height_with(|path| ct_get_json(&base_url, &service, path)).await?;
             // Success-only write: an error result is never memoized.
             tip_cache.set(Some((now_ms(), height)));
             Ok(height)
