@@ -182,7 +182,7 @@ if (DELIVERING && STATE2 && MOCK_PORT) {
         return
       }
     }
-    res.writeHead(200, { 'content-type': 'application/json' }).end('{}')
+    res.writeHead(200, { 'content-type': 'application/json' }).end(mode === 'unheld' ? '{"held":false}' : '{}')
   })
   await new Promise((ok) => mock.listen(Number(MOCK_PORT), '127.0.0.1', ok))
   const rows2 = () => d1('SELECT kind, item, generation FROM change_parked ORDER BY kind, item', STATE2)
@@ -244,6 +244,31 @@ if (DELIVERING && STATE2 && MOCK_PORT) {
       '7. D3-H1: the fallback trigger (/admin/complete-proofs) drains the parked pot and hop rows',
       `parked=${parkedC} ${cp.status} change_parked=${JSON.stringify(cpJson?.change_parked)} rows=${JSON.stringify(rows2())} posts=${posts.length} ${cpJson ? '' : cpText.slice(0, 300)}`,
     )
+
+    // FIX-CADENCE-GAUGES: actual workerd D1 + the shipped transport. A full page of
+    // word frames is attempted, including 2xx {held:false}; no old row monopolizes a tick.
+    for (const outcome of ['plain', 'unheld']) {
+      mode = outcome
+      posts.length = 0
+      d1("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<500) INSERT INTO change_parked(kind,item,parked_at_ms,next_attempt_at_ms) SELECT 'word',json_object('txid',printf('%064x',i),'kind','refresh'),1000,0 FROM n", STATE2)
+      const ticks = outcome === 'plain' ? 4 : 32
+      let removed = 0, exhausted = 0
+      for (let tick = 1; tick <= ticks; tick++) {
+        const result = await lever({ op: 'drain' }, TOKEN, DELIVERING)
+        expect(result.status === 200 && result.json?.read <= 128, `cadence ${outcome} tick ${tick} bounded`, result.text)
+        removed += result.json?.unparked ?? 0
+        exhausted += result.json?.exhausted ?? 0
+      }
+      const rows = d1("SELECT COUNT(*) AS active FROM change_parked WHERE kind='word' AND exhausted=0", STATE2)
+      expect(rows[0]?.active === 0 && (outcome === 'plain' ? removed === 500 : exhausted === 500),
+        `cadence 500 word frames ${outcome === 'plain' ? 'delivered in 4' : 'exhausted in 32'} ticks`,
+        JSON.stringify({ rows, removed, exhausted, posts: posts.length }))
+      expect(posts.length === (outcome === 'plain' ? 500 : 4000), `cadence ${outcome} every attempt reaches the transport`, `${posts.length} POSTs`)
+      const health = await lever({ op: 'health' }, TOKEN, DELIVERING)
+      expect(health.json?.oldestParkedFrameAgeMs === null, 'cadence active age clears after delivery/exhaustion', health.text)
+      if (outcome === 'unheld') expect(health.json?.oldestExhaustedFrameAgeMs > 0, 'cadence exhausted age is served separately', health.text)
+      d1('DELETE FROM change_parked', STATE2)
+    }
   } finally {
     mock.close()
   }

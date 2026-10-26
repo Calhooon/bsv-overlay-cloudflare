@@ -378,6 +378,20 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   else table.push({ name: path, got, ceiling: null })
 }
 
+// The health read has its own ceiling on the populated fleet, including a real snapshot row.
+// The existing chain-event memo is expired so the ceiling covers its full shape; dirty is one lookup.
+{
+  const crate = new URL('../../crates/low-app-layer', import.meta.url).pathname
+  execFileSync('npx', ['wrangler', 'd1', 'execute', 'low-overlay-db', '--local', '--persist-to', process.env.D1_BUDGET_STATE, '--command',
+    "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backlog:dirty',json_object('count',12345,'oldestMarkedAtMs',1000,'tickAtMs',2000),2000) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs"], { cwd: crate, timeout: 30_000, stdio: 'pipe' })
+  await new Promise(resolve => setTimeout(resolve, 10_050)) // expire the existing chain-event health memo
+  const r = await get(APP, '/health')
+  const dirty = JSON.parse(r.text).owed?.dirty
+  if (dirty?.count === 12345 && dirty?.asOfMs === 2000) pass('health reads the drain snapshot, independent of the live fleet')
+  else fail('health reads the drain snapshot', JSON.stringify(dirty))
+  check('health-dirty-snapshot', segment(r.timing, 'd1'))
+}
+
 // ── 3. the health surfaces carry the running maxima ────────────────────────
 {
   const app = (await appHealth()).d1Budget

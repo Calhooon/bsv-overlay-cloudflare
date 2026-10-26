@@ -7,8 +7,8 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
-# The scratch root: the host's TMPDIR (every Mac sets it), else /tmp (the Linux tier host sets none: the land of PR 174 refused here).
-TMPDIR=${TMPDIR:-/tmp}; export TMPDIR
+# The scratch root: the host's TMPDIR (every Mac sets it), else the shared targets directory on the Linux tier.
+TMPDIR=${TMPDIR:-$HOME/bsv/targets/tmp}; mkdir -p "$TMPDIR"; export TMPDIR
 # npm's cache stays the host's default: a fresh cache under the scratch root made `npx wrangler` fetch wrangler, which the
 # land's offline seal refuses (ENOTCACHED on the vultr tier host; the land of PR 174, second refusal).
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HOME/bsv/targets/d2-owed-backfill}

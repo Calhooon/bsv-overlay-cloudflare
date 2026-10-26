@@ -124,16 +124,38 @@ pub fn counter_names() -> Vec<String> {
     vec![COUNTER_FILING_FAULTS.to_owned()]
 }
 pub const OWED_DIRTY_SUBJECTS_PER_PASS: usize = 64;
-/// The live backlog, including wanted envelopes. NULL oldest means there are no marks.
-pub const DIRTY_HEALTH_SQL: &str =
-    "SELECT COUNT(*) AS count, MIN(markedAtMs) AS oldest FROM owed_dirty";
+/// The drain counts at most this many oldest marks; a count at the cap means at least this many.
+pub const DIRTY_BACKLOG_COUNT_CAP: i64 = 65_536;
+/// The health read is one primary-key lookup of the drain's durable snapshot.
+pub const DIRTY_HEALTH_SQL: &str = "SELECT json_extract(cursor,'$.count') AS count,json_extract(cursor,'$.oldestMarkedAtMs') AS oldest,tickedAtMs AS asOfMs FROM owed_belt_state WHERE name='backlog:dirty'";
+/// One bounded, covering-index count per drain tick, including its oldest mark in that same read.
+pub const DIRTY_SNAPSHOT_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) SELECT 'backlog:dirty',json_object('count',COUNT(*),'oldestMarkedAtMs',MIN(markedAtMs),'tickAtMs',?1),?1 FROM (SELECT markedAtMs FROM owed_dirty INDEXED BY idx_owed_dirty_marked ORDER BY markedAtMs LIMIT ?2) WHERE 1 ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+
+pub async fn snapshot_dirty(db: &impl SqlPort) -> Result<(), String> {
+    db.run_batch(vec![Stmt {
+        sql: DIRTY_SNAPSHOT_SQL.into(),
+        binds: vec![
+            Bind::Int(db.now_ms() as i64),
+            Bind::Int(DIRTY_BACKLOG_COUNT_CAP),
+        ],
+    }])
+    .await?;
+    Ok(())
+}
 
 pub async fn dirty_health(db: &impl SqlPort) -> Value {
-    match db.run_batch(vec![Stmt { sql: DIRTY_HEALTH_SQL.into(), binds: vec![] }]).await {
+    match db
+        .run_batch(vec![Stmt {
+            sql: DIRTY_HEALTH_SQL.into(),
+            binds: vec![],
+        }])
+        .await
+    {
         Ok(rows) => match rows.first().and_then(|out| out.rows.first()) {
             Some(row) => json!({
                 "count": row["count"],
                 "oldestMarkAgeMs": row["oldest"].as_u64().map(|at| db.now_ms().saturating_sub(at)),
+                "asOfMs": row["asOfMs"],
             }),
             None => Value::Null,
         },
@@ -144,9 +166,11 @@ pub async fn dirty_health(db: &impl SqlPort) -> Value {
 /// MEDIUM-1); the rest are marked `backfill` and wait their identity's turn like any other mark.
 pub const OWED_WANTED_GAMES: usize = 32;
 /// Required source-table access paths, by index name: the overlay ships both (the native pin holds it).
-pub const REQUIRED_GAME_INDEX_NAMES: [&str; 2] =
-    ["idx_potparty_game_identity", "idx_evicted_party_identity_game"];
-pub const MARK_WANTED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,'','wanted','wanted',?2) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
+pub const REQUIRED_GAME_INDEX_NAMES: [&str; 2] = [
+    "idx_potparty_game_identity",
+    "idx_evicted_party_identity_game",
+];
+pub const MARK_WANTED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,'','wanted','wanted',strftime('%s','now') * 1000) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
 /// A judge's per-game delete, over `idx_owed_rows_identity_game` (the D2-OWED lens's LOW-2).
 pub const GAME_DELETE_SQL: &str = "DELETE FROM owed_rows WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))";
 /// The identity's state row, created once with its rows counted; the row triggers keep `rows` from then on.
@@ -192,7 +216,9 @@ pub trait JudgeDb: SqlPort {
     async fn canonical_root(&self, height: u64) -> Option<String>;
     async fn push(&self, identity: &str, body: Value);
     async fn hydrate(&self, identity: &str, games: &[String]) -> Result<JudgeInputs, String>
-    where Self: Sized {
+    where
+        Self: Sized,
+    {
         hydrate_inputs(self, identity, games).await
     }
 }
@@ -358,10 +384,7 @@ pub struct FilingMark {
 pub async fn mark_wanted(db: &impl SqlPort, identity: &str) -> Result<(), String> {
     db.run_batch(vec![Stmt {
         sql: MARK_WANTED_SQL.into(),
-        binds: vec![
-            Bind::Text(identity.to_ascii_lowercase()),
-            Bind::Int(db.now_ms() as i64),
-        ],
+        binds: vec![Bind::Text(identity.to_ascii_lowercase())],
     }])
     .await?;
     Ok(())
@@ -473,7 +496,10 @@ pub async fn judge_with_write(
         crate::owed::sort_rows_for_service(&mut rows);
         let cut = rows.len() > crate::owed::OWED_MAX_ROWS;
         rows.truncate(crate::owed::OWED_MAX_ROWS);
-        plan.push(Stmt{sql:GAME_DELETE_SQL.into(),binds:vec![Bind::Text(id.clone()),Bind::Text(json!(games).to_string())]});
+        plan.push(Stmt {
+            sql: GAME_DELETE_SQL.into(),
+            binds: vec![Bind::Text(id.clone()), Bind::Text(json!(games).to_string())],
+        });
         for row in &rows {
             plan.extend(row_statements(row, i.now_ms, i.tip, Some(i)));
         }
@@ -700,7 +726,10 @@ pub async fn refund_subjects(
     let rows: Vec<Value> = hydrate::read(
         db,
         REFUND_SUBJECTS_SQL,
-        vec![Bind::Text(pot.to_ascii_lowercase()), Bind::Int(i64::from(vout))],
+        vec![
+            Bind::Text(pot.to_ascii_lowercase()),
+            Bind::Int(i64::from(vout)),
+        ],
     )
     .await?;
     let filer = (filer.to_ascii_lowercase(), game.to_ascii_lowercase());
@@ -729,9 +758,9 @@ macro_rules! identity_games {
 }
 /// Expand the one wanted envelope to durable game marks: the newest [`OWED_WANTED_GAMES`] games `wanted`, the rest
 /// `backfill` ([`EXPAND_BACKFILL_SQL`]). An interrupted drain leaves all remaining games marked.
-pub const EXPAND_WANTED_SQL: &str = concat!("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,gameId,'wanted',?1,?2 FROM (", identity_games!(), " LIMIT 32) WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs");
+pub const EXPAND_WANTED_SQL: &str = concat!("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,gameId,'wanted',?1,strftime('%s','now') * 1000 FROM (", identity_games!(), " LIMIT 32) WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs");
 /// The wanted identity's older games, as the backfill marks them (`owed_backfill::MARK_SQL`'s source and key).
-pub const EXPAND_BACKFILL_SQL: &str = concat!("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,gameId,'backfill','owed-v2',?2 FROM (", identity_games!(), " LIMIT -1 OFFSET 32) WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs");
+pub const EXPAND_BACKFILL_SQL: &str = concat!("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,gameId,'backfill','owed-v2',strftime('%s','now') * 1000 FROM (", identity_games!(), " LIMIT -1 OFFSET 32) WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs");
 
 /// One identity's subjects in its turn order: oldest mark first, a `wanted` mark the tie-break.
 fn identity_subjects(marks: &[Value]) -> Vec<String> {
@@ -774,15 +803,14 @@ pub async fn drain_dirty(db: &impl JudgeDb, limit: usize) -> Result<DrainReport,
         let generation = r["generation"]
             .as_i64()
             .ok_or("wanted generation missing")?;
-        let now = Bind::Int(db.now_ms() as i64);
         db.run_batch(vec![
             Stmt {
                 sql: EXPAND_WANTED_SQL.into(),
-                binds: vec![Bind::Text(id.clone()), now.clone()],
+                binds: vec![Bind::Text(id.clone())],
             },
             Stmt {
                 sql: EXPAND_BACKFILL_SQL.into(),
-                binds: vec![Bind::Text(id.clone()), now],
+                binds: vec![Bind::Text(id.clone())],
             },
             Stmt {
                 sql: "DELETE FROM owed_dirty WHERE identity=?1 AND gameId='' AND source='wanted' AND generation<=?2".into(),
@@ -1105,15 +1133,31 @@ pub(crate) fn assert_fixture_roundtrip(i: &OwedInputs<'_>) {
 mod cadence_health_tests {
     use super::*;
     #[tokio::test]
-    async fn owed906_dirty_age_is_live_and_unreadable_is_not_empty() {
+    async fn cadence_dirty_health_reads_only_the_drain_snapshot() {
         let db = crate::pot_hook::tests::SqliteSql::migrated();
         db.now.set(900_000);
-        assert_eq!(dirty_health(&db).await, json!({"count":0,"oldestMarkAgeMs":null}));
+        assert_eq!(dirty_health(&db).await, Value::Null);
+        snapshot_dirty(&db).await.unwrap();
+        assert_eq!(
+            dirty_health(&db).await,
+            json!({"count":0,"oldestMarkAgeMs":null,"asOfMs":900000})
+        );
         db.conn.execute("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('seat','game','pot','pot:0',1000),('seat','other','word','word',800000)", []).unwrap();
-        assert_eq!(dirty_health(&db).await, json!({"count":2,"oldestMarkAgeMs":899000}));
-        db.conn.execute("DELETE FROM owed_dirty WHERE gameId='game'", []).unwrap();
-        assert_eq!(dirty_health(&db).await, json!({"count":1,"oldestMarkAgeMs":100000}));
+        // Reads never walk the newly written marks or pretend the last tick was current.
+        assert_eq!(dirty_health(&db).await["count"], 0);
+        snapshot_dirty(&db).await.unwrap();
+        db.now.set(901_000);
+        assert_eq!(
+            dirty_health(&db).await,
+            json!({"count":2,"oldestMarkAgeMs":900000,"asOfMs":900000})
+        );
         db.conn.execute("DROP TABLE owed_dirty", []).unwrap();
+        assert_eq!(
+            dirty_health(&db).await["count"],
+            2,
+            "health must not touch the backlog table"
+        );
+        db.conn.execute("DROP TABLE owed_belt_state", []).unwrap();
         assert_eq!(dirty_health(&db).await, Value::Null);
     }
 }

@@ -594,7 +594,7 @@ async fn owed893_backfill_f_the_age_remark_is_bounded_once_a_day_and_indexed() {
         .borrow()
         .prepare(&format!("EXPLAIN QUERY PLAN {}", backfill::AGE_MARK_SQL))
         .unwrap()
-        .query_map([1, 2, 3], |r| r.get(3))
+        .query_map([1, 3], |r| r.get(3))
         .unwrap()
         .map(Result::unwrap)
         .collect();

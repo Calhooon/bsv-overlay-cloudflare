@@ -23,25 +23,25 @@ pub mod beef_blob_sweep;
 pub mod broadcaster;
 pub mod chain_feed;
 pub mod chain_tracker;
-pub mod concurrent;
 pub mod change_flush;
 pub mod change_park;
+pub mod concurrent;
 pub mod conflict_repair;
+/// bsv-low #635 (B-COST-1): the cost bar served on `/health/invariants.costBar`.
+pub mod cost_bar;
 pub mod d1;
 pub mod d1_discovery;
 pub mod d1_ledger;
-/// bsv-low #635 (B-COST-1): the cost bar served on `/health/invariants.costBar`.
-pub mod cost_bar;
 pub mod d1_storage;
-pub mod door_words;
 pub mod dead_letters;
 pub mod derived_board;
 pub mod derived_hops;
 pub mod derived_owed;
+pub mod door_words;
 pub mod ef;
 pub mod ef_deferred;
-mod eviction_write;
 pub mod error;
+mod eviction_write;
 mod gasp_cost;
 pub mod gasp_deferred;
 pub mod gasp_fault_memo;
@@ -58,6 +58,7 @@ pub mod mainnet_fanout;
 // out-of-band migration emitter. NEVER part of the wasm32 Worker build — it
 // is host tooling (std::fs, the example `emit-migrations`), gated off wasm32
 // so `worker-build` and the wasm32 gate never see it.
+mod courier_counters;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod migration_emitter;
 pub mod ops;
@@ -73,7 +74,6 @@ pub mod routes;
 pub mod ship_lookup;
 pub mod submit_census;
 mod submit_counters;
-mod courier_counters;
 pub mod submit_gate;
 pub mod submit_refusals;
 mod tick;
@@ -1523,6 +1523,17 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
     }
     let pot_storage: Rc<dyn PotStorage> = Rc::new(D1PotStorage::new(db.clone()));
     let ops_db = db.clone();
+    // FIX-CADENCE-GAUGES: before proof completion and retirement, so their walls cannot starve
+    // the parked frames. bsv-low #649 D3-H1: the parked pot and hop notes (a background flush withheld them), delivered by the
+    //    SHARED drain the scheduled handler runs (D4-L1): the `*/15` tick is the observed trigger and this route
+    //    the additional authenticated admin path, which drains when invoked. One bounded pass (128 rows a set,
+    //    10 s to start its POSTs), counted `change_park_drain_complete_proofs_total`.
+    let parked = crate::change_park::drain_parked(
+        env,
+        &ops_db,
+        crate::change_park::DrainTrigger::CompleteProofs,
+    )
+    .await;
     let engine = match build_engine_from_env(env).await {
         Ok(e) => e,
         Err(e) => return Response::error(format!("complete-proofs: engine: {e}"), 500),
@@ -1663,16 +1674,6 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
         retire.conflict.faults,
         retire.end_line(),
     );
-    // 4b'. bsv-low #649 D3-H1: the parked pot and hop notes (a background flush withheld them), delivered by the
-    //    SHARED drain the scheduled handler runs (D4-L1): the `*/15` tick is the observed trigger and this route
-    //    the additional authenticated admin path, which drains when invoked. One bounded pass (128 rows a set,
-    //    10 s to start its POSTs), counted `change_park_drain_complete_proofs_total`.
-    let parked = crate::change_park::drain_parked(
-        env,
-        &ops_db,
-        crate::change_park::DrainTrigger::CompleteProofs,
-    )
-    .await;
     let change_parked = parked.map(|d| {
         serde_json::json!({
             "read": d.read,

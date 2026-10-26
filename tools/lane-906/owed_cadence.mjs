@@ -39,8 +39,8 @@ try {
   const one = (sql, ...binds) => db.prepare(sql).bind(...binds).first()
   const id = '02' + '91'.repeat(32), other = '03' + '92'.repeat(32), pot = '93'.repeat(32), spend = '94'.repeat(32), game = '95'.repeat(32)
   const now = Date.now()
-  await run(`INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,spentConfirmed,createdAt,lockKind,paramsDecoded,pubA,pubB,pubTower,payPkhA,payPkhB,rakePkh,stakeA,stakeB,feeSats,recoveryHeight,potSats,verdict,verdictTxid,settleSigners,spenderFinal) VALUES (?,0,1,?,0,?,'covenant',1,?,?,?, ?,?,?,1000,1000,1,899900,2000,'winner-a',?,'coop',1)`, pot, spend, Math.floor(now / 1000), id, other, id, '11'.repeat(20), '22'.repeat(20), '33'.repeat(20), spend)
-  await run(`INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,seatSettlePubkey,seatSigHex,sigValid) VALUES (?,?,?,?,0,899900,'00',?,0,?,?,'00',1)`, id, other, game, pot, '96'.repeat(32), Math.floor(now / 1000), id)
+  await run(`INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,spentConfirmed,createdAt,lockKind,paramsDecoded,pubA,pubB,pubTower,payPkhA,payPkhB,rakePkh,stakeA,stakeB,feeSats,recoveryHeight,potSats,verdict,verdictTxid,settleSigners,spenderFinal) VALUES (?,0,1,?,0,?,'covenant',1,?,?,?, ?,?,?,1000,1000,1,899900,2000,'winner-a',?,'coop',1)`, pot, spend, Math.floor(now / 1000) - 70 * 86400, id, other, id, '11'.repeat(20), '22'.repeat(20), '33'.repeat(20), spend)
+  await run(`INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,seatSettlePubkey,seatSigHex,sigValid) VALUES (?,?,?,?,0,899900,'00',?,0,?,?,'00',1)`, id, other, game, pot, '96'.repeat(32), Math.floor(now / 1000) - 70 * 86400, id)
   await run('DELETE FROM owed_dirty')
   const hook = async () => {
     const response = await mf.dispatchFetch('http://app/internal/pot-changed', { method: 'POST', headers: { authorization: 'Bearer ci-internal-tok', 'content-type': 'application/json' }, body: JSON.stringify({ outpoints: [{ txid: pot, vout: 0 }] }) })
@@ -48,7 +48,11 @@ try {
     assert.equal((await response.json()).announce, 'detached')
   }
   // Start with the unconfirmed source write, and let its own hook produce the first stored judgement.
+  const remarkedAt = Date.now()
   await run('UPDATE pot_records SET spentConfirmed=0 WHERE txid=?', pot)
+  const remark = await one("SELECT markedAtMs FROM owed_dirty WHERE source='pot' AND sourceKey=?", pot + ':0')
+  assert(remark.markedAtMs >= remarkedAt - 1000 && remark.markedAtMs <= Date.now(), 'a 70-day-old row re-marked at its write time')
+  console.log('PASS cadence old evidence re-marked at the database write time (workerd trigger)')
   await hook()
   const before = await one('SELECT family,facts,reason,claimable,judgedAtMs FROM owed_rows WHERE identity=? AND gameId=?', id, game)
   assert(before, 'the attributed seat is judged')
@@ -67,11 +71,17 @@ try {
   await run('UPDATE owed_rows SET beltDueAtMs=NULL')
   const plant = async () => run(`WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<499) INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT printf('cadence%04d',i),printf('game%04d',i),'pin','pin',? FROM n`, now - 301000)
   await plant()
-  const health = await (await mf.dispatchFetch('http://app/health')).json()
-  assert.equal(health.owed.dirty.count, 500)
-  assert(health.owed.dirty.oldestMarkAgeMs >= 301000)
+  const staleHealth = await (await mf.dispatchFetch('http://app/health')).json()
+  assert(staleHealth.owed.dirty === null || staleHealth.owed.dirty.count !== 500, 'health cannot scan the new backlog')
   const ns = await mf.getDurableObjectNamespace('BOARD_VIEW')
   const stub = ns.get(ns.idFromName('owed-belt:v1'))
+  // Run the actual drain before expecting its snapshot. It consumes the first 64.
+  const first = await stub.fetch('http://pin/pin/belt-alarm')
+  assert.equal(first.status, 200)
+  const health = await (await mf.dispatchFetch('http://app/health')).json()
+  assert.equal(health.owed.dirty.count, 436)
+  assert(health.owed.dirty.asOfMs >= now)
+  assert(health.owed.dirty.oldestMarkAgeMs >= 301000)
   const alarm = async () => {
     const r = await stub.fetch('http://pin/pin/belt-alarm')
     assert.equal(r.status, 200, await r.clone().text())
@@ -82,8 +92,8 @@ try {
     assert(b.wallMs < 30000)
     return b.drain.subjects
   }
-  let drained = 0
-  for (let tick = 1; tick <= 8; tick++) {
+  let drained = 64
+  for (let tick = 2; tick <= 8; tick++) {
     drained += await alarm()
     const left = (await one("SELECT COUNT(*) AS n FROM owed_dirty WHERE source='pin'")).n
     assert.equal(left, Math.max(500 - 64 * tick, 0), `tick ${tick}: bounded progress`)

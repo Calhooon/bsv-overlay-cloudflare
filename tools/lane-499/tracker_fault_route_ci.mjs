@@ -1,8 +1,9 @@
+import { basename } from 'node:path'
 // NS3D-M1: real Worker + local D1 fault, no production data or network spend.
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 const [base, state] = process.argv.slice(2)
-assert(base?.startsWith('http://127.0.0.1:') && state?.startsWith('/tmp/lane499-d1-state.'))
+assert(base?.startsWith('http://127.0.0.1:') && state && basename(state).startsWith('lane499-d1-state.'))
 const d1 = (sql) => execFileSync('npx', ['wrangler', 'd1', 'execute', 'low-overlay-db', '--local', '--persist-to', state, '--command', sql], {
   cwd: new URL('../../crates/low-app-layer', import.meta.url), timeout: 60000, stdio: 'pipe',
 })
