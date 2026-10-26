@@ -663,7 +663,8 @@ mod tests {
             .copied()
             .filter(|s| s.starts_with("CREATE TRIGGER IF NOT EXISTS owed_dirty_"))
             .collect();
-        assert_eq!(dirty.len(), 28);
+        // 29 since D2-OWED-FOLD-8 (released_hop_evidence_missing's insert)
+        assert_eq!(dirty.len(), 29);
         for sql in dirty {
             let file = crate::migration_emitter::part_body(&[sql]);
             assert_eq!(split_wrangler_454(&file), [sql], "{sql}");
