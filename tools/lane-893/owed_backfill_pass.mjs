@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-const [base, standin, token] = process.argv.slice(2)
+import { execFileSync } from 'node:child_process'
+const [base, standin, token, d1File] = process.argv.slice(2)
 const ceilings = JSON.parse(readFileSync(new URL('../lane-499/ceilings.json', import.meta.url))).scenarios
-const pass = async () => {
-  const response = await fetch(`${base}/internal/owed-backfill-pass`, { method: 'POST', headers: { authorization: `Bearer ${token}` } })
+const pass = async (query = '') => {
+  const response = await fetch(`${base}/internal/owed-backfill-pass${query}`, { method: 'POST', headers: { authorization: `Bearer ${token}` } })
   assert.equal(response.status, 200, await response.clone().text())
   const timing = response.headers.get('server-timing')
   const match = timing?.match(/d1;desc="reads=(\d+) writes=(\d+) stmts=(\d+)(?: maxReads=(\d+))?"/)
@@ -41,9 +42,24 @@ assert.equal(stamped.report.stop, 'Stamped')
 assert.equal(stamped.cost.stmts, 1, 'a stamped replay is one statement')
 assert.equal(stamped.cost.reads, 1, 'and one row read')
 assert.equal(stamped.cost.writes, 0)
+// The D2-OWED lens's LOW-3 and MEDIUM-5: the drain's age repair on local D1, after ageing the judged rows a day and
+// turning ten back into an old worker's keyless rows: bounded at 128 pending, the keyless rows first.
+assert.ok(d1File, 'the local D1 file')
+execFileSync('sqlite3', [d1File, "UPDATE owed_rows SET judgedAtMs = 1; UPDATE owed_rows SET judgedAtMs = NULL WHERE rowid IN (SELECT rowid FROM owed_rows ORDER BY rowid LIMIT 10);"])
+const aged = await pass('?aged=1')
+console.log('owed-age-remark', JSON.stringify(aged))
+// the LIMIT counts rows (a game holds one or two), so 128 rows mark fewer subjects; the bound is the pending count
+assert.ok(aged.report.aged > 0 && aged.report.aged <= 128, `aged ${aged.report.aged}`)
+const sql = q => Number(execFileSync('sqlite3', [d1File, q]).toString().trim())
+const keyless = sql("SELECT COUNT(DISTINCT d.identity||d.gameId) FROM owed_dirty d JOIN owed_rows r ON r.identity=d.identity AND r.gameId=d.gameId WHERE d.source='age' AND r.judgedAtMs IS NULL")
+assert.ok(keyless > 0, 'the keyless rows are among the age marks')
+for (let n = 0; n < 8; n++) await pass('?aged=1')
+const pending = sql("SELECT COUNT(*) FROM owed_dirty WHERE source='age'")
+assert.ok(pending <= 128, `never more than 128 age marks pending: ${pending}`)
+console.log('owed-age-pending', pending)
 const calls = await (await fetch(`${standin}/__calls`)).json()
 assert.equal(calls.length, 0, 'the backfill asks no courier')
-for (const [name, run] of [['owed-backfill-pass', { cost: work }], ['owed-backfill-stamped', stamped]]) {
+for (const [name, run] of [['owed-backfill-pass', { cost: work }], ['owed-backfill-stamped', stamped], ['owed-age-remark', aged]]) {
   const c = ceilings[name]?.ceiling
   if (!c) { console.log(`NO CEILING ${name} (measure first)`); continue }
   for (const key of ['reads', 'writes', 'stmts', 'maxReads']) assert.ok(run.cost[key] <= c[key], `${name} ${key}: ${run.cost[key]} > ${c[key]}`)

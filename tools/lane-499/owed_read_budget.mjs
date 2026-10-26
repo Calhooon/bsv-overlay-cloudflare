@@ -87,7 +87,11 @@ try {
   assert.equal(fleet.body.rows.length, 500)
   assert.equal(fleet.body.markerlessProgress, null)
   assert.ok(Number.isInteger(fleet.body.recomputeSeq) && fleet.body.recomputeSeq > 0)
-  assert.ok(fleet.body.rows.every(row => row.facts.beltNextAtMs === null))
+  // the belt's date (lane D2-OWED-BELT): a young in-progress hop at its marker + 30 min, every other row of the seed none
+  for (const row of fleet.body.rows) {
+    const young = row.family === 'in-progress' && typeof row.facts.hopTxid === 'string'
+    assert.equal(row.facts.beltNextAtMs, young ? row.facts.markerCreatedAtMs + 1_800_000 : null, row.outpoint)
+  }
   assert.equal(fleet.cost.stmts, 3)
   for (const [key, limit] of Object.entries(ceilings['owed-fleet-read'].ceiling)) assert.ok(fleet.cost[key] <= limit, `${key}: ${fleet.cost[key]} > ${limit}`)
   assert.deepEqual(wanted.body.rows, [])
