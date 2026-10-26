@@ -10,7 +10,9 @@ use owed_db::*;
 fn clone_row(db: &Db, from: &str, prefix: &str, n: usize, start: usize) {
     let cols: Vec<String> = {
         let conn = db.conn.borrow();
-        let mut s = conn.prepare("SELECT name FROM pragma_table_info('owed_rows')").unwrap();
+        let mut s = conn
+            .prepare("SELECT name FROM pragma_table_info('owed_rows')")
+            .unwrap();
         s.query_map([], |r| r.get::<_, String>(0))
             .unwrap()
             .map(Result::unwrap)
@@ -43,9 +45,21 @@ async fn date_sweeps_at(unspent: usize) -> (i64, i64) {
     drain_all(&db).await;
     let honest = format!("{}:0", hop(0));
     let leaning = format!("{}:0", hop(1));
-    assert_eq!(db.int(&format!("SELECT claimable FROM owed_rows WHERE outpoint='{honest}'")), 1);
-    assert_eq!(db.int(&format!("SELECT claimable FROM owed_rows WHERE outpoint='{leaning}'")), 1);
-    db.exec(&format!("UPDATE owed_rows SET beltDueAtMs=NULL WHERE outpoint='{leaning}'"));
+    assert_eq!(
+        db.int(&format!(
+            "SELECT claimable FROM owed_rows WHERE outpoint='{honest}'"
+        )),
+        1
+    );
+    assert_eq!(
+        db.int(&format!(
+            "SELECT claimable FROM owed_rows WHERE outpoint='{leaning}'"
+        )),
+        1
+    );
+    db.exec(&format!(
+        "UPDATE owed_rows SET beltDueAtMs=NULL WHERE outpoint='{leaning}'"
+    ));
     clone_row(&db, &leaning, "courier", 39, 10_000);
     clone_row(&db, &honest, "stranger", unspent - 1, 100_000);
     assert_eq!(
@@ -64,7 +78,9 @@ async fn date_sweeps_at(unspent: usize) -> (i64, i64) {
         .find(|(sql, _)| sql == judge::DATE_SWEEPS_SQL)
         .map(|(_, n)| *n)
         .expect("the date statement ran");
-    let dated = db.int(&format!("SELECT COUNT(*) FROM owed_rows WHERE beltDueAtMs={now}"));
+    let dated = db.int(&format!(
+        "SELECT COUNT(*) FROM owed_rows WHERE beltDueAtMs={now}"
+    ));
     (steps, dated)
 }
 
@@ -77,7 +93,11 @@ async fn d2fold3_the_tip_sweep_date_reads_only_the_rows_it_writes() {
     let (few, dated_few) = date_sweeps_at(10).await;
     let (many, dated_many) = date_sweeps_at(1_000).await;
     eprintln!("DATE_SWEEPS_SQL: {few} VM steps at N=10, {many} at N=1000; dated {dated_few} and {dated_many}");
-    assert_eq!((dated_few, dated_many), (40, 40), "the 40 courier-dependent sweeps dated, no index-unspent one");
+    assert_eq!(
+        (dated_few, dated_many),
+        (40, 40),
+        "the 40 courier-dependent sweeps dated, no index-unspent one"
+    );
     let share = few / 40;
     assert!(
         (many - few).abs() <= share,
