@@ -14,12 +14,32 @@ pub const HOPS_SQL: &str = "SELECT hp.*,hp.txid AS hopTxid,hp.txid AS markerTxid
 /// its author named under two games is ONE row, the walk's (`owed_cursor::select_hops`, the oldest marker); the
 /// projection is [`HOPS_SQL`]'s.
 pub const HOP_COMPETITORS_SQL: &str = "SELECT hp.*,hp.txid AS hopTxid,hp.txid AS markerTxid,hp.outputIndex AS markerVout,hp.createdAt AS markerCreatedAt,hp.rowid AS markerRowid,r.createdAt AS potCreatedAt,r.txid IS NULL AS unknownHop,r.spent,r.spendingTxid,r.spentConfirmed,r.spenderFinal,CASE WHEN hp.hopLockHex IS NOT NULL AND hp.hopSatsOnChain=hp.hopSats THEN 0 ELSE 1 END AS paidTier FROM json_each(?2) k CROSS JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=json_extract(k.value,'$[0]') AND hp.hopVout=json_extract(k.value,'$[1]') LEFT JOIN pot_records r ON r.txid=hp.txid AND r.outputIndex=hp.hopVout WHERE hp.identity=?1";
+/// The evidence the judge honours (D2-OWED-FOLD-10, the sixth delta lens's NOTE-1): an evidence row under its OPEN
+/// ledger at its own `evictedAt` (`h` the evidence row, `he` its ledger row). ONE predicate, read by [`RELEASED_SQL`]
+/// and by [`MISSING_SQL`]'s exclusion, so the two cannot drift: both are built from it, each naming its tables and
+/// the join in its own literal (the ownership checker reads a table where its literal names it), and the whole joined
+/// predicate is pinned equal by text (`fold10_n1`).
+macro_rules! honoured_evidence {
+    () => {
+        "he.readmittedAt IS NULL AND h.evictedAt=he.evictedAt"
+    };
+}
+pub const HONOURED_EVIDENCE: &str = honoured_evidence!();
 /// D2-OWED-FOLD-8: the identity's missing-evidence rows of its games under an open eviction, with the opponent its
 /// verified twin party names (the old walk's seat), less the outpoints its own evidence names (D2-OWED-FOLD-9, the
 /// fifth delta lens's NOTE-B: evidence the judge honours, as [`RELEASED_SQL`] reads it: under its open ledger at its
 /// own `evictedAt`, so a readmitted eviction's row hides no later eviction's missing row).
-pub const MISSING_SQL: &str = "SELECT m.hopTxid,m.hopVout,m.gameId,m.potTxid,m.evictedAt,m.bytesRead,(SELECT lower(pp.opponentIdentity) FROM potparty_records_evicted pp INDEXED BY idx_evicted_party_identity_game WHERE pp.identity=m.identity AND pp.gameId=m.gameId AND pp.potTxid=m.potTxid AND pp.sigValid=1 AND pp.seatSettlePubkey IS NOT NULL ORDER BY pp.createdAt,pp.rowid LIMIT 1) AS opponentIdentity FROM released_hop_evidence_missing m JOIN pot_evictions e ON e.txid=m.potTxid WHERE m.identity=?1 AND m.gameId IN (SELECT value FROM json_each(?2)) AND e.readmittedAt IS NULL AND m.evictedAt=e.evictedAt AND NOT EXISTS (SELECT 1 FROM released_hop_evidence h JOIN pot_evictions he ON he.txid=h.potTxid WHERE h.hopTxid=m.hopTxid AND h.hopVout=m.hopVout AND h.identity=m.identity AND he.readmittedAt IS NULL AND h.evictedAt=he.evictedAt) AND NOT EXISTS (SELECT 1 FROM potparty_records p INDEXED BY idx_potparty_identity WHERE p.identity=m.identity AND p.potTxid=m.hopTxid AND p.potVout=m.hopVout) AND NOT EXISTS (SELECT 1 FROM hopparty_records hp INDEXED BY idx_hopparty_hop WHERE hp.txid=m.hopTxid AND hp.hopVout=m.hopVout AND hp.identity=m.identity AND hp.markerValid=1)";
-pub const RELEASED_SQL: &str = "SELECT h.* FROM released_hop_evidence h JOIN pot_evictions e ON e.txid = h.potTxid WHERE h.hopTxid = ?1 AND h.hopVout = ?2 AND e.readmittedAt IS NULL AND h.evictedAt = e.evictedAt";
+pub const MISSING_SQL: &str = concat!(
+    "SELECT m.hopTxid,m.hopVout,m.gameId,m.potTxid,m.evictedAt,m.bytesRead,(SELECT lower(pp.opponentIdentity) FROM potparty_records_evicted pp INDEXED BY idx_evicted_party_identity_game WHERE pp.identity=m.identity AND pp.gameId=m.gameId AND pp.potTxid=m.potTxid AND pp.sigValid=1 AND pp.seatSettlePubkey IS NOT NULL ORDER BY pp.createdAt,pp.rowid LIMIT 1) AS opponentIdentity FROM released_hop_evidence_missing m JOIN pot_evictions e ON e.txid=m.potTxid WHERE m.identity=?1 AND m.gameId IN (SELECT value FROM json_each(?2)) AND e.readmittedAt IS NULL AND m.evictedAt=e.evictedAt AND NOT EXISTS (SELECT 1 FROM released_hop_evidence h JOIN pot_evictions he ON he.txid=h.potTxid WHERE ",
+    honoured_evidence!(),
+    " AND h.hopTxid=m.hopTxid AND h.hopVout=m.hopVout AND h.identity=m.identity) AND NOT EXISTS (SELECT 1 FROM potparty_records p INDEXED BY idx_potparty_identity WHERE p.identity=m.identity AND p.potTxid=m.hopTxid AND p.potVout=m.hopVout) AND NOT EXISTS (SELECT 1 FROM hopparty_records hp INDEXED BY idx_hopparty_hop WHERE hp.txid=m.hopTxid AND hp.hopVout=m.hopVout AND hp.identity=m.identity AND hp.markerValid=1)"
+);
+/// The evidence rows of one hop the judge honours ([`HONOURED_EVIDENCE`]).
+pub const RELEASED_SQL: &str = concat!(
+    "SELECT h.* FROM released_hop_evidence h JOIN pot_evictions he ON he.txid=h.potTxid WHERE ",
+    honoured_evidence!(),
+    " AND h.hopTxid=?1 AND h.hopVout=?2"
+);
 
 pub(super) async fn read<T: DeserializeOwned>(
     db: &impl SqlPort,
