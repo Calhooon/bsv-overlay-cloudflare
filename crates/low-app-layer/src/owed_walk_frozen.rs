@@ -930,7 +930,7 @@ mod pins {
             seed,
             identities: vec![HOME_MARKER_SEAT.into()],
         };
-        let (judge, _walk) = seeded(&f);
+        let judge = seeded(&f);
         judge.tip.set(Some(FOLD8_TIP));
         judge.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
         backfill_to_the_stamp(&judge).await;
@@ -973,7 +973,7 @@ mod pins {
             seed,
             identities: vec![HOME_MARKER_SEAT.into()],
         };
-        let (judge, _walk) = seeded(&f);
+        let judge = seeded(&f);
         judge.tip.set(Some(FOLD8_TIP));
         judge.conn.execute_batch(&format!(
             "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('{HOME_MARKER_SEAT}','{HOME_MARKER_GAME}','hop','{HOME_MARKER_HOP}:0',{NOW_MS})"
