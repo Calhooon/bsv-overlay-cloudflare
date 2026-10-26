@@ -765,6 +765,80 @@ mod pins {
         assert_eq!(w, j, "the walk and the write path's judgement store the same press");
     }
 
+    /// The third delta lens's D3-N1: the press above does not rest on its filing (the hop's index-unspent press stands
+    /// without the sweep), so dropping the filing's facts from `judge_with_write` left it green. Here a press that
+    /// RESTS on the filed fact: the seat of an indexed pot whose funding the network holds (`network_seen`) and whose
+    /// recovery gate is open, with NO refund backup until the seat files one through `record_post`; judged by the
+    /// write path with no drain after it, the row is `refund-due`, `claimable: true`, and the old walk over the same
+    /// D1 data stores the same row. Before the filing the same judge stores no press for that pot.
+    #[tokio::test]
+    async fn d3n1_a_press_resting_on_the_filed_backup_judged_by_the_write_path_stores_the_walks_row() {
+        use crate::record_post::{self, tests as rp, DoorOutcome, RecordKind};
+        let judge = SqliteSql::migrated();
+        judge.now.set(NOW_MS);
+        judge.tip.set(Some(TIP));
+        let victim = rp::wallet(0x43);
+        let id = hex::encode(rp::identity(&victim));
+        let game = [0x7b; 32];
+        rp::md_index_the_pot(&judge);
+        rp::md_seat(&judge, &id, &game);
+        judge
+            .conn
+            .execute(
+                "INSERT INTO network_seen (txid, seenAt) VALUES (?1, ?2)",
+                rusqlite::params![hex::encode(rp::POT_TXID), (NOW_MS / 1000) as i64],
+            )
+            .unwrap();
+        // before the filing: the drain's judgement holds no press for the pot
+        for _ in 0..100 {
+            let r = crate::owed_judge::drain_dirty(&judge, 64).await.unwrap();
+            assert!(r.faults.is_empty(), "{:?}", r.faults);
+            if r.subjects == 0 {
+                break;
+            }
+        }
+        let rows = |conn: &rusqlite::Connection| -> Vec<serde_json::Value> {
+            stored(conn, &id)
+                .values()
+                .map(|row| serde_json::from_str::<serde_json::Value>(row).unwrap())
+                .collect()
+        };
+        let presses = |rows: &[serde_json::Value]| rows.iter().filter(|r| r[6]["claimable"] == true).count();
+        let before = rows(&judge.conn);
+        assert_eq!(presses(&before), 0, "no press before the backup is filed: {before:#?}");
+        let script = rp::potrefund_script(&victim, &game, &rp::presigned_refund());
+        let mut filing = record_post::verify_record_post(RecordKind::Potrefund, &script, &id).unwrap();
+        let out = record_post::file_verified(&judge, &mut filing, &id, (NOW_MS / 1000) as i64)
+            .await
+            .unwrap();
+        assert!(matches!(out, DoorOutcome::Written { row_written: true }), "{out:?}");
+        assert_eq!(judge.counter(crate::owed_judge::COUNTER_FILING_FAULTS), 0, "judged by the write path");
+        let pending: i64 = judge
+            .conn
+            .query_row("SELECT COUNT(*) FROM owed_dirty WHERE identity=?1", [&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending, 0, "the write path acknowledged the filer's marks: nothing left for a drain");
+        let after = rows(&judge.conn);
+        let press = after
+            .iter()
+            .find(|r| r[0] == "refund-due")
+            .unwrap_or_else(|| panic!("the filing's judgement stores the refund press: {after:#?}"));
+        assert_eq!(press[6]["claimable"], true, "the press rests on the filed backup: {press}");
+        let j = stored(&judge.conn, &id);
+        let path = std::env::temp_dir().join(format!("d3n1-press-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        judge.conn.execute("VACUUM INTO ?1", [path.to_str().unwrap()]).unwrap();
+        let walk = rusqlite::Connection::open(&path).unwrap();
+        walk.execute_batch(&format!("DELETE FROM owed_row_words WHERE identity='{id}'; DELETE FROM owed_rows WHERE identity='{id}'; DELETE FROM owed_state WHERE identity='{id}';")).unwrap();
+        let walk_db = std::rc::Rc::new(WalkDb { conn: RefCell::new(walk) });
+        let walked = run_old_walk(walk_db.clone(), &id, Some(TIP), None, NOW_MS).await.unwrap();
+        assert!(!walked.truncated && !walked.budget_cut);
+        let w = stored(&walk_db.conn.borrow(), &id);
+        let _ = std::fs::remove_file(&path);
+        eprintln!("refund press: walk {w:#?}\njudge {j:#?}");
+        assert_eq!(w, j, "the walk and the write path's judgement store the same press");
+    }
+
     #[tokio::test]
     async fn d2fold_medium3_smoke_the_old_walk_runs_natively() {
         let made = (NOW_MS as i64 - 2 * 3_600_000) / 1000;
