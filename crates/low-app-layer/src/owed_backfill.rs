@@ -59,6 +59,14 @@ pub const OWED_BACKFILL_EVICTIONS: &str = "backfill:owed-v2:evictions";
 pub const EVICTIONS_DONE: &str = "~";
 /// One page of open evictions (each a ledger read beside it, two reads and one write batch an eviction).
 pub const OWED_BACKFILL_EVICTIONS_PER_PAGE: usize = 32;
+/// A skipped eviction is retried by the age repair once its skip is this old (the repair's own day), at most
+/// [`OWED_SKIPPED_EVICTION_RETRIES_PER_PASS`] a pass, oldest skip first; each retry round has the phase's three faults
+/// before it is skipped again (D2-OWED-FOLD-10, the sixth delta lens's NEW-L1: a fault is transient, a lost press is
+/// not, so no skip is permanent).
+pub const OWED_SKIPPED_EVICTION_RETRY_AFTER_MS: i64 = OWED_AGE_REMARK_AFTER_MS;
+pub const OWED_SKIPPED_EVICTION_RETRIES_PER_PASS: usize = 4;
+/// The skipped evictions one age repair reads and names on its line.
+pub const OWED_SKIPPED_EVICTIONS_NAMED: usize = 32;
 
 pub const COUNTER_IDENTITIES: &str = "owed_backfill_identities_total";
 pub const COUNTER_ROWS: &str = "owed_backfill_rows_total";
@@ -89,7 +97,18 @@ pub const STAMP_SQL: &str = "SELECT 1 AS stamped FROM view_derivation_state WHER
 pub const GATE_SQL: &str = "SELECT (SELECT value FROM ops_counters WHERE name='overlay_migration_count') AS count,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2') AS cursor,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:open') AS open,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:faults') AS faults,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:evictions') AS evictions,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:eviction-faults') AS evictionFaults";
 /// The open evictions past the cursor, ascending, each naming no evidence row of its own for any released outpoint
 /// (an eviction the writer saw has them; each probe a primary-key search of the evidence by outpoint).
-pub const EVICTIONS_SQL: &str = "SELECT e.txid,e.releasedSpends FROM pot_evictions e WHERE e.txid>?1 AND e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r JOIN released_hop_evidence h ON h.hopTxid=lower(json_extract(r.value,'$.txid')) AND h.hopVout=json_extract(r.value,'$.vout') WHERE h.potTxid=e.txid AND h.evictedAt=e.evictedAt) ORDER BY e.txid LIMIT ?2";
+/// An open eviction `e` that names no evidence row of its own for any released outpoint: the evidence phase's page
+/// and the age repair's retry of a skipped eviction read the one predicate.
+macro_rules! eviction_unwritten {
+    () => {
+        "e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r JOIN released_hop_evidence h ON h.hopTxid=lower(json_extract(r.value,'$.txid')) AND h.hopVout=json_extract(r.value,'$.vout') WHERE h.potTxid=e.txid AND h.evictedAt=e.evictedAt)"
+    };
+}
+pub const EVICTIONS_SQL: &str = concat!(
+    "SELECT e.txid,e.releasedSpends FROM pot_evictions e WHERE e.txid>?1 AND ",
+    eviction_unwritten!(),
+    " ORDER BY e.txid LIMIT ?2"
+);
 /// The JOIN's stored bytes as the writer reads them, in its order (`transactions`, then `pot_beefs`; then
 /// `transactions_evicted`, [`EVICTED_BEEF_SQL`], read alone: the overlay makes that shadow at its first eviction).
 pub const STORED_BEEF_SQL: &str = "SELECT hex(beef) AS beef FROM transactions WHERE txid = ?";
@@ -137,9 +156,24 @@ pub const FAULTS_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs
 pub const SKIPPED_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:skipped:'||?1,?2,?3) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// The faulted eviction's count, written by a faulted pass and cleared ('{}') by its eviction's save or its skip.
 pub const EVICTION_FAULTS_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:eviction-faults',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
-/// An eviction passed by after its faults: its row names the last fault (bounded); its outpoints get no evidence and
-/// no missing row from the phase (the drain, the age repair and every source mark still judge its seats).
+/// An eviction passed by after its faults: its row (`{"reason":..,"faults":n}`, the last fault bounded, `tickedAtMs`
+/// the skip's time) names it while it is skipped. Its outpoints get no evidence and no missing row from the phase; the
+/// age repair RETRIES it once the skip is a day old (D2-OWED-FOLD-10, [`age_repair`]), and its row is deleted by the
+/// retry that lands.
 pub const SKIPPED_EVICTION_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:skipped-eviction:'||?1,?2,?3) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+/// The skipped evictions, oldest skip first (at most [`OWED_SKIPPED_EVICTIONS_NAMED`]), each with its ledger row and
+/// whether it still needs its evidence (the phase's own predicate): a range of the state's key, one key search each.
+pub const SKIPPED_EVICTIONS_SQL: &str = concat!(
+    "SELECT substr(s.name,35) AS txid,s.cursor AS skip,s.tickedAtMs AS skippedAt,e.releasedSpends AS releasedSpends,CASE WHEN e.txid IS NOT NULL AND ",
+    eviction_unwritten!(),
+    " THEN 1 ELSE 0 END AS open FROM owed_belt_state s LEFT JOIN pot_evictions e ON e.txid=substr(s.name,35) WHERE s.name>'backfill:owed-v2:skipped-eviction:' AND s.name<'backfill:owed-v2:skipped-eviction;' ORDER BY s.tickedAtMs,s.name LIMIT ?1"
+);
+/// A faulted retry's count, the skip's time kept (so the next age repair retries it again).
+pub const SKIPPED_EVICTION_FAULT_SQL: &str =
+    "UPDATE owed_belt_state SET cursor=?2 WHERE name='backfill:owed-v2:skipped-eviction:'||?1";
+/// The skip ends: written in the retry's own write batch, or alone when the eviction no longer needs its evidence.
+pub const SKIPPED_EVICTION_END_SQL: &str =
+    "DELETE FROM owed_belt_state WHERE name='backfill:owed-v2:skipped-eviction:'||?1";
 /// Arm the cursor; a pass that finds it armed begins.
 pub const ARM_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2','',?1) ON CONFLICT(name) DO NOTHING";
 /// The identities past the cursor, distinct and ascending, each side bounded on its own identity index.
@@ -349,20 +383,29 @@ fn first_beef(out: &[crate::pot_hook::StmtOut]) -> Option<Vec<u8>> {
         .find_map(crate::logic::decode_beef_hex)
 }
 
-/// One open eviction of the evidence phase: its reads, then one write batch (its evidence or missing rows, its cursor,
-/// and `clear` (the fault count cleared) when the count names it). `Ok(None)`: the wall fell first. The report's
-/// figures are added only once the batch landed.
+/// `f` under the deadline less its reserve, or awaited whole with none (the age repair's retry: its caller races it).
+async fn within<F: std::future::Future>(deadline: Option<&Deadline>, f: F) -> Option<F::Output> {
+    match deadline {
+        Some(d) => d.run_reserving(f).await,
+        None => Some(f.await),
+    }
+}
+
+/// One open eviction: its reads, then one write batch (its evidence or missing rows, then `tail`: the phase's cursor
+/// and the fault count cleared when the count names it; the retry's end of its skip). `Ok(None)`: the wall fell first.
+/// The report's figures are added only once the batch landed.
 async fn evidence_one(
-    db: &impl JudgeDb,
-    deadline: &Deadline,
+    db: &impl SqlPort,
+    deadline: Option<&Deadline>,
     txid: &str,
     released: &[(String, u32)],
-    clear: bool,
+    tail: Vec<Stmt>,
     report: &mut BackfillReport,
 ) -> Result<Option<()>, String> {
     use overlay_discovery::pot::released_evidence::{evidence_writes, EvidenceWrite};
-    let Some(reads) = deadline
-        .run_reserving(db.run_batch(vec![
+    let Some(reads) = within(
+        deadline,
+        db.run_batch(vec![
             Stmt {
                 sql: SEAT_KEYS_SQL.into(),
                 binds: vec![Bind::Text(txid.to_owned())],
@@ -375,8 +418,9 @@ async fn evidence_one(
                 sql: POT_BEEF_SQL.into(),
                 binds: vec![Bind::Text(txid.to_owned())],
             },
-        ]))
-        .await
+        ]),
+    )
+    .await
     else {
         return Ok(None);
     };
@@ -392,12 +436,14 @@ async fn evidence_one(
         .unwrap_or_default();
     let mut beef = first_beef(reads.get(1..).unwrap_or_default());
     if beef.is_none() {
-        let Some(evicted) = deadline
-            .run_reserving(db.run_batch(vec![Stmt {
+        let Some(evicted) = within(
+            deadline,
+            db.run_batch(vec![Stmt {
                 sql: EVICTED_BEEF_SQL.into(),
                 binds: vec![Bind::Text(txid.to_owned())],
-            }]))
-            .await
+            }]),
+        )
+        .await
         else {
             return Ok(None);
         };
@@ -438,17 +484,8 @@ async fn evidence_one(
             }
         }
     }
-    writes.push(Stmt {
-        sql: EVICTIONS_CURSOR_SQL.into(),
-        binds: vec![Bind::Text(txid.to_owned()), Bind::Int(db.now_ms() as i64)],
-    });
-    if clear {
-        writes.push(Stmt {
-            sql: EVICTION_FAULTS_SQL.into(),
-            binds: vec![Bind::Text("{}".into()), Bind::Int(db.now_ms() as i64)],
-        });
-    }
-    let Some(out) = deadline.run_reserving(db.run_batch(writes)).await else {
+    writes.extend(tail);
+    let Some(out) = within(deadline, db.run_batch(writes)).await else {
         return Ok(None);
     };
     out?;
@@ -503,7 +540,18 @@ async fn evidence_phase(
                 db.log(&format!("[owed-backfill] eviction {txid}: {tableless} released spend(s) carry no table field, read as pot_records (the writer's evidence statement refuses them)"));
             }
             let counted = faults["txid"] == txid.as_str();
-            match evidence_one(db, deadline, &txid, &released, counted, report).await {
+            let now = db.now_ms() as i64;
+            let mut tail = vec![Stmt {
+                sql: EVICTIONS_CURSOR_SQL.into(),
+                binds: vec![Bind::Text(txid.clone()), Bind::Int(now)],
+            }];
+            if counted {
+                tail.push(Stmt {
+                    sql: EVICTION_FAULTS_SQL.into(),
+                    binds: vec![Bind::Text("{}".into()), Bind::Int(now)],
+                });
+            }
+            match evidence_one(db, Some(deadline), &txid, &released, tail, report).await {
                 Ok(None) => return Ok(false),
                 Ok(Some(())) => report.evictions += 1,
                 Err(error) => {
@@ -519,9 +567,9 @@ async fn evidence_phase(
                             .await;
                     }
                     db.log(&format!(
-                        "[owed-backfill] eviction {txid}: the evidence phase faulted on {seen} passes ({error}); recorded, no evidence written, passed"
+                        "[owed-backfill] eviction {txid}: the evidence phase faulted on {seen} passes ({error}); recorded, no evidence written, passed (the age repair retries it once the skip is a day old)"
                     ));
-                    let reason: String = error.chars().take(200).collect();
+                    let reason = skip_value(&error, 0);
                     let Some(out) = deadline
                         .run(db.run_batch(vec![
                             Stmt {
@@ -810,8 +858,156 @@ pub async fn evidence_pass(
     Ok(report)
 }
 
+/// A skipped eviction's row value: its fault clipped to 200 characters and the faults of its current retry round.
+fn skip_value(error: &str, faults: usize) -> String {
+    let reason: String = error.chars().take(200).collect();
+    serde_json::json!({ "reason": reason, "faults": faults }).to_string()
+}
+
+/// What one age repair did: the marks, and the skipped evictions it read, retried, ended and skipped again.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AgeRepair {
+    pub marked: u64,
+    /// The retries made this pass (at most [`OWED_SKIPPED_EVICTION_RETRIES_PER_PASS`]).
+    pub retried: usize,
+    /// Retries that landed: the eviction's rows written, its skip ended.
+    pub recovered: Vec<String>,
+    /// Retries whose round reached its third fault: skipped again, a day from now.
+    pub reskipped: Vec<String>,
+    /// Skips ended because the eviction no longer needs its evidence (readmitted, gone, or the writer wrote it).
+    pub resolved: Vec<String>,
+    /// The evictions still skipped after this pass, named on the repair's line (oldest skip first, at most
+    /// [`OWED_SKIPPED_EVICTIONS_NAMED`] read).
+    pub still_skipped: Vec<String>,
+}
+
 /// The drain's daily re-mark of rows judged more than 24 h ago. Returns the marks written.
 pub async fn mark_aged(db: &impl SqlPort) -> Result<u64, String> {
+    age_repair(db).await.map(|r| r.marked)
+}
+
+/// The age repair (risk 8.2's third repair, run by the scheduled drain on every pass): the aged and keyless rows
+/// re-marked, then the skipped evictions retried (D2-OWED-FOLD-10). A skip a day old is retried, at most
+/// [`OWED_SKIPPED_EVICTION_RETRIES_PER_PASS`] a pass, oldest first, by the phase's own [`evidence_one`] (its reads,
+/// its statements, one write batch ending the skip); a fault is counted on the skip's row, and the round's third
+/// fault skips it again from now (counted `owed_backfill_skipped_evictions_total`, logged). Every pass that reads a
+/// skip names the still skipped on its line. Its caller races the whole repair; each retry's write is one batch.
+pub async fn age_repair(db: &impl SqlPort) -> Result<AgeRepair, String> {
+    let mut repair = AgeRepair::default();
+    let marks = age_marks(db).await;
+    if let Ok(marked) = marks {
+        repair.marked = marked;
+    }
+    if let Err(error) = retry_skipped_evictions(db, &mut repair).await {
+        db.log(&format!(
+            "[owed-backfill] the skipped evictions' retry deferred: {error}"
+        ));
+    }
+    if !repair.still_skipped.is_empty() || repair.retried > 0 || !repair.resolved.is_empty() {
+        db.log(&format!(
+            "[owed-backfill] skipped evictions: {:?} still skipped, {} retried, recovered {:?}, skipped again {:?}, resolved {:?}",
+            repair.still_skipped, repair.retried, repair.recovered, repair.reskipped, repair.resolved
+        ));
+    }
+    marks.map(|_| repair)
+}
+
+async fn retry_skipped_evictions(db: &impl SqlPort, repair: &mut AgeRepair) -> Result<(), String> {
+    let now = db.now_ms() as i64;
+    let rows = read(
+        db,
+        SKIPPED_EVICTIONS_SQL,
+        vec![Bind::Int(OWED_SKIPPED_EVICTIONS_NAMED as i64)],
+    )
+    .await?;
+    let mut found = BackfillReport::default();
+    for row in rows {
+        let Some(txid) = row["txid"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        let due = row["skippedAt"]
+            .as_i64()
+            .is_none_or(|at| at <= now - OWED_SKIPPED_EVICTION_RETRY_AFTER_MS);
+        if !due || repair.retried + repair.resolved.len() >= OWED_SKIPPED_EVICTION_RETRIES_PER_PASS
+        {
+            repair.still_skipped.push(txid);
+            continue;
+        }
+        let end = Stmt {
+            sql: SKIPPED_EVICTION_END_SQL.into(),
+            binds: vec![Bind::Text(txid.clone())],
+        };
+        if row["open"].as_i64() != Some(1) {
+            match db.run_batch(vec![end]).await {
+                Ok(_) => repair.resolved.push(txid),
+                Err(error) => {
+                    db.log(&format!(
+                        "[owed-backfill] eviction {txid}: its skip could not be ended ({error})"
+                    ));
+                    repair.still_skipped.push(txid);
+                }
+            }
+            continue;
+        }
+        repair.retried += 1;
+        let (released, _) = released_of(row["releasedSpends"].as_str());
+        match evidence_one(db, None, &txid, &released, vec![end], &mut found).await {
+            Ok(_) => {
+                found.evictions += 1;
+                repair.recovered.push(txid);
+            }
+            Err(error) => {
+                let skip = row["skip"].as_str().unwrap_or_default();
+                let faults = serde_json::from_str::<Value>(skip)
+                    .ok()
+                    .and_then(|v| v["faults"].as_u64())
+                    .unwrap_or(0) as usize
+                    + 1;
+                let write = if faults < OWED_BACKFILL_IDENTITY_FAULTS_MAX {
+                    db.log(&format!(
+                        "[owed-backfill] eviction {txid}: its retry faulted ({faults} of {OWED_BACKFILL_IDENTITY_FAULTS_MAX} this round): {error}"
+                    ));
+                    Stmt {
+                        sql: SKIPPED_EVICTION_FAULT_SQL.into(),
+                        binds: vec![
+                            Bind::Text(txid.clone()),
+                            Bind::Text(skip_value(&error, faults)),
+                        ],
+                    }
+                } else {
+                    db.log(&format!(
+                        "[owed-backfill] eviction {txid}: its retry faulted {faults} times ({error}); skipped again, retried a day from now"
+                    ));
+                    Stmt {
+                        sql: SKIPPED_EVICTION_SQL.into(),
+                        binds: vec![
+                            Bind::Text(txid.clone()),
+                            Bind::Text(skip_value(&error, 0)),
+                            Bind::Int(now),
+                        ],
+                    }
+                };
+                match db.run_batch(vec![write]).await {
+                    Ok(_) if faults >= OWED_BACKFILL_IDENTITY_FAULTS_MAX => {
+                        db.counters(vec![(COUNTER_SKIPPED_EVICTIONS.into(), 1)])
+                            .await;
+                        repair.reskipped.push(txid.clone());
+                    }
+                    Ok(_) => {}
+                    Err(e) => db.log(&format!(
+                        "[owed-backfill] eviction {txid}: its retry's fault was not counted ({e})"
+                    )),
+                }
+                repair.still_skipped.push(txid);
+            }
+        }
+    }
+    flush_evidence_counters(db, &found).await;
+    Ok(())
+}
+
+/// The aged and keyless rows' marks (risk 8.2's third repair, the D2-OWED lens's MEDIUM-5).
+async fn age_marks(db: &impl SqlPort) -> Result<u64, String> {
     let now = db.now_ms() as i64;
     let out = db
         .run_batch(vec![
@@ -870,8 +1066,15 @@ pub async fn lever(req: worker::Request, env: &worker::Env) -> worker::Result<wo
         .is_ok_and(|u| u.query_pairs().any(|(k, v)| k == "aged" && v == "1"))
     {
         let sql = crate::routes::D1Sql::of(env)?;
-        return match mark_aged(&sql).await {
-            Ok(aged) => worker::Response::from_json(&serde_json::json!({ "aged": aged })),
+        return match age_repair(&sql).await {
+            Ok(r) => worker::Response::from_json(&serde_json::json!({
+                "aged": r.marked,
+                "skippedEvictions": r.still_skipped,
+                "retriedEvictions": r.retried,
+                "recoveredEvictions": r.recovered,
+                "reskippedEvictions": r.reskipped,
+                "resolvedEvictions": r.resolved,
+            })),
             Err(e) => worker::Response::error(format!("owed age repair faulted: {e}"), 503),
         };
     }
@@ -947,6 +1150,20 @@ mod tests {
         assert_eq!(super::OWED_BACKFILL_IDENTITIES_PER_PASS, 128);
         assert_eq!(super::OWED_BACKFILL_GAMES_PER_BATCH, 16);
         assert_eq!(super::OWED_AGE_REMARKS_PER_PASS, 128);
+    }
+
+    /// D2-OWED-FOLD-10: the evidence phase's page is the shipped text byte for byte, and the age repair's retry of a
+    /// skipped eviction reads the same predicate; the retry's cadence is the age repair's day, four a pass.
+    #[test]
+    fn fold10_the_retry_reads_the_phases_own_predicate() {
+        assert_eq!(super::EVICTIONS_SQL, "SELECT e.txid,e.releasedSpends FROM pot_evictions e WHERE e.txid>?1 AND e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r JOIN released_hop_evidence h ON h.hopTxid=lower(json_extract(r.value,'$.txid')) AND h.hopVout=json_extract(r.value,'$.vout') WHERE h.potTxid=e.txid AND h.evictedAt=e.evictedAt) ORDER BY e.txid LIMIT ?2");
+        assert!(super::SKIPPED_EVICTIONS_SQL.contains(eviction_unwritten!()));
+        assert_eq!("backfill:owed-v2:skipped-eviction:".len() + 1, 35);
+        assert_eq!(
+            super::OWED_SKIPPED_EVICTION_RETRY_AFTER_MS,
+            super::OWED_AGE_REMARK_AFTER_MS
+        );
+        assert_eq!(super::OWED_SKIPPED_EVICTION_RETRIES_PER_PASS, 4);
     }
 
     /// D2-OWED-FOLD-8: the evidence phase runs the overlay eviction writer's own statements, byte for byte (the app
