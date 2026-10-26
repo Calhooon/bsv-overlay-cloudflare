@@ -257,13 +257,15 @@ fn w16_643_the_tip_mark_reads_due_rows_by_gate_index() {
     db.execute_batch("INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs,gateHeight) SELECT identity,'gate:' || rowid,'unbound',gameId,'{}',0,958700+(rowid%300) FROM potparty_records").unwrap();
     let select = &MARK_TIP_SQL
         [MARK_TIP_SQL.find("SELECT identity").unwrap()..MARK_TIP_SQL.find(" ON CONFLICT").unwrap()];
-    let old = select.replace("INDEXED BY idx_owed_rows_gate", "NOT INDEXED");
+    // Compare the selected subjects, with a constant projection for the independently tested write clock.
+    let subjects = select.replace("strftime('%s','now') * 1000", "0");
+    let old = subjects.replace("INDEXED BY idx_owed_rows_gate", "NOT INDEXED");
     for tip in [
         958_699i64, 958_700, 958_705, 958_846, 958_852, 958_853, 958_999, 959_100,
     ] {
         assert_eq!(
-            sorted(rows(&db, select, &[Value::Integer(tip), Value::Integer(0)])),
-            sorted(rows(&db, &old, &[Value::Integer(tip), Value::Integer(0)]))
+            sorted(rows(&db, &subjects, &[Value::Integer(tip)])),
+            sorted(rows(&db, &old, &[Value::Integer(tip)]))
         );
     }
     for sql in [select, MARK_TIP_SQL] {

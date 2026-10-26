@@ -635,7 +635,7 @@ async fn owed893_tip_marks_seek_gate_index_and_judge_is_bounded() {
             .prepare(&format!("EXPLAIN QUERY PLAN {}", judge::MARK_TIP_SQL))
             .unwrap();
         let details: Vec<String> = plan
-            .query_map(rusqlite::params![900_000, 1], |r| r.get(3))
+            .query_map(rusqlite::params![900_000], |r| r.get(3))
             .unwrap()
             .map(Result::unwrap)
             .collect();

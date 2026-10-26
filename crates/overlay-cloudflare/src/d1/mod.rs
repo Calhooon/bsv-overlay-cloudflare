@@ -308,7 +308,7 @@ pub fn migration_error_is_benign(sql: &str, err: &str) -> bool {
 /// overlay migration list is permitted to hold: `CREATE` (IF NOT EXISTS),
 /// `ALTER TABLE` (additive; a re-run duplicate-column error is benign, see
 /// [`migration_error_is_benign`]), `INSERT OR IGNORE` (a PK-deduped data
-/// carry), or `DROP INDEX IF EXISTS` (an index is a derived structure, so
+/// carry), or `DROP INDEX IF EXISTS` / `DROP TRIGGER IF EXISTS` (derived structures, so
 /// dropping one loses no row and IF EXISTS makes the whole-list re-run a
 /// no-op). Plain `INSERT`, `DROP TABLE`, `DROP COLUMN` and a bare `DROP INDEX`
 /// are NOT additive and answer false.
@@ -324,6 +324,7 @@ pub fn migration_statement_is_additive(sql: &str) -> bool {
         || trimmed.starts_with("ALTER TABLE")
         || trimmed.starts_with("INSERT OR IGNORE")
         || trimmed.starts_with("DROP INDEX IF EXISTS")
+        || trimmed.starts_with("DROP TRIGGER IF EXISTS")
 }
 
 /// Set once THIS isolate has applied [`OVERLAY_MIGRATIONS`] successfully.
@@ -2451,7 +2452,7 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::derived_owed::write_time::SPENDER_BYTES_INSERT,
     crate::change_park::CHANGE_PARKED_AGE_INDEX,
     // The drain's bounded backlog count and oldest mark share this covering index.
-    crate::derived_owed::DIRTY_MARKED_INDEX,
+    crate::derived_owed::DIRTY_BACKLOG_INDEX,
 
 ];
 
@@ -2870,7 +2871,7 @@ mod tests {
                 // `migration_statement_is_additive` the native migration
                 // emitter guards its `--file` output with.
                 super::migration_statement_is_additive(sql),
-                "Migration {i} should start with CREATE, ALTER TABLE, INSERT OR IGNORE, or DROP INDEX IF EXISTS, got: {}",
+                "Migration {i} should start with CREATE, ALTER TABLE, INSERT OR IGNORE, or DROP INDEX/TRIGGER IF EXISTS, got: {}",
                 &trimmed[..30.min(trimmed.len())]
             );
         }

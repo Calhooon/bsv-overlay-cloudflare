@@ -56,12 +56,13 @@ EOF
 # D2-OWED-FOLD-8: with the captured pair-13 eviction (made before the eviction writer) for the evidence phase
 OWED_SEED_PAIR13=1 cargo run --quiet --manifest-path workers/Cargo.toml -p low-app-layer --example owed_read_seed > "$out/seed.sql"
 # an old worker's rows: no keys, no judgement stamp, no state, no marks; the overlay certified at the gate's figure
-cat >> "$out/seed.sql" <<'EOF'
+migration_count=$(sed -n 's/^pub const OVERLAY_MIGRATION_COUNT: usize = \([0-9][0-9]*\);/\1/p' crates/overlay-cloudflare/src/d1/mod.rs)
+cat >> "$out/seed.sql" <<EOF
 UPDATE owed_rows SET judgedAtMs = NULL, claimable = NULL, gateHeight = NULL, beltDueAtMs = NULL, probeTip = NULL;
 DELETE FROM owed_row_words;
 DELETE FROM owed_state;
 DELETE FROM owed_dirty;
-INSERT INTO ops_counters(name, value) VALUES ('overlay_migration_count', 409) ON CONFLICT(name) DO UPDATE SET value = excluded.value;
+INSERT INTO ops_counters(name, value) VALUES ('overlay_migration_count', $migration_count) ON CONFLICT(name) DO UPDATE SET value = excluded.value;
 EOF
 python3 scripts/d1-load-chunked.py "$out" low-overlay-db "$state" "$out/seed.sql" 80 > "$out/seed.log" 2>&1
 jobs=()

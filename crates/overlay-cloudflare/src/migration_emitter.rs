@@ -483,6 +483,7 @@ mod tests {
             "ALTER TABLE t ADD COLUMN y INTEGER",
             "INSERT OR IGNORE INTO t (x) VALUES (1)",
             "DROP INDEX IF EXISTS i",
+            "DROP TRIGGER IF EXISTS owed_dirty_pot_records_update",
             "  create table if not exists lower (x integer)",
         ];
         let banned = [
@@ -491,6 +492,7 @@ mod tests {
             "INSERT INTO t (x) VALUES (1)",
             "DELETE FROM t",
             "UPDATE t SET x = 1",
+            "DROP TRIGGER owed_dirty_pot_records_update",
         ];
         for sql in additive {
             assert!(migration_statement_is_additive(sql), "additive: {sql}");

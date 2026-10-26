@@ -129,7 +129,7 @@ pub const DIRTY_BACKLOG_COUNT_CAP: i64 = 65_536;
 /// The health read is one primary-key lookup of the drain's durable snapshot.
 pub const DIRTY_HEALTH_SQL: &str = "SELECT json_extract(cursor,'$.count') AS count,json_extract(cursor,'$.oldestMarkedAtMs') AS oldest,tickedAtMs AS asOfMs FROM owed_belt_state WHERE name='backlog:dirty'";
 /// One bounded, covering-index count per drain tick, including its oldest mark in that same read.
-pub const DIRTY_SNAPSHOT_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) SELECT 'backlog:dirty',json_object('count',COUNT(*),'oldestMarkedAtMs',MIN(markedAtMs),'tickAtMs',?1),?1 FROM (SELECT markedAtMs FROM owed_dirty INDEXED BY idx_owed_dirty_marked ORDER BY markedAtMs LIMIT ?2) WHERE 1 ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+pub const DIRTY_SNAPSHOT_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) SELECT 'backlog:dirty',json_object('count',COUNT(*),'oldestMarkedAtMs',MIN(markedAtMs),'tickAtMs',?1),?1 FROM (SELECT markedAtMs FROM owed_dirty INDEXED BY idx_owed_dirty_backlog ORDER BY markedAtMs LIMIT ?2) WHERE 1 ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 
 pub async fn snapshot_dirty(db: &impl SqlPort) -> Result<(), String> {
     db.run_batch(vec![Stmt {
@@ -1137,6 +1137,8 @@ mod cadence_health_tests {
         let db = crate::pot_hook::tests::SqliteSql::migrated();
         db.now.set(900_000);
         assert_eq!(dirty_health(&db).await, Value::Null);
+        // A rolling old overlay replays its historical index drop; the new snapshot still works.
+        db.conn.execute_batch(bsv_overlay_cloudflare::derived_owed::DIRTY_MARKED_DROP).unwrap();
         snapshot_dirty(&db).await.unwrap();
         assert_eq!(
             dirty_health(&db).await,

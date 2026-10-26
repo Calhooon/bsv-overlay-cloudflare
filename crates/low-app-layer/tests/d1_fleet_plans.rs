@@ -270,8 +270,6 @@ fn hot_routes_never_scan_fleet_tables() {
                     "pot_records",
                     "owed_dirty",
                     "owed_belt_state",
-                    "owed_dirty",
-                    "owed_belt_state",
                     "potparty_records",
                     "hopparty_records",
                     "potrefund_records",
