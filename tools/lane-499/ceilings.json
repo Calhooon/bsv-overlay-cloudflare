@@ -365,9 +365,9 @@
       "censusKey": null
     },
     "owed-belt-tick": {
-      "route": "POST /internal/owed-belt-tick: one belt tick over the READ lane's fleet seed (the lived-in identity, 500 judged rows) with every belt date an hour back; WoC 404, BananaBlocks unspent: 8 finds, each one judge batch (bsv-low #893 section 5). Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 17,223 to 896 (LOW-2's commit: the per-game delete on the game index, one state row, the ceiling joined from it; HIGH-3's walk of at most 64 identities, never the due set), writes 162 to 260 (the fold's owed_rows index entries, the row-count triggers, the walk's cursor row); the largest statement is the backlog gauge's index count. Re-run by lane D2-OWED-FOLD-2 (2026-10-25): unchanged (the turn order and the back-off move no statement of a first tick). Re-measured by lane D2-OWED-FOLD-4 (2026-10-26): reads 896 to 898, statements 313 to 314 (the second delta lens's D2-M1: the block-dated courier-only sweeps read first over idx_owed_rows_sweep, none on this seed, then the walk of at most 512 dated identities with one MIN seek each, turns only to those holding a due row)",
+      "route": "POST /internal/owed-belt-tick: one belt tick over the READ lane's fleet seed (the lived-in identity, 500 judged rows) with every belt date an hour back; WoC 404, BananaBlocks unspent: 8 finds, each one judge batch (bsv-low #893 section 5). Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 17,223 to 896 (LOW-2's commit: the per-game delete on the game index, one state row, the ceiling joined from it; HIGH-3's walk of at most 64 identities, never the due set), writes 162 to 260 (the fold's owed_rows index entries, the row-count triggers, the walk's cursor row); the largest statement is the backlog gauge's index count. Re-run by lane D2-OWED-FOLD-2 (2026-10-25): unchanged (the turn order and the back-off move no statement of a first tick). Re-measured by lane D2-OWED-FOLD-4 (2026-10-26): reads 896 to 898, statements 313 to 314 (the second delta lens's D2-M1: the block-dated courier-only sweeps read first over idx_owed_rows_sweep, none on this seed, then the walk of at most 512 dated identities with one MIN seek each, turns only to those holding a due row) Re-measured by lane D2-OWED-FOLD-5 (2026-10-26): reads 898 to 900 (the third delta lens's D3-N3: the first class walks the distinct judged tips below the present, one MIN seek each; D3-M1: the second class's walk runs on every tick)",
       "measured": {
-        "reads": 898,
+        "reads": 900,
         "writes": 260,
         "stmts": 314,
         "maxReads": 243,
@@ -383,9 +383,9 @@
       "censusKey": null
     },
     "owed-belt-tick-429": {
-      "route": "POST /internal/owed-belt-tick: every courier answers 429; each rung closed after its first call, 8 candidates re-armed once at now + 300 s, no find. Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 709 to 266, writes 27 to 36, statements 17 to 29 (the walk, its per-identity due reads and the cursor row). Re-run by lane D2-OWED-FOLD-2 (2026-10-25): unchanged (the turn order and the back-off move no statement of a first tick). Re-measured by lane D2-OWED-FOLD-4 (2026-10-26): reads 266 to 268, statements 29 to 30 (D2-M1's first-class read)",
+      "route": "POST /internal/owed-belt-tick: every courier answers 429; each rung closed after its first call, 8 candidates re-armed once at now + 300 s, no find. Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 709 to 266, writes 27 to 36, statements 17 to 29 (the walk, its per-identity due reads and the cursor row). Re-run by lane D2-OWED-FOLD-2 (2026-10-25): unchanged (the turn order and the back-off move no statement of a first tick). Re-measured by lane D2-OWED-FOLD-4 (2026-10-26): reads 266 to 268, statements 29 to 30 (D2-M1's first-class read) Re-measured by lane D2-OWED-FOLD-5 (2026-10-26): reads 268 to 270 (D3-N3's first-class seek)",
       "measured": {
-        "reads": 268,
+        "reads": 270,
         "writes": 36,
         "stmts": 30,
         "maxReads": 228,
@@ -401,20 +401,38 @@
       "censusKey": null
     },
     "owed-tip-mark": {
-      "route": "POST /internal/tip-changed at the seed's tip + 1, after the belt's cells, over the READ lane's fleet seed plus the delta lens's D-H1 shape planted (1,000 strangers' index-unspent claimable sweeps and 40 courier-dependent ones, judged at the seed's tip, belt dates an hour ahead): the gate window marked, the 40 dated due now and the 1,000 not, the tipless rows re-marked, nothing judged, no courier call (lane D2-OWED-FOLD-2, 2026-10-25). Since D2-OWED-FOLD-3 (2026-10-26) `idx_owed_rows_sweep` carries the date statement's own status term, so the date reads only the 40 rows it writes (maxReads 40) and no index-unspent sweep; on 8396f8b2 it read every claimable sweep judged below the tip (reads 1,052, maxReads 1,040: RED under this ceiling). On d521888f the same cell wrote 3,120 and dated all 1,040 (RED)",
+      "route": "POST /internal/tip-changed at the seed's tip + 1, after the belt's cells, over the READ lane's fleet seed plus the delta lens's D-H1 shape planted (1,000 strangers' index-unspent claimable sweeps and 40 courier-dependent ones, judged at the seed's tip, belt dates an hour ahead): the gate window marked, the 40 dated due now and the 1,000 not, the tipless rows re-marked, nothing judged, no courier call (lane D2-OWED-FOLD-2, 2026-10-25). Since D2-OWED-FOLD-3 (2026-10-26) `idx_owed_rows_sweep` carries the date statement's own status term, so the date reads only the 40 rows it writes (maxReads 40) and no index-unspent sweep; on 8396f8b2 it read every claimable sweep judged below the tip (reads 1,052, maxReads 1,040: RED under this ceiling). On d521888f the same cell wrote 3,120 and dated all 1,040 (RED). Re-measured by lane D2-OWED-FOLD-5 (2026-10-26): reads 52 to 132, writes 120 to 160, maxReads 40 to 120 (the third delta lens's D3-N3: `idx_owed_rows_sweep`'s key now holds the due time, so the date rewrites each dated row's index entry, one write, and reads it twice, the update's two passes over an index whose key it moves; still the 40 rows it writes and no index-unspent sweep, far under the 1,052 that is RED)",
       "measured": {
-        "reads": 52,
-        "writes": 120,
+        "reads": 132,
+        "writes": 160,
         "stmts": 4,
-        "maxReads": 40,
+        "maxReads": 120,
         "calls": 0
       },
       "ceiling": {
-        "reads": 78,
-        "writes": 180,
+        "reads": 198,
+        "writes": 240,
         "stmts": 6,
-        "maxReads": 60,
+        "maxReads": 180,
         "calls": 0
+      },
+      "censusKey": null
+    },
+    "owed-belt-tick-fleet": {
+      "route": "POST /internal/owed-belt-tick after the tip mark's cell (lane D2-OWED-FOLD-5, 2026-10-26; the third delta lens's D3-N2 and D3-M1): the belt tier's seed plus the 1,040 strangers (each its own identity; 1,000 dated an hour ahead and not due) and a first-class flood of 40 courier-dependent sweeps judged below the stand-in's tip and due now, one second-class row due inside the walk's window. The walk reads its whole window of 512 dated identities (maxReads 1,537, the walk's statement), the flood holds 7 places and the second class's one due row its reserved place (the other yields). At 720 ticks a day a full-window tick of 8 finds is about 1.57 M rows read a day (the walk alone about 1.11 M), near 8 % of prod's 20 M budget; a tick whose window holds fewer dated identities reads less",
+      "measured": {
+        "reads": 2180,
+        "writes": 54,
+        "stmts": 178,
+        "maxReads": 1537,
+        "calls": 16
+      },
+      "ceiling": {
+        "reads": 3270,
+        "writes": 81,
+        "stmts": 267,
+        "maxReads": 2306,
+        "calls": 24
       },
       "censusKey": null
     },
