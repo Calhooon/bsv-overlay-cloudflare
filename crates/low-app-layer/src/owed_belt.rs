@@ -4,8 +4,10 @@
 //! A Durable Object alarm (the `BOARD_VIEW` actor named [`OWED_BELT_ACTOR`]; the deferred walk's alarm is gone) runs
 //! one [`tick`] every [`OWED_BELT_TICK_MS`], and the scheduled pass re-arms it ([`arm`], the watchdog: a lost alarm
 //! costs at most one 15 minute cron). A tick reads the [`OWED_BELT_OUTPOINTS_PER_TICK`] rows whose `beltDueAtMs` is
-//! past (round-robin by identity over `idx_owed_rows_belt_turn`: up to 64 identities walked past a cursor, one row of
-//! each due identity before a second of any, the D2-OWED lens's HIGH-3, `due_candidates`; the judge sets that column for exactly the rows that owe the
+//! past: first the courier-only sweeps a block dated (`idx_owed_rows_sweep`, the press the read withholds until their
+//! look; the second delta lens's D2-M1), then round-robin by identity over `idx_owed_rows_belt_turn` (up to 512 dated
+//! identities walked past a cursor, turns only to those holding a row due now, one row of each before a second of any,
+//! the D2-OWED lens's HIGH-3, `due_candidates`); the judge sets that column for exactly the rows that owe the
 //! chain a question it can answer, `owed_judge::row_statements`) and asks each through the existing ladders behind ONE gate
 //! ([`Gate`]): at most [`OWED_BELT_CALLS_PER_OUTPOINT`] courier calls an outpoint and [`OWED_BELT_CALLS_PER_TICK`] a
 //! tick, the three-fault circuit per rung per tick, a rung's 429 ending that rung's turn (never the tick). Every find
@@ -42,17 +44,30 @@ pub const OWED_BELT_STATE_NAME: &str = "belt";
 pub const RUNGS: [&str; 4] = ["woc", "bitails", "bananablocks", "other"];
 
 /// The identities the tick walks (the D2-OWED lens's HIGH-3): up to ?2 distinct identities holding a dated row,
-/// ascending past the cursor ?1, one covering-index search each; the tick wraps to the start for the rest.
-pub const BELT_IDENTITIES_SQL: &str = "WITH RECURSIVE walk(identity,n) AS (SELECT (SELECT MIN(identity) FROM owed_rows INDEXED BY idx_owed_rows_belt_turn WHERE beltDueAtMs IS NOT NULL AND identity>?1),1 UNION ALL SELECT (SELECT MIN(identity) FROM owed_rows INDEXED BY idx_owed_rows_belt_turn WHERE beltDueAtMs IS NOT NULL AND identity>walk.identity),n+1 FROM walk WHERE walk.identity IS NOT NULL AND n<?2) SELECT identity FROM walk WHERE identity IS NOT NULL";
+/// ascending past the cursor ?1, one covering-index search each, each with its earliest date (`due`, one MIN seek on
+/// the same index: the second delta lens's D2-M1 gives turns only to an identity holding a row due now); the tick wraps
+/// to the start for the rest.
+pub const BELT_IDENTITIES_SQL: &str = "WITH RECURSIVE walk(identity,n) AS (SELECT (SELECT MIN(identity) FROM owed_rows INDEXED BY idx_owed_rows_belt_turn WHERE beltDueAtMs IS NOT NULL AND identity>?1),1 UNION ALL SELECT (SELECT MIN(identity) FROM owed_rows INDEXED BY idx_owed_rows_belt_turn WHERE beltDueAtMs IS NOT NULL AND identity>walk.identity),n+1 FROM walk WHERE walk.identity IS NOT NULL AND n<?2) SELECT identity,(SELECT MIN(beltDueAtMs) FROM owed_rows INDEXED BY idx_owed_rows_belt_turn WHERE identity=walk.identity AND beltDueAtMs IS NOT NULL) AS due FROM walk WHERE identity IS NOT NULL";
+/// The first class (the second delta lens's D2-M1): the courier-only sweeps a block dated and their look not yet made
+/// (claimable `hop-stranded`, index status not `unspent`, judged below the present tip ?1, due by ?2), over
+/// `idx_owed_rows_sweep` (the tip's own dating index: its WHERE is this statement's, so it reads only that class), at
+/// most ?3 rows a tick.
+pub const BELT_SWEEPS_DUE_SQL: &str = "SELECT identity,outpoint,beltDueAtMs FROM owed_rows INDEXED BY idx_owed_rows_sweep WHERE family='hop-stranded' AND claimable=1 AND json_extract(facts,'$.status') IS NOT 'unspent' AND probeTip<?1 AND beltDueAtMs<=?2 LIMIT ?3";
+/// The first class's rows read a tick at most.
+pub const OWED_BELT_SWEEP_ROWS_READ: usize = 256;
 /// One walked identity's oldest due rows (at most a tick's worth).
 pub const BELT_DUE_SQL: &str = "SELECT outpoint,beltDueAtMs FROM owed_rows INDEXED BY idx_owed_rows_belt_turn WHERE identity=?1 AND beltDueAtMs<=?2 ORDER BY beltDueAtMs,outpoint LIMIT ?3";
 /// A chosen row, by its primary key.
 pub const CANDIDATES_SQL: &str = "SELECT identity,outpoint,gameId,family,facts,reason,probeTip,beltDueAtMs,judgedAtMs,COALESCE(claimable, CASE json_type(facts,'$.claimable') WHEN 'true' THEN 1 WHEN 'false' THEN 0 END) AS claimable FROM owed_rows WHERE identity=?1 AND outpoint=?2";
-/// The identities one tick walks. The round-robin's bound (the delta lens's D-L1; the first build claimed `ceil(N /
+/// The due identities one tick gives turns to at most. The round-robin's bound (the delta lens's D-L1; the first build claimed `ceil(N /
 /// 64)` ticks, false at 8 looks a tick): the cursor passes only identities given a turn or holding no due row, so an
 /// identity holding a due row is given its turn within `ceil(D / 8)` ticks of the walk's window reaching it, `D` the
-/// identities holding a due row ahead of it; the window reaches 64 dated identities past the cursor a tick.
+/// identities holding a due row ahead of it; the window reaches [`OWED_BELT_WALKED_PER_TICK`] dated identities past the
+/// cursor a tick, of which only those holding a row due now take turns (D2-M1).
 pub const OWED_BELT_IDENTITIES_PER_TICK: usize = 64;
+/// The dated identities one tick walks at most (two index seeks each): S identities dated and not due delay the second
+/// class by `ceil(S / 512)` ticks at most; the first class (a block's courier-only sweeps) is read before the walk.
+pub const OWED_BELT_WALKED_PER_TICK: usize = 512;
 /// The walk's cursor row (the last identity a tick walked).
 pub const OWED_BELT_WALK_STATE_NAME: &str = "belt:identities";
 /// The row as the find's judge left it, for the backoff's comparison.
@@ -427,95 +442,166 @@ pub struct TickReport {
     pub no_tip: bool,
 }
 
-/// The tick's candidates, round-robin by identity (the D2-OWED lens's HIGH-3): up to
-/// [`OWED_BELT_IDENTITIES_PER_TICK`] identities walked past the cursor (wrapping), each one's oldest due rows in one
-/// batch, then each identity's oldest before a second of any, in walk order, [`OWED_BELT_OUTPOINTS_PER_TICK`] in all;
-/// the chosen rows read by primary key. The cursor moves to the last identity GIVEN A TURN (the delta lens's D-L1), so
-/// no identity holding a due row is passed unserved. Reads are bounded by the walk, never the due set.
-async fn due_candidates(db: &impl JudgeDb, now: i64) -> Result<Vec<Value>, String> {
+/// The tick's candidates in two classes (the second delta lens's D2-M1, the captain's ruling: a look a PRESS WAITS ON
+/// comes before a look that can only downgrade). FIRST the courier-only sweeps a block dated
+/// ([`BELT_SWEEPS_DUE_SQL`]: claimable, index status not `unspent`, judged below the present tip, due), the class the
+/// read withholds at every block until its look, round-robin by identity (each identity's oldest before a second of
+/// any). THEN, in the places left, the round-robin of the rest (the D2-OWED lens's HIGH-3): up to
+/// [`OWED_BELT_WALKED_PER_TICK`] dated identities walked past the cursor (wrapping), one index seek and one MIN seek
+/// each, of which only those holding a row DUE NOW are given turns (at most [`OWED_BELT_IDENTITIES_PER_TICK`]), each
+/// one's oldest due rows in one batch, each identity's oldest before a second of any, in walk order,
+/// [`OWED_BELT_OUTPOINTS_PER_TICK`] in all; the chosen rows read by primary key. The cursor moves to the last identity
+/// GIVEN A TURN (the delta lens's D-L1), or past the whole walk when none was, so no identity holding a due row is
+/// passed unserved. A tick the first class fills walks nothing and keeps the cursor. Reads are bounded by the first
+/// class's [`OWED_BELT_SWEEP_ROWS_READ`] and the walk, never the due set.
+async fn due_candidates(db: &impl JudgeDb, now: i64, tip: u64) -> Result<Vec<Value>, String> {
     let first = |out: Vec<crate::pot_hook::StmtOut>| {
         out.into_iter().next().map(|o| o.rows).unwrap_or_default()
     };
-    let cursor = first(
+    let text = |r: &Value, k: &str| r[k].as_str().map(str::to_owned);
+    let mut chosen: Vec<(String, String)> = Vec::new();
+    // The first class: the block-dated courier-only sweeps, by due time then identity, round-robin by identity.
+    let mut sweeps: Vec<(i64, String, String)> = first(
         db.run_batch(vec![Stmt {
-            sql: "SELECT cursor FROM owed_belt_state WHERE name='belt:identities'".into(),
-            binds: vec![],
+            sql: BELT_SWEEPS_DUE_SQL.into(),
+            binds: vec![
+                Bind::Int(tip as i64),
+                Bind::Int(now),
+                Bind::Int(OWED_BELT_SWEEP_ROWS_READ as i64),
+            ],
         }])
         .await?,
     )
-    .first()
-    .and_then(|r| r["cursor"].as_str().map(str::to_owned))
-    .unwrap_or_default();
-    let walk = |after: String, n: usize| async move {
-        db.run_batch(vec![Stmt {
-            sql: BELT_IDENTITIES_SQL.into(),
-            binds: vec![Bind::Text(after), Bind::Int(n as i64)],
-        }])
-        .await
-        .map(|out| {
-            first(out)
-                .iter()
-                .filter_map(|r| r["identity"].as_str().map(str::to_owned))
-                .collect::<Vec<_>>()
-        })
-    };
-    let span = OWED_BELT_IDENTITIES_PER_TICK;
-    let mut identities = walk(cursor.clone(), span).await?;
-    if identities.len() < span && !cursor.is_empty() {
-        for id in walk(String::new(), span - identities.len()).await? {
-            if id > cursor || identities.contains(&id) {
-                break;
-            }
-            identities.push(id);
+    .iter()
+    .filter_map(|r| {
+        Some((
+            r["beltDueAtMs"].as_i64()?,
+            text(r, "identity")?,
+            text(r, "outpoint")?,
+        ))
+    })
+    .collect();
+    sweeps.sort();
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for (_, identity, outpoint) in sweeps {
+        match groups.iter_mut().find(|(id, _)| *id == identity) {
+            Some((_, rows)) => rows.push(outpoint),
+            None => groups.push((identity, vec![outpoint])),
         }
     }
-    if identities.is_empty() {
+    for turn in 0..OWED_BELT_OUTPOINTS_PER_TICK {
+        for (identity, rows) in &groups {
+            if let Some(outpoint) = rows.get(turn) {
+                if chosen.len() < OWED_BELT_OUTPOINTS_PER_TICK {
+                    chosen.push((identity.clone(), outpoint.clone()));
+                }
+            }
+        }
+    }
+    let mut reads = Vec::new();
+    if chosen.len() < OWED_BELT_OUTPOINTS_PER_TICK {
+        let cursor = first(
+            db.run_batch(vec![Stmt {
+                sql: "SELECT cursor FROM owed_belt_state WHERE name='belt:identities'".into(),
+                binds: vec![],
+            }])
+            .await?,
+        )
+        .first()
+        .and_then(|r| r["cursor"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+        let walk = |after: String, n: usize| async move {
+            db.run_batch(vec![Stmt {
+                sql: BELT_IDENTITIES_SQL.into(),
+                binds: vec![Bind::Text(after), Bind::Int(n as i64)],
+            }])
+            .await
+            .map(|out| {
+                first(out)
+                    .iter()
+                    .filter_map(|r| Some((r["identity"].as_str()?.to_owned(), r["due"].as_i64())))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let span = OWED_BELT_WALKED_PER_TICK;
+        let mut walked = walk(cursor.clone(), span).await?;
+        if walked.len() < span && !cursor.is_empty() {
+            for (id, due) in walk(String::new(), span - walked.len()).await? {
+                if id > cursor || walked.iter().any(|(w, _)| *w == id) {
+                    break;
+                }
+                walked.push((id, due));
+            }
+        }
+        // Only an identity holding a row DUE NOW is given a turn (D2-M1 (a)); the walk ends at the last of them.
+        let mut identities = Vec::new();
+        let mut walked_to = None;
+        for (id, due) in &walked {
+            walked_to = Some(id.clone());
+            if due.is_some_and(|d| d <= now) {
+                identities.push(id.clone());
+                if identities.len() == OWED_BELT_IDENTITIES_PER_TICK {
+                    break;
+                }
+            }
+        }
+        let due = if identities.is_empty() {
+            Vec::new()
+        } else {
+            db.run_batch(
+                identities
+                    .iter()
+                    .map(|id| Stmt {
+                        sql: BELT_DUE_SQL.into(),
+                        binds: vec![
+                            Bind::Text(id.clone()),
+                            Bind::Int(now),
+                            Bind::Int(OWED_BELT_OUTPOINTS_PER_TICK as i64),
+                        ],
+                    })
+                    .collect(),
+            )
+            .await?
+        };
+        let mut turned = vec![false; identities.len()];
+        // Each turn in WALK order, as the drain's (the delta lens's D-L1): the cursor then passes no identity holding a
+        // due row that was not given its turn. (Inside a turn by due time, as first built, a later identity in the walk
+        // could take a place an earlier one was owed, and the cursor at the last WALKED identity passed both.)
+        for turn in 0..OWED_BELT_OUTPOINTS_PER_TICK {
+            for (at, (id, out)) in identities.iter().zip(&due).enumerate() {
+                let Some(outpoint) = out.rows.get(turn).and_then(|r| r["outpoint"].as_str()) else {
+                    continue;
+                };
+                if chosen.iter().any(|(i, o)| i == id && o == outpoint) {
+                    continue;
+                }
+                if chosen.len() < OWED_BELT_OUTPOINTS_PER_TICK {
+                    chosen.push((id.clone(), outpoint.to_owned()));
+                    turned[at] = true;
+                }
+            }
+        }
+        // The next tick starts after the last identity this one gave a turn (the whole walk when none was given one).
+        let last = turned
+            .iter()
+            .rposition(|t| *t)
+            .and_then(|at| identities.get(at).cloned())
+            .or(walked_to);
+        if let Some(last) = last {
+            reads.push(Stmt {
+                sql: STATE_SQL.into(),
+                binds: vec![
+                    Bind::Text(OWED_BELT_WALK_STATE_NAME.into()),
+                    Bind::Text(last),
+                    Bind::Int(now),
+                ],
+            });
+        }
+    }
+    if chosen.is_empty() && reads.is_empty() {
         return Ok(Vec::new());
     }
-    let due = db
-        .run_batch(
-            identities
-                .iter()
-                .map(|id| Stmt {
-                    sql: BELT_DUE_SQL.into(),
-                    binds: vec![
-                        Bind::Text(id.clone()),
-                        Bind::Int(now),
-                        Bind::Int(OWED_BELT_OUTPOINTS_PER_TICK as i64),
-                    ],
-                })
-                .collect(),
-        )
-        .await?;
-    let mut chosen: Vec<(String, String)> = Vec::new();
-    let mut turned = vec![false; identities.len()];
-    // Each turn in WALK order, as the drain's (the delta lens's D-L1): the cursor then passes no identity holding a
-    // due row that was not given its turn. (Inside a turn by due time, as first built, a later identity in the walk
-    // could take a place an earlier one was owed, and the cursor at the last WALKED identity passed both.)
-    for turn in 0..OWED_BELT_OUTPOINTS_PER_TICK {
-        for (at, (id, out)) in identities.iter().zip(&due).enumerate() {
-            let Some(outpoint) = out.rows.get(turn).and_then(|r| r["outpoint"].as_str()) else {
-                continue;
-            };
-            if chosen.len() < OWED_BELT_OUTPOINTS_PER_TICK {
-                chosen.push((id.clone(), outpoint.to_owned()));
-                turned[at] = true;
-            }
-        }
-    }
-    // The next tick starts after the last identity this one gave a turn (every walked one when none was chosen).
-    let last = turned
-        .iter()
-        .rposition(|t| *t)
-        .map_or_else(|| identities.last(), |at| identities.get(at));
-    let mut reads = vec![Stmt {
-        sql: STATE_SQL.into(),
-        binds: vec![
-            Bind::Text(OWED_BELT_WALK_STATE_NAME.into()),
-            Bind::Text(last.cloned().unwrap_or_default()),
-            Bind::Int(now),
-        ],
-    }];
+    let skip = reads.len();
     reads.extend(chosen.iter().map(|(id, outpoint)| Stmt {
         sql: CANDIDATES_SQL.into(),
         binds: vec![Bind::Text(id.clone()), Bind::Text(outpoint.clone())],
@@ -524,7 +610,7 @@ async fn due_candidates(db: &impl JudgeDb, now: i64) -> Result<Vec<Value>, Strin
         .run_batch(reads)
         .await?
         .into_iter()
-        .skip(1)
+        .skip(skip)
         .filter_map(|o| o.rows.into_iter().next())
         .collect())
 }
@@ -542,7 +628,7 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
             ..Default::default()
         });
     }
-    let rows = due_candidates(db, now).await?;
+    let rows = due_candidates(db, now, db.tip().unwrap_or_default()).await?;
     let gate = Gate::new(courier);
     let mut report = TickReport {
         candidates: rows.len(),

@@ -365,36 +365,36 @@
       "censusKey": null
     },
     "owed-belt-tick": {
-      "route": "POST /internal/owed-belt-tick: one belt tick over the READ lane's fleet seed (the lived-in identity, 500 judged rows) with every belt date an hour back; WoC 404, BananaBlocks unspent: 8 finds, each one judge batch (bsv-low #893 section 5). Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 17,223 to 896 (LOW-2's commit: the per-game delete on the game index, one state row, the ceiling joined from it; HIGH-3's walk of at most 64 identities, never the due set), writes 162 to 260 (the fold's owed_rows index entries, the row-count triggers, the walk's cursor row); the largest statement is the backlog gauge's index count. Re-run by lane D2-OWED-FOLD-2 (2026-10-25): unchanged (the turn order and the back-off move no statement of a first tick)",
+      "route": "POST /internal/owed-belt-tick: one belt tick over the READ lane's fleet seed (the lived-in identity, 500 judged rows) with every belt date an hour back; WoC 404, BananaBlocks unspent: 8 finds, each one judge batch (bsv-low #893 section 5). Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 17,223 to 896 (LOW-2's commit: the per-game delete on the game index, one state row, the ceiling joined from it; HIGH-3's walk of at most 64 identities, never the due set), writes 162 to 260 (the fold's owed_rows index entries, the row-count triggers, the walk's cursor row); the largest statement is the backlog gauge's index count. Re-run by lane D2-OWED-FOLD-2 (2026-10-25): unchanged (the turn order and the back-off move no statement of a first tick). Re-measured by lane D2-OWED-FOLD-4 (2026-10-26): reads 896 to 898, statements 313 to 314 (the second delta lens's D2-M1: the block-dated courier-only sweeps read first over idx_owed_rows_sweep, none on this seed, then the walk of at most 512 dated identities with one MIN seek each, turns only to those holding a due row)",
       "measured": {
-        "reads": 896,
+        "reads": 898,
         "writes": 260,
-        "stmts": 313,
+        "stmts": 314,
         "maxReads": 243,
         "calls": 16
       },
       "ceiling": {
-        "reads": 1344,
+        "reads": 1347,
         "writes": 390,
-        "stmts": 470,
+        "stmts": 471,
         "maxReads": 365,
         "calls": 24
       },
       "censusKey": null
     },
     "owed-belt-tick-429": {
-      "route": "POST /internal/owed-belt-tick: every courier answers 429; each rung closed after its first call, 8 candidates re-armed once at now + 300 s, no find. Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 709 to 266, writes 27 to 36, statements 17 to 29 (the walk, its per-identity due reads and the cursor row). Re-run by lane D2-OWED-FOLD-2 (2026-10-25): unchanged (the turn order and the back-off move no statement of a first tick)",
+      "route": "POST /internal/owed-belt-tick: every courier answers 429; each rung closed after its first call, 8 candidates re-armed once at now + 300 s, no find. Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 709 to 266, writes 27 to 36, statements 17 to 29 (the walk, its per-identity due reads and the cursor row). Re-run by lane D2-OWED-FOLD-2 (2026-10-25): unchanged (the turn order and the back-off move no statement of a first tick). Re-measured by lane D2-OWED-FOLD-4 (2026-10-26): reads 266 to 268, statements 29 to 30 (D2-M1's first-class read)",
       "measured": {
-        "reads": 266,
+        "reads": 268,
         "writes": 36,
-        "stmts": 29,
+        "stmts": 30,
         "maxReads": 228,
         "calls": 3
       },
       "ceiling": {
-        "reads": 399,
+        "reads": 402,
         "writes": 54,
-        "stmts": 44,
+        "stmts": 45,
         "maxReads": 342,
         "calls": 5
       },

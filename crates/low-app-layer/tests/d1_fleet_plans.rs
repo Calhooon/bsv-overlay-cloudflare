@@ -331,6 +331,8 @@ const OWED_893_PLANS: &[(&str, &str, &[&str])] = &[
     ("owed tipless rows", low_app_layer::owed_judge::MARK_UNTIPPED_SQL, &["idx_owed_rows_untipped"]),
     ("owed belt walk", low_app_layer::owed_belt::BELT_IDENTITIES_SQL, &["idx_owed_rows_belt_turn"]),
     ("owed belt due rows", low_app_layer::owed_belt::BELT_DUE_SQL, &["idx_owed_rows_belt_turn"]),
+    // the second delta lens's D2-M1: the block-dated courier-only sweeps first, on the tip's own scoped index
+    ("owed belt block-dated sweeps", low_app_layer::owed_belt::BELT_SWEEPS_DUE_SQL, &["idx_owed_rows_sweep"]),
     ("owed belt candidate", low_app_layer::owed_belt::CANDIDATES_SQL, &["sqlite_autoindex_owed_rows_1"]),
     ("owed belt gauge", low_app_layer::owed_belt::DUE_GAUGE_SQL, &["idx_owed_rows_belt"]),
     ("owed age repair", low_app_layer::owed_backfill::AGE_MARK_SQL, &["idx_owed_rows_judged", "idx_owed_dirty_source_key"]),
