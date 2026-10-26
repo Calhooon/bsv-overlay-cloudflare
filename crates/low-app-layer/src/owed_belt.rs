@@ -26,11 +26,10 @@ use serde_json::Value;
 use std::cell::RefCell;
 
 pub const OWED_BELT_TICK_MS: i64 = 120_000;
-/// A drain gets the same 17 s working wall on the alarm and scheduled pass. The alarm reserves the rest of its
-/// 27 s working wall for the courier tick; slow couriers cannot consume the dirty drain's reservation.
+/// A drain gets the same separate 17 s working wall on the alarm and scheduled pass. The alarm drains first,
+/// so the courier tick cannot consume the dirty drain's reservation.
 pub const OWED_DRAIN_WALL_MS: u64 = 20_000;
 pub const OWED_DRAIN_RESERVE_MS: u64 = 3_000;
-pub const OWED_ALARM_WALL_MS: u64 = 30_000;
 pub const OWED_BELT_OUTPOINTS_PER_TICK: usize = 8;
 pub const OWED_BELT_CALLS_PER_TICK: usize = 24;
 pub const OWED_BELT_CALLS_PER_OUTPOINT: usize = 3;
@@ -961,10 +960,9 @@ pub async fn drain_env(env: &worker::Env, repair_age: bool) -> worker::Result<ow
     }
 }
 
-/// The 120 s alarm: drain first under its own reservation, then give the courier tick the remaining wall. Its
-/// meter is returned and logged separately from the scheduled pass's durable row.
+/// The 120 s alarm: drain under its own reservation, then run the existing courier tick. Its meter is returned
+/// and logged separately from the scheduled pass's durable row.
 pub async fn alarm_env(env: &worker::Env) -> worker::Result<worker::Response> {
-    let deadline = crate::routes::worker_deadline(OWED_ALARM_WALL_MS, OWED_DRAIN_RESERVE_MS);
     let meter = crate::pass_meter::PassMeter::new(Box::new(|| worker::Date::now().as_millis()), 1);
     let drain = match meter.phase("owed.drain", drain_env(env, false)).await {
         Ok(report) => serde_json::json!({"subjects": report.subjects, "faults": report.faults.len()}),
@@ -973,18 +971,14 @@ pub async fn alarm_env(env: &worker::Env) -> worker::Result<worker::Response> {
             serde_json::json!({"error": error.to_string()})
         }
     };
-    let tick = match meter.phase("owed.belt_tick", deadline.run_reserving(tick_env(env))).await {
-        Some(Ok(report)) => serde_json::json!({
+    let tick = match meter.phase("owed.belt_tick", tick_env(env)).await {
+        Ok(report) => serde_json::json!({
             "candidates": report.candidates, "asked": report.asked, "found": report.found,
             "rearmed": report.rearmed, "calls": report.calls,
         }),
-        Some(Err(error)) => {
+        Err(error) => {
             worker::console_warn!("[owed-belt] tick faulted: {error}");
             serde_json::json!({"error": error})
-        }
-        None => {
-            worker::console_warn!("[owed-belt] tick reached its wall");
-            serde_json::json!({"error": "owed belt tick reached its wall"})
         }
     };
     let walls = meter.task_done().expect("one alarm task");

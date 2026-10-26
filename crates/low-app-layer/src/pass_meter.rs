@@ -7,7 +7,7 @@
 //! serves as `/health/invariants.appLayerScheduledPass`, so a beta window can read whether `/tip`'s latency rides the
 //! pass.
 //!
-//! The pass has four `wait_until` tasks: the pot drain, chain-event intake, tracker, and owed drain. Each phase is timed by
+//! The pass has five `wait_until` tasks: pot drain, chain-event intake, tracker, owed drain and owed backfill. Each phase is timed by
 //! [`PassMeter::phase`] and each task tells the meter it ended ([`PassMeter::task_done`]); the task that ends LAST
 //! writes the line and the row. Stated: a task the platform cancels never ends, so its pass writes nothing (the row's
 //! `at` then stays at the previous pass, which is the signal); a phase a deadline dropped is timed to the drop.
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(walls.phases_json(), r#"{"owed.belt_tick":10000,"owed.drain":17000}"#);
         let alarm = squash(include_str!("owed_belt.rs"));
         assert!(alarm.contains(".phase(\"owed.drain\",drain_env(env,false))"));
-        assert!(alarm.contains(".phase(\"owed.belt_tick\",deadline.run_reserving(tick_env(env)))"));
+        assert!(alarm.contains(".phase(\"owed.belt_tick\",tick_env(env))"));
     }
 
 }
