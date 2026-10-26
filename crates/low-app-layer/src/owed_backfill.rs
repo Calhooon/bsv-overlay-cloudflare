@@ -74,13 +74,13 @@ pub const STAMP_WRITE_SQL: &str =
 /// Risk 8.2's third repair: the oldest judged rows' subjects, by the judged index, coalesced on the dirty key. At most
 /// [`OWED_AGE_REMARKS_PER_PASS`] age marks are ever pending, and the drain judges them after every other mark
 /// (`owed_judge::drain_dirty`), so the repair fills the drain's idle room and never delays a source's mark.
-pub const AGE_MARK_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'age',identity,?2 FROM owed_rows r INDEXED BY idx_owed_rows_judged WHERE judgedAtMs<?1 AND gameId<>'' AND NOT EXISTS (SELECT 1 FROM owed_dirty d WHERE d.identity=r.identity AND d.gameId=r.gameId AND d.source='age') ORDER BY judgedAtMs LIMIT max(0,?3-(SELECT COUNT(*) FROM owed_dirty INDEXED BY idx_owed_dirty_source_marked WHERE source='age')) ON CONFLICT(identity,gameId,source,sourceKey) DO NOTHING";
+pub const AGE_MARK_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'age','age',?2 FROM owed_rows r INDEXED BY idx_owed_rows_judged WHERE judgedAtMs<?1 AND gameId<>'' AND NOT EXISTS (SELECT 1 FROM owed_dirty d WHERE d.identity=r.identity AND d.gameId=r.gameId AND d.source='age') ORDER BY judgedAtMs LIMIT max(0,?3-(SELECT COUNT(*) FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey='age' AND source='age')) ON CONFLICT(identity,gameId,source,sourceKey) DO NOTHING";
 
 /// The D2-OWED lens's MEDIUM-5: the subjects of KEYLESS rows (`judgedAtMs` NULL: an old worker's write in the deploy
 /// window, or a rollback to the old walk and forward again), marked `age` in the same room as [`AGE_MARK_SQL`]: run
 /// first in one batch, the two together never past [`OWED_AGE_REMARKS_PER_PASS`] pending. The judge rewrites each
 /// with its keys, so the set drains; a game no source names any more is judged away.
-pub const AGE_MARK_UNJUDGED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'age',identity,?1 FROM (SELECT DISTINCT r.identity,r.gameId FROM owed_rows r INDEXED BY idx_owed_rows_unjudged WHERE r.judgedAtMs IS NULL AND r.gameId<>'' AND NOT EXISTS (SELECT 1 FROM owed_dirty d WHERE d.identity=r.identity AND d.gameId=r.gameId AND d.source='age') LIMIT max(0,?2-(SELECT COUNT(*) FROM owed_dirty INDEXED BY idx_owed_dirty_source_marked WHERE source='age'))) WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO NOTHING";
+pub const AGE_MARK_UNJUDGED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'age','age',?1 FROM (SELECT DISTINCT r.identity,r.gameId FROM owed_rows r INDEXED BY idx_owed_rows_unjudged WHERE r.judgedAtMs IS NULL AND r.gameId<>'' AND NOT EXISTS (SELECT 1 FROM owed_dirty d WHERE d.identity=r.identity AND d.gameId=r.gameId AND d.source='age') LIMIT max(0,?2-(SELECT COUNT(*) FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey='age' AND source='age'))) WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO NOTHING";
 
 /// Where a pass stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -131,7 +131,7 @@ async fn read(db: &impl SqlPort, sql: &str, binds: Vec<Bind>) -> Result<Vec<Valu
 /// so a certified count at or past it holds them; pinned against the overlay's list (the app layer does not link the
 /// overlay, so the figure is this crate's). The deploy order is the window's (the D2-OWED lens's LOW-5): the overlay
 /// first, its certified count read on `/health` at or past this figure, then the app layer.
-pub const OWED_TRIGGERS_MIGRATION_COUNT: u32 = 406;
+pub const OWED_TRIGGERS_MIGRATION_COUNT: u32 = 407;
 
 /// The gate: the overlay certified a migration list that holds the triggers (the rows' marks) and the age index.
 pub fn gate_open(count: Option<f64>) -> bool {
@@ -397,6 +397,17 @@ pub async fn run_env(env: &worker::Env) -> Result<BackfillReport, String> {
 pub async fn lever(req: worker::Request, env: &worker::Env) -> worker::Result<worker::Response> {
     if !crate::internal_events::internal_bearer_ok(&req, env) {
         return worker::Response::error("unauthorized", 401);
+    }
+    // `?aged=1`: the drain's age repair alone (`mark_aged`, the D2-OWED lens's LOW-3: the tier runs it on local D1)
+    if req
+        .url()
+        .is_ok_and(|u| u.query_pairs().any(|(k, v)| k == "aged" && v == "1"))
+    {
+        let sql = crate::routes::D1Sql::of(env)?;
+        return match mark_aged(&sql).await {
+            Ok(aged) => worker::Response::from_json(&serde_json::json!({ "aged": aged })),
+            Err(e) => worker::Response::error(format!("owed age repair faulted: {e}"), 503),
+        };
     }
     match run_env(env).await {
         Ok(r) => worker::Response::from_json(&serde_json::json!({

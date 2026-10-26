@@ -625,12 +625,14 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 396 to 398 for #893 (lane D2-OWED-FOLD, the money lens's HIGH-1): `idx_owed_rows_sweep` (a tip dates the
 /// claimable sweeps judged below it) and `idx_owed_rows_untipped` (a tipless judgement re-marked on the next tip).
 /// 398 to 399 for #893 (lane D2-OWED-FOLD, HIGH-3): `idx_owed_rows_belt_turn`, the belt's round-robin by identity.
-/// 399 to 402 for #893 (lane D2-OWED-FOLD, MEDIUM-1): `owed_dirty` by source key, by (source, age) and by (identity,
-/// age), so no drain statement scans the fleet's marks.
-/// 402 to 403 for #893 (lane D2-OWED-FOLD, MEDIUM-5): `idx_owed_rows_unjudged`, the age repair's keyless rows.
-/// 403 to 406 for #893 (lane D2-OWED-FOLD, LOW-2): `idx_owed_rows_identity_game` and the two triggers that keep
+/// 399 to 401 for #893 (lane D2-OWED-FOLD, MEDIUM-1): `owed_dirty` by source key and by (identity, age), so no drain
+/// statement scans the fleet's marks.
+/// 401 to 402 for #893 (lane D2-OWED-FOLD, MEDIUM-5): `idx_owed_rows_unjudged`, the age repair's keyless rows.
+/// 402 to 405 for #893 (lane D2-OWED-FOLD, LOW-2): `idx_owed_rows_identity_game` and the two triggers that keep
 /// `owed_state.rows`, so a judge reads one game's rows and one state row.
-pub const OVERLAY_MIGRATION_COUNT: usize = 406;
+/// 405 to 407 for #893 (lane D2-OWED-FOLD): `idx_owed_dirty_marked` and `idx_owed_dirty_identity` dropped (no reader
+/// since MEDIUM-1; each cost every mark a write).
+pub const OVERLAY_MIGRATION_COUNT: usize = 407;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2373,12 +2375,13 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::derived_owed::UNTIPPED_INDEX,
     crate::derived_owed::BELT_TURN_INDEX,
     crate::derived_owed::DIRTY_SOURCE_KEY_INDEX,
-    crate::derived_owed::DIRTY_SOURCE_MARKED_INDEX,
     crate::derived_owed::DIRTY_IDENTITY_MARKED_INDEX,
     crate::derived_owed::UNJUDGED_INDEX,
     crate::derived_owed::ROWS_GAME_INDEX,
     crate::derived_owed::ROWS_COUNT_INSERT,
     crate::derived_owed::ROWS_COUNT_DELETE,
+    crate::derived_owed::DIRTY_MARKED_DROP,
+    crate::derived_owed::DIRTY_IDENTITY_DROP,
 ];
 
 // =============================================================================
