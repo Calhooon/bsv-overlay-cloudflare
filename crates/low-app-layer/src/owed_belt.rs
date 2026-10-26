@@ -12,8 +12,9 @@
 //! is ONE batch (`owed_judge::judge_with_write`): the probe memo with the tip it was taken at, the spender's bytes
 //! (content-addressed, DO NOTHING), a `proofmined:` or `homeproof:` latch when it checked, then the judge's rows for
 //! that subject, judged over the same facts supplied in memory. A fault rolls all of it back. A candidate no rung
-//! answered keeps its row and facts and is re-armed once at `now +` [`OWED_BELT_UNANSWERED_RETRY_MS`]; a find that
-//! changed nothing the row says doubles the row's period, to [`OWED_BELT_BACKOFF_MAX_MS`].
+//! answered keeps its row and facts and is re-armed once, waiting as long again as it has since its judgement
+//! ([`unanswered_period`]: at least [`OWED_BELT_UNANSWERED_RETRY_MS`]); a find that changed nothing the row says
+//! doubles the row's period, a moving tip included; both to [`OWED_BELT_BACKOFF_MAX_MS`] (the delta lens's D-L2).
 use crate::hops_view::{ChainSpendProbe, ProbeMemo};
 use crate::owed::{self, HomeSpendWord, HopChainWord, StoredSpenderBytes};
 use crate::owed_judge::{self, JudgeDb, Subject};
@@ -25,7 +26,8 @@ pub const OWED_BELT_TICK_MS: i64 = 120_000;
 pub const OWED_BELT_OUTPOINTS_PER_TICK: usize = 8;
 pub const OWED_BELT_CALLS_PER_TICK: usize = 24;
 pub const OWED_BELT_CALLS_PER_OUTPOINT: usize = 3;
-/// A candidate no rung answered (every rung faulted, rate-limited or closed) is looked at again this much later.
+/// A candidate no rung answered (every rung faulted, rate-limited or closed) is looked at again at least this much
+/// later; each further unanswered look doubles it ([`unanswered_period`]).
 pub const OWED_BELT_UNANSWERED_RETRY_MS: i64 = 300_000;
 /// A look that changed nothing (the D2-OWED lens's HIGH-3) doubles its row's period, to this ceiling (6 h). The
 /// judge's own dating (a source write, a tip) starts it again at the family's base period.
@@ -658,12 +660,13 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
     Ok(report)
 }
 
-/// What a look can change about a row: its family, its words of the claim, the chain's word, the tip it was judged at.
-fn look_shape(family: &str, facts: &Value, reason: Option<&str>, probe_tip: Option<i64>) -> Value {
+/// What a look can change about a row: its family, its words of the claim, the chain's word. NOT the tip it was judged
+/// at (the delta lens's D-L2): the find's judge stamps the present tip, so a look spanning a block read as a change and
+/// reset the period on every block, and the 6 h ceiling was reached only on a still chain.
+fn look_shape(family: &str, facts: &Value, reason: Option<&str>) -> Value {
     serde_json::json!([
         family,
         reason,
-        probe_tip,
         facts["claim"],
         facts["claimable"],
         facts["chainProbe"],
@@ -709,12 +712,11 @@ async fn backoff(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickRe
         .as_str()
         .and_then(|f| serde_json::from_str(f).ok())
         .unwrap_or(Value::Null);
-    let before = look_shape(&c.family, &c.facts, c.reason.as_deref(), c.probe_tip);
+    let before = look_shape(&c.family, &c.facts, c.reason.as_deref());
     let now_shape = look_shape(
         row["family"].as_str().unwrap_or_default(),
         &facts,
         row["reason"].as_str(),
-        row["probeTip"].as_i64(),
     );
     if before != now_shape {
         return;
@@ -734,13 +736,23 @@ async fn backoff(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickRe
     }
 }
 
+/// The next look of a row no rung answered (the delta lens's D-L2: it re-armed at a fixed 300 s for ever): it waits
+/// as long again as it has gone since its last judgement, at least [`OWED_BELT_UNANSWERED_RETRY_MS`] and at most
+/// [`OWED_BELT_BACKOFF_MAX_MS`]. No judge runs on an unanswered look, so `judgedAtMs` stays and each unanswered look
+/// doubles the period (300 s, 600 s, 1,200 s, ... to 6 h); the judge's own dating starts it again.
+pub fn unanswered_period(now: i64, judged_at_ms: Option<i64>) -> i64 {
+    judged_at_ms
+        .map_or(0, |j| now.saturating_sub(j))
+        .clamp(OWED_BELT_UNANSWERED_RETRY_MS, OWED_BELT_BACKOFF_MAX_MS)
+}
+
 async fn rearm(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickReport) {
     let stmt = Stmt {
         sql: REARM_SQL.into(),
         binds: vec![
             Bind::Text(c.identity.clone()),
             Bind::Text(c.outpoint.clone()),
-            Bind::Int(now + OWED_BELT_UNANSWERED_RETRY_MS),
+            Bind::Int(now + unanswered_period(now, c.judged_at_ms)),
         ],
     };
     match db.run_batch(vec![stmt]).await {
