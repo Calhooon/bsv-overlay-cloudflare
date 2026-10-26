@@ -68,11 +68,11 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..349]), 428_073_086);
     // The count and fingerprint the overlay certifies (moved by lane D2-OWED-FOLD's appended indexes, then by
     // D2-OWED-FOLD-3's in-place scope of `idx_owed_rows_sweep`, then by D2-OWED-FOLD-5's in-place `owed_dirty.downgrade`
-    // and the triggers' classes, then the sweep index's key).
+    // and the triggers' classes, then the sweep index's key, then D2-OWED-FOLD-6's in-place class of a pot's admission).
     const COUNT: usize = 407;
     assert_eq!(OVERLAY_MIGRATIONS.len(), COUNT);
     assert_eq!(d1::OVERLAY_MIGRATION_COUNT, COUNT);
-    const FINGERPRINT: u32 = 2_009_384_664;
+    const FINGERPRINT: u32 = 1_860_122_119;
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT, "the certified fingerprint");
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT);
     assert_eq!(fingerprint(OVERLAY_MIGRATIONS), FINGERPRINT);
