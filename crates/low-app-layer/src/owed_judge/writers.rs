@@ -5,11 +5,17 @@ use super::*;
 /// 2.1, the tip row): `gateHeight BETWEEN tip - 6 AND tip`, so a row past its gate long ago is never re-marked at
 /// every block (the D2-OWED lens's HIGH-2); a gate the tip skipped is judged by its own source write or the age repair.
 pub const MARK_TIP_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'tip','gate',?2 FROM owed_rows INDEXED BY idx_owed_rows_gate WHERE gateHeight BETWEEN ?1-6 AND ?1 GROUP BY identity,gameId ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
-/// The design's tip row for a claimable sweep (the D2-OWED lens's HIGH-1): judged below the new tip, it is due at the
-/// belt NOW, so its probe is re-taken first; the read degrades it until then (`Snapshot::body`). A judgement with no
-/// tip stores no claimable sweep (TIP-877's end-of-derive degrade), and an old worker's row has no `claimable`
-/// column, so neither is in the partial index; the read withholds both.
-pub const DATE_SWEEPS_SQL: &str = "UPDATE owed_rows INDEXED BY idx_owed_rows_sweep SET beltDueAtMs=?2 WHERE family='hop-stranded' AND claimable=1 AND probeTip<?1 AND (beltDueAtMs IS NULL OR beltDueAtMs>?2)";
+/// The design's tip row for a claimable sweep (the D2-OWED lens's HIGH-1), narrowed by the delta lens's D-H1 (the
+/// captain's ruling): only a sweep whose press rests on a COURIER probe alone (the hop's index status, the stored
+/// fact `status`, is not `unspent`) is due at the belt NOW when judged below the new tip; the read degrades it until
+/// its look (`Snapshot::body`). An index-UNSPENT sweep is pressable on the index's own word (main's #669b and #808
+/// (b) rule), so a block neither withholds it nor dates it: it keeps the belt's own back-off cadence and its look is
+/// a downgrade only. Re-dating every claimable sweep at every block let K strangers' own sweeps fill the belt's 8
+/// looks a tick fleet-wide. A judgement with no tip stores no claimable sweep (TIP-877's end-of-derive degrade), and
+/// an old worker's row has no `claimable` column, so neither is in the partial index; the read withholds both. Cost:
+/// the partial index's range below the tip, each row's `facts` read for its status (the stated ceiling,
+/// `owed-tip-mark`); written rows are the courier-dependent ones only.
+pub const DATE_SWEEPS_SQL: &str = "UPDATE owed_rows INDEXED BY idx_owed_rows_sweep SET beltDueAtMs=?2 WHERE family='hop-stranded' AND claimable=1 AND probeTip<?1 AND (beltDueAtMs IS NULL OR beltDueAtMs>?2) AND json_extract(facts,'$.status') IS NOT 'unspent'";
 /// A row judged with no chain tip (TIP-877: its tip-dependent claims withheld, `tipUnknown`) is re-judged on the next
 /// tip; bounded per tip, the rest left to the next tip and the age repair.
 pub const MARK_UNTIPPED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'tip','untipped',?1 FROM (SELECT DISTINCT identity,gameId FROM owed_rows INDEXED BY idx_owed_rows_untipped WHERE probeTip IS NULL LIMIT ?2) WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";

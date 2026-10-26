@@ -166,8 +166,16 @@ impl Snapshot {
                 // bsv-low #669 (the D2-OWED lens's HIGH-1): the read-time freshness gate, per row. A claimable sweep
                 // rests on the tip it was judged at (`probeTip`; NULL is unknown); a block since, or a present tip that
                 // cannot be read, degrades it IN THE SERVED BODY to a pending chain-wait, never a dead sweep.
+                // The delta lens's D-H1: an index-UNSPENT sweep keeps its press, the move stated
+                // (`owed::state_index_unspent_sweep`); only a press resting on a courier probe alone is degraded.
                 let mut reason = joined["reason"].as_str().map(str::to_owned);
-                if joined["family"] == owed::OwedFamily::HopStranded.as_str()
+                let is_sweep = joined["family"] == owed::OwedFamily::HopStranded.as_str();
+                if is_sweep
+                    && !owed::state_index_unspent_sweep(
+                        &mut facts,
+                        number(&joined["probeTip"]),
+                        present_tip,
+                    )
                     && facts["claimable"] == Value::Bool(true)
                 {
                     let mut one = [owed::OwedRow {
