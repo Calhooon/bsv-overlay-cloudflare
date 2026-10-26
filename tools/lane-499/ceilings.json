@@ -76,17 +76,17 @@
       "censusKey": "/owed"
     },
     "owed-judge-filing": {
-      "route": "POST /record?kind=potrefund: the verified filing core, with both seats judged in the source batch on the shared fleet plus the 250-result/270-hop fixture",
+      "route": "POST /record?kind=potrefund: the verified filing core, with both seats judged in the source batch on the shared fleet plus the 250-result/270-hop fixture. Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 118 to 126, writes 36 to 42, statements 59 to 61 (the fold's owed_rows indexes on each row written; the state row created once and stamped, LOW-2)",
       "measured": {
-        "reads": 118,
-        "writes": 36,
-        "stmts": 59,
+        "reads": 126,
+        "writes": 42,
+        "stmts": 61,
         "maxReads": 7
       },
       "ceiling": {
-        "reads": 177,
-        "writes": 38,
-        "stmts": 61,
+        "reads": 189,
+        "writes": 63,
+        "stmts": 92,
         "maxReads": 11
       },
       "censusKey": null
@@ -365,53 +365,53 @@
       "censusKey": null
     },
     "owed-belt-tick": {
-      "route": "POST /internal/owed-belt-tick: one belt tick over the READ lane's fleet seed (the lived-in identity, 500 judged rows) with every belt date an hour back; WoC 404, BananaBlocks unspent: 8 finds, each one judge batch (bsv-low #893 section 5). The rows are the judge's commit over a 500-row identity (the 500-row cap DELETE, the per-game DELETE, the owed_state COUNT), about 2,100 a find",
+      "route": "POST /internal/owed-belt-tick: one belt tick over the READ lane's fleet seed (the lived-in identity, 500 judged rows) with every belt date an hour back; WoC 404, BananaBlocks unspent: 8 finds, each one judge batch (bsv-low #893 section 5). Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 17,223 to 896 (LOW-2's commit: the per-game delete on the game index, one state row, the ceiling joined from it; HIGH-3's walk of at most 64 identities, never the due set), writes 162 to 260 (the fold's owed_rows index entries, the row-count triggers, the walk's cursor row); the largest statement is the backlog gauge's index count",
       "measured": {
-        "reads": 17223,
-        "writes": 162,
-        "stmts": 270,
-        "maxReads": 1001,
+        "reads": 896,
+        "writes": 260,
+        "stmts": 313,
+        "maxReads": 243,
         "calls": 16
       },
       "ceiling": {
-        "reads": 25835,
-        "writes": 243,
-        "stmts": 405,
-        "maxReads": 1502,
+        "reads": 1344,
+        "writes": 390,
+        "stmts": 470,
+        "maxReads": 365,
         "calls": 24
       },
       "censusKey": null
     },
     "owed-belt-tick-429": {
-      "route": "POST /internal/owed-belt-tick: every courier answers 429; each rung closed after its first call, 8 candidates re-armed once at now + 300 s, no find",
+      "route": "POST /internal/owed-belt-tick: every courier answers 429; each rung closed after its first call, 8 candidates re-armed once at now + 300 s, no find. Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 709 to 266, writes 27 to 36, statements 17 to 29 (the walk, its per-identity due reads and the cursor row)",
       "measured": {
-        "reads": 709,
-        "writes": 27,
-        "stmts": 17,
-        "maxReads": 469,
+        "reads": 266,
+        "writes": 36,
+        "stmts": 29,
+        "maxReads": 228,
         "calls": 3
       },
       "ceiling": {
-        "reads": 1064,
-        "writes": 41,
-        "stmts": 26,
-        "maxReads": 704,
-        "calls": 4
+        "reads": 399,
+        "writes": 54,
+        "stmts": 44,
+        "maxReads": 342,
+        "calls": 5
       },
       "censusKey": null
     },
     "owed-backfill-pass": {
-      "route": "POST /internal/owed-backfill-pass: the owed-v2 backfill over the READ lane's fleet seed turned back into an old worker's rows (no keys, no state, no marks): two identities, the lived-in seat's 270 games in 17 judge batches of 16 and the one-game wanted identity in one, the cursor saved after each, the stamp with the last save, one pass (bsv-low #893 section 6.1). About 2,970 rows a batch: the judge's commit over a 500-row identity (the cap DELETE, the per-game DELETE, the owed_state COUNT) and its hydration",
+      "route": "POST /internal/owed-backfill-pass: the owed-v2 backfill over the READ lane's fleet seed turned back into an old worker's rows (no keys, no state, no marks): two identities, the lived-in seat's 270 games in 17 judge batches of 16 and the one-game wanted identity in one, the cursor saved after each, the stamp with the last save, one pass (bsv-low #893 section 6.1). Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 53,424 to 25,591 (LOW-2: the per-game delete on idx_owed_rows_identity_game, the state row counted once, the ceiling joined from it), writes 5,575 to 7,344 (the fold's owed_rows index entries and the two row-count triggers)",
       "measured": {
-        "reads": 53424,
-        "writes": 5575,
-        "stmts": 3062,
+        "reads": 25591,
+        "writes": 7344,
+        "stmts": 3097,
         "maxReads": 1291
       },
       "ceiling": {
-        "reads": 80136,
-        "writes": 8363,
-        "stmts": 4593,
+        "reads": 38387,
+        "writes": 11016,
+        "stmts": 4646,
         "maxReads": 1937
       },
       "censusKey": null
@@ -429,6 +429,22 @@
         "writes": 0,
         "stmts": 1,
         "maxReads": 1
+      },
+      "censusKey": null
+    },
+    "owed-age-remark": {
+      "route": "POST /internal/owed-backfill-pass?aged=1 (lane D2-OWED-FOLD, the lens's LOW-3 and MEDIUM-5): the drain's age repair on local D1 after the backfill, every judged row aged a day and ten turned keyless: the keyless subjects first, then the aged, 128 rows' subjects (73 here) under the 128 pending bound",
+      "measured": {
+        "reads": 286,
+        "writes": 296,
+        "stmts": 3,
+        "maxReads": 265
+      },
+      "ceiling": {
+        "reads": 429,
+        "writes": 444,
+        "stmts": 5,
+        "maxReads": 398
       },
       "censusKey": null
     }
