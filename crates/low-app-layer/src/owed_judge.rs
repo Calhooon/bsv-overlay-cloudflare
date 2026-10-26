@@ -701,9 +701,11 @@ pub async fn refund_subjects(
         .collect())
 }
 
+// One unit, milliseconds (the delta lens's D-L3): the party rows' `createdAt` is seconds, `evictedAt` (the eviction
+// pass's `now_ms`) and `updatedAtMs` are milliseconds; mixed, a game with a released hop always sorted newest.
 macro_rules! identity_games {
     () => {
-        "SELECT gameId,MAX(at) AS at FROM (SELECT gameId,createdAt AS at FROM potparty_records WHERE identity=?1 UNION ALL SELECT gameId,createdAt FROM hopparty_records WHERE identity=?1 UNION ALL SELECT gameId,evictedAt FROM released_hop_evidence WHERE identity=?1 UNION ALL SELECT gameId,updatedAtMs/1000 FROM owed_rows WHERE identity=?1) WHERE gameId<>'' GROUP BY gameId ORDER BY at DESC,gameId"
+        "SELECT gameId,MAX(at) AS at FROM (SELECT gameId,createdAt*1000 AS at FROM potparty_records WHERE identity=?1 UNION ALL SELECT gameId,createdAt*1000 FROM hopparty_records WHERE identity=?1 UNION ALL SELECT gameId,evictedAt FROM released_hop_evidence WHERE identity=?1 UNION ALL SELECT gameId,updatedAtMs FROM owed_rows WHERE identity=?1) WHERE gameId<>'' GROUP BY gameId ORDER BY at DESC,gameId"
     };
 }
 /// Expand the one wanted envelope to durable game marks: the newest [`OWED_WANTED_GAMES`] games `wanted`, the rest
