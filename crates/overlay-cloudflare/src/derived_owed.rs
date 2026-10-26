@@ -23,9 +23,9 @@ pub const ROW_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_row_words (i
 /// Coalesced dirty subjects. Generation aliases an AUTOINCREMENT rowid that is never reused after a drain.
 /// A re-mark advances it, so a judge acknowledging `generation <= seen` leaves newer work pending.
 /// `downgrade` is the mark's CLASS (the third delta lens's D3-L1): 1 when the write may take a press away (the index
-/// recording a spend, a pot row deleted, an eviction), the only marks the read withholds a press over; a re-mark keeps
-/// the larger class until the judge acknowledges it. Edited in place: the table has shipped nowhere (beta and prod
-/// certify 349).
+/// recording a spend, a pot row admitted or deleted, an eviction), the only marks the read withholds a press over; a
+/// re-mark keeps the larger class until the judge acknowledges it. Edited in place: the table has shipped nowhere
+/// (beta and prod certify 349).
 pub const DIRTY_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_dirty (generation INTEGER PRIMARY KEY AUTOINCREMENT, identity TEXT NOT NULL, gameId TEXT NOT NULL, source TEXT NOT NULL, sourceKey TEXT NOT NULL, markedAtMs INTEGER NOT NULL, downgrade INTEGER NOT NULL DEFAULT 0, UNIQUE (identity, gameId, source, sourceKey))";
 /// Evidence written beside an eviction's released spends, one identity per released hop.
 pub const RELEASED_HOP_EVIDENCE_CREATE: &str = "CREATE TABLE IF NOT EXISTS released_hop_evidence (hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, identity TEXT NOT NULL, gameId TEXT NOT NULL, potTxid TEXT NOT NULL, seatSettlePubkey TEXT NOT NULL, hopSats INTEGER NOT NULL, evictedAt INTEGER NOT NULL, PRIMARY KEY (hopTxid, hopVout, identity))";
@@ -101,7 +101,8 @@ pub const ROW_DELETE: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_delete_word
 // SQLite assigns the attempted insert a fresh AUTOINCREMENT value before checking the unique key;
 // keep excluded.generation and the newest mark's fields so an in-flight judge cannot erase the re-mark.
 // The mark's class (`downgrade`, D3-L1) is an expression over the row: "0" for every source but the pot's spend
-// columns, its delete and the eviction; a re-mark keeps the larger class (MAX), so a stamp after a spend leaves it.
+// columns, its admission (D4-L1), its delete and the eviction; a re-mark keeps the larger class (MAX), so a stamp
+// after a spend leaves it.
 macro_rules! mark {
     ($source:literal, $key:expr, $at:expr, $subjects:expr) => {
         mark!(class "0", $source, $key, $at, $subjects, " WHERE 1")
@@ -194,14 +195,11 @@ macro_rules! pot_mark {
     };
 }
 
-/// Admission, including the INSERT arm of store_record's UPSERT: a downgrade only when the row arrives spent (a
-/// readmission restoring a recorded spend).
-pub const POT_INSERT: &str = trigger!(
-    "pot_records",
-    insert,
-    "INSERT",
-    pot_mark!("NEW", "COALESCE(NEW.spent,0)<>0")
-);
+/// Admission, including the INSERT arm of store_record's UPSERT: always a downgrade (the fourth delta lens's D4-L1, the
+/// ruling): a new pot row is a spend of its inputs, so a JOIN admitted withholds its seats' sweep presses of the hops
+/// it consumed until the judge reads them, a readmission restoring a recorded spend too. A pot row is inserted once a
+/// game, so the withheld moment costs nothing an honest seat can press.
+pub const POT_INSERT: &str = trigger!("pot_records", insert, "INSERT", pot_mark!("NEW", "1"));
 /// Spend, reorg, classification and the UPDATE arm of admission. Both keys are covered if moved. A downgrade only when
 /// a spend column changed (the index recording, moving or clearing a spender) or the key moved; a stamp, a facts fill
 /// or a re-present that leaves the spend columns as they were is a plain mark (D3-L1).
