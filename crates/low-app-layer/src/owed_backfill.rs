@@ -1311,13 +1311,17 @@ mod tests {
             .unwrap();
         let handed = cron.find(&squash("ctx.wait_until(backfill);")).unwrap();
         assert!(tick < handed, "handed after the tracker's task");
-        let aged = cron
-            .find(&squash("owed_backfill::mark_aged(&judge).await"))
+        assert!(cron.contains(&squash("let work = owed_belt::drain(&env_owed);")));
+        let actor = squash(include_str!("board_view.rs"));
+        assert!(actor.contains(&squash("crate::owed_belt::drain_env(&self.env, true).await")));
+        let belt = squash(include_str!("owed_belt.rs"));
+        let aged = belt
+            .find(&squash("if repair_age { if let Err(error) = crate::owed_backfill::mark_aged(&judge).await"))
             .unwrap();
-        let drain = cron
+        let drain = belt
             .find(&squash("owed_judge::drain_dirty(&judge,"))
             .unwrap();
-        assert!(aged < drain, "the age re-mark precedes the drain");
+        assert!(aged < drain, "the scheduled actor turn re-marks age before draining");
         assert!(lib.contains(&squash(
             "req.path() == \"/internal/owed-backfill-pass\" { return owed_backfill::lever(req, &env).await; }"
         )));
