@@ -401,19 +401,19 @@
       "censusKey": null
     },
     "owed-tip-mark": {
-      "route": "POST /internal/tip-changed at the seed's tip + 1, after the belt's cells, over the READ lane's fleet seed plus the delta lens's D-H1 shape planted (1,000 strangers' index-unspent claimable sweeps and 40 courier-dependent ones, judged at the seed's tip, belt dates an hour ahead): the gate window marked, the 40 dated due now and the 1,000 not, the tipless rows re-marked, nothing judged, no courier call (lane D2-OWED-FOLD-2, 2026-10-25). The date's range scan reads every claimable sweep judged below the tip (1,040); it writes the courier-dependent ones only. On d521888f the same cell wrote 3,120 and dated all 1,040 (RED)",
+      "route": "POST /internal/tip-changed at the seed's tip + 1, after the belt's cells, over the READ lane's fleet seed plus the delta lens's D-H1 shape planted (1,000 strangers' index-unspent claimable sweeps and 40 courier-dependent ones, judged at the seed's tip, belt dates an hour ahead): the gate window marked, the 40 dated due now and the 1,000 not, the tipless rows re-marked, nothing judged, no courier call (lane D2-OWED-FOLD-2, 2026-10-25). Since D2-OWED-FOLD-3 (2026-10-26) `idx_owed_rows_sweep` carries the date statement's own status term, so the date reads only the 40 rows it writes (maxReads 40) and no index-unspent sweep; on 8396f8b2 it read every claimable sweep judged below the tip (reads 1,052, maxReads 1,040: RED under this ceiling). On d521888f the same cell wrote 3,120 and dated all 1,040 (RED)",
       "measured": {
-        "reads": 1052,
+        "reads": 52,
         "writes": 120,
         "stmts": 4,
-        "maxReads": 1040,
+        "maxReads": 40,
         "calls": 0
       },
       "ceiling": {
-        "reads": 1578,
+        "reads": 78,
         "writes": 180,
         "stmts": 6,
-        "maxReads": 1560,
+        "maxReads": 60,
         "calls": 0
       },
       "censusKey": null
