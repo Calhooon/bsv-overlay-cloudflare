@@ -994,7 +994,7 @@ async fn lens_l2_the_reorg_window_is_exact_at_both_edges() {
     assert_eq!(row.state().cursor, "41");
 }
 
-/// LENS L3 (the invalidated window): with chaintracks' tip at 1000 an `invalidated` selects 856..=1000. A refuted row
+/// LENS L3 (the invalidated window): with chaintracks' tip at 1000 an `invalidated` selects 856..=1144 (#896). A refuted row
 /// at 856 is demoted; a refuted row at 855, one deeper than `INVALIDATED_DEPTH`, is not examined and keeps its
 /// confirmation (the stated limit: deeper is the operator's `/internal/reorg`, or the `reorg` event that follows an
 /// invalidation that moves the tip).
@@ -1013,6 +1013,35 @@ async fn lens_l3_an_invalidation_145_deep_is_not_examined() {
     assert!(!store.pot_beef_proof_verified(&inside).await.unwrap(), "856 = tip - 144: judged, demoted");
     assert!(store.pot_beef_proof_verified(&deeper).await.unwrap(), "855 = tip - 145: not examined");
     assert_eq!(INVALIDATED_DEPTH, 144);
+}
+
+/// bsv-low #896: the tracker's tip is chaintracks' VERIFIED header, which an invalidation of its own tip header
+/// lowers: with the verified tip now at 1000, a row anchored at 1001 rests on the invalidated header and is judged
+/// (demoted, its root no longer served); so is one at 1000 + `INVALIDATED_ABOVE_TIP`; one past it is not examined.
+/// RED on 8e5e73f7 (the window closed at the tip): `left: (1, 1, 1) right: (1, 3, 3)`, the rows above the tip never
+/// examined.
+#[tokio::test]
+async fn e896_c_an_invalidated_window_reaches_the_rows_above_the_verified_tip() {
+    let store = MemoryPotStorage::new();
+    let tracker = Roots::at(1000);
+    let at_tip = confirmed_pot_with_stored_proof(&store, &pot(30), 1000).await;
+    let invalidated_tip = confirmed_pot_with_stored_proof(&store, &pot(31), 1001).await;
+    let at_top = confirmed_pot_with_stored_proof(&store, &pot(32), 1144).await;
+    let past_top = confirmed_pot_with_stored_proof(&store, &pot(33), 1145).await;
+    let feed = Journal::of(&[(41, INVALIDATED)]);
+    let row = Row::default();
+    let txs = MemoryTxStore::default();
+    let ladder = CourierStub::none();
+    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    assert_eq!((s.applied, s.spenders.scanned, s.demoted()), (1, 3, 3), "{s:?}");
+    assert!(!store.pot_beef_proof_verified(&at_tip).await.unwrap(), "1000, the verified tip: judged");
+    assert!(
+        !store.pot_beef_proof_verified(&invalidated_tip).await.unwrap(),
+        "1001, the invalidated header above the verified tip: judged, demoted"
+    );
+    assert!(!store.pot_beef_proof_verified(&at_top).await.unwrap(), "1144 = tip + 144: judged");
+    assert!(store.pot_beef_proof_verified(&past_top).await.unwrap(), "1145: not examined");
+    assert_eq!(INVALIDATED_ABOVE_TIP, 144);
 }
 
 /// LENS L4 (both consumers on one deployment in one tick): the feed applies the reorg at 101 (the refuted row
