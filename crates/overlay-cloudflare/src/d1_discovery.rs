@@ -1725,7 +1725,7 @@ pub(crate) const POT_UNSPENT_BY_OUTPOINTS_MAX: usize = 20;
 
 /// The examine stamp (`note_spend_discovery_attempt`): a const so the
 /// real-SQLite tier runs the shipped string against the shipped schema.
-pub(crate) const POT_SPEND_DISCOVERY_STAMP_SQL: &str =
+pub const POT_SPEND_DISCOVERY_STAMP_SQL: &str =
     "UPDATE pot_records SET spendDiscoveryAt = unixepoch() WHERE txid = ? AND outputIndex = ?";
 
 pub(crate) fn pot_spent_unconfirmed_sql(limit: u64, min_age_secs: u64) -> String {
