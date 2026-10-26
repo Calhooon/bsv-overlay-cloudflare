@@ -639,7 +639,7 @@ fn paths(f: &Fixture) -> Result<(), String> {
         marks("sweep", "filed:sweep", &["alice"]),
     )?;
     f.execute(
-        owed::OWED_ROW_INSERT_SQL,
+        "INSERT INTO owed_rows (identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         vec![
             "alice".to_string().into(),
             "pot:0".to_string().into(),

@@ -115,17 +115,13 @@ fn hot_routes_never_scan_fleet_tables() {
             low_app_layer::refund_backups::refund_backups_sql(None),
         ),
         (
-            "owed recompute spenders",
-            low_app_layer::owed::covenant_spenders_sql(16),
-        ),
-        (
-            "owed recompute backups",
+            "owed judge backups",
             low_app_layer::owed::valid_refunds_sql(16),
         ),
         // bsv-low #831: the paired hydration carries the funding latch's two PK probes (`fundingHeld`)
         (
-            "owed recompute paired hydration",
-            low_app_layer::owed_cursor::hydrate_party_pair_sql(),
+            "owed judge paired hydration",
+            low_app_layer::owed_judge::rank::hydrate_party_pair_sql(),
         ),
         // bsv-low #642: every statement `/leaderboard:view` runs, at the chunk bound.
         (
@@ -525,48 +521,47 @@ fn values(db: &Connection, sql: &str, binds: &[rusqlite::types::Value]) -> Vec<s
     .collect()
 }
 
-fn cursor_candidates(
-    db: &Connection,
-    sources: &[low_app_layer::owed_cursor::Source],
-) -> Vec<serde_json::Value> {
-    use low_app_layer::owed_cursor::{candidates_sql, Cursor, PAGE};
+/// The judge's candidate reads (`owed_judge::PARTIES_SQL` and `LINKS_SQL`, or `HOPS_SQL`) over every game of the
+/// whale, as its hydration runs them: no fullscan of any fleet source.
+fn judge_candidates(db: &Connection, hops: bool) -> Vec<serde_json::Value> {
     use rusqlite::types::Value;
+    let games: Vec<String> = db
+        .prepare("SELECT gameId FROM potparty_records WHERE identity=?1 UNION SELECT gameId FROM hopparty_records WHERE identity=?1")
+        .unwrap()
+        .query_map([d1_fleet::WHALE], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let binds = [
+        Value::Text(d1_fleet::WHALE.into()),
+        Value::Text(serde_json::to_string(&games).unwrap()),
+    ];
+    let sqls: &[&str] = if hops {
+        &[low_app_layer::owed_judge::HOPS_SQL]
+    } else {
+        &[
+            low_app_layer::owed_judge::PARTIES_SQL,
+            low_app_layer::owed_judge::LINKS_SQL,
+        ]
+    };
     let mut all = Vec::new();
-    for source in sources {
-        for _ in 0..1 {
-            let mut cursor = Cursor::default();
-            loop {
-                let (nulls, seek) = cursor.phase();
-                let sql = candidates_sql(*source, nulls, seek, cursor.next_stamp);
-                let mut binds = vec![Value::Text(d1_fleet::WHALE.into())];
-                if seek {
-                    binds.extend(cursor.bind_numbers(nulls).into_iter().map(Value::Integer));
-                }
-                let page = values(db, &sql, &binds);
-                assert!(page.len() <= PAGE);
-                // A bound applies before all keyed joins; no fullscan of any fleet source.
-                for detail in plan(db, &sql) {
-                    assert!(
-                        !detail.starts_with("SCAN pot")
-                            && !detail.starts_with("SCAN hp")
-                            && !detail.starts_with("SCAN hop"),
-                        "{detail}"
-                    );
-                }
-                let more = cursor.advance(&page, nulls);
-                all.extend(page);
-                if !more {
-                    break;
-                }
-            }
+    for sql in sqls {
+        for detail in plan(db, sql) {
+            assert!(
+                !detail.starts_with("SCAN pot")
+                    && !detail.starts_with("SCAN hp")
+                    && !detail.starts_with("SCAN hop"),
+                "{detail}"
+            );
         }
+        all.extend(values(db, sql, &binds));
     }
     all
 }
 
 #[test]
-fn created_at_cursor_union_equals_unpaged_ranked_views_byte_for_byte() {
-    use low_app_layer::owed_cursor::{self, Source};
+fn the_judges_selection_equals_the_unpaged_ranked_views_byte_for_byte() {
+    use low_app_layer::owed_judge::rank;
     use rusqlite::types::Value;
     let db = fixture();
     // Include NULL/equal stamps, replay representatives and all validity tiers.
@@ -586,15 +581,15 @@ fn created_at_cursor_union_equals_unpaged_ranked_views_byte_for_byte() {
         };
         db.execute_batch(&format!("UPDATE pot_records SET createdAt={pot_stamp} WHERE txid='{pot}'; UPDATE potparty_records SET createdAt={marker_stamp},sigValid=1 WHERE potTxid='{pot}';")).unwrap();
     }
-    let candidates = cursor_candidates(&db, &[Source::Party, Source::Link]);
-    let hop_candidates = cursor_candidates(&db, &[Source::Hop]);
+    let candidates = judge_candidates(&db, false);
+    let hop_candidates = judge_candidates(&db, true);
     for era in [
         Some(1_790_000_000_000),
         None,
         Some(1_790_000_000_001),
         Some(1_789_999_999_000),
     ] {
-        let selected = owed_cursor::select(candidates.clone(), era, 10);
+        let selected = rank::select(candidates.clone(), era, 10);
         if era == Some(1_790_000_000_000) {
             let included: Vec<_> = pots
                 .iter()
@@ -619,10 +614,10 @@ fn created_at_cursor_union_equals_unpaged_ranked_views_byte_for_byte() {
             }
             let expected = values(&db, &unpaged, &binds);
             let mut got = Vec::new();
-            for page in selected.chunks(owed_cursor::PAGE) {
+            for page in selected.chunks(rank::PAGE) {
                 got.extend(values(
                     &db,
-                    &owed_cursor::hydrate_sql(&original),
+                    &rank::hydrate_sql(&original),
                     &[Value::Text(serde_json::to_string(page).unwrap())],
                 ));
             }
@@ -632,10 +627,10 @@ fn created_at_cursor_union_equals_unpaged_ranked_views_byte_for_byte() {
                 "party era {era:?}"
             );
             let mut paired = Vec::new();
-            for page in selected.chunks(owed_cursor::PAGE) {
+            for page in selected.chunks(rank::PAGE) {
                 paired.extend(values(
                     &db,
-                    &owed_cursor::hydrate_party_pair_sql(),
+                    &rank::hydrate_party_pair_sql(),
                     &[Value::Text(serde_json::to_string(page).unwrap())],
                 ));
             }
@@ -668,12 +663,12 @@ fn created_at_cursor_union_equals_unpaged_ranked_views_byte_for_byte() {
             binds.push(Value::Integer(era));
         }
         let expected = values(&db, &unpaged, &binds);
-        let selected = owed_cursor::select_hops(hop_candidates.clone(), era, 1_790_000_000);
+        let selected = rank::select_hops(hop_candidates.clone(), era, 1_790_000_000);
         let mut got = Vec::new();
-        for page in selected.chunks(owed_cursor::PAGE) {
+        for page in selected.chunks(rank::PAGE) {
             got.extend(values(
                 &db,
-                &owed_cursor::hydrate_hops_sql(),
+                &rank::hydrate_hops_sql(),
                 &[Value::Text(serde_json::to_string(page).unwrap())],
             ));
         }
@@ -683,29 +678,6 @@ fn created_at_cursor_union_equals_unpaged_ranked_views_byte_for_byte() {
             "hops era {era:?}"
         );
     }
-}
-
-#[test]
-fn initial_cursor_uses_maximum_even_when_union_arm_rows_are_reordered() {
-    let rows = vec![
-        serde_json::json!({"createdAt": 10, "cursorRowid": 9}),
-        serde_json::json!({"createdAt": null, "cursorRowid": 100}),
-        serde_json::json!({"createdAt": 10, "cursorRowid": 3}),
-    ];
-    let mut cursor = low_app_layer::owed_cursor::Cursor::default();
-    cursor.start(&rows);
-    assert_eq!(
-        cursor.last,
-        Some((Some(10), 9)),
-        "cursor must use maximum, not last UNION arm row"
-    );
-    cursor.start(&[
-        rows[1].clone(),
-        serde_json::json!({"createdAt": null, "cursorRowid": 2}),
-    ]);
-    assert_eq!(cursor.last, Some((None, 100)));
-    cursor.start(&[]);
-    assert_eq!(cursor.last, None);
 }
 
 /// bsv-low #642: each candidate arm walks `idx_pot_records_chain_wins` in its
@@ -1031,7 +1003,7 @@ fn fix831_the_paired_hydration_reads_the_funding_latch_by_key() {
                 "createdAt": 1790000000, "markerRowid": i, "tier": 0, "potBestSigRank": 2, "finalRank": i + 1})
         })
         .collect();
-    let sql = low_app_layer::owed_cursor::hydrate_party_pair_sql();
+    let sql = low_app_layer::owed_judge::rank::hydrate_party_pair_sql();
     let mut stmt = db.prepare(&sql).unwrap();
     let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let at = names

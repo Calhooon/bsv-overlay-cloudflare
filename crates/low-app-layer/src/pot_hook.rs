@@ -4,8 +4,8 @@
 //! sequential fan-out (11 to 15 s p50 under the fleet), then a full `/results` gather per attributed seat.
 //!
 //! The rule here: the answer path is D1 alone, in batches; no relay call and no read-model walk is awaited before
-//! the answer. The worker's handler is [`serve_pot_changed`]: what the hook decides is [`apply_pot_changed`] /
-//! [`apply_hop_changed`], over a [`HookStore`] port (the worker's is [`HookD1`] over `routes::D1Sql`; a queue
+//! the answer. The worker's handler is [`serve_pot_changed`]: what the hook decides is [`apply_pot_changed`], over a
+//! [`HookStore`] port (the worker's is [`HookD1`] over `routes::D1Sql`; a queue
 //! consumer is the next caller, L3's seam). The publish is VOLATILE scheduling, the filing DURABLE: every wake-up of
 //! a body is PARKED in D1 in the hook's one write batch before the answer (the review's H1); [`announce_and_report`]
 //! runs DETACHED (`ctx.wait_until`) under one wall ([`ANNOUNCE_WALL_MS`]), counted, and settles the park (a
@@ -497,13 +497,9 @@ pub trait HookStore {
     /// batch, only when a pot decoded; one batch per marker arm (three), only when an outpoint has no decoded params
     /// or no attributed seat. So 1 to 5 reads (5 + n on a required-read fault), then the caller's ONE write.
     async fn read_outpoints(&self, outpoints: &[(String, u32)]) -> Vec<OutpointRead>;
-    /// Every stale mark and every park statement given, in ONE batch (the hook's write; the settle's; the
-    /// drain's), the parks' tokens taken in it (N1). Answers each op's [`OpOut`], in order.
-    async fn write(
-        &self,
-        marks: &[(String, &'static str)],
-        ops: &[ParkOp],
-    ) -> Result<Vec<OpOut>, String>;
+    /// Every park statement given, in ONE batch (the hook's write; the settle's; the drain's), the parks' tokens
+    /// taken in it (N1). Answers each op's [`OpOut`], in order.
+    async fn write(&self, ops: &[ParkOp]) -> Result<Vec<OpOut>, String>;
     /// The parked wake-ups due at `now`, oldest due first, at most `limit`.
     async fn due_parked(&self, now: u64, limit: u32) -> Result<Vec<Parked>, String>;
     async fn counters(&self, deltas: Vec<(String, u64)>);
@@ -719,20 +715,8 @@ impl<P: SqlPort> HookStore for HookD1<P> {
             .collect()
     }
 
-    async fn write(
-        &self,
-        marks: &[(String, &'static str)],
-        ops: &[ParkOp],
-    ) -> Result<Vec<OpOut>, String> {
-        let mut stmts: Vec<Stmt> = marks
-            .iter()
-            .map(|(id, _)| {
-                Stmt::new(
-                    crate::owed::OWED_STALE_FOR_IDENTITY_SQL,
-                    vec![Bind::Text(id.clone())],
-                )
-            })
-            .collect();
+    async fn write(&self, ops: &[ParkOp]) -> Result<Vec<OpOut>, String> {
+        let mut stmts: Vec<Stmt> = Vec::new();
         // N1: the parks' tokens, the counter's last plus each park's position; the bump after them
         let parks = ops
             .iter()
@@ -764,11 +748,10 @@ impl<P: SqlPort> HookStore for HookD1<P> {
             stmts.push(Stmt::new(PARK_MAKE_ROOM_SQL, room));
         }
         let out = self.sql.run_batch(stmts).await?;
-        let at = marks.len();
         if parks > 0 {
-            self.room_made(&out[at + ops.len() + 2]).await;
+            self.room_made(&out[ops.len() + 2]).await;
         }
-        Ok(out[at..at + ops.len()]
+        Ok(out[..ops.len()]
             .iter()
             .zip(ops)
             .map(|(o, op)| OpOut {
@@ -956,21 +939,20 @@ pub struct Call {
     pub generation: Option<u64>,
 }
 
-/// What [`apply_pot_changed`] decided: the answer's lists, the identities whose owed rows the detached recompute
-/// re-derives, and the detached announce.
+/// What [`apply_pot_changed`] decided: the answer's lists, the identities whose owed rows the hook's drain judges,
+/// and the detached announce.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PotChangedOutcome {
     pub filed: Vec<Value>,
     pub skipped: Vec<Value>,
     pub owed_identities: Vec<String>,
-    pub stale_marks: Vec<(String, &'static str)>,
-    /// The hook's write batch (the stale marks and the parks) faulted: nothing of it landed, NOTHING is announced
-    /// (N2), and the answer says so (503, retryable).
-    pub stale_fault: Option<String>,
+    /// The hook's write batch (the parks) faulted: nothing of it landed, NOTHING is announced (N2), and the answer
+    /// says so (503, retryable).
+    pub write_fault: Option<String>,
     /// Wake-ups parked durably before the answer: the rows the park WROTE (N1, `RETURNING`).
     pub parked: usize,
     /// N6: wake-ups of a body the park refused WHOLE at its ceiling (no room to make): counted, and the body is
-    /// answered 503 (`stale_fault` is set) with nothing announced.
+    /// answered 503 (`write_fault` is set) with nothing announced.
     pub park_full: usize,
     pub plan: AnnouncePlan,
 }
@@ -981,13 +963,12 @@ fn push_unique(v: &mut Vec<String>, id: &str) {
     }
 }
 
-/// The pot hook's whole decision for one parsed body: the store's reads, then ONE write batch (the stale marks and
-/// every wake-up parked), and the plan of what runs after the answer. No relay call, no read-model walk, no owed
-/// recompute.
+/// The pot hook's whole decision for one parsed body: the store's reads, then ONE write batch (every wake-up
+/// parked), and the plan of what runs after the answer. No relay call, no read-model walk.
 ///
 /// Per outpoint, the branches of the handler before L4: a read fault is skipped; with no decoded params, or with
-/// decoded params and no attributed seat, the marker-named identities are marked stale and queued for the
-/// recompute (fleet loop 11 and 15); an attributed pot queues a `pot` event for each seat and its recompute.
+/// decoded params and no attributed seat, the marker-named identities are queued for the judge (fleet loop 11 and
+/// 15); an attributed pot queues a `pot` event for each seat and its judgement.
 pub async fn apply_pot_changed<S: HookStore>(
     store: &S,
     outpoints: &[(String, u32)],
@@ -1013,8 +994,6 @@ pub async fn apply_pot_changed<S: HookStore>(
             }
             OutpointRead::NoParams { marker_named } => {
                 for id in &marker_named {
-                    out.stale_marks
-                        .push((id.clone(), "pot-changed (by marker)"));
                     push_unique(&mut out.owed_identities, id);
                 }
                 out.skipped.push(json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] {txid}:{vout} has no decoded params yet, nothing to file ({} seat(s) attributed by marker)", marker_named.len()) }));
@@ -1024,11 +1003,9 @@ pub async fn apply_pot_changed<S: HookStore>(
                 marker_named,
             } if seats.is_empty() => {
                 for id in &marker_named {
-                    out.stale_marks
-                        .push((id.clone(), "pot-changed (unattributed, by marker)"));
                     push_unique(&mut out.owed_identities, id);
                 }
-                out.skipped.push(json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] {txid}:{vout} has no attributed seats yet, nothing to file ({} seat(s) marked stale by marker)", marker_named.len()) }));
+                out.skipped.push(json!({ "txid": txid, "vout": vout, "why": format!("[pot-changed] {txid}:{vout} has no attributed seats yet, nothing to file ({} seat(s) attributed by marker)", marker_named.len()) }));
             }
             OutpointRead::Decoded { seats, .. } => {
                 for id in seats {
@@ -1042,7 +1019,7 @@ pub async fn apply_pot_changed<S: HookStore>(
             }
         }
     }
-    // H1: every wake-up of the plan is PARKED in the same write batch as the stale marks, BEFORE the answer, not
+    // H1: every wake-up of the plan is PARKED in one write batch, BEFORE the answer, not
     // due until the detached announce has had its window; the announce's settle takes out what it delivered. N1:
     // each park's token is the one the batch WROTE; N6: a batch the ceiling refuses is rolled back whole.
     let parks: Vec<ParkOp> = out
@@ -1055,7 +1032,7 @@ pub async fn apply_pot_changed<S: HookStore>(
             next_ms: at_ms + PARK_GRACE_MS,
         })
         .collect();
-    match store.write(&out.stale_marks, &parks).await {
+    match store.write(&parks).await {
         Ok(outs) => {
             out.plan.generations = outs.iter().map(|o| o.generation).collect();
             out.parked = outs.iter().filter(|o| o.generation.is_some()).count();
@@ -1072,26 +1049,11 @@ pub async fn apply_pot_changed<S: HookStore>(
                     out.park_full as u64,
                 )])
                 .await;
-            out.stale_fault = Some(format!("the park is full: {e}"));
+            out.write_fault = Some(format!("the park is full: {e}"));
         }
-        Err(e) => out.stale_fault = Some(e),
+        Err(e) => out.write_fault = Some(e),
     }
     out
-}
-
-/// The hop hook's decision: every parsed identity marked stale in ONE batch; the recompute runs after the answer.
-pub async fn apply_hop_changed<S: HookStore>(
-    store: &S,
-    identities: &[String],
-) -> Result<(), String> {
-    let marks: Vec<(String, &'static str)> = identities
-        .iter()
-        .map(|id| (id.clone(), "hop-changed"))
-        .collect();
-    if marks.is_empty() {
-        return Ok(());
-    }
-    store.write(&marks, &[]).await.map(|_| ())
 }
 
 /// The `entry` of a seat's `pot` event since L4: an empty object (the client's parser requires an object; no
@@ -1329,7 +1291,7 @@ pub async fn announce_and_report<S: HookStore, R: RelayPort, W: Future<Output = 
         }
     }
     if !ops.is_empty() {
-        if let Err(e) = store.write(&[], &ops).await {
+        if let Err(e) = store.write(&ops).await {
             t.park_faults += 1;
             store.log(&format!(
                 "[pot-changed] announce settle failed ({} wake-up(s)): {e}",
@@ -1519,7 +1481,7 @@ pub async fn drain_parked<S: HookStore, R: RelayPort>(
             });
         }
         if !ops.is_empty() {
-            match deadline.run(store.write(&[], &ops)).await {
+            match deadline.run(store.write(&ops)).await {
                 Some(Ok(outs)) => {
                     if round == 0 {
                         let n = outs.len();
@@ -1611,7 +1573,7 @@ where
     W: Future<Output = ()> + 'static,
 {
     let outcome = apply_pot_changed(&*store, outpoints, at_ms, admitted_at_ms).await;
-    if outcome.stale_fault.is_none() {
+    if outcome.write_fault.is_none() {
         let plan = outcome.plan.clone();
         detach(Box::pin(async move {
             announce_and_report(&*store, &*relay, &plan, wall, &redrive).await;
@@ -2266,7 +2228,7 @@ pub(crate) mod tests {
             at,
         )
         .await;
-        assert_eq!(out.stale_fault, None);
+        assert_eq!(out.write_fault, None);
         assert_eq!(relay.started.get(), 0, "nothing sent before the answer");
         let before = parked_rows(&store.sql);
         assert_eq!(
@@ -2324,14 +2286,11 @@ pub(crate) mod tests {
         };
         let now = store.sql.now.get();
         store
-            .write(
-                &[],
-                &[ParkOp::Park {
-                    wake,
-                    at_ms: now,
-                    next_ms: now,
-                }],
-            )
+            .write(&[ParkOp::Park {
+                wake,
+                at_ms: now,
+                next_ms: now,
+            }])
             .await
             .unwrap();
         let failing = SlowRelay::new(Duration::ZERO, Delivery::Failed);
@@ -2364,8 +2323,8 @@ pub(crate) mod tests {
     /// (H2, M2 c) AN OPTIONAL MARKER ARM'S FAULT LEAVES THE OTHER SEATS FILED. The review's case through the
     /// production handler and the real store's SQL: the mixed body with `potrefund_records` unavailable (renamed
     /// away under SQLite, so the shipped statement fails to prepare as on a D1 that faults it). The fourteen
-    /// verified seats are filed, the five marker identities (named by the party arm, which answered) are marked
-    /// stale in D1 and queued, and the faulted arm is counted and logged by name; nothing is `Failed`.
+    /// verified seats are filed, the five marker identities (named by the party arm, which answered) are queued,
+    /// and the faulted arm is counted and logged by name; nothing is `Failed`.
     #[tokio::test(flavor = "current_thread")]
     async fn e649f_h2_an_optional_arm_fault_leaves_the_other_seats_filed() {
         let (db, ops) = mixed_fixture();
@@ -2394,30 +2353,9 @@ pub(crate) mod tests {
         assert_eq!(
             out.owed_identities.len(),
             19,
-            "every identity queued for its recompute"
+            "every identity queued for its judgement"
         );
-        assert_eq!(
-            out.stale_marks.len(),
-            5,
-            "the marker identities marked stale"
-        );
-        assert_eq!(out.stale_fault, None);
-        let stale: i64 = store
-            .sql
-            .conn
-            .query_row(
-                &format!(
-                    "SELECT COUNT(*) FROM owed_state WHERE stale = 1 AND identity IN ({})",
-                    (0..5)
-                        .map(|k| format!("'{}'", marker_seat(k)))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ),
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(stale, 5, "the stale marks landed in D1");
+        assert_eq!(out.write_fault, None);
         assert_eq!(
             store.sql.counter(COUNTER_MARKER_ARM_FAILED),
             1,
@@ -2738,16 +2676,13 @@ pub(crate) mod tests {
         assert_eq!(generations(&store.sql), gb, "untouched at the later tokens");
         // a retry at an old token touches nothing
         store
-            .write(
-                &[],
-                &[ParkOp::Retry {
-                    wake: ob.plan.wakes()[0].clone(),
-                    generation: ga[0] as u64,
-                    attempts: 3,
-                    next_ms: 0,
-                    exhausted_at_ms: Some(1),
-                }],
-            )
+            .write(&[ParkOp::Retry {
+                wake: ob.plan.wakes()[0].clone(),
+                generation: ga[0] as u64,
+                attempts: 3,
+                next_ms: 0,
+                exhausted_at_ms: Some(1),
+            }])
             .await
             .unwrap();
         assert_eq!(generations(&store.sql), gb);
@@ -2801,7 +2736,7 @@ pub(crate) mod tests {
             7,
         )
         .await;
-        assert!(o1.stale_fault.is_some(), "the batch faulted");
+        assert!(o1.write_fault.is_some(), "the batch faulted");
         assert_eq!(
             (o1.parked, parked_count(&store.sql)),
             (0, 0),
@@ -2827,7 +2762,7 @@ pub(crate) mod tests {
             8,
         )
         .await;
-        assert_eq!((o2.stale_fault.clone(), o2.parked), (None, 22));
+        assert_eq!((o2.write_fault.clone(), o2.parked), (None, 22));
         rec.run_all().await;
         let (all, room) = {
             let d = relay.delivered.borrow();
@@ -2911,7 +2846,7 @@ pub(crate) mod tests {
         let src = squash(&code_only(include_str!("pot_hook.rs")));
         let serve = &src[src.find("pubasyncfnserve_pot_changed<").unwrap()..];
         assert!(
-            serve.contains(&squash("if outcome.stale_fault.is_none() {")),
+            serve.contains(&squash("if outcome.write_fault.is_none() {")),
             "the announce is scheduled only on a committed batch"
         );
     }
@@ -2967,7 +2902,7 @@ pub(crate) mod tests {
             "the last body answers what it parked"
         );
         assert!(
-            last.stale_fault.is_some(),
+            last.write_fault.is_some(),
             "N6: a refused body is answered 503"
         );
         assert!(store
@@ -3076,14 +3011,11 @@ pub(crate) mod tests {
             recipient: None,
         };
         store
-            .write(
-                &[],
-                &[ParkOp::Park {
-                    wake,
-                    at_ms: now,
-                    next_ms: now,
-                }],
-            )
+            .write(&[ParkOp::Park {
+                wake,
+                at_ms: now,
+                next_ms: now,
+            }])
             .await
             .unwrap();
         let relay = Rc::new(Relay::default());
@@ -3170,7 +3102,7 @@ pub(crate) mod tests {
 
     /// (N5) EVERY BRANCH OF THE DECISION, THROUGH `apply_pot_changed` (the seam the worker's handler runs): a read that
     /// failed, no params with and without marker-named seats, decoded with no attributed seat with and without
-    /// markers, and an attributed pot; each branch's `skipped` words, its stale marks, its queued identities and its
+    /// markers, and an attributed pot; each branch's `skipped` words, its queued identities and its
     /// parks (a room per outpoint, a seat per attributed identity). And the real store's failed branch: with
     /// `pot_records` unavailable every outpoint is skipped as a read failure and only its room is parked.
     #[tokio::test(flavor = "current_thread")]
@@ -3183,12 +3115,8 @@ pub(crate) mod tests {
             async fn read_outpoints(&self, _o: &[(String, u32)]) -> Vec<OutpointRead> {
                 self.reads.clone()
             }
-            async fn write(
-                &self,
-                marks: &[(String, &'static str)],
-                ops: &[ParkOp],
-            ) -> Result<Vec<OpOut>, String> {
-                self.inner.write(marks, ops).await
+            async fn write(&self, ops: &[ParkOp]) -> Result<Vec<OpOut>, String> {
+                self.inner.write(ops).await
             }
             async fn due_parked(&self, now: u64, limit: u32) -> Result<Vec<Parked>, String> {
                 self.inner.due_parked(now, limit).await
@@ -3244,16 +3172,8 @@ pub(crate) mod tests {
                 format!("[pot-changed] decoded-pots read failed for {}: boom", o(0)),
                 format!("[pot-changed] {} has no decoded params yet, nothing to file (2 seat(s) attributed by marker)", o(1)),
                 format!("[pot-changed] {} has no decoded params yet, nothing to file (0 seat(s) attributed by marker)", o(2)),
-                format!("[pot-changed] {} has no attributed seats yet, nothing to file (1 seat(s) marked stale by marker)", o(3)),
-                format!("[pot-changed] {} has no attributed seats yet, nothing to file (0 seat(s) marked stale by marker)", o(4)),
-            ]
-        );
-        assert_eq!(
-            out.stale_marks,
-            vec![
-                (m.clone(), "pot-changed (by marker)"),
-                (n.clone(), "pot-changed (by marker)"),
-                (m.clone(), "pot-changed (unattributed, by marker)"),
+                format!("[pot-changed] {} has no attributed seats yet, nothing to file (1 seat(s) attributed by marker)", o(3)),
+                format!("[pot-changed] {} has no attributed seats yet, nothing to file (0 seat(s) attributed by marker)", o(4)),
             ]
         );
         assert_eq!(
@@ -3268,7 +3188,7 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(
-            (out.parked, out.park_full, out.stale_fault),
+            (out.parked, out.park_full, out.write_fault),
             (8, 0, None),
             "six rooms and two seats"
         );
@@ -3291,30 +3211,6 @@ pub(crate) mod tests {
             .borrow()
             .iter()
             .any(|l| l.contains("each outpoint asked alone")));
-    }
-
-    /// (N5) THE HOP BATCH: eight identities marked stale in ONE batch of eight statements, each landed.
-    #[tokio::test(flavor = "current_thread")]
-    async fn e649f2_n5_c_the_hop_hook_marks_eight_identities_in_one_batch() {
-        let (db, _) = decoded_fixture(4);
-        let store = HookD1 { sql: db };
-        let ids: Vec<String> = (0..4).flat_map(|i| [seat(2, i), seat(3, i)]).collect();
-        apply_hop_changed(&store, &ids).await.unwrap();
-        assert_eq!(
-            (store.sql.batches.get(), store.sql.stmts.get()),
-            (1, 8),
-            "one batch, a statement per identity"
-        );
-        let stale: i64 = store
-            .sql
-            .conn
-            .query_row("SELECT COUNT(*) FROM owed_state WHERE stale = 1", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(stale, 8);
-        apply_hop_changed(&store, &[]).await.unwrap();
-        assert_eq!(store.sql.batches.get(), 1, "no identity, no batch");
     }
 
     /// (N5) ALL 24 CALLS SLOW: a full body (8 decoded pots, 16 attributed seats) with EVERY relay call past the
@@ -3373,7 +3269,7 @@ pub(crate) mod tests {
     /// `c830527`: 400 capped bodies with cancelled announces leave 2,048 rows; the mixed body then answered 200 with
     /// `parkFull: 22` and volatile sends; its announce cancelled, 22 drain passes over the 2,048 older rows never
     /// delivered one of its wake-ups (RED: `left: 0 right: 22`). Now that body is refused WHOLE: 503, nothing written
-    /// (its stale marks rolled back too), nothing announced, counted; the producer's re-send after the drain has made
+    /// nothing announced, counted; the producer's re-send after the drain has made
     /// room parks all 22, and the drain delivers them though the re-sent announce is cancelled too.
     #[tokio::test(flavor = "current_thread")]
     async fn e649f3_n6_a_the_review_sequence_never_loses_the_mixed_body_silently() {
@@ -3397,13 +3293,6 @@ pub(crate) mod tests {
             .await;
         }
         assert_eq!(parked_count(&store.sql), i64::from(PARK_MAX_ROWS));
-        let stale = |db: &SqliteSql| -> i64 {
-            db.conn
-                .query_row("SELECT COUNT(*) FROM owed_state WHERE stale = 1", [], |r| {
-                    r.get(0)
-                })
-                .unwrap()
-        };
         let rec = Recorded::default();
         let o = serve_pot_changed(
             store.clone(),
@@ -3420,13 +3309,12 @@ pub(crate) mod tests {
             "refused whole, nothing announced"
         );
         assert!(
-            o.stale_fault
+            o.write_fault
                 .as_deref()
                 .is_some_and(|e| e.contains("park is full")),
             "answered 503: {:?}",
-            o.stale_fault
+            o.write_fault
         );
-        assert_eq!(stale(&store.sql), 0, "the batch rolled back whole");
         assert_eq!(parked_count(&store.sql), i64::from(PARK_MAX_ROWS));
         assert_eq!(
             store.sql.counter(COUNTER_ANNOUNCE_PARK_FULL),
@@ -3529,7 +3417,7 @@ pub(crate) mod tests {
             .unwrap();
         let o = serve(mixed.clone()).await;
         assert_eq!((o.parked, o.park_full), (22, 0));
-        assert!(o.stale_fault.is_none());
+        assert!(o.write_fault.is_none());
         assert_eq!(parked_count(&store.sql), i64::from(PARK_MAX_ROWS));
         assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_EVICTED_EXHAUSTED), 14);
         assert_eq!(store.sql.counter(COUNTER_ANNOUNCE_DISPLACED), 0);
@@ -3629,13 +3517,9 @@ pub(crate) mod tests {
         async fn read_outpoints(&self, o: &[(String, u32)]) -> Vec<OutpointRead> {
             self.inner.read_outpoints(o).await
         }
-        async fn write(
-            &self,
-            marks: &[(String, &'static str)],
-            ops: &[ParkOp],
-        ) -> Result<Vec<OpOut>, String> {
+        async fn write(&self, ops: &[ParkOp]) -> Result<Vec<OpOut>, String> {
             slow(self.write).await;
-            self.inner.write(marks, ops).await
+            self.inner.write(ops).await
         }
         async fn due_parked(&self, now: u64, limit: u32) -> Result<Vec<Parked>, String> {
             slow(self.read).await;
@@ -3776,7 +3660,7 @@ pub(crate) mod tests {
         for step in [
             ".run_reserving(store.due_parked(now, DRAIN_MAX_PER_PASS))",
             ".run_reserving(futures_util::future::join_all(calls))",
-            "deadline.run(store.write(&[], &ops))",
+            "deadline.run(store.write(&ops))",
             "deadline.run(store.counters(counters))",
         ] {
             assert!(pass.contains(&squash(step)), "the pass: {step}");
@@ -3825,7 +3709,7 @@ pub(crate) mod tests {
                 next_ms: now,
             })
             .collect();
-        store.write(&[], &parks).await.unwrap();
+        store.write(&parks).await.unwrap();
         let before = generations(&store.sql);
         let s = SlowStore {
             inner: &store,

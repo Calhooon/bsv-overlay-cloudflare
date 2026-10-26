@@ -755,33 +755,6 @@ pub fn memo_predates_tip(m: &ProbeMemo, walk_tip: Option<u64>) -> bool {
     !m.spent && walk_tip.is_some_and(|t| m.tip_height.is_none_or(|h| h < t))
 }
 
-/// PURE (bsv-low #808, the FIX-808 lens's LOW-1): how old an isolate-cached `/spent-any` answer the owed walk's
-/// fresh ask of `(txid, vout)` accepts. The cache (`SPENT_ANY_CACHE_TTL_MS`, 15 s, shared with the public route)
-/// holds no tip, so a word cached in the seconds before a block would be handed to the re-ask and stamped at the new
-/// tip, where it answers for five minutes: the #808 shape narrowed to 15 s. A target the tip rule sent back (its
-/// newest memo [`memo_predates_tip`]) therefore accepts NO cached answer (0: `spent_any_cache_fresh` is never true)
-/// and asks the couriers; every other target keeps the cache. The residual left is the walk's tip itself: it comes
-/// from the 30 s cross-isolate tip cache, so a fresh courier answer can still be stamped at a tip the chain has
-/// already passed (stated at [`memo_predates_tip`]).
-pub fn reask_cache_max_age_ms(
-    memos: &[ProbeMemo],
-    txid: &str,
-    vout: u32,
-    walk_tip: Option<u64>,
-) -> f64 {
-    let key = format!("{}.{vout}", txid.to_ascii_lowercase());
-    let sent_back = memos
-        .iter()
-        .filter(|m| m.outpoint == key)
-        .max_by_key(|m| m.probed_at_ms)
-        .is_some_and(|m| memo_predates_tip(m, walk_tip));
-    if sent_back {
-        0.0
-    } else {
-        crate::results::SPENT_ANY_CACHE_TTL_MS
-    }
-}
-
 /// How old a memo may be to answer for a probe — the same five minutes as the isolate's `SPENT_ANY_PROBE_MAX_AGE_MS`
 /// (a `recoverable` word may lag a sweep by minutes safely: the sweep is judged at broadcast, nothing is released
 /// on the word).
@@ -1086,7 +1059,7 @@ pub fn mark_refused_word_rows(
     }
 }
 
-/// The owed row fact [`mark_reorg_grace_rows`] writes and `owed::row_is_open` reads.
+/// The owed row fact [`mark_reorg_grace_rows`] writes.
 pub const OWED_FACT_REORG_GRACE_WORD: &str = "chainWordInReorgGrace";
 
 /// PURE (D-M1, the cadence half): a PAYOUT row whose hop's chain word was a "confirmed" taken inside the reorg
@@ -1107,78 +1080,6 @@ pub fn mark_reorg_grace_rows(
     }) {
         r.facts[OWED_FACT_REORG_GRACE_WORD] = json!(true);
     }
-}
-
-/// PURE (bsv-low #469, the stranded cell's run 5): the order the OWED walk asks the outpoints no memo answered, under
-/// its per-recompute budget. Never probed first, the NEWEST marker first (a hop that just crossed the stranded window is
-/// the one a player is waiting on), then the expired memos OLDEST first (a round robin: every candidate gets its turn
-/// within a few recomputes instead of the same first eight forever). Stable inside each group; `marker_at` is keyed
-/// `<txid>.<vout>` lowercase and an outpoint without a marker stamp sorts last among the never probed.
-///
-/// The gate's M2 (2026-09-19): an outpoint the couriers can never answer leaves NO memo (`probe_memo_of` remembers a
-/// known answer only) and would stay "never probed" for ever; with eight of them the never group ate the whole budget
-/// every pass and no expired memo was refreshed again. So the never group's share of the FRONT is capped at `never_cap`
-/// (the route passes half the budget): `never[..cap]`, then every expired memo oldest first, then the rest of `never`.
-/// `rotate` (the delta-verify's NEW-2): the never group's LEADER stays the newest marker (the newcomer guarantee), the
-/// other `never_cap - 1` front slots are taken from the rest of the never group at a rotating offset (the route passes
-/// the recompute's minute), so ≥ `never_cap` permanently-unanswerable outpoints with new markers cannot camp the front
-/// and leave the tail unprobed for ever.
-pub fn order_probe_targets(
-    to_probe: Vec<(String, u32)>,
-    memos: &[ProbeMemo],
-    marker_at: &std::collections::HashMap<String, i64>,
-    never_cap: usize,
-    rotate: usize,
-) -> Vec<(String, u32)> {
-    let mut never: Outpoints = Vec::new();
-    let mut expired: Vec<(i64, String, u32)> = Vec::new();
-    for (txid, vout) in to_probe {
-        let key = format!("{}.{vout}", txid.to_ascii_lowercase());
-        match memos
-            .iter()
-            .filter(|m| m.outpoint == key)
-            .map(|m| m.probed_at_ms)
-            .max()
-        {
-            None => never.push((txid, vout)),
-            Some(at) => expired.push((at, txid, vout)),
-        }
-    }
-    never.sort_by_key(|(txid, vout)| {
-        std::cmp::Reverse(
-            marker_at
-                .get(&format!("{}.{vout}", txid.to_ascii_lowercase()))
-                .copied()
-                .unwrap_or(i64::MIN),
-        )
-    });
-    expired.sort_by_key(|(at, _, _)| *at);
-    let cap = never_cap.min(never.len());
-    let (front, rest): (Outpoints, Outpoints) = if cap == 0 {
-        (Vec::new(), never)
-    } else {
-        // the leader, then `cap - 1` from the others at the rotating offset; the others keep their newest-first order
-        let leader = never.remove(0);
-        let n = never.len();
-        let take = (cap - 1).min(n);
-        let start = if n == 0 { 0 } else { rotate % n };
-        let picked: Vec<usize> = (0..take).map(|k| (start + k) % n).collect();
-        let mut front = vec![leader];
-        let mut rest = Vec::new();
-        for (idx, item) in never.into_iter().enumerate() {
-            if picked.contains(&idx) {
-                front.push(item)
-            } else {
-                rest.push(item)
-            }
-        }
-        (front, rest)
-    };
-    front
-        .into_iter()
-        .chain(expired.into_iter().map(|(_, txid, vout)| (txid, vout)))
-        .chain(rest)
-        .collect()
 }
 
 /// PURE: the memo table's key for an outpoint (`<txid>.<vout>`, lowercase): the ONE spelling the write and the read share.
@@ -2858,42 +2759,30 @@ mod tests {
             Some(t0 + 200 * min),
             "the sweep took the old memo and left the tombstone"
         );
-        // the walk reads the tombstone with its memos and splits by it (source)
-        let code_only = |s: &str| {
-            s.lines()
-                .map(|l| l.split("//").next().unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let squash = |s: &str| {
-            s.split_whitespace()
-                .collect::<String>()
-                .replace(",)", ")")
-                .replace(",]", "]")
-        };
-        let routes = include_str!("routes.rs");
-        let routes = squash(&code_only(
-            &routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())],
-        ));
-        assert!(routes.contains(&squash("let memos = read_probe_memos(db, &[candidates.as_slice(), &[crate::hops_view::reorg_mark_target()]].concat()).await;")));
-        assert!(routes.contains(&squash(
-            "let reorg_clear = crate::hops_view::reorg_clear_at(&memos); let (answered, to_probe) = crate::hops_view::split_probe_targets_at_tip( &candidates, &memos, now_ms, crate::hops_view::PROBE_MEMO_MAX_AGE_MS, crate::hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS, reorg_clear, tip, )"
-        )));
-        // bsv-low #808 (the FIX-808 lens's LOW-3): the memo's tip is WRITTEN at the walk's tip, BOUND into the upsert,
-        // and READ back under its column's name; a revert of any of them made every memo tipless with the lib green
-        let wired = |needle: &str| {
+        // the judge reads the tombstone with its memos and splits by it, and the belt writes each memo at its tip
+        // (source; bsv-low #893 section 6.2: the walk that did both retired)
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let hydrate = squash(include_str!("owed_judge/hydrate.rs"));
+        for needle in [
+            "targets.push(hops_view::reorg_mark_target());",
+            "let clear = hops_view::reorg_clear_at(&memos);",
+            "hops_view::split_probe_targets_at_tip( &hop_pairs, &memos, i.now_ms, hops_view::PROBE_MEMO_MAX_AGE_MS, hops_view::PROBE_MEMO_CONFIRMED_MAX_AGE_MS, clear, i.tip, );",
+            // bsv-low #808 (the FIX-808 lens's LOW-3): the memo's tip is READ back under its column's name
+            "tip_height: r[\"tipHeight\"].as_u64(),",
+        ] {
+            assert!(hydrate.contains(&squash(needle)), "the judge no longer runs: {needle}");
+        }
+        // ... and WRITTEN at the belt's tip, BOUND into the upsert
+        let belt = squash(include_str!("owed_belt.rs"));
+        for needle in [
+            "crate::hops_view::probe_memo_at_tip(txid, vout, probe, now, tip)",
+            "m.tip_height.map_or(Bind::Null, |t| Bind::Int(t as i64)),",
+        ] {
             assert!(
-                routes.contains(&squash(needle)),
-                "the #808 tip wiring no longer runs: {needle}"
-            )
-        };
-        wired("if let Some(m) = crate::hops_view::probe_memo_at_tip(t, *v, &probe, now_ms, tip) { fresh.push(m); }");
-        wired("m.tip_height.map(|t| JsValue::from_f64(t as f64)).unwrap_or(JsValue::NULL), ];");
-        wired("#[serde(rename = \"tipHeight\", default)] tip_height: Option<i64>,");
-        // the walk's memo read (the one whose fault is counted), not the latch read's mapping of the same row
-        wired("probe_memo_read_faulted(db).await; return Vec::new(); } } } rows.into_iter().map(|r| crate::hops_view::ProbeMemo { outpoint: r.outpoint, probed_at_ms: r.probed_at_ms, spent: r.spent != 0, spending_txid: r.spending_txid, spent_confirmed: r.spent_confirmed.map(|v| v != 0), tip_height: r.tip_height.and_then(|t| u64::try_from(t).ok()), })");
-        // the lens's LOW-1: the re-ask the tip rule sent back bypasses the isolate's cache
-        wired("let max_age = crate::hops_view::reask_cache_max_age_ms(&memos, t, *v, tip); let row = spent_any_resolve_cached(t, *v, \"owed\", max_age).await;");
+                belt.contains(&squash(needle)),
+                "the belt no longer runs: {needle}"
+            );
+        }
     }
 
     /// THE ONE PLACE these pins build `owed::OwedInputs` (the second delta lens's D2-M2): the struct holds
@@ -2959,9 +2848,8 @@ mod tests {
     /// To red: skip `set_aside_proofs_a_refused_word_contradicts` in `walk` below (the route at `2335e76`).
     #[test]
     fn inside_the_reorg_grace_a_refused_rival_word_still_contradicts_the_index_proof() {
-        use crate::owed::{
-            count_sweep_proof_contradictions, outpoint_key, row_is_open, OwedFamily, OwedRow,
-        };
+        use crate::owed::tests::count_sweep_proof_contradictions;
+        use crate::owed::{outpoint_key, OwedFamily, OwedRow};
         use std::collections::HashMap;
         let t0: i64 = 1_800_000_000_000;
         let min = 60_000i64;
@@ -3035,10 +2923,6 @@ mod tests {
             "the operator sees WHICH hop"
         );
         assert_eq!(counted, 1, "and it is counted");
-        assert!(
-            row_is_open(&row),
-            "an open row: the five-minute rule comes back for it"
-        );
         // the same row the derivation gives with no reorg at all (the word's confirmation intact, `owed`'s own rule)
         let (base, base_counted) = walk(&rival_memo, w2, None, true);
         assert_eq!(
@@ -3122,7 +3006,6 @@ mod tests {
             CHAIN_WORD_AWAITS_PROBE_REASON,
             crate::owed::UNCONFIRMED_PAYOUT_REASON
         );
-        assert!(row_is_open(&row));
         // a spend the courier itself called unconfirmed keeps the chain's own sentence
         let honest_unmined = ProbeMemo {
             spent_confirmed: Some(false),
@@ -3146,41 +3029,29 @@ mod tests {
         assert_eq!(row.facts["spenderPresence"]["source"], "courier");
         assert!(row.facts[OWED_FACT_CHAIN_WORD_AWAITS_PROBE].is_null());
 
-        // THE WALK RUNS THESE (source), in this order: the refusal remembered, the set-aside after the proof read
-        // and before the derivation, the mark before the count
-        let code_only = |s: &str| {
-            s.lines()
-                .map(|l| l.split("//").next().unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let squash = |s: &str| {
-            s.split_whitespace()
-                .collect::<String>()
-                .replace(",)", ")")
-                .replace(",]", "]")
-        };
-        let routes = include_str!("routes.rs");
-        let routes = squash(&code_only(
-            &routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())],
-        ));
+        // THE JUDGE RUNS THESE (source, bsv-low #893: the walk that ran them retired), in this order: the refusal
+        // remembered, the set-aside after the proof read and before the derivation, the mark after it
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let hydrate = squash(include_str!("owed_judge/hydrate.rs"));
         let at = |needle: &str| {
-            routes
+            hydrate
                 .find(&squash(needle))
-                .unwrap_or_else(|| panic!("the owed walk no longer runs: {needle}"))
+                .unwrap_or_else(|| panic!("the judge's hydration no longer runs: {needle}"))
         };
-        let remembered = at("if crate::hops_view::confirmation_refused(m, reorg_clear) { refused_words.insert(key.clone(), m.spending_txid.as_deref().map(str::to_ascii_lowercase)); } hop_chain.insert(key, crate::hops_view::stale_memo_word(m, now_ms, reorg_clear, tip));");
-        let proof_read =
-            at("hop_sweeps.insert(key, crate::hopsweep::pick_filed_sweep(newest, older));");
-        let set_aside = at("let proofs_set_aside = crate::hops_view::set_aside_proofs_a_refused_word_contradicts(&mut hop_sweeps, &refused_words);");
-        let derived = at("hop_sweeps: &hop_sweeps,");
-        let marked = at("crate::hops_view::mark_refused_word_rows(&mut rows, &refused_words, &proofs_set_aside); crate::owed::note_sweep_proof_contradictions(crate::owed::count_sweep_proof_contradictions(&rows));");
-        assert!(
-            remembered < proof_read
-                && proof_read < set_aside
-                && set_aside < derived
-                && derived < marked
+        let remembered = at("if hops_view::confirmation_refused(m, clear) {");
+        let proof_read = at("crate::hopsweep::pick_filed_sweep(newest, sweeps)");
+        let set_aside = at(
+            "hops_view::set_aside_proofs_a_refused_word_contradicts(&mut i.hop_sweeps, &refused)",
         );
+        assert!(remembered < proof_read && proof_read < set_aside);
+        let judge = squash(include_str!("owed_judge.rs"));
+        let derived = judge
+            .find(&squash("derive_owed_rows(&i.as_inputs())"))
+            .expect("the derivation");
+        let marked = judge
+            .find(&squash("crate::hops_view::mark_refused_word_rows(&mut rows, &i.refused_words, &i.proofs_set_aside);"))
+            .expect("the mark");
+        assert!(derived < marked);
     }
 
     /// bsv-low #484 (delta fold 2, D-L5): A 101-OUTPOINT IDENTITY STILL READS ITS MEMOS AND THE REORG TOMBSTONE.
@@ -3351,7 +3222,8 @@ mod tests {
 
     /// bsv-low #484 (delta fold, D-M1): INSIDE THE GRACE A LAGGING COURIER'S "CONFIRMED" DRIVES `claimable: true`
     /// FOR ONE FIVE-MINUTE RECOMPUTE, NOT FIFTEEN MINUTES AND NOT THE ROTATION. Through the real derivation
-    /// (`owed::derive_owed_rows`), the read's one rule (`owed::should_recompute`) and the walk's own words:
+    /// (`owed::derive_owed_rows`) and the walk's own words (bsv-low #893: the read's five-minute re-derivation rule
+    /// retired with the walk; the belt dates such a row):
     /// 1. the walk the clear's push triggers asks a courier behind the reorg; the row says `claimable: true` and is
     ///    an OPEN row, so its list is re-derived after five minutes (it was a closed row: fifteen);
     /// 2. that re-derivation finds the memo past its short window; past the probe budget the memo's word is served
@@ -3365,11 +3237,11 @@ mod tests {
     /// five-minute rule until a checked word or the index's proof lands); the grace's mark, the memo's refused
     /// confirmation and the index proof's precedence are unchanged.
     ///
-    /// To red: drop the grace clause from `owed::row_is_open`, or serve `m.spent_confirmed` in `stale_memo_word`.
+    /// To red: serve `m.spent_confirmed` in `stale_memo_word`.
     #[test]
     fn inside_the_reorg_grace_a_lagging_confirmed_word_is_claimable_for_one_five_minute_recompute()
     {
-        use crate::owed::{outpoint_key, should_recompute, HopChainWord, OwedFamily, OwedRow};
+        use crate::owed::{outpoint_key, HopChainWord, OwedFamily, OwedRow};
         use std::collections::{HashMap, HashSet};
         let t0: i64 = 1_800_000_000_000;
         let min = 60_000i64;
@@ -3424,15 +3296,6 @@ mod tests {
                 HashSet::new()
             }
         };
-        let recompute = |age_ms: i64, row: &OwedRow| {
-            should_recompute(
-                false,
-                age_ms,
-                Some(900_000),
-                Some(900_000),
-                std::slice::from_ref(row),
-            )
-        };
 
         // 1. FIVE SECONDS AFTER THE CLEAR: the courier behind the reorg says "confirmed"
         let w1 = t0 + 5_000;
@@ -3443,11 +3306,6 @@ mod tests {
             "the lagging word is served as the hint, never a press (L2)"
         );
         assert_eq!(row.facts[OWED_FACT_REORG_GRACE_WORD], true);
-        assert!(!recompute(4 * min, &row));
-        assert!(
-            recompute(5 * min + 1, &row),
-            "an OPEN row: re-derived by the five-minute rule, not left for fifteen"
-        );
         // the memo that walk wrote
         let memo = probe_memo_of(
             &hop_txid,
@@ -3499,16 +3357,12 @@ mod tests {
             row.facts["claimReason"],
             crate::owed::UNCONFIRMED_PAYOUT_REASON
         );
-        assert!(
-            recompute(5 * min + 1, &row),
-            "and open, so the walk comes back for it"
-        );
         // asked again within the budget, the courier has caught up: not mined
         let row = derive(w2, fresh(false), &grace_of(Some(false), w2), false);
         assert_eq!(row.facts["claimable"], false);
         // still behind: the same one-recompute word, never a longer one
         let row = derive(w2, fresh(true), &grace_of(Some(true), w2), false);
-        assert!(row.facts["claimable"] == false && recompute(5 * min + 1, &row));
+        assert_eq!(row.facts["claimable"], false);
         // a memo answering inside its short window (a recompute a push triggered two minutes on) is the same word
         let (answered, _) = split_probe_targets_after_reorg(
             &target,
@@ -3546,11 +3400,6 @@ mod tests {
             "a courier's word presses nothing (L2)"
         );
         assert!(row.facts[OWED_FACT_REORG_GRACE_WORD].is_null());
-        assert!(
-            recompute(5 * min + 1, &row),
-            "an open row, waiting for a checked word (L2; it was a closed row)"
-        );
-        assert!(recompute(15 * min + 1, &row), "the fifteen-minute rule");
         let late = ProbeMemo {
             probed_at_ms: w3,
             ..memo.clone()
@@ -3588,19 +3437,22 @@ mod tests {
                 .replace(",)", ")")
                 .replace(",]", "]")
         };
-        let routes = include_str!("routes.rs");
-        let routes = squash(&code_only(
-            &routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())],
-        ));
+        // the judge runs the grace (source; bsv-low #893 section 6.2: the walk that did it retired)
+        let hydrate = squash(&code_only(include_str!("owed_judge/hydrate.rs")));
         for needle in [
-            "let reorg_clear = crate::hops_view::reorg_clear_at(&memos);",
-            "if crate::hops_view::confirmed_in_reorg_grace(p.spent_confirmed, now_ms - age_ms.unwrap_or(0), reorg_clear) { grace_words.insert(outpoint_key(&t, v)); }",
-            "hop_chain.insert(key, crate::hops_view::stale_memo_word(m, now_ms, reorg_clear, tip));",
-            "if crate::hops_view::confirmed_in_reorg_grace(row.spent_confirmed, now_ms, reorg_clear) { grace_words.insert(key.clone()); }",
-            "crate::hops_view::mark_reorg_grace_rows(&mut rows, &grace_words); sort_rows_for_service(&mut rows);",
+            "let clear = hops_view::reorg_clear_at(&memos);",
+            "let mut word = hops_view::stale_memo_word(m, i.now_ms, clear, i.tip);",
+            "if fresh && hops_view::confirmed_in_reorg_grace(m.spent_confirmed, m.probed_at_ms, clear) { i.grace_words.insert(owed::outpoint_key(t, v)); }",
         ] {
-            assert!(routes.contains(&squash(needle)), "the owed walk no longer runs: {needle}");
+            assert!(hydrate.contains(&squash(needle)), "the judge no longer runs: {needle}");
         }
+        let judge = squash(&code_only(include_str!("owed_judge.rs")));
+        assert!(
+            judge.contains(&squash(
+                "crate::hops_view::mark_reorg_grace_rows(&mut rows, &i.grace_words);"
+            )),
+            "the judge no longer marks the grace rows"
+        );
     }
 
     /// bsv-low #451 slice C: the memo split — fresh answers, stale/missing/future asked, a fault never remembered.
@@ -3683,158 +3535,5 @@ mod tests {
         };
         assert_eq!(probe_memo_of("a1", 0, &unknown_spent, now), None);
         assert_eq!(probe_memo_read_sql(3), "SELECT outpoint, probedAtMs, spent, spendingTxid, spentConfirmed, tipHeight FROM hop_chain_probes WHERE outpoint IN (?, ?, ?)");
-    }
-
-    /// bsv-low #469, the stranded cell's run 5 (2026-09-19): the owed walk's two rules against starvation, pinned on
-    /// the shape the pair showed (the same first eight re-probed every five minutes; a new hop never reached).
-    #[test]
-    fn the_owed_walk_keeps_a_confirmed_spend_for_two_hours_and_asks_the_never_probed_newest_first_then_the_oldest_memo(
-    ) {
-        let now = 1_789_829_879_169_i64;
-        let t = |seed: &str| (seed.repeat(32), 0u32);
-        let key = |seed: &str| format!("{}.0", seed.repeat(32));
-        let memo = |seed: &str, age_ms: i64, spent: bool, confirmed: Option<bool>| ProbeMemo {
-            outpoint: key(seed),
-            probed_at_ms: now - age_ms,
-            spent,
-            spending_txid: if spent { Some("e5".repeat(32)) } else { None },
-            spent_confirmed: confirmed,
-            tip_height: None,
-        };
-        // 1. the confirmed window (2 h since the gate's M1): a CONFIRMED spend 1 h old answers the owed walk and is asked
-        //    by everyone else; 3 h old it is asked by all; an UNCONFIRMED spend and an UNSPENT word 6 min old are asked
-        //    by all (the 5 min window)
-        let memos = vec![
-            memo("a1", 60 * 60_000, true, Some(true)),
-            memo("b2", 3 * 60 * 60_000, true, Some(true)),
-            memo("c3", 6 * 60_000, true, Some(false)),
-            memo("d4", 6 * 60_000, false, None),
-        ];
-        let targets = vec![t("a1"), t("b2"), t("c3"), t("d4")];
-        let (answered, to_probe) = split_probe_targets_with(
-            &targets,
-            &memos,
-            now,
-            PROBE_MEMO_MAX_AGE_MS,
-            PROBE_MEMO_CONFIRMED_MAX_AGE_MS,
-        );
-        assert_eq!(
-            answered
-                .iter()
-                .map(|(t, _, _)| t.clone())
-                .collect::<Vec<_>>(),
-            vec!["a1".repeat(32)],
-            "judged {answered:?}"
-        );
-        assert_eq!(answered[0].2.spent_confirmed, Some(true));
-        assert_eq!(
-            to_probe,
-            vec![t("b2"), t("c3"), t("d4")],
-            "judged {to_probe:?}"
-        );
-        let (answered, to_probe) =
-            split_probe_targets(&targets, &memos, now, PROBE_MEMO_MAX_AGE_MS);
-        assert!(
-            answered.is_empty(),
-            "one window: the confirmed memo past 5 min is asked too ({answered:?})"
-        );
-        assert_eq!(to_probe, targets);
-        // 2. the order: never probed first, newest marker first, then the expired memos oldest first
-        let memos = vec![
-            memo("m1", 10 * 60_000, false, None),
-            memo("m2", 20 * 60_000, true, Some(false)),
-        ];
-        let marker_at: std::collections::HashMap<String, i64> = [
-            (key("n1"), now - 40 * 60_000), // stranded 40 min ago
-            (key("n2"), now - 31 * 60_000), // just crossed the window: first
-            (key("m1"), now - 3 * 60 * 60_000),
-            (key("m2"), now - 2 * 60 * 60_000),
-        ]
-        .into_iter()
-        .collect();
-        let to_probe = vec![t("m1"), t("n1"), t("m2"), t("n0"), t("n2")]; // the hops view's rank order, as the route hands it over
-        let ordered = order_probe_targets(to_probe.clone(), &memos, &marker_at, 8, 0);
-        assert_eq!(
-            ordered,
-            vec![t("n2"), t("n1"), t("n0"), t("m2"), t("m1")],
-            "judged {ordered:?}"
-        );
-        // the gate's M2: the never group's share of the FRONT is capped; the expired memos follow at once, the rest of the
-        // never group after them (here cap 2: n2, n1 lead; m2, m1 next; n0 last)
-        let capped = order_probe_targets(to_probe.clone(), &memos, &marker_at, 2, 0);
-        assert_eq!(
-            capped,
-            vec![t("n2"), t("n1"), t("m2"), t("m1"), t("n0")],
-            "judged {capped:?}"
-        );
-        // the delta-verify's NEW-2: with cap 2 the leader is fixed and the ONE other front slot ROTATES through the rest
-        // of the never group (n1 at minute 0, n0 at minute 1), so every never-probed outpoint reaches the front for some
-        // minute; the expired memos follow the front either way
-        let r0 = order_probe_targets(to_probe.clone(), &memos, &marker_at, 2, 0);
-        let r1 = order_probe_targets(to_probe, &memos, &marker_at, 2, 1);
-        assert_eq!(
-            r0,
-            vec![t("n2"), t("n1"), t("m2"), t("m1"), t("n0")],
-            "rotate 0 ({r0:?})"
-        );
-        assert_eq!(
-            r1,
-            vec![t("n2"), t("n0"), t("m2"), t("m1"), t("n1")],
-            "rotate 1 ({r1:?})"
-        );
-        // the gate's L4 (the delta-verify's NEW-3, the DISCRIMINATING case): two rows for one key with DIFFERENT windows —
-        // an older CONFIRMED row still inside its 2 h window and a newer UNSPENT row past its 5 min window. The split must
-        // judge the NEWEST row (stale → asked); the old first-match-that-fits answered with the older, contradicted word.
-        let two_windows = vec![
-            memo("a1", 30 * 60_000, true, Some(true)),
-            memo("a1", 10 * 60_000, false, None),
-        ];
-        let (answered, to_probe2) = split_probe_targets_with(
-            &[t("a1")],
-            &two_windows,
-            now,
-            PROBE_MEMO_MAX_AGE_MS,
-            PROBE_MEMO_CONFIRMED_MAX_AGE_MS,
-        );
-        assert!(
-            answered.is_empty(),
-            "the newest (unspent, 10 min) row is judged, and it is stale ({answered:?})"
-        );
-        assert_eq!(to_probe2, vec![t("a1")]);
-        // a newcomer behind eight expired memos is asked first (the pair's shape: 35 candidates, 8 per recompute)
-        let backlog: Vec<ProbeMemo> = (0..8)
-            .map(|i| {
-                memo(
-                    &format!("{i}{i}"),
-                    (i as i64 + 6) * 60_000,
-                    true,
-                    Some(false),
-                )
-            })
-            .collect();
-        let mut to_probe: Vec<(String, u32)> = (0..8).map(|i| t(&format!("{i}{i}"))).collect();
-        to_probe.push(t("ff"));
-        let ordered =
-            order_probe_targets(to_probe, &backlog, &std::collections::HashMap::new(), 4, 0);
-        assert_eq!(
-            ordered[0],
-            t("ff"),
-            "the never-probed newcomer leads ({ordered:?})"
-        );
-        assert_eq!(ordered[1], t("77"), "then the oldest memo ({ordered:?})");
-        // M2's shape: nine never-probed unanswerables + eight expired memos, budget 8 → the expired still get four slots
-        let never9: Vec<(String, u32)> = (0..9).map(|i| t(&format!("e{i}"))).collect();
-        let mut mixed = never9.clone();
-        mixed.extend((0..8).map(|i| t(&format!("{i}{i}"))));
-        let front: Vec<(String, u32)> =
-            order_probe_targets(mixed, &backlog, &std::collections::HashMap::new(), 4, 0)
-                .into_iter()
-                .take(8)
-                .collect();
-        assert_eq!(
-            front.iter().filter(|x| never9.contains(x)).count(),
-            4,
-            "four never, four expired in the first eight ({front:?})"
-        );
     }
 }

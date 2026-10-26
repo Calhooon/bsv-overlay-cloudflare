@@ -105,15 +105,16 @@ use crate::pot_hook::{Bind, SqlPort, Stmt, StmtOut};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 mod hydrate;
+pub mod rank;
 mod writers;
+pub(crate) use hydrate::hydrate_filings;
+pub use hydrate::{
+    hydrate_inputs, COLLECTED_SQL, DOOR_REFUSAL_SQL, HONOURED_EVIDENCE, HOPS_SQL,
+    HOP_COMPETITORS_SQL, LINKS_SQL, MISSING_SQL, PARTIES_SQL, RELEASED_SQL, REPRESENTATIVES_SQL,
+};
 pub use writers::{
     drain_changed, drain_identities, judge_word_write, mark_tip, DATE_SWEEPS_SQL, MARK_TIP_SQL,
     MARK_UNTIPPED_SQL, UNTIPPED_MARKS_PER_TIP,
-};
-pub(crate) use hydrate::hydrate_filings;
-pub use hydrate::{
-    hydrate_inputs, HONOURED_EVIDENCE, HOPS_SQL, HOP_COMPETITORS_SQL, LINKS_SQL, MISSING_SQL,
-    PARTIES_SQL, RELEASED_SQL, REPRESENTATIVES_SQL,
 };
 
 pub const OWED_JUDGE_SUBJECTS_PER_INVOCATION: usize = 16;
@@ -638,16 +639,6 @@ fn row_statements(
     let due = belt_due(&row, stamp, evidence);
     strip_words(&mut row);
     if let Some(facts) = row.facts.as_object_mut() {
-        for k in [
-            "refresh",
-            "carried",
-            "claimableBeforeShed",
-            "supersededFallback",
-            "judgedAtMs",
-            "spenderUnread",
-        ] {
-            facts.remove(k);
-        }
         facts.insert("beltNextAtMs".into(), json!(due));
     }
     let int = |n: Option<i64>| n.map_or(Bind::Null, Bind::Int);
@@ -921,26 +912,22 @@ pub(crate) fn assert_fixture_roundtrip(i: &OwedInputs<'_>) {
         c.execute_batch("CREATE TABLE owed_row_words(identity TEXT,outpoint TEXT,role TEXT,txid TEXT,PRIMARY KEY(identity,outpoint,role))").unwrap();
         c
     }
+    /// The word facts (joined at the read) and the facts the judge's write stamps.
+    const STRIPPED: &[&str] = &[
+        "coinWord",
+        "spenderWord",
+        "fundingWord",
+        "tracker",
+        "tipMoved",
+        "servedTip",
+        "beltNextAtMs",
+    ];
     fn rows(c: &Connection, sql: &str, identity: &str) -> BTreeSet<String> {
         let mut s = c.prepare(sql).unwrap();
         s.query_map([identity], |r| {
             let mut facts: Value = serde_json::from_str(&r.get::<_, String>("facts")?).unwrap();
-            for key in [
-                "coinWord",
-                "spenderWord",
-                "fundingWord",
-                "tracker",
-                "refresh",
-                "carried",
-                "claimableBeforeShed",
-                "supersededFallback",
-                "judgedAtMs",
-                "spenderUnread",
-                "tipMoved",
-                "servedTip",
-                "beltNextAtMs",
-            ] {
-                facts.as_object_mut().unwrap().remove(key);
+            for key in STRIPPED {
+                facts.as_object_mut().unwrap().remove(*key);
             }
             Ok(json!([
                 r.get::<_, String>("identity")?,
@@ -960,22 +947,7 @@ pub(crate) fn assert_fixture_roundtrip(i: &OwedInputs<'_>) {
         .collect()
     }
     let derived = derive_owed_rows(i);
-    let mut old = schema();
     let mut new = schema();
-    let tx = old.transaction().unwrap();
-    for (sql, binds) in
-        crate::owed::owed_write_plan(i.identity_lc, &derived, i.now_ms, i.tip, false)
-    {
-        let values = binds.into_iter().map(|b| match b {
-            crate::owed::OwedBind::Text(s) => SqlValue::Text(s),
-            crate::owed::OwedBind::Int(n) => SqlValue::Integer(n),
-            crate::owed::OwedBind::Null => SqlValue::Null,
-        });
-        let mut stmt = tx.prepare(sql).unwrap();
-        let mut result = stmt.query(rusqlite::params_from_iter(values)).unwrap();
-        while result.next().unwrap().is_some() {}
-    }
-    tx.commit().unwrap();
     let tx = new.transaction().unwrap();
     for r in &derived {
         for stmt in row_statements(r, i.now_ms, i.tip, None) {
@@ -987,10 +959,35 @@ pub(crate) fn assert_fixture_roundtrip(i: &OwedInputs<'_>) {
         }
     }
     tx.commit().unwrap();
+    // The derived rows, read back through the judge's own read, field for field (bsv-low #893 section 6.2: the old
+    // walk's write plan, the other side of this comparison, retired with the walk).
+    let expected: BTreeSet<String> = derived
+        .iter()
+        .map(|r| {
+            let mut facts = r.facts.clone();
+            for key in STRIPPED {
+                if let Some(o) = facts.as_object_mut() {
+                    o.remove(*key);
+                }
+            }
+            json!([
+                r.identity,
+                r.outpoint,
+                r.family.as_str(),
+                r.game_id,
+                r.sats.map(|v| v as i64),
+                r.opponent_identity,
+                r.at_height.map(|v| v as i64),
+                r.reason,
+                facts
+            ])
+            .to_string()
+        })
+        .collect();
     assert_eq!(
-        rows(&old, crate::owed::OWED_ROWS_READ_SQL, i.identity_lc),
         rows(&new, ROWS_READ_SQL, i.identity_lc),
-        "the judge's stored rows must equal the walk's on every input fixture"
+        expected,
+        "the judge's stored rows must equal the derivation on every input fixture"
     );
     let mut stmt = new.prepare(crate::owed_read::ROWS_SQL).unwrap();
     let names: Vec<_> = stmt.column_names().into_iter().map(str::to_owned).collect();
@@ -1061,7 +1058,6 @@ pub(crate) fn assert_fixture_roundtrip(i: &OwedInputs<'_>) {
     }
     for body in [&mut served, &mut previous] {
         body.as_object_mut().unwrap().remove("pending");
-        body.as_object_mut().unwrap().remove("markerlessProgress");
         for row in body["rows"].as_array_mut().unwrap() {
             for key in [
                 "coinWord",

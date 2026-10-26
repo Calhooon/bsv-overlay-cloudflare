@@ -602,34 +602,17 @@ async fn d2fold_low2_one_subjects_commit_reads_its_game_not_the_identity() {
     }
     eprintln!("LOW-2: one subject's commit statements on a 500-row identity: {now} VM steps (the base's: {base})");
     assert!(now * 5 < base, "{now} against {base}");
-    // the old worker's whole-identity write (the deploy window) sets the figure explicitly: still exact after it
-    let rows: Vec<low_app_layer::owed::OwedRow> = (0..3)
-        .map(|n| low_app_layer::owed::OwedRow {
-            identity: seat.into(),
-            outpoint: format!("{}:0", hop(30_000 + n)),
-            family: low_app_layer::owed::OwedFamily::Unbound,
-            game_id: "g".into(),
-            sats: None,
-            opponent_identity: None,
-            at_height: None,
-            facts: serde_json::json!({}),
-            reason: None,
-        })
-        .collect();
+    // an old worker's keyless rows (its column set; the walk that wrote them retired, bsv-low #893 section 6.2): the
+    // row-count triggers keep the figure exact through them
     {
         let conn = db.conn.borrow();
-        let tx = conn.unchecked_transaction().unwrap();
-        for (sql, binds) in low_app_layer::owed::owed_write_plan(seat, &rows, NOW as i64 + 1, Some(900_000), false) {
-            let values = binds.into_iter().map(|b| match b {
-                low_app_layer::owed::OwedBind::Text(s) => SqlValue::Text(s),
-                low_app_layer::owed::OwedBind::Int(n) => SqlValue::Integer(n),
-                low_app_layer::owed::OwedBind::Null => SqlValue::Null,
-            });
-            let mut st = tx.prepare(sql).unwrap();
-            let mut q = st.query(rusqlite::params_from_iter(values)).unwrap();
-            while q.next().unwrap().is_some() {}
+        for n in 0..3 {
+            conn.execute(
+                "INSERT INTO owed_rows (identity, outpoint, family, gameId, facts, updatedAtMs) VALUES (?1, ?2, 'unbound', 'g', '{}', ?3)",
+                rusqlite::params![seat, format!("{}:0", hop(30_000 + n)), NOW as i64 + 1],
+            )
+            .unwrap();
         }
-        tx.commit().unwrap();
     }
     assert_eq!(
         db.int(&format!("SELECT rows FROM owed_state WHERE identity='{seat}'")),

@@ -1,45 +1,13 @@
-//! #638: walk candidate metadata once by createdAt, then preserve the view's ranking.
-//! Each source page is bounded before any join. BLOB hydration happens only for selected pots.
+//! The judge's selection and hydration of one identity's chosen games (bsv-low #638's ranked view, kept by #893
+//! section 6.2 when the walk's createdAt cursor over the three sources retired): the same representative, quota and
+//! dense ranks as `results_sql` / `refund_view_sql` and the hops window, and the views' own outer projections over
+//! the chosen rows. BLOB hydration happens only for selected pots.
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+/// The hydration page: the chosen rows bound as one JSON array of at most this many.
 pub const PAGE: usize = 32;
-pub const PAGE_READ_CEILING: usize = 287;
-
-#[derive(Clone, Copy, Debug)]
-pub enum Source {
-    Party,
-    Link,
-    Hop,
-}
-
-/// NULL stamps form a separate indexed prefix, so no sentinel can skip a legacy row.
-/// Non-NULL pages seek by (createdAt,rowid); rowid breaks equal-stamp ties.
-pub fn candidates_sql(source: Source, nulls: bool, seek: bool, next_stamp: bool) -> String {
-    let (table, index) = match source {
-        Source::Party => ("potparty_records", "idx_potparty_identity_created"),
-        Source::Link => ("hop_pot_links", "idx_hop_pot_links_identity_created"),
-        Source::Hop => ("hopparty_records", "idx_hopparty_identity_created"),
-    };
-    let predicate = match (nulls, seek) {
-        (true, false) => "1=1",
-        (true, true) => "createdAt IS NULL AND rowid > ?2",
-        (false, false) => "createdAt IS NOT NULL",
-        (false, true) if next_stamp => "createdAt > ?2",
-        (false, true) => "createdAt = ?2 AND rowid > ?3",
-    };
-    let source_sql = format!("(SELECT *, rowid AS cursorRowid FROM {table} INDEXED BY {index} WHERE identity=?1 AND {predicate} ORDER BY createdAt,rowid LIMIT {PAGE})");
-    if matches!(source, Source::Hop) {
-        return format!("SELECT page_row.*, page_row.txid AS hopTxid, page_row.hopVout, page_row.txid AS markerTxid, page_row.outputIndex AS markerVout, page_row.createdAt AS markerCreatedAt, page_row.cursorRowid AS markerRowid, r.createdAt AS potCreatedAt, r.txid IS NULL AS unknownHop, r.spent, r.spendingTxid, r.spentConfirmed, r.spenderFinal, CASE WHEN page_row.hopLockHex IS NOT NULL AND page_row.hopSatsOnChain=page_row.hopSats THEN 0 ELSE 1 END AS paidTier FROM {source_sql} page_row LEFT JOIN pot_records r ON r.txid=page_row.txid AND r.outputIndex=page_row.hopVout ORDER BY page_row.createdAt,page_row.cursorRowid");
-    }
-    let party = match source {
-        Source::Party => format!("SELECT s.*, s.cursorRowid AS markerRowid FROM {source_sql} s"),
-        Source::Link => format!("SELECT hp.identity, hp.opponentIdentity, hp.gameId, s.potTxid, s.potVout, pot.recoveryHeight, hp.seatSettlePubkey, hp.seatSigHex, hp.identitySigHex AS sigHex, hp.markerValid AS sigValid, hp.createdAt, hp.rowid AS markerRowid, s.cursorRowid FROM {source_sql} s CROSS JOIN hopparty_records hp ON hp.rowid=s.markerRowid CROSS JOIN pot_records pot ON pot.txid=s.potTxid AND pot.outputIndex=s.potVout"),
-        Source::Hop => unreachable!(),
-    };
-    format!("SELECT pp.*, r.createdAt AS potCreatedAt, r.txid IS NULL AS unknownPot FROM ({party}) pp LEFT JOIN pot_records r ON r.txid=pp.potTxid AND r.outputIndex=pp.potVout ORDER BY pp.createdAt,pp.cursorRowid")
-}
 
 pub fn number(v: &Value, key: &str) -> Option<i64> {
     v[key]
@@ -324,149 +292,6 @@ pub fn hydrate_hops_sql() -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{prefix}FROM (SELECT {fields} FROM json_each(?1)) w LEFT JOIN{suffix}")
-}
-
-/// Preserve the original rank windows and their probe/drop behavior at the walk cap,
-/// including dense-rank ties. A createdAt cursor changes retrieval, never selection.
-pub fn party_walk(rows: &[Value], pages: usize) -> (Vec<Vec<Value>>, bool) {
-    let cap = crate::results::RESULTS_MAX_ROWS;
-    let mut out = Vec::new();
-    let mut more = false;
-    for page in 0..pages {
-        let after = page * cap;
-        let mut selected: Vec<_> = rows
-            .iter()
-            .filter(|v| {
-                let rank = number(v, "finalRank").unwrap() as usize;
-                rank > after && rank <= after + cap + 1
-            })
-            .take(cap + 1)
-            .cloned()
-            .collect();
-        more = selected.len() > cap;
-        selected.truncate(cap);
-        out.push(selected);
-        if !more {
-            break;
-        }
-    }
-    (out, more)
-}
-
-pub fn hop_walk(rows: &[Value], pages: usize) -> (Vec<Vec<Value>>, bool) {
-    let cap = crate::hops_view::HOPS_VIEW_MAX_OUTPOINTS;
-    let row_cap = (cap + 1) * crate::hops_view::HOPS_VIEW_ROWS_PER_OUTPOINT;
-    let mut out = Vec::new();
-    let mut more = false;
-    for page in 0..pages {
-        let after = page * cap;
-        let selected: Vec<_> = rows
-            .iter()
-            .filter(|v| {
-                let rank = number(v, "finalRank").unwrap() as usize;
-                rank > after && rank <= after + cap + 1
-            })
-            .take(row_cap)
-            .cloned()
-            .collect();
-        let mut keys = Vec::new();
-        for v in &selected {
-            let key = hop_key(v);
-            if !keys.contains(&key) {
-                keys.push(key);
-            }
-        }
-        more = keys.len() > cap;
-        keys.truncate(cap);
-        out.push(
-            selected
-                .into_iter()
-                .filter(|v| keys.contains(&hop_key(v)))
-                .collect(),
-        );
-        if !more {
-            break;
-        }
-    }
-    (out, more)
-}
-
-/// SQLite versions that cannot seek the implicit rowid in a tuple range still
-/// seek it with an equality on createdAt. Exhaust that stamp, then seek the next.
-#[derive(Default)]
-pub struct Cursor {
-    pub last: Option<(Option<i64>, i64)>,
-    pub next_stamp: bool,
-}
-impl Cursor {
-    /// A compound UNION ALL does not promise the order of each returned arm.
-    pub fn start(&mut self, rows: &[Value]) {
-        self.last = rows
-            .iter()
-            .map(|row| {
-                (
-                    number(row, "createdAt"),
-                    number(row, "cursorRowid").unwrap(),
-                )
-            })
-            .max();
-    }
-
-    pub fn bind_numbers(&self, nulls: bool) -> Vec<i64> {
-        match self.last {
-            None => vec![],
-            Some((_, rowid)) if nulls => vec![rowid],
-            Some((stamp, _)) if self.next_stamp => vec![stamp.unwrap()],
-            Some((stamp, rowid)) => vec![stamp.unwrap(), rowid],
-        }
-    }
-    pub fn advance(&mut self, rows: &[Value], _nulls: bool) -> bool {
-        let scoped_stamp = self.last.is_some() && !self.next_stamp;
-        if let Some(last) = rows.last() {
-            self.last = Some((
-                number(last, "createdAt"),
-                number(last, "cursorRowid").unwrap(),
-            ));
-        }
-        if rows.len() < PAGE {
-            if scoped_stamp {
-                self.next_stamp = true;
-                return true;
-            }
-            return false;
-        }
-        self.next_stamp = false;
-        true
-    }
-}
-
-impl Cursor {
-    pub fn phase(&self) -> (bool, bool) {
-        match self.last {
-            None => (true, false),
-            Some((None, _)) if self.next_stamp => (false, false),
-            Some((None, _)) => (true, true),
-            Some((Some(_), _)) => (false, true),
-        }
-    }
-}
-
-pub const INITIAL_PAGE: usize = 16;
-
-/// One bounded initial read for the two party-shaped sources. This avoids an
-/// empty-source statement on small identities, while keeping the statement below 287.
-pub fn initial_party_sql() -> String {
-    let columns = "identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,seatSettlePubkey,seatSigHex,sigHex,createdAt,markerRowid,sigValid,cursorRowid,potCreatedAt,unknownPot";
-    [Source::Party, Source::Link]
-        .into_iter()
-        .enumerate()
-        .map(|(i, source)| {
-            let sql = candidates_sql(source, true, false, false)
-                .replace(&format!("LIMIT {PAGE}"), &format!("LIMIT {INITIAL_PAGE}"));
-            format!("SELECT {i} AS sourceTag,{columns} FROM ({sql})")
-        })
-        .collect::<Vec<_>>()
-        .join(" UNION ALL ")
 }
 
 /// Results and refund projections share one bounded spine read, with separate

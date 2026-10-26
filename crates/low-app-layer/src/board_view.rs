@@ -72,9 +72,9 @@ impl DurableObject for BoardView {
         self.flush_counters_if_due();
         out
     }
-    /// bsv-low #628: the deferred owed walk runs in this actor's isolate, so its counts (the walk's couriers,
-    /// its faults, the abandoned retry) are flushed here, under the census's due rule, never only by a fetch
-    /// isolate that never saw them.
+    /// bsv-low #628: the owed belt's tick runs in this actor's isolate (#893 section 5; it was the deferred owed
+    /// walk's), so its counts (the belt's couriers, its faults) are flushed here, under the census's due rule, never
+    /// only by a fetch isolate that never saw them.
     async fn alarm(&self) -> Result<Response> {
         self.install_courier_sink();
         let out = self.serve_alarm().await;
@@ -84,8 +84,8 @@ impl DurableObject for BoardView {
 }
 
 impl BoardView {
-    /// bsv-low #731: the deferred owed walk asks couriers from this actor's isolate, which may never have run the
-    /// front door's entry, so the actor installs the courier sink itself.
+    /// bsv-low #731: the owed belt asks couriers from this actor's isolate, which may never have run the front
+    /// door's entry, so the actor installs the courier sink itself.
     fn install_courier_sink(&self) {
         crate::routes::set_courier_sink(self.env.var("COURIER_SINK").ok().map(|v| v.to_string()));
     }

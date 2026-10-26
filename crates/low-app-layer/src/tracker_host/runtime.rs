@@ -412,95 +412,6 @@ pub fn spend_depth_health_json(raw: Option<&str>) -> Value {
     })
 }
 
-/// Owed snapshots already persist their word tuples in facts. Recheck those
-/// proofs without another D1 lookup or a read-triggered fallback write.
-pub async fn owed_body(env: &worker::Env, value: &mut Value) {
-    fn collect(value: &Value, rows: &mut BTreeMap<String, Row>) {
-        if let Some(obj) = value.as_object() {
-            if let (Some(word), Some(id)) = (
-                obj.get("spenderWord"),
-                obj.get("coinWord").and_then(|c| c["txid"].as_str()),
-            ) {
-                let p = &word["verifyPath"];
-                rows.insert(
-                    id.to_string(),
-                    Row {
-                        txid: id.into(),
-                        word: word["word"].as_str().unwrap_or("unknown").into(),
-                        tier: word["tier"].as_str().unwrap_or("host").into(),
-                        height: word["height"].as_f64(),
-                        proof_root: p["root"].as_str().map(str::to_string),
-                        proof_height: p["height"].as_f64(),
-                        proof_hex: p["merklePath"].as_str().map(str::to_string),
-                        header_hash: p["headerHash"].as_str().map(str::to_string),
-                        hint_source: word["source"].as_str().map(str::to_string),
-                        hint_at: word["at"].as_f64(),
-                        updated_at: 0.0,
-                        legacy_body: None,
-                    },
-                );
-            }
-            for (key, child) in obj {
-                if key != "spenderWord" {
-                    collect(child, rows);
-                }
-            }
-        } else if let Some(a) = value.as_array() {
-            for child in a {
-                collect(child, rows);
-            }
-        }
-    }
-    fn replace(value: &mut Value, views: &BTreeMap<String, Value>) {
-        if let Some(obj) = value.as_object_mut() {
-            let id = obj
-                .get("coinWord")
-                .and_then(|c| c["txid"].as_str())
-                .map(str::to_string);
-            if let Some(id) = id {
-                if let Some(word) = views.get(&id) {
-                    let old_coin = obj["coinWord"]["word"].as_str().unwrap_or("pending");
-                    let coin = if word["word"] == "stale" {
-                        "suspended"
-                    } else if word["word"] == "mined" && !word["verifyPath"].is_null() {
-                        if old_coin == "lost" {
-                            "lost"
-                        } else {
-                            "spent"
-                        }
-                    } else {
-                        "pending"
-                    };
-                    obj.insert(
-                        "coinWord".into(),
-                        crate::owed::coin_word_value(coin, &id, word),
-                    );
-                    obj.insert("spenderWord".into(), word.clone());
-                }
-            }
-            for (key, child) in obj.iter_mut() {
-                if key != "spenderWord" {
-                    replace(child, views);
-                }
-            }
-        } else if let Some(a) = value.as_array_mut() {
-            for child in a {
-                replace(child, views);
-            }
-        }
-    }
-    let mut rows = BTreeMap::new();
-    collect(value, &mut rows);
-    // A recompute with a word-store fault persists only legacy facts. Do not
-    // synthesize tracker decorations when that snapshot has no word tuples.
-    if rows.is_empty() {
-        return;
-    }
-    let views = views(env, &rows).await;
-    replace(value, &views);
-    decorate(value, None, &views);
-}
-
 #[derive(serde::Deserialize)]
 struct BeefRow {
     beef: Option<Vec<u8>>,
@@ -1207,7 +1118,7 @@ mod budget_pins {
     fn ns3_m4_a_read_with_no_row_writes_nothing() {
         let runtime = include_str!("runtime.rs");
         let body = &runtime[runtime.find("pub async fn body_loaded(").unwrap()
-            ..runtime.find("pub async fn owed_body(").unwrap()];
+            ..runtime.find("pub fn spend_depth_of(").unwrap()];
         assert!(
             !body.contains("event("),
             "a read with no row still writes a fallback word"
@@ -1219,13 +1130,11 @@ mod budget_pins {
             !tx.contains("runtime::event("),
             "tx-any read still writes a word"
         );
-        let owed = &routes[routes.find("async fn owed_recompute_inner(").unwrap()
-            ..routes
-                .find("let mut rows = derive_owed_rows(&inputs);")
-                .unwrap()];
+        // bsv-low #893: the owed judge reads the words its hydration needs and writes none
+        let hydrate = include_str!("../owed_judge/hydrate.rs");
         assert!(
-            !owed.contains("runtime::event("),
-            "owed read still writes a word"
+            !hydrate.contains("runtime::event("),
+            "the owed judge's read still writes a word"
         );
     }
 }

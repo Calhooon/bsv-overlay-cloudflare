@@ -33,7 +33,7 @@ fn obs_628_the_flush_is_one_hop_per_64_increments_or_per_minute() {
     let mut hops = 0;
     let mut written = 0;
     for _ in 0..COURIER_FLUSH_AT_CALLS {
-        crate::owed::note_recompute_shed();
+        note_presence("applayer_owed_read_faults_total");
         let batch = take_pending_if_due(NOW + 1.0);
         if !batch.is_empty() {
             hops += 1;
@@ -63,102 +63,35 @@ fn obs_628_the_flush_is_one_hop_per_64_increments_or_per_minute() {
     );
 }
 
+/// bsv-low #893 section 6.2: the walk's recompute counters retired with it (their durable rows stay seeded and
+/// served); the judge's markerless read fault is mirrored as a read fault of its kind beside the sum.
 #[test]
-fn obs_628_the_owed_faults_and_the_recompute_seq_are_mirrored() {
-    let before = crate::owed::owed_health_json();
-    crate::owed::note_recompute_fault();
-    crate::owed::note_recompute_shed();
-    crate::owed::note_recompute_deferred_abandoned();
-    crate::owed::note_recompute_deferred_faulted();
-    crate::owed::note_recompute_arm_failed();
-    crate::owed::note_spender_read_fault();
+fn obs_628_the_owed_read_faults_are_mirrored() {
     crate::owed::note_markerless_read_fault();
-    crate::owed::note_sweep_proof_contradictions(3);
-    crate::owed::note_recompute("read-first", &[]);
     let d = drained();
     for (name, want) in [
-        ("applayer_owed_recompute_faults_total", 1),
-        ("applayer_owed_recompute_shed_total", 1),
-        ("applayer_owed_recompute_deferred_abandoned_total", 1),
-        ("applayer_owed_recompute_deferred_faulted_total", 1),
-        ("applayer_owed_recompute_arm_failed_total", 1),
-        ("applayer_owed_read_faults_total", 2),
-        ("applayer_owed_read_faults_spender_total", 1),
+        ("applayer_owed_read_faults_total", 1),
         ("applayer_owed_read_faults_markerless_total", 1),
-        ("applayer_owed_sweep_proof_contradictions_total", 3),
-        (crate::owed::COUNTER_RECOMPUTES, 1),
     ] {
         assert_eq!(d.get(name).copied(), Some(want), "{name} in {d:?}");
     }
-    let after = crate::owed::owed_health_json();
-    let seq = |v: &serde_json::Value| v["recomputesThisIsolate"].as_u64().unwrap();
-    assert!(
-        seq(&after) > seq(&before),
-        "the isolate's recomputesThisIsolate is served beside them"
-    );
 }
 
-/// The isolate fields on `/health.owed` keep their keys; `recomputesThisIsolate` is the one added (#628; the lens's
-/// M1 renamed it from `recomputeSeq`, which is #566's per-identity sequence on `/owed`, never on `/health`).
+/// The isolate fields on `/health.owed` since the walk retired (bsv-low #893 section 6.2): the judge's markerless
+/// read, the probe memo read, the spender-bytes sweep, and the stranded window. `recomputeSeq` is #566's
+/// per-identity word on `/owed`, never an isolate field.
 #[test]
-fn obs_628_the_owed_health_keys_are_the_old_ones_and_recomputes_this_isolate() {
+fn obs_628_the_owed_health_keys_are_the_judges() {
     let v = crate::owed::owed_health_json();
-    let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
     let mut want = vec![
         "countersScope",
-        "recomputeBySource",
-        "rowsWrittenByFamily",
-        "recomputeFaults",
-        "recomputeCoalesced",
-        "recomputeLockTakeovers",
-        "recomputeWritesSuperseded",
-        "recomputeShed",
-        "owed_recompute_shed_total",
-        "owed_recompute_deferred_total",
-        "owed_recompute_arm_failed_total",
-        "owed_recompute_deferred_abandoned_total",
-        "owed_recompute_deferred_faulted_total",
-        "recomputesPerIdentityPerMinute",
-        "recomputeCeilingScope",
-        "collectedReadFaults",
-        "heldFilingsMatched",
-        "heldFilingsKeyMismatch",
-        "payVoutReadFaults",
-        "potSpendersReadFaults",
-        "hopSweepsReadFaults",
-        "sweepProofsReadFaults",
         "markerlessReadFaults",
         "markerlessIgnoredMarkers",
         "probeMemoReadFaults",
-        "sweepProofContradictions",
-        "owed_swept_confirmed_by_proof_total",
-        "spenderReadFaults",
-        "withheldPreviousReadFaults",
-        "spenderStoreHits",
-        "spenderStorePersisted",
-        "spenderStoreCarried",
-        "spenderStoreReadFaults",
         "spenderStoreSweepPasses",
-        "spenderReadsPerRecompute",
-        "recomputeTimeBudgetMs",
-        "readRefreshesKicked",
-        "readRefreshesSkippedInFlight",
         "hopStrandedAfterMs",
-        "recomputeOpenAfterMs",
-        "recomputeAnyAfterMs",
-        "recomputesThisIsolate",
-        // bsv-low #800: the lock's take-over age, the walks dropped at their deadline or never started, the deadline
-        "recomputeLockTakeoverMaxAgeMs",
-        "recomputeWalkDeadline",
-        "recomputeNoSlice",
-        "recomputeWalkHardDeadlineMs",
-        "recomputeDeferredWalkDeadlineMs",
     ];
-    assert!(
-        !keys.contains(&"recomputeSeq"),
-        "recomputeSeq is #566's per-identity word on /owed, not an isolate field"
-    );
-    let mut keys = keys;
     keys.sort_unstable();
     want.sort_unstable();
     assert_eq!(keys, want);
@@ -255,7 +188,7 @@ fn obs_628_every_name_is_seeded_by_the_overlay() {
 }
 
 /// The flush the router's answer, the front door's refusals and the exempt identity routes ride, and the
-/// BoardView actor's (where the deferred owed walk runs).
+/// BoardView actor's (where the owed belt's tick runs).
 #[test]
 fn obs_628_every_door_flushes_under_the_due_rule() {
     let squash = |s: &str| s.split_whitespace().collect::<String>();
@@ -279,105 +212,52 @@ fn obs_628_every_door_flushes_under_the_due_rule() {
 }
 
 /// bsv-low #566 (the W1-OBS-APPLAYER lens's M1): `recomputeSeq` is PER IDENTITY, stored in the identity's
-/// `owed_state` row and bumped by the snapshot's own upsert, so it moves once per LANDED write (a superseded walk's
-/// refused upsert leaves it), is monotone across isolates (it lives in the row), and is served on the `/owed`
-/// answer beside `computedAtMs`. Real SQLite, the shipped statements in the shipped order.
+/// `owed_state` row and bumped by the judge's state statement once per judgement (bsv-low #893: the judge's batch,
+/// where it was the walk's snapshot upsert), monotone across isolates (it lives in the row), and served on the
+/// `/owed` answer beside `computedAtMs`. Real SQLite under the overlay's migrations, the judge's shipped statements.
 #[test]
-fn obs_566_recompute_seq_is_per_identity_and_rides_the_snapshot_row() {
-    use crate::owed::{
-        owed_body, owed_write_landed, owed_write_plan, OwedBind, OWED_ROWS_CREATE,
-        OWED_STATE_CREATE, OWED_STATE_READ_SQL, OWED_STATE_SEQ_ALTER,
-    };
+fn obs_566_recompute_seq_is_per_identity_and_rides_the_state_row() {
+    use crate::owed_judge::{STATE_CREATE_SQL, STATE_UPDATE_SQL};
     const A: &str = "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch(OWED_ROWS_CREATE).unwrap();
-    conn.execute_batch(OWED_STATE_CREATE).unwrap();
-    conn.execute_batch(OWED_STATE_SEQ_ALTER).unwrap();
-    conn.execute_batch(
-        bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
-            .iter()
-            .find(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS hop_chain_probes "))
-            .unwrap(),
-    )
-    .unwrap();
-    conn.execute_batch(bsv_overlay_cloudflare::d1::HOP_CHAIN_PROBES_TIP_ALTER)
-        .unwrap();
-    // one snapshot write, the batch's closing read-back answered as the route reads it: (stamp, seq)
-    let mut write = |identity: &str, at: i64| -> (Option<i64>, Option<i64>) {
-        let plan = owed_write_plan(identity, &[], at, Some(900_000), false);
-        let txn = conn.transaction().unwrap();
-        let mut back = (None, None);
-        for (n, (sql, binds)) in plan.iter().enumerate() {
-            let vals: Vec<rusqlite::types::Value> = binds
-                .iter()
-                .map(|b| match b {
-                    OwedBind::Text(s) => rusqlite::types::Value::Text(s.clone()),
-                    OwedBind::Int(v) => rusqlite::types::Value::Integer(*v),
-                    OwedBind::Null => rusqlite::types::Value::Null,
-                })
-                .collect();
-            if n + 1 == plan.len() {
-                back = txn
-                    .query_row(sql, rusqlite::params_from_iter(vals), |r| {
-                        Ok((r.get(0)?, r.get(1)?))
-                    })
-                    .unwrap();
-            } else {
-                txn.execute(sql, rusqlite::params_from_iter(vals)).unwrap();
-            }
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+        if let Err(e) = conn.execute_batch(sql) {
+            assert!(
+                bsv_overlay_cloudflare::d1::migration_error_is_benign(sql, &e.to_string()),
+                "{sql}: {e}"
+            );
         }
-        txn.commit().unwrap();
-        back
-    };
-    let first = write(A, 1_000);
-    assert!(owed_write_landed(first.0, 1_000));
-    let second = write(A, 2_000);
-    assert!(owed_write_landed(second.0, 2_000));
-    let n = first.1.expect("a landed write reads its sequence back");
-    assert_eq!(
-        second.1,
-        Some(n + 1),
-        "two landed writes for one identity: N then N+1"
-    );
-    // a superseded walk (its stamp older than the marker's) is refused by the upsert: the sequence stays
-    let refused = write(A, 1_500);
-    assert!(!owed_write_landed(refused.0, 1_500));
-    assert_eq!(
-        refused.1,
-        Some(n + 1),
-        "a superseded walk leaves the sequence"
-    );
-    // a second identity has its own
-    assert_eq!(
-        write(B, 1_200).1,
-        Some(1),
-        "a second identity counts from its own first write"
-    );
-    assert_eq!(
-        write(A, 3_000).1,
-        Some(n + 2),
-        "and does not move the first's"
-    );
-    // the read the route serves names it
-    let served: i64 = conn
-        .query_row(OWED_STATE_READ_SQL, [A], |r| r.get("recomputeSeq"))
+    }
+    let judge = |identity: &str, at: i64| -> i64 {
+        conn.execute(STATE_CREATE_SQL, rusqlite::params![identity, at])
+            .unwrap();
+        conn.execute(
+            STATE_UPDATE_SQL,
+            rusqlite::params![identity, at, 900_000, 0],
+        )
         .unwrap();
-    assert_eq!(served, n + 2);
-    // the `/owed` body carries it beside `computedAtMs`
-    let body: serde_json::Value =
-        serde_json::from_str(&owed_body(A, None, &[], 3_000, false, Some(n + 2))).unwrap();
-    assert_eq!(body["recomputeSeq"], serde_json::json!(n + 2));
-    assert_eq!(body["computedAtMs"], serde_json::json!(3_000));
+        conn.query_row(crate::owed_read::STATE_SQL, [identity], |r| {
+            r.get("recomputeSeq")
+        })
+        .unwrap()
+    };
+    assert_eq!(judge(A, 1_000), 1);
+    assert_eq!(
+        judge(A, 2_000),
+        2,
+        "two judgements of one identity: N then N+1"
+    );
+    assert_eq!(
+        judge(B, 1_200),
+        1,
+        "a second identity counts from its own first judgement"
+    );
+    assert_eq!(judge(A, 3_000), 3, "and does not move the first's");
     // the column reaches a cold isolate's schema and the overlay's migrations, byte-identical
-    assert!(crate::schema::LATCH_COLUMN_ALTERS.contains(&OWED_STATE_SEQ_ALTER));
-    assert!(bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS.contains(&OWED_STATE_SEQ_ALTER));
-    // the route threads the snapshot's sequence into the one `/owed` body it builds
-    let routes = include_str!("routes.rs");
-    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    assert!(crate::schema::LATCH_COLUMN_ALTERS.contains(&crate::owed::OWED_STATE_SEQ_ALTER));
     assert!(
-        squash(routes).contains(&squash("snapshot.body(&identity, tip, &words)")),
-        "the /owed answer serves the snapshot's recomputeSeq"
+        bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS.contains(&crate::owed::OWED_STATE_SEQ_ALTER)
     );
 }
 

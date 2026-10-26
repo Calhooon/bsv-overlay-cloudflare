@@ -2190,9 +2190,8 @@ mod door_refusals {
     use bsv_rs::script::{Script, ScriptTemplate, SignOutputs, UnlockingScript};
     use bsv_rs::transaction::{MerklePath, MerklePathLeaf};
     use low_app_layer::owed::{
-        derive_owed_rows, door_refused_hops, DoorRefusal, HopChainWord, OwedFamily, OwedInputs,
-        OwedRow, DOOR_REFUSED_REASON, DOOR_SCRIPT_REFUSED_REASON, OWED_DOOR_REFUSALS_SQL,
-        OWED_EVICTION_WINDOW_MS,
+        derive_owed_rows, outpoint_key, DoorRefusal, HopChainWord, OwedFamily, OwedInputs, OwedRow,
+        DOOR_REFUSED_REASON, DOOR_SCRIPT_REFUSED_REASON, OWED_EVICTION_WINDOW_MS,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -2352,16 +2351,61 @@ mod door_refusals {
         )
     }
 
-    /// THE WALK'S READ: the shipped `OWED_DOOR_REFUSALS_SQL` with the route's binds, mapped as the route maps it.
+    /// THE JUDGE'S READ of the door's ledger (`owed_judge::DOOR_REFUSAL_SQL`, bsv-low #893: the walk's identity-wide
+    /// read retired with the walk), one statement per own hop, the rows as read.
     fn door_rows(conn: &Connection, identity: &str, now_ms: i64) -> Vec<(String, u32, String)> {
-        conn.prepare(OWED_DOOR_REFUSALS_SQL)
-            .unwrap()
-            .query_map(params![identity, now_ms - OWED_EVICTION_WINDOW_MS], |r| {
-                Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get(2)?))
-            })
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect()
+        let mut st = conn
+            .prepare(low_app_layer::owed_judge::DOOR_REFUSAL_SQL)
+            .unwrap();
+        let mut out = Vec::new();
+        for h in hops_of(conn, identity) {
+            let rows = st
+                .query_map(
+                    params![
+                        h.hop_txid.to_ascii_lowercase(),
+                        h.hop_vout,
+                        now_ms - OWED_EVICTION_WINDOW_MS
+                    ],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?.to_ascii_lowercase(),
+                            r.get::<_, i64>(1)? as u32,
+                            r.get(2)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            out.extend(rows.map(Result::unwrap));
+        }
+        out
+    }
+
+    /// The judge's fold of those rows (`DoorRefusal::of_reason`, by outpoint).
+    fn door_refused(
+        conn: &Connection,
+        hops: &[low_app_layer::hops_view::HopEntry],
+        now_ms: i64,
+    ) -> HashMap<String, DoorRefusal> {
+        let mut out = HashMap::new();
+        let mut st = conn
+            .prepare(low_app_layer::owed_judge::DOOR_REFUSAL_SQL)
+            .unwrap();
+        for h in hops {
+            let txid = h.hop_txid.to_ascii_lowercase();
+            let rows = st
+                .query_map(
+                    params![txid, h.hop_vout, now_ms - OWED_EVICTION_WINDOW_MS],
+                    |r| r.get::<_, String>(2),
+                )
+                .unwrap();
+            for reason in rows {
+                out.insert(
+                    outpoint_key(&txid, h.hop_vout),
+                    DoorRefusal::of_reason(&reason.unwrap()),
+                );
+            }
+        }
+        out
     }
 
     /// The walk's own hops: the shipped hops SQL, the route's seconds-to-ms mapping of the marker stamp.
@@ -2391,7 +2435,7 @@ mod door_refusals {
         now_ms: i64,
     ) -> (Vec<OwedRow>, HashMap<String, DoorRefusal>) {
         let hops = hops_of(conn, identity);
-        let door = door_refused_hops(&door_rows(conn, identity, now_ms), &hops);
+        let door = door_refused(conn, &hops, now_ms);
         let chain: HashMap<String, HopChainWord> = hops
             .iter()
             .map(|h| {
@@ -2547,7 +2591,7 @@ mod door_refusals {
     /// are written, each seat's walk reads ITS OWN row and nothing of the other's (the lens's MEDIUM-1: the read
     /// is driven from the walking identity's hop markers), an identity with no hop reads nothing, and the plan
     /// never scans the ledger.
-    /// To red: read the ledger by window instead of through `hopparty_records`.
+    /// To red: read the ledger by window instead of by the own hop's key.
     #[tokio::test]
     async fn the_422_arm_writes_both_signed_hops_and_each_walk_reads_only_its_own() {
         let conn = production_schema_db();
@@ -2596,26 +2640,23 @@ mod door_refusals {
             NOW_MS + OWED_EVICTION_WINDOW_MS + 1
         )
         .is_empty());
-        // the plan: the identity's markers drive, the ledger is probed by its primary key, never scanned
+        // the plan: the ledger is probed by its primary key (one own hop at a time), never scanned
         let plan: Vec<String> = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {OWED_DOOR_REFUSALS_SQL}"))
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                low_app_layer::owed_judge::DOOR_REFUSAL_SQL
+            ))
             .unwrap()
-            .query_map(params![ma.identity_hex, 0i64], |r| r.get::<_, String>(3))
+            .query_map(params![hop_a.id(), 0i64, 0i64], |r| r.get::<_, String>(3))
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
         assert!(
-            plan.iter()
-                .any(|l| l.contains("SEARCH hp") && l.contains("idx_hopparty_identity")),
+            plan.iter().any(|l| l.contains("SEARCH submit_refusals")
+                && l.contains("sqlite_autoindex_submit_refusals_1")),
             "{plan:?}"
         );
-        assert!(plan.iter().any(|l| l.contains("SEARCH r") && l.contains("sqlite_autoindex_submit_refusals_1")), "{plan:?}");
-        assert!(
-            !plan
-                .iter()
-                .any(|l| l.contains("SCAN r") || l.contains("SCAN hp")),
-            "{plan:?}"
-        );
+        assert!(!plan.iter().any(|l| l.contains("SCAN")), "{plan:?}");
     }
 
     /// The lens's MEDIUM-1, the lever itself: the opponent holds seat A's SIGNED JOIN input and mints refused
@@ -2714,7 +2755,7 @@ mod door_refusals {
     /// hop spent by it, through the shipped `mark_spent_sql`). The walk stops reading the refusal at once (the read
     /// skips a hop the index shows spent), the hop is no longer the door's sweep press, and the door's retirement
     /// deletes the row by the outpoint the admitted transaction consumed.
-    /// To red: drop the `NOT EXISTS` from `OWED_DOOR_REFUSALS_SQL`, or retire by the refused txid.
+    /// To red: drop the `NOT EXISTS` from `owed_judge::DOOR_REFUSAL_SQL`, or retire by the refused txid.
     #[tokio::test]
     async fn an_admission_after_a_refusal_un_strands_the_hop_and_retires_the_row() {
         let conn = production_schema_db();
@@ -2758,107 +2799,5 @@ mod door_refusals {
         let (beef, late, _) = join(&hop_a, &key_a, &hop_b, &PrivateKey::random()).await;
         assert!(door_refuses(&conn, &beef, &late, REASON_SCRIPT_REFUSED, NOW_MS + 5).is_empty());
         assert_eq!(ledger_rows(&conn), 0);
-    }
-
-    /// The delta fold's LOW-2 and LOW-3: a seat with MORE unspent door-refused hops than one walk reads (seventy,
-    /// each refused a second after the one before). The shipped read returns exactly `OWED_DOOR_REFUSALS_MAX` rows,
-    /// the NEWEST first, so the hop the seat just tried is among the ones stranded at once; the six oldest keep the
-    /// rejoin and are stranded by the thirty-minute age rule like any hop the ledger never named. As the newest is
-    /// swept (the index shows it spent) the next oldest enters the 64. At `762e621` the cut had no order and served
-    /// the 64 lowest txids (`/tmp/b1-fold-2/red-item3-762e621.log`).
-    /// To red: drop the `ORDER BY` from `OWED_DOOR_REFUSALS_SQL`, or change its `LIMIT`.
-    #[test]
-    fn more_door_refused_hops_than_the_read_holds_are_served_newest_first_and_the_rest_wait_for_the_age_rule(
-    ) {
-        use low_app_layer::owed::OWED_DOOR_REFUSALS_MAX;
-        const HOPS: usize = 70;
-        let conn = production_schema_db();
-        let mut identity = String::new();
-        let mut funded: Vec<String> = Vec::new(); // by refusal time, oldest first
-        for i in 0..HOPS {
-            let (m, hop, _key) = fund_hop(
-                &conn,
-                0xa1,
-                [0x40 + i as u8; 32],
-                20_190,
-                0x40 + i as u8,
-                true,
-            );
-            identity = m.identity_hex.clone();
-            for q in write_queries(
-                &[SignedSpend {
-                    txid: hop.id(),
-                    vout: 0,
-                }],
-                &format!("{:064x}", 0xbad0 + i),
-                REASON_SCRIPT_REFUSED,
-                NOW_MS - 1_000 * (HOPS - i) as i64,
-            ) {
-                exec_query(&conn, &q);
-            }
-            funded.push(hop.id());
-        }
-        assert_eq!(ledger_rows(&conn), HOPS as i64);
-        let newest_first: Vec<String> = funded.iter().rev().cloned().collect();
-        // the read: exactly the cap, the newest refusals, newest first
-        let rows = door_rows(&conn, &identity, NOW_MS);
-        assert_eq!(rows.len(), OWED_DOOR_REFUSALS_MAX, "the LIMIT, executed");
-        assert_eq!(
-            rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
-            newest_first[..OWED_DOOR_REFUSALS_MAX],
-            "newest first, deterministic"
-        );
-        // the walk: 64 stranded at once (the hop just tried among them), the six oldest still the rejoin
-        let (owed, door) = owed_of(&conn, &identity);
-        assert_eq!((owed.len(), door.len()), (HOPS, OWED_DOOR_REFUSALS_MAX));
-        let family_of = |owed: &[OwedRow], txid: &str| {
-            owed.iter()
-                .find(|r| r.outpoint == format!("{txid}:0"))
-                .map(|r| (r.family, r.facts["claim"].clone()))
-                .unwrap()
-        };
-        assert_eq!(
-            family_of(&owed, &newest_first[0]),
-            (OwedFamily::HopStranded, serde_json::json!("sweep-hop"))
-        );
-        for old in &newest_first[OWED_DOOR_REFUSALS_MAX..] {
-            assert_eq!(
-                family_of(&owed, old),
-                (OwedFamily::InProgress, serde_json::json!("rejoin")),
-                "past the read: the pre-#486 word, never a wrong one"
-            );
-        }
-        // the next rule: past the young window the age rule strands the overflow, ledger or no ledger
-        let (aged, _) = owed_of_at(&conn, &identity, NOW_MS + 31 * 60_000);
-        for old in &newest_first[OWED_DOOR_REFUSALS_MAX..] {
-            assert_eq!(
-                family_of(&aged, old),
-                (OwedFamily::HopStranded, serde_json::json!("sweep-hop"))
-            );
-        }
-        // the cut rotates as the seat sweeps: the newest hop spent, the 65th newest enters
-        mark_hop_spent(&conn, &newest_first[0], &"5e".repeat(32), false);
-        let rows = door_rows(&conn, &identity, NOW_MS);
-        assert_eq!(
-            rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
-            newest_first[1..=OWED_DOOR_REFUSALS_MAX]
-        );
-        // two refusals of the same instant: the outpoint breaks the tie, the same way on every read
-        conn.execute(
-            "UPDATE submit_refusals SET refusedAt = ?1",
-            params![NOW_MS - 5],
-        )
-        .unwrap();
-        let tied = door_rows(&conn, &identity, NOW_MS);
-        let mut by_txid: Vec<String> = funded
-            .iter()
-            .filter(|t| **t != newest_first[0])
-            .cloned()
-            .collect();
-        by_txid.sort();
-        assert_eq!(
-            tied.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
-            by_txid[..OWED_DOOR_REFUSALS_MAX]
-        );
     }
 }

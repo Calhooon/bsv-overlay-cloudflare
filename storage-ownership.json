@@ -396,15 +396,11 @@
    "why": "`FROM {party}`: logic::party_candidates_sql(), a subquery over these tables whose own statements are scanned in logic.rs"
   },
   {
-   "file": "crates/low-app-layer/src/owed_cursor.rs",
+   "file": "crates/low-app-layer/src/owed_judge/rank.rs",
    "op": "SELECT",
-   "count": 8,
+   "count": 4,
    "crate": "low-app-layer",
    "statements": [
-    "(SELECT *, rowid AS cursorRowid FROM {table} INDEXED BY {index} WHERE identity=?1 AND {predicate} ORDER BY createdAt,row",
-    "SELECT page_row.*, page_row.txid AS hopTxid, page_row.hopVout, page_row.txid AS markerTxid, page_row.outputIndex AS mark",
-    "SELECT s.*, s.cursorRowid AS markerRowid FROM {source_sql} s",
-    "SELECT hp.identity, hp.opponentIdentity, hp.gameId, s.potTxid, s.potVout, pot.recoveryHeight, hp.seatSettlePubkey, hp.se",
     ") w LEFT JOIN",
     "{prefix}FROM (SELECT pp.*, pp.createdAt AS markerCreatedAt, r.createdAt AS potCreatedAt, r.spent, r.spendingTxid, r.spen",
     ") w LEFT JOIN",
@@ -412,14 +408,13 @@
    ],
    "tables": [
     "potparty_records",
-    "hop_pot_links",
     "hopparty_records",
     "pot_records",
     "pot_beefs",
     "network_seen",
     "potrefund_records"
    ],
-   "why": "owed_cursor source enum selects only the three identity-owned candidate streams. The hydration helpers retain the production outer proof/BEEF/network-seen joins and keyed backup presence; JSON spines are request-local values. These are read grants only."
+   "why": "owed_judge::rank (bsv-low #893 section 6.2: the judge's half of the retired owed_cursor) hydrates the chosen rows of the judge's own candidate reads. The hydration helpers retain the production outer proof/BEEF/network-seen joins and keyed backup presence; JSON spines are request-local values. These are read grants only."
   }
  ],
  "tables": [

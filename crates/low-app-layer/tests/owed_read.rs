@@ -158,7 +158,8 @@ async fn owed_read_joins_words_once_and_preserves_stored_claims() {
     }
     assert_eq!(body["pending"], 1);
     assert_eq!(body["retryAfterMs"], 1500);
-    assert_eq!(body["markerlessProgress"], Value::Null);
+    // bsv-low #893 section 6.2: the ring retired; `markerlessProgress` (served null for the D2 release) is gone
+    assert!(body.get("markerlessProgress").is_none());
 }
 
 #[tokio::test]
@@ -245,7 +246,7 @@ async fn owed_read_body_byte_compatibility_except_named_d2_fields() {
         .map(|(id, row)| (id, row.view()))
         .collect();
     let mut body = snapshot.body("owner", Some(100), &words).unwrap();
-    for key in ["pending", "markerlessProgress"] {
+    for key in ["pending"] {
         body.as_object_mut().unwrap().remove(key);
     }
     body["rows"][0]["facts"]
