@@ -55,8 +55,10 @@ pub const JUDGED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_judged 
 /// that statement's whole access path (`probeTip` is the tip the row was judged at, NULL = judged with no tip). The
 /// status term is the statement's own, written as it writes it, so the index holds only the rows the statement writes
 /// and an index-unspent claimable sweep (an honest un-swept hop, a stranger's dust hop) costs it no read
-/// (D2-OWED-FOLD-3). Edited in place: migrations 396 to 407 shipped nowhere.
-pub const SWEEP_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_sweep ON owed_rows(probeTip) WHERE family='hop-stranded' AND claimable=1 AND json_extract(facts,'$.status') IS NOT 'unspent'";
+/// (D2-OWED-FOLD-3). The key's tail (the third delta lens's D3-N3) makes the belt's first class a seek too: inside one
+/// judged tip, its rows due by now (`beltDueAtMs`), covering the identity and the outpoint it reads, so a row of the
+/// class re-armed (not due) is never visited. Edited in place: migrations 396 to 407 shipped nowhere.
+pub const SWEEP_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_sweep ON owed_rows(probeTip,beltDueAtMs,identity,outpoint) WHERE family='hop-stranded' AND claimable=1 AND json_extract(facts,'$.status') IS NOT 'unspent'";
 /// The D2-OWED lens's HIGH-1 and MEDIUM-2: a row judged with no chain tip (TIP-877's tipless judgement) is re-marked
 /// on the next tip; an old worker's keyless row is in it too.
 pub const UNTIPPED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_untipped ON owed_rows(probeTip,identity,gameId) WHERE probeTip IS NULL";
