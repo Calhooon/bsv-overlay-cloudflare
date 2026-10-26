@@ -275,7 +275,7 @@ SESSION_LANE = "true"
 LOW_BETA_MARKER = "_beta"
 # Beta's own storage epoch — bumping THIS orders beta clients to clear their
 # local state without touching prod clients.
-STORAGE_EPOCH = "beta-2026-08-12-1"
+STORAGE_EPOCH = "beta-2026-10-26-1"
 # 2026-08-27 — SET (the rehearsal the note below anticipated): beta's own
 # campaign history crossed the 500-pot leaderboard window (BOARD_CLAIM_LIMIT),
 # so every board page returned truncated:true and every client fell back to
@@ -288,8 +288,8 @@ STORAGE_EPOCH = "beta-2026-08-12-1"
 # retires a pre-launch era; wiping beta wholesale is a DELETE, not a cutoff.)
 # 2026-09-21 (the M21 promotion's wipe): the beta cutoff bumped to the activation instant 2026-09-21T13:04:21Z / tip 967727
 # (the fleet loops 11 to 21 written off from every view; the collect pass ran first, 14/18 pressed green, 4 #512 already-held).
-WRITTEN_OFF_BEFORE_MS = "1789995861000"
-WRITTEN_OFF_BEFORE_HEIGHT = "967727"
+WRITTEN_OFF_BEFORE_MS = "1793028153000"
+WRITTEN_OFF_BEFORE_HEIGHT = "972762"
 # bsv-low #862 (L7-DEPTH): the host's spend depth (see the prod vars).
 SPEND_DEPTH = "1"
 
