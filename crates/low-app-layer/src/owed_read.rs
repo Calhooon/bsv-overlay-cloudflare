@@ -12,13 +12,14 @@ pub const ROWS_SQL: &str = "SELECT r.identity,r.outpoint,r.family,r.gameId,r.sat
 pub const STATE_SQL: &str =
     "SELECT computedAtMs,rows,truncated,recomputeSeq,tip FROM owed_state WHERE identity=?1";
 /// The identity's pending marks: their count, and (the second delta lens's D2-L1) the games holding an undrained mark
-/// of a DOWNGRADE-class source, the index's spend or admission (`pot`) and the eviction (`eviction`), over the
-/// covering UNIQUE index's identity prefix. The count already visits every pending mark of the identity, so naming
+/// of the DOWNGRADE class (the third delta lens's D3-L1: the mark's own `downgrade`, written by the trigger: the index
+/// recording a spend, a pot row deleted, an eviction; a `pot` stamp, facts fill or re-present is not one), over the
+/// covering UNIQUE index's identity prefix and the row. The count already visits every pending mark of the identity, so naming
 /// them adds no row and no statement. A mark still in `owed_dirty` is one no judge has acknowledged since it was
 /// written (the judge deletes `generation <= seen` for each subject it judges), so its presence is what "newer than the
 /// row's judgement" means; `markedAtMs` cannot say it (a `pot` mark carries the pot row's `createdAt`). A filing's, a
 /// tip's, a wanted or an age mark is not a downgrade; a belt find is judged in its own batch and leaves no mark.
-pub const PENDING_SQL: &str = "SELECT COUNT(*) AS pending,json_group_array(CASE WHEN source IN ('pot','eviction') THEN json_array(gameId,source) END) AS downgrades FROM owed_dirty WHERE identity=?1";
+pub const PENDING_SQL: &str = "SELECT COUNT(*) AS pending,json_group_array(CASE WHEN downgrade=1 THEN json_array(gameId,source) END) AS downgrades FROM owed_dirty WHERE identity=?1";
 /// The served reason of a press withheld over a pending downgrade (D2-L1).
 pub const PENDING_DOWNGRADE_REASON: &str =
     "re-judging: a downgrade of this game is recorded and not yet judged; the press waits for the judgement";

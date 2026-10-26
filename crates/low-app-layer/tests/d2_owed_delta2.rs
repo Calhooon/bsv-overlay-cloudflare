@@ -199,7 +199,8 @@ async fn d2delta2_l1_a_pending_downgrade_withholds_the_press_until_the_drain() {
     seed_stranded_hop(&db, "owner", "g02", &hop(2));
     drain_all(&db).await;
     let op2 = format!("{}:0", hop(2));
-    db.exec(&format!("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner','g02','eviction','{}',1)", "dd".repeat(32)));
+    // the eviction trigger's mark, its class a downgrade (D3-L1)
+    db.exec(&format!("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs,downgrade) VALUES ('owner','g02','eviction','{}',1,1)", "dd".repeat(32)));
     let body = served(&db, "owner", Some(900_000)).await;
     let row = row_of(&body, &op2).unwrap();
     assert_eq!(row["facts"]["claimable"], false, "{row}");

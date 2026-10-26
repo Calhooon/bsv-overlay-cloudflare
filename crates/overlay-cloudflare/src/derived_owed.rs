@@ -22,7 +22,11 @@ pub const PROBE_TIP_ALTER: &str = "ALTER TABLE owed_rows ADD COLUMN probeTip INT
 pub const ROW_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_row_words (identity TEXT, outpoint TEXT, role TEXT, txid TEXT, PRIMARY KEY (identity, outpoint, role))";
 /// Coalesced dirty subjects. Generation aliases an AUTOINCREMENT rowid that is never reused after a drain.
 /// A re-mark advances it, so a judge acknowledging `generation <= seen` leaves newer work pending.
-pub const DIRTY_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_dirty (generation INTEGER PRIMARY KEY AUTOINCREMENT, identity TEXT NOT NULL, gameId TEXT NOT NULL, source TEXT NOT NULL, sourceKey TEXT NOT NULL, markedAtMs INTEGER NOT NULL, UNIQUE (identity, gameId, source, sourceKey))";
+/// `downgrade` is the mark's CLASS (the third delta lens's D3-L1): 1 when the write may take a press away (the index
+/// recording a spend, a pot row deleted, an eviction), the only marks the read withholds a press over; a re-mark keeps
+/// the larger class until the judge acknowledges it. Edited in place: the table has shipped nowhere (beta and prod
+/// certify 349).
+pub const DIRTY_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_dirty (generation INTEGER PRIMARY KEY AUTOINCREMENT, identity TEXT NOT NULL, gameId TEXT NOT NULL, source TEXT NOT NULL, sourceKey TEXT NOT NULL, markedAtMs INTEGER NOT NULL, downgrade INTEGER NOT NULL DEFAULT 0, UNIQUE (identity, gameId, source, sourceKey))";
 /// Evidence written beside an eviction's released spends, one identity per released hop.
 pub const RELEASED_HOP_EVIDENCE_CREATE: &str = "CREATE TABLE IF NOT EXISTS released_hop_evidence (hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, identity TEXT NOT NULL, gameId TEXT NOT NULL, potTxid TEXT NOT NULL, seatSettlePubkey TEXT NOT NULL, hopSats INTEGER NOT NULL, evictedAt INTEGER NOT NULL, PRIMARY KEY (hopTxid, hopVout, identity))";
 /// The belt's rotation cursor and the backfill's identity cursor, each under its own name.
@@ -94,14 +98,22 @@ pub const ROW_DELETE: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_delete_word
 // clause below preserves coalescing there too, including a subject reached through several indexes.
 // SQLite assigns the attempted insert a fresh AUTOINCREMENT value before checking the unique key;
 // keep excluded.generation and the newest mark's fields so an in-flight judge cannot erase the re-mark.
+// The mark's class (`downgrade`, D3-L1) is an expression over the row: "0" for every source but the pot's spend
+// columns, its delete and the eviction; a re-mark keeps the larger class (MAX), so a stamp after a spend leaves it.
 macro_rules! mark {
     ($source:literal, $key:expr, $at:expr, $subjects:expr) => {
-        mark!($source, $key, $at, $subjects, " WHERE 1")
+        mark!(class "0", $source, $key, $at, $subjects, " WHERE 1")
     };
     ($source:literal, $key:expr, $at:expr, $subjects:expr, $guard:literal) => {
-        concat!("INSERT OR IGNORE INTO owed_dirty (identity,gameId,source,sourceKey,markedAtMs) SELECT s.identity,s.gameId,'",
-            $source, "',", $key, ",", $at, " FROM (", $subjects, ") s", $guard,
-            " ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,source=excluded.source,sourceKey=excluded.sourceKey,markedAtMs=excluded.markedAtMs; ")
+        mark!(class "0", $source, $key, $at, $subjects, $guard)
+    };
+    (class $class:expr, $source:literal, $key:expr, $at:expr, $subjects:expr) => {
+        mark!(class $class, $source, $key, $at, $subjects, " WHERE 1")
+    };
+    (class $class:expr, $source:literal, $key:expr, $at:expr, $subjects:expr, $guard:literal) => {
+        concat!("INSERT OR IGNORE INTO owed_dirty (identity,gameId,source,sourceKey,markedAtMs,downgrade) SELECT s.identity,s.gameId,'",
+            $source, "',", $key, ",", $at, ",", $class, " FROM (", $subjects, ") s", $guard,
+            " ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,source=excluded.source,sourceKey=excluded.sourceKey,markedAtMs=excluded.markedAtMs,downgrade=MAX(owed_dirty.downgrade,excluded.downgrade); ")
     };
 }
 
@@ -169,8 +181,9 @@ macro_rules! pot_subjects {
 }
 
 macro_rules! pot_mark {
-    ($row:literal) => {
+    ($row:literal, $class:expr) => {
         mark!(
+            class $class,
             "pot",
             concat!($row, ".txid || ':' || ", $row, ".outputIndex"),
             created_at!($row),
@@ -179,16 +192,25 @@ macro_rules! pot_mark {
     };
 }
 
-/// Admission, including the INSERT arm of store_record's UPSERT.
-pub const POT_INSERT: &str = trigger!("pot_records", insert, "INSERT", pot_mark!("NEW"));
-/// Spend, reorg, classification and the UPDATE arm of admission. Both keys are covered if moved.
+/// Admission, including the INSERT arm of store_record's UPSERT: a downgrade only when the row arrives spent (a
+/// readmission restoring a recorded spend).
+pub const POT_INSERT: &str = trigger!(
+    "pot_records",
+    insert,
+    "INSERT",
+    pot_mark!("NEW", "COALESCE(NEW.spent,0)<>0")
+);
+/// Spend, reorg, classification and the UPDATE arm of admission. Both keys are covered if moved. A downgrade only when
+/// a spend column changed (the index recording, moving or clearing a spender) or the key moved; a stamp, a facts fill
+/// or a re-present that leaves the spend columns as they were is a plain mark (D3-L1).
 pub const POT_UPDATE: &str = trigger!(
     "pot_records",
     update,
     UPDATE,
     concat!(
-        pot_mark!("NEW"),
+        pot_mark!("NEW", "(OLD.spent IS NOT NEW.spent OR OLD.spendingTxid IS NOT NEW.spendingTxid OR OLD.spentConfirmed IS NOT NEW.spentConfirmed OR OLD.txid<>NEW.txid OR OLD.outputIndex<>NEW.outputIndex)"),
         mark!(
+            class "1",
             "pot",
             "OLD.txid || ':' || OLD.outputIndex",
             created_at!("OLD"),
@@ -198,7 +220,7 @@ pub const POT_UPDATE: &str = trigger!(
     )
 );
 /// The eviction's source DELETE, before any derived link can be relied on to survive.
-pub const POT_DELETE: &str = trigger!("pot_records", delete, "DELETE", pot_mark!("OLD"));
+pub const POT_DELETE: &str = trigger!("pot_records", delete, "DELETE", pot_mark!("OLD", "1"));
 
 /// A party admission or filing.
 pub const PARTY_INSERT: &str = trigger!(
@@ -323,6 +345,7 @@ pub const EVICTION_INSERT: &str = trigger!(
     insert,
     INSERT,
     mark!(
+        class "1",
         "eviction",
         "NEW.txid",
         "NEW.evictedAt",
@@ -335,6 +358,7 @@ pub const EVICTION_UPDATE: &str = trigger!(
     update,
     UPDATE,
     mark!(
+        class "1",
         "eviction",
         "NEW.txid",
         "COALESCE(NEW.readmittedAt,NEW.evictedAt)",

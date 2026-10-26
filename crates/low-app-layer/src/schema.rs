@@ -175,7 +175,7 @@ pub const OWED_PROBE_TIP_ALTER: &str = "ALTER TABLE owed_rows ADD COLUMN probeTi
 /// #893: the read's word joins, inverted by txid at the word write.
 pub const OWED_ROW_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_row_words (identity TEXT, outpoint TEXT, role TEXT, txid TEXT, PRIMARY KEY (identity, outpoint, role))";
 /// #893: subjects the source statements mark for judgement, in the source transaction.
-pub const OWED_DIRTY_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_dirty (generation INTEGER PRIMARY KEY AUTOINCREMENT, identity TEXT NOT NULL, gameId TEXT NOT NULL, source TEXT NOT NULL, sourceKey TEXT NOT NULL, markedAtMs INTEGER NOT NULL, UNIQUE (identity, gameId, source, sourceKey))";
+pub const OWED_DIRTY_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_dirty (generation INTEGER PRIMARY KEY AUTOINCREMENT, identity TEXT NOT NULL, gameId TEXT NOT NULL, source TEXT NOT NULL, sourceKey TEXT NOT NULL, markedAtMs INTEGER NOT NULL, downgrade INTEGER NOT NULL DEFAULT 0, UNIQUE (identity, gameId, source, sourceKey))";
 /// #893: the eviction's released-hop evidence, read by identity and game or hop outpoint.
 pub const RELEASED_HOP_EVIDENCE_CREATE: &str = "CREATE TABLE IF NOT EXISTS released_hop_evidence (hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, identity TEXT NOT NULL, gameId TEXT NOT NULL, potTxid TEXT NOT NULL, seatSettlePubkey TEXT NOT NULL, hopSats INTEGER NOT NULL, evictedAt INTEGER NOT NULL, PRIMARY KEY (hopTxid, hopVout, identity))";
 /// #893: independent belt and backfill cursors; the backfill stamp remains in view_derivation_state.

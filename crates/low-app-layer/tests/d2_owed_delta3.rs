@@ -159,3 +159,144 @@ async fn d3m1_b_a_class_with_nothing_due_yields_its_places() {
         "second class alone: {report:?}"
     );
 }
+
+/// Bind `?` placeholders in order (the shipped overlay statements use bare `?`).
+fn run_bound(db: &Db, sql: &str, binds: &[&dyn rusqlite::ToSql]) {
+    db.conn.borrow().execute(sql, binds).unwrap();
+}
+
+/// D3-L1 (the ruling: the mark carries its CLASS, and only a DOWNGRADE mark withholds a press at the read). The
+/// discovery pass's stamp and a no-op funding facts fill, each an UPDATE of the owner's hop row through the shipped
+/// statement, mark the game and withhold nothing; the index recording a competing spender withholds the press until
+/// the drain. RED on e53c1406: every `pot_records` UPDATE's `pot` mark withheld the press (`pendingSource: "pot"`).
+#[tokio::test]
+async fn d3l1_a_only_a_downgrade_mark_withholds_the_press() {
+    let db = Db::new();
+    seed_stranded_hop(&db, "owner", "g00", &hop(0));
+    drain_all(&db).await;
+    let op = format!("{}:0", hop(0));
+    let press = |body: &Value| row_of(body, &op).unwrap()["facts"]["claimable"].clone();
+    assert_eq!(press(&served(&db, "owner", Some(900_000)).await), true);
+
+    let txid = hop(0);
+    run_bound(
+        &db,
+        bsv_overlay_cloudflare::d1_discovery::POT_SPEND_DISCOVERY_STAMP_SQL,
+        &[&txid, &0i64],
+    );
+    run_bound(
+        &db,
+        bsv_overlay_cloudflare::d1_discovery::pot_funding_facts_fill_sql(),
+        &[&rusqlite::types::Null, &rusqlite::types::Null, &txid, &0i64],
+    );
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_dirty WHERE identity='owner' AND source='pot'"),
+        1,
+        "the writes still mark the game"
+    );
+    assert_eq!(
+        db.int("SELECT downgrade FROM owed_dirty WHERE identity='owner' AND source='pot'"),
+        0,
+        "a plain mark"
+    );
+    let body = served(&db, "owner", Some(900_000)).await;
+    assert_eq!(
+        press(&body),
+        true,
+        "a stamp and a no-op fill withhold nothing: {body}"
+    );
+    drain_all(&db).await;
+
+    // the index records a competing spender: withheld until the drain
+    let rival = "cc".repeat(32);
+    db.exec(&format!(
+        "UPDATE pot_records SET spent=1,spendingTxid='{rival}' WHERE txid='{txid}' AND outputIndex=0"
+    ));
+    let body = served(&db, "owner", Some(900_000)).await;
+    let row = row_of(&body, &op).unwrap();
+    assert_eq!(row["facts"]["claimable"], false, "{row}");
+    assert_eq!(row["facts"]["pendingSource"], "pot", "{row}");
+    assert_eq!(
+        db.int("SELECT downgrade FROM owed_dirty WHERE identity='owner' AND source='pot'"),
+        1
+    );
+    // a later stamp before the drain does not lift the downgrade's class
+    run_bound(
+        &db,
+        bsv_overlay_cloudflare::d1_discovery::POT_SPEND_DISCOVERY_STAMP_SQL,
+        &[&txid, &0i64],
+    );
+    let body = served(&db, "owner", Some(900_000)).await;
+    assert_eq!(press(&body), false, "{body}");
+    drain_all(&db).await;
+    let body = served(&db, "owner", Some(900_000)).await;
+    if let Some(row) = row_of(&body, &op) {
+        assert_ne!(row["facts"]["claimable"], true, "{row}");
+        assert!(row["facts"].get("refresh").is_none(), "{row}");
+    }
+}
+
+/// D3-L1, the classes the triggers write: of the `owed_dirty` triggers only the pot row's spend columns, its moved key,
+/// its delete, an admission arriving spent and the eviction ledger write a downgrade; every other source is a plain
+/// mark. A pot row deleted (the eviction's shadow move) marks a downgrade.
+#[test]
+fn d3l1_b_the_downgrade_class_is_written_by_the_spend_delete_and_eviction_triggers() {
+    use bsv_overlay_cloudflare::derived_owed as d;
+    let class = |sql: &str| {
+        sql.split("INSERT OR IGNORE INTO owed_dirty")
+            .skip(1)
+            .map(|m| {
+                let start = m.find(" SELECT s.identity,s.gameId,'").unwrap();
+                let tail = &m[start..];
+                let from = tail.find(" FROM (").unwrap();
+                tail[..from].rsplit(',').next().unwrap().trim().to_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+    let downgrade = [
+        d::POT_INSERT,
+        d::POT_UPDATE,
+        d::POT_DELETE,
+        d::EVICTION_INSERT,
+        d::EVICTION_UPDATE,
+    ];
+    for sql in downgrade {
+        assert!(class(sql).iter().all(|c| c != "0"), "{sql}");
+    }
+    for sql in [
+        d::PARTY_INSERT,
+        d::PARTY_UPDATE,
+        d::PARTY_DELETE,
+        d::HOP_INSERT,
+        d::HOP_UPDATE,
+        d::HOP_DELETE,
+        d::REFUND_INSERT,
+        d::REFUND_UPDATE,
+        d::RESULT_INSERT,
+        d::COLLECTED_INSERT,
+        d::SWEEP_INSERT,
+        d::SEEN_INSERT,
+        d::WORD_INSERT,
+        d::WORD_UPDATE,
+        d::WORD_LINK_INSERT,
+        d::WORD_LINK_UPDATE,
+        d::BEEF_INSERT,
+        d::BEEF_UPDATE,
+        d::REFUSAL_INSERT,
+        d::REFUSAL_UPDATE,
+        d::REFUSAL_DELETE,
+        d::RELEASED_HOP_INSERT,
+        d::SPENDER_BYTES_INSERT,
+    ] {
+        assert!(class(sql).iter().all(|c| c == "0"), "{sql}");
+    }
+
+    let db = Db::new();
+    seed_stranded_hop(&db, "owner", "g00", &hop(0));
+    db.exec("DELETE FROM owed_dirty");
+    db.exec(&format!("DELETE FROM pot_records WHERE txid='{}'", hop(0)));
+    assert_eq!(
+        db.int("SELECT downgrade FROM owed_dirty WHERE identity='owner' AND source='pot'"),
+        1
+    );
+}
