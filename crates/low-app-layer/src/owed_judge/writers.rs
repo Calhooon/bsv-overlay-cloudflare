@@ -13,8 +13,9 @@ pub const MARK_TIP_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,so
 /// a downgrade only. Re-dating every claimable sweep at every block let K strangers' own sweeps fill the belt's 8
 /// looks a tick fleet-wide. A judgement with no tip stores no claimable sweep (TIP-877's end-of-derive degrade), and
 /// an old worker's row has no `claimable` column, so neither is in the partial index; the read withholds both. Cost:
-/// the partial index's range below the tip, each row's `facts` read for its status (the stated ceiling,
-/// `owed-tip-mark`); written rows are the courier-dependent ones only.
+/// the partial index's range below the tip, which since D2-OWED-FOLD-3 holds only the rows this statement writes (its
+/// WHERE carries the status term, textually this statement's), so the reads are the courier-dependent sweeps and no
+/// index-unspent sweep a stranger plants (the stated ceiling, `owed-tip-mark`).
 pub const DATE_SWEEPS_SQL: &str = "UPDATE owed_rows INDEXED BY idx_owed_rows_sweep SET beltDueAtMs=?2 WHERE family='hop-stranded' AND claimable=1 AND probeTip<?1 AND (beltDueAtMs IS NULL OR beltDueAtMs>?2) AND json_extract(facts,'$.status') IS NOT 'unspent'";
 /// A row judged with no chain tip (TIP-877: its tip-dependent claims withheld, `tipUnknown`) is re-judged on the next
 /// tip; bounded per tip, the rest left to the next tip and the age repair.

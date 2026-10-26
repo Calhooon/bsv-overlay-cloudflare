@@ -46,9 +46,13 @@ pub const BELT_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_belt ON o
 /// The scheduled drain's daily re-judge of rows older than 24 h (risk 8.2's third repair); NULL is an old worker's row,
 /// which the backfill rewrites.
 pub const JUDGED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_judged ON owed_rows(judgedAtMs) WHERE judgedAtMs IS NOT NULL";
-/// The D2-OWED lens's HIGH-1: on a tip, the claimable sweeps judged below it are dated due now; this is that
-/// statement's whole access path (`probeTip` is the tip the row was judged at, NULL = judged with no tip).
-pub const SWEEP_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_sweep ON owed_rows(probeTip) WHERE family='hop-stranded' AND claimable=1";
+/// The D2-OWED lens's HIGH-1 as narrowed by the delta lens's D-H1: on a tip, the claimable sweeps judged below it
+/// whose press rests on a courier probe alone (the hop's index `status` fact not `unspent`) are dated due now; this is
+/// that statement's whole access path (`probeTip` is the tip the row was judged at, NULL = judged with no tip). The
+/// status term is the statement's own, written as it writes it, so the index holds only the rows the statement writes
+/// and an index-unspent claimable sweep (an honest un-swept hop, a stranger's dust hop) costs it no read
+/// (D2-OWED-FOLD-3). Edited in place: migrations 396 to 407 shipped nowhere.
+pub const SWEEP_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_sweep ON owed_rows(probeTip) WHERE family='hop-stranded' AND claimable=1 AND json_extract(facts,'$.status') IS NOT 'unspent'";
 /// The D2-OWED lens's HIGH-1 and MEDIUM-2: a row judged with no chain tip (TIP-877's tipless judgement) is re-marked
 /// on the next tip; an old worker's keyless row is in it too.
 pub const UNTIPPED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_untipped ON owed_rows(probeTip,identity,gameId) WHERE probeTip IS NULL";
