@@ -1,0 +1,7 @@
+{
+  "rows": {
+    "97288e47d846066d59f0caa8a2bec22fd9040dd5af05f323c67cf010373ab064:0": "[\"unbound\",\"9d88aaaa348acae127efd08e133822201ecae56513831c37124837f3ef9ae17f\",20190,\"030d9e9fbe045a8130f190b103609c8a6bf13b1887d5c4f15e2f918d68aca8ad67\",null,\"the hop was spent outside this game by a transaction that pays none of your homes (your wallet's own spend, or a sweep elsewhere): if it was yours, the money is already there; nothing here can move it\",{\"ageMs\":90000000,\"chainProbe\":\"spent\",\"chainProbeAgeMs\":0,\"chainSpender\":\"57d8e2907420da08795e3146fb5bd05446a51ef2f870213775a074eccae73851\",\"claim\":null,\"hopSats\":20190,\"hopTxid\":\"97288e47d846066d59f0caa8a2bec22fd9040dd5af05f323c67cf010373ab064\",\"hopVout\":0,\"joinRefused\":true,\"joinRefusedBy\":\"eviction\",\"markerCreatedAtMs\":1789910000000,\"markerVerified\":\"verified\",\"seatSettlePubkey\":\"038884be9dd2274f39f6a60a0d0a54ed3ca1aaf9bebdde62d0d48ebd5aafd1a5a9\",\"spendKind\":\"spent-elsewhere\",\"spendingTxid\":null,\"spent\":false,\"spentConfirmed\":true,\"status\":\"unspent\",\"statusSource\":\"index\"}]"
+  },
+  "cut": false,
+  "derived": 1
+}

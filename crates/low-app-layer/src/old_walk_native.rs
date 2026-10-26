@@ -393,6 +393,50 @@ mod pins {
         .collect()
     }
 
+    /// What the OLD walk stored for one identity of one pin: its rows (`stored`), whether its own bound cut it, and
+    /// how many rows it derived. Frozen at the walk's retirement (bsv-low #893 section 6.2, lane D2-OWED-RETIRE) in
+    /// `tests/fixtures/old_walk_893/<key>.json`, so each walk-against-judge pin keeps comparing the judge with the
+    /// rows the walk served, after the walk's text is gone.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    pub(super) struct Walked {
+        pub rows: BTreeMap<String, String>,
+        pub cut: bool,
+        pub derived: usize,
+    }
+
+    pub(super) fn frozen_path(key: &str) -> std::path::PathBuf {
+        let name: String = key
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/old_walk_893")
+            .join(format!("{name}.json"))
+    }
+
+    /// Runs the walk and, under `OLD_WALK_FREEZE=1`, writes what it stored to its frozen file.
+    pub(super) async fn walk_rows(
+        key: &str,
+        walk_db: &std::rc::Rc<WalkDb>,
+        id: &str,
+        tip: u64,
+    ) -> Walked {
+        let walked = run_old_walk(walk_db.clone(), id, Some(tip), None, NOW_MS)
+            .await
+            .unwrap_or_else(|e| panic!("{key}: {id}: the walk faulted: {e}"));
+        let out = Walked {
+            rows: stored(&walk_db.conn.borrow(), id),
+            cut: walked.truncated || walked.budget_cut,
+            derived: walked.rows.len(),
+        };
+        if std::env::var("OLD_WALK_FREEZE").is_ok() {
+            let path = frozen_path(key);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, serde_json::to_string_pretty(&out).unwrap() + "\n").unwrap();
+        }
+        out
+    }
+
     mod fleet {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/d1_fleet.rs"));
     }
@@ -602,9 +646,7 @@ mod pins {
         for f in fixtures() {
             let (judge, walk_db) = seeded(&f);
             for id in &f.identities {
-                let walked = run_old_walk(walk_db.clone(), id, Some(TIP), None, NOW_MS)
-                    .await
-                    .unwrap_or_else(|e| panic!("{}: {id}: the walk faulted: {e}", f.name));
+                let walked = walk_rows(&format!("medium3-{}-{id}", f.name), &walk_db, id, TIP).await;
                 if f.name == "d1_fleet" {
                     judge_identity(&judge, id).await;
                 } else {
@@ -617,12 +659,12 @@ mod pins {
                         }
                     }
                 }
-                let w = stored(&walk_db.conn.borrow(), id);
+                let w = walked.rows.clone();
                 let j = stored(&judge.conn, id);
-                assert_eq!(w.len(), walked.rows.len().min(crate::owed::OWED_MAX_ROWS));
+                assert_eq!(w.len(), walked.derived.min(crate::owed::OWED_MAX_ROWS));
                 // A walk its page bound cut, or a list past the stored ceiling, keeps a different subset by design
                 // (the walk's cursor pages against the judge's ranked 500): the rows both hold are compared.
-                let cut = walked.truncated || walked.budget_cut || j.len() >= crate::owed::OWED_MAX_ROWS;
+                let cut = walked.cut || j.len() >= crate::owed::OWED_MAX_ROWS;
                 for (outpoint, row) in &w {
                     if cut && !j.contains_key(outpoint) {
                         continue;
@@ -695,9 +737,9 @@ mod pins {
         let walk = rusqlite::Connection::open(&path).unwrap();
         walk.execute_batch(&format!("DELETE FROM owed_row_words WHERE identity='{id}'; DELETE FROM owed_rows WHERE identity='{id}'; DELETE FROM owed_state WHERE identity='{id}';")).unwrap();
         let walk_db = std::rc::Rc::new(WalkDb { conn: RefCell::new(walk) });
-        let walked = run_old_walk(walk_db.clone(), &id, Some(TIP), None, NOW_MS).await.unwrap();
-        assert!(!walked.truncated && !walked.budget_cut);
-        let w = stored(&walk_db.conn.borrow(), &id);
+        let walked = walk_rows("write-path-filing", &walk_db, &id, TIP).await;
+        assert!(!walked.cut);
+        let w = walked.rows;
         let _ = std::fs::remove_file(&path);
         eprintln!("filing: walk {w:#?}\njudge {j:#?}");
         assert_eq!(w, j, "the walk and the write path's judgement store the same rows");
@@ -757,9 +799,9 @@ mod pins {
         let walk = rusqlite::Connection::open(&path).unwrap();
         walk.execute_batch(&format!("DELETE FROM owed_row_words WHERE identity='{id}'; DELETE FROM owed_rows WHERE identity='{id}'; DELETE FROM owed_state WHERE identity='{id}';")).unwrap();
         let walk_db = std::rc::Rc::new(WalkDb { conn: RefCell::new(walk) });
-        let walked = run_old_walk(walk_db.clone(), &id, Some(TIP), None, NOW_MS).await.unwrap();
-        assert!(!walked.truncated && !walked.budget_cut);
-        let w = stored(&walk_db.conn.borrow(), &id);
+        let walked = walk_rows("write-path-press", &walk_db, &id, TIP).await;
+        assert!(!walked.cut);
+        let w = walked.rows;
         let _ = std::fs::remove_file(&path);
         eprintln!("press: walk {w:#?}\njudge {j:#?}");
         assert_eq!(w, j, "the walk and the write path's judgement store the same press");
@@ -831,9 +873,9 @@ mod pins {
         let walk = rusqlite::Connection::open(&path).unwrap();
         walk.execute_batch(&format!("DELETE FROM owed_row_words WHERE identity='{id}'; DELETE FROM owed_rows WHERE identity='{id}'; DELETE FROM owed_state WHERE identity='{id}';")).unwrap();
         let walk_db = std::rc::Rc::new(WalkDb { conn: RefCell::new(walk) });
-        let walked = run_old_walk(walk_db.clone(), &id, Some(TIP), None, NOW_MS).await.unwrap();
-        assert!(!walked.truncated && !walked.budget_cut);
-        let w = stored(&walk_db.conn.borrow(), &id);
+        let walked = walk_rows("write-path-refund-press", &walk_db, &id, TIP).await;
+        assert!(!walked.cut);
+        let w = walked.rows;
         let _ = std::fs::remove_file(&path);
         eprintln!("refund press: walk {w:#?}\njudge {j:#?}");
         assert_eq!(w, j, "the walk and the write path's judgement store the same press");
@@ -951,15 +993,11 @@ mod pins {
         let db = std::rc::Rc::new(WalkDb {
             conn: RefCell::new(walk_conn),
         });
-        let walked = run_old_walk(db.clone(), "owner", Some(TIP), None, NOW_MS).await;
-        LOG.with(|l| eprintln!("{:#?}", l.borrow()));
-        let walked = walked.unwrap();
-        eprintln!("walk rows: {:#?}", walked.rows);
+        let w = walk_rows("smoke", &db, "owner", TIP).await.rows;
         let judge = SqliteSql::migrated();
         judge.now.set(NOW_MS);
         judge.conn.execute_batch(&seed).unwrap();
         crate::owed_judge::drain_dirty(&judge, 64).await.unwrap();
-        let w = stored(&db.conn.borrow(), "owner");
         let j = stored(&judge.conn, "owner");
         eprintln!("walk {w:#?}\njudge {j:#?}");
         assert_eq!(w, j);
@@ -1049,10 +1087,7 @@ mod pins {
         backfill_to_the_stamp(&judge).await;
         let mut diffs = Vec::new();
         for id in &f.identities {
-            run_old_walk(walk_db.clone(), id, Some(FOLD8_TIP), None, NOW_MS)
-                .await
-                .unwrap_or_else(|e| panic!("{id}: the walk faulted: {e}"));
-            let w = stored(&walk_db.conn.borrow(), id);
+            let w = walk_rows(&format!("fold8-a-{id}"), &walk_db, id, FOLD8_TIP).await.rows;
             let j = stored(&judge.conn, id);
             eprintln!("{id}:\n  walk  {w:#?}\n  judge {j:#?}");
             assert!(!w.is_empty(), "{id}: the walk serves a row");
@@ -1102,10 +1137,7 @@ mod pins {
             "the old worker's press stands before the backfill"
         );
         backfill_to_the_stamp(&judge).await;
-        run_old_walk(walk_db.clone(), &id, Some(TIP), None, NOW_MS)
-            .await
-            .unwrap();
-        let w = stored(&walk_db.conn.borrow(), &id);
+        let w = walk_rows("fold8-b", &walk_db, &id, TIP).await.rows;
         let j = stored(&judge.conn, &id);
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(j, w, "the old worker's press is judged away");

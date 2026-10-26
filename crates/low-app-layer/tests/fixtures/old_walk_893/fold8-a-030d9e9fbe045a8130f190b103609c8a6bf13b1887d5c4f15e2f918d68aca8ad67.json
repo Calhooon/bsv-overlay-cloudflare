@@ -1,0 +1,7 @@
+{
+  "rows": {
+    "9b238eed0177c714b1f9a608243e8f1bf79e35e9597110f83cefa1b658785c62:0": "[\"hop-stranded\",\"9d88aaaa348acae127efd08e133822201ecae56513831c37124837f3ef9ae17f\",20190,\"02f9f80a92a92677d97fce5bb0a03d0321425b918868b3ef5773120d9cf5364e49\",null,\"the network refused the transaction that spent this stake (it was evicted from the index): the hand cannot start from it; your stake can be swept back now\",{\"ageMs\":90000000,\"chainProbe\":\"index-unspent\",\"claim\":\"sweep-hop\",\"claimable\":true,\"hopSats\":20190,\"hopTxid\":\"9b238eed0177c714b1f9a608243e8f1bf79e35e9597110f83cefa1b658785c62\",\"hopVout\":0,\"joinRefused\":true,\"joinRefusedBy\":\"eviction\",\"markerCreatedAtMs\":1789910000000,\"markerVerified\":\"verified\",\"seatSettlePubkey\":\"023186e1d618b96dca2583a21aa8c5e2227ba49f3f671f59e3f2be1c346ed41763\",\"spendingTxid\":null,\"spent\":false,\"spentConfirmed\":false,\"status\":\"unspent\",\"statusSource\":\"index\",\"sweepSource\":\"sign-here\"}]"
+  },
+  "cut": false,
+  "derived": 1
+}

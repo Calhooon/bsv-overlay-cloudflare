@@ -1,0 +1,8 @@
+{
+  "rows": {
+    "97288e47d846066d59f0caa8a2bec22fd9040dd5af05f323c67cf010373ab064:0": "[\"unbound\",\"9d88aaaa348acae127efd08e133822201ecae56513831c37124837f3ef9ae17f\",null,\"opponent\",null,\"could not judge: evidence-missing: the evicted JOIN's stored bytes are absent or undecodable\",{\"claim\":null,\"claimable\":false,\"evidenceMissing\":true,\"hopTxid\":\"97288e47d846066d59f0caa8a2bec22fd9040dd5af05f323c67cf010373ab064\",\"hopVout\":0,\"markerCreatedAtMs\":1790000000000,\"markerlessReadFault\":true}]",
+    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:0": "[\"unbound\",\"healthy-game\",null,\"opponent\",null,\"the recovery gate is open and no valid filed refund names this pot (the tower's dead-man switch is the path)\",{\"committedKeys\":null,\"firstPartyMarkerAtMs\":1790000000000,\"mySeat\":null,\"outcome\":\"unresolved\",\"outcomeSource\":null,\"potAdmittedAtMs\":1790000000000,\"potTxid\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"potVout\":0,\"recoveryHeight\":958846,\"refundStatus\":\"gate-open\",\"settleSigners\":null,\"settleTxid\":null,\"spent\":false,\"spentConfirmed\":false,\"stakeSats\":null,\"tip\":971000,\"verdict\":null}]"
+  },
+  "cut": true,
+  "derived": 2
+}
