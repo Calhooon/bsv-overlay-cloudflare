@@ -268,6 +268,9 @@ mod tests {
             "\"tracker.chain_events\"",
             "\"tracker.tick\"",
             "\"tracker.sweep\"",
+            "\"owed.drain\"",
+            "\"owed.belt_arm\"",
+            "\"owed.backfill\"",
         ] {
             assert!(
                 sched.contains(&format!(".phase({phase},")),
@@ -280,4 +283,19 @@ mod tests {
             "each of the five tasks ends through the meter"
         );
     }
+    #[tokio::test]
+    async fn owed906_alarm_meter_keeps_the_drain_and_belt_phases_separate() {
+        let now = Rc::new(Cell::new(1000));
+        let clock = now.clone();
+        let meter = PassMeter::new(Box::new(move || clock.get()), 1);
+        meter.phase("owed.drain", async { now.set(now.get() + 17_000); }).await;
+        meter.phase("owed.belt_tick", async { now.set(now.get() + 10_000); }).await;
+        let walls = meter.task_done().unwrap();
+        assert_eq!(walls.wall_ms(), 27_000);
+        assert_eq!(walls.phases_json(), r#"{"owed.belt_tick":10000,"owed.drain":17000}"#);
+        let alarm = squash(include_str!("owed_belt.rs"));
+        assert!(alarm.contains(".phase(\"owed.drain\",drain_env(env,false))"));
+        assert!(alarm.contains(".phase(\"owed.belt_tick\",deadline.run_reserving(tick_env(env)))"));
+    }
+
 }

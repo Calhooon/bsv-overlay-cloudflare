@@ -3047,8 +3047,8 @@ pub(crate) async fn internal_pot_changed(
     // The overlay source transaction already marked every affected game.
     let tip = chaintracks_present_height_env(env, "owed").await.ok();
     let judge = crate::owed_judge::D1Judge::new(env, tip, written_off_before_ms_env(env))?;
-    let keys: Vec<String> = outpoints.iter().flat_map(|(txid, vout)| [txid.clone(), format!("{txid}:{vout}")]).collect();
-    match crate::owed_judge::drain_changed(&judge, &outcome.owed_identities, &keys, "pot-changed").await {
+    let identities = outcome.owed_identities;
+    match crate::owed_judge::drain_identities(&judge, &identities, "pot-changed").await {
         Ok(report) => for (_, error) in report.faults { console_warn!("[owed] pot judgement deferred: {error}"); },
         Err(error) => console_warn!("[owed] pot drain failed: {error}"),
     }
@@ -6969,6 +6969,10 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     body["record"] = crate::record_post::record_health_json();
     // bsv-low #469: the owed list's recomputes by source, the rows written by family, the faults.
     body["owed"] = crate::owed::owed_health_json();
+    body["owed"]["dirty"] = match D1Sql::of(&ctx.env) {
+        Ok(sql) => crate::owed_judge::dirty_health(&sql).await,
+        Err(_) => serde_json::Value::Null,
+    };
     // bsv-low #499: this isolate's D1 rows ledger, the per-route running maxima since boot (the overlay serves the
     // same body on `/health/invariants.d1Budget`; `scripts/d1-census.py` reads both).
     body["d1Budget"] = crate::d1_ledger::budget_json();

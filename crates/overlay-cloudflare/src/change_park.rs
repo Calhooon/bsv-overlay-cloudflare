@@ -147,7 +147,8 @@ pub const PARKED_COUNT_SQL: &str = "SELECT \
      (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'word' AND exhausted = 0 LIMIT ?1)) AS word, \
      (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'word' AND exhausted = 1 LIMIT ?1)) AS word_exhausted, \
      (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'lobby' AND exhausted = 0 LIMIT ?1)) AS lobby, \
-     (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'lobby' AND exhausted = 1 LIMIT ?1)) AS lobby_exhausted";
+     (SELECT COUNT(*) FROM (SELECT 1 FROM change_parked WHERE kind = 'lobby' AND exhausted = 1 LIMIT ?1)) AS lobby_exhausted, \
+     (SELECT MIN(parked_at_ms) FROM change_parked WHERE kind = 'word') AS oldest_word";
 /// N3: where the gauge stops counting (at most four times this many index entries a read).
 pub const HEALTH_COUNT_CAP: i64 = 256;
 
@@ -923,6 +924,7 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
         word_exhausted: f64,
         lobby: f64,
         lobby_exhausted: f64,
+        oldest_word: Option<f64>,
     }
     match crate::d1::Query::new(PARKED_COUNT_SQL)
         .bind(HEALTH_COUNT_CAP)
@@ -936,6 +938,7 @@ pub async fn health_json(db: &D1Database) -> serde_json::Value {
             "hopExhausted": r.hop_exhausted as u64,
             "word": r.word as u64,
             "wordExhausted": r.word_exhausted as u64,
+            "oldestParkedFrameAgeMs": r.oldest_word.map(|at| Date::now().as_millis().saturating_sub(at as u64)),
             "lobby": r.lobby as u64,
             "lobbyExhausted": r.lobby_exhausted as u64,
             "outboxParkMax": OUTBOX_PARK_MAX,
@@ -3036,4 +3039,15 @@ mod tests {
             "a lobby park reads at most the ceiling: {steps}"
         );
     }
+    #[test]
+    fn owed906_oldest_frame_includes_exhausted_words_and_excludes_notes() {
+        let db = parked_db();
+        let oldest = || db.query_row(PARKED_COUNT_SQL, [HEALTH_COUNT_CAP], |row| row.get::<_, Option<i64>>("oldest_word")).unwrap();
+        assert_eq!(oldest(), None);
+        db.execute("INSERT INTO change_parked(kind,item,parked_at_ms,exhausted) VALUES ('pot','a',1,0),('word','b',2000,0),('word','c',1000,1)", []).unwrap();
+        assert_eq!(oldest(), Some(1000));
+        db.execute("DELETE FROM change_parked WHERE item='c'", []).unwrap();
+        assert_eq!(oldest(), Some(2000));
+    }
+
 }
