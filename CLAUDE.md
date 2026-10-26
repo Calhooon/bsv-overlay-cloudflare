@@ -3404,3 +3404,14 @@ bsv-low `docs/audit/D2-OWED-DELTA-2026-10-25.md` (HOLD: one NEW HIGH, three LOWs
 - **NOTEs.** D-N1 corrected here: the read reads the present tip only for a row with a gate, a `probeTip` or a claimable sweep (the fold's "every read with a row" was too wide). D-N2 (a lost acknowledgement re-runs a filing's content-keyed source statements alone): stated, nothing to fold.
 
 No migration moved (the list stays 407, fingerprint 1,328,337,484; since D2-OWED-FOLD-3's in-place scope of `idx_owed_rows_sweep`, 2,691,125,399). Every other owed tier re-ran unchanged (`owed-belt-tick` 896 / 260 / 313, `-429` 266 / 36 / 29, `owed-fleet-read` 2,000 reads, `owed-wanted-read` 5 writes, `owed-backfill-pass` 25,591 / 7,344 / 3,097, `owed-backfill-stamped` 1 read, `owed-age-remark` 286 / 296 / 3, `owed-judge-filing` 126 / 42 / 61).
+
+## The second delta lens's folds (D2-OWED-FOLD-4, 2026-10-26)
+
+bsv-low `docs/audit/D2-OWED-DELTA-2-2026-10-26.md` (LAND: one new MEDIUM, one LOW, two NOTEs), folded on `lane/D2-OWED-FOLD-2` from `6ec6eb9a`. Pins in `crates/low-app-layer/tests/d2_owed_delta2.rs` unless named.
+
+- **D2-M1.** The belt's first class (the block-dated courier-only sweeps over `idx_owed_rows_sweep`) and the due-only walk: the belt paragraph above. After a block an honest courier-only sweep is looked at within `ceil(C / 8)` ticks, `C` the courier-dependent rows the block dated, whatever the strangers' index-unspent rows. Pins `d2delta2_m1_a` (640 strangers dated, not due: the honest look on the first tick) and `d2delta2_m1_b` (that class before older back-off re-looks), both RED on 6ec6eb9a. The new statement is in `d1_fleet_plans`' owed list on its index. Tier `owed-belt-tick` reads 896 to 898, statements 313 to 314; `-429` 266 to 268, 29 to 30.
+- **D2-L1.** The read withholds a press over a pending downgrade: the `GET /owed` paragraph above. Pin `d2delta2_l1_*`, RED on 6ec6eb9a. `owed-fleet-read` unchanged.
+- **D2-N1.** The D-H1 pin split into `d2delta_h1_a` to `_d` (`tests/d2_owed_delta.rs`): (a) and (b) RED on d521888f; (c) and (d) were d521888f's own behaviour and are RED against a mutant each (the find's facts not applied in `judge_with_write`; `state_index_unspent_sweep` without its status test).
+- **D2-N2.** `routes::old_walk_native::pins::d2delta2_n2_*`: a press (the seat's own index-unspent hop, its sweep filed through `record_post`, judged by the write path `claimable: true`) stored byte for byte as the old walk stores it.
+
+No migration moved (the list stays 407, fingerprint 2,691,125,399).
