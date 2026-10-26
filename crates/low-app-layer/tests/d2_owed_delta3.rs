@@ -300,3 +300,98 @@ fn d3l1_b_the_downgrade_class_is_written_by_the_spend_delete_and_eviction_trigge
         1
     );
 }
+
+/// Copy `from`'s stored row `n` times under fresh identities and outpoints, every other column as judged, the due
+/// time `due`.
+fn clone_row(db: &Db, from: &str, prefix: &str, n: usize, start: usize, due: i64) {
+    let cols: Vec<String> = {
+        let conn = db.conn.borrow();
+        let mut s = conn
+            .prepare("SELECT name FROM pragma_table_info('owed_rows')")
+            .unwrap();
+        s.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let list = cols.join(",");
+    for k in 0..n {
+        let picked: Vec<String> = cols
+            .iter()
+            .map(|c| match c.as_str() {
+                "identity" => format!("'{prefix}{k:04}'"),
+                "outpoint" => format!("'{}:0'", hop(start + k)),
+                "beltDueAtMs" => due.to_string(),
+                other => other.into(),
+            })
+            .collect();
+        db.exec(&format!(
+            "INSERT INTO owed_rows({list}) SELECT {} FROM owed_rows WHERE outpoint='{from}'",
+            picked.join(",")
+        ));
+    }
+}
+
+/// The first class's statement's VM steps and its rows, over 8 due block-dated courier-only sweeps and `idle` more of
+/// the same class judged below the tip but re-armed (an unanswered look: not due).
+async fn first_class_at(idle: usize) -> (i64, usize) {
+    let db = Db::new();
+    seed_courier_unspent_hop(&db, "courier", "c00", &hop(1), 900_000);
+    drain_all(&db).await;
+    let model = format!("{}:0", hop(1));
+    let now = db.now.get() as i64 + 1_000;
+    db.exec(&format!(
+        "UPDATE owed_rows SET beltDueAtMs={now} WHERE outpoint='{model}'"
+    ));
+    clone_row(&db, &model, "due", 7, 10_000, now - 1);
+    clone_row(&db, &model, "idle", idle, 100_000, now + 600_000);
+    db.steps.borrow_mut().clear();
+    let out = low_app_layer::pot_hook::SqlPort::run_batch(
+        &db,
+        vec![low_app_layer::pot_hook::Stmt {
+            sql: belt::BELT_SWEEPS_DUE_SQL.into(),
+            binds: vec![
+                low_app_layer::pot_hook::Bind::Int(900_001),
+                low_app_layer::pot_hook::Bind::Int(now),
+                low_app_layer::pot_hook::Bind::Int(belt::OWED_BELT_SWEEP_ROWS_READ as i64),
+            ],
+        }],
+    )
+    .await
+    .unwrap();
+    let steps = db.steps.borrow()[0].1;
+    let plan = db.plan(
+        belt::BELT_SWEEPS_DUE_SQL,
+        &[
+            rusqlite::types::Value::Integer(900_001),
+            rusqlite::types::Value::Integer(now),
+            rusqlite::types::Value::Integer(256),
+        ],
+    );
+    assert!(
+        !plan.iter().any(|d| d.starts_with("SCAN owed_rows")),
+        "no scan of owed_rows: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|d| d.contains("idx_owed_rows_sweep") && d.contains("beltDueAtMs<?")),
+        "the due set is a seek on the sweep index: {plan:?}"
+    );
+    (steps, out[0].rows.len())
+}
+
+/// D3-N3: the first class's due set is a SEEK. Its statement's steps over 1,000 re-armed (not due) rows of the class
+/// equal its steps over 10, within one row's share: a row not due is never visited. RED on e53c1406, where the index
+/// keyed `probeTip` alone and the statement filtered `beltDueAtMs` row by row.
+#[tokio::test]
+async fn d3n3_the_first_class_reads_only_its_due_rows() {
+    let (few, rows_few) = first_class_at(10).await;
+    let (many, rows_many) = first_class_at(1_000).await;
+    eprintln!("BELT_SWEEPS_DUE_SQL: {few} VM steps at 10 idle rows, {many} at 1,000; rows {rows_few} and {rows_many}");
+    assert_eq!((rows_few, rows_many), (8, 8));
+    let share = few / 8;
+    assert!(
+        (many - few).abs() <= share,
+        "the first class reads its idle rows: {few} at 10, {many} at 1,000 (one row's share {share})"
+    );
+}
