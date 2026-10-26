@@ -237,7 +237,7 @@ async fn d3l1_a_only_a_downgrade_mark_withholds_the_press() {
 }
 
 /// D3-L1, the classes the triggers write: of the `owed_dirty` triggers only the pot row's spend columns, its moved key,
-/// its delete, an admission arriving spent and the eviction ledger write a downgrade; every other source is a plain
+/// its delete, an admission (D4-L1) and the eviction ledger write a downgrade; every other source is a plain
 /// mark. A pot row deleted (the eviction's shadow move) marks a downgrade.
 #[test]
 fn d3l1_b_the_downgrade_class_is_written_by_the_spend_delete_and_eviction_triggers() {
