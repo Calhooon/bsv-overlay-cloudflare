@@ -4567,6 +4567,40 @@ pub fn degrade_stale_sweeps(
     }
 }
 
+/// The D2-OWED delta lens's D-H1 (the captain's ruling): the read's tip arm for a STORED claimable sweep whose hop the
+/// INDEX holds unspent (the row's `status` fact, `pot_records`' word as the judge read it). Main's rule
+/// (`index-unspent` and #808 (b)): the owner's own index-unspent stranded hop is pressable on the index's word; the
+/// chain rung is a downgrade and a re-probe trigger, never a precondition of the honest press. So a block since the
+/// judgement (or a tip that cannot be read) does not withhold it: the press stands and the move is STATED (`tipMoved`
+/// or `tipUnknown`, `snapshotTip` the tip it was judged at, `chainProbeTip` the probe's own tip or else that one,
+/// `servedTip`). A dead sweep costs a refused broadcast of the owner's own output, never an honest party's sats, and
+/// heals on the next word. Answers `false` (nothing touched) for every other row: those take
+/// [`degrade_stale_sweeps`].
+pub fn state_index_unspent_sweep(
+    facts: &mut Value,
+    snapshot_tip: Option<u64>,
+    present_tip: Option<u64>,
+) -> bool {
+    if facts["claimable"] != Value::Bool(true) || facts["status"] != HopStatus::Unspent.as_str() {
+        return false;
+    }
+    match (snapshot_tip, present_tip) {
+        (Some(t0), Some(tn)) if tn <= t0 => return true,
+        (Some(_), Some(_)) => facts["tipMoved"] = json!(true),
+        _ => facts["tipUnknown"] = json!(true),
+    }
+    if let Some(t0) = snapshot_tip {
+        facts["snapshotTip"] = json!(t0);
+        if facts["chainProbeTip"].is_null() {
+            facts["chainProbeTip"] = json!(t0);
+        }
+    }
+    if let Some(tn) = present_tip {
+        facts["servedTip"] = json!(tn);
+    }
+    true
+}
+
 /// The `owed_rows` table (the overlay's migration 156 owns the DDL; this crate
 /// issues the byte-identical catch-up). `facts` is the row's JSON.
 pub const OWED_ROWS_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_rows (identity TEXT NOT NULL, outpoint TEXT NOT NULL, family TEXT NOT NULL, gameId TEXT NOT NULL, sats INTEGER, opponentIdentity TEXT, atHeight INTEGER, facts TEXT NOT NULL, updatedAtMs INTEGER NOT NULL, reason TEXT, PRIMARY KEY (identity, outpoint))";
