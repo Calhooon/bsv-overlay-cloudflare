@@ -1,5 +1,5 @@
-//! Local D1 executes these exact native-pinned cursor pages and reports rows_read for each.
-use low_app_layer::owed_cursor::{self, Source, PAGE};
+//! Local D1 executes these exact native-pinned pages and reports rows_read for each.
+use low_app_layer::owed_judge::rank::{self, PAGE};
 use rusqlite::{
     types::{Value, ValueRef},
     Connection,
@@ -186,65 +186,55 @@ fn ns_cost_statements() -> Vec<(&'static str, String, u64)> {
     out
 }
 
+/// One hydration page's rows-read bound (the retired cursor's `PAGE_READ_CEILING`, kept for the judge's pages).
+const HYDRATION_PAGE_READ_CEILING: u64 = 287;
+
 pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
     let mut sql = String::new();
     let mut expected = Vec::new();
     let mut party = Vec::new();
     let mut hops = Vec::new();
-    let (expanded, rows) = query(
-        db,
-        &owed_cursor::initial_party_sql(),
-        &[Value::Text(identity.into())],
-    );
-    sql.push_str(&format!("{expanded};\n"));
-    expected.push(json!({"name":"combined initial party cursor","rows":rows,"sql":expanded,"ceiling":owed_cursor::PAGE_READ_CEILING}));
-    for source in [Source::Party, Source::Link, Source::Hop] {
-        for _ in 0..1 {
-            let mut cursor = owed_cursor::Cursor::default();
-            loop {
-                let (nulls, seek) = cursor.phase();
-                let mut binds = vec![Value::Text(identity.into())];
-                if seek {
-                    binds.extend(cursor.bind_numbers(nulls).into_iter().map(Value::Integer));
-                }
-                let (expanded, rows) = query(
-                    db,
-                    &owed_cursor::candidates_sql(source, nulls, seek, cursor.next_stamp),
-                    &binds,
-                );
-                sql.push_str(&format!("{expanded};\n"));
-                expected.push(json!({"name":format!("{source:?} nulls={nulls} page={}",expected.len()),"rows":rows,"sql":expanded,"ceiling":owed_cursor::PAGE_READ_CEILING}));
-                let more = cursor.advance(&rows, nulls);
-                match source {
-                    Source::Hop => hops.extend(rows),
-                    _ => party.extend(rows),
-                }
-                if !more {
-                    break;
-                }
-            }
-        }
+    // The judge's candidate reads over every game of the identity (bsv-low #893 section 6.2: the walk's createdAt
+    // cursor pages retired with it; the judge reads at most 16 games a statement, unmeasured here), then the
+    // hydration pages of the chosen rows, each measured under the page bound.
+    let games: Vec<String> = db
+        .prepare("SELECT gameId FROM potparty_records WHERE identity=?1 UNION SELECT gameId FROM hopparty_records WHERE identity=?1")
+        .unwrap()
+        .query_map([identity], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let bound = [
+        Value::Text(identity.into()),
+        Value::Text(serde_json::to_string(&games).unwrap()),
+    ];
+    for candidates in [
+        low_app_layer::owed_judge::PARTIES_SQL,
+        low_app_layer::owed_judge::LINKS_SQL,
+    ] {
+        party.extend(query(db, candidates, &bound).1);
     }
+    hops.extend(query(db, low_app_layer::owed_judge::HOPS_SQL, &bound).1);
     for (name, selected, hydration) in [
         (
             "results",
-            owed_cursor::select(party.clone(), None, 10),
-            owed_cursor::hydrate_sql(&low_app_layer::results::results_sql(None, 0)),
+            rank::select(party.clone(), None, 10),
+            rank::hydrate_sql(&low_app_layer::results::results_sql(None, 0)),
         ),
         (
             "paired hydration",
-            owed_cursor::select(party.clone(), None, 10),
-            owed_cursor::hydrate_party_pair_sql(),
+            rank::select(party.clone(), None, 10),
+            rank::hydrate_party_pair_sql(),
         ),
         (
             "refund",
-            owed_cursor::select(party, None, 10),
-            owed_cursor::hydrate_sql(&low_app_layer::refund_view::refund_view_sql(None, 0)),
+            rank::select(party, None, 10),
+            rank::hydrate_sql(&low_app_layer::refund_view::refund_view_sql(None, 0)),
         ),
         (
             "hops",
-            owed_cursor::select_hops(hops, None, now as i64),
-            owed_cursor::hydrate_hops_sql(),
+            rank::select_hops(hops, None, now as i64),
+            rank::hydrate_hops_sql(),
         ),
     ] {
         for (page, rows) in selected.chunks(PAGE).enumerate() {
@@ -254,7 +244,7 @@ pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
                 &[Value::Text(serde_json::to_string(rows).unwrap())],
             );
             sql.push_str(&format!("{expanded};\n"));
-            expected.push(json!({"name":format!("{name} hydration page={page}"),"rows":rows,"sql":expanded,"ceiling":owed_cursor::PAGE_READ_CEILING}));
+            expected.push(json!({"name":format!("{name} hydration page={page}"),"rows":rows,"sql":expanded,"ceiling":HYDRATION_PAGE_READ_CEILING}));
         }
     }
     // bsv-low #643, #644, #645 (W1.6): the hot passes' reads on the fleet fixture, each under its own ceiling
