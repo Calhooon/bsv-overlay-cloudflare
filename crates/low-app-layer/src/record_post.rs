@@ -2879,7 +2879,7 @@ pub(crate) mod tests {
         }
     }
     /// A signed potrefund marker for `raw` under wallet `w`.
-    fn potrefund_script(w: &ProtoWallet, gid: &[u8; 32], raw: &[u8]) -> Vec<u8> {
+    pub(crate) fn potrefund_script(w: &ProtoWallet, gid: &[u8; 32], raw: &[u8]) -> Vec<u8> {
         let id = identity(w);
         let sig = sign(
             w,
@@ -4347,7 +4347,7 @@ pub(crate) mod tests {
     }
 
     /// The fixture's covenant pot, held by the index as the overlay decodes it (`paramsDecoded = 1`).
-    fn md_index_the_pot(db: &crate::pot_hook::tests::SqliteSql) {
+    pub(crate) fn md_index_the_pot(db: &crate::pot_hook::tests::SqliteSql) {
         let p = pot_params();
         db.conn
             .execute(
@@ -4373,7 +4373,7 @@ pub(crate) mod tests {
     }
 
     /// The victim's seat on the pot (the party window `/refund-backups` is driven from).
-    fn md_seat(db: &crate::pot_hook::tests::SqliteSql, id_lc: &str, gid: &[u8; 32]) {
+    pub(crate) fn md_seat(db: &crate::pot_hook::tests::SqliteSql, id_lc: &str, gid: &[u8; 32]) {
         db.conn
             .execute(
                 POTPARTY_FILE_SQL,
