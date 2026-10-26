@@ -40,101 +40,24 @@ try {
   assert(cleared.alarm > Date.now(), 'NOTE-C deleteAll preserves the alarm at configured 2024-12-01 date')
   console.log('PASS NOTE-C real SQLite DO deleteAll: keys=0, alarm preserved (2024-12-01)')
 
+  // D2-OWED-FOLD-8: the deferred owed walk is retired (bsv-low #893: the read is one lookup, the judge runs at the
+  // write, the belt asks the chain in the background), so its pins are DROPPED: SHEDD-M1 and SHED-L1 (a faulted alarm's
+  // one retry, two faulted windows), SHEDD-L1 (the read=1 retry, a refused storage arm), NOTE-3 (the reserved
+  // first-read walk) and the two exhausted route windows. What stays of it: a stale caller of the retired routes is
+  // answered 410 and served nothing, and an actor the retired walk armed before the deploy clears its storage at its
+  // alarm and arms nothing again.
   const identity = '02' + (299).toString(16).padStart(64, '0')
   const stub = ns.get(ns.idFromName(`owed-deferred:pin:${identity}`))
   const call = async path => stub.fetch('http://board-view' + path)
-  const state = async () => (await call('/pin/state')).json()
-  const arm = due => call(`/owed-deferred?identity=${identity}&due=${due}`)
-  await db.prepare(`CREATE TRIGGER ns2_alarm_fault BEFORE INSERT ON owed_rows WHEN NEW.identity='${identity}' BEGIN SELECT RAISE(FAIL,'NS2 deterministic write fault'); END;`).run()
-  assert.equal((await arm(Date.now() + 30000)).status, 200)
-  const once = await (await call('/pin/alarm')).json()
-  assert.equal(once.keys['owed-retry'], true, 'SHEDD-M1 faulted alarm carries a durable once latch')
-  assert(once.alarm > Date.now(), 'SHED-L1 faulted alarm rearms next window')
-  assert.equal(once.keys['owed-started'], undefined, 'SHED-L1 consumed claim cleared')
-  assert.equal((await (await mf.dispatchFetch('http://app/health')).json()).owed.owed_recompute_deferred_faulted_total, 1, 'SHED-L1 fault counted once')
-  // The next exhausted window lands on the same object/slot, retaining the retry latch.
-  assert.equal((await arm(once.keys['owed-due'])).status, 200)
-  const twice = await (await call('/pin/alarm')).json()
-  assert.equal(twice.keys['owed-identity'], undefined, 'SHEDD-M1 faulted retry arms NOTHING; two faulted windows cannot stack chains')
-  const duplicate = await (await call('/pin/duplicate-alarm')).json()
-  assert.equal(duplicate.keys['owed-consumed-due'], twice.keys['owed-consumed-due'], 'NOTE-C duplicate old alarm preserves the consumed tombstone until its expiry')
-  assert.equal(duplicate.keys['owed-identity'], undefined)
-  const health = await (await mf.dispatchFetch('http://app/health')).json()
-  assert.equal(health.owed.owed_recompute_deferred_abandoned_total, 1, 'SHEDD-M1 abandoned retry counted once')
-  console.log('PASS SHEDD-M1 two faulted windows: one live retry then zero; abandoned=1')
-  await db.exec('DROP TRIGGER ns2_alarm_fault;')
-  const readFault = '02' + (296).toString(16).padStart(64, '0')
-  const readStub = ns.get(ns.idFromName(`owed-deferred:pin:${readFault}`))
-  const readCall = path => readStub.fetch('http://board-view' + path)
-  await db.prepare(`CREATE TRIGGER ns2_reserved_read_fault BEFORE INSERT ON owed_rows WHEN NEW.identity='${readFault}' BEGIN SELECT RAISE(FAIL,'NS2 reserved read fault'); END;`).run()
-  assert.equal((await readCall(`/owed-deferred?identity=${readFault}&due=${Date.now() + 30000}&read=1`)).status, 503)
-  const readRetry = await (await readCall('/pin/state')).json()
-  assert.equal(readRetry.keys['owed-retry'], true, 'read=1 fault arms one retry')
-  assert.equal((await readCall(`/owed-deferred?identity=${readFault}&due=${readRetry.keys['owed-due']}&read=1`)).status, 503)
-  const readStopped = await (await readCall('/pin/state')).json()
-  assert.equal(readStopped.keys['owed-identity'], undefined, 'read=1 retry fault arms nothing')
-  assert.equal((await (await mf.dispatchFetch('http://app/health')).json()).owed.owed_recompute_deferred_abandoned_total, 2, 'read=1 retry abandonment counted')
-  await db.exec('DROP TRIGGER ns2_reserved_read_fault;')
-  console.log('PASS SHEDD-L1 read=1 fault: one retry; retry fault: no arm, abandonment counted')
-
-  // SHEDD-L1: production route -> DO -> a REAL refused storage.put, counted by the scheduling caller.
-  const refused = '02' + (298).toString(16).padStart(64, '0')
-  const request = path => mf.dispatchFetch('http://app' + path)
-  const owedHealth = async () => (await (await request('/health')).json()).owed
-  await db.prepare(`CREATE TRIGGER ns2_refused_arm_fault BEFORE INSERT ON owed_rows WHEN NEW.identity='${refused}' BEGIN SELECT RAISE(FAIL,'NS2 no snapshot'); END;`).run()
-  for (let n = 0; n < 12; n++) assert.equal((await request(`/owed?identity=${refused}`)).status, 503, 'twelve ordinary walks fault before any snapshot')
-  const armBefore = await owedHealth()
-  await request(`/pin/refuse?identity=${refused}`)
-  assert.equal((await mf.dispatchFetch('http://app/internal/pot-changed', {
-    method: 'POST', headers: {'Content-Type': 'application/json', Authorization: 'Bearer ci-internal-tok'},
-    body: JSON.stringify({outpoints: [{txid: 'cc' + (298).toString(16).padStart(62, '0'), vout: 0}]})
-  })).status, 200)
-  // The scheduler runs after the hook answer. Only health is polled, never another shed.
-  let armAfter
-  for (let n = 0; n < 100; n++) {
-    armAfter = await owedHealth()
-    if (armAfter.owed_recompute_arm_failed_total > armBefore.owed_recompute_arm_failed_total) break
-    await new Promise(resolve => setTimeout(resolve, 20))
+  for (const path of [`/owed-deferred?identity=${identity}&due=${Date.now() + 30000}`, `/owed-deferred-note?identity=${identity}`]) {
+    assert.equal((await call(path)).status, 410, `${path}: the retired walk answers 410`)
   }
-  assert.equal(armAfter.owed_recompute_arm_failed_total, armBefore.owed_recompute_arm_failed_total + 1, 'SHED-L2 refused storage arm counted once')
-  await db.exec('DROP TRIGGER ns2_refused_arm_fault;')
-  await request('/pin/advance-clock')
-  const repaired = await request(`/owed?identity=${refused}`)
-  assert.equal(repaired.status, 200, 'SHED-L2 the last shed had no snapshot: own next-window read walks')
-  assert.equal((await repaired.json()).rows.length, 1)
-  assert.equal((await owedHealth()).recomputeBySource['read-first'], armAfter.recomputeBySource['read-first'] + 1, 'SHED-L2 next read runs exactly one walk')
-  console.log('PASS SHEDD-L1 refused storage arm counted once; snapshotless own next-window read walks once')
-
-  // NOTE-3: first read and alarm share the durable claim, even after twelve real D1 faults.
-  const first = '02' + (297).toString(16).padStart(64, '0')
-  await db.prepare(`CREATE TRIGGER ns2_first_read_fault BEFORE INSERT ON owed_rows WHEN NEW.identity='${first}' BEGIN SELECT RAISE(FAIL,'NS2 first read'); END;`).run()
-  for (let n = 0; n < 12; n++) assert.equal((await request(`/owed?identity=${first}`)).status, 503)
-  await db.exec('DROP TRIGGER ns2_first_read_fault;')
-  const readBefore = await owedHealth()
-  const reservedRead = await request(`/owed?identity=${first}`)
-  assert.equal(reservedRead.status, 200, 'NOTE-3 snapshotless read spends the DO reservation')
-  assert.equal((await reservedRead.json()).rows.length, 1)
-  const readAfter = await owedHealth()
-  assert.equal(readAfter.owed_recompute_deferred_total, readBefore.owed_recompute_deferred_total + 1, 'NOTE-3 reserved read walked once')
-  assert.equal((await request(`/owed?identity=${first}`)).status, 200)
-  assert.equal((await owedHealth()).owed_recompute_deferred_total, readAfter.owed_recompute_deferred_total, 'NOTE-3 second read spends no second reservation')
-  await request(`/pin/route-alarm?identity=${first}`)
-  assert.equal((await owedHealth()).owed_recompute_deferred_total, readAfter.owed_recompute_deferred_total, 'NOTE-3 alarm cannot spend the first read’s claim twice')
-  console.log('PASS SHEDD-L1 snapshotless first read: reserved walk=1; second read=0; alarm=0')
-  // Two genuinely exhausted ROUTE windows under a deterministic write fault must resolve one live actor.
-  const stacked = '02' + (295).toString(16).padStart(64, '0')
-  await db.prepare(`CREATE TRIGGER ns2_two_window_fault BEFORE INSERT ON owed_rows WHEN NEW.identity='${stacked}' BEGIN SELECT RAISE(FAIL,'NS2 two-window fault'); END;`).run()
-  for (let window = 0; window < 2; window++) {
-    for (let n = 0; n < 13; n++) assert.equal((await request(`/owed?identity=${stacked}`)).status, 503)
-    const ids = await (await request(`/pin/object-ids?identity=${stacked}`)).json()
-    assert.equal(ids.length, 1, 'SHEDD-M1 two exhausted route windows share ONE live actor, never window-named chains')
-    if (window === 0) await request('/pin/advance-clock')
-  }
-  const abandonedBefore = (await owedHealth()).owed_recompute_deferred_abandoned_total
-  await request(`/pin/route-alarm?identity=${stacked}`)
-  assert.equal((await owedHealth()).owed_recompute_deferred_abandoned_total, abandonedBefore + 1, 'SHEDD-M1 the sole faulted carried retry is abandoned')
-  await db.exec('DROP TRIGGER ns2_two_window_fault;')
-  console.log('PASS SHEDD-M1 2 exhausted route windows (26 faults): live actors=1, faulted retry abandoned=1')
-
+  const before = Date.now()
+  const old = await (await call(`/pin/old-actor?identity=${identity}`)).json()
+  assert.deepEqual(old.keys, {}, 'an old actor\'s alarm clears its storage')
+  // deleteAll keeps an alarm at this compatibility date (NOTE-C, above): what stays is the one the old walk set
+  // (30 s out), never a new arm; its next firing finds empty storage and clears again
+  assert(old.alarm === null || old.alarm <= before + 31000, `and arms nothing new: alarm ${old.alarm}`)
+  console.log('PASS D2-OWED-FOLD-8 the retired deferred walk: 410 to a stale caller; an old actor clears at its alarm')
 
 } finally { await mf.dispose() }
