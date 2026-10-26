@@ -649,6 +649,8 @@ ci-d1-budget:
 	node tools/lane-831/retire_pass_budget_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
 	node tools/lane-837/join_hop_pass_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
 	node tools/lane-834/janitor_pacing_budget_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
+	echo "→ ci-d1-budget: the owed belt tier (owed-belt-tick, -429, owed-tip-mark, owed-belt-tick-fleet: bsv-low D2-OWED-DELTA-4 D4-N2)"; \
+	env $$seal LANE_BASE=$$((B+20)) bash tools/lane-893/owed_belt_tick.sh; \
 	guard_ran=1; \
 	node tools/lane-731/egress_guard.mjs "app-layer=$$app_log" "overlay=$$ov_log" "delivering-overlay=$$dv_log" "retire-overlay=$$rv_log"
 
