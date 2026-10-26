@@ -129,7 +129,7 @@ pub const OWED_WANTED_GAMES: usize = 32;
 /// Required source-table access paths, by index name: the overlay ships both (the native pin holds it).
 pub const REQUIRED_GAME_INDEX_NAMES: [&str; 2] =
     ["idx_potparty_game_identity", "idx_evicted_party_identity_game"];
-pub const MARK_WANTED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,'','wanted',?1,?2) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
+pub const MARK_WANTED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,'','wanted','wanted',?2) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
 /// A judge's per-game delete, over `idx_owed_rows_identity_game` (the D2-OWED lens's LOW-2).
 pub const GAME_DELETE_SQL: &str = "DELETE FROM owed_rows WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))";
 /// The identity's state row, created once with its rows counted; the row triggers keep `rows` from then on.
@@ -143,11 +143,12 @@ pub const STATE_UPDATE_SQL: &str = "UPDATE owed_state SET computedAtMs=MAX(compu
 /// source statements raised, ?4 a JSON list of `[source, sourceKey]`.
 pub const ACK_DIRTY_SQL: &str = "DELETE FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2)) AND (generation<=?3 OR EXISTS (SELECT 1 FROM json_each(?4) m WHERE json_extract(m.value,'$[0]')=owed_dirty.source AND json_extract(m.value,'$[1]')=owed_dirty.sourceKey))";
 pub const MARKS_SQL: &str = "SELECT generation,source,sourceKey FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))";
-/// The wanted envelopes, oldest first, by (source, age).
-pub const WANTED_ENVELOPES_SQL: &str = "SELECT identity,generation FROM owed_dirty INDEXED BY idx_owed_dirty_source_marked WHERE source='wanted' AND gameId='' ORDER BY markedAtMs,generation LIMIT ?1";
+/// The wanted envelopes, oldest first: an envelope's source key is the constant `wanted` (the D2-OWED fold), so the
+/// source-key index finds them, and one wanted mark stays five physical D1 writes (ruling 1, bsv-low record 1277).
+pub const WANTED_ENVELOPES_SQL: &str = "SELECT identity,generation FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey='wanted' AND source='wanted' AND gameId='' ORDER BY markedAtMs,generation LIMIT ?1";
 /// The drain's round-robin walk (the D2-OWED lens's MEDIUM-1): up to ?2 distinct identities holding a mark, ascending
 /// past the cursor ?1, one covering-index search each; the caller wraps to the start for the rest.
-pub const DRAIN_IDENTITIES_SQL: &str = "WITH RECURSIVE walk(identity,n) AS (SELECT (SELECT MIN(identity) FROM owed_dirty INDEXED BY idx_owed_dirty_identity WHERE identity>?1),1 UNION ALL SELECT (SELECT MIN(identity) FROM owed_dirty INDEXED BY idx_owed_dirty_identity WHERE identity>walk.identity),n+1 FROM walk WHERE walk.identity IS NOT NULL AND n<?2) SELECT identity FROM walk WHERE identity IS NOT NULL";
+pub const DRAIN_IDENTITIES_SQL: &str = "WITH RECURSIVE walk(identity,n) AS (SELECT (SELECT MIN(identity) FROM owed_dirty INDEXED BY idx_owed_dirty_identity_marked WHERE identity>?1),1 UNION ALL SELECT (SELECT MIN(identity) FROM owed_dirty INDEXED BY idx_owed_dirty_identity_marked WHERE identity>walk.identity),n+1 FROM walk WHERE walk.identity IS NOT NULL AND n<?2) SELECT identity FROM walk WHERE identity IS NOT NULL";
 /// One identity's oldest marks, a bounded few (the drain groups them by game): ?3 = 0 its source marks, ?3 = 1 its
 /// age repair's (read only when the source marks leave room; at most 128 age marks are ever pending fleet-wide).
 pub const DRAIN_MARKS_SQL: &str = "SELECT gameId,source,markedAtMs,generation FROM owed_dirty INDEXED BY idx_owed_dirty_identity_marked WHERE identity=?1 AND (source='age')=?3 ORDER BY markedAtMs,generation LIMIT ?2";

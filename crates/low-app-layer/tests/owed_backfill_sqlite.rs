@@ -567,14 +567,17 @@ async fn owed893_backfill_g_the_belt_candidate_reads_facts_claimable_under_a_nul
         ('i','b:0','hop-stranded','g','{"claimable":false}',0,NULL,2),
         ('i','c:0','hop-stranded','g','{"claimable":true}',0,0,3),
         ('i','d:0','hop-stranded','g','{}',0,NULL,4)"#);
-    let got: Vec<Option<i64>> = db
-        .conn
-        .borrow()
-        .prepare(low_app_layer::owed_belt::CANDIDATES_SQL)
-        .unwrap()
-        .query_map([10, 10], |r| r.get("claimable"))
-        .unwrap()
-        .map(Result::unwrap)
+    // the chosen row's read, by its key (the D2-OWED lens's HIGH-3 split the walk from it)
+    let got: Vec<Option<i64>> = ["a:0", "b:0", "c:0", "d:0"]
+        .iter()
+        .map(|outpoint| {
+            db.conn
+                .borrow()
+                .query_row(low_app_layer::owed_belt::CANDIDATES_SQL, ["i", outpoint], |r| {
+                    r.get("claimable")
+                })
+                .unwrap()
+        })
         .collect();
     assert_eq!(got, [Some(1), Some(0), Some(0), None]);
 }
@@ -634,7 +637,6 @@ fn owed893_backfill_i_the_gate_and_the_counters_are_the_overlays() {
         o::UNTIPPED_INDEX,
         o::BELT_TURN_INDEX,
         o::DIRTY_SOURCE_KEY_INDEX,
-        o::DIRTY_SOURCE_MARKED_INDEX,
         o::DIRTY_IDENTITY_MARKED_INDEX,
         o::UNJUDGED_INDEX,
         o::ROWS_GAME_INDEX,
@@ -644,7 +646,7 @@ fn owed893_backfill_i_the_gate_and_the_counters_are_the_overlays() {
     }
     assert_eq!(
         list[n - 1],
-        o::ROWS_COUNT_DELETE,
+        o::DIRTY_IDENTITY_DROP,
         "the figure is the block's end (the D2-OWED fold's last migration)"
     );
     assert_eq!(

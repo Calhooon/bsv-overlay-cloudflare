@@ -52,16 +52,14 @@ pub const SWEEP_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_sweep ON
 /// The D2-OWED lens's HIGH-1 and MEDIUM-2: a row judged with no chain tip (TIP-877's tipless judgement) is re-marked
 /// on the next tip; an old worker's keyless row is in it too.
 pub const UNTIPPED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_untipped ON owed_rows(probeTip,identity,gameId) WHERE probeTip IS NULL";
-/// The D2-OWED lens's HIGH-3: the belt's due rows read in due order with their identity, covering, so the tick takes
-/// its eight round-robin by identity without a table read per due row.
-pub const BELT_TURN_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_belt_turn ON owed_rows(beltDueAtMs,identity,outpoint) WHERE beltDueAtMs IS NOT NULL";
+/// The D2-OWED lens's HIGH-3: the belt's dated rows by identity, then due time, covering, so the tick walks a bounded
+/// number of identities past its cursor and takes each one's oldest due rows (round-robin), never the whole due set.
+pub const BELT_TURN_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_rows_belt_turn ON owed_rows(identity,beltDueAtMs,outpoint) WHERE beltDueAtMs IS NOT NULL";
 /// The D2-OWED lens's MEDIUM-1: a hook's change note names source keys (a txid, `gate`, `untipped`); its subjects are an
-/// index search, never a scan of the fleet's marks.
+/// index search, never a scan of the fleet's marks. The wanted envelopes and the age marks carry the constant keys
+/// `wanted` and `age`, so it serves them too (one index fewer for every mark to write).
 pub const DIRTY_SOURCE_KEY_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_owed_dirty_source_key ON owed_dirty(sourceKey)";
-/// The wanted envelopes and the age repair's pending count, by source then age.
-pub const DIRTY_SOURCE_MARKED_INDEX: &str =
-    "CREATE INDEX IF NOT EXISTS idx_owed_dirty_source_marked ON owed_dirty(source,markedAtMs)";
 /// The drain's round-robin: an identity's marks oldest first, read a bounded few at a time.
 pub const DIRTY_IDENTITY_MARKED_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_dirty_identity_marked ON owed_dirty(identity,markedAtMs)";
 /// The D2-OWED lens's MEDIUM-5: an old worker's keyless row (`judgedAtMs` NULL: the deploy window, or a rollback to
@@ -76,6 +74,12 @@ pub const ROWS_GAME_INDEX: &str =
 pub const ROWS_COUNT_INSERT: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_count_insert AFTER INSERT ON owed_rows BEGIN UPDATE owed_state SET rows=rows+1 WHERE identity=NEW.identity; END";
 /// The count's other half: a judge's per-game delete, the stored ceiling, an old worker's whole-identity delete.
 pub const ROWS_COUNT_DELETE: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_count_delete AFTER DELETE ON owed_rows BEGIN UPDATE owed_state SET rows=MAX(rows-1,0) WHERE identity=OLD.identity; END";
+/// The D2-OWED fold's write cost: every mark writes each of `owed_dirty`'s indexes (one wanted mark is five physical
+/// writes, ruling 1), and since MEDIUM-1 the drain reads neither of these two (its age order is
+/// `idx_owed_dirty_identity_marked`, an identity's prefix the UNIQUE key's index).
+pub const DIRTY_MARKED_DROP: &str = "DROP INDEX IF EXISTS idx_owed_dirty_marked";
+/// See [`DIRTY_MARKED_DROP`].
+pub const DIRTY_IDENTITY_DROP: &str = "DROP INDEX IF EXISTS idx_owed_dirty_identity";
 /// Old workers delete an identity's rows whole; their word joins must disappear in that statement too.
 pub const ROW_DELETE: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_delete_words AFTER DELETE ON owed_rows BEGIN DELETE FROM owed_row_words WHERE identity=OLD.identity AND outpoint=OLD.outpoint; END";
 
