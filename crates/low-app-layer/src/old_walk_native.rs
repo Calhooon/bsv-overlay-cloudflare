@@ -1110,4 +1110,157 @@ mod pins {
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(j, w, "the old worker's press is judged away");
     }
+    /// The seat of the captured pair 13 that pays its committed home (`pubA` 023186e1..., `payPkhA` 3e7bb94f...) and
+    /// its hop. In hand 3's shape (D2-OWED-HOME-MARKER) it has NO party row, live or evicted, only its VERIFIED hop
+    /// marker; its hop is swept around the overlay to the committed home, the sweep's bytes a courier's.
+    const HOME_MARKER_SEAT: &str = FOLD8_TWIN_ONLY;
+    const HOME_MARKER_KEY: &str =
+        "023186e1d618b96dca2583a21aa8c5e2227ba49f3f671f59e3f2be1c346ed41763";
+    const HOME_MARKER_PKH: &str = "3e7bb94f261568ca8d457d8b4f935b0a3f8ccf89";
+    const HOME_MARKER_HOP: &str =
+        "9b238eed0177c714b1f9a608243e8f1bf79e35e9597110f83cefa1b658785c62";
+    const HOME_MARKER_GAME: &str =
+        "9d88aaaa348acae127efd08e133822201ecae56513831c37124837f3ef9ae17f";
+
+    /// Hand 3's rows over the captured pair 13: the seat's party rows gone, its verified marker, the courier sweep.
+    fn home_marker_seed() -> (Vec<String>, String) {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{Transaction, TransactionInput, TransactionOutput};
+        let mut seed = l23::l23_r2_route_rows(NOW_MS / 1000);
+        let pkh: [u8; 20] = hex::decode(HOME_MARKER_PKH).unwrap().try_into().unwrap();
+        let mut sweep = Transaction::new();
+        sweep.inputs.push(TransactionInput::new(HOME_MARKER_HOP.to_string(), 0));
+        sweep.outputs.push(TransactionOutput {
+            satoshis: Some(20_000),
+            locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(&pkh))
+                .unwrap(),
+            change: false,
+        });
+        let sweep_txid = sweep.id();
+        let bytes = crate::owed::StoredSpenderBytes::from_parts(
+            &[(HOME_MARKER_HOP.to_string(), 0)],
+            &crate::routes::spender_outputs_of(&sweep),
+        )
+        .to_json_capped()
+        .unwrap();
+        let now_s = NOW_MS / 1000;
+        seed.push(format!(
+            "DELETE FROM potparty_records_evicted WHERE identity='{HOME_MARKER_SEAT}'"
+        ));
+        seed.push(format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,markerValid,txid,outputIndex,createdAt) VALUES ('{HOME_MARKER_SEAT}','{FOLD8_P28}','{HOME_MARKER_GAME}',0,20190,'{HOME_MARKER_KEY}','00','00',2,1,'{HOME_MARKER_HOP}',1,{})", now_s - 2 * 3600));
+        seed.push(format!("INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES ('{HOME_MARKER_HOP}.0',{NOW_MS},1,'{sweep_txid}',1,{FOLD8_TIP})"));
+        seed.push(format!(
+            "INSERT INTO owed_spender_bytes(txid,bytesJson,createdAtMs) VALUES ('{sweep_txid}','{}',{NOW_MS})",
+            bytes.replace('\'', "''")
+        ));
+        (seed, sweep_txid)
+    }
+
+    fn home_marker_row(judge: &SqliteSql) -> (String, serde_json::Value, Option<String>) {
+        judge
+            .conn
+            .query_row(
+                "SELECT family,facts,reason FROM owed_rows WHERE identity=?1 AND outpoint=?2",
+                [HOME_MARKER_SEAT, &format!("{HOME_MARKER_HOP}:0")],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        serde_json::from_str(&r.get::<_, String>(1)?).unwrap(),
+                        r.get(2)?,
+                    ))
+                },
+            )
+            .unwrap_or_else(|e| panic!("no row for the seat's hop: {e}"))
+    }
+
+    /// D2-OWED-HOME-MARKER (c): beta's courier-retire hand 3 (game 39cf..., JOIN e494f0b5..., 2026-10-26): a released
+    /// hop with a VERIFIED hop marker and NO party row, swept around the overlay to the seat's committed home. The
+    /// eviction's evidence is written from the marker's K (the shared statements, here by the `owed-v2` backfill's
+    /// evidence phase over the captured JOIN's real covenant bytes), so the judge binds the home from the twin's params
+    /// and serves the design's row, `payout` `courier-bytes`, never "cannot tell which committed home is yours".
+    #[tokio::test]
+    async fn home_marker_c_a_marker_only_seat_swept_home_is_a_courier_bytes_payout() {
+        let (seed, sweep) = home_marker_seed();
+        let f = Fixture {
+            name: "home marker",
+            seed,
+            identities: vec![HOME_MARKER_SEAT.into()],
+        };
+        let (judge, _walk) = seeded(&f);
+        judge.tip.set(Some(FOLD8_TIP));
+        judge.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        backfill_to_the_stamp(&judge).await;
+        let (family, facts, reason) = home_marker_row(&judge);
+        assert_eq!(
+            (family.as_str(), facts["creditKind"].as_str()),
+            ("payout", Some("courier-bytes")),
+            "{reason:?} {facts}"
+        );
+        assert_ne!(reason.as_deref(), Some(crate::owed::HOME_UNKNOWN_REASON));
+        assert!(facts.to_string().contains(&sweep), "{facts}");
+        let evidence: (String, String, String) = judge
+            .conn
+            .query_row(
+                "SELECT identity,gameId,seatSettlePubkey FROM released_hop_evidence WHERE hopTxid=?1 AND hopVout=0",
+                [HOME_MARKER_HOP],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("the marker's evidence row");
+        assert_eq!(
+            evidence,
+            (
+                HOME_MARKER_SEAT.into(),
+                HOME_MARKER_GAME.into(),
+                HOME_MARKER_KEY.into()
+            )
+        );
+    }
+
+    /// D2-OWED-HOME-MARKER (c2): an eviction the writer made BEFORE it took the marker (beta's hand 3 itself, and
+    /// prod's), on a deployment whose `owed-v2` backfill and evidence phase are long done: the judge serves the
+    /// finding's row ("cannot tell which committed home is yours") until the drain's age repair walks the ledger
+    /// once, writes the marker seat's evidence through the shipped statements, and the next drain serves the payout.
+    /// Then the repair is done: one read a pass.
+    #[tokio::test]
+    async fn home_marker_c2_the_age_repair_writes_a_pre_fix_evictions_marker_seat() {
+        let (seed, _) = home_marker_seed();
+        let f = Fixture {
+            name: "home marker, pre-fix",
+            seed,
+            identities: vec![HOME_MARKER_SEAT.into()],
+        };
+        let (judge, _walk) = seeded(&f);
+        judge.tip.set(Some(FOLD8_TIP));
+        judge.conn.execute_batch(&format!(
+            "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('{HOME_MARKER_SEAT}','{HOME_MARKER_GAME}','hop','{HOME_MARKER_HOP}:0',{NOW_MS})"
+        )).unwrap_or(());
+        for _ in 0..10 {
+            if crate::owed_judge::drain_dirty(&judge, 64).await.unwrap().subjects == 0 {
+                break;
+            }
+        }
+        let (family, _, reason) = home_marker_row(&judge);
+        assert_eq!(
+            (family.as_str(), reason.as_deref()),
+            ("unbound", Some(crate::owed::HOME_UNKNOWN_REASON)),
+            "before the repair: the finding's row"
+        );
+        let repair = crate::owed_backfill::age_repair(&judge).await.unwrap();
+        assert_eq!(repair.marker_repaired, vec!["cfce07ce1295866bad55be28657f19d9c74648d58a012cd05ae07400d99c5233".to_string()]);
+        assert_eq!(repair.marker_cursor.as_deref(), Some(crate::owed_backfill::EVICTIONS_DONE));
+        for _ in 0..10 {
+            if crate::owed_judge::drain_dirty(&judge, 64).await.unwrap().subjects == 0 {
+                break;
+            }
+        }
+        let (family, facts, reason) = home_marker_row(&judge);
+        assert_eq!(
+            (family.as_str(), facts["creditKind"].as_str()),
+            ("payout", Some("courier-bytes")),
+            "{reason:?} {facts}"
+        );
+        let again = crate::owed_backfill::age_repair(&judge).await.unwrap();
+        assert!(again.marker_repaired.is_empty());
+    }
+
 }

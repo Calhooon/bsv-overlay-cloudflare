@@ -104,6 +104,14 @@ macro_rules! eviction_unwritten {
         "e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r JOIN released_hop_evidence h ON h.hopTxid=lower(json_extract(r.value,'$.txid')) AND h.hopVout=json_extract(r.value,'$.vout') WHERE h.potTxid=e.txid AND h.evictedAt=e.evictedAt)"
     };
 }
+/// D2-OWED-HOME-MARKER: an open eviction `e` releasing a hop whose VERIFIED hop marker names an identity the
+/// eviction wrote no evidence row for. The writer before this lane took check 1 from the twin party row alone, so a
+/// seat whose only attestation is its marker (beta's courier-retire hand 3: its filing never landed) got none.
+macro_rules! marker_unwritten {
+    () => {
+        "EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=lower(json_extract(r.value,'$.txid')) AND hp.hopVout=json_extract(r.value,'$.vout') WHERE IFNULL(json_extract(r.value,'$.table'),'pot_records')='pot_records' AND hp.markerValid=1 AND NOT EXISTS (SELECT 1 FROM released_hop_evidence h WHERE h.hopTxid=hp.txid AND h.hopVout=hp.hopVout AND h.identity=lower(hp.identity) AND h.potTxid=e.txid AND h.evictedAt=e.evictedAt))"
+    };
+}
 pub const EVICTIONS_SQL: &str = concat!(
     "SELECT e.txid,e.releasedSpends FROM pot_evictions e WHERE e.txid>?1 AND ",
     eviction_unwritten!(),
@@ -122,7 +130,13 @@ pub const EVIDENCE_INSERT_SQL: &str = "WITH seats AS (\
  SELECT lower(identity) AS identity,lower(gameId) AS gameId,lower(seatSettlePubkey) AS seatKey \
  FROM potparty_records_evicted INDEXED BY idx_evicted_party_pot \
  WHERE potTxid=?1 AND sigValid=1 AND seatSettlePubkey IS NOT NULL GROUP BY lower(identity) \
- HAVING MIN(lower(gameId))=MAX(lower(gameId)) AND MIN(lower(seatSettlePubkey))=MAX(lower(seatSettlePubkey))\
+ HAVING MIN(lower(gameId))=MAX(lower(gameId)) AND MIN(lower(seatSettlePubkey))=MAX(lower(seatSettlePubkey)) \
+ UNION ALL SELECT lower(hp.identity),lower(hp.gameId),lower(hp.seatSettlePubkey) \
+ FROM hopparty_records hp INDEXED BY idx_hopparty_hop \
+ WHERE hp.txid=?2 AND hp.hopVout=?3 AND hp.markerValid=1 \
+ AND NOT EXISTS (SELECT 1 FROM potparty_records_evicted x INDEXED BY idx_evicted_party_pot WHERE x.potTxid=?1 AND x.sigValid=1 AND x.seatSettlePubkey IS NOT NULL AND lower(x.identity)=lower(hp.identity)) \
+ GROUP BY lower(hp.identity) \
+ HAVING MIN(lower(hp.gameId))=MAX(lower(hp.gameId)) AND MIN(lower(hp.seatSettlePubkey))=MAX(lower(hp.seatSettlePubkey))\
 ), committed AS (\
  SELECT lower(pubA) AS a,lower(pubB) AS b,lower(payPkhA) AS pa,lower(payPkhB) AS pb \
  FROM pot_records_evicted INDEXED BY idx_evicted_pot_txid WHERE txid=?1 \
@@ -148,6 +162,12 @@ pub const MISSING_INSERT_SQL: &str = "WITH seats AS (\
  FROM seats s JOIN pot_evictions e ON e.txid=?1 JOIN json_each(?2) o \
  WHERE e.readmittedAt IS NULL \
  AND EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r WHERE IFNULL(json_extract(r.value,'$.table'),'pot_records')='pot_records' AND lower(json_extract(r.value,'$.txid'))=lower(json_extract(o.value,'$.txid')) AND json_extract(r.value,'$.vout')=json_extract(o.value,'$.vout')) \
+ UNION SELECT lower(hp.identity),lower(hp.gameId),lower(json_extract(o.value,'$.txid')),json_extract(o.value,'$.vout'),?1,e.evictedAt,?3 \
+ FROM json_each(?2) o JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=lower(json_extract(o.value,'$.txid')) AND hp.hopVout=json_extract(o.value,'$.vout') \
+ JOIN pot_evictions e ON e.txid=?1 \
+ WHERE e.readmittedAt IS NULL AND hp.markerValid=1 \
+ AND NOT EXISTS (SELECT 1 FROM potparty_records_evicted x INDEXED BY idx_evicted_party_pot WHERE x.potTxid=?1 AND x.sigValid=1 AND x.seatSettlePubkey IS NOT NULL AND lower(x.identity)=lower(hp.identity)) \
+ AND EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r WHERE IFNULL(json_extract(r.value,'$.table'),'pot_records')='pot_records' AND lower(json_extract(r.value,'$.txid'))=lower(json_extract(o.value,'$.txid')) AND json_extract(r.value,'$.vout')=json_extract(o.value,'$.vout')) \
  ON CONFLICT(identity,gameId,hopTxid,hopVout) DO UPDATE SET potTxid=excluded.potTxid,evictedAt=excluded.evictedAt,bytesRead=excluded.bytesRead";
 pub const EVICTIONS_CURSOR_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:evictions',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// The open identity's fault count, written by a faulted pass and cleared ('{}') by its identity's save.
@@ -164,9 +184,11 @@ pub const SKIPPED_EVICTION_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,
 /// The skipped evictions, oldest skip first (at most [`OWED_SKIPPED_EVICTIONS_NAMED`]), each with its ledger row and
 /// whether it still needs its evidence (the phase's own predicate): a range of the state's key, one key search each.
 pub const SKIPPED_EVICTIONS_SQL: &str = concat!(
-    "SELECT substr(s.name,35) AS txid,s.cursor AS skip,s.tickedAtMs AS skippedAt,e.releasedSpends AS releasedSpends,CASE WHEN e.txid IS NOT NULL AND ",
+    "SELECT substr(s.name,35) AS txid,s.cursor AS skip,s.tickedAtMs AS skippedAt,e.releasedSpends AS releasedSpends,CASE WHEN e.txid IS NOT NULL AND (",
     eviction_unwritten!(),
-    " THEN 1 ELSE 0 END AS open FROM owed_belt_state s LEFT JOIN pot_evictions e ON e.txid=substr(s.name,35) WHERE s.name>'backfill:owed-v2:skipped-eviction:' AND s.name<'backfill:owed-v2:skipped-eviction;' ORDER BY s.tickedAtMs,s.name LIMIT ?1"
+    " OR (e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL AND ",
+    marker_unwritten!(),
+    ")) THEN 1 ELSE 0 END AS open FROM owed_belt_state s LEFT JOIN pot_evictions e ON e.txid=substr(s.name,35) WHERE s.name>'backfill:owed-v2:skipped-eviction:' AND s.name<'backfill:owed-v2:skipped-eviction;' ORDER BY s.tickedAtMs,s.name LIMIT ?1"
 );
 /// A faulted retry's count, the skip's time kept (so the next age repair retries it again).
 pub const SKIPPED_EVICTION_FAULT_SQL: &str =
@@ -174,6 +196,21 @@ pub const SKIPPED_EVICTION_FAULT_SQL: &str =
 /// The skip ends: written in the retry's own write batch, or alone when the eviction no longer needs its evidence.
 pub const SKIPPED_EVICTION_END_SQL: &str =
     "DELETE FROM owed_belt_state WHERE name='backfill:owed-v2:skipped-eviction:'||?1";
+/// The `owed_belt_state` row of the marker repair's cursor: the last eviction txid it looked at, [`EVICTIONS_DONE`]
+/// once a window came back short.
+pub const OWED_MARKER_REPAIR: &str = "backfill:owed-v2:marker-evictions";
+/// The evictions one age repair looks at (by the ledger's primary key, from the cursor), each a candidate only when
+/// [`marker_unwritten`] holds; a candidate is written by the phase's own [`evidence_one`].
+pub const OWED_MARKER_REPAIR_WINDOW: usize = 16;
+pub const MARKER_REPAIR_CURSOR_SQL: &str =
+    "SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:marker-evictions'";
+/// The window: every ledger txid past the cursor (at most `?2`), each with its row when it is a candidate.
+pub const MARKER_REPAIR_SQL: &str = concat!(
+    "SELECT w.txid AS seen,e.txid AS txid,e.releasedSpends AS releasedSpends FROM (SELECT txid FROM pot_evictions WHERE txid>?1 ORDER BY txid LIMIT ?2) w LEFT JOIN pot_evictions e ON e.txid=w.txid AND e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL AND ",
+    marker_unwritten!(),
+    " ORDER BY w.txid"
+);
+pub const MARKER_REPAIR_SAVE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:marker-evictions',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// Arm the cursor; a pass that finds it armed begins.
 pub const ARM_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2','',?1) ON CONFLICT(name) DO NOTHING";
 /// The identities past the cursor, distinct and ascending, each side bounded on its own identity index.
@@ -879,6 +916,10 @@ pub struct AgeRepair {
     /// The evictions still skipped after this pass, named on the repair's line (oldest skip first, at most
     /// [`OWED_SKIPPED_EVICTIONS_NAMED`] read).
     pub still_skipped: Vec<String>,
+    /// D2-OWED-HOME-MARKER: the evictions whose marker-bound seats the marker repair wrote this pass.
+    pub marker_repaired: Vec<String>,
+    /// The marker repair's cursor after this pass ([`EVICTIONS_DONE`] once it has looked at every eviction).
+    pub marker_cursor: Option<String>,
 }
 
 /// The drain's daily re-mark of rows judged more than 24 h ago. Returns the marks written.
@@ -901,6 +942,17 @@ pub async fn age_repair(db: &impl SqlPort) -> Result<AgeRepair, String> {
     if let Err(error) = retry_skipped_evictions(db, &mut repair).await {
         db.log(&format!(
             "[owed-backfill] the skipped evictions' retry deferred: {error}"
+        ));
+    }
+    if let Err(error) = repair_marker_evictions(db, &mut repair).await {
+        db.log(&format!(
+            "[owed-backfill] the marker repair deferred: {error}"
+        ));
+    }
+    if !repair.marker_repaired.is_empty() {
+        db.log(&format!(
+            "[owed-backfill] marker repair: evidence written for {:?}, cursor {:?}",
+            repair.marker_repaired, repair.marker_cursor
         ));
     }
     if !repair.still_skipped.is_empty() || repair.retried > 0 || !repair.resolved.is_empty() {
@@ -1006,6 +1058,82 @@ async fn retry_skipped_evictions(db: &impl SqlPort, repair: &mut AgeRepair) -> R
     Ok(())
 }
 
+/// D2-OWED-HOME-MARKER: the evictions the writer made before it took a seat's VERIFIED hop marker as check 1's
+/// attestation (a seat whose party filing never landed got no evidence row, so its swept hop was served "cannot tell
+/// which committed home is yours"). The judge cannot reach such an eviction from the hop at read time (the ledger's
+/// `releasedSpends` is unindexed JSON, and the hop's seat links go with the evicted pot), so the drain's age repair
+/// walks the ledger once by its primary key, [`OWED_MARKER_REPAIR_WINDOW`] evictions a pass from its cursor, and writes
+/// each eviction [`marker_unwritten`] names through the phase's own [`evidence_one`] (the writer's statements, which
+/// now take the marker). A candidate that faults is recorded as a skipped eviction (the retry's `open` reads the same
+/// predicate) and passed; the cursor is saved after the window, `~` once a window comes back short. Done, a pass costs
+/// one primary-key read.
+async fn repair_marker_evictions(db: &impl SqlPort, repair: &mut AgeRepair) -> Result<(), String> {
+    let cursor = read(db, MARKER_REPAIR_CURSOR_SQL, vec![])
+        .await?
+        .first()
+        .and_then(|r| r["cursor"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    if cursor == EVICTIONS_DONE {
+        repair.marker_cursor = Some(cursor);
+        return Ok(());
+    }
+    let window = read(
+        db,
+        MARKER_REPAIR_SQL,
+        vec![
+            Bind::Text(cursor.clone()),
+            Bind::Int(OWED_MARKER_REPAIR_WINDOW as i64),
+        ],
+    )
+    .await?;
+    let mut found = BackfillReport::default();
+    let mut last = cursor;
+    for row in &window {
+        if let Some(seen) = row["seen"].as_str() {
+            last = seen.to_owned();
+        }
+        let Some(txid) = row["txid"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        let (released, _) = released_of(row["releasedSpends"].as_str());
+        match evidence_one(db, None, &txid, &released, vec![], &mut found).await {
+            Ok(_) => {
+                found.evictions += 1;
+                repair.marker_repaired.push(txid);
+            }
+            Err(error) => {
+                db.log(&format!(
+                    "[owed-backfill] eviction {txid}: the marker repair faulted ({error}); recorded as skipped, the age repair retries it once the skip is a day old"
+                ));
+                db.run_batch(vec![Stmt {
+                    sql: SKIPPED_EVICTION_SQL.into(),
+                    binds: vec![
+                        Bind::Text(txid.clone()),
+                        Bind::Text(skip_value(&error, 0)),
+                        Bind::Int(db.now_ms() as i64),
+                    ],
+                }])
+                .await?;
+                db.counters(vec![(COUNTER_SKIPPED_EVICTIONS.into(), 1)])
+                    .await;
+            }
+        }
+    }
+    let next = if window.len() < OWED_MARKER_REPAIR_WINDOW {
+        EVICTIONS_DONE.to_owned()
+    } else {
+        last
+    };
+    db.run_batch(vec![Stmt {
+        sql: MARKER_REPAIR_SAVE_SQL.into(),
+        binds: vec![Bind::Text(next.clone()), Bind::Int(db.now_ms() as i64)],
+    }])
+    .await?;
+    repair.marker_cursor = Some(next);
+    flush_evidence_counters(db, &found).await;
+    Ok(())
+}
+
 /// The aged and keyless rows' marks (risk 8.2's third repair, the D2-OWED lens's MEDIUM-5).
 async fn age_marks(db: &impl SqlPort) -> Result<u64, String> {
     let now = db.now_ms() as i64;
@@ -1074,6 +1202,8 @@ pub async fn lever(req: worker::Request, env: &worker::Env) -> worker::Result<wo
                 "recoveredEvictions": r.recovered,
                 "reskippedEvictions": r.reskipped,
                 "resolvedEvictions": r.resolved,
+                "markerRepaired": r.marker_repaired,
+                "markerCursor": r.marker_cursor,
             })),
             Err(e) => worker::Response::error(format!("owed age repair faulted: {e}"), 503),
         };
