@@ -44,6 +44,7 @@ const OP_TOKEN = process.env.D1_BUDGET_OP_TOKEN ?? 'ci-submit-tok'
 const INTERNAL_TOKEN = process.env.D1_BUDGET_INTERNAL_TOKEN ?? 'ci-internal-tok'
 const MEASURE = process.env.D1_BUDGET_MEASURE === '1'
 const CEILINGS = JSON.parse(readFileSync(new URL('./ceilings.json', import.meta.url), 'utf8'))
+const MIGRATION_COUNT = Number(readFileSync(new URL('../../crates/overlay-cloudflare/src/d1/mod.rs', import.meta.url), 'utf8').match(/pub const OVERLAY_MIGRATION_COUNT: usize = (\d+)/)[1])
 
 const ID_A = '02' + 'a1'.repeat(32)
 const ID_B = '02' + 'b2'.repeat(32)
@@ -270,7 +271,7 @@ const measured = {}
   // the app layer's D1 here is the seed's, which the overlay never certified: write its certification row (the backfill
   // gate reads it), as the backfill tier does
   execFileSync('npx', ['wrangler', 'd1', 'execute', 'low-overlay-db', '--local', '--persist-to', process.env.D1_BUDGET_STATE, '--command',
-    "INSERT INTO ops_counters(name,value) VALUES ('overlay_migration_count',409) ON CONFLICT(name) DO UPDATE SET value=excluded.value"],
+    `INSERT INTO ops_counters(name,value) VALUES ('overlay_migration_count',${MIGRATION_COUNT}) ON CONFLICT(name) DO UPDATE SET value=excluded.value`],
   { cwd: crate, timeout: 30_000, stdio: 'pipe' })
   await portGuard('owed-backfill evidence')
   const armed = await backfillLever()

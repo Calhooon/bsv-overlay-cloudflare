@@ -19,11 +19,11 @@ fn production_schema_db() -> Connection {
 fn owed893_tip_marks_only_due_gates_and_advances_the_generation() {
     let db = production_schema_db();
     db.execute_batch("INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs,gateHeight) VALUES ('due','p:0','unbound','g','{}',0,7),('equal','p:0','unbound','g','{}',0,8),('future','p:0','unbound','g','{}',0,9),('absent','p:0','unbound','g','{}',0,NULL)").unwrap();
-    assert_eq!(db.execute(MARK_TIP_SQL, params![8, 1]).unwrap(), 2);
+    assert_eq!(db.execute(MARK_TIP_SQL, params![8]).unwrap(), 2);
     let first: i64 = db
         .query_row("SELECT MAX(generation) FROM owed_dirty", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(db.execute(MARK_TIP_SQL, params![8, 2]).unwrap(), 2);
+    assert_eq!(db.execute(MARK_TIP_SQL, params![8]).unwrap(), 2);
     let last: i64 = db
         .query_row("SELECT MIN(generation) FROM owed_dirty", [], |r| r.get(0))
         .unwrap();

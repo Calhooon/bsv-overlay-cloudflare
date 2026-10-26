@@ -19,6 +19,11 @@ const DISCOVERY: &str = include_str!("../../overlay-cloudflare/src/d1_discovery.
 type Mark = (String, String, String, String);
 type Program = (String, String, i32, i32, i32);
 
+fn database_now_ms(db: &Connection) -> i64 {
+    db.query_row("SELECT strftime('%s','now') * 1000", [], |row| row.get(0)).unwrap()
+}
+
+
 fn value(v: &QVal) -> Value {
     match v {
         QVal::Null => Value::Null,
@@ -1542,6 +1547,7 @@ fn owed893_a_faulted_remark_rolls_back_the_source_and_generation() {
         "the failed source write must leave the old mark intact"
     );
     f.db.execute_batch("DROP TRIGGER fail_remark").unwrap();
+    let written_at = database_now_ms(&f.db);
     f.db.execute(
         "UPDATE potparty_records SET createdAt=2 WHERE txid='party-a'",
         [],
@@ -1553,7 +1559,7 @@ fn owed893_a_faulted_remark_rolls_back_the_source_and_generation() {
         })
         .unwrap();
     assert!(after.0 > before.0);
-    assert_eq!(after.1, 2_000);
+    assert!((written_at..=database_now_ms(&f.db)).contains(&after.1), "a successful re-mark uses its write time, not createdAt=2");
 }
 
 #[test]
@@ -1564,6 +1570,7 @@ fn owed893_a_word_upsert_advances_a_coalesced_generation() {
     f.clear();
     let mut seen = 0;
     for (word, at) in [("seen", 1), ("mined", 2), ("stale", 3)] {
+        let written_at = database_now_ms(&f.db);
         f.execute(
             low_app_layer::tracker_host::stored::UPSERT,
             vec![
@@ -1591,7 +1598,7 @@ fn owed893_a_word_upsert_advances_a_coalesced_generation() {
             generation > seen,
             "re-mark generation {generation} must be newer than {seen}"
         );
-        assert_eq!(marked_at, at, "keep the newest mark's time");
+        assert!((written_at..=database_now_ms(&f.db)).contains(&marked_at), "the word mark uses its write time, not updated_at={at}");
         seen = generation;
     }
 }

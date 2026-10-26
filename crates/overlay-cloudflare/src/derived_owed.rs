@@ -93,6 +93,8 @@ pub const ROWS_COUNT_DELETE: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_coun
 /// writes, ruling 1), and since MEDIUM-1 the drain reads neither of these two (its age order is
 /// `idx_owed_dirty_identity_marked`, an identity's prefix the UNIQUE key's index).
 pub const DIRTY_MARKED_DROP: &str = "DROP INDEX IF EXISTS idx_owed_dirty_marked";
+/// The backlog snapshot uses a new name: a rolling old worker can still execute DIRTY_MARKED_DROP.
+pub const DIRTY_BACKLOG_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_dirty_backlog ON owed_dirty(markedAtMs)";
 /// See [`DIRTY_MARKED_DROP`].
 pub const DIRTY_IDENTITY_DROP: &str = "DROP INDEX IF EXISTS idx_owed_dirty_identity";
 /// Old workers delete an identity's rows whole; their word joins must disappear in that statement too.
