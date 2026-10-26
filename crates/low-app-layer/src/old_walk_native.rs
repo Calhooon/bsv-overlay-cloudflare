@@ -703,6 +703,68 @@ mod pins {
         assert_eq!(w, j, "the walk and the write path's judgement store the same rows");
     }
 
+    /// The second delta lens's D2-N2: the write-path comparison above covers one row and it is not a press. Here a
+    /// PRESS: the seat's own index-UNSPENT stranded hop (its `pot_records` row unspent, its marker verified) and the
+    /// seat's pre-signed sweep of it filed through `record_post` (`verify_record_post`, `file_verified`), judged by the
+    /// WRITE path with no drain after it: the judge stores the `hop-stranded` row `claim: "sweep-hop"`, `claimable:
+    /// true`, and the old walk over the same D1 data stores the same row, byte for byte, the word facts stripped.
+    #[tokio::test]
+    async fn d2delta2_n2_a_press_filed_through_record_post_judged_by_the_write_path_stores_the_walks_row() {
+        use crate::hopsweep::tests as hs;
+        use crate::record_post::{self, tests as rp, DoorOutcome, RecordKind};
+        let judge = SqliteSql::migrated();
+        judge.now.set(NOW_MS);
+        judge.tip.set(Some(TIP));
+        let w = hs::wallet(0x47);
+        let identity = hs::identity(&w);
+        let id = hex::encode(&identity);
+        let seat = hs::skey(16);
+        let made = (NOW_MS as i64 - 2 * 3_600_000) / 1000;
+        judge
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{}',0,0,{made},'p2pkh')",
+                hex::encode(hs::HOP)
+            ))
+            .unwrap();
+        rp::md_index_the_hop(&judge, &hs::hop_ctx(&w, &seat, true), Some(1));
+        judge.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        let raw = hs::sweep_raw(&seat, &seat, 0, hs::HOP_SATS, &hs::DEST);
+        let script = rp::md_sweep_script(&identity, &hs::GID, &raw);
+        let mut filing = record_post::verify_record_post(RecordKind::Hopsweep, &script, &id).unwrap();
+        let out = record_post::file_verified(&judge, &mut filing, &id, (NOW_MS / 1000) as i64)
+            .await
+            .unwrap();
+        assert!(matches!(out, DoorOutcome::Written { row_written: true }), "{out:?}");
+        assert_eq!(judge.counter(crate::owed_judge::COUNTER_FILING_FAULTS), 0, "judged by the write path");
+        let pending: i64 = judge
+            .conn
+            .query_row("SELECT COUNT(*) FROM owed_dirty WHERE identity=?1", [&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending, 0, "the write path acknowledged the filer's marks: nothing left for a drain");
+        let j = stored(&judge.conn, &id);
+        let press = j
+            .values()
+            .map(|row| serde_json::from_str::<serde_json::Value>(row).unwrap())
+            .find(|row| row[0] == "hop-stranded")
+            .unwrap_or_else(|| panic!("no hop-stranded row: {j:#?}"));
+        assert_eq!(press[6]["claim"], "sweep-hop", "{press}");
+        assert_eq!(press[6]["claimable"], true, "the write path judged a press: {press}");
+        assert_eq!(press[6]["status"], "unspent", "{press}");
+        let path = std::env::temp_dir().join(format!("d2delta2-n2-press-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        judge.conn.execute("VACUUM INTO ?1", [path.to_str().unwrap()]).unwrap();
+        let walk = rusqlite::Connection::open(&path).unwrap();
+        walk.execute_batch(&format!("DELETE FROM owed_row_words WHERE identity='{id}'; DELETE FROM owed_rows WHERE identity='{id}'; DELETE FROM owed_state WHERE identity='{id}';")).unwrap();
+        let walk_db = std::rc::Rc::new(WalkDb { conn: RefCell::new(walk) });
+        let walked = run_old_walk(walk_db.clone(), &id, Some(TIP), None, NOW_MS).await.unwrap();
+        assert!(!walked.truncated && !walked.budget_cut);
+        let w = stored(&walk_db.conn.borrow(), &id);
+        let _ = std::fs::remove_file(&path);
+        eprintln!("press: walk {w:#?}\njudge {j:#?}");
+        assert_eq!(w, j, "the walk and the write path's judgement store the same press");
+    }
+
     #[tokio::test]
     async fn d2fold_medium3_smoke_the_old_walk_runs_natively() {
         let made = (NOW_MS as i64 - 2 * 3_600_000) / 1000;
