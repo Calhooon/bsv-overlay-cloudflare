@@ -809,3 +809,36 @@ async fn fold9_l1_an_eviction_faulting_every_pass_is_skipped_and_counted_after_t
         "the fault count is cleared once the eviction is passed"
     );
 }
+
+/// D2-OWED-FOLD-9, the fifth delta lens's NOTE-B: an evidence row of a READMITTED eviction no longer hides the seat's
+/// missing-evidence row of a later open eviction releasing the same hop. The judge's evidence read (`RELEASED_SQL`)
+/// honours an evidence row only under its open ledger and its own `evictedAt`; the missing read's exclusion now reads
+/// the same, so the seat is served the could-not-judge row and never nothing. RED on 708b08c8 (the re-export of
+/// `MISSING_SQL` grafted): no row.
+#[test]
+fn fold9_b_a_readmitted_evictions_evidence_hides_no_missing_row() {
+    let db = Db::new();
+    let (a, b, hop) = (
+        format!("a1{}", "0".repeat(62)),
+        format!("b2{}", "0".repeat(62)),
+        format!("cc{}", "0".repeat(62)),
+    );
+    db.exec(&format!("INSERT INTO pot_evictions(txid,reason,evictedAt,readmittedAt,releasedSpends) VALUES ('{a}','R',5,6,'[]')"));
+    db.exec(&format!("INSERT INTO pot_evictions(txid,reason,evictedAt,releasedSpends) VALUES ('{b}','R',7,'[]')"));
+    db.exec(&format!("INSERT INTO released_hop_evidence(hopTxid,hopVout,identity,gameId,potTxid,seatSettlePubkey,hopSats,evictedAt) VALUES ('{hop}',0,'s','g','{a}','02aa',1000,5)"));
+    db.exec(&format!("INSERT INTO released_hop_evidence_missing(identity,gameId,hopTxid,hopVout,potTxid,evictedAt,bytesRead) VALUES ('s','g','{hop}',0,'{b}',7,0)"));
+    let served = |db: &Db| {
+        db.conn
+            .borrow()
+            .prepare(judge::MISSING_SQL)
+            .unwrap()
+            .query_map(rusqlite::params!["s", "[\"g\"]"], |r| r.get::<_, String>("potTxid"))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(served(&db), vec![b.clone()], "the readmitted eviction's evidence is not the seat's");
+    // the control: evidence of the OPEN eviction itself still excludes its missing row
+    db.exec(&format!("UPDATE released_hop_evidence SET potTxid='{b}',evictedAt=7"));
+    assert!(served(&db).is_empty(), "the seat's own evidence names the outpoint");
+}
