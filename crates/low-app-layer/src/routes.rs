@@ -6130,14 +6130,7 @@ pub(crate) async fn tx_any_external_leg(
     crate::txany::AbsenceCorroboration,
     Option<u64>,
 ) {
-    // Owed already missed the index for this spender and read admitted pots
-    // and refused JOINs. Its external spender is foreign; avoid re-reading
-    // local scope (and probing Arcade) for the same judgement.
-    let (ours, anchor) = if caller == "owed" {
-        (false, None)
-    } else {
-        tx_any_scope(env, txid_lc).await
-    };
+    let (ours, anchor) = tx_any_scope(env, txid_lc).await;
     tx_any_presence_leg_via(
         txid_lc,
         worker::Date::now().as_millis() as i64,
@@ -7639,24 +7632,6 @@ mod e606_tests {
             .query_row(TX_ANY_HELD_ANCHOR_SQL, [], |r| r.get(0))
             .unwrap();
         assert_eq!(anchor, "held");
-    }
-
-    #[test]
-    fn ns2pd2_l1_owed_external_spender_skips_scope_statement() {
-        let src = include_str!("routes.rs");
-        let external = &src[src.find("async fn tx_any_external_leg(").unwrap()
-            ..src.find("async fn tx_any_presence_leg_via<").unwrap()];
-        let skipped = &external
-            [external.find("if caller == \"owed\" {").unwrap()..external.find("} else {").unwrap()];
-        assert!(skipped.contains("(false, None)"));
-        assert!(!skipped.contains("tx_any_scope("));
-        assert!(external.contains("tx_any_scope(env, txid_lc).await"));
-        let ceilings: serde_json::Value =
-            serde_json::from_str(include_str!("../../../tools/lane-499/ceilings.json")).unwrap();
-        assert_eq!(
-            ceilings["scenarios"]["owed-first-read"]["ceiling"]["stmts"],
-            41 // #693 fold-2: 39 measured (#638's 30, plus A's durable swept hop, 9); the owed scope skip remains above.
-        );
     }
 
     #[test]
