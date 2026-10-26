@@ -1129,7 +1129,9 @@ mod pins {
         let mut seed = l23::l23_r2_route_rows(NOW_MS / 1000);
         let pkh: [u8; 20] = hex::decode(HOME_MARKER_PKH).unwrap().try_into().unwrap();
         let mut sweep = Transaction::new();
-        sweep.inputs.push(TransactionInput::new(HOME_MARKER_HOP.to_string(), 0));
+        sweep
+            .inputs
+            .push(TransactionInput::new(HOME_MARKER_HOP.to_string(), 0));
         sweep.outputs.push(TransactionOutput {
             satoshis: Some(20_000),
             locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(&pkh))
@@ -1235,7 +1237,12 @@ mod pins {
             "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('{HOME_MARKER_SEAT}','{HOME_MARKER_GAME}','hop','{HOME_MARKER_HOP}:0',{NOW_MS})"
         )).unwrap_or(());
         for _ in 0..10 {
-            if crate::owed_judge::drain_dirty(&judge, 64).await.unwrap().subjects == 0 {
+            if crate::owed_judge::drain_dirty(&judge, 64)
+                .await
+                .unwrap()
+                .subjects
+                == 0
+            {
                 break;
             }
         }
@@ -1246,10 +1253,21 @@ mod pins {
             "before the repair: the finding's row"
         );
         let repair = crate::owed_backfill::age_repair(&judge).await.unwrap();
-        assert_eq!(repair.marker_repaired, vec!["cfce07ce1295866bad55be28657f19d9c74648d58a012cd05ae07400d99c5233".to_string()]);
-        assert_eq!(repair.marker_cursor.as_deref(), Some(crate::owed_backfill::EVICTIONS_DONE));
+        assert_eq!(
+            repair.marker_repaired,
+            vec!["cfce07ce1295866bad55be28657f19d9c74648d58a012cd05ae07400d99c5233".to_string()]
+        );
+        assert_eq!(
+            repair.marker_cursor.as_deref(),
+            Some(crate::owed_backfill::EVICTIONS_DONE)
+        );
         for _ in 0..10 {
-            if crate::owed_judge::drain_dirty(&judge, 64).await.unwrap().subjects == 0 {
+            if crate::owed_judge::drain_dirty(&judge, 64)
+                .await
+                .unwrap()
+                .subjects
+                == 0
+            {
                 break;
             }
         }
@@ -1262,5 +1280,4 @@ mod pins {
         let again = crate::owed_backfill::age_repair(&judge).await.unwrap();
         assert!(again.marker_repaired.is_empty());
     }
-
 }
