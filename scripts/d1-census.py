@@ -109,7 +109,10 @@ def self_test():
     assert "| `/utxo-status` | 9 | 8 | 0 | 1 |  |  |" in out, out
     assert "(unscoped)" in out
     real = ceilings_by_route(CEILINGS)
-    assert real.get("/owed", ("",))[0] == "owed-first-read", real
+    # one scenario a route (D2-OWED-FOLD-8): the read's own ceiling since the READ lane (bsv-low #893)
+    assert real.get("/owed", ("",))[0] == "owed-fleet-read", real
+    keys = [s.get("censusKey") for s in json.load(open(CEILINGS, encoding="utf-8"))["scenarios"].values() if s.get("censusKey")]
+    assert len(keys) == len(set(keys)), f"a census key named by two scenarios: {sorted(k for k in keys if keys.count(k) > 1)}"
     print("d1-census self-test: ok")
 
 

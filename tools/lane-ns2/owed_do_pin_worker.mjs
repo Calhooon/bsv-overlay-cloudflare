@@ -56,6 +56,14 @@ export class OwedPin {
       return this.fetch(new Request('http://pin/pin/state'))
     }
     if (url.pathname === '/pin/refuse') { this.refuse = true; return new Response('next put refused') }
+    if (url.pathname === '/pin/old-actor') {
+      // the storage the retired deferred walk left (its identity, due and an armed alarm), then its alarm fires
+      await this.state.storage.put('owed-identity', url.searchParams.get('identity'))
+      await this.state.storage.put('owed-due', Date.now() - 1)
+      await this.state.storage.setAlarm(Date.now() + 30000)
+      await this.inner.alarm()
+      return this.fetch(new Request('http://pin/pin/state'))
+    }
     if (url.pathname === '/pin/delete-all') {
       await this.state.storage.setAlarm(Date.now() + 120000)
       await this.state.storage.put('probe', true)

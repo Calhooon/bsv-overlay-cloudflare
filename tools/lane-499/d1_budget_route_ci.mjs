@@ -16,18 +16,16 @@
  *
  * Legs:
  *  1. app layer: /utxo-status and /pots-view over identity A's 8 pots, /results (the view actor's compute, served
- *     as `d1view`, and the forwarding request itself), /owed's first read (the compute on read) and a served read.
+ *     as `d1view`, and the forwarding request itself), /owed's first read (pending, one wanted mark: the read never
+ *     computes since bsv-low #893) and, after the targeted judge (`/internal/hop-changed`), a served read.
  *  2. overlay: an operator `historical-tx-no-spv` /submit that ADMITS one tm_collected output (the admission
  *     writes); the overlay's ARCADE_URL points at a closed local port, so nothing leaves the machine.
  *  3. the health surfaces: `/health.d1Budget` (app) and `/health/invariants.d1Budget` (overlay) carry each route
  *     driven, with a running maximum at least the figure its answer carried.
- *  4. the brain's recompute ceiling: identity B's pot is announced 13 times inside one minute through
- *     `/internal/pot-changed` (each waited out, so none is folded into an in-flight one). The announcement names
- *     BOTH seats (B and B's opponent), so each ask is two recomputes, one per identity, and each identity's 13th
- *     is shed: `recomputeBySource.pot-changed` moves by 24 and `/health.owed.recomputeShed` by exactly 2. Each
- *     hook answer carries its `d1` segment, the hooks are keyed `/internal` and every walk after the answer
- *     `owed-recompute` on `d1Budget` (the lens fold's M2 and M3). E649 L4: the first ask's own figures are held to
- *     `pot-changed-hook-1` (one attribution batch, one seat-marker batch, no walk) and it answers `hook;dur=`.
+ *  4. the pot hook: identity B's pot announced three times through `/internal/pot-changed`; each answer carries
+ *     its `d1` segment (the judge inside it, bsv-low #893), the hooks are keyed `/internal` on `d1Budget`, and the
+ *     first ask is held to `pot-changed-hook-1` and answers `hook;dur=`. (The recompute ceiling, its shed and the
+ *     deferred walk are the retired walk's: D2-OWED-FOLD-8 dropped their cells.)
  *  5. E649 L4 M1: the hook's maximum bodies (eight decoded outpoints; the marker fallback; the 8-outpoint /
  *     19-identity body with existing owed-state rows) and one pass of the park's drain, each held to its ceiling.
  *
@@ -74,7 +72,10 @@ function segment(header, name) {
 async function get(base, path, init) {
   const res = await fetch(base + path, init)
   const text = await res.text()
-  return { status: res.status, timing: res.headers.get('server-timing'), text }
+  const out = { status: res.status, timing: res.headers.get('server-timing'), text }
+  // the port guard's record: every request of more than 50 statements, with the loopback count right after it
+  if (((segment(out.timing, 'd1')?.stmts ?? 0) > 50 || path.startsWith('/internal') || path.startsWith('/record')) && typeof noteRequest === 'function') noteRequest(`${init?.method ?? 'GET'} ${path.split('?')[0]}`, out)
+  return out
 }
 
 /** Hold one measured figure against its ceiling, by the scenario's name. */
@@ -141,6 +142,43 @@ async function pollFor(predicate, timeoutMs = 20_000, stepMs = 100) {
   }
 }
 
+/** `POST /internal/hop-changed {"identities":[..]}`: the targeted judge (at most 16 dirty subjects, then the answer). */
+const hopChanged = (identities) => get(APP, '/internal/hop-changed', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${INTERNAL_TOKEN}` },
+  body: JSON.stringify({ identities }),
+})
+/** The owed-v2 backfill's lever: `''` one pass (the first arms), `'?evidence=1'` its evidence phase alone. */
+const backfillLever = (query = '') => get(APP, `/internal/owed-backfill-pass${query}`, { method: 'POST', headers: { Authorization: `Bearer ${INTERNAL_TOKEN}` } })
+
+// D2-OWED-FOLD-8, the port guard: wrangler dev's local D1 shim leaves about two loopback connections per D1 statement
+// for about ten seconds, so a hook of 433 statements holds about 2,500 by itself. Before each heavy cell the harness
+// waits for the loopback count to fall under 500 (at most 30 s) and stops the run past 2,000; the peak it saw is
+// printed at the end.
+function loopbackConnections() {
+  const cmd = process.platform === 'darwin'
+    ? "netstat -an -p tcp | grep ESTABLISHED | grep -c '127\\.0\\.0\\.1' || true"
+    : "ss -Htn state established 2>/dev/null | grep -c '127\\.0\\.0\\.1' || true"
+  try { return Number(execFileSync('sh', ['-c', cmd]).toString().trim()) || 0 } catch { return 0 }
+}
+let portPeak = 0
+/** Each heavy request's own figures and the loopback count right after it (the port guard's record). */
+function noteRequest(label, r) {
+  const n = loopbackConnections()
+  portPeak = Math.max(portPeak, n)
+  console.log(`REQUEST ${label}: d1 ${JSON.stringify(segment(r.timing, 'd1'))}, loopback after ${n}`)
+}
+async function portGuard(label) {
+  let n = 0
+  for (let i = 0; i < 60; i++) {
+    n = loopbackConnections()
+    portPeak = Math.max(portPeak, n)
+    if (n < 500) return
+    await new Promise((r) => setTimeout(r, 500))
+  }
+  if (n > 2000) throw new Error(`port guard: ${n} loopback connections before ${label} (past 2,000): the run stops`)
+}
+
 const measured = {}
 
 // ── 1. the app layer's hot routes ──────────────────────────────────────────
@@ -159,13 +197,24 @@ const measured = {}
   check('results-view-compute', (measured['/results:view'] = segment(r.timing, 'd1view')))
   check('results-forward', (measured['/results'] = segment(r.timing, 'd1')))
 
+  // D2-OWED-FOLD-8: the read never computes (bsv-low #893, the READ lane). A's first read finds no stored state, so it
+  // answers `pending: true` and writes ONE wanted mark (five physical rows, the captain's ruling) and nothing else.
+  // The judge writes the rows at the write path: A's seed rows carry their dirty marks (the seed loads after the
+  // triggers), so `/internal/hop-changed` (the targeted judge) judges A's games, and ONE read then serves them.
   const o1 = await get(APP, `/owed?identity=${ID_A}`)
-  if (o1.status !== 200) fail('/owed first read answers', `${o1.status}: ${o1.text.slice(0, 200)}`)
-  else if (JSON.parse(o1.text).rows?.length !== 9) fail('/owed computes A\'s 9 rows (8 pots and the swept hop)', o1.text.slice(0, 200))
+  let b1 = {}
+  try { b1 = JSON.parse(o1.text) } catch {}
+  if (o1.status === 200 && b1.pending === true && (b1.rows ?? []).length === 0) pass('/owed first read answers pending: true and computes nothing')
+  else fail('/owed first read answers pending: true and computes nothing', `${o1.status}: ${o1.text.slice(0, 200)}`)
   const first = segment(o1.timing, 'd1')
   check('owed-first-read', first)
+  await portGuard('hop-changed A')
+  const judgedA = await hopChanged([ID_A])
+  if (judgedA.status !== 200) fail('/internal/hop-changed judges A', `${judgedA.status}: ${judgedA.text.slice(0, 200)}`)
   const o2 = await get(APP, `/owed?identity=${ID_A}`)
   if (o2.status !== 200) fail('/owed served read answers', `${o2.status}: ${o2.text.slice(0, 200)}`)
+  else if (JSON.parse(o2.text).rows?.length !== 9) fail('/owed serves A\'s 9 judged rows (8 pots and the swept hop)', o2.text.slice(0, 300))
+  else pass('/owed serves A\'s 9 judged rows (8 pots and the swept hop) after the targeted judge')
   const served = segment(o2.timing, 'd1')
   check('owed-served-read', served)
   measured['/owed'] = first && served ? { reads: Math.max(first.reads, served.reads), writes: Math.max(first.writes, served.writes), stmts: Math.max(first.stmts, served.stmts) } : null
@@ -201,69 +250,71 @@ const measured = {}
   check('spent-any-20', (measured['/spent-any'] = segment(r.timing, 'd1')))
 }
 
-// L23R2-H1/M2/M3/M4: the real /owed route over captured, markerless, twin-only 25h evidence.
+// L23R2 and D2-OWED-FOLD-8: the captured beta pair 13 (an eviction made BEFORE the eviction writer, so no evidence row)
+// and its synthetic missing-bytes JOIN. The owed-v2 backfill's evidence phase writes their evidence through the
+// writer's own statements (`?evidence=1`, after the arming pass), each evidence row marking its seat's game; the
+// targeted judge then judges the four seats and ONE read each serves the old walk's rows (bsv-low
+// D2-OWED-FOLD-7-FINDING; `old_walk_native::pins::fold8_a` is the native oracle, byte for byte).
+// Dropped, by design: the old ring's cursor facts (`markerlessCandidates`: the ring is replaced by the evidence row)
+// and the walk's per-pass cut (`truncated`, `judgement`: a missing JOIN's could-not-judge row is a complete judgement).
+// The twin-only seat's hop memo is stamped by the cell's clock (overlay #85), so the judgement asks no courier.
 {
   const p28 = '02f9f80a92a92677d97fce5bb0a03d0321425b918868b3ef5773120d9cf5364e49'
-  const r = await get(APP, `/owed?identity=${p28}`)
-  const body = JSON.parse(r.text)
-  const row = body.rows?.find(r => r.gameId === '9d88aaaa348acae127efd08e133822201ecae56513831c37124837f3ef9ae17f')
-  if (r.status === 200 && row?.facts?.spendKind === 'spent-elsewhere' && row.facts.claim == null && row.facts.markerlessCandidates === 1)
-    pass('L23R2 route-selection: captured ninth eviction, twin-only seat, planted marker, 25h story')
-  else fail('L23R2 route-selection: captured ninth eviction, twin-only seat, planted marker, 25h story', r.text.slice(0, 2000))
-  const tally = segment(r.timing, 'd1')
-  if (tally && tally.reads <= 256) pass('L23R2-H1 captured read stays in the 256-read #499 class under twin noise')
-  else fail('L23R2-H1 captured read stays in the 256-read #499 class under twin noise', JSON.stringify(tally))
-  const h = await appHealth()
-  if (h.owed.markerlessIgnoredMarkers >= 1) pass('L23R2-M2 planted marker counted')
-  else fail('L23R2-M2 planted marker counted', JSON.stringify(h.owed))
-}
-
-// M3 independently: the other captured identity has only permanent twin party rows, no hopparty row.
-// Overlay #85: the hop's unspent probe memo is stamped HERE, by the cell's clock, just before the read. Seeded at
-// seed time it outlived its five minutes (`hops_view::PROBE_MEMO_MAX_AGE_MS`) behind the tier's builds on a loaded
-// host; the walk then asked mainnet WoC, which knows this captured hop swept home, and served 0 rows (or 1 when WoC
-// answered 429), at 33 to 35 statements against the offline read's 23 (the "owed surface 35 > 30" row).
-// bsv-low #808: the seed carries no `tipHeight`. That holds only because the tier runs no `rust-chaintracks`, so the
-// walk reads no tip and the memo's tip rule is off (`hops_view::memo_predates_tip`); a tier that serves a tip must
-// seed the memo at it, or the walk asks WoC again.
-{
   const other = '030d9e9fbe045a8130f190b103609c8a6bf13b1887d5c4f15e2f918d68aca8ad67'
-  const hop = '9b238eed0177c714b1f9a608243e8f1bf79e35e9597110f83cefa1b658785c62'
+  const f1 = '02' + 'f1'.repeat(32), f2 = '02' + 'f2'.repeat(32)
+  const otherHop = '9b238eed0177c714b1f9a608243e8f1bf79e35e9597110f83cefa1b658785c62'
   const crate = fileURLToPath(new URL('../../crates/low-app-layer/', import.meta.url))
   execFileSync('npx', ['wrangler', 'd1', 'execute', 'low-overlay-db', '--local', '--persist-to', process.env.D1_BUDGET_STATE, '--command',
-    `INSERT OR REPLACE INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed) VALUES ('${hop}.0',${Date.now()},0,NULL,0)`],
+    `INSERT OR REPLACE INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed) VALUES ('${otherHop}.0',${Date.now()},0,NULL,0)`],
   { cwd: crate, timeout: 30_000, stdio: 'pipe' })
-  const r = await get(APP, `/owed?identity=${other}`)
-  const row = JSON.parse(r.text).rows?.find(r => r.outpoint === '9b238eed0177c714b1f9a608243e8f1bf79e35e9597110f83cefa1b658785c62:0')
-  if (r.status === 200 && row?.facts?.markerlessCandidates === 1) pass('L23R2-M3 twin-only captured seat computes through owed route')
-  else fail('L23R2-M3 twin-only captured seat computes through owed route', `${r.status} ${r.text}`)
-}
-
-// L23R2D-M1: absent permanent bytes fault this candidate; the first read serves its row with 200.
-{
-  const before = (await appHealth()).owed.markerlessReadFaults
-  const r = await get(APP, `/owed?identity=02${'f1'.repeat(32)}`)
-  const after = (await appHealth()).owed.markerlessReadFaults
-  const body = JSON.parse(r.text)
-  const fault = body.rows?.find(row => row.facts?.evidenceMissing)
-  if (r.status === 200 && fault?.reason?.includes('evidence-missing') && fault.facts.claim == null && body.rows.length === 2 && body.rows.some(row => row.gameId === 'healthy-game') && body.truncated && after > before)
-    pass('L23R2-L2 markerless read fault counted, could not judge served')
-  else fail('L23R2-L2 markerless read fault counted, could not judge served', `${r.status} ${r.text} faults ${before}->${after}`)
-}
-
-// The detached fault must also mark a previously served snapshot; its old press is withheld.
-{
-  const url = `/owed?identity=02${'f2'.repeat(32)}`
-  let r = await get(APP, url)
-  for (let i = 0; i < 30 && !JSON.parse(r.text).rows?.[0]?.facts?.markerlessReadFault; i++) {
-    await new Promise(resolve => setTimeout(resolve, 100))
-    r = await get(APP, url)
+  // the app layer's D1 here is the seed's, which the overlay never certified: write its certification row (the backfill
+  // gate reads it), as the backfill tier does
+  execFileSync('npx', ['wrangler', 'd1', 'execute', 'low-overlay-db', '--local', '--persist-to', process.env.D1_BUDGET_STATE, '--command',
+    "INSERT INTO ops_counters(name,value) VALUES ('overlay_migration_count',409) ON CONFLICT(name) DO UPDATE SET value=excluded.value"],
+  { cwd: crate, timeout: 30_000, stdio: 'pipe' })
+  await portGuard('owed-backfill evidence')
+  const armed = await backfillLever()
+  const evidence = await backfillLever('?evidence=1')
+  let ev = {}
+  try { ev = JSON.parse(evidence.text) } catch {}
+  if (armed.status === 200 && evidence.status === 200 && ev.stop === 'Page' && ev.evictions >= 2 && ev.evidenceCandidates >= 2)
+    pass(`D2-OWED-FOLD-8 the evidence phase writes the pre-writer evictions' evidence (${ev.evictions} open evictions, ${ev.evidenceCandidates} hop outputs, ${ev.missingOutpoints} unreadable outpoints)`)
+  else fail('D2-OWED-FOLD-8 the evidence phase writes the pre-writer evictions\' evidence', `${armed.status} ${evidence.status}: ${evidence.text.slice(0, 300)}`)
+  const h0 = (await appHealth()).owed
+  await portGuard('hop-changed pair 13')
+  const judged = await hopChanged([p28, other, f1, f2])
+  if (judged.status !== 200) fail('/internal/hop-changed judges pair 13', `${judged.status}: ${judged.text.slice(0, 200)}`)
+  const h1 = (await appHealth()).owed
+  const read = async (id) => {
+    const r = await get(APP, `/owed?identity=${id}`)
+    let body = {}
+    try { body = JSON.parse(r.text) } catch {}
+    return { r, body, rows: body.rows ?? [] }
   }
-  const body = JSON.parse(r.text)
-  const row = body.rows?.[0]
-  if (r.status === 200 && body.truncated && body.judgement?.includes('could not judge') && row?.facts?.markerlessReadFault && row.facts.claim == null)
-    pass('L23R2-L2 cached snapshot tells could-not-judge and withholds its press')
-  else fail('L23R2-L2 cached snapshot tells could-not-judge and withholds its press', `${r.status} ${r.text}`)
+  const p = await read(p28)
+  const prow = p.rows.find((x) => x.gameId === '9d88aaaa348acae127efd08e133822201ecae56513831c37124837f3ef9ae17f')
+  if (p.r.status === 200 && prow?.facts?.spendKind === 'spent-elsewhere' && prow.facts.claim == null && prow.facts.markerVerified === 'verified')
+    pass('L23R2 route-selection: captured eviction, twin evidence over the planted marker, 25h story (spent elsewhere)')
+  else fail('L23R2 route-selection: captured eviction, twin evidence over the planted marker, 25h story', p.r.text.slice(0, 2000))
+  const tally = segment(p.r.timing, 'd1')
+  if (tally && tally.reads <= 256) pass('L23R2-H1 captured read stays in the 256-read #499 class under twin noise')
+  else fail('L23R2-H1 captured read stays in the 256-read #499 class under twin noise', JSON.stringify(tally))
+  if (h1.markerlessIgnoredMarkers > h0.markerlessIgnoredMarkers) pass('L23R2-M2 planted marker counted (the judge replaced it with the twin evidence)')
+  else fail('L23R2-M2 planted marker counted', `${h0.markerlessIgnoredMarkers} -> ${h1.markerlessIgnoredMarkers}`)
+  const o = await read(other)
+  const orow = o.rows.find((x) => x.outpoint === `${otherHop}:0`)
+  if (o.r.status === 200 && orow?.family === 'hop-stranded' && orow.facts?.joinRefusedBy === 'eviction' && orow.facts.markerVerified === 'verified')
+    pass('L23R2-M3 twin-only captured seat: its released hop judged from the evidence the backfill wrote')
+  else fail('L23R2-M3 twin-only captured seat judged', `${o.r.status} ${o.r.text.slice(0, 1500)}`)
+  const a = await read(f1)
+  const fault = a.rows.find((x) => x.facts?.evidenceMissing)
+  if (a.r.status === 200 && fault?.reason?.includes('evidence-missing') && fault.facts.claim == null && fault.facts.claimable === false && a.rows.length === 2 && a.rows.some((x) => x.gameId === 'healthy-game') && h1.markerlessReadFaults > h0.markerlessReadFaults)
+    pass('L23R2-L2 the missing JOIN is judged could-not-judge beside the healthy game, counted')
+  else fail('L23R2-L2 the missing JOIN is judged could-not-judge beside the healthy game, counted', `${a.r.status} ${a.r.text.slice(0, 1500)} faults ${h0.markerlessReadFaults}->${h1.markerlessReadFaults}`)
+  const c = await read(f2)
+  if (c.r.status === 200 && c.rows.length > 0 && c.rows.every((x) => x.facts?.markerlessReadFault && x.facts.claim == null && x.facts.claimable === false))
+    pass('L23R2-L2 the old snapshot\'s press is judged away: could-not-judge, no press')
+  else fail('L23R2-L2 the old snapshot\'s press is judged away: could-not-judge, no press', `${c.r.status} ${c.r.text.slice(0, 1500)}`)
 }
 
 // A real signed stranger filing: all request statements join /record's measured ceiling.
@@ -271,52 +322,30 @@ const measured = {}
 {
   const seed = readFileSync(process.env.D1_BUDGET_SEED, 'utf8')
   const fixture = JSON.parse(seed.split('\n').find((line) => line.startsWith('-- NS2_RECORD_FIXTURE ')).slice('-- NS2_RECORD_FIXTURE '.length))
-  const before = (await appHealth()).owed.recomputeBySource.filing
+  const victimBefore = JSON.parse((await get(APP, `/owed?identity=${ID_A}`)).text)
+  await portGuard('record filing')
   const filed = await get(APP, `/record?kind=potparty&identity=${fixture.identity}`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ scriptHex: fixture.scriptHex }),
   })
   if (filed.status === 200 && JSON.parse(filed.text).filed) pass('NS2 stranger potparty filing admitted')
   else fail('NS2 stranger potparty filing admitted', `${filed.status}: ${filed.text}`)
+  // D2-OWED-FOLD-8: the filing judges its filer in its own batch (the design's cost at the write), so this figure is
+  // the filing's statements AND the filer's judgement
   check('record-potparty-filing', (measured['/record'] = segment(filed.timing, 'd1')))
-  const ran = await pollFor(async () => (await appHealth()).owed.recomputeBySource.filing > before)
-  const after = (await appHealth()).owed.recomputeBySource.filing
-  if (ran && after === before + 1) pass('SHED-M1 filing walks and pushes only its filer; no victim walk or push')
-  else fail('SHED-M1 filing walks only its filer', `filing walks +${after - before} (want 1)`)
-  const staleBefore = (await appHealth()).owed.recomputeBySource['read-stale']
-  await get(APP, `/owed?identity=${ID_A}`)
-  const repaired = await pollFor(async () => (await appHealth()).owed.recomputeBySource['read-stale'] > staleBefore)
-  const staleAfter = (await appHealth()).owed.recomputeBySource['read-stale']
-  if (repaired && staleAfter === staleBefore + 1) pass('SHED-M1 victim own next read consumes its stale mark with one walk')
-  else fail('SHED-M1 victim own next read recomputes once', `read-stale walks +${staleAfter - staleBefore}`)
+  // SHED-M1, re-pointed (the walk counters `recomputeBySource.filing` / `read-stale` are the retired walk's): the
+  // filing judged the stranger alone; A's stored judgement is untouched (its stamp and rows as before), and the filer's
+  // own read serves the judgement the filing wrote
+  const victimAfter = JSON.parse((await get(APP, `/owed?identity=${ID_A}`)).text)
+  if (victimAfter.computedAtMs === victimBefore.computedAtMs && victimAfter.rows?.length === victimBefore.rows?.length) pass('SHED-M1 a stranger\'s filing judges only its filer: A\'s judgement untouched')
+  else fail('SHED-M1 a stranger\'s filing judges only its filer', `A computedAtMs ${victimBefore.computedAtMs} -> ${victimAfter.computedAtMs}, rows ${victimBefore.rows?.length} -> ${victimAfter.rows?.length}`)
+  const filer = JSON.parse((await get(APP, `/owed?identity=${fixture.identity}`)).text)
+  if (filer.computedAtMs > 0 && filer.pending !== true) pass(`SHED-M1 the filer's read serves the judgement its filing wrote (${filer.rows?.length} row(s))`)
+  else fail('SHED-M1 the filer\'s read serves the judgement its filing wrote', JSON.stringify(filer).slice(0, 400))
 }
 
-// NOTE-3: twelve real failed writes leave no snapshot. The next read spends the reserved walk once.
-{
-  const identity = '02' + (299).toString(16).padStart(64, '0')
-  const crate = fileURLToPath(new URL('../../crates/low-app-layer/', import.meta.url))
-  const sql = (command) => execFileSync('npx', ['wrangler', 'd1', 'execute', 'low-overlay-db', '--local', '--persist-to', process.env.D1_BUDGET_STATE, '--command', command], { cwd: crate, timeout: 30_000, stdio: 'pipe' })
-  sql(`CREATE TRIGGER ns2_first_read_fault BEFORE INSERT ON owed_rows WHEN NEW.identity='${identity}' BEGIN SELECT RAISE(FAIL,'NS2 pinned write fault'); END;`)
-  try {
-    let faulted = 0
-    for (let n = 0; n < 12; n++) {
-      const r = await get(APP, `/owed?identity=${identity}`)
-      if (r.status === 503 && !JSON.parse(r.text).refresh) faulted++
-    }
-    if (faulted === 12) pass('NOTE-3 twelve ordinary first-read writes faulted with no snapshot')
-    else fail('NOTE-3 twelve first reads fault', `${faulted}/12 real write faults`)
-  } finally { sql('DROP TRIGGER ns2_first_read_fault;') }
-  const before = (await appHealth()).owed
-  const read = await get(APP, `/owed?identity=${identity}`)
-  const after = (await appHealth()).owed
-  if (read.status === 200 && JSON.parse(read.text).rows?.length === 1 && after.owed_recompute_deferred_total === before.owed_recompute_deferred_total + 1)
-    pass('NOTE-3 snapshotless read past the ceiling runs one reserved walk and answers 200')
-  else fail('NOTE-3 snapshotless first read walks instead of shedding 503', `${read.status} ${read.text} deferred ${before.owed_recompute_deferred_total}->${after.owed_recompute_deferred_total}`)
-  const second = await get(APP, `/owed?identity=${identity}`)
-  const served = (await appHealth()).owed
-  if (second.status === 200 && JSON.parse(second.text).rows?.length === 1 && served.owed_recompute_deferred_total === after.owed_recompute_deferred_total && served.recomputeBySource['read-first'] === after.recomputeBySource['read-first'])
-    pass('NOTE-3 a second read serves the snapshot without a second reserved walk')
-  else fail('NOTE-3 one reserved walk per window', JSON.stringify(served))
-}
+// NOTE-3 (twelve failed first-read writes, then one reserved walk): DROPPED by design. The read never walks and the
+// reserved deferred walk is retired (bsv-low #893, the READ and BELT lanes); a write fault is the judge's, under the
+// drain's and the filing's own fault rules (pinned natively: `owed893_app_filing_atomic_on_row_fault`, the drain's).
 
 // ── 2. the overlay's admission writes ──────────────────────────────────────
 {
@@ -373,12 +402,11 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   }
 }
 
-// bsv-low #837 (FIX-837, fix 2): identity C holds 300 results (the seed's `fix837_c_rows`; loop 44 pair 1's A held
-// 264, and every recompute of A ran 12 to 26 s with the budget cut and served one row fewer). C's first owed read
-// (the compute on read) must serve the NEWEST game's row (game 299) inside the walk's outward budget (12 s), and never
-// fewer rows than C's games; the figures are printed for the record. It runs AFTER section 3: its first read writes C's
-// 300 rows in one batch (about 426 statements, under the platform's 1,000), a heavier identity than A's, and the
-// app's `/owed` running maximum that section 3 holds to A's named ceiling (`owed-first-read`) would carry it.
+// bsv-low #837 (FIX-837, fix 2), re-pointed by D2-OWED-FOLD-8: identity C holds 300 results (the seed's
+// `fix837_c_rows`; loop 44 pair 1's A held 264). The read never computes, so C's 300 games are JUDGED NATIVELY by the
+// seed (`d1_budget_seed`, the shipped judge 16 games a batch, its writes in the seed: the backfill's shape), and the
+// read serves them: the NEWEST game's row (game 299) and every game, from ONE read of stored rows, measured
+// (`owed-read-c`). A second read serves the same rows. It runs AFTER section 3, whose `/owed` maximum is A's.
 {
   const ID_C = '02' + 'c3'.repeat(32)
   const newestGame = '837d' + (299).toString(16).padStart(60, '0')
@@ -390,17 +418,17 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   const rows = body.rows ?? []
   const games = new Set(rows.map((r) => r.gameId))
   const d1 = segment(o.timing, 'd1')
-  console.log(`#837 C's first owed read: ${ms} ms, ${rows.length} rows over ${games.size} games, refresh=${body.refresh ?? null}, truncated=${body.truncated ?? null}, d1 ${JSON.stringify(d1)}`)
-  if (o.status === 200 && rows.some((r) => r.gameId === newestGame) && ms < 12_000) pass(`#837 a 300-result identity's newest game is served within the budget (${ms} ms)`)
-  else fail('#837 a 300-result identity\'s newest game is served within the budget', `${o.status} ${ms} ms rows=${rows.length} ${o.text.slice(0, 300)}`)
-  if (games.size >= 300 || body.refresh === 'shed') pass(`#837 C's list holds every game (${games.size}) or names the shed`)
-  else fail('#837 C\'s list holds every game or names the shed', `games=${games.size} refresh=${body.refresh}`)
+  console.log(`#837 C's read: ${ms} ms, ${rows.length} rows over ${games.size} games, truncated=${body.truncated ?? null}, d1 ${JSON.stringify(d1)}`)
+  if (o.status === 200 && rows.some((r) => r.gameId === newestGame)) pass(`#837 a 300-result identity's newest game is served (${ms} ms)`)
+  else fail('#837 a 300-result identity\'s newest game is served', `${o.status} ${ms} ms rows=${rows.length} ${o.text.slice(0, 300)}`)
+  if (games.size >= 300) pass(`#837 C's list holds every game (${games.size})`)
+  else fail('#837 C\'s list holds every game', `games=${games.size}`)
+  check('owed-read-c', d1)
   const o2 = await get(APP, `/owed?identity=${ID_C}`)
   let rows2 = []
   try { rows2 = JSON.parse(o2.text).rows ?? [] } catch {}
-  console.log(`#837 C's served read: ${rows2.length} rows, d1 ${JSON.stringify(segment(o2.timing, 'd1'))}`)
-  if (o2.status === 200 && rows2.some((r) => r.gameId === newestGame) && rows2.length >= rows.length) pass('#837 C\'s served read keeps every row the first read served')
-  else fail('#837 C\'s served read keeps every row the first read served', `${o2.status} ${rows2.length} < ${rows.length}`)
+  if (o2.status === 200 && rows2.some((r) => r.gameId === newestGame) && rows2.length === rows.length) pass('#837 C\'s second read serves the same rows')
+  else fail('#837 C\'s second read serves the same rows', `${o2.status} ${rows2.length} vs ${rows.length}`)
 }
 
 // ── 3b. bsv-low #838: the harness's settle of /health/invariants on the fleet fixture ─────────────────────
@@ -423,17 +451,20 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   else pass(`health-invariants: two answers in ${ms} ms (ceiling ${c.settleCeilingMs}, the harness's settle 20000)`)
 }
 
-// ── 4. the brain's recompute ceiling sheds ─────────────────────────────────
+// ── 4. the pot hook answers with its own figures ────────────────────────────
+// D2-OWED-FOLD-8: the recompute ceiling, its shed, the deferred alarm walk and `owed-recompute` are the retired walk's
+// machinery (bsv-low #893: the judge runs at the write, the read is a lookup, the belt looks in the background), so
+// their cells are DROPPED: "pot-changed ask N settles", "the ceiling sheds the 13th recompute", "d1Budget keys each
+// detached walk under owed-recompute", "owed maximum within named ceiling" (the owed-recompute maximum), and NS2's
+// shed read, its count, the deferred walks converging and the alarm's fresh snapshot. What stays: the hook is a write
+// whose answer carries its D1 figures (the judge inside it, the design's cost at the write) and its `hook;dur=`, is
+// keyed under `/internal`, and answers each of three asks on B's pot.
 {
-  const h0 = (await appHealth()).owed
-  const ceiling = h0.recomputesPerIdentityPerMinute
-  if (ceiling !== 12) fail('/health serves the recompute ceiling', `recomputesPerIdentityPerMinute = ${ceiling}`)
-  const t0 = Date.now()
-  const asks = (ceiling ?? 12) + 1
-  const SEATS = 2 // the announcement names both seats of B's pot: one recompute per identity per ask
+  const asks = 3
   const b0 = (await appHealth()).d1Budget
-  let hookUnstamped = 0 // the lens fold's M2: a hook's own answer carries its D1 figures too
+  let hookUnstamped = 0
   for (let i = 0; i < asks; i++) {
+    await portGuard(`pot-changed ask ${i + 1}`)
     const r = await get(APP, '/internal/pot-changed', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${INTERNAL_TOKEN}` },
@@ -444,8 +475,6 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
       break
     }
     if (!segment(r.timing, 'd1')) hookUnstamped++
-    // E649 L4: the hook is a write. Its first answer is held to a named ceiling (the attribution batch and the seat
-    // markers' batch, no statement per outpoint, no walk) and carries its own timing (`hook;dur=`).
     if (i === 0) {
       check('pot-changed-hook-1', segment(r.timing, 'd1'))
       const dur = (r.timing ?? '').match(/(?:^|,\s*)hook;dur=(\d+)/)
@@ -456,60 +485,13 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
       if (body.announce === 'detached') pass('E649 L4: the answer says the announce is detached')
       else fail('E649 L4: the answer says the announce is detached', r.text.slice(0, 200))
     }
-    // the recompute runs after the answer: wait it out, so the next ask is a recompute and not a folded one
-    const settled = await pollFor(async () => {
-      const o = (await appHealth()).owed
-      return o.inFlight.count === 0 && (o.recomputeBySource['pot-changed'] + o.recomputeShed) >= (h0.recomputeBySource['pot-changed'] + h0.recomputeShed) + SEATS * (i + 1)
-    })
-    if (!settled) {
-      fail(`pot-changed ask ${i + 1} settles`, 'the recompute neither ran nor shed inside 20 s')
-      break
-    }
   }
-  const maximum = (await appHealth()).d1Budget?.routes?.['owed-recompute']?.max
-  const owedCeiling = CEILINGS.scenarios['owed-first-read'].ceiling.stmts
-  if (maximum) {
-    console.log(`OWED MAXIMUM reads ${maximum.reads} writes ${maximum.writes} stmts ${maximum.stmts}; ceiling ${owedCeiling}`)
-    if (maximum.stmts > owedCeiling) fail('owed maximum within named ceiling', `${maximum.stmts} > ${owedCeiling}`)
-  }
-  const h1 = (await appHealth()).owed
-  const elapsed = Date.now() - t0
-  const ran = h1.recomputeBySource['pot-changed'] - h0.recomputeBySource['pot-changed']
-  const shed = h1.recomputeShed - h0.recomputeShed
-  if (elapsed >= 60_000) fail('the 13 asks fall inside one minute', `${elapsed} ms`)
-  else if (ran === SEATS * ceiling && shed === SEATS && h1.recomputeFaults === h0.recomputeFaults && h1.recomputeAtCeiling >= SEATS)
-    pass(`the ceiling sheds: ${asks} announcements of B's pot in ${elapsed} ms, ${ran} recomputes ran (${ceiling} per seat), each seat's ${asks}th shed (recomputeShed +${shed}, recomputeAtCeiling ${h1.recomputeAtCeiling})`)
-  else fail('the ceiling sheds the 13th recompute of each identity inside a minute', `ran ${ran} (want ${SEATS * ceiling}), shed ${shed} (want ${SEATS}), atCeiling ${h1.recomputeAtCeiling}, faults +${h1.recomputeFaults - h0.recomputeFaults}`)
-  // the lens fold's M2 and M3: the hooks run under the ledger (`/internal`), and each walk after the answer is
-  // keyed `owed-recompute` (before, both landed only in `unscoped`)
   if (hookUnstamped === 0) pass(`every /internal/pot-changed answer carries d1;desc= (${asks} of ${asks})`)
   else fail('a hook route answers with its D1 figures', `${hookUnstamped} of ${asks} answers carry no d1 segment`)
   const b1 = (await appHealth()).d1Budget
   const moved = (route) => (b1?.routes?.[route]?.requests ?? 0) - (b0?.routes?.[route]?.requests ?? 0)
   if (moved('/internal') >= asks) pass(`d1Budget keys the hooks under /internal (+${moved('/internal')} requests)`)
   else fail('d1Budget keys the hooks under /internal', `+${moved('/internal')} requests (want at least ${asks})`)
-  if (moved('owed-recompute') >= ran && ran > 0) pass(`d1Budget keys each detached walk under owed-recompute (+${moved('owed-recompute')}, max reads ${b1.routes['owed-recompute'].max.reads})`)
-  else fail('d1Budget keys each detached walk under owed-recompute', `+${moved('owed-recompute')} (want at least ${ran})`)
-  // #648: a stale mount read names its shed. No owed read during the delay: only the alarm can refresh it.
-  const stale = await get(APP, `/owed?identity=${ID_B}`)
-  const old = JSON.parse(stale.text)
-  if (stale.status === 200 && old.refresh === 'shed' && old.retryAfterMs > 0 && old.retryAfterMs <= 60_000)
-    pass(`NS2 shed read marked: refresh=shed, retryAfterMs=${old.retryAfterMs}`)
-  else fail('NS2 shed read carries its refresh word and window remainder', stale.text)
-  const marked = (await appHealth()).owed
-  if (marked.owed_recompute_shed_total === marked.recomputeShed && marked.owed_recompute_shed_total >= h1.recomputeShed + 1)
-    pass('NS2 the shed mount read is counted')
-  else fail('NS2 every shed is counted', JSON.stringify(marked))
-  await new Promise((resolve) => setTimeout(resolve, Math.min(Math.max(old.retryAfterMs ?? 60_000, 0), 60_000)))
-  const ranDeferred = await pollFor(async () => (await appHealth()).owed.owed_recompute_deferred_total >= (h1.owed_recompute_deferred_total ?? 0) + SEATS, 20_000)
-  if (ranDeferred && (await appHealth()).owed.owed_recompute_deferred_total === (h1.owed_recompute_deferred_total ?? 0) + SEATS) pass('NS2 exactly one reserved alarm walk per seat runs without an owed poll')
-  else fail('NS2 deferred walks converge at the window end', JSON.stringify((await appHealth()).owed))
-  const refreshed = await get(APP, `/owed?identity=${ID_B}`)
-  const fresh = JSON.parse(refreshed.text)
-  if (refreshed.status === 200 && fresh.computedAtMs > old.computedAtMs && fresh.refresh !== 'shed')
-    pass(`NS2 snapshot advanced without client poll: ${old.computedAtMs} -> ${fresh.computedAtMs}`)
-  else fail('NS2 the alarm writes a fresh owed snapshot', refreshed.text)
-
 }
 
 // ── 5. E649 L4 M1: the pot hook's maximum bodies and its park's drain, each against a named ceiling ──────────
@@ -533,6 +515,7 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
     ['pot-changed-hook-8x19', [...Array.from({ length: 7 }, (_, i) => ({ txid: e649(i), vout: 0 })), { txid: e649(0xff), vout: 0 }], 14],
   ]
   for (const [name, outpoints, seats] of bodies) {
+    await portGuard(name)
     const r = await hook(outpoints)
     if (r.status !== 200) {
       fail(`${name} answers`, `${r.status}: ${r.text.slice(0, 200)}`)
@@ -546,6 +529,7 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   // E649 L4 N3: the seed's backlog of 120 due rows. The first pass runs its four rounds of 24 (96 settled, not
   // configured here) and sweeps the 6 exhausted; the second takes the 24 left and reads one more round of none.
   const drain = async () => get(APP, '/internal/pot-announce-drain', { method: 'POST', headers: { Authorization: `Bearer ${INTERNAL_TOKEN}` } })
+  await portGuard('pot-announce-drain')
   for (const [name, want] of [
     ['pot-announce-drain-backlog', { rounds: 4, due: 96, skipped: 96, swept: 6 }],
     ['pot-announce-drain', { rounds: 2, due: 24, skipped: 24, swept: 0 }],
@@ -570,6 +554,7 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   const sql = (command) => execFileSync('npx', ['wrangler', 'd1', 'execute', 'low-overlay-db', '--local', '--persist-to', process.env.D1_BUDGET_STATE, '--command', command], { cwd: crate, timeout: 30_000, stdio: 'pipe' })
   sql("WITH RECURSIVE k(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM k WHERE i + 1 < 2048) INSERT INTO pot_announce_parked (outpoint, kind, recipient, at, attempts, next_attempt_at_ms, generation, exhausted_at_ms) SELECT printf('e64f%060x:0', i), 'room', '', 1, 0, 9000000000000, 1, NULL FROM k WHERE i < 2048 - (SELECT COUNT(*) FROM pot_announce_parked)")
   const fresh = Array.from({ length: 8 }, (_, i) => ({ txid: 'e64e' + i.toString(16).padStart(60, '0'), vout: 0 }))
+  await portGuard('pot-changed-hook-full-refused')
   const refused = await hook(fresh)
   const rb = refused.status === 503 ? JSON.parse(refused.text) : null
   if (rb && rb.retryable === true && rb.parked === 0 && rb.parkFull === 8 && rb.announce === 'none') pass('pot-changed-hook-full-refused: refused whole at 2,048 rows, 503 retryable, nothing announced')
@@ -581,6 +566,7 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   // local wrangler CLI reports no rows read, so that total is stated (docs/D1-BUDGETS.md), bounded by the scans the
   // tail scenario below measures, not measured here.
   sql("UPDATE pot_announce_parked SET exhausted_at_ms = 1 WHERE rowid IN (SELECT rowid FROM pot_announce_parked WHERE outpoint LIKE 'e64f%' ORDER BY outpoint LIMIT 8)")
+  await portGuard('pot-changed-hook-full-room')
   const room = await hook(fresh)
   const ob = room.status === 200 ? JSON.parse(room.text) : null
   // the detached announce (not configured here) settles the eight as delivered at once: what is left to read is that
@@ -605,6 +591,7 @@ for (const path of ['/refund-view', '/recovery-view', '/refund-backups']) {
   sql('UPDATE pot_announce_parked SET exhausted_at_ms = 1 WHERE rowid IN (SELECT rowid FROM pot_announce_parked ORDER BY rowid DESC LIMIT 8)')
   const before = one('SELECT COUNT(*) AS n FROM pot_announce_parked')
   const tailFresh = Array.from({ length: 8 }, (_, i) => ({ txid: 'e64c' + i.toString(16).padStart(60, '0'), vout: 0 }))
+  await portGuard('pot-changed-hook-full-room-tail')
   const tail = await hook(tailFresh)
   const tb = tail.status === 200 ? JSON.parse(tail.text) : null
   const tailCount = one('SELECT COUNT(*) AS n FROM pot_announce_parked')
@@ -649,6 +636,7 @@ for (const { name, got, ceiling } of table) {
 }
 console.log('')
 for (const l of lines) console.log(l)
+console.log(`PORT GUARD the loopback connections the guard saw: peak ${portPeak}`)
 if (MEASURE) {
   console.log('\nD1_BUDGET_MEASURE=1: measured only, no ceiling enforced')
   process.exit(failures === 0 ? 0 : 1)
