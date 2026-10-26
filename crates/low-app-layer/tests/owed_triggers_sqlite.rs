@@ -1212,6 +1212,19 @@ fn eviction_paths(f: &Fixture) -> Result<(), String> {
         ],
         marks("eviction", "pot", &["alice", "bob"]),
     )?;
+    // D2-OWED-FOLD-8's writer statement (the overlay's eviction writer and the backfill's evidence phase, pinned equal):
+    // the closed eviction's JOIN bytes do not read, so its released hop is named for each verified twin seat (alice's;
+    // bob's twin is unverified).
+    f.check(
+        "released hop evidence missing",
+        low_app_layer::owed_backfill::MISSING_INSERT_SQL,
+        vec![
+            "pot".to_string().into(),
+            r#"[{"txid":"hop","vout":0}]"#.to_string().into(),
+            0.into(),
+        ],
+        marks("hop", "hop:0", &["alice"]),
+    )?;
     // The restored pot precedes its parties, so those INSERTs are independently responsible for their marks.
     let mut restored = marks("party", "party-a", &["alice"]);
     restored.extend(marks("party", "party-b", &["bob"]));
@@ -1420,8 +1433,8 @@ fn owed893_each_source_trigger_removed_or_not_advanced_alone_turns_the_productio
         .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
     assert_eq!(
         names.len(),
-        28,
-        "fourteen source tables, refusal UPSERT's UPDATE and two word triggers per verb"
+        29,
+        "fifteen source tables (released_hop_evidence_missing, D2-OWED-FOLD-8's, the fifteenth), refusal UPSERT's UPDATE and two word triggers per verb"
     );
     for name in names {
         let err = paths(&Fixture::new(Some(&name)))
