@@ -290,7 +290,8 @@ pub(crate) async fn hydrate_filings(
             marker_created_at: crate::owed_cursor::number(&r, "evictedAt"),
             batch: None,
         };
-        owed::merge_markerless_hops(&mut i.hops, vec![h]);
+        // the old walk's isolate count of the planted markers verified evidence replaced (`/health.owed`)
+        owed::note_markerless_ignored_markers(owed::merge_markerless_hops(&mut i.hops, vec![h]));
     }
     // D2-OWED-FOLD-8: the released hops of an evicted JOIN whose bytes do not read, as the old walk faulted them; an
     // outpoint the identity's own evidence names (a released-hop evidence row, its pot, its verified hop marker) is
@@ -303,6 +304,7 @@ pub(crate) async fn hydrate_filings(
         } else {
             "evidence-missing: the evicted JOIN's stored bytes are absent or undecodable"
         };
+        owed::note_markerless_read_fault();
         i.markerless_faults.push(owed::OwedRow {
             identity: identity.to_owned(),
             outpoint: owed::outpoint_key(&hop, vout),
