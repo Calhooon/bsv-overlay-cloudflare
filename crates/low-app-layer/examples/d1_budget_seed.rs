@@ -59,6 +59,7 @@ fn main() {
         .expect("schema rows")
         .map(|r| r.expect("schema row"))
         .collect();
+    drop(stmt);
     for s in schema {
         out.push_str(&s);
         out.push_str(";\n");
@@ -148,6 +149,43 @@ fn main() {
         out.push_str(r);
         out.push_str(";\n");
     }
+    // D2-OWED-FOLD-8: the read never computes (bsv-low #893), so identity C's 300 games are judged HERE by the shipped
+    // judge, 16 games a batch (the backfill's shape), its writes replayed in the seed; the tier's #837 cell then reads
+    // C's stored rows. No tip, as the tier's own judgements have none (it runs no CHAINTRACKS).
+    let judge = seed_judge::SeedDb {
+        db: std::cell::RefCell::new(conn),
+        now: now_s * 1000,
+        tip: None,
+        out: std::cell::RefCell::new(String::new()),
+    };
+    let games: Vec<_> = (0..C_POTS).map(|i| format!("837d{i:060x}")).collect();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    for chunk in games.chunks(low_app_layer::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION) {
+        runtime
+            .block_on(low_app_layer::owed_judge::judge_subjects(
+                &judge,
+                ID_C,
+                chunk,
+                "budget-fixture",
+            ))
+            .expect("C judged");
+    }
+    out.push_str(&judge.out.borrow());
+    let conn = judge.db.into_inner();
+    let judged: (u64, u64) = conn
+        .query_row(
+            "SELECT (SELECT COUNT(DISTINCT gameId) FROM owed_rows WHERE identity=?1),(SELECT COUNT(*) FROM owed_dirty WHERE identity=?1)",
+            [ID_C],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("C's judged rows");
+    assert_eq!(
+        judged,
+        (u64::from(C_POTS), 0),
+        "C's 300 games judged, no mark left"
+    );
     // bsv-low #645: the schema dump carries the count's triggers, not its row: the backfill the overlay's migration
     // runs, run here after the rows (a no-op on the native connection, which already holds it).
     // NS-COST-BAR-1: the same for each trigger-kept count (its set fills from the rows' triggers on the local D1,
@@ -291,6 +329,8 @@ fn e649_hook_rows(now_s: u64) -> Vec<String> {
 
 #[path = "../tests/support/l23_pair13.rs"]
 mod l23_pair13;
+#[path = "../tests/support/seed_judge.rs"]
+mod seed_judge;
 use l23_pair13::l23_r2_route_rows;
 
 /// Signed stranger filing naming A's pot: a real /record budget and SHED-M1 route pin.

@@ -46,6 +46,8 @@ async fn main() {
     let port = SeedDb {
         db: std::cell::RefCell::new(db),
         now: now * 1000,
+        tip: Some(900_000),
+        out: std::cell::RefCell::new(String::new()),
     };
     let games: Vec<_> = (0..270).map(|n| format!("a1{n:062x}")).collect();
     for games in games.chunks(16) {
@@ -53,6 +55,7 @@ async fn main() {
             .await
             .unwrap();
     }
+    print!("{}", port.out.borrow());
     let counts: (u64, u64, u64, u64) = port.db.borrow().query_row(
         "SELECT (SELECT COUNT(*) FROM potparty_records WHERE identity=?1),(SELECT COUNT(*) FROM hopparty_records WHERE identity=?1),(SELECT COUNT(*) FROM owed_rows WHERE identity=?1),(SELECT COUNT(*) FROM owed_dirty WHERE identity=?1)",
         [id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
@@ -74,107 +77,6 @@ async fn main() {
 #[path = "../tests/support/l23_pair13.rs"]
 mod l23_pair13;
 
-struct SeedDb {
-    db: std::cell::RefCell<rusqlite::Connection>,
-    now: u64,
-}
-impl low_app_layer::pot_hook::SqlPort for SeedDb {
-    async fn run_batch(
-        &self,
-        statements: Vec<low_app_layer::pot_hook::Stmt>,
-    ) -> Result<Vec<low_app_layer::pot_hook::StmtOut>, String> {
-        use low_app_layer::pot_hook::Bind;
-        use rusqlite::types::{Value, ValueRef};
-        let mut db = self.db.borrow_mut();
-        let tx = db.transaction().map_err(|e| e.to_string())?;
-        let mut results = Vec::new();
-        for statement in statements {
-            let mut query = tx
-                .prepare_cached(&statement.sql)
-                .map_err(|e| e.to_string())?;
-            let readonly = query.readonly();
-            let names: Vec<_> = query
-                .column_names()
-                .into_iter()
-                .map(str::to_owned)
-                .collect();
-            let values = statement.binds.iter().map(|bind| match bind {
-                Bind::Text(s) => Value::Text(s.clone()),
-                Bind::Int(n) => Value::Integer(*n),
-                Bind::Null => Value::Null,
-            });
-            let rows = query
-                .query_map(rusqlite::params_from_iter(values), |row| {
-                    let mut object = serde_json::Map::new();
-                    for (index, name) in names.iter().enumerate() {
-                        let value = match row.get_ref(index)? {
-                            ValueRef::Null => serde_json::Value::Null,
-                            ValueRef::Integer(n) => serde_json::json!(n),
-                            ValueRef::Real(n) => serde_json::json!(n),
-                            ValueRef::Text(s) => serde_json::json!(std::str::from_utf8(s).unwrap()),
-                            ValueRef::Blob(b) => serde_json::json!(hex::encode(b)),
-                        };
-                        object.insert(name.clone(), value);
-                    }
-                    Ok(serde_json::Value::Object(object))
-                })
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
-            if !readonly {
-                let literals: Vec<_> = statement
-                    .binds
-                    .iter()
-                    .map(|bind| match bind {
-                        Bind::Text(s) => format!("'{}'", s.replace('\'', "''")),
-                        Bind::Int(n) => n.to_string(),
-                        Bind::Null => "NULL".to_string(),
-                    })
-                    .collect();
-                let mut expanded = String::new();
-                let mut chars = statement.sql.chars().peekable();
-                while let Some(ch) = chars.next() {
-                    if ch == '?' {
-                        let mut number = String::new();
-                        while chars.peek().is_some_and(|ch| ch.is_ascii_digit()) {
-                            number.push(chars.next().unwrap());
-                        }
-                        expanded.push_str(&literals[number.parse::<usize>().unwrap() - 1]);
-                    } else {
-                        expanded.push(ch);
-                    }
-                }
-                println!("{expanded};");
-            }
-            results.push(low_app_layer::pot_hook::StmtOut {
-                rows,
-                changes: Some(tx.changes()),
-            });
-        }
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(results)
-    }
-    async fn counters(&self, _: Vec<(String, u64)>) {}
-    fn now_ms(&self) -> u64 {
-        self.now
-    }
-    fn log(&self, _: &str) {}
-}
-impl low_app_layer::owed_judge::JudgeDb for SeedDb {
-    fn tip(&self) -> Option<u64> {
-        Some(900_000)
-    }
-    async fn word_views(
-        &self,
-        rows: &std::collections::BTreeMap<String, low_app_layer::tracker_host::stored::Row>,
-    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, String> {
-        Ok(rows
-            .iter()
-            .map(|(id, row)| (id.clone(), row.view()))
-            .collect())
-    }
-    async fn canonical_root(&self, _: u64) -> Option<String> {
-        None
-    }
-    async fn push(&self, _: &str, _: serde_json::Value) {}
-}
+#[path = "../tests/support/seed_judge.rs"]
+mod seed_judge;
+use seed_judge::SeedDb;
