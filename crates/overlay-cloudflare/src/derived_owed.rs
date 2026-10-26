@@ -23,8 +23,8 @@ pub const ROW_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_row_words (i
 /// Coalesced dirty subjects. Generation aliases an AUTOINCREMENT rowid that is never reused after a drain.
 /// A re-mark advances it, so a judge acknowledging `generation <= seen` leaves newer work pending.
 /// `downgrade` is the mark's CLASS (the third delta lens's D3-L1): 1 when the write may take a press away (the index
-/// recording a spend, a pot row admitted or deleted, an eviction), the only marks the read withholds a press over; a
-/// re-mark keeps the larger class until the judge acknowledges it. Edited in place: the table has shipped nowhere
+/// recording a spend, a pot row admitted or deleted, an eviction, a word refusing its transaction), the only marks the
+/// read withholds a press over; a re-mark keeps the larger class until the judge acknowledges it. Edited in place: the table has shipped nowhere
 /// (beta and prod certify 349).
 pub const DIRTY_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_dirty (generation INTEGER PRIMARY KEY AUTOINCREMENT, identity TEXT NOT NULL, gameId TEXT NOT NULL, source TEXT NOT NULL, sourceKey TEXT NOT NULL, markedAtMs INTEGER NOT NULL, downgrade INTEGER NOT NULL DEFAULT 0, UNIQUE (identity, gameId, source, sourceKey))";
 /// Evidence written beside an eviction's released spends, one identity per released hop.
@@ -101,8 +101,8 @@ pub const ROW_DELETE: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_delete_word
 // SQLite assigns the attempted insert a fresh AUTOINCREMENT value before checking the unique key;
 // keep excluded.generation and the newest mark's fields so an in-flight judge cannot erase the re-mark.
 // The mark's class (`downgrade`, D3-L1) is an expression over the row: "0" for every source but the pot's spend
-// columns, its admission (D4-L1), its delete and the eviction; a re-mark keeps the larger class (MAX), so a stamp
-// after a spend leaves it.
+// columns, its admission (D4-L1), its delete, the eviction and a refusing word (D4-N3); a re-mark keeps the larger
+// class (MAX), so a stamp after a spend leaves it.
 macro_rules! mark {
     ($source:literal, $key:expr, $at:expr, $subjects:expr) => {
         mark!(class "0", $source, $key, $at, $subjects, " WHERE 1")
@@ -404,33 +404,45 @@ macro_rules! word_link_subjects {
         )
     };
 }
+/// A word's mark class (the fourth delta lens's D4-N3, the ruling): a DOWNGRADE when the word refuses its transaction
+/// as the judge reads a refusal (`owed::funding_refusal_word`: a chain-tier `rejected` or `conflicted`, or #598's
+/// producer mark `trackerTerminal` on a word that is not `mined`), so a refund press over a funding the network refused
+/// is withheld at the read until the judge takes it; every other word is a plain mark. The JSON is read only behind
+/// `json_valid` (a malformed body is no refusal, never an error in the source statement). Leading whitespace before
+/// each `CASE` for wrangler 4.54's splitter.
+macro_rules! word_class {
+    () => {
+        " CASE WHEN NEW.tier='chain' AND NEW.word IN ('rejected','conflicted') THEN 1 WHEN NEW.word='mined' THEN 0 WHEN json_valid(NEW.legacy_body) THEN json_type(NEW.legacy_body,'$.trackerTerminal') IS 'true' ELSE 0 END"
+    };
+}
+
 /// The first tracker word, including a txid no stored owed row names yet.
 pub const WORD_INSERT: &str = trigger!(
     "tx_words",
     insert,
     INSERT,
-    mark!("word", "NEW.txid", "NEW.updated_at", word_subjects!())
+    mark!(class word_class!(), "word", "NEW.txid", "NEW.updated_at", word_subjects!())
 );
 /// A tracker word or checked proof changing through the UPSERT's UPDATE arm.
 pub const WORD_UPDATE: &str = trigger!(
     "tx_words",
     update,
     "UPDATE OF word,height,proof_root,header_hash",
-    mark!("word", "NEW.txid", "NEW.updated_at", word_subjects!())
+    mark!(class word_class!(), "word", "NEW.txid", "NEW.updated_at", word_subjects!())
 );
 /// The first word's linked hop subjects, split from the five direct arms for D1's compound limit.
 pub const WORD_LINK_INSERT: &str = trigger!(
     "tx_words",
     insert_links,
     INSERT,
-    mark!("word", "NEW.txid", "NEW.updated_at", word_link_subjects!())
+    mark!(class word_class!(), "word", "NEW.txid", "NEW.updated_at", word_link_subjects!())
 );
 /// A changed word's linked hop subjects, in the same source transaction as the direct arms.
 pub const WORD_LINK_UPDATE: &str = trigger!(
     "tx_words",
     update_links,
     "UPDATE OF word,height,proof_root,header_hash",
-    mark!("word", "NEW.txid", "NEW.updated_at", word_link_subjects!())
+    mark!(class word_class!(), "word", "NEW.txid", "NEW.updated_at", word_link_subjects!())
 );
 
 macro_rules! beef_subjects {

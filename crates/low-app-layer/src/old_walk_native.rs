@@ -839,6 +839,109 @@ mod pins {
         assert_eq!(w, j, "the walk and the write path's judgement store the same press");
     }
 
+    /// The fourth delta lens's D4-N3 (the ruling: a word refusing a refund's funding is a DOWNGRADE for the refund
+    /// press). The seat files its backup over an indexed pot whose funding the network holds (`network_seen`) and
+    /// whose gate is open: the stored row is a `refund-due` press. Arcade then answers the pot REJECTED on its
+    /// callback, the word stored as this tip's producer stores it (#598's mark, the tracker keeping `seen`): the read
+    /// withholds the press (`pendingSource: "word"`) until the drain, whose judgement is FIX-831's (`funding-not-held`,
+    /// `fundingHeld: refused`). RED on ae41223c: the word's mark was plain and the read served the stored press.
+    #[tokio::test]
+    async fn d4n3_a_refused_funding_word_withholds_the_refund_press_until_the_drain() {
+        use crate::record_post::{self, tests as rp, DoorOutcome, RecordKind};
+        let judge = SqliteSql::migrated();
+        judge.now.set(NOW_MS);
+        judge.tip.set(Some(TIP));
+        let victim = rp::wallet(0x44);
+        let id = hex::encode(rp::identity(&victim));
+        let game = [0x7c; 32];
+        let pot = hex::encode(rp::POT_TXID);
+        rp::md_index_the_pot(&judge);
+        rp::md_seat(&judge, &id, &game);
+        judge
+            .conn
+            .execute(
+                "INSERT INTO network_seen (txid, seenAt) VALUES (?1, ?2)",
+                rusqlite::params![pot, (NOW_MS / 1000) as i64],
+            )
+            .unwrap();
+        // the overlay's `seen` word for the pot, as the producer stores it
+        crate::owed::tests::produce_words(&judge.conn, &pot, &[], true, NOW_MS / 1000 - 600);
+        let script = rp::potrefund_script(&victim, &game, &rp::presigned_refund());
+        let mut filing = record_post::verify_record_post(RecordKind::Potrefund, &script, &id).unwrap();
+        let out = record_post::file_verified(&judge, &mut filing, &id, (NOW_MS / 1000) as i64)
+            .await
+            .unwrap();
+        assert!(matches!(out, DoorOutcome::Written { row_written: true }), "{out:?}");
+        let drain = || async {
+            for _ in 0..100 {
+                let r = crate::owed_judge::drain_dirty(&judge, 64).await.unwrap();
+                assert!(r.faults.is_empty(), "{:?}", r.faults);
+                if r.subjects == 0 {
+                    break;
+                }
+            }
+        };
+        drain().await;
+        let served = || async {
+            let snapshot = crate::owed_read::read(&judge, &id).await.unwrap();
+            let words: BTreeMap<_, _> = snapshot
+                .word_rows()
+                .unwrap()
+                .into_iter()
+                .map(|(t, row)| (t, row.view()))
+                .collect();
+            let body = snapshot.body(&id, Some(TIP), &words).unwrap();
+            body["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["family"] == "refund-due" || r["facts"]["claim"] == "funding-not-held")
+                .cloned()
+                .unwrap_or_else(|| panic!("the pot's refund row: {body}"))
+        };
+        let row = served().await;
+        assert_eq!(row["family"], "refund-due", "{row}");
+        assert_eq!(row["facts"]["claimable"], true, "the press before the word: {row}");
+
+        // Arcade refuses the funding: the callback's word, stored by the producer
+        let rejected = format!(
+            r#"{{"txid":"{pot}","txStatus":"REJECTED","extraInfo":"arc error 461: missing inputs"}}"#
+        );
+        let word = crate::owed::tests::produce_words(
+            &judge.conn,
+            &pot,
+            &[rejected.as_str()],
+            false,
+            NOW_MS / 1000 - 300,
+        );
+        assert_eq!(
+            word.word, "seen",
+            "the tracker keeps the word (NS-3): only the mark says refused"
+        );
+        let row = served().await;
+        assert_eq!(
+            row["facts"]["claimable"], false,
+            "a refused funding word withholds the refund press until the drain: {row}"
+        );
+        assert_eq!(row["facts"]["pendingSource"], "word", "{row}");
+        let class: i64 = judge
+            .conn
+            .query_row(
+                "SELECT MAX(downgrade) FROM owed_dirty WHERE identity=?1 AND source='word'",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(class, 1, "the refusal's word mark is a downgrade");
+
+        drain().await;
+        let row = served().await;
+        assert_eq!(row["facts"]["claim"], crate::owed::FUNDING_NOT_HELD_CLAIM, "{row}");
+        assert_eq!(row["facts"]["fundingHeld"], crate::owed::FUNDING_HELD_REFUSED, "{row}");
+        assert_eq!(row["facts"]["claimable"], false, "{row}");
+        assert!(row["facts"].get("refresh").is_none(), "{row}");
+    }
+
     #[tokio::test]
     async fn d2fold_medium3_smoke_the_old_walk_runs_natively() {
         let made = (NOW_MS as i64 - 2 * 3_600_000) / 1000;
