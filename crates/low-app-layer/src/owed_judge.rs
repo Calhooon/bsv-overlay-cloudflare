@@ -1006,6 +1006,7 @@ pub(crate) fn assert_fixture_roundtrip(i: &OwedInputs<'_>) {
         state: Some(json!({"computedAtMs":i.now_ms,"tip":i.tip,"truncated":0})),
         pending: 0,
         wanted: false,
+        downgrades: BTreeMap::new(),
     };
     let empty = BTreeMap::new();
     let mut served = snapshot

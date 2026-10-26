@@ -123,3 +123,85 @@ async fn d2delta2_m1_b_the_block_dated_class_precedes_the_backoff_relooks() {
         "the rest of the tick to the back-off re-looks"
     );
 }
+/// D2-L1 (the captain's ruling: a read never does work, but never serves a press over a pending downgrade). The index
+/// records a COMPETING spend of the owner's index-unspent hop (`pot_records.spent = 1`, the trigger's `pot` mark) while
+/// the game's mark waits for a drain: the read serves the row with its press withheld as re-judging (`refresh:
+/// "pending"`, the mark's source stated); the drain then downgrades it. An eviction's mark withholds the same way; a
+/// filing's, a tip's or a wanted mark does not. RED on 6ec6eb9a: the stale press was served (`claimable: true`).
+#[tokio::test]
+async fn d2delta2_l1_a_pending_downgrade_withholds_the_press_until_the_drain() {
+    let db = Db::new();
+    seed_stranded_hop(&db, "owner", "g00", &hop(0));
+    seed_stranded_hop(&db, "other", "g01", &hop(1));
+    drain_all(&db).await;
+    let op = format!("{}:0", hop(0));
+    let body = served(&db, "owner", Some(900_000)).await;
+    assert_eq!(
+        row_of(&body, &op).unwrap()["facts"]["claimable"],
+        true,
+        "{body}"
+    );
+
+    // a filing's, a tip's and a wanted mark withhold nothing
+    for (source, key) in [("sweep", "aa"), ("tip", "gate"), ("wanted", "wanted")] {
+        db.exec(&format!("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner','g00','{source}','{key}',{})", db.now.get()));
+        let body = served(&db, "owner", Some(900_000)).await;
+        assert_eq!(
+            row_of(&body, &op).unwrap()["facts"]["claimable"],
+            true,
+            "{source}: {body}"
+        );
+        db.exec("DELETE FROM owed_dirty");
+    }
+
+    // the competitor recorded by the index; the mark waits
+    let rival = "cc".repeat(32);
+    db.exec(&format!(
+        "UPDATE pot_records SET spent=1,spendingTxid='{rival}' WHERE txid='{}' AND outputIndex=0",
+        hop(0)
+    ));
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_dirty WHERE identity='owner' AND source='pot'"),
+        1
+    );
+    let body = served(&db, "owner", Some(900_000)).await;
+    let row = row_of(&body, &op).unwrap();
+    assert_eq!(
+        row["facts"]["claimable"], false,
+        "no press over a pending downgrade: {row}"
+    );
+    assert_eq!(row["facts"]["refresh"], "pending", "{row}");
+    assert_eq!(row["facts"]["pendingSource"], "pot", "{row}");
+    assert_eq!(row["facts"]["claimableBeforePending"], true, "{row}");
+    // across a block too
+    let row = row_of(&served(&db, "owner", Some(900_001)).await, &op)
+        .unwrap()
+        .clone();
+    assert_eq!(row["facts"]["claimable"], false, "{row}");
+    // another identity's game is untouched
+    let other = format!("{}:0", hop(1));
+    let body = served(&db, "other", Some(900_000)).await;
+    assert_eq!(
+        row_of(&body, &other).unwrap()["facts"]["claimable"],
+        true,
+        "{body}"
+    );
+
+    // the drain lifts it: the row is downgraded
+    drain_all(&db).await;
+    let body = served(&db, "owner", Some(900_000)).await;
+    if let Some(row) = row_of(&body, &op) {
+        assert_ne!(row["facts"]["claimable"], true, "{row}");
+        assert!(row["facts"].get("refresh").is_none(), "{row}");
+    }
+
+    // an eviction's mark withholds the same way
+    seed_stranded_hop(&db, "owner", "g02", &hop(2));
+    drain_all(&db).await;
+    let op2 = format!("{}:0", hop(2));
+    db.exec(&format!("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner','g02','eviction','{}',1)", "dd".repeat(32)));
+    let body = served(&db, "owner", Some(900_000)).await;
+    let row = row_of(&body, &op2).unwrap();
+    assert_eq!(row["facts"]["claimable"], false, "{row}");
+    assert_eq!(row["facts"]["pendingSource"], "eviction", "{row}");
+}

@@ -312,7 +312,7 @@
       "censusKey": "/health/invariants"
     },
     "owed-fleet-read": {
-      "route": "/owed?identity=OWED_SEAT: unchanged 250 results and 270 hops, written through the per-game judge into 500 stored rows",
+      "route": "/owed?identity=OWED_SEAT: unchanged 250 results and 270 hops, written through the per-game judge into 500 stored rows. Re-run by lane D2-OWED-FOLD-4 (2026-10-26): unchanged, 2,000 reads, 3 statements (the second delta lens's D2-L1: the pending count names the games' undrained downgrade marks in the same statement, over the covering UNIQUE index; it reads the identity's pending marks, which the count already read, so no row and no statement is added; the seed holds none)",
       "measured": {
         "reads": 2000,
         "writes": 0,
