@@ -326,12 +326,14 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         {
             Ok(r) if r.identities > 0 || r.stop != owed_backfill::Stop::Stamped => {
                 worker::console_log!(
-                    "[owed-backfill] {:?}: {} identities, {} rows, {} batches, cursor {:?}",
+                    "[owed-backfill] {:?}: {} identities, {} rows, {} batches, cursor {:?}, evictions {}, skipped evictions {:?}",
                     r.stop,
                     r.identities,
                     r.rows,
                     r.batches,
-                    r.cursor
+                    r.cursor,
+                    r.evictions,
+                    r.skipped_evictions
                 )
             }
             Ok(_) => {}

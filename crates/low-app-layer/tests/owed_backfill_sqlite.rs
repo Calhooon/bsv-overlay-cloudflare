@@ -747,3 +747,65 @@ async fn fold8_c_the_evidence_phase_visits_each_open_eviction_once_and_ends() {
     assert_eq!(again.evictions, 0);
     assert_eq!(statements(&db, backfill::EVICTIONS_SQL), 0);
 }
+
+/// D2-OWED-FOLD-9, the fifth delta lens's DELTA5-L1: an eviction whose batch faults on every pass is counted on its
+/// own row, recorded and passed after [`backfill::OWED_BACKFILL_IDENTITY_FAULTS_MAX`] passes (the identity loop's
+/// LOW-1 bound), so one eviction cannot hold the evidence phase, every identity and the stamp back. The evictions
+/// after it are written; the skipped one is named (its row, its counter, the report) and its outpoints stay unjudged
+/// by the phase, never silent. Literal names only, so the pin compiles on the base (708b08c8) and is RED there: the
+/// third pass faults like the first two and the stamp is never written.
+#[tokio::test]
+async fn fold9_l1_an_eviction_faulting_every_pass_is_skipped_and_counted_after_three() {
+    let wedged = "aa00000000000000000000000000000000000000000000000000000000000000";
+    let honest = "bb00000000000000000000000000000000000000000000000000000000000000";
+    let db = Db::new();
+    for (txid, seat, hop) in [(wedged, "seat-a", "a1"), (honest, "seat-b", "b1")] {
+        db.exec(&format!("INSERT INTO potparty_records_evicted(identity,potTxid,gameId,opponentIdentity,seatSettlePubkey,sigValid) VALUES ('{seat}','{txid}','g-{seat}','o','02aa',1)"));
+        db.exec(&format!("INSERT INTO pot_evictions(txid,reason,evictedAt,releasedSpends) VALUES ('{txid}','R',5,'[{{\"table\":\"pot_records\",\"txid\":\"{hop}{}\",\"vout\":0}}]')", "0".repeat(62)));
+    }
+    db.exec(&format!("CREATE TRIGGER wedge BEFORE INSERT ON released_hop_evidence_missing WHEN NEW.potTxid='{wedged}' BEGIN SELECT RAISE(ABORT,'wedged'); END;"));
+    db.certify(backfill::OWED_TRIGGERS_MIGRATION_COUNT);
+    backfill::backfill_pass(&db, &open_deadline(&db))
+        .await
+        .unwrap(); // armed
+    for pass in 1..backfill::OWED_BACKFILL_IDENTITY_FAULTS_MAX {
+        let r = backfill::backfill_pass(&db, &open_deadline(&db)).await;
+        assert!(r.is_err(), "pass {pass}: the fault is the pass's: {r:?}");
+        assert_eq!(
+            db.count("SELECT COUNT(*) FROM released_hop_evidence_missing WHERE potTxid LIKE 'bb%'"),
+            0,
+            "pass {pass}: the phase stops at the faulted eviction"
+        );
+    }
+    let r = backfill::backfill_pass(&db, &open_deadline(&db)).await;
+    let r = r.expect("the third faulted pass records the eviction and goes on");
+    assert_eq!(
+        db.count(&format!("SELECT COUNT(*) FROM owed_belt_state WHERE name='backfill:owed-v2:skipped-eviction:{wedged}' AND cursor LIKE '%wedged%'")),
+        1,
+        "recorded with its fault"
+    );
+    assert_eq!(
+        db.counters.borrow()["owed_backfill_skipped_evictions_total"],
+        1
+    );
+    assert_eq!(
+        db.count(&format!("SELECT COUNT(*) FROM released_hop_evidence_missing WHERE potTxid='{honest}' AND identity='seat-b'")),
+        1,
+        "the eviction after it is written"
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM owed_belt_state WHERE name='backfill:owed-v2:evictions' AND cursor='~'"),
+        1,
+        "the phase is done"
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-v2'"),
+        1,
+        "the identities are visited and the stamp written: {r:?}"
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM owed_belt_state WHERE name='backfill:owed-v2:eviction-faults' AND cursor<>'{}'"),
+        0,
+        "the fault count is cleared once the eviction is passed"
+    );
+}

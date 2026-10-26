@@ -50,6 +50,9 @@ pub const OWED_AGE_REMARKS_PER_PASS: usize = 128;
 pub const OWED_BACKFILL_IDENTITY_FAULTS_MAX: usize = 3;
 /// The `owed_belt_state` row counting the open identity's consecutive faulted passes (`{"identity":..,"faults":n}`).
 pub const OWED_BACKFILL_FAULTS: &str = "backfill:owed-v2:faults";
+/// The `owed_belt_state` row counting the faulted eviction's consecutive faulted passes (`{"txid":..,"faults":n}`;
+/// D2-OWED-FOLD-9, the fifth delta lens's DELTA5-L1: the evidence phase takes the identity loop's LOW-1 bound).
+pub const OWED_BACKFILL_EVICTION_FAULTS: &str = "backfill:owed-v2:eviction-faults";
 /// The `owed_belt_state` row holding the last eviction the evidence phase wrote ('' or absent before the first).
 pub const OWED_BACKFILL_EVICTIONS: &str = "backfill:owed-v2:evictions";
 /// The evidence phase's cursor once its last page was short: past every hex txid, so the page read finds none.
@@ -64,6 +67,7 @@ pub const COUNTER_SKIPPED: &str = "owed_backfill_skipped_identities_total";
 pub const COUNTER_EVICTIONS: &str = "owed_backfill_evictions_total";
 pub const COUNTER_EVIDENCE: &str = "owed_backfill_evidence_candidates_total";
 pub const COUNTER_MISSING: &str = "owed_backfill_evidence_missing_total";
+pub const COUNTER_SKIPPED_EVICTIONS: &str = "owed_backfill_skipped_evictions_total";
 pub fn counter_names() -> Vec<String> {
     [
         COUNTER_IDENTITIES,
@@ -73,6 +77,7 @@ pub fn counter_names() -> Vec<String> {
         COUNTER_EVICTIONS,
         COUNTER_EVIDENCE,
         COUNTER_MISSING,
+        COUNTER_SKIPPED_EVICTIONS,
     ]
     .map(str::to_owned)
     .to_vec()
@@ -81,7 +86,7 @@ pub fn counter_names() -> Vec<String> {
 /// The stamped replay's one statement: a primary-key read of one row.
 pub const STAMP_SQL: &str = "SELECT 1 AS stamped FROM view_derivation_state WHERE name='owed-v2'";
 /// The gate (the overlay's certified migration list) and both cursor rows, each a primary-key read.
-pub const GATE_SQL: &str = "SELECT (SELECT value FROM ops_counters WHERE name='overlay_migration_count') AS count,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2') AS cursor,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:open') AS open,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:faults') AS faults,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:evictions') AS evictions";
+pub const GATE_SQL: &str = "SELECT (SELECT value FROM ops_counters WHERE name='overlay_migration_count') AS count,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2') AS cursor,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:open') AS open,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:faults') AS faults,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:evictions') AS evictions,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:eviction-faults') AS evictionFaults";
 /// The open evictions past the cursor, ascending, each naming no evidence row of its own for any released outpoint
 /// (an eviction the writer saw has them; each probe a primary-key search of the evidence by outpoint).
 pub const EVICTIONS_SQL: &str = "SELECT e.txid,e.releasedSpends FROM pot_evictions e WHERE e.txid>?1 AND e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r JOIN released_hop_evidence h ON h.hopTxid=lower(json_extract(r.value,'$.txid')) AND h.hopVout=json_extract(r.value,'$.vout') WHERE h.potTxid=e.txid AND h.evictedAt=e.evictedAt) ORDER BY e.txid LIMIT ?2";
@@ -130,6 +135,11 @@ pub const EVICTIONS_CURSOR_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,
 pub const FAULTS_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:faults',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// An identity passed by after its faults: its row names the last fault (bounded), its marks stay for the drain.
 pub const SKIPPED_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:skipped:'||?1,?2,?3) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+/// The faulted eviction's count, written by a faulted pass and cleared ('{}') by its eviction's save or its skip.
+pub const EVICTION_FAULTS_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:eviction-faults',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+/// An eviction passed by after its faults: its row names the last fault (bounded); its outpoints get no evidence and
+/// no missing row from the phase (the drain, the age repair and every source mark still judge its seats).
+pub const SKIPPED_EVICTION_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:skipped-eviction:'||?1,?2,?3) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// Arm the cursor; a pass that finds it armed begins.
 pub const ARM_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2','',?1) ON CONFLICT(name) DO NOTHING";
 /// The identities past the cursor, distinct and ascending, each side bounded on its own identity index.
@@ -183,6 +193,9 @@ pub struct BackfillReport {
     pub evictions: usize,
     pub evidence_candidates: u64,
     pub missing_outpoints: u64,
+    /// The open evictions recorded and passed this pass after [`OWED_BACKFILL_IDENTITY_FAULTS_MAX`] faulted passes
+    /// (D2-OWED-FOLD-9), named on the scheduled pass's line and the lever's answer.
+    pub skipped_evictions: Vec<String>,
     pub identities: usize,
     pub rows: usize,
     pub batches: usize,
@@ -329,16 +342,130 @@ fn first_beef(out: &[crate::pot_hook::StmtOut]) -> Option<Vec<u8>> {
         .find_map(crate::logic::decode_beef_hex)
 }
 
+/// One open eviction of the evidence phase: its reads, then one write batch (its evidence or missing rows, its cursor,
+/// and `clear` (the fault count cleared) when the count names it). `Ok(None)`: the wall fell first. The report's
+/// figures are added only once the batch landed.
+async fn evidence_one(
+    db: &impl JudgeDb,
+    deadline: &Deadline,
+    txid: &str,
+    released: &[(String, u32)],
+    clear: bool,
+    report: &mut BackfillReport,
+) -> Result<Option<()>, String> {
+    use overlay_discovery::pot::released_evidence::{evidence_writes, EvidenceWrite};
+    let Some(reads) = deadline
+        .run_reserving(db.run_batch(vec![
+            Stmt {
+                sql: SEAT_KEYS_SQL.into(),
+                binds: vec![Bind::Text(txid.to_owned())],
+            },
+            Stmt {
+                sql: STORED_BEEF_SQL.into(),
+                binds: vec![Bind::Text(txid.to_owned())],
+            },
+            Stmt {
+                sql: POT_BEEF_SQL.into(),
+                binds: vec![Bind::Text(txid.to_owned())],
+            },
+        ]))
+        .await
+    else {
+        return Ok(None);
+    };
+    let reads = reads?;
+    let seat_keys: Vec<String> = reads
+        .first()
+        .map(|o| {
+            o.rows
+                .iter()
+                .filter_map(|r| r["key"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut beef = first_beef(reads.get(1..).unwrap_or_default());
+    if beef.is_none() {
+        let Some(evicted) = deadline
+            .run_reserving(db.run_batch(vec![Stmt {
+                sql: EVICTED_BEEF_SQL.into(),
+                binds: vec![Bind::Text(txid.to_owned())],
+            }]))
+            .await
+        else {
+            return Ok(None);
+        };
+        beef = match evicted {
+            Ok(out) => first_beef(&out),
+            // the shadow the overlay makes at its first eviction: none yet is no bytes
+            Err(e) if e.contains("no such table") => None,
+            Err(e) => return Err(e),
+        };
+    }
+    let (mut candidates, mut missing) = (0u64, 0u64);
+    let mut writes = Vec::new();
+    for w in evidence_writes(beef.as_deref(), txid, released, &seat_keys) {
+        match w {
+            EvidenceWrite::Found(f) => {
+                candidates += 1;
+                writes.push(Stmt {
+                    sql: EVIDENCE_INSERT_SQL.into(),
+                    binds: vec![
+                        Bind::Text(txid.to_owned()),
+                        Bind::Text(f.hop_txid),
+                        Bind::Int(i64::from(f.hop_vout)),
+                        Bind::Text(f.seat_key),
+                        Bind::Int(f.sats),
+                    ],
+                });
+            }
+            EvidenceWrite::Missing { list, bytes_read } => {
+                missing += serde_json::from_str::<Vec<Value>>(&list).map_or(0, |l| l.len() as u64);
+                writes.push(Stmt {
+                    sql: MISSING_INSERT_SQL.into(),
+                    binds: vec![
+                        Bind::Text(txid.to_owned()),
+                        Bind::Text(list),
+                        Bind::Int(i64::from(bytes_read)),
+                    ],
+                });
+            }
+        }
+    }
+    writes.push(Stmt {
+        sql: EVICTIONS_CURSOR_SQL.into(),
+        binds: vec![Bind::Text(txid.to_owned()), Bind::Int(db.now_ms() as i64)],
+    });
+    if clear {
+        writes.push(Stmt {
+            sql: EVICTION_FAULTS_SQL.into(),
+            binds: vec![Bind::Text("{}".into()), Bind::Int(db.now_ms() as i64)],
+        });
+    }
+    let Some(out) = deadline.run_reserving(db.run_batch(writes)).await else {
+        return Ok(None);
+    };
+    out?;
+    report.evidence_candidates += candidates;
+    report.missing_outpoints += missing;
+    Ok(Some(()))
+}
+
 /// The evidence phase (D2-OWED-FOLD-8): the open evictions past `cursor` that name no evidence row, each written by
 /// the overlay's eviction writer's own checks and statements, its cursor saved in the same batch. `Ok(true)`: the
 /// phase is done, its cursor at [`EVICTIONS_DONE`]; `Ok(false)`: the wall fell first.
+///
+/// D2-OWED-FOLD-9 (the fifth delta lens's DELTA5-L1): an eviction whose reads or batch fault is counted across passes
+/// on [`OWED_BACKFILL_EVICTION_FAULTS`] (`faults`, as the gate read it); the pass is the fault's below the bound, and
+/// at [`OWED_BACKFILL_IDENTITY_FAULTS_MAX`] the eviction is recorded (`backfill:owed-v2:skipped-eviction:<txid>`, its
+/// fault), counted, named on the report, and the cursor moves past it, so one eviction cannot hold the identities and
+/// the stamp back. A page read that faults names no eviction and stays the pass's fault.
 async fn evidence_phase(
     db: &impl JudgeDb,
     deadline: &Deadline,
     mut cursor: String,
+    faults: &Value,
     report: &mut BackfillReport,
 ) -> Result<bool, String> {
-    use overlay_discovery::pot::released_evidence::{evidence_writes, EvidenceWrite};
     loop {
         if cursor == EVICTIONS_DONE {
             return Ok(true);
@@ -364,92 +491,63 @@ async fn evidence_phase(
                 .ok_or("open eviction without a txid")?
                 .to_owned();
             let released = released_of(e["releasedSpends"].as_str());
-            let Some(reads) = deadline
-                .run_reserving(db.run_batch(vec![
-                    Stmt {
-                        sql: SEAT_KEYS_SQL.into(),
-                        binds: vec![Bind::Text(txid.clone())],
-                    },
-                    Stmt {
-                        sql: STORED_BEEF_SQL.into(),
-                        binds: vec![Bind::Text(txid.clone())],
-                    },
-                    Stmt {
-                        sql: POT_BEEF_SQL.into(),
-                        binds: vec![Bind::Text(txid.clone())],
-                    },
-                ]))
-                .await
-            else {
-                return Ok(false);
-            };
-            let reads = reads?;
-            let seat_keys: Vec<String> = reads
-                .first()
-                .map(|o| {
-                    o.rows
-                        .iter()
-                        .filter_map(|r| r["key"].as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut beef = first_beef(reads.get(1..).unwrap_or_default());
-            if beef.is_none() {
-                let Some(evicted) = deadline
-                    .run_reserving(db.run_batch(vec![Stmt {
-                        sql: EVICTED_BEEF_SQL.into(),
-                        binds: vec![Bind::Text(txid.clone())],
-                    }]))
-                    .await
-                else {
-                    return Ok(false);
-                };
-                beef = match evicted {
-                    Ok(out) => first_beef(&out),
-                    // the shadow the overlay makes at its first eviction: none yet is no bytes
-                    Err(e) if e.contains("no such table") => None,
-                    Err(e) => return Err(e),
-                };
-            }
-            let mut writes = Vec::new();
-            for w in evidence_writes(beef.as_deref(), &txid, &released, &seat_keys) {
-                match w {
-                    EvidenceWrite::Found(f) => {
-                        report.evidence_candidates += 1;
-                        writes.push(Stmt {
-                            sql: EVIDENCE_INSERT_SQL.into(),
+            let counted = faults["txid"] == txid.as_str();
+            match evidence_one(db, deadline, &txid, &released, counted, report).await {
+                Ok(None) => return Ok(false),
+                Ok(Some(())) => report.evictions += 1,
+                Err(error) => {
+                    let seen = if counted {
+                        faults["faults"].as_u64().unwrap_or(0) as usize
+                    } else {
+                        0
+                    } + 1;
+                    let now = db.now_ms() as i64;
+                    if seen < OWED_BACKFILL_IDENTITY_FAULTS_MAX {
+                        db.run_batch(vec![Stmt {
+                            sql: EVICTION_FAULTS_SQL.into(),
                             binds: vec![
-                                Bind::Text(txid.clone()),
-                                Bind::Text(f.hop_txid),
-                                Bind::Int(i64::from(f.hop_vout)),
-                                Bind::Text(f.seat_key),
-                                Bind::Int(f.sats),
+                                Bind::Text(
+                                    serde_json::json!({"txid": txid, "faults": seen}).to_string(),
+                                ),
+                                Bind::Int(now),
                             ],
-                        });
+                        }])
+                        .await?;
+                        return Err(error);
                     }
-                    EvidenceWrite::Missing { list, bytes_read } => {
-                        report.missing_outpoints +=
-                            serde_json::from_str::<Vec<Value>>(&list).map_or(0, |l| l.len() as u64);
-                        writes.push(Stmt {
-                            sql: MISSING_INSERT_SQL.into(),
-                            binds: vec![
-                                Bind::Text(txid.clone()),
-                                Bind::Text(list),
-                                Bind::Int(i64::from(bytes_read)),
-                            ],
-                        });
-                    }
+                    db.log(&format!(
+                        "[owed-backfill] eviction {txid}: the evidence phase faulted on {seen} passes ({error}); recorded, no evidence written, passed"
+                    ));
+                    let reason: String = error.chars().take(200).collect();
+                    let Some(out) = deadline
+                        .run(db.run_batch(vec![
+                            Stmt {
+                                sql: SKIPPED_EVICTION_SQL.into(),
+                                binds: vec![
+                                    Bind::Text(txid.clone()),
+                                    Bind::Text(reason),
+                                    Bind::Int(now),
+                                ],
+                            },
+                            Stmt {
+                                sql: EVICTIONS_CURSOR_SQL.into(),
+                                binds: vec![Bind::Text(txid.clone()), Bind::Int(now)],
+                            },
+                            Stmt {
+                                sql: EVICTION_FAULTS_SQL.into(),
+                                binds: vec![Bind::Text("{}".into()), Bind::Int(now)],
+                            },
+                        ]))
+                        .await
+                    else {
+                        return Ok(false);
+                    };
+                    out?;
+                    db.counters(vec![(COUNTER_SKIPPED_EVICTIONS.into(), 1)])
+                        .await;
+                    report.skipped_evictions.push(txid.clone());
                 }
             }
-            writes.push(Stmt {
-                sql: EVICTIONS_CURSOR_SQL.into(),
-                binds: vec![Bind::Text(txid.clone()), Bind::Int(db.now_ms() as i64)],
-            });
-            let Some(out) = deadline.run_reserving(db.run_batch(writes)).await else {
-                return Ok(false);
-            };
-            out?;
-            report.evictions += 1;
             cursor = txid;
         }
         if short {
@@ -469,6 +567,14 @@ async fn evidence_phase(
             return Ok(true);
         }
     }
+}
+
+/// The faulted eviction's count as the gate read it (`Null` when none).
+fn eviction_faults(gate: &Value) -> Value {
+    gate["evictionFaults"]
+        .as_str()
+        .and_then(|f| serde_json::from_str(f).ok())
+        .unwrap_or_default()
 }
 
 async fn flush_evidence_counters(db: &impl SqlPort, report: &BackfillReport) {
@@ -515,7 +621,14 @@ pub async fn backfill_pass(
     // D2-OWED-FOLD-8: the evidence of the evictions made before the writer, before any identity is judged.
     let evictions = gate["evictions"].as_str().unwrap_or("").to_owned();
     if evictions != EVICTIONS_DONE {
-        let phase = evidence_phase(db, deadline, evictions, &mut report).await;
+        let phase = evidence_phase(
+            db,
+            deadline,
+            evictions,
+            &eviction_faults(&gate),
+            &mut report,
+        )
+        .await;
         flush_evidence_counters(db, &report).await;
         if !phase? {
             report.stop = Stop::Wall;
@@ -661,7 +774,14 @@ pub async fn evidence_pass(
     let evictions = gate["evictions"].as_str().unwrap_or("").to_owned();
     report.stop = Stop::Page;
     if evictions != EVICTIONS_DONE {
-        let phase = evidence_phase(db, deadline, evictions, &mut report).await;
+        let phase = evidence_phase(
+            db,
+            deadline,
+            evictions,
+            &eviction_faults(&gate),
+            &mut report,
+        )
+        .await;
         flush_evidence_counters(db, &report).await;
         if !phase? {
             report.stop = Stop::Wall;
@@ -749,6 +869,7 @@ pub async fn lever(req: worker::Request, env: &worker::Env) -> worker::Result<wo
             "evictions": r.evictions,
             "evidenceCandidates": r.evidence_candidates,
             "missingOutpoints": r.missing_outpoints,
+            "skippedEvictions": r.skipped_evictions,
             "identities": r.identities,
             "rows": r.rows,
             "batches": r.batches,
