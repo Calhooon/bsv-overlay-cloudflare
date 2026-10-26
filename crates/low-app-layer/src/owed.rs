@@ -9982,13 +9982,33 @@ pub(crate) mod tests {
         txid: &str,
         bodies: &[&str],
     ) -> std::collections::BTreeMap<String, Value> {
+        use crate::tracker_host::{stored, HeaderSnapshot};
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(stored::CREATE).unwrap();
+        let row = produce_words(&db, txid, bodies, true, 1_000);
+        let empty = HeaderSnapshot {
+            tip: Ok(0),
+            headers: Default::default(),
+        };
+        [(txid.to_string(), row.rechecked(&empty).unwrap())]
+            .into_iter()
+            .collect()
+    }
+
+    /// The writes of [`produced_word_views`] into `db` (a `tx_words` table already made): the overlay's `seen` event
+    /// when `seen_first`, then each `callback` body, 60 s apart from `start`; the stored row after the last.
+    pub(crate) fn produce_words(
+        db: &rusqlite::Connection,
+        txid: &str,
+        bodies: &[&str],
+        seen_first: bool,
+        start: u64,
+    ) -> crate::tracker_host::stored::Row {
         use crate::tracker_host::{runtime, stored, HeaderSnapshot};
         let empty = || HeaderSnapshot {
             tip: Ok(0),
             headers: Default::default(),
         };
-        let db = rusqlite::Connection::open_in_memory().unwrap();
-        db.execute_batch(stored::CREATE).unwrap();
         let read = |db: &rusqlite::Connection| -> Option<stored::Row> {
             db.query_row(
                 "SELECT tx_words.* FROM tx_words WHERE txid = ?1",
@@ -10025,16 +10045,19 @@ pub(crate) mod tests {
                 .unwrap();
         };
         let params = bsv_tracker::Params { age_threshold: 60 };
-        let mut now = 1_000;
-        // the overlay's `seen` event: the latch's broadcaster
-        let mut state = stored::seed_hint(None, txid);
-        runtime::event_hints(&mut state, "seen", true, None, now);
-        let mut row = stored::project(None, &state, now, None);
-        runtime::mark_terminal(&mut row, None, None);
-        write(&db, &row);
+        let mut now = start;
+        if seen_first {
+            // the overlay's `seen` event: the latch's broadcaster
+            let old = read(db);
+            let mut state = stored::seed_hint(old.as_ref(), txid);
+            runtime::event_hints(&mut state, "seen", true, None, now);
+            let mut row = stored::project(old.as_ref(), &state, now, None);
+            runtime::mark_terminal(&mut row, old.as_ref(), None);
+            write(db, &row);
+        }
         for body in bodies {
             now += 60;
-            let old = read(&db);
+            let old = read(db);
             let mut state = stored::seed_hint(old.as_ref(), txid);
             runtime::event_hints(&mut state, "callback", true, None, now);
             let v = bsv_tracker::Verdict::from_arc_body(txid, body.as_bytes()).unwrap();
@@ -10045,12 +10068,9 @@ pub(crate) mod tests {
                 .unwrap();
             let mut row = stored::project(old.as_ref(), &state, now, None);
             runtime::mark_terminal(&mut row, old.as_ref(), terminal);
-            write(&db, &row);
+            write(db, &row);
         }
-        let row = read(&db).unwrap();
-        [(txid.to_string(), row.rechecked(&empty()).unwrap())]
-            .into_iter()
-            .collect()
+        read(db).unwrap()
     }
 
     /// bsv-low #598 (the B-OWED-2 lens's HIGH-1, loop 22's p27/p28 shape): a SEEN-latched JOIN that Arcade then

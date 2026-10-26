@@ -237,8 +237,8 @@ async fn d3l1_a_only_a_downgrade_mark_withholds_the_press() {
 }
 
 /// D3-L1, the classes the triggers write: of the `owed_dirty` triggers only the pot row's spend columns, its moved key,
-/// its delete, an admission (D4-L1) and the eviction ledger write a downgrade; every other source is a plain
-/// mark. A pot row deleted (the eviction's shadow move) marks a downgrade.
+/// its delete, an admission (D4-L1) and the eviction ledger write a downgrade, and a word only when it refuses its
+/// transaction (D4-N3); every other source is a plain mark. A pot row deleted (the eviction's shadow move) marks a downgrade.
 #[test]
 fn d3l1_b_the_downgrade_class_is_written_by_the_spend_delete_and_eviction_triggers() {
     use bsv_overlay_cloudflare::derived_owed as d;
@@ -276,10 +276,6 @@ fn d3l1_b_the_downgrade_class_is_written_by_the_spend_delete_and_eviction_trigge
         d::COLLECTED_INSERT,
         d::SWEEP_INSERT,
         d::SEEN_INSERT,
-        d::WORD_INSERT,
-        d::WORD_UPDATE,
-        d::WORD_LINK_INSERT,
-        d::WORD_LINK_UPDATE,
         d::BEEF_INSERT,
         d::BEEF_UPDATE,
         d::REFUSAL_INSERT,
@@ -289,6 +285,18 @@ fn d3l1_b_the_downgrade_class_is_written_by_the_spend_delete_and_eviction_trigge
         d::SPENDER_BYTES_INSERT,
     ] {
         assert!(class(sql).iter().all(|c| c == "0"), "{sql}");
+    }
+    // the fourth delta lens's D4-N3: a word's class is its refusal, never a constant
+    for sql in [
+        d::WORD_INSERT,
+        d::WORD_UPDATE,
+        d::WORD_LINK_INSERT,
+        d::WORD_LINK_UPDATE,
+    ] {
+        assert!(
+            sql.contains(",'word',NEW.txid,NEW.updated_at, CASE WHEN NEW.tier='chain' AND NEW.word IN ('rejected','conflicted') THEN 1"),
+            "{sql}"
+        );
     }
 
     let db = Db::new();
