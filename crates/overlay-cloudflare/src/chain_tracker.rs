@@ -28,7 +28,8 @@ use serde::Deserialize;
 ///
 /// Endpoints used:
 /// - `GET /findHeaderHexForHeight?height={N}` — returns block header with merkle root
-/// - `GET /getPresentHeight` — returns current chain height
+/// - `GET /findChainTipHeaderHex` — the served, VERIFIED header tip (its height, hash and
+///   merkle root): the engine's chain tip (bsv-low #896), the reader the app layer's `/tip` uses
 pub struct WorkerChainTracker {
     base_url: String,
     /// When set, requests route through a Cloudflare SERVICE BINDING instead of a
@@ -39,7 +40,7 @@ pub struct WorkerChainTracker {
     /// `base_url` still supplies the request URL (only its PATH is used by the
     /// bound service; the host is resolved via the binding).
     service: Option<worker::Fetcher>,
-    /// Per-isolate `(fetched_at_ms, height)` memo for `current_height`
+    /// Per-isolate `(fetched_at_ms, tip)` memo for `current_height`
     /// (bsv-low #289): `ls_low`'s expiry filter resolves the tip on EVERY
     /// lobby poll, which was an uncached network subrequest each time. A tip
     /// is stale-tolerant by construction (blocks are ~10 min apart; the
@@ -47,7 +48,23 @@ pub struct WorkerChainTracker {
     /// memo is behaviourally invisible while removing the per-poll fetch.
     /// SUCCESS-ONLY: an error is never cached. `is_valid_root_for_height`
     /// (the SPV verify path) is deliberately untouched.
-    tip_cache: std::rc::Rc<std::cell::Cell<Option<(f64, u32)>>>,
+    tip_cache: TipCache,
+}
+
+/// The tracker's memo of its last verified tip and when it was read.
+type TipCache = std::rc::Rc<std::cell::RefCell<Option<(f64, EngineTip)>>>;
+
+/// bsv-low #896: chaintracks' served, verified header tip as the engine reads it (`GET /findChainTipHeaderHex`, the
+/// header chaintracks serves under the same validation ceiling as the proof headers `is_valid_root_for_height`
+/// reads). The height and the hash are one chaintracks row; never the couriers' `getPresentHeight` maximum.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineTip {
+    /// The verified tip's height.
+    pub height: u32,
+    /// Its block hash, lowercase hex.
+    pub hash: String,
+    /// Its merkle root, lowercase hex.
+    pub merkle_root: String,
 }
 
 /// How long a fetched chain tip is served from memory (30 s ≪ the ~10 min
@@ -71,9 +88,9 @@ fn now_ms() -> f64 {
     }
 }
 
-/// Pure cache-read: `Some(height)` iff a cached entry exists and is younger
+/// Pure cache-read: `Some(tip)` iff a cached entry exists and is younger
 /// than `ttl_ms`. Factored out for direct unit testing.
-fn tip_cache_read(cached: Option<(f64, u32)>, now_ms: f64, ttl_ms: f64) -> Option<u32> {
+fn tip_cache_read<T>(cached: Option<(f64, T)>, now_ms: f64, ttl_ms: f64) -> Option<T> {
     cached.and_then(|(at, height)| {
         // A clock that moved backwards (now < at) reads as fresh — harmless
         // for a 30 s tip memo, and impossible within one isolate anyway.
@@ -96,7 +113,7 @@ impl WorkerChainTracker {
         Self {
             base_url,
             service: None,
-            tip_cache: std::rc::Rc::new(std::cell::Cell::new(None)),
+            tip_cache: TipCache::default(),
         }
     }
 
@@ -107,8 +124,13 @@ impl WorkerChainTracker {
         Self {
             base_url,
             service: Some(service),
-            tip_cache: std::rc::Rc::new(std::cell::Cell::new(None)),
+            tip_cache: TipCache::default(),
         }
+    }
+
+    /// bsv-low #896: the verified header tip, its height and hash, from the tracker's 30 s memo or one request.
+    pub async fn verified_tip(&self) -> Result<EngineTip, ChainTrackerError> {
+        cached_verified_tip(&self.base_url, &self.service, &self.tip_cache).await
     }
 }
 
@@ -456,34 +478,75 @@ async fn ct_get_json(
     Ok((status, body))
 }
 
-/// The engine's chain tip from chaintracks, through `get` (a route and its answer): the Worker's binding in
-/// production, a fixture in the pins.
-pub(crate) async fn current_height_with<G, F>(get: G) -> Result<u32, ChainTrackerError>
+/// bsv-low #896: the engine's chain tip from chaintracks, through `get` (a route and its answer): the Worker's
+/// binding in production, a fixture in the pins. ONE request, `findChainTipHeaderHex`: the verified header tip.
+/// Every answer that is not a well formed verified header (a non-2xx, an error frame, a missing or malformed height,
+/// hash, merkle root or time) is a FAULT, never a height by a guess, and never the couriers' present height.
+pub(crate) async fn verified_tip_with<G, F>(get: G) -> Result<EngineTip, ChainTrackerError>
 where
     G: Fn(String) -> F,
     F: Future<Output = Result<(u16, serde_json::Value), ChainTrackerError>>,
 {
-    let (status, body) = get("getPresentHeight".into()).await?;
+    let (status, frame) = get("findChainTipHeaderHex".into()).await?;
     if !(200..300).contains(&status) {
         return Err(ChainTrackerError::InvalidResponse(format!(
-            "ChainTracks getPresentHeight returned HTTP {status}"
+            "ChainTracks findChainTipHeaderHex returned HTTP {status}"
         )));
     }
-    let frame: ResponseFrame<u32> = serde_json::from_value(body)
-        .map_err(|e| ChainTrackerError::InvalidResponse(format!("ChainTracks parse error: {e}")))?;
-
-    if !frame.is_success() {
+    if frame["status"] != "success" {
         return Err(ChainTrackerError::NetworkError(format!(
-            "ChainTracks getPresentHeight: status={}",
-            frame.status
+            "ChainTracks findChainTipHeaderHex: status={}",
+            frame["status"]
         )));
     }
-
-    frame.value.ok_or_else(|| {
-        ChainTrackerError::InvalidResponse(
-            "ChainTracks getPresentHeight: missing value".to_string(),
-        )
+    let value = &frame["value"];
+    let malformed = |what: &str| {
+        ChainTrackerError::InvalidResponse(format!(
+            "ChainTracks findChainTipHeaderHex: malformed or missing {what}"
+        ))
+    };
+    let hex64 = |key: &str| {
+        value[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| malformed(key))
+    };
+    let height = value["height"]
+        .as_u64()
+        .and_then(|h| u32::try_from(h).ok())
+        .ok_or_else(|| malformed("height"))?;
+    let hash = hex64("hash")?;
+    let merkle_root = hex64("merkleRoot")?;
+    // the app layer's reader refuses a tip frame with no time; so does the engine's (one reading of the frame)
+    value["time"]
+        .as_u64()
+        .and_then(|t| u32::try_from(t).ok())
+        .ok_or_else(|| malformed("time"))?;
+    Ok(EngineTip {
+        height,
+        hash,
+        merkle_root,
     })
+}
+
+/// The verified tip from `cache` while it is younger than [`TIP_CACHE_TTL_MS`], else one request through the
+/// binding; only a success is memoized.
+async fn cached_verified_tip(
+    base_url: &str,
+    service: &Option<worker::Fetcher>,
+    cache: &TipCache,
+) -> Result<EngineTip, ChainTrackerError> {
+    // Serve a fresh-enough memoized tip without a network subrequest
+    // (bsv-low #289: the per-lobby-poll tip read).
+    if let Some(tip) = tip_cache_read(cache.borrow().clone(), now_ms(), TIP_CACHE_TTL_MS) {
+        return Ok(tip);
+    }
+    let tip = verified_tip_with(|path| ct_get_json(base_url, service, path)).await?;
+    // Success-only write: an error result is never memoized.
+    *cache.borrow_mut() = Some((now_ms(), tip.clone()));
+    Ok(tip)
 }
 
 /// Manual `ChainTracker` impl that matches the `#[async_trait]` desugaring.
@@ -522,15 +585,9 @@ impl ChainTracker for WorkerChainTracker {
         let service = self.service.clone();
         let tip_cache = self.tip_cache.clone();
         Box::pin(UnsafeSendFuture(async move {
-            // Serve a fresh-enough memoized tip without a network subrequest
-            // (bsv-low #289 — the per-lobby-poll /getPresentHeight).
-            if let Some(height) = tip_cache_read(tip_cache.get(), now_ms(), TIP_CACHE_TTL_MS) {
-                return Ok(height);
-            }
-            let height = current_height_with(|path| ct_get_json(&base_url, &service, path)).await?;
-            // Success-only write: an error result is never memoized.
-            tip_cache.set(Some((now_ms(), height)));
-            Ok(height)
+            cached_verified_tip(&base_url, &service, &tip_cache)
+                .await
+                .map(|tip| tip.height)
         }))
     }
 }
@@ -575,7 +632,7 @@ mod tip_cache_tests {
 
     #[test]
     fn empty_cache_misses() {
-        assert_eq!(tip_cache_read(None, 1_000.0, TIP_CACHE_TTL_MS), None);
+        assert_eq!(tip_cache_read::<u32>(None, 1_000.0, TIP_CACHE_TTL_MS), None);
     }
 
     #[test]
@@ -592,5 +649,125 @@ mod tip_cache_tests {
             tip_cache_read(cached, 100_000.0 + TIP_CACHE_TTL_MS, TIP_CACHE_TTL_MS),
             None
         );
+    }
+}
+
+/// bsv-low #896: the engine's tip is chaintracks' VERIFIED header tip, never the couriers' present height.
+#[cfg(test)]
+mod e896 {
+    use super::{verified_tip_with, EngineTip};
+    use bsv_rs::transaction::ChainTrackerError;
+    use serde_json::{json, Value};
+    use std::{cell::RefCell, future::ready};
+
+    /// The couriers' maximum, one block past what chaintracks has verified.
+    const COURIER_MAX: u32 = 972_186;
+    /// Chaintracks' served, verified header tip.
+    const VERIFIED_HEIGHT: u32 = 972_185;
+
+    fn verified_hash() -> String {
+        "0000000000000000".to_string() + &"5a".repeat(24)
+    }
+
+    fn tip_frame() -> Value {
+        json!({"status": "success", "value": {
+            "height": VERIFIED_HEIGHT,
+            "hash": verified_hash().to_ascii_uppercase(),
+            "merkleRoot": "a7".repeat(32),
+            "time": 1_792_000_000u64,
+            "version": 536_870_912u64
+        }})
+    }
+
+    /// Chaintracks as its routes answer: the verified tip and the couriers' maximum differ.
+    fn chaintracks(route: &str) -> Result<(u16, Value), ChainTrackerError> {
+        match route {
+            "findChainTipHeaderHex" => Ok((200, tip_frame())),
+            "getPresentHeight" => Ok((200, json!({"status": "success", "value": COURIER_MAX}))),
+            other => panic!("unexpected chaintracks route: {other}"),
+        }
+    }
+
+    /// RED on 8e5e73f7 (the read extracted unchanged, 6778f68e, the pin asking its height): `left: Some(972186)
+    /// right: Some(972185)`, the couriers' maximum.
+    #[tokio::test]
+    async fn e896_a_the_engine_tip_is_the_verified_header_not_the_courier_max() {
+        let calls = RefCell::new(Vec::new());
+        let tip = verified_tip_with(|route| {
+            calls.borrow_mut().push(route.clone());
+            ready(chaintracks(&route))
+        })
+        .await;
+        assert_eq!(
+            tip.as_ref().ok().map(|t| t.height),
+            Some(VERIFIED_HEIGHT),
+            "the verified header's height"
+        );
+        assert_eq!(
+            tip.ok(),
+            Some(EngineTip {
+                height: VERIFIED_HEIGHT,
+                hash: verified_hash(),
+                merkle_root: "a7".repeat(32),
+            }),
+            "its hash and root, one chaintracks row"
+        );
+        assert_eq!(
+            calls.into_inner(),
+            ["findChainTipHeaderHex"],
+            "one request, the verified tip"
+        );
+    }
+
+    /// A chaintracks fault stays a fault: no height by a guess, and never the couriers' maximum in its place.
+    #[tokio::test]
+    async fn e896_b_a_chaintracks_fault_is_a_fault_never_a_height() {
+        let mut faults: Vec<(&str, Result<(u16, Value), ChainTrackerError>)> = vec![
+            ("404", Ok((404, Value::Null))),
+            ("503", Ok((503, Value::Null))),
+            (
+                "error frame",
+                Ok((200, json!({"status": "error", "value": null}))),
+            ),
+            (
+                "transport",
+                Err(ChainTrackerError::NetworkError("binding".into())),
+            ),
+        ];
+        for (name, edit) in [
+            ("no height", ("height", Value::Null)),
+            (
+                "height past u32",
+                ("height", json!(u64::from(u32::MAX) + 1)),
+            ),
+            ("no hash", ("hash", Value::Null)),
+            ("short hash", ("hash", json!("5a5a"))),
+            ("hash not hex", ("hash", json!("zz".repeat(32)))),
+            ("no merkle root", ("merkleRoot", Value::Null)),
+            ("no time", ("time", Value::Null)),
+        ] {
+            let mut frame = tip_frame();
+            frame["value"][edit.0] = edit.1;
+            faults.push((name, Ok((200, frame))));
+        }
+        for (name, answer) in faults {
+            let answer = RefCell::new(Some(answer));
+            let calls = RefCell::new(Vec::new());
+            let tip = verified_tip_with(|route| {
+                calls.borrow_mut().push(route.clone());
+                let out = match route.as_str() {
+                    "findChainTipHeaderHex" => answer.borrow_mut().take().expect("asked once"),
+                    other => chaintracks(other),
+                };
+                ready(out)
+            })
+            .await;
+            assert!(tip.is_err(), "{name}: a fault, never a height: {tip:?}");
+            assert_eq!(
+                calls.into_inner(),
+                ["findChainTipHeaderHex"],
+                "{name}: no fallback to the couriers' present height"
+            );
+        }
     }
 }
