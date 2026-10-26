@@ -62,7 +62,7 @@ pub const COUNTER_ROWS: &str = "owed_backfill_rows_total";
 pub const COUNTER_AGED: &str = "owed_age_remarked_total";
 pub const COUNTER_SKIPPED: &str = "owed_backfill_skipped_identities_total";
 pub const COUNTER_EVICTIONS: &str = "owed_backfill_evictions_total";
-pub const COUNTER_EVIDENCE: &str = "owed_backfill_evidence_rows_total";
+pub const COUNTER_EVIDENCE: &str = "owed_backfill_evidence_candidates_total";
 pub const COUNTER_MISSING: &str = "owed_backfill_evidence_missing_total";
 pub fn counter_names() -> Vec<String> {
     [
@@ -177,10 +177,12 @@ pub enum Stop {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BackfillReport {
     pub stop: Stop,
-    /// Open evictions the evidence phase examined this pass, and the evidence and missing-evidence rows it wrote.
+    /// Open evictions the evidence phase examined this pass; the hop outputs paying a candidate key (each an evidence
+    /// statement run, the writer's checks 1 and 2 deciding the row); the released outpoints its bytes could not judge
+    /// (each named for every verified seat). Counted as issued, not by D1's `changes` (which counts trigger writes).
     pub evictions: usize,
-    pub evidence_rows: u64,
-    pub missing_rows: u64,
+    pub evidence_candidates: u64,
+    pub missing_outpoints: u64,
     pub identities: usize,
     pub rows: usize,
     pub batches: usize,
@@ -410,11 +412,10 @@ async fn evidence_phase(
                 };
             }
             let mut writes = Vec::new();
-            let mut kinds = Vec::new();
             for w in evidence_writes(beef.as_deref(), &txid, &released, &seat_keys) {
                 match w {
                     EvidenceWrite::Found(f) => {
-                        kinds.push(true);
+                        report.evidence_candidates += 1;
                         writes.push(Stmt {
                             sql: EVIDENCE_INSERT_SQL.into(),
                             binds: vec![
@@ -427,7 +428,8 @@ async fn evidence_phase(
                         });
                     }
                     EvidenceWrite::Missing { list, bytes_read } => {
-                        kinds.push(false);
+                        report.missing_outpoints +=
+                            serde_json::from_str::<Vec<Value>>(&list).map_or(0, |l| l.len() as u64);
                         writes.push(Stmt {
                             sql: MISSING_INSERT_SQL.into(),
                             binds: vec![
@@ -446,15 +448,7 @@ async fn evidence_phase(
             let Some(out) = deadline.run_reserving(db.run_batch(writes)).await else {
                 return Ok(false);
             };
-            let out = out?;
-            for (found, o) in kinds.iter().zip(&out) {
-                let n = o.changes.unwrap_or(0);
-                if *found {
-                    report.evidence_rows += n;
-                } else {
-                    report.missing_rows += n;
-                }
-            }
+            out?;
             report.evictions += 1;
             cursor = txid;
         }
@@ -481,8 +475,8 @@ async fn flush_evidence_counters(db: &impl SqlPort, report: &BackfillReport) {
     if report.evictions > 0 {
         db.counters(vec![
             (COUNTER_EVICTIONS.into(), report.evictions as u64),
-            (COUNTER_EVIDENCE.into(), report.evidence_rows),
-            (COUNTER_MISSING.into(), report.missing_rows),
+            (COUNTER_EVIDENCE.into(), report.evidence_candidates),
+            (COUNTER_MISSING.into(), report.missing_outpoints),
         ])
         .await;
     }
@@ -643,6 +637,39 @@ pub async fn backfill_pass(
     result.map(|()| report)
 }
 
+/// The evidence phase alone (`POST /internal/owed-backfill-pass?evidence=1`, the tier's measure of its cost per
+/// eviction): behind the same stamp and gate as [`backfill_pass`], only once the cursor is armed; `Stop::Page` when the
+/// phase is done, `Stop::Wall` when the wall fell first. A later [`backfill_pass`] finds it done and goes on.
+pub async fn evidence_pass(
+    db: &impl JudgeDb,
+    deadline: &Deadline,
+) -> Result<BackfillReport, String> {
+    let mut report = BackfillReport::default();
+    if !read(db, STAMP_SQL, vec![]).await?.is_empty() {
+        return Ok(report);
+    }
+    let gate = read(db, GATE_SQL, vec![]).await?;
+    let gate = gate.first().cloned().unwrap_or_default();
+    if !gate_open(gate["count"].as_f64()) {
+        report.stop = Stop::Gated;
+        return Ok(report);
+    }
+    if gate["cursor"].as_str().is_none() {
+        report.stop = Stop::Gated;
+        return Ok(report);
+    }
+    let evictions = gate["evictions"].as_str().unwrap_or("").to_owned();
+    report.stop = Stop::Page;
+    if evictions != EVICTIONS_DONE {
+        let phase = evidence_phase(db, deadline, evictions, &mut report).await;
+        flush_evidence_counters(db, &report).await;
+        if !phase? {
+            report.stop = Stop::Wall;
+        }
+    }
+    Ok(report)
+}
+
 /// The drain's daily re-mark of rows judged more than 24 h ago. Returns the marks written.
 pub async fn mark_aged(db: &impl SqlPort) -> Result<u64, String> {
     let now = db.now_ms() as i64;
@@ -682,6 +709,16 @@ pub async fn run_env(env: &worker::Env) -> Result<BackfillReport, String> {
     backfill_pass(&judge, &deadline).await
 }
 
+/// `?evidence=1`: the evidence phase alone under the backfill's own wall (the tier's lever, as `?aged=1`).
+async fn evidence_env(env: &worker::Env) -> Result<BackfillReport, String> {
+    let deadline =
+        crate::routes::worker_deadline(OWED_BACKFILL_WALL_MS, OWED_BACKFILL_SAVE_RESERVE_MS);
+    crate::schema::ensure_latch_columns(env).await;
+    let judge = owed_judge::D1Judge::new(env, None, crate::routes::written_off_before_ms_env(env))
+        .map_err(|e| e.to_string())?;
+    evidence_pass(&judge, &deadline).await
+}
+
 /// `POST /internal/owed-backfill-pass` (bearer `INTERNAL_TOKEN`): one pass, answered with its report (the tier's).
 pub async fn lever(req: worker::Request, env: &worker::Env) -> worker::Result<worker::Response> {
     if !crate::internal_events::internal_bearer_ok(&req, env) {
@@ -698,9 +735,20 @@ pub async fn lever(req: worker::Request, env: &worker::Env) -> worker::Result<wo
             Err(e) => worker::Response::error(format!("owed age repair faulted: {e}"), 503),
         };
     }
-    match run_env(env).await {
+    let evidence = req
+        .url()
+        .is_ok_and(|u| u.query_pairs().any(|(k, v)| k == "evidence" && v == "1"));
+    let run = if evidence {
+        evidence_env(env).await
+    } else {
+        run_env(env).await
+    };
+    match run {
         Ok(r) => worker::Response::from_json(&serde_json::json!({
             "stop": format!("{:?}", r.stop),
+            "evictions": r.evictions,
+            "evidenceCandidates": r.evidence_candidates,
+            "missingOutpoints": r.missing_outpoints,
             "identities": r.identities,
             "rows": r.rows,
             "batches": r.batches,

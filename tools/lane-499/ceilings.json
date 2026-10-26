@@ -436,19 +436,35 @@
       },
       "censusKey": null
     },
-    "owed-backfill-pass": {
-      "route": "POST /internal/owed-backfill-pass: the owed-v2 backfill over the READ lane's fleet seed turned back into an old worker's rows (no keys, no state, no marks): two identities, the lived-in seat's 270 games in 17 judge batches of 16 and the one-game wanted identity in one, the cursor saved after each, the stamp with the last save, one pass (bsv-low #893 section 6.1). Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 53,424 to 25,591 (LOW-2: the per-game delete on idx_owed_rows_identity_game, the state row counted once, the ceiling joined from it), writes 5,575 to 7,344 (the fold's owed_rows index entries and the two row-count triggers)",
+    "owed-backfill-evidence": {
+      "route": "POST /internal/owed-backfill-pass?evidence=1 (lane D2-OWED-FOLD-8): the owed-v2 backfill's evidence phase alone, over the seed's ten open evictions made before the eviction writer (the captured beta pair 13 with its JOIN's bytes: two evidence rows by the writer's own statements; the synthetic JOIN with none: its two released hops named for two verified seats, four missing-evidence rows; eight noise evictions with no verified seat: nothing written), one page, the cursor saved in each eviction's batch, the done mark. Per open eviction: 17.1 reads, 5.9 writes, 5.8 statements",
       "measured": {
-        "reads": 25591,
-        "writes": 7344,
-        "stmts": 3097,
-        "maxReads": 1291
+        "reads": 171,
+        "writes": 59,
+        "stmts": 58,
+        "maxReads": 22
       },
       "ceiling": {
-        "reads": 38387,
-        "writes": 11016,
-        "stmts": 4646,
-        "maxReads": 1937
+        "reads": 257,
+        "writes": 89,
+        "stmts": 87,
+        "maxReads": 33
+      },
+      "censusKey": null
+    },
+    "owed-backfill-pass": {
+      "route": "POST /internal/owed-backfill-pass: the owed-v2 backfill over the READ lane's fleet seed turned back into an old worker's rows (no keys, no state, no marks), with the captured pair 13 since lane D2-OWED-FOLD-8: six identities, the lived-in seat's 270 games in 17 judge batches of 16, the one-game wanted identity in one, and pair 13's twin-only seat, p28, f1 and f2 one each (the twin-only seat named by the evicted twin of its open eviction), the cursor saved after each, the stamp with the last save, one pass, after the evidence phase ran alone (bsv-low #893 section 6.1). Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 53,424 to 25,591 (LOW-2), writes 5,575 to 7,344; by D2-OWED-FOLD-8 (2026-10-26): reads 25,591 to 27,168, writes 7,344 to 7,449, statements 3,097 to 3,244 (pair 13's four identities and the evidence phase's done read in the gate)",
+      "measured": {
+        "reads": 27168,
+        "writes": 7449,
+        "stmts": 3244,
+        "maxReads": 1294
+      },
+      "ceiling": {
+        "reads": 40752,
+        "writes": 11174,
+        "stmts": 4866,
+        "maxReads": 1941
       },
       "censusKey": null
     },

@@ -62,7 +62,17 @@ async fn main() {
         "-- judged fixture: {} results, {} hops, {} rows, {} pending",
         counts.0, counts.1, counts.2, counts.3
     );
+    // D2-OWED-FOLD-8: `OWED_SEED_PAIR13=1` (the backfill tier) adds the captured beta pair 13, an eviction made
+    // before the eviction writer, and its synthetic legs (the budget seed's rows), for the evidence phase's cost.
+    if std::env::var("OWED_SEED_PAIR13").is_ok_and(|v| v == "1") {
+        for sql in l23_pair13::l23_r2_route_rows(now) {
+            println!("{sql};");
+        }
+    }
 }
+
+#[path = "../tests/support/l23_pair13.rs"]
+mod l23_pair13;
 
 struct SeedDb {
     db: std::cell::RefCell<rusqlite::Connection>,
