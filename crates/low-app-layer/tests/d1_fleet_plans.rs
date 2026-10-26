@@ -339,6 +339,8 @@ const OWED_893_PLANS: &[(&str, &str, &[&str])] = &[
     ("owed belt gauge", low_app_layer::owed_belt::DUE_GAUGE_SQL, &["idx_owed_rows_belt"]),
     // D2-OWED-FOLD-10, the sixth delta lens's NOTE-2: the judge's missing-evidence read and the backfill's gate
     ("owed missing evidence", low_app_layer::owed_judge::MISSING_SQL, &["sqlite_autoindex_released_hop_evidence_missing_1", "sqlite_autoindex_pot_evictions_1", "sqlite_autoindex_released_hop_evidence_1", "idx_evicted_party_identity_game", "idx_potparty_identity", "idx_hopparty_hop"]),
+    // NEW-L1: the age repair's read of the skipped evictions, a range of the state's key and a key search each
+    ("owed skipped evictions", low_app_layer::owed_backfill::SKIPPED_EVICTIONS_SQL, &["sqlite_autoindex_owed_belt_state_1", "sqlite_autoindex_pot_evictions_1", "sqlite_autoindex_released_hop_evidence_1"]),
     ("owed backfill gate", low_app_layer::owed_backfill::GATE_SQL, &["sqlite_autoindex_ops_counters_1", "sqlite_autoindex_owed_belt_state_1"]),
     ("owed age repair", low_app_layer::owed_backfill::AGE_MARK_SQL, &["idx_owed_rows_judged", "idx_owed_dirty_source_key"]),
     ("owed keyless repair", low_app_layer::owed_backfill::AGE_MARK_UNJUDGED_SQL, &["idx_owed_rows_unjudged", "idx_owed_dirty_source_key"]),

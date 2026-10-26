@@ -921,3 +921,133 @@ async fn fold10_n3_the_fault_count_write_is_raced_by_the_deadline() {
         1
     );
 }
+
+/// The fold-9 shape: one eviction (`aa..`) whose missing-row insert is wedged and one honest (`bb..`), driven through
+/// the three faulted passes to the skip. Literal names only.
+fn fold10_skipped_fixture() -> (Db, &'static str) {
+    let wedged = "aa00000000000000000000000000000000000000000000000000000000000000";
+    let honest = "bb00000000000000000000000000000000000000000000000000000000000000";
+    let db = Db::new();
+    for (txid, seat, hop) in [(wedged, "seat-a", "a1"), (honest, "seat-b", "b1")] {
+        db.exec(&format!("INSERT INTO potparty_records_evicted(identity,potTxid,gameId,opponentIdentity,seatSettlePubkey,sigValid) VALUES ('{seat}','{txid}','g-{seat}','o','02aa',1)"));
+        db.exec(&format!("INSERT INTO pot_evictions(txid,reason,evictedAt,releasedSpends) VALUES ('{txid}','R',5,'[{{\"table\":\"pot_records\",\"txid\":\"{hop}{}\",\"vout\":0}}]')", "0".repeat(62)));
+    }
+    db.exec(&format!("CREATE TRIGGER wedge BEFORE INSERT ON released_hop_evidence_missing WHEN NEW.potTxid='{wedged}' BEGIN SELECT RAISE(ABORT,'wedged'); END;"));
+    db.certify(backfill::OWED_TRIGGERS_MIGRATION_COUNT);
+    (db, wedged)
+}
+
+async fn fold10_skip(db: &Db) {
+    for _ in 0..=backfill::OWED_BACKFILL_IDENTITY_FAULTS_MAX {
+        let _ = backfill::backfill_pass(db, &open_deadline(db)).await; // armed, then the three faults
+    }
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM owed_belt_state WHERE name LIKE 'backfill:owed-v2:skipped-eviction:%'"),
+        1,
+        "skipped"
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-v2'"),
+        1,
+        "the backfill is stamped: neither of its entrances will visit the eviction again"
+    );
+}
+
+/// D2-OWED-FOLD-10, the sixth delta lens's NEW-L1 (the ruling: a fault is transient, a lost press is not): an eviction
+/// the evidence phase passed after three faulted passes is RETRIED by the age repair the drain runs on every scheduled
+/// pass, once its skip is a day old; a retry that lands writes its rows and ends the skip. Only `mark_aged`, which the
+/// base has, is called. RED on 237ae72b: the skip is permanent, the healthy eviction is never judged.
+#[tokio::test]
+async fn fold10_l1_a_skipped_eviction_is_retried_by_the_age_repair_and_lands() {
+    let (db, wedged) = fold10_skipped_fixture();
+    fold10_skip(&db).await;
+    db.exec("DROP TRIGGER wedge"); // the fault was transient
+    let missing = format!(
+        "SELECT COUNT(*) FROM released_hop_evidence_missing WHERE potTxid='{wedged}' AND identity='seat-a'"
+    );
+    backfill::mark_aged(&db).await.unwrap();
+    assert_eq!(db.count(&missing), 0, "not retried before its skip is a day old");
+    db.now.set(db.now.get() + backfill::OWED_AGE_REMARK_AFTER_MS as u64 + 1);
+    backfill::mark_aged(&db).await.unwrap();
+    assert_eq!(db.count(&missing), 1, "the age repair's retry judges the skipped eviction");
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM owed_belt_state WHERE name LIKE 'backfill:owed-v2:skipped-eviction:%'"),
+        0,
+        "the skip ends with the landed retry"
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM owed_belt_state WHERE name='backfill:owed-v2:evictions' AND cursor='~'"),
+        1,
+        "the phase's cursor is not moved by the retry"
+    );
+    assert_eq!(db.counters.borrow()["owed_backfill_evictions_total"], 2);
+}
+
+/// D2-OWED-FOLD-10, NEW-L1's bounds: a retry round has the phase's three faults (counted on the skip's row, its time
+/// kept), then the eviction is skipped AGAIN from now (counted, a day before its next round), never silent: every
+/// repair names it while it is skipped.
+#[tokio::test]
+async fn fold10_l1_b_a_retry_round_faulting_three_times_skips_again_and_is_named() {
+    let (db, wedged) = fold10_skipped_fixture();
+    fold10_skip(&db).await;
+    let skip = format!("SELECT tickedAtMs FROM owed_belt_state WHERE name='backfill:owed-v2:skipped-eviction:{wedged}'");
+    let skipped_at = db.count(&skip);
+    let r = backfill::age_repair(&db).await.unwrap();
+    assert_eq!((r.retried, r.still_skipped.clone()), (0, vec![wedged.to_owned()]), "named, not due");
+    db.now.set(db.now.get() + backfill::OWED_SKIPPED_EVICTION_RETRY_AFTER_MS as u64 + 1);
+    for fault in 1..backfill::OWED_BACKFILL_IDENTITY_FAULTS_MAX {
+        let r = backfill::age_repair(&db).await.unwrap();
+        assert_eq!((r.retried, r.reskipped.len()), (1, 0), "retry {fault}");
+        assert_eq!(r.still_skipped, vec![wedged.to_owned()]);
+        assert_eq!(db.count(&skip), skipped_at, "the skip's time is kept inside the round");
+        assert_eq!(
+            db.count(&format!("SELECT json_extract(cursor,'$.faults') FROM owed_belt_state WHERE name='backfill:owed-v2:skipped-eviction:{wedged}'")),
+            fault as i64
+        );
+    }
+    let r = backfill::age_repair(&db).await.unwrap();
+    assert_eq!(r.reskipped, vec![wedged.to_owned()], "{r:?}");
+    assert_eq!(db.count(&skip), db.now.get() as i64, "skipped again from now");
+    assert_eq!(
+        db.count(&format!("SELECT json_extract(cursor,'$.faults') FROM owed_belt_state WHERE name='backfill:owed-v2:skipped-eviction:{wedged}'")),
+        0,
+        "the next round starts at zero"
+    );
+    assert_eq!(db.counters.borrow()["owed_backfill_skipped_evictions_total"], 2);
+    let r = backfill::age_repair(&db).await.unwrap();
+    assert_eq!((r.retried, r.still_skipped.len()), (0, 1), "a day before the next round");
+    // the next round lands once the fault is gone
+    db.exec("DROP TRIGGER wedge");
+    db.now.set(db.now.get() + backfill::OWED_SKIPPED_EVICTION_RETRY_AFTER_MS as u64);
+    let r = backfill::age_repair(&db).await.unwrap();
+    assert_eq!((r.recovered, r.still_skipped), (vec![wedged.to_owned()], vec![]));
+}
+
+/// D2-OWED-FOLD-10, NEW-L1's cadence bound: at most four retries a repair, oldest skip first; a skip whose eviction no
+/// longer needs its evidence (readmitted) is ended without a retry, inside the same bound. Each statement is a key
+/// search (the read's plan is pinned in `d1_fleet_plans`).
+#[tokio::test]
+async fn fold10_l1_c_at_most_four_retries_a_repair_oldest_skip_first() {
+    let db = Db::new();
+    let txids: Vec<String> = (0..7).map(|n| format!("c{n}{}", "0".repeat(62))).collect();
+    for (n, txid) in txids.iter().enumerate() {
+        db.exec(&format!("INSERT INTO potparty_records_evicted(identity,potTxid,gameId,opponentIdentity,seatSettlePubkey,sigValid) VALUES ('seat-{n}','{txid}','g-{n}','o','02aa',1)"));
+        let readmitted = if n == 5 { "6" } else { "NULL" };
+        db.exec(&format!("INSERT INTO pot_evictions(txid,reason,evictedAt,readmittedAt,releasedSpends) VALUES ('{txid}','R',5,{readmitted},'[{{\"table\":\"pot_records\",\"txid\":\"d{n}{}\",\"vout\":0}}]')", "0".repeat(62)));
+        // the newest skip first in key order, so the order read is the skip's time, not the key's
+        db.exec(&format!("INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:skipped-eviction:{txid}','{{\"reason\":\"r\",\"faults\":0}}',{})", 1_000 - n as i64));
+    }
+    db.reset();
+    let r = backfill::age_repair(&db).await.unwrap();
+    assert_eq!(r.retried + r.resolved.len(), 4, "{r:?}");
+    assert_eq!(r.resolved, vec![txids[5].clone()], "the readmitted one ended, not retried");
+    assert_eq!(r.recovered, vec![txids[6].clone(), txids[4].clone(), txids[3].clone()]);
+    assert_eq!(r.still_skipped, vec![txids[2].clone(), txids[1].clone(), txids[0].clone()]);
+    assert_eq!(db.counters.borrow()["owed_backfill_evictions_total"], 3);
+    for ran in db.ran.borrow().iter() {
+        assert_eq!(ran.fullscan, 0, "{}", ran.sql);
+    }
+    let r = backfill::age_repair(&db).await.unwrap();
+    assert_eq!(r.recovered.len(), 3, "{r:?}");
+    assert!(r.still_skipped.is_empty());
+}
