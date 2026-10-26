@@ -3977,7 +3977,7 @@ pub async fn backfill_settle_signers(
 // admitted-but-network-absent rebroadcast backstop (bsv-low #273, #267 item c)
 // ============================================================================
 
-/// Per-tick candidate bound for [`rebroadcast_absent_admitted`] — the same
+/// Per-tick candidate bound for `rebroadcast_absent_admitted` — the same
 /// figure as the #284 backfill (each candidate costs ≤2 presence GETs and,
 /// only when provably absent, the rebroadcast POSTs).
 pub const REBROADCAST_BACKSTOP_LIMIT: u64 = 16;
@@ -4756,7 +4756,7 @@ pub struct RetireSummary {
     /// #602 fold (MEDIUM-1): the conflict pass that runs first.
     pub conflict: crate::admit_fast::ConflictPassSummary,
     /// bsv-low #831 half 2: retired rows (either store's arm) whose LIVE pot the pass then evicted
-    /// ([`end_retired_pot`]).
+    /// (`end_retired_pot`).
     pub evicted_on_retire: usize,
     /// bsv-low #831 half 2: end steps of a retirement that faulted (the end-state read, the eviction, or an
     /// eviction that left work undone); such a pot is latched and live, the backlog pass's candidate.
@@ -4765,14 +4765,14 @@ pub struct RetireSummary {
     /// ([`RETIRE_PASS_STATEMENT_BUDGET`]); each pot is latched and live, so the backlog takes it on a later pass.
     pub end_deferred: usize,
     /// bsv-low #831 half 2: the bounded backlog pass over pots latched or engine-retired before the pass evicted
-    /// ([`run_retire_backlog`]).
+    /// (`run_retire_backlog`).
     pub backlog: RetireBacklogSummary,
     /// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): the D1 statements the whole pass issued (the conflict pass,
     /// both arms, the backlog), as the statement budget counted them.
     pub statements: u64,
 }
 
-/// bsv-low #831 half 2: what one backlog pass did ([`run_retire_backlog`]).
+/// bsv-low #831 half 2: what one backlog pass did (`run_retire_backlog`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RetireBacklogSummary {
     /// Latched or engine-retired pots with a live `pot_records` row the pass looked at again (at most
@@ -5873,7 +5873,7 @@ pub fn retire_pass_json(s: &RetireSummary, d1: crate::d1_ledger::Tally) -> serde
 }
 
 /// bsv-low #831 (the FIX-831-B lens's MEDIUM-2): `POST /internal/retire-pass` (bearer `INTERNAL_TOKEN` in fixed
-/// time, as the #576 levers; body empty or `{}`, else 400): ONE retire pass through [`run_retire_pass`], the
+/// time, as the #576 levers; body empty or `{}`, else 400): ONE retire pass through `run_retire_pass`, the
 /// function the scheduled tick calls, with the tick's own Arcade base and WoC key, answered with its summary and its
 /// own D1 figures. For the budget tier (`tools/lane-831`, `make ci-d1-budget`), which no longer fires the
 /// production tick, and for an operator draining a backlog.

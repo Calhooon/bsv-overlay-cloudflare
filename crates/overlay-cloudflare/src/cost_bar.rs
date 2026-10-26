@@ -3,8 +3,8 @@
 //! Both Workers of one D1 (the overlay and the app layer) write what each isolate cost the plan into
 //! `worker_cost_daily`, one row per UTC day and Worker (`d1_ledger`'s cost window: fetch requests, D1 rows read,
 //! rows written and statements, written one upsert per window, never one per request). This module reads the last
-//! [`COST_DAYS_SERVED`] days and serves each beside the plan's INCLUDED quotas per day, which are CONFIGURED VARS
-//! ([`QUOTA_VARS`]), never constants here: an unset or unparsable var serves `null` for its quota, its ratio and its
+//! `COST_DAYS_SERVED` days and serves each beside the plan's INCLUDED quotas per day, which are CONFIGURED VARS
+//! (`QUOTA_VARS`), never constants here: an unset or unparsable var serves `null` for its quota, its ratio and its
 //! share of the over-quota flag. The ratio is the day's total over BOTH Workers divided by the quota; `overQuota` is
 //! `true` when any configured measure's total is past its quota, `false` when every configured one is within it,
 //! `null` when none is configured or the rows are unreadable.
@@ -52,7 +52,7 @@ pub struct CostRow {
     pub updated_at: f64,
 }
 
-/// The configured quotas per day, in [`QUOTA_VARS`]' order.
+/// The configured quotas per day, in `QUOTA_VARS`' order.
 pub type Quotas = [Option<u64>; 3];
 
 /// PURE: the quotas from a var reader (a positive integer, `_` separators allowed; anything else is unset).

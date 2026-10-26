@@ -3,7 +3,7 @@
 //! Under the fleet's load a D1 statement's latency is mostly its wait in the database's queue (loop 44:
 //! `/health/invariants` spent 5 to 20 s of wall time on 20 to 170 ms of CPU, 31 statements awaited one after
 //! another). Awaited in turn, independent reads pay that wait once each; issued together they pay it about once.
-//! [`concurrently!`] is that join for a handful of heterogeneous futures, without a new dependency: each future
+//! `concurrently!` is that join for a handful of heterogeneous futures, without a new dependency: each future
 //! is polled until it is done, every poll of the join polls every future not yet done, and the outputs are bound
 //! to the names the caller gives, in the caller's scope.
 //!

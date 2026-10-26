@@ -107,7 +107,7 @@ impl AbortRows for D1Database {
 pub type AbortingManagers = Vec<(String, Box<dyn TopicManager>)>;
 
 /// Every workspace manager whose `aborts_admissions` is true
-/// ([`crate::WORKSPACE_TOPIC_MANAGERS`]). Empty today.
+/// (`crate::WORKSPACE_TOPIC_MANAGERS`). Empty today.
 pub fn managers_that_abort() -> AbortingManagers {
     crate::WORKSPACE_TOPIC_MANAGERS
         .iter()

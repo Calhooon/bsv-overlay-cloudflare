@@ -2729,7 +2729,7 @@ impl ArcadeBroadcaster {
     }
 
     /// bsv-low #637: the submit's echo was a duplicate's stored SEEN and the corroboration its accept claim asked
-    /// answered INCONCLUSIVE (never a conflict): the shape [`duplicate_of_a_standing_admission`] reads.
+    /// answered INCONCLUSIVE (never a conflict): the shape `duplicate_of_a_standing_admission` reads.
     pub fn duplicate_echo_unconfirmed(&self) -> bool {
         self.duplicate_echo.get() && self.claim_unconfirmed.get()
     }
