@@ -207,3 +207,66 @@ async fn d2delta_l1_the_belt_cursor_passes_no_identity_it_did_not_serve() {
         "the cursor rests on the last identity given a turn"
     );
 }
+
+/// D-L2: the twin of `d2fold_high3_c` on a MOVING chain: a look that changed nothing doubles its period to the 6 h
+/// ceiling though every look runs at a new tip (the find's judge stamps it as `probeTip`). RED on d521888f: the period
+/// stayed at the base, `left: 600000 right: 1200000`.
+#[tokio::test]
+async fn d2delta_l2_a_moving_tip_does_not_reset_the_backoff() {
+    let db = Db::new();
+    seed_stranded_hop(&db, "owner", "g00", &hop(0));
+    drain_all(&db).await;
+    let op = format!("{}:0", hop(0));
+    let fake = Fake::default();
+    let mut tip = 900_000;
+    let mut at = due(&db, &op).unwrap() as u64;
+    let mut look = |at: u64| {
+        tip += 1;
+        db.now.set(at);
+        db.tip.set(Some(tip));
+        belt::tick(&db, &fake)
+    };
+    look(at).await.unwrap();
+    let mut period = due(&db, &op).unwrap() - at as i64;
+    assert_eq!(period, 600_000, "the first look changed the probe: the base period");
+    for _ in 0..8 {
+        at += period as u64;
+        look(at).await.unwrap();
+        let next = due(&db, &op).unwrap() - at as i64;
+        assert_eq!(next, (2 * period).min(belt::OWED_BELT_BACKOFF_MAX_MS), "a block is not a change");
+        period = next;
+    }
+    assert_eq!(period, belt::OWED_BELT_BACKOFF_MAX_MS);
+}
+
+/// D-L2: a look no rung answered doubles too (it re-armed at a fixed 300 s for ever): the row waits as long again as
+/// it has since its judgement, from the 300 s floor to the 6 h ceiling, and its row and facts are untouched. RED on
+/// d521888f: `left: 300000 right: 600000`.
+#[tokio::test]
+async fn d2delta_l2_an_unanswered_look_doubles_from_its_floor_to_the_ceiling() {
+    assert_eq!(belt::unanswered_period(1_000, Some(1_000)), belt::OWED_BELT_UNANSWERED_RETRY_MS);
+    assert_eq!(belt::unanswered_period(1_000, None), belt::OWED_BELT_UNANSWERED_RETRY_MS);
+    let db = Db::new();
+    seed_stranded_hop(&db, "owner", "g00", &hop(0));
+    drain_all(&db).await;
+    let op = format!("{}:0", hop(0));
+    let facts = db.text(&format!("SELECT facts FROM owed_rows WHERE outpoint='{op}'"));
+    let fake = Fake::default();
+    fake.on("", Some((429, b"{}".to_vec())));
+    let judged = db.opt(&format!("SELECT judgedAtMs FROM owed_rows WHERE outpoint='{op}'")).unwrap();
+    let mut at = due(&db, &op).unwrap();
+    let mut periods = Vec::new();
+    for _ in 0..8 {
+        db.now.set(at as u64);
+        let report = belt::tick(&db, &fake).await.unwrap();
+        assert_eq!(report.rearmed, 1, "{report:?}");
+        let next = due(&db, &op).unwrap() - at;
+        assert_eq!(next, (at - judged).min(belt::OWED_BELT_BACKOFF_MAX_MS), "as long again as since its judgement");
+        periods.push(next);
+        at += next;
+    }
+    let period = *periods.last().unwrap();
+    assert_eq!(periods[..3], [600_000, 1_200_000, 2_400_000], "{periods:?}");
+    assert_eq!(period, belt::OWED_BELT_BACKOFF_MAX_MS);
+    assert_eq!(db.text(&format!("SELECT facts FROM owed_rows WHERE outpoint='{op}'")), facts);
+}
