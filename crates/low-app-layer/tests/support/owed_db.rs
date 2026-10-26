@@ -165,6 +165,13 @@ pub fn seed_stranded_hop(db: &Db, identity: &str, game: &str, hop_txid: &str) {
     db.exec(&format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{hop_txid}',0,0,{made},'p2pkh'); INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('{identity}','other','{game}',0,20190,'seat','00','00',2,'{hop_txid}',1,{made},1);"));
 }
 
+/// A hop the INDEX does not hold (no `pot_records` row: index status `unknown`) whose chain rung said "unspent" at
+/// `tip` (the probe memo, keyed `txid.vout`): claimable on the courier's word alone.
+pub fn seed_courier_unspent_hop(db: &Db, identity: &str, game: &str, hop_txid: &str, tip: u64) {
+    let made = (db.now.get() as i64 - 2 * HOUR) / 1000;
+    db.exec(&format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('{identity}','other','{game}',0,20190,'seat','00','00',2,'{hop_txid}',1,{made},1); INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES ('{hop_txid}.0',{now},0,NULL,NULL,{tip});", now = db.now.get()));
+}
+
 /// Drain every mark through the shipped scheduled drain.
 pub async fn drain_all(db: &Db) {
     for _ in 0..10_000 {
