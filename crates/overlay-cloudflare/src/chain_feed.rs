@@ -73,7 +73,11 @@ pub const INVALIDATED_DEPTH: u64 = 144;
 /// checked was against a header chaintracks served at or below its verified tip then, so a row above the tip now
 /// rests on a header chaintracks no longer serves: exactly the rows the event names. Before #896 the tip was the
 /// couriers' maximum, usually at or above the invalidated height; the verified tip alone would have missed them. As
-/// deep above as the window reaches below.
+/// deep above as the window reaches below. While chaintracks re-validates (its served ceiling below its stored tip) the
+/// verified tip is that ceiling, so the window anchors there and misses rows on an invalidated header near the real
+/// tip, which the couriers' maximum covered (the ENGINE-TIP-896 lens's LOW-2); bounded: the producer emits no
+/// `invalidated` live yet, a miss demotes nothing (the row keeps its confirmation until a later reorg event), and the
+/// heal is `POST /internal/reorg`.
 pub const INVALIDATED_ABOVE_TIP: u64 = INVALIDATED_DEPTH;
 
 /// The released windows the row keeps (newest last).
@@ -909,6 +913,8 @@ where
             // a selecting event past the pass's budget is the next pass's (its cursor not passed)
             _ if finished >= limits.events_per_pass => break,
             Selection::Heights(lo, hi) => (lo, hi),
+            // the verified tip; during a chaintracks re-validation it is the served ceiling, and the window anchors
+            // there (`INVALIDATED_ABOVE_TIP`, the ENGINE-TIP-896 lens's LOW-2)
             Selection::BelowTip => match tracker.current_height().await {
                 Ok(tip) => {
                     let tip = u64::from(tip);
