@@ -1,0 +1,8 @@
+{
+  "rows": {
+    "97288e47d846066d59f0caa8a2bec22fd9040dd5af05f323c67cf010373ab064:0": "[\"unbound\",\"9d88aaaa348acae127efd08e133822201ecae56513831c37124837f3ef9ae17f\",null,\"opponent\",null,\"could not judge: evidence-missing: the evicted JOIN's stored bytes are absent or undecodable\",{\"claim\":null,\"claimable\":false,\"evidenceMissing\":true,\"hopTxid\":\"97288e47d846066d59f0caa8a2bec22fd9040dd5af05f323c67cf010373ab064\",\"hopVout\":0,\"markerCreatedAtMs\":1790000000000,\"markerlessReadFault\":true}]",
+    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee:0": "[\"unbound\",\"9d88aaaa348acae127efd08e133822201ecae56513831c37124837f3ef9ae17f\",null,\"opponent\",null,\"could not judge: evidence-missing: the evicted JOIN's stored bytes are absent or undecodable\",{\"claim\":null,\"claimable\":false,\"evidenceMissing\":true,\"hopTxid\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"hopVout\":0,\"markerCreatedAtMs\":1790000000000,\"markerlessReadFault\":true}]"
+  },
+  "cut": true,
+  "derived": 2
+}

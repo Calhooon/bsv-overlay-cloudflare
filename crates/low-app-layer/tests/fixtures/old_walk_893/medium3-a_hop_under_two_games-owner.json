@@ -1,0 +1,7 @@
+{
+  "rows": {
+    "b500000000000000000000000000000000000000000000000000000000000001:0": "[\"hop-stranded\",\"9c00000000000000000000000000000000000000000000000000000000000001\",20190,\"other\",null,null,{\"ageMs\":7200000,\"chainProbe\":\"index-unspent\",\"claim\":\"sweep-hop\",\"claimable\":true,\"hopSats\":20190,\"hopTxid\":\"b500000000000000000000000000000000000000000000000000000000000001\",\"hopVout\":0,\"joinRefused\":false,\"markerCreatedAtMs\":1789992800000,\"markerVerified\":\"verified\",\"seatSettlePubkey\":\"seat\",\"spendingTxid\":null,\"spent\":false,\"spentConfirmed\":false,\"status\":\"unspent\",\"statusSource\":\"index\",\"sweepSource\":\"sign-here\"}]"
+  },
+  "cut": false,
+  "derived": 1
+}

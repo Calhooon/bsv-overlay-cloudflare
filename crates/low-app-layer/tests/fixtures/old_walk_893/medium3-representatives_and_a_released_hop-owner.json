@@ -1,0 +1,8 @@
+{
+  "rows": {
+    "d700000000000000000000000000000000000000000000000000000000000001:0": "[\"in-progress\",\"9b00000000000000000000000000000000000000000000000000000000000001\",null,\"other\",null,null,{\"blocksToGate\":100,\"claim\":\"rejoin\",\"claimable\":true,\"committedKeys\":null,\"firstPartyMarkerAtMs\":1789992800000,\"mySeat\":null,\"outcome\":\"unresolved\",\"outcomeSource\":null,\"potAdmittedAtMs\":1789992800000,\"potTxid\":\"d700000000000000000000000000000000000000000000000000000000000001\",\"potVout\":0,\"recoveryHeight\":900100,\"settleSigners\":null,\"settleTxid\":null,\"spent\":false,\"spentConfirmed\":false,\"stakeSats\":null,\"tip\":900000,\"verdict\":null}]",
+    "ef5433780de521c82a8f56f2d1b52cc3c8c89926d4caf43cd71a58274cd51149:0": "[\"hop-stranded\",\"9b00000000000000000000000000000000000000000000000000000000000003\",20190,\"x\",null,\"the network refused the transaction that spent this stake (it was evicted from the index): the hand cannot start from it; your stake can be swept back now\",{\"ageMs\":3600000,\"chainProbe\":\"index-unspent\",\"claim\":\"sweep-hop\",\"claimable\":true,\"hopSats\":20190,\"hopTxid\":\"ef5433780de521c82a8f56f2d1b52cc3c8c89926d4caf43cd71a58274cd51149\",\"hopVout\":0,\"joinRefused\":true,\"joinRefusedBy\":\"eviction\",\"markerCreatedAtMs\":1789996400000,\"markerVerified\":\"verified\",\"seatSettlePubkey\":\"02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"spendingTxid\":null,\"spent\":false,\"spentConfirmed\":false,\"status\":\"unspent\",\"statusSource\":\"index\",\"sweepSource\":\"sign-here\"}]"
+  },
+  "cut": false,
+  "derived": 2
+}

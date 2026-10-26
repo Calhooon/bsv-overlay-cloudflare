@@ -1,0 +1,7 @@
+{
+  "rows": {
+    "5555555555555555555555555555555555555555555555555555555555555555:0": "[\"unbound\",\"7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a\",null,\"02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",null,\"the pot's funding is not held by the network: nothing can spend it until the network sees it or the pot is retired\",{\"claim\":\"funding-not-held\",\"claimReason\":\"the pot's funding is not held by the network: nothing can spend it until the network sees it or the pot is retired\",\"claimable\":false,\"committedKeys\":{\"payPkhA\":\"1111111111111111111111111111111111111111\",\"payPkhB\":\"2222222222222222222222222222222222222222\",\"pubA\":\"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\",\"pubB\":\"02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\"},\"firstPartyMarkerAtMs\":1000000,\"fundingHeld\":\"none\",\"mySeat\":null,\"outcome\":\"unresolved\",\"outcomeSource\":null,\"potAdmittedAtMs\":1000,\"potTxid\":\"5555555555555555555555555555555555555555555555555555555555555555\",\"potVout\":0,\"recoveryHeight\":900000,\"refundStatus\":\"gate-open\",\"settleSigners\":null,\"settleTxid\":null,\"spent\":false,\"spentConfirmed\":false,\"stakeSats\":null,\"tip\":900000,\"verdict\":null}]"
+  },
+  "cut": false,
+  "derived": 1
+}
