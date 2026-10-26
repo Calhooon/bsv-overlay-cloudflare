@@ -623,7 +623,8 @@ pub fn migration_list_fingerprint() -> u32 {
 /// (word subjects split for D1's compound limit) and the two game-bounded hydration indexes.
 /// 395 to 396 for #893 (lane D2-OWED-BACKFILL): `idx_owed_rows_judged`, the scheduled drain's daily age re-mark.
 /// 396 to 398 for #893 (lane D2-OWED-FOLD, the money lens's HIGH-1): `idx_owed_rows_sweep` (a tip dates the
-/// claimable sweeps judged below it) and `idx_owed_rows_untipped` (a tipless judgement re-marked on the next tip).
+/// claimable sweeps judged below it whose index status is not `unspent`, the courier-dependent ones; scoped to them
+/// in place by D2-OWED-FOLD-3, so the statement reads only the rows it writes) and `idx_owed_rows_untipped` (a tipless judgement re-marked on the next tip).
 /// 398 to 399 for #893 (lane D2-OWED-FOLD, HIGH-3): `idx_owed_rows_belt_turn`, the belt's round-robin by identity.
 /// 399 to 401 for #893 (lane D2-OWED-FOLD, MEDIUM-1): `owed_dirty` by source key and by (identity, age), so no drain
 /// statement scans the fleet's marks.
