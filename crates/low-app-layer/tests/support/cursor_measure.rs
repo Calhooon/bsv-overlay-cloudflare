@@ -260,7 +260,8 @@ pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
     // bsv-low #643, #644, #645 (W1.6): the hot passes' reads on the fleet fixture, each under its own ceiling
     // (docs/D1-BUDGETS.md). The tip mark is its UPDATE's subquery at a block whose window holds no pot.
     let tip_sql = low_app_layer::owed_judge::MARK_TIP_SQL;
-    let tip_select = &tip_sql[tip_sql.find("SELECT identity").unwrap()..tip_sql.find(" ON CONFLICT").unwrap()];
+    let tip_select =
+        &tip_sql[tip_sql.find("SELECT identity").unwrap()..tip_sql.find(" ON CONFLICT").unwrap()];
     for (name, statement, binds, ceiling, unordered) in [
         (
             "#644 signers-backfill candidates",
@@ -279,7 +280,7 @@ pub fn write(db: &Connection, path: &str, now: u64, identity: &str) {
         (
             "#643 tip mark at a block reaching no pot",
             tip_select.to_string(),
-            vec![Value::Integer(958_900),Value::Integer(0)],
+            vec![Value::Integer(958_900), Value::Integer(0)],
             TIP_MARK_READ_CEILING,
             false,
         ),
