@@ -270,3 +270,43 @@ async fn d2delta_l2_an_unanswered_look_doubles_from_its_floor_to_the_ceiling() {
     assert_eq!(period, belt::OWED_BELT_BACKOFF_MAX_MS);
     assert_eq!(db.text(&format!("SELECT facts FROM owed_rows WHERE outpoint='{op}'")), facts);
 }
+
+/// D-L3: the wanted envelope's "newest 32 games" orders by ONE unit, milliseconds: `potparty_records` and
+/// `hopparty_records` give `createdAt` in seconds, `released_hop_evidence.evictedAt` and `owed_rows.updatedAtMs` are
+/// milliseconds. 32 games of hops made in the last hour and one game known only by a released hop evicted ten days
+/// ago: the old game is the 33rd, marked `backfill`, not `wanted`. RED on d521888f: the ten-day-old eviction sorted
+/// newest (its milliseconds read as seconds), so it was `wanted` and the 32nd newest hop game was not.
+#[tokio::test]
+async fn d2delta_l3_the_wanted_envelope_orders_its_games_in_one_unit() {
+    use low_app_layer::pot_hook::{Bind, SqlPort, Stmt};
+    let db = Db::new();
+    let now = db.now.get() as i64;
+    for n in 0..32 {
+        let made = (now - 60_000 * (n as i64 + 1)) / 1000;
+        db.exec(&format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('owner','other','g{n:02}',0,20190,'seat','00','00',2,'{}',1,{made},1)", hop(n)));
+    }
+    db.exec(&format!("INSERT INTO released_hop_evidence(hopTxid,hopVout,identity,gameId,potTxid,seatSettlePubkey,hopSats,evictedAt) VALUES('{}',0,'owner','old','{}','seat',20190,{})", hop(90), hop(91), now - 10 * 24 * HOUR));
+    db.exec("DELETE FROM owed_dirty");
+    for sql in [judge::EXPAND_WANTED_SQL, judge::EXPAND_BACKFILL_SQL] {
+        db.run_batch(vec![Stmt {
+            sql: sql.into(),
+            binds: vec![Bind::Text("owner".into()), Bind::Int(now)],
+        }])
+        .await
+        .unwrap();
+    }
+    let marked = |source: &str| {
+        let conn = db.conn.borrow();
+        let mut s = conn
+            .prepare("SELECT gameId FROM owed_dirty WHERE identity='owner' AND source=?1 ORDER BY gameId")
+            .unwrap();
+        s.query_map([source], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(marked("backfill"), ["old"], "the ten-day-old game is the oldest");
+    let wanted = marked("wanted");
+    assert_eq!(wanted.len(), 32);
+    assert!(wanted.iter().all(|g| g.starts_with('g')), "{wanted:?}");
+}
