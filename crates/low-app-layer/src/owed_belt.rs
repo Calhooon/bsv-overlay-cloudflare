@@ -52,8 +52,13 @@ pub const BELT_IDENTITIES_SQL: &str = "WITH RECURSIVE walk(identity,n) AS (SELEC
 /// The first class (the second delta lens's D2-M1): the courier-only sweeps a block dated and their look not yet made
 /// (claimable `hop-stranded`, index status not `unspent`, judged below the present tip ?1, due by ?2), over
 /// `idx_owed_rows_sweep` (the tip's own dating index: its WHERE is this statement's, so it reads only that class), at
-/// most ?3 rows a tick.
-pub const BELT_SWEEPS_DUE_SQL: &str = "SELECT identity,outpoint,beltDueAtMs FROM owed_rows INDEXED BY idx_owed_rows_sweep WHERE family='hop-stranded' AND claimable=1 AND json_extract(facts,'$.status') IS NOT 'unspent' AND probeTip<?1 AND beltDueAtMs<=?2 LIMIT ?3";
+/// most ?3 rows a tick. The due set is a SEEK (the third delta lens's D3-N3): the walk steps up the distinct judged
+/// tips below ?1, oldest first as the index order the first build read (an unlooked row judged at an older tip before
+/// a looked one), one MIN seek each, at most ?3 of them, and inside each takes the rows due by ?2 on the key's
+/// `(probeTip, beltDueAtMs)` range, so a row of the class not due is never read. A row judged at a tip past the ?3
+/// oldest distinct tips below the present is left to the second class (the walk of `idx_owed_rows_belt_turn`) on that
+/// tick.
+pub const BELT_SWEEPS_DUE_SQL: &str = "WITH RECURSIVE walk(t,n) AS (SELECT (SELECT MIN(probeTip) FROM owed_rows INDEXED BY idx_owed_rows_sweep WHERE family='hop-stranded' AND claimable=1 AND json_extract(facts,'$.status') IS NOT 'unspent' AND probeTip<?1),1 UNION ALL SELECT (SELECT MIN(probeTip) FROM owed_rows INDEXED BY idx_owed_rows_sweep WHERE family='hop-stranded' AND claimable=1 AND json_extract(facts,'$.status') IS NOT 'unspent' AND probeTip>walk.t AND probeTip<?1),n+1 FROM walk WHERE walk.t IS NOT NULL AND n<?3) SELECT r.identity,r.outpoint,r.beltDueAtMs FROM walk CROSS JOIN owed_rows r INDEXED BY idx_owed_rows_sweep WHERE walk.t IS NOT NULL AND r.family='hop-stranded' AND r.claimable=1 AND json_extract(r.facts,'$.status') IS NOT 'unspent' AND r.probeTip=walk.t AND r.beltDueAtMs<=?2 LIMIT ?3";
 /// The places of a tick reserved for the second class (the third delta lens's D3-M1) whenever it holds a due row.
 pub const OWED_BELT_SECOND_CLASS_RESERVED: usize = 2;
 /// The first class's rows read a tick at most.
