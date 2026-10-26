@@ -727,9 +727,9 @@ pub fn collected_challenge(game_id_lc: &str, identity_lc: &str) -> Vec<u8> {
 // 3. ONCE. One filing per (game, payTxid), remembered in a device memo keyed by both, never one per read of
 //    `/owed`. A row still served after its filing answered 200 is NOT a reason to file again (the read may
 //    simply be older than the write; a replaced spend has another `payTxid`, which is another filing). A
-//    re-file repairs nothing (the B3 delta lens D-L3): if the write's stale mark was missed, the list heals
-//    at the read's age rule (15 minutes, `owed::OWED_RECOMPUTE_ANY_AFTER_MS`), and a re-file answers `alreadyFiled` and
-//    marks nothing. A device that sees a row it already filed for WAITS for the age rule, never re-files.
+//    re-file repairs nothing (the B3 delta lens D-L3): a filing is judged in its own batch, or its marks wait for the
+//    drain (bsv-low #893), and a re-file answers `alreadyFiled` and marks nothing. A device that sees a row it
+//    already filed for WAITS for the judgement, never re-files.
 // 4. ONE SHAPE. After a FRESH credit (the wallet's internalize answered and the balance rose) file the held
 //    filing ALONE: it is exact, and it is one row of the day budget. The v1 marker is for nothing new.
 // 5. NOTHING TO FILE for a row with `payTxid: null` or `claimable: false`: the wallet cannot hold what has not

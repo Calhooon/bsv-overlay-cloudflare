@@ -85,7 +85,7 @@ try {
   console.log('owed-empty-read', JSON.stringify(empty.cost))
   assert.equal(fleet.body.pending, 0)
   assert.equal(fleet.body.rows.length, 500)
-  assert.equal(fleet.body.markerlessProgress, null)
+  assert.equal('markerlessProgress' in fleet.body, false, 'the ring retired: markerlessProgress is gone (bsv-low #893 section 6.2)')
   assert.ok(Number.isInteger(fleet.body.recomputeSeq) && fleet.body.recomputeSeq > 0)
   // the belt's date (lane D2-OWED-BELT): a young in-progress hop at its marker + 30 min, every other row of the seed none
   for (const row of fleet.body.rows) {

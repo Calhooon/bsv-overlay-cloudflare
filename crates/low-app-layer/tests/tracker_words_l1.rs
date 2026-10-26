@@ -262,10 +262,10 @@ fn l1_routes_wire_the_outpoint_words() {
         spent.contains("runtime::decorate_outpoints("),
         "spent-any skips the outpoint words"
     );
-    let runtime_src = include_str!("../src/tracker_host/runtime.rs");
-    let owed_read = &runtime_src[runtime_src.find("pub async fn owed_body(").unwrap()..];
+    // the owed read rebuilds coinWord from the joined word rows (`owed_read::Snapshot::body`, bsv-low #893)
+    let owed_read = include_str!("../src/owed_read.rs");
     assert!(
-        owed_read[..owed_read.find("\n}\n").unwrap()].contains("coin_word_value("),
+        owed_read.contains("owed::spender_coin_word("),
         "the owed read rebuilds coinWord without its tuple"
     );
 }

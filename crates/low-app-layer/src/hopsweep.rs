@@ -350,10 +350,6 @@ pub const HOP_CONTEXT_SQL: &str = "SELECT identity, opponentIdentity, gameId, ho
             hopLockHex, hopSatsOnChain, markerValid \
      FROM hopparty_records WHERE txid = ?1 AND hopVout = ?2 AND identity = ?3 \
      ORDER BY COALESCE(markerValid, 0) DESC, createdAt ASC, rowid ASC LIMIT 1";
-/// Every filed sweep of an identity, newest first (the owed recompute keeps the newest per hop outpoint).
-pub const HOPSWEEPS_FOR_IDENTITY_SQL: &str =
-    "SELECT hopTxid, hopVout, sweepTxid, sweepRawHex FROM hopsweep_records \
-     WHERE identity = ?1 ORDER BY createdAt DESC, rowid DESC LIMIT 500";
 
 /// bsv-low #517: the filed sweeps the index holds PROVEN, one chunk of txids per ask (the caller closes the `IN (`
 /// list with its placeholders). `has_proof = 1` is the latch only the chaintracks-verified stitch sets (the admit
@@ -753,7 +749,6 @@ pub(crate) mod tests {
             HOPSWEEP_FILED_ROWS_SQL,
             HOPSWEEP_FILED_TODAY_SQL,
             HOPSWEEP_CHAIN_ROWS_SQL,
-            HOPSWEEPS_FOR_IDENTITY_SQL,
         ] {
             assert!(sql.contains("hopsweep_records"));
         }

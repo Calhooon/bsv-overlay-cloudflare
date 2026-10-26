@@ -136,7 +136,8 @@ fn owed893_schema_is_additive_replayable_and_keeps_the_old_walks_rows() {
     }
     let db = schema();
     db.execute(
-        low_app_layer::owed::OWED_ROW_INSERT_SQL,
+        // an old worker's row (its column set, before the #893 columns)
+        "INSERT INTO owed_rows (identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             "owner",
             "pot:0",
@@ -183,11 +184,11 @@ fn owed893_app_layer_schema_text_is_byte_identical_to_the_overlay() {
 }
 
 #[test]
-fn owed893_old_walk_delete_clears_words_in_the_same_statement() {
+fn owed893_a_row_delete_clears_its_words_in_the_same_statement() {
     let db = schema();
     for id in ["owner", "bystander"] {
         db.execute(
-            low_app_layer::owed::OWED_ROW_INSERT_SQL,
+            "INSERT INTO owed_rows (identity, outpoint, family, gameId, sats, opponentIdentity, atHeight, facts, updatedAtMs, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![id, "pot:0", "payout", "game", 100, "other", 20, "{}", 1_000, "paid"],
         )
         .unwrap();
@@ -196,8 +197,8 @@ fn owed893_old_walk_delete_clears_words_in_the_same_statement() {
     db.execute_batch("CREATE TEMP TRIGGER fail_word_delete AFTER DELETE ON owed_row_words BEGIN SELECT RAISE(ABORT,'word delete failed'); END;").unwrap();
     assert!(db
         .execute(
-            low_app_layer::owed::OWED_ROWS_DELETE_SQL,
-            rusqlite::params!["owner", 1_000]
+            "DELETE FROM owed_rows WHERE identity = ?1",
+            rusqlite::params!["owner"]
         )
         .is_err());
     for table in ["owed_rows", "owed_row_words"] {
@@ -210,8 +211,8 @@ fn owed893_old_walk_delete_clears_words_in_the_same_statement() {
     }
     db.execute_batch("DROP TRIGGER fail_word_delete").unwrap();
     db.execute(
-        low_app_layer::owed::OWED_ROWS_DELETE_SQL,
-        rusqlite::params!["owner", 1_000],
+        "DELETE FROM owed_rows WHERE identity = ?1",
+        rusqlite::params!["owner"],
     )
     .unwrap();
     assert_eq!(

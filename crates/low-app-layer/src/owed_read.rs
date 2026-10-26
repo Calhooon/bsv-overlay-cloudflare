@@ -278,7 +278,7 @@ impl Snapshot {
                 }
             }
         }
-        let mut body = json!({"v":owed::OWED_WIRE_VERSION,"identity":identity,"tip":tip,"rows":rows,"truncated":truncated,"computedAtMs":self.state.as_ref().and_then(|s|number(&s["computedAtMs"])).unwrap_or(0),"pending":self.pending,"markerlessProgress":null});
+        let mut body = json!({"v":owed::OWED_WIRE_VERSION,"identity":identity,"tip":tip,"rows":rows,"truncated":truncated,"computedAtMs":self.state.as_ref().and_then(|s|number(&s["computedAtMs"])).unwrap_or(0),"pending":self.pending});
         if let Some(seq) = self.state.as_ref().and_then(|s| number(&s["recomputeSeq"])) {
             body["recomputeSeq"] = json!(seq);
         }

@@ -1270,11 +1270,12 @@ mod tests {
     /// Fleet loop 15 (2026-09-20, pair 1's refundLandedVerify): a pot whose seats never filed their party
     /// markers (both tabs killed at the funding) has owed rows for the identities the refund-backup and hop
     /// markers name; its CONFIRM event reached the "no attributed seats" branch, filed nothing and marked
-    /// nobody stale, so the rows said "wait for a block" for a spend that had confirmed. The branch now marks
-    /// the marker-named identities stale and queues their re-derivation, like the no-decoded-params branch.
-    /// To red: drop `owed_identities_by_marker` / `owed_mark_stale` from that branch.
+    /// nobody stale, so the rows said "wait for a block" for a spend that had confirmed. The branch now queues the
+    /// marker-named identities for the judge, like the no-decoded-params branch (bsv-low #893: the judge's drain is
+    /// the re-derivation; the old `owed_state.stale` mark retired with the walk). To red: drop the queue from that
+    /// branch.
     #[test]
-    fn internal_pot_changed_marks_the_marker_named_identities_stale_when_no_seat_is_attributed() {
+    fn internal_pot_changed_queues_the_marker_named_identities_when_no_seat_is_attributed() {
         // E649 L4: the branch is the seam's (`pot_hook::apply_pot_changed`), executed by
         // `pot_hook::tests::e649f_h2_*` over the real store's SQL; here, that the D1 store reads the three marker arms,
         // the refund-backup one included (the one marker a seat killed at the funding filed).
@@ -1307,11 +1308,10 @@ mod tests {
         let body = &body[..body
             .find(&squash("out.skipped.push("))
             .expect("the branch skips")];
-        let stale = body.find(&squash("out.stale_marks")).expect("marked stale");
-        let queued = body
-            .find(&squash("push_unique(&mut out.owed_identities, id)"))
-            .expect("and queued for the recompute");
-        assert!(stale < queued, "mark stale, then queue");
+        assert!(
+            body.contains(&squash("push_unique(&mut out.owed_identities, id)")),
+            "queued for the judge"
+        );
     }
 
     #[test]

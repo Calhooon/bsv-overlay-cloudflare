@@ -153,7 +153,6 @@ pub mod logic;
 pub mod owed;
 pub mod owed_backfill;
 pub mod owed_belt;
-pub mod owed_cursor;
 pub mod owed_judge;
 pub mod owed_read;
 pub mod pass_meter;
@@ -830,3 +829,7 @@ mod b_cost_1_wiring {
 /// FAST-C-LENS and FAST-C-FOLD: regression cases over the handfile family.
 #[cfg(test)]
 mod handfile_lens;
+
+// bsv-low #893 section 6.2: the retired owed walk's rows, frozen, against the judge.
+#[cfg(test)]
+mod owed_walk_frozen;

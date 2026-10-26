@@ -529,12 +529,6 @@ pub struct TxAnyAnswer {
     pub observed_at_ms: Option<i64>,
 }
 
-/// Content-addressed bytes describe the spender even when its presence is hearsay.
-/// Reading these bytes does not confer confirmation or authorize a money action.
-pub fn fact_reader_raw_hex(answer: &TxAnyAnswer) -> Option<&str> {
-    answer.raw_hex.as_deref()
-}
-
 /// bsv-low #692 (RC-L34-OWED-COURIER-RETIRE): is this `/tx-any` answer a CHAINTRACKS-CHECKED mined word?
 /// `confirmed == Some(true)` AND a proven `height` — the index BUMP's (`decide_tx_any`'s index leg), or the
 /// external leg's `/proof/tsc` bound through [`mined_proof_matches`] against the canonical root chaintracks holds

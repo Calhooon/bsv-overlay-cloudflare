@@ -1753,16 +1753,33 @@ pub(crate) mod tests {
             (mv, lock.as_str(), sats),
             (1, facts.lock_hex.as_str(), HOP_SATS as i64)
         );
-        // the owed list's evidence rule (the K binding, bsv-low #610) reads the exploded v2 row
-        let owed = crate::owed::markerless_seats_sql(1);
-        let found: Option<String> = conn
-            .query_row(
-                &owed,
-                rusqlite::params![hand.poster(), hex::encode(hand.pot_txid)],
-                |r| r.get(0),
+        // the owed judge's party read (`owed_judge::PARTIES_SQL`, the K binding of bsv-low #610: a verified seat
+        // with its settle key) reads the exploded v2 row
+        let mut st = conn.prepare(crate::owed_judge::PARTIES_SQL).unwrap();
+        let parties: Vec<(String, Option<i64>, Option<String>)> = st
+            .query_map(
+                rusqlite::params![
+                    hand.poster(),
+                    serde_json::json!([hex::encode(hand.game_id)]).to_string()
+                ],
+                |r| {
+                    Ok((
+                        r.get("potTxid")?,
+                        r.get("sigValid")?,
+                        r.get("seatSettlePubkey")?,
+                    ))
+                },
             )
-            .ok();
-        assert_eq!(found.as_deref(), Some(hex::encode(hand.pot_txid).as_str()));
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            parties.iter().any(|(pot, valid, key)| pot
+                .eq_ignore_ascii_case(&hex::encode(hand.pot_txid))
+                && *valid == Some(1)
+                && key.is_some()),
+            "the judge reads the exploded v2 row, verified with its settle key: {parties:?}"
+        );
         // the direct door's cap counts the exploded rows: a third potparty content is refused
         let (rows_sql, binds, _, _) = crate::record_post::cap_queries(&VerifiedRecord::Potparty(
             {
