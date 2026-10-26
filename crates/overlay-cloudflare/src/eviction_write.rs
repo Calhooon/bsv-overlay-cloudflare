@@ -26,12 +26,21 @@ const READMISSION_FENCE_SQL: &str = "INSERT INTO pot_evictions (txid,reason,evic
 
 /// Checks 1 and 2 of owed::markerless_released_hops, on the rows this batch moved:
 /// one verified game/key per identity, all structurally valid commitments agreeing, K on exactly one seat.
+/// Check 1's attestation is ANY ONE of the identity's verified twin party row or its VERIFIED hop marker for this
+/// hop (`?2:?3`; register row D1's #610, D2-OWED-HOME-MARKER): the marker arm names only an identity with no
+/// verified twin party row, so a seat the party row binds is judged exactly as before.
 /// Check 3 is the hash-verified BEEF output comparison in evidence_inserts below.
 pub const EVIDENCE_INSERT_SQL: &str = "WITH seats AS (\
  SELECT lower(identity) AS identity,lower(gameId) AS gameId,lower(seatSettlePubkey) AS seatKey \
  FROM potparty_records_evicted INDEXED BY idx_evicted_party_pot \
  WHERE potTxid=?1 AND sigValid=1 AND seatSettlePubkey IS NOT NULL GROUP BY lower(identity) \
- HAVING MIN(lower(gameId))=MAX(lower(gameId)) AND MIN(lower(seatSettlePubkey))=MAX(lower(seatSettlePubkey))\
+ HAVING MIN(lower(gameId))=MAX(lower(gameId)) AND MIN(lower(seatSettlePubkey))=MAX(lower(seatSettlePubkey)) \
+ UNION ALL SELECT lower(hp.identity),lower(hp.gameId),lower(hp.seatSettlePubkey) \
+ FROM hopparty_records hp INDEXED BY idx_hopparty_hop \
+ WHERE hp.txid=?2 AND hp.hopVout=?3 AND hp.markerValid=1 \
+ AND NOT EXISTS (SELECT 1 FROM potparty_records_evicted x INDEXED BY idx_evicted_party_pot WHERE x.potTxid=?1 AND x.sigValid=1 AND x.seatSettlePubkey IS NOT NULL AND lower(x.identity)=lower(hp.identity)) \
+ GROUP BY lower(hp.identity) \
+ HAVING MIN(lower(hp.gameId))=MAX(lower(hp.gameId)) AND MIN(lower(hp.seatSettlePubkey))=MAX(lower(hp.seatSettlePubkey))\
 ), committed AS (\
  SELECT lower(pubA) AS a,lower(pubB) AS b,lower(payPkhA) AS pa,lower(payPkhB) AS pb \
  FROM pot_records_evicted INDEXED BY idx_evicted_pot_txid WHERE txid=?1 \
@@ -50,8 +59,9 @@ pub const EVIDENCE_INSERT_SQL: &str = "WITH seats AS (\
 /// D2-OWED-FOLD-8: the released outpoints of `?2` (a JSON array of `{"txid","vout"}`; `?3` whether the bytes
 /// parsed) the evicted JOIN's stored bytes cannot judge (absent, undecodable, or not carrying the hop's transaction), named for each verified seat of the JOIN
 /// by check 1's seats (one game and key per identity), each a released `pot_records` spend of the open eviction (a
-/// ledger entry with no `table` field is a `pot_records` spend, as the old walk read it). The judge serves each as
-/// the old walk's could-not-judge row; a later evidence row for the hop takes it over.
+/// ledger entry with no `table` field is a `pot_records` spend, as the old walk read it), and for each identity with
+/// no verified twin party row whose VERIFIED hop marker names a listed hop (D2-OWED-HOME-MARKER). The judge serves
+/// each as the old walk's could-not-judge row; a later evidence row for the hop takes it over.
 pub const MISSING_INSERT_SQL: &str = "WITH seats AS (\
  SELECT lower(identity) AS identity,lower(gameId) AS gameId \
  FROM potparty_records_evicted INDEXED BY idx_evicted_party_pot \
@@ -61,6 +71,12 @@ pub const MISSING_INSERT_SQL: &str = "WITH seats AS (\
  SELECT DISTINCT s.identity,s.gameId,lower(json_extract(o.value,'$.txid')),json_extract(o.value,'$.vout'),?1,e.evictedAt,?3 \
  FROM seats s JOIN pot_evictions e ON e.txid=?1 JOIN json_each(?2) o \
  WHERE e.readmittedAt IS NULL \
+ AND EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r WHERE IFNULL(json_extract(r.value,'$.table'),'pot_records')='pot_records' AND lower(json_extract(r.value,'$.txid'))=lower(json_extract(o.value,'$.txid')) AND json_extract(r.value,'$.vout')=json_extract(o.value,'$.vout')) \
+ UNION SELECT lower(hp.identity),lower(hp.gameId),lower(json_extract(o.value,'$.txid')),json_extract(o.value,'$.vout'),?1,e.evictedAt,?3 \
+ FROM json_each(?2) o JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=lower(json_extract(o.value,'$.txid')) AND hp.hopVout=json_extract(o.value,'$.vout') \
+ JOIN pot_evictions e ON e.txid=?1 \
+ WHERE e.readmittedAt IS NULL AND hp.markerValid=1 \
+ AND NOT EXISTS (SELECT 1 FROM potparty_records_evicted x INDEXED BY idx_evicted_party_pot WHERE x.potTxid=?1 AND x.sigValid=1 AND x.seatSettlePubkey IS NOT NULL AND lower(x.identity)=lower(hp.identity)) \
  AND EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r WHERE IFNULL(json_extract(r.value,'$.table'),'pot_records')='pot_records' AND lower(json_extract(r.value,'$.txid'))=lower(json_extract(o.value,'$.txid')) AND json_extract(r.value,'$.vout')=json_extract(o.value,'$.vout')) \
  ON CONFLICT(identity,gameId,hopTxid,hopVout) DO UPDATE SET potTxid=excluded.potTxid,evictedAt=excluded.evictedAt,bytesRead=excluded.bytesRead";
 
@@ -800,6 +816,118 @@ mod tests {
                 "each seat's game is marked for each hop"
             );
         }
+    }
+
+    /// The seat of hop 0 has NO party row (its filing never landed: beta's courier-retire hand 3, game 39cf...);
+    /// its VERIFIED hop marker names the hop, the identity, the game and K. `game` is the marker's game.
+    fn home_marker_fixture(marker_valid: i64, marker_key: usize, game: &str) -> Fixture {
+        let f = fixture();
+        f.db.execute(
+            "DELETE FROM potparty_records WHERE identity='identity-0'",
+            [],
+        )
+        .unwrap();
+        f.db.execute("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,markerValid,txid,outputIndex,createdAt) VALUES ('identity-0','opponent',?1,0,20190,?2,'00','00',2,?3,?4,1,1)", params![game, f.keys[marker_key], marker_valid, f.hops[0]]).unwrap();
+        f
+    }
+
+    fn evidence(db: &Connection) -> Vec<(String, String, String, String, i64)> {
+        db.prepare("SELECT hopTxid,identity,gameId,seatSettlePubkey,hopSats FROM released_hop_evidence ORDER BY identity")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn skipped(db: &Connection) -> i64 {
+        db.query_row(
+            "SELECT IFNULL((SELECT value FROM ops_counters WHERE name='released_hop_evidence_skipped_total'),0)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// D2-OWED-HOME-MARKER (a): the identity's signed attestation binding a hop is ANY ONE of its verified party row
+    /// or its VERIFIED hop marker (register row D1's #610). A seat with a verified marker and no party row gets its
+    /// evidence row from the marker's K and game, through the same checks 2 and 3 (the twin committing K on exactly
+    /// one seat, the JOIN's bytes paying hash160(K) at the hop). An unverified marker, or one naming a key the hop
+    /// does not pay, writes nothing.
+    #[test]
+    fn home_marker_a_a_verified_marker_without_a_party_row_writes_the_evidence() {
+        let f = home_marker_fixture(1, 0, "game-m");
+        execute(&f.db, &plan(&f.snapshot, &f.join, "REJECTED", 1_000)).unwrap();
+        assert_eq!(
+            evidence(&f.db),
+            vec![
+                (
+                    f.hops[0].clone(),
+                    "identity-0".into(),
+                    "game-m".into(),
+                    f.keys[0].clone(),
+                    20_190
+                ),
+                (
+                    f.hops[1].clone(),
+                    "identity-1".into(),
+                    "game".into(),
+                    f.keys[1].clone(),
+                    20_191
+                ),
+            ],
+            "the marker's K binds hop 0 as the party row would"
+        );
+        assert_eq!(skipped(&f.db), 0);
+        for (valid, key) in [(0, 0), (1, 1)] {
+            let f = home_marker_fixture(valid, key, "game-m");
+            execute(&f.db, &plan(&f.snapshot, &f.join, "REJECTED", 1_000)).unwrap();
+            let rows = evidence(&f.db);
+            assert_eq!(rows.len(), 1, "markerValid={valid} key={key}: {rows:?}");
+            assert_eq!(rows[0].1, "identity-1");
+            assert_eq!(skipped(&f.db), 1);
+        }
+    }
+
+    /// D2-OWED-HOME-MARKER (b): a marker-bound seat whose JOIN's bytes cannot judge the hop is never silence: the
+    /// missing row names it (keyed by the marker's identity and game), and the hop is counted unwritten. A hop with
+    /// NEITHER a party row nor a verified marker has no identity to key a row by: it is counted, and nothing names it.
+    #[test]
+    fn home_marker_b_unreadable_bytes_name_the_marker_seat_and_neither_is_counted() {
+        let mut f = home_marker_fixture(1, 0, "game-m");
+        f.snapshot.beef = None;
+        execute(&f.db, &plan(&f.snapshot, &f.join, "REJECTED", 1_000)).unwrap();
+        let rows: Vec<(String, String, String)> = f
+            .db
+            .prepare("SELECT identity,gameId,hopTxid FROM released_hop_evidence_missing ORDER BY identity,hopTxid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut hops = f.hops.clone();
+        hops.sort();
+        let mut want = vec![(
+            "identity-0".to_string(),
+            "game-m".to_string(),
+            f.hops[0].clone(),
+        )];
+        want.extend(
+            hops.iter()
+                .map(|h| ("identity-1".to_string(), "game".to_string(), h.clone())),
+        );
+        assert_eq!(
+            rows, want,
+            "the marker's seat names its own hop, the party seat every released hop"
+        );
+        assert_eq!(skipped(&f.db), 2);
+
+        let f = home_marker_fixture(0, 0, "game-m");
+        f.db.execute("DELETE FROM potparty_records", []).unwrap();
+        execute(&f.db, &plan(&f.snapshot, &f.join, "REJECTED", 1_000)).unwrap();
+        assert_eq!(count(&f.db, "released_hop_evidence"), 0);
+        assert_eq!(count(&f.db, "released_hop_evidence_missing"), 0);
+        assert_eq!(skipped(&f.db), 2, "neither: counted, no identity to name");
     }
 
     #[test]
