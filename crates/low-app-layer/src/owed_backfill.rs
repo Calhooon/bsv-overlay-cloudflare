@@ -196,6 +196,8 @@ pub struct BackfillReport {
     /// The open evictions recorded and passed this pass after [`OWED_BACKFILL_IDENTITY_FAULTS_MAX`] faulted passes
     /// (D2-OWED-FOLD-9), named on the scheduled pass's line and the lever's answer.
     pub skipped_evictions: Vec<String>,
+    /// Released spends with no `table` field the phase read (NOTE-A), each eviction logged by txid.
+    pub tableless_spends: u64,
     pub identities: usize,
     pub rows: usize,
     pub batches: usize,
@@ -303,12 +305,16 @@ async fn backfill_identity(
     }
 }
 
-/// The released `pot_records` outpoints of a ledger row (an entry with no `table` field is one, as the old walk read it).
-fn released_of(raw: Option<&str>) -> Vec<(String, u32)> {
+/// The released `pot_records` outpoints of a ledger row (an entry with no `table` field is one, as the old walk read it),
+/// and how many of them carried no `table` field (D2-OWED-FOLD-9, the fifth delta lens's NOTE-A: the writer's
+/// evidence statement requires the field, so such an entry with readable bytes gets neither row; never written by the
+/// overlay since 45c4a63b, it is counted and named rather than silent).
+fn released_of(raw: Option<&str>) -> (Vec<(String, u32)>, usize) {
     let Some(Ok(Value::Array(entries))) = raw.map(serde_json::from_str::<Value>) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let mut out = Vec::new();
+    let mut tableless = 0;
     for e in entries {
         if e.get("table")
             .and_then(Value::as_str)
@@ -329,10 +335,11 @@ fn released_of(raw: Option<&str>) -> Vec<(String, u32)> {
         }
         let hop = (txid.to_ascii_lowercase(), vout);
         if !out.contains(&hop) {
+            tableless += usize::from(e.get("table").is_none());
             out.push(hop);
         }
     }
-    out
+    (out, tableless)
 }
 
 fn first_beef(out: &[crate::pot_hook::StmtOut]) -> Option<Vec<u8>> {
@@ -490,7 +497,11 @@ async fn evidence_phase(
                 .as_str()
                 .ok_or("open eviction without a txid")?
                 .to_owned();
-            let released = released_of(e["releasedSpends"].as_str());
+            let (released, tableless) = released_of(e["releasedSpends"].as_str());
+            if tableless > 0 {
+                report.tableless_spends += tableless as u64;
+                db.log(&format!("[owed-backfill] eviction {txid}: {tableless} released spend(s) carry no table field, read as pot_records (the writer's evidence statement refuses them)"));
+            }
             let counted = faults["txid"] == txid.as_str();
             match evidence_one(db, deadline, &txid, &released, counted, report).await {
                 Ok(None) => return Ok(false),
@@ -870,6 +881,7 @@ pub async fn lever(req: worker::Request, env: &worker::Env) -> worker::Result<wo
             "evidenceCandidates": r.evidence_candidates,
             "missingOutpoints": r.missing_outpoints,
             "skippedEvictions": r.skipped_evictions,
+            "tablelessSpends": r.tableless_spends,
             "identities": r.identities,
             "rows": r.rows,
             "batches": r.batches,

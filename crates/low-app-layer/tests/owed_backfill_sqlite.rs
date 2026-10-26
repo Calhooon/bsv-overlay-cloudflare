@@ -704,6 +704,8 @@ async fn fold8_c_the_evidence_phase_visits_each_open_eviction_once_and_ends() {
         "the missing JOIN's two released hops, one with no table field"
     );
     assert_eq!(r.evidence_candidates, 0, "no fleet JOIN's bytes are stored");
+    // NOTE-A (D2-OWED-FOLD-9): the one released spend with no table field is counted, not silent
+    assert_eq!(r.tableless_spends, 1, "{r:?}");
     assert!(r.missing_outpoints >= 2, "{r:?}");
     assert_eq!(
         db.counters.borrow()["owed_backfill_evictions_total"] as i64,
