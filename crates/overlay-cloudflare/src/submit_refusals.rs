@@ -39,7 +39,7 @@
 //!
 //! Written after the answer is decided, under `wait_until`, fail-soft: the
 //! door's verdict never depends on it. Read by the app layer alone, by the
-//! walking identity's own hop outpoints (`owed::OWED_DOOR_REFUSALS_SQL`).
+//! judged identity's own hop outpoints, one by key (`owed_judge::DOOR_REFUSAL_SQL`).
 //!
 //! COST of one refused submit, after this fold: one signature check per
 //! judged input (at most `SUBMIT_REFUSAL_MAX_INPUTS`), one D1 read, and for a
