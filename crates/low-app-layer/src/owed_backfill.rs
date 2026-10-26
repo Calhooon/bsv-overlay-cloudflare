@@ -9,6 +9,18 @@
 //! games marked `source = 'backfill'` and judged [`OWED_BACKFILL_GAMES_PER_BATCH`] a batch through the shipped judge,
 //! then the cursor saved. The stamp lands in the batch that saves the cursor past the last identity.
 //!
+//! Before the identities (D2-OWED-FOLD-8), the pass writes the released-hop evidence of every OPEN eviction made
+//! before the overlay's eviction writer existed: [`OWED_BACKFILL_EVICTIONS_PER_PAGE`] open evictions a page past the
+//! cursor [`OWED_BACKFILL_EVICTIONS`], ascending by txid, each one naming no evidence row for any of its released
+//! outpoints, judged by the WRITER's own three checks (its two statements, byte for byte the overlay's, over the
+//! evicted twins, and its check 3, `overlay_discovery::pot::released_evidence::evidence_writes`, over the JOIN's stored
+//! bytes); a JOIN whose bytes are absent or undecodable names its released outpoints per verified seat
+//! (`released_hop_evidence_missing`), so the judge serves the old walk's could-not-judge row. The phase ends with its
+//! cursor at [`EVICTIONS_DONE`]; only then are identities visited. The identities come from `potparty_records`,
+//! `hopparty_records` AND the evicted twin (`potparty_records_evicted`, a verified seat with its settle key, of an open
+//! eviction: the #610 rule), so a seat whose only party row was moved by an eviction is judged too; the one identity
+//! cursor walks the union of the three in identity order, a twin-named identity named by its identity as the others.
+//!
 //! An identity the wall cuts keeps its remaining marks (the drain may judge them too) and its `open` row, so the next
 //! pass finishes its marks and never re-marks it from the start: an identity bigger than one pass still converges.
 //!
@@ -38,21 +50,82 @@ pub const OWED_AGE_REMARKS_PER_PASS: usize = 128;
 pub const OWED_BACKFILL_IDENTITY_FAULTS_MAX: usize = 3;
 /// The `owed_belt_state` row counting the open identity's consecutive faulted passes (`{"identity":..,"faults":n}`).
 pub const OWED_BACKFILL_FAULTS: &str = "backfill:owed-v2:faults";
+/// The `owed_belt_state` row holding the last eviction the evidence phase wrote ('' or absent before the first).
+pub const OWED_BACKFILL_EVICTIONS: &str = "backfill:owed-v2:evictions";
+/// The evidence phase's cursor once its last page was short: past every hex txid, so the page read finds none.
+pub const EVICTIONS_DONE: &str = "~";
+/// One page of open evictions (each a ledger read beside it, two reads and one write batch an eviction).
+pub const OWED_BACKFILL_EVICTIONS_PER_PAGE: usize = 32;
 
 pub const COUNTER_IDENTITIES: &str = "owed_backfill_identities_total";
 pub const COUNTER_ROWS: &str = "owed_backfill_rows_total";
 pub const COUNTER_AGED: &str = "owed_age_remarked_total";
 pub const COUNTER_SKIPPED: &str = "owed_backfill_skipped_identities_total";
+pub const COUNTER_EVICTIONS: &str = "owed_backfill_evictions_total";
+pub const COUNTER_EVIDENCE: &str = "owed_backfill_evidence_rows_total";
+pub const COUNTER_MISSING: &str = "owed_backfill_evidence_missing_total";
 pub fn counter_names() -> Vec<String> {
-    [COUNTER_IDENTITIES, COUNTER_ROWS, COUNTER_AGED, COUNTER_SKIPPED]
-        .map(str::to_owned)
-        .to_vec()
+    [
+        COUNTER_IDENTITIES,
+        COUNTER_ROWS,
+        COUNTER_AGED,
+        COUNTER_SKIPPED,
+        COUNTER_EVICTIONS,
+        COUNTER_EVIDENCE,
+        COUNTER_MISSING,
+    ]
+    .map(str::to_owned)
+    .to_vec()
 }
 
 /// The stamped replay's one statement: a primary-key read of one row.
 pub const STAMP_SQL: &str = "SELECT 1 AS stamped FROM view_derivation_state WHERE name='owed-v2'";
 /// The gate (the overlay's certified migration list) and both cursor rows, each a primary-key read.
-pub const GATE_SQL: &str = "SELECT (SELECT value FROM ops_counters WHERE name='overlay_migration_count') AS count,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2') AS cursor,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:open') AS open,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:faults') AS faults";
+pub const GATE_SQL: &str = "SELECT (SELECT value FROM ops_counters WHERE name='overlay_migration_count') AS count,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2') AS cursor,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:open') AS open,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:faults') AS faults,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:evictions') AS evictions";
+/// The open evictions past the cursor, ascending, each naming no evidence row of its own for any released outpoint
+/// (an eviction the writer saw has them; each probe a primary-key search of the evidence by outpoint).
+pub const EVICTIONS_SQL: &str = "SELECT e.txid,e.releasedSpends FROM pot_evictions e WHERE e.txid>?1 AND e.readmittedAt IS NULL AND e.releasedSpends IS NOT NULL AND NOT EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r JOIN released_hop_evidence h ON h.hopTxid=lower(json_extract(r.value,'$.txid')) AND h.hopVout=json_extract(r.value,'$.vout') WHERE h.potTxid=e.txid AND h.evictedAt=e.evictedAt) ORDER BY e.txid LIMIT ?2";
+/// The JOIN's stored bytes as the writer reads them, in its order (`transactions`, then `pot_beefs`; then
+/// `transactions_evicted`, [`EVICTED_BEEF_SQL`], read alone: the overlay makes that shadow at its first eviction).
+pub const STORED_BEEF_SQL: &str = "SELECT hex(beef) AS beef FROM transactions WHERE txid = ?";
+pub const POT_BEEF_SQL: &str = "SELECT hex(beef) AS beef FROM pot_beefs WHERE txid = ?";
+pub const EVICTED_BEEF_SQL: &str =
+    "SELECT hex(beef) AS beef FROM transactions_evicted WHERE txid = ?";
+/// The writer's candidate seat keys, byte for byte the overlay's `eviction_write::SEAT_KEYS_SQL` (pinned).
+pub const SEAT_KEYS_SQL: &str = "SELECT DISTINCT lower(seatSettlePubkey) AS key FROM potparty_records_evicted INDEXED BY idx_evicted_party_pot WHERE potTxid=?1 AND sigValid=1 AND seatSettlePubkey IS NOT NULL UNION SELECT DISTINCT lower(seatSettlePubkey) AS key FROM potparty_records INDEXED BY idx_potparty_pot WHERE potTxid=?1 AND sigValid=1 AND seatSettlePubkey IS NOT NULL";
+/// The writer's evidence statement (checks 1 and 2 on the evicted rows), byte for byte the overlay's (pinned).
+pub const EVIDENCE_INSERT_SQL: &str = "WITH seats AS (\
+ SELECT lower(identity) AS identity,lower(gameId) AS gameId,lower(seatSettlePubkey) AS seatKey \
+ FROM potparty_records_evicted INDEXED BY idx_evicted_party_pot \
+ WHERE potTxid=?1 AND sigValid=1 AND seatSettlePubkey IS NOT NULL GROUP BY lower(identity) \
+ HAVING MIN(lower(gameId))=MAX(lower(gameId)) AND MIN(lower(seatSettlePubkey))=MAX(lower(seatSettlePubkey))\
+), committed AS (\
+ SELECT lower(pubA) AS a,lower(pubB) AS b,lower(payPkhA) AS pa,lower(payPkhB) AS pb \
+ FROM pot_records_evicted INDEXED BY idx_evicted_pot_txid WHERE txid=?1 \
+ AND length(pubA)=66 AND lower(pubA) NOT GLOB '*[^0-9a-f]*' \
+ AND length(pubB)=66 AND lower(pubB) NOT GLOB '*[^0-9a-f]*' \
+ AND length(payPkhA)=40 AND lower(payPkhA) NOT GLOB '*[^0-9a-f]*' \
+ AND length(payPkhB)=40 AND lower(payPkhB) NOT GLOB '*[^0-9a-f]*'\
+) INSERT INTO released_hop_evidence (hopTxid,hopVout,identity,gameId,potTxid,seatSettlePubkey,hopSats,evictedAt) \
+ SELECT DISTINCT ?2,?3,s.identity,s.gameId,?1,s.seatKey,?5,e.evictedAt FROM seats s \
+ JOIN pot_evictions e ON e.txid=?1 WHERE s.seatKey=?4 AND e.readmittedAt IS NULL \
+ AND EXISTS (SELECT 1 FROM committed c WHERE (c.a=?4)<>(c.b=?4) \
+ AND NOT EXISTS (SELECT 1 FROM committed other WHERE other.a<>c.a OR other.b<>c.b OR other.pa<>c.pa OR other.pb<>c.pb)) \
+ AND EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r WHERE json_extract(r.value,'$.table')='pot_records' AND lower(json_extract(r.value,'$.txid'))=?2 AND json_extract(r.value,'$.vout')=?3) \
+ ON CONFLICT(hopTxid,hopVout,identity) DO UPDATE SET gameId=excluded.gameId,potTxid=excluded.potTxid,seatSettlePubkey=excluded.seatSettlePubkey,hopSats=excluded.hopSats,evictedAt=excluded.evictedAt";
+/// The writer's missing-evidence statement, byte for byte the overlay's `eviction_write::MISSING_INSERT_SQL` (pinned).
+pub const MISSING_INSERT_SQL: &str = "WITH seats AS (\
+ SELECT lower(identity) AS identity,lower(gameId) AS gameId \
+ FROM potparty_records_evicted INDEXED BY idx_evicted_party_pot \
+ WHERE potTxid=?1 AND sigValid=1 AND seatSettlePubkey IS NOT NULL GROUP BY lower(identity) \
+ HAVING MIN(lower(gameId))=MAX(lower(gameId)) AND MIN(lower(seatSettlePubkey))=MAX(lower(seatSettlePubkey))\
+) INSERT INTO released_hop_evidence_missing (identity,gameId,hopTxid,hopVout,potTxid,evictedAt,bytesRead) \
+ SELECT DISTINCT s.identity,s.gameId,lower(json_extract(o.value,'$.txid')),json_extract(o.value,'$.vout'),?1,e.evictedAt,?3 \
+ FROM seats s JOIN pot_evictions e ON e.txid=?1 JOIN json_each(?2) o \
+ WHERE e.readmittedAt IS NULL \
+ AND EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r WHERE IFNULL(json_extract(r.value,'$.table'),'pot_records')='pot_records' AND lower(json_extract(r.value,'$.txid'))=lower(json_extract(o.value,'$.txid')) AND json_extract(r.value,'$.vout')=json_extract(o.value,'$.vout')) \
+ ON CONFLICT(identity,gameId,hopTxid,hopVout) DO UPDATE SET potTxid=excluded.potTxid,evictedAt=excluded.evictedAt,bytesRead=excluded.bytesRead";
+pub const EVICTIONS_CURSOR_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:evictions',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// The open identity's fault count, written by a faulted pass and cleared ('{}') by its identity's save.
 pub const FAULTS_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:faults',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// An identity passed by after its faults: its row names the last fault (bounded), its marks stay for the drain.
@@ -60,9 +133,10 @@ pub const SKIPPED_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtM
 /// Arm the cursor; a pass that finds it armed begins.
 pub const ARM_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2','',?1) ON CONFLICT(name) DO NOTHING";
 /// The identities past the cursor, distinct and ascending, each side bounded on its own identity index.
-pub const IDENTITIES_SQL: &str = "SELECT identity FROM (SELECT identity FROM (SELECT DISTINCT identity FROM potparty_records INDEXED BY idx_potparty_identity WHERE identity>?1 ORDER BY identity LIMIT ?2) UNION SELECT identity FROM (SELECT DISTINCT identity FROM hopparty_records INDEXED BY idx_hopparty_identity WHERE identity>?1 ORDER BY identity LIMIT ?2)) ORDER BY identity LIMIT ?2";
+/// D2-OWED-FOLD-8: and the verified seats of the evicted twin of an OPEN eviction (the #610 rule), by its identity index.
+pub const IDENTITIES_SQL: &str = "SELECT identity FROM (SELECT identity FROM (SELECT DISTINCT identity FROM potparty_records INDEXED BY idx_potparty_identity WHERE identity>?1 ORDER BY identity LIMIT ?2) UNION SELECT identity FROM (SELECT DISTINCT identity FROM hopparty_records INDEXED BY idx_hopparty_identity WHERE identity>?1 ORDER BY identity LIMIT ?2) UNION SELECT identity FROM (SELECT DISTINCT p.identity FROM potparty_records_evicted p INDEXED BY idx_evicted_party_identity_game WHERE p.identity>?1 AND p.sigValid=1 AND p.seatSettlePubkey IS NOT NULL AND EXISTS (SELECT 1 FROM pot_evictions e WHERE e.txid=p.potTxid AND e.readmittedAt IS NULL) ORDER BY p.identity LIMIT ?2)) ORDER BY identity LIMIT ?2";
 /// Every game of the identity the judge's wanted expansion names, marked `backfill`.
-pub const MARK_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,gameId,'backfill','owed-v2',?2 FROM (SELECT gameId FROM potparty_records WHERE identity=?1 UNION SELECT gameId FROM hopparty_records WHERE identity=?1 UNION SELECT gameId FROM released_hop_evidence WHERE identity=?1 UNION SELECT gameId FROM owed_rows WHERE identity=?1) WHERE gameId<>'' ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
+pub const MARK_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,gameId,'backfill','owed-v2',?2 FROM (SELECT gameId FROM potparty_records WHERE identity=?1 UNION SELECT gameId FROM hopparty_records WHERE identity=?1 UNION SELECT gameId FROM released_hop_evidence WHERE identity=?1 UNION SELECT gameId FROM released_hop_evidence_missing WHERE identity=?1 UNION SELECT gameId FROM owed_rows WHERE identity=?1) WHERE gameId<>'' ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
 pub const OPEN_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:open',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// The whole identity is rebuilt by this backfill, so its earlier overflow flag is judged again (the judge ORs it).
 pub const TRUNCATED_RESET_SQL: &str = "UPDATE owed_state SET truncated=0 WHERE identity=?1";
@@ -103,6 +177,10 @@ pub enum Stop {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BackfillReport {
     pub stop: Stop,
+    /// Open evictions the evidence phase examined this pass, and the evidence and missing-evidence rows it wrote.
+    pub evictions: usize,
+    pub evidence_rows: u64,
+    pub missing_rows: u64,
     pub identities: usize,
     pub rows: usize,
     pub batches: usize,
@@ -131,7 +209,8 @@ async fn read(db: &impl SqlPort, sql: &str, binds: Vec<Bind>) -> Result<Vec<Valu
 /// so a certified count at or past it holds them; pinned against the overlay's list (the app layer does not link the
 /// overlay, so the figure is this crate's). The deploy order is the window's (the D2-OWED lens's LOW-5): the overlay
 /// first, its certified count read on `/health` at or past this figure, then the app layer.
-pub const OWED_TRIGGERS_MIGRATION_COUNT: u32 = 407;
+/// 409 since D2-OWED-FOLD-8: the evidence phase writes `released_hop_evidence_missing` (overlay migrations 408, 409).
+pub const OWED_TRIGGERS_MIGRATION_COUNT: u32 = 409;
 
 /// The gate: the overlay certified a migration list that holds the triggers (the rows' marks) and the age index.
 pub fn gate_open(count: Option<f64>) -> bool {
@@ -209,6 +288,206 @@ async fn backfill_identity(
     }
 }
 
+/// The released `pot_records` outpoints of a ledger row (an entry with no `table` field is one, as the old walk read it).
+fn released_of(raw: Option<&str>) -> Vec<(String, u32)> {
+    let Some(Ok(Value::Array(entries))) = raw.map(serde_json::from_str::<Value>) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in entries {
+        if e.get("table")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t != "pot_records")
+        {
+            continue;
+        }
+        let (Some(txid), Some(vout)) = (
+            e.get("txid").and_then(Value::as_str),
+            e.get("vout")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok()),
+        ) else {
+            continue;
+        };
+        if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let hop = (txid.to_ascii_lowercase(), vout);
+        if !out.contains(&hop) {
+            out.push(hop);
+        }
+    }
+    out
+}
+
+fn first_beef(out: &[crate::pot_hook::StmtOut]) -> Option<Vec<u8>> {
+    out.iter()
+        .filter_map(|o| o.rows.first())
+        .filter_map(|r| r["beef"].as_str())
+        .find_map(crate::logic::decode_beef_hex)
+}
+
+/// The evidence phase (D2-OWED-FOLD-8): the open evictions past `cursor` that name no evidence row, each written by
+/// the overlay's eviction writer's own checks and statements, its cursor saved in the same batch. `Ok(true)`: the
+/// phase is done, its cursor at [`EVICTIONS_DONE`]; `Ok(false)`: the wall fell first.
+async fn evidence_phase(
+    db: &impl JudgeDb,
+    deadline: &Deadline,
+    mut cursor: String,
+    report: &mut BackfillReport,
+) -> Result<bool, String> {
+    use overlay_discovery::pot::released_evidence::{evidence_writes, EvidenceWrite};
+    loop {
+        if cursor == EVICTIONS_DONE {
+            return Ok(true);
+        }
+        let Some(page) = deadline
+            .run_reserving(read(
+                db,
+                EVICTIONS_SQL,
+                vec![
+                    Bind::Text(cursor.clone()),
+                    Bind::Int(OWED_BACKFILL_EVICTIONS_PER_PAGE as i64),
+                ],
+            ))
+            .await
+        else {
+            return Ok(false);
+        };
+        let page = page?;
+        let short = page.len() < OWED_BACKFILL_EVICTIONS_PER_PAGE;
+        for e in &page {
+            let txid = e["txid"]
+                .as_str()
+                .ok_or("open eviction without a txid")?
+                .to_owned();
+            let released = released_of(e["releasedSpends"].as_str());
+            let Some(reads) = deadline
+                .run_reserving(db.run_batch(vec![
+                    Stmt {
+                        sql: SEAT_KEYS_SQL.into(),
+                        binds: vec![Bind::Text(txid.clone())],
+                    },
+                    Stmt {
+                        sql: STORED_BEEF_SQL.into(),
+                        binds: vec![Bind::Text(txid.clone())],
+                    },
+                    Stmt {
+                        sql: POT_BEEF_SQL.into(),
+                        binds: vec![Bind::Text(txid.clone())],
+                    },
+                ]))
+                .await
+            else {
+                return Ok(false);
+            };
+            let reads = reads?;
+            let seat_keys: Vec<String> = reads
+                .first()
+                .map(|o| {
+                    o.rows
+                        .iter()
+                        .filter_map(|r| r["key"].as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut beef = first_beef(reads.get(1..).unwrap_or_default());
+            if beef.is_none() {
+                let Some(evicted) = deadline
+                    .run_reserving(db.run_batch(vec![Stmt {
+                        sql: EVICTED_BEEF_SQL.into(),
+                        binds: vec![Bind::Text(txid.clone())],
+                    }]))
+                    .await
+                else {
+                    return Ok(false);
+                };
+                beef = match evicted {
+                    Ok(out) => first_beef(&out),
+                    // the shadow the overlay makes at its first eviction: none yet is no bytes
+                    Err(e) if e.contains("no such table") => None,
+                    Err(e) => return Err(e),
+                };
+            }
+            let mut writes = Vec::new();
+            let mut kinds = Vec::new();
+            for w in evidence_writes(beef.as_deref(), &txid, &released, &seat_keys) {
+                match w {
+                    EvidenceWrite::Found(f) => {
+                        kinds.push(true);
+                        writes.push(Stmt {
+                            sql: EVIDENCE_INSERT_SQL.into(),
+                            binds: vec![
+                                Bind::Text(txid.clone()),
+                                Bind::Text(f.hop_txid),
+                                Bind::Int(i64::from(f.hop_vout)),
+                                Bind::Text(f.seat_key),
+                                Bind::Int(f.sats),
+                            ],
+                        });
+                    }
+                    EvidenceWrite::Missing { list, bytes_read } => {
+                        kinds.push(false);
+                        writes.push(Stmt {
+                            sql: MISSING_INSERT_SQL.into(),
+                            binds: vec![
+                                Bind::Text(txid.clone()),
+                                Bind::Text(list),
+                                Bind::Int(i64::from(bytes_read)),
+                            ],
+                        });
+                    }
+                }
+            }
+            writes.push(Stmt {
+                sql: EVICTIONS_CURSOR_SQL.into(),
+                binds: vec![Bind::Text(txid.clone()), Bind::Int(db.now_ms() as i64)],
+            });
+            let Some(out) = deadline.run_reserving(db.run_batch(writes)).await else {
+                return Ok(false);
+            };
+            let out = out?;
+            for (found, o) in kinds.iter().zip(&out) {
+                let n = o.changes.unwrap_or(0);
+                if *found {
+                    report.evidence_rows += n;
+                } else {
+                    report.missing_rows += n;
+                }
+            }
+            report.evictions += 1;
+            cursor = txid;
+        }
+        if short {
+            let Some(done) = deadline
+                .run(db.run_batch(vec![Stmt {
+                    sql: EVICTIONS_CURSOR_SQL.into(),
+                    binds: vec![
+                        Bind::Text(EVICTIONS_DONE.into()),
+                        Bind::Int(db.now_ms() as i64),
+                    ],
+                }]))
+                .await
+            else {
+                return Ok(false);
+            };
+            done?;
+            return Ok(true);
+        }
+    }
+}
+
+async fn flush_evidence_counters(db: &impl SqlPort, report: &BackfillReport) {
+    if report.evictions > 0 {
+        db.counters(vec![
+            (COUNTER_EVICTIONS.into(), report.evictions as u64),
+            (COUNTER_EVIDENCE.into(), report.evidence_rows),
+            (COUNTER_MISSING.into(), report.missing_rows),
+        ])
+        .await;
+    }
+}
+
 /// One scheduled pass of the backfill under `deadline` (its wall and the cursor save's reserve).
 pub async fn backfill_pass(
     db: &impl JudgeDb,
@@ -239,6 +518,16 @@ pub async fn backfill_pass(
         .and_then(|f| serde_json::from_str(f).ok())
         .unwrap_or_default();
     report.cursor = Some(cursor.clone());
+    // D2-OWED-FOLD-8: the evidence of the evictions made before the writer, before any identity is judged.
+    let evictions = gate["evictions"].as_str().unwrap_or("").to_owned();
+    if evictions != EVICTIONS_DONE {
+        let phase = evidence_phase(db, deadline, evictions, &mut report).await;
+        flush_evidence_counters(db, &report).await;
+        if !phase? {
+            report.stop = Stop::Wall;
+            return Ok(report);
+        }
+    }
     let page = read(
         db,
         IDENTITIES_SQL,
@@ -468,5 +757,45 @@ mod tests {
         assert_eq!(super::OWED_BACKFILL_IDENTITIES_PER_PASS, 128);
         assert_eq!(super::OWED_BACKFILL_GAMES_PER_BATCH, 16);
         assert_eq!(super::OWED_AGE_REMARKS_PER_PASS, 128);
+    }
+
+    /// D2-OWED-FOLD-8: the evidence phase runs the overlay eviction writer's own statements, byte for byte (the app
+    /// layer does not link the overlay; its native tests do), reads the JOIN's bytes in the writer's order, and the
+    /// seeded counters are the overlay's.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn fold8_the_evidence_phase_runs_the_writers_statements() {
+        use bsv_overlay_cloudflare::admit_fast as w;
+        assert_eq!(super::EVIDENCE_INSERT_SQL, w::EVIDENCE_INSERT_SQL);
+        assert_eq!(super::MISSING_INSERT_SQL, w::MISSING_INSERT_SQL);
+        assert_eq!(super::SEAT_KEYS_SQL, w::SEAT_KEYS_SQL);
+        assert_eq!(
+            super::STORED_BEEF_SQL,
+            bsv_overlay_cloudflare::admission_abort::STORED_BEEF_SQL
+        );
+        let overlay = squash(include_str!(
+            "../../overlay-cloudflare/src/admission_abort.rs"
+        ));
+        let order = overlay
+            .find(&squash(
+                "for sql in [STORED_BEEF_SQL, POT_BEEF_SQL, EVICTED_BEEF_SQL]",
+            ))
+            .unwrap();
+        assert!(order > 0);
+        for (name, sql) in [
+            ("POT_BEEF_SQL", super::POT_BEEF_SQL),
+            ("EVICTED_BEEF_SQL", super::EVICTED_BEEF_SQL),
+        ] {
+            assert!(
+                overlay.contains(&squash(&format!("const {name}: &str = \"{sql}\";"))),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            super::counter_names(),
+            bsv_overlay_cloudflare::applayer_counters::OWED_BACKFILL
+                .map(str::to_owned)
+                .to_vec()
+        );
     }
 }

@@ -633,7 +633,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// `owed_state.rows`, so a judge reads one game's rows and one state row.
 /// 405 to 407 for #893 (lane D2-OWED-FOLD): `idx_owed_dirty_marked` and `idx_owed_dirty_identity` dropped (no reader
 /// since MEDIUM-1; each cost every mark a write).
-pub const OVERLAY_MIGRATION_COUNT: usize = 407;
+/// 407 to 409 for #893 (lane D2-OWED-FOLD-8): `released_hop_evidence_missing` and its dirty trigger (an evicted JOIN
+/// whose bytes do not read names its released hops per verified seat: the judge's could-not-judge row).
+pub const OVERLAY_MIGRATION_COUNT: usize = 409;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2383,6 +2385,10 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::derived_owed::ROWS_COUNT_DELETE,
     crate::derived_owed::DIRTY_MARKED_DROP,
     crate::derived_owed::DIRTY_IDENTITY_DROP,
+    // #893 (lane D2-OWED-FOLD-8): an eviction whose JOIN's bytes the writer (or the owed-v2 backfill over an eviction
+    // made before it) cannot read names its released outpoints per verified seat, and marks each seat's game.
+    crate::derived_owed::RELEASED_HOP_EVIDENCE_MISSING_CREATE,
+    crate::derived_owed::RELEASED_HOP_MISSING_INSERT,
 ];
 
 // =============================================================================

@@ -418,10 +418,10 @@ async fn owed893_backfill_e_the_wall_leaves_marks_and_the_next_pass_resumes_with
         .await
         .unwrap(); // armed
     db.reset();
-    // Each batch costs 1 s of a 9 s wall with 3 s reserved: the stamp, the gate, the page, the marks, one games page
-    // and one judge fit, then the wall.
+    // Each batch costs 1 s of an 11 s wall with 3 s reserved: the stamp, the gate, the evidence phase's empty page and
+    // its done mark (D2-OWED-FOLD-8), the page, the marks, one games page and one judge fit, then the wall.
     db.batch_ms.set(1_000);
-    let r = backfill::backfill_pass(&db, &deadline(&db, 9_000, 3_000))
+    let r = backfill::backfill_pass(&db, &deadline(&db, 11_000, 3_000))
         .await
         .unwrap();
     assert_eq!((r.stop, r.identities), (backfill::Stop::Wall, 0));
@@ -641,13 +641,14 @@ fn owed893_backfill_i_the_gate_and_the_counters_are_the_overlays() {
         o::UNJUDGED_INDEX,
         o::ROWS_GAME_INDEX,
         o::ROWS_COUNT_INSERT,
+        o::RELEASED_HOP_EVIDENCE_MISSING_CREATE,
     ] {
         assert!(held.contains(&sql), "the gate's list holds {sql}");
     }
     assert_eq!(
         list[n - 1],
-        o::DIRTY_IDENTITY_DROP,
-        "the figure is the block's end (the D2-OWED fold's last migration)"
+        o::RELEASED_HOP_MISSING_INSERT,
+        "the figure is the block's end (D2-OWED-FOLD-8's last migration: the evidence phase writes its table)"
     );
     assert_eq!(
         backfill::counter_names(),
@@ -658,4 +659,94 @@ fn owed893_backfill_i_the_gate_and_the_counters_are_the_overlays() {
     for name in backfill::counter_names() {
         assert!(bsv_overlay_cloudflare::applayer_counters::seeded_names().contains(&name));
     }
+}
+
+/// D2-OWED-FOLD-8: the evidence phase visits every open eviction that names no evidence row once, 32 a page, on the
+/// fleet fixture's evictions (none of them the writer's), saves its cursor in each eviction's batch, ends at the done
+/// mark, and is not run again: a pass after it reads no eviction. A readmitted eviction and one the writer already
+/// gave evidence are never read. Its statements full-scan nothing but the page's own ledger walk.
+#[tokio::test]
+async fn fold8_c_the_evidence_phase_visits_each_open_eviction_once_and_ends() {
+    let db = Db::new();
+    for row in d1_fleet::rows(1_790_000_000) {
+        d1_fleet::execute_row(&db.conn.borrow(), &row);
+    }
+    // a JOIN without bytes and one verified seat: its two released hops are named for that seat
+    db.exec("INSERT INTO potparty_records_evicted(identity,potTxid,gameId,opponentIdentity,seatSettlePubkey,sigValid) VALUES ('seat','ff00000000000000000000000000000000000000000000000000000000000000','g','o','02aa',1)");
+    db.exec("INSERT INTO pot_evictions(txid,reason,evictedAt,releasedSpends) VALUES ('ff00000000000000000000000000000000000000000000000000000000000000','R',5,'[{\"table\":\"pot_records\",\"txid\":\"ab00000000000000000000000000000000000000000000000000000000000000\",\"vout\":0},{\"txid\":\"ab00000000000000000000000000000000000000000000000000000000000000\",\"vout\":1}]')");
+    // a readmitted eviction is never read
+    db.exec("INSERT INTO pot_evictions(txid,reason,evictedAt,readmittedAt,releasedSpends) VALUES ('fe00000000000000000000000000000000000000000000000000000000000000','R',5,6,'[]')");
+    let open = db.count("SELECT COUNT(*) FROM pot_evictions WHERE readmittedAt IS NULL AND releasedSpends IS NOT NULL");
+    db.certify(backfill::OWED_TRIGGERS_MIGRATION_COUNT);
+    backfill::backfill_pass(&db, &open_deadline(&db))
+        .await
+        .unwrap(); // armed
+    db.reset();
+    let r = backfill::backfill_pass(&db, &open_deadline(&db))
+        .await
+        .unwrap();
+    assert_eq!(r.evictions as i64, open, "{r:?}");
+    assert_eq!(
+        statements(&db, backfill::EVICTIONS_SQL) as i64,
+        open / 32 + 1
+    );
+    assert_eq!(
+        statements(&db, backfill::EVICTIONS_CURSOR_SQL) as i64,
+        open + 1
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM owed_belt_state WHERE name='backfill:owed-v2:evictions' AND cursor='~'"),
+        1
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM released_hop_evidence_missing WHERE identity='seat' AND gameId='g' AND bytesRead=0"),
+        2,
+        "the missing JOIN's two released hops, one with no table field"
+    );
+    assert_eq!(
+        r.missing_rows,
+        2 + db.count("SELECT COUNT(*) FROM released_hop_evidence_missing WHERE identity<>'seat'")
+            as u64
+    );
+    assert_eq!(
+        db.counters.borrow()["owed_backfill_evictions_total"] as i64,
+        open
+    );
+    for ran in db
+        .ran
+        .borrow()
+        .iter()
+        .filter(|r| r.sql != backfill::EVICTIONS_SQL)
+    {
+        assert_eq!(ran.fullscan, 0, "{}", ran.sql);
+    }
+    let plan: Vec<String> = db
+        .conn
+        .borrow()
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", backfill::EVICTIONS_SQL))
+        .unwrap()
+        .query_map(rusqlite::params!["", 32], |r| r.get(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        plan.iter().any(
+            |d| d.starts_with("SEARCH e USING INDEX sqlite_autoindex_pot_evictions")
+                || d.starts_with("SEARCH e USING PRIMARY KEY")
+        ),
+        "{plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|d| d.starts_with("SEARCH h USING INDEX sqlite_autoindex_released_hop_evidence")),
+        "{plan:?}"
+    );
+    // the phase is not run again
+    db.exec("DELETE FROM view_derivation_state WHERE name='owed-v2'");
+    db.reset();
+    let again = backfill::backfill_pass(&db, &open_deadline(&db))
+        .await
+        .unwrap();
+    assert_eq!(again.evictions, 0);
+    assert_eq!(statements(&db, backfill::EVICTIONS_SQL), 0);
 }
