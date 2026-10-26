@@ -568,7 +568,7 @@ mod tests {
     fn every_create_table_catchup_is_byte_identical_to_its_overlay_migration() {
         assert_eq!(
             CREATE_TABLE_CATCHUPS.len(),
-            20,
+            21,
             "tx_words and tracker_backfill (NS-3), network_seen (#371), collected_markers_v2 (#252 stage A), \
              hand_markers (#382, mirrored for the brain-cutover M2 join), \
              proof_posts (bsv-low P1.1 proof-in-DB, owner GO 2026-09-02), \
@@ -579,7 +579,8 @@ mod tests {
              owed_spender_bytes (bsv-low #672, RC-L30, the durable spender-bytes store), \
              tracker_chain_events + tracker_reasks (bsv-low #771, the chain-event intake), \
              handfile_batches + handfile_rows (bsv-low #848, the handfile batches and their rows), \
-             owed_row_words + owed_dirty + released_hop_evidence + owed_belt_state (#893)"
+             owed_row_words + owed_dirty + released_hop_evidence + owed_belt_state (#893), \
+             released_hop_evidence_missing (D2-OWED-FOLD-8)"
         );
         for stmt in CREATE_TABLE_CATCHUPS {
             assert!(stmt.starts_with("CREATE TABLE IF NOT EXISTS "), "{stmt}");
@@ -589,7 +590,8 @@ mod tests {
                 .expect("a table name follows the prefix");
             let hits: Vec<&&str> = bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS
                 .iter()
-                .filter(|m| m.starts_with(&format!("CREATE TABLE IF NOT EXISTS {table}")))
+                // the name whole (`released_hop_evidence` is a prefix of `released_hop_evidence_missing`)
+                .filter(|m| m.starts_with(&format!("CREATE TABLE IF NOT EXISTS {table} ")))
                 .collect();
             assert_eq!(hits.len(), 1, "exactly one migration CREATEs {table}");
             assert_eq!(
