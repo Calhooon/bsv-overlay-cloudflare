@@ -29,17 +29,26 @@ const UNKNOWN_KIND: &str = r#"{"v":1,"kind":"retarget","height":101}"#;
 const UNKNOWN_VERSION: &str = r#"{"v":3,"kind":"tip","height":102}"#;
 const GO_SHAPE: &str = r#"{"orphanedHashes":["1bcfb203aa391d9680a0a48530cc59aa016ca7421c480605fc88e113036f055b"],"commonAncestor":{"height":100,"hash":"578ad467ca9479201762f87874cc3c91dcd76b52cb0388bfbc617aaca6bfbd85"},"newTip":{"height":102,"hash":"3422cb84faba77c01514deff35bb5106a6b1027e7b19a9048b5b14e1876b40bf"},"depth":1}"#;
 
-/// A header source holding a SET of (height, root) pairs (a single-leaf bump's root is its txid) and a tip.
+/// A header source holding a SET of (height, root) pairs (a single-leaf bump's root is its txid) and a tip. A root it
+/// does not hold is `Ok(false)` (refuted), at any height, unless `serving_up_to` is set: then a height above it is
+/// `Err(BlockNotFound)`, production's answer for a height chaintracks does not serve (`chain_tracker.rs`, its 404).
 struct Roots {
     valid: std::sync::Mutex<std::collections::HashSet<(u32, String)>>,
     tip: u32,
+    serving_up_to: Option<u32>,
 }
 impl Roots {
     fn at(tip: u32) -> Self {
         Roots {
             valid: std::sync::Mutex::default(),
             tip,
+            serving_up_to: None,
         }
+    }
+    /// Production's answer above `height`: chaintracks serves no header there, so a root asked there is a fault.
+    fn serving_up_to(mut self, height: u32) -> Self {
+        self.serving_up_to = Some(height);
+        self
     }
     fn add_root(&self, height: u32, root: String) {
         self.valid.lock().unwrap().insert((height, root));
@@ -52,6 +61,9 @@ impl ChainTracker for Roots {
         root: &str,
         height: u32,
     ) -> Result<bool, ChainTrackerError> {
+        if self.serving_up_to.is_some_and(|top| height > top) {
+            return Err(ChainTrackerError::BlockNotFound(height));
+        }
         Ok(self
             .valid
             .lock()
@@ -1016,10 +1028,17 @@ async fn lens_l3_an_invalidation_145_deep_is_not_examined() {
 }
 
 /// bsv-low #896: the tracker's tip is chaintracks' VERIFIED header, which an invalidation of its own tip header
-/// lowers: with the verified tip now at 1000, a row anchored at 1001 rests on the invalidated header and is judged
-/// (demoted, its root no longer served); so is one at 1000 + `INVALIDATED_ABOVE_TIP`; one past it is not examined.
-/// RED on 8e5e73f7 (the window closed at the tip): `left: (1, 1, 1) right: (1, 3, 3)`, the rows above the tip never
-/// examined.
+/// lowers: with the verified tip now at 1000, a row anchored at 1001 rests on the invalidated header and is judged;
+/// so is one at 1000 + `INVALIDATED_ABOVE_TIP`; one past it is not examined. RED on 8e5e73f7 (the window closed at
+/// the tip): `left: (1, 1, 1) right: (1, 3, 3)`, the rows above the tip never examined.
+///
+/// What "judged" does to a row above the tip (the ENGINE-TIP-896 lens's LOW-1): the first pass runs the fake tracker,
+/// whose `is_valid_root_for_height` answers `Ok(false)` for a height it holds no root at, so the rows at 1001 and 1144
+/// are DEMOTED. That is the fake's verdict, not production's: there a height chaintracks does not serve answers 404,
+/// `BlockNotFound`, an `Err` in `verify_bump_memoized`, so the window FAULTS, holds, and is released unresolved at the
+/// fault ceiling unless the chain regrows at that height first. The second pass gives production's answer
+/// (`serving_up_to(1000)`) and shows the fault: nothing demoted, the window held. The window's extent is the same in
+/// both.
 #[tokio::test]
 async fn e896_c_an_invalidated_window_reaches_the_rows_above_the_verified_tip() {
     let store = MemoryPotStorage::new();
@@ -1042,6 +1061,21 @@ async fn e896_c_an_invalidated_window_reaches_the_rows_above_the_verified_tip() 
     assert!(!store.pot_beef_proof_verified(&at_top).await.unwrap(), "1144 = tip + 144: judged");
     assert!(store.pot_beef_proof_verified(&past_top).await.unwrap(), "1145: not examined");
     assert_eq!(INVALIDATED_ABOVE_TIP, 144);
+
+    // production's answer above the verified tip: a 404 is `BlockNotFound`, a fault of the window, never a demotion
+    let store = MemoryPotStorage::new();
+    let tracker = Roots::at(1000).serving_up_to(1000);
+    let above = confirmed_pot_with_stored_proof(&store, &pot(34), 1001).await;
+    let row = Row::default();
+    let s = pass(&feed, &row, &store, &txs, &tracker, &ladder, limits(2, 50, 12), &Start::At("40".into())).await;
+    assert_eq!((s.faults, s.applied, s.released, s.demoted()), (1, 0, 0, 0), "{s:?}");
+    assert!(
+        store.pot_beef_proof_verified(&above).await.unwrap(),
+        "1001 under production's 404: the window faults, the row keeps its confirmation"
+    );
+    let st = row.state();
+    assert_eq!(st.cursor, "40", "the window held, its cursor kept");
+    assert_eq!(st.pending.as_ref().map(|p| (p.lo, p.hi, p.fault_passes)), Some((856, 1144, 1)));
 }
 
 /// LENS L4 (both consumers on one deployment in one tick): the feed applies the reorg at 101 (the refuted row
