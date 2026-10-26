@@ -34,6 +34,9 @@ struct Db {
     now: Cell<u64>,
     /// Virtual milliseconds each batch costs (the wall pin's clock).
     batch_ms: Cell<u64>,
+    /// Virtual milliseconds each game of a judge's acknowledgement costs, charged and yielded on BEFORE the batch runs,
+    /// so a clock-watching deadline drops a judge that does not fit before its commit (the stalled-identity pin).
+    ack_game_ms: Cell<u64>,
     clock: Rc<Cell<u64>>,
 }
 impl Db {
@@ -54,6 +57,7 @@ impl Db {
             counters: RefCell::new(BTreeMap::new()),
             now: Cell::new(1_790_000_000_000),
             batch_ms: Cell::new(0),
+            ack_game_ms: Cell::new(0),
             clock: Rc::new(Cell::new(0)),
         }
     }
@@ -85,6 +89,22 @@ fn bind(v: &Bind) -> SqlValue {
 impl SqlPort for Db {
     async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
         self.clock.set(self.clock.get() + self.batch_ms.get());
+        if self.ack_game_ms.get() > 0 {
+            let games: u64 = stmts
+                .iter()
+                .filter(|s| s.sql == judge::ACK_DIRTY_SQL)
+                .filter_map(|s| match s.binds.get(1) {
+                    Some(Bind::Text(t)) => serde_json::from_str::<Vec<Value>>(t).ok(),
+                    _ => None,
+                })
+                .map(|g| g.len() as u64)
+                .sum();
+            if games > 0 {
+                self.clock
+                    .set(self.clock.get() + games * self.ack_game_ms.get());
+                tokio::task::yield_now().await;
+            }
+        }
         self.batches
             .borrow_mut()
             .push(stmts.iter().map(|s| s.sql.clone()).collect());
@@ -165,6 +185,32 @@ fn deadline(db: &Db, ms: u64, reserve: u64) -> Deadline {
         reserve,
         Box::new(move || clock.get() - t0),
         Box::new(|_| Box::pin(std::future::pending())),
+    )
+}
+/// A deadline on the Db's virtual clock whose timer fires once the clock passes it (polled after each yield), the
+/// clock then reading the time it fired at, as a real timer's drop would.
+fn watching_deadline(db: &Db, ms: u64, reserve: u64) -> Deadline {
+    let clock = db.clock.clone();
+    let t0 = clock.get();
+    let timer_clock = db.clock.clone();
+    Deadline::new(
+        ms,
+        reserve,
+        Box::new(move || clock.get() - t0),
+        Box::new(move |left| {
+            let c = timer_clock.clone();
+            let at = c.get() + left;
+            Box::pin(std::future::poll_fn(move |cx| {
+                if c.get() >= at {
+                    // The drop happens at `at`: the batch it dropped never ran, so the clock reads the drop's time.
+                    c.set(at);
+                    std::task::Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            }))
+        }),
     )
 }
 fn open_deadline(db: &Db) -> Deadline {
@@ -1050,4 +1096,87 @@ async fn fold10_l1_c_at_most_four_retries_a_repair_oldest_skip_first() {
     let r = backfill::age_repair(&db).await.unwrap();
     assert_eq!(r.recovered.len(), 3, "{r:?}");
     assert!(r.still_skipped.is_empty());
+}
+
+/// Prod, 2026-10-26 16:06Z: the open identity 03295e29... held 17 backfill marks and one judge batch did not finish
+/// inside the pass's wall, so every pass logged "0 identities, 0 rows, 0 batches" and restarted the same batch; the
+/// stamp never landed. Now a pass that judges none of the open identity's batches halves its batch (floor 1): the
+/// identity converges at a smaller batch over later passes, the stamp lands, and the next identity starts at the full
+/// batch again. RED on main: ten passes, every one `Wall` with no batch.
+#[tokio::test]
+async fn home_marker_stall_a_batch_past_the_wall_is_halved_until_it_fits_and_the_stamp_lands() {
+    let db = Db::new();
+    db.certify(backfill::OWED_TRIGGERS_MIGRATION_COUNT);
+    for n in 0..17 {
+        db.seed("whale", &format!("g{n:02}"));
+    }
+    for n in 0..5 {
+        db.seed("zeta", &format!("z{n}"));
+    }
+    backfill::backfill_pass(&db, &open_deadline(&db))
+        .await
+        .unwrap(); // armed
+                   // 2.5 s a judged game against the 20 s wall less its 3 s reserve: 16 and 8 games never fit, 4 do (10 s), and the
+                   // second batch of 4 in one pass does not.
+    db.ack_game_ms.set(2_500);
+    let mut sizes = Vec::new();
+    let mut batches: Vec<String> = Vec::new();
+    let mut finished = false;
+    for _ in 0..10 {
+        let r = backfill::backfill_pass(
+            &db,
+            &watching_deadline(
+                &db,
+                backfill::OWED_BACKFILL_WALL_MS,
+                backfill::OWED_BACKFILL_SAVE_RESERVE_MS,
+            ),
+        )
+        .await
+        .unwrap();
+        sizes.push(r.batches);
+        batches.push(
+            db.conn
+                .borrow()
+                .query_row(
+                    "SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:batch'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap_or_default(),
+        );
+        if r.stop == backfill::Stop::Finished {
+            finished = true;
+            break;
+        }
+    }
+    assert!(
+        finished,
+        "the identity converges and the stamp lands: batches a pass {sizes:?}"
+    );
+    // The whale: 16 cut, 8 cut, then 4 a pass (its 17th game a second batch of the fifth). Zeta starts at the FULL 16
+    // (5 games, 12.5 s, after the whale's 12.5 s: cut, halved to 8), then fits in one batch.
+    assert_eq!(sizes, vec![0, 0, 1, 1, 1, 2, 1], "batches a pass");
+    let w = |n| format!("{{\"identity\":\"whale\",\"size\":{n}}}");
+    assert_eq!(
+        batches,
+        vec![
+            w(8),
+            w(4),
+            w(4),
+            w(4),
+            w(4),
+            "{\"identity\":\"zeta\",\"size\":8}".to_string(),
+            "{}".to_string()
+        ],
+        "the size halves only on a pass with no batch, and restarts full for the next identity"
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-v2'"),
+        1
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM owed_rows WHERE identity='whale'"),
+        17
+    );
+    assert_eq!(db.count("SELECT COUNT(*) FROM owed_dirty"), 0);
 }

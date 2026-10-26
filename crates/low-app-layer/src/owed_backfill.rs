@@ -23,6 +23,9 @@
 //!
 //! An identity the wall cuts keeps its remaining marks (the drain may judge them too) and its `open` row, so the next
 //! pass finishes its marks and never re-marks it from the start: an identity bigger than one pass still converges.
+//! A pass that completes NO judge batch of the open identity (its batch outlasting the wall, so every pass restarted
+//! the same batch: prod's 03295e29..., 2026-10-26) halves that identity's batch ([`OWED_BACKFILL_BATCH`], floor 1);
+//! the next identity starts at the full size again.
 //!
 //! [`mark_aged`] is risk 8.2's third repair: the scheduled drain re-marks, at most once a day a row, the subjects whose
 //! stored row was judged more than 24 h ago (`source = 'age'`), bounded [`OWED_AGE_REMARKS_PER_PASS`] a pass.
@@ -50,6 +53,9 @@ pub const OWED_AGE_REMARKS_PER_PASS: usize = 128;
 pub const OWED_BACKFILL_IDENTITY_FAULTS_MAX: usize = 3;
 /// The `owed_belt_state` row counting the open identity's consecutive faulted passes (`{"identity":..,"faults":n}`).
 pub const OWED_BACKFILL_FAULTS: &str = "backfill:owed-v2:faults";
+/// The `owed_belt_state` row holding the open identity's judge batch once a pass judged none of it
+/// (`{"identity":..,"size":n}`): halved at each such pass, at least 1, cleared ('{}') by its identity's save.
+pub const OWED_BACKFILL_BATCH: &str = "backfill:owed-v2:batch";
 /// The `owed_belt_state` row counting the faulted eviction's consecutive faulted passes (`{"txid":..,"faults":n}`;
 /// D2-OWED-FOLD-9, the fifth delta lens's DELTA5-L1: the evidence phase takes the identity loop's LOW-1 bound).
 pub const OWED_BACKFILL_EVICTION_FAULTS: &str = "backfill:owed-v2:eviction-faults";
@@ -94,7 +100,7 @@ pub fn counter_names() -> Vec<String> {
 /// The stamped replay's one statement: a primary-key read of one row.
 pub const STAMP_SQL: &str = "SELECT 1 AS stamped FROM view_derivation_state WHERE name='owed-v2'";
 /// The gate (the overlay's certified migration list) and both cursor rows, each a primary-key read.
-pub const GATE_SQL: &str = "SELECT (SELECT value FROM ops_counters WHERE name='overlay_migration_count') AS count,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2') AS cursor,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:open') AS open,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:faults') AS faults,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:evictions') AS evictions,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:eviction-faults') AS evictionFaults";
+pub const GATE_SQL: &str = "SELECT (SELECT value FROM ops_counters WHERE name='overlay_migration_count') AS count,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2') AS cursor,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:open') AS open,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:faults') AS faults,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:evictions') AS evictions,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:eviction-faults') AS evictionFaults,(SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:batch') AS batch";
 /// The open evictions past the cursor, ascending, each naming no evidence row of its own for any released outpoint
 /// (an eviction the writer saw has them; each probe a primary-key search of the evidence by outpoint).
 /// An open eviction `e` that names no evidence row of its own for any released outpoint: the evidence phase's page
@@ -172,6 +178,20 @@ pub const MISSING_INSERT_SQL: &str = "WITH seats AS (\
 pub const EVICTIONS_CURSOR_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:evictions',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// The open identity's fault count, written by a faulted pass and cleared ('{}') by its identity's save.
 pub const FAULTS_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:faults',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+/// The open identity's judge batch size, written when a pass judged none of its batches, cleared ('{}') by its save.
+pub const BATCH_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:batch',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+/// The judge batch the identity starts at: the size [`OWED_BACKFILL_BATCH`] names for it, else the full batch.
+pub fn batch_size_for(batch: &Value, identity: &str) -> usize {
+    if batch["identity"] == identity {
+        batch["size"]
+            .as_u64()
+            .map_or(OWED_BACKFILL_GAMES_PER_BATCH, |n| {
+                (n as usize).clamp(1, OWED_BACKFILL_GAMES_PER_BATCH)
+            })
+    } else {
+        OWED_BACKFILL_GAMES_PER_BATCH
+    }
+}
 /// An identity passed by after its faults: its row names the last fault (bounded), its marks stay for the drain.
 pub const SKIPPED_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:skipped:'||?1,?2,?3) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// The faulted eviction's count, written by a faulted pass and cleared ('{}') by its eviction's save or its skip.
@@ -311,6 +331,7 @@ async fn backfill_identity(
     deadline: &Deadline,
     identity: &str,
     resume: bool,
+    size: usize,
     report: &mut BackfillReport,
 ) -> Result<Option<usize>, String> {
     let now = db.now_ms() as i64;
@@ -339,16 +360,14 @@ async fn backfill_identity(
         }
     }
     let mut rows = 0;
+    let mut judged_here = 0;
     let mut last: Option<Vec<String>> = None;
     loop {
         let Some(page) = deadline
             .run_reserving(read(
                 db,
                 GAMES_SQL,
-                vec![
-                    Bind::Text(identity.into()),
-                    Bind::Int(OWED_BACKFILL_GAMES_PER_BATCH as i64),
-                ],
+                vec![Bind::Text(identity.into()), Bind::Int(size as i64)],
             ))
             .await
         else {
@@ -368,9 +387,28 @@ async fn backfill_identity(
             .run_reserving(owed_judge::judge_subjects(db, identity, &games, "backfill"))
             .await
         else {
+            if judged_here == 0 {
+                // No batch of this identity fits the pass: the next pass judges half as many (the save's reserve
+                // carries the write; a lost one costs one more pass at this size).
+                let half = (size / 2).max(1);
+                db.log(&format!(
+                    "[owed-backfill] {identity}: a batch of {size} did not finish inside the wall; the next pass judges {half}"
+                ));
+                let row = serde_json::json!({"identity": identity, "size": half});
+                if let Some(r) = deadline
+                    .run(db.run_batch(vec![Stmt {
+                        sql: BATCH_SQL.into(),
+                        binds: vec![Bind::Text(row.to_string()), Bind::Int(now)],
+                    }]))
+                    .await
+                {
+                    r?;
+                }
+            }
             return Ok(None);
         };
         rows = judged?.rows;
+        judged_here += 1;
         report.batches += 1;
         last = Some(games);
     }
@@ -732,6 +770,10 @@ pub async fn backfill_pass(
         .as_str()
         .and_then(|f| serde_json::from_str(f).ok())
         .unwrap_or_default();
+    let batch: Value = gate["batch"]
+        .as_str()
+        .and_then(|f| serde_json::from_str(f).ok())
+        .unwrap_or_default();
     report.cursor = Some(cursor.clone());
     // D2-OWED-FOLD-8: the evidence of the evictions made before the writer, before any identity is judged.
     let evictions = gate["evictions"].as_str().unwrap_or("").to_owned();
@@ -781,7 +823,14 @@ pub async fn backfill_pass(
                 sql: CURSOR_SQL.into(),
                 binds: vec![Bind::Text(identity.clone()), Bind::Int(db.now_ms() as i64)],
             }];
-            let rows = match backfill_identity(db, deadline, identity, resume, &mut report).await {
+            let size = if resume {
+                batch_size_for(&batch, identity)
+            } else {
+                OWED_BACKFILL_GAMES_PER_BATCH
+            };
+            let rows = match backfill_identity(db, deadline, identity, resume, size, &mut report)
+                .await
+            {
                 Ok(Some(rows)) => rows,
                 Ok(None) => {
                     report.stop = Stop::Wall;
@@ -813,6 +862,12 @@ pub async fn backfill_pass(
                 }
             };
             let finished = last_page && n + 1 == identities.len();
+            if batch["identity"] == identity.as_str() {
+                save.push(Stmt {
+                    sql: BATCH_SQL.into(),
+                    binds: vec![Bind::Text("{}".into()), Bind::Int(db.now_ms() as i64)],
+                });
+            }
             if faults["identity"] == identity.as_str() {
                 save.push(Stmt {
                     sql: FAULTS_SQL.into(),
