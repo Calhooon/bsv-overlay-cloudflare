@@ -72,3 +72,12 @@ for ((n=0; n<120; n++)); do
   sleep 1
 done
 node tools/lane-893/owed_belt_tick.mjs "http://127.0.0.1:$port" "http://127.0.0.1:$standin" "$token" | tee "$out/measurements.log"
+# The delta lens's D-H1 (`owed-tip-mark`), after the belt's cells so their figures stand: the lens's shape planted
+# (1,000 strangers, each one index-unspent claimable sweep, and 40 courier-dependent ones, judged at the seed's tip,
+# their belt dates an hour ahead), then one block.
+d1() { (cd "$out" && npx wrangler d1 execute low-overlay-db --config "$out/wrangler.toml" --local --persist-to "$state" --json --command "$1"); }
+mark_at=$(( ($(date -u +%s) + 3600) * 1000 ))
+d1 "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<1039) INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs,judgedAtMs,claimable,probeTip,beltDueAtMs) SELECT printf('stranger%04d',i), printf('%064x:0',i+4096), 'hop-stranded', printf('s%04d',i), json_object('claim','sweep-hop','claimable',json('true'),'status',CASE WHEN i<1000 THEN 'unspent' ELSE 'unknown' END,'chainProbe',CASE WHEN i<1000 THEN 'index-unspent' ELSE 'unspent' END), $mark_at-3600000, $mark_at-3600000, 1, 900000, $mark_at FROM n" > "$out/tip-mark-plant.json"
+node tools/lane-893/owed_tip_mark.mjs "http://127.0.0.1:$port" "http://127.0.0.1:$standin" "$token" mark | tee -a "$out/measurements.log"
+dated=$(d1 "SELECT COUNT(*) AS n FROM owed_rows WHERE identity GLOB 'stranger*' AND beltDueAtMs<$mark_at" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["results"][0]["n"])')
+node tools/lane-893/owed_tip_mark.mjs "http://127.0.0.1:$port" "http://127.0.0.1:$standin" "$token" check "$dated" | tee -a "$out/measurements.log"

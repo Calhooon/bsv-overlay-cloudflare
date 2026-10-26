@@ -365,7 +365,7 @@
       "censusKey": null
     },
     "owed-belt-tick": {
-      "route": "POST /internal/owed-belt-tick: one belt tick over the READ lane's fleet seed (the lived-in identity, 500 judged rows) with every belt date an hour back; WoC 404, BananaBlocks unspent: 8 finds, each one judge batch (bsv-low #893 section 5). Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 17,223 to 896 (LOW-2's commit: the per-game delete on the game index, one state row, the ceiling joined from it; HIGH-3's walk of at most 64 identities, never the due set), writes 162 to 260 (the fold's owed_rows index entries, the row-count triggers, the walk's cursor row); the largest statement is the backlog gauge's index count",
+      "route": "POST /internal/owed-belt-tick: one belt tick over the READ lane's fleet seed (the lived-in identity, 500 judged rows) with every belt date an hour back; WoC 404, BananaBlocks unspent: 8 finds, each one judge batch (bsv-low #893 section 5). Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 17,223 to 896 (LOW-2's commit: the per-game delete on the game index, one state row, the ceiling joined from it; HIGH-3's walk of at most 64 identities, never the due set), writes 162 to 260 (the fold's owed_rows index entries, the row-count triggers, the walk's cursor row); the largest statement is the backlog gauge's index count. Re-run by lane D2-OWED-FOLD-2 (2026-10-25): unchanged (the turn order and the back-off move no statement of a first tick)",
       "measured": {
         "reads": 896,
         "writes": 260,
@@ -383,7 +383,7 @@
       "censusKey": null
     },
     "owed-belt-tick-429": {
-      "route": "POST /internal/owed-belt-tick: every courier answers 429; each rung closed after its first call, 8 candidates re-armed once at now + 300 s, no find. Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 709 to 266, writes 27 to 36, statements 17 to 29 (the walk, its per-identity due reads and the cursor row)",
+      "route": "POST /internal/owed-belt-tick: every courier answers 429; each rung closed after its first call, 8 candidates re-armed once at now + 300 s, no find. Re-measured by lane D2-OWED-FOLD (2026-10-25): reads 709 to 266, writes 27 to 36, statements 17 to 29 (the walk, its per-identity due reads and the cursor row). Re-run by lane D2-OWED-FOLD-2 (2026-10-25): unchanged (the turn order and the back-off move no statement of a first tick)",
       "measured": {
         "reads": 266,
         "writes": 36,
@@ -397,6 +397,24 @@
         "stmts": 44,
         "maxReads": 342,
         "calls": 5
+      },
+      "censusKey": null
+    },
+    "owed-tip-mark": {
+      "route": "POST /internal/tip-changed at the seed's tip + 1, after the belt's cells, over the READ lane's fleet seed plus the delta lens's D-H1 shape planted (1,000 strangers' index-unspent claimable sweeps and 40 courier-dependent ones, judged at the seed's tip, belt dates an hour ahead): the gate window marked, the 40 dated due now and the 1,000 not, the tipless rows re-marked, nothing judged, no courier call (lane D2-OWED-FOLD-2, 2026-10-25). The date's range scan reads every claimable sweep judged below the tip (1,040); it writes the courier-dependent ones only. On d521888f the same cell wrote 3,120 and dated all 1,040 (RED)",
+      "measured": {
+        "reads": 1052,
+        "writes": 120,
+        "stmts": 4,
+        "maxReads": 1040,
+        "calls": 0
+      },
+      "ceiling": {
+        "reads": 1578,
+        "writes": 180,
+        "stmts": 6,
+        "maxReads": 1560,
+        "calls": 0
       },
       "censusKey": null
     },
