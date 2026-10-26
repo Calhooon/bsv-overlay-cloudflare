@@ -679,8 +679,11 @@ mod e896 {
         }})
     }
 
+    /// One chaintracks answer: its status and body, or the transport's fault.
+    type Answer = Result<(u16, Value), ChainTrackerError>;
+
     /// Chaintracks as its routes answer: the verified tip and the couriers' maximum differ.
-    fn chaintracks(route: &str) -> Result<(u16, Value), ChainTrackerError> {
+    fn chaintracks(route: &str) -> Answer {
         match route {
             "findChainTipHeaderHex" => Ok((200, tip_frame())),
             "getPresentHeight" => Ok((200, json!({"status": "success", "value": COURIER_MAX}))),
@@ -722,7 +725,7 @@ mod e896 {
     /// A chaintracks fault stays a fault: no height by a guess, and never the couriers' maximum in its place.
     #[tokio::test]
     async fn e896_b_a_chaintracks_fault_is_a_fault_never_a_height() {
-        let mut faults: Vec<(&str, Result<(u16, Value), ChainTrackerError>)> = vec![
+        let mut faults: Vec<(&str, Answer)> = vec![
             ("404", Ok((404, Value::Null))),
             ("503", Ok((503, Value::Null))),
             (
