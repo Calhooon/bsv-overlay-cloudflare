@@ -29,6 +29,11 @@ pub const ROW_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_row_words (i
 pub const DIRTY_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_dirty (generation INTEGER PRIMARY KEY AUTOINCREMENT, identity TEXT NOT NULL, gameId TEXT NOT NULL, source TEXT NOT NULL, sourceKey TEXT NOT NULL, markedAtMs INTEGER NOT NULL, downgrade INTEGER NOT NULL DEFAULT 0, UNIQUE (identity, gameId, source, sourceKey))";
 /// Evidence written beside an eviction's released spends, one identity per released hop.
 pub const RELEASED_HOP_EVIDENCE_CREATE: &str = "CREATE TABLE IF NOT EXISTS released_hop_evidence (hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, identity TEXT NOT NULL, gameId TEXT NOT NULL, potTxid TEXT NOT NULL, seatSettlePubkey TEXT NOT NULL, hopSats INTEGER NOT NULL, evictedAt INTEGER NOT NULL, PRIMARY KEY (hopTxid, hopVout, identity))";
+/// D2-OWED-FOLD-8: an evicted JOIN whose stored bytes are absent or undecodable (or do not carry a released hop's
+/// transaction) leaves no evidence; each released outpoint is named for each verified seat of that JOIN, so the
+/// judge serves the old walk's could-not-judge row (`evidenceMissing`), never silence and never a press. Keyed for the
+/// judge's read by identity and game; ended by the ledger's readmission as the evidence is.
+pub const RELEASED_HOP_EVIDENCE_MISSING_CREATE: &str = "CREATE TABLE IF NOT EXISTS released_hop_evidence_missing (identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, potTxid TEXT NOT NULL, evictedAt INTEGER NOT NULL, bytesRead INTEGER NOT NULL, PRIMARY KEY (identity, gameId, hopTxid, hopVout))";
 /// The belt's rotation cursor and the backfill's identity cursor, each under its own name.
 pub const BELT_STATE_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_belt_state (name TEXT PRIMARY KEY, cursor TEXT, tickedAtMs INTEGER)";
 
@@ -509,6 +514,18 @@ pub const REFUSAL_DELETE: &str = trigger!(
 /// The eviction's newly derived markerless hop uses the same hop source and outpoint key.
 pub const RELEASED_HOP_INSERT: &str = trigger!(
     "released_hop_evidence",
+    insert,
+    INSERT,
+    mark!(
+        "hop",
+        "NEW.hopTxid || ':' || NEW.hopVout",
+        "NEW.evictedAt",
+        own_subject!("NEW")
+    )
+);
+/// D2-OWED-FOLD-8: a missing-evidence row marks its seat's game as the evidence row does.
+pub const RELEASED_HOP_MISSING_INSERT: &str = trigger!(
+    "released_hop_evidence_missing",
     insert,
     INSERT,
     mark!(

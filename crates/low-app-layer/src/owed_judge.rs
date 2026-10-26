@@ -261,6 +261,10 @@ pub struct JudgeInputs {
     pub spender_words: BTreeMap<String, Value>,
     /// Pot outpoints whose chosen party row verifies (`sigValid = 1`): the only pot rows the belt dates (HIGH-3).
     pub verified_pots: HashSet<String>,
+    /// D2-OWED-FOLD-8: the old walk's could-not-judge rows of the released hops of an evicted JOIN whose bytes do not
+    /// read (`released_hop_evidence_missing`), merged after the derivation by the walk's own rule
+    /// (`owed::merge_markerless_faults`: never over a row judged from other evidence).
+    pub markerless_faults: Vec<OwedRow>,
     funding_seen: HashSet<String>,
     word_rows: BTreeMap<String, crate::tracker_host::stored::Row>,
     moved_latches: Vec<(String, String)>,
@@ -434,6 +438,14 @@ pub async fn judge_with_write(
         }
         let mut rows = derive_owed_rows(&i.as_inputs());
         rows.retain(|r| games.contains(&r.game_id));
+        crate::owed::merge_markerless_faults(
+            &mut rows,
+            i.markerless_faults
+                .iter()
+                .filter(|f| games.contains(&f.game_id))
+                .cloned()
+                .collect(),
+        );
         // The old walk's display marks after its derivation, in its order (the walk-against-judge pin holds them).
         for row in &mut rows {
             crate::routes::mark_pending_spender(row, None, i.now_ms);
@@ -705,7 +717,7 @@ pub async fn refund_subjects(
 // pass's `now_ms`) and `updatedAtMs` are milliseconds; mixed, a game with a released hop always sorted newest.
 macro_rules! identity_games {
     () => {
-        "SELECT gameId,MAX(at) AS at FROM (SELECT gameId,createdAt*1000 AS at FROM potparty_records WHERE identity=?1 UNION ALL SELECT gameId,createdAt*1000 FROM hopparty_records WHERE identity=?1 UNION ALL SELECT gameId,evictedAt FROM released_hop_evidence WHERE identity=?1 UNION ALL SELECT gameId,updatedAtMs FROM owed_rows WHERE identity=?1) WHERE gameId<>'' GROUP BY gameId ORDER BY at DESC,gameId"
+        "SELECT gameId,MAX(at) AS at FROM (SELECT gameId,createdAt*1000 AS at FROM potparty_records WHERE identity=?1 UNION ALL SELECT gameId,createdAt*1000 FROM hopparty_records WHERE identity=?1 UNION ALL SELECT gameId,evictedAt FROM released_hop_evidence WHERE identity=?1 UNION ALL SELECT gameId,evictedAt FROM released_hop_evidence_missing WHERE identity=?1 UNION ALL SELECT gameId,updatedAtMs FROM owed_rows WHERE identity=?1) WHERE gameId<>'' GROUP BY gameId ORDER BY at DESC,gameId"
     };
 }
 /// Expand the one wanted envelope to durable game marks: the newest [`OWED_WANTED_GAMES`] games `wanted`, the rest

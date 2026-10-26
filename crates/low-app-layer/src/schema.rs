@@ -178,6 +178,9 @@ pub const OWED_ROW_WORDS_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_row_wor
 pub const OWED_DIRTY_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_dirty (generation INTEGER PRIMARY KEY AUTOINCREMENT, identity TEXT NOT NULL, gameId TEXT NOT NULL, source TEXT NOT NULL, sourceKey TEXT NOT NULL, markedAtMs INTEGER NOT NULL, downgrade INTEGER NOT NULL DEFAULT 0, UNIQUE (identity, gameId, source, sourceKey))";
 /// #893: the eviction's released-hop evidence, read by identity and game or hop outpoint.
 pub const RELEASED_HOP_EVIDENCE_CREATE: &str = "CREATE TABLE IF NOT EXISTS released_hop_evidence (hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, identity TEXT NOT NULL, gameId TEXT NOT NULL, potTxid TEXT NOT NULL, seatSettlePubkey TEXT NOT NULL, hopSats INTEGER NOT NULL, evictedAt INTEGER NOT NULL, PRIMARY KEY (hopTxid, hopVout, identity))";
+/// D2-OWED-FOLD-8: the released outpoints of an evicted JOIN whose bytes do not read, per verified seat (the overlay's
+/// migration, byte for byte), written by the overlay's eviction writer and this layer's `owed-v2` backfill.
+pub const RELEASED_HOP_EVIDENCE_MISSING_CREATE: &str = "CREATE TABLE IF NOT EXISTS released_hop_evidence_missing (identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, potTxid TEXT NOT NULL, evictedAt INTEGER NOT NULL, bytesRead INTEGER NOT NULL, PRIMARY KEY (identity, gameId, hopTxid, hopVout))";
 /// #893: independent belt and backfill cursors; the backfill stamp remains in view_derivation_state.
 pub const OWED_BELT_STATE_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_belt_state (name TEXT PRIMARY KEY, cursor TEXT, tickedAtMs INTEGER)";
 
@@ -320,6 +323,7 @@ pub const CREATE_TABLE_CATCHUPS: &[&str] = &[
     OWED_ROW_WORDS_CREATE,
     OWED_DIRTY_CREATE,
     RELEASED_HOP_EVIDENCE_CREATE,
+    RELEASED_HOP_EVIDENCE_MISSING_CREATE,
     OWED_BELT_STATE_CREATE,
 ];
 

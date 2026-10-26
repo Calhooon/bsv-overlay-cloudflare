@@ -14,6 +14,9 @@ pub const HOPS_SQL: &str = "SELECT hp.*,hp.txid AS hopTxid,hp.txid AS markerTxid
 /// its author named under two games is ONE row, the walk's (`owed_cursor::select_hops`, the oldest marker); the
 /// projection is [`HOPS_SQL`]'s.
 pub const HOP_COMPETITORS_SQL: &str = "SELECT hp.*,hp.txid AS hopTxid,hp.txid AS markerTxid,hp.outputIndex AS markerVout,hp.createdAt AS markerCreatedAt,hp.rowid AS markerRowid,r.createdAt AS potCreatedAt,r.txid IS NULL AS unknownHop,r.spent,r.spendingTxid,r.spentConfirmed,r.spenderFinal,CASE WHEN hp.hopLockHex IS NOT NULL AND hp.hopSatsOnChain=hp.hopSats THEN 0 ELSE 1 END AS paidTier FROM json_each(?2) k CROSS JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=json_extract(k.value,'$[0]') AND hp.hopVout=json_extract(k.value,'$[1]') LEFT JOIN pot_records r ON r.txid=hp.txid AND r.outputIndex=hp.hopVout WHERE hp.identity=?1";
+/// D2-OWED-FOLD-8: the identity's missing-evidence rows of its games under an open eviction, with the opponent its
+/// verified twin party names (the old walk's seat), less the outpoints its own evidence names.
+pub const MISSING_SQL: &str = "SELECT m.hopTxid,m.hopVout,m.gameId,m.potTxid,m.evictedAt,m.bytesRead,(SELECT lower(pp.opponentIdentity) FROM potparty_records_evicted pp INDEXED BY idx_evicted_party_identity_game WHERE pp.identity=m.identity AND pp.gameId=m.gameId AND pp.potTxid=m.potTxid AND pp.sigValid=1 AND pp.seatSettlePubkey IS NOT NULL ORDER BY pp.createdAt,pp.rowid LIMIT 1) AS opponentIdentity FROM released_hop_evidence_missing m JOIN pot_evictions e ON e.txid=m.potTxid WHERE m.identity=?1 AND m.gameId IN (SELECT value FROM json_each(?2)) AND e.readmittedAt IS NULL AND m.evictedAt=e.evictedAt AND NOT EXISTS (SELECT 1 FROM released_hop_evidence h WHERE h.hopTxid=m.hopTxid AND h.hopVout=m.hopVout AND h.identity=m.identity) AND NOT EXISTS (SELECT 1 FROM potparty_records p INDEXED BY idx_potparty_identity WHERE p.identity=m.identity AND p.potTxid=m.hopTxid AND p.potVout=m.hopVout) AND NOT EXISTS (SELECT 1 FROM hopparty_records hp INDEXED BY idx_hopparty_hop WHERE hp.txid=m.hopTxid AND hp.hopVout=m.hopVout AND hp.identity=m.identity AND hp.markerValid=1)";
 pub const RELEASED_SQL: &str = "SELECT h.* FROM released_hop_evidence h JOIN pot_evictions e ON e.txid = h.potTxid WHERE h.hopTxid = ?1 AND h.hopVout = ?2 AND e.readmittedAt IS NULL AND h.evictedAt = e.evictedAt";
 
 pub(super) async fn read<T: DeserializeOwned>(
@@ -288,6 +291,32 @@ pub(crate) async fn hydrate_filings(
             batch: None,
         };
         owed::merge_markerless_hops(&mut i.hops, vec![h]);
+    }
+    // D2-OWED-FOLD-8: the released hops of an evicted JOIN whose bytes do not read, as the old walk faulted them; an
+    // outpoint the identity's own evidence names (a released-hop evidence row, its pot, its verified hop marker) is
+    // judged from that evidence instead.
+    for r in read::<Value>(db, MISSING_SQL, bound.clone()).await? {
+        let hop = text(&r, "hopTxid");
+        let vout = num(&r, "hopVout") as u32;
+        let reason = if flag(&r, "bytesRead") == Some(true) {
+            "evidence-missing: the evicted JOIN's stored outputs are absent or undecodable"
+        } else {
+            "evidence-missing: the evicted JOIN's stored bytes are absent or undecodable"
+        };
+        i.markerless_faults.push(owed::OwedRow {
+            identity: identity.to_owned(),
+            outpoint: owed::outpoint_key(&hop, vout),
+            family: owed::OwedFamily::Unbound,
+            game_id: text(&r, "gameId"),
+            sats: None,
+            opponent_identity: r["opponentIdentity"].as_str().map(str::to_owned),
+            at_height: None,
+            facts: json!({"markerlessEvidence":true,"markerlessJoin":text(&r,"potTxid"),
+                "markerlessReadFault":true,"evidenceMissing":true,
+                "hopTxid":hop,"hopVout":vout,"claim":null,"claimable":false,
+                "markerCreatedAtMs":num(&r,"evictedAt") as i64}),
+            reason: Some(format!("could not judge: {reason}")),
+        });
     }
     let unknown: Vec<_> = i
         .results

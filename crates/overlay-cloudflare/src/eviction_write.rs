@@ -16,18 +16,18 @@ pub const RELEASED_HOP_READ_SQL: &str = "SELECT h.hopTxid,h.hopVout,h.identity,h
 /// The same fourth marker source for one identity's game, using its migration's index.
 pub const RELEASED_GAME_READ_SQL: &str = "SELECT h.hopTxid,h.hopVout,h.identity,h.gameId,h.potTxid,h.seatSettlePubkey,h.hopSats,h.evictedAt FROM released_hop_evidence h INDEXED BY idx_released_hop_evidence_identity_game JOIN pot_evictions e ON e.txid=h.potTxid WHERE h.identity=?1 AND h.gameId=?2 AND e.readmittedAt IS NULL AND h.evictedAt=e.evictedAt";
 
-// Read the candidate keys only. The INSERT rechecks their signatures and commitment on the
-// actual evicted rows inside the transaction, after all the move statements have run.
-const SEAT_KEYS_SQL: &str = "SELECT DISTINCT lower(seatSettlePubkey) AS key FROM potparty_records_evicted INDEXED BY idx_evicted_party_pot WHERE potTxid=?1 AND sigValid=1 AND seatSettlePubkey IS NOT NULL UNION SELECT DISTINCT lower(seatSettlePubkey) AS key FROM potparty_records INDEXED BY idx_potparty_pot WHERE potTxid=?1 AND sigValid=1 AND seatSettlePubkey IS NOT NULL";
+/// Read the candidate keys only. The INSERT rechecks their signatures and commitment on the
+/// actual evicted rows inside the transaction, after all the move statements have run.
+pub const SEAT_KEYS_SQL: &str = "SELECT DISTINCT lower(seatSettlePubkey) AS key FROM potparty_records_evicted INDEXED BY idx_evicted_party_pot WHERE potTxid=?1 AND sigValid=1 AND seatSettlePubkey IS NOT NULL UNION SELECT DISTINCT lower(seatSettlePubkey) AS key FROM potparty_records INDEXED BY idx_potparty_pot WHERE potTxid=?1 AND sigValid=1 AND seatSettlePubkey IS NOT NULL";
 
 // A newer readmission must abort the whole batch before its first move. Deliberately duplicate
 // that ledger row's primary key: unlike a read outside the batch this cannot race the moves.
 const READMISSION_FENCE_SQL: &str = "INSERT INTO pot_evictions (txid,reason,evictedAt) SELECT txid,reason,evictedAt FROM pot_evictions WHERE txid=?1 AND readmittedAt IS NOT NULL";
 
-// Checks 1 and 2 of owed::markerless_released_hops, on the rows this batch moved:
-// one verified game/key per identity, all structurally valid commitments agreeing, K on exactly one seat.
-// Check 3 is the hash-verified BEEF output comparison in evidence_inserts below.
-const EVIDENCE_INSERT_SQL: &str = "WITH seats AS (\
+/// Checks 1 and 2 of owed::markerless_released_hops, on the rows this batch moved:
+/// one verified game/key per identity, all structurally valid commitments agreeing, K on exactly one seat.
+/// Check 3 is the hash-verified BEEF output comparison in evidence_inserts below.
+pub const EVIDENCE_INSERT_SQL: &str = "WITH seats AS (\
  SELECT lower(identity) AS identity,lower(gameId) AS gameId,lower(seatSettlePubkey) AS seatKey \
  FROM potparty_records_evicted INDEXED BY idx_evicted_party_pot \
  WHERE potTxid=?1 AND sigValid=1 AND seatSettlePubkey IS NOT NULL GROUP BY lower(identity) \
@@ -47,6 +47,23 @@ const EVIDENCE_INSERT_SQL: &str = "WITH seats AS (\
  AND EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r WHERE json_extract(r.value,'$.table')='pot_records' AND lower(json_extract(r.value,'$.txid'))=?2 AND json_extract(r.value,'$.vout')=?3) \
  ON CONFLICT(hopTxid,hopVout,identity) DO UPDATE SET gameId=excluded.gameId,potTxid=excluded.potTxid,seatSettlePubkey=excluded.seatSettlePubkey,hopSats=excluded.hopSats,evictedAt=excluded.evictedAt";
 
+/// D2-OWED-FOLD-8: the released outpoints of `?2` (a JSON array of `{"txid","vout"}`; `?3` whether the bytes
+/// parsed) the evicted JOIN's stored bytes cannot judge (absent, undecodable, or not carrying the hop's transaction), named for each verified seat of the JOIN
+/// by check 1's seats (one game and key per identity), each a released `pot_records` spend of the open eviction (a
+/// ledger entry with no `table` field is a `pot_records` spend, as the old walk read it). The judge serves each as
+/// the old walk's could-not-judge row; a later evidence row for the hop takes it over.
+pub const MISSING_INSERT_SQL: &str = "WITH seats AS (\
+ SELECT lower(identity) AS identity,lower(gameId) AS gameId \
+ FROM potparty_records_evicted INDEXED BY idx_evicted_party_pot \
+ WHERE potTxid=?1 AND sigValid=1 AND seatSettlePubkey IS NOT NULL GROUP BY lower(identity) \
+ HAVING MIN(lower(gameId))=MAX(lower(gameId)) AND MIN(lower(seatSettlePubkey))=MAX(lower(seatSettlePubkey))\
+) INSERT INTO released_hop_evidence_missing (identity,gameId,hopTxid,hopVout,potTxid,evictedAt,bytesRead) \
+ SELECT DISTINCT s.identity,s.gameId,lower(json_extract(o.value,'$.txid')),json_extract(o.value,'$.vout'),?1,e.evictedAt,?3 \
+ FROM seats s JOIN pot_evictions e ON e.txid=?1 JOIN json_each(?2) o \
+ WHERE e.readmittedAt IS NULL \
+ AND EXISTS (SELECT 1 FROM json_each(e.releasedSpends) r WHERE IFNULL(json_extract(r.value,'$.table'),'pot_records')='pot_records' AND lower(json_extract(r.value,'$.txid'))=lower(json_extract(o.value,'$.txid')) AND json_extract(r.value,'$.vout')=json_extract(o.value,'$.vout')) \
+ ON CONFLICT(identity,gameId,hopTxid,hopVout) DO UPDATE SET potTxid=excluded.potTxid,evictedAt=excluded.evictedAt,bytesRead=excluded.bytesRead";
+
 const COUNT_SKIPPED_SQL: &str = "INSERT INTO ops_counters (name,value) SELECT 'released_hop_evidence_skipped_total',COUNT(*) FROM pot_evictions e,json_each(e.releasedSpends) r WHERE e.txid=?1 AND e.readmittedAt IS NULL AND json_extract(r.value,'$.table')='pot_records' AND NOT EXISTS (SELECT 1 FROM released_hop_evidence h WHERE h.hopTxid=lower(json_extract(r.value,'$.txid')) AND h.hopVout=json_extract(r.value,'$.vout') AND h.potTxid=e.txid AND h.evictedAt=e.evictedAt) ON CONFLICT(name) DO UPDATE SET value=ops_counters.value+excluded.value";
 
 #[derive(Default)]
@@ -61,91 +78,39 @@ pub(crate) struct Snapshot {
     pub fresh_spends: bool,
 }
 
+/// The writer's evidence for one eviction from its JOIN's bytes (check 3, the shared
+/// [`overlay_discovery::pot::released_evidence::evidence_writes`]): an evidence statement per hop output paying a
+/// candidate key, then one missing-evidence statement naming the released hops the bytes cannot judge (every one when
+/// the bytes are absent or undecodable). The app layer's `owed-v2` backfill binds the same writes to the same two
+/// statements over an eviction made before this writer existed (D2-OWED-FOLD-8).
 fn evidence_inserts(snapshot: &Snapshot, txid: &str) -> Vec<Query> {
-    let Some(beef) = snapshot.beef.as_deref() else {
-        return Vec::new();
-    };
-    let Ok(mut beef) = overlay_engine::beef_limits::parse_beef(
-        beef,
-        &overlay_engine::beef_limits::STORED_BEEF_LIMITS,
-    ) else {
-        return Vec::new();
-    };
-    let mut seat_keys: std::collections::BTreeSet<_> = snapshot.seat_keys.iter().cloned().collect();
-    let mut hops = snapshot.released.clone();
-    // The subject already names every input, even if a pointer or party row lands after
-    // the snapshot. The batch still requires a released outpoint and a verified twin party.
-    if let Some(raw) = beef.find_txid_mut(txid).and_then(|t| t.raw_tx_or_compute()) {
-        if let Ok(join) = bsv_rs::transaction::Transaction::from_binary(&raw) {
-            for input in &join.inputs {
-                if let Ok(txid) = input.get_source_txid() {
-                    let hop = ReleasedSpend {
-                        table: "pot_records".into(),
-                        txid: txid.to_ascii_lowercase(),
-                        vout: input.source_output_index,
-                    };
-                    if !hops.contains(&hop) {
-                        hops.push(hop);
-                    }
-                }
-            }
-            for output in &join.outputs {
-                if let Some(keys) = overlay_discovery::pot::covenant::extract_covenant_params(
-                    &output.locking_script.to_binary(),
-                ) {
-                    seat_keys.insert(hex::encode(keys.pub_a));
-                    seat_keys.insert(hex::encode(keys.pub_b));
-                }
-            }
-        }
-    }
-    let keys: Vec<_> = seat_keys
+    use overlay_discovery::pot::released_evidence::{evidence_writes, EvidenceWrite};
+    let released: Vec<(String, u32)> = snapshot
+        .released
         .iter()
-        .filter_map(|key| {
-            let key = key.to_ascii_lowercase();
-            let bytes = hex::decode(&key).ok()?;
-            (bytes.len() == 33).then(|| {
-                let lock =
-                    overlay_discovery::pot::p2pkh_lock(&bsv_rs::primitives::hash::hash160(&bytes));
-                (key, lock)
-            })
-        })
+        .filter(|r| r.table == "pot_records")
+        .map(|r| (r.txid.to_ascii_lowercase(), r.vout))
         .collect();
-    let mut out = Vec::new();
-    for hop in &hops {
-        if hop.table != "pot_records" {
-            continue;
-        }
-        let hop_txid = hop.txid.to_ascii_lowercase();
-        let Some(raw) = beef
-            .find_txid_mut(&hop_txid)
-            .and_then(|t| t.raw_tx_or_compute())
-        else {
-            continue;
-        };
-        let Ok(tx) = bsv_rs::transaction::Transaction::from_binary(&raw) else {
-            continue;
-        };
-        let Some(output) = tx.outputs.get(hop.vout as usize) else {
-            continue;
-        };
-        let Some(sats) = output.satoshis.and_then(|n| i64::try_from(n).ok()) else {
-            continue;
-        };
-        for (key, lock) in &keys {
-            if output.locking_script.to_binary() == *lock {
-                out.push(
-                    Query::new(EVIDENCE_INSERT_SQL)
-                        .bind(txid)
-                        .bind(hop_txid.as_str())
-                        .bind(hop.vout)
-                        .bind(key.as_str())
-                        .bind(sats),
-                );
-            }
-        }
-    }
-    out
+    evidence_writes(
+        snapshot.beef.as_deref(),
+        txid,
+        &released,
+        &snapshot.seat_keys,
+    )
+    .into_iter()
+    .map(|w| match w {
+        EvidenceWrite::Found(f) => Query::new(EVIDENCE_INSERT_SQL)
+            .bind(txid)
+            .bind(f.hop_txid)
+            .bind(f.hop_vout)
+            .bind(f.seat_key)
+            .bind(f.sats),
+        EvidenceWrite::Missing { list, bytes_read } => Query::new(MISSING_INSERT_SQL)
+            .bind(txid)
+            .bind(list)
+            .bind(i64::from(bytes_read)),
+    })
+    .collect()
 }
 
 fn merge_releases_sql(cols: &[ColumnInfo]) -> String {
@@ -772,6 +737,68 @@ mod tests {
             }
             execute(&f.db, &plan(&f.snapshot, &f.join, "REJECTED", 1_000)).unwrap();
             assert_eq!(count(&f.db, "released_hop_evidence"), 0);
+        }
+    }
+
+    /// D2-OWED-FOLD-8: the bytes that cannot judge a released hop are never silence. An absent or undecodable JOIN
+    /// names every released hop per verified seat (`bytesRead` 0); bytes that parse but do not carry the hop's output
+    /// name that hop (`bytesRead` 1); readable bytes name none. Each is the judge's could-not-judge row.
+    #[test]
+    fn fold8_an_unreadable_join_names_its_released_hops_for_each_verified_seat() {
+        for bad in 0..4 {
+            let mut f = fixture();
+            match bad {
+                0 => f.snapshot.beef = None,
+                1 => f.snapshot.beef = Some(vec![0, 1, 2]),
+                2 => {
+                    for hop in &mut f.snapshot.released {
+                        hop.vout = 1;
+                    }
+                    f.db.execute(
+                        "UPDATE pot_records SET outputIndex=1 WHERE spendingTxid=?1",
+                        [&f.join],
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            execute(&f.db, &plan(&f.snapshot, &f.join, "REJECTED", 1_000)).unwrap();
+            let rows: Vec<(String, String, i64, i64)> = f
+                .db
+                .prepare("SELECT identity,hopTxid,hopVout,bytesRead FROM released_hop_evidence_missing ORDER BY identity,hopTxid")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            if bad == 3 {
+                assert!(rows.is_empty(), "{rows:?}");
+                assert_eq!(count(&f.db, "released_hop_evidence"), 2);
+                continue;
+            }
+            let mut hops = f.hops.clone();
+            hops.sort();
+            let vout = i64::from(bad == 2);
+            let want: Vec<_> = ["identity-0", "identity-1"]
+                .iter()
+                .flat_map(|id| {
+                    hops.iter()
+                        .map(move |h| (id.to_string(), h.clone(), vout, vout))
+                })
+                .collect();
+            assert_eq!(rows, want, "case {bad}");
+            assert_eq!(count(&f.db, "released_hop_evidence"), 0);
+            // each named hop marks its seat's game (the dirty trigger, keyed per hop)
+            assert_eq!(
+                f.db.query_row(
+                    "SELECT COUNT(*) FROM owed_dirty WHERE source='hop' AND gameId='game'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                4,
+                "each seat's game is marked for each hop"
+            );
         }
     }
 
