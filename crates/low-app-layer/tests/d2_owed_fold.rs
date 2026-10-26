@@ -224,16 +224,28 @@ async fn d2fold_high3_a_a_thousand_stranger_rows_leave_the_honest_look_in_the_fi
         "the honest row is looked at in the first tick: {:?}",
         fake.calls.borrow()
     );
+    // the walk and the per-identity due read are covering-index searches: the tick never reads the due set
     let plan = db.plan(
-        belt::CANDIDATES_SQL,
-        &[SqlValue::Integer(NOW as i64), SqlValue::Integer(8)],
+        belt::BELT_DUE_SQL,
+        &[SqlValue::Text("owner".into()), SqlValue::Integer(NOW as i64), SqlValue::Integer(8)],
     );
     assert!(
-        plan.iter()
-            .any(|d| d.contains("USING COVERING INDEX idx_owed_rows_belt_turn (beltDueAtMs<?)")),
+        plan.iter().any(|d| d.contains(
+            "USING COVERING INDEX idx_owed_rows_belt_turn (identity=? AND beltDueAtMs<?)"
+        )),
         "{plan:?}"
     );
-    assert!(!plan.iter().any(|d| d.starts_with("SCAN owed_rows")), "{plan:?}");
+    let walk = db.plan(
+        belt::BELT_IDENTITIES_SQL,
+        &[SqlValue::Text(String::new()), SqlValue::Integer(64)],
+    );
+    assert!(
+        walk.iter().any(|d| d.contains("USING COVERING INDEX idx_owed_rows_belt_turn (identity>?)")),
+        "{walk:?}"
+    );
+    for p in plan.iter().chain(&walk) {
+        assert!(!p.starts_with("SCAN owed_rows"), "{p}");
+    }
 }
 
 /// HIGH-3: the judge dates only a row that owes the chain a question it can answer. A hop whose marker does not verify

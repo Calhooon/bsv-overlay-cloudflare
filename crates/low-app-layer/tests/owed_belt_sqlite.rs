@@ -460,24 +460,28 @@ async fn owed893_belt_a_find_is_one_batch_and_a_faulted_row_insert_leaves_no_mem
 fn owed893_belt_candidates_ride_the_belt_index() {
     let db = Db::new();
     let conn = db.conn.borrow();
-    let mut plan = conn
-        .prepare(&format!("EXPLAIN QUERY PLAN {}", belt::CANDIDATES_SQL))
-        .unwrap();
-    let details: Vec<String> = plan
-        .query_map(rusqlite::params![NOW as i64, 8], |r| r.get(3))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let plan = |sql: &str, binds: &[&dyn rusqlite::ToSql]| -> Vec<String> {
+        let mut plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        plan.query_map(binds, |r| r.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let due = plan(belt::BELT_DUE_SQL, &[&"owner", &(NOW as i64), &8]);
     assert!(
-        details
-            .iter()
-            .any(|d| d.contains("SEARCH owed_rows USING COVERING INDEX idx_owed_rows_belt_turn (beltDueAtMs<?)")),
-        "{details:?}"
+        due.iter().any(|d| d.contains(
+            "SEARCH owed_rows USING COVERING INDEX idx_owed_rows_belt_turn (identity=? AND beltDueAtMs<?)"
+        )),
+        "{due:?}"
     );
+    let walk = plan(belt::BELT_IDENTITIES_SQL, &[&"", &64]);
     assert!(
-        !details.iter().any(|d| d.starts_with("SCAN owed_rows")),
-        "{details:?}"
+        walk.iter().any(|d| d.contains("idx_owed_rows_belt_turn (identity>?)")),
+        "{walk:?}"
     );
+    for d in due.iter().chain(&walk) {
+        assert!(!d.starts_with("SCAN owed_rows"), "{d}");
+    }
 }
 
 #[tokio::test]

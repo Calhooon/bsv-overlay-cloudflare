@@ -58,7 +58,7 @@ UPDATE owed_rows SET judgedAtMs = NULL, claimable = NULL, gateHeight = NULL, bel
 DELETE FROM owed_row_words;
 DELETE FROM owed_state;
 DELETE FROM owed_dirty;
-INSERT INTO ops_counters(name, value) VALUES ('overlay_migration_count', 406) ON CONFLICT(name) DO UPDATE SET value = excluded.value;
+INSERT INTO ops_counters(name, value) VALUES ('overlay_migration_count', 407) ON CONFLICT(name) DO UPDATE SET value = excluded.value;
 EOF
 python3 scripts/d1-load-chunked.py "$out" low-overlay-db "$state" "$out/seed.sql" 80 > "$out/seed.log" 2>&1
 jobs=()
@@ -77,5 +77,6 @@ for ((n=0; n<120; n++)); do
   if curl --silent --fail "http://127.0.0.1:$port/health" > "$out/health.json"; then break; fi
   sleep 1
 done
-node tools/lane-893/owed_backfill_pass.mjs "http://127.0.0.1:$port" "http://127.0.0.1:$standin" "$token" | tee "$out/measurements.log"
+d1_file="$(find "$state" -path '*D1*' -name '*.sqlite' | head -1)"
+node tools/lane-893/owed_backfill_pass.mjs "http://127.0.0.1:$port" "http://127.0.0.1:$standin" "$token" "$d1_file" | tee "$out/measurements.log"
 sqlite3 "$(find "$state" -name '*.sqlite' | head -1)" "SELECT identity, rows, truncated FROM owed_state ORDER BY identity; SELECT COUNT(*) FROM owed_rows WHERE judgedAtMs IS NULL; SELECT name FROM view_derivation_state WHERE name='owed-v2'; SELECT COUNT(*) FROM owed_dirty;" | tee "$out/state.log"

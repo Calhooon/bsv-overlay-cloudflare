@@ -312,7 +312,7 @@ const OWED_893_PLANS: &[(&str, &str, &[&str])] = &[
         &["idx_owed_rows_identity_game", "sqlite_autoindex_owed_row_words_1", "sqlite_autoindex_tx_words_1"],
     ),
     ("owed identity marker", low_app_layer::owed_read::STATE_SQL, &["sqlite_autoindex_owed_state_1"]),
-    ("owed pending count", low_app_layer::owed_read::PENDING_SQL, &["idx_owed_dirty_identity"]),
+    ("owed pending count", low_app_layer::owed_read::PENDING_SQL, &["idx_owed_dirty_identity_marked"]),
     // The D2-OWED lens's MEDIUM-1: the SHIPPED drain, tip, belt and repair statements, never proxies.
     ("owed judge marks", low_app_layer::owed_judge::MARKS_SQL, &["sqlite_autoindex_owed_dirty_1"]),
     ("owed hop competitors", low_app_layer::owed_judge::HOP_COMPETITORS_SQL, &["idx_hopparty_hop"]),
@@ -322,17 +322,19 @@ const OWED_893_PLANS: &[(&str, &str, &[&str])] = &[
     ("owed judge state stamp", low_app_layer::owed_judge::STATE_UPDATE_SQL, &["sqlite_autoindex_owed_state_1"]),
     ("owed acknowledge seen generation", low_app_layer::owed_judge::ACK_DIRTY_SQL, &["sqlite_autoindex_owed_dirty_1"]),
     ("owed word invalidation", "SELECT identity,outpoint FROM owed_row_words WHERE txid=?1", &["idx_owed_row_words_txid"]),
-    ("owed wanted envelopes", low_app_layer::owed_judge::WANTED_ENVELOPES_SQL, &["idx_owed_dirty_source_marked"]),
-    ("owed drain walk", low_app_layer::owed_judge::DRAIN_IDENTITIES_SQL, &["idx_owed_dirty_identity"]),
+    ("owed wanted envelopes", low_app_layer::owed_judge::WANTED_ENVELOPES_SQL, &["idx_owed_dirty_source_key"]),
+    ("owed drain walk", low_app_layer::owed_judge::DRAIN_IDENTITIES_SQL, &["idx_owed_dirty_identity_marked"]),
     ("owed drain marks", low_app_layer::owed_judge::DRAIN_MARKS_SQL, &["idx_owed_dirty_identity_marked"]),
-    ("owed hook subjects", low_app_layer::owed_judge::CHANGED_SQL, &["idx_owed_dirty_identity", "idx_owed_dirty_source_key"]),
+    ("owed hook subjects", low_app_layer::owed_judge::CHANGED_SQL, &["idx_owed_dirty_source_key"]),
     ("owed tip range", low_app_layer::owed_judge::MARK_TIP_SQL, &["idx_owed_rows_gate"]),
     ("owed tip sweeps", low_app_layer::owed_judge::DATE_SWEEPS_SQL, &["idx_owed_rows_sweep"]),
     ("owed tipless rows", low_app_layer::owed_judge::MARK_UNTIPPED_SQL, &["idx_owed_rows_untipped"]),
-    ("owed due belt", low_app_layer::owed_belt::CANDIDATES_SQL, &["idx_owed_rows_belt_turn"]),
+    ("owed belt walk", low_app_layer::owed_belt::BELT_IDENTITIES_SQL, &["idx_owed_rows_belt_turn"]),
+    ("owed belt due rows", low_app_layer::owed_belt::BELT_DUE_SQL, &["idx_owed_rows_belt_turn"]),
+    ("owed belt candidate", low_app_layer::owed_belt::CANDIDATES_SQL, &["sqlite_autoindex_owed_rows_1"]),
     ("owed belt gauge", low_app_layer::owed_belt::DUE_GAUGE_SQL, &["idx_owed_rows_belt"]),
-    ("owed age repair", low_app_layer::owed_backfill::AGE_MARK_SQL, &["idx_owed_rows_judged", "idx_owed_dirty_source_marked"]),
-    ("owed keyless repair", low_app_layer::owed_backfill::AGE_MARK_UNJUDGED_SQL, &["idx_owed_rows_unjudged", "idx_owed_dirty_source_marked"]),
+    ("owed age repair", low_app_layer::owed_backfill::AGE_MARK_SQL, &["idx_owed_rows_judged", "idx_owed_dirty_source_key"]),
+    ("owed keyless repair", low_app_layer::owed_backfill::AGE_MARK_UNJUDGED_SQL, &["idx_owed_rows_unjudged", "idx_owed_dirty_source_key"]),
     ("owed released hop", "SELECT identity,gameId FROM released_hop_evidence WHERE hopTxid=?1 AND hopVout=?2", &["sqlite_autoindex_released_hop_evidence_1"]),
     ("owed released game", "SELECT hopTxid,hopVout FROM released_hop_evidence WHERE identity=?1 AND gameId=?2", &["idx_released_hop_evidence_identity_game"]),
     ("owed belt cursor", "SELECT cursor,tickedAtMs FROM owed_belt_state WHERE name=?1", &["sqlite_autoindex_owed_belt_state_1"]),
@@ -382,7 +384,7 @@ fn owed893_each_owed_lookup_index_removed_alone_turns_the_hot_plan_pin_red() {
         .flat_map(|(_, _, indexes)| indexes.iter().copied())
         .filter(|index| !index.starts_with("sqlite_autoindex_"))
         .collect();
-    assert_eq!(indexes.len(), 16);
+    assert_eq!(indexes.len(), 14);
     for index in indexes {
         db.execute_batch("SAVEPOINT missing_index").unwrap();
         db.execute_batch(&format!("DROP INDEX {index}")).unwrap();

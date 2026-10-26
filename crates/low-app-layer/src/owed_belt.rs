@@ -4,8 +4,8 @@
 //! A Durable Object alarm (the `BOARD_VIEW` actor named [`OWED_BELT_ACTOR`]; the deferred walk's alarm is gone) runs
 //! one [`tick`] every [`OWED_BELT_TICK_MS`], and the scheduled pass re-arms it ([`arm`], the watchdog: a lost alarm
 //! costs at most one 15 minute cron). A tick reads the [`OWED_BELT_OUTPOINTS_PER_TICK`] rows whose `beltDueAtMs` is
-//! past ([`CANDIDATES_SQL`] over `idx_owed_rows_belt_turn`, round-robin by identity: one row of each due identity
-//! before a second of any, the D2-OWED lens's HIGH-3; the judge sets that column for exactly the rows that owe the
+//! past (round-robin by identity over `idx_owed_rows_belt_turn`: up to 64 identities walked past a cursor, one row of
+//! each due identity before a second of any, the D2-OWED lens's HIGH-3, `due_candidates`; the judge sets that column for exactly the rows that owe the
 //! chain a question it can answer, `owed_judge::row_statements`) and asks each through the existing ladders behind ONE gate
 //! ([`Gate`]): at most [`OWED_BELT_CALLS_PER_OUTPOINT`] courier calls an outpoint and [`OWED_BELT_CALLS_PER_TICK`] a
 //! tick, the three-fault circuit per rung per tick, a rung's 429 ending that rung's turn (never the tick). Every find
@@ -39,10 +39,18 @@ pub const OWED_BELT_STATE_NAME: &str = "belt";
 /// The rungs, by courier host. `other` is any host the ladders reach that is none of the three.
 pub const RUNGS: [&str; 4] = ["woc", "bitails", "bananablocks", "other"];
 
-/// The due rows, every identity's oldest first, then each identity's second, and so on (the D2-OWED lens's HIGH-3: a
-/// stranger's thousand due rows take one place a tick, not the tick). The inner read is the covering partial index's
-/// due range; the outer read is one primary-key read per chosen row.
-pub const CANDIDATES_SQL: &str = "SELECT r.identity,r.outpoint,r.gameId,r.family,r.facts,r.reason,r.probeTip,r.beltDueAtMs,r.judgedAtMs,COALESCE(r.claimable, CASE json_type(r.facts,'$.claimable') WHEN 'true' THEN 1 WHEN 'false' THEN 0 END) AS claimable FROM (SELECT identity,outpoint,beltDueAtMs,ROW_NUMBER() OVER (PARTITION BY identity ORDER BY beltDueAtMs,outpoint) AS turn FROM owed_rows INDEXED BY idx_owed_rows_belt_turn WHERE beltDueAtMs<=?1) d CROSS JOIN owed_rows r ON r.identity=d.identity AND r.outpoint=d.outpoint ORDER BY d.turn,d.beltDueAtMs,d.outpoint LIMIT ?2";
+/// The identities the tick walks (the D2-OWED lens's HIGH-3): up to ?2 distinct identities holding a dated row,
+/// ascending past the cursor ?1, one covering-index search each; the tick wraps to the start for the rest.
+pub const BELT_IDENTITIES_SQL: &str = "WITH RECURSIVE walk(identity,n) AS (SELECT (SELECT MIN(identity) FROM owed_rows INDEXED BY idx_owed_rows_belt_turn WHERE beltDueAtMs IS NOT NULL AND identity>?1),1 UNION ALL SELECT (SELECT MIN(identity) FROM owed_rows INDEXED BY idx_owed_rows_belt_turn WHERE beltDueAtMs IS NOT NULL AND identity>walk.identity),n+1 FROM walk WHERE walk.identity IS NOT NULL AND n<?2) SELECT identity FROM walk WHERE identity IS NOT NULL";
+/// One walked identity's oldest due rows (at most a tick's worth).
+pub const BELT_DUE_SQL: &str = "SELECT outpoint,beltDueAtMs FROM owed_rows INDEXED BY idx_owed_rows_belt_turn WHERE identity=?1 AND beltDueAtMs<=?2 ORDER BY beltDueAtMs,outpoint LIMIT ?3";
+/// A chosen row, by its primary key.
+pub const CANDIDATES_SQL: &str = "SELECT identity,outpoint,gameId,family,facts,reason,probeTip,beltDueAtMs,judgedAtMs,COALESCE(claimable, CASE json_type(facts,'$.claimable') WHEN 'true' THEN 1 WHEN 'false' THEN 0 END) AS claimable FROM owed_rows WHERE identity=?1 AND outpoint=?2";
+/// The identities one tick walks: the round-robin's reach (every identity holding a due row is looked at within
+/// `ceil(identities holding a dated row / 64)` ticks).
+pub const OWED_BELT_IDENTITIES_PER_TICK: usize = 64;
+/// The walk's cursor row (the last identity a tick walked).
+pub const OWED_BELT_WALK_STATE_NAME: &str = "belt:identities";
 /// The row as the find's judge left it, for the backoff's comparison.
 pub const AFTER_FIND_SQL: &str = "SELECT family,facts,reason,probeTip,beltDueAtMs FROM owed_rows WHERE identity=?1 AND outpoint=?2";
 /// The backoff: a dated row whose look changed nothing.
@@ -415,6 +423,108 @@ pub struct TickReport {
     pub no_tip: bool,
 }
 
+/// The tick's candidates, round-robin by identity (the D2-OWED lens's HIGH-3): up to
+/// [`OWED_BELT_IDENTITIES_PER_TICK`] identities walked past the cursor (wrapping), each one's oldest due rows in one
+/// batch, then each identity's oldest before a second of any, [`OWED_BELT_OUTPOINTS_PER_TICK`] in all; the chosen rows
+/// read by primary key. The cursor moves to the last identity walked. Reads are bounded by the walk, never the due set.
+async fn due_candidates(db: &impl JudgeDb, now: i64) -> Result<Vec<Value>, String> {
+    let first = |out: Vec<crate::pot_hook::StmtOut>| {
+        out.into_iter().next().map(|o| o.rows).unwrap_or_default()
+    };
+    let cursor = first(
+        db.run_batch(vec![Stmt {
+            sql: "SELECT cursor FROM owed_belt_state WHERE name='belt:identities'".into(),
+            binds: vec![],
+        }])
+        .await?,
+    )
+    .first()
+    .and_then(|r| r["cursor"].as_str().map(str::to_owned))
+    .unwrap_or_default();
+    let walk = |after: String, n: usize| async move {
+        db.run_batch(vec![Stmt {
+            sql: BELT_IDENTITIES_SQL.into(),
+            binds: vec![Bind::Text(after), Bind::Int(n as i64)],
+        }])
+        .await
+        .map(|out| {
+            first(out)
+                .iter()
+                .filter_map(|r| r["identity"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+    };
+    let span = OWED_BELT_IDENTITIES_PER_TICK;
+    let mut identities = walk(cursor.clone(), span).await?;
+    if identities.len() < span && !cursor.is_empty() {
+        for id in walk(String::new(), span - identities.len()).await? {
+            if id > cursor || identities.contains(&id) {
+                break;
+            }
+            identities.push(id);
+        }
+    }
+    if identities.is_empty() {
+        return Ok(Vec::new());
+    }
+    let due = db
+        .run_batch(
+            identities
+                .iter()
+                .map(|id| Stmt {
+                    sql: BELT_DUE_SQL.into(),
+                    binds: vec![
+                        Bind::Text(id.clone()),
+                        Bind::Int(now),
+                        Bind::Int(OWED_BELT_OUTPOINTS_PER_TICK as i64),
+                    ],
+                })
+                .collect(),
+        )
+        .await?;
+    let mut chosen: Vec<(String, String)> = Vec::new();
+    for turn in 0..OWED_BELT_OUTPOINTS_PER_TICK {
+        // inside a turn, the oldest due first
+        let mut this_turn: Vec<(i64, String, String)> = identities
+            .iter()
+            .zip(&due)
+            .filter_map(|(id, out)| {
+                let r = out.rows.get(turn)?;
+                Some((
+                    r["beltDueAtMs"].as_i64().unwrap_or_default(),
+                    r["outpoint"].as_str()?.to_owned(),
+                    id.clone(),
+                ))
+            })
+            .collect();
+        this_turn.sort();
+        for (_, outpoint, id) in this_turn {
+            if chosen.len() < OWED_BELT_OUTPOINTS_PER_TICK {
+                chosen.push((id, outpoint));
+            }
+        }
+    }
+    let mut reads = vec![Stmt {
+        sql: STATE_SQL.into(),
+        binds: vec![
+            Bind::Text(OWED_BELT_WALK_STATE_NAME.into()),
+            Bind::Text(identities.last().cloned().unwrap_or_default()),
+            Bind::Int(now),
+        ],
+    }];
+    reads.extend(chosen.iter().map(|(id, outpoint)| Stmt {
+        sql: CANDIDATES_SQL.into(),
+        binds: vec![Bind::Text(id.clone()), Bind::Text(outpoint.clone())],
+    }));
+    Ok(db
+        .run_batch(reads)
+        .await?
+        .into_iter()
+        .skip(1)
+        .filter_map(|o| o.rows.into_iter().next())
+        .collect())
+}
+
 pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickReport, String> {
     let now = db.now_ms() as i64;
     // Without a chain tip a find's memo carries no tip and its judgement withholds every tip-dependent claim (TIP-877),
@@ -428,19 +538,7 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
             ..Default::default()
         });
     }
-    let rows = db
-        .run_batch(vec![Stmt {
-            sql: CANDIDATES_SQL.into(),
-            binds: vec![
-                Bind::Int(now),
-                Bind::Int(OWED_BELT_OUTPOINTS_PER_TICK as i64),
-            ],
-        }])
-        .await?
-        .into_iter()
-        .next()
-        .map(|o| o.rows)
-        .unwrap_or_default();
+    let rows = due_candidates(db, now).await?;
     let gate = Gate::new(courier);
     let mut report = TickReport {
         candidates: rows.len(),
