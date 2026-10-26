@@ -9,7 +9,7 @@
 //! row whose stored proof is anchored from that height to the highest the event names (the deactivated headers, the
 //! new tip, the competing or witness tips); an `invalidated` block names no height and its header is no longer served
 //! as active (`findHeaderHexForBlockHash` reads the active chain only), so it selects the last
-//! [`INVALIDATED_DEPTH`] heights below chaintracks' tip. `tip`, `tipAge`, `frozen` and `splitResolved` select nothing
+//! [`INVALIDATED_DEPTH`] heights below chaintracks' verified tip and the [`INVALIDATED_ABOVE_TIP`] above it. `tip`, `tipAge`, `frozen` and `splitResolved` select nothing
 //! (the crate's own `on_chain` set; a tip's recheck of SUSPECT words is the app layer's, the overlay holds no word).
 //! The selected rows are judged by THE EXISTING JUDGEMENT, never a new one (`arcade_reorg::judge_window_legs`, which
 //! Arcade's orphan events, register row D7, run over one height): each confirmed spender by ITS OWN stored proof
@@ -66,6 +66,15 @@ pub const PAGES_PER_PASS: usize = 2;
 
 /// An `invalidated` block's window: this many heights below chaintracks' tip, up to the tip.
 pub const INVALIDATED_DEPTH: u64 = 144;
+
+/// bsv-low #896: an `invalidated` block's window also reaches this many heights ABOVE chaintracks' verified tip.
+/// The tracker's tip is the verified header (`chain_tracker::verified_tip_with`), and an invalidation of the tip's
+/// own header LOWERS it: the rows anchored on the invalidated header sit above the new tip. Every proof the overlay
+/// checked was against a header chaintracks served at or below its verified tip then, so a row above the tip now
+/// rests on a header chaintracks no longer serves: exactly the rows the event names. Before #896 the tip was the
+/// couriers' maximum, usually at or above the invalidated height; the verified tip alone would have missed them. As
+/// deep above as the window reaches below.
+pub const INVALIDATED_ABOVE_TIP: u64 = INVALIDATED_DEPTH;
 
 /// The released windows the row keeps (newest last).
 pub const UNRESOLVED_KEPT: usize = 20;
@@ -295,7 +304,8 @@ pub fn kind_name(event: &ChainEvent) -> &'static str {
 pub enum Selection {
     /// The rows anchored in `lo..=hi`.
     Heights(u64, u64),
-    /// The last [`INVALIDATED_DEPTH`] heights below chaintracks' tip (an invalidated block names none).
+    /// The last [`INVALIDATED_DEPTH`] heights below chaintracks' verified tip and the [`INVALIDATED_ABOVE_TIP`] above
+    /// it (an invalidated block names none).
     BelowTip,
     /// Nothing moves.
     None,
@@ -902,7 +912,10 @@ where
             Selection::BelowTip => match tracker.current_height().await {
                 Ok(tip) => {
                     let tip = u64::from(tip);
-                    (tip.saturating_sub(INVALIDATED_DEPTH), tip)
+                    (
+                        tip.saturating_sub(INVALIDATED_DEPTH),
+                        tip.saturating_add(INVALIDATED_ABOVE_TIP),
+                    )
                 }
                 Err(e) => {
                     out.faults += 1;
