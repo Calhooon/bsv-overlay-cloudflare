@@ -579,6 +579,22 @@ mod pins {
     /// The D2-OWED lens's MEDIUM-3: the OLD walk (`owed_recompute_at_tip`, its cursor, ring, probes and write) and the
     /// judge over the same D1 data store the same rows, byte for byte, the word facts stripped. A walk its own page
     /// bound cut serves a subset: each row it stored is the judge's, byte for byte.
+    ///
+    /// The walk's text IS main's (the delta lens's MEDIUM-3 gap): `python3 tools/lane-893/old_walk_text_diff.py
+    /// 8e5e73f7`, run from the repository root, diffs the six `owed_walk_*` regions of `routes.rs` against main
+    /// `8e5e73f7`'s `routes.rs` line for line: 3,282 lines, each region the length of its span on main (3392..3460,
+    /// 3531..5834, 5836..6016, 7445..7959, 8468..8649, 10053..10083), 53 alias edits (`WalkDb`, `WalkDate`, `WalkEnv`,
+    /// `walk_read_soft`, `walk_views`, `walk_canonical_root`, `walk_counted_batch`, `console_log!` unqualified) and the
+    /// retired-walk `#[allow(dead_code)]` marks, and NO logic line differs (it exits 1 on one; a one-word change inside
+    /// a region is caught). The write path is compared too: `d2delta_medium3_a_filing_judged_by_the_write_path_*`
+    /// enters a filing through `record_post` and compares the rows its `judge_with_write` stored with the walk's.
+    ///
+    /// The word facts (`coinWord`, `spenderWord`, `fundingWord`, `tracker`) are stripped on purpose, NOT a gap: a
+    /// stored word fact is never served. The read removes the stored copies and joins the words in their place,
+    /// identically for every row (`owed_read::Snapshot::body`, over `owed_row_words` and `tx_words`), and a row's word
+    /// roles are the txids of its own facts (`settleTxid`, `spendingTxid`, `payTxid`, `chainSpender`, `sweepTxid`, the
+    /// outpoint's funding: `owed_judge::row_statements`), which ARE compared here; so what is served is the same
+    /// function of the same word rows for both sides.
     #[tokio::test]
     async fn d2fold_medium3_the_old_walk_and_the_judge_store_the_same_rows() {
         let mut compared = 0;
@@ -639,6 +655,52 @@ mod pins {
         }
         assert!(diffs.is_empty(), "{} of {compared} rows differ:\n{}", diffs.len(), diffs.join("\n"));
         assert!(compared > 0);
+    }
+
+    /// The delta lens's MEDIUM-3 gap (the fixtures above enter by SQL and are judged by the shipped drain): a filing
+    /// that enters through `record_post` (a signed potrefund marker for a seat of an indexed pot, through
+    /// `verify_record_post` and `file_verified`) is judged by the WRITE path (`judge_with_write`, the filing's source
+    /// statements and the judge in one batch), with no drain after it; the old walk over the same D1 data stores the
+    /// same rows, byte for byte, the word facts stripped.
+    #[tokio::test]
+    async fn d2delta_medium3_a_filing_judged_by_the_write_path_stores_the_walks_rows() {
+        use crate::record_post::{self, tests as rp, DoorOutcome, RecordKind};
+        let judge = SqliteSql::migrated();
+        judge.now.set(NOW_MS);
+        judge.tip.set(Some(TIP));
+        let victim = rp::wallet(0x41);
+        let id = hex::encode(rp::identity(&victim));
+        let game = [0x7a; 32];
+        rp::md_index_the_pot(&judge);
+        rp::md_seat(&judge, &id, &game);
+        judge.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        let script = rp::potrefund_script(&victim, &game, &rp::presigned_refund());
+        let mut filing = record_post::verify_record_post(RecordKind::Potrefund, &script, &id).unwrap();
+        let out = record_post::file_verified(&judge, &mut filing, &id, (NOW_MS / 1000) as i64)
+            .await
+            .unwrap();
+        assert!(matches!(out, DoorOutcome::Written { row_written: true }), "{out:?}");
+        assert_eq!(judge.counter(crate::owed_judge::COUNTER_FILING_FAULTS), 0, "judged by the write path");
+        let pending: i64 = judge
+            .conn
+            .query_row("SELECT COUNT(*) FROM owed_dirty WHERE identity=?1", [&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending, 0, "the write path acknowledged the filer's marks: nothing left for a drain");
+        let j = stored(&judge.conn, &id);
+        assert!(!j.is_empty(), "the filing's judgement stored the seat's rows");
+        // the same D1 data on the walk's side, the judge's rows for the identity taken away first
+        let path = std::env::temp_dir().join(format!("d2delta-medium3-filing-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        judge.conn.execute("VACUUM INTO ?1", [path.to_str().unwrap()]).unwrap();
+        let walk = rusqlite::Connection::open(&path).unwrap();
+        walk.execute_batch(&format!("DELETE FROM owed_row_words WHERE identity='{id}'; DELETE FROM owed_rows WHERE identity='{id}'; DELETE FROM owed_state WHERE identity='{id}';")).unwrap();
+        let walk_db = std::rc::Rc::new(WalkDb { conn: RefCell::new(walk) });
+        let walked = run_old_walk(walk_db.clone(), &id, Some(TIP), None, NOW_MS).await.unwrap();
+        assert!(!walked.truncated && !walked.budget_cut);
+        let w = stored(&walk_db.conn.borrow(), &id);
+        let _ = std::fs::remove_file(&path);
+        eprintln!("filing: walk {w:#?}\njudge {j:#?}");
+        assert_eq!(w, j, "the walk and the write path's judgement store the same rows");
     }
 
     #[tokio::test]
