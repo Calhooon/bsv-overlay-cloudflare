@@ -46,8 +46,10 @@ pub const BELT_IDENTITIES_SQL: &str = "WITH RECURSIVE walk(identity,n) AS (SELEC
 pub const BELT_DUE_SQL: &str = "SELECT outpoint,beltDueAtMs FROM owed_rows INDEXED BY idx_owed_rows_belt_turn WHERE identity=?1 AND beltDueAtMs<=?2 ORDER BY beltDueAtMs,outpoint LIMIT ?3";
 /// A chosen row, by its primary key.
 pub const CANDIDATES_SQL: &str = "SELECT identity,outpoint,gameId,family,facts,reason,probeTip,beltDueAtMs,judgedAtMs,COALESCE(claimable, CASE json_type(facts,'$.claimable') WHEN 'true' THEN 1 WHEN 'false' THEN 0 END) AS claimable FROM owed_rows WHERE identity=?1 AND outpoint=?2";
-/// The identities one tick walks: the round-robin's reach (every identity holding a due row is looked at within
-/// `ceil(identities holding a dated row / 64)` ticks).
+/// The identities one tick walks. The round-robin's bound (the delta lens's D-L1; the first build claimed `ceil(N /
+/// 64)` ticks, false at 8 looks a tick): the cursor passes only identities given a turn or holding no due row, so an
+/// identity holding a due row is given its turn within `ceil(D / 8)` ticks of the walk's window reaching it, `D` the
+/// identities holding a due row ahead of it; the window reaches 64 dated identities past the cursor a tick.
 pub const OWED_BELT_IDENTITIES_PER_TICK: usize = 64;
 /// The walk's cursor row (the last identity a tick walked).
 pub const OWED_BELT_WALK_STATE_NAME: &str = "belt:identities";
@@ -425,8 +427,9 @@ pub struct TickReport {
 
 /// The tick's candidates, round-robin by identity (the D2-OWED lens's HIGH-3): up to
 /// [`OWED_BELT_IDENTITIES_PER_TICK`] identities walked past the cursor (wrapping), each one's oldest due rows in one
-/// batch, then each identity's oldest before a second of any, [`OWED_BELT_OUTPOINTS_PER_TICK`] in all; the chosen rows
-/// read by primary key. The cursor moves to the last identity walked. Reads are bounded by the walk, never the due set.
+/// batch, then each identity's oldest before a second of any, in walk order, [`OWED_BELT_OUTPOINTS_PER_TICK`] in all;
+/// the chosen rows read by primary key. The cursor moves to the last identity GIVEN A TURN (the delta lens's D-L1), so
+/// no identity holding a due row is passed unserved. Reads are bounded by the walk, never the due set.
 async fn due_candidates(db: &impl JudgeDb, now: i64) -> Result<Vec<Value>, String> {
     let first = |out: Vec<crate::pot_hook::StmtOut>| {
         out.into_iter().next().map(|o| o.rows).unwrap_or_default()
@@ -483,32 +486,31 @@ async fn due_candidates(db: &impl JudgeDb, now: i64) -> Result<Vec<Value>, Strin
         )
         .await?;
     let mut chosen: Vec<(String, String)> = Vec::new();
+    let mut turned = vec![false; identities.len()];
+    // Each turn in WALK order, as the drain's (the delta lens's D-L1): the cursor then passes no identity holding a
+    // due row that was not given its turn. (Inside a turn by due time, as first built, a later identity in the walk
+    // could take a place an earlier one was owed, and the cursor at the last WALKED identity passed both.)
     for turn in 0..OWED_BELT_OUTPOINTS_PER_TICK {
-        // inside a turn, the oldest due first
-        let mut this_turn: Vec<(i64, String, String)> = identities
-            .iter()
-            .zip(&due)
-            .filter_map(|(id, out)| {
-                let r = out.rows.get(turn)?;
-                Some((
-                    r["beltDueAtMs"].as_i64().unwrap_or_default(),
-                    r["outpoint"].as_str()?.to_owned(),
-                    id.clone(),
-                ))
-            })
-            .collect();
-        this_turn.sort();
-        for (_, outpoint, id) in this_turn {
+        for (at, (id, out)) in identities.iter().zip(&due).enumerate() {
+            let Some(outpoint) = out.rows.get(turn).and_then(|r| r["outpoint"].as_str()) else {
+                continue;
+            };
             if chosen.len() < OWED_BELT_OUTPOINTS_PER_TICK {
-                chosen.push((id, outpoint));
+                chosen.push((id.clone(), outpoint.to_owned()));
+                turned[at] = true;
             }
         }
     }
+    // The next tick starts after the last identity this one gave a turn (every walked one when none was chosen).
+    let last = turned
+        .iter()
+        .rposition(|t| *t)
+        .map_or_else(|| identities.last(), |at| identities.get(at));
     let mut reads = vec![Stmt {
         sql: STATE_SQL.into(),
         binds: vec![
             Bind::Text(OWED_BELT_WALK_STATE_NAME.into()),
-            Bind::Text(identities.last().cloned().unwrap_or_default()),
+            Bind::Text(last.cloned().unwrap_or_default()),
             Bind::Int(now),
         ],
     }];

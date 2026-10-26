@@ -161,3 +161,49 @@ async fn d2delta_h1_an_index_unspent_sweep_keeps_its_press_across_a_block_and_no
     assert_ne!(row["family"], "hop-stranded", "{row}");
     assert_ne!(row["facts"]["claimable"], true, "{row}");
 }
+
+/// The outpoints the fake was asked about, by hop index, in first-asked order.
+fn asked(fake: &Fake, hops: std::ops::Range<usize>) -> Vec<usize> {
+    let mut seen = Vec::new();
+    for url in fake.calls.borrow().iter() {
+        if let Some(n) = hops.clone().find(|n| url.contains(&hop(*n))) {
+            if !seen.contains(&n) {
+                seen.push(n);
+            }
+        }
+    }
+    seen.sort();
+    seen
+}
+
+/// D-L1: the belt's cursor saves the last identity GIVEN A TURN, and each turn is taken in walk order (the drain's
+/// rule), so no identity holding a due row is passed unserved. 80 dated identities, every fourth one due, the due
+/// times falling along the walk: three ticks serve them eight at a time in walk order. RED on d521888f: the first tick
+/// took the eight OLDEST due of the 64 walked (`left: [32, .., 60]`), its cursor at the 64th, passing seven unserved.
+#[tokio::test]
+async fn d2delta_l1_the_belt_cursor_passes_no_identity_it_did_not_serve() {
+    let db = Db::new();
+    for n in 0..80 {
+        seed_stranded_hop(&db, &format!("id{n:03}"), &format!("g{n:03}"), &hop(n));
+    }
+    drain_all(&db).await;
+    let now = db.now.get() as i64;
+    for n in 0..80 {
+        let at = if n % 4 == 0 { now - 1_000 - n as i64 } else { now + 3 * HOUR };
+        db.exec(&format!("UPDATE owed_rows SET beltDueAtMs={at} WHERE outpoint='{}:0'", hop(n)));
+    }
+    let mut served_by_tick = Vec::new();
+    for _ in 0..3 {
+        let fake = Fake::default();
+        belt::tick(&db, &fake).await.unwrap();
+        served_by_tick.push(asked(&fake, 0..80));
+    }
+    assert_eq!(served_by_tick[0], [0, 4, 8, 12, 16, 20, 24, 28], "the first eight due, in walk order");
+    assert_eq!(served_by_tick[1], [32, 36, 40, 44, 48, 52, 56, 60]);
+    assert_eq!(served_by_tick[2], [64, 68, 72, 76]);
+    assert_eq!(
+        db.text("SELECT cursor FROM owed_belt_state WHERE name='belt:identities'").as_deref(),
+        Some("id076"),
+        "the cursor rests on the last identity given a turn"
+    );
+}
