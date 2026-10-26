@@ -110,15 +110,15 @@ pub const OWED_BELT: [&str; 8] = [
 
 /// bsv-low #893 section 6.1 (lane D2-OWED-BACKFILL): the app layer's one-time `owed-v2` backfill and the daily age
 /// re-mark (`low_app_layer::owed_backfill::counter_names`, pinned equal there). Totals the pass adds. The last three
-/// (D2-OWED-FOLD-8): the open evictions made before the eviction writer the pass examined, and the evidence and
-/// missing-evidence rows it wrote for them.
+/// (D2-OWED-FOLD-8): the open evictions made before the eviction writer the pass examined, the hop outputs paying a
+/// candidate key (each an evidence statement run), and the released outpoints their bytes could not judge.
 pub const OWED_BACKFILL: [&str; 7] = [
     "owed_backfill_identities_total",
     "owed_backfill_rows_total",
     "owed_age_remarked_total",
     "owed_backfill_skipped_identities_total",
     "owed_backfill_evictions_total",
-    "owed_backfill_evidence_rows_total",
+    "owed_backfill_evidence_candidates_total",
     "owed_backfill_evidence_missing_total",
 ];
 
