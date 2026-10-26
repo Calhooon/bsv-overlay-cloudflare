@@ -81,3 +81,11 @@ d1 "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<1039) I
 node tools/lane-893/owed_tip_mark.mjs "http://127.0.0.1:$port" "http://127.0.0.1:$standin" "$token" mark | tee -a "$out/measurements.log"
 dated=$(d1 "SELECT COUNT(*) AS n FROM owed_rows WHERE identity GLOB 'stranger*' AND beltDueAtMs<$mark_at" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["results"][0]["n"])')
 node tools/lane-893/owed_tip_mark.mjs "http://127.0.0.1:$port" "http://127.0.0.1:$standin" "$token" check "$dated" | tee -a "$out/measurements.log"
+# The third delta lens's D3-N2 and D3-M1 (`owed-belt-tick-fleet`): a first-class flood of 40 courier-dependent sweeps
+# judged below the stand-in's tip and due now, beside the strangers above (more than 512 dated identities), then one
+# tick: the walk reads its whole window and the second class keeps its reserved places.
+flood_at=$(( $(date -u +%s) * 1000 - 1000 ))
+d1 "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<39) INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs,judgedAtMs,claimable,probeTip,beltDueAtMs) SELECT printf('flood%04d',i), printf('ffff%060x:0',i), 'hop-stranded', printf('f%04d',i), json_object('claim','sweep-hop','claimable',json('true'),'status','unknown','chainProbe','unspent'), $flood_at, $flood_at, 1, 899999, $flood_at FROM n" > "$out/fleet-plant.json"
+# one second-class row due now inside the walk's window (after the flood's identities): an index-unspent sweep's re-look
+d1 "INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs,judgedAtMs,claimable,probeTip,beltDueAtMs) VALUES ('floodzz-second', printf('eeee%060x:0',0), 'hop-stranded', 'e0000', json_object('claim','sweep-hop','claimable',json('true'),'status','unspent','chainProbe','index-unspent'), $flood_at, $flood_at, 1, 900000, $flood_at)" > "$out/fleet-plant-second.json"
+node tools/lane-893/owed_belt_fleet.mjs "http://127.0.0.1:$port" "http://127.0.0.1:$standin" "$token" | tee -a "$out/measurements.log"
