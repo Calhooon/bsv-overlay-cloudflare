@@ -60,18 +60,18 @@
       "censusKey": "/results"
     },
     "owed-first-read": {
-      "route": "/owed?identity=A: the first read (the compute on read and its write); A's swept hop's sweep is a DURABLE spender with a proofmined: latch, so the recompute makes the latch range read (bsv-low #693 fold-2). D2-OWED-FOLD-8: no longer the /owed census key (two scenarios named it and the later won silently); the census holds /owed to owed-fleet-read, the read's own ceiling since the READ lane",
+      "route": "/owed?identity=A: the first read of an identity no judge has reached: the read never computes (bsv-low #893), it writes ONE wanted mark (its envelope) and answers pending: true. Re-measured by D2-OWED-RETIRE (bsv-low #893 section 6.2): the old figure (382/20/39, maxReads 160) measured the retired walk's compute on read. Not the /owed census key (owed-fleet-read is).",
       "measured": {
-        "reads": 382,
-        "writes": 20,
-        "stmts": 39,
-        "maxReads": 160
+        "reads": 22,
+        "writes": 5,
+        "stmts": 5,
+        "maxReads": 19
       },
       "ceiling": {
-        "reads": 573,
-        "writes": 22,
-        "stmts": 41,
-        "maxReads": 573
+        "reads": 33,
+        "writes": 7,
+        "stmts": 7,
+        "maxReads": 29
       },
       "censusKey": null
     },
@@ -172,11 +172,11 @@
       "censusKey": "/record"
     },
     "pot-changed-hook-1": {
-      "route": "/internal/pot-changed: B's pot, one outpoint, no decoded params, its two marker-named seats marked stale (E649 L4: the required read, the marker arms one batch each, ONE write batch of the stale marks and the outpoint's parked wake-up (H1); no walk, no relay call on the answer path; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1)). Re-measured by D2-OWED-FOLD-8: the hook now judges its marked identities inside the request (owed_judge::drain_changed, bsv-low #893: the design's cost at the write); the old ceiling measured the attribution and stale marks alone, the walk after the answer",
+      "route": "/internal/pot-changed: B's pot, one outpoint, no decoded params, its two marker-named seats queued for the judge (E649 L4: the required read, the marker arms one batch each, ONE write batch of the outpoint's parked wake-up (H1); no walk, no relay call on the answer path; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1)). Re-measured by D2-OWED-FOLD-8: the hook now judges its marked identities inside the request (owed_judge::drain_changed, bsv-low #893: the design's cost at the write); the old ceiling measured the attribution and stale marks alone, the walk after the answer Re-measured by D2-OWED-RETIRE (bsv-low #893 section 6.2): the owed_state stale marks are gone from the batch (nothing read them since the read went to the dirty marks); the ceiling stands.",
       "measured": {
-        "reads": 402,
+        "reads": 403,
         "writes": 55,
-        "stmts": 117,
+        "stmts": 115,
         "maxReads": 128
       },
       "ceiling": {
@@ -204,11 +204,11 @@
       "censusKey": null
     },
     "pot-changed-hook-marker": {
-      "route": "/internal/pot-changed: the fixture's undecoded pot whose party and refund-backup markers name five identities with owed-state rows (E649 L4 M1, the marker fallback: the required read, three arm batches, ONE write batch of five stale marks and one park; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1)). Re-measured by D2-OWED-FOLD-8: the hook's attribution, parks AND the judge of its five marker-named identities inside the request (bsv-low #893)",
+      "route": "/internal/pot-changed: the fixture's undecoded pot whose party and refund-backup markers name five identities with owed-state rows (E649 L4 M1, the marker fallback: the required read, three arm batches, ONE write batch of one park; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1)). Re-measured by D2-OWED-FOLD-8: the hook's attribution, parks AND the judge of its five marker-named identities inside the request (bsv-low #893) Re-measured by D2-OWED-RETIRE (bsv-low #893 section 6.2): the owed_state stale marks are gone from the batch (nothing read them since the read went to the dirty marks); the ceiling stands.",
       "measured": {
-        "reads": 582,
-        "writes": 84,
-        "stmts": 144,
+        "reads": 577,
+        "writes": 79,
+        "stmts": 139,
         "maxReads": 128
       },
       "ceiling": {
@@ -220,11 +220,11 @@
       "censusKey": null
     },
     "pot-changed-hook-8x19": {
-      "route": "/internal/pot-changed: seven decoded pots with two latched seats each and the marker pot naming five, 19 identities each with an owed-state row (E649 L4 M1, the review's H2 body: required batch of 8, seat markers, three arm batches over the one marker outpoint, ONE write batch of 5 stale marks and 22 parks; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1)). Re-measured by D2-OWED-FOLD-8: the hook's attribution, parks AND the judge of its 19 identities inside the request (bsv-low #893); the heaviest request of the tier (435 statements: about 4,700 loopback connections on wrangler dev's local D1 for a few seconds)",
+      "route": "/internal/pot-changed: seven decoded pots with two latched seats each and the marker pot naming five, 19 identities each with an owed-state row (E649 L4 M1, the review's H2 body: required batch of 8, seat markers, three arm batches over the one marker outpoint, ONE write batch of 22 parks; the park batch reads the table's room ONCE, after its parks (N6, fold-3: the counter, then the guard and the room-making delete, each at limit 0 under the ceiling), one LIMITed scan of the parked table, at most 2,048 rows (E649 L4 N3; 126 parked rows here, so the largest statement is 127), and takes its tokens from the one-row counter (N1)). Re-measured by D2-OWED-FOLD-8: the hook's attribution, parks AND the judge of its 19 identities inside the request (bsv-low #893); the heaviest request of the tier (435 statements: about 4,700 loopback connections on wrangler dev's local D1 for a few seconds) Re-measured by D2-OWED-RETIRE (bsv-low #893 section 6.2): the owed_state stale marks are gone from the batch (nothing read them since the read went to the dirty marks); the ceiling stands.",
       "measured": {
-        "reads": 1416,
-        "writes": 240,
-        "stmts": 435,
+        "reads": 1411,
+        "writes": 235,
+        "stmts": 430,
         "maxReads": 149
       },
       "ceiling": {
