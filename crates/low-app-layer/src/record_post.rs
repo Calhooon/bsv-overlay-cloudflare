@@ -4641,7 +4641,7 @@ pub(crate) mod tests {
     }
 
     /// The hop's marker row as the index holds it (the shipped hopparty write), `markerValid` as given.
-    fn md_index_the_hop(
+    pub(crate) fn md_index_the_hop(
         db: &crate::pot_hook::tests::SqliteSql,
         hop: &crate::hopsweep::HopContext,
         marker_valid: Option<i64>,
@@ -4670,7 +4670,7 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    fn md_sweep_script(id: &[u8], gid: &[u8; 32], raw: &[u8]) -> Vec<u8> {
+    pub(crate) fn md_sweep_script(id: &[u8], gid: &[u8; 32], raw: &[u8]) -> Vec<u8> {
         crate::hopsweep::tests::script(&[
             crate::hopsweep::HOPSWEEP_TAG,
             id,
