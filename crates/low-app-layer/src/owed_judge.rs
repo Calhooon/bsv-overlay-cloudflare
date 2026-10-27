@@ -113,7 +113,8 @@ pub use hydrate::{
 };
 pub use writers::{
     drain_changed, drain_changed_within, drain_identities, judge_written_word, judge_written_words,
-    mark_tip, write_word, DATE_SWEEPS_SQL, MARK_TIP_SQL, MARK_UNTIPPED_SQL, UNTIPPED_MARKS_PER_TIP,
+    mark_tip, write_tip_marks, write_word, DATE_SWEEPS_SQL, MARK_TIP_SQL, MARK_UNTIPPED_SQL,
+    UNTIPPED_MARKS_PER_TIP,
 };
 
 pub const OWED_JUDGE_SUBJECTS_PER_INVOCATION: usize = 16;
@@ -788,6 +789,27 @@ fn identity_subjects(marks: &[Value]) -> Vec<String> {
     ordered.into_iter().map(|(game, _)| game).collect()
 }
 
+/// A wanted envelope (`gameId` empty) expanded to its identity's newest games (`wanted`) and the rest (`backfill`),
+/// the envelope deleted up to the generation read. The drain's and the `owed-events` consumer's one expansion.
+pub async fn expand_wanted(db: &impl SqlPort, identity: &str, generation: i64) -> Result<(), String> {
+    db.run_batch(vec![
+        Stmt {
+            sql: EXPAND_WANTED_SQL.into(),
+            binds: vec![Bind::Text(identity.to_owned())],
+        },
+        Stmt {
+            sql: EXPAND_BACKFILL_SQL.into(),
+            binds: vec![Bind::Text(identity.to_owned())],
+        },
+        Stmt {
+            sql: "DELETE FROM owed_dirty WHERE identity=?1 AND gameId='' AND source='wanted' AND generation<=?2".into(),
+            binds: vec![Bind::Text(identity.to_owned()), Bind::Int(generation)],
+        },
+    ])
+    .await?;
+    Ok(())
+}
+
 /// The scheduled drain (the D2-OWED lens's MEDIUM-1): expand the wanted envelopes, then take up to `limit` subjects
 /// round-robin across identities, each identity's oldest first, from the identity after the last pass's; a subject
 /// marked only by the age repair after every other subject. No statement scans `owed_dirty`.
@@ -808,21 +830,7 @@ pub async fn drain_dirty(db: &impl JudgeDb, limit: usize) -> Result<DrainReport,
         let generation = r["generation"]
             .as_i64()
             .ok_or("wanted generation missing")?;
-        db.run_batch(vec![
-            Stmt {
-                sql: EXPAND_WANTED_SQL.into(),
-                binds: vec![Bind::Text(id.clone())],
-            },
-            Stmt {
-                sql: EXPAND_BACKFILL_SQL.into(),
-                binds: vec![Bind::Text(id.clone())],
-            },
-            Stmt {
-                sql: "DELETE FROM owed_dirty WHERE identity=?1 AND gameId='' AND source='wanted' AND generation<=?2".into(),
-                binds: vec![Bind::Text(id), Bind::Int(generation)],
-            },
-        ])
-        .await?;
+        expand_wanted(db, &id, generation).await?;
     }
     let cursor: Vec<Value> = hydrate::read(db, DRAIN_CURSOR_READ_SQL, vec![]).await?;
     let cursor = cursor

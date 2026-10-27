@@ -478,7 +478,13 @@ const DAY_MS: f64 = 86_400_000.0;
 pub const COST_DAILY_CREATE: &str = "CREATE TABLE IF NOT EXISTS worker_cost_daily (day TEXT NOT NULL, worker TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0, rowsRead INTEGER NOT NULL DEFAULT 0, rowsWritten INTEGER NOT NULL DEFAULT 0, statements INTEGER NOT NULL DEFAULT 0, updatedAt INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, worker))";
 
 /// bsv-low #635: one window added to its day's row (a key search on the primary key; one row written).
-pub const COST_DAILY_UPSERT_SQL: &str = "INSERT INTO worker_cost_daily (day, worker, requests, rowsRead, rowsWritten, statements, updatedAt) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(day, worker) DO UPDATE SET requests = requests + excluded.requests, rowsRead = rowsRead + excluded.rowsRead, rowsWritten = rowsWritten + excluded.rowsWritten, statements = statements + excluded.statements, updatedAt = excluded.updatedAt";
+/// bsv-low #911 (D2-ACTOR-A): the queue's family rides the same row (`queueOps`, [`COST_DAILY_QUEUE_ALTER`]).
+pub const COST_DAILY_UPSERT_SQL: &str = "INSERT INTO worker_cost_daily (day, worker, requests, rowsRead, rowsWritten, statements, updatedAt, queueOps) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(day, worker) DO UPDATE SET requests = requests + excluded.requests, rowsRead = rowsRead + excluded.rowsRead, rowsWritten = rowsWritten + excluded.rowsWritten, statements = statements + excluded.statements, updatedAt = excluded.updatedAt, queueOps = queueOps + excluded.queueOps";
+
+/// bsv-low #911 (D2-ACTOR-A): the queue operations column of the daily cost row (appended; an old worker's upsert
+/// leaves it at its default).
+pub const COST_DAILY_QUEUE_ALTER: &str =
+    "ALTER TABLE worker_cost_daily ADD COLUMN queueOps INTEGER NOT NULL DEFAULT 0";
 
 /// bsv-low #635: the name this Worker writes its rows under.
 pub const COST_WORKER: &str = env!("CARGO_PKG_NAME");
@@ -496,12 +502,14 @@ pub struct CostWindow {
     pub writes: u64,
     /// D1 statements.
     pub stmts: u64,
+    /// bsv-low #911 (D2-ACTOR-A): queue operations (messages sent; the consumer's deliveries are its invocations).
+    pub queue_ops: u64,
 }
 
 impl CostWindow {
     /// Nothing to write.
     pub fn is_empty(&self) -> bool {
-        self.requests == 0 && self.stmts == 0
+        self.requests == 0 && self.stmts == 0 && self.queue_ops == 0
     }
 }
 
@@ -515,7 +523,7 @@ pub struct CostFlush {
 }
 
 thread_local! {
-    static COST: Cell<CostWindow> = const { Cell::new(CostWindow { day: None, requests: 0, reads: 0, writes: 0, stmts: 0 }) };
+    static COST: Cell<CostWindow> = const { Cell::new(CostWindow { day: None, requests: 0, reads: 0, writes: 0, stmts: 0, queue_ops: 0 }) };
     static COST_LAST_TAKE_MS: Cell<f64> = const { Cell::new(f64::NEG_INFINITY) };
 }
 
@@ -555,6 +563,15 @@ fn note_cost(reads: u64, writes: u64) {
         w.reads = w.reads.saturating_add(reads);
         w.writes = w.writes.saturating_add(writes);
         w.stmts = w.stmts.saturating_add(1);
+        c.set(w);
+    });
+}
+
+/// bsv-low #911 (D2-ACTOR-A): count `n` queue operations (messages sent) in the window.
+pub fn note_queue_ops(n: u64) {
+    COST.with(|c| {
+        let mut w = c.get();
+        w.queue_ops = w.queue_ops.saturating_add(n);
         c.set(w);
     });
 }
@@ -614,6 +631,7 @@ pub fn restore_cost(f: &CostFlush) {
         w.reads = w.reads.saturating_add(f.window.reads);
         w.writes = w.writes.saturating_add(f.window.writes);
         w.stmts = w.stmts.saturating_add(f.window.stmts);
+        w.queue_ops = w.queue_ops.saturating_add(f.window.queue_ops);
         c.set(w);
     });
 }
@@ -635,6 +653,7 @@ pub async fn flush_cost(db: &worker::D1Database, f: CostFlush, now_ms: f64) {
         JsValue::from_f64(f.window.writes as f64),
         JsValue::from_f64(f.window.stmts as f64),
         JsValue::from_f64(now_ms.floor()),
+        JsValue::from_f64(f.window.queue_ops as f64),
     ]);
     let result = match bound {
         Ok(stmt) => stmt.counted_run().await.map(|_| ()),
@@ -980,7 +999,8 @@ mod b_cost_1 {
                 requests: 1,
                 reads: 10,
                 writes: 2,
-                stmts: 2
+                stmts: 2,
+                queue_ops: 0
             },
             "the window holds every noted statement and the request"
         );

@@ -64,6 +64,7 @@ mod courier_counters;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod migration_emitter;
 pub mod ops;
+pub mod owed_events;
 pub mod peer_crawler;
 pub mod pot_changes;
 pub mod proof_fetcher;
@@ -643,6 +644,11 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
     // this request changed, off the critical path. The routes that already flush have drained the set (a no-op here); the
     // ones that never did (`/admin/complete-proofs` confirmed a tower-broadcast refund's spend and pushed
     // nothing, `/admin/readmit`'s discovery, a `/lookup` whose serve-time rung latches a spend) ride this one.
+    // bsv-low #911 (HIGH-2): the request's owed events and word frames are PUBLISHED before its answer, bounded
+    // (`owed_events::PUBLISH_ANSWER_WALL_MS`); a frame not published rides the flush's POST.
+    for frame in crate::owed_events::publish_before_answer(&env, crate::tracker_events::drain()).await {
+        crate::tracker_events::requeue(frame);
+    }
     crate::pot_changes::flush(&env, |fut| ctx.wait_until(fut));
     crate::lobby_changes::flush(&env, |fut| ctx.wait_until(fut));
     result

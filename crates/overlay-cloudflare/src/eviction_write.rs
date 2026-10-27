@@ -115,12 +115,15 @@ fn evidence_inserts(snapshot: &Snapshot, txid: &str) -> Vec<Query> {
     )
     .into_iter()
     .map(|w| match w {
-        EvidenceWrite::Found(f) => Query::new(EVIDENCE_INSERT_SQL)
+        EvidenceWrite::Found(f) => {
+            crate::owed_events::note("hop", &overlay_discovery::owed_event::outpoint_key(&f.hop_txid, f.hop_vout));
+            Query::new(EVIDENCE_INSERT_SQL)
             .bind(txid)
             .bind(f.hop_txid)
             .bind(f.hop_vout)
             .bind(f.seat_key)
-            .bind(f.sats),
+            .bind(f.sats)
+        }
         EvidenceWrite::Missing { list, bytes_read } => Query::new(MISSING_INSERT_SQL)
             .bind(txid)
             .bind(list)
@@ -139,6 +142,8 @@ fn merge_releases_sql(cols: &[ColumnInfo]) -> String {
 }
 
 pub(crate) fn plan(snapshot: &Snapshot, txid: &str, reason: &str, now_ms: u64) -> Vec<Query> {
+    // bsv-low #911: the eviction's own mark names every party, shadow party and released hop it moves.
+    crate::owed_events::note("eviction", txid);
     let mut out = vec![Query::new(OPEN_EVICTION_MARKER_SQL)
         .bind(txid)
         .bind(reason)

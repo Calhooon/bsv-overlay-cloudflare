@@ -705,6 +705,11 @@ async fn event_held(
     land_word(&crate::routes::D1Sql::of(env)?, &row)
         .await
         .map_err(worker::Error::RustError)?;
+    // bsv-low #911 (D2-ACTOR-A): with the queue the landed word's `word` event is noted (the caller's publish point
+    // ships it; the consumer's own ingest routes it at once) and no judge runs here or after the answer.
+    if crate::owed_events::configured(env).await {
+        crate::owed_events_publish::note("word", &row.txid);
+    }
     Ok(row)
 }
 
@@ -889,10 +894,16 @@ pub async fn ingest(
         return worker::Response::error("Unauthorized", 401);
     }
     let frame: Value = req.json().await?;
+    // bsv-low #911 (D2-ACTOR-A): with the queue the judge is the consumer's; the frame's word event is published
+    // before the answer (the POST is the belt of a frame the queue did not take)
+    let queued = crate::owed_events::configured(env).await;
     let answer = ingest_frame(
         &frame,
         |id, kind, body| async move { event(env, &id, &kind, body.as_ref(), None).await },
         |txid| {
+            if queued {
+                return;
+            }
             // the READ-934 lens's LOW-1: one detached judge per isolate; a frame landed meanwhile leaves its marks
             if !DETACHED_JUDGE.claim(&txid) {
                 return;
@@ -921,6 +932,9 @@ pub async fn ingest(
         },
     )
     .await?;
+    if queued {
+        crate::owed_events_publish::publish_before_answer(env, Vec::new()).await;
+    }
     worker::Response::from_json(&answer)
 }
 
@@ -983,12 +997,18 @@ pub async fn tick(env: &worker::Env) -> worker::Result<()> {
         .await?
         .results::<Subject>()?;
     super::pacing::begin_tick(now / 900);
+    // bsv-low #911: with the queue the tick's words ride their events; the consumer judges them
+    let queued = crate::owed_events::configured(env).await;
     for row in rows {
         // bsv-low #934: the scheduled pass judges what it landed inline, as before (no caller waits on it)
         if let Some(word) = event(env, &row.txid, "tick", None, None).await? {
-            judge_word(env, &word.txid).await?;
+            if !queued {
+                judge_word(env, &word.txid).await?;
+            }
         }
     }
+    // bsv-low #911: the tick's word events, at its end
+    crate::owed_events_publish::publish_env(env, Vec::new()).await;
     Ok(())
 }
 

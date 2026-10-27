@@ -570,7 +570,7 @@
    "database": "low-overlay-db",
    "owner": "low-app-layer",
    "writers": {},
-   "readers": [],
+   "readers": ["overlay-cloudflare"],
    "rebuild_class": "filings",
    "never_wipe": true,
    "holds": "`filed:` hop sweep raws (sweepRawHex)",
@@ -871,7 +871,7 @@
    "database": "low-overlay-db",
    "owner": "low-app-layer",
    "writers": {},
-   "readers": [],
+   "readers": ["overlay-cloudflare"],
    "rebuild_class": "transient",
    "never_wipe": false,
    "holds": "independent named cursors for the owed belt and backfill",
@@ -1201,6 +1201,28 @@
    "never_wipe": false,
    "holds": "the cost bar (bsv-low #635): per UTC day and Worker, fetch requests and D1 rows read, rows written and statements, each Worker's isolates adding a window at most every 64 requests or 60 s; the app layer writes its rows through the overlay's shared d1_ledger.rs source (compiled into it by #[path], so this check sees the statement as the overlay's)",
    "why": "served on /health/invariants.costBar beside the plan's included quotas per day (vars); a lost row loses that day's served figure only, the counting starts again at the next window"
+  },
+  {
+   "name": "owed_event_seq",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "one row: the last `seq` the owed events' publish handed out (bsv-low #911, D2-ACTOR-A, MEDIUM-1), taken by each publish's own batch in the transaction that reads the rows' facts; the app layer publishes through the overlay's shared owed_events.rs source (compiled into it by #[path], so this check sees the statement as the overlay's)",
+   "why": "a counter only, the convention of change_parked_seq: a wipe re-seeds it from the clock (times 1,024) at the next publish; transient"
+  },
+  {
+   "name": "owed_event_dead_letters",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {"overlay-cloudflare": ["CREATE", "DELETE"]},
+   "readers": ["overlay-cloudflare"],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the `owed-events` queue's dead letters (bsv-low #911, LOW-3): the message body as sent, its pair, its park time; at most 2,000 rows; parked by the app layer's DLQ consumer (park first, ack after), re-driven and deleted by the overlay's lever (`POST /internal/redrive-dead-letters`, `family: owed-events`)",
+   "why": "never the only copy of the intent: the letter's marks stay in owed_dirty and the un-acked sweep re-publishes them; a lost row loses an operator's view only"
   },
   {
    "name": "submit_refusals",
@@ -1731,7 +1753,7 @@
      "CREATE"
     ]
    },
-   "readers": [],
+   "readers": ["overlay-cloudflare"],
    "rebuild_class": "re-askable",
    "never_wipe": false,
    "holds": "compact tracker words and checked proof records per subject",

@@ -16,6 +16,30 @@ const BOUNDS: [u64; 11] = [
     u64::MAX,
 ];
 static COUNTS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// bsv-low #911 (D2-ACTOR-A): the publish's own milliseconds, the door's `enqueue;dur`, in the same buckets.
+static ENQUEUE: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+thread_local! {
+    /// The enqueue of the answer being stamped (set by the door, taken by [`stamp_answer`]).
+    static PENDING_ENQUEUE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The door's publish took `ms` (taken by the answer's stamp).
+pub(crate) fn note_enqueue(ms: u64) {
+    PENDING_ENQUEUE.with(|p| p.set(Some(ms)));
+}
+
+/// The enqueue quantile (`/health.record.enqueueMsP50/95`).
+pub(super) fn enqueue_quantile(q: f64) -> Option<u64> {
+    let counts = ENQUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
+    quantile_of(&counts, q)
+}
+
+fn bucket_of(ms: u64) -> usize {
+    BOUNDS
+        .iter()
+        .position(|bound| ms <= *bound)
+        .unwrap_or(BOUNDS.len() - 1)
+}
 
 pub(super) fn samples() -> u64 {
     COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).sum()
@@ -41,20 +65,26 @@ fn quantile_of(counts: &[u64; 11], q: f64) -> Option<u64> {
 }
 
 pub(crate) fn stamp_answer(response: &mut worker::Response, ms: u64) -> worker::Result<()> {
-    let bucket = BOUNDS
-        .iter()
-        .position(|bound| ms <= *bound)
-        .unwrap_or(BOUNDS.len() - 1);
-    COUNTS[bucket].fetch_add(1, Ordering::Relaxed);
+    COUNTS[bucket_of(ms)].fetch_add(1, Ordering::Relaxed);
     let prefix = response
         .headers()
         .get("Server-Timing")?
         .map(|s| format!("{s}, "))
         .unwrap_or_default();
-    response.headers_mut().set(
-        "Server-Timing",
-        &format!("{prefix}write;dur={ms}, judge;desc=detached"),
-    )
+    let timing = timing(ms, PENDING_ENQUEUE.with(std::cell::Cell::take));
+    response.headers_mut().set("Server-Timing", &format!("{prefix}{timing}"))
+}
+
+/// PURE (bsv-low #911): the door's `Server-Timing` entries: the write and the publish apart (no judge: the
+/// `owed-events` consumer's), or the detached judge of a Worker with no queue binding.
+pub(crate) fn timing(ms: u64, enqueue: Option<u64>) -> String {
+    match enqueue {
+        Some(e) => {
+            ENQUEUE[bucket_of(e)].fetch_add(1, Ordering::Relaxed);
+            format!("write;dur={}, enqueue;dur={e}", ms.saturating_sub(e))
+        }
+        None => format!("write;dur={ms}, judge;desc=detached"),
+    }
 }
 
 #[cfg(test)]

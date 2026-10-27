@@ -990,11 +990,27 @@ pub async fn handfile_post(
     let wrote = write_handfile(&port, &verified, &facts, refund_valid, &write, now)
         .await
         .map_err(worker::Error::RustError)?;
-    crate::record_post::detached::schedule(
-        ctx,
-        vec![VerifiedRecord::Potrefund(verified.potrefund.clone(), refund_valid)],
-        "handfile",
-    );
+    // bsv-low #911 (D2-ACTOR-A): the batch's owed events before the answer, never a judge here (the consumer's):
+    // its hop marker, its two party rows and its refund, each the pair its row's trigger marks.
+    if crate::owed_events::configured(&ctx.env) {
+        crate::owed_events_publish::note(
+            "hop",
+            &overlay_discovery::owed_event::outpoint_key(&verified.hop_txid, verified.hopparty.hop_vout),
+        );
+        crate::owed_events_publish::note("party", &verified.potparty_v1.txid);
+        crate::owed_events_publish::note("party", &verified.potparty_v2.txid);
+        crate::record_post::owed_write::note_events(&VerifiedRecord::Potrefund(
+            verified.potrefund.clone(),
+            refund_valid,
+        ));
+        crate::record_post::note_enqueue(crate::owed_events::publish_noted(&ctx.env).await);
+    } else {
+        crate::record_post::detached::schedule(
+            ctx,
+            vec![VerifiedRecord::Potrefund(verified.potrefund.clone(), refund_valid)],
+            "handfile",
+        );
+    }
     if !wrote {
         crate::record_post::note_already_filed(kind);
         return crate::routes::json_response(
