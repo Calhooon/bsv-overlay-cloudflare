@@ -19,6 +19,19 @@
  *     `arc_ingest_evicted_total` +1 and ONE memo write; a following re-present answers 422 and its re-run writes no
  *     second memo (the memo-write counter unchanged).
  *
+ * THE CORROBORATOR (bsv-low #731, the land of 2026-10-27: the retire overlay's witnessed door posted these legs to
+ * arc.taal.com and arc.gorillapool.io and every expectation held on THEIR answers). The retire overlay now runs
+ * `DUAL_BROADCAST=off` (the #413 dual push, a `wait_until` side leg that only ever latches `network_seen` on an accept,
+ * is off) and `CORROBORATOR_URL` on this stand-in's `/corroborator`, whose `POST /corroborator/v1/tx` answers 503, a
+ * transport fault (`corroborator_verdict`'s `Err`: inconclusive, never an accept, never a refusal), per leg:
+ *  leg 1: Arcade's own terminal REJECTED (`ARCADE_URL`) refuses under the open eviction; no corroborator is needed and
+ *         an ask would read "could not confirm".
+ *  leg 2: the young retryable 502 rests on Arcade's terminal word and the indexers' absence; a corroborator ask reads
+ *         "could not confirm", so it stays the retryable 502, never an accept and never a 422.
+ *  leg 3: the push and the re-present's 422 rest on the ledger and Arcade's word; a corroborator ask reads the same.
+ * No expectation changed: none read the real hosts' answer (they were the dual push's, which latched nothing:
+ * TAAL did not accept, so GorillaPool was asked, 3 + 3 subrequests). The asks are printed (INFO), not asserted.
+ *
  * The past-deadline landing itself is not driven: the arm's 12 s deadline is a constant and local D1 does not hold a
  * write past it (the lens, section 5); its settle is pinned natively (`--lib fix920`).
  *
@@ -62,8 +75,15 @@ const C_PUSH = 'arc_ingest_evicted_total'
 // The couriers' stand-in. Arcade's GET names S REJECTED (its stored terminal word); a POST is logged and refused.
 const asked = []
 const arcadePosts = []
+const corroboratorPosts = []
 const sink = createServer((req, res) => {
   asked.push(`${req.method} ${req.url}`)
+  // the retire overlay's CORROBORATOR_URL (TAAL's and GorillaPool's base): a transport fault, inconclusive
+  if (req.method === 'POST' && req.url.startsWith('/corroborator/')) {
+    corroboratorPosts.push(req.url)
+    res.writeHead(503, { 'content-type': 'text/plain' })
+    return res.end('lane-920: the corroborator is unavailable (inconclusive)')
+  }
   if (req.method === 'POST' && req.url.startsWith('/arcade/')) {
     arcadePosts.push(req.url)
     res.writeHead(503, { 'content-type': 'text/plain' })
@@ -236,6 +256,7 @@ try {
 }
 
 lines.push(`INFO  stand-in asked: ${JSON.stringify(asked.slice(0, 40))}`)
+lines.push(`INFO  corroborator asked: ${corroboratorPosts.length} (${JSON.stringify(corroboratorPosts)})`)
 console.log(lines.join('\n'))
 if (failures) {
   console.log(`✗ lane-920 eviction landing: ${failures} failure(s)`)

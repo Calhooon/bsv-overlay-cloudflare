@@ -639,7 +639,7 @@ ci-d1-budget: gate-output-dirs
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PD/listTopicManagers "$$dv_log" "delivering overlay"; \
 	tap $$ID delivering-overlay; \
-	echo "→ starting wrangler dev :$$PR (the retire overlay of the #831, #834 and #920 cells, its couriers sunk to each cell's stand-in on :$$PS)…"; \
+	echo "→ starting wrangler dev :$$PR (the retire overlay of the #831, #834 and #920 cells, its couriers and its corroborator sunk to each cell's stand-in on :$$PS, DUAL_BROADCAST=off: bsv-low #731, nothing leaves the loopback)…"; \
 	( cd crates/overlay-cloudflare && exec env $$seal npx wrangler dev --local --log-level debug --port $$PR --inspector-port $$IR --ip 127.0.0.1 --persist-to "$$rv_state" \
 	    --var ARCADE_URL:http://127.0.0.1:$$PS/arcade \
 	    --var COURIER_SINK:http://127.0.0.1:$$PS \
@@ -648,6 +648,8 @@ ci-d1-budget: gate-output-dirs
 	    --var ADMIN_TOKEN:ci-admin-tok \
 	    --var MAINNET_FANOUT:false \
 	    --var TAAL_API_KEY:ci-lane-920-arc-ingest \
+	    --var DUAL_BROADCAST:off \
+	    --var CORROBORATOR_URL:http://127.0.0.1:$$PS/corroborator \
 	) > "$$rv_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PR/listTopicManagers "$$rv_log" "retire overlay"; \
