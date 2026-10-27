@@ -24,6 +24,12 @@ pub const MARK_UNTIPPED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,sour
 pub const UNTIPPED_MARKS_PER_TIP: usize = 128;
 
 pub async fn mark_tip(db: &impl JudgeDb, height: u64) -> Result<DrainReport, String> {
+    write_tip_marks(db, height).await?;
+    drain_changed(db, &[], &["gate".into(), "untipped".into()], "tip").await
+}
+
+/// bsv-low #911 (D2-ACTOR-A): the tip's marks and sweep dates alone; the `tip` events' consumer judges them.
+pub async fn write_tip_marks(db: &impl SqlPort, height: u64) -> Result<(), String> {
     let now = db.now_ms() as i64;
     db.run_batch(vec![
         Stmt {
@@ -40,7 +46,7 @@ pub async fn mark_tip(db: &impl JudgeDb, height: u64) -> Result<DrainReport, Str
         },
     ])
     .await?;
-    drain_changed(db, &[], &["gate".into(), "untipped".into()], "tip").await
+    Ok(())
 }
 
 pub async fn drain_identities(

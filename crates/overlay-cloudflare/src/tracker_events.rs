@@ -129,6 +129,11 @@ pub fn forget(parked: &[((String, String), Value)]) {
     });
 }
 
+/// bsv-low #911: put back a frame whose queue publish did not land (it rides the next flush's POST, the belt).
+pub fn requeue(frame: Value) {
+    enqueue(frame);
+}
+
 /// Take every queued event.
 pub fn drain() -> Vec<Value> {
     EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()).into_values().collect())

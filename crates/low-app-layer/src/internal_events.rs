@@ -676,6 +676,20 @@ pub async fn tip_changed(mut req: Request, env: &Env, ctx: &Context) -> Result<R
         Some(height),
         crate::routes::written_off_before_ms_env(env),
     )?;
+    // bsv-low #911 (D2-ACTOR-A): the tip's marks written here, judged by the `owed-events` consumer.
+    if crate::owed_events::configured(env) {
+        match crate::owed_judge::write_tip_marks(&judge, height).await {
+            Ok(()) => {
+                crate::owed_events::publish_pairs(
+                    env,
+                    &[("tip", "gate".to_string()), ("tip", "untipped".to_string())],
+                )
+                .await;
+            }
+            Err(error) => console_log!("[owed] tip marking failed: {error}"),
+        }
+        return Response::from_json(&json!({ "ok": true, "room": TIP_ROOM, "height": height }));
+    }
     match crate::owed_judge::mark_tip(&judge, height).await {
         Ok(report) => {
             for (_, error) in report.faults {

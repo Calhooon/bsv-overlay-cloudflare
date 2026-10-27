@@ -155,6 +155,15 @@ bucket_name = "low-overlay-beefs"
 queue = "low-overlay-mutations"
 binding = "MUTATION_QUEUE"
 
+# bsv-low #911 (D2-ACTOR-A): the owed events' PRODUCER. Every overlay writer that
+# changes an owed source row publishes its event here beside the trigger's
+# `owed_dirty` mark (owed_events.rs); the app layer CONSUMES the queue and is
+# the judge's only trigger. Create it (and its DLQ) before deploying:
+# `wrangler queues create low-owed-events` and `wrangler queues create low-owed-events-dlq`.
+[[queues.producers]]
+queue = "low-owed-events"
+binding = "OWED_EVENTS"
+
 [[queues.consumers]]
 queue = "low-overlay-mutations"
 max_batch_size = 1
@@ -335,6 +344,15 @@ bucket_name = "low-overlay-beefs-beta"
 [[env.beta.queues.producers]]
 queue = "low-overlay-mutations-beta"
 binding = "MUTATION_QUEUE"
+
+# bsv-low #911 (D2-ACTOR-A): the owed events' PRODUCER. Every overlay writer that
+# changes an owed source row publishes its event here beside the trigger's
+# `owed_dirty` mark (owed_events.rs); the app layer CONSUMES the queue and is
+# the judge's only trigger. Create it (and its DLQ) before deploying:
+# `wrangler queues create low-owed-events-beta` and `wrangler queues create low-owed-events-beta-dlq`.
+[[env.beta.queues.producers]]
+queue = "low-owed-events-beta"
+binding = "OWED_EVENTS"
 
 [[env.beta.queues.consumers]]
 queue = "low-overlay-mutations-beta"

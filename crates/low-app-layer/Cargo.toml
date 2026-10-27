@@ -34,7 +34,7 @@ getrandom = { version = "0.2", features = ["js"] }
 # `cargo build` is fine with two majors, which is exactly why `make ci` stayed
 # green over an undeployable worker. THE WORKSPACE MAY HOLD EXACTLY ONE
 # `worker` VERSION — it is now 0.8 everywhere. Do not reintroduce a second.
-worker = { version = "0.8", features = ["d1"] }
+worker = { version = "0.8", features = ["d1", "queue"] }
 # BRC-103/104 mutual-auth front door (bsv-low #318) — the canonical public
 # middleware, pinned from crates.io at the same major the tower pins
 # (`workers/low-watchtower` pins "0.3"; NEVER a cargo path-patch — a dead

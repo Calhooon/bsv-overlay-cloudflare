@@ -25,6 +25,8 @@ thread_local! {
 
 /// Record that `(txid, vout)`'s row changed. Cheap, never fails.
 pub fn note(txid: &str, vout: u32) {
+    // bsv-low #911 (D2-ACTOR-A): every pot writer's note is also the owed event of its row (the `pot` trigger pair).
+    crate::owed_events::note("pot", &overlay_discovery::owed_event::outpoint_key(txid, vout));
     let key = (txid.to_ascii_lowercase(), vout);
     let version = VERSION.with(|v| {
         v.set(v.get() + 1);
@@ -252,7 +254,10 @@ pub async fn ship(
 /// rows (the post-submit signers self-heal, `routes.rs`) must end with
 /// `flush_inline(env.clone()).await` so its own notes ride its own task.
 pub async fn flush_inline(env: Env) {
-    let tracker_events = crate::tracker_events::drain();
+    // bsv-low #911: the invocation's owed events and its word frames to the queue first (a frame whose publish
+    // faulted rides the POST below, the belt)
+    let tracker_events =
+        crate::owed_events::publish_env(&env, crate::tracker_events::drain()).await;
     let changed = drain();
     // bsv-low #469 (2026-09-19): the hop-marker notes ride every flush the pot notes ride (one set of flush points)
     let hops = crate::hop_changes::drain();
@@ -342,7 +347,9 @@ pub async fn flush_inline_within(env: Env, started_ms: u64) {
             }
         }
         BackgroundFlush::Ship { deadline_ms } => {
-            let tracker_events = crate::tracker_events::drain();
+            // bsv-low #911: the job's owed events and word frames to the queue first, inside its own window
+            let tracker_events =
+                crate::owed_events::publish_env(&env, crate::tracker_events::drain()).await;
             let changed = drain();
             let hops = crate::hop_changes::drain();
             // the words first (bsv-low #660 under #618, [`flush`]), in the one order
@@ -390,11 +397,19 @@ pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
     let changed = drain();
     // bsv-low #469 (2026-09-19): the hop-marker notes ride the same flush (one detached task carries both sets)
     let hops = crate::hop_changes::drain();
-    if changed.is_empty() && hops.is_empty() && tracker_events.is_empty() {
+    if changed.is_empty()
+        && hops.is_empty()
+        && tracker_events.is_empty()
+        && crate::owed_events::is_empty()
+    {
         return;
     }
     let env2 = env.clone();
     wait_until(Box::pin(async move {
+        // bsv-low #911: the owed events and the word frames to the queue first (what is still noted when the task
+        // runs; a request's fetch end publishes before its answer, so this is the rest); a frame whose publish
+        // faulted rides the POST, the belt
+        let tracker_events = crate::owed_events::publish_env(&env2, tracker_events).await;
         // one wall for the three sets, read when the task starts: the words first (bsv-low #660 under #618), then
         // the hop set (the owed list's hop rows), then the pot set
         let deadline_ms = Date::now().as_millis() + crate::change_flush::FLUSH_WALL_BUDGET_MS;

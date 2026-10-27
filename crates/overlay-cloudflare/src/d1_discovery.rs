@@ -3442,6 +3442,7 @@ impl PotStorage for D1PotStorage {
     }
 
     async fn unlatch_pot_beef_proof(&self, txid: &str) -> Result<(), PotStorageError> {
+        crate::owed_events::note("beef", txid);
         Query::new(unlatch_pot_beef_sql())
             .bind(txid)
             .execute(&self.db)
@@ -3487,6 +3488,11 @@ impl PotStorage for D1PotStorage {
         // push-primary backstop's age gate measures real age. The #2b
         // retirement latch is preserved by the same subselect idiom (the
         // sixth bind — new bytes cannot change what the subject spends).
+        crate::owed_events::note("beef", txid);
+        // MEDIUM-3: the recorded transaction's facts, decoded once here (the subject of its own BEEF).
+        if let Some(raw) = overlay_discovery::owed_event::subject_raw_of_beef(beef, txid) {
+            crate::owed_events::note_txfacts(txid, &raw);
+        }
         Query::new(POT_BEEF_ADMIT_WRITE_SQL)
             .bind(txid)
             .bind(beef)
@@ -3550,6 +3556,7 @@ impl PotStorage for D1PotStorage {
         // the bytes (the sweep's pot_beefs leg windows by it)
         let proof_height =
             overlay_discovery::pot::storage::pot_beef_bump_height(txid, new_beef).map(|h| h as f64);
+        crate::owed_events::note("beef", txid);
         Query::new(POT_BEEF_VERIFIED_WRITE_SQL)
             .bind(txid)
             .bind(new_beef)
@@ -3565,6 +3572,7 @@ impl PotStorage for D1PotStorage {
         txid: &str,
         height: Option<u64>,
     ) -> Result<(), PotStorageError> {
+        crate::owed_events::note("beef", txid);
         Query::new(POT_BEEF_MARK_PROVEN_AT_SQL)
             .bind(opt_f64(height.map(|h| h as f64)))
             .bind(txid)
@@ -3586,6 +3594,7 @@ impl PotStorage for D1PotStorage {
         for chunk in rows.chunks(POT_BEEF_MARK_PROVEN_AT_CHUNK) {
             let mut q = Query::new(pot_beef_mark_proven_at_batch_sql(chunk.len()));
             for (txid, height) in chunk {
+                crate::owed_events::note("beef", txid);
                 q = q
                     .bind(txid.as_str())
                     .bind(opt_f64(height.map(|h| h as f64)));
@@ -3610,6 +3619,7 @@ impl PotStorage for D1PotStorage {
         // pass chaintracks-re-verified the STORED bump (the honest-backlog
         // fast path). has_proof is latched alongside (the bytes demonstrably
         // carry the bump that just verified).
+        crate::owed_events::note("beef", txid);
         Query::new(POT_BEEF_MARK_PROVEN_SQL)
             .bind(txid)
             .execute(&self.db)
@@ -3631,6 +3641,7 @@ impl PotStorage for D1PotStorage {
         for chunk in txids.chunks(POT_BEEF_MARK_PROVEN_CHUNK) {
             let mut q = Query::new(pot_beef_mark_proven_batch_sql(chunk.len()));
             for txid in chunk {
+                crate::owed_events::note("beef", txid);
                 q = q.bind(txid.as_str());
             }
             q.execute(&self.db).await.map_err(pot_err)?;
@@ -3815,6 +3826,7 @@ fn collected_err(e: String) -> CollectedStorageError {
 #[async_trait(?Send)]
 impl CollectedStorage for D1CollectedStorage {
     async fn store_record(&self, record: &CollectedRecord) -> Result<(), CollectedStorageError> {
+        crate::owed_events::note("collected", &record.txid);
         // INSERT OR IGNORE on the (txid, outputIndex) primary key: a replayed
         // submit of the same output is a no-op; a marker for the same
         // (identity, gameId) from another tx is a NEW row. Never overwrite,
@@ -4365,6 +4377,7 @@ pub mod result_write {
 
     /// THE result admission write for `record`, admitted at `created_at`, its tier derived here.
     pub fn result_insert_query(record: &ResultRecord, created_at: i64) -> LatchedResultInsert {
+        crate::owed_events::note("result", &record.txid);
         let claim_tier = overlay_discovery::result::validity::claim_tier(record);
         LatchedResultInsert {
             query: Query::new(
@@ -4409,6 +4422,7 @@ pub mod result_write {
 
     /// THE result re-latch write for `record`, its tier re-derived here.
     pub fn result_relatch_query(record: &ResultRecord) -> LatchedResultRelatch {
+        crate::owed_events::note("result", &record.txid);
         let claim_tier = overlay_discovery::result::validity::claim_tier(record);
         LatchedResultRelatch {
             query: Query::new(
@@ -5771,6 +5785,7 @@ pub mod potparty_write {
         record: &PotpartyRecord,
         created_at: i64,
     ) -> LatchedPotpartyInsert {
+        crate::owed_events::note("party", &record.txid);
         let sig_valid = overlay_discovery::potparty::validity::record_sig_valid(record);
         LatchedPotpartyInsert {
             query: Query::new(
@@ -5836,6 +5851,7 @@ pub mod potparty_write {
     /// admission write uses. "The pass's own predicate version" in #355's
     /// closure criterion is therefore literally this call.
     pub fn potparty_relatch_query(record: &PotpartyRecord) -> LatchedPotpartyRelatch {
+        crate::owed_events::note("party", &record.txid);
         let sig_valid = overlay_discovery::potparty::validity::record_sig_valid(record);
         LatchedPotpartyRelatch {
             query: Query::new(
@@ -6372,6 +6388,7 @@ impl PotrefundStorage for D1PotrefundStorage {
     }
 
     async fn store_record(&self, record: &PotrefundRecord) -> Result<(), PotrefundStorageError> {
+        crate::owed_events::note("refund", &record.txid);
         // INSERT OR IGNORE on the (txid, outputIndex) primary key — a
         // replayed submit of the same output is a no-op; markers for the
         // same pot from different txs are ALL kept; never overwrite, never
@@ -6618,6 +6635,7 @@ pub mod hopparty_write {
         record: &HoppartyRecord,
         created_at: i64,
     ) -> LatchedHoppartyInsert {
+        crate::owed_events::note("hop", &overlay_discovery::owed_event::outpoint_key(&record.txid, record.hop_vout));
         let marker_valid = overlay_discovery::hopparty::validity::record_marker_valid(record);
         LatchedHoppartyInsert {
             query: Query::new(
@@ -6682,6 +6700,7 @@ pub mod hopparty_write {
     /// marker rides the hop transaction, which is already on chain, so no
     /// republish can re-latch a legacy row.
     pub fn hopparty_relatch_query(record: &HoppartyRecord) -> LatchedHoppartyRelatch {
+        crate::owed_events::note("hop", &overlay_discovery::owed_event::outpoint_key(&record.txid, record.hop_vout));
         let marker_valid = overlay_discovery::hopparty::validity::record_marker_valid(record);
         LatchedHoppartyRelatch {
             query: Query::new(

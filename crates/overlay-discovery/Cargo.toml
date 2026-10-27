@@ -9,7 +9,7 @@ rust-version.workspace = true
 readme = "README.md"
 keywords = ["bitcoin", "bsv", "overlay", "discovery"]
 categories = ["cryptography::cryptocurrencies"]
-include = ["src/**/*.rs", "src/pot/poc5_template.hex", "src/uhrp/fixtures/hash/*.json", "docs/*.md", "README.md", "LICENSE-*"]
+include = ["src/**/*.rs", "src/pot/poc5_template.hex", "src/uhrp/fixtures/hash/*.json", "vectors/owed_event_v1.json", "docs/*.md", "README.md", "LICENSE-*"]
 
 [dependencies]
 overlay-engine = { package = "bsv-overlay-engine", version = "0.3.1", path = "../overlay-engine" }

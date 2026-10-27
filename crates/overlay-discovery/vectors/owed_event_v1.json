@@ -1,0 +1,113 @@
+{
+ "_doc": "bsv-low #911 (D2-ACTOR-A): the owed-events queue message, frozen. Each case's event encodes to its body byte for byte (serde's field order; a facts object's keys sorted, serde_json's map). Read by overlay-discovery, overlay-cloudflare and low-app-layer tests.",
+ "cases": [
+  {
+   "name": "pot",
+   "event": {
+    "v": 1,
+    "seq": 4096001,
+    "source": "pot",
+    "sourceKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+    "facts": {
+     "marks": 2,
+     "row": {
+      "spendingTxid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "spent": 1,
+      "spentConfirmed": 0,
+      "txid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "vout": 0
+     }
+    },
+    "atMs": 1793059200000
+   },
+   "body": "{\"v\":1,\"seq\":4096001,\"source\":\"pot\",\"sourceKey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0\",\"facts\":{\"marks\":2,\"row\":{\"spendingTxid\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"spent\":1,\"spentConfirmed\":0,\"txid\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"vout\":0}},\"atMs\":1793059200000}"
+  },
+  {
+   "name": "word with its frame",
+   "event": {
+    "v": 1,
+    "seq": 4096002,
+    "source": "word",
+    "sourceKey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "facts": {
+     "frame": {
+      "body": {
+       "at": 1793059200000,
+       "source": "arcade"
+      },
+      "kind": "seen",
+      "txid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+     }
+    },
+    "atMs": 1793059200001
+   },
+   "body": "{\"v\":1,\"seq\":4096002,\"source\":\"word\",\"sourceKey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"facts\":{\"frame\":{\"body\":{\"at\":1793059200000,\"source\":\"arcade\"},\"kind\":\"seen\",\"txid\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}},\"atMs\":1793059200001}"
+  },
+  {
+   "name": "party",
+   "event": {
+    "v": 1,
+    "seq": 4096003,
+    "source": "party",
+    "sourceKey": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "facts": {
+     "marks": 1,
+     "row": [
+      {
+       "gameId": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+       "identity": "021111111111111111111111111111111111111111111111111111111111111111",
+       "potTxid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "potVout": 0,
+       "sigValid": 1
+      }
+     ]
+    },
+    "atMs": 1793059200002
+   },
+   "body": "{\"v\":1,\"seq\":4096003,\"source\":\"party\",\"sourceKey\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"facts\":{\"marks\":1,\"row\":[{\"gameId\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"identity\":\"021111111111111111111111111111111111111111111111111111111111111111\",\"potTxid\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"potVout\":0,\"sigValid\":1}]},\"atMs\":1793059200002}"
+  },
+  {
+   "name": "identity route",
+   "event": {
+    "v": 1,
+    "seq": 4096004,
+    "source": "identity",
+    "sourceKey": "032222222222222222222222222222222222222222222222222222222222222222",
+    "facts": null,
+    "atMs": 1793059200003
+   },
+   "body": "{\"v\":1,\"seq\":4096004,\"source\":\"identity\",\"sourceKey\":\"032222222222222222222222222222222222222222222222222222222222222222\",\"facts\":null,\"atMs\":1793059200003}"
+  },
+  {
+   "name": "txfacts",
+   "event": {
+    "v": 1,
+    "seq": 4096005,
+    "source": "txfacts",
+    "sourceKey": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "facts": {
+     "inputs": [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0"
+     ],
+     "outputs": [
+      {
+       "kind": "p2pkh",
+       "pkh": "2222222222222222222222222222222222222222",
+       "sats": 1000,
+       "vout": 0
+      }
+     ],
+     "txid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "atMs": 1793059200004
+   },
+   "body": "{\"v\":1,\"seq\":4096005,\"source\":\"txfacts\",\"sourceKey\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"facts\":{\"inputs\":[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0\"],\"outputs\":[{\"kind\":\"p2pkh\",\"pkh\":\"2222222222222222222222222222222222222222\",\"sats\":1000,\"vout\":0}],\"txid\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"},\"atMs\":1793059200004}"
+  }
+ ],
+ "refused": [
+  "{\"v\":2,\"seq\":1,\"source\":\"pot\",\"sourceKey\":\"a:0\",\"facts\":null,\"atMs\":0}",
+  "{\"v\":1,\"seq\":1,\"source\":\"\",\"sourceKey\":\"a\",\"facts\":null,\"atMs\":0}",
+  "{\"v\":1,\"source\":\"pot\",\"sourceKey\":\"a:0\",\"facts\":null,\"atMs\":0}",
+  "not json"
+ ]
+}
