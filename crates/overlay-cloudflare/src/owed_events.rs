@@ -89,10 +89,14 @@ pub const READ_WORD_SQL: &str = marks_and!("SELECT json_object('word',word,'tier
 pub const READ_BEEF_SQL: &str = marks_and!("SELECT json_object('hasProof',has_proof,'proofVerified',proof_verified,'proofHeight',proofHeight,'structurallyUnprovable',structurally_unprovable,'createdAt',createdAt) FROM pot_beefs WHERE txid=?3");
 /// `refusal` (`hopTxid:hopVout`).
 pub const READ_REFUSAL_SQL: &str = marks_and!("SELECT json_object('refusedTxid',refusedTxid,'reason',reason,'refusedAt',refusedAt) FROM submit_refusals WHERE hopTxid=?3 AND hopVout=?4");
+/// `identity` (the hook's identity-only note): does the identity hold any mark? (The D2-ACTOR-A lens's LOW-6: an
+/// identity with nothing pending is not sent.) One covering-index probe; no facts.
+pub const READ_IDENTITY_SQL: &str = "SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM owed_dirty INDEXED BY idx_owed_dirty_identity_marked WHERE identity=?2 AND ?1='identity' LIMIT 1)) AS marks,NULL AS facts";
 /// The sources no table holds (`wanted`, `age`, `backfill`, `tip`): the marks alone.
 pub const READ_MARKS_SQL: &str = marks_and!("SELECT NULL");
 
-/// The facts read of a source; `None` for an event that reads nothing (a word frame, `txfacts`, an identity route).
+/// The facts read of a source; `None` for an event that reads nothing (a word frame, `txfacts`: lane B's mirror,
+/// sent whatever the marks). An identity route reads its marks only ([`READ_IDENTITY_SQL`]).
 pub fn read_sql(source: &str) -> Option<&'static str> {
     Some(match source {
         "pot" => READ_POT_SQL,
@@ -107,6 +111,7 @@ pub fn read_sql(source: &str) -> Option<&'static str> {
         "word" => READ_WORD_SQL,
         "beef" => READ_BEEF_SQL,
         "refusal" => READ_REFUSAL_SQL,
+        owed_event::ROUTE_IDENTITY => READ_IDENTITY_SQL,
         s if owed_event::OWN_SOURCES.contains(&s) => READ_MARKS_SQL,
         _ => return None,
     })
