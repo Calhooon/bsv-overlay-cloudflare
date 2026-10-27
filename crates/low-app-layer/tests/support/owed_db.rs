@@ -26,6 +26,9 @@ pub struct Db {
     pub tip: Cell<Option<u64>>,
     /// Fail every batch whose statements contain this text (a judge fault on demand).
     pub fail_on: RefCell<Option<String>>,
+    /// Fail every judge write batch (one writing `owed_rows`) one of whose text binds contains this (a subject that
+    /// faults for good, beside subjects that judge: D2-ACTOR-A-DELTA's NEW-M1).
+    pub fail_bind: RefCell<Option<String>>,
     /// Each statement run and its SQLite VM steps (the cost pins).
     pub steps: RefCell<Vec<(String, i64)>>,
 }
@@ -48,6 +51,7 @@ impl Db {
             now: Cell::new(NOW),
             tip: Cell::new(Some(900_000)),
             fail_on: RefCell::new(None),
+            fail_bind: RefCell::new(None),
             steps: RefCell::new(Vec::new()),
         }
     }
@@ -86,6 +90,17 @@ impl SqlPort for Db {
         if let Some(text) = self.fail_on.borrow().as_deref() {
             if stmts.iter().any(|s| s.sql.contains(text)) {
                 return Err(format!("injected fault on {text}"));
+            }
+        }
+        if let Some(text) = self.fail_bind.borrow().as_deref() {
+            let writes_rows = stmts.iter().any(|s| s.sql.contains("INSERT INTO owed_rows"));
+            let names = stmts.iter().any(|s| {
+                s.binds
+                    .iter()
+                    .any(|b| matches!(b, Bind::Text(t) if t.contains(text)))
+            });
+            if writes_rows && names {
+                return Err(format!("injected fault on the subject {text}"));
             }
         }
         let mut conn = self.conn.borrow_mut();
