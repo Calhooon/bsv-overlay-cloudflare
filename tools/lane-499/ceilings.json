@@ -523,18 +523,18 @@
       "censusKey": null
     },
     "health-dirty-snapshot": {
-      "route": "GET /health: one backlog:dirty snapshot lookup plus the existing chain-event health reads; fleet populated, chain-event memo may expire. FIX-CADENCE-GAUGES; measured by the Linux budget tier.",
+      "route": "GET /health: one backlog:dirty snapshot lookup plus the two existing chain-event health reads, with the 10-second memo expired. Linux workerd on the populated fleet fixture, FIX-CADENCE-GAUGES.",
       "measured": {
-        "reads": 1,
+        "reads": 3,
         "writes": 0,
-        "stmts": 1,
+        "stmts": 3,
         "maxReads": 1
       },
       "ceiling": {
-        "reads": 36,
+        "reads": 7,
         "writes": 0,
-        "stmts": 8,
-        "maxReads": 24
+        "stmts": 5,
+        "maxReads": 5
       },
       "censusKey": "/health"
     }

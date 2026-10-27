@@ -126,13 +126,23 @@ async function lever(body, token = INTERNAL, route = '/internal/redrive-dead-let
   return { status: res.status, text, json }
 }
 function d1(sql) {
-  const out = execFileSync(
-    'npx',
-    ['wrangler', 'd1', 'execute', 'OVERLAY_DB', '--local', '--persist-to', STATE, '--json', '--command', sql],
-    { cwd: CRATE, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
-  )
-  return JSON.parse(out)[0]?.results ?? []
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const out = execFileSync(
+        'npx',
+        ['wrangler', 'd1', 'execute', 'OVERLAY_DB', '--local', '--persist-to', STATE, '--json', '--command', sql],
+        { cwd: CRATE, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+      )
+      return JSON.parse(out)[0]?.results ?? []
+    } catch (e) {
+      // The local CLI can exit while the live queue is writing this database. Retry reads
+      // only: a replayed INSERT could duplicate the very history this pin is measuring.
+      if (!/^\s*SELECT\b/i.test(sql) || attempt >= 3) throw e
+      console.warn(`local D1 read retry ${attempt}/2: exit=${e.status} signal=${e.signal}`)
+    }
+  }
 }
+
 async function health() {
   for (let attempt = 1; ; attempt++) {
     try {
@@ -494,7 +504,7 @@ d1(`DELETE FROM mutation_dead_letters WHERE txid = '${s4}'`)
 d1(`DELETE FROM mutation_dead_letters WHERE txid LIKE 'e576flood%'`)
 
 } catch (e) {
-  expect(false, 'the seeded legs ran (the table and the lever exist)', `${e.message ?? e}`.split('\n')[0])
+  expect(false, 'the seeded legs ran (the table and the lever exist)', `${e.message ?? e} ${e.stderr ?? ''} ${e.stdout ?? ''}`.replace(/\s+/g, ' ').slice(0, 1600))
 }
 
 console.log('── lane E576: the dead letters parked and re-driven at the route ──')
