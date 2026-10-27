@@ -900,5 +900,5 @@ fn d2_actor_a_fold2_low_a_b_the_message_wall_and_the_fresh_tip() {
         .unwrap();
     assert!(wall < back);
     assert!(body.contains("\"serviceMs\":service_max"));
-    assert!(owed_events::CONSUMER_MESSAGE_WALL_MS < 15 * 60_000, "inside the platform's 15 minutes");
+    const { assert!(owed_events::CONSUMER_MESSAGE_WALL_MS < 15 * 60_000, "inside the platform's 15 minutes") };
 }
