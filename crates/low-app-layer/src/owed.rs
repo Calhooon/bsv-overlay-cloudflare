@@ -8286,7 +8286,7 @@ pub(crate) mod tests {
 
     #[test]
     fn ns2_filing_commits_before_the_detached_judge_and_push() {
-        let source = include_str!("record_post/owed_write.rs");
+        let source: String = include_str!("record_post/owed_write.rs").split_whitespace().collect();
         assert!(source.contains("db.run_batch(writes).await?"));
         assert!(!source.contains("judge_with_write"));
         let task = include_str!("record_post/detached.rs");
