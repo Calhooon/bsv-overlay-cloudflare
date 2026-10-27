@@ -1150,7 +1150,6 @@ async fn evict_core_with_abort(
     )>,
 ) -> (EvictionCore, Option<crate::admission_abort::PendingAbort>) {
     let mut core = EvictionCore::default();
-    crate::owed_events::note("eviction", txid);
     if let Err(e) = db
         .exec(
             OPEN_EVICTION_MARKER_SQL,
@@ -1163,6 +1162,9 @@ async fn evict_core_with_abort(
         .await
     {
         core.faults.push(format!("the open marker failed ({e})"));
+    } else {
+        // bsv-low #911 (the D2-ACTOR-A lens's LOW-8): noted once its statement (and its trigger's mark) landed
+        crate::owed_events::note("eviction", txid);
     }
     match readmitted_after(db, txid, now_ms).await {
         Ok(Some(at)) => {
