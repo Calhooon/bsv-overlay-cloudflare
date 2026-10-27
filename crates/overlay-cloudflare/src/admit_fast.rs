@@ -931,8 +931,8 @@ pub async fn guard_landed(db: &D1Database, landed: &[(String, String)], origin: 
     for (txid, topic) in landed {
         match open_eviction(db, txid).await {
             Ok(Some(ev)) => {
-                let now_ms = worker::Date::now().as_millis();
-                let outcome = evict_txid_everywhere(db, txid, &ev.reason, now_ms).await;
+                // the FIX-920 lens's LOW-2: stamped with the evidence's start, so a readmission after it yields
+                let outcome = evict_txid_everywhere(db, txid, &ev.reason, ev.evicted_at_ms).await;
                 settle_reevicted(db, txid, &outcome, &ev.reason, origin).await;
                 crate::ops::bump_counter(
                     db,
@@ -1115,7 +1115,10 @@ pub(crate) async fn reevict_after_write_with<P: WriteGuardPort>(
     let Some(ev) = port.open_eviction().await? else {
         return Ok(None);
     };
-    let outcome = port.evict(&ev.reason, now_ms).await;
+    // the FIX-920 lens's LOW-2: the re-eviction is stamped with the evidence's start (the open row's `evictedAt`),
+    // never this clock: a readmission stamped after the refusal's evidence (the chain's word, landed while the write
+    // was in flight) is kept and the pass yields to it, as the stamp policy of `evict_txid_everywhere` intends
+    let outcome = port.evict(&ev.reason, ev.evicted_at_ms).await;
     settle_reevicted_with(port, txid, now_ms, &outcome, &ev.reason, origin).await;
     port.count_reevicted().await;
     Ok(Some((ev, outcome)))
@@ -8827,6 +8830,65 @@ mod tests {
         );
     }
 
+    /// bsv-low #920, the FIX-920 lens's LOW-2: the guard's re-eviction is stamped with the evidence's start (the
+    /// open row's `evictedAt`), never the landing's clock, so a readmission that lands between the guard's read and
+    /// its marker (stamped after the push's evidence, before the landing) is KEPT: the pass yields, nothing moves, no
+    /// memo. RED with the landing's clock (the marker re-opens the row, the rows move, the memo is written).
+    #[tokio::test]
+    async fn fix920_low2_a_readmission_between_the_push_and_the_landing_is_kept() {
+        let txid = "59".repeat(32);
+        let reason = "REJECTED (arcade live REJECTED: UTXO_SPENT (70): x; both indexers absent)";
+        let db = SqliteShadow::new(shipped_conn());
+        evict_core(&db, &txid, reason, 1_000).await;
+        fix920_land(&db.conn, &txid);
+        let port = SqliteGuard::new(&db, &txid);
+        let readmit_txid = txid.clone();
+        *port.before_evict.borrow_mut() = Some(Box::new(move |conn: &rusqlite::Connection| {
+            conn.execute(
+                crate::proof_fetcher::TX_ANY_VERDICT_DELETE_SQL,
+                [readmit_txid.as_str()],
+            )
+            .unwrap();
+            conn.execute(
+                READMIT_EVICTION_SQL,
+                rusqlite::params![15_000_i64, readmit_txid.as_str()],
+            )
+            .unwrap();
+        }));
+        let (ev, outcome) = reevict_after_write_with(&port, &txid, 21_000, "pin")
+            .await
+            .unwrap()
+            .expect("the guard read the open row before the readmission");
+        assert_eq!(ev.evicted_at_ms, 1_000);
+        assert!(
+            outcome.yielded,
+            "the pass yields to the readmission (moved {})",
+            outcome.moved
+        );
+        assert_eq!(outcome.moved, 0);
+        for t in ["outputs", "pot_records", "applied_transactions"] {
+            assert_eq!(
+                count(&db.conn, t, "txid", &txid),
+                1,
+                "{t} keeps the readmitted row"
+            );
+        }
+        let readmitted: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT readmittedAt FROM pot_evictions WHERE txid = ?1",
+                [txid.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(readmitted, Some(15_000), "the readmission's stamp is kept");
+        assert_eq!(
+            fix920_served_memo(&db.conn, &txid),
+            None,
+            "no memo over the readmission"
+        );
+    }
+
     /// bsv-low #920: every write-side guard that re-evicts after a write settles the refusal right after its
     /// eviction (the past-deadline landing, the request's guard, a resumed run's, a landed predecessor's) and so does
     /// the Rejected arm's re-run under an open eviction. RED on main (no site settles).
@@ -8853,17 +8915,17 @@ mod tests {
             (
                 "guard_landed",
                 guard,
-                "evict_txid_everywhere(db, txid, &ev.reason, now_ms)",
+                "evict_txid_everywhere(db, txid, &ev.reason, ev.evicted_at_ms)",
             ),
             (
                 "finish_past_deadline",
                 past,
-                "evict_txid_everywhere(&db, &subject, &ev.reason, now_ms)",
+                "evict_txid_everywhere(\n                &db,\n                &subject,\n                &ev.reason,\n                ev.evicted_at_ms,",
             ),
             (
                 "the request's guard",
                 routes,
-                "evict_txid_everywhere(&ledger_db, subject, &ev.reason, now_ms)",
+                "evict_txid_everywhere(&ledger_db, subject, &ev.reason, ev.evicted_at_ms)",
             ),
             (
                 "the resumed run's stored echo",
@@ -8874,7 +8936,7 @@ mod tests {
             (
                 "reevict_after_write_with (the queue replay's guard)",
                 after_write,
-                "port.evict(&ev.reason, now_ms)",
+                "port.evict(&ev.reason, ev.evicted_at_ms)",
             ),
         ] {
             let at = body

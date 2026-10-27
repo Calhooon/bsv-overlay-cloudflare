@@ -846,9 +846,14 @@ async fn finish_past_deadline<F, S>(
             );
         }
         Ok(Some(ev)) => {
-            let now_ms = worker::Date::now().as_millis();
-            let outcome =
-                crate::admit_fast::evict_txid_everywhere(&db, &subject, &ev.reason, now_ms).await;
+            // the FIX-920 lens's LOW-2: stamped with the evidence's start, so a readmission after it yields
+            let outcome = crate::admit_fast::evict_txid_everywhere(
+                &db,
+                &subject,
+                &ev.reason,
+                ev.evicted_at_ms,
+            )
+            .await;
             // bsv-low #920: the refusal that arrived while this write was in flight is completed HERE, at the
             // landing: its memo (unless a settle wrote it), then its count
             crate::admit_fast::settle_reevicted(
@@ -1934,12 +1939,12 @@ async fn submit_parts(
                         if let Ok(Some(ev)) =
                             crate::admit_fast::open_eviction(&ledger_db, &subject_txid).await
                         {
-                            let now_ms = worker::Date::now().as_millis();
+                            // the FIX-920 lens's LOW-2: the evidence's start, never this clock
                             let outcome = crate::admit_fast::evict_txid_everywhere(
                                 &ledger_db,
                                 &subject_txid,
                                 &ev.reason,
-                                now_ms,
+                                ev.evicted_at_ms,
                             )
                             .await;
                             // bsv-low #920: the refusal's memo, unless its own settle wrote it
@@ -2164,9 +2169,9 @@ async fn submit_parts(
                     }
                 }
                 Ok(Some(ev)) => {
-                    let now_ms = worker::Date::now().as_millis();
+                    // the FIX-920 lens's LOW-2: stamped with the evidence's start, so a readmission after it yields
                     #[rustfmt::skip] // Main's exact eviction wiring pin.
-                    let outcome = crate::admit_fast::evict_txid_everywhere(&ledger_db, subject, &ev.reason, now_ms).await;
+                    let outcome = crate::admit_fast::evict_txid_everywhere(&ledger_db, subject, &ev.reason, ev.evicted_at_ms).await;
                     // bsv-low #920: the refusal's memo, unless its own settle wrote it
                     crate::admit_fast::settle_reevicted(
                         &ledger_db,
@@ -6379,7 +6384,7 @@ mod tests {
         let post = &src[after..s2];
         let reevict = [
             "crate::admit_fast::evict_txid_",
-            "everywhere(&ledger_db, subject, &ev.reason, now_ms)",
+            "everywhere(&ledger_db, subject, &ev.reason, ev.evicted_at_ms)",
         ]
         .concat();
         assert!(
