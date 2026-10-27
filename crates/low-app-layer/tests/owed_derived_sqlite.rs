@@ -75,7 +75,7 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     const COUNT: usize = 469;
     assert_eq!(OVERLAY_MIGRATIONS.len(), COUNT);
     assert_eq!(d1::OVERLAY_MIGRATION_COUNT, COUNT);
-    const FINGERPRINT: u32 = 145_177_324;
+    const FINGERPRINT: u32 = 889_593_182;
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT, "the certified fingerprint");
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT);
     assert_eq!(fingerprint(OVERLAY_MIGRATIONS), FINGERPRINT);

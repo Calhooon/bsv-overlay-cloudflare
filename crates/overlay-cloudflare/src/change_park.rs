@@ -137,9 +137,9 @@ pub const SWEEP_EXHAUSTED_SQL: &str = "DELETE FROM change_parked WHERE rowid IN 
 /// `next_attempt_at_ms, item`), [`SWEEP_EXHAUSTED_SQL`] and the gauge's bounded counts. Appended (#638).
 pub const CHANGE_PARKED_DRAIN_INDEX: &str = "CREATE INDEX IF NOT EXISTS change_parked_drain \
      ON change_parked(kind, exhausted, next_attempt_at_ms, item)";
-/// The oldest active/exhausted word is an index seek, not a scan of every parked frame.
+/// The oldest active/exhausted word is an index seek. Notes do not pay for a word-only gauge.
 pub const CHANGE_PARKED_AGE_INDEX: &str =
-    "CREATE INDEX IF NOT EXISTS change_parked_age ON change_parked(kind,exhausted,parked_at_ms)";
+    "CREATE INDEX IF NOT EXISTS change_parked_age ON change_parked(exhausted,parked_at_ms) WHERE kind='word'";
 /// The gauge (N3: BOUNDED): each set's eligible-or-backing-off and exhausted rows, each count read through the
 /// drain's index and stopped at `?1` ([`HEALTH_COUNT_CAP`]); a count equal to the cap reads "at least".
 pub const PARKED_COUNT_SQL: &str = "SELECT \
