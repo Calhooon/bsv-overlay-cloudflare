@@ -308,10 +308,11 @@ mod pins {
             ("eviction", include_str!("admit_fast.rs"), "async fn evict_core_with_abort(", r#"note("eviction","#),
             ("eviction", include_str!("admit_fast.rs"), "pub async fn evict_txid_everywhere_repointed(", r#"note("eviction","#),
             ("eviction", include_str!("admit_fast.rs"), "pub async fn readmit_if_evicted(", r#"note("eviction","#),
-            ("eviction", include_str!("eviction_write.rs"), "pub(crate) fn plan(", r#"note("eviction","#),
-            ("hop", include_str!("eviction_write.rs"), "fn evidence_inserts(", r#"note("hop","#),
+            ("eviction", include_str!("eviction_write.rs"), "pub(crate) fn plan_pairs(", r#"("eviction","#),
+            ("hop", include_str!("eviction_write.rs"), "pub(crate) fn plan_pairs(", r#""hop","#),
+            ("eviction", include_str!("eviction_write.rs"), "pub(crate) async fn evict(", "for(source,key)inplan_pairs(&snapshot,txid){crate::owed_events::note(source,&key);}"),
             ("seen", include_str!("ops.rs"), "pub async fn latch_network_seen(", r#"note("seen","#),
-            ("refusal", include_str!("submit_refusals.rs"), "pub fn write_queries(", r#"note("refusal","#),
+            ("refusal", include_str!("submit_refusals.rs"), "pub async fn record(", r#"note("refusal","#),
             ("refund", app("record_post"), "pub(crate) async fn potrefund_chain_noop<", "SOURCE_REFUND"),
             ("party", app("owed_write"), "pub(crate) fn note_events(", r#"note("party","#),
             ("refund", app("owed_write"), "pub(crate) fn note_events(", r#"note("refund","#),
@@ -339,6 +340,20 @@ mod pins {
                     .unwrap_or(sig)
             );
         }
+        // LOW-8 (the lens): the eviction's and the refusal's notes are made after their writes, never while the
+        // statements are planned (a concurrent publish between the plan and the commit read no mark)
+        for (src, sig) in [
+            (include_str!("eviction_write.rs"), "pub(crate) fn plan("),
+            (include_str!("eviction_write.rs"), "fn evidence_inserts("),
+            (include_str!("submit_refusals.rs"), "pub fn write_queries("),
+        ] {
+            assert!(!fn_body(src, sig).contains("owed_events::note"), "{sig} notes at plan time");
+        }
+        let evict = fn_body(include_str!("eviction_write.rs"), "pub(crate) async fn evict(");
+        assert!(
+            evict.find("counted_batch(db,statements)").unwrap() < evict.find("owed_events::note(").unwrap(),
+            "the eviction notes after its batch"
+        );
         // every trigger source but the word's spender bytes has a noting writer here
         for (_, source) in owed_event::TRIGGER_SOURCES {
             assert!(
