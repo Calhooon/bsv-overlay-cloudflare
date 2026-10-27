@@ -120,7 +120,7 @@ pub const COUNTER_SKIPPED: &str = "owed_events_publish_skipped_total";
 /// Publishes that faulted (the D1 batch or the send): their marks wait for the sweep.
 pub const COUNTER_FAULTS: &str = "owed_events_publish_faults_total";
 /// Every counter this module and the consumer write, for the seeds.
-pub const COUNTERS: [&str; 12] = [
+pub const COUNTERS: [&str; 13] = [
     COUNTER_PUBLISHED,
     COUNTER_SKIPPED,
     COUNTER_FAULTS,
@@ -134,7 +134,26 @@ pub const COUNTERS: [&str; 12] = [
     // the D2-ACTOR-A lens's MEDIUM-2: a judge fault that set its pair's hold; a pair the sweep left out, held
     "owed_events_fault_held_total",
     "owed_events_sweep_held_total",
+    COUNTER_WALL_DROPS,
 ];
+/// LOW-7 (the D2-ACTOR-A lens): publishes dropped at a request's answer wall ([`PUBLISH_ANSWER_WALL_MS`]): their
+/// marks wait for the sweep. Counted on the isolate ([`note_wall_drop`]) and written with the isolate's next publish
+/// (a write at the wall would wait on the D1 the wall gave up on); an isolate that ends first loses its count.
+pub const COUNTER_WALL_DROPS: &str = "owed_events_publish_wall_drops_total";
+
+thread_local! {
+    static WALL_DROPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// LOW-7: one publish dropped at the answer wall.
+pub fn note_wall_drop() {
+    WALL_DROPS.with(|d| d.set(d.get() + 1));
+}
+
+/// LOW-7: the drops not yet written, taken.
+pub fn take_wall_drops() -> u64 {
+    WALL_DROPS.with(|d| d.replace(0))
+}
 const BUMP_SQL: &str = "INSERT INTO ops_counters (name, value) VALUES (?1, ?2) ON CONFLICT(name) DO UPDATE SET value = ops_counters.value + excluded.value";
 
 /// One noted pair, with the facts the writer holds (a word frame, a transaction's `txfacts`), if any.
@@ -438,10 +457,13 @@ impl PublishPort for WorkerPublish {
 
 /// THE PUBLISH of this invocation's notes and of `frames` (the word frames the caller drained), over the Worker's
 /// bindings. Answers the frames NOT published (the caller ships them through the `/internal/tx-word` POST, the belt).
-/// With no queue binding nothing is drained: the notes wait for the next publish of a configured isolate, the marks
-/// for the drain, and every frame is answered back.
+/// With no queue binding the notes are dropped (LOW-9: the marks wait for the drain) and every frame is answered
+/// back.
 pub async fn publish_env(env: &worker::Env, frames: Vec<Value>) -> Vec<Value> {
     let Some(port) = WorkerPublish::of(env) else {
+        // LOW-9 (the lens): no queue here, so no publish will ever take these notes: dropped (the marks are the
+        // record; the drain judges them), never grown for the isolate's life
+        let _ = drain();
         return frames;
     };
     let mut notes = drain();
@@ -476,6 +498,7 @@ pub async fn publish_env(env: &worker::Env, frames: Vec<Value>) -> Vec<Value> {
         (COUNTER_PUBLISHED, report.sent.len() as u64),
         (COUNTER_SKIPPED, report.skipped as u64),
         (COUNTER_FAULTS, u64::from(report.fault.is_some())),
+        (COUNTER_WALL_DROPS, take_wall_drops()),
     ];
     deltas.retain(|(_, d)| *d > 0);
     bump(env, &deltas).await;
@@ -498,6 +521,7 @@ pub async fn publish_before_answer(env: &worker::Env, frames: Vec<Value>) -> Vec
     match select(publish, wall).await {
         Either::Left((back, _)) => back,
         Either::Right(_) => {
+            note_wall_drop();
             worker::console_warn!(
                 "[owed-events] the publish passed its {PUBLISH_ANSWER_WALL_MS} ms answer wall: the marks wait for the sweep"
             );
