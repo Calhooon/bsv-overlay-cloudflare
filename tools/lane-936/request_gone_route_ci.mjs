@@ -17,22 +17,36 @@
  * `outputs` row is there and aborts the client's fetch at that moment: the cancel falls between two statements of
  * the write, the S4 class (loop 52's `fad01028…`).
  *
+ * WHAT THE TIER CAN PROVE (lane FIX-936-CELL, measured on vultr 2026-10-27 with a probe worker, workerd 2026-10-06
+ * under wrangler 4.148.0, `compatibility_date = "2024-12-01"`, `enable_request_signal`; READ-936 section 4b): the
+ * local runtime NEVER delivers a client's going to `Request.signal` while the fetch handler is still pending, under
+ * `wrangler dev --local` and under the raw `workerd serve` alike, for every client shape tried: (a) node's `fetch`
+ * with an `AbortController` abort, (b) `http.request` then `req.destroy()` or `req.socket.destroy()`, (c)
+ * `Connection: close` and `socket.end()`; the same flag date 2026-10-01 too. It fires (about 1 ms after the cut)
+ * only once the handler has RETURNED its Response and the body is still streaming: raw workerd for (a) and (b),
+ * wrangler dev for (b) alone, (c) never. The gated arm returns its Response after its write, so its abort mid-write
+ * is never seen here: on the tier every write's task names `in-request`. So the cell proves the fold's TASK, the
+ * write whole after a client's going and the task's after-write with its guard; the `request-gone` cause (its word,
+ * `submit_write_outlived_request_total`, the deferred job at rest, the cover's line) is the BETA WINDOW's read
+ * (READ-936 section 5), never claimed here. If a later runtime delivers the abort, leg A takes the request-gone
+ * branch and asserts all four.
+ *
  * Legs (each a fresh JOIN: a proofless V1 BEEF, an `OP_TRUE` parent and the JOIN spending it into a
  * `Poc5TemplatePot` covenant output built from the frozen template, `tm_pot` / `ls_pot`):
  *  A. the abort mid-write: (a) `outputs`, `transactions`, `pot_records`, `pot_beefs` and the `tm_pot` applied row
- *     all present after the task; (b) the task's own line `<S> request-gone write landed` and
- *     `submit_write_outlived_request_total` +1; (d) the deferred job at rest (`ef_deferred_jobs`, the cover put on
- *     the abort, shape (a) of the fold) and its line.
+ *     all present after the task; (b) the task's own line `<S> <cause> write landed`, one of the three cause words,
+ *     and the counter, the job and the cover's line CONSISTENT with that word (`request-gone`: +1, the job at rest,
+ *     the line; `in-request`: the counter unchanged, no job).
  *  B. the abort mid-write with an OPEN eviction written DURING the write (the `outputs` trigger writes the
  *     `pot_evictions` row after the coin and before the lookup services' rows): (c) the task's guard re-evicts:
- *     no live `outputs`, `pot_records` or applied row, the rows in the twins, the line `<S> request-gone write
- *     outran its eviction`.
+ *     no live `outputs`, `pot_records` or applied row, the rows in the twins, the task's line `<S> <cause> write
+ *     outran its eviction`, and `admit_fast_reevicted_after_write_total` +1 exactly (counted by the request under
+ *     `in-request`, by the task under `request-gone`: once either way).
  *  C. the control (Rule 6), no abort: 200, the line `<S> in-request write landed`, the counter unchanged, no job.
  *
- * NOT exercised here: the platform's own cut of the task (`wait_until`'s cap after a cancel) and the job's run
- * landing a cut write (the job's message is delayed 45 s; the local tier's queue is not the platform's). Whether
- * `wrangler dev`'s proxy hands a client's disconnect to the runtime's `Request.signal` is what leg A finds first:
- * an `in-request` line with the client aborted is named as that, not as the fold's failure.
+ * NOT exercised here: the `request-gone` cause (above), the platform's own cut of the task (`wait_until`'s cap after
+ * a cancel) and the job's run landing a cut write (the job's message is delayed 45 s; the local tier's queue is not
+ * the platform's).
  *
  *   node tools/lane-936/request_gone_route_ci.mjs <port base> <worker log path>
  *
@@ -60,6 +74,7 @@ const ROOT = fileURLToPath(new URL('../../', import.meta.url))
 const CRATE = join(ROOT, 'crates/overlay-cloudflare')
 const SHIM = join(CRATE, 'build/worker/shim.mjs')
 const COUNTER = 'submit_write_outlived_request_total'
+const REEVICTED = 'admit_fast_reevicted_after_write_total'
 const SPIN_MS = { outputs: 1_500, pot_records: 4_000 }
 
 let failures = 0
@@ -285,9 +300,18 @@ END;
   return { outputs: n('outputs'), pot_records: n('pot_records') }
 }
 
-async function counter() {
+async function counter(name = COUNTER) {
   const r = await fetch(OVERLAY + '/health/invariants', { headers: { Connection: 'close' } })
-  return Number((await r.json())?.counters?.[COUNTER] ?? NaN)
+  return Number((await r.json())?.counters?.[name] ?? NaN)
+}
+/** A counter once it reaches `want` (the request's counters flush after its answer), or its last read. */
+async function counterAt(name, want, ms = 20_000) {
+  const t0 = Date.now()
+  for (;;) {
+    const n = await counter(name)
+    if (n >= want || Date.now() - t0 > ms) return n
+    await sleep(500)
+  }
 }
 const logText = () => (existsSync(LOG) ? readFileSync(LOG, 'utf8') : '')
 async function logLine(re, ms = 45_000) {
@@ -380,32 +404,41 @@ try {
   lines.push(`INFO  leg A: ${a.S} aborted at ${a.abortedAt} ms; the client saw ${a.got.status} ${a.got.text.slice(0, 120)}`)
   expect(a.abortedAt !== null && a.got.status === 0, 'leg A: the client aborted mid-write (after the coin, before the answer)', JSON.stringify(a))
   const lineA = await logLine(new RegExp(`${a.S} (request-gone|in-request|past-deadline) write (landed|answered an error)`))
-  if (lineA && / in-request /.test(lineA)) {
-    expect(false, "leg A: the runtime delivered the client's abort to Request.signal", `the task's line says in-request: ${lineA} (wrangler dev's proxy did not cancel the runtime's request, or the flag is not in force)`)
-  }
-  expect(lineA && / request-gone write landed/.test(lineA), "leg A (b): the task's own after-write line, request-gone", String(lineA))
+  const causeA = lineA?.match(/ (request-gone|in-request|past-deadline) write /)?.[1] ?? null
+  lines.push(`INFO  leg A: the task's cause ${causeA} (the tier's runtime never delivers a pending handler's abort: in-request expected; request-gone is the beta window's)`)
+  expect(lineA && / write landed/.test(lineA), "leg A (b): the task's own after-write line, one cause word, write landed", String(lineA))
   const rA = rows(a.S)
   expect(rA && rA.outputs >= 1 && rA.transactions === 1 && rA.pot_records >= 1 && rA.pot_beefs === 1 && rA.applied === 1, 'leg A (a): the write whole: outputs, transactions, pot_records, pot_beefs, the applied row', JSON.stringify(rA))
   const cA = await counter()
-  expect(cA - c0 === 1, `leg A (b): ${COUNTER} +1`, `${c0} -> ${cA}`)
-  expect(jobs(a.S) === 1, 'leg A (d): the deferred job at rest, put on the abort', `jobs ${jobs(a.S)}`)
-  expect(
-    new RegExp(`${a.S}'s request went away during its engine write; the write goes on in its own task, the submission deferred as [0-9a-f]{64}`).test(logText()),
-    "leg A (d): the cover's line",
-    'no deferral line for the subject',
-  )
+  const coverA = new RegExp(`${a.S}'s request went away during its engine write; the write goes on in its own task, the submission deferred as [0-9a-f]{64}`).test(logText())
+  if (causeA === 'request-gone') {
+    expect(cA - c0 === 1, `leg A (b): request-gone: ${COUNTER} +1`, `${c0} -> ${cA}`)
+    expect(jobs(a.S) === 1, 'leg A (d): request-gone: the deferred job at rest, put on the abort', `jobs ${jobs(a.S)}`)
+    expect(coverA, "leg A (d): request-gone: the cover's line", 'no deferral line for the subject')
+  } else {
+    // past-deadline (a slow host past the arm's 12 s): the request's 202 put the job at rest, no cover; in-request: none
+    const wantJobs = causeA === 'past-deadline' ? 1 : 0
+    expect(cA === c0, `leg A (b): ${causeA}: ${COUNTER} unchanged (only a request-gone write counts)`, `${c0} -> ${cA}`)
+    expect(jobs(a.S) === wantJobs && !coverA, `leg A (d): ${causeA}: no cover (nothing fired the request's signal), jobs ${wantJobs}`, `jobs ${jobs(a.S)}, cover line ${coverA}`)
+  }
 
   // B. the abort mid-write, an eviction opened during the write
+  const r0 = await counter(REEVICTED)
   const b = await present({ evict: true, abortMidWrite: true })
   lines.push(`INFO  leg B: ${b.S} aborted at ${b.abortedAt} ms; the client saw ${b.got.status}`)
   expect(b.abortedAt !== null && b.got.status === 0, 'leg B: the client aborted mid-write', JSON.stringify(b))
-  const lineB = await logLine(new RegExp(`${b.S} request-gone write outran its eviction \\(evicted at \\d+ ms: [^)]*\\): re-evicted \\d+ row`))
-  expect(lineB !== null, "leg B (c): the task's guard re-evicted the write that outran its eviction", String(lineB))
+  const lineB = await logLine(new RegExp(`${b.S} (request-gone|in-request|past-deadline) write outran its eviction \\(evicted at \\d+ ms: .*\\): re-evicted \\d+ row`))
+  expect(lineB !== null, "leg B (c): the task's guard re-evicted the write that outran its eviction (any cause word)", String(lineB))
   const rB = rows(b.S)
   const tB = twins(b.S)
   expect(rB && rB.outputs === 0 && rB.pot_records === 0 && rB.applied === 0 && tB >= 2, 'leg B (c): no live rows, the rows in the twins', JSON.stringify({ rows: rB, twins: tB }))
+  const rB1 = await counterAt(REEVICTED, Number(r0) + 1)
+  await sleep(2_000) // a second count (the request's and the task's both) would land by now
+  const rB2 = await counter(REEVICTED)
+  expect(rB1 - r0 === 1 && rB2 === rB1, `leg B (c): ${REEVICTED} +1, counted once`, `${r0} -> ${rB1} -> ${rB2}`)
   const cB = await counter()
-  expect(cB - cA === 1, `leg B: ${COUNTER} +1`, `${cA} -> ${cB}`)
+  const causeB = lineB?.match(/ (request-gone|in-request|past-deadline) write /)?.[1] ?? null
+  expect(causeB === 'request-gone' ? cB - cA === 1 : cB === cA, `leg B: ${COUNTER} consistent with the cause ${causeB}`, `${cA} -> ${cB}`)
 
   // C. the control: no abort
   const c = await present({ evict: false, abortMidWrite: false })
