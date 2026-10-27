@@ -933,6 +933,7 @@ pub async fn guard_landed(db: &D1Database, landed: &[(String, String)], origin: 
             Ok(Some(ev)) => {
                 let now_ms = worker::Date::now().as_millis();
                 let outcome = evict_txid_everywhere(db, txid, &ev.reason, now_ms).await;
+                settle_reevicted(db, txid, &outcome, &ev.reason, origin).await;
                 crate::ops::bump_counter(
                     db,
                     crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
@@ -956,6 +957,128 @@ pub async fn guard_landed(db: &D1Database, landed: &[(String, String)], origin: 
             }
         }
     }
+}
+
+/// bsv-low #920: the memo a re-eviction after a write reads before it settles: the kind of the txid's `/tx-any`
+/// verdict memo, if any.
+pub const REEVICTED_MEMO_KIND_SQL: &str = "SELECT kind FROM tx_any_verdicts WHERE txid = ?";
+
+/// PURE (bsv-low #920): does a re-eviction after a write still owe the refusal's memo? Never over a pass that
+/// yielded to a readmission (the chain's word stands, as `settle_corroborated_refusal` reads it); never over a
+/// memo a settle already wrote (`refused`, the retire pass's `retired`, the request-time `unconfirmable` the upsert
+/// keeps). An unreadable memo is owed: the upsert is idempotent, and a missing memo is the loss #920 measured.
+pub fn reevicted_owes_memo(yielded: bool, kind: Option<&str>) -> bool {
+    !yielded && !matches!(kind, Some("refused" | "retired" | "unconfirmable"))
+}
+
+/// What the write-side guard's settle touches after its re-eviction (bsv-low #920): D1 in production, real SQLite
+/// under the pins (`settle_reevicted_with`).
+pub(crate) trait ReevictedPort {
+    /// The kind of the txid's verdict memo (`REEVICTED_MEMO_KIND_SQL`).
+    async fn memo_kind(&self) -> Result<Option<String>, String>;
+    /// The memo and its write counter, one batch.
+    async fn commit(&self, queries: Vec<Query>) -> Result<(), String>;
+    fn log(&self, line: String);
+}
+
+/// THE WRITE-SIDE GUARD'S SETTLE (bsv-low #920, L51 pair 17, JOIN `55ee1d0a…`): after a write that outran an open
+/// eviction has been re-evicted, the refusal's `/tx-any` memo is written when no settle wrote it. Before #920 the
+/// guard moved the rows and counted `admit_fast_reevicted_after_write_total`, but only the refusal's own job (the
+/// `/arc-ingest` push, the pending watch) wrote the memo, AFTER its eviction: when that job ran while the admission's
+/// write was still in flight (#838's past-deadline landing, 20 s under the fleet's D1 queue) it found no rows, and a
+/// job the platform cut after its OPEN marker left the marker and nothing else; the landing then re-evicted with no
+/// memo, and the subject read as unknown until a re-present aged past the floor. The landing IS the trigger: the
+/// open marker on the ledger is how a refusal in flight reaches the write it outran. The memo's reason is the
+/// ledger's own (the evidence's words); its write counter is the memo's, the eviction's count stays the caller's.
+pub(crate) async fn settle_reevicted_with<P: ReevictedPort>(
+    port: &P,
+    txid: &str,
+    now_ms: u64,
+    outcome: &EvictionOutcome,
+    reason: &str,
+    origin: &str,
+) {
+    if outcome.yielded {
+        return;
+    }
+    let kind = match port.memo_kind().await {
+        Ok(kind) => kind,
+        Err(e) => {
+            port.log(format!(
+                "{origin}: the verdict memo could not be read for {txid} after its re-eviction ({e}): written"
+            ));
+            None
+        }
+    };
+    if !reevicted_owes_memo(outcome.yielded, kind.as_deref()) {
+        return;
+    }
+    let queries = vec![
+        Query::new(crate::proof_fetcher::TX_ANY_VERDICT_UPSERT_SQL)
+            .bind(txid)
+            .bind(now_ms)
+            .bind("refused")
+            .bind(reason),
+        Query::new(crate::ops::BUMP_COUNTER_SQL)
+            .bind(crate::applayer_counters::COUNTER_TXANY_MEMO_WRITE_REFUSED)
+            .bind(1),
+    ];
+    match port.commit(queries).await {
+        Ok(()) => port.log(format!(
+            "{origin}: {txid} re-evicted after its write: the refusal's memo written ({reason}; bsv-low #920)"
+        )),
+        Err(e) => port.log(format!(
+            "{origin}: {txid} re-evicted after its write: the refusal's memo FAILED ({e})"
+        )),
+    }
+}
+
+struct D1Reevicted<'a> {
+    db: &'a D1Database,
+    txid: &'a str,
+}
+
+impl ReevictedPort for D1Reevicted<'_> {
+    async fn memo_kind(&self) -> Result<Option<String>, String> {
+        #[derive(serde::Deserialize)]
+        struct Kind {
+            kind: Option<String>,
+        }
+        Ok(Query::new(REEVICTED_MEMO_KIND_SQL)
+            .bind(self.txid)
+            .fetch_optional::<Kind>(self.db)
+            .await?
+            .and_then(|k| k.kind))
+    }
+    async fn commit(&self, queries: Vec<Query>) -> Result<(), String> {
+        let statements = queries
+            .iter()
+            .map(|query| query.prepare(self.db))
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::d1_ledger::counted_batch(self.db, statements)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+    fn log(&self, line: String) {
+        worker::console_log!("{line}");
+    }
+}
+
+/// [`settle_reevicted_with`] over D1: called by every write-side guard right after its `evict_txid_everywhere`
+/// (the request's, the past-deadline landing's, the queue replay's, a landed predecessor's, a resumed run's) and by
+/// the Rejected arm's re-run under an open eviction.
+pub async fn settle_reevicted(
+    db: &D1Database,
+    txid: &str,
+    outcome: &EvictionOutcome,
+    reason: &str,
+    origin: &str,
+) {
+    let txid = txid.to_ascii_lowercase();
+    let port = D1Reevicted { db, txid: &txid };
+    let now_ms = worker::Date::now().as_millis();
+    settle_reevicted_with(&port, &txid, now_ms, outcome, reason, origin).await;
 }
 
 /// The refused verdict memo for a txid (round 5 of the gate, N1): the door's readmission deletes the memo FIRST, so
@@ -8319,5 +8442,363 @@ mod tests {
                 RetireEnd::NoLivePot
             );
         }
+    }
+
+    /// bsv-low #920: the write-side guard's settle over real SQLite (the shipped schema and the shipped memo SQL).
+    struct SqliteReevicted<'a> {
+        conn: &'a rusqlite::Connection,
+        txid: &'a str,
+        commits: std::cell::Cell<usize>,
+    }
+    impl ReevictedPort for SqliteReevicted<'_> {
+        async fn memo_kind(&self) -> Result<Option<String>, String> {
+            use rusqlite::OptionalExtension;
+            self.conn
+                .query_row(REEVICTED_MEMO_KIND_SQL, [self.txid], |r| {
+                    r.get::<_, Option<String>>(0)
+                })
+                .optional()
+                .map(|k| k.flatten())
+                .map_err(|e| e.to_string())
+        }
+        async fn commit(&self, queries: Vec<Query>) -> Result<(), String> {
+            let tx = self
+                .conn
+                .unchecked_transaction()
+                .map_err(|e| e.to_string())?;
+            for query in &queries {
+                let params: Vec<_> = query.params().iter().map(to_sql).collect();
+                tx.execute(query.sql(), rusqlite::params_from_iter(params))
+                    .map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            self.commits.set(self.commits.get() + 1);
+            Ok(())
+        }
+        fn log(&self, _: String) {}
+    }
+
+    fn fix920_counter(conn: &rusqlite::Connection, name: &str) -> i64 {
+        conn.query_row(
+            "SELECT value FROM ops_counters WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// The app layer's `/tx-any` memo read (`low-app-layer` `txany.rs`, `VERDICT_MEMO_READ_SQL`, verbatim): what it
+    /// serves as `source: "memo"`, `present: false`, `terminal: true` for a `refused` row.
+    const FIX920_APP_MEMO_READ_SQL: &str =
+        "SELECT txid, verdictAtMs, inputOutpoint, spenderTxid, kind, evidence FROM tx_any_verdicts WHERE txid = ?";
+
+    fn fix920_served_memo(conn: &rusqlite::Connection, txid: &str) -> Option<(String, String)> {
+        use rusqlite::OptionalExtension;
+        conn.query_row(FIX920_APP_MEMO_READ_SQL, [txid], |r| {
+            Ok((r.get::<_, String>(4)?, r.get::<_, String>(5)?))
+        })
+        .optional()
+        .unwrap()
+    }
+
+    /// The write-side guard as every site runs it (`routes::finish_past_deadline`'s arm, the request's, a landed
+    /// predecessor's): the ledger's open row, the eviction under its reason, the settle, the count.
+    async fn fix920_landing_guard(db: &SqliteShadow, txid: &str, now_ms: u64) -> Option<u64> {
+        use rusqlite::OptionalExtension;
+        let reason: Option<String> = db
+            .conn
+            .query_row(OPEN_EVICTION_SQL, [txid], |r| r.get(0))
+            .optional()
+            .unwrap();
+        let reason = reason?;
+        let core = evict_core(db, txid, &reason, now_ms).await;
+        let outcome = EvictionOutcome {
+            moved: core.moved,
+            yielded: core.yielded_to_readmission.is_some(),
+            incomplete: !core.faults.is_empty(),
+        };
+        let port = SqliteReevicted {
+            conn: &db.conn,
+            txid,
+            commits: std::cell::Cell::new(0),
+        };
+        settle_reevicted_with(&port, txid, now_ms, &outcome, &reason, "pin").await;
+        db.conn
+            .execute(
+                crate::ops::BUMP_COUNTER_SQL,
+                rusqlite::params![crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1],
+            )
+            .unwrap();
+        Some(outcome.moved)
+    }
+
+    fn fix920_land(conn: &rusqlite::Connection, txid: &str) {
+        conn.execute("INSERT INTO outputs (txid, outputIndex, outputScript, topic, satoshis, spent) VALUES (?1, 0, X'51', 'tm_pot', 40000, 0)", [txid]).unwrap();
+        conn.execute("INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind) VALUES (?1, 0, 0, 1789959998, 'covenant')", [txid]).unwrap();
+        conn.execute(
+            "INSERT INTO applied_transactions (txid, topic) VALUES (?1, 'tm_pot')",
+            [txid],
+        )
+        .unwrap();
+    }
+
+    /// bsv-low #920 (a), L51 pair 17's order: Arcade's REJECTED push is judged (Arcade's own live word, both
+    /// indexers absent: refused, no age floor) and its eviction runs while the admission's engine write is still in
+    /// flight (#838's past-deadline landing, 20 s later): the push's pass finds no rows and its job is cut after
+    /// its OPEN marker (no memo, no count). The write then LANDS, and its write-side guard reads the open row it
+    /// outran: the rows move to the twins, the refusal's memo (the app layer's `/tx-any` source) and the counts are
+    /// written. RED with the settle made inert (main's guard: the rows moved, the count bumped, NO memo, so
+    /// `/tx-any` served the index's unknown for thirteen minutes).
+    #[tokio::test]
+    async fn fix920_a_a_refusal_in_flight_completes_at_the_admissions_landing() {
+        let txid = "55".repeat(32);
+        let reason = "REJECTED (arcade live REJECTED: UTXO_SPENT (70): x; both indexers absent)";
+        let db = SqliteShadow::new(shipped_conn());
+        // the push's evidence check: Arcade's own live word, the admission unknown (its write in flight)
+        let verdict = verdict_of_look(
+            &ArcadeLook::Fatal("REJECTED".into(), "UTXO_SPENT (70)".into()),
+            async {
+                (
+                    crate::door_words::CourierWord::Absent,
+                    crate::door_words::CourierWord::Absent,
+                )
+            },
+            async { None },
+        )
+        .await;
+        assert!(
+            matches!(verdict, EvidenceVerdict::Refused(_)),
+            "Arcade's own fatal word needs no age: {verdict:?}"
+        );
+        // the push's eviction before the landing: its marker, nothing to move; the job cut before its settle
+        let push = evict_core(&db, &txid, reason, 1_000).await;
+        assert_eq!(push.moved, 0, "the write is still in flight: {push:?}");
+        assert_eq!(
+            fix920_served_memo(&db.conn, &txid),
+            None,
+            "the cut job wrote no memo"
+        );
+        // the admission's write lands after the answer, then its guard
+        fix920_land(&db.conn, &txid);
+        let moved = fix920_landing_guard(&db, &txid, 21_000).await;
+        assert!(
+            moved.is_some_and(|m| m >= 3),
+            "the landed rows re-evicted: {moved:?}"
+        );
+        for t in ["outputs", "pot_records", "applied_transactions"] {
+            assert_eq!(
+                count(&db.conn, t, "txid", &txid),
+                0,
+                "{t} still holds the evicted txid"
+            );
+        }
+        assert_eq!(
+            fix920_served_memo(&db.conn, &txid),
+            Some(("refused".to_string(), reason.to_string())),
+            "the app layer's /tx-any serves the refusal memo after the landing"
+        );
+        assert_eq!(
+            fix920_counter(
+                &db.conn,
+                crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE
+            ),
+            1
+        );
+        assert_eq!(
+            fix920_counter(
+                &db.conn,
+                crate::applayer_counters::COUNTER_TXANY_MEMO_WRITE_REFUSED
+            ),
+            1
+        );
+        // a second guard over the same landing (the deferred job's run, a re-present) moves nothing, writes no
+        // second memo
+        assert_eq!(fix920_landing_guard(&db, &txid, 40_000).await, Some(0));
+        assert_eq!(
+            fix920_counter(
+                &db.conn,
+                crate::applayer_counters::COUNTER_TXANY_MEMO_WRITE_REFUSED
+            ),
+            1,
+            "the memo is written once"
+        );
+    }
+
+    /// bsv-low #920 (b): the push AFTER the landing (today's path) is unchanged: its own settle (the shipped
+    /// `settle_corroborated_refusal`'s batch) writes the memo and its count, and a later write-side guard over the
+    /// same txid writes no second memo; a guard whose pass yielded to a readmission writes none at all; a memo
+    /// another settle wrote (`retired`, `unconfirmable`) is never overwritten.
+    #[tokio::test]
+    async fn fix920_b_the_push_after_the_landing_is_unchanged_and_the_memo_is_written_once() {
+        let txid = "56".repeat(32);
+        let reason = "REJECTED (arcade live REJECTED: UTXO_SPENT (70): x; both indexers absent)";
+        let db = SqliteShadow::new(shipped_conn());
+        fix920_land(&db.conn, &txid);
+        let push = evict_core(&db, &txid, reason, 1_000).await;
+        assert!(push.moved >= 3);
+        let tx = db.conn.unchecked_transaction().unwrap();
+        for q in refusal_fact_queries(&txid, 1_000, crate::ops::COUNTER_ARC_INGEST_EVICTED, reason)
+        {
+            let params: Vec<_> = q.params().iter().map(to_sql).collect();
+            tx.execute(q.sql(), rusqlite::params_from_iter(params))
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        assert_eq!(
+            fix920_counter(&db.conn, crate::ops::COUNTER_ARC_INGEST_EVICTED),
+            1
+        );
+        assert_eq!(fix920_landing_guard(&db, &txid, 2_000).await, Some(0));
+        assert_eq!(
+            fix920_counter(
+                &db.conn,
+                crate::applayer_counters::COUNTER_TXANY_MEMO_WRITE_REFUSED
+            ),
+            1,
+            "the push's settle wrote the memo; the guard writes no second"
+        );
+        // the decision's table
+        assert!(reevicted_owes_memo(false, None));
+        assert!(reevicted_owes_memo(false, Some("absent")));
+        for kept in ["refused", "retired", "unconfirmable"] {
+            assert!(!reevicted_owes_memo(false, Some(kept)), "{kept}");
+        }
+        assert!(
+            !reevicted_owes_memo(true, None),
+            "never over a yielded pass"
+        );
+        let port = SqliteReevicted {
+            conn: &db.conn,
+            txid: "57",
+            commits: std::cell::Cell::new(0),
+        };
+        let yielded = EvictionOutcome {
+            moved: 0,
+            yielded: true,
+            incomplete: false,
+        };
+        settle_reevicted_with(&port, "57", 1, &yielded, reason, "pin").await;
+        assert_eq!(port.commits.get(), 0, "a yielded pass writes nothing");
+    }
+
+    /// bsv-low #920: every write-side guard that re-evicts after a write settles the refusal right after its
+    /// eviction (the past-deadline landing, the request's guard, a resumed run's, a landed predecessor's) and so does
+    /// the Rejected arm's re-run under an open eviction. RED on main (no site settles).
+    #[test]
+    fn fix920_every_write_side_guard_settles_after_its_eviction() {
+        let routes = include_str!("routes.rs");
+        let routes = &routes[..routes.find("#[cfg(test)]").unwrap_or(routes.len())];
+        let src = include_str!("admit_fast.rs");
+        let guard = &src[src.find("pub async fn guard_landed(").unwrap()..];
+        let guard = &guard[..guard.find("\n}\n").unwrap()];
+        let past = &routes[routes.find("async fn finish_past_deadline<").unwrap()..];
+        let past = &past[..past.find("\n}\n").unwrap()];
+        for (site, body, needle) in [
+            (
+                "guard_landed",
+                guard,
+                "evict_txid_everywhere(db, txid, &ev.reason, now_ms)",
+            ),
+            (
+                "finish_past_deadline",
+                past,
+                "evict_txid_everywhere(&db, &subject, &ev.reason, now_ms)",
+            ),
+            (
+                "the request's guard",
+                routes,
+                "evict_txid_everywhere(&ledger_db, subject, &ev.reason, now_ms)",
+            ),
+            (
+                "the resumed run's stored echo",
+                routes,
+                "STORED_ECHO_UNDER_EVICTION",
+            ),
+            ("the Rejected arm's re-run", routes, "&crate::admit_fast::ladder_rerefusal_reason(&reason),\n                            worker::Date"),
+        ] {
+            let at = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("{site}: {needle}"));
+            let window = &body[at..(at + 900).min(body.len())];
+            assert!(
+                window.contains("settle_reevicted("),
+                "{site}: the eviction is not followed by the refusal's settle"
+            );
+        }
+    }
+
+    /// bsv-low #920 (c): the re-present's terminal judgement under an OPEN eviction. The door's probe is Arcade's
+    /// own `GET /tx`; with both indexers absent the age floor (Rule 6) is read only when no eviction stands, so the
+    /// re-present answers the Rejected arm (the 422 and the memo) young or aged; mempool presence keeps #602's race
+    /// word. The evidence check's own rows (#740): Arcade's live fatal word refuses young; a Recorded (pushed) or
+    /// faulted look is absence-based and young is "not now". RED with main's rule (absence always reads the age).
+    #[tokio::test]
+    async fn fix920_c_a_re_present_under_an_open_eviction_on_arcades_own_word_is_refused_young_or_aged(
+    ) {
+        use crate::broadcaster::{terminal_at_arcade_by_presence, terminal_reads_age, ArcOutcome};
+        use crate::proof_fetcher::NetworkPresence;
+        let bound = crate::door_words::LockBound::default();
+        let txid = "55".repeat(32);
+        let judge = |under_open: bool, young_read: bool, presence: NetworkPresence| {
+            let young = terminal_reads_age(&presence, under_open) && young_read;
+            terminal_at_arcade_by_presence(
+                presence,
+                young,
+                &txid,
+                "REJECTED",
+                "UTXO_SPENT (70)",
+                &bound,
+            )
+        };
+        // under an open eviction: young or aged, both indexers absent → the refusal
+        for young in [true, false] {
+            assert!(
+                matches!(
+                    judge(true, young, NetworkPresence::Absent),
+                    Ok(ArcOutcome::Rejected(_))
+                ),
+                "young={young}"
+            );
+        }
+        // no eviction: Rule 6 stands for a first presentation
+        assert!(judge(false, true, NetworkPresence::Absent).is_err());
+        assert!(matches!(
+            judge(false, false, NetworkPresence::Absent),
+            Ok(ArcOutcome::Rejected(_))
+        ));
+        // mempool presence keeps #602's race word under an eviction too; mined presence admits
+        assert!(judge(true, true, NetworkPresence::Present { height: None }).is_err());
+        assert!(matches!(
+            judge(true, true, NetworkPresence::Present { height: Some(1) }),
+            Ok(ArcOutcome::Accepted(_))
+        ));
+        assert!(judge(true, false, NetworkPresence::Inconclusive).is_err());
+        // the evidence check (#740): only Arcade's live fatal word refuses a young or unknown admission
+        let absent = || async {
+            (
+                crate::door_words::CourierWord::Absent,
+                crate::door_words::CourierWord::Absent,
+            )
+        };
+        let fatal = ArcadeLook::Fatal("REJECTED".into(), "UTXO_SPENT (70)".into());
+        let recorded = ArcadeLook::Recorded("REJECTED".into(), "UTXO_SPENT (70)".into());
+        assert!(matches!(
+            verdict_of_look(&fatal, absent(), async { Some(1_000) }).await,
+            EvidenceVerdict::Refused(_)
+        ));
+        for look in [recorded, ArcadeLook::Fault] {
+            assert!(
+                matches!(
+                    verdict_of_look(&look, absent(), async { Some(1_000) }).await,
+                    EvidenceVerdict::Uncertain(_)
+                ),
+                "{look:?} young is not now"
+            );
+        }
+        // the door's arm reads the floor through the one rule, under the broadcaster's own eviction stamp
+        let b = include_str!("broadcaster.rs");
+        assert!(b.contains(
+            "let young = if terminal_reads_age(&presence, self.evicted_at_ms.is_some()) {"
+        ));
     }
 }
