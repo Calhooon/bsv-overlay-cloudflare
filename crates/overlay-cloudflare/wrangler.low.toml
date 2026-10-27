@@ -257,7 +257,7 @@ TOPIC_SUFFIX = "_beta"
 CHAIN_TRACKER_URL = "https://__HOST_CHAINTRACKS__"
 # Its OWN hosting URL — also what scopes this deploy's advertisement set.
 HOSTING_URL = "https://__HOST_OVERLAY_BETA__"
-WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
+WALLET_STORAGE_URL = "https://wallet-infra-beta.x402agency.com"  # the storage BETA line (the keeper, 2026-10-27): a beta Worker never writes a row into production storage
 # BASE names in both envs — the suffix is applied at registration, in one
 # place (src/lib.rs), so a topic added later cannot be forgotten by it.
 TOPIC_MANAGERS = "tm_ship,tm_slap,tm_low,tm_reveal,tm_pot,tm_lowfund,tm_collected,tm_hand,tm_result,tm_proof,tm_potparty,tm_potrefund,tm_hopparty"
