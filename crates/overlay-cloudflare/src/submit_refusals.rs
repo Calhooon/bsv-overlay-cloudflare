@@ -231,6 +231,10 @@ pub fn write_queries(
     let mut out: Vec<Query> = to_write
         .iter()
         .map(|s| {
+            crate::owed_events::note(
+                "refusal",
+                &overlay_discovery::owed_event::outpoint_key(&s.txid, s.vout),
+            );
             Query::new(SUBMIT_REFUSAL_UPSERT_SQL)
                 .bind(s.txid.as_str())
                 .bind(i64::from(s.vout))

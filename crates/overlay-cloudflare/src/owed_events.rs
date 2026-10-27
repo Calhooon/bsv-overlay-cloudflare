@@ -1,0 +1,565 @@
+//! bsv-low #911 (lane D2-ACTOR-A; `DESIGN-D2-ACTOR-2026-10-26.md` sections 3 and 11, the audit's HIGH-1, HIGH-2 and
+//! MEDIUM-1): THE PUBLISH of the `owed-events` queue. ONE source for both Workers (the app layer includes this file
+//! by path, as it includes `d1_ledger.rs`), so the two producers write one shape through one plan.
+//!
+//! A writer that changes an owed source row NOTES the row's trigger pair (`source`, `sourceKey`: exactly what the
+//! row's `owed_dirty` trigger writes, `overlay_discovery::owed_event::TRIGGER_SOURCES`) beside the mark its statement
+//! made ([`note`]; the overlay's pot writers note through `pot_changes::note`, every one of them). At its flush point
+//! (a request before its answer, a queue replay at its ack, the cron at its end, a detached `wait_until` writer at its
+//! own end, `flush_inline`-shaped) the invocation PUBLISHES its notes ([`publish_with`]): ONE D1 batch takes the
+//! publish's `seq` from the shared counter ([`SEQ_BUMP_SQL`]) and, in the same transaction, each row's facts and its
+//! mark count ([`read_sql`]); then ONE `sendBatch` per 100 events. A note whose row holds no mark names no subject and
+//! is not sent (counted `owed_events_publish_skipped_total`). A word frame (`tracker_events`) rides as a `word` event
+//! with its frame (the consumer ingests it, then routes): the frames LEAVE the `/internal/tx-word` POST, its flush wall
+//! and its D1 park; a frame whose publish faulted goes back to that POST (the belt for a missing binding or a Queues
+//! incident).
+//!
+//! A publish that faults, is cancelled or is refused leaves the MARK (the trigger wrote it in the writer's own
+//! transaction): never a lost event. The app layer's un-acked mark sweep (`owed_belt`, every 120 s) re-publishes the
+//! marks no consumer acknowledged within one tick, oldest first, 64 a tick.
+use overlay_discovery::owed_event::{self, OwedEvent};
+use serde_json::{json, Value};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+/// The queue's producer binding, in both Workers.
+pub const BINDING: &str = "OWED_EVENTS";
+
+/// The shared counter's table (one row). Transient: a wipe re-seeds it from the clock ([`SEQ_BUMP_SQL`]).
+pub const SEQ_CREATE: &str =
+    "CREATE TABLE IF NOT EXISTS owed_event_seq (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL)";
+/// LOW-3: the `owed-events` dead letters, parked by the app layer's DLQ consumer (park first, ack after) and
+/// re-driven by the overlay's lever (`POST /internal/redrive-dead-letters` with `"family":"owed-events"`). A dead
+/// letter is never the only copy of the intent: its marks stay in `owed_dirty` (the consumer acknowledges them only
+/// after the judge wrote) and the sweep re-publishes them. Transient; at most [`DEAD_LETTERS_MAX`] rows.
+pub const DEAD_LETTERS_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_event_dead_letters (messageId TEXT PRIMARY KEY, body TEXT NOT NULL, source TEXT, sourceKey TEXT, parkedAt INTEGER NOT NULL, redrives INTEGER NOT NULL DEFAULT 0)";
+/// The parked letters' bound (a park past it is refused, the platform retries it, then it is lost: its marks stay).
+pub const DEAD_LETTERS_MAX: i64 = 2000;
+/// The `hop` facts read's index on the missing-evidence rows (their key leads with the identity).
+pub const RELEASED_MISSING_HOP_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_released_missing_hop ON released_hop_evidence_missing(hopTxid,hopVout)";
+/// MEDIUM-1: the FIRST statement of every publish batch: `?1` tokens for the batch's events, answered as the LAST
+/// one (`RETURNING n`; the events take `n - ?1 + 1 ..= n` in order). D1 runs a batch as one transaction, so no other
+/// publish takes a token between it and the batch's reads. A first row (none yet, or after a wipe) starts at the
+/// clock (`?2` ms) times 1024, above every token a counter of the same clock less than a second behind could have
+/// handed out; under 2^53 until about 2248.
+pub const SEQ_BUMP_SQL: &str = "INSERT INTO owed_event_seq (id, n) VALUES (1, CAST(?2 AS INTEGER) * 1024 + ?1) ON CONFLICT (id) DO UPDATE SET n = n + ?1 RETURNING n";
+
+/// The pair's marks (how many subjects it names) and the row's own facts, in one statement (see [`read_sql`]).
+macro_rules! marks_and {
+    ($facts:expr) => {
+        concat!(
+            "SELECT (SELECT COUNT(*) FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey=?2 AND source=?1) AS marks,(",
+            $facts,
+            ") AS facts"
+        )
+    };
+}
+
+/// `pot` (`txid:vout`): the pot row's own columns (no bytes).
+pub const READ_POT_SQL: &str = marks_and!("SELECT json_object('txid',txid,'vout',outputIndex,'spent',spent,'spendingTxid',spendingTxid,'spentConfirmed',spentConfirmed,'spentHeight',spentHeight,'lockKind',lockKind,'potSats',potSats,'recoveryHeight',recoveryHeight,'verdict',verdict,'createdAt',createdAt) FROM pot_records WHERE txid=?3 AND outputIndex=?4");
+/// `party` (the marker's `txid`).
+pub const READ_PARTY_SQL: &str = marks_and!("SELECT json_group_array(json_object('identity',identity,'opponentIdentity',opponentIdentity,'gameId',gameId,'potTxid',potTxid,'potVout',potVout,'recoveryHeight',recoveryHeight,'seatSettlePubkey',seatSettlePubkey,'sigValid',sigValid,'outputIndex',outputIndex)) FROM potparty_records WHERE txid=?3");
+/// `hop` (`txid:hopVout`): the hop's markers, its released evidence and its missing-evidence rows.
+pub const READ_HOP_SQL: &str = marks_and!("SELECT json_object('markers',(SELECT json_group_array(json_object('identity',identity,'opponentIdentity',opponentIdentity,'gameId',gameId,'hopSats',hopSats,'seatSettlePubkey',seatSettlePubkey,'markerValid',markerValid,'outputIndex',outputIndex)) FROM hopparty_records INDEXED BY idx_hopparty_hop WHERE txid=?3 AND hopVout=?4),'released',(SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'potTxid',potTxid,'seatSettlePubkey',seatSettlePubkey,'hopSats',hopSats,'evictedAt',evictedAt)) FROM released_hop_evidence WHERE hopTxid=?3 AND hopVout=?4),'missing',(SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'potTxid',potTxid,'evictedAt',evictedAt,'bytesRead',bytesRead)) FROM released_hop_evidence_missing INDEXED BY idx_released_missing_hop WHERE hopTxid=?3 AND hopVout=?4))");
+/// `refund` (the backup's `txid`).
+pub const READ_REFUND_SQL: &str = marks_and!("SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'potTxid',potTxid,'potVout',potVout,'refundValid',refundValid,'outputIndex',outputIndex)) FROM potrefund_records WHERE txid=?3");
+/// `result` (the marker's `txid`).
+pub const READ_RESULT_SQL: &str = marks_and!("SELECT json_group_array(json_object('gameId',gameId,'winner',winner,'loser',loser,'potTxid',potTxid,'settleTxid',settleTxid,'claimValid',claimValid,'outputIndex',outputIndex)) FROM result_markers_v2 WHERE txid=?3");
+/// `collected` (the marker's `txid`).
+pub const READ_COLLECTED_SQL: &str = marks_and!("SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'payTxid',payTxid,'outputIndex',outputIndex)) FROM collected_markers_v2 WHERE txid=?3");
+/// `sweep` (the filing's `txid`; the raw bytes are not read).
+pub const READ_SWEEP_SQL: &str = marks_and!("SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'hopTxid',hopTxid,'hopVout',hopVout,'sweepTxid',sweepTxid,'outputIndex',outputIndex)) FROM hopsweep_records WHERE txid=?3");
+/// `eviction` (the evicted `txid`).
+pub const READ_EVICTION_SQL: &str = marks_and!("SELECT json_object('reason',reason,'evictedAt',evictedAt,'readmittedAt',readmittedAt,'rowsMoved',rowsMoved,'releasedSpends',json(COALESCE(releasedSpends,'[]'))) FROM pot_evictions WHERE txid=?3");
+/// `seen` (the witnessed `txid`).
+pub const READ_SEEN_SQL: &str = marks_and!("SELECT json_object('seenAt',seenAt,'seenSource',seenSource,'sourceAtMs',sourceAtMs) FROM network_seen WHERE txid=?3");
+/// `word` (the `txid`): the word, never its legacy body (MEDIUM-4: the words and their recheck stay the read's).
+pub const READ_WORD_SQL: &str = marks_and!("SELECT json_object('word',word,'tier',tier,'height',height,'proofRoot',proof_root,'headerHash',header_hash,'hintSource',hint_source,'hintAt',hint_at,'updatedAt',updated_at) FROM tx_words WHERE txid=?3");
+/// `beef` (the `txid`): the proof flags, never the bytes.
+pub const READ_BEEF_SQL: &str = marks_and!("SELECT json_object('hasProof',has_proof,'proofVerified',proof_verified,'proofHeight',proofHeight,'structurallyUnprovable',structurally_unprovable,'createdAt',createdAt) FROM pot_beefs WHERE txid=?3");
+/// `refusal` (`hopTxid:hopVout`).
+pub const READ_REFUSAL_SQL: &str = marks_and!("SELECT json_object('refusedTxid',refusedTxid,'reason',reason,'refusedAt',refusedAt) FROM submit_refusals WHERE hopTxid=?3 AND hopVout=?4");
+/// The sources no table holds (`wanted`, `age`, `backfill`, `tip`): the marks alone.
+pub const READ_MARKS_SQL: &str = marks_and!("SELECT NULL");
+
+/// The facts read of a source; `None` for an event that reads nothing (a word frame, `txfacts`, an identity route).
+pub fn read_sql(source: &str) -> Option<&'static str> {
+    Some(match source {
+        "pot" => READ_POT_SQL,
+        "party" => READ_PARTY_SQL,
+        "hop" => READ_HOP_SQL,
+        "refund" => READ_REFUND_SQL,
+        "result" => READ_RESULT_SQL,
+        "collected" => READ_COLLECTED_SQL,
+        "sweep" => READ_SWEEP_SQL,
+        "eviction" => READ_EVICTION_SQL,
+        "seen" => READ_SEEN_SQL,
+        "word" => READ_WORD_SQL,
+        "beef" => READ_BEEF_SQL,
+        "refusal" => READ_REFUSAL_SQL,
+        s if owed_event::OWN_SOURCES.contains(&s) => READ_MARKS_SQL,
+        _ => return None,
+    })
+}
+
+/// The counters (both Workers write `ops_counters` rows; served on the app layer's `/health.owedEvents` and the
+/// overlay's `/health/invariants.owedEvents`).
+pub const COUNTER_PUBLISHED: &str = "owed_events_published_total";
+/// Notes whose row held no mark (no subject to judge): not sent.
+pub const COUNTER_SKIPPED: &str = "owed_events_publish_skipped_total";
+/// Publishes that faulted (the D1 batch or the send): their marks wait for the sweep.
+pub const COUNTER_FAULTS: &str = "owed_events_publish_faults_total";
+/// Every counter this module and the consumer write, for the seeds.
+pub const COUNTERS: [&str; 10] = [
+    COUNTER_PUBLISHED,
+    COUNTER_SKIPPED,
+    COUNTER_FAULTS,
+    "owed_events_consumed_total",
+    "owed_events_acked_marks_total",
+    "owed_events_judge_faults_total",
+    "owed_events_continued_total",
+    "owed_events_swept_total",
+    "owed_events_dlq_total",
+    "owed_events_redriven_total",
+];
+const BUMP_SQL: &str = "INSERT INTO ops_counters (name, value) VALUES (?1, ?2) ON CONFLICT(name) DO UPDATE SET value = ops_counters.value + excluded.value";
+
+/// One noted pair, with the facts the writer holds (a word frame, a transaction's `txfacts`), if any.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Noted {
+    /// The trigger's source (or a routing kind).
+    pub source: String,
+    /// The trigger's source key.
+    pub key: String,
+    /// Facts the writer holds; `None`: read from the row at publish.
+    pub held: Option<Value>,
+}
+
+thread_local! {
+    static NOTES: RefCell<BTreeMap<(String, String), Option<Value>>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Note that the row of `(source, key)` changed (its trigger marked it). Cheap, never fails, deduped.
+pub fn note(source: &str, key: &str) {
+    NOTES.with(|n| {
+        n.borrow_mut()
+            .entry((source.to_string(), key.to_ascii_lowercase()))
+            .or_insert(None);
+    });
+}
+
+/// Note `(source, key)` with facts the writer holds (the latest note of a key wins).
+pub fn note_with(source: &str, key: &str, facts: Value) {
+    NOTES.with(|n| {
+        n.borrow_mut()
+            .insert((source.to_string(), key.to_ascii_lowercase()), Some(facts));
+    });
+}
+
+/// MEDIUM-3: note a recorded transaction's `txfacts`, decoded once here from its raw bytes.
+pub fn note_txfacts(txid: &str, raw: &[u8]) {
+    if let Some(facts) = owed_event::txfacts_of_raw(raw) {
+        note_with(owed_event::TXFACTS, txid, facts);
+    }
+}
+
+/// Take every note (deduped, in key order).
+pub fn drain() -> Vec<Noted> {
+    NOTES.with(|n| {
+        std::mem::take(&mut *n.borrow_mut())
+            .into_iter()
+            .map(|((source, key), held)| Noted { source, key, held })
+            .collect()
+    })
+}
+
+/// Take one note out (the consumer routes a word it just ingested itself).
+pub fn forget(source: &str, key: &str) {
+    NOTES.with(|n| {
+        n.borrow_mut()
+            .remove(&(source.to_string(), key.to_ascii_lowercase()));
+    });
+}
+
+/// No note is held.
+pub fn is_empty() -> bool {
+    NOTES.with(|n| n.borrow().is_empty())
+}
+
+/// A copy of the notes, the set left as it is (the pins).
+pub fn snapshot() -> Vec<Noted> {
+    NOTES.with(|n| {
+        n.borrow()
+            .iter()
+            .map(|((source, key), held)| Noted {
+                source: source.clone(),
+                key: key.clone(),
+                held: held.clone(),
+            })
+            .collect()
+    })
+}
+
+/// A word frame (`tracker_events`' `{txid, kind, body}`) as a `word` note carrying it.
+pub fn frame_note(frame: &Value) -> Option<Noted> {
+    let txid = frame["txid"].as_str()?.to_ascii_lowercase();
+    Some(Noted {
+        source: "word".into(),
+        key: txid,
+        held: Some(json!({ "frame": frame })),
+    })
+}
+
+/// One bound of a statement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Arg {
+    /// TEXT.
+    Text(String),
+    /// INTEGER.
+    Int(i64),
+    /// NULL.
+    Null,
+}
+
+/// What a publish needs of its Worker: one D1 batch (each statement's rows as JSON objects) and one send.
+#[allow(async_fn_in_trait)]
+pub trait PublishPort {
+    /// Run the statements as ONE batch (one transaction), each answering its rows.
+    async fn batch(&self, stmts: Vec<(&'static str, Vec<Arg>)>) -> Result<Vec<Vec<Value>>, String>;
+    /// Send the bodies to the queue as one `sendBatch` (at most [`owed_event::SEND_BATCH_MAX`]).
+    async fn send(&self, bodies: Vec<String>) -> Result<(), String>;
+    /// The clock, ms.
+    fn now_ms(&self) -> i64;
+}
+
+/// What one publish did.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Published {
+    /// Events sent.
+    pub sent: Vec<OwedEvent>,
+    /// Notes whose row held no mark (not sent).
+    pub skipped: usize,
+    /// Notes not published because the batch or a send faulted (their marks wait for the sweep; a word frame among
+    /// them goes back to the POST).
+    pub unsent: Vec<Noted>,
+    /// The fault, if any.
+    pub fault: Option<String>,
+}
+
+/// PURE: the bounds of one note's read (`?1` source, `?2` key, `?3` the txid part, `?4` the vout part).
+pub fn read_args(n: &Noted) -> Vec<Arg> {
+    let (txid, vout) = owed_event::split_key(&n.key);
+    vec![
+        Arg::Text(n.source.clone()),
+        Arg::Text(n.key.clone()),
+        Arg::Text(txid.to_string()),
+        vout.map_or(Arg::Null, |v| Arg::Int(i64::from(v))),
+    ]
+}
+
+/// PURE: does this note read its row at publish? (A held fact, an identity route and an unknown source do not.)
+pub fn reads_row(n: &Noted) -> bool {
+    n.held.is_none() && read_sql(&n.source).is_some()
+}
+
+/// THE PUBLISH, transport injected (the Workers' ports and the pins run exactly this): at most
+/// [`owed_event::PUBLISH_MAX`] notes (the rest answered `unsent`, for the caller's next publish or the sweep), the
+/// seq and the rows in ONE batch, then the sends, 100 a batch.
+pub async fn publish_with(port: &impl PublishPort, mut notes: Vec<Noted>) -> Published {
+    let mut out = Published::default();
+    if notes.is_empty() {
+        return out;
+    }
+    if notes.len() > owed_event::PUBLISH_MAX {
+        out.unsent = notes.split_off(owed_event::PUBLISH_MAX);
+    }
+    let now = port.now_ms();
+    let mut stmts: Vec<(&'static str, Vec<Arg>)> = vec![(
+        SEQ_BUMP_SQL,
+        vec![Arg::Int(notes.len() as i64), Arg::Int(now)],
+    )];
+    for n in notes.iter().filter(|n| reads_row(n)) {
+        stmts.push((read_sql(&n.source).unwrap_or(READ_MARKS_SQL), read_args(n)));
+    }
+    let rows = match port.batch(stmts).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            out.fault = Some(e);
+            out.unsent.extend(notes);
+            return out;
+        }
+    };
+    let last = rows
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|r| r["n"].as_i64());
+    let Some(last) = last else {
+        out.fault = Some("the seq bump answered no token".into());
+        out.unsent.extend(notes);
+        return out;
+    };
+    let first = last - notes.len() as i64 + 1;
+    let mut reads = rows.into_iter().skip(1);
+    let mut events: Vec<(Noted, OwedEvent)> = Vec::new();
+    for (i, n) in notes.into_iter().enumerate() {
+        let facts = if let Some(held) = &n.held {
+            held.clone()
+        } else if reads_row(&n) {
+            let row = reads.next().and_then(|r| r.into_iter().next());
+            let marks = row.as_ref().and_then(|r| r["marks"].as_i64()).unwrap_or(0);
+            if marks == 0 {
+                out.skipped += 1;
+                continue;
+            }
+            let facts = row
+                .as_ref()
+                .and_then(|r| r["facts"].as_str())
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .unwrap_or(Value::Null);
+            json!({ "marks": marks, "row": facts })
+        } else {
+            Value::Null
+        };
+        let event = OwedEvent {
+            v: owed_event::OWED_EVENT_V,
+            seq: first + i as i64,
+            source: n.source.clone(),
+            source_key: n.key.clone(),
+            facts,
+            at_ms: now,
+        };
+        events.push((n, event));
+    }
+    for chunk in events.chunks(owed_event::SEND_BATCH_MAX) {
+        let bodies = chunk.iter().map(|(_, e)| e.encode()).collect();
+        match port.send(bodies).await {
+            Ok(()) => out.sent.extend(chunk.iter().map(|(_, e)| e.clone())),
+            Err(e) => {
+                out.fault = Some(e);
+                out.unsent.extend(chunk.iter().map(|(n, _)| n.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// The worker port: the D1 binding and the queue binding.
+pub struct WorkerPublish {
+    db: worker::D1Database,
+    queue: worker::Queue,
+}
+
+impl WorkerPublish {
+    /// `None` when either binding is absent (a config without the queue: the marks wait for the drain).
+    pub fn of(env: &worker::Env) -> Option<Self> {
+        Some(WorkerPublish {
+            db: env.d1("OVERLAY_DB").ok()?,
+            queue: env.queue(BINDING).ok()?,
+        })
+    }
+}
+
+impl PublishPort for WorkerPublish {
+    async fn batch(&self, stmts: Vec<(&'static str, Vec<Arg>)>) -> Result<Vec<Vec<Value>>, String> {
+        use worker::wasm_bindgen::JsValue;
+        let mut prepared = Vec::with_capacity(stmts.len());
+        for (sql, args) in stmts {
+            let binds: Vec<JsValue> = args
+                .iter()
+                .map(|a| match a {
+                    Arg::Text(t) => JsValue::from_str(t),
+                    Arg::Int(n) => JsValue::from_f64(*n as f64),
+                    Arg::Null => JsValue::NULL,
+                })
+                .collect();
+            prepared.push(
+                self.db
+                    .prepare(sql)
+                    .bind(&binds)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        let results = crate::d1_ledger::counted_batch(&self.db, prepared)
+            .await
+            .map_err(|e| e.to_string())?;
+        results
+            .into_iter()
+            .map(|r| r.results::<Value>().map_err(|e| e.to_string()))
+            .collect()
+    }
+    async fn send(&self, bodies: Vec<String>) -> Result<(), String> {
+        let messages: Vec<worker::SendMessage<worker::wasm_bindgen::JsValue>> = bodies
+            .into_iter()
+            .map(|b| {
+                worker::RawMessageBuilder::new(worker::wasm_bindgen::JsValue::from_str(&b))
+                    .build_with_content_type(worker::QueueContentType::Text)
+            })
+            .collect();
+        let n = messages.len() as u64;
+        self.queue
+            .send_raw_batch(messages)
+            .await
+            .map_err(|e| e.to_string())?;
+        crate::d1_ledger::note_queue_ops(n);
+        Ok(())
+    }
+    fn now_ms(&self) -> i64 {
+        worker::Date::now().as_millis() as i64
+    }
+}
+
+/// THE PUBLISH of this invocation's notes and of `frames` (the word frames the caller drained), over the Worker's
+/// bindings. Answers the frames NOT published (the caller ships them through the `/internal/tx-word` POST, the belt).
+/// With no queue binding nothing is drained: the notes wait for the next publish of a configured isolate, the marks
+/// for the drain, and every frame is answered back.
+pub async fn publish_env(env: &worker::Env, frames: Vec<Value>) -> Vec<Value> {
+    let Some(port) = WorkerPublish::of(env) else {
+        return frames;
+    };
+    let mut notes = drain();
+    let mut frame_of: BTreeMap<String, Value> = BTreeMap::new();
+    for f in frames {
+        if let Some(n) = frame_note(&f) {
+            frame_of.insert(n.key.clone(), f);
+            notes.retain(|m| !(m.source == "word" && m.key == n.key));
+            notes.push(n);
+        }
+    }
+    if notes.is_empty() {
+        return Vec::new();
+    }
+    let report = publish_with(&port, notes).await;
+    let mut back = Vec::new();
+    for n in &report.unsent {
+        if n.source == "word" && n.held.is_some() {
+            if let Some(frame) = frame_of.remove(&n.key) {
+                back.push(frame);
+            }
+        }
+    }
+    if let Some(fault) = &report.fault {
+        worker::console_warn!(
+            "[owed-events] publish faulted ({} unsent, {} frame(s) back to the POST; the marks wait for the sweep): {fault}",
+            report.unsent.len(),
+            back.len()
+        );
+    }
+    let mut deltas = vec![
+        (COUNTER_PUBLISHED, report.sent.len() as u64),
+        (COUNTER_SKIPPED, report.skipped as u64),
+        (COUNTER_FAULTS, u64::from(report.fault.is_some())),
+    ];
+    deltas.retain(|(_, d)| *d > 0);
+    bump(env, &deltas).await;
+    back
+}
+
+/// HIGH-2: the most a request's answer waits for its publish (the D1 batch and the send). Past it the publish is
+/// dropped: its marks wait for the sweep, its frames go back to the POST (a frame both sent and posted is ingested
+/// twice, idempotently).
+pub const PUBLISH_ANSWER_WALL_MS: u64 = 1_500;
+
+/// [`publish_env`] raced against [`PUBLISH_ANSWER_WALL_MS`]: a request's publish before its answer.
+pub async fn publish_before_answer(env: &worker::Env, frames: Vec<Value>) -> Vec<Value> {
+    use futures_util::future::{select, Either};
+    let copy = frames.clone();
+    let publish = std::pin::pin!(publish_env(env, frames));
+    let wall = std::pin::pin!(worker::Delay::from(std::time::Duration::from_millis(
+        PUBLISH_ANSWER_WALL_MS
+    )));
+    match select(publish, wall).await {
+        Either::Left((back, _)) => back,
+        Either::Right(_) => {
+            worker::console_warn!(
+                "[owed-events] the publish passed its {PUBLISH_ANSWER_WALL_MS} ms answer wall: the marks wait for the sweep"
+            );
+            copy
+        }
+    }
+}
+
+/// LOW-3: the parked letters a re-drive takes, oldest first.
+pub const DEAD_LETTERS_READ_SQL: &str =
+    "SELECT messageId,body FROM owed_event_dead_letters ORDER BY parkedAt,messageId LIMIT ?1";
+/// LOW-3: the re-driven letters out of the park (their bodies are on the queue again).
+pub const DEAD_LETTERS_DELETE_SQL: &str =
+    "DELETE FROM owed_event_dead_letters WHERE messageId IN (SELECT value FROM json_each(?1))";
+/// The most letters one lever call re-drives.
+pub const REDRIVE_MAX: i64 = 200;
+
+/// LOW-3: `POST /internal/redrive-dead-letters` with `{"family":"owed-events","limit"?: n}` (the #576 lever, bearer
+/// checked by its caller): the oldest parked owed events (default 25, at most [`REDRIVE_MAX`]) sent to the queue
+/// again as they were, then taken out of the park. A send that faults leaves them parked.
+pub async fn redrive_dead_letters(
+    raw: &[u8],
+    env: &worker::Env,
+) -> worker::Result<worker::Response> {
+    use worker::wasm_bindgen::JsValue;
+    let body: Value = serde_json::from_slice(raw).unwrap_or(Value::Null);
+    let limit = body["limit"].as_i64().unwrap_or(25).clamp(1, REDRIVE_MAX);
+    let Some(port) = WorkerPublish::of(env) else {
+        return worker::Response::error("no OWED_EVENTS binding", 503);
+    };
+    let rows = port
+        .db
+        .prepare(DEAD_LETTERS_READ_SQL)
+        .bind(&[JsValue::from_f64(limit as f64)])?
+        .all()
+        .await?
+        .results::<Value>()?;
+    let mut ids = Vec::new();
+    let mut bodies = Vec::new();
+    for r in &rows {
+        if let (Some(id), Some(b)) = (r["messageId"].as_str(), r["body"].as_str()) {
+            ids.push(id.to_string());
+            bodies.push(b.to_string());
+        }
+    }
+    let mut redriven = 0usize;
+    for (chunk_ids, chunk) in ids
+        .chunks(owed_event::SEND_BATCH_MAX)
+        .zip(bodies.chunks(owed_event::SEND_BATCH_MAX))
+    {
+        if let Err(e) = port.send(chunk.to_vec()).await {
+            worker::console_warn!(
+                "[owed-events] re-drive send faulted ({e}): the letters stay parked"
+            );
+            break;
+        }
+        port.db
+            .prepare(DEAD_LETTERS_DELETE_SQL)
+            .bind(&[JsValue::from_str(
+                &serde_json::to_string(chunk_ids).unwrap_or_default(),
+            )])?
+            .run()
+            .await?;
+        redriven += chunk.len();
+    }
+    bump(env, &[("owed_events_redriven_total", redriven as u64)]).await;
+    worker::Response::from_json(
+        &json!({"family": "owed-events", "read": ids.len(), "redriven": redriven}),
+    )
+}
+
+/// The counters in one batch, best effort (telemetry only).
+pub async fn bump(env: &worker::Env, deltas: &[(&str, u64)]) {
+    use worker::wasm_bindgen::JsValue;
+    if deltas.is_empty() {
+        return;
+    }
+    let Ok(db) = env.d1("OVERLAY_DB") else {
+        return;
+    };
+    let mut stmts = Vec::new();
+    for (name, d) in deltas {
+        if let Ok(s) = db
+            .prepare(BUMP_SQL)
+            .bind(&[JsValue::from_str(name), JsValue::from_f64(*d as f64)])
+        {
+            stmts.push(s);
+        }
+    }
+    if let Err(e) = crate::d1_ledger::counted_batch(&db, stmts).await {
+        worker::console_warn!("[owed-events] counters not written: {e}");
+    }
+}

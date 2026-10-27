@@ -247,6 +247,35 @@ new_classes = ["BoardView"]
 tag = "v3-auth-session-store"
 new_classes = ["AuthSessionStore"]
 
+# bsv-low #911 (D2-ACTOR-A): the `owed-events` queue. The app layer PRODUCES
+# (the record door, the hooks, the word ingest and the un-acked mark sweep
+# publish beside their marks) and is its ONE CONSUMER: the judge's only trigger
+# (owed_events.rs). `max_batch_size = 1` and `max_batch_timeout = 0` (LOW-5: the
+# judge's trigger never waits a batch); a message whose judge faults is handed
+# back, `max_retries = 3`, then dead-lettered. Create both queues before
+# deploying: `wrangler queues create low-owed-events` and `wrangler queues create low-owed-events-dlq`.
+[[queues.producers]]
+queue = "low-owed-events"
+binding = "OWED_EVENTS"
+
+[[queues.consumers]]
+queue = "low-owed-events"
+max_batch_size = 1
+max_batch_timeout = 0
+max_retries = 3
+dead_letter_queue = "low-owed-events-dlq"
+
+# LOW-3: the owed events' dead letters, parked in D1 (`owed_event_dead_letters`,
+# park first, ack after) and re-driven by the overlay's lever
+# (`POST /internal/redrive-dead-letters` with `"family":"owed-events"`). A dead
+# letter's marks stay in `owed_dirty`: the sweep re-publishes them anyway.
+[[queues.consumers]]
+queue = "low-owed-events-dlq"
+max_batch_size = 10
+max_retries = 100
+retry_delay = 300
+max_concurrency = 1
+
 # Workers Logs (2026-09-03): persistent, queryable invocation logs for the fleet.
 [observability]
 enabled = true
@@ -340,6 +369,35 @@ bindings = [
   { name = "BOARD_VIEW", class_name = "BoardView" },
   { name = "AUTH_SESSION_STORE", class_name = "AuthSessionStore" },
 ]
+
+# bsv-low #911 (D2-ACTOR-A): the `owed-events` queue. The app layer PRODUCES
+# (the record door, the hooks, the word ingest and the un-acked mark sweep
+# publish beside their marks) and is its ONE CONSUMER: the judge's only trigger
+# (owed_events.rs). `max_batch_size = 1` and `max_batch_timeout = 0` (LOW-5: the
+# judge's trigger never waits a batch); a message whose judge faults is handed
+# back, `max_retries = 3`, then dead-lettered. Create both queues before
+# deploying: `wrangler queues create low-owed-events-beta` and `wrangler queues create low-owed-events-beta-dlq`.
+[[env.beta.queues.producers]]
+queue = "low-owed-events-beta"
+binding = "OWED_EVENTS"
+
+[[env.beta.queues.consumers]]
+queue = "low-owed-events-beta"
+max_batch_size = 1
+max_batch_timeout = 0
+max_retries = 3
+dead_letter_queue = "low-owed-events-beta-dlq"
+
+# LOW-3: the owed events' dead letters, parked in D1 (`owed_event_dead_letters`,
+# park first, ack after) and re-driven by the overlay's lever
+# (`POST /internal/redrive-dead-letters` with `"family":"owed-events"`). A dead
+# letter's marks stay in `owed_dirty`: the sweep re-publishes them anyway.
+[[env.beta.queues.consumers]]
+queue = "low-owed-events-beta-dlq"
+max_batch_size = 10
+max_retries = 100
+retry_delay = 300
+max_concurrency = 1
 
 # One bounded deploy convergence page per scheduled owed-clock pass.
 [triggers]

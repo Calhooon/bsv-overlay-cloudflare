@@ -3044,13 +3044,23 @@ pub(crate) async fn internal_pot_changed(
     if let Some(e) = &outcome.write_fault {
         console_warn!("[pot-changed] write batch (stale marks and parks) failed: {e}");
     }
-    // The overlay source transaction already marked every affected game.
-    let tip = chaintracks_present_height_env(env, "owed").await.ok();
-    let judge = crate::owed_judge::D1Judge::new(env, tip, written_off_before_ms_env(env))?;
-    let identities = outcome.owed_identities;
-    match crate::owed_judge::drain_identities(&judge, &identities, "pot-changed").await {
-        Ok(report) => for (_, error) in report.faults { console_warn!("[owed] pot judgement deferred: {error}"); },
-        Err(error) => console_warn!("[owed] pot drain failed: {error}"),
+    // The overlay source transaction already marked every affected game. bsv-low #911 (D2-ACTOR-A, MEDIUM-7): the
+    // felt's announce above is unchanged; the judge's trigger is the `owed-events` consumer, so the hook publishes
+    // the outpoints' `pot` events (the overlay already did: a duplicate routes to acknowledged marks) and never judges.
+    if crate::owed_events::configured(env) {
+        let pairs: Vec<(&str, String)> = outpoints
+            .iter()
+            .map(|(t, v)| ("pot", overlay_discovery::owed_event::outpoint_key(t, *v)))
+            .collect();
+        crate::owed_events::publish_pairs(env, &pairs).await;
+    } else {
+        let tip = chaintracks_present_height_env(env, "owed").await.ok();
+        let judge = crate::owed_judge::D1Judge::new(env, tip, written_off_before_ms_env(env))?;
+        let identities = outcome.owed_identities;
+        match crate::owed_judge::drain_identities(&judge, &identities, "pot-changed").await {
+            Ok(report) => for (_, error) in report.faults { console_warn!("[owed] pot judgement deferred: {error}"); },
+            Err(error) => console_warn!("[owed] pot drain failed: {error}"),
+        }
     }
     // FIX-935-FOLD: the judge's `owed-changed` pushes are queued, never sent in the answer path; handed here.
     crate::push_coalesce::flush_after(ctx, env);
@@ -3235,11 +3245,21 @@ pub(crate) async fn internal_hop_changed(
             .await;
         });
     }
-    let tip = chaintracks_present_height_env(env, "owed").await.ok();
-    let judge = crate::owed_judge::D1Judge::new(env, tip, written_off_before_ms_env(env))?;
-    match crate::owed_judge::drain_identities(&judge, &identities, "hop-changed").await {
-        Ok(report) => for (_, error) in report.faults { console_warn!("[owed] hop judgement deferred: {error}"); },
-        Err(error) => console_warn!("[owed] hop drain failed: {error}"),
+    // bsv-low #911 (D2-ACTOR-A): an identity route per identity for the `owed-events` consumer, never a judge here
+    // (with no queue binding the bounded judgement runs as before).
+    if crate::owed_events::configured(env) {
+        let pairs: Vec<(&str, String)> = identities
+            .iter()
+            .map(|id| (overlay_discovery::owed_event::ROUTE_IDENTITY, id.to_ascii_lowercase()))
+            .collect();
+        crate::owed_events::publish_pairs(env, &pairs).await;
+    } else {
+        let tip = chaintracks_present_height_env(env, "owed").await.ok();
+        let judge = crate::owed_judge::D1Judge::new(env, tip, written_off_before_ms_env(env))?;
+        match crate::owed_judge::drain_identities(&judge, &identities, "hop-changed").await {
+            Ok(report) => for (_, error) in report.faults { console_warn!("[owed] hop judgement deferred: {error}"); },
+            Err(error) => console_warn!("[owed] hop drain failed: {error}"),
+        }
     }
     // FIX-935-FOLD: the judge's queued pushes, after the answer.
     crate::push_coalesce::flush_after(ctx, env);
@@ -6973,6 +6993,11 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     body["record"] = crate::record_post::record_health_json();
     // bsv-low #469: the owed list's recomputes by source, the rows written by family, the faults.
     body["owed"] = crate::owed::owed_health_json();
+    // bsv-low #911 (D2-ACTOR-A, MEDIUM-8): the owed events' totals and served ages.
+    body["owedEvents"] = match D1Sql::of(&ctx.env) {
+        Ok(sql) => crate::owed_events::health(&sql).await,
+        Err(_) => serde_json::Value::Null,
+    };
     body["owed"]["dirty"] = match D1Sql::of(&ctx.env) {
         Ok(sql) => crate::owed_judge::dirty_health(&sql).await,
         Err(_) => serde_json::Value::Null,

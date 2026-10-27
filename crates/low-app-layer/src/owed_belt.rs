@@ -951,6 +951,16 @@ pub async fn drain_env(
                 worker::console_warn!("[owed] age re-mark deferred: {error}");
             }
         }
+        // bsv-low #911 (D2-ACTOR-A, HIGH-2's second belt): with the queue the drain no longer judges; it
+        // RE-PUBLISHES the marks no consumer acknowledged within one tick, oldest first, 64 pairs a tick (the
+        // consumer judges them). With no queue binding it judges as before.
+        if crate::owed_events::configured(env) {
+            let swept = crate::owed_events::sweep_publish(env)
+                .await
+                .map_err(worker::Error::RustError)?;
+            worker::console_log!("[owed-events] sweep: {swept} pair(s) re-published");
+            return Ok(owed_judge::DrainReport::default());
+        }
         owed_judge::drain_dirty(&judge, owed_judge::OWED_DIRTY_SUBJECTS_PER_PASS)
             .await.map_err(worker::Error::RustError)
     };

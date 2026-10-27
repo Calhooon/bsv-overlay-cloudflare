@@ -110,7 +110,7 @@
 pub(crate) mod owed_write;
 pub(crate) mod detached;
 mod latency;
-pub(crate) use latency::stamp_answer;
+pub(crate) use latency::{note_enqueue, stamp_answer};
 
 use crate::d1_ledger::Counted;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1877,6 +1877,9 @@ pub fn record_health_json() -> serde_json::Value {
         "answerSamples": latency::samples(),
         "answerMsP50": latency::quantile(0.50),
         "answerMsP95": latency::quantile(0.95),
+        // bsv-low #911: the door's publish (the judge's trigger), apart from its write
+        "enqueueMsP50": latency::enqueue_quantile(0.50),
+        "enqueueMsP95": latency::enqueue_quantile(0.95),
         "filedByKind": by_kind(&FILED_BY_KIND),
         "refusedByKind": by_kind(&REFUSED_BY_KIND),
         "tooManyFiledByKind": by_kind(&TOO_MANY_FILED_BY_KIND),
@@ -2364,7 +2367,14 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
         } else {
             kind.as_str()
         };
-        detached::schedule(&ctx, vec![verified.clone()], source);
+        // bsv-low #911 (D2-ACTOR-A): the door answers before any judge: its owed events are published here (the
+        // `owed-events` consumer is the judge's trigger); a Worker with no queue binding keeps the detached judge.
+        if crate::owed_events::configured(&ctx.env) {
+            owed_write::note_events(&verified);
+            latency::note_enqueue(crate::owed_events::publish_noted(&ctx.env).await);
+        } else {
+            detached::schedule(&ctx, vec![verified.clone()], source);
+        }
     }
     let row_written = match outcome {
         DoorOutcome::Refused(r) => {

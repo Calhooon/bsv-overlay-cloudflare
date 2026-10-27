@@ -1158,6 +1158,7 @@ pub async fn latch_network_seen(db: &D1Database, txid: &str, source: SeenSource,
         worker::console_log!("[#371] network_seen latch failed for {txid}: {e}");
         return;
     }
+    crate::owed_events::note("seen", txid);
     crate::tracker_events::note(
         txid,
         "seen",
@@ -1892,6 +1893,29 @@ pub async fn census_json(db: &D1Database) -> serde_json::Value {
 pub const APPLAYER_SCHEDULED_PASS_READ_SQL: &str =
     "SELECT at, started_at, wall_ms, phases, passes FROM applayer_scheduled_pass WHERE id = 1";
 
+/// bsv-low #911 (D2-ACTOR-A, MEDIUM-8): the `owed-events` consumer's batch row, written by the app layer's consumer
+/// (the oldest message's enqueue age of its last batch): one primary-key read.
+pub const OWED_EVENTS_CONSUMER_READ_SQL: &str =
+    "SELECT cursor,tickedAtMs FROM owed_belt_state WHERE name='owed-events:consumer'";
+
+async fn owed_events_consumer_view(db: &D1Database) -> serde_json::Value {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        cursor: Option<String>,
+    }
+    match Query::new(OWED_EVENTS_CONSUMER_READ_SQL)
+        .fetch_optional::<Row>(db)
+        .await
+    {
+        Ok(Some(r)) => r
+            .cursor
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .unwrap_or(serde_json::Value::Null),
+        Ok(None) => serde_json::Value::Null,
+        Err(e) => json!({ "readable": false, "fault": e }),
+    }
+}
+
 async fn applayer_scheduled_pass_view(db: &D1Database) -> serde_json::Value {
     #[derive(serde::Deserialize)]
     struct Row {
@@ -1976,6 +2000,7 @@ pub async fn health_invariants(
         conflict_memo = crate::admit_fast::conflict_fault_memo_health(db, now),
         applayer_pass = applayer_scheduled_pass_view(db),
         chain_feed = crate::chain_feed::health_json(db),
+        owed_events_consumer = owed_events_consumer_view(db),
     }
 
     let hb: Option<HeartbeatRow> = hb.ok().flatten();
@@ -2155,6 +2180,9 @@ pub async fn health_invariants(
     // bsv-low #781, #778 (B-FLEET-4): the app layer's last scheduled pass, its wall and each phase's wall, as the
     // app layer wrote them at the pass's end (`low-app-layer` `pass_meter`).
     body["appLayerScheduledPass"] = applayer_pass;
+    // bsv-low #911 (D2-ACTOR-A, MEDIUM-8): the owed events' totals (both Workers' publishes, the app layer's consumer)
+    // and the consumer's last batch: the oldest message's enqueue age.
+    body["owedEvents"] = crate::applayer_counters::owed_events_view(&counters, owed_events_consumer);
     // bsv-low #620 (L4): the chain-event feed's cursor row (the overlay's reorg word), beside D7's `arcadeReorg`.
     body["chainFeed"] = chain_feed;
     body["gaspLastSync"] = gasp_speed["lastSync"].clone();

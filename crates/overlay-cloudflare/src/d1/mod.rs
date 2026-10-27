@@ -637,7 +637,11 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 407 to 409 for #893 (lane D2-OWED-FOLD-8): `released_hop_evidence_missing` and its dirty trigger (an evicted JOIN
 /// whose bytes do not read names its released hops per verified seat: the judge's could-not-judge row).
 // 410..469: 29 write-time dirty triggers (DROP + CREATE), and the two gauge indexes.
-pub const OVERLAY_MIGRATION_COUNT: usize = 469;
+/// 469 to 473 for bsv-low #911 (lane D2-ACTOR-A): `owed_event_seq` (the owed events' database-monotonic `seq`),
+/// `owed_event_dead_letters` (the `owed-events` DLQ's parked letters), `idx_released_missing_hop` (the `hop` event's
+/// facts read) and `worker_cost_daily.queueOps` (the cost bar's queue family). The app layer reads and writes the
+/// first two and the column: deploy the overlay first (its certified count at 473), then the app layer.
+pub const OVERLAY_MIGRATION_COUNT: usize = 473;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2453,7 +2457,12 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::change_park::CHANGE_PARKED_AGE_INDEX,
     // The drain's bounded backlog count and oldest mark share this covering index.
     crate::derived_owed::DIRTY_BACKLOG_INDEX,
-
+    // 470..473: bsv-low #911 (D2-ACTOR-A): the owed events' counter, their dead letters, the hop facts' index and
+    // the cost bar's queue column.
+    crate::owed_events::SEQ_CREATE,
+    crate::owed_events::DEAD_LETTERS_CREATE,
+    crate::owed_events::RELEASED_MISSING_HOP_INDEX,
+    crate::d1_ledger::COST_DAILY_QUEUE_ALTER,
 ];
 
 // =============================================================================
