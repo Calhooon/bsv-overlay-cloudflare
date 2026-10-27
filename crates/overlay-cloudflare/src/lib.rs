@@ -54,6 +54,8 @@ pub mod hop_probe_memos;
 pub mod janitor;
 pub mod lobby_changes;
 pub mod mainnet_fanout;
+// bsv-low #936: the gated engine write owned by `ctx.wait_until`, never by the request.
+pub mod owned_write;
 // bsv-low promotion-repair, remedy B (Option 1, the #430 shape): the native
 // out-of-band migration emitter. NEVER part of the wasm32 Worker build — it
 // is host tooling (std::fs, the example `emit-migrations`), gated off wasm32
@@ -2463,6 +2465,10 @@ mod stored_rows;
 // bsv-low #838 (FIX-838-FOLD): the FIX-838 lens's folds, pinned over the shipped sources.
 #[cfg(test)]
 mod fix838_fold;
+
+// bsv-low #936 (READ-936): the gated write owned by wait_until, pinned over the shipped sources.
+#[cfg(test)]
+mod fix936;
 
 #[cfg(test)]
 #[path = "../../worker-build-info/src/worker_tests.rs"]

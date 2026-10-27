@@ -672,6 +672,55 @@ pub async fn defer_past_deadline<D: std::future::Future>(
     deferral_answer(put, subject_txid, work, 0, DeferralCause::AnswerDeadline)
 }
 
+/// bsv-low #936: why a gated engine write finishes after the request stopped waiting on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterAnswer {
+    /// #838: the write outran the arm's answer deadline; the request answered its 202.
+    PastDeadline,
+    /// #936: the request went away (the invocation `canceled`) while the write ran; nobody was answered.
+    RequestGone,
+}
+
+impl AfterAnswer {
+    /// The cause as the after-write's log line names it.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::PastDeadline => "past-deadline",
+            Self::RequestGone => "request-gone",
+        }
+    }
+}
+
+/// bsv-low #936: the cover of a gated write whose request went away while it ran, put at rest at that moment
+/// exactly as #838 puts a write past its deadline at rest (the job delayed past the platform's end of the write's
+/// own task): its run is this arm again and finds the write landed (a dedup) or finishes a write the platform cut.
+pub async fn defer_request_gone(
+    env: &Env,
+    tagged: &overlay_engine::types::TaggedBEEF,
+    submit_mode: &str,
+    subject_txid: &str,
+    work: EfWork,
+) {
+    match put_at_rest(
+        env,
+        tagged,
+        submit_mode,
+        subject_txid,
+        work,
+        0,
+        Some(PAST_DEADLINE_JOB_DELAY_SECS),
+    )
+    .await
+    {
+        Ok(reference) => worker::console_log!(
+            "POST /submit(broadcast-gated): {subject_txid}'s request went away during its engine write; the write goes on in its own task, the submission deferred as {reference} (bsv-low #936)"
+        ),
+        Err(e) => worker::console_log!(
+            "POST /submit(broadcast-gated): {subject_txid}'s request went away during its engine write and the submission could not be put at rest ({e}); the write's own task is its only cover (bsv-low #936)"
+        ),
+    }
+}
+
 fn deferral_answer(
     put: Result<String, String>,
     subject_txid: &str,
@@ -1382,8 +1431,8 @@ mod fix838 {
             .find("let arm_started_ms = js_sys::Date::now();")
             .expect("the arm's start");
         let race = parts
-            .find("crate::ef_deferred::within_deadline(write, deadline).await")
-            .expect("the write is raced");
+            .find("crate::ef_deferred::within_deadline(handle, deadline).await")
+            .expect("the write is raced (bsv-low #936: through the handle of the write `ctx.wait_until` owns)");
         let left = parts
             .find("crate::ef_deferred::answer_ms_left(arm_started_ms, engine_started)")
             .expect("what is left of the arm's deadline");
