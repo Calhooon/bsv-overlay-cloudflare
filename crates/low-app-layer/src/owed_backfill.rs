@@ -1324,7 +1324,7 @@ mod tests {
             .unwrap();
         assert!(aged < drain, "the scheduled actor turn re-marks age before draining");
         assert!(lib.contains(&squash(
-            "req.path() == \"/internal/owed-backfill-pass\" { return owed_backfill::lever(req, &env).await; }"
+            "req.path() == \"/internal/owed-backfill-pass\" { let resp = owed_backfill::lever(req, &env).await; push_coalesce::flush_after(&ctx, &env); return resp; }"
         )));
         let me = squash(include_str!("owed_backfill.rs"));
         assert!(me.contains(&squash(

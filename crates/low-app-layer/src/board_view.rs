@@ -93,7 +93,16 @@ impl BoardView {
         crate::routes::set_courier_sink(self.env.var("COURIER_SINK").ok().map(|v| v.to_string()));
     }
 
+    /// FIX-935-FOLD: the owed judge's queued pushes (the belt's and the drain's), sent after the actor's work.
+    fn flush_pushes(&self) {
+        if crate::push_coalesce::has_queued() {
+            self.state
+                .wait_until(crate::push_coalesce::flush_queued(self.env.clone()));
+        }
+    }
+
     fn flush_counters_if_due(&self) {
+        self.flush_pushes();
         let pending = crate::courier::take_pending_if_due(Date::now().as_millis() as f64);
         if !pending.is_empty() {
             let db = self.env.d1("OVERLAY_DB").ok();

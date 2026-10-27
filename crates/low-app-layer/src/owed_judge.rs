@@ -268,8 +268,10 @@ impl JudgeDb for D1Judge {
         crate::beef_guard::canonical_root(&self.sql.env, height).await
     }
     async fn push(&self, identity: &str, body: Value) {
-        // bsv-low #935: coalesced per seat under the relay's send budget.
-        crate::push_coalesce::push_to_seat(&self.sql.env, identity, None, body).await;
+        // bsv-low #935: coalesced per seat under the relay's send budget. FIX-935-FOLD: QUEUED, never sent here, so
+        // no coalescing window sits in a route's answer or a pass's wall; the fetch door, the scheduled tasks and the
+        // belt actor flush the queue after their work (`push_coalesce::flush_queued`).
+        crate::push_coalesce::queue_seat_push(identity, body);
     }
 }
 

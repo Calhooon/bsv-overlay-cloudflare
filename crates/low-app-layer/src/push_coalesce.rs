@@ -542,6 +542,12 @@ pub async fn push_to_seat(
     message_id: Option<&str>,
     body: Value,
 ) -> crate::pot_hook::Delivery {
+    // FIX-935-FOLD: with no relay there is no send budget to keep and nothing to coalesce. The raw call answers
+    // `NotConfigured` at once, as before #935; a window here only delayed what settles on that answer (the detached
+    // announce's parks).
+    if !crate::internal_events::relay_configured(env) {
+        return first_party_push_answer_raw(env, recipient, message_id, body).await;
+    }
     let knobs = Knobs::from_env(env);
     let port = WorkerPush { env };
     // The cell is the isolate's; `submit` never holds its borrow across an await.
@@ -549,6 +555,92 @@ pub async fn push_to_seat(
     submit(cell, &port, &knobs, recipient, message_id, body)
         .await
         .delivery()
+}
+
+async fn first_party_push_answer_raw(
+    env: &worker::Env,
+    recipient: &str,
+    message_id: Option<&str>,
+    body: Value,
+) -> crate::pot_hook::Delivery {
+    crate::internal_events::first_party_push_answer(env, recipient, message_id, body)
+        .await
+        .delivery()
+}
+
+/// The most queued pushes an isolate holds ([`queue_seat_push`]); one key per (identity, kind's coalescing key), so
+/// the bound is only met by that many distinct seats between two flushes. Past it the oldest is let go (the seat
+/// re-reads on its next event).
+pub const PUSH_QUEUE_MAX: usize = 4_096;
+
+thread_local! {
+    static QUEUED: RefCell<BTreeMap<(String, String), (u64, Value)>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// FIX-935-FOLD: a push that nobody waits on (the owed judge's `owed-changed`) is QUEUED in the isolate's memory,
+/// never sent in its caller's path, so a coalescing window never sits in a route's answer or a pass's wall. The
+/// queue keeps the newest body per (identity, coalescing key) and is sent by [`flush_queued`], which the fetch
+/// door, the scheduled tasks and the belt actor hand to `wait_until` after their work. A lost queue (an isolate's
+/// end) costs the seat one re-read on its next event.
+pub fn queue_seat_push(identity: &str, body: Value) {
+    let identity = identity.to_ascii_lowercase();
+    let key = coalesce_key(&body).unwrap_or_else(|| format!("raw|{}", body));
+    QUEUED.with(|q| {
+        let mut q = q.borrow_mut();
+        let seq = q.values().map(|(s, _)| *s).max().unwrap_or(0) + 1;
+        q.insert((identity, key), (seq, body));
+        while q.len() > PUSH_QUEUE_MAX {
+            let oldest = q
+                .iter()
+                .min_by_key(|(_, (s, _))| *s)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => {
+                    q.remove(&k);
+                }
+                None => break,
+            }
+        }
+    });
+}
+
+/// Whether the isolate holds queued pushes (read before handing a flush to `wait_until`).
+pub fn has_queued() -> bool {
+    QUEUED.with(|q| !q.borrow().is_empty())
+}
+
+/// Takes the isolate's queued pushes, oldest first.
+pub fn take_queued() -> Vec<(String, Value)> {
+    let mut taken: Vec<_> = QUEUED
+        .with(|q| std::mem::take(&mut *q.borrow_mut()))
+        .into_iter()
+        .map(|((identity, _), (seq, body))| (seq, identity, body))
+        .collect();
+    taken.sort_by_key(|(seq, _, _)| *seq);
+    taken.into_iter().map(|(_, i, b)| (i, b)).collect()
+}
+
+/// Hands the isolate's queued pushes to `wait_until`, after the answer (a no-op with none queued).
+pub fn flush_after(ctx: &worker::Context, env: &worker::Env) {
+    if has_queued() {
+        ctx.wait_until(flush_queued(env.clone()));
+    }
+}
+
+/// Sends the isolate's queued pushes through the coalescer ([`push_to_seat`]), together. Called after an answer
+/// (`wait_until`) or after a pass's walled work, never inside either.
+pub async fn flush_queued(env: worker::Env) {
+    let pushes = take_queued();
+    if pushes.is_empty() {
+        return;
+    }
+    futures_util::future::join_all(pushes.into_iter().map(|(identity, body)| {
+        let env = &env;
+        async move {
+            push_to_seat(env, &identity, None, body).await;
+        }
+    }))
+    .await;
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

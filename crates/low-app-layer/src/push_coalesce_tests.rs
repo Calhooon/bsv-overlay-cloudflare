@@ -375,9 +375,12 @@ async fn fix935_e_many_seats_share_the_senders_bucket() {
 fn fix935_f_every_push_to_a_seat_calls_the_helper() {
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     let judge = squash(include_str!("owed_judge.rs"));
+    // FIX-935-FOLD: the judge QUEUES its push; the queue is flushed through `push_to_seat` (`flush_queued`).
     assert!(judge.contains(&squash(
-        "crate::push_coalesce::push_to_seat(&self.sql.env, identity, None, body).await;"
+        "crate::push_coalesce::queue_seat_push(identity, body);"
     )));
+    assert!(squash(include_str!("push_coalesce.rs"))
+        .contains(&squash("push_to_seat(env, &identity, None, body).await;")));
     assert!(!judge.contains("first_party_push"));
     let hook = squash(include_str!("pot_hook.rs"));
     assert!(hook.contains(&squash(
@@ -386,4 +389,77 @@ fn fix935_f_every_push_to_a_seat_calls_the_helper() {
     assert!(!hook.contains(&squash("crate::internal_events::first_party_push_with_id(")));
     let me = squash(include_str!("push_coalesce.rs"));
     assert!(me.contains(&squash("let knobs = Knobs::from_env(env);")));
+}
+
+/// FIX-935-FOLD (the land's budget tier, PR 194): under the coalescer `/internal/pot-changed` answered in 2,068 ms
+/// (`hook;dur=`, E649 L4's bound 1,000): its judge awaited the `owed-changed` push, and a second push to a seat waits
+/// out the window. The judge's push is QUEUED in the isolate (newest body per seat and coalescing key, oldest first,
+/// bounded) and nothing in the answer path waits on it: the queue is handed to `wait_until` after the answer.
+#[test]
+fn fix935_fold_the_judges_push_is_queued_newest_per_seat_and_bounded() {
+    let _ = take_queued();
+    let owed = |n: u64| json!({"kind": "owed-changed", "identity": "x", "rows": n});
+    queue_seat_push("AA", owed(1));
+    queue_seat_push("bb", owed(1));
+    queue_seat_push("aa", owed(2));
+    assert!(has_queued());
+    let taken = take_queued();
+    assert_eq!(
+        taken,
+        vec![("bb".to_string(), owed(1)), ("aa".to_string(), owed(2))],
+        "one push per seat and key, the newest body, oldest first"
+    );
+    assert!(!has_queued());
+    for i in 0..(PUSH_QUEUE_MAX + 5) {
+        queue_seat_push(&format!("{i:08x}"), owed(i as u64));
+    }
+    let taken = take_queued();
+    assert_eq!(taken.len(), PUSH_QUEUE_MAX, "bounded");
+    assert_eq!(taken[0].0, format!("{:08x}", 5), "the oldest let go");
+}
+
+/// FIX-935-FOLD: the wiring. No coalescing wait in an answer path: the judge queues, the hook routes hand the flush to
+/// `wait_until` after their judgement, and an unconfigured relay bypasses the coalescer (the detached announce's
+/// parks settle at once, as before #935, so the tier's full-table cells see the table they filled).
+#[test]
+fn fix935_fold_no_coalescing_wait_in_an_answer_path() {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let judge = squash(include_str!("owed_judge.rs"));
+    assert!(
+        !judge.contains(&squash("push_coalesce::push_to_seat(")),
+        "the judge never sends in its caller's path"
+    );
+    let routes = squash(include_str!("routes.rs"));
+    for drain in [
+        "\"[owed] pot drain failed: {error}\"",
+        "\"[owed] hop drain failed: {error}\"",
+    ] {
+        let at = routes.find(&squash(drain)).expect("the hook's drain");
+        let tail = &routes[at..];
+        let flush = tail
+            .find("crate::push_coalesce::flush_after(ctx,env);")
+            .expect("the flush handed after the drain");
+        let answer = tail.find("json_response(").expect("the answer");
+        assert!(
+            flush < answer,
+            "the flush is handed before the answer leaves, never awaited"
+        );
+    }
+    let events = squash(include_str!("internal_events.rs"));
+    assert!(events.contains(&squash("crate::push_coalesce::flush_after(ctx, env);")));
+    let me = squash(include_str!("push_coalesce.rs"));
+    assert!(me.contains(&squash("ctx.wait_until(flush_queued(env.clone()));")));
+    assert!(me.contains(&squash(
+        "if !crate::internal_events::relay_configured(env) { return first_party_push_answer_raw(env, recipient, message_id, body).await; }"
+    )));
+    let lib = squash(include_str!("lib.rs"));
+    assert!(lib.contains(&squash("push_coalesce::flush_after(&ctx, &push_env);")));
+    assert!(lib.contains(&squash("push_coalesce::flush_queued(env_backfill).await;")));
+    let actor = squash(include_str!("board_view.rs"));
+    let flush = &actor[actor
+        .find("fnflush_counters_if_due(&self){")
+        .expect("the actor's flush")..];
+    assert!(flush.starts_with(&squash(
+        "fn flush_counters_if_due(&self) { self.flush_pushes();"
+    )));
 }
