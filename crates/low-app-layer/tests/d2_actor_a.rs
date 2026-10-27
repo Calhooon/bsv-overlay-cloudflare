@@ -266,3 +266,155 @@ fn d2_actor_a_b_the_door_publishes_and_answers_before_any_judge() {
     let lat = include_str!("../src/record_post/latency.rs");
     assert!(lat.contains("write;dur={}, enqueue;dur={e}"));
 }
+
+/// A [`Db`] whose FIRST judge write batch (the one that writes `owed_rows`) waits on a gate: the first event's judge
+/// has read its marks and hydrated, and commits only once the test opens the gate (MEDIUM-1's interleaving).
+struct Held<'a> {
+    db: &'a Db,
+    gate: RefCell<Option<tokio::sync::oneshot::Receiver<()>>>,
+    reached: std::cell::Cell<bool>,
+}
+impl low_app_layer::pot_hook::SqlPort for Held<'_> {
+    async fn run_batch(
+        &self,
+        stmts: Vec<low_app_layer::pot_hook::Stmt>,
+    ) -> Result<Vec<low_app_layer::pot_hook::StmtOut>, String> {
+        if stmts.iter().any(|s| s.sql.contains("INSERT INTO owed_rows")) {
+            let gate = self.gate.borrow_mut().take();
+            if let Some(gate) = gate {
+                self.reached.set(true);
+                let _ = gate.await;
+            }
+        }
+        self.db.run_batch(stmts).await
+    }
+    async fn counters(&self, deltas: Vec<(String, u64)>) {
+        self.db.counters(deltas).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.db.now_ms()
+    }
+    fn log(&self, line: &str) {
+        self.db.log(line);
+    }
+}
+impl low_app_layer::owed_judge::JudgeDb for Held<'_> {
+    fn tip(&self) -> Option<u64> {
+        self.db.tip()
+    }
+    async fn word_views(
+        &self,
+        rows: &std::collections::BTreeMap<String, low_app_layer::tracker_host::stored::Row>,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, String> {
+        self.db.word_views(rows).await
+    }
+    async fn canonical_root(&self, height: u64) -> Option<String> {
+        self.db.canonical_root(height).await
+    }
+    async fn push(&self, identity: &str, body: serde_json::Value) {
+        self.db.push(identity, body).await;
+    }
+}
+
+fn stored_rows(db: &Db) -> Vec<(String, Option<i64>, Option<String>)> {
+    let conn = db.conn.borrow();
+    let mut s = conn
+        .prepare("SELECT outpoint,claimable,reason FROM owed_rows ORDER BY outpoint")
+        .unwrap();
+    s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// The hop's spend (the index's own word: a sweep of it is no longer a press) and its pair.
+fn spend_the_hop(db: &Db, hop: &str) {
+    db.exec(&format!(
+        "UPDATE pot_records SET spent=1,spendingTxid='{}' WHERE txid='{hop}' AND outputIndex=0",
+        "cc".repeat(32)
+    ));
+}
+
+/// MEDIUM-1 (the D2-ACTOR-A lens): TWO EVENTS FOR ONE IDENTITY, the first's judge hydrated BEFORE the second write
+/// and committing AFTER the second event's judge: the interleaving two concurrent consumers make. Its rows are the
+/// first's stale ones over the second's, with every mark acknowledged (nothing pending withholds the press): the
+/// class `max_concurrency = 1` excludes. Run one at a time (the configured consumer), the second event's rows stand.
+/// The renders: every `owed-events` consumer of both app-layer environments (and its dead letters') is ONE at a time.
+#[tokio::test(flavor = "current_thread")]
+async fn d2_actor_a_fold_m1_one_consumer_at_a_time_derives_the_second_events_rows() {
+    let hop = owed_db::hop(7);
+    let fresh = || {
+        let db = Db::new();
+        seed_stranded_hop(&db, ID, "g1", &hop);
+        db
+    };
+    // the oracle: both writes, then one judge
+    let oracle = fresh();
+    spend_the_hop(&oracle, &hop);
+    owed_events::route(&oracle, &event("identity", ID)).await.unwrap();
+    let truth = stored_rows(&oracle);
+
+    // serial (the configured consumer): E1 judged, W2, E2 judged
+    let serial = fresh();
+    owed_events::route(&serial, &event("hop", &hop_key(&hop))).await.unwrap();
+    let before = stored_rows(&serial);
+    spend_the_hop(&serial, &hop);
+    owed_events::route(&serial, &event("pot", &hop_key(&hop))).await.unwrap();
+    assert_eq!(stored_rows(&serial), truth, "one at a time: the second event's rows");
+    assert_ne!(before, truth, "the second write moves the judgement");
+    assert_eq!(serial.int("SELECT COUNT(*) FROM owed_dirty"), 0);
+
+    // interleaved (two consumers): E1 hydrates, W2 lands, E2 judges and acks, E1 commits last
+    let racy = fresh();
+    let (open, gate) = tokio::sync::oneshot::channel();
+    let held = Held {
+        db: &racy,
+        gate: RefCell::new(Some(gate)),
+        reached: std::cell::Cell::new(false),
+    };
+    let e1 = event("hop", &hop_key(&hop));
+    let first = owed_events::route(&held, &e1);
+    let second = async {
+        while !held.reached.get() {
+            tokio::task::yield_now().await;
+        }
+        spend_the_hop(&racy, &hop);
+        let r = owed_events::route(&racy, &event("pot", &hop_key(&hop))).await;
+        let _ = open.send(());
+        r
+    };
+    let (a, b) = tokio::join!(first, second);
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(
+        racy.int("SELECT COUNT(*) FROM owed_dirty"),
+        0,
+        "every mark acknowledged: nothing pending withholds the stale row"
+    );
+    assert_eq!(
+        stored_rows(&racy),
+        before,
+        "two at a time: the first event's stale rows stand over the second's"
+    );
+
+    // the renders: one consumer at a time for the queue and its dead letters, in both environments
+    let render = include_str!("../wrangler.toml");
+    for env in ["", "env.beta."] {
+        let head = format!("[[{env}queues.consumers]]");
+        let blocks: Vec<&str> = render.split("[[").collect();
+        let owed: Vec<&&str> = blocks
+            .iter()
+            .filter(|b| b.starts_with(&head[2..]) && b.contains("owed-events"))
+            .collect();
+        assert_eq!(owed.len(), 2, "{env}: the queue's consumer and its dead letters'");
+        for block in owed {
+            assert!(
+                block.contains(&format!(
+                    "max_concurrency = {}",
+                    low_app_layer::owed_events::CONSUMER_MAX_CONCURRENCY
+                )),
+                "{env}: one consumer at a time: {block}"
+            );
+        }
+    }
+}
