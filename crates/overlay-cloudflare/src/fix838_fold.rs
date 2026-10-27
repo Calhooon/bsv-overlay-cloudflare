@@ -49,10 +49,15 @@ fn fix838f_m1_a_past_deadline_write_that_faults_enqueues_its_s2_replay() {
         "the job is the second cover, not the only one"
     );
     let parts = body(routes, "async fn submit_parts(");
-    let hand = &parts[parts.find("ctx.wait_until(finish_past_deadline(").unwrap()..];
-    let hand = &hand[..hand.find("));").unwrap()];
+    // bsv-low #936's fold: the background is the write's own task, its after-write `finish_past_deadline`
+    let hand = &parts[parts
+        .find("let (after_env, after_tagged, after_subject) =")
+        .unwrap()..];
+    let hand = &hand[..hand.find("ctx.wait_until(task);").unwrap()];
     assert!(
-        hand.contains("tagged_beef.clone(),") && hand.contains("mode,"),
+        hand.contains("tagged_beef.clone(),")
+            && hand.contains("finish_past_deadline(")
+            && hand.contains("mode,"),
         "the background is handed the bytes and the mode: {hand}"
     );
     // the job is at rest before the 202: a dropped isolate leaves it

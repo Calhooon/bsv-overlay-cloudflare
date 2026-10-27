@@ -1,6 +1,8 @@
 name = "bsv-overlay-cloudflare"
 main = "build/worker/shim.mjs"
 compatibility_date = "2024-12-01"
+# bsv-low #936 (the FIX-936 lens fold): Request.signal fires when the client goes away (no default date)
+compatibility_flags = ["enable_request_signal"]
 
 account_id = "<your-cloudflare-account-id>"
 
