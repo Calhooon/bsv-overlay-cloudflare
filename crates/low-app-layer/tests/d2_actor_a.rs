@@ -651,7 +651,8 @@ async fn d2_actor_a_fold_l6_no_subject_no_tip_and_no_identity_event_without_a_ma
     let src = squash(include_str!("../src/owed_events.rs"));
     let at = src.find("pubasyncfnconsume_one(").unwrap();
     let body = &src[at..];
-    let empty = body.find("ifplan.is_empty(){returnOk(Routed::default());}").unwrap();
+    let empty = body.find("ifplan.is_empty(){").unwrap();
+    assert!(body.contains("returnOk(plan.empty_routed());"), "an empty plan answers its held count");
     let tip = body
         .find("lettip=tip_memoised(env,tip_reads_fresh(&ev.source)).await;")
         .unwrap();
@@ -896,9 +897,196 @@ fn d2_actor_a_fold2_low_a_b_the_message_wall_and_the_fresh_tip() {
         .find("futures_util::future::select(work,wall).await")
         .unwrap();
     let back = body
-        .find(".with_delay_seconds(CONSUMER_WALL_RETRY_S)")
+        .find("letmutdelay=CONSUMER_WALL_RETRY_S;")
         .unwrap();
+    assert!(body.contains(".with_delay_seconds(delay)"), "the wall's hand-back (LOW-1: the subjects' hold, at least 60 s)");
     assert!(wall < back);
     assert!(body.contains("\"serviceMs\":service_max"));
     const { assert!(owed_events::CONSUMER_MESSAGE_WALL_MS < 15 * 60_000, "inside the platform's 15 minutes") };
+}
+
+/// 64 poisoned games of one identity, then one honest identity's game, every mark moved onto `(source, key)`, the
+/// poisoned ones faulting at every judge; three deliveries fault them to their hold (nothing lands: `Err`).
+async fn sixty_four_held_and_one_live(source: &str, key: &str) -> (Db, String) {
+    let whale = format!("02{}", "b1".repeat(32));
+    let honest = format!("02{}", "c1".repeat(32));
+    let db = Db::new();
+    for n in 0..64 {
+        seed_stranded_hop(&db, &whale, &format!("bad{n:02}"), &owed_db::hop(100 + n));
+    }
+    seed_stranded_hop(&db, &honest, "g1", &owed_db::hop(1));
+    onto_pair(&db, source, key);
+    *db.fail_bind.borrow_mut() = Some("bad".into());
+    for delivery in 1..=3 {
+        let r = owed_events::route(&db, &event(source, key)).await;
+        assert!(r.is_err(), "{source}/{key} delivery {delivery}: the 64 poisoned fault: {r:?}");
+    }
+    (db, honest)
+}
+
+/// D2-ACTOR-A-DELTA-2's NEW2-M1 (a): A HELD SUBJECT DOES NOT COUNT TOWARD THE 64-GAME CAP. 64 held subjects at the head
+/// of a shared pair and one live subject behind them: the next delivery inside the hold judges the live one. RED on
+/// `7bb95ea2`: `Ok subjects=0 held=64 more=true`, the honest `g1` never judged.
+#[tokio::test(flavor = "current_thread")]
+async fn d2_actor_a_fold3_m1_a_held_subjects_never_fill_the_cap() {
+    for (source, key) in [("age", "age"), ("tip", "gate")] {
+        let (db, honest) = sixty_four_held_and_one_live(source, key).await;
+        let routed = owed_events::route(&db, &event(source, key))
+            .await
+            .unwrap_or_else(|e| panic!("{source}/{key}: delivery 4: {e}"));
+        assert_eq!(
+            (routed.subjects, routed.faults, routed.held, routed.more),
+            (1, 0, 64, false),
+            "{source}/{key}: the live subject judged past the 64 held, no continuation"
+        );
+        assert!(rows_of(&db, &honest, "g1") >= 1, "{source}/{key}: g1 judged");
+        assert_eq!(
+            db.int(&format!(
+                "SELECT COUNT(*) FROM owed_dirty WHERE source='{source}' AND sourceKey='{key}'"
+            )),
+            64,
+            "{source}/{key}: the held marks stand"
+        );
+    }
+}
+
+/// NEW2-M1 (b): AN ALL-HELD MESSAGE ENDS. Once the live subject is judged, a delivery of the pair inside the hold
+/// meets only held subjects: `Ok`, no judge, no continuation (`continues` false), counted all-held; the consumer's
+/// continuation and its counter go through `continues` and `all_held`. RED on `7bb95ea2`: `more = true` on every
+/// such delivery, each publishing the pair again.
+#[tokio::test(flavor = "current_thread")]
+async fn d2_actor_a_fold3_m1_b_an_all_held_message_ends() {
+    for (source, key) in [("age", "age"), ("tip", "gate")] {
+        let (db, _) = sixty_four_held_and_one_live(source, key).await;
+        owed_events::route(&db, &event(source, key)).await.unwrap();
+        for delivery in 5..=7 {
+            let routed = owed_events::route(&db, &event(source, key)).await.unwrap();
+            assert_eq!(
+                (routed.subjects, routed.faults, routed.held, routed.more),
+                (0, 0, 64, false),
+                "{source}/{key} delivery {delivery}: all held, no continuation"
+            );
+            assert!(!owed_events::continues(&routed), "{source}/{key}: no continuation");
+            assert!(owed_events::all_held(&routed), "{source}/{key}: counted all-held");
+        }
+        // a message that judged something and has more behind it continues; one that judged nothing never does
+        let mut r = owed_events::Routed {
+            more: true,
+            held: 3,
+            ..Default::default()
+        };
+        assert!(!owed_events::continues(&r));
+        r.subjects = 1;
+        assert!(owed_events::continues(&r));
+        assert!(!owed_events::all_held(&r));
+    }
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/owed_events.rs")).unwrap();
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let body = squash(&src);
+    assert!(body.contains(&squash("if continues(&routed) {")), "consume_one continues only through `continues`");
+    assert!(
+        body.contains(&squash("if all_held(&routed) {")),
+        "the consumer counts an all-held message"
+    );
+    assert!(body.contains("owed_events_all_held_total"));
+}
+
+/// NEW2-M1 (c): THE SWEEP STILL RE-PUBLISHES THE PAIR WHEN THE HOLD EXPIRES. Inside the hold the pair of only held
+/// subjects is left out; past it the pair is re-published, and its delivery judges the subjects again.
+#[tokio::test(flavor = "current_thread")]
+async fn d2_actor_a_fold3_m1_c_the_sweep_republishes_the_pair_when_the_hold_ends() {
+    for (source, key) in [("age", "age"), ("tip", "gate")] {
+        let (db, _) = sixty_four_held_and_one_live(source, key).await;
+        owed_events::route(&db, &event(source, key)).await.unwrap();
+        db.exec(&format!(
+            "UPDATE owed_dirty SET markedAtMs={}",
+            db.now.get() as i64 - 4 * owed_events::SWEEP_AFTER_MS
+        ));
+        assert!(
+            owed_events::sweep(&db, db.now.get() as i64).await.unwrap().is_empty(),
+            "{source}/{key}: held, left out"
+        );
+        *db.fail_bind.borrow_mut() = None;
+        db.now.set(db.now.get() + owed_events::FAULT_HOLD_BASE_MS as u64 + 1);
+        let swept = owed_events::sweep(&db, db.now.get() as i64).await.unwrap();
+        assert_eq!(swept, vec![(source.to_string(), key.to_string())], "{source}/{key}: re-published");
+        let routed = owed_events::route(&db, &event(source, key)).await.unwrap();
+        assert_eq!((routed.subjects, routed.held, routed.more), (64, 0, false), "{source}/{key}");
+        assert_eq!(db.int("SELECT COUNT(*) FROM owed_dirty"), 0);
+    }
+}
+
+/// D2-ACTOR-A-DELTA-2's LOW-1 and LOW-2. LOW-1: a message the wall drops notes the SUBJECTS of the judge call in flight
+/// on their own memos (the third such drop holds them), never the pair, and is handed back with the longest hold that
+/// set (at least the wall's 60 s); with no call in flight the pair is noted as before. LOW-2: a memo whose hold ended
+/// more than 6 h ago counts its next fault from 0.
+#[tokio::test(flavor = "current_thread")]
+async fn d2_actor_a_fold3_low1_low2_the_wall_notes_its_subjects_and_a_stale_memo_counts_from_zero() {
+    let db = Db::new();
+    let names = vec![
+        owed_events::subject_memo_name(ID, "g1"),
+        owed_events::subject_memo_name(ID, "g2"),
+    ];
+    assert_eq!(owed_events::note_wall_subjects(&db, &[]).await, None, "none in flight: the pair's");
+    for drop in 1..=3 {
+        let delay = owed_events::note_wall_subjects(&db, &names).await.unwrap();
+        let want = if drop < 3 {
+            owed_events::CONSUMER_WALL_RETRY_S
+        } else {
+            (owed_events::FAULT_HOLD_BASE_MS / 1000) as u32
+        };
+        assert_eq!(delay, want.max(owed_events::CONSUMER_WALL_RETRY_S), "drop {drop}");
+    }
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_belt_state WHERE name LIKE 'owed-events:fault:subject %'"),
+        2
+    );
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_belt_state WHERE name LIKE 'owed-events:fault:%' AND name NOT LIKE 'owed-events:fault:subject %'"),
+        0,
+        "no pair memo"
+    );
+    // LOW-2: past the hold plus 6 h the next fault is the first
+    let memo = db.int(&format!(
+        "SELECT json_extract(cursor,'$.heldUntilMs') FROM owed_belt_state WHERE name='{}'",
+        names[0]
+    ));
+    db.now.set((memo + owed_events::FAULT_HOLD_CAP_MS + 1) as u64);
+    let m = owed_events::note_fault_named(&db, &names[0], "transient").await.unwrap();
+    assert_eq!((m.faults, m.hold_ms), (1, 0), "a stale memo counts from 0");
+    let c = serde_json::json!({"faults": 9, "heldUntilMs": 1_000});
+    assert_eq!(owed_events::stale_memo_faults(&c, 1_000 + owed_events::FAULT_HOLD_CAP_MS), 9);
+    assert_eq!(owed_events::stale_memo_faults(&c, 1_001 + owed_events::FAULT_HOLD_CAP_MS), 0);
+    // the wiring: every judge call sets its subjects in flight; the wall's branch takes them
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let src = squash(include_str!("../src/owed_events.rs"));
+    assert_eq!(src.matches("set_in_flight(&identity,chunk);").count(), 1);
+    assert_eq!(src.matches("set_in_flight(&identity,one);").count(), 1);
+    assert!(src.contains("letin_flight=take_in_flight();"));
+    assert!(src.contains("matchnote_wall_subjects(&sql,&in_flight).await{"));
+}
+
+/// NEW2-M1's statements on their indexes: the marks' reads and the held counts walk `owed_dirty` by the named index and
+/// probe `owed_belt_state` by its primary key (never a scan of either).
+#[test]
+fn d2_actor_a_fold3_m1_d_the_route_reads_are_index_searches() {
+    let db = Db::new();
+    for (sql, index) in [
+        (owed_events::ROUTE_MARKS_SQL, "idx_owed_dirty_source_key"),
+        (owed_events::ROUTE_HELD_SQL, "idx_owed_dirty_source_key"),
+        (owed_events::ROUTE_IDENTITY_SQL, "idx_owed_dirty_identity_marked"),
+        (owed_events::ROUTE_IDENTITY_HELD_SQL, "idx_owed_dirty_identity_marked"),
+    ] {
+        let conn = db.conn.borrow();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(rusqlite::params_from_iter(std::iter::repeat_n(rusqlite::types::Value::Null, sql.matches('?').count().min(4))), |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let text = plan.join(" | ");
+        assert!(text.contains(index), "{sql}: {text}");
+        assert!(!text.contains("SCAN owed_belt_state"), "{sql}: {text}");
+        assert!(text.contains("owed_belt_state USING"), "{sql}: the memo probed by key: {text}");
+    }
 }

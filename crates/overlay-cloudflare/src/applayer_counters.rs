@@ -281,6 +281,7 @@ pub fn owed_events_view(
         "redriven": c("owed_events_redriven_total"),
         "faultHeld": c("owed_events_fault_held_total"),
         "sweepHeld": c("owed_events_sweep_held_total"),
+        "allHeld": c("owed_events_all_held_total"),
         "oldestEnqueueAgeMs": consumer["oldestEnqueueAgeMs"].clone(),
         "consumer": consumer,
     })
