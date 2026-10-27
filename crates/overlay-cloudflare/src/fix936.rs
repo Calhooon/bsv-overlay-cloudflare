@@ -45,24 +45,93 @@ fn fix936_a_the_gated_write_is_owned_by_wait_until_never_by_the_request() {
     );
 }
 
-/// The request gone: the write's own task runs what the request would have run after it (the write-side guard,
-/// the S2 decision, the notes; `finish_past_deadline` under the cause `RequestGone`), and the moment the request is
-/// gone with the write still running, the submission is put at rest as the deferred job (the cover of a task the
-/// platform itself cuts), as #838 defers a write past its deadline.
+/// The FIX-936 lens's fold: the write's own task runs the after-write (`finish_past_deadline`, the guard, S2, the
+/// notes) on EVERY gated write, named by the cause the task reads (never a literal `RequestGone` the request's drop
+/// chose); the cover (the deferred job) is started from the request's `AbortSignal`, never from `Handle::drop`; and
+/// the request past its deadline only marks the handle (no second after-write spawned by the request).
 #[test]
-fn fix936_b_a_gone_request_has_its_after_write_and_its_deferred_job() {
+fn fix936_b_the_task_runs_the_after_write_and_the_abort_starts_the_cover() {
     let routes = code(include_str!("routes.rs"));
     let w = gated_write(routes);
+    let owned = &w[w.find("crate::owned_write::owned_write(").unwrap()..];
+    let owned = &owned[..owned.find("ctx.wait_until(task);").unwrap()];
+    let gone = owned
+        .find("request_signal.gone(),")
+        .expect("#936 fold: the going is the request's AbortSignal");
+    let cover = owned
+        .find("crate::ef_deferred::defer_request_gone(")
+        .expect("#936: the cover is the deferred job");
+    let after = owned
+        .find("finish_past_deadline(")
+        .expect("#936 fold: the task's own after-write");
     assert!(
-        w.contains("crate::ef_deferred::defer_request_gone("),
-        "#936: the cover is the deferred job, put at rest when the request goes"
+        gone < cover && cover < after,
+        "the signal, the cover, the after-write"
     );
     assert!(
-        w.contains("crate::ef_deferred::AfterAnswer::RequestGone"),
-        "#936: the orphaned write's after-write is finish_past_deadline's, named"
+        owned.contains("cause,") && !owned.contains("AfterAnswer::RequestGone"),
+        "#936 fold: the cause is the task's reading, never chosen by a drop"
     );
     assert!(
-        w.contains("crate::ef_deferred::AfterAnswer::PastDeadline"),
-        "#838's path keeps its own cause"
+        !w.contains("ctx.wait_until(finish_past_deadline("),
+        "#936 fold: past the deadline the request spawns no second after-write"
+    );
+    assert!(w.contains("handle.past_deadline();"));
+    let ow = code(include_str!("owned_write.rs"));
+    assert!(
+        !ow.contains("impl<T> Drop for Handle<T>"),
+        "#936 fold: nothing hangs on a Drop the platform never makes"
+    );
+    let parts = &routes[routes.find("async fn submit_inner(").unwrap()..];
+    assert!(parts.contains("request_signal: crate::owned_write::RequestSignal::of(&req),"));
+}
+
+/// The FIX-936 lens's LOW-2 and MEDIUM-2: every line of the after-write names its cause, and the counter L53 reads
+/// is bumped by the task on a request gone.
+#[test]
+fn fix936_h_every_after_write_line_names_its_cause() {
+    let routes = code(include_str!("routes.rs"));
+    let f = &routes[routes.find("async fn finish_past_deadline<").unwrap()..];
+    let f = &f[..f.find("\n}\n").unwrap()];
+    assert!(
+        !f.contains("past-deadline"),
+        "LOW-2: no line says past-deadline for every cause"
+    );
+    let lines = f.matches("worker::console_log!(").count();
+    assert!(lines >= 9);
+    assert_eq!(
+        f.matches("{word}").count(),
+        lines,
+        "LOW-2: one cause word on each line"
+    );
+    let gone = f
+        .find("if cause == crate::ef_deferred::AfterAnswer::RequestGone {")
+        .unwrap();
+    assert!(f[gone..].starts_with(
+        "if cause == crate::ef_deferred::AfterAnswer::RequestGone {\n        crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_WRITE_OUTLIVED_REQUEST, 1).await;"
+    ));
+}
+
+/// The `enable_request_signal` compatibility flag (no default date: Cloudflare's compatibility flags page) is set in
+/// every overlay render, so the request's `AbortSignal` fires when its client goes away.
+#[test]
+fn fix936_i_the_request_signal_flag_is_in_every_render() {
+    let flag = "compatibility_flags = [\"enable_request_signal\"]";
+    let low = include_str!("../wrangler.low.toml");
+    let beta = low.find("\n[env.beta]\n").expect("the beta render");
+    let top = &low[..beta];
+    assert!(
+        top.contains(&format!("\n{flag}\n")),
+        "wrangler.low.toml prod: {flag}"
+    );
+    let beta = &low[beta..];
+    let beta = &beta[..beta[1..].find("\n[").map_or(beta.len(), |i| i + 1)];
+    assert!(
+        beta.contains(&format!("\n{flag}\n")),
+        "wrangler.low.toml beta: {flag}"
+    );
+    assert!(
+        include_str!("../wrangler.toml").contains(&format!("\n{flag}\n")),
+        "wrangler.toml: {flag}"
     );
 }

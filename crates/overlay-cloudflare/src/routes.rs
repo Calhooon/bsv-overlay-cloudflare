@@ -741,6 +741,7 @@ async fn submit_inner(
             off_chain_values,
             mode_header,
             operator_authed,
+            request_signal: crate::owned_write::RequestSignal::of(&req),
         },
         hosting_url,
         arcade_url,
@@ -753,18 +754,21 @@ async fn submit_inner(
     .await
 }
 
-/// bsv-low #838: the rest of a gated engine write that outran the answer deadline, after the answer (in
-/// `ctx.wait_until`): the write finishes, then what the request does after its write, in its order: a walk the
-/// engine's budget could not hold counted, the carried predecessors guarded (lane E1D), the write-side guard (loop
-/// 18: an eviction that opened while the write ran moves what it wrote again; the door's faulted readmission
-/// retried, as the request retries it), the S2 decision (a report that is not durable enqueues its idempotent
-/// replay, marked `gated`, exactly as the request does: the FIX-838 lens's MEDIUM-1), and the notes this write took
-/// shipped. The deferred job is the second cover (its run is this arm again, after the platform's end of this
-/// task): it covers a write the platform cuts and a replay the queue refused. This never evicts an accepted subject.
-/// bsv-low #936: the same after-write for a write whose request went away while it ran (`cause` `RequestGone`, run
-/// by the write's own task; its deferred job put at rest when the request went).
+/// bsv-low #838: the rest of a gated engine write after its write, run by the write's OWN task (bsv-low #936: on
+/// every gated write, `crate::owned_write`, whether or not the request still waits; the FIX-936 lens's fold), in the
+/// request's order: a walk the engine's budget could not hold counted, the carried predecessors guarded (lane E1D),
+/// the write-side guard (loop 18: an eviction that opened while the write ran moves what it wrote again; the door's
+/// faulted readmission retried, as the request retries it), the S2 decision (a report that is not durable enqueues
+/// its idempotent replay, marked `gated`, exactly as the request does: the FIX-838 lens's MEDIUM-1), and the notes
+/// this write took shipped. Every line names its `cause` (the FIX-936 lens's LOW-2). Under `InRequest` the request
+/// runs its own copy beside this one (each step idempotent; the counters it shares with the request are counted by
+/// the request alone, so a request that waited is counted once); under `PastDeadline` the request answered its 202
+/// and put the deferred job at rest; under `RequestGone` (the request's `AbortSignal` fired during the write) the
+/// job was put at rest on the abort and this write is counted `submit_write_outlived_request_total`. The deferred
+/// job is the second cover (its run is this arm again): it covers a write the platform cuts and a replay the queue
+/// refused. This never evicts an accepted subject.
 #[allow(clippy::too_many_arguments)]
-async fn finish_past_deadline<F, S>(
+async fn finish_past_deadline<F>(
     write: F,
     env: Env,
     tagged: TaggedBEEF,
@@ -774,15 +778,17 @@ async fn finish_past_deadline<F, S>(
     engine_started: f64,
     cause: crate::ef_deferred::AfterAnswer,
 ) where
-    F: std::future::Future<
-        Output = Result<(S, overlay_engine::engine::MutationReport), EngineError>,
-    >,
+    F: std::future::Future<Output = Result<overlay_engine::engine::MutationReport, String>>,
 {
     let outcome = write.await;
     let took = js_sys::Date::now() - engine_started;
+    let word = cause.word();
+    let cover = cause.cover();
+    // the request's own counters, when the request waited, are its own (counted once)
+    let counts = cause != crate::ef_deferred::AfterAnswer::InRequest;
     let Ok(db) = env.d1("OVERLAY_DB") else {
         worker::console_log!(
-            "POST /submit(broadcast-gated): {subject} past-deadline write ended in {took:.0} ms; OVERLAY_DB unavailable for its guard (the deferred job's run guards it)"
+            "POST /submit(broadcast-gated): {subject} {word} write ended in {took:.0} ms; OVERLAY_DB unavailable for its guard ({cover} guards it)"
         );
         return;
     };
@@ -790,14 +796,15 @@ async fn finish_past_deadline<F, S>(
         crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_WRITE_OUTLIVED_REQUEST, 1).await;
     }
     let report = match &outcome {
-        Ok((_, report)) => {
+        Ok(report) => {
             worker::console_log!(
-                "POST /submit(broadcast-gated): {subject} {} write landed after the answer in {took:.0} ms (durable: {}; {} fault(s))",
-                cause.word(),
+                "POST /submit(broadcast-gated): {subject} {word} write landed in {took:.0} ms; its own task's after-write (durable: {}; {} fault(s))",
                 report.is_durable(),
                 report.faults.len()
             );
-            if report.walk_could_not_run.is_some() || !report.landed_walks_could_not_run.is_empty()
+            if counts
+                && (report.walk_could_not_run.is_some()
+                    || !report.landed_walks_could_not_run.is_empty())
             {
                 crate::ops::note_engine_walk(&db, report, "POST /submit").await;
             }
@@ -808,10 +815,10 @@ async fn finish_past_deadline<F, S>(
             Some(report)
         }
         Err(e) => {
-            // the request answers an engine error as its own status and queues nothing; here the deferred job's run
-            // submits it again
+            // the request answers an engine error as its own status and queues nothing; the deferred job's run (when
+            // there is one) submits it again
             worker::console_log!(
-                "POST /submit(broadcast-gated): {subject} past-deadline write answered an error after {took:.0} ms ({e}); the deferred job's run submits it again"
+                "POST /submit(broadcast-gated): {subject} {word} write answered an error after {took:.0} ms ({e}); {cover}"
             );
             None
         }
@@ -822,7 +829,7 @@ async fn finish_past_deadline<F, S>(
         match crate::admit_fast::refused_memo_exists(&db, &subject).await {
             Ok(present) => present,
             Err(e) => {
-                worker::console_log!("POST /submit(broadcast-gated): the refused memo could not be read for {subject} after its past-deadline write ({e}): read as a fresh refusal");
+                worker::console_log!("POST /submit(broadcast-gated): the refused memo could not be read for {subject} after its {word} write ({e}): read as a fresh refusal");
                 true
             }
         }
@@ -838,7 +845,7 @@ async fn finish_past_deadline<F, S>(
                 worker::Date::now().as_millis(),
             )
             .await;
-            if again {
+            if again && counts {
                 crate::ops::bump_counter(
                     &db,
                     crate::ops::COUNTER_SUBMIT_READMITTED_BY_FRESH_ACCEPT,
@@ -847,21 +854,27 @@ async fn finish_past_deadline<F, S>(
                 .await;
             }
             worker::console_log!(
-                "POST /submit(broadcast-gated): {subject} past-deadline write under an open eviction the network had overruled (evicted at {} ms: {}): {}",
+                "POST /submit(broadcast-gated): {subject} {word} write under an open eviction the network had overruled (evicted at {} ms: {}): {}",
                 ev.evicted_at_ms,
                 ev.reason,
-                if again { "readmitted on the second try" } else { "its readmission faulted again; the deferred job's run asks the network again" }
+                if again { "readmitted on the second try".to_string() } else { format!("its readmission faulted again; {cover} asks the network again") }
             );
         }
         Ok(Some(ev)) => {
             let now_ms = worker::Date::now().as_millis();
             let outcome =
                 crate::admit_fast::evict_txid_everywhere(&db, &subject, &ev.reason, now_ms).await;
-            crate::ops::bump_counter(&db, crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1)
+            if counts {
+                crate::ops::bump_counter(
+                    &db,
+                    crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
+                    1,
+                )
                 .await;
+            }
             reevicted = true;
             worker::console_log!(
-                "POST /submit(broadcast-gated): {subject} past-deadline write outran its eviction (evicted at {} ms: {}): re-evicted {} row(s)",
+                "POST /submit(broadcast-gated): {subject} {word} write outran its eviction (evicted at {} ms: {}): re-evicted {} row(s)",
                 ev.evicted_at_ms,
                 ev.reason,
                 outcome.moved
@@ -869,10 +882,12 @@ async fn finish_past_deadline<F, S>(
         }
         Ok(None) => {}
         Err(e) => {
-            crate::ops::bump_counter(&db, crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1)
-                .await;
+            if counts {
+                crate::ops::bump_counter(&db, crate::ops::COUNTER_ADMIT_FAST_LEDGER_UNREADABLE, 1)
+                    .await;
+            }
             worker::console_log!(
-                "POST /submit(broadcast-gated): the eviction ledger could not be read for {subject} after its past-deadline write ({e}); the deferred job's run asks again"
+                "POST /submit(broadcast-gated): the eviction ledger could not be read for {subject} after its {word} write ({e}); {cover} asks again"
             );
         }
     }
@@ -882,9 +897,11 @@ async fn finish_past_deadline<F, S>(
     if let Some(report) = report.filter(|_| !reevicted) {
         let durable = report.is_durable();
         if !durable {
-            crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_FAULT, 1).await;
+            if counts {
+                crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_FAULT, 1).await;
+            }
             worker::console_log!(
-                "POST /submit(broadcast-gated): {subject} past-deadline write NOT DURABLE: {} fault(s): {}: enqueueing an idempotent replay (S2)",
+                "POST /submit(broadcast-gated): {subject} {word} write NOT DURABLE: {} fault(s): {}: enqueueing an idempotent replay (S2)",
                 report.faults.len(),
                 report.summary()
             );
@@ -896,15 +913,21 @@ async fn finish_past_deadline<F, S>(
         {
             crate::queue::MutationAck::Durable => {}
             crate::queue::MutationAck::Queued => {
-                crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_QUEUED, 1).await;
+                if counts {
+                    crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_QUEUED, 1)
+                        .await;
+                }
                 worker::console_log!(
-                    "POST /submit(broadcast-gated): {subject} past-deadline replay QUEUED (S2): the queue is the guarantee"
+                    "POST /submit(broadcast-gated): {subject} {word} replay QUEUED (S2): the queue is the guarantee"
                 );
             }
             crate::queue::MutationAck::Refused(reason) => {
-                crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_REFUSED, 1).await;
+                if counts {
+                    crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_MUTATION_REFUSED, 1)
+                        .await;
+                }
                 worker::console_log!(
-                    "POST /submit(broadcast-gated): {subject} past-deadline write NOT DURABLE and its replay could not be queued ({reason}); the deferred job's run is the cover"
+                    "POST /submit(broadcast-gated): {subject} {word} write NOT DURABLE and its replay could not be queued ({reason}); {cover} is the cover"
                 );
             }
         }
@@ -927,6 +950,9 @@ pub(crate) struct SubmitParts {
     pub(crate) off_chain_values: Option<Vec<u8>>,
     pub(crate) mode_header: Option<String>,
     pub(crate) operator_authed: bool,
+    /// bsv-low #936 (the FIX-936 lens's fold): the request's `AbortSignal`, the gated write's cover trigger; none on
+    /// a deferred job's run.
+    pub(crate) request_signal: crate::owned_write::RequestSignal,
 }
 
 /// NL-6c: the queue consumer's run of a deferred broadcast-gated submission:
@@ -987,6 +1013,7 @@ async fn submit_parts(
         off_chain_values,
         mode_header,
         operator_authed,
+        request_signal,
     } = parts;
     // bsv-low #838: the gated arm's answer deadline runs from here (`ef_deferred::IN_REQUEST_ANSWER_MS`).
     let arm_started_ms = js_sys::Date::now();
@@ -2016,19 +2043,22 @@ async fn submit_parts(
             let write =
                 Box::pin(async move { write_engine.submit_with_report(&write_beef, mode).await });
             // bsv-low #936: the write is OWNED by `ctx.wait_until` from its first statement and the request only
-            // waits on its answer (`handle`). A client that goes away cancels the request, and on eaaee0ec that
-            // dropped the write between `insert_output` and the lookup services' rows (loop 52's `fad01028…`: a
-            // `tm_pot` coin with no `pot_records` or `pot_beefs`, then deleted by the refund's admission, the pot
-            // gone from the index with no eviction record). Gone during the write: the submission is put at rest
-            // as the deferred job at once (the cover of a task the platform itself cuts), and the write's own task
-            // runs what the request would have run after it (`finish_past_deadline`, cause `RequestGone`).
+            // waits on its answer (`handle`). A client that goes away cancels the request, and on eaaee0ec that cut
+            // the write between `insert_output` and the lookup services' rows (loop 52's `fad01028…`: a `tm_pot`
+            // coin with no `pot_records` or `pot_beefs`, then deleted by the refund's admission, the pot gone from
+            // the index with no eviction record). The FIX-936 lens's fold: a cancelled request's future is never
+            // dropped on wasm32, so the write's own task runs the after-write (`finish_past_deadline`: the guard,
+            // S2, the notes, its line and, under `RequestGone`, its counter) on EVERY gated write, and the request's
+            // going is read from its `AbortSignal`: when it fires during the write the submission is put at rest as
+            // the deferred job at once (the cover of a task the platform itself cuts about 30 s later).
             let (cover_env, cover_tagged, cover_subject) =
                 (env.clone(), tagged_beef.clone(), subject.to_string());
             let cover_mode = mode_header.clone().unwrap_or_default();
-            let (orphan_env, orphan_tagged, orphan_subject) =
+            let (after_env, after_tagged, after_subject) =
                 (env.clone(), tagged_beef.clone(), subject.to_string());
             let (task, handle) = crate::owned_write::owned_write(
                 write,
+                request_signal.gone(),
                 move || async move {
                     crate::ef_deferred::defer_request_gone(
                         &cover_env,
@@ -2039,16 +2069,20 @@ async fn submit_parts(
                     )
                     .await;
                 },
-                move |outcome| {
+                move |outcome, cause| {
+                    let outcome = match outcome {
+                        Ok((_, report)) => Ok(report.clone()),
+                        Err(e) => Err(e.to_string()),
+                    };
                     finish_past_deadline(
                         std::future::ready(outcome),
-                        orphan_env,
-                        orphan_tagged,
+                        after_env,
+                        after_tagged,
                         mode,
-                        orphan_subject,
+                        after_subject,
                         door_readmit_failed,
                         engine_started,
-                        crate::ef_deferred::AfterAnswer::RequestGone,
+                        cause,
                     )
                 },
             );
@@ -2057,21 +2091,13 @@ async fn submit_parts(
             let deadline = worker::Delay::from(std::time::Duration::from_millis(left));
             match crate::ef_deferred::within_deadline(handle, deadline).await {
                 crate::ef_deferred::Deadlined::Done(outcome) => outcome,
-                crate::ef_deferred::Deadlined::Past(write) => {
+                crate::ef_deferred::Deadlined::Past(handle) => {
                     worker::console_log!(
-                        "POST /submit(broadcast-gated): {subject} engine write past the arm's {} ms answer deadline (the write was given {left} ms); the write goes on after the answer, the submission is deferred (bsv-low #838)",
+                        "POST /submit(broadcast-gated): {subject} engine write past the arm's {} ms answer deadline (the write was given {left} ms); the write goes on after the answer in its own task, the submission is deferred (bsv-low #838)",
                         crate::ef_deferred::IN_REQUEST_ANSWER_MS
                     );
-                    ctx.wait_until(finish_past_deadline(
-                        write,
-                        env.clone(),
-                        tagged_beef.clone(),
-                        mode,
-                        subject.to_string(),
-                        door_readmit_failed,
-                        engine_started,
-                        crate::ef_deferred::AfterAnswer::PastDeadline,
-                    ));
+                    // the write's own task runs its after-write under `past-deadline` (bsv-low #936's fold)
+                    handle.past_deadline();
                     counters.reason(SubmitReason::Queued);
                     let answer = crate::ef_deferred::defer_past_deadline(
                         env,

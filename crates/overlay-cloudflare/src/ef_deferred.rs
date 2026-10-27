@@ -672,27 +672,40 @@ pub async fn defer_past_deadline<D: std::future::Future>(
     deferral_answer(put, subject_txid, work, 0, DeferralCause::AnswerDeadline)
 }
 
-/// bsv-low #936: why a gated engine write finishes after the request stopped waiting on it.
+/// bsv-low #936: whose after-write the write's own task runs (it runs on every gated write in the request, the
+/// FIX-936 lens's fold), named on every line of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AfterAnswer {
+    /// The write ended while the request still waited; the request runs its own copy beside this one.
+    InRequest,
     /// #838: the write outran the arm's answer deadline; the request answered its 202.
     PastDeadline,
-    /// #936: the request went away (the invocation `canceled`) while the write ran; nobody was answered.
+    /// #936: the request's `AbortSignal` fired (the client went away) while the write ran; nobody was answered.
     RequestGone,
 }
 
 impl AfterAnswer {
-    /// The cause as the after-write's log line names it.
+    /// The cause as the after-write's log lines name it.
     pub fn word(self) -> &'static str {
         match self {
+            Self::InRequest => "in-request",
             Self::PastDeadline => "past-deadline",
             Self::RequestGone => "request-gone",
         }
     }
+
+    /// What covers a write this after-write could not finish, as its lines say it.
+    pub fn cover(self) -> &'static str {
+        match self {
+            Self::InRequest => "the request answers it",
+            Self::PastDeadline => "the deferred job's run",
+            Self::RequestGone => "the deferred job put at rest on the abort",
+        }
+    }
 }
 
-/// bsv-low #936: the cover of a gated write whose request went away while it ran, put at rest at that moment
-/// exactly as #838 puts a write past its deadline at rest (the job delayed past the platform's end of the write's
+/// bsv-low #936: the cover of a gated write whose request went away while it ran (its `AbortSignal` fired), put at
+/// rest at that moment exactly as #838 puts a write past its deadline at rest (the job delayed past the platform's end of the write's
 /// own task): its run is this arm again and finds the write landed (a dedup) or finishes a write the platform cut.
 pub async fn defer_request_gone(
     env: &Env,
@@ -1131,6 +1144,7 @@ pub async fn run_job(
         off_chain_values: off_chain,
         mode_header: Some(job.submit_mode.clone()),
         operator_authed: false,
+        request_signal: crate::owned_write::RequestSignal::none(),
     };
     let hosting_url = env.var("HOSTING_URL").ok().map(|v| v.to_string());
     let arcade_url = env.var("ARCADE_URL").ok().map(|v| v.to_string());
@@ -1438,9 +1452,10 @@ mod fix838 {
             .expect("what is left of the arm's deadline");
         assert!(start < left && left < race);
         let past = &parts[race..];
-        let hand = past
-            .find("ctx.wait_until(finish_past_deadline(")
-            .expect("handed on");
+        // bsv-low #936's fold: the write's own task (spawned before the race) runs the after-write; past the
+        // deadline the request marks the handle so its line names `past-deadline`
+        assert!(parts[..race].contains("ctx.wait_until(task);"));
+        let hand = past.find("handle.past_deadline();").expect("handed on");
         let defer = past
             .find("crate::ef_deferred::defer_past_deadline(")
             .expect("deferred");
