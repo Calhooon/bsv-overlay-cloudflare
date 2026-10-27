@@ -236,6 +236,7 @@ pub fn owed_events_view(
         "publishedTotal": c("owed_events_published_total"),
         "publishSkipped": c("owed_events_publish_skipped_total"),
         "publishFaults": c("owed_events_publish_faults_total"),
+        "publishWallDrops": c("owed_events_publish_wall_drops_total"),
         "consumedTotal": c("owed_events_consumed_total"),
         "ackedMarks": c("owed_events_acked_marks_total"),
         "judgeFaults": c("owed_events_judge_faults_total"),

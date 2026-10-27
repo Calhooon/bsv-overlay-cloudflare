@@ -364,6 +364,30 @@ mod pins {
         }
     }
 
+    /// LOW-7 and LOW-9 (the D2-ACTOR-A lens): a publish dropped at the answer wall is counted (on the isolate, written
+    /// with its next publish, served `publishWallDrops`), and with no queue binding the notes are dropped, never kept
+    /// for the isolate's life. RED on 59d98ec6: no wall counter, the no-port arm returns with the notes held.
+    #[test]
+    fn d2_actor_a_fold_l7_l9_the_wall_drop_is_counted_and_no_port_keeps_no_notes() {
+        let _ = take_wall_drops();
+        note_wall_drop();
+        note_wall_drop();
+        assert_eq!(take_wall_drops(), 2);
+        assert_eq!(take_wall_drops(), 0);
+        assert!(COUNTERS.contains(&COUNTER_WALL_DROPS));
+        let view = crate::applayer_counters::owed_events_view(
+            &json!({ COUNTER_WALL_DROPS: 3 }),
+            Value::Null,
+        );
+        assert_eq!(view["publishWallDrops"], 3);
+        let src = include_str!("owed_events.rs");
+        let wall = fn_body(src, "pub async fn publish_before_answer(");
+        assert!(wall.contains("Either::Right(_)=>{note_wall_drop();"));
+        let env = fn_body(src, "pub async fn publish_env(");
+        assert!(env.contains("let_=drain();returnframes;"));
+        assert!(env.contains("(COUNTER_WALL_DROPS,take_wall_drops()),"));
+    }
+
     /// The facts of every source read under the shipped schema (a column renamed is a red here, not a fault at publish).
     #[test]
     fn d2_actor_a_every_facts_read_prepares_on_the_shipped_schema() {
