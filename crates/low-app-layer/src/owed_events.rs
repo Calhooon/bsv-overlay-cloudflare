@@ -52,7 +52,7 @@ pub const SWEEP_CURSOR_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tick
 /// the pass-meter precedent), served on `/health.owedEvents` and the overlay's `/health/invariants.owedEvents`.
 pub const CONSUMER_ROW_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:consumer',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// The served ages and totals, one batch of key reads.
-pub const HEALTH_COUNTERS_SQL: &str = "SELECT name,value FROM ops_counters WHERE name IN ('owed_events_published_total','owed_events_consumed_total','owed_events_acked_marks_total','owed_events_dlq_total','owed_events_publish_faults_total','owed_events_judge_faults_total','owed_events_swept_total','owed_events_fault_held_total','owed_events_sweep_held_total')";
+pub const HEALTH_COUNTERS_SQL: &str = "SELECT name,value FROM ops_counters WHERE name IN ('owed_events_published_total','owed_events_consumed_total','owed_events_acked_marks_total','owed_events_dlq_total','owed_events_publish_faults_total','owed_events_judge_faults_total','owed_events_swept_total','owed_events_fault_held_total','owed_events_sweep_held_total','owed_events_publish_wall_drops_total')";
 /// The consumer's row.
 pub const HEALTH_CONSUMER_SQL: &str =
     "SELECT cursor,tickedAtMs FROM owed_belt_state WHERE name='owed-events:consumer'";
@@ -833,6 +833,7 @@ pub async fn health(db: &impl SqlPort) -> Value {
         "consumerAtMs": consumer.as_ref().map(|c| c["atMs"].clone()),
         "dlqTotal": counter("owed_events_dlq_total"),
         "publishFaults": counter("owed_events_publish_faults_total"),
+        "publishWallDrops": counter("owed_events_publish_wall_drops_total"),
         "judgeFaults": counter("owed_events_judge_faults_total"),
         "sweptTotal": counter("owed_events_swept_total"),
         "faultHeld": counter("owed_events_fault_held_total"),
