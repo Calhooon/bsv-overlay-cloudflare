@@ -584,11 +584,30 @@ async fn owed893_word_event_judges_sixteen_of_forty_marked_subjects() {
         db.conn.borrow().execute("INSERT INTO owed_row_words(identity,outpoint,role,txid) VALUES('owner',?1,'settle',?2)", rusqlite::params![format!("{pot}:0"), word_txid]).unwrap();
     }
     db.exec("DELETE FROM owed_dirty");
-    let row = serde_json::from_value(
-        json!({"txid":word_txid,"word":"seen","tier":"courier","updated_at":1_790_000_000}),
+    // bsv-low #934 (the READ-934 lens's LOW-3): the frame lands the word through `ingest_frame`, then the judge runs
+    let frame = json!({"txid": word_txid, "kind": "seen"});
+    let detached = RefCell::new(Vec::new());
+    ingest_frame(
+        &frame,
+        |id, _kind, _body| {
+            let db = &db;
+            async move {
+                let row: low_app_layer::tracker_host::stored::Row = serde_json::from_value(
+                    json!({"txid":id,"word":"seen","tier":"courier","updated_at":1_790_000_000}),
+                )
+                .unwrap();
+                land_word(db, &row)
+                    .await
+                    .map_err(worker::Error::RustError)?;
+                Ok(Some(row))
+            }
+        },
+        |txid| detached.borrow_mut().push(txid),
     )
+    .await
     .unwrap();
-    let report = judge::judge_word_write(&db, &row).await.unwrap();
+    assert_eq!(*detached.borrow(), vec![word_txid.clone()]);
+    let report = judge::judge_written_word(&db, &word_txid).await.unwrap();
     assert!(report.faults.is_empty(), "{:?}", report.faults);
     assert_eq!(report.subjects, 16);
     assert_eq!(db.pushes.borrow().len(), 16);
@@ -817,4 +836,119 @@ async fn read934_a_word_frame_is_answered_once_written_never_after_its_judge() {
     assert!(report.faults.is_empty(), "{:?}", report.faults);
     assert_eq!(report.subjects, 16);
     assert_eq!(db.count("owed_dirty"), 24);
+}
+
+/// bsv-low #934 (the READ-934 lens's LOW-1): one detached judge per isolate. 128 word frames, each naming one subject,
+/// ingested while a SLOW judge (a second before each run) holds the isolate's gate: every frame is answered held inside
+/// 2 s with its word written and its subject marked; exactly one judge was claimed (127 frames judged nothing); the
+/// judge's one re-run takes the 127 kept txids under what its first run left of the invocation's sixteen (15), so the
+/// invocation judged 16 subjects and 112 stay marked; released, the next frame claims again; the scheduled drain's
+/// passes find the 112. RED with the gate inert (`claim` answering `true`): 128 judges claimed.
+#[tokio::test(start_paused = true)]
+async fn read934f_l1_one_detached_judge_per_isolate_the_rest_left_marked() {
+    let db = Db::new();
+    let word = |n: usize| format!("f{n:063x}");
+    for n in 0..128 {
+        let game = format!("g{n:03}");
+        let pot = format!("{n:064x}");
+        db.seed_game(&game, &pot);
+        db.conn.borrow().execute("INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs) VALUES('owner',?1,'unbound',?2,'{}',0)", rusqlite::params![format!("{pot}:0"), game]).unwrap();
+        db.conn.borrow().execute("INSERT INTO owed_row_words(identity,outpoint,role,txid) VALUES('owner',?1,'settle',?2)", rusqlite::params![format!("{pot}:0"), word(n)]).unwrap();
+    }
+    db.exec("DELETE FROM owed_dirty");
+    let frames: Vec<Value> = (0..128)
+        .map(|n| json!({"txid": word(n), "kind": "seen"}))
+        .collect();
+    let gate = DetachedJudgeGate::new();
+    let claimed = RefCell::new(Vec::new());
+    let apply = |id: String, _kind: String, _body: Option<Value>| {
+        let db = &db;
+        async move {
+            let row: low_app_layer::tracker_host::stored::Row = serde_json::from_value(
+                json!({"txid":id,"word":"seen","tier":"courier","updated_at":1_790_000_000}),
+            )
+            .unwrap();
+            land_word(db, &row)
+                .await
+                .map_err(worker::Error::RustError)?;
+            Ok(Some(row))
+        }
+    };
+    // the route's closure: claim, else leave the marks
+    let detach = |txid: String| {
+        if gate.claim(&txid) {
+            claimed.borrow_mut().push(txid);
+        }
+    };
+    let first = ingest_frame(&frames[0], apply, detach).await.unwrap();
+    assert!(bsv_overlay_cloudflare::tracker_events::answered_held(
+        &first.to_string()
+    ));
+    let owner = claimed.borrow()[0].clone();
+    let runs = Cell::new(0usize);
+    let slow = |txids: Vec<String>, limit: usize| {
+        let db = &db;
+        runs.set(runs.get() + 1);
+        async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            judge::judge_written_words(db, &txids, limit)
+                .await
+                .map(|r| r.subjects)
+                .map_err(worker::Error::RustError)
+        }
+    };
+    let marked_at_answers = Cell::new(0i64);
+    let (rerun, answers) = tokio::join!(detached_judge_run(&gate, owner, slow), async {
+        let answers = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            futures_util::future::join_all(
+                frames[1..].iter().map(|f| ingest_frame(f, apply, detach)),
+            ),
+        )
+        .await
+        .expect("every frame is answered inside 2 s");
+        marked_at_answers.set(db.count("owed_dirty"));
+        answers
+    });
+    gate.release();
+    for answer in answers {
+        assert!(bsv_overlay_cloudflare::tracker_events::answered_held(
+            &answer.unwrap().to_string()
+        ));
+    }
+    assert_eq!(claimed.borrow().len(), 1, "exactly one judge per isolate");
+    assert_eq!(
+        db.count("tx_words"),
+        128,
+        "every word written before its answer"
+    );
+    assert_eq!(
+        marked_at_answers.get(),
+        128,
+        "every subject marked at the answers"
+    );
+    assert!(
+        rerun.unwrap(),
+        "the judge ran once more over the frames kept"
+    );
+    assert_eq!(runs.get(), 2, "the first run and one re-run, never more");
+    assert_eq!(
+        db.count("owed_dirty"),
+        112,
+        "sixteen judged in the invocation"
+    );
+    assert!(
+        !gate.running() && gate.claim(&word(0)),
+        "released, the next frame claims"
+    );
+    gate.release();
+    // the scheduled drain's passes find the rest
+    let all: Vec<String> = (0..128).map(word).collect();
+    let mut passes = 0;
+    while db.count("owed_dirty") > 0 {
+        let r = judge::judge_written_words(&db, &all, 16).await.unwrap();
+        assert!(r.faults.is_empty() && r.subjects > 0, "{:?}", r.faults);
+        passes += 1;
+    }
+    assert_eq!(passes, 7);
 }

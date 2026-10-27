@@ -724,18 +724,137 @@ pub async fn land_word(
 /// bsv-low #934 (READ-934): the judgement of a landed word, its marked subjects (at most sixteen) over D1 with the
 /// verified tip; a subject that faults keeps its mark for the drain.
 pub async fn judge_word(env: &worker::Env, txid: &str) -> worker::Result<()> {
+    judge_words(
+        env,
+        vec![txid.to_string()],
+        crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// bsv-low #934 (the READ-934 lens's LOW-1): [`judge_word`] over several landed words, at most `limit` subjects;
+/// answers the subjects it judged.
+pub async fn judge_words(
+    env: &worker::Env,
+    txids: Vec<String>,
+    limit: usize,
+) -> worker::Result<usize> {
     let tip = crate::routes::chaintracks_present_height_env(env, "owed")
         .await
         .ok();
     let judge =
         crate::owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))?;
-    let report = crate::owed_judge::judge_written_word(&judge, txid)
+    let report = crate::owed_judge::judge_written_words(&judge, &txids, limit)
         .await
         .map_err(worker::Error::RustError)?;
     for (_, error) in report.faults {
         worker::console_warn!("[owed] word judgement deferred: {error}");
     }
-    Ok(())
+    Ok(report.subjects)
+}
+
+/// bsv-low #934 (the READ-934 lens's LOW-1): one detached word judge per isolate at a time. A frame whose write landed
+/// while a judge runs starts no second judge: its marks are already in `owed_dirty` (the `tx_words` triggers wrote
+/// them in the writer's statement), its txid is kept here, and the running judge, at its end, runs ONCE more over
+/// those txids under the same wall, inside what its first run left of the invocation's sixteen subjects. What is left
+/// after that is the scheduled drain's (the belt actor's alarm, the scheduled pass). Before the fold one drain pass of
+/// the producer's 128 frames started up to 128 detached judges, each bounded only by its 17 s wall, all reading D1
+/// and CHAINTRACKS at once; under L52's burst none would have committed in its wall.
+pub struct DetachedJudgeGate {
+    running: std::sync::atomic::AtomicBool,
+    pending: std::sync::Mutex<BTreeSet<String>>,
+}
+
+/// The txids a running judge keeps for its re-run; a frame past it leaves its marks to the drain alone.
+pub const DETACHED_JUDGE_PENDING_MAX: usize = 128;
+
+/// The isolate's gate (`/internal/tx-word`).
+pub static DETACHED_JUDGE: DetachedJudgeGate = DetachedJudgeGate::new();
+
+pub const COUNTER_DETACHED_JUDGE_RUNS: &str = "tracker_detached_judge_runs_total";
+pub const COUNTER_DETACHED_JUDGE_RERUN: &str = "tracker_detached_judge_rerun_total";
+pub const COUNTER_DETACHED_JUDGE_SKIPPED: &str = "tracker_detached_judge_skipped_total";
+
+impl Default for DetachedJudgeGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DetachedJudgeGate {
+    pub const fn new() -> Self {
+        Self {
+            running: std::sync::atomic::AtomicBool::new(false),
+            pending: std::sync::Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    /// `true`: the caller now owns the isolate's judge and must [`Self::release`] it when the run ends (ran, faulted
+    /// or walled). `false`: a judge runs; `txid` is kept for its re-run (bounded) and the frame judges nothing.
+    pub fn claim(&self, txid: &str) -> bool {
+        use std::sync::atomic::Ordering;
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return true;
+        }
+        if let Ok(mut pending) = self.pending.lock() {
+            if pending.len() < DETACHED_JUDGE_PENDING_MAX {
+                pending.insert(txid.to_string());
+            }
+        }
+        crate::courier::note_presence(COUNTER_DETACHED_JUDGE_SKIPPED);
+        false
+    }
+
+    /// The txids kept while the judge ran, taken once (its re-run).
+    pub fn take_pending(&self) -> Vec<String> {
+        self.pending
+            .lock()
+            .map(|mut p| std::mem::take(&mut *p).into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// The run ended: what is still kept is the drain's, and the next frame may start a judge.
+    pub fn release(&self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.clear();
+        }
+        self.running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// The owned run of [`DetachedJudgeGate`]: the frame's own word judged (at most sixteen subjects), then at most ONE
+/// re-run over the words that landed meanwhile, limited to what the first run left of the sixteen, so one invocation
+/// never judges more than the hook's sixteen. `judge(txids, limit)` answers the subjects it judged. Answers whether the
+/// re-run ran.
+pub async fn detached_judge_run<J, JF>(
+    gate: &DetachedJudgeGate,
+    txid: String,
+    mut judge: J,
+) -> worker::Result<bool>
+where
+    J: FnMut(Vec<String>, usize) -> JF,
+    JF: std::future::Future<Output = worker::Result<usize>>,
+{
+    let cap = crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION;
+    crate::courier::note_presence(COUNTER_DETACHED_JUDGE_RUNS);
+    let judged = judge(vec![txid], cap).await?;
+    let pending = gate.take_pending();
+    if pending.is_empty() || judged >= cap {
+        return Ok(false);
+    }
+    crate::courier::note_presence(COUNTER_DETACHED_JUDGE_RERUN);
+    judge(pending, cap - judged).await?;
+    Ok(true)
 }
 
 /// bsv-low #934 (READ-934): one `/internal/tx-word` frame's answer, built once `apply` (the word event, which lands
@@ -774,14 +893,23 @@ pub async fn ingest(
         &frame,
         |id, kind, body| async move { event(env, &id, &kind, body.as_ref(), None).await },
         |txid| {
+            // the READ-934 lens's LOW-1: one detached judge per isolate; a frame landed meanwhile leaves its marks
+            if !DETACHED_JUDGE.claim(&txid) {
+                return;
+            }
             let env = env.clone();
             ctx.wait_until(async move {
                 let deadline = crate::routes::worker_deadline(
                     crate::owed_belt::OWED_DRAIN_WALL_MS,
                     crate::owed_belt::OWED_DRAIN_RESERVE_MS,
                 );
-                match deadline.run_reserving(judge_word(&env, &txid)).await {
-                    Some(Ok(())) => {}
+                let run = detached_judge_run(&DETACHED_JUDGE, txid, |txids, limit| {
+                    judge_words(&env, txids, limit)
+                });
+                let outcome = deadline.run_reserving(run).await;
+                DETACHED_JUDGE.release();
+                match outcome {
+                    Some(Ok(_)) => {}
                     Some(Err(error)) => {
                         worker::console_warn!("[owed] word judgement deferred: {error}")
                     }
@@ -807,6 +935,9 @@ pub fn tracker_mirrored_counter_names() -> Vec<String> {
     vec![
         COUNTER_TRACKER_EVENT_UNHELD.to_string(),
         SPEND_DEPTH_MALFORMED_COUNTER.to_string(),
+        COUNTER_DETACHED_JUDGE_RUNS.to_string(),
+        COUNTER_DETACHED_JUDGE_RERUN.to_string(),
+        COUNTER_DETACHED_JUDGE_SKIPPED.to_string(),
     ]
 }
 

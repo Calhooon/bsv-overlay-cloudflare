@@ -222,6 +222,11 @@ pub fn names() -> Vec<String> {
     v.push("applayer_tracker_event_unheld_total".to_string());
     // bsv-low #862 (L7-DEPTH): a missing or malformed SPEND_DEPTH var (the floor served), once per isolate
     v.push("spend_depth_var_malformed_total".to_string());
+    // bsv-low #934 (the READ-934 lens's LOW-1, LOW-4): the detached word judge's runs, re-runs and the frames that
+    // found one running (their marks left to it and the drain)
+    v.push("tracker_detached_judge_runs_total".to_string());
+    v.push("tracker_detached_judge_rerun_total".to_string());
+    v.push("tracker_detached_judge_skipped_total".to_string());
     v
 }
 

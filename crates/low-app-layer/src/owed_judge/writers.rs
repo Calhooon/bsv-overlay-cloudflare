@@ -58,12 +58,36 @@ pub async fn drain_changed(
     keys: &[String],
     source: &str,
 ) -> Result<DrainReport, String> {
-    let candidates: Vec<Value> = hydrate::read(db,
+    drain_changed_within(
+        db,
+        identities,
+        keys,
+        source,
+        OWED_JUDGE_SUBJECTS_PER_INVOCATION,
+    )
+    .await
+}
+
+/// [`drain_changed`] under a subject limit of its own (at most the hook's sixteen): the detached word judge's re-run
+/// takes what its first run left of the invocation's sixteen (bsv-low #934, the READ-934 lens's LOW-1).
+pub async fn drain_changed_within(
+    db: &impl JudgeDb,
+    identities: &[String],
+    keys: &[String],
+    source: &str,
+    limit: usize,
+) -> Result<DrainReport, String> {
+    let limit = limit.min(OWED_JUDGE_SUBJECTS_PER_INVOCATION);
+    if limit == 0 {
+        return Ok(DrainReport::default());
+    }
+    let candidates: Vec<Value> = hydrate::read(
+        db,
         CHANGED_SQL,
         vec![
             Bind::Text(json!(identities).to_string()),
             Bind::Text(json!(keys).to_string()),
-            Bind::Int(OWED_JUDGE_SUBJECTS_PER_INVOCATION as i64),
+            Bind::Int(limit as i64),
         ],
     )
     .await?;
@@ -91,16 +115,6 @@ pub async fn drain_changed(
     Ok(report)
 }
 
-/// The word lands first, so the trigger and the hydration see the same accepted UPSERT.
-/// A refused downgrade therefore cannot be applied to the inputs by accident.
-pub async fn judge_word_write(
-    db: &impl JudgeDb,
-    row: &crate::tracker_host::stored::Row,
-) -> Result<DrainReport, String> {
-    write_word(db, row).await?;
-    judge_written_word(db, &row.txid).await
-}
-
 /// bsv-low #934 (READ-934): the word's write alone, the tracker's UPSERT in its own batch. Its `tx_words` triggers write
 /// the marks of every subject naming the word, so the write is durable and judgeable before any judge runs.
 pub async fn write_word(
@@ -126,5 +140,16 @@ pub async fn write_word(
 /// bsv-low #934 (READ-934): the judgement of a written word, its marked subjects by the word's txid (at most the hook's
 /// sixteen), after the write and never inside the frame's answer.
 pub async fn judge_written_word(db: &impl JudgeDb, txid: &str) -> Result<DrainReport, String> {
-    drain_changed(db, &[], &[txid.to_string()], "word").await
+    judge_written_words(db, &[txid.to_string()], OWED_JUDGE_SUBJECTS_PER_INVOCATION).await
+}
+
+/// bsv-low #934 (the READ-934 lens's LOW-1): the judgement of several written words at once, their marked subjects
+/// by the words' txids, at most `limit` (itself at most the hook's sixteen): the detached judge's re-run over the
+/// frames that landed while it ran.
+pub async fn judge_written_words(
+    db: &impl JudgeDb,
+    txids: &[String],
+    limit: usize,
+) -> Result<DrainReport, String> {
+    drain_changed_within(db, &[], txids, "word", limit).await
 }

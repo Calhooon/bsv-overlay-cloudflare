@@ -2624,9 +2624,20 @@ pub(crate) mod tests {
         }
         let land = section("pub async fn land_word(", "pub async fn judge_word(");
         assert!(land.contains("write_word(db, row)"));
-        assert!(!land.contains("judge_word_write") && !land.contains("drain_changed"));
+        assert!(!land.contains("judge_written") && !land.contains("drain_changed"));
         let ingest = section("pub async fn ingest(", "/// bsv-low #660");
-        assert!(ingest.contains("ctx.wait_until(") && ingest.contains("judge_word(&env, &txid)"));
+        // the READ-934 lens's LOW-1: one detached judge per isolate, claimed before it is detached, released after
+        // its wall whatever the outcome
+        let claim = ingest.find("if !DETACHED_JUDGE.claim(&txid)").unwrap();
+        let wait = ingest.find("ctx.wait_until(").unwrap();
+        let release = ingest.find("DETACHED_JUDGE.release();").unwrap();
+        let wall = ingest.find("deadline.run_reserving(run).await").unwrap();
+        assert!(
+            claim < wait && wall < release,
+            "claim, detach, wall, release"
+        );
+        assert!(ingest.contains("detached_judge_run(&DETACHED_JUDGE, txid,"));
+        assert!(ingest.contains("judge_words(&env, txids, limit)"));
         let tick = section("pub async fn tick(", "/// Host pacing");
         assert!(
             tick.contains("judge_word(env, &word.txid)"),

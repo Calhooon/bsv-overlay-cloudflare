@@ -531,7 +531,8 @@ ci-d1-budget: gate-output-dirs
 	IA=$$((B+13)); IO=$$((B+14)); ID=$$((B+15)); PR=$$((B+16)); IR=$$((B+17)); PS=$$((B+18)); \
 	app_log=$${TMPDIR:?}/lane499-d1-$$B-app.log; ov_log=$${TMPDIR:?}/lane499-d1-$$B-overlay.log; seed_log=$${TMPDIR:?}/lane499-d1-$$B-seed.log; \
 	dv_log=$${TMPDIR:?}/lane499-d1-$$B-delivering.log; rv_log=$${TMPDIR:?}/lane499-d1-$$B-retire.log; \
-	: > "$$app_log"; : > "$$ov_log"; : > "$$dv_log"; : > "$$rv_log"; \
+	tw_log=$${TMPDIR:?}/lane499-d1-$$B-lane934.log; PW=$$((B+26)); \
+	: > "$$app_log"; : > "$$ov_log"; : > "$$dv_log"; : > "$$rv_log"; : > "$$tw_log"; \
 	state=$$(mktemp -d $${TMPDIR:?}/lane499-d1-state.XXXXXX); ov_state=$$(mktemp -d $${TMPDIR:?}/lane499-d1-ovstate.XXXXXX); \
 	dv_state=$$(mktemp -d $${TMPDIR:?}/lane499-d1-dvstate.XXXXXX); seed_v3=$$(mktemp -d $${TMPDIR:?}/lane499-d1-seedv3.XXXXXX); \
 	rv_state=$$(mktemp -d $${TMPDIR:?}/lane499-d1-rvstate.XXXXXX); \
@@ -560,11 +561,11 @@ ci-d1-budget: gate-output-dirs
 	egress_diag() { \
 	  [ -s "$$app_log" ] && [ -z "$$guard_ran" ] || return 0; \
 	  echo "→ ci-d1-budget: a cell red; the egress guard over the logs so far (a red that rested on mainnet is named here):"; \
-	  node tools/lane-731/egress_guard.mjs "app-layer=$$app_log" "overlay=$$ov_log" "delivering-overlay=$$dv_log" "retire-overlay=$$rv_log" || true; \
+	  node tools/lane-731/egress_guard.mjs "app-layer=$$app_log" "overlay=$$ov_log" "delivering-overlay=$$dv_log" "retire-overlay=$$rv_log" "lane934-app-layer=$$tw_log" || true; \
 	}; \
 	trap 'cleanup; exit 130' INT TERM; \
 	trap '_rc=$$?; if [ $$_rc -ne 0 ]; then egress_diag; fi; cleanup' EXIT; \
-	for _pt in $$PA $$PO $$PD $$PM $$IA $$IO $$ID $$PR $$IR $$PS; do \
+	for _pt in $$PA $$PO $$PD $$PM $$IA $$IO $$ID $$PR $$IR $$PS $$PW $$((PW+1)) $$((PW+2)); do \
 	  _held=$$(lsof -nP -tiTCP:$$_pt -sTCP:LISTEN 2>/dev/null || true); \
 	  if [ -n "$$_held" ]; then \
 	    echo "✗ ci-d1-budget: :$$_pt is ALREADY BOUND before we start, refusing to run (a stale worker would answer)."; \
@@ -673,10 +674,12 @@ ci-d1-budget: gate-output-dirs
 	node tools/lane-837/join_hop_pass_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
 	node tools/lane-834/janitor_pacing_budget_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
 	node tools/lane-920/eviction_landing_route_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
+	echo "→ ci-d1-budget: the #934 cell (/internal/tx-word under 128 frames at once, a slow CHAINTRACKS, its own app layer on :$$PW)"; \
+	env $$seal node tools/lane-934/tx_word_burst_route_ci.mjs $$PW "$$tw_log"; \
 	echo "→ ci-d1-budget: the owed belt tier (owed-belt-tick, -429, owed-tip-mark, owed-belt-tick-fleet: bsv-low D2-OWED-DELTA-4 D4-N2)"; \
 	env $$seal LANE_BASE=$$((B+20)) bash tools/lane-893/owed_belt_tick.sh; \
 	guard_ran=1; \
-	node tools/lane-731/egress_guard.mjs "app-layer=$$app_log" "overlay=$$ov_log" "delivering-overlay=$$dv_log" "retire-overlay=$$rv_log"
+	node tools/lane-731/egress_guard.mjs "app-layer=$$app_log" "overlay=$$ov_log" "delivering-overlay=$$dv_log" "retire-overlay=$$rv_log" "lane934-app-layer=$$tw_log"
 
 # DEPLOY-PATH coverage (bsv-low #348). PART OF `ci`, and the reason is the
 # whole issue: `low-app-layer` was UNDEPLOYABLE for a month while `make ci`
