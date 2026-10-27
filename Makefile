@@ -639,7 +639,7 @@ ci-d1-budget: gate-output-dirs
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PD/listTopicManagers "$$dv_log" "delivering overlay"; \
 	tap $$ID delivering-overlay; \
-	echo "→ starting wrangler dev :$$PR (the retire overlay of the #831 and #834 cells, its couriers sunk to each cell's stand-in on :$$PS)…"; \
+	echo "→ starting wrangler dev :$$PR (the retire overlay of the #831, #834 and #920 cells, its couriers sunk to each cell's stand-in on :$$PS)…"; \
 	( cd crates/overlay-cloudflare && exec env $$seal npx wrangler dev --local --log-level debug --port $$PR --inspector-port $$IR --ip 127.0.0.1 --persist-to "$$rv_state" \
 	    --var ARCADE_URL:http://127.0.0.1:$$PS/arcade \
 	    --var COURIER_SINK:http://127.0.0.1:$$PS \
@@ -647,6 +647,7 @@ ci-d1-budget: gate-output-dirs
 	    --var INTERNAL_TOKEN:ci-internal-tok \
 	    --var ADMIN_TOKEN:ci-admin-tok \
 	    --var MAINNET_FANOUT:false \
+	    --var TAAL_API_KEY:ci-lane-920-arc-ingest \
 	) > "$$rv_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PR/listTopicManagers "$$rv_log" "retire overlay"; \
@@ -669,6 +670,7 @@ ci-d1-budget: gate-output-dirs
 	node tools/lane-831/retire_pass_budget_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
 	node tools/lane-837/join_hop_pass_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
 	node tools/lane-834/janitor_pacing_budget_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
+	node tools/lane-920/eviction_landing_route_ci.mjs http://127.0.0.1:$$PR "$$rv_state" $$PS; \
 	echo "→ ci-d1-budget: the owed belt tier (owed-belt-tick, -429, owed-tip-mark, owed-belt-tick-fleet: bsv-low D2-OWED-DELTA-4 D4-N2)"; \
 	env $$seal LANE_BASE=$$((B+20)) bash tools/lane-893/owed_belt_tick.sh; \
 	guard_ran=1; \
