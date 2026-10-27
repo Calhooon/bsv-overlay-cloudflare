@@ -74,12 +74,13 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..409]), 740_971_678);
     // bsv-low #911 (D2-ACTOR-A) appends four: the owed events' counter, their dead letters, the hop facts' index and
     // the cost bar's queue column; the 469 before them are untouched. The D2-ACTOR-A lens fold re-keyed the dead
-    // letters by pair in place (MEDIUM-2, LOW-4; the four shipped nowhere): 1,223,941,910 then 751,808,187.
+    // letters by pair in place (MEDIUM-2, LOW-4; the four shipped nowhere): 1,223,941,910 then 751,808,187; the delta lens fold gave them
+    // `redrivenAt` in place (LOW-C): 1,823,919,051.
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..469]), 889_593_182);
     const COUNT: usize = 473;
     assert_eq!(OVERLAY_MIGRATIONS.len(), COUNT);
     assert_eq!(d1::OVERLAY_MIGRATION_COUNT, COUNT);
-    const FINGERPRINT: u32 = 751_808_187;
+    const FINGERPRINT: u32 = 1_823_919_051;
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT, "the certified fingerprint");
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT);
     assert_eq!(fingerprint(OVERLAY_MIGRATIONS), FINGERPRINT);
