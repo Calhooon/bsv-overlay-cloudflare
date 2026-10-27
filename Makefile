@@ -8,6 +8,9 @@
 # The harness's admin bearer: seeded into `wrangler dev`, read by
 # reference/docker-compose.yml (same default) and carried by the
 # parity-harness/corpus/admin/*.json fixtures. Override both sides together.
+# Keep all gate scratch on the host's selected volume, including Linux tier hosts.
+export TMPDIR := $(or $(TMPDIR),$(HOME)/bsv/targets/tmp)
+
 ADMIN_TOKEN ?= parity-harness-token
 export ADMIN_TOKEN
 
@@ -119,7 +122,7 @@ test:
 # Check the SUCCESS MARKER in a separate command — a pipe returns the pipe's
 # exit code, never the build's.
 ci:
-	@set -e; \
+	@set -e; mkdir -p "$${TMPDIR}"; \
 	bash scripts/check-config-ids.sh --self-test; \
 	bash scripts/check-config-ids.sh; \
 	python3 scripts/check-storage-ownership.py --self-test; \
@@ -244,17 +247,17 @@ ownership:
 ROUTE_UP_TRIES ?= 60
 ROUTE_UP_SLEEP ?= 3
 ci-route: ci-d1-budget ci-d1-board
-	@set -e; \
+	@set -e; mkdir -p "$${TMPDIR}"; \
 	B=$${LANE_BASE:-8791}; P1=$$B; P2=$$((B+1)); P3=$$((B+2)); P4=$$((B+3)); P5=$$((B+4)); P6=$$((B+5)); P7=$$((B+6)); P8=$$((B+7)); P9=$$((B+8)); P10=$$((B+11)); P11=$$((B+12)); \
-	strict_log=/tmp/lane347-route-$$B-strict.log; \
-	kill_log=/tmp/lane347-route-$$B-kill.log; \
-	lenient_log=/tmp/lane366-route-$$B-lenient.log; \
-	arc_log=/tmp/lane-arc-ingest-route-$$B.log; \
-	seen_log=/tmp/lane371-route-$$B-seen.log; \
-	door_log=/tmp/lane-script-route-$$B-door.log; \
-	door_off_log=/tmp/lane-script-route-$$B-door-off.log; \
-	ef_log=/tmp/lane-nl6c-route-$$B-ef.log; \
-	ef_state=$$(mktemp -d /tmp/lane-nl6c-route-$$B-state.XXXXXX); \
+	strict_log=$${TMPDIR}/lane347-route-$$B-strict.log; \
+	kill_log=$${TMPDIR}/lane347-route-$$B-kill.log; \
+	lenient_log=$${TMPDIR}/lane366-route-$$B-lenient.log; \
+	arc_log=$${TMPDIR}/lane-arc-ingest-route-$$B.log; \
+	seen_log=$${TMPDIR}/lane371-route-$$B-seen.log; \
+	door_log=$${TMPDIR}/lane-script-route-$$B-door.log; \
+	door_off_log=$${TMPDIR}/lane-script-route-$$B-door-off.log; \
+	ef_log=$${TMPDIR}/lane-nl6c-route-$$B-ef.log; \
+	ef_state=$$(mktemp -d $${TMPDIR}/lane-nl6c-route-$$B-state.XXXXXX); \
 	job_pids=""; owned_ports=""; \
 	kill_tree() { \
 	  for _c in $$(pgrep -P "$$1" 2>/dev/null); do kill_tree "$$_c"; done; \
@@ -431,8 +434,8 @@ ci-route: ci-d1-budget ci-d1-board
 # bsv-low #674, the cutoff: each board again under an era cutoff (`w1500cut`, `w3000cut`), the seed's last statement the
 # stamp, so the re-derivation runs on local D1 and the requests are the table read under the cutoff (flat between them).
 ci-d1-board:
-	@set -e; \
-	dir=$$(mktemp -d "$${TMPDIR:-/tmp}/lane642-board.XXXXXX"); \
+	@set -e; mkdir -p "$${TMPDIR}"; \
+	dir=$$(mktemp -d "$${TMPDIR}/lane642-board.XXXXXX"); \
 	trap 'rm -rf "$$dir"' EXIT; \
 	LB642_D1_PIN="$$dir" cargo test -q $(WORKERS) -p low-app-layer --lib lb642_emit_the_d1_cell -- --ignored > "$$dir/emit.log" 2>&1 \
 	  || { echo "✗ ci-d1-board: the emit failed"; cat "$$dir/emit.log"; exit 1; }; \
@@ -482,9 +485,9 @@ ci-d1-board:
 # bounded wait and owned teardown as `ci-route` (its comment above has the why). No leg needs the network (the NO
 # EGRESS paragraph below proves it): no fixture pot is spent, the app layer's service bindings are absent (its tip
 # reads answer 503 and the views serve without a tip), and the overlay's ARCADE_URL is a closed local port. The logs carry
-# the port base (`/tmp/lane499-d1-<LANE_BASE>-app.log`, `-overlay.log`, `-seed.log`; the d3 fold-3, E585-D3-DELTA-M2):
+# the port base (`$${TMPDIR}/lane499-d1-<LANE_BASE>-app.log`, `-overlay.log`, `-seed.log`; the d3 fold-3, E585-D3-DELTA-M2):
 # two tiers on different bases never overwrite each other's logs (`ci-route`'s own logs too, the d3 fold-4:
-# `/tmp/lane347-route-<LANE_BASE>-strict.log` and the rest). No cell fires the scheduled tick (the d3 fold-4,
+# `$${TMPDIR}/lane347-route-<LANE_BASE>-strict.log` and the rest). No cell fires the scheduled tick (the d3 fold-4,
 # E585-D3-DELTA2-L1): the d3 fold-2's leg 7 did (`/__scheduled` under `--test-scheduled`), and the whole production
 # tick synced the worker's hard-coded peers over the network, deferred real graphs into `gasp_deferred_graphs` in the
 # background (18 rows under the e555 cell's counts in the captain's re-run of the fold-2) and could reach the
@@ -506,18 +509,19 @@ ci-d1-board:
 # `loopback-only.sb`): a missed ask fails closed instead of reaching mainnet; `D1_EGRESS_SEAL=0` runs unsealed (the
 # guard still reds). A red cell prints the guard's verdict over the logs so far.
 ci-d1-budget:
+	@mkdir -p "$${TMPDIR}"
 	@if [ "$${OWED_READ_ONLY:-0}" = "1" ]; then exec bash tools/lane-499/owed_read_budget.sh; fi; \
 	if [ "$${OWED_BELT_ONLY:-0}" = "1" ]; then exec bash tools/lane-893/owed_belt_tick.sh; fi; \
 	if [ "$${OWED_BACKFILL_ONLY:-0}" = "1" ]; then exec bash tools/lane-893/owed_backfill_pass.sh; fi; \
 	set -e; \
 	B=$${LANE_BASE:-8791}; PA=$$((B+9)); PO=$$((B+10)); PD=$$((B+11)); PM=$$((B+12)); \
 	IA=$$((B+13)); IO=$$((B+14)); ID=$$((B+15)); PR=$$((B+16)); IR=$$((B+17)); PS=$$((B+18)); \
-	app_log=/tmp/lane499-d1-$$B-app.log; ov_log=/tmp/lane499-d1-$$B-overlay.log; seed_log=/tmp/lane499-d1-$$B-seed.log; \
-	dv_log=/tmp/lane499-d1-$$B-delivering.log; rv_log=/tmp/lane499-d1-$$B-retire.log; \
+	app_log=$${TMPDIR}/lane499-d1-$$B-app.log; ov_log=$${TMPDIR}/lane499-d1-$$B-overlay.log; seed_log=$${TMPDIR}/lane499-d1-$$B-seed.log; \
+	dv_log=$${TMPDIR}/lane499-d1-$$B-delivering.log; rv_log=$${TMPDIR}/lane499-d1-$$B-retire.log; \
 	: > "$$app_log"; : > "$$ov_log"; : > "$$dv_log"; : > "$$rv_log"; \
-	state=$$(mktemp -d /tmp/lane499-d1-state.XXXXXX); ov_state=$$(mktemp -d /tmp/lane499-d1-ovstate.XXXXXX); \
-	dv_state=$$(mktemp -d /tmp/lane499-d1-dvstate.XXXXXX); seed_v3=$$(mktemp -d /tmp/lane499-d1-seedv3.XXXXXX); \
-	rv_state=$$(mktemp -d /tmp/lane499-d1-rvstate.XXXXXX); \
+	state=$$(mktemp -d $${TMPDIR}/lane499-d1-state.XXXXXX); ov_state=$$(mktemp -d $${TMPDIR}/lane499-d1-ovstate.XXXXXX); \
+	dv_state=$$(mktemp -d $${TMPDIR}/lane499-d1-dvstate.XXXXXX); seed_v3=$$(mktemp -d $${TMPDIR}/lane499-d1-seedv3.XXXXXX); \
+	rv_state=$$(mktemp -d $${TMPDIR}/lane499-d1-rvstate.XXXXXX); \
 	job_pids=""; owned_ports=""; \
 	kill_tree() { \
 	  for _c in $$(pgrep -P "$$1" 2>/dev/null); do kill_tree "$$_c"; done; \
@@ -575,7 +579,7 @@ ci-d1-budget:
 	  return 1; \
 	}; \
 	tap() { \
-	  _tl="/tmp/lane499-d1-$$B-tap-$$2.log"; node tools/lane-731/network_tap.mjs "$$1" "$$2" > "$$_tl" 2>&1 & \
+	  _tl="$${TMPDIR}/lane499-d1-$$B-tap-$$2.log"; node tools/lane-731/network_tap.mjs "$$1" "$$2" > "$$_tl" 2>&1 & \
 	  job_pids="$$job_pids $$!"; _i=0; \
 	  while [ $$_i -lt 60 ]; do grep -q "TAP ATTACHED" "$$_tl" && return 0; _i=$$((_i+1)); sleep 1; done; \
 	  echo "✗ ci-d1-budget: the network tap never attached to the $$2 inspector on :$$1"; cat "$$_tl"; return 1; \
@@ -638,6 +642,8 @@ ci-d1-budget:
 	python3 tools/lane-ns2/register_pin.py; \
 	D1_BUDGET_SEED_V3="$$seed_v3" npx --package wrangler -c 'node tools/lane-ns2/owed_do_pins.mjs'; \
 	D1_BUDGET_SEED_V3="$$seed_v3" npx --package wrangler -c 'node tools/lane-906/owed_cadence.mjs'; \
+	RECORD_DOOR_FIXTURE="$$state/record-door.json" cargo test -q $(WORKERS) -p low-app-layer --lib export_record_door_fixture -- --ignored; \
+	RECORD_DOOR_FIXTURE="$$state/record-door.json" npx --package wrangler -c 'node tools/lane-908/record_door.mjs'; \
 	node tools/lane-499/tracker_fault_route_ci.mjs http://127.0.0.1:$$PA "$$state"; \
 	python3 scripts/d1-census.py --self-test; \
 	python3 scripts/d1-census.py --app http://127.0.0.1:$$PA --overlay http://127.0.0.1:$$PO; \
@@ -712,7 +718,7 @@ DEPLOY_CONFIGS ?= crates/overlay-cloudflare:wrangler.toml \
                   crates/overlay-cloudflare:wrangler.low.toml \
                   crates/low-app-layer:wrangler.toml
 ci-deploy:
-	@set -e; \
+	@set -e; mkdir -p "$${TMPDIR}"; \
 	bash scripts/check-workspaces.sh; \
 	rootw=$$(grep -c '^name = "worker"$$' Cargo.lock || true); \
 	if [ "$$rootw" != "0" ]; then \
@@ -743,7 +749,7 @@ ci-deploy:
 	  exit 1; \
 	fi; \
 	echo "→ ci-deploy preflight ok: worker $$vers, worker-build ^$$pins, 3 configs"; \
-	out=$$(mktemp -d /tmp/ci-deploy.XXXXXX); \
+	out=$$(mktemp -d $${TMPDIR}/ci-deploy.XXXXXX); \
 	trap 'rm -rf "$$out"' EXIT; \
 	for cfg in $(DEPLOY_CONFIGS); do \
 	  d=$${cfg%%:*}; f=$${cfg##*:}; \

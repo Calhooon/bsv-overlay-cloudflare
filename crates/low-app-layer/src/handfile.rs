@@ -757,9 +757,9 @@ pub fn handfile_row_keys(v: &VerifiedHandfile) -> [(HandfileSlot, String, u32); 
     ]
 }
 
-/// The handfile source rows and both seats' judgements commit together.
-pub(crate) async fn judge_handfile(
-    db: &impl crate::owed_judge::JudgeDb,
+/// The handfile source rows and their trigger marks commit together, before any judgement.
+pub(crate) async fn write_handfile(
+    db: &impl crate::pot_hook::SqlPort,
     verified: &VerifiedHandfile,
     facts: &HopFacts,
     refund_valid: bool,
@@ -767,7 +767,7 @@ pub(crate) async fn judge_handfile(
     now: i64,
 ) -> Result<bool, String> {
     use crate::record_post::{
-        int as js_num, text as js, text_opt as js_opt, VerifiedRecord, POTPARTY_FILE_SQL,
+        int as js_num, text as js, text_opt as js_opt, POTPARTY_FILE_SQL,
         POTREFUND_FILE_SQL, POTREFUND_LATCH_SQL,
     };
     let mut stmts = vec![crate::pot_hook::Stmt::new(
@@ -872,52 +872,8 @@ pub(crate) async fn judge_handfile(
         ));
     }
 
-    let mut filings = Vec::new();
-    if write[HandfileSlot::PotpartyV1 as usize] {
-        filings.push(VerifiedRecord::Potparty(verified.potparty_v1.clone(), true));
-    }
-    if write[HandfileSlot::PotpartyV2 as usize] {
-        filings.push(VerifiedRecord::Potparty(verified.potparty_v2.clone(), true));
-    }
-    // Include the refund subject on a chain-covered row too, so a new hand judges both seats.
-    filings.push(VerifiedRecord::Potrefund(
-        verified.potrefund.clone(),
-        refund_valid,
-    ));
-    let m = &verified.hopparty;
-    let hops = if write[HandfileSlot::Hopparty as usize] {
-        vec![serde_json::json!({
-            "identity":verified.identity,"opponentIdentity":hex::encode(&m.opponent),"gameId":verified.game_id,
-            "txid":verified.hop_txid,"hopTxid":verified.hop_txid,"hopVout":m.hop_vout,"hopSats":m.hop_sats,
-            "seatSettlePubkey":hex::encode(&m.seat_settle_pubkey),"seatSigHex":verified.settle_sig_hex,
-            "identitySigHex":verified.identity_sig_hex,"hopLockHex":facts.lock_hex,"hopSatsOnChain":facts.sats,"containerOutputs":facts.outputs,
-            "outputIndex":verified.hop_row_vout,"markerTxid":verified.hop_txid,"markerVout":verified.hop_row_vout,
-            "createdAt":now,"markerCreatedAt":now,"markerRowid":i64::MAX,"markerValid":1,"paidTier":0,"unknownHop":0
-        })]
-    } else {
-        vec![]
-    };
-    let mut marks: Vec<_> = filings
-        .iter()
-        .filter(|filing| {
-            !matches!(filing, VerifiedRecord::Potrefund(..))
-                || write[HandfileSlot::Potrefund as usize]
-        })
-        .map(crate::record_post::owed_write::mark)
-        .collect();
-    if write[HandfileSlot::Hopparty as usize] {
-        marks.push(crate::owed_judge::FilingMark {
-            source: "hop".into(),
-            source_key: format!("{}:{}", verified.hop_txid, m.hop_vout),
-        });
-    }
-    let report =
-        crate::record_post::owed_write::judge_filings(db, &filings, &hops, now, stmts, &marks)
-            .await?;
-    Ok(report
-        .source_changes
-        .iter()
-        .any(|n| crate::record_post::insert_wrote_a_row(n.map(|n| n as usize))))
+    let changes = crate::record_post::owed_write::write_filings(db, stmts).await?;
+    Ok(changes.iter().any(|n| crate::record_post::insert_wrote_a_row(n.map(|n| n as usize))))
 }
 
 /// The door's handfile arm, after the kind and the raw body are read (`record_post` dispatches here).
@@ -990,14 +946,7 @@ pub async fn handfile_post(
     write[HandfileSlot::Hopparty as usize] = hop_chain == 0;
     // bsv-low #798: the refund's chain no-op is the direct door's, row by row (a junk-signed chain row naming this
     // identity is never a no-op; an own row is latched before the batch)
-    let tip = crate::routes::chaintracks_present_height_env(&ctx.env, "owed")
-        .await
-        .ok();
-    let port = crate::owed_judge::D1Judge::new(
-        &ctx.env,
-        tip,
-        crate::routes::written_off_before_ms_env(&ctx.env),
-    )?;
+    let port = crate::routes::D1Sql::of(&ctx.env)?;
     let refund_chain =
         crate::record_post::potrefund_chain_noop(&port, &verified.potrefund, pot.as_ref())
             .await
@@ -1038,9 +987,14 @@ pub async fn handfile_post(
             return crate::record_post::refuse_with_family(Some(kind), r, Some(query.family));
         }
     }
-    let wrote = judge_handfile(&port, &verified, &facts, refund_valid, &write, now)
+    let wrote = write_handfile(&port, &verified, &facts, refund_valid, &write, now)
         .await
         .map_err(worker::Error::RustError)?;
+    crate::record_post::detached::schedule(
+        ctx,
+        vec![VerifiedRecord::Potrefund(verified.potrefund.clone(), refund_valid)],
+        "handfile",
+    );
     if !wrote {
         crate::record_post::note_already_filed(kind);
         return crate::routes::json_response(
@@ -1193,7 +1147,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn owed893_handfile_sources_and_rows_are_one_transaction() {
+    async fn owed908_handfile_sources_and_marks_are_one_transaction() {
         let db = crate::pot_hook::tests::SqliteSql::migrated();
         let hand = Hand::new(15);
         let verified = verify_handfile(&hand.body(), &hand.poster()).unwrap();
@@ -1209,10 +1163,10 @@ pub(crate) mod tests {
             )
             .unwrap();
         db.conn.execute_batch("DELETE FROM owed_dirty; CREATE TRIGGER fail_owed BEFORE INSERT ON owed_rows BEGIN SELECT RAISE(ABORT,'owed row fault'); END;").unwrap();
-        // the D2-OWED lens's MEDIUM-2: a judge fault lands the batch's sources ALONE (one transaction still), its
-        // marks left for the drain, counted; the filing is never refused for the judge's sake
+        // A judge fault cannot affect the source batch: no judge runs until after the answer.
+        // The marks remain durable for the detached job or belt alarm.
         assert!(
-            judge_handfile(&db, &verified, &facts, false, &[true; 4], 2_000)
+            write_handfile(&db, &verified, &facts, false, &[true; 4], 2_000)
                 .await
                 .unwrap(),
             "the sources landed"
@@ -1233,7 +1187,7 @@ pub(crate) mod tests {
         }
         assert_eq!(count("owed_rows"), 0);
         assert!(count("owed_dirty") > 0, "the marks stand for the drain");
-        assert_eq!(db.counter(crate::owed_judge::COUNTER_FILING_FAULTS), 1);
+        assert_eq!(db.counter(crate::owed_judge::COUNTER_FILING_FAULTS), 0, "the door never invokes a judge");
         db.conn.execute_batch("DROP TRIGGER fail_owed").unwrap();
         crate::owed_judge::drain_dirty(&db, 64).await.unwrap();
         let rows: i64 = db
@@ -1297,7 +1251,7 @@ pub(crate) mod tests {
             hop: format!("{}:{}", verified.hop_txid, verified.hopparty.hop_vout),
         };
         assert!(
-            !judge_handfile(&racing, &verified, &facts, false, &[false; 4], 2_001)
+            !write_handfile(&racing, &verified, &facts, false, &[false; 4], 2_001)
                 .await
                 .unwrap()
         );

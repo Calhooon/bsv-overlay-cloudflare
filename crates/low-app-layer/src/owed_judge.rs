@@ -107,7 +107,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 mod hydrate;
 pub mod rank;
 mod writers;
-pub(crate) use hydrate::hydrate_filings;
 pub use hydrate::{
     hydrate_inputs, COLLECTED_SQL, DOOR_REFUSAL_SQL, HONOURED_EVIDENCE, HOPS_SQL,
     HOP_COMPETITORS_SQL, LINKS_SQL, MISSING_SQL, PARTIES_SQL, RELEASED_SQL, REPRESENTATIVES_SQL,

@@ -1,79 +1,7 @@
-//! Apply verified filings to the same hydrated views used by the owed judge.
+//! Source writes and subject selection for verified record filings.
 use super::{VerifiedRecord, *};
-use crate::owed_judge::{self as judge, FilingMark, JudgeDb, JudgeInputs, Subject};
-use crate::pot_hook::{SqlPort, Stmt, StmtOut};
-use serde_json::Value;
-use std::collections::BTreeMap;
-
-struct FilingJudge<'a, P> {
-    db: &'a P,
-    filings: &'a [VerifiedRecord],
-    hops: &'a [Value],
-    stamp: i64,
-}
-impl<P: JudgeDb> SqlPort for FilingJudge<'_, P> {
-    async fn run_batch(&self, statements: Vec<Stmt>) -> std::result::Result<Vec<StmtOut>, String> {
-        self.db.run_batch(statements).await
-    }
-    async fn counters(&self, deltas: Vec<(String, u64)>) {
-        self.db.counters(deltas).await;
-    }
-    fn now_ms(&self) -> u64 {
-        self.db.now_ms()
-    }
-    fn log(&self, line: &str) {
-        self.db.log(line);
-    }
-}
-impl<P: JudgeDb> JudgeDb for FilingJudge<'_, P> {
-    fn tip(&self) -> Option<u64> {
-        self.db.tip()
-    }
-    fn era_ms(&self) -> Option<i64> {
-        self.db.era_ms()
-    }
-    async fn word_views(
-        &self,
-        rows: &BTreeMap<String, crate::tracker_host::stored::Row>,
-    ) -> std::result::Result<BTreeMap<String, Value>, String> {
-        self.db.word_views(rows).await
-    }
-    async fn canonical_root(&self, height: u64) -> Option<String> {
-        self.db.canonical_root(height).await
-    }
-    async fn push(&self, identity: &str, body: Value) {
-        self.db.push(identity, body).await;
-    }
-    async fn hydrate(
-        &self,
-        identity: &str,
-        games: &[String],
-    ) -> std::result::Result<JudgeInputs, String> {
-        judge::hydrate_filings(
-            self.db,
-            identity,
-            games,
-            self.filings,
-            self.hops,
-            self.stamp,
-        )
-        .await
-    }
-}
-
-pub(crate) fn mark(v: &VerifiedRecord) -> FilingMark {
-    FilingMark {
-        source: match v {
-            VerifiedRecord::Potparty(..) => "party",
-            VerifiedRecord::Potrefund(..) => "refund",
-            VerifiedRecord::Result(..) => "result",
-            VerifiedRecord::Collected(..) | VerifiedRecord::Held(..) => "collected",
-            VerifiedRecord::Hopsweep(..) => "sweep",
-        }
-        .into(),
-        source_key: v.key().into(),
-    }
-}
+use crate::owed_judge::{self as judge, Subject};
+use crate::pot_hook::{SqlPort, Stmt};
 
 pub(crate) async fn subjects(
     db: &impl SqlPort,
@@ -99,121 +27,18 @@ pub(crate) async fn subjects(
     })
 }
 
-/// The filing's source statements and its subjects' judgement in ONE batch. A judge that cannot run (a hydration
-/// read, the batch's own fault) never refuses the filing (the D2-OWED lens's MEDIUM-2): the source statements land
-/// ALONE, their triggers' marks stand for the drain, and the fault is counted (`owed_judge_filing_faults_total`).
-/// Only a fault of that lone write refuses the filing.
-pub(crate) async fn judge_filings(
-    db: &impl JudgeDb,
-    filings: &[VerifiedRecord],
-    hops: &[Value],
-    stamp: i64,
+/// Commit only the source rows. Their triggers mark owed_dirty in this same atomic batch.
+/// No judge or subject reads are part of the request's write.
+pub(crate) async fn write_filings(
+    db: &impl SqlPort,
     writes: Vec<Stmt>,
-    extra_marks: &[FilingMark],
-) -> std::result::Result<judge::JudgeReport, String> {
-    let alone = writes.clone();
-    let judged = async {
-        let mut selected = Vec::new();
-        for filing in filings {
-            selected.extend(subjects(db, filing).await?);
-        }
-        let adapter = FilingJudge {
-            db,
-            filings,
-            hops,
-            stamp,
-        };
-        judge::judge_with_write(
-            &adapter,
-            &selected,
-            "filing",
-            writes,
-            extra_marks,
-            |inputs| {
-                for i in inputs {
-                    for filing in filings {
-                        apply(i, filing);
-                    }
-                }
-                Ok(())
-            },
-        )
-        .await
-    }
-    .await;
-    match judged {
-        Ok(report) => Ok(report),
-        Err(error) => {
-            db.log(&format!(
-                "[owed] a filing's judge faulted; the filing lands alone and its marks wait for the drain: {error}"
-            ));
-            let landed = if alone.is_empty() {
-                Vec::new()
-            } else {
-                db.run_batch(alone).await?
-            };
-            db.counters(vec![(judge::COUNTER_FILING_FAULTS.to_owned(), 1)])
-                .await;
-            Ok(judge::JudgeReport {
-                source_changes: landed.iter().map(|r| r.changes).collect(),
-                judge_fault: Some(error),
-                ..Default::default()
-            })
-        }
-    }
-}
-
-fn apply(i: &mut JudgeInputs, filing: &VerifiedRecord) {
-    match filing {
-        VerifiedRecord::Potrefund(r, valid) => {
-            let key = crate::owed::outpoint_key(&r.pot_txid, r.pot_vout);
-            for e in &mut i.refunds {
-                if e.pot_txid == r.pot_txid && e.pot_vout == r.pot_vout {
-                    e.backup_marker_present = true;
-                }
-            }
-            if *valid {
-                let home = i
-                    .results
-                    .iter()
-                    .find(|e| e.pot_txid == r.pot_txid && e.pot_vout == r.pot_vout)
-                    .and_then(|e| e.committed_keys.as_ref().zip(e.my_seat))
-                    .map(|(keys, seat)| match seat {
-                        crate::results::SeatLetter::A => &keys.pay_pkh_a,
-                        crate::results::SeatLetter::B => &keys.pay_pkh_b,
-                    });
-                // The filed backup is the NEWEST valid one, which every later judge reads first (`valid_refunds_sql`,
-                // `createdAt DESC`; the D2-OWED lens's LOW-4): it replaces the hydrated one, never yields to it.
-                i.valid_refunds.insert(
-                    key,
-                    crate::owed::ValidRefund {
-                        raw_hex: r.refund_raw_hex.clone(),
-                        my_sats: home.and_then(|pkh| {
-                            crate::owed::refund_output_sats(&r.refund_raw_hex, pkh)
-                        }),
-                    },
-                );
-            }
-        }
-        VerifiedRecord::Collected(r) | VerifiedRecord::Held(r, _) if i.identity == r.identity => {
-            let mut fold = crate::owed::CollectedFold::default();
-            let pay = match filing {
-                VerifiedRecord::Held(_, pay) => Some(pay.as_str()),
-                _ => None,
-            };
-            fold.row(
-                &r.identity,
-                &r.game_id,
-                r.sig_hex.as_deref(),
-                Some(&r.txid),
-                pay,
-            );
-            i.collected_verified.extend(fold.verified);
-            i.collected_present.extend(fold.present);
-            i.held_verified.extend(fold.held);
-        }
-        _ => {}
-    }
+) -> std::result::Result<Vec<Option<u64>>, String> {
+    Ok(db
+        .run_batch(writes)
+        .await?
+        .iter()
+        .map(|r| r.changes)
+        .collect())
 }
 
 pub(crate) fn statements(v: &VerifiedRecord, now: i64) -> Vec<Stmt> {
@@ -344,31 +169,43 @@ pub(crate) fn statements(v: &VerifiedRecord, now: i64) -> Vec<Stmt> {
 mod tests {
     use super::*;
 
-    /// The D2-OWED lens's LOW-4: the filed valid backup REPLACES the hydrated one in the filing's judgement, as every
-    /// later judge reads the newest (`valid_refunds_sql`, `createdAt DESC`), so the press bytes never flip.
-    #[test]
-    fn d2fold_low4_the_filed_backup_replaces_the_hydrated_one() {
-        let filing = overlay_discovery::potrefund::storage::PotrefundRecord {
+    /// The detached judge reads the newest durable backup through its production selector.
+    #[tokio::test]
+    async fn d2fold_low4_the_filed_backup_replaces_the_hydrated_one() {
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        let mut filing = overlay_discovery::potrefund::storage::PotrefundRecord {
             identity: "owner".into(),
             game_id: "game".into(),
             pot_txid: "aa".repeat(32),
             pot_vout: 0,
-            refund_raw_hex: "newer".into(),
+            refund_raw_hex: "older".into(),
             sig_hex: "00".into(),
-            txid: "filed".into(),
+            txid: "filed:older".into(),
             output_index: 0,
-            created_at: 2,
+            created_at: 1,
         };
-        let key = crate::owed::outpoint_key(&filing.pot_txid, 0);
-        let mut i = JudgeInputs::default();
-        i.valid_refunds.insert(
-            key.clone(),
-            crate::owed::ValidRefund {
-                raw_hex: "older".into(),
-                my_sats: None,
-            },
-        );
-        apply(&mut i, &VerifiedRecord::Potrefund(filing, true));
-        assert_eq!(i.valid_refunds[&key].raw_hex, "newer");
+        write_filings(
+            &db,
+            statements(&VerifiedRecord::Potrefund(filing.clone(), true), 1),
+        )
+        .await
+        .unwrap();
+        filing.txid = "filed:newer".into();
+        filing.refund_raw_hex = "newer".into();
+        write_filings(
+            &db,
+            statements(&VerifiedRecord::Potrefund(filing.clone(), true), 2),
+        )
+        .await
+        .unwrap();
+        let newest: String = db
+            .conn
+            .query_row(
+                &crate::owed::valid_refunds_sql(1),
+                rusqlite::params![filing.pot_txid, 0],
+                |r| r.get("refundRawHex"),
+            )
+            .unwrap();
+        assert_eq!(newest, "newer");
     }
 }
