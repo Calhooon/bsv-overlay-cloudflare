@@ -231,10 +231,6 @@ pub fn write_queries(
     let mut out: Vec<Query> = to_write
         .iter()
         .map(|s| {
-            crate::owed_events::note(
-                "refusal",
-                &overlay_discovery::owed_event::outpoint_key(&s.txid, s.vout),
-            );
             Query::new(SUBMIT_REFUSAL_UPSERT_SQL)
                 .bind(s.txid.as_str())
                 .bind(i64::from(s.vout))
@@ -284,11 +280,16 @@ pub async fn record(env: Env, beef: Vec<u8>, subject_txid: String, reason: Strin
     }
     let mut queries = write_queries(&to_write, &subject_txid, &reason, now_ms);
     let prune = queries.pop();
-    for q in queries {
+    for (q, s) in queries.into_iter().zip(&to_write) {
         if let Err(e) = q.execute(&db).await {
             console_log!("[submit-refusals] ledger write failed for {subject_txid}: {e}");
             return;
         }
+        // bsv-low #911 (the D2-ACTOR-A lens's LOW-8): the hop's `refusal` pair, noted once its upsert landed
+        crate::owed_events::note(
+            "refusal",
+            &overlay_discovery::owed_event::outpoint_key(&s.txid, s.vout),
+        );
     }
     if let Some(prune) = prune {
         if let Err(e) = prune.execute(&db).await {

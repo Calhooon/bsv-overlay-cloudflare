@@ -115,15 +115,12 @@ fn evidence_inserts(snapshot: &Snapshot, txid: &str) -> Vec<Query> {
     )
     .into_iter()
     .map(|w| match w {
-        EvidenceWrite::Found(f) => {
-            crate::owed_events::note("hop", &overlay_discovery::owed_event::outpoint_key(&f.hop_txid, f.hop_vout));
-            Query::new(EVIDENCE_INSERT_SQL)
+        EvidenceWrite::Found(f) => Query::new(EVIDENCE_INSERT_SQL)
             .bind(txid)
             .bind(f.hop_txid)
             .bind(f.hop_vout)
             .bind(f.seat_key)
-            .bind(f.sats)
-        }
+            .bind(f.sats),
         EvidenceWrite::Missing { list, bytes_read } => Query::new(MISSING_INSERT_SQL)
             .bind(txid)
             .bind(list)
@@ -141,9 +138,31 @@ fn merge_releases_sql(cols: &[ColumnInfo]) -> String {
     format!("UPDATE pot_evictions SET releasedSpends=(SELECT json_group_array(json_object('table',r.tbl,'txid',r.txid,'vout',r.vout)) FROM (SELECT json_extract(value,'$.table') AS tbl,lower(json_extract(value,'$.txid')) AS txid,json_extract(value,'$.vout') AS vout FROM json_each(CASE WHEN json_valid(releasedSpends) THEN releasedSpends ELSE '[]' END) UNION SELECT 'pot_records',txid,outputIndex FROM pot_records INDEXED BY idx_pot_spending WHERE spendingTxid=?1{confirmed} UNION SELECT json_extract(value,'$.table'),lower(json_extract(value,'$.txid')),json_extract(value,'$.vout') FROM json_each(?2)) r) WHERE txid=?1 AND readmittedAt IS NULL")
 }
 
+/// bsv-low #911: the pairs one committed [`plan`] marked: the eviction's own (it names every party, shadow party and
+/// released hop it moves) and each released hop's evidence row. Noted AFTER the plan's batch answered (the
+/// D2-ACTOR-A lens's LOW-8: a note made at plan time could be published by a concurrent request before its batch
+/// landed, reading no mark).
+pub(crate) fn plan_pairs(snapshot: &Snapshot, txid: &str) -> Vec<(&'static str, String)> {
+    use overlay_discovery::pot::released_evidence::{evidence_writes, EvidenceWrite};
+    let released: Vec<(String, u32)> = snapshot
+        .released
+        .iter()
+        .filter(|r| r.table == "pot_records")
+        .map(|r| (r.txid.to_ascii_lowercase(), r.vout))
+        .collect();
+    let mut out = vec![("eviction", txid.to_string())];
+    for w in evidence_writes(snapshot.beef.as_deref(), txid, &released, &snapshot.seat_keys) {
+        if let EvidenceWrite::Found(f) = w {
+            out.push((
+                "hop",
+                overlay_discovery::owed_event::outpoint_key(&f.hop_txid, f.hop_vout),
+            ));
+        }
+    }
+    out
+}
+
 pub(crate) fn plan(snapshot: &Snapshot, txid: &str, reason: &str, now_ms: u64) -> Vec<Query> {
-    // bsv-low #911: the eviction's own mark names every party, shadow party and released hop it moves.
-    crate::owed_events::note("eviction", txid);
     let mut out = vec![Query::new(OPEN_EVICTION_MARKER_SQL)
         .bind(txid)
         .bind(reason)
@@ -340,6 +359,9 @@ pub(crate) async fn evict(
             crate::d1_ledger::counted_batch(db, statements)
                 .await
                 .map_err(|e| e.to_string())?;
+            for (source, key) in plan_pairs(&snapshot, txid) {
+                crate::owed_events::note(source, &key);
+            }
             Ok::<_, String>(Some(snapshot))
         }
         .await;
