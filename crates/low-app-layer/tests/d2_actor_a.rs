@@ -603,3 +603,39 @@ fn d2_actor_a_fold_l1_the_queue_waits_for_the_overlays_certified_migrations() {
     let at = gate.find("pubasyncfnconfigured(").unwrap();
     assert!(gate[at..].contains("letready=ready_at(count);"));
 }
+
+/// LOW-6 (the D2-ACTOR-A lens): a message pays the chain tip only when its marks name a subject (the plan before
+/// the tip, the tip memoised 30 s), and an identity event is sent only for an identity holding a mark. RED on
+/// 59d98ec6: the tip read preceded the routing, and an identity note was sent whatever its marks.
+#[tokio::test(flavor = "current_thread")]
+async fn d2_actor_a_fold_l6_no_subject_no_tip_and_no_identity_event_without_a_mark() {
+    let db = Db::new();
+    let plan = owed_events::plan(&db, &event("identity", ID)).await.unwrap();
+    assert!(plan.is_empty(), "no mark, no subject");
+    let sent = RefCell::new(Vec::new());
+    let port = owed_events::SqlPublish {
+        db: &db,
+        send: |b: Vec<String>| {
+            sent.borrow_mut().extend(b);
+            async { Ok(()) }
+        },
+    };
+    let note = publish::Noted {
+        source: "identity".into(),
+        key: ID.into(),
+        held: None,
+    };
+    let quiet = publish::publish_with(&port, vec![note.clone()]).await;
+    assert_eq!((quiet.sent.len(), quiet.skipped), (0, 1), "nothing pending: not sent");
+    seed_stranded_hop(&db, ID, "g1", &owed_db::hop(3));
+    let busy = publish::publish_with(&port, vec![note]).await;
+    assert_eq!((busy.sent.len(), busy.skipped), (1, 0));
+    assert!(!owed_events::plan(&db, &event("identity", ID)).await.unwrap().is_empty());
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let src = squash(include_str!("../src/owed_events.rs"));
+    let at = src.find("pubasyncfnconsume_one(").unwrap();
+    let body = &src[at..];
+    let empty = body.find("ifplan.is_empty(){returnOk(Routed::default());}").unwrap();
+    let tip = body.find("lettip=tip_memoised(env).await;").unwrap();
+    assert!(empty < tip, "the plan before the tip");
+}
