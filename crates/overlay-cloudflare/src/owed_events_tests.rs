@@ -191,13 +191,15 @@ mod pins {
         out
     }
 
-    /// (a) EVERY WRITER IN THE TRIGGER LIST PUBLISHES ONE EVENT WITH THE ROW'S OWN FACTS. The 29 triggers are read from
-    /// `derived_owed_triggers.rs`; each one's write runs under real SQLite with the shipped migrations, the writer's
-    /// note is published through the shipped [`publish_with`], and the pin holds: the note's pair is exactly the pair
-    /// the trigger marked (so the consumer's routing read finds the marks), ONE event is sent for it, it carries the
-    /// marks and the row's own facts read in the publish's batch, and every marked pair of the write was noted.
+    /// (a) EVERY TRIGGER'S PAIR, NOTED, PUBLISHES ONE EVENT WITH THE ROW'S OWN FACTS. The 29 triggers are read from
+    /// `derived_owed_triggers.rs`; each one's write runs under real SQLite with the shipped migrations, the pair a
+    /// writer of that table notes (hand-written here) is published through the shipped [`publish_with`], and the pin
+    /// holds: that pair is exactly the pair the trigger marked (so the consumer's routing read finds the marks), ONE
+    /// event is sent for it, and it carries the marks and the row's own facts read in the publish's batch. It proves
+    /// the spelling and the publish, NOT that a production writer notes (the D2-ACTOR-A lens's MEDIUM-3): that is
+    /// [`d2_actor_a_fold_m3_every_production_writer_of_a_trigger_table_notes_its_pair`].
     #[test]
-    fn d2_actor_a_a_every_trigger_writer_publishes_one_event_with_its_rows_facts() {
+    fn d2_actor_a_a_each_trigger_pair_noted_publishes_one_event_with_its_rows_facts() {
         let triggers = shipped_triggers();
         assert_eq!(triggers.len(), 29, "the trigger list: {triggers:?}");
         for trigger in &triggers {
@@ -246,6 +248,104 @@ mod pins {
                     sent.facts
                 );
             }
+        }
+    }
+
+    /// The text of the function whose signature starts with `sig` in `src`: from the signature to the first line that
+    /// closes it at its own indentation (whitespace squashed).
+    fn fn_body(src: &str, sig: &str) -> String {
+        let at = src
+            .find(sig)
+            .unwrap_or_else(|| panic!("no writer `{sig}`"));
+        let line_start = src[..at].rfind('\n').map_or(0, |i| i + 1);
+        let indent = &src[line_start..at];
+        let indent: String = indent.chars().take_while(|c| *c == ' ').collect();
+        let close = format!("\n{indent}}}\n");
+        let end = src[at..]
+            .find(&close)
+            .map_or(src.len(), |i| at + i + close.len());
+        src[at..end].split_whitespace().collect()
+    }
+
+    /// MEDIUM-3 (the D2-ACTOR-A lens): EVERY PRODUCTION WRITER OF A TRIGGER TABLE NOTES ITS PAIR, by source. Each
+    /// writer function named here (the lens's enumeration, both Workers) holds its note; a writer that stops noting is
+    /// RED here (the lens's mutant, the `seen` latch's note removed at `ops.rs`, passed every pin before: now `seen:
+    /// latch_network_seen does not note`). Outside the contract, stated: the backfill's evidence writes (a scheduled
+    /// pass; the sweep), the refusal ledger's 48 h GC delete (outside the judge's window), the eviction's
+    /// missing-evidence arm (its subjects are the `eviction` event's), the belt's own find (`owed_spender_bytes` and
+    /// the probe memo in the judge's own batch, which acknowledges them) and the tip's marks (`internal_events`
+    /// publishes `tip`); every one of them is swept within a tick.
+    #[test]
+    fn d2_actor_a_fold_m3_every_production_writer_of_a_trigger_table_notes_its_pair() {
+        let disc = include_str!("d1_discovery.rs");
+        let disc = &disc[..disc.find("#[cfg(test)]\nmod").unwrap_or(disc.len())];
+        let app = |f: &str| -> &'static str {
+            match f {
+                "record_post" => include_str!("../../low-app-layer/src/record_post.rs"),
+                "owed_write" => include_str!("../../low-app-layer/src/record_post/owed_write.rs"),
+                "handfile" => include_str!("../../low-app-layer/src/handfile.rs"),
+                "runtime" => include_str!("../../low-app-layer/src/tracker_host/runtime.rs"),
+                _ => unreachable!(),
+            }
+        };
+        let writers: Vec<(&str, &str, &str, &str)> = vec![
+            ("pot", include_str!("pot_changes.rs"), "pub fn note(", r#"crate::owed_events::note("pot","#),
+            ("party", disc, "pub fn potparty_insert_query(", r#"note("party","#),
+            ("party", disc, "pub fn potparty_relatch_query(", r#"note("party","#),
+            ("hop", disc, "pub fn hopparty_insert_query(", r#"note("hop","#),
+            ("hop", disc, "pub fn hopparty_relatch_query(", r#"note("hop","#),
+            ("refund", disc, "async fn store_record(&self, record: &PotrefundRecord)", "SOURCE_REFUND"),
+            ("result", disc, "pub fn result_insert_query(", r#"note("result","#),
+            ("result", disc, "pub fn result_relatch_query(", r#"note("result","#),
+            ("collected", disc, "async fn store_record(&self, record: &CollectedRecord)", "SOURCE_COLLECTED"),
+            ("beef", disc, "async fn unlatch_pot_beef_proof(", r#"note("beef","#),
+            ("beef", disc, "async fn store_beef(", r#"note("beef","#),
+            ("beef", disc, "async fn compact_pot_beef(", r#"note("beef","#),
+            ("beef", disc, "async fn mark_pot_beef_proven_at(", r#"note("beef","#),
+            ("beef", disc, "async fn mark_pot_beefs_proven_at(", r#"note("beef","#),
+            ("beef", disc, "async fn mark_pot_beef_proven(&self", r#"note("beef","#),
+            ("beef", disc, "async fn mark_pot_beefs_proven(&self", r#"note("beef","#),
+            ("eviction", include_str!("admit_fast.rs"), "async fn evict_core_with_abort(", r#"note("eviction","#),
+            ("eviction", include_str!("admit_fast.rs"), "pub async fn evict_txid_everywhere_repointed(", r#"note("eviction","#),
+            ("eviction", include_str!("admit_fast.rs"), "pub async fn readmit_if_evicted(", r#"note("eviction","#),
+            ("eviction", include_str!("eviction_write.rs"), "pub(crate) fn plan(", r#"note("eviction","#),
+            ("hop", include_str!("eviction_write.rs"), "fn evidence_inserts(", r#"note("hop","#),
+            ("seen", include_str!("ops.rs"), "pub async fn latch_network_seen(", r#"note("seen","#),
+            ("refusal", include_str!("submit_refusals.rs"), "pub fn write_queries(", r#"note("refusal","#),
+            ("refund", app("record_post"), "pub(crate) async fn potrefund_chain_noop<", "SOURCE_REFUND"),
+            ("party", app("owed_write"), "pub(crate) fn note_events(", r#"note("party","#),
+            ("refund", app("owed_write"), "pub(crate) fn note_events(", r#"note("refund","#),
+            ("result", app("owed_write"), "pub(crate) fn note_events(", r#"note("result","#),
+            ("collected", app("owed_write"), "pub(crate) fn note_events(", r#"note("collected","#),
+            ("sweep", app("owed_write"), "pub(crate) fn note_events(", r#"note("sweep","#),
+            ("filing", app("record_post"), "pub async fn record_post(", "owed_write::note_events(&verified);"),
+            ("hop", app("handfile"), "pub async fn handfile_post(", r#"note("hop","#),
+            ("party", app("handfile"), "pub async fn handfile_post(", r#"note("party","#),
+            ("refund", app("handfile"), "pub async fn handfile_post(", "owed_write::note_events(&VerifiedRecord::Potrefund("),
+            ("word", app("runtime"), "async fn event_held(", r#"note("word","#),
+        ];
+        for (source, src, sig, note) in writers {
+            let body = fn_body(src, sig);
+            let note: String = note.split_whitespace().collect();
+            assert!(
+                body.contains(&note),
+                "{source}: {} does not note",
+                sig.trim_start_matches("pub ")
+                    .trim_start_matches("(crate) ")
+                    .trim_start_matches("async ")
+                    .trim_start_matches("fn ")
+                    .split('(')
+                    .next()
+                    .unwrap_or(sig)
+            );
+        }
+        // every trigger source but the word's spender bytes has a noting writer here
+        for (_, source) in owed_event::TRIGGER_SOURCES {
+            assert!(
+                ["pot", "party", "hop", "refund", "result", "collected", "sweep", "eviction", "seen", "word", "beef", "refusal"]
+                    .contains(&source),
+                "{source}"
+            );
         }
     }
 
