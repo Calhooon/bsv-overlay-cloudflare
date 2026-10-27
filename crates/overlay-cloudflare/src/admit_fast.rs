@@ -933,7 +933,7 @@ pub async fn guard_landed(db: &D1Database, landed: &[(String, String)], origin: 
             Ok(Some(ev)) => {
                 // the FIX-920 lens's LOW-2: stamped with the evidence's start, so a readmission after it yields
                 let outcome = evict_txid_everywhere(db, txid, &ev.reason, ev.evicted_at_ms).await;
-                settle_reevicted(db, txid, &outcome, &ev.reason, origin).await;
+                settle_reevicted(db, txid, ev.evicted_at_ms, &outcome, &ev.reason, origin).await;
                 crate::ops::bump_counter(
                     db,
                     crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
@@ -1001,6 +1001,7 @@ pub(crate) async fn settle_reevicted_with<P: ReevictedPort>(
     port: &P,
     txid: &str,
     now_ms: u64,
+    evicted_at_ms: u64,
     outcome: &EvictionOutcome,
     reason: &str,
     origin: &str,
@@ -1020,12 +1021,15 @@ pub(crate) async fn settle_reevicted_with<P: ReevictedPort>(
     if !reevicted_owes_memo(outcome.yielded, kind.as_deref()) {
         return;
     }
+    // the FIX-920 lens's LOW-1: guarded by the ledger inside the statement (a readmission newer than the eviction's
+    // stamp keeps its row clear of the memo)
     let queries = vec![
-        Query::new(crate::proof_fetcher::TX_ANY_VERDICT_UPSERT_SQL)
+        Query::new(crate::proof_fetcher::TX_ANY_VERDICT_REFUSED_UNLESS_READMITTED_SQL)
             .bind(txid)
             .bind(now_ms)
             .bind("refused")
-            .bind(reason),
+            .bind(reason)
+            .bind(evicted_at_ms),
         Query::new(crate::ops::BUMP_COUNTER_SQL)
             .bind(crate::applayer_counters::COUNTER_TXANY_MEMO_WRITE_REFUSED)
             .bind(1),
@@ -1080,6 +1084,7 @@ impl ReevictedPort for D1Reevicted<'_> {
 pub async fn settle_reevicted(
     db: &D1Database,
     txid: &str,
+    evicted_at_ms: u64,
     outcome: &EvictionOutcome,
     reason: &str,
     origin: &str,
@@ -1087,7 +1092,7 @@ pub async fn settle_reevicted(
     let txid = txid.to_ascii_lowercase();
     let port = D1Reevicted { db, txid: &txid };
     let now_ms = worker::Date::now().as_millis();
-    settle_reevicted_with(&port, &txid, now_ms, outcome, reason, origin).await;
+    settle_reevicted_with(&port, &txid, now_ms, evicted_at_ms, outcome, reason, origin).await;
 }
 
 /// What the write-side guard AFTER a write touches (bsv-low #920, the FIX-920 lens's MEDIUM-1): the ledger's open
@@ -1119,7 +1124,16 @@ pub(crate) async fn reevict_after_write_with<P: WriteGuardPort>(
     // never this clock: a readmission stamped after the refusal's evidence (the chain's word, landed while the write
     // was in flight) is kept and the pass yields to it, as the stamp policy of `evict_txid_everywhere` intends
     let outcome = port.evict(&ev.reason, ev.evicted_at_ms).await;
-    settle_reevicted_with(port, txid, now_ms, &outcome, &ev.reason, origin).await;
+    settle_reevicted_with(
+        port,
+        txid,
+        now_ms,
+        ev.evicted_at_ms,
+        &outcome,
+        &ev.reason,
+        origin,
+    )
+    .await;
     port.count_reevicted().await;
     Ok(Some((ev, outcome)))
 }
@@ -2871,12 +2885,15 @@ fn refusal_fact_queries(
     counter: &'static str,
     reason: &str,
 ) -> [Query; 3] {
+    // the FIX-920 lens's LOW-1: `now_ms` is the eviction's stamp too (the evidence's start), so a readmission
+    // stamped after it, landing between the eviction and this batch, keeps its row clear of the memo
     [
-        Query::new(crate::proof_fetcher::TX_ANY_VERDICT_UPSERT_SQL)
+        Query::new(crate::proof_fetcher::TX_ANY_VERDICT_REFUSED_UNLESS_READMITTED_SQL)
             .bind(txid)
             .bind(now_ms)
             .bind("refused")
-            .bind(reason),
+            .bind(reason)
+            .bind(now_ms),
         Query::new(crate::ops::BUMP_COUNTER_SQL)
             .bind(counter)
             .bind(1),
@@ -8779,7 +8796,7 @@ mod tests {
             yielded: true,
             incomplete: false,
         };
-        settle_reevicted_with(&port, "57", 1, &yielded, reason, "pin").await;
+        settle_reevicted_with(&port, "57", 1, 1, &yielded, reason, "pin").await;
         assert_eq!(port.commits.get(), 0, "a yielded pass writes nothing");
     }
 
@@ -8889,6 +8906,71 @@ mod tests {
         );
     }
 
+    /// bsv-low #920, the FIX-920 lens's LOW-1: a readmission that lands AFTER the eviction's checks and before the
+    /// settle's memo upsert (its memo delete first, its stamp after the eviction's) is never overwritten by the memo,
+    /// at both settles: the write-side guard's (`settle_reevicted_with`) and the push's (`refusal_fact_queries`).
+    /// RED with the unguarded upsert (the `refused` memo written over the readmitted row).
+    #[tokio::test]
+    async fn fix920_low1_a_readmission_after_the_eviction_is_never_overwritten_by_the_memo() {
+        let reason = "REJECTED (arcade live REJECTED: UTXO_SPENT (70): x; both indexers absent)";
+        let readmit = |txid: String, at: i64| {
+            move |conn: &rusqlite::Connection| {
+                conn.execute(
+                    crate::proof_fetcher::TX_ANY_VERDICT_DELETE_SQL,
+                    [txid.as_str()],
+                )
+                .unwrap();
+                conn.execute(READMIT_EVICTION_SQL, rusqlite::params![at, txid.as_str()])
+                    .unwrap();
+            }
+        };
+        // the write-side guard: the readmission lands between the pass and the settle's memo read
+        let txid = "5a".repeat(32);
+        let db = SqliteShadow::new(shipped_conn());
+        evict_core(&db, &txid, reason, 1_000).await;
+        fix920_land(&db.conn, &txid);
+        let port = SqliteGuard::new(&db, &txid);
+        *port.before_memo.borrow_mut() = Some(Box::new(readmit(txid.clone(), 25_000)));
+        let (_, outcome) = reevict_after_write_with(&port, &txid, 21_000, "pin")
+            .await
+            .unwrap()
+            .expect("the open row");
+        assert!(!outcome.yielded && outcome.moved >= 3);
+        assert_eq!(
+            fix920_served_memo(&db.conn, &txid),
+            None,
+            "the guard's memo never stands over the readmission"
+        );
+        // the push's settle: its eviction ran (stamp 1_000), then a readmission, then its fact batch
+        let txid = "5b".repeat(32);
+        let db = SqliteShadow::new(shipped_conn());
+        fix920_land(&db.conn, &txid);
+        assert!(evict_core(&db, &txid, reason, 1_000).await.moved >= 3);
+        readmit(txid.clone(), 2_000)(&db.conn);
+        for q in refusal_fact_queries(&txid, 1_000, crate::ops::COUNTER_ARC_INGEST_EVICTED, reason)
+        {
+            let params: Vec<_> = q.params().iter().map(to_sql).collect();
+            db.conn
+                .execute(q.sql(), rusqlite::params_from_iter(params))
+                .unwrap();
+        }
+        assert_eq!(
+            fix920_served_memo(&db.conn, &txid),
+            None,
+            "the push's memo never stands over the readmission"
+        );
+        // the control: no readmission, the memo is written by both
+        let txid = "5c".repeat(32);
+        let db = SqliteShadow::new(shipped_conn());
+        evict_core(&db, &txid, reason, 1_000).await;
+        fix920_land(&db.conn, &txid);
+        assert!(fix920_landing_guard(&db, &txid, 21_000).await.is_some());
+        assert_eq!(
+            fix920_served_memo(&db.conn, &txid),
+            Some(("refused".to_string(), reason.to_string()))
+        );
+    }
+
     /// bsv-low #920: every write-side guard that re-evicts after a write settles the refusal right after its
     /// eviction (the past-deadline landing, the request's guard, a resumed run's, a landed predecessor's) and so does
     /// the Rejected arm's re-run under an open eviction. RED on main (no site settles).
@@ -8932,7 +9014,7 @@ mod tests {
                 routes,
                 "STORED_ECHO_UNDER_EVICTION",
             ),
-            ("the Rejected arm's re-run", routes, "&crate::admit_fast::ladder_rerefusal_reason(&reason),\n                            worker::Date"),
+            ("the Rejected arm's re-run", routes, "&crate::admit_fast::ladder_rerefusal_reason(&reason),\n                            rerun_ms,"),
             (
                 "reevict_after_write_with (the queue replay's guard)",
                 after_write,
@@ -8944,7 +9026,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{site}: {needle}"));
             let window = &body[at..(at + 900).min(body.len())];
             assert!(
-                window.contains("settle_reevicted(") || window.contains("settle_reevicted_with(port,"),
+                window.contains("settle_reevicted(") || window.contains("settle_reevicted_with(\n        port,"),
                 "{site}: the eviction is not followed by the refusal's settle"
             );
         }

@@ -859,6 +859,7 @@ async fn finish_past_deadline<F, S>(
             crate::admit_fast::settle_reevicted(
                 &db,
                 &subject,
+                ev.evicted_at_ms,
                 &outcome,
                 &ev.reason,
                 "POST /submit(broadcast-gated) past-deadline",
@@ -1881,11 +1882,12 @@ async fn submit_parts(
                 if let Some(ev) = door_open.take() {
                     if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
                         // the ledger's word is the LADDER's fresh reason (round 3, NIT): the earlier one stands in the log
+                        let rerun_ms = worker::Date::now().as_millis();
                         let outcome = crate::admit_fast::evict_txid_everywhere(
                             &ledger_db,
                             &subject_txid,
                             &crate::admit_fast::ladder_rerefusal_reason(&reason),
-                            worker::Date::now().as_millis(),
+                            rerun_ms,
                         )
                         .await;
                         // bsv-low #920: the network's second refusal completes the first one's settle (its memo,
@@ -1893,6 +1895,7 @@ async fn submit_parts(
                         crate::admit_fast::settle_reevicted(
                             &ledger_db,
                             &subject_txid,
+                            rerun_ms,
                             &outcome,
                             &crate::admit_fast::ladder_rerefusal_reason(&reason),
                             "POST /submit(broadcast-gated) re-refused",
@@ -1951,6 +1954,7 @@ async fn submit_parts(
                             crate::admit_fast::settle_reevicted(
                                 &ledger_db,
                                 &subject_txid,
+                                ev.evicted_at_ms,
                                 &outcome,
                                 &ev.reason,
                                 "POST /submit(broadcast-gated) resumed",
@@ -2176,6 +2180,7 @@ async fn submit_parts(
                     crate::admit_fast::settle_reevicted(
                         &ledger_db,
                         subject,
+                        ev.evicted_at_ms,
                         &outcome,
                         &ev.reason,
                         "POST /submit",
