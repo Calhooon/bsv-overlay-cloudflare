@@ -954,7 +954,7 @@ pub async fn drain_env(
         // bsv-low #911 (D2-ACTOR-A, HIGH-2's second belt): with the queue the drain no longer judges; it
         // RE-PUBLISHES the marks no consumer acknowledged within one tick, oldest first, 64 pairs a tick (the
         // consumer judges them). With no queue binding it judges as before.
-        if crate::owed_events::configured(env) {
+        if crate::owed_events::configured(env).await {
             let swept = crate::owed_events::sweep_publish(env)
                 .await
                 .map_err(worker::Error::RustError)?;

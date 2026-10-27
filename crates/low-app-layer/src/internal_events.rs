@@ -701,7 +701,7 @@ pub async fn tip_changed(mut req: Request, env: &Env, ctx: &Context) -> Result<R
         crate::routes::written_off_before_ms_env(env),
     )?;
     // bsv-low #911 (D2-ACTOR-A): the tip's marks written here, judged by the `owed-events` consumer.
-    if crate::owed_events::configured(env) {
+    if crate::owed_events::configured(env).await {
         match crate::owed_judge::write_tip_marks(&judge, height).await {
             Ok(()) => {
                 crate::owed_events::publish_pairs(

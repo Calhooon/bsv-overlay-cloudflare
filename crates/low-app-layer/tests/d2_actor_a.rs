@@ -256,7 +256,7 @@ fn d2_actor_a_b_the_door_publishes_and_answers_before_any_judge() {
         + src[at..]
             .find(&squash("let row_written = match outcome"))
             .unwrap()];
-    assert!(door.contains(&squash("if crate::owed_events::configured(&ctx.env) {")));
+    assert!(door.contains(&squash("if crate::owed_events::configured(&ctx.env).await {")));
     assert!(door.contains(&squash(
         "latency::note_enqueue(crate::owed_events::publish_noted(&ctx.env).await);"
     )));
@@ -582,4 +582,24 @@ async fn d2_actor_a_fold_l3_the_park_holds_one_row_a_pair_and_stops_at_three_red
 
 fn json_key(source: &str, key: &str) -> String {
     format!("'{}'", serde_json::json!([[source, key]]))
+}
+
+/// LOW-1 (the D2-ACTOR-A lens): the queue is the judge's trigger only once the overlay's certified migration count
+/// holds the publish's statements: the figure is the overlay's own list, a short or unreadable count keeps the inline
+/// judge, and every caller awaits the gate. RED on 59d98ec6 (`configured` was the binding alone).
+#[test]
+fn d2_actor_a_fold_l1_the_queue_waits_for_the_overlays_certified_migrations() {
+    assert_eq!(
+        owed_events::OWED_EVENTS_MIGRATION_COUNT as usize,
+        bsv_overlay_cloudflare::d1::OVERLAY_MIGRATION_COUNT
+    );
+    let n = f64::from(owed_events::OWED_EVENTS_MIGRATION_COUNT);
+    assert!(owed_events::ready_at(Some(n)));
+    assert!(owed_events::ready_at(Some(n + 1.0)));
+    assert!(!owed_events::ready_at(Some(n - 1.0)), "the overlay at 469");
+    assert!(!owed_events::ready_at(None), "no certified count read");
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let gate = squash(include_str!("../src/owed_events.rs"));
+    let at = gate.find("pubasyncfnconfigured(").unwrap();
+    assert!(gate[at..].contains("letready=ready_at(count);"));
 }
