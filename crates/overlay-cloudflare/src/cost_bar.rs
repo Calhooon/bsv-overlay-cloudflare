@@ -30,7 +30,7 @@ pub const QUOTA_VARS: [(&str, &str); 3] = [
 
 /// bsv-low #635: the served days' rows, a range of the primary key (at most two Workers a day are written; the
 /// LIMIT bounds the read whatever else writes the table).
-pub const COST_DAILY_READ_SQL: &str = "SELECT day, worker, requests, rowsRead, rowsWritten, statements, updatedAt FROM worker_cost_daily WHERE day >= ?1 ORDER BY day DESC, worker LIMIT 64";
+pub const COST_DAILY_READ_SQL: &str = "SELECT day, worker, requests, rowsRead, rowsWritten, statements, updatedAt, queueOps FROM worker_cost_daily WHERE day >= ?1 ORDER BY day DESC, worker LIMIT 64";
 
 /// One row of `worker_cost_daily`.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -50,6 +50,10 @@ pub struct CostRow {
     pub statements: f64,
     /// The last write, unix ms.
     pub updated_at: f64,
+    /// bsv-low #911 (the D2-ACTOR-A lens's LOW-2): queue messages sent (`d1_ledger::note_queue_ops`), served beside
+    /// `statements`.
+    #[serde(default)]
+    pub queue_ops: f64,
 }
 
 /// The configured quotas per day, in `QUOTA_VARS`' order.
@@ -79,10 +83,10 @@ pub async fn read(db: &D1Database, now_ms: i64) -> Result<Vec<CostRow>, String> 
         .await
 }
 
-fn measures(rows: &[&CostRow]) -> [u64; 4] {
-    let mut out = [0u64; 4];
+fn measures(rows: &[&CostRow]) -> [u64; 5] {
+    let mut out = [0u64; 5];
     for r in rows {
-        for (i, v) in [r.requests, r.rows_read, r.rows_written, r.statements]
+        for (i, v) in [r.requests, r.rows_read, r.rows_written, r.statements, r.queue_ops]
             .into_iter()
             .enumerate()
         {
@@ -92,8 +96,8 @@ fn measures(rows: &[&CostRow]) -> [u64; 4] {
     out
 }
 
-fn figures(m: [u64; 4]) -> Value {
-    json!({ "requests": m[0], "d1RowsRead": m[1], "d1RowsWritten": m[2], "statements": m[3] })
+fn figures(m: [u64; 5]) -> Value {
+    json!({ "requests": m[0], "d1RowsRead": m[1], "d1RowsWritten": m[2], "statements": m[3], "queueOps": m[4] })
 }
 
 /// PURE: one day's entry: each Worker's figures, the total, the ratio to each configured quota and the flag.
@@ -189,6 +193,7 @@ mod tests {
             rows_written: written,
             statements: req * 2.0,
             updated_at: 1.0,
+            queue_ops: req / 10.0,
         }
     }
 
@@ -220,7 +225,7 @@ mod tests {
         let today = &v["days"][0];
         assert_eq!(
             today["total"],
-            json!({ "requests": 150, "d1RowsRead": 1_100_000, "d1RowsWritten": 15, "statements": 300 })
+            json!({ "requests": 150, "d1RowsRead": 1_100_000, "d1RowsWritten": 15, "statements": 300, "queueOps": 15 })
         );
         assert_eq!(today["byWorker"]["low-app-layer"]["d1RowsRead"], 200_000);
         assert_eq!(
@@ -293,6 +298,13 @@ mod tests {
             .unwrap();
         }
         let mut stmt = conn.prepare(COST_DAILY_READ_SQL).unwrap();
+        // the D2-ACTOR-A lens's LOW-2: the queue column is read (and served), its windows added
+        let queue_ops: Vec<f64> = stmt
+            .query_map(["2026-10-17"], |r| r.get(7))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(queue_ops, vec![1.0, 2.0], "queueOps read, its windows added");
         let got: Vec<(String, String, f64, f64, f64, f64)> = stmt
             .query_map(["2026-10-17"], |r| {
                 Ok((
