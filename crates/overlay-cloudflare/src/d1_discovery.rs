@@ -3826,7 +3826,7 @@ fn collected_err(e: String) -> CollectedStorageError {
 #[async_trait(?Send)]
 impl CollectedStorage for D1CollectedStorage {
     async fn store_record(&self, record: &CollectedRecord) -> Result<(), CollectedStorageError> {
-        crate::owed_events::note("collected", &record.txid);
+        crate::owed_events::note(overlay_discovery::owed_event::SOURCE_COLLECTED, &record.txid);
         // INSERT OR IGNORE on the (txid, outputIndex) primary key: a replayed
         // submit of the same output is a no-op; a marker for the same
         // (identity, gameId) from another tx is a NEW row. Never overwrite,
@@ -6388,7 +6388,7 @@ impl PotrefundStorage for D1PotrefundStorage {
     }
 
     async fn store_record(&self, record: &PotrefundRecord) -> Result<(), PotrefundStorageError> {
-        crate::owed_events::note("refund", &record.txid);
+        crate::owed_events::note(overlay_discovery::owed_event::SOURCE_REFUND, &record.txid);
         // INSERT OR IGNORE on the (txid, outputIndex) primary key — a
         // replayed submit of the same output is a no-op; markers for the
         // same pot from different txs are ALL kept; never overwrite, never

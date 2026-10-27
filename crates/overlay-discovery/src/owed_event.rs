@@ -44,6 +44,11 @@ pub const TRIGGER_SOURCES: [(&str, &str); 15] = [
     ("owed_spender_bytes", "word"),
 ];
 
+/// The `refund` source (named where a store's first string literal must stay its statement).
+pub const SOURCE_REFUND: &str = "refund";
+/// The `collected` source (as [`SOURCE_REFUND`]).
+pub const SOURCE_COLLECTED: &str = "collected";
+
 /// The `owed_dirty` sources no table trigger writes: the read's wanted envelope and its expansion, the age repair,
 /// the backfill and the tip's gate and untipped marks. The un-acked sweep re-publishes their marks like any other.
 pub const OWN_SOURCES: [&str; 4] = ["wanted", "age", "backfill", "tip"];
