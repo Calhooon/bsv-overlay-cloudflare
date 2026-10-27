@@ -4572,6 +4572,16 @@ pub const TX_ANY_VERDICT_UPSERT_SQL: &str = "INSERT INTO tx_any_verdicts (txid, 
      ON CONFLICT(txid) DO UPDATE SET verdictAtMs = excluded.verdictAtMs, inputOutpoint = excluded.inputOutpoint, spenderTxid = excluded.spenderTxid, kind = excluded.kind, evidence = excluded.evidence \
      WHERE tx_any_verdicts.kind IS NOT 'unconfirmable'";
 
+/// bsv-low #920, the FIX-920 lens's LOW-1: a refusal's `refused` memo, written only while the eviction ledger holds
+/// no readmission newer than the eviction's stamp (`?5`), read INSIDE the statement: a readmission deletes the memo
+/// first and stamps last, so one landing between an eviction and its settle is never overwritten by the memo.
+/// Otherwise [`TX_ANY_VERDICT_UPSERT_SQL`]. Binds: ?1 txid, ?2 verdictAtMs, ?3 kind, ?4 evidence, ?5 the eviction's
+/// stamp.
+pub const TX_ANY_VERDICT_REFUSED_UNLESS_READMITTED_SQL: &str = "INSERT INTO tx_any_verdicts (txid, verdictAtMs, inputOutpoint, spenderTxid, kind, evidence) \
+     SELECT ?1, ?2, '', '', ?3, ?4 WHERE NOT EXISTS (SELECT 1 FROM pot_evictions WHERE txid = ?1 AND readmittedAt IS NOT NULL AND readmittedAt > ?5) \
+     ON CONFLICT(txid) DO UPDATE SET verdictAtMs = excluded.verdictAtMs, inputOutpoint = excluded.inputOutpoint, spenderTxid = excluded.spenderTxid, kind = excluded.kind, evidence = excluded.evidence \
+     WHERE tx_any_verdicts.kind IS NOT 'unconfirmable'";
+
 /// The memo's reversal (the second gate's MEDIUM-3b, "confirm beats the latch"): a proof landing, a readmission —
 /// the same moments that clear the retire latch — delete the memo, so a retired row that the chain later proves
 /// never answers `present: false` from a stale word.
