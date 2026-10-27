@@ -6432,17 +6432,11 @@ mod tests {
             q_guard < q_write,
             "a replay asks the ledger before it writes"
         );
-        let q_after = consumer[q_write..]
-            .find(&q_guard_needle)
-            .expect("the consumer's post-write guard")
-            + q_write;
-        let q_reevict = [
-            "crate::admit_fast::evict_txid_",
-            "everywhere(db, &subject, &ev.reason, now_ms)",
-        ]
-        .concat();
+        // bsv-low #920 (the FIX-920 lens's MEDIUM-1): the post-write guard is the one function that reads the open
+        // row, re-evicts, settles the memo and counts (`admit_fast::reevict_after_write_with`, pinned there)
+        let q_after_needle = ["crate::admit_fast::reevict_", "after_write(db, &subject"].concat();
         assert!(
-            consumer[q_after..].contains(&q_reevict),
+            consumer[q_write..].contains(&q_after_needle),
             "the replay that outran an eviction re-evicts"
         );
         let guard_block = &consumer[q_guard..q_write];

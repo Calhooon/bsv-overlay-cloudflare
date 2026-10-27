@@ -1081,6 +1081,65 @@ pub async fn settle_reevicted(
     settle_reevicted_with(&port, &txid, now_ms, outcome, reason, origin).await;
 }
 
+/// What the write-side guard AFTER a write touches (bsv-low #920, the FIX-920 lens's MEDIUM-1): the ledger's open
+/// row, the eviction, the count, beside the settle's memo ([`ReevictedPort`]). D1 in production, real SQLite under
+/// the pins.
+pub(crate) trait WriteGuardPort: ReevictedPort {
+    /// The ledger's OPEN row for the txid (`OPEN_EVICTION_SQL`); `Err` when the ledger cannot be read.
+    async fn open_eviction(&self) -> Result<Option<OpenEviction>, String>;
+    /// The eviction under `reason`, stamped `stamp_ms`.
+    async fn evict(&self, reason: &str, stamp_ms: u64) -> EvictionOutcome;
+    /// `admit_fast_reevicted_after_write_total`, one.
+    async fn count_reevicted(&self);
+}
+
+/// THE WRITE-SIDE GUARD AFTER A WRITE, one function (bsv-low #920, the FIX-920 lens's MEDIUM-1; the queue consumer's
+/// arm after a durable replay): an OPEN eviction of the txid re-evicts what the write landed, settles the refusal's
+/// memo ([`settle_reevicted_with`]) and counts the re-eviction. `Ok(None)` with no open row (nothing written);
+/// `Err` when the ledger cannot be read (the caller's to name and retry).
+pub(crate) async fn reevict_after_write_with<P: WriteGuardPort>(
+    port: &P,
+    txid: &str,
+    now_ms: u64,
+    origin: &str,
+) -> Result<Option<(OpenEviction, EvictionOutcome)>, String> {
+    let Some(ev) = port.open_eviction().await? else {
+        return Ok(None);
+    };
+    let outcome = port.evict(&ev.reason, now_ms).await;
+    settle_reevicted_with(port, txid, now_ms, &outcome, &ev.reason, origin).await;
+    port.count_reevicted().await;
+    Ok(Some((ev, outcome)))
+}
+
+impl WriteGuardPort for D1Reevicted<'_> {
+    async fn open_eviction(&self) -> Result<Option<OpenEviction>, String> {
+        open_eviction(self.db, self.txid).await
+    }
+    async fn evict(&self, reason: &str, stamp_ms: u64) -> EvictionOutcome {
+        evict_txid_everywhere(self.db, self.txid, reason, stamp_ms).await
+    }
+    async fn count_reevicted(&self) {
+        crate::ops::bump_counter(
+            self.db,
+            crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
+            1,
+        )
+        .await;
+    }
+}
+
+/// [`reevict_after_write_with`] over D1 (the queue consumer's guard after a durable replay).
+pub async fn reevict_after_write(
+    db: &D1Database,
+    txid: &str,
+    origin: &str,
+) -> Result<Option<(OpenEviction, EvictionOutcome)>, String> {
+    let txid = txid.to_ascii_lowercase();
+    let port = D1Reevicted { db, txid: &txid };
+    reevict_after_write_with(&port, &txid, worker::Date::now().as_millis(), origin).await
+}
+
 /// The refused verdict memo for a txid (round 5 of the gate, N1): the door's readmission deletes the memo FIRST, so
 /// a `refused` row present after the write was written by a pass that completed after the door — the network's
 /// fresh word, never the door's stale one. `Err` when the memo could not be read.
@@ -8444,16 +8503,34 @@ mod tests {
         }
     }
 
-    /// bsv-low #920: the write-side guard's settle over real SQLite (the shipped schema and the shipped memo SQL).
-    struct SqliteReevicted<'a> {
-        conn: &'a rusqlite::Connection,
+    /// bsv-low #920: the write-side guard after a write over real SQLite (the shipped schema, the shipped eviction
+    /// core and the shipped memo SQL). `before_evict` and `before_memo` land a write between the guard's steps.
+    struct SqliteGuard<'a> {
+        db: &'a SqliteShadow,
         txid: &'a str,
         commits: std::cell::Cell<usize>,
+        before_evict: std::cell::RefCell<Option<LateWrite>>,
+        before_memo: std::cell::RefCell<Option<LateWrite>>,
     }
-    impl ReevictedPort for SqliteReevicted<'_> {
+    impl<'a> SqliteGuard<'a> {
+        fn new(db: &'a SqliteShadow, txid: &'a str) -> Self {
+            Self {
+                db,
+                txid,
+                commits: std::cell::Cell::new(0),
+                before_evict: std::cell::RefCell::new(None),
+                before_memo: std::cell::RefCell::new(None),
+            }
+        }
+    }
+    impl ReevictedPort for SqliteGuard<'_> {
         async fn memo_kind(&self) -> Result<Option<String>, String> {
             use rusqlite::OptionalExtension;
-            self.conn
+            if let Some(write) = self.before_memo.borrow_mut().take() {
+                write(&self.db.conn);
+            }
+            self.db
+                .conn
                 .query_row(REEVICTED_MEMO_KIND_SQL, [self.txid], |r| {
                     r.get::<_, Option<String>>(0)
                 })
@@ -8463,6 +8540,7 @@ mod tests {
         }
         async fn commit(&self, queries: Vec<Query>) -> Result<(), String> {
             let tx = self
+                .db
                 .conn
                 .unchecked_transaction()
                 .map_err(|e| e.to_string())?;
@@ -8476,6 +8554,41 @@ mod tests {
             Ok(())
         }
         fn log(&self, _: String) {}
+    }
+    impl WriteGuardPort for SqliteGuard<'_> {
+        async fn open_eviction(&self) -> Result<Option<OpenEviction>, String> {
+            use rusqlite::OptionalExtension;
+            self.db
+                .conn
+                .query_row(OPEN_EVICTION_SQL, [self.txid], |r| {
+                    Ok(OpenEviction {
+                        reason: r.get(0)?,
+                        evicted_at_ms: r.get::<_, i64>(1)?.max(0) as u64,
+                    })
+                })
+                .optional()
+                .map_err(|e| e.to_string())
+        }
+        async fn evict(&self, reason: &str, stamp_ms: u64) -> EvictionOutcome {
+            if let Some(write) = self.before_evict.borrow_mut().take() {
+                write(&self.db.conn);
+            }
+            let core = evict_core(self.db, self.txid, reason, stamp_ms).await;
+            EvictionOutcome {
+                moved: core.moved,
+                yielded: core.yielded_to_readmission.is_some(),
+                incomplete: !core.faults.is_empty(),
+            }
+        }
+        async fn count_reevicted(&self) {
+            self.db
+                .conn
+                .execute(
+                    crate::ops::BUMP_COUNTER_SQL,
+                    rusqlite::params![crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1],
+                )
+                .unwrap();
+        }
     }
 
     fn fix920_counter(conn: &rusqlite::Connection, name: &str) -> i64 {
@@ -8501,35 +8614,15 @@ mod tests {
         .unwrap()
     }
 
-    /// The write-side guard as every site runs it (`routes::finish_past_deadline`'s arm, the request's, a landed
-    /// predecessor's): the ledger's open row, the eviction under its reason, the settle, the count.
+    /// The write-side guard after a write as the queue consumer's arm runs it (the shipped
+    /// `reevict_after_write_with`; the request's, the past-deadline landing's and a landed predecessor's run the same
+    /// steps, pinned by source below): the ledger's open row, the eviction, the settle, the count.
     async fn fix920_landing_guard(db: &SqliteShadow, txid: &str, now_ms: u64) -> Option<u64> {
-        use rusqlite::OptionalExtension;
-        let reason: Option<String> = db
-            .conn
-            .query_row(OPEN_EVICTION_SQL, [txid], |r| r.get(0))
-            .optional()
-            .unwrap();
-        let reason = reason?;
-        let core = evict_core(db, txid, &reason, now_ms).await;
-        let outcome = EvictionOutcome {
-            moved: core.moved,
-            yielded: core.yielded_to_readmission.is_some(),
-            incomplete: !core.faults.is_empty(),
-        };
-        let port = SqliteReevicted {
-            conn: &db.conn,
-            txid,
-            commits: std::cell::Cell::new(0),
-        };
-        settle_reevicted_with(&port, txid, now_ms, &outcome, &reason, "pin").await;
-        db.conn
-            .execute(
-                crate::ops::BUMP_COUNTER_SQL,
-                rusqlite::params![crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1],
-            )
-            .unwrap();
-        Some(outcome.moved)
+        let port = SqliteGuard::new(db, txid);
+        reevict_after_write_with(&port, txid, now_ms, "pin")
+            .await
+            .unwrap()
+            .map(|(_, outcome)| outcome.moved)
     }
 
     fn fix920_land(conn: &rusqlite::Connection, txid: &str) {
@@ -8546,8 +8639,9 @@ mod tests {
     /// indexers absent: refused, no age floor) and its eviction runs while the admission's engine write is still in
     /// flight (#838's past-deadline landing, 20 s later): the push's pass finds no rows and its job is cut after
     /// its OPEN marker (no memo, no count). The write then LANDS, and its write-side guard reads the open row it
-    /// outran: the rows move to the twins, the refusal's memo (the app layer's `/tx-any` source) and the counts are
-    /// written. RED with the settle made inert (main's guard: the rows moved, the count bumped, NO memo, so
+    /// outran (the queue consumer's arm after a durable replay, the shipped `reevict_after_write_with`; the FIX-920
+    /// lens's MEDIUM-1): the rows move to the twins, the refusal's memo (the app layer's `/tx-any` source) and the
+    /// counts are written. RED with the settle made inert (main's guard: the rows moved, the count bumped, NO memo, so
     /// `/tx-any` served the index's unknown for thirteen minutes).
     #[tokio::test]
     async fn fix920_a_a_refusal_in_flight_completes_at_the_admissions_landing() {
@@ -8667,11 +8761,7 @@ mod tests {
             !reevicted_owes_memo(true, None),
             "never over a yielded pass"
         );
-        let port = SqliteReevicted {
-            conn: &db.conn,
-            txid: "57",
-            commits: std::cell::Cell::new(0),
-        };
+        let port = SqliteGuard::new(&db, "57");
         let yielded = EvictionOutcome {
             moved: 0,
             yielded: true,
@@ -8693,6 +8783,16 @@ mod tests {
         let guard = &guard[..guard.find("\n}\n").unwrap()];
         let past = &routes[routes.find("async fn finish_past_deadline<").unwrap()..];
         let past = &past[..past.find("\n}\n").unwrap()];
+        let consumer = include_str!("lib.rs");
+        let consumer = &consumer[..consumer.find("#[cfg(test)]").unwrap_or(consumer.len())];
+        assert!(
+            consumer.contains("crate::admit_fast::reevict_after_write(db, &subject, \"Queue\")"),
+            "the queue consumer's guard after a durable replay is the one function"
+        );
+        let after_write = &src[src
+            .find("pub(crate) async fn reevict_after_write_with<")
+            .unwrap()..];
+        let after_write = &after_write[..after_write.find("\n}\n").unwrap()];
         for (site, body, needle) in [
             (
                 "guard_landed",
@@ -8715,13 +8815,18 @@ mod tests {
                 "STORED_ECHO_UNDER_EVICTION",
             ),
             ("the Rejected arm's re-run", routes, "&crate::admit_fast::ladder_rerefusal_reason(&reason),\n                            worker::Date"),
+            (
+                "reevict_after_write_with (the queue replay's guard)",
+                after_write,
+                "port.evict(&ev.reason, now_ms)",
+            ),
         ] {
             let at = body
                 .find(needle)
                 .unwrap_or_else(|| panic!("{site}: {needle}"));
             let window = &body[at..(at + 900).min(body.len())];
             assert!(
-                window.contains("settle_reevicted("),
+                window.contains("settle_reevicted(") || window.contains("settle_reevicted_with(port,"),
                 "{site}: the eviction is not followed by the refusal's settle"
             );
         }

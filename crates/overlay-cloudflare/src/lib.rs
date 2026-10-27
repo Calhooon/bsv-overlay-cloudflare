@@ -2070,15 +2070,11 @@ async fn queue_handler(
                 // while this replay was landing — its table loop missed the rows landing after each step — is
                 // re-run over what the replay wrote; the replay is acked either way (its bytes are refused)
                 if let Some(db) = &counters {
-                    match crate::admit_fast::open_eviction(db, &subject).await {
-                        Ok(Some(ev)) => {
-                            let now_ms = worker::Date::now().as_millis();
-                            let moved =
-                                crate::admit_fast::evict_txid_everywhere(db, &subject, &ev.reason, now_ms)
-                                    .await
-                                    .moved;
-                            crate::ops::bump_counter(db, crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1)
-                                .await;
+                    // bsv-low #920 (the FIX-920 lens's MEDIUM-1): the re-eviction, the refusal's memo (unless a
+                    // settle wrote it) and the count, one function
+                    match crate::admit_fast::reevict_after_write(db, &subject, "Queue").await {
+                        Ok(Some((ev, outcome))) => {
+                            let moved = outcome.moved;
                             crate::pot_changes::flush_inline(env.clone()).await;
                             worker::console_log!(
                                 "Queue: the replay of {subject} outran an eviction (at {} ms — {}): re-evicted {moved} row(s); acked",
