@@ -135,3 +135,72 @@ fn fix936_i_the_request_signal_flag_is_in_every_render() {
         "wrangler.toml: {flag}"
     );
 }
+
+/// FIX-936-REBASE (PR 183 under PR 188): bsv-low #920's landing guard (the re-eviction stamped with the evidence's
+/// start, `settle_reevicted`, the `admit_fast_reevicted_after_write_total` count) runs ONCE per landing of a gated
+/// owned write, in the write's OWN task (`finish_past_deadline`, under every cause, its count not gated on the
+/// cause), and the request's copy beside it under `InRequest` reads the open row only to answer its 422. Every
+/// other arm (an ungated write, a deferred job's run) keeps the request's full guard. A source pin: the route runs
+/// on wasm only. RED against the guard run in both copies (the request's `task_guards` branch removed) and against the
+/// task's count gated on `counts` again.
+#[test]
+fn fix936_j_the_landing_guard_runs_once_in_the_writes_own_task() {
+    let routes = code(include_str!("routes.rs"));
+    let f = &routes[routes.find("async fn finish_past_deadline<").unwrap()..];
+    let f = &f[..f.find("\n}\n").unwrap()];
+    let arm = &f[f
+        .find("evict_txid_everywhere(\n                &db,\n                &subject,\n                &ev.reason,\n                ev.evicted_at_ms,")
+        .expect("the task's re-eviction, stamped with the evidence's start")..];
+    let arm = &arm[..arm.find("reevicted = true;").unwrap()];
+    assert!(
+        arm.contains("settle_reevicted("),
+        "the task's re-eviction is settled (#920)"
+    );
+    assert!(
+        arm.contains("bump_counter(&db, crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1)"),
+        "the task counts its re-eviction"
+    );
+    assert!(
+        !arm.contains("if counts"),
+        "the task's landing guard and its count run under every cause (the request's copy no longer counts it)"
+    );
+
+    let w = gated_write(routes);
+    let spawned = w.find("ctx.wait_until(task);").unwrap();
+    let set = w
+        .find("task_guards = true;")
+        .expect("the owned arm marks that its task guards the landing");
+    assert!(
+        spawned < set,
+        "marked once the task is handed to the platform"
+    );
+
+    let post = &routes[routes
+        .find("let (steak, mutation_report) = match engine_outcome {")
+        .unwrap()..];
+    let arm = post
+        .find("Ok(Some(ev)) => {\n                    if task_guards {")
+        .expect("the request's copy asks whether the task guards the landing");
+    let split = arm + post[arm..].find("} else {").unwrap();
+    let read_only = &post[arm..split];
+    let full = split
+        + post[split..]
+            .find("everywhere(&ledger_db, subject, &ev.reason, ev.evicted_at_ms)")
+            .expect("the request's full guard for every other arm");
+    for needle in [
+        "evict_txid_everywhere",
+        "settle_reevicted",
+        "COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE",
+    ] {
+        assert!(
+            !read_only.contains(needle),
+            "the request's copy beside the task does not run the landing guard ({needle})"
+        );
+    }
+    let answer = &post[full..];
+    let answer = &answer[..answer.find("Ok(None) => {}").unwrap()];
+    assert!(
+        answer.contains("evicted_after_write_message(word), 422"),
+        "both branches answer the refusal, never a 200 over an open eviction"
+    );
+}

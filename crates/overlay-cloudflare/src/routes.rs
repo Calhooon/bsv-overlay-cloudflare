@@ -880,7 +880,7 @@ async fn finish_past_deadline<F>(
                 ev.evicted_at_ms,
                 &outcome,
                 &ev.reason,
-                &format!("POST /submit(broadcast-gated) {word}"),
+                &["POST /submit(broadcast-gated) ", word].concat(),
             )
             .await;
             crate::ops::bump_counter(&db, crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1)
@@ -2247,43 +2247,41 @@ async fn submit_parts(
                         return Ok(with_server_timing(resp, "admit;desc=\"unavailable\""));
                     }
                 }
-                Ok(Some(ev)) if task_guards => {
-                    // bsv-low #936 (FIX-936-REBASE): the write's own task runs the landing guard (#920's re-eviction,
-                    // settle and count, `finish_past_deadline`) on this landing; this copy reads the open row only to
-                    // answer the refusal it is (never a 200 over an open eviction), so the guard runs ONCE
-                    worker::console_log!(
-                        "POST /submit -> 422 (the admission write for {subject} outran its eviction (evicted at {} ms — {}): the write's own task re-evicts; the network's word stands)",
-                        ev.evicted_at_ms,
-                        ev.reason
-                    );
-                    counters.reason(SubmitReason::Evicted);
-                    let word = crate::admit_fast::refusal_status_word(&ev.reason);
-                    let resp = json_error(&evicted_after_write_message(word), 422)?;
-                    return Ok(with_server_timing(resp, "admit;desc=\"evicted\""));
-                }
                 Ok(Some(ev)) => {
-                    // the FIX-920 lens's LOW-2: stamped with the evidence's start, so a readmission after it yields
-                    #[rustfmt::skip] // Main's exact eviction wiring pin.
-                    let outcome = crate::admit_fast::evict_txid_everywhere(&ledger_db, subject, &ev.reason, ev.evicted_at_ms).await;
-                    // bsv-low #920: the refusal's memo, unless its own settle wrote it
-                    crate::admit_fast::settle_reevicted(
-                        &ledger_db,
-                        subject,
-                        ev.evicted_at_ms,
-                        &outcome,
-                        &ev.reason,
-                        "POST /submit",
-                    )
-                    .await;
-                    let moved = outcome.moved;
-                    counters.bump(crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1);
-                    // the eviction is the event the felt voids on: ship its notes now (this answer is not a 200)
-                    crate::pot_changes::flush_inline(env.clone()).await;
-                    worker::console_log!(
-                        "POST /submit -> 422 (the admission write for {subject} outran its eviction (evicted at {} ms — {}): re-evicted {moved} row(s); the network's word stands)",
-                        ev.evicted_at_ms,
-                        ev.reason
-                    );
+                    if task_guards {
+                        // bsv-low #936 (FIX-936-REBASE): the write's own task runs the landing guard (#920's
+                        // re-eviction, settle and count, `finish_past_deadline`) on this landing; this copy reads the
+                        // open row only to answer the refusal it is (never a 200 over an open eviction), so the guard
+                        // runs ONCE per landing
+                        worker::console_log!(
+                            "POST /submit -> 422 (the admission write for {subject} outran its eviction (evicted at {} ms — {}): the write's own task re-evicts; the network's word stands)",
+                            ev.evicted_at_ms,
+                            ev.reason
+                        );
+                    } else {
+                        // the FIX-920 lens's LOW-2: stamped with the evidence's start, so a readmission after it yields
+                        #[rustfmt::skip] // Main's exact eviction wiring pin.
+                        let outcome = crate::admit_fast::evict_txid_everywhere(&ledger_db, subject, &ev.reason, ev.evicted_at_ms).await;
+                        // bsv-low #920: the refusal's memo, unless its own settle wrote it
+                        crate::admit_fast::settle_reevicted(
+                            &ledger_db,
+                            subject,
+                            ev.evicted_at_ms,
+                            &outcome,
+                            &ev.reason,
+                            "POST /submit",
+                        )
+                        .await;
+                        let moved = outcome.moved;
+                        counters.bump(crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1);
+                        // the eviction is the event the felt voids on: ship its notes now (this answer is not a 200)
+                        crate::pot_changes::flush_inline(env.clone()).await;
+                        worker::console_log!(
+                            "POST /submit -> 422 (the admission write for {subject} outran its eviction (evicted at {} ms — {}): re-evicted {moved} row(s); the network's word stands)",
+                            ev.evicted_at_ms,
+                            ev.reason
+                        );
+                    }
                     // the status WORD only (the gate's NIT): the reason embeds Arcade's extraInfo, and the client's
                     // already-known belt classifies on text
                     counters.reason(SubmitReason::Evicted);
