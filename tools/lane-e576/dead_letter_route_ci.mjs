@@ -135,10 +135,13 @@ function d1(sql) {
       )
       return JSON.parse(out)[0]?.results ?? []
     } catch (e) {
-      // The local CLI can exit while the live queue is writing this database. Retry reads
-      // only: a replayed INSERT could duplicate the very history this pin is measuring.
-      if (!/^\s*SELECT\b/i.test(sql) || attempt >= 3) throw e
-      console.warn(`local D1 read retry ${attempt}/2: exit=${e.status} signal=${e.signal}`)
+      // SQLITE_BUSY means this single statement did not complete: the live queue held
+      // the local database. Other CLI faults are retried only for reads, never writes.
+      const busy = /SQLITE_BUSY/.test(`${e.stderr ?? ''}${e.stdout ?? ''}`)
+      const read = /^\s*SELECT\b/i.test(sql)
+      if ((!busy && !read) || attempt >= 4) throw e
+      console.warn(`local D1 ${busy ? 'busy statement' : 'read'} retry ${attempt}/3: exit=${e.status} signal=${e.signal}`)
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100 * 2 ** (attempt - 1))
     }
   }
 }
