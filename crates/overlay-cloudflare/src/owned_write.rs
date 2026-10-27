@@ -64,6 +64,8 @@ impl<T> Future for Handle<T> {
 /// The request's `AbortSignal` (`Request.signal`), read where the request is; a run with no request (a deferred
 /// job's, a native pin's) holds none and is never gone.
 #[derive(Clone, Default)]
+// natively no request carries a signal: the field is read on wasm32 only
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub struct RequestSignal(Option<worker::web_sys::AbortSignal>);
 
 impl RequestSignal {
