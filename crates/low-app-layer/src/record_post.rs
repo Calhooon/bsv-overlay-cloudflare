@@ -1609,6 +1609,11 @@ pub(crate) async fn potrefund_chain_noop<P: crate::pot_hook::SqlPort>(
             .collect();
         let changes = owed_write::write_filings(port, writes).await?;
         latched = changes.iter().any(|n| insert_wrote_a_row(n.map(|n| n as usize)));
+        // bsv-low #911 (the D2-ACTOR-A lens's MEDIUM-3): the latch moved CHAIN rows, whose `refund` trigger marked
+        // each by its own txid (the filing's row was never written): noted after the batch, published by the door
+        for (txid, _) in &own {
+            crate::owed_events_publish::note(overlay_discovery::owed_event::SOURCE_REFUND, txid);
+        }
     }
     Ok(ChainNoop {
         own: own.len() as i64,
@@ -4640,6 +4645,34 @@ pub(crate) mod tests {
             "crate::record_post::potrefund_chain_noop(&port,&verified.potrefund,pot.as_ref())"
         ));
         assert!(!handfile.contains("(HandfileSlot::Potrefund,&refund)"));
+    }
+
+    /// bsv-low #911 (the D2-ACTOR-A lens's MEDIUM-3 (a)): the #798 chain latch is a door write outside the filing's
+    /// own row: its latched CHAIN rows are noted as `refund` by their own txid, each holding the trigger's mark, so the
+    /// door's publish routes them (the filing's own txid holds no row and no mark). RED on 59d98ec6: no `refund` note
+    /// of the chain row, the mark waited for the sweep.
+    #[tokio::test(flavor = "current_thread")]
+    async fn d2_actor_a_fold_m3_the_chain_latch_notes_its_rows_as_refund() {
+        let victim = wallet(0x42);
+        let id = identity(&victim);
+        let id_lc = hex::encode(&id);
+        let gid = [0x7bu8; 32];
+        let filing = potrefund_script(&victim, &gid, &presigned_refund());
+        let db = crate::pot_hook::tests::SqliteSql::migrated();
+        md_index_the_pot(&db);
+        md_seat(&db, &id_lc, &gid);
+        let own_txid = "b1".repeat(32);
+        md_chain_admit(&db, &filing, &own_txid, 1_500);
+        let _ = crate::owed_events_publish::drain();
+        let (out, _) = md_file(&db, RecordKind::Potrefund, &filing, &id_lc).await;
+        assert_eq!(out, DoorOutcome::AlreadyIndexed { latched: true });
+        let notes = crate::owed_events_publish::drain();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.source == "refund" && n.key == own_txid),
+            "the latched chain row is noted: {notes:?}"
+        );
     }
 
     /// The hop's marker row as the index holds it (the shipped hopparty write), `markerValid` as given.
