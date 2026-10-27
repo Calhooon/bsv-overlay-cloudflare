@@ -3052,6 +3052,8 @@ pub(crate) async fn internal_pot_changed(
         Ok(report) => for (_, error) in report.faults { console_warn!("[owed] pot judgement deferred: {error}"); },
         Err(error) => console_warn!("[owed] pot drain failed: {error}"),
     }
+    // FIX-935-FOLD: the judge's `owed-changed` pushes are queued, never sent in the answer path; handed here.
+    crate::push_coalesce::flush_after(ctx, env);
     let ms = worker::Date::now().as_millis().saturating_sub(t0);
     worker::console_log!(
         "[pot-changed] answered in {ms} ms, announce detached ({} outpoints)",
@@ -3239,6 +3241,8 @@ pub(crate) async fn internal_hop_changed(
         Ok(report) => for (_, error) in report.faults { console_warn!("[owed] hop judgement deferred: {error}"); },
         Err(error) => console_warn!("[owed] hop drain failed: {error}"),
     }
+    // FIX-935-FOLD: the judge's queued pushes, after the answer.
+    crate::push_coalesce::flush_after(ctx, env);
     let ms = worker::Date::now().as_millis().saturating_sub(t0);
     worker::console_log!(
         "[hop-changed] answered in {ms} ms, bounded judgement ({} identities)",

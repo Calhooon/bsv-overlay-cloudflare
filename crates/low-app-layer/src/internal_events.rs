@@ -178,6 +178,14 @@ pub async fn first_party_push_with_id(
         .delivery()
 }
 
+/// Whether this Worker can push at all (`RELAY_URL`, `BROADCAST_TOKEN`, `SERVER_PRIVATE_KEY`, the three
+/// [`first_party_push_answer`] reads; FIX-935-FOLD: the coalescer is bypassed without them).
+pub fn relay_configured(env: &Env) -> bool {
+    env.var("RELAY_URL").is_ok()
+        && env.secret("BROADCAST_TOKEN").is_ok()
+        && env.secret("SERVER_PRIVATE_KEY").is_ok()
+}
+
 /// One relay `/push`, answered as `push_coalesce::answer_of` reads it (bsv-low #935: a `429 ERR_SEND_BUDGET` by its
 /// code, apart from any other refusal).
 pub async fn first_party_push_answer(
@@ -700,6 +708,8 @@ pub async fn tip_changed(mut req: Request, env: &Env, ctx: &Context) -> Result<R
         }
         Err(error) => console_log!("[owed] tip marking failed: {error}"),
     }
+    // FIX-935-FOLD: the judge's queued pushes, after the answer.
+    crate::push_coalesce::flush_after(ctx, env);
     Response::from_json(&json!({ "ok": true, "room": TIP_ROOM, "height": height }))
 }
 

@@ -61,5 +61,7 @@ pub(crate) fn schedule(
         }
         let ms = worker::Date::now().as_millis().saturating_sub(started);
         worker::console_log!("[record] {source} detached judge;dur={ms}");
+        // FIX-935-FOLD: the judge's queued pushes, outside its wall.
+        crate::push_coalesce::flush_queued(env).await;
     });
 }

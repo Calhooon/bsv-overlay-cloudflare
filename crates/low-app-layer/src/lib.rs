@@ -270,6 +270,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
             )
             .await;
         pass_meter::end_task(&meter, routes::D1Sql::of(&env_intake).ok().as_ref()).await;
+        push_coalesce::flush_queued(env_intake).await;
     });
     let env_owed = env.clone();
     let meter_owed = meter.clone();
@@ -323,6 +324,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
             routes::D1Sql::of(&env_backfill).ok().as_ref(),
         )
         .await;
+        // FIX-935-FOLD: the judge's queued pushes, after the task's walled work.
+        push_coalesce::flush_queued(env_backfill).await;
     });
     let tracker: pot_hook::Detached = Box::pin(async move {
         meter
@@ -357,6 +360,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
             .phase("tracker.sweep", routes::sweep_owed_spender_bytes(&env))
             .await;
         pass_meter::end_task(&meter, routes::D1Sql::of(&env).ok().as_ref()).await;
+        push_coalesce::flush_queued(env).await;
     });
     pot_hook::schedule_tick(&|f| ctx.wait_until(f), drain, intake, tracker);
     ctx.wait_until(backfill);
@@ -392,6 +396,8 @@ fn flush_counters_if_due(ctx: &Context, env: &Env) {
         let db = env.d1("OVERLAY_DB").ok();
         ctx.wait_until(async move { courier::flush(db, pending).await });
     }
+    // FIX-935-FOLD: the owed judge's queued pushes, sent after the answer.
+    push_coalesce::flush_after(ctx, env);
 }
 
 /// The fetch body, under the ledger [`fetch`] scopes.
@@ -474,10 +480,14 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // the same `owed_belt::tick` the alarm runs, under this request's D1 ledger.
     // bsv-low #893 section 6.1: one backfill pass on demand (bearer `INTERNAL_TOKEN`), the scheduled task's function.
     if req.method() == worker::Method::Post && req.path() == "/internal/owed-backfill-pass" {
-        return owed_backfill::lever(req, &env).await;
+        let resp = owed_backfill::lever(req, &env).await;
+        push_coalesce::flush_after(&ctx, &env);
+        return resp;
     }
     if req.method() == worker::Method::Post && req.path() == "/internal/owed-belt-tick" {
-        return owed_belt::lever(req, &env).await;
+        let resp = owed_belt::lever(req, &env).await;
+        push_coalesce::flush_after(&ctx, &env);
+        return resp;
     }
     // bsv-low W4 (2026-09-03): the tower watchdog's population — unspent pots
     // with an admitted refund-backup marker, bearer-gated like the webhooks.
@@ -524,12 +534,15 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let counters_db = env.d1("OVERLAY_DB").ok();
     // bsv-low #499: the figures ride the answer's `Server-Timing` (stamped by `fetch`, after this body signed or
     // sealed the response) and `/health.d1Budget`.
+    let push_env = env.clone();
     let mut resp = router(state, schema_ready).run(req, env).await?;
     if !stored_owed {
         let pending = courier::take_pending_if_due(worker::Date::now().as_millis() as f64);
         if !pending.is_empty() {
             ctx.wait_until(async move { courier::flush(counters_db, pending).await });
         }
+        // FIX-935-FOLD: the owed judge's queued pushes (a filing's, a word's), sent after the answer.
+        push_coalesce::flush_after(&ctx, &push_env);
     }
 
     // Sign the terminal JSON for an AUTHENTICATED caller (the tower's
