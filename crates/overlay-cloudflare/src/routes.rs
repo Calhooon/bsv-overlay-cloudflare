@@ -761,6 +761,9 @@ async fn submit_inner(
 /// replay, marked `gated`, exactly as the request does: the FIX-838 lens's MEDIUM-1), and the notes this write took
 /// shipped. The deferred job is the second cover (its run is this arm again, after the platform's end of this
 /// task): it covers a write the platform cuts and a replay the queue refused. This never evicts an accepted subject.
+/// bsv-low #936: the same after-write for a write whose request went away while it ran (`cause` `RequestGone`, run
+/// by the write's own task; its deferred job put at rest when the request went).
+#[allow(clippy::too_many_arguments)]
 async fn finish_past_deadline<F, S>(
     write: F,
     env: Env,
@@ -769,6 +772,7 @@ async fn finish_past_deadline<F, S>(
     subject: String,
     door_readmit_failed: bool,
     engine_started: f64,
+    cause: crate::ef_deferred::AfterAnswer,
 ) where
     F: std::future::Future<
         Output = Result<(S, overlay_engine::engine::MutationReport), EngineError>,
@@ -782,10 +786,14 @@ async fn finish_past_deadline<F, S>(
         );
         return;
     };
+    if cause == crate::ef_deferred::AfterAnswer::RequestGone {
+        crate::ops::bump_counter(&db, crate::ops::COUNTER_SUBMIT_WRITE_OUTLIVED_REQUEST, 1).await;
+    }
     let report = match &outcome {
         Ok((_, report)) => {
             worker::console_log!(
-                "POST /submit(broadcast-gated): {subject} past-deadline write landed after the answer in {took:.0} ms (durable: {}; {} fault(s))",
+                "POST /submit(broadcast-gated): {subject} {} write landed after the answer in {took:.0} ms (durable: {}; {} fault(s))",
+                cause.word(),
                 report.is_durable(),
                 report.faults.len()
             );
@@ -2045,9 +2053,47 @@ async fn submit_parts(
             let write_beef = tagged_beef.clone();
             let write =
                 Box::pin(async move { write_engine.submit_with_report(&write_beef, mode).await });
+            // bsv-low #936: the write is OWNED by `ctx.wait_until` from its first statement and the request only
+            // waits on its answer (`handle`). A client that goes away cancels the request, and on eaaee0ec that
+            // dropped the write between `insert_output` and the lookup services' rows (loop 52's `fad01028…`: a
+            // `tm_pot` coin with no `pot_records` or `pot_beefs`, then deleted by the refund's admission, the pot
+            // gone from the index with no eviction record). Gone during the write: the submission is put at rest
+            // as the deferred job at once (the cover of a task the platform itself cuts), and the write's own task
+            // runs what the request would have run after it (`finish_past_deadline`, cause `RequestGone`).
+            let (cover_env, cover_tagged, cover_subject) =
+                (env.clone(), tagged_beef.clone(), subject.to_string());
+            let cover_mode = mode_header.clone().unwrap_or_default();
+            let (orphan_env, orphan_tagged, orphan_subject) =
+                (env.clone(), tagged_beef.clone(), subject.to_string());
+            let (task, handle) = crate::owned_write::owned_write(
+                write,
+                move || async move {
+                    crate::ef_deferred::defer_request_gone(
+                        &cover_env,
+                        &cover_tagged,
+                        &cover_mode,
+                        &cover_subject,
+                        work,
+                    )
+                    .await;
+                },
+                move |outcome| {
+                    finish_past_deadline(
+                        std::future::ready(outcome),
+                        orphan_env,
+                        orphan_tagged,
+                        mode,
+                        orphan_subject,
+                        door_readmit_failed,
+                        engine_started,
+                        crate::ef_deferred::AfterAnswer::RequestGone,
+                    )
+                },
+            );
+            ctx.wait_until(task);
             let left = crate::ef_deferred::answer_ms_left(arm_started_ms, engine_started);
             let deadline = worker::Delay::from(std::time::Duration::from_millis(left));
-            match crate::ef_deferred::within_deadline(write, deadline).await {
+            match crate::ef_deferred::within_deadline(handle, deadline).await {
                 crate::ef_deferred::Deadlined::Done(outcome) => outcome,
                 crate::ef_deferred::Deadlined::Past(write) => {
                     worker::console_log!(
@@ -2062,6 +2108,7 @@ async fn submit_parts(
                         subject.to_string(),
                         door_readmit_failed,
                         engine_started,
+                        crate::ef_deferred::AfterAnswer::PastDeadline,
                     ));
                     counters.reason(SubmitReason::Queued);
                     let answer = crate::ef_deferred::defer_past_deadline(
