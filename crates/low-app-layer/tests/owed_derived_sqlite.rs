@@ -72,10 +72,13 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     // admission and a refusing word, then D2-OWED-FOLD-8's appended missing-evidence table and its dirty trigger).
     // FIX-CADENCE-GAUGES appends 29 DROP/CREATE pairs and two covering indexes.
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..409]), 740_971_678);
-    const COUNT: usize = 469;
+    // bsv-low #911 (D2-ACTOR-A) appends four: the owed events' counter, their dead letters, the hop facts' index and
+    // the cost bar's queue column; the 469 before them are untouched.
+    assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..469]), 889_593_182);
+    const COUNT: usize = 473;
     assert_eq!(OVERLAY_MIGRATIONS.len(), COUNT);
     assert_eq!(d1::OVERLAY_MIGRATION_COUNT, COUNT);
-    const FINGERPRINT: u32 = 889_593_182;
+    const FINGERPRINT: u32 = 1_223_941_910;
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT, "the certified fingerprint");
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT);
     assert_eq!(fingerprint(OVERLAY_MIGRATIONS), FINGERPRINT);
