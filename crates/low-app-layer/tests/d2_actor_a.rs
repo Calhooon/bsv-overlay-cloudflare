@@ -497,17 +497,20 @@ async fn d2_actor_a_fold_m2_a_pair_faulting_for_good_is_held_doubling_and_parked
     assert!(cause.contains("injected fault"), "the cause readable: {cause}");
     assert_eq!(db.int("SELECT COUNT(*) FROM owed_dirty"), 1, "its mark stays");
 
-    // the health serves the memo: one pair, its faults and its last error
+    // the health serves the memo: the pair's and its one subject's (NEW-M1), its faults and its last error
     let health = owed_events::health(&db).await;
-    assert_eq!(health["faultMemo"]["rows"], 1);
+    assert_eq!(health["faultMemo"]["rows"], 2);
     assert!(health["faultMemo"]["last"]["lastFault"]
         .as_str()
         .unwrap()
         .contains("injected fault"));
     assert_eq!(health["deadLetters"]["parked"], 1);
 
-    // the judge lands: the memo cleared, the letter resolved, in the consumer's batch row
+    // the judge lands once the subject's hold ran out: both memos cleared, the letter resolved, in the consumer's
+    // batch row
     *db.fail_on.borrow_mut() = None;
+    db.now
+        .set(db.now.get() + owed_events::FAULT_HOLD_CAP_MS as u64 + 1);
     owed_events::route(&db, &event("hop", &hop_key(&hop)))
         .await
         .unwrap();
@@ -589,9 +592,22 @@ fn json_key(source: &str, key: &str) -> String {
 /// judge, and every caller awaits the gate. RED on 59d98ec6 (`configured` was the binding alone).
 #[test]
 fn d2_actor_a_fold_l1_the_queue_waits_for_the_overlays_certified_migrations() {
-    assert_eq!(
-        owed_events::OWED_EVENTS_MIGRATION_COUNT as usize,
-        bsv_overlay_cloudflare::d1::OVERLAY_MIGRATION_COUNT
+    // D2-ACTOR-A-DELTA's NOTE-3: the gate is the count from which the publish's statements EXIST (`>=` is the
+    // rule), so the pin holds them inside the overlay's first 473 migrations and lets the list grow past it
+    let n_gate = owed_events::OWED_EVENTS_MIGRATION_COUNT as usize;
+    assert!(n_gate <= bsv_overlay_cloudflare::d1::OVERLAY_MIGRATION_COUNT);
+    let prefix = &bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS[..n_gate];
+    for needed in [
+        publish::SEQ_CREATE,
+        publish::DEAD_LETTERS_CREATE,
+        publish::RELEASED_MISSING_HOP_INDEX,
+    ] {
+        assert!(prefix.contains(&needed), "inside the gate: {needed}");
+    }
+    assert!(
+        !bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS[..n_gate - 1]
+            .contains(&bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS[n_gate - 1]),
+        "the gate's last migration is its own"
     );
     let n = f64::from(owed_events::OWED_EVENTS_MIGRATION_COUNT);
     assert!(owed_events::ready_at(Some(n)));
@@ -636,6 +652,253 @@ async fn d2_actor_a_fold_l6_no_subject_no_tip_and_no_identity_event_without_a_ma
     let at = src.find("pubasyncfnconsume_one(").unwrap();
     let body = &src[at..];
     let empty = body.find("ifplan.is_empty(){returnOk(Routed::default());}").unwrap();
-    let tip = body.find("lettip=tip_memoised(env).await;").unwrap();
+    let tip = body
+        .find("lettip=tip_memoised(env,tip_reads_fresh(&ev.source)).await;")
+        .unwrap();
     assert!(empty < tip, "the plan before the tip");
+}
+
+/// Every mark of the store moved onto one shared pair (the age repair's `age`/`age`, the tip's `tip`/`gate`).
+fn onto_pair(db: &Db, source: &str, key: &str) {
+    db.exec(&format!(
+        "UPDATE owed_dirty SET source='{source}',sourceKey='{key}'"
+    ));
+}
+
+fn rows_of(db: &Db, identity: &str, game: &str) -> i64 {
+    db.int(&format!(
+        "SELECT COUNT(*) FROM owed_rows WHERE identity='{identity}' AND gameId='{game}'"
+    ))
+}
+
+/// D2-ACTOR-A-DELTA's NEW-M1: ONE POISONED SUBJECT NEVER HOLDS A SHARED PAIR. Three identities and a fourth's three
+/// games marked under one shared pair (`age`/`age`, then `tip`/`gate`), the middle identity's game and the fourth's
+/// middle game faulting at every judge (`fail_bind`). The first delivery judges every other subject and acknowledges
+/// it, keeps the two poisoned marks, keys the fault memo by SUBJECT (no pair memo: the pair is not held), and answers
+/// `Ok`; the next delivery of the pair judges a subject marked since. From the third fault a poisoned subject is held
+/// (skipped, its mark kept) and the sweep leaves out a pair holding only held subjects. RED on `7ad5279f`: the first
+/// delivery's `Err` at the first poisoned chunk, the subjects behind it never judged.
+#[tokio::test(flavor = "current_thread")]
+async fn d2_actor_a_fold2_m1_a_poisoned_subject_never_holds_a_shared_pair() {
+    let ids = [
+        format!("02{}", "a1".repeat(32)),
+        format!("02{}", "a2".repeat(32)),
+        format!("02{}", "a3".repeat(32)),
+        format!("02{}", "a4".repeat(32)),
+    ];
+    for (source, key) in [("age", "age"), ("tip", "gate")] {
+        let db = Db::new();
+        seed_stranded_hop(&db, &ids[0], "g1", &owed_db::hop(1));
+        seed_stranded_hop(&db, &ids[1], "gbad", &owed_db::hop(2));
+        seed_stranded_hop(&db, &ids[2], "g3", &owed_db::hop(3));
+        seed_stranded_hop(&db, &ids[3], "d1", &owed_db::hop(4));
+        seed_stranded_hop(&db, &ids[3], "dbad", &owed_db::hop(5));
+        seed_stranded_hop(&db, &ids[3], "d3", &owed_db::hop(6));
+        onto_pair(&db, source, key);
+        *db.fail_bind.borrow_mut() = Some("bad".into());
+
+        let routed = owed_events::route(&db, &event(source, key)).await;
+        let routed = routed.unwrap_or_else(|e| panic!("{source}/{key}: one poisoned subject failed the message: {e}"));
+        assert_eq!(
+            (routed.subjects, routed.faults),
+            (4, 2),
+            "{source}/{key}: the four others judged, the two poisoned faulted"
+        );
+        for (id, g) in [(&ids[0], "g1"), (&ids[2], "g3"), (&ids[3], "d1"), (&ids[3], "d3")] {
+            assert!(rows_of(&db, id, g) >= 1, "{source}/{key}: {g} judged");
+        }
+        assert_eq!(
+            db.int(&format!(
+                "SELECT COUNT(*) FROM owed_dirty WHERE source='{source}' AND sourceKey='{key}'"
+            )),
+            2,
+            "{source}/{key}: the poisoned marks stay, the others acknowledged"
+        );
+        assert_eq!(
+            db.int(&format!(
+                "SELECT COUNT(*) FROM owed_belt_state WHERE name='{}'",
+                owed_events::fault_memo_name(source, key)
+            )),
+            0,
+            "{source}/{key}: no pair memo: the pair is not held"
+        );
+        assert_eq!(
+            db.int(&format!(
+                "SELECT COUNT(*) FROM owed_belt_state WHERE name='{}'",
+                owed_events::subject_memo_name(&ids[1], "gbad")
+            )),
+            1,
+            "{source}/{key}: the memo is the subject's"
+        );
+
+        // the next delivery of the pair judges a subject marked since
+        seed_stranded_hop(&db, &ids[0], "g5", &owed_db::hop(7));
+        onto_pair(&db, source, key);
+        let routed = owed_events::route(&db, &event(source, key)).await.unwrap();
+        assert_eq!(routed.subjects, 1, "{source}/{key}: the new subject judged");
+        assert!(rows_of(&db, &ids[0], "g5") >= 1);
+
+        // the poisoned subjects alone: nothing lands, so the message is an Err (the pair's own memo is the consumer's);
+        // that third fault holds each poisoned subject: skipped, its mark kept, never a judge
+        let err = owed_events::route(&db, &event(source, key)).await;
+        assert!(err.is_err(), "{source}/{key}: nothing landed: {err:?}");
+        let routed = owed_events::route(&db, &event(source, key)).await.unwrap();
+        assert_eq!(
+            (routed.subjects, routed.faults, routed.held),
+            (0, 0, 2),
+            "{source}/{key}: held subjects are skipped"
+        );
+        // the sweep leaves out a pair whose every subject is held
+        // the marks waited four ticks (the trigger stamps the wall clock; the test's clock is NOW)
+        db.exec(&format!(
+            "UPDATE owed_dirty SET markedAtMs={}",
+            db.now.get() as i64 - 4 * owed_events::SWEEP_AFTER_MS
+        ));
+        assert!(
+            owed_events::sweep(&db, db.now.get() as i64).await.unwrap().is_empty(),
+            "{source}/{key}: a pair of held subjects is not re-published"
+        );
+        // the poison lifts: once the hold ends the subject is judged and its memo cleared
+        *db.fail_bind.borrow_mut() = None;
+        db.now.set(db.now.get() + owed_events::FAULT_HOLD_BASE_MS as u64 + 1);
+        let routed = owed_events::route(&db, &event(source, key)).await.unwrap();
+        assert_eq!(routed.subjects, 2, "{source}/{key}: judged after the hold");
+        assert_eq!(
+            db.int("SELECT COUNT(*) FROM owed_belt_state WHERE name LIKE 'owed-events:fault:%'"),
+            0
+        );
+        assert_eq!(db.int("SELECT COUNT(*) FROM owed_dirty"), 0);
+    }
+}
+
+/// D2-ACTOR-A-DELTA's LOW-C: a `redriven` letter whose message neither re-parked nor landed is returned to the lever
+/// after the hour (its spent re-drive kept), and the family's discard takes `parked` and `exhausted` letters by pair,
+/// never a `redriven` one in flight, never a mark; the body's bounds; both levers' wiring. RED on `7ad5279f`: no
+/// `redrivenAt`, no stale return, no discard of the family.
+#[tokio::test(flavor = "current_thread")]
+async fn d2_actor_a_fold2_low_c_a_lost_redrive_returns_and_the_family_discards() {
+    use owed_events::{park_letter, Parked};
+    let db = Db::new();
+    seed_stranded_hop(&db, ID, "g1", &owed_db::hop(1));
+    for (i, n) in [1usize, 2, 3].iter().enumerate() {
+        let body = event("pot", &hop_key(&owed_db::hop(*n))).encode();
+        assert_eq!(
+            park_letter(&db, &format!("m{i}"), &body).await.unwrap(),
+            Parked::Row("parked".into())
+        );
+    }
+    let t0: i64 = 1_790_000_000_000;
+    let redrive = |key: &str, at: i64| {
+        db.exec(
+            &publish::DEAD_LETTERS_REDRIVEN_SQL
+                .replace("?1", &json_key("pot", key))
+                .replace("?2", &at.to_string()),
+        );
+    };
+    redrive(&hop_key(&owed_db::hop(1)), t0);
+    let status = |n: usize| {
+        db.text(&format!(
+            "SELECT status FROM owed_event_dead_letters WHERE sourceKey='{}'",
+            hop_key(&owed_db::hop(n))
+        ))
+        .unwrap()
+    };
+    assert_eq!(status(1), "redriven");
+    let stale = |now: i64| {
+        db.int(&format!(
+            "SELECT COUNT(*) FROM owed_event_dead_letters WHERE status='redriven' AND (redrivenAt IS NULL OR redrivenAt<{})",
+            now - publish::REDRIVE_STALE_MS
+        ))
+    };
+    assert_eq!(stale(t0 + publish::REDRIVE_STALE_MS - 1), 0, "inside the hour: in flight");
+    assert_eq!(stale(t0 + publish::REDRIVE_STALE_MS + 1), 1);
+    // the lever's call an hour and a millisecond on: its cutoff is `now - REDRIVE_STALE_MS`
+    let now = t0 + publish::REDRIVE_STALE_MS + 1;
+    db.exec(
+        &publish::DEAD_LETTERS_STALE_RETURN_SQL
+            .replace("?1", &(now - publish::REDRIVE_STALE_MS).to_string()),
+    );
+    assert_eq!(status(1), "parked", "returned to the lever");
+    assert_eq!(
+        db.int(&format!(
+            "SELECT redrives FROM owed_event_dead_letters WHERE sourceKey='{}'",
+            hop_key(&owed_db::hop(1))
+        )),
+        1,
+        "its spent re-drive kept"
+    );
+
+    // the discard: a parked and an exhausted letter by pair; a redriven one in flight and an unknown key are not found
+    redrive(&hop_key(&owed_db::hop(2)), t0);
+    db.exec(&format!(
+        "UPDATE owed_event_dead_letters SET status='exhausted' WHERE sourceKey='{}'",
+        hop_key(&owed_db::hop(3))
+    ));
+    let marks = db.int("SELECT COUNT(*) FROM owed_dirty");
+    let named = serde_json::json!([
+        ["pot", hop_key(&owed_db::hop(1))],
+        ["pot", hop_key(&owed_db::hop(2))],
+        ["pot", hop_key(&owed_db::hop(3))],
+        ["pot", "nothing"]
+    ]);
+    db.exec(&publish::DEAD_LETTERS_DISCARD_SQL.replace("?1", &format!("'{named}'")));
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_event_dead_letters WHERE source='pot'"),
+        1,
+        "the parked and the exhausted discarded"
+    );
+    assert_eq!(status(2), "redriven", "never a re-drive in flight");
+    assert_eq!(db.int("SELECT COUNT(*) FROM owed_dirty"), marks, "the marks stay");
+
+    // the body's bounds
+    let one = br#"{"family":"owed-events","letters":[{"source":"pot","sourceKey":"k"}]}"#;
+    assert_eq!(publish::parse_discard(one).unwrap(), vec![("pot".into(), "k".into())]);
+    assert!(publish::parse_discard(br#"{"family":"owed-events","letters":[]}"#).is_err());
+    assert!(publish::parse_discard(br#"{"letters":[{"source":"pot"}]}"#).is_err());
+    let many: Vec<_> = (0..=publish::DISCARD_MAX)
+        .map(|i| serde_json::json!({"source": "pot", "sourceKey": format!("k{i}")}))
+        .collect();
+    let many = serde_json::json!({"family": "owed-events", "letters": many}).to_string();
+    assert!(publish::parse_discard(many.as_bytes()).is_err(), "past 50: refused");
+
+    // the wiring: the discard lever routes the family; the re-drive returns stale letters before it reads
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let dl = squash(include_str!("../../overlay-cloudflare/src/dead_letters.rs"));
+    let at = dl.find("pubasyncfninternal_discard(").unwrap();
+    let body = &dl[at..];
+    let gate = body.find("bearer_ok(").unwrap();
+    let family = body
+        .find("returncrate::owed_events::discard_dead_letters(&raw,env).await;")
+        .unwrap();
+    assert!(gate < family, "the bearer before the family");
+    let ov = squash(include_str!("../../overlay-cloudflare/src/owed_events.rs"));
+    let at = ov.find("pubasyncfnredrive_dead_letters(").unwrap();
+    let body = &ov[at..];
+    assert!(
+        body.find(".prepare(DEAD_LETTERS_STALE_RETURN_SQL)").unwrap()
+            < body.find(".prepare(DEAD_LETTERS_READ_SQL)").unwrap()
+    );
+}
+
+/// D2-ACTOR-A-DELTA's LOW-A and LOW-B: the consumer races each message against its wall (handed back past it, the
+/// pair's memo noted, the service time served), and a `tip` event reads the chain tip fresh.
+#[test]
+fn d2_actor_a_fold2_low_a_b_the_message_wall_and_the_fresh_tip() {
+    assert!(owed_events::tip_reads_fresh("tip"));
+    for other in ["age", "pot", "word", "identity", "backfill"] {
+        assert!(!owed_events::tip_reads_fresh(other), "{other}");
+    }
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let src = squash(include_str!("../src/owed_events.rs"));
+    let at = src.find("pubasyncfnqueue(").unwrap();
+    let body = &src[at..];
+    let wall = body
+        .find("futures_util::future::select(work,wall).await")
+        .unwrap();
+    let back = body
+        .find(".with_delay_seconds(CONSUMER_WALL_RETRY_S)")
+        .unwrap();
+    assert!(wall < back);
+    assert!(body.contains("\"serviceMs\":service_max"));
+    assert!(owed_events::CONSUMER_MESSAGE_WALL_MS < 15 * 60_000, "inside the platform's 15 minutes");
 }

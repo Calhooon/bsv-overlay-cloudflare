@@ -42,7 +42,7 @@ pub const SWEEP_PAIRS_PER_TICK: usize = 64;
 /// The mark rows one sweep tick reads past its cursor (several marks share a pair).
 pub const SWEEP_READ_LIMIT: usize = 256;
 /// The sweep's walk, oldest first past the cursor `(?2, ?3)`, only marks older than `?1` (`idx_owed_dirty_backlog`).
-pub const SWEEP_SQL: &str = "SELECT generation,source,sourceKey,markedAtMs FROM owed_dirty INDEXED BY idx_owed_dirty_backlog WHERE markedAtMs<?1 AND (markedAtMs>?2 OR (markedAtMs=?2 AND generation>?3)) ORDER BY markedAtMs,generation LIMIT ?4";
+pub const SWEEP_SQL: &str = "SELECT generation,source,sourceKey,markedAtMs,identity,gameId FROM owed_dirty INDEXED BY idx_owed_dirty_backlog WHERE markedAtMs<?1 AND (markedAtMs>?2 OR (markedAtMs=?2 AND generation>?3)) ORDER BY markedAtMs,generation LIMIT ?4";
 /// The sweep's cursor row.
 pub const SWEEP_CURSOR_READ_SQL: &str =
     "SELECT cursor FROM owed_belt_state WHERE name='owed-events:sweep'";
@@ -52,7 +52,7 @@ pub const SWEEP_CURSOR_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tick
 /// the pass-meter precedent), served on `/health.owedEvents` and the overlay's `/health/invariants.owedEvents`.
 pub const CONSUMER_ROW_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:consumer',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// The served ages and totals, one batch of key reads.
-pub const HEALTH_COUNTERS_SQL: &str = "SELECT name,value FROM ops_counters WHERE name IN ('owed_events_published_total','owed_events_consumed_total','owed_events_acked_marks_total','owed_events_dlq_total','owed_events_publish_faults_total','owed_events_judge_faults_total','owed_events_swept_total','owed_events_fault_held_total','owed_events_sweep_held_total','owed_events_publish_wall_drops_total')";
+pub const HEALTH_COUNTERS_SQL: &str = "SELECT name,value FROM ops_counters WHERE name IN ('owed_events_published_total','owed_events_consumed_total','owed_events_acked_marks_total','owed_events_dlq_total','owed_events_publish_faults_total','owed_events_judge_faults_total','owed_events_swept_total','owed_events_fault_held_total','owed_events_sweep_held_total','owed_events_publish_wall_drops_total','owed_events_subject_faults_total','owed_events_subject_held_total','owed_events_consumer_wall_drops_total','owed_events_dead_letters_stale_returned_total','owed_events_dead_letters_discarded_total')";
 /// The consumer's row.
 pub const HEALTH_CONSUMER_SQL: &str =
     "SELECT cursor,tickedAtMs FROM owed_belt_state WHERE name='owed-events:consumer'";
@@ -97,6 +97,11 @@ pub const FAULT_MEMO_HEALTH_SQL: &str = "SELECT COUNT(*) AS rows,COALESCE(SUM(js
 /// The memo's newest fault (the cause an operator reads first).
 pub const FAULT_MEMO_LAST_SQL: &str = "SELECT name,cursor FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;' ORDER BY tickedAtMs DESC LIMIT 1";
 
+/// The memo row's name of one subject.
+pub fn subject_memo_name(identity: &str, game: &str) -> String {
+    format!("{FAULT_MEMO_PREFIX}subject {identity}/{game}")
+}
+
 /// The memo row's name of a pair.
 pub fn fault_memo_name(source: &str, key: &str) -> String {
     format!("{FAULT_MEMO_PREFIX}{source} {key}")
@@ -131,7 +136,12 @@ pub async fn note_fault(
     key: &str,
     fault: &str,
 ) -> Result<FaultMemo, String> {
-    let name = fault_memo_name(source, key);
+    note_fault_named(db, &fault_memo_name(source, key), fault).await
+}
+
+/// One fault on the memo row `name` (a pair's, or a subject's: NEW-M1).
+pub async fn note_fault_named(db: &impl SqlPort, name: &str, fault: &str) -> Result<FaultMemo, String> {
+    let name = name.to_owned();
     let now = db.now_ms() as i64;
     let held = rows(
         db,
@@ -181,9 +191,15 @@ pub fn resolved_statements(source: &str, key: &str) -> Vec<Stmt> {
     ]
 }
 
-/// PURE: the pairs the sweep re-publishes, the held ones left out (`memos`: the memo rows of `pairs`), and how many
-/// were held.
-pub fn unheld(pairs: Vec<Pair>, memos: &[Value], now_ms: i64) -> (Vec<Pair>, usize) {
+/// PURE: the pairs the sweep re-publishes, the held ones left out (`memos`: the memo rows of `pairs` and of their
+/// subjects), and how many were held. A pair is held by its own memo, or (NEW-M1) when every subject the sweep read
+/// for it is held by its subject memo (`subjects`: a subject's memo name, `None` for a wanted envelope, never held).
+pub fn unheld(
+    pairs: Vec<Pair>,
+    subjects: &BTreeMap<Pair, Vec<Option<String>>>,
+    memos: &[Value],
+    now_ms: i64,
+) -> (Vec<Pair>, usize) {
     let held_names: std::collections::BTreeSet<&str> = memos
         .iter()
         .filter(|r| {
@@ -198,7 +214,18 @@ pub fn unheld(pairs: Vec<Pair>, memos: &[Value], now_ms: i64) -> (Vec<Pair>, usi
     let before = pairs.len();
     let kept: Vec<Pair> = pairs
         .into_iter()
-        .filter(|(s, k)| !held_names.contains(fault_memo_name(s, k).as_str()))
+        .filter(|pair| {
+            let (s, k) = pair;
+            if held_names.contains(fault_memo_name(s, k).as_str()) {
+                return false;
+            }
+            !subjects.get(pair).is_some_and(|names| {
+                !names.is_empty()
+                    && names
+                        .iter()
+                        .all(|n| n.as_deref().is_some_and(|n| held_names.contains(n)))
+            })
+        })
         .collect();
     let held = before - kept.len();
     (kept, held)
@@ -261,6 +288,10 @@ pub struct Routed {
     pub marks: usize,
     /// More marks remain for this pair: a continuation is published.
     pub more: bool,
+    /// Subjects whose judge faulted alone (their marks kept, their subject memos noted).
+    pub faults: usize,
+    /// Subjects skipped while their subject hold runs (their marks kept).
+    pub held: usize,
 }
 
 /// THE ONE JUDGE CALL of the consumer (lane B replaces its body with the actor's delivery): one identity's games, at
@@ -394,7 +425,31 @@ pub async fn plan(db: &impl SqlPort, ev: &OwedEvent) -> Result<Plan, String> {
     })
 }
 
+/// The held-until (ms) of each memo row read, by its name.
+fn memo_holds(memos: &[Value]) -> BTreeMap<String, i64> {
+    memos
+        .iter()
+        .filter_map(|r| {
+            let until = r["cursor"]
+                .as_str()
+                .and_then(|c| serde_json::from_str::<Value>(c).ok())
+                .and_then(|c| c["heldUntilMs"].as_i64())
+                .unwrap_or(0);
+            Some((r["name"].as_str()?.to_owned(), until))
+        })
+        .collect()
+}
+
 /// Judge a [`plan`]'s subjects through [`deliver`], 16 a call.
+///
+/// D2-ACTOR-A-DELTA's NEW-M1: a chunk whose judge faults is judged again ONE SUBJECT AT A TIME, and a subject whose
+/// judge faults alone is SKIPPED: its mark stays, its fault is noted on its own memo ([`subject_memo_name`], keyed
+/// `(identity, game)`, never the pair's), and every other subject of the message is judged and acknowledged by its
+/// own batch. From the [`FAULT_HOLD_AFTER`]th fault the subject is HELD (120 s doubling to 6 h, [`fault_hold_ms`]):
+/// skipped unjudged while it runs, and the sweep leaves out a pair whose every subject is held. So the shared pairs
+/// (`age`/`age`, `tip`/`gate`, `tip`/`untipped`, `backfill`/`owed-v2`) are never stopped by one poisoned subject.
+/// `Err` only when NOTHING landed and some subject faulted: the pair's own memo and hold (the consumer's) then cover
+/// a pair whose every subject faults (a D1 or chaintracks outage). A landed subject's memo is cleared.
 pub async fn judge_plan(db: &impl JudgeDb, plan: Plan) -> Result<Routed, String> {
     let Plan {
         order,
@@ -406,19 +461,108 @@ pub async fn judge_plan(db: &impl JudgeDb, plan: Plan) -> Result<Routed, String>
         more,
         ..Routed::default()
     };
+    let names: Vec<String> = order
+        .iter()
+        .flat_map(|id| games[id].iter().map(move |g| subject_memo_name(id, g)))
+        .collect();
+    let memos = if names.is_empty() {
+        BTreeMap::new()
+    } else {
+        memo_holds(
+            &rows(
+                db,
+                FAULT_MEMO_READ_SQL,
+                vec![Bind::Text(json!(names).to_string())],
+            )
+            .await?,
+        )
+    };
+    let now = db.now_ms() as i64;
+    let mut landed = 0usize;
+    let mut cleared: Vec<String> = Vec::new();
+    let mut first_fault: Option<String> = None;
+    let marks_of = |identity: &str, chunk: &[String]| -> usize {
+        chunk
+            .iter()
+            .map(|g| {
+                held.get(&(identity.to_owned(), g.clone()))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .sum()
+    };
     for identity in order {
-        let list = &games[&identity];
+        let mut list: Vec<String> = Vec::new();
+        for g in &games[&identity] {
+            if memos
+                .get(&subject_memo_name(&identity, g))
+                .is_some_and(|until| *until > now)
+            {
+                out.held += 1;
+            } else {
+                list.push(g.clone());
+            }
+        }
         for chunk in list.chunks(owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION) {
-            let report = deliver(db, &identity, chunk).await?;
-            out.subjects += report.subjects;
-            out.marks += chunk
-                .iter()
-                .map(|g| {
-                    held.get(&(identity.clone(), g.clone()))
-                        .copied()
-                        .unwrap_or(0)
-                })
-                .sum::<usize>();
+            let singles: Vec<&[String]> = match deliver(db, &identity, chunk).await {
+                Ok(report) => {
+                    landed += 1;
+                    out.subjects += report.subjects;
+                    out.marks += marks_of(&identity, chunk);
+                    cleared.extend(
+                        chunk
+                            .iter()
+                            .map(|g| subject_memo_name(&identity, g))
+                            .filter(|n| memos.contains_key(n)),
+                    );
+                    continue;
+                }
+                Err(e) if chunk.len() == 1 => {
+                    out.faults += 1;
+                    let name = subject_memo_name(&identity, &chunk[0]);
+                    let _ = note_fault_named(db, &name, &e).await;
+                    first_fault.get_or_insert(e);
+                    continue;
+                }
+                Err(_) => chunk.chunks(1).collect(),
+            };
+            for one in singles {
+                let name = subject_memo_name(&identity, &one[0]);
+                match deliver(db, &identity, one).await {
+                    Ok(report) => {
+                        landed += 1;
+                        out.subjects += report.subjects;
+                        out.marks += marks_of(&identity, one);
+                        if memos.contains_key(&name) {
+                            cleared.push(name);
+                        }
+                    }
+                    Err(e) => {
+                        out.faults += 1;
+                        let _ = note_fault_named(db, &name, &e).await;
+                        first_fault.get_or_insert(e);
+                    }
+                }
+            }
+        }
+    }
+    if !cleared.is_empty() {
+        let clears = cleared
+            .into_iter()
+            .map(|n| Stmt {
+                sql: FAULT_MEMO_CLEAR_SQL.into(),
+                binds: vec![Bind::Text(n)],
+            })
+            .collect();
+        if let Err(e) = db.run_batch(clears).await {
+            db.log(&format!(
+                "[owed-events] a landed subject's fault memo not cleared ({e}): its next fault counts on"
+            ));
+        }
+    }
+    if landed == 0 {
+        if let Some(fault) = first_fault {
+            return Err(fault);
         }
     }
     Ok(out)
@@ -486,14 +630,35 @@ pub async fn sweep(db: &impl SqlPort, now_ms: i64) -> Result<Vec<(String, String
     let pairs = if pairs.is_empty() {
         pairs
     } else {
-        let names: Vec<String> = pairs.iter().map(|(s, k)| fault_memo_name(s, k)).collect();
+        let mut names: Vec<String> = pairs.iter().map(|(s, k)| fault_memo_name(s, k)).collect();
+        // NEW-M1: the subjects read for each chosen pair, by their subject memos
+        let mut subjects: BTreeMap<Pair, Vec<Option<String>>> = BTreeMap::new();
+        for r in &read {
+            let (Some(source), Some(key)) = (r["source"].as_str(), r["sourceKey"].as_str()) else {
+                continue;
+            };
+            let pair = (source.to_owned(), key.to_owned());
+            if !pairs.contains(&pair) {
+                continue;
+            }
+            let name = match (r["identity"].as_str(), r["gameId"].as_str()) {
+                (Some(id), Some(g)) if !g.is_empty() => Some(subject_memo_name(id, g)),
+                _ => None,
+            };
+            if let Some(n) = &name {
+                if !names.contains(n) {
+                    names.push(n.clone());
+                }
+            }
+            subjects.entry(pair).or_default().push(name);
+        }
         let memos = rows(
             db,
             FAULT_MEMO_READ_SQL,
             vec![Bind::Text(json!(names).to_string())],
         )
         .await?;
-        let (kept, held) = unheld(pairs, &memos, now_ms);
+        let (kept, held) = unheld(pairs, &subjects, &memos, now_ms);
         if held > 0 {
             db.counters(vec![("owed_events_sweep_held_total".into(), held as u64)])
                 .await;
@@ -688,7 +853,11 @@ async fn ingest_frame(env: &worker::Env, frame: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// LOW-6: how long the consumer's isolate keeps a verified tip it read (the read's own memo).
+/// LOW-6: how long the consumer's isolate keeps a verified tip it read (the read's own memo). D2-ACTOR-A-DELTA's
+/// LOW-B: a `tip` event (`tip`/`gate`, `tip`/`untipped`: the block's own marks) reads the tip FRESH, never this memo,
+/// so a gate the new block opens is judged open on that event; any other event may judge at a tip up to 30 s old,
+/// which can at worst judge a gate one block late until the next block's tip event re-judges it (a delay, never a
+/// loss: #831's rule withholds nothing it would not withhold one block later).
 pub const TIP_MEMO_MS: f64 = 30_000.0;
 
 thread_local! {
@@ -697,10 +866,10 @@ thread_local! {
 
 /// The verified chain tip, from the isolate's memo when younger than [`TIP_MEMO_MS`] (a read that faults is never
 /// memoised: the judge then runs tipless, as before).
-async fn tip_memoised(env: &worker::Env) -> Option<u64> {
+async fn tip_memoised(env: &worker::Env, fresh: bool) -> Option<u64> {
     let now = worker::Date::now().as_millis() as f64;
     if let Some((tip, at)) = TIP.with(std::cell::Cell::get) {
-        if now - at < TIP_MEMO_MS {
+        if !fresh && now - at < TIP_MEMO_MS {
             return Some(tip);
         }
     }
@@ -710,6 +879,23 @@ async fn tip_memoised(env: &worker::Env) -> Option<u64> {
     TIP.with(|t| t.set(Some((tip, now))));
     Some(tip)
 }
+
+/// PURE: LOW-B: does an event of `source` read the chain tip fresh (the block's own marks), never the memo?
+pub fn tip_reads_fresh(source: &str) -> bool {
+    source == "tip"
+}
+
+/// LOW-A (D2-ACTOR-A-DELTA): the wall one message's handling is raced against. The platform's queue consumer runs a
+/// batch for at most 15 minutes of wall time (and the Worker's CPU limit, 30 s by default); with
+/// `max_batch_size = 1` and `max_concurrency = 1` one hung message held the whole fleet's queue for as long as its
+/// awaits hung (L52 measured `/internal/tx-word` calls cancelled at about 100 s). Past the wall the message is handed
+/// back after [`CONSUMER_WALL_RETRY_S`] and its pair's fault memo noted (a pair that hangs every time is held, the
+/// fold's doubling): what its judge committed before the wall is acknowledged by its own batch, the rest is planned
+/// again. A judge batch dropped in flight may still land (#559's limit 5): the marks are generation-bounded, so a
+/// late landing acknowledges only what it judged and the replay is idempotent.
+pub const CONSUMER_MESSAGE_WALL_MS: u64 = 60_000;
+/// The delay a message past [`CONSUMER_MESSAGE_WALL_MS`] is handed back with.
+pub const CONSUMER_WALL_RETRY_S: u32 = 60;
 
 /// The `owed-events` consumer's handler of one decoded message: the frame's ingest, the routing and the judge, the
 /// continuation. `Err`: hand it back.
@@ -726,7 +912,7 @@ pub async fn consume_one(env: &worker::Env, ev: &OwedEvent) -> Result<Routed, St
     if plan.is_empty() {
         return Ok(Routed::default());
     }
-    let tip = tip_memoised(env).await;
+    let tip = tip_memoised(env, tip_reads_fresh(&ev.source)).await;
     let judge = owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))
         .map_err(|e| e.to_string())?;
     let routed = judge_plan(&judge, plan).await?;
@@ -749,6 +935,7 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
     let mut deltas: BTreeMap<&str, u64> = BTreeMap::new();
     let mut messages = 0u64;
     let mut resolved: Vec<Stmt> = Vec::new();
+    let mut service_max: u64 = 0;
     for msg in batch.raw_iter() {
         messages += 1;
         let age = now - msg.timestamp().as_millis() as i64;
@@ -764,11 +951,47 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                 continue;
             }
         };
-        match consume_one(&env, &ev).await {
+        let started = worker::Date::now().as_millis();
+        let walled = {
+            let work = std::pin::pin!(consume_one(&env, &ev));
+            let wall = std::pin::pin!(worker::Delay::from(std::time::Duration::from_millis(
+                CONSUMER_MESSAGE_WALL_MS
+            )));
+            match futures_util::future::select(work, wall).await {
+                futures_util::future::Either::Left((done, _)) => Some(done),
+                futures_util::future::Either::Right(((), _)) => None,
+            }
+        };
+        let service_ms = worker::Date::now().as_millis().saturating_sub(started);
+        service_max = service_max.max(service_ms);
+        let Some(done) = walled else {
+            worker::console_warn!(
+                "[owed-events] {} {} seq={} passed the {CONSUMER_MESSAGE_WALL_MS} ms message wall: handed back in {CONSUMER_WALL_RETRY_S} s",
+                ev.source,
+                ev.source_key,
+                ev.seq
+            );
+            *deltas.entry("owed_events_consumer_wall_drops_total").or_default() += 1;
+            if let Ok(sql) = crate::routes::D1Sql::of(&env) {
+                let _ = note_fault(&sql, &ev.source, &ev.source_key, "the consumer's message wall").await;
+            }
+            msg.retry_with_options(
+                &worker::QueueRetryOptionsBuilder::new()
+                    .with_delay_seconds(CONSUMER_WALL_RETRY_S)
+                    .build(),
+            );
+            continue;
+        };
+        match done {
             Ok(routed) => {
-                resolved.extend(resolved_statements(&ev.source, &ev.source_key));
+                // a landed (or empty) message resolves its pair; one whose every subject was held resolves nothing
+                if routed.subjects > 0 || routed.held == 0 {
+                    resolved.extend(resolved_statements(&ev.source, &ev.source_key));
+                }
                 *deltas.entry("owed_events_consumed_total").or_default() += 1;
                 *deltas.entry("owed_events_acked_marks_total").or_default() += routed.marks as u64;
+                *deltas.entry("owed_events_subject_faults_total").or_default() += routed.faults as u64;
+                *deltas.entry("owed_events_subject_held_total").or_default() += routed.held as u64;
                 if routed.more {
                     *deltas.entry("owed_events_continued_total").or_default() += 1;
                 }
@@ -801,10 +1024,10 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
             }
         }
     }
-    let deltas: Vec<(&str, u64)> = deltas.into_iter().collect();
+    let deltas: Vec<(&str, u64)> = deltas.into_iter().filter(|(_, d)| *d > 0).collect();
     publish::bump(&env, &deltas).await;
     if let Ok(sql) = crate::routes::D1Sql::of(&env) {
-        let row = json!({"oldestEnqueueAgeMs": oldest_age, "messages": messages, "atMs": now});
+        let row = json!({"oldestEnqueueAgeMs": oldest_age, "messages": messages, "serviceMs": service_max, "atMs": now});
         let mut batch_row = vec![Stmt {
             sql: CONSUMER_ROW_SQL.into(),
             binds: vec![Bind::Text(row.to_string()), Bind::Int(now)],
@@ -944,6 +1167,12 @@ pub async fn health(db: &impl SqlPort) -> Value {
         "oldestUnackedMarkAgeMs": dirty["oldestMarkAgeMs"],
         "oldestEnqueueAgeMs": consumer.as_ref().map(|c| c["oldestEnqueueAgeMs"].clone()),
         "consumerAtMs": consumer.as_ref().map(|c| c["atMs"].clone()),
+        "serviceMs": consumer.as_ref().map(|c| c["serviceMs"].clone()),
+        "subjectFaults": counter("owed_events_subject_faults_total"),
+        "subjectHeld": counter("owed_events_subject_held_total"),
+        "consumerWallDrops": counter("owed_events_consumer_wall_drops_total"),
+        "deadLettersStaleReturned": counter("owed_events_dead_letters_stale_returned_total"),
+        "deadLettersDiscarded": counter("owed_events_dead_letters_discarded_total"),
         "dlqTotal": counter("owed_events_dlq_total"),
         "publishFaults": counter("owed_events_publish_faults_total"),
         "publishWallDrops": counter("owed_events_publish_wall_drops_total"),
