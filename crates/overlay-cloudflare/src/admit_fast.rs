@@ -1078,7 +1078,7 @@ impl ReevictedPort for D1Reevicted<'_> {
     }
 }
 
-/// [`settle_reevicted_with`] over D1: called by every write-side guard right after its `evict_txid_everywhere`
+/// `settle_reevicted_with` over D1: called by every write-side guard right after its `evict_txid_everywhere`
 /// (the request's, the past-deadline landing's, the queue replay's, a landed predecessor's, a resumed run's) and by
 /// the Rejected arm's re-run under an open eviction.
 pub async fn settle_reevicted(
@@ -1109,7 +1109,7 @@ pub(crate) trait WriteGuardPort: ReevictedPort {
 
 /// THE WRITE-SIDE GUARD AFTER A WRITE, one function (bsv-low #920, the FIX-920 lens's MEDIUM-1; the queue consumer's
 /// arm after a durable replay): an OPEN eviction of the txid re-evicts what the write landed, settles the refusal's
-/// memo ([`settle_reevicted_with`]) and counts the re-eviction. `Ok(None)` with no open row (nothing written);
+/// memo (`settle_reevicted_with`) and counts the re-eviction. `Ok(None)` with no open row (nothing written);
 /// `Err` when the ledger cannot be read (the caller's to name and retry).
 pub(crate) async fn reevict_after_write_with<P: WriteGuardPort>(
     port: &P,
@@ -1155,7 +1155,7 @@ impl WriteGuardPort for D1Reevicted<'_> {
     }
 }
 
-/// [`reevict_after_write_with`] over D1 (the queue consumer's guard after a durable replay).
+/// `reevict_after_write_with` over D1 (the queue consumer's guard after a durable replay).
 pub async fn reevict_after_write(
     db: &D1Database,
     txid: &str,
