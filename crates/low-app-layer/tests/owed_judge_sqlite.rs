@@ -6,6 +6,7 @@ use low_app_layer::{
     owed,
     owed_judge::{self as judge, JudgeDb},
     pot_hook::{Bind, SqlPort, Stmt, StmtOut},
+    tracker_host::runtime::{detached_judge_run, ingest_frame, land_word, DetachedJudgeGate},
 };
 use rusqlite::{
     types::{Value as SqlValue, ValueRef},
