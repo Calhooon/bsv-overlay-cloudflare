@@ -707,6 +707,15 @@ async fn event_held(
         .ok();
     let judge =
         crate::owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))?;
+    // bsv-low #911 (D2-ACTOR-A): with the queue the word is written here and its `word` event noted (the caller's
+    // publish point ships it; the consumer's own ingest routes it at once); without it the judge runs as before.
+    if crate::owed_events::configured(env) {
+        crate::owed_judge::write_word(&judge, &row)
+            .await
+            .map_err(worker::Error::RustError)?;
+        crate::owed_events_publish::note("word", &row.txid);
+        return Ok(row);
+    }
     let report = crate::owed_judge::judge_word_write(&judge, &row)
         .await
         .map_err(worker::Error::RustError)?;
@@ -735,6 +744,8 @@ pub async fn ingest(
     if !held {
         note_unheld();
     }
+    // bsv-low #911: the word's event before the answer (the POST is the belt of a frame the queue did not take)
+    crate::owed_events_publish::publish_before_answer(env, Vec::new()).await;
     worker::Response::from_json(&ingest_answer(held))
 }
 
@@ -797,6 +808,8 @@ pub async fn tick(env: &worker::Env) -> worker::Result<()> {
     for row in rows {
         event(env, &row.txid, "tick", None, None).await?;
     }
+    // bsv-low #911: the tick's word events, at its end
+    crate::owed_events_publish::publish_env(env, Vec::new()).await;
     Ok(())
 }
 

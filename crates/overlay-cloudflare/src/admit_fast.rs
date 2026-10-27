@@ -1150,6 +1150,7 @@ async fn evict_core_with_abort(
     )>,
 ) -> (EvictionCore, Option<crate::admission_abort::PendingAbort>) {
     let mut core = EvictionCore::default();
+    crate::owed_events::note("eviction", txid);
     if let Err(e) = db
         .exec(
             OPEN_EVICTION_MARKER_SQL,
@@ -1362,6 +1363,7 @@ pub async fn evict_txid_everywhere_repointed(
         if !core.restore_faults.is_empty() {
             let (in_twins, twins_unreadable) = twin_rows_of(db, &txid).await;
             if in_twins > 0 || twins_unreadable {
+                crate::owed_events::note("eviction", &txid);
                 if let Err(e) =
                     Query::new("UPDATE pot_evictions SET readmittedAt = NULL WHERE txid = ?")
                         .bind(txid.as_str())
@@ -1537,6 +1539,7 @@ pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> boo
     // the stamp is THIS moment's clock (round 3, residual A): a pass whose clock read predates this restore but
     // whose marker lands after it must read the readmission as newer
     let stamp_ms = worker::Date::now().as_millis();
+    crate::owed_events::note("eviction", &txid);
     if let Err(e) = Query::new(READMIT_EVICTION_SQL)
         .bind(QVal::Int(stamp_ms as i64))
         .bind(txid.as_str())
@@ -1604,6 +1607,7 @@ pub async fn readmit_if_evicted(db: &D1Database, txid: &str, now_ms: u64) -> boo
             // only while the twins still hold the txid, count, the next pass restores
             let (left, unreadable) = twin_rows_of(db, &txid).await;
             if left > 0 || unreadable {
+                crate::owed_events::note("eviction", &txid);
                 if let Err(e) =
                     Query::new("UPDATE pot_evictions SET readmittedAt = NULL WHERE txid = ?")
                         .bind(txid.as_str())

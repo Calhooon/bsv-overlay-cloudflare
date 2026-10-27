@@ -1548,6 +1548,13 @@ pub async fn internal_redrive(mut req: Request, env: &Env) -> Result<Response> {
         return Response::error("unauthorized", 401);
     }
     let raw = req.bytes().await?;
+    // bsv-low #911 (LOW-3): the owed events' family, parked by the app layer's DLQ consumer, re-driven here.
+    if serde_json::from_slice::<serde_json::Value>(&raw)
+        .ok()
+        .is_some_and(|v| v["family"] == "owed-events")
+    {
+        return crate::owed_events::redrive_dead_letters(&raw, env).await;
+    }
     let parsed = match parse_redrive_request(&raw) {
         Ok(p) => p,
         Err(why) => {

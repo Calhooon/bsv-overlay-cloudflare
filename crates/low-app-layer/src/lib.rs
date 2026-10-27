@@ -153,6 +153,11 @@ pub mod logic;
 pub mod owed;
 pub mod owed_backfill;
 pub mod owed_belt;
+/// bsv-low #911 (D2-ACTOR-A): the `owed-events` consumer, its dead letters, the un-acked sweep and the served ages.
+pub mod owed_events;
+/// bsv-low #911 (D2-ACTOR-A): the owed events' publish, the overlay's own source compiled here (one plan, one shape).
+#[path = "../../overlay-cloudflare/src/owed_events.rs"]
+pub mod owed_events_publish;
 pub mod owed_judge;
 pub mod owed_read;
 pub mod pass_meter;
@@ -359,6 +364,25 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     });
     pot_hook::schedule_tick(&|f| ctx.wait_until(f), drain, intake, tracker);
     ctx.wait_until(backfill);
+}
+
+/// bsv-low #911 (D2-ACTOR-A): the `owed-events` queue's consumer (`max_batch_size = 1`, `max_batch_timeout = 0`) and
+/// its dead letter queue's park (`owed_events::queue`).
+#[event(queue)]
+pub async fn queue(
+    batch: worker::MessageBatch<serde_json::Value>,
+    env: Env,
+    _ctx: Context,
+) -> Result<()> {
+    let out = owed_events::queue(batch, env.clone()).await;
+    // bsv-low #635: the consumer's statements are in the cost window; written when due.
+    if let (Some(window), Ok(db)) = (
+        d1_ledger::take_cost_if_due(worker::Date::now().as_millis() as f64),
+        env.d1("OVERLAY_DB"),
+    ) {
+        d1_ledger::flush_cost(&db, window, worker::Date::now().as_millis() as f64).await;
+    }
+    out
 }
 
 #[event(fetch)]

@@ -27,6 +27,34 @@ pub(crate) async fn subjects(
     })
 }
 
+/// bsv-low #911 (D2-ACTOR-A): note the filing's owed events: exactly the pair each row's trigger marks (`party`,
+/// `refund`, `result`, `collected` and `sweep` by the marker's txid), and the `txfacts` of a filed refund's and a
+/// filed sweep's transaction, decoded once here (MEDIUM-3). The door publishes them before its answer.
+pub(crate) fn note_events(v: &VerifiedRecord) {
+    use crate::owed_events_publish::{note, note_txfacts};
+    match v {
+        VerifiedRecord::Potparty(r, _) => note("party", &r.txid),
+        VerifiedRecord::Potrefund(r, _) => {
+            note("refund", &r.txid);
+            if let Ok(raw) = hex::decode(&r.refund_raw_hex) {
+                if let Some(facts) = overlay_discovery::owed_event::txfacts_of_raw(&raw) {
+                    if let Some(txid) = facts["txid"].as_str() {
+                        note_txfacts(txid, &raw);
+                    }
+                }
+            }
+        }
+        VerifiedRecord::Result(r, _) => note("result", &r.txid),
+        VerifiedRecord::Collected(r) | VerifiedRecord::Held(r, _) => note("collected", &r.txid),
+        VerifiedRecord::Hopsweep(_, r) => {
+            note("sweep", &r.txid);
+            if let Ok(raw) = hex::decode(&r.sweep_raw_hex) {
+                note_txfacts(&r.sweep_txid, &raw);
+            }
+        }
+    }
+}
+
 /// Commit only the source rows. Their triggers mark owed_dirty in this same atomic batch.
 /// No judge or subject reads are part of the request's write.
 pub(crate) async fn write_filings(

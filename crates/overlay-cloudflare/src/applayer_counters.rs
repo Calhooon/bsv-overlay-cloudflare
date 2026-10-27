@@ -225,9 +225,33 @@ pub fn names() -> Vec<String> {
     v
 }
 
+/// bsv-low #911 (D2-ACTOR-A): `/health/invariants.owedEvents`: the owed events' counters (seeded at 0) and the
+/// consumer's last batch row (its oldest message's enqueue age).
+pub fn owed_events_view(
+    counters: &serde_json::Value,
+    consumer: serde_json::Value,
+) -> serde_json::Value {
+    let c = |n: &str| counters[n].as_u64().unwrap_or(0);
+    serde_json::json!({
+        "publishedTotal": c("owed_events_published_total"),
+        "publishSkipped": c("owed_events_publish_skipped_total"),
+        "publishFaults": c("owed_events_publish_faults_total"),
+        "consumedTotal": c("owed_events_consumed_total"),
+        "ackedMarks": c("owed_events_acked_marks_total"),
+        "judgeFaults": c("owed_events_judge_faults_total"),
+        "continued": c("owed_events_continued_total"),
+        "sweptTotal": c("owed_events_swept_total"),
+        "dlqTotal": c("owed_events_dlq_total"),
+        "redriven": c("owed_events_redriven_total"),
+        "oldestEnqueueAgeMs": consumer["oldestEnqueueAgeMs"].clone(),
+        "consumer": consumer,
+    })
+}
+
 /// Every name [`crate::ops`]'s `read_counters` seeds for this module: the app layer's and this worker's memo writes.
 pub fn seeded_names() -> Vec<String> {
     let mut v = names();
+    v.extend(crate::owed_events::COUNTERS.iter().map(|n| n.to_string()));
     v.push(COUNTER_TXANY_MEMO_WRITE_REFUSED.to_string());
     v.push(COUNTER_TXANY_MEMO_WRITE_RETIRED.to_string());
     v

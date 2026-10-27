@@ -24,6 +24,12 @@ pub const MARK_UNTIPPED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,sour
 pub const UNTIPPED_MARKS_PER_TIP: usize = 128;
 
 pub async fn mark_tip(db: &impl JudgeDb, height: u64) -> Result<DrainReport, String> {
+    write_tip_marks(db, height).await?;
+    drain_changed(db, &[], &["gate".into(), "untipped".into()], "tip").await
+}
+
+/// bsv-low #911 (D2-ACTOR-A): the tip's marks and sweep dates alone; the `tip` events' consumer judges them.
+pub async fn write_tip_marks(db: &impl SqlPort, height: u64) -> Result<(), String> {
     let now = db.now_ms() as i64;
     db.run_batch(vec![
         Stmt {
@@ -40,7 +46,7 @@ pub async fn mark_tip(db: &impl JudgeDb, height: u64) -> Result<DrainReport, Str
         },
     ])
     .await?;
-    drain_changed(db, &[], &["gate".into(), "untipped".into()], "tip").await
+    Ok(())
 }
 
 pub async fn drain_identities(
@@ -97,6 +103,16 @@ pub async fn judge_word_write(
     db: &impl JudgeDb,
     row: &crate::tracker_host::stored::Row,
 ) -> Result<DrainReport, String> {
+    write_word(db, row).await?;
+    drain_changed(db, &[], std::slice::from_ref(&row.txid), "word").await
+}
+
+/// bsv-low #911 (D2-ACTOR-A): the word's write alone (its triggers mark the subjects); the judge is the
+/// `owed-events` consumer's, triggered by the `word` event the caller publishes.
+pub async fn write_word(
+    db: &impl SqlPort,
+    row: &crate::tracker_host::stored::Row,
+) -> Result<(), String> {
     let binds = crate::tracker_host::stored::upsert_binds(row)
         .into_iter()
         .map(|value| match value {
@@ -110,5 +126,5 @@ pub async fn judge_word_write(
         binds,
     }])
     .await?;
-    drain_changed(db, &[], std::slice::from_ref(&row.txid), "word").await
+    Ok(())
 }
