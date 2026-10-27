@@ -442,7 +442,7 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
 
     if req.method() == worker::Method::Post && req.path() == "/internal/tx-word" {
         // bsv-low #660 (B-OWED-3-FOLD L2): the answer takes the counters, so an unheld drop reaches `ops_counters`
-        let resp = tracker_host::runtime::ingest(req, &env).await;
+        let resp = tracker_host::runtime::ingest(req, &env, &ctx).await;
         flush_counters_if_due(&ctx, &env);
         return resp;
     }

@@ -696,3 +696,125 @@ async fn owed893_released_hop_requires_the_current_eviction_epoch() {
         .unwrap();
     assert!(readmitted.hops.is_empty());
 }
+
+/// bsv-low #934 (READ-934): the judge port of the beta stall: every SQL statement is the shipped one on SQLite, but a
+/// subject's hydration never answers (the CHAINTRACKS root checks and D1 reads that held 121 frames about 100 s).
+struct StalledJudge<'a>(&'a Db);
+impl SqlPort for StalledJudge<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        self.0.run_batch(stmts).await
+    }
+    async fn counters(&self, _: Vec<(String, u64)>) {}
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    fn log(&self, _: &str) {}
+}
+impl JudgeDb for StalledJudge<'_> {
+    fn tip(&self) -> Option<u64> {
+        self.0.tip()
+    }
+    async fn word_views(
+        &self,
+        rows: &BTreeMap<String, low_app_layer::tracker_host::stored::Row>,
+    ) -> Result<BTreeMap<String, Value>, String> {
+        self.0.word_views(rows).await
+    }
+    async fn canonical_root(&self, _: u64) -> Option<String> {
+        std::future::pending().await
+    }
+    async fn push(&self, _: &str, _: Value) {}
+    async fn hydrate(&self, _: &str, _: &[String]) -> Result<judge::JudgeInputs, String> {
+        std::future::pending().await
+    }
+}
+
+/// bsv-low #934 (READ-934): a parked word frame, as the overlay's producer writes it (`tracker_events::note`, then
+/// `drain`), POSTed under the change-park drain's wall (`DRAIN_WALL_MS`, its `race_or_deadline`), is answered held
+/// once its word is written: the 40 subjects naming the word are marked, none judged, while the judge stalls; the
+/// overlay's own reader (`answered_held`) reads the answer as held, so the row unparks. The judge then runs after the
+/// answer over the same marks. RED on eaaee0ec's rule (the word event judging its subjects before it answers: the
+/// wall falls first, the frame is refused and backed off, the park never clears).
+#[tokio::test(start_paused = true)]
+async fn read934_a_word_frame_is_answered_once_written_never_after_its_judge() {
+    let db = Db::new();
+    let word_txid = "ab".repeat(32);
+    for n in 0..40 {
+        let game = format!("g{n:02}");
+        let pot = format!("{n:064x}");
+        db.seed_game(&game, &pot);
+        db.conn.borrow().execute("INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs) VALUES('owner',?1,'unbound',?2,'{}',0)", rusqlite::params![format!("{pot}:0"), game]).unwrap();
+        db.conn.borrow().execute("INSERT INTO owed_row_words(identity,outpoint,role,txid) VALUES('owner',?1,'settle',?2)", rusqlite::params![format!("{pot}:0"), word_txid]).unwrap();
+    }
+    db.exec("DELETE FROM owed_dirty");
+    let rows_before = db.count("owed_rows");
+    // The overlay's producer: the frame bytes its drain parks and POSTs.
+    bsv_overlay_cloudflare::tracker_events::note(
+        &word_txid.to_ascii_uppercase(),
+        "seen",
+        Some(bsv_overlay_cloudflare::tracker_events::seen_body(
+            "arcade",
+            1_790_000_000_000,
+        )),
+    );
+    let frames = bsv_overlay_cloudflare::tracker_events::drain();
+    assert_eq!(frames.len(), 1);
+    let posted: Value = serde_json::from_str(&frames[0].to_string()).unwrap();
+    let stalled = StalledJudge(&db);
+    let detached = RefCell::new(Vec::new());
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_millis(bsv_overlay_cloudflare::change_park::DRAIN_WALL_MS),
+        low_app_layer::tracker_host::runtime::ingest_frame(
+            &posted,
+            |id, kind, _body| {
+                let (stalled, expected) = (&stalled, &word_txid);
+                async move {
+                    assert_eq!((id.as_str(), kind.as_str()), (expected.as_str(), "seen"));
+                    let row: low_app_layer::tracker_host::stored::Row = serde_json::from_value(
+                        json!({"txid":id,"word":"seen","tier":"courier","updated_at":1_790_000_000}),
+                    )
+                    .unwrap();
+                    low_app_layer::tracker_host::runtime::land_word(stalled, &row)
+                        .await
+                        .map_err(worker::Error::RustError)?;
+                    Ok(Some(row))
+                }
+            },
+            |txid| detached.borrow_mut().push(txid),
+        ),
+    )
+    .await;
+    let answer = answer
+        .expect("the frame is answered inside the producer's wall")
+        .unwrap();
+    assert!(
+        bsv_overlay_cloudflare::tracker_events::answered_held(&answer.to_string()),
+        "{answer}"
+    );
+    assert_eq!(*detached.borrow(), vec![word_txid.clone()]);
+    let word: String = db
+        .conn
+        .borrow()
+        .query_row(
+            "SELECT word FROM tx_words WHERE txid=?1",
+            [&word_txid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(word, "seen", "the word is durable before the answer");
+    assert_eq!(
+        db.count("owed_dirty"),
+        40,
+        "every subject naming the word is marked"
+    );
+    assert_eq!(db.count("owed_rows"), rows_before);
+    assert!(
+        db.pushes.borrow().is_empty(),
+        "nothing judged inside the answer"
+    );
+    // After the answer: the detached judge over the same marks, sixteen a run.
+    let report = judge::judge_written_word(&db, &word_txid).await.unwrap();
+    assert!(report.faults.is_empty(), "{:?}", report.faults);
+    assert_eq!(report.subjects, 16);
+    assert_eq!(db.count("owed_dirty"), 24);
+}
