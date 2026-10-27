@@ -656,7 +656,7 @@ fn i757_the_handler_runs_these_steps() {
         "event_hints(&mut state, kind, held || raw_bytes, callback, now);",
         "let pushed = pushed_proof(txid, callback);",
         "stored::project(old.as_ref(), &state, now, legacy)",
-        "crate::owed_judge::judge_word_write(&judge, &row)",
+        "land_word(&crate::routes::D1Sql::of(env)?, &row)",
     ] {
         assert!(held.contains(call), "event_held lost {call}");
     }
@@ -832,10 +832,12 @@ async fn b_owed_3_l2_an_unheld_frame_is_counted_unheld_on_both_sides() {
     let runtime_src: String = include_str!("../src/tracker_host/runtime.rs")
         .split_whitespace()
         .collect();
-    let ingest = &runtime_src[runtime_src.find("pubasyncfningest(").unwrap()..];
-    let ingest = &ingest[..ingest.find("pubconstCOUNTER_TRACKER_EVENT_UNHELD").unwrap()];
-    assert!(ingest.contains("if!held{note_unheld();}"));
-    assert!(ingest.contains("Response::from_json(&ingest_answer(held))"));
+    // bsv-low #934 (READ-934): the frame's answer is `ingest_frame`'s, the route answers it
+    let frame = &runtime_src[runtime_src.find("pubasyncfningest_frame<").unwrap()..];
+    let frame = &frame[..frame.find("pubconstCOUNTER_TRACKER_EVENT_UNHELD").unwrap()];
+    assert!(frame.contains("None=>note_unheld(),"));
+    assert!(frame.contains("Ok(ingest_answer(held.is_some()))"));
+    assert!(frame.contains("Response::from_json(&answer)"));
     let lib: String = include_str!("../src/lib.rs").split_whitespace().collect();
     let door = &lib[lib.find("req.path()==\"/internal/tx-word\"{").unwrap()..];
     assert!(door[..door.find("returnresp;").unwrap()].contains("flush_counters_if_due(&ctx,&env);"));
@@ -931,9 +933,16 @@ async fn b_owed_3_l4_f5_the_flush_ships_the_words_then_the_notes_under_one_deadl
     let runtime_src: String = include_str!("../src/tracker_host/runtime.rs")
         .split_whitespace()
         .collect();
-    let ingest = &runtime_src[runtime_src.find("pubasyncfningest(").unwrap()..];
+    // bsv-low #934 (READ-934): the write (`apply`, the event) before the answer; the judge after both, detached
+    let frame = &runtime_src[runtime_src.find("pubasyncfningest_frame<").unwrap()..];
+    let apply = frame.find("apply(id,kind,").unwrap();
+    let judge = frame.find("Some(row)=>judge(row.txid.clone()),").unwrap();
+    let answer = frame.find("Ok(ingest_answer(").unwrap();
     assert!(
-        ingest.find("event(env,&id,kind,").unwrap() < ingest.find("Response::from_json(").unwrap(),
+        apply < judge && judge < answer,
         "the handler writes before it answers"
     );
+    let ingest = &frame[frame.find("pubasyncfningest(").unwrap()..];
+    assert!(ingest.contains("event(env,&id,&kind,body.as_ref(),None)"));
+    assert!(ingest.contains("ctx.wait_until("));
 }

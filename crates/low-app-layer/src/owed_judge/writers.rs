@@ -97,6 +97,16 @@ pub async fn judge_word_write(
     db: &impl JudgeDb,
     row: &crate::tracker_host::stored::Row,
 ) -> Result<DrainReport, String> {
+    write_word(db, row).await?;
+    judge_written_word(db, &row.txid).await
+}
+
+/// bsv-low #934 (READ-934): the word's write alone, the tracker's UPSERT in its own batch. Its `tx_words` triggers write
+/// the marks of every subject naming the word, so the write is durable and judgeable before any judge runs.
+pub async fn write_word(
+    db: &impl SqlPort,
+    row: &crate::tracker_host::stored::Row,
+) -> Result<(), String> {
     let binds = crate::tracker_host::stored::upsert_binds(row)
         .into_iter()
         .map(|value| match value {
@@ -110,5 +120,11 @@ pub async fn judge_word_write(
         binds,
     }])
     .await?;
-    drain_changed(db, &[], std::slice::from_ref(&row.txid), "word").await
+    Ok(())
+}
+
+/// bsv-low #934 (READ-934): the judgement of a written word, its marked subjects by the word's txid (at most the hook's
+/// sixteen), after the write and never inside the frame's answer.
+pub async fn judge_written_word(db: &impl JudgeDb, txid: &str) -> Result<DrainReport, String> {
+    drain_changed(db, &[], &[txid.to_string()], "word").await
 }

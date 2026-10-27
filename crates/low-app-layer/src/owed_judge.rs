@@ -112,7 +112,7 @@ pub use hydrate::{
     HOP_COMPETITORS_SQL, LINKS_SQL, MISSING_SQL, PARTIES_SQL, RELEASED_SQL, REPRESENTATIVES_SQL,
 };
 pub use writers::{
-    drain_changed, drain_identities, judge_word_write, mark_tip, DATE_SWEEPS_SQL, MARK_TIP_SQL,
+    drain_changed, drain_identities, judge_word_write, judge_written_word, mark_tip, write_word, DATE_SWEEPS_SQL, MARK_TIP_SQL,
     MARK_UNTIPPED_SQL, UNTIPPED_MARKS_PER_TIP,
 };
 

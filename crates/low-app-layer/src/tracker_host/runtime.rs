@@ -702,40 +702,98 @@ async fn event_held(
     }
     let mut row = stored::project(old.as_ref(), &state, now, legacy);
     mark_terminal(&mut row, old.as_ref(), terminal.get());
+    land_word(&crate::routes::D1Sql::of(env)?, &row)
+        .await
+        .map_err(worker::Error::RustError)?;
+    Ok(row)
+}
+
+/// bsv-low #934 (READ-934): what a word event lands before its caller is answered: the tracker's UPSERT alone. Its
+/// `tx_words` triggers mark every subject naming the word in the same statement, so the write is durable and the
+/// marks are enough; the judgement is [`judge_word`]'s, after the answer (`/internal/tx-word`, detached) or inline
+/// on the scheduled pass ([`tick`]). Until #934 the event judged here, up to sixteen subjects one after another,
+/// each hydration a run of D1 reads and CHAINTRACKS root checks, so a drain's 128 frames at once held each POST
+/// about 100 s past the overlay's 10 s wall and the park never cleared.
+pub async fn land_word(
+    db: &impl crate::pot_hook::SqlPort,
+    row: &Row,
+) -> std::result::Result<(), String> {
+    crate::owed_judge::write_word(db, row).await
+}
+
+/// bsv-low #934 (READ-934): the judgement of a landed word, its marked subjects (at most sixteen) over D1 with the
+/// verified tip; a subject that faults keeps its mark for the drain.
+pub async fn judge_word(env: &worker::Env, txid: &str) -> worker::Result<()> {
     let tip = crate::routes::chaintracks_present_height_env(env, "owed")
         .await
         .ok();
     let judge =
         crate::owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))?;
-    let report = crate::owed_judge::judge_word_write(&judge, &row)
+    let report = crate::owed_judge::judge_written_word(&judge, txid)
         .await
         .map_err(worker::Error::RustError)?;
     for (_, error) in report.faults {
         worker::console_warn!("[owed] word judgement deferred: {error}");
     }
-    Ok(row)
+    Ok(())
 }
-pub async fn ingest(
-    mut req: worker::Request,
-    env: &worker::Env,
-) -> worker::Result<worker::Response> {
-    if !crate::internal_events::internal_bearer_ok(&req, env) {
-        return worker::Response::error("Unauthorized", 401);
-    }
-    let frame: Value = req.json().await?;
+
+/// bsv-low #934 (READ-934): one `/internal/tx-word` frame's answer, built once `apply` (the word event, which lands
+/// the word: [`land_word`]) returned. A held frame's txid is handed to `judge` AFTER the write and the answer never
+/// awaits it: the route detaches it under the owed drain's wall. An unheld frame is counted and judges nothing.
+pub async fn ingest_frame<A, AF, J>(frame: &Value, apply: A, judge: J) -> worker::Result<Value>
+where
+    A: FnOnce(String, String, Option<Value>) -> AF,
+    AF: std::future::Future<Output = worker::Result<Option<Row>>>,
+    J: FnOnce(String),
+{
     let id = frame["txid"]
         .as_str()
         .filter(|id| crate::logic::valid_txid(id))
         .ok_or_else(|| worker::Error::RustError("invalid tracker event txid".into()))?
         .to_ascii_lowercase();
-    let kind = frame["kind"].as_str().unwrap_or("refresh");
-    let held = event(env, &id, kind, frame.get("body"), None)
-        .await?
-        .is_some();
-    if !held {
-        note_unheld();
+    let kind = frame["kind"].as_str().unwrap_or("refresh").to_string();
+    let held = apply(id, kind, frame.get("body").cloned()).await?;
+    match &held {
+        Some(row) => judge(row.txid.clone()),
+        None => note_unheld(),
     }
-    worker::Response::from_json(&ingest_answer(held))
+    Ok(ingest_answer(held.is_some()))
+}
+
+pub async fn ingest(
+    mut req: worker::Request,
+    env: &worker::Env,
+    ctx: &worker::Context,
+) -> worker::Result<worker::Response> {
+    if !crate::internal_events::internal_bearer_ok(&req, env) {
+        return worker::Response::error("Unauthorized", 401);
+    }
+    let frame: Value = req.json().await?;
+    let answer = ingest_frame(
+        &frame,
+        |id, kind, body| async move { event(env, &id, &kind, body.as_ref(), None).await },
+        |txid| {
+            let env = env.clone();
+            ctx.wait_until(async move {
+                let deadline = crate::routes::worker_deadline(
+                    crate::owed_belt::OWED_DRAIN_WALL_MS,
+                    crate::owed_belt::OWED_DRAIN_RESERVE_MS,
+                );
+                match deadline.run_reserving(judge_word(&env, &txid)).await {
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => {
+                        worker::console_warn!("[owed] word judgement deferred: {error}")
+                    }
+                    None => worker::console_warn!(
+                        "[owed] word judgement deferred: wall reached; marks left for the drain"
+                    ),
+                }
+            });
+        },
+    )
+    .await?;
+    worker::Response::from_json(&answer)
 }
 
 /// bsv-low #660 (B-OWED-3-FOLD, the lens's L2): a frame whose subject the live hold does not name (and that is not
@@ -795,7 +853,10 @@ pub async fn tick(env: &worker::Env) -> worker::Result<()> {
         .results::<Subject>()?;
     super::pacing::begin_tick(now / 900);
     for row in rows {
-        event(env, &row.txid, "tick", None, None).await?;
+        // bsv-low #934: the scheduled pass judges what it landed inline, as before (no caller waits on it)
+        if let Some(word) = event(env, &row.txid, "tick", None, None).await? {
+            judge_word(env, &word.txid).await?;
+        }
     }
     Ok(())
 }

@@ -2600,15 +2600,36 @@ pub(crate) mod tests {
     #[test]
     fn owed893_writers_use_the_judge() {
         let runtime = include_str!("tracker_host/runtime.rs");
-        let held = runtime
-            .split("async fn event_held(")
-            .nth(1)
-            .unwrap()
-            .split("pub async fn ingest(")
-            .next()
-            .unwrap();
+        // bsv-low #934 (READ-934): the word event lands the word and judges nothing; `/internal/tx-word` answers
+        // after the write and detaches the judge, the scheduled pass judges inline
+        let section = |from: &str, to: &str| {
+            runtime
+                .split(from)
+                .nth(1)
+                .unwrap()
+                .split(to)
+                .next()
+                .unwrap()
+        };
+        let held = section(
+            "async fn event_held(",
+            "/// bsv-low #934 (READ-934): what a word event lands",
+        );
+        assert!(held.contains("land_word("), "the word event lands its word");
+        for judge in ["judge_word", "drain_changed", "D1Judge"] {
+            assert!(
+                !held.contains(judge),
+                "the word event must not judge ({judge})"
+            );
+        }
+        let land = section("pub async fn land_word(", "pub async fn judge_word(");
+        assert!(land.contains("write_word(db, row)"));
+        assert!(!land.contains("judge_word_write") && !land.contains("drain_changed"));
+        let ingest = section("pub async fn ingest(", "/// bsv-low #660");
+        assert!(ingest.contains("ctx.wait_until(") && ingest.contains("judge_word(&env, &txid)"));
+        let tick = section("pub async fn tick(", "/// Host pacing");
         assert!(
-            held.contains("judge_word_write"),
+            tick.contains("judge_word(env, &word.txid)"),
             "the word hook must judge its own marked subjects"
         );
         let tip = include_str!("internal_events.rs")
