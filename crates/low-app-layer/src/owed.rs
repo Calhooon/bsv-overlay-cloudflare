@@ -8285,9 +8285,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ns2_filing_judges_its_source_batch_before_the_push() {
+    fn ns2_filing_commits_before_the_detached_judge_and_push() {
         let source = include_str!("record_post/owed_write.rs");
-        assert!(source.contains("judge::judge_with_write"));
+        assert!(source.contains("db.run_batch(writes).await?"));
+        assert!(!source.contains("judge_with_write"));
+        let task = include_str!("record_post/detached.rs");
+        assert!(task.contains("wait.wait_until(async move"));
+        assert!(task.contains("owed_judge::drain_identities"));
+        assert!(task.contains("deadline.run_reserving(work).await"));
         assert!(source.contains("judge::refund_subjects"));
         let door = include_str!("record_post.rs").split("#[cfg(test)]").next().unwrap();
         assert!(!door.contains("OWED_STALE_FOR_POT_SQL"));

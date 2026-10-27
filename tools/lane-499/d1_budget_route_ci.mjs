@@ -330,18 +330,18 @@ const measured = {}
   })
   if (filed.status === 200 && JSON.parse(filed.text).filed) pass('NS2 stranger potparty filing admitted')
   else fail('NS2 stranger potparty filing admitted', `${filed.status}: ${filed.text}`)
-  // D2-OWED-FOLD-8: the filing judges its filer in its own batch (the design's cost at the write), so this figure is
-  // the filing's statements AND the filer's judgement
+  // #908: only verification, caps and the source transaction belong to the request.
   check('record-potparty-filing', (measured['/record'] = segment(filed.timing, 'd1')))
-  // SHED-M1, re-pointed (the walk counters `recomputeBySource.filing` / `read-stale` are the retired walk's): the
-  // filing judged the stranger alone; A's stored judgement is untouched (its stamp and rows as before), and the filer's
-  // own read serves the judgement the filing wrote
   const victimAfter = JSON.parse((await get(APP, `/owed?identity=${ID_A}`)).text)
   if (victimAfter.computedAtMs === victimBefore.computedAtMs && victimAfter.rows?.length === victimBefore.rows?.length) pass('SHED-M1 a stranger\'s filing judges only its filer: A\'s judgement untouched')
   else fail('SHED-M1 a stranger\'s filing judges only its filer', `A computedAtMs ${victimBefore.computedAtMs} -> ${victimAfter.computedAtMs}, rows ${victimBefore.rows?.length} -> ${victimAfter.rows?.length}`)
-  const filer = JSON.parse((await get(APP, `/owed?identity=${fixture.identity}`)).text)
-  if (filer.computedAtMs > 0 && filer.pending !== true) pass(`SHED-M1 the filer's read serves the judgement its filing wrote (${filer.rows?.length} row(s))`)
-  else fail('SHED-M1 the filer\'s read serves the judgement its filing wrote', JSON.stringify(filer).slice(0, 400))
+  let filer
+  const judged = await pollFor(async () => {
+    filer = JSON.parse((await get(APP, `/owed?identity=${fixture.identity}`)).text)
+    return filer.computedAtMs > 0 && filer.pending !== true
+  })
+  if (judged) pass(`SHED-M1 the filer's read serves its detached judgement (${filer.rows?.length} row(s))`)
+  else fail('SHED-M1 the filer\'s detached judgement lands', JSON.stringify(filer).slice(0, 400))
 }
 
 // NOTE-3 (twelve failed first-read writes, then one reserved walk): DROPPED by design. The read never walks and the

@@ -371,6 +371,7 @@ mod pins {
         let out = record_post::file_verified(&judge, &mut filing, &id, (NOW_MS / 1000) as i64)
             .await
             .unwrap();
+        record_post::detached::judge(&judge, std::slice::from_ref(&filing), "test").await.unwrap();
         assert!(
             matches!(out, DoorOutcome::Written { row_written: true }),
             "{out:?}"
@@ -442,6 +443,7 @@ mod pins {
         let out = record_post::file_verified(&judge, &mut filing, &id, (NOW_MS / 1000) as i64)
             .await
             .unwrap();
+        record_post::detached::judge(&judge, std::slice::from_ref(&filing), "test").await.unwrap();
         assert!(
             matches!(out, DoorOutcome::Written { row_written: true }),
             "{out:?}"
@@ -538,6 +540,7 @@ mod pins {
         let out = record_post::file_verified(&judge, &mut filing, &id, (NOW_MS / 1000) as i64)
             .await
             .unwrap();
+        record_post::detached::judge(&judge, std::slice::from_ref(&filing), "test").await.unwrap();
         assert!(
             matches!(out, DoorOutcome::Written { row_written: true }),
             "{out:?}"
@@ -614,6 +617,7 @@ mod pins {
         let out = record_post::file_verified(&judge, &mut filing, &id, (NOW_MS / 1000) as i64)
             .await
             .unwrap();
+        record_post::detached::judge(&judge, std::slice::from_ref(&filing), "test").await.unwrap();
         assert!(
             matches!(out, DoorOutcome::Written { row_written: true }),
             "{out:?}"
