@@ -16,3 +16,8 @@ regexes = ['''^0[23][0-9a-fA-F]{64}$''']
 description = "SQLite UPSERT assignments (`col=excluded.col`) inside SQL strings: the generic-api-key rule read the owed triggers' ON CONFLICT clause as a key (bsv-low #893's branch, 2026-10-26)"
 regexTarget = "line"
 regexes = ['''=excluded\.[A-Za-z_]+''']
+
+[[allowlists]]
+description = "the CI tiers' placeholder tokens (`--var NAME:ci-...` on the Makefile's wrangler dev lines): a fixed word the tier seeds and reads back, never a secret; the generic-api-key rule read `ci-lane-920-arc-ingest` as a key (PR 183, 2026-10-27)"
+regexTarget = "secret"
+regexes = ['''^ci-[a-z0-9-]+$''']
