@@ -63,8 +63,6 @@ mod courier_counters;
 pub mod migration_emitter;
 pub mod ops;
 pub mod owed_events;
-#[cfg(test)]
-mod owed_events_tests;
 pub mod peer_crawler;
 pub mod pot_changes;
 pub mod proof_fetcher;
@@ -2477,3 +2475,7 @@ mod fix838_fold;
 mod build_info_tests;
 
 pub mod tracker_events;
+
+// bsv-low #911 (D2-ACTOR-A): the owed events' publish pins (apart from the shared source).
+#[cfg(test)]
+mod owed_events_tests;
