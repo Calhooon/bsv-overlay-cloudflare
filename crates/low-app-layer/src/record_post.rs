@@ -2374,7 +2374,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
         };
         // bsv-low #911 (D2-ACTOR-A): the door answers before any judge: its owed events are published here (the
         // `owed-events` consumer is the judge's trigger); a Worker with no queue binding keeps the detached judge.
-        if crate::owed_events::configured(&ctx.env) {
+        if crate::owed_events::configured(&ctx.env).await {
             owed_write::note_events(&verified);
             latency::note_enqueue(crate::owed_events::publish_noted(&ctx.env).await);
         } else {

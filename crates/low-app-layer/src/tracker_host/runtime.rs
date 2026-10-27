@@ -709,7 +709,7 @@ async fn event_held(
         crate::owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))?;
     // bsv-low #911 (D2-ACTOR-A): with the queue the word is written here and its `word` event noted (the caller's
     // publish point ships it; the consumer's own ingest routes it at once); without it the judge runs as before.
-    if crate::owed_events::configured(env) {
+    if crate::owed_events::configured(env).await {
         crate::owed_judge::write_word(&judge, &row)
             .await
             .map_err(worker::Error::RustError)?;
