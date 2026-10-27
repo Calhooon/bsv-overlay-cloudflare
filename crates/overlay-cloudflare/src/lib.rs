@@ -65,6 +65,8 @@ mod courier_counters;
 pub mod migration_emitter;
 pub mod ops;
 pub mod owed_events;
+#[cfg(test)]
+mod owed_events_tests;
 pub mod peer_crawler;
 pub mod pot_changes;
 pub mod proof_fetcher;
@@ -2427,7 +2429,7 @@ mod tests {
         let tail = squash(&handler[dispatch..]);
         assert!(
             tail.contains(&squash(
-                "}; crate::pot_changes::flush(&env, |fut| ctx.wait_until(fut)); crate::lobby_changes::flush(&env, |fut| ctx.wait_until(fut)); result }"
+                "}; for frame in crate::owed_events::publish_before_answer(&env, crate::tracker_events::drain()).await { crate::tracker_events::requeue(frame); } crate::pot_changes::flush(&env, |fut| ctx.wait_until(fut)); crate::lobby_changes::flush(&env, |fut| ctx.wait_until(fut)); result }"
             )),
             "the dispatch's single exit flushes the pot (and hop, and lobby) changes before it answers"
         );

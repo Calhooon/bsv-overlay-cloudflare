@@ -118,7 +118,9 @@ impl SqlPort for Db {
             }
             drop(rows);
             let steps = s.get_status(rusqlite::StatementStatus::VmStep);
-            self.steps.borrow_mut().push((st.sql.clone(), i64::from(steps)));
+            self.steps
+                .borrow_mut()
+                .push((st.sql.clone(), i64::from(steps)));
             out.push(StmtOut {
                 rows: got,
                 changes: Some(tx.changes()),
@@ -178,7 +180,9 @@ pub async fn drain_all(db: &Db) {
         if db.int("SELECT COUNT(*) FROM owed_dirty") == 0 {
             return;
         }
-        let r = low_app_layer::owed_judge::drain_dirty(db, 64).await.unwrap();
+        let r = low_app_layer::owed_judge::drain_dirty(db, 64)
+            .await
+            .unwrap();
         assert!(r.faults.is_empty(), "{:?}", r.faults);
         if r.subjects == 0 {
             return;
