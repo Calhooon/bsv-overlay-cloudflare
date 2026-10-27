@@ -286,10 +286,34 @@ async fn rows(db: &impl SqlPort, sql: &str, binds: Vec<Bind>) -> Result<Vec<Valu
         .unwrap_or_default())
 }
 
-/// HIGH-1: route one event through the marks its source row made and judge their subjects (see the module doc).
+/// One message's subjects, read from its marks before any judge ([`plan`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Plan {
+    order: Vec<String>,
+    games: BTreeMap<String, Vec<String>>,
+    held: BTreeMap<(String, String), usize>,
+    more: bool,
+}
+
+impl Plan {
+    /// No subject to judge (and no continuation).
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty() && !self.more
+    }
+}
+
+/// HIGH-1: route one event through the marks its source row made and judge their subjects (see the module doc):
+/// [`plan`], then [`judge_plan`].
 pub async fn route(db: &impl JudgeDb, ev: &OwedEvent) -> Result<Routed, String> {
+    let plan = plan(db, ev).await?;
+    judge_plan(db, plan).await
+}
+
+/// The marks of one event, read (a wanted envelope expanded) into its subjects, before any judge: the consumer reads
+/// the chain tip only for a plan that holds one (the D2-ACTOR-A lens's LOW-6).
+pub async fn plan(db: &impl SqlPort, ev: &OwedEvent) -> Result<Plan, String> {
     if ev.source == owed_event::TXFACTS {
-        return Ok(Routed::default());
+        return Ok(Plan::default());
     }
     let limit = ROUTE_READ_LIMIT as i64;
     let mut marks = if ev.source == owed_event::ROUTE_IDENTITY {
@@ -362,6 +386,22 @@ pub async fn route(db: &impl JudgeDb, ev: &OwedEvent) -> Result<Routed, String> 
         list.push(game.to_owned());
         counted += 1;
     }
+    Ok(Plan {
+        order,
+        games,
+        held,
+        more,
+    })
+}
+
+/// Judge a [`plan`]'s subjects through [`deliver`], 16 a call.
+pub async fn judge_plan(db: &impl JudgeDb, plan: Plan) -> Result<Routed, String> {
+    let Plan {
+        order,
+        games,
+        held,
+        more,
+    } = plan;
     let mut out = Routed {
         more,
         ..Routed::default()
@@ -648,6 +688,29 @@ async fn ingest_frame(env: &worker::Env, frame: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// LOW-6: how long the consumer's isolate keeps a verified tip it read (the read's own memo).
+pub const TIP_MEMO_MS: f64 = 30_000.0;
+
+thread_local! {
+    static TIP: std::cell::Cell<Option<(u64, f64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// The verified chain tip, from the isolate's memo when younger than [`TIP_MEMO_MS`] (a read that faults is never
+/// memoised: the judge then runs tipless, as before).
+async fn tip_memoised(env: &worker::Env) -> Option<u64> {
+    let now = worker::Date::now().as_millis() as f64;
+    if let Some((tip, at)) = TIP.with(std::cell::Cell::get) {
+        if now - at < TIP_MEMO_MS {
+            return Some(tip);
+        }
+    }
+    let tip = crate::routes::chaintracks_present_height_env(env, "owed")
+        .await
+        .ok()?;
+    TIP.with(|t| t.set(Some((tip, now))));
+    Some(tip)
+}
+
 /// The `owed-events` consumer's handler of one decoded message: the frame's ingest, the routing and the judge, the
 /// continuation. `Err`: hand it back.
 pub async fn consume_one(env: &worker::Env, ev: &OwedEvent) -> Result<Routed, String> {
@@ -657,12 +720,16 @@ pub async fn consume_one(env: &worker::Env, ev: &OwedEvent) -> Result<Routed, St
         publish::forget(&ev.source, &ev.source_key);
     }
     crate::schema::ensure_latch_columns(env).await;
-    let tip = crate::routes::chaintracks_present_height_env(env, "owed")
-        .await
-        .ok();
+    // LOW-6 (the lens): the marks first; the chain tip (its 30 s isolate memo) only for a message with a subject
+    let sql = crate::routes::D1Sql::of(env).map_err(|e| e.to_string())?;
+    let plan = plan(&sql, ev).await?;
+    if plan.is_empty() {
+        return Ok(Routed::default());
+    }
+    let tip = tip_memoised(env).await;
     let judge = owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))
         .map_err(|e| e.to_string())?;
-    let routed = route(&judge, ev).await?;
+    let routed = judge_plan(&judge, plan).await?;
     if routed.more {
         publish::note(&ev.source, &ev.source_key);
         publish::publish_env(env, Vec::new()).await;
