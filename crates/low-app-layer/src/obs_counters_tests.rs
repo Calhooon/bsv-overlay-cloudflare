@@ -160,6 +160,7 @@ fn observability_counter_names() -> Vec<String> {
     names.extend(crate::owed_belt::counter_names());
     names.extend(crate::owed_backfill::counter_names());
     names.extend(crate::owed_judge::counter_names());
+    names.extend(crate::push_coalesce::counter_names());
     names
 }
 
