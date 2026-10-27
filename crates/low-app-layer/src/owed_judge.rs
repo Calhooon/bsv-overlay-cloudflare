@@ -112,8 +112,8 @@ pub use hydrate::{
     HOP_COMPETITORS_SQL, LINKS_SQL, MISSING_SQL, PARTIES_SQL, RELEASED_SQL, REPRESENTATIVES_SQL,
 };
 pub use writers::{
-    drain_changed, drain_identities, judge_word_write, judge_written_word, mark_tip, write_word, DATE_SWEEPS_SQL, MARK_TIP_SQL,
-    MARK_UNTIPPED_SQL, UNTIPPED_MARKS_PER_TIP,
+    drain_changed, drain_changed_within, drain_identities, judge_written_word, judge_written_words,
+    mark_tip, write_word, DATE_SWEEPS_SQL, MARK_TIP_SQL, MARK_UNTIPPED_SQL, UNTIPPED_MARKS_PER_TIP,
 };
 
 pub const OWED_JUDGE_SUBJECTS_PER_INVOCATION: usize = 16;
