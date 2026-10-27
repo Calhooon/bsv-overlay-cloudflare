@@ -14,6 +14,8 @@
 name = "low-overlay"
 main = "build/worker/shim.mjs"
 compatibility_date = "2024-12-01"
+# bsv-low #936 (the FIX-936 lens fold): Request.signal fires when the client goes away (no default date)
+compatibility_flags = ["enable_request_signal"]
 
 [build]
 # worker-build ^0.8 — same crate, same workspace lock, so this pin MUST match
@@ -234,6 +236,7 @@ head_sampling_rate = 1
 
 [env.beta]
 name = "low-overlay-beta"
+compatibility_flags = ["enable_request_signal"]
 
 [env.beta.vars]
 # bsv-low #635 (B-COST-1): the plan's INCLUDED quotas per day that `/health/invariants.costBar` serves its ratio and
