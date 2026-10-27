@@ -129,6 +129,35 @@ pub const OWED_BACKFILL: [&str; 8] = [
 /// (`low_app_layer::owed_judge::counter_names`, pinned equal there).
 pub const OWED_JUDGE: [&str; 1] = ["owed_judge_filing_faults_total"];
 
+/// bsv-low #935: the app layer's first-party pushes to a seat, coalesced per identity under the relay's send budget
+/// (`low_app_layer::push_coalesce::counter_names`, pinned equal there). Totals the coalescer adds.
+pub const PUSH: [&str; 5] = [
+    "push_coalesced_total",
+    "push_held_total",
+    "push_refused_budget_total",
+    "push_given_up_total",
+    "push_windows_total",
+];
+
+/// `/health/invariants.push` (bsv-low #935): states a newer one carried (`coalesced`), windows a state waited for a
+/// bucket (`held`), the relay's `429 ERR_SEND_BUDGET` read by name (`refusedBudget`), states given up after three
+/// retried windows (`givenUp`), sends made at a window's end (`windows`). L53 reads `refusedBudget` at 0.
+pub fn push_view(counters: &serde_json::Value) -> serde_json::Value {
+    let n = |k: &str| {
+        counters
+            .get(k)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    serde_json::json!({
+        "coalesced": n("push_coalesced_total"),
+        "held": n("push_held_total"),
+        "refusedBudget": n("push_refused_budget_total"),
+        "givenUp": n("push_given_up_total"),
+        "windows": n("push_windows_total"),
+    })
+}
+
 /// `/health/invariants.owedBelt`: the belt's durable totals and its backlog, from the counters read.
 pub fn owed_belt_view(counters: &serde_json::Value) -> serde_json::Value {
     let n = |k: &str| {
@@ -191,6 +220,7 @@ pub fn names() -> Vec<String> {
     // bsv-low #831 (the FIX-831 lens's L3): the refund-due pots the owed judgement found funding-not-held
     v.push("owed_refund_funding_unheld_total".to_string());
     v.extend(OWED_BELT.iter().map(|n| n.to_string()));
+    v.extend(PUSH.iter().map(|n| n.to_string()));
     v.extend(OWED_BACKFILL.iter().map(|n| n.to_string()));
     v.extend(OWED_JUDGE.iter().map(|n| n.to_string()));
     // bsv-low #608 (the B-OWED-2 lens's LOW-1): the reads whose recompute only the unread-spender rule asked for

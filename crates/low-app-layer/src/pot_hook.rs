@@ -1196,13 +1196,8 @@ impl RelayPort for WorkerRelay {
         crate::internal_events::push_broadcast(&self.env, room, body).await
     }
     async fn push(&self, recipient: &str, message_id: &str, body: Value) -> Delivery {
-        crate::internal_events::first_party_push_with_id(
-            &self.env,
-            recipient,
-            Some(message_id),
-            body,
-        )
-        .await
+        // bsv-low #935: coalesced per seat under the relay's send budget.
+        crate::push_coalesce::push_to_seat(&self.env, recipient, Some(message_id), body).await
     }
 }
 

@@ -268,7 +268,8 @@ impl JudgeDb for D1Judge {
         crate::beef_guard::canonical_root(&self.sql.env, height).await
     }
     async fn push(&self, identity: &str, body: Value) {
-        crate::internal_events::first_party_push(&self.sql.env, identity, body).await;
+        // bsv-low #935: coalesced per seat under the relay's send budget.
+        crate::push_coalesce::push_to_seat(&self.sql.env, identity, None, body).await;
     }
 }
 
@@ -555,6 +556,8 @@ pub async fn judge_with_write(
     let landed = db.run_batch(plan).await?;
     report.source_changes = landed.iter().take(source_count).map(|r| r.changes).collect();
     // The batch committed: nothing below may fail the call (a filing would land its source statements twice).
+    // bsv-low #935: the pushes go together after the loop, so a coalescing window costs the call one wait at most.
+    let mut pushes = Vec::new();
     for (pos, id, stamp) in state_positions {
         let Some(count) = landed
             .get(pos)
@@ -568,12 +571,13 @@ pub async fn judge_with_write(
         let state = &landed[pos].rows[0];
         report.rows += count;
         report.truncated |= state["truncated"].as_i64().unwrap_or(0) != 0;
-        db.push(
-            &id,
-            crate::owed::owed_changed_event_body(&id, source, count, stamp),
-        )
-        .await;
+        let body = crate::owed::owed_changed_event_body(&id, source, count, stamp);
+        pushes.push((id, body));
     }
+    futures_util::future::join_all(pushes.into_iter().map(|(id, body)| async move {
+        db.push(&id, body).await;
+    }))
+    .await;
     Ok(report)
 }
 
