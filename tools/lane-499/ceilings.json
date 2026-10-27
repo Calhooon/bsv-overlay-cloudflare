@@ -683,6 +683,7 @@
       "crate::admit_fast::open_eviction(",
       "crate::admit_fast::readmit_if_evicted(",
       "crate::admit_fast::evict_txid_everywhere(",
+      "crate::admit_fast::settle_reevicted(",
       "crate::pot_changes::flush_inline(",
       "crate::queue::enqueue_replay(",
       "crate::ops::renote_latched_seen(",

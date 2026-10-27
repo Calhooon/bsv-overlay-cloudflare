@@ -849,6 +849,16 @@ async fn finish_past_deadline<F, S>(
             let now_ms = worker::Date::now().as_millis();
             let outcome =
                 crate::admit_fast::evict_txid_everywhere(&db, &subject, &ev.reason, now_ms).await;
+            // bsv-low #920: the refusal that arrived while this write was in flight is completed HERE, at the
+            // landing: its memo (unless a settle wrote it), then its count
+            crate::admit_fast::settle_reevicted(
+                &db,
+                &subject,
+                &outcome,
+                &ev.reason,
+                "POST /submit(broadcast-gated) past-deadline",
+            )
+            .await;
             crate::ops::bump_counter(&db, crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1)
                 .await;
             reevicted = true;
@@ -1873,6 +1883,16 @@ async fn submit_parts(
                             worker::Date::now().as_millis(),
                         )
                         .await;
+                        // bsv-low #920: the network's second refusal completes the first one's settle (its memo,
+                        // which a refusal job cut after its OPEN marker never wrote)
+                        crate::admit_fast::settle_reevicted(
+                            &ledger_db,
+                            &subject_txid,
+                            &outcome,
+                            &crate::admit_fast::ladder_rerefusal_reason(&reason),
+                            "POST /submit(broadcast-gated) re-refused",
+                        )
+                        .await;
                         crate::pot_changes::flush_inline(env.clone()).await;
                         worker::console_log!(
                             "broadcast-gated(arcade): {subject_txid} refused again under an open eviction (at {} ms — {}) — the eviction re-run moved {} row(s){}",
@@ -1920,6 +1940,15 @@ async fn submit_parts(
                                 &subject_txid,
                                 &ev.reason,
                                 now_ms,
+                            )
+                            .await;
+                            // bsv-low #920: the refusal's memo, unless its own settle wrote it
+                            crate::admit_fast::settle_reevicted(
+                                &ledger_db,
+                                &subject_txid,
+                                &outcome,
+                                &ev.reason,
+                                "POST /submit(broadcast-gated) resumed",
                             )
                             .await;
                             if outcome.moved > 0 {
@@ -2138,6 +2167,15 @@ async fn submit_parts(
                     let now_ms = worker::Date::now().as_millis();
                     #[rustfmt::skip] // Main's exact eviction wiring pin.
                     let outcome = crate::admit_fast::evict_txid_everywhere(&ledger_db, subject, &ev.reason, now_ms).await;
+                    // bsv-low #920: the refusal's memo, unless its own settle wrote it
+                    crate::admit_fast::settle_reevicted(
+                        &ledger_db,
+                        subject,
+                        &outcome,
+                        &ev.reason,
+                        "POST /submit",
+                    )
+                    .await;
                     let moved = outcome.moved;
                     counters.bump(crate::ops::COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE, 1);
                     // the eviction is the event the felt voids on: ship its notes now (this answer is not a 200)

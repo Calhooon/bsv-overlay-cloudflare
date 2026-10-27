@@ -2230,6 +2230,27 @@ pub fn terminal_at_arcade_by_presence(
     }
 }
 
+/// PURE (bsv-low #920): does the door's terminal judgement read the admission's age for this presence? Mempool-only
+/// presence does (#602's race word: retryable while young). Absence does, EXCEPT under an OPEN eviction: Rule 6's
+/// floor keeps a first presentation of a young subject Arcade holds terminal from a client-terminal 422 while the
+/// network has not had its window, but an open eviction is the ledger's two-source refusal already made (#513's
+/// evidence rule: Arcade's OWN fatal word plus both indexers absent, which needs no age; the floor is for a refusal
+/// that rests on absence, #740), and the probe's terminal word is Arcade's own `GET /tx`, never a pushed status. So
+/// a re-present that reads Arcade terminal again and both indexers absent answers the Rejected arm (its eviction
+/// re-run, the refusal's memo, the 422), where it answered the retryable 502 for ten minutes (L51 pair 17: 23:49Z
+/// to 00:01Z). A fresh courier read still decides it (`must_reask_before_refusing`).
+pub fn terminal_reads_age(
+    presence: &crate::proof_fetcher::NetworkPresence,
+    under_open_eviction: bool,
+) -> bool {
+    use crate::proof_fetcher::NetworkPresence;
+    match presence {
+        NetworkPresence::Absent => !under_open_eviction,
+        NetworkPresence::Present { height: None } => true,
+        _ => false,
+    }
+}
+
 /// PURE (bsv-low #836): the door's retryable answer to Arcade's non-final word (the 502 shape a young subject
 /// gets): Arcade's text scrubbed as #519 scrubs a refusal's, the lock height and Arcade's PEER's height named as
 /// hints (the lag is the courier's, never the chain's; neither is a gate input).
@@ -3260,12 +3281,9 @@ impl ArcadeBroadcaster {
             let started = worker::js_sys::Date::now();
             let extra_info = probe.as_ref().map(|r| r.extra_info.as_str()).unwrap_or("");
             let (mut presence, mut source) = self.terminal_presence(subject_txid, started).await;
-            // #602: the age floor applies to absence and mempool-only presence.
-            let young = if matches!(
-                presence,
-                crate::proof_fetcher::NetworkPresence::Absent
-                    | crate::proof_fetcher::NetworkPresence::Present { height: None }
-            ) {
+            // #602: the age floor applies to absence and mempool-only presence; bsv-low #920: never to absence
+            // under an OPEN eviction (`terminal_reads_age`)
+            let young = if terminal_reads_age(&presence, self.evicted_at_ms.is_some()) {
                 subject_young.await
             } else {
                 false
