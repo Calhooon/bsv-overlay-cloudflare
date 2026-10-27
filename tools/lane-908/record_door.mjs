@@ -7,6 +7,9 @@ import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, wri
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+// Miniflare's dispose can close its loopback server twice (node 20 raises ERR_SERVER_NOT_RUNNING on the second
+// close, after the first instance is gone): benign for this cell, which starts a second instance on the copied D1.
+process.on('uncaughtException', e => { if (e?.code === 'ERR_SERVER_NOT_RUNNING') return; console.error(e); process.exit(1) })
 const root = fileURLToPath(new URL('../../', import.meta.url))
 const fixturePath = process.env.RECORD_DOOR_FIXTURE
 assert(fixturePath, 'RECORD_DOOR_FIXTURE names the exported fleet fixture')
@@ -20,7 +23,8 @@ const scratch = mkdtempSync(resolve(tmpdir(), 'record-door-'))
 const state = resolve(scratch, 'state')
 const paths = ['tools/lane-908/record_door_worker.mjs', 'crates/low-app-layer/build/worker/shim.mjs', 'crates/low-app-layer/build/index.js', 'crates/low-app-layer/build/index_bg.wasm']
 const options = {
-  name: 'record-door', resourcePersistencePath: state, modulesRoot: root,
+  // `defaultPersistRoot` is the name a Miniflare without `convertV4MiniflareOptions` (4.86) reads; the older reads the other.
+  name: 'record-door', resourcePersistencePath: state, defaultPersistRoot: state, modulesRoot: root,
   modules: paths.map(path => ({ path: root + path, type: path.endsWith('.wasm') ? 'CompiledWasm' : 'ESModule', contents: readFileSync(path.includes('/build/') ? path.replace('crates/low-app-layer/build', build) : root + path) })),
   compatibilityDate: '2024-12-01', compatibilityFlags: ['nodejs_compat'],
   durableObjects: { BOARD_VIEW: { className: 'RecordBelt', useSQLite: true }, AUTH_SESSIONS: 'AuthSessionStore' },

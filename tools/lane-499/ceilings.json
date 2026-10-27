@@ -539,114 +539,114 @@
       "censusKey": "/health"
     },
     "record-door-handfile": {
-      "route": "POST /record handfile on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908). Re-measured after #180 added the dirty-backlog index; statement count remains the write-only shape.",
+      "route": "POST /record handfile on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge runs in the owed-events consumer, never the door (#908, #911). Re-measured by D2-ACTOR-A (2026-10-27): the door's one publish batch (the owed_event_seq token and each filed row's facts and mark count) rides the request.",
       "measured": {
-        "reads": 23,
-        "writes": 71,
-        "stmts": 21,
+        "reads": 38,
+        "writes": 74,
+        "stmts": 27,
         "maxReads": 10
       },
       "ceiling": {
-        "reads": 35,
-        "writes": 73,
-        "stmts": 23,
+        "reads": 57,
+        "writes": 76,
+        "stmts": 29,
         "maxReads": 15
       },
       "censusKey": null
     },
     "record-door-potparty": {
-      "route": "POST /record potparty on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908). Re-measured after #180 added the dirty-backlog index; statement count remains the write-only shape.",
+      "route": "POST /record potparty on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge runs in the owed-events consumer, never the door (#908, #911). Re-measured by D2-ACTOR-A (2026-10-27): the door's one publish batch (the owed_event_seq token and each filed row's facts and mark count) rides the request.",
       "measured": {
-        "reads": 3,
-        "writes": 14,
-        "stmts": 4,
+        "reads": 8,
+        "writes": 16,
+        "stmts": 7,
         "maxReads": 2
       },
       "ceiling": {
-        "reads": 7,
-        "writes": 16,
-        "stmts": 6,
+        "reads": 12,
+        "writes": 18,
+        "stmts": 9,
         "maxReads": 3
       },
       "censusKey": null
     },
     "record-door-potrefund": {
-      "route": "POST /record potrefund on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908). Re-measured after #180 added the dirty-backlog index; statement count remains the write-only shape.",
+      "route": "POST /record potrefund on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge runs in the owed-events consumer, never the door (#908, #911). Re-measured by D2-ACTOR-A (2026-10-27): the door's one publish batch (the owed_event_seq token and each filed row's facts and mark count) rides the request.",
       "measured": {
-        "reads": 8,
-        "writes": 26,
-        "stmts": 5,
+        "reads": 15,
+        "writes": 28,
+        "stmts": 8,
         "maxReads": 8
       },
       "ceiling": {
-        "reads": 12,
-        "writes": 28,
-        "stmts": 7,
+        "reads": 23,
+        "writes": 30,
+        "stmts": 10,
         "maxReads": 12
       },
       "censusKey": null
     },
     "record-door-result": {
-      "route": "POST /record result on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908). Re-measured after #180 added the dirty-backlog index; statement count remains the write-only shape.",
+      "route": "POST /record result on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge runs in the owed-events consumer, never the door (#908, #911). Re-measured by D2-ACTOR-A (2026-10-27): the door's one publish batch (the owed_event_seq token and each filed row's facts and mark count) rides the request.",
       "measured": {
-        "reads": 9,
-        "writes": 23,
-        "stmts": 5,
+        "reads": 16,
+        "writes": 25,
+        "stmts": 8,
         "maxReads": 7
       },
       "ceiling": {
-        "reads": 14,
-        "writes": 25,
-        "stmts": 7,
+        "reads": 24,
+        "writes": 27,
+        "stmts": 10,
         "maxReads": 11
       },
       "censusKey": null
     },
     "record-door-collected": {
-      "route": "POST /record collected on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908). Re-measured after #180 added the dirty-backlog index; statement count remains the write-only shape.",
+      "route": "POST /record collected on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge runs in the owed-events consumer, never the door (#908, #911). Re-measured by D2-ACTOR-A (2026-10-27): the door's one publish batch (the owed_event_seq token and each filed row's facts and mark count) rides the request.",
       "measured": {
-        "reads": 1,
-        "writes": 9,
-        "stmts": 4,
-        "maxReads": 1
+        "reads": 7,
+        "writes": 11,
+        "stmts": 7,
+        "maxReads": 3
       },
       "ceiling": {
-        "reads": 5,
-        "writes": 11,
-        "stmts": 6,
-        "maxReads": 2
+        "reads": 11,
+        "writes": 13,
+        "stmts": 9,
+        "maxReads": 5
       },
       "censusKey": null
     },
     "record-door-held": {
-      "route": "POST /record held on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908). Re-measured after #180 added the dirty-backlog index; statement count remains the write-only shape.",
+      "route": "POST /record held on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge runs in the owed-events consumer, never the door (#908, #911). Re-measured by D2-ACTOR-A (2026-10-27): the door's one publish batch (the owed_event_seq token and each filed row's facts and mark count) rides the request.",
       "measured": {
-        "reads": 3,
-        "writes": 9,
-        "stmts": 3,
-        "maxReads": 1
+        "reads": 9,
+        "writes": 11,
+        "stmts": 6,
+        "maxReads": 3
       },
       "ceiling": {
-        "reads": 7,
-        "writes": 11,
-        "stmts": 5,
-        "maxReads": 2
+        "reads": 14,
+        "writes": 13,
+        "stmts": 8,
+        "maxReads": 5
       },
       "censusKey": null
     },
     "record-door-hopsweep": {
-      "route": "POST /record hopsweep on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908). Re-measured after #180 added the dirty-backlog index; statement count remains the write-only shape.",
+      "route": "POST /record hopsweep on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge runs in the owed-events consumer, never the door (#908, #911). Re-measured by D2-ACTOR-A (2026-10-27): the door's one publish batch (the owed_event_seq token and each filed row's facts and mark count) rides the request.",
       "measured": {
-        "reads": 4,
-        "writes": 10,
-        "stmts": 5,
-        "maxReads": 3
+        "reads": 11,
+        "writes": 12,
+        "stmts": 8,
+        "maxReads": 4
       },
       "ceiling": {
-        "reads": 8,
-        "writes": 12,
-        "stmts": 7,
-        "maxReads": 5
+        "reads": 17,
+        "writes": 14,
+        "stmts": 10,
+        "maxReads": 6
       },
       "censusKey": null
     }
