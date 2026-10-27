@@ -6978,6 +6978,8 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     body["d1Budget"] = crate::d1_ledger::budget_json();
     // bsv-low #451 slice B: the isolate's courier tally (the durable one is the overlay's /health/invariants).
     body["couriers"] = crate::courier::health_json();
+    // bsv-low #935: this isolate's push coalescer (the durable totals are the overlay's `/health/invariants.push`).
+    body["push"] = crate::push_coalesce::health_json();
     body["trackerReask"] = crate::tracker_host::pacing::health_json();
     // bsv-low #862 (L7-DEPTH): the spend depth the served words carry (`spendDepth`), its source and the var as set.
     body["spendDepth"] = crate::tracker_host::runtime::spend_depth_health_json(

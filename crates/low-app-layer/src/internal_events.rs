@@ -165,24 +165,39 @@ pub async fn first_party_push(
 /// `pot_hook::seat_message_id`, one per intent). The relay keeps a flat body's `messageId` (`rust-message-box`
 /// 0.4.6 `split_push_body`), stores it once (`messages.message_id` UNIQUE, `INSERT OR IGNORE`) and answers a repeat
 /// `400 ERR_DUPLICATE_MESSAGE`: [`push_answer`] reads that as delivered. With `None` the relay mints its own id.
+/// bsv-low #935: the raw call, never coalesced; a push to a seat goes through
+/// `push_coalesce::push_to_seat`, which calls [`first_party_push_answer`].
 pub async fn first_party_push_with_id(
     env: &Env,
     recipient: &str,
     message_id: Option<&str>,
     body: Value,
 ) -> crate::pot_hook::Delivery {
-    use crate::pot_hook::Delivery;
+    first_party_push_answer(env, recipient, message_id, body)
+        .await
+        .delivery()
+}
+
+/// One relay `/push`, answered as `push_coalesce::answer_of` reads it (bsv-low #935: a `429 ERR_SEND_BUDGET` by its
+/// code, apart from any other refusal).
+pub async fn first_party_push_answer(
+    env: &Env,
+    recipient: &str,
+    message_id: Option<&str>,
+    body: Value,
+) -> crate::push_coalesce::Answer {
+    use crate::push_coalesce::Answer;
     let (Ok(relay), Ok(token), Ok(sk)) = (
         env.var("RELAY_URL").map(|v| v.to_string()),
         env.secret("BROADCAST_TOKEN").map(|v| v.to_string()),
         env.secret("SERVER_PRIVATE_KEY").map(|v| v.to_string()),
     ) else {
         console_log!("[push] not configured (RELAY_URL / BROADCAST_TOKEN / SERVER_PRIVATE_KEY) — event dropped");
-        return Delivery::NotConfigured;
+        return Answer::NotConfigured;
     };
     let Some(sender) = sender_pubkey_hex(&sk) else {
         console_log!("[push] SERVER_PRIVATE_KEY does not derive a pubkey — event dropped");
-        return Delivery::NotConfigured;
+        return Answer::NotConfigured;
     };
     let mut payload = json!({
         "sender": sender,
@@ -194,27 +209,28 @@ pub async fn first_party_push_with_id(
         payload["messageId"] = json!(id);
     }
     match relay_post(env, &relay, "/push", &token, payload.to_string()).await {
-        Ok(r) if (200..300).contains(&r.status_code()) => Delivery::Sent,
+        Ok(r) if (200..300).contains(&r.status_code()) => Answer::Sent,
         Ok(mut r) => {
             let status = r.status_code();
             let server = r.headers().get("server").ok().flatten().unwrap_or_default();
             let body = r.text().await.unwrap_or_default();
-            if push_answer(status, &body) == Delivery::Sent {
-                return Delivery::Sent;
+            let answer = crate::push_coalesce::answer_of(status, &body);
+            if answer == Answer::Sent {
+                return answer;
             }
             console_log!(
                 "[push] → {}… HTTP {status} (server={server}) {}",
                 &recipient[..12.min(recipient.len())],
                 excerpt(&body)
             );
-            Delivery::Failed
+            answer
         }
         Err(e) => {
             console_log!(
                 "[push] → {}… failed: {e}",
                 &recipient[..12.min(recipient.len())]
             );
-            Delivery::Failed
+            Answer::Failed
         }
     }
 }

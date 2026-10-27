@@ -2146,6 +2146,8 @@ pub async fn health_invariants(
     body["changePark"] = body["changeParked"].clone();
     // bsv-low #893 section 5: the app layer's owed belt, the one place the owed list asks the chain explorers.
     body["owedBelt"] = crate::applayer_counters::owed_belt_view(&counters);
+    // bsv-low #935: the app layer's first-party pushes, coalesced per seat under the relay's send budget.
+    body["push"] = crate::applayer_counters::push_view(&counters);
     // bsv-low #781, #778 (B-FLEET-4): the app layer's last scheduled pass, its wall and each phase's wall, as the
     // app layer wrote them at the pass's end (`low-app-layer` `pass_meter`).
     body["appLayerScheduledPass"] = applayer_pass;
