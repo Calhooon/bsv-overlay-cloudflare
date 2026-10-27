@@ -188,12 +188,15 @@ pub async fn route(db: &impl JudgeDb, ev: &OwedEvent) -> Result<Routed, String> 
     Ok(out)
 }
 
+/// One `(source, sourceKey)` pair the sweep re-publishes.
+pub type Pair = (String, String);
+
 /// PURE: the sweep's choice over the rows read past its cursor: up to [`SWEEP_PAIRS_PER_TICK`] distinct pairs, oldest
 /// first, and the cursor to save (`None`: the walk reached the end of the backlog, start again next tick).
 pub fn sweep_choice(
     rows: &[Value],
     read_limit: usize,
-) -> (Vec<(String, String)>, Option<(i64, i64)>) {
+) -> (Vec<Pair>, Option<(i64, i64)>) {
     let mut pairs: Vec<(String, String)> = Vec::new();
     let mut cursor = None;
     for r in rows {
@@ -268,7 +271,7 @@ where
     S: Fn(Vec<String>) -> F,
     F: std::future::Future<Output = Result<(), String>>,
 {
-    async fn batch(
+    async fn run_reads(
         &self,
         stmts: Vec<(&'static str, Vec<publish::Arg>)>,
     ) -> Result<Vec<Vec<Value>>, String> {

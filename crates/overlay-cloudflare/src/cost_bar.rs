@@ -278,6 +278,9 @@ mod tests {
         assert!(crate::d1::OVERLAY_MIGRATIONS.contains(&crate::d1_ledger::COST_DAILY_CREATE));
         conn.execute_batch(crate::d1_ledger::COST_DAILY_CREATE)
             .unwrap();
+        // bsv-low #911: the queue family's column, appended
+        conn.execute_batch(crate::d1_ledger::COST_DAILY_QUEUE_ALTER)
+            .unwrap();
         for (w, req, read) in [
             ("low-app-layer", 64, 1_000),
             ("low-app-layer", 3, 20),
@@ -285,7 +288,7 @@ mod tests {
         ] {
             conn.execute(
                 crate::d1_ledger::COST_DAILY_UPSERT_SQL,
-                rusqlite::params!["2026-10-23", w, req as f64, read as f64, 2.0, 4.0, 9.0],
+                rusqlite::params!["2026-10-23", w, req as f64, read as f64, 2.0, 4.0, 9.0, 1.0],
             )
             .unwrap();
         }

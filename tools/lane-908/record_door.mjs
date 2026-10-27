@@ -1,4 +1,6 @@
 // #908: the production record doors, real workerd/D1, and a 10 s evidence-read fake.
+// bsv-low #911 (D2-ACTOR-A): the door publishes its owed events to the `owed-events` queue and answers; the judge
+// runs in the queue's consumer (the same Worker here, its producer and consumer bound as wrangler.toml binds them).
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
@@ -23,6 +25,8 @@ const options = {
   compatibilityDate: '2024-12-01', compatibilityFlags: ['nodejs_compat'],
   durableObjects: { BOARD_VIEW: { className: 'RecordBelt', useSQLite: true }, AUTH_SESSIONS: 'AuthSessionStore' },
   d1Databases: { OVERLAY_DB: '00000000-0000-0000-0000-000000000908' },
+  queueProducers: { OWED_EVENTS: { queueName: 'low-owed-events' } },
+  queueConsumers: { 'low-owed-events': { maxBatchSize: 1, maxBatchTimeout: 0, maxRetries: 3, deadLetterQueue: 'low-owed-events-dlq' }, 'low-owed-events-dlq': { maxBatchSize: 10, maxRetries: 100 } },
   bindings: { AUTH_ENFORCE: 'false', SESSION_LANE: 'false', INTERNAL_TOKEN: 'ci-internal-tok', COURIER_SINK: 'http://127.0.0.1:9' },
   serviceBindings: { CHAINTRACKS: async request => {
     const path = new URL(request.url).pathname
@@ -51,7 +55,7 @@ try {
   const poll = async (fn, ms = 22000) => {
     const end = Date.now() + ms
     do { if (await fn()) return; await new Promise(r => setTimeout(r, 25)) } while (Date.now() < end)
-    assert.fail('timed out waiting for the detached judge')
+    assert.fail('timed out waiting for the queue consumer\u2019s judge')
   }
   await call('/health') // Cold schema work belongs to boot, not a warm door sample.
   const run = async (scenario, delay = 10000) => {
@@ -70,8 +74,8 @@ try {
     if (before) assert(ms >= 10000, 'the old door paid for the slow judge')
     else {
       assert(ms < 300, `${scenario.name} took ${ms} ms with a 10 s judge`)
-      assert.match(timing, /write;dur=\d+/)
-      assert.match(timing, /judge;desc=detached/)
+      assert.match(timing, /write;dur=\d+, enqueue;dur=\d+/)
+      assert.doesNotMatch(timing, /judge;desc=detached/, 'no judge rides the door')
       const got = Object.fromEntries([...timing.matchAll(/(reads|writes|stmts|maxReads)=(\d+)/g)].map(m => [m[1], Number(m[2])]))
       const ceiling = JSON.parse(readFileSync(new URL('../lane-499/ceilings.json', import.meta.url), 'utf8')).scenarios['record-door-' + scenario.name]?.ceiling
       if (process.env.D1_BUDGET_MEASURE !== '1') assert(ceiling, 'each record door has a write-only ceiling')
@@ -84,27 +88,30 @@ try {
   else {
     for (const [index, scenario] of fixture.scenarios.entries()) {
       await run(scenario)
-      await poll(async () => (await (await call('/pin/judge')).json()).delayed >= index + 1, 3000)
+      // the consumer's judge takes the injected delay (one at a time: a queue consumer's batches run in order)
+      await poll(async () => (await (await call('/pin/judge')).json()).delayed >= index + 1, 40000)
     }
     // The collected/held filings use the handfile identity while its first judgement sleeps.
     assert.equal(fixture.scenarios[0].identity, fixture.scenarios.find(s => s.name === 'held').identity)
-    await poll(async () => (await one('SELECT COUNT(*) AS n FROM owed_dirty')).n === 0)
+    await poll(async () => (await one('SELECT COUNT(*) AS n FROM owed_dirty')).n === 0, 60000)
     assert((await one('SELECT COUNT(*) AS n FROM owed_state WHERE identity=? AND recomputeSeq>0', fixture.scenarios[0].identity)).n > 0, 'judgement landed after the answer')
     const health = await (await call('/health')).json()
     assert(health.record.answerSamples >= 7)
     assert(health.record.answerMsP50 < 300 && health.record.answerMsP95 < 300, JSON.stringify(health.record))
-    console.log('PASS all seven doors: write-only budgets, <300 ms answers, immediate reads, detached judgement, concurrent filing marks drained, /health.record.answerMsP50 and answerMsP95')
+    assert(health.record.enqueueMsP50 !== null && health.record.enqueueMsP95 !== null, JSON.stringify(health.record))
+    assert(health.owedEvents.consumedTotal >= 7 && health.owedEvents.ackedMarks > 0, JSON.stringify(health.owedEvents))
+    assert(health.owedEvents.oldestEnqueueAgeMs !== null, 'the consumer wrote its batch row')
+    console.log('PASS all seven doors: write-only budgets, <300 ms answers with the publish, immediate reads, the queue consumer\u2019s judgement, concurrent filing marks drained, /health.record and /health.owedEvents served')
+    // HIGH-2's second belt: a mark no consumer acknowledged within one tick is re-published by the sweep on the belt's
+    // alarm and judged by the consumer.
     const party = fixture.scenarios.find(s => s.name === 'potparty')
-    await db.prepare("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'pin','wall',? FROM potparty_records WHERE txid=?").bind(Date.now(), party.binds[0]).run()
-    const t0 = Date.now()
-    await run(party, 25000)
-    await poll(async () => Date.now() - t0 >= 17500)
-    assert.equal((await one("SELECT COUNT(*) AS n FROM owed_dirty WHERE source='pin'")).n, 1, 'the wall leaves the unacknowledged mark')
+    await db.prepare("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'pin','wall',? FROM potparty_records WHERE txid=?").bind(Date.now() - 600000, party.binds[0]).run()
+    assert.equal((await one("SELECT COUNT(*) AS n FROM owed_dirty WHERE source='pin'")).n, 1, 'the planted mark is un-acked')
     const ns = await mf.getDurableObjectNamespace('BOARD_VIEW')
     const response = await ns.get(ns.idFromName('owed-belt:v1')).fetch('http://pin/pin/alarm')
     assert.equal(response.status, 200, await response.clone().text())
-    assert.equal((await one("SELECT COUNT(*) AS n FROM owed_dirty WHERE source='pin'")).n, 0, 'the belt alarm drains the mark left by the wall')
-    console.log('PASS the record judge wall leaves its mark; the real belt alarm drains it')
+    await poll(async () => (await one("SELECT COUNT(*) AS n FROM owed_dirty WHERE source='pin'")).n === 0)
+    console.log('PASS the un-acked sweep on the belt alarm re-publishes a mark older than a tick; the consumer acknowledges it')
   }
   writeFileSync(resolve(dirname(fixturePath), before ? 'before.json' : 'after.json'), JSON.stringify(measured, null, 2) + '\n')
 } finally { await mf.dispose(); rmSync(scratch, { recursive: true, force: true }) }

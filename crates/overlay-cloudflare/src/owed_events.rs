@@ -225,7 +225,10 @@ pub enum Arg {
 #[allow(async_fn_in_trait)]
 pub trait PublishPort {
     /// Run the statements as ONE batch (one transaction), each answering its rows.
-    async fn batch(&self, stmts: Vec<(&'static str, Vec<Arg>)>) -> Result<Vec<Vec<Value>>, String>;
+    async fn run_reads(
+        &self,
+        stmts: Vec<(&'static str, Vec<Arg>)>,
+    ) -> Result<Vec<Vec<Value>>, String>;
     /// Send the bodies to the queue as one `sendBatch` (at most [`owed_event::SEND_BATCH_MAX`]).
     async fn send(&self, bodies: Vec<String>) -> Result<(), String>;
     /// The clock, ms.
@@ -247,14 +250,23 @@ pub struct Published {
 }
 
 /// PURE: the bounds of one note's read (`?1` source, `?2` key, `?3` the txid part, `?4` the vout part).
+/// Only the bounds its statement names (a statement given more bounds than it names is refused).
 pub fn read_args(n: &Noted) -> Vec<Arg> {
     let (txid, vout) = owed_event::split_key(&n.key);
-    vec![
+    let mut args = vec![
         Arg::Text(n.source.clone()),
         Arg::Text(n.key.clone()),
         Arg::Text(txid.to_string()),
         vout.map_or(Arg::Null, |v| Arg::Int(i64::from(v))),
-    ]
+    ];
+    let named = read_sql(&n.source).map_or(2, |sql| {
+        (1..=4)
+            .rev()
+            .find(|i| sql.contains(&format!("?{i}")))
+            .unwrap_or(0)
+    });
+    args.truncate(named);
+    args
 }
 
 /// PURE: does this note read its row at publish? (A held fact, an identity route and an unknown source do not.)
@@ -281,7 +293,7 @@ pub async fn publish_with(port: &impl PublishPort, mut notes: Vec<Noted>) -> Pub
     for n in notes.iter().filter(|n| reads_row(n)) {
         stmts.push((read_sql(&n.source).unwrap_or(READ_MARKS_SQL), read_args(n)));
     }
-    let rows = match port.batch(stmts).await {
+    let rows = match port.run_reads(stmts).await {
         Ok(rows) => rows,
         Err(e) => {
             out.fault = Some(e);
@@ -360,7 +372,10 @@ impl WorkerPublish {
 }
 
 impl PublishPort for WorkerPublish {
-    async fn batch(&self, stmts: Vec<(&'static str, Vec<Arg>)>) -> Result<Vec<Vec<Value>>, String> {
+    async fn run_reads(
+        &self,
+        stmts: Vec<(&'static str, Vec<Arg>)>,
+    ) -> Result<Vec<Vec<Value>>, String> {
         use worker::wasm_bindgen::JsValue;
         let mut prepared = Vec::with_capacity(stmts.len());
         for (sql, args) in stmts {
@@ -494,6 +509,7 @@ pub async fn redrive_dead_letters(
     raw: &[u8],
     env: &worker::Env,
 ) -> worker::Result<worker::Response> {
+    use crate::d1_ledger::Counted;
     use worker::wasm_bindgen::JsValue;
     let body: Value = serde_json::from_slice(raw).unwrap_or(Value::Null);
     let limit = body["limit"].as_i64().unwrap_or(25).clamp(1, REDRIVE_MAX);
@@ -504,7 +520,7 @@ pub async fn redrive_dead_letters(
         .db
         .prepare(DEAD_LETTERS_READ_SQL)
         .bind(&[JsValue::from_f64(limit as f64)])?
-        .all()
+        .counted_all()
         .await?
         .results::<Value>()?;
     let mut ids = Vec::new();
@@ -531,7 +547,7 @@ pub async fn redrive_dead_letters(
             .bind(&[JsValue::from_str(
                 &serde_json::to_string(chunk_ids).unwrap_or_default(),
             )])?
-            .run()
+            .counted_run()
             .await?;
         redriven += chunk.len();
     }
