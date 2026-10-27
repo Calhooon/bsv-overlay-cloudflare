@@ -2837,7 +2837,12 @@ pub(crate) mod tests {
             ie.contains(&squash("payload[\"messageId\"] = json!(id);")),
             "the payload carries messageId"
         );
-        assert!(ie.contains(&squash("if push_answer(status, &body) == Delivery::Sent {")));
+        // bsv-low #935: the answer is read by `push_coalesce::answer_of`, which reads the duplicate through `push_answer`.
+        assert!(ie.contains(&squash("let answer = crate::push_coalesce::answer_of(status, &body);")));
+        let pc = squash(&code_only(include_str!("push_coalesce.rs")));
+        assert!(pc.contains(&squash(
+            "if crate::internal_events::push_answer(status, body) == crate::pot_hook::Delivery::Sent {"
+        )));
         let src = squash(&code_only(include_str!("pot_hook.rs")));
         let serve = &src[src.find("pubasyncfnserve_pot_changed<").unwrap()..];
         assert!(
