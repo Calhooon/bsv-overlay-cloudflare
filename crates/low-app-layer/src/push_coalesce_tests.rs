@@ -199,13 +199,15 @@ async fn fix935_b_a_budget_refusal_is_retried_at_the_next_window_then_given_up()
     );
     let t = cell.borrow().tally;
     assert_eq!((t.refused_budget, t.given_up), (4, 1));
-    let logs = fake.logs.borrow();
-    assert!(
-        logs.iter().any(|l| l.contains("GIVEN UP")
-            && l.contains(&SEAT[..12])
-            && l.contains("kind=owed-changed")),
-        "{logs:?}"
-    );
+    {
+        let logs = fake.logs.borrow();
+        assert!(
+            logs.iter().any(|l| l.contains("GIVEN UP")
+                && l.contains(&SEAT[..12])
+                && l.contains("kind=owed-changed")),
+            "{logs:?}"
+        );
+    }
 
     // Any other refusal is today's: answered failed, never retried, never counted a budget refusal.
     let cell = RefCell::new(Coalescer::default());
