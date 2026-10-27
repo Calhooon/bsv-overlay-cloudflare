@@ -3,6 +3,8 @@ use super::*;
 use crate::{hops_view, owed, results, routes};
 use serde::de::DeserializeOwned;
 
+/// bsv-low #937: the result pots under an OPEN eviction marker (`pot_evictions`' primary key, one probe a pot).
+pub const OPEN_EVICTED_POTS_SQL: &str = "SELECT txid FROM pot_evictions WHERE readmittedAt IS NULL AND txid IN (SELECT value FROM json_each(?1))";
 // The game index is an additive schema dependency, pinned with the migrations.
 pub const PARTIES_SQL: &str = "SELECT pp.*, pp.rowid AS markerRowid, r.createdAt AS potCreatedAt, r.txid IS NULL AS unknownPot FROM potparty_records pp INDEXED BY idx_potparty_game_identity LEFT JOIN pot_records r ON r.txid=pp.potTxid AND r.outputIndex=pp.potVout WHERE pp.identity=?1 AND pp.gameId IN (SELECT value FROM json_each(?2))";
 pub const LINKS_SQL: &str = "SELECT hp.identity,hp.opponentIdentity,hp.gameId,l.potTxid,l.potVout,p.recoveryHeight,hp.seatSettlePubkey,hp.seatSigHex,hp.identitySigHex AS sigHex,hp.markerValid AS sigValid,hp.createdAt,hp.rowid AS markerRowid,p.createdAt AS potCreatedAt,0 AS unknownPot FROM hopparty_records hp INDEXED BY idx_hopparty_game CROSS JOIN hop_pot_links l ON l.markerRowid=hp.rowid CROSS JOIN pot_records p ON p.txid=l.potTxid AND p.outputIndex=l.potVout WHERE hp.identity=?1 AND hp.gameId IN (SELECT value FROM json_each(?2))";
@@ -344,14 +346,14 @@ pub(crate) async fn hydrate_filings(
             reason: Some(format!("could not judge: {reason}")),
         });
     }
-    let unknown: Vec<_> = i
-        .results
-        .iter()
-        .filter(|r| r.spent.is_none())
-        .map(|r| r.pot_txid.clone())
-        .collect();
+    // bsv-low #937: EVERY result's pot is asked of the ledger, its row present or not: a `pot_records` row written
+    // after its pot's OPEN marker (the gated arm's write past its answer deadline, L52 pair 13) is not held, and
+    // `owed::derive_owed_rows` drops an evicted pot whatever its row says (#518). Asked only of the row-less pots
+    // before, so such a row read "unspent" until the write-side guard moved it. One statement, as before; one
+    // primary-key probe per result pot.
+    let unknown: Vec<_> = i.results.iter().map(|r| r.pot_txid.clone()).collect();
     if !unknown.is_empty() {
-        let rows:Vec<Value> = read(db,"SELECT txid FROM pot_evictions WHERE readmittedAt IS NULL AND txid IN (SELECT value FROM json_each(?1))",vec![json_bind(&unknown)]).await?;
+        let rows: Vec<Value> = read(db, OPEN_EVICTED_POTS_SQL, vec![json_bind(&unknown)]).await?;
         i.evicted_pots.extend(rows.iter().map(|r| text(r, "txid")));
     }
     hydrate_evidence(db, &mut i, games, filings).await?;

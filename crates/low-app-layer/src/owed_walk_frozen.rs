@@ -703,6 +703,97 @@ mod pins {
         assert!(row["facts"].get("refresh").is_none(), "{row}");
     }
 
+    /// bsv-low #937 (L52 pair 13): the pot's row stays in `pot_records` while its eviction's OPEN marker stands (the
+    /// gated arm's write landed after the marker, before the write-side guard's move). The judge asks the ledger of
+    /// every result pot, so the refund press is withdrawn at the drain the marker's own dirty mark triggers, exactly
+    /// as for the evicted twin (#518); the readmission's stamp restores it at the next drain. RED on eaaee0ec: the
+    /// ledger was asked only of row-less pots and the press stood (`claimable: true`).
+    #[tokio::test]
+    async fn fix937_e_the_judge_drops_the_press_of_a_pot_under_an_open_marker() {
+        use crate::record_post::{self, tests as rp, RecordKind};
+        let judge = SqliteSql::migrated();
+        judge.now.set(NOW_MS);
+        judge.tip.set(Some(TIP));
+        let victim = rp::wallet(0x45);
+        let id = hex::encode(rp::identity(&victim));
+        let game = [0x7d; 32];
+        let pot = hex::encode(rp::POT_TXID);
+        rp::md_index_the_pot(&judge);
+        rp::md_seat(&judge, &id, &game);
+        judge
+            .conn
+            .execute(
+                "INSERT INTO network_seen (txid, seenAt) VALUES (?1, ?2)",
+                rusqlite::params![pot, (NOW_MS / 1000) as i64],
+            )
+            .unwrap();
+        crate::owed::tests::produce_words(&judge.conn, &pot, &[], true, NOW_MS / 1000 - 600);
+        let script = rp::potrefund_script(&victim, &game, &rp::presigned_refund());
+        let mut filing =
+            record_post::verify_record_post(RecordKind::Potrefund, &script, &id).unwrap();
+        record_post::file_verified(&judge, &mut filing, &id, (NOW_MS / 1000) as i64)
+            .await
+            .unwrap();
+        record_post::detached::judge(&judge, std::slice::from_ref(&filing), "test")
+            .await
+            .unwrap();
+        let drain = || async {
+            for _ in 0..100 {
+                let r = crate::owed_judge::drain_dirty(&judge, 64).await.unwrap();
+                assert!(r.faults.is_empty(), "{:?}", r.faults);
+                if r.subjects == 0 {
+                    break;
+                }
+            }
+        };
+        let refund_press = || {
+            stored(&judge.conn, &id)
+                .values()
+                .map(|row| serde_json::from_str::<serde_json::Value>(row).unwrap())
+                .any(|r| r[0] == "refund-due" && r[6]["claimable"] == true)
+        };
+        drain().await;
+        assert!(refund_press(), "the press before the marker");
+
+        // the eviction's step 1, its own statement; the pot's row stays (the late write the guard has not moved)
+        judge
+            .conn
+            .execute(
+                bsv_overlay_cloudflare::admit_fast::OPEN_EVICTION_MARKER_SQL,
+                rusqlite::params![
+                    pot,
+                    "REJECTED (arcade live REJECTED: bad script)",
+                    (NOW_MS - 60_000) as i64
+                ],
+            )
+            .unwrap();
+        let held: i64 = judge
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pot_records WHERE txid=?1",
+                [&pot],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(held, 1, "the row is still in pot_records");
+        drain().await;
+        assert!(
+            !refund_press(),
+            "no refund press over a pot under an open marker: {:#?}",
+            stored(&judge.conn, &id)
+        );
+
+        judge
+            .conn
+            .execute(
+                bsv_overlay_cloudflare::admit_fast::READMIT_EVICTION_SQL,
+                rusqlite::params![NOW_MS as i64, pot],
+            )
+            .unwrap();
+        drain().await;
+        assert!(refund_press(), "readmitted: the press again");
+    }
+
     #[tokio::test]
     async fn d2fold_medium3_smoke_the_old_walk_runs_natively() {
         let made = (NOW_MS as i64 - 2 * 3_600_000) / 1000;
