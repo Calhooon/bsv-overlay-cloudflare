@@ -1699,6 +1699,13 @@ pub async fn internal_discard(mut req: Request, env: &Env) -> Result<Response> {
         return Response::error("unauthorized", 401);
     }
     let raw = req.bytes().await?;
+    // bsv-low #911 (D2-ACTOR-A-DELTA's LOW-C): the owed events' family, discarded by pair.
+    if serde_json::from_slice::<serde_json::Value>(&raw)
+        .ok()
+        .is_some_and(|v| v["family"] == "owed-events")
+    {
+        return crate::owed_events::discard_dead_letters(&raw, env).await;
+    }
     let keys = match parse_discard_request(&raw) {
         Ok(k) => k,
         Err(why) => {

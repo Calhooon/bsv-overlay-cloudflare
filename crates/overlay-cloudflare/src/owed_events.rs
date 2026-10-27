@@ -37,9 +37,10 @@ pub const SEQ_CREATE: &str =
 /// `('', messageId)`), never one per message: a pair whose judge faults for good holds one row however often it
 /// dead-letters (`parks` counts them, `lastFault` is the consumer's fault memo's last error), `redrives` counts the
 /// lever's re-drives, and a letter re-parked after [`MAX_REDRIVES`] is `exhausted`: never re-driven again. The
-/// consumer deletes the pair's row when its judge lands. (Edited in place: migrations 470 to 473 shipped nowhere,
-/// PR 184 unlanded.)
-pub const DEAD_LETTERS_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_event_dead_letters (source TEXT NOT NULL, sourceKey TEXT NOT NULL, messageId TEXT NOT NULL, body TEXT NOT NULL, parks INTEGER NOT NULL DEFAULT 1, lastFault TEXT, status TEXT NOT NULL DEFAULT 'parked', parkedAt INTEGER NOT NULL, redrives INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (source, sourceKey))";
+/// consumer deletes the pair's row when its judge lands. `redrivenAt` (D2-ACTOR-A-DELTA's LOW-C): the lever's last
+/// re-drive, read by its stale return ([`DEAD_LETTERS_STALE_RETURN_SQL`]). (Edited in place: migrations 470 to 473
+/// shipped nowhere, PR 184 unlanded.)
+pub const DEAD_LETTERS_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_event_dead_letters (source TEXT NOT NULL, sourceKey TEXT NOT NULL, messageId TEXT NOT NULL, body TEXT NOT NULL, parks INTEGER NOT NULL DEFAULT 1, lastFault TEXT, status TEXT NOT NULL DEFAULT 'parked', parkedAt INTEGER NOT NULL, redrives INTEGER NOT NULL DEFAULT 0, redrivenAt INTEGER, PRIMARY KEY (source, sourceKey))";
 /// The parked letters' bound (a NEW pair's park past it is refused, the platform retries it, then it is lost: its
 /// marks stay; a pair already parked is always re-parked on its own row).
 pub const DEAD_LETTERS_MAX: i64 = 2000;
@@ -125,7 +126,7 @@ pub const COUNTER_SKIPPED: &str = "owed_events_publish_skipped_total";
 /// Publishes that faulted (the D1 batch or the send): their marks wait for the sweep.
 pub const COUNTER_FAULTS: &str = "owed_events_publish_faults_total";
 /// Every counter this module and the consumer write, for the seeds.
-pub const COUNTERS: [&str; 13] = [
+pub const COUNTERS: [&str; 18] = [
     COUNTER_PUBLISHED,
     COUNTER_SKIPPED,
     COUNTER_FAULTS,
@@ -140,6 +141,13 @@ pub const COUNTERS: [&str; 13] = [
     "owed_events_fault_held_total",
     "owed_events_sweep_held_total",
     COUNTER_WALL_DROPS,
+    // D2-ACTOR-A-DELTA: NEW-M1 a subject faulting alone, a subject skipped while held; LOW-A the consumer's message
+    // wall; LOW-C a re-drive returned to the lever, a letter discarded
+    "owed_events_subject_faults_total",
+    "owed_events_subject_held_total",
+    "owed_events_consumer_wall_drops_total",
+    "owed_events_dead_letters_stale_returned_total",
+    "owed_events_dead_letters_discarded_total",
 ];
 /// LOW-7 (the D2-ACTOR-A lens): publishes dropped at a request's answer wall ([`PUBLISH_ANSWER_WALL_MS`]): their
 /// marks wait for the sweep. Counted on the isolate ([`note_wall_drop`]) and written with the isolate's next publish
@@ -540,9 +548,101 @@ pub const DEAD_LETTERS_READ_SQL: &str = "SELECT source,sourceKey,body FROM owed_
 /// LOW-4: the re-driven letters (their bodies are on the queue again) marked `redriven`, their re-drive counted;
 /// `?1` a JSON array of `[source, sourceKey]`. The row stays until the pair's judge lands (the consumer deletes it) or
 /// it dead-letters again (re-parked, `exhausted` past [`MAX_REDRIVES`]).
-pub const DEAD_LETTERS_REDRIVEN_SQL: &str = "UPDATE owed_event_dead_letters SET status='redriven',redrives=redrives+1 WHERE status='parked' AND (source,sourceKey) IN (SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?1))";
+pub const DEAD_LETTERS_REDRIVEN_SQL: &str = "UPDATE owed_event_dead_letters SET status='redriven',redrives=redrives+1,redrivenAt=?2 WHERE status='parked' AND (source,sourceKey) IN (SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?1))";
 /// The most letters one lever call re-drives.
 pub const REDRIVE_MAX: i64 = 200;
+/// D2-ACTOR-A-DELTA's LOW-C: a re-drive whose message neither parked again nor landed a judge within this long (a
+/// message lost on the way, a landed judge whose consumer batch row faulted) is returned to `parked` by the lever's
+/// next call, keeping its spent re-drive (#576's stale return, the same hour). A wrong verdict (the copy still in
+/// flight) sends a second copy, which routes by the same marks: harmless.
+pub const REDRIVE_STALE_MS: i64 = 3_600_000;
+/// The stale return (`?1` the cutoff, ms); answers the rows returned. A scan of at most [`DEAD_LETTERS_MAX`] rows.
+pub const DEAD_LETTERS_STALE_RETURN_SQL: &str = "UPDATE owed_event_dead_letters SET status='parked' WHERE status='redriven' AND (redrivenAt IS NULL OR redrivenAt<?1) RETURNING source,sourceKey";
+/// The most letters one discard call names (#576's `DISCARD_MAX_LETTERS`).
+pub const DISCARD_MAX: usize = 50;
+/// LOW-C: discard the named letters (`?1` a JSON array of `[source, sourceKey]`), never a `redriven` one in flight;
+/// answers each row taken. The pair's MARKS stay (a letter is never the only copy of the intent): the sweep and the
+/// consumer still judge them.
+pub const DEAD_LETTERS_DISCARD_SQL: &str = "DELETE FROM owed_event_dead_letters WHERE status IN ('parked','exhausted') AND (source,sourceKey) IN (SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?1)) RETURNING source,sourceKey,status,parks,redrives,lastFault";
+
+/// PURE: the keys a discard body names (`{"family":"owed-events","letters":[{"source","sourceKey"}, ...]}`, 1 to
+/// [`DISCARD_MAX`]), or why it is refused.
+pub fn parse_discard(raw: &[u8]) -> Result<Vec<(String, String)>, &'static str> {
+    let v: Value = serde_json::from_slice(raw).map_err(|_| "body must be JSON")?;
+    let letters = v["letters"].as_array().ok_or("letters must be an array")?;
+    if letters.is_empty() {
+        return Err("letters must name at least one letter");
+    }
+    if letters.len() > DISCARD_MAX {
+        return Err("letters names more than the lever discards per call");
+    }
+    letters
+        .iter()
+        .map(|l| {
+            let text = |k: &str| {
+                l[k].as_str()
+                    .filter(|t| t.len() <= 1024)
+                    .map(str::to_string)
+            };
+            match (text("source"), text("sourceKey")) {
+                (Some(s), Some(k)) if !k.is_empty() => Ok((s, k)),
+                _ => Err("each letter needs a source and a non-empty sourceKey"),
+            }
+        })
+        .collect()
+}
+
+/// LOW-C: `POST /internal/discard-dead-letters` with `{"family":"owed-events","letters":[...]}` (the #576 lever's
+/// route and bearer, checked by its caller): delete the named `parked` or `exhausted` letters, each logged with its
+/// parks, re-drives and last fault, counted `owed_events_dead_letters_discarded_total`; a key naming no such row is
+/// `notFound`. The marks stay.
+pub async fn discard_dead_letters(raw: &[u8], env: &worker::Env) -> worker::Result<worker::Response> {
+    use crate::d1_ledger::Counted;
+    use worker::wasm_bindgen::JsValue;
+    let keys = match parse_discard(raw) {
+        Ok(k) => k,
+        Err(why) => {
+            return worker::Response::error(
+                format!("{why}: {{\"family\": \"owed-events\", \"letters\": [{{\"source\": \"<source>\", \"sourceKey\": \"<key>\"}}, ...]}} (1..{DISCARD_MAX})"),
+                400,
+            )
+        }
+    };
+    let db = env.d1("OVERLAY_DB")?;
+    let named: Vec<Value> = keys.iter().map(|(s, k)| json!([s, k])).collect();
+    let rows = db
+        .prepare(DEAD_LETTERS_DISCARD_SQL)
+        .bind(&[JsValue::from_str(&Value::Array(named).to_string())])?
+        .counted_all()
+        .await?
+        .results::<Value>()?;
+    for r in &rows {
+        worker::console_warn!(
+            "[owed-events] DISCARDED dead letter {} {} ({}; parks={} redrives={} lastFault={})",
+            r["source"].as_str().unwrap_or(""),
+            r["sourceKey"].as_str().unwrap_or(""),
+            r["status"].as_str().unwrap_or(""),
+            r["parks"],
+            r["redrives"],
+            r["lastFault"].as_str().unwrap_or("")
+        );
+    }
+    let taken: Vec<(String, String)> = rows
+        .iter()
+        .filter_map(|r| Some((r["source"].as_str()?.to_string(), r["sourceKey"].as_str()?.to_string())))
+        .collect();
+    let not_found: Vec<Value> = keys
+        .iter()
+        .filter(|k| !taken.contains(k))
+        .map(|(s, k)| json!({"source": s, "sourceKey": k}))
+        .collect();
+    bump(env, &[("owed_events_dead_letters_discarded_total", rows.len() as u64)]).await;
+    worker::Response::from_json(&json!({
+        "family": "owed-events",
+        "discarded": rows,
+        "notFound": not_found,
+    }))
+}
 
 /// LOW-3: `POST /internal/redrive-dead-letters` with `{"family":"owed-events","limit"?: n}` (the #576 lever, bearer
 /// checked by its caller): the oldest parked owed events (default 25, at most [`REDRIVE_MAX`]) sent to the queue
@@ -559,6 +659,21 @@ pub async fn redrive_dead_letters(
     let Some(port) = WorkerPublish::of(env) else {
         return worker::Response::error("no OWED_EVENTS binding", 503);
     };
+    let now = worker::Date::now().as_millis() as f64;
+    // LOW-C: a re-drive older than the hour that neither re-parked nor landed is parked again first
+    let returned = port
+        .db
+        .prepare(DEAD_LETTERS_STALE_RETURN_SQL)
+        .bind(&[JsValue::from_f64(now - REDRIVE_STALE_MS as f64)])?
+        .counted_all()
+        .await?
+        .results::<Value>()?
+        .len();
+    if returned > 0 {
+        worker::console_warn!(
+            "[owed-events] {returned} re-driven letters neither re-parked nor landed within the hour: parked again"
+        );
+    }
     let rows = port
         .db
         .prepare(DEAD_LETTERS_READ_SQL)
@@ -591,16 +706,24 @@ pub async fn redrive_dead_letters(
         }
         port.db
             .prepare(DEAD_LETTERS_REDRIVEN_SQL)
-            .bind(&[JsValue::from_str(
-                &serde_json::to_string(chunk_keys).unwrap_or_default(),
-            )])?
+            .bind(&[
+                JsValue::from_str(&serde_json::to_string(chunk_keys).unwrap_or_default()),
+                JsValue::from_f64(now),
+            ])?
             .counted_run()
             .await?;
         redriven += chunk.len();
     }
-    bump(env, &[("owed_events_redriven_total", redriven as u64)]).await;
+    bump(
+        env,
+        &[
+            ("owed_events_redriven_total", redriven as u64),
+            ("owed_events_dead_letters_stale_returned_total", returned as u64),
+        ],
+    )
+    .await;
     worker::Response::from_json(
-        &json!({"family": "owed-events", "read": keys.len(), "redriven": redriven, "maxRedrives": MAX_REDRIVES}),
+        &json!({"family": "owed-events", "staleReturned": returned, "read": keys.len(), "redriven": redriven, "maxRedrives": MAX_REDRIVES}),
     )
 }
 
