@@ -992,7 +992,7 @@ pub async fn handfile_post(
         .map_err(worker::Error::RustError)?;
     // bsv-low #911 (D2-ACTOR-A): the batch's owed events before the answer, never a judge here (the consumer's):
     // its hop marker, its two party rows and its refund, each the pair its row's trigger marks.
-    if crate::owed_events::configured(&ctx.env) {
+    if crate::owed_events::configured(&ctx.env).await {
         crate::owed_events_publish::note(
             "hop",
             &overlay_discovery::owed_event::outpoint_key(&verified.hop_txid, verified.hopparty.hop_vout),

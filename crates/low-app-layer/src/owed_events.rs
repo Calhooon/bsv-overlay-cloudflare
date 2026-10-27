@@ -531,9 +531,55 @@ pub fn notes_of(pairs: &[(String, String)]) -> Vec<publish::Noted> {
         .collect()
 }
 
-/// `true` when this Worker holds the producer binding (the queue configured): the judge's trigger is the consumer.
-pub fn configured(env: &worker::Env) -> bool {
-    env.queue(publish::BINDING).is_ok()
+/// LOW-1 (the D2-ACTOR-A lens): the overlay's certified migration count from which the publish's statements exist
+/// (`owed_event_seq`, `idx_released_missing_hop`, the dead letters, the cost bar's queue column): the app layer does
+/// not link the overlay, so the figure is pinned against `OVERLAY_MIGRATION_COUNT` by `d2_actor_a_fold_l1_*`.
+pub const OWED_EVENTS_MIGRATION_COUNT: u32 = 473;
+/// The certified count's row (the backfill's gate reads the same).
+pub const CERTIFIED_COUNT_SQL: &str =
+    "SELECT value AS count FROM ops_counters WHERE name='overlay_migration_count'";
+/// A count found short is read again after this long (a found one holds for the isolate's life).
+pub const CERTIFIED_RECHECK_MS: f64 = 60_000.0;
+
+thread_local! {
+    /// The isolate's reading: `(ready, read at ms)`.
+    static READY: std::cell::Cell<Option<(bool, f64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// PURE: is the overlay's certified count at or past the publish's migrations? (An unreadable count is not.)
+pub fn ready_at(count: Option<f64>) -> bool {
+    count.is_some_and(|c| c >= f64::from(OWED_EVENTS_MIGRATION_COUNT))
+}
+
+/// `true` when this Worker holds the producer binding (the queue configured) AND the overlay's migrations the
+/// publish needs are certified (LOW-1: an app layer deployed before the overlay keeps the inline judge and the
+/// drain, where every publish and sweep would fault on a table that is not there). The count is read once per
+/// isolate when found, again each [`CERTIFIED_RECHECK_MS`] while short.
+pub async fn configured(env: &worker::Env) -> bool {
+    if env.queue(publish::BINDING).is_err() {
+        return false;
+    }
+    let now = worker::Date::now().as_millis() as f64;
+    match READY.with(std::cell::Cell::get) {
+        Some((true, _)) => return true,
+        Some((false, at)) if now - at < CERTIFIED_RECHECK_MS => return false,
+        _ => {}
+    }
+    let count = match crate::routes::D1Sql::of(env) {
+        Ok(sql) => rows(&sql, CERTIFIED_COUNT_SQL, vec![])
+            .await
+            .ok()
+            .and_then(|r| r.first().and_then(|r| r["count"].as_f64())),
+        Err(_) => None,
+    };
+    let ready = ready_at(count);
+    if !ready {
+        worker::console_warn!(
+            "[owed-events] the overlay's certified migration count {count:?} is short of {OWED_EVENTS_MIGRATION_COUNT}: the inline judge stands"
+        );
+    }
+    READY.with(|r| r.set(Some((ready, now))));
+    ready
 }
 
 /// The sweep on the belt's alarm, then its publish. Answers the pairs re-published.

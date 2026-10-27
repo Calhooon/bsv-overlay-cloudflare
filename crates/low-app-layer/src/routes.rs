@@ -3047,7 +3047,7 @@ pub(crate) async fn internal_pot_changed(
     // The overlay source transaction already marked every affected game. bsv-low #911 (D2-ACTOR-A, MEDIUM-7): the
     // felt's announce above is unchanged; the judge's trigger is the `owed-events` consumer, so the hook publishes
     // the outpoints' `pot` events (the overlay already did: a duplicate routes to acknowledged marks) and never judges.
-    if crate::owed_events::configured(env) {
+    if crate::owed_events::configured(env).await {
         let pairs: Vec<(&str, String)> = outpoints
             .iter()
             .map(|(t, v)| ("pot", overlay_discovery::owed_event::outpoint_key(t, *v)))
@@ -3247,7 +3247,7 @@ pub(crate) async fn internal_hop_changed(
     }
     // bsv-low #911 (D2-ACTOR-A): an identity route per identity for the `owed-events` consumer, never a judge here
     // (with no queue binding the bounded judgement runs as before).
-    if crate::owed_events::configured(env) {
+    if crate::owed_events::configured(env).await {
         let pairs: Vec<(&str, String)> = identities
             .iter()
             .map(|id| (overlay_discovery::owed_event::ROUTE_IDENTITY, id.to_ascii_lowercase()))
