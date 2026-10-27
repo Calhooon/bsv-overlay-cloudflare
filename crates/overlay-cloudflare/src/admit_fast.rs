@@ -971,6 +971,13 @@ pub fn reevicted_owes_memo(yielded: bool, kind: Option<&str>) -> bool {
     !yielded && !matches!(kind, Some("refused" | "retired" | "unconfirmable"))
 }
 
+/// PURE (bsv-low #920, the FIX-920 lens's LOW-4): the memo kind a re-eviction's settle reads off its memo row:
+/// `None` when no row is held; a row with a NULL `kind` (written before migration 152) is `unconfirmable`, as the
+/// app layer reads it (`txany.rs`), so the settle keeps it.
+pub(crate) fn memo_kind_of(row: Option<Option<String>>) -> Option<String> {
+    row.map(|kind| kind.unwrap_or_else(|| "unconfirmable".to_string()))
+}
+
 /// What the write-side guard's settle touches after its re-eviction (bsv-low #920): D1 in production, real SQLite
 /// under the pins (`settle_reevicted_with`).
 pub(crate) trait ReevictedPort {
@@ -1044,11 +1051,13 @@ impl ReevictedPort for D1Reevicted<'_> {
         struct Kind {
             kind: Option<String>,
         }
-        Ok(Query::new(REEVICTED_MEMO_KIND_SQL)
-            .bind(self.txid)
-            .fetch_optional::<Kind>(self.db)
-            .await?
-            .and_then(|k| k.kind))
+        Ok(memo_kind_of(
+            Query::new(REEVICTED_MEMO_KIND_SQL)
+                .bind(self.txid)
+                .fetch_optional::<Kind>(self.db)
+                .await?
+                .map(|k| k.kind),
+        ))
     }
     async fn commit(&self, queries: Vec<Query>) -> Result<(), String> {
         let statements = queries
@@ -8535,7 +8544,7 @@ mod tests {
                     r.get::<_, Option<String>>(0)
                 })
                 .optional()
-                .map(|k| k.flatten())
+                .map(memo_kind_of)
                 .map_err(|e| e.to_string())
         }
         async fn commit(&self, queries: Vec<Query>) -> Result<(), String> {
@@ -8769,6 +8778,53 @@ mod tests {
         };
         settle_reevicted_with(&port, "57", 1, &yielded, reason, "pin").await;
         assert_eq!(port.commits.get(), 0, "a yielded pass writes nothing");
+    }
+
+    /// bsv-low #920, the FIX-920 lens's LOW-4: a memo row with a NULL `kind` (a row from before migration 152, read
+    /// by the app layer as `unconfirmable`, `txany.rs`) is a memo the settle keeps, never "no memo" overwritten with
+    /// `refused`. RED with the row flattened (`left: None right: Some("unconfirmable")`).
+    #[tokio::test]
+    async fn fix920_low4_a_null_kind_memo_reads_unconfirmable_and_is_kept() {
+        assert_eq!(memo_kind_of(None), None, "no row: no memo");
+        assert_eq!(
+            memo_kind_of(Some(None)),
+            Some("unconfirmable".to_string()),
+            "a NULL kind is the app layer's unconfirmable"
+        );
+        assert_eq!(
+            memo_kind_of(Some(Some("absent".into()))),
+            Some("absent".to_string())
+        );
+        let txid = "58".repeat(32);
+        let reason = "REJECTED (arcade live REJECTED: UTXO_SPENT (70): x; both indexers absent)";
+        let db = SqliteShadow::new(shipped_conn());
+        db.conn
+            .execute(
+                "INSERT INTO tx_any_verdicts (txid, verdictAtMs, inputOutpoint, spenderTxid, kind, evidence) VALUES (?1, 5, 'aa:0', 'bb', NULL, 'input conflict')",
+                [txid.as_str()],
+            )
+            .unwrap();
+        evict_core(&db, &txid, reason, 1_000).await;
+        fix920_land(&db.conn, &txid);
+        assert!(fix920_landing_guard(&db, &txid, 21_000)
+            .await
+            .is_some_and(|m| m >= 3));
+        let kind: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT kind FROM tx_any_verdicts WHERE txid = ?1",
+                [txid.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, None, "the pre-152 memo is kept, not turned refused");
+        assert_eq!(
+            fix920_counter(
+                &db.conn,
+                crate::applayer_counters::COUNTER_TXANY_MEMO_WRITE_REFUSED
+            ),
+            0
+        );
     }
 
     /// bsv-low #920: every write-side guard that re-evicts after a write settles the refusal right after its
