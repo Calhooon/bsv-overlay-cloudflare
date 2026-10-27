@@ -1217,11 +1217,11 @@
    "name": "owed_event_dead_letters",
    "database": "low-overlay-db",
    "owner": "low-app-layer",
-   "writers": {"overlay-cloudflare": ["CREATE", "DELETE"]},
+   "writers": {"overlay-cloudflare": ["CREATE", "UPDATE"]},
    "readers": ["overlay-cloudflare"],
    "rebuild_class": "transient",
    "never_wipe": false,
-   "holds": "the `owed-events` queue's dead letters (bsv-low #911, LOW-3): the message body as sent, its pair, its park time; at most 2,000 rows; parked by the app layer's DLQ consumer (park first, ack after), re-driven and deleted by the overlay's lever (`POST /internal/redrive-dead-letters`, `family: owed-events`)",
+   "holds": "the `owed-events` queue's dead letters (bsv-low #911, LOW-3; the lens's MEDIUM-2 and LOW-4): ONE row per (source, sourceKey) pair, the newest body, its parks, the fault memo's last error, its status (parked, redriven, exhausted after 3 re-drives); at most 2,000 rows; parked by the app layer's DLQ consumer (park first, ack after), deleted by the consumer when the pair's judge lands, re-driven by the overlay's lever (`POST /internal/redrive-dead-letters`, `family: owed-events`), which marks it redriven",
    "why": "never the only copy of the intent: the letter's marks stay in owed_dirty and the un-acked sweep re-publishes them; a lost row loses an operator's view only"
   },
   {

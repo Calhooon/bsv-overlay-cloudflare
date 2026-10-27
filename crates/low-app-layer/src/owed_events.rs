@@ -52,15 +52,205 @@ pub const SWEEP_CURSOR_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tick
 /// the pass-meter precedent), served on `/health.owedEvents` and the overlay's `/health/invariants.owedEvents`.
 pub const CONSUMER_ROW_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:consumer',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// The served ages and totals, one batch of key reads.
-pub const HEALTH_COUNTERS_SQL: &str = "SELECT name,value FROM ops_counters WHERE name IN ('owed_events_published_total','owed_events_consumed_total','owed_events_acked_marks_total','owed_events_dlq_total','owed_events_publish_faults_total','owed_events_judge_faults_total','owed_events_swept_total')";
+pub const HEALTH_COUNTERS_SQL: &str = "SELECT name,value FROM ops_counters WHERE name IN ('owed_events_published_total','owed_events_consumed_total','owed_events_acked_marks_total','owed_events_dlq_total','owed_events_publish_faults_total','owed_events_judge_faults_total','owed_events_swept_total','owed_events_fault_held_total','owed_events_sweep_held_total')";
 /// The consumer's row.
 pub const HEALTH_CONSUMER_SQL: &str =
     "SELECT cursor,tickedAtMs FROM owed_belt_state WHERE name='owed-events:consumer'";
-/// LOW-3: park one dead letter, under the bound (a full table answers no row: the platform retries it).
-pub const DEAD_LETTER_PARK_SQL: &str = "INSERT INTO owed_event_dead_letters (messageId,body,source,sourceKey,parkedAt) SELECT ?1,?2,?3,?4,?5 WHERE (SELECT COUNT(*) FROM (SELECT 1 FROM owed_event_dead_letters LIMIT ?6))<?6 ON CONFLICT(messageId) DO NOTHING RETURNING messageId";
-/// A letter already parked (a redelivery).
-pub const DEAD_LETTER_HELD_SQL: &str =
-    "SELECT 1 AS held FROM owed_event_dead_letters WHERE messageId=?1";
+/// LOW-3 and the lens's MEDIUM-2: park one dead letter ON ITS PAIR'S ROW (`?1` source, `?2` sourceKey, `?3` the
+/// message id, `?4` the body, `?5` now, `?6` the pair's fault memo row, `?7` the bound, `?8`
+/// `owed_events_publish::MAX_REDRIVES`). A new pair is taken only under the bound (a full table answers no row: the
+/// platform retries it); a pair already parked is re-parked in place: the newest body, `parks` counted once a message
+/// (a redelivery of the same message counts nothing), `lastFault` the memo's last error, and `exhausted` once the
+/// lever re-drove it [`publish::MAX_REDRIVES`] times. Answers the row's status.
+pub const DEAD_LETTER_PARK_SQL: &str = "INSERT INTO owed_event_dead_letters (source,sourceKey,messageId,body,parks,lastFault,status,parkedAt,redrives) SELECT ?1,?2,?3,?4,1,(SELECT json_extract(cursor,'$.lastFault') FROM owed_belt_state WHERE name=?6),'parked',?5,0 WHERE (SELECT COUNT(*) FROM (SELECT 1 FROM owed_event_dead_letters LIMIT ?7))<?7 OR EXISTS (SELECT 1 FROM owed_event_dead_letters WHERE source=?1 AND sourceKey=?2) ON CONFLICT(source,sourceKey) DO UPDATE SET parks=owed_event_dead_letters.parks+(owed_event_dead_letters.messageId IS NOT excluded.messageId),messageId=excluded.messageId,body=excluded.body,lastFault=COALESCE(excluded.lastFault,owed_event_dead_letters.lastFault),parkedAt=excluded.parkedAt,status=CASE WHEN owed_event_dead_letters.redrives>=?8 THEN 'exhausted' ELSE 'parked' END RETURNING status";
+/// The pair's letter is resolved: its judge landed (in the batch that clears its fault memo).
+pub const DEAD_LETTER_RESOLVE_SQL: &str =
+    "DELETE FROM owed_event_dead_letters WHERE source=?1 AND sourceKey=?2";
+/// The parked letters by status (at most [`publish::DEAD_LETTERS_MAX`] rows), for `/health.owedEvents`.
+pub const DEAD_LETTER_HEALTH_SQL: &str =
+    "SELECT status,COUNT(*) AS n FROM owed_event_dead_letters GROUP BY status";
+
+/// MEDIUM-2 (the D2-ACTOR-A lens): THE FAULT MEMO, one `owed_belt_state` row per pair whose judge faulted, named
+/// `owed-events:fault:<source> <sourceKey>`, its cursor `{faults, lastFault, lastFaultAtMs, heldUntilMs}`: the
+/// consecutive faults (a landed judge deletes the row), the last error (the cause, readable), and the hold. From the
+/// [`FAULT_HOLD_AFTER`]th fault the pair is HELD for a doubling period ([`fault_hold_ms`], 120 s to 6 h): the sweep
+/// leaves it out and the consumer hands its message back with that delay. So a pair whose judge faults for good
+/// costs four deliveries a hold (the platform's 1 + `max_retries`) and ONE park row, at most 16 attempts a day once
+/// the hold is 6 h; it was 2,880 attempts and 720 park rows a day.
+pub const FAULT_MEMO_PREFIX: &str = "owed-events:fault:";
+/// The consecutive faults after which a pair is held.
+pub const FAULT_HOLD_AFTER: i64 = 3;
+/// The first hold: one sweep tick.
+pub const FAULT_HOLD_BASE_MS: i64 = SWEEP_AFTER_MS;
+/// The longest hold.
+pub const FAULT_HOLD_CAP_MS: i64 = 6 * 3_600_000;
+/// The memo rows of the pairs in `?1` (a JSON array of row names).
+pub const FAULT_MEMO_READ_SQL: &str =
+    "SELECT name,cursor FROM owed_belt_state WHERE name IN (SELECT value FROM json_each(?1))";
+/// Write one pair's memo.
+pub const FAULT_MEMO_WRITE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,?2,?3) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+/// Clear one pair's memo (its judge landed).
+pub const FAULT_MEMO_CLEAR_SQL: &str = "DELETE FROM owed_belt_state WHERE name=?1";
+/// The memo's served figures at `?1` (now): the rows, the pairs held now, the most consecutive faults (a range of
+/// the state's primary key).
+pub const FAULT_MEMO_HEALTH_SQL: &str = "SELECT COUNT(*) AS rows,COALESCE(SUM(json_extract(cursor,'$.heldUntilMs')>?1),0) AS held,MAX(json_extract(cursor,'$.faults')) AS maxFaults FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;'";
+/// The memo's newest fault (the cause an operator reads first).
+pub const FAULT_MEMO_LAST_SQL: &str = "SELECT name,cursor FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;' ORDER BY tickedAtMs DESC LIMIT 1";
+
+/// The memo row's name of a pair.
+pub fn fault_memo_name(source: &str, key: &str) -> String {
+    format!("{FAULT_MEMO_PREFIX}{source} {key}")
+}
+
+/// PURE: the hold after `faults` consecutive faults: none before [`FAULT_HOLD_AFTER`], then 120 s doubling to 6 h.
+pub fn fault_hold_ms(faults: i64) -> i64 {
+    if faults < FAULT_HOLD_AFTER {
+        return 0;
+    }
+    let shift = (faults - FAULT_HOLD_AFTER).clamp(0, 20) as u32;
+    FAULT_HOLD_BASE_MS
+        .saturating_mul(1i64 << shift)
+        .min(FAULT_HOLD_CAP_MS)
+}
+
+/// What the memo says of one pair after a fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultMemo {
+    /// Consecutive faults, this one included.
+    pub faults: i64,
+    /// The hold this fault set (0: none yet).
+    pub hold_ms: i64,
+    /// The hold's end (ms; `now` when none).
+    pub held_until_ms: i64,
+}
+
+/// MEDIUM-2: record one judge fault of `(source, key)`: one read of its memo, one write (the fault path only).
+pub async fn note_fault(
+    db: &impl SqlPort,
+    source: &str,
+    key: &str,
+    fault: &str,
+) -> Result<FaultMemo, String> {
+    let name = fault_memo_name(source, key);
+    let now = db.now_ms() as i64;
+    let held = rows(
+        db,
+        FAULT_MEMO_READ_SQL,
+        vec![Bind::Text(json!([name]).to_string())],
+    )
+    .await?;
+    let prior = held
+        .first()
+        .and_then(|r| r["cursor"].as_str())
+        .and_then(|c| serde_json::from_str::<Value>(c).ok())
+        .and_then(|c| c["faults"].as_i64())
+        .unwrap_or(0);
+    let faults = prior + 1;
+    let hold_ms = fault_hold_ms(faults);
+    let memo = FaultMemo {
+        faults,
+        hold_ms,
+        held_until_ms: now + hold_ms,
+    };
+    let clipped: String = fault.chars().take(300).collect();
+    let cursor = json!({"faults": faults, "lastFault": clipped, "lastFaultAtMs": now, "heldUntilMs": memo.held_until_ms});
+    db.run_batch(vec![Stmt {
+        sql: FAULT_MEMO_WRITE_SQL.into(),
+        binds: vec![
+            Bind::Text(name),
+            Bind::Text(cursor.to_string()),
+            Bind::Int(now),
+        ],
+    }])
+    .await?;
+    Ok(memo)
+}
+
+/// The statements a landed judge of `(source, key)` adds to its consumer's batch row: the memo cleared, the pair's
+/// dead letter resolved (two primary-key deletes).
+pub fn resolved_statements(source: &str, key: &str) -> Vec<Stmt> {
+    vec![
+        Stmt {
+            sql: FAULT_MEMO_CLEAR_SQL.into(),
+            binds: vec![Bind::Text(fault_memo_name(source, key))],
+        },
+        Stmt {
+            sql: DEAD_LETTER_RESOLVE_SQL.into(),
+            binds: vec![Bind::Text(source.into()), Bind::Text(key.into())],
+        },
+    ]
+}
+
+/// PURE: the pairs the sweep re-publishes, the held ones left out (`memos`: the memo rows of `pairs`), and how many
+/// were held.
+pub fn unheld(pairs: Vec<Pair>, memos: &[Value], now_ms: i64) -> (Vec<Pair>, usize) {
+    let held_names: std::collections::BTreeSet<&str> = memos
+        .iter()
+        .filter(|r| {
+            r["cursor"]
+                .as_str()
+                .and_then(|c| serde_json::from_str::<Value>(c).ok())
+                .and_then(|c| c["heldUntilMs"].as_i64())
+                .is_some_and(|until| until > now_ms)
+        })
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    let before = pairs.len();
+    let kept: Vec<Pair> = pairs
+        .into_iter()
+        .filter(|(s, k)| !held_names.contains(fault_memo_name(s, k).as_str()))
+        .collect();
+    let held = before - kept.len();
+    (kept, held)
+}
+
+/// What the dead letter queue's park did with one letter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Parked {
+    /// On its pair's row, with the row's status (`parked`, or `exhausted` past the re-drives).
+    Row(String),
+    /// A new pair at a full table: handed back.
+    Full,
+}
+
+/// LOW-3: park one dead letter (the DLQ consumer's one statement; the pins run exactly this).
+pub async fn park_letter(
+    db: &impl SqlPort,
+    message_id: &str,
+    body: &str,
+) -> Result<Parked, String> {
+    let (source, key) = match OwedEvent::decode(body) {
+        Ok(ev) => (ev.source, ev.source_key),
+        Err(_) => (String::new(), message_id.to_string()),
+    };
+    let memo = fault_memo_name(&source, &key);
+    let out = rows(
+        db,
+        DEAD_LETTER_PARK_SQL,
+        vec![
+            Bind::Text(source),
+            Bind::Text(key),
+            Bind::Text(message_id.into()),
+            Bind::Text(body.into()),
+            Bind::Int(db.now_ms() as i64),
+            Bind::Text(memo),
+            Bind::Int(publish::DEAD_LETTERS_MAX),
+            Bind::Int(publish::MAX_REDRIVES),
+        ],
+    )
+    .await?;
+    Ok(match out.first().and_then(|r| r["status"].as_str()) {
+        Some(status) => Parked::Row(status.to_string()),
+        None => Parked::Full,
+    })
+}
+
+/// LOW-5 (the lens): the delay a letter whose park did not land is handed back with: its age since its message was
+/// sent, 60 s to 30 min (#576's doubling shape, read off the clock since `attempts` is not exposed on a raw message):
+/// over the DLQ's 100 retries about 48 h, where a fixed 60 s gave about 100 minutes.
+pub fn park_retry_delay_s(age_ms: i64) -> u32 {
+    (age_ms / 1000).clamp(60, 1800) as u32
+}
 
 /// What one message's routing did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -252,6 +442,24 @@ pub async fn sweep(db: &impl SqlPort, now_ms: i64) -> Result<Vec<(String, String
     )
     .await?;
     let (pairs, next) = sweep_choice(&read, SWEEP_READ_LIMIT);
+    // MEDIUM-2: a pair whose judge faulted past the bound waits out its hold (its marks stay; the walk wraps to it)
+    let pairs = if pairs.is_empty() {
+        pairs
+    } else {
+        let names: Vec<String> = pairs.iter().map(|(s, k)| fault_memo_name(s, k)).collect();
+        let memos = rows(
+            db,
+            FAULT_MEMO_READ_SQL,
+            vec![Bind::Text(json!(names).to_string())],
+        )
+        .await?;
+        let (kept, held) = unheld(pairs, &memos, now_ms);
+        if held > 0 {
+            db.counters(vec![("owed_events_sweep_held_total".into(), held as u64)])
+                .await;
+        }
+        kept
+    };
     let next = next.map_or(
         json!({"at": -1, "g": 0}),
         |(at, g)| json!({"at": at, "g": g}),
@@ -427,6 +635,7 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
     let mut oldest_age: i64 = 0;
     let mut deltas: BTreeMap<&str, u64> = BTreeMap::new();
     let mut messages = 0u64;
+    let mut resolved: Vec<Stmt> = Vec::new();
     for msg in batch.raw_iter() {
         messages += 1;
         let age = now - msg.timestamp().as_millis() as i64;
@@ -444,6 +653,7 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
         };
         match consume_one(&env, &ev).await {
             Ok(routed) => {
+                resolved.extend(resolved_statements(&ev.source, &ev.source_key));
                 *deltas.entry("owed_events_consumed_total").or_default() += 1;
                 *deltas.entry("owed_events_acked_marks_total").or_default() += routed.marks as u64;
                 if routed.more {
@@ -459,7 +669,22 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                     ev.seq
                 );
                 *deltas.entry("owed_events_judge_faults_total").or_default() += 1;
-                msg.retry();
+                // MEDIUM-2: the pair's fault memo (the cause readable), and its hold once past the bound
+                let memo = match crate::routes::D1Sql::of(&env) {
+                    Ok(sql) => note_fault(&sql, &ev.source, &ev.source_key, &e).await.ok(),
+                    Err(_) => None,
+                };
+                match memo {
+                    Some(m) if m.hold_ms > 0 => {
+                        *deltas.entry("owed_events_fault_held_total").or_default() += 1;
+                        msg.retry_with_options(
+                            &worker::QueueRetryOptionsBuilder::new()
+                                .with_delay_seconds((m.hold_ms / 1000).clamp(1, 43_200) as u32)
+                                .build(),
+                        );
+                    }
+                    _ => msg.retry(),
+                }
             }
         }
     }
@@ -467,11 +692,14 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
     publish::bump(&env, &deltas).await;
     if let Ok(sql) = crate::routes::D1Sql::of(&env) {
         let row = json!({"oldestEnqueueAgeMs": oldest_age, "messages": messages, "atMs": now});
+        let mut batch_row = vec![Stmt {
+            sql: CONSUMER_ROW_SQL.into(),
+            binds: vec![Bind::Text(row.to_string()), Bind::Int(now)],
+        }];
+        // MEDIUM-2: a landed judge clears its pair's fault memo and resolves its dead letter
+        batch_row.extend(resolved);
         if let Err(e) = sql
-            .run_batch(vec![Stmt {
-                sql: CONSUMER_ROW_SQL.into(),
-                binds: vec![Bind::Text(row.to_string()), Bind::Int(now)],
-            }])
+            .run_batch(batch_row)
             .await
         {
             worker::console_warn!("[owed-events] the consumer's age row not written: {e}");
@@ -480,8 +708,9 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
     Ok(())
 }
 
-/// LOW-3: the dead letter queue's consumer, on #576's shape: PARK FIRST, ACK AFTER. A park that faults or meets a
-/// full table is handed back (60 s); the platform's last delivery loses the letter, never its marks.
+/// LOW-3: the dead letter queue's consumer, on #576's shape: PARK FIRST, ACK AFTER, one row per pair
+/// ([`park_letter`]). A park that faults or meets a full table is handed back with [`park_retry_delay_s`] (LOW-5);
+/// the platform's last delivery loses the letter, never its marks.
 async fn park_dead_letters(
     batch: &worker::MessageBatch<Value>,
     env: &worker::Env,
@@ -492,54 +721,32 @@ async fn park_dead_letters(
     let mut parked = 0u64;
     for msg in batch.raw_iter() {
         let body = msg.body().as_string().unwrap_or_default();
-        let ev = OwedEvent::decode(&body).ok();
         let id = msg.id();
-        let out = sql
-            .run_batch(vec![
-                Stmt {
-                    sql: DEAD_LETTER_PARK_SQL.into(),
-                    binds: vec![
-                        Bind::Text(id.clone()),
-                        Bind::Text(body.clone()),
-                        ev.as_ref()
-                            .map_or(Bind::Null, |e| Bind::Text(e.source.clone())),
-                        ev.as_ref()
-                            .map_or(Bind::Null, |e| Bind::Text(e.source_key.clone())),
-                        Bind::Int(now),
-                        Bind::Int(publish::DEAD_LETTERS_MAX),
-                    ],
-                },
-                Stmt {
-                    sql: DEAD_LETTER_HELD_SQL.into(),
-                    binds: vec![Bind::Text(id.clone())],
-                },
-            ])
-            .await;
-        match out {
-            Ok(outs) if outs.get(1).is_some_and(|o| !o.rows.is_empty()) => {
-                parked += u64::from(outs.first().is_some_and(|o| !o.rows.is_empty()));
-                worker::console_warn!("[owed-events] PARKED dead letter {id}: {body}");
+        let delay = park_retry_delay_s(now - msg.timestamp().as_millis() as i64);
+        let back = || {
+            msg.retry_with_options(
+                &worker::QueueRetryOptionsBuilder::new()
+                    .with_delay_seconds(delay)
+                    .build(),
+            )
+        };
+        match park_letter(&sql, &id, &body).await {
+            Ok(Parked::Row(status)) => {
+                parked += 1;
+                worker::console_warn!("[owed-events] PARKED dead letter {id} ({status}): {body}");
                 msg.ack();
             }
-            Ok(_) => {
+            Ok(Parked::Full) => {
                 worker::console_warn!(
-                    "[owed-events] dead letter {id} not parked (the table is full): handed back"
+                    "[owed-events] dead letter {id} not parked (the table is full): handed back in {delay} s"
                 );
-                msg.retry_with_options(
-                    &worker::QueueRetryOptionsBuilder::new()
-                        .with_delay_seconds(60)
-                        .build(),
-                );
+                back();
             }
             Err(e) => {
                 worker::console_warn!(
-                    "[owed-events] dead letter {id} park faulted ({e}): handed back"
+                    "[owed-events] dead letter {id} park faulted ({e}): handed back in {delay} s"
                 );
-                msg.retry_with_options(
-                    &worker::QueueRetryOptionsBuilder::new()
-                        .with_delay_seconds(60)
-                        .build(),
-                );
+                back();
             }
         }
     }
@@ -558,6 +765,18 @@ pub async fn health(db: &impl SqlPort) -> Value {
             },
             Stmt {
                 sql: HEALTH_CONSUMER_SQL.into(),
+                binds: vec![],
+            },
+            Stmt {
+                sql: FAULT_MEMO_HEALTH_SQL.into(),
+                binds: vec![Bind::Int(db.now_ms() as i64)],
+            },
+            Stmt {
+                sql: FAULT_MEMO_LAST_SQL.into(),
+                binds: vec![],
+            },
+            Stmt {
+                sql: DEAD_LETTER_HEALTH_SQL.into(),
                 binds: vec![],
             },
         ])
@@ -580,6 +799,29 @@ pub async fn health(db: &impl SqlPort) -> Value {
         .and_then(|o| o.rows.first())
         .and_then(|r| r["cursor"].as_str())
         .and_then(|c| serde_json::from_str::<Value>(c).ok());
+    let memo = read.get(2).and_then(|o| o.rows.first()).cloned().unwrap_or(Value::Null);
+    let last = read.get(3).and_then(|o| o.rows.first()).map(|r| {
+        let cursor = r["cursor"]
+            .as_str()
+            .and_then(|c| serde_json::from_str::<Value>(c).ok())
+            .unwrap_or(Value::Null);
+        json!({
+            "pair": r["name"].as_str().map(|n| n.trim_start_matches(FAULT_MEMO_PREFIX)),
+            "faults": cursor["faults"],
+            "lastFault": cursor["lastFault"],
+            "lastFaultAtMs": cursor["lastFaultAtMs"],
+            "heldUntilMs": cursor["heldUntilMs"],
+        })
+    });
+    let letters: serde_json::Map<String, Value> = read
+        .get(4)
+        .map(|o| {
+            o.rows
+                .iter()
+                .filter_map(|r| Some((r["status"].as_str()?.to_string(), r["n"].clone())))
+                .collect()
+        })
+        .unwrap_or_default();
     let dirty = owed_judge::dirty_health(db).await;
     json!({
         "publishedTotal": counter("owed_events_published_total"),
@@ -593,5 +835,17 @@ pub async fn health(db: &impl SqlPort) -> Value {
         "publishFaults": counter("owed_events_publish_faults_total"),
         "judgeFaults": counter("owed_events_judge_faults_total"),
         "sweptTotal": counter("owed_events_swept_total"),
+        "faultHeld": counter("owed_events_fault_held_total"),
+        "sweepHeld": counter("owed_events_sweep_held_total"),
+        "faultMemo": {
+            "rows": memo["rows"],
+            "held": memo["held"],
+            "maxFaults": memo["maxFaults"],
+            "last": last,
+            "holdAfter": FAULT_HOLD_AFTER,
+            "holdBaseMs": FAULT_HOLD_BASE_MS,
+            "holdCapMs": FAULT_HOLD_CAP_MS,
+        },
+        "deadLetters": letters,
     })
 }
