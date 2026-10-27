@@ -251,7 +251,9 @@ new_classes = ["AuthSessionStore"]
 # (the record door, the hooks, the word ingest and the un-acked mark sweep
 # publish beside their marks) and is its ONE CONSUMER: the judge's only trigger
 # (owed_events.rs). `max_batch_size = 1` and `max_batch_timeout = 0` (LOW-5: the
-# judge's trigger never waits a batch); a message whose judge faults is handed
+# judge's trigger never waits a batch); `max_concurrency = 1` (the lens's
+# MEDIUM-1: one judge at a time fleet-wide, the per-identity serialiser until
+# lane B's actor); a message whose judge faults is handed
 # back, `max_retries = 3`, then dead-lettered. Create both queues before
 # deploying: `wrangler queues create low-owed-events` and `wrangler queues create low-owed-events-dlq`.
 [[queues.producers]]
@@ -264,6 +266,7 @@ max_batch_size = 1
 max_batch_timeout = 0
 max_retries = 3
 dead_letter_queue = "low-owed-events-dlq"
+max_concurrency = 1
 
 # LOW-3: the owed events' dead letters, parked in D1 (`owed_event_dead_letters`,
 # park first, ack after) and re-driven by the overlay's lever
@@ -374,7 +377,9 @@ bindings = [
 # (the record door, the hooks, the word ingest and the un-acked mark sweep
 # publish beside their marks) and is its ONE CONSUMER: the judge's only trigger
 # (owed_events.rs). `max_batch_size = 1` and `max_batch_timeout = 0` (LOW-5: the
-# judge's trigger never waits a batch); a message whose judge faults is handed
+# judge's trigger never waits a batch); `max_concurrency = 1` (the lens's
+# MEDIUM-1: one judge at a time fleet-wide, the per-identity serialiser until
+# lane B's actor); a message whose judge faults is handed
 # back, `max_retries = 3`, then dead-lettered. Create both queues before
 # deploying: `wrangler queues create low-owed-events-beta` and `wrangler queues create low-owed-events-beta-dlq`.
 [[env.beta.queues.producers]]
@@ -387,6 +392,7 @@ max_batch_size = 1
 max_batch_timeout = 0
 max_retries = 3
 dead_letter_queue = "low-owed-events-beta-dlq"
+max_concurrency = 1
 
 # LOW-3: the owed events' dead letters, parked in D1 (`owed_event_dead_letters`,
 # park first, ack after) and re-driven by the overlay's lever

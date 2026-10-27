@@ -22,6 +22,12 @@ use overlay_discovery::owed_event::{self, OwedEvent};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+/// MEDIUM-1 (the D2-ACTOR-A lens): the `owed-events` consumer's `max_concurrency` in every app-layer render: ONE
+/// judge at a time fleet-wide, the serialiser of the judge per identity until lane B's per-identity actor. Two
+/// consumers judging one identity can commit the first's stale rows over the second's with every mark acknowledged
+/// (pinned by `d2_actor_a_fold_m1_*`).
+pub const CONSUMER_MAX_CONCURRENCY: u32 = 1;
+
 /// The pair's marks, oldest generation first (`idx_owed_dirty_source_key`; the source filtered in the index's row).
 pub const ROUTE_MARKS_SQL: &str = "SELECT identity,gameId,generation FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey=?2 AND source=?1 ORDER BY generation LIMIT ?3";
 /// An identity route's marks, oldest first (`idx_owed_dirty_identity_marked`).
