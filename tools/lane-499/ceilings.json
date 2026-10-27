@@ -159,13 +159,13 @@
       "route": "/record?kind=potparty: a signed stranger filing. #908: the request ends after the source commit; judgement runs in wait_until. The four-statement write shape is also pinned by record-door-potparty on the fleet fixture.",
       "measured": {
         "reads": 3,
-        "writes": 13,
+        "writes": 14,
         "stmts": 4,
         "maxReads": 2
       },
       "ceiling": {
         "reads": 7,
-        "writes": 15,
+        "writes": 16,
         "stmts": 6,
         "maxReads": 3
       },
@@ -539,112 +539,112 @@
       "censusKey": "/health"
     },
     "record-door-handfile": {
-      "route": "POST /record handfile on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908).",
+      "route": "POST /record handfile on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908). Re-measured after #180 added the dirty-backlog index; statement count remains the write-only shape.",
       "measured": {
         "reads": 23,
-        "writes": 65,
+        "writes": 71,
         "stmts": 21,
         "maxReads": 10
       },
       "ceiling": {
         "reads": 35,
-        "writes": 67,
+        "writes": 73,
         "stmts": 23,
         "maxReads": 15
       },
       "censusKey": null
     },
     "record-door-potparty": {
-      "route": "POST /record potparty on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908).",
+      "route": "POST /record potparty on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908). Re-measured after #180 added the dirty-backlog index; statement count remains the write-only shape.",
       "measured": {
         "reads": 3,
-        "writes": 13,
+        "writes": 14,
         "stmts": 4,
         "maxReads": 2
       },
       "ceiling": {
         "reads": 7,
-        "writes": 15,
+        "writes": 16,
         "stmts": 6,
         "maxReads": 3
       },
       "censusKey": null
     },
     "record-door-potrefund": {
-      "route": "POST /record potrefund on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908).",
+      "route": "POST /record potrefund on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908). Re-measured after #180 added the dirty-backlog index; statement count remains the write-only shape.",
       "measured": {
         "reads": 8,
-        "writes": 22,
+        "writes": 26,
         "stmts": 5,
         "maxReads": 8
       },
       "ceiling": {
         "reads": 12,
-        "writes": 24,
+        "writes": 28,
         "stmts": 7,
         "maxReads": 12
       },
       "censusKey": null
     },
     "record-door-result": {
-      "route": "POST /record result on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908).",
+      "route": "POST /record result on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908). Re-measured after #180 added the dirty-backlog index; statement count remains the write-only shape.",
       "measured": {
         "reads": 9,
-        "writes": 21,
+        "writes": 23,
         "stmts": 5,
         "maxReads": 7
       },
       "ceiling": {
         "reads": 14,
-        "writes": 23,
+        "writes": 25,
         "stmts": 7,
         "maxReads": 11
       },
       "censusKey": null
     },
     "record-door-collected": {
-      "route": "POST /record collected on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908).",
+      "route": "POST /record collected on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908). Re-measured after #180 added the dirty-backlog index; statement count remains the write-only shape.",
       "measured": {
         "reads": 1,
-        "writes": 8,
+        "writes": 9,
         "stmts": 4,
         "maxReads": 1
       },
       "ceiling": {
         "reads": 5,
-        "writes": 10,
+        "writes": 11,
         "stmts": 6,
         "maxReads": 2
       },
       "censusKey": null
     },
     "record-door-held": {
-      "route": "POST /record held on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908).",
+      "route": "POST /record held on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908). Re-measured after #180 added the dirty-backlog index; statement count remains the write-only shape.",
       "measured": {
         "reads": 3,
-        "writes": 8,
+        "writes": 9,
         "stmts": 3,
         "maxReads": 1
       },
       "ceiling": {
         "reads": 7,
-        "writes": 10,
+        "writes": 11,
         "stmts": 5,
         "maxReads": 2
       },
       "censusKey": null
     },
     "record-door-hopsweep": {
-      "route": "POST /record hopsweep on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908).",
+      "route": "POST /record hopsweep on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908). Re-measured after #180 added the dirty-backlog index; statement count remains the write-only shape.",
       "measured": {
         "reads": 4,
-        "writes": 9,
+        "writes": 10,
         "stmts": 5,
         "maxReads": 3
       },
       "ceiling": {
         "reads": 8,
-        "writes": 11,
+        "writes": 12,
         "stmts": 7,
         "maxReads": 5
       },
