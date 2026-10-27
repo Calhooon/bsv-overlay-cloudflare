@@ -7,6 +7,7 @@ mod owed_db;
 
 use low_app_layer::{owed_events, owed_events_publish as publish};
 use overlay_discovery::owed_event::{self, OwedEvent};
+use low_app_layer::pot_hook::SqlPort;
 use owed_db::{seed_stranded_hop, Db, NOW};
 use std::cell::RefCell;
 
@@ -274,7 +275,7 @@ struct Held<'a> {
     gate: RefCell<Option<tokio::sync::oneshot::Receiver<()>>>,
     reached: std::cell::Cell<bool>,
 }
-impl low_app_layer::pot_hook::SqlPort for Held<'_> {
+impl SqlPort for Held<'_> {
     async fn run_batch(
         &self,
         stmts: Vec<low_app_layer::pot_hook::Stmt>,
@@ -417,4 +418,168 @@ async fn d2_actor_a_fold_m1_one_consumer_at_a_time_derives_the_second_events_row
             );
         }
     }
+}
+
+/// MEDIUM-2 (the D2-ACTOR-A lens): A PAIR WHOSE JUDGE FAULTS FOR GOOD COSTS A BOUNDED, BACKING-OFF NUMBER OF ATTEMPTS
+/// AND ONE PARK ROW, ITS CAUSE READABLE. A day of the shipped sweep (every 120 s belt tick) over a subject whose row
+/// write errs every time, the platform's deliveries modelled (1 + `max_retries` = 4, a retry at once or after the
+/// memo's hold, then the dead letter queue's park): the shipped `note_fault`, `sweep` and `park_letter`. Without the
+/// memo's hold the same day is 2,880 attempts and 720 letters (the lens's figure; RED with `fault_hold_ms` answering
+/// 0 in `note_fault`: "bounded and backing off: 2880 attempts a day", 720 letters).
+#[tokio::test(flavor = "current_thread")]
+async fn d2_actor_a_fold_m2_a_pair_faulting_for_good_is_held_doubling_and_parked_once() {
+    // the doubling: none for two faults, then 120 s doubling to 6 h
+    let holds: Vec<i64> = (1..=12).map(owed_events::fault_hold_ms).collect();
+    assert_eq!(&holds[..5], &[0, 0, 120_000, 240_000, 480_000]);
+    assert_eq!(holds[11], owed_events::FAULT_HOLD_CAP_MS);
+
+    let db = Db::new();
+    let hop = owed_db::hop(9);
+    seed_stranded_hop(&db, ID, "g1", &hop);
+    *db.fail_on.borrow_mut() = Some("INSERT INTO owed_rows".into());
+    let start = db.int("SELECT markedAtMs FROM owed_dirty") + owed_events::SWEEP_AFTER_MS + 1;
+    let day = 24 * 3_600_000i64;
+    let tick = owed_events::SWEEP_AFTER_MS;
+    let (mut attempts, mut letters) = (0u64, 0u64);
+    // the message in flight: (due at, delivery number, its id)
+    let mut flight: Option<(i64, u32, String)> = None;
+    let mut t = start;
+    let mut next_sweep = start;
+    let mut sent = 0u32;
+    while t < start + day {
+        db.now.set(t as u64);
+        while let Some((due, n, id)) = flight.clone() {
+            if due > t {
+                break;
+            }
+            attempts += 1;
+            let ev = event("hop", &hop_key(&hop));
+            let err = owed_events::route(&db, &ev).await.unwrap_err();
+            let memo = owed_events::note_fault(&db, "hop", &hop_key(&hop), &err)
+                .await
+                .unwrap();
+            if n < 4 {
+                flight = Some((t + memo.hold_ms, n + 1, id));
+            } else {
+                letters += 1;
+                let body = ev.encode();
+                assert!(matches!(
+                    owed_events::park_letter(&db, &id, &body).await.unwrap(),
+                    owed_events::Parked::Row(_)
+                ));
+                flight = None;
+            }
+        }
+        // one sweep a belt tick; its message's deliveries run from the next step on
+        if flight.is_none() && t >= next_sweep {
+            next_sweep = t + tick;
+            let pairs = owed_events::sweep(&db, t).await.unwrap();
+            if !pairs.is_empty() {
+                sent += 1;
+                flight = Some((t + 1, 1, format!("m{sent}")));
+            }
+        }
+        let wake = flight.as_ref().map_or(next_sweep, |(due, _, _)| *due);
+        t = wake.max(t + 1);
+    }
+    assert!(attempts <= 40, "bounded and backing off: {attempts} attempts a day");
+    assert!(attempts >= 8, "the pair is still retried: {attempts}");
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_event_dead_letters"),
+        1,
+        "{letters} dead letters, one row"
+    );
+    assert_eq!(
+        db.int("SELECT parks FROM owed_event_dead_letters") as u64,
+        letters
+    );
+    let cause = db.text("SELECT lastFault FROM owed_event_dead_letters").unwrap();
+    assert!(cause.contains("injected fault"), "the cause readable: {cause}");
+    assert_eq!(db.int("SELECT COUNT(*) FROM owed_dirty"), 1, "its mark stays");
+
+    // the health serves the memo: one pair, its faults and its last error
+    let health = owed_events::health(&db).await;
+    assert_eq!(health["faultMemo"]["rows"], 1);
+    assert!(health["faultMemo"]["last"]["lastFault"]
+        .as_str()
+        .unwrap()
+        .contains("injected fault"));
+    assert_eq!(health["deadLetters"]["parked"], 1);
+
+    // the judge lands: the memo cleared, the letter resolved, in the consumer's batch row
+    *db.fail_on.borrow_mut() = None;
+    owed_events::route(&db, &event("hop", &hop_key(&hop)))
+        .await
+        .unwrap();
+    db.run_batch(owed_events::resolved_statements("hop", &hop_key(&hop)))
+        .await
+        .unwrap();
+    assert_eq!(db.int("SELECT COUNT(*) FROM owed_event_dead_letters"), 0);
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_belt_state WHERE name LIKE 'owed-events:fault:%'"),
+        0
+    );
+}
+
+/// LOW-3, LOW-4 and LOW-5 (the lens): THE PARK over real SQLite: one row per pair (a redelivery counts nothing, a new
+/// message of the pair counts one), an undecodable body keyed by its message, a full table refusing a NEW pair and
+/// re-parking a held one, three re-drives then `exhausted` (never read by the lever again), the hand-back delay
+/// doubling with the letter's age to 30 min.
+#[tokio::test(flavor = "current_thread")]
+async fn d2_actor_a_fold_l3_the_park_holds_one_row_a_pair_and_stops_at_three_redrives() {
+    use owed_events::{park_letter, Parked};
+    let db = Db::new();
+    let body = event("pot", &hop_key(&owed_db::hop(1))).encode();
+    assert_eq!(park_letter(&db, "m1", &body).await.unwrap(), Parked::Row("parked".into()));
+    assert_eq!(park_letter(&db, "m1", &body).await.unwrap(), Parked::Row("parked".into()));
+    assert_eq!(db.int("SELECT parks FROM owed_event_dead_letters"), 1, "a redelivery");
+    park_letter(&db, "m2", &body).await.unwrap();
+    assert_eq!(
+        (
+            db.int("SELECT COUNT(*) FROM owed_event_dead_letters"),
+            db.int("SELECT parks FROM owed_event_dead_letters")
+        ),
+        (1, 2),
+        "one row a pair"
+    );
+    park_letter(&db, "m3", "not an event").await.unwrap();
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_event_dead_letters WHERE source='' AND sourceKey='m3'"),
+        1
+    );
+
+    // the re-drives: three, then exhausted
+    let key = json_key("pot", &hop_key(&owed_db::hop(1)));
+    for n in 1..=3 {
+        db.exec(&publish::DEAD_LETTERS_REDRIVEN_SQL.replace("?1", &key));
+        assert_eq!(db.int("SELECT redrives FROM owed_event_dead_letters WHERE source='pot'"), n);
+        let again = park_letter(&db, &format!("r{n}"), &body).await.unwrap();
+        let want = if n < publish::MAX_REDRIVES { "parked" } else { "exhausted" };
+        assert_eq!(again, Parked::Row(want.into()), "re-drive {n}");
+    }
+    let readable = db.int(&format!(
+        "SELECT COUNT(*) FROM ({})",
+        publish::DEAD_LETTERS_READ_SQL.replace("?1", "100")
+    ));
+    assert_eq!(readable, 1, "the lever reads the undecodable letter only, never the exhausted one");
+
+    // a full table: a new pair is refused, a held pair re-parks
+    for i in 0..publish::DEAD_LETTERS_MAX {
+        db.exec(&format!("INSERT INTO owed_event_dead_letters(source,sourceKey,messageId,body,parkedAt) VALUES ('seen','k{i}','x{i}','{{}}',1)"));
+    }
+    let other = event("pot", &hop_key(&owed_db::hop(2))).encode();
+    assert_eq!(park_letter(&db, "n1", &other).await.unwrap(), Parked::Full);
+    assert_eq!(
+        park_letter(&db, "r9", &body).await.unwrap(),
+        Parked::Row("exhausted".into())
+    );
+
+    // LOW-5: the hand-back delay
+    assert_eq!(owed_events::park_retry_delay_s(0), 60);
+    assert_eq!(owed_events::park_retry_delay_s(300_000), 300);
+    assert_eq!(owed_events::park_retry_delay_s(10 * 3_600_000), 1800);
+}
+
+fn json_key(source: &str, key: &str) -> String {
+    format!("'{}'", serde_json::json!([[source, key]]))
 }
