@@ -53,6 +53,9 @@ pub const COUNTER_SUBMIT_MUTATION_REFUSED: &str = "submit_mutation_refused_total
 /// bsv-low #838 (the FIX-838 lens's LOW-3): gated submissions deferred (the 202) because the engine write passed
 /// the arm's answer deadline, apart from NL-6c's EF-work deferrals (both answer the census reason `queued`).
 pub const COUNTER_SUBMIT_DEFERRED_PAST_DEADLINE: &str = "submit_deferred_past_deadline_total";
+/// bsv-low #936: gated engine writes whose request went away (the invocation `canceled`) before the write ended;
+/// the write ran on whole in its own task, and its after-write ran there.
+pub const COUNTER_SUBMIT_WRITE_OUTLIVED_REQUEST: &str = "submit_write_outlived_request_total";
 /// Queue consumer: replays whose every write landed (acked).
 pub const COUNTER_QUEUE_MUTATION_APPLIED: &str = "queue_mutation_applied_total";
 /// Queue consumer: replays that still faulted (or errored) and were handed
@@ -1675,6 +1678,7 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_ARC_INGEST_LOCK_TIME_NOT_FINAL,
         COUNTER_ADMIT_FAST_REEVICTED_AFTER_WRITE,
         COUNTER_SUBMIT_DEFERRED_PAST_DEADLINE,
+        COUNTER_SUBMIT_WRITE_OUTLIVED_REQUEST,
         COUNTER_LANDING_REFUSED_EVICTED,
         COUNTER_ADMIT_FAST_EVICT_INCOMPLETE,
         COUNTER_RELEASED_HOP_EVIDENCE_SKIPPED,
