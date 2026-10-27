@@ -156,18 +156,18 @@
       "censusKey": "/submit"
     },
     "record-potparty-filing": {
-      "route": "/record?kind=potparty: a signed stranger filing naming A's pot; all inline filing reads and marks. Re-measured by D2-OWED-FOLD-8: the filing's own statements AND the filer's judgement in the same batch (record_post::owed_write, bsv-low #893: the design's cost at the write); the old ceiling (17/9/8) measured the filing with the walk deferred",
+      "route": "/record?kind=potparty: a signed stranger filing. #908: the request ends after the source commit; judgement runs in wait_until. The four-statement write shape is also pinned by record-door-potparty on the fleet fixture.",
       "measured": {
-        "reads": 65,
-        "writes": 25,
-        "stmts": 33,
-        "maxReads": 9
+        "reads": 3,
+        "writes": 13,
+        "stmts": 4,
+        "maxReads": 2
       },
       "ceiling": {
-        "reads": 98,
-        "writes": 38,
-        "stmts": 50,
-        "maxReads": 14
+        "reads": 7,
+        "writes": 15,
+        "stmts": 6,
+        "maxReads": 3
       },
       "censusKey": "/record"
     },
@@ -537,6 +537,118 @@
         "maxReads": 5
       },
       "censusKey": "/health"
+    },
+    "record-door-handfile": {
+      "route": "POST /record handfile on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908).",
+      "measured": {
+        "reads": 23,
+        "writes": 65,
+        "stmts": 21,
+        "maxReads": 10
+      },
+      "ceiling": {
+        "reads": 35,
+        "writes": 67,
+        "stmts": 23,
+        "maxReads": 15
+      },
+      "censusKey": null
+    },
+    "record-door-potparty": {
+      "route": "POST /record potparty on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908).",
+      "measured": {
+        "reads": 3,
+        "writes": 13,
+        "stmts": 4,
+        "maxReads": 2
+      },
+      "ceiling": {
+        "reads": 7,
+        "writes": 15,
+        "stmts": 6,
+        "maxReads": 3
+      },
+      "censusKey": null
+    },
+    "record-door-potrefund": {
+      "route": "POST /record potrefund on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908).",
+      "measured": {
+        "reads": 8,
+        "writes": 22,
+        "stmts": 5,
+        "maxReads": 8
+      },
+      "ceiling": {
+        "reads": 12,
+        "writes": 24,
+        "stmts": 7,
+        "maxReads": 12
+      },
+      "censusKey": null
+    },
+    "record-door-result": {
+      "route": "POST /record result on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908).",
+      "measured": {
+        "reads": 9,
+        "writes": 21,
+        "stmts": 5,
+        "maxReads": 7
+      },
+      "ceiling": {
+        "reads": 14,
+        "writes": 23,
+        "stmts": 7,
+        "maxReads": 11
+      },
+      "censusKey": null
+    },
+    "record-door-collected": {
+      "route": "POST /record collected on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908).",
+      "measured": {
+        "reads": 1,
+        "writes": 8,
+        "stmts": 4,
+        "maxReads": 1
+      },
+      "ceiling": {
+        "reads": 5,
+        "writes": 10,
+        "stmts": 6,
+        "maxReads": 2
+      },
+      "censusKey": null
+    },
+    "record-door-held": {
+      "route": "POST /record held on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908).",
+      "measured": {
+        "reads": 3,
+        "writes": 8,
+        "stmts": 3,
+        "maxReads": 1
+      },
+      "ceiling": {
+        "reads": 7,
+        "writes": 10,
+        "stmts": 5,
+        "maxReads": 2
+      },
+      "censusKey": null
+    },
+    "record-door-hopsweep": {
+      "route": "POST /record hopsweep on the fleet-shaped workerd fixture; only verification, caps, source writes and their trigger marks are in the request; the 10 s judge is detached (#908).",
+      "measured": {
+        "reads": 4,
+        "writes": 9,
+        "stmts": 5,
+        "maxReads": 3
+      },
+      "ceiling": {
+        "reads": 8,
+        "writes": 11,
+        "stmts": 7,
+        "maxReads": 5
+      },
+      "censusKey": null
     }
   },
   "censusKey": "the d1Budget route a production census holds against this ceiling (advisory there: production rows are not the fixture's); null = the route's maximum is another scenario's",

@@ -108,6 +108,9 @@
 //! seat, none of them a chain win; the per-IP rate rule at the edge is the
 //! operator's step at the promotion (the same residual as `/cases`).
 pub(crate) mod owed_write;
+pub(crate) mod detached;
+mod latency;
+pub(crate) use latency::stamp_answer;
 
 use crate::d1_ledger::Counted;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1574,9 +1577,9 @@ pub(crate) struct ChainNoop {
 
 /// bsv-low #798: the potrefund chain no-op through the port, shared by the direct door and the handfile arm. Reads
 /// the chain rows of the filing's (identity, game, pot outpoint), judges each by the filed path's bar, LATCHES every
-/// own row `refundValid = 1` and judges both seats in one batch; answers how many own rows there are and whether
+/// own row `refundValid = 1` and its dirty marks in one batch; answers how many own rows there are and whether
 /// the latch moved one. The batch runs before the caller answers.
-pub(crate) async fn potrefund_chain_noop<P: crate::owed_judge::JudgeDb>(
+pub(crate) async fn potrefund_chain_noop<P: crate::pot_hook::SqlPort>(
     port: &P,
     filing: &PotrefundRecord,
     pot: Option<&PotContext>,
@@ -1604,27 +1607,8 @@ pub(crate) async fn potrefund_chain_noop<P: crate::owed_judge::JudgeDb>(
                 )
             })
             .collect();
-        let marks: Vec<_> = own
-            .iter()
-            .map(|(txid, _)| crate::owed_judge::FilingMark {
-                source: "refund".into(),
-                source_key: txid.clone(),
-            })
-            .collect();
-        let verified = VerifiedRecord::Potrefund(filing.clone(), true);
-        let report = owed_write::judge_filings(
-            port,
-            &[verified],
-            &[],
-            (port.now_ms() / 1000) as i64,
-            writes,
-            &marks,
-        )
-        .await?;
-        latched = report
-            .source_changes
-            .iter()
-            .any(|n| insert_wrote_a_row(n.map(|n| n as usize)));
+        let changes = owed_write::write_filings(port, writes).await?;
+        latched = changes.iter().any(|n| insert_wrote_a_row(n.map(|n| n as usize)));
     }
     Ok(ChainNoop {
         own: own.len() as i64,
@@ -1890,6 +1874,9 @@ fn by_kind(c: &[AtomicU64; RECORD_KINDS]) -> serde_json::Value {
 pub fn record_health_json() -> serde_json::Value {
     serde_json::json!({
         "countersScope": "isolate",
+        "answerSamples": latency::samples(),
+        "answerMsP50": latency::quantile(0.50),
+        "answerMsP95": latency::quantile(0.95),
         "filedByKind": by_kind(&FILED_BY_KIND),
         "refusedByKind": by_kind(&REFUSED_BY_KIND),
         "tooManyFiledByKind": by_kind(&TOO_MANY_FILED_BY_KIND),
@@ -2206,7 +2193,7 @@ async fn port_hop_context<P: crate::pot_hook::SqlPort>(
 /// THE DOOR'S CORE, after the marker verified (`verify_record_post`): a refund backup bound to its pot, a hop
 /// sweep bound to its hop, the chain no-op, the caps, the family's write and the refund's late latch, in that
 /// order. The route runs it over D1 (`routes::D1Sql`); the pins run it as shipped over real SQLite.
-pub(crate) async fn file_verified<P: crate::owed_judge::JudgeDb>(
+pub(crate) async fn file_verified<P: crate::pot_hook::SqlPort>(
     port: &P,
     verified: &mut VerifiedRecord,
     identity: &str,
@@ -2291,25 +2278,17 @@ pub(crate) async fn file_verified<P: crate::owed_judge::JudgeDb>(
         return Ok(DoorOutcome::Refused(r));
     }
     let writes = owed_write::statements(verified, now);
-    let report = owed_write::judge_filings(
-        port,
-        std::slice::from_ref(verified),
-        &[],
-        now,
-        writes,
-        &[owed_write::mark(verified)],
-    )
-    .await?;
+    let source_changes = owed_write::write_filings(port, writes).await?;
     let mut row_written = true;
     match verified {
         VerifiedRecord::Collected(r) | VerifiedRecord::Held(r, _) => {
-            row_written = match report.source_changes.first().copied().flatten() {
+            row_written = match source_changes.first().copied().flatten() {
                 Some(n) => insert_wrote_a_row(Some(n as usize)),
                 None => collected_written_now(port, &r.txid, now).await?,
             };
         }
         VerifiedRecord::Potrefund(_, valid) => {
-            if *valid && report.source_changes.get(1).copied().flatten().unwrap_or(0) > 0 {
+            if *valid && source_changes.get(1).copied().flatten().unwrap_or(0) > 0 {
                 REFUNDS_LATCHED_LATER.fetch_add(1, Ordering::Relaxed);
             } else if !valid {
                 REFUNDS_FILED_UNBOUND.fetch_add(1, Ordering::Relaxed);
@@ -2375,17 +2354,18 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
     };
     // The overlay stamps every one of these tables in unix SECONDS.
     let now = (worker::Date::now().as_millis() / 1000) as i64;
-    let tip = crate::routes::chaintracks_present_height_env(&ctx.env, "owed")
-        .await
-        .ok();
-    let port = crate::owed_judge::D1Judge::new(
-        &ctx.env,
-        tip,
-        crate::routes::written_off_before_ms_env(&ctx.env),
-    )?;
+    let port = crate::routes::D1Sql::of(&ctx.env)?;
     let outcome = file_verified(&port, &mut verified, &identity, now)
         .await
         .map_err(worker::Error::RustError)?;
+    if !matches!(outcome, DoorOutcome::Refused(_)) {
+        let source = if matches!(verified, VerifiedRecord::Held(..)) {
+            "held"
+        } else {
+            kind.as_str()
+        };
+        detached::schedule(&ctx, vec![verified.clone()], source);
+    }
     let row_written = match outcome {
         DoorOutcome::Refused(r) => {
             if matches!(
@@ -2427,11 +2407,15 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
 }
 
 #[cfg(test)]
+#[path = "../tests/support/record_door_fixture.rs"]
+mod door_pins;
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 pub(crate) mod tests {
     use super::*;
 
-    mod budget_fleet {
+    pub(super) mod budget_fleet {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/support/d1_fleet.rs"
@@ -2493,7 +2477,7 @@ pub(crate) mod tests {
         file_verified(&db, &mut filing, &id, 2_000).await.unwrap();
         let batches: Vec<_> = db.recorded.borrow().iter().map(|batch|batch.iter().map(|s|serde_json::json!({"sql":s.sql,"binds":s.binds.iter().map(|b|match b {Bind::Text(t)=>serde_json::json!(t),Bind::Int(n)=>serde_json::json!(n),Bind::Null=>serde_json::Value::Null}).collect::<Vec<_>>() })).collect::<Vec<_>>()).collect();
         let expected_rows: i64 = db.conn.query_row("SELECT COUNT(*) FROM owed_rows", [], |r| r.get(0)).unwrap();
-        assert_eq!(expected_rows, 2);
+        assert_eq!(expected_rows, 0);
         std::fs::write(
             path,
             serde_json::to_vec(
@@ -2532,7 +2516,10 @@ pub(crate) mod tests {
         assert_eq!(count("owed_rows"), 0, "nothing judged");
         assert_eq!(count("observed_marks"), 2, "both seats marked in the source transaction");
         assert_eq!(count("owed_dirty"), 2, "the marks stand for the drain");
-        assert_eq!(db.counter(crate::owed_judge::COUNTER_FILING_FAULTS), 1);
+        assert_eq!(db.counter(crate::owed_judge::COUNTER_FILING_FAULTS), 0, "the door never invokes a judge");
+        let deferred = super::detached::judge(&db, std::slice::from_ref(&filing), "test").await.unwrap();
+        assert_eq!(deferred.faults.len(), 2, "each failed subject keeps its mark");
+        assert_eq!(count("owed_dirty"), 2);
         db.conn.execute_batch("DROP TRIGGER fail_owed;").unwrap();
         crate::owed_judge::drain_dirty(&db, 64).await.unwrap();
         assert_eq!(count("owed_rows"), 2, "the drain judged both seats");
@@ -2563,6 +2550,7 @@ pub(crate) mod tests {
             matches!(result, Ok(DoorOutcome::Written { row_written: true })),
             "{result:?}"
         );
+        super::detached::judge(&db, std::slice::from_ref(&filing), "test").await.unwrap();
         assert_eq!(db.counter(crate::owed_judge::COUNTER_FILING_FAULTS), 0, "judged, not faulted");
         let (claimable, probe): (Option<i64>, Option<i64>) = db
             .conn
@@ -2601,11 +2589,12 @@ pub(crate) mod tests {
         let mut filing = verify_record_post(RecordKind::Potrefund, &script, &id).unwrap();
         file_verified(&db, &mut filing, &id, 2_000).await.unwrap();
         assert_eq!(db.counter(crate::owed_judge::COUNTER_FILING_FAULTS), 0);
+        super::detached::judge(&db, std::slice::from_ref(&filing), "test").await.unwrap();
         let n: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM owed_rows WHERE identity=?1", [&id], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 1, "the filer's own subject judged in its filing batch");
+        assert_eq!(n, 1, "the detached judge reaches the filer's own subject");
     }
 
     #[test]
@@ -3972,7 +3961,7 @@ pub(crate) mod tests {
             1,
             "one source statement builder"
         );
-        assert!(door.contains("owed_write::judge_filings"));
+        assert!(door.contains("owed_write::write_filings"));
         let route = door.find("pub async fn record_post(").expect("the door");
         let verify = door[route..]
             .find("verify_record_post(kind, &script, &identity)")
@@ -4458,6 +4447,9 @@ pub(crate) mod tests {
     ) -> (DoorOutcome, VerifiedRecord) {
         let mut v = verify_record_post(kind, script, poster).expect("the marker verifies");
         let out = file_verified(db, &mut v, poster, 2_000).await.unwrap();
+        if !matches!(out, DoorOutcome::Refused(_)) {
+            super::detached::judge(db, std::slice::from_ref(&v), "test").await.unwrap();
+        }
         (out, v)
     }
 
@@ -5162,16 +5154,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn money_door_fold_l1_b_handfile_judges_in_its_batch() {
+    fn money_door_fold_l1_b_handfile_writes_before_its_judge() {
         let source = include_str!("handfile.rs");
         let body = source
-            .split("pub(crate) async fn judge_handfile(")
+            .split("pub(crate) async fn write_handfile(")
             .nth(1)
             .unwrap()
             .split("/// The door's handfile arm")
             .next()
             .unwrap();
-        assert!(body.contains("owed_write::judge_filings"));
+        assert!(body.contains("owed_write::write_filings"));
         assert!(!source.contains("note_filing_and_recompute"));
     }
 

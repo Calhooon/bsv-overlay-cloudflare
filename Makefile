@@ -655,6 +655,8 @@ ci-d1-budget: gate-output-dirs
 	python3 tools/lane-ns2/register_pin.py; \
 	D1_BUDGET_SEED_V3="$$seed_v3" npx --package wrangler -c 'node tools/lane-ns2/owed_do_pins.mjs'; \
 	D1_BUDGET_SEED_V3="$$seed_v3" npx --package wrangler -c 'node tools/lane-906/owed_cadence.mjs'; \
+	RECORD_DOOR_FIXTURE="$$state/record-door.json" cargo test -q $(WORKERS) -p low-app-layer --lib export_record_door_fixture -- --ignored; \
+	RECORD_DOOR_FIXTURE="$$state/record-door.json" npx --package wrangler -c 'node tools/lane-908/record_door.mjs'; \
 	node tools/lane-499/tracker_fault_route_ci.mjs http://127.0.0.1:$$PA "$$state"; \
 	python3 scripts/d1-census.py --self-test; \
 	python3 scripts/d1-census.py --app http://127.0.0.1:$$PA --overlay http://127.0.0.1:$$PO; \

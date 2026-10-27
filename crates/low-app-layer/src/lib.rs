@@ -363,6 +363,8 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
 
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    let started = worker::Date::now().as_millis();
+    let record = req.method() == worker::Method::Post && req.path() == "/record";
     let d1_route = d1_ledger::route_of(req.path().as_str(), D1_LEDGER_ROUTES);
     let (out, d1) = d1_ledger::scoped(serve(req, env, ctx)).await;
     d1_ledger::record(d1_route, d1);
@@ -374,6 +376,9 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
             return Ok(resp);
         }
     };
+    if record && (200..300).contains(&resp.status_code()) {
+        record_post::stamp_answer(&mut resp, worker::Date::now().as_millis().saturating_sub(started))?;
+    }
     d1_ledger::stamp(&mut resp, d1);
     Ok(resp)
 }
