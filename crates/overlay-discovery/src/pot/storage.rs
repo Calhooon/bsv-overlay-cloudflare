@@ -426,6 +426,28 @@ pub fn evictions_by_txid_sql(n: usize) -> String {
 /// Txids per ledger statement (D1 binds at most 100).
 pub const EVICTIONS_CHUNK: usize = 90;
 
+/// PURE (bsv-low #937): THE read rule of an open eviction marker. A `pot_records` row whose txid the ledger holds
+/// OPEN (`readmittedAt IS NULL`, the marker `admit_fast::evict_txid_everywhere` writes FIRST) is NOT held: it is
+/// served exactly as its evicted twin is (`known: false`, every money field null, the ledger's word beside it). Such
+/// a row exists only between a write that landed after the marker (the gated arm's engine write past its 12,000 ms
+/// answer deadline, #838; L52 pair 13) and the write-side guard's move of it; this rule closes that window at the
+/// read. A readmitted row (`readmittedAt` set) is held. `None` (no ledger row) is held. The callers that already
+/// read the ledger for the field (`ls_pot spentStatus`, the app layer's `/utxo-status`) apply this; a statement that
+/// serves `pot_records` with no ledger read carries [`not_under_open_eviction_sql`], the same rule in SQL.
+pub fn open_eviction_hides_row(entry: Option<&EvictionLedgerEntry>) -> bool {
+    matches!(entry, Some(e) if e.readmitted_at.is_none())
+}
+
+/// bsv-low #937: [`open_eviction_hides_row`] as a SQL conjunct over a `pot_records` txid column (e.g. `p.txid`):
+/// TRUE when no OPEN marker names it. One primary-key probe of `pot_evictions` per row the statement serves, no
+/// scan (pinned by the plan pins). The ledger key is written lowercase and `pot_records.txid` is lowercase by its
+/// writer, so the probe compares the column as stored (a `lower()` would defeat the key).
+pub fn not_under_open_eviction_sql(txid_col: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM pot_evictions ev WHERE ev.txid = {txid_col} AND ev.readmittedAt IS NULL)"
+    )
+}
+
 /// Backend-agnostic storage for pot-spend records.
 #[async_trait(?Send)]
 pub trait PotStorage {

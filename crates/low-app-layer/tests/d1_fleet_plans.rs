@@ -111,6 +111,21 @@ fn hot_routes_never_scan_fleet_tables() {
             "/recovery-view",
             low_app_layer::logic::recovery_view_sql(None, 0),
         ),
+        // bsv-low #937: the open-marker conjunct is one `pot_evictions` primary-key probe a row, never a scan
+        (
+            "/pots-view",
+            low_app_layer::logic::pots_view_join_sql(
+                low_app_layer::logic::D1_CHUNK_OUTPOINTS,
+                None,
+            ),
+        ),
+        (
+            "/pots-view (era)",
+            low_app_layer::logic::pots_view_join_sql(
+                low_app_layer::logic::D1_CHUNK_OUTPOINTS,
+                Some(1),
+            ),
+        ),
         (
             "/refund-backups",
             low_app_layer::refund_backups::refund_backups_sql(None),
@@ -268,6 +283,8 @@ fn hot_routes_never_scan_fleet_tables() {
             if name.is_some_and(|n| {
                 [
                     "pot_records",
+                    "pot_evictions",
+                    "ev",
                     "owed_dirty",
                     "owed_belt_state",
                     "potparty_records",

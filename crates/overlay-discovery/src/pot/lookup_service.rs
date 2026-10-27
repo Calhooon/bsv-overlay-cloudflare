@@ -580,6 +580,21 @@ impl LookupService for PotLookupService {
         // Build an input-ordered array: one entry per requested outpoint.
         let mut entries = Vec::with_capacity(outpoints.len());
         for ((op, record), seen) in outpoints.iter().zip(records).zip(witnessed) {
+            // bsv-low #937: a row under an OPEN eviction marker is served as its evicted twin is (`known:false`, the
+            // ledger's word beside it), never held: the write that landed after the marker is the write-side
+            // guard's to move, and until it does the read honours the marker. Zero reads more (the ledger above).
+            // A faulted ledger read cannot see a marker: the row is served as stored, as before (stated).
+            let record = match &ledger {
+                Some(l)
+                    if super::storage::open_eviction_hides_row(
+                        l.get(&op.txid.to_ascii_lowercase())
+                            .and_then(|e| e.as_ref()),
+                    ) =>
+                {
+                    None
+                }
+                _ => record,
+            };
             // Fail-safe: an outpoint we never admitted is `known:false` with
             // null spent/spendingTxid/spentConfirmed — never assert
             // "unspent" for an output we never saw.
@@ -977,6 +992,101 @@ mod tests {
         let arr = spent_status(&svc, ask).await;
         assert_eq!(arr[0]["known"], false);
         assert!(arr[0].get("evicted").is_none(), "a fault is not served");
+    }
+
+    /// bsv-low #937 (L52 pair 13): a pot row written AFTER its open eviction marker (the gated arm's engine write
+    /// landing past its answer deadline) is served as the evicted twin is: `known:false`, every money field and
+    /// the witness null, the ledger's word beside it; never held. RED on eaaee0ec: `known: true`.
+    #[tokio::test]
+    async fn fix937_a_a_row_under_an_open_marker_is_served_evicted() {
+        let (svc, storage) = make_service_with_storage();
+        let pot = funding_tx(41);
+        let other = funding_tx(42);
+        let txid = pot.id();
+        // the marker first (the eviction's step 1), then the late write lands the row
+        storage.record_eviction_word(
+            &txid,
+            1_760_000_000_000,
+            None,
+            Some(crate::pot::storage::CONFLICTED_WORD),
+        );
+        svc.output_admitted_by_topic(&admit(beef_of(&pot), 0))
+            .await
+            .unwrap();
+        svc.output_admitted_by_topic(&admit(beef_of(&other), 0))
+            .await
+            .unwrap();
+        storage.mark_network_seen(&txid);
+        assert_eq!(storage.record_count(), 2, "the late write landed the row");
+        let arr = spent_status(
+            &svc,
+            serde_json::json!([
+                {"txid": txid.to_ascii_uppercase(), "vout": 0},
+                {"txid": other.id(), "vout": 0},
+            ]),
+        )
+        .await;
+        assert_eq!(
+            arr[0],
+            serde_json::json!({
+                "txid": txid.to_ascii_uppercase(), "vout": 0, "known": false, "spent": null,
+                "spendingTxid": null, "spentConfirmed": null, "settleSigners": null,
+                "networkSeen": null, "networkSeenBy": null,
+                "evicted": {"at": 1_760_000_000_000_i64, "word": "conflicted", "readmittedAt": null},
+            }),
+            "the evicted twin's shape, the eviction's word"
+        );
+        assert_eq!(arr[1]["known"], true, "a pot with no marker stays held");
+        assert_eq!(arr[1]["evicted"], serde_json::Value::Null);
+    }
+
+    /// bsv-low #937: a CLOSED marker (readmitted) holds the row at once (no memo on this path); a faulted ledger
+    /// read cannot see a marker and serves the row as stored (the pre-#937 answer, stated).
+    #[tokio::test]
+    async fn fix937_b_a_readmitted_row_is_held() {
+        let (svc, storage) = make_service_with_storage();
+        let pot = funding_tx(43);
+        let txid = pot.id();
+        storage.record_eviction(&txid, 1_760_000_000_000, None);
+        svc.output_admitted_by_topic(&admit(beef_of(&pot), 0))
+            .await
+            .unwrap();
+        let ask = serde_json::json!([{"txid": txid, "vout": 0}]);
+        assert_eq!(spent_status(&svc, ask.clone()).await[0]["known"], false);
+        storage.record_eviction(&txid, 1_760_000_000_000, Some(1_760_000_060_000));
+        let arr = spent_status(&svc, ask.clone()).await;
+        assert_eq!(arr[0]["known"], true, "readmitted: held at the next read");
+        assert_eq!(arr[0]["spent"], false);
+        assert_eq!(arr[0]["networkSeen"], false);
+        assert_eq!(arr[0]["evicted"]["readmittedAt"], 1_760_000_060_000_i64);
+        storage.fault_evictions();
+        let arr = spent_status(&svc, ask).await;
+        assert_eq!(arr[0]["known"], true);
+        assert!(arr[0].get("evicted").is_none());
+    }
+
+    /// The rule itself: open hides, readmitted and absent hold; the SQL conjunct is the same predicate.
+    #[test]
+    fn fix937_the_rule_and_its_sql() {
+        use crate::pot::storage::{
+            not_under_open_eviction_sql, open_eviction_hides_row, EvictionLedgerEntry,
+        };
+        let open = EvictionLedgerEntry {
+            evicted_at: 1,
+            readmitted_at: None,
+            chain_word: None,
+        };
+        let closed = EvictionLedgerEntry {
+            readmitted_at: Some(2),
+            ..open
+        };
+        assert!(open_eviction_hides_row(Some(&open)));
+        assert!(!open_eviction_hides_row(Some(&closed)));
+        assert!(!open_eviction_hides_row(None));
+        assert_eq!(
+            not_under_open_eviction_sql("p.txid"),
+            "NOT EXISTS (SELECT 1 FROM pot_evictions ev WHERE ev.txid = p.txid AND ev.readmittedAt IS NULL)"
+        );
     }
 
     /// admit-fast step 4: `spentStatus` serves the pot's OWN network witness —

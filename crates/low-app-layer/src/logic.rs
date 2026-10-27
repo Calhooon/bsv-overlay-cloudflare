@@ -274,13 +274,31 @@ pub fn distinct_db_txids(outpoints: &[Outpoint]) -> Vec<String> {
 }
 
 /// Attach the ledger's word to every entry: a row by txid, else `NoRow` (the read answered and holds none).
+///
+/// bsv-low #937: an entry whose txid the ledger holds OPEN is served as its evicted twin is (the
+/// [`OutpointStatus::unknown`] facts, the ledger's word beside them), never held, by the one rule
+/// `ls_pot spentStatus` applies (`overlay_discovery::pot::storage::open_eviction_hides_row`). A `pot_records` row
+/// under an open marker is a write that landed after the marker (L52 pair 13), not yet moved by the write-side
+/// guard. Zero reads more: the ledger is already read for the field.
 pub fn attach_evictions(entries: &mut [OutpointStatus], rows: &[EvictionLedgerRow]) {
     for e in entries.iter_mut() {
-        e.evicted = match rows.iter().find(|r| r.txid.eq_ignore_ascii_case(&e.txid)) {
+        let row = rows.iter().find(|r| r.txid.eq_ignore_ascii_case(&e.txid));
+        let entry = row.map(|r| overlay_discovery::pot::storage::EvictionLedgerEntry {
+            evicted_at: r.evicted_at,
+            readmitted_at: r.readmitted_at,
+            chain_word: overlay_discovery::pot::storage::eviction_chain_word(&r.reason),
+        });
+        if overlay_discovery::pot::storage::open_eviction_hides_row(entry.as_ref()) {
+            *e = OutpointStatus::unknown(&Outpoint {
+                txid: e.txid.clone(),
+                vout: e.vout,
+            });
+        }
+        e.evicted = match entry {
             Some(r) => ServedEviction::Row {
                 at: r.evicted_at,
                 readmitted_at: r.readmitted_at,
-                chain_word: overlay_discovery::pot::storage::eviction_chain_word(&r.reason),
+                chain_word: r.chain_word,
             },
             None => ServedEviction::NoRow,
         };
@@ -525,18 +543,22 @@ pub fn assemble_statuses(outpoints: &[Outpoint], rows: &[PotRecordRow]) -> Vec<O
 /// (`pot_records.createdAt`, unix seconds, server-written) pre-dates the
 /// cutoff is excluded — the requested outpoint then assembles as the
 /// fail-safe `known:false` shape, never a Collect-able status. ONE extra
-/// bind (the cutoff, LAST). `None` ⇒ byte-identical to the pre-#375 query.
+/// bind (the cutoff, LAST). `None` ⇒ no era conjunct.
+/// bsv-low #937: a pot under an OPEN eviction marker is excluded by
+/// `overlay_discovery::pot::storage::not_under_open_eviction_sql` (the rule
+/// `ls_pot` and `/utxo-status` apply in Rust over the ledger they already
+/// read; this route reads no ledger, so the rule rides its one statement): the
+/// outpoint then assembles as the fail-safe `known:false` shape, its evicted
+/// twin's. One `pot_evictions` primary-key probe per matched row, no bind.
 pub fn pots_view_join_sql(n: usize, written_off_before_ms: Option<i64>) -> String {
     debug_assert!((1..=MAX_OUTPOINTS).contains(&n), "parse_outpoints bounds n");
     let clause = vec!["(p.txid = ? AND p.outputIndex = ?)"; n].join(" OR ");
-    // The OR list needs its own parens once a conjunct follows it.
-    let where_clause = match written_off_before_ms {
-        None => format!("WHERE {clause}"),
-        Some(_) => format!(
-            "WHERE ({clause}){era}",
-            era = era_filter_sql("p.createdAt", "?", written_off_before_ms)
-        ),
-    };
+    // The OR list needs its own parens: conjuncts follow it.
+    let where_clause = format!(
+        "WHERE ({clause}){era} AND {open}",
+        era = era_filter_sql("p.createdAt", "?", written_off_before_ms),
+        open = overlay_discovery::pot::storage::not_under_open_eviction_sql("p.txid"),
+    );
     format!(
         "SELECT p.txid, p.outputIndex, p.spent, p.spendingTxid, p.spentConfirmed, \
                 hex(b.beef) AS spenderBeef \
@@ -3728,9 +3750,9 @@ mod tests {
     /// #375 — the era filter on `/pots-view`: the shared fragment appears
     /// EXACTLY ONCE (anchored on `pot_records.createdAt`, the pot's own
     /// admission stamp), the OR list is parenthesized so the conjunct binds
-    /// the whole batch, and STRIPPING the fragment (plus the added parens)
-    /// yields the `None` arm byte-for-byte — the None-is-byte-identical
-    /// property, pinned positively rather than by a bare negative substring.
+    /// the whole batch, and STRIPPING the fragment yields the `None` arm
+    /// byte-for-byte (both arms carry bsv-low #937's open-marker conjunct),
+    /// pinned positively rather than by a bare negative substring.
     #[test]
     fn pots_view_sql_era_filter_shape_and_none_identity() {
         let cutoff = Some(1_754_500_000_000i64);
@@ -3748,9 +3770,9 @@ mod tests {
             );
             // Removing the era decoration restores the None arm exactly.
             assert_eq!(
-                with.replace(&format!("({clause}){frag}"), &clause),
+                with.replace(&frag, ""),
                 without,
-                "None must stay byte-identical to the pre-#375 query"
+                "None is the era arm without its one conjunct"
             );
         }
     }
