@@ -28,10 +28,17 @@ use std::collections::BTreeMap;
 /// (pinned by `d2_actor_a_fold_m1_*`).
 pub const CONSUMER_MAX_CONCURRENCY: u32 = 1;
 
-/// The pair's marks, oldest generation first (`idx_owed_dirty_source_key`; the source filtered in the index's row).
-pub const ROUTE_MARKS_SQL: &str = "SELECT identity,gameId,generation FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey=?2 AND source=?1 ORDER BY generation LIMIT ?3";
-/// An identity route's marks, oldest first (`idx_owed_dirty_identity_marked`).
-pub const ROUTE_IDENTITY_SQL: &str = "SELECT identity,gameId,generation FROM owed_dirty INDEXED BY idx_owed_dirty_identity_marked WHERE identity=?1 ORDER BY markedAtMs,generation LIMIT ?2";
+/// The pair's marks, oldest generation first (`idx_owed_dirty_source_key`; the source filtered in the index's row),
+/// the marks of a HELD subject left out (D2-ACTOR-A-DELTA-2's NEW2-M1: its subject memo's hold runs past `?4`, one
+/// primary-key probe of `owed_belt_state` a mark), so a held subject never takes a place of the 64.
+pub const ROUTE_MARKS_SQL: &str = "SELECT identity,gameId,generation FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey=?2 AND source=?1 AND NOT EXISTS (SELECT 1 FROM owed_belt_state WHERE name='owed-events:fault:subject '||identity||'/'||gameId AND json_extract(cursor,'$.heldUntilMs')>?4) ORDER BY generation LIMIT ?3";
+/// An identity route's marks, oldest first (`idx_owed_dirty_identity_marked`), a held subject's left out (`?3` now).
+pub const ROUTE_IDENTITY_SQL: &str = "SELECT identity,gameId,generation FROM owed_dirty INDEXED BY idx_owed_dirty_identity_marked WHERE identity=?1 AND NOT EXISTS (SELECT 1 FROM owed_belt_state WHERE name='owed-events:fault:subject '||identity||'/'||gameId AND json_extract(cursor,'$.heldUntilMs')>?3) ORDER BY markedAtMs,generation LIMIT ?2";
+/// NEW2-M1: the HELD subjects among the pair's first `?3` marks (`?4` now), in the batch of the marks' read: the
+/// figure an all-held message is counted by (bounded by the window, never the pair's whole backlog).
+pub const ROUTE_HELD_SQL: &str = "SELECT COUNT(DISTINCT d.identity||'/'||d.gameId) AS n FROM (SELECT identity,gameId FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey=?2 AND source=?1 ORDER BY generation LIMIT ?3) d WHERE d.gameId<>'' AND EXISTS (SELECT 1 FROM owed_belt_state WHERE name='owed-events:fault:subject '||d.identity||'/'||d.gameId AND json_extract(cursor,'$.heldUntilMs')>?4)";
+/// NEW2-M1: an identity route's held subjects among its first `?2` marks (`?3` now).
+pub const ROUTE_IDENTITY_HELD_SQL: &str = "SELECT COUNT(DISTINCT d.identity||'/'||d.gameId) AS n FROM (SELECT identity,gameId FROM owed_dirty INDEXED BY idx_owed_dirty_identity_marked WHERE identity=?1 ORDER BY markedAtMs,generation LIMIT ?2) d WHERE d.gameId<>'' AND EXISTS (SELECT 1 FROM owed_belt_state WHERE name='owed-events:fault:subject '||d.identity||'/'||d.gameId AND json_extract(cursor,'$.heldUntilMs')>?3)";
 /// Mark rows one message reads (a subject can hold several marks).
 pub const ROUTE_READ_LIMIT: usize = 4 * owed_event::MAX_GAMES_PER_MESSAGE;
 
@@ -52,7 +59,7 @@ pub const SWEEP_CURSOR_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tick
 /// the pass-meter precedent), served on `/health.owedEvents` and the overlay's `/health/invariants.owedEvents`.
 pub const CONSUMER_ROW_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:consumer',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// The served ages and totals, one batch of key reads.
-pub const HEALTH_COUNTERS_SQL: &str = "SELECT name,value FROM ops_counters WHERE name IN ('owed_events_published_total','owed_events_consumed_total','owed_events_acked_marks_total','owed_events_dlq_total','owed_events_publish_faults_total','owed_events_judge_faults_total','owed_events_swept_total','owed_events_fault_held_total','owed_events_sweep_held_total','owed_events_publish_wall_drops_total','owed_events_subject_faults_total','owed_events_subject_held_total','owed_events_consumer_wall_drops_total','owed_events_dead_letters_stale_returned_total','owed_events_dead_letters_discarded_total')";
+pub const HEALTH_COUNTERS_SQL: &str = "SELECT name,value FROM ops_counters WHERE name IN ('owed_events_published_total','owed_events_consumed_total','owed_events_acked_marks_total','owed_events_dlq_total','owed_events_publish_faults_total','owed_events_judge_faults_total','owed_events_swept_total','owed_events_fault_held_total','owed_events_sweep_held_total','owed_events_publish_wall_drops_total','owed_events_subject_faults_total','owed_events_subject_held_total','owed_events_consumer_wall_drops_total','owed_events_dead_letters_stale_returned_total','owed_events_dead_letters_discarded_total','owed_events_all_held_total')";
 /// The consumer's row.
 pub const HEALTH_CONSUMER_SQL: &str =
     "SELECT cursor,tickedAtMs FROM owed_belt_state WHERE name='owed-events:consumer'";
@@ -153,7 +160,7 @@ pub async fn note_fault_named(db: &impl SqlPort, name: &str, fault: &str) -> Res
         .first()
         .and_then(|r| r["cursor"].as_str())
         .and_then(|c| serde_json::from_str::<Value>(c).ok())
-        .and_then(|c| c["faults"].as_i64())
+        .map(|c| stale_memo_faults(&c, now))
         .unwrap_or(0);
     let faults = prior + 1;
     let hold_ms = fault_hold_ms(faults);
@@ -174,6 +181,60 @@ pub async fn note_fault_named(db: &impl SqlPort, name: &str, fault: &str) -> Res
     }])
     .await?;
     Ok(memo)
+}
+
+/// PURE (D2-ACTOR-A-DELTA-2's LOW-2): the consecutive faults a memo carries into the next fault. A memo whose hold
+/// ended more than [`FAULT_HOLD_CAP_MS`] ago counts from 0: its subject was judged meanwhile by another road (the
+/// belt's find, the backfill), which clears no memo, or simply never faulted again; a transient fault then never
+/// re-arms a 6 h hold at once.
+pub fn stale_memo_faults(cursor: &Value, now_ms: i64) -> i64 {
+    let faults = cursor["faults"].as_i64().unwrap_or(0);
+    let until = cursor["heldUntilMs"]
+        .as_i64()
+        .or_else(|| cursor["lastFaultAtMs"].as_i64())
+        .unwrap_or(now_ms);
+    if now_ms > until.saturating_add(FAULT_HOLD_CAP_MS) {
+        0
+    } else {
+        faults
+    }
+}
+
+thread_local! {
+    /// LOW-1 (the second delta lens): the subject memos of the judge call in flight, so a message the wall drops
+    /// notes THOSE subjects, never the pair (a judge that outlasts the wall every time is one identity's, not its
+    /// pair's neighbours').
+    static IN_FLIGHT: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The subject memos of the judge call in flight (taken: the wall's branch).
+pub fn take_in_flight() -> Vec<String> {
+    IN_FLIGHT.with(|f| std::mem::take(&mut *f.borrow_mut()))
+}
+
+fn set_in_flight(identity: &str, games: &[String]) {
+    IN_FLIGHT.with(|f| {
+        *f.borrow_mut() = games
+            .iter()
+            .map(|g| subject_memo_name(identity, g))
+            .collect();
+    });
+}
+
+/// LOW-1: the wall fell during a judge call: note each subject in flight on its own memo; the delay to hand the
+/// message back with is the longest hold that set, at least [`CONSUMER_WALL_RETRY_S`]. `None`: no call was in flight
+/// (the plan's reads, the ingest): the caller notes the pair as before.
+pub async fn note_wall_subjects(db: &impl SqlPort, names: &[String]) -> Option<u32> {
+    if names.is_empty() {
+        return None;
+    }
+    let mut hold_ms = 0i64;
+    for name in names {
+        if let Ok(m) = note_fault_named(db, name, "the consumer's message wall").await {
+            hold_ms = hold_ms.max(m.hold_ms);
+        }
+    }
+    Some(((hold_ms / 1000) as u32).clamp(CONSUMER_WALL_RETRY_S, 43_200))
 }
 
 /// The statements a landed judge of `(source, key)` adds to its consumer's batch row: the memo cleared, the pair's
@@ -324,6 +385,8 @@ pub struct Plan {
     games: BTreeMap<String, Vec<String>>,
     held: BTreeMap<(String, String), usize>,
     more: bool,
+    /// NEW2-M1: held subjects the read left out (among the window it counts).
+    held_subjects: usize,
 }
 
 impl Plan {
@@ -331,6 +394,26 @@ impl Plan {
     pub fn is_empty(&self) -> bool {
         self.order.is_empty() && !self.more
     }
+
+    /// What an empty plan answers: nothing judged, its held subjects counted.
+    pub fn empty_routed(&self) -> Routed {
+        Routed {
+            held: self.held_subjects,
+            ..Routed::default()
+        }
+    }
+}
+
+/// PURE (D2-ACTOR-A-DELTA-2's NEW2-M1): a message publishes its continuation only when more unheld marks remain AND it
+/// judged a subject. A message that judged nothing never starts a chain of messages that judge nothing.
+pub fn continues(routed: &Routed) -> bool {
+    routed.more && routed.subjects > 0
+}
+
+/// PURE (NEW2-M1): a message whose every subject was held: acked with its marks standing (its pair unresolved), no
+/// continuation, counted `owed_events_all_held_total`.
+pub fn all_held(routed: &Routed) -> bool {
+    routed.subjects == 0 && routed.faults == 0 && routed.held > 0
 }
 
 /// HIGH-1: route one event through the marks its source row made and judge their subjects (see the module doc):
@@ -347,25 +430,49 @@ pub async fn plan(db: &impl SqlPort, ev: &OwedEvent) -> Result<Plan, String> {
         return Ok(Plan::default());
     }
     let limit = ROUTE_READ_LIMIT as i64;
-    let mut marks = if ev.source == owed_event::ROUTE_IDENTITY {
-        rows(
-            db,
+    let now = db.now_ms() as i64;
+    // NEW2-M1 (the second delta lens): the unheld marks and the held count, one batch
+    let (marks_sql, held_sql, binds) = if ev.source == owed_event::ROUTE_IDENTITY {
+        (
             ROUTE_IDENTITY_SQL,
-            vec![Bind::Text(ev.source_key.clone()), Bind::Int(limit)],
+            ROUTE_IDENTITY_HELD_SQL,
+            vec![
+                Bind::Text(ev.source_key.clone()),
+                Bind::Int(limit),
+                Bind::Int(now),
+            ],
         )
-        .await?
     } else {
-        rows(
-            db,
+        (
             ROUTE_MARKS_SQL,
+            ROUTE_HELD_SQL,
             vec![
                 Bind::Text(ev.source.clone()),
                 Bind::Text(ev.source_key.clone()),
                 Bind::Int(limit),
+                Bind::Int(now),
             ],
         )
-        .await?
     };
+    let mut read = db
+        .run_batch(vec![
+            Stmt {
+                sql: marks_sql.into(),
+                binds: binds.clone(),
+            },
+            Stmt {
+                sql: held_sql.into(),
+                binds,
+            },
+        ])
+        .await?
+        .into_iter();
+    let mut marks = read.next().map(|o| o.rows).unwrap_or_default();
+    let held_subjects = read
+        .next()
+        .and_then(|o| o.rows.first().and_then(|r| r["n"].as_i64()))
+        .unwrap_or(0)
+        .max(0) as usize;
     let mut more = marks.len() >= ROUTE_READ_LIMIT;
     // A wanted envelope (the read's own mark, no game) is expanded first, then routed by its identity.
     let envelopes: Vec<(String, i64)> = marks
@@ -383,7 +490,11 @@ pub async fn plan(db: &impl SqlPort, ev: &OwedEvent) -> Result<Plan, String> {
         let expanded = rows(
             db,
             ROUTE_IDENTITY_SQL,
-            vec![Bind::Text(identity.clone()), Bind::Int(limit)],
+            vec![
+                Bind::Text(identity.clone()),
+                Bind::Int(limit),
+                Bind::Int(now),
+            ],
         )
         .await?;
         more |= expanded.len() >= ROUTE_READ_LIMIT;
@@ -422,6 +533,7 @@ pub async fn plan(db: &impl SqlPort, ev: &OwedEvent) -> Result<Plan, String> {
         games,
         held,
         more,
+        held_subjects,
     })
 }
 
@@ -456,9 +568,11 @@ pub async fn judge_plan(db: &impl JudgeDb, plan: Plan) -> Result<Routed, String>
         games,
         held,
         more,
+        held_subjects,
     } = plan;
     let mut out = Routed {
         more,
+        held: held_subjects,
         ..Routed::default()
     };
     let names: Vec<String> = order
@@ -504,7 +618,10 @@ pub async fn judge_plan(db: &impl JudgeDb, plan: Plan) -> Result<Routed, String>
             }
         }
         for chunk in list.chunks(owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION) {
-            let singles: Vec<&[String]> = match deliver(db, &identity, chunk).await {
+            set_in_flight(&identity, chunk);
+            let delivered = deliver(db, &identity, chunk).await;
+            set_in_flight(&identity, &[]);
+            let singles: Vec<&[String]> = match delivered {
                 Ok(report) => {
                     landed += 1;
                     out.subjects += report.subjects;
@@ -528,7 +645,10 @@ pub async fn judge_plan(db: &impl JudgeDb, plan: Plan) -> Result<Routed, String>
             };
             for one in singles {
                 let name = subject_memo_name(&identity, &one[0]);
-                match deliver(db, &identity, one).await {
+                set_in_flight(&identity, one);
+                let delivered = deliver(db, &identity, one).await;
+                set_in_flight(&identity, &[]);
+                match delivered {
                     Ok(report) => {
                         landed += 1;
                         out.subjects += report.subjects;
@@ -910,13 +1030,14 @@ pub async fn consume_one(env: &worker::Env, ev: &OwedEvent) -> Result<Routed, St
     let sql = crate::routes::D1Sql::of(env).map_err(|e| e.to_string())?;
     let plan = plan(&sql, ev).await?;
     if plan.is_empty() {
-        return Ok(Routed::default());
+        // NEW2-M1: an all-held message ends here (no judge, no tip, no continuation)
+        return Ok(plan.empty_routed());
     }
     let tip = tip_memoised(env, tip_reads_fresh(&ev.source)).await;
     let judge = owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))
         .map_err(|e| e.to_string())?;
     let routed = judge_plan(&judge, plan).await?;
-    if routed.more {
+    if continues(&routed) {
         publish::note(&ev.source, &ev.source_key);
         publish::publish_env(env, Vec::new()).await;
     }
@@ -952,6 +1073,7 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
             }
         };
         let started = worker::Date::now().as_millis();
+        let _ = take_in_flight();
         let walled = {
             let work = std::pin::pin!(consume_one(&env, &ev));
             let wall = std::pin::pin!(worker::Delay::from(std::time::Duration::from_millis(
@@ -972,12 +1094,20 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                 ev.seq
             );
             *deltas.entry("owed_events_consumer_wall_drops_total").or_default() += 1;
+            // LOW-1 (the second delta lens): the subjects in flight are noted, the pair only when none was
+            let in_flight = take_in_flight();
+            let mut delay = CONSUMER_WALL_RETRY_S;
             if let Ok(sql) = crate::routes::D1Sql::of(&env) {
-                let _ = note_fault(&sql, &ev.source, &ev.source_key, "the consumer's message wall").await;
+                match note_wall_subjects(&sql, &in_flight).await {
+                    Some(d) => delay = d,
+                    None => {
+                        let _ = note_fault(&sql, &ev.source, &ev.source_key, "the consumer's message wall").await;
+                    }
+                }
             }
             msg.retry_with_options(
                 &worker::QueueRetryOptionsBuilder::new()
-                    .with_delay_seconds(CONSUMER_WALL_RETRY_S)
+                    .with_delay_seconds(delay)
                     .build(),
             );
             continue;
@@ -992,8 +1122,11 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                 *deltas.entry("owed_events_acked_marks_total").or_default() += routed.marks as u64;
                 *deltas.entry("owed_events_subject_faults_total").or_default() += routed.faults as u64;
                 *deltas.entry("owed_events_subject_held_total").or_default() += routed.held as u64;
-                if routed.more {
+                if continues(&routed) {
                     *deltas.entry("owed_events_continued_total").or_default() += 1;
+                }
+                if all_held(&routed) {
+                    *deltas.entry("owed_events_all_held_total").or_default() += 1;
                 }
                 msg.ack();
             }
@@ -1170,6 +1303,7 @@ pub async fn health(db: &impl SqlPort) -> Value {
         "serviceMs": consumer.as_ref().map(|c| c["serviceMs"].clone()),
         "subjectFaults": counter("owed_events_subject_faults_total"),
         "subjectHeld": counter("owed_events_subject_held_total"),
+        "allHeld": counter("owed_events_all_held_total"),
         "consumerWallDrops": counter("owed_events_consumer_wall_drops_total"),
         "deadLettersStaleReturned": counter("owed_events_dead_letters_stale_returned_total"),
         "deadLettersDiscarded": counter("owed_events_dead_letters_discarded_total"),

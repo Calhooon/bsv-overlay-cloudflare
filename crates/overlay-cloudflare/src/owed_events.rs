@@ -126,7 +126,7 @@ pub const COUNTER_SKIPPED: &str = "owed_events_publish_skipped_total";
 /// Publishes that faulted (the D1 batch or the send): their marks wait for the sweep.
 pub const COUNTER_FAULTS: &str = "owed_events_publish_faults_total";
 /// Every counter this module and the consumer write, for the seeds.
-pub const COUNTERS: [&str; 18] = [
+pub const COUNTERS: [&str; 19] = [
     COUNTER_PUBLISHED,
     COUNTER_SKIPPED,
     COUNTER_FAULTS,
@@ -148,6 +148,8 @@ pub const COUNTERS: [&str; 18] = [
     "owed_events_consumer_wall_drops_total",
     "owed_events_dead_letters_stale_returned_total",
     "owed_events_dead_letters_discarded_total",
+    // D2-ACTOR-A-DELTA-2's NEW2-M1: a message whose every subject was held (acked, no continuation)
+    "owed_events_all_held_total",
 ];
 /// LOW-7 (the D2-ACTOR-A lens): publishes dropped at a request's answer wall ([`PUBLISH_ANSWER_WALL_MS`]): their
 /// marks wait for the sweep. Counted on the isolate ([`note_wall_drop`]) and written with the isolate's next publish
