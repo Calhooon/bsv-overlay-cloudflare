@@ -1004,6 +1004,11 @@ pub async fn handfile_post(
             refund_valid,
         ));
         crate::record_post::note_enqueue(crate::owed_events::publish_noted(&ctx.env).await);
+        crate::owed_actor::object::schedule_direct(
+            ctx,
+            vec![VerifiedRecord::Potrefund(verified.potrefund.clone(), refund_valid)],
+            worker::Date::now().as_millis(),
+        );
     } else {
         crate::record_post::detached::schedule(
             ctx,

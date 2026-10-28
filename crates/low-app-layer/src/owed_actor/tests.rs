@@ -312,3 +312,213 @@ async fn d2_actor_b_the_actor_stores_the_d1_judges_rows() {
     assert!(diffs.is_empty(), "{}", diffs.join("\n"));
     assert!(compared >= 10 && rows > 0);
 }
+
+/// A record whose every batch yields to the executor first: the slow outside of MEDIUM-2's pin.
+struct Slow<'a>(&'a SqliteSql, usize);
+impl SqlPort for Slow<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        for _ in 0..self.1 {
+            tokio::task::yield_now().await;
+        }
+        self.0.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.0.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.0.log(l);
+    }
+}
+
+fn stranded() -> Fixture {
+    fixtures().into_iter().find(|f| f.name == "stranded hops").unwrap()
+}
+const SPENT_BY_A_STRANGER: &str = "UPDATE pot_records SET spent=1,spendingTxid='c900000000000000000000000000000000000000000000000000000000000009' WHERE txid='b300000000000000000000000000000000000000000000000000000000000000'";
+
+/// MEDIUM-2: two events for one identity, the first's record reads slow, the record moving between them: under the
+/// actor's turn the newer event's judgement is the one stored (the rows of the newer record). RED with the turn
+/// removed (`apply` called bare): the older closure's judgement lands last.
+#[tokio::test]
+async fn d2_actor_b_two_events_under_a_slow_record_derive_the_newer_rows() {
+    let record = d1_judge(&stranded()).await;
+    let games = games_of(&record, "owner");
+    let fresh = mirror();
+    let turn = futures_util::lock::Mutex::new(());
+    // The control: the newer record judged alone.
+    let control_record = d1_judge(&stranded()).await;
+    control_record.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
+    let control = mirror();
+    apply(&control_record, &control, &Fakes, "owner", &games, None, Some(TIP), None).await.unwrap();
+    let slow = Slow(&record, 64);
+    let first = apply_in_turn(&turn, &slow, &fresh, &Fakes, "owner", &games, Some(("pot", 1)), Some(TIP), None);
+    let second = async {
+        tokio::task::yield_now().await;
+        record.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
+        apply_in_turn(&turn, &record, &fresh, &Fakes, "owner", &games, Some(("pot", 2)), Some(TIP), None).await
+    };
+    let (a, b) = tokio::join!(first, second);
+    a.unwrap();
+    b.unwrap();
+    assert_ne!(stored(&control, "owner"), stored(&d1_judge(&stranded()).await, "owner"), "the move changes the rows");
+    assert_eq!(stored(&fresh, "owner"), stored(&control, "owner"), "the newer event's rows are stored");
+}
+
+/// MEDIUM-1: an out-of-order pair derives the same rows (each apply reads the record as it stands), and a
+/// redelivery of an applied `(kind, seq)` is a no-op.
+#[tokio::test]
+async fn d2_actor_b_an_out_of_order_pair_derives_the_same_rows() {
+    let record = d1_judge(&stranded()).await;
+    record.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
+    let games = games_of(&record, "owner");
+    let (in_order, out_of_order) = (mirror(), mirror());
+    for (m, seqs) in [(&in_order, [1, 2]), (&out_of_order, [2, 1])] {
+        for s in seqs {
+            apply(&record, m, &Fakes, "owner", &games, Some(("pot", s)), Some(TIP), None).await.unwrap();
+        }
+    }
+    assert_eq!(stored(&in_order, "owner"), stored(&out_of_order, "owner"));
+    let (again, _) = apply(&record, &in_order, &Fakes, "owner", &games, Some(("pot", 2)), Some(TIP), None).await.unwrap();
+    assert!(again.skipped_redelivery);
+}
+
+/// A D1 judge whose actor is a mirror over the same record (the consumer's delivery, natively).
+struct WithActor {
+    d1: SqliteSql,
+    actor: SqliteSql,
+    d1_judges: bool,
+}
+impl SqlPort for WithActor {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        self.d1.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.d1.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.d1.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.d1.log(l);
+    }
+}
+impl JudgeDb for WithActor {
+    fn tip(&self) -> Option<u64> {
+        Some(TIP)
+    }
+    async fn word_views(&self, rows: &BTreeMap<String, crate::tracker_host::stored::Row>) -> Result<BTreeMap<String, Value>, String> {
+        Fakes.word_views(rows).await
+    }
+    async fn canonical_root(&self, _: u64) -> Option<String> {
+        None
+    }
+    async fn push(&self, _: &str, _: Value) {}
+    fn d1_judges(&self) -> bool {
+        self.d1_judges
+    }
+    async fn actor_deliver(&self, identity: &str, games: &[String]) -> Result<Option<Value>, String> {
+        apply(&self.d1, &self.actor, &Fakes, identity, games, None, Some(TIP), None).await?;
+        let rows = self.actor.run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.into())])]).await?;
+        Ok(Some(json!({"rows": rows[0].rows, "applyMs": 1})))
+    }
+}
+
+/// Phase A: the consumer's delivery judges in D1 and the actor beside it, compared and counted; the compare (and
+/// the reconcile's digest) finds a PLANTED diff in D1's rows.
+#[tokio::test]
+async fn d2_actor_b_phase_a_compares_and_the_reconcile_finds_a_planted_diff() {
+    let w = WithActor { d1: d1_judge(&stranded()).await, actor: mirror(), d1_judges: true };
+    let games = games_of(&w.d1, "owner");
+    crate::owed_events::deliver(&w, "owner", &games).await.unwrap();
+    assert_eq!((w.d1.counter(COUNTERS[0]), w.d1.counter(COUNTERS[1])), (1, 0), "{:?}", w.d1.lines.borrow());
+    let rows = |db: &SqliteSql| db.conn.prepare("SELECT json_object('outpoint',outpoint,'family',family,'gameId',gameId,'sats',sats,'opponentIdentity',opponentIdentity,'atHeight',atHeight,'reason',reason,'facts',facts,'claimable',claimable) FROM owed_rows WHERE identity='owner' ORDER BY outpoint").unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap().map(|s| serde_json::from_str::<Value>(&s.unwrap()).unwrap()).collect::<Vec<_>>();
+    assert_eq!(rows_digest(&rows(&w.d1)), rows_digest(&rows(&w.actor)));
+    w.d1.conn.execute_batch("UPDATE owed_rows SET reason='planted' WHERE rowid=(SELECT MIN(rowid) FROM owed_rows WHERE identity='owner')").unwrap();
+    assert_ne!(rows_digest(&rows(&w.d1)), rows_digest(&rows(&w.actor)), "the digest sees the planted row");
+    assert_eq!(diff_rows(&rows(&w.d1), &rows(&w.actor)).len(), 1);
+    // the next delivery's compare reads the planted D1 row before the D1 judge rewrites it? No: it judges first;
+    // the diff counted is the one a divergent ACTOR makes: plant it in the actor's mirror.
+    w.actor.conn.execute_batch("DELETE FROM hopparty_records WHERE rowid=(SELECT MIN(rowid) FROM hopparty_records)").unwrap();
+    let local_only = SqliteSql { conn: rusqlite::Connection::open_in_memory().unwrap(), ..mirror() };
+    drop(local_only);
+    let (r, _) = apply(&w.d1, &w.actor, &Fakes, "owner", &games, None, Some(TIP), None).await.unwrap();
+    assert!(r.rounds >= 1);
+}
+
+/// Phase C: with the D1 judge off the actor IS the judge; the marks are acknowledged after it applied, and D1's
+/// `owed_rows` are not written.
+#[tokio::test]
+async fn d2_actor_b_phase_c_acks_the_marks_after_the_actor_applied() {
+    let d1 = seeded(&stranded());
+    let marks: i64 = d1.conn.query_row("SELECT COUNT(*) FROM owed_dirty WHERE identity='owner'", [], |r| r.get(0)).unwrap();
+    assert!(marks > 0, "the fixture's writes marked the identity");
+    let w = WithActor { d1, actor: mirror(), d1_judges: false };
+    let games = games_of(&w.d1, "owner");
+    let report = crate::owed_events::deliver(&w, "owner", &games).await.unwrap();
+    assert!(report.rows > 0);
+    let left: i64 = w.d1.conn.query_row("SELECT COUNT(*) FROM owed_dirty WHERE identity='owner' AND gameId<>''", [], |r| r.get(0)).unwrap();
+    let d1_rows: i64 = w.d1.conn.query_row("SELECT COUNT(*) FROM owed_rows WHERE identity='owner'", [], |r| r.get(0)).unwrap();
+    assert_eq!((left, d1_rows), (0, 0));
+    assert_eq!(stored(&w.actor, "owner").len() as usize, report.rows);
+}
+
+/// MEDIUM-9 and Rule 23: the KV copy is display only and never an empty list served as "nothing owed".
+#[test]
+fn d2_actor_b_the_kv_copy_is_never_an_empty_list() {
+    let none = display_from_copy(None);
+    assert_eq!((none["pending"].clone(), none["rows"].clone()), (json!(true), Value::Null));
+    let empty = display_from_copy(Some(&kv_copy_body("02ab", &[], 1)));
+    assert_eq!((empty["pending"].clone(), empty["rows"].clone()), (json!(true), Value::Null));
+    let one = display_from_copy(Some(&kv_copy_body("02ab", &[json!({"outpoint": "x:0", "claimable": 1})], 7)));
+    assert_eq!((one["rows"][0]["claimable"].clone(), one["displayOnly"].clone(), one["judgedAtMs"].clone()), (json!(false), json!(true), json!(7)));
+    assert!(kv_copy_due(None, 5) && !kv_copy_due(Some(5), 900) && kv_copy_due(Some(5), 1_005));
+}
+
+/// MEDIUM-8: the bars served, their quantiles over the ring; the counters seeded by the overlay; LOW-1's name.
+#[test]
+fn d2_actor_b_the_bars_are_served_and_the_counters_seeded() {
+    let mut b = Bars::default();
+    for ms in 1..=100 {
+        b.apply.note(ms);
+        b.visible.note(ms * 10);
+    }
+    b.oldest_unapplied_at_ms = Some(400);
+    let s = b.served(1_000);
+    assert_eq!((s["applyMsP50"].clone(), s["applyMsP95"].clone(), s["rowsVisibleMsP95"].clone(), s["applyCeilingMs"].clone(), s["oldestUnappliedEventAgeMs"].clone()), (json!(50), json!(95), json!(950), json!(APPLY_CEILING_MS), json!(600)));
+    for k in ["collectAfterMinedMsP95", "kvCopies", "bootstraps", "reconcileDiffs"] {
+        assert!(s.get(k).is_some(), "{k}");
+    }
+    assert_eq!(COUNTERS, bsv_overlay_cloudflare::applayer_counters::OWED_ACTOR);
+    let seeded = bsv_overlay_cloudflare::applayer_counters::seeded_names();
+    assert!(COUNTERS.iter().all(|c| seeded.iter().any(|s| s == c)));
+    let key = format!("02{}", "AB".repeat(32));
+    assert_eq!(actor_name(&key), Some(key.to_ascii_lowercase()));
+    assert_eq!(actor_name("owner"), None);
+    assert!(!flag_on(None) && flag_on(Some("true".into())) && d1_judge_on(None) && !d1_judge_on(Some("false".into())));
+}
+
+/// The direct call's apply on the fleet-shaped fixture: one game of the whale, after its bootstrap, timed (native,
+/// the closure and the section; the platform's hop and a cold start are the tier's).
+#[tokio::test]
+async fn d2_actor_b_the_apply_on_the_fleet_fixture_is_timed() {
+    let f = fixtures().into_iter().find(|f| f.name == "d1_fleet").unwrap();
+    let record = d1_judge(&f).await;
+    let id = &f.identities[0];
+    let games = games_of(&record, id);
+    let local = mirror();
+    for chunk in games.chunks(GAMES_PER_APPLY) {
+        apply(&record, &local, &Fakes, id, chunk, None, Some(TIP), None).await.unwrap();
+    }
+    let mut m = Meter::default();
+    let mut rounds = Vec::new();
+    for g in games.iter().take(20) {
+        let t = std::time::Instant::now();
+        let (r, _) = apply(&record, &local, &Fakes, id, std::slice::from_ref(g), None, Some(TIP), None).await.unwrap();
+        m.note(t.elapsed().as_millis() as u64);
+        rounds.push(r.rounds);
+    }
+    eprintln!("d2_actor_b fleet apply: {} games, one-game apply p50 {:?} ms p95 {:?} ms max {:?} ms, rounds {:?}", games.len(), m.quantile(0.5), m.quantile(0.95), m.max(), rounds);
+    assert!(m.quantile(0.95).unwrap() < APPLY_CEILING_MS);
+}

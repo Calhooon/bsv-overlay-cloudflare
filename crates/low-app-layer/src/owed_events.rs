@@ -350,12 +350,22 @@ pub struct Routed {
 
 /// THE ONE JUDGE CALL of the consumer (lane B replaces its body with the actor's delivery): one identity's games, at
 /// most `owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION` per call.
+///
+/// bsv-low #912 (lane D2-ACTOR-B): with `OWED_D1_JUDGE` on (Phases A and B) the D1 judge writes `owed_rows` as
+/// before and the identity's actor applies beside it, its rows compared ([`crate::owed_actor::beside`]; its fault
+/// never fails the message). Off (Phase C) the actor IS the judge and the marks are acknowledged after it applied
+/// ([`crate::owed_actor::as_the_judge`]).
 pub async fn deliver(
     db: &impl JudgeDb,
     identity: &str,
     games: &[String],
 ) -> Result<owed_judge::JudgeReport, String> {
-    owed_judge::judge_subjects(db, identity, games, "owed-events").await
+    if db.d1_judges() {
+        let report = owed_judge::judge_subjects(db, identity, games, "owed-events").await?;
+        crate::owed_actor::beside(db, identity, games).await;
+        return Ok(report);
+    }
+    crate::owed_actor::as_the_judge(db, identity, games).await
 }
 
 async fn rows(db: &impl SqlPort, sql: &str, binds: Vec<Bind>) -> Result<Vec<Value>, String> {
@@ -982,7 +992,7 @@ thread_local! {
 
 /// The verified chain tip, from the isolate's memo when younger than [`TIP_MEMO_MS`] (a read that faults is never
 /// memoised: the judge then runs tipless, as before).
-async fn tip_memoised(env: &worker::Env, fresh: bool) -> Option<u64> {
+pub(crate) async fn tip_memoised(env: &worker::Env, fresh: bool) -> Option<u64> {
     let now = worker::Date::now().as_millis() as f64;
     if let Some((tip, at)) = TIP.with(std::cell::Cell::get) {
         if !fresh && now - at < TIP_MEMO_MS {
@@ -1031,7 +1041,8 @@ pub async fn consume_one(env: &worker::Env, ev: &OwedEvent) -> Result<Routed, St
     }
     let tip = tip_memoised(env, tip_reads_fresh(&ev.source)).await;
     let judge = owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .with_event(crate::owed_actor::EventCtx::of(ev));
     let routed = judge_plan(&judge, plan).await?;
     if continues(&routed) {
         publish::note(&ev.source, &ev.source_key);

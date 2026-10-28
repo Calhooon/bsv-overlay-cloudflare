@@ -3288,11 +3288,23 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
         return json_response(body.to_string(), 200);
     }
     let db = D1Sql::of(&ctx.env)?;
-    let snapshot = match crate::owed_read::read(&db, &identity).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            console_warn!("[owed] stored read failed: {error}");
-            return json_error("database query failed", 503);
+    // bsv-low #912 (Phase B, `OWED_ACTOR_READ`): the actor's rows, the words joined from D1 as below.
+    let snapshot = if crate::owed_actor::flag_on(ctx.env.var(crate::owed_actor::READ_FLAG).ok().map(|v| v.to_string())) {
+        match crate::owed_actor::object::read_snapshot(&ctx.env, &db, &identity).await {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(display)) => return json_response(display.to_string(), 200),
+            Err(error) => {
+                console_warn!("[owed] stored read failed: {error}");
+                return json_error("database query failed", 503);
+            }
+        }
+    } else {
+        match crate::owed_read::read(&db, &identity).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                console_warn!("[owed] stored read failed: {error}");
+                return json_error("database query failed", 503);
+            }
         }
     };
     let tip = if snapshot.needs_tip() {
@@ -7004,6 +7016,16 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         Err(_) => serde_json::Value::Null,
     };
     body["owed"]["dirty"] = dirty;
+    // bsv-low #912 (D2-ACTOR-B, MEDIUM-8): the actor's bars measured in this isolate (the consumer's deliveries and
+    // the writers' direct calls): the apply's p50, p95 and ceiling, the rows' visibility after the write.
+    body["owedActor"] = crate::owed_actor::served_bars(worker::Date::now().as_millis());
+    body["owedActor"]["readFlag"] = serde_json::json!(crate::owed_actor::flag_on(
+        ctx.env.var(crate::owed_actor::READ_FLAG).ok().map(|v| v.to_string())
+    ));
+    body["owedActor"]["d1Judge"] = serde_json::json!(crate::owed_actor::d1_judge_on(
+        ctx.env.var(crate::owed_actor::D1_JUDGE_FLAG).ok().map(|v| v.to_string())
+    ));
+    body["owedActor"]["bound"] = serde_json::json!(ctx.env.durable_object(crate::owed_actor::BINDING).is_ok());
     // bsv-low #499: this isolate's D1 rows ledger, the per-route running maxima since boot (the overlay serves the
     // same body on `/health/invariants.d1Budget`; `scripts/d1-census.py` reads both).
     body["d1Budget"] = crate::d1_ledger::budget_json();
