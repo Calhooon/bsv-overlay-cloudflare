@@ -1090,3 +1090,39 @@ fn d2_actor_a_fold3_m1_d_the_route_reads_are_index_searches() {
         assert!(text.contains("owed_belt_state USING"), "{sql}: the memo probed by key: {text}");
     }
 }
+
+/// D2-ACTOR-A-DELTA-3's R1: the consumer's judge only queues its pushes (bsv-low #935's coalescer), so the queue
+/// event flushes them, awaited, after `owed_events::queue` and before the batch's answer. RED with the flush
+/// removed: "the queue event flushes the coalesced pushes after the consumer".
+#[test]
+fn delta3_r1_the_queue_event_flushes_the_consumers_pushes() {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let lib = squash(include_str!("../src/lib.rs"));
+    let at = lib.find("#[event(queue)]").unwrap();
+    let end = at + lib[at..].find("#[event(fetch)]").unwrap();
+    let wrapper = &lib[at..end];
+    let consumer = wrapper
+        .find("letout=owed_events::queue(batch,env.clone()).await;")
+        .expect("the consumer");
+    let flush = wrapper
+        .find("push_coalesce::flush_queued(env).await;")
+        .expect("the queue event flushes the coalesced pushes after the consumer");
+    let answer = wrapper.rfind("out}").unwrap();
+    assert!(consumer < flush && flush < answer, "after the consumer, before the answer");
+    assert!(!wrapper.contains("wait_until"), "awaited in the handler, never handed to wait_until");
+}
+
+/// D2-ACTOR-A-DELTA-3's LOW-1: the consumer's word ingest takes back the `word` note its write left, since the same
+/// message routes that pair. RED without the line: "the ingest forgets its own word note".
+#[test]
+fn delta3_low1_the_ingest_forgets_its_word_note() {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let src = squash(include_str!("../src/owed_events.rs"));
+    let at = src.find("asyncfningest_frame(").unwrap();
+    let body = &src[at..at + src[at..].find("pubconstTIP_MEMO_MS").unwrap()];
+    let event = body.find("runtime::event(env,&txid,").unwrap();
+    let forget = body
+        .find("publish::forget(\"word\",&txid);")
+        .expect("the ingest forgets its own word note");
+    assert!(event < forget);
+}

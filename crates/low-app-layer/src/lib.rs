@@ -387,6 +387,10 @@ pub async fn queue(
     ) {
         d1_ledger::flush_cost(&db, window, worker::Date::now().as_millis() as f64).await;
     }
+    // D2-ACTOR-A-DELTA-3's R1: under the queue the consumer is the owed list's one judge, and its judge only QUEUES
+    // each seat's `owed-changed` push (bsv-low #935's coalescer); flushed here, awaited, before the batch is acked or
+    // retried, so a consumer invocation never ends with pushes stranded in the isolate's memory.
+    push_coalesce::flush_queued(env).await;
     out
 }
 
