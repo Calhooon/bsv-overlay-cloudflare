@@ -1108,8 +1108,14 @@ fn delta3_r1_the_queue_event_flushes_the_consumers_pushes() {
         .find("push_coalesce::flush_queued(env).await;")
         .expect("the queue event flushes the coalesced pushes after the consumer");
     let answer = wrapper.rfind("out}").unwrap();
-    assert!(consumer < flush && flush < answer, "after the consumer, before the answer");
-    assert!(!wrapper.contains("wait_until"), "awaited in the handler, never handed to wait_until");
+    assert!(
+        consumer < flush && flush < answer,
+        "after the consumer, before the answer"
+    );
+    assert!(
+        !wrapper.contains("wait_until"),
+        "awaited in the handler, never handed to wait_until"
+    );
 }
 
 /// D2-ACTOR-A-DELTA-3's LOW-1: the consumer's word ingest takes back the `word` note its write left, since the same
