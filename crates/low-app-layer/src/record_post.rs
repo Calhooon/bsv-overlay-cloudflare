@@ -2377,6 +2377,8 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
         if crate::owed_events::configured(&ctx.env).await {
             owed_write::note_events(&verified);
             latency::note_enqueue(crate::owed_events::publish_noted(&ctx.env).await);
+            // bsv-low #912: the identities' actors called directly after the answer; the queue is the backstop.
+            crate::owed_actor::object::schedule_direct(&ctx, vec![verified.clone()], worker::Date::now().as_millis());
         } else {
             detached::schedule(&ctx, vec![verified.clone()], source);
         }

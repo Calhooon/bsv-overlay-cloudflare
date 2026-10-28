@@ -31,6 +31,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub mod object;
+#[rustfmt::skip]
 pub mod schema;
 
 /// The binding of the class (`wrangler.toml`, `[durable_objects]`).
@@ -721,6 +722,9 @@ async fn keys_of_mirror(
     Ok(())
 }
 
+/// The txids the last judgement of these games named (its rows' outpoints and facts, their word roles).
+const JUDGED_TXIDS_SQL: &str = "SELECT r.outpoint,r.facts,w.txid FROM owed_rows r LEFT JOIN owed_row_words w ON w.identity=r.identity AND w.outpoint=r.outpoint WHERE r.identity=?1 AND r.gameId IN (SELECT value FROM json_each(?2))";
+
 /// THE APPLY: the closure over `games` of `me`, then the last judgement over the mirror with the outside held.
 /// `seq` is the event's (or the bootstrap's) token; a redelivery of an applied `(kind, seq)` returns at once.
 #[allow(clippy::too_many_arguments)]
@@ -755,8 +759,22 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
     }
     let seq = kind_seq.map_or(0, |(_, s)| s);
     let held = Held::default();
+    // The closure starts from what the mirror already names for these games (the last apply's domain): in the steady
+    // state its first round finds no new key and its judgement stands.
     let mut keys = Keys::default();
-    loop {
+    for _ in 0..CLOSURE_ROUNDS_MAX {
+        let mut next = keys.clone();
+        keys_of_mirror(local, &me, &games, &keys, &mut next).await?;
+        if next == keys {
+            break;
+        }
+        keys = next;
+    }
+    let judged = local
+        .run_batch(vec![Stmt::new(JUDGED_TXIDS_SQL, vec![Bind::Text(me.clone()), Bind::Text(json!(games).to_string())])])
+        .await?;
+    judged.iter().flat_map(|o| &o.rows).for_each(|r| txids_in_value(r, &mut keys.txids));
+    let pushes = loop {
         if report.rounds >= CLOSURE_ROUNDS_MAX {
             return Err(format!("owed actor: the closure of {me} did not close in {CLOSURE_ROUNDS_MAX} rounds ({} txids)", keys.txids.len()));
         }
@@ -772,7 +790,7 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
             local,
             seen: RefCell::default(),
         };
-        let trial = ActorJudge {
+        let judge = ActorJudge {
             local: &noting,
             outside: Some(outside),
             held: &held,
@@ -780,36 +798,26 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
             era_ms,
             pushes: RefCell::default(),
         };
+        let mut rows = 0;
         for chunk in games.chunks(crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION) {
-            crate::owed_judge::judge_subjects(&trial, &me, chunk, "owed-actor").await?;
+            rows = crate::owed_judge::judge_subjects(&judge, &me, chunk, "owed-actor").await?.rows;
         }
-        next.txids.extend(noting.seen.into_inner());
+        let pushes = judge.pushes.take();
+        next.txids.extend(noting.seen.take());
         if next.txids.len() > CLOSURE_KEYS_MAX {
             return Err(format!(
                 "owed actor: the closure of {me} passed {CLOSURE_KEYS_MAX} txids"
             ));
         }
         if next == keys {
-            break;
+            // THE FIXPOINT: this round's judgement read a mirror holding every key its statements named, so it
+            // is the record's judgement and its write stands (the object's turn keeps any other apply out of it).
+            report.rows = rows;
+            break pushes;
         }
         keys = next;
-    }
-    report.txids = keys.txids.len();
-    // THE SECTION: hydrate, judge and write over the mirror, the outside held: no await below yields.
-    let last = ActorJudge {
-        local,
-        outside: None::<&O>,
-        held: &held,
-        tip,
-        era_ms,
-        pushes: RefCell::default(),
     };
-    for chunk in games.chunks(crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION) {
-        report.rows = crate::owed_judge::judge_subjects(&last, &me, chunk, "owed-actor")
-            .await?
-            .rows;
-    }
-    report.missed = *held.missed.borrow();
+    report.txids = keys.txids.len();
     if let Some((kind, seq)) = kind_seq {
         local
             .run_batch(vec![
@@ -828,7 +836,25 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
             ])
             .await?;
     }
-    Ok((report, last.pushes.into_inner()))
+    Ok((report, pushes))
+}
+
+/// MEDIUM-2's in-object serial queue: every apply of one actor takes its turn, so an event arriving during another's
+/// outside reads is applied after it (never a judgement of an older closure written over a newer one).
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_in_turn<R: SqlPort, L: SqlPort, O: Outside>(
+    turn: &futures_util::lock::Mutex<()>,
+    record: &R,
+    local: &L,
+    outside: &O,
+    me: &str,
+    games: &[String],
+    kind_seq: Option<(&str, i64)>,
+    tip: Option<u64>,
+    era_ms: Option<i64>,
+) -> Result<(ApplyReport, Vec<(String, Value)>), String> {
+    let _turn = turn.lock().await;
+    apply(record, local, outside, me, games, kind_seq, tip, era_ms).await
 }
 
 /// A `txfacts` event (MEDIUM-3): the transaction's facts as the overlay decoded them (`owed_event::txfacts_of_raw`),
@@ -1050,3 +1076,118 @@ pub fn rows_digest(rows: &[Value]) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// The counters (seeded by the overlay, `applayer_counters::OWED_ACTOR`, pinned equal).
+pub const COUNTERS: [&str; 8] = [
+    "owed_actor_compared_total",
+    "owed_actor_diffs_total",
+    "owed_actor_faults_total",
+    "owed_actor_direct_calls_total",
+    "owed_actor_direct_faults_total",
+    "owed_actor_reconcile_republished_total",
+    "owed_actor_reconcile_compared_total",
+    "owed_actor_reconcile_diffs_total",
+];
+/// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
+pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;
+
+/// The event a delivery carries to the actor: its kind and seq (the redelivery idempotency), its write time (the
+/// visibility bar) and whether its word is `mined` (the collect-after-mined bar).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventCtx {
+    pub kind: String,
+    pub seq: i64,
+    pub at_ms: i64,
+    pub mined: bool,
+}
+impl EventCtx {
+    pub fn of(ev: &overlay_discovery::owed_event::OwedEvent) -> Self {
+        let word = ev.facts["word"].as_str().or_else(|| ev.facts["frame"]["word"].as_str());
+        Self { kind: ev.source.clone(), seq: ev.seq, at_ms: ev.at_ms, mined: ev.source == "word" && word == Some("mined") }
+    }
+}
+
+/// The `/apply` body of one delivery.
+pub fn apply_body(identity: &str, games: &[String], e: &EventCtx, tip: Option<u64>) -> Value {
+    json!({"identity": identity.to_ascii_lowercase(), "games": games, "kind": e.kind, "seq": e.seq, "atMs": e.at_ms, "tip": tip, "mined": e.mined})
+}
+
+fn of_games(rows: &[Value], games: &[String]) -> Vec<Value> {
+    rows.iter()
+        .filter(|r| r["gameId"].as_str().is_some_and(|g| games.iter().any(|x| x.eq_ignore_ascii_case(g))))
+        .cloned()
+        .collect()
+}
+
+/// PHASE A (section 6): the actor applies beside the D1 judge; its rows for `games` are compared with the D1 judge's
+/// just written, counted (`owed_actor_compared_total`, `owed_actor_diffs_total`) with a sampled diff line. The
+/// actor's fault never fails the message (`owed_actor_faults_total`).
+pub async fn beside(db: &impl JudgeDb, identity: &str, games: &[String]) {
+    let answer = match db.actor_deliver(identity, games).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return,
+        Err(e) => {
+            db.counters(vec![(COUNTERS[2].into(), 1)]).await;
+            db.log(&format!("[owed-actor] FAULT {identity}: {e}"));
+            return;
+        }
+    };
+    note_answer(&answer);
+    let d1 = match db.run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.to_ascii_lowercase())])]).await {
+        Ok(mut o) if !o.is_empty() => o.remove(0).rows,
+        _ => return,
+    };
+    let actor: Vec<Value> = answer["rows"].as_array().cloned().unwrap_or_default();
+    let diffs = diff_rows(&of_games(&d1, games), &of_games(&actor, games));
+    let mut deltas = vec![(COUNTERS[0].to_string(), 1)];
+    if !diffs.is_empty() {
+        deltas.push((COUNTERS[1].to_string(), 1));
+        db.log(&format!("[owed-actor] DIFF {identity}: {} of {} games, first {}", diffs.len(), games.len(), diffs[0]));
+    }
+    db.counters(deltas).await;
+}
+
+/// The bars of one answer, in this isolate.
+pub fn note_answer(answer: &Value) {
+    if let Some(ms) = answer["applyMs"].as_u64() {
+        note_apply(ms);
+    }
+}
+
+/// PHASE C: the actor is the judge; the marks this delivery covers are acknowledged after it applied (the ack is
+/// what empties `owed_dirty`; a mark written meanwhile keeps its newer generation).
+pub async fn as_the_judge(db: &impl JudgeDb, identity: &str, games: &[String]) -> Result<crate::owed_judge::JudgeReport, String> {
+    let id = identity.to_ascii_lowercase();
+    let gj = json!(games).to_string();
+    let marks = db.run_batch(vec![Stmt::new(crate::owed_judge::MARKS_SQL, vec![Bind::Text(id.clone()), Bind::Text(gj.clone())])]).await?;
+    let seen = marks.first().map_or(0, |o| o.rows.iter().filter_map(|m| m["generation"].as_i64()).max().unwrap_or(0));
+    let answer = db.actor_deliver(&id, games).await?.ok_or("the D1 judge is off and no owed actor is bound")?;
+    note_answer(&answer);
+    db.run_batch(vec![Stmt::new(crate::owed_judge::ACK_DIRTY_SQL, vec![Bind::Text(id), Bind::Text(gj), Bind::Int(seen), Bind::Text("[]".into())])]).await?;
+    Ok(crate::owed_judge::JudgeReport {
+        subjects: games.len(),
+        rows: answer["rows"].as_array().map_or(0, Vec::len),
+        ..Default::default()
+    })
+}
+
+/// The word columns of a joined read row (`owed_read::ROWS_SQL`): the read takes them from D1's `tx_words`, never
+/// the mirror's (MEDIUM-4).
+pub const WORD_COLUMNS: [&str; 12] = ["word", "tier", "height", "proof_root", "proof_height", "proof_hex", "header_hash", "hint_source", "hint_at", "updated_at", "trackerTerminal", "trackerTerminalWord"];
+/// The read's word join over the actor's rows' word roles, one D1 statement.
+pub const READ_WORDS_SQL: &str = "SELECT t.txid AS wordTxid,t.word,t.tier,t.height,t.proof_root,t.proof_height,t.proof_hex,t.header_hash,t.hint_source,t.hint_at,t.updated_at,CASE WHEN json_valid(t.legacy_body) THEN json_type(t.legacy_body,'$.trackerTerminal')='true' END AS trackerTerminal,CASE WHEN json_valid(t.legacy_body) THEN json_extract(t.legacy_body,'$.trackerTerminalWord') END AS trackerTerminalWord FROM tx_words t WHERE t.txid IN (SELECT value FROM json_each(?1))";
+
+/// The txids the actor's joined rows name as words.
+pub fn word_txids(joined: &[Value]) -> Vec<String> {
+    joined.iter().filter_map(|r| r["wordTxid"].as_str().map(str::to_string)).collect::<BTreeSet<_>>().into_iter().collect()
+}
+/// MEDIUM-4: the actor's joined rows with every word column replaced by D1's (absent there: null).
+pub fn join_words(joined: &mut [Value], words: &[Value]) {
+    let by: HashMap<&str, &Value> = words.iter().filter_map(|w| Some((w["wordTxid"].as_str()?, w))).collect();
+    for r in joined.iter_mut() {
+        let w = r["wordTxid"].as_str().and_then(|t| by.get(t).copied()).cloned();
+        for c in WORD_COLUMNS {
+            r[c] = w.as_ref().map_or(Value::Null, |w| w[c].clone());
+        }
+    }
+}

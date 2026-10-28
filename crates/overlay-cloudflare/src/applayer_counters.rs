@@ -108,6 +108,19 @@ pub const OWED_BELT: [&str; 8] = [
     "owed_belt_faults_other_total",
 ];
 
+/// bsv-low #912 (lane D2-ACTOR-B): the app layer's owed actor (`low_app_layer::owed_actor::COUNTERS`, pinned equal
+/// there): its Phase A compares against the D1 judge, the diffs, its faults, the direct calls, the reconcile.
+pub const OWED_ACTOR: [&str; 8] = [
+    "owed_actor_compared_total",
+    "owed_actor_diffs_total",
+    "owed_actor_faults_total",
+    "owed_actor_direct_calls_total",
+    "owed_actor_direct_faults_total",
+    "owed_actor_reconcile_republished_total",
+    "owed_actor_reconcile_compared_total",
+    "owed_actor_reconcile_diffs_total",
+];
+
 /// bsv-low #893 section 6.1 (lane D2-OWED-BACKFILL): the app layer's one-time `owed-v2` backfill and the daily age
 /// re-mark (`low_app_layer::owed_backfill::counter_names`, pinned equal there). Totals the pass adds. The last three
 /// (D2-OWED-FOLD-8): the open evictions made before the eviction writer the pass examined, the hop outputs paying a
@@ -220,6 +233,7 @@ pub fn names() -> Vec<String> {
     // bsv-low #831 (the FIX-831 lens's L3): the refund-due pots the owed judgement found funding-not-held
     v.push("owed_refund_funding_unheld_total".to_string());
     v.extend(OWED_BELT.iter().map(|n| n.to_string()));
+    v.extend(OWED_ACTOR.iter().map(|n| n.to_string()));
     v.extend(PUSH.iter().map(|n| n.to_string()));
     v.extend(OWED_BACKFILL.iter().map(|n| n.to_string()));
     v.extend(OWED_JUDGE.iter().map(|n| n.to_string()));

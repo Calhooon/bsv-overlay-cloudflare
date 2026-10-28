@@ -216,6 +216,15 @@ pub trait JudgeDb: SqlPort {
     ) -> Result<BTreeMap<String, Value>, String>;
     async fn canonical_root(&self, height: u64) -> Option<String>;
     async fn push(&self, identity: &str, body: Value);
+    /// bsv-low #912 (D2-ACTOR-B): does this judge write the D1 `owed_rows` (`OWED_D1_JUDGE`, Phases A and B)?
+    fn d1_judges(&self) -> bool {
+        true
+    }
+    /// bsv-low #912: the identity's actor applies the games (`owed_actor::object::call_apply`); `None` where no
+    /// actor is bound (the native judges, a render without the class).
+    async fn actor_deliver(&self, _identity: &str, _games: &[String]) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
     /// MEDIUM-3 (bsv-low #912): a transaction's decoded facts. The D1 judge decodes the stored BEEF here; the
     /// actor serves them from its `txfacts` table and holds no bytes.
     async fn tx_facts(&self, txid: &str, from: FactsFrom) -> Result<Option<TxFacts>, String>
@@ -237,6 +246,9 @@ pub struct D1Judge {
     sql: crate::routes::D1Sql,
     tip: Option<u64>,
     era_ms: Option<i64>,
+    /// bsv-low #912: the event this judge serves (its kind, seq, write time, a mined word), for the actor's call.
+    event: Option<crate::owed_actor::EventCtx>,
+    d1_judges: bool,
 }
 impl D1Judge {
     pub fn new(env: &worker::Env, tip: Option<u64>, era_ms: Option<i64>) -> worker::Result<Self> {
@@ -244,7 +256,16 @@ impl D1Judge {
             sql: crate::routes::D1Sql::of(env)?,
             tip,
             era_ms,
+            event: None,
+            d1_judges: crate::owed_actor::d1_judge_on(
+                env.var(crate::owed_actor::D1_JUDGE_FLAG).ok().map(|v| v.to_string()),
+            ),
         })
+    }
+    /// bsv-low #912: the consumer's judge carries its event to the actor.
+    pub fn with_event(mut self, event: crate::owed_actor::EventCtx) -> Self {
+        self.event = Some(event);
+        self
     }
 }
 impl SqlPort for D1Judge {
@@ -264,6 +285,21 @@ impl SqlPort for D1Judge {
 impl JudgeDb for D1Judge {
     fn tip(&self) -> Option<u64> {
         self.tip
+    }
+    fn d1_judges(&self) -> bool {
+        self.d1_judges
+    }
+    async fn actor_deliver(&self, identity: &str, games: &[String]) -> Result<Option<Value>, String> {
+        let Some(event) = &self.event else {
+            return Ok(None);
+        };
+        if crate::owed_actor::object::stub_of(&self.sql.env, identity).is_none() {
+            return Ok(None);
+        }
+        let body = crate::owed_actor::apply_body(identity, games, event, self.tip);
+        crate::owed_actor::object::call_apply(&self.sql.env, &body, crate::owed_actor::CONSUMER_CALL_WALL_MS)
+            .await
+            .map(Some)
     }
     fn era_ms(&self) -> Option<i64> {
         self.era_ms
@@ -771,6 +807,8 @@ macro_rules! identity_games {
         "SELECT gameId,MAX(at) AS at FROM (SELECT gameId,createdAt*1000 AS at FROM potparty_records WHERE identity=?1 UNION ALL SELECT gameId,createdAt*1000 FROM hopparty_records WHERE identity=?1 UNION ALL SELECT gameId,evictedAt FROM released_hop_evidence WHERE identity=?1 UNION ALL SELECT gameId,evictedAt FROM released_hop_evidence_missing WHERE identity=?1 UNION ALL SELECT gameId,updatedAtMs FROM owed_rows WHERE identity=?1) WHERE gameId<>'' GROUP BY gameId ORDER BY at DESC,gameId"
     };
 }
+/// bsv-low #912: every game of an identity, newest first (the actor's bootstrap pages them, `?2` the offset).
+pub const IDENTITY_GAMES_PAGE_SQL: &str = concat!("SELECT gameId FROM (", identity_games!(), " LIMIT 16 OFFSET ?2) WHERE 1");
 /// Expand the one wanted envelope to durable game marks: the newest [`OWED_WANTED_GAMES`] games `wanted`, the rest
 /// `backfill` ([`EXPAND_BACKFILL_SQL`]). An interrupted drain leaves all remaining games marked.
 pub const EXPAND_WANTED_SQL: &str = concat!("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,gameId,'wanted',?1,strftime('%s','now') * 1000 FROM (", identity_games!(), " LIMIT 32) WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs");

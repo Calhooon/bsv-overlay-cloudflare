@@ -50,6 +50,10 @@ command = "cargo install -q --version ^0.8 worker-build && worker-build --releas
 # BY NAME at deploy by bsv-low's scripts/runner/patterns/render-wrangler.sh beside the `__LOW_..._ID__` ids; a name it
 # does not know refuses the render, so a literal `__HOST_` never reaches a deployed [vars].
 [vars]
+# bsv-low #912 (D2-ACTOR-B): Phase B's read flag (the actor's rows served) and Phase C's (the D1 judge off). Off and
+# on until E4: Phase A, the actor applies beside the D1 judge and its rows are compared.
+OWED_ACTOR_READ = "false"
+OWED_D1_JUDGE = "true"
 AUTH_ENFORCE = "true"  # the promotion 2026-09-21: the identity reads enforced (C6), as proven on beta
 # bsv-low #441: the session lane (one BRC-103 handshake per origin, then a MAC'd lane
 # on `x-low-session*`); the store binding must exist for the flag to mean anything
@@ -208,6 +212,13 @@ service = "low-identity-resolver"
 binding = "IDENTITY_KILL"
 id = "__LOW_APPLAYER_DEFAULT_KV_IDENTITY_KILL_ID__"  # low-app-layer-identity-kill
 
+# bsv-low #912 (D2-ACTOR-B): the owed actor's display copy (MEDIUM-9): at most one write a second per identity,
+# served display-only (`claimable` false) when the actor cannot be reached. Placeholder id, injected at deploy time
+# (`npx wrangler kv namespace create OWED_COPY`).
+[[kv_namespaces]]
+binding = "OWED_COPY"
+id = "__LOW_APPLAYER_DEFAULT_KV_OWED_COPY_ID__"  # low-app-layer-owed-copy
+
 # ══════════════════════════════════════════════════════════════════════════
 # beta — the ISOLATED pre-release stack (bsv-low, 2026-08-12)
 #
@@ -237,6 +248,9 @@ bindings = [
   # bsv-low #441 (2026-09-10): the session lane's store (bsv-middleware-cloudflare
   # 0.3.4 `AuthSessionStore`): one object per BRC-104 session nonce and per lane id.
   { name = "AUTH_SESSION_STORE", class_name = "AuthSessionStore" },
+  # bsv-low #912 (D2-ACTOR-B): the owed judge's actor, one per identity (idFromName of the lowercased key), its own
+  # SQLite. Reached by binding only (the consumer's delivery, the writers' direct call, the read).
+  { name = "OWED_ACTOR", class_name = "OwedActor" },
 ]
 
 [[migrations]]
@@ -246,6 +260,13 @@ new_classes = ["BoardView"]
 [[migrations]]
 tag = "v3-auth-session-store"
 new_classes = ["AuthSessionStore"]
+
+# bsv-low #912: appended, never renamed. A `new_sqlite_classes` class (the actor's SqlStorage). Its wipe is each
+# actor's `/reset` (deleteAll) over the identity list read from D1 BEFORE the wipe, or a `deleted_classes` migration
+# and a fresh class name (LOW-2).
+[[migrations]]
+tag = "v4-owed-actor"
+new_sqlite_classes = ["OwedActor"]
 
 # bsv-low #911 (D2-ACTOR-A): the `owed-events` queue. The app layer PRODUCES
 # (the record door, the hooks, the word ingest and the un-acked mark sweep
@@ -288,6 +309,10 @@ head_sampling_rate = 1
 name = "low-app-layer-beta"
 
 [env.beta.vars]
+# bsv-low #912 (D2-ACTOR-B): Phase B's read flag (the actor's rows served) and Phase C's (the D1 judge off). Off and
+# on until E4: Phase A, the actor applies beside the D1 judge and its rows are compared.
+OWED_ACTOR_READ = "false"
+OWED_D1_JUDGE = "true"
 RELAY_URL = "https://__HOST_RELAY_BETA__"
 OVERLAY_URL = "https://__HOST_OVERLAY_BETA__"
 ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"
@@ -367,10 +392,15 @@ service = "low-identity-resolver-beta"
 binding = "IDENTITY_KILL"
 id = "__LOW_APPLAYER_BETA_KV_IDENTITY_KILL_ID__"  # low-app-layer-identity-kill-beta
 
+[[env.beta.kv_namespaces]]
+binding = "OWED_COPY"
+id = "__LOW_APPLAYER_BETA_KV_OWED_COPY_ID__"  # low-app-layer-owed-copy-beta
+
 [env.beta.durable_objects]
 bindings = [
   { name = "BOARD_VIEW", class_name = "BoardView" },
   { name = "AUTH_SESSION_STORE", class_name = "AuthSessionStore" },
+  { name = "OWED_ACTOR", class_name = "OwedActor" },
 ]
 
 # bsv-low #911 (D2-ACTOR-A): the `owed-events` queue. The app layer PRODUCES
