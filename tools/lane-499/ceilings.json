@@ -523,12 +523,12 @@
       "censusKey": null
     },
     "health-dirty-snapshot": {
-      "route": "GET /health: one backlog:dirty snapshot lookup plus the two existing chain-event health reads, with the 10-second memo expired. Linux workerd on the populated fleet fixture, FIX-CADENCE-GAUGES. D2-ACTOR-A-FOLD-4 (bsv-low #911): plus /health.owedEvents' one consumer-row primary-key read (the owed_belt_state row owed-events:consumer); its dirty snapshot is the same read owed.dirty serves, and the totals, fault memo and dead letters are the overlay's /health/invariants.owedEvents (one statement), so no ceiling moves.",
+      "route": "GET /health: one backlog:dirty snapshot lookup plus the two existing chain-event health reads, with the 10-second memo expired. Linux workerd on the populated fleet fixture, FIX-CADENCE-GAUGES. D2-ACTOR-A-FOLD-4 (bsv-low #911): plus /health.owedEvents' one consumer-row primary-key read (the owed_belt_state row owed-events:consumer); its dirty snapshot is the same read owed.dirty serves, and the fault memo, dead letters and the family's other totals are the overlay's /health/invariants.owedEvents (one statement). D2-ACTOR-A-FOLD-5: plus publishedTotal and consumedTotal, one ops_counters statement keyed by the two names (two rows, in the consumer row's batch), so no ceiling moves.",
       "measured": {
-        "reads": 3,
+        "reads": 5,
         "writes": 0,
-        "stmts": 4,
-        "maxReads": 1
+        "stmts": 5,
+        "maxReads": 2
       },
       "ceiling": {
         "reads": 7,
