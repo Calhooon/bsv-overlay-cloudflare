@@ -1242,6 +1242,18 @@ pub async fn lever(req: worker::Request, env: &worker::Env) -> worker::Result<wo
     if !crate::internal_events::internal_bearer_ok(&req, env) {
         return worker::Response::error("unauthorized", 401);
     }
+    // bsv-low #912 (the D2-ACTOR-B lens's LOW-4): the lever judges in D1, so it is refused while the D1 judge is off
+    // (Phase C); Phase C's rollback re-judge is `POST /internal/owed-v3-pass`.
+    if !crate::owed_actor::d1_judge_on(
+        env.var(crate::owed_actor::D1_JUDGE_FLAG)
+            .ok()
+            .map(|v| v.to_string()),
+    ) {
+        return worker::Response::error(
+            "the D1 judge is off (OWED_D1_JUDGE=false): the owed-v2 lever does not run",
+            409,
+        );
+    }
     // `?aged=1`: the drain's age repair alone (`mark_aged`, the D2-OWED lens's LOW-3: the tier runs it on local D1)
     if req
         .url()

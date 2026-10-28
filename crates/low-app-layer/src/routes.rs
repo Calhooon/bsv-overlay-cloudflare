@@ -3296,8 +3296,19 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             .map(|v| v.to_string()),
     ) {
         match crate::owed_actor::object::read_snapshot(&ctx.env, &db, &identity).await {
-            Ok(Ok(snapshot)) => snapshot,
-            Ok(Err(display)) => return json_response(display.to_string(), 200),
+            Ok(crate::owed_actor::object::ActorRead::Rows(snapshot)) => snapshot,
+            // The D2-ACTOR-B lens's MEDIUM-2: the display copy in the owed wire's shape, every row display only.
+            Ok(crate::owed_actor::object::ActorRead::Fallback(
+                crate::owed_actor::Fallback::Display(body),
+            )) => return json_response(body.to_string(), 200),
+            // No copy: a 503 naming `pending` (the client keeps its last list), never `rows: []`.
+            Ok(crate::owed_actor::object::ActorRead::Fallback(
+                crate::owed_actor::Fallback::Unavailable(body),
+            )) => {
+                let mut resp = json_response(body.to_string(), 503)?;
+                resp.headers_mut().set("Retry-After", "2")?;
+                return Ok(resp);
+            }
             Err(error) => {
                 console_warn!("[owed] stored read failed: {error}");
                 return json_error("database query failed", 503);
@@ -7021,40 +7032,50 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         Err(_) => serde_json::Value::Null,
     };
     body["owed"]["dirty"] = dirty;
-    // bsv-low #912 (D2-ACTOR-B, MEDIUM-8): the actor's bars measured in this isolate (the consumer's deliveries and
-    // the writers' direct calls): the apply's p50, p95 and ceiling, the rows' visibility after the write.
-    body["owedActor"] = crate::owed_actor::served_bars(worker::Date::now().as_millis());
+    // bsv-low #912 (D2-ACTOR-B; the lens's MEDIUM-1, MEDIUM-7, MEDIUM-8): the FLEET's bars from their durable class
+    // rows (`direct`, `queue`, `mined`; this isolate's under `isolate`), the compare's durable totals (Phase B's
+    // gate), the bootstraps beside the identities holding rows, and the actor's own oldest unapplied event (Phases A
+    // and B; Phase C's is the fleet's oldest un-acked mark): ONE statement.
+    let d1_judges = crate::owed_actor::d1_judge_on(
+        ctx.env
+            .var(crate::owed_actor::D1_JUDGE_FLAG)
+            .ok()
+            .map(|v| v.to_string()),
+    );
+    let actor_read = match D1Sql::of(&ctx.env) {
+        Ok(sql) => crate::pot_hook::SqlPort::run_batch(
+            &sql,
+            vec![crate::pot_hook::Stmt::new(
+                crate::owed_actor::HEALTH_SQL,
+                vec![],
+            )],
+        )
+        .await
+        .ok()
+        .and_then(|o| o.into_iter().next())
+        .and_then(|o| o.rows.into_iter().next()),
+        Err(_) => None,
+    };
+    body["owedActor"] = crate::owed_actor::health_body(
+        actor_read.as_ref(),
+        worker::Date::now().as_millis(),
+        d1_judges,
+        &body["owedEvents"]["oldestUnackedMarkAgeMs"],
+    );
     body["owedActor"]["readFlag"] = serde_json::json!(crate::owed_actor::flag_on(
         ctx.env
             .var(crate::owed_actor::READ_FLAG)
             .ok()
             .map(|v| v.to_string())
     ));
-    body["owedActor"]["d1Judge"] = serde_json::json!(crate::owed_actor::d1_judge_on(
-        ctx.env
-            .var(crate::owed_actor::D1_JUDGE_FLAG)
-            .ok()
-            .map(|v| v.to_string())
-    ));
+    body["owedActor"]["d1Judge"] = serde_json::json!(d1_judges);
     body["owedActor"]["bound"] =
         serde_json::json!(ctx.env.durable_object(crate::owed_actor::BINDING).is_ok());
-    // The oldest event no judge has applied: the fleet's oldest un-acked mark (the marks are acknowledged after the
-    // judge applied; in Phase C after the actor did), where this isolate holds no sample of its own.
-    if body["owedActor"]["oldestUnappliedEventAgeMs"].is_null() {
-        body["owedActor"]["oldestUnappliedEventAgeMs"] =
-            body["owedEvents"]["oldestUnackedMarkAgeMs"].clone();
-    }
     // The flags at the design's named place (the harness reads `owedActor.flags.OWED_ACTOR_READ`).
     body["owedActor"]["flags"] = serde_json::json!({
         crate::owed_actor::READ_FLAG: body["owedActor"]["readFlag"],
         crate::owed_actor::D1_JUDGE_FLAG: body["owedActor"]["d1Judge"],
     });
-    // The reconcile's diffs are the fleet's (the belt's alarm runs it in another isolate): the durable count.
-    if let Ok(sql) = D1Sql::of(&ctx.env) {
-        if let Some(diffs) = crate::owed_actor::durable_reconcile_diffs(&sql).await {
-            body["owedActor"]["reconcileDiffs"] = serde_json::json!(diffs);
-        }
-    }
     // bsv-low #499: this isolate's D1 rows ledger, the per-route running maxima since boot (the overlay serves the
     // same body on `/health/invariants.d1Budget`; `scripts/d1-census.py` reads both).
     body["d1Budget"] = crate::d1_ledger::budget_json();

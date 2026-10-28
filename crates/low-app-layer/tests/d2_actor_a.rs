@@ -1120,9 +1120,14 @@ fn delta3_r1_the_queue_event_flushes_the_consumers_pushes() {
         consumer < flush && flush < answer,
         "after the consumer, before the answer"
     );
-    assert!(
-        !wrapper.contains("wait_until"),
-        "awaited in the handler, never handed to wait_until"
+    // bsv-low #912 (the D2-ACTOR-B lens's MEDIUM-6): the one `wait_until` of the handler is Phase A's deferred actor
+    // apply; the pushes' flush is awaited, never handed to it.
+    assert_eq!(
+        wrapper.matches("wait_until").count(),
+        wrapper
+            .matches("ctx.wait_until(owed_actor::run_deferred(env.clone(),deferred));")
+            .count(),
+        "the pushes are awaited in the handler, never handed to wait_until"
     );
 }
 

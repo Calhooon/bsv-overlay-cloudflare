@@ -586,6 +586,9 @@ const TXFACTS_STORED_SQL: &str = "SELECT facts FROM txfacts WHERE txid=?1 AND sr
 pub const APPLIED_CREATE: &str = "CREATE TABLE IF NOT EXISTS applied (kind TEXT NOT NULL, seq INTEGER NOT NULL, game TEXT NOT NULL, atMs INTEGER NOT NULL, PRIMARY KEY (kind, seq, game))";
 pub const META_CREATE: &str = "CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value TEXT)";
 pub const APPLIED_SQL: &str = "INSERT INTO applied(kind,seq,game,atMs) SELECT ?1,?2,value,?3 FROM json_each(?4) WHERE 1 ON CONFLICT DO NOTHING";
+/// LOW-2 (the D2-ACTOR-B lens): the redelivery rows older than [`APPLIED_KEEP_MS`] go.
+pub const APPLIED_PRUNE_SQL: &str = "DELETE FROM applied WHERE atMs<?1";
+pub const APPLIED_KEEP_MS: i64 = 7 * 86_400_000;
 /// The games of `?3` the event `(?1, ?2)` has applied.
 pub const APPLIED_GAMES_SQL: &str = "SELECT game FROM applied WHERE kind=?1 AND seq=?2 AND game IN (SELECT value FROM json_each(?3))";
 /// The version of the actor's own tables (`txfacts`, `applied`, `meta`) beside the mirror's generated digest: a move
@@ -925,6 +928,11 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
             META_PUT_SQL,
             vec![Bind::Text("ackSeq".into()), Bind::Text(seq.to_string())],
         ));
+        // LOW-2: `applied` keeps a week of events (the queues' retention is four days: no redelivery is older).
+        marks.push(Stmt::new(
+            APPLIED_PRUNE_SQL,
+            vec![Bind::Int(local.now_ms() as i64 - APPLIED_KEEP_MS)],
+        ));
     }
     if !marks.is_empty() {
         local.run_batch(marks).await?;
@@ -1209,30 +1217,128 @@ pub fn diff_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// The KV display copy (MEDIUM-9): the rows, each display-only (`claimable` false, the reason), never an empty list
-/// served as "nothing owed": a copy with no rows is served `pending`.
+/// The KV display copy (MEDIUM-9): the actor's stored rows (`ROWS_SQL`'s), written at most once a second.
 pub fn kv_copy_body(identity: &str, rows: &[Value], judged_at_ms: u64) -> Value {
     json!({"identity": identity, "judgedAtMs": judged_at_ms, "rows": rows})
 }
-/// The read's answer from a copy, or from no copy (Rule 23).
-pub fn display_from_copy(copy: Option<&Value>) -> Value {
-    match copy {
-        Some(c) if c["rows"].as_array().is_some_and(|r| !r.is_empty()) => {
-            let rows: Vec<Value> = c["rows"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|r| {
-                    let mut r = r.clone();
-                    r["claimable"] = json!(false);
-                    r["claimReason"] = json!(KV_COPY_REASON);
-                    r
-                })
-                .collect();
-            json!({"rows": rows, "pending": false, "source": "kv-copy", "displayOnly": true, "reason": KV_COPY_REASON, "judgedAtMs": c["judgedAtMs"]})
-        }
-        _ => json!({"rows": null, "pending": true, "source": "none", "reason": KV_COPY_REASON}),
+/// The reason a bootstrapping actor's read is served with (the D2-ACTOR-B lens's MEDIUM-1).
+pub const BOOTSTRAP_REASON: &str = "the judge is building this identity's rows; re-read";
+
+/// The read's answer when the actor's rows cannot be served as complete: the actor out of reach, or its bootstrap
+/// unfinished (the D2-ACTOR-B lens's MEDIUM-1 and MEDIUM-2).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fallback {
+    /// A 200 body in the owed wire's own shape (`owed_read::Snapshot::body`: `v`, the identity, the rows with their
+    /// facts an object), each row display only (`facts.claimable: false`, `facts.claimReason`, `facts.displayOnly`),
+    /// the body `pending: true`, `refresh: "shed"` and `retryAfterMs` (the client re-reads it).
+    Display(Value),
+    /// No copy to show: a 503 naming `pending: true` (the client keeps its last list and says "could not load";
+    /// a 200 with `rows: []` reads "Nothing is owed to you right now", Rule 23).
+    Unavailable(Value),
+}
+
+/// MEDIUM-2: the fallback of `identity`'s read from its KV copy (or none), through the wire's own builder.
+pub fn fallback_body(identity: &str, copy: Option<&Value>, reason: &str, source: &str) -> Fallback {
+    let unavailable = || {
+        Fallback::Unavailable(
+            json!({"v": crate::owed::OWED_WIRE_VERSION, "identity": identity, "rows": null, "pending": true, "retryAfterMs": 1500, "source": source, "reason": reason}),
+        )
+    };
+    let rows: Vec<Value> = copy
+        .and_then(|c| c["rows"].as_array())
+        .into_iter()
+        .flatten()
+        .filter(|r| {
+            r["outpoint"].is_string()
+                && r["facts"]
+                    .as_str()
+                    .and_then(|f| serde_json::from_str::<Value>(f).ok())
+                    .is_some_and(|f| f.is_object())
+        })
+        .cloned()
+        .collect();
+    if rows.is_empty() {
+        return unavailable();
     }
+    let snapshot = crate::owed_read::Snapshot {
+        state: Some(
+            json!({"computedAtMs": copy.and_then(|c| c["judgedAtMs"].as_u64()), "rows": rows.len(), "truncated": 0}),
+        ),
+        joined: rows,
+        ..Default::default()
+    };
+    let Ok(mut body) = snapshot.body(identity, None, &BTreeMap::new()) else {
+        return unavailable();
+    };
+    for r in body["rows"].as_array_mut().into_iter().flatten() {
+        r["facts"]["claimable"] = json!(false);
+        r["facts"]["claimReason"] = json!(reason);
+        r["facts"]["displayOnly"] = json!(true);
+    }
+    body["pending"] = json!(true);
+    body["refresh"] = json!("shed");
+    body["retryAfterMs"] = json!(1500);
+    body["displayOnly"] = json!(true);
+    body["source"] = json!(source);
+    body["reason"] = json!(reason);
+    Fallback::Display(body)
+}
+
+/// THE ERA (the D2-ACTOR-B lens's MEDIUM-5): the stamp an actor holds in `meta` (`epoch`), the app layer's two render
+/// vars the wipe moves (`STORAGE_EPOCH`, then `WRITTEN_OFF_BEFORE_MS`, WIPE-REHEARSAL-2 step 6 and WIPE-REHEARSAL-3's
+/// era bump). Read on every apply, read and alarm: an actor holding another era's stamp is RESET (`deleteAll`) before
+/// it answers, so no actor that re-hydrated from the pre-wipe D1 (the queue, the sweep, the belt, its own alarm, a
+/// read, between step 4a's reset and the bump) serves that era afterwards.
+pub const META_EPOCH: &str = "epoch";
+pub fn actor_epoch(storage_epoch: Option<String>, written_off_before_ms: Option<i64>) -> String {
+    format!(
+        "{}|{}",
+        crate::logic::normalize_storage_epoch(storage_epoch).unwrap_or_default(),
+        written_off_before_ms.map_or(String::new(), |m| m.to_string())
+    )
+}
+/// What an actor does with the era stamp it holds against the render's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochVerdict {
+    /// No stamp held (a fresh actor, or one minted before the stamp existed): stamp it.
+    Stamp,
+    Keep,
+    /// Another era's stamp: reset the actor (its storage and its alarm), then stamp.
+    Reset,
+}
+pub fn epoch_verdict(held: Option<&str>, current: &str) -> EpochVerdict {
+    match held {
+        None => EpochVerdict::Stamp,
+        Some(h) if h == current => EpochVerdict::Keep,
+        Some(_) => EpochVerdict::Reset,
+    }
+}
+
+/// THE TIP ALARM (the D2-ACTOR-B lens's MEDIUM-4): the games whose rows the tips since the last one judged have
+/// reached: a gate in `(?2, ?1]` (`?2` the last tip the alarm judged, `meta.tipJudged`, -1 for none; `?1` the tip
+/// now), or a claimable courier-dated sweep (`json_extract(facts,'$.status') IS NOT 'unspent'`, the D1 rule's
+/// D-H1) judged below the tip, at most 1,024 games (applied 64 at a time). A gate already open is never selected
+/// again; a re-judged sweep carries the tip it was judged at, so it waits for the next block.
+pub const GATED_GAMES_SQL: &str = "SELECT DISTINCT gameId FROM owed_rows WHERE (gateHeight<=?1 AND gateHeight>?2) OR (family='hop-stranded' AND claimable=1 AND probeTip<?1 AND json_extract(facts,'$.status') IS NOT 'unspent') LIMIT 1024";
+/// The next gate above the tip (`?1`) and whether a courier-dated sweep is held (a block re-dates it).
+pub const NEXT_GATE_SQL: &str = "SELECT (SELECT MIN(gateHeight) FROM owed_rows WHERE gateHeight>?1) AS gate,(SELECT 1 FROM owed_rows WHERE family='hop-stranded' AND claimable=1 AND probeTip IS NOT NULL AND json_extract(facts,'$.status') IS NOT 'unspent' LIMIT 1) AS sweeps";
+/// About one block.
+pub const BLOCK_MS: u64 = 600_000;
+/// When the tip alarm is next owed: a held courier-dated sweep at the next block; else the next gate at its height's
+/// expected time (a block of [`BLOCK_MS`] a height, at least one); else none (the hook's `tip` event stays the
+/// second belt).
+pub fn next_tip_alarm_ms(
+    now: u64,
+    tip: Option<u64>,
+    next_gate: Option<u64>,
+    sweeps: bool,
+) -> Option<u64> {
+    if sweeps {
+        return Some(now + BLOCK_MS);
+    }
+    let gate = next_gate?;
+    let blocks = tip.map_or(1, |t| gate.saturating_sub(t).max(1));
+    Some(now + blocks.saturating_mul(BLOCK_MS))
 }
 
 /// Whether a KV copy is due: at most one a second per identity (the alarm coalesces the rest).
@@ -1310,6 +1416,292 @@ pub fn note_apply(ms: u64) {
 }
 pub fn served_bars(now_ms: u64) -> Value {
     BARS.with(|b| b.borrow().served(now_ms))
+}
+
+/// THE DURABLE BARS (the D2-ACTOR-B lens's MEDIUM-7): each answer's samples by CLASS, `direct` (a writer's direct
+/// call), `queue` (the consumer's delivery, Phase A's deferred apply included) and `mined` (a `mined` word's event,
+/// the collect-after-mined bar), kept in the belt's ledger, one row a class (`owed-actor:bars:<class>`, its `cursor`
+/// the last [`METER_SAMPLES`] of each meter), so `/health.owedActor` serves the FLEET's figures whatever isolate it
+/// lands on. An isolate adds its samples at most once a [`BARS_FLUSH_EVERY_MS`] or every [`BARS_FLUSH_SAMPLES`]
+/// (one read and one batch). The `queue` row also carries the actor's OWN oldest unapplied event: the oldest write
+/// time of an event whose actor apply faulted in this isolate with no later apply of that identity landed.
+pub const BAR_CLASSES: [&str; 3] = ["direct", "queue", "mined"];
+pub const BARS_FLUSH_EVERY_MS: u64 = 60_000;
+pub const BARS_FLUSH_SAMPLES: usize = 64;
+pub fn bars_state_name(class: &str) -> String {
+    format!("owed-actor:bars:{class}")
+}
+pub const BARS_READ_SQL: &str = "SELECT name,cursor,tickedAtMs FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined')";
+
+/// This isolate's samples not yet added to the durable rows.
+#[derive(Debug, Default, Clone)]
+pub struct PendingBars {
+    pub apply: BTreeMap<&'static str, Vec<u64>>,
+    pub visible: BTreeMap<&'static str, Vec<u64>>,
+    /// identity -> the oldest write time of an event whose apply faulted, no later apply landed.
+    pub unapplied: BTreeMap<String, u64>,
+    /// The queue class's unapplied set moved since the last flush (only then is the row's age rewritten).
+    pub queue_touched: bool,
+    pub noted: usize,
+    pub last_flush_ms: Option<u64>,
+}
+impl PendingBars {
+    pub fn note_answer(&mut self, class: &'static str, answer: &Value) {
+        if let Some(ms) = answer["applyMs"].as_u64() {
+            self.apply.entry(class).or_default().push(ms);
+            self.noted += 1;
+        }
+        if let (Some(at), Some(judged)) = (answer["atMs"].as_u64(), answer["judgedAtMs"].as_u64()) {
+            let ms = judged.saturating_sub(at);
+            self.visible.entry(class).or_default().push(ms);
+            if answer["mined"] == true {
+                self.visible.entry("mined").or_default().push(ms);
+            }
+        }
+        if let Some(id) = answer["identity"].as_str() {
+            if self.unapplied.remove(id).is_some() {
+                self.queue_touched = true;
+            }
+        }
+        if class == "queue" {
+            self.queue_touched = true;
+        }
+    }
+    pub fn note_fault(&mut self, identity: &str, at_ms: Option<u64>) {
+        if let Some(at) = at_ms {
+            let e = self
+                .unapplied
+                .entry(identity.to_ascii_lowercase())
+                .or_insert(at);
+            *e = (*e).min(at);
+            self.queue_touched = true;
+        }
+    }
+    pub fn due(&self) -> bool {
+        self.noted > 0 || self.queue_touched
+    }
+    fn flush_due(&self, now: u64) -> bool {
+        self.due()
+            && (self.noted >= BARS_FLUSH_SAMPLES
+                || self
+                    .last_flush_ms
+                    .is_none_or(|l| now.saturating_sub(l) >= BARS_FLUSH_EVERY_MS))
+    }
+}
+thread_local! {
+    static PENDING_BARS: RefCell<PendingBars> = RefCell::default();
+}
+/// One answer's samples under its class (this isolate's bars too).
+pub fn note_answer_as(class: &'static str, answer: &Value) {
+    BARS.with(|b| note_answer_into(&mut b.borrow_mut(), answer));
+    PENDING_BARS.with(|p| p.borrow_mut().note_answer(class, answer));
+}
+/// An actor apply that faulted: its event is unapplied for the actor until a later apply of the identity lands.
+pub fn note_actor_fault(identity: &str, at_ms: Option<u64>) {
+    PENDING_BARS.with(|p| p.borrow_mut().note_fault(identity, at_ms));
+}
+
+/// One class row after this isolate's samples: the stored rings with the new samples appended, the last
+/// [`METER_SAMPLES`] kept; `unapplied` (the queue row only) the oldest unapplied write time, `Some(None)` cleared.
+pub fn merge_bars_row(
+    stored: Option<&str>,
+    apply: &[u64],
+    visible: &[u64],
+    unapplied: Option<Option<u64>>,
+) -> String {
+    let mut row: Value = stored
+        .and_then(|s| serde_json::from_str(s).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    for (k, new) in [("apply", apply), ("visible", visible)] {
+        let mut ring: Vec<u64> = row[k]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .collect();
+        ring.extend_from_slice(new);
+        let cut = ring.len().saturating_sub(METER_SAMPLES);
+        row[k] = json!(ring[cut..]);
+    }
+    if let Some(u) = unapplied {
+        row["oldestUnappliedAtMs"] = json!(u);
+    }
+    row.to_string()
+}
+
+/// Add this isolate's samples to the durable rows when due (`force`: whatever the count and the time). A fault
+/// keeps them for the next flush.
+pub async fn flush_bars(db: &impl SqlPort, now: u64, force: bool) {
+    let pending = PENDING_BARS.with(|p| {
+        let p = p.borrow();
+        (if force { p.due() } else { p.flush_due(now) }).then(|| p.clone())
+    });
+    let Some(pending) = pending else { return };
+    match flush_bars_from(db, now, &pending).await {
+        Ok(()) => PENDING_BARS.with(|p| {
+            let mut p = p.borrow_mut();
+            let unapplied = std::mem::take(&mut p.unapplied);
+            *p = PendingBars {
+                unapplied,
+                last_flush_ms: Some(now),
+                ..Default::default()
+            };
+        }),
+        Err(e) => db.log(&format!("[owed-actor] bars not flushed: {e}")),
+    }
+}
+/// The flush of one isolate's pending samples (the pins run it with an explicit state).
+pub async fn flush_bars_from(
+    db: &impl SqlPort,
+    now: u64,
+    pending: &PendingBars,
+) -> Result<(), String> {
+    let stored = db
+        .run_batch(vec![Stmt::new(BARS_READ_SQL, vec![])])
+        .await?
+        .into_iter()
+        .next()
+        .map(|o| o.rows)
+        .unwrap_or_default();
+    let held = |class: &str| {
+        let name = bars_state_name(class);
+        stored
+            .iter()
+            .find(|r| r["name"] == name.as_str())
+            .and_then(|r| r["cursor"].as_str().map(str::to_string))
+    };
+    let mut stmts = Vec::new();
+    for class in BAR_CLASSES {
+        let apply = pending.apply.get(class).cloned().unwrap_or_default();
+        let visible = pending.visible.get(class).cloned().unwrap_or_default();
+        let unapplied = (class == "queue" && pending.queue_touched)
+            .then(|| pending.unapplied.values().min().copied());
+        if apply.is_empty() && visible.is_empty() && unapplied.is_none() {
+            continue;
+        }
+        stmts.push(Stmt::new(
+            crate::owed_belt::STATE_SQL,
+            vec![
+                Bind::Text(bars_state_name(class)),
+                Bind::Text(merge_bars_row(
+                    held(class).as_deref(),
+                    &apply,
+                    &visible,
+                    unapplied,
+                )),
+                Bind::Int(now as i64),
+            ],
+        ));
+    }
+    if !stmts.is_empty() {
+        db.run_batch(stmts).await?;
+    }
+    Ok(())
+}
+
+/// The fleet's bars from the durable rows ([`BARS_READ_SQL`]'s): the apply's p50, p95 and maximum over the direct and
+/// queue classes, the rows' visibility p95 by class (`rowsVisibleMsP95` the queue's, the path every write takes;
+/// `rowsVisibleDirectMsP95` the record door's direct call), the collect-after-mined p95, the actor's own oldest
+/// unapplied event's age, and each class's sample count and flush time.
+pub fn fleet_bars(rows: &[Value], now: u64) -> Value {
+    let ring = |class: &str, k: &str| -> (Meter, Option<i64>, Value) {
+        let name = bars_state_name(class);
+        let r = rows.iter().find(|r| r["name"] == name.as_str());
+        let row: Value = r
+            .and_then(|r| r["cursor"].as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(Value::Null);
+        let mut m = Meter::default();
+        for v in row[k]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+        {
+            m.note(v);
+        }
+        (m, r.and_then(|r| r["tickedAtMs"].as_i64()), row)
+    };
+    let mut apply = Meter::default();
+    for class in ["direct", "queue"] {
+        for v in ring(class, "apply").0.samples {
+            apply.note(v);
+        }
+    }
+    let (queue_visible, _, queue_row) = ring("queue", "visible");
+    let (direct_visible, _, _) = ring("direct", "visible");
+    let (mined, _, _) = ring("mined", "visible");
+    let classes: serde_json::Map<String, Value> = BAR_CLASSES
+        .iter()
+        .map(|c| {
+            let (v, at, _) = ring(c, "visible");
+            let (a, _, _) = ring(c, "apply");
+            (
+                (*c).to_string(),
+                json!({"applySamples": a.samples.len(), "applyMsP95": a.quantile(0.95), "visibleSamples": v.samples.len(), "visibleMsP95": v.quantile(0.95), "flushedAtMs": at}),
+            )
+        })
+        .collect();
+    json!({
+        "applyMsP50": apply.quantile(0.50),
+        "applyMsP95": apply.quantile(0.95),
+        "applyMsMax": apply.max(),
+        "rowsVisibleMsP95": queue_visible.quantile(0.95),
+        "rowsVisibleMsMax": queue_visible.max(),
+        "rowsVisibleDirectMsP95": direct_visible.quantile(0.95),
+        "collectAfterMinedMsP95": mined.quantile(0.95),
+        "actorOldestUnappliedEventAgeMs": queue_row["oldestUnappliedAtMs"].as_u64().map(|a| now.saturating_sub(a)),
+        "classes": classes,
+    })
+}
+
+/// `/health.owedActor`'s one D1 statement (MEDIUM-1, MEDIUM-7, MEDIUM-8): the class rows, the actor's durable totals
+/// and the identities holding owed rows (a count over `owed_state`, one row an identity).
+pub const HEALTH_SQL: &str = "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',tickedAtMs)) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities";
+
+/// The served object: this isolate's bars under `isolate`, the fleet's figures at the top (the harness's keys),
+/// the durable compare totals (MEDIUM-8: Phase B's gate), the bootstraps beside the identities holding rows
+/// (MEDIUM-1: Phase B's other gate), and the oldest unapplied event's age: the actor's OWN in Phases A and B, the
+/// fleet's oldest un-acked mark in Phase C (where the marks are acknowledged after the actor applied).
+pub fn health_body(
+    read: Option<&Value>,
+    now: u64,
+    d1_judges: bool,
+    d1_oldest_unacked: &Value,
+) -> Value {
+    let mut body = served_bars(now);
+    body["isolate"] = body.clone();
+    let rows: Vec<Value> = read
+        .and_then(|r| r["bars"].as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let fleet = fleet_bars(&rows, now);
+    for (k, v) in fleet.as_object().into_iter().flatten() {
+        body[k.as_str()] = v.clone();
+    }
+    let counters: Value = read
+        .and_then(|r| r["counters"].as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Null);
+    let n = |k: &str| counters.get(k).and_then(Value::as_u64).unwrap_or(0);
+    body["comparedTotal"] = json!(n(COUNTERS[0]));
+    body["diffsTotal"] = json!(n(COUNTERS[1]));
+    body["faultsTotal"] = json!(n(COUNTERS[2]));
+    body["reconcileDiffs"] = json!(n(COUNTERS[7]));
+    body["bootstraps"] = json!(n(COUNTERS[10]));
+    body["unknownReads"] = json!(n(COUNTERS[11]));
+    body["epochResets"] = json!(n(COUNTERS[12]));
+    body["deferred"] = json!(n(COUNTERS[13]));
+    body["v3"] = json!({"identities": n(COUNTERS[14]), "rows": n(COUNTERS[15])});
+    body["activeIdentities"] = json!(read.and_then(|r| r["activeIdentities"].as_u64()));
+    body["oldestUnappliedEventAgeMs"] = if d1_judges {
+        fleet["actorOldestUnappliedEventAgeMs"].clone()
+    } else {
+        d1_oldest_unacked.clone()
+    };
+    body["healthRead"] = json!(read.is_some());
+    body
 }
 
 /// The sampled digest compare (MEDIUM-10, the reconcile's second question; the exact first, the un-acked marks
@@ -1521,7 +1913,11 @@ mod tests;
 /// The counters (seeded by the overlay, `applayer_counters::OWED_ACTOR`, pinned equal).
 /// `reconcile_republished`: the games a reconcile's DIFF re-applied (Phases A and B). The last two (Phase C, HIGH-3):
 /// the asks the actors published, and the belt's finds handed back to an actor.
-pub const COUNTERS: [&str; 10] = [
+/// The D2-ACTOR-B lens's MEDIUMs (lane D2-ACTOR-B-FOLD-2) add six: the bootstraps that finished (MEDIUM-1), the
+/// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
+/// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
+/// (MEDIUM-9).
+pub const COUNTERS: [&str; 16] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -1532,6 +1928,12 @@ pub const COUNTERS: [&str; 10] = [
     "owed_actor_reconcile_diffs_total",
     "owed_actor_belt_asks_total",
     "owed_belt_handed_back_total",
+    "owed_actor_bootstraps_total",
+    "owed_actor_unknown_reads_total",
+    "owed_actor_epoch_resets_total",
+    "owed_actor_deferred_total",
+    "owed_v3_identities_total",
+    "owed_v3_rows_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;
@@ -1584,12 +1986,62 @@ pub async fn beside(db: &impl JudgeDb, identity: &str, games: &[String]) {
         Ok(None) => return,
         Err(e) => {
             db.counters(vec![(COUNTERS[2].into(), 1)]).await;
+            note_actor_fault(identity, db.event_at_ms());
             db.log(&format!("[owed-actor] FAULT {identity}: {e}"));
             return;
         }
     };
     note_answer(&answer);
     compare(db, identity, games, &answer).await;
+}
+
+/// THE DEFERRED APPLY (the D2-ACTOR-B lens's MEDIUM-6, Phase A): the consumer's delivery judges in D1 and ACKS; the
+/// actor's apply and its compare ([`beside`]) run after the batch, under the queue handler's `ctx.wait_until`
+/// ([`run_deferred`]), so the serial consumer's per-message service time is the D1 judge's alone. At most
+/// [`DEFERRED_MAX`] an isolate between two batches (past it the delivery applies inline, as before). The actor reads
+/// the record as it stands (its closure), so a later apply is the same judgement or a newer one; its compare reads
+/// D1's rows at that time, so a D1 judgement landing between them can count a diff the next apply heals (stated).
+#[derive(Debug, Clone)]
+pub struct Deferred {
+    pub identity: String,
+    pub games: Vec<String>,
+    pub event: EventCtx,
+    pub tip: Option<u64>,
+    pub era_ms: Option<i64>,
+}
+pub const DEFERRED_MAX: usize = 256;
+thread_local! {
+    static DEFERRED: RefCell<Vec<Deferred>> = const { RefCell::new(Vec::new()) };
+}
+/// Queue one Phase A apply for after the batch; `false` past the bound.
+pub fn defer(d: Deferred) -> bool {
+    DEFERRED.with(|q| {
+        let mut q = q.borrow_mut();
+        if q.len() >= DEFERRED_MAX {
+            return false;
+        }
+        q.push(d);
+        true
+    })
+}
+pub fn take_deferred() -> Vec<Deferred> {
+    DEFERRED.with(|q| std::mem::take(&mut *q.borrow_mut()))
+}
+/// The deferred applies of one batch, each the identity's actor applying beside the D1 judge's rows, then this
+/// isolate's bars flushed (the queue class).
+pub async fn run_deferred(env: worker::Env, items: Vec<Deferred>) {
+    let n = items.len() as u64;
+    for d in items {
+        let Ok(judge) = crate::owed_judge::D1Judge::new(&env, d.tip, d.era_ms) else {
+            continue;
+        };
+        let judge = judge.with_event(d.event);
+        beside(&judge, &d.identity, &d.games).await;
+    }
+    if let Ok(db) = crate::routes::D1Sql::of(&env) {
+        db.counters(vec![(COUNTERS[13].into(), n)]).await;
+        flush_bars(&db, worker::Date::now().as_millis(), false).await;
+    }
 }
 
 /// PHASE B (`OWED_ACTOR_READ` with the D1 judge on; the D2-ACTOR-B lens's HIGH-3, option (a), Phase C's rule): the
@@ -1606,6 +2058,7 @@ pub async fn actor_then_d1(
         Ok(a) => a,
         Err(e) => {
             db.counters(vec![(COUNTERS[2].into(), 1)]).await;
+            note_actor_fault(identity, db.event_at_ms());
             db.log(&format!(
                 "[owed-actor] FAULT {identity}: {e}; Phase B hands the message back, its marks kept"
             ));
@@ -1639,8 +2092,15 @@ async fn compare(db: &impl JudgeDb, identity: &str, games: &[String], answer: &V
     let mut deltas = vec![(COUNTERS[0].to_string(), 1)];
     if !diffs.is_empty() {
         deltas.push((COUNTERS[1].to_string(), 1));
+        // MEDIUM-8: the line names the identity and the game (the cutover's STOP reads it).
+        let game = d1
+            .iter()
+            .chain(&actor)
+            .find(|r| r["outpoint"] == diffs[0].as_str())
+            .and_then(|r| r["gameId"].as_str())
+            .unwrap_or("?");
         db.log(&format!(
-            "[owed-actor] DIFF {identity}: {} of {} games, first {}",
+            "[owed-actor] DIFF {identity} game {game}: {} outpoints of {} games, first {}",
             diffs.len(),
             games.len(),
             diffs[0]
@@ -1649,26 +2109,10 @@ async fn compare(db: &impl JudgeDb, identity: &str, games: &[String], answer: &V
     db.counters(deltas).await;
 }
 
-/// The fleet's reconcile diffs (`owed_actor_reconcile_diffs_total`), served as `/health.owedActor.reconcileDiffs`:
-/// the reconcile runs on the belt's alarm, in its own isolate, so this isolate's bar would read 0.
-pub async fn durable_reconcile_diffs(db: &impl SqlPort) -> Option<u64> {
-    db.run_batch(vec![Stmt::new(
-        "SELECT value FROM ops_counters WHERE name=?1",
-        vec![Bind::Text(COUNTERS[7].into())],
-    )])
-    .await
-    .ok()?
-    .into_iter()
-    .next()?
-    .rows
-    .first()
-    .map_or(Some(0), |r| r["value"].as_u64())
-}
-
 /// The bars of one answer, in this isolate: the apply's time, and (an answer naming its event's write time) the rows'
 /// visibility after the write and, for a `mined` word's event, the collect-after-mined bar.
 pub fn note_answer(answer: &Value) {
-    BARS.with(|b| note_answer_into(&mut b.borrow_mut(), answer));
+    note_answer_as("queue", answer);
 }
 pub fn note_answer_into(bars: &mut Bars, answer: &Value) {
     if let Some(ms) = answer["applyMs"].as_u64() {
@@ -1707,10 +2151,14 @@ pub async fn as_the_judge(
             .max()
             .unwrap_or(0)
     });
-    let answer = db
-        .actor_deliver(&id, games)
-        .await?
-        .ok_or("the D1 judge is off and no owed actor is bound")?;
+    let answer = match db.actor_deliver(&id, games).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return Err("the D1 judge is off and no owed actor is bound".into()),
+        Err(e) => {
+            note_actor_fault(&id, db.event_at_ms());
+            return Err(e);
+        }
+    };
     note_answer(&answer);
     let applied: Vec<String> = answer["appliedGames"]
         .as_array()
@@ -1743,6 +2191,200 @@ pub async fn as_the_judge(
         rows: answer["rows"].as_array().map_or(0, Vec::len),
         ..Default::default()
     })
+}
+
+/// THE `owed-v3` RE-JUDGE (the D2-ACTOR-B lens's MEDIUM-9; `CUTOVER-D2-ACTOR-2026-10-28.md` section 4, Phase C's
+/// rollback): with the D1 judge back on, every identity's `owed_rows` re-judged by the D1 judge from D1's OWN
+/// evidence (never a copy of the actors' rows: the evidence is the record), resumable, bounded a call, then stamped
+/// `owed-v3` in `view_derivation_state`. The identities are the reconcile's union (`owed_state`, the party, hop
+/// marker and released evidence identities, [`RECONCILE_NEXT_SQL`]), each identity's games by game id past the open
+/// one ([`crate::owed_judge::IDENTITY_GAMES_BY_ID_SQL`]), 16 a judge call (`judge_subjects`, which acknowledges the
+/// marks it judged). Its state is one row of the belt's ledger (`rollback:owed-v3`: the last identity done and the
+/// open one with its last game). Counted `owed_v3_identities_total`, `owed_v3_rows_total`.
+pub const OWED_V3_STAMP: &str = "owed-v3";
+pub const OWED_V3_STATE: &str = "rollback:owed-v3";
+pub const OWED_V3_STAMP_SQL: &str =
+    "SELECT 1 AS stamped FROM view_derivation_state WHERE name='owed-v3'";
+pub const OWED_V3_STATE_SQL: &str =
+    "SELECT cursor FROM owed_belt_state WHERE name='rollback:owed-v3'";
+pub const OWED_V3_STAMP_WRITE_SQL: &str =
+    "INSERT OR IGNORE INTO view_derivation_state(name) VALUES ('owed-v3')";
+/// The lever's `{"restart": true}`: the stamp and the state cleared by the lever itself, never by hand.
+pub const OWED_V3_RESTART_SQL: [&str; 2] = [
+    "DELETE FROM view_derivation_state WHERE name='owed-v3'",
+    "DELETE FROM owed_belt_state WHERE name='rollback:owed-v3'",
+];
+/// The games one lever call judges, at most.
+pub const OWED_V3_GAMES_PER_CALL: usize = 256;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct V3Report {
+    pub stamped: bool,
+    pub identities: usize,
+    pub games: usize,
+    pub rows: usize,
+    /// The state after this call: the last identity done and the open one.
+    pub after: String,
+    pub open: Option<(String, String)>,
+}
+
+/// One bounded call of the `owed-v3` re-judge (`games_budget` the games it may judge).
+pub async fn owed_v3_pass(
+    db: &impl JudgeDb,
+    now: i64,
+    games_budget: usize,
+) -> Result<V3Report, String> {
+    let first = |out: Vec<StmtOut>| out.into_iter().next().map(|o| o.rows).unwrap_or_default();
+    let mut report = V3Report::default();
+    let held = db
+        .run_batch(vec![
+            Stmt::new(OWED_V3_STAMP_SQL, vec![]),
+            Stmt::new(OWED_V3_STATE_SQL, vec![]),
+        ])
+        .await?;
+    if held.first().is_some_and(|o| !o.rows.is_empty()) {
+        report.stamped = true;
+        return Ok(report);
+    }
+    let state: Value = held
+        .get(1)
+        .and_then(|o| o.rows.first())
+        .and_then(|r| r["cursor"].as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| json!({}));
+    report.after = state["after"].as_str().unwrap_or_default().to_string();
+    report.open = state["open"].as_array().and_then(|a| {
+        Some((
+            a.first()?.as_str()?.to_string(),
+            a.get(1)?.as_str()?.to_string(),
+        ))
+    });
+    let save = |r: &V3Report| {
+        Stmt::new(
+            crate::owed_belt::STATE_SQL,
+            vec![
+                Bind::Text(OWED_V3_STATE.into()),
+                Bind::Text(
+                    json!({"after": r.after, "open": r.open.as_ref().map(|(i, g)| json!([i, g]))})
+                        .to_string(),
+                ),
+                Bind::Int(now),
+            ],
+        )
+    };
+    while report.games < games_budget {
+        let Some((identity, last)) = report.open.clone() else {
+            let next = first(
+                db.run_batch(vec![Stmt::new(
+                    RECONCILE_NEXT_SQL,
+                    vec![Bind::Text(report.after.clone())],
+                )])
+                .await?,
+            );
+            match next.first().and_then(|r| r["identity"].as_str()) {
+                Some(id) => report.open = Some((id.to_string(), String::new())),
+                None => {
+                    db.run_batch(vec![
+                        save(&report),
+                        Stmt::new(OWED_V3_STAMP_WRITE_SQL, vec![]),
+                    ])
+                    .await?;
+                    report.stamped = true;
+                    break;
+                }
+            }
+            continue;
+        };
+        let page = (games_budget - report.games)
+            .min(crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION);
+        let games: Vec<String> = first(
+            db.run_batch(vec![Stmt::new(
+                crate::owed_judge::IDENTITY_GAMES_BY_ID_SQL,
+                vec![
+                    Bind::Text(identity.clone()),
+                    Bind::Text(last),
+                    Bind::Int(page as i64),
+                ],
+            )])
+            .await?,
+        )
+        .iter()
+        .filter_map(|r| r["gameId"].as_str().map(str::to_string))
+        .collect();
+        if games.is_empty() {
+            report.identities += 1;
+            report.after = identity;
+            report.open = None;
+            db.run_batch(vec![save(&report)]).await?;
+            continue;
+        }
+        let judged = crate::owed_judge::judge_subjects(db, &identity, &games, "owed-v3").await?;
+        report.games += games.len();
+        report.rows += judged.rows;
+        report.open = Some((identity, games.last().cloned().unwrap_or_default()));
+        db.run_batch(vec![save(&report)]).await?;
+    }
+    db.counters(vec![
+        (COUNTERS[14].into(), report.identities as u64),
+        (COUNTERS[15].into(), report.rows as u64),
+    ])
+    .await;
+    Ok(report)
+}
+
+/// `POST /internal/owed-v3-pass` (bearer `INTERNAL_TOKEN`), body empty, `{}` or `{"restart": true}`: one bounded call
+/// of [`owed_v3_pass`], answered with its report. Refused (409) while `OWED_D1_JUDGE` is off: the rollback turns the
+/// D1 judge back on FIRST (the render), then calls this until `stamped`, then flips the read back.
+pub async fn owed_v3_lever(
+    mut req: worker::Request,
+    env: &worker::Env,
+) -> worker::Result<worker::Response> {
+    if !crate::internal_events::internal_bearer_ok(&req, env) {
+        return worker::Response::error("unauthorized", 401);
+    }
+    if !d1_judge_on(env.var(D1_JUDGE_FLAG).ok().map(|v| v.to_string())) {
+        return worker::Response::error(
+            "the D1 judge is off (OWED_D1_JUDGE=false): turn it on before the owed-v3 re-judge",
+            409,
+        );
+    }
+    let text = req.text().await.unwrap_or_default();
+    let body: Value = if text.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str(&text) {
+            Ok(b @ Value::Object(_)) => b,
+            _ => {
+                return worker::Response::error("the body is empty, {} or {\"restart\": true}", 400)
+            }
+        }
+    };
+    let db = crate::routes::D1Sql::of(env)?;
+    if body["restart"] == true {
+        db.run_batch(
+            OWED_V3_RESTART_SQL
+                .iter()
+                .map(|s| Stmt::new(*s, vec![]))
+                .collect(),
+        )
+        .await
+        .map_err(worker::Error::RustError)?;
+    }
+    let tip = crate::owed_events::tip_memoised(env, false).await;
+    let judge =
+        crate::owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))?;
+    let now = worker::Date::now().as_millis() as i64;
+    match owed_v3_pass(&judge, now, OWED_V3_GAMES_PER_CALL).await {
+        Ok(r) => worker::Response::from_json(&json!({
+            "stamped": r.stamped,
+            "identities": r.identities,
+            "games": r.games,
+            "rows": r.rows,
+            "after": r.after,
+            "open": r.open.map(|(i, g)| json!({"identity": i, "game": g})),
+        })),
+        Err(e) => worker::Response::error(format!("owed-v3: {e}"), 503),
+    }
 }
 
 /// The word columns of a joined read row (`owed_read::ROWS_SQL`): the read takes them from D1's `tx_words`, never

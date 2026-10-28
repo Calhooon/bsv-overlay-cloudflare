@@ -378,9 +378,17 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
 pub async fn queue(
     batch: worker::MessageBatch<serde_json::Value>,
     env: Env,
-    _ctx: Context,
+    ctx: Context,
 ) -> Result<()> {
     let out = owed_events::queue(batch, env.clone()).await;
+    // bsv-low #912 (the D2-ACTOR-B lens's MEDIUM-6): Phase A's actor applies, after the batch's acks, off the serial
+    // consumer's critical path; then this isolate's actor bars (MEDIUM-7).
+    let deferred = owed_actor::take_deferred();
+    if !deferred.is_empty() {
+        ctx.wait_until(owed_actor::run_deferred(env.clone(), deferred));
+    } else if let Ok(db) = routes::D1Sql::of(&env) {
+        owed_actor::flush_bars(&db, worker::Date::now().as_millis(), false).await;
+    }
     // bsv-low #635: the consumer's statements are in the cost window; written when due.
     if let (Some(window), Ok(db)) = (
         d1_ledger::take_cost_if_due(worker::Date::now().as_millis() as f64),
@@ -519,6 +527,14 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
     if req.method() == worker::Method::Post && req.path() == "/internal/owed-actor-reset" {
         return owed_actor::object::reset_lever(req, &env).await;
+    }
+    // bsv-low #912 (the D2-ACTOR-B lens's MEDIUM-1 and MEDIUM-9): the Phase A bootstrap of every identity D1 knows,
+    // and Phase C's rollback re-judge.
+    if req.method() == worker::Method::Post && req.path() == "/internal/owed-actor-bootstrap" {
+        return owed_actor::object::bootstrap_lever(req, &env).await;
+    }
+    if req.method() == worker::Method::Post && req.path() == "/internal/owed-v3-pass" {
+        return owed_actor::owed_v3_lever(req, &env).await;
     }
     if req.method() == worker::Method::Post && req.path() == "/internal/owed-belt-tick" {
         let resp = owed_belt::lever(req, &env).await;
