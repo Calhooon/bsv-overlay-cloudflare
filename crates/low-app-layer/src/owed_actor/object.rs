@@ -237,6 +237,10 @@ pub struct ApplyBody {
     /// A `word` event whose word is `mined`: its judgement is the collect-after-mined bar's sample.
     #[serde(default)]
     pub mined: bool,
+    /// D2-ACTOR-D (bsv-low #952): the consumer's acknowledgement bound (the marks' greatest generation it read before
+    /// this call): every game covered at or past it is a DUPE, answered from the seq check without an apply.
+    #[serde(default)]
+    pub bound: Option<i64>,
 }
 
 #[durable_object]
@@ -416,6 +420,7 @@ impl DurableObject for OwedActor {
                         tip,
                         txfacts: Vec::new(),
                         mined: false,
+                        bound: None,
                     };
                     async move {
                         self.apply_route(body)
@@ -754,6 +759,7 @@ impl OwedActor {
             mined: body.mined,
             tip: body.tip,
             held_at_ms: started,
+            bound: body.bound,
         };
         // D2-ACTOR-B-FOLD-7: an actor without `bootstrapped` holds the event and arms its bootstrap (never a closure
         // over a mirror the bootstrap has not filled); a bootstrapped one whose closure meets its bound re-arms.
@@ -792,10 +798,25 @@ impl OwedActor {
             Err(e) => return Response::error(format!("owed actor apply: {e}"), 503),
         };
         let now = Date::now().as_millis();
+        if report.skipped {
+            // D2-ACTOR-D: a covered DUPE: nothing applied, nothing sampled, no push, no copy; the rows as they stand
+            // (the consumer's sampled compare) and the last judgement's time.
+            let dupe = &report;
+            let mut answer = answer_of(dupe, self.rows_of(&local, &me));
+            answer["identity"] = json!(me);
+            answer["judgedAtMs"] = json!(self
+                .meta(META_JUDGED_AT)
+                .and_then(|v| v.parse::<u64>().ok()));
+            answer["atMs"] = json!(body.at_ms);
+            answer["mined"] = json!(body.mined);
+            answer["applyMs"] = json!(now.saturating_sub(started));
+            answer["ackSeq"] = json!(self.meta(META_ACK));
+            return Response::from_json(&answer);
+        }
         {
             let mut bars = self.bars.borrow_mut();
             bars.apply.note(now.saturating_sub(started));
-            if let Some(at) = body.at_ms {
+            if let (true, Some(at)) = (report.first_apply, body.at_ms) {
                 bars.visible.note(now.saturating_sub(at));
                 if body.mined {
                     bars.collect_after_mined.note(now.saturating_sub(at));
@@ -1173,67 +1194,9 @@ pub async fn read_kv_copy(env: &Env, identity: &str) -> Option<Value> {
 /// The read's wall on the actor (the KV copy past it).
 pub const READ_WALL_MS: u64 = 1_500;
 
-/// THE AMENDED BAR (item 4): after a writer's own durable answer, its filings' identities' actors are called
-/// directly (bounded, `wait_until`); the queue message stands as the durable backstop. Counted
-/// `owed_actor_direct_calls_total` and `owed_actor_direct_faults_total`; the rows' visibility is measured from
-/// `at_ms`, the write.
-pub fn schedule_direct(
-    ctx: &RouteContext<crate::auth::AuthState>,
-    filings: Vec<crate::record_post::VerifiedRecord>,
-    at_ms: u64,
-) {
-    let Some(wait) = &ctx.data.wait else { return };
-    if ctx.env.durable_object(BINDING).is_err() {
-        return;
-    }
-    let env = ctx.env.clone();
-    wait.wait_until(async move {
-        let Ok(db) = crate::routes::D1Sql::of(&env) else {
-            return;
-        };
-        let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for f in &filings {
-            if let Ok(subjects) = crate::record_post::owed_write::subjects(&db, f).await {
-                for s in subjects {
-                    by.entry(s.identity).or_default().push(s.game_id);
-                }
-            }
-        }
-        let tip = crate::owed_events::tip_memoised(&env, false).await;
-        let (mut calls, mut faults) = (0u64, 0u64);
-        for (identity, games) in by {
-            let e = EventCtx {
-                kind: "direct".into(),
-                seq: 0,
-                at_ms: at_ms as i64,
-                mined: false,
-            };
-            // LOW-7: an apply takes at most `GAMES_PER_APPLY` games; a bigger batch is split here.
-            for chunk in games.chunks(GAMES_PER_APPLY) {
-                let mut body = apply_body(&identity, chunk, &e, tip);
-                body["seq"] = Value::Null;
-                calls += 1;
-                match call_apply(&env, &body, DIRECT_CALL_WALL_MS).await {
-                    // D2-ACTOR-B-FOLD-7: a held answer is neither a fault nor a sample (the actor counts it).
-                    Ok(answer) if is_held(&answer) => {}
-                    Ok(answer) => note_answer_as("direct", &answer),
-                    Err(e) => {
-                        faults += 1;
-                        console_log!("[owed-actor] direct call {identity}: {e}");
-                    }
-                }
-            }
-        }
-        db.counters(vec![
-            (COUNTERS[3].into(), calls),
-            (COUNTERS[4].into(), faults),
-        ])
-        .await;
-        // MEDIUM-7: the direct class's samples into the fleet's durable bars.
-        flush_bars(&db, Date::now().as_millis(), false).await;
-    });
-}
-
+/// THE AMENDED BAR (item 4; D2-ACTOR-D, bsv-low #952): after a writer's own durable answer the identities' actors are
+/// called directly; the ONE site is `owed_events::schedule_direct` over the invocation's published events (every
+/// owed frame's publisher, the record door's and the handfile batch's included), the queue message the backstop.
 /// The answer of Phase B's read.
 #[derive(Debug)]
 pub(crate) enum ActorRead {

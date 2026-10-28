@@ -530,7 +530,18 @@ impl JudgeDb for WithActor {
         identity: &str,
         games: &[String],
     ) -> Result<Option<Value>, String> {
-        self.actor_call(identity, games, self.event).await
+        self.actor_call(identity, games, self.event, None).await
+    }
+    async fn actor_deliver_bounded(
+        &self,
+        identity: &str,
+        games: &[String],
+        bound: Option<i64>,
+    ) -> Result<Option<Value>, String> {
+        self.actor_call(identity, games, self.event, bound).await
+    }
+    fn event_seq(&self) -> Option<i64> {
+        self.event.map(|(_, s)| s)
     }
     /// As the object's `/apply`: the apply in its turn, Phase C's asks published inside it.
     async fn actor_apply(
@@ -539,7 +550,7 @@ impl JudgeDb for WithActor {
         games: &[String],
         _kind: &str,
     ) -> Result<Option<Value>, String> {
-        self.actor_call(identity, games, None).await
+        self.actor_call(identity, games, None, None).await
     }
     async fn actor_rows(&self, identity: &str) -> Result<Option<Vec<Value>>, String> {
         let rows = self
@@ -558,6 +569,7 @@ impl WithActor {
         identity: &str,
         games: &[String],
         event: Option<(&'static str, i64)>,
+        bound: Option<i64>,
     ) -> Result<Option<Value>, String> {
         if self.actor_fails.get() {
             return Err("owed actor: unreachable (pin)".into());
@@ -567,7 +579,7 @@ impl WithActor {
             self.d1.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
         }
         let turn = futures_util::lock::Mutex::new(());
-        let (report, _) = apply_and_publish_in_turn(
+        let (report, _) = apply_event_in_turn(
             &turn,
             &self.d1,
             &self.actor,
@@ -578,6 +590,7 @@ impl WithActor {
             Some(TIP),
             None,
             !self.d1_judges,
+            bound,
         )
         .await?;
         // NEW-H1's pin: a downgrade written while the actor applied (after its record read, before the D1 judge).
@@ -1961,7 +1974,7 @@ async fn d2_actor_b_fold2_m6_phase_a_applies_the_actor_off_the_consumer() {
     let before = w.d1.counter(COUNTERS[0]);
     // after the batch: the event's own apply (a fresh seq here: the warm delivery applied seq 9) and its compare
     let answer = w
-        .actor_call(&id, &games, Some(("pot", 10)))
+        .actor_call(&id, &games, Some(("pot", 10)), None)
         .await
         .unwrap()
         .unwrap();
@@ -1984,7 +1997,7 @@ async fn d2_actor_b_fold2_m6_phase_a_applies_the_actor_off_the_consumer() {
             .await
             .unwrap();
         let a = w
-            .actor_call(&id, &games, Some(("pot", 100 + n)))
+            .actor_call(&id, &games, Some(("pot", 100 + n)), None)
             .await
             .unwrap()
             .unwrap();
@@ -3710,6 +3723,7 @@ fn fold7_event(kind: &str, seq: i64, games: &[String], at_ms: u64) -> HeldEvent 
         mined: false,
         tip: Some(TIP),
         held_at_ms: at_ms,
+        bound: None,
     }
 }
 
@@ -4952,6 +4966,9 @@ async fn d2_actor_b_fold8_j_phase_a_counts_a_mark_between_the_judges_apart() {
         event: Some(("pot", 8)),
         ..w
     };
+    // D2-ACTOR-D (bsv-low #952): every delivery carries its own event's mark (a delivery with none is covered by the
+    // last apply: a dupe the actor answers from its seq check); seq 8 is one of the compare's one-in-eight.
+    d_mark(&w, &games[0], "fold8-j-8");
     FOLD8_J_BETWEEN.with(|c| c.set(true));
     crate::owed_events::deliver(&w, "owner", &games)
         .await
@@ -4982,9 +4999,10 @@ async fn d2_actor_b_fold8_j_phase_a_counts_a_mark_between_the_judges_apart() {
     );
     // The next delivery judges the mark in both: no DIFF of either class.
     let w = WithActor {
-        event: Some(("pot", 9)),
+        event: Some(("pot", 16)),
         ..w
     };
+    d_mark(&w, &games[0], "fold8-j-16");
     crate::owed_events::deliver(&w, "owner", &games)
         .await
         .unwrap();
@@ -4993,8 +5011,9 @@ async fn d2_actor_b_fold8_j_phase_a_counts_a_mark_between_the_judges_apart() {
     // The deferred path carries the same bound (wasm32: `D1Judge::defer_actor`).
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     let events = squash(include_str!("../owed_events.rs"));
-    assert!(events.contains(&squash("let bound = owed_judge::marks_bound(db, identity, games).await.ok(); let report = owed_judge::judge_subjects(db, identity, games, \"owed-events\").await?;")));
-    assert!(events.contains(&squash("if !db.defer_actor(identity, games, bound) { crate::owed_actor::beside(db, identity, games, bound).await; }")));
+    // D2-ACTOR-D (bsv-low #952): the bound also bounds the D1 judge's acknowledgement and names the actor's seq check.
+    assert!(events.contains(&squash("let bound = owed_judge::marks_bound(db, identity, games).await?; let report = owed_judge::judge_subjects_acked_to(db, identity, games, \"owed-events\", bound).await?;")));
+    assert!(events.contains(&squash("if !db.defer_actor(identity, games, Some(bound)) { crate::owed_actor::beside(db, identity, games, Some(bound)).await; }")));
     let actor = squash(include_str!("../owed_actor.rs"));
     assert!(actor.contains(&squash(
         "beside(&judge, &d.identity, &d.games, d.bound).await;"
@@ -5037,4 +5056,466 @@ fn d2_actor_b_fold8_k_the_diff_lines_name_what_differs() {
     );
     assert!(src.contains("actorbootstrappedatthecompare:{};{}"));
     assert!(src.contains("diff_detail(&a,&b,&differ)"));
+}
+
+// ---- D2-ACTOR-D (bsv-low #952): every owed frame's publisher calls the actor directly; a visible sample once per
+// event at its first apply; the consumer's per-event cost ----
+
+/// One event's write in the record: a mark of `game` under `(source, key)` (the trigger's own row shape).
+fn d_mark(w: &WithActor, game: &str, key: &str) {
+    w.d1.conn
+        .execute(
+            "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner',?1,'pot',?2,1) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=(SELECT COALESCE(MAX(generation),0)+1 FROM owed_dirty)",
+            [game, key],
+        )
+        .unwrap();
+}
+fn d_marks(w: &WithActor) -> i64 {
+    new_h1_marks(w)
+}
+/// An answer as the object stamps it (its event's write time and its judgement's), noted through the SHIPPED rule.
+fn d_note(bars: &mut PendingBars, class: &'static str, answer: &Value) {
+    let mut a = answer.clone();
+    a["atMs"] = json!(1_000);
+    a["judgedAtMs"] = json!(1_300);
+    a["applyMs"] = json!(40);
+    bars.note_answer(class, &a);
+}
+
+/// d_b (bsv-low #952): A DUPE APPLY SAMPLES NOTHING AND AN APPLIED ONE SAMPLES ONCE. The writer's direct call applies
+/// the event (its first apply: one `direct` visibility sample); the queue's delivery of the SAME event names its
+/// acknowledgement bound and is covered: a dupe (`applied: false`, no apply, no sample), and the consumer's Phase B
+/// delivery acknowledges its marks; a redelivery after a newer mark applies again (an apply sample) but is not the
+/// event's first apply (no second visibility sample). The fleet's bars: `rowsVisibleMsP95` the first visibility over
+/// both classes, `backstopLagMsP95` the queue's own, its bar named. New API (`apply_event_in_turn`'s bound, the answer's
+/// `applied`/`firstApply`, `backstopLagMsP95`): does not compile on `046b721e`; RED against `samples_visible`
+/// answering `true` (the base's rule: every answer sampled): `left: 2 right: 1`.
+#[tokio::test]
+async fn d2_actor_d_b_a_dupe_samples_nothing_and_an_applied_event_samples_once() {
+    let w = WithActor {
+        d1: d1_judge(&stranded()).await,
+        actor: mirror(),
+        d1_judges: true,
+        event: Some(("pot", 41)),
+        actor_reads: true,
+        actor_fails: Cell::new(false),
+    };
+    let games = games_of(&w.d1, "owner");
+    d_mark(&w, &games[0], "d-b");
+    let mut bars = PendingBars::default();
+    // the writer's direct call: no bound, always applied, the event's first apply
+    let direct = w
+        .actor_call("owner", &games, w.event, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (&direct["applied"], &direct["firstApply"]),
+        (&json!(true), &json!(true))
+    );
+    d_note(&mut bars, "direct", &direct);
+    // the queue's delivery of the same event names its bound: covered, a dupe
+    let bound = crate::owed_judge::marks_bound(&w.d1, "owner", &games)
+        .await
+        .unwrap();
+    assert!(bound > 0, "the event's mark stands");
+    let dupe = w
+        .actor_call("owner", &games, w.event, Some(bound))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dupe["applied"], json!(false), "a dupe applied nothing");
+    assert_eq!(
+        dupe["rounds"],
+        json!(0),
+        "answered from the seq check, no closure"
+    );
+    d_note(&mut bars, "queue", &dupe);
+    // the consumer's Phase B delivery (the shipped `deliver`): the dupe acknowledges the event's marks
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    assert_eq!(d_marks(&w), 0, "the covered marks acknowledged");
+    // a newer mark, then a redelivery of the same event: applied again, never its first apply
+    w.d1.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
+    let bound = crate::owed_judge::marks_bound(&w.d1, "owner", &games)
+        .await
+        .unwrap();
+    let again = w
+        .actor_call("owner", &games, w.event, Some(bound))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (&again["applied"], &again["firstApply"]),
+        (&json!(true), &json!(false))
+    );
+    d_note(&mut bars, "queue", &again);
+    let visible: usize = bars.visible.values().map(Vec::len).sum();
+    assert_eq!(
+        visible, 1,
+        "one visibility sample for the event: {:?}",
+        bars.visible
+    );
+    assert_eq!(bars.visible.get("direct").map(Vec::len), Some(1));
+    assert_eq!(
+        bars.apply.get("queue").map(Vec::len),
+        Some(1),
+        "the redelivery's apply is sampled, the dupe's is not"
+    );
+    // the fleet's bars: the first visibility over both classes, the backstop's lag apart, its bar named
+    let rows = vec![
+        json!({"name": bars_state_name("direct"), "cursor": json!({"libRev": "d", "visible": [300, 900]}).to_string(), "tickedAtMs": 1}),
+        json!({"name": bars_state_name("queue"), "cursor": json!({"libRev": "d", "visible": []}).to_string(), "tickedAtMs": 1}),
+    ];
+    let fleet = fleet_bars(&rows, 2_000, "d");
+    assert!(
+        fleet["rowsVisibleMsP95"].as_u64().is_some(),
+        "the first visibility is the direct class's too: {fleet}"
+    );
+    assert_eq!(fleet["rowsVisibleMsMax"], json!(900));
+    assert!(fleet["rowsVisibleDirectMsP95"].as_u64().is_some());
+    assert_eq!(
+        fleet["backstopLagMsP95"],
+        Value::Null,
+        "no queue first apply"
+    );
+    assert_eq!(fleet["backstopLagBarMs"], json!(BACKSTOP_LAG_BAR_MS));
+    assert_eq!(BACKSTOP_LAG_BAR_MS, 60_000);
+}
+
+/// A direct port over fakes: the identity is the event's key; `ok*` answers an applied first apply, `wall*` meets the
+/// wall (`call_apply`'s words), any other answers a fault.
+struct FakeDirect(RefCell<Vec<Value>>);
+impl crate::owed_events::DirectPort for FakeDirect {
+    async fn subjects(
+        &self,
+        ev: &overlay_discovery::owed_event::OwedEvent,
+    ) -> Result<Vec<(String, Vec<String>)>, String> {
+        Ok(vec![(ev.source_key.clone(), vec!["g".into()])])
+    }
+    async fn call(&self, body: Value) -> Result<Value, String> {
+        self.0.borrow_mut().push(body.clone());
+        let id = body["identity"].as_str().unwrap_or_default().to_string();
+        if id.starts_with("ok") {
+            Ok(
+                json!({"applied": true, "firstApply": true, "atMs": body["atMs"], "judgedAtMs": 2, "applyMs": 1}),
+            )
+        } else if id.starts_with("wall") {
+            Err(format!(
+                "owed actor: no answer in {} ms",
+                crate::owed_actor::DIRECT_CALL_WALL_MS
+            ))
+        } else {
+            Err("owed actor answered 503: owed actor apply: D1 overloaded".into())
+        }
+    }
+}
+fn d_event(
+    source: &str,
+    key: &str,
+    seq: i64,
+    facts: Value,
+) -> overlay_discovery::owed_event::OwedEvent {
+    overlay_discovery::owed_event::OwedEvent {
+        v: overlay_discovery::owed_event::OWED_EVENT_V,
+        seq,
+        source: source.into(),
+        source_key: key.into(),
+        facts,
+        at_ms: 1_000 + seq,
+    }
+}
+
+/// d_c (bsv-low #952): THE DIRECT SITE'S WALL IS COUNTED AND NEVER FAILS THE WRITE. One direct pass over five
+/// published events: three identities (one applies, one meets the wall, one faults), a `word` event carrying its frame
+/// and a `txfacts` event (both the queue's alone): every call carries its event's kind, seq and write time (the queue
+/// delivery's key), the wall and the fault are counted apart, and the pass returns (no error reaches the writer). The
+/// sites: the writers publish, then schedule the pass after their answer (`wait_until`), the overlay hands its set to
+/// `POST /internal/owed-direct` from its flush points, and the publish holds what it sent. New API: does not compile on
+/// `046b721e` (no direct pass; the record door's own call carried `seq: null`); RED against `is_wall` answering false:
+/// `left: (0, 2) right: (1, 1)`.
+#[tokio::test]
+async fn d2_actor_d_c_the_direct_sites_wall_is_counted_and_never_fails_the_write() {
+    let port = FakeDirect(RefCell::default());
+    let events = vec![
+        d_event("pot", "ok-a", 11, Value::Null),
+        d_event("pot", "wall-b", 12, Value::Null),
+        d_event("pot", "fault-c", 13, Value::Null),
+        d_event(
+            "word",
+            "w",
+            14,
+            json!({"frame": {"txid": "ab", "kind": "seen"}}),
+        ),
+        d_event("txfacts", "t", 15, json!({})),
+    ];
+    let report = crate::owed_events::direct_with(&port, events, Some(TIP)).await;
+    assert_eq!(
+        (report.walls, report.faults),
+        (1, 1),
+        "the wall and the fault counted apart: {report:?}"
+    );
+    assert_eq!(
+        (report.events, report.calls, report.left_to_queue),
+        (3, 3, 2)
+    );
+    let calls = port.0.borrow();
+    assert_eq!(calls[0]["kind"], json!("pot"));
+    assert_eq!(
+        calls[0]["seq"],
+        json!(11),
+        "the queue delivery's key: never seq null"
+    );
+    assert_eq!(calls[0]["atMs"], json!(1_011));
+    assert!(
+        calls.iter().all(|c| c["bound"].is_null()),
+        "a direct call always applies"
+    );
+    // the sites: never awaited by a write's answer
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let events_src = squash(include_str!("../owed_events.rs"));
+    let sched = &events_src[events_src.find("pubfnschedule_direct(").unwrap()..];
+    let sched = &sched[..sched.find("pubconstDIRECT_BODY_MAX").unwrap()];
+    assert!(sched.contains("ctx.wait_until(asyncmove{direct_events(&env,events).await;});"));
+    let door = squash(include_str!("../record_post.rs"));
+    let at = door
+        .find("latency::note_enqueue(crate::owed_events::publish_noted(&ctx.env).await);")
+        .unwrap();
+    assert!(door[at..at + 700].contains("crate::owed_events::schedule_direct(&ctx.env,wait);"));
+    let route = &events_src[events_src.find("pubasyncfndirect_route(").unwrap()..];
+    assert!(route.contains("ctx.wait_until(asyncmove{direct_events(&env,events).await;});"));
+    assert!(
+        route.contains("with_status(202)"),
+        "answered before any actor is called"
+    );
+    let publish = squash(include_str!(
+        "../../../overlay-cloudflare/src/owed_events.rs"
+    ));
+    let env_fn = &publish[publish.find("pubasyncfnpublish_env(").unwrap()..];
+    assert!(
+        env_fn.contains("hold_direct(&report.sent);"),
+        "the publish holds what it sent"
+    );
+    let pots = squash(include_str!(
+        "../../../overlay-cloudflare/src/pot_changes.rs"
+    ));
+    assert_eq!(
+        pots.matches("crate::change_flush::ship_owed_direct(&")
+            .count(),
+        3,
+        "the overlay's three flush points hand their set to the app layer"
+    );
+    let lib = squash(include_str!("../lib.rs"));
+    assert!(lib.contains("req.path()==\"/internal/owed-direct\"{returnowed_events::direct_route(req,&env,&ctx).await;}"));
+}
+
+/// d_e (bsv-low #952): AN OUT-OF-ORDER SEQ IS HELD AND FILLED. Phase C (the actor the judge). Two events of one game:
+/// seq 5's write, then seq 7's; seq 7's direct call lands first and covers both marks; seq 5's delivery arrives after,
+/// names its bound and is a dupe (no apply, no sample), its marks acknowledged with 7's; a third write whose direct
+/// call and queue message were both lost holds its mark (never acknowledged unjudged), and the un-acked mark sweep's
+/// re-publish (a new seq) fills it: applied, its marks acknowledged, the actor's rows the record's. New API: does not
+/// compile on `046b721e`; RED against `covered_at` answering false: seq 5's delivery applied (`applied: true`).
+#[tokio::test]
+async fn d2_actor_d_e_an_out_of_order_seq_is_held_and_filled() {
+    let mut w = WithActor {
+        d1: d1_judge(&stranded()).await,
+        actor: mirror(),
+        d1_judges: false,
+        event: Some(("pot", 5)),
+        actor_reads: true,
+        actor_fails: Cell::new(false),
+    };
+    let games = games_of(&w.d1, "owner");
+    let g0 = vec![games[0].clone()];
+    // the actor holds the identity (its bootstrap)
+    for chunk in games.chunks(GAMES_PER_APPLY) {
+        apply(
+            &w.d1,
+            &w.actor,
+            &Fakes,
+            "owner",
+            chunk,
+            None,
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    d_mark(&w, &g0[0], "k5");
+    d_mark(&w, &g0[0], "k7");
+    // seq 7's direct call first
+    let seven = w
+        .actor_call("owner", &g0, Some(("pot", 7)), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seven["applied"], json!(true));
+    // seq 5's delivery after it: the consumer's shipped Phase C delivery (bound read before the call)
+    let bound = crate::owed_judge::marks_bound(&w.d1, "owner", &g0)
+        .await
+        .unwrap();
+    let five = w
+        .actor_call("owner", &g0, Some(("pot", 5)), Some(bound))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        five["applied"],
+        json!(false),
+        "seq 5 is covered by seq 7's apply: {five}"
+    );
+    assert_eq!(
+        five["appliedGames"],
+        json!(g0),
+        "its covered games acknowledged"
+    );
+    crate::owed_events::deliver(&w, "owner", &g0).await.unwrap();
+    assert_eq!(d_marks(&w), 0, "both marks acknowledged");
+    // a lost event: its mark written, no direct call, no message
+    w.d1.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
+    let lost = d_marks(&w);
+    assert!(lost > 0, "the lost event's marks stand");
+    // the sweep re-publishes the un-acked pairs (a new seq each), the consumer routes them
+    let pairs = crate::owed_events::sweep(&w.d1, i64::MAX / 4)
+        .await
+        .unwrap();
+    assert!(!pairs.is_empty(), "the sweep finds the lost marks");
+    w.event = Some(("pot", 9));
+    for (source, key) in pairs {
+        let ev = d_event(&source, &key, 9, Value::Null);
+        crate::owed_events::route(&w, &ev).await.unwrap();
+    }
+    assert_eq!(d_marks(&w), 0, "filled: every mark judged and acknowledged");
+    // the actor's rows are the record's (a fresh actor over the same record)
+    let control = mirror();
+    for chunk in games.chunks(GAMES_PER_APPLY) {
+        apply(
+            &w.d1,
+            &control,
+            &Fakes,
+            "owner",
+            chunk,
+            None,
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(stored(&w.actor, "owner"), stored(&control, "owner"));
+}
+
+/// The concurrency knob (bsv-low #952, item 3): `OWED_CONSUMER_CONCURRENCY` in each render equals the consumer's
+/// `max_concurrency`, 1 in both environments today; a value past 1 is refused while the D1 judge writes.
+#[test]
+fn d2_actor_d_the_consumer_concurrency_knob_moves_with_the_config() {
+    use crate::owed_events::{consumer_concurrency_of, consumer_concurrency_refused};
+    assert_eq!(consumer_concurrency_of(None), 1);
+    assert_eq!(consumer_concurrency_of(Some("x")), 1);
+    assert_eq!(consumer_concurrency_of(Some("0")), 1);
+    assert_eq!(consumer_concurrency_of(Some(" 4 ")), 4);
+    assert!(consumer_concurrency_refused(2, true));
+    assert!(!consumer_concurrency_refused(2, false));
+    assert!(!consumer_concurrency_refused(1, true));
+    let render = include_str!("../../wrangler.toml");
+    let var_line = format!("{} = \"", crate::owed_events::CONSUMER_CONCURRENCY_VAR);
+    let vars: Vec<u32> = render
+        .lines()
+        .filter(|l| l.starts_with(&var_line))
+        .map(|l| consumer_concurrency_of(l.split('"').nth(1)))
+        .collect();
+    assert_eq!(vars, vec![1, 1], "prod and beta");
+    for (env, var) in ["", "env.beta."].iter().zip(vars) {
+        let head = format!("{env}queues.consumers]]");
+        let block = render
+            .split("[[")
+            .find(|b| {
+                b.starts_with(&head)
+                    && b.lines().nth(1).is_some_and(|l| {
+                        l.starts_with("queue = \"low-owed-events") && !l.contains("-dlq")
+                    })
+            })
+            .unwrap();
+        assert!(
+            block.contains(&format!("max_concurrency = {var}")),
+            "{env}: {block}"
+        );
+    }
+}
+
+/// d_d (bsv-low #952): the consumer's per-event wall on the frozen fixture (the fleet's whale, a chunk of 16 games),
+/// before and after, printed (the REPORT's number, not a pin). BEFORE: the base's delivery (the D1 judge, the actor's
+/// full apply of a fresh event, the compare on every event). AFTER: each event's write (a mark), the writer's direct
+/// call (off the consumer, not timed), then the consumer's Phase B delivery: the actor's seq check (a dupe), the D1
+/// judge acknowledging to the bound, the compare on one event in eight.
+#[tokio::test]
+async fn d2_actor_d_d_the_consumers_per_event_wall_before_and_after() {
+    let f = fixtures()
+        .into_iter()
+        .find(|f| f.name == "d1_fleet")
+        .unwrap();
+    let mut w = WithActor {
+        d1: d1_judge(&f).await,
+        actor: mirror(),
+        d1_judges: true,
+        event: None,
+        actor_reads: true,
+        actor_fails: Cell::new(false),
+    };
+    let id = f.identities[0].clone();
+    let every = games_of(&w.d1, &id);
+    let games: Vec<String> = every.iter().take(16).cloned().collect();
+    for chunk in every.chunks(GAMES_PER_APPLY) {
+        apply(&w.d1, &w.actor, &Fakes, &id, chunk, None, Some(TIP), None)
+            .await
+            .unwrap();
+    }
+    let mark = |w: &WithActor, n: i64| {
+        w.d1.conn
+            .execute(
+                "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,?2,'pot',?3,1)",
+                [id.as_str(), games[0].as_str(), &format!("d-d-{n}")],
+            )
+            .unwrap();
+    };
+    let (mut before, mut after) = (Meter::default(), Meter::default());
+    for n in 0..8i64 {
+        mark(&w, 1000 + n);
+        let t = std::time::Instant::now();
+        crate::owed_judge::judge_subjects(&w, &id, &games, "owed-events")
+            .await
+            .unwrap();
+        let a = w
+            .actor_call(&id, &games, Some(("pot", 1000 + n)), None)
+            .await
+            .unwrap()
+            .unwrap();
+        compare(&w, &id, &games, &a, None).await;
+        before.note(t.elapsed().as_millis() as u64);
+        let seq = 2001 + n;
+        mark(&w, seq);
+        w.actor_call(&id, &games, Some(("pot", seq)), None)
+            .await
+            .unwrap();
+        w.event = Some(("pot", seq));
+        let t = std::time::Instant::now();
+        crate::owed_events::deliver(&w, &id, &games).await.unwrap();
+        after.note(t.elapsed().as_millis() as u64);
+    }
+    eprintln!(
+        "d2_actor_d d consumer per-event wall ({} games of {}, {} build): before (D1 judge + actor apply + compare) p50 {:?} ms max {:?} ms; after (actor seq check, D1 judge, compare 1 in 8) p50 {:?} ms max {:?} ms",
+        games.len(),
+        every.len(),
+        if cfg!(debug_assertions) { "debug" } else { "release" },
+        before.quantile(0.5),
+        before.max(),
+        after.quantile(0.5),
+        after.max()
+    );
+    assert!(
+        after.quantile(0.5) < before.quantile(0.5),
+        "the consumer's per-event wall falls"
+    );
 }

@@ -228,6 +228,38 @@ pub fn forget(source: &str, key: &str) {
     });
 }
 
+/// D2-ACTOR-D (bsv-low #952; the design's bar 2 as amended 2026-10-27: "the writer calls the identity's actor
+/// directly after its answer, the queue is the durable backstop"): EVERY event a publish SENT is also held here, the
+/// invocation's DIRECT set, so the writer's flush point hands it to the identities' actors after (or beside) its
+/// answer: the app layer calls them itself (`owed_events::direct_events`), the overlay hands the set to the app layer
+/// (`POST /internal/owed-direct`, its `APP_LAYER` binding). The queue message stands either way (the backstop); a
+/// direct call that walls or faults is counted and never fails the write. A `txfacts` event judges nothing and is not
+/// held. At most [`DIRECT_HELD_MAX`] events (past it the queue alone carries the rest).
+pub const DIRECT_HELD_MAX: usize = 512;
+thread_local! {
+    static DIRECT: RefCell<Vec<OwedEvent>> = const { RefCell::new(Vec::new()) };
+}
+/// Hold the sent events for the invocation's direct call.
+pub fn hold_direct(sent: &[OwedEvent]) {
+    DIRECT.with(|d| {
+        let mut d = d.borrow_mut();
+        for e in sent.iter().filter(|e| e.source != owed_event::TXFACTS) {
+            if d.len() >= DIRECT_HELD_MAX {
+                break;
+            }
+            d.push(e.clone());
+        }
+    });
+}
+/// Take the held direct set.
+pub fn take_direct() -> Vec<OwedEvent> {
+    DIRECT.with(|d| std::mem::take(&mut *d.borrow_mut()))
+}
+/// No direct event is held.
+pub fn direct_is_empty() -> bool {
+    DIRECT.with(|d| d.borrow().is_empty())
+}
+
 /// No note is held.
 pub fn is_empty() -> bool {
     NOTES.with(|n| n.borrow().is_empty())
@@ -494,6 +526,8 @@ pub async fn publish_env(env: &worker::Env, frames: Vec<Value>) -> Vec<Value> {
         return Vec::new();
     }
     let report = publish_with(&port, notes).await;
+    // D2-ACTOR-D: what was sent is the invocation's direct set too (its flush point calls the actors).
+    hold_direct(&report.sent);
     let mut back = Vec::new();
     for n in &report.unsent {
         if n.source == "word" && n.held.is_some() {

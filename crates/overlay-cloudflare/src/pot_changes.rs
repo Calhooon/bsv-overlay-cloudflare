@@ -258,6 +258,8 @@ pub async fn flush_inline(env: Env) {
     // faulted rides the POST below, the belt)
     let tracker_events =
         crate::owed_events::publish_env(&env, crate::tracker_events::drain()).await;
+    // D2-ACTOR-D (bsv-low #952): the published events' actors, called by the app layer (the queue the backstop)
+    crate::change_flush::ship_owed_direct(&env).await;
     let changed = drain();
     // bsv-low #469 (2026-09-19): the hop-marker notes ride every flush the pot notes ride (one set of flush points)
     let hops = crate::hop_changes::drain();
@@ -350,6 +352,8 @@ pub async fn flush_inline_within(env: Env, started_ms: u64) {
             // bsv-low #911: the job's owed events and word frames to the queue first, inside its own window
             let tracker_events =
                 crate::owed_events::publish_env(&env, crate::tracker_events::drain()).await;
+            // D2-ACTOR-D (bsv-low #952): the published events' actors, called by the app layer
+            crate::change_flush::ship_owed_direct(&env).await;
             let changed = drain();
             let hops = crate::hop_changes::drain();
             // the words first (bsv-low #660 under #618, [`flush`]), in the one order
@@ -401,6 +405,7 @@ pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
         && hops.is_empty()
         && tracker_events.is_empty()
         && crate::owed_events::is_empty()
+        && crate::owed_events::direct_is_empty()
     {
         return;
     }
@@ -410,6 +415,9 @@ pub fn flush<F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>)
         // runs; a request's fetch end publishes before its answer, so this is the rest); a frame whose publish
         // faulted rides the POST, the belt
         let tracker_events = crate::owed_events::publish_env(&env2, tracker_events).await;
+        // D2-ACTOR-D (bsv-low #952): what this request (and this task) published, its actors called by the app layer
+        // after the answer (the queue the backstop)
+        crate::change_flush::ship_owed_direct(&env2).await;
         // one wall for the three sets, read when the task starts: the words first (bsv-low #660 under #618), then
         // the hop set (the owed list's hop rows), then the pot set
         let deadline_ms = Date::now().as_millis() + crate::change_flush::FLUSH_WALL_BUDGET_MS;

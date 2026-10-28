@@ -602,6 +602,20 @@ pub const APPLIED_SQL: &str = "INSERT INTO applied(kind,seq,game,atMs) SELECT ?1
 /// LOW-2 (the D2-ACTOR-B lens): the redelivery rows older than [`APPLIED_KEEP_MS`] go.
 pub const APPLIED_PRUNE_SQL: &str = "DELETE FROM applied WHERE atMs<?1";
 pub const APPLIED_KEEP_MS: i64 = 7 * 86_400_000;
+
+/// D2-ACTOR-D (bsv-low #952): THE COVERAGE of an apply. Every apply reads, BEFORE its closure reads the record, the
+/// greatest generation of the marks of its games ([`crate::owed_judge::marks_bound`]) and records it, once the
+/// fixpoint's commit landed, as one `applied` row a game under the kind [`COVERED_KIND`] (its `seq` that generation;
+/// no new table: the digest does not move). A mark of generation `g` at most that number was written before the read
+/// (generations are AUTOINCREMENT: a mark written after it takes a greater one), so its source change is in the
+/// record the apply judged. A delivery that names its acknowledgement bound (`bound`, the generation the consumer read
+/// before its call) over games each covered at or past it is a DUPE: answered from the seq check in milliseconds,
+/// nothing applied, nothing sampled ([`COVERED_SQL`]); the marks it acknowledges were judged by the covering apply.
+pub const COVERED_KIND: &str = "covered";
+/// How many of `?2` (a JSON array of games) an apply covered at or past the bound `?1`.
+pub const COVERED_SQL: &str = "SELECT COUNT(DISTINCT game) AS n FROM applied WHERE kind='covered' AND seq>=?1 AND game IN (SELECT value FROM json_each(?2))";
+/// How many of `?3`'s games the event `(?1, ?2)` already applied: none, its FIRST apply (the visibility sample's rule).
+pub const EVENT_APPLIED_SQL: &str = "SELECT COUNT(*) AS n FROM applied WHERE kind=?1 AND seq=?2 AND game IN (SELECT value FROM json_each(?3))";
 /// The version of the actor's own tables (`txfacts`, `applied`, `meta`) beside the mirror's generated digest: a move
 /// of either rebuilds the actor (HIGH-4, [`actor_digest`]).
 pub const ACTOR_TABLES_VERSION: &str = "applied-per-game-1";
@@ -695,6 +709,12 @@ pub struct ApplyReport {
     /// (b): a redelivery is applied again, never skipped as "applied by an earlier delivery": the skip acknowledged a
     /// mark newer than that delivery's apply, unjudged.
     pub applied_games: Vec<String>,
+    /// D2-ACTOR-D: a DUPE (every game covered at or past the delivery's bound, [`COVERED_SQL`]): nothing applied,
+    /// nothing sampled; `applied_games` names the covered games (Phase C acknowledges their marks).
+    pub skipped: bool,
+    /// D2-ACTOR-D: the event's FIRST apply at this actor (no `applied` row of its `(kind, seq)` for these games; an
+    /// event with no seq is its own). Only a first apply samples the rows' visibility: once per event.
+    pub first_apply: bool,
 }
 
 /// The decoded facts of a copied BEEF row: the pot's own (`pot`, `pot_beefs` only) and the stored order's.
@@ -889,6 +909,11 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
     let games = wanted;
     let mut report = ApplyReport::default();
     let seq = kind_seq.map_or(0, |(_, s)| s);
+    // D2-ACTOR-D: the coverage's generation, read BEFORE the closure reads the record (a fault reads no coverage:
+    // nothing is recorded, no later delivery is skipped on it).
+    let covered = crate::owed_judge::marks_bound(record, &me, &games)
+        .await
+        .ok();
     let held = Held::default();
     // The closure starts from what the mirror already names for these games (the last apply's domain): in the steady
     // state its first round finds no new key and its judgement stands.
@@ -970,6 +995,17 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
         push["rows"] = json!(report.rows);
     }
     let mut marks = Vec::new();
+    if let Some(cov) = covered {
+        marks.push(Stmt::new(
+            APPLIED_SQL,
+            vec![
+                Bind::Text(COVERED_KIND.into()),
+                Bind::Int(cov),
+                Bind::Int(local.now_ms() as i64),
+                Bind::Text(json!(games).to_string()),
+            ],
+        ));
+    }
     if let Some((kind, seq)) = kind_seq {
         marks.push(Stmt::new(
             APPLIED_SQL,
@@ -1082,7 +1118,66 @@ pub async fn commit_fixpoint<L: SqlPort>(
 /// The answer of one apply (the object's `/apply`, the pins' harness): the actor's rows, the redelivery verdict, the
 /// games the event has applied.
 pub fn answer_of(report: &ApplyReport, rows: Vec<Value>) -> Value {
-    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games})
+    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply})
+}
+
+/// D2-ACTOR-D: does this answer sample the rows' visibility? Only an APPLIED answer (never a covered dupe) of its
+/// event's FIRST apply: once per event, in the class of the path that applied it. An answer from an older build
+/// (neither field) samples, as before.
+pub fn samples_visible(answer: &Value) -> bool {
+    answer["applied"] != false && answer["firstApply"] != false
+}
+
+/// D2-ACTOR-D: the event's first apply at this actor? (`None` seq: its own event.)
+pub async fn first_apply_of<L: SqlPort>(
+    local: &L,
+    kind_seq: Option<(&str, i64)>,
+    games: &[String],
+) -> bool {
+    let Some((kind, seq)) = kind_seq else {
+        return true;
+    };
+    let games: Vec<String> = games.iter().map(|g| g.to_ascii_lowercase()).collect();
+    local
+        .run_batch(vec![Stmt::new(
+            EVENT_APPLIED_SQL,
+            vec![
+                Bind::Text(kind.into()),
+                Bind::Int(seq),
+                Bind::Text(json!(games).to_string()),
+            ],
+        )])
+        .await
+        .ok()
+        .and_then(|o| {
+            o.first()
+                .and_then(|o| o.rows.first())
+                .and_then(|r| r["n"].as_i64())
+        })
+        .is_none_or(|n| n == 0)
+}
+
+/// D2-ACTOR-D: is every game covered at or past `bound` ([`COVERED_SQL`])? A read that faults is never covered.
+pub async fn covered_at<L: SqlPort>(local: &L, games: &[String], bound: i64) -> bool {
+    let mut games: Vec<String> = games.iter().map(|g| g.to_ascii_lowercase()).collect();
+    games.sort();
+    games.dedup();
+    if games.is_empty() {
+        return false;
+    }
+    local
+        .run_batch(vec![Stmt::new(
+            COVERED_SQL,
+            vec![Bind::Int(bound), Bind::Text(json!(games).to_string())],
+        )])
+        .await
+        .ok()
+        .and_then(|o| {
+            o.first()
+                .and_then(|o| o.rows.first())
+                .and_then(|r| r["n"].as_i64())
+        })
+        .is_some_and(|n| n as usize >= games.len())
 }
 
 /// MEDIUM-2's in-object serial queue: every apply of one actor takes its turn, so an event arriving during another's
@@ -1181,12 +1276,58 @@ pub async fn apply_and_publish_in_turn<R: SqlPort, L: SqlPort, O: Outside>(
     era_ms: Option<i64>,
     publish: bool,
 ) -> Result<(ApplyReport, Vec<(String, Value)>), String> {
+    apply_event_in_turn(
+        turn, record, local, outside, me, games, kind_seq, tip, era_ms, publish, None,
+    )
+    .await
+}
+
+/// D2-ACTOR-D (bsv-low #952): [`apply_and_publish_in_turn`] for a delivery that names its acknowledgement `bound`:
+/// inside the turn, the event's first-apply check ([`first_apply_of`]), then the seq check ([`covered_at`]): a
+/// delivery whose every game is covered at or past its bound is a DUPE, answered without an apply (milliseconds);
+/// any other is applied. `None` bound (a writer's direct call, the tip alarm, a held event's drain): always applied.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_event_in_turn<R: SqlPort, L: SqlPort, O: Outside>(
+    turn: &futures_util::lock::Mutex<()>,
+    record: &R,
+    local: &L,
+    outside: &O,
+    me: &str,
+    games: &[String],
+    kind_seq: Option<(&str, i64)>,
+    tip: Option<u64>,
+    era_ms: Option<i64>,
+    publish: bool,
+    bound: Option<i64>,
+) -> Result<(ApplyReport, Vec<(String, Value)>), String> {
     let _turn = turn.lock().await;
-    let applied = apply(record, local, outside, me, games, kind_seq, tip, era_ms).await?;
+    let first = first_apply_of(local, kind_seq, games).await;
+    if let Some(b) = bound {
+        if covered_at(local, games, b).await {
+            let mut named: Vec<String> = Vec::new();
+            for g in games.iter().map(|g| g.to_ascii_lowercase()) {
+                if !named.contains(&g) {
+                    named.push(g);
+                }
+            }
+            return Ok((
+                ApplyReport {
+                    applied_games: named,
+                    skipped: true,
+                    first_apply: first,
+                    ..ApplyReport::default()
+                },
+                Vec::new(),
+            ));
+        }
+    }
+    let (mut report, pushes) =
+        apply(record, local, outside, me, games, kind_seq, tip, era_ms).await?;
+    report.first_apply = first;
     if publish {
         publish_belt_asks(record, local, me, games).await?;
     }
-    Ok(applied)
+    Ok((report, pushes))
 }
 
 /// The words every closure-bound fault begins with ([`CLOSURE_ROUNDS_MAX`], [`CLOSURE_KEYS_MAX`]): the apply could not
@@ -1252,6 +1393,10 @@ pub struct HeldEvent {
     #[serde(default)]
     pub tip: Option<u64>,
     pub held_at_ms: u64,
+    /// D2-ACTOR-D: the delivery's acknowledgement bound (the seq check's); never stored with a held event (a held
+    /// event is applied at the drain, always).
+    #[serde(default, skip_serializing)]
+    pub bound: Option<i64>,
 }
 impl HeldEvent {
     pub fn name(&self) -> String {
@@ -1314,8 +1459,8 @@ pub async fn apply_or_hold<R: SqlPort, L: SqlPort, O: Outside>(
         return Ok(Applied::Held { rearmed: false });
     }
     let kind_seq = ev.kind.as_deref().zip(ev.seq);
-    match apply_and_publish_in_turn(
-        turn, record, local, outside, me, &ev.games, kind_seq, ev.tip, era_ms, publish,
+    match apply_event_in_turn(
+        turn, record, local, outside, me, &ev.games, kind_seq, ev.tip, era_ms, publish, ev.bound,
     )
     .await
     {
@@ -2351,6 +2496,9 @@ pub fn served_bars(now_ms: u64) -> Value {
 /// D2-ACTOR-B-FOLD-7 (the captain's item 7): `cold`, one sample a cold actor, the first held event's write time to
 /// its held events applied; its `visible` ring alone (never the warm `queue` and `direct` bars).
 pub const BAR_CLASSES: [&str; 4] = ["direct", "queue", "mined", "cold"];
+/// D2-ACTOR-D (bsv-low #952): the queue's backstop lag bar, named in the health block (`backstopLagBarMs`): an event
+/// the writer's direct call did not land is visible within this long of its write through the queue.
+pub const BACKSTOP_LAG_BAR_MS: u64 = 60_000;
 pub const BARS_FLUSH_EVERY_MS: u64 = 60_000;
 pub const BARS_FLUSH_SAMPLES: usize = 64;
 pub fn bars_state_name(class: &str) -> String {
@@ -2375,11 +2523,20 @@ pub struct PendingBars {
 }
 impl PendingBars {
     pub fn note_answer(&mut self, class: &'static str, answer: &Value) {
+        // D2-ACTOR-D: a covered dupe applied nothing: no apply sample, no visibility sample.
+        if answer["applied"] == false {
+            return;
+        }
         if let Some(ms) = answer["applyMs"].as_u64() {
             self.apply.entry(class).or_default().push(ms);
             self.noted += 1;
         }
-        if let (Some(at), Some(judged)) = (answer["atMs"].as_u64(), answer["judgedAtMs"].as_u64()) {
+        // D2-ACTOR-D: the rows' visibility once per event, at its first apply ([`samples_visible`]).
+        if let (true, Some(at), Some(judged)) = (
+            samples_visible(answer),
+            answer["atMs"].as_u64(),
+            answer["judgedAtMs"].as_u64(),
+        ) {
             let ms = judged.saturating_sub(at);
             self.visible.entry(class).or_default().push(ms);
             if answer["mined"] == true {
@@ -2592,8 +2749,9 @@ pub async fn flush_bars_from(
 }
 
 /// The fleet's bars from the durable rows ([`BARS_READ_SQL`]'s): the apply's p50, p95 and maximum over the direct and
-/// queue classes, the rows' visibility p95 by class (`rowsVisibleMsP95` the queue's, the path every write takes;
-/// `rowsVisibleDirectMsP95` the record door's direct call), the collect-after-mined p95, the actor's own oldest
+/// queue classes, the rows' FIRST visibility p95 over both classes (`rowsVisibleMsP95`, D2-ACTOR-D: each event sampled
+/// once, at its first apply), the direct class's (`rowsVisibleDirectMsP95`) and the queue's own, the backstop's lag
+/// (`backstopLagMsP95`, its bar `backstopLagBarMs`), the collect-after-mined p95, the actor's own oldest
 /// unapplied event's age, and each class's sample count and flush time.
 ///
 /// Item 9: only the rows `rev` wrote are read (a row of another build, or one written before the stamp, is not this
@@ -2628,6 +2786,10 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
     }
     let (queue_visible, _, queue_row) = ring("queue", "visible");
     let (direct_visible, _, _) = ring("direct", "visible");
+    let mut first_visible = Meter::default();
+    for v in direct_visible.samples.iter().chain(&queue_visible.samples) {
+        first_visible.note(*v);
+    }
     let (mined, _, _) = ring("mined", "visible");
     let (cold, _, _) = ring("cold", "visible");
     let classes: serde_json::Map<String, Value> = BAR_CLASSES
@@ -2645,9 +2807,15 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
         "applyMsP50": apply.quantile(0.50),
         "applyMsP95": apply.quantile(0.95),
         "applyMsMax": apply.max(),
-        "rowsVisibleMsP95": queue_visible.quantile(0.95),
-        "rowsVisibleMsMax": queue_visible.max(),
+        // D2-ACTOR-D (bsv-low #952; the design's bar 2): each event is sampled once, at its FIRST apply, in the class
+        // of the path that applied it, so the union of the two classes is the rows' FIRST visibility.
+        "rowsVisibleMsP95": first_visible.quantile(0.95),
+        "rowsVisibleMsMax": first_visible.max(),
         "rowsVisibleDirectMsP95": direct_visible.quantile(0.95),
+        // The queue's own first applies (the events the direct call missed): the durable backstop's lag, its bar.
+        "backstopLagMsP95": queue_visible.quantile(0.95),
+        "backstopLagMsMax": queue_visible.max(),
+        "backstopLagBarMs": BACKSTOP_LAG_BAR_MS,
         "collectAfterMinedMsP95": mined.quantile(0.95),
         // D2-ACTOR-B-FOLD-7 (item 7): the cold path's own bar (the heaviest seat within 60 s of its first event).
         "coldMsP95": cold.quantile(0.95),
@@ -2667,7 +2835,7 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
 /// (`owed_events::HEALTH_CONSUMER_SQL`).
 macro_rules! health_select {
     () => {
-        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding"
+        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding"
     };
 }
 pub const HEALTH_SQL: &str = health_select!();
@@ -2772,6 +2940,10 @@ pub fn health_body(
         }),
         None => Value::Null,
     };
+    // D2-ACTOR-D (bsv-low #952): the writers' direct calls (every owed frame's publisher), and those that met their
+    // wall or faulted (the queue's message is the backstop of each).
+    body["direct"] =
+        json!({"calls": n(COUNTERS[3]), "walls": n(COUNTERS[25]), "faults": n(COUNTERS[4])});
     // NEW-L3: Phase B's gate is COVERAGE, the bootstrap lever's last full pass (`complete`, `contiguous`, `uncovered`
     // 0), never `bootstraps` against `activeIdentities` (two counts).
     body["coverage"] = field("coverage");
@@ -3049,7 +3221,7 @@ mod tests;
 /// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
 /// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
 /// (MEDIUM-9).
-pub const COUNTERS: [&str; 25] = [
+pub const COUNTERS: [&str; 26] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -3084,6 +3256,9 @@ pub const COUNTERS: [&str; 25] = [
     "owed_actor_alarm_rearmed_total",
     // The fourth delta lens's NEW4-M2: every bootstrap-page and drain fault (a page parked at its fifth in a row).
     "owed_actor_bootstrap_faults_total",
+    // D2-ACTOR-D (bsv-low #952): the writers' direct calls that met their wall (`DIRECT_CALL_WALL_MS`); a direct call
+    // that answered an error is `owed_actor_direct_faults_total`, every call `owed_actor_direct_calls_total`.
+    "owed_actor_direct_walls_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;
@@ -3135,8 +3310,12 @@ fn of_games(rows: &[Value], games: &[String]) -> Vec<Value> {
 /// [`actor_then_d1`] reads it before the actor), so a mark written between the two judges (a word landing between
 /// them) makes its game's DIFF a HELD one (`owed_actor_compare_held_total`), never the cutover's STOP; a diff with no
 /// mark above the bound stays real. `None` (the bound's read faulted) compares as before.
+///
+/// D2-ACTOR-D (bsv-low #952): the delivery names the same `bound` to the actor, so a delivery the writer's direct call
+/// already covered is a DUPE the actor answers in milliseconds; the compare runs on one event in
+/// [`COMPARE_SAMPLE_EVERY`] ([`compare_sampled`]).
 pub async fn beside(db: &impl JudgeDb, identity: &str, games: &[String], bound: Option<i64>) {
-    let answer = match db.actor_deliver(identity, games).await {
+    let answer = match db.actor_deliver_bounded(identity, games, bound).await {
         Ok(Some(a)) => a,
         Ok(None) => return,
         Err(e) => {
@@ -3151,7 +3330,19 @@ pub async fn beside(db: &impl JudgeDb, identity: &str, games: &[String], bound: 
         return;
     }
     note_answer(&answer);
-    compare(db, identity, games, &answer, bound).await;
+    if compare_sampled(db.event_seq()) {
+        compare(db, identity, games, &answer, bound).await;
+    }
+}
+
+/// D2-ACTOR-D (bsv-low #952; the consumer's per-event cost): Phases A and B compare the actor's rows with the D1
+/// judge's on ONE event in this many (by the event's seq, consecutive tokens from the publish). The STOP signal
+/// (`owed_actor_diffs_total`) is kept STATISTICALLY: a diff that persists across events is found within about eight
+/// of its game's events; a diff that lives for one event is found with probability one in eight. A sampled DIFF still
+/// counts and still names its game. An apply with no event (`None`: a belt find, the reconcile) always compares.
+pub const COMPARE_SAMPLE_EVERY: i64 = 8;
+pub fn compare_sampled(seq: Option<i64>) -> bool {
+    seq.is_none_or(|s| s.rem_euclid(COMPARE_SAMPLE_EVERY) == 0)
 }
 
 /// D2-ACTOR-B-FOLD-7: the actor HELD the event (202 `held: true`): it is bootstrapping and applies the event at its
@@ -3173,7 +3364,7 @@ pub struct Deferred {
     pub event: EventCtx,
     pub tip: Option<u64>,
     pub era_ms: Option<i64>,
-    /// Item 11: the acknowledgement's bound read before the D1 judge.
+    /// Item 11: the acknowledgement's bound read before the D1 judge (D2-ACTOR-D: the actor's seq check too).
     pub bound: Option<i64>,
 }
 pub const DEFERRED_MAX: usize = 256;
@@ -3229,7 +3420,8 @@ pub async fn actor_then_d1(
     // The delta lens's NEW-H1 (a): the acknowledgement's bound is read BEFORE the actor reads the record; a mark
     // written while it applies is judged by D1 below but left standing for the actor's next apply.
     let bound = crate::owed_judge::marks_bound(db, identity, games).await?;
-    let answer = match db.actor_deliver(identity, games).await {
+    // D2-ACTOR-D: the actor's call first, naming the bound: a delivery the writer's direct call covered is a dupe.
+    let answer = match db.actor_deliver_bounded(identity, games, Some(bound)).await {
         Ok(a) => a,
         Err(e) => {
             db.counters(vec![(COUNTERS[2].into(), 1)]).await;
@@ -3249,7 +3441,7 @@ pub async fn actor_then_d1(
     let report =
         crate::owed_judge::judge_subjects_acked_to(db, identity, games, "owed-events", bound)
             .await?;
-    if let Some(a) = &answer {
+    if let (Some(a), true) = (&answer, compare_sampled(db.event_seq())) {
         compare(db, identity, games, a, Some(bound)).await;
     }
     Ok(report)
@@ -3346,10 +3538,17 @@ pub fn note_answer(answer: &Value) {
     note_answer_as("queue", answer);
 }
 pub fn note_answer_into(bars: &mut Bars, answer: &Value) {
+    if answer["applied"] == false {
+        return;
+    }
     if let Some(ms) = answer["applyMs"].as_u64() {
         bars.apply.note(ms);
     }
-    if let (Some(at), Some(judged)) = (answer["atMs"].as_u64(), answer["judgedAtMs"].as_u64()) {
+    if let (true, Some(at), Some(judged)) = (
+        samples_visible(answer),
+        answer["atMs"].as_u64(),
+        answer["judgedAtMs"].as_u64(),
+    ) {
         let ms = judged.saturating_sub(at);
         bars.visible.note(ms);
         if answer["mined"] == true {
@@ -3383,7 +3582,9 @@ pub async fn as_the_judge(
             .max()
             .unwrap_or(0)
     });
-    let answer = match db.actor_deliver(&id, games).await {
+    // D2-ACTOR-D: the bound read before the call names the seq check (a covered delivery is a dupe, its marks
+    // acknowledged up to the same bound).
+    let answer = match db.actor_deliver_bounded(&id, games, Some(seen)).await {
         Ok(Some(a)) => a,
         Ok(None) => return Err("the D1 judge is off and no owed actor is bound".into()),
         Err(e) => {

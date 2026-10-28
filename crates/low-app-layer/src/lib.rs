@@ -504,6 +504,10 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     if req.method() == worker::Method::Post && req.path() == "/internal/pot-changed" {
         return routes::internal_pot_changed(req, &env, &ctx).await;
     }
+    // D2-ACTOR-D (bsv-low #952): the overlay's published events, their actors called after the answer.
+    if req.method() == worker::Method::Post && req.path() == "/internal/owed-direct" {
+        return owed_events::direct_route(req, &env, &ctx).await;
+    }
     if req.method() == worker::Method::Post && req.path() == "/internal/hop-changed" {
         return routes::internal_hop_changed(req, &env, &ctx).await;
     }
