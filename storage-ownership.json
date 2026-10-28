@@ -164,7 +164,7 @@
   {
    "file": "crates/low-app-layer/src/owed_actor.rs",
    "op": "SELECT",
-   "count": 7,
+   "count": 8,
    "crate": "low-app-layer",
    "statements": [
     "json_each(?5) k CROSS JOIN {} t ON t.outpoint>=k.value AND t.outpoint<k.value||'~'",
@@ -173,7 +173,8 @@
     "SELECT rowid FROM {} WHERE {c} IN (SELECT value FROM json_each(?3))",
     "SELECT rowid FROM {} WHERE {c} IN (SELECT value FROM json_each(?4))",
     "SELECT {} FROM {}",
-    "SELECT {} FROM {}"
+    "SELECT {} FROM {}",
+    "SELECT t.rowid AS r FROM {} AND t.identity=?1"
    ],
    "tables": [
     "collected_markers_v2",

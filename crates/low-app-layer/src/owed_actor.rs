@@ -29,6 +29,19 @@
 //! came in (pin `d2_actor_b_an_out_of_order_pair_derives_the_same_rows`); `applied (kind, seq, game)` is the
 //! redelivery idempotency (the D2-ACTOR-B lens's HIGH-1: one event's games arrive in several calls); the `txfacts`
 //! rows an event carries are last-writer-by-seq per row.
+//!
+//! THE COLD ACTOR (D2-ACTOR-B-FOLD-7, beta's first window of 2026-10-28). The cold path is a MIGRATION and RECOVERY
+//! path, never a request path: after the cutover every new identity's first event arrives with no history (its first
+//! hop), so its mirror grows with it; a cold actor exists only for a standing identity the lever has not reached
+//! (bounded by the lever's pace: `POST /internal/owed-actor-bootstrap`, 50 identities a call, and the fleet's budget of
+//! 60 pages a minute), a rebuilt actor (HIGH-4; bounded by the alarm's pace, one page of 16 games a second under the
+//! same budget) and a wipe (bounded by the wipe's list, `GET /internal/owed-actor-identities`, reset 50 a call). An
+//! actor without `bootstrapped` HOLDS each event in its own `meta` and answers 202 at once ([`apply_or_hold`]); its
+//! paged bootstrap applies the held events at its end ([`drain_held`]) and only then stamps `bootstrapped`; the cold
+//! time is its own bar (`coldMsP95`). The closure is keyed by the GAMES: the hop markers the domain holds (never the
+//! identity's every marker) and a pot row's own txid (its spender only where the judge names it), so a seat whose
+//! coins chain through its games is never walked whole; the mirror's own fixpoint is walked to its end before the
+//! record's rounds, so a retry starts where the last attempt stopped.
 use crate::owed_judge::{FactsFrom, JudgeDb, TxFacts};
 use crate::pot_hook::{Bind, SqlPort, Stmt, StmtOut};
 use serde_json::{json, Value};
@@ -176,7 +189,7 @@ pub const FAMILIES: &[Family] = &[
     },
     Family {
         table: "pot_records",
-        keys: &[Txid("txid"), Txid("spendingTxid")],
+        keys: &[Txid("txid")],
         beef: false,
     },
     Family {
@@ -814,9 +827,12 @@ async fn keys_of_mirror(
             )
         })
         .collect();
-    stmts.push(Stmt::new(
-        "SELECT rowid AS r FROM hopparty_records WHERE identity=?1",
-        vec![Bind::Text(me.into())],
+    stmts.push(fitted(
+        format!(
+            "SELECT t.rowid AS r FROM {} AND t.identity=?1",
+            selection(&FAMILIES[1])
+        ),
+        &binds,
     ));
     let out = local.run_batch(stmts).await?;
     for (n, o) in out.iter().enumerate() {
@@ -825,6 +841,9 @@ async fn keys_of_mirror(
                 if let Some(id) = r["r"].as_i64() {
                     into.markers.insert(id);
                 }
+            } else if FAMILIES[n].table == "pot_records" {
+                // FOLD-7: a pot row's own txid is its key; its SPENDER is a key only where the judge names it.
+                txids_in_value(&r["txid"], &mut into.txids);
             } else {
                 txids_in_value(r, &mut into.txids);
             }
@@ -870,12 +889,20 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
     let held = Held::default();
     // The closure starts from what the mirror already names for these games (the last apply's domain): in the steady
     // state its first round finds no new key and its judgement stands.
+    // D2-ACTOR-B-FOLD-7: the LOCAL walk runs to its own fixpoint (it reads the mirror alone; bounded by the keys,
+    // [`CLOSURE_KEYS_MAX`]); until the fold it stopped at [`CLOSURE_ROUNDS_MAX`] too, so a closure deeper than the
+    // local 8 and the record's 8 started every retry at the same depth and never closed, whatever the mirror held.
     let mut keys = Keys::default();
-    for _ in 0..CLOSURE_ROUNDS_MAX {
+    loop {
         let mut next = keys.clone();
         keys_of_mirror(local, &me, &games, &keys, &mut next).await?;
         if next == keys {
             break;
+        }
+        if next.txids.len() > CLOSURE_KEYS_MAX {
+            return Err(format!(
+                "{CLOSURE_BOUND}{me} passed {CLOSURE_KEYS_MAX} txids in the mirror"
+            ));
         }
         keys = next;
     }
@@ -891,7 +918,10 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
         .for_each(|r| txids_in_value(r, &mut keys.txids));
     let (staged, mut pushes) = loop {
         if report.rounds >= CLOSURE_ROUNDS_MAX {
-            return Err(format!("owed actor: the closure of {me} did not close in {CLOSURE_ROUNDS_MAX} rounds ({} txids)", keys.txids.len()));
+            return Err(format!(
+                "{CLOSURE_BOUND}{me} did not close in {CLOSURE_ROUNDS_MAX} rounds ({} txids)",
+                keys.txids.len()
+            ));
         }
         report.rounds += 1;
         let read = read_round(record, &me, &games, &keys).await?;
@@ -921,7 +951,7 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
         next.txids.extend(noting.seen.take());
         if next.txids.len() > CLOSURE_KEYS_MAX {
             return Err(format!(
-                "owed actor: the closure of {me} passed {CLOSURE_KEYS_MAX} txids"
+                "{CLOSURE_BOUND}{me} passed {CLOSURE_KEYS_MAX} txids"
             ));
         }
         if next == keys {
@@ -1154,6 +1184,323 @@ pub async fn apply_and_publish_in_turn<R: SqlPort, L: SqlPort, O: Outside>(
         publish_belt_asks(record, local, me, games).await?;
     }
     Ok(applied)
+}
+
+/// The words every closure-bound fault begins with ([`CLOSURE_ROUNDS_MAX`], [`CLOSURE_KEYS_MAX`]): the apply could not
+/// close over the mirror it holds, a state the bootstrap repairs (D2-ACTOR-B-FOLD-7), never a storage fault.
+pub const CLOSURE_BOUND: &str = "owed actor: the closure of ";
+/// Is this apply fault the closure's bound (D2-ACTOR-B-FOLD-7), as against a storage or record fault?
+pub fn is_closure_bound(e: &str) -> bool {
+    e.starts_with(CLOSURE_BOUND)
+}
+
+// ---- D2-ACTOR-B-FOLD-7: the cold actor's events are HELD, its bootstrap pages, then the held events apply ----
+//
+// THE COLD PATH IS A MIGRATION AND RECOVERY PATH, NEVER A REQUEST PATH (the captain's amendment, item 8). After the
+// cutover every new identity's first event arrives with no history (its first hop), so its mirror grows with it; a
+// cold actor exists only for a standing identity the lever has not reached (bounded by the lever's pace,
+// `POST /internal/owed-actor-bootstrap`, 50 identities a call, and the fleet's bootstrap budget, 60 pages a minute),
+// a rebuilt actor (HIGH-4; bounded by the alarm's pace, one page of 16 games a second per actor under the same
+// budget) and a wipe (bounded by the wipe's list, `GET /internal/owed-actor-identities`, reset 50 a call).
+//
+// The design's rule (`DESIGN-D2-ACTOR-2026-10-26.md` section 6): "the first event for an identity the actor has
+// never seen triggers a one-time hydrate from D1 ... Until it completes the actor serves `pending: true` and the KV
+// copy"; section 7: "the actor never loads an identity whole except at bootstrap, which pages". Beta's first window
+// (2026-10-28) ran every first event's closure over an EMPTY mirror: pair 20's proof seats (hundreds of games) faulted
+// at the 8 rounds on every retry. So an actor without `bootstrapped` HOLDS the event in its own `meta` (one row an
+// event, [`HELD_PREFIX`]; no new table: the digest does not move), arms its bootstrap and answers at once
+// (`held: true`); the bootstrap's last page applies the held events in seq order over the warm mirror and only then
+// stamps `bootstrapped` (one statement that refuses while a held row stands, [`STAMP_BOOTSTRAPPED_SQL`]), so no read
+// serves the actor's rows before a held event is applied. A bootstrapped actor whose closure meets its bound
+// un-stamps itself, re-arms its bootstrap and holds the event the same way (`owed_actor_closure_rearmed_total`).
+
+/// The `meta` rows of the held events: `held:<seq, 20 digits>:<kind>:<the games' digest>`, so the name's order is the
+/// seq order.
+pub const HELD_PREFIX: &str = "held:";
+/// The held events in seq order.
+pub const HELD_LIST_SQL: &str =
+    "SELECT name,value FROM meta WHERE name>='held:' AND name<'held;' ORDER BY name";
+/// Hold the event unless the actor is bootstrapped: ONE statement (the check and the hold cannot be split by an
+/// apply's stamp). A re-hold of the same name keeps the first write time (`atMs`, the cold bar's start) and counts
+/// itself in `n`, so the drain's delete (only the value it applied) never takes a re-hold that landed meanwhile.
+pub const HOLD_UNLESS_BOOTSTRAPPED_SQL: &str = "INSERT INTO meta(name,value) SELECT ?1,?2 WHERE NOT EXISTS (SELECT 1 FROM meta WHERE name='bootstrapped') ON CONFLICT(name) DO UPDATE SET value=json_set(excluded.value,'$.atMs',COALESCE(json_extract(meta.value,'$.atMs'),json_extract(excluded.value,'$.atMs')),'$.n',COALESCE(json_extract(meta.value,'$.n'),0)+1) RETURNING name";
+/// The re-arm's hold (item 3): the actor's `bootstrapped` taken out and the event held, in one batch.
+pub const UNSTAMP_SQL: &str = "DELETE FROM meta WHERE name='bootstrapped'";
+/// A held event applied: its row deleted only as the drain read it.
+pub const HELD_DELETE_SQL: &str = "DELETE FROM meta WHERE name=?1 AND value=?2";
+/// The bootstrap's end: `bootstrapped` stamped only while no held event stands (one statement).
+pub const STAMP_BOOTSTRAPPED_SQL: &str = "INSERT INTO meta(name,value) SELECT 'bootstrapped',?1 WHERE NOT EXISTS (SELECT 1 FROM meta WHERE name>='held:' AND name<'held;') ON CONFLICT(name) DO UPDATE SET value=excluded.value RETURNING name";
+/// The games of one bootstrap page (`owed_judge::IDENTITY_GAMES_AFTER_SQL`'s `LIMIT`): a shorter page is the last.
+pub const BOOTSTRAP_PAGE_GAMES: usize = 16;
+
+/// One held event (its `/apply` body as the actor received it, and when it was held).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeldEvent {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub seq: Option<i64>,
+    pub games: Vec<String>,
+    #[serde(default)]
+    pub at_ms: Option<u64>,
+    #[serde(default)]
+    pub mined: bool,
+    #[serde(default)]
+    pub tip: Option<u64>,
+    pub held_at_ms: u64,
+}
+impl HeldEvent {
+    pub fn name(&self) -> String {
+        let games = json!(self
+            .games
+            .iter()
+            .map(|g| g.to_ascii_lowercase())
+            .collect::<Vec<_>>())
+        .to_string();
+        let digest = hex::encode(bsv_rs::primitives::hash::sha256(games.as_bytes()));
+        format!(
+            "{HELD_PREFIX}{:020}:{}:{}",
+            self.seq.unwrap_or(0).max(0),
+            self.kind.as_deref().unwrap_or(""),
+            &digest[..16]
+        )
+    }
+    /// The cold bar's start: the event's write time, else when the actor held it.
+    pub fn started_ms(&self) -> u64 {
+        self.at_ms.unwrap_or(self.held_at_ms)
+    }
+    fn value(&self) -> String {
+        let mut v = json!(self);
+        v["n"] = json!(0);
+        v.to_string()
+    }
+}
+
+/// How one apply ended: applied, or HELD (the actor not bootstrapped; `rearmed`, a bootstrapped actor whose closure
+/// met its bound and un-stamped itself).
+#[derive(Debug)]
+pub enum Applied {
+    Done(ApplyReport, Vec<(String, Value)>),
+    Held { rearmed: bool },
+}
+
+/// THE APPLY OR THE HOLD (D2-ACTOR-B-FOLD-7, items 1 and 3): an actor without `bootstrapped` holds the event and
+/// answers at once (no closure over a mirror the bootstrap has not filled); a bootstrapped one applies it, and a
+/// closure-bound fault un-stamps it and holds the event. The caller arms the bootstrap on `Held`. Every other fault
+/// (the record's, the mirror's) is the apply's `Err`.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_or_hold<R: SqlPort, L: SqlPort, O: Outside>(
+    turn: &futures_util::lock::Mutex<()>,
+    record: &R,
+    local: &L,
+    outside: &O,
+    me: &str,
+    ev: &HeldEvent,
+    era_ms: Option<i64>,
+    publish: bool,
+) -> Result<Applied, String> {
+    let held = local
+        .run_batch(vec![Stmt::new(
+            HOLD_UNLESS_BOOTSTRAPPED_SQL,
+            vec![Bind::Text(ev.name()), Bind::Text(ev.value())],
+        )])
+        .await?;
+    if held.first().is_some_and(|o| !o.rows.is_empty()) {
+        return Ok(Applied::Held { rearmed: false });
+    }
+    let kind_seq = ev.kind.as_deref().zip(ev.seq);
+    match apply_and_publish_in_turn(
+        turn, record, local, outside, me, &ev.games, kind_seq, ev.tip, era_ms, publish,
+    )
+    .await
+    {
+        Ok((report, pushes)) => Ok(Applied::Done(report, pushes)),
+        Err(e) if is_closure_bound(&e) => {
+            local.log(&format!(
+                "[owed-actor] {e}: the bootstrap re-armed, the event held"
+            ));
+            local
+                .run_batch(vec![
+                    Stmt::new(UNSTAMP_SQL, vec![]),
+                    Stmt::new(
+                        HOLD_UNLESS_BOOTSTRAPPED_SQL,
+                        vec![Bind::Text(ev.name()), Bind::Text(ev.value())],
+                    ),
+                ])
+                .await?;
+            Ok(Applied::Held { rearmed: true })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The object's answer to a HELD event (202): `held`, whether its bootstrap is armed, no ack watermark (nothing
+/// applied yet), the games held (the consumer's Phase C acknowledges exactly these, [`as_the_judge`]).
+pub fn held_answer(
+    me: &str,
+    games: &[String],
+    at_ms: Option<u64>,
+    armed: bool,
+    rearmed: bool,
+) -> Value {
+    json!({"held": true, "bootstrapArmed": armed, "ackSeq": null, "rearmed": rearmed, "identity": me, "heldGames": games, "atMs": at_ms})
+}
+
+/// One held event the drain applied.
+#[derive(Debug)]
+pub struct Drained {
+    pub event: HeldEvent,
+    pub report: ApplyReport,
+    pub pushes: Vec<(String, Value)>,
+}
+/// The drain's account: the events applied in seq order and the cold time (the first held event's write time to the
+/// last applied, item 7), `None` when nothing was held.
+#[derive(Debug, Default)]
+pub struct Drain {
+    pub applied: Vec<Drained>,
+    pub cold_ms: Option<u64>,
+}
+
+/// THE DRAIN (item 2): inside ONE turn, every held event applied in seq order over the warm mirror (a normal apply:
+/// its `(kind, seq)` recorded, its asks published), each row deleted as read; a hold that landed meanwhile (a
+/// re-hold of a name, a new event while the drain awaited the record) is read on the next pass; then `bootstrapped`
+/// stamped by the one statement that refuses while a held row stands. A held event's tip is the newer of its own and
+/// `tip_now`. An apply's fault ends the drain with the rows standing and the actor unstamped (the bootstrap's alarm
+/// runs it again).
+#[allow(clippy::too_many_arguments)]
+pub async fn drain_held<R: SqlPort, L: SqlPort, O: Outside>(
+    turn: &futures_util::lock::Mutex<()>,
+    record: &R,
+    local: &L,
+    outside: &O,
+    me: &str,
+    tip_now: Option<u64>,
+    era_ms: Option<i64>,
+    publish: bool,
+) -> Result<Drain, String> {
+    let _turn = turn.lock().await;
+    let mut drain = Drain::default();
+    let mut first: Option<u64> = None;
+    loop {
+        let list = local
+            .run_batch(vec![Stmt::new(HELD_LIST_SQL, vec![])])
+            .await?
+            .into_iter()
+            .next()
+            .map(|o| o.rows)
+            .unwrap_or_default();
+        if list.is_empty() {
+            let stamped = local
+                .run_batch(vec![Stmt::new(
+                    STAMP_BOOTSTRAPPED_SQL,
+                    vec![Bind::Text(local.now_ms().to_string())],
+                )])
+                .await?;
+            if stamped.first().is_some_and(|o| !o.rows.is_empty()) {
+                break;
+            }
+            continue;
+        }
+        for row in list {
+            let (Some(name), Some(value)) = (row["name"].as_str(), row["value"].as_str()) else {
+                continue;
+            };
+            let Ok(ev) = serde_json::from_str::<HeldEvent>(value) else {
+                local.log(&format!(
+                    "[owed-actor] held row {name} does not read: dropped"
+                ));
+                local
+                    .run_batch(vec![Stmt::new(
+                        HELD_DELETE_SQL,
+                        vec![Bind::Text(name.into()), Bind::Text(value.into())],
+                    )])
+                    .await?;
+                continue;
+            };
+            let tip = match (ev.tip, tip_now) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            let kind_seq = ev.kind.as_deref().zip(ev.seq);
+            let (report, pushes) =
+                apply(record, local, outside, me, &ev.games, kind_seq, tip, era_ms).await?;
+            if publish {
+                publish_belt_asks(record, local, me, &ev.games).await?;
+            }
+            local
+                .run_batch(vec![Stmt::new(
+                    HELD_DELETE_SQL,
+                    vec![Bind::Text(name.into()), Bind::Text(value.into())],
+                )])
+                .await?;
+            first = Some(first.map_or(ev.started_ms(), |f| f.min(ev.started_ms())));
+            drain.applied.push(Drained {
+                event: ev,
+                report,
+                pushes,
+            });
+        }
+    }
+    drain.cold_ms = first.map(|f| local.now_ms().saturating_sub(f));
+    Ok(drain)
+}
+
+/// One bootstrap page's outcome: the next page's keyset cursor, or the bootstrap's end (the held events drained).
+#[derive(Debug)]
+pub enum BootStep {
+    Page { cursor: String, games: usize },
+    Done { games: usize, drain: Drain },
+}
+
+/// ONE BOOTSTRAP PAGE (the object's alarm runs it after its budget token, MEDIUM-1 and NEW-M2): the identity's next
+/// [`BOOTSTRAP_PAGE_GAMES`] games past `cursor` (keyset, LOW-6) applied in one apply; a short page ends the bootstrap
+/// with the held events' drain ([`drain_held`]), which stamps `bootstrapped`.
+#[allow(clippy::too_many_arguments)]
+pub async fn bootstrap_step<R: SqlPort, L: SqlPort, O: Outside>(
+    turn: &futures_util::lock::Mutex<()>,
+    record: &R,
+    local: &L,
+    outside: &O,
+    me: &str,
+    cursor: Option<&str>,
+    tip: Option<u64>,
+    era_ms: Option<i64>,
+    publish: bool,
+) -> Result<BootStep, String> {
+    let (at, after) = object::boot_keyset(cursor);
+    let rows = record
+        .run_batch(vec![Stmt::new(
+            crate::owed_judge::IDENTITY_GAMES_AFTER_SQL,
+            vec![Bind::Text(me.into()), Bind::Int(at), Bind::Text(after)],
+        )])
+        .await?
+        .into_iter()
+        .next()
+        .map(|o| o.rows)
+        .unwrap_or_default();
+    let games: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r["gameId"].as_str().map(str::to_string))
+        .collect();
+    if !games.is_empty() {
+        apply_and_publish_in_turn(
+            turn, record, local, outside, me, &games, None, tip, era_ms, publish,
+        )
+        .await?;
+    }
+    if games.len() < BOOTSTRAP_PAGE_GAMES {
+        let drain = drain_held(turn, record, local, outside, me, tip, era_ms, publish).await?;
+        return Ok(BootStep::Done {
+            games: games.len(),
+            drain,
+        });
+    }
+    let last = rows.last().cloned().unwrap_or(Value::Null);
+    Ok(BootStep::Page {
+        cursor: json!([last["at"].as_i64().unwrap_or(0), last["gameId"]]).to_string(),
+        games: games.len(),
+    })
 }
 
 /// A `txfacts` event (MEDIUM-3): the transaction's facts as the overlay decoded them (`owed_event::txfacts_of_raw`),
@@ -1521,6 +1868,8 @@ pub struct Bars {
     pub apply: Meter,
     pub visible: Meter,
     pub collect_after_mined: Meter,
+    /// D2-ACTOR-B-FOLD-7: the cold time of each bootstrap that applied held events.
+    pub cold: Meter,
     pub kv_copies: u64,
     pub bootstraps: u64,
     pub reconcile_diffs: u64,
@@ -1536,6 +1885,9 @@ impl Bars {
             "rowsVisibleMsP95": self.visible.quantile(0.95),
             "rowsVisibleMsMax": self.visible.max(),
             "collectAfterMinedMsP95": self.collect_after_mined.quantile(0.95),
+            "coldMsP95": self.cold.quantile(0.95),
+            "coldMsMax": self.cold.max(),
+            "coldSamples": self.cold.samples.len(),
             "oldestUnappliedEventAgeMs": self.oldest_unapplied_at_ms.map(|a| now_ms.saturating_sub(a)),
             "kvCopies": self.kv_copies,
             "bootstraps": self.bootstraps,
@@ -1562,13 +1914,15 @@ pub fn served_bars(now_ms: u64) -> Value {
 /// lands on. An isolate adds its samples at most once a [`BARS_FLUSH_EVERY_MS`] or every [`BARS_FLUSH_SAMPLES`]
 /// (one read and one batch). The `queue` row also carries the actor's OWN oldest unapplied event: the oldest write
 /// time of an event whose actor apply faulted in this isolate with no later apply of that identity landed.
-pub const BAR_CLASSES: [&str; 3] = ["direct", "queue", "mined"];
+/// D2-ACTOR-B-FOLD-7 (the captain's item 7): `cold`, one sample a cold actor, the first held event's write time to
+/// its held events applied; its `visible` ring alone (never the warm `queue` and `direct` bars).
+pub const BAR_CLASSES: [&str; 4] = ["direct", "queue", "mined", "cold"];
 pub const BARS_FLUSH_EVERY_MS: u64 = 60_000;
 pub const BARS_FLUSH_SAMPLES: usize = 64;
 pub fn bars_state_name(class: &str) -> String {
     format!("owed-actor:bars:{class}")
 }
-pub const BARS_READ_SQL: &str = "SELECT name,cursor,tickedAtMs FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined')";
+pub const BARS_READ_SQL: &str = "SELECT name,cursor,tickedAtMs FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold')";
 
 /// This isolate's samples not yet added to the durable rows.
 #[derive(Debug, Default, Clone)]
@@ -1604,6 +1958,10 @@ impl PendingBars {
             self.queue_touched = true;
         }
     }
+    pub fn note_cold(&mut self, ms: u64) {
+        self.visible.entry("cold").or_default().push(ms);
+        self.noted += 1;
+    }
     pub fn note_fault(&mut self, identity: &str, at_ms: Option<u64>) {
         if let Some(at) = at_ms {
             let e = self
@@ -1632,6 +1990,25 @@ thread_local! {
 pub fn note_answer_as(class: &'static str, answer: &Value) {
     BARS.with(|b| note_answer_into(&mut b.borrow_mut(), answer));
     PENDING_BARS.with(|p| p.borrow_mut().note_answer(class, answer));
+}
+/// D2-ACTOR-B-FOLD-7: one cold actor's time, into the fleet's `cold` bar at the next flush.
+pub fn note_cold(ms: u64) {
+    PENDING_BARS.with(|p| p.borrow_mut().note_cold(ms));
+}
+/// A JSON number as milliseconds, an integer or a whole REAL (D1's bind of a JS number).
+pub fn json_ms(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
+}
+/// An alarm's OFFSET from now for workers-rs 0.8.7 (`ScheduledTime: From<i64>` is an offset): `at_ms` an epoch stamp
+/// (with `now_ms`), or an offset already (`now_ms` 0); 0 for a stamp past.
+pub fn alarm_offset_ms(at_ms: u64, now_ms: u64) -> i64 {
+    at_ms.saturating_sub(now_ms).min(i64::MAX as u64) as i64
+}
+/// The captain's item 12: is a bootstrap's stored alarm DEAD (none, or later than one page delay and a minute from
+/// now: lost, or set decades out by a build that handed `set_alarm` an epoch stamp)? `held` the stored epoch time.
+pub fn alarm_is_dead(held: Option<i64>, now_ms: u64) -> bool {
+    held.is_none_or(|h| h > (now_ms + BOOTSTRAP_PAGE_DELAY_MS + 60_000) as i64)
 }
 /// An actor apply that faulted: its event is unapplied for the actor until a later apply of the identity lands.
 pub fn note_actor_fault(identity: &str, at_ms: Option<u64>) {
@@ -1771,6 +2148,7 @@ pub fn fleet_bars(rows: &[Value], now: u64) -> Value {
     let (queue_visible, _, queue_row) = ring("queue", "visible");
     let (direct_visible, _, _) = ring("direct", "visible");
     let (mined, _, _) = ring("mined", "visible");
+    let (cold, _, _) = ring("cold", "visible");
     let classes: serde_json::Map<String, Value> = BAR_CLASSES
         .iter()
         .map(|c| {
@@ -1790,6 +2168,10 @@ pub fn fleet_bars(rows: &[Value], now: u64) -> Value {
         "rowsVisibleMsMax": queue_visible.max(),
         "rowsVisibleDirectMsP95": direct_visible.quantile(0.95),
         "collectAfterMinedMsP95": mined.quantile(0.95),
+        // D2-ACTOR-B-FOLD-7 (item 7): the cold path's own bar (the heaviest seat within 60 s of its first event).
+        "coldMsP95": cold.quantile(0.95),
+        "coldMsMax": cold.max(),
+        "coldSamples": cold.samples.len(),
         "actorOldestUnappliedEventAgeMs": queue_row["oldestUnappliedAtMs"].as_u64().map(|a| now.saturating_sub(a)),
         "classes": classes,
     })
@@ -1803,7 +2185,7 @@ pub fn fleet_bars(rows: &[Value], now: u64) -> Value {
 /// (`owed_events::HEALTH_CONSUMER_SQL`).
 macro_rules! health_select {
     () => {
-        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',tickedAtMs)) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage"
+        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',tickedAtMs)) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage"
     };
 }
 pub const HEALTH_SQL: &str = health_select!();
@@ -1817,7 +2199,7 @@ pub const HEALTH_SQL: &str = health_select!();
 pub const HEALTH_SNAPSHOT_NAME: &str = "owed-actor:health";
 pub const HEALTH_SNAPSHOT_EVERY_MS: u64 = 60_000;
 pub const HEALTH_SNAPSHOT_SQL: &str = concat!(
-    "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) SELECT 'owed-actor:health',json_object('asOfMs',?1,'bars',h.bars,'counters',h.counters,'activeIdentities',h.activeIdentities,'coverage',h.coverage),?1 FROM (",
+    "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) SELECT 'owed-actor:health',json_object('asOfMs',CAST(?1 AS INTEGER),'bars',h.bars,'counters',h.counters,'activeIdentities',h.activeIdentities,'coverage',h.coverage),?1 FROM (",
     health_select!(),
     ") h WHERE NOT (?2>0 AND EXISTS (SELECT 1 FROM owed_belt_state WHERE name='owed-actor:health' AND tickedAtMs>?1-?2)) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs"
 );
@@ -1892,13 +2274,20 @@ pub fn health_body(
     // The third delta lens's LOW-1: the games the tip alarm parked; LOW-2: the schema plans that did not apply whole.
     body["tipParked"] = n(COUNTERS[19]);
     body["schemaPartial"] = n(COUNTERS[20]);
+    // D2-ACTOR-B-FOLD-7: the events held (a cold or re-armed actor) and the re-arms.
+    body["held"] = n(COUNTERS[21]);
+    body["closureRearmed"] = n(COUNTERS[22]);
+    // Item 12: the actors armed under a dead alarm, re-armed by the lever or a held event.
+    body["alarmRearmed"] = n(COUNTERS[23]);
     // NEW-L3: Phase B's gate is COVERAGE, the bootstrap lever's last full pass (`complete`, `contiguous`, `uncovered`
     // 0), never `bootstraps` against `activeIdentities` (two counts).
     body["coverage"] = field("coverage");
     body["v3"] = json!({"identities": n(COUNTERS[14]), "rows": n(COUNTERS[15])});
     body["activeIdentities"] = json!(read.and_then(|r| r["activeIdentities"].as_u64()));
     // The snapshot's time (lane D2-ACTOR-B-FOLD-6): one older than its cadence is served as it is.
-    body["asOfMs"] = json!(read.and_then(|r| r["asOfMs"].as_u64()));
+    // D2-ACTOR-B-FOLD-7 (item 5): D1 binds every number as a JS number (a REAL), so a row written before the fold
+    // holds `asOfMs` as `1793190803706.0`; read either form.
+    body["asOfMs"] = json!(read.and_then(|r| json_ms(&r["asOfMs"])));
     body["oldestUnappliedEventAgeMs"] = if d1_judges {
         fleet["actorOldestUnappliedEventAgeMs"].clone()
     } else {
@@ -2157,7 +2546,7 @@ mod tests;
 /// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
 /// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
 /// (MEDIUM-9).
-pub const COUNTERS: [&str; 21] = [
+pub const COUNTERS: [&str; 24] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -2184,6 +2573,12 @@ pub const COUNTERS: [&str; 21] = [
     "owed_actor_tip_parked_total",
     // LOW-2: an actor's schema plan that did not apply whole (its digest left unstamped, retried by its next instance).
     "owed_actor_schema_partial_total",
+    // D2-ACTOR-B-FOLD-7: the events an actor HELD (not bootstrapped, or re-armed: answered 202, neither a fault nor an
+    // apply sample), and the bootstrapped actors whose closure met its bound and re-armed their bootstrap.
+    "owed_actor_apply_held_total",
+    "owed_actor_closure_rearmed_total",
+    // The captain's item 12: an actor armed under a dead alarm (lost, or set decades out by an older build) re-armed.
+    "owed_actor_alarm_rearmed_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;
@@ -2241,8 +2636,18 @@ pub async fn beside(db: &impl JudgeDb, identity: &str, games: &[String]) {
             return;
         }
     };
+    // D2-ACTOR-B-FOLD-7: a HELD answer (the actor bootstrapping) holds no rows to compare: not a fault, not a sample.
+    if is_held(&answer) {
+        return;
+    }
     note_answer(&answer);
     compare(db, identity, games, &answer, None).await;
+}
+
+/// D2-ACTOR-B-FOLD-7: the actor HELD the event (202 `held: true`): it is bootstrapping and applies the event at its
+/// bootstrap's end, from its own durable storage.
+pub fn is_held(answer: &Value) -> bool {
+    answer["held"] == true
 }
 
 /// THE DEFERRED APPLY (the D2-ACTOR-B lens's MEDIUM-6, Phase A): the consumer's delivery judges in D1 and ACKS; the
@@ -2323,6 +2728,9 @@ pub async fn actor_then_d1(
             return Err(e);
         }
     };
+    // D2-ACTOR-B-FOLD-7: a HELD answer acknowledges as an applied one (the actor serves no row until the held event
+    // is applied: held means not bootstrapped, and its read is the fallback); it has no rows to compare.
+    let answer = answer.filter(|a| !is_held(a));
     if let Some(a) = &answer {
         note_answer(a);
     }
@@ -2470,7 +2878,17 @@ pub async fn as_the_judge(
         }
     };
     note_answer(&answer);
-    let applied: Vec<String> = answer["appliedGames"]
+    // D2-ACTOR-B-FOLD-7 (the ack rule of a held event): the actor HELD the games (`heldGames`) in its own durable
+    // storage (the platform's output gate: the 202 leaves only after the row is written) and applies them at its
+    // bootstrap's end, reading the record as it stands then, after every mark read here; until then it is not
+    // bootstrapped and no read serves its rows (the fallback, never a press). So the held games' marks are
+    // acknowledged up to the generation read BEFORE the call, as an applied answer's are (NEW-H1 (b)).
+    let named = if is_held(&answer) {
+        "heldGames"
+    } else {
+        "appliedGames"
+    };
+    let applied: Vec<String> = answer[named]
         .as_array()
         .map(|a| {
             a.iter()

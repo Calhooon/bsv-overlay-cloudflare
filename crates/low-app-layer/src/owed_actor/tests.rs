@@ -2161,8 +2161,11 @@ async fn d2_actor_b_fold2_m1_the_bootstrap_runs_in_phase_a_and_pages_by_keyset()
     let object = squash(include_str!("object.rs"));
     let apply =
         &object[object.find("asyncfnapply_route(").unwrap()..object.find("fnrows_of(").unwrap()];
+    // D2-ACTOR-B-FOLD-7: the first event of an actor not bootstrapped is HELD and arms the bootstrap.
     assert!(
-        apply.contains(&squash("let _ = self.arm_bootstrap(&me).await;")),
+        apply.contains(&squash(
+            "let (armed, _, _) = self.arm_bootstrap(&me).await;"
+        )),
         "the first event arms the bootstrap"
     );
     assert!(object.contains(&squash(
@@ -2676,11 +2679,18 @@ fn d2_actor_b_fold3_m2_the_bootstrap_pages_take_a_fleet_budget() {
         !page.contains("BOOT_BUDGET_READ_SQL"),
         "NEW2-L3: one statement"
     );
+    // D2-ACTOR-B-FOLD-7: the page's read is `bootstrap_step`'s (the shipped step the pins run natively), the next
+    // page's alarm an OFFSET (`alarm_in`, the captain's item 11).
     assert!(
-        budget < page.find("IDENTITY_GAMES_AFTER_SQL").unwrap(),
+        budget < page.find("bootstrap_step(").unwrap(),
         "before its read"
     );
-    assert!(page.contains("+BOOTSTRAP_PAGE_DELAY_MS)"));
+    let actor = include_str!("../owed_actor.rs")
+        .split_whitespace()
+        .collect::<String>();
+    let step = &actor[actor.find("pubasyncfnbootstrap_step").unwrap()..];
+    assert!(step[..step.find("drain_held(").unwrap()].contains("IDENTITY_GAMES_AFTER_SQL"));
+    assert!(page.contains("self.alarm_in(BOOTSTRAP_PAGE_DELAY_MS).await;"));
 }
 
 /// The delta lens's LOWs. NEW-L1: the tip alarm moves `tipJudged` only when every apply of its window answered (a
@@ -2699,8 +2709,9 @@ fn d2_actor_b_fold3_lows() {
     assert!(alarm.contains(&squash(
         "self.put_meta(&local, META_TIP_JUDGED, &window.tip_judged.to_string());"
     )));
+    // D2-ACTOR-B-FOLD-7: a held answer (202) is a landed apply for the window (the bootstrap applies it).
     assert!(alarm.contains(&squash(
-        "self.apply_route(body) .await .is_ok_and(|r| r.status_code() == 200)"
+        "self.apply_route(body) .await .is_ok_and(|r| matches!(r.status_code(), 200 | 202))"
     )));
     // L2
     let me = format!("02{}", "ab".repeat(32));
@@ -3077,9 +3088,11 @@ async fn d2_actor_b_fold4_l5_a_faulting_tip_game_never_holds_the_window() {
     assert!(alarm.contains("tip_window(&identity,games,&held,"));
     assert!(alarm.contains("COUNTERS[18]"));
     let route = &object[object.find("asyncfnapply_route(").unwrap()..];
-    assert!(
-        route[..route.find("Response::from_json(&answer)").unwrap()].contains("META_TIP_FAULTS")
-    );
+    // D2-ACTOR-B-FOLD-7: the landed apply's clear is `clear_tip_faults` (the drain's held events take it too).
+    assert!(route[..route.find("answer_of(&report").unwrap()]
+        .contains("self.clear_tip_faults(&local,&body.games);"));
+    let clear = &object[object.find("fnclear_tip_faults(").unwrap()..];
+    assert!(clear[..clear.find("fnpublish_pushes(").unwrap()].contains("META_TIP_FAULTS"));
 }
 
 /// NEW2-L3: a full minute's take writes nothing: the 61st take answers no row (the page waits) and leaves the row's
@@ -3568,4 +3581,565 @@ async fn d2_actor_b_fold6_the_served_keys_are_the_pre_fold_bodys() {
     ] {
         assert_eq!(none[k], Value::Null, "{k}");
     }
+}
+
+// ---- D2-ACTOR-B-FOLD-7: an unseen identity's first event, held and bootstrapped (beta's first window) ----
+
+/// The fleet's heaviest seat, scaled (beta's pair 20 proof seats: hundreds of games each): `n` games, each a hop
+/// marker of `owner` whose hop's CHANGE funds the next game's hop (`pot_records` `(H_k, 1)` spent by `H_{k+1}`, the
+/// seat's ordinary chain of coins) and whose stake a covenant JOIN spends (`(H_k, 0)` spent by `P_k`). The chain is
+/// what a cold closure walked one link a round in both directions (the change's spender, then that spender's own
+/// outputs, then the outputs it spends) until the 8 rounds ran out.
+fn fold7_chained_seat(n: usize) -> Fixture {
+    let made = (NOW_MS / 1000) as i64 - 7_200;
+    let mut seed = Vec::new();
+    for k in 0..n {
+        let hop = h("b8", k);
+        let pot = h("c8", k);
+        let next = if k + 1 < n {
+            format!("1,'{}'", h("b8", k + 1))
+        } else {
+            "0,NULL".into()
+        };
+        seed.push(format!("INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,createdAt,lockKind) VALUES ('{hop}',0,1,'{pot}',{},'p2pkh')", made + k as i64));
+        seed.push(format!("INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,createdAt,lockKind) VALUES ('{hop}',1,{next},{},'p2pkh')", made + k as i64));
+        seed.push(format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind,paramsDecoded,recoveryHeight) VALUES ('{pot}',0,0,{},'covenant',1,900100)", made + k as i64));
+        seed.push(format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('owner','other','{}',0,20190,'seat','00','00',2,'{hop}',2,{},1)", h("9e", k), made + k as i64));
+        seed.push(format!("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,sigValid) VALUES ('owner','other','{}','{pot}',0,900100,'00','{}',1,{},1)", h("9e", k), h("e7", k), made + k as i64));
+    }
+    Fixture {
+        name: "fold7 chained seat",
+        seed,
+        identities: vec!["owner".into()],
+    }
+}
+
+/// The bootstrap run to its end the way the object's alarm runs it (`bootstrap_step` from the first cursor, each page
+/// after the last), answering the pages and the drain. A page's closure-bound fault is retried as the alarm retries
+/// it (`retries` counts them); any other fault fails the pin.
+async fn fold7_bootstrap(
+    turn: &futures_util::lock::Mutex<()>,
+    record: &SqliteSql,
+    local: &SqliteSql,
+    me: &str,
+) -> (usize, usize, Drain) {
+    let mut cursor = object::BOOT_CURSOR_START.to_string();
+    let (mut pages, mut retries) = (0, 0);
+    loop {
+        match bootstrap_step(
+            turn,
+            record,
+            local,
+            &Fakes,
+            me,
+            Some(&cursor),
+            Some(TIP),
+            None,
+            false,
+        )
+        .await
+        {
+            Ok(BootStep::Page {
+                cursor: next,
+                games,
+            }) => {
+                assert_eq!(games, BOOTSTRAP_PAGE_GAMES);
+                pages += 1;
+                cursor = next;
+            }
+            Ok(BootStep::Done { drain, .. }) => return (pages + 1, retries, drain),
+            Err(e) if is_closure_bound(&e) && retries < 8 => {
+                eprintln!("fold7 retry {retries}: {e}");
+                retries += 1
+            }
+            Err(e) => panic!("bootstrap page {pages}: {e}"),
+        }
+    }
+}
+
+fn fold7_held(local: &SqliteSql) -> Vec<String> {
+    let mut q = local
+        .conn
+        .prepare("SELECT name FROM meta WHERE name>='held:' AND name<'held;' ORDER BY name")
+        .unwrap();
+    q.query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn fold7_meta(local: &SqliteSql, name: &str) -> Option<String> {
+    local
+        .conn
+        .query_row("SELECT value FROM meta WHERE name=?1", [name], |r| r.get(0))
+        .ok()
+}
+
+fn fold7_event(kind: &str, seq: i64, games: &[String], at_ms: u64) -> HeldEvent {
+    HeldEvent {
+        kind: Some(kind.into()),
+        seq: Some(seq),
+        games: games.to_vec(),
+        at_ms: Some(at_ms),
+        mined: false,
+        tip: Some(TIP),
+        held_at_ms: at_ms,
+    }
+}
+
+/// THE FINDING (beta, 2026-10-28, pair 20's proof seats) and the design's rule (section 6): an identity shaped like
+/// the fleet's heaviest seat (600 games, 3,000 record rows, its hops chained by their change) whose actor holds no
+/// `bootstrapped`: its first event is HELD inside the direct call's wall (no closure, no fault), the bootstrap pages
+/// to its short page with no page faulting, the held event is applied in the drain, the rows are the D1 judge's
+/// byte for byte, and the cold time is measured.
+/// RED on `d910ad5d`: the same one-game event's apply over the cold mirror, `Err("owed actor: the closure of owner did
+/// not close in 8 rounds (52 txids)")` (the probe run on that tree's `apply`, quoted in the commit); a 16-game page the
+/// same (`... (210 txids)`).
+#[tokio::test]
+async fn d2_actor_b_fold7_a_an_unseen_heavy_seat_is_held_bootstrapped_then_applied() {
+    let f = fold7_chained_seat(600);
+    let d1 = d1_judge(&f).await;
+    let want = stored(&d1, "owner");
+    let record = seeded(&f);
+    let games = games_of(&record, "owner");
+    assert_eq!(games.len(), 600);
+    let local = mirror();
+    let turn = futures_util::lock::Mutex::new(());
+    let t = std::time::Instant::now();
+    let ev = fold7_event("pot", 9, &games[300..301], NOW_MS - 1_000);
+    let first = apply_or_hold(&turn, &record, &local, &Fakes, "owner", &ev, None, false)
+        .await
+        .unwrap();
+    let held_ms = t.elapsed().as_millis() as u64;
+    assert!(
+        matches!(first, Applied::Held { rearmed: false }),
+        "{first:?}"
+    );
+    assert!(held_ms < DIRECT_CALL_WALL_MS, "held in {held_ms} ms");
+    assert_eq!(fold7_held(&local).len(), 1);
+    assert!(
+        stored(&local, "owner").is_empty(),
+        "no closure over the empty mirror"
+    );
+    let t = std::time::Instant::now();
+    let (pages, retries, drain) = fold7_bootstrap(&turn, &record, &local, "owner").await;
+    let boot_ms = t.elapsed().as_millis() as u64;
+    assert_eq!(retries, 0, "no bootstrap page met the closure's bound");
+    assert_eq!(pages, 600 / BOOTSTRAP_PAGE_GAMES + 1);
+    assert_eq!(drain.applied.len(), 1);
+    assert_eq!(drain.applied[0].event, ev);
+    assert!(fold7_held(&local).is_empty());
+    assert!(fold7_meta(&local, "bootstrapped").is_some());
+    let got = stored(&local, "owner");
+    assert_eq!(got.len(), want.len());
+    assert_eq!(got, want, "the actor's rows are the D1 judge's");
+    let cold = drain.cold_ms.unwrap();
+    // The amendment's item 9: the cold time under the pace as it stands (one page a second, 16 games a page) is the
+    // pages' delay plus their work; the native work is measured here, the wasm32 and D1 hop is the beta rehearsal's.
+    let paced = (pages as u64 - 1) * BOOTSTRAP_PAGE_DELAY_MS + boot_ms;
+    eprintln!("fold7_a: held in {held_ms} ms; {pages} pages, native work {boot_ms} ms; cold (the fixture's clock) {cold} ms; under the pace about {paced} ms");
+}
+
+/// Two HELD events out of order (seq 12 held first, then seq 10, the record moved between them): the drain applies
+/// them in seq order and the rows are the record's as it stands (the newer judgement), MEDIUM-1's shape.
+#[tokio::test]
+async fn d2_actor_b_fold7_b_two_held_events_apply_in_seq_order_and_derive_the_newer_rows() {
+    let f = fold7_chained_seat(20);
+    let record = seeded(&f);
+    let games = games_of(&record, "owner");
+    let local = mirror();
+    let turn = futures_util::lock::Mutex::new(());
+    let late = fold7_event("pot", 12, &games[3..4], NOW_MS - 500);
+    let early = fold7_event("hop", 10, &games[3..4], NOW_MS - 900);
+    for ev in [&late, &early] {
+        let r = apply_or_hold(&turn, &record, &local, &Fakes, "owner", ev, None, false)
+            .await
+            .unwrap();
+        assert!(matches!(r, Applied::Held { rearmed: false }));
+        // The record moves between the holds: game 3's JOIN is spent by a settle.
+        record.conn.execute_batch(&format!("UPDATE pot_records SET spent=1,spendingTxid='{}' WHERE txid='{}' AND outputIndex=0", h("f1", 3), h("c8", 3))).unwrap();
+    }
+    let (_, _, drain) = fold7_bootstrap(&turn, &record, &local, "owner").await;
+    let seqs: Vec<Option<i64>> = drain.applied.iter().map(|d| d.event.seq).collect();
+    assert_eq!(seqs, vec![Some(10), Some(12)], "applied in seq order");
+    let reference = seeded(&f);
+    reference
+        .conn
+        .execute_batch(&format!(
+            "UPDATE pot_records SET spent=1,spendingTxid='{}' WHERE txid='{}' AND outputIndex=0",
+            h("f1", 3),
+            h("c8", 3)
+        ))
+        .unwrap();
+    for chunk in games.chunks(16) {
+        crate::owed_judge::judge_subjects(&reference, "owner", chunk, "d1")
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        stored(&local, "owner"),
+        stored(&reference, "owner"),
+        "the newer rows"
+    );
+    // `applied` holds both events' tokens.
+    let applied: i64 = local
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM applied WHERE seq IN (10,12)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(applied, 2);
+}
+
+/// A BOOTSTRAPPED actor whose record grew under it past the closure's bound (a chain of word rows each naming the
+/// next, 20 links: the 8 rounds cannot reach its end): the apply re-arms the bootstrap and HOLDS the event, never a
+/// 503; the re-bootstrap's page persists each attempt's rounds and closes on a retry, then the held event is applied.
+/// RED on `d910ad5d`: the apply answers `Err("owed actor: the closure of owner did not close in 8 rounds ...")`, the
+/// object's 503.
+#[tokio::test]
+async fn d2_actor_b_fold7_c_a_bootstrapped_actor_past_the_bound_rearms_and_holds() {
+    let f = fold7_chained_seat(20);
+    let record = seeded(&f);
+    let games = games_of(&record, "owner");
+    let local = mirror();
+    let turn = futures_util::lock::Mutex::new(());
+    let (_, _, _) = fold7_bootstrap(&turn, &record, &local, "owner").await;
+    assert!(fold7_meta(&local, "bootstrapped").is_some());
+    // The record grows: game 5's hop names a chain of 20 word rows.
+    let hop = h("b8", 5);
+    let mut chain = vec![hop.clone()];
+    chain.extend((0..20).map(|i| h("fa", i)));
+    for w in chain.windows(2) {
+        record.conn.execute(
+            "INSERT OR REPLACE INTO tx_words(txid,word,tier,updated_at,legacy_body) VALUES (?1,'seen','hint',1,?2)",
+            [&w[0], &format!("{{\"next\":\"{}\"}}", w[1])],
+        ).unwrap();
+    }
+    let ev = fold7_event("word", 31, &games[5..6], NOW_MS - 100);
+    let r = apply_or_hold(&turn, &record, &local, &Fakes, "owner", &ev, None, false)
+        .await
+        .unwrap();
+    assert!(matches!(r, Applied::Held { rearmed: true }), "{r:?}");
+    assert!(
+        fold7_meta(&local, "bootstrapped").is_none(),
+        "un-stamped: its reads serve the fallback"
+    );
+    assert_eq!(fold7_held(&local).len(), 1);
+    let (_, retries, drain) = fold7_bootstrap(&turn, &record, &local, "owner").await;
+    // Each attempt's rounds persist and the next starts from the mirror's own fixpoint (FOLD-7's local walk), so the
+    // page closes within a retry or two.
+    assert!(
+        retries <= 2,
+        "the re-bootstrap converges: {retries} retries"
+    );
+    assert_eq!(drain.applied.len(), 1);
+    assert!(fold7_meta(&local, "bootstrapped").is_some());
+    let reference = seeded(&f);
+    for w in chain.windows(2) {
+        reference.conn.execute(
+            "INSERT OR REPLACE INTO tx_words(txid,word,tier,updated_at,legacy_body) VALUES (?1,'seen','hint',1,?2)",
+            [&w[0], &format!("{{\"next\":\"{}\"}}", w[1])],
+        ).unwrap();
+    }
+    for chunk in games.chunks(16) {
+        crate::owed_judge::judge_subjects(&reference, "owner", chunk, "d1")
+            .await
+            .unwrap();
+    }
+    assert_eq!(stored(&local, "owner"), stored(&reference, "owner"));
+}
+
+/// The steady state: a bootstrapped actor's apply of one game of the heavy seat is ONE round (the closure keyed by the
+/// games: no identity-wide marker key, no spend chain walked), and its record read is the game's, not the seat's.
+#[tokio::test]
+async fn d2_actor_b_fold7_d_the_steady_state_apply_is_one_round() {
+    let f = fold7_chained_seat(600);
+    let record = seeded(&f);
+    let games = games_of(&record, "owner");
+    let local = mirror();
+    let turn = futures_util::lock::Mutex::new(());
+    fold7_bootstrap(&turn, &record, &local, "owner").await;
+    for g in [&games[0], &games[299], &games[599]] {
+        let ev = fold7_event("pot", 40, std::slice::from_ref(g), NOW_MS);
+        match apply_or_hold(&turn, &record, &local, &Fakes, "owner", &ev, None, false)
+            .await
+            .unwrap()
+        {
+            Applied::Done(r, _) => {
+                assert_eq!(r.rounds, 1, "{g}: {r:?}");
+                assert!(
+                    r.record_rows < 20,
+                    "{g}: the game's rows, not the seat's: {r:?}"
+                );
+            }
+            Applied::Held { .. } => panic!("a bootstrapped actor held"),
+        }
+    }
+}
+
+/// The actor's answer to a held event, as the object answers it (`object::apply_route`), for the consumer's pins.
+struct Holding<'a>(&'a WithActor);
+impl SqlPort for Holding<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        self.0.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.0.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.0.log(l);
+    }
+}
+impl JudgeDb for Holding<'_> {
+    fn tip(&self) -> Option<u64> {
+        Some(TIP)
+    }
+    async fn word_views(
+        &self,
+        rows: &BTreeMap<String, crate::tracker_host::stored::Row>,
+    ) -> Result<BTreeMap<String, Value>, String> {
+        Fakes.word_views(rows).await
+    }
+    async fn canonical_root(&self, _: u64) -> Option<String> {
+        None
+    }
+    async fn push(&self, _: &str, _: Value) {}
+    fn d1_judges(&self) -> bool {
+        self.0.d1_judges
+    }
+    fn actor_reads(&self) -> bool {
+        self.0.actor_reads
+    }
+    async fn actor_deliver(
+        &self,
+        identity: &str,
+        games: &[String],
+    ) -> Result<Option<Value>, String> {
+        let turn = futures_util::lock::Mutex::new(());
+        let ev = fold7_event("pot", 77, games, NOW_MS);
+        match apply_or_hold(
+            &turn,
+            &self.0.d1,
+            &self.0.actor,
+            &Fakes,
+            identity,
+            &ev,
+            None,
+            !self.0.d1_judges,
+        )
+        .await?
+        {
+            Applied::Held { rearmed } => {
+                Ok(Some(held_answer(identity, games, ev.at_ms, true, rearmed)))
+            }
+            Applied::Done(report, _) => Ok(Some(answer_of(&report, Vec::new()))),
+        }
+    }
+}
+
+/// THE CONSUMER'S ACK OF A HELD EVENT: the held games' marks are acknowledged as an applied answer's are (up to the
+/// generation read before the call), because the actor holds the event durably and serves no row until it has
+/// applied it (held means not bootstrapped). Phase C (the actor the judge): the marks go, D1 writes no row, the event
+/// stands in the actor; its bootstrap then derives the D1 judge's rows. Phase B: the D1 judge acknowledges, no compare
+/// is counted (a held answer has no rows), no fault. RED on `d910ad5d`: `held_answer` and `apply_or_hold` do not
+/// exist; Phase C's ack read `appliedGames` alone, so a held answer was `Err("... applied none of the N games")`.
+#[tokio::test]
+async fn d2_actor_b_fold7_e_the_consumer_acks_a_held_event_and_the_actor_applies_it() {
+    for phase_c in [true, false] {
+        let w = WithActor {
+            d1: seeded(&stranded()),
+            actor: mirror(),
+            d1_judges: !phase_c,
+            event: None,
+            actor_reads: !phase_c,
+            actor_fails: Cell::new(false),
+        };
+        let games = games_of(&w.d1, "owner");
+        let holding = Holding(&w);
+        crate::owed_events::deliver(&holding, "owner", &games)
+            .await
+            .unwrap();
+        let left: i64 =
+            w.d1.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM owed_dirty WHERE identity='owner' AND gameId<>''",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(
+            left, 0,
+            "phase C {phase_c}: the held games' marks acknowledged"
+        );
+        assert_eq!(
+            fold7_held(&w.actor).len(),
+            1,
+            "phase C {phase_c}: the event stands in the actor"
+        );
+        assert!(
+            !w.d1
+                .counted
+                .borrow()
+                .iter()
+                .any(|(k, _)| k == COUNTERS[2] || k == COUNTERS[0]),
+            "no fault, no compare"
+        );
+        let turn = futures_util::lock::Mutex::new(());
+        let (_, _, drain) = fold7_bootstrap(&turn, &w.d1, &w.actor, "owner").await;
+        assert_eq!(drain.applied.len(), 1);
+        let reference = d1_judge(&stranded()).await;
+        assert_eq!(
+            stored(&w.actor, "owner"),
+            stored(&reference, "owner"),
+            "phase C {phase_c}"
+        );
+    }
+}
+
+/// Item 5: the health snapshot's `asOfMs` is its stamp whenever the figures are served. D1 binds every JS number as a
+/// REAL (`routes::D1Sql`, `JsValue::from_f64`), so `json_object('asOfMs',?1)` stored `1793190803706.0` and `as_u64`
+/// served null beside the figures. Run here with the REAL bind D1 makes. RED on `d910ad5d`: `asOfMs: null`.
+#[test]
+fn d2_actor_b_fold7_f_as_of_ms_is_the_snapshots_stamp() {
+    let db = seeded(&Fixture {
+        name: "empty",
+        seed: Vec::new(),
+        identities: Vec::new(),
+    });
+    let now: u64 = 1_793_190_803_706;
+    db.conn
+        .execute(HEALTH_SNAPSHOT_SQL, rusqlite::params![now as f64, 0.0f64])
+        .unwrap();
+    let cursor: String = db
+        .conn
+        .query_row(
+            "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:health'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let snap = health_snapshot_of(Some(&cursor)).unwrap();
+    let body = health_body(Some(&snap), now + 5, true, &Value::Null);
+    assert_eq!(body["asOfMs"], json!(now), "{cursor}");
+    assert_eq!(body["healthRead"], json!(true));
+    // A row written before the fold (a REAL in the JSON) is read as its stamp too.
+    let old = json!({"asOfMs": now as f64, "bars": "[]", "counters": "{}"});
+    assert_eq!(
+        health_body(Some(&old), now, true, &Value::Null)["asOfMs"],
+        json!(now)
+    );
+}
+
+/// The amendment's item 7: the cold path's OWN bar. Two events held at 10 s and 4 s before the drain: ONE cold sample
+/// a cold actor, from the FIRST held event's write time to the held events applied; served `coldMsP95`, `coldMsMax`,
+/// `coldSamples` from the fleet's durable rows; never in the warm `rowsVisibleMsP95`.
+#[tokio::test]
+async fn d2_actor_b_fold7_g_the_cold_figure_is_noted_once_from_the_first_held_event() {
+    let f = fold7_chained_seat(20);
+    let record = seeded(&f);
+    let games = games_of(&record, "owner");
+    let local = mirror();
+    local.now.set(NOW_MS);
+    let turn = futures_util::lock::Mutex::new(());
+    for (seq, at) in [(3, NOW_MS - 10_000), (4, NOW_MS - 4_000)] {
+        let ev = fold7_event("pot", seq, &games[seq as usize..seq as usize + 1], at);
+        apply_or_hold(&turn, &record, &local, &Fakes, "owner", &ev, None, false)
+            .await
+            .unwrap();
+    }
+    let (_, _, drain) = fold7_bootstrap(&turn, &record, &local, "owner").await;
+    assert_eq!(drain.applied.len(), 2);
+    assert_eq!(
+        drain.cold_ms,
+        Some(10_000),
+        "one sample, from the first held event"
+    );
+    let mut pending = PendingBars::default();
+    pending.note_cold(drain.cold_ms.unwrap());
+    let d1 = seeded(&Fixture {
+        name: "empty",
+        seed: Vec::new(),
+        identities: Vec::new(),
+    });
+    flush_bars_from(&d1, NOW_MS, &pending).await.unwrap();
+    let rows = d1
+        .run_batch(vec![Stmt::new(BARS_READ_SQL, vec![])])
+        .await
+        .unwrap()[0]
+        .rows
+        .clone();
+    let fleet = fleet_bars(&rows, NOW_MS);
+    assert_eq!(
+        (
+            fleet["coldMsP95"].clone(),
+            fleet["coldMsMax"].clone(),
+            fleet["coldSamples"].clone()
+        ),
+        (json!(10_000), json!(10_000), json!(1))
+    );
+    assert_eq!(
+        fleet["rowsVisibleMsP95"],
+        Value::Null,
+        "the warm bar carries no cold cost"
+    );
+    // The served body (the snapshot) names it at the top.
+    d1.run_batch(vec![health_snapshot_stmt(NOW_MS, true)])
+        .await
+        .unwrap();
+    let cursor: String = d1
+        .conn
+        .query_row(
+            "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:health'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let body = health_body(
+        health_snapshot_of(Some(&cursor)).as_ref(),
+        NOW_MS,
+        true,
+        &Value::Null,
+    );
+    assert_eq!(body["coldMsP95"], json!(10_000));
+    assert_eq!(body["held"], json!(0));
+}
+
+/// The captain's item 11, natively: workers-rs 0.8.7 reads an `i64` alarm as an OFFSET (`ScheduledTime: From<i64>`),
+/// so every site passes one through `alarm_in` / `alarm_at` (`alarm_offset_ms`); no other `set_alarm` stands in the
+/// object. RED on `d910ad5d`: seven sites passed an epoch stamp (`set_alarm(Date::now().as_millis() as i64 ...)`).
+/// The fired-alarm proof on real workerd is `tools/lane-912/owed_actor_alarm.mjs` (`fold7_h`, and `fold7_i`: an actor
+/// armed under a dead alarm re-armed by the lever and by a held event).
+#[test]
+fn d2_actor_b_fold7_h_every_alarm_is_an_offset() {
+    assert_eq!(alarm_offset_ms(60_000, 0), 60_000);
+    assert_eq!(alarm_offset_ms(NOW_MS + 600_000, NOW_MS), 600_000);
+    assert_eq!(
+        alarm_offset_ms(NOW_MS - 5, NOW_MS),
+        0,
+        "a stamp past is now"
+    );
+    // Item 12 (fold7_i natively; its workerd proof is the cell's `(i)`): a bootstrap's alarm lost, or set the way the
+    // old build set it (an epoch stamp read as an offset: about 56 years out), is dead and re-armed; a live one is kept.
+    assert!(alarm_is_dead(None, NOW_MS));
+    assert!(alarm_is_dead(Some((NOW_MS + NOW_MS) as i64), NOW_MS));
+    assert!(!alarm_is_dead(Some(NOW_MS as i64), NOW_MS));
+    assert!(!alarm_is_dead(
+        Some((NOW_MS + BOOTSTRAP_PAGE_DELAY_MS + 60_000) as i64),
+        NOW_MS
+    ));
+    assert!(alarm_is_dead(
+        Some((NOW_MS + BOOTSTRAP_PAGE_DELAY_MS + 60_001) as i64),
+        NOW_MS
+    ));
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    let sets = object.matches(".set_alarm(").count();
+    assert_eq!(sets, 2, "set_alarm only inside alarm_in and alarm_at");
+    assert!(object.contains(".set_alarm(alarm_offset_ms(offset_ms,0))"));
+    assert!(object.contains(".set_alarm(alarm_offset_ms(at_ms,Date::now().as_millis()))"));
 }
