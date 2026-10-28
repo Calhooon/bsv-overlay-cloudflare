@@ -85,8 +85,11 @@ pub const HOP_PROBE_MEMO_REORG_CLEAR_SQL: &str =
 /// Rule 2: every memo no reader honours (bind: `now - HOP_PROBE_MEMO_TTL_MS`; the reader refuses
 /// `age >= window`, so the row read exactly at the bound goes too: the lens's N2), never the reorg tombstone,
 /// never the app layer's own rows (its proof latch included: [`HOP_PROBE_MEMO_REORG_DEMOTED_PREFIXES`]).
+/// bsv-low #953 (D2-ACTOR-B-FOLD-9): never the belt's EVIDENCE of a spend (`<txid>:<vout>`, a colon where a memo
+/// has a dot; `low-app-layer` `hops_view::probe_evidence_key`) while the outpoint's index row stands: evidence, not a
+/// memo, so its age is no reason to forget it; one whose index row is gone (evicted) ages out as a memo does.
 pub const HOP_PROBE_MEMO_EXPIRE_SQL: &str =
-    "DELETE FROM hop_chain_probes WHERE probedAtMs <= ? AND outpoint <> 'reorg-clear.0' AND outpoint NOT LIKE 'homeproof:%' AND outpoint NOT LIKE 'homecursor:%' AND outpoint NOT LIKE 'proofmined:%'";
+    "DELETE FROM hop_chain_probes WHERE probedAtMs <= ? AND outpoint <> 'reorg-clear.0' AND outpoint NOT LIKE 'homeproof:%' AND outpoint NOT LIKE 'homecursor:%' AND outpoint NOT LIKE 'proofmined:%' AND NOT (substr(outpoint,65,1)=':' AND EXISTS (SELECT 1 FROM pot_records p WHERE p.txid=substr(hop_chain_probes.outpoint,1,64) AND p.outputIndex=CAST(substr(hop_chain_probes.outpoint,66) AS INTEGER)))";
 
 /// Rule 3: the tombstone's key in `hop_chain_probes.outpoint`. It has the memo key's shape (`<txid>.<vout>`)
 /// with a txid no transaction has, so the app layer reads it in the same `IN` read as the memos it judges (one

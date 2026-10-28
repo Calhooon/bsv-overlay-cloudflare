@@ -441,17 +441,17 @@
       "censusKey": null
     },
     "owed-belt-tick-fleet": {
-      "route": "POST /internal/owed-belt-tick after the tip mark's cell (lane D2-OWED-FOLD-5, 2026-10-26; the third delta lens's D3-N2 and D3-M1): the belt tier's seed plus the 1,040 strangers (each its own identity; 1,000 dated an hour ahead and not due) and a first-class flood of 40 courier-dependent sweeps judged below the stand-in's tip and due now, one second-class row due inside the walk's window. The walk reads its whole window of 512 dated identities (maxReads 1,537, the walk's statement), the flood holds 7 places and the second class's one due row its reserved place (the other yields). At 720 ticks a day a full-window tick of 8 finds is about 1.57 M rows read a day (the walk alone about 1.11 M), near 8 % of prod's 20 M budget; a tick whose window holds fewer dated identities reads less",
+      "route": "POST /internal/owed-belt-tick after the tip mark's cell (lane D2-OWED-FOLD-5, 2026-10-26; the third delta lens's D3-N2 and D3-M1): the belt tier's seed plus the 1,040 strangers (each its own identity; 1,000 dated an hour ahead and not due) and a first-class flood of 40 courier-dependent sweeps judged below the stand-in's tip and due now, one second-class row due inside the walk's window. The walk reads its whole window of 512 dated identities (maxReads 1,537, the walk's statement), the flood holds 7 places and the second class's one due row its reserved place (the other yields). At 720 ticks a day a full-window tick of 8 finds is about 1.57 M rows read a day (the walk alone about 1.11 M), near 8 % of prod's 20 M budget; a tick whose window holds fewer dated identities reads less. Re-measured by lane D2-ACTOR-B-FOLD-9 (2026-10-28, bsv-low #953): writes 54 to 110, statements 178 to 202, reads 2,180 to 2,220 (each of the 8 finds now writes the belt's durable evidence of the spend, `hop_chain_probes` `<txid>:<vout>`, and its dirty mark, `owed_dirty` `hop` with its index entries, acknowledged in the D1 judge's batch: about 7 writes a find); the ceiling's writes 81 to 153",
       "measured": {
-        "reads": 2180,
-        "writes": 54,
-        "stmts": 178,
+        "reads": 2220,
+        "writes": 110,
+        "stmts": 202,
         "maxReads": 1537,
         "calls": 16
       },
       "ceiling": {
         "reads": 3270,
-        "writes": 81,
+        "writes": 153,
         "stmts": 267,
         "maxReads": 2306,
         "calls": 24

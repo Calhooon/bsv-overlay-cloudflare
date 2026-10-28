@@ -1425,6 +1425,23 @@ impl HeldEvent {
     }
 }
 
+/// bsv-low #953 item 6 (the captain's ruling, read on beta through `GET /internal/owed-actor-rows`): the tip the actor
+/// holds, the greater of its rows' judged tip (`owed_rows.probeTip`) and the tip alarm's stamp (`meta.tipJudged`).
+/// `None` only for an actor never judged at a tip.
+pub const HELD_TIP_SQL: &str = "SELECT MAX(t) AS tip FROM (SELECT MAX(probeTip) AS t FROM owed_rows WHERE identity=?1 UNION ALL SELECT CAST(value AS INTEGER) FROM meta WHERE name='tipJudged')";
+
+/// [`HELD_TIP_SQL`] read; a fault reads as no tip (the apply then judges as it did).
+pub async fn held_tip<L: SqlPort>(local: &L, me: &str) -> Option<u64> {
+    local
+        .run_batch(vec![Stmt::new(HELD_TIP_SQL, vec![Bind::Text(me.into())])])
+        .await
+        .ok()?
+        .first()?
+        .rows
+        .first()?["tip"]
+        .as_u64()
+}
+
 /// How one apply ended: applied, or HELD (the actor not bootstrapped; `rearmed`, a bootstrapped actor whose closure
 /// met its bound and un-stamped itself).
 #[derive(Debug)]
@@ -1459,8 +1476,14 @@ pub async fn apply_or_hold<R: SqlPort, L: SqlPort, O: Outside>(
         return Ok(Applied::Held { rearmed: false });
     }
     let kind_seq = ev.kind.as_deref().zip(ev.seq);
+    // bsv-low #953 item 6: a body with no tip (the reconcile's re-apply as built, any caller whose tip read failed)
+    // is judged at the tip the actor holds, never as tip-unknown over rows judged at a tip.
+    let tip = match ev.tip {
+        Some(t) => Some(t),
+        None => held_tip(local, me).await,
+    };
     match apply_event_in_turn(
-        turn, record, local, outside, me, &ev.games, kind_seq, ev.tip, era_ms, publish, ev.bound,
+        turn, record, local, outside, me, &ev.games, kind_seq, tip, era_ms, publish, ev.bound,
     )
     .await
     {

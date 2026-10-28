@@ -705,6 +705,29 @@ async fn hydrate_evidence(
             .map(memo),
         );
     }
+    // bsv-low #953: a hop whose memo is gone (aged out and swept) is judged on the belt's durable evidence of a spend,
+    // as a memo that is not fresh; a memo, while it stands, is the newer word.
+    for keys in hops_view::probe_evidence_read_chunks(&hop_pairs) {
+        for r in read::<Value>(
+            db,
+            hops_view::probe_memo_read_sql(keys.len()),
+            strings(keys),
+        )
+        .await?
+        {
+            let mut m = memo(&r);
+            let Some((t, v)) = m.outpoint.rsplit_once(':') else {
+                continue;
+            };
+            let Ok(v) = v.parse::<u32>() else {
+                continue;
+            };
+            m.outpoint = hops_view::probe_memo_key(t, v);
+            if m.spent && !memos.iter().any(|x| x.outpoint == m.outpoint) {
+                memos.push(m);
+            }
+        }
+    }
     let clear = hops_view::reorg_clear_at(&memos);
     let fresh = hops_view::split_probe_targets_at_tip(
         &hop_pairs,
