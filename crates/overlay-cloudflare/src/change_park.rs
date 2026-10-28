@@ -1087,6 +1087,12 @@ pub async fn internal_lever(
             }
             for (t, v) in &pots {
                 crate::pot_changes::note(t, *v);
+                // bsv-low #911 (D2-ACTOR-A-FOLD-4): the lever writes no pot row, so it owes no `pot` event: the
+                // owed note `pot_changes::note` makes for a writer is taken back (the cell measures the park alone)
+                crate::owed_events::forget(
+                    "pot",
+                    &overlay_discovery::owed_event::outpoint_key(t, *v),
+                );
             }
             for h in &body.hops {
                 crate::hop_changes::note(h, h);
