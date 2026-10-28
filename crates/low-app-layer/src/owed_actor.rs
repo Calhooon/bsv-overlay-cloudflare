@@ -1355,6 +1355,13 @@ pub const GATED_GAMES_SQL: &str = "SELECT DISTINCT gameId FROM owed_rows WHERE (
 /// the next alarms, and at [`TIP_FAULTS_MAX`] consecutive faults it is PARKED: left out of every later window until an
 /// apply of it lands by another road (an event, the reconcile; `apply_route` clears its entry). Fail-safe: a parked
 /// game keeps the rows of its last landed judgement, and the read withholds what its marks downgrade.
+///
+/// The third delta lens's LOW-1: a fault counts toward the park only in an alarm where some apply of the window
+/// LANDED. An alarm in which no apply landed (the actor's D1 record unreachable, say) is the ACTOR's fault, not a
+/// game's: its games are carried at the count they held (a new one at 0), retried, and never parked for it. So a
+/// game that faults alone among landed games is parked at its third such fault; a window of one game that always
+/// faults is retried on every alarm, never parked (stated). Each game parked is counted
+/// (`owed_actor_tip_parked_total`, served `/health.owedActor.tipParked`).
 pub const TIP_FAULTS_MAX: u32 = 3;
 
 /// One tip alarm's window ([`tip_window`]).
@@ -1370,6 +1377,10 @@ pub struct TipWindow {
     pub parked: Vec<String>,
     /// `owed_actor_tip_faults_total`'s delta: 1 for an alarm with a faulted game, once whatever their number.
     pub counted: u64,
+    /// LOW-1: `owed_actor_tip_parked_total`'s delta, the games this alarm parked.
+    pub parked_counted: u64,
+    /// LOW-1: whether any apply of this alarm landed (else no fault counted toward the park).
+    pub landed: bool,
     /// The alarm's line, when a game faulted.
     pub line: Option<String>,
 }
@@ -1397,8 +1408,10 @@ where
     games.retain(|g| held.get(g).is_none_or(|n| *n < TIP_FAULTS_MAX));
     let mut faults = held.clone();
     let mut faulted = Vec::new();
+    let mut landed = false;
     for chunk in games.chunks(GAMES_PER_APPLY) {
         if apply(chunk.to_vec()).await {
+            landed = true;
             for g in chunk {
                 faults.remove(g);
             }
@@ -1406,11 +1419,19 @@ where
         }
         for g in chunk {
             if chunk.len() > 1 && apply(vec![g.clone()]).await {
+                landed = true;
                 faults.remove(g);
             } else {
-                *faults.entry(g.clone()).or_default() += 1;
                 faulted.push(g.clone());
             }
+        }
+    }
+    // LOW-1: a fault counts toward the park only when some apply of this alarm landed; otherwise it is the actor's,
+    // and each faulted game is carried at the count it held.
+    for g in &faulted {
+        let n = faults.entry(g.clone()).or_default();
+        if landed {
+            *n += 1;
         }
     }
     let parked: Vec<String> = faulted
@@ -1420,12 +1441,15 @@ where
         .collect();
     let line = (!faulted.is_empty()).then(|| {
         format!(
-            "[owed-actor] TIP WINDOW FAULT {identity}: games {faulted:?} faulted (carried, retried up to {TIP_FAULTS_MAX} alarms); parked {parked:?}; tipJudged {tip}"
+            "[owed-actor] TIP WINDOW FAULT {identity}: games {faulted:?} faulted (carried, retried up to {TIP_FAULTS_MAX} alarms{}); parked {parked:?}; tipJudged {tip}",
+            if landed { "" } else { "; no apply landed: the actor's fault, not counted toward the park" }
         )
     });
     TipWindow {
         tip_judged: tip,
         counted: u64::from(!faulted.is_empty()),
+        parked_counted: parked.len() as u64,
+        landed,
         faults,
         faulted,
         parked,
@@ -1771,7 +1795,7 @@ pub fn fleet_bars(rows: &[Value], now: u64) -> Value {
 
 /// `/health.owedActor`'s one D1 statement (MEDIUM-1, MEDIUM-7, MEDIUM-8): the class rows, the actor's durable totals
 /// and the identities holding owed rows (a count over `owed_state`, one row an identity).
-pub const HEALTH_SQL: &str = "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',tickedAtMs)) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage";
+pub const HEALTH_SQL: &str = "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',tickedAtMs)) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage";
 
 /// The served object: this isolate's bars under `isolate`, the fleet's figures at the top (the harness's keys),
 /// the durable compare totals (MEDIUM-8: Phase B's gate), the bootstraps beside the identities holding rows
@@ -1812,6 +1836,9 @@ pub fn health_body(
     // window held a faulting game.
     body["heldDiffsTotal"] = json!(n(COUNTERS[17]));
     body["tipFaults"] = json!(n(COUNTERS[18]));
+    // The third delta lens's LOW-1: the games the tip alarm parked; LOW-2: the schema plans that did not apply whole.
+    body["tipParked"] = json!(n(COUNTERS[19]));
+    body["schemaPartial"] = json!(n(COUNTERS[20]));
     // NEW-L3: Phase B's gate is COVERAGE, the bootstrap lever's last full pass (`complete`, `contiguous`, `uncovered`
     // 0), never `bootstraps` against `activeIdentities` (two counts).
     body["coverage"] = read
@@ -2078,7 +2105,7 @@ mod tests;
 /// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
 /// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
 /// (MEDIUM-9).
-pub const COUNTERS: [&str; 19] = [
+pub const COUNTERS: [&str; 21] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -2101,6 +2128,10 @@ pub const COUNTERS: [&str; 19] = [
     "owed_actor_compare_held_total",
     // NEW2-L5: the tip alarms whose window held a game whose apply faulted (each named in its line).
     "owed_actor_tip_faults_total",
+    // The third delta lens's LOW-1: the games the tip alarm parked (a fault counted only where another apply landed).
+    "owed_actor_tip_parked_total",
+    // LOW-2: an actor's schema plan that did not apply whole (its digest left unstamped, retried by its next instance).
+    "owed_actor_schema_partial_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;

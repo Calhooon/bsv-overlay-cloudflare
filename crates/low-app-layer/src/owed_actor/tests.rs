@@ -2914,7 +2914,8 @@ async fn d2_actor_b_fold4_l1_a_held_marks_diff_is_counted_apart() {
 /// NEW2-L4: `digest` and `shape` are stamped only when every statement of the plan answered: a plan with one failing
 /// `CREATE INDEX` stamps nothing (the next ensure computes the same plan and retries it), the same plan whole stamps
 /// both. New API; RED with `ensure_schema` grafted to the base's rule (stamp after the loop whatever answered):
-/// `left: 2 right: 0`.
+/// `left: 2 right: 0`. Amended by the third delta lens's LOW-2: a failed `CREATE INDEX` stamps `shape` (every table
+/// statement answered) and never the digest; a failed TABLE statement stamps neither.
 #[test]
 fn d2_actor_b_fold4_l4_a_failed_plan_statement_stamps_nothing() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -2933,6 +2934,23 @@ fn d2_actor_b_fold4_l4_a_failed_plan_statement_stamps_nothing() {
         .unwrap()
     };
     let mut lines = Vec::new();
+    let mut table_failing = plan.clone();
+    table_failing.push("CREATE TABLE no_such_schema.t(x)".into());
+    let whole = object::ensure_schema(
+        &table_failing,
+        |s| conn.execute_batch(s).map_err(|e| e.to_string()),
+        |l| lines.push(l),
+        |n, v| {
+            conn.execute(META_PUT_SQL, [n, v]).unwrap();
+        },
+    );
+    assert!(!whole);
+    assert_eq!(
+        stamps(&conn),
+        0,
+        "a failed table statement stamped: {lines:?}"
+    );
+    assert!(lines.iter().any(|l| l.contains("NOT stamped")));
     let whole = object::ensure_schema(
         &failing,
         |s| conn.execute_batch(s).map_err(|e| e.to_string()),
@@ -2942,8 +2960,13 @@ fn d2_actor_b_fold4_l4_a_failed_plan_statement_stamps_nothing() {
         },
     );
     assert!(!whole);
-    assert_eq!(stamps(&conn), 0, "a failed statement stamped: {lines:?}");
-    assert!(lines.iter().any(|l| l.contains("NOT stamped")));
+    assert_eq!(stamps(&conn), 1, "only the shape: {lines:?}");
+    let schema: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE name='schema'", [], |r| {
+            r.get(0)
+        })
+        .ok();
+    assert_eq!(schema, None, "a failed index stamped the digest");
     let whole = object::ensure_schema(
         &plan,
         |s| conn.execute_batch(s).map_err(|e| e.to_string()),
@@ -2983,7 +3006,16 @@ fn d2_actor_b_fold4_l4_a_failed_plan_statement_stamps_nothing() {
 /// removed (`{"a": 3, "b": 3, "c": 3}`, `left: 3 right: 2`: one faulting game carries its whole window, the base's).
 #[tokio::test]
 async fn d2_actor_b_fold4_l5_a_faulting_tip_game_never_holds_the_window() {
-    let gates: [(&str, i64); 3] = [("a", 101), ("b", 102), ("c", 103)];
+    // Amended by the third delta lens's LOW-1: a fault counts toward the park only in an alarm where another apply
+    // landed, so each alarm opens one more gate (`d`, `e`, `f`) beside the carried `b`.
+    let gates: [(&str, i64); 6] = [
+        ("a", 101),
+        ("b", 102),
+        ("c", 103),
+        ("d", 104),
+        ("e", 105),
+        ("f", 106),
+    ];
     let applied = std::cell::RefCell::new(BTreeMap::<String, usize>::new());
     let mut last = 100i64;
     let mut held = BTreeMap::new();
@@ -3021,8 +3053,13 @@ async fn d2_actor_b_fold4_l5_a_faulting_tip_game_never_holds_the_window() {
     );
     assert_eq!(applied["c"], 2, "C: once: {applied:?}");
     assert_eq!(
-        applied["b"], 4,
-        "B: the chunk, then its single on three alarms, then parked: {applied:?}"
+        applied["b"], 6,
+        "B: its chunk and its single on three alarms, then parked: {applied:?}"
+    );
+    assert_eq!(
+        (applied["d"], applied["e"], applied["f"]),
+        (2, 2, 1),
+        "{applied:?}"
     );
     assert_eq!(last, 106, "tipJudged moved with every alarm");
     assert_eq!(held.get("b"), Some(&TIP_FAULTS_MAX), "parked");
@@ -3083,4 +3120,180 @@ fn d2_actor_b_fold4_l3_a_waiters_take_writes_nothing() {
         1,
         "a new minute counts from one"
     );
+}
+
+/// The third delta lens's LOW-1 (its `lens3_pd`): a window of 130 games and three alarms in which EVERY apply faults
+/// (the actor's D1 record unreachable): the fault is the actor's, not a game's, so no game is parked, each alarm's
+/// fault is still counted once and its line says so; when the fault clears, every carried game is applied. RED on
+/// `5a88734d` (the count moved in every alarm): `parked after three whole-actor faults: left: 130 right: 0`.
+#[tokio::test]
+async fn d2_actor_b_fold5_l1_a_whole_actor_fault_parks_no_game() {
+    let games: Vec<String> = (0..130).map(|i| format!("g{i:03}")).collect();
+    let mut held = BTreeMap::new();
+    let mut counted = 0;
+    let mut parked_counted = 0;
+    let mut lines = Vec::new();
+    for alarm in 0..3 {
+        let sel = if alarm == 0 {
+            games.clone()
+        } else {
+            Vec::new()
+        };
+        let w = tip_window("owner", sel, &held, 200 + alarm, |_c: Vec<String>| async {
+            false
+        })
+        .await;
+        counted += w.counted;
+        parked_counted += w.parked_counted;
+        lines.extend(w.line.clone());
+        held = w.faults;
+    }
+    let parked = held.values().filter(|n| **n >= TIP_FAULTS_MAX).count();
+    assert_eq!(parked, 0, "parked after three whole-actor faults");
+    assert_eq!(parked_counted, 0);
+    assert_eq!(counted, 3, "the fault counted once an alarm");
+    assert_eq!(held.len(), 130, "every game carried");
+    assert!(
+        lines.iter().all(|l| l.contains("no apply landed")),
+        "{lines:?}"
+    );
+    let applied = std::cell::RefCell::new(Vec::<String>::new());
+    let w = tip_window("owner", vec!["new".into()], &held, 300, |c: Vec<String>| {
+        applied.borrow_mut().extend(c);
+        async { true }
+    })
+    .await;
+    assert!(applied.borrow().contains(&"g000".to_string()));
+    assert_eq!(applied.borrow().len(), 131);
+    assert!(w.faults.is_empty() && w.line.is_none());
+    let object = include_str!("object.rs")
+        .split_whitespace()
+        .collect::<String>();
+    let alarm = &object[object.find("asyncfnalarm(").unwrap()..];
+    assert!(alarm.contains("(COUNTERS[19].into(),window.parked_counted)"));
+    assert_eq!(COUNTERS[19], "owed_actor_tip_parked_total");
+}
+
+/// LOW-1's control: a game that faults ALONE among landed games is still parked at its third such alarm and counted
+/// (`parked_counted` 1 in that alarm); a whole-actor alarm in between does not move its count.
+#[tokio::test]
+async fn d2_actor_b_fold5_l1_a_game_faulting_among_landed_games_is_parked() {
+    let mut held = BTreeMap::new();
+    let mut parked_counted = 0;
+    for alarm in 0..4 {
+        let sel = if alarm == 0 {
+            vec!["a".to_string(), "b".to_string()]
+        } else {
+            vec![format!("n{alarm}")]
+        };
+        let whole_actor = alarm == 1;
+        let w = tip_window("owner", sel, &held, 100 + alarm, |c: Vec<String>| {
+            let ok = !whole_actor && !c.iter().any(|g| g == "b");
+            async move { ok }
+        })
+        .await;
+        if alarm == 1 {
+            assert!(!w.landed);
+            assert_eq!(
+                w.faults.get("b"),
+                Some(&1),
+                "a whole-actor alarm moves no count"
+            );
+        }
+        parked_counted += w.parked_counted;
+        if alarm == 3 {
+            assert_eq!(w.parked, vec!["b".to_string()]);
+        }
+        held = w.faults;
+    }
+    assert_eq!(held.get("b"), Some(&TIP_FAULTS_MAX), "parked");
+    assert_eq!(parked_counted, 1, "counted");
+}
+
+/// The third delta lens's LOW-2: a REBUILD plan whose one `CREATE INDEX` fails stamps `shape` (every table statement
+/// answered) and not the digest, so the next instance takes the INDEX-ONLY path: `bootstrapped` kept, no second
+/// rebuild; the plan reports not whole (the caller counts `owed_actor_schema_partial_total`). RED on `5a88734d`
+/// (nothing stamped): `the next instance rebuilds again`.
+#[test]
+fn d2_actor_b_fold5_l2_a_failed_index_on_a_rebuild_retries_as_index_only() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(META_CREATE).unwrap();
+    for (n, v) in [
+        ("schema", "an-older-digest"),
+        ("shape", "an-older-shape"),
+        ("identity", "owner"),
+        ("bootstrapped", "1"),
+    ] {
+        conn.execute(META_PUT_SQL, [n, v]).unwrap();
+    }
+    let meta = |conn: &rusqlite::Connection, name: &str| -> Option<String> {
+        conn.query_row(META_GET_SQL, [name], |r| r.get(0)).ok()
+    };
+    let plan = object::schema_plan_kept(Some("an-older-digest"), Some("an-older-shape"), &[]);
+    assert!(
+        plan.iter().any(|s| s.starts_with("DROP TABLE")),
+        "a rebuild"
+    );
+    let failing = plan
+        .iter()
+        .find(|s| s.trim_start().starts_with("CREATE INDEX"))
+        .cloned()
+        .unwrap();
+    let mut lines = Vec::new();
+    let whole = object::ensure_schema(
+        &plan,
+        |s| {
+            if s == failing {
+                return Err("SQLITE_ERROR: refused".into());
+            }
+            conn.execute_batch(s).map_err(|e| e.to_string())
+        },
+        |l| lines.push(l),
+        |n, v| {
+            conn.execute(META_PUT_SQL, [n, v]).unwrap();
+        },
+    );
+    assert!(!whole, "not whole: the caller counts it");
+    assert_eq!(meta(&conn, "schema").as_deref(), Some("an-older-digest"));
+    // The rebuild ran once; its bootstrap ends and stamps `bootstrapped`.
+    conn.execute(META_PUT_SQL, ["bootstrapped", "1"]).unwrap();
+    // The next instance.
+    let held_indexes: Vec<String> = {
+        let mut st = conn.prepare(object::HELD_INDEXES_SQL).unwrap();
+        st.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let shape = meta(&conn, "shape");
+    let next = object::schema_plan_kept(
+        meta(&conn, "schema").as_deref(),
+        shape.as_deref(),
+        &held_indexes,
+    );
+    assert!(
+        !next
+            .iter()
+            .any(|s| s.starts_with("DROP TABLE") || s.starts_with("DELETE FROM meta")),
+        "the next instance rebuilds again: {lines:?}"
+    );
+    let whole = object::ensure_schema(
+        &next,
+        |s| conn.execute_batch(s).map_err(|e| e.to_string()),
+        |_| {},
+        |n, v| {
+            conn.execute(META_PUT_SQL, [n, v]).unwrap();
+        },
+    );
+    assert!(whole);
+    assert_eq!(meta(&conn, "bootstrapped").as_deref(), Some("1"), "kept");
+    assert_eq!(meta(&conn, "schema"), Some(actor_digest()));
+    let object = include_str!("object.rs")
+        .split_whitespace()
+        .collect::<String>();
+    let local = &object[object.find("fnlocal(&self)->DoSql").unwrap()..];
+    assert!(local.contains("if!whole{*self.schema_partial.borrow_mut()=true;}"));
+    let rearm = &object[object.find("asyncfnrearm_after_rebuild").unwrap()..];
+    assert!(rearm.contains("(COUNTERS[20].into(),1)"));
+    assert_eq!(COUNTERS[20], "owed_actor_schema_partial_total");
 }
