@@ -61,6 +61,10 @@ pub const CONSUMER_ROW_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tick
 /// The consumer's row.
 pub const HEALTH_CONSUMER_SQL: &str =
     "SELECT cursor,tickedAtMs FROM owed_belt_state WHERE name='owed-events:consumer'";
+/// D2-ACTOR-A-FOLD-5 (bsv-low #911, E2): the queue's two totals `/health.owedEvents` serves (the harness's
+/// `owed-queue-backlog` row reads published minus consumed there): two primary-key rows of `ops_counters`, never the
+/// family's whole counter read.
+pub const HEALTH_TOTALS_SQL: &str = "SELECT name,value FROM ops_counters WHERE name IN ('owed_events_published_total','owed_events_consumed_total')";
 /// LOW-3 and the lens's MEDIUM-2: park one dead letter ON ITS PAIR'S ROW (`?1` source, `?2` sourceKey, `?3` the
 /// message id, `?4` the body, `?5` now, `?6` the pair's fault memo row, `?7` the bound, `?8`
 /// `owed_events_publish::MAX_REDRIVES`). A new pair is taken only under the bound (a full table answers no row: the
@@ -1217,20 +1221,48 @@ async fn park_dead_letters(
 
 /// MEDIUM-8: `/health.owedEvents`: the served ages, from rows (never a scan): the drain's backlog snapshot `dirty`
 /// (`owed_judge::dirty_health`, the one `/health` already reads for `owed.dirty`) and the consumer's batch row (one
-/// primary-key read). D2-ACTOR-A-FOLD-4: the totals, the fault memo and the dead letters are the overlay's
-/// `/health/invariants.owedEvents` (its counters and `publish::HEALTH_STATE_SQL`); here they cost the route five
-/// statements and a 16-row counter read past its budget (the tier's `health-dirty-snapshot`).
+/// primary-key read). D2-ACTOR-A-FOLD-4: the fault memo, the dead letters and the family's other totals are the
+/// overlay's `/health/invariants.owedEvents` (its counters and `publish::HEALTH_STATE_SQL`); here they cost the route
+/// five statements and a 16-row counter read past its budget (the tier's `health-dirty-snapshot`).
+/// D2-ACTOR-A-FOLD-5: `publishedTotal` and `consumedTotal` stay here, numbers (0 for an absent row), read by
+/// [`HEALTH_TOTALS_SQL`] (two rows) in the consumer row's batch.
 pub async fn health(db: &impl SqlPort, dirty: &Value) -> Value {
-    let consumer = rows(db, HEALTH_CONSUMER_SQL, vec![])
+    let read = db
+        .run_batch(vec![
+            Stmt {
+                sql: HEALTH_CONSUMER_SQL.into(),
+                binds: vec![],
+            },
+            Stmt {
+                sql: HEALTH_TOTALS_SQL.into(),
+                binds: vec![],
+            },
+        ])
         .await
-        .ok()
-        .and_then(|r| r.into_iter().next())
+        .ok();
+    let consumer = read
+        .as_ref()
+        .and_then(|r| r.first())
+        .and_then(|o| o.rows.first())
         .and_then(|r| {
             r["cursor"]
                 .as_str()
                 .and_then(|c| serde_json::from_str::<Value>(c).ok())
         });
+    let total = |name: &str| -> u64 {
+        read.as_ref()
+            .and_then(|r| r.get(1))
+            .and_then(|o| o.rows.iter().find(|r| r["name"].as_str() == Some(name)))
+            .and_then(|r| {
+                r["value"]
+                    .as_u64()
+                    .or_else(|| r["value"].as_f64().map(|f| f as u64))
+            })
+            .unwrap_or(0)
+    };
     json!({
+        "publishedTotal": total("owed_events_published_total"),
+        "consumedTotal": total("owed_events_consumed_total"),
         "unackedMarks": dirty["count"],
         "oldestUnackedMarkAgeMs": dirty["oldestMarkAgeMs"],
         "oldestEnqueueAgeMs": consumer.as_ref().map(|c| c["oldestEnqueueAgeMs"].clone()),
