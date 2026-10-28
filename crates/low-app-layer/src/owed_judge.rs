@@ -220,6 +220,11 @@ pub trait JudgeDb: SqlPort {
     fn d1_judges(&self) -> bool {
         true
     }
+    /// bsv-low #912 (Phase B, `OWED_ACTOR_READ`): does the read serve the actor's rows? Then a delivery applies the
+    /// actor before the D1 judge acknowledges the marks (the D2-ACTOR-B lens's HIGH-3).
+    fn actor_reads(&self) -> bool {
+        false
+    }
     /// bsv-low #912: the identity's actor applies the games (`owed_actor::object::call_apply`); `None` where no
     /// actor is bound (the native judges, a render without the class).
     async fn actor_deliver(
@@ -268,6 +273,7 @@ pub struct D1Judge {
     /// bsv-low #912: the event this judge serves (its kind, seq, write time, a mined word), for the actor's call.
     event: Option<crate::owed_actor::EventCtx>,
     d1_judges: bool,
+    actor_reads: bool,
 }
 impl D1Judge {
     pub fn new(env: &worker::Env, tip: Option<u64>, era_ms: Option<i64>) -> worker::Result<Self> {
@@ -278,6 +284,11 @@ impl D1Judge {
             event: None,
             d1_judges: crate::owed_actor::d1_judge_on(
                 env.var(crate::owed_actor::D1_JUDGE_FLAG)
+                    .ok()
+                    .map(|v| v.to_string()),
+            ),
+            actor_reads: crate::owed_actor::flag_on(
+                env.var(crate::owed_actor::READ_FLAG)
                     .ok()
                     .map(|v| v.to_string()),
             ),
@@ -309,6 +320,9 @@ impl JudgeDb for D1Judge {
     }
     fn d1_judges(&self) -> bool {
         self.d1_judges
+    }
+    fn actor_reads(&self) -> bool {
+        self.actor_reads
     }
     async fn actor_deliver(
         &self,

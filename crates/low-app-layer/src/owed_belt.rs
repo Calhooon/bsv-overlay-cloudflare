@@ -877,6 +877,34 @@ async fn ask_find(
     }
 }
 
+/// Phase B's find (the D2-ACTOR-B lens's HIGH-3): the find's facts written alone, the actor's apply of them, then the
+/// D1 judge; `Err` at the first fault (the facts' marks standing).
+async fn phase_b_find(
+    db: &impl JudgeDb,
+    c: &Candidate,
+    subject: &Subject,
+    find: &Find,
+    now: i64,
+) -> Result<(), String> {
+    db.run_batch(find.statements(now)).await?;
+    if let Some(answer) = db
+        .actor_apply(&c.identity, std::slice::from_ref(&c.game_id), "belt-find")
+        .await?
+    {
+        crate::owed_actor::note_answer(&answer);
+    }
+    owed_judge::judge_with_write(
+        db,
+        std::slice::from_ref(subject),
+        "belt",
+        Vec::new(),
+        &[],
+        |_| Ok(()),
+    )
+    .await
+    .map(|_| ())
+}
+
 /// The ask's backoff ([`backoff`]'s rule over the actor's row): a look that changed nothing doubles the period.
 async fn ask_backoff(
     db: &impl JudgeDb,
@@ -993,6 +1021,23 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
             continue;
         }
         match found {
+            // Phase B (the D2-ACTOR-B lens's HIGH-3): the find's facts land alone, the actor applies them, and only
+            // then the D1 judge (whose batch acknowledges the marks the facts wrote): an actor fault keeps them, so
+            // the read withholds the game's presses and the sweep re-publishes the pair.
+            Ok(Some(find)) if db.actor_reads() => {
+                match phase_b_find(db, &c, &subject, &find, now).await {
+                    Ok(()) => {
+                        report.found += 1;
+                        report.handed_back += 1;
+                        backoff(db, &c, now, &mut report).await;
+                    }
+                    Err(e) => {
+                        db.log(&format!("[owed-belt] {} find faulted: {e}", c.outpoint));
+                        report.write_faults.push((c.outpoint.clone(), e));
+                        rearm(db, &c, now, &mut report).await;
+                    }
+                }
+            }
             Ok(Some(find)) => {
                 let writes = find.statements(now);
                 let identity = c.identity.clone();
@@ -1007,6 +1052,26 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
                 match judged {
                     Ok(_) => {
                         report.found += 1;
+                        // Phase A: the find reaches the actor too (it was judged only in D1 and re-published by
+                        // the sweep); its fault is counted, never the find's.
+                        match db
+                            .actor_apply(&c.identity, std::slice::from_ref(&c.game_id), "belt-find")
+                            .await
+                        {
+                            Ok(Some(answer)) => {
+                                report.handed_back += 1;
+                                crate::owed_actor::note_answer(&answer);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                db.counters(vec![(crate::owed_actor::COUNTERS[2].into(), 1)])
+                                    .await;
+                                db.log(&format!(
+                                    "[owed-actor] FAULT {} (belt-find): {e}",
+                                    c.identity
+                                ));
+                            }
+                        }
                         backoff(db, &c, now, &mut report).await;
                     }
                     Err(e) => {

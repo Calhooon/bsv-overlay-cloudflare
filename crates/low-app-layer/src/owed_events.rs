@@ -353,13 +353,19 @@ pub struct Routed {
 ///
 /// bsv-low #912 (lane D2-ACTOR-B): with `OWED_D1_JUDGE` on (Phases A and B) the D1 judge writes `owed_rows` as
 /// before and the identity's actor applies beside it, its rows compared ([`crate::owed_actor::beside`]; its fault
-/// never fails the message). Off (Phase C) the actor IS the judge and the marks are acknowledged after it applied
+/// never fails the message). Phase B (`OWED_ACTOR_READ` on, the read serving the actor's rows; the D2-ACTOR-B lens's
+/// HIGH-3, option (a)): the actor applies FIRST and its fault hands the message back, then the D1 judge acknowledges
+/// the marks ([`crate::owed_actor::actor_then_d1`]), so no mark that withholds a press is gone before the actor
+/// applied. Off (Phase C) the actor IS the judge and the marks are acknowledged after it applied
 /// ([`crate::owed_actor::as_the_judge`]).
 pub async fn deliver(
     db: &impl JudgeDb,
     identity: &str,
     games: &[String],
 ) -> Result<owed_judge::JudgeReport, String> {
+    if db.d1_judges() && db.actor_reads() {
+        return crate::owed_actor::actor_then_d1(db, identity, games).await;
+    }
     if db.d1_judges() {
         let report = owed_judge::judge_subjects(db, identity, games, "owed-events").await?;
         crate::owed_actor::beside(db, identity, games).await;

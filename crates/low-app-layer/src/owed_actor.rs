@@ -20,13 +20,15 @@
 //! word views' header rechecks, the canonical roots) included, runs inside it, and an event arriving meanwhile waits
 //! and is applied after (pin `d2_actor_b_two_events_under_a_slow_chaintracks_derive_the_newer_rows`, RED with the
 //! turn removed: the older judgement's claimable `hop-stranded` row stored over the newer `unbound` one). The judgement that stands is the FIXPOINT round's: the round whose statements named no key the mirror
-//! did not hold. The closure starts from what the mirror already names for the games (closed locally, no record
+//! did not hold; it is the only one WRITTEN (the lens's HIGH-2: [`Noting`] stages each round's commit,
+//! [`commit_fixpoint`] runs the fixpoint's and restores the identity's rows on its fault). The closure starts from what the mirror already names for the games (closed locally, no record
 //! read) and the last judgement's own txids, so a steady-state apply is ONE round: one record batch, one local
 //! write, one judgement.
 //!
 //! ORDER (MEDIUM-1). An apply reads the record as it stands, so its rows are the record's whatever order the events
-//! came in (pin `d2_actor_b_an_out_of_order_pair_derives_the_same_rows`); `applied (kind, seq)` is the redelivery
-//! idempotency; the `txfacts` rows an event carries are last-writer-by-seq per row.
+//! came in (pin `d2_actor_b_an_out_of_order_pair_derives_the_same_rows`); `applied (kind, seq, game)` is the
+//! redelivery idempotency (the D2-ACTOR-B lens's HIGH-1: one event's games arrive in several calls); the `txfacts`
+//! rows an event carries are last-writer-by-seq per row.
 use crate::owed_judge::{FactsFrom, JudgeDb, TxFacts};
 use crate::pot_hook::{Bind, SqlPort, Stmt, StmtOut};
 use serde_json::{json, Value};
@@ -393,9 +395,27 @@ impl Keys {
 }
 
 /// The local SQL with the keys of every statement it runs noted (binds and answers).
+///
+/// The D2-ACTOR-B lens's HIGH-2: the judge's COMMIT (its one write batch, the batch that holds
+/// [`crate::owed_judge::GAME_DELETE_SQL`]) is STAGED here, never run: its binds are noted as a run batch's are, and it
+/// answers as an empty judgement would (no row changed, the state read back as 0 rows). The apply runs the staged
+/// commits of the FIXPOINT round alone, in one synchronous batch ([`commit_fixpoint`]); a round that is not the
+/// fixpoint writes nothing a read can see.
 pub struct Noting<'a, L: SqlPort> {
     pub local: &'a L,
     pub seen: RefCell<BTreeSet<String>>,
+    pub staged: RefCell<Vec<Stmt>>,
+}
+
+/// Is this batch the judge's commit (`owed_judge::judge_with_write`'s plan)?
+fn is_commit(stmts: &[Stmt]) -> bool {
+    stmts
+        .iter()
+        .any(|s| s.sql == crate::owed_judge::GAME_DELETE_SQL)
+}
+/// The judge's state read back at the end of its commit (`owed_judge::judge_with_write`).
+fn is_state_readback(s: &Stmt) -> bool {
+    s.sql.starts_with("SELECT rows,truncated FROM owed_state")
 }
 impl<L: SqlPort> SqlPort for Noting<'_, L> {
     async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
@@ -408,6 +428,21 @@ impl<L: SqlPort> SqlPort for Noting<'_, L> {
                     }
                 }
             }
+        }
+        if is_commit(&stmts) {
+            let out = stmts
+                .iter()
+                .map(|s| StmtOut {
+                    changes: Some(0),
+                    rows: if is_state_readback(s) {
+                        vec![json!({"rows": 0, "truncated": 0})]
+                    } else {
+                        Vec::new()
+                    },
+                })
+                .collect();
+            self.staged.borrow_mut().extend(stmts);
+            return Ok(out);
         }
         let out = self.local.run_batch(stmts).await?;
         let mut seen = self.seen.borrow_mut();
@@ -546,10 +581,22 @@ pub const TXFACTS_DELETE_SQL: &str = "DELETE FROM txfacts WHERE src IN ('pot','s
 const TXFACTS_POT_SQL: &str = "SELECT facts FROM txfacts WHERE txid=?1 AND src='pot'";
 const TXFACTS_STORED_SQL: &str = "SELECT facts FROM txfacts WHERE txid=?1 AND src IN ('stored','event') ORDER BY src='event' LIMIT 1";
 /// The redelivery idempotency (MEDIUM-1) and the actor's own state (the ack watermark, the gate, the reconcile).
-pub const APPLIED_CREATE: &str = "CREATE TABLE IF NOT EXISTS applied (kind TEXT NOT NULL, seq INTEGER NOT NULL, atMs INTEGER NOT NULL, PRIMARY KEY (kind, seq))";
+/// The D2-ACTOR-B lens's HIGH-1: keyed per GAME, so a game is skipped only when the event itself applied it (one
+/// event's games reach the actor in several calls: the consumer's chunks of 16, its singles after a fault).
+pub const APPLIED_CREATE: &str = "CREATE TABLE IF NOT EXISTS applied (kind TEXT NOT NULL, seq INTEGER NOT NULL, game TEXT NOT NULL, atMs INTEGER NOT NULL, PRIMARY KEY (kind, seq, game))";
 pub const META_CREATE: &str = "CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value TEXT)";
-pub const APPLIED_SQL: &str =
-    "INSERT INTO applied(kind,seq,atMs) VALUES (?1,?2,?3) ON CONFLICT DO NOTHING RETURNING seq";
+pub const APPLIED_SQL: &str = "INSERT INTO applied(kind,seq,game,atMs) SELECT ?1,?2,value,?3 FROM json_each(?4) WHERE 1 ON CONFLICT DO NOTHING";
+/// The games of `?3` the event `(?1, ?2)` has applied.
+pub const APPLIED_GAMES_SQL: &str = "SELECT game FROM applied WHERE kind=?1 AND seq=?2 AND game IN (SELECT value FROM json_each(?3))";
+/// The version of the actor's own tables (`txfacts`, `applied`, `meta`) beside the mirror's generated digest: a move
+/// of either rebuilds the actor (HIGH-4, [`actor_digest`]).
+pub const ACTOR_TABLES_VERSION: &str = "applied-per-game-1";
+/// The digest an actor holds in `meta` (`schema`): the mirror's and the actor's own tables'.
+pub fn actor_digest() -> String {
+    format!("{}+{ACTOR_TABLES_VERSION}", schema::DIGEST)
+}
+/// The judge's own tables (their indexes and triggers go with them): dropped and recreated on a digest change.
+pub const JUDGE_TABLES: [&str; 4] = ["owed_rows", "owed_row_words", "owed_state", "owed_dirty"];
 pub const META_PUT_SQL: &str = "INSERT INTO meta(name,value) VALUES (?1,?2) ON CONFLICT(name) DO UPDATE SET value=excluded.value";
 pub const META_GET_SQL: &str = "SELECT value FROM meta WHERE name=?1";
 
@@ -570,7 +617,11 @@ pub struct ApplyReport {
     pub record_rows: usize,
     pub rows: usize,
     pub missed: bool,
+    /// Every game the call names was already applied by its event: nothing judged.
     pub skipped_redelivery: bool,
+    /// The games the event has applied, by this call or an earlier delivery of it (Phase C acknowledges exactly
+    /// these games' marks, HIGH-1).
+    pub applied_games: Vec<String>,
 }
 
 /// The decoded facts of a copied BEEF row: the pot's own (`pot`, `pot_beefs` only) and the stored order's.
@@ -729,7 +780,13 @@ async fn keys_of_mirror(
 const JUDGED_TXIDS_SQL: &str = "SELECT r.outpoint,r.facts,w.txid FROM owed_rows r LEFT JOIN owed_row_words w ON w.identity=r.identity AND w.outpoint=r.outpoint WHERE r.identity=?1 AND r.gameId IN (SELECT value FROM json_each(?2))";
 
 /// THE APPLY: the closure over `games` of `me`, then the last judgement over the mirror with the outside held.
-/// `seq` is the event's (or the bootstrap's) token; a redelivery of an applied `(kind, seq)` returns at once.
+/// `kind_seq` is the event's token: a game the event already applied is skipped (HIGH-1: the key is per game), and
+/// a call whose every game was applied returns at once (`skipped_redelivery`).
+///
+/// HIGH-2: only the FIXPOINT round's judgement is written ([`Noting`] stages each round's commit), in one
+/// synchronous batch after the identity's judged rows are snapshotted; a fault of that batch restores them, so no
+/// read (`/rows`, the KV copy, the reconcile's `/stored`) ever sees a judgement over a partial mirror or a commit cut
+/// half way.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
     record: &R,
@@ -742,24 +799,47 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
     era_ms: Option<i64>,
 ) -> Result<(ApplyReport, Vec<(String, Value)>), String> {
     let me = me.to_ascii_lowercase();
-    let games: Vec<String> = games
-        .iter()
-        .map(|g| g.to_ascii_lowercase())
-        .take(GAMES_PER_APPLY)
-        .collect();
+    let mut wanted: Vec<String> = Vec::new();
+    for g in games.iter().map(|g| g.to_ascii_lowercase()) {
+        if !wanted.contains(&g) {
+            wanted.push(g);
+        }
+    }
+    wanted.truncate(GAMES_PER_APPLY);
+    let mut games = wanted;
     let mut report = ApplyReport::default();
     if let Some((kind, seq)) = kind_seq {
         let seen = local
             .run_batch(vec![Stmt::new(
-                "SELECT 1 AS hit FROM applied WHERE kind=?1 AND seq=?2",
-                vec![Bind::Text(kind.into()), Bind::Int(seq)],
+                APPLIED_GAMES_SQL,
+                vec![
+                    Bind::Text(kind.into()),
+                    Bind::Int(seq),
+                    Bind::Text(json!(games).to_string()),
+                ],
             )])
             .await?;
-        if seen.first().is_some_and(|o| !o.rows.is_empty()) {
+        let done: BTreeSet<String> = seen
+            .first()
+            .map(|o| {
+                o.rows
+                    .iter()
+                    .filter_map(|r| r["game"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        report.applied_games = games
+            .iter()
+            .filter(|g| done.contains(*g))
+            .cloned()
+            .collect();
+        games.retain(|g| !done.contains(g));
+        if games.is_empty() {
             report.skipped_redelivery = true;
             return Ok((report, Vec::new()));
         }
     }
+    let games = games;
     let seq = kind_seq.map_or(0, |(_, s)| s);
     let held = Held::default();
     // The closure starts from what the mirror already names for these games (the last apply's domain): in the steady
@@ -783,7 +863,7 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
         .iter()
         .flat_map(|o| &o.rows)
         .for_each(|r| txids_in_value(r, &mut keys.txids));
-    let pushes = loop {
+    let (staged, mut pushes) = loop {
         if report.rounds >= CLOSURE_ROUNDS_MAX {
             return Err(format!("owed actor: the closure of {me} did not close in {CLOSURE_ROUNDS_MAX} rounds ({} txids)", keys.txids.len()));
         }
@@ -798,6 +878,7 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
         let noting = Noting {
             local,
             seen: RefCell::default(),
+            staged: RefCell::default(),
         };
         let judge = ActorJudge {
             local: &noting,
@@ -807,11 +888,8 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
             era_ms,
             pushes: RefCell::default(),
         };
-        let mut rows = 0;
         for chunk in games.chunks(crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION) {
-            rows = crate::owed_judge::judge_subjects(&judge, &me, chunk, "owed-actor")
-                .await?
-                .rows;
+            crate::owed_judge::judge_subjects(&judge, &me, chunk, "owed-actor").await?;
         }
         let pushes = judge.pushes.take();
         next.txids.extend(noting.seen.take());
@@ -822,32 +900,125 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
         }
         if next == keys {
             // THE FIXPOINT: this round's judgement read a mirror holding every key its statements named, so it
-            // is the record's judgement and its write stands (the object's turn keeps any other apply out of it).
-            report.rows = rows;
-            break pushes;
+            // is the record's judgement and only its commit is run (the object's turn keeps any other apply out).
+            break (noting.staged.take(), pushes);
         }
         keys = next;
     };
     report.txids = keys.txids.len();
-    if let Some((kind, seq)) = kind_seq {
-        local
-            .run_batch(vec![
-                Stmt::new(
-                    APPLIED_SQL,
-                    vec![
-                        Bind::Text(kind.into()),
-                        Bind::Int(seq),
-                        Bind::Int(local.now_ms() as i64),
-                    ],
-                ),
-                Stmt::new(
-                    META_PUT_SQL,
-                    vec![Bind::Text("ackSeq".into()), Bind::Text(seq.to_string())],
-                ),
-            ])
-            .await?;
+    report.rows = commit_fixpoint(local, &me, staged).await?;
+    for (_, push) in &mut pushes {
+        push["rows"] = json!(report.rows);
     }
+    let mut marks = Vec::new();
+    if let Some((kind, seq)) = kind_seq {
+        marks.push(Stmt::new(
+            APPLIED_SQL,
+            vec![
+                Bind::Text(kind.into()),
+                Bind::Int(seq),
+                Bind::Int(local.now_ms() as i64),
+                Bind::Text(json!(games).to_string()),
+            ],
+        ));
+        marks.push(Stmt::new(
+            META_PUT_SQL,
+            vec![Bind::Text("ackSeq".into()), Bind::Text(seq.to_string())],
+        ));
+    }
+    if !marks.is_empty() {
+        local.run_batch(marks).await?;
+    }
+    report.applied_games.extend(games);
     Ok((report, pushes))
+}
+
+/// The identity's judged rows, copied aside before the fixpoint's commit (HIGH-2): every row of the identity, since
+/// the commit's ceiling may take another game's.
+pub const SNAPSHOT_TABLES: [&str; 4] = JUDGE_TABLES;
+fn snapshot_stmts(me: &str) -> Vec<Stmt> {
+    SNAPSHOT_TABLES
+        .iter()
+        .flat_map(|t| {
+            [
+                Stmt::new(format!("DROP TABLE IF EXISTS {t}_snap"), Vec::new()),
+                Stmt::new(
+                    format!("CREATE TABLE {t}_snap AS SELECT * FROM {t} WHERE identity=?1"),
+                    vec![Bind::Text(me.into())],
+                ),
+            ]
+        })
+        .collect()
+}
+fn restore_stmts(me: &str) -> Vec<Stmt> {
+    let mut out: Vec<Stmt> = SNAPSHOT_TABLES
+        .iter()
+        .map(|t| {
+            Stmt::new(
+                format!("DELETE FROM {t} WHERE identity=?1"),
+                vec![Bind::Text(me.into())],
+            )
+        })
+        .collect();
+    // `owed_rows` first: its row-count triggers find no state row (deleted above), and the state is restored last.
+    for t in SNAPSHOT_TABLES {
+        out.push(Stmt::new(
+            format!("INSERT INTO {t} SELECT * FROM {t}_snap"),
+            Vec::new(),
+        ));
+    }
+    out.extend(drop_snapshot_stmts());
+    out
+}
+fn drop_snapshot_stmts() -> Vec<Stmt> {
+    SNAPSHOT_TABLES
+        .iter()
+        .map(|t| Stmt::new(format!("DROP TABLE IF EXISTS {t}_snap"), Vec::new()))
+        .collect()
+}
+
+/// THE FIXPOINT'S COMMIT (HIGH-2): the identity's judged rows snapshotted, then the round's staged commits in ONE
+/// batch (each statement runs synchronously on the object's SQLite, so no read lands between them); a fault restores
+/// the snapshot (a statement that faults ends the batch and its earlier statements stand). Returns the identity's
+/// rows as the last commit's state read back.
+pub async fn commit_fixpoint<L: SqlPort>(
+    local: &L,
+    me: &str,
+    staged: Vec<Stmt>,
+) -> Result<usize, String> {
+    if staged.is_empty() {
+        return Ok(0);
+    }
+    local.run_batch(snapshot_stmts(me)).await?;
+    let readbacks: Vec<usize> = staged
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| is_state_readback(s))
+        .map(|(n, _)| n)
+        .collect();
+    match local.run_batch(staged).await {
+        Ok(out) => {
+            if let Err(e) = local.run_batch(drop_snapshot_stmts()).await {
+                local.log(&format!("[owed-actor] snapshot not dropped: {e}"));
+            }
+            Ok(readbacks
+                .last()
+                .and_then(|n| out.get(*n))
+                .and_then(|o| o.rows.first())
+                .and_then(|r| r["rows"].as_u64())
+                .unwrap_or(0) as usize)
+        }
+        Err(e) => match local.run_batch(restore_stmts(me)).await {
+            Ok(_) => Err(e),
+            Err(r) => Err(format!("{e}; the restore faulted too: {r}")),
+        },
+    }
+}
+
+/// The answer of one apply (the object's `/apply`, the pins' harness): the actor's rows, the redelivery verdict, the
+/// games the event has applied.
+pub fn answer_of(report: &ApplyReport, rows: Vec<Value>) -> Value {
+    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "skippedRedelivery": report.skipped_redelivery, "missed": report.missed, "appliedGames": report.applied_games})
 }
 
 /// MEDIUM-2's in-object serial queue: every apply of one actor takes its turn, so an event arriving during another's
@@ -1418,6 +1589,41 @@ pub async fn beside(db: &impl JudgeDb, identity: &str, games: &[String]) {
         }
     };
     note_answer(&answer);
+    compare(db, identity, games, &answer).await;
+}
+
+/// PHASE B (`OWED_ACTOR_READ` with the D1 judge on; the D2-ACTOR-B lens's HIGH-3, option (a), Phase C's rule): the
+/// read serves the actor's rows, so the marks that withhold a press over a pending downgrade (D2-L1) may be
+/// acknowledged only once BOTH judges applied. The actor applies FIRST: its fault is the message's (handed back, the
+/// marks standing, the read withholding the game's presses); then the D1 judge, whose batch acknowledges the marks;
+/// then the compare. `Ok(None)`: no actor is bound (the D1 judge alone).
+pub async fn actor_then_d1(
+    db: &impl JudgeDb,
+    identity: &str,
+    games: &[String],
+) -> Result<crate::owed_judge::JudgeReport, String> {
+    let answer = match db.actor_deliver(identity, games).await {
+        Ok(a) => a,
+        Err(e) => {
+            db.counters(vec![(COUNTERS[2].into(), 1)]).await;
+            db.log(&format!(
+                "[owed-actor] FAULT {identity}: {e}; Phase B hands the message back, its marks kept"
+            ));
+            return Err(e);
+        }
+    };
+    if let Some(a) = &answer {
+        note_answer(a);
+    }
+    let report = crate::owed_judge::judge_subjects(db, identity, games, "owed-events").await?;
+    if let Some(a) = &answer {
+        compare(db, identity, games, a).await;
+    }
+    Ok(report)
+}
+
+/// The compare of one answer with the D1 judge's rows just written (Phases A and B), counted.
+async fn compare(db: &impl JudgeDb, identity: &str, games: &[String], answer: &Value) {
     let d1 = match db
         .run_batch(vec![Stmt::new(
             ROWS_SQL,
@@ -1477,8 +1683,10 @@ pub fn note_answer_into(bars: &mut Bars, answer: &Value) {
     }
 }
 
-/// PHASE C: the actor is the judge; the marks this delivery covers are acknowledged after it applied (the ack is
-/// what empties `owed_dirty`; a mark written meanwhile keeps its newer generation).
+/// PHASE C: the actor is the judge; the marks of the games the actor APPLIED (`appliedGames`: by this call, or an
+/// earlier delivery of the same event; the D2-ACTOR-B lens's HIGH-1) are acknowledged after it applied (the ack is
+/// what empties `owed_dirty`; a mark written meanwhile keeps its newer generation). A game the answer does not name
+/// keeps its marks.
 pub async fn as_the_judge(
     db: &impl JudgeDb,
     identity: &str,
@@ -1504,6 +1712,22 @@ pub async fn as_the_judge(
         .await?
         .ok_or("the D1 judge is off and no owed actor is bound")?;
     note_answer(&answer);
+    let applied: Vec<String> = answer["appliedGames"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|g| g.as_str().map(str::to_ascii_lowercase))
+                .filter(|g| games.iter().any(|x| x.eq_ignore_ascii_case(g)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if applied.is_empty() {
+        return Err(format!(
+            "owed actor: {id} applied none of the {} games",
+            games.len()
+        ));
+    }
+    let gj = json!(applied).to_string();
     db.run_batch(vec![Stmt::new(
         crate::owed_judge::ACK_DIRTY_SQL,
         vec![
@@ -1515,7 +1739,7 @@ pub async fn as_the_judge(
     )])
     .await?;
     Ok(crate::owed_judge::JudgeReport {
-        subjects: games.len(),
+        subjects: applied.len(),
         rows: answer["rows"].as_array().map_or(0, Vec::len),
         ..Default::default()
     })
