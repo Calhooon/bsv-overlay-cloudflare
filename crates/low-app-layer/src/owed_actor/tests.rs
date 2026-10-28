@@ -1822,7 +1822,7 @@ fn d2_actor_b_fold2_m4_the_tip_alarm_judges_each_gate_once() {
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     let object = squash(include_str!("object.rs"));
     assert!(object.contains(&squash(
-        "self.put_meta(&local, META_TIP_JUDGED, &t.to_string());"
+        "self.put_meta(&local, META_TIP_JUDGED, &window.tip_judged.to_string());"
     )));
     assert!(
         !object.contains(&squash("now as i64 + TIP_ALARM_MS as i64")),
@@ -1962,7 +1962,7 @@ async fn d2_actor_b_fold2_m6_phase_a_applies_the_actor_off_the_consumer() {
         .unwrap()
         .unwrap();
     assert_eq!(answer["appliedGames"], json!(games));
-    compare(&w, &id, &games, &answer).await;
+    compare(&w, &id, &games, &answer, None).await;
     assert_eq!(
         (
             w.d1.counter(COUNTERS[0]) - before,
@@ -1984,7 +1984,7 @@ async fn d2_actor_b_fold2_m6_phase_a_applies_the_actor_off_the_consumer() {
             .await
             .unwrap()
             .unwrap();
-        compare(&w, &id, &games, &a).await;
+        compare(&w, &id, &games, &a, None).await;
         inline.note(t.elapsed().as_millis() as u64);
         let t = std::time::Instant::now();
         crate::owed_events::deliver(&d, &id, &games).await.unwrap();
@@ -2100,7 +2100,7 @@ async fn d2_actor_b_fold2_m7_the_bars_are_the_fleets() {
     // MEDIUM-8: the diff line names its identity and game.
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     assert!(squash(include_str!("../owed_actor.rs"))
-        .contains(&squash("\"[owed-actor] DIFF {identity} game {game}:")));
+        .contains(&squash("\"[owed-actor] DIFF {identity} game {}:")));
 }
 
 /// MEDIUM-1 (and LOW-6): an actor's first apply arms its bootstrap; the bootstrap pages every game of the identity by
@@ -2639,9 +2639,14 @@ fn d2_actor_b_fold3_m2_the_bootstrap_pages_take_a_fleet_budget() {
     )
     .unwrap();
     let take = |now: u64| -> i64 {
-        conn.execute(BOOT_BUDGET_TAKE_SQL, [now as i64]).unwrap();
-        conn.query_row(BOOT_BUDGET_READ_SQL, [], |r| r.get(0))
+        let rows: Vec<Value> = conn
+            .prepare(BOOT_BUDGET_TAKE_SQL)
             .unwrap()
+            .query_map([now as i64], |r| Ok(json!({"taken": r.get::<_, i64>(0)?})))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        boot_taken(&rows)
     };
     let t0 = 1_800_000_000_000u64;
     let id = format!("02{}", "ab".repeat(32));
@@ -2668,6 +2673,10 @@ fn d2_actor_b_fold3_m2_the_bootstrap_pages_take_a_fleet_budget() {
         .find("BOOT_BUDGET_TAKE_SQL")
         .expect("the page takes a token");
     assert!(
+        !page.contains("BOOT_BUDGET_READ_SQL"),
+        "NEW2-L3: one statement"
+    );
+    assert!(
         budget < page.find("IDENTITY_GAMES_AFTER_SQL").unwrap(),
         "before its read"
     );
@@ -2685,10 +2694,14 @@ fn d2_actor_b_fold3_lows() {
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     let object = squash(include_str!("object.rs"));
     let alarm = &object[object.find("asyncfnalarm(").unwrap()..];
+    // Since the second delta lens's NEW2-L5 the window moves `tipJudged` past its answered games and carries a
+    // faulted one ([`tip_window`], pinned by `d2_actor_b_fold4_l5_*`).
     assert!(alarm.contains(&squash(
-        "if answered { self.put_meta(&local, META_TIP_JUDGED, &t.to_string()); }"
+        "self.put_meta(&local, META_TIP_JUDGED, &window.tip_judged.to_string());"
     )));
-    assert!(alarm.contains(&squash("answered &= self .apply_route(body) .await")));
+    assert!(alarm.contains(&squash(
+        "self.apply_route(body) .await .is_ok_and(|r| r.status_code() == 200)"
+    )));
     // L2
     let me = format!("02{}", "ab".repeat(32));
     let mut copy = kv_copy_body(&me, &[], 1);
@@ -2751,4 +2764,323 @@ fn d2_actor_b_fold3_lows() {
     let started = run.find("COUNTERS[13]").expect("counted at the start");
     assert!(started < run.find("fordinitems").unwrap());
     assert!(run.find("COUNTERS[16]").unwrap() > run.find("fordinitems").unwrap());
+}
+
+// ---- D2-ACTOR-B-FOLD-4: the second delta lens (bsv-low `D2-ACTOR-B-delta-2-2026-10-28.md`) ----
+
+/// The outpoints the D1 read (`owed_read::read`, D1's rows) serves as presses.
+fn fold4_d1_presses(d1: &SqliteSql) -> Vec<String> {
+    let s = futures_executor_block(crate::owed_read::read(d1, "owner")).unwrap();
+    let b = s.body("owner", Some(TIP), &BTreeMap::new()).unwrap();
+    b["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["facts"]["claimable"] == json!(true))
+        .map(|r| r["outpoint"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// NEW2-M1 (the lens's `lens2_p5`): a SECOND Phase C epoch. Rollback 1's pass ran to its stamp (its cursor row at the
+/// end); Phase C again, a stranger spends `b3..00:0`, the actor downgrades it and its marks are acknowledged; rollback
+/// 2's pass must re-judge every identity before it stamps, and the D1 read then serves no press over the spent hop.
+/// RED on `e3e70b65`: one call answers `stamped true games 0 rows 0` and the D1 read serves `b3..00:0` as a press.
+#[tokio::test]
+async fn d2_actor_b_fold4_m1_a_second_rollback_rejudges_every_identity_before_it_stamps() {
+    let w = WithActor {
+        d1: d1_judge(&stranded()).await,
+        actor: mirror(),
+        d1_judges: false,
+        event: Some(("pot", 7)),
+        actor_reads: true,
+        actor_fails: Cell::new(false),
+    };
+    let games = games_of(&w.d1, "owner");
+    // Phase C epoch 1, then rollback 1 (render 1, the pass to its stamp).
+    w.d1.conn
+        .execute(
+            "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner',?1,'age','age',1)",
+            [&games[0]],
+        )
+        .unwrap();
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    let w = WithActor {
+        d1_judges: true,
+        ..w
+    };
+    while !owed_v3_pass(&w, NOW_MS as i64, 16).await.unwrap().stamped {}
+    assert!(
+        fold4_d1_presses(&w.d1).contains(&NEW_H1_DOWN.to_string()),
+        "rollback 1 serves the re-judged press"
+    );
+    // Phase C epoch 2: the spend, judged by the actor alone, its marks acknowledged.
+    let w = WithActor {
+        d1_judges: false,
+        event: Some(("pot", 9)),
+        ..w
+    };
+    w.d1.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    assert_eq!(new_h1_marks(&w), 0, "epoch 2's marks acknowledged");
+    // Rollback 2, render 1: the pass to its stamp; it re-judges every identity first.
+    let w = WithActor {
+        d1_judges: true,
+        ..w
+    };
+    let mut games_judged = 0;
+    loop {
+        let r = owed_v3_pass(&w, NOW_MS as i64, 256).await.unwrap();
+        games_judged += r.games;
+        if r.stamped {
+            break;
+        }
+    }
+    // Render 2: the D1 read.
+    let p = fold4_d1_presses(&w.d1);
+    assert!(
+        games_judged >= games.len() && !p.contains(&NEW_H1_DOWN.to_string()),
+        "rollback 2's pass stamped having re-judged {games_judged} games; the D1 read serves {p:?}"
+    );
+}
+
+/// NEW2-L1 (the lens's P6): in Phase B a mark written while the actor applies is judged by D1 and left standing for
+/// the actor's next apply; the compare's DIFF on its game is the designed state, counted APART
+/// (`owed_actor_compare_held_total`, served `/health.owedActor.heldDiffsTotal`), `owed_actor_diffs_total` flat, and
+/// its log line names the class. RED on `e3e70b65`: `owed_actor_diffs_total` 0 -> 1.
+#[tokio::test]
+async fn d2_actor_b_fold4_l1_a_held_marks_diff_is_counted_apart() {
+    let w = WithActor {
+        d1: d1_judge(&stranded()).await,
+        actor: mirror(),
+        d1_judges: true,
+        event: Some(("pot", 7)),
+        actor_reads: true,
+        actor_fails: Cell::new(false),
+    };
+    let games = games_of(&w.d1, "owner");
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    let diffs = w.d1.counter("owed_actor_diffs_total");
+    let w = WithActor {
+        event: Some(("pot", 8)),
+        ..w
+    };
+    w.d1.conn
+        .execute(
+            "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner',?1,'age','age',1)",
+            [&games[0]],
+        )
+        .unwrap();
+    NEW_H1_INJECT.with(|c| c.set(true));
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    let lines: Vec<String> =
+        w.d1.lines
+            .borrow()
+            .iter()
+            .filter(|l| l.contains("DIFF"))
+            .cloned()
+            .collect();
+    assert_eq!(
+        w.d1.counter("owed_actor_diffs_total"),
+        diffs,
+        "a held mark's DIFF counted as a DIFF: {lines:?}"
+    );
+    assert_eq!(w.d1.counter("owed_actor_compare_held_total"), 1);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("held mark") && l.contains("NEW2-L1")),
+        "{lines:?}"
+    );
+    // The next delivery applies the mark in the actor: no DIFF of either class.
+    let w = WithActor {
+        event: Some(("pot", 9)),
+        ..w
+    };
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    assert_eq!(w.d1.counter("owed_actor_diffs_total"), diffs);
+    assert_eq!(w.d1.counter("owed_actor_compare_held_total"), 1);
+}
+
+/// NEW2-L4: `digest` and `shape` are stamped only when every statement of the plan answered: a plan with one failing
+/// `CREATE INDEX` stamps nothing (the next ensure computes the same plan and retries it), the same plan whole stamps
+/// both. New API; RED with `ensure_schema` grafted to the base's rule (stamp after the loop whatever answered):
+/// `left: 2 right: 0`.
+#[test]
+fn d2_actor_b_fold4_l4_a_failed_plan_statement_stamps_nothing() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(META_CREATE).unwrap();
+    let held = Some("an-older-digest");
+    let plan = object::schema_plan_kept(held, Some(actor_shape().as_str()), &[]);
+    assert!(!plan.is_empty(), "an index-only move");
+    let mut failing = plan.clone();
+    failing.push("CREATE INDEX idx_nowhere ON no_such_table(x)".into());
+    let stamps = |conn: &rusqlite::Connection| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM meta WHERE name IN ('schema','shape')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let mut lines = Vec::new();
+    let whole = object::ensure_schema(
+        &failing,
+        |s| conn.execute_batch(s).map_err(|e| e.to_string()),
+        |l| lines.push(l),
+        |n, v| {
+            conn.execute(META_PUT_SQL, [n, v]).unwrap();
+        },
+    );
+    assert!(!whole);
+    assert_eq!(stamps(&conn), 0, "a failed statement stamped: {lines:?}");
+    assert!(lines.iter().any(|l| l.contains("NOT stamped")));
+    let whole = object::ensure_schema(
+        &plan,
+        |s| conn.execute_batch(s).map_err(|e| e.to_string()),
+        |_| {},
+        |n, v| {
+            conn.execute(META_PUT_SQL, [n, v]).unwrap();
+        },
+    );
+    assert!(whole);
+    assert_eq!(stamps(&conn), 2);
+    let digest: String = conn
+        .query_row("SELECT value FROM meta WHERE name='schema'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(digest, actor_digest());
+    let object = include_str!("object.rs")
+        .split_whitespace()
+        .collect::<String>();
+    let local = &object[object.find("fnlocal(&self)->DoSql").unwrap()..];
+    let local = &local[..local.find("fnrearm_after_rebuild").unwrap()];
+    assert!(
+        local.contains("ensure_schema("),
+        "local() runs the plan through ensure_schema"
+    );
+    assert!(
+        !local.contains("SqlStorageValue::from(actor_digest())"),
+        "no stamp outside it"
+    );
+}
+
+/// NEW2-L5: one game of three faults deterministically in the tip alarm's window: `tipJudged` moves past the window,
+/// the other two are applied once and never re-applied for it, the faulting game is carried and retried, parked at its
+/// third fault and then left out; each alarm with a fault counts once and names the game; an apply that lands by
+/// another road clears it. New API; RED against two revert mutants: the park removed ("alarm 3: once per alarm with a
+/// fault", `left: 1 right: 0`: the faulting game re-applied on every alarm, NEW2-L5's shape) and the per-game split
+/// removed (`{"a": 3, "b": 3, "c": 3}`, `left: 3 right: 2`: one faulting game carries its whole window, the base's).
+#[tokio::test]
+async fn d2_actor_b_fold4_l5_a_faulting_tip_game_never_holds_the_window() {
+    let gates: [(&str, i64); 3] = [("a", 101), ("b", 102), ("c", 103)];
+    let applied = std::cell::RefCell::new(BTreeMap::<String, usize>::new());
+    let mut last = 100i64;
+    let mut held = BTreeMap::new();
+    let mut counted = 0;
+    let mut lines = Vec::new();
+    for alarm in 0..4 {
+        let tip = 103 + alarm;
+        let selected: Vec<String> = gates
+            .iter()
+            .filter(|(_, h)| *h > last && *h <= tip)
+            .map(|(g, _)| g.to_string())
+            .collect();
+        let w = tip_window("owner", selected, &held, tip, |chunk: Vec<String>| {
+            for g in &chunk {
+                *applied.borrow_mut().entry(g.clone()).or_default() += 1;
+            }
+            let ok = !chunk.iter().any(|g| g == "b");
+            async move { ok }
+        })
+        .await;
+        last = w.tip_judged;
+        held = w.faults.clone();
+        counted += w.counted;
+        lines.extend(w.line.clone());
+        assert_eq!(
+            w.counted,
+            u64::from(alarm < 3),
+            "alarm {alarm}: once per alarm with a fault"
+        );
+    }
+    let applied = applied.into_inner();
+    assert_eq!(
+        applied["a"], 2,
+        "A: its chunk and its single, once: {applied:?}"
+    );
+    assert_eq!(applied["c"], 2, "C: once: {applied:?}");
+    assert_eq!(
+        applied["b"], 4,
+        "B: the chunk, then its single on three alarms, then parked: {applied:?}"
+    );
+    assert_eq!(last, 106, "tipJudged moved with every alarm");
+    assert_eq!(held.get("b"), Some(&TIP_FAULTS_MAX), "parked");
+    assert_eq!(counted, 3);
+    assert!(lines.iter().all(|l| l.contains("[\"b\"]")), "{lines:?}");
+    assert!(lines[2].contains("parked [\"b\"]"), "{lines:?}");
+    // A landed apply by another road clears it (the object's `apply_route`): the next window applies it again.
+    held.remove("b");
+    let w = tip_window("owner", Vec::new(), &held, 107, |_| async { true }).await;
+    assert!(w.faults.is_empty() && w.line.is_none());
+    let object = include_str!("object.rs")
+        .split_whitespace()
+        .collect::<String>();
+    let alarm = &object[object.find("asyncfnalarm(").unwrap()..];
+    assert!(alarm.contains("tip_window(&identity,games,&held,"));
+    assert!(alarm.contains("COUNTERS[18]"));
+    let route = &object[object.find("asyncfnapply_route(").unwrap()..];
+    assert!(
+        route[..route.find("Response::from_json(&answer)").unwrap()].contains("META_TIP_FAULTS")
+    );
+}
+
+/// NEW2-L3: a full minute's take writes nothing: the 61st take answers no row (the page waits) and leaves the row's
+/// count at 60 and its change count 0; the next minute counts from one. RED with the base's take (an unconditional
+/// upsert): `left: 1 right: 0` (the waiter's take wrote the row).
+#[test]
+fn d2_actor_b_fold4_l3_a_waiters_take_writes_nothing() {
+    assert!(BOOT_BUDGET_TAKE_SQL.contains(&format!("<{BOOTSTRAP_PAGES_PER_MINUTE} ")));
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE owed_belt_state (name TEXT PRIMARY KEY, cursor TEXT, tickedAtMs INTEGER)",
+    )
+    .unwrap();
+    let t0 = 1_800_000_000_000i64;
+    let take = |now: i64| -> (Vec<Value>, u64) {
+        let rows: Vec<Value> = conn
+            .prepare(BOOT_BUDGET_TAKE_SQL)
+            .unwrap()
+            .query_map([now], |r| Ok(json!({"taken": r.get::<_, i64>(0)?})))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        (rows, conn.changes())
+    };
+    for n in 1..=BOOTSTRAP_PAGES_PER_MINUTE {
+        assert_eq!(boot_taken(&take(t0).0), n);
+    }
+    let (rows, changes) = take(t0 + 1);
+    assert_eq!(changes, 0, "the waiter's take wrote the row");
+    assert!(rows.is_empty());
+    assert!(boot_pace(boot_taken(&rows), t0 as u64, "02ab").is_some());
+    let count: String = conn
+        .query_row("SELECT cursor FROM owed_belt_state", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, "60");
+    assert_eq!(
+        boot_taken(&take(t0 + 60_000).0),
+        1,
+        "a new minute counts from one"
+    );
 }

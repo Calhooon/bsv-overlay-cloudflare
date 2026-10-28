@@ -621,8 +621,19 @@ pub fn actor_shape() -> String {
 /// fleet at 60 pages (960 games) a minute, whatever the reads that arm it.
 pub const BOOTSTRAP_PAGES_PER_MINUTE: i64 = 60;
 pub const BOOTSTRAP_PAGE_DELAY_MS: u64 = 1_000;
-pub const BOOT_BUDGET_TAKE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-actor:boot-budget','1',?1/60000) ON CONFLICT(name) DO UPDATE SET cursor=CASE WHEN owed_belt_state.tickedAtMs=excluded.tickedAtMs THEN CAST(CAST(owed_belt_state.cursor AS INTEGER)+1 AS TEXT) ELSE '1' END,tickedAtMs=excluded.tickedAtMs";
-pub const BOOT_BUDGET_READ_SQL: &str = "SELECT CAST(cursor AS INTEGER) AS taken FROM owed_belt_state WHERE name='owed-actor:boot-budget'";
+/// The second delta lens's NEW2-L3: the take is ONE conditional upsert that writes NOTHING once this minute's
+/// [`BOOTSTRAP_PAGES_PER_MINUTE`] tokens are taken (its `DO UPDATE ... WHERE` refuses, `RETURNING` answers no row: the
+/// page waits, [`boot_pace`] over `i64::MAX`); it answers the token's number otherwise. So N waiting actors are N
+/// one-row reads a minute of `owed-actor:boot-budget` and no write (they were N writes, each over-budget take
+/// counted). The order is unchanged: each waiter's slot in the next minute is fixed by its identity's hash, so the
+/// rebuild runs at 60 pages a minute in that order (no queue, no fairness beyond the spread), stated.
+pub const BOOT_BUDGET_TAKE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-actor:boot-budget','1',?1/60000) ON CONFLICT(name) DO UPDATE SET cursor=CASE WHEN owed_belt_state.tickedAtMs=excluded.tickedAtMs THEN CAST(CAST(owed_belt_state.cursor AS INTEGER)+1 AS TEXT) ELSE '1' END,tickedAtMs=excluded.tickedAtMs WHERE owed_belt_state.tickedAtMs IS NOT excluded.tickedAtMs OR CAST(owed_belt_state.cursor AS INTEGER)<60 RETURNING CAST(cursor AS INTEGER) AS taken";
+/// The token's number a take answered (no row: the minute is full, the page waits).
+pub fn boot_taken(rows: &[Value]) -> i64 {
+    rows.first()
+        .and_then(|r| r["taken"].as_i64())
+        .unwrap_or(i64::MAX)
+}
 /// The page's verdict for the `taken`-th token of this minute: `None` runs it; `Some(at)` is its wait, a slot in
 /// the next minute spread by the identity (so the waiting actors do not all wake at the minute's edge).
 pub fn boot_pace(taken: i64, now_ms: u64, identity: &str) -> Option<u64> {
@@ -1338,6 +1349,90 @@ pub fn epoch_verdict(held: Option<&str>, current: &str) -> EpochVerdict {
 /// D-H1) judged below the tip, at most 1,024 games (applied 64 at a time). A gate already open is never selected
 /// again; a re-judged sweep carries the tip it was judged at, so it waits for the next block.
 pub const GATED_GAMES_SQL: &str = "SELECT DISTINCT gameId FROM owed_rows WHERE (gateHeight<=?1 AND gateHeight>?2) OR (family='hop-stranded' AND claimable=1 AND probeTip<?1 AND json_extract(facts,'$.status') IS NOT 'unspent') LIMIT 1024";
+/// THE TIP WINDOW'S FAULTS (the second delta lens's NEW2-L5). A game whose apply faults in the tip alarm's window is
+/// carried in the actor's `meta` (`tipFaults`, game to consecutive faults), so `tipJudged` moves past the window
+/// whatever one game does and the window's other games are never re-applied for it; the carried game is retried on
+/// the next alarms, and at [`TIP_FAULTS_MAX`] consecutive faults it is PARKED: left out of every later window until an
+/// apply of it lands by another road (an event, the reconcile; `apply_route` clears its entry). Fail-safe: a parked
+/// game keeps the rows of its last landed judgement, and the read withholds what its marks downgrade.
+pub const TIP_FAULTS_MAX: u32 = 3;
+
+/// One tip alarm's window ([`tip_window`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TipWindow {
+    /// The `tipJudged` the alarm stamps: the tip, always (the faulted games ride `faults`).
+    pub tip_judged: i64,
+    /// The `tipFaults` the alarm stores (a parked game's entry kept).
+    pub faults: BTreeMap<String, u32>,
+    /// The games whose apply faulted in this alarm, named in its line.
+    pub faulted: Vec<String>,
+    /// The games this alarm parked.
+    pub parked: Vec<String>,
+    /// `owed_actor_tip_faults_total`'s delta: 1 for an alarm with a faulted game, once whatever their number.
+    pub counted: u64,
+    /// The alarm's line, when a game faulted.
+    pub line: Option<String>,
+}
+
+/// The tip alarm's window: the games `selected` for `(last, tip]` and the carried `held` faults' games below the park,
+/// applied [`GAMES_PER_APPLY`] at a time by `apply`; a chunk that faults is applied one game at a time, so only the
+/// faulting game is carried.
+pub async fn tip_window<F, Fut>(
+    identity: &str,
+    selected: Vec<String>,
+    held: &BTreeMap<String, u32>,
+    tip: i64,
+    mut apply: F,
+) -> TipWindow
+where
+    F: FnMut(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut games = selected;
+    for (g, n) in held {
+        if *n < TIP_FAULTS_MAX && !games.contains(g) {
+            games.push(g.clone());
+        }
+    }
+    games.retain(|g| held.get(g).is_none_or(|n| *n < TIP_FAULTS_MAX));
+    let mut faults = held.clone();
+    let mut faulted = Vec::new();
+    for chunk in games.chunks(GAMES_PER_APPLY) {
+        if apply(chunk.to_vec()).await {
+            for g in chunk {
+                faults.remove(g);
+            }
+            continue;
+        }
+        for g in chunk {
+            if chunk.len() > 1 && apply(vec![g.clone()]).await {
+                faults.remove(g);
+            } else {
+                *faults.entry(g.clone()).or_default() += 1;
+                faulted.push(g.clone());
+            }
+        }
+    }
+    let parked: Vec<String> = faulted
+        .iter()
+        .filter(|g| faults.get(*g).is_some_and(|n| *n >= TIP_FAULTS_MAX))
+        .cloned()
+        .collect();
+    let line = (!faulted.is_empty()).then(|| {
+        format!(
+            "[owed-actor] TIP WINDOW FAULT {identity}: games {faulted:?} faulted (carried, retried up to {TIP_FAULTS_MAX} alarms); parked {parked:?}; tipJudged {tip}"
+        )
+    });
+    TipWindow {
+        tip_judged: tip,
+        counted: u64::from(!faulted.is_empty()),
+        faults,
+        faulted,
+        parked,
+        line,
+    }
+}
+
 /// The next gate above the tip (`?1`) and whether a courier-dated sweep is held (a block re-dates it).
 pub const NEXT_GATE_SQL: &str = "SELECT (SELECT MIN(gateHeight) FROM owed_rows WHERE gateHeight>?1) AS gate,(SELECT 1 FROM owed_rows WHERE family='hop-stranded' AND claimable=1 AND probeTip IS NOT NULL AND json_extract(facts,'$.status') IS NOT 'unspent' LIMIT 1) AS sweeps";
 /// About one block.
@@ -1676,7 +1771,7 @@ pub fn fleet_bars(rows: &[Value], now: u64) -> Value {
 
 /// `/health.owedActor`'s one D1 statement (MEDIUM-1, MEDIUM-7, MEDIUM-8): the class rows, the actor's durable totals
 /// and the identities holding owed rows (a count over `owed_state`, one row an identity).
-pub const HEALTH_SQL: &str = "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',tickedAtMs)) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage";
+pub const HEALTH_SQL: &str = "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',tickedAtMs)) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage";
 
 /// The served object: this isolate's bars under `isolate`, the fleet's figures at the top (the harness's keys),
 /// the durable compare totals (MEDIUM-8: Phase B's gate), the bootstraps beside the identities holding rows
@@ -1713,6 +1808,10 @@ pub fn health_body(
     body["deferred"] = json!(n(COUNTERS[13]));
     // NEW-L6: the deferred applies started (above) and ended; the difference is what `wait_until`'s bound cut.
     body["deferredDone"] = json!(n(COUNTERS[16]));
+    // NEW2-L1: the Phase B DIFFs on a game holding a mark above the bound (not a STOP); NEW2-L5: the tip alarms whose
+    // window held a faulting game.
+    body["heldDiffsTotal"] = json!(n(COUNTERS[17]));
+    body["tipFaults"] = json!(n(COUNTERS[18]));
     // NEW-L3: Phase B's gate is COVERAGE, the bootstrap lever's last full pass (`complete`, `contiguous`, `uncovered`
     // 0), never `bootstraps` against `activeIdentities` (two counts).
     body["coverage"] = read
@@ -1979,7 +2078,7 @@ mod tests;
 /// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
 /// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
 /// (MEDIUM-9).
-pub const COUNTERS: [&str; 17] = [
+pub const COUNTERS: [&str; 19] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -1998,6 +2097,10 @@ pub const COUNTERS: [&str; 17] = [
     "owed_v3_rows_total",
     // The delta lens's NEW-L6: the deferred applies that ENDED (`owed_actor_deferred_total` counts each at its start).
     "owed_actor_deferred_done_total",
+    // The second delta lens's NEW2-L1: Phase B's DIFFs on a game holding a mark above the acknowledgement bound.
+    "owed_actor_compare_held_total",
+    // NEW2-L5: the tip alarms whose window held a game whose apply faulted (each named in its line).
+    "owed_actor_tip_faults_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;
@@ -2056,7 +2159,7 @@ pub async fn beside(db: &impl JudgeDb, identity: &str, games: &[String]) {
         }
     };
     note_answer(&answer);
-    compare(db, identity, games, &answer).await;
+    compare(db, identity, games, &answer, None).await;
 }
 
 /// THE DEFERRED APPLY (the D2-ACTOR-B lens's MEDIUM-6, Phase A): the consumer's delivery judges in D1 and ACKS; the
@@ -2144,40 +2247,89 @@ pub async fn actor_then_d1(
         crate::owed_judge::judge_subjects_acked_to(db, identity, games, "owed-events", bound)
             .await?;
     if let Some(a) = &answer {
-        compare(db, identity, games, a).await;
+        compare(db, identity, games, a, Some(bound)).await;
     }
     Ok(report)
 }
 
-/// The compare of one answer with the D1 judge's rows just written (Phases A and B), counted.
-async fn compare(db: &impl JudgeDb, identity: &str, games: &[String], answer: &Value) {
-    let d1 = match db
-        .run_batch(vec![Stmt::new(
-            ROWS_SQL,
-            vec![Bind::Text(identity.to_ascii_lowercase())],
-        )])
-        .await
-    {
-        Ok(mut o) if !o.is_empty() => o.remove(0).rows,
+/// The games of `?2` (a JSON array) holding a mark of `?1`'s above the acknowledgement bound `?3`: Phase B's compare
+/// (the second delta lens's NEW2-L1).
+pub const HELD_GAMES_SQL: &str = "SELECT DISTINCT gameId FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2)) AND generation>?3";
+
+/// The compare of one answer with the D1 judge's rows just written (Phases A and B), counted. The second delta lens's
+/// NEW2-L1: in Phase B (`bound`, the acknowledgement's bound read before the actor's call) a game holding a mark
+/// above the bound at the compare is NEW-H1's designed state (the D1 judge judged the newer evidence, the actor will
+/// at its next apply): its DIFF is counted APART (`owed_actor_compare_held_total`, served
+/// `/health.owedActor.heldDiffsTotal`), its line `DIFF (held mark, NEW2-L1)`, never `owed_actor_diffs_total` (the
+/// cutover's STOP).
+async fn compare(
+    db: &impl JudgeDb,
+    identity: &str,
+    games: &[String],
+    answer: &Value,
+    bound: Option<i64>,
+) {
+    let id = identity.to_ascii_lowercase();
+    let mut stmts = vec![Stmt::new(ROWS_SQL, vec![Bind::Text(id.clone())])];
+    if let Some(b) = bound {
+        let gj = json!(games
+            .iter()
+            .map(|g| g.to_ascii_lowercase())
+            .collect::<Vec<_>>())
+        .to_string();
+        stmts.push(Stmt::new(
+            HELD_GAMES_SQL,
+            vec![Bind::Text(id), Bind::Text(gj), Bind::Int(b)],
+        ));
+    }
+    let (d1, held): (Vec<Value>, Vec<String>) = match db.run_batch(stmts).await {
+        Ok(o) if !o.is_empty() => {
+            let held = o
+                .get(1)
+                .map(|h| {
+                    h.rows
+                        .iter()
+                        .filter_map(|r| r["gameId"].as_str().map(str::to_ascii_lowercase))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (o[0].rows.clone(), held)
+        }
         _ => return,
     };
     let actor: Vec<Value> = answer["rows"].as_array().cloned().unwrap_or_default();
     let diffs = diff_rows(&of_games(&d1, games), &of_games(&actor, games));
+    let game_of = |outpoint: &str| -> String {
+        d1.iter()
+            .chain(&actor)
+            .find(|r| r["outpoint"] == outpoint)
+            .and_then(|r| r["gameId"].as_str())
+            .unwrap_or("?")
+            .to_string()
+    };
+    let (held_diffs, diffs): (Vec<String>, Vec<String>) = diffs
+        .into_iter()
+        .partition(|o| held.contains(&game_of(o).to_ascii_lowercase()));
     let mut deltas = vec![(COUNTERS[0].to_string(), 1)];
     if !diffs.is_empty() {
         deltas.push((COUNTERS[1].to_string(), 1));
         // MEDIUM-8: the line names the identity and the game (the cutover's STOP reads it).
-        let game = d1
-            .iter()
-            .chain(&actor)
-            .find(|r| r["outpoint"] == diffs[0].as_str())
-            .and_then(|r| r["gameId"].as_str())
-            .unwrap_or("?");
         db.log(&format!(
-            "[owed-actor] DIFF {identity} game {game}: {} outpoints of {} games, first {}",
+            "[owed-actor] DIFF {identity} game {}: {} outpoints of {} games, first {}",
+            game_of(&diffs[0]),
             diffs.len(),
             games.len(),
             diffs[0]
+        ));
+    }
+    if !held_diffs.is_empty() {
+        deltas.push((COUNTERS[17].to_string(), 1));
+        db.log(&format!(
+            "[owed-actor] DIFF (held mark, NEW2-L1; not a STOP) {identity} game {}: {} outpoints of {} games, first {}",
+            game_of(&held_diffs[0]),
+            held_diffs.len(),
+            games.len(),
+            held_diffs[0]
         ));
     }
     db.counters(deltas).await;
@@ -2263,7 +2415,11 @@ pub async fn as_the_judge(
         ),
         // NEW-M3: D1's `owed_rows` are no longer judged; the D1 read serves no press until `owed-v3` is stamped.
         Stmt::new(PHASE_C_MARK_SQL, vec![]),
+        // The second delta lens's NEW2-M1: BOTH restart statements, the stamp AND the pass's cursor row, so the next
+        // rollback's pass starts from the first identity and re-judges every one before it stamps (a stamped run's
+        // cursor, left at the last identity, stamped again having judged nothing).
         Stmt::new(OWED_V3_RESTART_SQL[0], vec![]),
+        Stmt::new(OWED_V3_RESTART_SQL[1], vec![]),
     ])
     .await?;
     Ok(crate::owed_judge::JudgeReport {
@@ -2283,7 +2439,9 @@ pub async fn as_the_judge(
 /// open one with its last game). Counted `owed_v3_identities_total`, `owed_v3_rows_total`.
 /// The delta lens's NEW-M3: every Phase C acknowledgement stamps `owed-actor-judged` and deletes the `owed-v3` stamp
 /// in its own batch, so the D1 read (`owed_read::PENDING_SQL`'s two probes) withholds every press from D1's
-/// `owed_rows` (the rows of the flip) until the rollback's re-judge stamps `owed-v3` again.
+/// `owed_rows` (the rows of the flip) until the rollback's re-judge stamps `owed-v3` again. The second delta lens's
+/// NEW2-M1: that batch also deletes the pass's cursor row (`rollback:owed-v3`), so a pass after a Phase C epoch always
+/// starts from the first identity.
 pub const PHASE_C_MARK_SQL: &str =
     "INSERT OR IGNORE INTO view_derivation_state(name) VALUES ('owed-actor-judged')";
 pub const OWED_V3_STAMP: &str = "owed-v3";
@@ -2294,7 +2452,8 @@ pub const OWED_V3_STATE_SQL: &str =
     "SELECT cursor FROM owed_belt_state WHERE name='rollback:owed-v3'";
 pub const OWED_V3_STAMP_WRITE_SQL: &str =
     "INSERT OR IGNORE INTO view_derivation_state(name) VALUES ('owed-v3')";
-/// The lever's `{"restart": true}`: the stamp and the state cleared by the lever itself, never by hand.
+/// The lever's `{"restart": true}`: the stamp and the state cleared by the lever itself (and, NEW2-M1, by every Phase C
+/// acknowledgement), never by hand.
 pub const OWED_V3_RESTART_SQL: [&str; 2] = [
     "DELETE FROM view_derivation_state WHERE name='owed-v3'",
     "DELETE FROM owed_belt_state WHERE name='rollback:owed-v3'",
