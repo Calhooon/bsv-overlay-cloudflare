@@ -3,7 +3,8 @@
 // (`owed_belt_state`), so the consumer's judge of that ONE subject faults for good and its memo is still written.
 import Worker, { AuthSessionStore, BoardView } from '../../crates/low-app-layer/build/worker/shim.mjs'
 export { AuthSessionStore, BoardView }
-export const POISON = 'poison-911'
+// not exported: workerd reads every named export of the main module as an entrypoint (a string one fails its start)
+const POISON = 'poison-911'
 let faulted = 0
 const statements = new WeakMap()
 function database(db) {
