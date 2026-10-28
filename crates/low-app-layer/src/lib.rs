@@ -152,6 +152,7 @@ pub mod live_view;
 pub mod logic;
 pub mod owed;
 pub mod owed_backfill;
+pub mod owed_actor;
 pub mod owed_belt;
 /// bsv-low #911 (D2-ACTOR-A): the `owed-events` consumer, its dead letters, the un-acked sweep and the served ages.
 pub mod owed_events;

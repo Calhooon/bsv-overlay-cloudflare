@@ -5,12 +5,12 @@
 //! and the old ring's cursor facts stripped: the regression guard on the judge after the walk is gone.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod pins {
+pub(crate) mod pins {
     use crate::pot_hook::tests::SqliteSql;
     use std::collections::BTreeMap;
 
-    pub(super) const NOW_MS: u64 = 1_790_000_000_000;
-    pub(super) const TIP: u64 = 900_000;
+    pub(crate) const NOW_MS: u64 = 1_790_000_000_000;
+    pub(crate) const TIP: u64 = 900_000;
 
     /// The stored rows of `identity`, the word facts and the write-path stamps stripped (the D2-OWED lens's
     /// MEDIUM-3: "the stored rows compared byte for byte, the word facts stripped").
@@ -100,7 +100,7 @@ mod pins {
     }
 
     /// One fixture: its seed statements (run through the overlay's migrations and triggers), the identities compared.
-    pub(super) struct Fixture {
+    pub(crate) struct Fixture {
         pub name: &'static str,
         pub seed: Vec<String>,
         pub identities: Vec<String>,
@@ -149,7 +149,7 @@ mod pins {
         (id, beef.to_binary(), hops, keys)
     }
 
-    pub(super) fn fixtures() -> Vec<Fixture> {
+    pub(crate) fn fixtures() -> Vec<Fixture> {
         let now_s = NOW_MS / 1000;
         let made = now_s as i64 - 7_200;
         let mut out = Vec::new();
@@ -235,7 +235,7 @@ mod pins {
     }
 
     /// The fixture seeded on the judge's side (the walk's side was the same D1 data, copied whole).
-    pub(super) fn seeded(f: &Fixture) -> SqliteSql {
+    pub(crate) fn seeded(f: &Fixture) -> SqliteSql {
         let judge = SqliteSql::migrated();
         judge.now.set(NOW_MS);
         judge.tip.set(Some(TIP));

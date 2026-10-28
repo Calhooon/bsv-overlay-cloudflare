@@ -105,6 +105,7 @@ use crate::pot_hook::{Bind, SqlPort, Stmt, StmtOut};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 mod hydrate;
+pub use hydrate::{facts_of_beefs, FactsFrom, TxFacts, STORED_BEEFS_SQL};
 pub mod rank;
 mod writers;
 pub use hydrate::{
@@ -215,6 +216,14 @@ pub trait JudgeDb: SqlPort {
     ) -> Result<BTreeMap<String, Value>, String>;
     async fn canonical_root(&self, height: u64) -> Option<String>;
     async fn push(&self, identity: &str, body: Value);
+    /// MEDIUM-3 (bsv-low #912): a transaction's decoded facts. The D1 judge decodes the stored BEEF here; the
+    /// actor serves them from its `txfacts` table and holds no bytes.
+    async fn tx_facts(&self, txid: &str, from: FactsFrom) -> Result<Option<TxFacts>, String>
+    where
+        Self: Sized,
+    {
+        hydrate::stored_tx_facts(self, txid, from).await
+    }
     async fn hydrate(&self, identity: &str, games: &[String]) -> Result<JudgeInputs, String>
     where
         Self: Sized,
