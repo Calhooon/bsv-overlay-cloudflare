@@ -15,11 +15,14 @@
 //! deleted, an eviction's move, leaves the mirror too). The byte-identity pin
 //! (`d2_actor_b_the_actor_stores_the_d1_judges_rows`) is what proves it, on the frozen fixtures.
 //!
-//! THE SECTION (MEDIUM-2). Every await on the outside (the record's batches, the word views' header rechecks, the
-//! canonical roots) happens in the closure's rounds; the last judgement then runs over the mirror with those answers
-//! held ([`Held`]): hydrate, judge and write with no await that yields, so a Durable Object's open input gate never
-//! interleaves two judgements. The object serialises its applies besides (one in-object queue, `object.rs`), so an
-//! event arriving during the outside reads waits and is applied after.
+//! THE SECTION (MEDIUM-2). A Durable Object's input gate stays open across a fetch await, so the object holds ONE
+//! turn (`apply_in_turn`, a mutex in the object): every apply, its closure's record reads and outside answers (the
+//! word views' header rechecks, the canonical roots) included, runs inside it, and an event arriving meanwhile waits
+//! and is applied after (pin `d2_actor_b_two_events_under_a_slow_record_derive_the_newer_rows`, RED with the turn
+//! removed). The judgement that stands is the FIXPOINT round's: the round whose statements named no key the mirror
+//! did not hold. The closure starts from what the mirror already names for the games (closed locally, no record
+//! read) and the last judgement's own txids, so a steady-state apply is ONE round: one record batch, one local
+//! write, one judgement.
 //!
 //! ORDER (MEDIUM-1). An apply reads the record as it stands, so its rows are the record's whatever order the events
 //! came in (pin `d2_actor_b_an_out_of_order_pair_derives_the_same_rows`); `applied (kind, seq)` is the redelivery
@@ -63,7 +66,7 @@ pub fn flag_on(value: Option<String>) -> bool {
 }
 /// `OWED_D1_JUDGE` defaults ON (Phases A and B): only the literal `false` turns it off.
 pub fn d1_judge_on(value: Option<String>) -> bool {
-    !value.is_some_and(|v| v.trim() == "false")
+    value.is_none_or(|v| v.trim() != "false")
 }
 /// LOW-1: the object's name is the lowercased 66-hex identity key; anything else is refused before a stub is made.
 pub fn actor_name(identity: &str) -> Option<String> {
@@ -771,9 +774,15 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
         keys = next;
     }
     let judged = local
-        .run_batch(vec![Stmt::new(JUDGED_TXIDS_SQL, vec![Bind::Text(me.clone()), Bind::Text(json!(games).to_string())])])
+        .run_batch(vec![Stmt::new(
+            JUDGED_TXIDS_SQL,
+            vec![Bind::Text(me.clone()), Bind::Text(json!(games).to_string())],
+        )])
         .await?;
-    judged.iter().flat_map(|o| &o.rows).for_each(|r| txids_in_value(r, &mut keys.txids));
+    judged
+        .iter()
+        .flat_map(|o| &o.rows)
+        .for_each(|r| txids_in_value(r, &mut keys.txids));
     let pushes = loop {
         if report.rounds >= CLOSURE_ROUNDS_MAX {
             return Err(format!("owed actor: the closure of {me} did not close in {CLOSURE_ROUNDS_MAX} rounds ({} txids)", keys.txids.len()));
@@ -800,7 +809,9 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
         };
         let mut rows = 0;
         for chunk in games.chunks(crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION) {
-            rows = crate::owed_judge::judge_subjects(&judge, &me, chunk, "owed-actor").await?.rows;
+            rows = crate::owed_judge::judge_subjects(&judge, &me, chunk, "owed-actor")
+                .await?
+                .rows;
         }
         let pushes = judge.pushes.take();
         next.txids.extend(noting.seen.take());
@@ -1102,8 +1113,15 @@ pub struct EventCtx {
 }
 impl EventCtx {
     pub fn of(ev: &overlay_discovery::owed_event::OwedEvent) -> Self {
-        let word = ev.facts["word"].as_str().or_else(|| ev.facts["frame"]["word"].as_str());
-        Self { kind: ev.source.clone(), seq: ev.seq, at_ms: ev.at_ms, mined: ev.source == "word" && word == Some("mined") }
+        let word = ev.facts["word"]
+            .as_str()
+            .or_else(|| ev.facts["frame"]["word"].as_str());
+        Self {
+            kind: ev.source.clone(),
+            seq: ev.seq,
+            at_ms: ev.at_ms,
+            mined: ev.source == "word" && word == Some("mined"),
+        }
     }
 }
 
@@ -1114,7 +1132,11 @@ pub fn apply_body(identity: &str, games: &[String], e: &EventCtx, tip: Option<u6
 
 fn of_games(rows: &[Value], games: &[String]) -> Vec<Value> {
     rows.iter()
-        .filter(|r| r["gameId"].as_str().is_some_and(|g| games.iter().any(|x| x.eq_ignore_ascii_case(g))))
+        .filter(|r| {
+            r["gameId"]
+                .as_str()
+                .is_some_and(|g| games.iter().any(|x| x.eq_ignore_ascii_case(g)))
+        })
         .cloned()
         .collect()
 }
@@ -1133,7 +1155,13 @@ pub async fn beside(db: &impl JudgeDb, identity: &str, games: &[String]) {
         }
     };
     note_answer(&answer);
-    let d1 = match db.run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.to_ascii_lowercase())])]).await {
+    let d1 = match db
+        .run_batch(vec![Stmt::new(
+            ROWS_SQL,
+            vec![Bind::Text(identity.to_ascii_lowercase())],
+        )])
+        .await
+    {
         Ok(mut o) if !o.is_empty() => o.remove(0).rows,
         _ => return,
     };
@@ -1142,7 +1170,12 @@ pub async fn beside(db: &impl JudgeDb, identity: &str, games: &[String]) {
     let mut deltas = vec![(COUNTERS[0].to_string(), 1)];
     if !diffs.is_empty() {
         deltas.push((COUNTERS[1].to_string(), 1));
-        db.log(&format!("[owed-actor] DIFF {identity}: {} of {} games, first {}", diffs.len(), games.len(), diffs[0]));
+        db.log(&format!(
+            "[owed-actor] DIFF {identity}: {} of {} games, first {}",
+            diffs.len(),
+            games.len(),
+            diffs[0]
+        ));
     }
     db.counters(deltas).await;
 }
@@ -1156,14 +1189,41 @@ pub fn note_answer(answer: &Value) {
 
 /// PHASE C: the actor is the judge; the marks this delivery covers are acknowledged after it applied (the ack is
 /// what empties `owed_dirty`; a mark written meanwhile keeps its newer generation).
-pub async fn as_the_judge(db: &impl JudgeDb, identity: &str, games: &[String]) -> Result<crate::owed_judge::JudgeReport, String> {
+pub async fn as_the_judge(
+    db: &impl JudgeDb,
+    identity: &str,
+    games: &[String],
+) -> Result<crate::owed_judge::JudgeReport, String> {
     let id = identity.to_ascii_lowercase();
     let gj = json!(games).to_string();
-    let marks = db.run_batch(vec![Stmt::new(crate::owed_judge::MARKS_SQL, vec![Bind::Text(id.clone()), Bind::Text(gj.clone())])]).await?;
-    let seen = marks.first().map_or(0, |o| o.rows.iter().filter_map(|m| m["generation"].as_i64()).max().unwrap_or(0));
-    let answer = db.actor_deliver(&id, games).await?.ok_or("the D1 judge is off and no owed actor is bound")?;
+    let marks = db
+        .run_batch(vec![Stmt::new(
+            crate::owed_judge::MARKS_SQL,
+            vec![Bind::Text(id.clone()), Bind::Text(gj.clone())],
+        )])
+        .await?;
+    let seen = marks.first().map_or(0, |o| {
+        o.rows
+            .iter()
+            .filter_map(|m| m["generation"].as_i64())
+            .max()
+            .unwrap_or(0)
+    });
+    let answer = db
+        .actor_deliver(&id, games)
+        .await?
+        .ok_or("the D1 judge is off and no owed actor is bound")?;
     note_answer(&answer);
-    db.run_batch(vec![Stmt::new(crate::owed_judge::ACK_DIRTY_SQL, vec![Bind::Text(id), Bind::Text(gj), Bind::Int(seen), Bind::Text("[]".into())])]).await?;
+    db.run_batch(vec![Stmt::new(
+        crate::owed_judge::ACK_DIRTY_SQL,
+        vec![
+            Bind::Text(id),
+            Bind::Text(gj),
+            Bind::Int(seen),
+            Bind::Text("[]".into()),
+        ],
+    )])
+    .await?;
     Ok(crate::owed_judge::JudgeReport {
         subjects: games.len(),
         rows: answer["rows"].as_array().map_or(0, Vec::len),
@@ -1173,19 +1233,43 @@ pub async fn as_the_judge(db: &impl JudgeDb, identity: &str, games: &[String]) -
 
 /// The word columns of a joined read row (`owed_read::ROWS_SQL`): the read takes them from D1's `tx_words`, never
 /// the mirror's (MEDIUM-4).
-pub const WORD_COLUMNS: [&str; 12] = ["word", "tier", "height", "proof_root", "proof_height", "proof_hex", "header_hash", "hint_source", "hint_at", "updated_at", "trackerTerminal", "trackerTerminalWord"];
+pub const WORD_COLUMNS: [&str; 12] = [
+    "word",
+    "tier",
+    "height",
+    "proof_root",
+    "proof_height",
+    "proof_hex",
+    "header_hash",
+    "hint_source",
+    "hint_at",
+    "updated_at",
+    "trackerTerminal",
+    "trackerTerminalWord",
+];
 /// The read's word join over the actor's rows' word roles, one D1 statement.
 pub const READ_WORDS_SQL: &str = "SELECT t.txid AS wordTxid,t.word,t.tier,t.height,t.proof_root,t.proof_height,t.proof_hex,t.header_hash,t.hint_source,t.hint_at,t.updated_at,CASE WHEN json_valid(t.legacy_body) THEN json_type(t.legacy_body,'$.trackerTerminal')='true' END AS trackerTerminal,CASE WHEN json_valid(t.legacy_body) THEN json_extract(t.legacy_body,'$.trackerTerminalWord') END AS trackerTerminalWord FROM tx_words t WHERE t.txid IN (SELECT value FROM json_each(?1))";
 
 /// The txids the actor's joined rows name as words.
 pub fn word_txids(joined: &[Value]) -> Vec<String> {
-    joined.iter().filter_map(|r| r["wordTxid"].as_str().map(str::to_string)).collect::<BTreeSet<_>>().into_iter().collect()
+    joined
+        .iter()
+        .filter_map(|r| r["wordTxid"].as_str().map(str::to_string))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 /// MEDIUM-4: the actor's joined rows with every word column replaced by D1's (absent there: null).
 pub fn join_words(joined: &mut [Value], words: &[Value]) {
-    let by: HashMap<&str, &Value> = words.iter().filter_map(|w| Some((w["wordTxid"].as_str()?, w))).collect();
+    let by: HashMap<&str, &Value> = words
+        .iter()
+        .filter_map(|w| Some((w["wordTxid"].as_str()?, w)))
+        .collect();
     for r in joined.iter_mut() {
-        let w = r["wordTxid"].as_str().and_then(|t| by.get(t).copied()).cloned();
+        let w = r["wordTxid"]
+            .as_str()
+            .and_then(|t| by.get(t).copied())
+            .cloned();
         for c in WORD_COLUMNS {
             r[c] = w.as_ref().map_or(Value::Null, |w| w[c].clone());
         }

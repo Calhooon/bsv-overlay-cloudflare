@@ -33,7 +33,9 @@ pub struct DoSql {
 }
 impl DoSql {
     pub fn of(state: &State) -> Self {
-        Self { sql: state.storage().sql() }
+        Self {
+            sql: state.storage().sql(),
+        }
     }
     fn run(&self, st: &Stmt) -> std::result::Result<StmtOut, String> {
         let binds: Vec<SqlStorageValue> = st
@@ -47,7 +49,10 @@ impl DoSql {
             .collect();
         let cursor = self.sql.exec(&st.sql, binds).map_err(|e| e.to_string())?;
         let rows: Vec<Value> = cursor.to_array().map_err(|e| e.to_string())?;
-        Ok(StmtOut { changes: Some(cursor.rows_written() as u64), rows })
+        Ok(StmtOut {
+            changes: Some(cursor.rows_written() as u64),
+            rows,
+        })
     }
 }
 impl SqlPort for DoSql {
@@ -150,10 +155,15 @@ impl DurableObject for OwedActor {
                 self.apply_route(body).await
             }
             (Method::Get, "/rows") => {
-                let identity = url.query_pairs().find(|(k, _)| k == "identity").map(|(_, v)| v.to_string());
+                let identity = url
+                    .query_pairs()
+                    .find(|(k, _)| k == "identity")
+                    .map(|(_, v)| v.to_string());
                 self.rows_route(identity).await
             }
-            (Method::Get, "/bars") => Response::from_json(&self.bars.borrow().served(Date::now().as_millis())),
+            (Method::Get, "/bars") => {
+                Response::from_json(&self.bars.borrow().served(Date::now().as_millis()))
+            }
             (Method::Post, "/reset") => {
                 let _turn = self.turn.lock().await;
                 self.state.storage().delete_all().await?;
@@ -170,7 +180,11 @@ impl DurableObject for OwedActor {
         if self.meta(META_BOOT_CURSOR).is_some() {
             if let Err(e) = self.bootstrap_page(&local).await {
                 console_log!("[owed-actor] bootstrap page: {e}");
-                let _ = self.state.storage().set_alarm(Date::now().as_millis() as i64 + 60_000).await;
+                let _ = self
+                    .state
+                    .storage()
+                    .set_alarm(Date::now().as_millis() as i64 + 60_000)
+                    .await;
             }
         }
         if self.meta(META_KV_DIRTY).as_deref() == Some("1") {
@@ -180,10 +194,23 @@ impl DurableObject for OwedActor {
             let tip = crate::owed_events::tip_memoised(&self.env, true).await;
             let games = self.gated_games(&local, tip);
             if !games.is_empty() {
-                let body = ApplyBody { identity, games, kind: Some("tip".into()), seq: None, at_ms: None, tip, txfacts: Vec::new(), mined: false };
+                let body = ApplyBody {
+                    identity,
+                    games,
+                    kind: Some("tip".into()),
+                    seq: None,
+                    at_ms: None,
+                    tip,
+                    txfacts: Vec::new(),
+                    mined: false,
+                };
                 let _ = self.apply_route(body).await;
             } else if gate.parse::<u64>().is_ok() {
-                let _ = self.state.storage().set_alarm(Date::now().as_millis() as i64 + TIP_ALARM_MS as i64).await;
+                let _ = self
+                    .state
+                    .storage()
+                    .set_alarm(Date::now().as_millis() as i64 + TIP_ALARM_MS as i64)
+                    .await;
             }
         }
         Response::ok("ok")
@@ -199,13 +226,22 @@ impl OwedActor {
                 .exec("SELECT value FROM meta WHERE name='schema'", None)
                 .ok()
                 .and_then(|c| c.to_array::<Value>().ok())
-                .and_then(|r| r.first().and_then(|v| v["value"].as_str().map(str::to_string)));
+                .and_then(|r| {
+                    r.first()
+                        .and_then(|v| v["value"].as_str().map(str::to_string))
+                });
             for s in schema_plan(held.as_deref()) {
                 if let Err(e) = local.sql.exec(&s, None) {
                     console_log!("[owed-actor] schema: {e}: {s}");
                 }
             }
-            let _ = local.sql.exec(META_PUT_SQL, vec![SqlStorageValue::from(META_SCHEMA.to_string()), SqlStorageValue::from(schema::DIGEST.to_string())]);
+            let _ = local.sql.exec(
+                META_PUT_SQL,
+                vec![
+                    SqlStorageValue::from(META_SCHEMA.to_string()),
+                    SqlStorageValue::from(schema::DIGEST.to_string()),
+                ],
+            );
             *self.ready.borrow_mut() = true;
         }
         local
@@ -218,11 +254,20 @@ impl OwedActor {
             .exec(META_GET_SQL, vec![SqlStorageValue::from(name.to_string())])
             .ok()
             .and_then(|c| c.to_array::<Value>().ok())
-            .and_then(|r| r.first().and_then(|v| v["value"].as_str().map(str::to_string)))
+            .and_then(|r| {
+                r.first()
+                    .and_then(|v| v["value"].as_str().map(str::to_string))
+            })
     }
 
     fn put_meta(&self, local: &DoSql, name: &str, value: &str) {
-        let _ = local.sql.exec(META_PUT_SQL, vec![SqlStorageValue::from(name.to_string()), SqlStorageValue::from(value.to_string())]);
+        let _ = local.sql.exec(
+            META_PUT_SQL,
+            vec![
+                SqlStorageValue::from(name.to_string()),
+                SqlStorageValue::from(value.to_string()),
+            ],
+        );
     }
 
     /// The games whose rows wait for the block that has come: a gate at or below the tip, or a courier-dated sweep
@@ -247,13 +292,28 @@ impl OwedActor {
         let started = Date::now().as_millis();
         let local = self.local();
         let seq = body.seq.unwrap_or(0);
-        let facts: Vec<Stmt> = body.txfacts.iter().filter_map(|f| txfacts_event_stmt(f, seq)).collect();
+        let facts: Vec<Stmt> = body
+            .txfacts
+            .iter()
+            .filter_map(|f| txfacts_event_stmt(f, seq))
+            .collect();
         if !facts.is_empty() {
             let _ = local.run_batch(facts).await;
         }
         let record = crate::routes::D1Sql::of(&self.env)?;
         let kind_seq = body.kind.as_deref().zip(body.seq);
-        let applied = apply_in_turn(&self.turn, &record, &local, &EnvOutside(&self.env), &me, &body.games, kind_seq, body.tip, crate::routes::written_off_before_ms_env(&self.env)).await;
+        let applied = apply_in_turn(
+            &self.turn,
+            &record,
+            &local,
+            &EnvOutside(&self.env),
+            &me,
+            &body.games,
+            kind_seq,
+            body.tip,
+            crate::routes::written_off_before_ms_env(&self.env),
+        )
+        .await;
         let (report, pushes) = match applied {
             Ok(r) => r,
             Err(e) => return Response::error(format!("owed actor apply: {e}"), 503),
@@ -279,7 +339,8 @@ impl OwedActor {
             crate::push_coalesce::queue_seat_push(&identity, push);
         }
         if crate::push_coalesce::has_queued() {
-            self.state.wait_until(crate::push_coalesce::flush_queued(self.env.clone()));
+            self.state
+                .wait_until(crate::push_coalesce::flush_queued(self.env.clone()));
         }
         // MEDIUM-9: the KV copy at most once a second; the rest coalesced on the alarm.
         let last = *self.last_kv_ms.borrow();
@@ -287,7 +348,11 @@ impl OwedActor {
             self.write_kv_copy(&local).await;
         } else {
             self.put_meta(&local, META_KV_DIRTY, "1");
-            let _ = self.state.storage().set_alarm(now as i64 + KV_COPY_MIN_INTERVAL_MS as i64).await;
+            let _ = self
+                .state
+                .storage()
+                .set_alarm(now as i64 + KV_COPY_MIN_INTERVAL_MS as i64)
+                .await;
         }
         // MEDIUM-5: the actor's own tip alarm while a row waits for a block.
         let gate = local
@@ -299,8 +364,20 @@ impl OwedActor {
         match gate {
             Some(g) => {
                 self.put_meta(&local, META_GATE, &g.to_string());
-                if self.state.storage().get_alarm().await.ok().flatten().is_none() {
-                    let _ = self.state.storage().set_alarm(now as i64 + TIP_ALARM_MS as i64).await;
+                if self
+                    .state
+                    .storage()
+                    .get_alarm()
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    let _ = self
+                        .state
+                        .storage()
+                        .set_alarm(now as i64 + TIP_ALARM_MS as i64)
+                        .await;
                 }
             }
             None => {
@@ -336,20 +413,31 @@ impl OwedActor {
     /// answers `bootstrapped: false` and starts its bootstrap on its alarm (MEDIUM-6).
     async fn rows_route(&self, identity: Option<String>) -> Result<Response> {
         let local = self.local();
-        let me = self.meta(META_IDENTITY).or(identity.and_then(|i| actor_name(&i)));
+        let me = self
+            .meta(META_IDENTITY)
+            .or(identity.and_then(|i| actor_name(&i)));
         let bootstrapped = self.meta(META_BOOTSTRAPPED).is_some();
         if !bootstrapped {
             if let Some(me) = &me {
                 self.put_meta(&local, META_IDENTITY, me);
                 if self.meta(META_BOOT_CURSOR).is_none() {
                     self.put_meta(&local, META_BOOT_CURSOR, "0");
-                    let _ = self.state.storage().set_alarm(Date::now().as_millis() as i64).await;
+                    let _ = self
+                        .state
+                        .storage()
+                        .set_alarm(Date::now().as_millis() as i64)
+                        .await;
                 }
             }
         }
         let read = |sql: &str| -> Vec<Value> {
             me.as_deref()
-                .and_then(|m| local.sql.exec(sql, vec![SqlStorageValue::from(m.to_string())]).ok())
+                .and_then(|m| {
+                    local
+                        .sql
+                        .exec(sql, vec![SqlStorageValue::from(m.to_string())])
+                        .ok()
+                })
                 .and_then(|c| c.to_array::<Value>().ok())
                 .unwrap_or_default()
         };
@@ -366,38 +454,69 @@ impl OwedActor {
     /// MEDIUM-6: one bootstrap page (16 games, newest first) per alarm, resumable on its cursor, until the page is
     /// short: then the actor is bootstrapped and its reads serve its rows.
     async fn bootstrap_page(&self, local: &DoSql) -> Result<()> {
-        let (Some(me), Some(cursor)) = (self.meta(META_IDENTITY), self.meta(META_BOOT_CURSOR)) else {
+        let (Some(me), Some(cursor)) = (self.meta(META_IDENTITY), self.meta(META_BOOT_CURSOR))
+        else {
             return Ok(());
         };
         let offset: i64 = cursor.parse().unwrap_or(0);
         let record = crate::routes::D1Sql::of(&self.env)?;
         let page = record
-            .run_batch(vec![Stmt::new(crate::owed_judge::IDENTITY_GAMES_PAGE_SQL, vec![Bind::Text(me.clone()), Bind::Int(offset)])])
+            .run_batch(vec![Stmt::new(
+                crate::owed_judge::IDENTITY_GAMES_PAGE_SQL,
+                vec![Bind::Text(me.clone()), Bind::Int(offset)],
+            )])
             .await
             .map_err(Error::RustError)?;
-        let games: Vec<String> = page.first().map(|o| o.rows.iter().filter_map(|r| r["gameId"].as_str().map(str::to_string)).collect()).unwrap_or_default();
+        let games: Vec<String> = page
+            .first()
+            .map(|o| {
+                o.rows
+                    .iter()
+                    .filter_map(|r| r["gameId"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
         if !games.is_empty() {
             let tip = crate::owed_events::tip_memoised(&self.env, false).await;
-            apply_in_turn(&self.turn, &record, local, &EnvOutside(&self.env), &me, &games, None, tip, crate::routes::written_off_before_ms_env(&self.env))
-                .await
-                .map_err(Error::RustError)?;
+            apply_in_turn(
+                &self.turn,
+                &record,
+                local,
+                &EnvOutside(&self.env),
+                &me,
+                &games,
+                None,
+                tip,
+                crate::routes::written_off_before_ms_env(&self.env),
+            )
+            .await
+            .map_err(Error::RustError)?;
         }
         if games.len() < 16 {
             let now = Date::now().as_millis();
             self.put_meta(local, META_BOOTSTRAPPED, &now.to_string());
             self.put_meta(local, META_JUDGED_AT, &now.to_string());
-            let _ = local.sql.exec("DELETE FROM meta WHERE name='bootCursor'", None);
+            let _ = local
+                .sql
+                .exec("DELETE FROM meta WHERE name='bootCursor'", None);
             self.bars.borrow_mut().bootstraps += 1;
         } else {
             self.put_meta(local, META_BOOT_CURSOR, &(offset + 16).to_string());
-            self.state.storage().set_alarm(Date::now().as_millis() as i64 + 1).await?;
+            self.state
+                .storage()
+                .set_alarm(Date::now().as_millis() as i64 + 1)
+                .await?;
         }
         Ok(())
     }
 
     async fn write_kv_copy(&self, local: &DoSql) {
-        let Some(me) = self.meta(META_IDENTITY) else { return };
-        let Ok(kv) = self.env.kv(KV_BINDING) else { return };
+        let Some(me) = self.meta(META_IDENTITY) else {
+            return;
+        };
+        let Ok(kv) = self.env.kv(KV_BINDING) else {
+            return;
+        };
         let now = Date::now().as_millis();
         let body = kv_copy_body(&me, &self.rows_of(local, &me), now);
         let put = kv.put(&me, body.to_string());
@@ -405,7 +524,9 @@ impl OwedActor {
             if put.execute().await.is_ok() {
                 *self.last_kv_ms.borrow_mut() = Some(now);
                 self.bars.borrow_mut().kv_copies += 1;
-                let _ = local.sql.exec("DELETE FROM meta WHERE name='kvDirty'", None);
+                let _ = local
+                    .sql
+                    .exec("DELETE FROM meta WHERE name='kvDirty'", None);
             }
         }
     }
@@ -419,20 +540,38 @@ pub const GATED_GAMES_SQL: &str = "SELECT DISTINCT gameId FROM owed_rows WHERE g
 /// A stub of the identity's actor, `None` without the binding or for a key that is not 66-hex.
 pub fn stub_of(env: &Env, identity: &str) -> Option<Stub> {
     let name = actor_name(identity)?;
-    env.durable_object(BINDING).ok()?.id_from_name(&name).ok()?.get_stub().ok()
+    env.durable_object(BINDING)
+        .ok()?
+        .id_from_name(&name)
+        .ok()?
+        .get_stub()
+        .ok()
 }
 
 /// One actor call (the consumer's delivery, a writer's direct call), bounded by `wall_ms`.
-pub async fn call_apply(env: &Env, body: &Value, wall_ms: u64) -> std::result::Result<Value, String> {
+pub async fn call_apply(
+    env: &Env,
+    body: &Value,
+    wall_ms: u64,
+) -> std::result::Result<Value, String> {
     let identity = body["identity"].as_str().unwrap_or_default();
     let stub = stub_of(env, identity).ok_or("no owed actor for this identity")?;
     let mut init = RequestInit::new();
-    init.with_method(Method::Post).with_body(Some(body.to_string().into()));
-    let req = Request::new_with_init("https://owed-actor/apply", &init).map_err(|e| e.to_string())?;
+    init.with_method(Method::Post)
+        .with_body(Some(body.to_string().into()));
+    let req =
+        Request::new_with_init("https://owed-actor/apply", &init).map_err(|e| e.to_string())?;
     let call = async {
-        let mut resp = stub.fetch_with_request(req).await.map_err(|e| e.to_string())?;
+        let mut resp = stub
+            .fetch_with_request(req)
+            .await
+            .map_err(|e| e.to_string())?;
         if resp.status_code() != 200 {
-            return Err(format!("owed actor answered {}: {}", resp.status_code(), resp.text().await.unwrap_or_default()));
+            return Err(format!(
+                "owed actor answered {}: {}",
+                resp.status_code(),
+                resp.text().await.unwrap_or_default()
+            ));
         }
         resp.json::<Value>().await.map_err(|e| e.to_string())
     };
@@ -441,16 +580,25 @@ pub async fn call_apply(env: &Env, body: &Value, wall_ms: u64) -> std::result::R
     futures_util::pin_mut!(wall);
     match futures_util::future::select(call, wall).await {
         futures_util::future::Either::Left((r, _)) => r,
-        futures_util::future::Either::Right(_) => Err(format!("owed actor: no answer in {wall_ms} ms")),
+        futures_util::future::Either::Right(_) => {
+            Err(format!("owed actor: no answer in {wall_ms} ms"))
+        }
     }
 }
 
 /// The read's call (`GET /rows`), bounded.
-pub async fn call_rows(env: &Env, identity: &str, wall_ms: u64) -> std::result::Result<Value, String> {
+pub async fn call_rows(
+    env: &Env,
+    identity: &str,
+    wall_ms: u64,
+) -> std::result::Result<Value, String> {
     let stub = stub_of(env, identity).ok_or("no owed actor for this identity")?;
     let name = actor_name(identity).unwrap_or_default();
     let call = async {
-        let mut resp = stub.fetch_with_str(&format!("https://owed-actor/rows?identity={name}")).await.map_err(|e| e.to_string())?;
+        let mut resp = stub
+            .fetch_with_str(&format!("https://owed-actor/rows?identity={name}"))
+            .await
+            .map_err(|e| e.to_string())?;
         resp.json::<Value>().await.map_err(|e| e.to_string())
     };
     let wall = Delay::from(std::time::Duration::from_millis(wall_ms));
@@ -458,7 +606,9 @@ pub async fn call_rows(env: &Env, identity: &str, wall_ms: u64) -> std::result::
     futures_util::pin_mut!(wall);
     match futures_util::future::select(call, wall).await {
         futures_util::future::Either::Left((r, _)) => r,
-        futures_util::future::Either::Right(_) => Err(format!("owed actor: no answer in {wall_ms} ms")),
+        futures_util::future::Either::Right(_) => {
+            Err(format!("owed actor: no answer in {wall_ms} ms"))
+        }
     }
 }
 
@@ -487,7 +637,9 @@ pub fn schedule_direct(
     }
     let env = ctx.env.clone();
     wait.wait_until(async move {
-        let Ok(db) = crate::routes::D1Sql::of(&env) else { return };
+        let Ok(db) = crate::routes::D1Sql::of(&env) else {
+            return;
+        };
         let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for f in &filings {
             if let Ok(subjects) = crate::record_post::owed_write::subjects(&db, f).await {
@@ -499,7 +651,12 @@ pub fn schedule_direct(
         let tip = crate::owed_events::tip_memoised(&env, false).await;
         let (mut calls, mut faults) = (0u64, 0u64);
         for (identity, games) in by {
-            let e = EventCtx { kind: "direct".into(), seq: 0, at_ms: at_ms as i64, mined: false };
+            let e = EventCtx {
+                kind: "direct".into(),
+                seq: 0,
+                at_ms: at_ms as i64,
+                mined: false,
+            };
             let mut body = apply_body(&identity, &games, &e, tip);
             body["seq"] = Value::Null;
             calls += 1;
@@ -516,39 +673,56 @@ pub fn schedule_direct(
                 }
             }
         }
-        db.counters(vec![(COUNTERS[3].into(), calls), (COUNTERS[4].into(), faults)]).await;
+        db.counters(vec![
+            (COUNTERS[3].into(), calls),
+            (COUNTERS[4].into(), faults),
+        ])
+        .await;
     });
 }
 
 /// Phase B's read (`OWED_ACTOR_READ`): the actor's rows joined with D1's words, the D1 snapshot's pending marks
 /// kept; an actor not yet bootstrapped is `pending` with no rows; an actor out of reach is the KV copy, display only,
 /// or `pending` with no rows (Rule 23: never `rows: []` by silence). `Err` is the stored read's fault (503).
-pub(crate) async fn read_snapshot(env: &Env, db: &crate::routes::D1Sql, identity: &str) -> std::result::Result<std::result::Result<crate::owed_read::Snapshot, Value>, String> {
+pub(crate) async fn read_snapshot(
+    env: &Env,
+    db: &crate::routes::D1Sql,
+    identity: &str,
+) -> std::result::Result<std::result::Result<crate::owed_read::Snapshot, Value>, String> {
     let mut snapshot = crate::owed_read::read(db, identity).await?;
     let answer = match call_rows(env, identity, READ_WALL_MS).await {
         Ok(a) => a,
         Err(e) => {
             console_log!("[owed-actor] read {identity}: {e}");
-            return Ok(Err(display_from_copy(read_kv_copy(env, identity).await.as_ref())));
+            return Ok(Err(display_from_copy(
+                read_kv_copy(env, identity).await.as_ref(),
+            )));
         }
     };
     if answer["bootstrapped"] != true {
-        return Ok(Err(json!({"identity": identity, "rows": null, "pending": true, "source": "owed-actor", "reason": "the judge is building this identity's rows; re-read"})));
+        return Ok(Err(
+            json!({"identity": identity, "rows": null, "pending": true, "source": "owed-actor", "reason": "the judge is building this identity's rows; re-read"}),
+        ));
     }
     let mut joined: Vec<Value> = answer["joined"].as_array().cloned().unwrap_or_default();
     let txids = word_txids(&joined);
     let words = if txids.is_empty() {
         Vec::new()
     } else {
-        db.run_batch(vec![Stmt::new(READ_WORDS_SQL, vec![Bind::Text(json!(txids).to_string())])])
-            .await?
-            .into_iter()
-            .next()
-            .map(|o| o.rows)
-            .unwrap_or_default()
+        db.run_batch(vec![Stmt::new(
+            READ_WORDS_SQL,
+            vec![Bind::Text(json!(txids).to_string())],
+        )])
+        .await?
+        .into_iter()
+        .next()
+        .map(|o| o.rows)
+        .unwrap_or_default()
     };
     join_words(&mut joined, &words);
     snapshot.joined = joined;
-    snapshot.state = answer["state"].as_object().map(|o| Value::Object(o.clone()));
+    snapshot.state = answer["state"]
+        .as_object()
+        .map(|o| Value::Object(o.clone()));
     Ok(Ok(snapshot))
 }

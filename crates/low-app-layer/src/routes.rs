@@ -3289,7 +3289,12 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
     }
     let db = D1Sql::of(&ctx.env)?;
     // bsv-low #912 (Phase B, `OWED_ACTOR_READ`): the actor's rows, the words joined from D1 as below.
-    let snapshot = if crate::owed_actor::flag_on(ctx.env.var(crate::owed_actor::READ_FLAG).ok().map(|v| v.to_string())) {
+    let snapshot = if crate::owed_actor::flag_on(
+        ctx.env
+            .var(crate::owed_actor::READ_FLAG)
+            .ok()
+            .map(|v| v.to_string()),
+    ) {
         match crate::owed_actor::object::read_snapshot(&ctx.env, &db, &identity).await {
             Ok(Ok(snapshot)) => snapshot,
             Ok(Err(display)) => return json_response(display.to_string(), 200),
@@ -7020,12 +7025,19 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     // the writers' direct calls): the apply's p50, p95 and ceiling, the rows' visibility after the write.
     body["owedActor"] = crate::owed_actor::served_bars(worker::Date::now().as_millis());
     body["owedActor"]["readFlag"] = serde_json::json!(crate::owed_actor::flag_on(
-        ctx.env.var(crate::owed_actor::READ_FLAG).ok().map(|v| v.to_string())
+        ctx.env
+            .var(crate::owed_actor::READ_FLAG)
+            .ok()
+            .map(|v| v.to_string())
     ));
     body["owedActor"]["d1Judge"] = serde_json::json!(crate::owed_actor::d1_judge_on(
-        ctx.env.var(crate::owed_actor::D1_JUDGE_FLAG).ok().map(|v| v.to_string())
+        ctx.env
+            .var(crate::owed_actor::D1_JUDGE_FLAG)
+            .ok()
+            .map(|v| v.to_string())
     ));
-    body["owedActor"]["bound"] = serde_json::json!(ctx.env.durable_object(crate::owed_actor::BINDING).is_ok());
+    body["owedActor"]["bound"] =
+        serde_json::json!(ctx.env.durable_object(crate::owed_actor::BINDING).is_ok());
     // bsv-low #499: this isolate's D1 rows ledger, the per-route running maxima since boot (the overlay serves the
     // same body on `/health/invariants.d1Budget`; `scripts/d1-census.py` reads both).
     body["d1Budget"] = crate::d1_ledger::budget_json();
