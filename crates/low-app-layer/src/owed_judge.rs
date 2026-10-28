@@ -874,7 +874,11 @@ macro_rules! identity_games {
     };
 }
 /// bsv-low #912: every game of an identity, newest first (the actor's bootstrap pages them, `?2` the offset).
-pub const IDENTITY_GAMES_PAGE_SQL: &str = concat!("SELECT gameId FROM (", identity_games!(), " LIMIT 16 OFFSET ?2) WHERE 1");
+pub const IDENTITY_GAMES_PAGE_SQL: &str = concat!(
+    "SELECT gameId FROM (",
+    identity_games!(),
+    " LIMIT 16 OFFSET ?2) WHERE 1"
+);
 /// Expand the one wanted envelope to durable game marks: the newest [`OWED_WANTED_GAMES`] games `wanted`, the rest
 /// `backfill` ([`EXPAND_BACKFILL_SQL`]). An interrupted drain leaves all remaining games marked.
 pub const EXPAND_WANTED_SQL: &str = concat!("INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,gameId,'wanted',?1,strftime('%s','now') * 1000 FROM (", identity_games!(), " LIMIT 32) WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs");

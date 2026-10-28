@@ -1134,13 +1134,6 @@ thread_local! {
     /// THIS isolate's bars (the direct calls and the consumer's deliveries measured where they are made).
     pub static BARS: RefCell<Bars> = RefCell::default();
 }
-pub fn note_visible(write_at_ms: u64, judged_at_ms: u64) {
-    BARS.with(|b| {
-        b.borrow_mut()
-            .visible
-            .note(judged_at_ms.saturating_sub(write_at_ms))
-    });
-}
 pub fn note_apply(ms: u64) {
     BARS.with(|b| b.borrow_mut().apply.note(ms));
 }
@@ -1269,7 +1262,11 @@ pub async fn reconcile_step(
             .await?,
         );
         for o in diff_rows(&d1, &actor) {
-            for r in d1.iter().chain(&actor).filter(|r| r["outpoint"] == o.as_str()) {
+            for r in d1
+                .iter()
+                .chain(&actor)
+                .filter(|r| r["outpoint"] == o.as_str())
+            {
                 games_of_rows(std::slice::from_ref(r), &mut games);
             }
         }
@@ -1462,10 +1459,21 @@ pub async fn durable_reconcile_diffs(db: &impl SqlPort) -> Option<u64> {
     .map_or(Some(0), |r| r["value"].as_u64())
 }
 
-/// The bars of one answer, in this isolate.
+/// The bars of one answer, in this isolate: the apply's time, and (an answer naming its event's write time) the rows'
+/// visibility after the write and, for a `mined` word's event, the collect-after-mined bar.
 pub fn note_answer(answer: &Value) {
+    BARS.with(|b| note_answer_into(&mut b.borrow_mut(), answer));
+}
+pub fn note_answer_into(bars: &mut Bars, answer: &Value) {
     if let Some(ms) = answer["applyMs"].as_u64() {
-        note_apply(ms);
+        bars.apply.note(ms);
+    }
+    if let (Some(at), Some(judged)) = (answer["atMs"].as_u64(), answer["judgedAtMs"].as_u64()) {
+        let ms = judged.saturating_sub(at);
+        bars.visible.note(ms);
+        if answer["mined"] == true {
+            bars.collect_after_mined.note(ms);
+        }
     }
 }
 

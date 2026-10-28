@@ -759,10 +759,7 @@ async fn ask_candidates(db: &impl JudgeDb, now: i64) -> Result<Vec<Value>, Strin
     let page = first(
         db.run_batch(vec![Stmt {
             sql: ASKS_PAGE_SQL.into(),
-            binds: vec![
-                Bind::Text(cursor),
-                Bind::Int(OWED_BELT_ASKS_PAGE as i64),
-            ],
+            binds: vec![Bind::Text(cursor), Bind::Int(OWED_BELT_ASKS_PAGE as i64)],
         }])
         .await?,
     );
@@ -840,7 +837,10 @@ async fn ask_find(
     report: &mut TickReport,
 ) {
     if let Err(e) = db.run_batch(find.statements(now)).await {
-        db.log(&format!("[owed-belt] {} find's write faulted: {e}", c.outpoint));
+        db.log(&format!(
+            "[owed-belt] {} find's write faulted: {e}",
+            c.outpoint
+        ));
         report.write_faults.push((c.outpoint.clone(), e));
         return rearm_ask(db, c, now, report).await;
     }
@@ -867,7 +867,10 @@ async fn ask_find(
             rearm_ask(db, c, now, report).await;
         }
         Err(e) => {
-            db.log(&format!("[owed-belt] {} find's hand-back faulted: {e}", c.outpoint));
+            db.log(&format!(
+                "[owed-belt] {} find's hand-back faulted: {e}",
+                c.outpoint
+            ));
             report.write_faults.push((c.outpoint.clone(), e));
             rearm_ask(db, c, now, report).await;
         }
@@ -875,7 +878,13 @@ async fn ask_find(
 }
 
 /// The ask's backoff ([`backoff`]'s rule over the actor's row): a look that changed nothing doubles the period.
-async fn ask_backoff(db: &impl JudgeDb, c: &Candidate, row: &Value, now: i64, report: &mut TickReport) {
+async fn ask_backoff(
+    db: &impl JudgeDb,
+    c: &Candidate,
+    row: &Value,
+    now: i64,
+    report: &mut TickReport,
+) {
     let Some(base_due) = row["beltDueAtMs"].as_i64() else {
         return;
     };
@@ -904,7 +913,10 @@ async fn ask_backoff(db: &impl JudgeDb, c: &Candidate, row: &Value, now: i64, re
         .await
     {
         Ok(_) => report.backed_off += 1,
-        Err(e) => db.log(&format!("[owed-belt] backoff of {} faulted: {e}", c.outpoint)),
+        Err(e) => db.log(&format!(
+            "[owed-belt] backoff of {} faulted: {e}",
+            c.outpoint
+        )),
     }
 }
 
@@ -918,7 +930,10 @@ async fn rearm_ask(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut Tick
     };
     match db.run_batch(vec![stmt]).await {
         Ok(_) => report.rearmed += 1,
-        Err(e) => db.log(&format!("[owed-belt] re-arm of {} faulted: {e}", c.outpoint)),
+        Err(e) => db.log(&format!(
+            "[owed-belt] re-arm of {} faulted: {e}",
+            c.outpoint
+        )),
     }
 }
 
@@ -1023,7 +1038,12 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
                 ],
             },
             Stmt {
-                sql: if asks { ASKS_DUE_GAUGE_SQL } else { DUE_GAUGE_SQL }.into(),
+                sql: if asks {
+                    ASKS_DUE_GAUGE_SQL
+                } else {
+                    DUE_GAUGE_SQL
+                }
+                .into(),
                 binds: vec![Bind::Int(now)],
             },
         ])

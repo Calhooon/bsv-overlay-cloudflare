@@ -874,7 +874,7 @@
    "readers": ["overlay-cloudflare"],
    "rebuild_class": "transient",
    "never_wipe": false,
-   "holds": "independent named cursors for the owed belt and backfill",
+   "holds": "independent named cursors for the owed belt and backfill, the owed events' fault memos, and Phase C's belt-ask rows the owed actors publish (bsv-low #912)",
    "why": "a lost cursor restarts bounded work; the backfill completion stamp remains in view_derivation_state"
   },
   {
