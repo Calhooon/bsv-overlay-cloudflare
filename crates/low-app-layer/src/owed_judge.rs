@@ -229,6 +229,21 @@ pub trait JudgeDb: SqlPort {
     ) -> Result<Option<Value>, String> {
         Ok(None)
     }
+    /// bsv-low #912 (Phase C's `belt-find`): the identity's actor applies the games as an event of `kind` (the belt's
+    /// find handed back); `None` where no actor is bound.
+    async fn actor_apply(
+        &self,
+        _identity: &str,
+        _games: &[String],
+        _kind: &str,
+    ) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+    /// bsv-low #912 (the reconcile, MEDIUM-10): the identity's actor's stored rows (`owed_actor::ROWS_SQL` on its
+    /// SQLite), read without an apply; `None` where no actor is bound.
+    async fn actor_rows(&self, _identity: &str) -> Result<Option<Vec<Value>>, String> {
+        Ok(None)
+    }
     /// MEDIUM-3 (bsv-low #912): a transaction's decoded facts. The D1 judge decodes the stored BEEF here; the
     /// actor serves them from its `txfacts` table and holds no bytes.
     async fn tx_facts(&self, txid: &str, from: FactsFrom) -> Result<Option<TxFacts>, String>
@@ -307,6 +322,43 @@ impl JudgeDb for D1Judge {
             return Ok(None);
         }
         let body = crate::owed_actor::apply_body(identity, games, event, self.tip);
+        crate::owed_actor::object::call_apply(
+            &self.sql.env,
+            &body,
+            crate::owed_actor::CONSUMER_CALL_WALL_MS,
+        )
+        .await
+        .map(Some)
+    }
+    async fn actor_rows(&self, identity: &str) -> Result<Option<Vec<Value>>, String> {
+        if crate::owed_actor::object::stub_of(&self.sql.env, identity).is_none() {
+            return Ok(None);
+        }
+        crate::owed_actor::object::call_stored(
+            &self.sql.env,
+            identity,
+            crate::owed_actor::CONSUMER_CALL_WALL_MS,
+        )
+        .await
+        .map(Some)
+    }
+    async fn actor_apply(
+        &self,
+        identity: &str,
+        games: &[String],
+        kind: &str,
+    ) -> Result<Option<Value>, String> {
+        if crate::owed_actor::object::stub_of(&self.sql.env, identity).is_none() {
+            return Ok(None);
+        }
+        let event = crate::owed_actor::EventCtx {
+            kind: kind.into(),
+            seq: 0,
+            at_ms: worker::Date::now().as_millis() as i64,
+            mined: false,
+        };
+        let mut body = crate::owed_actor::apply_body(identity, games, &event, self.tip);
+        body["seq"] = Value::Null;
         crate::owed_actor::object::call_apply(
             &self.sql.env,
             &body,

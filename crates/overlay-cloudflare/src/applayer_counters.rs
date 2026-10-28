@@ -110,7 +110,8 @@ pub const OWED_BELT: [&str; 8] = [
 
 /// bsv-low #912 (lane D2-ACTOR-B): the app layer's owed actor (`low_app_layer::owed_actor::COUNTERS`, pinned equal
 /// there): its Phase A compares against the D1 judge, the diffs, its faults, the direct calls, the reconcile.
-pub const OWED_ACTOR: [&str; 8] = [
+/// The last two (Phase C, HIGH-3): the `belt-ask`s the actors published, the belt's finds handed back to an actor.
+pub const OWED_ACTOR: [&str; 10] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -119,7 +120,36 @@ pub const OWED_ACTOR: [&str; 8] = [
     "owed_actor_reconcile_republished_total",
     "owed_actor_reconcile_compared_total",
     "owed_actor_reconcile_diffs_total",
+    "owed_actor_belt_asks_total",
+    "owed_belt_handed_back_total",
 ];
+
+/// bsv-low #912: `/health/invariants.owedActor`, the actor's durable totals: the Phase A compares and their diffs,
+/// its faults, the writers' direct calls, the sampled digest reconcile (64 identities a day on the belt's alarm) and
+/// Phase C's belt questions.
+pub fn owed_actor_view(counters: &serde_json::Value) -> serde_json::Value {
+    let n = |k: &str| {
+        counters
+            .get(k)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    serde_json::json!({
+        "compared": n("owed_actor_compared_total"),
+        "diffs": n("owed_actor_diffs_total"),
+        "faults": n("owed_actor_faults_total"),
+        "directCalls": n("owed_actor_direct_calls_total"),
+        "directFaults": n("owed_actor_direct_faults_total"),
+        "reconcile": {
+            "compared": n("owed_actor_reconcile_compared_total"),
+            "diffs": n("owed_actor_reconcile_diffs_total"),
+            "reapplied": n("owed_actor_reconcile_republished_total"),
+            "perDay": 64,
+        },
+        "beltAsks": n("owed_actor_belt_asks_total"),
+        "handedBack": n("owed_belt_handed_back_total"),
+    })
+}
 
 /// bsv-low #893 section 6.1 (lane D2-OWED-BACKFILL): the app layer's one-time `owed-v2` backfill and the daily age
 /// re-mark (`low_app_layer::owed_backfill::counter_names`, pinned equal there). Totals the pass adds. The last three

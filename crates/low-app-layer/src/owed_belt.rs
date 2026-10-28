@@ -93,6 +93,60 @@ pub const STATE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs)
 /// The backlog gauge: SET (not added), counted over the partial index.
 pub const DUE_GAUGE_SQL: &str = "INSERT INTO ops_counters(name,value) SELECT 'owed_belt_due_total',COUNT(*) FROM owed_rows INDEXED BY idx_owed_rows_belt WHERE beltDueAtMs<=?1 ON CONFLICT(name) DO UPDATE SET value=excluded.value";
 
+/// bsv-low #912 (lane D2-ACTOR-B, HIGH-3): PHASE C's asks. With the D1 judge off (`OWED_D1_JUDGE=false`) the D1
+/// `owed_rows` are no longer dated, so each identity's actor PUBLISHES a `belt-ask` per dated row of its own
+/// (`owed_actor::publish_belt_asks`): one row of the belt's ledger, `belt-ask:<identity> <outpoint>`, its `cursor` the
+/// ask `{identity, outpoint, question, dueAtMs}` (the question: the row as the actor judged it, what the belt reads off
+/// a candidate), its `tickedAtMs` the due time. The belt singleton STAYS the only thing that asks a courier: it reads
+/// the asks at its cadence through its one gate, writes the find's facts to the record and hands the find back to the
+/// actor as a `belt-find` event (the actor's closure re-reads them and re-publishes its asks).
+pub const BELT_ASK_PREFIX: &str = "belt-ask:";
+/// The asks' range ends before `belt-ask;` (`;` follows `:`).
+pub const BELT_ASK_END: &str = "belt-ask;";
+/// The asks one tick reads past its cursor (a range of the ledger's key), at most.
+pub const OWED_BELT_ASKS_PAGE: usize = 256;
+/// The asks' rotating cursor.
+pub const OWED_BELT_ASKS_STATE_NAME: &str = "belt:asks";
+pub const ASKS_PAGE_SQL: &str = "SELECT name,cursor,tickedAtMs FROM owed_belt_state WHERE name>=?1 AND name<'belt-ask;' ORDER BY name LIMIT ?2";
+/// An ask's next look (the backoff, an unanswered look's re-arm): only its due time moves.
+pub const ASK_DUE_SQL: &str = "UPDATE owed_belt_state SET tickedAtMs=?2 WHERE name=?1";
+pub const ASKS_DUE_GAUGE_SQL: &str = "INSERT INTO ops_counters(name,value) SELECT 'owed_belt_due_total',COUNT(*) FROM owed_belt_state WHERE name>='belt-ask:' AND name<'belt-ask;' AND tickedAtMs<=?1 ON CONFLICT(name) DO UPDATE SET value=excluded.value";
+/// The ledger name of one ask.
+pub fn ask_name(identity: &str, outpoint: &str) -> String {
+    format!("{BELT_ASK_PREFIX}{identity} {outpoint}")
+}
+/// The question an actor publishes for one of its dated rows (`owed_actor::ASK_ROWS_SQL`'s row): the row as the belt
+/// reads a candidate, and the ask the belt will make of it ([`ask_of`]).
+pub fn ask_of_row(identity: &str, row: &Value) -> Option<(String, Value, i64)> {
+    let outpoint = row["outpoint"].as_str()?.to_owned();
+    let due = row["beltDueAtMs"].as_i64()?;
+    let facts: Value = row["facts"]
+        .as_str()
+        .and_then(|f| serde_json::from_str(f).ok())
+        .unwrap_or(Value::Null);
+    let c = candidate_of(&serde_json::json!({
+        "identity": identity, "outpoint": outpoint, "gameId": row["gameId"], "family": row["family"],
+        "facts": row["facts"], "reason": row["reason"], "claimable": row["claimable"],
+        "probeTip": row["probeTip"], "beltDueAtMs": due, "judgedAtMs": row["judgedAtMs"],
+    }));
+    let ask = match ask_of(&c)? {
+        Ask::Outpoint { .. } => "outpoint",
+        Ask::Spender { .. } => "spender",
+        Ask::Home => "home",
+    };
+    let body = serde_json::json!({
+        "identity": identity,
+        "outpoint": outpoint,
+        "question": {
+            "ask": ask, "gameId": row["gameId"], "family": row["family"], "facts": facts,
+            "reason": row["reason"], "claimable": row["claimable"], "probeTip": row["probeTip"],
+            "judgedAtMs": row["judgedAtMs"],
+        },
+        "dueAtMs": due,
+    });
+    Some((ask_name(identity, &outpoint), body, due))
+}
+
 pub const COUNTER_TICKS: &str = "owed_belt_ticks_total";
 pub const COUNTER_ASKED: &str = "owed_belt_asked_total";
 pub const COUNTER_FOUND: &str = "owed_belt_found_total";
@@ -452,6 +506,8 @@ pub struct TickReport {
     pub write_faults: Vec<(String, String)>,
     /// The tick had no chain tip: nothing was asked.
     pub no_tip: bool,
+    /// bsv-low #912 (Phase C): finds handed back to their actor as a `belt-find` event.
+    pub handed_back: usize,
 }
 
 /// The tick's places by class (the third delta lens's D3-M1, the ruling: no class owns the whole tick), given each
@@ -658,6 +714,214 @@ async fn due_candidates(db: &impl JudgeDb, now: i64, tip: u64) -> Result<Vec<Val
         .collect())
 }
 
+/// A candidate row ([`CANDIDATES_SQL`]'s shape; an ask's question read into it) as the tick reads it.
+pub fn candidate_of(r: &Value) -> Candidate {
+    let text = |k: &str| r[k].as_str().unwrap_or_default().to_owned();
+    Candidate {
+        identity: text("identity"),
+        outpoint: text("outpoint"),
+        game_id: text("gameId"),
+        family: text("family"),
+        facts: r["facts"]
+            .as_str()
+            .and_then(|f| serde_json::from_str(f).ok())
+            .unwrap_or(Value::Null),
+        claimable: r["claimable"]
+            .as_i64()
+            .map(|n| n != 0)
+            .or_else(|| r["claimable"].as_bool()),
+        reason: r["reason"].as_str().map(str::to_owned),
+        probe_tip: r["probeTip"].as_i64(),
+        due_at_ms: r["beltDueAtMs"].as_i64(),
+        judged_at_ms: r["judgedAtMs"].as_i64(),
+    }
+}
+
+/// PHASE C's candidates: one page of the asks past the cursor (at most [`OWED_BELT_ASKS_PAGE`] ledger rows, a range
+/// of its key), the due ones taken round-robin by identity (each identity's first ask before a second of any) up to
+/// [`OWED_BELT_OUTPOINTS_PER_TICK`]; the cursor at the first due ask not taken (the next tick starts there), past the
+/// page when every due ask of it was taken, back to the start when the page was short.
+async fn ask_candidates(db: &impl JudgeDb, now: i64) -> Result<Vec<Value>, String> {
+    let first = |out: Vec<crate::pot_hook::StmtOut>| {
+        out.into_iter().next().map(|o| o.rows).unwrap_or_default()
+    };
+    let cursor = first(
+        db.run_batch(vec![Stmt {
+            sql: "SELECT cursor FROM owed_belt_state WHERE name='belt:asks'".into(),
+            binds: vec![],
+        }])
+        .await?,
+    )
+    .first()
+    .and_then(|r| r["cursor"].as_str().map(str::to_owned))
+    .filter(|c| c.as_str() > BELT_ASK_PREFIX)
+    .unwrap_or_else(|| BELT_ASK_PREFIX.to_owned());
+    let page = first(
+        db.run_batch(vec![Stmt {
+            sql: ASKS_PAGE_SQL.into(),
+            binds: vec![
+                Bind::Text(cursor),
+                Bind::Int(OWED_BELT_ASKS_PAGE as i64),
+            ],
+        }])
+        .await?,
+    );
+    let due: Vec<(String, Value)> = page
+        .iter()
+        .filter(|r| r["tickedAtMs"].as_i64().is_some_and(|d| d <= now))
+        .filter_map(|r| {
+            let ask: Value = serde_json::from_str(r["cursor"].as_str()?).ok()?;
+            Some((r["name"].as_str()?.to_owned(), ask))
+        })
+        .collect();
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (n, (_, ask)) in due.iter().enumerate() {
+        let id = ask["identity"].as_str().unwrap_or_default().to_owned();
+        match groups.iter_mut().find(|(g, _)| *g == id) {
+            Some((_, at)) => at.push(n),
+            None => groups.push((id, vec![n])),
+        }
+    }
+    let mut taken: Vec<usize> = Vec::new();
+    'turns: for turn in 0..OWED_BELT_OUTPOINTS_PER_TICK {
+        for (_, at) in &groups {
+            if let Some(n) = at.get(turn) {
+                if taken.len() == OWED_BELT_OUTPOINTS_PER_TICK {
+                    break 'turns;
+                }
+                taken.push(*n);
+            }
+        }
+    }
+    let next = match (0..due.len()).find(|n| !taken.contains(n)) {
+        Some(n) => due[n].0.clone(),
+        None if page.len() < OWED_BELT_ASKS_PAGE => String::new(),
+        None => format!(
+            "{}\u{1}",
+            page.last()
+                .and_then(|r| r["name"].as_str())
+                .unwrap_or_default()
+        ),
+    };
+    db.run_batch(vec![Stmt {
+        sql: STATE_SQL.into(),
+        binds: vec![
+            Bind::Text(OWED_BELT_ASKS_STATE_NAME.into()),
+            Bind::Text(next),
+            Bind::Int(now),
+        ],
+    }])
+    .await?;
+    taken.sort_unstable();
+    Ok(taken
+        .into_iter()
+        .map(|n| {
+            let (_, ask) = &due[n];
+            let q = &ask["question"];
+            serde_json::json!({
+                "identity": ask["identity"], "outpoint": ask["outpoint"], "gameId": q["gameId"],
+                "family": q["family"], "facts": q["facts"].to_string(), "reason": q["reason"],
+                "claimable": q["claimable"], "probeTip": q["probeTip"], "beltDueAtMs": ask["dueAtMs"],
+                "judgedAtMs": q["judgedAtMs"],
+            })
+        })
+        .collect())
+}
+
+/// PHASE C's find: the find's durable facts written to the record ALONE (the D1 judge writes no `owed_rows` in this
+/// phase: one writer), then handed back to the actor as a `belt-find` event, which re-reads them in its closure,
+/// judges and re-publishes its asks; then the ask's own backoff over the actor's answer. A fault of either step leaves
+/// the ask re-armed (the facts that landed are the record's; the actor's next event reads them).
+async fn ask_find(
+    db: &impl JudgeDb,
+    c: &Candidate,
+    find: &Find,
+    now: i64,
+    report: &mut TickReport,
+) {
+    if let Err(e) = db.run_batch(find.statements(now)).await {
+        db.log(&format!("[owed-belt] {} find's write faulted: {e}", c.outpoint));
+        report.write_faults.push((c.outpoint.clone(), e));
+        return rearm_ask(db, c, now, report).await;
+    }
+    match db
+        .actor_apply(&c.identity, std::slice::from_ref(&c.game_id), "belt-find")
+        .await
+    {
+        Ok(Some(answer)) => {
+            report.found += 1;
+            report.handed_back += 1;
+            let row = answer["rows"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|r| r["outpoint"] == c.outpoint.as_str()))
+                .cloned();
+            if let Some(row) = row {
+                ask_backoff(db, c, &row, now, report).await;
+            }
+        }
+        Ok(None) => {
+            db.log(&format!(
+                "[owed-belt] {} found, no owed actor bound: re-armed",
+                c.outpoint
+            ));
+            rearm_ask(db, c, now, report).await;
+        }
+        Err(e) => {
+            db.log(&format!("[owed-belt] {} find's hand-back faulted: {e}", c.outpoint));
+            report.write_faults.push((c.outpoint.clone(), e));
+            rearm_ask(db, c, now, report).await;
+        }
+    }
+}
+
+/// The ask's backoff ([`backoff`]'s rule over the actor's row): a look that changed nothing doubles the period.
+async fn ask_backoff(db: &impl JudgeDb, c: &Candidate, row: &Value, now: i64, report: &mut TickReport) {
+    let Some(base_due) = row["beltDueAtMs"].as_i64() else {
+        return;
+    };
+    let facts: Value = row["facts"]
+        .as_str()
+        .and_then(|f| serde_json::from_str(f).ok())
+        .unwrap_or(Value::Null);
+    let before = look_shape(&c.family, &c.facts, c.reason.as_deref());
+    let after = look_shape(
+        row["family"].as_str().unwrap_or_default(),
+        &facts,
+        row["reason"].as_str(),
+    );
+    if before != after {
+        return;
+    }
+    let period = backoff_period(c.due_at_ms, c.judged_at_ms, (base_due - now).max(1));
+    match db
+        .run_batch(vec![Stmt {
+            sql: ASK_DUE_SQL.into(),
+            binds: vec![
+                Bind::Text(ask_name(&c.identity, &c.outpoint)),
+                Bind::Int(now + period),
+            ],
+        }])
+        .await
+    {
+        Ok(_) => report.backed_off += 1,
+        Err(e) => db.log(&format!("[owed-belt] backoff of {} faulted: {e}", c.outpoint)),
+    }
+}
+
+async fn rearm_ask(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickReport) {
+    let stmt = Stmt {
+        sql: ASK_DUE_SQL.into(),
+        binds: vec![
+            Bind::Text(ask_name(&c.identity, &c.outpoint)),
+            Bind::Int(now + unanswered_period(now, c.judged_at_ms)),
+        ],
+    };
+    match db.run_batch(vec![stmt]).await {
+        Ok(_) => report.rearmed += 1,
+        Err(e) => db.log(&format!("[owed-belt] re-arm of {} faulted: {e}", c.outpoint)),
+    }
+}
+
 pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickReport, String> {
     let now = db.now_ms() as i64;
     // Without a chain tip a find's memo carries no tip and its judgement withholds every tip-dependent claim (TIP-877),
@@ -671,7 +935,13 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
             ..Default::default()
         });
     }
-    let rows = due_candidates(db, now, db.tip().unwrap_or_default()).await?;
+    // bsv-low #912: Phase C (the D1 judge off) reads the actors' asks; Phases A and B the D1 judge's dated rows.
+    let asks = !db.d1_judges();
+    let rows = if asks {
+        ask_candidates(db, now).await?
+    } else {
+        due_candidates(db, now, db.tip().unwrap_or_default()).await?
+    };
     let gate = Gate::new(courier);
     let mut report = TickReport {
         candidates: rows.len(),
@@ -679,22 +949,7 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
     };
     let mut cursor = None;
     for r in rows {
-        let text = |k: &str| r[k].as_str().unwrap_or_default().to_owned();
-        let c = Candidate {
-            identity: text("identity"),
-            outpoint: text("outpoint"),
-            game_id: text("gameId"),
-            family: text("family"),
-            facts: r["facts"]
-                .as_str()
-                .and_then(|f| serde_json::from_str(f).ok())
-                .unwrap_or(Value::Null),
-            claimable: r["claimable"].as_i64().map(|n| n != 0),
-            reason: r["reason"].as_str().map(str::to_owned),
-            probe_tip: r["probeTip"].as_i64(),
-            due_at_ms: r["beltDueAtMs"].as_i64(),
-            judged_at_ms: r["judgedAtMs"].as_i64(),
-        };
+        let c = candidate_of(&r);
         if gate.spent() {
             report.left += 1;
             continue;
@@ -710,6 +965,18 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
             identity: c.identity.clone(),
             game_id: c.game_id.clone(),
         };
+        if asks {
+            match found {
+                Ok(Some(find)) => ask_find(db, &c, &find, now, &mut report).await,
+                Ok(None) => rearm_ask(db, &c, now, &mut report).await,
+                Err(e) => {
+                    db.log(&format!("[owed-belt] {} ask faulted: {e}", c.outpoint));
+                    report.write_faults.push((c.outpoint.clone(), e));
+                    rearm_ask(db, &c, now, &mut report).await;
+                }
+            }
+            continue;
+        }
         match found {
             Ok(Some(find)) => {
                 let writes = find.statements(now);
@@ -756,7 +1023,7 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
                 ],
             },
             Stmt {
-                sql: DUE_GAUGE_SQL.into(),
+                sql: if asks { ASKS_DUE_GAUGE_SQL } else { DUE_GAUGE_SQL }.into(),
                 binds: vec![Bind::Int(now)],
             },
         ])
@@ -769,6 +1036,12 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
         (COUNTER_ASKED.to_owned(), report.asked as u64),
         (COUNTER_FOUND.to_owned(), report.found as u64),
     ];
+    if report.handed_back > 0 {
+        deltas.push((
+            crate::owed_actor::COUNTERS[9].to_owned(),
+            report.handed_back as u64,
+        ));
+    }
     for (rung, n) in report.faults.iter().enumerate() {
         if *n > 0 {
             deltas.push((fault_counter(rung), *n));
@@ -1016,10 +1289,21 @@ pub async fn alarm_env(
             serde_json::json!({"error": error})
         }
     };
+    // bsv-low #912 (MEDIUM-10): the sampled digest reconcile on the same driver, one identity a 22.5 minutes.
+    let reconcile = match meter.phase("owed.reconcile", reconcile_env(env)).await {
+        Ok(Some(r)) => serde_json::json!({
+            "identity": r.identity, "diff": r.diff, "reapplied": r.reapplied, "noActor": r.no_actor,
+        }),
+        Ok(None) => Value::Null,
+        Err(error) => {
+            worker::console_warn!("[owed-actor] reconcile faulted: {error}");
+            serde_json::json!({"error": error})
+        }
+    };
     let walls = meter.task_done().expect("one alarm task");
     worker::console_log!("{}", walls.line().replace("[scheduled-pass]", "[owed-alarm]"));
     worker::Response::from_json(&serde_json::json!({
-        "drain": drain, "tick": tick, "wallMs": walls.wall_ms(),
+        "drain": drain, "tick": tick, "reconcile": reconcile, "wallMs": walls.wall_ms(),
         "phases": serde_json::from_str::<Value>(&walls.phases_json()).unwrap_or_default(),
     }))
 }
@@ -1033,6 +1317,18 @@ pub async fn tick_env(env: &worker::Env) -> Result<TickReport, String> {
     let judge = owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))
         .map_err(|e| e.to_string())?;
     tick(&judge, &WorkerCourier).await
+}
+
+/// The alarm's reconcile step (bsv-low #912): the D1 judge's port (its flag, its actor calls).
+pub async fn reconcile_env(
+    env: &worker::Env,
+) -> Result<Option<crate::owed_actor::ReconcileReport>, String> {
+    if env.durable_object(crate::owed_actor::BINDING).is_err() {
+        return Ok(None);
+    }
+    let judge = owed_judge::D1Judge::new(env, None, crate::routes::written_off_before_ms_env(env))
+        .map_err(|e| e.to_string())?;
+    crate::owed_actor::reconcile_step(&judge, worker::Date::now().as_millis() as i64).await
 }
 
 /// `POST /internal/owed-belt-tick` (bearer `INTERNAL_TOKEN`): one tick, answered with its report.
@@ -1051,6 +1347,7 @@ pub async fn lever(req: worker::Request, env: &worker::Env) -> worker::Result<wo
             "faults": {"woc": r.faults[0], "bitails": r.faults[1], "bananablocks": r.faults[2], "other": r.faults[3]},
             "writeFaults": r.write_faults.len(),
             "noTip": r.no_tip,
+            "handedBack": r.handed_back,
         })),
         Err(e) => worker::Response::error(format!("owed belt tick faulted: {e}"), 503),
     }
