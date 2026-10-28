@@ -279,9 +279,9 @@ impl DurableObject for OwedActor {
                 let Some(me) = body["identity"].as_str().and_then(actor_name) else {
                     return Response::error("identity is not a 66-hex key", 400);
                 };
-                let (armed, already) = self.arm_bootstrap(&me).await;
+                let (armed, already, rearmed) = self.arm_bootstrap(&me).await;
                 Response::from_json(
-                    &json!({"identity": me, "armed": armed, "bootstrapped": already}),
+                    &json!({"identity": me, "armed": armed, "bootstrapped": already, "rearmed": rearmed}),
                 )
             }
             (Method::Post, "/apply") => {
@@ -332,11 +332,7 @@ impl DurableObject for OwedActor {
         if self.meta(META_BOOT_CURSOR).is_some() {
             if let Err(e) = self.bootstrap_page(&local).await {
                 console_log!("[owed-actor] bootstrap page: {e}");
-                let _ = self
-                    .state
-                    .storage()
-                    .set_alarm(Date::now().as_millis() as i64 + 60_000)
-                    .await;
+                self.alarm_in(60_000).await;
             }
         }
         if self.meta(META_KV_DIRTY).as_deref() == Some("1") {
@@ -370,7 +366,7 @@ impl DurableObject for OwedActor {
                     async move {
                         self.apply_route(body)
                             .await
-                            .is_ok_and(|r| r.status_code() == 200)
+                            .is_ok_and(|r| matches!(r.status_code(), 200 | 202))
                     }
                 })
                 .await;
@@ -485,11 +481,7 @@ impl OwedActor {
             }
         }
         if self.rebuilt.replace(false) && self.meta(META_BOOT_CURSOR).is_some() {
-            let _ = self
-                .state
-                .storage()
-                .set_alarm(Date::now().as_millis() as i64)
-                .await;
+            self.alarm_in(0).await;
         }
     }
 
@@ -538,22 +530,33 @@ impl OwedActor {
 
     /// MEDIUM-1: arm the bootstrap of `me` (its first page on the alarm, now) unless it is done or armed. Answers
     /// (armed now, already bootstrapped).
-    async fn arm_bootstrap(&self, me: &str) -> (bool, bool) {
+    ///
+    /// D2-ACTOR-B-FOLD-7 (the captain's item 12): an actor ARMED UNDER A DEAD ALARM (its cursor set, its alarm lost or
+    /// set decades out by an older build that handed `set_alarm` an epoch stamp) is re-armed now by the lever's
+    /// `/bootstrap` and by a held event ([`alarm_is_dead`]), answered armed with `rearmed`, counted
+    /// `owed_actor_alarm_rearmed_total`; a live alarm within the bound is kept (the page cadence is the alarm's own).
+    /// Answers (armed now, already bootstrapped, re-armed).
+    async fn arm_bootstrap(&self, me: &str) -> (bool, bool, bool) {
         let local = self.local();
         if self.meta(META_BOOTSTRAPPED).is_some() {
-            return (false, true);
+            return (false, true, false);
         }
         if self.meta(META_BOOT_CURSOR).is_some() {
-            return (false, false);
+            let held = self.state.storage().get_alarm().await.ok().flatten();
+            if !alarm_is_dead(held, Date::now().as_millis()) {
+                return (false, false, false);
+            }
+            console_log!("[owed-actor] {me}: armed under a dead alarm ({held:?}): re-armed now");
+            self.alarm_in(0).await;
+            if let Ok(record) = crate::routes::D1Sql::of(&self.env) {
+                record.counters(vec![(COUNTERS[23].into(), 1)]).await;
+            }
+            return (true, false, true);
         }
         self.put_meta(&local, META_IDENTITY, me);
         self.put_meta(&local, META_BOOT_CURSOR, BOOT_CURSOR_START);
-        let _ = self
-            .state
-            .storage()
-            .set_alarm(Date::now().as_millis() as i64)
-            .await;
-        (true, false)
+        self.alarm_in(0).await;
+        (true, false, false)
     }
 
     /// MEDIUM-4: the tip alarm at the next gate above `tip`, or the next block while a courier-dated sweep is held
@@ -579,16 +582,11 @@ impl OwedActor {
         ) {
             Some(at) => {
                 self.put_meta(local, META_GATE, &at.to_string());
-                if self
-                    .state
-                    .storage()
-                    .get_alarm()
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_none()
-                {
-                    let _ = self.state.storage().set_alarm(at as i64).await;
+                // FOLD-7 (item 11): the earlier alarm wins, so an alarm an older build set decades out (an absolute
+                // stamp read as an offset) is pulled back to the gate.
+                let held = self.state.storage().get_alarm().await.ok().flatten();
+                if held.is_none_or(|h| h > at as i64) {
+                    self.alarm_at(at).await;
                 }
             }
             None => {
@@ -667,22 +665,47 @@ impl OwedActor {
             let _ = local.run_batch(facts).await;
         }
         let record = crate::routes::D1Sql::of(&self.env)?;
-        let kind_seq = body.kind.as_deref().zip(body.seq);
-        let applied = apply_and_publish_in_turn(
+        let ev = HeldEvent {
+            kind: body.kind.clone(),
+            seq: body.seq,
+            games: body.games.clone(),
+            at_ms: body.at_ms,
+            mined: body.mined,
+            tip: body.tip,
+            held_at_ms: started,
+        };
+        // D2-ACTOR-B-FOLD-7: an actor without `bootstrapped` holds the event and arms its bootstrap (never a closure
+        // over a mirror the bootstrap has not filled); a bootstrapped one whose closure meets its bound re-arms.
+        let applied = apply_or_hold(
             &self.turn,
             &record,
             &local,
             &EnvOutside(&self.env),
             &me,
-            &body.games,
-            kind_seq,
-            body.tip,
+            &ev,
             crate::routes::written_off_before_ms_env(&self.env),
             self.publishes_asks(),
         )
         .await;
         let (report, pushes) = match applied {
-            Ok(r) => r,
+            Ok(Applied::Done(report, pushes)) => (report, pushes),
+            Ok(Applied::Held { rearmed }) => {
+                self.put_meta(&local, META_IDENTITY, &me);
+                let (armed, _, _) = self.arm_bootstrap(&me).await;
+                let mut deltas = vec![(COUNTERS[21].to_string(), 1)];
+                if rearmed {
+                    deltas.push((COUNTERS[22].to_string(), 1));
+                }
+                record.counters(deltas).await;
+                let answer = held_answer(
+                    &me,
+                    &body.games,
+                    body.at_ms,
+                    armed || self.meta(META_BOOT_CURSOR).is_some(),
+                    rearmed,
+                );
+                return Ok(Response::from_json(&answer)?.with_status(202));
+            }
             Err(e) => return Response::error(format!("owed actor apply: {e}"), 503),
         };
         let now = Date::now().as_millis();
@@ -699,40 +722,20 @@ impl OwedActor {
         self.put_meta(&local, META_IDENTITY, &me);
         self.put_meta(&local, META_JUDGED_AT, &now.to_string());
         // NEW2-L5: an apply that landed clears its games' carried tip faults (a parked game re-enters the window).
-        let mut held = self.tip_faults();
-        let before = held.len();
-        held.retain(|g, _| !body.games.iter().any(|x| x.eq_ignore_ascii_case(g)));
-        if held.len() != before {
-            self.put_meta(&local, META_TIP_FAULTS, &json!(held).to_string());
-        }
+        self.clear_tip_faults(&local, &body.games);
         // THE PUSH (section 4): `owed-changed` through the relay's pots room, carrying the judgement and the event's
         // write time (the harness's bar).
-        for (identity, mut push) in pushes {
-            push["judgedAtMs"] = json!(now);
-            push["atMs"] = json!(body.at_ms);
-            crate::push_coalesce::queue_seat_push(&identity, push);
-        }
-        if crate::push_coalesce::has_queued() {
-            self.state
-                .wait_until(crate::push_coalesce::flush_queued(self.env.clone()));
-        }
+        self.publish_pushes(pushes, now, body.at_ms);
         // MEDIUM-9: the KV copy at most once a second; the rest coalesced on the alarm.
         let last = *self.last_kv_ms.borrow();
         if kv_copy_due(last, now) {
             self.write_kv_copy(&local).await;
         } else {
             self.put_meta(&local, META_KV_DIRTY, "1");
-            let _ = self
-                .state
-                .storage()
-                .set_alarm(now as i64 + KV_COPY_MIN_INTERVAL_MS as i64)
-                .await;
+            self.alarm_in(KV_COPY_MIN_INTERVAL_MS).await;
         }
         // MEDIUM-4: the actor's own tip alarm, at the next gate or (a courier-dated sweep held) the next block.
         self.arm_tip_alarm(&local, body.tip).await;
-        // MEDIUM-1: an actor's first event bootstraps it (every other game of its identity, paged on its alarm), so
-        // Phase A proves the bootstrap before any read is served from it.
-        let _ = self.arm_bootstrap(&me).await;
         let mut answer = answer_of(&report, self.rows_of(&local, &me));
         answer["identity"] = json!(me);
         answer["judgedAtMs"] = json!(now);
@@ -741,6 +744,54 @@ impl OwedActor {
         answer["applyMs"] = json!(now.saturating_sub(started));
         answer["ackSeq"] = json!(self.meta(META_ACK));
         Response::from_json(&answer)
+    }
+
+    /// NEW2-L5: an apply that landed clears its games' carried tip faults.
+    fn clear_tip_faults(&self, local: &DoSql, games: &[String]) {
+        let mut held = self.tip_faults();
+        let before = held.len();
+        held.retain(|g, _| !games.iter().any(|x| x.eq_ignore_ascii_case(g)));
+        if held.len() != before {
+            self.put_meta(local, META_TIP_FAULTS, &json!(held).to_string());
+        }
+    }
+
+    /// THE PUSH (section 4): each judgement's `owed-changed`, its time and its event's write time.
+    fn publish_pushes(&self, pushes: Vec<(String, Value)>, now: u64, at_ms: Option<u64>) {
+        for (identity, mut push) in pushes {
+            push["judgedAtMs"] = json!(now);
+            push["atMs"] = json!(at_ms);
+            crate::push_coalesce::queue_seat_push(&identity, push);
+        }
+        if crate::push_coalesce::has_queued() {
+            self.state
+                .wait_until(crate::push_coalesce::flush_queued(self.env.clone()));
+        }
+    }
+
+    /// THE ALARM (D2-ACTOR-B-FOLD-7, the captain's item 11): workers-rs 0.8.7 reads an `i64` as an OFFSET from now
+    /// (`ScheduledTime: From<i64>`), so every site passes one through these two helpers. Until the fold each site
+    /// passed an epoch stamp, and the alarm landed about 56 years out: no OwedActor alarm ever fired on beta.
+    async fn alarm_in(&self, offset_ms: u64) {
+        if let Err(e) = self
+            .state
+            .storage()
+            .set_alarm(alarm_offset_ms(offset_ms, 0))
+            .await
+        {
+            console_log!("[owed-actor] alarm not set: {e}");
+        }
+    }
+    /// The alarm at the epoch stamp `at_ms` (its offset from now, 0 when it has passed).
+    async fn alarm_at(&self, at_ms: u64) {
+        if let Err(e) = self
+            .state
+            .storage()
+            .set_alarm(alarm_offset_ms(at_ms, Date::now().as_millis()))
+            .await
+        {
+            console_log!("[owed-actor] alarm not set: {e}");
+        }
     }
 
     fn rows_of(&self, local: &DoSql, me: &str) -> Vec<Value> {
@@ -787,16 +838,17 @@ impl OwedActor {
     }
 
     /// MEDIUM-6: one bootstrap page (16 games, newest first) per alarm, resumable on its keyset cursor (LOW-6),
-    /// until the page is short: then the actor is bootstrapped and its reads serve its rows, counted durably
-    /// (`owed_actor_bootstraps_total`, served `/health.owedActor.bootstraps`, the D2-ACTOR-B lens's MEDIUM-1). The
-    /// delta lens's NEW-M2: each page takes a token of the fleet's budget first ([`boot_pace`]), and the pages of one
-    /// actor are [`BOOTSTRAP_PAGE_DELAY_MS`] apart.
+    /// until the page is short: then the HELD events are applied in seq order over the warm mirror and the actor is
+    /// stamped bootstrapped ([`bootstrap_step`], [`drain_held`]; D2-ACTOR-B-FOLD-7), counted durably
+    /// (`owed_actor_bootstraps_total`, served `/health.owedActor.bootstraps`, the D2-ACTOR-B lens's MEDIUM-1), and the
+    /// cold time (the first held event's write to the last applied) noted once into the fleet's `cold` bar (the
+    /// captain's item 7; never the warm `rowsVisibleMsP95`). The delta lens's NEW-M2: each page takes a token of the
+    /// fleet's budget first ([`boot_pace`]), and the pages of one actor are [`BOOTSTRAP_PAGE_DELAY_MS`] apart.
     async fn bootstrap_page(&self, local: &DoSql) -> Result<()> {
         let (Some(me), Some(cursor)) = (self.meta(META_IDENTITY), self.meta(META_BOOT_CURSOR))
         else {
             return Ok(());
         };
-        let (at, after) = boot_keyset(Some(&cursor));
         let record = crate::routes::D1Sql::of(&self.env)?;
         // NEW-M2: one token of the fleet's bootstrap budget, or a wait for a slot in a later minute.
         let now = Date::now().as_millis();
@@ -815,60 +867,52 @@ impl OwedActor {
                 .unwrap_or_default(),
         );
         if let Some(wait) = boot_pace(taken, now, &me) {
-            self.state.storage().set_alarm(wait as i64).await?;
+            self.alarm_at(wait).await;
             return Ok(());
         }
-        let page = record
-            .run_batch(vec![Stmt::new(
-                crate::owed_judge::IDENTITY_GAMES_AFTER_SQL,
-                vec![Bind::Text(me.clone()), Bind::Int(at), Bind::Text(after)],
-            )])
-            .await
-            .map_err(Error::RustError)?;
-        let rows: Vec<Value> = page.into_iter().next().map(|o| o.rows).unwrap_or_default();
-        let games: Vec<String> = rows
-            .iter()
-            .filter_map(|r| r["gameId"].as_str().map(str::to_string))
-            .collect();
-        if !games.is_empty() {
-            let tip = crate::owed_events::tip_memoised(&self.env, false).await;
-            apply_and_publish_in_turn(
-                &self.turn,
-                &record,
-                local,
-                &EnvOutside(&self.env),
-                &me,
-                &games,
-                None,
-                tip,
-                crate::routes::written_off_before_ms_env(&self.env),
-                self.publishes_asks(),
-            )
-            .await
-            .map_err(Error::RustError)?;
-        }
-        if games.len() < 16 {
-            let now = Date::now().as_millis();
-            self.put_meta(local, META_BOOTSTRAPPED, &now.to_string());
-            self.put_meta(local, META_JUDGED_AT, &now.to_string());
-            let _ = local
-                .sql
-                .exec("DELETE FROM meta WHERE name='bootCursor'", None);
-            self.bars.borrow_mut().bootstraps += 1;
-            record.counters(vec![(COUNTERS[10].into(), 1)]).await;
-            self.put_meta(local, META_KV_DIRTY, "1");
-            self.write_kv_copy(local).await;
-        } else {
-            let last = rows.last().cloned().unwrap_or(Value::Null);
-            self.put_meta(
-                local,
-                META_BOOT_CURSOR,
-                &json!([last["at"].as_i64().unwrap_or(0), last["gameId"]]).to_string(),
-            );
-            self.state
-                .storage()
-                .set_alarm((Date::now().as_millis() + BOOTSTRAP_PAGE_DELAY_MS) as i64)
-                .await?;
+        let tip = crate::owed_events::tip_memoised(&self.env, false).await;
+        let step = bootstrap_step(
+            &self.turn,
+            &record,
+            local,
+            &EnvOutside(&self.env),
+            &me,
+            Some(&cursor),
+            tip,
+            crate::routes::written_off_before_ms_env(&self.env),
+            self.publishes_asks(),
+        )
+        .await
+        .map_err(Error::RustError)?;
+        match step {
+            BootStep::Page { cursor, .. } => {
+                self.put_meta(local, META_BOOT_CURSOR, &cursor);
+                self.alarm_in(BOOTSTRAP_PAGE_DELAY_MS).await;
+            }
+            BootStep::Done { drain, .. } => {
+                let now = Date::now().as_millis();
+                self.put_meta(local, META_JUDGED_AT, &now.to_string());
+                let _ = local
+                    .sql
+                    .exec("DELETE FROM meta WHERE name='bootCursor'", None);
+                for d in drain.applied {
+                    self.clear_tip_faults(local, &d.event.games);
+                    self.publish_pushes(d.pushes, now, d.event.at_ms);
+                }
+                self.bars.borrow_mut().bootstraps += 1;
+                record.counters(vec![(COUNTERS[10].into(), 1)]).await;
+                if let Some(ms) = drain.cold_ms {
+                    console_log!(
+                        "[owed-actor] COLD {me}: the held events applied {ms} ms after the first"
+                    );
+                    self.bars.borrow_mut().cold.note(ms);
+                    note_cold(ms);
+                    flush_bars(&record, now, true).await;
+                }
+                self.put_meta(local, META_KV_DIRTY, "1");
+                self.write_kv_copy(local).await;
+                self.arm_tip_alarm(local, tip).await;
+            }
         }
         Ok(())
     }
@@ -934,7 +978,8 @@ pub async fn call_apply(
             .fetch_with_request(req)
             .await
             .map_err(|e| e.to_string())?;
-        if resp.status_code() != 200 {
+        // D2-ACTOR-B-FOLD-7: 202 is a HELD event (`held: true`), never a fault.
+        if !matches!(resp.status_code(), 200 | 202) {
             return Err(format!(
                 "owed actor answered {}: {}",
                 resp.status_code(),
@@ -1064,6 +1109,8 @@ pub fn schedule_direct(
                 body["seq"] = Value::Null;
                 calls += 1;
                 match call_apply(&env, &body, DIRECT_CALL_WALL_MS).await {
+                    // D2-ACTOR-B-FOLD-7: a held answer is neither a fault nor a sample (the actor counts it).
+                    Ok(answer) if is_held(&answer) => {}
                     Ok(answer) => note_answer_as("direct", &answer),
                     Err(e) => {
                         faults += 1;
