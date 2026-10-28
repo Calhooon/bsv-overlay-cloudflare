@@ -140,8 +140,21 @@ pub(crate) async fn hydrate_filings(
         )
         .await?;
         for mut pending in pending_parties {
-            if representatives.iter().any(|r| r["txid"] == pending["txid"] && r["outputIndex"] == pending["outputIndex"]) { continue; }
-            let pot: Vec<Value> = read(db,"SELECT createdAt FROM pot_records WHERE txid=?1 AND outputIndex=?2",vec![Bind::Text(text(&pending,"potTxid")),Bind::Int(num(&pending,"potVout") as i64)]).await?;
+            if representatives
+                .iter()
+                .any(|r| r["txid"] == pending["txid"] && r["outputIndex"] == pending["outputIndex"])
+            {
+                continue;
+            }
+            let pot: Vec<Value> = read(
+                db,
+                "SELECT createdAt FROM pot_records WHERE txid=?1 AND outputIndex=?2",
+                vec![
+                    Bind::Text(text(&pending, "potTxid")),
+                    Bind::Int(num(&pending, "potVout") as i64),
+                ],
+            )
+            .await?;
             pending["unknownPot"] = json!(i64::from(pot.is_empty()));
             pending["potCreatedAt"] = pot.first().map_or(Value::Null, |p| p["createdAt"].clone());
             representatives.push(pending);
@@ -149,8 +162,10 @@ pub(crate) async fn hydrate_filings(
         parties = crate::owed_judge::rank::select(representatives, db.era_ms(), usize::MAX);
         for p in &parties {
             if text(p, "identity") == identity && flag(p, "sigValid") == Some(true) {
-                i.verified_pots
-                    .insert(owed::outpoint_key(&text(p, "potTxid"), num(p, "potVout") as u32));
+                i.verified_pots.insert(owed::outpoint_key(
+                    &text(p, "potTxid"),
+                    num(p, "potVout") as u32,
+                ));
             }
         }
         // Keep a representative outside the requested games as bounded pot
@@ -201,18 +216,29 @@ pub(crate) async fn hydrate_filings(
         )
         .await?
         {
-            if !hop_candidates.iter().any(|h| h["txid"] == c["txid"] && h["outputIndex"] == c["outputIndex"]) {
+            if !hop_candidates
+                .iter()
+                .any(|h| h["txid"] == c["txid"] && h["outputIndex"] == c["outputIndex"])
+            {
                 hop_candidates.push(c);
             }
         }
     }
-    for hop in pending_hops.iter().filter(|h| text(h,"identity") == identity && games.contains(&text(h,"gameId"))) {
-        if !hop_candidates.iter().any(|r| r["txid"] == hop["txid"] && r["outputIndex"] == hop["outputIndex"]) {
+    for hop in pending_hops
+        .iter()
+        .filter(|h| text(h, "identity") == identity && games.contains(&text(h, "gameId")))
+    {
+        if !hop_candidates
+            .iter()
+            .any(|r| r["txid"] == hop["txid"] && r["outputIndex"] == hop["outputIndex"])
+        {
             let mut hop = hop.clone();
             let rows: Vec<Value> = read(db,"SELECT createdAt AS potCreatedAt,spent,spendingTxid,spentConfirmed,spenderFinal FROM pot_records WHERE txid=?1 AND outputIndex=?2",vec![Bind::Text(text(&hop,"hopTxid")),Bind::Int(num(&hop,"hopVout") as i64)]).await?;
             hop["unknownHop"] = json!(i64::from(rows.is_empty()));
             if let Some(row) = rows.first().and_then(Value::as_object) {
-                hop.as_object_mut().ok_or("pending hop is not an object")?.extend(row.clone());
+                hop.as_object_mut()
+                    .ok_or("pending hop is not an object")?
+                    .extend(row.clone());
             }
             hop_candidates.push(hop);
         }
@@ -261,12 +287,25 @@ pub(crate) async fn hydrate_filings(
     let released: Vec<Value> = read(db,"SELECT DISTINCT hopTxid,hopVout FROM released_hop_evidence INDEXED BY idx_released_hop_evidence_identity_game WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))",bound.clone()).await?;
     let mut released_rows = Vec::new();
     for key in released {
-        for mut r in read::<Value>(db,RELEASED_SQL,vec![Bind::Text(text(&key,"hopTxid")),Bind::Int(num(&key,"hopVout") as i64)]).await? {
-            if text(&r,"identity") != identity || !games.contains(&text(&r,"gameId")) { continue; }
+        for mut r in read::<Value>(
+            db,
+            RELEASED_SQL,
+            vec![
+                Bind::Text(text(&key, "hopTxid")),
+                Bind::Int(num(&key, "hopVout") as i64),
+            ],
+        )
+        .await?
+        {
+            if text(&r, "identity") != identity || !games.contains(&text(&r, "gameId")) {
+                continue;
+            }
             // the opponent the twin party names, as the old walk's ring served it (the walk-against-judge pin)
             let context: Vec<Value> = read(db,"SELECT h.spent,h.spendingTxid,h.spentConfirmed,h.spenderFinal,p.pubA,p.pubB,p.payPkhA,p.payPkhB,(SELECT lower(pp.opponentIdentity) FROM potparty_records_evicted pp INDEXED BY idx_evicted_party_identity_game WHERE pp.identity=?5 AND pp.gameId=?6 AND pp.potTxid=?3 AND pp.sigValid=1 ORDER BY pp.createdAt,pp.rowid LIMIT 1) AS opponentIdentity FROM (SELECT 1) LEFT JOIN pot_records h ON h.txid=?1 AND h.outputIndex=?2 LEFT JOIN pot_records_evicted p ON p.txid=?3 AND p.lockKind='covenant' AND p.paramsDecoded=1 AND (p.pubA=?4 OR p.pubB=?4)",vec![Bind::Text(text(&r,"hopTxid")),Bind::Int(num(&r,"hopVout") as i64),Bind::Text(text(&r,"potTxid")),Bind::Text(text(&r,"seatSettlePubkey")),Bind::Text(text(&r,"identity")),Bind::Text(text(&r,"gameId"))]).await?;
             if let Some(context) = context.first().and_then(Value::as_object) {
-                r.as_object_mut().ok_or("released hop is not an object")?.extend(context.clone());
+                r.as_object_mut()
+                    .ok_or("released hop is not an object")?
+                    .extend(context.clone());
             }
             released_rows.push(r);
         }
@@ -421,12 +460,21 @@ async fn assemble_results(
     for filing in filings {
         if let crate::record_post::VerifiedRecord::Potparty(r, valid) = filing {
             if let (Some(key), Some(sig)) = (&r.seat_settle_pubkey, &r.seat_sig_hex) {
-                seats.entry((r.pot_txid.clone(), r.pot_vout)).or_default().push(results::SeatMarkerRow {
-                    identity:r.identity.clone(), opponent_identity:r.opponent_identity.clone(),
-                    game_id:r.game_id.clone(), pot_txid:r.pot_txid.clone(), pot_vout:r.pot_vout,
-                    recovery_height:r.recovery_height, seat_settle_pubkey:key.clone(),
-                    seat_sig_hex:sig.clone(), identity_sig_hex:r.sig_hex.clone(), sig_valid:Some(*valid),
-                });
+                seats
+                    .entry((r.pot_txid.clone(), r.pot_vout))
+                    .or_default()
+                    .push(results::SeatMarkerRow {
+                        identity: r.identity.clone(),
+                        opponent_identity: r.opponent_identity.clone(),
+                        game_id: r.game_id.clone(),
+                        pot_txid: r.pot_txid.clone(),
+                        pot_vout: r.pot_vout,
+                        recovery_height: r.recovery_height,
+                        seat_settle_pubkey: key.clone(),
+                        seat_sig_hex: sig.clone(),
+                        identity_sig_hex: r.sig_hex.clone(),
+                        sig_valid: Some(*valid),
+                    });
             }
         }
     }
@@ -472,17 +520,24 @@ async fn assemble_results(
     )
     .await?;
     let mut claim_rows: Vec<_> = claim_rows
-            .into_iter()
-            .filter_map(routes::ResultRowD1::into_marker)
-            .collect();
+        .into_iter()
+        .filter_map(routes::ResultRowD1::into_marker)
+        .collect();
     for filing in filings {
         if let crate::record_post::VerifiedRecord::Result(r, tier) = filing {
             if games.contains(&r.game_id) && !claim_rows.iter().any(|row| row.txid == r.txid) {
                 claim_rows.push(crate::logic::ResultMarkerRow {
-                    game_id:r.game_id.clone(),winner:r.winner.clone(),loser:r.loser.clone(),
-                    pot_txid:r.pot_txid.clone(),settle_txid:r.settle_txid.clone(),winner_sig_hex:r.winner_sig_hex.clone(),
-                    loser_sig_hex:r.loser_sig_hex.clone(),cards_hex:r.cards_hex.clone(),txid:r.txid.clone(),
-                    created_at:Some(stamp),claim_valid:Some(*tier),
+                    game_id: r.game_id.clone(),
+                    winner: r.winner.clone(),
+                    loser: r.loser.clone(),
+                    pot_txid: r.pot_txid.clone(),
+                    settle_txid: r.settle_txid.clone(),
+                    winner_sig_hex: r.winner_sig_hex.clone(),
+                    loser_sig_hex: r.loser_sig_hex.clone(),
+                    cards_hex: r.cards_hex.clone(),
+                    txid: r.txid.clone(),
+                    created_at: Some(stamp),
+                    claim_valid: Some(*tier),
                 });
             }
         }
@@ -678,7 +733,13 @@ async fn hydrate_evidence(
                         refused.insert(owed::outpoint_key(t, v), m.spending_txid.clone());
                     }
                     // the walk's grace word: a fresh memo's confirmation taken inside the reorg grace
-                    if fresh && hops_view::confirmed_in_reorg_grace(m.spent_confirmed, m.probed_at_ms, clear) {
+                    if fresh
+                        && hops_view::confirmed_in_reorg_grace(
+                            m.spent_confirmed,
+                            m.probed_at_ms,
+                            clear,
+                        )
+                    {
                         i.grace_words.insert(owed::outpoint_key(t, v));
                     }
                     i.hop_chain.insert(owed::outpoint_key(t, v), word);
@@ -735,13 +796,10 @@ async fn hydrate_evidence(
         .await?;
         for join in joins {
             let pot = text(&join, "potTxid");
-            let bytes: Vec<Value> =
-                read(db, owed::JOIN_POT_BEEF_SQL, vec![Bind::Text(pot.clone())]).await?;
-            if bytes
-                .first()
-                .and_then(|r| r["beef"].as_str())
-                .and_then(|h| hex::decode(h).ok())
-                .is_some_and(|b| owed::join_spends_outpoint(&b, &pot, hop, *vout))
+            if db
+                .tx_facts(&pot, FactsFrom::PotBeefs)
+                .await?
+                .is_some_and(|f| f.spends(hop, *vout))
             {
                 i.join_spent_hops
                     .insert(owed::outpoint_key(hop, *vout), pot);
@@ -751,18 +809,31 @@ async fn hydrate_evidence(
     }
     for filing in filings {
         if let crate::record_post::VerifiedRecord::Hopsweep(_, r) = filing {
-            if r.identity != i.identity || !hop_pairs.contains(&(r.hop_txid.clone(),r.hop_vout)) { continue; }
-            let key = owed::outpoint_key(&r.hop_txid,r.hop_vout);
+            if r.identity != i.identity || !hop_pairs.contains(&(r.hop_txid.clone(), r.hop_vout)) {
+                continue;
+            }
+            let key = owed::outpoint_key(&r.hop_txid, r.hop_vout);
             let sweeps = all_sweeps.entry(key).or_default();
-            if sweeps.iter().any(|s| s.sweep_txid == r.sweep_txid) { continue; }
-            let proof: Vec<Value> = read(db,"SELECT has_proof,proofHeight FROM transactions WHERE txid=?1",vec![Bind::Text(r.sweep_txid.clone())]).await?;
+            if sweeps.iter().any(|s| s.sweep_txid == r.sweep_txid) {
+                continue;
+            }
+            let proof: Vec<Value> = read(
+                db,
+                "SELECT has_proof,proofHeight FROM transactions WHERE txid=?1",
+                vec![Bind::Text(r.sweep_txid.clone())],
+            )
+            .await?;
             let proof = proof.first();
-            sweeps.insert(0,crate::hopsweep::FiledHopSweep {
-                sweep_txid:r.sweep_txid.clone(),raw_hex:r.sweep_raw_hex.clone(),
-                pays_sats:crate::hopsweep::sweep_output_sats(&r.sweep_raw_hex),
-                index_proven:proof.is_some_and(|p|flag(p,"has_proof")==Some(true)),
-                index_proof_height:proof.and_then(|p|p["proofHeight"].as_u64()),
-            });
+            sweeps.insert(
+                0,
+                crate::hopsweep::FiledHopSweep {
+                    sweep_txid: r.sweep_txid.clone(),
+                    raw_hex: r.sweep_raw_hex.clone(),
+                    pays_sats: crate::hopsweep::sweep_output_sats(&r.sweep_raw_hex),
+                    index_proven: proof.is_some_and(|p| flag(p, "has_proof") == Some(true)),
+                    index_proof_height: proof.and_then(|p| p["proofHeight"].as_u64()),
+                },
+            );
         }
     }
     for (key, mut sweeps) in all_sweeps {
@@ -806,20 +877,8 @@ async fn hydrate_evidence(
         }
     }
     for sp in &named {
-        let bytes:Vec<Value>=read(db,"SELECT hex(beef) AS beef FROM pot_beefs WHERE txid=?1 UNION ALL SELECT hex(beef) AS beef FROM transactions WHERE txid=?1",vec![Bind::Text(sp.clone())]).await?;
-        let tx = bytes
-            .iter()
-            .filter_map(|r| hex::decode(text(r, "beef")).ok())
-            .filter_map(|b| {
-                overlay_engine::beef_limits::parse_beef(
-                    &b,
-                    &overlay_engine::beef_limits::APP_BEEF_LIMITS,
-                )
-                .ok()
-            })
-            .find_map(|b| b.find_txid(sp).and_then(|t| t.tx().cloned()));
-        if let Some(tx) = tx {
-            let mut outputs = routes::spender_outputs_of(&tx);
+        if let Some(facts) = db.tx_facts(sp, FactsFrom::Stored).await? {
+            let mut outputs = facts.outputs;
             for r in read::<Value>(
                 db,
                 "SELECT outputIndex,spent FROM pot_records WHERE txid=?1",
@@ -834,8 +893,7 @@ async fn hydrate_evidence(
                     o.spent = flag(&r, "spent");
                 }
             }
-            i.spender_inputs
-                .insert(sp.clone(), routes::spender_inputs_of(&tx));
+            i.spender_inputs.insert(sp.clone(), facts.inputs);
             i.spender_outputs.insert(sp.clone(), outputs);
             i.courier_spenders.remove(sp);
         } else if !i.spender_outputs.contains_key(sp) {
@@ -906,25 +964,12 @@ async fn hydrate_evidence(
 pub(super) async fn finish_rows(db: &impl JudgeDb, rows: &mut Vec<OwedRow>) -> Result<(), String> {
     let mut vouts = HashMap::new();
     for (txid, pkh) in owed::pay_vout_wanted(rows) {
-        let values:Vec<Value>=read(db,"SELECT hex(beef) AS beef FROM pot_beefs WHERE txid=?1 UNION ALL SELECT hex(beef) AS beef FROM transactions WHERE txid=?1",vec![Bind::Text(txid.clone())]).await?;
-        for r in values {
-            let Some(tx) = hex::decode(text(&r, "beef"))
-                .ok()
-                .and_then(|b| {
-                    overlay_engine::beef_limits::parse_beef(
-                        &b,
-                        &overlay_engine::beef_limits::APP_BEEF_LIMITS,
-                    )
-                    .ok()
-                })
-                .and_then(|b| b.find_txid(&txid).and_then(|t| t.tx().cloned()))
-            else {
-                continue;
-            };
-            if let Some(vout) = owed::sole_home_vout_of_raw(&tx.to_binary(), &txid, &pkh) {
-                vouts.insert(owed::pay_vout_key(&txid, &pkh), vout);
-                break;
-            }
+        if let Some(vout) = db
+            .tx_facts(&txid, FactsFrom::Stored)
+            .await?
+            .and_then(|f| f.sole_home_vout(&pkh))
+        {
+            vouts.insert(owed::pay_vout_key(&txid, &pkh), vout);
         }
     }
     owed::mark_pay_vouts(rows, &vouts);
@@ -945,4 +990,113 @@ pub(super) async fn finish_rows(db: &impl JudgeDb, rows: &mut Vec<OwedRow>) -> R
     }
     owed::retire_index_spent_homes(rows, &spent);
     Ok(())
+}
+
+/// MEDIUM-3 (bsv-low #912): where a transaction's facts are read. `PotBeefs` is the JOIN's own stored BEEF alone
+/// (`owed::JOIN_POT_BEEF_SQL`), `Stored` the pot's BEEF and then the engine's (`pot_beefs`, then `transactions`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactsFrom {
+    PotBeefs,
+    Stored,
+}
+
+/// The facts of one transaction the judge reads: its inputs (lowercase `txid`, vout) and its outputs as
+/// `routes::spender_outputs_of` reads them (no spend word). The D1 judge decodes them from the stored BEEF at each
+/// read; the actor (`owed_actor`) keeps them decoded and never holds the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxFacts {
+    pub inputs: Vec<(String, u32)>,
+    pub outputs: Vec<owed::SpenderOutput>,
+}
+impl TxFacts {
+    pub fn of_tx(tx: &bsv_rs::transaction::Transaction) -> Self {
+        Self {
+            inputs: routes::spender_inputs_of(tx),
+            outputs: routes::spender_outputs_of(tx),
+        }
+    }
+    /// `owed::join_spends_outpoint`'s answer over the decoded inputs.
+    pub fn spends(&self, hop: &str, vout: u32) -> bool {
+        self.inputs
+            .iter()
+            .any(|(t, v)| *v == vout && t.eq_ignore_ascii_case(hop))
+    }
+    /// `owed::sole_home_vout_of_raw`'s answer over the decoded outputs.
+    pub fn sole_home_vout(&self, pkh: &str) -> Option<u32> {
+        owed::sole_home_vout(
+            self.outputs.iter().map(|o| (o.vout, o.pkh_hex.as_deref())),
+            pkh,
+        )
+    }
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "inputs": self.inputs.iter().map(|(t, v)| serde_json::json!([t, v])).collect::<Vec<_>>(),
+            "outputs": self.outputs.iter().map(|o| serde_json::json!([o.vout, o.pkh_hex, o.sats, o.pot_lock])).collect::<Vec<_>>(),
+        })
+    }
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let inputs = v["inputs"]
+            .as_array()?
+            .iter()
+            .map(|i| Some((i[0].as_str()?.to_string(), i[1].as_u64()? as u32)))
+            .collect::<Option<Vec<_>>>()?;
+        let outputs = v["outputs"]
+            .as_array()?
+            .iter()
+            .map(|o| {
+                Some(owed::SpenderOutput {
+                    vout: o[0].as_u64()? as u32,
+                    pkh_hex: o[1].as_str().map(str::to_string),
+                    sats: o[2].as_u64()?,
+                    spent: None,
+                    pot_lock: o[3].as_bool()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { inputs, outputs })
+    }
+}
+
+/// The SQL a stored transaction's BEEFs are read by, in `FactsFrom`'s order.
+pub const STORED_BEEFS_SQL: &str = "SELECT hex(beef) AS beef FROM pot_beefs WHERE txid=?1 UNION ALL SELECT hex(beef) AS beef FROM transactions WHERE txid=?1";
+
+/// The first stored BEEF that parses and carries `txid`, decoded (the D1 judge's read, unchanged).
+pub fn facts_of_beefs<'a>(txid: &str, beefs: impl IntoIterator<Item = &'a str>) -> Option<TxFacts> {
+    beefs
+        .into_iter()
+        .filter_map(|h| hex::decode(h).ok())
+        .filter_map(|b| {
+            overlay_engine::beef_limits::parse_beef(
+                &b,
+                &overlay_engine::beef_limits::APP_BEEF_LIMITS,
+            )
+            .ok()
+        })
+        .find_map(|b| b.find_txid(txid).and_then(|t| t.tx().cloned()))
+        .map(|tx| TxFacts::of_tx(&tx))
+}
+
+pub(super) async fn stored_tx_facts(
+    db: &impl SqlPort,
+    txid: &str,
+    from: FactsFrom,
+) -> Result<Option<TxFacts>, String> {
+    let rows: Vec<Value> = read(
+        db,
+        match from {
+            FactsFrom::PotBeefs => owed::JOIN_POT_BEEF_SQL,
+            FactsFrom::Stored => STORED_BEEFS_SQL,
+        },
+        vec![Bind::Text(txid.to_string())],
+    )
+    .await?;
+    let take = if from == FactsFrom::PotBeefs {
+        1
+    } else {
+        rows.len()
+    };
+    Ok(facts_of_beefs(
+        txid,
+        rows.iter().take(take).filter_map(|r| r["beef"].as_str()),
+    ))
 }
