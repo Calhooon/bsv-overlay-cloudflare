@@ -28,6 +28,8 @@ const META_BOOTSTRAPPED: &str = "bootstrapped";
 const META_BOOT_CURSOR: &str = "bootCursor";
 /// MEDIUM-4: the last tip the tip alarm judged (its next window is `(tipJudged, tip]`).
 const META_TIP_JUDGED: &str = "tipJudged";
+/// NEW2-L5: the tip window's carried faults ([`tip_window`]), a JSON object of game to consecutive faults.
+const META_TIP_FAULTS: &str = "tipFaults";
 /// LOW-6: the bootstrap's first keyset cursor (`[at, gameId]` of the last page; this one precedes every game).
 pub const BOOT_CURSOR_START: &str = "[9223372036854775807,\"\"]";
 /// The bootstrap's keyset from its stored cursor (anything that is not one, the HIGH-4 re-arm's `0` included, is
@@ -111,6 +113,34 @@ pub fn schema_plan(held_digest: Option<&str>) -> Vec<String> {
     schema_plan_kept(held_digest, None, &[])
 }
 
+/// The second delta lens's NEW2-L4: runs every statement of `plan` through `exec`, and stamps the render's `digest`
+/// and `shape` ([`META_SCHEMA`], `shape`) through `stamp` only when EVERY statement answered. A statement that fails
+/// is logged and leaves the stamps where they were, so the object's next ensure (its next instance) computes the same
+/// plan and retries it; an actor whose index `CREATE` failed is never stamped as holding the render's indexes (a
+/// statement naming the index in `INDEXED BY` would fail on every apply until the next digest move). Answers whether
+/// the plan applied whole.
+pub fn ensure_schema(
+    plan: &[String],
+    mut exec: impl FnMut(&str) -> std::result::Result<(), String>,
+    mut log: impl FnMut(String),
+    mut stamp: impl FnMut(&str, &str),
+) -> bool {
+    let mut whole = true;
+    for s in plan {
+        if let Err(e) = exec(s) {
+            whole = false;
+            log(format!("[owed-actor] schema: {e}: {s}"));
+        }
+    }
+    if whole {
+        stamp(META_SCHEMA, &actor_digest());
+        stamp("shape", &actor_shape());
+    } else {
+        log("[owed-actor] schema: the plan did not apply whole; digest and shape NOT stamped (the next ensure retries it)".into());
+    }
+    whole
+}
+
 /// The delta lens's NEW-M2: [`schema_plan`] with the held SHAPE ([`actor_shape`]) and the held indexes' names. A
 /// digest move whose shape is the render's is index-only: every held index dropped and the render's created, the rows
 /// and `meta` kept (no rebuild, no bootstrap, no read served `pending`). Otherwise the rebuild of HIGH-4.
@@ -147,7 +177,7 @@ pub fn schema_plan_kept(
     out.extend(mirror_ddl());
     if held_digest.is_some() {
         out.push(format!(
-            "DELETE FROM meta WHERE name IN ('{META_BOOTSTRAPPED}','{META_BOOT_CURSOR}','{META_ACK}','{META_GATE}','{META_JUDGED_AT}','{META_KV_DIRTY}','{META_TIP_JUDGED}')"
+            "DELETE FROM meta WHERE name IN ('{META_BOOTSTRAPPED}','{META_BOOT_CURSOR}','{META_ACK}','{META_GATE}','{META_JUDGED_AT}','{META_KV_DIRTY}','{META_TIP_JUDGED}','{META_TIP_FAULTS}')"
         ));
         out.push(format!(
             "INSERT INTO meta(name,value) SELECT '{META_BOOT_CURSOR}','0' WHERE EXISTS (SELECT 1 FROM meta WHERE name='{META_IDENTITY}')"
@@ -301,13 +331,14 @@ impl DurableObject for OwedActor {
                     .and_then(|v| v.parse::<i64>().ok())
                     .unwrap_or(-1);
                 let games = self.gated_games(&local, t, last);
-                // The delta lens's NEW-L1: `tipJudged` moves only when every apply of the window answered; a faulted
-                // one leaves the window open for the next alarm (its gates selected again).
-                let mut answered = true;
-                for chunk in games.chunks(GAMES_PER_APPLY) {
+                // The second delta lens's NEW2-L5 (over the delta lens's NEW-L1): `tipJudged` moves past the window;
+                // a game whose apply faulted is carried in `tipFaults` and retried, parked at its third consecutive
+                // fault, counted once an alarm and named in its line ([`tip_window`]).
+                let held = self.tip_faults();
+                let window = tip_window(&identity, games, &held, t as i64, |chunk| {
                     let body = ApplyBody {
                         identity: identity.clone(),
-                        games: chunk.to_vec(),
+                        games: chunk,
                         kind: Some("tip".into()),
                         seq: None,
                         at_ms: None,
@@ -315,13 +346,22 @@ impl DurableObject for OwedActor {
                         txfacts: Vec::new(),
                         mined: false,
                     };
-                    answered &= self
-                        .apply_route(body)
-                        .await
-                        .is_ok_and(|r| r.status_code() == 200);
-                }
-                if answered {
-                    self.put_meta(&local, META_TIP_JUDGED, &t.to_string());
+                    async move {
+                        self.apply_route(body)
+                            .await
+                            .is_ok_and(|r| r.status_code() == 200)
+                    }
+                })
+                .await;
+                self.put_meta(&local, META_TIP_FAULTS, &json!(window.faults).to_string());
+                self.put_meta(&local, META_TIP_JUDGED, &window.tip_judged.to_string());
+                if let Some(line) = &window.line {
+                    console_log!("{line}");
+                    if let Ok(record) = crate::routes::D1Sql::of(&self.env) {
+                        record
+                            .counters(vec![(COUNTERS[18].into(), window.counted)])
+                            .await;
+                    }
                 }
             }
             self.arm_tip_alarm(&local, tip).await;
@@ -380,24 +420,27 @@ impl OwedActor {
                     "[owed-actor] an index-only digest move: the indexes rebuilt, the rows kept"
                 );
             }
-            for s in plan {
-                if let Err(e) = local.sql.exec(&s, None) {
-                    console_log!("[owed-actor] schema: {e}: {s}");
-                }
-            }
-            let _ = local.sql.exec(
-                META_PUT_SQL,
-                vec![
-                    SqlStorageValue::from(META_SCHEMA.to_string()),
-                    SqlStorageValue::from(actor_digest()),
-                ],
-            );
-            let _ = local.sql.exec(
-                META_PUT_SQL,
-                vec![
-                    SqlStorageValue::from("shape".to_string()),
-                    SqlStorageValue::from(actor_shape()),
-                ],
+            // NEW2-L4: `digest` and `shape` are stamped only when the whole plan applied; this instance does not
+            // run the plan again (`ready`), its next instance does.
+            ensure_schema(
+                &plan,
+                |s| {
+                    local
+                        .sql
+                        .exec(s, None)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                },
+                |l| console_log!("{l}"),
+                |name, value| {
+                    let _ = local.sql.exec(
+                        META_PUT_SQL,
+                        vec![
+                            SqlStorageValue::from(name.to_string()),
+                            SqlStorageValue::from(value.to_string()),
+                        ],
+                    );
+                },
             );
             *self.ready.borrow_mut() = true;
         }
@@ -539,6 +582,13 @@ impl OwedActor {
             })
     }
 
+    /// NEW2-L5: the tip window's carried faults (empty when absent or unreadable).
+    fn tip_faults(&self) -> BTreeMap<String, u32> {
+        self.meta(META_TIP_FAULTS)
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default()
+    }
+
     fn put_meta(&self, local: &DoSql, name: &str, value: &str) {
         let _ = local.sql.exec(
             META_PUT_SQL,
@@ -615,6 +665,13 @@ impl OwedActor {
         }
         self.put_meta(&local, META_IDENTITY, &me);
         self.put_meta(&local, META_JUDGED_AT, &now.to_string());
+        // NEW2-L5: an apply that landed clears its games' carried tip faults (a parked game re-enters the window).
+        let mut held = self.tip_faults();
+        let before = held.len();
+        held.retain(|g, _| !body.games.iter().any(|x| x.eq_ignore_ascii_case(g)));
+        if held.len() != before {
+            self.put_meta(&local, META_TIP_FAULTS, &json!(held).to_string());
+        }
         // THE PUSH (section 4): `owed-changed` through the relay's pots room, carrying the judgement and the event's
         // write time (the harness's bar).
         for (identity, mut push) in pushes {
@@ -710,16 +767,20 @@ impl OwedActor {
         let record = crate::routes::D1Sql::of(&self.env)?;
         // NEW-M2: one token of the fleet's bootstrap budget, or a wait for a slot in a later minute.
         let now = Date::now().as_millis();
-        let taken = record
-            .run_batch(vec![
-                Stmt::new(BOOT_BUDGET_TAKE_SQL, vec![Bind::Int(now as i64)]),
-                Stmt::new(BOOT_BUDGET_READ_SQL, vec![]),
-            ])
-            .await
-            .map_err(Error::RustError)?
-            .get(1)
-            .and_then(|o| o.rows.first().and_then(|r| r["taken"].as_i64()))
-            .unwrap_or(0);
+        // NEW2-L3: one statement; a full minute writes nothing and answers no row (the page waits).
+        let taken = boot_taken(
+            &record
+                .run_batch(vec![Stmt::new(
+                    BOOT_BUDGET_TAKE_SQL,
+                    vec![Bind::Int(now as i64)],
+                )])
+                .await
+                .map_err(Error::RustError)?
+                .into_iter()
+                .next()
+                .map(|o| o.rows)
+                .unwrap_or_default(),
+        );
         if let Some(wait) = boot_pace(taken, now, &me) {
             self.state.storage().set_alarm(wait as i64).await?;
             return Ok(());
