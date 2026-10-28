@@ -817,7 +817,7 @@ fn d2_actor_b_the_bars_are_served_and_the_counters_seeded() {
         .split_whitespace()
         .collect::<String>();
     assert!(routes.contains(
-        &"body[\"owedActor\"] = crate::owed_actor::health_body( actor_read.as_ref(), worker::Date::now().as_millis(), d1_judges, &body[\"owedEvents\"][\"oldestUnackedMarkAgeMs\"], );"
+        &"body[\"owedActor\"] = crate::owed_actor::health_body( actor_snapshot.as_ref(), worker::Date::now().as_millis(), d1_judges, &body[\"owedEvents\"][\"oldestUnackedMarkAgeMs\"], );"
             .split_whitespace()
             .collect::<String>()
     ));
@@ -3296,4 +3296,276 @@ fn d2_actor_b_fold5_l2_a_failed_index_on_a_rebuild_retries_as_index_only() {
     let rearm = &object[object.find("asyncfnrearm_after_rebuild").unwrap()..];
     assert!(rearm.contains("(COUNTERS[20].into(),1)"));
     assert_eq!(COUNTERS[20], "owed_actor_schema_partial_total");
+}
+
+// ---- D2-ACTOR-B-FOLD-6: the land tier's refusal (`health-dirty-snapshot`: 49 reads, 6 statements, largest 44) ----
+
+/// A fleet-shaped record for the health read: 600 identities holding owed rows, the actor's 21 counters, the three
+/// class rows and a coverage row.
+fn fold6_fleet() -> SqliteSql {
+    let db = SqliteSql::migrated();
+    for i in 0..600 {
+        db.conn
+            .execute(
+                "INSERT INTO owed_state(identity,computedAtMs,tip,rows,stale,truncated,recomputeSeq) VALUES (?1,1,NULL,3,0,0,1)",
+                [format!("02{i:064x}")],
+            )
+            .unwrap();
+    }
+    for (i, c) in COUNTERS.iter().enumerate() {
+        db.conn
+            .execute(
+                "INSERT INTO ops_counters(name,value) VALUES (?1,?2) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                rusqlite::params![c, 10 + i as i64],
+            )
+            .unwrap();
+    }
+    for class in BAR_CLASSES {
+        db.conn
+            .execute(
+                "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,?2,5)",
+                [
+                    bars_state_name(class),
+                    merge_bars_row(None, &[100, 200, 300], &[40, 50], Some(Some(1_000))),
+                ],
+            )
+            .unwrap();
+    }
+    let cov = coverage_fold(None, "", 600, 0, None, 7);
+    db.conn
+        .execute(
+            "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,?2,7)",
+            [COVERAGE_NAME.to_string(), cov.to_string()],
+        )
+        .unwrap();
+    db
+}
+
+/// One statement's cost on SQLite, D1's engine: the rows it answered and the rows a full scan stepped through.
+fn fold6_cost(db: &SqliteSql, sql: &str) -> (usize, i32) {
+    let mut st = db.conn.prepare(sql).unwrap();
+    let n = st.query_map([], |_| Ok(())).unwrap().count();
+    (n, st.get_status(rusqlite::StatementStatus::FullscanStep))
+}
+
+/// The health route's owed blocks read within the tier's ceilings (7 reads, 5 statements, the largest 5): the
+/// statements the route's `health` names, each a primary-key read of at most 5 rows with no scan, three in all (main's
+/// D2-ACTOR-A-FOLD-5 count). RED on `7b455de3`: the route names `owed_actor::HEALTH_SQL`, a fourth statement whose
+/// `owed_state` count scans the fleet (600 rows here, the tier's 44).
+#[tokio::test]
+async fn d2_actor_b_fold6_the_health_read_is_one_snapshot_row_within_the_ceilings() {
+    let db = fold6_fleet();
+    let routes = include_str!("../routes.rs");
+    let route = &routes[routes.find("pub async fn health(").unwrap()..];
+    let route = &route[..route.find("\n}\n").unwrap()];
+    let named: Vec<(&str, &str)> = [
+        (
+            "owed_judge::dirty_health",
+            crate::owed_judge::DIRTY_HEALTH_SQL,
+        ),
+        (
+            "owed_events::health",
+            crate::owed_events::HEALTH_CONSUMER_SQL,
+        ),
+        ("owed_events::health", crate::owed_events::HEALTH_TOTALS_SQL),
+        ("owed_actor::HEALTH_SQL", HEALTH_SQL),
+    ]
+    .into_iter()
+    .filter(|(name, _)| route.contains(name))
+    .collect();
+    let costs: Vec<(usize, i32)> = named.iter().map(|(_, sql)| fold6_cost(&db, sql)).collect();
+    assert!(
+        named.len() <= 3 && costs.iter().all(|&(rows, scan)| rows <= 5 && scan == 0),
+        "the health route's owed statements {:?}: (rows, scanned) {costs:?}",
+        named.iter().map(|n| n.0).collect::<Vec<_>>()
+    );
+    assert!(route.contains("owed_events::health_and_actor"));
+    // The snapshot is ONE of the consumer statement's rows.
+    db.run_batch(vec![health_snapshot_stmt(9, true)])
+        .await
+        .unwrap();
+    assert_eq!(
+        fold6_cost(&db, crate::owed_events::HEALTH_CONSUMER_SQL),
+        (1, 0)
+    );
+}
+
+/// The snapshot's cadence: two writes inside a minute leave one row, the second skipped (no composition run: no scan,
+/// a few VM steps); past the minute it is rewritten; `force` writes whatever the stamp. Each writer carries it in its
+/// own batch. RED on `7b455de3`: no snapshot statement exists (the route read the composition per request).
+#[tokio::test]
+async fn d2_actor_b_fold6_the_snapshot_is_written_at_most_once_a_minute() {
+    let db = fold6_fleet();
+    let snap = |db: &SqliteSql| -> Value {
+        db.conn
+            .query_row(
+                "SELECT cursor FROM owed_belt_state WHERE name=?1",
+                [HEALTH_SNAPSHOT_NAME],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|c| serde_json::from_str(&c).unwrap())
+            .unwrap_or(Value::Null)
+    };
+    let compared = |v: &Value| health_body(Some(v), 0, true, &Value::Null)["comparedTotal"].clone();
+    db.run_batch(vec![health_snapshot_stmt(1_000_000, false)])
+        .await
+        .unwrap();
+    assert_eq!(snap(&db)["asOfMs"], json!(1_000_000));
+    assert_eq!(compared(&snap(&db)), json!(10));
+    db.conn
+        .execute(
+            "UPDATE ops_counters SET value=41 WHERE name=?1",
+            [COUNTERS[0]],
+        )
+        .unwrap();
+    // The second write inside the minute: skipped, and it runs none of the composition (no scan of `owed_state`).
+    let mut st = db.conn.prepare(HEALTH_SNAPSHOT_SQL).unwrap();
+    let changed = st
+        .execute(rusqlite::params![
+            1_030_000i64,
+            HEALTH_SNAPSHOT_EVERY_MS as i64
+        ])
+        .unwrap();
+    let (scan, steps) = (
+        st.get_status(rusqlite::StatementStatus::FullscanStep),
+        st.get_status(rusqlite::StatementStatus::VmStep),
+    );
+    drop(st);
+    assert_eq!(
+        (changed, scan),
+        (0, 0),
+        "skipped, nothing read past the stamp"
+    );
+    assert!(steps < 100, "the skipped write ran {steps} VM steps");
+    let one: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM owed_belt_state WHERE name=?1",
+            [HEALTH_SNAPSHOT_NAME],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(one, 1);
+    assert_eq!(
+        (snap(&db)["asOfMs"].clone(), compared(&snap(&db))),
+        (json!(1_000_000), json!(10))
+    );
+    // Past the minute: rewritten.
+    db.run_batch(vec![health_snapshot_stmt(1_061_000, false)])
+        .await
+        .unwrap();
+    assert_eq!(
+        (snap(&db)["asOfMs"].clone(), compared(&snap(&db))),
+        (json!(1_061_000), json!(41))
+    );
+    // Forced (the coverage pass's last call): written at once.
+    db.run_batch(vec![health_snapshot_stmt(1_062_000, true)])
+        .await
+        .unwrap();
+    assert_eq!(snap(&db)["asOfMs"], json!(1_062_000));
+    // The read serves it.
+    let (_, actor) = crate::owed_events::health_and_actor(&db, &Value::Null).await;
+    assert_eq!(actor.unwrap()["asOfMs"], json!(1_062_000));
+    // Each writer carries the snapshot in its own batch; no read writes it.
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let actor_src = squash(include_str!("../owed_actor.rs"));
+    let flush = &actor_src[actor_src.find("pubasyncfnflush_bars_from(").unwrap()..];
+    assert!(flush[..flush.find("Ok(())").unwrap()]
+        .contains("stmts.push(health_snapshot_stmt(now,false));"));
+    let events = squash(include_str!("../owed_events.rs"));
+    assert!(
+        events.contains("batch_row.push(crate::owed_actor::health_snapshot_stmt(nowasu64,false));")
+    );
+    let object = squash(include_str!("object.rs"));
+    assert!(object.contains(
+        "crate::owed_actor::health_snapshot_stmt(Date::now().as_millis(),next.is_none()),"
+    ));
+    let routes = squash(include_str!("../routes.rs"));
+    assert!(
+        !routes.contains("health_snapshot_stmt"),
+        "a read never writes it"
+    );
+}
+
+/// The served body's KEYS are the pre-fold body's (the harness's bars cell and the cutover doc read them by name),
+/// with the same values on a fixture, plus `asOfMs`; no snapshot yet serves them null. RED on `7b455de3`: no
+/// `asOfMs`, and a missing read served the totals 0.
+#[tokio::test]
+async fn d2_actor_b_fold6_the_served_keys_are_the_pre_fold_bodys() {
+    let db = fold6_fleet();
+    let pre = db
+        .run_batch(vec![Stmt::new(HEALTH_SQL, vec![])])
+        .await
+        .unwrap()
+        .remove(0)
+        .rows
+        .remove(0);
+    let before = health_body(Some(&pre), 2_000, true, &json!(99));
+    db.run_batch(vec![health_snapshot_stmt(1_500, true)])
+        .await
+        .unwrap();
+    let (_, snap) = crate::owed_events::health_and_actor(&db, &Value::Null).await;
+    let after = health_body(snap.as_ref(), 2_000, true, &json!(99));
+    let keys = |v: &Value| {
+        v.as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    };
+    let mut want = keys(&before);
+    want.insert("asOfMs".into());
+    assert_eq!(keys(&after), want);
+    for k in keys(&before) {
+        if k != "isolate" && k != "asOfMs" {
+            assert_eq!(after[&k], before[&k], "{k}");
+        }
+    }
+    assert_eq!(after["asOfMs"], json!(1_500));
+    for k in [
+        "applyMsP50",
+        "applyMsP95",
+        "applyCeilingMs",
+        "rowsVisibleMsP95",
+        "collectAfterMinedMsP95",
+        "oldestUnappliedEventAgeMs",
+        "kvCopies",
+        "bootstraps",
+        "reconcileDiffs",
+        "comparedTotal",
+        "diffsTotal",
+        "faultsTotal",
+        "heldDiffsTotal",
+        "tipFaults",
+        "tipParked",
+        "schemaPartial",
+        "coverage",
+        "epochResets",
+        "deferred",
+        "deferredDone",
+        "activeIdentities",
+        "unknownReads",
+        "v3",
+        "classes",
+        "isolate",
+        "healthRead",
+        "asOfMs",
+    ] {
+        assert!(after.get(k).is_some(), "{k}");
+    }
+    assert_eq!(after["comparedTotal"], json!(10));
+    assert_eq!(after["activeIdentities"], json!(600));
+    assert_eq!(after["coverage"]["complete"], json!(true));
+    let none = health_body(None, 2_000, true, &json!(99));
+    assert_eq!(keys(&none), keys(&after));
+    for k in [
+        "asOfMs",
+        "comparedTotal",
+        "diffsTotal",
+        "bootstraps",
+        "coverage",
+        "activeIdentities",
+    ] {
+        assert_eq!(none[k], Value::Null, "{k}");
+    }
 }

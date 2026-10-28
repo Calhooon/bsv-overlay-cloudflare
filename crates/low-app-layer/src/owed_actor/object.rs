@@ -1279,15 +1279,20 @@ pub async fn bootstrap_lever(mut req: Request, env: &Env) -> Result<Response> {
         next.as_deref(),
         Date::now().as_millis(),
     );
+    // D2-ACTOR-B-FOLD-6: the health snapshot in the fold's batch, at most once a minute; the pass's last call
+    // (`next` null) writes it whatever its stamp, so a finished pass is served finished.
     let _ = db
-        .run_batch(vec![Stmt::new(
-            crate::owed_belt::STATE_SQL,
-            vec![
-                Bind::Text(COVERAGE_NAME.into()),
-                Bind::Text(coverage.to_string()),
-                Bind::Int(Date::now().as_millis() as i64),
-            ],
-        )])
+        .run_batch(vec![
+            Stmt::new(
+                crate::owed_belt::STATE_SQL,
+                vec![
+                    Bind::Text(COVERAGE_NAME.into()),
+                    Bind::Text(coverage.to_string()),
+                    Bind::Int(Date::now().as_millis() as i64),
+                ],
+            ),
+            crate::owed_actor::health_snapshot_stmt(Date::now().as_millis(), next.is_none()),
+        ])
         .await;
     Response::from_json(
         &json!({"identities": ids.len(), "armed": armed, "bootstrapped": done, "skipped": skipped, "faults": faults, "next": next, "coverage": coverage}),
