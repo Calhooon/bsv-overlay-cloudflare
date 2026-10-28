@@ -8477,8 +8477,10 @@ pub(crate) mod tests {
         let mut at = Vec::new();
         for wired in [
             "owed::JOIN_SEAT_POTS_SQL,",
-            "read(db, owed::JOIN_POT_BEEF_SQL, vec![Bind::Text(pot.clone())])",
-            ".is_some_and(|b| owed::join_spends_outpoint(&b, &pot, hop, *vout))",
+            // bsv-low #912: the JOIN's bytes are read behind `JudgeDb::tx_facts` (the D1 judge's
+            // `owed::JOIN_POT_BEEF_SQL`, the actor's `txfacts`), the spend answered by the facts
+            ".tx_facts(&pot, FactsFrom::PotBeefs)",
+            ".is_some_and(|f| f.spends(hop, *vout))",
             "i.join_spent_hops.insert(owed::outpoint_key(hop, *vout), pot);",
         ] {
             at.push(
