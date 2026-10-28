@@ -273,6 +273,9 @@ pub enum Stop {
     Finished,
     /// The wall (less the save's reserve) fell.
     Wall,
+    /// bsv-low #912 (the D2-ACTOR-B delta lens's NEW-H1): `OWED_ACTOR_READ` is on, so the D1-only judge does not run
+    /// (its acknowledgement would remove marks the actor never applied, under rows the read serves from the actor).
+    ActorRead,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -748,6 +751,11 @@ pub async fn backfill_pass(
 ) -> Result<BackfillReport, String> {
     let mut report = BackfillReport::default();
     if !read(db, STAMP_SQL, vec![]).await?.is_empty() {
+        return Ok(report);
+    }
+    // NEW-H1: never a D1-only judge (and its acknowledgement) under the actor's read.
+    if db.actor_reads() {
+        report.stop = Stop::ActorRead;
         return Ok(report);
     }
     let gate = read(db, GATE_SQL, vec![]).await?;
@@ -1251,6 +1259,23 @@ pub async fn lever(req: worker::Request, env: &worker::Env) -> worker::Result<wo
     ) {
         return worker::Response::error(
             "the D1 judge is off (OWED_D1_JUDGE=false): the owed-v2 lever does not run",
+            409,
+        );
+    }
+    // The D2-ACTOR-B delta lens's NEW-H1: nor while the read serves the actor's rows (`OWED_ACTOR_READ`): the D1-only
+    // judge would acknowledge marks the actor never applied. Its `?aged=1` repair writes marks only and still runs.
+    let aged_only = req
+        .url()
+        .is_ok_and(|u| u.query_pairs().any(|(k, v)| k == "aged" && v == "1"));
+    if !aged_only
+        && crate::owed_actor::flag_on(
+            env.var(crate::owed_actor::READ_FLAG)
+                .ok()
+                .map(|v| v.to_string()),
+        )
+    {
+        return worker::Response::error(
+            "the owed actor serves the read (OWED_ACTOR_READ=true): the owed-v2 lever's D1-only judge does not run",
             409,
         );
     }

@@ -877,8 +877,9 @@ async fn ask_find(
     }
 }
 
-/// Phase B's find (the D2-ACTOR-B lens's HIGH-3): the find's facts written alone, the actor's apply of them, then the
-/// D1 judge; `Err` at the first fault (the facts' marks standing).
+/// Phase B's find (the D2-ACTOR-B lens's HIGH-3): the find's facts written alone, the marks' bound read, the actor's
+/// apply of them, then the D1 judge acknowledging up to that bound (NEW-H1 (a)); `Err` at the first fault (the
+/// facts' marks standing).
 async fn phase_b_find(
     db: &impl JudgeDb,
     c: &Candidate,
@@ -887,18 +888,22 @@ async fn phase_b_find(
     now: i64,
 ) -> Result<(), String> {
     db.run_batch(find.statements(now)).await?;
+    // The delta lens's NEW-H1 (a): the acknowledgement's bound is read after the facts' marks and BEFORE the actor
+    // reads the record, so a downgrade written while it applies stands for its next apply.
+    let bound = owed_judge::marks_bound(db, &c.identity, std::slice::from_ref(&c.game_id)).await?;
     if let Some(answer) = db
         .actor_apply(&c.identity, std::slice::from_ref(&c.game_id), "belt-find")
         .await?
     {
         crate::owed_actor::note_answer(&answer);
     }
-    owed_judge::judge_with_write(
+    owed_judge::judge_with_write_bounded(
         db,
         std::slice::from_ref(subject),
         "belt",
         Vec::new(),
         &[],
+        Some(bound),
         |_| Ok(()),
     )
     .await
