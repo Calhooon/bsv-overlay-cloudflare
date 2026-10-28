@@ -7038,6 +7038,12 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     ));
     body["owedActor"]["bound"] =
         serde_json::json!(ctx.env.durable_object(crate::owed_actor::BINDING).is_ok());
+    // The oldest event no judge has applied: the fleet's oldest un-acked mark (the marks are acknowledged after the
+    // judge applied; in Phase C after the actor did), where this isolate holds no sample of its own.
+    if body["owedActor"]["oldestUnappliedEventAgeMs"].is_null() {
+        body["owedActor"]["oldestUnappliedEventAgeMs"] =
+            body["owedEvents"]["oldestUnackedMarkAgeMs"].clone();
+    }
     // The flags at the design's named place (the harness reads `owedActor.flags.OWED_ACTOR_READ`).
     body["owedActor"]["flags"] = serde_json::json!({
         crate::owed_actor::READ_FLAG: body["owedActor"]["readFlag"],

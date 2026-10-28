@@ -171,7 +171,10 @@ impl DurableObject for OwedActor {
                     .query_pairs()
                     .find(|(k, _)| k == "identity")
                     .and_then(|(_, v)| actor_name(&v));
-                let rows = me.as_deref().map(|m| self.rows_of(&local, m)).unwrap_or_default();
+                let rows = me
+                    .as_deref()
+                    .map(|m| self.rows_of(&local, m))
+                    .unwrap_or_default();
                 Response::from_json(&json!({"identity": me, "rows": rows}))
             }
             (Method::Get, "/bars") => {
@@ -413,6 +416,8 @@ impl OwedActor {
             "skippedRedelivery": report.skipped_redelivery,
             "missed": report.missed,
             "judgedAtMs": now,
+            "atMs": body.at_ms,
+            "mined": body.mined,
             "applyMs": now.saturating_sub(started),
             "ackSeq": self.meta(META_ACK),
         }))
@@ -711,12 +716,7 @@ pub fn schedule_direct(
             body["seq"] = Value::Null;
             calls += 1;
             match call_apply(&env, &body, DIRECT_CALL_WALL_MS).await {
-                Ok(answer) => {
-                    note_answer(&answer);
-                    if let Some(j) = answer["judgedAtMs"].as_u64() {
-                        note_visible(at_ms, j);
-                    }
-                }
+                Ok(answer) => note_answer(&answer),
                 Err(e) => {
                     faults += 1;
                     console_log!("[owed-actor] direct call {identity}: {e}");

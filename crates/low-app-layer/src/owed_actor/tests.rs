@@ -355,9 +355,18 @@ async fn d2_actor_b_two_events_under_a_slow_chaintracks_derive_the_newer_rows() 
     let record = d1_judge(&stranded()).await;
     let games = games_of(&record, "owner");
     let actor = mirror();
-    apply(&record, &actor, &Fakes, "owner", &games, None, Some(TIP), None)
-        .await
-        .unwrap();
+    apply(
+        &record,
+        &actor,
+        &Fakes,
+        "owner",
+        &games,
+        None,
+        Some(TIP),
+        None,
+    )
+    .await
+    .unwrap();
     let older = stored(&actor, "owner");
     let control_record = d1_judge(&stranded()).await;
     control_record
@@ -365,10 +374,23 @@ async fn d2_actor_b_two_events_under_a_slow_chaintracks_derive_the_newer_rows() 
         .execute_batch(SPENT_BY_A_STRANGER)
         .unwrap();
     let control = mirror();
-    apply(&control_record, &control, &Fakes, "owner", &games, None, Some(TIP), None)
-        .await
-        .unwrap();
-    assert_ne!(stored(&control, "owner"), older, "the move changes the rows");
+    apply(
+        &control_record,
+        &control,
+        &Fakes,
+        "owner",
+        &games,
+        None,
+        Some(TIP),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        stored(&control, "owner"),
+        older,
+        "the move changes the rows"
+    );
     let turn = futures_util::lock::Mutex::new(());
     let slow = SlowOutside(64, Cell::new(0));
     let first = apply_in_turn(
@@ -401,7 +423,10 @@ async fn d2_actor_b_two_events_under_a_slow_chaintracks_derive_the_newer_rows() 
     let (a, b) = tokio::join!(first, second);
     a.unwrap();
     b.unwrap();
-    assert!(slow.1.get() > 0, "the first event's judgement asked the slow chaintracks");
+    assert!(
+        slow.1.get() > 0,
+        "the first event's judgement asked the slow chaintracks"
+    );
     assert_eq!(
         stored(&actor, "owner"),
         stored(&control, "owner"),
@@ -725,6 +750,33 @@ fn d2_actor_b_the_bars_are_served_and_the_counters_seeded() {
     ] {
         assert!(s.get(k).is_some(), "{k}");
     }
+    // The caller's isolate notes an answer's bars: a `mined` word's event is the collect-after-mined sample.
+    let mut c = Bars::default();
+    note_answer_into(
+        &mut c,
+        &json!({"applyMs": 40, "atMs": 1_000, "judgedAtMs": 1_300, "mined": true}),
+    );
+    note_answer_into(
+        &mut c,
+        &json!({"applyMs": 60, "atMs": 1_000, "judgedAtMs": 1_200}),
+    );
+    let s = c.served(2_000);
+    assert_eq!(
+        (
+            s["applyMsP95"].clone(),
+            s["rowsVisibleMsP95"].clone(),
+            s["collectAfterMinedMsP95"].clone()
+        ),
+        (json!(60), json!(300), json!(300))
+    );
+    let routes = include_str!("../routes.rs")
+        .split_whitespace()
+        .collect::<String>();
+    assert!(routes.contains(
+        &"body[\"owedActor\"][\"oldestUnappliedEventAgeMs\"] = body[\"owedEvents\"][\"oldestUnackedMarkAgeMs\"].clone();"
+            .split_whitespace()
+            .collect::<String>()
+    ));
     assert_eq!(
         COUNTERS,
         bsv_overlay_cloudflare::applayer_counters::OWED_ACTOR
@@ -852,8 +904,18 @@ async fn d2_actor_b_the_belt_ask_round_trip() {
         .cloned()
         .unwrap_or_else(|| panic!("the stranded hop's ask is published: {asks:?}"));
     assert_eq!(
-        (ask["identity"].clone(), ask["question"]["ask"].clone(), ask["question"]["family"].clone(), ask["dueAtMs"].clone()),
-        (json!("owner"), json!("outpoint"), json!("hop-stranded"), json!(due))
+        (
+            ask["identity"].clone(),
+            ask["question"]["ask"].clone(),
+            ask["question"]["family"].clone(),
+            ask["dueAtMs"].clone()
+        ),
+        (
+            json!("owner"),
+            json!("outpoint"),
+            json!("hop-stranded"),
+            json!(due)
+        )
     );
     let press = |db: &SqliteSql| -> (String, Option<i64>) {
         db.conn
@@ -915,15 +977,14 @@ async fn d2_actor_b_the_belt_ask_round_trip() {
         "every courier call is the belt gate's"
     );
     assert!(report.calls <= crate::owed_belt::OWED_BELT_CALLS_PER_TICK);
-    let memo: i64 = w
-        .d1
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM hop_chain_probes WHERE outpoint=?1",
-            [&format!("{STRANDED_HOP}.0")],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let memo: i64 =
+        w.d1.conn
+            .query_row(
+                "SELECT COUNT(*) FROM hop_chain_probes WHERE outpoint=?1",
+                [&format!("{STRANDED_HOP}.0")],
+                |r| r.get(0),
+            )
+            .unwrap();
     assert_eq!(memo, 1, "the find's facts are the record's");
     let (family, claimable) = press(&w.actor);
     assert!(
@@ -970,17 +1031,40 @@ async fn d2_actor_b_the_reconcile_finds_a_planted_diff() {
         .unwrap();
     let t0 = NOW_MS as i64;
     let clean = reconcile_step(&w, t0).await.unwrap().unwrap();
-    assert_eq!((clean.identity.as_str(), clean.diff, clean.no_actor), ("owner", false, false), "{clean:?}");
-    assert_eq!(reconcile_step(&w, t0 + 1).await.unwrap(), None, "one identity per interval");
+    assert_eq!(
+        (clean.identity.as_str(), clean.diff, clean.no_actor),
+        ("owner", false, false),
+        "{clean:?}"
+    );
+    assert_eq!(
+        reconcile_step(&w, t0 + 1).await.unwrap(),
+        None,
+        "one identity per interval"
+    );
     plant_actor(&w);
-    let found = reconcile_step(&w, t0 + RECONCILE_INTERVAL_MS).await.unwrap().unwrap();
+    let found = reconcile_step(&w, t0 + RECONCILE_INTERVAL_MS)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(found.diff && found.reapplied > 0, "{found:?}");
     assert_eq!(
-        (w.d1.counter(COUNTERS[6]), w.d1.counter(COUNTERS[7]), w.d1.counter(COUNTERS[5])),
+        (
+            w.d1.counter(COUNTERS[6]),
+            w.d1.counter(COUNTERS[7]),
+            w.d1.counter(COUNTERS[5])
+        ),
         (2, 1, found.reapplied as u64)
     );
-    assert!(w.d1.lines.borrow().iter().any(|l| l.starts_with("[owed-actor] RECONCILE DIFF owner")));
-    let healed = reconcile_step(&w, t0 + 2 * RECONCILE_INTERVAL_MS).await.unwrap().unwrap();
+    assert!(w
+        .d1
+        .lines
+        .borrow()
+        .iter()
+        .any(|l| l.starts_with("[owed-actor] RECONCILE DIFF owner")));
+    let healed = reconcile_step(&w, t0 + 2 * RECONCILE_INTERVAL_MS)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(!healed.diff, "the re-apply repaired the actor: {healed:?}");
     // Phase C: the D1 rows are cold; the actor's rows against a re-apply of its games from the record.
     let c = WithActor {
@@ -992,9 +1076,16 @@ async fn d2_actor_b_the_reconcile_finds_a_planted_diff() {
         .await
         .unwrap();
     let clean = reconcile_step(&c, t0).await.unwrap().unwrap();
-    assert_eq!((clean.identity.as_str(), clean.diff), ("owner", false), "{clean:?}");
+    assert_eq!(
+        (clean.identity.as_str(), clean.diff),
+        ("owner", false),
+        "{clean:?}"
+    );
     plant_actor(&c);
-    let found = reconcile_step(&c, t0 + RECONCILE_INTERVAL_MS).await.unwrap().unwrap();
+    let found = reconcile_step(&c, t0 + RECONCILE_INTERVAL_MS)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(found.diff && found.reapplied > 0, "{found:?}");
     assert_eq!(c.d1.counter(COUNTERS[7]), 1);
 }
@@ -1008,10 +1099,9 @@ fn d2_actor_b_the_wipe_lever_resets_the_named_actors() {
     assert!(object::reset_plan(&json!({"identities": []})).is_err());
     let many: Vec<String> = (0..51).map(|n| format!("02{n:064x}")).collect();
     assert!(object::reset_plan(&json!({ "identities": many })).is_err());
-    let (reset, skipped) = object::reset_plan(
-        &json!({"identities": [key('A'), key('a'), key('b'), "owner"]}),
-    )
-    .unwrap();
+    let (reset, skipped) =
+        object::reset_plan(&json!({"identities": [key('A'), key('a'), key('b'), "owner"]}))
+            .unwrap();
     assert_eq!(reset, vec![key('a'), key('b')]);
     assert_eq!(skipped, vec!["\"owner\"".to_string()]);
     let squash = |s: &str| s.split_whitespace().collect::<String>();
@@ -1026,7 +1116,9 @@ fn d2_actor_b_the_wipe_lever_resets_the_named_actors() {
     assert!(object.contains(&squash(
         "self.state.storage().delete_all().await?; let _ = self.state.storage().delete_alarm().await;"
     )));
-    assert!(object.contains(&squash("if !crate::internal_events::internal_bearer_ok(&req, env) {")));
+    assert!(object.contains(&squash(
+        "if !crate::internal_events::internal_bearer_ok(&req, env) {"
+    )));
 }
 
 /// The captain's harness (bsv-low `owedActorBars.mjs`) reads the flags at `/health.owedActor.flags`.
@@ -1038,7 +1130,13 @@ fn d2_actor_b_the_health_serves_the_flags() {
         .find(&squash("body[\"owedActor\"][\"flags\"] = serde_json::json!({ crate::owed_actor::READ_FLAG: body[\"owedActor\"][\"readFlag\"], crate::owed_actor::D1_JUDGE_FLAG: body[\"owedActor\"][\"d1Judge\"], });"))
         .expect("the flags object is served");
     for k in ["readFlag", "d1Judge", "bound"] {
-        assert!(routes[..at].contains(&format!("body[\"owedActor\"][\"{k}\"]=")), "{k}");
+        assert!(
+            routes[..at].contains(&format!("body[\"owedActor\"][\"{k}\"]=")),
+            "{k}"
+        );
     }
-    assert_eq!((READ_FLAG, D1_JUDGE_FLAG), ("OWED_ACTOR_READ", "OWED_D1_JUDGE"));
+    assert_eq!(
+        (READ_FLAG, D1_JUDGE_FLAG),
+        ("OWED_ACTOR_READ", "OWED_D1_JUDGE")
+    );
 }
