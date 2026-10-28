@@ -527,7 +527,7 @@
       "measured": {
         "reads": 3,
         "writes": 0,
-        "stmts": 3,
+        "stmts": 4,
         "maxReads": 1
       },
       "ceiling": {
