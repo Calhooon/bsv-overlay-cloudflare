@@ -165,6 +165,18 @@ fn export_record_door_fixture() {
     db.conn
         .execute_batch("COMMIT; DELETE FROM owed_dirty")
         .unwrap();
+    // D2-ACTOR-A-FOLD-4: certified as the overlay's boot certifies its list, so the app layer's publish gate
+    // (`owed_events::configured`, the lens's LOW-1) opens and the door enqueues; an uncertified fixture kept the
+    // inline judge (the cell's red `judge;desc=detached`, first reached once the route cell went green)
+    db.conn
+        .execute(
+            bsv_overlay_cloudflare::d1::MIGRATION_CERTIFY_SQL,
+            rusqlite::params![
+                bsv_overlay_cloudflare::d1::OVERLAY_MIGRATION_COUNT as f64,
+                bsv_overlay_cloudflare::d1::migration_list_fingerprint() as f64
+            ],
+        )
+        .unwrap();
     let mut hand = Hand::new(15);
     let mut tx = bsv_rs::transaction::Transaction::new();
     tx.add_input(bsv_rs::transaction::TransactionInput {
