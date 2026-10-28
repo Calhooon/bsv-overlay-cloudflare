@@ -967,6 +967,9 @@ async fn ingest_frame(env: &worker::Env, frame: &Value) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?
         .is_some();
+    // D2-ACTOR-A-DELTA-3's LOW-1: the write noted its `word` pair; this very message routes that pair next, so the
+    // note is taken back (it was left in the isolate's notes, re-sent by a later continuation).
+    publish::forget("word", &txid);
     if !held {
         crate::tracker_host::runtime::note_unheld();
     }
