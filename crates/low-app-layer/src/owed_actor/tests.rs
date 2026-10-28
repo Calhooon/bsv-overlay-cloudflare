@@ -256,6 +256,8 @@ async fn d1_judge(f: &Fixture) -> SqliteSql {
 
 async fn actor_judge(record: &SqliteSql, identity: &str) -> (SqliteSql, Vec<ApplyReport>) {
     let local = mirror();
+    // the record's clock (a pin that moves it judges both sides at one time)
+    local.now.set(record.now.get());
     let mut reports = Vec::new();
     for chunk in games_of(record, identity).chunks(GAMES_PER_APPLY) {
         let (r, _) = apply(
@@ -5517,5 +5519,641 @@ async fn d2_actor_d_d_the_consumers_per_event_wall_before_and_after() {
     assert!(
         after.quantile(0.5) < before.quantile(0.5),
         "the consumer's per-event wall falls"
+    );
+}
+
+// ---- D2-ACTOR-B-FOLD-9 (bsv-low #953): a courier-found spend is durable evidence the actor reaches ----
+
+const FOLD9_HOP: &str = "b900000000000000000000000000000000000000000000000000000000000000";
+
+/// The stranger's spend of the hop (a P2PKH that pays none of the seat's homes), its raw bytes and txid.
+fn fold9_spend(hop: &str) -> (bsv_rs::transaction::Transaction, String) {
+    use bsv_rs::script::LockingScript;
+    use bsv_rs::transaction::{Transaction, TransactionInput, TransactionOutput};
+    let mut spend = Transaction::new();
+    spend
+        .add_input(TransactionInput::new(hop.to_string(), 0))
+        .unwrap();
+    spend
+        .add_output(TransactionOutput {
+            satoshis: Some(20_000),
+            locking_script: LockingScript::from_hex(&format!("76a914{}88ac", "11".repeat(20)))
+                .unwrap(),
+            change: false,
+        })
+        .unwrap();
+    let id = spend.id();
+    (spend, id)
+}
+
+/// beta's traced hop (#953, record 1484) as the record holds it after the fold, three hours after the belt's find:
+/// the index row of the hop unspent and naming no spender, the memo aged out and swept, the find's durable trace the
+/// EVIDENCE row (`<hop>:0`) and the spender's bytes (keyed by the spender's txid), the spender SEEN. The byte-identity
+/// pin's fixtures gain it ([`all_fixtures`] does not: its frozen set is the walk's; this pin runs it beside them).
+fn fold9_fixture() -> Fixture {
+    let made = (NOW_MS / 1000) as i64 - 4 * 3_600;
+    let found = NOW_MS as i64 - 3 * 3_600_000;
+    let (spend, s) = fold9_spend(FOLD9_HOP);
+    let bytes = crate::owed::StoredSpenderBytes::from_parts(
+        &crate::routes::spender_inputs_of(&spend),
+        &crate::routes::spender_outputs_of(&spend),
+    )
+    .to_json_capped()
+    .unwrap();
+    Fixture {
+        name: "fold9 courier-found spend, memo expired",
+        seed: vec![
+            format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{FOLD9_HOP}',0,0,{made},'p2pkh')"),
+            format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('owner','other','{}',0,20190,'seat','00','00',2,'{FOLD9_HOP}',1,{made},1)", h("9f", 1)),
+            format!("INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES ('{FOLD9_HOP}:0',{found},1,'{s}',1,{})", TIP - 18),
+            format!("INSERT INTO owed_spender_bytes(txid,bytesJson,createdAtMs) VALUES ('{s}','{bytes}',{found})"),
+            format!("INSERT INTO network_seen(txid,seenAt) VALUES ('{s}',{})", found / 1000),
+        ],
+        identities: vec!["owner".into()],
+    }
+}
+
+fn fold9_row(
+    db: &SqliteSql,
+    outpoint: &str,
+) -> Option<(String, Option<i64>, Value, Option<String>)> {
+    db.conn
+        .query_row(
+            "SELECT family,claimable,facts,reason FROM owed_rows WHERE identity='owner' AND outpoint=?1",
+            [outpoint],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    serde_json::from_str(&r.get::<_, String>(2)?).unwrap(),
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .ok()
+}
+
+/// What the finding compares of the row: its family, claim, the chain's spender, the spend's kind, its confirmation
+/// and the reason.
+fn fold9_judgement(r: &(String, Option<i64>, Value, Option<String>)) -> Value {
+    json!([
+        r.0,
+        r.1,
+        r.2["chainProbe"],
+        r.2["chainSpender"],
+        r.2["spendKind"],
+        r.2["spentConfirmed"],
+        r.3
+    ])
+}
+
+/// The belt finds the stranded hop spent by a stranger (Phase A), the clock passes the memo's two hours and the
+/// overlay's TTL sweep runs (the shipped statement): answers the D1 record and the spender's txid.
+async fn fold9_found() -> (WithActor, String) {
+    let w = WithActor {
+        d1: d1_judge(&stranded()).await,
+        actor: mirror(),
+        d1_judges: true,
+        event: None,
+        actor_reads: false,
+        actor_fails: Cell::new(false),
+    };
+    let hop = format!("{STRANDED_HOP}:0");
+    let due: i64 =
+        w.d1.conn
+            .query_row(
+                "SELECT beltDueAtMs FROM owed_rows WHERE identity='owner' AND outpoint=?1",
+                [&hop],
+                |r| r.get(0),
+            )
+            .unwrap();
+    let at = due as u64 + 1;
+    w.d1.now.set(at);
+    w.actor.now.set(at);
+    let (spend, spender) = fold9_spend(STRANDED_HOP);
+    let courier = Couriers {
+        answers: vec![
+            (
+                format!("{STRANDED_HOP}/0/spent"),
+                (
+                    200,
+                    json!({"txid": spender, "vin": 0, "status": "confirmed"})
+                        .to_string()
+                        .into_bytes(),
+                ),
+            ),
+            (
+                format!("tx/{spender}/hex"),
+                (200, hex::encode(spend.to_binary()).into_bytes()),
+            ),
+        ],
+        ..Default::default()
+    };
+    crate::owed_events_publish::drain();
+    let report = crate::owed_belt::tick(&w, &courier).await.unwrap();
+    assert!(
+        report.write_faults.is_empty() && report.found >= 1,
+        "{report:?}"
+    );
+    (w, spender)
+}
+
+/// Past the memo's window: the overlay's TTL sweep, as its pass binds it.
+fn fold9_expire(db: &SqliteSql) -> usize {
+    let later = db.now.get() + 3 * 3_600_000;
+    db.now.set(later);
+    db.conn
+        .execute(
+            bsv_overlay_cloudflare::hop_probe_memos::HOP_PROBE_MEMO_EXPIRE_SQL,
+            [later as i64 - bsv_overlay_cloudflare::hop_probe_memos::HOP_PROBE_MEMO_TTL_MS],
+        )
+        .unwrap()
+}
+
+fn fold9_probe(db: &SqliteSql, key: &str) -> Option<Value> {
+    db.conn
+        .query_row(
+            "SELECT json_array(spent,spendingTxid,spentConfirmed,tipHeight) FROM hop_chain_probes WHERE outpoint=?1",
+            [key],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .map(|s| serde_json::from_str(&s).unwrap())
+}
+
+/// (a) THE FIND IS DURABLE EVIDENCE keyed by the spent outpoint: beside the spender's bytes the belt writes
+/// `hop_chain_probes` `<hop>:0` with `spent`, `spendingTxid`, `spentConfirmed` and `tipHeight`; the overlay's TTL
+/// sweep takes the memo (`<hop>.0`) and leaves the evidence while the hop's index row stands, and takes it once the
+/// index row is gone. RED on `046b721e`: no evidence row is written (`left: None`).
+#[tokio::test]
+async fn fold9_a_the_find_is_durable_evidence_keyed_by_the_spent_outpoint() {
+    let (w, spender) = fold9_found().await;
+    let evidence = format!("{STRANDED_HOP}:0");
+    assert_eq!(
+        fold9_probe(&w.d1, &evidence),
+        Some(json!([1, spender, 1, TIP])),
+        "the evidence row"
+    );
+    assert!(fold9_probe(&w.d1, &format!("{STRANDED_HOP}.0")).is_some());
+    assert!(fold9_expire(&w.d1) >= 1, "the memo is swept");
+    assert!(fold9_probe(&w.d1, &format!("{STRANDED_HOP}.0")).is_none());
+    assert_eq!(
+        fold9_probe(&w.d1, &evidence),
+        Some(json!([1, spender, 1, TIP])),
+        "the evidence outlives the memo while the index row stands"
+    );
+    w.d1.conn
+        .execute_batch(&format!(
+            "DELETE FROM pot_records WHERE txid='{STRANDED_HOP}' AND outputIndex=0"
+        ))
+        .unwrap();
+    fold9_expire(&w.d1);
+    assert!(
+        fold9_probe(&w.d1, &evidence).is_none(),
+        "an evicted hop's evidence ages out as a memo"
+    );
+    // A look that finds the outpoint unspent retires it.
+    let find = crate::owed_belt::Find {
+        cleared: vec![evidence.clone()],
+        ..Default::default()
+    };
+    w.d1.conn
+        .execute(
+            "INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid) VALUES (?1,1,1,'x')",
+            [&evidence],
+        )
+        .unwrap();
+    w.d1.run_batch(find.statements(w.d1.now.get() as i64))
+        .await
+        .unwrap();
+    assert!(fold9_probe(&w.d1, &evidence).is_none());
+}
+
+/// (b) THE CLOSURE REACHES THE BYTES by the input outpoint: an actor bootstrapped AFTER the memo's expiry copies the
+/// evidence row (the hop's txid's probe range) and, through the spender it names, the spender's bytes into its mirror.
+/// RED on `046b721e`: the mirror holds no `owed_spender_bytes` row.
+#[tokio::test]
+async fn fold9_b_the_closure_reaches_the_spenders_bytes_by_the_input_outpoint() {
+    let (w, spender) = fold9_found().await;
+    fold9_expire(&w.d1);
+    let (local, _) = actor_judge(&w.d1, "owner").await;
+    let held = |sql: &str| -> i64 { local.conn.query_row(sql, [&spender], |r| r.get(0)).unwrap() };
+    assert_eq!(
+        held("SELECT COUNT(*) FROM hop_chain_probes WHERE spendingTxid=?1"),
+        1,
+        "the evidence in the mirror"
+    );
+    assert_eq!(
+        held("SELECT COUNT(*) FROM owed_spender_bytes WHERE txid=?1"),
+        1,
+        "the spender's bytes in the mirror"
+    );
+}
+
+/// (c) THE FIND IS AN EVENT: it marks the subject's game (`hop`, the row's outpoint, a downgrade: it carries a
+/// spend) in the find's own batch and notes the pair for the tick's publish, so a bootstrapped actor re-judges on it in
+/// every phase. In Phase A the D1 judge reads the find in that batch and acknowledges the mark there (D-H1 (c); the
+/// actor is called directly after); in Phase C there is no D1 judge, so the mark stands for the consumer to carry to
+/// the actor. RED on `046b721e`: no mark, no note.
+#[tokio::test]
+async fn fold9_c_the_find_marks_its_game_and_publishes_its_pair() {
+    let key = format!("{STRANDED_HOP}:0");
+    let mark_of = |db: &SqliteSql| -> Option<(String, i64)> {
+        db.conn
+            .query_row(
+                "SELECT gameId,downgrade FROM owed_dirty WHERE identity='owner' AND source='hop' AND sourceKey=?1",
+                [&key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()
+    };
+    // Phase A: acknowledged in the find's own judge batch.
+    let (a, _) = fold9_found().await;
+    assert_eq!(mark_of(&a.d1), None, "Phase A: judged in its own batch");
+    assert!(
+        crate::owed_events_publish::snapshot()
+            .iter()
+            .any(|n| n.source == "hop" && n.key == key),
+        "the find's pair is noted for the publish"
+    );
+    // Phase C: no D1 judge; the mark stands for the consumer.
+    let w = WithActor {
+        d1: seeded(&stranded()),
+        actor: mirror(),
+        d1_judges: false,
+        event: None,
+        actor_reads: false,
+        actor_fails: Cell::new(false),
+    };
+    crate::owed_events::deliver(&w, "owner", &games_of(&w.d1, "owner"))
+        .await
+        .unwrap();
+    let (_, _, due) = asks_of(&w.d1)
+        .into_iter()
+        .find(|(n, _, _)| *n == crate::owed_belt::ask_name("owner", &key))
+        .unwrap();
+    w.d1.now.set(due as u64 + 1);
+    w.actor.now.set(due as u64 + 1);
+    let (spend, spender) = fold9_spend(STRANDED_HOP);
+    let courier = Couriers {
+        answers: vec![
+            (
+                format!("{STRANDED_HOP}/0/spent"),
+                (
+                    200,
+                    json!({"txid": spender, "vin": 0, "status": "confirmed"})
+                        .to_string()
+                        .into_bytes(),
+                ),
+            ),
+            (
+                format!("tx/{spender}/hex"),
+                (200, hex::encode(spend.to_binary()).into_bytes()),
+            ),
+        ],
+        ..Default::default()
+    };
+    crate::owed_events_publish::drain();
+    let report = crate::owed_belt::tick(&w, &courier).await.unwrap();
+    assert!(report.found >= 1 && report.handed_back >= 1, "{report:?}");
+    assert_eq!(
+        mark_of(&w.d1),
+        Some((h("9a", 0), 1)),
+        "Phase C: the find's mark stands for the consumer"
+    );
+    assert!(crate::owed_events_publish::snapshot()
+        .iter()
+        .any(|n| n.source == "hop" && n.key == key));
+}
+
+/// (d) BYTE-IDENTITY AFTER THE MEMO'S EXPIRY: over the same durable find, the D1 judge and an actor bootstrapped
+/// afterwards store the same row: family `unbound`, the same `chainSpender`, `spendKind`, `spentConfirmed`, reason;
+/// over the find made under the fold and over the fixture shaped as the record holds it, whole rows byte for byte.
+/// RED on `046b721e`: the actor answers `hop-stranded` claimable there.
+#[tokio::test]
+async fn fold9_d_both_judges_agree_on_the_found_spend_after_the_memos_expiry() {
+    let (w, spender) = fold9_found().await;
+    let key = format!("{STRANDED_HOP}:0");
+    let at_find = fold9_row(&w.d1, &key).unwrap();
+    assert_eq!(at_find.0, "unbound", "{at_find:?}");
+    assert_eq!(at_find.2["chainSpender"], json!(spender));
+    fold9_expire(&w.d1);
+    let (local, _) = actor_judge(&w.d1, "owner").await;
+    let actor = fold9_row(&local, &key).unwrap();
+    assert_eq!(
+        fold9_judgement(&actor),
+        fold9_judgement(&at_find),
+        "actor {actor:?}"
+    );
+    for chunk in games_of(&w.d1, "owner").chunks(16) {
+        crate::owed_judge::judge_subjects(&w.d1, "owner", chunk, "d1")
+            .await
+            .unwrap();
+    }
+    let d1 = fold9_row(&w.d1, &key).unwrap();
+    assert_eq!(fold9_judgement(&d1), fold9_judgement(&at_find), "d1 {d1:?}");
+    assert_eq!(stored(&local, "owner"), stored(&w.d1, "owner"));
+    // The fixture as the record holds it (the finding's shape), whole rows.
+    let f = fold9_fixture();
+    let d1 = d1_judge(&f).await;
+    let (local, _) = actor_judge(&d1, "owner").await;
+    let hop = format!("{FOLD9_HOP}:0");
+    let row = fold9_row(&d1, &hop).unwrap();
+    assert_eq!(
+        (row.0.as_str(), row.1, row.2["chainProbe"].clone()),
+        ("unbound", None, json!("spent")),
+        "{row:?}"
+    );
+    assert_eq!(stored(&local, "owner"), stored(&d1, "owner"));
+}
+
+/// (e) THE RECONCILE READS ZERO DIFFERING: D1's rows judged at the find, the memo swept, an actor bootstrapped
+/// afterwards, the sampled digest compare of that identity (Phase A) finds no diff and re-applies nothing. RED on
+/// `046b721e`: `RECONCILE DIFF owner` (the actor's `hop-stranded` against D1's `unbound`).
+#[tokio::test]
+async fn fold9_e_the_reconcile_reads_zero_outpoints_differing() {
+    let (found, _) = fold9_found().await;
+    // D1's rows of every game judged at the find (the finding's D1 side), then the memo gone (swept at the TTL's
+    // bound) and the actor bootstrapped, at one clock: the digest then compares the judgement alone (a row's
+    // `spenderPresence.at` is a clock fact the digest keeps, so a later clock differs on rows this pin is not about).
+    for chunk in games_of(&found.d1, "owner").chunks(16) {
+        crate::owed_judge::judge_subjects(&found.d1, "owner", chunk, "d1")
+            .await
+            .unwrap();
+    }
+    let now = found.d1.now.get();
+    found
+        .d1
+        .conn
+        .execute(
+            bsv_overlay_cloudflare::hop_probe_memos::HOP_PROBE_MEMO_EXPIRE_SQL,
+            [now as i64],
+        )
+        .unwrap();
+    assert!(fold9_probe(&found.d1, &format!("{STRANDED_HOP}.0")).is_none());
+    let (local, _) = actor_judge(&found.d1, "owner").await;
+    let w = WithActor {
+        d1: found.d1,
+        actor: local,
+        d1_judges: true,
+        event: None,
+        actor_reads: false,
+        actor_fails: Cell::new(false),
+    };
+    let r = reconcile_step(&w, w.d1.now.get() as i64)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (r.identity.as_str(), r.diff, r.reapplied, r.no_actor),
+        ("owner", false, 0, false),
+        "{r:?}"
+    );
+}
+
+/// (f) THE SWEEPS OF OLD MEMOS ARE NOT THE EVIDENCE'S: the overlay's TTL sweep at any age and the moved-latch delete
+/// (`PROOF_LATCH_MOVED_DELETE_SQL`, its keys `proofmined:` latches) leave a find row whose index row stands; the
+/// memos beside it go. RED on `046b721e`: the TTL sweep deletes the evidence row.
+#[tokio::test]
+async fn fold9_f_the_sweeps_of_old_memos_leave_the_find_rows() {
+    let d1 = seeded(&fold9_fixture());
+    let evidence = format!("{FOLD9_HOP}:0");
+    d1.conn
+        .execute(
+            "INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed) VALUES (?1,1,1,?2,1)",
+            [format!("{FOLD9_HOP}.0"), h("c1", 1)],
+        )
+        .unwrap();
+    d1.conn
+        .execute(
+            "INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed) VALUES (?1,1,1,?2,1)",
+            [format!("{}:3", h("d1", 1)), h("c1", 2)],
+        )
+        .unwrap();
+    let swept = d1
+        .conn
+        .execute(
+            bsv_overlay_cloudflare::hop_probe_memos::HOP_PROBE_MEMO_EXPIRE_SQL,
+            [i64::MAX],
+        )
+        .unwrap();
+    assert_eq!(
+        swept, 2,
+        "the memo and the evidence of an unindexed outpoint"
+    );
+    let spender = fold9_probe(&d1, &evidence).unwrap()[1]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A moved proof latch of the same spender: the judge's pass reads the memos (the find row among them, as the
+    // hydrate hands them), and the shipped decision names the `proofmined:` key alone; its delete runs.
+    let latch = format!(
+        "{}{spender}.{}",
+        crate::owed::PROOF_MINED_LATCH_PREFIX,
+        TIP - 18
+    );
+    d1.conn
+        .execute(
+            "INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed) VALUES (?1,1,1,?2,1)",
+            [latch.clone(), "aa".repeat(32)],
+        )
+        .unwrap();
+    let memos: Vec<crate::hops_view::ProbeMemo> = [
+        (latch.clone(), "aa".repeat(32)),
+        (evidence.clone(), spender.clone()),
+    ]
+    .into_iter()
+    .map(|(outpoint, txid)| crate::hops_view::ProbeMemo {
+        outpoint,
+        probed_at_ms: 1,
+        spent: true,
+        spending_txid: Some(txid),
+        spent_confirmed: Some(true),
+        tip_height: None,
+    })
+    .collect();
+    let latches = crate::owed::proof_latches_of(std::slice::from_ref(&spender), &memos);
+    let canonical = std::collections::HashMap::from([(TIP - 18, Some("bb".repeat(32)))]);
+    let moved = crate::owed::moved_proof_latches(&latches, &canonical);
+    assert_eq!(moved, vec![(latch.clone(), "aa".repeat(32))]);
+    d1.conn
+        .execute(
+            crate::owed::PROOF_LATCH_MOVED_DELETE_SQL,
+            [crate::owed::moved_proof_latch_delete_bind(&moved).unwrap()],
+        )
+        .unwrap();
+    assert!(
+        fold9_probe(&d1, &latch).is_none(),
+        "the moved latch is gone"
+    );
+    assert!(fold9_probe(&d1, &evidence).is_some(), "the find row stands");
+}
+
+/// (j) THE STANDING FINDS (made before the fold: memo swept, the spender's bytes their only trace, keyed by the
+/// spender's txid) are seeded ONCE by the age repair: the hop's evidence row naming the spender, the seat's game
+/// marked (`hop`, a downgrade), the cursor `~` after a short page; a second pass writes nothing; then both judges
+/// serve the spend. A hop the index holds spent, or one with evidence already, is left.
+#[tokio::test]
+async fn fold9_j_the_standing_finds_are_seeded_once() {
+    let mut f = fold9_fixture();
+    f.seed
+        .retain(|s| !s.starts_with("INSERT INTO hop_chain_probes"));
+    let d1 = seeded(&f);
+    let hop = format!("{FOLD9_HOP}:0");
+    assert!(fold9_probe(&d1, &hop).is_none());
+    let first = crate::owed_backfill::age_repair(&d1).await.unwrap();
+    assert_eq!(
+        (
+            first.find_evidence_seeded,
+            first.find_evidence_cursor.as_deref()
+        ),
+        (1, Some(crate::owed_backfill::EVICTIONS_DONE))
+    );
+    let (_, s) = fold9_spend(FOLD9_HOP);
+    assert_eq!(fold9_probe(&d1, &hop), Some(json!([1, s, null, null])));
+    let marked: i64 = d1
+        .conn
+        .query_row(
+            "SELECT downgrade FROM owed_dirty WHERE identity='owner' AND source='hop' AND sourceKey=?1",
+            [&hop],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(marked, 1);
+    let second = crate::owed_backfill::age_repair(&d1).await.unwrap();
+    assert_eq!(second.find_evidence_seeded, 0);
+    for chunk in games_of(&d1, "owner").chunks(16) {
+        crate::owed_judge::judge_subjects(&d1, "owner", chunk, "d1")
+            .await
+            .unwrap();
+    }
+    let (local, _) = actor_judge(&d1, "owner").await;
+    let row = fold9_row(&d1, &hop).unwrap();
+    assert_eq!(
+        (row.0.as_str(), row.2["chainSpender"].clone()),
+        ("unbound", json!(s))
+    );
+    assert_eq!(stored(&local, "owner"), stored(&d1, "owner"));
+}
+
+/// A record port that counts what it answers (the rows the copy reads back, the statements).
+struct Counting<'a>(&'a SqliteSql, Cell<usize>, Cell<usize>);
+impl SqlPort for Counting<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        self.2.set(self.2.get() + stmts.len());
+        let out = self.0.run_batch(stmts).await?;
+        self.1
+            .set(self.1.get() + out.iter().map(|o| o.rows.len()).sum::<usize>());
+        Ok(out)
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.0.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.0.log(l);
+    }
+}
+
+/// (h) THE COST, measured on FOLD-7's 600-game chained seat: one steady-state apply of one game after the bootstrap,
+/// the record's rows answered and statements, and the mirror's statements (the evidence read is the judge's, on the
+/// mirror: one key read per 90 hops). Printed for the REPORT; the record's side is bounded as FOLD-7's.
+#[tokio::test]
+async fn fold9_h_the_rows_read_per_apply_on_the_600_game_seat() {
+    let f = fold7_chained_seat(600);
+    let record = seeded(&f);
+    let games = games_of(&record, "owner");
+    let local = mirror();
+    for chunk in games.chunks(GAMES_PER_APPLY) {
+        apply(
+            &record,
+            &local,
+            &Fakes,
+            "owner",
+            chunk,
+            Some(("bootstrap", 1)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let counted = Counting(&record, Cell::new(0), Cell::new(0));
+    let before = local.stmts.get();
+    apply(
+        &counted,
+        &local,
+        &Fakes,
+        "owner",
+        &games[300..301],
+        Some(("pot", 2)),
+        Some(TIP),
+        None,
+    )
+    .await
+    .unwrap();
+    eprintln!(
+        "fold9_h: one apply of one game of 600: record rows answered {}, record statements {}, mirror statements {}",
+        counted.1.get(),
+        counted.2.get(),
+        local.stmts.get() - before
+    );
+}
+
+/// (g) THE RECONCILE'S RE-APPLY KEEPS THE JUDGED TIP (bsv-low #953 item 6, the captain's ruling; beta's identity
+/// 0247bf52..: every one of its eleven differing rows rewritten by the reconcile's re-apply at 16:49:16Z as
+/// `tipUnknown`, the reason "the chain tip is unavailable"): a bootstrapped actor whose rows were judged at tip T,
+/// re-applied through the object's own path (`apply_or_hold`) by a body that carries NO tip, judges at its held tip
+/// T: every row unchanged, none `tipUnknown`. And the belt's port sends the served tip on every apply, the reconcile's
+/// included. RED on `171d1ca3`: the stranded hop's row rewritten `tipUnknown: true`, `snapshotTip: null`.
+#[tokio::test]
+async fn fold9_g_a_reconcile_reapply_keeps_the_judged_tip() {
+    let record = seeded(&stranded());
+    let local = mirror();
+    let turn = futures_util::lock::Mutex::new(());
+    fold7_bootstrap(&turn, &record, &local, "owner").await;
+    let before = stored(&local, "owner");
+    assert!(!before.is_empty());
+    assert!(
+        before.iter().all(|r| !r.contains("tipUnknown")),
+        "{before:?}"
+    );
+    let games = games_of(&record, "owner");
+    let ev = HeldEvent {
+        kind: Some("reconcile".into()),
+        seq: None,
+        games: games.clone(),
+        at_ms: Some(NOW_MS),
+        mined: false,
+        tip: None,
+        held_at_ms: NOW_MS,
+        bound: None,
+    };
+    let applied = apply_or_hold(&turn, &record, &local, &Fakes, "owner", &ev, None, false)
+        .await
+        .unwrap();
+    assert!(matches!(applied, Applied::Done(..)), "{applied:?}");
+    let after = stored(&local, "owner");
+    assert!(
+        after.iter().all(|r| !r.contains("tipUnknown")),
+        "a tipless re-apply wrote tip-unknown over judged rows: {:?}",
+        after.iter().find(|r| r.contains("tipUnknown"))
+    );
+    assert_eq!(after, before, "judged at the held tip, every row unchanged");
+    // A never-judged actor with no tip anywhere: nothing held.
+    assert_eq!(held_tip(&mirror(), "owner").await, None);
+    assert_eq!(held_tip(&local, "owner").await, Some(TIP));
+    // The belt's port: every apply carries the served tip; the reconcile's judge is built with it.
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let judge = squash(include_str!("../owed_judge.rs"));
+    assert!(judge.contains(&squash(
+        "None => crate::owed_events::tip_memoised(&self.sql.env, false).await,"
+    )));
+    let belt = squash(include_str!("../owed_belt.rs"));
+    let reconcile = &belt[belt.find("pubasyncfnreconcile_env(").unwrap()..];
+    assert!(
+        reconcile[..reconcile.find("reconcile_step(").unwrap()].contains("tip_memoised(env,false)")
     );
 }

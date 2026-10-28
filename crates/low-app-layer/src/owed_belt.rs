@@ -100,6 +100,12 @@ pub const DUE_GAUGE_SQL: &str = "INSERT INTO ops_counters(name,value) SELECT 'ow
 /// a candidate), its `tickedAtMs` the due time. The belt singleton STAYS the only thing that asks a courier: it reads
 /// the asks at its cadence through its one gate, writes the find's facts to the record and hands the find back to the
 /// actor as a `belt-find` event (the actor's closure re-reads them and re-publishes its asks).
+/// bsv-low #953: a find's dirty mark, the `hop` source keyed by the row's outpoint (the pair `owed_events` routes and
+/// [`READ_HOP_SQL`](crate::owed_events_publish::READ_HOP_SQL) reads), class `?5` (1 when it carries evidence of a
+/// spend: the read withholds the game's presses until the judge has read it), the trigger's conflict rule.
+pub const FIND_MARK_SQL: &str = "INSERT INTO owed_dirty (identity,gameId,source,sourceKey,markedAtMs,downgrade) VALUES (?1,?2,'hop',?3,?4,?5) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,source=excluded.source,sourceKey=excluded.sourceKey,markedAtMs=excluded.markedAtMs,downgrade=MAX(owed_dirty.downgrade,excluded.downgrade)";
+/// #953: the find's pair's source.
+pub const FIND_MARK_SOURCE: &str = "hop";
 pub const BELT_ASK_PREFIX: &str = "belt-ask:";
 /// The asks' range ends before `belt-ask;` (`;` follows `:`).
 pub const BELT_ASK_END: &str = "belt-ask;";
@@ -311,6 +317,14 @@ pub fn ask_of(c: &Candidate) -> Option<Ask> {
 #[derive(Debug, Default, Clone)]
 pub struct Find {
     pub memos: Vec<ProbeMemo>,
+    /// bsv-low #953: the durable evidence of a spend the look found, keyed by the spent outpoint
+    /// (`hops_view::probe_evidence_key`): never aged out while the outpoint's index row stands.
+    pub evidence: Vec<ProbeMemo>,
+    /// #953: the evidence keys a look that found the outpoint UNSPENT retires.
+    pub cleared: Vec<String>,
+    /// #953: the subject the find marks dirty and the pair it publishes (`identity`, `gameId`, the row's outpoint):
+    /// a find is an event, so a bootstrapped actor re-judges on it in every phase.
+    pub subject: Option<(String, String, String)>,
     pub bytes: Vec<(String, StoredSpenderBytes)>,
     pub hop_words: Vec<(String, HopChainWord)>,
     pub proven: Vec<String>,
@@ -319,6 +333,36 @@ pub struct Find {
 impl Find {
     fn is_empty(&self) -> bool {
         self.memos.is_empty() && self.bytes.is_empty() && self.home_words.is_empty()
+    }
+    /// #953: the find's dirty mark (`hop`, the row's outpoint): a downgrade when it carries evidence of a spend.
+    pub fn mark(&self, now_ms: i64) -> Option<Stmt> {
+        let (identity, game, outpoint) = self.subject.as_ref()?;
+        Some(Stmt {
+            sql: FIND_MARK_SQL.into(),
+            binds: vec![
+                Bind::Text(identity.to_ascii_lowercase()),
+                Bind::Text(game.clone()),
+                Bind::Text(outpoint.to_ascii_lowercase()),
+                Bind::Int(now_ms),
+                Bind::Int(i64::from(!self.evidence.is_empty())),
+            ],
+        })
+    }
+    /// #953: the find's mark as the judge's own (the D1 judge that reads the find in its batch acknowledges it).
+    pub fn owned_mark(&self) -> Vec<owed_judge::FilingMark> {
+        self.subject
+            .iter()
+            .map(|(_, _, outpoint)| owed_judge::FilingMark {
+                source: FIND_MARK_SOURCE.into(),
+                source_key: outpoint.to_ascii_lowercase(),
+            })
+            .collect()
+    }
+    /// #953: note the find's pair for the invocation's publish (the frame every writer sends).
+    pub fn note(&self) {
+        if let Some((_, _, outpoint)) = &self.subject {
+            crate::owed_events_publish::note(FIND_MARK_SOURCE, outpoint);
+        }
     }
     pub fn statements(&self, now_ms: i64) -> Vec<Stmt> {
         let mut out = Vec::new();
@@ -336,6 +380,26 @@ impl Find {
                 ],
             });
         }
+        for m in &self.evidence {
+            out.push(Stmt {
+                sql: crate::hops_view::PROBE_MEMO_UPSERT_SQL.into(),
+                binds: vec![
+                    Bind::Text(m.outpoint.clone()),
+                    Bind::Int(m.probed_at_ms),
+                    Bind::Int(i64::from(m.spent)),
+                    m.spending_txid.clone().map_or(Bind::Null, Bind::Text),
+                    m.spent_confirmed
+                        .map_or(Bind::Null, |c| Bind::Int(i64::from(c))),
+                    m.tip_height.map_or(Bind::Null, |t| Bind::Int(t as i64)),
+                ],
+            });
+        }
+        for k in &self.cleared {
+            out.push(Stmt {
+                sql: crate::hops_view::PROBE_EVIDENCE_CLEAR_SQL.into(),
+                binds: vec![Bind::Text(k.clone())],
+            });
+        }
         for (txid, bytes) in &self.bytes {
             if let Some(json) = bytes.to_json_capped() {
                 out.push(Stmt {
@@ -348,6 +412,7 @@ impl Find {
                 });
             }
         }
+        out.extend(self.mark(now_ms));
         out
     }
     /// The same facts the statements write, into the judge's hydrated inputs.
@@ -401,6 +466,16 @@ fn probe_find(
                 predates_tip: false,
             },
         ));
+        // bsv-low #953: a spend is durable evidence keyed by the spent outpoint; an unspent answer retires it.
+        if memo.spent {
+            find.evidence.push(ProbeMemo {
+                outpoint: crate::hops_view::probe_evidence_key(txid, vout),
+                ..memo.clone()
+            });
+        } else {
+            find.cleared
+                .push(crate::hops_view::probe_evidence_key(txid, vout));
+        }
         find.memos.push(memo);
     }
     if let (Some(sp), Some(raw)) = (probe.spending_txid.as_deref(), raw) {
@@ -411,8 +486,21 @@ fn probe_find(
     find
 }
 
-/// The ask of one candidate through the gate. `None`: no rung answered (or the row owes nothing askable).
+/// The ask of one candidate through the gate. `None`: no rung answered (or the row owes nothing askable). The find
+/// names its subject (bsv-low #953: it marks that game and publishes its pair).
 async fn ask<C: Courier>(
+    db: &impl JudgeDb,
+    gate: &Gate<'_, C>,
+    c: &Candidate,
+    now: i64,
+) -> Result<Option<Find>, String> {
+    Ok(ask_inner(db, gate, c, now).await?.map(|mut find| {
+        find.subject = Some((c.identity.clone(), c.game_id.clone(), c.outpoint.clone()));
+        find
+    }))
+}
+
+async fn ask_inner<C: Courier>(
     db: &impl JudgeDb,
     gate: &Gate<'_, C>,
     c: &Candidate,
@@ -481,6 +569,9 @@ async fn ask<C: Courier>(
                 db.tip(),
             );
             find.hop_words.clear();
+            // a home output is no hop: its spend has its own latch, never the hop's evidence
+            find.evidence.clear();
+            find.cleared.clear();
             if let Some((word, latch)) = owed::home_word(&probe, raw.as_deref(), home, now) {
                 find.home_words
                     .push((owed::outpoint_key(&home.sweep_txid, home.vout), word));
@@ -844,6 +935,7 @@ async fn ask_find(
         report.write_faults.push((c.outpoint.clone(), e));
         return rearm_ask(db, c, now, report).await;
     }
+    find.note();
     match db
         .actor_apply(&c.identity, std::slice::from_ref(&c.game_id), "belt-find")
         .await
@@ -888,6 +980,7 @@ async fn phase_b_find(
     now: i64,
 ) -> Result<(), String> {
     db.run_batch(find.statements(now)).await?;
+    find.note();
     // The delta lens's NEW-H1 (a): the acknowledgement's bound is read after the facts' marks and BEFORE the actor
     // reads the record, so a downgrade written while it applies stands for its next apply.
     let bound = owed_judge::marks_bound(db, &c.identity, std::slice::from_ref(&c.game_id)).await?;
@@ -1046,17 +1139,28 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
             Ok(Some(find)) => {
                 let writes = find.statements(now);
                 let identity = c.identity.clone();
-                let judged =
-                    owed_judge::judge_with_write(db, &[subject], "belt", writes, &[], |inputs| {
+                // bsv-low #953: the D1 judge reads the find in this batch, so it acknowledges the find's own mark
+                // here (D-H1 (c): nothing left dirty); the actor is called directly below. In Phase C (no D1 judge)
+                // the mark stands for the consumer to carry to the actor.
+                let owned = find.owned_mark();
+                let judged = owed_judge::judge_with_write(
+                    db,
+                    &[subject],
+                    "belt",
+                    writes,
+                    &owned,
+                    |inputs| {
                         for i in inputs.iter_mut().filter(|i| i.identity == identity) {
                             find.apply(i);
                         }
                         Ok(())
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 match judged {
                     Ok(_) => {
                         report.found += 1;
+                        find.note();
                         // Phase A: the find reaches the actor too (it was judged only in D1 and re-published by
                         // the sweep); its fault is counted, never the find's.
                         match db
@@ -1406,7 +1510,13 @@ pub async fn tick_env(env: &worker::Env) -> Result<TickReport, String> {
         .ok();
     let judge = owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))
         .map_err(|e| e.to_string())?;
-    tick(&judge, &WorkerCourier).await
+    let report = tick(&judge, &WorkerCourier).await;
+    // bsv-low #953: a find is an event: the pairs its writes noted are published as every writer's are (a pair whose
+    // mark a judge already acknowledged is not sent; a publish that does not land leaves the mark to the sweep).
+    if crate::owed_events::configured(env).await {
+        crate::owed_events::publish_noted(env).await;
+    }
+    report
 }
 
 /// The alarm's reconcile step (bsv-low #912): the D1 judge's port (its flag, its actor calls).
@@ -1416,7 +1526,10 @@ pub async fn reconcile_env(
     if env.durable_object(crate::owed_actor::BINDING).is_err() {
         return Ok(None);
     }
-    let judge = owed_judge::D1Judge::new(env, None, crate::routes::written_off_before_ms_env(env))
+    // bsv-low #953 item 6: the reconcile's re-apply carries the served tip (it carried none: its rows were rewritten
+    // tip-unknown).
+    let tip = crate::owed_events::tip_memoised(env, false).await;
+    let judge = owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))
         .map_err(|e| e.to_string())?;
     crate::owed_actor::reconcile_step(&judge, worker::Date::now().as_millis() as i64).await
 }

@@ -231,6 +231,38 @@ pub const MARKER_REPAIR_SQL: &str = concat!(
     " ORDER BY d.txid"
 );
 pub const MARKER_REPAIR_SAVE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:marker-evictions',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+/// bsv-low #953 (D2-ACTOR-B-FOLD-9): the cursor of the one-time seeding of the belt's evidence for the finds made
+/// before the fold (their memos aged out; their only trace the spender's bytes, keyed by the SPENDER's txid): the
+/// last `owed_spender_bytes` txid looked at, [`EVICTIONS_DONE`] once a page came back short.
+pub const FIND_EVIDENCE_SEED: &str = "backfill:owed-v2:find-evidence";
+/// The stored spenders one age repair looks at, by the store's primary key from the cursor.
+pub const FIND_EVIDENCE_SEED_PAGE: usize = 64;
+pub const FIND_EVIDENCE_CURSOR_SQL: &str =
+    "SELECT cursor FROM owed_belt_state WHERE name='backfill:owed-v2:find-evidence'";
+/// The page's extent: its last txid and its size.
+pub const FIND_EVIDENCE_PAGE_SQL: &str = "SELECT MAX(txid) AS last,COUNT(*) AS n FROM (SELECT txid FROM owed_spender_bytes WHERE txid>?1 ORDER BY txid LIMIT ?2)";
+/// The standing finds of a page, as the belt now writes them: each input of a stored spender that is a HOP (a
+/// marker names it) whose index row stands unspent and names no spender (the class the index never saw) gets the
+/// evidence row `<txid>:<vout>` naming that spender (`spentConfirmed` unknown: the bytes carry no block), unless
+/// one stands. A content-addressed spender, hash-checked against its txid before its bytes were kept.
+macro_rules! seed_candidates {
+    () => {
+        "FROM (SELECT txid,bytesJson,createdAtMs FROM owed_spender_bytes WHERE txid>?1 ORDER BY txid LIMIT ?2) b CROSS JOIN json_each(b.bytesJson,'$.inputs') i CROSS JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=lower(json_extract(i.value,'$[0]')) AND hp.hopVout=json_extract(i.value,'$[1]') WHERE json_valid(b.bytesJson) AND EXISTS (SELECT 1 FROM pot_records p WHERE p.txid=hp.txid AND p.outputIndex=hp.hopVout AND p.spent=0 AND p.spendingTxid IS NULL) AND NOT EXISTS (SELECT 1 FROM hop_chain_probes e WHERE e.outpoint=hp.txid||':'||hp.hopVout)"
+    };
+}
+/// The seats of the page's standing finds marked (`hop`, the evidence key; a downgrade), BEFORE the seeding (its
+/// `NOT EXISTS` reads the evidence absent), in the seeding's batch.
+pub const FIND_EVIDENCE_MARK_SQL: &str = concat!(
+    "INSERT INTO owed_dirty (identity,gameId,source,sourceKey,markedAtMs,downgrade) SELECT DISTINCT hp.identity,hp.gameId,'hop',hp.txid||':'||hp.hopVout,strftime('%s','now') * 1000,1 ",
+    seed_candidates!(),
+    " ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs,downgrade=MAX(owed_dirty.downgrade,excluded.downgrade)"
+);
+pub const FIND_EVIDENCE_SEED_SQL: &str = concat!(
+    "INSERT INTO hop_chain_probes (outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) SELECT DISTINCT hp.txid||':'||hp.hopVout,b.createdAtMs,1,b.txid,NULL,NULL ",
+    seed_candidates!(),
+    " ON CONFLICT(outpoint) DO NOTHING"
+);
+pub const FIND_EVIDENCE_SAVE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2:find-evidence',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// Arm the cursor; a pass that finds it armed begins.
 pub const ARM_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('backfill:owed-v2','',?1) ON CONFLICT(name) DO NOTHING";
 /// The identities past the cursor, distinct and ascending, each side bounded on its own identity index.
@@ -983,6 +1015,9 @@ pub struct AgeRepair {
     pub marker_repaired: Vec<String>,
     /// The marker repair's cursor after this pass ([`EVICTIONS_DONE`] once it has looked at every eviction).
     pub marker_cursor: Option<String>,
+    /// bsv-low #953: the evidence rows the seeding wrote this pass, and its cursor after it.
+    pub find_evidence_seeded: u64,
+    pub find_evidence_cursor: Option<String>,
 }
 
 /// The drain's daily re-mark of rows judged more than 24 h ago. Returns the marks written.
@@ -1010,6 +1045,17 @@ pub async fn age_repair(db: &impl SqlPort) -> Result<AgeRepair, String> {
     if let Err(error) = repair_marker_evictions(db, &mut repair).await {
         db.log(&format!(
             "[owed-backfill] the marker repair deferred: {error}"
+        ));
+    }
+    if let Err(error) = seed_find_evidence(db, &mut repair).await {
+        db.log(&format!(
+            "[owed-backfill] the find evidence seeding deferred: {error}"
+        ));
+    }
+    if repair.find_evidence_seeded > 0 {
+        db.log(&format!(
+            "[owed-backfill] find evidence: {} row(s) seeded, cursor {:?}",
+            repair.find_evidence_seeded, repair.find_evidence_cursor
         ));
     }
     if !repair.marker_repaired.is_empty() {
@@ -1194,6 +1240,55 @@ async fn repair_marker_evictions(db: &impl SqlPort, repair: &mut AgeRepair) -> R
     .await?;
     repair.marker_cursor = Some(next);
     flush_evidence_counters(db, &found).await;
+    Ok(())
+}
+
+/// bsv-low #953: the one-time seeding of the belt's evidence for the finds made before the fold, one page of
+/// [`FIND_EVIDENCE_SEED_PAGE`] stored spenders a pass by the store's primary key; the seats marked and the rows
+/// written in one batch with the cursor; `~` once a page comes back short. Done, a pass costs one primary-key read.
+async fn seed_find_evidence(db: &impl SqlPort, repair: &mut AgeRepair) -> Result<(), String> {
+    let cursor = read(db, FIND_EVIDENCE_CURSOR_SQL, vec![])
+        .await?
+        .first()
+        .and_then(|r| r["cursor"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    if cursor == EVICTIONS_DONE {
+        repair.find_evidence_cursor = Some(cursor);
+        return Ok(());
+    }
+    let page_binds = || {
+        vec![
+            Bind::Text(cursor.clone()),
+            Bind::Int(FIND_EVIDENCE_SEED_PAGE as i64),
+        ]
+    };
+    let page = read(db, FIND_EVIDENCE_PAGE_SQL, page_binds()).await?;
+    let n = page.first().and_then(|r| r["n"].as_u64()).unwrap_or(0) as usize;
+    let next = if n < FIND_EVIDENCE_SEED_PAGE {
+        EVICTIONS_DONE.to_owned()
+    } else {
+        page.first()
+            .and_then(|r| r["last"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| EVICTIONS_DONE.to_owned())
+    };
+    let out = db
+        .run_batch(vec![
+            Stmt {
+                sql: FIND_EVIDENCE_MARK_SQL.into(),
+                binds: page_binds(),
+            },
+            Stmt {
+                sql: FIND_EVIDENCE_SEED_SQL.into(),
+                binds: page_binds(),
+            },
+            Stmt {
+                sql: FIND_EVIDENCE_SAVE_SQL.into(),
+                binds: vec![Bind::Text(next.clone()), Bind::Int(db.now_ms() as i64)],
+            },
+        ])
+        .await?;
+    repair.find_evidence_seeded = out.get(1).and_then(|o| o.changes).unwrap_or(0);
+    repair.find_evidence_cursor = Some(next);
     Ok(())
 }
 

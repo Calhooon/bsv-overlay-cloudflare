@@ -448,7 +448,12 @@ impl JudgeDb for D1Judge {
             at_ms: worker::Date::now().as_millis() as i64,
             mined: false,
         };
-        let mut body = crate::owed_actor::apply_body(identity, games, &event, self.tip);
+        // bsv-low #953 item 6: every apply the belt's port makes carries the served tip (the consumer's own).
+        let tip = match self.tip {
+            Some(t) => Some(t),
+            None => crate::owed_events::tip_memoised(&self.sql.env, false).await,
+        };
+        let mut body = crate::owed_actor::apply_body(identity, games, &event, tip);
         body["seq"] = Value::Null;
         crate::owed_actor::object::call_apply(
             &self.sql.env,
