@@ -26,6 +26,18 @@ const META_JUDGED_AT: &str = "judgedAtMs";
 const META_IDENTITY: &str = "identity";
 const META_BOOTSTRAPPED: &str = "bootstrapped";
 const META_BOOT_CURSOR: &str = "bootCursor";
+/// MEDIUM-4: the last tip the tip alarm judged (its next window is `(tipJudged, tip]`).
+const META_TIP_JUDGED: &str = "tipJudged";
+/// LOW-6: the bootstrap's first keyset cursor (`[at, gameId]` of the last page; this one precedes every game).
+pub const BOOT_CURSOR_START: &str = "[9223372036854775807,\"\"]";
+/// The bootstrap's keyset from its stored cursor (anything that is not one, the HIGH-4 re-arm's `0` included, is
+/// the start).
+pub fn boot_keyset(cursor: Option<&str>) -> (i64, String) {
+    cursor
+        .and_then(|c| serde_json::from_str::<Value>(c).ok())
+        .and_then(|v| Some((v.get(0)?.as_i64()?, v.get(1)?.as_str()?.to_string())))
+        .unwrap_or((i64::MAX, String::new()))
+}
 
 /// The actor's SQLite as a [`SqlPort`]. Each statement runs synchronously (`ctx.storage.sql.exec`): a batch runs in
 /// one turn of the object's event loop, so its writes commit together (the platform's write coalescing); a
@@ -116,7 +128,7 @@ pub fn schema_plan(held_digest: Option<&str>) -> Vec<String> {
     out.extend(mirror_ddl());
     if held_digest.is_some() {
         out.push(format!(
-            "DELETE FROM meta WHERE name IN ('{META_BOOTSTRAPPED}','{META_BOOT_CURSOR}','{META_ACK}','{META_GATE}','{META_JUDGED_AT}','{META_KV_DIRTY}')"
+            "DELETE FROM meta WHERE name IN ('{META_BOOTSTRAPPED}','{META_BOOT_CURSOR}','{META_ACK}','{META_GATE}','{META_JUDGED_AT}','{META_KV_DIRTY}','{META_TIP_JUDGED}')"
         ));
         out.push(format!(
             "INSERT INTO meta(name,value) SELECT '{META_BOOT_CURSOR}','0' WHERE EXISTS (SELECT 1 FROM meta WHERE name='{META_IDENTITY}')"
@@ -174,10 +186,30 @@ impl DurableObject for OwedActor {
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
-        self.rearm_after_rebuild().await;
         let url = req.url()?;
         let path = url.path().to_string();
+        // MEDIUM-3: a read of an object never applied writes nothing (no schema, no meta, no alarm); the read's caller
+        // asked D1 first and arms a bootstrap explicitly (`/bootstrap`) only for an identity D1 knows.
+        if req.method() == Method::Get && path == "/rows" && self.is_fresh() {
+            return Response::from_json(
+                &json!({"identity": null, "fresh": true, "bootstrapped": false, "bootstrapArmed": false}),
+            );
+        }
+        if path != "/reset" && path != "/bars" {
+            self.check_epoch().await;
+        }
+        self.rearm_after_rebuild().await;
         match (req.method(), path.as_str()) {
+            (Method::Post, "/bootstrap") => {
+                let body: Value = req.json().await.unwrap_or(Value::Null);
+                let Some(me) = body["identity"].as_str().and_then(actor_name) else {
+                    return Response::error("identity is not a 66-hex key", 400);
+                };
+                let (armed, already) = self.arm_bootstrap(&me).await;
+                Response::from_json(
+                    &json!({"identity": me, "armed": armed, "bootstrapped": already}),
+                )
+            }
             (Method::Post, "/apply") => {
                 let body: ApplyBody = match req.json().await {
                     Ok(b) => b,
@@ -220,6 +252,7 @@ impl DurableObject for OwedActor {
     }
 
     async fn alarm(&self) -> Result<Response> {
+        self.check_epoch().await;
         self.rearm_after_rebuild().await;
         let local = self.local();
         if self.meta(META_BOOT_CURSOR).is_some() {
@@ -235,28 +268,32 @@ impl DurableObject for OwedActor {
         if self.meta(META_KV_DIRTY).as_deref() == Some("1") {
             self.write_kv_copy(&local).await;
         }
-        if let (Some(gate), Some(identity)) = (self.meta(META_GATE), self.meta(META_IDENTITY)) {
+        // MEDIUM-4: the tip alarm judges the gates in `(tipJudged, tip]` and the courier-dated sweeps below the tip,
+        // then arms at the next gate (never a re-judge of every open gate each ten minutes).
+        if let (Some(_), Some(identity)) = (self.meta(META_GATE), self.meta(META_IDENTITY)) {
             let tip = crate::owed_events::tip_memoised(&self.env, true).await;
-            let games = self.gated_games(&local, tip);
-            if !games.is_empty() {
-                let body = ApplyBody {
-                    identity,
-                    games,
-                    kind: Some("tip".into()),
-                    seq: None,
-                    at_ms: None,
-                    tip,
-                    txfacts: Vec::new(),
-                    mined: false,
-                };
-                let _ = self.apply_route(body).await;
-            } else if gate.parse::<u64>().is_ok() {
-                let _ = self
-                    .state
-                    .storage()
-                    .set_alarm(Date::now().as_millis() as i64 + TIP_ALARM_MS as i64)
-                    .await;
+            if let Some(t) = tip {
+                let last = self
+                    .meta(META_TIP_JUDGED)
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(-1);
+                let games = self.gated_games(&local, t, last);
+                for chunk in games.chunks(GAMES_PER_APPLY) {
+                    let body = ApplyBody {
+                        identity: identity.clone(),
+                        games: chunk.to_vec(),
+                        kind: Some("tip".into()),
+                        seq: None,
+                        at_ms: None,
+                        tip,
+                        txfacts: Vec::new(),
+                        mined: false,
+                    };
+                    let _ = self.apply_route(body).await;
+                }
+                self.put_meta(&local, META_TIP_JUDGED, &t.to_string());
             }
+            self.arm_tip_alarm(&local, tip).await;
         }
         Response::ok("ok")
     }
@@ -310,6 +347,113 @@ impl OwedActor {
         }
     }
 
+    /// MEDIUM-3: an object no apply, bootstrap or read ever wrote (no `meta` table): a read of it writes nothing.
+    fn is_fresh(&self) -> bool {
+        !*self.ready.borrow()
+            && self
+                .state
+                .storage()
+                .sql()
+                .exec(
+                    "SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='meta'",
+                    None,
+                )
+                .ok()
+                .and_then(|c| c.to_array::<Value>().ok())
+                .is_none_or(|r| r.is_empty())
+    }
+
+    /// MEDIUM-5: the era the actor holds against the render's ([`actor_epoch`]): another era's actor is RESET (its
+    /// storage and its alarm, inside its turn) before it answers, then stamped; counted `owed_actor_epoch_resets_total`.
+    async fn check_epoch(&self) {
+        let current = actor_epoch(
+            self.env.var("STORAGE_EPOCH").ok().map(|v| v.to_string()),
+            crate::routes::written_off_before_ms_env(&self.env),
+        );
+        let held = self.meta(META_EPOCH);
+        match epoch_verdict(held.as_deref(), &current) {
+            EpochVerdict::Keep => {}
+            EpochVerdict::Stamp => self.put_meta(&self.local(), META_EPOCH, &current),
+            EpochVerdict::Reset => {
+                let _turn = self.turn.lock().await;
+                let _ = self.state.storage().delete_all().await;
+                let _ = self.state.storage().delete_alarm().await;
+                *self.ready.borrow_mut() = false;
+                *self.rebuilt.borrow_mut() = false;
+                console_log!(
+                    "[owed-actor] RESET on an era move: held {}, the render's {current}",
+                    held.unwrap_or_default()
+                );
+                let local = self.local();
+                self.put_meta(&local, META_EPOCH, &current);
+                if let Ok(record) = crate::routes::D1Sql::of(&self.env) {
+                    record.counters(vec![(COUNTERS[12].into(), 1)]).await;
+                }
+            }
+        }
+    }
+
+    /// MEDIUM-1: arm the bootstrap of `me` (its first page on the alarm, now) unless it is done or armed. Answers
+    /// (armed now, already bootstrapped).
+    async fn arm_bootstrap(&self, me: &str) -> (bool, bool) {
+        let local = self.local();
+        if self.meta(META_BOOTSTRAPPED).is_some() {
+            return (false, true);
+        }
+        if self.meta(META_BOOT_CURSOR).is_some() {
+            return (false, false);
+        }
+        self.put_meta(&local, META_IDENTITY, me);
+        self.put_meta(&local, META_BOOT_CURSOR, BOOT_CURSOR_START);
+        let _ = self
+            .state
+            .storage()
+            .set_alarm(Date::now().as_millis() as i64)
+            .await;
+        (true, false)
+    }
+
+    /// MEDIUM-4: the tip alarm at the next gate above `tip`, or the next block while a courier-dated sweep is held
+    /// ([`next_tip_alarm_ms`]); none owed: `meta.gate` cleared. An alarm already set (an earlier duty) is kept: each
+    /// alarm re-arms this one at its end.
+    async fn arm_tip_alarm(&self, local: &DoSql, tip: Option<u64>) {
+        let row = local
+            .sql
+            .exec(
+                NEXT_GATE_SQL,
+                vec![SqlStorageValue::Integer(tip.map_or(-1, |t| t as i64))],
+            )
+            .ok()
+            .and_then(|c| c.to_array::<Value>().ok())
+            .and_then(|r| r.into_iter().next())
+            .unwrap_or(Value::Null);
+        let now = Date::now().as_millis();
+        match next_tip_alarm_ms(
+            now,
+            tip,
+            row["gate"].as_u64(),
+            row["sweeps"].as_i64() == Some(1),
+        ) {
+            Some(at) => {
+                self.put_meta(local, META_GATE, &at.to_string());
+                if self
+                    .state
+                    .storage()
+                    .get_alarm()
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    let _ = self.state.storage().set_alarm(at as i64).await;
+                }
+            }
+            None => {
+                let _ = local.sql.exec("DELETE FROM meta WHERE name='gate'", None);
+            }
+        }
+    }
+
     /// Phase C (`OWED_D1_JUDGE=false`): the D1 rows are not dated, so the actor publishes its belt questions.
     fn publishes_asks(&self) -> bool {
         !d1_judge_on(self.env.var(D1_JUDGE_FLAG).ok().map(|v| v.to_string()))
@@ -338,13 +482,17 @@ impl OwedActor {
         );
     }
 
-    /// The games whose rows wait for the block that has come: a gate at or below the tip, or a courier-dated sweep
-    /// judged below it (`probeTip < tip`, MEDIUM-5).
-    fn gated_games(&self, local: &DoSql, tip: Option<u64>) -> Vec<String> {
-        let Some(tip) = tip else { return Vec::new() };
+    /// The games whose rows the tips since `last` have reached (MEDIUM-4, [`GATED_GAMES_SQL`]).
+    fn gated_games(&self, local: &DoSql, tip: u64, last: i64) -> Vec<String> {
         local
             .sql
-            .exec(GATED_GAMES_SQL, vec![SqlStorageValue::Integer(tip as i64)])
+            .exec(
+                GATED_GAMES_SQL,
+                vec![
+                    SqlStorageValue::Integer(tip as i64),
+                    SqlStorageValue::Integer(last),
+                ],
+            )
             .ok()
             .and_then(|c| c.to_array::<Value>().ok())
             .unwrap_or_default()
@@ -423,36 +571,11 @@ impl OwedActor {
                 .set_alarm(now as i64 + KV_COPY_MIN_INTERVAL_MS as i64)
                 .await;
         }
-        // MEDIUM-5: the actor's own tip alarm while a row waits for a block.
-        let gate = local
-            .sql
-            .exec(GATE_SQL, None)
-            .ok()
-            .and_then(|c| c.to_array::<Value>().ok())
-            .and_then(|r| r.first().and_then(|v| v["gate"].as_i64()));
-        match gate {
-            Some(g) => {
-                self.put_meta(&local, META_GATE, &g.to_string());
-                if self
-                    .state
-                    .storage()
-                    .get_alarm()
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_none()
-                {
-                    let _ = self
-                        .state
-                        .storage()
-                        .set_alarm(now as i64 + TIP_ALARM_MS as i64)
-                        .await;
-                }
-            }
-            None => {
-                let _ = local.sql.exec("DELETE FROM meta WHERE name='gate'", None);
-            }
-        }
+        // MEDIUM-4: the actor's own tip alarm, at the next gate or (a courier-dated sweep held) the next block.
+        self.arm_tip_alarm(&local, body.tip).await;
+        // MEDIUM-1: an actor's first event bootstraps it (every other game of its identity, paged on its alarm), so
+        // Phase A proves the bootstrap before any read is served from it.
+        let _ = self.arm_bootstrap(&me).await;
         let mut answer = answer_of(&report, self.rows_of(&local, &me));
         answer["identity"] = json!(me);
         answer["judgedAtMs"] = json!(now);
@@ -473,27 +596,16 @@ impl OwedActor {
     }
 
     /// `GET /rows?identity=`: the joined rows as the D1 read joins them (`owed_read::ROWS_SQL` over the actor's own
-    /// tables; the read replaces every word column with D1's, MEDIUM-4) and the state row. An actor never applied
-    /// answers `bootstrapped: false` and starts its bootstrap on its alarm (MEDIUM-6).
+    /// tables; the read replaces every word column with D1's, MEDIUM-4) and the state row. It WRITES NOTHING (the
+    /// D2-ACTOR-B lens's MEDIUM-3): an actor not bootstrapped answers `bootstrapped: false` (and whether its bootstrap
+    /// is armed); the read's caller arms it by `/bootstrap`.
     async fn rows_route(&self, identity: Option<String>) -> Result<Response> {
         let local = self.local();
         let me = self
             .meta(META_IDENTITY)
             .or(identity.and_then(|i| actor_name(&i)));
         let bootstrapped = self.meta(META_BOOTSTRAPPED).is_some();
-        if !bootstrapped {
-            if let Some(me) = &me {
-                self.put_meta(&local, META_IDENTITY, me);
-                if self.meta(META_BOOT_CURSOR).is_none() {
-                    self.put_meta(&local, META_BOOT_CURSOR, "0");
-                    let _ = self
-                        .state
-                        .storage()
-                        .set_alarm(Date::now().as_millis() as i64)
-                        .await;
-                }
-            }
-        }
+        let armed = self.meta(META_BOOT_CURSOR).is_some();
         let read = |sql: &str| -> Vec<Value> {
             me.as_deref()
                 .and_then(|m| {
@@ -507,7 +619,9 @@ impl OwedActor {
         };
         Response::from_json(&json!({
             "identity": me,
+            "fresh": false,
             "bootstrapped": bootstrapped,
+            "bootstrapArmed": armed,
             "joined": read(crate::owed_read::ROWS_SQL),
             "state": read(crate::owed_read::STATE_SQL).first(),
             "ackSeq": self.meta(META_ACK).and_then(|s| s.parse::<i64>().ok()),
@@ -515,31 +629,28 @@ impl OwedActor {
         }))
     }
 
-    /// MEDIUM-6: one bootstrap page (16 games, newest first) per alarm, resumable on its cursor, until the page is
-    /// short: then the actor is bootstrapped and its reads serve its rows.
+    /// MEDIUM-6: one bootstrap page (16 games, newest first) per alarm, resumable on its keyset cursor (LOW-6),
+    /// until the page is short: then the actor is bootstrapped and its reads serve its rows, counted durably
+    /// (`owed_actor_bootstraps_total`, served `/health.owedActor.bootstraps`, the D2-ACTOR-B lens's MEDIUM-1).
     async fn bootstrap_page(&self, local: &DoSql) -> Result<()> {
         let (Some(me), Some(cursor)) = (self.meta(META_IDENTITY), self.meta(META_BOOT_CURSOR))
         else {
             return Ok(());
         };
-        let offset: i64 = cursor.parse().unwrap_or(0);
+        let (at, after) = boot_keyset(Some(&cursor));
         let record = crate::routes::D1Sql::of(&self.env)?;
         let page = record
             .run_batch(vec![Stmt::new(
-                crate::owed_judge::IDENTITY_GAMES_PAGE_SQL,
-                vec![Bind::Text(me.clone()), Bind::Int(offset)],
+                crate::owed_judge::IDENTITY_GAMES_AFTER_SQL,
+                vec![Bind::Text(me.clone()), Bind::Int(at), Bind::Text(after)],
             )])
             .await
             .map_err(Error::RustError)?;
-        let games: Vec<String> = page
-            .first()
-            .map(|o| {
-                o.rows
-                    .iter()
-                    .filter_map(|r| r["gameId"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let rows: Vec<Value> = page.into_iter().next().map(|o| o.rows).unwrap_or_default();
+        let games: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r["gameId"].as_str().map(str::to_string))
+            .collect();
         if !games.is_empty() {
             let tip = crate::owed_events::tip_memoised(&self.env, false).await;
             apply_and_publish_in_turn(
@@ -565,8 +676,16 @@ impl OwedActor {
                 .sql
                 .exec("DELETE FROM meta WHERE name='bootCursor'", None);
             self.bars.borrow_mut().bootstraps += 1;
+            record.counters(vec![(COUNTERS[10].into(), 1)]).await;
+            self.put_meta(local, META_KV_DIRTY, "1");
+            self.write_kv_copy(local).await;
         } else {
-            self.put_meta(local, META_BOOT_CURSOR, &(offset + 16).to_string());
+            let last = rows.last().cloned().unwrap_or(Value::Null);
+            self.put_meta(
+                local,
+                META_BOOT_CURSOR,
+                &json!([last["at"].as_i64().unwrap_or(0), last["gameId"]]).to_string(),
+            );
             self.state
                 .storage()
                 .set_alarm(Date::now().as_millis() as i64 + 1)
@@ -596,11 +715,6 @@ impl OwedActor {
         }
     }
 }
-
-/// The lowest gate the actor's rows wait for, and whether a courier-dated sweep is held (`probeTip` set).
-pub const GATE_SQL: &str = "SELECT MIN(COALESCE(gateHeight, probeTip + 1)) AS gate FROM owed_rows WHERE gateHeight IS NOT NULL OR (family='hop-stranded' AND claimable=1 AND probeTip IS NOT NULL)";
-/// The games whose rows the tip has reached (`?1` the tip).
-pub const GATED_GAMES_SQL: &str = "SELECT DISTINCT gameId FROM owed_rows WHERE gateHeight<=?1 OR (family='hop-stranded' AND claimable=1 AND probeTip<?1) LIMIT 64";
 
 /// A stub of the identity's actor, `None` without the binding or for a key that is not 66-hex.
 pub fn stub_of(env: &Env, identity: &str) -> Option<Stub> {
@@ -752,14 +866,17 @@ pub fn schedule_direct(
                 at_ms: at_ms as i64,
                 mined: false,
             };
-            let mut body = apply_body(&identity, &games, &e, tip);
-            body["seq"] = Value::Null;
-            calls += 1;
-            match call_apply(&env, &body, DIRECT_CALL_WALL_MS).await {
-                Ok(answer) => note_answer(&answer),
-                Err(e) => {
-                    faults += 1;
-                    console_log!("[owed-actor] direct call {identity}: {e}");
+            // LOW-7: an apply takes at most `GAMES_PER_APPLY` games; a bigger batch is split here.
+            for chunk in games.chunks(GAMES_PER_APPLY) {
+                let mut body = apply_body(&identity, chunk, &e, tip);
+                body["seq"] = Value::Null;
+                calls += 1;
+                match call_apply(&env, &body, DIRECT_CALL_WALL_MS).await {
+                    Ok(answer) => note_answer_as("direct", &answer),
+                    Err(e) => {
+                        faults += 1;
+                        console_log!("[owed-actor] direct call {identity}: {e}");
+                    }
                 }
             }
         }
@@ -768,31 +885,68 @@ pub fn schedule_direct(
             (COUNTERS[4].into(), faults),
         ])
         .await;
+        // MEDIUM-7: the direct class's samples into the fleet's durable bars.
+        flush_bars(&db, Date::now().as_millis(), false).await;
     });
 }
 
-/// Phase B's read (`OWED_ACTOR_READ`): the actor's rows joined with D1's words, the D1 snapshot's pending marks
-/// kept; an actor not yet bootstrapped is `pending` with no rows; an actor out of reach is the KV copy, display only,
-/// or `pending` with no rows (Rule 23: never `rows: []` by silence). `Err` is the stored read's fault (503).
+/// The answer of Phase B's read.
+#[derive(Debug)]
+pub(crate) enum ActorRead {
+    /// The rows to serve through `Snapshot::body` (the actor's, or D1's own for an identity D1 does not know).
+    Rows(crate::owed_read::Snapshot),
+    /// The actor's rows are not served as complete (out of reach, or its bootstrap unfinished).
+    Fallback(Fallback),
+}
+
+/// MEDIUM-3: does D1 know the identity (a stated owed list, or a party, hop marker or evicted party row: the
+/// existing indexed probe `owed_read::read_with` asks of an unstated one)?
+pub fn known_to_d1(snapshot: &crate::owed_read::Snapshot) -> bool {
+    snapshot.state.is_some() || snapshot.wanted
+}
+
+/// Phase B's read (`OWED_ACTOR_READ`). FIRST D1's state and pending marks (LOW-5: never D1's rows): an identity D1
+/// does not know is answered from D1 as before, no actor called and none minted (MEDIUM-3, counted
+/// `owed_actor_unknown_reads_total`). Then the actor's rows joined with D1's words, D1's pending marks kept. An actor
+/// whose bootstrap is unfinished is served its KV copy display only, or a 503 `pending` with no copy, and its
+/// bootstrap armed when it is not (MEDIUM-1); an actor out of reach the same (MEDIUM-2; Rule 23: never `rows: []` by
+/// silence). `Err` is the stored read's fault (503).
 pub(crate) async fn read_snapshot(
     env: &Env,
     db: &crate::routes::D1Sql,
     identity: &str,
-) -> std::result::Result<std::result::Result<crate::owed_read::Snapshot, Value>, String> {
-    let mut snapshot = crate::owed_read::read(db, identity).await?;
+) -> std::result::Result<ActorRead, String> {
+    let mut snapshot = crate::owed_read::read_with(db, identity, false).await?;
+    if !known_to_d1(&snapshot) {
+        db.counters(vec![(COUNTERS[11].into(), 1)]).await;
+        return Ok(ActorRead::Rows(snapshot));
+    }
     let answer = match call_rows(env, identity, READ_WALL_MS).await {
         Ok(a) => a,
         Err(e) => {
             console_log!("[owed-actor] read {identity}: {e}");
-            return Ok(Err(display_from_copy(
-                read_kv_copy(env, identity).await.as_ref(),
+            let copy = read_kv_copy(env, identity).await;
+            return Ok(ActorRead::Fallback(fallback_body(
+                identity,
+                copy.as_ref(),
+                KV_COPY_REASON,
+                "kv-copy",
             )));
         }
     };
     if answer["bootstrapped"] != true {
-        return Ok(Err(
-            json!({"identity": identity, "rows": null, "pending": true, "source": "owed-actor", "reason": "the judge is building this identity's rows; re-read"}),
-        ));
+        if answer["bootstrapArmed"] != true {
+            if let Err(e) = call_bootstrap(env, identity, READ_WALL_MS).await {
+                console_log!("[owed-actor] bootstrap {identity}: {e}");
+            }
+        }
+        let copy = read_kv_copy(env, identity).await;
+        return Ok(ActorRead::Fallback(fallback_body(
+            identity,
+            copy.as_ref(),
+            BOOTSTRAP_REASON,
+            "owed-actor-bootstrap",
+        )));
     }
     let mut joined: Vec<Value> = answer["joined"].as_array().cloned().unwrap_or_default();
     let txids = word_txids(&joined);
@@ -814,7 +968,100 @@ pub(crate) async fn read_snapshot(
     snapshot.state = answer["state"]
         .as_object()
         .map(|o| Value::Object(o.clone()));
-    Ok(Ok(snapshot))
+    Ok(ActorRead::Rows(snapshot))
+}
+
+/// MEDIUM-1: arm one identity's bootstrap (`/bootstrap`), bounded.
+pub async fn call_bootstrap(
+    env: &Env,
+    identity: &str,
+    wall_ms: u64,
+) -> std::result::Result<Value, String> {
+    let stub = stub_of(env, identity).ok_or("no owed actor for this identity")?;
+    let name = actor_name(identity).unwrap_or_default();
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_body(Some(json!({ "identity": name }).to_string().into()));
+    let req =
+        Request::new_with_init("https://owed-actor/bootstrap", &init).map_err(|e| e.to_string())?;
+    let call = async {
+        let mut resp = stub
+            .fetch_with_request(req)
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.status_code() != 200 {
+            return Err(format!("owed actor answered {}", resp.status_code()));
+        }
+        resp.json::<Value>().await.map_err(|e| e.to_string())
+    };
+    let wall = Delay::from(std::time::Duration::from_millis(wall_ms));
+    futures_util::pin_mut!(call);
+    futures_util::pin_mut!(wall);
+    match futures_util::future::select(call, wall).await {
+        futures_util::future::Either::Left((r, _)) => r,
+        futures_util::future::Either::Right(_) => {
+            Err(format!("owed actor: no answer in {wall_ms} ms"))
+        }
+    }
+}
+
+/// THE PHASE A BOOTSTRAP LEVER (the D2-ACTOR-B lens's MEDIUM-1): `POST /internal/owed-actor-bootstrap` (bearer
+/// `INTERNAL_TOKEN`), body empty, `{}` or `{"after": "<identity>"}`: every identity D1 knows ([`RESET_IDENTITIES_SQL`]'s
+/// union), [`BOOTSTRAP_PER_CALL`] a call past `after`, each actor's `/bootstrap` (armed now, already bootstrapped, or
+/// a fault), `next` the cursor (`null` at the end). Run it in Phase A until `next` is null, then read
+/// `/health.owedActor.bootstraps` against `activeIdentities` before the Phase B flip.
+pub const BOOTSTRAP_PER_CALL: usize = 50;
+pub async fn bootstrap_lever(mut req: Request, env: &Env) -> Result<Response> {
+    if !crate::internal_events::internal_bearer_ok(&req, env) {
+        return Response::error("unauthorized", 401);
+    }
+    let text = req.text().await.unwrap_or_default();
+    let body: Value = if text.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str(&text) {
+            Ok(b @ Value::Object(_)) => b,
+            _ => {
+                return Response::error("the body is empty, {} or {\"after\": \"<identity>\"}", 400)
+            }
+        }
+    };
+    let after = body["after"].as_str().unwrap_or_default().to_string();
+    let db = crate::routes::D1Sql::of(env)?;
+    let rows = db
+        .run_batch(vec![Stmt::new(
+            RESET_IDENTITIES_SQL,
+            vec![Bind::Text(after), Bind::Int(BOOTSTRAP_PER_CALL as i64)],
+        )])
+        .await
+        .map_err(Error::RustError)?
+        .into_iter()
+        .next()
+        .map(|o| o.rows)
+        .unwrap_or_default();
+    let ids: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r["identity"].as_str().map(str::to_string))
+        .collect();
+    let (mut armed, mut done, mut skipped, mut faults) = (0u64, 0u64, Vec::new(), Vec::new());
+    for id in &ids {
+        if actor_name(id).is_none() {
+            skipped.push(id.clone());
+            continue;
+        }
+        match call_bootstrap(env, id, DIRECT_CALL_WALL_MS).await {
+            Ok(a) if a["armed"] == true => armed += 1,
+            Ok(a) if a["bootstrapped"] == true => done += 1,
+            Ok(_) => {}
+            Err(e) => faults.push(json!({"identity": id, "error": e})),
+        }
+    }
+    let next = (ids.len() == BOOTSTRAP_PER_CALL)
+        .then(|| ids.last().cloned())
+        .flatten();
+    Response::from_json(
+        &json!({"identities": ids.len(), "armed": armed, "bootstrapped": done, "skipped": skipped, "faults": faults, "next": next}),
+    )
 }
 
 /// THE WIPE'S LEVER (LOW-2; WIPE-REHEARSAL-3 section 2, step 4a), part 1: `GET /internal/owed-actor-identities?after=`

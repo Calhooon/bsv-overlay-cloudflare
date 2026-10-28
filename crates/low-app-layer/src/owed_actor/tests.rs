@@ -724,26 +724,30 @@ async fn d2_actor_b_phase_c_acks_the_marks_after_the_actor_applied() {
 /// MEDIUM-9 and Rule 23: the KV copy is display only and never an empty list served as "nothing owed".
 #[test]
 fn d2_actor_b_the_kv_copy_is_never_an_empty_list() {
-    let none = display_from_copy(None);
-    assert_eq!(
-        (none["pending"].clone(), none["rows"].clone()),
-        (json!(true), Value::Null)
-    );
-    let empty = display_from_copy(Some(&kv_copy_body("02ab", &[], 1)));
-    assert_eq!(
-        (empty["pending"].clone(), empty["rows"].clone()),
-        (json!(true), Value::Null)
-    );
-    let one = display_from_copy(Some(&kv_copy_body(
-        "02ab",
-        &[json!({"outpoint": "x:0", "claimable": 1})],
-        7,
-    )));
+    let me = format!("02{}", "ab".repeat(32));
+    for copy in [None, Some(kv_copy_body(&me, &[], 1))] {
+        match fallback_body(&me, copy.as_ref(), KV_COPY_REASON, "kv-copy") {
+            Fallback::Unavailable(b) => assert_eq!(
+                (b["pending"].clone(), b["rows"].clone()),
+                (json!(true), Value::Null)
+            ),
+            other => panic!("no copy rows must be a 503, never rows: [] ({other:?})"),
+        }
+    }
+    let row = json!({"identity": me, "outpoint": format!("{}:0", "c1".repeat(32)), "family": "payout", "gameId": "9d".repeat(32), "sats": 5, "facts": "{\"claim\":\"internalize\",\"claimable\":true}", "reason": null});
+    let Fallback::Display(one) = fallback_body(
+        &me,
+        Some(&kv_copy_body(&me, &[row], 7)),
+        KV_COPY_REASON,
+        "kv-copy",
+    ) else {
+        panic!("a copy with a row is displayed");
+    };
     assert_eq!(
         (
-            one["rows"][0]["claimable"].clone(),
+            one["rows"][0]["facts"]["claimable"].clone(),
             one["displayOnly"].clone(),
-            one["judgedAtMs"].clone()
+            one["computedAtMs"].clone()
         ),
         (json!(false), json!(true), json!(7))
     );
@@ -807,7 +811,7 @@ fn d2_actor_b_the_bars_are_served_and_the_counters_seeded() {
         .split_whitespace()
         .collect::<String>();
     assert!(routes.contains(
-        &"body[\"owedActor\"][\"oldestUnappliedEventAgeMs\"] = body[\"owedEvents\"][\"oldestUnackedMarkAgeMs\"].clone();"
+        &"body[\"owedActor\"] = crate::owed_actor::health_body( actor_read.as_ref(), worker::Date::now().as_millis(), d1_judges, &body[\"owedEvents\"][\"oldestUnackedMarkAgeMs\"], );"
             .split_whitespace()
             .collect::<String>()
     ));
@@ -1569,4 +1573,640 @@ async fn d2_actor_b_fold_h4_a_digest_change_rebuilds_the_judges_tables() {
         (None, Some("0".into())),
         "the bootstrap is re-armed"
     );
+}
+
+// ---- D2-ACTOR-B-FOLD-2: the lens's nine MEDIUMs (`D2-ACTOR-B-lens-2026-10-28.md`) ----
+
+/// A Rust mirror of bsv-low `app/src/lib/owed.ts` `parseOwedBody` (the wire's one reader): `None` where the client
+/// reads the body as malformed (its `v`, its identity, its `rows` not an array); else each row the client keeps,
+/// with its `claimable` as the client reads it (`facts.claimable !== false`).
+fn client_reads(body: &Value) -> Option<Vec<(String, bool)>> {
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+    if body["v"] != json!(crate::owed::OWED_WIRE_VERSION) {
+        return None;
+    }
+    let id = body["identity"].as_str()?;
+    if !(id.len() == 66 && (id.starts_with("02") || id.starts_with("03")) && hex(&id[2..], 64)) {
+        return None;
+    }
+    let mut out = Vec::new();
+    for r in body["rows"].as_array()? {
+        let Some((t, v)) = r["outpoint"].as_str().and_then(|o| o.split_once(':')) else {
+            continue;
+        };
+        if !hex(t, 64) || v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if !r["gameId"].as_str().is_some_and(|g| hex(g, 64)) {
+            continue;
+        }
+        let claimable = r["facts"]
+            .as_object()
+            .is_none_or(|f| f.get("claimable") != Some(&json!(false)));
+        out.push((format!("{t}:{v}").to_ascii_lowercase(), claimable));
+    }
+    Some(out)
+}
+
+fn rows_of_actor(actor: &SqliteSql, identity: &str) -> Vec<Value> {
+    futures_executor_block(
+        actor.run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.into())])]),
+    )
+    .unwrap()
+    .remove(0)
+    .rows
+}
+
+/// MEDIUM-2: the KV copy's fallback is the owed wire (`v`, the facts an object) and every row is display only as
+/// the client reads it; the frozen body is the one bsv-low's own parser was run over
+/// (`tests/fixtures/owed_actor_fallback_body.json`, `OWED_ACTOR_FIXTURE_WRITE=1` writes it). RED on `ee48085c`: its
+/// `display_from_copy` body has no `v`, so the client read every copy as malformed (`client_reads` is `None`).
+#[tokio::test]
+async fn d2_actor_b_fold2_m2_the_fallback_bodies_are_the_owed_wire() {
+    let record = d1_judge(&stranded()).await;
+    let games = games_of(&record, "owner");
+    let actor = mirror();
+    apply(
+        &record,
+        &actor,
+        &Fakes,
+        "owner",
+        &games,
+        Some(("pot", 1)),
+        Some(TIP),
+        None,
+    )
+    .await
+    .unwrap();
+    let rows = rows_of_actor(&actor, "owner");
+    assert!(
+        rows.iter().any(|r| r["claimable"] == json!(1)),
+        "the copy holds a press"
+    );
+    let me = format!("02{}", "ab".repeat(32));
+    let copy = kv_copy_body(&me, &rows, NOW_MS);
+    // The base's shape, as `ee48085c` served it: the client drops it whole.
+    let base = json!({"rows": rows, "pending": false, "source": "kv-copy", "displayOnly": true, "reason": KV_COPY_REASON, "judgedAtMs": NOW_MS});
+    assert_eq!(
+        client_reads(&base),
+        None,
+        "the base's copy body is not the wire"
+    );
+    for (reason, source) in [
+        (KV_COPY_REASON, "kv-copy"),
+        (BOOTSTRAP_REASON, "owed-actor-bootstrap"),
+    ] {
+        let Fallback::Display(body) = fallback_body(&me, Some(&copy), reason, source) else {
+            panic!("a copy with rows is displayed");
+        };
+        let read = client_reads(&body).expect("the client parses the fallback body");
+        assert_eq!(
+            read.len(),
+            rows.len(),
+            "every copy row is kept by the client"
+        );
+        assert!(read.iter().all(|(_, c)| !c), "no row is a press: {read:?}");
+        assert_eq!(
+            (
+                body["pending"].clone(),
+                body["refresh"].clone(),
+                body["reason"].clone()
+            ),
+            (json!(true), json!("shed"), json!(reason))
+        );
+        if source == "kv-copy" {
+            let path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/owed_actor_fallback_body.json"
+            );
+            let text = serde_json::to_string_pretty(&body).unwrap() + "\n";
+            if std::env::var("OWED_ACTOR_FIXTURE_WRITE").is_ok() {
+                std::fs::write(path, &text).unwrap();
+            }
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                text,
+                "OWED_ACTOR_FIXTURE_WRITE=1"
+            );
+        }
+    }
+    let Fallback::Unavailable(none) = fallback_body(&me, None, KV_COPY_REASON, "none") else {
+        panic!("no copy is never a 200");
+    };
+    assert_eq!(
+        (none["pending"].clone(), none["rows"].clone()),
+        (json!(true), Value::Null)
+    );
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let routes = squash(include_str!("../routes.rs"));
+    assert!(routes.contains(&squash(
+        "let mut resp = json_response(body.to_string(), 503)?;"
+    )));
+}
+
+/// MEDIUM-3 and LOW-5: Phase B's read asks D1 first (the state and the pending marks, never `ROWS_SQL`); an identity
+/// D1 does not know is answered from D1 and no actor is called or minted; a read of a fresh object writes nothing.
+/// RED on `ee48085c` (source): `read_snapshot` read D1's whole list and called the actor for any key, and `/rows`
+/// wrote the identity, the cursor and an alarm.
+#[tokio::test]
+async fn d2_actor_b_fold2_m3_a_stranger_read_mints_no_actor() {
+    let d1 = d1_judge(&stranded()).await;
+    let known = crate::owed_read::read_with(&d1, "owner", false)
+        .await
+        .unwrap();
+    assert!(object::known_to_d1(&known) && known.joined.is_empty());
+    let stranger = format!("02{}", "ee".repeat(32));
+    d1.recorded.borrow_mut().clear();
+    let s = crate::owed_read::read_with(&d1, &stranger, false)
+        .await
+        .unwrap();
+    assert!(!object::known_to_d1(&s), "a key D1 does not know");
+    let ran: Vec<String> = d1
+        .recorded
+        .borrow()
+        .iter()
+        .flatten()
+        .map(|st| st.sql.clone())
+        .collect();
+    assert!(
+        !ran.iter().any(|q| q == crate::owed_read::ROWS_SQL),
+        "LOW-5: the actor's read never runs D1's rows"
+    );
+    assert!(
+        !ran.iter().any(|q| q.starts_with("INSERT")),
+        "a stranger's read writes nothing: {ran:?}"
+    );
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    let read = &object[object.find("pub(crate)asyncfnread_snapshot(").unwrap()..];
+    let gate = read
+        .find(&squash("if !known_to_d1(&snapshot) {"))
+        .expect("the D1 gate");
+    let call = read
+        .find(&squash("call_rows(env, identity, READ_WALL_MS)"))
+        .expect("the actor's call");
+    assert!(gate < call, "D1 is asked before the actor");
+    let fetch = &object[object.find("asyncfnfetch(").unwrap()..];
+    let fresh = fetch
+        .find("self.is_fresh()")
+        .expect("a fresh object's read");
+    assert!(fresh < fetch.find("self.check_epoch().await").unwrap());
+    assert!(fresh < fetch.find("self.rearm_after_rebuild().await").unwrap());
+    let rows_route = &object[object.find("asyncfnrows_route(").unwrap()
+        ..object.find("asyncfnbootstrap_page(").unwrap()];
+    assert!(
+        !rows_route.contains("put_meta") && !rows_route.contains("set_alarm"),
+        "/rows writes nothing"
+    );
+}
+
+/// MEDIUM-4: the tip alarm selects the gates in `(last tip judged, tip]` and the courier-dated sweeps below the tip
+/// (never an index-unspent sweep), and arms at the next gate. RED on `ee48085c`'s statement (`gateHeight<=?1`, no lower
+/// bound, no status): an opened gate re-judged on every alarm for ever (`["gA", "gC", "gD"]`).
+#[test]
+fn d2_actor_b_fold2_m4_the_tip_alarm_judges_each_gate_once() {
+    let actor = mirror();
+    actor
+        .conn
+        .execute_batch(
+            "INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs,claimable,gateHeight,probeTip) VALUES \
+             ('owner','a:0','refund-due','gA','{}',0,0,100,NULL),\
+             ('owner','b:0','refund-due','gB','{}',0,0,105,NULL),\
+             ('owner','c:0','hop-stranded','gC','{\"status\":\"spent\"}',0,1,NULL,99),\
+             ('owner','d:0','hop-stranded','gD','{\"status\":\"unspent\"}',0,1,NULL,99)",
+        )
+        .unwrap();
+    let gated = |tip: i64, last: i64| -> Vec<String> {
+        let mut q = actor.conn.prepare(GATED_GAMES_SQL).unwrap();
+        let mut g: Vec<String> = q
+            .query_map([tip, last], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        g.sort();
+        g
+    };
+    assert_eq!(gated(101, -1), vec!["gA", "gC"], "the first window");
+    assert_eq!(
+        gated(102, 101),
+        vec!["gC"],
+        "an opened gate is never re-judged"
+    );
+    assert_eq!(gated(105, 102), vec!["gB", "gC"]);
+    let (gate, sweeps): (Option<i64>, Option<i64>) = actor
+        .conn
+        .query_row(NEXT_GATE_SQL, [101], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!((gate, sweeps), (Some(105), Some(1)));
+    assert_eq!(
+        next_tip_alarm_ms(0, Some(101), Some(105), false),
+        Some(4 * BLOCK_MS)
+    );
+    assert_eq!(
+        next_tip_alarm_ms(0, Some(101), Some(105), true),
+        Some(BLOCK_MS)
+    );
+    assert_eq!(next_tip_alarm_ms(0, None, Some(105), false), Some(BLOCK_MS));
+    assert_eq!(
+        next_tip_alarm_ms(0, Some(101), None, false),
+        None,
+        "no gate: no alarm"
+    );
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    assert!(object.contains(&squash(
+        "self.put_meta(&local, META_TIP_JUDGED, &t.to_string());"
+    )));
+    assert!(
+        !object.contains(&squash("now as i64 + TIP_ALARM_MS as i64")),
+        "no ten-minute re-arm"
+    );
+}
+
+/// MEDIUM-5: the era stamp is the render's two vars the wipe moves; another era's actor is reset before it answers.
+#[test]
+fn d2_actor_b_fold2_m5_another_eras_actor_is_reset() {
+    let now = actor_epoch(Some(" beta-2026-10-26-1 ".into()), Some(1_790_000_000_000));
+    assert_eq!(now, "beta-2026-10-26-1|1790000000000");
+    assert_eq!(epoch_verdict(None, &now), EpochVerdict::Stamp);
+    assert_eq!(epoch_verdict(Some(&now), &now), EpochVerdict::Keep);
+    let bumped = actor_epoch(Some("beta-2026-11-02-1".into()), Some(1_790_000_000_000));
+    assert_eq!(epoch_verdict(Some(&now), &bumped), EpochVerdict::Reset);
+    let cutoff = actor_epoch(Some("beta-2026-10-26-1".into()), Some(1_791_000_000_000));
+    assert_eq!(epoch_verdict(Some(&now), &cutoff), EpochVerdict::Reset);
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    let fetch =
+        &object[object.find("asyncfnfetch(").unwrap()..object.find("asyncfnalarm(").unwrap()];
+    assert!(fetch.contains(&squash(
+        "if path != \"/reset\" && path != \"/bars\" { self.check_epoch().await; }"
+    )));
+    let alarm = &object[object.find("asyncfnalarm(").unwrap()..];
+    assert!(alarm.starts_with(&squash(
+        "async fn alarm(&self) -> Result<Response> { self.check_epoch().await;"
+    )));
+    let check = &object[object.find("asyncfncheck_epoch(").unwrap()..];
+    let reset = check.find("EpochVerdict::Reset=>{").unwrap();
+    assert!(check[reset..].starts_with(&squash(
+        "EpochVerdict::Reset => { let _turn = self.turn.lock().await; let _ = self.state.storage().delete_all().await; let _ = self.state.storage().delete_alarm().await;"
+    )));
+}
+
+/// A Phase A judge whose actor's apply is deferred to after the batch (MEDIUM-6), the actor's calls counted.
+struct Deferring<'a> {
+    w: &'a WithActor,
+    deferred: RefCell<Vec<(String, Vec<String>)>>,
+    calls: Cell<usize>,
+}
+impl SqlPort for Deferring<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        self.w.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.w.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.w.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.w.log(l);
+    }
+}
+impl JudgeDb for Deferring<'_> {
+    fn tip(&self) -> Option<u64> {
+        Some(TIP)
+    }
+    async fn word_views(
+        &self,
+        rows: &BTreeMap<String, crate::tracker_host::stored::Row>,
+    ) -> Result<BTreeMap<String, Value>, String> {
+        Fakes.word_views(rows).await
+    }
+    async fn canonical_root(&self, _: u64) -> Option<String> {
+        None
+    }
+    async fn push(&self, _: &str, _: Value) {}
+    fn defer_actor(&self, identity: &str, games: &[String]) -> bool {
+        self.deferred
+            .borrow_mut()
+            .push((identity.to_string(), games.to_vec()));
+        true
+    }
+    async fn actor_deliver(
+        &self,
+        identity: &str,
+        games: &[String],
+    ) -> Result<Option<Value>, String> {
+        self.calls.set(self.calls.get() + 1);
+        self.w.actor_deliver(identity, games).await
+    }
+}
+
+/// MEDIUM-6: in Phase A the consumer's delivery is the D1 judge alone; the actor's apply and its compare run after
+/// the batch (`run_deferred` under the queue handler's `ctx.wait_until`). Timed on the fleet's whale, a chunk of 16
+/// games, inline against deferred (printed; the PR body carries the figures). RED on `ee48085c`: `deliver` awaited
+/// `beside` inline (`left: 1 right: 0`).
+#[tokio::test]
+async fn d2_actor_b_fold2_m6_phase_a_applies_the_actor_off_the_consumer() {
+    let f = fixtures()
+        .into_iter()
+        .find(|f| f.name == "d1_fleet")
+        .unwrap();
+    let w = WithActor {
+        d1: d1_judge(&f).await,
+        actor: mirror(),
+        d1_judges: true,
+        event: Some(("pot", 9)),
+        actor_reads: false,
+        actor_fails: Cell::new(false),
+    };
+    let id = f.identities[0].clone();
+    let every = games_of(&w.d1, &id);
+    let games: Vec<String> = every.iter().take(16).cloned().collect();
+    // the actor bootstrapped (MEDIUM-1: in Phase A): its rows are the whole identity's, under the same 500-row ceiling
+    // as D1's (an actor holding 16 games of the whale differs from D1's ceiling: a bootstrap's absence, not a diff)
+    for chunk in every.chunks(GAMES_PER_APPLY) {
+        apply(&w.d1, &w.actor, &Fakes, &id, chunk, None, Some(TIP), None)
+            .await
+            .unwrap();
+    }
+    crate::owed_events::deliver(&w, &id, &games).await.unwrap();
+    let d = Deferring {
+        w: &w,
+        deferred: RefCell::default(),
+        calls: Cell::new(0),
+    };
+    crate::owed_events::deliver(&d, &id, &games).await.unwrap();
+    assert_eq!(
+        d.calls.get(),
+        0,
+        "the consumer's delivery never calls the actor in Phase A"
+    );
+    assert_eq!(
+        d.deferred.borrow().len(),
+        1,
+        "the apply is handed to after the batch"
+    );
+    let before = w.d1.counter(COUNTERS[0]);
+    // after the batch: the event's own apply (a fresh seq here: the warm delivery applied seq 9) and its compare
+    let answer = w
+        .actor_call(&id, &games, Some(("pot", 10)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer["skippedRedelivery"], json!(false));
+    compare(&w, &id, &games, &answer).await;
+    assert_eq!(
+        (
+            w.d1.counter(COUNTERS[0]) - before,
+            w.d1.counter(COUNTERS[1])
+        ),
+        (1, 0),
+        "the deferred apply compares equal: {:?}",
+        w.d1.lines.borrow()
+    );
+    let (mut inline, mut deferred) = (Meter::default(), Meter::default());
+    for n in 0..5 {
+        // the base's inline path: the D1 judge, then the actor's apply of a fresh event, then the compare
+        let t = std::time::Instant::now();
+        crate::owed_judge::judge_subjects(&w, &id, &games, "owed-events")
+            .await
+            .unwrap();
+        let a = w
+            .actor_call(&id, &games, Some(("pot", 100 + n)))
+            .await
+            .unwrap()
+            .unwrap();
+        compare(&w, &id, &games, &a).await;
+        inline.note(t.elapsed().as_millis() as u64);
+        let t = std::time::Instant::now();
+        crate::owed_events::deliver(&d, &id, &games).await.unwrap();
+        deferred.note(t.elapsed().as_millis() as u64);
+    }
+    eprintln!(
+        "d2_actor_b_fold2 m6 consumer service ({} games of {}): inline (D1 judge + actor + compare) p50 {:?} ms max {:?} ms; deferred (D1 judge alone) p50 {:?} ms max {:?} ms",
+        games.len(),
+        games_of(&w.d1, &id).len(),
+        inline.quantile(0.5),
+        inline.max(),
+        deferred.quantile(0.5),
+        deferred.max()
+    );
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let lib = squash(include_str!("../lib.rs"));
+    assert!(lib.contains(&squash(
+        "let deferred = owed_actor::take_deferred(); if !deferred.is_empty() { ctx.wait_until(owed_actor::run_deferred(env.clone(), deferred));"
+    )));
+}
+
+/// MEDIUM-7 and MEDIUM-8: one isolate's samples flushed by class are what ANOTHER isolate serves (the fleet's
+/// figures, the actor's own oldest unapplied event), beside the compare's durable totals and the bootstraps against
+/// the identities holding rows. RED on `ee48085c`: the bars were one isolate's (`rowsVisibleMsP95` null here) and the
+/// oldest unapplied age in Phase A was D1's un-acked mark.
+#[tokio::test]
+async fn d2_actor_b_fold2_m7_the_bars_are_the_fleets() {
+    let d1 = d1_judge(&stranded()).await;
+    let mut a = PendingBars::default();
+    for n in 0..10u64 {
+        a.note_answer("queue", &json!({"identity": "x", "applyMs": 100 + n, "atMs": 1_000, "judgedAtMs": 1_200 + n * 10}));
+    }
+    a.note_answer(
+        "direct",
+        &json!({"identity": "y", "applyMs": 50, "atMs": 1_000, "judgedAtMs": 1_090}),
+    );
+    a.note_answer(
+        "queue",
+        &json!({"identity": "z", "applyMs": 70, "atMs": 1_000, "judgedAtMs": 1_290, "mined": true}),
+    );
+    a.note_fault("owner", Some(4_000));
+    a.note_fault("owner", Some(3_000));
+    flush_bars_from(&d1, 5_000, &a).await.unwrap();
+    d1.conn
+        .execute_batch(
+            "INSERT INTO ops_counters(name,value) VALUES ('owed_actor_compared_total',40),('owed_actor_diffs_total',2),('owed_actor_faults_total',1),('owed_actor_bootstraps_total',3) \
+             ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+        )
+        .unwrap();
+    let read = d1
+        .run_batch(vec![Stmt::new(HEALTH_SQL, vec![])])
+        .await
+        .unwrap()
+        .remove(0)
+        .rows
+        .remove(0);
+    let served = health_body(Some(&read), 10_000, true, &json!(99));
+    assert_eq!(served["rowsVisibleMsP95"], json!(290), "{served}");
+    assert_eq!(served["rowsVisibleDirectMsP95"], json!(90));
+    assert_eq!(served["collectAfterMinedMsP95"], json!(290));
+    assert_eq!(served["classes"]["mined"]["visibleSamples"], json!(1));
+    assert_eq!(
+        served["oldestUnappliedEventAgeMs"],
+        json!(7_000),
+        "the actor's own, in Phase A"
+    );
+    assert_eq!(
+        (
+            served["comparedTotal"].clone(),
+            served["diffsTotal"].clone(),
+            served["faultsTotal"].clone(),
+            served["bootstraps"].clone()
+        ),
+        (json!(40), json!(2), json!(1), json!(3))
+    );
+    assert!(served["activeIdentities"].as_u64().unwrap() >= 1);
+    assert_eq!(
+        health_body(Some(&read), 10_000, false, &json!(99))["oldestUnappliedEventAgeMs"],
+        json!(99),
+        "Phase C: D1's un-acked mark"
+    );
+    // A later apply of the identity clears its unapplied age.
+    let mut b = PendingBars::default();
+    b.note_fault("owner", Some(3_000));
+    b.note_answer("queue", &json!({"identity": "owner", "applyMs": 1}));
+    flush_bars_from(&d1, 6_000, &b).await.unwrap();
+    let read = d1
+        .run_batch(vec![Stmt::new(HEALTH_SQL, vec![])])
+        .await
+        .unwrap()
+        .remove(0)
+        .rows
+        .remove(0);
+    assert_eq!(
+        health_body(Some(&read), 10_000, true, &Value::Null)["oldestUnappliedEventAgeMs"],
+        Value::Null
+    );
+    // The ring keeps the last 256.
+    let ring: Value = serde_json::from_str(&merge_bars_row(
+        None,
+        &(0..300).collect::<Vec<_>>(),
+        &[],
+        None,
+    ))
+    .unwrap();
+    assert_eq!(
+        (
+            ring["apply"].as_array().unwrap().len(),
+            ring["apply"][0].clone()
+        ),
+        (METER_SAMPLES, json!(44))
+    );
+    // MEDIUM-8: the diff line names its identity and game.
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    assert!(squash(include_str!("../owed_actor.rs"))
+        .contains(&squash("\"[owed-actor] DIFF {identity} game {game}:")));
+}
+
+/// MEDIUM-1 (and LOW-6): an actor's first apply arms its bootstrap; the bootstrap pages every game of the identity by
+/// keyset (a game entering the union between two pages shifts no page: the base's `OFFSET` skipped one), and a
+/// finished bootstrap is counted durably; a read of an actor whose bootstrap is unfinished is the display fallback.
+#[tokio::test]
+async fn d2_actor_b_fold2_m1_the_bootstrap_runs_in_phase_a_and_pages_by_keyset() {
+    let f = fixtures()
+        .into_iter()
+        .find(|f| f.name == "d1_fleet")
+        .unwrap();
+    let d1 = seeded(&f);
+    let id = f.identities[0].clone();
+    let all: BTreeSet<String> = games_of(&d1, &id).into_iter().collect();
+    assert!(all.len() > 32);
+    let page = |at: i64, after: &str| -> Vec<(String, i64)> {
+        let mut q = d1
+            .conn
+            .prepare(crate::owed_judge::IDENTITY_GAMES_AFTER_SQL)
+            .unwrap();
+        q.query_map(rusqlite::params![id, at, after], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    };
+    let (mut at, mut after) = object::boot_keyset(Some(object::BOOT_CURSOR_START));
+    assert_eq!(
+        object::boot_keyset(Some("0")),
+        (i64::MAX, String::new()),
+        "HIGH-4's re-arm reads as the start"
+    );
+    let mut seen: Vec<String> = Vec::new();
+    let mut pages = 0;
+    loop {
+        let p = page(at, &after);
+        pages += 1;
+        if pages == 2 {
+            // a new game enters the union, newest, between two pages
+            d1.conn.execute_batch(&format!("INSERT INTO potparty_records SELECT * FROM potparty_records WHERE identity='{id}' LIMIT 1; UPDATE potparty_records SET gameId='{}', createdAt=createdAt+100000000 WHERE rowid=(SELECT MAX(rowid) FROM potparty_records)", "fe".repeat(32))).ok();
+        }
+        seen.extend(p.iter().map(|(g, _)| g.clone()));
+        if p.len() < 16 {
+            break;
+        }
+        let cursor = json!([p.last().unwrap().1, p.last().unwrap().0]).to_string();
+        (at, after) = object::boot_keyset(Some(&cursor));
+    }
+    let got: BTreeSet<String> = seen.iter().cloned().collect();
+    assert_eq!(seen.len(), got.len(), "no game twice");
+    assert!(
+        all.is_subset(&got),
+        "no game skipped: {:?}",
+        all.difference(&got).collect::<Vec<_>>()
+    );
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    let apply =
+        &object[object.find("asyncfnapply_route(").unwrap()..object.find("fnrows_of(").unwrap()];
+    assert!(
+        apply.contains(&squash("let _ = self.arm_bootstrap(&me).await;")),
+        "the first event arms the bootstrap"
+    );
+    assert!(object.contains(&squash(
+        "record.counters(vec![(COUNTERS[10].into(), 1)]).await;"
+    )));
+    let read = &object[object.find("pub(crate)asyncfnread_snapshot(").unwrap()..];
+    assert!(read.contains(&squash("if answer[\"bootstrapped\"] != true {")));
+    assert!(read.contains(&squash("BOOTSTRAP_REASON, \"owed-actor-bootstrap\",")));
+    let lib = squash(include_str!("../lib.rs"));
+    assert!(lib.contains(&squash("req.path() == \"/internal/owed-actor-bootstrap\" { return owed_actor::object::bootstrap_lever(req, &env).await;")));
+}
+
+/// MEDIUM-9: the `owed-v3` re-judge rebuilds D1's `owed_rows` from D1's own evidence after Phase C left them stale,
+/// resumable over bounded calls, then stamped (a stamped call judges nothing). New API: no `owed-v3` existed on
+/// `ee48085c`.
+#[tokio::test]
+async fn d2_actor_b_fold2_m9_the_owed_v3_rejudge_restores_d1s_rows() {
+    let d1 = d1_judge(&stranded()).await;
+    let all = |d1: &SqliteSql| -> Vec<String> {
+        let mut q = d1.conn.prepare("SELECT json_array(identity,outpoint,family,gameId,sats,facts,reason,claimable,gateHeight,beltDueAtMs,probeTip) FROM owed_rows ORDER BY identity,outpoint").unwrap();
+        q.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let want = all(&d1);
+    assert!(!want.is_empty());
+    // Phase C's stale mirror: rows changed and one lost while the actor judged.
+    d1.conn
+        .execute_batch("UPDATE owed_rows SET reason='stale at the flip', claimable=1; DELETE FROM owed_rows WHERE rowid=(SELECT MIN(rowid) FROM owed_rows)")
+        .unwrap();
+    assert_ne!(all(&d1), want);
+    let mut calls = 0;
+    loop {
+        calls += 1;
+        let r = owed_v3_pass(&d1, NOW_MS as i64, 3).await.unwrap();
+        if r.stamped {
+            break;
+        }
+        assert!(calls < 200, "the re-judge converges");
+    }
+    assert!(calls > 2, "resumable over bounded calls ({calls})");
+    assert_eq!(all(&d1), want, "D1's rows are the D1 judge's again");
+    assert!(d1.counter(COUNTERS[14]) >= 1);
+    d1.recorded.borrow_mut().clear();
+    assert!(owed_v3_pass(&d1, NOW_MS as i64, 3).await.unwrap().stamped);
+    assert_eq!(d1.recorded.borrow().len(), 1, "a stamped call is one read");
+    let lib = include_str!("../lib.rs")
+        .split_whitespace()
+        .collect::<String>();
+    assert!(lib.contains(
+        "req.path()==\"/internal/owed-v3-pass\"{returnowed_actor::owed_v3_lever(req,&env).await;"
+    ));
 }

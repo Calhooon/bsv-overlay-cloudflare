@@ -225,6 +225,16 @@ pub trait JudgeDb: SqlPort {
     fn actor_reads(&self) -> bool {
         false
     }
+    /// bsv-low #912 (the D2-ACTOR-B lens's MEDIUM-6, Phase A): hand the actor's apply and its compare to after the
+    /// consumer's batch (`ctx.wait_until`), off the serial consumer's critical path; `false` where it cannot be
+    /// deferred (the native judges, no actor bound), and the caller applies inline.
+    fn defer_actor(&self, _identity: &str, _games: &[String]) -> bool {
+        false
+    }
+    /// The write time of the event this judge serves (the actor's own oldest-unapplied age, MEDIUM-7).
+    fn event_at_ms(&self) -> Option<u64> {
+        None
+    }
     /// bsv-low #912: the identity's actor applies the games (`owed_actor::object::call_apply`); `None` where no
     /// actor is bound (the native judges, a render without the class).
     async fn actor_deliver(
@@ -323,6 +333,25 @@ impl JudgeDb for D1Judge {
     }
     fn actor_reads(&self) -> bool {
         self.actor_reads
+    }
+    fn defer_actor(&self, identity: &str, games: &[String]) -> bool {
+        let Some(event) = &self.event else {
+            return false;
+        };
+        if self.actor_reads || crate::owed_actor::object::stub_of(&self.sql.env, identity).is_none()
+        {
+            return false;
+        }
+        crate::owed_actor::defer(crate::owed_actor::Deferred {
+            identity: identity.to_ascii_lowercase(),
+            games: games.to_vec(),
+            event: event.clone(),
+            tip: self.tip,
+            era_ms: self.era_ms,
+        })
+    }
+    fn event_at_ms(&self) -> Option<u64> {
+        self.event.as_ref().map(|e| e.at_ms.max(0) as u64)
     }
     async fn actor_deliver(
         &self,
@@ -892,6 +921,20 @@ pub const IDENTITY_GAMES_PAGE_SQL: &str = concat!(
     "SELECT gameId FROM (",
     identity_games!(),
     " LIMIT 16 OFFSET ?2) WHERE 1"
+);
+/// bsv-low #912 (the D2-ACTOR-B lens's LOW-6): the bootstrap's page by KEYSET on `(at, gameId)` in the order above
+/// (`?2` the last page's `at`, `?3` its game; the first page `i64::MAX` and `''`), 16 a page: a game that enters or
+/// leaves the union between two pages shifts no page (an `OFFSET` skipped one).
+pub const IDENTITY_GAMES_AFTER_SQL: &str = concat!(
+    "SELECT gameId,at FROM (SELECT gameId,COALESCE(at,0) AS at FROM (",
+    identity_games!(),
+    ")) WHERE at<?2 OR (at=?2 AND gameId>?3) ORDER BY at DESC,gameId LIMIT 16"
+);
+/// bsv-low #912 (MEDIUM-9, the `owed-v3` re-judge): an identity's games past `?2` in game order, `?3` a page.
+pub const IDENTITY_GAMES_BY_ID_SQL: &str = concat!(
+    "SELECT gameId FROM (",
+    identity_games!(),
+    ") WHERE gameId>?2 ORDER BY gameId LIMIT ?3"
 );
 /// Expand the one wanted envelope to durable game marks: the newest [`OWED_WANTED_GAMES`] games `wanted`, the rest
 /// `backfill` ([`EXPAND_BACKFILL_SQL`]). An interrupted drain leaves all remaining games marked.

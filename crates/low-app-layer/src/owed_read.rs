@@ -58,19 +58,33 @@ impl<D: SqlPort> SqlPort for WantedMarker<'_, D> {
 /// The only optional fourth read is the existing indexed identity probe.
 /// A wanted envelope is one insert; the writer's drain owns all subsequent work.
 pub async fn read(db: &impl SqlPort, identity: &str) -> Result<Snapshot, String> {
+    read_with(db, identity, true).await
+}
+
+/// bsv-low #912 (the D2-ACTOR-B lens's LOW-5): the actor's read (Phase B) takes the state and the pending marks
+/// only; its rows are the actor's. `rows: false` runs [`STATE_SQL`] and [`PENDING_SQL`] (and the identity probe of
+/// an unstated identity), never [`ROWS_SQL`].
+pub async fn read_with(db: &impl SqlPort, identity: &str, rows: bool) -> Result<Snapshot, String> {
+    let sqls: &[&str] = if rows {
+        &[ROWS_SQL, STATE_SQL, PENDING_SQL]
+    } else {
+        &[STATE_SQL, PENDING_SQL]
+    };
     let mut batch = db
         .run_batch(
-            [ROWS_SQL, STATE_SQL, PENDING_SQL]
-                .into_iter()
+            sqls.iter()
                 .map(|sql| Stmt {
-                    sql: sql.into(),
+                    sql: (*sql).into(),
                     binds: vec![Bind::Text(identity.into())],
                 })
                 .collect(),
         )
         .await?;
-    if batch.len() != 3 {
+    if batch.len() != sqls.len() {
         return Err("incomplete owed read batch".into());
+    }
+    if !rows {
+        batch.insert(0, StmtOut::default());
     }
     let marks = batch.pop().unwrap().rows.into_iter().next();
     let pending = marks

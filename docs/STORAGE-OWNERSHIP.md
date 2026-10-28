@@ -228,7 +228,7 @@ A new table: its CREATE in `OVERLAY_MIGRATIONS`, its row in `storage-ownership.j
 
 | `hop_pot_links` | overlay-cloudflare | derived | no | App-layer identity lookup, source-write triggers. |
 | `pot_hop_seats` | overlay-cloudflare | derived | no | App-layer outpoint lookup, source-write triggers. |
-| `view_derivation_state` | overlay-cloudflare | derived | no | Guarded one-time legacy backfill. The app layer INSERTs the `owed-v2` stamp when its owed backfill's cursor passes the last identity (#893 section 6.1). |
+| `view_derivation_state` | overlay-cloudflare | derived | no | Guarded one-time legacy backfill. The app layer INSERTs the `owed-v2` stamp when its owed backfill's cursor passes the last identity (#893 section 6.1), and the `owed-v3` stamp when Phase C's rollback re-judge passes the last identity (#912, the D2-ACTOR-B lens's MEDIUM-9); it DELETEs only the `owed-v3` stamp, through that lever's own `{"restart": true}`. |
 | `count_network_seen` | overlay-cloudflare | derived | no | bsv-low #645: one row, the count of `network_seen` kept by its insert and delete triggers; guarded one-time backfill. |
 | `pot_beefs_unprovable_set` | overlay-cloudflare | derived | no | NS-COST-BAR-1: the txids of the latched `structurally_unprovable = 1` rows, kept by `pot_beefs`' triggers (idempotent under `INSERT OR REPLACE`); wiped only with its count row. |
 | `count_pot_beefs_unprovable` | overlay-cloudflare | derived | no | NS-COST-BAR-1: one row, the count of `pot_beefs_unprovable_set` kept by its insert and delete triggers; guarded one-time backfill. |

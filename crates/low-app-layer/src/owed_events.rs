@@ -368,7 +368,11 @@ pub async fn deliver(
     }
     if db.d1_judges() {
         let report = owed_judge::judge_subjects(db, identity, games, "owed-events").await?;
-        crate::owed_actor::beside(db, identity, games).await;
+        // The D2-ACTOR-B lens's MEDIUM-6: Phase A's apply and compare run after the batch (`ctx.wait_until`), never
+        // inline in the serial consumer; inline only where it cannot be deferred.
+        if !db.defer_actor(identity, games) {
+            crate::owed_actor::beside(db, identity, games).await;
+        }
         return Ok(report);
     }
     crate::owed_actor::as_the_judge(db, identity, games).await

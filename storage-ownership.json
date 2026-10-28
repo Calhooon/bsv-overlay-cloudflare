@@ -1710,11 +1710,11 @@
    "name": "view_derivation_state",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",
-   "writers": {"low-app-layer": ["INSERT"]},
+   "writers": {"low-app-layer": ["INSERT", "DELETE"]},
    "readers": ["low-app-layer"],
    "rebuild_class": "derived",
    "never_wipe": false,
-   "holds": "transactional hop view derivation; the app layer's owed-v2 backfill stamp (#893 section 6.1, owed_backfill::STAMP_WRITE_SQL)",
+   "holds": "transactional hop view derivation; the app layer's owed-v2 backfill stamp (#893 section 6.1, owed_backfill::STAMP_WRITE_SQL) and its owed-v3 re-judge stamp (#912, the D2-ACTOR-B lens's MEDIUM-9: owed_actor::OWED_V3_STAMP_WRITE_SQL, deleted only by that lever's own restart, OWED_V3_RESTART_SQL)",
    "why": "rebuild from admitted hop markers, pot columns and party rows"
    },
    {
