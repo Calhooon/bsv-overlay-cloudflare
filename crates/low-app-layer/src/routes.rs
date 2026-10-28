@@ -3045,14 +3045,12 @@ pub(crate) async fn internal_pot_changed(
         console_warn!("[pot-changed] write batch (stale marks and parks) failed: {e}");
     }
     // The overlay source transaction already marked every affected game. bsv-low #911 (D2-ACTOR-A, MEDIUM-7): the
-    // felt's announce above is unchanged; the judge's trigger is the `owed-events` consumer, so the hook publishes
-    // the outpoints' `pot` events (the overlay already did: a duplicate routes to acknowledged marks) and never judges.
+    // felt's announce above is unchanged; the judge's trigger is the `owed-events` consumer, and the overlay's write
+    // published these outpoints' `pot` events at its own flush (a publish that faulted there is the sweep's), so the
+    // hook publishes only what THIS invocation noted (nothing, today: no statement) and never judges
+    // (D2-ACTOR-A-FOLD-4: re-publishing the pairs cost the hook a seq bump and a read per outpoint for nothing).
     if crate::owed_events::configured(env).await {
-        let pairs: Vec<(&str, String)> = outpoints
-            .iter()
-            .map(|(t, v)| ("pot", overlay_discovery::owed_event::outpoint_key(t, *v)))
-            .collect();
-        crate::owed_events::publish_pairs(env, &pairs).await;
+        crate::owed_events::publish_noted(env).await;
     } else {
         let tip = chaintracks_present_height_env(env, "owed").await.ok();
         let judge = crate::owed_judge::D1Judge::new(env, tip, written_off_before_ms_env(env))?;
@@ -6994,14 +6992,18 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     // bsv-low #469: the owed list's recomputes by source, the rows written by family, the faults.
     body["owed"] = crate::owed::owed_health_json();
     // bsv-low #911 (D2-ACTOR-A, MEDIUM-8): the owed events' totals and served ages.
-    body["owedEvents"] = match D1Sql::of(&ctx.env) {
-        Ok(sql) => crate::owed_events::health(&sql).await,
-        Err(_) => serde_json::Value::Null,
-    };
-    body["owed"]["dirty"] = match D1Sql::of(&ctx.env) {
+    // D2-ACTOR-A-FOLD-4: the ages from the one dirty snapshot `owed.dirty` reads and the consumer's row (one
+    // primary-key read); the totals, the fault memo and the dead letters are the overlay's
+    // `/health/invariants.owedEvents`.
+    let dirty = match D1Sql::of(&ctx.env) {
         Ok(sql) => crate::owed_judge::dirty_health(&sql).await,
         Err(_) => serde_json::Value::Null,
     };
+    body["owedEvents"] = match D1Sql::of(&ctx.env) {
+        Ok(sql) => crate::owed_events::health(&sql, &dirty).await,
+        Err(_) => serde_json::Value::Null,
+    };
+    body["owed"]["dirty"] = dirty;
     // bsv-low #499: this isolate's D1 rows ledger, the per-route running maxima since boot (the overlay serves the
     // same body on `/health/invariants.d1Budget`; `scripts/d1-census.py` reads both).
     body["d1Budget"] = crate::d1_ledger::budget_json();
