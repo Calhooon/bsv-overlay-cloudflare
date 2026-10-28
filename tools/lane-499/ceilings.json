@@ -140,15 +140,15 @@
       "censusKey": "/spent-any"
     },
     "submit-admit-1": {
-      "route": "/submit: an operator historical-tx-no-spv submit admitting one tm_collected output. Re-measured by D2-OWED-FOLD-8: the admission's writes now include the owed dirty triggers' marks in the same statements (bsv-low #893, the design's cost at the write): writes 15 to 18",
+      "route": "/submit: an operator historical-tx-no-spv submit admitting one tm_collected output. Re-measured by D2-OWED-FOLD-8: the admission's writes now include the owed dirty triggers' marks in the same statements (bsv-low #893, the design's cost at the write): writes 15 to 18. Re-measured by D2-ACTOR-A-FOLD-4 (bsv-low #911, the design's section 7 cost of a writer's publish, as record-door-handfile): the admission's ONE publish batch rides the request, the owed_event_seq token (its RETURNING row), the noted rows' facts with their mark counts, and the publish counter's upsert: reads 2 to 6, writes 18 to 22, stmts 8 to 11; the reads ceiling moves by exactly those 4 reads, 4 to 8",
       "measured": {
-        "reads": 2,
-        "writes": 18,
-        "stmts": 8,
-        "maxReads": 1
+        "reads": 6,
+        "writes": 22,
+        "stmts": 11,
+        "maxReads": 2
       },
       "ceiling": {
-        "reads": 4,
+        "reads": 8,
         "writes": 27,
         "stmts": 12,
         "maxReads": 2
@@ -523,7 +523,7 @@
       "censusKey": null
     },
     "health-dirty-snapshot": {
-      "route": "GET /health: one backlog:dirty snapshot lookup plus the two existing chain-event health reads, with the 10-second memo expired. Linux workerd on the populated fleet fixture, FIX-CADENCE-GAUGES.",
+      "route": "GET /health: one backlog:dirty snapshot lookup plus the two existing chain-event health reads, with the 10-second memo expired. Linux workerd on the populated fleet fixture, FIX-CADENCE-GAUGES. D2-ACTOR-A-FOLD-4 (bsv-low #911): plus /health.owedEvents' one consumer-row primary-key read (the owed_belt_state row owed-events:consumer); its dirty snapshot is the same read owed.dirty serves, and the totals, fault memo and dead letters are the overlay's /health/invariants.owedEvents (one statement), so no ceiling moves.",
       "measured": {
         "reads": 3,
         "writes": 0,

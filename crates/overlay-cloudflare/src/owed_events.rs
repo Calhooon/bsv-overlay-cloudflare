@@ -545,6 +545,46 @@ pub async fn publish_before_answer(env: &worker::Env, frames: Vec<Value>) -> Vec
     }
 }
 
+/// D2-ACTOR-A-FOLD-4: the consumer's state as `/health/invariants.owedEvents` serves it, ONE statement at `?1` (now):
+/// the consumer's batch row (a primary-key read), the fault memo's figures and its newest fault (a range of
+/// `owed_belt_state`'s primary key, the pairs and subjects whose judge faulted), and the parked letters by status (at
+/// most [`DEAD_LETTERS_MAX`] rows). These were five statements of the app layer's `/health` (the budget tier's
+/// `health-dirty-snapshot` red); the app layer's `/health.owedEvents` keeps the ages only.
+pub const HEALTH_STATE_SQL: &str = "SELECT (SELECT cursor FROM owed_belt_state WHERE name='owed-events:consumer') AS consumer,(SELECT json_object('rows',COUNT(*),'held',COALESCE(SUM(json_extract(cursor,'$.heldUntilMs')>?1),0),'maxFaults',MAX(json_extract(cursor,'$.faults'))) FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;') AS memo,(SELECT json_object('name',name,'cursor',json(cursor)) FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;' ORDER BY tickedAtMs DESC LIMIT 1) AS lastMemo,(SELECT json_group_object(status,n) FROM (SELECT status,COUNT(*) AS n FROM owed_event_dead_letters GROUP BY status)) AS letters";
+
+/// The served view of one [`HEALTH_STATE_SQL`] row: `{consumer, faultMemo {rows, held, maxFaults, last}, deadLetters}`.
+pub fn health_state_view(row: &Value) -> Value {
+    let parse = |k: &str| {
+        row[k]
+            .as_str()
+            .and_then(|c| serde_json::from_str::<Value>(c).ok())
+            .unwrap_or(Value::Null)
+    };
+    let memo = parse("memo");
+    let last = parse("lastMemo");
+    let last = (!last.is_null()).then(|| {
+        let cursor = &last["cursor"];
+        json!({
+            "pair": last["name"].as_str().map(|n| n.trim_start_matches("owed-events:fault:")),
+            "faults": cursor["faults"],
+            "lastFault": cursor["lastFault"],
+            "lastFaultAtMs": cursor["lastFaultAtMs"],
+            "heldUntilMs": cursor["heldUntilMs"],
+        })
+    });
+    let letters = parse("letters");
+    json!({
+        "consumer": parse("consumer"),
+        "faultMemo": {
+            "rows": memo["rows"],
+            "held": memo["held"],
+            "maxFaults": memo["maxFaults"],
+            "last": last,
+        },
+        "deadLetters": if letters.is_object() { letters } else { json!({}) },
+    })
+}
+
 /// LOW-3: the parked letters a re-drive takes, oldest first (never a `redriven` one in flight, never `exhausted`).
 pub const DEAD_LETTERS_READ_SQL: &str = "SELECT source,sourceKey,body FROM owed_event_dead_letters WHERE status='parked' ORDER BY parkedAt,source,sourceKey LIMIT ?1";
 /// LOW-4: the re-driven letters (their bodies are on the queue again) marked `redriven`, their re-drive counted;

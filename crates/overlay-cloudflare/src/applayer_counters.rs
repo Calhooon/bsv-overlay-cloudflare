@@ -261,10 +261,12 @@ pub fn names() -> Vec<String> {
 }
 
 /// bsv-low #911 (D2-ACTOR-A): `/health/invariants.owedEvents`: the owed events' counters (seeded at 0) and the
-/// consumer's last batch row (its oldest message's enqueue age).
+/// consumer's state (`owed_events::health_state_view`: its last batch row, the fault memo, the parked letters by
+/// status; D2-ACTOR-A-FOLD-4 moved the memo, the letters and the consumer's counters here from the app layer's
+/// `/health`, at no statement: the counters ride `read_counters`, the state one statement).
 pub fn owed_events_view(
     counters: &serde_json::Value,
-    consumer: serde_json::Value,
+    state: serde_json::Value,
 ) -> serde_json::Value {
     let c = |n: &str| counters[n].as_u64().unwrap_or(0);
     serde_json::json!({
@@ -282,8 +284,15 @@ pub fn owed_events_view(
         "faultHeld": c("owed_events_fault_held_total"),
         "sweepHeld": c("owed_events_sweep_held_total"),
         "allHeld": c("owed_events_all_held_total"),
-        "oldestEnqueueAgeMs": consumer["oldestEnqueueAgeMs"].clone(),
-        "consumer": consumer,
+        "subjectFaults": c("owed_events_subject_faults_total"),
+        "subjectHeld": c("owed_events_subject_held_total"),
+        "consumerWallDrops": c("owed_events_consumer_wall_drops_total"),
+        "deadLettersStaleReturned": c("owed_events_dead_letters_stale_returned_total"),
+        "deadLettersDiscarded": c("owed_events_dead_letters_discarded_total"),
+        "oldestEnqueueAgeMs": state["consumer"]["oldestEnqueueAgeMs"].clone(),
+        "consumer": state["consumer"].clone(),
+        "faultMemo": state["faultMemo"].clone(),
+        "deadLetters": state["deadLetters"].clone(),
     })
 }
 

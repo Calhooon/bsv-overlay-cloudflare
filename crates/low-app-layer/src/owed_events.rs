@@ -58,8 +58,6 @@ pub const SWEEP_CURSOR_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tick
 /// MEDIUM-8: the consumer's batch row: the oldest message's enqueue age (a Worker cannot read its queue's backlog;
 /// the pass-meter precedent), served on `/health.owedEvents` and the overlay's `/health/invariants.owedEvents`.
 pub const CONSUMER_ROW_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:consumer',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
-/// The served ages and totals, one batch of key reads.
-pub const HEALTH_COUNTERS_SQL: &str = "SELECT name,value FROM ops_counters WHERE name IN ('owed_events_published_total','owed_events_consumed_total','owed_events_acked_marks_total','owed_events_dlq_total','owed_events_publish_faults_total','owed_events_judge_faults_total','owed_events_swept_total','owed_events_fault_held_total','owed_events_sweep_held_total','owed_events_publish_wall_drops_total','owed_events_subject_faults_total','owed_events_subject_held_total','owed_events_consumer_wall_drops_total','owed_events_dead_letters_stale_returned_total','owed_events_dead_letters_discarded_total','owed_events_all_held_total')";
 /// The consumer's row.
 pub const HEALTH_CONSUMER_SQL: &str =
     "SELECT cursor,tickedAtMs FROM owed_belt_state WHERE name='owed-events:consumer'";
@@ -73,9 +71,6 @@ pub const DEAD_LETTER_PARK_SQL: &str = "INSERT INTO owed_event_dead_letters (sou
 /// The pair's letter is resolved: its judge landed (in the batch that clears its fault memo).
 pub const DEAD_LETTER_RESOLVE_SQL: &str =
     "DELETE FROM owed_event_dead_letters WHERE source=?1 AND sourceKey=?2";
-/// The parked letters by status (at most [`publish::DEAD_LETTERS_MAX`] rows), for `/health.owedEvents`.
-pub const DEAD_LETTER_HEALTH_SQL: &str =
-    "SELECT status,COUNT(*) AS n FROM owed_event_dead_letters GROUP BY status";
 
 /// MEDIUM-2 (the D2-ACTOR-A lens): THE FAULT MEMO, one `owed_belt_state` row per pair whose judge faulted, named
 /// `owed-events:fault:<source> <sourceKey>`, its cursor `{faults, lastFault, lastFaultAtMs, heldUntilMs}`: the
@@ -98,12 +93,6 @@ pub const FAULT_MEMO_READ_SQL: &str =
 pub const FAULT_MEMO_WRITE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,?2,?3) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// Clear one pair's memo (its judge landed).
 pub const FAULT_MEMO_CLEAR_SQL: &str = "DELETE FROM owed_belt_state WHERE name=?1";
-/// The memo's served figures at `?1` (now): the rows, the pairs held now, the most consecutive faults (a range of
-/// the state's primary key).
-pub const FAULT_MEMO_HEALTH_SQL: &str = "SELECT COUNT(*) AS rows,COALESCE(SUM(json_extract(cursor,'$.heldUntilMs')>?1),0) AS held,MAX(json_extract(cursor,'$.faults')) AS maxFaults FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;'";
-/// The memo's newest fault (the cause an operator reads first).
-pub const FAULT_MEMO_LAST_SQL: &str = "SELECT name,cursor FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;' ORDER BY tickedAtMs DESC LIMIT 1";
-
 /// The memo row's name of one subject.
 pub fn subject_memo_name(identity: &str, game: &str) -> String {
     format!("{FAULT_MEMO_PREFIX}subject {identity}/{game}")
@@ -1226,106 +1215,27 @@ async fn park_dead_letters(
     Ok(())
 }
 
-/// MEDIUM-8: `/health.owedEvents`: the totals and the served ages, from rows (never a scan): the counters, the
-/// consumer's batch row and the drain's backlog snapshot (`owed_judge::dirty_health`).
-pub async fn health(db: &impl SqlPort) -> Value {
-    let read = db
-        .run_batch(vec![
-            Stmt {
-                sql: HEALTH_COUNTERS_SQL.into(),
-                binds: vec![],
-            },
-            Stmt {
-                sql: HEALTH_CONSUMER_SQL.into(),
-                binds: vec![],
-            },
-            Stmt {
-                sql: FAULT_MEMO_HEALTH_SQL.into(),
-                binds: vec![Bind::Int(db.now_ms() as i64)],
-            },
-            Stmt {
-                sql: FAULT_MEMO_LAST_SQL.into(),
-                binds: vec![],
-            },
-            Stmt {
-                sql: DEAD_LETTER_HEALTH_SQL.into(),
-                binds: vec![],
-            },
-        ])
-        .await;
-    let Ok(read) = read else {
-        return Value::Null;
-    };
-    let counter = |name: &str| -> u64 {
-        read.first()
-            .and_then(|o| o.rows.iter().find(|r| r["name"].as_str() == Some(name)))
-            .and_then(|r| {
-                r["value"]
-                    .as_u64()
-                    .or_else(|| r["value"].as_f64().map(|f| f as u64))
-            })
-            .unwrap_or(0)
-    };
-    let consumer = read
-        .get(1)
-        .and_then(|o| o.rows.first())
-        .and_then(|r| r["cursor"].as_str())
-        .and_then(|c| serde_json::from_str::<Value>(c).ok());
-    let memo = read.get(2).and_then(|o| o.rows.first()).cloned().unwrap_or(Value::Null);
-    let last = read.get(3).and_then(|o| o.rows.first()).map(|r| {
-        let cursor = r["cursor"]
-            .as_str()
-            .and_then(|c| serde_json::from_str::<Value>(c).ok())
-            .unwrap_or(Value::Null);
-        json!({
-            "pair": r["name"].as_str().map(|n| n.trim_start_matches(FAULT_MEMO_PREFIX)),
-            "faults": cursor["faults"],
-            "lastFault": cursor["lastFault"],
-            "lastFaultAtMs": cursor["lastFaultAtMs"],
-            "heldUntilMs": cursor["heldUntilMs"],
-        })
-    });
-    let letters: serde_json::Map<String, Value> = read
-        .get(4)
-        .map(|o| {
-            o.rows
-                .iter()
-                .filter_map(|r| Some((r["status"].as_str()?.to_string(), r["n"].clone())))
-                .collect()
-        })
-        .unwrap_or_default();
-    let dirty = owed_judge::dirty_health(db).await;
+/// MEDIUM-8: `/health.owedEvents`: the served ages, from rows (never a scan): the drain's backlog snapshot `dirty`
+/// (`owed_judge::dirty_health`, the one `/health` already reads for `owed.dirty`) and the consumer's batch row (one
+/// primary-key read). D2-ACTOR-A-FOLD-4: the totals, the fault memo and the dead letters are the overlay's
+/// `/health/invariants.owedEvents` (its counters and `publish::HEALTH_STATE_SQL`); here they cost the route five
+/// statements and a 16-row counter read past its budget (the tier's `health-dirty-snapshot`).
+pub async fn health(db: &impl SqlPort, dirty: &Value) -> Value {
+    let consumer = rows(db, HEALTH_CONSUMER_SQL, vec![])
+        .await
+        .ok()
+        .and_then(|r| r.into_iter().next())
+        .and_then(|r| {
+            r["cursor"]
+                .as_str()
+                .and_then(|c| serde_json::from_str::<Value>(c).ok())
+        });
     json!({
-        "publishedTotal": counter("owed_events_published_total"),
-        "consumedTotal": counter("owed_events_consumed_total"),
-        "ackedMarks": counter("owed_events_acked_marks_total"),
         "unackedMarks": dirty["count"],
         "oldestUnackedMarkAgeMs": dirty["oldestMarkAgeMs"],
         "oldestEnqueueAgeMs": consumer.as_ref().map(|c| c["oldestEnqueueAgeMs"].clone()),
         "consumerAtMs": consumer.as_ref().map(|c| c["atMs"].clone()),
         "serviceMs": consumer.as_ref().map(|c| c["serviceMs"].clone()),
-        "subjectFaults": counter("owed_events_subject_faults_total"),
-        "subjectHeld": counter("owed_events_subject_held_total"),
-        "allHeld": counter("owed_events_all_held_total"),
-        "consumerWallDrops": counter("owed_events_consumer_wall_drops_total"),
-        "deadLettersStaleReturned": counter("owed_events_dead_letters_stale_returned_total"),
-        "deadLettersDiscarded": counter("owed_events_dead_letters_discarded_total"),
-        "dlqTotal": counter("owed_events_dlq_total"),
-        "publishFaults": counter("owed_events_publish_faults_total"),
-        "publishWallDrops": counter("owed_events_publish_wall_drops_total"),
-        "judgeFaults": counter("owed_events_judge_faults_total"),
-        "sweptTotal": counter("owed_events_swept_total"),
-        "faultHeld": counter("owed_events_fault_held_total"),
-        "sweepHeld": counter("owed_events_sweep_held_total"),
-        "faultMemo": {
-            "rows": memo["rows"],
-            "held": memo["held"],
-            "maxFaults": memo["maxFaults"],
-            "last": last,
-            "holdAfter": FAULT_HOLD_AFTER,
-            "holdBaseMs": FAULT_HOLD_BASE_MS,
-            "holdCapMs": FAULT_HOLD_CAP_MS,
-        },
-        "deadLetters": letters,
+        "totals": "/health/invariants.owedEvents",
     })
 }

@@ -498,7 +498,15 @@ async fn d2_actor_a_fold_m2_a_pair_faulting_for_good_is_held_doubling_and_parked
     assert_eq!(db.int("SELECT COUNT(*) FROM owed_dirty"), 1, "its mark stays");
 
     // the health serves the memo: the pair's and its one subject's (NEW-M1), its faults and its last error
-    let health = owed_events::health(&db).await;
+    // (D2-ACTOR-A-FOLD-4: the overlay's `/health/invariants.owedEvents`, its one shipped statement over this store)
+    let state = db
+        .run_batch(vec![low_app_layer::pot_hook::Stmt {
+            sql: publish::HEALTH_STATE_SQL.into(),
+            binds: vec![low_app_layer::pot_hook::Bind::Int(db.now_ms() as i64)],
+        }])
+        .await
+        .unwrap();
+    let health = publish::health_state_view(&state[0].rows[0]);
     assert_eq!(health["faultMemo"]["rows"], 2);
     assert!(health["faultMemo"]["last"]["lastFault"]
         .as_str()

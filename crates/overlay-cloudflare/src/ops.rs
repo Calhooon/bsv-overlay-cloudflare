@@ -1893,24 +1893,16 @@ pub async fn census_json(db: &D1Database) -> serde_json::Value {
 pub const APPLAYER_SCHEDULED_PASS_READ_SQL: &str =
     "SELECT at, started_at, wall_ms, phases, passes FROM applayer_scheduled_pass WHERE id = 1";
 
-/// bsv-low #911 (D2-ACTOR-A, MEDIUM-8): the `owed-events` consumer's batch row, written by the app layer's consumer
-/// (the oldest message's enqueue age of its last batch): one primary-key read.
-pub const OWED_EVENTS_CONSUMER_READ_SQL: &str =
-    "SELECT cursor,tickedAtMs FROM owed_belt_state WHERE name='owed-events:consumer'";
-
-async fn owed_events_consumer_view(db: &D1Database) -> serde_json::Value {
-    #[derive(serde::Deserialize)]
-    struct Row {
-        cursor: Option<String>,
-    }
-    match Query::new(OWED_EVENTS_CONSUMER_READ_SQL)
-        .fetch_optional::<Row>(db)
+/// bsv-low #911 (D2-ACTOR-A, MEDIUM-8; D2-ACTOR-A-FOLD-4): the `owed-events` consumer's state, ONE statement
+/// (`owed_events::HEALTH_STATE_SQL`): its batch row (the oldest message's enqueue age), the fault memo and the parked
+/// letters by status.
+async fn owed_events_consumer_view(db: &D1Database, now: i64) -> serde_json::Value {
+    match Query::new(crate::owed_events::HEALTH_STATE_SQL)
+        .bind(now)
+        .fetch_optional::<serde_json::Value>(db)
         .await
     {
-        Ok(Some(r)) => r
-            .cursor
-            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-            .unwrap_or(serde_json::Value::Null),
+        Ok(Some(r)) => crate::owed_events::health_state_view(&r),
         Ok(None) => serde_json::Value::Null,
         Err(e) => json!({ "readable": false, "fault": e }),
     }
@@ -2000,7 +1992,7 @@ pub async fn health_invariants(
         conflict_memo = crate::admit_fast::conflict_fault_memo_health(db, now),
         applayer_pass = applayer_scheduled_pass_view(db),
         chain_feed = crate::chain_feed::health_json(db),
-        owed_events_consumer = owed_events_consumer_view(db),
+        owed_events_consumer = owed_events_consumer_view(db, now),
     }
 
     let hb: Option<HeartbeatRow> = hb.ok().flatten();

@@ -80,6 +80,16 @@ fn hot_routes_never_scan_fleet_tables() {
     );
     for (route, sql) in [
         ("/health", low_app_layer::owed_judge::DIRTY_HEALTH_SQL.to_string()),
+        // bsv-low #911 (D2-ACTOR-A-FOLD-4): `/health.owedEvents`' one consumer-row read, and the overlay's
+        // `/health/invariants.owedEvents` state statement (the fault memo and the letters moved there)
+        (
+            "/health owed events",
+            low_app_layer::owed_events::HEALTH_CONSUMER_SQL.to_string(),
+        ),
+        (
+            "/health/invariants owed events",
+            low_app_layer::owed_events_publish::HEALTH_STATE_SQL.to_string(),
+        ),
         (
             "/results:view",
             low_app_layer::results::results_sql(None, 0),
