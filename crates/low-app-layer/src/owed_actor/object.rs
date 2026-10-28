@@ -108,8 +108,27 @@ impl Outside for EnvOutside<'_> {
 /// sets its alarm, [`OwedActor`]'s `rebuilt`), so a read serves `pending` until the bootstrap ends (Rule 23: never
 /// a short list served as complete).
 pub fn schema_plan(held_digest: Option<&str>) -> Vec<String> {
+    schema_plan_kept(held_digest, None, &[])
+}
+
+/// The delta lens's NEW-M2: [`schema_plan`] with the held SHAPE ([`actor_shape`]) and the held indexes' names. A
+/// digest move whose shape is the render's is index-only: every held index dropped and the render's created, the rows
+/// and `meta` kept (no rebuild, no bootstrap, no read served `pending`). Otherwise the rebuild of HIGH-4.
+pub fn schema_plan_kept(
+    held_digest: Option<&str>,
+    held_shape: Option<&str>,
+    held_indexes: &[String],
+) -> Vec<String> {
     if held_digest == Some(actor_digest().as_str()) {
         return Vec::new();
+    }
+    if held_digest.is_some() && held_shape == Some(actor_shape().as_str()) {
+        let mut out: Vec<String> = held_indexes
+            .iter()
+            .map(|i| format!("DROP INDEX IF EXISTS \"{}\"", i.replace('"', "")))
+            .collect();
+        out.extend(mirror_ddl());
+        return out;
     }
     let mut out = Vec::new();
     if held_digest.is_some() {
@@ -136,6 +155,10 @@ pub fn schema_plan(held_digest: Option<&str>) -> Vec<String> {
     }
     out
 }
+
+/// The indexes the actor's SQLite holds that a statement made (never an automatic one).
+pub const HELD_INDEXES_SQL: &str =
+    "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name";
 
 /// The `/apply` body.
 #[derive(Debug, serde::Deserialize)]
@@ -278,6 +301,9 @@ impl DurableObject for OwedActor {
                     .and_then(|v| v.parse::<i64>().ok())
                     .unwrap_or(-1);
                 let games = self.gated_games(&local, t, last);
+                // The delta lens's NEW-L1: `tipJudged` moves only when every apply of the window answered; a faulted
+                // one leaves the window open for the next alarm (its gates selected again).
+                let mut answered = true;
                 for chunk in games.chunks(GAMES_PER_APPLY) {
                     let body = ApplyBody {
                         identity: identity.clone(),
@@ -289,9 +315,14 @@ impl DurableObject for OwedActor {
                         txfacts: Vec::new(),
                         mined: false,
                     };
-                    let _ = self.apply_route(body).await;
+                    answered &= self
+                        .apply_route(body)
+                        .await
+                        .is_ok_and(|r| r.status_code() == 200);
                 }
-                self.put_meta(&local, META_TIP_JUDGED, &t.to_string());
+                if answered {
+                    self.put_meta(&local, META_TIP_JUDGED, &t.to_string());
+                }
             }
             self.arm_tip_alarm(&local, tip).await;
         }
@@ -312,10 +343,42 @@ impl OwedActor {
                     r.first()
                         .and_then(|v| v["value"].as_str().map(str::to_string))
                 });
-            let plan = schema_plan(held.as_deref());
-            if held.is_some() && !plan.is_empty() {
+            let read_one = |sql: &str| -> Option<String> {
+                local
+                    .sql
+                    .exec(sql, None)
+                    .ok()
+                    .and_then(|c| c.to_array::<Value>().ok())
+                    .and_then(|r| {
+                        r.first()
+                            .and_then(|v| v["value"].as_str().map(str::to_string))
+                    })
+            };
+            let held_shape = read_one("SELECT value FROM meta WHERE name='shape'");
+            let held_indexes: Vec<String> =
+                if held.is_some() && held.as_deref() != Some(actor_digest().as_str()) {
+                    local
+                        .sql
+                        .exec(HELD_INDEXES_SQL, None)
+                        .ok()
+                        .and_then(|c| c.to_array::<Value>().ok())
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|r| r["name"].as_str().map(str::to_string))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            let plan = schema_plan_kept(held.as_deref(), held_shape.as_deref(), &held_indexes);
+            let index_only =
+                held.is_some() && held_shape.as_deref() == Some(actor_shape().as_str());
+            if held.is_some() && !plan.is_empty() && !index_only {
                 console_log!("[owed-actor] rebuilt under a new digest: the judge's tables dropped, the bootstrap re-armed");
                 *self.rebuilt.borrow_mut() = true;
+            } else if !plan.is_empty() && index_only {
+                console_log!(
+                    "[owed-actor] an index-only digest move: the indexes rebuilt, the rows kept"
+                );
             }
             for s in plan {
                 if let Err(e) = local.sql.exec(&s, None) {
@@ -327,6 +390,13 @@ impl OwedActor {
                 vec![
                     SqlStorageValue::from(META_SCHEMA.to_string()),
                     SqlStorageValue::from(actor_digest()),
+                ],
+            );
+            let _ = local.sql.exec(
+                META_PUT_SQL,
+                vec![
+                    SqlStorageValue::from("shape".to_string()),
+                    SqlStorageValue::from(actor_shape()),
                 ],
             );
             *self.ready.borrow_mut() = true;
@@ -366,10 +436,7 @@ impl OwedActor {
     /// MEDIUM-5: the era the actor holds against the render's ([`actor_epoch`]): another era's actor is RESET (its
     /// storage and its alarm, inside its turn) before it answers, then stamped; counted `owed_actor_epoch_resets_total`.
     async fn check_epoch(&self) {
-        let current = actor_epoch(
-            self.env.var("STORAGE_EPOCH").ok().map(|v| v.to_string()),
-            crate::routes::written_off_before_ms_env(&self.env),
-        );
+        let current = env_epoch(&self.env);
         let held = self.meta(META_EPOCH);
         match epoch_verdict(held.as_deref(), &current) {
             EpochVerdict::Keep => {}
@@ -631,7 +698,9 @@ impl OwedActor {
 
     /// MEDIUM-6: one bootstrap page (16 games, newest first) per alarm, resumable on its keyset cursor (LOW-6),
     /// until the page is short: then the actor is bootstrapped and its reads serve its rows, counted durably
-    /// (`owed_actor_bootstraps_total`, served `/health.owedActor.bootstraps`, the D2-ACTOR-B lens's MEDIUM-1).
+    /// (`owed_actor_bootstraps_total`, served `/health.owedActor.bootstraps`, the D2-ACTOR-B lens's MEDIUM-1). The
+    /// delta lens's NEW-M2: each page takes a token of the fleet's budget first ([`boot_pace`]), and the pages of one
+    /// actor are [`BOOTSTRAP_PAGE_DELAY_MS`] apart.
     async fn bootstrap_page(&self, local: &DoSql) -> Result<()> {
         let (Some(me), Some(cursor)) = (self.meta(META_IDENTITY), self.meta(META_BOOT_CURSOR))
         else {
@@ -639,6 +708,22 @@ impl OwedActor {
         };
         let (at, after) = boot_keyset(Some(&cursor));
         let record = crate::routes::D1Sql::of(&self.env)?;
+        // NEW-M2: one token of the fleet's bootstrap budget, or a wait for a slot in a later minute.
+        let now = Date::now().as_millis();
+        let taken = record
+            .run_batch(vec![
+                Stmt::new(BOOT_BUDGET_TAKE_SQL, vec![Bind::Int(now as i64)]),
+                Stmt::new(BOOT_BUDGET_READ_SQL, vec![]),
+            ])
+            .await
+            .map_err(Error::RustError)?
+            .get(1)
+            .and_then(|o| o.rows.first().and_then(|r| r["taken"].as_i64()))
+            .unwrap_or(0);
+        if let Some(wait) = boot_pace(taken, now, &me) {
+            self.state.storage().set_alarm(wait as i64).await?;
+            return Ok(());
+        }
         let page = record
             .run_batch(vec![Stmt::new(
                 crate::owed_judge::IDENTITY_GAMES_AFTER_SQL,
@@ -688,7 +773,7 @@ impl OwedActor {
             );
             self.state
                 .storage()
-                .set_alarm(Date::now().as_millis() as i64 + 1)
+                .set_alarm((Date::now().as_millis() + BOOTSTRAP_PAGE_DELAY_MS) as i64)
                 .await?;
         }
         Ok(())
@@ -702,7 +787,9 @@ impl OwedActor {
             return;
         };
         let now = Date::now().as_millis();
-        let body = kv_copy_body(&me, &self.rows_of(local, &me), now);
+        let mut body = kv_copy_body(&me, &self.rows_of(local, &me), now);
+        // NEW-L2: the copy names its era; a read of another era serves none of it.
+        body["epoch"] = json!(env_epoch(&self.env));
         let put = kv.put(&me, body.to_string());
         if let Ok(put) = put {
             if put.execute().await.is_ok() {
@@ -714,6 +801,14 @@ impl OwedActor {
             }
         }
     }
+}
+
+/// The render's era ([`actor_epoch`] of `STORAGE_EPOCH` and `WRITTEN_OFF_BEFORE_MS`).
+pub fn env_epoch(env: &Env) -> String {
+    actor_epoch(
+        env.var("STORAGE_EPOCH").ok().map(|v| v.to_string()),
+        crate::routes::written_off_before_ms_env(env),
+    )
 }
 
 /// A stub of the identity's actor, `None` without the binding or for a key that is not 66-hex.
@@ -825,7 +920,10 @@ pub async fn call_stored(
 pub async fn read_kv_copy(env: &Env, identity: &str) -> Option<Value> {
     let kv = env.kv(KV_BINDING).ok()?;
     let id = actor_name(identity)?;
-    kv.get(&id).json::<Value>().await.ok().flatten()
+    kv_copy_of_era(
+        kv.get(&id).json::<Value>().await.ok().flatten(),
+        &env_epoch(env),
+    )
 }
 
 /// The read's wall on the actor (the KV copy past it).
@@ -900,9 +998,11 @@ pub(crate) enum ActorRead {
 }
 
 /// MEDIUM-3: does D1 know the identity (a stated owed list, or a party, hop marker or evicted party row: the
-/// existing indexed probe `owed_read::read_with` asks of an unstated one)?
+/// existing indexed probe `owed_read::read_with` asks of an unstated one)? The delta lens's NEW-M1: the probe's
+/// answer (`known`) is the gate, never a wanted mark: in Phase C nothing writes D1's `owed_state`, and a mark per read
+/// re-judged a new player's whole identity on every sweep tick.
 pub fn known_to_d1(snapshot: &crate::owed_read::Snapshot) -> bool {
-    snapshot.state.is_some() || snapshot.wanted
+    snapshot.state.is_some() || snapshot.wanted || snapshot.known
 }
 
 /// Phase B's read (`OWED_ACTOR_READ`). FIRST D1's state and pending marks (LOW-5: never D1's rows): an identity D1
@@ -1008,8 +1108,9 @@ pub async fn call_bootstrap(
 /// THE PHASE A BOOTSTRAP LEVER (the D2-ACTOR-B lens's MEDIUM-1): `POST /internal/owed-actor-bootstrap` (bearer
 /// `INTERNAL_TOKEN`), body empty, `{}` or `{"after": "<identity>"}`: every identity D1 knows ([`RESET_IDENTITIES_SQL`]'s
 /// union), [`BOOTSTRAP_PER_CALL`] a call past `after`, each actor's `/bootstrap` (armed now, already bootstrapped, or
-/// a fault), `next` the cursor (`null` at the end). Run it in Phase A until `next` is null, then read
-/// `/health.owedActor.bootstraps` against `activeIdentities` before the Phase B flip.
+/// a fault), `next` the cursor (`null` at the end). Run it in Phase A until `next` is null, then run a SECOND full pass
+/// and read its `coverage` (also `/health.owedActor.coverage`): Phase B's gate is that pass `complete`, `contiguous`
+/// and `uncovered` 0 (the delta lens's NEW-L3; `bootstraps` against `activeIdentities` is a hint only).
 pub const BOOTSTRAP_PER_CALL: usize = 50;
 pub async fn bootstrap_lever(mut req: Request, env: &Env) -> Result<Response> {
     if !crate::internal_events::internal_bearer_ok(&req, env) {
@@ -1031,7 +1132,10 @@ pub async fn bootstrap_lever(mut req: Request, env: &Env) -> Result<Response> {
     let rows = db
         .run_batch(vec![Stmt::new(
             RESET_IDENTITIES_SQL,
-            vec![Bind::Text(after), Bind::Int(BOOTSTRAP_PER_CALL as i64)],
+            vec![
+                Bind::Text(after.clone()),
+                Bind::Int(BOOTSTRAP_PER_CALL as i64),
+            ],
         )])
         .await
         .map_err(Error::RustError)?
@@ -1059,8 +1163,40 @@ pub async fn bootstrap_lever(mut req: Request, env: &Env) -> Result<Response> {
     let next = (ids.len() == BOOTSTRAP_PER_CALL)
         .then(|| ids.last().cloned())
         .flatten();
+    // NEW-L3: the pass's coverage, folded into its ledger row (an identity is covered only when it answered
+    // `bootstrapped`; a key that is not 66-hex has no actor and is counted apart).
+    let uncovered = ids.len() - skipped.len() - done as usize;
+    let prev: Option<Value> = db
+        .run_batch(vec![Stmt::new(COVERAGE_READ_SQL, vec![])])
+        .await
+        .ok()
+        .and_then(|o| o.into_iter().next())
+        .and_then(|o| o.rows.into_iter().next())
+        .and_then(|r| {
+            r["cursor"]
+                .as_str()
+                .and_then(|s| serde_json::from_str(s).ok())
+        });
+    let coverage = coverage_fold(
+        prev.as_ref(),
+        &after,
+        ids.len() - skipped.len(),
+        uncovered,
+        next.as_deref(),
+        Date::now().as_millis(),
+    );
+    let _ = db
+        .run_batch(vec![Stmt::new(
+            crate::owed_belt::STATE_SQL,
+            vec![
+                Bind::Text(COVERAGE_NAME.into()),
+                Bind::Text(coverage.to_string()),
+                Bind::Int(Date::now().as_millis() as i64),
+            ],
+        )])
+        .await;
     Response::from_json(
-        &json!({"identities": ids.len(), "armed": armed, "bootstrapped": done, "skipped": skipped, "faults": faults, "next": next}),
+        &json!({"identities": ids.len(), "armed": armed, "bootstrapped": done, "skipped": skipped, "faults": faults, "next": next, "coverage": coverage}),
     )
 }
 

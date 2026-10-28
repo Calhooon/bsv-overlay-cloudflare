@@ -84,7 +84,9 @@ pub async fn drain_changed_within(
     limit: usize,
 ) -> Result<DrainReport, String> {
     let limit = limit.min(OWED_JUDGE_SUBJECTS_PER_INVOCATION);
-    if limit == 0 {
+    // bsv-low #912 (the D2-ACTOR-B delta lens's NEW-H1): no D1-only judge under the actor's read (its acknowledgement
+    // would remove marks the actor never applied); the marks stand for the consumer.
+    if limit == 0 || db.actor_reads() {
         return Ok(DrainReport::default());
     }
     let candidates: Vec<Value> = hydrate::read(

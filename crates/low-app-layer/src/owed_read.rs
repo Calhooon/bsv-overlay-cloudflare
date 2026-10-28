@@ -19,10 +19,19 @@ pub const STATE_SQL: &str =
 /// written (the judge deletes `generation <= seen` for each subject it judges), so its presence is what "newer than the
 /// row's judgement" means; `markedAtMs` cannot say it (a `pot` mark carries the pot row's `createdAt`). A filing's, a
 /// tip's, a wanted or an age mark is not a downgrade; a belt find is judged in its own batch and leaves no mark.
-pub const PENDING_SQL: &str = "SELECT COUNT(*) AS pending,json_group_array(CASE WHEN downgrade=1 THEN json_array(gameId,source) END) AS downgrades FROM owed_dirty WHERE identity=?1";
+///
+/// bsv-low #912 (the D2-ACTOR-B delta lens's NEW-M3): the same row carries the Phase C rollback's two stamps
+/// (`view_derivation_state`, two primary-key probes, no statement added): `actorJudged`, written by every Phase C
+/// acknowledgement (`owed_actor::PHASE_C_MARK_SQL`), and `owedV3`, the re-judge's stamp, which that acknowledgement
+/// deletes. While the first stands without the second, D1's `owed_rows` are the rows of the Phase C flip, not a
+/// judgement, and the D1 read serves no press from them.
+pub const PENDING_SQL: &str = "SELECT COUNT(*) AS pending,json_group_array(CASE WHEN downgrade=1 THEN json_array(gameId,source) END) AS downgrades,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-actor-judged') AS actorJudged,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-v3') AS owedV3 FROM owed_dirty WHERE identity=?1";
 /// The served reason of a press withheld over a pending downgrade (D2-L1).
 pub const PENDING_DOWNGRADE_REASON: &str =
     "re-judging: a downgrade of this game is recorded and not yet judged; the press waits for the judgement";
+/// The served reason of a press withheld while the Phase C rollback's re-judge has not stamped `owed-v3` (NEW-M3).
+pub const ROLLBACK_PENDING_REASON: &str =
+    "re-judging: the owed list is being rebuilt after the actor served it; the press waits for the re-judge";
 
 #[derive(Debug, Default)]
 pub struct Snapshot {
@@ -30,6 +39,12 @@ pub struct Snapshot {
     pub state: Option<Value>,
     pub pending: u64,
     pub wanted: bool,
+    /// bsv-low #912 (the D2-ACTOR-B delta lens's NEW-M1): the actor's read (`rows: false`) found the identity by the
+    /// indexed probe (a party, hop marker or evicted party row) with no stated list, and wrote NO wanted mark: the
+    /// actor judges the identity (its events, its bootstrap), so a mark would only re-judge it whole each sweep.
+    pub known: bool,
+    /// NEW-M3: the D1 read of a database a Phase C actor judged, before the `owed-v3` re-judge stamped: no press.
+    pub rollback_pending: bool,
     /// The games holding an undrained downgrade-class mark, each with its source (D2-L1).
     pub downgrades: BTreeMap<String, String>,
 }
@@ -112,6 +127,18 @@ pub async fn read_with(db: &impl SqlPort, identity: &str, rows: bool) -> Result<
         state,
         pending,
         wanted: false,
+        known: false,
+        rollback_pending: rows
+            && marks
+                .as_ref()
+                .and_then(|r| number(&r["actorJudged"]))
+                .unwrap_or(0)
+                > 0
+            && marks
+                .as_ref()
+                .and_then(|r| number(&r["owedV3"]))
+                .unwrap_or(0)
+                == 0,
         downgrades,
     };
     if snapshot.state.is_none() {
@@ -123,8 +150,12 @@ pub async fn read_with(db: &impl SqlPort, identity: &str, rows: bool) -> Result<
             }])
             .await?;
         if probe.first().is_some_and(|r| !r.rows.is_empty()) {
-            crate::owed_judge::mark_wanted(&WantedMarker(db), identity).await?;
-            snapshot.wanted = true;
+            if rows {
+                crate::owed_judge::mark_wanted(&WantedMarker(db), identity).await?;
+                snapshot.wanted = true;
+            } else {
+                snapshot.known = true;
+            }
         }
     }
     Ok(snapshot)
@@ -238,6 +269,16 @@ impl Snapshot {
                 // The second delta lens's D2-L1 (the captain's ruling): a read never does work, but never serves a
                 // press over a pending downgrade. A game holding an undrained downgrade-class mark serves its press
                 // withheld as re-judging; the drain's judgement lifts it.
+                // NEW-M3: D1's rows after a Phase C actor judged, before the `owed-v3` re-judge: no press.
+                if self.rollback_pending && facts["claimable"] == Value::Bool(true) {
+                    facts["claimable"] = json!(false);
+                    facts["claimableBeforePending"] = json!(true);
+                    facts["refresh"] = json!("pending");
+                    facts["pendingSource"] = json!("owed-v3");
+                    facts["stale"] = json!(true);
+                    facts["retryAfterMs"] = json!(1500);
+                    facts["claimReason"] = json!(ROLLBACK_PENDING_REASON);
+                }
                 if facts["claimable"] == Value::Bool(true) {
                     if let Some(source) = joined["gameId"]
                         .as_str()

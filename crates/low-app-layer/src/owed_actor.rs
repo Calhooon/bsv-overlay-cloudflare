@@ -589,14 +589,58 @@ pub const APPLIED_SQL: &str = "INSERT INTO applied(kind,seq,game,atMs) SELECT ?1
 /// LOW-2 (the D2-ACTOR-B lens): the redelivery rows older than [`APPLIED_KEEP_MS`] go.
 pub const APPLIED_PRUNE_SQL: &str = "DELETE FROM applied WHERE atMs<?1";
 pub const APPLIED_KEEP_MS: i64 = 7 * 86_400_000;
-/// The games of `?3` the event `(?1, ?2)` has applied.
-pub const APPLIED_GAMES_SQL: &str = "SELECT game FROM applied WHERE kind=?1 AND seq=?2 AND game IN (SELECT value FROM json_each(?3))";
 /// The version of the actor's own tables (`txfacts`, `applied`, `meta`) beside the mirror's generated digest: a move
 /// of either rebuilds the actor (HIGH-4, [`actor_digest`]).
 pub const ACTOR_TABLES_VERSION: &str = "applied-per-game-1";
 /// The digest an actor holds in `meta` (`schema`): the mirror's and the actor's own tables'.
 pub fn actor_digest() -> String {
     format!("{}+{ACTOR_TABLES_VERSION}", schema::DIGEST)
+}
+/// The delta lens's NEW-M2: the SHAPE an actor holds in `meta` (`shape`): the digest of every statement of
+/// [`mirror_ddl`] but a plain `CREATE INDEX` (the tables, the `UNIQUE` indexes, which decide a write, and the
+/// row-count triggers) with [`ACTOR_TABLES_VERSION`]. A digest move whose shape holds is an INDEX-ONLY change: the
+/// actor drops its indexes and creates the render's, its rows, its bootstrap and its judgement kept
+/// ([`object::schema_plan_kept`]); only a move of the shape rebuilds (HIGH-4).
+pub fn actor_shape() -> String {
+    let shape: Vec<String> = mirror_ddl()
+        .into_iter()
+        .filter(|s| !is_plain_index(s))
+        .collect();
+    format!(
+        "{}+{ACTOR_TABLES_VERSION}",
+        hex::encode(bsv_rs::primitives::hash::sha256(
+            shape.join("\n").as_bytes()
+        ))
+    )
+}
+/// THE BOOTSTRAP'S FLEET BUDGET (the delta lens's NEW-M2): every actor's bootstrap page (a whole closure read over D1)
+/// first takes one token of a window shared by the fleet, one row of the belt's ledger (`owed-actor:boot-budget`:
+/// the minute's taken count in `cursor`, the minute in `tickedAtMs`), [`BOOTSTRAP_PAGES_PER_MINUTE`] a minute; past it
+/// the page waits for its slot in a later minute ([`boot_pace`]), and an actor's pages are
+/// [`BOOTSTRAP_PAGE_DELAY_MS`] apart (they were 1 ms). So a digest-moving or era-moving deploy re-bootstraps the
+/// fleet at 60 pages (960 games) a minute, whatever the reads that arm it.
+pub const BOOTSTRAP_PAGES_PER_MINUTE: i64 = 60;
+pub const BOOTSTRAP_PAGE_DELAY_MS: u64 = 1_000;
+pub const BOOT_BUDGET_TAKE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-actor:boot-budget','1',?1/60000) ON CONFLICT(name) DO UPDATE SET cursor=CASE WHEN owed_belt_state.tickedAtMs=excluded.tickedAtMs THEN CAST(CAST(owed_belt_state.cursor AS INTEGER)+1 AS TEXT) ELSE '1' END,tickedAtMs=excluded.tickedAtMs";
+pub const BOOT_BUDGET_READ_SQL: &str = "SELECT CAST(cursor AS INTEGER) AS taken FROM owed_belt_state WHERE name='owed-actor:boot-budget'";
+/// The page's verdict for the `taken`-th token of this minute: `None` runs it; `Some(at)` is its wait, a slot in
+/// the next minute spread by the identity (so the waiting actors do not all wake at the minute's edge).
+pub fn boot_pace(taken: i64, now_ms: u64, identity: &str) -> Option<u64> {
+    if taken <= BOOTSTRAP_PAGES_PER_MINUTE {
+        return None;
+    }
+    let spread = identity
+        .bytes()
+        .skip(2)
+        .take(8)
+        .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b)))
+        % 60_000;
+    Some((now_ms / 60_000 + 1) * 60_000 + spread)
+}
+
+/// A `CREATE INDEX` statement (never `CREATE UNIQUE INDEX`).
+pub fn is_plain_index(ddl: &str) -> bool {
+    ddl.trim_start().starts_with("CREATE INDEX")
 }
 /// The judge's own tables (their indexes and triggers go with them): dropped and recreated on a digest change.
 pub const JUDGE_TABLES: [&str; 4] = ["owed_rows", "owed_row_words", "owed_state", "owed_dirty"];
@@ -620,10 +664,9 @@ pub struct ApplyReport {
     pub record_rows: usize,
     pub rows: usize,
     pub missed: bool,
-    /// Every game the call names was already applied by its event: nothing judged.
-    pub skipped_redelivery: bool,
-    /// The games the event has applied, by this call or an earlier delivery of it (Phase C acknowledges exactly
-    /// these games' marks, HIGH-1).
+    /// The games this call applied (Phase C acknowledges exactly these games' marks, HIGH-1). The delta lens's NEW-H1
+    /// (b): a redelivery is applied again, never skipped as "applied by an earlier delivery": the skip acknowledged a
+    /// mark newer than that delivery's apply, unjudged.
     pub applied_games: Vec<String>,
 }
 
@@ -783,8 +826,9 @@ async fn keys_of_mirror(
 const JUDGED_TXIDS_SQL: &str = "SELECT r.outpoint,r.facts,w.txid FROM owed_rows r LEFT JOIN owed_row_words w ON w.identity=r.identity AND w.outpoint=r.outpoint WHERE r.identity=?1 AND r.gameId IN (SELECT value FROM json_each(?2))";
 
 /// THE APPLY: the closure over `games` of `me`, then the last judgement over the mirror with the outside held.
-/// `kind_seq` is the event's token: a game the event already applied is skipped (HIGH-1: the key is per game), and
-/// a call whose every game was applied returns at once (`skipped_redelivery`).
+/// `kind_seq` is the event's token, recorded in `applied` (the served `ackSeq`); a redelivery is applied again (the
+/// delta lens's NEW-H1 (b): its record read is the record as it stands, the same judgement or a newer one, and the
+/// consumer acknowledges only the marks it read before this apply).
 ///
 /// HIGH-2: only the FIXPOINT round's judgement is written ([`Noting`] stages each round's commit), in one
 /// synchronous batch after the identity's judged rows are snapshotted; a fault of that batch restores them, so no
@@ -809,40 +853,8 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
         }
     }
     wanted.truncate(GAMES_PER_APPLY);
-    let mut games = wanted;
+    let games = wanted;
     let mut report = ApplyReport::default();
-    if let Some((kind, seq)) = kind_seq {
-        let seen = local
-            .run_batch(vec![Stmt::new(
-                APPLIED_GAMES_SQL,
-                vec![
-                    Bind::Text(kind.into()),
-                    Bind::Int(seq),
-                    Bind::Text(json!(games).to_string()),
-                ],
-            )])
-            .await?;
-        let done: BTreeSet<String> = seen
-            .first()
-            .map(|o| {
-                o.rows
-                    .iter()
-                    .filter_map(|r| r["game"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        report.applied_games = games
-            .iter()
-            .filter(|g| done.contains(*g))
-            .cloned()
-            .collect();
-        games.retain(|g| !done.contains(g));
-        if games.is_empty() {
-            report.skipped_redelivery = true;
-            return Ok((report, Vec::new()));
-        }
-    }
-    let games = games;
     let seq = kind_seq.map_or(0, |(_, s)| s);
     let held = Held::default();
     // The closure starts from what the mirror already names for these games (the last apply's domain): in the steady
@@ -1026,7 +1038,7 @@ pub async fn commit_fixpoint<L: SqlPort>(
 /// The answer of one apply (the object's `/apply`, the pins' harness): the actor's rows, the redelivery verdict, the
 /// games the event has applied.
 pub fn answer_of(report: &ApplyReport, rows: Vec<Value>) -> Value {
-    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "skippedRedelivery": report.skipped_redelivery, "missed": report.missed, "appliedGames": report.applied_games})
+    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games})
 }
 
 /// MEDIUM-2's in-object serial queue: every apply of one actor takes its turn, so an event arriving during another's
@@ -1127,7 +1139,7 @@ pub async fn apply_and_publish_in_turn<R: SqlPort, L: SqlPort, O: Outside>(
 ) -> Result<(ApplyReport, Vec<(String, Value)>), String> {
     let _turn = turn.lock().await;
     let applied = apply(record, local, outside, me, games, kind_seq, tip, era_ms).await?;
-    if publish && !applied.0.skipped_redelivery {
+    if publish {
         publish_belt_asks(record, local, me, games).await?;
     }
     Ok(applied)
@@ -1220,6 +1232,12 @@ pub fn diff_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
 /// The KV display copy (MEDIUM-9): the actor's stored rows (`ROWS_SQL`'s), written at most once a second.
 pub fn kv_copy_body(identity: &str, rows: &[Value], judged_at_ms: u64) -> Value {
     json!({"identity": identity, "judgedAtMs": judged_at_ms, "rows": rows})
+}
+/// The delta lens's NEW-L2: the copy carries the era it was written in ([`actor_epoch`]), and a read serves no copy of
+/// another era (an era reset or a rebuild's copy shows the previous era's rows otherwise, display only, until the
+/// bootstrap ends). A copy with no era (written before the fold) is another era's.
+pub fn kv_copy_of_era(copy: Option<Value>, epoch: &str) -> Option<Value> {
+    copy.filter(|c| c["epoch"].as_str() == Some(epoch))
 }
 /// The reason a bootstrapping actor's read is served with (the D2-ACTOR-B lens's MEDIUM-1).
 pub const BOOTSTRAP_REASON: &str = "the judge is building this identity's rows; re-read";
@@ -1658,7 +1676,7 @@ pub fn fleet_bars(rows: &[Value], now: u64) -> Value {
 
 /// `/health.owedActor`'s one D1 statement (MEDIUM-1, MEDIUM-7, MEDIUM-8): the class rows, the actor's durable totals
 /// and the identities holding owed rows (a count over `owed_state`, one row an identity).
-pub const HEALTH_SQL: &str = "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',tickedAtMs)) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities";
+pub const HEALTH_SQL: &str = "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',tickedAtMs)) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage";
 
 /// The served object: this isolate's bars under `isolate`, the fleet's figures at the top (the harness's keys),
 /// the durable compare totals (MEDIUM-8: Phase B's gate), the bootstraps beside the identities holding rows
@@ -1693,6 +1711,14 @@ pub fn health_body(
     body["unknownReads"] = json!(n(COUNTERS[11]));
     body["epochResets"] = json!(n(COUNTERS[12]));
     body["deferred"] = json!(n(COUNTERS[13]));
+    // NEW-L6: the deferred applies started (above) and ended; the difference is what `wait_until`'s bound cut.
+    body["deferredDone"] = json!(n(COUNTERS[16]));
+    // NEW-L3: Phase B's gate is COVERAGE, the bootstrap lever's last full pass (`complete`, `contiguous`, `uncovered`
+    // 0), never `bootstraps` against `activeIdentities` (two counts).
+    body["coverage"] = read
+        .and_then(|r| r["coverage"].as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Null);
     body["v3"] = json!({"identities": n(COUNTERS[14]), "rows": n(COUNTERS[15])});
     body["activeIdentities"] = json!(read.and_then(|r| r["activeIdentities"].as_u64()));
     body["oldestUnappliedEventAgeMs"] = if d1_judges {
@@ -1702,6 +1728,42 @@ pub fn health_body(
     };
     body["healthRead"] = json!(read.is_some());
     body
+}
+
+/// THE BOOTSTRAP'S COVERAGE (the delta lens's NEW-L3): one row of the belt's ledger (`owed-actor:coverage`), folded
+/// by every call of the bootstrap lever ([`coverage_fold`]): a call from the start (`after` empty) opens a pass, each
+/// call adds its identities and the UNCOVERED ones (armed now, still bootstrapping, a fault: any answer but
+/// `bootstrapped`), a call whose `after` is not the pass's `next` breaks it (`contiguous: false`), and the call that
+/// answers `next: null` closes it (`complete`). Phase B's gate: a pass `complete`, `contiguous` and `uncovered` 0,
+/// started after the last deploy that could move a digest or an era (its `startedAtMs`).
+pub const COVERAGE_NAME: &str = "owed-actor:coverage";
+pub const COVERAGE_READ_SQL: &str =
+    "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage'";
+pub fn coverage_fold(
+    prev: Option<&Value>,
+    after: &str,
+    identities: usize,
+    uncovered: usize,
+    next: Option<&str>,
+    now: u64,
+) -> Value {
+    let mut c = match prev {
+        Some(p) if !after.is_empty() => p.clone(),
+        _ => {
+            json!({"startedAtMs": now, "identities": 0, "uncovered": 0, "contiguous": true, "complete": false, "next": ""})
+        }
+    };
+    if !after.is_empty() && (c["complete"] == true || c["next"].as_str() != Some(after)) {
+        c["contiguous"] = json!(false);
+    }
+    c["identities"] = json!(c["identities"].as_u64().unwrap_or(0) + identities as u64);
+    c["uncovered"] = json!(c["uncovered"].as_u64().unwrap_or(0) + uncovered as u64);
+    c["next"] = json!(next);
+    c["complete"] = json!(next.is_none());
+    if next.is_none() {
+        c["endedAtMs"] = json!(now);
+    }
+    c
 }
 
 /// The sampled digest compare (MEDIUM-10, the reconcile's second question; the exact first, the un-acked marks
@@ -1917,7 +1979,7 @@ mod tests;
 /// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
 /// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
 /// (MEDIUM-9).
-pub const COUNTERS: [&str; 16] = [
+pub const COUNTERS: [&str; 17] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -1934,6 +1996,8 @@ pub const COUNTERS: [&str; 16] = [
     "owed_actor_deferred_total",
     "owed_v3_identities_total",
     "owed_v3_rows_total",
+    // The delta lens's NEW-L6: the deferred applies that ENDED (`owed_actor_deferred_total` counts each at its start).
+    "owed_actor_deferred_done_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;
@@ -2031,6 +2095,11 @@ pub fn take_deferred() -> Vec<Deferred> {
 /// isolate's bars flushed (the queue class).
 pub async fn run_deferred(env: worker::Env, items: Vec<Deferred>) {
     let n = items.len() as u64;
+    // The delta lens's NEW-L6: counted at the START (a platform cut of `wait_until` loses the rest uncounted otherwise)
+    // and again at the end (`owed_actor_deferred_done_total`).
+    if let Ok(db) = crate::routes::D1Sql::of(&env) {
+        db.counters(vec![(COUNTERS[13].into(), n)]).await;
+    }
     for d in items {
         let Ok(judge) = crate::owed_judge::D1Judge::new(&env, d.tip, d.era_ms) else {
             continue;
@@ -2039,7 +2108,7 @@ pub async fn run_deferred(env: worker::Env, items: Vec<Deferred>) {
         beside(&judge, &d.identity, &d.games).await;
     }
     if let Ok(db) = crate::routes::D1Sql::of(&env) {
-        db.counters(vec![(COUNTERS[13].into(), n)]).await;
+        db.counters(vec![(COUNTERS[16].into(), n)]).await;
         flush_bars(&db, worker::Date::now().as_millis(), false).await;
     }
 }
@@ -2054,6 +2123,9 @@ pub async fn actor_then_d1(
     identity: &str,
     games: &[String],
 ) -> Result<crate::owed_judge::JudgeReport, String> {
+    // The delta lens's NEW-H1 (a): the acknowledgement's bound is read BEFORE the actor reads the record; a mark
+    // written while it applies is judged by D1 below but left standing for the actor's next apply.
+    let bound = crate::owed_judge::marks_bound(db, identity, games).await?;
     let answer = match db.actor_deliver(identity, games).await {
         Ok(a) => a,
         Err(e) => {
@@ -2068,7 +2140,9 @@ pub async fn actor_then_d1(
     if let Some(a) = &answer {
         note_answer(a);
     }
-    let report = crate::owed_judge::judge_subjects(db, identity, games, "owed-events").await?;
+    let report =
+        crate::owed_judge::judge_subjects_acked_to(db, identity, games, "owed-events", bound)
+            .await?;
     if let Some(a) = &answer {
         compare(db, identity, games, a).await;
     }
@@ -2127,10 +2201,11 @@ pub fn note_answer_into(bars: &mut Bars, answer: &Value) {
     }
 }
 
-/// PHASE C: the actor is the judge; the marks of the games the actor APPLIED (`appliedGames`: by this call, or an
-/// earlier delivery of the same event; the D2-ACTOR-B lens's HIGH-1) are acknowledged after it applied (the ack is
-/// what empties `owed_dirty`; a mark written meanwhile keeps its newer generation). A game the answer does not name
-/// keeps its marks.
+/// PHASE C: the actor is the judge; the marks of the games the actor APPLIED by THIS call (`appliedGames`; the
+/// D2-ACTOR-B lens's HIGH-1) are acknowledged after it applied, up to the generation read BEFORE the call (the delta
+/// lens's NEW-H1 (b): a redelivery is applied again, never skipped, so no mark newer than the apply's record read is
+/// acknowledged; a mark written meanwhile keeps its newer generation). A game the answer does not name keeps its
+/// marks.
 pub async fn as_the_judge(
     db: &impl JudgeDb,
     identity: &str,
@@ -2176,15 +2251,20 @@ pub async fn as_the_judge(
         ));
     }
     let gj = json!(applied).to_string();
-    db.run_batch(vec![Stmt::new(
-        crate::owed_judge::ACK_DIRTY_SQL,
-        vec![
-            Bind::Text(id),
-            Bind::Text(gj),
-            Bind::Int(seen),
-            Bind::Text("[]".into()),
-        ],
-    )])
+    db.run_batch(vec![
+        Stmt::new(
+            crate::owed_judge::ACK_DIRTY_SQL,
+            vec![
+                Bind::Text(id),
+                Bind::Text(gj),
+                Bind::Int(seen),
+                Bind::Text("[]".into()),
+            ],
+        ),
+        // NEW-M3: D1's `owed_rows` are no longer judged; the D1 read serves no press until `owed-v3` is stamped.
+        Stmt::new(PHASE_C_MARK_SQL, vec![]),
+        Stmt::new(OWED_V3_RESTART_SQL[0], vec![]),
+    ])
     .await?;
     Ok(crate::owed_judge::JudgeReport {
         subjects: applied.len(),
@@ -2201,6 +2281,11 @@ pub async fn as_the_judge(
 /// one ([`crate::owed_judge::IDENTITY_GAMES_BY_ID_SQL`]), 16 a judge call (`judge_subjects`, which acknowledges the
 /// marks it judged). Its state is one row of the belt's ledger (`rollback:owed-v3`: the last identity done and the
 /// open one with its last game). Counted `owed_v3_identities_total`, `owed_v3_rows_total`.
+/// The delta lens's NEW-M3: every Phase C acknowledgement stamps `owed-actor-judged` and deletes the `owed-v3` stamp
+/// in its own batch, so the D1 read (`owed_read::PENDING_SQL`'s two probes) withholds every press from D1's
+/// `owed_rows` (the rows of the flip) until the rollback's re-judge stamps `owed-v3` again.
+pub const PHASE_C_MARK_SQL: &str =
+    "INSERT OR IGNORE INTO view_derivation_state(name) VALUES ('owed-actor-judged')";
 pub const OWED_V3_STAMP: &str = "owed-v3";
 pub const OWED_V3_STATE: &str = "rollback:owed-v3";
 pub const OWED_V3_STAMP_SQL: &str =
@@ -2318,7 +2403,14 @@ pub async fn owed_v3_pass(
             db.run_batch(vec![save(&report)]).await?;
             continue;
         }
-        let judged = crate::owed_judge::judge_subjects(db, &identity, &games, "owed-v3").await?;
+        // The delta lens's NEW-H1 and NEW-M3: under the actor's read (the rollback's first render, the D1 judge back
+        // on with `OWED_ACTOR_READ` still on) the pass re-judges D1's rows and acknowledges NOTHING: the marks stand
+        // for the consumer, which applies the actor first and acknowledges under its bound.
+        let judged = if db.actor_reads() {
+            crate::owed_judge::judge_subjects_acked_to(db, &identity, &games, "owed-v3", 0).await?
+        } else {
+            crate::owed_judge::judge_subjects(db, &identity, &games, "owed-v3").await?
+        };
         report.games += games.len();
         report.rows += judged.rows;
         report.open = Some((identity, games.last().cloned().unwrap_or_default()));

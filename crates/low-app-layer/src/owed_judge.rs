@@ -563,6 +563,65 @@ pub async fn judge_subjects(
     judge_with_write(db, &subjects, source, Vec::new(), &[], |_| Ok(())).await
 }
 
+/// bsv-low #912 (the D2-ACTOR-B delta lens's NEW-H1): the judge's acknowledgement bounded by `ack_bound`, the marks'
+/// greatest generation read BEFORE another reader (the owed actor) read the record: a mark written after it is
+/// judged here but left for that reader's next apply, so no mark that withholds a press (D2-L1) is acknowledged
+/// before the rows the read serves were judged over its evidence. `0` acknowledges nothing (generations start at 1).
+pub async fn judge_subjects_acked_to(
+    db: &impl JudgeDb,
+    identity: &str,
+    games: &[String],
+    source: &str,
+    ack_bound: i64,
+) -> Result<JudgeReport, String> {
+    let subjects: Vec<_> = games
+        .iter()
+        .map(|g| Subject {
+            identity: identity.to_ascii_lowercase(),
+            game_id: g.to_ascii_lowercase(),
+        })
+        .collect();
+    judge_with_write_bounded(
+        db,
+        &subjects,
+        source,
+        Vec::new(),
+        &[],
+        Some(ack_bound),
+        |_| Ok(()),
+    )
+    .await
+}
+
+/// The greatest generation of the marks of `games` (0 with none): read BEFORE another judge reads the record, it is
+/// the bound of what may be acknowledged after both judged ([`judge_subjects_acked_to`]).
+pub async fn marks_bound(
+    db: &impl SqlPort,
+    identity: &str,
+    games: &[String],
+) -> Result<i64, String> {
+    let marks: Vec<Value> = hydrate::read(
+        db,
+        MARKS_SQL,
+        vec![
+            Bind::Text(identity.to_ascii_lowercase()),
+            Bind::Text(
+                json!(games
+                    .iter()
+                    .map(|g| g.to_ascii_lowercase())
+                    .collect::<Vec<_>>())
+                .to_string(),
+            ),
+        ],
+    )
+    .await?;
+    Ok(marks
+        .iter()
+        .filter_map(|m| m["generation"].as_i64())
+        .max()
+        .unwrap_or(0))
+}
+
 /// Source statements run first in the ONE atomic batch. `apply` receives all selected subjects' inputs;
 /// it must apply only already verified filing/evidence facts. Use both seats from `refund_subjects` for refunds.
 pub async fn judge_with_write(
@@ -571,6 +630,19 @@ pub async fn judge_with_write(
     source: &str,
     writes: Vec<Stmt>,
     owned_marks: &[FilingMark],
+    apply: impl FnOnce(&mut [JudgeInputs]) -> Result<(), String>,
+) -> Result<JudgeReport, String> {
+    judge_with_write_bounded(db, subjects, source, writes, owned_marks, None, apply).await
+}
+
+/// [`judge_with_write`] with its acknowledgement bounded by `ack_bound` (NEW-H1; `None`: the marks read here).
+pub async fn judge_with_write_bounded(
+    db: &impl JudgeDb,
+    subjects: &[Subject],
+    source: &str,
+    writes: Vec<Stmt>,
+    owned_marks: &[FilingMark],
+    ack_bound: Option<i64>,
     apply: impl FnOnce(&mut [JudgeInputs]) -> Result<(), String>,
 ) -> Result<JudgeReport, String> {
     if subjects.is_empty() && !writes.is_empty() {
@@ -697,7 +769,7 @@ pub async fn judge_with_write(
             binds: vec![
                 Bind::Text(id.clone()),
                 Bind::Text(json!(games).to_string()),
-                Bind::Int(seen[idx]),
+                Bind::Int(ack_bound.map_or(seen[idx], |b| b.min(seen[idx]))),
                 Bind::Text(json!(owned).to_string()),
             ],
         });
@@ -990,7 +1062,9 @@ pub async fn expand_wanted(db: &impl SqlPort, identity: &str, generation: i64) -
 pub async fn drain_dirty(db: &impl JudgeDb, limit: usize) -> Result<DrainReport, String> {
     let limit = limit.min(OWED_DIRTY_SUBJECTS_PER_PASS);
     let mut report = DrainReport::default();
-    if limit == 0 {
+    // bsv-low #912 (the D2-ACTOR-B delta lens's NEW-H1): no D1-only judge under the actor's read; the consumer
+    // (actor first, then D1 bounded) owns the marks.
+    if limit == 0 || db.actor_reads() {
         return Ok(report);
     }
     // Empty game IDs belong only to wanted envelopes, not derivable subjects.
@@ -1246,6 +1320,8 @@ pub(crate) fn assert_fixture_roundtrip(i: &OwedInputs<'_>) {
         state: Some(json!({"computedAtMs":i.now_ms,"tip":i.tip,"truncated":0})),
         pending: 0,
         wanted: false,
+        known: false,
+        rollback_pending: false,
         downgrades: BTreeMap::new(),
     };
     let empty = BTreeMap::new();
