@@ -87,6 +87,10 @@ fn hot_routes_never_scan_fleet_tables() {
             low_app_layer::owed_events::HEALTH_CONSUMER_SQL.to_string(),
         ),
         (
+            "/health owed events totals",
+            low_app_layer::owed_events::HEALTH_TOTALS_SQL.to_string(),
+        ),
+        (
             "/health/invariants owed events",
             low_app_layer::owed_events_publish::HEALTH_STATE_SQL.to_string(),
         ),

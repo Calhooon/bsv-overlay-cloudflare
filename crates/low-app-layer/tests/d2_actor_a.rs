@@ -1140,3 +1140,38 @@ fn delta3_low1_the_ingest_forgets_its_word_note() {
         .expect("the ingest forgets its own word note");
     assert!(event < forget);
 }
+
+/// D2-ACTOR-A-FOLD-5 (bsv-low #911, E2): `/health.owedEvents` serves the queue's two totals as NUMBERS (bsv-low's
+/// harness reads `publishedTotal - consumedTotal` there for its `owed-queue-backlog` row): 0 with no counter row,
+/// the durable counters once written, beside the ages and the pointer to the overlay's totals; read by ONE
+/// statement keyed by exactly the two names. RED on e9f806e3: the keys were gone (`Null`).
+#[tokio::test(flavor = "current_thread")]
+async fn d2_actor_a_fold5_the_health_serves_published_and_consumed_as_numbers() {
+    let db = Db::new();
+    let dirty = serde_json::json!({"count": 0, "oldestMarkAgeMs": null});
+    let empty = owed_events::health(&db, &dirty).await;
+    assert_eq!(
+        (
+            empty["publishedTotal"].as_u64(),
+            empty["consumedTotal"].as_u64()
+        ),
+        (Some(0), Some(0)),
+        "absent rows serve 0: {empty}"
+    );
+    db.exec(
+        "INSERT INTO ops_counters(name,value) VALUES ('owed_events_published_total',7),\
+         ('owed_events_consumed_total',5),('owed_events_swept_total',3)",
+    );
+    let body = owed_events::health(&db, &dirty).await;
+    assert_eq!(body["publishedTotal"].as_u64(), Some(7), "{body}");
+    assert_eq!(body["consumedTotal"].as_u64(), Some(5), "{body}");
+    assert_eq!(body["totals"], "/health/invariants.owedEvents");
+    assert_eq!(body["unackedMarks"], 0);
+    assert!(
+        body.get("sweptTotal").is_none(),
+        "only the two totals: {body}"
+    );
+    let sql = owed_events::HEALTH_TOTALS_SQL;
+    assert!(sql.contains("ops_counters") && sql.contains("name IN ("));
+    assert_eq!(sql.matches("'owed_events_").count(), 2, "{sql}");
+}
