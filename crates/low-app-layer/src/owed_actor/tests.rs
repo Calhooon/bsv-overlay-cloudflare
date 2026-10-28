@@ -270,7 +270,9 @@ async fn actor_judge(record: &SqliteSql, identity: &str) -> (SqliteSql, Vec<Appl
         )
         .await
         .unwrap();
-        local.conn.execute("DELETE FROM applied", []).unwrap();
+        // ONE event's chunks under one `(kind, seq)`: the per-game key applies each (the lens's HIGH-1; the pin
+        // deleted `applied` between its chunks before the fold).
+        assert!(!r.skipped_redelivery);
         reports.push(r);
     }
     (local, reports)
@@ -479,6 +481,13 @@ struct WithActor {
     d1: SqliteSql,
     actor: SqliteSql,
     d1_judges: bool,
+    /// The event the consumer's delivery carries (`D1Judge::with_event`): its kind and seq reach the actor's
+    /// redelivery key, so the pins run the shipped idempotency (the D2-ACTOR-B lens's HIGH-1).
+    event: Option<(&'static str, i64)>,
+    /// Phase B (`OWED_ACTOR_READ`): the read serves the actor's rows.
+    actor_reads: bool,
+    /// The actor's apply faults (an unreachable object, a record fault inside it).
+    actor_fails: Cell<bool>,
 }
 impl SqlPort for WithActor {
     async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
@@ -511,12 +520,15 @@ impl JudgeDb for WithActor {
     fn d1_judges(&self) -> bool {
         self.d1_judges
     }
+    fn actor_reads(&self) -> bool {
+        self.actor_reads
+    }
     async fn actor_deliver(
         &self,
         identity: &str,
         games: &[String],
     ) -> Result<Option<Value>, String> {
-        self.actor_apply(identity, games, "pot").await
+        self.actor_call(identity, games, self.event).await
     }
     /// As the object's `/apply`: the apply in its turn, Phase C's asks published inside it.
     async fn actor_apply(
@@ -525,15 +537,38 @@ impl JudgeDb for WithActor {
         games: &[String],
         _kind: &str,
     ) -> Result<Option<Value>, String> {
+        self.actor_call(identity, games, None).await
+    }
+    async fn actor_rows(&self, identity: &str) -> Result<Option<Vec<Value>>, String> {
+        let rows = self
+            .actor
+            .run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.into())])])
+            .await?;
+        Ok(Some(rows[0].rows.clone()))
+    }
+}
+
+impl WithActor {
+    /// As the object's `/apply`: the apply in its turn, Phase C's asks published inside it, the answer's rows and
+    /// the games the event has applied.
+    async fn actor_call(
+        &self,
+        identity: &str,
+        games: &[String],
+        event: Option<(&'static str, i64)>,
+    ) -> Result<Option<Value>, String> {
+        if self.actor_fails.get() {
+            return Err("owed actor: unreachable (pin)".into());
+        }
         let turn = futures_util::lock::Mutex::new(());
-        apply_and_publish_in_turn(
+        let (report, _) = apply_and_publish_in_turn(
             &turn,
             &self.d1,
             &self.actor,
             &Fakes,
             identity,
             games,
-            None,
+            event,
             Some(TIP),
             None,
             !self.d1_judges,
@@ -543,14 +578,7 @@ impl JudgeDb for WithActor {
             .actor
             .run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.into())])])
             .await?;
-        Ok(Some(json!({"rows": rows[0].rows, "applyMs": 1})))
-    }
-    async fn actor_rows(&self, identity: &str) -> Result<Option<Vec<Value>>, String> {
-        let rows = self
-            .actor
-            .run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.into())])])
-            .await?;
-        Ok(Some(rows[0].rows.clone()))
+        Ok(Some(answer_of(&report, rows[0].rows.clone())))
     }
 }
 
@@ -602,6 +630,9 @@ async fn d2_actor_b_phase_a_compares_and_the_reconcile_finds_a_planted_diff() {
         d1: d1_judge(&stranded()).await,
         actor: mirror(),
         d1_judges: true,
+        event: None,
+        actor_reads: false,
+        actor_fails: Cell::new(false),
     };
     let games = games_of(&w.d1, "owner");
     crate::owed_events::deliver(&w, "owner", &games)
@@ -661,6 +692,9 @@ async fn d2_actor_b_phase_c_acks_the_marks_after_the_actor_applied() {
         d1,
         actor: mirror(),
         d1_judges: false,
+        event: None,
+        actor_reads: false,
+        actor_fails: Cell::new(false),
     };
     let games = games_of(&w.d1, "owner");
     let report = crate::owed_events::deliver(&w, "owner", &games)
@@ -834,7 +868,8 @@ async fn d2_actor_b_the_apply_on_the_fleet_fixture_is_timed() {
     eprintln!("d2_actor_b fleet apply: {} games, one-game apply p50 {:?} ms p95 {:?} ms max {:?} ms, rounds {:?}", games.len(), m.quantile(0.5), m.quantile(0.95), m.max(), rounds);
     assert!(m.quantile(0.95).unwrap() < APPLY_CEILING_MS);
     // The amended bar (rows visible under 1 s p95 of the write) is measured in a release build: 2026-10-27, native,
-    // p50 278 ms, p95 302 ms, max 340 ms, one round each. A debug build holds the served ceiling alone.
+    // p50 278 ms, p95 302 ms, max 340 ms, one round each; after the lens fold's fixpoint commit (its copy of the
+    // identity's rows aside), 2026-10-28: p50 290 ms, p95 322 ms, max 325 ms. A debug build holds the served ceiling alone.
     if !cfg!(debug_assertions) {
         assert!(m.quantile(0.95).unwrap() < 1_000, "the 1 s bar");
     }
@@ -891,6 +926,9 @@ async fn d2_actor_b_the_belt_ask_round_trip() {
         d1: seeded(&stranded()),
         actor: mirror(),
         d1_judges: false,
+        event: None,
+        actor_reads: false,
+        actor_fails: Cell::new(false),
     };
     let games = games_of(&w.d1, "owner");
     crate::owed_events::deliver(&w, "owner", &games)
@@ -1024,6 +1062,9 @@ async fn d2_actor_b_the_reconcile_finds_a_planted_diff() {
         d1: d1_judge(&stranded()).await,
         actor: mirror(),
         d1_judges: true,
+        event: None,
+        actor_reads: false,
+        actor_fails: Cell::new(false),
     };
     let games = games_of(&w.d1, "owner");
     crate::owed_events::deliver(&w, "owner", &games)
@@ -1071,6 +1112,9 @@ async fn d2_actor_b_the_reconcile_finds_a_planted_diff() {
         d1: seeded(&stranded()),
         actor: mirror(),
         d1_judges: false,
+        event: None,
+        actor_reads: false,
+        actor_fails: Cell::new(false),
     };
     crate::owed_events::deliver(&c, "owner", &games_of(&c.d1, "owner"))
         .await
@@ -1138,5 +1182,391 @@ fn d2_actor_b_the_health_serves_the_flags() {
     assert_eq!(
         (READ_FLAG, D1_JUDGE_FLAG),
         ("OWED_ACTOR_READ", "OWED_D1_JUDGE")
+    );
+}
+
+// ---- D2-ACTOR-B-FOLD: the lens's four HIGHs (`D2-ACTOR-B-lens-2026-10-28.md`) ----
+
+/// A fixture identity holding at least `n` games whose D1 list is under the ceiling, and its first `n` games.
+fn identity_with_games(n: usize) -> (Fixture, String, Vec<String>) {
+    for f in all_fixtures() {
+        let d1 = seeded(&f);
+        for id in f.identities.clone() {
+            let g = games_of(&d1, &id);
+            if g.len() >= n {
+                return (f, id, g.into_iter().take(n).collect());
+            }
+        }
+    }
+    panic!("no fixture identity holds {n} games");
+}
+
+/// HIGH-1: ONE event naming 20 games of one identity, through the shipped consumer (`route`: the plan, then
+/// `judge_plan`'s chunks of 16) in Phase C: the second chunk carries the same `(kind, seq)` and is applied (the
+/// idempotency is per game), and only the marks of games the actor applied are acknowledged; the actor's rows are
+/// the D1 judge's over the same 20 games. RED on `8af15944`: the second chunk answered `skipped_redelivery`, its
+/// games unjudged and their marks acknowledged.
+#[tokio::test]
+async fn d2_actor_b_fold_h1_one_event_of_twenty_games_is_applied_whole() {
+    let (f, id, games) = identity_with_games(20);
+    let reference = seeded(&f);
+    for chunk in games.chunks(16) {
+        crate::owed_judge::judge_subjects(&reference, &id, chunk, "d1")
+            .await
+            .unwrap();
+    }
+    let want = stored(&reference, &id);
+    assert!(!want.is_empty(), "the 20 games hold rows");
+    let d1 = seeded(&f);
+    d1.conn.execute("DELETE FROM owed_dirty", []).unwrap();
+    for g in &games {
+        d1.conn
+            .execute(
+                "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,?2,'age','age',1)",
+                [&id, g],
+            )
+            .unwrap();
+    }
+    let w = WithActor {
+        d1,
+        actor: mirror(),
+        d1_judges: false,
+        event: Some(("age", 7)),
+        actor_reads: true,
+        actor_fails: Cell::new(false),
+    };
+    let ev = overlay_discovery::owed_event::OwedEvent {
+        v: overlay_discovery::owed_event::OWED_EVENT_V,
+        seq: 7,
+        source: "age".into(),
+        source_key: "age".into(),
+        facts: Value::Null,
+        at_ms: NOW_MS as i64,
+    };
+    let routed = crate::owed_events::route(&w, &ev).await.unwrap();
+    let left: i64 =
+        w.d1.conn
+            .query_row("SELECT COUNT(*) FROM owed_dirty", [], |r| r.get(0))
+            .unwrap();
+    assert_eq!(
+        (routed.subjects, routed.faults, left),
+        (20, 0, 0),
+        "every game judged, every mark acknowledged after its apply"
+    );
+    let got = stored(&w.actor, &id);
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "the actor's rows over the event's 20 games"
+    );
+    assert_eq!(
+        got, want,
+        "the actor's rows are the D1 judge's over the event's 20 games"
+    );
+    // A redelivery of the same event skips every game it applied, and acknowledges nothing it did not apply.
+    let mut answer = w.actor_deliver(&id, &games[..3]).await.unwrap().unwrap();
+    assert_eq!(answer["skippedRedelivery"], json!(true));
+    assert_eq!(answer["appliedGames"].take(), json!(games[..3]));
+}
+
+/// A mirror whose SQL faults the judge's commit after running its first `after` statements (a statement that
+/// faults ends the batch and its earlier statements stand: `object.rs`'s `DoSql`).
+struct FaultCommit<'a>(&'a SqliteSql, Cell<bool>, usize);
+impl SqlPort for FaultCommit<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        if self.1.get()
+            && stmts
+                .iter()
+                .any(|s| s.sql == crate::owed_judge::GAME_DELETE_SQL)
+        {
+            let ran: Vec<Stmt> = stmts.into_iter().take(self.2).collect();
+            self.0.run_batch(ran).await?;
+            return Err("the commit faulted (pin)".into());
+        }
+        self.0.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.0.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.0.log(l);
+    }
+}
+
+/// A record that answers its first `n` batches and faults after (the lens's probe 3).
+struct FaultAfter<'a>(&'a SqliteSql, Cell<usize>, usize);
+impl SqlPort for FaultAfter<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        let n = self.1.get();
+        self.1.set(n + 1);
+        if n >= self.2 {
+            return Err("record fault (pin)".into());
+        }
+        self.0.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.0.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.0.log(l);
+    }
+}
+
+/// HIGH-2: (a) a record fault on a fresh actor's second round leaves its rows exactly as before the apply (none),
+/// on every fixture identity; (b) a read made while an apply waits on its outside answers serves the rows before the
+/// apply or the fixpoint's, never a non-fixpoint round's; (c) a commit that faults half way restores the games' rows
+/// as they stood. RED on `8af15944`: round 1's judgement over a partial mirror kept (10 of 10 identities).
+#[tokio::test]
+async fn d2_actor_b_fold_h2_only_the_fixpoint_round_is_committed() {
+    let mut faulted = 0;
+    let mut kept = Vec::new();
+    for f in all_fixtures() {
+        let record = d1_judge(&f).await;
+        for id in &f.identities {
+            let games = games_of(&record, id);
+            if games.is_empty() {
+                continue;
+            }
+            let local = mirror();
+            let rec = FaultAfter(&record, Cell::new(0), 1);
+            let r = apply(
+                &rec,
+                &local,
+                &Fakes,
+                id,
+                &games,
+                Some(("pot", 9)),
+                Some(TIP),
+                None,
+            )
+            .await;
+            if r.is_err() {
+                faulted += 1;
+                let got = stored(&local, id);
+                if !got.is_empty() {
+                    kept.push(format!("{} {id}: {} rows", f.name, got.len()));
+                }
+            }
+        }
+    }
+    assert!(faulted >= 10, "the second round faulted on {faulted}");
+    assert!(
+        kept.is_empty(),
+        "a faulted apply kept a partial judgement: {kept:?}"
+    );
+
+    // (b) A reader sampling the actor's rows at every yield of a fresh actor's slow apply.
+    let record = d1_judge(&stranded()).await;
+    let games = games_of(&record, "owner");
+    let actor = mirror();
+    let slow = SlowOutside(8, Cell::new(0));
+    let done = Cell::new(false);
+    let samples = RefCell::new(Vec::new());
+    let applying = async {
+        let r = apply(
+            &record,
+            &actor,
+            &slow,
+            "owner",
+            &games,
+            Some(("pot", 1)),
+            Some(TIP),
+            None,
+        )
+        .await;
+        done.set(true);
+        r
+    };
+    let reading = async {
+        while !done.get() {
+            samples.borrow_mut().push(stored(&actor, "owner"));
+            tokio::task::yield_now().await;
+        }
+    };
+    let (r, ()) = tokio::join!(applying, reading);
+    assert!(
+        r.unwrap().0.rounds >= 2,
+        "a fresh actor's apply takes rounds"
+    );
+    let fixpoint = stored(&actor, "owner");
+    let partial: Vec<_> = samples
+        .borrow()
+        .iter()
+        .filter(|s| !s.is_empty() && **s != fixpoint)
+        .cloned()
+        .collect();
+    assert!(
+        partial.is_empty(),
+        "a read mid-apply served a non-fixpoint judgement ({} of {} samples)",
+        partial.len(),
+        samples.borrow().len()
+    );
+
+    // (c) The actor judged, the record moved, the next apply's commit faults after its delete and two rows.
+    let before = stored(&actor, "owner");
+    assert!(!before.is_empty());
+    record.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
+    let faulting = FaultCommit(&actor, Cell::new(true), 3);
+    let r = apply(
+        &record,
+        &faulting,
+        &Fakes,
+        "owner",
+        &games,
+        Some(("pot", 2)),
+        Some(TIP),
+        None,
+    )
+    .await;
+    assert!(r.is_err(), "the commit faulted");
+    assert_eq!(
+        stored(&actor, "owner"),
+        before,
+        "the games' rows are restored as they stood"
+    );
+}
+
+/// HIGH-3 (option (a)): in Phase B a read between the D1 judge's commit and a faulted actor apply serves no press for
+/// the downgraded game: the actor applies FIRST, its fault hands the message back, and the D1 judge (whose batch
+/// acknowledges the marks) runs only after it, so the downgrade's mark stays pending and the read withholds. RED on
+/// `8af15944`: the D1 judge acknowledged the mark, the actor's fault was swallowed, and the read served the actor's
+/// stale claimable sweep.
+#[tokio::test]
+async fn d2_actor_b_fold_h3_phase_b_never_serves_a_press_over_a_faulted_actor() {
+    let w = WithActor {
+        d1: d1_judge(&stranded()).await,
+        actor: mirror(),
+        d1_judges: true,
+        event: None,
+        actor_reads: true,
+        actor_fails: Cell::new(false),
+    };
+    let games = games_of(&w.d1, "owner");
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    let served = |w: &WithActor| -> Vec<(String, Value)> {
+        let mut snapshot = futures_executor_block(crate::owed_read::read(&w.d1, "owner")).unwrap();
+        snapshot.joined = w
+            .actor
+            .conn
+            .prepare(crate::owed_read::ROWS_SQL)
+            .unwrap()
+            .query_map(["owner"], |r| {
+                let n = r.as_ref().column_count();
+                let mut m = serde_json::Map::new();
+                for i in 0..n {
+                    let v: rusqlite::types::Value = r.get(i)?;
+                    let name = r.as_ref().column_name(i)?.to_string();
+                    m.insert(
+                        name,
+                        match v {
+                            rusqlite::types::Value::Null => Value::Null,
+                            rusqlite::types::Value::Integer(i) => json!(i),
+                            rusqlite::types::Value::Real(f) => json!(f),
+                            rusqlite::types::Value::Text(t) => json!(t),
+                            rusqlite::types::Value::Blob(b) => json!(hex::encode(b)),
+                        },
+                    );
+                }
+                Ok(Value::Object(m))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let body = snapshot.body("owner", Some(TIP), &BTreeMap::new()).unwrap();
+        body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["outpoint"].as_str().unwrap().to_string(),
+                    r["facts"]["claimable"].clone(),
+                )
+            })
+            .collect()
+    };
+    let downgraded = "b300000000000000000000000000000000000000000000000000000000000000:0";
+    assert!(
+        served(&w).contains(&(downgraded.to_string(), json!(true))),
+        "the sweep is a press before the competitor: {:?}",
+        served(&w)
+    );
+    w.d1.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
+    w.actor_fails.set(true);
+    let event = { (crate::owed_events::deliver(&w, "owner", &games).await).err() };
+    let presses: Vec<_> = served(&w)
+        .into_iter()
+        .filter(|(o, c)| o == downgraded && *c == json!(true))
+        .collect();
+    assert!(
+        presses.is_empty(),
+        "a press served over a downgrade the actor has not applied (delivery: {event:?})"
+    );
+    assert!(event.is_some(), "the actor's fault hands the message back");
+    // The actor reachable again: the redelivery applies both judges and the downgrade is served.
+    w.actor_fails.set(false);
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    assert!(!served(&w).contains(&(downgraded.to_string(), json!(true))));
+}
+
+fn futures_executor_block<F: std::future::Future>(f: F) -> F::Output {
+    futures_util::FutureExt::now_or_never(f).expect("the native SQL answers at once")
+}
+
+/// HIGH-4: an actor holding the previous digest's tables (an `owed_rows(identity, outpoint)` of an older DDL, its
+/// bootstrap done) rebuilt under the new digest applies and stores the D1 judge's rows, its `bootstrapped` cleared
+/// and its bootstrap re-armed (a read serves `pending` until it ends). RED on `8af15944`: the judge's write named a
+/// column the old `owed_rows` lacks.
+#[tokio::test]
+async fn d2_actor_b_fold_h4_a_digest_change_rebuilds_the_judges_tables() {
+    let record = d1_judge(&stranded()).await;
+    let games = games_of(&record, "owner");
+    let actor = mirror();
+    actor
+        .conn
+        .execute_batch(
+            "DROP TABLE owed_rows; CREATE TABLE owed_rows (identity TEXT NOT NULL, outpoint TEXT NOT NULL, PRIMARY KEY(identity,outpoint)); \
+             INSERT INTO meta(name,value) VALUES ('schema','an older digest'),('identity','owner'),('bootstrapped','1')",
+        )
+        .unwrap();
+    for s in crate::owed_actor::object::schema_plan(Some("an older digest")) {
+        actor
+            .conn
+            .execute_batch(&s)
+            .unwrap_or_else(|e| panic!("{e}: {s}"));
+    }
+    let r = apply(
+        &record,
+        &actor,
+        &Fakes,
+        "owner",
+        &games,
+        Some(("pot", 1)),
+        Some(TIP),
+        None,
+    )
+    .await;
+    assert!(r.is_ok(), "the apply under the new digest: {r:?}");
+    assert_eq!(stored(&actor, "owner"), stored(&record, "owner"));
+    let meta = |n: &str| -> Option<String> {
+        actor
+            .conn
+            .query_row("SELECT value FROM meta WHERE name=?1", [n], |r| r.get(0))
+            .ok()
+    };
+    assert_eq!(
+        (meta("bootstrapped"), meta("bootCursor")),
+        (None, Some("0".into())),
+        "the bootstrap is re-armed"
     );
 }

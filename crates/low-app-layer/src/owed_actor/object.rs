@@ -30,7 +30,8 @@ const META_BOOT_CURSOR: &str = "bootCursor";
 /// The actor's SQLite as a [`SqlPort`]. Each statement runs synchronously (`ctx.storage.sql.exec`): a batch runs in
 /// one turn of the object's event loop, so its writes commit together (the platform's write coalescing); a
 /// statement that faults ends the batch and its earlier statements stand (the mirror is a cache of the record the
-/// next closure replaces, and the judge's write replaces its games' rows whole).
+/// next closure replaces; the judge's commit is the fixpoint's alone and a fault of it restores the identity's rows,
+/// `commit_fixpoint`, the D2-ACTOR-B lens's HIGH-2).
 pub struct DoSql {
     sql: SqlStorage,
 }
@@ -85,19 +86,42 @@ impl Outside for EnvOutside<'_> {
     }
 }
 
-/// The schema statements of a fresh (or a rebuilt) mirror: drop what an older digest made, then create.
+/// The schema statements of a fresh (or a rebuilt) actor: drop what an older digest made, then create.
+///
+/// The D2-ACTOR-B lens's HIGH-4: a digest change ([`actor_digest`]: the mirror's generated DDL, or the actor's own
+/// tables) drops the JUDGE's tables too (`owed_rows`, `owed_row_words`, `owed_state`, `owed_dirty`, their indexes and
+/// triggers with them; `CREATE ... IF NOT EXISTS` keeps an old shape), and the actor's own `txfacts`, `applied` and
+/// the commit's snapshot tables; its judged state in `meta` is cleared (`bootstrapped`, the ack, the gate, the
+/// judgement's time) and, where it knows its identity, its bootstrap is re-armed from the first page (the object
+/// sets its alarm, [`OwedActor`]'s `rebuilt`), so a read serves `pending` until the bootstrap ends (Rule 23: never
+/// a short list served as complete).
 pub fn schema_plan(held_digest: Option<&str>) -> Vec<String> {
-    if held_digest == Some(schema::DIGEST) {
+    if held_digest == Some(actor_digest().as_str()) {
         return Vec::new();
     }
     let mut out = Vec::new();
     if held_digest.is_some() {
-        for f in FAMILIES {
-            out.push(format!("DROP TABLE IF EXISTS {}", f.table));
+        for t in FAMILIES
+            .iter()
+            .map(|f| f.table)
+            .chain(JUDGE_TABLES)
+            .chain(["txfacts", "applied"])
+        {
+            out.push(format!("DROP TABLE IF EXISTS {t}"));
         }
-        out.push("DROP TABLE IF EXISTS txfacts".into());
+        for t in SNAPSHOT_TABLES {
+            out.push(format!("DROP TABLE IF EXISTS {t}_snap"));
+        }
     }
     out.extend(mirror_ddl());
+    if held_digest.is_some() {
+        out.push(format!(
+            "DELETE FROM meta WHERE name IN ('{META_BOOTSTRAPPED}','{META_BOOT_CURSOR}','{META_ACK}','{META_GATE}','{META_JUDGED_AT}','{META_KV_DIRTY}')"
+        ));
+        out.push(format!(
+            "INSERT INTO meta(name,value) SELECT '{META_BOOT_CURSOR}','0' WHERE EXISTS (SELECT 1 FROM meta WHERE name='{META_IDENTITY}')"
+        ));
+    }
     out
 }
 
@@ -130,6 +154,8 @@ pub struct OwedActor {
     /// event arriving meanwhile is applied after it, never interleaved at an await.
     turn: futures_util::lock::Mutex<()>,
     ready: RefCell<bool>,
+    /// HIGH-4: this isolate rebuilt the actor under a new digest; its bootstrap's alarm is set at the next await.
+    rebuilt: RefCell<bool>,
     bars: RefCell<Bars>,
     last_kv_ms: RefCell<Option<u64>>,
 }
@@ -141,12 +167,14 @@ impl DurableObject for OwedActor {
             env,
             turn: futures_util::lock::Mutex::new(()),
             ready: RefCell::new(false),
+            rebuilt: RefCell::new(false),
             bars: RefCell::default(),
             last_kv_ms: RefCell::new(None),
         }
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
+        self.rearm_after_rebuild().await;
         let url = req.url()?;
         let path = url.path().to_string();
         match (req.method(), path.as_str()) {
@@ -192,6 +220,7 @@ impl DurableObject for OwedActor {
     }
 
     async fn alarm(&self) -> Result<Response> {
+        self.rearm_after_rebuild().await;
         let local = self.local();
         if self.meta(META_BOOT_CURSOR).is_some() {
             if let Err(e) = self.bootstrap_page(&local).await {
@@ -246,7 +275,12 @@ impl OwedActor {
                     r.first()
                         .and_then(|v| v["value"].as_str().map(str::to_string))
                 });
-            for s in schema_plan(held.as_deref()) {
+            let plan = schema_plan(held.as_deref());
+            if held.is_some() && !plan.is_empty() {
+                console_log!("[owed-actor] rebuilt under a new digest: the judge's tables dropped, the bootstrap re-armed");
+                *self.rebuilt.borrow_mut() = true;
+            }
+            for s in plan {
                 if let Err(e) = local.sql.exec(&s, None) {
                     console_log!("[owed-actor] schema: {e}: {s}");
                 }
@@ -255,12 +289,25 @@ impl OwedActor {
                 META_PUT_SQL,
                 vec![
                     SqlStorageValue::from(META_SCHEMA.to_string()),
-                    SqlStorageValue::from(schema::DIGEST.to_string()),
+                    SqlStorageValue::from(actor_digest()),
                 ],
             );
             *self.ready.borrow_mut() = true;
         }
         local
+    }
+
+    /// HIGH-4: after a rebuild the bootstrap's first page runs on the next alarm (now): the read serves `pending`
+    /// until it ends.
+    async fn rearm_after_rebuild(&self) {
+        let _ = self.local();
+        if self.rebuilt.replace(false) && self.meta(META_BOOT_CURSOR).is_some() {
+            let _ = self
+                .state
+                .storage()
+                .set_alarm(Date::now().as_millis() as i64)
+                .await;
+        }
     }
 
     /// Phase C (`OWED_D1_JUDGE=false`): the D1 rows are not dated, so the actor publishes its belt questions.
@@ -406,21 +453,14 @@ impl OwedActor {
                 let _ = local.sql.exec("DELETE FROM meta WHERE name='gate'", None);
             }
         }
-        let rows = self.rows_of(&local, &me);
-        Response::from_json(&json!({
-            "identity": me,
-            "rounds": report.rounds,
-            "txids": report.txids,
-            "recordRows": report.record_rows,
-            "rows": rows,
-            "skippedRedelivery": report.skipped_redelivery,
-            "missed": report.missed,
-            "judgedAtMs": now,
-            "atMs": body.at_ms,
-            "mined": body.mined,
-            "applyMs": now.saturating_sub(started),
-            "ackSeq": self.meta(META_ACK),
-        }))
+        let mut answer = answer_of(&report, self.rows_of(&local, &me));
+        answer["identity"] = json!(me);
+        answer["judgedAtMs"] = json!(now);
+        answer["atMs"] = json!(body.at_ms);
+        answer["mined"] = json!(body.mined);
+        answer["applyMs"] = json!(now.saturating_sub(started));
+        answer["ackSeq"] = json!(self.meta(META_ACK));
+        Response::from_json(&answer)
     }
 
     fn rows_of(&self, local: &DoSql, me: &str) -> Vec<Value> {

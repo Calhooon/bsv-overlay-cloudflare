@@ -151,9 +151,13 @@
    "statements": [
     "INSERT OR REPLACE INTO {}({}) VALUES ({})",
     "DELETE FROM {} WHERE rowid IN (SELECT t.rowid FROM {})",
-    "DROP TABLE IF EXISTS {}"
+    "DROP TABLE IF EXISTS {t}",
+    "DROP TABLE IF EXISTS {t}_snap",
+    "CREATE TABLE {t}_snap AS SELECT * FROM {t} WHERE identity=?1",
+    "DELETE FROM {t} WHERE identity=?1",
+    "INSERT INTO {t} SELECT * FROM {t}_snap"
    ],
-   "why": "bsv-low #912: the owed actor's own SQLite (new_sqlite_classes, tag v4-owed-actor), never the shared D1: its decoded facts, its redelivery ledger and its state; the MIRROR of the record's families the judge reads (their DDL generated from the overlay's migrations, schema.rs) and the closure's per-family delete and insert into it. Its READS of the record (the copy and the key selections) are the dynamic SELECT pin below, judged as any read. Wiped by each actor's /reset (POST /internal/owed-actor-reset) or a deleted_classes migration."
+   "why": "bsv-low #912: the owed actor's own SQLite (new_sqlite_classes, tag v4-owed-actor), never the shared D1: its decoded facts, its redelivery ledger and its state; the MIRROR of the record's families the judge reads (their DDL generated from the overlay's migrations, schema.rs) and the closure's per-family delete and insert into it; the rebuild's drops of the mirror, the judge's tables and its own (a digest change, the D2-ACTOR-B lens's HIGH-4); the fixpoint commit's copy of the identity's judged rows aside ({t}_snap over owed_rows, owed_row_words, owed_state, owed_dirty) and its restore on a fault (HIGH-2). Its READS of the record (the copy and the key selections) are the dynamic SELECT pin below, judged as any read. Wiped by each actor's /reset (POST /internal/owed-actor-reset) or a deleted_classes migration."
   }
  ],
  "dynamic_sites": [
