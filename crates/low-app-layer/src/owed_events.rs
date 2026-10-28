@@ -58,9 +58,10 @@ pub const SWEEP_CURSOR_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tick
 /// MEDIUM-8: the consumer's batch row: the oldest message's enqueue age (a Worker cannot read its queue's backlog;
 /// the pass-meter precedent), served on `/health.owedEvents` and the overlay's `/health/invariants.owedEvents`.
 pub const CONSUMER_ROW_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:consumer',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
-/// The consumer's row.
-pub const HEALTH_CONSUMER_SQL: &str =
-    "SELECT cursor,tickedAtMs FROM owed_belt_state WHERE name='owed-events:consumer'";
+/// The consumer's row, and beside it (D2-ACTOR-B-FOLD-6, the land tier's `health-dirty-snapshot`) the owed actor's
+/// health snapshot (`owed_actor::HEALTH_SNAPSHOT_NAME`): two primary-key rows in one statement, so `/health.owedActor`
+/// adds one row read and no statement.
+pub const HEALTH_CONSUMER_SQL: &str = "SELECT name,cursor,tickedAtMs FROM owed_belt_state WHERE name IN ('owed-events:consumer','owed-actor:health')";
 /// D2-ACTOR-A-FOLD-5 (bsv-low #911, E2): the queue's two totals `/health.owedEvents` serves (the harness's
 /// `owed-queue-backlog` row reads published minus consumed there): two primary-key rows of `ops_counters`, never the
 /// family's whole counter read.
@@ -1184,6 +1185,8 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
         }];
         // MEDIUM-2: a landed judge clears its pair's fault memo and resolves its dead letter
         batch_row.extend(resolved);
+        // D2-ACTOR-B-FOLD-6: the owed actor's health snapshot, in the consumer row's batch (at most once a minute).
+        batch_row.push(crate::owed_actor::health_snapshot_stmt(now as u64, false));
         if let Err(e) = sql
             .run_batch(batch_row)
             .await
@@ -1248,6 +1251,12 @@ async fn park_dead_letters(
 /// D2-ACTOR-A-FOLD-5: `publishedTotal` and `consumedTotal` stay here, numbers (0 for an absent row), read by
 /// [`HEALTH_TOTALS_SQL`] (two rows) in the consumer row's batch.
 pub async fn health(db: &impl SqlPort, dirty: &Value) -> Value {
+    health_and_actor(db, dirty).await.0
+}
+
+/// [`health`] and the owed actor's health snapshot read by the same statement (`None` before its first write or on a
+/// fault).
+pub async fn health_and_actor(db: &impl SqlPort, dirty: &Value) -> (Value, Option<Value>) {
     let read = db
         .run_batch(vec![
             Stmt {
@@ -1261,15 +1270,14 @@ pub async fn health(db: &impl SqlPort, dirty: &Value) -> Value {
         ])
         .await
         .ok();
-    let consumer = read
-        .as_ref()
-        .and_then(|r| r.first())
-        .and_then(|o| o.rows.first())
-        .and_then(|r| {
-            r["cursor"]
-                .as_str()
-                .and_then(|c| serde_json::from_str::<Value>(c).ok())
-        });
+    let row = |name: &str| {
+        read.as_ref()
+            .and_then(|r| r.first())
+            .and_then(|o| o.rows.iter().find(|r| r["name"].as_str() == Some(name)))
+            .and_then(|r| r["cursor"].as_str())
+    };
+    let consumer = row("owed-events:consumer").and_then(|c| serde_json::from_str::<Value>(c).ok());
+    let actor = crate::owed_actor::health_snapshot_of(row(crate::owed_actor::HEALTH_SNAPSHOT_NAME));
     let total = |name: &str| -> u64 {
         read.as_ref()
             .and_then(|r| r.get(1))
@@ -1281,7 +1289,7 @@ pub async fn health(db: &impl SqlPort, dirty: &Value) -> Value {
             })
             .unwrap_or(0)
     };
-    json!({
+    let body = json!({
         "publishedTotal": total("owed_events_published_total"),
         "consumedTotal": total("owed_events_consumed_total"),
         "unackedMarks": dirty["count"],
@@ -1290,5 +1298,6 @@ pub async fn health(db: &impl SqlPort, dirty: &Value) -> Value {
         "consumerAtMs": consumer.as_ref().map(|c| c["atMs"].clone()),
         "serviceMs": consumer.as_ref().map(|c| c["serviceMs"].clone()),
         "totals": "/health/invariants.owedEvents",
-    })
+    });
+    (body, actor)
 }

@@ -7027,37 +7027,26 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
         Ok(sql) => crate::owed_judge::dirty_health(&sql).await,
         Err(_) => serde_json::Value::Null,
     };
-    body["owedEvents"] = match D1Sql::of(&ctx.env) {
-        Ok(sql) => crate::owed_events::health(&sql, &dirty).await,
-        Err(_) => serde_json::Value::Null,
+    // D2-ACTOR-B-FOLD-6: the owed actor's health snapshot rides the consumer row's statement (one row more, no
+    // statement more: the land tier's `health-dirty-snapshot`).
+    let (owed_events_body, actor_snapshot) = match D1Sql::of(&ctx.env) {
+        Ok(sql) => crate::owed_events::health_and_actor(&sql, &dirty).await,
+        Err(_) => (serde_json::Value::Null, None),
     };
+    body["owedEvents"] = owed_events_body;
     body["owed"]["dirty"] = dirty;
     // bsv-low #912 (D2-ACTOR-B; the lens's MEDIUM-1, MEDIUM-7, MEDIUM-8): the FLEET's bars from their durable class
     // rows (`direct`, `queue`, `mined`; this isolate's under `isolate`), the compare's durable totals (Phase B's
     // gate), the bootstraps beside the identities holding rows, and the actor's own oldest unapplied event (Phases A
-    // and B; Phase C's is the fleet's oldest un-acked mark): ONE statement.
+    // and B; Phase C's is the fleet's oldest un-acked mark): the writers' snapshot row, read above (D2-ACTOR-B-FOLD-6).
     let d1_judges = crate::owed_actor::d1_judge_on(
         ctx.env
             .var(crate::owed_actor::D1_JUDGE_FLAG)
             .ok()
             .map(|v| v.to_string()),
     );
-    let actor_read = match D1Sql::of(&ctx.env) {
-        Ok(sql) => crate::pot_hook::SqlPort::run_batch(
-            &sql,
-            vec![crate::pot_hook::Stmt::new(
-                crate::owed_actor::HEALTH_SQL,
-                vec![],
-            )],
-        )
-        .await
-        .ok()
-        .and_then(|o| o.into_iter().next())
-        .and_then(|o| o.rows.into_iter().next()),
-        Err(_) => None,
-    };
     body["owedActor"] = crate::owed_actor::health_body(
-        actor_read.as_ref(),
+        actor_snapshot.as_ref(),
         worker::Date::now().as_millis(),
         d1_judges,
         &body["owedEvents"]["oldestUnackedMarkAgeMs"],

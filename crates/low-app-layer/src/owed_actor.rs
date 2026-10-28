@@ -1732,6 +1732,8 @@ pub async fn flush_bars_from(
         ));
     }
     if !stmts.is_empty() {
+        // D2-ACTOR-B-FOLD-6: the health snapshot after the class rows, in their batch (at most once a minute).
+        stmts.push(health_snapshot_stmt(now, false));
         db.run_batch(stmts).await?;
     }
     Ok(())
@@ -1793,9 +1795,52 @@ pub fn fleet_bars(rows: &[Value], now: u64) -> Value {
     })
 }
 
-/// `/health.owedActor`'s one D1 statement (MEDIUM-1, MEDIUM-7, MEDIUM-8): the class rows, the actor's durable totals
-/// and the identities holding owed rows (a count over `owed_state`, one row an identity).
-pub const HEALTH_SQL: &str = "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',tickedAtMs)) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage";
+/// What `/health.owedActor` serves from the FLEET (MEDIUM-1, MEDIUM-7, MEDIUM-8): the class rows, the actor's durable
+/// totals, the identities holding owed rows (a count over `owed_state`, one row an identity) and the bootstrap's
+/// coverage. Since the land tier's refusal (lane D2-ACTOR-B-FOLD-6: `health-dirty-snapshot` measured 49 reads, 6
+/// statements, the largest 44 rows, against 7, 5 and 5) the READ never runs it: the WRITERS fold it into one snapshot
+/// row ([`HEALTH_SNAPSHOT_SQL`]) and `/health` reads that row beside the queue's consumer row in one statement
+/// (`owed_events::HEALTH_CONSUMER_SQL`).
+macro_rules! health_select {
+    () => {
+        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',tickedAtMs)) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage"
+    };
+}
+pub const HEALTH_SQL: &str = health_select!();
+
+/// THE HEALTH SNAPSHOT (lane D2-ACTOR-B-FOLD-6): one row of the belt's ledger, [`HEALTH_SNAPSHOT_NAME`], its cursor
+/// [`HEALTH_SQL`]'s four columns and `asOfMs`. Written by the writers, never by a read: the consumer's batch (beside
+/// its own row), the actor's meter flush ([`flush_bars_from`]) and the bootstrap lever's coverage fold; each at most
+/// once a [`HEALTH_SNAPSHOT_EVERY_MS`] FLEET-WIDE, the stamp compared inside the statement (`?2` the window: a stamp
+/// younger than it writes nothing and runs none of the composition's subqueries; `?2` 0 writes whatever the stamp:
+/// the coverage pass's last call, so a finished pass is never served unfinished). `?1` now.
+pub const HEALTH_SNAPSHOT_NAME: &str = "owed-actor:health";
+pub const HEALTH_SNAPSHOT_EVERY_MS: u64 = 60_000;
+pub const HEALTH_SNAPSHOT_SQL: &str = concat!(
+    "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) SELECT 'owed-actor:health',json_object('asOfMs',?1,'bars',h.bars,'counters',h.counters,'activeIdentities',h.activeIdentities,'coverage',h.coverage),?1 FROM (",
+    health_select!(),
+    ") h WHERE NOT (?2>0 AND EXISTS (SELECT 1 FROM owed_belt_state WHERE name='owed-actor:health' AND tickedAtMs>?1-?2)) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs"
+);
+/// The snapshot's write: `force` the coverage pass's last call (no stamp compare).
+pub fn health_snapshot_stmt(now: u64, force: bool) -> Stmt {
+    Stmt::new(
+        HEALTH_SNAPSHOT_SQL,
+        vec![
+            Bind::Int(now as i64),
+            Bind::Int(if force {
+                0
+            } else {
+                HEALTH_SNAPSHOT_EVERY_MS as i64
+            }),
+        ],
+    )
+}
+/// The snapshot as `/health` read it (its cursor parsed); `None` before the first write.
+pub fn health_snapshot_of(cursor: Option<&str>) -> Option<Value> {
+    cursor
+        .and_then(|c| serde_json::from_str::<Value>(c).ok())
+        .filter(Value::is_object)
+}
 
 /// The served object: this isolate's bars under `isolate`, the fleet's figures at the top (the harness's keys),
 /// the durable compare totals (MEDIUM-8: Phase B's gate), the bootstraps beside the identities holding rows
@@ -1809,44 +1854,51 @@ pub fn health_body(
 ) -> Value {
     let mut body = served_bars(now);
     body["isolate"] = body.clone();
-    let rows: Vec<Value> = read
-        .and_then(|r| r["bars"].as_str())
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
+    // A field of the snapshot: the composition's text (a `json_group_*` column) or the JSON itself.
+    let field = |k: &str| -> Value {
+        match read.map(|r| &r[k]) {
+            Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
+            Some(v) => v.clone(),
+            None => Value::Null,
+        }
+    };
+    let rows: Vec<Value> = field("bars").as_array().cloned().unwrap_or_default();
     let fleet = fleet_bars(&rows, now);
     for (k, v) in fleet.as_object().into_iter().flatten() {
         body[k.as_str()] = v.clone();
     }
-    let counters: Value = read
-        .and_then(|r| r["counters"].as_str())
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(Value::Null);
-    let n = |k: &str| counters.get(k).and_then(Value::as_u64).unwrap_or(0);
-    body["comparedTotal"] = json!(n(COUNTERS[0]));
-    body["diffsTotal"] = json!(n(COUNTERS[1]));
-    body["faultsTotal"] = json!(n(COUNTERS[2]));
-    body["reconcileDiffs"] = json!(n(COUNTERS[7]));
-    body["bootstraps"] = json!(n(COUNTERS[10]));
-    body["unknownReads"] = json!(n(COUNTERS[11]));
-    body["epochResets"] = json!(n(COUNTERS[12]));
-    body["deferred"] = json!(n(COUNTERS[13]));
+    let counters = field("counters");
+    // No snapshot yet: every total null (an unmeasured bar is red by design, never a 0).
+    let n = |k: &str| -> Value {
+        match read {
+            Some(_) => json!(counters.get(k).and_then(Value::as_u64).unwrap_or(0)),
+            None => Value::Null,
+        }
+    };
+    body["comparedTotal"] = n(COUNTERS[0]);
+    body["diffsTotal"] = n(COUNTERS[1]);
+    body["faultsTotal"] = n(COUNTERS[2]);
+    body["reconcileDiffs"] = n(COUNTERS[7]);
+    body["bootstraps"] = n(COUNTERS[10]);
+    body["unknownReads"] = n(COUNTERS[11]);
+    body["epochResets"] = n(COUNTERS[12]);
+    body["deferred"] = n(COUNTERS[13]);
     // NEW-L6: the deferred applies started (above) and ended; the difference is what `wait_until`'s bound cut.
-    body["deferredDone"] = json!(n(COUNTERS[16]));
+    body["deferredDone"] = n(COUNTERS[16]);
     // NEW2-L1: the Phase B DIFFs on a game holding a mark above the bound (not a STOP); NEW2-L5: the tip alarms whose
     // window held a faulting game.
-    body["heldDiffsTotal"] = json!(n(COUNTERS[17]));
-    body["tipFaults"] = json!(n(COUNTERS[18]));
+    body["heldDiffsTotal"] = n(COUNTERS[17]);
+    body["tipFaults"] = n(COUNTERS[18]);
     // The third delta lens's LOW-1: the games the tip alarm parked; LOW-2: the schema plans that did not apply whole.
-    body["tipParked"] = json!(n(COUNTERS[19]));
-    body["schemaPartial"] = json!(n(COUNTERS[20]));
+    body["tipParked"] = n(COUNTERS[19]);
+    body["schemaPartial"] = n(COUNTERS[20]);
     // NEW-L3: Phase B's gate is COVERAGE, the bootstrap lever's last full pass (`complete`, `contiguous`, `uncovered`
     // 0), never `bootstraps` against `activeIdentities` (two counts).
-    body["coverage"] = read
-        .and_then(|r| r["coverage"].as_str())
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(Value::Null);
+    body["coverage"] = field("coverage");
     body["v3"] = json!({"identities": n(COUNTERS[14]), "rows": n(COUNTERS[15])});
     body["activeIdentities"] = json!(read.and_then(|r| r["activeIdentities"].as_u64()));
+    // The snapshot's time (lane D2-ACTOR-B-FOLD-6): one older than its cadence is served as it is.
+    body["asOfMs"] = json!(read.and_then(|r| r["asOfMs"].as_u64()));
     body["oldestUnappliedEventAgeMs"] = if d1_judges {
         fleet["actorOldestUnappliedEventAgeMs"].clone()
     } else {
