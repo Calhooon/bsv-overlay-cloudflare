@@ -334,7 +334,10 @@ impl SqlPort for Slow<'_> {
 }
 
 fn stranded() -> Fixture {
-    fixtures().into_iter().find(|f| f.name == "stranded hops").unwrap()
+    fixtures()
+        .into_iter()
+        .find(|f| f.name == "stranded hops")
+        .unwrap()
 }
 const SPENT_BY_A_STRANGER: &str = "UPDATE pot_records SET spent=1,spendingTxid='c900000000000000000000000000000000000000000000000000000000000009' WHERE txid='b300000000000000000000000000000000000000000000000000000000000000'";
 
@@ -349,21 +352,64 @@ async fn d2_actor_b_two_events_under_a_slow_record_derive_the_newer_rows() {
     let turn = futures_util::lock::Mutex::new(());
     // The control: the newer record judged alone.
     let control_record = d1_judge(&stranded()).await;
-    control_record.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
+    control_record
+        .conn
+        .execute_batch(SPENT_BY_A_STRANGER)
+        .unwrap();
     let control = mirror();
-    apply(&control_record, &control, &Fakes, "owner", &games, None, Some(TIP), None).await.unwrap();
+    apply(
+        &control_record,
+        &control,
+        &Fakes,
+        "owner",
+        &games,
+        None,
+        Some(TIP),
+        None,
+    )
+    .await
+    .unwrap();
     let slow = Slow(&record, 64);
-    let first = apply_in_turn(&turn, &slow, &fresh, &Fakes, "owner", &games, Some(("pot", 1)), Some(TIP), None);
+    let first = apply_in_turn(
+        &turn,
+        &slow,
+        &fresh,
+        &Fakes,
+        "owner",
+        &games,
+        Some(("pot", 1)),
+        Some(TIP),
+        None,
+    );
     let second = async {
         tokio::task::yield_now().await;
         record.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
-        apply_in_turn(&turn, &record, &fresh, &Fakes, "owner", &games, Some(("pot", 2)), Some(TIP), None).await
+        apply_in_turn(
+            &turn,
+            &record,
+            &fresh,
+            &Fakes,
+            "owner",
+            &games,
+            Some(("pot", 2)),
+            Some(TIP),
+            None,
+        )
+        .await
     };
     let (a, b) = tokio::join!(first, second);
     a.unwrap();
     b.unwrap();
-    assert_ne!(stored(&control, "owner"), stored(&d1_judge(&stranded()).await, "owner"), "the move changes the rows");
-    assert_eq!(stored(&fresh, "owner"), stored(&control, "owner"), "the newer event's rows are stored");
+    assert_ne!(
+        stored(&control, "owner"),
+        stored(&d1_judge(&stranded()).await, "owner"),
+        "the move changes the rows"
+    );
+    assert_eq!(
+        stored(&fresh, "owner"),
+        stored(&control, "owner"),
+        "the newer event's rows are stored"
+    );
 }
 
 /// MEDIUM-1: an out-of-order pair derives the same rows (each apply reads the record as it stands), and a
@@ -376,11 +422,33 @@ async fn d2_actor_b_an_out_of_order_pair_derives_the_same_rows() {
     let (in_order, out_of_order) = (mirror(), mirror());
     for (m, seqs) in [(&in_order, [1, 2]), (&out_of_order, [2, 1])] {
         for s in seqs {
-            apply(&record, m, &Fakes, "owner", &games, Some(("pot", s)), Some(TIP), None).await.unwrap();
+            apply(
+                &record,
+                m,
+                &Fakes,
+                "owner",
+                &games,
+                Some(("pot", s)),
+                Some(TIP),
+                None,
+            )
+            .await
+            .unwrap();
         }
     }
     assert_eq!(stored(&in_order, "owner"), stored(&out_of_order, "owner"));
-    let (again, _) = apply(&record, &in_order, &Fakes, "owner", &games, Some(("pot", 2)), Some(TIP), None).await.unwrap();
+    let (again, _) = apply(
+        &record,
+        &in_order,
+        &Fakes,
+        "owner",
+        &games,
+        Some(("pot", 2)),
+        Some(TIP),
+        None,
+    )
+    .await
+    .unwrap();
     assert!(again.skipped_redelivery);
 }
 
@@ -408,7 +476,10 @@ impl JudgeDb for WithActor {
     fn tip(&self) -> Option<u64> {
         Some(TIP)
     }
-    async fn word_views(&self, rows: &BTreeMap<String, crate::tracker_host::stored::Row>) -> Result<BTreeMap<String, Value>, String> {
+    async fn word_views(
+        &self,
+        rows: &BTreeMap<String, crate::tracker_host::stored::Row>,
+    ) -> Result<BTreeMap<String, Value>, String> {
         Fakes.word_views(rows).await
     }
     async fn canonical_root(&self, _: u64) -> Option<String> {
@@ -418,10 +489,67 @@ impl JudgeDb for WithActor {
     fn d1_judges(&self) -> bool {
         self.d1_judges
     }
-    async fn actor_deliver(&self, identity: &str, games: &[String]) -> Result<Option<Value>, String> {
-        apply(&self.d1, &self.actor, &Fakes, identity, games, None, Some(TIP), None).await?;
-        let rows = self.actor.run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.into())])]).await?;
+    async fn actor_deliver(
+        &self,
+        identity: &str,
+        games: &[String],
+    ) -> Result<Option<Value>, String> {
+        apply(
+            &self.d1,
+            &self.actor,
+            &Fakes,
+            identity,
+            games,
+            None,
+            Some(TIP),
+            None,
+        )
+        .await?;
+        let rows = self
+            .actor
+            .run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.into())])])
+            .await?;
         Ok(Some(json!({"rows": rows[0].rows, "applyMs": 1})))
+    }
+}
+
+/// A delivery that answers the actor's stored rows without applying (the planted-diff compare).
+struct Planted<'a>(&'a WithActor);
+impl SqlPort for Planted<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        self.0.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.0.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.0.log(l);
+    }
+}
+impl JudgeDb for Planted<'_> {
+    fn tip(&self) -> Option<u64> {
+        Some(TIP)
+    }
+    async fn word_views(
+        &self,
+        rows: &BTreeMap<String, crate::tracker_host::stored::Row>,
+    ) -> Result<BTreeMap<String, Value>, String> {
+        Fakes.word_views(rows).await
+    }
+    async fn canonical_root(&self, _: u64) -> Option<String> {
+        None
+    }
+    async fn push(&self, _: &str, _: Value) {}
+    async fn actor_deliver(&self, identity: &str, _: &[String]) -> Result<Option<Value>, String> {
+        let rows = self
+            .0
+            .actor
+            .run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.into())])])
+            .await?;
+        Ok(Some(json!({"rows": rows[0].rows})))
     }
 }
 
@@ -429,22 +557,49 @@ impl JudgeDb for WithActor {
 /// the reconcile's digest) finds a PLANTED diff in D1's rows.
 #[tokio::test]
 async fn d2_actor_b_phase_a_compares_and_the_reconcile_finds_a_planted_diff() {
-    let w = WithActor { d1: d1_judge(&stranded()).await, actor: mirror(), d1_judges: true };
+    let w = WithActor {
+        d1: d1_judge(&stranded()).await,
+        actor: mirror(),
+        d1_judges: true,
+    };
     let games = games_of(&w.d1, "owner");
-    crate::owed_events::deliver(&w, "owner", &games).await.unwrap();
-    assert_eq!((w.d1.counter(COUNTERS[0]), w.d1.counter(COUNTERS[1])), (1, 0), "{:?}", w.d1.lines.borrow());
-    let rows = |db: &SqliteSql| db.conn.prepare("SELECT json_object('outpoint',outpoint,'family',family,'gameId',gameId,'sats',sats,'opponentIdentity',opponentIdentity,'atHeight',atHeight,'reason',reason,'facts',facts,'claimable',claimable) FROM owed_rows WHERE identity='owner' ORDER BY outpoint").unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap().map(|s| serde_json::from_str::<Value>(&s.unwrap()).unwrap()).collect::<Vec<_>>();
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    assert_eq!(
+        (w.d1.counter(COUNTERS[0]), w.d1.counter(COUNTERS[1])),
+        (1, 0),
+        "{:?}",
+        w.d1.lines.borrow()
+    );
+    let rows = |db: &SqliteSql| {
+        db.conn.prepare("SELECT json_object('outpoint',outpoint,'family',family,'gameId',gameId,'sats',sats,'opponentIdentity',opponentIdentity,'atHeight',atHeight,'reason',reason,'facts',facts,'claimable',claimable) FROM owed_rows WHERE identity='owner' ORDER BY outpoint").unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap().map(|s| serde_json::from_str::<Value>(&s.unwrap()).unwrap()).collect::<Vec<_>>()
+    };
     assert_eq!(rows_digest(&rows(&w.d1)), rows_digest(&rows(&w.actor)));
     w.d1.conn.execute_batch("UPDATE owed_rows SET reason='planted' WHERE rowid=(SELECT MIN(rowid) FROM owed_rows WHERE identity='owner')").unwrap();
-    assert_ne!(rows_digest(&rows(&w.d1)), rows_digest(&rows(&w.actor)), "the digest sees the planted row");
+    assert_ne!(
+        rows_digest(&rows(&w.d1)),
+        rows_digest(&rows(&w.actor)),
+        "the digest sees the planted row"
+    );
     assert_eq!(diff_rows(&rows(&w.d1), &rows(&w.actor)).len(), 1);
-    // the next delivery's compare reads the planted D1 row before the D1 judge rewrites it? No: it judges first;
-    // the diff counted is the one a divergent ACTOR makes: plant it in the actor's mirror.
-    w.actor.conn.execute_batch("DELETE FROM hopparty_records WHERE rowid=(SELECT MIN(rowid) FROM hopparty_records)").unwrap();
-    let local_only = SqliteSql { conn: rusqlite::Connection::open_in_memory().unwrap(), ..mirror() };
-    drop(local_only);
-    let (r, _) = apply(&w.d1, &w.actor, &Fakes, "owner", &games, None, Some(TIP), None).await.unwrap();
-    assert!(r.rounds >= 1);
+    // A divergent ACTOR is counted by the next delivery's compare: its judged rows planted, then compared against the
+    // D1 judge's fresh rows through `beside` itself (the actor's own apply would repair them, so the compare reads
+    // the planted rows through a delivery that only reads).
+    w.actor.conn.execute_batch("UPDATE owed_rows SET reason='actor-planted' WHERE rowid=(SELECT MIN(rowid) FROM owed_rows)").unwrap();
+    let planted = Planted(&w);
+    beside(&planted, "owner", &games).await;
+    assert_eq!(
+        (w.d1.counter(COUNTERS[0]), w.d1.counter(COUNTERS[1])),
+        (2, 1),
+        "the planted diff counted"
+    );
+    assert!(w
+        .d1
+        .lines
+        .borrow()
+        .iter()
+        .any(|l| l.starts_with("[owed-actor] DIFF owner")));
 }
 
 /// Phase C: with the D1 judge off the actor IS the judge; the marks are acknowledged after it applied, and D1's
@@ -452,27 +607,71 @@ async fn d2_actor_b_phase_a_compares_and_the_reconcile_finds_a_planted_diff() {
 #[tokio::test]
 async fn d2_actor_b_phase_c_acks_the_marks_after_the_actor_applied() {
     let d1 = seeded(&stranded());
-    let marks: i64 = d1.conn.query_row("SELECT COUNT(*) FROM owed_dirty WHERE identity='owner'", [], |r| r.get(0)).unwrap();
+    let marks: i64 = d1
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM owed_dirty WHERE identity='owner'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert!(marks > 0, "the fixture's writes marked the identity");
-    let w = WithActor { d1, actor: mirror(), d1_judges: false };
+    let w = WithActor {
+        d1,
+        actor: mirror(),
+        d1_judges: false,
+    };
     let games = games_of(&w.d1, "owner");
-    let report = crate::owed_events::deliver(&w, "owner", &games).await.unwrap();
+    let report = crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
     assert!(report.rows > 0);
-    let left: i64 = w.d1.conn.query_row("SELECT COUNT(*) FROM owed_dirty WHERE identity='owner' AND gameId<>''", [], |r| r.get(0)).unwrap();
-    let d1_rows: i64 = w.d1.conn.query_row("SELECT COUNT(*) FROM owed_rows WHERE identity='owner'", [], |r| r.get(0)).unwrap();
+    let left: i64 =
+        w.d1.conn
+            .query_row(
+                "SELECT COUNT(*) FROM owed_dirty WHERE identity='owner' AND gameId<>''",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+    let d1_rows: i64 =
+        w.d1.conn
+            .query_row(
+                "SELECT COUNT(*) FROM owed_rows WHERE identity='owner'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
     assert_eq!((left, d1_rows), (0, 0));
-    assert_eq!(stored(&w.actor, "owner").len() as usize, report.rows);
+    assert_eq!(stored(&w.actor, "owner").len(), report.rows);
 }
 
 /// MEDIUM-9 and Rule 23: the KV copy is display only and never an empty list served as "nothing owed".
 #[test]
 fn d2_actor_b_the_kv_copy_is_never_an_empty_list() {
     let none = display_from_copy(None);
-    assert_eq!((none["pending"].clone(), none["rows"].clone()), (json!(true), Value::Null));
+    assert_eq!(
+        (none["pending"].clone(), none["rows"].clone()),
+        (json!(true), Value::Null)
+    );
     let empty = display_from_copy(Some(&kv_copy_body("02ab", &[], 1)));
-    assert_eq!((empty["pending"].clone(), empty["rows"].clone()), (json!(true), Value::Null));
-    let one = display_from_copy(Some(&kv_copy_body("02ab", &[json!({"outpoint": "x:0", "claimable": 1})], 7)));
-    assert_eq!((one["rows"][0]["claimable"].clone(), one["displayOnly"].clone(), one["judgedAtMs"].clone()), (json!(false), json!(true), json!(7)));
+    assert_eq!(
+        (empty["pending"].clone(), empty["rows"].clone()),
+        (json!(true), Value::Null)
+    );
+    let one = display_from_copy(Some(&kv_copy_body(
+        "02ab",
+        &[json!({"outpoint": "x:0", "claimable": 1})],
+        7,
+    )));
+    assert_eq!(
+        (
+            one["rows"][0]["claimable"].clone(),
+            one["displayOnly"].clone(),
+            one["judgedAtMs"].clone()
+        ),
+        (json!(false), json!(true), json!(7))
+    );
     assert!(kv_copy_due(None, 5) && !kv_copy_due(Some(5), 900) && kv_copy_due(Some(5), 1_005));
 }
 
@@ -486,36 +685,80 @@ fn d2_actor_b_the_bars_are_served_and_the_counters_seeded() {
     }
     b.oldest_unapplied_at_ms = Some(400);
     let s = b.served(1_000);
-    assert_eq!((s["applyMsP50"].clone(), s["applyMsP95"].clone(), s["rowsVisibleMsP95"].clone(), s["applyCeilingMs"].clone(), s["oldestUnappliedEventAgeMs"].clone()), (json!(50), json!(95), json!(950), json!(APPLY_CEILING_MS), json!(600)));
-    for k in ["collectAfterMinedMsP95", "kvCopies", "bootstraps", "reconcileDiffs"] {
+    assert_eq!(
+        (
+            s["applyMsP50"].clone(),
+            s["applyMsP95"].clone(),
+            s["rowsVisibleMsP95"].clone(),
+            s["applyCeilingMs"].clone(),
+            s["oldestUnappliedEventAgeMs"].clone()
+        ),
+        (
+            json!(50),
+            json!(95),
+            json!(950),
+            json!(APPLY_CEILING_MS),
+            json!(600)
+        )
+    );
+    for k in [
+        "collectAfterMinedMsP95",
+        "kvCopies",
+        "bootstraps",
+        "reconcileDiffs",
+    ] {
         assert!(s.get(k).is_some(), "{k}");
     }
-    assert_eq!(COUNTERS, bsv_overlay_cloudflare::applayer_counters::OWED_ACTOR);
+    assert_eq!(
+        COUNTERS,
+        bsv_overlay_cloudflare::applayer_counters::OWED_ACTOR
+    );
     let seeded = bsv_overlay_cloudflare::applayer_counters::seeded_names();
     assert!(COUNTERS.iter().all(|c| seeded.iter().any(|s| s == c)));
     let key = format!("02{}", "AB".repeat(32));
     assert_eq!(actor_name(&key), Some(key.to_ascii_lowercase()));
     assert_eq!(actor_name("owner"), None);
-    assert!(!flag_on(None) && flag_on(Some("true".into())) && d1_judge_on(None) && !d1_judge_on(Some("false".into())));
+    assert!(
+        !flag_on(None)
+            && flag_on(Some("true".into()))
+            && d1_judge_on(None)
+            && !d1_judge_on(Some("false".into()))
+    );
 }
 
 /// The direct call's apply on the fleet-shaped fixture: one game of the whale, after its bootstrap, timed (native,
 /// the closure and the section; the platform's hop and a cold start are the tier's).
 #[tokio::test]
 async fn d2_actor_b_the_apply_on_the_fleet_fixture_is_timed() {
-    let f = fixtures().into_iter().find(|f| f.name == "d1_fleet").unwrap();
+    let f = fixtures()
+        .into_iter()
+        .find(|f| f.name == "d1_fleet")
+        .unwrap();
     let record = d1_judge(&f).await;
     let id = &f.identities[0];
     let games = games_of(&record, id);
     let local = mirror();
     for chunk in games.chunks(GAMES_PER_APPLY) {
-        apply(&record, &local, &Fakes, id, chunk, None, Some(TIP), None).await.unwrap();
+        apply(&record, &local, &Fakes, id, chunk, None, Some(TIP), None)
+            .await
+            .unwrap();
     }
     let mut m = Meter::default();
     let mut rounds = Vec::new();
     for g in games.iter().take(20) {
         let t = std::time::Instant::now();
-        let (r, _) = apply(&record, &local, &Fakes, id, std::slice::from_ref(g), None, Some(TIP), None).await.unwrap();
+        let (r, _) = apply(
+            &record,
+            &local,
+            &Fakes,
+            id,
+            std::slice::from_ref(g),
+            None,
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
         m.note(t.elapsed().as_millis() as u64);
         rounds.push(r.rounds);
     }

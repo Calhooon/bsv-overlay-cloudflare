@@ -222,7 +222,11 @@ pub trait JudgeDb: SqlPort {
     }
     /// bsv-low #912: the identity's actor applies the games (`owed_actor::object::call_apply`); `None` where no
     /// actor is bound (the native judges, a render without the class).
-    async fn actor_deliver(&self, _identity: &str, _games: &[String]) -> Result<Option<Value>, String> {
+    async fn actor_deliver(
+        &self,
+        _identity: &str,
+        _games: &[String],
+    ) -> Result<Option<Value>, String> {
         Ok(None)
     }
     /// MEDIUM-3 (bsv-low #912): a transaction's decoded facts. The D1 judge decodes the stored BEEF here; the
@@ -258,7 +262,9 @@ impl D1Judge {
             era_ms,
             event: None,
             d1_judges: crate::owed_actor::d1_judge_on(
-                env.var(crate::owed_actor::D1_JUDGE_FLAG).ok().map(|v| v.to_string()),
+                env.var(crate::owed_actor::D1_JUDGE_FLAG)
+                    .ok()
+                    .map(|v| v.to_string()),
             ),
         })
     }
@@ -289,7 +295,11 @@ impl JudgeDb for D1Judge {
     fn d1_judges(&self) -> bool {
         self.d1_judges
     }
-    async fn actor_deliver(&self, identity: &str, games: &[String]) -> Result<Option<Value>, String> {
+    async fn actor_deliver(
+        &self,
+        identity: &str,
+        games: &[String],
+    ) -> Result<Option<Value>, String> {
         let Some(event) = &self.event else {
             return Ok(None);
         };
@@ -297,9 +307,13 @@ impl JudgeDb for D1Judge {
             return Ok(None);
         }
         let body = crate::owed_actor::apply_body(identity, games, event, self.tip);
-        crate::owed_actor::object::call_apply(&self.sql.env, &body, crate::owed_actor::CONSUMER_CALL_WALL_MS)
-            .await
-            .map(Some)
+        crate::owed_actor::object::call_apply(
+            &self.sql.env,
+            &body,
+            crate::owed_actor::CONSUMER_CALL_WALL_MS,
+        )
+        .await
+        .map(Some)
     }
     fn era_ms(&self) -> Option<i64> {
         self.era_ms
