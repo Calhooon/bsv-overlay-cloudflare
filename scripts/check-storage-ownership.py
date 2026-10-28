@@ -273,6 +273,17 @@ def hits_in(text):
     return out
 
 
+def cfg_test_module(path):
+    """bsv-low #912: a `tests.rs` whose parent module declares it `#[cfg(test)] mod tests;` is test code (the lexer's
+    test spans are items inside a file, so a whole file under a module-level cfg(test) was scanned as production)."""
+    if os.path.basename(path) != "tests.rs":
+        return False
+    parent = os.path.dirname(path) + ".rs"
+    if not os.path.exists(parent):
+        return False
+    return re.search(r"#\[cfg\(test\)\]\s*mod\s+tests\s*;", open(parent, encoding="utf-8").read()) is not None
+
+
 def scan_crate(crate_dir, root=ROOT):
     """Every hit of one crate: dicts with file, line, op, table (None if dynamic), token, allow."""
     hits = []
@@ -282,6 +293,8 @@ def scan_crate(crate_dir, root=ROOT):
             if not (f.endswith(".rs") or f.endswith(".sql")):
                 continue
             path = os.path.join(dp, f)
+            if cfg_test_module(path):
+                continue
             hits.extend(scan_file(path, os.path.relpath(path, root)))
     return hits
 
@@ -369,10 +382,39 @@ def judge(man, hits_by_crate):
         reds.append(f"{where}: crate `{crate}` deletes from `{name}`, a NEVER-WIPE table, and its row grants no "
                     f"delete_scope for this statement: `{stmt[:96]}`")
 
+    # bsv-low #912: a Durable Object's OWN SQLite (`object_stores`, e.g. the owed actor's mirror) is not the shared D1.
+    # In a store's files a hit is the object's when it names one of the store's own tables (any op), CREATEs or DROPs
+    # one of its mirrored tables (the shared D1's DDL is the schema owner's, never these files'), or is one of its
+    # pinned dynamic statements; every other hit there (the store's reads of the record) is judged as usual.
+    stores = man.get("object_stores", [])
+    store_used = set()  # (store, kind, value)
+    for st in stores:
+        for own in st.get("own_tables", []):
+            if own in tables:
+                reds.append(f"{MANIFEST}: object store `{st['store']}` claims `{own}` as its own, a shared D1 table")
+
+    def object_store(crate, h):
+        for st in stores:
+            if st["crate"] != crate or h["file"] not in st["files"]:
+                continue
+            name = h["table"]
+            if name is not None and name in st.get("own_tables", []):
+                store_used.add((st["store"], "own", name))
+                return st
+            if name is not None and h["op"] in ("CREATE", "DROP") and name in st.get("mirrored", []):
+                store_used.add((st["store"], "mirrored", name))
+                return st
+            if name is None and h["stmt"] in st.get("statements", []):
+                store_used.add((st["store"], "statement", h["stmt"]))
+                return st
+        return None
+
     for crate, hits in hits_by_crate.items():
         for h in hits:
             where = f'{h["file"]}:{h["line"]}'
             name = h["table"]
+            if h["op"] != "CTE" and object_store(crate, h) is not None:
+                continue
             if h["op"] == "CTE":
                 if name in tables:
                     reds.append(f"{where}: a CTE named `{name}`, a manifest table, would hide that table's reads in this file: rename it")
@@ -448,6 +490,16 @@ def judge(man, hits_by_crate):
                         scopes_used.add((name, g["crate"], g["file"], g["statement"]))
 
     scanned = set(hits_by_crate)
+    for st in stores:
+        if st["crate"] not in scanned:
+            continue
+        for kind, key in (("own", "own_tables"), ("mirrored", "mirrored"), ("statement", "statements")):
+            for v in st.get(key, []):
+                if (st["store"], kind, v) not in store_used:
+                    reds.append(f"{MANIFEST}: object store `{st['store']}` lists {kind} `{str(v)[:96]}` and no statement of its files uses it: drop it")
+        for m in st.get("mirrored", []):
+            if m not in tables:
+                reds.append(f"{MANIFEST}: object store `{st['store']}` mirrors `{m}`, not in {MANIFEST}")
     for name, t in tables.items():
         if t["database"] == man["shared_database"] and name not in created:
             reds.append(f"{MANIFEST}: table `{name}` is listed and nothing in the scanned crates creates it: a stale row")
@@ -652,6 +704,23 @@ def self_test():
     reds, _, _ = tree('fn a() { q("ALTER TABLE owned ADD COLUMN x INTEGER"); q("SELECT x FROM owned"); }\n',
                       lambda m: (m["tables"][0]["readers"].clear(), m["tables"][0]["writers"].update(guest=["ALTER"])))
     check("a DDL grant implies no read (lens N1)", any("reads table `owned`" in x for x in reds))
+    # bsv-low #912: an object store's own tables, its mirror's DDL and its pinned dynamic statements are the object's;
+    # its reads of the record are judged as usual; an unused entry is stale; a shared table is never "own".
+    ostore = lambda m: m.update(object_stores=[{"store": "fixture DO", "crate": "guest", "files": ["guest/src/lib.rs"],
+                                                "own_tables": ["local"], "mirrored": ["owned"],
+                                                "statements": ["DELETE FROM {} WHERE k = ?"], "why": "fixture"}])
+    osrc = ('fn o() { q("CREATE TABLE IF NOT EXISTS local (k TEXT)"); q("INSERT INTO local (k) VALUES (?)"); '
+            'q("CREATE TABLE IF NOT EXISTS owned (k TEXT)"); q(format!("DELETE FROM {} WHERE k = ?", t)); '
+            'q("SELECT k FROM owned"); }\n')
+    reds, _, _ = tree(osrc, ostore)
+    check("an object store's own tables, mirror DDL and pinned statements are the object's (#912)", reds == [])
+    reds, _, _ = tree(osrc + 'fn w() { q("INSERT INTO owned (k) VALUES (?)"); }\n', ostore)
+    check("an object store's file still may not write a shared table it has no grant for (#912)",
+          any("writes (INSERT) table `owned`" in x for x in reds))
+    reds, _, _ = tree(osrc.replace('q("INSERT INTO local (k) VALUES (?)"); ', '').replace('q("CREATE TABLE IF NOT EXISTS local (k TEXT)"); ', ''), ostore)
+    check("an object store's unused own table is stale (#912)", any("lists own `local`" in x for x in reds))
+    reds, _, _ = tree(osrc, lambda m: (ostore(m), m["object_stores"][0]["own_tables"].append("shared")))
+    check("a shared table is never an object store's own (#912)", any("claims `shared`" in x for x in reds))
     print(f"check-storage-ownership self-test: {ok} ok, {bad} failed")
     return bad == 0
 
