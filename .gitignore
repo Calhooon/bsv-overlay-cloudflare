@@ -16,3 +16,7 @@ reference/.docker/
 wrangler.deploy.toml
 wrangler.low.deploy.toml
 __pycache__/
+
+# the gates' output symlinks (make gate-output-dirs) are never tracked: a shipped tree holding them dangles on the land host and refuses the tier (PR 200, 2026-10-28)
+crates/*/build
+crates/*/.wrangler
