@@ -513,6 +513,13 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
         push_coalesce::flush_after(&ctx, &env);
         return resp;
     }
+    // bsv-low #912 (LOW-2, the wipe's step): the identity list read from D1 BEFORE the wipe, then each actor reset.
+    if req.method() == worker::Method::Get && req.path() == "/internal/owed-actor-identities" {
+        return owed_actor::object::identities_lever(req, &env).await;
+    }
+    if req.method() == worker::Method::Post && req.path() == "/internal/owed-actor-reset" {
+        return owed_actor::object::reset_lever(req, &env).await;
+    }
     if req.method() == worker::Method::Post && req.path() == "/internal/owed-belt-tick" {
         let resp = owed_belt::lever(req, &env).await;
         push_coalesce::flush_after(&ctx, &env);

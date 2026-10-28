@@ -18,8 +18,8 @@
 //! THE SECTION (MEDIUM-2). A Durable Object's input gate stays open across a fetch await, so the object holds ONE
 //! turn (`apply_in_turn`, a mutex in the object): every apply, its closure's record reads and outside answers (the
 //! word views' header rechecks, the canonical roots) included, runs inside it, and an event arriving meanwhile waits
-//! and is applied after (pin `d2_actor_b_two_events_under_a_slow_record_derive_the_newer_rows`, RED with the turn
-//! removed). The judgement that stands is the FIXPOINT round's: the round whose statements named no key the mirror
+//! and is applied after (pin `d2_actor_b_two_events_under_a_slow_chaintracks_derive_the_newer_rows`, RED with the
+//! turn removed: the older judgement's claimable `hop-stranded` row stored over the newer `unbound` one). The judgement that stands is the FIXPOINT round's: the round whose statements named no key the mirror
 //! did not hold. The closure starts from what the mirror already names for the games (closed locally, no record
 //! read) and the last judgement's own txids, so a steady-state apply is ONE round: one record batch, one local
 //! write, one judgement.
@@ -868,6 +868,92 @@ pub async fn apply_in_turn<R: SqlPort, L: SqlPort, O: Outside>(
     apply(record, local, outside, me, games, kind_seq, tip, era_ms).await
 }
 
+/// bsv-low #912 (HIGH-3, Phase C): the actor's dated rows of these games, the questions it owes the chain.
+pub const ASK_ROWS_SQL: &str = "SELECT outpoint,gameId,family,facts,reason,probeTip,beltDueAtMs,judgedAtMs,claimable FROM owed_rows WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2)) AND beltDueAtMs IS NOT NULL ORDER BY outpoint";
+/// The identity's asks of these games that no dated row names any more (`?1`, `?2` the identity's range of the
+/// ledger's key, `?3` the games, `?4` the asks kept): taken out of the belt's ledger.
+pub const ASKS_CLEAR_SQL: &str = "DELETE FROM owed_belt_state WHERE name>=?1 AND name<?2 AND json_extract(cursor,'$.question.gameId') IN (SELECT value FROM json_each(?3)) AND name NOT IN (SELECT value FROM json_each(?4))";
+/// One ask, rewritten only when its question moved (an unchanged re-publish keeps the belt's backoff).
+pub const ASK_PUT_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,?2,?3) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs WHERE owed_belt_state.cursor IS NOT excluded.cursor";
+
+/// PUBLISH THE BELT'S QUESTIONS (HIGH-3, Phase C): every dated row of the judged games is a `belt-ask` in the belt's
+/// ledger ([`crate::owed_belt::ask_of_row`]), and an ask no dated row names any more is taken out; ONE record batch.
+/// The actor asks no courier: the belt singleton does, at its cadence, through its one gate. Returns the asks held.
+pub async fn publish_belt_asks<R: SqlPort, L: SqlPort>(
+    record: &R,
+    local: &L,
+    me: &str,
+    games: &[String],
+) -> Result<usize, String> {
+    let me = me.to_ascii_lowercase();
+    let games: Vec<String> = games.iter().map(|g| g.to_ascii_lowercase()).collect();
+    let gj = json!(games).to_string();
+    let rows = local
+        .run_batch(vec![Stmt::new(
+            ASK_ROWS_SQL,
+            vec![Bind::Text(me.clone()), Bind::Text(gj.clone())],
+        )])
+        .await?
+        .into_iter()
+        .next()
+        .map(|o| o.rows)
+        .unwrap_or_default();
+    let asks: Vec<(String, Value, i64)> = rows
+        .iter()
+        .filter_map(|r| crate::owed_belt::ask_of_row(&me, r))
+        .collect();
+    let names: Vec<&String> = asks.iter().map(|(n, _, _)| n).collect();
+    let mut stmts = vec![Stmt::new(
+        ASKS_CLEAR_SQL,
+        vec![
+            Bind::Text(format!("{}{me} ", crate::owed_belt::BELT_ASK_PREFIX)),
+            Bind::Text(format!("{}{me}!", crate::owed_belt::BELT_ASK_PREFIX)),
+            Bind::Text(gj),
+            Bind::Text(json!(names).to_string()),
+        ],
+    )];
+    for (name, body, due) in &asks {
+        stmts.push(Stmt::new(
+            ASK_PUT_SQL,
+            vec![
+                Bind::Text(name.clone()),
+                Bind::Text(body.to_string()),
+                Bind::Int(*due),
+            ],
+        ));
+    }
+    record.run_batch(stmts).await?;
+    if !asks.is_empty() {
+        record
+            .counters(vec![(COUNTERS[8].to_string(), asks.len() as u64)])
+            .await;
+    }
+    Ok(asks.len())
+}
+
+/// [`apply_in_turn`], then (Phase C, `publish`) the asks of the games published INSIDE the same turn, so a later
+/// apply's asks are never overwritten by an earlier one's.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_and_publish_in_turn<R: SqlPort, L: SqlPort, O: Outside>(
+    turn: &futures_util::lock::Mutex<()>,
+    record: &R,
+    local: &L,
+    outside: &O,
+    me: &str,
+    games: &[String],
+    kind_seq: Option<(&str, i64)>,
+    tip: Option<u64>,
+    era_ms: Option<i64>,
+    publish: bool,
+) -> Result<(ApplyReport, Vec<(String, Value)>), String> {
+    let _turn = turn.lock().await;
+    let applied = apply(record, local, outside, me, games, kind_seq, tip, era_ms).await?;
+    if publish && !applied.0.skipped_redelivery {
+        publish_belt_asks(record, local, me, games).await?;
+    }
+    Ok(applied)
+}
+
 /// A `txfacts` event (MEDIUM-3): the transaction's facts as the overlay decoded them (`owed_event::txfacts_of_raw`),
 /// held under `event`, last-writer-by-seq.
 pub fn txfacts_event_stmt(facts: &Value, seq: i64) -> Option<Stmt> {
@@ -904,15 +990,28 @@ pub const ROWS_SQL: &str = "SELECT identity,outpoint,family,gameId,sats,opponent
 
 /// Phase A's compare (section 6): the actor's rows against the D1 judge's, by outpoint, each `(family, gameId, sats,
 /// opponentIdentity, atHeight, reason, facts)`; the outpoints that differ, sorted.
+/// The facts of a stored row as the compares read them: the judgement, not its clock (the facts relative to the
+/// judge's `now` taken out, so two judges of one record at two instants compare equal).
+pub const CLOCK_FACTS: [&str; 4] = ["ageMs", "chainProbeAgeMs", "beltNextAtMs", "asOfMs"];
+pub fn compared_facts(row: &Value) -> Value {
+    let mut facts: Value = row["facts"]
+        .as_str()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Null);
+    if let Some(m) = facts.as_object_mut() {
+        for k in CLOCK_FACTS {
+            m.remove(k);
+        }
+    }
+    facts
+}
+
 pub fn diff_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
     fn keyed(rows: &[Value]) -> BTreeMap<String, Value> {
         rows.iter()
             .filter_map(|r| {
                 let k = r["outpoint"].as_str()?.to_string();
-                let facts: Value = r["facts"]
-                    .as_str()
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or(Value::Null);
+                let facts = compared_facts(r);
                 Some((
                     k,
                     json!([
@@ -1049,22 +1148,185 @@ pub fn served_bars(now_ms: u64) -> Value {
     BARS.with(|b| b.borrow().served(now_ms))
 }
 
-/// The reconcile's exact first question (MEDIUM-10): the un-acked marks older than an hour, re-published.
-pub const RECONCILE_OLD_MARKS_SQL: &str = "SELECT source,sourceKey,MIN(markedAtMs) AS markedAtMs FROM owed_dirty INDEXED BY idx_owed_dirty_backlog WHERE markedAtMs<?1 GROUP BY source,sourceKey ORDER BY MIN(markedAtMs) LIMIT ?2";
-/// The sampled digest compare: 64 identities a day on the belt's driver.
+/// The sampled digest compare (MEDIUM-10, the reconcile's second question; the exact first, the un-acked marks
+/// re-published, is lane A's sweep on the same driver, `owed_events::sweep_publish`): 64 identities a day on the belt
+/// singleton's alarm, ONE identity per [`RECONCILE_INTERVAL_MS`], in identity order over `owed_state` (wrapping).
 pub const RECONCILE_SAMPLE_PER_DAY: usize = 64;
-pub const RECONCILE_MARK_AGE_MS: u64 = 3_600_000;
+/// One identity every 22.5 minutes (86,400,000 / 64).
+pub const RECONCILE_INTERVAL_MS: i64 = 86_400_000 / RECONCILE_SAMPLE_PER_DAY as i64;
+/// The reconcile's place in the belt's ledger: the last identity compared and when.
+pub const RECONCILE_STATE_NAME: &str = "reconcile:owed-actor";
+pub const RECONCILE_STATE_SQL: &str =
+    "SELECT cursor,tickedAtMs FROM owed_belt_state WHERE name='reconcile:owed-actor'";
+/// The next identity past the cursor: the least of four key seeks (`owed_state`'s key; the party, hop marker and
+/// released evidence identity indexes), so an identity the D1 judge never stated (Phase C) is sampled too.
+pub const RECONCILE_NEXT_SQL: &str = "SELECT MIN(i) AS identity FROM (SELECT (SELECT MIN(identity) FROM owed_state WHERE identity>?1) AS i UNION ALL SELECT (SELECT MIN(identity) FROM potparty_records WHERE identity>?1) UNION ALL SELECT (SELECT MIN(identity) FROM hopparty_records WHERE identity>?1) UNION ALL SELECT (SELECT MIN(identity) FROM released_hop_evidence WHERE identity>?1))";
+/// The games one reconcile re-applies, at most (four applies of [`GAMES_PER_APPLY`]).
+pub const RECONCILE_GAMES_MAX: usize = 256;
 /// The stored rows the digest compares (D1's `owed_rows` of one identity, the words stripped as stored).
 pub const RECONCILE_D1_ROWS_SQL: &str = ROWS_SQL;
+
+/// One reconcile's account.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReconcileReport {
+    pub identity: String,
+    /// The two digests compared (Phases A and B: D1's rows against the actor's; Phase C: the actor's rows before
+    /// and after a re-apply of its games from the record).
+    pub d1_digest: Option<String>,
+    pub actor_digest: Option<String>,
+    pub diff: bool,
+    /// The games re-applied (on a diff; in Phase C, every game of the identity's rows, to the bound).
+    pub reapplied: usize,
+    /// No actor answered (none bound, or the actor out of reach).
+    pub no_actor: bool,
+}
+
+fn games_of_rows(rows: &[Value], into: &mut BTreeSet<String>) {
+    into.extend(
+        rows.iter()
+            .filter_map(|r| r["gameId"].as_str().map(str::to_string)),
+    );
+}
+
+/// THE SAMPLED DIGEST RECONCILE (MEDIUM-10), one step on the belt's driver: at most one identity a
+/// [`RECONCILE_INTERVAL_MS`] (64 a day). Phases A and B (`OWED_D1_JUDGE` on): D1's stored rows of the identity
+/// against the actor's ([`rows_digest`], no apply); a diff re-applies the differing games (the actor's closure re-reads
+/// the record), counted and logged. Phase C (the D1 rows are cold): the actor's rows before and after a re-apply of
+/// its games from the record (a divergence the events missed is a diff). D1 reads: the state, one `owed_state` seek,
+/// the identity's rows (A and B). Counted `owed_actor_reconcile_{compared,diffs,republished}_total`.
+pub async fn reconcile_step(
+    db: &impl JudgeDb,
+    now: i64,
+) -> Result<Option<ReconcileReport>, String> {
+    let first = |out: Vec<StmtOut>| out.into_iter().next().map(|o| o.rows).unwrap_or_default();
+    let state = first(
+        db.run_batch(vec![Stmt::new(RECONCILE_STATE_SQL, vec![])])
+            .await?,
+    );
+    let (cursor, last) = state.first().map_or((String::new(), None), |r| {
+        (
+            r["cursor"].as_str().unwrap_or_default().to_string(),
+            r["tickedAtMs"].as_i64(),
+        )
+    });
+    if last.is_some_and(|l| now.saturating_sub(l) < RECONCILE_INTERVAL_MS) {
+        return Ok(None);
+    }
+    let next = |after: String| async move {
+        db.run_batch(vec![Stmt::new(RECONCILE_NEXT_SQL, vec![Bind::Text(after)])])
+            .await
+            .map(|o| {
+                first(o)
+                    .first()
+                    .and_then(|r| r["identity"].as_str().map(str::to_string))
+            })
+    };
+    let identity = match next(cursor.clone()).await? {
+        Some(i) => Some(i),
+        None if !cursor.is_empty() => next(String::new()).await?,
+        None => None,
+    };
+    let save = |id: String| async move {
+        db.run_batch(vec![Stmt::new(
+            crate::owed_belt::STATE_SQL,
+            vec![
+                Bind::Text(RECONCILE_STATE_NAME.into()),
+                Bind::Text(id),
+                Bind::Int(now),
+            ],
+        )])
+        .await
+    };
+    let Some(identity) = identity else {
+        save(String::new()).await?;
+        return Ok(None);
+    };
+    let mut report = ReconcileReport {
+        identity: identity.clone(),
+        ..Default::default()
+    };
+    let actor = match db.actor_rows(&identity).await {
+        Ok(Some(rows)) => rows,
+        Ok(None) => {
+            report.no_actor = true;
+            save(identity).await?;
+            return Ok(Some(report));
+        }
+        Err(e) => {
+            db.log(&format!("[owed-actor] reconcile {identity}: {e}"));
+            report.no_actor = true;
+            save(identity).await?;
+            return Ok(Some(report));
+        }
+    };
+    let mut games = BTreeSet::new();
+    let compare_to: Vec<Value> = if db.d1_judges() {
+        let d1 = first(
+            db.run_batch(vec![Stmt::new(
+                RECONCILE_D1_ROWS_SQL,
+                vec![Bind::Text(identity.clone())],
+            )])
+            .await?,
+        );
+        for o in diff_rows(&d1, &actor) {
+            for r in d1.iter().chain(&actor).filter(|r| r["outpoint"] == o.as_str()) {
+                games_of_rows(std::slice::from_ref(r), &mut games);
+            }
+        }
+        d1
+    } else {
+        games_of_rows(&actor, &mut games);
+        actor.clone()
+    };
+    let games: Vec<String> = games.into_iter().take(RECONCILE_GAMES_MAX).collect();
+    let mut after = actor.clone();
+    for chunk in games.chunks(GAMES_PER_APPLY) {
+        match db.actor_apply(&identity, chunk, "reconcile").await {
+            Ok(Some(a)) => {
+                report.reapplied += chunk.len();
+                if let Some(rows) = a["rows"].as_array() {
+                    after = rows.clone();
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                db.log(&format!("[owed-actor] reconcile {identity}: re-apply: {e}"));
+                break;
+            }
+        }
+    }
+    // A and B: D1 against the actor as it stood; C: the actor before against after its re-apply.
+    let (a, b) = if db.d1_judges() {
+        (compare_to, actor)
+    } else {
+        (compare_to, after)
+    };
+    report.d1_digest = Some(rows_digest(&a));
+    report.actor_digest = Some(rows_digest(&b));
+    report.diff = report.d1_digest != report.actor_digest;
+    let mut deltas = vec![(COUNTERS[6].to_string(), 1)];
+    if report.diff {
+        deltas.push((COUNTERS[7].to_string(), 1));
+        BARS.with(|b| b.borrow_mut().reconcile_diffs += 1);
+        db.log(&format!(
+            "[owed-actor] RECONCILE DIFF {identity}: {} outpoints differ, {} games re-applied",
+            diff_rows(&a, &b).len(),
+            report.reapplied
+        ));
+    }
+    if report.reapplied > 0 && db.d1_judges() {
+        deltas.push((COUNTERS[5].to_string(), report.reapplied as u64));
+    }
+    db.counters(deltas).await;
+    save(identity).await?;
+    Ok(Some(report))
+}
 /// The digest of one identity's rows: the sorted outpoints with their compared fields, hashed.
 pub fn rows_digest(rows: &[Value]) -> String {
     let mut keyed: Vec<String> = rows
         .iter()
         .map(|r| {
-            let facts: Value = r["facts"]
-                .as_str()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or(Value::Null);
+            let facts = compared_facts(r);
             json!([
                 r["outpoint"],
                 r["family"],
@@ -1089,7 +1351,9 @@ pub fn rows_digest(rows: &[Value]) -> String {
 mod tests;
 
 /// The counters (seeded by the overlay, `applayer_counters::OWED_ACTOR`, pinned equal).
-pub const COUNTERS: [&str; 8] = [
+/// `reconcile_republished`: the games a reconcile's DIFF re-applied (Phases A and B). The last two (Phase C, HIGH-3):
+/// the asks the actors published, and the belt's finds handed back to an actor.
+pub const COUNTERS: [&str; 10] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -1098,6 +1362,8 @@ pub const COUNTERS: [&str; 8] = [
     "owed_actor_reconcile_republished_total",
     "owed_actor_reconcile_compared_total",
     "owed_actor_reconcile_diffs_total",
+    "owed_actor_belt_asks_total",
+    "owed_belt_handed_back_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;
@@ -1178,6 +1444,22 @@ pub async fn beside(db: &impl JudgeDb, identity: &str, games: &[String]) {
         ));
     }
     db.counters(deltas).await;
+}
+
+/// The fleet's reconcile diffs (`owed_actor_reconcile_diffs_total`), served as `/health.owedActor.reconcileDiffs`:
+/// the reconcile runs on the belt's alarm, in its own isolate, so this isolate's bar would read 0.
+pub async fn durable_reconcile_diffs(db: &impl SqlPort) -> Option<u64> {
+    db.run_batch(vec![Stmt::new(
+        "SELECT value FROM ops_counters WHERE name=?1",
+        vec![Bind::Text(COUNTERS[7].into())],
+    )])
+    .await
+    .ok()?
+    .into_iter()
+    .next()?
+    .rows
+    .first()
+    .map_or(Some(0), |r| r["value"].as_u64())
 }
 
 /// The bars of one answer, in this isolate.

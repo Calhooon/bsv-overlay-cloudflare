@@ -1,11 +1,14 @@
 //! `OwedActor`, the Durable Object (bsv-low #912; `DESIGN-D2-ACTOR-2026-10-26.md` section 4). One per identity
 //! (`idFromName` of the lowercased 66-hex key, LOW-1), its own SQLite (`new_sqlite_classes`, tag `v4-owed-actor`),
 //! reached only by binding: the consumer's delivery and the writers' direct call (`/apply`), the read (`/rows`), the
-//! wipe's lever (`/reset`, LOW-2). It accepts no public input: the Worker's router never forwards to it.
+//! wipe's lever (`/reset`, LOW-2). It accepts no public input: the Worker's router never forwards a public request to
+//! it (the wipe's two bearer levers below are the operator's).
 //!
 //! Routes (POST unless named): `/apply {identity, games, kind, seq, atMs, tip, txfacts?}` applies one event (the
 //! closure, then the section; the facts of a `txfacts` event held first); `GET /rows?identity=` its stored rows and
-//! its ack watermark; `GET /bars` the object's own bars; `/reset` deletes its whole storage (the alarm included).
+//! its ack watermark; `GET /stored?identity=` its stored rows (the reconcile's read); `GET /bars` the object's own
+//! bars; `/reset` deletes its whole storage (the alarm included), reached from outside only through the bearer lever
+//! `POST /internal/owed-actor-reset` over the identity list `GET /internal/owed-actor-identities` reads from D1.
 //! The alarm writes the coalesced KV copy (at most one a second, MEDIUM-9) and re-judges its gated games when the
 //! block it waits for has come (MEDIUM-5; the hook's `tip` event stays the second belt).
 use super::*;
@@ -161,6 +164,16 @@ impl DurableObject for OwedActor {
                     .map(|(_, v)| v.to_string());
                 self.rows_route(identity).await
             }
+            // The reconcile's read (MEDIUM-10): the stored rows, the words stripped as stored, no apply.
+            (Method::Get, "/stored") => {
+                let local = self.local();
+                let me = url
+                    .query_pairs()
+                    .find(|(k, _)| k == "identity")
+                    .and_then(|(_, v)| actor_name(&v));
+                let rows = me.as_deref().map(|m| self.rows_of(&local, m)).unwrap_or_default();
+                Response::from_json(&json!({"identity": me, "rows": rows}))
+            }
             (Method::Get, "/bars") => {
                 Response::from_json(&self.bars.borrow().served(Date::now().as_millis()))
             }
@@ -247,6 +260,11 @@ impl OwedActor {
         local
     }
 
+    /// Phase C (`OWED_D1_JUDGE=false`): the D1 rows are not dated, so the actor publishes its belt questions.
+    fn publishes_asks(&self) -> bool {
+        !d1_judge_on(self.env.var(D1_JUDGE_FLAG).ok().map(|v| v.to_string()))
+    }
+
     fn meta(&self, name: &str) -> Option<String> {
         let local = self.local();
         local
@@ -302,7 +320,7 @@ impl OwedActor {
         }
         let record = crate::routes::D1Sql::of(&self.env)?;
         let kind_seq = body.kind.as_deref().zip(body.seq);
-        let applied = apply_in_turn(
+        let applied = apply_and_publish_in_turn(
             &self.turn,
             &record,
             &local,
@@ -312,6 +330,7 @@ impl OwedActor {
             kind_seq,
             body.tip,
             crate::routes::written_off_before_ms_env(&self.env),
+            self.publishes_asks(),
         )
         .await;
         let (report, pushes) = match applied {
@@ -478,7 +497,7 @@ impl OwedActor {
             .unwrap_or_default();
         if !games.is_empty() {
             let tip = crate::owed_events::tip_memoised(&self.env, false).await;
-            apply_in_turn(
+            apply_and_publish_in_turn(
                 &self.turn,
                 &record,
                 local,
@@ -488,6 +507,7 @@ impl OwedActor {
                 None,
                 tip,
                 crate::routes::written_off_before_ms_env(&self.env),
+                self.publishes_asks(),
             )
             .await
             .map_err(Error::RustError)?;
@@ -600,6 +620,36 @@ pub async fn call_rows(
             .await
             .map_err(|e| e.to_string())?;
         resp.json::<Value>().await.map_err(|e| e.to_string())
+    };
+    let wall = Delay::from(std::time::Duration::from_millis(wall_ms));
+    futures_util::pin_mut!(call);
+    futures_util::pin_mut!(wall);
+    match futures_util::future::select(call, wall).await {
+        futures_util::future::Either::Left((r, _)) => r,
+        futures_util::future::Either::Right(_) => {
+            Err(format!("owed actor: no answer in {wall_ms} ms"))
+        }
+    }
+}
+
+/// The reconcile's call (`GET /stored`), bounded: the actor's stored rows.
+pub async fn call_stored(
+    env: &Env,
+    identity: &str,
+    wall_ms: u64,
+) -> std::result::Result<Vec<Value>, String> {
+    let stub = stub_of(env, identity).ok_or("no owed actor for this identity")?;
+    let name = actor_name(identity).unwrap_or_default();
+    let call = async {
+        let mut resp = stub
+            .fetch_with_str(&format!("https://owed-actor/stored?identity={name}"))
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.status_code() != 200 {
+            return Err(format!("owed actor answered {}", resp.status_code()));
+        }
+        let v = resp.json::<Value>().await.map_err(|e| e.to_string())?;
+        Ok(v["rows"].as_array().cloned().unwrap_or_default())
     };
     let wall = Delay::from(std::time::Duration::from_millis(wall_ms));
     futures_util::pin_mut!(call);
@@ -725,4 +775,102 @@ pub(crate) async fn read_snapshot(
         .as_object()
         .map(|o| Value::Object(o.clone()));
     Ok(Ok(snapshot))
+}
+
+/// THE WIPE'S LEVER (LOW-2; WIPE-REHEARSAL-3 section 2, step 4a), part 1: `GET /internal/owed-actor-identities?after=`
+/// (bearer `INTERNAL_TOKEN`): the identities an actor may exist for, read from D1 (every identity of a party, a hop
+/// marker, a released hop's evidence or a stored owed state: each actor is minted by an event, a direct call or a read
+/// of one of them), [`RESET_IDENTITIES_PAGE`] a page in key order past `after`; `next` is the cursor, `null` at the end.
+/// Read it WHOLE before D1 is wiped.
+pub const RESET_IDENTITIES_PAGE: usize = 500;
+pub const RESET_IDENTITIES_SQL: &str = "SELECT identity FROM (SELECT identity FROM owed_state UNION SELECT identity FROM potparty_records UNION SELECT identity FROM hopparty_records UNION SELECT identity FROM released_hop_evidence) WHERE identity>?1 ORDER BY identity LIMIT ?2";
+/// Part 2: `POST /internal/owed-actor-reset {"identities": [...]}` (bearer `INTERNAL_TOKEN`), 1 to
+/// [`RESET_PER_CALL`] keys a call (more is a 400): each identity's actor `/reset` (`deleteAll`, its alarm deleted),
+/// answered per key (`reset`, `skipped` for a key that is not 66-hex, `faults`).
+pub const RESET_PER_CALL: usize = 50;
+
+pub async fn identities_lever(req: Request, env: &Env) -> Result<Response> {
+    if !crate::internal_events::internal_bearer_ok(&req, env) {
+        return Response::error("unauthorized", 401);
+    }
+    let after = req
+        .url()?
+        .query_pairs()
+        .find(|(k, _)| k == "after")
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_default();
+    let db = crate::routes::D1Sql::of(env)?;
+    let rows = db
+        .run_batch(vec![Stmt::new(
+            RESET_IDENTITIES_SQL,
+            vec![Bind::Text(after), Bind::Int(RESET_IDENTITIES_PAGE as i64)],
+        )])
+        .await
+        .map_err(Error::RustError)?
+        .into_iter()
+        .next()
+        .map(|o| o.rows)
+        .unwrap_or_default();
+    let ids: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r["identity"].as_str().map(str::to_string))
+        .collect();
+    let next = (ids.len() == RESET_IDENTITIES_PAGE)
+        .then(|| ids.last().cloned())
+        .flatten();
+    Response::from_json(&json!({"identities": ids, "next": next}))
+}
+
+/// The reset lever's plan: the keys it resets (lowercased, 66-hex, deduplicated) and those it skips; `Err` past the
+/// bound or with no key.
+pub fn reset_plan(body: &Value) -> std::result::Result<(Vec<String>, Vec<String>), String> {
+    let keys = body["identities"]
+        .as_array()
+        .ok_or("the body names no identities")?;
+    if keys.is_empty() || keys.len() > RESET_PER_CALL {
+        return Err(format!("1 to {RESET_PER_CALL} identities a call"));
+    }
+    let (mut reset, mut skipped) = (BTreeSet::new(), Vec::new());
+    for k in keys {
+        match k.as_str().and_then(actor_name) {
+            Some(n) => {
+                reset.insert(n);
+            }
+            None => skipped.push(k.to_string()),
+        }
+    }
+    Ok((reset.into_iter().collect(), skipped))
+}
+
+pub async fn reset_lever(mut req: Request, env: &Env) -> Result<Response> {
+    if !crate::internal_events::internal_bearer_ok(&req, env) {
+        return Response::error("unauthorized", 401);
+    }
+    let body: Value = match req.json().await {
+        Ok(b) => b,
+        Err(e) => return Response::error(format!("bad reset body: {e}"), 400),
+    };
+    let (keys, skipped) = match reset_plan(&body) {
+        Ok(p) => p,
+        Err(e) => return Response::error(e, 400),
+    };
+    let (mut reset, mut faults) = (Vec::new(), Vec::new());
+    for k in keys {
+        let Some(stub) = stub_of(env, &k) else {
+            faults.push(json!({"identity": k, "error": "no owed actor binding"}));
+            continue;
+        };
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post);
+        let answer = match Request::new_with_init("https://owed-actor/reset", &init) {
+            Ok(r) => stub.fetch_with_request(r).await,
+            Err(e) => Err(e),
+        };
+        match answer {
+            Ok(resp) if resp.status_code() == 200 => reset.push(k),
+            Ok(resp) => faults.push(json!({"identity": k, "error": resp.status_code()})),
+            Err(e) => faults.push(json!({"identity": k, "error": e.to_string()})),
+        }
+    }
+    Response::from_json(&json!({"reset": reset, "skipped": skipped, "faults": faults}))
 }

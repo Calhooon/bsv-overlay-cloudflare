@@ -7038,6 +7038,17 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     ));
     body["owedActor"]["bound"] =
         serde_json::json!(ctx.env.durable_object(crate::owed_actor::BINDING).is_ok());
+    // The flags at the design's named place (the harness reads `owedActor.flags.OWED_ACTOR_READ`).
+    body["owedActor"]["flags"] = serde_json::json!({
+        crate::owed_actor::READ_FLAG: body["owedActor"]["readFlag"],
+        crate::owed_actor::D1_JUDGE_FLAG: body["owedActor"]["d1Judge"],
+    });
+    // The reconcile's diffs are the fleet's (the belt's alarm runs it in another isolate): the durable count.
+    if let Ok(sql) = D1Sql::of(&ctx.env) {
+        if let Some(diffs) = crate::owed_actor::durable_reconcile_diffs(&sql).await {
+            body["owedActor"]["reconcileDiffs"] = serde_json::json!(diffs);
+        }
+    }
     // bsv-low #499: this isolate's D1 rows ledger, the per-route running maxima since boot (the overlay serves the
     // same body on `/health/invariants.d1Budget`; `scripts/d1-census.py` reads both).
     body["d1Budget"] = crate::d1_ledger::budget_json();
