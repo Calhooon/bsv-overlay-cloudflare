@@ -228,7 +228,7 @@ pub trait JudgeDb: SqlPort {
     /// bsv-low #912 (the D2-ACTOR-B lens's MEDIUM-6, Phase A): hand the actor's apply and its compare to after the
     /// consumer's batch (`ctx.wait_until`), off the serial consumer's critical path; `false` where it cannot be
     /// deferred (the native judges, no actor bound), and the caller applies inline.
-    fn defer_actor(&self, _identity: &str, _games: &[String]) -> bool {
+    fn defer_actor(&self, _identity: &str, _games: &[String], _bound: Option<i64>) -> bool {
         false
     }
     /// The write time of the event this judge serves (the actor's own oldest-unapplied age, MEDIUM-7).
@@ -258,6 +258,14 @@ pub trait JudgeDb: SqlPort {
     /// SQLite), read without an apply; `None` where no actor is bound.
     async fn actor_rows(&self, _identity: &str) -> Result<Option<Vec<Value>>, String> {
         Ok(None)
+    }
+    /// The captain's item 12 (D2-ACTOR-B-FOLD-8): the actor's whole stored answer, its rows and its state
+    /// (`bootstrapped`); by default the rows alone ([`JudgeDb::actor_rows`]).
+    async fn actor_stored(&self, identity: &str) -> Result<Option<Value>, String> {
+        Ok(self
+            .actor_rows(identity)
+            .await?
+            .map(|rows| serde_json::json!({ "rows": rows })))
     }
     /// MEDIUM-3 (bsv-low #912): a transaction's decoded facts. The D1 judge decodes the stored BEEF here; the
     /// actor serves them from its `txfacts` table and holds no bytes.
@@ -334,7 +342,7 @@ impl JudgeDb for D1Judge {
     fn actor_reads(&self) -> bool {
         self.actor_reads
     }
-    fn defer_actor(&self, identity: &str, games: &[String]) -> bool {
+    fn defer_actor(&self, identity: &str, games: &[String], bound: Option<i64>) -> bool {
         let Some(event) = &self.event else {
             return false;
         };
@@ -348,6 +356,7 @@ impl JudgeDb for D1Judge {
             event: event.clone(),
             tip: self.tip,
             era_ms: self.era_ms,
+            bound,
         })
     }
     fn event_at_ms(&self) -> Option<u64> {
@@ -368,6 +377,18 @@ impl JudgeDb for D1Judge {
         crate::owed_actor::object::call_apply(
             &self.sql.env,
             &body,
+            crate::owed_actor::CONSUMER_CALL_WALL_MS,
+        )
+        .await
+        .map(Some)
+    }
+    async fn actor_stored(&self, identity: &str) -> Result<Option<Value>, String> {
+        if crate::owed_actor::object::stub_of(&self.sql.env, identity).is_none() {
+            return Ok(None);
+        }
+        crate::owed_actor::object::call_stored_answer(
+            &self.sql.env,
+            identity,
             crate::owed_actor::CONSUMER_CALL_WALL_MS,
         )
         .await

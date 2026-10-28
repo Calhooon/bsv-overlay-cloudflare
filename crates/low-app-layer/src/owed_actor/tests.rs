@@ -562,6 +562,10 @@ impl WithActor {
         if self.actor_fails.get() {
             return Err("owed actor: unreachable (pin)".into());
         }
+        // FOLD-8's item 11 pin: a word written between the two judges (after the D1 judge, before the actor reads).
+        if FOLD8_J_BETWEEN.with(|c| c.replace(false)) {
+            self.d1.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
+        }
         let turn = futures_util::lock::Mutex::new(());
         let (report, _) = apply_and_publish_in_turn(
             &turn,
@@ -666,7 +670,7 @@ async fn d2_actor_b_phase_a_compares_and_the_reconcile_finds_a_planted_diff() {
     // the planted rows through a delivery that only reads).
     w.actor.conn.execute_batch("UPDATE owed_rows SET reason='actor-planted' WHERE rowid=(SELECT MIN(rowid) FROM owed_rows)").unwrap();
     let planted = Planted(&w);
-    beside(&planted, "owner", &games).await;
+    beside(&planted, "owner", &games, None).await;
     assert_eq!(
         (w.d1.counter(COUNTERS[0]), w.d1.counter(COUNTERS[1])),
         (2, 1),
@@ -1893,7 +1897,7 @@ impl JudgeDb for Deferring<'_> {
         None
     }
     async fn push(&self, _: &str, _: Value) {}
-    fn defer_actor(&self, identity: &str, games: &[String]) -> bool {
+    fn defer_actor(&self, identity: &str, games: &[String], _bound: Option<i64>) -> bool {
         self.deferred
             .borrow_mut()
             .push((identity.to_string(), games.to_vec()));
@@ -2088,6 +2092,7 @@ async fn d2_actor_b_fold2_m7_the_bars_are_the_fleets() {
         &(0..300).collect::<Vec<_>>(),
         &[],
         None,
+        lib_rev(),
     ))
     .unwrap();
     assert_eq!(
@@ -2164,7 +2169,7 @@ async fn d2_actor_b_fold2_m1_the_bootstrap_runs_in_phase_a_and_pages_by_keyset()
     // D2-ACTOR-B-FOLD-7: the first event of an actor not bootstrapped is HELD and arms the bootstrap.
     assert!(
         apply.contains(&squash(
-            "let (armed, _, _) = self.arm_bootstrap(&me).await;"
+            "let armed = self.arm_bootstrap(&me, false).await.armed;"
         )),
         "the first event arms the bootstrap"
     );
@@ -3339,7 +3344,13 @@ fn fold6_fleet() -> SqliteSql {
                 "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,?2,5)",
                 [
                     bars_state_name(class),
-                    merge_bars_row(None, &[100, 200, 300], &[40, 50], Some(Some(1_000))),
+                    merge_bars_row(
+                        None,
+                        &[100, 200, 300],
+                        &[40, 50],
+                        Some(Some(1_000)),
+                        lib_rev(),
+                    ),
                 ],
             )
             .unwrap();
@@ -3625,6 +3636,8 @@ async fn fold7_bootstrap(
 ) -> (usize, usize, Drain) {
     let mut cursor = object::BOOT_CURSOR_START.to_string();
     let (mut pages, mut retries) = (0, 0);
+    let mut drained = Drain::default();
+    let mut alarms = 0usize;
     loop {
         match bootstrap_step(
             turn,
@@ -3647,7 +3660,20 @@ async fn fold7_bootstrap(
                 pages += 1;
                 cursor = next;
             }
-            Ok(BootStep::Done { drain, .. }) => return (pages + 1, retries, drain),
+            // FOLD-8 (NEW4-L1): a drain past its per-alarm bound goes on at the next alarm, cursor `drain`.
+            Ok(BootStep::Draining { drain }) => {
+                drained.applied.extend(drain.applied);
+                drained.pushes.extend(drain.pushes);
+                cursor = BOOT_CURSOR_DRAIN.to_string();
+                alarms += 1;
+            }
+            Ok(BootStep::Done { mut drain, .. }) => {
+                drained.applied.append(&mut drain.applied);
+                drained.applied.sort_by_key(|e| e.seq.unwrap_or(0));
+                drain.applied = drained.applied;
+                let _ = alarms;
+                return (pages + 1, retries, drain);
+            }
             Err(e) if is_closure_bound(&e) && retries < 8 => {
                 eprintln!("fold7 retry {retries}: {e}");
                 retries += 1
@@ -3727,7 +3753,7 @@ async fn d2_actor_b_fold7_a_an_unseen_heavy_seat_is_held_bootstrapped_then_appli
     assert_eq!(retries, 0, "no bootstrap page met the closure's bound");
     assert_eq!(pages, 600 / BOOTSTRAP_PAGE_GAMES + 1);
     assert_eq!(drain.applied.len(), 1);
-    assert_eq!(drain.applied[0].event, ev);
+    assert_eq!(drain.applied[0], ev);
     assert!(fold7_held(&local).is_empty());
     assert!(fold7_meta(&local, "bootstrapped").is_some());
     let got = stored(&local, "owner");
@@ -3738,6 +3764,12 @@ async fn d2_actor_b_fold7_a_an_unseen_heavy_seat_is_held_bootstrapped_then_appli
     // pages' delay plus their work; the native work is measured here, the wasm32 and D1 hop is the beta rehearsal's.
     let paced = (pages as u64 - 1) * BOOTSTRAP_PAGE_DELAY_MS + boot_ms;
     eprintln!("fold7_a: held in {held_ms} ms; {pages} pages, native work {boot_ms} ms; cold (the fixture's clock) {cold} ms; under the pace about {paced} ms");
+    // D2-ACTOR-B-FOLD-8 (the fourth delta lens's NOTE-1): the cold bar asserted ONCE, as what it measures: ONE cold
+    // actor alone under the pace (its 38 pages one page delay apart) plus this process's measured native work is under
+    // the design's 60 s. It is not the wasm32 and D1 time (beta's rehearsal reads that), and not a mass bootstrap's,
+    // where the fleet's 60 pages a minute make a heavy seat's cold time the fleet's page count over 60 a minute.
+    assert_eq!(pages, 38);
+    assert!(paced < 60_000, "one cold actor under the pace: {paced} ms");
 }
 
 /// Two HELD events out of order (seq 12 held first, then seq 10, the record moved between them): the drain applies
@@ -3760,7 +3792,7 @@ async fn d2_actor_b_fold7_b_two_held_events_apply_in_seq_order_and_derive_the_ne
         record.conn.execute_batch(&format!("UPDATE pot_records SET spent=1,spendingTxid='{}' WHERE txid='{}' AND outputIndex=0", h("f1", 3), h("c8", 3))).unwrap();
     }
     let (_, _, drain) = fold7_bootstrap(&turn, &record, &local, "owner").await;
-    let seqs: Vec<Option<i64>> = drain.applied.iter().map(|d| d.event.seq).collect();
+    let seqs: Vec<Option<i64>> = drain.applied.iter().map(|d| d.seq).collect();
     assert_eq!(seqs, vec![Some(10), Some(12)], "applied in seq order");
     let reference = seeded(&f);
     reference
@@ -4073,7 +4105,7 @@ async fn d2_actor_b_fold7_g_the_cold_figure_is_noted_once_from_the_first_held_ev
         .unwrap()[0]
         .rows
         .clone();
-    let fleet = fleet_bars(&rows, NOW_MS);
+    let fleet = fleet_bars(&rows, NOW_MS, lib_rev());
     assert_eq!(
         (
             fleet["coldMsP95"].clone(),
@@ -4128,12 +4160,13 @@ fn d2_actor_b_fold7_h_every_alarm_is_an_offset() {
     assert!(alarm_is_dead(None, NOW_MS));
     assert!(alarm_is_dead(Some((NOW_MS + NOW_MS) as i64), NOW_MS));
     assert!(!alarm_is_dead(Some(NOW_MS as i64), NOW_MS));
+    // FOLD-8 (NEW4-L2): the bound sits past the pace's longest wait (`fold8_d`).
     assert!(!alarm_is_dead(
-        Some((NOW_MS + BOOTSTRAP_PAGE_DELAY_MS + 60_000) as i64),
+        Some((NOW_MS + BOOT_ALARM_DEAD_AFTER_MS) as i64),
         NOW_MS
     ));
     assert!(alarm_is_dead(
-        Some((NOW_MS + BOOTSTRAP_PAGE_DELAY_MS + 60_001) as i64),
+        Some((NOW_MS + BOOT_ALARM_DEAD_AFTER_MS + 1) as i64),
         NOW_MS
     ));
     let squash = |s: &str| s.split_whitespace().collect::<String>();
@@ -4142,4 +4175,866 @@ fn d2_actor_b_fold7_h_every_alarm_is_an_offset() {
     assert_eq!(sets, 2, "set_alarm only inside alarm_in and alarm_at");
     assert!(object.contains(".set_alarm(alarm_offset_ms(offset_ms,0))"));
     assert!(object.contains(".set_alarm(alarm_offset_ms(at_ms,Date::now().as_millis()))"));
+}
+
+// ---- D2-ACTOR-B-FOLD-8: the fourth delta lens on PR 206 (NEW4-M1, NEW4-M2, NEW4-L1 to NEW4-L4, NOTE-1, NOTE-2) ----
+
+fn fold8_empty() -> SqliteSql {
+    seeded(&Fixture {
+        name: "empty",
+        seed: Vec::new(),
+        identities: Vec::new(),
+    })
+}
+
+/// NEW4-M1: the fleet's bootstrap budget is real on D1. D1 binds every JS number as a REAL (`routes::D1Sql`,
+/// `JsValue::from_f64`), so the take is run here with the bind D1 makes (`f64`, as `fold7_f` does): 70 takes inside
+/// one minute, each a different millisecond, answer 1 to 60 and then no row (the page waits, `boot_pace`); the next
+/// minute takes again from 1; the stored minute is an INTEGER. RED on `a1010ad0` (`?1/60000`, a fractional minute a
+/// millisecond): every take answers 1 (`left: [1, 1, 1, ..]`).
+#[test]
+fn d2_actor_b_fold8_a_the_boot_budget_refuses_past_60_a_minute_under_d1s_real_bind() {
+    let db = fold8_empty();
+    let take = |now: u64| -> i64 {
+        let mut q = db.conn.prepare(BOOT_BUDGET_TAKE_SQL).unwrap();
+        let rows: Vec<Value> = q
+            .query_map(rusqlite::params![now as f64], |r| {
+                Ok(json!({"taken": r.get::<_, i64>(0)?}))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        boot_taken(&rows)
+    };
+    let minute = (NOW_MS / 60_000) * 60_000;
+    let answers: Vec<i64> = (0..70u64).map(|k| take(minute + 7 + k * 13)).collect();
+    let want: Vec<i64> = (1..=60).chain(std::iter::repeat_n(i64::MAX, 10)).collect();
+    assert_eq!(answers, want, "1 to 60, then refused");
+    assert!(boot_pace(answers[60], minute + 900, "02ab").is_some());
+    let (ty, stored): (String, i64) = db
+        .conn
+        .query_row(
+            "SELECT typeof(tickedAtMs),tickedAtMs FROM owed_belt_state WHERE name='owed-actor:boot-budget'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((ty.as_str(), stored), ("integer", (minute / 60_000) as i64));
+    assert_eq!(take(minute + 60_000 + 3), 1, "the next minute takes again");
+}
+
+/// A record that faults every bootstrap page read (`IDENTITY_GAMES_AFTER_SQL`) and answers the rest.
+struct PageFaults<'a>(&'a SqliteSql);
+impl SqlPort for PageFaults<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        if stmts
+            .iter()
+            .any(|s| s.sql == crate::owed_judge::IDENTITY_GAMES_AFTER_SQL)
+        {
+            return Err("D1_ERROR: the page's read faulted".into());
+        }
+        self.0.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.0.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.0.log(l);
+    }
+}
+
+fn fold8_holding(record: &SqliteSql) -> Vec<(String, i64)> {
+    let mut q = record
+        .conn
+        .prepare("SELECT name,tickedAtMs FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;' ORDER BY name")
+        .unwrap();
+    q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// NEW4-M2: an actor whose bootstrap page faults on every alarm is COUNTED (each fault), PARKED at its fifth in a
+/// row (its line names it; the alarm retries it no more), SERVED (`/health.owedActor.holding` {`count`, `oldestMs`}
+/// from the snapshot the writers compose, `bootstrapFaults`), and its seat's read is the fallback (Rule 23: no
+/// `bootstrapped`, so `/rows` answers pending and the read serves no press). Its holding row is written ONCE (a later
+/// hold writes nothing to D1); the lever clears the park once (`parked: true`), the page re-runs from its parked
+/// cursor, and the stamp deletes the holding row. The alarm's wiring is pinned on `object.rs`'s source (the object
+/// runs only on wasm32). RED on `a1010ad0`: none of `note_holding`, `boot_fault`, `boot_parked`, `clear_boot_park`
+/// exists (the module does not compile); the alarm there logs `bootstrap page:` and re-arms 60 s for ever, uncounted,
+/// and nothing served names the actor.
+#[tokio::test]
+async fn d2_actor_b_fold8_b_a_stuck_actor_is_counted_served_and_parked() {
+    let f = fold7_chained_seat(20);
+    let record = seeded(&f);
+    record.now.set(NOW_MS);
+    let games = games_of(&record, "owner");
+    let local = mirror();
+    local.now.set(NOW_MS);
+    let turn = futures_util::lock::Mutex::new(());
+    let ev = fold7_event("pot", 5, &games[2..3], NOW_MS - 1_000);
+    let first = apply_or_hold(&turn, &record, &local, &Fakes, "owner", &ev, None, false)
+        .await
+        .unwrap();
+    assert!(matches!(first, Applied::Held { rearmed: false }));
+    assert_eq!(
+        fold8_holding(&record),
+        vec![("owed-actor:holding:owner".to_string(), NOW_MS as i64)]
+    );
+    // A later hold writes nothing to D1 (one row an actor, its first hold's time kept).
+    let before = record.recorded.borrow().len();
+    local.now.set(NOW_MS + 5_000);
+    let ev2 = fold7_event("hop", 6, &games[3..4], NOW_MS + 4_000);
+    apply_or_hold(&turn, &record, &local, &Fakes, "owner", &ev2, None, false)
+        .await
+        .unwrap();
+    assert_eq!(record.recorded.borrow().len(), before, "no D1 write");
+    assert_eq!(fold8_holding(&record)[0].1, NOW_MS as i64);
+    // Five alarms: each page faults; four retry, the fifth parks.
+    let faulty = PageFaults(&record);
+    let mut verdicts = Vec::new();
+    for _ in 0..7 {
+        if boot_parked(&local).await {
+            break;
+        }
+        let e = bootstrap_step(
+            &turn,
+            &faulty,
+            &local,
+            &Fakes,
+            "owner",
+            Some(object::BOOT_CURSOR_START),
+            Some(TIP),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        record.counters(vec![(COUNTERS[24].into(), 1)]).await;
+        verdicts.push(boot_fault(&local, "owner", &e).await);
+    }
+    assert_eq!(verdicts.len(), 5, "the alarm stops at the park");
+    assert_eq!(
+        verdicts[..4],
+        (1..=4)
+            .map(|faults| BootFault::Retry { faults })
+            .collect::<Vec<_>>()[..]
+    );
+    let BootFault::Parked { faults, line } = &verdicts[4] else {
+        panic!("{:?}", verdicts[4]);
+    };
+    assert_eq!(*faults, BOOT_FAULTS_PARK);
+    assert_eq!(
+        line,
+        "[owed-actor] bootstrap PARKED owner after 5 faults: D1_ERROR: the page's read faulted"
+    );
+    assert_eq!(record.counter(COUNTERS[24]), 5, "every fault counted");
+    // Rule 23: not bootstrapped, so `/rows` answers `bootstrapped: false` and the read serves the fallback.
+    assert!(fold7_meta(&local, "bootstrapped").is_none());
+    match fallback_body("owner", None, BOOTSTRAP_REASON, "owed-actor-bootstrap") {
+        Fallback::Unavailable(b) => assert_eq!(b["pending"], json!(true)),
+        Fallback::Display(b) => panic!("no copy, no rows: {b}"),
+    }
+    // Served: the holding count and age, and the faults, from the snapshot the writers compose.
+    for (name, n) in record.counted.borrow().iter() {
+        record
+            .conn
+            .execute(
+                "INSERT INTO ops_counters(name,value) VALUES (?1,?2) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value",
+                rusqlite::params![name, *n as i64],
+            )
+            .unwrap();
+    }
+    record
+        .conn
+        .execute(
+            HEALTH_SNAPSHOT_SQL,
+            rusqlite::params![(NOW_MS + 60_000) as f64, 0.0f64],
+        )
+        .unwrap();
+    let cursor: String = record
+        .conn
+        .query_row(
+            "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:health'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let body = health_body(
+        health_snapshot_of(Some(&cursor)).as_ref(),
+        NOW_MS + 90_000,
+        true,
+        &Value::Null,
+    );
+    assert_eq!(body["holding"], json!({"count": 1, "oldestMs": 90_000}));
+    assert_eq!(body["bootstrapFaults"], json!(5));
+    // The lever clears the park once; the page re-runs from its parked cursor and the stamp ends the hold.
+    assert!(clear_boot_park(&local).await, "parked: true");
+    assert!(!clear_boot_park(&local).await, "once");
+    let (_, retries, drain) = fold7_bootstrap(&turn, &record, &local, "owner").await;
+    assert_eq!(retries, 0);
+    assert_eq!(drain.applied.len(), 2);
+    assert!(fold7_meta(&local, "bootstrapped").is_some());
+    assert!(fold8_holding(&record).is_empty(), "the stamp deleted it");
+    // The alarm's wiring (object.rs runs on wasm32 only).
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    let alarm = &object[object.find("asyncfnalarm(&self)").unwrap()..];
+    for want in [
+        "ifself.meta(META_BOOT_CURSOR).is_some()&&!boot_parked(&local).await{",
+        "record.counters(vec![(COUNTERS[24].into(),1)]).await;",
+        "matchboot_fault(&local,&me,&e.to_string()).await{",
+        "BootFault::Retry{..}=>self.alarm_in(BOOT_FAULT_RETRY_MS).await,",
+        "BootFault::Parked{line,..}=>console_log!(\"{line}\"),",
+    ] {
+        assert!(alarm.contains(want), "the alarm: {want}");
+    }
+    let arm = &object[object.find("asyncfnarm_bootstrap(").unwrap()..];
+    assert!(arm.contains("if!lever||!clear_boot_park(&local).await{"));
+    assert!(object.contains("boot_page_landed(local).await;"));
+}
+
+/// NEW4-L1: the drain applies the UNION of the held games in chunks of 16, at most [`DRAIN_CHUNKS_PER_ALARM`] a
+/// call: 150 one-game events past a bootstrap are 128 events in one alarm (`Draining`, the cursor `drain`) and 22 in
+/// the next (`Done`, stamped), the rows the D1 judge's; held events naming one game are one apply. RED on `a1010ad0`:
+/// `drain_union`, `Draining` and the bound do not exist; the drain applied each of the 150 rows in one alarm.
+#[tokio::test]
+async fn d2_actor_b_fold8_c_the_drain_is_the_union_in_chunks_bounded_per_alarm() {
+    let a = fold7_event("pot", 1, &["G1".into(), "g2".into()], NOW_MS);
+    let b = fold7_event("pot", 2, &["g2".into()], NOW_MS);
+    let c = fold7_event("pot", 3, &["g1".into(), "g3".into()], NOW_MS);
+    assert_eq!(drain_union(&[a, b, c]), vec!["g1", "g2", "g3"]);
+    let f = fold7_chained_seat(160);
+    let d1 = d1_judge(&f).await;
+    let record = seeded(&f);
+    let games = games_of(&record, "owner");
+    let local = mirror();
+    let turn = futures_util::lock::Mutex::new(());
+    for (k, g) in games.iter().take(150).enumerate() {
+        let ev = fold7_event(
+            "pot",
+            100 + k as i64,
+            std::slice::from_ref(g),
+            NOW_MS - 1_000,
+        );
+        apply_or_hold(&turn, &record, &local, &Fakes, "owner", &ev, None, false)
+            .await
+            .unwrap();
+    }
+    assert_eq!(fold7_held(&local).len(), 150);
+    let mut cursor = object::BOOT_CURSOR_START.to_string();
+    let mut steps = Vec::new();
+    loop {
+        match bootstrap_step(
+            &turn,
+            &record,
+            &local,
+            &Fakes,
+            "owner",
+            Some(&cursor),
+            Some(TIP),
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        {
+            BootStep::Page { cursor: c, .. } => cursor = c,
+            BootStep::Draining { drain } => {
+                steps.push(("draining", drain.applied.len(), fold7_held(&local).len()));
+                assert!(fold7_meta(&local, "bootstrapped").is_none());
+                cursor = BOOT_CURSOR_DRAIN.into();
+            }
+            BootStep::Done { drain, .. } => {
+                steps.push(("done", drain.applied.len(), fold7_held(&local).len()));
+                assert!(drain.cold_ms.is_some(), "the cold sample at the stamp");
+                break;
+            }
+        }
+    }
+    assert_eq!(steps, vec![("draining", 128, 22), ("done", 22, 0)]);
+    assert!(fold7_meta(&local, "bootstrapped").is_some());
+    assert_eq!(stored(&local, "owner"), stored(&d1, "owner"));
+}
+
+/// NEW4-L2: a paced wait is never dead (`boot_pace`'s wait is up to the next minute's edge plus a spread under a
+/// minute), a lost alarm and a 56-year one still are. RED on `a1010ad0` (the bound one page delay and a minute):
+/// `a paced wait is not dead` fails for every wait past now + 61 s.
+#[test]
+fn d2_actor_b_fold8_d_a_paced_wait_is_not_dead() {
+    let mut longest = 0;
+    for k in 0..600u64 {
+        let now = NOW_MS + k * 977;
+        let id = format!("02{:064x}", k.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let wait = boot_pace(i64::MAX, now, &id).unwrap();
+        longest = longest.max(wait - now);
+        assert!(
+            !alarm_is_dead(Some(wait as i64), now),
+            "a paced wait is not dead: {} ms out",
+            wait - now
+        );
+    }
+    assert!(longest > 61_000, "the pins reach the long waits: {longest}");
+    assert!(alarm_is_dead(None, NOW_MS));
+    assert!(alarm_is_dead(Some((NOW_MS + NOW_MS) as i64), NOW_MS));
+}
+
+/// NEW4-L3: each class's `flushedAtMs` is served as an integer when D1 stored the bound `tickedAtMs` as a REAL (the
+/// `asOfMs` fact). RED on `a1010ad0`: `flushedAtMs: null`.
+#[test]
+fn d2_actor_b_fold8_e_flushed_at_ms_is_an_integer() {
+    let db = fold8_empty();
+    let at: u64 = 1_793_190_803_706;
+    db.conn
+        .execute(
+            crate::owed_belt::STATE_SQL,
+            rusqlite::params![
+                "owed-actor:bars:queue",
+                json!({"visible": [5], "libRev": lib_rev()}).to_string(),
+                at as f64
+            ],
+        )
+        .unwrap();
+    db.conn
+        .execute(
+            HEALTH_SNAPSHOT_SQL,
+            rusqlite::params![(at + 1) as f64, 0.0f64],
+        )
+        .unwrap();
+    let cursor: String = db
+        .conn
+        .query_row(
+            "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:health'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let body = health_body(
+        health_snapshot_of(Some(&cursor)).as_ref(),
+        at + 2,
+        true,
+        &Value::Null,
+    );
+    assert_eq!(
+        body["classes"]["queue"]["flushedAtMs"],
+        json!(at),
+        "{cursor}"
+    );
+    // A row read as D1 renders a REAL (the fleet's read of the bars, whatever the composition).
+    let row = json!({"name": "owed-actor:bars:queue", "cursor": json!({"visible": [5], "libRev": "r1"}).to_string(), "tickedAtMs": at as f64});
+    assert_eq!(
+        fleet_bars(&[row], at, "r1")["classes"]["queue"]["flushedAtMs"],
+        json!(at)
+    );
+}
+
+/// NEW4-L4: the held answers are counted in the isolate's bars, ONE counter write a flush (never one D1 write a held
+/// event); the tip window does not run while the bootstrap's cursor stands. RED on `a1010ad0`: the Held arm wrote
+/// `(COUNTERS[21], 1)` with its own statement per answer, and the alarm ran the window whenever a gate stood.
+#[tokio::test]
+async fn d2_actor_b_fold8_f_held_answers_are_counted_a_flush_and_the_tip_window_waits() {
+    let mut pending = PendingBars::default();
+    for _ in 0..100 {
+        pending.note_held();
+    }
+    let db = fold8_empty();
+    flush_bars_from(&db, NOW_MS, &pending).await.unwrap();
+    assert_eq!(
+        *db.counted.borrow(),
+        vec![(COUNTERS[21].to_string(), 100)],
+        "one counter write"
+    );
+    assert!(tip_window_due(true, false));
+    assert!(!tip_window_due(true, true), "never while the cursor stands");
+    assert!(!tip_window_due(false, false));
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    assert!(!object.contains("COUNTERS[21]"), "no per-answer held write");
+    let apply =
+        &object[object.find("asyncfnapply_route(").unwrap()..object.find("fnrows_of(").unwrap()];
+    assert!(apply.contains("note_held();"));
+    assert!(apply.contains("flush_bars(&record,Date::now().as_millis(),false).await;"));
+    let alarm = &object[object.find("asyncfnalarm(&self)").unwrap()..];
+    assert!(alarm.contains(
+        "tip_window_due(self.meta(META_GATE).is_some(),self.meta(META_BOOT_CURSOR).is_some(),),"
+    ));
+}
+
+/// The key columns of a family (what selects a record row into the mirror), lowercased; `rowid` always.
+fn fold8_keys(f: &Family) -> Vec<String> {
+    let mut out = vec!["rowid".to_string()];
+    for k in f.keys {
+        match k {
+            Mine(i, g) => out.extend([i.to_ascii_lowercase(), g.to_ascii_lowercase()]),
+            Games(c) | Txid(c) | Marker(c) => out.push(c.to_ascii_lowercase()),
+            ProbeRange => out.push("outpoint".into()),
+        }
+    }
+    out
+}
+
+/// The violations of one statement: each family table it reads (by its alias) whose `WHERE` / `ON` columns name
+/// none of the family's keys. Literals are stripped; a qualified column (`a.col`) is its alias's, a bare one is every
+/// family's of the statement that has the column.
+fn fold8_unkeyed(sql: &str) -> Vec<String> {
+    let mut clean = String::new();
+    let mut in_str = false;
+    for ch in sql.chars() {
+        if ch == '\'' {
+            in_str = !in_str;
+            clean.push(' ');
+        } else if !in_str {
+            clean.push(ch);
+        }
+    }
+    let spaced: String = clean
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let toks: Vec<String> = spaced
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    const KW: [&str; 24] = [
+        "where", "on", "join", "inner", "left", "cross", "select", "from", "group", "order",
+        "limit", "union", "and", "or", "as", "using", "indexed", "not", "in", "exists", "having",
+        "set", "values", "by",
+    ];
+    let family = |t: &str| FAMILIES.iter().find(|f| f.table.eq_ignore_ascii_case(t));
+    let mut alias: BTreeMap<String, &'static Family> = BTreeMap::new();
+    for (i, t) in toks.iter().enumerate() {
+        if i == 0 || !matches!(toks[i - 1].as_str(), "from" | "join") {
+            continue;
+        }
+        if let Some(f) = family(t) {
+            alias.insert(t.clone(), f);
+            let mut j = i + 1;
+            if toks.get(j).map(String::as_str) == Some("as") {
+                j += 1;
+            }
+            if let Some(a) = toks.get(j).filter(|a| !KW.contains(&a.as_str())) {
+                alias.insert(a.clone(), f);
+            }
+        }
+    }
+    if alias.is_empty() {
+        return Vec::new();
+    }
+    let mut cols: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+    let mut cond = false;
+    for t in &toks {
+        match t.as_str() {
+            "where" | "on" | "having" => {
+                cond = true;
+                continue;
+            }
+            "select" | "from" | "join" | "group" | "order" | "limit" | "union" | "set"
+            | "values" => {
+                cond = false;
+                continue;
+            }
+            _ => {}
+        }
+        if !cond {
+            continue;
+        }
+        if let Some((a, c)) = t.split_once('.') {
+            if let Some(f) = alias.get(a) {
+                cols.entry(f.table).or_default().insert(c.to_string());
+            }
+        } else {
+            for f in alias.values() {
+                if schema::columns(f.table)
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(t))
+                    || t == "rowid"
+                {
+                    cols.entry(f.table).or_default().insert(t.clone());
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let tables: BTreeSet<&'static str> = alias.values().map(|f| f.table).collect();
+    for table in tables {
+        let f = family(table).unwrap();
+        let keys = fold8_keys(f);
+        let got = cols.get(table).cloned().unwrap_or_default();
+        if !got.iter().any(|c| keys.contains(c)) {
+            out.push(format!("{table}: {got:?}"));
+        }
+    }
+    out
+}
+
+/// NOTE-2 (the fourth delta lens): every statement the judge runs over a family selects it by one of that family's
+/// KEYS (`FAMILIES`), so the actor's mirror (rows copied by those keys) holds every row the judge reads: a later judge
+/// statement that selects `pot_records` by `spendingTxid` alone, or a marker of another game by its rowid, is RED here
+/// (the actor alone would diverge). The judge's statements are those `judge_subjects` runs over every frozen fixture,
+/// and the bootstrap's own page read. Stated: the check is lexical (a `WHERE` or `ON` column of the family, by its
+/// alias or bare), so a filter beside a key is allowed; it holds the class the lens names, not a proof of the plan.
+#[tokio::test]
+async fn d2_actor_b_fold8_g_every_judge_statement_selects_a_family_by_a_key() {
+    // The checker itself: an unkeyed selection is caught, a keyed one is not.
+    assert_eq!(
+        fold8_unkeyed("SELECT txid FROM pot_records WHERE spendingTxid=?1 AND spent=1"),
+        vec!["pot_records: {\"spendingtxid\", \"spent\"}".to_string()]
+    );
+    assert!(fold8_unkeyed(
+        "SELECT p.txid FROM pot_records p JOIN pot_beefs b ON b.txid=p.spendingTxid WHERE p.txid IN (SELECT value FROM json_each(?1))"
+    )
+    .is_empty());
+    assert_eq!(
+        fold8_unkeyed("SELECT h.txid FROM hopparty_records h WHERE h.markerValid=1").len(),
+        1
+    );
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for f in all_fixtures() {
+        let d1 = d1_judge(&f).await;
+        for batch in d1.recorded.borrow().iter() {
+            for st in batch {
+                seen.insert(st.sql.clone());
+            }
+        }
+    }
+    let read: Vec<&String> = seen
+        .iter()
+        .filter(|s| {
+            let l = s.to_ascii_lowercase();
+            FAMILIES.iter().any(|f| {
+                l.contains(&format!("from {}", f.table.to_ascii_lowercase()))
+                    || l.contains(&format!("join {}", f.table.to_ascii_lowercase()))
+            })
+        })
+        .collect();
+    eprintln!("fold8_g: {} judge statements read a family", read.len());
+    assert!(read.len() > 5, "the judge's family reads: {}", read.len());
+    let mut bad = Vec::new();
+    for s in &read {
+        for v in fold8_unkeyed(s) {
+            bad.push(format!("{v}\n    in {s}"));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "unkeyed family selections:\n{}",
+        bad.join("\n")
+    );
+}
+
+/// The captain's item 9: THE FLEET BARS ARE THE BUILD'S. A bars row holding another build's samples (beta, an hour
+/// after PR 206's T0: the old build's cold-closure retries, `rowsVisibleMsP95` 311,719 ms) is REPLACED, not merged,
+/// by this build's first flush, and the served p95s read this build's samples alone (`barsLibRev` names it); a row
+/// no flush of this build has touched serves no samples. RED on `a1010ad0`: `merge_bars_row` and `fleet_bars` take no
+/// build (the old samples merged and served: `rowsVisibleMsP95` 311719).
+#[tokio::test]
+async fn d2_actor_b_fold8_h_the_fleet_bars_are_the_builds() {
+    let db = fold8_empty();
+    let old = json!({"apply": [7_818], "visible": [311_719], "libRev": "old-build"}).to_string();
+    for class in ["queue", "direct"] {
+        db.conn
+            .execute(
+                crate::owed_belt::STATE_SQL,
+                rusqlite::params![bars_state_name(class), old, NOW_MS as i64 - 3_600_000],
+            )
+            .unwrap();
+    }
+    let read = |db: &SqliteSql| {
+        db.conn
+            .prepare(BARS_READ_SQL)
+            .unwrap()
+            .query_map([], |r| {
+                Ok(json!({"name": r.get::<_, String>(0)?, "cursor": r.get::<_, String>(1)?, "tickedAtMs": r.get::<_, i64>(2)?}))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<Value>>()
+    };
+    let before = fleet_bars(&read(&db), NOW_MS, "new-build");
+    assert_eq!(
+        before["rowsVisibleMsP95"],
+        Value::Null,
+        "another build's samples are not served"
+    );
+    assert_eq!(before["barsLibRev"], json!("new-build"));
+    // This build's first flush: one queue sample, replacing the old row (never merged).
+    let fresh = merge_bars_row(Some(&old), &[40], &[90], None, "new-build");
+    let row: Value = serde_json::from_str(&fresh).unwrap();
+    assert_eq!(row["visible"], json!([90]), "replaced, not merged");
+    assert_eq!(row["apply"], json!([40]));
+    assert_eq!(row["libRev"], json!("new-build"));
+    db.conn
+        .execute(
+            crate::owed_belt::STATE_SQL,
+            rusqlite::params![bars_state_name("queue"), fresh, NOW_MS as i64],
+        )
+        .unwrap();
+    let after = fleet_bars(&read(&db), NOW_MS, "new-build");
+    assert_eq!(after["rowsVisibleMsP95"], json!(90));
+    assert_eq!(
+        after["applyMsP95"],
+        json!(40),
+        "the direct row's old 7,818 is not served"
+    );
+    assert_eq!(after["rowsVisibleDirectMsP95"], Value::Null);
+    // The same build's next flush merges as before.
+    let merged: Value =
+        serde_json::from_str(&merge_bars_row(Some(&fresh), &[], &[95], None, "new-build")).unwrap();
+    assert_eq!(merged["visible"], json!([90, 95]));
+    // The shipped flush stamps this build.
+    let mut pending = PendingBars::default();
+    pending.note_answer("queue", &json!({"applyMs": 12}));
+    flush_bars_from(&db, NOW_MS, &pending).await.unwrap();
+    let q: String = db
+        .conn
+        .query_row(
+            "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:bars:queue'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let q: Value = serde_json::from_str(&q).unwrap();
+    assert_eq!(q["libRev"], json!(lib_rev()));
+    if lib_rev() != "new-build" {
+        assert_eq!(
+            q["apply"],
+            json!([12]),
+            "another build's row replaced by the shipped flush"
+        );
+    }
+}
+
+/// The captain's item 10: `GET /internal/owed-actor-rows?identity=` answers one actor's state and rows beside D1's
+/// and the outpoints that differ, by the reconcile's own reads (`/stored`, `RECONCILE_D1_ROWS_SQL`) and functions
+/// (`diff_rows`, `rows_digest`); 401 without the bearer, before any read. Run over a fixture judged by both judges
+/// with one D1 row planted different. RED on `a1010ad0`: no route, no `rows_view`.
+#[tokio::test]
+async fn d2_actor_b_fold8_i_the_rows_lever_serves_the_reconciles_diff() {
+    let f = fold7_chained_seat(20);
+    let d1 = d1_judge(&f).await;
+    let record = seeded(&f);
+    let local = mirror();
+    let turn = futures_util::lock::Mutex::new(());
+    fold7_bootstrap(&turn, &record, &local, "owner").await;
+    let actor_rows = |db: &SqliteSql| -> Vec<Value> {
+        let mut q = db.conn.prepare(RECONCILE_D1_ROWS_SQL).unwrap();
+        let cols: Vec<String> = q.column_names().iter().map(|c| c.to_string()).collect();
+        q.query_map(["owner"], |r| {
+            let mut m = serde_json::Map::new();
+            for (k, c) in cols.iter().enumerate() {
+                let v: rusqlite::types::Value = r.get(k)?;
+                m.insert(
+                    c.clone(),
+                    match v {
+                        rusqlite::types::Value::Integer(n) => json!(n),
+                        rusqlite::types::Value::Text(t) => json!(t),
+                        rusqlite::types::Value::Real(x) => json!(x),
+                        _ => Value::Null,
+                    },
+                );
+            }
+            Ok(Value::Object(m))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    };
+    let same = rows_view(
+        "owner",
+        Ok(json!({"rows": actor_rows(&local), "bootstrapped": true, "held": 0})),
+        &actor_rows(&d1),
+    );
+    assert_eq!(same["diff"], json!([]), "the two judges agree");
+    assert_eq!(same["digests"]["d1"], same["digests"]["actor"]);
+    // One D1 row planted different.
+    let planted: String = d1
+        .conn
+        .query_row(
+            "SELECT outpoint FROM owed_rows WHERE identity='owner' ORDER BY outpoint LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    d1.conn
+        .execute(
+            "UPDATE owed_rows SET sats=sats+1 WHERE identity='owner' AND outpoint=?1",
+            [&planted],
+        )
+        .unwrap();
+    let d1_rows = actor_rows(&d1);
+    let a_rows = actor_rows(&local);
+    let view = rows_view(
+        "owner",
+        Ok(
+            json!({"rows": a_rows.clone(), "bootstrapped": true, "bootstrapArmed": false, "held": 0, "ackSeq": null, "judgedAtMs": NOW_MS}),
+        ),
+        &d1_rows,
+    );
+    assert_eq!(view["diff"], json!([planted.clone()]));
+    assert_eq!(
+        view["diff"],
+        json!(diff_rows(&d1_rows, &a_rows)),
+        "the reconcile's diff"
+    );
+    assert_ne!(view["digests"]["d1"], view["digests"]["actor"]);
+    assert_eq!(view["actor"]["bootstrapped"], json!(true));
+    assert_eq!(
+        view["actor"]["rows"].as_array().unwrap().len(),
+        a_rows.len()
+    );
+    assert_eq!(view["d1"]["rows"].as_array().unwrap().len(), d1_rows.len());
+    // An actor out of reach is named, never an empty diff.
+    let down = rows_view(
+        "owner",
+        Err("owed actor: no answer in 1500 ms".into()),
+        &d1_rows,
+    );
+    assert_eq!(down["diff"], Value::Null);
+    assert_eq!(
+        down["actor"]["error"],
+        json!("owed actor: no answer in 1500 ms")
+    );
+    // The lever's wiring (wasm32 only): the bearer first (401), one identity, the reconcile's reads, no write.
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    let lever = &object[object.find("pubasyncfnrows_lever(").unwrap()
+        ..object.find("pubasyncfnidentities_lever(").unwrap()];
+    assert!(lever.starts_with(&squash("pub async fn rows_lever(req: Request, env: &Env) -> Result<Response> { if !crate::internal_events::internal_bearer_ok(&req, env) { return Response::error(\"unauthorized\", 401); }")));
+    assert!(lever.contains("RECONCILE_D1_ROWS_SQL"));
+    assert!(lever.contains("call_stored_answer(env,&me,READ_WALL_MS)"));
+    assert!(lever.contains("rows_view(&me,actor,&d1)"));
+    assert!(!lever.contains("INSERT") && !lever.contains("DELETE") && !lever.contains("UPDATE"));
+    let lib = squash(include_str!("../lib.rs"));
+    assert!(lib.contains("req.path()==\"/internal/owed-actor-rows\"{returnowed_actor::object::rows_lever(req,&env).await;"));
+    let stored = &object[object.find("path==\"/stored\"&&self.is_fresh()").unwrap()..];
+    assert!(
+        stored.starts_with("path==\"/stored\"&&self.is_fresh(){returnResponse::from_json("),
+        "a fresh object writes nothing"
+    );
+}
+
+thread_local! { static FOLD8_J_BETWEEN: Cell<bool> = const { Cell::new(false) }; }
+
+/// The captain's item 11: PHASE A's compare is evidence-bound like Phase B's. A downgrade written BETWEEN the two
+/// judges (the D1 judge has written its rows, the actor then reads the record with the new evidence) is the window's
+/// one "real" DIFF (pair 20's seat at its settle): its game holds a mark above the bound read before the D1 judge, so
+/// it is counted APART (`owed_actor_compare_held_total`), `owed_actor_diffs_total` flat; the next delivery heals it.
+/// RED on `046b721e` (Phase A's `compare` ran with `bound: None`; the bound read made inert):
+/// `owed_actor_diffs_total` 0 -> 1.
+#[tokio::test]
+async fn d2_actor_b_fold8_j_phase_a_counts_a_mark_between_the_judges_apart() {
+    let w = WithActor {
+        d1: d1_judge(&stranded()).await,
+        actor: mirror(),
+        d1_judges: true,
+        event: Some(("pot", 7)),
+        actor_reads: false,
+        actor_fails: Cell::new(false),
+    };
+    let games = games_of(&w.d1, "owner");
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    let (diffs, held) = (
+        w.d1.counter("owed_actor_diffs_total"),
+        w.d1.counter("owed_actor_compare_held_total"),
+    );
+    let w = WithActor {
+        event: Some(("pot", 8)),
+        ..w
+    };
+    FOLD8_J_BETWEEN.with(|c| c.set(true));
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    let lines: Vec<String> =
+        w.d1.lines
+            .borrow()
+            .iter()
+            .filter(|l| l.contains("DIFF"))
+            .cloned()
+            .collect();
+    assert_eq!(
+        w.d1.counter("owed_actor_diffs_total"),
+        diffs,
+        "a mark between the judges is not a STOP: {lines:?}"
+    );
+    assert_eq!(
+        w.d1.counter("owed_actor_compare_held_total"),
+        held + 1,
+        "{lines:?}"
+    );
+    // Item 12 on the held line: the outpoint and the field that differs.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("held mark") && l.contains(" d1=") && l.contains(" actor=")),
+        "{lines:?}"
+    );
+    // The next delivery judges the mark in both: no DIFF of either class.
+    let w = WithActor {
+        event: Some(("pot", 9)),
+        ..w
+    };
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    assert_eq!(w.d1.counter("owed_actor_diffs_total"), diffs);
+    assert_eq!(w.d1.counter("owed_actor_compare_held_total"), held + 1);
+    // The deferred path carries the same bound (wasm32: `D1Judge::defer_actor`).
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let events = squash(include_str!("../owed_events.rs"));
+    assert!(events.contains(&squash("let bound = owed_judge::marks_bound(db, identity, games).await.ok(); let report = owed_judge::judge_subjects(db, identity, games, \"owed-events\").await?;")));
+    assert!(events.contains(&squash("if !db.defer_actor(identity, games, bound) { crate::owed_actor::beside(db, identity, games, bound).await; }")));
+    let actor = squash(include_str!("../owed_actor.rs"));
+    assert!(actor.contains(&squash(
+        "beside(&judge, &d.identity, &d.games, d.bound).await;"
+    )));
+}
+
+/// The captain's item 12: THE DIFF LINES NAME WHAT DIFFERS. For the first three differing outpoints, each compared
+/// field with both values (`family d1=unbound actor=hop-stranded`, `claimable d1=null actor=1`, a facts key by name),
+/// a row on one side `absent`; the reconcile's line also says whether the actor was bootstrapped at the compare.
+/// RED on `046b721e`: `diff_detail` does not exist; the lines carried counts only.
+#[test]
+fn d2_actor_b_fold8_k_the_diff_lines_name_what_differs() {
+    let row = |o: &str, family: &str, claimable: Value, claim: &str| json!({"outpoint": o, "family": family, "gameId": "g", "sats": 5, "opponentIdentity": null, "atHeight": null, "reason": "r", "claimable": claimable, "facts": json!({"claim": claim, "ageMs": 9}).to_string()});
+    let d1 = vec![
+        row("a:0", "unbound", Value::Null, "none"),
+        row("b:0", "payout", json!(1), "x"),
+        row("c:0", "payout", json!(1), "x"),
+        row("d:0", "payout", json!(1), "x"),
+    ];
+    let actor = vec![
+        row("a:0", "hop-stranded", json!(1), "sweep-hop"),
+        row("c:0", "payout", json!(0), "x"),
+        row("d:0", "payout", json!(0), "x"),
+        row("e:0", "payout", json!(0), "x"),
+    ];
+    let differ = diff_rows(&d1, &actor);
+    assert_eq!(differ.len(), 5);
+    let line = diff_detail(&d1, &actor, &differ);
+    assert_eq!(
+        line,
+        "a:0 [family d1=unbound actor=hop-stranded, claimable d1=null actor=1, facts.claim d1=none actor=sweep-hop]; b:0 [d1=present actor=absent]; c:0 [claimable d1=1 actor=0]"
+    );
+    assert!(!line.contains("ageMs"), "the clock is not a difference");
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let src = squash(include_str!("../owed_actor.rs"));
+    assert_eq!(
+        src.matches("diff_detail(&d1,&actor,&").count(),
+        2,
+        "both compare lines"
+    );
+    assert!(src.contains("actorbootstrappedatthecompare:{};{}"));
+    assert!(src.contains("diff_detail(&a,&b,&differ)"));
 }

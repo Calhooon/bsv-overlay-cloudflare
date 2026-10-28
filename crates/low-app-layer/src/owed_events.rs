@@ -368,11 +368,14 @@ pub async fn deliver(
         return crate::owed_actor::actor_then_d1(db, identity, games).await;
     }
     if db.d1_judges() {
+        // D2-ACTOR-B-FOLD-8 (the captain's item 11): the acknowledgement's bound read BEFORE the D1 judge, as Phase B
+        // reads it before the actor, so the compare counts a game marked between the two judges apart.
+        let bound = owed_judge::marks_bound(db, identity, games).await.ok();
         let report = owed_judge::judge_subjects(db, identity, games, "owed-events").await?;
         // The D2-ACTOR-B lens's MEDIUM-6: Phase A's apply and compare run after the batch (`ctx.wait_until`), never
         // inline in the serial consumer; inline only where it cannot be deferred.
-        if !db.defer_actor(identity, games) {
-            crate::owed_actor::beside(db, identity, games).await;
+        if !db.defer_actor(identity, games, bound) {
+            crate::owed_actor::beside(db, identity, games, bound).await;
         }
         return Ok(report);
     }

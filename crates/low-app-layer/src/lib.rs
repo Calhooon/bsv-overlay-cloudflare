@@ -525,6 +525,10 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     if req.method() == worker::Method::Get && req.path() == "/internal/owed-actor-identities" {
         return owed_actor::object::identities_lever(req, &env).await;
     }
+    // D2-ACTOR-B-FOLD-8 (the captain's item 10): one actor's rows beside the D1 judge's, read only.
+    if req.method() == worker::Method::Get && req.path() == "/internal/owed-actor-rows" {
+        return owed_actor::object::rows_lever(req, &env).await;
+    }
     if req.method() == worker::Method::Post && req.path() == "/internal/owed-actor-reset" {
         return owed_actor::object::reset_lever(req, &env).await;
     }

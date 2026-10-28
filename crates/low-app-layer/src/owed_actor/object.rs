@@ -15,6 +15,16 @@ use super::*;
 use crate::pot_hook::SqlPort;
 use worker::*;
 
+/// What `arm_bootstrap` did: armed now, already bootstrapped, re-armed under a dead alarm (item 12), a parked
+/// bootstrap cleared by the lever (NEW4-M2).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Armed {
+    pub armed: bool,
+    pub already: bool,
+    pub rearmed: bool,
+    pub parked: bool,
+}
+
 /// The alarm's cadence while the actor waits for a block (a gated row or a courier-dated sweep): about a block.
 pub const TIP_ALARM_MS: u64 = 600_000;
 /// The meta keys.
@@ -269,6 +279,13 @@ impl DurableObject for OwedActor {
                 &json!({"identity": null, "fresh": true, "bootstrapped": false, "bootstrapArmed": false}),
             );
         }
+        // The captain's item 10 (D2-ACTOR-B-FOLD-8): the operator's rows lever and the reconcile read `/stored`; a
+        // fresh object answers no rows and writes nothing (no schema, no meta, no epoch stamp).
+        if req.method() == Method::Get && path == "/stored" && self.is_fresh() {
+            return Response::from_json(
+                &json!({"identity": null, "fresh": true, "bootstrapped": false, "bootstrapArmed": false, "held": 0, "rows": []}),
+            );
+        }
         if path != "/reset" && path != "/bars" {
             self.check_epoch().await;
         }
@@ -279,9 +296,9 @@ impl DurableObject for OwedActor {
                 let Some(me) = body["identity"].as_str().and_then(actor_name) else {
                     return Response::error("identity is not a 66-hex key", 400);
                 };
-                let (armed, already, rearmed) = self.arm_bootstrap(&me).await;
+                let armed = self.arm_bootstrap(&me, true).await;
                 Response::from_json(
-                    &json!({"identity": me, "armed": armed, "bootstrapped": already, "rearmed": rearmed}),
+                    &json!({"identity": me, "armed": armed.armed, "bootstrapped": armed.already, "rearmed": armed.rearmed, "parked": armed.parked}),
                 )
             }
             (Method::Post, "/apply") => {
@@ -309,7 +326,27 @@ impl DurableObject for OwedActor {
                     .as_deref()
                     .map(|m| self.rows_of(&local, m))
                     .unwrap_or_default();
-                Response::from_json(&json!({"identity": me, "rows": rows}))
+                // Item 10: the actor's state beside its rows (read only).
+                let held = local
+                    .sql
+                    .exec(
+                        "SELECT COUNT(*) AS n FROM meta WHERE name>='held:' AND name<'held;'",
+                        None,
+                    )
+                    .ok()
+                    .and_then(|c| c.to_array::<Value>().ok())
+                    .and_then(|r| r.first().and_then(|v| v["n"].as_u64()))
+                    .unwrap_or(0);
+                Response::from_json(&json!({
+                    "identity": me,
+                    "rows": rows,
+                    "bootstrapped": self.meta(META_BOOTSTRAPPED).is_some(),
+                    "bootstrapArmed": self.meta(META_BOOT_CURSOR).is_some(),
+                    "bootParked": self.meta(META_BOOT_PARKED),
+                    "held": held,
+                    "ackSeq": self.meta(META_ACK).and_then(|s| s.parse::<i64>().ok()),
+                    "judgedAtMs": self.meta(META_JUDGED_AT).and_then(|s| s.parse::<u64>().ok()),
+                }))
             }
             (Method::Get, "/bars") => {
                 Response::from_json(&self.bars.borrow().served(Date::now().as_millis()))
@@ -329,10 +366,19 @@ impl DurableObject for OwedActor {
         self.check_epoch().await;
         self.rearm_after_rebuild().await;
         let local = self.local();
-        if self.meta(META_BOOT_CURSOR).is_some() {
+        // The fourth delta lens's NEW4-M2: a parked bootstrap is not retried (the lever's `/bootstrap` clears it);
+        // each fault is counted, and the fifth in a row parks the page, named in its line.
+        if self.meta(META_BOOT_CURSOR).is_some() && !boot_parked(&local).await {
             if let Err(e) = self.bootstrap_page(&local).await {
                 console_log!("[owed-actor] bootstrap page: {e}");
-                self.alarm_in(60_000).await;
+                if let Ok(record) = crate::routes::D1Sql::of(&self.env) {
+                    record.counters(vec![(COUNTERS[24].into(), 1)]).await;
+                }
+                let me = self.meta(META_IDENTITY).unwrap_or_default();
+                match boot_fault(&local, &me, &e.to_string()).await {
+                    BootFault::Retry { .. } => self.alarm_in(BOOT_FAULT_RETRY_MS).await,
+                    BootFault::Parked { line, .. } => console_log!("{line}"),
+                }
             }
         }
         if self.meta(META_KV_DIRTY).as_deref() == Some("1") {
@@ -340,7 +386,15 @@ impl DurableObject for OwedActor {
         }
         // MEDIUM-4: the tip alarm judges the gates in `(tipJudged, tip]` and the courier-dated sweeps below the tip,
         // then arms at the next gate (never a re-judge of every open gate each ten minutes).
-        if let (Some(_), Some(identity)) = (self.meta(META_GATE), self.meta(META_IDENTITY)) {
+        // NEW4-L4: never while the bootstrap's cursor stands (the drain judges at the tip, and a re-armed actor's
+        // window would only re-hold its games every page alarm).
+        if let (true, Some(identity)) = (
+            tip_window_due(
+                self.meta(META_GATE).is_some(),
+                self.meta(META_BOOT_CURSOR).is_some(),
+            ),
+            self.meta(META_IDENTITY),
+        ) {
             let tip = crate::owed_events::tip_memoised(&self.env, true).await;
             if let Some(t) = tip {
                 let last = self
@@ -536,27 +590,54 @@ impl OwedActor {
     /// `/bootstrap` and by a held event ([`alarm_is_dead`]), answered armed with `rearmed`, counted
     /// `owed_actor_alarm_rearmed_total`; a live alarm within the bound is kept (the page cadence is the alarm's own).
     /// Answers (armed now, already bootstrapped, re-armed).
-    async fn arm_bootstrap(&self, me: &str) -> (bool, bool, bool) {
+    ///
+    /// The fourth delta lens's NEW4-M2: a PARKED bootstrap is re-armed by the lever alone (`lever`: the park cleared,
+    /// the page re-run from its parked cursor now, answered `parked` once); a held event leaves it parked.
+    async fn arm_bootstrap(&self, me: &str, lever: bool) -> Armed {
         let local = self.local();
         if self.meta(META_BOOTSTRAPPED).is_some() {
-            return (false, true, false);
+            return Armed {
+                already: true,
+                ..Armed::default()
+            };
         }
         if self.meta(META_BOOT_CURSOR).is_some() {
+            if boot_parked(&local).await {
+                if !lever || !clear_boot_park(&local).await {
+                    return Armed::default();
+                }
+                console_log!(
+                    "[owed-actor] {me}: the parked bootstrap cleared by the lever: re-armed now"
+                );
+                self.alarm_in(0).await;
+                return Armed {
+                    armed: true,
+                    parked: true,
+                    ..Armed::default()
+                };
+            }
             let held = self.state.storage().get_alarm().await.ok().flatten();
             if !alarm_is_dead(held, Date::now().as_millis()) {
-                return (false, false, false);
+                return Armed::default();
             }
             console_log!("[owed-actor] {me}: armed under a dead alarm ({held:?}): re-armed now");
             self.alarm_in(0).await;
             if let Ok(record) = crate::routes::D1Sql::of(&self.env) {
                 record.counters(vec![(COUNTERS[23].into(), 1)]).await;
             }
-            return (true, false, true);
+            return Armed {
+                armed: true,
+                rearmed: true,
+                ..Armed::default()
+            };
         }
         self.put_meta(&local, META_IDENTITY, me);
         self.put_meta(&local, META_BOOT_CURSOR, BOOT_CURSOR_START);
         self.alarm_in(0).await;
-        (true, false, false)
+        Armed {
+            armed: true,
+            ..Armed::default()
+        }
     }
 
     /// MEDIUM-4: the tip alarm at the next gate above `tip`, or the next block while a courier-dated sweep is held
@@ -691,12 +772,14 @@ impl OwedActor {
             Ok(Applied::Done(report, pushes)) => (report, pushes),
             Ok(Applied::Held { rearmed }) => {
                 self.put_meta(&local, META_IDENTITY, &me);
-                let (armed, _, _) = self.arm_bootstrap(&me).await;
-                let mut deltas = vec![(COUNTERS[21].to_string(), 1)];
+                let armed = self.arm_bootstrap(&me, false).await.armed;
+                // NEW4-L4: the held answer is counted in this isolate's bars (one counter write a flush); a re-arm
+                // is rare and counted at once.
+                note_held();
                 if rearmed {
-                    deltas.push((COUNTERS[22].to_string(), 1));
+                    record.counters(vec![(COUNTERS[22].to_string(), 1)]).await;
                 }
-                record.counters(deltas).await;
+                flush_bars(&record, Date::now().as_millis(), false).await;
                 let answer = held_answer(
                     &me,
                     &body.games,
@@ -884,9 +967,21 @@ impl OwedActor {
         )
         .await
         .map_err(Error::RustError)?;
+        // NEW4-M2: a page (or a drain's alarm) that landed ends the run of faults.
+        boot_page_landed(local).await;
         match step {
             BootStep::Page { cursor, .. } => {
                 self.put_meta(local, META_BOOT_CURSOR, &cursor);
+                self.alarm_in(BOOTSTRAP_PAGE_DELAY_MS).await;
+            }
+            // NEW4-L1: the drain met its per-alarm bound; the next alarm drains on (no page).
+            BootStep::Draining { drain } => {
+                let now = Date::now().as_millis();
+                for ev in &drain.applied {
+                    self.clear_tip_faults(local, &ev.games);
+                }
+                self.publish_pushes(drain.pushes, now, drain.first_at_ms);
+                self.put_meta(local, META_BOOT_CURSOR, BOOT_CURSOR_DRAIN);
                 self.alarm_in(BOOTSTRAP_PAGE_DELAY_MS).await;
             }
             BootStep::Done { drain, .. } => {
@@ -895,10 +990,10 @@ impl OwedActor {
                 let _ = local
                     .sql
                     .exec("DELETE FROM meta WHERE name='bootCursor'", None);
-                for d in drain.applied {
-                    self.clear_tip_faults(local, &d.event.games);
-                    self.publish_pushes(d.pushes, now, d.event.at_ms);
+                for ev in &drain.applied {
+                    self.clear_tip_faults(local, &ev.games);
                 }
+                self.publish_pushes(drain.pushes, now, drain.first_at_ms);
                 self.bars.borrow_mut().bootstraps += 1;
                 record.counters(vec![(COUNTERS[10].into(), 1)]).await;
                 if let Some(ms) = drain.cold_ms {
@@ -1031,6 +1126,17 @@ pub async fn call_stored(
     identity: &str,
     wall_ms: u64,
 ) -> std::result::Result<Vec<Value>, String> {
+    call_stored_answer(env, identity, wall_ms)
+        .await
+        .map(|v| v["rows"].as_array().cloned().unwrap_or_default())
+}
+
+/// The actor's whole `/stored` answer: its rows (the reconcile's read) and its state (item 10).
+pub async fn call_stored_answer(
+    env: &Env,
+    identity: &str,
+    wall_ms: u64,
+) -> std::result::Result<Value, String> {
     let stub = stub_of(env, identity).ok_or("no owed actor for this identity")?;
     let name = actor_name(identity).unwrap_or_default();
     let call = async {
@@ -1041,8 +1147,7 @@ pub async fn call_stored(
         if resp.status_code() != 200 {
             return Err(format!("owed actor answered {}", resp.status_code()));
         }
-        let v = resp.json::<Value>().await.map_err(|e| e.to_string())?;
-        Ok(v["rows"].as_array().cloned().unwrap_or_default())
+        resp.json::<Value>().await.map_err(|e| e.to_string())
     };
     let wall = Delay::from(std::time::Duration::from_millis(wall_ms));
     futures_util::pin_mut!(call);
@@ -1357,6 +1462,38 @@ pub const RESET_IDENTITIES_SQL: &str = "SELECT identity FROM (SELECT identity FR
 /// [`RESET_PER_CALL`] keys a call (more is a 400): each identity's actor `/reset` (`deleteAll`, its alarm deleted),
 /// answered per key (`reset`, `skipped` for a key that is not 66-hex, `faults`).
 pub const RESET_PER_CALL: usize = 50;
+
+/// THE OPERATOR'S ROWS LEVER (the captain's item 10, D2-ACTOR-B-FOLD-8): `GET /internal/owed-actor-rows?identity=`
+/// (bearer `INTERNAL_TOKEN`), ONE identity a call, no write: the actor's state and stored rows (`/stored`, the
+/// reconcile's read) beside D1's stored rows ([`RECONCILE_D1_ROWS_SQL`], the reconcile's), and the outpoints that
+/// differ ([`diff_rows`]) with both [`rows_digest`]s ([`rows_view`]): exactly what the reconcile compares.
+pub async fn rows_lever(req: Request, env: &Env) -> Result<Response> {
+    if !crate::internal_events::internal_bearer_ok(&req, env) {
+        return Response::error("unauthorized", 401);
+    }
+    let Some(me) = req
+        .url()?
+        .query_pairs()
+        .find(|(k, _)| k == "identity")
+        .and_then(|(_, v)| actor_name(&v))
+    else {
+        return Response::error("identity is not a 66-hex key", 400);
+    };
+    let db = crate::routes::D1Sql::of(env)?;
+    let d1 = db
+        .run_batch(vec![Stmt::new(
+            RECONCILE_D1_ROWS_SQL,
+            vec![Bind::Text(me.clone())],
+        )])
+        .await
+        .map_err(Error::RustError)?
+        .into_iter()
+        .next()
+        .map(|o| o.rows)
+        .unwrap_or_default();
+    let actor = call_stored_answer(env, &me, READ_WALL_MS).await;
+    Response::from_json(&rows_view(&me, actor, &d1))
+}
 
 pub async fn identities_lever(req: Request, env: &Env) -> Result<Response> {
     if !crate::internal_events::internal_bearer_ok(&req, env) {
