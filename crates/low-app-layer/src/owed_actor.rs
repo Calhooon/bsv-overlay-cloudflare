@@ -640,7 +640,10 @@ pub const BOOTSTRAP_PAGE_DELAY_MS: u64 = 1_000;
 /// one-row reads a minute of `owed-actor:boot-budget` and no write (they were N writes, each over-budget take
 /// counted). The order is unchanged: each waiter's slot in the next minute is fixed by its identity's hash, so the
 /// rebuild runs at 60 pages a minute in that order (no queue, no fairness beyond the spread), stated.
-pub const BOOT_BUDGET_TAKE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-actor:boot-budget','1',?1/60000) ON CONFLICT(name) DO UPDATE SET cursor=CASE WHEN owed_belt_state.tickedAtMs=excluded.tickedAtMs THEN CAST(CAST(owed_belt_state.cursor AS INTEGER)+1 AS TEXT) ELSE '1' END,tickedAtMs=excluded.tickedAtMs WHERE owed_belt_state.tickedAtMs IS NOT excluded.tickedAtMs OR CAST(owed_belt_state.cursor AS INTEGER)<60 RETURNING CAST(cursor AS INTEGER) AS taken";
+/// The fourth delta lens's NEW4-M1 (D2-ACTOR-B-FOLD-8): D1 binds a JS number as a REAL, so `?1/60000` was a
+/// fractional minute, a new value every millisecond: every take reset the count and answered 1, and the budget never
+/// refused on D1. The minute is `CAST(?1 AS INTEGER)/60000`, an integer whatever the bind.
+pub const BOOT_BUDGET_TAKE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-actor:boot-budget','1',CAST(?1 AS INTEGER)/60000) ON CONFLICT(name) DO UPDATE SET cursor=CASE WHEN owed_belt_state.tickedAtMs=excluded.tickedAtMs THEN CAST(CAST(owed_belt_state.cursor AS INTEGER)+1 AS TEXT) ELSE '1' END,tickedAtMs=excluded.tickedAtMs WHERE owed_belt_state.tickedAtMs IS NOT excluded.tickedAtMs OR CAST(owed_belt_state.cursor AS INTEGER)<60 RETURNING CAST(cursor AS INTEGER) AS taken";
 /// The token's number a take answered (no row: the minute is full, the page waits).
 pub fn boot_taken(rows: &[Value]) -> i64 {
     rows.first()
@@ -1307,6 +1310,7 @@ pub async fn apply_or_hold<R: SqlPort, L: SqlPort, O: Outside>(
         )])
         .await?;
     if held.first().is_some_and(|o| !o.rows.is_empty()) {
+        note_holding(record, local, me, ev).await;
         return Ok(Applied::Held { rearmed: false });
     }
     let kind_seq = ev.kind.as_deref().zip(ev.seq);
@@ -1315,7 +1319,11 @@ pub async fn apply_or_hold<R: SqlPort, L: SqlPort, O: Outside>(
     )
     .await
     {
-        Ok((report, pushes)) => Ok(Applied::Done(report, pushes)),
+        Ok((report, pushes)) => {
+            // A holding row whose stamp's delete faulted is deleted at the next landed apply.
+            clear_holding(record, local, me).await;
+            Ok(Applied::Done(report, pushes))
+        }
         Err(e) if is_closure_bound(&e) => {
             local.log(&format!(
                 "[owed-actor] {e}: the bootstrap re-armed, the event held"
@@ -1329,6 +1337,7 @@ pub async fn apply_or_hold<R: SqlPort, L: SqlPort, O: Outside>(
                     ),
                 ])
                 .await?;
+            note_holding(record, local, me, ev).await;
             Ok(Applied::Held { rearmed: true })
         }
         Err(e) => Err(e),
@@ -1347,27 +1356,53 @@ pub fn held_answer(
     json!({"held": true, "bootstrapArmed": armed, "ackSeq": null, "rearmed": rearmed, "identity": me, "heldGames": games, "atMs": at_ms})
 }
 
-/// One held event the drain applied.
-#[derive(Debug)]
-pub struct Drained {
-    pub event: HeldEvent,
-    pub report: ApplyReport,
-    pub pushes: Vec<(String, Value)>,
-}
-/// The drain's account: the events applied in seq order and the cold time (the first held event's write time to the
-/// last applied, item 7), `None` when nothing was held.
+/// The drain's account: the held events applied, in seq order; their judgements' pushes, the earliest write time
+/// among them (the pushes' `atMs`), and the cold time (the first held event's write time to the stamp, item 7),
+/// `None` when nothing was held or the drain is not finished; `more` when the per-alarm bound left held events for
+/// the next alarm (the fourth delta lens's NEW4-L1).
 #[derive(Debug, Default)]
 pub struct Drain {
-    pub applied: Vec<Drained>,
+    pub applied: Vec<HeldEvent>,
+    pub pushes: Vec<(String, Value)>,
+    pub first_at_ms: Option<u64>,
     pub cold_ms: Option<u64>,
+    pub more: bool,
 }
 
-/// THE DRAIN (item 2): inside ONE turn, every held event applied in seq order over the warm mirror (a normal apply:
-/// its `(kind, seq)` recorded, its asks published), each row deleted as read; a hold that landed meanwhile (a
-/// re-hold of a name, a new event while the drain awaited the record) is read on the next pass; then `bootstrapped`
-/// stamped by the one statement that refuses while a held row stands. A held event's tip is the newer of its own and
-/// `tip_now`. An apply's fault ends the drain with the rows standing and the actor unstamped (the bootstrap's alarm
-/// runs it again).
+/// THE DRAIN'S BOUND (the fourth delta lens's NEW4-L1, D2-ACTOR-B-FOLD-8): one alarm applies at most
+/// [`DRAIN_CHUNKS_PER_ALARM`] chunks of [`DRAIN_CHUNK_GAMES`] games; the held events left wait for the next alarm
+/// (the cursor [`BOOT_CURSOR_DRAIN`]). The union of the held events' games is applied, never each event alone: the
+/// apply reads the record as it stands, so one apply of a game covers every held event naming it.
+pub const DRAIN_CHUNK_GAMES: usize = 16;
+pub const DRAIN_CHUNKS_PER_ALARM: usize = 8;
+/// The boot cursor of an actor whose pages are done and whose held events are still draining (NEW4-L1): its next
+/// alarm drains again and pages nothing.
+pub const BOOT_CURSOR_DRAIN: &str = "drain";
+/// The cold bar's start carried across the alarms of one drain (NEW4-L1): the first held event's write time.
+pub const META_COLD_FROM: &str = "coldFrom";
+
+/// The union of the held events' games, the first event's games first (so the oldest event always completes inside
+/// one alarm's bound), each game once, lowercased.
+pub fn drain_union(events: &[HeldEvent]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for ev in events {
+        for g in ev.games.iter().map(|g| g.to_ascii_lowercase()) {
+            if !out.contains(&g) {
+                out.push(g);
+            }
+        }
+    }
+    out
+}
+
+/// THE DRAIN (item 2, bounded by NEW4-L1): inside ONE turn, the union of the held events' games applied in chunks of
+/// [`DRAIN_CHUNK_GAMES`] over the warm mirror, at most [`DRAIN_CHUNKS_PER_ALARM`] chunks; each held event whose games
+/// are all applied is recorded in `applied` (its `(kind, seq)`) and its row deleted as read, in one batch; a hold
+/// that landed meanwhile is read on the next pass; with nothing held `bootstrapped` is stamped by the one statement
+/// that refuses while a held row stands. Past the bound the drain answers `more` (the object re-arms; its cursor
+/// [`BOOT_CURSOR_DRAIN`]). A held event's tip is the newer of its own and `tip_now`. An apply's fault ends the drain
+/// with the rows standing and the actor unstamped (the bootstrap's alarm runs it again, counted and parked by
+/// [`boot_fault`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn drain_held<R: SqlPort, L: SqlPort, O: Outside>(
     turn: &futures_util::lock::Mutex<()>,
@@ -1381,7 +1416,20 @@ pub async fn drain_held<R: SqlPort, L: SqlPort, O: Outside>(
 ) -> Result<Drain, String> {
     let _turn = turn.lock().await;
     let mut drain = Drain::default();
-    let mut first: Option<u64> = None;
+    let mut first: Option<u64> = local
+        .run_batch(vec![Stmt::new(
+            META_GET_SQL,
+            vec![Bind::Text(META_COLD_FROM.into())],
+        )])
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|o| {
+            o.rows
+                .first()
+                .and_then(|r| r["value"].as_str()?.parse().ok())
+        });
+    let mut chunks = 0usize;
     loop {
         let list = local
             .run_batch(vec![Stmt::new(HELD_LIST_SQL, vec![])])
@@ -1402,55 +1450,124 @@ pub async fn drain_held<R: SqlPort, L: SqlPort, O: Outside>(
             }
             continue;
         }
+        let mut held: Vec<(String, String, HeldEvent)> = Vec::new();
         for row in list {
             let (Some(name), Some(value)) = (row["name"].as_str(), row["value"].as_str()) else {
                 continue;
             };
-            let Ok(ev) = serde_json::from_str::<HeldEvent>(value) else {
-                local.log(&format!(
-                    "[owed-actor] held row {name} does not read: dropped"
-                ));
-                local
-                    .run_batch(vec![Stmt::new(
-                        HELD_DELETE_SQL,
-                        vec![Bind::Text(name.into()), Bind::Text(value.into())],
-                    )])
-                    .await?;
-                continue;
-            };
-            let tip = match (ev.tip, tip_now) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            };
-            let kind_seq = ev.kind.as_deref().zip(ev.seq);
-            let (report, pushes) =
-                apply(record, local, outside, me, &ev.games, kind_seq, tip, era_ms).await?;
-            if publish {
-                publish_belt_asks(record, local, me, &ev.games).await?;
+            match serde_json::from_str::<HeldEvent>(value) {
+                Ok(ev) => held.push((name.into(), value.into(), ev)),
+                Err(_) => {
+                    local.log(&format!(
+                        "[owed-actor] held row {name} does not read: dropped"
+                    ));
+                    local
+                        .run_batch(vec![Stmt::new(
+                            HELD_DELETE_SQL,
+                            vec![Bind::Text(name.into()), Bind::Text(value.into())],
+                        )])
+                        .await?;
+                }
             }
-            local
-                .run_batch(vec![Stmt::new(
-                    HELD_DELETE_SQL,
-                    vec![Bind::Text(name.into()), Bind::Text(value.into())],
-                )])
-                .await?;
-            first = Some(first.map_or(ev.started_ms(), |f| f.min(ev.started_ms())));
-            drain.applied.push(Drained {
-                event: ev,
-                report,
-                pushes,
-            });
         }
+        if held.is_empty() {
+            continue;
+        }
+        if chunks >= DRAIN_CHUNKS_PER_ALARM {
+            drain.more = true;
+            break;
+        }
+        let events: Vec<HeldEvent> = held.iter().map(|(_, _, e)| e.clone()).collect();
+        let tip = events.iter().filter_map(|e| e.tip).chain(tip_now).max();
+        let union = drain_union(&events);
+        let mut done: Vec<String> = Vec::new();
+        for chunk in union.chunks(DRAIN_CHUNK_GAMES) {
+            if chunks >= DRAIN_CHUNKS_PER_ALARM {
+                break;
+            }
+            let (_, pushes) = apply(record, local, outside, me, chunk, None, tip, era_ms).await?;
+            if publish {
+                publish_belt_asks(record, local, me, chunk).await?;
+            }
+            drain.pushes.extend(pushes);
+            done.extend(chunk.iter().cloned());
+            chunks += 1;
+        }
+        let now = local.now_ms() as i64;
+        let mut stmts = Vec::new();
+        let mut finished = Vec::new();
+        for (name, value, ev) in held {
+            if !ev
+                .games
+                .iter()
+                .all(|g| done.contains(&g.to_ascii_lowercase()))
+            {
+                continue;
+            }
+            if let (Some(kind), Some(seq)) = (ev.kind.as_deref(), ev.seq) {
+                stmts.push(Stmt::new(
+                    APPLIED_SQL,
+                    vec![
+                        Bind::Text(kind.into()),
+                        Bind::Int(seq),
+                        Bind::Int(now),
+                        Bind::Text(json!(ev.games).to_string()),
+                    ],
+                ));
+            }
+            stmts.push(Stmt::new(
+                HELD_DELETE_SQL,
+                vec![Bind::Text(name), Bind::Text(value)],
+            ));
+            first = Some(first.map_or(ev.started_ms(), |f| f.min(ev.started_ms())));
+            drain.first_at_ms = Some(
+                drain
+                    .first_at_ms
+                    .map_or(ev.started_ms(), |f| f.min(ev.started_ms())),
+            );
+            finished.push(ev);
+        }
+        if let Some(f) = first {
+            stmts.push(Stmt::new(
+                META_PUT_SQL,
+                vec![Bind::Text(META_COLD_FROM.into()), Bind::Text(f.to_string())],
+            ));
+        }
+        if !stmts.is_empty() {
+            local.run_batch(stmts).await?;
+        }
+        finished.sort_by_key(|e| e.seq.unwrap_or(0));
+        drain.applied.extend(finished);
     }
-    drain.cold_ms = first.map(|f| local.now_ms().saturating_sub(f));
+    if !drain.more {
+        drain.cold_ms = first.map(|f| local.now_ms().saturating_sub(f));
+        local
+            .run_batch(vec![Stmt::new(
+                "DELETE FROM meta WHERE name=?1",
+                vec![Bind::Text(META_COLD_FROM.into())],
+            )])
+            .await?;
+    }
+    drain.applied.sort_by_key(|e| e.seq.unwrap_or(0));
     Ok(drain)
 }
 
 /// One bootstrap page's outcome: the next page's keyset cursor, or the bootstrap's end (the held events drained).
 #[derive(Debug)]
 pub enum BootStep {
-    Page { cursor: String, games: usize },
-    Done { games: usize, drain: Drain },
+    Page {
+        cursor: String,
+        games: usize,
+    },
+    /// NEW4-L1: the pages are done and the held events' drain met its per-alarm bound; the next alarm drains again
+    /// (the cursor [`BOOT_CURSOR_DRAIN`]).
+    Draining {
+        drain: Drain,
+    },
+    Done {
+        games: usize,
+        drain: Drain,
+    },
 }
 
 /// ONE BOOTSTRAP PAGE (the object's alarm runs it after its budget token, MEDIUM-1 and NEW-M2): the identity's next
@@ -1468,6 +1585,9 @@ pub async fn bootstrap_step<R: SqlPort, L: SqlPort, O: Outside>(
     era_ms: Option<i64>,
     publish: bool,
 ) -> Result<BootStep, String> {
+    if cursor == Some(BOOT_CURSOR_DRAIN) {
+        return drain_step(turn, record, local, outside, me, 0, tip, era_ms, publish).await;
+    }
     let (at, after) = object::boot_keyset(cursor);
     let rows = record
         .run_batch(vec![Stmt::new(
@@ -1490,17 +1610,236 @@ pub async fn bootstrap_step<R: SqlPort, L: SqlPort, O: Outside>(
         .await?;
     }
     if games.len() < BOOTSTRAP_PAGE_GAMES {
-        let drain = drain_held(turn, record, local, outside, me, tip, era_ms, publish).await?;
-        return Ok(BootStep::Done {
-            games: games.len(),
-            drain,
-        });
+        return drain_step(
+            turn,
+            record,
+            local,
+            outside,
+            me,
+            games.len(),
+            tip,
+            era_ms,
+            publish,
+        )
+        .await;
     }
     let last = rows.last().cloned().unwrap_or(Value::Null);
     Ok(BootStep::Page {
         cursor: json!([last["at"].as_i64().unwrap_or(0), last["gameId"]]).to_string(),
         games: games.len(),
     })
+}
+
+/// The bootstrap's last step: the held events' drain; `Done` (its holding row cleared, [`clear_holding`]) once the
+/// actor is stamped, `Draining` past the drain's per-alarm bound (NEW4-L1).
+#[allow(clippy::too_many_arguments)]
+async fn drain_step<R: SqlPort, L: SqlPort, O: Outside>(
+    turn: &futures_util::lock::Mutex<()>,
+    record: &R,
+    local: &L,
+    outside: &O,
+    me: &str,
+    games: usize,
+    tip: Option<u64>,
+    era_ms: Option<i64>,
+    publish: bool,
+) -> Result<BootStep, String> {
+    let drain = drain_held(turn, record, local, outside, me, tip, era_ms, publish).await?;
+    if drain.more {
+        return Ok(BootStep::Draining { drain });
+    }
+    clear_holding(record, local, me).await;
+    Ok(BootStep::Done { games, drain })
+}
+
+// ---- D2-ACTOR-B-FOLD-8: a stuck actor counted, served and parked (the fourth delta lens's NEW4-M2) ----
+//
+// A held answer is acknowledged (Phases B and C), so an actor whose bootstrap can never finish was invisible: its
+// seat served no press (Rule 23 holds: display only, or 503 `pending`) and nothing served named it. Now (1) every
+// bootstrap-page and drain fault is counted (`owed_actor_bootstrap_faults_total`, `/health.owedActor.bootstrapFaults`);
+// (2) a holding actor keeps ONE D1 row, `owed-actor:holding:<identity>` in the belt's ledger, written at its first
+// hold ([`note_holding`]) and deleted by its stamp ([`clear_holding`]), served as `/health.owedActor.holding`
+// {`count`, `oldestMs`} from the health snapshot the writers compose (no statement on the read); (3) a page that has
+// faulted [`BOOT_FAULTS_PARK`] alarms in a row is PARKED ([`boot_fault`]): its alarm stops retrying it, its line names
+// it, and the lever's `/bootstrap` clears the park and re-arms from the parked cursor.
+
+/// The fourth delta lens's NEW4-L4: does the alarm run the tip window? Only with a gate held and NO bootstrap cursor
+/// (a re-armed actor's window re-held its games on every page alarm, and the drain judges at the tip anyway).
+pub fn tip_window_due(gate: bool, boot_cursor: bool) -> bool {
+    gate && !boot_cursor
+}
+
+/// The belt ledger's prefix of the holding actors' rows.
+pub const HOLDING_PREFIX: &str = "owed-actor:holding:";
+/// The holding row, written once (its `tickedAtMs` the first hold; a later hold writes nothing). `?1` the identity,
+/// `?2` the row's cursor (the first held event's kind and seq), `?3` now.
+pub const HOLDING_PUT_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-actor:holding:'||?1,?2,CAST(?3 AS INTEGER)) ON CONFLICT(name) DO NOTHING";
+/// The stamp's delete of the holding row.
+pub const HOLDING_DELETE_SQL: &str =
+    "DELETE FROM owed_belt_state WHERE name='owed-actor:holding:'||?1";
+/// The actor's own note that its holding row is written (so a hold writes D1 once, never once an event).
+pub const META_HOLDING: &str = "holding";
+/// The consecutive bootstrap-page faults ([`boot_fault`]) and the park.
+pub const META_BOOT_FAULTS: &str = "bootFaults";
+pub const META_BOOT_PARKED: &str = "bootParked";
+/// The alarms a page may fault in a row before it is parked.
+pub const BOOT_FAULTS_PARK: u32 = 5;
+/// A faulted page's retry.
+pub const BOOT_FAULT_RETRY_MS: u64 = 60_000;
+
+async fn meta_value<L: SqlPort>(local: &L, name: &str) -> Option<String> {
+    local
+        .run_batch(vec![Stmt::new(META_GET_SQL, vec![Bind::Text(name.into())])])
+        .await
+        .ok()?
+        .into_iter()
+        .next()?
+        .rows
+        .first()?["value"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The first hold of a cold or re-armed actor writes its holding row (and the health snapshot, at most once a
+/// minute fleet-wide); later holds write nothing to D1. A D1 fault is logged and retried at the next hold.
+pub async fn note_holding<R: SqlPort, L: SqlPort>(record: &R, local: &L, me: &str, ev: &HeldEvent) {
+    if meta_value(local, META_HOLDING).await.is_some() {
+        return;
+    }
+    let now = local.now_ms();
+    let put = record
+        .run_batch(vec![
+            Stmt::new(
+                HOLDING_PUT_SQL,
+                vec![
+                    Bind::Text(me.to_ascii_lowercase()),
+                    Bind::Text(json!({"kind": ev.kind, "seq": ev.seq}).to_string()),
+                    Bind::Int(now as i64),
+                ],
+            ),
+            health_snapshot_stmt(now, false),
+        ])
+        .await;
+    match put {
+        Ok(_) => {
+            let _ = local
+                .run_batch(vec![Stmt::new(
+                    META_PUT_SQL,
+                    vec![Bind::Text(META_HOLDING.into()), Bind::Text(now.to_string())],
+                )])
+                .await;
+        }
+        Err(e) => local.log(&format!(
+            "[owed-actor] holding row of {me} not written: {e}"
+        )),
+    }
+}
+
+/// The stamp's end of a hold: the holding row deleted (and the snapshot, at most once a minute), then the actor's
+/// note. Run at the stamp and again at each landed apply while the note stands (a delete that faulted is retried).
+pub async fn clear_holding<R: SqlPort, L: SqlPort>(record: &R, local: &L, me: &str) {
+    if meta_value(local, META_HOLDING).await.is_none() {
+        return;
+    }
+    let now = local.now_ms();
+    let deleted = record
+        .run_batch(vec![
+            Stmt::new(
+                HOLDING_DELETE_SQL,
+                vec![Bind::Text(me.to_ascii_lowercase())],
+            ),
+            health_snapshot_stmt(now, false),
+        ])
+        .await;
+    match deleted {
+        Ok(_) => {
+            let _ = local
+                .run_batch(vec![Stmt::new(
+                    "DELETE FROM meta WHERE name=?1",
+                    vec![Bind::Text(META_HOLDING.into())],
+                )])
+                .await;
+        }
+        Err(e) => local.log(&format!(
+            "[owed-actor] holding row of {me} not deleted: {e}"
+        )),
+    }
+}
+
+/// What the alarm does after a bootstrap-page or drain fault ([`boot_fault`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootFault {
+    /// Retry in [`BOOT_FAULT_RETRY_MS`]; `faults` in a row so far.
+    Retry { faults: u32 },
+    /// Parked at the [`BOOT_FAULTS_PARK`]-th fault: no retry; the line names it.
+    Parked { faults: u32, line: String },
+}
+
+/// A bootstrap page (or its drain) faulted: the consecutive count moves, and at [`BOOT_FAULTS_PARK`] the page is
+/// PARKED (`bootParked`, the reason): the alarm stops retrying it until the lever's `/bootstrap` clears the park
+/// ([`clear_boot_park`]). The caller counts `owed_actor_bootstrap_faults_total` once a fault.
+pub async fn boot_fault<L: SqlPort>(local: &L, me: &str, reason: &str) -> BootFault {
+    let faults = meta_value(local, META_BOOT_FAULTS)
+        .await
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+        + 1;
+    let mut stmts = vec![Stmt::new(
+        META_PUT_SQL,
+        vec![
+            Bind::Text(META_BOOT_FAULTS.into()),
+            Bind::Text(faults.to_string()),
+        ],
+    )];
+    let verdict = if faults >= BOOT_FAULTS_PARK {
+        stmts.push(Stmt::new(
+            META_PUT_SQL,
+            vec![
+                Bind::Text(META_BOOT_PARKED.into()),
+                Bind::Text(
+                    json!({"faults": faults, "reason": reason, "atMs": local.now_ms()}).to_string(),
+                ),
+            ],
+        ));
+        BootFault::Parked {
+            faults,
+            line: format!("[owed-actor] bootstrap PARKED {me} after {faults} faults: {reason}"),
+        }
+    } else {
+        BootFault::Retry { faults }
+    };
+    let _ = local.run_batch(stmts).await;
+    verdict
+}
+/// A page that landed: the consecutive faults cleared.
+pub async fn boot_page_landed<L: SqlPort>(local: &L) {
+    let _ = local
+        .run_batch(vec![Stmt::new(
+            "DELETE FROM meta WHERE name=?1",
+            vec![Bind::Text(META_BOOT_FAULTS.into())],
+        )])
+        .await;
+}
+/// Is the actor's bootstrap parked?
+pub async fn boot_parked<L: SqlPort>(local: &L) -> bool {
+    meta_value(local, META_BOOT_PARKED).await.is_some()
+}
+/// The lever's `/bootstrap` on a parked actor: the park and the fault count cleared (the cursor kept); answers
+/// whether it was parked (once: the next call finds no park).
+pub async fn clear_boot_park<L: SqlPort>(local: &L) -> bool {
+    if !boot_parked(local).await {
+        return false;
+    }
+    let _ = local
+        .run_batch(vec![Stmt::new(
+            "DELETE FROM meta WHERE name IN (?1,?2)",
+            vec![
+                Bind::Text(META_BOOT_PARKED.into()),
+                Bind::Text(META_BOOT_FAULTS.into()),
+            ],
+        )])
+        .await;
+    true
 }
 
 /// A `txfacts` event (MEDIUM-3): the transaction's facts as the overlay decoded them (`owed_event::txfacts_of_raw`),
@@ -1555,6 +1894,37 @@ pub fn compared_facts(row: &Value) -> Value {
     facts
 }
 
+/// The operator's rows lever's answer (the captain's item 10): the actor's state and rows (`/stored`, or its fault),
+/// D1's rows, the outpoints that differ and both digests, by the reconcile's own functions.
+pub fn rows_view(identity: &str, actor: std::result::Result<Value, String>, d1: &[Value]) -> Value {
+    let (actor_rows, actor_state) = match actor {
+        Ok(a) => {
+            let rows = a["rows"].as_array().cloned().unwrap_or_default();
+            (
+                Some(rows.clone()),
+                json!({
+                    "bootstrapped": a["bootstrapped"],
+                    "bootstrapArmed": a["bootstrapArmed"],
+                    "bootParked": a["bootParked"],
+                    "held": a["held"],
+                    "ackSeq": a["ackSeq"],
+                    "judgedAtMs": a["judgedAtMs"],
+                    "fresh": a["fresh"] == true,
+                    "rows": rows,
+                }),
+            )
+        }
+        Err(e) => (None, json!({"error": e})),
+    };
+    json!({
+        "identity": identity,
+        "actor": actor_state,
+        "d1": {"rows": d1},
+        "diff": actor_rows.as_deref().map(|a| diff_rows(d1, a)),
+        "digests": {"d1": rows_digest(d1), "actor": actor_rows.as_deref().map(rows_digest)},
+    })
+}
+
 pub fn diff_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
     fn keyed(rows: &[Value]) -> BTreeMap<String, Value> {
         rows.iter()
@@ -1585,6 +1955,70 @@ pub fn diff_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
         .filter(|k| a.get(*k) != b.get(*k))
         .cloned()
         .collect()
+}
+
+/// THE DIFF LINES NAME WHAT DIFFERS (the captain's item 12, D2-ACTOR-B-FOLD-8): for the first [`DIFF_DETAIL_MAX`]
+/// differing outpoints, each compared field that differs with both values (`family d1=unbound actor=hop-stranded`,
+/// `claimable d1=null actor=1`, a facts key by name: `facts.claim d1=.. actor=..`), the fields [`diff_rows`] compares;
+/// a row on one side only is `absent`.
+pub const DIFF_DETAIL_MAX: usize = 3;
+pub fn diff_detail(d1: &[Value], actor: &[Value], outpoints: &[String]) -> String {
+    let find = |rows: &[Value], o: &str| rows.iter().find(|r| r["outpoint"] == o).cloned();
+    let short = |v: &Value| -> String {
+        let t = match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        if t.chars().count() > 80 {
+            format!("{}..", t.chars().take(80).collect::<String>())
+        } else {
+            t
+        }
+    };
+    let mut parts = Vec::new();
+    for o in outpoints.iter().take(DIFF_DETAIL_MAX) {
+        let (a, b) = (find(d1, o), find(actor, o));
+        let fields = match (&a, &b) {
+            (Some(a), Some(b)) => {
+                let mut f = Vec::new();
+                for k in [
+                    "family",
+                    "gameId",
+                    "sats",
+                    "opponentIdentity",
+                    "atHeight",
+                    "reason",
+                    "claimable",
+                ] {
+                    if a[k] != b[k] {
+                        f.push(format!("{k} d1={} actor={}", short(&a[k]), short(&b[k])));
+                    }
+                }
+                let (fa, fb) = (compared_facts(a), compared_facts(b));
+                let keys: BTreeSet<String> = fa
+                    .as_object()
+                    .into_iter()
+                    .chain(fb.as_object())
+                    .flat_map(|m| m.keys().cloned())
+                    .collect();
+                for k in keys {
+                    if fa[&k] != fb[&k] {
+                        f.push(format!(
+                            "facts.{k} d1={} actor={}",
+                            short(&fa[&k]),
+                            short(&fb[&k])
+                        ));
+                    }
+                }
+                f.join(", ")
+            }
+            (Some(_), None) => "d1=present actor=absent".into(),
+            (None, Some(_)) => "d1=absent actor=present".into(),
+            (None, None) => "absent on both".into(),
+        };
+        parts.push(format!("{o} [{fields}]"));
+    }
+    parts.join("; ")
 }
 
 /// The KV display copy (MEDIUM-9): the actor's stored rows (`ROWS_SQL`'s), written at most once a second.
@@ -1934,6 +2368,9 @@ pub struct PendingBars {
     /// The queue class's unapplied set moved since the last flush (only then is the row's age rewritten).
     pub queue_touched: bool,
     pub noted: usize,
+    /// The fourth delta lens's NEW4-L4: the held answers since the last flush (`owed_actor_apply_held_total`, added
+    /// once a flush, never one D1 write a held event).
+    pub held: u64,
     pub last_flush_ms: Option<u64>,
 }
 impl PendingBars {
@@ -1960,6 +2397,11 @@ impl PendingBars {
     }
     pub fn note_cold(&mut self, ms: u64) {
         self.visible.entry("cold").or_default().push(ms);
+        self.noted += 1;
+    }
+    /// NEW4-L4: one held answer, counted at the next flush.
+    pub fn note_held(&mut self) {
+        self.held += 1;
         self.noted += 1;
     }
     pub fn note_fault(&mut self, identity: &str, at_ms: Option<u64>) {
@@ -1995,6 +2437,10 @@ pub fn note_answer_as(class: &'static str, answer: &Value) {
 pub fn note_cold(ms: u64) {
     PENDING_BARS.with(|p| p.borrow_mut().note_cold(ms));
 }
+/// NEW4-L4: one held answer, into this isolate's pending bars (counted `owed_actor_apply_held_total` at the flush).
+pub fn note_held() {
+    PENDING_BARS.with(|p| p.borrow_mut().note_held());
+}
 /// A JSON number as milliseconds, an integer or a whole REAL (D1's bind of a JS number).
 pub fn json_ms(v: &Value) -> Option<u64> {
     v.as_u64()
@@ -2007,26 +2453,49 @@ pub fn alarm_offset_ms(at_ms: u64, now_ms: u64) -> i64 {
 }
 /// The captain's item 12: is a bootstrap's stored alarm DEAD (none, or later than one page delay and a minute from
 /// now: lost, or set decades out by a build that handed `set_alarm` an epoch stamp)? `held` the stored epoch time.
+///
+/// The fourth delta lens's NEW4-L2 (D2-ACTOR-B-FOLD-8): the bound sits past [`boot_pace`]'s longest wait (the next
+/// minute's edge plus a spread under a minute: under two minutes from now) with a page delay and
+/// [`BOOT_ALARM_SLACK_MS`] of slack, so a paced wait is never called dead (it was: the bound was one page delay and a
+/// minute, and a held event or a lever call during a wait re-armed the page at once and spent a token).
 pub fn alarm_is_dead(held: Option<i64>, now_ms: u64) -> bool {
-    held.is_none_or(|h| h > (now_ms + BOOTSTRAP_PAGE_DELAY_MS + 60_000) as i64)
+    held.is_none_or(|h| h > (now_ms + BOOT_ALARM_DEAD_AFTER_MS) as i64)
 }
+/// The slack past a paced wait before an alarm is dead.
+pub const BOOT_ALARM_SLACK_MS: u64 = 5_000;
+/// [`boot_pace`]'s longest wait (two minutes), a page delay and the slack.
+pub const BOOT_ALARM_DEAD_AFTER_MS: u64 =
+    2 * 60_000 + BOOTSTRAP_PAGE_DELAY_MS + BOOT_ALARM_SLACK_MS;
 /// An actor apply that faulted: its event is unapplied for the actor until a later apply of the identity lands.
 pub fn note_actor_fault(identity: &str, at_ms: Option<u64>) {
     PENDING_BARS.with(|p| p.borrow_mut().note_fault(identity, at_ms));
 }
 
+/// THE FLEET BARS ARE THE BUILD'S (the captain's item 9 of lane D2-ACTOR-B-FOLD-8): each class row names the build
+/// that wrote its samples (`libRev`, the app layer's `OVERLAY_LIB_REV`); the first flush of another build REPLACES the
+/// row (never merges into it), and the served figures read only the rows of the reading build ([`fleet_bars`]), so a
+/// fixed build's p95s are never the old build's history (beta, an hour after PR 206's T0: `rowsVisibleMsP95` 311,719
+/// ms, every sample the old build's cold-closure retries).
+pub fn lib_rev() -> &'static str {
+    option_env!("OVERLAY_LIB_REV").unwrap_or("unknown")
+}
+
 /// One class row after this isolate's samples: the stored rings with the new samples appended, the last
-/// [`METER_SAMPLES`] kept; `unapplied` (the queue row only) the oldest unapplied write time, `Some(None)` cleared.
+/// [`METER_SAMPLES`] kept; `unapplied` (the queue row only) the oldest unapplied write time, `Some(None)` cleared. A
+/// stored row of another build (`libRev` not `rev`, or none) is replaced, not merged.
 pub fn merge_bars_row(
     stored: Option<&str>,
     apply: &[u64],
     visible: &[u64],
     unapplied: Option<Option<u64>>,
+    rev: &str,
 ) -> String {
     let mut row: Value = stored
         .and_then(|s| serde_json::from_str(s).ok())
         .filter(Value::is_object)
+        .filter(|r: &Value| r["libRev"] == rev)
         .unwrap_or_else(|| json!({}));
+    row["libRev"] = json!(rev);
     for (k, new) in [("apply", apply), ("visible", visible)] {
         let mut ring: Vec<u64> = row[k]
             .as_array()
@@ -2103,10 +2572,16 @@ pub async fn flush_bars_from(
                     &apply,
                     &visible,
                     unapplied,
+                    lib_rev(),
                 )),
                 Bind::Int(now as i64),
             ],
         ));
+    }
+    if pending.held > 0 {
+        // NEW4-L4: the held answers since the last flush, one counter write a flush.
+        db.counters(vec![(COUNTERS[21].to_string(), pending.held)])
+            .await;
     }
     if !stmts.is_empty() {
         // D2-ACTOR-B-FOLD-6: the health snapshot after the class rows, in their batch (at most once a minute).
@@ -2120,14 +2595,19 @@ pub async fn flush_bars_from(
 /// queue classes, the rows' visibility p95 by class (`rowsVisibleMsP95` the queue's, the path every write takes;
 /// `rowsVisibleDirectMsP95` the record door's direct call), the collect-after-mined p95, the actor's own oldest
 /// unapplied event's age, and each class's sample count and flush time.
-pub fn fleet_bars(rows: &[Value], now: u64) -> Value {
-    let ring = |class: &str, k: &str| -> (Meter, Option<i64>, Value) {
+///
+/// Item 9: only the rows `rev` wrote are read (a row of another build, or one written before the stamp, is not this
+/// build's: its class serves no samples until this build flushes); `barsLibRev` names the build served.
+pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
+    let ring = |class: &str, k: &str| -> (Meter, Option<u64>, Value) {
         let name = bars_state_name(class);
-        let r = rows.iter().find(|r| r["name"] == name.as_str());
-        let row: Value = r
+        let found = rows.iter().find(|r| r["name"] == name.as_str());
+        let row: Value = found
             .and_then(|r| r["cursor"].as_str())
-            .and_then(|s| serde_json::from_str(s).ok())
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .filter(|row| row["libRev"] == rev)
             .unwrap_or(Value::Null);
+        let r = found.filter(|_| !row.is_null());
         let mut m = Meter::default();
         for v in row[k]
             .as_array()
@@ -2137,7 +2617,8 @@ pub fn fleet_bars(rows: &[Value], now: u64) -> Value {
         {
             m.note(v);
         }
-        (m, r.and_then(|r| r["tickedAtMs"].as_i64()), row)
+        // The fourth delta lens's NEW4-L3: D1 stores the bound `tickedAtMs` as a REAL; read either form.
+        (m, r.and_then(|r| json_ms(&r["tickedAtMs"])), row)
     };
     let mut apply = Meter::default();
     for class in ["direct", "queue"] {
@@ -2174,6 +2655,7 @@ pub fn fleet_bars(rows: &[Value], now: u64) -> Value {
         "coldSamples": cold.samples.len(),
         "actorOldestUnappliedEventAgeMs": queue_row["oldestUnappliedAtMs"].as_u64().map(|a| now.saturating_sub(a)),
         "classes": classes,
+        "barsLibRev": rev,
     })
 }
 
@@ -2185,7 +2667,7 @@ pub fn fleet_bars(rows: &[Value], now: u64) -> Value {
 /// (`owed_events::HEALTH_CONSUMER_SQL`).
 macro_rules! health_select {
     () => {
-        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',tickedAtMs)) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage"
+        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding"
     };
 }
 pub const HEALTH_SQL: &str = health_select!();
@@ -2199,7 +2681,7 @@ pub const HEALTH_SQL: &str = health_select!();
 pub const HEALTH_SNAPSHOT_NAME: &str = "owed-actor:health";
 pub const HEALTH_SNAPSHOT_EVERY_MS: u64 = 60_000;
 pub const HEALTH_SNAPSHOT_SQL: &str = concat!(
-    "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) SELECT 'owed-actor:health',json_object('asOfMs',CAST(?1 AS INTEGER),'bars',h.bars,'counters',h.counters,'activeIdentities',h.activeIdentities,'coverage',h.coverage),?1 FROM (",
+    "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) SELECT 'owed-actor:health',json_object('asOfMs',CAST(?1 AS INTEGER),'bars',h.bars,'counters',h.counters,'activeIdentities',h.activeIdentities,'coverage',h.coverage,'holding',h.holding),?1 FROM (",
     health_select!(),
     ") h WHERE NOT (?2>0 AND EXISTS (SELECT 1 FROM owed_belt_state WHERE name='owed-actor:health' AND tickedAtMs>?1-?2)) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs"
 );
@@ -2245,7 +2727,7 @@ pub fn health_body(
         }
     };
     let rows: Vec<Value> = field("bars").as_array().cloned().unwrap_or_default();
-    let fleet = fleet_bars(&rows, now);
+    let fleet = fleet_bars(&rows, now, lib_rev());
     for (k, v) in fleet.as_object().into_iter().flatten() {
         body[k.as_str()] = v.clone();
     }
@@ -2279,6 +2761,17 @@ pub fn health_body(
     body["closureRearmed"] = n(COUNTERS[22]);
     // Item 12: the actors armed under a dead alarm, re-armed by the lever or a held event.
     body["alarmRearmed"] = n(COUNTERS[23]);
+    // The fourth delta lens's NEW4-M2: the bootstrap-page and drain faults, and the actors holding events now (their
+    // count and the oldest hold's age; from the snapshot the writers compose, no statement on this read).
+    body["bootstrapFaults"] = n(COUNTERS[24]);
+    let holding = field("holding");
+    body["holding"] = match read {
+        Some(_) => json!({
+            "count": holding["count"].as_u64().unwrap_or(0),
+            "oldestMs": json_ms(&holding["oldestAtMs"]).map(|a| now.saturating_sub(a)),
+        }),
+        None => Value::Null,
+    };
     // NEW-L3: Phase B's gate is COVERAGE, the bootstrap lever's last full pass (`complete`, `contiguous`, `uncovered`
     // 0), never `bootstraps` against `activeIdentities` (two counts).
     body["coverage"] = field("coverage");
@@ -2430,8 +2923,12 @@ pub async fn reconcile_step(
         identity: identity.clone(),
         ..Default::default()
     };
-    let actor = match db.actor_rows(&identity).await {
-        Ok(Some(rows)) => rows,
+    // Item 12: the actor's stored answer, its rows and whether it was bootstrapped at the compare.
+    let (actor, bootstrapped) = match db.actor_stored(&identity).await {
+        Ok(Some(answer)) => (
+            answer["rows"].as_array().cloned().unwrap_or_default(),
+            answer["bootstrapped"].clone(),
+        ),
         Ok(None) => {
             report.no_actor = true;
             save(identity).await?;
@@ -2497,10 +2994,16 @@ pub async fn reconcile_step(
     if report.diff {
         deltas.push((COUNTERS[7].to_string(), 1));
         BARS.with(|b| b.borrow_mut().reconcile_diffs += 1);
+        let differ = diff_rows(&a, &b);
         db.log(&format!(
-            "[owed-actor] RECONCILE DIFF {identity}: {} outpoints differ, {} games re-applied",
-            diff_rows(&a, &b).len(),
-            report.reapplied
+            "[owed-actor] RECONCILE DIFF {identity}: {} outpoints differ, {} games re-applied, actor bootstrapped at the compare: {}; {}",
+            differ.len(),
+            report.reapplied,
+            match bootstrapped {
+                Value::Bool(b) => b.to_string(),
+                _ => "unknown".into(),
+            },
+            diff_detail(&a, &b, &differ)
         ));
     }
     if report.reapplied > 0 && db.d1_judges() {
@@ -2546,7 +3049,7 @@ mod tests;
 /// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
 /// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
 /// (MEDIUM-9).
-pub const COUNTERS: [&str; 24] = [
+pub const COUNTERS: [&str; 25] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -2579,6 +3082,8 @@ pub const COUNTERS: [&str; 24] = [
     "owed_actor_closure_rearmed_total",
     // The captain's item 12: an actor armed under a dead alarm (lost, or set decades out by an older build) re-armed.
     "owed_actor_alarm_rearmed_total",
+    // The fourth delta lens's NEW4-M2: every bootstrap-page and drain fault (a page parked at its fifth in a row).
+    "owed_actor_bootstrap_faults_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;
@@ -2625,7 +3130,12 @@ fn of_games(rows: &[Value], games: &[String]) -> Vec<Value> {
 /// PHASE A (section 6): the actor applies beside the D1 judge; its rows for `games` are compared with the D1 judge's
 /// just written, counted (`owed_actor_compared_total`, `owed_actor_diffs_total`) with a sampled diff line. The
 /// actor's fault never fails the message (`owed_actor_faults_total`).
-pub async fn beside(db: &impl JudgeDb, identity: &str, games: &[String]) {
+///
+/// The captain's item 11 (D2-ACTOR-B-FOLD-8): `bound` is the acknowledgement's bound read BEFORE the D1 judge (as
+/// [`actor_then_d1`] reads it before the actor), so a mark written between the two judges (a word landing between
+/// them) makes its game's DIFF a HELD one (`owed_actor_compare_held_total`), never the cutover's STOP; a diff with no
+/// mark above the bound stays real. `None` (the bound's read faulted) compares as before.
+pub async fn beside(db: &impl JudgeDb, identity: &str, games: &[String], bound: Option<i64>) {
     let answer = match db.actor_deliver(identity, games).await {
         Ok(Some(a)) => a,
         Ok(None) => return,
@@ -2641,7 +3151,7 @@ pub async fn beside(db: &impl JudgeDb, identity: &str, games: &[String]) {
         return;
     }
     note_answer(&answer);
-    compare(db, identity, games, &answer, None).await;
+    compare(db, identity, games, &answer, bound).await;
 }
 
 /// D2-ACTOR-B-FOLD-7: the actor HELD the event (202 `held: true`): it is bootstrapping and applies the event at its
@@ -2663,6 +3173,8 @@ pub struct Deferred {
     pub event: EventCtx,
     pub tip: Option<u64>,
     pub era_ms: Option<i64>,
+    /// Item 11: the acknowledgement's bound read before the D1 judge.
+    pub bound: Option<i64>,
 }
 pub const DEFERRED_MAX: usize = 256;
 thread_local! {
@@ -2696,7 +3208,7 @@ pub async fn run_deferred(env: worker::Env, items: Vec<Deferred>) {
             continue;
         };
         let judge = judge.with_event(d.event);
-        beside(&judge, &d.identity, &d.games).await;
+        beside(&judge, &d.identity, &d.games, d.bound).await;
     }
     if let Ok(db) = crate::routes::D1Sql::of(&env) {
         db.counters(vec![(COUNTERS[16].into(), n)]).await;
@@ -2806,21 +3318,23 @@ async fn compare(
         deltas.push((COUNTERS[1].to_string(), 1));
         // MEDIUM-8: the line names the identity and the game (the cutover's STOP reads it).
         db.log(&format!(
-            "[owed-actor] DIFF {identity} game {}: {} outpoints of {} games, first {}",
+            "[owed-actor] DIFF {identity} game {}: {} outpoints of {} games, first {}; {}",
             game_of(&diffs[0]),
             diffs.len(),
             games.len(),
-            diffs[0]
+            diffs[0],
+            diff_detail(&d1, &actor, &diffs)
         ));
     }
     if !held_diffs.is_empty() {
         deltas.push((COUNTERS[17].to_string(), 1));
         db.log(&format!(
-            "[owed-actor] DIFF (held mark, NEW2-L1; not a STOP) {identity} game {}: {} outpoints of {} games, first {}",
+            "[owed-actor] DIFF (held mark, NEW2-L1; not a STOP) {identity} game {}: {} outpoints of {} games, first {}; {}",
             game_of(&held_diffs[0]),
             held_diffs.len(),
             games.len(),
-            held_diffs[0]
+            held_diffs[0],
+            diff_detail(&d1, &actor, &held_diffs)
         ));
     }
     db.counters(deltas).await;
