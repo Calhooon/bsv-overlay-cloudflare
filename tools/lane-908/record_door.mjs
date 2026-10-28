@@ -103,7 +103,11 @@ try {
     assert(health.record.answerSamples >= 7)
     assert(health.record.answerMsP50 < 300 && health.record.answerMsP95 < 300, JSON.stringify(health.record))
     assert(health.record.enqueueMsP50 !== null && health.record.enqueueMsP95 !== null, JSON.stringify(health.record))
-    assert(health.owedEvents.consumedTotal >= 7 && health.owedEvents.ackedMarks > 0, JSON.stringify(health.owedEvents))
+    // D2-ACTOR-A-FOLD-4: the totals are the overlay's /health/invariants.owedEvents (no overlay in this cell): their
+    // ops_counters rows, read here as that route reads them; /health.owedEvents keeps the ages
+    const total = async name => Number((await one('SELECT value FROM ops_counters WHERE name=?', name))?.value ?? 0)
+    const consumed = await total('owed_events_consumed_total'), acked = await total('owed_events_acked_marks_total')
+    assert(consumed >= 7 && acked > 0, JSON.stringify({ consumed, acked, owedEvents: health.owedEvents }))
     assert(health.owedEvents.oldestEnqueueAgeMs !== null, 'the consumer wrote its batch row')
     console.log('PASS all seven doors: write-only budgets, <300 ms answers with the publish, immediate reads, the queue consumer\u2019s judgement, concurrent filing marks drained, /health.record and /health.owedEvents served')
     // HIGH-2's second belt: a mark no consumer acknowledged within one tick is re-published by the sweep on the belt's
