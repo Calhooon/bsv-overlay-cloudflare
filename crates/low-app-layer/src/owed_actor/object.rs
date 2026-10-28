@@ -119,6 +119,12 @@ pub fn schema_plan(held_digest: Option<&str>) -> Vec<String> {
 /// plan and retries it; an actor whose index `CREATE` failed is never stamped as holding the render's indexes (a
 /// statement naming the index in `INDEXED BY` would fail on every apply until the next digest move). Answers whether
 /// the plan applied whole.
+///
+/// The third delta lens's LOW-2: `shape` is stamped when every TABLE statement answered (every statement but an
+/// index's `CREATE INDEX` or `DROP INDEX`), so a rebuild whose one `CREATE INDEX` failed is retried by the next
+/// instance as the INDEX-ONLY move ([`schema_plan_kept`]): the rows and `bootstrapped` kept, no second rebuild and no
+/// second bootstrap. The digest is stamped only when the plan is whole, as before. The caller counts a plan that did
+/// not apply whole (`owed_actor_schema_partial_total`, served `schemaPartial`).
 pub fn ensure_schema(
     plan: &[String],
     mut exec: impl FnMut(&str) -> std::result::Result<(), String>,
@@ -126,19 +132,31 @@ pub fn ensure_schema(
     mut stamp: impl FnMut(&str, &str),
 ) -> bool {
     let mut whole = true;
+    let mut tables_whole = true;
     for s in plan {
         if let Err(e) = exec(s) {
             whole = false;
+            if !is_index_statement(s) {
+                tables_whole = false;
+            }
             log(format!("[owed-actor] schema: {e}: {s}"));
         }
     }
     if whole {
         stamp(META_SCHEMA, &actor_digest());
         stamp("shape", &actor_shape());
+    } else if tables_whole {
+        stamp("shape", &actor_shape());
+        log("[owed-actor] schema: an index statement failed; shape stamped, digest NOT stamped (the next ensure retries the indexes only)".into());
     } else {
         log("[owed-actor] schema: the plan did not apply whole; digest and shape NOT stamped (the next ensure retries it)".into());
     }
     whole
+}
+
+/// LOW-2: an index's own statement (`CREATE INDEX`, `DROP INDEX`), the part of a plan [`actor_shape`] does not hold.
+pub fn is_index_statement(ddl: &str) -> bool {
+    is_plain_index(ddl) || ddl.trim_start().starts_with("DROP INDEX")
 }
 
 /// The delta lens's NEW-M2: [`schema_plan`] with the held SHAPE ([`actor_shape`]) and the held indexes' names. A
@@ -221,6 +239,8 @@ pub struct OwedActor {
     ready: RefCell<bool>,
     /// HIGH-4: this isolate rebuilt the actor under a new digest; its bootstrap's alarm is set at the next await.
     rebuilt: RefCell<bool>,
+    /// The third delta lens's LOW-2: this isolate's schema plan did not apply whole; counted at the next await.
+    schema_partial: RefCell<bool>,
     bars: RefCell<Bars>,
     last_kv_ms: RefCell<Option<u64>>,
 }
@@ -233,6 +253,7 @@ impl DurableObject for OwedActor {
             turn: futures_util::lock::Mutex::new(()),
             ready: RefCell::new(false),
             rebuilt: RefCell::new(false),
+            schema_partial: RefCell::new(false),
             bars: RefCell::default(),
             last_kv_ms: RefCell::new(None),
         }
@@ -359,7 +380,10 @@ impl DurableObject for OwedActor {
                     console_log!("{line}");
                     if let Ok(record) = crate::routes::D1Sql::of(&self.env) {
                         record
-                            .counters(vec![(COUNTERS[18].into(), window.counted)])
+                            .counters(vec![
+                                (COUNTERS[18].into(), window.counted),
+                                (COUNTERS[19].into(), window.parked_counted),
+                            ])
                             .await;
                     }
                 }
@@ -422,7 +446,7 @@ impl OwedActor {
             }
             // NEW2-L4: `digest` and `shape` are stamped only when the whole plan applied; this instance does not
             // run the plan again (`ready`), its next instance does.
-            ensure_schema(
+            let whole = ensure_schema(
                 &plan,
                 |s| {
                     local
@@ -442,6 +466,9 @@ impl OwedActor {
                     );
                 },
             );
+            if !whole {
+                *self.schema_partial.borrow_mut() = true;
+            }
             *self.ready.borrow_mut() = true;
         }
         local
@@ -451,6 +478,12 @@ impl OwedActor {
     /// until it ends.
     async fn rearm_after_rebuild(&self) {
         let _ = self.local();
+        // LOW-2: a plan that did not apply whole is counted once an instance.
+        if self.schema_partial.replace(false) {
+            if let Ok(record) = crate::routes::D1Sql::of(&self.env) {
+                record.counters(vec![(COUNTERS[20].into(), 1)]).await;
+            }
+        }
         if self.rebuilt.replace(false) && self.meta(META_BOOT_CURSOR).is_some() {
             let _ = self
                 .state
