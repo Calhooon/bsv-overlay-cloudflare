@@ -1004,14 +1004,10 @@ pub async fn handfile_post(
             refund_valid,
         ));
         crate::record_post::note_enqueue(crate::owed_events::publish_noted(&ctx.env).await);
-        crate::owed_actor::object::schedule_direct(
-            ctx,
-            vec![VerifiedRecord::Potrefund(
-                verified.potrefund.clone(),
-                refund_valid,
-            )],
-            worker::Date::now().as_millis(),
-        );
+        // D2-ACTOR-D (bsv-low #952): the published events' actors called directly after the answer (one site).
+        if let Some(wait) = &ctx.data.wait {
+            crate::owed_events::schedule_direct(&ctx.env, wait);
+        }
     } else {
         crate::record_post::detached::schedule(
             ctx,

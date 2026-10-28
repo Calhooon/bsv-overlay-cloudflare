@@ -681,6 +681,61 @@ impl FlushPort for WorkerFlush<'_> {
     }
 }
 
+/// D2-ACTOR-D: the most events one `/internal/owed-direct` body carries.
+pub const OWED_DIRECT_BODY_MAX: usize = 64;
+/// The wall of one hand-off POST (the app layer answers before it calls any actor).
+pub const OWED_DIRECT_POST_WALL_MS: u64 = 2_000;
+/// D2-ACTOR-D (bsv-low #952; the design's bar 2 as amended: "the writer calls the identity's actor directly after its
+/// answer, the queue is the durable backstop"): the overlay's flush point hands its published events (the direct set
+/// `owed_events::publish_env` held, [`crate::owed_events::take_direct`]) to the app layer, which calls each identity's
+/// actor (`POST /internal/owed-direct`, answered 202 at once, the calls after its answer). Chunked at
+/// [`OWED_DIRECT_BODY_MAX`]; each POST raced against [`OWED_DIRECT_POST_WALL_MS`]. A POST that walls or is refused is
+/// counted `owed_actor_direct_faults_total` and logged: never a fault of the write (its queue messages were sent).
+pub async fn ship_owed_direct(env: &Env) {
+    let events = crate::owed_events::take_direct();
+    if events.is_empty() {
+        return;
+    }
+    let Some((url, token)) = configured(env) else {
+        console_log!(
+            "[owed-direct] not configured (APP_LAYER_URL / INTERNAL_TOKEN): {} event(s) left to the queue",
+            events.len()
+        );
+        return;
+    };
+    let mut faults = 0u64;
+    for chunk in events.chunks(OWED_DIRECT_BODY_MAX) {
+        let body =
+            serde_json::json!({"events": chunk.iter().map(|e| e.encode()).collect::<Vec<_>>()})
+                .to_string();
+        let post = std::pin::pin!(post_body_answer(
+            env,
+            &url,
+            &token,
+            "/internal/owed-direct",
+            "owed-direct",
+            body
+        ));
+        let wall = std::pin::pin!(Delay::from(std::time::Duration::from_millis(
+            OWED_DIRECT_POST_WALL_MS
+        )));
+        match futures_util::future::select(post, wall).await {
+            futures_util::future::Either::Left((Ok(_), _)) => {}
+            futures_util::future::Either::Left((Err(()), _)) => faults += 1,
+            futures_util::future::Either::Right(_) => {
+                console_log!(
+                    "[owed-direct] the hand-off passed its {OWED_DIRECT_POST_WALL_MS} ms wall: {} event(s) left to the queue",
+                    chunk.len()
+                );
+                faults += 1;
+            }
+        }
+    }
+    if faults > 0 {
+        crate::owed_events::bump(env, &[("owed_actor_direct_faults_total", faults)]).await;
+    }
+}
+
 /// Run a future that never waits on anything outside itself (the pins' fake transports) to its answer.
 #[cfg(test)]
 pub(crate) fn run<F: Future>(fut: F) -> F::Output {

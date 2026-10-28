@@ -709,6 +709,8 @@ pub async fn tip_changed(mut req: Request, env: &Env, ctx: &Context) -> Result<R
                     &[("tip", "gate".to_string()), ("tip", "untipped".to_string())],
                 )
                 .await;
+                // D2-ACTOR-D (bsv-low #952): the block's gate events' actors called after the answer.
+                crate::owed_events::schedule_direct(env, ctx);
             }
             Err(error) => console_log!("[owed] tip marking failed: {error}"),
         }

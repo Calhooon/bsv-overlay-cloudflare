@@ -934,6 +934,8 @@ pub async fn ingest(
     .await?;
     if queued {
         crate::owed_events_publish::publish_before_answer(env, Vec::new()).await;
+        // D2-ACTOR-D (bsv-low #952): the landed word's events' actors called after the answer.
+        crate::owed_events::schedule_direct(env, ctx);
     }
     worker::Response::from_json(&answer)
 }
@@ -1009,6 +1011,8 @@ pub async fn tick(env: &worker::Env) -> worker::Result<()> {
     }
     // bsv-low #911: the tick's word events, at its end
     crate::owed_events_publish::publish_env(env, Vec::new()).await;
+    // D2-ACTOR-D (bsv-low #952): their actors called inline (the scheduled pass waits on nobody's answer).
+    crate::owed_events::direct_held(env).await;
     Ok(())
 }
 

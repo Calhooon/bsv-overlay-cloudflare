@@ -28,6 +28,23 @@ use std::collections::BTreeMap;
 /// (pinned by `d2_actor_a_fold_m1_*`).
 pub const CONSUMER_MAX_CONCURRENCY: u32 = 1;
 
+/// D2-ACTOR-D (bsv-low #952): the render's knob of the consumer's concurrency (`[vars]`), moved by the cutover doc with
+/// the phase and pinned equal to each render's `max_concurrency`. A value past 1 is honoured only with the D1 judge
+/// OFF (Phase C: the actor is the one writer, each identity serialised by its own Durable Object); with it on (Phases
+/// A and B) two consumers are two D1 writers of one identity's rows, so the consumer counts and logs the refusal
+/// (every batch, [`consumer_concurrency_refused`]) and the cutover must not deploy it.
+pub const CONSUMER_CONCURRENCY_VAR: &str = "OWED_CONSUMER_CONCURRENCY";
+/// PURE: the knob's value (a missing or malformed var is 1).
+pub fn consumer_concurrency_of(var: Option<&str>) -> u32 {
+    var.and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1)
+}
+/// PURE: is a consumer concurrency of `n` refused under the phase (`d1_judges`: Phases A and B)?
+pub fn consumer_concurrency_refused(n: u32, d1_judges: bool) -> bool {
+    n > CONSUMER_MAX_CONCURRENCY && d1_judges
+}
+
 /// The pair's marks, oldest generation first (`idx_owed_dirty_source_key`; the source filtered in the index's row),
 /// the marks of a HELD subject left out (D2-ACTOR-A-DELTA-2's NEW2-M1: its subject memo's hold runs past `?4`, one
 /// primary-key probe of `owed_belt_state` a mark), so a held subject never takes a place of the 64.
@@ -368,14 +385,17 @@ pub async fn deliver(
         return crate::owed_actor::actor_then_d1(db, identity, games).await;
     }
     if db.d1_judges() {
-        // D2-ACTOR-B-FOLD-8 (the captain's item 11): the acknowledgement's bound read BEFORE the D1 judge, as Phase B
-        // reads it before the actor, so the compare counts a game marked between the two judges apart.
-        let bound = owed_judge::marks_bound(db, identity, games).await.ok();
-        let report = owed_judge::judge_subjects(db, identity, games, "owed-events").await?;
+        // D2-ACTOR-D (bsv-low #952): the acknowledgement's bound read BEFORE the D1 judge (NEW-H1's rule, as Phase B):
+        // the D1 judge acknowledges at most it, and the actor's apply names it, so a delivery the writer's direct call
+        // already covered is a dupe the actor answers from its seq check in milliseconds, never a mark acknowledged
+        // past what the covering apply read.
+        let bound = owed_judge::marks_bound(db, identity, games).await?;
+        let report =
+            owed_judge::judge_subjects_acked_to(db, identity, games, "owed-events", bound).await?;
         // The D2-ACTOR-B lens's MEDIUM-6: Phase A's apply and compare run after the batch (`ctx.wait_until`), never
         // inline in the serial consumer; inline only where it cannot be deferred.
-        if !db.defer_actor(identity, games, bound) {
-            crate::owed_actor::beside(db, identity, games, bound).await;
+        if !db.defer_actor(identity, games, Some(bound)) {
+            crate::owed_actor::beside(db, identity, games, Some(bound)).await;
         }
         return Ok(report);
     }
@@ -412,6 +432,14 @@ impl Plan {
         self.order.is_empty() && !self.more
     }
 
+    /// D2-ACTOR-D: the plan's subjects, each identity's games in the plan's order.
+    pub fn subjects(&self) -> Vec<(String, Vec<String>)> {
+        self.order
+            .iter()
+            .map(|id| (id.clone(), self.games.get(id).cloned().unwrap_or_default()))
+            .collect()
+    }
+
     /// What an empty plan answers: nothing judged, its held subjects counted.
     pub fn empty_routed(&self) -> Routed {
         Routed {
@@ -443,6 +471,12 @@ pub async fn route(db: &impl JudgeDb, ev: &OwedEvent) -> Result<Routed, String> 
 /// The marks of one event, read (a wanted envelope expanded) into its subjects, before any judge: the consumer reads
 /// the chain tip only for a plan that holds one (the D2-ACTOR-A lens's LOW-6).
 pub async fn plan(db: &impl SqlPort, ev: &OwedEvent) -> Result<Plan, String> {
+    plan_with(db, ev, true).await
+}
+
+/// [`plan`], with or without the wanted envelopes' expansion (a write: the consumer's alone; the writer's direct call
+/// reads the marks and writes nothing, D2-ACTOR-D).
+pub async fn plan_with(db: &impl SqlPort, ev: &OwedEvent, expand: bool) -> Result<Plan, String> {
     if ev.source == owed_event::TXFACTS {
         return Ok(Plan::default());
     }
@@ -502,7 +536,7 @@ pub async fn plan(db: &impl SqlPort, ev: &OwedEvent) -> Result<Plan, String> {
             ))
         })
         .collect();
-    for (identity, generation) in &envelopes {
+    for (identity, generation) in envelopes.iter().filter(|_| expand) {
         owed_judge::expand_wanted(db, identity, *generation).await?;
         let expanded = rows(
             db,
@@ -935,6 +969,8 @@ pub async fn sweep_publish(env: &worker::Env) -> Result<usize, String> {
         return Err("no owed-events binding".into());
     };
     let report = publish::publish_with(&port, notes_of(&pairs)).await;
+    // D2-ACTOR-D (bsv-low #952): the re-published pairs' actors called inline (the scheduled drain's own pass).
+    direct_events(env, report.sent.clone()).await;
     publish::bump(
         env,
         &[
@@ -1062,6 +1098,9 @@ pub async fn consume_one(env: &worker::Env, ev: &OwedEvent) -> Result<Routed, St
         publish::note(&ev.source, &ev.source_key);
         publish::publish_env(env, Vec::new()).await;
     }
+    // D2-ACTOR-D: the consumer IS this event's delivery; what it published (a continuation, a frame's own word) is
+    // the queue's alone, never held for a direct call by a later request of this isolate.
+    let _ = publish::take_direct();
     Ok(routed)
 }
 
@@ -1073,6 +1112,23 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
         return park_dead_letters(&batch, &env).await;
     }
     let now = worker::Date::now().as_millis() as i64;
+    // D2-ACTOR-D: a render that raised the consumer's concurrency while the D1 judge writes is named on every batch.
+    let concurrency = consumer_concurrency_of(
+        env.var(CONSUMER_CONCURRENCY_VAR)
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    );
+    let d1_judges = crate::owed_actor::flag_on(
+        env.var(crate::owed_actor::D1_JUDGE_FLAG)
+            .ok()
+            .map(|v| v.to_string()),
+    );
+    if consumer_concurrency_refused(concurrency, d1_judges) {
+        worker::console_warn!(
+            "[owed-events] {CONSUMER_CONCURRENCY_VAR}={concurrency} with the D1 judge ON: two consumers are two D1 writers of one identity's rows; set it to 1 until Phase C"
+        );
+    }
     let mut oldest_age: i64 = 0;
     let mut deltas: BTreeMap<&str, u64> = BTreeMap::new();
     let mut messages = 0u64;
@@ -1303,4 +1359,210 @@ pub async fn health_and_actor(db: &impl SqlPort, dirty: &Value) -> (Value, Optio
         "totals": "/health/invariants.owedEvents",
     });
     (body, actor)
+}
+
+// ---- D2-ACTOR-D (bsv-low #952; the design's section 7, bar 2 as amended 2026-10-27): THE DIRECT CALL ----
+//
+// "The writer calls the identity's actor directly after its answer, the queue is the durable backstop." Every event a
+// publish SENT is held in the invocation's direct set (`owed_events_publish::hold_direct`, inside `publish_env`, the
+// one function every owed frame of both Workers passes); the invocation's flush point hands the set here: the app
+// layer's writers through [`schedule_direct`] (`wait_until` after the answer: the record door, the handfile batch,
+// the pot-, hop- and tip-changed hooks, the word ingest) or [`direct_held`] inline (the scheduled word tick), the
+// overlay's through `POST /internal/owed-direct` ([`direct_route`], its `APP_LAYER` binding, from its own flush
+// points). Each event's subjects are read from its marks ([`plan_with`], no envelope expanded, no write), and each
+// identity's actor is called with the event's kind, seq and write time ([`crate::owed_actor::apply_body`], no bound:
+// a direct call always applies), all identities at once, each call under `DIRECT_CALL_WALL_MS`. A call that walls is
+// counted `owed_actor_direct_walls_total`, one that faults `owed_actor_direct_faults_total`, every call
+// `owed_actor_direct_calls_total`; none fails the write (the write committed and answered before). The queue message
+// goes regardless; its delivery names the consumer's acknowledgement bound, so a delivery the direct call covered is a
+// DUPE the actor answers from its seq check (`owed_actor::COVERED_SQL`). A `word` event carrying a frame is left to
+// the consumer: its ingest is the tracker's own write (its marks do not exist until then).
+
+/// The most events one direct pass calls (past it the queue alone carries the rest, counted in the report).
+pub const DIRECT_EVENTS_MAX: usize = 64;
+
+/// What one direct pass did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DirectReport {
+    pub events: usize,
+    pub calls: u64,
+    pub walls: u64,
+    pub faults: u64,
+    pub held: u64,
+    /// Events past [`DIRECT_EVENTS_MAX`] or carrying a frame: the queue's alone.
+    pub left_to_queue: usize,
+}
+
+/// PURE: a direct call's error is its WALL (`object::call_apply`'s "no answer in" words), else a fault.
+pub fn is_wall(e: &str) -> bool {
+    e.contains("no answer in")
+}
+
+/// The direct pass's port: the marks' read and the actor's call.
+#[allow(async_fn_in_trait)]
+pub trait DirectPort {
+    /// The event's subjects from its marks (no write).
+    async fn subjects(&self, ev: &OwedEvent) -> Result<Vec<(String, Vec<String>)>, String>;
+    /// One apply body to the identity's actor, under the direct call's wall.
+    async fn call(&self, body: Value) -> Result<Value, String>;
+}
+
+/// THE DIRECT PASS over a port: every event's subjects, then every identity's call at once, counted; answers are
+/// noted into the `direct` class (an applied first apply samples the rows' visibility once).
+pub async fn direct_with(
+    port: &impl DirectPort,
+    events: Vec<OwedEvent>,
+    tip: Option<u64>,
+) -> DirectReport {
+    let mut report = DirectReport::default();
+    let mut bodies: Vec<Value> = Vec::new();
+    for (n, ev) in events.into_iter().enumerate() {
+        if n >= DIRECT_EVENTS_MAX || ev.frame().is_some() || ev.source == owed_event::TXFACTS {
+            report.left_to_queue += 1;
+            continue;
+        }
+        report.events += 1;
+        let Ok(subjects) = port.subjects(&ev).await else {
+            report.left_to_queue += 1;
+            continue;
+        };
+        let e = crate::owed_actor::EventCtx::of(&ev);
+        for (identity, games) in subjects {
+            for chunk in games.chunks(crate::owed_actor::GAMES_PER_APPLY) {
+                bodies.push(crate::owed_actor::apply_body(&identity, chunk, &e, tip));
+            }
+        }
+    }
+    report.calls = bodies.len() as u64;
+    let answers = futures_util::future::join_all(bodies.into_iter().map(|b| port.call(b))).await;
+    for answer in answers {
+        match answer {
+            // D2-ACTOR-B-FOLD-7: a held answer is neither a fault nor a sample (the actor counts it).
+            Ok(a) if crate::owed_actor::is_held(&a) => report.held += 1,
+            Ok(a) => crate::owed_actor::note_answer_as("direct", &a),
+            Err(e) if is_wall(&e) => report.walls += 1,
+            Err(_) => report.faults += 1,
+        }
+    }
+    report
+}
+
+/// The Worker's direct port: D1's marks and the actor's binding.
+pub(crate) struct WorkerDirect {
+    pub(crate) env: worker::Env,
+    pub(crate) sql: crate::routes::D1Sql,
+}
+impl DirectPort for WorkerDirect {
+    async fn subjects(&self, ev: &OwedEvent) -> Result<Vec<(String, Vec<String>)>, String> {
+        Ok(plan_with(&self.sql, ev, false).await?.subjects())
+    }
+    async fn call(&self, body: Value) -> Result<Value, String> {
+        crate::owed_actor::object::call_apply(
+            &self.env,
+            &body,
+            crate::owed_actor::DIRECT_CALL_WALL_MS,
+        )
+        .await
+    }
+}
+
+/// The direct pass over the Worker's bindings, its counters and the `direct` bars flushed. Nothing without the actor's
+/// binding (the queue alone).
+pub async fn direct_events(env: &worker::Env, events: Vec<OwedEvent>) -> DirectReport {
+    if events.is_empty() || env.durable_object(crate::owed_actor::BINDING).is_err() {
+        return DirectReport::default();
+    }
+    let Ok(sql) = crate::routes::D1Sql::of(env) else {
+        return DirectReport::default();
+    };
+    let tip = tip_memoised(env, false).await;
+    let port = WorkerDirect {
+        env: env.clone(),
+        sql,
+    };
+    let report = direct_with(&port, events, tip).await;
+    if report.walls + report.faults > 0 {
+        worker::console_warn!(
+            "[owed-actor] direct: {} call(s), {} walled, {} faulted (the queue's messages are their backstop)",
+            report.calls,
+            report.walls,
+            report.faults
+        );
+    }
+    let deltas: Vec<(String, u64)> = [
+        (crate::owed_actor::COUNTERS[3], report.calls),
+        (crate::owed_actor::COUNTERS[4], report.faults),
+        (crate::owed_actor::COUNTERS[25], report.walls),
+    ]
+    .into_iter()
+    .filter(|(_, d)| *d > 0)
+    .map(|(n, d)| (n.to_string(), d))
+    .collect();
+    port.sql.counters(deltas).await;
+    // MEDIUM-7: the direct class's samples into the fleet's durable bars.
+    crate::owed_actor::flush_bars(&port.sql, worker::Date::now().as_millis(), false).await;
+    report
+}
+
+/// The invocation's held direct set, called inline (the scheduled word tick: "inline on the scheduled drain").
+pub async fn direct_held(env: &worker::Env) -> DirectReport {
+    direct_events(env, publish::take_direct()).await
+}
+
+/// The invocation's held direct set, called after the answer (`wait_until`): never awaited by the write.
+pub fn schedule_direct(env: &worker::Env, ctx: &worker::Context) {
+    let events = publish::take_direct();
+    if events.is_empty() {
+        return;
+    }
+    let env = env.clone();
+    ctx.wait_until(async move {
+        direct_events(&env, events).await;
+    });
+}
+
+/// The most events one `/internal/owed-direct` body carries (the overlay's held set is at most
+/// `owed_events_publish::DIRECT_HELD_MAX`; it chunks at this).
+pub const DIRECT_BODY_MAX: usize = DIRECT_EVENTS_MAX;
+
+/// PURE: the events of an `/internal/owed-direct` body (`{"events": [<encoded event>, ...]}`, each the queue's own
+/// message text or its object), or why it is refused.
+pub fn parse_direct_body(raw: &[u8]) -> Result<Vec<OwedEvent>, &'static str> {
+    let v: Value = serde_json::from_slice(raw).map_err(|_| "body must be JSON")?;
+    let list = v["events"].as_array().ok_or("events must be an array")?;
+    if list.len() > DIRECT_BODY_MAX {
+        return Err("events names more than one body carries");
+    }
+    list.iter()
+        .map(|e| {
+            let text = match e {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            OwedEvent::decode(&text).map_err(|_| "an event does not read")
+        })
+        .collect()
+}
+
+/// `POST /internal/owed-direct` (bearer `INTERNAL_TOKEN`): the overlay's held direct set (D2-ACTOR-D). Answered 202 at
+/// once; the calls run after the answer (`wait_until`), so the overlay's flush waits on the hand-off alone.
+pub async fn direct_route(
+    mut req: worker::Request,
+    env: &worker::Env,
+    ctx: &worker::Context,
+) -> worker::Result<worker::Response> {
+    if !crate::internal_events::internal_bearer_ok(&req, env) {
+        return worker::Response::error("unauthorized", 401);
+    }
+    let raw = req.bytes().await?;
+    let events = match parse_direct_body(&raw) {
+        Ok(e) => e,
+        Err(why) => return worker::Response::error(why, 400),
+    };
+    let n = events.len();
+    let env = env.clone();
+    ctx.wait_until(async move {
+        direct_events(&env, events).await;
+    });
+    Ok(worker::Response::from_json(&json!({"accepted": n}))?.with_status(202))
 }

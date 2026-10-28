@@ -3051,6 +3051,8 @@ pub(crate) async fn internal_pot_changed(
     // (D2-ACTOR-A-FOLD-4: re-publishing the pairs cost the hook a seq bump and a read per outpoint for nothing).
     if crate::owed_events::configured(env).await {
         crate::owed_events::publish_noted(env).await;
+        // D2-ACTOR-D (bsv-low #952): what this invocation published, its actors called after the answer.
+        crate::owed_events::schedule_direct(env, ctx);
     } else {
         let tip = chaintracks_present_height_env(env, "owed").await.ok();
         let judge = crate::owed_judge::D1Judge::new(env, tip, written_off_before_ms_env(env))?;
@@ -3251,6 +3253,8 @@ pub(crate) async fn internal_hop_changed(
             .map(|id| (overlay_discovery::owed_event::ROUTE_IDENTITY, id.to_ascii_lowercase()))
             .collect();
         crate::owed_events::publish_pairs(env, &pairs).await;
+        // D2-ACTOR-D (bsv-low #952): the published identity routes' actors called after the answer.
+        crate::owed_events::schedule_direct(env, ctx);
     } else {
         let tip = chaintracks_present_height_env(env, "owed").await.ok();
         let judge = crate::owed_judge::D1Judge::new(env, tip, written_off_before_ms_env(env))?;

@@ -244,6 +244,21 @@ pub trait JudgeDb: SqlPort {
     ) -> Result<Option<Value>, String> {
         Ok(None)
     }
+    /// D2-ACTOR-D (bsv-low #952): [`JudgeDb::actor_deliver`] naming the delivery's acknowledgement `bound` (the
+    /// marks' greatest generation read before the call): a covered delivery is a DUPE the actor answers from its seq
+    /// check (`owed_actor::COVERED_SQL`). The default ignores the bound (always an apply).
+    async fn actor_deliver_bounded(
+        &self,
+        identity: &str,
+        games: &[String],
+        _bound: Option<i64>,
+    ) -> Result<Option<Value>, String> {
+        self.actor_deliver(identity, games).await
+    }
+    /// D2-ACTOR-D: the seq of the event this judge serves (the compare's one-in-eight sample), `None` without one.
+    fn event_seq(&self) -> Option<i64> {
+        None
+    }
     /// bsv-low #912 (Phase C's `belt-find`): the identity's actor applies the games as an event of `kind` (the belt's
     /// find handed back); `None` where no actor is bound.
     async fn actor_apply(
@@ -367,13 +382,25 @@ impl JudgeDb for D1Judge {
         identity: &str,
         games: &[String],
     ) -> Result<Option<Value>, String> {
+        self.actor_deliver_bounded(identity, games, None).await
+    }
+    fn event_seq(&self) -> Option<i64> {
+        self.event.as_ref().map(|e| e.seq)
+    }
+    async fn actor_deliver_bounded(
+        &self,
+        identity: &str,
+        games: &[String],
+        bound: Option<i64>,
+    ) -> Result<Option<Value>, String> {
         let Some(event) = &self.event else {
             return Ok(None);
         };
         if crate::owed_actor::object::stub_of(&self.sql.env, identity).is_none() {
             return Ok(None);
         }
-        let body = crate::owed_actor::apply_body(identity, games, event, self.tip);
+        let mut body = crate::owed_actor::apply_body(identity, games, event, self.tip);
+        body["bound"] = json!(bound);
         crate::owed_actor::object::call_apply(
             &self.sql.env,
             &body,
