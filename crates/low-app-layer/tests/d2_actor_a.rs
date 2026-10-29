@@ -116,12 +116,18 @@ async fn d2_actor_a_c_a_message_naming_more_than_64_games_is_split() {
 }
 
 /// (e) THE UN-ACKED SWEEP RE-PUBLISHES A MARK OLDER THAN A TICK AND NOTHING YOUNGER: the shipped `sweep` over the
-/// backlog index, then the shipped publish (seq and facts in one batch), the sent bodies recorded.
+/// backlog index, then the shipped publish (seq and facts in one batch), the sent bodies recorded. Amended by FIX-956
+/// (bsv-low #956): the consumer's horizon is past every mark (it judged a message published at `now`), so a tick-old
+/// mark reads lost; without the horizon only the long bound re-publishes (`owed_events::tests::s956_*`).
 #[tokio::test]
 async fn d2_actor_a_e_the_sweep_republishes_marks_older_than_a_tick_only() {
     let db = Db::new();
     let now = NOW as i64;
     let tick = owed_events::SWEEP_AFTER_MS;
+    db.exec(&format!(
+        "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:consumer','{{\"horizonMs\":{}}}',{now})",
+        now + tick
+    ));
     db.exec(&format!(
         "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('{ID}','g1','tip','gate',{}), ('{ID}','g2','tip','untipped',{}), ('{ID}','g3','age','age',{})",
         now - tick - 1,
@@ -170,8 +176,8 @@ fn d2_actor_a_e_the_sweep_takes_64_pairs_and_wraps() {
 }
 
 /// (g) A CANCELLED OR REFUSED PUBLISH LEAVES THE MARK AND THE SWEEP SHIPS IT: a record filing's source write marks
-/// its pair; the publish is refused (a Queues incident, a `wait_until` wall); one tick later the sweep re-publishes
-/// that pair, and the consumer routes it.
+/// its pair; the publish is refused (a Queues incident, a `wait_until` wall); the publisher's lost note (FIX-956) has
+/// the next sweep tick re-publish that pair, and the consumer routes it.
 #[tokio::test]
 async fn d2_actor_a_g_a_refused_publish_leaves_the_mark_and_the_sweep_ships_it() {
     let db = Db::new();
@@ -188,7 +194,7 @@ async fn d2_actor_a_g_a_refused_publish_leaves_the_mark_and_the_sweep_ships_it()
     };
     let report = publish::publish_with(&refused, vec![note.clone()]).await;
     assert!(report.fault.is_some());
-    assert_eq!(report.unsent, vec![note]);
+    assert_eq!(report.unsent, vec![note.clone()]);
     assert_eq!(
         db.int("SELECT COUNT(*) FROM owed_dirty"),
         1,
@@ -196,10 +202,14 @@ async fn d2_actor_a_g_a_refused_publish_leaves_the_mark_and_the_sweep_ships_it()
     );
     // the trigger dates its mark by the database's clock (the write's own time)
     let marked = db.int("SELECT markedAtMs FROM owed_dirty");
-    // inside the tick: nothing swept
-    assert!(owed_events::sweep(&db, marked).await.unwrap().is_empty());
-    // past the tick: the pair is re-published and routed
+    // FIX-956 (bsv-low #956): with no lost note and no consumer past it, a tick-old mark is NOT re-published (its
+    // message may still be in the queue); only the long bound would take it
     db.now.set((marked + owed_events::SWEEP_AFTER_MS + 1) as u64);
+    assert!(owed_events::sweep(&db, db.now.get() as i64).await.unwrap().is_empty());
+    // the publisher KNOWS it lost the pair (the send faulted): its lost note (`publish_env`'s step), and the next
+    // tick re-publishes the pair, whatever the horizon, and it is routed
+    assert_eq!(publish::write_lost(&refused, publish::lost_of(&report)).await, 1);
+    db.now.set((marked + owed_events::SWEEP_AFTER_MS + 2) as u64);
     let pairs = owed_events::sweep(&db, db.now.get() as i64).await.unwrap();
     assert_eq!(pairs, vec![("hop".to_string(), hop_key(&hop))]);
     let sent = RefCell::new(Vec::new());
