@@ -3,8 +3,8 @@
 // landed about 56 years out and none fired on beta (bootstraps 0, the budget row never written). On real workerd
 // (Miniflare, the tier's pinned wrangler), the production actor (`owed_actor_alarm_worker.mjs`, a read-only wrapper):
 //   (a) an armed bootstrap's alarm is stored within now + 2 s and FIRES: its first page runs (the fleet's budget row
-//       written in D1) and a seat under 16 games is bootstrapped within seconds;
-//   (b) a seat over 16 games: after the first page the stored alarm is within now + BOOTSTRAP_PAGE_DELAY_MS + 2 s and
+//       written in D1) and a seat under one page (32 games since FIX-962) is bootstrapped within seconds;
+//   (b) a seat over one page: after the first page the stored alarm is within now + BOOTSTRAP_PAGE_DELAY_MS + 2 s and
 //       the next page fires;
 //   (i) the captain's item 12, fold7_i: an actor ARMED UNDER A DEAD ALARM (its cursor set, its alarm set the way the old
 //       build set it, about 56 years out): one `/bootstrap` call stores an alarm within now + 2 s (`rearmed`), and it
@@ -67,8 +67,11 @@ try {
   }
   // Seats by their game count (the identity union the bootstrap pages), 66-hex keys only.
   const seats = (await db.prepare("SELECT identity,COUNT(DISTINCT gameId) AS n FROM (SELECT identity,gameId FROM potparty_records UNION SELECT identity,gameId FROM hopparty_records) WHERE length(identity)=66 GROUP BY identity ORDER BY n").all()).results
-  const small = seats.find(s => s.n >= 1 && s.n < 16)
-  const bigs = seats.filter(s => s.n > 16)
+  // FIX-962 (bsv-low #962): a page is 32 games and the pages 500 ms apart.
+  const PAGE_GAMES = 32
+  const PAGE_DELAY_MS = 500
+  const small = seats.find(s => s.n >= 1 && s.n < PAGE_GAMES)
+  const bigs = seats.filter(s => s.n > PAGE_GAMES)
   assert(small && bigs.length >= 2, `the fixture holds a seat under one page and two over it: ${JSON.stringify(seats.slice(0, 3))} .. ${seats.length}`)
   const big = bigs[0]
   const actor = id => ns.get(ns.idFromName(id))
@@ -94,7 +97,7 @@ try {
   const b = big.identity
   await actor(b).fetch('http://owed-actor/bootstrap', { method: 'POST', body: JSON.stringify({ identity: b }) })
   const paged = await poll('(b) the first page ran', async () => { const s = await pinState(b); return s.fired >= 1 && s.meta.bootCursor && s.meta.bootCursor.startsWith('[') && !s.meta.bootCursor.startsWith('[9223372036854775807') ? s : null })
-  within(paged, 1000, '(b) the next page')
+  within(paged, PAGE_DELAY_MS, '(b) the next page')
   const t1 = Date.now()
   const doneB = await poll('(b) every page fired', async () => { const s = await pinState(b); return s.meta.bootstrapped ? s : null }, 90000)
   console.log(`PASS fold7_h (b): ${b.slice(0, 10)}.. (${big.n} games) paged by its own alarms (${doneB.fired} fired), bootstrapped ${Date.now() - t1} ms after the first page`)
