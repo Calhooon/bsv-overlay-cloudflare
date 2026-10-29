@@ -1501,6 +1501,91 @@ pub const CONSUMER_MESSAGE_WALL_MS: u64 = 60_000;
 /// The delay a message past [`CONSUMER_MESSAGE_WALL_MS`] is handed back with.
 pub const CONSUMER_WALL_RETRY_S: u32 = 60;
 
+/// FIX-969 (bsv-low #969): a wall is the CONSUMER's time running out, never the event's fault, so a walled message
+/// does not spend the queue's `max_retries` (3, then the dead letter queue). Until this fix every walled message was
+/// handed back by `retry`: under a backlog a batch of 16 that met the wall four times (the message in flight AND the
+/// bystanders the pass never reached) dead-lettered all of them, parked with no fault recorded (L53: 30 parked at the
+/// fold; beta on 2026-10-29: 58 parked, every one `lastFault` null, `txfacts` events among them, which are never
+/// judged). Now a walled message is RE-QUEUED: its body sent again as a fresh message (its delivery count from 0)
+/// under the wall's delay, carrying [`WALLS_FIELD`] (an extra top-level key the event's decode ignores; the frozen v1
+/// bytes are unchanged for a message never walled), and the original acked. At most [`WALL_REQUEUES_MAX`] re-queues a
+/// message: past them (or when the send faults) it is handed back by `retry` as before, so the queue's 3 retries and
+/// the dead letter queue still bound it, and its letter carries `walls` (the class readable from the body). A subject
+/// that walls every time is held by its memo from its third wall and left out of the plan, so its messages are acked
+/// all-held, never re-queued for ever.
+pub const WALL_REQUEUES_MAX: u64 = 8;
+/// FIX-969: the top-level key of a re-queued body counting its walls.
+pub const WALLS_FIELD: &str = "walls";
+
+/// FIX-969: how a walled message leaves the consumer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WallCarriage {
+    /// Sent again as a fresh message (`body` carries `walls`), the original acked.
+    Requeue { body: String, walls: u64 },
+    /// Handed back by `retry` (it spends one of the queue's retries): past [`WALL_REQUEUES_MAX`], or a body that is
+    /// not a JSON object.
+    Retry,
+}
+
+/// PURE (FIX-969): the carriage of a walled message's body.
+pub fn wall_carriage(body: &str) -> WallCarriage {
+    let Ok(Value::Object(mut o)) = serde_json::from_str::<Value>(body) else {
+        return WallCarriage::Retry;
+    };
+    let walls = o.get(WALLS_FIELD).and_then(Value::as_u64).unwrap_or(0);
+    if walls >= WALL_REQUEUES_MAX {
+        return WallCarriage::Retry;
+    }
+    o.insert(WALLS_FIELD.into(), json!(walls + 1));
+    WallCarriage::Requeue {
+        body: Value::Object(o).to_string(),
+        walls: walls + 1,
+    }
+}
+
+/// FIX-969: the queue a walled message is re-sent to (the Worker's is the `OWED_EVENTS` binding).
+#[allow(async_fn_in_trait)]
+pub trait RequeuePort {
+    async fn send_delayed(&self, body: String, delay_s: u32) -> Result<(), String>;
+}
+
+/// FIX-969: what became of one walled message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handback {
+    /// Re-sent fresh: ack the original (`owed_events_wall_requeued_total`).
+    Requeued,
+    /// Hand it back by `retry` with the delay (`owed_events_wall_retried_total`): it spends a queue retry.
+    Retried,
+}
+
+/// FIX-969: the ONE decision every wall site calls (the coalesced batch's in-flight and bystander messages, the
+/// singles a walled batch leaves, the one-message arm): re-queue when [`wall_carriage`] says so and the send lands,
+/// else retry.
+pub async fn hand_back_walled(port: &impl RequeuePort, body: &str, delay_s: u32) -> Handback {
+    match wall_carriage(body) {
+        WallCarriage::Requeue { body, .. } => match port.send_delayed(body, delay_s).await {
+            Ok(()) => Handback::Requeued,
+            Err(_) => Handback::Retried,
+        },
+        WallCarriage::Retry => Handback::Retried,
+    }
+}
+
+/// FIX-969: the Worker's re-queue, the `OWED_EVENTS` producer binding.
+struct WorkerRequeue(Option<worker::Queue>);
+
+impl RequeuePort for WorkerRequeue {
+    async fn send_delayed(&self, body: String, delay_s: u32) -> Result<(), String> {
+        let q = self.0.as_ref().ok_or("no OWED_EVENTS binding")?;
+        let msg = worker::RawMessageBuilder::new(worker::wasm_bindgen::JsValue::from_str(&body))
+            .delay_seconds(delay_s)
+            .build_with_content_type(worker::QueueContentType::Text);
+        q.send_raw_batch(vec![msg]).await.map_err(|e| e.to_string())?;
+        crate::d1_ledger::note_queue_ops(1);
+        Ok(())
+    }
+}
+
 /// The `owed-events` consumer's handler of one decoded message: the frame's ingest, the routing and the judge, the
 /// continuation. `Err`: hand it back.
 pub async fn consume_one(env: &worker::Env, ev: &OwedEvent) -> Result<Routed, String> {
@@ -1929,12 +2014,14 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
         );
     }
     let mut oldest_age: i64 = 0;
-    let mut deltas: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut deltas: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut messages = 0u64;
     let mut resolved: Vec<Stmt> = Vec::new();
     let mut service_max: u64 = 0;
     // FIX-956: the greatest publish stamp among the messages this batch ACKNOWLEDGED (the consumer's horizon)
     let mut horizon: Option<i64> = None;
+    // FIX-969: a walled message is re-sent fresh on the producer binding
+    let requeue = WorkerRequeue(env.queue(publish::BINDING).ok());
     // D2-ACTOR-E (bsv-low #954) item 3: a batch of several messages is judged ONCE per identity first; a fault of
     // that pass hands the batch to the one-message path below (each message's own fault memo and wall).
     let raw: Vec<_> = batch.raw_iter().collect();
@@ -1992,7 +2079,10 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                             horizon = horizon.max(Some(ev.at_ms));
                             msg.ack();
                         }
-                        Fate::Retry { delay_s } => retry(*delay_s),
+                        // FIX-969: a wall's hand-back re-queues (never a spent retry)
+                        Fate::Retry { delay_s } => {
+                            hand_back_msg(msg, &requeue, delay_s.unwrap_or(0), &mut deltas).await
+                        }
                         Fate::Fault { delay_s } => {
                             *deltas.entry("owed_events_judge_faults_total").or_default() += 1;
                             if delay_s.is_some() {
@@ -2037,7 +2127,7 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                     // a walled batch spent its time: what the pass left waits for the next batch
                     for i in singles.drain(..) {
                         messages += 1;
-                        raw[i].retry();
+                        hand_back_msg(&raw[i], &requeue, 0, &mut deltas).await;
                     }
                 }
                 *deltas
@@ -2097,11 +2187,8 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                 // D2-ACTOR-B-FOLD-11: the one rule both arms call
                 delay = wall_fate(&sql, &[(&ev.source, &ev.source_key)], &in_flight).await;
             }
-            msg.retry_with_options(
-                &worker::QueueRetryOptionsBuilder::new()
-                    .with_delay_seconds(delay)
-                    .build(),
-            );
+            // FIX-969: re-queued, never a spent retry
+            hand_back_msg(msg, &requeue, delay, &mut deltas).await;
             continue;
         };
         match done {
@@ -2155,6 +2242,37 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
     )
     .await
 }
+
+/// FIX-969: one walled message handed back by [`hand_back_walled`], counted by its carriage.
+async fn hand_back_msg(
+    msg: &worker::RawMessage,
+    port: &WorkerRequeue,
+    delay_s: u32,
+    deltas: &mut BTreeMap<&'static str, u64>,
+) {
+    use worker::MessageExt;
+    let body = msg.body().as_string().unwrap_or_default();
+    match hand_back_walled(port, &body, delay_s).await {
+        Handback::Requeued => {
+            *deltas.entry(COUNTER_WALL_REQUEUED).or_default() += 1;
+            msg.ack();
+        }
+        Handback::Retried => {
+            *deltas.entry(COUNTER_WALL_RETRIED).or_default() += 1;
+            msg.retry_with_options(
+                &worker::QueueRetryOptionsBuilder::new()
+                    .with_delay_seconds(delay_s)
+                    .build(),
+            );
+        }
+    }
+}
+
+/// FIX-969: walled messages re-sent fresh (each one; `owed_events_consumer_wall_drops_total` counts the walls).
+pub const COUNTER_WALL_REQUEUED: &str = "owed_events_wall_requeued_total";
+/// FIX-969: walled messages handed back by `retry` (past [`WALL_REQUEUES_MAX`], or a faulted send): these spend the
+/// queue's retries and may become letters.
+pub const COUNTER_WALL_RETRIED: &str = "owed_events_wall_retried_total";
 
 /// PURE (FIX-956): the consumer row's cursor of one batch (`horizon`: the greatest publish stamp it acknowledged;
 /// [`CONSUMER_ROW_SQL`] keeps the row's when this is lower or absent).

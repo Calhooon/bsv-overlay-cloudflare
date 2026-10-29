@@ -1455,3 +1455,155 @@ async fn fold11_d_an_all_held_message_resolves_nothing_inside_a_batch() {
     assert_eq!(rows_of(&db, ID, "live"), 1);
     assert_eq!(rows_of(&db, ID, "heldgame"), 0);
 }
+
+/// FIX-969 (bsv-low #969): the queue's deliveries of ONE message modelled over the SHIPPED wall decision
+/// (`hand_back_walled`) and the DLQ's park (`park_letter`): 1 + `max_retries` (3) deliveries of a message spend its
+/// retries, the fifth delivery is the dead letter queue's. `walls_before_landing`: how many deliveries in a row meet
+/// the consumer's wall before one lands. Answers (re-queues, retries spent, parked).
+struct Requeues(RefCell<Vec<(String, u32)>>, bool);
+
+impl owed_events::RequeuePort for Requeues {
+    async fn send_delayed(&self, body: String, delay_s: u32) -> Result<(), String> {
+        if self.1 {
+            return Err("the send faulted".into());
+        }
+        self.0.borrow_mut().push((body, delay_s));
+        Ok(())
+    }
+}
+
+async fn deliver_walled(db: &Db, body: &str, walls_before_landing: u32, port: &Requeues) -> (u32, u32, bool) {
+    use owed_events::Handback;
+    let (mut requeued, mut retries) = (0u32, 0u32);
+    // the message on the queue: its body and the platform's delivery count (a fresh message starts at 0)
+    let (mut body, mut attempts) = (body.to_string(), 0u32);
+    for wall in 0..walls_before_landing + 20 {
+        if wall >= walls_before_landing {
+            return (requeued, retries, false); // this delivery landed: acked
+        }
+        attempts += 1;
+        let ev = OwedEvent::decode(&body).expect("a re-queued body still decodes");
+        let _ = owed_events::wall_fate(db, &[(&ev.source, &ev.source_key)], &[]).await;
+        match owed_events::hand_back_walled(port, &body, owed_events::CONSUMER_WALL_RETRY_S).await {
+            Handback::Requeued => {
+                requeued += 1;
+                body = port.0.borrow().last().unwrap().0.clone();
+                attempts = 0;
+            }
+            Handback::Retried => {
+                retries += 1;
+                if attempts > 3 {
+                    // max_retries spent: the dead letter queue's delivery parks it
+                    owed_events::park_letter(db, "m1", &body).await.unwrap();
+                    return (requeued, retries, true);
+                }
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// FIX-969 (a): A WALLED MESSAGE IS RE-QUEUED FRESH, NEVER PARKED. A message that meets the consumer's message wall
+/// six times in a row under a backlog (each wall a batch past `CONSUMER_MESSAGE_WALL_MS`), then lands: re-queued six
+/// times, no queue retry spent, no letter; the re-queued body decodes to the same event (the frozen v1 bytes plus the
+/// `walls` key). The base rule (every wall a `retry`) parks it at its fourth wall: RED on 149869bf (the API is new),
+/// and with `wall_carriage` answering `Retry` alone: `left: (0, 4, true) right: (6, 0, false)`.
+#[tokio::test(flavor = "current_thread")]
+async fn fix969_a_a_walled_message_is_requeued_never_a_spent_retry() {
+    let db = Db::new();
+    let ev = event("txfacts", "aa".repeat(32).as_str());
+    let body = ev.encode();
+    let port = Requeues(RefCell::new(Vec::new()), false);
+    assert_eq!(deliver_walled(&db, &body, 6, &port).await, (6, 0, false));
+    assert_eq!(db.int("SELECT COUNT(*) FROM owed_event_dead_letters"), 0);
+    let sent = port.0.borrow();
+    let last: serde_json::Value = serde_json::from_str(&sent[5].0).unwrap();
+    assert_eq!(last[owed_events::WALLS_FIELD], 6);
+    assert_eq!(sent[5].1, owed_events::CONSUMER_WALL_RETRY_S, "under the wall's delay");
+    let again = OwedEvent::decode(&sent[5].0).unwrap();
+    assert_eq!((again.seq, again.source, again.source_key, again.at_ms), (ev.seq, ev.source.clone(), ev.source_key.clone(), ev.at_ms));
+    // an unwalled event's bytes are the frozen v1 bytes: no `walls` key until its first wall
+    assert!(!body.contains("\"walls\""));
+    assert_eq!(
+        owed_events::wall_carriage("not an event"),
+        owed_events::WallCarriage::Retry,
+        "a body that is not an object keeps the queue's retry"
+    );
+}
+
+/// FIX-969 (b): THE BOUND, AND A TRUE FAULT KEEPS ITS PARK. A message that walls for ever is re-queued
+/// `WALL_REQUEUES_MAX` (8) times, then handed back by `retry`: the queue's 3 retries, then the dead letter queue parks
+/// it ON ITS FOURTH such delivery, the letter's body carrying `walls: 8` and its `lastFault` the wall's ("the
+/// consumer's message wall", the pair's memo): a WALL letter, readable as such. A send that faults falls back to the
+/// retry. A judge fault is never re-queued (its arm hands back by `retry`, unchanged): its letter is parked with the
+/// judge's own text and no `walls`.
+#[tokio::test(flavor = "current_thread")]
+async fn fix969_b_the_bound_and_a_fault_letter_keeps_its_park() {
+    let db = Db::new();
+    let ev = event("pot", &hop_key(&owed_db::hop(3)));
+    let port = Requeues(RefCell::new(Vec::new()), false);
+    let (requeued, retries, parked) = deliver_walled(&db, &ev.encode(), u32::MAX - 30, &port).await;
+    assert_eq!((requeued, retries, parked), (owed_events::WALL_REQUEUES_MAX as u32, 4, true));
+    let letter: serde_json::Value =
+        serde_json::from_str(&db.text("SELECT body FROM owed_event_dead_letters").unwrap()).unwrap();
+    assert_eq!(letter[owed_events::WALLS_FIELD], owed_events::WALL_REQUEUES_MAX);
+    assert_eq!(
+        db.text("SELECT lastFault FROM owed_event_dead_letters").as_deref(),
+        Some("the consumer's message wall")
+    );
+    // a faulted send: the retry (its retries spent as before the fix)
+    let down = Requeues(RefCell::new(Vec::new()), true);
+    assert_eq!(
+        owed_events::hand_back_walled(&down, &ev.encode(), 60).await,
+        owed_events::Handback::Retried
+    );
+    // a true fault: the judge's text on the pair's memo, then its park (the fault arm is unchanged)
+    let db = Db::new();
+    let fault = event("hop", &hop_key(&owed_db::hop(4)));
+    owed_events::fault_fate(&db, &fault.source, &fault.source_key, "a row write faulted").await;
+    owed_events::park_letter(&db, "f1", &fault.encode()).await.unwrap();
+    assert_eq!(
+        db.text("SELECT lastFault FROM owed_event_dead_letters").as_deref(),
+        Some("a row write faulted")
+    );
+    assert!(!db.text("SELECT body FROM owed_event_dead_letters").unwrap().contains("\"walls\""));
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let src = squash(include_str!("../src/owed_events.rs"));
+    assert!(
+        src.contains("Fate::Fault{delay_s}=>{*deltas.entry(\"owed_events_judge_faults_total\").or_default()+=1;ifdelay_s.is_some(){*deltas.entry(\"owed_events_fault_held_total\").or_default()+=1;}retry(*delay_s);}"),
+        "a judge fault keeps the queue's retry (its park)"
+    );
+}
+
+/// FIX-969 (c): THE WIRING AND THE COUNTERS. Every wall site of the consumer (the coalesced batch's walled fates, the
+/// singles a walled batch leaves, the one-message arm) hands back through `hand_back_msg` (the shipped
+/// `hand_back_walled`), never `retry` alone; each carriage is counted apart (`owed_events_wall_requeued_total`, and
+/// `owed_events_wall_retried_total` for those that spend a queue retry), beside `owed_events_consumer_wall_drops_total`
+/// (one a wall), every name seeded by the overlay. RED on 149869bf (the API does not compile there); with the walled
+/// singles put back to `retry` alone: "the singles a walled batch leaves re-queue".
+#[test]
+fn fix969_c_every_wall_site_requeues_and_counts_apart() {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let src = squash(include_str!("../src/owed_events.rs"));
+    assert!(
+        src.contains("Fate::Retry{delay_s}=>{hand_back_msg(msg,&requeue,delay_s.unwrap_or(0),&mutdeltas).await}"),
+        "the coalesced wall re-queues"
+    );
+    assert!(
+        src.contains("foriinsingles.drain(..){messages+=1;hand_back_msg(&raw[i],&requeue,0,&mutdeltas).await;}"),
+        "the singles a walled batch leaves re-queue"
+    );
+    assert!(
+        src.contains("hand_back_msg(msg,&requeue,delay,&mutdeltas).await;continue;"),
+        "the one-message wall re-queues"
+    );
+    assert!(!src.contains("raw[i].retry();}"), "no walled single spends a retry");
+    assert!(src.contains("matchhand_back_walled(port,&body,delay_s).await{Handback::Requeued=>{*deltas.entry(COUNTER_WALL_REQUEUED).or_default()+=1;msg.ack();}Handback::Retried=>{*deltas.entry(COUNTER_WALL_RETRIED).or_default()+=1;"));
+    for name in [
+        owed_events::COUNTER_WALL_REQUEUED,
+        owed_events::COUNTER_WALL_RETRIED,
+        "owed_events_consumer_wall_drops_total",
+    ] {
+        assert!(publish::COUNTERS.contains(&name), "{name} seeded");
+    }
+}

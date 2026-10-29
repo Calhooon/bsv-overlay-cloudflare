@@ -126,7 +126,7 @@ pub const COUNTER_SKIPPED: &str = "owed_events_publish_skipped_total";
 /// Publishes that faulted (the D1 batch or the send): their marks wait for the sweep.
 pub const COUNTER_FAULTS: &str = "owed_events_publish_faults_total";
 /// Every counter this module and the consumer write, for the seeds.
-pub const COUNTERS: [&str; 25] = [
+pub const COUNTERS: [&str; 27] = [
     COUNTER_PUBLISHED,
     COUNTER_SKIPPED,
     COUNTER_FAULTS,
@@ -159,6 +159,10 @@ pub const COUNTERS: [&str; 25] = [
     COUNTER_SWEEP_LOST,
     COUNTER_LOST_NOTED,
     COUNTER_DIRECT_ACKED,
+    // FIX-969 (bsv-low #969): a walled message re-sent fresh (never a spent queue retry), and one handed back by
+    // `retry` past the app layer's re-queue bound or on a faulted send (these may become letters)
+    "owed_events_wall_requeued_total",
+    "owed_events_wall_retried_total",
 ];
 /// FIX-956: a pair re-published because the consumer's horizon passed its mark (the consumer has moved past it and
 /// it is still un-acked: its message was lost).

@@ -394,6 +394,9 @@ pub fn owed_events_view(
         "subjectFaults": c("owed_events_subject_faults_total"),
         "subjectHeld": c("owed_events_subject_held_total"),
         "consumerWallDrops": c("owed_events_consumer_wall_drops_total"),
+        // FIX-969: the walled messages re-queued apart from those that spent a queue retry (a letter's road)
+        "wallRequeued": c("owed_events_wall_requeued_total"),
+        "wallRetried": c("owed_events_wall_retried_total"),
         "deadLettersStaleReturned": c("owed_events_dead_letters_stale_returned_total"),
         "deadLettersDiscarded": c("owed_events_dead_letters_discarded_total"),
         "oldestEnqueueAgeMs": state["consumer"]["oldestEnqueueAgeMs"].clone(),
