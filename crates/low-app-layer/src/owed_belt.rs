@@ -1442,7 +1442,10 @@ pub async fn drain_env(
                 .await
                 .map_err(worker::Error::RustError)?;
             worker::console_log!("[owed-events] sweep: {swept} pair(s) re-published");
-            return Ok(owed_judge::DrainReport::default());
+            return Ok(owed_judge::DrainReport {
+                swept,
+                ..Default::default()
+            });
         }
         owed_judge::drain_dirty(&judge, owed_judge::OWED_DIRTY_SUBJECTS_PER_PASS)
             .await.map_err(worker::Error::RustError)
@@ -1480,9 +1483,14 @@ pub async fn alarm_env(
         let _turn = turn.lock().await;
         meter.phase("owed.drain", drain_env(env, false)).await
     };
+    // D2-ACTOR-B-FOLD-16 (NEW9-L1): a drain that did work counts in the invocation's statement bound: the re-judge then
+    // makes one judge call at most and the reconcile yields. A drain that faulted or reached its wall is counted busy.
+    let drain_bound = drained
+        .as_ref()
+        .map_or(true, |r| r.swept > 0 || r.subjects > 0);
     let drain = match drained {
         Ok(report) => {
-            serde_json::json!({"subjects": report.subjects, "faults": report.faults.len()})
+            serde_json::json!({"subjects": report.subjects, "faults": report.faults.len(), "swept": report.swept})
         }
         Err(error) => {
             worker::console_warn!("[owed] alarm drain deferred: {error}");
@@ -1499,16 +1507,19 @@ pub async fn alarm_env(
             serde_json::json!({"error": error})
         }
     };
-    // D2-ACTOR-B-FOLD-13 (bsv-low #958): D1's fleet re-judge after a judge-version move, paced (FOLD-15: 16 games,
-    // one judge call and at most 32 identities a tick), BEFORE the reconcile so the sampler compares a re-judged D1;
-    // one primary-key read a tick once done.
-    let rejudged = meter.phase("owed.d1_rejudge", d1_rejudge_env(env)).await;
+    // D2-ACTOR-B-FOLD-13 (bsv-low #958): D1's fleet re-judge after a judge-version move, paced (FOLD-15: the pace
+    // lever, 32 games by default, two judge calls with the reconcile yielding; 0 to 32; at most 32 identities opened a
+    // tick; FOLD-16: one judge call when the drain did work), BEFORE the reconcile so the sampler compares a re-judged
+    // D1; one primary-key read a tick once done.
+    let rejudged = meter
+        .phase("owed.d1_rejudge", d1_rejudge_env(env, drain_bound))
+        .await;
     let rejudge_report = rejudged.as_ref().ok().and_then(Option::clone);
     let rejudge = match rejudged {
         Ok(Some(r)) => serde_json::json!({
             "started": r.started, "identities": r.identities, "games": r.games, "faulted": r.faulted,
             "skipped": r.skipped, "done": r.done, "judgeCalls": r.judge_calls,
-            "gamesPerTick": r.games_per_tick, "paused": r.paused,
+            "gamesPerTick": r.games_per_tick, "paused": r.paused, "drainBound": r.drain_bound,
         }),
         Ok(None) => Value::Null,
         Err(error) => {
@@ -1585,6 +1596,7 @@ pub async fn reconcile_env(
 /// The alarm's D1 re-judge step (bsv-low #958): the D1 judge's port under the served tip and the era.
 pub async fn d1_rejudge_env(
     env: &worker::Env,
+    drain_bound: bool,
 ) -> Result<Option<crate::owed_actor::RejudgeReport>, String> {
     let tip = crate::owed_events::tip_memoised(env, false).await;
     let judge = owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))
@@ -1594,10 +1606,11 @@ pub async fn d1_rejudge_env(
         .var("OWED_D1_REJUDGE_GAMES_PER_TICK")
         .ok()
         .map(|v| v.to_string());
-    crate::owed_actor::d1_rejudge_step_paced(
+    crate::owed_actor::d1_rejudge_step_after_drain(
         &judge,
         worker::Date::now().as_millis() as i64,
         pace.as_deref(),
+        drain_bound,
     )
     .await
 }

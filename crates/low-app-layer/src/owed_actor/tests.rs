@@ -2,7 +2,7 @@
 use super::*;
 use crate::owed_walk_frozen::pins::{fixtures, seeded, Fixture, NOW_MS, TIP};
 use crate::pot_hook::tests::SqliteSql;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 /// The judge's own tables the actor writes (its rows, their word references, its state, the marks it reads).
 const JUDGE_TABLES: [&str; 4] = ["owed_rows", "owed_row_words", "owed_state", "owed_dirty"];
@@ -8036,6 +8036,8 @@ struct Fold13<'a> {
     die_after: Cell<u32>,
     /// FOLD-15: the D1 judge's commits (batches holding `GAME_DELETE_SQL`): one per judge call.
     commits: Cell<u32>,
+    /// FOLD-16: a game whose mark the actor's apply writes to the record WHILE the two judge (taken once).
+    mark_during: RefCell<Vec<String>>,
 }
 impl SqlPort for Fold13<'_> {
     async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
@@ -8102,6 +8104,15 @@ impl JudgeDb for Fold13<'_> {
         _kind: &str,
     ) -> Result<Option<Value>, String> {
         self.applies.set(self.applies.get() + 1);
+        for g in self.mark_during.borrow_mut().drain(..) {
+            self.d1
+                .conn
+                .execute(
+                    "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,?2,'word','during',1)",
+                    rusqlite::params![identity, g],
+                )
+                .unwrap();
+        }
         apply(
             self.d1,
             self.actor,
@@ -8164,6 +8175,7 @@ async fn fold13_a_the_reconcile_judges_d1_fresh_and_never_counts_a_stale_row() {
         actor_era: None,
         die_after: Cell::new(u32::MAX),
         commits: Cell::new(0),
+        mark_during: RefCell::new(Vec::new()),
     };
     let r = reconcile_step(&p, NOW_MS as i64).await.unwrap().unwrap();
     assert_eq!(
@@ -8222,6 +8234,7 @@ async fn fold13_a_the_reconcile_judges_d1_fresh_and_never_counts_a_stale_row() {
         actor_era: Some(None),
         die_after: Cell::new(u32::MAX),
         commits: Cell::new(0),
+        mark_during: RefCell::new(Vec::new()),
     };
     apply(
         &d1,
@@ -8332,6 +8345,7 @@ async fn fold13_b_a_version_move_rejudges_every_identity_once_and_moves_the_stam
         actor_era: None,
         die_after: Cell::new(u32::MAX),
         commits: Cell::new(0),
+        mark_during: RefCell::new(Vec::new()),
     };
     let t0 = NOW_MS as i64;
     let (_, reports) = fold13_run(&p, t0).await;
@@ -8931,6 +8945,7 @@ fn fold15_port<'a>(d1: &'a SqliteSql, actor: &'a SqliteSql) -> Fold13<'a> {
         actor_era: None,
         die_after: Cell::new(u32::MAX),
         commits: Cell::new(0),
+        mark_during: RefCell::new(Vec::new()),
     }
 }
 
@@ -9371,4 +9386,354 @@ async fn fold15_e_the_pace_is_a_lever_and_zero_pauses_with_the_cursor_kept() {
             .count(),
         2
     );
+}
+
+// ---- D2-ACTOR-B-FOLD-16 (the ninth delta lens's NEW9-M1, NEW9-L1; bsv-low #958) ----
+
+/// One reconcile of `fold13_a`'s planted judge disagreement (D1 writes the hop press off under the era, the actor's
+/// closure under no era keeps it), the identity's games holding `start` marks before the reconcile and `during` marks
+/// written by the actor's re-apply (while the two judge). Answers (diff, reconcileDiffs, heldDiffs, the lines).
+async fn fold16_a_run(start: bool, during: bool) -> (bool, u64, u64, Vec<String>) {
+    let made = (NOW_MS / 1000) as i64 - 8 * 86_400;
+    let era = (made + 5 * 86_400) * 1000;
+    let d1 = seeded(&fold11_g_fixture(made));
+    let games = games_of(&d1, "owner");
+    let local = mirror();
+    let pe = Fold13 {
+        era: Some(era),
+        ..fold15_port(&d1, &local)
+    };
+    crate::owed_judge::judge_subjects(&pe, "owner", &games, "d1-era")
+        .await
+        .unwrap();
+    apply(
+        &d1,
+        &local,
+        &Fakes,
+        "owner",
+        &games,
+        Some(("bootstrap", 1)),
+        Some(TIP),
+        None,
+    )
+    .await
+    .unwrap();
+    d1.conn.execute("DELETE FROM owed_dirty", []).unwrap();
+    if start {
+        for g in &games {
+            d1.conn
+                .execute(
+                    "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner',?1,'age','age',1)",
+                    rusqlite::params![g],
+                )
+                .unwrap();
+        }
+    }
+    let p = Fold13 {
+        era: Some(era),
+        actor_era: Some(None),
+        ..fold15_port(&d1, &local)
+    };
+    if during {
+        *p.mark_during.borrow_mut() = games.clone();
+    }
+    let r = reconcile_step(&p, NOW_MS as i64).await.unwrap().unwrap();
+    assert_eq!(r.identity, "owner");
+    let lines: Vec<String> = d1
+        .lines
+        .borrow()
+        .iter()
+        .filter(|l| l.contains("RECONCILE"))
+        .cloned()
+        .collect();
+    (
+        r.diff,
+        d1.counter(COUNTERS[7]),
+        d1.counter(COUNTERS[17]),
+        lines,
+    )
+}
+
+/// (fold16_a) NEW9-M1: A MARK PENDING AT THE RECONCILE'S START NEVER TURNS A JUDGE DISAGREEMENT INTO A HELD NOTE. The
+/// lens's scratch a: the actor holds a press D1 writes off (a genuine disagreement). With no mark it is a STOP; with
+/// an `age` mark on its games before the reconcile (both fresh judgements read the record after it) it is STILL a STOP
+/// (`reconcileDiffs` 1, `heldDiffs` 0, the line "a judge disagreement"); only a mark written WHILE the two judge (the
+/// actor's re-apply writes it, a generation above the bound) holds it (`heldDiffs` 1, "not a STOP"). RED on
+/// `d57bc0fa0` at the start mark: `left: 0 right: 1` (the disagreement counted held).
+#[tokio::test]
+async fn fold16_a_a_start_mark_never_holds_a_judge_disagreement() {
+    let control = fold16_a_run(false, false).await;
+    eprintln!("fold16_a control: {control:?}");
+    assert_eq!(
+        (control.0, control.1, control.2),
+        (true, 1, 0),
+        "the control is a STOP"
+    );
+    let start = fold16_a_run(true, false).await;
+    eprintln!("fold16_a start mark: {start:?}");
+    assert_eq!(
+        start.1, 1,
+        "a mark both judges read past is still a STOP: {start:?}"
+    );
+    assert_eq!(start.2, 0, "never a held note: {start:?}");
+    assert!(start.0);
+    assert!(
+        start.3.iter().any(|l| l.contains("a judge disagreement"))
+            && !start.3.iter().any(|l| l.contains("held mark")),
+        "{:?}",
+        start.3
+    );
+    let during = fold16_a_run(false, true).await;
+    eprintln!("fold16_a mark during the judge: {during:?}");
+    assert_eq!(
+        (during.1, during.2),
+        (0, 1),
+        "a mark written while they judged holds it: {during:?}"
+    );
+    assert!(during.3.iter().any(|l| l.contains("held mark; not a STOP")));
+}
+
+/// A direct port over the SQLite record (the drain's direct pass): each event's subjects read from its marks
+/// (`plan_with`, as `WorkerDirect`), every call answered applied; Phases A and B (no acknowledgement).
+struct Fold16Direct<'a>(&'a SqliteSql);
+impl crate::owed_events::DirectPort for Fold16Direct<'_> {
+    async fn subjects(
+        &self,
+        ev: &overlay_discovery::owed_event::OwedEvent,
+    ) -> Result<Vec<(String, Vec<String>)>, String> {
+        Ok(crate::owed_events::plan_with(self.0, ev, false)
+            .await?
+            .subjects())
+    }
+    async fn call(&self, _body: Value) -> Result<Value, String> {
+        Ok(json!({"applied": true, "firstApply": false, "appliedGames": []}))
+    }
+}
+
+/// The D1 statements of the alarm's drain with a full sweep (64 pairs, a stalled consumer): the sweep's tick, its
+/// publish batch, the direct pass's mark reads, the bars' flush and the backlog snapshot, plus the counter deltas the
+/// Worker writes one statement each (`FOLD16_DRAIN_COUNTER_STMTS`: the publish's eight and the direct pass's four).
+async fn fold16_drain_statements() -> (u32, usize) {
+    let d1 = SqliteSql::migrated();
+    let now: i64 = 1_800_000_000_000;
+    d1.now.set(now as u64);
+    for i in 0..80u32 {
+        d1.conn
+            .execute(
+                "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,?2,'hop',?3,?4)",
+                rusqlite::params![
+                    format!("02{:064x}", i),
+                    format!("g{i}"),
+                    format!("{:064x}:0", i + 1),
+                    now - 3_600_000
+                ],
+            )
+            .unwrap();
+    }
+    let s0 = d1.stmts.get();
+    let swept = crate::owed_events::sweep_tick(&d1, now).await.unwrap();
+    let pairs = swept.pairs.clone();
+    let port = crate::owed_events::SqlPublish {
+        db: &d1,
+        send: |_: Vec<String>| async { Ok::<(), String>(()) },
+    };
+    let report =
+        crate::owed_events_publish::publish_with(&port, crate::owed_events::notes_of(&pairs)).await;
+    assert!(report.fault.is_none());
+    crate::owed_events::direct_with(&Fold16Direct(&d1), report.sent.clone(), Some(TIP)).await;
+    crate::owed_actor::flush_bars(&d1, now as u64, true).await;
+    crate::owed_judge::snapshot_dirty(&d1).await.unwrap();
+    (
+        d1.stmts.get() - s0 + FOLD16_DRAIN_COUNTER_STMTS,
+        pairs.len(),
+    )
+}
+const FOLD16_DRAIN_COUNTER_STMTS: u32 = 12;
+/// The belt tick's statements (the budget tier's `owed-belt-tick`, as `fold15_c` takes it).
+const FOLD16_BELT_TICK_STMTS: u32 = 314;
+
+/// (fold16_b) NEW9-L1: THE DRAIN'S STATEMENTS COUNT IN THE ALARM'S BOUND. A full sweep (64 pairs re-published) is
+/// measured, then the re-judge run to its end on the fleet in an alarm whose drain did work: every tick makes at most
+/// ONE judge call and the reconcile yields, so the worst alarm (the drain, the belt tick, the worst re-judge tick) and
+/// the alarm whose re-judge made no call (the drain, the belt tick, the whale's reconcile) both stay under D1's 1,000.
+/// The wiring: the alarm hands the drain's work to the re-judge. Measured: the drain 276 statements, the worst alarm
+/// 915 (the drain, 314, 325), the reconcile's 872. RED against the drain ignored (`rejudge_calls_max` answering
+/// `ceil(pace / 16)` and `reconcile_yields` at `> 1` alone, `d57bc0fa0`'s rule): "one judge call under a working
+/// drain" (two calls a tick: the alarm 276 + 314 + 635 = 1,225). The API is new (it does not compile on `d57bc0fa0`).
+#[tokio::test]
+async fn fold16_b_the_drains_statements_count_in_the_alarms_bound() {
+    let (drain, pairs) = fold16_drain_statements().await;
+    assert_eq!(pairs, 64, "a full sweep");
+    let f = fixtures()
+        .into_iter()
+        .find(|f| f.name == "d1_fleet")
+        .unwrap();
+    let d1 = d1_judge(&f).await;
+    let local = mirror();
+    let p = fold15_port(&d1, &local);
+    let mut now = NOW_MS as i64;
+    let mut worst = 0u32;
+    let mut ticks = 0usize;
+    loop {
+        now += 120_000;
+        let (s, c) = (d1.stmts.get(), p.commits.get());
+        let r = d1_rejudge_step_after_drain(&p, now, None, true)
+            .await
+            .unwrap();
+        worst = worst.max(d1.stmts.get() - s);
+        let calls = p.commits.get() - c;
+        let Some(r) = r else { break };
+        ticks += 1;
+        assert!(r.drain_bound && r.games_per_tick == 32);
+        assert!(calls <= 1, "one judge call under a working drain: {r:?}");
+        assert_eq!(reconcile_yields(&r), calls == 1, "{r:?}");
+        if r.done {
+            break;
+        }
+    }
+    assert!(ticks > 1);
+    // The alarm whose re-judge made no call (done or paused): the reconcile runs beside the drain.
+    let id = f.identities[0].clone();
+    fold15_bootstrap(&d1, &local, &id, TIP).await;
+    d1.conn
+        .execute(
+            "UPDATE owed_rows SET reason='old-build' WHERE identity=?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    d1.conn
+        .execute(
+            "DELETE FROM owed_belt_state WHERE name LIKE 'reconcile%'",
+            [],
+        )
+        .unwrap();
+    let mut reconcile = None;
+    for _ in 0..200 {
+        now += RECONCILE_INTERVAL_MS;
+        let s = d1.stmts.get();
+        if let Some(r) = reconcile_step(&p, now).await.unwrap() {
+            if r.identity == id {
+                reconcile = Some(d1.stmts.get() - s);
+                break;
+            }
+        }
+    }
+    let reconcile = reconcile.expect("the whale reconciled");
+    let with_rejudge = drain + FOLD16_BELT_TICK_STMTS + worst;
+    let with_reconcile = drain + FOLD16_BELT_TICK_STMTS + reconcile;
+    eprintln!(
+        "fold16_b: a full 64-pair drain {drain} statements; the worst re-judge tick under it {worst} (one judge call, the reconcile yielding): the alarm {with_rejudge}; the whale's reconcile {reconcile}: the alarm {with_reconcile}"
+    );
+    assert!(with_rejudge < 1000, "{with_rejudge}");
+    assert!(with_reconcile < 1000, "{with_reconcile}");
+    // The pure rules and the alarm's wiring.
+    assert_eq!(rejudge_calls_max(32, false), 2);
+    assert_eq!(rejudge_calls_max(32, true), 1);
+    assert_eq!(rejudge_calls_max(0, true), 0);
+    let src: String = include_str!("../owed_belt.rs").split_whitespace().collect();
+    assert!(
+        src.contains("r.swept>0||r.subjects>0"),
+        "the drain's work read"
+    );
+    assert!(
+        src.contains("d1_rejudge_env(env,drain_bound)"),
+        "handed to the re-judge"
+    );
+    assert!(src.contains("d1_rejudge_step_after_drain(&judge,"));
+    assert!(src.contains("DrainReport{swept,..Default::default()}"));
+}
+
+/// A direct port answering every call as an applied first apply with its timings (an answer the object did NOT note),
+/// recording each body it was given.
+struct Fold16Sampled(RefCell<Vec<Value>>);
+impl crate::owed_events::DirectPort for Fold16Sampled {
+    async fn subjects(
+        &self,
+        ev: &overlay_discovery::owed_event::OwedEvent,
+    ) -> Result<Vec<(String, Vec<String>)>, String> {
+        let games: Vec<String> = (0..16).map(|i| format!("{}-{i}", ev.source_key)).collect();
+        Ok(vec![("02".to_string() + &"ab".repeat(32), games)])
+    }
+    async fn call(&self, body: Value) -> Result<Value, String> {
+        self.0.borrow_mut().push(body.clone());
+        Ok(
+            json!({"identity": body["identity"], "applied": true, "firstApply": true, "warmAtBirth": true,
+            "applyMs": 3533, "judgeMs": 3105, "readMs": 428, "waitMs": 0,
+            "atMs": body["atMs"], "judgedAtMs": body["atMs"].as_u64().map(|a| a + 3533)}),
+        )
+    }
+}
+
+/// (fold16_c) THE CAPTAIN'S ITEM 5 (beta at 5f820ebf9: the direct class served two samples of 3,533 ms apply with no
+/// writer's event behind them): the bars are the writers'. Found: the reconcile's fresh re-apply (`kind`
+/// "reconcile", `D1Judge::actor_apply`) carried an event's `atMs` and no class, so the object sampled it into the
+/// QUEUE class; the DIRECT samples are the drain's sweep re-publishing the `backfill` marks the reconcile writes for
+/// the games past its 16 (`RECONCILE_MARK_REST_SQL`), its direct pass calling the actor with up to 64 games under
+/// `class: "direct"`. Now the reconcile's body carries no `atMs` and the sweep's pass `class: "sweep"`: neither is
+/// sampled by the object (`samples_bars`) nor by the caller; a writer's direct pass still is. The D1 re-judge calls no
+/// actor. RED against the sweep's pass as on `d57bc0fa0` (its bodies under `class: "direct"`, its answers noted): the
+/// assertion that every body the sweep sent carries `class: "sweep"` (`fold16-red-item5.txt`). The object's gate is
+/// pinned by its source (wasm32 only); not run on beta.
+#[tokio::test]
+async fn fold16_c_the_reconcile_and_the_sweep_sample_nothing_into_the_writers_bars() {
+    // The reconcile's body: no event, no class: sampled by no one.
+    let games: Vec<String> = (0..16).map(|i| format!("g{i}")).collect();
+    let body = reconcile_apply_body("Owner", &games, "reconcile", Some(TIP));
+    assert!(body["atMs"].is_null() && body["seq"].is_null() && body["class"].is_null());
+    assert!(!samples_bars(body["atMs"].as_u64(), body["class"].as_str()));
+    assert!(!samples_bars(Some(1), Some(SWEEP_CLASS)));
+    assert!(samples_bars(Some(1), Some("direct")) && samples_bars(Some(1), None));
+    // The sweep's direct pass over N events: nothing into the bars; a writer's pass: its samples.
+    let direct_samples = || {
+        let p = pending_bars_snapshot();
+        (
+            p.apply.get("direct").map_or(0, Vec::len),
+            p.visible.get("direct").map_or(0, Vec::len),
+            p.apply.get("queue").map_or(0, Vec::len),
+        )
+    };
+    let events: Vec<overlay_discovery::owed_event::OwedEvent> = (0..4)
+        .map(|i| {
+            serde_json::from_value(json!({"v": 1, "seq": 100 + i, "source": "backfill",
+                "sourceKey": format!("owed-v2-{i}"), "facts": null, "atMs": NOW_MS}))
+            .unwrap()
+        })
+        .collect();
+    let before = direct_samples();
+    let port = Fold16Sampled(RefCell::new(Vec::new()));
+    let r =
+        crate::owed_events::direct_with_class(&port, events.clone(), Some(TIP), SWEEP_CLASS).await;
+    assert_eq!(r.calls, 1, "{r:?}");
+    assert!(port.0.borrow().iter().all(
+        |b| b["class"] == SWEEP_CLASS && !samples_bars(b["atMs"].as_u64(), b["class"].as_str())
+    ));
+    assert_eq!(
+        direct_samples(),
+        before,
+        "the sweep's pass sampled into the bars"
+    );
+    let writer = Fold16Sampled(RefCell::new(Vec::new()));
+    crate::owed_events::direct_with(&writer, events, Some(TIP)).await;
+    assert_eq!(
+        direct_samples().0,
+        before.0 + 1,
+        "a writer's direct pass still samples"
+    );
+    assert!(writer.0.borrow().iter().all(|b| b["class"] == "direct"));
+    // The wiring: the reconcile's call, the object's two notes, the sweep's pass.
+    let judge: String = include_str!("../owed_judge.rs")
+        .split_whitespace()
+        .collect();
+    assert!(judge.contains(
+        "ifkind==\"reconcile\"{crate::owed_actor::reconcile_apply_body(identity,games,kind,tip)"
+    ));
+    let object: String = include_str!("object.rs").split_whitespace().collect();
+    assert!(object.contains("letsamples=samples_bars(body.at_ms,body.class.as_deref());ifsamples{letmutbars=self.bars.borrow_mut();"));
+    assert!(object.contains("ifsamples{note_answer_as(bars_class(body.class.as_deref()),&answer);"));
+    let events_src: String = include_str!("../owed_events.rs")
+        .split_whitespace()
+        .collect();
+    assert!(events_src.contains(
+        "direct_events_as(env,report.sent.clone(),crate::owed_actor::SWEEP_CLASS).await;"
+    ));
 }
