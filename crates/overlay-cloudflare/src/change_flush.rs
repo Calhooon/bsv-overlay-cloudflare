@@ -691,7 +691,12 @@ pub const OWED_DIRECT_POST_WALL_MS: u64 = 2_000;
 /// actor (`POST /internal/owed-direct`, answered 202 at once, the calls after its answer). Chunked at
 /// [`OWED_DIRECT_BODY_MAX`]; each POST raced against [`OWED_DIRECT_POST_WALL_MS`]. A POST that walls or is refused is
 /// counted `owed_actor_direct_faults_total` and logged: never a fault of the write (its queue messages were sent).
-pub async fn ship_owed_direct(env: &Env) {
+///
+/// D2-ACTOR-B-FOLD-10 (the fifth delta lens's NEW5-L3): the WHOLE hand-off shares one wall, the earlier of
+/// [`OWED_DIRECT_POST_WALL_MS`] from its start and the flush's own `deadline_ms` (it was 2 s a chunk, after which the
+/// flush computed its 20 s wall: up to 8 chunks of 2 s stacked on it). A chunk not started inside it is left to the
+/// queue, logged and counted as one fault.
+pub async fn ship_owed_direct(env: &Env, deadline_ms: u64) {
     let events = crate::owed_events::take_direct();
     if events.is_empty() {
         return;
@@ -704,7 +709,17 @@ pub async fn ship_owed_direct(env: &Env) {
         return;
     };
     let mut faults = 0u64;
-    for chunk in events.chunks(OWED_DIRECT_BODY_MAX) {
+    let end = owed_direct_end(Date::now().as_millis(), deadline_ms);
+    for (n, chunk) in events.chunks(OWED_DIRECT_BODY_MAX).enumerate() {
+        let left = end.saturating_sub(Date::now().as_millis());
+        if left == 0 {
+            let rest = events.len() - n * OWED_DIRECT_BODY_MAX;
+            console_log!(
+                "[owed-direct] the hand-off's wall fell: {rest} event(s) left to the queue"
+            );
+            faults += 1;
+            break;
+        }
         let body =
             serde_json::json!({"events": chunk.iter().map(|e| e.encode()).collect::<Vec<_>>()})
                 .to_string();
@@ -716,9 +731,7 @@ pub async fn ship_owed_direct(env: &Env) {
             "owed-direct",
             body
         ));
-        let wall = std::pin::pin!(Delay::from(std::time::Duration::from_millis(
-            OWED_DIRECT_POST_WALL_MS
-        )));
+        let wall = std::pin::pin!(Delay::from(std::time::Duration::from_millis(left)));
         match futures_util::future::select(post, wall).await {
             futures_util::future::Either::Left((Ok(_), _)) => {}
             futures_util::future::Either::Left((Err(()), _)) => faults += 1,
@@ -734,6 +747,12 @@ pub async fn ship_owed_direct(env: &Env) {
     if faults > 0 {
         crate::owed_events::bump(env, &[("owed_actor_direct_faults_total", faults)]).await;
     }
+}
+
+/// PURE (NEW5-L3): the hand-off's end, the earlier of [`OWED_DIRECT_POST_WALL_MS`] from `now_ms` and the flush's
+/// `deadline_ms`.
+pub fn owed_direct_end(now_ms: u64, deadline_ms: u64) -> u64 {
+    (now_ms + OWED_DIRECT_POST_WALL_MS).min(deadline_ms)
 }
 
 /// Run a future that never waits on anything outside itself (the pins' fake transports) to its answer.

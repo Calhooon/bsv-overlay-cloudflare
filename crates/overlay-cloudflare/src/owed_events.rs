@@ -255,6 +255,19 @@ pub fn hold_direct(sent: &[OwedEvent]) {
 pub fn take_direct() -> Vec<OwedEvent> {
     DIRECT.with(|d| std::mem::take(&mut *d.borrow_mut()))
 }
+/// D2-ACTOR-B-FOLD-10 (the fifth delta lens's NEW5-L2): take only the held events `own` names, leaving every other
+/// event held for the invocation that published it (synchronous: no await between the read and the removal). The
+/// set is the isolate's, so a caller that discards what it took (the queue consumer's own continuation) must take
+/// its own events alone, never a concurrent writer's.
+pub fn take_direct_where(own: impl Fn(&OwedEvent) -> bool) -> Vec<OwedEvent> {
+    DIRECT.with(|d| {
+        let mut d = d.borrow_mut();
+        let (taken, kept): (Vec<OwedEvent>, Vec<OwedEvent>) =
+            std::mem::take(&mut *d).into_iter().partition(|e| own(e));
+        *d = kept;
+        taken
+    })
+}
 /// No direct event is held.
 pub fn direct_is_empty() -> bool {
     DIRECT.with(|d| d.borrow().is_empty())

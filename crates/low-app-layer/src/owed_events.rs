@@ -1056,6 +1056,37 @@ pub(crate) async fn tip_memoised(env: &worker::Env, fresh: bool) -> Option<u64> 
     Some(tip)
 }
 
+/// D2-ACTOR-B-FOLD-10 (the fifth delta lens's NEW5-M1): the tip hook (`/internal/tip-changed`) hands the isolate's
+/// memo the height it was just ANNOUNCED, before it writes the block's marks and schedules the direct pass, so no
+/// apply of this isolate judges the block's marks at the previous height (a direct apply at T-1 covered the block's
+/// `tip` marks and made the consumer's fresh delivery at T a dupe). A lower height never replaces a higher one.
+pub(crate) fn seed_tip(height: u64) {
+    let now = worker::Date::now().as_millis() as f64;
+    seed_tip_at(height, now);
+}
+/// [`seed_tip`] at a clock (the pins).
+pub fn seed_tip_at(height: u64, now_ms: f64) {
+    TIP.with(|t| {
+        let keep = t
+            .get()
+            .is_some_and(|(held, at)| held > height && now_ms - at < TIP_MEMO_MS);
+        if !keep {
+            t.set(Some((height, now_ms)));
+        }
+    });
+}
+/// The memo's height when younger than [`TIP_MEMO_MS`] at `now_ms` (the pins).
+pub fn memo_tip_at(now_ms: f64) -> Option<u64> {
+    TIP.with(std::cell::Cell::get)
+        .filter(|(_, at)| now_ms - at < TIP_MEMO_MS)
+        .map(|(tip, _)| tip)
+}
+/// PURE (NEW5-M1): does a direct pass over these events read the tip FRESH? Exactly when one of them would at the
+/// consumer ([`tip_reads_fresh`]): a block's `tip` events are judged at the block, whichever path applies them first.
+pub fn direct_reads_fresh(events: &[OwedEvent]) -> bool {
+    events.iter().any(|e| tip_reads_fresh(&e.source))
+}
+
 /// PURE: LOW-B: does an event of `source` read the chain tip fresh (the block's own marks), never the memo?
 pub fn tip_reads_fresh(source: &str) -> bool {
     source == "tip"
@@ -1100,8 +1131,16 @@ pub async fn consume_one(env: &worker::Env, ev: &OwedEvent) -> Result<Routed, St
     }
     // D2-ACTOR-D: the consumer IS this event's delivery; what it published (a continuation, a frame's own word) is
     // the queue's alone, never held for a direct call by a later request of this isolate.
-    let _ = publish::take_direct();
+    // D2-ACTOR-B-FOLD-10 (NEW5-L2): only ITS OWN events are taken and dropped; a concurrent writer's (held by a
+    // publish that ran in this isolate during one of the consumer's awaits) stay held for that writer's flush point.
+    let _ = publish::take_direct_where(|e| consumer_owns(ev, e));
     Ok(routed)
+}
+
+/// PURE (NEW5-L2): is a held event the consumer's own publish for the delivery `ev` (its continuation, or its
+/// frame's word: the same pair)? Every other held event is a concurrent writer's.
+pub fn consumer_owns(ev: &OwedEvent, held: &OwedEvent) -> bool {
+    held.source == ev.source && held.source_key.eq_ignore_ascii_case(&ev.source_key)
 }
 
 /// The Worker's `queue` handler: the `owed-events` consumer, or its dead letter queue's park.
@@ -1391,6 +1430,114 @@ pub struct DirectReport {
     pub held: u64,
     /// Events past [`DIRECT_EVENTS_MAX`] or carrying a frame: the queue's alone.
     pub left_to_queue: usize,
+    /// D2-ACTOR-B-FOLD-10 (item 8): the first fault's text (a wall's or a refusal's), for the operator's line.
+    pub first_fault: Option<String>,
+}
+
+/// D2-ACTOR-B-FOLD-10 (item 8): the direct path's fault line is logged at most once in this many ms an isolate.
+pub const DIRECT_FAULT_LOG_EVERY_MS: u64 = 60_000;
+thread_local! {
+    static DIRECT_FAULT_LOGGED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+/// PURE: the operator's line for a pass's faults (`[owed-actor] direct fault: <text>`), when one is due at `now_ms`
+/// after the last line at `last_ms` (once a minute an isolate).
+pub fn direct_fault_line(
+    report: &DirectReport,
+    now_ms: u64,
+    last_ms: Option<u64>,
+) -> Option<String> {
+    let text = report.first_fault.as_deref()?;
+    if last_ms.is_some_and(|l| now_ms.saturating_sub(l) < DIRECT_FAULT_LOG_EVERY_MS) {
+        return None;
+    }
+    Some(format!(
+        "[owed-actor] direct fault: {text} ({} of {} call(s) walled, {} faulted)",
+        report.walls, report.calls, report.faults
+    ))
+}
+/// The fault line, logged through the isolate's once-a-minute gate.
+pub fn log_direct_fault(report: &DirectReport, now_ms: u64, log: impl Fn(&str)) {
+    let last = DIRECT_FAULT_LOGGED.with(std::cell::Cell::get);
+    if let Some(line) = direct_fault_line(report, now_ms, last) {
+        DIRECT_FAULT_LOGGED.with(|c| c.set(Some(now_ms)));
+        log(&line);
+    }
+}
+
+/// An event's subjects: each identity with its games.
+pub type Subjects = Vec<(String, Vec<String>)>;
+
+/// One coalesced direct call (NEW5-L3): an identity's games over every event of the pass that names it, in first-
+/// seen order, under the FIRST event's key, the earliest write time, and the other events' keys (`also`).
+#[derive(Debug, Clone, Default)]
+struct Coalesced {
+    games: Vec<String>,
+    first: Option<crate::owed_actor::EventCtx>,
+    at_ms: i64,
+    mined: bool,
+    also: Vec<(String, i64)>,
+}
+
+/// PURE (NEW5-L3, D2-ACTOR-B-FOLD-10): the pass's events' subjects merged into ONE call body an identity (per
+/// [`crate::owed_actor::GAMES_PER_APPLY`] games), never one call an event: a write of k events naming one identity
+/// (a JOIN's pot, party, hop and word pairs) queued k whole applies in that actor's turn, each later one covered by the
+/// first. Each body carries `class: "direct"` (the object notes its own visibility under it, NEW5-L5).
+pub fn coalesce_direct(
+    subjects: Vec<(crate::owed_actor::EventCtx, Subjects)>,
+    tip: Option<u64>,
+) -> Vec<Value> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by: BTreeMap<String, Coalesced> = BTreeMap::new();
+    for (e, subjects) in subjects {
+        for (identity, games) in subjects {
+            let id = identity.to_ascii_lowercase();
+            let c = by.entry(id.clone()).or_insert_with(|| {
+                order.push(id.clone());
+                Coalesced::default()
+            });
+            for g in games {
+                if !c.games.iter().any(|x| x.eq_ignore_ascii_case(&g)) {
+                    c.games.push(g);
+                }
+            }
+            c.mined |= e.mined;
+            match &c.first {
+                None => {
+                    c.at_ms = e.at_ms;
+                    c.first = Some(e.clone());
+                }
+                Some(f) => {
+                    c.at_ms = c.at_ms.min(e.at_ms);
+                    let key = (e.kind.clone(), e.seq);
+                    if (f.kind.as_str(), f.seq) != (e.kind.as_str(), e.seq)
+                        && !c.also.contains(&key)
+                    {
+                        c.also.push(key);
+                    }
+                }
+            }
+        }
+    }
+    let mut bodies = Vec::new();
+    for id in order {
+        let c = &by[&id];
+        let Some(first) = &c.first else { continue };
+        let e = crate::owed_actor::EventCtx {
+            kind: first.kind.clone(),
+            seq: first.seq,
+            at_ms: c.at_ms,
+            mined: c.mined,
+        };
+        for chunk in c.games.chunks(crate::owed_actor::GAMES_PER_APPLY) {
+            let mut b = crate::owed_actor::apply_body(&id, chunk, &e, tip);
+            b["class"] = json!("direct");
+            if !c.also.is_empty() {
+                b["also"] = json!(c.also);
+            }
+            bodies.push(b);
+        }
+    }
+    bodies
 }
 
 /// PURE: a direct call's error is its WALL (`object::call_apply`'s "no answer in" words), else a fault.
@@ -1415,7 +1562,7 @@ pub async fn direct_with(
     tip: Option<u64>,
 ) -> DirectReport {
     let mut report = DirectReport::default();
-    let mut bodies: Vec<Value> = Vec::new();
+    let mut subjects_of = Vec::new();
     for (n, ev) in events.into_iter().enumerate() {
         if n >= DIRECT_EVENTS_MAX || ev.frame().is_some() || ev.source == owed_event::TXFACTS {
             report.left_to_queue += 1;
@@ -1426,13 +1573,9 @@ pub async fn direct_with(
             report.left_to_queue += 1;
             continue;
         };
-        let e = crate::owed_actor::EventCtx::of(&ev);
-        for (identity, games) in subjects {
-            for chunk in games.chunks(crate::owed_actor::GAMES_PER_APPLY) {
-                bodies.push(crate::owed_actor::apply_body(&identity, chunk, &e, tip));
-            }
-        }
+        subjects_of.push((crate::owed_actor::EventCtx::of(&ev), subjects));
     }
+    let bodies = coalesce_direct(subjects_of, tip);
     report.calls = bodies.len() as u64;
     let answers = futures_util::future::join_all(bodies.into_iter().map(|b| port.call(b))).await;
     for answer in answers {
@@ -1440,8 +1583,14 @@ pub async fn direct_with(
             // D2-ACTOR-B-FOLD-7: a held answer is neither a fault nor a sample (the actor counts it).
             Ok(a) if crate::owed_actor::is_held(&a) => report.held += 1,
             Ok(a) => crate::owed_actor::note_answer_as("direct", &a),
-            Err(e) if is_wall(&e) => report.walls += 1,
-            Err(_) => report.faults += 1,
+            Err(e) => {
+                if is_wall(&e) {
+                    report.walls += 1;
+                } else {
+                    report.faults += 1;
+                }
+                report.first_fault.get_or_insert(e);
+            }
         }
     }
     report
@@ -1475,20 +1624,17 @@ pub async fn direct_events(env: &worker::Env, events: Vec<OwedEvent>) -> DirectR
     let Ok(sql) = crate::routes::D1Sql::of(env) else {
         return DirectReport::default();
     };
-    let tip = tip_memoised(env, false).await;
+    // NEW5-M1: a block's `tip` events read the tip fresh here too, as the consumer reads them.
+    let tip = tip_memoised(env, direct_reads_fresh(&events)).await;
     let port = WorkerDirect {
         env: env.clone(),
         sql,
     };
     let report = direct_with(&port, events, tip).await;
-    if report.walls + report.faults > 0 {
-        worker::console_warn!(
-            "[owed-actor] direct: {} call(s), {} walled, {} faulted (the queue's messages are their backstop)",
-            report.calls,
-            report.walls,
-            report.faults
-        );
-    }
+    // item 8 (D2-ACTOR-B-FOLD-10): the first fault's own text, once a minute an isolate.
+    log_direct_fault(&report, worker::Date::now().as_millis(), |l| {
+        worker::console_warn!("{l} (the queue's messages are their backstop)");
+    });
     let deltas: Vec<(String, u64)> = [
         (crate::owed_actor::COUNTERS[3], report.calls),
         (crate::owed_actor::COUNTERS[4], report.faults),

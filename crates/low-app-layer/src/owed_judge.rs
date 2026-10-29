@@ -894,6 +894,12 @@ fn belt_due(row: &OwedRow, stamp: i64, evidence: Option<&JudgeInputs>) -> Option
     }
     match row.family {
         OwedFamily::HopStranded => Some(stamp + 600_000),
+        // NEW5-M2 (D2-ACTOR-B-FOLD-10): a hop row resting on a courier find of an unconfirmed spend is re-asked at
+        // the outpoint (`owed_belt::rests_on_unconfirmed_find`), whatever bytes are held: a spend that never mines
+        // is retired by that look, and the honest sweep press comes back.
+        OwedFamily::Unbound if crate::owed_belt::rests_on_unconfirmed_find(&row.facts) => {
+            Some(stamp + 600_000)
+        }
         OwedFamily::Unbound => {
             let spender = named_spender(row)?;
             let held = evidence.is_some_and(|i| i.spender_outputs.contains_key(&spender));

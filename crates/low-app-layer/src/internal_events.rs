@@ -686,6 +686,9 @@ pub async fn tip_changed(mut req: Request, env: &Env, ctx: &Context) -> Result<R
     let announced_hash = parse_tip_changed_hash(&raw);
     // the `/beef` read-side guard's present-height latch (bsv-low M19 R2)
     crate::beef_guard::latch_present_tip(height);
+    // D2-ACTOR-B-FOLD-10 (NEW5-M1): the owed memo holds the announced height before the block's marks are written
+    // and their direct pass scheduled, so no apply of this isolate judges them at the previous height.
+    crate::owed_events::seed_tip(height);
     push_broadcast(
         env,
         TIP_ROOM,

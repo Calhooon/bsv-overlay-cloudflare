@@ -612,8 +612,23 @@ pub const APPLIED_KEEP_MS: i64 = 7 * 86_400_000;
 /// before its call) over games each covered at or past it is a DUPE: answered from the seq check in milliseconds,
 /// nothing applied, nothing sampled ([`COVERED_SQL`]); the marks it acknowledges were judged by the covering apply.
 pub const COVERED_KIND: &str = "covered";
-/// How many of `?2` (a JSON array of games) an apply covered at or past the bound `?1`.
-pub const COVERED_SQL: &str = "SELECT COUNT(DISTINCT game) AS n FROM applied WHERE kind='covered' AND seq>=?1 AND game IN (SELECT value FROM json_each(?2))";
+/// D2-ACTOR-B-FOLD-10 (the fifth delta lens's NEW5-M1): the TIP of each game's LAST apply, one `applied` row a game
+/// under this kind (its `seq` the tip the apply judged at, `-1` for none; replaced by every apply that records its
+/// coverage). The marks are not the apply's only input: a block is an input no mark carries past the tip marks'
+/// generations, so a direct apply at a stale tip covered the block's `tip` marks and the consumer's delivery at the
+/// block was a dupe, the actor's rows left at the previous height. A delivery is a dupe only when the game's last
+/// apply judged at a tip no lower than the delivery's.
+pub const COVERED_TIP_KIND: &str = "covered-tip";
+/// The last apply's tip of each game replaced (`?1` the games): before [`APPLIED_SQL`] writes the new one.
+pub const COVERED_TIP_CLEAR_SQL: &str =
+    "DELETE FROM applied WHERE kind='covered-tip' AND game IN (SELECT value FROM json_each(?1))";
+/// How many of `?2` (a JSON array of games) an apply covered at or past the bound `?1` and whose LAST apply judged at
+/// a tip at least `?3` (`-1`: the delivery names no tip).
+pub const COVERED_SQL: &str = "SELECT COUNT(*) AS n FROM (SELECT DISTINCT value AS g FROM json_each(?2)) j WHERE EXISTS (SELECT 1 FROM applied a WHERE a.kind='covered' AND a.seq>=?1 AND a.game=j.g) AND EXISTS (SELECT 1 FROM applied t WHERE t.kind='covered-tip' AND t.seq>=?3 AND t.game=j.g)";
+/// The tip an apply records, or a delivery is compared at ([`COVERED_TIP_KIND`]): `-1` for none.
+pub fn covered_tip(tip: Option<u64>) -> i64 {
+    tip.map_or(-1, |t| t.min(i64::MAX as u64) as i64)
+}
 /// How many of `?3`'s games the event `(?1, ?2)` already applied: none, its FIRST apply (the visibility sample's rule).
 pub const EVENT_APPLIED_SQL: &str = "SELECT COUNT(*) AS n FROM applied WHERE kind=?1 AND seq=?2 AND game IN (SELECT value FROM json_each(?3))";
 /// The version of the actor's own tables (`txfacts`, `applied`, `meta`) beside the mirror's generated digest: a move
@@ -1005,6 +1020,20 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
                 Bind::Text(json!(games).to_string()),
             ],
         ));
+        // NEW5-M1: the tip this apply judged at, the games' last.
+        marks.push(Stmt::new(
+            COVERED_TIP_CLEAR_SQL,
+            vec![Bind::Text(json!(games).to_string())],
+        ));
+        marks.push(Stmt::new(
+            APPLIED_SQL,
+            vec![
+                Bind::Text(COVERED_TIP_KIND.into()),
+                Bind::Int(covered_tip(tip)),
+                Bind::Int(local.now_ms() as i64),
+                Bind::Text(json!(games).to_string()),
+            ],
+        ));
     }
     if let Some((kind, seq)) = kind_seq {
         marks.push(Stmt::new(
@@ -1157,8 +1186,14 @@ pub async fn first_apply_of<L: SqlPort>(
         .is_none_or(|n| n == 0)
 }
 
-/// D2-ACTOR-D: is every game covered at or past `bound` ([`COVERED_SQL`])? A read that faults is never covered.
-pub async fn covered_at<L: SqlPort>(local: &L, games: &[String], bound: i64) -> bool {
+/// D2-ACTOR-D: is every game covered at or past `bound` ([`COVERED_SQL`]), its last apply judged at a tip no lower
+/// than the delivery's `tip` (NEW5-M1)? A read that faults is never covered.
+pub async fn covered_at<L: SqlPort>(
+    local: &L,
+    games: &[String],
+    bound: i64,
+    tip: Option<u64>,
+) -> bool {
     let mut games: Vec<String> = games.iter().map(|g| g.to_ascii_lowercase()).collect();
     games.sort();
     games.dedup();
@@ -1168,7 +1203,11 @@ pub async fn covered_at<L: SqlPort>(local: &L, games: &[String], bound: i64) -> 
     local
         .run_batch(vec![Stmt::new(
             COVERED_SQL,
-            vec![Bind::Int(bound), Bind::Text(json!(games).to_string())],
+            vec![
+                Bind::Int(bound),
+                Bind::Text(json!(games).to_string()),
+                Bind::Int(covered_tip(tip)),
+            ],
         )])
         .await
         .ok()
@@ -1303,7 +1342,7 @@ pub async fn apply_event_in_turn<R: SqlPort, L: SqlPort, O: Outside>(
     let _turn = turn.lock().await;
     let first = first_apply_of(local, kind_seq, games).await;
     if let Some(b) = bound {
-        if covered_at(local, games, b).await {
+        if covered_at(local, games, b, tip).await {
             let mut named: Vec<String> = Vec::new();
             for g in games.iter().map(|g| g.to_ascii_lowercase()) {
                 if !named.contains(&g) {
@@ -2544,10 +2583,37 @@ pub struct PendingBars {
     pub held: u64,
     pub last_flush_ms: Option<u64>,
 }
+/// D2-ACTOR-B-FOLD-10 (the captain's item, beta 2026-10-29: an actor bootstrapped on FOLD-7's build kept a row the
+/// FOLD-9 judge no longer produces, because the lever answered `already` whenever `bootstrapped` was set): a
+/// bootstrapped actor whose state was judged by ANOTHER build (`meta.judgedLibRev`, stamped with `bootstrapped` at the
+/// bootstrap's end; absent on an actor stamped before this fold) is re-judged: its bootstrap re-armed from the start
+/// (its state kept and served until the pages rewrite it), on the lever and on an event it applies. The same build:
+/// `already`.
+pub fn rejudge_due(bootstrapped: bool, judged_rev: Option<&str>, running: &str) -> bool {
+    bootstrapped && judged_rev != Some(running)
+}
+
+/// NEW5-L5 (D2-ACTOR-B-FOLD-10): the bars class an object notes its own answer under (`direct`, else `queue`).
+pub fn bars_class(class: Option<&str>) -> &'static str {
+    match class {
+        Some("direct") => "direct",
+        _ => "queue",
+    }
+}
 impl PendingBars {
     pub fn note_answer(&mut self, class: &'static str, answer: &Value) {
         // D2-ACTOR-D: a covered dupe applied nothing: no apply sample, no visibility sample.
         if answer["applied"] == false {
+            return;
+        }
+        // NEW5-L5: the object already noted this answer's samples itself; the caller keeps only its own isolate's
+        // unapplied bookkeeping.
+        if answer["noted"] == true {
+            if let Some(id) = answer["identity"].as_str() {
+                if self.unapplied.remove(id).is_some() {
+                    self.queue_touched = true;
+                }
+            }
             return;
         }
         if let Some(ms) = answer["applyMs"].as_u64() {
@@ -2670,11 +2736,24 @@ pub fn merge_bars_row(
     unapplied: Option<Option<u64>>,
     rev: &str,
 ) -> String {
-    let mut row: Value = stored
+    let parsed: Option<Value> = stored
         .and_then(|s| serde_json::from_str(s).ok())
-        .filter(Value::is_object)
+        .filter(Value::is_object);
+    let mut row: Value = parsed
+        .clone()
         .filter(|r: &Value| r["libRev"] == rev)
         .unwrap_or_else(|| json!({}));
+    // D2-ACTOR-B-FOLD-10 (the fifth delta lens's NEW5-L4): the by-build replace keeps the SAMPLES apart; the oldest
+    // unapplied write time is a fact about the fleet's actors, not a sample of a build, so it is carried across.
+    if row.get("oldestUnappliedAtMs").is_none() {
+        if let Some(u) = parsed
+            .as_ref()
+            .and_then(|p| p.get("oldestUnappliedAtMs"))
+            .filter(|u| !u.is_null())
+        {
+            row["oldestUnappliedAtMs"] = u.clone();
+        }
+    }
     row["libRev"] = json!(rev);
     for (k, new) in [("apply", apply), ("visible", visible)] {
         let mut ring: Vec<u64> = row[k]
@@ -2858,7 +2937,7 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
 /// (`owed_events::HEALTH_CONSUMER_SQL`).
 macro_rules! health_select {
     () => {
-        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding"
+        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding"
     };
 }
 pub const HEALTH_SQL: &str = health_select!();
@@ -2935,6 +3014,8 @@ pub fn health_body(
     body["faultsTotal"] = n(COUNTERS[2]);
     body["reconcileDiffs"] = n(COUNTERS[7]);
     body["bootstraps"] = n(COUNTERS[10]);
+    // D2-ACTOR-B-FOLD-10: the actors re-judged under the running build, beside the bootstraps.
+    body["rejudged"] = n(COUNTERS[26]);
     body["unknownReads"] = n(COUNTERS[11]);
     body["epochResets"] = n(COUNTERS[12]);
     body["deferred"] = n(COUNTERS[13]);
@@ -3244,7 +3325,7 @@ mod tests;
 /// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
 /// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
 /// (MEDIUM-9).
-pub const COUNTERS: [&str; 26] = [
+pub const COUNTERS: [&str; 27] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -3282,6 +3363,9 @@ pub const COUNTERS: [&str; 26] = [
     // D2-ACTOR-D (bsv-low #952): the writers' direct calls that met their wall (`DIRECT_CALL_WALL_MS`); a direct call
     // that answered an error is `owed_actor_direct_faults_total`, every call `owed_actor_direct_calls_total`.
     "owed_actor_direct_walls_total",
+    // D2-ACTOR-B-FOLD-10 (the captain's item, beta 2026-10-29): the bootstrapped actors whose state another build
+    // judged, re-armed from the start ([`rejudge_due`]).
+    "owed_actor_rejudged_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;

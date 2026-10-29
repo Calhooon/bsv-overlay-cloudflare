@@ -3785,8 +3785,22 @@ async fn d2_actor_b_fold7_a_an_unseen_heavy_seat_is_held_bootstrapped_then_appli
     // the design's 60 s. It is not the wasm32 and D1 time (beta's rehearsal reads that), and not a mass bootstrap's,
     // where the fleet's 60 pages a minute make a heavy seat's cold time the fleet's page count over 60 a minute.
     assert_eq!(pages, 38);
-    assert!(paced < 60_000, "one cold actor under the pace: {paced} ms");
+    // D2-ACTOR-B-FOLD-10 (the fifth delta lens's NEW5-L1): the bar is the PER-PAGE work against the pace's room
+    // ([`COLD_PAGE_WORK_BAR_MS`]), asserted only in a release profile: a debug build in the parallel suite measured
+    // 41 s of native work under a host load of 30 (60,035 and 78,252 ms against the 60 s), and passes alone.
+    let per_page = boot_ms / pages as u64;
+    eprintln!("fold7_a: {per_page} ms of native work a page (the bar {COLD_PAGE_WORK_BAR_MS} ms in a release build)");
+    if !cfg!(debug_assertions) {
+        assert!(
+            per_page < COLD_PAGE_WORK_BAR_MS,
+            "one cold actor's page work {per_page} ms (paced {paced} ms)"
+        );
+    }
 }
+
+/// NEW5-L1: the most native work a cold bootstrap page may take so that the 38 pages, one page delay apart, fit the
+/// design's 60 s: (60 s - 37 delays) / 38.
+const COLD_PAGE_WORK_BAR_MS: u64 = (60_000 - 37 * BOOTSTRAP_PAGE_DELAY_MS) / 38;
 
 /// Two HELD events out of order (seq 12 held first, then seq 10, the record moved between them): the drain applies
 /// them in seq order and the rows are the record's as it stands (the newer judgement), MEDIUM-1's shape.
@@ -6155,5 +6169,666 @@ async fn fold9_g_a_reconcile_reapply_keeps_the_judged_tip() {
     let reconcile = &belt[belt.find("pubasyncfnreconcile_env(").unwrap()..];
     assert!(
         reconcile[..reconcile.find("reconcile_step(").unwrap()].contains("tip_memoised(env,false)")
+    );
+}
+
+// ---- D2-ACTOR-B-FOLD-10 (the fifth delta lens on `e99472091`: NEW5-M1, NEW5-M2, NEW5-L1 to NEW5-L5; item 8) ----
+
+/// The greatest tip the actor's rows of `game` were judged at.
+fn fold10_probe_tip(actor: &SqliteSql, game: &str) -> Option<i64> {
+    actor
+        .conn
+        .query_row(
+            "SELECT MAX(probeTip) FROM owed_rows WHERE identity='owner' AND gameId=?1",
+            [game],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .unwrap()
+}
+
+/// fold10_a (NEW5-M1): A DIRECT APPLY NEVER SWALLOWS A BLOCK'S TIP EVENT. The lens's scratch shape: every game applied
+/// at TIP-1, the block's tip mark written, the hook's direct call judged at the isolate's stale memo (TIP-1, no bound),
+/// then the consumer's delivery at the FRESH tip with its bound: it applies (`skipped: false`) and the game's stored
+/// `probeTip` is the delivery's. A direct call whose tip read faulted judges at the held tip and covers no fresher
+/// delivery either. The memo: the hook seeds the announced height (a lower one never replaces a fresher higher), a
+/// direct pass over a `tip` event reads fresh, and the hook seeds before it writes the block's marks. RED on
+/// `e99472091` (the API grafted inert: `covered_at` without the tip): `skipped=true`, `probeTip` 899999 for 900000.
+#[tokio::test]
+async fn fold10_a_a_stale_tip_direct_apply_never_makes_the_blocks_delivery_a_dupe() {
+    let w = WithActor {
+        d1: d1_judge(&stranded()).await,
+        actor: mirror(),
+        d1_judges: false,
+        event: Some(("tip", 11)),
+        actor_reads: true,
+        actor_fails: Cell::new(false),
+    };
+    let games = games_of(&w.d1, "owner");
+    let g0 = vec![games[0].clone()];
+    for chunk in games.chunks(GAMES_PER_APPLY) {
+        apply(
+            &w.d1,
+            &w.actor,
+            &Fakes,
+            "owner",
+            chunk,
+            None,
+            Some(TIP - 1),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    d_mark(&w, &g0[0], "gate");
+    let turn = futures_util::lock::Mutex::new(());
+    let (direct, _) = apply_event_in_turn(
+        &turn,
+        &w.d1,
+        &w.actor,
+        &Fakes,
+        "owner",
+        &g0,
+        Some(("tip", 11)),
+        Some(TIP - 1),
+        None,
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!direct.skipped);
+    let bound = crate::owed_judge::marks_bound(&w.d1, "owner", &g0)
+        .await
+        .unwrap();
+    let (delivery, _) = apply_event_in_turn(
+        &turn,
+        &w.d1,
+        &w.actor,
+        &Fakes,
+        "owner",
+        &g0,
+        Some(("tip", 11)),
+        Some(TIP),
+        None,
+        true,
+        Some(bound),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !delivery.skipped,
+        "the block's delivery applies over a stale-tip coverage"
+    );
+    assert_eq!(fold10_probe_tip(&w.actor, &g0[0]), Some(TIP as i64));
+    // The same delivery again is a dupe now (covered at its tip), and a delivery naming no tip compares as -1.
+    let (again, _) = apply_event_in_turn(
+        &turn,
+        &w.d1,
+        &w.actor,
+        &Fakes,
+        "owner",
+        &g0,
+        Some(("tip", 11)),
+        Some(TIP),
+        None,
+        true,
+        Some(bound),
+    )
+    .await
+    .unwrap();
+    assert!(again.skipped, "covered at the block's tip: a dupe");
+    assert!(covered_at(&w.actor, &g0, bound, None).await);
+    assert!(!covered_at(&w.actor, &g0, bound, Some(TIP + 1)).await);
+    // The held tip: a tipless direct body at an actor whose rows stand at TIP-1 covers no delivery at TIP.
+    let w2 = WithActor {
+        d1: d1_judge(&stranded()).await,
+        actor: mirror(),
+        d1_judges: false,
+        event: Some(("tip", 12)),
+        actor_reads: true,
+        actor_fails: Cell::new(false),
+    };
+    for chunk in games.chunks(GAMES_PER_APPLY) {
+        apply(
+            &w2.d1,
+            &w2.actor,
+            &Fakes,
+            "owner",
+            chunk,
+            None,
+            Some(TIP - 1),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    w2.actor
+        .conn
+        .execute(
+            "INSERT INTO meta(name,value) VALUES ('bootstrapped','1') ON CONFLICT(name) DO NOTHING",
+            [],
+        )
+        .unwrap();
+    d_mark(&w2, &g0[0], "gate");
+    let tipless = HeldEvent {
+        kind: Some("tip".into()),
+        seq: Some(12),
+        games: g0.clone(),
+        at_ms: Some(NOW_MS - 1_000),
+        mined: false,
+        tip: None,
+        held_at_ms: NOW_MS,
+        bound: None,
+    };
+    let turn2 = futures_util::lock::Mutex::new(());
+    let a = apply_or_hold(
+        &turn2, &w2.d1, &w2.actor, &Fakes, "owner", &tipless, None, true,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(a, Applied::Done(..)), "{a:?}");
+    let bound2 = crate::owed_judge::marks_bound(&w2.d1, "owner", &g0)
+        .await
+        .unwrap();
+    assert!(
+        !covered_at(&w2.actor, &g0, bound2, Some(TIP)).await,
+        "a held-tip apply covers no fresher delivery"
+    );
+    // The memo and the hook.
+    crate::owed_events::seed_tip_at(TIP - 1, 1_000.0);
+    crate::owed_events::seed_tip_at(TIP, 2_000.0);
+    assert_eq!(crate::owed_events::memo_tip_at(2_500.0), Some(TIP));
+    crate::owed_events::seed_tip_at(TIP - 3, 3_000.0);
+    assert_eq!(
+        crate::owed_events::memo_tip_at(3_500.0),
+        Some(TIP),
+        "a lower height never replaces a fresh higher one"
+    );
+    assert!(crate::owed_events::direct_reads_fresh(&[
+        d_event("pot", "a", 1, Value::Null),
+        d_event("tip", "gate", 2, Value::Null)
+    ]));
+    assert!(!crate::owed_events::direct_reads_fresh(&[d_event(
+        "pot",
+        "a",
+        1,
+        Value::Null
+    )]));
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let hook = squash(include_str!("../internal_events.rs"));
+    let hook = &hook[hook.find("pubasyncfntip_changed(").unwrap()..];
+    let seed = hook.find("crate::owed_events::seed_tip(height);").unwrap();
+    assert!(seed < hook.find("write_tip_marks(&judge,height)").unwrap());
+    assert!(
+        seed < hook
+            .find("crate::owed_events::schedule_direct(env,ctx);")
+            .unwrap()
+    );
+    let events = squash(include_str!("../owed_events.rs"));
+    assert!(events.contains("lettip=tip_memoised(env,direct_reads_fresh(&events)).await;"));
+}
+
+/// fold10_b (NEW5-M1, Phase A): THE SAMPLED COMPARE COUNTS NO REAL DIFF FOR AN ORDINARY BLOCK. The block's `tip` event
+/// on a sampled seq: the hook's direct apply at the previous height, then the consumer's delivery through the shipped
+/// `deliver` (the D1 judge at the block, the actor at the block under its bound): the gate opens on both judges, so
+/// `owed_actor_diffs_total` does not move and the actor's rows are judged at the block.
+#[tokio::test]
+async fn fold10_b_an_ordinary_block_is_no_real_diff_in_phase_a() {
+    let w = WithActor {
+        d1: d1_judge(&stranded()).await,
+        actor: mirror(),
+        d1_judges: true,
+        event: Some(("tip", 16)),
+        actor_reads: false,
+        actor_fails: Cell::new(false),
+    };
+    assert!(compare_sampled(Some(16)));
+    let games = games_of(&w.d1, "owner");
+    for chunk in games.chunks(GAMES_PER_APPLY) {
+        apply(
+            &w.d1,
+            &w.actor,
+            &Fakes,
+            "owner",
+            chunk,
+            None,
+            Some(TIP - 1),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let g0 = vec![games[0].clone()];
+    d_mark(&w, &g0[0], "gate");
+    let turn = futures_util::lock::Mutex::new(());
+    apply_event_in_turn(
+        &turn,
+        &w.d1,
+        &w.actor,
+        &Fakes,
+        "owner",
+        &g0,
+        Some(("tip", 16)),
+        Some(TIP - 1),
+        None,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let diffs = w.d1.counter("owed_actor_diffs_total");
+    let compared = w.d1.counter("owed_actor_compared_total");
+    crate::owed_events::deliver(&w, "owner", &g0).await.unwrap();
+    assert_eq!(
+        w.d1.counter("owed_actor_compared_total"),
+        compared + 1,
+        "the sampled event compared"
+    );
+    let lines: Vec<String> =
+        w.d1.lines
+            .borrow()
+            .iter()
+            .filter(|l| l.contains("DIFF"))
+            .cloned()
+            .collect();
+    assert_eq!(
+        w.d1.counter("owed_actor_diffs_total"),
+        diffs,
+        "an ordinary block is no STOP: {lines:?}"
+    );
+    assert_eq!(fold10_probe_tip(&w.actor, &g0[0]), Some(TIP as i64));
+}
+
+/// fold10_c (NEW5-M2): A MEMPOOL SPEND THE BELT FOUND THAT NEVER MINES RESTORES THE HOP'S HONEST PRESS within the
+/// belt's cadence. The belt finds the stranded hop spent by a stranger's UNCONFIRMED transaction (WoC's `/spent`
+/// `status: unconfirmed`): the row is `unbound`, the evidence durable; the memo ages out and the TTL sweep leaves the
+/// evidence (the hop's index row stands). The row rests on an unconfirmed find, so it is DATED and its ask is the
+/// OUTPOINT (never the spender, whose bytes are held); at its due time the couriers say the outpoint is unspent (the
+/// spend was dropped): the look clears the evidence and the row is the hop's sweep press again. The seed's
+/// `spentConfirmed`: 1 where a checked proof of the spender is latched, NULL where nothing proves it. RED on
+/// `e99472091` (the predicate grafted inert): `beltDueAtMs` NULL, the row `unbound` for ever.
+#[tokio::test]
+async fn fold10_c_a_dropped_mempool_spend_restores_the_sweep_press() {
+    let w = WithActor {
+        d1: d1_judge(&stranded()).await,
+        actor: mirror(),
+        d1_judges: true,
+        event: None,
+        actor_reads: false,
+        actor_fails: Cell::new(false),
+    };
+    let hop = format!("{STRANDED_HOP}:0");
+    let due_of = |w: &WithActor| -> Option<i64> {
+        w.d1.conn
+            .query_row(
+                "SELECT beltDueAtMs FROM owed_rows WHERE identity='owner' AND outpoint=?1",
+                [&hop],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let at = due_of(&w).unwrap() as u64 + 1;
+    w.d1.now.set(at);
+    w.actor.now.set(at);
+    let (spend, spender) = fold9_spend(STRANDED_HOP);
+    let mempool = Couriers {
+        answers: vec![
+            (
+                format!("{STRANDED_HOP}/0/spent"),
+                (
+                    200,
+                    json!({"txid": spender, "vin": 0, "status": "unconfirmed"})
+                        .to_string()
+                        .into_bytes(),
+                ),
+            ),
+            (
+                format!("tx/{spender}/hex"),
+                (200, hex::encode(spend.to_binary()).into_bytes()),
+            ),
+        ],
+        ..Default::default()
+    };
+    crate::owed_events_publish::drain();
+    let report = crate::owed_belt::tick(&w, &mempool).await.unwrap();
+    assert!(report.found >= 1, "{report:?}");
+    let found = fold9_row(&w.d1, &hop).unwrap();
+    assert_eq!(found.0, "unbound", "{found:?}");
+    assert_ne!(found.2["spentConfirmed"], json!(true), "{found:?}");
+    assert!(crate::owed_belt::rests_on_unconfirmed_find(&found.2));
+    let due = due_of(&w).expect("a row on an unconfirmed find is dated");
+    // The memo's two hours pass; the TTL sweep leaves the evidence.
+    fold9_expire(&w.d1);
+    assert!(fold9_probe(&w.d1, &hop).is_some(), "the evidence stands");
+    let later = w.d1.now.get().max(due as u64 + 1);
+    w.d1.now.set(later);
+    w.actor.now.set(later);
+    let candidate = crate::owed_belt::candidate_of(&json!({
+        "identity": "owner", "outpoint": hop, "gameId": "g", "family": "unbound",
+        "facts": found.2.to_string(), "reason": found.3, "claimable": found.1,
+    }));
+    assert!(
+        matches!(
+            crate::owed_belt::ask_of(&candidate),
+            Some(crate::owed_belt::Ask::Outpoint { .. })
+        ),
+        "the ask is the outpoint, never the spender"
+    );
+    // The spend was dropped: WoC holds no spend, BananaBlocks says unspent.
+    let dropped = Couriers {
+        answers: vec![("/spend".to_string(), (200, br#"{"spent":false}"#.to_vec()))],
+        ..Default::default()
+    };
+    let report = crate::owed_belt::tick(&w, &dropped).await.unwrap();
+    assert!(report.found >= 1, "{report:?}");
+    assert!(fold9_probe(&w.d1, &hop).is_none(), "the evidence retired");
+    let row = fold9_row(&w.d1, &hop).unwrap();
+    assert_eq!(
+        (row.0.as_str(), row.1),
+        ("hop-stranded", Some(1)),
+        "the honest sweep press is back: {row:?}"
+    );
+    // The seed's confirmation (the one-time seeding of the finds made before FOLD-9).
+    let seed = crate::owed_backfill::FIND_EVIDENCE_SEED_SQL;
+    assert!(seed.contains("'proofmined:'||b.txid||'.'"));
+    assert!(seed.contains("t.has_proof=1) THEN 1 ELSE NULL END"));
+    assert!(!seed.contains("b.txid,NULL,NULL"));
+}
+
+/// fold10_d (NEW5-L1): `fold7_a`'s cold bar asserts its page count always and its per-page work only in a release
+/// profile, never a wall clock in the debug parallel suite (it red at 60,035 and 78,252 ms under load).
+#[test]
+fn fold10_d_the_cold_bar_is_no_wall_clock_in_a_debug_build() {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let src = squash(include_str!("tests.rs"));
+    let a = &src[src.find("asyncfnd2_actor_b_fold7_a_").unwrap()..];
+    let a = &a[..a.find("asyncfnd2_actor_b_fold7_b_").unwrap()];
+    assert!(a.contains("assert_eq!(pages,38);"));
+    assert!(
+        !a.contains("assert!(paced<60_000"),
+        "no wall-clock bar in the debug suite"
+    );
+    assert!(a.contains("if!cfg!(debug_assertions){"));
+    assert!(a.contains("per_page<COLD_PAGE_WORK_BAR_MS"));
+    assert_eq!(
+        COLD_PAGE_WORK_BAR_MS,
+        (60_000 - 37 * BOOTSTRAP_PAGE_DELAY_MS) / 38
+    );
+}
+
+/// fold10_e (NEW5-L2): THE CONSUMER DISCARDS ONLY ITS OWN EVENTS. A writer's event and the consumer's continuation
+/// held in the isolate's direct set: the consumer's take removes its own and leaves the writer's for the writer's
+/// flush point; the belt's tick calls its published set directly. New API (`take_direct_where`, `consumer_owns`):
+/// does not compile on `e99472091`, where the consumer took the whole set (`take_direct()`).
+#[test]
+fn fold10_e_the_consumer_takes_its_own_direct_events_alone() {
+    let _ = crate::owed_events_publish::take_direct();
+    let ev = d_event("tip", "gate", 40, Value::Null);
+    crate::owed_events_publish::hold_direct(&[
+        d_event("pot", "writer:0", 41, Value::Null),
+        d_event("tip", "gate", 42, Value::Null),
+    ]);
+    let own = crate::owed_events_publish::take_direct_where(|e| {
+        crate::owed_events::consumer_owns(&ev, e)
+    });
+    assert_eq!(own.len(), 1);
+    assert_eq!(own[0].seq, 42);
+    let left = crate::owed_events_publish::take_direct();
+    assert_eq!(left.len(), 1, "the writer's event stays held");
+    assert_eq!(left[0].source_key, "writer:0");
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let events = squash(include_str!("../owed_events.rs"));
+    let consume = &events[events.find("pubasyncfnconsume_one(").unwrap()..];
+    let consume = &consume[..consume.find("pubfnconsumer_owns(").unwrap()];
+    assert!(consume.contains("publish::take_direct_where(|e|consumer_owns(ev,e))"));
+    assert!(!consume.contains("publish::take_direct()"));
+    let belt = squash(include_str!("../owed_belt.rs"));
+    let tick = &belt[belt.find("pubasyncfntick_env(").unwrap()..];
+    let tick = &tick[..tick.find("pubasyncfnreconcile_env(").unwrap()];
+    assert!(tick.contains("crate::owed_events::direct_held(env).await;"));
+}
+
+/// fold10_f (NEW5-L3): A BURST FOR ONE IDENTITY IS ONE CALL with the union of its games, never N calls: three events
+/// naming one identity (a JOIN's pot, party and hop pairs) and one naming another are two calls, the first carrying
+/// the union, the first event's key, the earliest write time, the others' keys (`also`) and `class: "direct"`; a
+/// union past 16 games is its chunks. The overlay's hand-off shares one wall bounded by the flush's own deadline,
+/// read before it. RED on `e99472091`: one call an event (`left: 4 right: 2`).
+#[tokio::test]
+async fn fold10_f_a_burst_for_one_identity_is_one_call() {
+    struct Burst(RefCell<Vec<Value>>);
+    impl crate::owed_events::DirectPort for Burst {
+        async fn subjects(
+            &self,
+            ev: &overlay_discovery::owed_event::OwedEvent,
+        ) -> Result<Vec<(String, Vec<String>)>, String> {
+            Ok(match ev.source_key.as_str() {
+                "b" => vec![("other".into(), vec!["gb".into()])],
+                k => vec![("Owner".into(), vec!["g0".into(), format!("g-{k}")])],
+            })
+        }
+        async fn call(&self, body: Value) -> Result<Value, String> {
+            self.0.borrow_mut().push(body);
+            Ok(json!({"applied": true, "firstApply": true}))
+        }
+    }
+    let port = Burst(RefCell::default());
+    let events = vec![
+        d_event("pot", "p", 50, Value::Null),
+        d_event("party", "q", 48, Value::Null),
+        d_event("pot", "b", 51, Value::Null),
+        d_event("hop", "r", 52, Value::Null),
+    ];
+    let report = crate::owed_events::direct_with(&port, events, Some(TIP)).await;
+    assert_eq!(report.calls, 2, "{:?}", port.0.borrow());
+    let calls = port.0.borrow();
+    let owner = &calls[0];
+    assert_eq!(owner["identity"], json!("owner"));
+    assert_eq!(owner["games"], json!(["g0", "g-p", "g-q", "g-r"]));
+    assert_eq!(
+        (owner["kind"].clone(), owner["seq"].clone()),
+        (json!("pot"), json!(50))
+    );
+    assert_eq!(owner["atMs"], json!(1_048), "the earliest write time");
+    assert_eq!(owner["also"], json!([["party", 48], ["hop", 52]]));
+    assert_eq!(owner["class"], json!("direct"));
+    assert!(calls[1]["also"].is_null());
+    let many: Vec<(EventCtx, crate::owed_events::Subjects)> = (0..3)
+        .map(|n| {
+            (
+                EventCtx {
+                    kind: "pot".into(),
+                    seq: n,
+                    at_ms: 1,
+                    mined: false,
+                },
+                vec![(
+                    "owner".into(),
+                    (0..GAMES_PER_APPLY / 2 + 1)
+                        .map(|g| format!("g{n}-{g}"))
+                        .collect(),
+                )],
+            )
+        })
+        .collect();
+    assert_eq!(
+        crate::owed_events::coalesce_direct(many, None).len(),
+        2,
+        "a union past the call's games is its chunks"
+    );
+    // The overlay's hand-off: one wall, the flush's deadline read before it.
+    use bsv_overlay_cloudflare::change_flush::{owed_direct_end, OWED_DIRECT_POST_WALL_MS};
+    assert_eq!(
+        owed_direct_end(1_000, 50_000),
+        1_000 + OWED_DIRECT_POST_WALL_MS
+    );
+    assert_eq!(owed_direct_end(1_000, 1_500), 1_500);
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let pots = squash(include_str!(
+        "../../../overlay-cloudflare/src/pot_changes.rs"
+    ));
+    assert_eq!(
+        pots.matches("crate::change_flush::ship_owed_direct(&env,deadline_ms).await;")
+            .count()
+            + pots
+                .matches("crate::change_flush::ship_owed_direct(&env2,deadline_ms).await;")
+                .count(),
+        3
+    );
+    for (n, _) in pots.match_indices("crate::change_flush::ship_owed_direct(&") {
+        assert!(
+            pots[..n].rfind("letdeadline_ms=").is_some()
+                || pots[..n].contains("BackgroundFlush::Ship{deadline_ms}")
+        );
+    }
+}
+
+/// fold10_g (NEW5-L4): A BUILD'S REPLACE OF THE BARS ROWS CARRIES THE OLDEST UNAPPLIED WRITE TIME: the samples of the
+/// old build go, `oldestUnappliedAtMs` stays (a fact about the fleet's actors); a new value replaces it, a clear
+/// clears it. RED on `e99472091`: the replaced row has no `oldestUnappliedAtMs` (`left: Null right: 1234`).
+#[test]
+fn fold10_g_a_builds_replace_carries_the_oldest_unapplied() {
+    let old =
+        json!({"libRev": "old", "apply": [5, 6], "visible": [7], "oldestUnappliedAtMs": 1234})
+            .to_string();
+    let row: Value =
+        serde_json::from_str(&merge_bars_row(Some(&old), &[1], &[], None, "new")).unwrap();
+    assert_eq!(row["libRev"], json!("new"));
+    assert_eq!(row["apply"], json!([1]), "the old build's samples go");
+    assert_eq!(row["oldestUnappliedAtMs"], json!(1234));
+    let row: Value =
+        serde_json::from_str(&merge_bars_row(Some(&old), &[], &[], Some(Some(99)), "new")).unwrap();
+    assert_eq!(row["oldestUnappliedAtMs"], json!(99));
+    let row: Value =
+        serde_json::from_str(&merge_bars_row(Some(&old), &[], &[], Some(None), "new")).unwrap();
+    assert_eq!(row["oldestUnappliedAtMs"], Value::Null);
+}
+
+/// fold10_h (NEW5-L5): THE OBJECT NOTES ITS FIRST-APPLY VISIBILITY ITSELF. A direct call that walled still has its
+/// event applied (the caller gone): the object notes the answer into the fleet's bars under the call's class and marks
+/// it `noted`, so the caller's note of a noted answer adds no sample (only its unapplied bookkeeping), and the
+/// consumer's later covered delivery samples nothing. The object's source: noted before it answers, an event apply
+/// only (the tip alarm notes nothing). RED on `e99472091`: the object's samples reach its local meter only.
+#[test]
+fn fold10_h_the_object_notes_its_own_first_apply() {
+    let answer = json!({"applied": true, "firstApply": true, "identity": "owner", "atMs": 1_000, "judgedAtMs": 1_300, "applyMs": 40});
+    let mut object = PendingBars::default();
+    object.note_answer(bars_class(Some("direct")), &answer);
+    assert_eq!(object.visible.get("direct").map(Vec::len), Some(1));
+    let mut noted = answer.clone();
+    noted["noted"] = json!(true);
+    let mut caller = PendingBars::default();
+    caller.unapplied.insert("owner".into(), 5);
+    caller.note_answer("direct", &noted);
+    assert!(
+        caller.visible.is_empty() && caller.apply.is_empty(),
+        "no second sample"
+    );
+    assert!(
+        caller.unapplied.is_empty(),
+        "the caller's unapplied bookkeeping kept"
+    );
+    assert_eq!(bars_class(None), "queue");
+    assert_eq!(bars_class(Some("tip")), "queue");
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    let route = &object[object.find("asyncfnapply_route(").unwrap()..];
+    let note = route
+        .find("ifbody.at_ms.is_some(){note_answer_as(bars_class(body.class.as_deref()),&answer);flush_bars(&record,now,false).await;answer[\"noted\"]=json!(true);}")
+        .expect("the object notes its own answer");
+    assert!(
+        note < route
+            .find("Response::from_json(&answer)\n")
+            .unwrap_or(usize::MAX)
+            .min(route.len())
+    );
+}
+
+/// fold10_i (item 8): THE DIRECT PATH'S FAULTS LOG THEIR FIRST TEXT once a minute an isolate
+/// (`[owed-actor] direct fault: <status or error>`), so an operator can read why `direct.faults` moved. RED on
+/// `e99472091`: no fault text is kept (`DirectReport::first_fault` absent; the line counted only).
+#[tokio::test]
+async fn fold10_i_the_direct_faults_log_their_first_text_once_a_minute() {
+    let port = FakeDirect(RefCell::default());
+    let report = crate::owed_events::direct_with(
+        &port,
+        vec![
+            d_event("pot", "ok-a", 1, Value::Null),
+            d_event("pot", "fault-b", 2, Value::Null),
+            d_event("pot", "wall-c", 3, Value::Null),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!((report.faults, report.walls), (1, 1));
+    let text = report.first_fault.clone().unwrap();
+    assert!(
+        text.contains("503") || text.contains("no answer in"),
+        "{text}"
+    );
+    let line = crate::owed_events::direct_fault_line(&report, 100_000, None).unwrap();
+    assert!(line.starts_with("[owed-actor] direct fault: "), "{line}");
+    assert!(line.contains(&text));
+    assert!(crate::owed_events::direct_fault_line(&report, 130_000, Some(100_000)).is_none());
+    assert!(crate::owed_events::direct_fault_line(&report, 160_000, Some(100_000)).is_some());
+    let clean = crate::owed_events::DirectReport::default();
+    assert!(crate::owed_events::direct_fault_line(&clean, 0, None).is_none());
+    let logged = RefCell::new(Vec::<String>::new());
+    crate::owed_events::log_direct_fault(&report, 500_000, |l| logged.borrow_mut().push(l.into()));
+    crate::owed_events::log_direct_fault(&report, 510_000, |l| logged.borrow_mut().push(l.into()));
+    assert_eq!(logged.borrow().len(), 1, "once a minute");
+}
+
+/// fold10_j (the captain's item of 2026-10-29, beta's fourth RECONCILE DIFF): A STATE JUDGED UNDER ANOTHER BUILD IS
+/// JUDGED AGAIN. An actor bootstrapped on FOLD-7's build kept a row the FOLD-9 judge no longer produces: the lever's
+/// `arm_bootstrap` answered `already` whenever `bootstrapped` was set. Now the bootstrap's end stamps the build
+/// (`judgedLibRev`), and a bootstrapped actor whose stamp is another build's (or absent: stamped before this fold) is
+/// re-armed from the start on the lever and after an event it applies, counted `owed_actor_rejudged_total` (both
+/// Workers' lists), served beside `bootstraps`; the lever's answer names `rejudged` apart from `armed`; the same build
+/// answers `already`. RED on `e99472091`: `rejudge_due` does not exist (the lever answered `already` for every stamp).
+#[test]
+fn fold10_j_a_state_judged_under_another_build_bootstraps_again() {
+    let running = lib_rev();
+    assert!(
+        !rejudge_due(true, Some(running), running),
+        "the same build: already"
+    );
+    assert!(rejudge_due(true, Some("an-older-build"), running));
+    assert!(
+        rejudge_due(true, None, running),
+        "stamped before the fold: re-judged"
+    );
+    assert!(
+        !rejudge_due(false, None, running),
+        "a cold actor bootstraps as before"
+    );
+    assert_eq!(COUNTERS[26], "owed_actor_rejudged_total");
+    assert_eq!(
+        bsv_overlay_cloudflare::applayer_counters::OWED_ACTOR[26],
+        COUNTERS[26]
+    );
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    let arm = &object[object.find("asyncfnarm_bootstrap(").unwrap()..];
+    let arm = &arm[..arm
+        .find("ifself.meta(META_BOOT_CURSOR).is_some(){ifboot_parked")
+        .unwrap()];
+    let check = arm
+        .find("if!rejudge_due(true,judged.as_deref(),lib_rev()){returnArmed{already:true,")
+        .expect("`already` only under the running build");
+    let rearm = arm
+        .find("self.put_meta(&local,META_BOOT_CURSOR,BOOT_CURSOR_START);")
+        .unwrap();
+    assert!(check < rearm);
+    assert!(arm.contains("record.counters(vec![(COUNTERS[26].into(),1)]).await;"));
+    assert!(arm.contains("rejudged:true"));
+    let done = &object[object.find("BootStep::Done{drain,..}=>{").unwrap()..];
+    assert!(done[..400].contains("self.put_meta(local,META_JUDGED_REV,lib_rev());"));
+    let route = &object[object.find("asyncfnapply_route(").unwrap()..];
+    assert!(route.contains("lib_rev(),){self.arm_bootstrap(&me,false).await;}"));
+    assert!(object.contains("\"armed\":armed,\"rejudged\":rejudged,\"bootstrapped\":done,"));
+    let actor = squash(include_str!("../owed_actor.rs"));
+    assert!(actor.contains("body[\"rejudged\"]=n(COUNTERS[26]);"));
+    assert!(
+        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total'))AScounters")
     );
 }

@@ -250,6 +250,16 @@ macro_rules! seed_candidates {
         "FROM (SELECT txid,bytesJson,createdAtMs FROM owed_spender_bytes WHERE txid>?1 ORDER BY txid LIMIT ?2) b CROSS JOIN json_each(b.bytesJson,'$.inputs') i CROSS JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=lower(json_extract(i.value,'$[0]')) AND hp.hopVout=json_extract(i.value,'$[1]') WHERE json_valid(b.bytesJson) AND EXISTS (SELECT 1 FROM pot_records p WHERE p.txid=hp.txid AND p.outputIndex=hp.hopVout AND p.spent=0 AND p.spendingTxid IS NULL) AND NOT EXISTS (SELECT 1 FROM hop_chain_probes e WHERE e.outpoint=hp.txid||':'||hp.hopVout)"
     };
 }
+/// D2-ACTOR-B-FOLD-10 (the fifth delta lens's NEW5-M2): the seeded find's `spentConfirmed` from what the record
+/// already proves of the spender's block: `1` where a chaintracks-checked mined proof of it is latched
+/// (`proofmined:<txid>.<height>`, a range of the memo's key) or the index holds its verified proof
+/// (`transactions.has_proof`); NULL only where neither is known (the belt then re-asks the outpoint,
+/// `owed_belt::rests_on_unconfirmed_find`).
+macro_rules! seed_confirmed {
+    () => {
+        "CASE WHEN EXISTS (SELECT 1 FROM hop_chain_probes l WHERE l.outpoint>'proofmined:'||b.txid||'.' AND l.outpoint<'proofmined:'||b.txid||'/') OR EXISTS (SELECT 1 FROM transactions t WHERE t.txid=b.txid AND t.has_proof=1) THEN 1 ELSE NULL END"
+    };
+}
 /// The seats of the page's standing finds marked (`hop`, the evidence key; a downgrade), BEFORE the seeding (its
 /// `NOT EXISTS` reads the evidence absent), in the seeding's batch.
 pub const FIND_EVIDENCE_MARK_SQL: &str = concat!(
@@ -258,7 +268,9 @@ pub const FIND_EVIDENCE_MARK_SQL: &str = concat!(
     " ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs,downgrade=MAX(owed_dirty.downgrade,excluded.downgrade)"
 );
 pub const FIND_EVIDENCE_SEED_SQL: &str = concat!(
-    "INSERT INTO hop_chain_probes (outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) SELECT DISTINCT hp.txid||':'||hp.hopVout,b.createdAtMs,1,b.txid,NULL,NULL ",
+    "INSERT INTO hop_chain_probes (outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) SELECT DISTINCT hp.txid||':'||hp.hopVout,b.createdAtMs,1,b.txid,",
+    seed_confirmed!(),
+    ",NULL ",
     seed_candidates!(),
     " ON CONFLICT(outpoint) DO NOTHING"
 );

@@ -292,6 +292,19 @@ fn split_outpoint(outpoint: &str) -> Option<(String, u32)> {
     Some((t.to_ascii_lowercase(), v.parse().ok()?))
 }
 
+/// D2-ACTOR-B-FOLD-10 (the fifth delta lens's NEW5-M2): does this row rest on a courier find of an UNCONFIRMED spend
+/// (a hop row the chain rung found spent, `chainProbe: "spent"`, with no confirmation, `spentConfirmed` not `true`)?
+/// Such evidence is durable (bsv-low #953) and only an Outpoint look retires it, so the belt asks the OUTPOINT for it
+/// (never the spender: a spender's raw answers nothing about a spend that never mines), dated at its backoff
+/// (`owed_judge::belt_due`): a later look that finds it unspent clears the evidence and the hop's press returns; one
+/// that finds it confirmed refreshes `spentConfirmed` and the question ends. Never a press over a spend the couriers
+/// still hold: the row stays `unbound` until a look says unspent.
+pub fn rests_on_unconfirmed_find(facts: &Value) -> bool {
+    facts["hopTxid"].is_string()
+        && facts["chainProbe"] == "spent"
+        && facts["spentConfirmed"] != true
+}
+
 pub fn ask_of(c: &Candidate) -> Option<Ask> {
     let fact = |k: &str| {
         c.facts[k]
@@ -301,6 +314,9 @@ pub fn ask_of(c: &Candidate) -> Option<Ask> {
     };
     match c.family.as_str() {
         "payout" if c.facts["creditKind"] == "courier-bytes" => Some(Ask::Home),
+        "unbound" if rests_on_unconfirmed_find(&c.facts) => {
+            split_outpoint(&c.outpoint).map(|(txid, vout)| Ask::Outpoint { txid, vout })
+        }
         "unbound" => fact("chainSpender")
             .or_else(|| fact("spendingTxid"))
             .or_else(|| fact("settleTxid"))
@@ -1515,6 +1531,9 @@ pub async fn tick_env(env: &worker::Env) -> Result<TickReport, String> {
     // mark a judge already acknowledged is not sent; a publish that does not land leaves the mark to the sweep).
     if crate::owed_events::configured(env).await {
         crate::owed_events::publish_noted(env).await;
+        // D2-ACTOR-B-FOLD-10 (NEW5-L2): the tick's published finds are called directly too, inline (the belt is a
+        // writer like any other; its set was left held for the isolate's next taker).
+        crate::owed_events::direct_held(env).await;
     }
     report
 }

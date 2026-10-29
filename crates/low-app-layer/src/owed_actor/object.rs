@@ -23,6 +23,8 @@ pub struct Armed {
     pub already: bool,
     pub rearmed: bool,
     pub parked: bool,
+    /// D2-ACTOR-B-FOLD-10: a bootstrapped actor whose state another build judged, re-armed from the start.
+    pub rejudged: bool,
 }
 
 /// The alarm's cadence while the actor waits for a block (a gated row or a courier-dated sweep): about a block.
@@ -36,6 +38,8 @@ const META_JUDGED_AT: &str = "judgedAtMs";
 const META_IDENTITY: &str = "identity";
 const META_BOOTSTRAPPED: &str = "bootstrapped";
 const META_BOOT_CURSOR: &str = "bootCursor";
+/// D2-ACTOR-B-FOLD-10: the build (`lib_rev`) whose bootstrap last judged the whole state ([`rejudge_due`]).
+const META_JUDGED_REV: &str = "judgedLibRev";
 /// MEDIUM-4: the last tip the tip alarm judged (its next window is `(tipJudged, tip]`).
 const META_TIP_JUDGED: &str = "tipJudged";
 /// NEW2-L5: the tip window's carried faults ([`tip_window`]), a JSON object of game to consecutive faults.
@@ -241,6 +245,15 @@ pub struct ApplyBody {
     /// this call): every game covered at or past it is a DUPE, answered from the seq check without an apply.
     #[serde(default)]
     pub bound: Option<i64>,
+    /// D2-ACTOR-B-FOLD-10 (the fifth delta lens's NEW5-L5): the path that called (`direct`, else the queue's): the
+    /// object notes its own first-apply visibility into the fleet's durable bars under it, so an event whose direct
+    /// call walled (its caller gone, the apply landed) is still sampled once.
+    #[serde(default)]
+    pub class: Option<String>,
+    /// NEW5-L3: the other events a coalesced direct call carries (`[kind, seq]`), each recorded as applying these games
+    /// (the first-apply rule's key), beside the body's own.
+    #[serde(default)]
+    pub also: Vec<(String, i64)>,
 }
 
 #[durable_object]
@@ -302,7 +315,7 @@ impl DurableObject for OwedActor {
                 };
                 let armed = self.arm_bootstrap(&me, true).await;
                 Response::from_json(
-                    &json!({"identity": me, "armed": armed.armed, "bootstrapped": armed.already, "rearmed": armed.rearmed, "parked": armed.parked}),
+                    &json!({"identity": me, "armed": armed.armed, "bootstrapped": armed.already, "rearmed": armed.rearmed, "parked": armed.parked, "rejudged": armed.rejudged}),
                 )
             }
             (Method::Post, "/apply") => {
@@ -421,6 +434,8 @@ impl DurableObject for OwedActor {
                         txfacts: Vec::new(),
                         mined: false,
                         bound: None,
+                        class: None,
+                        also: Vec::new(),
                     };
                     async move {
                         self.apply_route(body)
@@ -601,8 +616,32 @@ impl OwedActor {
     async fn arm_bootstrap(&self, me: &str, lever: bool) -> Armed {
         let local = self.local();
         if self.meta(META_BOOTSTRAPPED).is_some() {
+            // D2-ACTOR-B-FOLD-10: the state another build judged is judged again (its bootstrap from the start, the
+            // state served meanwhile); one already re-judging keeps its run.
+            let judged = self.meta(META_JUDGED_REV);
+            if !rejudge_due(true, judged.as_deref(), lib_rev()) {
+                return Armed {
+                    already: true,
+                    ..Armed::default()
+                };
+            }
+            if self.meta(META_BOOT_CURSOR).is_some() {
+                return Armed::default();
+            }
+            console_log!(
+                "[owed-actor] {me}: the state was judged by build {} (running {}): re-judged from the start",
+                judged.as_deref().unwrap_or("before FOLD-10"),
+                lib_rev()
+            );
+            self.put_meta(&local, META_IDENTITY, me);
+            self.put_meta(&local, META_BOOT_CURSOR, BOOT_CURSOR_START);
+            self.alarm_in(0).await;
+            if let Ok(record) = crate::routes::D1Sql::of(&self.env) {
+                record.counters(vec![(COUNTERS[26].into(), 1)]).await;
+            }
             return Armed {
-                already: true,
+                armed: true,
+                rejudged: true,
                 ..Armed::default()
             };
         }
@@ -827,6 +866,14 @@ impl OwedActor {
         self.put_meta(&local, META_JUDGED_AT, &now.to_string());
         // NEW2-L5: an apply that landed clears its games' carried tip faults (a parked game re-enters the window).
         self.clear_tip_faults(&local, &body.games);
+        // D2-ACTOR-B-FOLD-10: an event applied over a state another build judged re-judges the rest of it.
+        if rejudge_due(
+            self.meta(META_BOOTSTRAPPED).is_some(),
+            self.meta(META_JUDGED_REV).as_deref(),
+            lib_rev(),
+        ) {
+            self.arm_bootstrap(&me, false).await;
+        }
         // THE PUSH (section 4): `owed-changed` through the relay's pots room, carrying the judgement and the event's
         // write time (the harness's bar).
         self.publish_pushes(pushes, now, body.at_ms);
@@ -840,6 +887,33 @@ impl OwedActor {
         }
         // MEDIUM-4: the actor's own tip alarm, at the next gate or (a courier-dated sweep held) the next block.
         self.arm_tip_alarm(&local, body.tip).await;
+        // NEW5-L3: a coalesced direct call's other events applied these games too.
+        if !body.also.is_empty() {
+            let games = json!(body
+                .games
+                .iter()
+                .map(|g| g.to_ascii_lowercase())
+                .collect::<Vec<_>>())
+            .to_string();
+            let stmts: Vec<Stmt> = body
+                .also
+                .iter()
+                .map(|(kind, seq)| {
+                    Stmt::new(
+                        APPLIED_SQL,
+                        vec![
+                            Bind::Text(kind.clone()),
+                            Bind::Int(*seq),
+                            Bind::Int(now as i64),
+                            Bind::Text(games.clone()),
+                        ],
+                    )
+                })
+                .collect();
+            if let Err(e) = local.run_batch(stmts).await {
+                console_log!("[owed-actor] {me}: a coalesced call's events not recorded: {e}");
+            }
+        }
         let mut answer = answer_of(&report, self.rows_of(&local, &me));
         answer["identity"] = json!(me);
         answer["judgedAtMs"] = json!(now);
@@ -847,6 +921,14 @@ impl OwedActor {
         answer["mined"] = json!(body.mined);
         answer["applyMs"] = json!(now.saturating_sub(started));
         answer["ackSeq"] = json!(self.meta(META_ACK));
+        // NEW5-L5: the object notes its own samples into the fleet's bars (the caller may be gone: a walled direct
+        // call), then marks the answer noted so the caller adds no second sample.
+        // An apply with no event (the tip alarm's window) is no delivery: its caller notes nothing, nor does it.
+        if body.at_ms.is_some() {
+            note_answer_as(bars_class(body.class.as_deref()), &answer);
+            flush_bars(&record, now, false).await;
+            answer["noted"] = json!(true);
+        }
         Response::from_json(&answer)
     }
 
@@ -1008,6 +1090,8 @@ impl OwedActor {
             BootStep::Done { drain, .. } => {
                 let now = Date::now().as_millis();
                 self.put_meta(local, META_JUDGED_AT, &now.to_string());
+                // D2-ACTOR-B-FOLD-10: the whole state is this build's judgement now.
+                self.put_meta(local, META_JUDGED_REV, lib_rev());
                 let _ = local
                     .sql
                     .exec("DELETE FROM meta WHERE name='bootCursor'", None);
@@ -1357,12 +1441,14 @@ pub async fn bootstrap_lever(mut req: Request, env: &Env) -> Result<Response> {
         .filter_map(|r| r["identity"].as_str().map(str::to_string))
         .collect();
     let (mut armed, mut done, mut skipped, mut faults) = (0u64, 0u64, Vec::new(), Vec::new());
+    let mut rejudged = 0u64;
     for id in &ids {
         if actor_name(id).is_none() {
             skipped.push(id.clone());
             continue;
         }
         match call_bootstrap(env, id, DIRECT_CALL_WALL_MS).await {
+            Ok(a) if a["rejudged"] == true => rejudged += 1,
             Ok(a) if a["armed"] == true => armed += 1,
             Ok(a) if a["bootstrapped"] == true => done += 1,
             Ok(_) => {}
@@ -1410,7 +1496,7 @@ pub async fn bootstrap_lever(mut req: Request, env: &Env) -> Result<Response> {
         ])
         .await;
     Response::from_json(
-        &json!({"identities": ids.len(), "armed": armed, "bootstrapped": done, "skipped": skipped, "faults": faults, "next": next, "coverage": coverage}),
+        &json!({"identities": ids.len(), "armed": armed, "rejudged": rejudged, "bootstrapped": done, "skipped": skipped, "faults": faults, "next": next, "coverage": coverage}),
     )
 }
 
