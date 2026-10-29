@@ -6756,8 +6756,9 @@ fn fold10_h_the_object_notes_its_own_first_apply() {
     let object = squash(include_str!("object.rs"));
     let route = &object[object.find("asyncfnapply_route(").unwrap()..];
     let note = route
-        .find("ifbody.at_ms.is_some(){note_answer_as(bars_class(body.class.as_deref()),&answer);flush_bars(&record,now,false).await;answer[\"noted\"]=json!(true);}")
+        .find("ifsamples{note_answer_as(bars_class(body.class.as_deref()),&answer);flush_bars(&record,now,false).await;answer[\"noted\"]=json!(true);}")
         .expect("the object notes its own answer");
+    assert!(route.contains("letsamples=samples_bars(body.at_ms,body.class.as_deref());"), "the note is gated by samples_bars (FOLD-16 item 5)");
     assert!(
         note < route
             .find("Response::from_json(&answer)\n")
