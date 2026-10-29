@@ -5100,8 +5100,8 @@ fn d2_actor_b_fold8_k_the_diff_lines_name_what_differs() {
     let src = squash(include_str!("../owed_actor.rs"));
     assert_eq!(
         src.matches("diff_detail(&d1,&actor,&").count(),
-        2,
-        "both compare lines"
+        3,
+        "the compare's three lines (FIX-964 added the lag line)"
     );
     assert!(src.contains("actorbootstrappedatthecompare:{};{}"));
     assert!(src.contains("diff_detail(&a,&b,&differ)"));
@@ -10033,4 +10033,188 @@ async fn fix962_c_the_page_line_and_the_cold_page_bar() {
     assert!(page.contains("console_log!(\"{}\",page_line(&me,page_games,page_ms,wait,&left));"));
     assert!(page.contains("if!rejudge{note_cold_page(page_ms);}"));
     assert!(page.contains("if!rejudge{flush_bars(&record,now,true).await;}"));
+}
+
+// ---- FIX-964 (bsv-low #964): under a queue backlog a stale actor row is held by LAG, never a judge disagreement ----
+
+/// The D1 judge's stored rows of `identity` (the compare's own read) and the first row's outpoint and game.
+fn fix964_rows(d1: &SqliteSql, identity: &str) -> Vec<Value> {
+    let mut q = d1
+        .conn
+        .prepare("SELECT json_object('identity',identity,'outpoint',outpoint,'family',family,'gameId',gameId,'sats',sats,'opponentIdentity',opponentIdentity,'atHeight',atHeight,'facts',facts,'reason',reason,'judgedAtMs',judgedAtMs,'claimable',claimable,'probeTip',probeTip,'gateHeight',gateHeight,'beltDueAtMs',beltDueAtMs) FROM owed_rows WHERE identity=?1 ORDER BY outpoint")
+        .unwrap();
+    q.query_map([identity], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|s| serde_json::from_str(&s.unwrap()).unwrap())
+        .collect()
+}
+/// A pending mark of `game`, written at `at_ms` (before the compare), its generation answered.
+fn fix964_mark(d1: &SqliteSql, game: &str, key: &str, at_ms: i64) -> i64 {
+    d1.conn
+        .execute(
+            "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner',?1,'pot',?2,?3)",
+            rusqlite::params![game, key, at_ms],
+        )
+        .unwrap();
+    d1.conn.last_insert_rowid()
+}
+/// The fixture judged in D1, its `owner` rows, and an actor answer whose first row is STALE (the same outpoint, an
+/// older judgement): `(d1, games, the stale outpoint's game, the answer)`.
+async fn fix964_stale() -> (SqliteSql, Vec<String>, String, Value, String) {
+    let d1 = d1_judge(&stranded()).await;
+    d1.conn.execute("DELETE FROM owed_dirty", []).unwrap();
+    let games = games_of(&d1, "owner");
+    let mut actor = fix964_rows(&d1, "owner");
+    assert!(!actor.is_empty(), "the fixture holds rows of owner");
+    let outpoint = actor[0]["outpoint"].as_str().unwrap().to_string();
+    let game = actor[0]["gameId"].as_str().unwrap().to_string();
+    actor[0]["family"] = json!("unbound");
+    actor[0]["claimable"] = json!(0);
+    actor[0]["reason"] = json!("the spend is not classified yet (no verdict)");
+    (d1, games, game, json!({ "rows": actor }), outpoint)
+}
+fn fix964_lines(d1: &SqliteSql) -> Vec<String> {
+    d1.lines
+        .borrow()
+        .iter()
+        .filter(|l| l.contains("DIFF"))
+        .cloned()
+        .collect()
+}
+
+/// fix964_a: a mark queued on the game BEFORE the compare and not consumed by the delivery (the backlog's mark, at or
+/// below the acknowledgement bound, still pending) holds the stale actor row by LAG: `owed_actor_compare_held_total`
+/// +1, `owed_actor_diffs_total` flat, the line `DIFF (held: lag <age> ms)` with the oldest unapplied mark's age.
+/// RED on 149869bf's rule (only a mark above the bound is held; grafted: `held_partition` answering no lag):
+/// `owed_actor_diffs_total` 0 -> 1.
+#[tokio::test]
+async fn fix964_a_a_queued_mark_older_than_the_compare_holds_by_lag() {
+    let (d1, games, game, answer, _) = fix964_stale().await;
+    d1.now.set(1_000_000);
+    let gen = fix964_mark(&d1, &game, "backlog:0", 400_000);
+    let (diffs, held) = (
+        d1.counter("owed_actor_diffs_total"),
+        d1.counter("owed_actor_compare_held_total"),
+    );
+    super::compare(&d1, "owner", &games, &answer, Some(gen)).await;
+    let lines = fix964_lines(&d1);
+    assert_eq!(
+        d1.counter("owed_actor_diffs_total"),
+        diffs,
+        "a stale row under a queued mark is not a STOP: {lines:?}"
+    );
+    assert_eq!(d1.counter("owed_actor_compare_held_total"), held + 1);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("DIFF (held: lag 600000 ms")),
+        "{lines:?}"
+    );
+    // With no bound (its read faulted) every pending mark is lag: held, never a STOP.
+    super::compare(&d1, "owner", &games, &answer, None).await;
+    assert_eq!(d1.counter("owed_actor_diffs_total"), diffs);
+    assert_eq!(d1.counter("owed_actor_compare_held_total"), held + 2);
+    // FOLD-16's class stands: a mark written while the two judged (above the bound) is NEW2-L1's line.
+    let above = fix964_mark(&d1, &game, "while:0", 999_999);
+    super::compare(&d1, "owner", &games, &answer, Some(above - 1)).await;
+    assert_eq!(d1.counter("owed_actor_diffs_total"), diffs);
+    assert_eq!(d1.counter("owed_actor_compare_held_total"), held + 3);
+    assert!(fix964_lines(&d1)
+        .iter()
+        .any(|l| l.contains("held mark") && l.contains("NEW2-L1")));
+}
+
+/// fix964_b: NO unapplied mark of the game and two outputs: the judge disagreement `owed_actor_diffs_total` counts
+/// (the cutover's STOP), never held; a mark on ANOTHER game holds nothing; the rows equal count nothing. A control,
+/// green on 149869bf by construction; RED against the compare holding every difference by lag:
+/// `owed_actor_diffs_total` 0 -> 0 where 1 was wanted.
+#[tokio::test]
+async fn fix964_b_no_unapplied_mark_and_two_outputs_is_a_diff() {
+    let (d1, games, game, answer, _) = fix964_stale().await;
+    let other = games.iter().find(|g| **g != game).cloned();
+    if let Some(o) = &other {
+        fix964_mark(&d1, o, "other:0", 1);
+    }
+    let (diffs, held) = (
+        d1.counter("owed_actor_diffs_total"),
+        d1.counter("owed_actor_compare_held_total"),
+    );
+    super::compare(&d1, "owner", &games, &answer, Some(i64::MAX / 2)).await;
+    let lines = fix964_lines(&d1);
+    assert_eq!(d1.counter("owed_actor_diffs_total"), diffs + 1, "{lines:?}");
+    assert_eq!(d1.counter("owed_actor_compare_held_total"), held);
+    assert!(lines
+        .iter()
+        .any(|l| l.starts_with("[owed-actor] DIFF ") && !l.contains("held")));
+    // The same rows on both sides: nothing counted.
+    let same = json!({ "rows": fix964_rows(&d1, "owner") });
+    super::compare(&d1, "owner", &games, &same, Some(0)).await;
+    assert_eq!(d1.counter("owed_actor_diffs_total"), diffs + 1);
+    assert_eq!(d1.counter("owed_actor_compare_held_total"), held);
+}
+
+/// fix964_c: #964's sampled line. D1's row is the consumer's judgement WITH the pot's verdict (a payout, outcome
+/// refund from the chain, claimable, `claim: internalize`); the actor's is the direct apply at the earlier pointer's
+/// write (unbound, outcome unresolved, "the spend is not classified yet (no verdict)"); the verdict's mark is still
+/// queued (written before the compare, not consumed). Held by lag, `owed_actor_diffs_total` flat; and the operator's
+/// rows lever keeps the outpoint in `diff` and names it in `heldByLag`. RED on 149869bf's rule (grafted as in
+/// fix964_a): `owed_actor_diffs_total` 0 -> 1; the lever's `heldByLag` absent.
+#[tokio::test]
+async fn fix964_c_the_issues_line_with_the_verdicts_mark_queued_is_held() {
+    let (d1, games, game, mut answer, outpoint) = fix964_stale().await;
+    let facts = json!({"outcome": "refund", "outcomeSource": "chain", "claim": "internalize", "payTxid": "cb59934f00000000000000000000000000000000000000000000000000000000"}).to_string();
+    d1.conn
+        .execute(
+            "UPDATE owed_rows SET family='payout',claimable=1,reason=NULL,facts=?2 WHERE identity='owner' AND outpoint=?1",
+            rusqlite::params![outpoint, facts],
+        )
+        .unwrap();
+    answer["rows"][0]["facts"] =
+        json!(json!({"outcome": "unresolved", "claimable": false}).to_string());
+    d1.now.set(2_000_000);
+    let gen = fix964_mark(&d1, &game, &format!("{outpoint}:verdict"), 1_000_000);
+    let (diffs, held) = (
+        d1.counter("owed_actor_diffs_total"),
+        d1.counter("owed_actor_compare_held_total"),
+    );
+    super::compare(&d1, "owner", &games, &answer, Some(gen)).await;
+    let lines = fix964_lines(&d1);
+    assert_eq!(d1.counter("owed_actor_diffs_total"), diffs, "{lines:?}");
+    assert_eq!(d1.counter("owed_actor_compare_held_total"), held + 1);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("DIFF (held: lag 1000000 ms") && l.contains(&outpoint)),
+        "{lines:?}"
+    );
+    // The lever: the shipped read of the pending marks, then the pure naming.
+    let pending = d1
+        .run_batch(vec![Stmt::new(
+            LEVER_PENDING_SQL,
+            vec![Bind::Text("owner".into())],
+        )])
+        .await
+        .unwrap()
+        .remove(0)
+        .rows;
+    let view = rows_view(
+        "owner",
+        Ok(answer.clone()),
+        &fix964_rows(&d1, "owner"),
+        None,
+        None,
+    );
+    assert!(view["diff"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|o| o == outpoint.as_str()));
+    assert_eq!(held_by_lag(&view, &pending), vec![outpoint.clone()]);
+    // With the mark consumed the same difference is no lag.
+    d1.conn.execute("DELETE FROM owed_dirty", []).unwrap();
+    assert!(held_by_lag(&view, &[]).is_empty());
+    let lever = include_str!("object.rs")
+        .split_whitespace()
+        .collect::<String>();
+    assert!(lever.contains("view[\"heldByLag\"]=json!(held_by_lag(&view,&pending));"));
 }
