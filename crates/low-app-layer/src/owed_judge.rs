@@ -476,6 +476,7 @@ impl JudgeDb for D1Judge {
             at_ms: worker::Date::now().as_millis() as i64,
             mined: false,
             txids: None,
+            also: Vec::new(),
         };
         // bsv-low #953 item 6: every apply the belt's port makes carries the served tip (the consumer's own).
         let tip = match self.tip {

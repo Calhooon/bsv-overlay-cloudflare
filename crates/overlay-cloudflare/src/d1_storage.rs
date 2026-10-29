@@ -240,15 +240,14 @@ pub(crate) fn transactions_proven_same_height_sql(limit: u64) -> String {
 /// A refuted stitched bump: `has_proof = 0` is the engine's own re-fetch
 /// cue (`complete_missing_proofs` re-verifies the stored bump, refetches a
 /// canonical one and re-stitches). Bytes and the anchor stay.
-pub(crate) const TRANSACTION_UNPROVE_SQL: &str =
-    "UPDATE transactions SET has_proof = 0 WHERE txid = ?";
+pub const TRANSACTION_UNPROVE_SQL: &str = "UPDATE transactions SET has_proof = 0 WHERE txid = ?";
 
 /// The anchored fast-path latch (bsv-low M19 R2 round 3, review MED-2): flip
 /// `has_proof = 1` AND record the block height the just-verified bump names
 /// (`proofHeight = COALESCE(?1, proofHeight)`, so a height-less caller keeps
 /// a held anchor), clearing the retire latch like `mark_transaction_proven`.
 /// Bind order: ?1 proofHeight (or NULL), ?2 txid.
-pub(crate) const MARK_TX_PROVEN_AT_SQL: &str =
+pub const MARK_TX_PROVEN_AT_SQL: &str =
     "UPDATE transactions SET has_proof = 1, retired_ms = NULL, retired_reason = NULL, \
          proofHeight = COALESCE(?1, proofHeight) \
      WHERE txid = ?2";

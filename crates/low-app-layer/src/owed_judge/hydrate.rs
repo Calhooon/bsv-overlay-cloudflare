@@ -301,11 +301,17 @@ pub(crate) async fn hydrate_filings(
                 continue;
             }
             // the opponent the twin party names, as the old walk's ring served it (the walk-against-judge pin)
-            let context: Vec<Value> = read(db,"SELECT h.spent,h.spendingTxid,h.spentConfirmed,h.spenderFinal,p.pubA,p.pubB,p.payPkhA,p.payPkhB,(SELECT lower(pp.opponentIdentity) FROM potparty_records_evicted pp INDEXED BY idx_evicted_party_identity_game WHERE pp.identity=?5 AND pp.gameId=?6 AND pp.potTxid=?3 AND pp.sigValid=1 ORDER BY pp.createdAt,pp.rowid LIMIT 1) AS opponentIdentity FROM (SELECT 1) LEFT JOIN pot_records h ON h.txid=?1 AND h.outputIndex=?2 LEFT JOIN pot_records_evicted p ON p.txid=?3 AND p.lockKind='covenant' AND p.paramsDecoded=1 AND (p.pubA=?4 OR p.pubB=?4)",vec![Bind::Text(text(&r,"hopTxid")),Bind::Int(num(&r,"hopVout") as i64),Bind::Text(text(&r,"potTxid")),Bind::Text(text(&r,"seatSettlePubkey")),Bind::Text(text(&r,"identity")),Bind::Text(text(&r,"gameId"))]).await?;
+            let context: Vec<Value> = read(db,"SELECT h.createdAt AS potCreatedAt,h.spent,h.spendingTxid,h.spentConfirmed,h.spenderFinal,p.pubA,p.pubB,p.payPkhA,p.payPkhB,(SELECT lower(pp.opponentIdentity) FROM potparty_records_evicted pp INDEXED BY idx_evicted_party_identity_game WHERE pp.identity=?5 AND pp.gameId=?6 AND pp.potTxid=?3 AND pp.sigValid=1 ORDER BY pp.createdAt,pp.rowid LIMIT 1) AS opponentIdentity FROM (SELECT 1) LEFT JOIN pot_records h ON h.txid=?1 AND h.outputIndex=?2 LEFT JOIN pot_records_evicted p ON p.txid=?3 AND p.lockKind='covenant' AND p.paramsDecoded=1 AND (p.pubA=?4 OR p.pubB=?4)",vec![Bind::Text(text(&r,"hopTxid")),Bind::Int(num(&r,"hopVout") as i64),Bind::Text(text(&r,"potTxid")),Bind::Text(text(&r,"seatSettlePubkey")),Bind::Text(text(&r,"identity")),Bind::Text(text(&r,"gameId"))]).await?;
             if let Some(context) = context.first().and_then(Value::as_object) {
                 r.as_object_mut()
                     .ok_or("released hop is not an object")?
                     .extend(context.clone());
+            }
+            // D2-ACTOR-B-FOLD-11 (bsv-low #957): the era's rule on this road too (the hop's own pot row, else the
+            // eviction's time): an old-era released hop is written off as its marker is, never a press (beta's
+            // 20,190 sat `hop-stranded` row of an Oct 21 hop the marker road had written off).
+            if era_stamped_before(&r, db.era_ms()) {
+                continue;
             }
             released_rows.push(r);
         }
@@ -362,6 +368,10 @@ pub(crate) async fn hydrate_filings(
     // outpoint the identity's own evidence names (a released-hop evidence row, its pot, its verified hop marker) is
     // judged from that evidence instead.
     for r in read::<Value>(db, MISSING_SQL, bound.clone()).await? {
+        // FOLD-11 (#957): an old-era eviction's could-not-judge row is written off with it
+        if era_stamped_before(&r, db.era_ms()) {
+            continue;
+        }
         let hop = text(&r, "hopTxid");
         let vout = num(&r, "hopVout") as u32;
         let reason = if flag(&r, "bytesRead") == Some(true) {
@@ -1122,4 +1132,15 @@ pub(super) async fn stored_tx_facts(
         txid,
         rows.iter().take(take).filter_map(|r| r["beef"].as_str()),
     ))
+}
+
+/// D2-ACTOR-B-FOLD-11 (bsv-low #957): a released-hop evidence row (or its could-not-judge twin) under the era's rule
+/// ([`crate::owed_judge::rank::before_era`]): its stamp the hop's own pot row (`potCreatedAt`, seconds), else the
+/// eviction's time (`evictedAt`, milliseconds).
+fn era_stamped_before(r: &Value, era_ms: Option<i64>) -> bool {
+    let mut v = json!({"potCreatedAt": r["potCreatedAt"].clone()});
+    if v["potCreatedAt"].is_null() {
+        v["createdAt"] = json!(crate::owed_judge::rank::number(r, "evictedAt").map(|ms| ms / 1000));
+    }
+    crate::owed_judge::rank::before_era(&v, era_ms)
 }
