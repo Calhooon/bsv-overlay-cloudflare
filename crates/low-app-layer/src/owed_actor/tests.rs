@@ -9738,3 +9738,102 @@ async fn fold16_c_the_reconcile_and_the_sweep_sample_nothing_into_the_writers_ba
         "direct_events_as(env,report.sent.clone(),crate::owed_actor::SWEEP_CLASS).await;"
     ));
 }
+
+/// The row of bsv-low #963's line: beta's `b084427d…:0` under Phase B, `hop-sweep` `internalize` waiting on its
+/// block, the two judges' facts equal save `spenderPresence` (given verbatim by the caller).
+fn fix963_row(presence: Value) -> Value {
+    json!({"outpoint": "b084427d:0", "family": "payout", "gameId": "024866f7", "sats": 20190,
+        "opponentIdentity": null, "atHeight": null, "reason": "the sweep is seen, awaiting the block",
+        "claimable": 0, "probeTip": 973_200,
+        "facts": json!({"outcome": "hop-sweep", "claim": "internalize", "claimable": false, "chainWait": "block",
+            "claimReason": "the sweep is seen, awaiting the block", "payTxid": "ab12", "marker": "cd34",
+            "hopSats": 20190, "tip": 973_200, "spenderPresence": presence}).to_string()})
+}
+
+/// (fix963_a) bsv-low #963: A PRESENCE'S OBSERVATION STAMP IS NOT A JUDGEMENT. Two rows equal save
+/// `facts.spenderPresence.at` are equal to every compare: `diff_rows` (the per-event compare and the reconcile's
+/// `disagree`), both digests, and the operator route's `diff`. RED on `3159bc90e`: the outpoint is one diff.
+#[test]
+fn fix963_a_rows_equal_save_the_presence_stamp_compare_equal() {
+    let p = |at: i64| json!({"word": "spent", "tier": "pending", "source": "spent-any", "at": at});
+    let (d1, actor) = (
+        fix963_row(p(1_793_288_680_506)),
+        fix963_row(p(1_793_288_679_526)),
+    );
+    assert_eq!(
+        diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        rows_digest(std::slice::from_ref(&d1)),
+        rows_digest(std::slice::from_ref(&actor))
+    );
+    let view = rows_view(
+        "03c31ebc",
+        Ok(json!({"rows": [actor.clone()], "bootstrapped": true})),
+        std::slice::from_ref(&d1),
+        None,
+        None,
+    );
+    assert_eq!(view["diff"], json!([]));
+    assert_eq!(view["tipLag"], json!([]));
+    assert_eq!(view["digests"]["d1"], view["digests"]["actor"]);
+    // the served rows keep the stamp: only the compare drops it
+    assert_eq!(view["d1"]["rows"][0], d1);
+    assert!(STAMP_FACTS.contains(&("spenderPresence", "at")));
+}
+
+/// (fix963_b) bsv-low #963: the presence is still compared by `{word, tier, source}`: a change of any of them is a
+/// diff (the judgement), stamps equal or not.
+#[test]
+fn fix963_b_the_presence_word_tier_and_source_still_differ() {
+    let p = |word: &str, tier: &str, source: &str, at: i64| json!({"word": word, "tier": tier, "source": source, "at": at});
+    let d1 = fix963_row(p("spent", "pending", "spent-any", 1));
+    for other in [
+        p("spent-outside", "pending", "spent-any", 1),
+        p("spent", "confirmed", "spent-any", 2),
+        p("spent", "pending", "courier", 2),
+    ] {
+        let actor = fix963_row(other.clone());
+        assert_eq!(
+            diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)),
+            vec!["b084427d:0".to_string()],
+            "{other}"
+        );
+        assert_ne!(
+            rows_digest(std::slice::from_ref(&d1)),
+            rows_digest(std::slice::from_ref(&actor))
+        );
+    }
+    // a presence on one side only is a diff (no stamp to drop makes it equal)
+    let mut none = fix963_row(Value::Null);
+    let mut f: Value = serde_json::from_str(none["facts"].as_str().unwrap()).unwrap();
+    f.as_object_mut().unwrap().remove("spenderPresence");
+    none["facts"] = json!(f.to_string());
+    assert_eq!(
+        diff_rows(std::slice::from_ref(&d1), &[none]),
+        vec!["b084427d:0".to_string()]
+    );
+}
+
+/// (fix963_c) bsv-low #963's line, both `spenderPresence` objects verbatim from beta's log at 2026-10-29 15:44:46Z:
+/// classified EQUAL (no diff, no tip lag, no detail named). RED on `3159bc90e`: `diff_rows` names `b084427d:0` and
+/// `diff_detail` names `facts.spenderPresence`.
+#[test]
+fn fix963_c_the_line_of_963_is_equal() {
+    let d1p: Value = serde_json::from_str(
+        r#"{"at":1793288680506,"source":"spent-any","tier":"pending","word":"spent"}"#,
+    )
+    .unwrap();
+    let actorp: Value = serde_json::from_str(
+        r#"{"at":1793288679526,"source":"spent-any","tier":"pending","word":"spent"}"#,
+    )
+    .unwrap();
+    let (d1, actor) = (fix963_row(d1p), fix963_row(actorp));
+    let (d1, actor) = (std::slice::from_ref(&d1), std::slice::from_ref(&actor));
+    assert_eq!(diff_rows(d1, actor), Vec::<String>::new());
+    assert_eq!(tip_lag_rows(d1, actor), Vec::<String>::new());
+    assert_eq!(tip_derived_rows(d1, actor), Vec::<String>::new());
+    let detail = diff_detail(d1, actor, &["b084427d:0".to_string()]);
+    assert!(!detail.contains("spenderPresence"), "{detail}");
+}
