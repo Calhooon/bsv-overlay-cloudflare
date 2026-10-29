@@ -3075,6 +3075,14 @@ pub const ROWS_SQL: &str = "SELECT identity,outpoint,family,gameId,sats,opponent
 /// D2-ACTOR-B-FOLD-11 (bsv-low #957 item 2): `tip`, the judge's input tip `owed.rs` writes into several families' facts,
 /// is the judgement's clock too (the verdict a tip moves is compared apart: `claimable`, `blocksToGate`, `tipUnknown`).
 pub const CLOCK_FACTS: [&str; 5] = ["ageMs", "chainProbeAgeMs", "beltNextAtMs", "asOfMs", "tip"];
+/// FIX-963 (bsv-low #963): the OBSERVATION STAMPS inside a stored fact, `(fact, key)`: the instant a word was seen,
+/// not the word. `spenderPresence.at` is the one a stored row carries: `routes::mark_pending_spender` takes the
+/// answer's `observed_at_ms`, else the judge's own `now_ms` less `chainProbeAgeMs`, and with no probe age (an
+/// index- or memo-less word) that is the judge's `now`, so two judges of one record one apply apart stamp it apart.
+/// The presence is compared by `{word, tier, source}`; the served rows keep the stamp. The word facts
+/// (`coinWord`, `spenderWord`, `fundingWord`, `tracker`) are stripped at storage and joined at the read, so their
+/// stamps never reach a compare.
+pub const STAMP_FACTS: [(&str, &str); 1] = [("spenderPresence", "at")];
 pub fn compared_facts(row: &Value) -> Value {
     let mut facts: Value = row["facts"]
         .as_str()
@@ -3083,6 +3091,11 @@ pub fn compared_facts(row: &Value) -> Value {
     if let Some(m) = facts.as_object_mut() {
         for k in CLOCK_FACTS {
             m.remove(k);
+        }
+        for (fact, k) in STAMP_FACTS {
+            if let Some(o) = m.get_mut(fact).and_then(Value::as_object_mut) {
+                o.remove(k);
+            }
         }
     }
     facts
