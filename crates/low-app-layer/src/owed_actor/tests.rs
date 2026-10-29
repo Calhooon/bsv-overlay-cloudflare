@@ -6653,6 +6653,7 @@ async fn fold10_f_a_burst_for_one_identity_is_one_call() {
                     at_ms: 1,
                     mined: false,
                     txids: None,
+                    also: Vec::new(),
                 },
                 vec![(
                     "owner".into(),
@@ -6800,7 +6801,8 @@ async fn fold10_i_the_direct_faults_log_their_first_text_once_a_minute() {
 /// answers `already`. RED on `e99472091`: `rejudge_due` does not exist (the lever answered `already` for every stamp).
 #[test]
 fn fold10_j_a_state_judged_under_another_build_bootstraps_again() {
-    let running = lib_rev();
+    // D2-ACTOR-B-FOLD-11 (NEW6-L2): the stamp is the judge's version, not the build (`fold11_f`)
+    let running = JUDGE_VERSION;
     assert!(
         !rejudge_due(true, Some(running), running),
         "the same build: already"
@@ -6826,7 +6828,7 @@ fn fold10_j_a_state_judged_under_another_build_bootstraps_again() {
         .find("ifself.meta(META_BOOT_CURSOR).is_some(){ifboot_parked")
         .unwrap()];
     let check = arm
-        .find("if!rejudge_due(true,judged.as_deref(),lib_rev()){returnArmed{already:true,")
+        .find("if!rejudge_due(true,judged.as_deref(),JUDGE_VERSION){returnArmed{already:true,")
         .expect("`already` only under the running build");
     let rearm = arm
         .find("self.put_meta(&local,META_BOOT_CURSOR,BOOT_CURSOR_START);")
@@ -6835,9 +6837,9 @@ fn fold10_j_a_state_judged_under_another_build_bootstraps_again() {
     assert!(arm.contains("record.counters(vec![(COUNTERS[26].into(),1)]).await;"));
     assert!(arm.contains("rejudged:true"));
     let done = &object[object.find("BootStep::Done{drain,..}=>{").unwrap()..];
-    assert!(done[..400].contains("self.put_meta(local,META_JUDGED_REV,lib_rev());"));
+    assert!(done[..400].contains("self.put_meta(local,META_JUDGED_REV,JUDGE_VERSION);"));
     let route = &object[object.find("asyncfnapply_route(").unwrap()..];
-    assert!(route.contains("lib_rev(),){self.arm_bootstrap(&me,false).await;}"));
+    assert!(route.contains("JUDGE_VERSION,){self.arm_bootstrap(&me,false).await;}"));
     assert!(object.contains("\"armed\":armed,\"rejudged\":rejudged,\"bootstrapped\":done,"));
     let actor = squash(include_str!("../owed_actor.rs"));
     assert!(actor.contains("body[\"rejudged\"]=n(COUNTERS[26]);"));
@@ -7453,4 +7455,502 @@ async fn d2_actor_e_e_b_the_read_is_one_statement_d1_accepts_and_falls_back_past
             "{table}"
         );
     }
+}
+
+// ---- D2-ACTOR-B-FOLD-11 (the sixth delta lens) ----
+
+/// D1's judgement and the actor's of every game of `owner`, an ordinary event between: the D1 judge over the record
+/// as it stands, the actor's narrowed apply told only `touch` (a txid no row of the fixture names).
+async fn fold11_both_judge(d1: &SqliteSql, local: &SqliteSql, touch: &str) -> ApplyReport {
+    fold11_both_judge_on(d1, d1, local, touch).await
+}
+
+/// [`fold11_both_judge`], the actor reading the record through `record` (a counting port).
+async fn fold11_both_judge_on(
+    d1: &SqliteSql,
+    record: &impl SqlPort,
+    local: &SqliteSql,
+    touch: &str,
+) -> ApplyReport {
+    let games = games_of(d1, "owner");
+    for chunk in games.chunks(16) {
+        crate::owed_judge::judge_subjects(d1, "owner", chunk, "d1")
+            .await
+            .unwrap();
+    }
+    let opts = ApplyOpts {
+        touch: Some(vec![touch.to_string()]),
+        ..ApplyOpts::default()
+    };
+    let (report, _) = apply_with(
+        record,
+        local,
+        &Fakes,
+        "owner",
+        &games,
+        Some(("word", 77)),
+        Some(TIP),
+        None,
+        &opts,
+    )
+    .await
+    .unwrap();
+    report
+}
+
+/// (fold11_a) NEW6-M1, THE LENS'S SCRATCH SHAPE: beta's #953 hop (index unspent, the evidence `<hop>:0` CONFIRMED),
+/// both judges `unbound` and the game warm; then the overlay's reorg clear (the shipped statement) deletes the
+/// confirmed evidence and marks nothing; then one ordinary event naming another txid. The warm actor's narrowed apply
+/// stores the D1 judge's rows: `hop-stranded`, `index-unspent`, the press. RED on `26f7443c6`: the actor keeps
+/// `unbound`, spent, no press (`narrowed true, misses 0`).
+#[tokio::test]
+async fn fold11_a_a_warm_apply_after_an_unmarked_reorg_clear_is_the_d1_judges() {
+    let d1 = d1_judge(&fold9_fixture()).await;
+    let (local, _) = actor_judge(&d1, "owner").await;
+    let hop = format!("{FOLD9_HOP}:0");
+    let before = fold9_row(&d1, &hop).unwrap();
+    assert_eq!(before.0, "unbound", "{before:?}");
+    assert_eq!(
+        fold9_judgement(&fold9_row(&local, &hop).unwrap()),
+        fold9_judgement(&before)
+    );
+    let marks = |db: &SqliteSql| -> i64 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM owed_dirty", [], |r| r.get(0))
+            .unwrap()
+    };
+    let marked = marks(&d1);
+    let cleared = d1
+        .conn
+        .execute(
+            bsv_overlay_cloudflare::hop_probe_memos::HOP_PROBE_MEMO_REORG_CLEAR_SQL,
+            [],
+        )
+        .unwrap();
+    assert_eq!(cleared, 1, "the confirmed evidence");
+    assert_eq!(marks(&d1), marked, "the reorg clear marks nothing");
+    let counted = Counting(&d1, Cell::new(0), Cell::new(0));
+    let report = fold11_both_judge_on(&d1, &counted, &local, &h("c1", 1)).await;
+    assert!(report.narrowed, "the warm game read narrowly: {report:?}");
+    // the cost after the fold: two record statements a warm apply (the marks, then every family in one statement),
+    // the statement's text unchanged (only its binds carry the whole key set)
+    let all: Vec<usize> = (0..FAMILIES.len()).collect();
+    let bytes = aggregate_select(true, &all).len();
+    eprintln!(
+        "fold11_a: warm apply record statements {}, rows answered {}, the compound statement {bytes} bytes",
+        counted.2.get(),
+        counted.1.get()
+    );
+    assert!(counted.2.get() < 4 && bytes < 100_000);
+    let d1_row = fold9_row(&d1, &hop).unwrap();
+    assert_eq!(
+        (d1_row.0.as_str(), d1_row.1, d1_row.2["chainProbe"].clone()),
+        ("hop-stranded", Some(1), json!("index-unspent")),
+        "{d1_row:?}"
+    );
+    let actor = fold9_row(&local, &hop).unwrap();
+    assert_eq!(
+        fold9_judgement(&actor),
+        fold9_judgement(&d1_row),
+        "the narrowed actor agrees with the D1 judge: {actor:?}"
+    );
+    assert_eq!(stored_rows_no_clock(&local), stored_rows_no_clock(&d1));
+}
+
+/// A filed sweep of the #953 hop paying the seat's home, its bytes in `transactions` with `has_proof` 1 (the
+/// index's verified proof, `hydrate.rs`'s filed-sweep read).
+fn fold11_sweep_fixture() -> Fixture {
+    let made = (NOW_MS / 1000) as i64 - 4 * 3_600;
+    let (spend, s) = fold9_spend(FOLD9_HOP);
+    let raw = hex::encode(spend.to_binary());
+    let mut beef = bsv_rs::transaction::Beef::new();
+    beef.merge_raw_tx(spend.to_binary(), None);
+    Fixture {
+        name: "fold11 a filed sweep proven by the index",
+        seed: vec![
+            format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{FOLD9_HOP}',0,0,{made},'p2pkh')"),
+            format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('owner','other','{}',0,20190,'seat','00','00',2,'{FOLD9_HOP}',1,{made},1)", h("9f", 1)),
+            format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES ('owner','{}','{FOLD9_HOP}',0,'{s}','{raw}','{}',0,{made})", h("9f", 1), h("5e", 1)),
+            format!("INSERT INTO transactions(txid,beef,has_proof,proofHeight,created_at) VALUES ('{s}',x'{}',1,{},{made})", hex::encode(beef.to_binary()), TIP - 18),
+        ],
+        identities: vec!["owner".into()],
+    }
+}
+
+/// (fold11_b) NEW6-M1, THE REVERSE DIRECTION: the filed sweep's payout rests on `transactions.has_proof`; the engine's
+/// refutation (`TRANSACTION_UNPROVE_SQL`, the shipped statement, no trigger) withdraws it, then an ordinary event: the
+/// warm actor withdraws what the D1 judge withdraws. RED on `26f7443c6`: the warm actor keeps the proven payout.
+#[tokio::test]
+async fn fold11_b_a_warm_apply_after_an_unmarked_unprove_is_the_d1_judges() {
+    let d1 = d1_judge(&fold11_sweep_fixture()).await;
+    let (local, _) = actor_judge(&d1, "owner").await;
+    let before = stored_rows_no_clock(&d1);
+    assert_eq!(stored_rows_no_clock(&local), before);
+    let (_, s) = fold9_spend(FOLD9_HOP);
+    let unproved = d1
+        .conn
+        .execute(
+            bsv_overlay_cloudflare::d1_storage::TRANSACTION_UNPROVE_SQL,
+            [&s],
+        )
+        .unwrap();
+    assert_eq!(unproved, 1);
+    let report = fold11_both_judge(&d1, &local, &h("c1", 2)).await;
+    assert!(report.narrowed, "{report:?}");
+    let after = stored_rows_no_clock(&d1);
+    eprintln!("fold11_b: d1 before {before:?}\nfold11_b: d1 after  {after:?}");
+    assert_ne!(after, before, "the withdrawn proof moves D1's judgement");
+    assert_eq!(
+        stored_rows_no_clock(&local),
+        after,
+        "the warm actor withdraws what D1 withdraws"
+    );
+    // and the latch back (`MARK_TX_PROVEN_AT_SQL`, no trigger either): both read it again
+    d1.conn
+        .execute(
+            bsv_overlay_cloudflare::d1_storage::MARK_TX_PROVEN_AT_SQL,
+            rusqlite::params![(TIP - 18) as f64, &s],
+        )
+        .unwrap();
+    fold11_both_judge(&d1, &local, &h("c1", 3)).await;
+    assert_eq!(stored_rows_no_clock(&d1), before);
+    assert_eq!(stored_rows_no_clock(&local), before);
+}
+
+/// (fold11_e) NEW6-L1: A COALESCED DELIVERY SAMPLES PER EVENT. A batch of two events for one identity: the oldest
+/// (`pot` 10) was applied by its direct call, the second's (`pot` 11) direct call faulted. The consumer's delivery
+/// carries the oldest under its key and the second in `also` with its write time ([`crate::owed_events::coalesced_event`],
+/// [`apply_body`]); the object reads each one's first apply before it records them ([`first_apply_of`]) and samples
+/// each first apply born warm ([`event_visibility`]): the second's lag goes into the backstop figure. On `26f7443c6`
+/// the delivery carried the oldest alone (`firstApply: false`) and sampled nothing (the old answer, no `visibleMs`,
+/// noted below: zero samples).
+#[tokio::test]
+async fn fold11_e_a_coalesced_delivery_samples_its_faulted_tail() {
+    let (record, local, games) = e_warm_seat(4).await;
+    let ev = |seq: i64, at: i64| overlay_discovery::owed_event::OwedEvent {
+        v: 1,
+        seq,
+        source: "pot".into(),
+        source_key: format!("{}:0", h("b8", seq as usize)),
+        facts: Value::Null,
+        at_ms: at,
+    };
+    let (a, b) = (ev(10, 1_000), ev(11, 2_000));
+    let ctx = crate::owed_events::coalesced_event(&[&b, &a]).unwrap();
+    assert_eq!(
+        (ctx.kind.as_str(), ctx.seq, ctx.at_ms),
+        ("pot", 10, 1_000),
+        "the oldest's key"
+    );
+    assert_eq!(ctx.also, vec![("pot".to_string(), 11, 2_000)]);
+    let body = apply_body("owner", &games[..1], &ctx, Some(TIP));
+    assert_eq!(body["also"], json!([["pot", 11]]));
+    assert_eq!(body["alsoAtMs"], json!([2_000]));
+    // the oldest applied by its direct call; the second's call faulted (no `applied` row)
+    apply(
+        &record,
+        &local,
+        &Fakes,
+        "owner",
+        &games[..1],
+        Some(("pot", 10)),
+        Some(TIP),
+        None,
+    )
+    .await
+    .unwrap();
+    let first_a = first_apply_of(&local, Some(("pot", 10)), &games[..1]).await;
+    let first_b = first_apply_of(&local, Some(("pot", 11)), &games[..1]).await;
+    assert_eq!((first_a, first_b), (false, true));
+    let now = 5_000u64;
+    let visible = event_visibility(
+        now,
+        &[(Some(1_000), first_a, true), (Some(2_000), first_b, true)],
+    );
+    assert_eq!(
+        visible,
+        vec![3_000],
+        "the faulted tail's first apply is sampled"
+    );
+    // an event born before the bootstrap stamp, or with no write time, samples nothing
+    assert!(event_visibility(now, &[(Some(2_000), true, false), (None, true, true)]).is_empty());
+    // the bars read the answer's samples
+    let old = json!({"applied": true, "firstApply": false, "atMs": 1_000, "judgedAtMs": now, "applyMs": 5});
+    let mut bars = Bars::default();
+    note_answer_into(&mut bars, &old);
+    assert_eq!(
+        bars.visible.samples.len(),
+        0,
+        "the base's answer: nothing sampled"
+    );
+    let mut new = old.clone();
+    new["visibleMs"] = json!(visible);
+    note_answer_into(&mut bars, &new);
+    assert_eq!(bars.visible.samples.len(), 1);
+    let mut pending = PendingBars::default();
+    pending.note_answer("queue", &new);
+    assert_eq!(pending.visible.get("queue").map(Vec::len), Some(1));
+    // the object reads each `also` event's first apply and samples per event (source pin: wasm32 only)
+    let object = include_str!("object.rs")
+        .split_whitespace()
+        .collect::<String>();
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    assert!(object.contains(&squash(
+        "let first = first_apply_of(&local, Some((kind.as_str(), *seq)), &body.games).await;"
+    )));
+    assert!(object.contains(&squash("let visible = event_visibility(now, &events);")));
+    assert!(object.contains(&squash("answer[\"visibleMs\"] = json!(visible);")));
+    let events = include_str!("../owed_events.rs")
+        .split_whitespace()
+        .collect::<String>();
+    assert!(events.contains(&squash("ctx.also = also;")));
+}
+
+/// (fold11_f) NEW6-L2: THE JUDGE'S VERSION, AND COLD PAGES FIRST. A bootstrapped actor stamped with this
+/// [`JUDGE_VERSION`] is re-armed by no build (whatever its git HEAD, [`lib_rev`]); one stamped by a moved version
+/// (or an older build's git sha) is re-judged. Under the fleet's budget a re-judge takes only the minute's first
+/// [`BOOTSTRAP_REJUDGE_PAGES_PER_MINUTE`] tokens, so with the re-judges at their share a cold page still takes the
+/// next; and a waiting cold page's slot comes before a waiting re-judge's. The shipped statements under real SQLite.
+/// On `26f7443c6` the stamp was `lib_rev()` (every deploy re-judged the fleet) and one take served both (no pin
+/// compiles: `JUDGE_VERSION`, `BOOT_BUDGET_REJUDGE_TAKE_SQL` and `boot_pace_of` are new).
+#[test]
+fn fold11_f_the_judge_version_and_cold_pages_first() {
+    // the version, not the build
+    assert!(!rejudge_due(true, Some(JUDGE_VERSION), JUDGE_VERSION));
+    assert!(
+        rejudge_due(true, Some("fold10-older"), JUDGE_VERSION),
+        "a moved version re-judges"
+    );
+    assert!(
+        rejudge_due(true, Some("663a31d09"), JUDGE_VERSION),
+        "an old build's sha re-judges once"
+    );
+    assert!(
+        !rejudge_due(false, Some("x"), JUDGE_VERSION),
+        "a cold actor is bootstrapped, not re-judged"
+    );
+    assert_ne!(JUDGE_VERSION, lib_rev());
+    let object = include_str!("object.rs")
+        .split_whitespace()
+        .collect::<String>();
+    assert!(!object.contains("rejudge_due(true,judged.as_deref(),lib_rev())"));
+    assert!(object.contains("rejudge_due(true,judged.as_deref(),JUDGE_VERSION)"));
+    assert!(object.contains("self.put_meta(local,META_JUDGED_REV,JUDGE_VERSION);"));
+    assert_eq!(
+        object.matches("lib_rev()").count(),
+        0,
+        "the actor stamps and compares the judge's version only"
+    );
+    // the budget: re-judges to their share, then a cold page still runs
+    assert!(
+        BOOT_BUDGET_REJUDGE_TAKE_SQL.contains(&format!("<{BOOTSTRAP_REJUDGE_PAGES_PER_MINUTE} "))
+    );
+    let db = fold8_empty();
+    let take = |sql: &str, now: u64| -> i64 {
+        let mut q = db.conn.prepare(sql).unwrap();
+        let rows: Vec<Value> = q
+            .query_map(rusqlite::params![now as f64], |r| {
+                Ok(json!({"taken": r.get::<_, i64>(0)?}))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        boot_taken(&rows)
+    };
+    let minute = (NOW_MS / 60_000) * 60_000;
+    let (cold_id, rejudge_id) = (
+        format!("02{}", "ab".repeat(32)),
+        format!("02{}", "ab".repeat(32)),
+    );
+    for n in 1..=BOOTSTRAP_REJUDGE_PAGES_PER_MINUTE {
+        let t = take(BOOT_BUDGET_REJUDGE_TAKE_SQL, minute + n as u64);
+        assert_eq!(
+            boot_pace_of(t, minute, &rejudge_id, true),
+            None,
+            "re-judge page {n} runs"
+        );
+    }
+    let refused = take(BOOT_BUDGET_REJUDGE_TAKE_SQL, minute + 100);
+    let rejudge_wait = boot_pace_of(refused, minute + 100, &rejudge_id, true)
+        .expect("past its share the re-judge waits");
+    for n in BOOTSTRAP_REJUDGE_PAGES_PER_MINUTE + 1..=BOOTSTRAP_PAGES_PER_MINUTE {
+        let t = take(BOOT_BUDGET_TAKE_SQL, minute + 200 + n as u64);
+        assert_eq!(t, n);
+        assert_eq!(
+            boot_pace_of(t, minute, &cold_id, false),
+            None,
+            "cold page {n} runs beside the re-judges"
+        );
+    }
+    let cold_wait = boot_pace_of(
+        take(BOOT_BUDGET_TAKE_SQL, minute + 500),
+        minute + 500,
+        &cold_id,
+        false,
+    )
+    .expect("past the minute the cold page waits");
+    let next = minute + 60_000;
+    assert!(
+        (next..next + 30_000).contains(&cold_wait),
+        "a cold wait in the next minute's first half"
+    );
+    assert!(
+        (next + 30_000..next + 60_000).contains(&rejudge_wait),
+        "a re-judge's in its second half"
+    );
+    assert!(
+        cold_wait < rejudge_wait,
+        "cold pages first in the slot order"
+    );
+    let page = &object[object.find("asyncfnbootstrap_page(").unwrap()..];
+    assert!(page.contains("letrejudge=self.meta(META_BOOTSTRAPPED).is_some();"));
+    assert!(page.contains("boot_pace_of(taken,now,&me,rejudge)"));
+}
+
+/// The record's own port under the render's era cutoff (`WRITTEN_OFF_BEFORE_MS`), the D1 judge's as `D1Judge` sets it.
+struct Era<'a>(&'a SqliteSql, i64);
+impl SqlPort for Era<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        self.0.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.0.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.0.log(l);
+    }
+}
+impl crate::owed_judge::JudgeDb for Era<'_> {
+    fn tip(&self) -> Option<u64> {
+        crate::owed_judge::JudgeDb::tip(self.0)
+    }
+    fn era_ms(&self) -> Option<i64> {
+        Some(self.1)
+    }
+    async fn word_views(
+        &self,
+        rows: &BTreeMap<String, crate::tracker_host::stored::Row>,
+    ) -> Result<BTreeMap<String, Value>, String> {
+        crate::owed_judge::JudgeDb::word_views(self.0, rows).await
+    }
+    async fn canonical_root(&self, h: u64) -> Option<String> {
+        crate::owed_judge::JudgeDb::canonical_root(self.0, h).await
+    }
+    async fn push(&self, identity: &str, body: Value) {
+        crate::owed_judge::JudgeDb::push(self.0, identity, body).await;
+    }
+}
+
+const FOLD11_G_HOP: &str = "8d00000000000000000000000000000000000000000000000000000000000001";
+const FOLD11_G_JOIN: &str = "8d00000000000000000000000000000000000000000000000000000000000002";
+
+/// bsv-low #957 item 1, beta's live shape: a hop-only game (no party row), its verified marker and its hop's index
+/// row (unspent) made five days before the era's cutoff, the JOIN that spent it EVICTED (the ledger open) and the
+/// eviction's released-hop evidence for the seat (`evictedAt` 12 s after the marker, beta's `markerCreatedAtMs`).
+fn fold11_g_fixture(made_s: i64) -> Fixture {
+    let game = h("ad", 1);
+    let evicted = made_s * 1000 + 12_383;
+    Fixture {
+        name: "fold11 #957 an old-era hop-only game, its JOIN evicted",
+        seed: vec![
+            format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{FOLD11_G_HOP}',0,0,{made_s},'p2pkh')"),
+            format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('owner','other','{game}',0,20190,'seat','00','00',2,'{FOLD11_G_HOP}',1,{made_s},1)"),
+            format!("INSERT INTO pot_evictions(txid,evictedAt,reason,releasedSpends) VALUES ('{FOLD11_G_JOIN}',{evicted},'refused','[{{\"txid\":\"{FOLD11_G_HOP}\",\"vout\":0,\"table\":\"pot_records\"}}]')"),
+            format!("INSERT INTO released_hop_evidence(hopTxid,hopVout,identity,gameId,potTxid,seatSettlePubkey,hopSats,evictedAt) VALUES ('{FOLD11_G_HOP}',0,'owner','{game}','{FOLD11_G_JOIN}','seat',20190,{evicted})"),
+        ],
+        identities: vec!["owner".into()],
+    }
+}
+
+/// (fold11_g) bsv-low #957 item 1: THE RELEASED-HOP EVIDENCE TAKES THE ERA'S RULE. Beta's live disagreement: the
+/// actor held `hop-stranded`, claimable, 20,190 sats, `joinRefusedBy: eviction`, `markerCreatedAtMs` the eviction's
+/// time (the evidence road's fingerprint: `hydrate.rs` stamps the rebuilt hop with `evictedAt`), for an Oct 21 hop
+/// D1 held no row for. The marker road writes an old-era hop off (`rank::select_hops`); the evidence road did not, so
+/// an old-era Collect press came back through the eviction (the owner's rule, #375: no old-era Collect anywhere).
+/// Under the era both judges now write it off, the same rows; with no era both serve the press (the shape reaches
+/// it). RED on `26f7443c6`: under the era both judges store the `hop-stranded` claimable row.
+#[tokio::test]
+async fn fold11_g_an_old_era_released_hop_is_written_off_by_both_judges() {
+    let made = (NOW_MS / 1000) as i64 - 8 * 86_400;
+    let era = (made + 5 * 86_400) * 1000;
+    let hop = format!("{FOLD11_G_HOP}:0");
+    let judge_both = |era: Option<i64>| async move {
+        let d1 = seeded(&fold11_g_fixture(made));
+        let games = games_of(&d1, "owner");
+        assert_eq!(games.len(), 1, "a hop-only game");
+        match era {
+            Some(e) => crate::owed_judge::judge_subjects(&Era(&d1, e), "owner", &games, "d1")
+                .await
+                .unwrap(),
+            None => crate::owed_judge::judge_subjects(&d1, "owner", &games, "d1")
+                .await
+                .unwrap(),
+        };
+        let local = mirror();
+        apply(
+            &d1,
+            &local,
+            &Fakes,
+            "owner",
+            &games,
+            Some(("bootstrap", 1)),
+            Some(TIP),
+            era,
+        )
+        .await
+        .unwrap();
+        (d1, local)
+    };
+    // no era: the shape is the live row (the press)
+    let (d1, local) = judge_both(None).await;
+    let row = fold9_row(&d1, &hop).expect("the press");
+    assert_eq!(
+        (row.0.as_str(), row.1),
+        ("hop-stranded", Some(1)),
+        "{row:?}"
+    );
+    assert_eq!(row.2["joinRefusedBy"], json!("eviction"));
+    assert_eq!(stored_rows_no_clock(&local), stored_rows_no_clock(&d1));
+    // the era: written off by both
+    let (d1, local) = judge_both(Some(era)).await;
+    assert_eq!(fold9_row(&d1, &hop), None, "D1 writes the old-era hop off");
+    assert_eq!(fold9_row(&local, &hop), None, "the actor writes it off too");
+    assert_eq!(stored_rows_no_clock(&local), stored_rows_no_clock(&d1));
+}
+
+/// (fold11_h) bsv-low #957 item 2: TWO JUDGES OF ONE RECORD AT TWO TIPS COMPARE EQUAL WITH THE SAME VERDICT. Beta's
+/// `329dba34…:0` differed only in `facts.tip` (D1 973080, the actor its bootstrap's tip), both `unbound`. The compare
+/// reads the judgement without its clock ([`CLOCK_FACTS`] now holds `tip`); a verdict change still differs
+/// (`claimable` and the family are compared apart). RED on `26f7443c6`: the same verdict at two tips is one diff.
+#[test]
+fn fold11_h_two_tips_with_one_verdict_compare_equal() {
+    let row = |tip: u64, family: &str, claimable: Option<i64>| {
+        json!({"outpoint": "329d:0", "family": family, "gameId": "g", "sats": null, "opponentIdentity": "o",
+            "atHeight": null, "reason": "the index holds no spend word for this pot", "claimable": claimable,
+            "facts": json!({"claim": null, "tip": tip, "ageMs": tip}).to_string()})
+    };
+    let (d1, actor) = (row(973_080, "unbound", None), row(973_131, "unbound", None));
+    assert!(
+        diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)).is_empty(),
+        "one verdict at two tips"
+    );
+    assert_eq!(
+        rows_digest(std::slice::from_ref(&d1)),
+        rows_digest(&[actor])
+    );
+    assert_eq!(
+        diff_rows(
+            std::slice::from_ref(&d1),
+            &[row(973_131, "hop-stranded", Some(1))]
+        ),
+        vec!["329d:0".to_string()]
+    );
+    assert_eq!(
+        diff_rows(&[d1], &[row(973_131, "unbound", Some(1))]),
+        vec!["329d:0".to_string()]
+    );
+    assert!(CLOCK_FACTS.contains(&"tip"));
 }

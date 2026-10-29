@@ -254,6 +254,10 @@ pub struct ApplyBody {
     /// (the first-apply rule's key), beside the body's own.
     #[serde(default)]
     pub also: Vec<(String, i64)>,
+    /// D2-ACTOR-B-FOLD-11 (NEW6-L1): the write time of each `also` event (the consumer's coalesced delivery), its
+    /// visibility sample's start; absent (a direct call, an older caller): those events sample nothing.
+    #[serde(default)]
+    pub also_at_ms: Vec<u64>,
     /// D2-ACTOR-E (bsv-low #954): the txids the event's write named (its source key and its facts): over warm games
     /// the apply reads exactly those rows ([`apply_with`]). Absent: the whole closure (an older caller, a tip alarm).
     #[serde(default)]
@@ -446,6 +450,7 @@ impl DurableObject for OwedActor {
                         bound: None,
                         class: None,
                         also: Vec::new(),
+                        also_at_ms: Vec::new(),
                         txids: None,
                     };
                     async move {
@@ -630,7 +635,7 @@ impl OwedActor {
             // D2-ACTOR-B-FOLD-10: the state another build judged is judged again (its bootstrap from the start, the
             // state served meanwhile); one already re-judging keeps its run.
             let judged = self.meta(META_JUDGED_REV);
-            if !rejudge_due(true, judged.as_deref(), lib_rev()) {
+            if !rejudge_due(true, judged.as_deref(), JUDGE_VERSION) {
                 return Armed {
                     already: true,
                     ..Armed::default()
@@ -640,9 +645,9 @@ impl OwedActor {
                 return Armed::default();
             }
             console_log!(
-                "[owed-actor] {me}: the state was judged by build {} (running {}): re-judged from the start",
+                "[owed-actor] {me}: the state was judged under judge version {} (running {}): re-judged from the start",
                 judged.as_deref().unwrap_or("before FOLD-10"),
-                lib_rev()
+                JUDGE_VERSION
             );
             self.put_meta(&local, META_IDENTITY, me);
             self.put_meta(&local, META_BOOT_CURSOR, BOOT_CURSOR_START);
@@ -873,19 +878,32 @@ impl OwedActor {
         // D2-ACTOR-E item 4: the rows' visibility is sampled only for an event born on a WARM actor (written after
         // its bootstrap's stamp): a held event's drain is the cold bar's, and an event the sweep re-published while
         // the actor held (or that waited out its bootstrap in the queue) is the cold path's, never a warm sample.
-        let warm_at_birth = warm_at_birth(
-            body.at_ms,
-            self.meta(META_BOOTSTRAPPED)
-                .and_then(|v| v.parse::<u64>().ok()),
-        );
+        let stamp = self
+            .meta(META_BOOTSTRAPPED)
+            .and_then(|v| v.parse::<u64>().ok());
+        let warm_at_birth = warm_at_birth(body.at_ms, stamp);
+        // D2-ACTOR-B-FOLD-11 (NEW6-L1): a coalesced delivery's other events, each by its OWN first apply (read before
+        // this delivery records them below) and birth: the batch's faulted tail is sampled even when its oldest event
+        // was applied by its direct call. An older caller's `also` carries no write times and samples nothing.
+        let mut events = vec![(body.at_ms, report.first_apply, warm_at_birth)];
+        for (n, (kind, seq)) in body.also.iter().enumerate() {
+            let Some(at) = body.also_at_ms.get(n).copied() else {
+                continue;
+            };
+            let first = first_apply_of(&local, Some((kind.as_str(), *seq)), &body.games).await;
+            events.push((Some(at), first, warm_at_birth_of(Some(at), stamp)));
+        }
+        let visible = event_visibility(now, &events);
         {
             let mut bars = self.bars.borrow_mut();
             bars.apply.note(now.saturating_sub(started));
             if let (true, true, Some(at)) = (report.first_apply, warm_at_birth, body.at_ms) {
-                bars.visible.note(now.saturating_sub(at));
                 if body.mined {
                     bars.collect_after_mined.note(now.saturating_sub(at));
                 }
+            }
+            for ms in &visible {
+                bars.visible.note(*ms);
             }
         }
         self.put_meta(&local, META_IDENTITY, &me);
@@ -896,7 +914,7 @@ impl OwedActor {
         if rejudge_due(
             self.meta(META_BOOTSTRAPPED).is_some(),
             self.meta(META_JUDGED_REV).as_deref(),
-            lib_rev(),
+            JUDGE_VERSION,
         ) {
             self.arm_bootstrap(&me, false).await;
         }
@@ -948,6 +966,8 @@ impl OwedActor {
         answer["applyMs"] = json!(now.saturating_sub(started));
         answer["ackSeq"] = json!(self.meta(META_ACK));
         answer["warmAtBirth"] = json!(warm_at_birth);
+        // NEW6-L1: the delivery's visibility samples, one an event ([`event_visibility`]), read by the bars' note.
+        answer["visibleMs"] = json!(visible);
         // NEW5-L5: the object notes its own samples into the fleet's bars (the caller may be gone: a walled direct
         // call), then marks the answer noted so the caller adds no second sample.
         // An apply with no event (the tip alarm's window) is no delivery: its caller notes nothing, nor does it.
@@ -1072,10 +1092,17 @@ impl OwedActor {
         // NEW-M2: one token of the fleet's bootstrap budget, or a wait for a slot in a later minute.
         let now = Date::now().as_millis();
         // NEW2-L3: one statement; a full minute writes nothing and answers no row (the page waits).
+        // D2-ACTOR-B-FOLD-11 (NEW6-L2): a re-judge (an actor already bootstrapped) takes only under its share, and
+        // waits behind the cold pages.
+        let rejudge = self.meta(META_BOOTSTRAPPED).is_some();
         let taken = boot_taken(
             &record
                 .run_batch(vec![Stmt::new(
-                    BOOT_BUDGET_TAKE_SQL,
+                    if rejudge {
+                        BOOT_BUDGET_REJUDGE_TAKE_SQL
+                    } else {
+                        BOOT_BUDGET_TAKE_SQL
+                    },
                     vec![Bind::Int(now as i64)],
                 )])
                 .await
@@ -1085,7 +1112,7 @@ impl OwedActor {
                 .map(|o| o.rows)
                 .unwrap_or_default(),
         );
-        if let Some(wait) = boot_pace(taken, now, &me) {
+        if let Some(wait) = boot_pace_of(taken, now, &me, rejudge) {
             self.alarm_at(wait).await;
             return Ok(());
         }
@@ -1124,7 +1151,7 @@ impl OwedActor {
                 let now = Date::now().as_millis();
                 self.put_meta(local, META_JUDGED_AT, &now.to_string());
                 // D2-ACTOR-B-FOLD-10: the whole state is this build's judgement now.
-                self.put_meta(local, META_JUDGED_REV, lib_rev());
+                self.put_meta(local, META_JUDGED_REV, JUDGE_VERSION);
                 let _ = local
                     .sql
                     .exec("DELETE FROM meta WHERE name='bootCursor'", None);

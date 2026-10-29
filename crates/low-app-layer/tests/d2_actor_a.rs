@@ -1081,7 +1081,10 @@ async fn d2_actor_a_fold3_low1_low2_the_wall_notes_its_subjects_and_a_stale_memo
     assert_eq!(src.matches("set_in_flight(&identity,chunk);").count(), 1);
     assert_eq!(src.matches("set_in_flight(&identity,one);").count(), 1);
     assert!(src.contains("letin_flight=take_in_flight();"));
-    assert!(src.contains("matchnote_wall_subjects(&sql,&in_flight).await{"));
+    // D2-ACTOR-B-FOLD-11: both arms call one rule, `wall_fate` (the subjects in flight, else the pair)
+    assert!(src.contains("matchnote_wall_subjects(db,in_flight).await{"));
+    assert!(src.contains("delay=wall_fate(&sql,&[(&ev.source,&ev.source_key)],&in_flight).await;"));
+    assert!(src.contains("letin_flight=take_in_flight();letwalled_pairs"));
 }
 
 /// NEW2-M1's statements on their indexes: the marks' reads and the held counts walk `owed_dirty` by the named index and
@@ -1189,4 +1192,266 @@ async fn d2_actor_a_fold5_the_health_serves_published_and_consumed_as_numbers() 
     let sql = owed_events::HEALTH_TOTALS_SQL;
     assert!(sql.contains("ops_counters") && sql.contains("name IN ("));
     assert_eq!(sql.matches("'owed_events_").count(), 2, "{sql}");
+}
+
+// ---- D2-ACTOR-B-FOLD-11 (the sixth delta lens's NEW6-M2) ----
+
+/// A [`Db`] whose judge write of any subject naming `slow` never answers (a subject whose judge outlasts every wall).
+struct Slow<'a> {
+    db: &'a Db,
+    slow: &'static str,
+}
+impl SqlPort for Slow<'_> {
+    async fn run_batch(
+        &self,
+        stmts: Vec<low_app_layer::pot_hook::Stmt>,
+    ) -> Result<Vec<low_app_layer::pot_hook::StmtOut>, String> {
+        let writes_rows = stmts.iter().any(|s| s.sql.contains("INSERT INTO owed_rows"));
+        let names = stmts.iter().any(|s| {
+            s.binds.iter().any(
+                |b| matches!(b, low_app_layer::pot_hook::Bind::Text(t) if t.contains(self.slow)),
+            )
+        });
+        if writes_rows && names {
+            std::future::pending::<()>().await;
+        }
+        self.db.run_batch(stmts).await
+    }
+    async fn counters(&self, deltas: Vec<(String, u64)>) {
+        self.db.counters(deltas).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.db.now_ms()
+    }
+    fn log(&self, line: &str) {
+        self.db.log(line);
+    }
+}
+impl low_app_layer::owed_judge::JudgeDb for Slow<'_> {
+    fn tip(&self) -> Option<u64> {
+        self.db.tip()
+    }
+    async fn word_views(
+        &self,
+        rows: &std::collections::BTreeMap<String, low_app_layer::tracker_host::stored::Row>,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, String> {
+        self.db.word_views(rows).await
+    }
+    async fn canonical_root(&self, height: u64) -> Option<String> {
+        self.db.canonical_root(height).await
+    }
+    async fn push(&self, identity: &str, body: serde_json::Value) {
+        self.db.push(identity, body).await;
+    }
+}
+
+fn fold11_wall() -> tokio::time::Sleep {
+    tokio::time::sleep(std::time::Duration::from_millis(40))
+}
+
+/// One delivery of `evs` through the shipped consumer core: a batch of several through `batch_core`, then each
+/// message the pass left (`Fate::Alone`; a batch of one is the one-message arm) through the one-message arm's own
+/// rule: `route` raced against its wall, a wall noted by `wall_fate`, a fault by `fault_fate` (the queue handler's
+/// single arm is those calls around `consume_one`, whose plan and judge are `route`'s). Answers each message's fate.
+async fn fold11_deliver(db: &Db, slow: &Slow<'_>, evs: &[OwedEvent]) -> Vec<owed_events::Fate> {
+    use owed_events::Fate;
+    let refs: Vec<&OwedEvent> = evs.iter().collect();
+    let mut fates = vec![Fate::Alone; evs.len()];
+    if evs.len() > 1 {
+        let mut plans = Vec::new();
+        for ev in evs {
+            plans.push(owed_events::plan(db, ev).await.unwrap());
+        }
+        let make = |_, _| async { Ok::<Slow, String>(Slow { db, slow: slow.slow }) };
+        let out = owed_events::batch_core(db, &refs, &plans, make, fold11_wall())
+            .await
+            .unwrap();
+        fates = out.fates;
+        if out.walled {
+            return fates;
+        }
+    }
+    for (ev, fate) in evs.iter().zip(fates.iter_mut()) {
+        if *fate != Fate::Alone {
+            continue;
+        }
+        let _ = owed_events::take_in_flight();
+        let work = std::pin::pin!(owed_events::route(slow, ev));
+        let wall = std::pin::pin!(fold11_wall());
+        *fate = match futures_util::future::select(work, wall).await {
+            futures_util::future::Either::Left((Ok(r), _)) => Fate::Ack {
+                resolve: r.subjects > 0 || r.held == 0,
+                continues: owed_events::continues(&r),
+            },
+            futures_util::future::Either::Left((Err(e), _)) => Fate::Fault {
+                delay_s: owed_events::fault_fate(db, &ev.source, &ev.source_key, &e).await,
+            },
+            futures_util::future::Either::Right(_) => {
+                let in_flight = owed_events::take_in_flight();
+                Fate::Retry {
+                    delay_s: Some(
+                        owed_events::wall_fate(db, &[(&ev.source, &ev.source_key)], &in_flight).await,
+                    ),
+                }
+            }
+        };
+    }
+    fates
+}
+
+/// (fold11_c) NEW6-M2: 16 MESSAGES FOR ONE IDENTITY WHOSE FIRST SUBJECT NEVER ANSWERS END WITH THAT SUBJECT HELD AND
+/// THE OTHER 15 JUDGED. The first coalesced batch walls with the chunk in flight: each in-flight subject noted on its
+/// own memo (as the one-message arm notes it) and handed back with its delay; the redelivery takes no message whose
+/// subject carries a memo into the coalesced pass, so each is judged alone: the slow one walls alone (its second
+/// note), the other 15 land and their memos clear; its third wall holds it; its next delivery is all held. And the
+/// merged plan is ONE message's bound: three messages of 30 games, the third left to the one-message arm. On
+/// `26f7443c6` (no `batch_core`; its batch arm hands all 16 back on every wall, noting nothing) the pin does not
+/// compile; with `batch_core`'s memo read made inert (every message coalesced) it is RED: nothing is ever judged.
+#[tokio::test(flavor = "current_thread")]
+async fn fold11_c_a_walled_subject_is_held_and_the_other_fifteen_judged() {
+    use owed_events::Fate;
+    let db = Db::new();
+    let games: Vec<String> = (0..16)
+        .map(|k| if k == 0 { "slow00".to_string() } else { format!("g{k:02}") })
+        .collect();
+    for (k, g) in games.iter().enumerate() {
+        seed_stranded_hop(&db, ID, g, &owed_db::hop(200 + k));
+    }
+    let evs: Vec<OwedEvent> = (0..16)
+        .map(|k| event("hop", &hop_key(&owed_db::hop(200 + k))))
+        .collect();
+    let slow = Slow { db: &db, slow: "slow00" };
+    // delivery 1: the batch walls, its subjects in flight noted, every message handed back
+    let first = fold11_deliver(&db, &slow, &evs).await;
+    assert!(
+        first.iter().all(|f| matches!(f, Fate::Retry { delay_s: Some(_) })),
+        "{first:?}"
+    );
+    let memo = |g: &str| {
+        db.opt(&format!(
+            "SELECT (SELECT json_extract(cursor,'$.faults') FROM owed_belt_state WHERE name='{}')",
+            owed_events::subject_memo_name(ID, g)
+        ))
+    };
+    assert_eq!(memo("slow00"), Some(1), "the walled subject noted");
+    // delivery 2: no message with a noted subject is coalesced: each alone, the 15 land
+    let second = fold11_deliver(&db, &slow, &evs).await;
+    assert!(matches!(second[0], Fate::Retry { .. }), "{:?}", second[0]);
+    assert!(second[1..].iter().all(|f| *f == Fate::Ack { resolve: true, continues: false }), "{second:?}");
+    for g in &games[1..] {
+        assert_eq!(rows_of(&db, ID, g), 1, "{g} judged");
+        assert_eq!(memo(g), None, "{g}'s memo cleared by its landing");
+    }
+    assert_eq!(memo("slow00"), Some(2));
+    // delivery 3 (the slow one alone): its third wall holds it
+    fold11_deliver(&db, &slow, &evs[..1]).await;
+    let until = db.int(&format!(
+        "SELECT json_extract(cursor,'$.heldUntilMs') FROM owed_belt_state WHERE name='{}'",
+        owed_events::subject_memo_name(ID, "slow00")
+    ));
+    assert!(until > db.now.get() as i64, "held");
+    // delivery 4: all held, nothing resolved, its mark standing
+    let fourth = fold11_deliver(&db, &slow, &evs[..1]).await;
+    assert_eq!(fourth, vec![Fate::Ack { resolve: false, continues: false }]);
+    assert_eq!(rows_of(&db, ID, "slow00"), 0);
+    assert_eq!(db.int("SELECT COUNT(*) FROM owed_dirty"), 1, "the held subject's mark stands");
+
+    // THE BOUND: three messages of 30 games each; the pass takes two (60 <= 64), the third is left alone.
+    let db = Db::new();
+    for k in 0..90 {
+        seed_stranded_hop(&db, ID, &format!("b{k:02}"), &owed_db::hop(400 + k));
+    }
+    for m in 0..3 {
+        db.exec(&format!(
+            "UPDATE owed_dirty SET source='age',sourceKey='age{m}' WHERE gameId IN (SELECT value FROM json_each('{}'))",
+            serde_json::json!((30 * m..30 * m + 30).map(|k| format!("b{k:02}")).collect::<Vec<_>>())
+        ));
+    }
+    let evs: Vec<OwedEvent> = (0..3).map(|m| event("age", &format!("age{m}"))).collect();
+    let mut plans = Vec::new();
+    for ev in &evs {
+        plans.push(owed_events::plan(&db, ev).await.unwrap());
+    }
+    assert!(plans.iter().all(|p| p.game_count() == 30));
+    assert_eq!(owed_events::batch_selection(&plans, &[false; 3]), vec![true, true, false]);
+    let refs: Vec<&OwedEvent> = evs.iter().collect();
+    let make = |_, _| async { Ok::<Slow, String>(Slow { db: &db, slow: "~never~" }) };
+    let out = owed_events::batch_core(&db, &refs, &plans, make, std::future::pending::<()>())
+        .await
+        .unwrap();
+    assert_eq!(out.coalesced, 2);
+    assert_eq!(out.routed.subjects, 60, "one message's bound");
+    assert_eq!(out.fates[2], Fate::Alone);
+    assert!(matches!(out.fates[0], Fate::Ack { resolve: true, .. }));
+}
+
+/// (fold11_d) NEW6-M2: A MESSAGE WHOSE EVERY SUBJECT WAS HELD LEAVES ITS FAULT MEMO AND ITS DEAD LETTER IN PLACE INSIDE
+/// A COALESCED BATCH. Three messages: a live one (judged, resolved), one whose only subject is held (taken: nothing to
+/// judge; resolves nothing, its dead letter stays), and one whose pair carries a fault memo (left to the one-message
+/// arm: the batch touches neither its memo nor its dead letter). The statements applied are the queue handler's
+/// (`resolved_statements` for each `Ack { resolve: true }`). On `26f7443c6` every message of a batch that judged a
+/// subject was resolved (`routed.subjects > 0` over the MERGED routing): both dead letters and the memo went.
+#[tokio::test(flavor = "current_thread")]
+async fn fold11_d_an_all_held_message_resolves_nothing_inside_a_batch() {
+    use owed_events::Fate;
+    let db = Db::new();
+    seed_stranded_hop(&db, ID, "live", &owed_db::hop(501));
+    seed_stranded_hop(&db, ID, "heldgame", &owed_db::hop(502));
+    seed_stranded_hop(&db, ID, "memo", &owed_db::hop(503));
+    let evs: Vec<OwedEvent> = [501, 502, 503]
+        .iter()
+        .map(|n| event("hop", &hop_key(&owed_db::hop(*n))))
+        .collect();
+    let now = db.now.get() as i64;
+    // the held subject's memo (held for an hour) and the third pair's fault memo; a dead letter for each of the two
+    db.exec(&format!(
+        "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('{}','{}',{now}),('{}','{}',{now})",
+        owed_events::subject_memo_name(ID, "heldgame"),
+        serde_json::json!({"faults": 3, "heldUntilMs": now + 3_600_000}),
+        owed_events::fault_memo_name(&evs[2].source, &evs[2].source_key),
+        serde_json::json!({"faults": 1, "heldUntilMs": now}),
+    ));
+    for ev in &evs[1..] {
+        db.exec(&format!(
+            "INSERT INTO owed_event_dead_letters(source,sourceKey,messageId,body,parkedAt) VALUES ('{}','{}','m','{{}}',{now})",
+            ev.source, ev.source_key
+        ));
+    }
+    let mut plans = Vec::new();
+    for ev in &evs {
+        plans.push(owed_events::plan(&db, ev).await.unwrap());
+    }
+    let refs: Vec<&OwedEvent> = evs.iter().collect();
+    let make = |_, _| async { Ok::<Slow, String>(Slow { db: &db, slow: "~never~" }) };
+    let out = owed_events::batch_core(&db, &refs, &plans, make, std::future::pending::<()>())
+        .await
+        .unwrap();
+    assert!(out.routed.subjects > 0, "the batch judged the live subject");
+    assert_eq!(
+        out.fates,
+        vec![
+            Fate::Ack { resolve: true, continues: false },
+            Fate::Ack { resolve: false, continues: false },
+            Fate::Alone
+        ]
+    );
+    // the queue handler's statements for the acked messages
+    let mut stmts = Vec::new();
+    for (ev, f) in evs.iter().zip(&out.fates) {
+        if matches!(f, Fate::Ack { resolve: true, .. }) {
+            stmts.extend(owed_events::resolved_statements(&ev.source, &ev.source_key));
+        }
+    }
+    db.run_batch(stmts).await.unwrap();
+    assert_eq!(db.int("SELECT COUNT(*) FROM owed_event_dead_letters"), 2, "both dead letters stay");
+    assert_eq!(
+        db.int(&format!(
+            "SELECT COUNT(*) FROM owed_belt_state WHERE name='{}'",
+            owed_events::fault_memo_name(&evs[2].source, &evs[2].source_key)
+        )),
+        1,
+        "the pair's memo stays"
+    );
+    assert_eq!(rows_of(&db, ID, "live"), 1);
+    assert_eq!(rows_of(&db, ID, "heldgame"), 0);
 }

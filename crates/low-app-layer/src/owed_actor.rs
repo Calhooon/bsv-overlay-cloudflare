@@ -673,6 +673,16 @@ pub const BOOTSTRAP_PAGE_DELAY_MS: u64 = 1_000;
 /// fractional minute, a new value every millisecond: every take reset the count and answered 1, and the budget never
 /// refused on D1. The minute is `CAST(?1 AS INTEGER)/60000`, an integer whatever the bind.
 pub const BOOT_BUDGET_TAKE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-actor:boot-budget','1',CAST(?1 AS INTEGER)/60000) ON CONFLICT(name) DO UPDATE SET cursor=CASE WHEN owed_belt_state.tickedAtMs=excluded.tickedAtMs THEN CAST(CAST(owed_belt_state.cursor AS INTEGER)+1 AS TEXT) ELSE '1' END,tickedAtMs=excluded.tickedAtMs WHERE owed_belt_state.tickedAtMs IS NOT excluded.tickedAtMs OR CAST(owed_belt_state.cursor AS INTEGER)<60 RETURNING CAST(cursor AS INTEGER) AS taken";
+/// D2-ACTOR-B-FOLD-11 (the sixth delta lens's NEW6-L2): the pages a minute a RE-JUDGE may take (an actor already
+/// bootstrapped whose state another judge version judged, [`rejudge_due`]). It takes from the same minute's count as a
+/// cold page but only while the count is under this, so at least `BOOTSTRAP_PAGES_PER_MINUTE -
+/// BOOTSTRAP_REJUDGE_PAGES_PER_MINUTE` pages a minute stay for COLD actors (a new seat, held events, a read served
+/// display-only or a 503) whatever the fleet's re-judge; and a waiting cold page's slot is in the first half of the
+/// next minute, a waiting re-judge's in the second ([`boot_pace_of`]): cold pages first in the slot order.
+pub const BOOTSTRAP_REJUDGE_PAGES_PER_MINUTE: i64 = 30;
+/// [`BOOT_BUDGET_TAKE_SQL`] for a re-judge's page: the same row and minute, refused at
+/// [`BOOTSTRAP_REJUDGE_PAGES_PER_MINUTE`].
+pub const BOOT_BUDGET_REJUDGE_TAKE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-actor:boot-budget','1',CAST(?1 AS INTEGER)/60000) ON CONFLICT(name) DO UPDATE SET cursor=CASE WHEN owed_belt_state.tickedAtMs=excluded.tickedAtMs THEN CAST(CAST(owed_belt_state.cursor AS INTEGER)+1 AS TEXT) ELSE '1' END,tickedAtMs=excluded.tickedAtMs WHERE owed_belt_state.tickedAtMs IS NOT excluded.tickedAtMs OR CAST(owed_belt_state.cursor AS INTEGER)<30 RETURNING CAST(cursor AS INTEGER) AS taken";
 /// The token's number a take answered (no row: the minute is full, the page waits).
 pub fn boot_taken(rows: &[Value]) -> i64 {
     rows.first()
@@ -682,7 +692,19 @@ pub fn boot_taken(rows: &[Value]) -> i64 {
 /// The page's verdict for the `taken`-th token of this minute: `None` runs it; `Some(at)` is its wait, a slot in
 /// the next minute spread by the identity (so the waiting actors do not all wake at the minute's edge).
 pub fn boot_pace(taken: i64, now_ms: u64, identity: &str) -> Option<u64> {
-    if taken <= BOOTSTRAP_PAGES_PER_MINUTE {
+    boot_pace_of(taken, now_ms, identity, false)
+}
+
+/// [`boot_pace`] for a cold page (`rejudge` false: the minute's [`BOOTSTRAP_PAGES_PER_MINUTE`], a wait in the first
+/// half of the next minute) or a re-judge's (NEW6-L2: [`BOOTSTRAP_REJUDGE_PAGES_PER_MINUTE`], a wait in the second
+/// half), each spread by the identity.
+pub fn boot_pace_of(taken: i64, now_ms: u64, identity: &str, rejudge: bool) -> Option<u64> {
+    let (cap, from) = if rejudge {
+        (BOOTSTRAP_REJUDGE_PAGES_PER_MINUTE, 30_000)
+    } else {
+        (BOOTSTRAP_PAGES_PER_MINUTE, 0)
+    };
+    if taken <= cap {
         return None;
     }
     let spread = identity
@@ -690,8 +712,8 @@ pub fn boot_pace(taken: i64, now_ms: u64, identity: &str) -> Option<u64> {
         .skip(2)
         .take(8)
         .fold(0u64, |a, b| a.wrapping_mul(31).wrapping_add(u64::from(b)))
-        % 60_000;
-    Some((now_ms / 60_000 + 1) * 60_000 + spread)
+        % 30_000;
+    Some((now_ms / 60_000 + 1) * 60_000 + from + spread)
 }
 
 /// A `CREATE INDEX` statement (never `CREATE UNIQUE INDEX`).
@@ -1082,9 +1104,11 @@ async fn keys_of_mirror(
 const JUDGED_TXIDS_SQL: &str = "SELECT r.outpoint,r.facts,w.txid FROM owed_rows r LEFT JOIN owed_row_words w ON w.identity=r.identity AND w.outpoint=r.outpoint WHERE r.identity=?1 AND r.gameId IN (SELECT value FROM json_each(?2))";
 
 /// D2-ACTOR-E (bsv-low #954): how long a game's last FULL refresh keeps it WARM ([`apply_with`]'s narrowed read).
-/// It bounds the drift of a family no trigger marks (the derived links, the evicted copies, the hand and proof
-/// markers, the probe memos the TTL sweep takes, `transactions`): a warm game re-reads them only for the rows its
-/// events name; past this the next apply of the game reads its whole closure again.
+/// Since D2-ACTOR-B-FOLD-11 (the sixth delta lens's NEW6-M1) warmth bounds no drift: a warm game's narrowed read
+/// re-reads every family over the mirror's whole key set, so a write no trigger marks (the reorg clear, a proof
+/// latched or withdrawn, the TTL sweep, an opponent's party row) is read by the game's next apply whatever its event.
+/// What warmth still decides: a warm game's closure is already walked, so its first round reads the event's new keys
+/// beside the mirror's (no miss round for them) and its coverage bound comes from the marks read before it.
 pub const FULL_REFRESH_EVERY_MS: i64 = 600_000;
 /// The kind of the `applied` rows that stamp a game's last full refresh (`seq` 0, `atMs` the refresh).
 pub const FULL_KIND: &str = "full";
@@ -1149,10 +1173,18 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
 /// [`apply`] told what the event wrote (D2-ACTOR-E, bsv-low #954).
 ///
 /// A game is WARM when its whole closure was read within [`FULL_REFRESH_EVERY_MS`]: an apply of warm games told the
-/// txids its event wrote (`opts.touch`) reads the record ONCE for exactly those rows: the rows the event's txids and
-/// the games' pending marks name ([`NARROW_MARKS_SQL`], one statement, so every mark the apply's bound covers has its
-/// row read), the games' own rows (the identity's and the result families') and the links of their hop markers, in
-/// one statement ([`compound_select`]); the mirror holds the rest. A key the judgement then names that the mirror
+/// txids its event wrote (`opts.touch`) reads the record in TWO statements: the games' pending marks
+/// ([`NARROW_MARKS_SQL`], so every mark the apply's bound covers has its row read), then every family in one
+/// statement ([`aggregate_select`]) over the mirror's WHOLE key set plus the event's and the marks' txids.
+///
+/// THE RULE (D2-ACTOR-B-FOLD-11, NEW6-M1): a warm game's judgement after ANY write equals the D1 judge's over the full
+/// closure. As D2-ACTOR-E built it the narrowed read took only the event's and the marks' rows, so a write no trigger
+/// marks (the overlay's reorg clear of confirmed evidence, `TRANSACTION_UNPROVE_SQL`, the TTL sweep, an opponent's
+/// party row) left the warm mirror stale and its judgement stood until a full read or the reconcile. Reading the
+/// unmarked families alone over the whole key set was the lens's narrower shape; it is not taken because the set of
+/// families every writer marks for every identity that reaches them is empty on inspection (partial triggers: the
+/// BEEF's delete, `network_seen`'s delete, a word's other columns; cross-identity txid keys), so the narrowing kept
+/// is the statement count, never the rows. A key the judgement then names that the mirror
 /// has not read is a MISS: read in its own round (its keys alone), counted (`owed_actor_closure_misses_total`).
 /// Any other apply (a cold game, no `touch`, a mark of [`FULL_SOURCES`]) reads the whole closure as before, in one
 /// statement a round (it was 24), and stamps its games warm.
@@ -1245,8 +1277,12 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
             .iter()
             .any(|m| FULL_SOURCES.contains(&m["source"].as_str().unwrap_or("")))
         {
+            // D2-ACTOR-B-FOLD-11 (NEW6-M1): the warm mirror's WHOLE key set, every family, beside the event's and the
+            // marks' keys: no family is narrowed to the event's rows, because no family's every writer marks every
+            // identity its rows reach (the nine untriggered families, a trigger on INSERT or UPDATE alone, an
+            // opponent's row reached by a txid key, a delete no trigger sees).
             let mut n = Keys {
-                txids: BTreeSet::new(),
+                txids: keys.txids.clone(),
                 markers: keys.markers.clone(),
             };
             touch.iter().for_each(|t| txids_in(t, &mut n.txids));
@@ -1305,8 +1341,7 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
             .run_batch(write_round(&me, &read_games, &read_keys, &read, seq))
             .await?;
         if first {
-            // A narrowed read leaves the warm mirror's keys as read (they are not re-read; their own events refresh
-            // them); a full read has read every key it holds.
+            // Both reads have read every key the mirror held (FOLD-11: the narrowed read takes the whole key set).
             fetched = keys.clone();
         }
         fetched.txids.extend(read_keys.txids.iter().cloned());
@@ -1513,6 +1548,11 @@ pub fn answer_of(report: &ApplyReport, rows: Vec<Value>) -> Value {
 /// backstop's lag): an event written while the actor held (a held event, the sweep's re-publish of a held mark) is
 /// the cold path's. An event with no write time, or an actor with no stamp (an older build's), samples as before.
 pub fn warm_at_birth(at_ms: Option<u64>, bootstrapped_at_ms: Option<u64>) -> bool {
+    warm_at_birth_of(at_ms, bootstrapped_at_ms)
+}
+
+/// [`warm_at_birth`] under a name a scope that shadows it with its own verdict can call.
+pub fn warm_at_birth_of(at_ms: Option<u64>, bootstrapped_at_ms: Option<u64>) -> bool {
     match (at_ms, bootstrapped_at_ms) {
         (Some(at), Some(stamp)) => at >= stamp,
         _ => true,
@@ -2700,7 +2740,9 @@ pub const ROWS_SQL: &str = "SELECT identity,outpoint,family,gameId,sats,opponent
 /// opponentIdentity, atHeight, reason, facts)`; the outpoints that differ, sorted.
 /// The facts of a stored row as the compares read them: the judgement, not its clock (the facts relative to the
 /// judge's `now` taken out, so two judges of one record at two instants compare equal).
-pub const CLOCK_FACTS: [&str; 4] = ["ageMs", "chainProbeAgeMs", "beltNextAtMs", "asOfMs"];
+/// D2-ACTOR-B-FOLD-11 (bsv-low #957 item 2): `tip`, the judge's input tip `owed.rs` writes into several families' facts,
+/// is the judgement's clock too (the verdict a tip moves is compared apart: `claimable`, `blocksToGate`, `tipUnknown`).
+pub const CLOCK_FACTS: [&str; 5] = ["ageMs", "chainProbeAgeMs", "beltNextAtMs", "asOfMs", "tip"];
 pub fn compared_facts(row: &Value) -> Value {
     let mut facts: Value = row["facts"]
         .as_str()
@@ -3234,13 +3276,21 @@ impl PendingBars {
             self.noted += 1;
         }
         // D2-ACTOR-D: the rows' visibility once per event, at its first apply ([`samples_visible`]).
+        // D2-ACTOR-B-FOLD-11 (NEW6-L1): an answer that names its samples (`visibleMs`, one an event of a coalesced
+        // delivery) is sampled by them; the mined bar stays its own event's.
+        if let Some(each) = answer["visibleMs"].as_array() {
+            let v = self.visible.entry(class).or_default();
+            v.extend(each.iter().filter_map(Value::as_u64));
+        }
         if let (true, Some(at), Some(judged)) = (
             samples_visible(answer),
             answer["atMs"].as_u64(),
             answer["judgedAtMs"].as_u64(),
         ) {
             let ms = judged.saturating_sub(at);
-            self.visible.entry(class).or_default().push(ms);
+            if answer["visibleMs"].is_null() {
+                self.visible.entry(class).or_default().push(ms);
+            }
             if answer["mined"] == true {
                 self.visible.entry("mined").or_default().push(ms);
             }
@@ -3338,6 +3388,15 @@ pub fn note_actor_fault(identity: &str, at_ms: Option<u64>) {
 pub fn lib_rev() -> &'static str {
     option_env!("OVERLAY_LIB_REV").unwrap_or("unknown")
 }
+
+/// D2-ACTOR-B-FOLD-11 (the sixth delta lens's NEW6-L2): THE JUDGE'S VERSION, the stamp a finished bootstrap writes
+/// (`meta.judgedLibRev`) and [`rejudge_due`] compares, so a deploy that changes no judgement re-judges no actor (it
+/// was the build's git HEAD, [`lib_rev`]: every deploy re-judged the fleet through the cold bootstrap's budget). MOVE IT
+/// BY HAND, in the commit that changes what an actor stores for the same record: the judge (`owed::derive_owed_rows`,
+/// `owed_judge`), its hydration, the mirror's closure or read ([`apply_with`], [`FAMILIES`]), the actor's own tables.
+/// A change of cost, bars, routing or logs moves nothing. Moved by FOLD-11 itself (NEW6-M1 changes the warm read).
+/// The fleet bars stay keyed by [`lib_rev`] (a build's own samples).
+pub const JUDGE_VERSION: &str = "fold11-2026-10-29";
 
 /// One class row after this isolate's samples: the stored rings with the new samples appended, the last
 /// [`METER_SAMPLES`] kept; `unapplied` (the queue row only) the oldest unapplied write time, `Some(None)` cleared. A
@@ -3998,6 +4057,24 @@ pub struct EventCtx {
     /// columns the publish read: a pot's spender, a party's pot, a hop's evidence); `None` for an event that names
     /// no row (an identity note, the read's and the repairs' own marks, the tip): the apply reads its whole closure.
     pub txids: Option<Vec<String>>,
+    /// D2-ACTOR-B-FOLD-11 (the sixth delta lens's NEW6-L1): the other events a coalesced consumer delivery carries
+    /// (`kind`, `seq`, write time): each recorded as applying the delivery's games and SAMPLED by its own first apply
+    /// and birth ([`event_visibility`]), so a batch whose oldest event an earlier call applied still samples the
+    /// faulted tail it carries.
+    pub also: Vec<(String, i64, i64)>,
+}
+
+/// PURE (NEW6-L1): the rows' visibility samples of one delivery, `now - atMs` for each event it carries (its own,
+/// then every coalesced one: `(atMs, first apply here, born on a warm actor)`) whose apply here is its FIRST and
+/// whose birth is warm. An event with no write time samples nothing.
+pub fn event_visibility(now_ms: u64, events: &[(Option<u64>, bool, bool)]) -> Vec<u64> {
+    events
+        .iter()
+        .filter_map(|(at, first, warm)| match (at, first, warm) {
+            (Some(at), true, true) => Some(now_ms.saturating_sub(*at)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// PURE (D2-ACTOR-E): the txids an event's write named, for an event of a trigger's pair.
@@ -4024,13 +4101,24 @@ impl EventCtx {
             at_ms: ev.at_ms,
             mined: ev.source == "word" && word == Some("mined"),
             txids: event_txids(ev),
+            also: Vec::new(),
         }
     }
 }
 
 /// The `/apply` body of one delivery.
 pub fn apply_body(identity: &str, games: &[String], e: &EventCtx, tip: Option<u64>) -> Value {
-    json!({"identity": identity.to_ascii_lowercase(), "games": games, "kind": e.kind, "seq": e.seq, "atMs": e.at_ms, "tip": tip, "mined": e.mined, "txids": e.txids})
+    let mut body = json!({"identity": identity.to_ascii_lowercase(), "games": games, "kind": e.kind, "seq": e.seq, "atMs": e.at_ms, "tip": tip, "mined": e.mined, "txids": e.txids});
+    // NEW6-L1: a coalesced delivery's other events, with their write times (an older object ignores the times)
+    if !e.also.is_empty() {
+        body["also"] = json!(e
+            .also
+            .iter()
+            .map(|(k, s, _)| json!([k, s]))
+            .collect::<Vec<_>>());
+        body["alsoAtMs"] = json!(e.also.iter().map(|(_, _, at)| at).collect::<Vec<_>>());
+    }
+    body
 }
 
 fn of_games(rows: &[Value], games: &[String]) -> Vec<Value> {
@@ -4286,13 +4374,21 @@ pub fn note_answer_into(bars: &mut Bars, answer: &Value) {
     if let Some(ms) = answer["applyMs"].as_u64() {
         bars.apply.note(ms);
     }
+    // NEW6-L1: an answer naming its samples (`visibleMs`) is sampled by them
+    if let Some(each) = answer["visibleMs"].as_array() {
+        each.iter()
+            .filter_map(Value::as_u64)
+            .for_each(|ms| bars.visible.note(ms));
+    }
     if let (true, Some(at), Some(judged)) = (
         samples_visible(answer),
         answer["atMs"].as_u64(),
         answer["judgedAtMs"].as_u64(),
     ) {
         let ms = judged.saturating_sub(at);
-        bars.visible.note(ms);
+        if answer["visibleMs"].is_null() {
+            bars.visible.note(ms);
+        }
         if answer["mined"] == true {
             bars.collect_after_mined.note(ms);
         }
