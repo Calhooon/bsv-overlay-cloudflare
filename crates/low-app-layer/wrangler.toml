@@ -276,8 +276,10 @@ new_sqlite_classes = ["OwedActor"]
 # bsv-low #911 (D2-ACTOR-A): the `owed-events` queue. The app layer PRODUCES
 # (the record door, the hooks, the word ingest and the un-acked mark sweep
 # publish beside their marks) and is its ONE CONSUMER: the judge's only trigger
-# (owed_events.rs). `max_batch_size = 1` and `max_batch_timeout = 0` (LOW-5: the
-# judge's trigger never waits a batch); `max_concurrency = 1` (the lens's
+# (owed_events.rs). `max_batch_timeout = 0` (LOW-5: the judge's trigger never
+# waits a batch); `max_batch_size = 16` (D2-ACTOR-E, bsv-low #954: a backlog's
+# messages are delivered together and judged once per identity, equal to
+# `CONSUMER_BATCH_MAX`, pinned); `max_concurrency = 1` (the lens's
 # MEDIUM-1: one judge at a time fleet-wide, the per-identity serialiser until
 # lane B's actor); a message whose judge faults is handed
 # back, `max_retries = 3`, then dead-lettered. Create both queues before
@@ -288,7 +290,7 @@ binding = "OWED_EVENTS"
 
 [[queues.consumers]]
 queue = "low-owed-events"
-max_batch_size = 1
+max_batch_size = 16
 max_batch_timeout = 0
 max_retries = 3
 dead_letter_queue = "low-owed-events-dlq"
@@ -419,8 +421,10 @@ bindings = [
 # bsv-low #911 (D2-ACTOR-A): the `owed-events` queue. The app layer PRODUCES
 # (the record door, the hooks, the word ingest and the un-acked mark sweep
 # publish beside their marks) and is its ONE CONSUMER: the judge's only trigger
-# (owed_events.rs). `max_batch_size = 1` and `max_batch_timeout = 0` (LOW-5: the
-# judge's trigger never waits a batch); `max_concurrency = 1` (the lens's
+# (owed_events.rs). `max_batch_timeout = 0` (LOW-5: the judge's trigger never
+# waits a batch); `max_batch_size = 16` (D2-ACTOR-E, bsv-low #954: a backlog's
+# messages are delivered together and judged once per identity, equal to
+# `CONSUMER_BATCH_MAX`, pinned); `max_concurrency = 1` (the lens's
 # MEDIUM-1: one judge at a time fleet-wide, the per-identity serialiser until
 # lane B's actor); a message whose judge faults is handed
 # back, `max_retries = 3`, then dead-lettered. Create both queues before
@@ -431,7 +435,7 @@ binding = "OWED_EVENTS"
 
 [[env.beta.queues.consumers]]
 queue = "low-owed-events-beta"
-max_batch_size = 1
+max_batch_size = 16
 max_batch_timeout = 0
 max_retries = 3
 dead_letter_queue = "low-owed-events-beta-dlq"

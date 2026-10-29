@@ -389,7 +389,10 @@ pub async fn deliver(
         // the D1 judge acknowledges at most it, and the actor's apply names it, so a delivery the writer's direct call
         // already covered is a dupe the actor answers from its seq check in milliseconds, never a mark acknowledged
         // past what the covering apply read.
-        let bound = owed_judge::marks_bound(db, identity, games).await?;
+        // D2-ACTOR-E (bsv-low #954): with the bound, the txids its marks name, for the deferred narrowed apply (the
+        // D1 judge acknowledges those marks before the actor reads).
+        let (bound, marks_touch) = owed_judge::marks_bound_keys(db, identity, games).await?;
+        db.note_marks_touch(marks_touch);
         let report =
             owed_judge::judge_subjects_acked_to(db, identity, games, "owed-events", bound).await?;
         // The D2-ACTOR-B lens's MEDIUM-6: Phase A's apply and compare run after the batch (`ctx.wait_until`), never
@@ -438,6 +441,37 @@ impl Plan {
             .iter()
             .map(|id| (id.clone(), self.games.get(id).cloned().unwrap_or_default()))
             .collect()
+    }
+
+    /// D2-ACTOR-E (bsv-low #954) item 3: the plans of one batch's messages as ONE plan: each identity once, its games
+    /// the union of the messages' games (in their order), its marks summed, so [`judge_plan`] makes one delivery (one
+    /// D1 judge pass and one actor apply) per identity per 16 games, however many messages named it.
+    pub fn merged(plans: &[Plan]) -> Plan {
+        let mut out = Plan::default();
+        for p in plans {
+            for id in &p.order {
+                if !out.order.contains(id) {
+                    out.order.push(id.clone());
+                }
+                let into = out.games.entry(id.clone()).or_default();
+                for g in p.games.get(id).into_iter().flatten() {
+                    if !into.contains(g) {
+                        into.push(g.clone());
+                    }
+                }
+            }
+            for (k, n) in &p.held {
+                *out.held.entry(k.clone()).or_default() += n;
+            }
+            out.more |= p.more;
+            out.held_subjects += p.held_subjects;
+        }
+        out
+    }
+
+    /// Does this message's own plan leave marks past it (its continuation, [`continues`])?
+    pub fn has_more(&self) -> bool {
+        self.more
     }
 
     /// What an empty plan answers: nothing judged, its held subjects counted.
@@ -1143,6 +1177,87 @@ pub fn consumer_owns(ev: &OwedEvent, held: &OwedEvent) -> bool {
     held.source == ev.source && held.source_key.eq_ignore_ascii_case(&ev.source_key)
 }
 
+/// D2-ACTOR-E (bsv-low #954) item 3: the most messages one consumer batch takes (`max_batch_size` in both renders,
+/// pinned equal): a burst's messages arrive together and are judged once per identity ([`consume_batch`]).
+pub const CONSUMER_BATCH_MAX: usize = 16;
+
+/// PURE: the event a coalesced delivery carries to the actor: the batch's OLDEST write (its visibility sample is the
+/// batch's worst), the txids every message's write named (`None` when one names no row: the whole closure), the
+/// tip read fresh when any message is a block's.
+pub fn coalesced_event(evs: &[&OwedEvent]) -> Option<crate::owed_actor::EventCtx> {
+    let oldest = evs.iter().min_by_key(|e| (e.at_ms, e.seq))?;
+    let mut ctx = crate::owed_actor::EventCtx::of(oldest);
+    let mut txids: Option<Vec<String>> = Some(Vec::new());
+    for e in evs {
+        txids = match (txids, crate::owed_actor::event_txids(e)) {
+            (Some(mut t), Some(more)) => {
+                t.extend(more);
+                Some(t)
+            }
+            _ => None,
+        };
+    }
+    if let Some(t) = txids.as_mut() {
+        t.sort();
+        t.dedup();
+    }
+    ctx.txids = txids;
+    Some(ctx)
+}
+
+/// THE COALESCED BATCH (D2-ACTOR-E item 3): every message's frame ingested and its marks planned, then ONE judge
+/// pass over the merged plan ([`Plan::merged`]): one delivery per identity per 16 games, whatever the number of
+/// messages that named it. Answers each message's own plan's `more` beside the batch's routing. `Err`: the caller
+/// handles the batch one message at a time (each message's fault memo, its own wall).
+pub async fn consume_batch(
+    env: &worker::Env,
+    evs: &[&OwedEvent],
+) -> Result<(Routed, Vec<bool>), String> {
+    for ev in evs {
+        if let Some(frame) = ev.frame() {
+            ingest_frame(env, frame).await?;
+            publish::forget(&ev.source, &ev.source_key);
+        }
+    }
+    crate::schema::ensure_latch_columns(env).await;
+    let sql = crate::routes::D1Sql::of(env).map_err(|e| e.to_string())?;
+    let mut plans = Vec::with_capacity(evs.len());
+    for ev in evs {
+        plans.push(plan(&sql, ev).await?);
+    }
+    let more: Vec<bool> = plans.iter().map(Plan::has_more).collect();
+    let merged = Plan::merged(&plans);
+    if merged.is_empty() {
+        return Ok((merged.empty_routed(), more));
+    }
+    let planned: Vec<&OwedEvent> = evs
+        .iter()
+        .zip(&plans)
+        .filter(|(_, p)| !p.is_empty())
+        .map(|(e, _)| *e)
+        .collect();
+    let fresh = evs.iter().any(|e| tip_reads_fresh(&e.source));
+    let tip = tip_memoised(env, fresh).await;
+    let mut judge =
+        owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))
+            .map_err(|e| e.to_string())?;
+    if let Some(ctx) = coalesced_event(&planned) {
+        judge = judge.with_event(ctx);
+    }
+    let routed = judge_plan(&judge, merged).await?;
+    for (ev, m) in evs.iter().zip(&more) {
+        if *m && routed.subjects > 0 {
+            publish::note(&ev.source, &ev.source_key);
+        }
+    }
+    if routed.subjects > 0 && more.iter().any(|m| *m) {
+        publish::publish_env(env, Vec::new()).await;
+    }
+    // NEW5-L2: only the batch's own publishes (its continuations, its frames' words) are the queue's alone.
+    let _ = publish::take_direct_where(|held| evs.iter().any(|ev| consumer_owns(ev, held)));
+    Ok((routed, more))
+}
+
 /// The Worker's `queue` handler: the `owed-events` consumer, or its dead letter queue's park.
 pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> worker::Result<()> {
     use worker::MessageExt;
@@ -1173,7 +1288,103 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
     let mut messages = 0u64;
     let mut resolved: Vec<Stmt> = Vec::new();
     let mut service_max: u64 = 0;
-    for msg in batch.raw_iter() {
+    // D2-ACTOR-E (bsv-low #954) item 3: a batch of several messages is judged ONCE per identity first; a fault of
+    // that pass hands the batch to the one-message path below (each message's own fault memo and wall).
+    let raw: Vec<_> = batch.raw_iter().collect();
+    let decoded: Vec<Option<OwedEvent>> = raw
+        .iter()
+        .map(|m| OwedEvent::decode(&m.body().as_string().unwrap_or_default()).ok())
+        .collect();
+    if decoded.iter().filter(|d| d.is_some()).count() > 1 {
+        let evs: Vec<&OwedEvent> = decoded.iter().flatten().collect();
+        let started = worker::Date::now().as_millis();
+        let _ = take_in_flight();
+        let walled = {
+            let work = std::pin::pin!(consume_batch(&env, &evs));
+            let wall = std::pin::pin!(worker::Delay::from(std::time::Duration::from_millis(
+                CONSUMER_MESSAGE_WALL_MS
+            )));
+            match futures_util::future::select(work, wall).await {
+                futures_util::future::Either::Left((done, _)) => Some(done),
+                futures_util::future::Either::Right(((), _)) => None,
+            }
+        };
+        let service_ms = worker::Date::now().as_millis().saturating_sub(started);
+        match walled {
+            Some(Ok((routed, more))) => {
+                for (msg, ev) in raw.iter().zip(&decoded) {
+                    messages += 1;
+                    oldest_age = oldest_age.max(now - msg.timestamp().as_millis() as i64);
+                    let Some(ev) = ev else {
+                        worker::console_warn!(
+                            "[owed-events] a message does not read: handed back, then dead-lettered"
+                        );
+                        msg.retry();
+                        continue;
+                    };
+                    if routed.subjects > 0 || routed.held == 0 {
+                        resolved.extend(resolved_statements(&ev.source, &ev.source_key));
+                    }
+                    *deltas.entry("owed_events_consumed_total").or_default() += 1;
+                    msg.ack();
+                }
+                *deltas.entry("owed_events_acked_marks_total").or_default() += routed.marks as u64;
+                *deltas
+                    .entry("owed_events_subject_faults_total")
+                    .or_default() += routed.faults as u64;
+                *deltas.entry("owed_events_subject_held_total").or_default() += routed.held as u64;
+                let continued = more.iter().filter(|m| **m).count() as u64;
+                if routed.subjects > 0 {
+                    *deltas.entry("owed_events_continued_total").or_default() += continued;
+                }
+                if all_held(&routed) {
+                    *deltas.entry("owed_events_all_held_total").or_default() += 1;
+                }
+                *deltas
+                    .entry("owed_events_coalesced_batches_total")
+                    .or_default() += 1;
+                service_max = service_max.max(service_ms);
+                return finish_batch(
+                    &env,
+                    now,
+                    oldest_age,
+                    messages,
+                    service_max,
+                    deltas,
+                    resolved,
+                )
+                .await;
+            }
+            Some(Err(e)) => {
+                worker::console_warn!(
+                    "[owed-events] the coalesced batch of {} not judged ({e}): each message judged alone",
+                    evs.len()
+                );
+            }
+            None => {
+                worker::console_warn!(
+                    "[owed-events] the coalesced batch of {} passed the {CONSUMER_MESSAGE_WALL_MS} ms wall: handed back in {CONSUMER_WALL_RETRY_S} s",
+                    evs.len()
+                );
+                *deltas
+                    .entry("owed_events_consumer_wall_drops_total")
+                    .or_default() += 1;
+                for msg in &raw {
+                    messages += 1;
+                    msg.retry_with_options(
+                        &worker::QueueRetryOptionsBuilder::new()
+                            .with_delay_seconds(CONSUMER_WALL_RETRY_S)
+                            .build(),
+                    );
+                }
+                return finish_batch(
+                    &env, now, oldest_age, messages, service_ms, deltas, resolved,
+                )
+                .await;
+            }
+        }
+    }
+    for msg in raw {
         messages += 1;
         let age = now - msg.timestamp().as_millis() as i64;
         oldest_age = oldest_age.max(age);
@@ -1273,9 +1484,22 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
             }
         }
     }
+    finish_batch(&env, now, oldest_age, messages, service_max, deltas, resolved).await
+}
+
+/// The batch's end: its counters, the consumer's age row, the resolved pairs and the health snapshot, one batch.
+async fn finish_batch(
+    env: &worker::Env,
+    now: i64,
+    oldest_age: i64,
+    messages: u64,
+    service_max: u64,
+    deltas: BTreeMap<&str, u64>,
+    resolved: Vec<Stmt>,
+) -> worker::Result<()> {
     let deltas: Vec<(&str, u64)> = deltas.into_iter().filter(|(_, d)| *d > 0).collect();
-    publish::bump(&env, &deltas).await;
-    if let Ok(sql) = crate::routes::D1Sql::of(&env) {
+    publish::bump(env, &deltas).await;
+    if let Ok(sql) = crate::routes::D1Sql::of(env) {
         let row = json!({"oldestEnqueueAgeMs": oldest_age, "messages": messages, "serviceMs": service_max, "atMs": now});
         let mut batch_row = vec![Stmt {
             sql: CONSUMER_ROW_SQL.into(),
@@ -1285,10 +1509,7 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
         batch_row.extend(resolved);
         // D2-ACTOR-B-FOLD-6: the owed actor's health snapshot, in the consumer row's batch (at most once a minute).
         batch_row.push(crate::owed_actor::health_snapshot_stmt(now as u64, false));
-        if let Err(e) = sql
-            .run_batch(batch_row)
-            .await
-        {
+        if let Err(e) = sql.run_batch(batch_row).await {
             worker::console_warn!("[owed-events] the consumer's age row not written: {e}");
         }
     }
@@ -1476,6 +1697,8 @@ struct Coalesced {
     at_ms: i64,
     mined: bool,
     also: Vec<(String, i64)>,
+    /// D2-ACTOR-E: the txids every event's write named (`None` once one names no row: the whole closure).
+    txids: Option<Vec<String>>,
 }
 
 /// PURE (NEW5-L3, D2-ACTOR-B-FOLD-10): the pass's events' subjects merged into ONE call body an identity (per
@@ -1501,6 +1724,16 @@ pub fn coalesce_direct(
                 }
             }
             c.mined |= e.mined;
+            c.txids = match (c.first.is_none(), c.txids.take(), &e.txids) {
+                (true, _, t) => t.clone(),
+                (false, Some(mut t), Some(more)) => {
+                    t.extend(more.iter().cloned());
+                    t.sort();
+                    t.dedup();
+                    Some(t)
+                }
+                _ => None,
+            };
             match &c.first {
                 None => {
                     c.at_ms = e.at_ms;
@@ -1527,6 +1760,7 @@ pub fn coalesce_direct(
             seq: first.seq,
             at_ms: c.at_ms,
             mined: c.mined,
+            txids: c.txids.clone(),
         };
         for chunk in c.games.chunks(crate::owed_actor::GAMES_PER_APPLY) {
             let mut b = crate::owed_actor::apply_body(&id, chunk, &e, tip);

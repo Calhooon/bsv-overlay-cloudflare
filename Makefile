@@ -687,6 +687,8 @@ ci-d1-budget: gate-output-dirs
 	env $$seal RECORD_DOOR_FIXTURE="$$state/record-door.json" npx --package wrangler -c 'node tools/lane-912/owed_actor_alarm.mjs'; \
 	echo "→ ci-d1-budget: the D2-ACTOR-D flood cell d_a (32 frames for 32 identities, each visible under 1 s by the writer's direct call, the queue behind; bsv-low #952)"; \
 	env $$seal RECORD_DOOR_FIXTURE="$$state/record-door.json" npx --package wrangler -c 'node tools/lane-912/owed_direct_flood.mjs'; \
+	echo "→ ci-d1-budget: the D2-ACTOR-E burst cell e_b (64 writes for ONE identity, each visible under 1 s by the direct call, the object's burst a few judge passes; bsv-low #954)"; \
+	env $$seal RECORD_DOOR_FIXTURE="$$state/record-door.json" npx --package wrangler -c 'node tools/lane-912/owed_burst_one_identity.mjs'; \
 	guard_ran=1; \
 	node tools/lane-731/egress_guard.mjs "app-layer=$$app_log" "overlay=$$ov_log" "delivering-overlay=$$dv_log" "retire-overlay=$$rv_log" "lane934-app-layer=$$tw_log" "lane936-overlay=$$gn_log"
 
