@@ -1632,6 +1632,12 @@ pub(crate) mod tests {
         (format!("{i:064x}"), i % 3)
     }
 
+    thread_local! {
+        /// D2-ACTOR-B-FOLD-12 (the D1-REAL class): while set, `run` binds every `Bind::Int` as a REAL, as the D1 port
+        /// binds it (`routes.rs`, `JsValue::from_f64`): a JSON value SQLite builds from such a bind stores `….0`.
+        pub(crate) static INTS_AS_REAL: Cell<bool> = const { Cell::new(false) };
+    }
+
     /// THE REAL STORE'S SQL over real SQLite: the overlay's production migrations, a batch atomic as D1's (one
     /// statement that faults rolls the batch back and fails it), every batch and statement counted, the clock
     /// settable, the counters and the log lines kept.
@@ -1684,6 +1690,9 @@ pub(crate) mod tests {
                 .iter()
                 .map(|b| match b {
                     Bind::Text(t) => rusqlite::types::Value::Text(t.clone()),
+                    Bind::Int(n) if INTS_AS_REAL.with(Cell::get) => {
+                        rusqlite::types::Value::Real(*n as f64)
+                    }
                     Bind::Int(n) => rusqlite::types::Value::Integer(*n),
                     Bind::Null => rusqlite::types::Value::Null,
                 })

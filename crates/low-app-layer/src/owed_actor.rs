@@ -2819,6 +2819,39 @@ pub fn diff_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// PURE (D2-ACTOR-B-FOLD-12, the seventh delta lens's NEW7-L2): the outpoints on BOTH sides that [`diff_rows`] reads
+/// equal (the same verdict) but whose JUDGED TIP differs: `facts.tip` (a clock fact the compare drops, FOLD-11) or the
+/// stored `probeTip` column (never compared). A lag, not a STOP: counted apart (`owed_actor_compare_tip_lag_total`,
+/// served `/health.owedActor.tipLagDiffsTotal`), where FOLD-11's drop left an actor judging at a lagging tip
+/// unobservable (the read's #669 degrade withholds a courier-dependent sweep there that D1's fresher row presses: the
+/// safe direction). A verdict difference is [`diff_rows`]'s, never this.
+pub fn tip_lag_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
+    let differ: BTreeSet<String> = diff_rows(d1, actor).into_iter().collect();
+    let tip_of = |r: &Value| -> (Option<i64>, Option<i64>) {
+        let facts: Value = r["facts"]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(Value::Null);
+        let n = |v: &Value| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64));
+        (n(&facts["tip"]), n(&r["probeTip"]))
+    };
+    let actor_by: BTreeMap<&str, &Value> = actor
+        .iter()
+        .filter_map(|r| Some((r["outpoint"].as_str()?, r)))
+        .collect();
+    let mut out: Vec<String> = d1
+        .iter()
+        .filter_map(|r| {
+            let o = r["outpoint"].as_str()?;
+            let a = actor_by.get(o)?;
+            (!differ.contains(o) && tip_of(r) != tip_of(a)).then(|| o.to_string())
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// THE DIFF LINES NAME WHAT DIFFERS (the captain's item 12, D2-ACTOR-B-FOLD-8): for the first [`DIFF_DETAIL_MAX`]
 /// differing outpoints, each compared field that differs with both values (`family d1=unbound actor=hop-stranded`,
 /// `claimable d1=null actor=1`, a facts key by name: `facts.claim d1=.. actor=..`), the fields [`diff_rows`] compares;
@@ -3609,7 +3642,7 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
 /// (`owed_events::HEALTH_CONSUMER_SQL`).
 macro_rules! health_select {
     () => {
-        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding"
+        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding"
     };
 }
 pub const HEALTH_SQL: &str = health_select!();
@@ -3696,6 +3729,8 @@ pub fn health_body(
     // NEW2-L1: the Phase B DIFFs on a game holding a mark above the bound (not a STOP); NEW2-L5: the tip alarms whose
     // window held a faulting game.
     body["heldDiffsTotal"] = n(COUNTERS[17]);
+    // NEW7-L2: the compares whose rows differed only in the judged tip (a lag, not a STOP).
+    body["tipLagDiffsTotal"] = n(COUNTERS[28]);
     body["tipFaults"] = n(COUNTERS[18]);
     // The third delta lens's LOW-1: the games the tip alarm parked; LOW-2: the schema plans that did not apply whole.
     body["tipParked"] = n(COUNTERS[19]);
@@ -3939,6 +3974,10 @@ pub async fn reconcile_step(
     report.actor_digest = Some(rows_digest(&b));
     report.diff = report.d1_digest != report.actor_digest;
     let mut deltas = vec![(COUNTERS[6].to_string(), 1)];
+    // NEW7-L2 (Phases A and B: D1 against the actor as it stood; Phase C's before-and-after differs in tip by time)
+    if db.d1_judges() && !tip_lag_rows(&a, &b).is_empty() {
+        deltas.push((COUNTERS[28].to_string(), 1));
+    }
     if report.diff {
         deltas.push((COUNTERS[7].to_string(), 1));
         BARS.with(|b| b.borrow_mut().reconcile_diffs += 1);
@@ -3997,7 +4036,7 @@ mod tests;
 /// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
 /// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
 /// (MEDIUM-9).
-pub const COUNTERS: [&str; 28] = [
+pub const COUNTERS: [&str; 29] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -4041,6 +4080,9 @@ pub const COUNTERS: [&str; 28] = [
     // D2-ACTOR-E (bsv-low #954): the record reads past an event's own rows (a cold game's whole closure, a key a warm
     // mirror had not read).
     "owed_actor_closure_misses_total",
+    // D2-ACTOR-B-FOLD-12 (the seventh delta lens's NEW7-L2): the compares (Phases A and B, the delivery's and the
+    // reconcile's) whose rows differed ONLY in the judged tip (`facts.tip`, the `probeTip` column): a lag, never a STOP.
+    "owed_actor_compare_tip_lag_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;
@@ -4062,6 +4104,46 @@ pub struct EventCtx {
     /// and birth ([`event_visibility`]), so a batch whose oldest event an earlier call applied still samples the
     /// faulted tail it carries.
     pub also: Vec<(String, i64, i64)>,
+    /// D2-ACTOR-B-FOLD-12 (the seventh delta lens's NEW7-L3): a coalesced consumer delivery's events PER IDENTITY (the
+    /// identity lowercased; each `(kind, seq, atMs, mined)` an event whose plan names it), so each identity's apply
+    /// carries only its own events ([`EventCtx::for_identity`], called by [`apply_body`]). Empty: one event's
+    /// delivery, carried as it stands. One `also` served every identity of the batch, so an event naming another
+    /// identity read as a first apply in each actor and was sampled once per identity.
+    pub by_identity: BTreeMap<String, Vec<(String, i64, i64, bool)>>,
+}
+
+impl EventCtx {
+    /// PURE (NEW7-L3): the delivery one identity's apply carries: its OWN events of a coalesced batch, the oldest under
+    /// the delivery's key and the rest in `also`; the context as it stands when it names no identities (one event),
+    /// or (never in a batch: every planned event names an identity) with no `also` for an identity it does not name.
+    pub fn for_identity(&self, identity: &str) -> EventCtx {
+        if self.by_identity.is_empty() {
+            return self.clone();
+        }
+        let mut out = EventCtx {
+            by_identity: BTreeMap::new(),
+            also: Vec::new(),
+            ..self.clone()
+        };
+        let Some(own) = self.by_identity.get(&identity.to_ascii_lowercase()) else {
+            return out;
+        };
+        let mut own = own.clone();
+        own.sort_by_key(|(_, seq, at, _)| (*at, *seq));
+        own.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        if let Some((kind, seq, at, mined)) = own.first().cloned() {
+            out.kind = kind;
+            out.seq = seq;
+            out.at_ms = at;
+            out.mined = mined;
+        }
+        out.also = own
+            .into_iter()
+            .skip(1)
+            .map(|(kind, seq, at, _)| (kind, seq, at))
+            .collect();
+        out
+    }
 }
 
 /// PURE (NEW6-L1): the rows' visibility samples of one delivery, `now - atMs` for each event it carries (its own,
@@ -4102,12 +4184,15 @@ impl EventCtx {
             mined: ev.source == "word" && word == Some("mined"),
             txids: event_txids(ev),
             also: Vec::new(),
+            by_identity: BTreeMap::new(),
         }
     }
 }
 
 /// The `/apply` body of one delivery.
 pub fn apply_body(identity: &str, games: &[String], e: &EventCtx, tip: Option<u64>) -> Value {
+    // NEW7-L3: the identity's own events of a coalesced batch
+    let e = &e.for_identity(identity);
     let mut body = json!({"identity": identity.to_ascii_lowercase(), "games": games, "kind": e.kind, "seq": e.seq, "atMs": e.at_ms, "tip": tip, "mined": e.mined, "txids": e.txids});
     // NEW6-L1: a coalesced delivery's other events, with their write times (an older object ignores the times)
     if !e.also.is_empty() {
@@ -4336,6 +4421,18 @@ async fn compare(
         .into_iter()
         .partition(|o| held.contains(&game_of(o).to_ascii_lowercase()));
     let mut deltas = vec![(COUNTERS[0].to_string(), 1)];
+    // NEW7-L2: the rows whose verdict agrees and whose judged tip does not (a lag, counted apart, never a STOP)
+    let lag = tip_lag_rows(&of_games(&d1, games), &of_games(&actor, games));
+    if !lag.is_empty() {
+        deltas.push((COUNTERS[28].to_string(), 1));
+        db.log(&format!(
+            "[owed-actor] TIP LAG (NEW7-L2; not a STOP) {identity} game {}: {} outpoints of {} games, first {}",
+            game_of(&lag[0]),
+            lag.len(),
+            games.len(),
+            lag[0]
+        ));
+    }
     if !diffs.is_empty() {
         deltas.push((COUNTERS[1].to_string(), 1));
         // MEDIUM-8: the line names the identity and the game (the cutover's STOP reads it).

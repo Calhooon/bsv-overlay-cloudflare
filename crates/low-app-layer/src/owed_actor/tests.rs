@@ -6654,6 +6654,7 @@ async fn fold10_f_a_burst_for_one_identity_is_one_call() {
                     mined: false,
                     txids: None,
                     also: Vec::new(),
+                    by_identity: Default::default(),
                 },
                 vec![(
                     "owner".into(),
@@ -6844,7 +6845,7 @@ fn fold10_j_a_state_judged_under_another_build_bootstraps_again() {
     let actor = squash(include_str!("../owed_actor.rs"));
     assert!(actor.contains("body[\"rejudged\"]=n(COUNTERS[26]);"));
     assert!(
-        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total'))AScounters")
+        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total'))AScounters")
     );
 }
 
@@ -7953,4 +7954,59 @@ fn fold11_h_two_tips_with_one_verdict_compare_equal() {
         vec!["329d:0".to_string()]
     );
     assert!(CLOCK_FACTS.contains(&"tip"));
+}
+
+/// (fold12_d) D2-ACTOR-B-FOLD-12, the seventh delta lens's NEW7-L2: A TIP-ONLY DIFFERENCE IS COUNTED APART. Two judges
+/// of one record at two tips with one verdict (`facts.tip` and the `probeTip` column apart): zero diffs (FOLD-11's
+/// clock fact stands) and ONE tip-lag diff (`owed_actor_compare_tip_lag_total`, its `TIP LAG` line, never the STOP);
+/// a verdict change is a diff as before and no tip lag. Through the shipped `compare` over the D1 row in `owed_rows`.
+/// RED against `tip_lag_rows` answering nothing (FOLD-11's drop): `left: [] right: ["329d:0"]`.
+#[tokio::test]
+async fn fold12_d_a_tip_only_difference_is_counted_apart() {
+    let row = |tip: u64, family: &str, claimable: Option<i64>| {
+        json!({"outpoint": "329d:0", "family": family, "gameId": "g", "sats": null, "opponentIdentity": "o",
+            "atHeight": null, "reason": "r", "claimable": claimable, "probeTip": tip,
+            "facts": json!({"claim": null, "tip": tip}).to_string()})
+    };
+    let (d1, lag, verdict) = (
+        row(973_080, "unbound", None),
+        row(973_081, "unbound", None),
+        row(973_081, "hop-stranded", Some(1)),
+    );
+    assert!(diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&lag)).is_empty());
+    assert_eq!(
+        tip_lag_rows(std::slice::from_ref(&d1), std::slice::from_ref(&lag)),
+        vec!["329d:0".to_string()]
+    );
+    assert!(tip_lag_rows(std::slice::from_ref(&d1), std::slice::from_ref(&verdict)).is_empty());
+    assert!(tip_lag_rows(std::slice::from_ref(&d1), std::slice::from_ref(&d1)).is_empty());
+    // the probeTip column alone is a lag too
+    let mut col = d1.clone();
+    col["probeTip"] = json!(973_081);
+    assert_eq!(tip_lag_rows(std::slice::from_ref(&d1), &[col]).len(), 1);
+
+    // through the shipped compare: D1's row stored, the actor's answer at the next tip
+    let db = SqliteSql::migrated();
+    let id = "02".to_string() + &"c".repeat(64);
+    db.conn
+        .execute(
+            "INSERT INTO owed_rows(identity,outpoint,family,gameId,opponentIdentity,facts,updatedAtMs,reason,claimable,probeTip) VALUES (?1,'329d:0','unbound','g','o',?2,1,'r',NULL,973080)",
+            rusqlite::params![&id, json!({"claim": null, "tip": 973_080}).to_string()],
+        )
+        .unwrap();
+    let games = vec!["g".to_string()];
+    compare(&db, &id, &games, &json!({"rows": [lag]}), None).await;
+    assert_eq!(
+        (db.counter(COUNTERS[1]), db.counter(COUNTERS[28])),
+        (0, 1),
+        "one verdict at two tips: a lag, never a STOP: {:?}",
+        db.lines.borrow()
+    );
+    compare(&db, &id, &games, &json!({"rows": [verdict]}), None).await;
+    assert_eq!(
+        (db.counter(COUNTERS[1]), db.counter(COUNTERS[28])),
+        (1, 1),
+        "a verdict change is a diff"
+    );
+    assert_eq!(COUNTERS[28], "owed_actor_compare_tip_lag_total");
 }

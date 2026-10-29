@@ -477,6 +477,7 @@ impl JudgeDb for D1Judge {
             mined: false,
             txids: None,
             also: Vec::new(),
+            by_identity: Default::default(),
         };
         // bsv-low #953 item 6: every apply the belt's port makes carries the served tip (the consumer's own).
         let tip = match self.tip {

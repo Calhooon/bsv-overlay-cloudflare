@@ -31,6 +31,18 @@
 //! (`owed_events_publish::LOST_MEMO_PREFIX`) and is re-published at the next tick whatever the horizon, the note
 //! deleted in that tick's batch. A pair held by its fault memo waits out its hold. With no queue binding the drain
 //! judges as before.
+//!
+//! THE D1-REAL CLASS, CLOSED IN THIS MODULE (D2-ACTOR-B-FOLD-12, the seventh delta lens's NEW7-M1; FOLD-7's `asOfMs`
+//! and FOLD-8's NEW4-M1 before it): D1 binds every `Bind::Int` as a JS number, so a JSON value SQLite builds from an
+//! integer bind (`json_object('k',?n)`) is stored as a REAL (`1793….0`) and an `as_i64` reader reads none. The swept
+//! stamp was that case (`json_object('sweptAtMs',?2)`): on D1 it never blocked, so a passed pair was re-published every
+//! tick until consumed and a stalled consumer's every 120 s, not 600 s. It is written `CAST(?2 AS INTEGER)` now and read
+//! through [`ms_of`] (an integer, or a REAL's value). Every other `owed_belt_state` cursor the sweep, the publisher and
+//! the consumer write is JSON TEXT built by serde from a Rust integer (the sweep's cursor, the consumer's row and its
+//! `json_set` of two such values, the fault and subject memos, the lost notes), so it stores integers; each is read
+//! through [`ms_of`] all the same, and the `tickedAtMs` column (a REAL on D1) is only compared in SQL or read through
+//! [`ms_of`]. The sweep's two range reads (the lost notes, the prune) read at most what they take ([`LOST_READ_SQL`],
+//! [`SWEPT_WINDOW_SQL`]: NEW7-L1).
 use crate::owed_events_publish as publish;
 use crate::owed_judge::{self, JudgeDb};
 use crate::pot_hook::{Bind, SqlPort, Stmt};
@@ -93,14 +105,45 @@ pub fn swept_memo_name(source: &str, key: &str) -> String {
     format!("{SWEPT_MEMO_PREFIX}{source} {key}")
 }
 /// Write one swept stamp (`?1` its name, `?2` now).
-pub const SWEPT_MEMO_WRITE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,json_object('sweptAtMs',?2),?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
-/// A stamp no consumer cleared (its marks acknowledged by another road) is pruned after a day, 64 a tick (a range of
-/// the primary key, `?1` the cutoff).
-pub const SWEPT_PRUNE_SQL: &str = "DELETE FROM owed_belt_state WHERE name IN (SELECT name FROM owed_belt_state WHERE name>='owed-events:swept:' AND name<'owed-events:swept;' AND tickedAtMs<?1 LIMIT 64)";
+pub const SWEPT_MEMO_WRITE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,json_object('sweptAtMs',CAST(?2 AS INTEGER)),?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+/// A stamp no consumer cleared (its marks acknowledged by another road) is pruned after a day. D2-ACTOR-B-FOLD-12 (the
+/// seventh delta lens's NEW7-L1): the prune reads at most [`SWEPT_PRUNE_WINDOW`] stamps a tick, the WINDOW past its
+/// cursor (`pruneAfter` in the sweep's cursor row) in key order ([`SWEPT_WINDOW_SQL`], a primary-key range, no sort),
+/// and deletes the window's stamps a day old by name ([`SWEPT_PRUNE_SQL`], the age read again in the statement, so a
+/// stamp written again since the read is spared); a short window wraps the cursor. It read every stamp of its range
+/// to find 64 a day old (100,023 VM steps over 20,000 young stamps); a round over N stamps is now `ceil(N / 64)`
+/// ticks, each reading 64 rows at most.
+pub const SWEPT_WINDOW_SQL: &str = "SELECT name,tickedAtMs FROM owed_belt_state WHERE name>?1 AND name<'owed-events:swept;' ORDER BY name LIMIT ?2";
+/// The stamps the prune reads a tick.
+pub const SWEPT_PRUNE_WINDOW: usize = 64;
+/// Delete the window's stamps older than `?2` (`?1` a JSON array of their names).
+pub const SWEPT_PRUNE_SQL: &str =
+    "DELETE FROM owed_belt_state WHERE name IN (SELECT value FROM json_each(?1)) AND tickedAtMs<?2";
 /// How long an uncleared swept stamp is kept.
 pub const SWEPT_PRUNE_AFTER_MS: i64 = 24 * 3_600_000;
-/// FIX-956 1b: the lost notes, oldest first (a range of the primary key; at most `?1`).
-pub const LOST_READ_SQL: &str = "SELECT name,cursor FROM owed_belt_state WHERE name>='owed-events:lost:' AND name<'owed-events:lost;' ORDER BY tickedAtMs LIMIT ?1";
+/// FIX-956 1b: the lost notes, at most `?1`, in key order past the cursor `?2` (`lostAfter` in the sweep's cursor row;
+/// the prefix itself at a round's start). D2-ACTOR-B-FOLD-12 (NEW7-L1): a primary-key range read to its LIMIT, never
+/// sorted (it sorted every note of the range by `tickedAtMs`: 40,614 VM steps over 5,000 notes). A full read moves the
+/// cursor to its last note, a short one wraps it, so a note held by its fault memo (kept, the sweep leaves it) is passed
+/// by the cursor and never keeps a newer note out of the tick's places: every note is read within `ceil(N / 32)` ticks
+/// of N notes, where oldest-first kept up to 32 held notes in the places for as long as their holds ran.
+pub const LOST_READ_SQL: &str = "SELECT name,cursor FROM owed_belt_state WHERE name>?2 AND name<'owed-events:lost;' ORDER BY name LIMIT ?1";
+/// PURE (NEW7-L1): a range cursor read back: the saved name when it lies in the prefix's range, else the prefix (a
+/// round's start; the prefix itself sorts before every name of its range).
+pub fn range_cursor(saved: Option<&str>, prefix: &str) -> String {
+    saved
+        .filter(|c| c.starts_with(prefix))
+        .unwrap_or(prefix)
+        .to_owned()
+}
+/// PURE (NEW7-L1): the next cursor after a window read of `limit` rows: its last name when the window was full, else
+/// the prefix (the round wraps).
+pub fn next_range_cursor(names: &[&str], limit: usize, prefix: &str) -> String {
+    match names.last() {
+        Some(last) if names.len() >= limit => (*last).to_owned(),
+        _ => prefix.to_owned(),
+    }
+}
 /// FIX-956 1b: the most lost notes one tick takes (the rest of its 64 places are the candidates').
 pub const SWEEP_LOST_PER_TICK: usize = SWEEP_PAIRS_PER_TICK / 2;
 /// FIX-956 1b: delete one lost note (the sweep re-published its pair).
@@ -155,12 +198,14 @@ pub const SWEEP_CURSOR_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tick
 /// FIX-956: the row carries the consumer's HORIZON, `horizonMs`, the greatest publish stamp among the messages a
 /// batch acknowledged, never lowered (a batch that acknowledged none, or an older one, keeps the row's).
 pub const CONSUMER_ROW_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:consumer',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=json_set(excluded.cursor,'$.horizonMs',MAX(COALESCE(json_extract(excluded.cursor,'$.horizonMs'),0),COALESCE(json_extract(owed_belt_state.cursor,'$.horizonMs'),0))),tickedAtMs=excluded.tickedAtMs";
+/// PURE (D2-ACTOR-B-FOLD-12, the seventh delta lens's NEW7-M1): a millisecond stamp in a cursor, read as an integer
+/// or as the REAL D1 stores a JS-number bind as (`1793….0`), so a stamp stored either way reads.
+pub fn ms_of(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
+}
 /// PURE: the horizon a consumer row's cursor names (`None`: none recorded).
 pub fn horizon_of(cursor: &Value) -> Option<i64> {
-    cursor["horizonMs"]
-        .as_i64()
-        .or_else(|| cursor["horizonMs"].as_f64().map(|f| f as i64))
-        .filter(|h| *h > 0)
+    ms_of(&cursor["horizonMs"]).filter(|h| *h > 0)
 }
 /// The consumer's row, and beside it (D2-ACTOR-B-FOLD-6, the land tier's `health-dirty-snapshot`) the owed actor's
 /// health snapshot (`owed_actor::HEALTH_SNAPSHOT_NAME`): two primary-key rows in one statement, so `/health.owedActor`
@@ -286,10 +331,9 @@ pub async fn note_fault_named(db: &impl SqlPort, name: &str, fault: &str) -> Res
 /// belt's find, the backfill), which clears no memo, or simply never faulted again; a transient fault then never
 /// re-arms a 6 h hold at once.
 pub fn stale_memo_faults(cursor: &Value, now_ms: i64) -> i64 {
-    let faults = cursor["faults"].as_i64().unwrap_or(0);
-    let until = cursor["heldUntilMs"]
-        .as_i64()
-        .or_else(|| cursor["lastFaultAtMs"].as_i64())
+    let faults = ms_of(&cursor["faults"]).unwrap_or(0);
+    let until = ms_of(&cursor["heldUntilMs"])
+        .or_else(|| ms_of(&cursor["lastFaultAtMs"]))
         .unwrap_or(now_ms);
     if now_ms > until.saturating_add(FAULT_HOLD_CAP_MS) {
         0
@@ -374,7 +418,7 @@ pub fn unheld(
             r["cursor"]
                 .as_str()
                 .and_then(|c| serde_json::from_str::<Value>(c).ok())
-                .and_then(|c| c["heldUntilMs"].as_i64())
+                .and_then(|c| ms_of(&c["heldUntilMs"]))
                 .is_some_and(|until| until > now_ms)
         })
         .filter_map(|r| r["name"].as_str())
@@ -755,7 +799,7 @@ fn memo_holds(memos: &[Value]) -> BTreeMap<String, i64> {
             let until = r["cursor"]
                 .as_str()
                 .and_then(|c| serde_json::from_str::<Value>(c).ok())
-                .and_then(|c| c["heldUntilMs"].as_i64())
+                .and_then(|c| ms_of(&c["heldUntilMs"]))
                 .unwrap_or(0);
             Some((r["name"].as_str()?.to_owned(), until))
         })
@@ -975,7 +1019,7 @@ pub async fn sweep(db: &impl SqlPort, now_ms: i64) -> Result<Vec<(String, String
 }
 
 /// FIX-956 (bsv-low #956): one sweep tick. Reads the cursor and the consumer's horizon (one statement), the lost
-/// notes, then the marks under [`sweep_bound`] past the cursor; leaves out a pair held by a fault memo or (once a
+/// notes and the prune's window past their cursors (one batch; NEW7-L1), then the marks under [`sweep_bound`] past the cursor; leaves out a pair held by a fault memo or (once a
 /// pass) by its swept stamp; then ONE batch: the cursor, a swept stamp per chosen pair, the chosen lost notes deleted
 /// and the old stamps pruned.
 pub async fn sweep_tick(db: &impl SqlPort, now_ms: i64) -> Result<Swept, String> {
@@ -987,17 +1031,55 @@ pub async fn sweep_tick(db: &impl SqlPort, now_ms: i64) -> Result<Swept, String>
             .and_then(|r| r["cursor"].as_str())
             .and_then(|c| serde_json::from_str::<Value>(c).ok())
     };
-    let (at, g) = state_of("owed-events:sweep")
-        .map(|c| (c["at"].as_i64().unwrap_or(-1), c["g"].as_i64().unwrap_or(0)))
-        .unwrap_or((-1, 0));
+    let sweep_cursor = state_of("owed-events:sweep").unwrap_or(Value::Null);
+    let (at, g) = (
+        ms_of(&sweep_cursor["at"]).unwrap_or(-1),
+        ms_of(&sweep_cursor["g"]).unwrap_or(0),
+    );
+    let lost_after = range_cursor(
+        sweep_cursor["lostAfter"].as_str(),
+        publish::LOST_MEMO_PREFIX,
+    );
+    let prune_after = range_cursor(sweep_cursor["pruneAfter"].as_str(), SWEPT_MEMO_PREFIX);
     let horizon = state_of("owed-events:consumer").and_then(|c| horizon_of(&c));
-    // 1b: the lost notes first, whatever the horizon
-    let lost_rows = rows(
-        db,
-        LOST_READ_SQL,
-        vec![Bind::Int(SWEEP_LOST_PER_TICK as i64)],
-    )
-    .await?;
+    // 1b: the lost notes first, whatever the horizon; beside them (NEW7-L1) the prune's window: one batch, two
+    // primary-key ranges each read to its LIMIT
+    let windows = db
+        .run_batch(vec![
+            Stmt {
+                sql: LOST_READ_SQL.into(),
+                binds: vec![
+                    Bind::Int(SWEEP_LOST_PER_TICK as i64),
+                    Bind::Text(lost_after),
+                ],
+            },
+            Stmt {
+                sql: SWEPT_WINDOW_SQL.into(),
+                binds: vec![
+                    Bind::Text(prune_after),
+                    Bind::Int(SWEPT_PRUNE_WINDOW as i64),
+                ],
+            },
+        ])
+        .await?;
+    let lost_rows: Vec<Value> = windows.first().map(|o| o.rows.clone()).unwrap_or_default();
+    let window: Vec<Value> = windows.get(1).map(|o| o.rows.clone()).unwrap_or_default();
+    let next_lost = next_range_cursor(
+        &lost_rows
+            .iter()
+            .filter_map(|r| r["name"].as_str())
+            .collect::<Vec<_>>(),
+        SWEEP_LOST_PER_TICK,
+        publish::LOST_MEMO_PREFIX,
+    );
+    let window_names: Vec<&str> = window.iter().filter_map(|r| r["name"].as_str()).collect();
+    let next_prune = next_range_cursor(&window_names, SWEPT_PRUNE_WINDOW, SWEPT_MEMO_PREFIX);
+    let prune_cutoff = now_ms - SWEPT_PRUNE_AFTER_MS;
+    let prunable: Vec<&str> = window
+        .iter()
+        .filter(|r| ms_of(&r["tickedAtMs"]).is_some_and(|t| t < prune_cutoff))
+        .filter_map(|r| r["name"].as_str())
+        .collect();
     let mut lost: Vec<(Pair, String)> = Vec::new();
     for r in &lost_rows {
         let Some(name) = r["name"].as_str() else {
@@ -1091,7 +1173,7 @@ pub async fn sweep_tick(db: &impl SqlPort, now_ms: i64) -> Result<Swept, String>
                 .find(|r| r["name"].as_str() == Some(name.as_str()))
                 .and_then(|r| r["cursor"].as_str())
                 .and_then(|c| serde_json::from_str::<Value>(c).ok())
-                .and_then(|c| c["sweptAtMs"].as_i64())
+                .and_then(|c| ms_of(&c["sweptAtMs"]))
         };
         let before = all.len();
         let all: Vec<Pair> = all
@@ -1117,10 +1199,12 @@ pub async fn sweep_tick(db: &impl SqlPort, now_ms: i64) -> Result<Swept, String>
         });
     }
     out.pairs = kept;
-    let next = next.map_or(
+    let mut next = next.map_or(
         json!({"at": -1, "g": 0}),
         |(at, g)| json!({"at": at, "g": g}),
     );
+    next["lostAfter"] = json!(next_lost);
+    next["pruneAfter"] = json!(next_prune);
     let mut batch = vec![Stmt {
         sql: SWEEP_CURSOR_SQL.into(),
         binds: vec![Bind::Text(next.to_string()), Bind::Int(now_ms)],
@@ -1140,10 +1224,15 @@ pub async fn sweep_tick(db: &impl SqlPort, now_ms: i64) -> Result<Swept, String>
             });
         }
     }
-    batch.push(Stmt {
-        sql: SWEPT_PRUNE_SQL.into(),
-        binds: vec![Bind::Int(now_ms - SWEPT_PRUNE_AFTER_MS)],
-    });
+    if !prunable.is_empty() {
+        batch.push(Stmt {
+            sql: SWEPT_PRUNE_SQL.into(),
+            binds: vec![
+                Bind::Text(json!(prunable).to_string()),
+                Bind::Int(prune_cutoff),
+            ],
+        });
+    }
     db.run_batch(batch).await?;
     Ok(out)
 }
@@ -1489,6 +1578,35 @@ pub fn coalesced_event(evs: &[&OwedEvent]) -> Option<crate::owed_actor::EventCtx
     Some(ctx)
 }
 
+/// PURE (D2-ACTOR-B-FOLD-12, the seventh delta lens's NEW7-L3): [`coalesced_event`] with each event filed under the
+/// identities its own plan names (`by_identity`), so each identity's apply carries only the events naming it: an event
+/// is sampled once, by its own first apply in its own actor.
+pub fn coalesced_event_of(planned: &[(&OwedEvent, &Plan)]) -> Option<crate::owed_actor::EventCtx> {
+    let evs: Vec<&OwedEvent> = planned.iter().map(|(e, _)| *e).collect();
+    let mut ctx = coalesced_event(&evs)?;
+    if planned.len() > 1 {
+        for (e, p) in planned {
+            let one = crate::owed_actor::EventCtx::of(e);
+            let mut ids: Vec<String> = p
+                .subject_pairs()
+                .into_iter()
+                .map(|(i, _)| i.to_ascii_lowercase())
+                .collect();
+            ids.sort();
+            ids.dedup();
+            for id in ids {
+                ctx.by_identity.entry(id).or_default().push((
+                    one.kind.clone(),
+                    one.seq,
+                    one.at_ms,
+                    one.mined,
+                ));
+            }
+        }
+    }
+    Some(ctx)
+}
+
 /// D2-ACTOR-B-FOLD-11 (the sixth delta lens's NEW6-M2): one message's fate in a consumer batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fate {
@@ -1646,15 +1764,15 @@ where
             .collect();
         return Ok(out);
     }
-    let planned: Vec<&OwedEvent> = evs
+    let planned: Vec<(&OwedEvent, &Plan)> = evs
         .iter()
         .zip(plans)
         .zip(&taken)
         .filter(|((_, p), t)| **t && !p.is_empty())
-        .map(|((e, _), _)| *e)
+        .map(|((e, p), _)| (*e, p))
         .collect();
-    let fresh = planned.iter().any(|e| tip_reads_fresh(&e.source));
-    let ctx = coalesced_event(&planned);
+    let fresh = planned.iter().any(|(e, _)| tip_reads_fresh(&e.source));
+    let ctx = coalesced_event_of(&planned);
     let _ = take_in_flight();
     let work = std::pin::pin!(async move {
         let judge = make(ctx, fresh).await?;
@@ -2345,6 +2463,7 @@ pub fn coalesce_direct(
             mined: c.mined,
             txids: c.txids.clone(),
             also: Vec::new(),
+            by_identity: Default::default(),
         };
         for chunk in c.games.chunks(crate::owed_actor::GAMES_PER_APPLY) {
             let mut b = crate::owed_actor::apply_body(&id, chunk, &e, tip);
