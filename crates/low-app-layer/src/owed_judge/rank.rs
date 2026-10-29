@@ -24,6 +24,14 @@ fn rank(v: &Value) -> i64 {
 fn stamp(v: &Value) -> Option<i64> {
     number(v, "potCreatedAt").or_else(|| number(v, "createdAt"))
 }
+
+/// THE ERA'S ONE RULE (#375): a candidate whose stamp (its pot's `createdAt`, else its own, in seconds) is before the
+/// cutoff, or that has none, is written off. Every road into the judgement reads it: the parties' representatives
+/// ([`select`]), the hop markers ([`select_hops`]) and, since D2-ACTOR-B-FOLD-11 (bsv-low #957), the released-hop
+/// evidence and its could-not-judge rows (`hydrate`).
+pub fn before_era(v: &Value, era_ms: Option<i64>) -> bool {
+    era_ms.is_some_and(|era| stamp(v).is_none_or(|s| s.saturating_mul(1000) < era))
+}
 fn recency(a: &Value, b: &Value) -> Ordering {
     rank(b)
         .cmp(&rank(a))
@@ -45,7 +53,7 @@ fn order(a: &Value, b: &Value) -> Ordering {
 pub fn select(candidates: Vec<Value>, era_ms: Option<i64>, quota: usize) -> Vec<Value> {
     let mut pots: BTreeMap<(String, i64), Value> = BTreeMap::new();
     for v in candidates {
-        if era_ms.is_some_and(|era| stamp(&v).is_none_or(|s| s.saturating_mul(1000) < era)) {
+        if before_era(&v, era_ms) {
             continue;
         }
         let key = (
@@ -169,7 +177,7 @@ pub fn select_hops(candidates: Vec<Value>, era_ms: Option<i64>, now_seconds: i64
     };
     let mut groups: BTreeMap<(String, i64), Vec<Value>> = BTreeMap::new();
     for v in candidates {
-        if era_ms.is_some_and(|era| stamp(&v).is_none_or(|s| s.saturating_mul(1000) < era)) {
+        if before_era(&v, era_ms) {
             continue;
         }
         groups.entry(hop_key(&v)).or_default().push(v);
