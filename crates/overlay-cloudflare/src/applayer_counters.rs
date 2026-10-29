@@ -111,7 +111,7 @@ pub const OWED_BELT: [&str; 8] = [
 /// bsv-low #912 (lane D2-ACTOR-B): the app layer's owed actor (`low_app_layer::owed_actor::COUNTERS`, pinned equal
 /// there): its Phase A compares against the D1 judge, the diffs, its faults, the direct calls, the reconcile.
 /// The last two (Phase C, HIGH-3): the `belt-ask`s the actors published, the belt's finds handed back to an actor.
-pub const OWED_ACTOR: [&str; 26] = [
+pub const OWED_ACTOR: [&str; 27] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -141,6 +141,8 @@ pub const OWED_ACTOR: [&str; 26] = [
     "owed_actor_bootstrap_faults_total",
     // D2-ACTOR-D (bsv-low #952): the writers' direct calls that met their wall.
     "owed_actor_direct_walls_total",
+    // D2-ACTOR-B-FOLD-10: the bootstrapped actors whose state another build judged, re-armed from the start.
+    "owed_actor_rejudged_total",
 ];
 
 /// bsv-low #912: `/health/invariants.owedActor`, the actor's durable totals: the Phase A compares and their diffs,
@@ -170,6 +172,7 @@ pub fn owed_actor_view(counters: &serde_json::Value) -> serde_json::Value {
         "handedBack": n("owed_belt_handed_back_total"),
         // the D2-ACTOR-B lens's MEDIUMs (lane D2-ACTOR-B-FOLD-2)
         "bootstraps": n("owed_actor_bootstraps_total"),
+        "rejudged": n("owed_actor_rejudged_total"),
         "unknownReads": n("owed_actor_unknown_reads_total"),
         "epochResets": n("owed_actor_epoch_resets_total"),
         "deferred": n("owed_actor_deferred_total"),

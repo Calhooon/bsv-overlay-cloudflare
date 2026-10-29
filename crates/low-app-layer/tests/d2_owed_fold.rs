@@ -270,7 +270,9 @@ async fn d2fold_high3_b_no_date_for_an_unverified_marker_or_a_held_spender() {
     );
     assert_eq!(due(&db, &planted), None, "an unverified marker is never dated");
 
-    // a verified hop the belt finds spent by a transaction it then holds the bytes of: no further look is owed
+    // a verified hop the belt finds spent by a CONFIRMED transaction it then holds the bytes of: no further look is
+    // owed (D2-ACTOR-B-FOLD-10, NEW5-M2: an UNCONFIRMED find is dated for an outpoint re-ask whatever bytes are held,
+    // `fold10_c`; this pin's find was unconfirmed until the fold)
     seed_stranded_hop(&db, "owner", "g00", &hop(0));
     drain_all(&db).await;
     let op = format!("{}:0", hop(0));
@@ -284,7 +286,7 @@ async fn d2fold_high3_b_no_date_for_an_unverified_marker_or_a_held_spender() {
         &format!("{}/0/spent", hop(0)),
         Some((
             200,
-            serde_json::json!({"txid": spender, "vin": 0, "status": "unconfirmed"})
+            serde_json::json!({"txid": spender, "vin": 0, "status": "confirmed"})
                 .to_string()
                 .into_bytes(),
         )),
