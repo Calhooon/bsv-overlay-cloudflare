@@ -1499,6 +1499,19 @@ pub async fn alarm_env(
             serde_json::json!({"error": error})
         }
     };
+    // D2-ACTOR-B-FOLD-13 (bsv-low #958): D1's fleet re-judge after a judge-version move, paced (32 games a tick),
+    // BEFORE the reconcile so the sampler compares a re-judged D1; one primary-key read a tick once done.
+    let rejudge = match meter.phase("owed.d1_rejudge", d1_rejudge_env(env)).await {
+        Ok(Some(r)) => serde_json::json!({
+            "started": r.started, "identities": r.identities, "games": r.games, "faulted": r.faulted,
+            "skipped": r.skipped, "done": r.done,
+        }),
+        Ok(None) => Value::Null,
+        Err(error) => {
+            worker::console_warn!("[owed-actor] D1 re-judge faulted: {error}");
+            serde_json::json!({"error": error})
+        }
+    };
     // bsv-low #912 (MEDIUM-10): the sampled digest reconcile on the same driver, one identity a 22.5 minutes.
     let reconcile = match meter.phase("owed.reconcile", reconcile_env(env)).await {
         Ok(Some(r)) => serde_json::json!({
@@ -1513,7 +1526,8 @@ pub async fn alarm_env(
     let walls = meter.task_done().expect("one alarm task");
     worker::console_log!("{}", walls.line().replace("[scheduled-pass]", "[owed-alarm]"));
     worker::Response::from_json(&serde_json::json!({
-        "drain": drain, "tick": tick, "reconcile": reconcile, "wallMs": walls.wall_ms(),
+        "drain": drain, "tick": tick, "d1Rejudge": rejudge, "reconcile": reconcile,
+        "wallMs": walls.wall_ms(),
         "phases": serde_json::from_str::<Value>(&walls.phases_json()).unwrap_or_default(),
     }))
 }
@@ -1551,6 +1565,16 @@ pub async fn reconcile_env(
     let judge = owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))
         .map_err(|e| e.to_string())?;
     crate::owed_actor::reconcile_step(&judge, worker::Date::now().as_millis() as i64).await
+}
+
+/// The alarm's D1 re-judge step (bsv-low #958): the D1 judge's port under the served tip and the era.
+pub async fn d1_rejudge_env(
+    env: &worker::Env,
+) -> Result<Option<crate::owed_actor::RejudgeReport>, String> {
+    let tip = crate::owed_events::tip_memoised(env, false).await;
+    let judge = owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))
+        .map_err(|e| e.to_string())?;
+    crate::owed_actor::d1_rejudge_step(&judge, worker::Date::now().as_millis() as i64).await
 }
 
 /// `POST /internal/owed-belt-tick` (bearer `INTERNAL_TOKEN`): one tick, answered with its report.

@@ -975,7 +975,7 @@
    "readers": ["overlay-cloudflare"],
    "rebuild_class": "transient",
    "never_wipe": false,
-   "holds": "independent named cursors for the owed belt and backfill, the owed events' fault memos, Phase C's belt-ask rows the owed actors publish, the actors' fleet bootstrap budget (owed-actor:boot-budget), the bootstrap lever's coverage (owed-actor:coverage) and one row per actor holding events until its bootstrap stamps (owed-actor:holding:<identity>) (bsv-low #912); the sweep's swept stamps (owed-events:swept:<source> <key>) and the lost notes a publisher of either Worker writes for a pair it knows it did not deliver (owed-events:lost:<source> <key>; the overlay's one write, owed_events::LOST_MEMO_WRITE_SQL) (bsv-low #956)",
+   "holds": "independent named cursors for the owed belt and backfill, the owed events' fault memos, Phase C's belt-ask rows the owed actors publish, the actors' fleet bootstrap budget (owed-actor:boot-budget), the bootstrap lever's coverage (owed-actor:coverage) and one row per actor holding events until its bootstrap stamps (owed-actor:holding:<identity>) (bsv-low #912); the judge version D1's owed_rows were last re-judged under and that fleet re-judge's cursor (owed-judge:version, bsv-low #958); the sweep's swept stamps (owed-events:swept:<source> <key>) and the lost notes a publisher of either Worker writes for a pair it knows it did not deliver (owed-events:lost:<source> <key>; the overlay's one write, owed_events::LOST_MEMO_WRITE_SQL) (bsv-low #956)",
    "why": "a lost cursor restarts bounded work; the backfill completion stamp remains in view_derivation_state"
   },
   {

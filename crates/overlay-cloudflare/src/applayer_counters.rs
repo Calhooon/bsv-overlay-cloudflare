@@ -111,7 +111,7 @@ pub const OWED_BELT: [&str; 8] = [
 /// bsv-low #912 (lane D2-ACTOR-B): the app layer's owed actor (`low_app_layer::owed_actor::COUNTERS`, pinned equal
 /// there): its Phase A compares against the D1 judge, the diffs, its faults, the direct calls, the reconcile.
 /// The last two (Phase C, HIGH-3): the `belt-ask`s the actors published, the belt's finds handed back to an actor.
-pub const OWED_ACTOR: [&str; 29] = [
+pub const OWED_ACTOR: [&str; 32] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -147,6 +147,11 @@ pub const OWED_ACTOR: [&str; 29] = [
     "owed_actor_closure_misses_total",
     // D2-ACTOR-B-FOLD-12 (the seventh delta lens's NEW7-L2): the compares whose only difference was the judged tip.
     "owed_actor_compare_tip_lag_total",
+    // D2-ACTOR-B-FOLD-13 (bsv-low #958): the reconciles that found a stale D1 (healed by its fresh judgement), and
+    // D1's fleet re-judge after a judge-version move (its identities, its faults).
+    "owed_actor_reconcile_stale_total",
+    "owed_d1_rejudge_identities_total",
+    "owed_d1_rejudge_faults_total",
 ];
 
 /// bsv-low #912: `/health/invariants.owedActor`, the actor's durable totals: the Phase A compares and their diffs,
@@ -171,6 +176,7 @@ pub fn owed_actor_view(counters: &serde_json::Value) -> serde_json::Value {
             "compared": n("owed_actor_reconcile_compared_total"),
             "diffs": n("owed_actor_reconcile_diffs_total"),
             "reapplied": n("owed_actor_reconcile_republished_total"),
+            "stale": n("owed_actor_reconcile_stale_total"),
             "perDay": 64,
         },
         "beltAsks": n("owed_actor_belt_asks_total"),
@@ -190,6 +196,10 @@ pub fn owed_actor_view(counters: &serde_json::Value) -> serde_json::Value {
         "closureRearmed": n("owed_actor_closure_rearmed_total"),
         "alarmRearmed": n("owed_actor_alarm_rearmed_total"),
         "bootstrapFaults": n("owed_actor_bootstrap_faults_total"),
+        "d1Rejudge": {
+            "identities": n("owed_d1_rejudge_identities_total"),
+            "faults": n("owed_d1_rejudge_faults_total"),
+        },
         "v3": {
             "identities": n("owed_v3_identities_total"),
             "rows": n("owed_v3_rows_total"),

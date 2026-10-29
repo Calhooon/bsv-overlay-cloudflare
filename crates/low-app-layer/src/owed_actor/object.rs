@@ -1589,19 +1589,29 @@ pub async fn rows_lever(req: Request, env: &Env) -> Result<Response> {
         return Response::error("identity is not a 66-hex key", 400);
     };
     let db = crate::routes::D1Sql::of(env)?;
-    let d1 = db
-        .run_batch(vec![Stmt::new(
-            RECONCILE_D1_ROWS_SQL,
-            vec![Bind::Text(me.clone())],
-        )])
+    let mut read = db
+        .run_batch(vec![
+            Stmt::new(RECONCILE_D1_ROWS_SQL, vec![Bind::Text(me.clone())]),
+            // D2-ACTOR-B-FOLD-13 (bsv-low #958): which judge version D1's rows are (the stamp, `computedAtMs`).
+            Stmt::new(D1_JUDGED_UNDER_SQL, vec![Bind::Text(me.clone())]),
+        ])
         .await
         .map_err(Error::RustError)?
-        .into_iter()
+        .into_iter();
+    let d1 = read.next().map(|o| o.rows).unwrap_or_default();
+    let under = read
         .next()
-        .map(|o| o.rows)
+        .and_then(|o| o.rows.into_iter().next())
         .unwrap_or_default();
+    let stamp = rejudge_state_of(Some(&json!({"cursor": under["stamp"]})));
     let actor = call_stored_answer(env, &me, READ_WALL_MS).await;
-    Response::from_json(&rows_view(&me, actor, &d1))
+    Response::from_json(&rows_view(
+        &me,
+        actor,
+        &d1,
+        stamp.as_ref(),
+        json_ms(&under["computedAtMs"]).map(|c| c as i64),
+    ))
 }
 
 pub async fn identities_lever(req: Request, env: &Env) -> Result<Response> {

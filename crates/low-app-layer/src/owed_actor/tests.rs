@@ -4891,6 +4891,8 @@ async fn d2_actor_b_fold8_i_the_rows_lever_serves_the_reconciles_diff() {
         "owner",
         Ok(json!({"rows": actor_rows(&local), "bootstrapped": true, "held": 0})),
         &actor_rows(&d1),
+        None,
+        None,
     );
     assert_eq!(same["diff"], json!([]), "the two judges agree");
     assert_eq!(same["digests"]["d1"], same["digests"]["actor"]);
@@ -4917,6 +4919,8 @@ async fn d2_actor_b_fold8_i_the_rows_lever_serves_the_reconciles_diff() {
             json!({"rows": a_rows.clone(), "bootstrapped": true, "bootstrapArmed": false, "held": 0, "ackSeq": null, "judgedAtMs": NOW_MS}),
         ),
         &d1_rows,
+        None,
+        None,
     );
     assert_eq!(view["diff"], json!([planted.clone()]));
     assert_eq!(
@@ -4936,6 +4940,8 @@ async fn d2_actor_b_fold8_i_the_rows_lever_serves_the_reconciles_diff() {
         "owner",
         Err("owed actor: no answer in 1500 ms".into()),
         &d1_rows,
+        None,
+        None,
     );
     assert_eq!(down["diff"], Value::Null);
     assert_eq!(
@@ -4950,7 +4956,7 @@ async fn d2_actor_b_fold8_i_the_rows_lever_serves_the_reconciles_diff() {
     assert!(lever.starts_with(&squash("pub async fn rows_lever(req: Request, env: &Env) -> Result<Response> { if !crate::internal_events::internal_bearer_ok(&req, env) { return Response::error(\"unauthorized\", 401); }")));
     assert!(lever.contains("RECONCILE_D1_ROWS_SQL"));
     assert!(lever.contains("call_stored_answer(env,&me,READ_WALL_MS)"));
-    assert!(lever.contains("rows_view(&me,actor,&d1)"));
+    assert!(lever.contains("rows_view(&me,actor,&d1,"));
     assert!(!lever.contains("INSERT") && !lever.contains("DELETE") && !lever.contains("UPDATE"));
     let lib = squash(include_str!("../lib.rs"));
     assert!(lib.contains("req.path()==\"/internal/owed-actor-rows\"{returnowed_actor::object::rows_lever(req,&env).await;"));
@@ -6845,7 +6851,7 @@ fn fold10_j_a_state_judged_under_another_build_bootstraps_again() {
     let actor = squash(include_str!("../owed_actor.rs"));
     assert!(actor.contains("body[\"rejudged\"]=n(COUNTERS[26]);"));
     assert!(
-        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total'))AScounters")
+        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total'))AScounters")
     );
 }
 
@@ -8009,4 +8015,449 @@ async fn fold12_d_a_tip_only_difference_is_counted_apart() {
         "a verdict change is a diff"
     );
     assert_eq!(COUNTERS[28], "owed_actor_compare_tip_lag_total");
+}
+
+/// D2-ACTOR-B-FOLD-13's port: the record under the render's era, the actor's stored rows read without an apply, and
+/// every re-apply counted (the actor's closure under the same era).
+struct Fold13<'a> {
+    d1: &'a SqliteSql,
+    actor: &'a SqliteSql,
+    era: Option<i64>,
+    applies: Cell<usize>,
+    /// The D1 judge's commits fault while this is above 0 (each fault takes one).
+    commit_faults: Cell<u32>,
+}
+impl SqlPort for Fold13<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        if self.commit_faults.get() > 0
+            && stmts
+                .iter()
+                .any(|s| s.sql == crate::owed_judge::GAME_DELETE_SQL)
+        {
+            self.commit_faults.set(self.commit_faults.get() - 1);
+            return Err("D1 overloaded (pin)".into());
+        }
+        self.d1.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.d1.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.d1.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.d1.log(l);
+    }
+}
+impl JudgeDb for Fold13<'_> {
+    fn tip(&self) -> Option<u64> {
+        Some(TIP)
+    }
+    fn era_ms(&self) -> Option<i64> {
+        self.era
+    }
+    async fn word_views(
+        &self,
+        rows: &BTreeMap<String, crate::tracker_host::stored::Row>,
+    ) -> Result<BTreeMap<String, Value>, String> {
+        Fakes.word_views(rows).await
+    }
+    async fn canonical_root(&self, _: u64) -> Option<String> {
+        None
+    }
+    async fn push(&self, _: &str, _: Value) {}
+    async fn actor_stored(&self, identity: &str) -> Result<Option<Value>, String> {
+        let rows = self
+            .actor
+            .run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.into())])])
+            .await?;
+        Ok(Some(
+            json!({"rows": rows[0].rows.clone(), "bootstrapped": true}),
+        ))
+    }
+    async fn actor_apply(
+        &self,
+        identity: &str,
+        games: &[String],
+        _kind: &str,
+    ) -> Result<Option<Value>, String> {
+        self.applies.set(self.applies.get() + 1);
+        apply(
+            self.d1,
+            self.actor,
+            &Fakes,
+            identity,
+            games,
+            None,
+            Some(TIP),
+            self.era,
+        )
+        .await?;
+        self.actor_stored(identity).await
+    }
+}
+
+/// (fold13_a) bsv-low #958: THE RECONCILE JUDGES D1 FRESH BEFORE IT COMPARES. Beta's shape: D1's stored rows are the
+/// old build's judgement (an old-era game's press, judged with no era rule on that road), the fresh actor writes it
+/// off under FOLD-11's era rule. The reconcile judges the identity's differing games in D1 first, compares the FRESH
+/// rows (equal), counts a stale D1 (`owed_actor_reconcile_stale_total`, its line `stale-d1`), counts no diff and
+/// re-applies nothing; D1's stale row is gone. RED on `c08be8b51` (the stored row compared): a diff counted and the
+/// game re-applied, `left: (true, 1) right: (false, 0)`.
+#[tokio::test]
+async fn fold13_a_the_reconcile_judges_d1_fresh_and_never_counts_a_stale_row() {
+    let made = (NOW_MS / 1000) as i64 - 8 * 86_400;
+    let era = (made + 5 * 86_400) * 1000;
+    let hop = format!("{FOLD11_G_HOP}:0");
+    let d1 = seeded(&fold11_g_fixture(made));
+    let games = games_of(&d1, "owner");
+    // The old build's judgement in D1 (no era on the released-hop road): the press stands.
+    crate::owed_judge::judge_subjects(&d1, "owner", &games, "old-build")
+        .await
+        .unwrap();
+    assert_eq!(
+        fold9_row(&d1, &hop).map(|r| (r.0, r.1)),
+        Some(("hop-stranded".to_string(), Some(1))),
+        "D1 holds the old judgement's press"
+    );
+    // The fresh actor under the era: written off.
+    let local = mirror();
+    apply(
+        &d1,
+        &local,
+        &Fakes,
+        "owner",
+        &games,
+        Some(("bootstrap", 1)),
+        Some(TIP),
+        Some(era),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fold9_row(&local, &hop), None);
+    let p = Fold13 {
+        d1: &d1,
+        actor: &local,
+        era: Some(era),
+        applies: Cell::new(0),
+        commit_faults: Cell::new(0),
+    };
+    let r = reconcile_step(&p, NOW_MS as i64).await.unwrap().unwrap();
+    assert_eq!(
+        (r.diff, r.reapplied),
+        (false, 0),
+        "a stale D1 row is never a diff: {r:?}"
+    );
+    assert_eq!(p.applies.get(), 0, "nothing re-applied into the actor");
+    assert_eq!(
+        (r.judged, r.unjudged, r.stale_outpoints),
+        (1, 0, 1),
+        "{r:?}"
+    );
+    assert_eq!(
+        fold9_row(&d1, &hop),
+        None,
+        "D1 re-judged fresh: written off"
+    );
+    assert_eq!(d1.counter(COUNTERS[7]), 0, "no reconcile diff");
+    assert_eq!(d1.counter(COUNTERS[29]), 1, "one stale D1");
+    {
+        let lines = d1.lines.borrow();
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("[owed-actor] RECONCILE stale-d1 owner: 1 outpoints")));
+        assert!(!lines.iter().any(|l| l.contains("RECONCILE DIFF")));
+    }
+    // A genuine disagreement (the actor planted) still counts a diff and re-applies, the fresh D1 the side.
+    local
+        .conn
+        .execute_batch("INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,reason,updatedAtMs) VALUES ('owner','planted:0','unbound',(SELECT gameId FROM released_hop_evidence LIMIT 1),'{}','actor-planted',1)")
+        .unwrap();
+    let r = reconcile_step(&p, NOW_MS as i64 + RECONCILE_INTERVAL_MS)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(r.diff && r.reapplied > 0 && r.stale_outpoints == 0, "{r:?}");
+    assert_eq!(d1.counter(COUNTERS[7]), 1);
+    assert!(d1
+        .lines
+        .borrow()
+        .iter()
+        .any(|l| l.contains("RECONCILE DIFF owner") && l.contains("a judge disagreement")));
+}
+
+/// The identities the re-judge walks (the reconcile's union).
+fn fold13_identities(d1: &SqliteSql) -> Vec<String> {
+    let mut q = d1.conn.prepare("SELECT identity FROM owed_state UNION SELECT identity FROM potparty_records UNION SELECT identity FROM hopparty_records UNION SELECT identity FROM released_hop_evidence ORDER BY 1").unwrap();
+    q.query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn fold13_stamp(d1: &SqliteSql) -> Value {
+    d1.conn
+        .query_row(D1_REJUDGE_STATE_SQL, [], |r| r.get::<_, String>(0))
+        .map(|c| serde_json::from_str(&c).unwrap())
+        .unwrap_or(Value::Null)
+}
+
+/// Mark every stored D1 row as an old build's (its reason), and count those left.
+fn fold13_plant_old(d1: &SqliteSql) -> usize {
+    d1.conn
+        .execute("UPDATE owed_rows SET reason='old-build'", [])
+        .unwrap()
+}
+fn fold13_old_left(d1: &SqliteSql) -> i64 {
+    d1.conn
+        .query_row(
+            "SELECT COUNT(*) FROM owed_rows WHERE reason='old-build'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// Run the re-judge to its end; the ticks it took.
+async fn fold13_run(p: &Fold13<'_>, mut now: i64) -> (usize, Vec<RejudgeReport>) {
+    let mut reports = Vec::new();
+    for tick in 1..=200 {
+        now += 120_000;
+        match d1_rejudge_step(p, now).await.unwrap() {
+            Some(r) => {
+                let done = r.done;
+                reports.push(r);
+                if done {
+                    return (tick, reports);
+                }
+            }
+            None => return (tick, reports),
+        }
+    }
+    panic!("the re-judge did not end in 200 ticks");
+}
+
+/// (fold13_b) bsv-low #958: D1'S ROWS RE-JUDGED FLEET-WIDE AFTER A JUDGE_VERSION MOVE, PACED. With no stamp (the first
+/// build carrying it) or another version's, every identity of the union is re-judged once, 32 games a tick at most,
+/// and the stamp moves to the running version (`done`, served on `/health.owedActor.d1Rejudge`); the same version
+/// re-judges none (one read, no write); a faulted identity is retried the next tick and counted, and skipped at its
+/// third consecutive fault. RED on `c08be8b51`: nothing re-judges D1 (the old rows stand; with the step made inert,
+/// `left: 6 right: 0` old rows left).
+#[tokio::test]
+async fn fold13_b_a_version_move_rejudges_every_identity_once_and_moves_the_stamp() {
+    // A fleet of two: the stranded hops' owner and an old-era hop-only seat under a second identity.
+    let d1 = d1_judge(&stranded()).await;
+    let made = (NOW_MS / 1000) as i64 - 8 * 86_400;
+    for st in fold11_g_fixture(made).seed {
+        d1.conn
+            .execute_batch(&st.replace("'owner'", "'owner2'"))
+            .unwrap();
+    }
+    crate::owed_judge::judge_subjects(&d1, "owner2", &games_of(&d1, "owner2"), "d1")
+        .await
+        .unwrap();
+    let ids = fold13_identities(&d1);
+    assert!(ids.len() >= 2, "a fleet: {ids:?}");
+    let old = fold13_plant_old(&d1);
+    assert!(old > 0);
+    let p = Fold13 {
+        d1: &d1,
+        actor: &d1,
+        era: None,
+        applies: Cell::new(0),
+        commit_faults: Cell::new(0),
+    };
+    let t0 = NOW_MS as i64;
+    let (_, reports) = fold13_run(&p, t0).await;
+    assert!(reports[0].started, "no stamp: a run starts");
+    assert!(
+        reports.iter().all(|r| r.games <= D1_REJUDGE_GAMES_PER_TICK),
+        "paced: {reports:?}"
+    );
+    assert_eq!(fold13_old_left(&d1), 0, "every identity's rows re-judged");
+    let stamp = fold13_stamp(&d1);
+    assert_eq!(stamp["version"], json!(JUDGE_VERSION));
+    assert_eq!(stamp["done"], json!(true));
+    assert_eq!(stamp["identities"], json!(ids.len()), "each identity once");
+    assert_eq!(d1.counter(COUNTERS[30]), ids.len() as u64);
+    assert!(stamp["endedAtMs"].as_i64() >= stamp["startedAtMs"].as_i64());
+    // Served on /health.owedActor.d1Rejudge (the snapshot the done tick forced).
+    let snap: String = d1
+        .conn
+        .query_row(
+            "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:health'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let body = health_body(
+        health_snapshot_of(Some(&snap)).as_ref(),
+        NOW_MS,
+        true,
+        &Value::Null,
+    );
+    assert_eq!(
+        (
+            &body["d1Rejudge"]["version"],
+            &body["d1Rejudge"]["done"],
+            &body["d1Rejudge"]["identities"]
+        ),
+        (&json!(JUDGE_VERSION), &json!(true), &json!(ids.len())),
+        "{}",
+        body["d1Rejudge"]
+    );
+    assert!(body["d1Rejudge"]["startedAtMs"].is_u64() && body["d1Rejudge"]["endedAtMs"].is_u64());
+    // The same version: nothing runs, nothing is re-judged.
+    fold13_plant_old(&d1);
+    assert_eq!(d1_rejudge_step(&p, t0 + 10_000_000).await.unwrap(), None);
+    assert!(fold13_old_left(&d1) > 0, "the same version re-judges none");
+    // A version move (the stamp another build's): a run again, the previous version kept.
+    d1.conn
+        .execute(
+            "UPDATE owed_belt_state SET cursor=json_set(cursor,'$.version','fold10-old') WHERE name=?1",
+            [D1_REJUDGE_NAME],
+        )
+        .unwrap();
+    // A faulted identity: retried next tick and counted.
+    p.commit_faults.set(1);
+    let first = d1_rejudge_step(&p, t0 + 20_000_000).await.unwrap().unwrap();
+    assert!(
+        first.started && first.faulted && first.identities == 0,
+        "{first:?}"
+    );
+    assert_eq!(d1.counter(COUNTERS[31]), 1);
+    let s = fold13_stamp(&d1);
+    assert_eq!(s["previous"]["version"], json!("fold10-old"));
+    assert_eq!(
+        (s["openFaults"].clone(), s["open"][0].clone()),
+        (json!(1), json!(ids[0]))
+    );
+    let (_, rest) = fold13_run(&p, t0 + 20_000_000).await;
+    assert!(!rest[0].faulted && rest.last().unwrap().done);
+    assert_eq!(fold13_old_left(&d1), 0);
+    assert_eq!(
+        fold13_stamp(&d1)["identities"],
+        json!(ids.len()),
+        "the faulted one retried, done"
+    );
+    // Three consecutive faults skip it; the run goes on to its end.
+    d1.conn
+        .execute(
+            "UPDATE owed_belt_state SET cursor=json_set(cursor,'$.version','fold10-old') WHERE name=?1",
+            [D1_REJUDGE_NAME],
+        )
+        .unwrap();
+    p.commit_faults.set(3);
+    let (_, skipped) = fold13_run(&p, t0 + 30_000_000).await;
+    assert_eq!(skipped.iter().map(|r| r.skipped).sum::<usize>(), 1);
+    let s = fold13_stamp(&d1);
+    assert_eq!(
+        (s["skipped"].clone(), s["identities"].clone()),
+        (json!(1), json!(ids.len() - 1))
+    );
+    assert!(d1
+        .lines
+        .borrow()
+        .iter()
+        .any(|l| l.contains("D1 re-judge under") && l.contains("SKIPPED")));
+}
+
+/// (fold13_c) bsv-low #958: THE ROUTE AND THE RECONCILE SAY WHICH SIDE IS STALE. The rows lever serves
+/// `d1JudgedUnder` (the stamp's version once its run passed the identity, the previous run's for a judgement older
+/// than the run, `unknown` otherwise) and `d1Rejudge`; the reconcile's `stale-d1` line names whether D1's re-judge had
+/// passed the identity, counted apart (`reconcileStaleTotal`), never a diff. RED on `c08be8b51`: neither field
+/// exists and a stale D1 is a `RECONCILE DIFF`.
+#[tokio::test]
+async fn fold13_c_the_route_and_the_reconcile_name_a_stale_d1() {
+    let st = |done: bool, after: &str| {
+        json!({"version": JUDGE_VERSION, "startedAtMs": 1_000, "done": done, "after": after,
+            "previous": {"version": "fold10-old", "startedAtMs": 10}})
+    };
+    assert_eq!(d1_judged_under(None, "b", Some(5)), json!("unknown"));
+    assert_eq!(
+        d1_judged_under(Some(&st(true, "")), "b", Some(5)),
+        json!(JUDGE_VERSION)
+    );
+    assert_eq!(
+        d1_judged_under(Some(&st(false, "m")), "b", None),
+        json!(JUDGE_VERSION)
+    );
+    assert_eq!(
+        d1_judged_under(Some(&st(false, "m")), "z", Some(500)),
+        json!("fold10-old")
+    );
+    assert_eq!(
+        d1_judged_under(Some(&st(false, "m")), "z", Some(5_000)),
+        json!("unknown")
+    );
+    assert!(
+        rejudge_passed(Some(&st(false, "m")), "b") && !rejudge_passed(Some(&st(false, "m")), "z")
+    );
+    let view = rows_view(
+        "z",
+        Ok(json!({"rows": []})),
+        &[],
+        Some(&st(false, "m")),
+        Some(500),
+    );
+    assert_eq!(view["d1JudgedUnder"], json!("fold10-old"));
+    assert_eq!(view["d1Rejudge"]["passed"], json!(false));
+    assert_eq!(view["d1Rejudge"]["stamp"]["running"], json!(JUDGE_VERSION));
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    let lever = &object[object.find("pubasyncfnrows_lever(").unwrap()
+        ..object.find("pubasyncfnidentities_lever(").unwrap()];
+    assert!(lever.contains("Stmt::new(D1_JUDGED_UNDER_SQL,vec![Bind::Text(me.clone())])"));
+    // The reconcile: a stale D1 row before the fleet re-judge passed the identity.
+    let w = WithActor {
+        d1: d1_judge(&stranded()).await,
+        actor: mirror(),
+        d1_judges: true,
+        event: None,
+        actor_reads: false,
+        actor_fails: Cell::new(false),
+    };
+    crate::owed_events::deliver(&w, "owner", &games_of(&w.d1, "owner"))
+        .await
+        .unwrap();
+    w.d1.conn
+        .execute_batch("UPDATE owed_rows SET reason='old-build' WHERE rowid=(SELECT MIN(rowid) FROM owed_rows WHERE identity='owner')")
+        .unwrap();
+    let r = reconcile_step(&w, NOW_MS as i64).await.unwrap().unwrap();
+    assert_eq!(
+        (r.diff, r.stale_outpoints, r.rejudge_passed),
+        (false, 1, false),
+        "{r:?}"
+    );
+    assert!(w
+        .d1
+        .lines
+        .borrow()
+        .iter()
+        .any(|l| l.starts_with("[owed-actor] RECONCILE stale-d1 owner")
+            && l.contains("had passed the identity: false")));
+    assert_eq!(
+        (w.d1.counter(COUNTERS[7]), w.d1.counter(COUNTERS[29])),
+        (0, 1)
+    );
+    // After D1's re-judge passed it, the line says so.
+    w.d1.conn
+        .execute(
+            "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,?2,0)",
+            rusqlite::params![D1_REJUDGE_NAME, st(true, "").to_string()],
+        )
+        .unwrap();
+    w.d1.conn
+        .execute_batch("UPDATE owed_rows SET reason='old-build' WHERE rowid=(SELECT MIN(rowid) FROM owed_rows WHERE identity='owner')")
+        .unwrap();
+    let r = reconcile_step(&w, NOW_MS as i64 + RECONCILE_INTERVAL_MS)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        r.rejudge_passed && !r.diff && r.stale_outpoints == 1,
+        "{r:?}"
+    );
+    // Served: the health body's `reconcileStaleTotal`.
+    assert!(squash(include_str!("../owed_actor.rs"))
+        .contains("body[\"reconcileStaleTotal\"]=n(COUNTERS[29]);"));
 }
