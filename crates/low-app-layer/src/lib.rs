@@ -541,6 +541,12 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     if req.method() == worker::Method::Post && req.path() == "/internal/owed-actor-bootstrap" {
         return owed_actor::object::bootstrap_lever(req, &env).await;
     }
+    // D2-ACTOR-B-FOLD-15 (the captain's pace lever): D1's re-judge's games a tick, 0 pauses.
+    if req.path() == "/internal/owed-rejudge"
+        && matches!(req.method(), worker::Method::Get | worker::Method::Post)
+    {
+        return owed_actor::rejudge_pace_lever(req, &env).await;
+    }
     if req.method() == worker::Method::Post && req.path() == "/internal/owed-v3-pass" {
         return owed_actor::owed_v3_lever(req, &env).await;
     }

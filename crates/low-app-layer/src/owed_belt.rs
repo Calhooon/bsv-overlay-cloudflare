@@ -1499,12 +1499,16 @@ pub async fn alarm_env(
             serde_json::json!({"error": error})
         }
     };
-    // D2-ACTOR-B-FOLD-13 (bsv-low #958): D1's fleet re-judge after a judge-version move, paced (32 games a tick),
-    // BEFORE the reconcile so the sampler compares a re-judged D1; one primary-key read a tick once done.
-    let rejudge = match meter.phase("owed.d1_rejudge", d1_rejudge_env(env)).await {
+    // D2-ACTOR-B-FOLD-13 (bsv-low #958): D1's fleet re-judge after a judge-version move, paced (FOLD-15: 16 games,
+    // one judge call and at most 32 identities a tick), BEFORE the reconcile so the sampler compares a re-judged D1;
+    // one primary-key read a tick once done.
+    let rejudged = meter.phase("owed.d1_rejudge", d1_rejudge_env(env)).await;
+    let rejudge_report = rejudged.as_ref().ok().and_then(Option::clone);
+    let rejudge = match rejudged {
         Ok(Some(r)) => serde_json::json!({
             "started": r.started, "identities": r.identities, "games": r.games, "faulted": r.faulted,
-            "skipped": r.skipped, "done": r.done,
+            "skipped": r.skipped, "done": r.done, "judgeCalls": r.judge_calls,
+            "gamesPerTick": r.games_per_tick, "paused": r.paused,
         }),
         Ok(None) => Value::Null,
         Err(error) => {
@@ -1513,10 +1517,21 @@ pub async fn alarm_env(
         }
     };
     // bsv-low #912 (MEDIUM-10): the sampled digest reconcile on the same driver, one identity a 22.5 minutes.
-    let reconcile = match meter.phase("owed.reconcile", reconcile_env(env)).await {
+    // D2-ACTOR-B-FOLD-15 (the captain's pace lever): a re-judge tick that made more than one judge call yields the
+    // reconcile to the next alarm, so the invocation stays under D1's bound (`owed_actor::reconcile_yields`).
+    let yields = rejudge_report
+        .as_ref()
+        .is_some_and(crate::owed_actor::reconcile_yields);
+    let reconciled = if yields {
+        Ok(None)
+    } else {
+        meter.phase("owed.reconcile", reconcile_env(env)).await
+    };
+    let reconcile = match reconciled {
         Ok(Some(r)) => serde_json::json!({
             "identity": r.identity, "diff": r.diff, "reapplied": r.reapplied, "noActor": r.no_actor,
         }),
+        Ok(None) if yields => serde_json::json!({"yielded": true}),
         Ok(None) => Value::Null,
         Err(error) => {
             worker::console_warn!("[owed-actor] reconcile faulted: {error}");
@@ -1574,7 +1589,17 @@ pub async fn d1_rejudge_env(
     let tip = crate::owed_events::tip_memoised(env, false).await;
     let judge = owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))
         .map_err(|e| e.to_string())?;
-    crate::owed_actor::d1_rejudge_step(&judge, worker::Date::now().as_millis() as i64).await
+    // FOLD-15: the render's pace (the lever's row wins), read once per alarm.
+    let pace = env
+        .var("OWED_D1_REJUDGE_GAMES_PER_TICK")
+        .ok()
+        .map(|v| v.to_string());
+    crate::owed_actor::d1_rejudge_step_paced(
+        &judge,
+        worker::Date::now().as_millis() as i64,
+        pace.as_deref(),
+    )
+    .await
 }
 
 /// `POST /internal/owed-belt-tick` (bearer `INTERNAL_TOKEN`): one tick, answered with its report.
