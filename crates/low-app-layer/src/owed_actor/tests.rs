@@ -2717,7 +2717,8 @@ fn d2_actor_b_fold3_m2_the_bootstrap_pages_take_a_fleet_budget() {
         .split_whitespace()
         .collect::<String>();
     let step = &actor[actor.find("pubasyncfnbootstrap_step").unwrap()..];
-    assert!(step[..step.find("drain_held(").unwrap()].contains("IDENTITY_GAMES_AFTER_SQL"));
+    // D2-ACTOR-B-FOLD-14: the page's games are read in its first round's record call (`ApplyOpts::page`).
+    assert!(step[..step.find("drain_held(").unwrap()].contains("page:Some((at,after)),"));
     assert!(page.contains("self.alarm_in(BOOTSTRAP_PAGE_DELAY_MS).await;"));
 }
 
@@ -4262,13 +4263,14 @@ fn d2_actor_b_fold8_a_the_boot_budget_refuses_past_60_a_minute_under_d1s_real_bi
     assert_eq!(take(minute + 60_000 + 3), 1, "the next minute takes again");
 }
 
-/// A record that faults every bootstrap page read (`IDENTITY_GAMES_AFTER_SQL`) and answers the rest.
+/// A record that faults every bootstrap page read (`IDENTITY_GAMES_AFTER_SQL`, or since D2-ACTOR-B-FOLD-14 the page's
+/// first round that carries it, [`page_select`]) and answers the rest.
 struct PageFaults<'a>(&'a SqliteSql);
 impl SqlPort for PageFaults<'_> {
     async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
         if stmts
             .iter()
-            .any(|s| s.sql == crate::owed_judge::IDENTITY_GAMES_AFTER_SQL)
+            .any(|s| s.sql == crate::owed_judge::IDENTITY_GAMES_AFTER_SQL || s.sql == page_select())
         {
             return Err("D1_ERROR: the page's read faulted".into());
         }
@@ -8460,4 +8462,393 @@ async fn fold13_c_the_route_and_the_reconcile_name_a_stale_d1() {
     // Served: the health body's `reconcileStaleTotal`.
     assert!(squash(include_str!("../owed_actor.rs"))
         .contains("body[\"reconcileStaleTotal\"]=n(COUNTERS[29]);"));
+}
+
+// ---- D2-ACTOR-B-FOLD-14 (bsv-low #954 item 9): the warm apply is ONE record read; the apply's stages served; a
+// burst's callers answered from the pass ----
+
+/// The mirror's key set for `games` as [`apply_with`] walks it before its read (the local walk to its fixpoint, the
+/// last judgement's txids).
+async fn fold14_mirror_keys(local: &SqliteSql, games: &[String]) -> Keys {
+    let mut keys = Keys::default();
+    loop {
+        let mut next = keys.clone();
+        keys_of_mirror(local, "owner", games, &keys, &mut next)
+            .await
+            .unwrap();
+        if next == keys {
+            break;
+        }
+        keys = next;
+    }
+    let judged = local
+        .run_batch(vec![Stmt::new(
+            JUDGED_TXIDS_SQL,
+            vec![
+                Bind::Text("owner".into()),
+                Bind::Text(json!(games).to_string()),
+            ],
+        )])
+        .await
+        .unwrap();
+    judged
+        .iter()
+        .flat_map(|o| &o.rows)
+        .for_each(|r| txids_in_value(r, &mut keys.txids));
+    keys
+}
+
+/// Each family's rows, as sorted JSON text (the read's `DISTINCT` fixes no order).
+fn fold14_sorted(rows: &[Vec<Value>]) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|f| {
+            let mut v: Vec<String> = f.iter().map(Value::to_string).collect();
+            v.sort();
+            v
+        })
+        .collect()
+}
+
+/// (fold14_a) THE WARM APPLY IS ONE RECORD CALL (bsv-low #954 item 9): on FOLD-7's 600-game chained seat, every game
+/// warm, one write to game 300 applied with its event's txids reads the record in ONE batch of one statement (on
+/// `c08be8b51` two sequential batches: the marks, then the compound over keys that depend on them), then writes the
+/// mirror; and the one statement reads exactly the rows the two-statement read reads, family by family, byte for
+/// byte, over exactly its key set. RED on `c08be8b51` (the marked read inert, `read_marked` answering `Ok(None)`:
+/// the base's two sequential reads): `left: 2 right: 1`.
+#[tokio::test]
+async fn fold14_a_a_warm_apply_is_one_record_read() {
+    let (record, local, games) = e_warm_seat(600).await;
+    let hop = e_write(&record, &games, 300);
+    let game = &games[300..301];
+    // The two-statement read of the base, over the same mirror.
+    let mut n = fold14_mirror_keys(&local, game).await;
+    txids_in(&hop, &mut n.txids);
+    let mut two = n.clone();
+    let marks = record
+        .run_batch(vec![Stmt::new(
+            NARROW_MARKS_SQL,
+            vec![
+                Bind::Text("owner".into()),
+                Bind::Text(json!(game).to_string()),
+            ],
+        )])
+        .await
+        .unwrap();
+    marks[0]
+        .rows
+        .iter()
+        .for_each(|m| txids_in_value(&m["sourceKey"], &mut two.txids));
+    let (rows_two, _) = read_round(&record, "owner", game, &two, false)
+        .await
+        .unwrap();
+    let one = read_marked(&record, "owner", game, &n, None)
+        .await
+        .unwrap()
+        .expect("no value past D1's bound");
+    assert_eq!(
+        one.keys, two,
+        "the one statement reads the two reads' key set"
+    );
+    assert_eq!(
+        fold14_sorted(&one.rows),
+        fold14_sorted(&rows_two),
+        "the one statement's rows are the two reads' rows"
+    );
+    assert!(one.rows.iter().map(Vec::len).sum::<usize>() > 0);
+    assert_eq!(one.marks.len(), marks[0].rows.len());
+    // The apply: one record batch, one statement.
+    let (b0, s0) = (record.batches.get(), record.stmts.get());
+    let opts = ApplyOpts {
+        touch: Some(vec![hop.clone()]),
+        ..ApplyOpts::default()
+    };
+    let (report, _) = apply_with(
+        &record,
+        &local,
+        &Fakes,
+        "owner",
+        game,
+        Some(("pot", 2)),
+        Some(TIP),
+        None,
+        &opts,
+    )
+    .await
+    .unwrap();
+    let (batches, stmts) = (record.batches.get() - b0, record.stmts.get() - s0);
+    eprintln!(
+        "fold14_a: one warm apply of one game of 600: record batches {batches}, statements {stmts}, rounds {}, misses {}",
+        report.rounds, report.misses
+    );
+    assert!(report.narrowed && report.misses == 0);
+    assert_eq!(batches, 1, "a warm apply is one record read");
+    assert_eq!(stmts, 1);
+    // and its judgement is a cold full apply's
+    let cold = mirror();
+    apply(
+        &record,
+        &cold,
+        &Fakes,
+        "owner",
+        game,
+        Some(("pot", 2)),
+        Some(TIP),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stored_game(&local, "owner", &games[300]),
+        stored_game(&cold, "owner", &games[300])
+    );
+    // A mark asking for the record (`age`): the marked read is the full apply's first round, still one call for it.
+    record
+        .conn
+        .execute(
+            "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner',?1,'age','age',1)",
+            [&games[301]],
+        )
+        .unwrap();
+    let b1 = record.batches.get();
+    let (r, _) = apply_with(
+        &record,
+        &local,
+        &Fakes,
+        "owner",
+        &games[301..302],
+        None,
+        Some(TIP),
+        None,
+        &ApplyOpts {
+            touch: Some(vec![h("b8", 301)]),
+            ..ApplyOpts::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!r.narrowed);
+    assert_eq!(
+        (record.batches.get() - b1) as usize,
+        r.rounds,
+        "a full apply reads one call a round, its first the marked read"
+    );
+}
+
+/// (fold14_b) A BOOTSTRAP PAGE READS ITS GAMES IN ITS FIRST ROUND: one page of FOLD-7's 600-game seat on a fresh
+/// mirror makes as many record calls as an apply of the same 16 games (one a round; on `c08be8b51` one more, the
+/// games' read before the apply), and stores the same rows. RED on `c08be8b51` (the page's marked read inert, the
+/// games read first): `left: 3 right: 2`.
+#[tokio::test]
+async fn fold14_b_a_bootstrap_page_reads_its_games_in_its_first_round() {
+    let record = seeded(&fold7_chained_seat(600));
+    let paged = mirror();
+    let turn = futures_util::lock::Mutex::new(());
+    let b0 = record.batches.get();
+    let step = bootstrap_step(
+        &turn,
+        &record,
+        &paged,
+        &Fakes,
+        "owner",
+        Some(object::BOOT_CURSOR_START),
+        Some(TIP),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    let page_calls = record.batches.get() - b0;
+    let BootStep::Page { games: n, .. } = step else {
+        panic!("{step:?}")
+    };
+    assert_eq!(n, BOOTSTRAP_PAGE_GAMES);
+    let page: Vec<String> = record
+        .run_batch(vec![Stmt::new(
+            crate::owed_judge::IDENTITY_GAMES_AFTER_SQL,
+            vec![
+                Bind::Text("owner".into()),
+                Bind::Int(i64::MAX),
+                Bind::Text(String::new()),
+            ],
+        )])
+        .await
+        .unwrap()
+        .remove(0)
+        .rows
+        .iter()
+        .map(|r| r["gameId"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(page.len(), n);
+    let alone = mirror();
+    let b1 = record.batches.get();
+    let (report, _) = apply(
+        &record,
+        &alone,
+        &Fakes,
+        "owner",
+        &page,
+        None,
+        Some(TIP),
+        None,
+    )
+    .await
+    .unwrap();
+    let apply_calls = record.batches.get() - b1;
+    eprintln!(
+        "fold14_b: one bootstrap page of {n} games: record calls {page_calls}; the same games' apply {apply_calls} ({} rounds)",
+        report.rounds
+    );
+    assert_eq!(apply_calls as usize, report.rounds);
+    assert_eq!(page_calls, apply_calls, "a page is its rounds' reads");
+    assert_eq!(stored_rows_no_clock(&paged), stored_rows_no_clock(&alone));
+    assert!(!stored_rows_no_clock(&paged).is_empty());
+}
+
+/// A local port whose clock moves one millisecond each time it is read.
+struct Ticking<'a>(&'a SqliteSql);
+impl SqlPort for Ticking<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        self.0.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.0.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        let t = self.0.now.get() + 1;
+        self.0.now.set(t);
+        t
+    }
+    fn log(&self, l: &str) {
+        self.0.log(l);
+    }
+}
+
+/// (fold14_c) THE APPLY'S STAGES (bsv-low #954 item 9): an event applied in the object's turn answers its stages
+/// (`readMs`, `judgeMs`, `writeMs`, `waitMs`), which sum to its time to the millisecond of the clock's own reads, a
+/// joined caller's included; and the bars row serves each stage's p95 per class and over the classes beside
+/// `applyMsP95`. New API; on `c08be8b51` no answer carries a stage.
+#[tokio::test]
+async fn fold14_c_the_apply_stages_sum_to_the_apply_and_are_served() {
+    let (record, local, games) = e_warm_seat(32).await;
+    let hops: Vec<String> = (0..3).map(|k| e_write(&record, &games, k)).collect();
+    let ticking = Ticking(&local);
+    let burst = Burst::default();
+    let turn = futures_util::lock::Mutex::new(());
+    let yielding = Yielding(&record);
+    let item = |k: usize| BurstItem {
+        games: vec![games[k].clone()],
+        kind_seq: Some(("pot".into(), 200 + k as i64)),
+        tip: Some(TIP),
+        bound: None,
+        touch: Some(vec![hops[k].clone()]),
+    };
+    let start = local.now.get();
+    let timed = |k: usize| {
+        let (burst, turn, yielding, ticking) = (&burst, &turn, &yielding, &ticking);
+        async move {
+            let t0 = ticking.now_ms();
+            let r = apply_coalesced(
+                burst,
+                turn,
+                yielding,
+                ticking,
+                &Fakes,
+                "owner",
+                item(k),
+                None,
+                false,
+                false,
+            )
+            .await
+            .unwrap()
+            .0;
+            (r, t0, ticking.now_ms())
+        }
+    };
+    let answers = futures_util::future::join_all((0..3).map(timed)).await;
+    assert!(local.now.get() > start);
+    let mut joined = 0;
+    for (report, t0, t1) in &answers {
+        let stages = report.read_ms + report.judge_ms + report.write_ms + report.wait_ms;
+        let elapsed = t1 - t0;
+        assert!(
+            stages <= elapsed && elapsed - stages <= 2,
+            "the stages sum to the apply: {stages} of {elapsed} ({report:?})"
+        );
+        assert!(report.read_ms > 0 && report.judge_ms > 0 && report.write_ms > 0);
+        if report.coalesced > 0 && report.wait_ms > 0 {
+            joined += 1;
+        }
+    }
+    assert!(joined > 0, "a caller waited in the turn");
+    // Served: the answer, the class's ring, the fleet's p95 per class and over the classes.
+    let a = answer_of(&answers[0].0, Vec::new());
+    for (field, _) in APPLY_STAGES {
+        assert!(a[field].as_u64().is_some(), "{field} answered");
+    }
+    let mut pending = PendingBars::default();
+    let mut served = a.clone();
+    served["applyMs"] = json!(answers[0].2 - answers[0].1);
+    pending.note_answer("direct", &served);
+    flush_bars_from(&record, NOW_MS, &pending).await.unwrap();
+    let rows: Vec<Value> = record
+        .run_batch(vec![Stmt::new(BARS_READ_SQL, vec![])])
+        .await
+        .unwrap()
+        .remove(0)
+        .rows;
+    let bars = fleet_bars(&rows, NOW_MS, lib_rev());
+    for (field, _) in APPLY_STAGES {
+        let k = format!("{field}P95");
+        assert_eq!(
+            bars["classes"]["direct"][&k],
+            json!(a[field]),
+            "{k} served for the class"
+        );
+        assert_eq!(bars["stages"][&k], json!(a[field]), "{k} served");
+    }
+    assert!(bars["applyMsP95"].as_u64().is_some());
+}
+
+/// (fold14_d) A JOINED CALLER IS ANSWERED BY THE PASS, NOT THE TURN (bsv-low #954 item 9, item 3): an event a holder's
+/// pass applied returns as soon as the pass leaves its answer, while the turn is still held (by a later caller's pass:
+/// futures-util's `Mutex` wakes its lowest slab slot, which a later caller may have taken). RED on `c08be8b51` (the
+/// answer read only after the turn, `apply_coalesced` awaiting `turn.lock()` alone): the joined caller times out.
+#[tokio::test]
+async fn fold14_d_a_joined_caller_is_answered_by_the_pass_not_the_turn() {
+    use std::future::Future;
+    let record = mirror();
+    let local = mirror();
+    let burst = Burst::default();
+    let turn = futures_util::lock::Mutex::new(());
+    let held = turn.lock().await;
+    let item = BurstItem {
+        games: vec!["g".into()],
+        kind_seq: Some(("pot".into(), 1)),
+        ..BurstItem::default()
+    };
+    let mut joiner = Box::pin(apply_coalesced(
+        &burst, &turn, &record, &local, &Fakes, "owner", item, None, false, false,
+    ));
+    let first = futures_util::future::poll_fn(|cx| {
+        std::task::Poll::Ready(joiner.as_mut().poll(cx).is_pending())
+    })
+    .await;
+    assert!(first, "the caller waits while the turn is held");
+    // A holder's pass took the caller's event and leaves its answer; the turn stays held (a later caller's pass).
+    let taken = burst.take();
+    assert_eq!(taken.len(), 1);
+    let report = ApplyReport {
+        applied_games: vec!["g".into()],
+        read_ms: 3,
+        ..ApplyReport::default()
+    };
+    burst.answer(vec![(taken[0].0, Ok((report, Vec::new())))]);
+    let got = tokio::time::timeout(std::time::Duration::from_secs(2), joiner)
+        .await
+        .expect("the joined caller is answered while the turn is held")
+        .unwrap();
+    assert_eq!(got.0.applied_games, vec!["g".to_string()]);
+    assert_eq!(got.0.read_ms, 3);
+    drop(held);
 }
