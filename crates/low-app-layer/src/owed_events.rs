@@ -1362,7 +1362,8 @@ pub async fn sweep_publish(env: &worker::Env) -> Result<usize, String> {
     // FIX-956 1b: a re-publish that faulted is noted lost again (the next tick takes it whatever its stamp)
     let lost_noted = publish::write_lost(&port, publish::lost_of(&report)).await;
     // D2-ACTOR-D (bsv-low #952): the re-published pairs' actors called inline (the scheduled drain's own pass).
-    direct_events(env, report.sent.clone()).await;
+    // FOLD-16 (the captain's item 5): the sweep is no writer: its direct pass samples nothing into the bars.
+    direct_events_as(env, report.sent.clone(), crate::owed_actor::SWEEP_CLASS).await;
     publish::bump(
         env,
         &[
@@ -2547,6 +2548,18 @@ pub async fn direct_with(
     events: Vec<OwedEvent>,
     tip: Option<u64>,
 ) -> DirectReport {
+    direct_with_class(port, events, tip, "direct").await
+}
+
+/// [`direct_with`] under a bars `class`: `direct` for a writer's pass; [`crate::owed_actor::SWEEP_CLASS`] for the drain's
+/// sweep (D2-ACTOR-B-FOLD-16, the captain's item 5), whose bodies carry it so the object samples nothing, and whose
+/// answers this pass notes into no bar.
+pub async fn direct_with_class(
+    port: &impl DirectPort,
+    events: Vec<OwedEvent>,
+    tip: Option<u64>,
+    class: &'static str,
+) -> DirectReport {
     let mut report = DirectReport::default();
     let mut subjects_of = Vec::new();
     for (n, ev) in events.into_iter().enumerate() {
@@ -2561,7 +2574,10 @@ pub async fn direct_with(
         };
         subjects_of.push((crate::owed_actor::EventCtx::of(&ev), subjects));
     }
-    let bodies = coalesce_direct(subjects_of, tip);
+    let mut bodies = coalesce_direct(subjects_of, tip);
+    for b in &mut bodies {
+        b["class"] = json!(class);
+    }
     report.calls = bodies.len() as u64;
     // FIX-956 item 3: in Phase C each body's acknowledgement bound, read BEFORE its call (a mark written after it is
     // left for the queue's delivery)
@@ -2594,6 +2610,7 @@ pub async fn direct_with(
         match answer {
             // D2-ACTOR-B-FOLD-7: a held answer is neither a fault nor a sample (the actor counts it).
             Ok(a) if crate::owed_actor::is_held(&a) => report.held += 1,
+            Ok(_) if class == crate::owed_actor::SWEEP_CLASS => {}
             Ok(a) => crate::owed_actor::note_answer_as("direct", &a),
             Err(e) => {
                 if is_wall(&e) {
@@ -2644,6 +2661,15 @@ impl DirectPort for WorkerDirect {
 /// The direct pass over the Worker's bindings, its counters and the `direct` bars flushed. Nothing without the actor's
 /// binding (the queue alone).
 pub async fn direct_events(env: &worker::Env, events: Vec<OwedEvent>) -> DirectReport {
+    direct_events_as(env, events, "direct").await
+}
+
+/// [`direct_events`] under a bars class ([`direct_with_class`]).
+pub async fn direct_events_as(
+    env: &worker::Env,
+    events: Vec<OwedEvent>,
+    class: &'static str,
+) -> DirectReport {
     if events.is_empty() || env.durable_object(crate::owed_actor::BINDING).is_err() {
         return DirectReport::default();
     }
@@ -2656,7 +2682,7 @@ pub async fn direct_events(env: &worker::Env, events: Vec<OwedEvent>) -> DirectR
         env: env.clone(),
         sql,
     };
-    let report = direct_with(&port, events, tip).await;
+    let report = direct_with_class(&port, events, tip, class).await;
     // item 8 (D2-ACTOR-B-FOLD-10): the first fault's own text, once a minute an isolate.
     log_direct_fault(&report, worker::Date::now().as_millis(), |l| {
         worker::console_warn!("{l} (the queue's messages are their backstop)");

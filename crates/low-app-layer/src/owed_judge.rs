@@ -484,7 +484,13 @@ impl JudgeDb for D1Judge {
             Some(t) => Some(t),
             None => crate::owed_events::tip_memoised(&self.sql.env, false).await,
         };
-        let mut body = crate::owed_actor::apply_body(identity, games, &event, tip);
+        // D2-ACTOR-B-FOLD-16 (the captain's item 5): the reconcile's fresh re-apply is no delivery: no `atMs`, so it
+        // samples nothing into the writers' bars.
+        let mut body = if kind == "reconcile" {
+            crate::owed_actor::reconcile_apply_body(identity, games, kind, tip)
+        } else {
+            crate::owed_actor::apply_body(identity, games, &event, tip)
+        };
         body["seq"] = Value::Null;
         crate::owed_actor::object::call_apply(
             &self.sql.env,
@@ -613,6 +619,8 @@ pub struct JudgeReport {
 pub struct DrainReport {
     pub subjects: usize,
     pub faults: Vec<(Subject, String)>,
+    /// D2-ACTOR-B-FOLD-16 (NEW9-L1): the pairs the queue's sweep re-published (the alarm's bound reads it).
+    pub swept: usize,
 }
 /// The exact trigger mark(s) belonging to the source writes at the front of the batch.
 #[derive(Debug, Clone)]

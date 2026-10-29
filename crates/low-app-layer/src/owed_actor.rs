@@ -3700,6 +3700,41 @@ pub fn rejudge_due(bootstrapped: bool, judged_rev: Option<&str>, running: &str) 
     bootstrapped && judged_rev != Some(running)
 }
 
+/// D2-ACTOR-B-FOLD-16 (the captain's item 5): the `class` of a direct pass that is no writer's (the drain's sweep
+/// re-publishing marks that waited, the reconcile's own `backfill` marks among them): its applies sample NOTHING into
+/// the fleet's bars, which are the writers' (the direct call's apply and visibility, the queue's backstop).
+pub const SWEEP_CLASS: &str = "sweep";
+
+/// PURE (FOLD-16, item 5): does an apply sample into the bars? Only a delivery (its event's write time, `atMs`) that is
+/// a writer's or the queue's: the tip alarm's window and the reconcile's fresh re-apply carry no `atMs`; the sweep's
+/// direct pass carries [`SWEEP_CLASS`].
+pub fn samples_bars(at_ms: Option<u64>, class: Option<&str>) -> bool {
+    at_ms.is_some() && class != Some(SWEEP_CLASS)
+}
+
+/// PURE (FOLD-16, item 5): the `/apply` body of the reconcile's fresh re-apply: no event (`seq` and `atMs` null), so
+/// the object samples nothing (`samples_bars`) and records no first apply of an event.
+pub fn reconcile_apply_body(
+    identity: &str,
+    games: &[String],
+    kind: &str,
+    tip: Option<u64>,
+) -> Value {
+    let e = EventCtx {
+        kind: kind.into(),
+        seq: 0,
+        at_ms: 0,
+        mined: false,
+        txids: None,
+        also: Vec::new(),
+        by_identity: Default::default(),
+    };
+    let mut body = apply_body(identity, games, &e, tip);
+    body["seq"] = Value::Null;
+    body["atMs"] = Value::Null;
+    body
+}
+
 /// NEW5-L5 (D2-ACTOR-B-FOLD-10): the bars class an object notes its own answer under (`direct`, else `queue`).
 pub fn bars_class(class: Option<&str>) -> &'static str {
     match class {
@@ -3793,6 +3828,11 @@ impl PendingBars {
 }
 thread_local! {
     static PENDING_BARS: RefCell<PendingBars> = RefCell::default();
+}
+/// The pins' view of this isolate's pending samples (FOLD-16, item 5).
+#[cfg(test)]
+pub fn pending_bars_snapshot() -> PendingBars {
+    PENDING_BARS.with(|p| p.borrow().clone())
 }
 /// One answer's samples under its class (this isolate's bars too).
 pub fn note_answer_as(class: &'static str, answer: &Value) {
@@ -4517,11 +4557,14 @@ pub const RECONCILE_MARKS_SQL: &str = "SELECT gameId,MAX(generation) AS generati
 /// The picked games' marks are read first (each game's greatest generation: the games a mark holds, and the bound).
 /// Then BOTH sides judge them at the reconcile's tip (the port's): D1 by the D1 judge (acknowledging nothing), the
 /// actor by a re-apply (its closure re-reads the record: never a stored row), and the two FRESH judgements are
-/// compared. A game holding a mark (at the start, or one written while the two judged, above the bound) is HELD, the
-/// delivery compare's NEW2-L1 partition: its difference counted apart (`owed_actor_compare_held_total`, the line
-/// `RECONCILE DIFF (held mark; not a STOP)`), never a disagreement. What else differs:
-/// - fresh D1 against the fresh actor: a JUDGE DISAGREEMENT (`owed_actor_reconcile_diffs_total`, the STOP);
-/// - the actor's stored rows against its fresh re-apply, outside a held game: only tip-derived
+/// compared. A game holding a mark written WHILE the two judged (above the bound) is HELD, the delivery compare's
+/// NEW2-L1 partition: its difference of the two fresh sides counted apart (`owed_actor_compare_held_total`, the line
+/// `RECONCILE DIFF (held mark; not a STOP)`), never a disagreement. A mark pending at the START is no such reason
+/// (D2-ACTOR-B-FOLD-16, the ninth delta lens's NEW9-M1): both fresh judgements read the record after it, so it
+/// explains only the actor's stored rows against its re-apply (`missed`). What else differs:
+/// - fresh D1 against the fresh actor, on a game no mark was written to while they judged: a JUDGE DISAGREEMENT
+///   (`owed_actor_reconcile_diffs_total`, the STOP), whatever marks the game held at the start;
+/// - the actor's stored rows against its fresh re-apply, outside a game holding a mark (start or during): only tip-derived
 ///   ([`tip_derived_rows`]) is a TIP LAG (`owed_actor_compare_tip_lag_total`, `RECONCILE TIP LAG`); anything else the
 ///   actor MISSED the record (an unmarked write), healed by the re-apply (counted a diff, its games
 ///   `owed_actor_reconcile_republished_total`);
@@ -4557,7 +4600,11 @@ async fn reconcile_fresh(
         )])
         .await?,
     );
-    let mut held: BTreeSet<String> = marks
+    // D2-ACTOR-B-FOLD-16 (NEW9-M1): the games a mark holds at the START explain only the actor's stored rows against
+    // its re-apply (`missed`); both fresh judgements read the record after such a mark, so they never excuse a
+    // difference between the two (`disagree`). Only a mark written WHILE the two judged (`during`, above the bound)
+    // does: the delivery compare's NEW2-L1 rule.
+    let start: BTreeSet<String> = marks
         .iter()
         .filter_map(|m| m["gameId"].as_str().map(str::to_string))
         .collect();
@@ -4628,13 +4675,13 @@ async fn reconcile_fresh(
     }
     let mut out = db.run_batch(stmts).await?.into_iter();
     let fresh_d1 = out.next().map(|o| o.rows).unwrap_or_default();
-    held.extend(
-        out.next()
-            .map(|o| o.rows)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|r| r["gameId"].as_str().map(str::to_string)),
-    );
+    let during: BTreeSet<String> = out
+        .next()
+        .map(|o| o.rows)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| r["gameId"].as_str().map(str::to_string))
+        .collect();
     let judged: BTreeSet<&str> = judge.iter().map(String::as_str).collect();
     let of_judged = |rows: &[Value]| -> Vec<Value> {
         rows.iter()
@@ -4660,14 +4707,18 @@ async fn reconcile_fresh(
             .unwrap_or("?")
             .to_string()
     };
-    let is_held = |o: &String| held.contains(&game_of(o));
+    let held_during = |o: &String| during.contains(&game_of(o));
     let (held_diffs, disagree): (Vec<String>, Vec<String>) =
-        diff_rows(&a, &b).into_iter().partition(is_held);
+        diff_rows(&a, &b).into_iter().partition(held_during);
+    let held_any = |o: &String| {
+        let g = game_of(o);
+        start.contains(&g) || during.contains(&g)
+    };
     let (actor_stored, actor_fresh) = (of_judged(&actor), of_judged(&fresh_actor));
     let actor_lag = tip_derived_rows(&actor_stored, &actor_fresh);
     let missed: Vec<String> = diff_rows(&actor_stored, &actor_fresh)
         .into_iter()
-        .filter(|o| !actor_lag.contains(o) && !is_held(o))
+        .filter(|o| !actor_lag.contains(o) && !held_any(o))
         .collect();
     let (d1_stored, d1_fresh) = (of_judged(&stored), of_judged(&fresh_d1));
     let d1_moved = diff_rows(&d1_stored, &d1_fresh);
@@ -4806,8 +4857,9 @@ async fn reconcile_phase_c(
 /// (`owed_judge::IDENTITY_GAMES_BY_ID_SQL`), judging them with the D1 judge from D1's own evidence and acknowledging
 /// NOTHING (the marks stand for the drain and the consumer, under their own bounds); then `done` and `endedAtMs`. A
 /// deploy with the same version runs nothing: one primary-key read a tick. THE PACE: [`D1_REJUDGE_GAMES_PER_TICK`]
-/// (16 since FOLD-15, ONE judge call; it was 32) a belt alarm (120 s), inside the alarm's existing turn, before the
-/// reconcile: 11,520 games a day, the whale of 1,033 games in about 130 minutes, and at most
+/// (32 by default, two judge calls with the reconcile yielding; the lever sets 0 to 32: FOLD-15) a belt alarm (120
+/// s), inside the alarm's existing turn, before the reconcile: 23,040 games a day at 32, the whale of 1,033 games in
+/// about 65 minutes (11,520 and about 130 minutes at 16), and at most
 /// [`D1_REJUDGE_IDENTITIES_PER_TICK`] identities opened a tick (an identity with no game counts); its cost is the judge's commit (measured by the backfill
 /// tier: about 3,000 rows read per 16 games on a 500-row identity, so at most about 4.3 M rows a day while a run
 /// lasts, none after). A faulted identity is retried the next tick (counted `owed_d1_rejudge_faults_total`) and
@@ -4823,8 +4875,15 @@ pub const D1_REJUDGE_STATE_SQL: &str =
 /// [`D1_REJUDGE_GAMES_PER_TICK`] (32); clamped to [`D1_REJUDGE_GAMES_PER_TICK_MAX`]. `0` PAUSES the walk, its cursor
 /// kept and the stamp serving `paused`. One judge call is 16 games ([`OWED_JUDGE_SUBJECTS_PER_INVOCATION`]), so a
 /// tick makes `ceil(N / 16)` judge calls; a tick that made more than one yields the alarm's reconcile to the next
-/// alarm ([`reconcile_yields`]), so the alarm's one invocation holds the belt tick and AT MOST 32 games of the
-/// re-judge, or the belt tick, one judge call and the reconcile's one (measured: `fold15_c`).
+/// alarm ([`reconcile_yields`]), so the alarm's one invocation holds the belt tick and AT MOST two judge calls of the
+/// re-judge (32 games), or the belt tick, one judge call and the reconcile's one (measured: `fold15_c`). D2-ACTOR-B-FOLD-16
+/// (NEW9-L1): the alarm's drain counts too: a drain that did work (its sweep re-published pairs) holds the re-judge to
+/// ONE judge call and the reconcile yields ([`rejudge_calls_max`]; the worst alarm measured by `fold16_b`).
+///
+/// THE RECONCILE'S READ (the ninth delta lens's NOTE-2): at 32 the re-judge makes two judge calls on nearly every tick
+/// of beta's seats (hundreds of games each), so the reconcile yields almost every tick and a flat
+/// `reconcileDiffs` there means nothing was compared. A Phase B read of `reconcileDiffs` needs the walk paused (`0`)
+/// or at 16 or below, AND `owed_actor_reconcile_compared_total` rising over the read.
 ///
 /// [`OWED_JUDGE_SUBJECTS_PER_INVOCATION`]: crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION
 pub const D1_REJUDGE_GAMES_PER_TICK: usize = 32;
@@ -4850,9 +4909,23 @@ pub fn rejudge_pace(row: Option<&Value>, var: Option<&str>) -> usize {
         .min(D1_REJUDGE_GAMES_PER_TICK_MAX)
 }
 
-/// PURE: does the alarm's reconcile yield to this re-judge tick (it made more than one judge call)?
+/// PURE: does the alarm's reconcile yield to this re-judge tick? It made more than one judge call, or (D2-ACTOR-B-FOLD-16,
+/// NEW9-L1) it made one in an alarm whose drain did work: the drain's statements count as one judge call's in the
+/// invocation's bound, so the alarm holds the belt tick and two of {the drain, a judge call, the reconcile's} at most.
 pub fn reconcile_yields(r: &RejudgeReport) -> bool {
-    r.judge_calls > 1
+    r.judge_calls > 1 || (r.drain_bound && r.judge_calls >= 1)
+}
+
+/// PURE (D2-ACTOR-B-FOLD-16, NEW9-L1): the judge calls a re-judge tick may make at `pace`: `ceil(pace / 16)`, or ONE
+/// when the alarm's drain did work this invocation (the drain's sweep, its publish batch and its direct pass's mark
+/// reads are measured at about 280 statements for a full 64-pair sweep: `fold16_b`).
+pub fn rejudge_calls_max(pace: usize, drain_bound: bool) -> usize {
+    let calls = pace.div_ceil(crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION);
+    if drain_bound {
+        calls.min(1)
+    } else {
+        calls
+    }
 }
 /// D2-ACTOR-B-FOLD-15 (NEW8-M2): the identities OPENED a tick, at most, whether they hold a game or none (each costs
 /// one `next` read and one games page; the state's write rides in the next read): an identity with no game counts.
@@ -4941,10 +5014,14 @@ pub struct RejudgeReport {
     pub judge_calls: usize,
     pub games_per_tick: usize,
     pub paused: bool,
+    /// D2-ACTOR-B-FOLD-16 (NEW9-L1): the alarm's drain did work this invocation (its sweep re-published pairs, or,
+    /// with no queue, it judged subjects), so the re-judge made at most ONE judge call and the reconcile yields.
+    pub drain_bound: bool,
 }
 
 /// One paced tick of D1's re-judge ([`D1_REJUDGE_NAME`]): since FOLD-15 at most [`D1_REJUDGE_IDENTITIES_PER_TICK`]
-/// identities opened and ONE judge call, the state saved after each identity; `None` when nothing runs (Phase C, or the stamp is the
+/// identities opened and `ceil(pace / 16)` judge calls (two at the default 32; one in an alarm whose drain did work,
+/// FOLD-16), the state saved after each identity; `None` when nothing runs (Phase C, or the stamp is the
 /// running version and done).
 pub async fn d1_rejudge_step(db: &impl JudgeDb, now: i64) -> Result<Option<RejudgeReport>, String> {
     d1_rejudge_step_paced(db, now, None).await
@@ -4956,6 +5033,18 @@ pub async fn d1_rejudge_step_paced(
     db: &impl JudgeDb,
     now: i64,
     pace_var: Option<&str>,
+) -> Result<Option<RejudgeReport>, String> {
+    d1_rejudge_step_after_drain(db, now, pace_var, false).await
+}
+
+/// [`d1_rejudge_step_paced`] in the alarm (D2-ACTOR-B-FOLD-16, NEW9-L1): `drain_bound` when the alarm's drain did work
+/// this invocation, so the tick makes at most one judge call ([`rejudge_calls_max`]) and the reconcile yields
+/// ([`reconcile_yields`]).
+pub async fn d1_rejudge_step_after_drain(
+    db: &impl JudgeDb,
+    now: i64,
+    pace_var: Option<&str>,
+    drain_bound: bool,
 ) -> Result<Option<RejudgeReport>, String> {
     if !db.d1_judges() {
         return Ok(None);
@@ -4980,8 +5069,10 @@ pub async fn d1_rejudge_step_paced(
     let mut report = RejudgeReport {
         games_per_tick: pace,
         paused: pace == 0,
+        drain_bound,
         ..Default::default()
     };
+    let calls_max = rejudge_calls_max(pace, drain_bound);
     if pace == 0 {
         // PAUSED: nothing walked, the cursor kept; the stamp says so once (the lever stamps it too).
         if let Some(mut s) = held.filter(|s| s["version"] == JUDGE_VERSION && s["done"] != true) {
@@ -5041,7 +5132,7 @@ pub async fn d1_rejudge_step_paced(
     };
     // D2-ACTOR-B-FOLD-15 (the eighth delta lens's NEW8-M2): bounded by D1 CALLS as well as games. At most
     // [`D1_REJUDGE_IDENTITIES_PER_TICK`] identities are OPENED a tick (each one `next` read and one games page,
-    // whether it holds a game or none) and at most the pace's games (16 a judge call); an identity whose page comes back short
+    // whether it holds a game or none) and at most the pace's games (16 a judge call, `calls_max` calls); an identity whose page comes back short
     // of its size is done with no empty page after it. The state is SAVED AFTER EACH IDENTITY or judge call: its
     // write rides in the next read's batch (no call added), the last in the tick's save, so a tick that dies loses
     // the one identity in flight at most.
@@ -5101,10 +5192,7 @@ pub async fn d1_rejudge_step_paced(
             }
             continue;
         };
-        if report.games >= pace
-            || report.judge_calls
-                >= pace.div_ceil(crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION)
-        {
+        if report.games >= pace || report.judge_calls >= calls_max {
             break;
         }
         let page = (pace - report.games).min(crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION);

@@ -894,7 +894,9 @@ impl OwedActor {
             events.push((Some(at), first, warm_at_birth_of(Some(at), stamp)));
         }
         let visible = event_visibility(now, &events);
-        {
+        // FOLD-16 (item 5): the reconcile's re-apply and the sweep's direct pass sample nothing (`samples_bars`).
+        let samples = samples_bars(body.at_ms, body.class.as_deref());
+        if samples {
             let mut bars = self.bars.borrow_mut();
             bars.apply.note(now.saturating_sub(started));
             if let (true, true, Some(at)) = (report.first_apply, warm_at_birth, body.at_ms) {
@@ -971,7 +973,7 @@ impl OwedActor {
         // NEW5-L5: the object notes its own samples into the fleet's bars (the caller may be gone: a walled direct
         // call), then marks the answer noted so the caller adds no second sample.
         // An apply with no event (the tip alarm's window) is no delivery: its caller notes nothing, nor does it.
-        if body.at_ms.is_some() {
+        if samples {
             note_answer_as(bars_class(body.class.as_deref()), &answer);
             flush_bars(&record, now, false).await;
             answer["noted"] = json!(true);
