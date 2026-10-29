@@ -111,7 +111,7 @@ pub const OWED_BELT: [&str; 8] = [
 /// bsv-low #912 (lane D2-ACTOR-B): the app layer's owed actor (`low_app_layer::owed_actor::COUNTERS`, pinned equal
 /// there): its Phase A compares against the D1 judge, the diffs, its faults, the direct calls, the reconcile.
 /// The last two (Phase C, HIGH-3): the `belt-ask`s the actors published, the belt's finds handed back to an actor.
-pub const OWED_ACTOR: [&str; 28] = [
+pub const OWED_ACTOR: [&str; 29] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -145,6 +145,8 @@ pub const OWED_ACTOR: [&str; 28] = [
     "owed_actor_rejudged_total",
     // D2-ACTOR-E (bsv-low #954): the record reads past an event's own rows (a cold game, a key the mirror lacked).
     "owed_actor_closure_misses_total",
+    // D2-ACTOR-B-FOLD-12 (the seventh delta lens's NEW7-L2): the compares whose only difference was the judged tip.
+    "owed_actor_compare_tip_lag_total",
 ];
 
 /// bsv-low #912: `/health/invariants.owedActor`, the actor's durable totals: the Phase A compares and their diffs,
@@ -180,6 +182,7 @@ pub fn owed_actor_view(counters: &serde_json::Value) -> serde_json::Value {
         "epochResets": n("owed_actor_epoch_resets_total"),
         "deferred": n("owed_actor_deferred_total"),
         "heldDiffs": n("owed_actor_compare_held_total"),
+        "tipLagDiffs": n("owed_actor_compare_tip_lag_total"),
         "tipFaults": n("owed_actor_tip_faults_total"),
         "tipParked": n("owed_actor_tip_parked_total"),
         "schemaPartial": n("owed_actor_schema_partial_total"),

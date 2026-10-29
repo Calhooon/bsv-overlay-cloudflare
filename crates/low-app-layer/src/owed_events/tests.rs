@@ -423,3 +423,312 @@ async fn s956_f2_the_consumer_row_keeps_the_greatest_horizon() {
     );
     assert_eq!(q.matches("horizon=horizon.max(Some(ev.at_ms));").count(), 2);
 }
+
+// ---- D2-ACTOR-B-FOLD-12 (the seventh delta lens's NEW7-M1, NEW7-L1, NEW7-L3) ----
+
+/// Binds every `Bind::Int` as a REAL while held, as the D1 port does (`routes.rs`: `JsValue::from_f64`).
+struct D1Real;
+impl D1Real {
+    fn on() -> Self {
+        crate::pot_hook::tests::INTS_AS_REAL.with(|c| c.set(true));
+        D1Real
+    }
+}
+impl Drop for D1Real {
+    fn drop(&mut self) {
+        crate::pot_hook::tests::INTS_AS_REAL.with(|c| c.set(false));
+    }
+}
+
+/// fold12_a (NEW7-M1): THE SWEPT STAMP BLOCKS ON D1. `s956_b`'s shape and `s956_c`'s, with every integer bound as the
+/// D1 port binds it (a REAL): the stamp is written and read back, so a passed pair is re-published once a pass (0 in
+/// the three ticks the stamp blocks) and a stalled consumer's pair once a long bound (2 in ten ticks). A stamp an
+/// older build stored as a REAL (`{"sweptAtMs":1800000240001.0}`) blocks too (the reader's `ms_of`). RED against
+/// `fd57eb831`'s write and read (`json_object('sweptAtMs',?2)`, `as_i64`): the stored stamp
+/// `{"sweptAtMs":1800000240001.0}`, `left: 3, right: 0`.
+#[tokio::test]
+async fn fold12_a_the_swept_stamp_blocks_on_d1() {
+    let _real = D1Real::on();
+    let db = SqliteSql::migrated();
+    let (s, k) = hop();
+    mark(&db, "g1", &s, &k, T0);
+    let first = T0 + 2 * TICK + 1;
+    consumer_at(&db, T0 + 2 * TICK, first);
+    assert_eq!(
+        sweep(&db, first).await.unwrap(),
+        vec![(s.clone(), k.clone())]
+    );
+    let stored: String = db
+        .conn
+        .query_row(
+            "SELECT cursor FROM owed_belt_state WHERE name LIKE 'owed-events:swept:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut blocked = 0usize;
+    for (h, t) in [
+        (first, first + TICK),
+        (first + TICK / 2, first + 2 * TICK),
+        (first + TICK, first + 3 * TICK),
+    ] {
+        consumer_at(&db, h, t);
+        blocked += sweep(&db, t).await.unwrap().len();
+    }
+    assert_eq!(blocked, 0, "re-published while its stamp blocks ({stored})");
+    // the horizon passed the re-publish: once more
+    let t = first + 4 * TICK;
+    consumer_at(&db, first + TICK + 1, t);
+    assert_eq!(sweep(&db, t).await.unwrap(), vec![(s.clone(), k.clone())]);
+
+    // a stalled consumer (no horizon): ten ticks past the long bound re-publish twice (once a long bound)
+    let db = SqliteSql::migrated();
+    mark(&db, "g1", &s, &k, T0);
+    let mut stalled = 0usize;
+    for n in 0..10i64 {
+        stalled += sweep(&db, T0 + 600_000 + 1 + n * TICK).await.unwrap().len();
+    }
+    assert_eq!(stalled, 2, "a stalled consumer's pair once a long bound");
+
+    // a stamp an older build stored as a REAL blocks
+    let db = SqliteSql::migrated();
+    mark(&db, "g1", &s, &k, T0);
+    let at = first;
+    db.conn
+        .execute_batch(&format!(
+            "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('{}',json_object('sweptAtMs',CAST({at} AS REAL)),CAST({at} AS REAL))",
+            swept_memo_name(&s, &k)
+        ))
+        .unwrap();
+    consumer_at(&db, first, first + TICK);
+    assert!(
+        sweep(&db, first + TICK).await.unwrap().is_empty(),
+        "a REAL stamp blocks"
+    );
+    assert_eq!(
+        ms_of(&json!(1_800_000_240_001.0_f64)),
+        Some(1_800_000_240_001)
+    );
+}
+
+/// fold12_b (NEW7-L1): THE LOST READ AND THE PRUNE READ AT MOST WHAT THEY TAKE. (1) Over the lens's sizes (5,000 lost
+/// notes, 20,000 young stamps) each shipped read is a primary-key range with no sort (`EXPLAIN QUERY PLAN` names no
+/// `TEMP B-TREE`) and its VM steps are bounded by its LIMIT, not the range (printed; the lens measured 40,614 and
+/// 100,023). (2) A lost note held by its fault memo never keeps a newer note out of the tick's 32 places: 32 held
+/// notes, older, then one newer: the cursor passes the held ones and the newer pair is re-published at the second
+/// tick. (3) The prune's window deletes the day-old stamps it reads and wraps. RED against `fd57eb831`'s
+/// `LOST_READ_SQL` at (2): the newer note never read (`ORDER BY tickedAtMs`: the held notes take every place, tick
+/// after tick; `left: [] right: [("hop", "ff..:0")]`). Measured: 238 VM steps for the 32 notes taken of 5,000 and 462
+/// for the 64 stamps read of 20,000 (the lens: 40,614 and 100,023).
+#[tokio::test]
+async fn fold12_b_the_lost_read_and_the_prune_read_at_most_what_they_take() {
+    // (2) first: it uses only `sweep`, as on the base
+    let db = SqliteSql::migrated();
+    let now = T0 + 10 * TICK;
+    for i in 0..32 {
+        let key = format!("{:064x}:0", i + 1);
+        db.conn
+            .execute_batch(&format!(
+                "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:lost:hop {key}','{{\"source\":\"hop\",\"sourceKey\":\"{key}\",\"atMs\":{T0}}}',{T0});
+                 INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:fault:hop {key}','{{\"faults\":3,\"heldUntilMs\":{}}}',{T0})",
+                now + 3_600_000
+            ))
+            .unwrap();
+    }
+    let newer = format!("{}:0", "f".repeat(64));
+    db.conn
+        .execute_batch(&format!(
+            "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:lost:hop {newer}','{{\"source\":\"hop\",\"sourceKey\":\"{newer}\",\"atMs\":{now}}}',{now})"
+        ))
+        .unwrap();
+    let mut got = Vec::new();
+    for n in 0..3 {
+        got.extend(sweep(&db, now + n * TICK).await.unwrap());
+    }
+    assert_eq!(
+        got,
+        vec![("hop".to_string(), newer.clone())],
+        "the newer note is read past the held ones"
+    );
+
+    // (1) the plans and the VM steps over the lens's sizes
+    let db = SqliteSql::migrated();
+    let mut sql = String::from("BEGIN;");
+    for i in 0..5_000 {
+        sql.push_str(&format!(
+            "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:lost:hop {i:064x}:0','{{}}',{});",
+            T0 + i
+        ));
+    }
+    for i in 0..20_000 {
+        sql.push_str(&format!(
+            "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:swept:hop {i:064x}:0','{{}}',{});",
+            T0 + i
+        ));
+    }
+    sql.push_str("COMMIT;");
+    db.conn.execute_batch(&sql).unwrap();
+    let plan = |q: &str, binds: &[rusqlite::types::Value]| -> String {
+        let mut st = db.conn.prepare(&format!("EXPLAIN QUERY PLAN {q}")).unwrap();
+        let rows: Vec<String> = st
+            .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows.join(" | ")
+    };
+    let steps = |q: &str, binds: &[rusqlite::types::Value]| -> (usize, i32) {
+        let mut st = db.conn.prepare(q).unwrap();
+        let n = st
+            .query_map(rusqlite::params_from_iter(binds.iter()), |_| Ok(()))
+            .unwrap()
+            .count();
+        (n, st.get_status(rusqlite::StatementStatus::VmStep))
+    };
+    use rusqlite::types::Value as V;
+    for (q, binds, limit) in [
+        (
+            LOST_READ_SQL,
+            vec![
+                V::Integer(SWEEP_LOST_PER_TICK as i64),
+                V::Text(publish::LOST_MEMO_PREFIX.into()),
+            ],
+            SWEEP_LOST_PER_TICK,
+        ),
+        (
+            SWEPT_WINDOW_SQL,
+            vec![
+                V::Text(SWEPT_MEMO_PREFIX.into()),
+                V::Integer(SWEPT_PRUNE_WINDOW as i64),
+            ],
+            SWEPT_PRUNE_WINDOW,
+        ),
+    ] {
+        let p = plan(q, &binds);
+        assert!(!p.contains("TEMP B-TREE"), "{q}: {p}");
+        assert!(
+            p.contains("PRIMARY KEY") || p.contains("autoindex"),
+            "{q}: {p}"
+        );
+        let (n, vm) = steps(q, &binds);
+        println!("fold12_b: {n} rows, {vm} VM steps, plan {p}: {q}");
+        assert_eq!(n, limit);
+        assert!(vm < 40 * limit as i32, "{q}: {vm} VM steps for {n} rows");
+    }
+
+    // (3) the prune: the window's day-old stamps deleted, a young one kept, the cursor wrapping on a short window
+    let db = SqliteSql::migrated();
+    let late = T0 + 25 * 3_600_000;
+    for i in 0..70 {
+        let at = if i == 5 { late } else { T0 };
+        db.conn
+            .execute_batch(&format!(
+                "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:swept:hop {i:064x}:0','{{}}',{at})"
+            ))
+            .unwrap();
+    }
+    let count = |db: &SqliteSql| {
+        int(
+            db,
+            "SELECT COUNT(*) FROM owed_belt_state WHERE name LIKE 'owed-events:swept:%'",
+        )
+    };
+    sweep(&db, late + 1).await.unwrap();
+    assert_eq!(
+        count(&db),
+        70 - 63,
+        "the first window: 63 of its 64 a day old"
+    );
+    sweep(&db, late + 2).await.unwrap();
+    assert_eq!(
+        count(&db),
+        1,
+        "the second window: the rest, then the cursor wraps"
+    );
+    let cursor: String = db
+        .conn
+        .query_row(
+            "SELECT cursor FROM owed_belt_state WHERE name='owed-events:sweep'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let c: Value = serde_json::from_str(&cursor).unwrap();
+    assert_eq!(c["pruneAfter"], json!(SWEPT_MEMO_PREFIX), "wrapped: {c}");
+}
+
+/// fold12_c (NEW7-L3): EACH IDENTITY'S APPLY CARRIES ITS OWN EVENTS. A batch of two identities with two events each:
+/// each identity's body names its own oldest event and the other in `also`, so the four events are sampled four times
+/// (each by its own first apply in its own actor), never eight, and each sample is that event's own lag. RED against
+/// `coalesced_event_of` answering `coalesced_event` (the base's one context for the whole batch): the first identity's
+/// body carries every other event of the batch (`left: [["pot",13],["pot",12],["pot",11]] right: [["pot",11]]`), so
+/// each identity's fresh actor samples all four: 8.
+#[test]
+fn fold12_c_each_identitys_apply_carries_its_own_also_events() {
+    let ev = |seq: i64, at: i64, key: &str| OwedEvent {
+        v: 1,
+        seq,
+        source: "pot".into(),
+        source_key: format!("{key}:0"),
+        facts: Value::Null,
+        at_ms: at,
+    };
+    let (a1, a2, b1, b2) = (
+        ev(10, 1_000, &"a1".repeat(32)),
+        ev(11, 2_000, &"a2".repeat(32)),
+        ev(12, 1_500, &"b1".repeat(32)),
+        ev(13, 3_000, &"b2".repeat(32)),
+    );
+    let (ida, idb) = (
+        format!("02{}", "a".repeat(64)),
+        format!("03{}", "b".repeat(64)),
+    );
+    let plan_of = |id: &str, game: &str| {
+        let mut p = Plan::default();
+        p.order.push(id.to_string());
+        p.games.insert(id.to_string(), vec![game.to_string()]);
+        p
+    };
+    let (pa1, pa2, pb1, pb2) = (
+        plan_of(&ida, "ga"),
+        plan_of(&ida, "ga"),
+        plan_of(&idb, "gb"),
+        plan_of(&idb, "gb"),
+    );
+    let ctx = coalesced_event_of(&[(&b2, &pb2), (&a1, &pa1), (&b1, &pb1), (&a2, &pa2)]).unwrap();
+    let now = 10_000u64;
+    let mut samples = Vec::new();
+    for (id, own) in [
+        (&ida, [(10, 1_000), (11, 2_000)]),
+        (&idb, [(12, 1_500), (13, 3_000)]),
+    ] {
+        let body = crate::owed_actor::apply_body(id, &["g".to_string()], &ctx, Some(900));
+        assert_eq!(
+            (body["seq"].clone(), body["atMs"].clone()),
+            (json!(own[0].0), json!(own[0].1)),
+            "{id}: its own oldest"
+        );
+        assert_eq!(
+            body["also"],
+            json!([["pot", own[1].0]]),
+            "{id}: only its own other event"
+        );
+        // a fresh actor: every event it carries is a first apply born warm
+        let mut events = vec![(body["atMs"].as_u64(), true, true)];
+        for at in body["alsoAtMs"].as_array().into_iter().flatten() {
+            events.push((at.as_u64(), true, true));
+        }
+        samples.extend(crate::owed_actor::event_visibility(now, &events));
+    }
+    samples.sort_unstable();
+    assert_eq!(
+        samples,
+        vec![7_000, 8_000, 8_500, 9_000],
+        "four samples, each the event's own lag"
+    );
+    // one event's delivery is carried as it stands
+    let one = coalesced_event_of(&[(&a1, &pa1)]).unwrap();
+    assert!(one.by_identity.is_empty() && one.also.is_empty());
+}
