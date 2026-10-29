@@ -495,6 +495,13 @@ struct WithActor {
 }
 impl SqlPort for WithActor {
     async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        // D2-ACTOR-E's e_c: the D1 judge's commits counted (its one write batch holds `GAME_DELETE_SQL`).
+        if stmts
+            .iter()
+            .any(|s| s.sql == crate::owed_judge::GAME_DELETE_SQL)
+        {
+            E_COMMITS.with(|c| c.set(c.get() + 1));
+        }
         self.d1.run_batch(stmts).await
     }
     async fn counters(&self, d: Vec<(String, u64)>) {
@@ -573,6 +580,7 @@ impl WithActor {
         event: Option<(&'static str, i64)>,
         bound: Option<i64>,
     ) -> Result<Option<Value>, String> {
+        E_CALLS.with(|c| c.set(c.get() + 1));
         if self.actor_fails.get() {
             return Err("owed actor: unreachable (pin)".into());
         }
@@ -3726,6 +3734,7 @@ fn fold7_event(kind: &str, seq: i64, games: &[String], at_ms: u64) -> HeldEvent 
         tip: Some(TIP),
         held_at_ms: at_ms,
         bound: None,
+        touch: None,
     }
 }
 
@@ -5028,7 +5037,8 @@ async fn d2_actor_b_fold8_j_phase_a_counts_a_mark_between_the_judges_apart() {
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     let events = squash(include_str!("../owed_events.rs"));
     // D2-ACTOR-D (bsv-low #952): the bound also bounds the D1 judge's acknowledgement and names the actor's seq check.
-    assert!(events.contains(&squash("let bound = owed_judge::marks_bound(db, identity, games).await?; let report = owed_judge::judge_subjects_acked_to(db, identity, games, \"owed-events\", bound).await?;")));
+    // D2-ACTOR-E (bsv-low #954): with the bound, the txids its marks name, told to the actor's delivery.
+    assert!(events.contains(&squash("let (bound, marks_touch) = owed_judge::marks_bound_keys(db, identity, games).await?; db.note_marks_touch(marks_touch); let report = owed_judge::judge_subjects_acked_to(db, identity, games, \"owed-events\", bound).await?;")));
     assert!(events.contains(&squash("if !db.defer_actor(identity, games, Some(bound)) { crate::owed_actor::beside(db, identity, games, Some(bound)).await; }")));
     let actor = squash(include_str!("../owed_actor.rs"));
     assert!(actor.contains(&squash(
@@ -6144,6 +6154,7 @@ async fn fold9_g_a_reconcile_reapply_keeps_the_judged_tip() {
         tip: None,
         held_at_ms: NOW_MS,
         bound: None,
+        touch: None,
     };
     let applied = apply_or_hold(&turn, &record, &local, &Fakes, "owner", &ev, None, false)
         .await
@@ -6319,6 +6330,7 @@ async fn fold10_a_a_stale_tip_direct_apply_never_makes_the_blocks_delivery_a_dup
         tip: None,
         held_at_ms: NOW_MS,
         bound: None,
+        touch: None,
     };
     let turn2 = futures_util::lock::Mutex::new(());
     let a = apply_or_hold(
@@ -6640,6 +6652,7 @@ async fn fold10_f_a_burst_for_one_identity_is_one_call() {
                     seq: n,
                     at_ms: 1,
                     mined: false,
+                    txids: None,
                 },
                 vec![(
                     "owner".into(),
@@ -6831,4 +6844,613 @@ fn fold10_j_a_state_judged_under_another_build_bootstraps_again() {
     assert!(
         actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total'))AScounters")
     );
+}
+
+// ---- D2-ACTOR-E (bsv-low #954): the apply costs the event's own rows; a burst is one judge pass; the consumer
+// coalesces per identity; a cold seat's re-published events never sample the warm bars ----
+
+thread_local! {
+    /// e_c: the actor deliveries and the D1 judge's commits a delivery made ([`WithActor`]).
+    static E_CALLS: Cell<usize> = const { Cell::new(0) };
+    static E_COMMITS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// A record port that yields before every batch, as D1 does (an await that lets another caller in): the burst's
+/// events queue up behind the turn the way they do inside the object.
+struct Yielding<'a>(&'a SqliteSql);
+impl SqlPort for Yielding<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        tokio::task::yield_now().await;
+        self.0.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.0.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.0.log(l);
+    }
+}
+
+/// The stored rows of one game.
+fn stored_game(db: &SqliteSql, identity: &str, game: &str) -> Vec<String> {
+    let mut q = db.conn.prepare("SELECT json_array(outpoint,family,gameId,sats,opponentIdentity,atHeight,facts,reason,claimable,gateHeight,beltDueAtMs,probeTip) FROM owed_rows WHERE identity=?1 AND gameId=?2 ORDER BY outpoint").unwrap();
+    q.query_map([identity, game], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// The 600-game chained seat with its whole closure read (every game warm).
+async fn e_warm_seat(n: usize) -> (SqliteSql, SqliteSql, Vec<String>) {
+    let record = seeded(&fold7_chained_seat(n));
+    let games = games_of(&record, "owner");
+    let local = mirror();
+    for chunk in games.chunks(GAMES_PER_APPLY) {
+        apply(
+            &record,
+            &local,
+            &Fakes,
+            "owner",
+            chunk,
+            Some(("bootstrap", 1)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    (record, local, games)
+}
+
+/// One write to game `k` of the chained seat: its hop's stake confirmed spent (`pot_records` `(H_k, 0)`), the
+/// trigger's mark (or, where the fixture carries no trigger, the mark the trigger writes).
+fn e_write(record: &SqliteSql, games: &[String], k: usize) -> String {
+    let hop = h("b8", k);
+    record
+        .conn
+        .execute(
+            "UPDATE pot_records SET spentConfirmed=1,spentHeight=900001 WHERE txid=?1 AND outputIndex=0",
+            [&hop],
+        )
+        .unwrap();
+    record
+        .conn
+        .execute(
+            "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner',?1,'pot',?2,1) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=(SELECT COALESCE(MAX(generation),0)+1 FROM owed_dirty)",
+            [&games[k], &format!("{hop}:0")],
+        )
+        .unwrap();
+    hop
+}
+
+/// (e_a) A WARM APPLY READS THE EVENT'S OWN ROWS (bsv-low #954 item 1): on FOLD-7's 600-game chained seat, every game
+/// warm, one write to game 300 applied with the txids its event named reads the record in at most 3 statements (the
+/// pending marks, then the event's rows in one compound statement): beta's figure was about 24 statements an apply
+/// (one a family, FOLD-9's), and the base's `apply` of the same event, measured here as `fold9_h` measures it, is 25.
+/// The rows it writes are the rows a cold apply of that game writes from the whole record. New API (`apply_with`,
+/// `ApplyOpts`); on `e99472091` the pin does not compile, and the base's apply of this event reads 25 statements.
+#[tokio::test]
+async fn d2_actor_e_a_a_warm_apply_reads_the_events_rows_under_4_statements() {
+    let (record, local, games) = e_warm_seat(600).await;
+    let hop = e_write(&record, &games, 300);
+    let counted = Counting(&record, Cell::new(0), Cell::new(0));
+    let opts = ApplyOpts {
+        touch: Some(vec![hop.clone()]),
+        ..ApplyOpts::default()
+    };
+    let (report, _) = apply_with(
+        &counted,
+        &local,
+        &Fakes,
+        "owner",
+        &games[300..301],
+        Some(("pot", 2)),
+        Some(TIP),
+        None,
+        &opts,
+    )
+    .await
+    .unwrap();
+    eprintln!(
+        "e_a: one warm apply of one game of 600: record statements {}, record rows answered {}, rounds {}, misses {}, narrowed {}",
+        counted.2.get(),
+        counted.1.get(),
+        report.rounds,
+        report.misses,
+        report.narrowed
+    );
+    assert!(report.narrowed, "the warm game is read narrowly");
+    assert_eq!(
+        report.misses, 0,
+        "the warm mirror held every key the judgement named"
+    );
+    assert!(
+        counted.2.get() < 4,
+        "a warm apply reads under 4 record statements: {}",
+        counted.2.get()
+    );
+    // The full apply (no txids) of the same game: one compound statement a round (it was 24 a round).
+    let full = Counting(&record, Cell::new(0), Cell::new(0));
+    let cold = mirror();
+    let (r, _) = apply(
+        &full,
+        &cold,
+        &Fakes,
+        "owner",
+        &games[300..301],
+        Some(("pot", 2)),
+        Some(TIP),
+        None,
+    )
+    .await
+    .unwrap();
+    eprintln!(
+        "e_a: the same game's cold full apply: record statements {}, rows {}, rounds {}",
+        full.2.get(),
+        full.1.get(),
+        r.rounds
+    );
+    assert_eq!(full.2.get(), r.rounds, "one compound statement a round");
+    // The narrowed judgement is the cold apply's, row for row.
+    assert_eq!(
+        stored_game(&local, "owner", &games[300]),
+        stored_game(&cold, "owner", &games[300])
+    );
+    assert!(!stored_game(&local, "owner", &games[300]).is_empty());
+}
+
+/// (e_a) A cold game, a mark asking for the record (`age`), and a game past its refresh window read the whole closure.
+#[tokio::test]
+async fn d2_actor_e_a_b_cold_and_repair_marks_and_stale_games_read_the_whole_closure() {
+    let (record, local, games) = e_warm_seat(32).await;
+    let touch = ApplyOpts {
+        touch: Some(vec![h("b8", 3)]),
+        ..ApplyOpts::default()
+    };
+    let run = |g: usize| {
+        let (record, local, games, touch) = (&record, &local, &games, &touch);
+        async move {
+            apply_with(
+                record,
+                local,
+                &Fakes,
+                "owner",
+                &games[g..g + 1],
+                None,
+                Some(TIP),
+                None,
+                touch,
+            )
+            .await
+            .unwrap()
+            .0
+        }
+    };
+    assert!(run(3).await.narrowed);
+    // an age mark (the repair's): the record as it stands
+    record
+        .conn
+        .execute(
+            "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner',?1,'age','age',1)",
+            [&games[4]],
+        )
+        .unwrap();
+    assert!(
+        !run(4).await.narrowed,
+        "an age mark reads the whole closure"
+    );
+    // past the refresh window
+    local.now.set(NOW_MS + FULL_REFRESH_EVERY_MS as u64 + 1);
+    let stale = run(5).await;
+    assert!(
+        !stale.narrowed && stale.misses > 0,
+        "a stale game reads the whole closure"
+    );
+    // and is warm again after it
+    assert!(run(5).await.narrowed);
+    // a game the mirror never read
+    let fresh = mirror();
+    let r = apply_with(
+        &record,
+        &fresh,
+        &Fakes,
+        "owner",
+        &games[6..7],
+        None,
+        Some(TIP),
+        None,
+        &touch,
+    )
+    .await
+    .unwrap()
+    .0;
+    assert!(!r.narrowed);
+}
+
+/// (e_a) Phase A's coverage: a narrowed apply records no coverage (the D1 judge acknowledges first, so a later
+/// delivery is applied, never a dupe); Phases B and C (`narrow_covers`) record the marks' bound.
+#[tokio::test]
+async fn d2_actor_e_a_c_a_narrowed_apply_covers_only_where_no_judge_acks_first() {
+    let (record, local, games) = e_warm_seat(32).await;
+    let hop = e_write(&record, &games, 7);
+    let bound = crate::owed_judge::marks_bound(&record, "owner", &games[7..8])
+        .await
+        .unwrap();
+    for (covers, want) in [(false, false), (true, true)] {
+        let opts = ApplyOpts {
+            touch: Some(vec![hop.clone()]),
+            narrow_covers: covers,
+            ..ApplyOpts::default()
+        };
+        local
+            .conn
+            .execute("DELETE FROM applied WHERE kind='covered'", [])
+            .unwrap();
+        let r = apply_with(
+            &record,
+            &local,
+            &Fakes,
+            "owner",
+            &games[7..8],
+            None,
+            Some(TIP),
+            None,
+            &opts,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(r.narrowed);
+        assert_eq!(
+            covered_at(&local, &games[7..8], bound, Some(TIP)).await,
+            want,
+            "narrow_covers {covers}"
+        );
+    }
+}
+
+/// (e_b) A BURST IS ONE JUDGE PASS (bsv-low #954 item 2): 64 events for one identity, each a write to its own game,
+/// arriving while the turn is held, are applied by the object's next turn holder as one pass over the union of their
+/// games: 2 passes for 64 events (the first caller's own, then the 63 that queued behind it), every event answered
+/// exactly (its games, its first apply, its `(kind, seq)` recorded), the rows those of a full apply of every game.
+/// On `e99472091` (no `Burst`) each event is its own apply: 64 passes. The workerd cell
+/// `tools/lane-912/owed_burst_one_identity.mjs` holds the same burst under 1 s each on real workerd.
+#[tokio::test]
+async fn d2_actor_e_b_a_burst_of_64_events_for_one_identity_is_two_judge_passes() {
+    let (record, local, games) = e_warm_seat(64).await;
+    let mut hops = Vec::new();
+    for k in 0..64 {
+        hops.push(e_write(&record, &games, k));
+    }
+    let burst = Burst::default();
+    let turn = futures_util::lock::Mutex::new(());
+    let yielding = Yielding(&record);
+    let calls = (0..64).map(|k| {
+        let item = BurstItem {
+            games: vec![games[k].clone()],
+            kind_seq: Some(("pot".into(), 100 + k as i64)),
+            tip: Some(TIP),
+            bound: None,
+            touch: Some(vec![hops[k].clone()]),
+        };
+        apply_coalesced(
+            &burst, &turn, &yielding, &local, &Fakes, "owner", item, None, false, false,
+        )
+    });
+    let answers = futures_util::future::join_all(calls).await;
+    eprintln!("e_b: 64 events, {} judge passes", burst.passes.get());
+    assert_eq!(burst.events.get(), 64);
+    assert!(
+        burst.passes.get() <= 3,
+        "a burst is a few passes: {}",
+        burst.passes.get()
+    );
+    for (k, a) in answers.into_iter().enumerate() {
+        let (report, _) = a.unwrap();
+        assert_eq!(report.applied_games, vec![games[k].clone()]);
+        assert!(report.first_apply && !report.skipped);
+        assert!(!first_apply_of(&local, Some(("pot", 100 + k as i64)), &games[k..k + 1]).await);
+    }
+    // the rows are a full apply's of every game
+    let full = mirror();
+    for chunk in games.chunks(GAMES_PER_APPLY) {
+        apply(
+            &record,
+            &full,
+            &Fakes,
+            "owner",
+            chunk,
+            None,
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(stored_rows_no_clock(&local), stored_rows_no_clock(&full));
+}
+
+/// The stored rows without the judgement's own clock (`judgedAtMs`).
+fn stored_rows_no_clock(db: &SqliteSql) -> Vec<String> {
+    let mut q = db.conn.prepare("SELECT json_array(outpoint,family,gameId,sats,opponentIdentity,atHeight,facts,reason,claimable,gateHeight,beltDueAtMs,probeTip) FROM owed_rows WHERE identity='owner' ORDER BY outpoint").unwrap();
+    q.query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// (e_c) THE CONSUMER COALESCES PER IDENTITY (bsv-low #954 item 3): eight messages of one batch, each naming one game
+/// of one identity, judged one by one are eight deliveries (eight actor applies, eight D1 judge commits); merged
+/// ([`crate::owed_events::Plan::merged`], the batch's one pass) they are ONE delivery: one actor apply and one D1
+/// judge pass, every mark acknowledged. And the consumer's batch is the renders' `max_batch_size` (pinned). New API;
+/// on `e99472091` the consumer judges each message alone (`max_batch_size = 1`).
+#[tokio::test]
+async fn d2_actor_e_c_a_batch_of_n_events_for_one_identity_is_one_apply_and_one_judge_pass() {
+    let w = WithActor {
+        d1: d1_judge(&fold7_chained_seat(8)).await,
+        actor: mirror(),
+        d1_judges: true,
+        event: Some(("pot", 9)),
+        actor_reads: false,
+        actor_fails: Cell::new(false),
+    };
+    let games = games_of(&w.d1, "owner");
+    let events = |round: usize| -> Vec<overlay_discovery::owed_event::OwedEvent> {
+        (0..8)
+            .map(|k| {
+                let key = format!("e-c-{round}-{k}");
+                d_mark(&w, &games[k], &key);
+                overlay_discovery::owed_event::OwedEvent {
+                    v: 1,
+                    seq: (round * 100 + k) as i64,
+                    source: "pot".into(),
+                    source_key: key,
+                    facts: Value::Null,
+                    at_ms: NOW_MS as i64,
+                }
+            })
+            .collect()
+    };
+    // one by one
+    E_CALLS.with(|c| c.set(0));
+    E_COMMITS.with(|c| c.set(0));
+    for ev in events(1) {
+        let plan = crate::owed_events::plan(&w.d1, &ev).await.unwrap();
+        crate::owed_events::judge_plan(&w, plan).await.unwrap();
+    }
+    let alone = (E_CALLS.with(Cell::get), E_COMMITS.with(Cell::get));
+    // merged
+    let mut plans = Vec::new();
+    for ev in events(2) {
+        plans.push(crate::owed_events::plan(&w.d1, &ev).await.unwrap());
+    }
+    E_CALLS.with(|c| c.set(0));
+    E_COMMITS.with(|c| c.set(0));
+    let routed = crate::owed_events::judge_plan(&w, crate::owed_events::Plan::merged(&plans))
+        .await
+        .unwrap();
+    let merged = (E_CALLS.with(Cell::get), E_COMMITS.with(Cell::get));
+    eprintln!("e_c: 8 messages for one identity: alone {alone:?} (actor applies, D1 commits), coalesced {merged:?}");
+    assert_eq!(alone, (8, 8));
+    assert_eq!(merged, (1, 1), "one apply and one judge pass");
+    assert_eq!(routed.subjects, 8);
+    assert_eq!(d_marks(&w), 0, "every mark acknowledged");
+    // The batch the consumer takes is the renders' `max_batch_size`.
+    let toml = include_str!("../../wrangler.toml");
+    let sizes: Vec<&str> = toml
+        .split("queues.consumers]]")
+        .skip(1)
+        .filter(|b| {
+            matches!(
+                b.lines().find(|l| l.starts_with("queue = ")),
+                Some("queue = \"low-owed-events\"" | "queue = \"low-owed-events-beta\"")
+            )
+        })
+        .map(|b| {
+            b.lines()
+                .find(|l| l.starts_with("max_batch_size"))
+                .unwrap_or("")
+        })
+        .collect();
+    assert_eq!(sizes.len(), 2, "{sizes:?}");
+    for s in sizes {
+        assert_eq!(
+            s,
+            format!(
+                "max_batch_size = {}",
+                crate::owed_events::CONSUMER_BATCH_MAX
+            ),
+            "the consumer's batch"
+        );
+    }
+}
+
+/// (e_d) A COLD SEAT'S RE-PUBLISHED EVENTS NEVER SAMPLE THE WARM BARS (bsv-low #954 item 4): the actor's answer
+/// carries `warmAtBirth`, true only for an event written at or after its bootstrap's stamp; the bars' one rule
+/// (`samples_visible`, read by the object and by the consumer's and the direct pass's notes) samples nothing for an
+/// event born while the actor held: the sweep's re-publish of a held mark (written before the stamp, applied after
+/// it) adds nothing to `rowsVisible` or the backstop's lag, an event written after it samples as before. RED on
+/// `e99472091` (no `warmAtBirth`): the re-published event's 364 s lag sampled into the queue class.
+#[tokio::test]
+async fn d2_actor_e_d_a_cold_seats_republished_events_sample_nothing_warm() {
+    let record = seeded(&fold7_chained_seat(20));
+    let games = games_of(&record, "owner");
+    let local = mirror();
+    let turn = futures_util::lock::Mutex::new(());
+    let held_at = NOW_MS;
+    let ev = fold7_event("pot", 50, &games[0..1], held_at);
+    assert!(matches!(
+        apply_or_hold(&turn, &record, &local, &Fakes, "owner", &ev, None, false)
+            .await
+            .unwrap(),
+        Applied::Held { .. }
+    ));
+    local.now.set(NOW_MS + 30_000);
+    let (pages, _, drain) = fold7_bootstrap(&turn, &record, &local, "owner").await;
+    assert!(pages >= 1 && !drain.applied.is_empty());
+    let stamp: u64 = fold7_meta(&local, "bootstrapped").unwrap().parse().unwrap();
+    assert!(stamp >= NOW_MS + 30_000);
+    // the sweep's re-publish of the held mark, written while the actor held, applied now (its queue lag 364 s)
+    let republished = fold7_event("pot", 51, &games[0..1], held_at + 1_000);
+    let Applied::Done(report, _) = apply_or_hold(
+        &turn,
+        &record,
+        &local,
+        &Fakes,
+        "owner",
+        &republished,
+        None,
+        false,
+    )
+    .await
+    .unwrap() else {
+        panic!("a bootstrapped actor applies");
+    };
+    let mut answer = answer_of(&report, Vec::new());
+    answer["atMs"] = json!(held_at + 1_000);
+    answer["judgedAtMs"] = json!(held_at + 365_000);
+    answer["warmAtBirth"] = json!(warm_at_birth(Some(held_at + 1_000), Some(stamp)));
+    assert!(report.first_apply, "its first apply");
+    assert!(
+        !samples_visible(&answer),
+        "a held-era event samples nothing warm"
+    );
+    let mut bars = Bars::default();
+    note_answer_into(&mut bars, &answer);
+    assert_eq!(bars.visible.samples.len(), 0, "rowsVisible untouched");
+    // an event written after the stamp samples as before
+    let warm = fold7_event("pot", 52, &games[1..2], stamp + 10);
+    let Applied::Done(report, _) =
+        apply_or_hold(&turn, &record, &local, &Fakes, "owner", &warm, None, false)
+            .await
+            .unwrap()
+    else {
+        panic!("applies");
+    };
+    let mut answer = answer_of(&report, Vec::new());
+    answer["atMs"] = json!(stamp + 10);
+    answer["judgedAtMs"] = json!(stamp + 200);
+    answer["warmAtBirth"] = json!(warm_at_birth(Some(stamp + 10), Some(stamp)));
+    assert!(samples_visible(&answer));
+    note_answer_into(&mut bars, &answer);
+    assert_eq!(bars.visible.samples.len(), 1);
+    // an older build's answer (no field) samples as before; an actor with no stamp too
+    assert!(warm_at_birth(Some(1), None) && warm_at_birth(None, Some(5)));
+    // the object computes it from its stamp before sampling (source pin: wasm32 only)
+    let object = include_str!("object.rs")
+        .split_whitespace()
+        .collect::<String>();
+    assert!(object.contains(
+        &"if let (true, true, Some(at)) = (report.first_apply, warm_at_birth, body.at_ms) {"
+            .split_whitespace()
+            .collect::<String>()
+    ));
+}
+
+/// (e_e) A BOOTSTRAP PAGE AT THE APPLY'S COST (bsv-low #954 item 5): one page of 16 games of FOLD-7's chained seat
+/// reads the record in one statement a closure round (it was 24 a round, about 4.8 s a page on beta's D1), the
+/// page's games list beside it. Printed for the REPORT with the rows. On `e99472091` the same page reads 24
+/// statements a round (`fold9_h`'s shape).
+#[tokio::test]
+async fn d2_actor_e_e_a_bootstrap_page_reads_under_4_statements() {
+    let record = seeded(&fold7_chained_seat(600));
+    let local = mirror();
+    let turn = futures_util::lock::Mutex::new(());
+    let counted = Counting(&record, Cell::new(0), Cell::new(0));
+    let step = bootstrap_step(
+        &turn,
+        &counted,
+        &local,
+        &Fakes,
+        "owner",
+        Some(object::BOOT_CURSOR_START),
+        Some(TIP),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(step, BootStep::Page { .. }), "{step:?}");
+    eprintln!(
+        "e_e: one bootstrap page of 16 games: record statements {}, rows answered {}",
+        counted.2.get(),
+        counted.1.get()
+    );
+    assert!(
+        counted.2.get() < 4,
+        "a page reads under 4 record statements: {}",
+        counted.2.get()
+    );
+}
+
+/// A record port that answers D1's value bound (`SQLITE_TOOBIG`) for any statement aggregating `fault_on`'s rows.
+struct TooBig<'a>(&'a SqliteSql, &'static str, Cell<usize>);
+impl SqlPort for TooBig<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        if stmts.iter().any(|s| {
+            s.sql.contains("json_group_array") && s.sql.contains(&format!("FROM {} t", self.1))
+        }) {
+            self.2.set(self.2.get() + 1);
+            return Err("D1_ERROR: string or blob too big: SQLITE_TOOBIG".into());
+        }
+        self.0.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.0.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.0.log(l);
+    }
+}
+
+/// (e_e) THE READ IS A STATEMENT D1 ACCEPTS (found by the burst cell's first workerd run: a 25-arm `UNION ALL` is
+/// refused, "too many terms in compound SELECT", D1's bound is 5): the round's read is one SELECT of one scalar
+/// subquery a family, no compound at its top, every inner compound at most 3 terms, under D1's 100 KB statement
+/// bound. A family whose rows pass D1's 2 MB value bound falls back, the BEEF families row by row (one compound of 2
+/// terms), then one statement a family, and the judgement is the same.
+#[tokio::test]
+async fn d2_actor_e_e_b_the_read_is_one_statement_d1_accepts_and_falls_back_past_a_value_bound() {
+    let all: Vec<usize> = (0..FAMILIES.len()).collect();
+    let sql = aggregate_select(true, &all);
+    assert!(sql.len() < 100_000, "{} bytes", sql.len());
+    assert!(!sql.contains("UNION ALL"));
+    for f in FAMILIES {
+        assert!(selection(f).matches(" UNION ").count() < 5, "{}", f.table);
+    }
+    let beefs: Vec<usize> = all.iter().copied().filter(|n| FAMILIES[*n].beef).collect();
+    assert!(beefs.len() <= 5 && rows_select(&beefs).matches(" UNION ALL ").count() < 5);
+    let record = seeded(&fold7_chained_seat(20));
+    let games = games_of(&record, "owner");
+    let want = mirror();
+    apply(
+        &record,
+        &want,
+        &Fakes,
+        "owner",
+        &games,
+        None,
+        Some(TIP),
+        None,
+    )
+    .await
+    .unwrap();
+    for (table, falls) in [("pot_beefs", 1), ("pot_records", 2)] {
+        let port = TooBig(&record, table, Cell::new(0));
+        let got = mirror();
+        apply(&port, &got, &Fakes, "owner", &games, None, Some(TIP), None)
+            .await
+            .unwrap();
+        assert!(port.2.get() >= falls, "{table}: {} refusals", port.2.get());
+        assert_eq!(
+            stored_rows_no_clock(&got),
+            stored_rows_no_clock(&want),
+            "{table}"
+        );
+    }
 }

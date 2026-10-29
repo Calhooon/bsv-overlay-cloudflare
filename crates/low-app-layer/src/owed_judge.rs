@@ -231,6 +231,10 @@ pub trait JudgeDb: SqlPort {
     fn defer_actor(&self, _identity: &str, _games: &[String], _bound: Option<i64>) -> bool {
         false
     }
+    /// D2-ACTOR-E (bsv-low #954): Phase A's D1 judge tells its actor deliveries the txids of the marks it is about
+    /// to acknowledge (`None`: a mark asks for the whole closure), so the actor's narrowed apply, deferred or inline,
+    /// reads their rows itself. The default keeps nothing (no actor bound).
+    fn note_marks_touch(&self, _marks_touch: Option<Vec<String>>) {}
     /// The write time of the event this judge serves (the actor's own oldest-unapplied age, MEDIUM-7).
     fn event_at_ms(&self) -> Option<u64> {
         None
@@ -307,6 +311,9 @@ pub struct D1Judge {
     event: Option<crate::owed_actor::EventCtx>,
     d1_judges: bool,
     actor_reads: bool,
+    /// D2-ACTOR-E: the txids of the marks this delivery's D1 judge acknowledges ([`JudgeDb::note_marks_touch`]);
+    /// `Some(None)`: a mark asked for the whole closure.
+    marks_touch: std::cell::RefCell<Option<Option<Vec<String>>>>,
 }
 impl D1Judge {
     pub fn new(env: &worker::Env, tip: Option<u64>, era_ms: Option<i64>) -> worker::Result<Self> {
@@ -315,6 +322,7 @@ impl D1Judge {
             tip,
             era_ms,
             event: None,
+            marks_touch: std::cell::RefCell::new(None),
             d1_judges: crate::owed_actor::d1_judge_on(
                 env.var(crate::owed_actor::D1_JUDGE_FLAG)
                     .ok()
@@ -331,6 +339,23 @@ impl D1Judge {
     pub fn with_event(mut self, event: crate::owed_actor::EventCtx) -> Self {
         self.event = Some(event);
         self
+    }
+    /// D2-ACTOR-E: the event as its actor delivery carries it: its own txids and those of the marks the D1 judge
+    /// acknowledges ([`JudgeDb::note_marks_touch`]); `None` txids (the whole closure) when either asks for it.
+    fn delivered_event(&self) -> Option<crate::owed_actor::EventCtx> {
+        let mut event = self.event.clone()?;
+        if let Some(marks) = self.marks_touch.borrow().clone() {
+            event.txids = match (event.txids.take(), marks) {
+                (Some(mut t), Some(more)) => {
+                    t.extend(more);
+                    t.sort();
+                    t.dedup();
+                    Some(t)
+                }
+                _ => None,
+            };
+        }
+        Some(event)
     }
 }
 impl SqlPort for D1Judge {
@@ -357,8 +382,11 @@ impl JudgeDb for D1Judge {
     fn actor_reads(&self) -> bool {
         self.actor_reads
     }
+    fn note_marks_touch(&self, marks_touch: Option<Vec<String>>) {
+        *self.marks_touch.borrow_mut() = Some(marks_touch);
+    }
     fn defer_actor(&self, identity: &str, games: &[String], bound: Option<i64>) -> bool {
-        let Some(event) = &self.event else {
+        let Some(event) = self.delivered_event() else {
             return false;
         };
         if self.actor_reads || crate::owed_actor::object::stub_of(&self.sql.env, identity).is_none()
@@ -368,7 +396,7 @@ impl JudgeDb for D1Judge {
         crate::owed_actor::defer(crate::owed_actor::Deferred {
             identity: identity.to_ascii_lowercase(),
             games: games.to_vec(),
-            event: event.clone(),
+            event,
             tip: self.tip,
             era_ms: self.era_ms,
             bound,
@@ -393,13 +421,13 @@ impl JudgeDb for D1Judge {
         games: &[String],
         bound: Option<i64>,
     ) -> Result<Option<Value>, String> {
-        let Some(event) = &self.event else {
+        let Some(event) = self.delivered_event() else {
             return Ok(None);
         };
         if crate::owed_actor::object::stub_of(&self.sql.env, identity).is_none() {
             return Ok(None);
         }
-        let mut body = crate::owed_actor::apply_body(identity, games, event, self.tip);
+        let mut body = crate::owed_actor::apply_body(identity, games, &event, self.tip);
         body["bound"] = json!(bound);
         crate::owed_actor::object::call_apply(
             &self.sql.env,
@@ -447,6 +475,7 @@ impl JudgeDb for D1Judge {
             seq: 0,
             at_ms: worker::Date::now().as_millis() as i64,
             mined: false,
+            txids: None,
         };
         // bsv-low #953 item 6: every apply the belt's port makes carries the served tip (the consumer's own).
         let tip = match self.tip {
@@ -653,6 +682,17 @@ pub async fn marks_bound(
     identity: &str,
     games: &[String],
 ) -> Result<i64, String> {
+    Ok(marks_bound_keys(db, identity, games).await?.0)
+}
+
+/// D2-ACTOR-E (bsv-low #954): [`marks_bound`] and the txids its marks name (their source keys), `None` when a mark
+/// of `owed_actor::FULL_SOURCES` asks for the record as it stands. Phase A's deferred actor apply is told them: the
+/// D1 judge acknowledges these marks before the actor reads, so its narrowed read must read their rows itself.
+pub async fn marks_bound_keys(
+    db: &impl SqlPort,
+    identity: &str,
+    games: &[String],
+) -> Result<(i64, Option<Vec<String>>), String> {
     let marks: Vec<Value> = hydrate::read(
         db,
         MARKS_SQL,
@@ -668,11 +708,21 @@ pub async fn marks_bound(
         ],
     )
     .await?;
-    Ok(marks
+    let bound = marks
         .iter()
         .filter_map(|m| m["generation"].as_i64())
         .max()
-        .unwrap_or(0))
+        .unwrap_or(0);
+    let full = marks
+        .iter()
+        .any(|m| crate::owed_actor::FULL_SOURCES.contains(&m["source"].as_str().unwrap_or("")));
+    let mut keys = std::collections::BTreeSet::new();
+    for m in &marks {
+        if let Some(k) = m["sourceKey"].as_str() {
+            crate::owed_actor::txids_in(k, &mut keys);
+        }
+    }
+    Ok((bound, (!full).then(|| keys.into_iter().collect())))
 }
 
 /// Source statements run first in the ONE atomic batch. `apply` receives all selected subjects' inputs;

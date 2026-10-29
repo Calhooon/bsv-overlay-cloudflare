@@ -111,7 +111,7 @@ pub const OWED_BELT: [&str; 8] = [
 /// bsv-low #912 (lane D2-ACTOR-B): the app layer's owed actor (`low_app_layer::owed_actor::COUNTERS`, pinned equal
 /// there): its Phase A compares against the D1 judge, the diffs, its faults, the direct calls, the reconcile.
 /// The last two (Phase C, HIGH-3): the `belt-ask`s the actors published, the belt's finds handed back to an actor.
-pub const OWED_ACTOR: [&str; 27] = [
+pub const OWED_ACTOR: [&str; 28] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -143,6 +143,8 @@ pub const OWED_ACTOR: [&str; 27] = [
     "owed_actor_direct_walls_total",
     // D2-ACTOR-B-FOLD-10: the bootstrapped actors whose state another build judged, re-armed from the start.
     "owed_actor_rejudged_total",
+    // D2-ACTOR-E (bsv-low #954): the record reads past an event's own rows (a cold game, a key the mirror lacked).
+    "owed_actor_closure_misses_total",
 ];
 
 /// bsv-low #912: `/health/invariants.owedActor`, the actor's durable totals: the Phase A compares and their diffs,
@@ -162,6 +164,7 @@ pub fn owed_actor_view(counters: &serde_json::Value) -> serde_json::Value {
         "directCalls": n("owed_actor_direct_calls_total"),
         "directFaults": n("owed_actor_direct_faults_total"),
         "directWalls": n("owed_actor_direct_walls_total"),
+        "closureMisses": n("owed_actor_closure_misses_total"),
         "reconcile": {
             "compared": n("owed_actor_reconcile_compared_total"),
             "diffs": n("owed_actor_reconcile_diffs_total"),
@@ -368,6 +371,7 @@ pub fn owed_events_view(
         "faultHeld": c("owed_events_fault_held_total"),
         "sweepHeld": c("owed_events_sweep_held_total"),
         "allHeld": c("owed_events_all_held_total"),
+        "coalescedBatches": c("owed_events_coalesced_batches_total"),
         "subjectFaults": c("owed_events_subject_faults_total"),
         "subjectHeld": c("owed_events_subject_held_total"),
         "consumerWallDrops": c("owed_events_consumer_wall_drops_total"),

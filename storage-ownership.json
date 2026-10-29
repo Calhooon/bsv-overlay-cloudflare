@@ -164,10 +164,12 @@
   {
    "file": "crates/low-app-layer/src/owed_actor.rs",
    "op": "SELECT",
-   "count": 8,
+   "count": 10,
    "crate": "low-app-layer",
    "statements": [
     "json_each(?5) k CROSS JOIN {} t ON t.outpoint>=k.value AND t.outpoint<k.value||'~'",
+    "(SELECT json_group_array(json(r)) FROM (SELECT DISTINCT {} AS r FROM {})) AS f{n}",
+    "SELECT DISTINCT {n} AS f,{} AS r FROM {}",
     "SELECT rowid FROM {} WHERE {i}=?1 AND {g} IN (SELECT value FROM json_each(?2))",
     "SELECT rowid FROM {} WHERE {g} IN (SELECT value FROM json_each(?2))",
     "SELECT rowid FROM {} WHERE {c} IN (SELECT value FROM json_each(?3))",

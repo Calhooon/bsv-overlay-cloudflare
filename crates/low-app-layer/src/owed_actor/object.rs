@@ -254,6 +254,10 @@ pub struct ApplyBody {
     /// (the first-apply rule's key), beside the body's own.
     #[serde(default)]
     pub also: Vec<(String, i64)>,
+    /// D2-ACTOR-E (bsv-low #954): the txids the event's write named (its source key and its facts): over warm games
+    /// the apply reads exactly those rows ([`apply_with`]). Absent: the whole closure (an older caller, a tip alarm).
+    #[serde(default)]
+    pub txids: Option<Vec<String>>,
 }
 
 #[durable_object]
@@ -263,6 +267,8 @@ pub struct OwedActor {
     /// MEDIUM-2: the in-object serial queue. Every apply (its closure's outside reads included) takes the turn, so an
     /// event arriving meanwhile is applied after it, never interleaved at an await.
     turn: futures_util::lock::Mutex<()>,
+    /// D2-ACTOR-E: the events waiting for the turn, applied as one judge pass by its next holder.
+    burst: Burst,
     ready: RefCell<bool>,
     /// HIGH-4: this isolate rebuilt the actor under a new digest; its bootstrap's alarm is set at the next await.
     rebuilt: RefCell<bool>,
@@ -278,6 +284,7 @@ impl DurableObject for OwedActor {
             state,
             env,
             turn: futures_util::lock::Mutex::new(()),
+            burst: Burst::default(),
             ready: RefCell::new(false),
             rebuilt: RefCell::new(false),
             schema_partial: RefCell::new(false),
@@ -366,7 +373,10 @@ impl DurableObject for OwedActor {
                 }))
             }
             (Method::Get, "/bars") => {
-                Response::from_json(&self.bars.borrow().served(Date::now().as_millis()))
+                let mut bars = self.bars.borrow().served(Date::now().as_millis());
+                bars["burst"] =
+                    json!({"passes": self.burst.passes.get(), "events": self.burst.events.get()});
+                Response::from_json(&bars)
             }
             (Method::Post, "/reset") => {
                 let _turn = self.turn.lock().await;
@@ -436,6 +446,7 @@ impl DurableObject for OwedActor {
                         bound: None,
                         class: None,
                         also: Vec::new(),
+                        txids: None,
                     };
                     async move {
                         self.apply_route(body)
@@ -799,10 +810,12 @@ impl OwedActor {
             tip: body.tip,
             held_at_ms: started,
             bound: body.bound,
+            touch: body.txids.clone(),
         };
         // D2-ACTOR-B-FOLD-7: an actor without `bootstrapped` holds the event and arms its bootstrap (never a closure
         // over a mirror the bootstrap has not filled); a bootstrapped one whose closure meets its bound re-arms.
-        let applied = apply_or_hold(
+        let applied = apply_or_hold_in(
+            Some((&self.burst, self.narrow_covers())),
             &self.turn,
             &record,
             &local,
@@ -852,10 +865,23 @@ impl OwedActor {
             answer["ackSeq"] = json!(self.meta(META_ACK));
             return Response::from_json(&answer);
         }
+        if report.misses > 0 {
+            record
+                .counters(vec![(COUNTERS[27].into(), report.misses as u64)])
+                .await;
+        }
+        // D2-ACTOR-E item 4: the rows' visibility is sampled only for an event born on a WARM actor (written after
+        // its bootstrap's stamp): a held event's drain is the cold bar's, and an event the sweep re-published while
+        // the actor held (or that waited out its bootstrap in the queue) is the cold path's, never a warm sample.
+        let warm_at_birth = warm_at_birth(
+            body.at_ms,
+            self.meta(META_BOOTSTRAPPED)
+                .and_then(|v| v.parse::<u64>().ok()),
+        );
         {
             let mut bars = self.bars.borrow_mut();
             bars.apply.note(now.saturating_sub(started));
-            if let (true, Some(at)) = (report.first_apply, body.at_ms) {
+            if let (true, true, Some(at)) = (report.first_apply, warm_at_birth, body.at_ms) {
                 bars.visible.note(now.saturating_sub(at));
                 if body.mined {
                     bars.collect_after_mined.note(now.saturating_sub(at));
@@ -921,6 +947,7 @@ impl OwedActor {
         answer["mined"] = json!(body.mined);
         answer["applyMs"] = json!(now.saturating_sub(started));
         answer["ackSeq"] = json!(self.meta(META_ACK));
+        answer["warmAtBirth"] = json!(warm_at_birth);
         // NEW5-L5: the object notes its own samples into the fleet's bars (the caller may be gone: a walled direct
         // call), then marks the answer noted so the caller adds no second sample.
         // An apply with no event (the tip alarm's window) is no delivery: its caller notes nothing, nor does it.
@@ -930,6 +957,12 @@ impl OwedActor {
             answer["noted"] = json!(true);
         }
         Response::from_json(&answer)
+    }
+
+    /// D2-ACTOR-E: a narrowed apply records its coverage only in Phases B and C ([`ApplyOpts::narrow_covers`]).
+    fn narrow_covers(&self) -> bool {
+        let var = |n: &str| self.env.var(n).ok().map(|v| v.to_string());
+        !d1_judge_on(var(D1_JUDGE_FLAG)) || flag_on(var(READ_FLAG))
     }
 
     /// NEW2-L5: an apply that landed clears its games' carried tip faults.

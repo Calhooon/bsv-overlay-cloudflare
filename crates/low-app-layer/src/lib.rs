@@ -372,7 +372,7 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
     ctx.wait_until(backfill);
 }
 
-/// bsv-low #911 (D2-ACTOR-A): the `owed-events` queue's consumer (`max_batch_size = 1`, `max_batch_timeout = 0`) and
+/// bsv-low #911 (D2-ACTOR-A): the `owed-events` queue's consumer (`max_batch_size = 16` since D2-ACTOR-E, `max_batch_timeout = 0`) and
 /// its dead letter queue's park (`owed_events::queue`).
 #[event(queue)]
 pub async fn queue(

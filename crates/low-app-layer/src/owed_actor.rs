@@ -730,6 +730,13 @@ pub struct ApplyReport {
     /// D2-ACTOR-D: the event's FIRST apply at this actor (no `applied` row of its `(kind, seq)` for these games; an
     /// event with no seq is its own). Only a first apply samples the rows' visibility: once per event.
     pub first_apply: bool,
+    /// D2-ACTOR-E: the record reads past the event's own (a cold game's whole closure, a key a warm mirror had not
+    /// read): `owed_actor_closure_misses_total`.
+    pub misses: usize,
+    /// D2-ACTOR-E: the apply read the event's rows over a warm mirror ([`apply_with`]).
+    pub narrowed: bool,
+    /// D2-ACTOR-E: the judge passes the burst this event rode took (0: applied alone, [`apply_burst`]).
+    pub coalesced: usize,
 }
 
 /// The decoded facts of a copied BEEF row: the pot's own (`pot`, `pot_beefs` only) and the stored order's.
@@ -757,24 +764,205 @@ fn facts_rows(
     }
 }
 
-/// One round's record read: every family's selection over the closure's keys, ONE batch.
+/// D2-ACTOR-E (bsv-low #954): the most arguments one `json_array` call takes in the record's read (D1 caps a SQL
+/// function at 32 arguments; `pot_records_evicted` has 37 columns, so a row is an array of arrays of at most this).
+pub const COMPOUND_ARGS_PER_CALL: usize = 30;
+
+/// The positional value expressions of one family's row in the record's read: the rowid, each column (a blob as hex,
+/// a BEEF column skipped), then the BEEF's hex; and their names (the row's keys once parsed).
+fn compound_columns(f: &Family) -> (Vec<String>, Vec<String>) {
+    let mut exprs = vec!["t.rowid".to_string()];
+    let mut names = vec!["__rowid".to_string()];
+    for c in schema::columns(f.table) {
+        if f.beef && *c == "beef" {
+            continue;
+        }
+        exprs.push(if schema::is_blob(f.table, c) {
+            format!("hex(t.{c})")
+        } else {
+            format!("t.{c}")
+        });
+        names.push((*c).to_string());
+    }
+    if f.beef {
+        exprs.push("hex(t.beef)".into());
+        names.push("__beef".into());
+    }
+    (exprs, names)
+}
+
+/// One family's row as nested JSON arrays ([`COMPOUND_ARGS_PER_CALL`] arguments a call).
+fn row_json(f: &Family) -> String {
+    let (exprs, _) = compound_columns(f);
+    let calls: Vec<String> = exprs
+        .chunks(COMPOUND_ARGS_PER_CALL)
+        .map(|c| format!("json_array({})", c.join(",")))
+        .collect();
+    format!("json_array({})", calls.join(","))
+}
+
+/// The marks' bound column of the record's read: the greatest generation of the games' marks, read in the SAME
+/// statement (one snapshot) as the rows (D2-ACTOR-D's coverage).
+pub const BOUND_COLUMN: &str = "(SELECT MAX(generation) FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))) AS b";
+
+/// D2-ACTOR-E (bsv-low #954): ONE record statement for the families of a round (it was one statement a family, 24):
+/// each family's selection a scalar subquery answering its rows as one JSON array (`f<n>`, `n` its index in
+/// [`FAMILIES`]); with `bound` the marks' bound beside them. No compound SELECT (D1 refuses one past 5 terms).
+pub fn aggregate_select(bound: bool, families: &[usize]) -> String {
+    let mut cols: Vec<String> = Vec::new();
+    if bound {
+        cols.push(BOUND_COLUMN.into());
+    }
+    for &n in families {
+        let f = &FAMILIES[n];
+        cols.push(format!(
+            "(SELECT json_group_array(json(r)) FROM (SELECT DISTINCT {} AS r FROM {})) AS f{n}",
+            row_json(f),
+            selection(f)
+        ));
+    }
+    format!("SELECT {}", cols.join(","))
+}
+
+/// The per-row read of the BEEF families (at most 5 arms: D1's compound bound), the fallback when a family's rows
+/// together pass D1's 2 MB value bound.
+pub fn rows_select(families: &[usize]) -> String {
+    families
+        .iter()
+        .map(|&n| {
+            let f = &FAMILIES[n];
+            format!(
+                "SELECT DISTINCT {n} AS f,{} AS r FROM {}",
+                row_json(f),
+                selection(f)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
+/// A family's row read back: the nested arrays flattened onto the family's column names.
+fn row_of(names: &[String], r: &Value) -> Value {
+    let flat: Vec<Value> = r
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .flat_map(|c| c.as_array().cloned().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut obj = serde_json::Map::new();
+    for (name, v) in names.iter().zip(flat) {
+        obj.insert(name.clone(), v);
+    }
+    Value::Object(obj)
+}
+
+fn json_of(v: &Value) -> Result<Value, String> {
+    match v {
+        Value::String(s) => serde_json::from_str(s).map_err(|e| format!("owed actor: {e}")),
+        Value::Null => Ok(Value::Array(Vec::new())),
+        other => Ok(other.clone()),
+    }
+}
+
+/// Does a record fault say a value passed D1's bound (`SQLITE_TOOBIG`)?
+fn too_big(e: &str) -> bool {
+    e.contains("TOOBIG") || e.contains("too big")
+}
+
+/// One round's record read: every family's selection over the closure's keys in ONE statement
+/// ([`aggregate_select`]); with `bound` the marks' bound beside the rows. A family's rows past D1's 2 MB value bound
+/// fall back: the BEEF families row by row beside the others aggregated (two statements), then one statement a family.
 async fn read_round(
     record: &impl SqlPort,
     me: &str,
     games: &[String],
     keys: &Keys,
-) -> Result<Vec<Vec<Value>>, String> {
+    bound: bool,
+) -> Result<(Vec<Vec<Value>>, Option<i64>), String> {
     let binds = keys.binds(me, games);
-    let stmts = FAMILIES
+    let names: Vec<Vec<String>> = FAMILIES.iter().map(|f| compound_columns(f).1).collect();
+    let all: Vec<usize> = (0..FAMILIES.len()).collect();
+    let mut out: Vec<Vec<Value>> = vec![Vec::new(); FAMILIES.len()];
+    let take_aggregate = |row: &Value, families: &[usize], out: &mut Vec<Vec<Value>>| {
+        for &n in families {
+            let rows = json_of(&row[format!("f{n}")])?;
+            for r in rows.as_array().into_iter().flatten() {
+                out[n].push(row_of(&names[n], r));
+            }
+        }
+        Ok::<Option<i64>, String>(if bound {
+            Some(row["b"].as_i64().unwrap_or(0))
+        } else {
+            None
+        })
+    };
+    match record
+        .run_batch(vec![fitted(aggregate_select(bound, &all), &binds)])
+        .await
+    {
+        Ok(o) => {
+            let row = o
+                .into_iter()
+                .next()
+                .and_then(|o| o.rows.into_iter().next())
+                .unwrap_or(Value::Null);
+            let b = take_aggregate(&row, &all, &mut out)?;
+            return Ok((out, b));
+        }
+        Err(e) if too_big(&e) => record.log(&format!(
+            "[owed-actor] {me}: the record's read passed a value bound ({e}): the BEEFs row by row"
+        )),
+        Err(e) => return Err(e),
+    }
+    let (beefs, rest): (Vec<usize>, Vec<usize>) = all.iter().partition(|&&n| FAMILIES[n].beef);
+    match record
+        .run_batch(vec![
+            fitted(aggregate_select(bound, &rest), &binds),
+            fitted(rows_select(&beefs), &binds),
+        ])
+        .await
+    {
+        Ok(o) => {
+            let mut o = o.into_iter();
+            let row = o
+                .next()
+                .and_then(|o| o.rows.into_iter().next())
+                .unwrap_or(Value::Null);
+            let b = take_aggregate(&row, &rest, &mut out)?;
+            for r in o.next().map(|o| o.rows).unwrap_or_default() {
+                let n = r["f"].as_i64().unwrap_or(-1);
+                let Some(cols) = usize::try_from(n).ok().and_then(|n| names.get(n)) else {
+                    return Err(format!("owed actor: a BEEF row names family {n}"));
+                };
+                out[n as usize].push(row_of(cols, &json_of(&r["r"])?));
+            }
+            return Ok((out, b));
+        }
+        Err(e) if too_big(&e) => record.log(&format!(
+            "[owed-actor] {me}: a family passed a value bound ({e}): one statement a family"
+        )),
+        Err(e) => return Err(e),
+    }
+    // The last fallback: one statement a family (as before D2-ACTOR-E), the bound its own.
+    let mut stmts: Vec<Stmt> = FAMILIES
         .iter()
         .map(|f| fitted(copy_select(f), &binds))
         .collect();
-    Ok(record
-        .run_batch(stmts)
-        .await?
-        .into_iter()
-        .map(|o| o.rows)
-        .collect())
+    if bound {
+        stmts.push(fitted(format!("SELECT {BOUND_COLUMN}"), &binds));
+    }
+    let o = record.run_batch(stmts).await?;
+    let mut b = None;
+    for (n, o) in o.into_iter().enumerate() {
+        if n == FAMILIES.len() {
+            b = o.rows.first().map(|r| r["b"].as_i64().unwrap_or(0));
+        } else {
+            out[n] = o.rows;
+        }
+    }
+    Ok((out, b))
 }
 
 /// The mirror's write of one round: each family's domain replaced by the record's rows, the BEEFs' facts decoded.
@@ -893,6 +1081,37 @@ async fn keys_of_mirror(
 /// The txids the last judgement of these games named (its rows' outpoints and facts, their word roles).
 const JUDGED_TXIDS_SQL: &str = "SELECT r.outpoint,r.facts,w.txid FROM owed_rows r LEFT JOIN owed_row_words w ON w.identity=r.identity AND w.outpoint=r.outpoint WHERE r.identity=?1 AND r.gameId IN (SELECT value FROM json_each(?2))";
 
+/// D2-ACTOR-E (bsv-low #954): how long a game's last FULL refresh keeps it WARM ([`apply_with`]'s narrowed read).
+/// It bounds the drift of a family no trigger marks (the derived links, the evicted copies, the hand and proof
+/// markers, the probe memos the TTL sweep takes, `transactions`): a warm game re-reads them only for the rows its
+/// events name; past this the next apply of the game reads its whole closure again.
+pub const FULL_REFRESH_EVERY_MS: i64 = 600_000;
+/// The kind of the `applied` rows that stamp a game's last full refresh (`seq` 0, `atMs` the refresh).
+pub const FULL_KIND: &str = "full";
+/// The full refresh's stamp, one row a game.
+pub const FULL_STAMP_SQL: &str = "INSERT INTO applied(kind,seq,game,atMs) SELECT 'full',0,value,?1 FROM json_each(?2) WHERE 1 ON CONFLICT(kind,seq,game) DO UPDATE SET atMs=excluded.atMs";
+/// How many of the games are warm (stamped after `?1`).
+pub const WARM_GAMES_SQL: &str = "SELECT COUNT(DISTINCT game) AS n FROM applied WHERE kind='full' AND seq=0 AND atMs>?1 AND game IN (SELECT value FROM json_each(?2))";
+/// The record's pending marks of the games (`owed_judge::MARKS_SQL`): the bound and the rows they name.
+pub const NARROW_MARKS_SQL: &str = crate::owed_judge::MARKS_SQL;
+/// The mark sources that name no row and ask for the record as it stands: a narrowed read is no answer to them.
+pub const FULL_SOURCES: [&str; 3] = ["wanted", "age", "backfill"];
+
+/// D2-ACTOR-E: what one apply is told beside its games.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApplyOpts {
+    /// The txids the event's write named (its source key and its facts, [`EventCtx::txids`]); `None`: the whole
+    /// closure is read (a tip alarm, a drain, the reconcile, a belt find, an older caller).
+    pub touch: Option<Vec<String>>,
+    /// A narrowed apply records its coverage (the seq check's dupe) only where no judge but the actor acknowledges
+    /// a mark before the actor read it: Phases B and C. In Phase A the D1 judge acknowledges first, so a narrowed
+    /// apply covers nothing (a later delivery is applied, narrowly).
+    pub narrow_covers: bool,
+    /// The other events this apply serves (a burst coalesced in the object, [`apply_burst`]): each recorded in
+    /// `applied` as its own `(kind, seq)`.
+    pub also: Vec<(String, i64)>,
+}
+
 /// THE APPLY: the closure over `games` of `me`, then the last judgement over the mirror with the outside held.
 /// `kind_seq` is the event's token, recorded in `applied` (the served `ackSeq`); a redelivery is applied again (the
 /// delta lens's NEW-H1 (b): its record read is the record as it stands, the same judgement or a newer one, and the
@@ -913,6 +1132,42 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
     tip: Option<u64>,
     era_ms: Option<i64>,
 ) -> Result<(ApplyReport, Vec<(String, Value)>), String> {
+    apply_with(
+        record,
+        local,
+        outside,
+        me,
+        games,
+        kind_seq,
+        tip,
+        era_ms,
+        &ApplyOpts::default(),
+    )
+    .await
+}
+
+/// [`apply`] told what the event wrote (D2-ACTOR-E, bsv-low #954).
+///
+/// A game is WARM when its whole closure was read within [`FULL_REFRESH_EVERY_MS`]: an apply of warm games told the
+/// txids its event wrote (`opts.touch`) reads the record ONCE for exactly those rows: the rows the event's txids and
+/// the games' pending marks name ([`NARROW_MARKS_SQL`], one statement, so every mark the apply's bound covers has its
+/// row read), the games' own rows (the identity's and the result families') and the links of their hop markers, in
+/// one statement ([`compound_select`]); the mirror holds the rest. A key the judgement then names that the mirror
+/// has not read is a MISS: read in its own round (its keys alone), counted (`owed_actor_closure_misses_total`).
+/// Any other apply (a cold game, no `touch`, a mark of [`FULL_SOURCES`]) reads the whole closure as before, in one
+/// statement a round (it was 24), and stamps its games warm.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
+    record: &R,
+    local: &L,
+    outside: &O,
+    me: &str,
+    games: &[String],
+    kind_seq: Option<(&str, i64)>,
+    tip: Option<u64>,
+    era_ms: Option<i64>,
+    opts: &ApplyOpts,
+) -> Result<(ApplyReport, Vec<(String, Value)>), String> {
     let me = me.to_ascii_lowercase();
     let mut wanted: Vec<String> = Vec::new();
     for g in games.iter().map(|g| g.to_ascii_lowercase()) {
@@ -924,11 +1179,7 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
     let games = wanted;
     let mut report = ApplyReport::default();
     let seq = kind_seq.map_or(0, |(_, s)| s);
-    // D2-ACTOR-D: the coverage's generation, read BEFORE the closure reads the record (a fault reads no coverage:
-    // nothing is recorded, no later delivery is skipped on it).
-    let covered = crate::owed_judge::marks_bound(record, &me, &games)
-        .await
-        .ok();
+    let now = local.now_ms() as i64;
     let held = Held::default();
     // The closure starts from what the mirror already names for these games (the last apply's domain): in the steady
     // state its first round finds no new key and its judgement stands.
@@ -959,6 +1210,61 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
         .iter()
         .flat_map(|o| &o.rows)
         .for_each(|r| txids_in_value(r, &mut keys.txids));
+    // D2-ACTOR-E: the narrowed read, where every game is warm and the event named its rows.
+    let warm = match &opts.touch {
+        Some(_) if !games.is_empty() => local
+            .run_batch(vec![Stmt::new(
+                WARM_GAMES_SQL,
+                vec![
+                    Bind::Int(now - FULL_REFRESH_EVERY_MS),
+                    Bind::Text(json!(games).to_string()),
+                ],
+            )])
+            .await
+            .ok()
+            .and_then(|o| {
+                o.first()
+                    .and_then(|o| o.rows.first())
+                    .and_then(|r| r["n"].as_i64())
+            })
+            .is_some_and(|n| n as usize >= games.len()),
+        _ => false,
+    };
+    let mut narrow: Option<Keys> = None;
+    let mut covered: Option<i64> = None;
+    if let (true, Some(touch)) = (warm, &opts.touch) {
+        // The marks first (their bound is what this apply covers: every mark it counts names a row read below).
+        let marks = record
+            .run_batch(vec![Stmt::new(
+                NARROW_MARKS_SQL,
+                vec![Bind::Text(me.clone()), Bind::Text(json!(games).to_string())],
+            )])
+            .await?;
+        let marks: Vec<Value> = marks.into_iter().next().map(|o| o.rows).unwrap_or_default();
+        if !marks
+            .iter()
+            .any(|m| FULL_SOURCES.contains(&m["source"].as_str().unwrap_or("")))
+        {
+            let mut n = Keys {
+                txids: BTreeSet::new(),
+                markers: keys.markers.clone(),
+            };
+            touch.iter().for_each(|t| txids_in(t, &mut n.txids));
+            marks
+                .iter()
+                .for_each(|m| txids_in_value(&m["sourceKey"], &mut n.txids));
+            let bound = marks
+                .iter()
+                .filter_map(|m| m["generation"].as_i64())
+                .max()
+                .unwrap_or(0);
+            covered = opts.narrow_covers.then_some(bound);
+            narrow = Some(n);
+        }
+    }
+    // What the record was read for in this apply (a later round reads only the keys past it).
+    let mut fetched = Keys::default();
+    let mut first = true;
     let (staged, mut pushes) = loop {
         if report.rounds >= CLOSURE_ROUNDS_MAX {
             return Err(format!(
@@ -967,13 +1273,50 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
             ));
         }
         report.rounds += 1;
-        let read = read_round(record, &me, &games, &keys).await?;
+        // The round's read: the narrowed one first (the event's rows over the warm mirror), else the closure's keys
+        // (all of them on a full apply's first round; a later round only those no earlier round read: a MISS).
+        let (read_keys, read_games): (Keys, Vec<String>) = match (&narrow, first) {
+            (Some(n), true) => (n.clone(), games.clone()),
+            (None, true) => (keys.clone(), games.clone()),
+            (_, false) => (
+                Keys {
+                    txids: keys.txids.difference(&fetched.txids).cloned().collect(),
+                    markers: keys.markers.difference(&fetched.markers).copied().collect(),
+                },
+                Vec::new(),
+            ),
+        };
+        if !first || narrow.is_none() {
+            report.misses += 1;
+        }
+        let (read, bound) = read_round(
+            record,
+            &me,
+            &read_games,
+            &read_keys,
+            first && narrow.is_none(),
+        )
+        .await?;
+        if first && narrow.is_none() {
+            covered = bound;
+        }
         report.record_rows += read.iter().map(Vec::len).sum::<usize>();
         local
-            .run_batch(write_round(&me, &games, &keys, &read, seq))
+            .run_batch(write_round(&me, &read_games, &read_keys, &read, seq))
             .await?;
+        if first {
+            // A narrowed read leaves the warm mirror's keys as read (they are not re-read; their own events refresh
+            // them); a full read has read every key it holds.
+            fetched = keys.clone();
+        }
+        fetched.txids.extend(read_keys.txids.iter().cloned());
+        fetched.markers.extend(read_keys.markers.iter().copied());
+        first = false;
         let mut next = keys.clone();
-        keys_of_mirror(local, &me, &games, &keys, &mut next).await?;
+        next.txids.extend(read_keys.txids.iter().cloned());
+        next.markers.extend(read_keys.markers.iter().copied());
+        let walk_from = next.clone();
+        keys_of_mirror(local, &me, &games, &walk_from, &mut next).await?;
         let noting = Noting {
             local,
             seen: RefCell::default(),
@@ -997,26 +1340,33 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
                 "{CLOSURE_BOUND}{me} passed {CLOSURE_KEYS_MAX} txids"
             ));
         }
-        if next == keys {
+        keys = next;
+        if keys.txids.is_subset(&fetched.txids) && keys.markers.is_subset(&fetched.markers) {
             // THE FIXPOINT: this round's judgement read a mirror holding every key its statements named, so it
             // is the record's judgement and only its commit is run (the object's turn keeps any other apply out).
             break (noting.staged.take(), pushes);
         }
-        keys = next;
     };
     report.txids = keys.txids.len();
+    report.narrowed = narrow.is_some();
     report.rows = commit_fixpoint(local, &me, staged).await?;
     for (_, push) in &mut pushes {
         push["rows"] = json!(report.rows);
     }
     let mut marks = Vec::new();
+    if narrow.is_none() {
+        marks.push(Stmt::new(
+            FULL_STAMP_SQL,
+            vec![Bind::Int(now), Bind::Text(json!(games).to_string())],
+        ));
+    }
     if let Some(cov) = covered {
         marks.push(Stmt::new(
             APPLIED_SQL,
             vec![
                 Bind::Text(COVERED_KIND.into()),
                 Bind::Int(cov),
-                Bind::Int(local.now_ms() as i64),
+                Bind::Int(now),
                 Bind::Text(json!(games).to_string()),
             ],
         ));
@@ -1035,16 +1385,24 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
             ],
         ));
     }
-    if let Some((kind, seq)) = kind_seq {
+    let events: Vec<(String, i64)> = kind_seq
+        .map(|(k, s)| (k.to_string(), s))
+        .into_iter()
+        .chain(opts.also.iter().cloned())
+        .collect();
+    let acked = events.iter().map(|(_, s)| *s).max();
+    for (kind, seq) in &events {
         marks.push(Stmt::new(
             APPLIED_SQL,
             vec![
-                Bind::Text(kind.into()),
-                Bind::Int(seq),
-                Bind::Int(local.now_ms() as i64),
+                Bind::Text(kind.clone()),
+                Bind::Int(*seq),
+                Bind::Int(now),
                 Bind::Text(json!(games).to_string()),
             ],
         ));
+    }
+    if let Some(seq) = acked {
         marks.push(Stmt::new(
             META_PUT_SQL,
             vec![Bind::Text("ackSeq".into()), Bind::Text(seq.to_string())],
@@ -1052,7 +1410,7 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
         // LOW-2: `applied` keeps a week of events (the queues' retention is four days: no redelivery is older).
         marks.push(Stmt::new(
             APPLIED_PRUNE_SQL,
-            vec![Bind::Int(local.now_ms() as i64 - APPLIED_KEEP_MS)],
+            vec![Bind::Int(now - APPLIED_KEEP_MS)],
         ));
     }
     if !marks.is_empty() {
@@ -1147,14 +1505,25 @@ pub async fn commit_fixpoint<L: SqlPort>(
 /// The answer of one apply (the object's `/apply`, the pins' harness): the actor's rows, the redelivery verdict, the
 /// games the event has applied.
 pub fn answer_of(report: &ApplyReport, rows: Vec<Value>) -> Value {
-    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply})
+    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply, "misses": report.misses, "narrowed": report.narrowed, "coalesced": report.coalesced})
+}
+
+/// D2-ACTOR-E (bsv-low #954) item 4: was the event born on a WARM actor (written at or after the actor's bootstrap
+/// stamp, `meta.bootstrapped`)? Only such an event's first apply samples the warm bars (`rowsVisible`, the
+/// backstop's lag): an event written while the actor held (a held event, the sweep's re-publish of a held mark) is
+/// the cold path's. An event with no write time, or an actor with no stamp (an older build's), samples as before.
+pub fn warm_at_birth(at_ms: Option<u64>, bootstrapped_at_ms: Option<u64>) -> bool {
+    match (at_ms, bootstrapped_at_ms) {
+        (Some(at), Some(stamp)) => at >= stamp,
+        _ => true,
+    }
 }
 
 /// D2-ACTOR-D: does this answer sample the rows' visibility? Only an APPLIED answer (never a covered dupe) of its
 /// event's FIRST apply: once per event, in the class of the path that applied it. An answer from an older build
 /// (neither field) samples, as before.
 pub fn samples_visible(answer: &Value) -> bool {
-    answer["applied"] != false && answer["firstApply"] != false
+    answer["applied"] != false && answer["firstApply"] != false && answer["warmAtBirth"] != false
 }
 
 /// D2-ACTOR-D: the event's first apply at this actor? (`None` seq: its own event.)
@@ -1369,6 +1738,202 @@ pub async fn apply_event_in_turn<R: SqlPort, L: SqlPort, O: Outside>(
     Ok((report, pushes))
 }
 
+/// D2-ACTOR-E (bsv-low #954): one event waiting for the object's turn ([`apply_coalesced`]).
+#[derive(Debug, Clone, Default)]
+pub struct BurstItem {
+    pub games: Vec<String>,
+    pub kind_seq: Option<(String, i64)>,
+    pub tip: Option<u64>,
+    pub bound: Option<i64>,
+    pub touch: Option<Vec<String>>,
+}
+
+type BurstResult = Result<(ApplyReport, Vec<(String, Value)>), String>;
+
+/// D2-ACTOR-E: the object's waiting events. A caller adds its event and takes the turn; the turn's holder applies
+/// EVERY event waiting by then as one judge pass over the union of their games ([`apply_burst`]) and leaves each
+/// other caller its answer, which that caller finds when its own turn comes.
+#[derive(Default)]
+pub struct Burst {
+    next: std::cell::Cell<u64>,
+    pending: RefCell<Vec<(u64, BurstItem)>>,
+    done: RefCell<BTreeMap<u64, BurstResult>>,
+    /// The judge passes run, and the events they served (served on the object's `/bars`).
+    pub passes: std::cell::Cell<u64>,
+    pub events: std::cell::Cell<u64>,
+}
+
+/// THE BURST (D2-ACTOR-E item 2): the events of `items` applied as ONE judge pass a [`GAMES_PER_APPLY`] chunk of
+/// the union of their games, each event answered exactly: its first-apply verdict and its seq check read before the
+/// pass (a covered dupe is answered without it), its games as its `applied_games`, its `(kind, seq)` recorded in
+/// `applied`; the pass's pushes go to the first event it applied (one push per judgement).
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_burst<R: SqlPort, L: SqlPort, O: Outside>(
+    record: &R,
+    local: &L,
+    outside: &O,
+    me: &str,
+    items: Vec<(u64, BurstItem)>,
+    era_ms: Option<i64>,
+    publish: bool,
+    narrow_covers: bool,
+) -> Vec<(u64, BurstResult)> {
+    let mut out: Vec<(u64, BurstResult)> = Vec::new();
+    let mut live: Vec<(u64, BurstItem, bool)> = Vec::new();
+    for (id, item) in items {
+        let ks = item.kind_seq.as_ref().map(|(k, s)| (k.as_str(), *s));
+        let first = first_apply_of(local, ks, &item.games).await;
+        let named = lowered(&item.games);
+        if let Some(b) = item.bound {
+            if covered_at(local, &item.games, b, item.tip).await {
+                out.push((
+                    id,
+                    Ok((
+                        ApplyReport {
+                            applied_games: named,
+                            skipped: true,
+                            first_apply: first,
+                            ..ApplyReport::default()
+                        },
+                        Vec::new(),
+                    )),
+                ));
+                continue;
+            }
+        }
+        live.push((id, item, first));
+    }
+    if live.is_empty() {
+        return out;
+    }
+    let mut union: Vec<String> = Vec::new();
+    let mut touch: Option<Vec<String>> = Some(Vec::new());
+    let mut tip: Option<u64> = None;
+    for (_, item, _) in &live {
+        for g in lowered(&item.games) {
+            if !union.contains(&g) {
+                union.push(g);
+            }
+        }
+        touch = match (touch, &item.touch) {
+            (Some(mut t), Some(more)) => {
+                t.extend(more.iter().cloned());
+                Some(t)
+            }
+            _ => None,
+        };
+        tip = tip.max(item.tip);
+    }
+    let mut pushes: Vec<(String, Value)> = Vec::new();
+    let mut reports: Vec<ApplyReport> = Vec::new();
+    let mut fault: Option<String> = None;
+    for chunk in union.chunks(GAMES_PER_APPLY) {
+        // each chunk records the events whose games it holds
+        let mut events: Vec<(String, i64)> = live
+            .iter()
+            .filter(|(_, item, _)| lowered(&item.games).iter().any(|g| chunk.contains(g)))
+            .filter_map(|(_, item, _)| item.kind_seq.clone())
+            .collect();
+        events.dedup();
+        let opts = ApplyOpts {
+            touch: touch.clone(),
+            narrow_covers,
+            also: events,
+        };
+        let applied = apply_with(record, local, outside, me, chunk, None, tip, era_ms, &opts).await;
+        let applied = match applied {
+            Ok(a) if publish => publish_belt_asks(record, local, me, chunk).await.map(|_| a),
+            other => other,
+        };
+        match applied {
+            Ok((report, p)) => {
+                pushes.extend(p);
+                reports.push(report);
+            }
+            Err(e) => {
+                fault = Some(e);
+                break;
+            }
+        }
+    }
+    let passes = reports.len();
+    let mut pushes = Some(pushes);
+    for (id, item, first) in live {
+        if let Some(e) = &fault {
+            out.push((id, Err(e.clone())));
+            continue;
+        }
+        let mut report = reports.first().cloned().unwrap_or_default();
+        report.rounds = reports.iter().map(|r| r.rounds).max().unwrap_or(0);
+        report.misses = reports.iter().map(|r| r.misses).sum();
+        report.record_rows = reports.iter().map(|r| r.record_rows).sum();
+        report.narrowed = reports.iter().all(|r| r.narrowed);
+        report.coalesced = passes;
+        report.applied_games = lowered(&item.games);
+        report.first_apply = first;
+        report.skipped = false;
+        out.push((id, Ok((report, pushes.take().unwrap_or_default()))));
+    }
+    out
+}
+
+fn lowered(games: &[String]) -> Vec<String> {
+    let mut named: Vec<String> = Vec::new();
+    for g in games.iter().map(|g| g.to_ascii_lowercase()) {
+        if !named.contains(&g) {
+            named.push(g);
+        }
+    }
+    named
+}
+
+/// D2-ACTOR-E: apply `item` in the object's turn, coalesced with every event waiting for it ([`Burst`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_coalesced<R: SqlPort, L: SqlPort, O: Outside>(
+    burst: &Burst,
+    turn: &futures_util::lock::Mutex<()>,
+    record: &R,
+    local: &L,
+    outside: &O,
+    me: &str,
+    item: BurstItem,
+    era_ms: Option<i64>,
+    publish: bool,
+    narrow_covers: bool,
+) -> BurstResult {
+    let id = burst.next.get();
+    burst.next.set(id + 1);
+    burst.pending.borrow_mut().push((id, item));
+    let _turn = turn.lock().await;
+    if let Some(r) = burst.done.borrow_mut().remove(&id) {
+        return r;
+    }
+    let items = std::mem::take(&mut *burst.pending.borrow_mut());
+    let n = items.len() as u64;
+    let results = apply_burst(
+        record,
+        local,
+        outside,
+        me,
+        items,
+        era_ms,
+        publish,
+        narrow_covers,
+    )
+    .await;
+    burst.passes.set(burst.passes.get() + 1);
+    burst.events.set(burst.events.get() + n);
+    let mut mine: Option<BurstResult> = None;
+    for (i, r) in results {
+        if i == id {
+            mine = Some(r);
+        } else {
+            burst.done.borrow_mut().insert(i, r);
+        }
+    }
+    mine.unwrap_or_else(|| Err("owed actor: the burst answered no result for its own event".into()))
+}
+
 /// The words every closure-bound fault begins with ([`CLOSURE_ROUNDS_MAX`], [`CLOSURE_KEYS_MAX`]): the apply could not
 /// close over the mirror it holds, a state the bootstrap repairs (D2-ACTOR-B-FOLD-7), never a storage fault.
 pub const CLOSURE_BOUND: &str = "owed actor: the closure of ";
@@ -1436,6 +2001,10 @@ pub struct HeldEvent {
     /// event is applied at the drain, always).
     #[serde(default, skip_serializing)]
     pub bound: Option<i64>,
+    /// D2-ACTOR-E: the txids the event's write named ([`ApplyOpts::touch`]); never stored with a held event (a held
+    /// event's drain reads the whole closure).
+    #[serde(default, skip_serializing)]
+    pub touch: Option<Vec<String>>,
 }
 impl HeldEvent {
     pub fn name(&self) -> String {
@@ -1504,6 +2073,23 @@ pub async fn apply_or_hold<R: SqlPort, L: SqlPort, O: Outside>(
     era_ms: Option<i64>,
     publish: bool,
 ) -> Result<Applied, String> {
+    apply_or_hold_in(None, turn, record, local, outside, me, ev, era_ms, publish).await
+}
+
+/// [`apply_or_hold`] with the object's burst (D2-ACTOR-E): `Some((burst, narrow_covers))` applies the event
+/// coalesced with every event waiting for the turn ([`apply_coalesced`]), narrowed where its games are warm.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_or_hold_in<R: SqlPort, L: SqlPort, O: Outside>(
+    coalesce: Option<(&Burst, bool)>,
+    turn: &futures_util::lock::Mutex<()>,
+    record: &R,
+    local: &L,
+    outside: &O,
+    me: &str,
+    ev: &HeldEvent,
+    era_ms: Option<i64>,
+    publish: bool,
+) -> Result<Applied, String> {
     let held = local
         .run_batch(vec![Stmt::new(
             HOLD_UNLESS_BOOTSTRAPPED_SQL,
@@ -1521,11 +2107,38 @@ pub async fn apply_or_hold<R: SqlPort, L: SqlPort, O: Outside>(
         Some(t) => Some(t),
         None => held_tip(local, me).await,
     };
-    match apply_event_in_turn(
-        turn, record, local, outside, me, &ev.games, kind_seq, tip, era_ms, publish, ev.bound,
-    )
-    .await
-    {
+    let applied = match coalesce {
+        Some((burst, narrow_covers)) => {
+            let item = BurstItem {
+                games: ev.games.clone(),
+                kind_seq: kind_seq.map(|(k, s)| (k.to_string(), s)),
+                tip,
+                bound: ev.bound,
+                touch: ev.touch.clone(),
+            };
+            apply_coalesced(
+                burst,
+                turn,
+                record,
+                local,
+                outside,
+                me,
+                item,
+                era_ms,
+                publish,
+                narrow_covers,
+            )
+            .await
+        }
+        None => {
+            apply_event_in_turn(
+                turn, record, local, outside, me, &ev.games, kind_seq, tip, era_ms, publish,
+                ev.bound,
+            )
+            .await
+        }
+    };
+    match applied {
         Ok((report, pushes)) => {
             // A holding row whose stamp's delete faulted is deleted at the next landed apply.
             clear_holding(record, local, me).await;
@@ -3325,7 +3938,7 @@ mod tests;
 /// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
 /// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
 /// (MEDIUM-9).
-pub const COUNTERS: [&str; 27] = [
+pub const COUNTERS: [&str; 28] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -3366,6 +3979,9 @@ pub const COUNTERS: [&str; 27] = [
     // D2-ACTOR-B-FOLD-10 (the captain's item, beta 2026-10-29): the bootstrapped actors whose state another build
     // judged, re-armed from the start ([`rejudge_due`]).
     "owed_actor_rejudged_total",
+    // D2-ACTOR-E (bsv-low #954): the record reads past an event's own rows (a cold game's whole closure, a key a warm
+    // mirror had not read).
+    "owed_actor_closure_misses_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;
@@ -3378,6 +3994,24 @@ pub struct EventCtx {
     pub seq: i64,
     pub at_ms: i64,
     pub mined: bool,
+    /// D2-ACTOR-E (bsv-low #954): the txids the event's write named, its source key and its facts (the row's own
+    /// columns the publish read: a pot's spender, a party's pot, a hop's evidence); `None` for an event that names
+    /// no row (an identity note, the read's and the repairs' own marks, the tip): the apply reads its whole closure.
+    pub txids: Option<Vec<String>>,
+}
+
+/// PURE (D2-ACTOR-E): the txids an event's write named, for an event of a trigger's pair.
+pub fn event_txids(ev: &overlay_discovery::owed_event::OwedEvent) -> Option<Vec<String>> {
+    if !overlay_discovery::owed_event::TRIGGER_SOURCES
+        .iter()
+        .any(|(_, s)| *s == ev.source)
+    {
+        return None;
+    }
+    let mut out = BTreeSet::new();
+    txids_in(&ev.source_key, &mut out);
+    txids_in_value(&ev.facts, &mut out);
+    Some(out.into_iter().collect())
 }
 impl EventCtx {
     pub fn of(ev: &overlay_discovery::owed_event::OwedEvent) -> Self {
@@ -3389,13 +4023,14 @@ impl EventCtx {
             seq: ev.seq,
             at_ms: ev.at_ms,
             mined: ev.source == "word" && word == Some("mined"),
+            txids: event_txids(ev),
         }
     }
 }
 
 /// The `/apply` body of one delivery.
 pub fn apply_body(identity: &str, games: &[String], e: &EventCtx, tip: Option<u64>) -> Value {
-    json!({"identity": identity.to_ascii_lowercase(), "games": games, "kind": e.kind, "seq": e.seq, "atMs": e.at_ms, "tip": tip, "mined": e.mined})
+    json!({"identity": identity.to_ascii_lowercase(), "games": games, "kind": e.kind, "seq": e.seq, "atMs": e.at_ms, "tip": tip, "mined": e.mined, "txids": e.txids})
 }
 
 fn of_games(rows: &[Value], games: &[String]) -> Vec<Value> {
