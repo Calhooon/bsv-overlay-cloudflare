@@ -977,7 +977,14 @@ async fn read_marked(
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|g| Some((g[0].as_str()?.to_string(), g[1].as_i64().unwrap_or(0))))
+        // D2-ACTOR-B-FOLD-15 (the eighth delta lens's NOTE-3): the game's `at` through `ms_of`, so a REAL `at` (D1's
+        // JS-number bind) reads its value, never 0 (which would end the bootstrap at that page).
+        .filter_map(|g| {
+            Some((
+                g[0].as_str()?.to_string(),
+                crate::owed_events::ms_of(&g[1]).unwrap_or(0),
+            ))
+        })
         .collect();
     page_games.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     Ok(Some(MarkedRead {
@@ -3085,7 +3092,9 @@ pub fn compared_facts(row: &Value) -> Value {
 /// D1's rows, the outpoints that differ and both digests, by the reconcile's own functions.
 /// D2-ACTOR-B-FOLD-13 (bsv-low #958): beside its rows, `d1JudgedUnder` ([`d1_judged_under`]: the judge version D1's
 /// rows of the identity were judged under, or `"unknown"`) and `d1Rejudge` (the fleet re-judge's stamp and whether it
-/// has passed this identity), so a reader can tell which side is stale.
+/// has passed this identity), so a reader can tell which side is stale. D2-ACTOR-B-FOLD-15 (NEW8-M1): a difference
+/// whose fields are only tip-derived ([`tip_derived_rows`]) between two different judged tips is served as `tipLag`
+/// (both tips in `tipLagTips`), apart from `diff`.
 pub fn rows_view(
     identity: &str,
     actor: std::result::Result<Value, String>,
@@ -3121,7 +3130,17 @@ pub fn rows_view(
             "stamp": rejudge_served(rejudge),
             "passed": rejudge_passed(rejudge, identity),
         },
-        "diff": actor_rows.as_deref().map(|a| diff_rows(d1, a)),
+        // D2-ACTOR-B-FOLD-15 (NEW8-M1): a difference that is only tip-derived between two judged tips is a TIP LAG
+        // (`tipLag`, both sides' tips in `tipLagTips`), never in `diff`.
+        "diff": actor_rows.as_deref().map(|a| {
+            let lag = tip_derived_rows(d1, a);
+            diff_rows(d1, a).into_iter().filter(|o| !lag.contains(o)).collect::<Vec<_>>()
+        }),
+        "tipLag": actor_rows.as_deref().map(|a| tip_derived_rows(d1, a)),
+        "tipLagTips": actor_rows.as_deref().map(|a| {
+            let lag = tip_derived_rows(d1, a);
+            json!({"d1": tips_of(d1, &lag), "actor": tips_of(a, &lag)})
+        }),
         "digests": {"d1": rows_digest(d1), "actor": actor_rows.as_deref().map(rows_digest)},
     })
 }
@@ -3189,6 +3208,64 @@ pub fn tip_lag_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// D2-ACTOR-B-FOLD-15 (the eighth delta lens's NEW8-M1): the facts a TIP moves with the record unchanged, beside
+/// `facts.tip` (a [`CLOCK_FACTS`] key) and the `probeTip` column (never compared): a gate's distance and the
+/// tip-unknown flag.
+pub const TIP_DERIVED_FACTS: [&str; 2] = ["blocksToGate", "tipUnknown"];
+
+/// The tip a stored row was judged at: `facts.tip`, else the `probeTip` column (`None`: neither).
+pub fn judged_tip(r: &Value) -> Option<i64> {
+    let facts: Value = r["facts"]
+        .as_str()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Null);
+    let n = |v: &Value| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64));
+    n(&facts["tip"]).or_else(|| n(&r["probeTip"]))
+}
+
+/// PURE (D2-ACTOR-B-FOLD-15, NEW8-M1): the outpoints [`diff_rows`] reads different whose difference is ONLY
+/// tip-derived: the row on both sides, equal once [`TIP_DERIVED_FACTS`] are taken out too, and judged at two
+/// different tips ([`judged_tip`]). A tip lag, never a verdict difference: the operator's route serves them apart
+/// (`tipLag`) and the reconcile counts an actor's own lag apart (`owed_actor_compare_tip_lag_total`).
+pub fn tip_derived_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
+    let strip = |r: &Value| -> Value {
+        let mut r = r.clone();
+        let mut facts = compared_facts(&r);
+        if let Some(m) = facts.as_object_mut() {
+            for k in TIP_DERIVED_FACTS {
+                m.remove(k);
+            }
+        }
+        r["facts"] = json!(facts.to_string());
+        r
+    };
+    let by = |rows: &[Value]| -> BTreeMap<String, Value> {
+        rows.iter()
+            .filter_map(|r| Some((r["outpoint"].as_str()?.to_string(), r.clone())))
+            .collect()
+    };
+    let (a, b) = (by(d1), by(actor));
+    diff_rows(d1, actor)
+        .into_iter()
+        .filter(|o| match (a.get(o), b.get(o)) {
+            (Some(x), Some(y)) => {
+                judged_tip(x) != judged_tip(y) && diff_rows(&[strip(x)], &[strip(y)]).is_empty()
+            }
+            _ => false,
+        })
+        .collect()
+}
+
+/// The distinct tips the rows of `outpoints` were judged at, on one side (the route's `tipLagTips`).
+fn tips_of(rows: &[Value], outpoints: &[String]) -> Vec<i64> {
+    rows.iter()
+        .filter(|r| outpoints.iter().any(|o| r["outpoint"] == o.as_str()))
+        .filter_map(judged_tip)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// THE DIFF LINES NAME WHAT DIFFERS (the captain's item 12, D2-ACTOR-B-FOLD-8): for the first [`DIFF_DETAIL_MAX`]
@@ -4253,13 +4330,15 @@ pub const RECONCILE_D1_ROWS_SQL: &str = ROWS_SQL;
 /// marks stand for the consumer, which acknowledges under its own bound), at most [`RECONCILE_JUDGE_GAMES_MAX`] games a
 /// reconcile, and the FRESH rows are compared. A game whose stored rows equal the actor's is not judged (both sides
 /// agree; the actor is the record's fresh judgement). Past the bound (an identity whose stored rows differ on more
-/// than 64 games, the whole-identity staleness of a judge change before D1's fleet re-judge passed it) the first 64
+/// than 16 games since FOLD-15, the whole-identity staleness of a judge change before D1's fleet re-judge passed it) the first 16
 /// games in game order are judged and compared; the rest are MARKED (`backfill`, [`RECONCILE_MARK_REST_SQL`]) for the
 /// drain or the consumer and left out of the compare, counted on the report (`unjudged`). A stored difference the
 /// fresh judgement heals is a STALE D1 (`stale-d1`, counted `owed_actor_reconcile_stale_total`, logged, never
 /// re-applied); a difference that stands after it is a judge disagreement (`owed_actor_reconcile_diffs_total`), and
 /// only then are the games re-applied into the actor (its closure re-reads the record: never a stored row).
-pub const RECONCILE_JUDGE_GAMES_MAX: usize = 64;
+/// D2-ACTOR-B-FOLD-15 (NEW8-M2): 16, ONE judge call a step (it was 64, four calls: about 1,013 statements in the alarm's
+/// one invocation beside the belt tick and the re-judge); and the compare is fresh with fresh ([`reconcile_fresh`]).
+pub const RECONCILE_JUDGE_GAMES_MAX: usize = 16;
 /// The games past the reconcile's judge bound, marked for the drain (`?1` the identity, `?2` now, `?3` the games).
 pub const RECONCILE_MARK_REST_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT ?1,value,'backfill','owed-v2',?2 FROM json_each(?3) WHERE value<>'' ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
 
@@ -4310,9 +4389,9 @@ fn games_of_rows(rows: &[Value], into: &mut BTreeSet<String>) {
 /// THE SAMPLED DIGEST RECONCILE (MEDIUM-10), one step on the belt's driver: at most one identity a
 /// [`RECONCILE_INTERVAL_MS`] (64 a day). Phases A and B (`OWED_D1_JUDGE` on): since D2-ACTOR-B-FOLD-13 (bsv-low #958)
 /// D1 is JUDGED FRESH first over the games its stored rows and the actor's differ on ([`RECONCILE_JUDGE_GAMES_MAX`]),
-/// and the FRESH rows are compared against the actor's ([`rows_digest`]); a stored difference the fresh judgement
-/// heals is a stale D1 (`stale-d1`, counted apart, nothing re-applied), a difference that stands is a judge
-/// disagreement and re-applies the differing games (the actor's closure re-reads the record), counted and logged. Phase C (the D1 rows are cold): the actor's rows before and after a re-apply of
+/// and since D2-ACTOR-B-FOLD-15 (NEW8-M1) the actor is re-applied over the same games at the same tip and the two
+/// FRESH judgements are compared ([`reconcile_fresh`]: a held game apart, an actor's own tip lag apart, a stale D1
+/// named, a disagreement the STOP). Phase C (the D1 rows are cold): the actor's rows before and after a re-apply of
 /// its games from the record (a divergence the events missed is a diff). D1 reads: the state, one `owed_state` seek,
 /// the identity's rows (A and B). Counted `owed_actor_reconcile_{compared,diffs,republished}_total`.
 pub async fn reconcile_step(
@@ -4390,79 +4469,292 @@ pub async fn reconcile_step(
             return Ok(Some(report));
         }
     };
-    let mut games = BTreeSet::new();
-    // The actor's rows as the compare reads them (A and B: those of the games the fresh judgement covered).
-    let mut actor_side = actor.clone();
-    let compare_to: Vec<Value> = if db.d1_judges() {
-        let stored = d1_stored_rows(db, &identity).await?;
-        let games_of = |rows: &[Value], outpoints: &[String]| {
-            let mut g = BTreeSet::new();
-            for o in outpoints {
-                for r in rows
-                    .iter()
-                    .chain(&actor)
-                    .filter(|r| r["outpoint"] == o.as_str())
-                {
-                    games_of_rows(std::slice::from_ref(r), &mut g);
-                }
-            }
-            g
-        };
-        let stored_diff = diff_rows(&stored, &actor);
-        let stale_games: Vec<String> = games_of(&stored, &stored_diff).into_iter().collect();
-        let (judge, rest) = stale_games.split_at(stale_games.len().min(RECONCILE_JUDGE_GAMES_MAX));
-        for chunk in judge.chunks(crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION) {
-            if let Err(e) =
-                crate::owed_judge::judge_subjects_acked_to(db, &identity, chunk, "reconcile", 0)
-                    .await
-            {
-                // No fresh judgement, no compare: a stored row is never the comparison's side.
-                db.log(&format!(
-                    "[owed-actor] reconcile {identity}: the fresh D1 judgement faulted, no compare: {e}"
-                ));
-                save(identity).await?;
-                return Ok(Some(report));
-            }
-            report.judged += chunk.len();
-        }
-        if !rest.is_empty() {
-            report.unjudged = rest.len();
-            db.run_batch(vec![Stmt::new(
-                RECONCILE_MARK_REST_SQL,
-                vec![
-                    Bind::Text(identity.clone()),
-                    Bind::Int(now),
-                    Bind::Text(json!(rest).to_string()),
-                ],
-            )])
-            .await?;
-        }
-        let unjudged: BTreeSet<&str> = rest.iter().map(String::as_str).collect();
-        let keep = |rows: Vec<Value>| -> Vec<Value> {
-            rows.into_iter()
-                .filter(|r| !unjudged.contains(r["gameId"].as_str().unwrap_or_default()))
-                .collect()
-        };
-        let fresh = keep(d1_stored_rows(db, &identity).await?);
-        actor_side = keep(actor.clone());
-        let fresh_diff = diff_rows(&fresh, &actor_side);
-        report.stale_outpoints = stored_diff
-            .iter()
-            .filter(|o| !fresh_diff.contains(o))
-            .filter(|o| {
-                stored
-                    .iter()
-                    .chain(&actor)
-                    .filter(|r| r["outpoint"] == o.as_str())
-                    .all(|r| !unjudged.contains(r["gameId"].as_str().unwrap_or_default()))
-            })
-            .count();
-        games = games_of(&fresh, &fresh_diff);
-        fresh
+    if db.d1_judges() {
+        reconcile_fresh(db, identity, actor, bootstrapped, report, now)
+            .await
+            .map(Some)
     } else {
-        games_of_rows(&actor, &mut games);
-        actor.clone()
+        reconcile_phase_c(db, identity, actor, bootstrapped, report, now)
+            .await
+            .map(Some)
+    }
+}
+
+/// The reconcile's cursor saved (the identity compared, at `now`).
+async fn reconcile_save(db: &impl JudgeDb, identity: &str, now: i64) -> Result<(), String> {
+    db.run_batch(vec![Stmt::new(
+        crate::owed_belt::STATE_SQL,
+        vec![
+            Bind::Text(RECONCILE_STATE_NAME.into()),
+            Bind::Text(identity.to_string()),
+            Bind::Int(now),
+        ],
+    )])
+    .await
+    .map(|_| ())
+}
+
+/// The games of `outpoints` on either side.
+fn games_of_outpoints(sides: &[&[Value]], outpoints: &[String]) -> BTreeSet<String> {
+    let mut g = BTreeSet::new();
+    for o in outpoints {
+        for side in sides {
+            for r in side.iter().filter(|r| r["outpoint"] == o.as_str()) {
+                games_of_rows(std::slice::from_ref(r), &mut g);
+            }
+        }
+    }
+    g
+}
+
+/// The pending marks of `?2`'s games of `?1`: each game's greatest generation (FOLD-15: the games a mark holds at the
+/// reconcile's start, and the bound of what was written before both judges read).
+pub const RECONCILE_MARKS_SQL: &str = "SELECT gameId,MAX(generation) AS generation FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2)) GROUP BY gameId";
+
+/// PHASES A AND B (D2-ACTOR-B-FOLD-15, the eighth delta lens's NEW8-M1): THE RECONCILE COMPARES FRESH WITH FRESH AT
+/// ONE TIP. D1's stored rows and the actor's pick the games (the outpoints they differ on); at most
+/// [`RECONCILE_JUDGE_GAMES_MAX`] (16, ONE judge call: NEW8-M2) are judged, the rest MARKED (`backfill`) and left out.
+/// The picked games' marks are read first (each game's greatest generation: the games a mark holds, and the bound).
+/// Then BOTH sides judge them at the reconcile's tip (the port's): D1 by the D1 judge (acknowledging nothing), the
+/// actor by a re-apply (its closure re-reads the record: never a stored row), and the two FRESH judgements are
+/// compared. A game holding a mark (at the start, or one written while the two judged, above the bound) is HELD, the
+/// delivery compare's NEW2-L1 partition: its difference counted apart (`owed_actor_compare_held_total`, the line
+/// `RECONCILE DIFF (held mark; not a STOP)`), never a disagreement. What else differs:
+/// - fresh D1 against the fresh actor: a JUDGE DISAGREEMENT (`owed_actor_reconcile_diffs_total`, the STOP);
+/// - the actor's stored rows against its fresh re-apply, outside a held game: only tip-derived
+///   ([`tip_derived_rows`]) is a TIP LAG (`owed_actor_compare_tip_lag_total`, `RECONCILE TIP LAG`); anything else the
+///   actor MISSED the record (an unmarked write), healed by the re-apply (counted a diff, its games
+///   `owed_actor_reconcile_republished_total`);
+/// - D1's stored rows against its fresh judgement, where the two fresh sides agree: a STALE D1 (`stale-d1`, #958).
+async fn reconcile_fresh(
+    db: &impl JudgeDb,
+    identity: String,
+    actor: Vec<Value>,
+    bootstrapped: Value,
+    mut report: ReconcileReport,
+    now: i64,
+) -> Result<ReconcileReport, String> {
+    let stored = d1_stored_rows(db, &identity).await?;
+    let stored_diff = diff_rows(&stored, &actor);
+    let picked: Vec<String> = games_of_outpoints(&[&stored, &actor], &stored_diff)
+        .into_iter()
+        .collect();
+    let (judge, rest) = picked.split_at(picked.len().min(RECONCILE_JUDGE_GAMES_MAX));
+    let mut deltas = vec![(COUNTERS[6].to_string(), 1)];
+    if judge.is_empty() {
+        report.d1_digest = Some(rows_digest(&stored));
+        report.actor_digest = Some(rows_digest(&actor));
+        db.counters(deltas).await;
+        reconcile_save(db, &identity, now).await?;
+        return Ok(report);
+    }
+    let judge_json = json!(judge).to_string();
+    let first = |out: Vec<StmtOut>| out.into_iter().next().map(|o| o.rows).unwrap_or_default();
+    let marks = first(
+        db.run_batch(vec![Stmt::new(
+            RECONCILE_MARKS_SQL,
+            vec![Bind::Text(identity.clone()), Bind::Text(judge_json.clone())],
+        )])
+        .await?,
+    );
+    let mut held: BTreeSet<String> = marks
+        .iter()
+        .filter_map(|m| m["gameId"].as_str().map(str::to_string))
+        .collect();
+    let bound = marks
+        .iter()
+        .filter_map(|m| crate::owed_events::ms_of(&m["generation"]))
+        .max()
+        .unwrap_or(0);
+    // D1 fresh, one judge call.
+    if let Err(e) =
+        crate::owed_judge::judge_subjects_acked_to(db, &identity, judge, "reconcile", 0).await
+    {
+        // No fresh judgement, no compare: a stored row is never the comparison's side.
+        db.log(&format!(
+            "[owed-actor] reconcile {identity}: the fresh D1 judgement faulted, no compare: {e}"
+        ));
+        reconcile_save(db, &identity, now).await?;
+        return Ok(report);
+    }
+    report.judged = judge.len();
+    // The actor fresh, at the same tip (the port's: the reconcile's served tip).
+    let fresh_actor: Vec<Value> = match db.actor_apply(&identity, judge, "reconcile").await {
+        Ok(Some(a)) if !is_held(&a) => a["rows"].as_array().cloned().unwrap_or_default(),
+        Ok(Some(_)) => {
+            db.log(&format!(
+                "[owed-actor] reconcile {identity}: the actor holds (bootstrapping), no compare"
+            ));
+            report.no_actor = true;
+            reconcile_save(db, &identity, now).await?;
+            return Ok(report);
+        }
+        Ok(None) => {
+            report.no_actor = true;
+            reconcile_save(db, &identity, now).await?;
+            return Ok(report);
+        }
+        Err(e) => {
+            db.log(&format!(
+                "[owed-actor] reconcile {identity}: the actor's fresh re-apply: {e}"
+            ));
+            report.no_actor = true;
+            reconcile_save(db, &identity, now).await?;
+            return Ok(report);
+        }
     };
+    // D1's fresh rows, the marks written while the two judged, and the rest marked: one call.
+    let mut stmts = vec![
+        Stmt::new(RECONCILE_D1_ROWS_SQL, vec![Bind::Text(identity.clone())]),
+        Stmt::new(
+            HELD_GAMES_SQL,
+            vec![
+                Bind::Text(identity.clone()),
+                Bind::Text(judge_json),
+                Bind::Int(bound),
+            ],
+        ),
+    ];
+    if !rest.is_empty() {
+        report.unjudged = rest.len();
+        stmts.push(Stmt::new(
+            RECONCILE_MARK_REST_SQL,
+            vec![
+                Bind::Text(identity.clone()),
+                Bind::Int(now),
+                Bind::Text(json!(rest).to_string()),
+            ],
+        ));
+    }
+    let mut out = db.run_batch(stmts).await?.into_iter();
+    let fresh_d1 = out.next().map(|o| o.rows).unwrap_or_default();
+    held.extend(
+        out.next()
+            .map(|o| o.rows)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| r["gameId"].as_str().map(str::to_string)),
+    );
+    let judged: BTreeSet<&str> = judge.iter().map(String::as_str).collect();
+    let of_judged = |rows: &[Value]| -> Vec<Value> {
+        rows.iter()
+            .filter(|r| judged.contains(r["gameId"].as_str().unwrap_or_default()))
+            .cloned()
+            .collect()
+    };
+    let unjudged: BTreeSet<&str> = rest.iter().map(String::as_str).collect();
+    let keep = |rows: &[Value]| -> Vec<Value> {
+        rows.iter()
+            .filter(|r| !unjudged.contains(r["gameId"].as_str().unwrap_or_default()))
+            .cloned()
+            .collect()
+    };
+    let (a, b) = (keep(&fresh_d1), keep(&fresh_actor));
+    let game_of = |o: &str| -> String {
+        a.iter()
+            .chain(&b)
+            .chain(&actor)
+            .chain(&stored)
+            .find(|r| r["outpoint"] == o)
+            .and_then(|r| r["gameId"].as_str())
+            .unwrap_or("?")
+            .to_string()
+    };
+    let is_held = |o: &String| held.contains(&game_of(o));
+    let (held_diffs, disagree): (Vec<String>, Vec<String>) =
+        diff_rows(&a, &b).into_iter().partition(is_held);
+    let (actor_stored, actor_fresh) = (of_judged(&actor), of_judged(&fresh_actor));
+    let actor_lag = tip_derived_rows(&actor_stored, &actor_fresh);
+    let missed: Vec<String> = diff_rows(&actor_stored, &actor_fresh)
+        .into_iter()
+        .filter(|o| !actor_lag.contains(o) && !is_held(o))
+        .collect();
+    let (d1_stored, d1_fresh) = (of_judged(&stored), of_judged(&fresh_d1));
+    let d1_moved = diff_rows(&d1_stored, &d1_fresh);
+    let fresh_differ: BTreeSet<&String> = disagree.iter().chain(&held_diffs).collect();
+    report.stale_outpoints = stored_diff
+        .iter()
+        .filter(|o| d1_moved.contains(o) && !fresh_differ.contains(o))
+        .count();
+    report.d1_digest = Some(rows_digest(&a));
+    report.actor_digest = Some(rows_digest(&b));
+    report.diff = !disagree.is_empty() || !missed.is_empty();
+    let tip = db.tip();
+    if !actor_lag.is_empty() || !tip_lag_rows(&a, &b).is_empty() {
+        deltas.push((COUNTERS[28].to_string(), 1));
+        db.log(&format!(
+            "[owed-actor] RECONCILE TIP LAG (not a STOP) {identity}: {} outpoints of the actor's stored rows judged at tip {:?} differ only by the tip from its re-apply at tip {tip:?}, first {}",
+            actor_lag.len(),
+            tips_of(&actor_stored, &actor_lag),
+            actor_lag.first().map_or("-", String::as_str)
+        ));
+    }
+    if report.stale_outpoints > 0 {
+        // bsv-low #958: a stale D1, never a judge disagreement (both fresh judgements agree; nothing healed in D1 by
+        // the actor).
+        deltas.push((COUNTERS[29].to_string(), 1));
+        db.log(&format!(
+            "[owed-actor] RECONCILE stale-d1 {identity}: {} outpoints of D1's stored rows differed and the fresh D1 judgement agrees with the actor's fresh re-apply; D1's re-judge under {} had passed the identity: {}; {} games judged, {} marked past the bound",
+            report.stale_outpoints,
+            JUDGE_VERSION,
+            report.rejudge_passed,
+            report.judged,
+            report.unjudged
+        ));
+    }
+    if !held_diffs.is_empty() {
+        deltas.push((COUNTERS[17].to_string(), 1));
+        db.log(&format!(
+            "[owed-actor] RECONCILE DIFF (held mark; not a STOP) {identity} game {}: {} outpoints, first {}; {}",
+            game_of(&held_diffs[0]),
+            held_diffs.len(),
+            held_diffs[0],
+            diff_detail(&a, &b, &held_diffs)
+        ));
+    }
+    let boot = match &bootstrapped {
+        Value::Bool(b) => b.to_string(),
+        _ => "unknown".into(),
+    };
+    if !disagree.is_empty() {
+        db.log(&format!(
+            "[owed-actor] RECONCILE DIFF {identity}: {} outpoints differ (a judge disagreement: D1 and the actor judged fresh over {} games at tip {tip:?}), actor bootstrapped at the compare: {boot}; {}",
+            disagree.len(),
+            report.judged,
+            diff_detail(&a, &b, &disagree)
+        ));
+    }
+    if !missed.is_empty() {
+        report.reapplied = judge.len();
+        deltas.push((COUNTERS[5].to_string(), report.reapplied as u64));
+        db.log(&format!(
+            "[owed-actor] RECONCILE DIFF {identity}: {} outpoints of the actor's stored rows differ from its fresh re-apply (the actor missed the record; {} games re-applied), actor bootstrapped at the compare: {boot}; {}",
+            missed.len(),
+            report.reapplied,
+            diff_detail(&actor_stored, &actor_fresh, &missed)
+        ));
+    }
+    if report.diff {
+        deltas.push((COUNTERS[7].to_string(), 1));
+        BARS.with(|b| b.borrow_mut().reconcile_diffs += 1);
+    }
+    db.counters(deltas).await;
+    reconcile_save(db, &identity, now).await?;
+    Ok(report)
+}
+
+/// PHASE C (the D1 rows are cold): the actor's rows before against after a re-apply of its games from the record (a
+/// divergence the events missed is a diff).
+async fn reconcile_phase_c(
+    db: &impl JudgeDb,
+    identity: String,
+    actor: Vec<Value>,
+    bootstrapped: Value,
+    mut report: ReconcileReport,
+    now: i64,
+) -> Result<ReconcileReport, String> {
+    let mut games = BTreeSet::new();
+    games_of_rows(&actor, &mut games);
     let games: Vec<String> = games.into_iter().take(RECONCILE_GAMES_MAX).collect();
     let mut after = actor.clone();
     for chunk in games.chunks(GAMES_PER_APPLY) {
@@ -4480,44 +4772,18 @@ pub async fn reconcile_step(
             }
         }
     }
-    // A and B: D1 against the actor as it stood; C: the actor before against after its re-apply.
-    let (a, b) = if db.d1_judges() {
-        (compare_to, actor_side)
-    } else {
-        (compare_to, after)
-    };
+    let (a, b) = (actor, after);
     report.d1_digest = Some(rows_digest(&a));
     report.actor_digest = Some(rows_digest(&b));
     report.diff = report.d1_digest != report.actor_digest;
     let mut deltas = vec![(COUNTERS[6].to_string(), 1)];
-    // NEW7-L2 (Phases A and B: D1 against the actor as it stood; Phase C's before-and-after differs in tip by time)
-    if db.d1_judges() && !tip_lag_rows(&a, &b).is_empty() {
-        deltas.push((COUNTERS[28].to_string(), 1));
-    }
-    if report.stale_outpoints > 0 {
-        // bsv-low #958: a stale D1, never a judge disagreement (the fresh judgement healed it; nothing re-applied).
-        deltas.push((COUNTERS[29].to_string(), 1));
-        db.log(&format!(
-            "[owed-actor] RECONCILE stale-d1 {identity}: {} outpoints of D1's stored rows differed and the fresh D1 judgement agrees with the actor; D1's re-judge under {} had passed the identity: {}; {} games judged, {} marked past the bound",
-            report.stale_outpoints,
-            JUDGE_VERSION,
-            report.rejudge_passed,
-            report.judged,
-            report.unjudged
-        ));
-    }
     if report.diff {
         deltas.push((COUNTERS[7].to_string(), 1));
         BARS.with(|b| b.borrow_mut().reconcile_diffs += 1);
         let differ = diff_rows(&a, &b);
         db.log(&format!(
-            "[owed-actor] RECONCILE DIFF {identity}: {} outpoints differ{}, {} games re-applied, actor bootstrapped at the compare: {}; {}",
+            "[owed-actor] RECONCILE DIFF {identity}: {} outpoints differ, {} games re-applied, actor bootstrapped at the compare: {}; {}",
             differ.len(),
-            if db.d1_judges() {
-                format!(" (a judge disagreement: D1 judged fresh over {} games)", report.judged)
-            } else {
-                String::new()
-            },
             report.reapplied,
             match bootstrapped {
                 Value::Bool(b) => b.to_string(),
@@ -4526,12 +4792,9 @@ pub async fn reconcile_step(
             diff_detail(&a, &b, &differ)
         ));
     }
-    if report.reapplied > 0 && db.d1_judges() {
-        deltas.push((COUNTERS[5].to_string(), report.reapplied as u64));
-    }
     db.counters(deltas).await;
-    save(identity).await?;
-    Ok(Some(report))
+    reconcile_save(db, &identity, now).await?;
+    Ok(report)
 }
 /// D2-ACTOR-B-FOLD-13 (bsv-low #958): D1'S ROWS RE-JUDGED FLEET-WIDE AFTER A [`JUDGE_VERSION`] MOVE. The actor
 /// re-judges itself on a version mismatch ([`rejudge_due`]); D1's `owed_rows` kept the old code's rows until a mark or
@@ -4543,8 +4806,9 @@ pub async fn reconcile_step(
 /// (`owed_judge::IDENTITY_GAMES_BY_ID_SQL`), judging them with the D1 judge from D1's own evidence and acknowledging
 /// NOTHING (the marks stand for the drain and the consumer, under their own bounds); then `done` and `endedAtMs`. A
 /// deploy with the same version runs nothing: one primary-key read a tick. THE PACE: [`D1_REJUDGE_GAMES_PER_TICK`]
-/// (32, two judge calls of 16) a belt alarm (120 s), inside the alarm's existing turn, before the reconcile: 23,040
-/// games a day, the whale of 1,033 games in about 65 minutes; its cost is the judge's commit (measured by the backfill
+/// (16 since FOLD-15, ONE judge call; it was 32) a belt alarm (120 s), inside the alarm's existing turn, before the
+/// reconcile: 11,520 games a day, the whale of 1,033 games in about 130 minutes, and at most
+/// [`D1_REJUDGE_IDENTITIES_PER_TICK`] identities opened a tick (an identity with no game counts); its cost is the judge's commit (measured by the backfill
 /// tier: about 3,000 rows read per 16 games on a 500-row identity, so at most about 4.3 M rows a day while a run
 /// lasts, none after). A faulted identity is retried the next tick (counted `owed_d1_rejudge_faults_total`) and
 /// skipped at its [`D1_REJUDGE_IDENTITY_FAULTS_MAX`]th consecutive fault (logged, `skipped`), so one poisoned identity
@@ -4553,7 +4817,46 @@ pub async fn reconcile_step(
 pub const D1_REJUDGE_NAME: &str = "owed-judge:version";
 pub const D1_REJUDGE_STATE_SQL: &str =
     "SELECT cursor FROM owed_belt_state WHERE name='owed-judge:version'";
+/// D2-ACTOR-B-FOLD-15 (NEW8-M2 and the captain's pace lever): THE PACE IS A LEVER. The games a tick are the pace
+/// row's (`owed-judge:pace`, `{"gamesPerTick": N}`, set by `POST /internal/owed-rejudge` under `INTERNAL_TOKEN`, read
+/// once per alarm with the stamp), else the render's `OWED_D1_REJUDGE_GAMES_PER_TICK`, else
+/// [`D1_REJUDGE_GAMES_PER_TICK`] (32); clamped to [`D1_REJUDGE_GAMES_PER_TICK_MAX`]. `0` PAUSES the walk, its cursor
+/// kept and the stamp serving `paused`. One judge call is 16 games ([`OWED_JUDGE_SUBJECTS_PER_INVOCATION`]), so a
+/// tick makes `ceil(N / 16)` judge calls; a tick that made more than one yields the alarm's reconcile to the next
+/// alarm ([`reconcile_yields`]), so the alarm's one invocation holds the belt tick and AT MOST 32 games of the
+/// re-judge, or the belt tick, one judge call and the reconcile's one (measured: `fold15_c`).
+///
+/// [`OWED_JUDGE_SUBJECTS_PER_INVOCATION`]: crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION
 pub const D1_REJUDGE_GAMES_PER_TICK: usize = 32;
+/// The ceiling a tick (the pace row and the var clamped to it): two judge calls, the reconcile yielding.
+pub const D1_REJUDGE_GAMES_PER_TICK_MAX: usize = 32;
+/// The pace row's name, its read, and the lever's write (`?1` the cursor, `?2` now).
+pub const D1_REJUDGE_PACE_NAME: &str = "owed-judge:pace";
+pub const D1_REJUDGE_PACE_SQL: &str =
+    "SELECT cursor FROM owed_belt_state WHERE name='owed-judge:pace'";
+/// The lever's statement that clears the row (the render's default applies again).
+pub const D1_REJUDGE_PACE_CLEAR_SQL: &str =
+    "DELETE FROM owed_belt_state WHERE name='owed-judge:pace'";
+/// The lever stamps the pace into a standing stamp (`?1` paused, `?2` the games a tick), so `d1Rejudge` serves it.
+pub const D1_REJUDGE_STAMP_PACE_SQL: &str = "UPDATE owed_belt_state SET cursor=json_set(cursor,'$.paused',json(?1),'$.gamesPerTick',CAST(?2 AS INTEGER)) WHERE name='owed-judge:version'";
+
+/// PURE: the games a tick: the pace row's, else the render's var, else the default; clamped to the ceiling.
+pub fn rejudge_pace(row: Option<&Value>, var: Option<&str>) -> usize {
+    let of_row = row.and_then(|r| crate::owed_events::ms_of(&r["gamesPerTick"]));
+    let of_var = var.and_then(|v| v.trim().parse::<i64>().ok());
+    of_row
+        .or(of_var)
+        .map_or(D1_REJUDGE_GAMES_PER_TICK, |n| n.max(0) as usize)
+        .min(D1_REJUDGE_GAMES_PER_TICK_MAX)
+}
+
+/// PURE: does the alarm's reconcile yield to this re-judge tick (it made more than one judge call)?
+pub fn reconcile_yields(r: &RejudgeReport) -> bool {
+    r.judge_calls > 1
+}
+/// D2-ACTOR-B-FOLD-15 (NEW8-M2): the identities OPENED a tick, at most, whether they hold a game or none (each costs
+/// one `next` read and one games page; the state's write rides in the next read): an identity with no game counts.
+pub const D1_REJUDGE_IDENTITIES_PER_TICK: usize = 32;
 pub const D1_REJUDGE_IDENTITY_FAULTS_MAX: u64 = 3;
 /// The operator's route: the identity's `owed_state.computedAtMs` and the stamp, one statement.
 pub const D1_JUDGED_UNDER_SQL: &str = "SELECT (SELECT CAST(computedAtMs AS INTEGER) FROM owed_state WHERE identity=?1) AS computedAtMs,(SELECT cursor FROM owed_belt_state WHERE name='owed-judge:version') AS stamp";
@@ -4577,7 +4880,8 @@ pub fn rejudge_passed(state: Option<&Value>, identity: &str) -> bool {
 
 /// The judge version D1's rows of `identity` were judged under: the stamp's when its run passed the identity (done,
 /// or the cursor at or past it); the PREVIOUS run's when the identity's last judgement (`owed_state.computedAtMs`, the
-/// greatest of its games') is older than the stamp's run; `"unknown"` otherwise (no stamp, or a judgement since the
+/// greatest of its games') is older than the stamp's run AND that previous run was done (FOLD-15, NEW8-L1);
+/// `"unknown"` otherwise (no stamp, or a judgement since the
 /// run began on an identity the run has not passed: its other games may be older).
 pub fn d1_judged_under(state: Option<&Value>, identity: &str, computed_at: Option<i64>) -> Value {
     let Some(s) = state else {
@@ -4591,10 +4895,14 @@ pub fn d1_judged_under(state: Option<&Value>, identity: &str, computed_at: Optio
         return s["version"].clone();
     }
     match (computed_at, s["startedAtMs"].as_i64()) {
-        (Some(c), Some(start)) if c < start => match &s["previous"]["version"] {
-            Value::String(v) => json!(v),
-            _ => json!("unknown"),
-        },
+        // D2-ACTOR-B-FOLD-15 (the eighth delta lens's NEW8-L1): the previous run's version only when that run was
+        // DONE (it passed every identity); a run replaced mid-walk names no version its rows were judged under.
+        (Some(c), Some(start)) if c < start && s["previous"]["done"] == true => {
+            match &s["previous"]["version"] {
+                Value::String(v) => json!(v),
+                _ => json!("unknown"),
+            }
+        }
         _ => json!("unknown"),
     }
 }
@@ -4608,6 +4916,8 @@ pub fn rejudge_served(state: Option<&Value>) -> Value {
             "identities": s["identities"].as_u64().unwrap_or(0),
             "skipped": s["skipped"].as_u64().unwrap_or(0),
             "done": s["done"] == true,
+            "paused": s["paused"] == true,
+            "gamesPerTick": s["gamesPerTick"],
             "startedAtMs": json_ms(&s["startedAtMs"]),
             "endedAtMs": json_ms(&s["endedAtMs"]),
         }),
@@ -4627,23 +4937,73 @@ pub struct RejudgeReport {
     pub skipped: usize,
     /// The run ended this tick (the stamp moved to the running version).
     pub done: bool,
+    /// FOLD-15: the judge calls this tick made, and the games a tick in force (0: paused).
+    pub judge_calls: usize,
+    pub games_per_tick: usize,
+    pub paused: bool,
 }
 
-/// One paced tick of D1's re-judge ([`D1_REJUDGE_NAME`]); `None` when nothing runs (Phase C, or the stamp is the
+/// One paced tick of D1's re-judge ([`D1_REJUDGE_NAME`]): since FOLD-15 at most [`D1_REJUDGE_IDENTITIES_PER_TICK`]
+/// identities opened and ONE judge call, the state saved after each identity; `None` when nothing runs (Phase C, or the stamp is the
 /// running version and done).
 pub async fn d1_rejudge_step(db: &impl JudgeDb, now: i64) -> Result<Option<RejudgeReport>, String> {
+    d1_rejudge_step_paced(db, now, None).await
+}
+
+/// [`d1_rejudge_step`] under the render's pace var (`OWED_D1_REJUDGE_GAMES_PER_TICK`, `None` unset): the pace row
+/// and the stamp read in ONE call.
+pub async fn d1_rejudge_step_paced(
+    db: &impl JudgeDb,
+    now: i64,
+    pace_var: Option<&str>,
+) -> Result<Option<RejudgeReport>, String> {
     if !db.d1_judges() {
         return Ok(None);
     }
-    let first = |out: Vec<StmtOut>| out.into_iter().next().map(|o| o.rows).unwrap_or_default();
-    let held = rejudge_state_of(
-        first(
-            db.run_batch(vec![Stmt::new(D1_REJUDGE_STATE_SQL, vec![])])
-                .await?,
-        )
-        .first(),
-    );
-    let mut report = RejudgeReport::default();
+    let mut read = db
+        .run_batch(vec![
+            Stmt::new(D1_REJUDGE_STATE_SQL, vec![]),
+            Stmt::new(D1_REJUDGE_PACE_SQL, vec![]),
+        ])
+        .await?
+        .into_iter();
+    let held = rejudge_state_of(read.next().map(|o| o.rows).unwrap_or_default().first());
+    let pace_row = read
+        .next()
+        .and_then(|o| o.rows.into_iter().next())
+        .and_then(|r| {
+            r["cursor"]
+                .as_str()
+                .and_then(|c| serde_json::from_str::<Value>(c).ok())
+        });
+    let pace = rejudge_pace(pace_row.as_ref(), pace_var);
+    let mut report = RejudgeReport {
+        games_per_tick: pace,
+        paused: pace == 0,
+        ..Default::default()
+    };
+    if pace == 0 {
+        // PAUSED: nothing walked, the cursor kept; the stamp says so once (the lever stamps it too).
+        if let Some(mut s) = held.filter(|s| s["version"] == JUDGE_VERSION && s["done"] != true) {
+            if s["paused"] != true {
+                s["paused"] = json!(true);
+                s["gamesPerTick"] = json!(0);
+                db.run_batch(vec![
+                    Stmt::new(
+                        crate::owed_belt::STATE_SQL,
+                        vec![
+                            Bind::Text(D1_REJUDGE_NAME.into()),
+                            Bind::Text(s.to_string()),
+                            Bind::Int(now),
+                        ],
+                    ),
+                    health_snapshot_stmt(now.max(0) as u64, true),
+                ])
+                .await?;
+            }
+        }
+        return Ok(Some(report));
+    }
     let mut st = match held {
         Some(s) if s["version"] == JUDGE_VERSION => {
             if s["done"] == true {
@@ -4661,6 +5021,8 @@ pub async fn d1_rejudge_step(db: &impl JudgeDb, now: i64) -> Result<Option<Rejud
             })
         }
     };
+    st["paused"] = json!(false);
+    st["gamesPerTick"] = json!(pace);
     let add = |st: &mut Value, k: &str, n: u64| {
         st[k] = json!(st[k].as_u64().unwrap_or(0) + n);
     };
@@ -4677,20 +5039,51 @@ pub async fn d1_rejudge_step(db: &impl JudgeDb, now: i64) -> Result<Option<Rejud
             health_snapshot_stmt(now.max(0) as u64, st["done"] == true),
         ]
     };
+    // D2-ACTOR-B-FOLD-15 (the eighth delta lens's NEW8-M2): bounded by D1 CALLS as well as games. At most
+    // [`D1_REJUDGE_IDENTITIES_PER_TICK`] identities are OPENED a tick (each one `next` read and one games page,
+    // whether it holds a game or none) and at most the pace's games (16 a judge call); an identity whose page comes back short
+    // of its size is done with no empty page after it. The state is SAVED AFTER EACH IDENTITY or judge call: its
+    // write rides in the next read's batch (no call added), the last in the tick's save, so a tick that dies loses
+    // the one identity in flight at most.
+    let state_stmt = |st: &Value| {
+        Stmt::new(
+            crate::owed_belt::STATE_SQL,
+            vec![
+                Bind::Text(D1_REJUDGE_NAME.into()),
+                Bind::Text(st.to_string()),
+                Bind::Int(now),
+            ],
+        )
+    };
+    let mut pending: Option<Stmt> = None;
+    let with_pending = |pending: &mut Option<Stmt>, read: Stmt| -> Vec<Stmt> {
+        let mut v: Vec<Stmt> = pending.take().into_iter().collect();
+        v.push(read);
+        v
+    };
+    let last = |out: Vec<StmtOut>| out.into_iter().last().map(|o| o.rows).unwrap_or_default();
     let mut faults = 0u64;
-    while report.games < D1_REJUDGE_GAMES_PER_TICK {
+    let mut opened = 0usize;
+    loop {
         let open = st["open"].as_array().and_then(|a| {
             Some((
                 a.first()?.as_str()?.to_string(),
                 a.get(1)?.as_str()?.to_string(),
             ))
         });
-        let Some((identity, last)) = open else {
-            let next = first(
-                db.run_batch(vec![Stmt::new(
-                    RECONCILE_NEXT_SQL,
-                    vec![Bind::Text(st["after"].as_str().unwrap_or_default().into())],
-                )])
+        let Some((identity, last_game)) = open else {
+            if opened >= D1_REJUDGE_IDENTITIES_PER_TICK {
+                break;
+            }
+            opened += 1;
+            let next = last(
+                db.run_batch(with_pending(
+                    &mut pending,
+                    Stmt::new(
+                        RECONCILE_NEXT_SQL,
+                        vec![Bind::Text(st["after"].as_str().unwrap_or_default().into())],
+                    ),
+                ))
                 .await?,
             );
             match next.first().and_then(|r| r["identity"].as_str()) {
@@ -4708,29 +5101,42 @@ pub async fn d1_rejudge_step(db: &impl JudgeDb, now: i64) -> Result<Option<Rejud
             }
             continue;
         };
-        let page = (D1_REJUDGE_GAMES_PER_TICK - report.games)
-            .min(crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION);
-        let games: Vec<String> = first(
-            db.run_batch(vec![Stmt::new(
-                crate::owed_judge::IDENTITY_GAMES_BY_ID_SQL,
-                vec![
-                    Bind::Text(identity.clone()),
-                    Bind::Text(last),
-                    Bind::Int(page as i64),
-                ],
-            )])
+        if report.games >= pace
+            || report.judge_calls
+                >= pace.div_ceil(crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION)
+        {
+            break;
+        }
+        let page = (pace - report.games).min(crate::owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION);
+        let games: Vec<String> = last(
+            db.run_batch(with_pending(
+                &mut pending,
+                Stmt::new(
+                    crate::owed_judge::IDENTITY_GAMES_BY_ID_SQL,
+                    vec![
+                        Bind::Text(identity.clone()),
+                        Bind::Text(last_game),
+                        Bind::Int(page as i64),
+                    ],
+                ),
+            ))
             .await?,
         )
         .iter()
         .filter_map(|r| r["gameId"].as_str().map(str::to_string))
         .collect();
-        if games.is_empty() {
+        let identity_done = |st: &mut Value, report: &mut RejudgeReport| {
             report.identities += 1;
-            add(&mut st, "identities", 1);
+            add(st, "identities", 1);
             st["after"] = json!(identity);
             st["open"] = Value::Null;
+        };
+        if games.is_empty() {
+            identity_done(&mut st, &mut report);
+            pending = Some(state_stmt(&st));
             continue;
         }
+        report.judge_calls += 1;
         match crate::owed_judge::judge_subjects_acked_to(db, &identity, &games, "rejudge", 0).await
         {
             Ok(judged) => {
@@ -4738,8 +5144,13 @@ pub async fn d1_rejudge_step(db: &impl JudgeDb, now: i64) -> Result<Option<Rejud
                 report.rows += judged.rows;
                 add(&mut st, "games", games.len() as u64);
                 add(&mut st, "rows", judged.rows as u64);
-                st["open"] = json!([identity, games.last().cloned().unwrap_or_default()]);
                 st["openFaults"] = json!(0);
+                if games.len() < page {
+                    identity_done(&mut st, &mut report);
+                } else {
+                    st["open"] = json!([identity, games.last().cloned().unwrap_or_default()]);
+                }
+                pending = Some(state_stmt(&st));
             }
             Err(e) => {
                 faults += 1;
@@ -4766,6 +5177,7 @@ pub async fn d1_rejudge_step(db: &impl JudgeDb, now: i64) -> Result<Option<Rejud
             }
         }
     }
+    drop(pending);
     db.run_batch(save(&st)).await?;
     let mut deltas = Vec::new();
     if report.identities > 0 {
@@ -5529,6 +5941,97 @@ pub async fn owed_v3_pass(
     ])
     .await;
     Ok(report)
+}
+
+/// `GET`/`POST /internal/owed-rejudge` (bearer `INTERNAL_TOKEN`; D2-ACTOR-B-FOLD-15, the captain's pace lever): `POST
+/// {"gamesPerTick": N}` writes the pace row (`0` pauses; past [`D1_REJUDGE_GAMES_PER_TICK_MAX`] a 400) and stamps it
+/// into a standing stamp; `{"gamesPerTick": null}` clears the row (the render's var applies again); `GET` answers the
+/// row, the pace in force, the var, the ceiling and the stamp as `d1Rejudge` serves it.
+pub async fn rejudge_pace_lever(
+    mut req: worker::Request,
+    env: &worker::Env,
+) -> worker::Result<worker::Response> {
+    if !crate::internal_events::internal_bearer_ok(&req, env) {
+        return worker::Response::error("unauthorized", 401);
+    }
+    let db = crate::routes::D1Sql::of(env)?;
+    let var = env
+        .var("OWED_D1_REJUDGE_GAMES_PER_TICK")
+        .ok()
+        .map(|v| v.to_string());
+    let now = worker::Date::now().as_millis() as i64;
+    if req.method() == worker::Method::Post {
+        let body: Value = req.json().await.unwrap_or(Value::Null);
+        let stmts = match pace_lever_plan(&body, now) {
+            Ok(stmts) => stmts,
+            Err(e) => return worker::Response::error(e, 400),
+        };
+        if let Err(e) = db.run_batch(stmts).await {
+            return worker::Response::error(format!("the pace's write faulted: {e}"), 503);
+        }
+    }
+    let out = match db
+        .run_batch(vec![
+            Stmt::new(D1_REJUDGE_PACE_SQL, vec![]),
+            Stmt::new(D1_REJUDGE_STATE_SQL, vec![]),
+        ])
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return worker::Response::error(format!("the pace's read faulted: {e}"), 503),
+    };
+    let row = out.first().and_then(|o| o.rows.first()).and_then(|r| {
+        r["cursor"]
+            .as_str()
+            .and_then(|c| serde_json::from_str::<Value>(c).ok())
+    });
+    let stamp = rejudge_state_of(out.get(1).and_then(|o| o.rows.first()));
+    worker::Response::from_json(&json!({
+        "row": row,
+        "gamesPerTick": rejudge_pace(row.as_ref(), var.as_deref()),
+        "var": var,
+        "default": D1_REJUDGE_GAMES_PER_TICK,
+        "max": D1_REJUDGE_GAMES_PER_TICK_MAX,
+        "d1Rejudge": rejudge_served(stamp.as_ref()),
+    }))
+}
+
+/// PURE: the lever's statements for a `POST` body (`Err`: the 400's words).
+pub fn pace_lever_plan(body: &Value, now: i64) -> Result<Vec<Stmt>, String> {
+    let n = match body.get("gamesPerTick") {
+        Some(Value::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(n) if n as usize <= D1_REJUDGE_GAMES_PER_TICK_MAX => Some(n),
+            _ => {
+                return Err(format!(
+                    "gamesPerTick must be an integer from 0 to {D1_REJUDGE_GAMES_PER_TICK_MAX}, or null"
+                ))
+            }
+        },
+        None => return Err("the body names gamesPerTick".into()),
+    };
+    let mut stmts = vec![match n {
+        Some(n) => Stmt::new(
+            crate::owed_belt::STATE_SQL,
+            vec![
+                Bind::Text(D1_REJUDGE_PACE_NAME.into()),
+                Bind::Text(json!({ "gamesPerTick": n, "setAtMs": now }).to_string()),
+                Bind::Int(now),
+            ],
+        ),
+        None => Stmt::new(D1_REJUDGE_PACE_CLEAR_SQL, vec![]),
+    }];
+    if let Some(n) = n {
+        stmts.push(Stmt::new(
+            D1_REJUDGE_STAMP_PACE_SQL,
+            vec![
+                Bind::Text(if n == 0 { "true" } else { "false" }.into()),
+                Bind::Int(n as i64),
+            ],
+        ));
+    }
+    stmts.push(health_snapshot_stmt(now.max(0) as u64, true));
+    Ok(stmts)
 }
 
 /// `POST /internal/owed-v3-pass` (bearer `INTERNAL_TOKEN`), body empty, `{}` or `{"restart": true}`: one bounded call

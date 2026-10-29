@@ -8028,9 +8028,27 @@ struct Fold13<'a> {
     applies: Cell<usize>,
     /// The D1 judge's commits fault while this is above 0 (each fault takes one).
     commit_faults: Cell<u32>,
+    /// D2-ACTOR-B-FOLD-15: the port's tip (both judges', the reconcile's served tip), and the era the ACTOR's
+    /// closure judges under (`None`: the port's own; a different one plants a genuine judge disagreement).
+    tip: Cell<u64>,
+    actor_era: Option<Option<i64>>,
+    /// FOLD-15: the record answers this many more calls, then every call faults (a tick the platform ends).
+    die_after: Cell<u32>,
+    /// FOLD-15: the D1 judge's commits (batches holding `GAME_DELETE_SQL`): one per judge call.
+    commits: Cell<u32>,
 }
 impl SqlPort for Fold13<'_> {
     async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        if self.die_after.get() == 0 {
+            return Err("the invocation ended (pin)".into());
+        }
+        self.die_after.set(self.die_after.get() - 1);
+        if stmts
+            .iter()
+            .any(|s| s.sql == crate::owed_judge::GAME_DELETE_SQL)
+        {
+            self.commits.set(self.commits.get() + 1);
+        }
         if self.commit_faults.get() > 0
             && stmts
                 .iter()
@@ -8053,7 +8071,7 @@ impl SqlPort for Fold13<'_> {
 }
 impl JudgeDb for Fold13<'_> {
     fn tip(&self) -> Option<u64> {
-        Some(TIP)
+        Some(self.tip.get())
     }
     fn era_ms(&self) -> Option<i64> {
         self.era
@@ -8091,8 +8109,8 @@ impl JudgeDb for Fold13<'_> {
             identity,
             games,
             None,
-            Some(TIP),
-            self.era,
+            Some(self.tip.get()),
+            self.actor_era.unwrap_or(self.era),
         )
         .await?;
         self.actor_stored(identity).await
@@ -8142,6 +8160,10 @@ async fn fold13_a_the_reconcile_judges_d1_fresh_and_never_counts_a_stale_row() {
         era: Some(era),
         applies: Cell::new(0),
         commit_faults: Cell::new(0),
+        tip: Cell::new(TIP),
+        actor_era: None,
+        die_after: Cell::new(u32::MAX),
+        commits: Cell::new(0),
     };
     let r = reconcile_step(&p, NOW_MS as i64).await.unwrap().unwrap();
     assert_eq!(
@@ -8149,7 +8171,9 @@ async fn fold13_a_the_reconcile_judges_d1_fresh_and_never_counts_a_stale_row() {
         (false, 0),
         "a stale D1 row is never a diff: {r:?}"
     );
-    assert_eq!(p.applies.get(), 0, "nothing re-applied into the actor");
+    // FOLD-15 (NEW8-M1): the actor is re-applied ONCE over the picked game, its fresh side of the compare (its
+    // closure re-reads the record); nothing is healed into it (`reapplied` 0).
+    assert_eq!(p.applies.get(), 1, "the actor's fresh judgement, one apply");
     assert_eq!(
         (r.judged, r.unjudged, r.stale_outpoints),
         (1, 0, 1),
@@ -8180,6 +8204,43 @@ async fn fold13_a_the_reconcile_judges_d1_fresh_and_never_counts_a_stale_row() {
         .unwrap();
     assert!(r.diff && r.reapplied > 0 && r.stale_outpoints == 0, "{r:?}");
     assert_eq!(d1.counter(COUNTERS[7]), 1);
+    // FOLD-15: the planted row is the ACTOR's miss (its stored rows against its own fresh re-apply), healed.
+    assert!(d1
+        .lines
+        .borrow()
+        .iter()
+        .any(|l| l.contains("RECONCILE DIFF owner") && l.contains("the actor missed the record")));
+    // A genuine judge disagreement (FOLD-15: both sides judged fresh at one tip): the actor's closure under no era
+    // keeps the press D1 writes off.
+    let p2 = Fold13 {
+        d1: &d1,
+        actor: &local,
+        era: Some(era),
+        applies: Cell::new(0),
+        commit_faults: Cell::new(0),
+        tip: Cell::new(TIP),
+        actor_era: Some(None),
+        die_after: Cell::new(u32::MAX),
+        commits: Cell::new(0),
+    };
+    apply(
+        &d1,
+        &local,
+        &Fakes,
+        "owner",
+        &games,
+        Some(("bootstrap", 2)),
+        Some(TIP),
+        None,
+    )
+    .await
+    .unwrap();
+    let r = reconcile_step(&p2, NOW_MS as i64 + 2 * RECONCILE_INTERVAL_MS)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(r.diff, "{r:?}");
+    assert_eq!(d1.counter(COUNTERS[7]), 2);
     assert!(d1
         .lines
         .borrow()
@@ -8267,6 +8328,10 @@ async fn fold13_b_a_version_move_rejudges_every_identity_once_and_moves_the_stam
         era: None,
         applies: Cell::new(0),
         commit_faults: Cell::new(0),
+        tip: Cell::new(TIP),
+        actor_era: None,
+        die_after: Cell::new(u32::MAX),
+        commits: Cell::new(0),
     };
     let t0 = NOW_MS as i64;
     let (_, reports) = fold13_run(&p, t0).await;
@@ -8372,7 +8437,7 @@ async fn fold13_b_a_version_move_rejudges_every_identity_once_and_moves_the_stam
 async fn fold13_c_the_route_and_the_reconcile_name_a_stale_d1() {
     let st = |done: bool, after: &str| {
         json!({"version": JUDGE_VERSION, "startedAtMs": 1_000, "done": done, "after": after,
-            "previous": {"version": "fold10-old", "startedAtMs": 10}})
+            "previous": {"version": "fold10-old", "startedAtMs": 10, "done": true}})
     };
     assert_eq!(d1_judged_under(None, "b", Some(5)), json!("unknown"));
     assert_eq!(
@@ -8851,4 +8916,459 @@ async fn fold14_d_a_joined_caller_is_answered_by_the_pass_not_the_turn() {
     assert_eq!(got.0.applied_games, vec!["g".to_string()]);
     assert_eq!(got.0.read_ms, 3);
     drop(held);
+}
+
+// ---- D2-ACTOR-B-FOLD-15 (the eighth delta lens's NEW8-M1, NEW8-M2, NEW8-L1; bsv-low #958) ----
+
+fn fold15_port<'a>(d1: &'a SqliteSql, actor: &'a SqliteSql) -> Fold13<'a> {
+    Fold13 {
+        d1,
+        actor,
+        era: None,
+        applies: Cell::new(0),
+        commit_faults: Cell::new(0),
+        tip: Cell::new(TIP),
+        actor_era: None,
+        die_after: Cell::new(u32::MAX),
+        commits: Cell::new(0),
+    }
+}
+
+/// A fleet identity holding a gated row more than 3 blocks from its gate: (fixture's D1, identity, outpoint, game).
+async fn fold15_gated() -> (SqliteSql, String, String, String) {
+    for f in fixtures() {
+        let d1 = d1_judge(&f).await;
+        for id in f.identities.clone() {
+            let rows = d1
+                .run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(id.clone())])])
+                .await
+                .unwrap()[0]
+                .rows
+                .clone();
+            let gated = rows.iter().find(|r| {
+                r["facts"]
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .is_some_and(|f| f["blocksToGate"].as_i64().is_some_and(|b| b > 3))
+            });
+            if let Some(g) = gated {
+                let (o, game) = (
+                    g["outpoint"].as_str().unwrap().to_string(),
+                    g["gameId"].as_str().unwrap().to_string(),
+                );
+                return (d1, id, o, game);
+            }
+        }
+    }
+    panic!("no fixture identity holds a row more than 3 blocks from its gate");
+}
+
+async fn fold15_bootstrap(d1: &SqliteSql, local: &SqliteSql, id: &str, tip: u64) {
+    for chunk in games_of(d1, id).chunks(GAMES_PER_APPLY) {
+        apply(
+            d1,
+            local,
+            &Fakes,
+            id,
+            chunk,
+            Some(("bootstrap", 1)),
+            Some(tip),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+}
+
+fn fold15_rows(db: &SqliteSql, id: &str, game: &str) -> Vec<Value> {
+    let mut q = db
+        .conn
+        .prepare("SELECT outpoint,family,gameId,sats,opponentIdentity,atHeight,facts,reason,claimable,probeTip FROM owed_rows WHERE identity=?1 AND gameId=?2 ORDER BY outpoint")
+        .unwrap();
+    q.query_map(rusqlite::params![id, game], |r| {
+        Ok(json!({
+            "outpoint": r.get::<_, String>(0)?, "family": r.get::<_, Option<String>>(1)?,
+            "gameId": r.get::<_, Option<String>>(2)?, "sats": r.get::<_, Option<i64>>(3)?,
+            "opponentIdentity": r.get::<_, Option<String>>(4)?, "atHeight": r.get::<_, Option<i64>>(5)?,
+            "facts": r.get::<_, Option<String>>(6)?, "reason": r.get::<_, Option<String>>(7)?,
+            "claimable": r.get::<_, Option<i64>>(8)?, "probeTip": r.get::<_, Option<i64>>(9)?,
+        }))
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// (fold15_a) NEW8-M1: THE RECONCILE COMPARES FRESH WITH FRESH AT ONE TIP, AND THE ROUTE NAMES A TIP LAG. The lens's
+/// scratch a: an actor bootstrapped at TIP, D1's stored row of a gated game made stale (another reason), the
+/// reconcile 3 blocks on. Both sides are judged at the reconcile's tip: no reconcile diff (`blocksToGate` 97 on both),
+/// the stale D1 named, the actor's own lag counted apart (`RECONCILE TIP LAG`). On the route, D1 judged 3 blocks
+/// after the actor: the gated row is `tipLag` (both tips stated), never `diff`; a verdict difference still is.
+/// RED on `800d8b2e3`: `RECONCILE DIFF .. (a judge disagreement ..) [facts.blocksToGate d1=97 actor=100]` counted.
+#[tokio::test]
+async fn fold15_a_the_reconcile_compares_fresh_with_fresh_and_the_route_names_a_tip_lag() {
+    let (d1, id, outpoint, game) = fold15_gated().await;
+    let local = mirror();
+    fold15_bootstrap(&d1, &local, &id, TIP).await;
+    let p = fold15_port(&d1, &local);
+    p.tip.set(TIP + 3);
+    d1.conn
+        .execute(
+            "UPDATE owed_rows SET reason='old-build' WHERE identity=?1 AND outpoint=?2",
+            rusqlite::params![id, outpoint],
+        )
+        .unwrap();
+    // The reconcile's cursor just before the identity (the port's other identities hold no bootstrapped actor).
+    let before_id = {
+        let mut b = id.clone().into_bytes();
+        let last = b.len() - 1;
+        b[last] -= 1;
+        String::from_utf8(b).unwrap()
+    };
+    d1.conn
+        .execute(
+            "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,?2,0)",
+            rusqlite::params![RECONCILE_STATE_NAME, before_id],
+        )
+        .unwrap();
+    let r = reconcile_step(&p, NOW_MS as i64 + RECONCILE_INTERVAL_MS)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.identity, id);
+    let lines = d1.lines.borrow().clone();
+    assert!(
+        !r.diff && d1.counter(COUNTERS[7]) == 0,
+        "a tip lag is never a judge disagreement: {r:?} {:?}",
+        lines
+            .iter()
+            .filter(|l| l.contains("RECONCILE"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!((r.judged, r.stale_outpoints), (1, 1), "{r:?}");
+    assert!(
+        d1.counter(COUNTERS[28]) >= 1,
+        "the actor's own lag counted apart"
+    );
+    assert!(lines
+        .iter()
+        .any(|l| l.starts_with(&format!("[owed-actor] RECONCILE TIP LAG (not a STOP) {id}"))));
+    assert!(!lines.iter().any(|l| l.contains("RECONCILE DIFF")));
+    // Both fresh at TIP + 3: the gated row's distance is the same on both sides.
+    let gate = |db: &SqliteSql| {
+        fold15_rows(db, &id, &game)
+            .into_iter()
+            .find(|r| r["outpoint"] == outpoint.as_str())
+            .and_then(|r| {
+                r["facts"]
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            })
+            .map(|f| f["blocksToGate"].clone())
+    };
+    assert_eq!(gate(&d1), gate(&local));
+    // The route: D1 judged at TIP + 3, a fresh actor bootstrapped at TIP.
+    let old = mirror();
+    fold15_bootstrap(&d1, &old, &id, TIP).await;
+    let (d1_rows, actor_rows) = (fold15_rows(&d1, &id, &game), fold15_rows(&old, &id, &game));
+    let view = rows_view(&id, Ok(json!({ "rows": actor_rows })), &d1_rows, None, None);
+    assert!(
+        view["tipLag"]
+            .as_array()
+            .is_some_and(|a| a.contains(&json!(outpoint))),
+        "{}",
+        view["tipLag"]
+    );
+    assert_eq!(view["diff"], json!([]), "only a tip lag: {}", view["diff"]);
+    assert_eq!(view["tipLagTips"]["actor"], json!([TIP]));
+    assert_eq!(view["tipLagTips"]["d1"], json!([TIP + 3]));
+    // A verdict difference beside the lag is still a diff.
+    let mut moved = actor_rows.clone();
+    for r in moved
+        .iter_mut()
+        .filter(|r| r["outpoint"] == outpoint.as_str())
+    {
+        r["reason"] = json!("another verdict");
+    }
+    let view = rows_view(&id, Ok(json!({ "rows": moved })), &d1_rows, None, None);
+    assert_eq!(view["diff"], json!([outpoint]));
+    assert_eq!(view["tipLag"], json!([]));
+}
+
+/// (fold15_b) NEW8-M2: THE RE-JUDGE IS BOUNDED BY CALLS AND SAVED PER IDENTITY. The lens's scratch b: 2,000
+/// identities of `owed_state` holding no game. One tick opens at most `D1_REJUDGE_IDENTITIES_PER_TICK` (each an
+/// identity, counted) in at most two calls each and the save; a tick the platform ends after its tenth call has
+/// saved the identities it passed. RED on `800d8b2e3`: ONE tick walked all 2,000 in 4,003 calls (`left: 2000`), and
+/// a dying tick saved nothing.
+#[tokio::test]
+async fn fold15_b_the_rejudge_is_bounded_by_calls_and_saved_per_identity() {
+    let d1 = SqliteSql::migrated();
+    for i in 0..2000 {
+        d1.conn
+            .execute(
+                &format!(
+                    "INSERT INTO owed_state(identity,computedAtMs,rows) VALUES ('02{i:064x}',1,0)"
+                ),
+                [],
+            )
+            .unwrap();
+    }
+    let local = mirror();
+    let p = fold15_port(&d1, &local);
+    let (b, st) = (d1.batches.get(), d1.stmts.get());
+    let r = d1_rejudge_step(&p, NOW_MS as i64).await.unwrap().unwrap();
+    let (calls, stmts) = (d1.batches.get() - b, d1.stmts.get() - st);
+    eprintln!("fold15_b: one tick over 2,000 no-game identities: {r:?}, {calls} calls, {stmts} statements");
+    assert_eq!(r.identities, D1_REJUDGE_IDENTITIES_PER_TICK, "{r:?}");
+    assert!(
+        calls as usize <= 2 * D1_REJUDGE_IDENTITIES_PER_TICK + 2,
+        "{calls} calls"
+    );
+    assert_eq!(
+        fold13_stamp(&d1)["after"],
+        json!(format!("02{:064x}", D1_REJUDGE_IDENTITIES_PER_TICK - 1))
+    );
+    // A tick that dies after its tenth call: the identities it passed are saved (the save rides the next read).
+    let before = fold13_stamp(&d1)["identities"].as_u64().unwrap();
+    p.die_after.set(10);
+    assert!(d1_rejudge_step(&p, NOW_MS as i64 + 120_000).await.is_err());
+    let after = fold13_stamp(&d1)["identities"].as_u64().unwrap();
+    assert!(
+        after >= before + 3,
+        "saved per identity: {before} then {after}"
+    );
+    // The run goes on to its end, each identity once.
+    p.die_after.set(u32::MAX);
+    let (ticks, _) = fold13_run(&p, NOW_MS as i64 + 240_000).await;
+    let s = fold13_stamp(&d1);
+    assert_eq!(
+        (s["done"].clone(), s["identities"].clone()),
+        (json!(true), json!(2000))
+    );
+    eprintln!("fold15_b: the 2,000 done in {} more ticks", ticks);
+}
+
+/// (fold15_c) NEW8-M2: THE RECONCILE'S FRESH JUDGE IS ONE CALL A STEP, and the alarm's two phases measured on the
+/// fleet's whale (every stored row of it stale: the #958 window). The step judges 16 games in ONE judge call and
+/// marks the rest; a re-judge tick at the default pace (32) is two judge calls and yields the reconcile, at 16 one
+/// call beside it; either alarm under 1,000 statements with the belt tick's 314. RED on `800d8b2e3`: the fresh
+/// judge made 4 calls (64 games).
+#[tokio::test]
+async fn fold15_c_the_reconciles_fresh_judge_is_one_call_and_the_alarm_is_bounded() {
+    let f = fixtures()
+        .into_iter()
+        .find(|f| f.name == "d1_fleet")
+        .unwrap();
+    let d1 = d1_judge(&f).await;
+    let local = mirror();
+    let p = fold15_port(&d1, &local);
+    let mut now = NOW_MS as i64;
+    // The re-judge at the default pace (32: two judge calls, the reconcile yielding), then at 16 (one call, the
+    // reconcile beside it): each run to its end on the fleet, the worst tick's statements kept.
+    let mut worst = [0u32; 2];
+    for (k, pace) in [(0usize, None), (1, Some("16"))] {
+        d1.conn
+            .execute(
+                "DELETE FROM owed_belt_state WHERE name='owed-judge:version'",
+                [],
+            )
+            .unwrap();
+        loop {
+            now += 120_000;
+            let (s, c) = (d1.stmts.get(), p.commits.get());
+            let r = d1_rejudge_step_paced(&p, now, pace).await.unwrap();
+            let st = d1.stmts.get() - s;
+            let calls = p.commits.get() - c;
+            worst[k] = worst[k].max(st);
+            let Some(r) = r else { break };
+            assert_eq!(r.judge_calls as u32, calls);
+            assert!(r.games <= r.games_per_tick && calls <= 2, "{r:?}");
+            assert_eq!(reconcile_yields(&r), calls > 1);
+            if pace.is_some() {
+                assert!(calls <= 1 && !reconcile_yields(&r));
+            }
+            if r.done {
+                break;
+            }
+        }
+    }
+    let worst_rejudge = worst[1];
+    let id = f.identities[0].clone();
+    fold15_bootstrap(&d1, &local, &id, TIP).await;
+    d1.conn
+        .execute(
+            "UPDATE owed_rows SET reason='old-build' WHERE identity=?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    d1.conn
+        .execute(
+            "DELETE FROM owed_belt_state WHERE name LIKE 'reconcile%'",
+            [],
+        )
+        .unwrap();
+    let mut got = None;
+    for _ in 0..200 {
+        now += RECONCILE_INTERVAL_MS;
+        let (s, c) = (d1.stmts.get(), p.commits.get());
+        if let Some(r) = reconcile_step(&p, now).await.unwrap() {
+            if r.identity == id {
+                got = Some((r, d1.stmts.get() - s, p.commits.get() - c));
+                break;
+            }
+        }
+    }
+    let (r, stmts, commits) = got.expect("the whale reconciled");
+    eprintln!(
+        "fold15_c: the worst re-judge tick at 32 games {} statements (the reconcile yields: the alarm {}), at 16 {worst_rejudge}; the whale's reconcile judged {} marked {} in {commits} judge calls, {stmts} statements; with the belt tick's 314 the alarm's worst at 16 {}",
+        worst[0],
+        314 + worst[0],
+        r.judged,
+        r.unjudged,
+        314 + worst_rejudge + stmts
+    );
+    assert!(
+        314 + worst[0] < 1000,
+        "the default pace alone: {}",
+        worst[0]
+    );
+    assert_eq!(commits, 1, "the fresh judge is one call");
+    assert_eq!(r.judged, RECONCILE_JUDGE_GAMES_MAX);
+    assert!(r.unjudged > 0 && !r.diff, "{r:?}");
+    assert!(
+        314 + worst_rejudge + stmts < 1000,
+        "the alarm's one invocation under D1's 1,000: {worst_rejudge} + {stmts}"
+    );
+}
+
+/// (fold15_d) NEW8-L1: `d1JudgedUnder` names the previous run's version only when that run was done. RED on
+/// `800d8b2e3`: `left: "fold10-old" right: "unknown"`.
+#[test]
+fn fold15_d_d1_judged_under_names_only_a_finished_previous_run() {
+    let st = |prev_done: bool| {
+        json!({"version": JUDGE_VERSION, "startedAtMs": 1_000, "done": false, "after": "m",
+            "previous": {"version": "fold10-old", "startedAtMs": 10, "done": prev_done}})
+    };
+    assert_eq!(
+        d1_judged_under(Some(&st(false)), "z", Some(500)),
+        json!("unknown")
+    );
+    assert_eq!(
+        d1_judged_under(Some(&st(true)), "z", Some(500)),
+        json!("fold10-old")
+    );
+}
+
+/// (fold15_e) THE CAPTAIN'S PACE LEVER: the pace row wins over the render's var, the var over the default, all
+/// clamped to 32; `0` PAUSES the walk with its cursor kept and the stamp serving `paused`; a positive pace resumes it
+/// from that cursor; the lever's body checked (an integer to 32, or null to clear); the route and both renders' var
+/// wired. New API: no RED on `800d8b2e3` (it does not compile there).
+#[tokio::test]
+async fn fold15_e_the_pace_is_a_lever_and_zero_pauses_with_the_cursor_kept() {
+    assert_eq!(rejudge_pace(None, None), 32);
+    assert_eq!(rejudge_pace(None, Some("8")), 8);
+    assert_eq!(
+        rejudge_pace(Some(&json!({"gamesPerTick": 4})), Some("8")),
+        4
+    );
+    assert_eq!(rejudge_pace(Some(&json!({"gamesPerTick": 4.0})), None), 4);
+    assert_eq!(
+        rejudge_pace(None, Some("500")),
+        D1_REJUDGE_GAMES_PER_TICK_MAX
+    );
+    assert_eq!(rejudge_pace(None, Some("junk")), 32);
+    assert!(pace_lever_plan(&json!({"gamesPerTick": 33}), 1).is_err());
+    assert!(pace_lever_plan(&json!({"gamesPerTick": -1}), 1).is_err());
+    assert!(pace_lever_plan(&json!({}), 1).is_err());
+    assert_eq!(
+        pace_lever_plan(&json!({"gamesPerTick": null}), 1).unwrap()[0].sql,
+        D1_REJUDGE_PACE_CLEAR_SQL
+    );
+    // A fleet of no-game identities: one tick, then the lever pauses (its own statements), a paused tick walks none.
+    let d1 = SqliteSql::migrated();
+    for i in 0..100 {
+        d1.conn
+            .execute(
+                &format!(
+                    "INSERT INTO owed_state(identity,computedAtMs,rows) VALUES ('02{i:064x}',1,0)"
+                ),
+                [],
+            )
+            .unwrap();
+    }
+    let local = mirror();
+    let p = fold15_port(&d1, &local);
+    let t0 = NOW_MS as i64;
+    let r = d1_rejudge_step(&p, t0).await.unwrap().unwrap();
+    assert_eq!(r.identities, D1_REJUDGE_IDENTITIES_PER_TICK);
+    let cursor = fold13_stamp(&d1)["after"].clone();
+    d1.run_batch(pace_lever_plan(&json!({"gamesPerTick": 0}), t0).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(fold13_stamp(&d1)["paused"], json!(true));
+    for k in 1..=3 {
+        let r = d1_rejudge_step(&p, t0 + k * 120_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            r.paused && r.identities == 0 && r.games_per_tick == 0,
+            "{r:?}"
+        );
+    }
+    let s = fold13_stamp(&d1);
+    assert_eq!(
+        (s["after"].clone(), s["done"].clone()),
+        (cursor.clone(), json!(false))
+    );
+    assert_eq!(rejudge_served(Some(&s))["paused"], json!(true));
+    // Served on /health.owedActor.d1Rejudge (the lever forced the snapshot).
+    let snap: String = d1
+        .conn
+        .query_row(
+            "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:health'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let body = health_body(
+        health_snapshot_of(Some(&snap)).as_ref(),
+        NOW_MS,
+        true,
+        &Value::Null,
+    );
+    assert_eq!(
+        body["d1Rejudge"]["paused"],
+        json!(true),
+        "{}",
+        body["d1Rejudge"]
+    );
+    // Resumed at 8 a tick from the kept cursor.
+    d1.run_batch(pace_lever_plan(&json!({"gamesPerTick": 8}), t0).unwrap())
+        .await
+        .unwrap();
+    let r = d1_rejudge_step(&p, t0 + 10 * 120_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !r.paused && r.games_per_tick == 8 && r.identities > 0,
+        "{r:?}"
+    );
+    assert!(fold13_stamp(&d1)["after"].as_str() > cursor.as_str());
+    assert_eq!(fold13_stamp(&d1)["paused"], json!(false));
+    // The route, the alarm's var read and yield, and both renders' var.
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let lib = squash(include_str!("../lib.rs"));
+    assert!(lib.contains("returnowed_actor::rejudge_pace_lever(req,&env).await;"));
+    let belt = squash(include_str!("../owed_belt.rs"));
+    assert!(belt.contains(".var(\"OWED_D1_REJUDGE_GAMES_PER_TICK\")"));
+    assert!(belt.contains(".is_some_and(crate::owed_actor::reconcile_yields);"));
+    let renders = include_str!("../../wrangler.toml");
+    assert_eq!(
+        renders
+            .matches("\nOWED_D1_REJUDGE_GAMES_PER_TICK = \"32\"\n")
+            .count(),
+        2
+    );
 }

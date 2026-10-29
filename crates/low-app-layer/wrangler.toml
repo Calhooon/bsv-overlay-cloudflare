@@ -59,6 +59,9 @@ OWED_D1_JUDGE = "true"
 # actor the one writer, each identity serialised by its own Durable Object) may raise it, moved WITH the consumer's
 # `max_concurrency` below (pinned equal; the consumer names a value above 1 while `OWED_D1_JUDGE` is on, every batch).
 OWED_CONSUMER_CONCURRENCY = "1"
+# D2-ACTOR-B-FOLD-15: D1's re-judge's games a tick after a JUDGE_VERSION move (at most 32; "0" pauses). The lever
+# `POST /internal/owed-rejudge {"gamesPerTick": N}` (bearer INTERNAL_TOKEN) overrides it with no deploy.
+OWED_D1_REJUDGE_GAMES_PER_TICK = "32"
 AUTH_ENFORCE = "true"  # the promotion 2026-09-21: the identity reads enforced (C6), as proven on beta
 # bsv-low #441: the session lane (one BRC-103 handshake per origin, then a MAC'd lane
 # on `x-low-session*`); the store binding must exist for the flag to mean anything
@@ -328,6 +331,9 @@ OWED_D1_JUDGE = "true"
 # actor the one writer, each identity serialised by its own Durable Object) may raise it, moved WITH the consumer's
 # `max_concurrency` below (pinned equal; the consumer names a value above 1 while `OWED_D1_JUDGE` is on, every batch).
 OWED_CONSUMER_CONCURRENCY = "1"
+# D2-ACTOR-B-FOLD-15: D1's re-judge's games a tick after a JUDGE_VERSION move (at most 32; "0" pauses). The lever
+# `POST /internal/owed-rejudge {"gamesPerTick": N}` (bearer INTERNAL_TOKEN) overrides it with no deploy.
+OWED_D1_REJUDGE_GAMES_PER_TICK = "32"
 RELAY_URL = "https://__HOST_RELAY_BETA__"
 OVERLAY_URL = "https://__HOST_OVERLAY_BETA__"
 ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"
