@@ -366,6 +366,12 @@ pub fn owed_events_view(
         "judgeFaults": c("owed_events_judge_faults_total"),
         "continued": c("owed_events_continued_total"),
         "sweptTotal": c("owed_events_swept_total"),
+        // FIX-956 (bsv-low #956): the sweep's re-publishes by reason, the lost notes, Phase C's direct acks
+        "sweepPassed": c("owed_events_sweep_passed_total"),
+        "sweepStalled": c("owed_events_sweep_stalled_total"),
+        "sweepLost": c("owed_events_sweep_lost_total"),
+        "lostNoted": c("owed_events_lost_noted_total"),
+        "directAcked": c("owed_events_direct_acked_total"),
         "dlqTotal": c("owed_events_dlq_total"),
         "redriven": c("owed_events_redriven_total"),
         "faultHeld": c("owed_events_fault_held_total"),

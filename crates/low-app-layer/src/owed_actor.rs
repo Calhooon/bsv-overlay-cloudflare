@@ -4360,13 +4360,24 @@ pub async fn as_the_judge(
             games.len()
         ));
     }
-    let gj = json!(applied).to_string();
-    db.run_batch(vec![
+    db.run_batch(phase_c_ack_statements(&id, &applied, seen))
+        .await?;
+    Ok(crate::owed_judge::JudgeReport {
+        subjects: applied.len(),
+        rows: answer["rows"].as_array().map_or(0, Vec::len),
+        ..Default::default()
+    })
+}
+
+/// PHASE C's acknowledgement of `games`' marks up to the generation `seen` read BEFORE the actor's call (the
+/// consumer's [`as_the_judge`] and, FIX-956 item 3, a direct apply that landed: one rule, one batch).
+pub fn phase_c_ack_statements(identity: &str, games: &[String], seen: i64) -> Vec<Stmt> {
+    vec![
         Stmt::new(
             crate::owed_judge::ACK_DIRTY_SQL,
             vec![
-                Bind::Text(id),
-                Bind::Text(gj),
+                Bind::Text(identity.to_ascii_lowercase()),
+                Bind::Text(json!(games).to_string()),
                 Bind::Int(seen),
                 Bind::Text("[]".into()),
             ],
@@ -4378,13 +4389,7 @@ pub async fn as_the_judge(
         // cursor, left at the last identity, stamped again having judged nothing).
         Stmt::new(OWED_V3_RESTART_SQL[0], vec![]),
         Stmt::new(OWED_V3_RESTART_SQL[1], vec![]),
-    ])
-    .await?;
-    Ok(crate::owed_judge::JudgeReport {
-        subjects: applied.len(),
-        rows: answer["rows"].as_array().map_or(0, Vec::len),
-        ..Default::default()
-    })
+    ]
 }
 
 /// THE `owed-v3` RE-JUDGE (the D2-ACTOR-B lens's MEDIUM-9; `CUTOVER-D2-ACTOR-2026-10-28.md` section 4, Phase C's

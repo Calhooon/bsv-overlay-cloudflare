@@ -12,15 +12,34 @@
 //! [`owed_event::MAX_GAMES_PER_MESSAGE`] subjects a message: the rest are a continuation event published by the
 //! consumer. A judge that faults leaves the marks and hands the message back (`max_retries = 3`, then the DLQ).
 //!
-//! THE SWEEP ([`sweep`], on the belt's 120 s alarm): the marks no consumer acknowledged within one tick are
-//! re-published as events, oldest first past a rotating cursor, 64 pairs a tick: `owed_dirty` is the durable intent
-//! ledger, so a publish cancelled or refused is never a lost event. With no queue binding the drain judges as before.
+//! THE SWEEP ([`sweep`], on the belt's 120 s alarm; FIX-956, bsv-low #956): `owed_dirty` is the durable intent ledger,
+//! so a publish cancelled or refused is never a lost event; the sweep re-publishes a mark only once the record says
+//! its message is LOST, never because the consumer has not reached it yet. Until FIX-956 every mark older than one
+//! tick was re-published, so with the serial consumer's backstop lag past a tick (273 s p95 on beta) every mark was
+//! re-published while its own message waited in the queue: 604 re-publishes in 6.7 quiet hours, each a direct call
+//! and a queue message adding to the lag it was meant to cover. Now the consumer records its HORIZON in its batch row
+//! (`horizonMs`: the greatest publish stamp, the event's `atMs`, among the messages its batch acknowledged; never
+//! lowered, [`CONSUMER_ROW_SQL`]), and a mark older than one tick is UN-ACKED when EITHER the horizon has passed it by
+//! [`SWEEP_HORIZON_MARGIN_MS`] (one tick, for the queue's re-ordering of retried messages: the consumer judged a
+//! message published after this mark's, so this mark's own message is gone) OR it is older than
+//! [`SWEEP_STALLED_AFTER_MS`] (five ticks: the consumer dead or the queue stalled, where re-publishing is the only
+//! belt). One bind ([`sweep_bound`]) over `idx_owed_dirty_backlog`, oldest first past a rotating cursor, 64 pairs a
+//! tick. AT MOST ONCE A PASS: a re-published pair is stamped (`owed-events:swept:<source> <sourceKey>`, the fault
+//! memos' shape, in the sweep's cursor batch) and not re-published again until the horizon passes that stamp by the
+//! margin, or the long bound passes it ([`swept_blocks`]); the consumer's landed judge of the pair clears the stamp.
+//! A pair a publisher KNOWS it lost (its send or seq batch faulted, the answer wall dropped it) carries a LOST NOTE
+//! (`owed_events_publish::LOST_MEMO_PREFIX`) and is re-published at the next tick whatever the horizon, the note
+//! deleted in that tick's batch. A pair held by its fault memo waits out its hold. With no queue binding the drain
+//! judges as before.
 use crate::owed_events_publish as publish;
 use crate::owed_judge::{self, JudgeDb};
 use crate::pot_hook::{Bind, SqlPort, Stmt};
 use overlay_discovery::owed_event::{self, OwedEvent};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+
+#[cfg(test)]
+mod tests;
 
 /// MEDIUM-1 (the D2-ACTOR-A lens): the `owed-events` consumer's `max_concurrency` in every app-layer render: ONE
 /// judge at a time fleet-wide, the serialiser of the judge per identity until lane B's per-identity actor. Two
@@ -59,22 +78,90 @@ pub const ROUTE_IDENTITY_HELD_SQL: &str = "SELECT COUNT(DISTINCT d.identity||'/'
 /// Mark rows one message reads (a subject can hold several marks).
 pub const ROUTE_READ_LIMIT: usize = 4 * owed_event::MAX_GAMES_PER_MESSAGE;
 
-/// A mark is UN-ACKED once it has waited this long (one belt tick) with no consumer acknowledging it.
+/// A mark is never re-published younger than this (one belt tick).
 pub const SWEEP_AFTER_MS: i64 = crate::owed_belt::OWED_BELT_TICK_MS;
+/// FIX-956: the consumer's horizon must pass a mark by this much before the mark reads lost (one tick: the queue
+/// re-orders a retried message behind later ones).
+pub const SWEEP_HORIZON_MARGIN_MS: i64 = SWEEP_AFTER_MS;
+/// FIX-956: past this a mark is re-published whatever the horizon (five ticks: the consumer dead or the queue
+/// stalled; the only belt there).
+pub const SWEEP_STALLED_AFTER_MS: i64 = 5 * SWEEP_AFTER_MS;
+/// FIX-956: the swept stamps' prefix (`owed-events:swept:<source> <sourceKey>`, cursor `{sweptAtMs}`).
+pub const SWEPT_MEMO_PREFIX: &str = "owed-events:swept:";
+/// The swept stamp's name of a pair.
+pub fn swept_memo_name(source: &str, key: &str) -> String {
+    format!("{SWEPT_MEMO_PREFIX}{source} {key}")
+}
+/// Write one swept stamp (`?1` its name, `?2` now).
+pub const SWEPT_MEMO_WRITE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,json_object('sweptAtMs',?2),?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+/// A stamp no consumer cleared (its marks acknowledged by another road) is pruned after a day, 64 a tick (a range of
+/// the primary key, `?1` the cutoff).
+pub const SWEPT_PRUNE_SQL: &str = "DELETE FROM owed_belt_state WHERE name IN (SELECT name FROM owed_belt_state WHERE name>='owed-events:swept:' AND name<'owed-events:swept;' AND tickedAtMs<?1 LIMIT 64)";
+/// How long an uncleared swept stamp is kept.
+pub const SWEPT_PRUNE_AFTER_MS: i64 = 24 * 3_600_000;
+/// FIX-956 1b: the lost notes, oldest first (a range of the primary key; at most `?1`).
+pub const LOST_READ_SQL: &str = "SELECT name,cursor FROM owed_belt_state WHERE name>='owed-events:lost:' AND name<'owed-events:lost;' ORDER BY tickedAtMs LIMIT ?1";
+/// FIX-956 1b: the most lost notes one tick takes (the rest of its 64 places are the candidates').
+pub const SWEEP_LOST_PER_TICK: usize = SWEEP_PAIRS_PER_TICK / 2;
+/// FIX-956 1b: delete one lost note (the sweep re-published its pair).
+pub const LOST_CLEAR_SQL: &str = "DELETE FROM owed_belt_state WHERE name=?1";
+
+/// PURE (FIX-956): the sweep's one bound: a mark older than one tick, AND passed by the consumer's horizon by the
+/// margin OR older than the long bound (`horizon` `None`: the consumer never recorded one; the long bound alone).
+pub fn sweep_bound(now_ms: i64, horizon_ms: Option<i64>) -> i64 {
+    let passed = horizon_ms.map_or(i64::MIN, |h| h - SWEEP_HORIZON_MARGIN_MS);
+    (now_ms - SWEEP_AFTER_MS).min(passed.max(now_ms - SWEEP_STALLED_AFTER_MS))
+}
+
+/// Why the sweep re-publishes a pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepReason {
+    /// The consumer's horizon passed its oldest mark.
+    Passed,
+    /// The long bound alone.
+    Stalled,
+    /// A publisher noted it lost.
+    Lost,
+}
+
+/// PURE: the reason of a mark marked at `marked_at_ms` under [`sweep_bound`] (passed when the horizon covers it).
+pub fn sweep_reason(marked_at_ms: i64, horizon_ms: Option<i64>) -> SweepReason {
+    if horizon_ms.is_some_and(|h| marked_at_ms < h - SWEEP_HORIZON_MARGIN_MS) {
+        SweepReason::Passed
+    } else {
+        SweepReason::Stalled
+    }
+}
+
+/// PURE (FIX-956, at most once a pass): does a swept stamp at `swept_at_ms` hold its pair back? Until the horizon has
+/// passed the re-publish by the margin (the consumer has not yet reached the re-published message), and the long
+/// bound has not passed it.
+pub fn swept_blocks(swept_at_ms: i64, now_ms: i64, horizon_ms: Option<i64>) -> bool {
+    let passed = horizon_ms.is_some_and(|h| swept_at_ms < h - SWEEP_HORIZON_MARGIN_MS);
+    !passed && now_ms - swept_at_ms < SWEEP_STALLED_AFTER_MS
+}
 /// The pairs one sweep tick re-publishes.
 pub const SWEEP_PAIRS_PER_TICK: usize = 64;
 /// The mark rows one sweep tick reads past its cursor (several marks share a pair).
 pub const SWEEP_READ_LIMIT: usize = 256;
 /// The sweep's walk, oldest first past the cursor `(?2, ?3)`, only marks older than `?1` (`idx_owed_dirty_backlog`).
 pub const SWEEP_SQL: &str = "SELECT generation,source,sourceKey,markedAtMs,identity,gameId FROM owed_dirty INDEXED BY idx_owed_dirty_backlog WHERE markedAtMs<?1 AND (markedAtMs>?2 OR (markedAtMs=?2 AND generation>?3)) ORDER BY markedAtMs,generation LIMIT ?4";
-/// The sweep's cursor row.
-pub const SWEEP_CURSOR_READ_SQL: &str =
-    "SELECT cursor FROM owed_belt_state WHERE name='owed-events:sweep'";
+/// The sweep's cursor row and (FIX-956) the consumer's row, whose `horizonMs` bounds the sweep: two primary-key rows.
+pub const SWEEP_CURSOR_READ_SQL: &str = "SELECT name,cursor FROM owed_belt_state WHERE name IN ('owed-events:sweep','owed-events:consumer')";
 /// Write the sweep's cursor.
 pub const SWEEP_CURSOR_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:sweep',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
 /// MEDIUM-8: the consumer's batch row: the oldest message's enqueue age (a Worker cannot read its queue's backlog;
 /// the pass-meter precedent), served on `/health.owedEvents` and the overlay's `/health/invariants.owedEvents`.
-pub const CONSUMER_ROW_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:consumer',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+/// FIX-956: the row carries the consumer's HORIZON, `horizonMs`, the greatest publish stamp among the messages a
+/// batch acknowledged, never lowered (a batch that acknowledged none, or an older one, keeps the row's).
+pub const CONSUMER_ROW_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-events:consumer',?1,?2) ON CONFLICT(name) DO UPDATE SET cursor=json_set(excluded.cursor,'$.horizonMs',MAX(COALESCE(json_extract(excluded.cursor,'$.horizonMs'),0),COALESCE(json_extract(owed_belt_state.cursor,'$.horizonMs'),0))),tickedAtMs=excluded.tickedAtMs";
+/// PURE: the horizon a consumer row's cursor names (`None`: none recorded).
+pub fn horizon_of(cursor: &Value) -> Option<i64> {
+    cursor["horizonMs"]
+        .as_i64()
+        .or_else(|| cursor["horizonMs"].as_f64().map(|f| f as i64))
+        .filter(|h| *h > 0)
+}
 /// The consumer's row, and beside it (D2-ACTOR-B-FOLD-6, the land tier's `health-dirty-snapshot`) the owed actor's
 /// health snapshot (`owed_actor::HEALTH_SNAPSHOT_NAME`): two primary-key rows in one statement, so `/health.owedActor`
 /// adds one row read and no statement.
@@ -249,12 +336,21 @@ pub async fn note_wall_subjects(db: &impl SqlPort, names: &[String]) -> Option<u
 }
 
 /// The statements a landed judge of `(source, key)` adds to its consumer's batch row: the memo cleared, the pair's
-/// dead letter resolved (two primary-key deletes).
+/// swept stamp and lost note cleared (FIX-956), its dead letter resolved (four primary-key deletes).
 pub fn resolved_statements(source: &str, key: &str) -> Vec<Stmt> {
     vec![
         Stmt {
             sql: FAULT_MEMO_CLEAR_SQL.into(),
             binds: vec![Bind::Text(fault_memo_name(source, key))],
+        },
+        // FIX-956: the pair's swept stamp and lost note go with it (the consumer passed the pair)
+        Stmt {
+            sql: FAULT_MEMO_CLEAR_SQL.into(),
+            binds: vec![Bind::Text(swept_memo_name(source, key))],
+        },
+        Stmt {
+            sql: FAULT_MEMO_CLEAR_SQL.into(),
+            binds: vec![Bind::Text(publish::lost_memo_name(source, key))],
         },
         Stmt {
             sql: DEAD_LETTER_RESOLVE_SQL.into(),
@@ -782,6 +878,15 @@ pub fn sweep_choice(
     rows: &[Value],
     read_limit: usize,
 ) -> (Vec<Pair>, Option<(i64, i64)>) {
+    sweep_choice_up_to(rows, read_limit, SWEEP_PAIRS_PER_TICK)
+}
+
+/// [`sweep_choice`] up to `cap` pairs (FIX-956: the tick's lost notes take their places first).
+pub fn sweep_choice_up_to(
+    rows: &[Value],
+    read_limit: usize,
+    cap: usize,
+) -> (Vec<Pair>, Option<(i64, i64)>) {
     let mut pairs: Vec<(String, String)> = Vec::new();
     let mut cursor = None;
     for r in rows {
@@ -795,7 +900,7 @@ pub fn sweep_choice(
         };
         let pair = (source.to_owned(), key.to_owned());
         if !pairs.contains(&pair) {
-            if pairs.len() >= SWEEP_PAIRS_PER_TICK {
+            if pairs.len() >= cap {
                 return (pairs, cursor);
             }
             pairs.push(pair);
@@ -809,33 +914,115 @@ pub fn sweep_choice(
     (pairs, cursor)
 }
 
+/// What one sweep tick chose (FIX-956).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Swept {
+    /// The pairs to re-publish, the lost notes' first.
+    pub pairs: Vec<Pair>,
+    /// Each pair's reason, in `pairs`' order.
+    pub reasons: Vec<SweepReason>,
+    /// Candidates left out by their swept stamp (re-published, the consumer not yet past it).
+    pub once: usize,
+    /// The consumer's horizon read.
+    pub horizon_ms: Option<i64>,
+}
+
+impl Swept {
+    /// How many pairs of `reason`.
+    pub fn count(&self, reason: SweepReason) -> usize {
+        self.reasons.iter().filter(|r| **r == reason).count()
+    }
+}
+
 /// HIGH-2's second belt: the pairs whose marks waited past one tick, oldest first past the cursor, and the cursor
 /// saved. The caller publishes them ([`sweep_publish`]).
 pub async fn sweep(db: &impl SqlPort, now_ms: i64) -> Result<Vec<(String, String)>, String> {
-    let cursor = rows(db, SWEEP_CURSOR_READ_SQL, vec![]).await?;
-    let (at, g) = cursor
-        .first()
-        .and_then(|r| r["cursor"].as_str())
-        .and_then(|c| serde_json::from_str::<Value>(c).ok())
+    Ok(sweep_tick(db, now_ms).await?.pairs)
+}
+
+/// FIX-956 (bsv-low #956): one sweep tick. Reads the cursor and the consumer's horizon (one statement), the lost
+/// notes, then the marks under [`sweep_bound`] past the cursor; leaves out a pair held by a fault memo or (once a
+/// pass) by its swept stamp; then ONE batch: the cursor, a swept stamp per chosen pair, the chosen lost notes deleted
+/// and the old stamps pruned.
+pub async fn sweep_tick(db: &impl SqlPort, now_ms: i64) -> Result<Swept, String> {
+    let state = rows(db, SWEEP_CURSOR_READ_SQL, vec![]).await?;
+    let state_of = |name: &str| {
+        state
+            .iter()
+            .find(|r| r["name"].as_str() == Some(name))
+            .and_then(|r| r["cursor"].as_str())
+            .and_then(|c| serde_json::from_str::<Value>(c).ok())
+    };
+    let (at, g) = state_of("owed-events:sweep")
         .map(|c| (c["at"].as_i64().unwrap_or(-1), c["g"].as_i64().unwrap_or(0)))
         .unwrap_or((-1, 0));
+    let horizon = state_of("owed-events:consumer").and_then(|c| horizon_of(&c));
+    // 1b: the lost notes first, whatever the horizon
+    let lost_rows = rows(
+        db,
+        LOST_READ_SQL,
+        vec![Bind::Int(SWEEP_LOST_PER_TICK as i64)],
+    )
+    .await?;
+    let mut lost: Vec<(Pair, String)> = Vec::new();
+    for r in &lost_rows {
+        let Some(name) = r["name"].as_str() else {
+            continue;
+        };
+        let c = r["cursor"]
+            .as_str()
+            .and_then(|c| serde_json::from_str::<Value>(c).ok())
+            .unwrap_or(Value::Null);
+        match (c["source"].as_str(), c["sourceKey"].as_str()) {
+            (Some(src), Some(key)) => lost.push(((src.to_owned(), key.to_owned()), name.to_owned())),
+            // a note that does not read is deleted (it names no pair)
+            _ => lost.push((("".into(), "".into()), name.to_owned())),
+        }
+    }
     let read = rows(
         db,
         SWEEP_SQL,
         vec![
-            Bind::Int(now_ms - SWEEP_AFTER_MS),
+            Bind::Int(sweep_bound(now_ms, horizon)),
             Bind::Int(at),
             Bind::Int(g),
             Bind::Int(SWEEP_READ_LIMIT as i64),
         ],
     )
     .await?;
-    let (pairs, next) = sweep_choice(&read, SWEEP_READ_LIMIT);
-    // MEDIUM-2: a pair whose judge faulted past the bound waits out its hold (its marks stay; the walk wraps to it)
-    let pairs = if pairs.is_empty() {
-        pairs
+    let lost_pairs: Vec<Pair> = lost
+        .iter()
+        .map(|(p, _)| p.clone())
+        .filter(|(s, _)| !s.is_empty())
+        .collect();
+    let cap = SWEEP_PAIRS_PER_TICK.saturating_sub(lost_pairs.len());
+    let (candidates, next) = sweep_choice_up_to(&read, SWEEP_READ_LIMIT, cap);
+    let oldest: BTreeMap<Pair, i64> = read.iter().fold(BTreeMap::new(), |mut m, r| {
+        if let (Some(s), Some(k), Some(at)) = (
+            r["source"].as_str(),
+            r["sourceKey"].as_str(),
+            r["markedAtMs"].as_i64(),
+        ) {
+            m.entry((s.to_owned(), k.to_owned())).or_insert(at);
+        }
+        m
+    });
+    let candidates: Vec<Pair> = candidates
+        .into_iter()
+        .filter(|p| !lost_pairs.contains(p))
+        .collect();
+    let mut out = Swept {
+        horizon_ms: horizon,
+        ..Swept::default()
+    };
+    let all: Vec<Pair> = lost_pairs.iter().chain(candidates.iter()).cloned().collect();
+    // MEDIUM-2: a pair whose judge faulted past the bound waits out its hold (its marks stay; the walk wraps to it);
+    // FIX-956: a candidate re-published and not yet passed by the consumer waits (its swept stamp)
+    let kept = if all.is_empty() {
+        all
     } else {
-        let mut names: Vec<String> = pairs.iter().map(|(s, k)| fault_memo_name(s, k)).collect();
+        let mut names: Vec<String> = all.iter().map(|(s, k)| fault_memo_name(s, k)).collect();
+        names.extend(candidates.iter().map(|(s, k)| swept_memo_name(s, k)));
         // NEW-M1: the subjects read for each chosen pair, by their subject memos
         let mut subjects: BTreeMap<Pair, Vec<Option<String>>> = BTreeMap::new();
         for r in &read {
@@ -843,7 +1030,7 @@ pub async fn sweep(db: &impl SqlPort, now_ms: i64) -> Result<Vec<(String, String
                 continue;
             };
             let pair = (source.to_owned(), key.to_owned());
-            if !pairs.contains(&pair) {
+            if !all.contains(&pair) {
                 continue;
             }
             let name = match (r["identity"].as_str(), r["gameId"].as_str()) {
@@ -863,23 +1050,68 @@ pub async fn sweep(db: &impl SqlPort, now_ms: i64) -> Result<Vec<(String, String
             vec![Bind::Text(json!(names).to_string())],
         )
         .await?;
-        let (kept, held) = unheld(pairs, &subjects, &memos, now_ms);
+        let swept_at = |pair: &Pair| -> Option<i64> {
+            let name = swept_memo_name(&pair.0, &pair.1);
+            memos
+                .iter()
+                .find(|r| r["name"].as_str() == Some(name.as_str()))
+                .and_then(|r| r["cursor"].as_str())
+                .and_then(|c| serde_json::from_str::<Value>(c).ok())
+                .and_then(|c| c["sweptAtMs"].as_i64())
+        };
+        let before = all.len();
+        let all: Vec<Pair> = all
+            .into_iter()
+            .filter(|p| {
+                lost_pairs.contains(p)
+                    || !swept_at(p).is_some_and(|at| swept_blocks(at, now_ms, horizon))
+            })
+            .collect();
+        out.once = before - all.len();
+        let (kept, held) = unheld(all, &subjects, &memos, now_ms);
         if held > 0 {
             db.counters(vec![("owed_events_sweep_held_total".into(), held as u64)])
                 .await;
         }
         kept
     };
+    for p in &kept {
+        out.reasons.push(if lost_pairs.contains(p) {
+            SweepReason::Lost
+        } else {
+            sweep_reason(oldest.get(p).copied().unwrap_or(now_ms), horizon)
+        });
+    }
+    out.pairs = kept;
     let next = next.map_or(
         json!({"at": -1, "g": 0}),
         |(at, g)| json!({"at": at, "g": g}),
     );
-    db.run_batch(vec![Stmt {
+    let mut batch = vec![Stmt {
         sql: SWEEP_CURSOR_SQL.into(),
         binds: vec![Bind::Text(next.to_string()), Bind::Int(now_ms)],
-    }])
-    .await?;
-    Ok(pairs)
+    }];
+    for (s, k) in &out.pairs {
+        batch.push(Stmt {
+            sql: SWEPT_MEMO_WRITE_SQL.into(),
+            binds: vec![Bind::Text(swept_memo_name(s, k)), Bind::Int(now_ms)],
+        });
+    }
+    // a lost note is taken out when its pair is re-published now (or names no pair); one held by its fault memo stays
+    for (pair, name) in &lost {
+        if pair.0.is_empty() || out.pairs.contains(pair) {
+            batch.push(Stmt {
+                sql: LOST_CLEAR_SQL.into(),
+                binds: vec![Bind::Text(name.clone())],
+            });
+        }
+    }
+    batch.push(Stmt {
+        sql: SWEPT_PRUNE_SQL.into(),
+        binds: vec![Bind::Int(now_ms - SWEPT_PRUNE_AFTER_MS)],
+    });
+    db.run_batch(batch).await?;
+    Ok(out)
 }
 
 /// The publish's port over a [`SqlPort`] (the pins' SQLite and the worker's D1) and a send.
@@ -995,7 +1227,8 @@ pub async fn configured(env: &worker::Env) -> bool {
 /// The sweep on the belt's alarm, then its publish. Answers the pairs re-published.
 pub async fn sweep_publish(env: &worker::Env) -> Result<usize, String> {
     let sql = crate::routes::D1Sql::of(env).map_err(|e| e.to_string())?;
-    let pairs = sweep(&sql, worker::Date::now().as_millis() as i64).await?;
+    let swept = sweep_tick(&sql, worker::Date::now().as_millis() as i64).await?;
+    let pairs = swept.pairs.clone();
     if pairs.is_empty() {
         return Ok(0);
     }
@@ -1003,12 +1236,18 @@ pub async fn sweep_publish(env: &worker::Env) -> Result<usize, String> {
         return Err("no owed-events binding".into());
     };
     let report = publish::publish_with(&port, notes_of(&pairs)).await;
+    // FIX-956 1b: a re-publish that faulted is noted lost again (the next tick takes it whatever its stamp)
+    let lost_noted = publish::write_lost(&port, publish::lost_of(&report)).await;
     // D2-ACTOR-D (bsv-low #952): the re-published pairs' actors called inline (the scheduled drain's own pass).
     direct_events(env, report.sent.clone()).await;
     publish::bump(
         env,
         &[
             ("owed_events_swept_total", report.sent.len() as u64),
+            (publish::COUNTER_SWEEP_PASSED, swept.count(SweepReason::Passed) as u64),
+            (publish::COUNTER_SWEEP_STALLED, swept.count(SweepReason::Stalled) as u64),
+            (publish::COUNTER_SWEEP_LOST, swept.count(SweepReason::Lost) as u64),
+            (publish::COUNTER_LOST_NOTED, lost_noted),
             (publish::COUNTER_PUBLISHED, report.sent.len() as u64),
             (publish::COUNTER_SKIPPED, report.skipped as u64),
             (publish::COUNTER_FAULTS, u64::from(report.fault.is_some())),
@@ -1288,6 +1527,8 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
     let mut messages = 0u64;
     let mut resolved: Vec<Stmt> = Vec::new();
     let mut service_max: u64 = 0;
+    // FIX-956: the greatest publish stamp among the messages this batch ACKNOWLEDGED (the consumer's horizon)
+    let mut horizon: Option<i64> = None;
     // D2-ACTOR-E (bsv-low #954) item 3: a batch of several messages is judged ONCE per identity first; a fault of
     // that pass hands the batch to the one-message path below (each message's own fault memo and wall).
     let raw: Vec<_> = batch.raw_iter().collect();
@@ -1326,6 +1567,7 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                         resolved.extend(resolved_statements(&ev.source, &ev.source_key));
                     }
                     *deltas.entry("owed_events_consumed_total").or_default() += 1;
+                    horizon = horizon.max(Some(ev.at_ms));
                     msg.ack();
                 }
                 *deltas.entry("owed_events_acked_marks_total").or_default() += routed.marks as u64;
@@ -1352,6 +1594,7 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                     service_max,
                     deltas,
                     resolved,
+                    horizon,
                 )
                 .await;
             }
@@ -1378,7 +1621,7 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                     );
                 }
                 return finish_batch(
-                    &env, now, oldest_age, messages, service_ms, deltas, resolved,
+                    &env, now, oldest_age, messages, service_ms, deltas, resolved, horizon,
                 )
                 .await;
             }
@@ -1455,6 +1698,7 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                 if all_held(&routed) {
                     *deltas.entry("owed_events_all_held_total").or_default() += 1;
                 }
+                horizon = horizon.max(Some(ev.at_ms));
                 msg.ack();
             }
             Err(e) => {
@@ -1484,10 +1728,35 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
             }
         }
     }
-    finish_batch(&env, now, oldest_age, messages, service_max, deltas, resolved).await
+    finish_batch(
+        &env, now, oldest_age, messages, service_max, deltas, resolved, horizon,
+    )
+    .await
 }
 
-/// The batch's end: its counters, the consumer's age row, the resolved pairs and the health snapshot, one batch.
+/// PURE (FIX-956): the consumer row's cursor of one batch (`horizon`: the greatest publish stamp it acknowledged;
+/// [`CONSUMER_ROW_SQL`] keeps the row's when this is lower or absent).
+pub fn consumer_row(
+    now: i64,
+    oldest_age: i64,
+    messages: u64,
+    service_max: u64,
+    horizon: Option<i64>,
+) -> Value {
+    json!({"oldestEnqueueAgeMs": oldest_age, "messages": messages, "serviceMs": service_max, "atMs": now, "horizonMs": horizon})
+}
+
+/// The consumer row's write (the pins run it as the batch writes it).
+pub fn consumer_row_stmt(row: &Value, now: i64) -> Stmt {
+    Stmt {
+        sql: CONSUMER_ROW_SQL.into(),
+        binds: vec![Bind::Text(row.to_string()), Bind::Int(now)],
+    }
+}
+
+/// The batch's end: its counters, the consumer's age row (and its horizon), the resolved pairs and the health
+/// snapshot, one batch.
+#[allow(clippy::too_many_arguments)]
 async fn finish_batch(
     env: &worker::Env,
     now: i64,
@@ -1496,15 +1765,13 @@ async fn finish_batch(
     service_max: u64,
     deltas: BTreeMap<&str, u64>,
     resolved: Vec<Stmt>,
+    horizon: Option<i64>,
 ) -> worker::Result<()> {
     let deltas: Vec<(&str, u64)> = deltas.into_iter().filter(|(_, d)| *d > 0).collect();
     publish::bump(env, &deltas).await;
     if let Ok(sql) = crate::routes::D1Sql::of(env) {
-        let row = json!({"oldestEnqueueAgeMs": oldest_age, "messages": messages, "serviceMs": service_max, "atMs": now});
-        let mut batch_row = vec![Stmt {
-            sql: CONSUMER_ROW_SQL.into(),
-            binds: vec![Bind::Text(row.to_string()), Bind::Int(now)],
-        }];
+        let row = consumer_row(now, oldest_age, messages, service_max, horizon);
+        let mut batch_row = vec![consumer_row_stmt(&row, now)];
         // MEDIUM-2: a landed judge clears its pair's fault memo and resolves its dead letter
         batch_row.extend(resolved);
         // D2-ACTOR-B-FOLD-6: the owed actor's health snapshot, in the consumer row's batch (at most once a minute).
@@ -1596,6 +1863,7 @@ pub async fn health_and_actor(db: &impl SqlPort, dirty: &Value) -> (Value, Optio
             .and_then(|r| r["cursor"].as_str())
     };
     let consumer = row("owed-events:consumer").and_then(|c| serde_json::from_str::<Value>(c).ok());
+    let horizon = consumer.as_ref().and_then(horizon_of);
     let actor = crate::owed_actor::health_snapshot_of(row(crate::owed_actor::HEALTH_SNAPSHOT_NAME));
     let total = |name: &str| -> u64 {
         read.as_ref()
@@ -1616,6 +1884,9 @@ pub async fn health_and_actor(db: &impl SqlPort, dirty: &Value) -> (Value, Optio
         "oldestEnqueueAgeMs": consumer.as_ref().map(|c| c["oldestEnqueueAgeMs"].clone()),
         "consumerAtMs": consumer.as_ref().map(|c| c["atMs"].clone()),
         "serviceMs": consumer.as_ref().map(|c| c["serviceMs"].clone()),
+        // FIX-956: the consumer's horizon (the newest publish stamp it acknowledged) and its age
+        "horizonMs": horizon,
+        "horizonAgeMs": horizon.map(|h| (db.now_ms() as i64 - h).max(0)),
         "totals": "/health/invariants.owedEvents",
     });
     (body, actor)
@@ -1637,6 +1908,13 @@ pub async fn health_and_actor(db: &impl SqlPort, dirty: &Value) -> (Value, Optio
 // goes regardless; its delivery names the consumer's acknowledgement bound, so a delivery the direct call covered is a
 // DUPE the actor answers from its seq check (`owed_actor::COVERED_SQL`). A `word` event carrying a frame is left to
 // the consumer: its ingest is the tracker's own write (its marks do not exist until then).
+//
+// FIX-956 (bsv-low #956) item 3: in PHASE C ONLY (`OWED_D1_JUDGE=false`: the actor is the one writer, its apply IS
+// the judgement) a call the actor answered APPLIED acknowledges the marks of the games it names applied, up to the
+// greatest generation of those games' marks read BEFORE the call (`owed_actor::phase_c_ack_statements`, the
+// consumer's Phase C batch), in the pass's own batch after the answer; a mark written during the call stands. A walled
+// or faulted call, a held answer, and every call in Phases A and B (the marks drive the consumer's D1 judge, whose
+// rows are served) acknowledge nothing: the queue path stands.
 
 /// The most events one direct pass calls (past it the queue alone carries the rest, counted in the report).
 pub const DIRECT_EVENTS_MAX: usize = 64;
@@ -1653,6 +1931,8 @@ pub struct DirectReport {
     pub left_to_queue: usize,
     /// D2-ACTOR-B-FOLD-10 (item 8): the first fault's text (a wall's or a refusal's), for the operator's line.
     pub first_fault: Option<String>,
+    /// FIX-956 item 3 (Phase C only): games whose marks the pass acknowledged after their apply landed.
+    pub acked: u64,
 }
 
 /// D2-ACTOR-B-FOLD-10 (item 8): the direct path's fault line is logged at most once in this many ms an isolate.
@@ -1786,6 +2066,55 @@ pub trait DirectPort {
     async fn subjects(&self, ev: &OwedEvent) -> Result<Vec<(String, Vec<String>)>, String>;
     /// One apply body to the identity's actor, under the direct call's wall.
     async fn call(&self, body: Value) -> Result<Value, String>;
+    /// FIX-956 item 3: does a landed direct apply acknowledge its marks? Phase C only (the D1 judge OFF: the actor is
+    /// the one writer, its apply IS the judgement). In Phases A and B the marks drive the consumer's D1 judge, whose
+    /// rows are served, so the direct call acknowledges nothing there.
+    fn acks(&self) -> bool {
+        false
+    }
+    /// The greatest generation of `games`' marks, read BEFORE the call (the acknowledgement's bound).
+    async fn bound(&self, _identity: &str, _games: &[String]) -> Result<i64, String> {
+        Ok(0)
+    }
+    /// Run the acknowledgement's batch.
+    async fn ack(&self, _stmts: Vec<Stmt>) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// FIX-956 item 3: the bound of [`DirectPort::bound`] over a [`SqlPort`] (`owed_judge::MARKS_SQL`, as the consumer's
+/// Phase C delivery reads it).
+pub async fn direct_bound(db: &impl SqlPort, identity: &str, games: &[String]) -> Result<i64, String> {
+    let marks = rows(
+        db,
+        owed_judge::MARKS_SQL,
+        vec![
+            Bind::Text(identity.to_ascii_lowercase()),
+            Bind::Text(json!(games).to_string()),
+        ],
+    )
+    .await?;
+    Ok(marks
+        .iter()
+        .filter_map(|m| m["generation"].as_i64())
+        .max()
+        .unwrap_or(0))
+}
+
+/// PURE (FIX-956 item 3): the games an actor's answer names APPLIED among `games` (a held answer, a fault: none).
+pub fn applied_games(answer: &Value, games: &[String]) -> Vec<String> {
+    if crate::owed_actor::is_held(answer) {
+        return Vec::new();
+    }
+    answer["appliedGames"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|g| g.as_str().map(str::to_ascii_lowercase))
+                .filter(|g| games.iter().any(|x| x.eq_ignore_ascii_case(g)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// THE DIRECT PASS over a port: every event's subjects, then every identity's call at once, counted; answers are
@@ -1811,8 +2140,34 @@ pub async fn direct_with(
     }
     let bodies = coalesce_direct(subjects_of, tip);
     report.calls = bodies.len() as u64;
+    // FIX-956 item 3: in Phase C each body's acknowledgement bound, read BEFORE its call (a mark written after it is
+    // left for the queue's delivery)
+    let mut bounds: Vec<Option<(String, Vec<String>, i64)>> = Vec::with_capacity(bodies.len());
+    for b in &bodies {
+        let id = b["identity"].as_str().unwrap_or_default().to_owned();
+        let games: Vec<String> = b["games"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|g| g.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default();
+        bounds.push(if port.acks() {
+            port.bound(&id, &games).await.ok().map(|seen| (id, games, seen))
+        } else {
+            None
+        });
+    }
     let answers = futures_util::future::join_all(bodies.into_iter().map(|b| port.call(b))).await;
-    for answer in answers {
+    for (answer, bound) in answers.into_iter().zip(bounds) {
+        if let (Ok(a), Some((id, games, seen))) = (&answer, &bound) {
+            let applied = applied_games(a, games);
+            if !applied.is_empty()
+                && port
+                    .ack(crate::owed_actor::phase_c_ack_statements(id, &applied, *seen))
+                    .await
+                    .is_ok()
+            {
+                report.acked += applied.len() as u64;
+            }
+        }
         match answer {
             // D2-ACTOR-B-FOLD-7: a held answer is neither a fault nor a sample (the actor counts it).
             Ok(a) if crate::owed_actor::is_held(&a) => report.held += 1,
@@ -1847,6 +2202,20 @@ impl DirectPort for WorkerDirect {
         )
         .await
     }
+    fn acks(&self) -> bool {
+        !crate::owed_actor::d1_judge_on(
+            self.env
+                .var(crate::owed_actor::D1_JUDGE_FLAG)
+                .ok()
+                .map(|v| v.to_string()),
+        )
+    }
+    async fn bound(&self, identity: &str, games: &[String]) -> Result<i64, String> {
+        direct_bound(&self.sql, identity, games).await
+    }
+    async fn ack(&self, stmts: Vec<Stmt>) -> Result<(), String> {
+        self.sql.run_batch(stmts).await.map(|_| ())
+    }
 }
 
 /// The direct pass over the Worker's bindings, its counters and the `direct` bars flushed. Nothing without the actor's
@@ -1873,6 +2242,7 @@ pub async fn direct_events(env: &worker::Env, events: Vec<OwedEvent>) -> DirectR
         (crate::owed_actor::COUNTERS[3], report.calls),
         (crate::owed_actor::COUNTERS[4], report.faults),
         (crate::owed_actor::COUNTERS[25], report.walls),
+        (publish::COUNTER_DIRECT_ACKED, report.acked),
     ]
     .into_iter()
     .filter(|(_, d)| *d > 0)

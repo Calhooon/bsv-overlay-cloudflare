@@ -126,7 +126,7 @@ pub const COUNTER_SKIPPED: &str = "owed_events_publish_skipped_total";
 /// Publishes that faulted (the D1 batch or the send): their marks wait for the sweep.
 pub const COUNTER_FAULTS: &str = "owed_events_publish_faults_total";
 /// Every counter this module and the consumer write, for the seeds.
-pub const COUNTERS: [&str; 20] = [
+pub const COUNTERS: [&str; 25] = [
     COUNTER_PUBLISHED,
     COUNTER_SKIPPED,
     COUNTER_FAULTS,
@@ -152,7 +152,111 @@ pub const COUNTERS: [&str; 20] = [
     "owed_events_all_held_total",
     // D2-ACTOR-E (bsv-low #954): a batch of several messages judged once per identity
     "owed_events_coalesced_batches_total",
+    // FIX-956 (bsv-low #956): the sweep's re-publishes by their reason (the consumer's horizon passed the mark, the
+    // long bound, a lost note), the pairs a publisher noted lost, the marks a Phase C direct apply acknowledged
+    COUNTER_SWEEP_PASSED,
+    COUNTER_SWEEP_STALLED,
+    COUNTER_SWEEP_LOST,
+    COUNTER_LOST_NOTED,
+    COUNTER_DIRECT_ACKED,
 ];
+/// FIX-956: a pair re-published because the consumer's horizon passed its mark (the consumer has moved past it and
+/// it is still un-acked: its message was lost).
+pub const COUNTER_SWEEP_PASSED: &str = "owed_events_sweep_passed_total";
+/// FIX-956: a pair re-published by the long bound alone (`SWEEP_STALLED_AFTER_MS`: the consumer dead or stalled).
+pub const COUNTER_SWEEP_STALLED: &str = "owed_events_sweep_stalled_total";
+/// FIX-956: a pair re-published because a publisher noted it lost ([`LOST_MEMO_PREFIX`]).
+pub const COUNTER_SWEEP_LOST: &str = "owed_events_sweep_lost_total";
+/// FIX-956: pairs a publisher noted lost (a faulted send or seq batch, a publish dropped at the answer wall).
+pub const COUNTER_LOST_NOTED: &str = "owed_events_lost_noted_total";
+/// FIX-956 item 3: games whose marks a Phase C direct apply acknowledged (the actor's answer naming them applied).
+pub const COUNTER_DIRECT_ACKED: &str = "owed_events_direct_acked_total";
+
+/// FIX-956 (bsv-low #956) 1b: THE LOST NOTE, one `owed_belt_state` row per pair a publisher KNOWS it did not deliver
+/// (its seq batch or its send faulted after the marks were written, or the request's answer wall dropped the publish
+/// in flight), named `owed-events:lost:<source> <sourceKey>`, its cursor `{source, sourceKey, atMs}` (the fault
+/// memos' shape). The app layer's sweep re-publishes a noted pair at its next tick whatever the consumer's horizon,
+/// and deletes the note in its own batch. The note is written by the publisher's NEXT batch: at once after a send
+/// that faulted (D1 answered the seq batch), and by the isolate's next publish after a wall (a write at the wall
+/// would wait on the D1 the wall gave up on) or a faulted seq batch (D1 itself faulted). A note that never lands (the
+/// isolate ends first, D1 faults on every try) is the sweep's long bound's case (`SWEEP_STALLED_AFTER_MS`).
+pub const LOST_MEMO_PREFIX: &str = "owed-events:lost:";
+/// Write one lost note (`?1` its name, `?2` its cursor, `?3` now).
+pub const LOST_MEMO_WRITE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,?2,?3) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+/// The most notes an isolate keeps for its next publish to write (past it the long bound covers the rest).
+pub const LOST_PENDING_MAX: usize = 512;
+/// A pair's lost note's name.
+pub fn lost_memo_name(source: &str, key: &str) -> String {
+    format!("{LOST_MEMO_PREFIX}{source} {key}")
+}
+/// PURE: does a note carry a pair the sweep can re-publish? (A held frame goes back to its POST; a `txfacts` event
+/// judges nothing; an identity route has no source row.)
+pub fn lost_note_kept(n: &Noted) -> bool {
+    n.held.is_none() && n.source != owed_event::TXFACTS && read_sql(&n.source).is_some()
+}
+/// PURE: the lost notes' writes for `notes` at `now` (the ones [`lost_note_kept`] keeps).
+pub fn lost_statements(notes: &[Noted], now: i64) -> Vec<(&'static str, Vec<Arg>)> {
+    notes
+        .iter()
+        .filter(|n| lost_note_kept(n))
+        .map(|n| {
+            (
+                LOST_MEMO_WRITE_SQL,
+                vec![
+                    Arg::Text(lost_memo_name(&n.source, &n.key)),
+                    Arg::Text(
+                        json!({"source": n.source, "sourceKey": n.key, "atMs": now}).to_string(),
+                    ),
+                    Arg::Int(now),
+                ],
+            )
+        })
+        .collect()
+}
+thread_local! {
+    static LOST_PENDING: RefCell<Vec<Noted>> = const { RefCell::new(Vec::new()) };
+}
+/// Keep `notes` for the isolate's next publish to write as lost notes (bounded by [`LOST_PENDING_MAX`]).
+pub fn note_lost(notes: Vec<Noted>) {
+    LOST_PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        for n in notes.into_iter().filter(lost_note_kept) {
+            if p.len() >= LOST_PENDING_MAX {
+                break;
+            }
+            if !p.iter().any(|m| m.source == n.source && m.key == n.key) {
+                p.push(n);
+            }
+        }
+    });
+}
+/// The pending lost notes, taken.
+pub fn take_lost() -> Vec<Noted> {
+    LOST_PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()))
+}
+/// Write `notes` as lost notes over the publish's port (one batch). Answers how many were written; on a fault the
+/// notes are kept for the next publish.
+pub async fn write_lost(port: &impl PublishPort, notes: Vec<Noted>) -> u64 {
+    let stmts = lost_statements(&notes, port.now_ms());
+    if stmts.is_empty() {
+        return 0;
+    }
+    let n = stmts.len() as u64;
+    match port.run_reads(stmts).await {
+        Ok(_) => n,
+        Err(_) => {
+            note_lost(notes);
+            0
+        }
+    }
+}
+/// The pairs of a publish the publisher knows were not delivered: every unsent note of a faulted publish.
+pub fn lost_of(report: &Published) -> Vec<Noted> {
+    if report.fault.is_none() {
+        return Vec::new();
+    }
+    report.unsent.iter().filter(|n| lost_note_kept(n)).cloned().collect()
+}
 /// LOW-7 (the D2-ACTOR-A lens): publishes dropped at a request's answer wall ([`PUBLISH_ANSWER_WALL_MS`]): their
 /// marks wait for the sweep. Counted on the isolate ([`note_wall_drop`]) and written with the isolate's next publish
 /// (a write at the wall would wait on the D1 the wall gave up on); an isolate that ends first loses its count.
@@ -543,6 +647,15 @@ pub async fn publish_env(env: &worker::Env, frames: Vec<Value>) -> Vec<Value> {
     let report = publish_with(&port, notes).await;
     // D2-ACTOR-D: what was sent is the invocation's direct set too (its flush point calls the actors).
     hold_direct(&report.sent);
+    // FIX-956 1b: what this publish knows it lost, and what an earlier one of this isolate could not note, as lost
+    // notes (the sweep's next tick re-publishes them)
+    let mut lost = take_lost();
+    lost.extend(lost_of(&report));
+    let lost_noted = if lost.is_empty() {
+        0
+    } else {
+        write_lost(&port, lost).await
+    };
     let mut back = Vec::new();
     for n in &report.unsent {
         if n.source == "word" && n.held.is_some() {
@@ -563,6 +676,7 @@ pub async fn publish_env(env: &worker::Env, frames: Vec<Value>) -> Vec<Value> {
         (COUNTER_SKIPPED, report.skipped as u64),
         (COUNTER_FAULTS, u64::from(report.fault.is_some())),
         (COUNTER_WALL_DROPS, take_wall_drops()),
+        (COUNTER_LOST_NOTED, lost_noted),
     ];
     deltas.retain(|(_, d)| *d > 0);
     bump(env, &deltas).await;
@@ -578,6 +692,8 @@ pub const PUBLISH_ANSWER_WALL_MS: u64 = 1_500;
 pub async fn publish_before_answer(env: &worker::Env, frames: Vec<Value>) -> Vec<Value> {
     use futures_util::future::{select, Either};
     let copy = frames.clone();
+    // FIX-956 1b: the notes this publish carries, kept as lost notes if the wall drops it in flight
+    let carried = snapshot();
     let publish = std::pin::pin!(publish_env(env, frames));
     let wall = std::pin::pin!(worker::Delay::from(std::time::Duration::from_millis(
         PUBLISH_ANSWER_WALL_MS
@@ -586,6 +702,7 @@ pub async fn publish_before_answer(env: &worker::Env, frames: Vec<Value>) -> Vec
         Either::Left((back, _)) => back,
         Either::Right(_) => {
             note_wall_drop();
+            note_lost(carried);
             worker::console_warn!(
                 "[owed-events] the publish passed its {PUBLISH_ANSWER_WALL_MS} ms answer wall: the marks wait for the sweep"
             );
