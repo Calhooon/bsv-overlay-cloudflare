@@ -1119,7 +1119,7 @@ pub const IDENTITY_GAMES_PAGE_SQL: &str = concat!(
 pub const IDENTITY_GAMES_AFTER_SQL: &str = concat!(
     "SELECT gameId,at FROM (SELECT gameId,COALESCE(at,0) AS at FROM (",
     identity_games!(),
-    ")) WHERE at<?2 OR (at=?2 AND gameId>?3) ORDER BY at DESC,gameId LIMIT 16"
+    ")) WHERE at<?2 OR (at=?2 AND gameId>?3) ORDER BY at DESC,gameId LIMIT 32"
 );
 /// bsv-low #912 (MEDIUM-9, the `owed-v3` re-judge): an identity's games past `?2` in game order, `?3` a page.
 pub const IDENTITY_GAMES_BY_ID_SQL: &str = concat!(

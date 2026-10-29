@@ -2695,7 +2695,7 @@ fn d2_actor_b_fold3_m2_the_bootstrap_pages_take_a_fleet_budget() {
     let next = (t0 / 60_000 + 1) * 60_000;
     assert_eq!(take(next), 1, "a new minute counts from one");
     assert_eq!(boot_pace(1, next, &id), None);
-    assert_eq!(BOOTSTRAP_PAGE_DELAY_MS, 1_000);
+    assert_eq!(BOOTSTRAP_PAGE_DELAY_MS, 500);
     let object = include_str!("object.rs")
         .split_whitespace()
         .collect::<String>();
@@ -3791,15 +3791,27 @@ async fn d2_actor_b_fold7_a_an_unseen_heavy_seat_is_held_bootstrapped_then_appli
     let paced = (pages as u64 - 1) * BOOTSTRAP_PAGE_DELAY_MS + boot_ms;
     eprintln!("fold7_a: held in {held_ms} ms; {pages} pages, native work {boot_ms} ms; cold (the fixture's clock) {cold} ms; under the pace about {paced} ms");
     // D2-ACTOR-B-FOLD-8 (the fourth delta lens's NOTE-1): the cold bar asserted ONCE, as what it measures: ONE cold
-    // actor alone under the pace (its 38 pages one page delay apart) plus this process's measured native work is under
+    // actor alone under the pace (its pages one page delay apart) plus this process's measured native work is under
     // the design's 60 s. It is not the wasm32 and D1 time (beta's rehearsal reads that), and not a mass bootstrap's,
     // where the fleet's 60 pages a minute make a heavy seat's cold time the fleet's page count over 60 a minute.
-    assert_eq!(pages, 38);
+    // FIX-962 (bsv-low #962): 19 pages of 32 games (38 of 16 on `3159bc90e`), each three D1 calls whatever its games.
+    assert_eq!(pages, 19);
     // D2-ACTOR-B-FOLD-10 (the fifth delta lens's NEW5-L1): the bar is the PER-PAGE work against the pace's room
     // ([`COLD_PAGE_WORK_BAR_MS`]), asserted only in a release profile: a debug build in the parallel suite measured
     // 41 s of native work under a host load of 30 (60,035 and 78,252 ms against the 60 s), and passes alone.
     let per_page = boot_ms / pages as u64;
     eprintln!("fold7_a: {per_page} ms of native work a page (the bar {COLD_PAGE_WORK_BAR_MS} ms in a release build)");
+    // FIX-962: the model at the real round trip, with this run's native work a page.
+    eprintln!(
+        "fold7_a: modelled cold time at {COLD_D1_ROUND_TRIP_MS} ms a D1 call: {} ms",
+        cold_bootstrap_ms(
+            600,
+            BOOTSTRAP_PAGE_GAMES as u64,
+            BOOTSTRAP_PAGE_DELAY_MS,
+            COLD_D1_ROUND_TRIP_MS,
+            per_page
+        )
+    );
     if !cfg!(debug_assertions) {
         assert!(
             per_page < COLD_PAGE_WORK_BAR_MS,
@@ -3808,9 +3820,12 @@ async fn d2_actor_b_fold7_a_an_unseen_heavy_seat_is_held_bootstrapped_then_appli
     }
 }
 
-/// NEW5-L1: the most native work a cold bootstrap page may take so that the 38 pages, one page delay apart, fit the
-/// design's 60 s: (60 s - 37 delays) / 38.
-const COLD_PAGE_WORK_BAR_MS: u64 = (60_000 - 37 * BOOTSTRAP_PAGE_DELAY_MS) / 38;
+/// NEW5-L1: the most native work a cold bootstrap page may take so that the pages, one page delay apart, fit the
+/// design's 60 s. FIX-962 (bsv-low #962): at the REAL D1 round trip: the 19 pages' room less their three calls of
+/// [`COLD_D1_ROUND_TRIP_MS`]: (60 s - 18 delays) / 19 - 3 x 700 = 584 ms (on `3159bc90e` (60 s - 37 s) / 38 = 605 ms
+/// with no round trip at all, which beta's 670 ms p95 read could not meet).
+const COLD_PAGE_WORK_BAR_MS: u64 =
+    (60_000 - 18 * BOOTSTRAP_PAGE_DELAY_MS) / 19 - COLD_PAGE_D1_CALLS * COLD_D1_ROUND_TRIP_MS;
 
 /// Two HELD events out of order (seq 12 held first, then seq 10, the record moved between them): the drain applies
 /// them in seq order and the rows are the record's as it stands (the newer judgement), MEDIUM-1's shape.
@@ -6563,7 +6578,7 @@ fn fold10_d_the_cold_bar_is_no_wall_clock_in_a_debug_build() {
     let src = squash(include_str!("tests.rs"));
     let a = &src[src.find("asyncfnd2_actor_b_fold7_a_").unwrap()..];
     let a = &a[..a.find("asyncfnd2_actor_b_fold7_b_").unwrap()];
-    assert!(a.contains("assert_eq!(pages,38);"));
+    assert!(a.contains("assert_eq!(pages,19);"));
     assert!(
         !a.contains("assert!(paced<60_000"),
         "no wall-clock bar in the debug suite"
@@ -6572,7 +6587,7 @@ fn fold10_d_the_cold_bar_is_no_wall_clock_in_a_debug_build() {
     assert!(a.contains("per_page<COLD_PAGE_WORK_BAR_MS"));
     assert_eq!(
         COLD_PAGE_WORK_BAR_MS,
-        (60_000 - 37 * BOOTSTRAP_PAGE_DELAY_MS) / 38
+        (60_000 - 18 * BOOTSTRAP_PAGE_DELAY_MS) / 19 - COLD_PAGE_D1_CALLS * COLD_D1_ROUND_TRIP_MS
     );
 }
 
@@ -9836,4 +9851,186 @@ fn fix963_c_the_line_of_963_is_equal() {
     assert_eq!(tip_derived_rows(d1, actor), Vec::<String>::new());
     let detail = diff_detail(d1, actor, &["b084427d:0".to_string()]);
     assert!(!detail.contains("spenderPresence"), "{detail}");
+}
+
+// ---- FIX-962 (bsv-low #962): a bootstrap page in flight is never a dead alarm; the cold bar at the real round trip ----
+
+/// fix962_a: A PAGE IN FLIGHT IS LIVE. A Durable Object's `getAlarm()` answers null while its alarm handler runs until
+/// the handler sets the next alarm, so a held event (or the lever) landing during a page read `None` and re-armed a live
+/// page (beta's three `armed under a dead alarm (None)` lines in one cold bootstrap). The verdict reads the page's stamp:
+/// a stamp younger than the wall with no alarm is live (no re-arm, no count, no line); a stamp past the wall with no
+/// alarm, or no stamp, is the dead class as before (FOLD-7's item 12 kept); a live alarm is live with or without a
+/// stamp. The object stamps the page in the alarm's bootstrap branch, clears it when the branch ends, and
+/// `arm_bootstrap` (the held event's road and the lever's alike) asks this verdict with the stamp.
+/// RED on `3159bc90e`'s rule (the verdict `alarm_is_dead(held, now)`, the stamp unread): `a page in flight is live`.
+#[test]
+fn fix962_a_a_page_in_flight_is_never_a_dead_alarm() {
+    let started = NOW_MS - 2_000;
+    assert!(
+        !boot_alarm_dead(None, Some(started), NOW_MS),
+        "a page in flight is live"
+    );
+    assert!(!boot_alarm_dead(
+        None,
+        Some(NOW_MS - BOOT_PAGE_WALL_MS + 1),
+        NOW_MS
+    ));
+    // Past the wall with no alarm: the dead class (re-armed, counted, logged).
+    assert!(boot_alarm_dead(
+        None,
+        Some(NOW_MS - BOOT_PAGE_WALL_MS),
+        NOW_MS
+    ));
+    assert!(boot_alarm_dead(None, None, NOW_MS));
+    // The old build's alarm decades out with no page running is dead; a live alarm is live.
+    assert!(boot_alarm_dead(
+        Some((NOW_MS + NOW_MS) as i64),
+        None,
+        NOW_MS
+    ));
+    assert!(!boot_alarm_dead(Some((NOW_MS + 500) as i64), None, NOW_MS));
+    assert!(page_in_flight(Some(NOW_MS), NOW_MS));
+    assert!(!page_in_flight(None, NOW_MS));
+    assert_eq!(BOOT_PAGE_WALL_MS, BOOT_ALARM_DEAD_AFTER_MS);
+    // The object: the stamp set before the page and cleared after its branch; `arm_bootstrap` reads it (one road for
+    // the held event and the lever).
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    let alarm = &object[object.find("asyncfnalarm(&self)").unwrap()..];
+    let stamp = alarm
+        .find("self.put_meta(&local,META_PAGE_STARTED,")
+        .expect("the alarm stamps the page");
+    let page = alarm.find("self.bootstrap_page(&local)").unwrap();
+    let clear = alarm
+        .find("DELETEFROMmetaWHEREname='pageStartedAtMs'")
+        .expect("the branch clears the stamp");
+    assert!(stamp < page && page < clear);
+    assert!(
+        clear < alarm.find("META_KV_DIRTY").unwrap(),
+        "inside the bootstrap branch"
+    );
+    let arm = &object[object.find("asyncfnarm_bootstrap(").unwrap()..];
+    let arm = &arm[..arm.find("asyncfnarm_tip_alarm(").unwrap()];
+    assert!(arm.contains("self.meta(META_PAGE_STARTED)"));
+    assert!(arm.contains(
+        "if!boot_alarm_dead(held,started,Date::now().as_millis()){returnArmed::default();}"
+    ));
+    assert!(
+        !arm.contains("alarm_is_dead("),
+        "no road reads the alarm alone"
+    );
+    assert_eq!(
+        object.matches("lever:bool").count(),
+        1,
+        "one arm for both roads"
+    );
+}
+
+/// fix962_b: THE COLD BAR AT THE REAL ROUND TRIP. One bootstrap page of FOLD-7's 600-game seat on a fresh mirror is 32
+/// games in two record calls of one statement each (FOLD-14), the object's budget take the third (one statement before
+/// the step): [`COLD_PAGE_D1_CALLS`]. At beta's round trip (700 ms) the model lands the seat under 60 s; under
+/// `3159bc90e`'s constants (16 games a page, 1,000 ms apart) it does not (116,800 ms before native work, the
+/// rehearsal's 94,789 ms). RED on `3159bc90e` (16, 1,000): `left: 16 right: 32` and the model 116,800 ms.
+#[tokio::test]
+async fn fix962_b_a_cold_600_game_seat_lands_under_60s_at_the_real_round_trip() {
+    let record = seeded(&fold7_chained_seat(600));
+    let paged = mirror();
+    let turn = futures_util::lock::Mutex::new(());
+    let (b0, s0) = (record.batches.get(), record.stmts.get());
+    let step = bootstrap_step(
+        &turn,
+        &record,
+        &paged,
+        &Fakes,
+        "owner",
+        Some(object::BOOT_CURSOR_START),
+        Some(TIP),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    let (calls, stmts) = (record.batches.get() - b0, record.stmts.get() - s0);
+    let BootStep::Page { games, .. } = step else {
+        panic!("{step:?}")
+    };
+    eprintln!("fix962_b: one page of {games} games: {calls} record calls, {stmts} statements (+1 the budget take)");
+    assert_eq!(games, 32);
+    assert_eq!(BOOTSTRAP_PAGE_GAMES, 32);
+    assert_eq!(
+        calls as u64 + 1,
+        COLD_PAGE_D1_CALLS,
+        "the page's rounds and its take"
+    );
+    assert_eq!(stmts, calls, "one statement a call");
+    // The model at the real round trip.
+    let now = cold_bootstrap_ms(
+        600,
+        BOOTSTRAP_PAGE_GAMES as u64,
+        BOOTSTRAP_PAGE_DELAY_MS,
+        COLD_D1_ROUND_TRIP_MS,
+        0,
+    );
+    assert_eq!(now, 19 * 2_100 + 18 * 500);
+    assert!(
+        now + 19 * COLD_PAGE_WORK_BAR_MS <= 60_000,
+        "{now} ms and the native bar"
+    );
+    assert_eq!(
+        cold_bootstrap_ms(600, 16, 1_000, COLD_D1_ROUND_TRIP_MS, 0),
+        116_800,
+        "the base's cadence"
+    );
+    assert_eq!(BOOTSTRAP_PAGE_DELAY_MS, 500);
+    // The page's take is ONE statement before the step (the third call).
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    let page = &object[object.find("asyncfnbootstrap_page(").unwrap()..];
+    let page = &page[..page.find("bootstrap_step(").unwrap()];
+    assert_eq!(page.matches(".run_batch(").count(), 1);
+    // The fleet's budget is unchanged.
+    assert_eq!(BOOTSTRAP_PAGES_PER_MINUTE, 60);
+    assert_eq!(BOOTSTRAP_REJUDGE_PAGES_PER_MINUTE, 30);
+}
+
+/// fix962_c: THE CADENCE IS READ FROM THE LOGS AND THE BARS. One line a page (games, its work, its wait since the last
+/// page, the cursor it leaves) and the cold page's work into the fleet's `cold` row's `page` ring, served
+/// `classes.cold.pageMsP95` beside `visibleMsP95`; a flush holding only page samples writes the cold row. New API
+/// (`page_line`, `note_cold_page`, `COLD_PAGE_RING`): none on `3159bc90e`.
+#[tokio::test]
+async fn fix962_c_the_page_line_and_the_cold_page_bar() {
+    let id = format!("03{}", "c2".repeat(32));
+    assert_eq!(
+        page_line(&id, 32, 1_480, Some(512), "[1790000000,\"g\"]"),
+        format!("[owed-actor] page {id}: games=32 ms=1480 waitMs=512 cursor=[1790000000,\"g\"]")
+    );
+    assert!(page_line(&id, 0, 9, None, "drain").ends_with("waitMs=- cursor=drain"));
+    let db = fold8_empty();
+    let mut pending = PendingBars::default();
+    for ms in [1_400, 1_500, 2_100] {
+        pending.note_cold_page(ms);
+    }
+    assert!(pending.due());
+    flush_bars_from(&db, NOW_MS, &pending).await.unwrap();
+    let rows = db
+        .run_batch(vec![Stmt::new(BARS_READ_SQL, vec![])])
+        .await
+        .unwrap()
+        .remove(0)
+        .rows;
+    let served = fleet_bars(&rows, NOW_MS, lib_rev());
+    let cold = &served["classes"]["cold"];
+    assert_eq!(cold["pageSamples"], json!(3), "{cold}");
+    assert_eq!(cold["pageMsP95"], json!(2_100));
+    assert_eq!(cold["pageMsMax"], json!(2_100));
+    assert!(cold.get("visibleMsP95").is_some());
+    assert!(served["classes"]["direct"].get("pageMsP95").is_none());
+    // The object: the line and the sample at every page that ran (a cold one's sample alone), flushed at the end.
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    let page = &object[object.find("asyncfnbootstrap_page(").unwrap()..];
+    let page = &page[..page.find("asyncfnwrite_kv_copy(").unwrap()];
+    assert!(page.contains("console_log!(\"{}\",page_line(&me,page_games,page_ms,wait,&left));"));
+    assert!(page.contains("if!rejudge{note_cold_page(page_ms);}"));
+    assert!(page.contains("if!rejudge{flush_bars(&record,now,true).await;}"));
 }

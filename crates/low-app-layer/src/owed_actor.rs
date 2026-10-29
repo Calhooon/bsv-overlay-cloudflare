@@ -662,7 +662,12 @@ pub fn actor_shape() -> String {
 /// [`BOOTSTRAP_PAGE_DELAY_MS`] apart (they were 1 ms). So a digest-moving or era-moving deploy re-bootstraps the
 /// fleet at 60 pages (960 games) a minute, whatever the reads that arm it.
 pub const BOOTSTRAP_PAGES_PER_MINUTE: i64 = 60;
-pub const BOOTSTRAP_PAGE_DELAY_MS: u64 = 1_000;
+/// FIX-962 (bsv-low #962): 500 ms (it was 1,000). One actor's pages are serial (the next page's alarm is set at the
+/// end of the one before), so this is idle time, not a bound on its concurrent reads; the fleet's
+/// [`BOOTSTRAP_PAGES_PER_MINUTE`] is the bound on D1. The floor: one actor at the measured page time (three round
+/// trips of [`COLD_D1_ROUND_TRIP_MS`], about 2.1 s) plus this takes at most 60,000 / 2,600 = 23 pages a minute, under
+/// half the fleet's minute, so a second cold actor always finds tokens.
+pub const BOOTSTRAP_PAGE_DELAY_MS: u64 = 500;
 /// The second delta lens's NEW2-L3: the take is ONE conditional upsert that writes NOTHING once this minute's
 /// [`BOOTSTRAP_PAGES_PER_MINUTE`] tokens are taken (its `DO UPDATE ... WHERE` refuses, `RETURNING` answers no row: the
 /// page waits, [`boot_pace`] over `i64::MAX`); it answers the token's number otherwise. So N waiting actors are N
@@ -2354,7 +2359,30 @@ pub const HELD_DELETE_SQL: &str = "DELETE FROM meta WHERE name=?1 AND value=?2";
 /// The bootstrap's end: `bootstrapped` stamped only while no held event stands (one statement).
 pub const STAMP_BOOTSTRAPPED_SQL: &str = "INSERT INTO meta(name,value) SELECT 'bootstrapped',?1 WHERE NOT EXISTS (SELECT 1 FROM meta WHERE name>='held:' AND name<'held;') ON CONFLICT(name) DO UPDATE SET value=excluded.value RETURNING name";
 /// The games of one bootstrap page (`owed_judge::IDENTITY_GAMES_AFTER_SQL`'s `LIMIT`): a shorter page is the last.
-pub const BOOTSTRAP_PAGE_GAMES: usize = 16;
+/// FIX-962 (bsv-low #962): 32 (it was 16). A page's D1 calls do not follow its games (its budget take and its rounds'
+/// reads, [`COLD_PAGE_D1_CALLS`]), so the page halves a cold seat's round trips and delays ([`cold_bootstrap_ms`]).
+pub const BOOTSTRAP_PAGE_GAMES: usize = 32;
+/// FIX-962: the D1 calls of one cold bootstrap page as measured (`fix962_b`): the budget take, then the page's two
+/// rounds (FOLD-14: its games read in the first). The same at 16 and 32 games.
+pub const COLD_PAGE_D1_CALLS: u64 = 3;
+/// FIX-962: the D1 round trip the cold bar is held at: beta's `stages.readMsP95` in the hour of the rehearsal of
+/// 2026-10-29 (670 ms), rounded up.
+pub const COLD_D1_ROUND_TRIP_MS: u64 = 700;
+/// FIX-962: the modelled cold time of one actor's bootstrap of `games` games alone (no fleet wait): its pages (the last
+/// one short), each [`COLD_PAGE_D1_CALLS`] round trips of `round_trip_ms` and `native_page_ms` of its own work, one
+/// [`BOOTSTRAP_PAGE_DELAY_MS`] apart. Under the base's constants (16 games, 1,000 ms) at 700 ms a call this is
+/// 38 x 2,100 + 37,000 = 116,800 ms before native work, the rehearsal's 94,789 ms at a faster median round trip;
+/// now 19 x 2,100 + 18 x 500 = 48,900 ms.
+pub const fn cold_bootstrap_ms(
+    games: u64,
+    page_games: u64,
+    delay_ms: u64,
+    round_trip_ms: u64,
+    native_page_ms: u64,
+) -> u64 {
+    let pages = games / page_games + 1;
+    pages * (COLD_PAGE_D1_CALLS * round_trip_ms + native_page_ms) + (pages - 1) * delay_ms
+}
 
 /// One held event (its `/apply` body as the actor received it, and when it was held).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -3701,6 +3729,9 @@ pub struct PendingBars {
     /// The fourth delta lens's NEW4-L4: the held answers since the last flush (`owed_actor_apply_held_total`, added
     /// once a flush, never one D1 write a held event).
     pub held: u64,
+    /// FIX-962 (bsv-low #962): each cold bootstrap page's own work (its budget take to its end), the `cold` row's
+    /// `page` ring, served `classes.cold.pageMsP95`.
+    pub cold_page: Vec<u64>,
     pub last_flush_ms: Option<u64>,
 }
 /// D2-ACTOR-B-FOLD-10 (the captain's item, beta 2026-10-29: an actor bootstrapped on FOLD-7's build kept a row the
@@ -3813,6 +3844,11 @@ impl PendingBars {
         self.visible.entry("cold").or_default().push(ms);
         self.noted += 1;
     }
+    /// FIX-962: one cold bootstrap page's work.
+    pub fn note_cold_page(&mut self, ms: u64) {
+        self.cold_page.push(ms);
+        self.noted += 1;
+    }
     /// NEW4-L4: one held answer, counted at the next flush.
     pub fn note_held(&mut self) {
         self.held += 1;
@@ -3856,6 +3892,10 @@ pub fn note_answer_as(class: &'static str, answer: &Value) {
 pub fn note_cold(ms: u64) {
     PENDING_BARS.with(|p| p.borrow_mut().note_cold(ms));
 }
+/// FIX-962: one cold bootstrap page's work, into the fleet's `cold` row's `page` ring at the next flush.
+pub fn note_cold_page(ms: u64) {
+    PENDING_BARS.with(|p| p.borrow_mut().note_cold_page(ms));
+}
 /// NEW4-L4: one held answer, into this isolate's pending bars (counted `owed_actor_apply_held_total` at the flush).
 pub fn note_held() {
     PENDING_BARS.with(|p| p.borrow_mut().note_held());
@@ -3879,6 +3919,39 @@ pub fn alarm_offset_ms(at_ms: u64, now_ms: u64) -> i64 {
 /// minute, and a held event or a lever call during a wait re-armed the page at once and spent a token).
 pub fn alarm_is_dead(held: Option<i64>, now_ms: u64) -> bool {
     held.is_none_or(|h| h > (now_ms + BOOT_ALARM_DEAD_AFTER_MS) as i64)
+}
+/// FIX-962 (bsv-low #962): is the bootstrap's alarm DEAD, read beside the page in flight? A Durable Object's
+/// `getAlarm()` answers null from the moment its alarm handler starts until the handler sets the next alarm
+/// (Cloudflare's Alarms API: "If getAlarm is called while an alarm is already running, it returns null unless setAlarm
+/// has also been called since the alarm handler started running"), so a held event or a lever call landing while a
+/// page runs (the page's D1 awaits open the input gate) read `None` and called the live page dead: beta's three
+/// `armed under a dead alarm (None)` lines in one cold bootstrap. A page stamped (`meta.pageStartedAtMs`) less than
+/// [`BOOT_PAGE_WALL_MS`] ago is LIVE whatever the alarm reads; a stamp older than the wall with no alarm is the dead
+/// class ([`alarm_is_dead`], FOLD-7's item 12).
+pub fn boot_alarm_dead(held: Option<i64>, page_started_ms: Option<u64>, now_ms: u64) -> bool {
+    !page_in_flight(page_started_ms, now_ms) && alarm_is_dead(held, now_ms)
+}
+/// FIX-962: a page stamped at `started_ms` is still running at `now_ms` (its stamp younger than [`BOOT_PAGE_WALL_MS`]).
+pub fn page_in_flight(started_ms: Option<u64>, now_ms: u64) -> bool {
+    started_ms.is_some_and(|s| now_ms.saturating_sub(s) < BOOT_PAGE_WALL_MS)
+}
+/// FIX-962: how long a stamped page is read as running: the dead bound itself ([`BOOT_ALARM_DEAD_AFTER_MS`]). A page
+/// is three D1 round trips (about 2 s); one past two minutes is a handler the runtime has lost (it retries a failed
+/// alarm with backoff from 2 s), and only then may a held event re-arm it.
+pub const BOOT_PAGE_WALL_MS: u64 = BOOT_ALARM_DEAD_AFTER_MS;
+/// FIX-962: the per-page line the alarm writes (`games`, the page's own work `ms` from its budget take to its end,
+/// `waitMs` since the previous page ended, the cursor it leaves), so a rehearsal reads the cadence from the logs.
+pub fn page_line(
+    identity: &str,
+    games: usize,
+    ms: u64,
+    wait_ms: Option<u64>,
+    cursor: &str,
+) -> String {
+    format!(
+        "[owed-actor] page {identity}: games={games} ms={ms} waitMs={} cursor={cursor}",
+        wait_ms.map_or_else(|| "-".to_string(), |w| w.to_string())
+    )
 }
 /// The slack past a paced wait before an alarm is dead.
 pub const BOOT_ALARM_SLACK_MS: u64 = 5_000;
@@ -3914,6 +3987,8 @@ pub const JUDGE_VERSION: &str = "fold11-2026-10-29";
 /// D2-ACTOR-B-FOLD-14 (bsv-low #954 item 9): the apply's stages an answer carries and the ring each is kept in on its
 /// class's bars row: the record's reads, the judge, the mirror's writes, the turn's queueing (they sum to `applyMs`
 /// within the object's own work before and after the apply: the event's facts, the coalesced events' checks).
+/// FIX-962 (bsv-low #962): the `cold` class row's ring of bootstrap page work ([`PendingBars::cold_page`]).
+pub const COLD_PAGE_RING: &str = "page";
 pub const APPLY_STAGES: [(&str, &str); 4] = [
     ("readMs", "read"),
     ("judgeMs", "judge"),
@@ -4029,7 +4104,7 @@ pub async fn flush_bars_from(
     for class in BAR_CLASSES {
         let apply = pending.apply.get(class).cloned().unwrap_or_default();
         let visible = pending.visible.get(class).cloned().unwrap_or_default();
-        let staged: Vec<(&str, Vec<u64>)> = APPLY_STAGES
+        let mut staged: Vec<(&str, Vec<u64>)> = APPLY_STAGES
             .iter()
             .map(|(_, ring)| {
                 (
@@ -4042,10 +4117,15 @@ pub async fn flush_bars_from(
                 )
             })
             .collect();
+        // FIX-962: the cold row's page ring.
+        if class == "cold" {
+            staged.push((COLD_PAGE_RING, pending.cold_page.clone()));
+        }
         let staged: Vec<(&str, &[u64])> = staged.iter().map(|(r, v)| (*r, &v[..])).collect();
         let unapplied = (class == "queue" && pending.queue_touched)
             .then(|| pending.unapplied.values().min().copied());
-        if apply.is_empty() && visible.is_empty() && unapplied.is_none() {
+        let pages = class == "cold" && !pending.cold_page.is_empty();
+        if apply.is_empty() && visible.is_empty() && unapplied.is_none() && !pages {
             continue;
         }
         stmts.push(Stmt::new(
@@ -4143,6 +4223,13 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
             // FOLD-14 item 2: each stage's p95 beside the apply's.
             for (field, r) in APPLY_STAGES {
                 out[format!("{field}P95")] = json!(ring(c, r).0.quantile(0.95));
+            }
+            // FIX-962: the cold bootstrap's page work beside its cold time.
+            if *c == "cold" {
+                let (p, _, _) = ring(c, COLD_PAGE_RING);
+                out["pageSamples"] = json!(p.samples.len());
+                out["pageMsP95"] = json!(p.quantile(0.95));
+                out["pageMsMax"] = json!(p.max());
             }
             ((*c).to_string(), out)
         })

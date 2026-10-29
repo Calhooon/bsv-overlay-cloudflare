@@ -38,6 +38,11 @@ const META_JUDGED_AT: &str = "judgedAtMs";
 const META_IDENTITY: &str = "identity";
 const META_BOOTSTRAPPED: &str = "bootstrapped";
 const META_BOOT_CURSOR: &str = "bootCursor";
+/// FIX-962 (bsv-low #962): the start of the bootstrap page in flight (the alarm handler's, cleared when the branch
+/// ends: the next page's alarm set, the bootstrap done or parked); [`boot_alarm_dead`] reads a young one as live.
+const META_PAGE_STARTED: &str = "pageStartedAtMs";
+/// FIX-962: when the last page ended (the per-page line's `waitMs`).
+const META_PAGE_ENDED: &str = "pageEndedAtMs";
 /// D2-ACTOR-B-FOLD-10: the build (`lib_rev`) whose bootstrap last judged the whole state ([`rejudge_due`]).
 const META_JUDGED_REV: &str = "judgedLibRev";
 /// MEDIUM-4: the last tip the tip alarm judged (its next window is `(tipJudged, tip]`).
@@ -400,6 +405,13 @@ impl DurableObject for OwedActor {
         // The fourth delta lens's NEW4-M2: a parked bootstrap is not retried (the lever's `/bootstrap` clears it);
         // each fault is counted, and the fifth in a row parks the page, named in its line.
         if self.meta(META_BOOT_CURSOR).is_some() && !boot_parked(&local).await {
+            // FIX-962: the page in flight is stamped; `getAlarm()` reads null until the page sets its next alarm, and a
+            // held event or the lever meanwhile reads the stamp ([`boot_alarm_dead`]).
+            self.put_meta(
+                &local,
+                META_PAGE_STARTED,
+                &Date::now().as_millis().to_string(),
+            );
             if let Err(e) = self.bootstrap_page(&local).await {
                 console_log!("[owed-actor] bootstrap page: {e}");
                 if let Ok(record) = crate::routes::D1Sql::of(&self.env) {
@@ -411,6 +423,10 @@ impl DurableObject for OwedActor {
                     BootFault::Parked { line, .. } => console_log!("{line}"),
                 }
             }
+            // FIX-962: the branch ended: its next alarm is set, or the bootstrap is done or parked.
+            let _ = local
+                .sql
+                .exec("DELETE FROM meta WHERE name='pageStartedAtMs'", None);
         }
         if self.meta(META_KV_DIRTY).as_deref() == Some("1") {
             self.write_kv_copy(&local).await;
@@ -677,10 +693,16 @@ impl OwedActor {
                 };
             }
             let held = self.state.storage().get_alarm().await.ok().flatten();
-            if !alarm_is_dead(held, Date::now().as_millis()) {
+            // FIX-962: a page in flight reads `None` from `getAlarm()`; its stamp says it is live.
+            let started = self
+                .meta(META_PAGE_STARTED)
+                .and_then(|v| v.parse::<u64>().ok());
+            if !boot_alarm_dead(held, started, Date::now().as_millis()) {
                 return Armed::default();
             }
-            console_log!("[owed-actor] {me}: armed under a dead alarm ({held:?}): re-armed now");
+            console_log!(
+                "[owed-actor] {me}: armed under a dead alarm ({held:?}, page stamp {started:?}): re-armed now"
+            );
             self.alarm_in(0).await;
             if let Ok(record) = crate::routes::D1Sql::of(&self.env) {
                 record.counters(vec![(COUNTERS[23].into(), 1)]).await;
@@ -1093,6 +1115,8 @@ impl OwedActor {
         let record = crate::routes::D1Sql::of(&self.env)?;
         // NEW-M2: one token of the fleet's bootstrap budget, or a wait for a slot in a later minute.
         let now = Date::now().as_millis();
+        // FIX-962: the page's own work runs from here (its budget take) to its end.
+        let page_from = now;
         // NEW2-L3: one statement; a full minute writes nothing and answers no row (the page waits).
         // D2-ACTOR-B-FOLD-11 (NEW6-L2): a re-judge (an actor already bootstrapped) takes only under its share, and
         // waits behind the cold pages.
@@ -1134,6 +1158,30 @@ impl OwedActor {
         .map_err(Error::RustError)?;
         // NEW4-M2: a page (or a drain's alarm) that landed ends the run of faults.
         boot_page_landed(local).await;
+        // FIX-962: one line a page (its games, its work, its wait since the last page, the cursor it leaves), and a
+        // cold page's work into the fleet's `cold` row (`classes.cold.pageMsP95`).
+        let page_to = Date::now().as_millis();
+        let (page_games, left) = match &step {
+            BootStep::Page { games, cursor } => (*games, cursor.clone()),
+            BootStep::Draining { .. } => (0, BOOT_CURSOR_DRAIN.to_string()),
+            BootStep::Done { games, .. } => (*games, "done".to_string()),
+        };
+        let wait = self
+            .meta(META_PAGE_ENDED)
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|e| page_from.saturating_sub(e));
+        let page_ms = page_to.saturating_sub(page_from);
+        console_log!("{}", page_line(&me, page_games, page_ms, wait, &left));
+        if !rejudge {
+            note_cold_page(page_ms);
+        }
+        if matches!(step, BootStep::Done { .. }) {
+            let _ = local
+                .sql
+                .exec("DELETE FROM meta WHERE name='pageEndedAtMs'", None);
+        } else {
+            self.put_meta(local, META_PAGE_ENDED, &page_to.to_string());
+        }
         match step {
             BootStep::Page { cursor, .. } => {
                 self.put_meta(local, META_BOOT_CURSOR, &cursor);
@@ -1169,6 +1217,9 @@ impl OwedActor {
                     );
                     self.bars.borrow_mut().cold.note(ms);
                     note_cold(ms);
+                }
+                // FIX-962: the cold time and the pages' work flushed at the bootstrap's end (one flush a bootstrap).
+                if !rejudge {
                     flush_bars(&record, now, true).await;
                 }
                 self.put_meta(local, META_KV_DIRTY, "1");
