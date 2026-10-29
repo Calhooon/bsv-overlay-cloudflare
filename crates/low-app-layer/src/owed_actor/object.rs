@@ -1647,6 +1647,8 @@ pub async fn rows_lever(req: Request, env: &Env) -> Result<Response> {
             Stmt::new(RECONCILE_D1_ROWS_SQL, vec![Bind::Text(me.clone())]),
             // D2-ACTOR-B-FOLD-13 (bsv-low #958): which judge version D1's rows are (the stamp, `computedAtMs`).
             Stmt::new(D1_JUDGED_UNDER_SQL, vec![Bind::Text(me.clone())]),
+            // FIX-964 (bsv-low #964): the identity's pending marks, so a difference the backlog explains is named.
+            Stmt::new(LEVER_PENDING_SQL, vec![Bind::Text(me.clone())]),
         ])
         .await
         .map_err(Error::RustError)?
@@ -1656,15 +1658,18 @@ pub async fn rows_lever(req: Request, env: &Env) -> Result<Response> {
         .next()
         .and_then(|o| o.rows.into_iter().next())
         .unwrap_or_default();
+    let pending = read.next().map(|o| o.rows).unwrap_or_default();
     let stamp = rejudge_state_of(Some(&json!({"cursor": under["stamp"]})));
     let actor = call_stored_answer(env, &me, READ_WALL_MS).await;
-    Response::from_json(&rows_view(
+    let mut view = rows_view(
         &me,
         actor,
         &d1,
         stamp.as_ref(),
         json_ms(&under["computedAtMs"]).map(|c| c as i64),
-    ))
+    );
+    view["heldByLag"] = json!(held_by_lag(&view, &pending));
+    Response::from_json(&view)
 }
 
 pub async fn identities_lever(req: Request, env: &Env) -> Result<Response> {

@@ -3186,6 +3186,37 @@ pub fn rows_view(
     })
 }
 
+/// FIX-964 (bsv-low #964): the operator's rows lever's read of the identity's pending marks (the queue's unacknowledged
+/// set), one row a game holding one: the search of the UNIQUE key's index on its `identity` prefix.
+pub const LEVER_PENDING_SQL: &str = "SELECT gameId,MIN(CAST(markedAtMs AS INTEGER)) AS oldestMs FROM owed_dirty WHERE identity=?1 GROUP BY gameId";
+
+/// PURE (FIX-964): the outpoints of a [`rows_view`]'s `diff` whose game holds a pending mark ([`LEVER_PENDING_SQL`]'s
+/// rows): a difference the queue's backlog explains (`heldByLag`), named beside `diff`, which keeps naming them.
+pub fn held_by_lag(view: &Value, pending: &[Value]) -> Vec<String> {
+    let games: BTreeSet<String> = pending
+        .iter()
+        .filter_map(|r| r["gameId"].as_str().map(str::to_ascii_lowercase))
+        .collect();
+    let game_of = |o: &str| -> Option<String> {
+        view["d1"]["rows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(view["actor"]["rows"].as_array().into_iter().flatten())
+            .find(|r| r["outpoint"] == o)
+            .and_then(|r| r["gameId"].as_str())
+            .map(str::to_ascii_lowercase)
+    };
+    view["diff"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|o| game_of(o).is_some_and(|g| games.contains(&g)))
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn diff_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
     fn keyed(rows: &[Value]) -> BTreeMap<String, Value> {
         rows.iter()
@@ -5755,8 +5786,38 @@ pub async fn actor_then_d1(
 }
 
 /// The games of `?2` (a JSON array) holding a mark of `?1`'s above the acknowledgement bound `?3`: Phase B's compare
-/// (the second delta lens's NEW2-L1).
+/// (the second delta lens's NEW2-L1); since FIX-964 the reconcile's alone (the delivery's compare reads
+/// [`PENDING_MARKS_SQL`]).
 pub const HELD_GAMES_SQL: &str = "SELECT DISTINCT gameId FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2)) AND generation>?3";
+
+/// FIX-964 (bsv-low #964): the delivery compare's ONE read of `owed_dirty` (the queue's unacknowledged set, lane A),
+/// per compared game of `?1`'s (`?2`, a JSON array): `whileMarks` the marks above the acknowledgement bound `?3`
+/// (written while the two judged: NEW2-L1, unchanged), `lagMarks` the marks at or below it written before the
+/// compare's start `?4` that the delivery did NOT consume (still pending after the D1 judge's acknowledgement: a
+/// subject the judge left, a backlog mark the actor's rows predate) and `lagOldestMs` the oldest of them. With no bound
+/// (its read faulted) `?3` is bound past every generation, so every pending mark is lag. One search of the UNIQUE
+/// key's index on `(identity, gameId)`, at most one row a compared game (a delivery's chunk: 16).
+pub const PENDING_MARKS_SQL: &str = "SELECT gameId,SUM(generation>?3) AS whileMarks,SUM(generation<=?3 AND CAST(markedAtMs AS INTEGER)<=?4) AS lagMarks,MIN(CASE WHEN generation<=?3 AND CAST(markedAtMs AS INTEGER)<=?4 THEN CAST(markedAtMs AS INTEGER) END) AS lagOldestMs FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2)) GROUP BY gameId";
+
+/// PURE (FIX-964): the compare's held partition from [`PENDING_MARKS_SQL`]'s rows: the games held because a mark was
+/// written WHILE the two judged (NEW2-L1), and the games held by LAG (an unapplied mark older than the compare, none
+/// written while), each with its oldest lag mark's time. A game with both is the NEW2-L1 class.
+pub fn held_partition(rows: &[Value]) -> (BTreeSet<String>, BTreeMap<String, i64>) {
+    let n = |v: &Value| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64));
+    let mut while_games = BTreeSet::new();
+    let mut lag = BTreeMap::new();
+    for r in rows {
+        let Some(g) = r["gameId"].as_str().map(str::to_ascii_lowercase) else {
+            continue;
+        };
+        if n(&r["whileMarks"]).unwrap_or(0) > 0 {
+            while_games.insert(g);
+        } else if n(&r["lagMarks"]).unwrap_or(0) > 0 {
+            lag.insert(g, n(&r["lagOldestMs"]).unwrap_or(0));
+        }
+    }
+    (while_games, lag)
+}
 
 /// The compare of one answer with the D1 judge's rows just written (Phases A and B), counted. The second delta lens's
 /// NEW2-L1: in Phase B (`bound`, the acknowledgement's bound read before the actor's call) a game holding a mark
@@ -5764,6 +5825,12 @@ pub const HELD_GAMES_SQL: &str = "SELECT DISTINCT gameId FROM owed_dirty WHERE i
 /// at its next apply): its DIFF is counted APART (`owed_actor_compare_held_total`, served
 /// `/health.owedActor.heldDiffsTotal`), its line `DIFF (held mark, NEW2-L1)`, never `owed_actor_diffs_total` (the
 /// cutover's STOP).
+///
+/// FIX-964 (bsv-low #964): a game holding ANY unapplied mark older than the compare's start (the queue's backlog: a
+/// mark still in `owed_dirty` after the delivery's acknowledgement, [`PENDING_MARKS_SQL`]) is held too, by LAG: the two
+/// sides read two instants of the record, so their difference is counted `owed_actor_compare_held_total`, its line
+/// `DIFF (held: lag <age> ms)` with the oldest unapplied mark's age, never `owed_actor_diffs_total`. What
+/// `owed_actor_diffs_total` counts is a difference on a game with NO pending mark: the same inputs, two outputs.
 async fn compare(
     db: &impl JudgeDb,
     identity: &str,
@@ -5772,28 +5839,29 @@ async fn compare(
     bound: Option<i64>,
 ) {
     let id = identity.to_ascii_lowercase();
-    let mut stmts = vec![Stmt::new(ROWS_SQL, vec![Bind::Text(id.clone())])];
-    if let Some(b) = bound {
-        let gj = json!(games
-            .iter()
-            .map(|g| g.to_ascii_lowercase())
-            .collect::<Vec<_>>())
-        .to_string();
-        stmts.push(Stmt::new(
-            HELD_GAMES_SQL,
-            vec![Bind::Text(id), Bind::Text(gj), Bind::Int(b)],
-        ));
-    }
-    let (d1, held): (Vec<Value>, Vec<String>) = match db.run_batch(stmts).await {
+    let start = db.now_ms() as i64;
+    let gj = json!(games
+        .iter()
+        .map(|g| g.to_ascii_lowercase())
+        .collect::<Vec<_>>())
+    .to_string();
+    let stmts = vec![
+        Stmt::new(ROWS_SQL, vec![Bind::Text(id.clone())]),
+        Stmt::new(
+            PENDING_MARKS_SQL,
+            vec![
+                Bind::Text(id),
+                Bind::Text(gj),
+                Bind::Int(bound.unwrap_or(i64::MAX)),
+                Bind::Int(start),
+            ],
+        ),
+    ];
+    let (d1, (held, lag_games)) = match db.run_batch(stmts).await {
         Ok(o) if !o.is_empty() => {
             let held = o
                 .get(1)
-                .map(|h| {
-                    h.rows
-                        .iter()
-                        .filter_map(|r| r["gameId"].as_str().map(str::to_ascii_lowercase))
-                        .collect()
-                })
+                .map(|h| held_partition(&h.rows))
                 .unwrap_or_default();
             (o[0].rows.clone(), held)
         }
@@ -5812,6 +5880,9 @@ async fn compare(
     let (held_diffs, diffs): (Vec<String>, Vec<String>) = diffs
         .into_iter()
         .partition(|o| held.contains(&game_of(o).to_ascii_lowercase()));
+    let (lag_diffs, diffs): (Vec<String>, Vec<String>) = diffs
+        .into_iter()
+        .partition(|o| lag_games.contains_key(&game_of(o).to_ascii_lowercase()));
     let mut deltas = vec![(COUNTERS[0].to_string(), 1)];
     // NEW7-L2: the rows whose verdict agrees and whose judged tip does not (a lag, counted apart, never a STOP)
     let lag = tip_lag_rows(&of_games(&d1, games), &of_games(&actor, games));
@@ -5846,6 +5917,26 @@ async fn compare(
             games.len(),
             held_diffs[0],
             diff_detail(&d1, &actor, &held_diffs)
+        ));
+    }
+    if !lag_diffs.is_empty() {
+        let oldest = lag_diffs
+            .iter()
+            .filter_map(|o| lag_games.get(&game_of(o).to_ascii_lowercase()))
+            .min()
+            .copied()
+            .unwrap_or(start);
+        if held_diffs.is_empty() {
+            deltas.push((COUNTERS[17].to_string(), 1));
+        }
+        db.log(&format!(
+            "[owed-actor] DIFF (held: lag {} ms; FIX-964, not a STOP) {identity} game {}: {} outpoints of {} games, first {}; {}",
+            start.saturating_sub(oldest).max(0),
+            game_of(&lag_diffs[0]),
+            lag_diffs.len(),
+            games.len(),
+            lag_diffs[0],
+            diff_detail(&d1, &actor, &lag_diffs)
         ));
     }
     db.counters(deltas).await;
