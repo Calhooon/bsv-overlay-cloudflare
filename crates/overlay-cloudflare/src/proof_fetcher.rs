@@ -3787,7 +3787,11 @@ pub async fn backfill_decoded_params(
     // the rows both judges must agree on: spent, CONFIRMED, a decoded
     // covenant lock, no CURRENT verdict, the spender's BEEF HELD (the
     // store's predicate, `find_spent_unclassified`; a row whose bytes are
-    // absent is not read, an unconfirmed pointer is not one either). Each
+    // absent is not read, an unconfirmed pointer is not one either: a spend
+    // D1 serves through its verified-proof or seen-and-final arm while the
+    // flag is down is the confirmation pass's candidate, which latches it on
+    // the tick it confirms; the FIX-986 lens's LOW-1, stated at
+    // `spent_unclassified_candidates_sql`). Each
     // is classified by the same function as the door's hook and latched
     // under the pointer CAS; one that matches no mandated exit is honestly
     // unresolved, logged, and stays a candidate (RANDOM-sampled, bounded).

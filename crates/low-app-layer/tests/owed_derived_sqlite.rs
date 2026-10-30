@@ -79,10 +79,13 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..469]), 889_593_182);
     // bsv-low #986 (FIX-986-COMPARE-2) appends one: `owed_actor_compare`; the 473 before it are untouched.
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..473]), 1_823_919_051);
-    const COUNT: usize = 474;
+    // bsv-low #986 (FIX-986, READ-986 item 2(b)) appends one: `idx_pot_spent_unclassified`, the params backfill's
+    // second verdict candidate set; the 474 before it are untouched.
+    assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..474]), 3_293_095_810);
+    const COUNT: usize = 475;
     assert_eq!(OVERLAY_MIGRATIONS.len(), COUNT);
     assert_eq!(d1::OVERLAY_MIGRATION_COUNT, COUNT);
-    const FINGERPRINT: u32 = 3_293_095_810;
+    const FINGERPRINT: u32 = 4_238_311_408;
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT, "the certified fingerprint");
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT);
     assert_eq!(fingerprint(OVERLAY_MIGRATIONS), FINGERPRINT);

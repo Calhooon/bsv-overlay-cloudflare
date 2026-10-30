@@ -12460,27 +12460,37 @@ mod fix986 {
     /// (`spent_unclassified_candidates_sql`), the parse and the one classifier (`classify_stored_spend`), and the
     /// pointer CAS (`verdict_cas_sql`), as `backfill_decoded_params`'s second loop runs them on D1. Answers the
     /// candidates it found.
-    fn janitor_latch(db: &SqliteSql, p: &CovenantParams) -> Vec<(String, String)> {
+    fn janitor_latch(db: &SqliteSql) -> Vec<(String, String)> {
         use bsv_overlay_cloudflare::d1_discovery::{
-            spent_unclassified_candidates_sql, verdict_cas_sql,
+            pot_record_of_d1_row, spent_unclassified_candidates_sql, verdict_cas_sql,
         };
+        // the scan's rows as D1 answers them (a JSON object a row), mapped by the D1 backend's own `PotRow` read: the
+        // classifier is fed the candidate's stored columns, never a record rebuilt from the test's params (NIT-1)
         let sql = spent_unclassified_candidates_sql(16);
-        let candidates: Vec<(String, u32, String)> = db
-            .conn
-            .prepare(&sql)
-            .unwrap()
+        let mut stmt = db.conn.prepare(&sql).unwrap();
+        let names: Vec<String> = stmt.column_names().iter().map(|n| n.to_string()).collect();
+        let candidates: Vec<PotRecord> = stmt
             .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, u32>(1)?,
-                    r.get::<_, String>(3)?,
-                ))
+                let mut row = serde_json::Map::new();
+                for (i, name) in names.iter().enumerate() {
+                    let v = match r.get_ref(i)? {
+                        rusqlite::types::ValueRef::Null => Value::Null,
+                        rusqlite::types::ValueRef::Integer(n) => json!(n),
+                        rusqlite::types::ValueRef::Real(f) => json!(f),
+                        rusqlite::types::ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
+                        rusqlite::types::ValueRef::Blob(_) => unreachable!("no blob column"),
+                    };
+                    row.insert(name.clone(), v);
+                }
+                Ok(Value::Object(row))
             })
             .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
+            .map(|r| pot_record_of_d1_row(r.unwrap()).expect("the D1 backend's row read"))
+            .collect();
         let mut latched = Vec::new();
-        for (txid, vout, spender) in candidates {
+        for rec in candidates {
+            let (txid, vout) = (rec.txid.clone(), rec.output_index);
+            let spender = rec.spending_txid.clone().expect("a candidate is spent");
             let beef: Vec<u8> = db
                 .conn
                 .query_row(
@@ -12489,27 +12499,6 @@ mod fix986 {
                     |r| r.get(0),
                 )
                 .unwrap();
-            let rec = PotRecord {
-                txid: txid.clone(),
-                output_index: vout,
-                spent: true,
-                spending_txid: Some(spender.clone()),
-                spent_confirmed: true,
-                params_decoded: true,
-                lock_kind: Some("covenant".into()),
-                pub_a: Some(hex::encode(p.pub_a)),
-                pub_b: Some(hex::encode(p.pub_b)),
-                pub_tower: Some(hex::encode(p.pub_tower)),
-                pay_pkh_a: Some(hex::encode(p.pay_pkh_a)),
-                pay_pkh_b: Some(hex::encode(p.pay_pkh_b)),
-                rake_pkh: Some(hex::encode(p.rake_pkh)),
-                stake_a: Some(p.stake_a),
-                stake_b: Some(p.stake_b),
-                fee_sats: Some(p.fee_sats),
-                recovery_height: Some(p.recovery_height),
-                pot_sats: Some(POT_SATS),
-                ..Default::default()
-            };
             let group =
                 bsv_overlay_cloudflare::proof_fetcher::classify_stored_spend(&rec, &spender, &beef)
                     .expect("the held bytes classify");
@@ -12540,7 +12529,7 @@ mod fix986 {
     #[tokio::test]
     async fn fix986_d_the_actor_and_d1_agree_on_a_discovery_found_spend_once_its_verdict_is_latched(
     ) {
-        let (f, pot, refund, _, p) = discovered_refund_fixture();
+        let (f, pot, refund, _, _) = discovered_refund_fixture();
         let d1 = d1_judge(&f).await;
         let (a, b) = (id_a(), id_b());
         let key = format!("{pot}:0");
@@ -12584,7 +12573,7 @@ mod fix986 {
         assert_ne!(stored(&actor, &a), stored(&d1, &a));
 
         // THE JANITOR'S LATCH: the candidate set is the pot and nothing else, and the group lands.
-        let latched = janitor_latch(&d1, &p);
+        let latched = janitor_latch(&d1);
         assert_eq!(latched, vec![(pot.clone(), refund.clone())]);
         let group: (Option<String>, Option<String>, Option<String>) = d1
             .conn
@@ -12603,7 +12592,7 @@ mod fix986 {
             )
         );
         assert!(
-            janitor_latch(&d1, &p).is_empty(),
+            janitor_latch(&d1).is_empty(),
             "a latched row leaves the candidate set"
         );
 
