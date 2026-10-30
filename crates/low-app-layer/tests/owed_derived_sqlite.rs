@@ -77,10 +77,12 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     // letters by pair in place (MEDIUM-2, LOW-4; the four shipped nowhere): 1,223,941,910 then 751,808,187; the delta lens fold gave them
     // `redrivenAt` in place (LOW-C): 1,823,919,051.
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..469]), 889_593_182);
-    const COUNT: usize = 473;
+    // bsv-low #986 appends one: the fleet compare's table (474); the 473 before it are untouched.
+    assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..473]), 1_823_919_051);
+    const COUNT: usize = 474;
     assert_eq!(OVERLAY_MIGRATIONS.len(), COUNT);
     assert_eq!(d1::OVERLAY_MIGRATION_COUNT, COUNT);
-    const FINGERPRINT: u32 = 1_823_919_051;
+    const FINGERPRINT: u32 = 4_098_687_699;
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT, "the certified fingerprint");
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT);
     assert_eq!(fingerprint(OVERLAY_MIGRATIONS), FINGERPRINT);

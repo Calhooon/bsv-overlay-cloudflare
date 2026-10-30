@@ -270,6 +270,7 @@ mod tests {
             "\"tracker.sweep\"",
             "\"owed.drain\"",
             "\"owed.belt_arm\"",
+            "\"owed.compare_arm\"",
             "\"owed.backfill\"",
         ] {
             assert!(

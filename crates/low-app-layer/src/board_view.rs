@@ -144,6 +144,19 @@ impl BoardView {
             }
             return Response::ok("held");
         }
+        // bsv-low #986: the fleet compare's ring actor (`owed_actor::compare::COMPARE_ACTOR`), armed by the scheduled
+        // pass on every cron as the belt is.
+        if req.path() == "/owed-compare-arm" {
+            let storage = self.state.storage();
+            storage
+                .put(crate::owed_actor::compare::COMPARE_STORAGE_KEY, true)
+                .await?;
+            if storage.get_alarm().await?.is_none() {
+                storage.set_alarm(0).await?;
+                return Response::ok("armed");
+            }
+            return Response::ok("held");
+        }
         // The deferred owed walk is retired (#893: the read is one lookup, the belt asks the chain); a stale caller
         // is answered, never served the board.
         if req.path() == "/owed-deferred" || req.path() == "/owed-deferred-note" {
@@ -220,6 +233,24 @@ impl BoardView {
     /// Any other actor's alarm (a deferred walk armed before the retirement) clears its storage and ends.
     async fn serve_alarm(&self) -> Result<Response> {
         let storage = self.state.storage();
+        // bsv-low #986: the ring's actor. Its next alarm is an OFFSET (workers-rs reads an `i64` so), set BEFORE the
+        // step runs, so a step that faults leaves the ring armed.
+        if storage
+            .get::<bool>(crate::owed_actor::compare::COMPARE_STORAGE_KEY)
+            .await?
+            .unwrap_or(false)
+        {
+            storage
+                .set_alarm(crate::owed_actor::compare::COMPARE_TICK_MS)
+                .await?;
+            return match crate::owed_actor::compare::ring_env(&self.env).await {
+                Ok(r) => Response::from_json(&crate::owed_actor::compare::ring_report_json(&r)),
+                Err(error) => {
+                    worker::console_warn!("[owed-compare] step faulted: {error}");
+                    Response::error(error, 503)
+                }
+            };
+        }
         if !storage.get::<bool>("owed-belt").await?.unwrap_or(false) {
             storage.delete_all().await?;
             return Response::ok("retired deferred owed alarm");

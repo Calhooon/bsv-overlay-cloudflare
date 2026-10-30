@@ -48,6 +48,8 @@ use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+/// bsv-low #986: the fleet compare (the one compare, the ring, the summary route).
+pub mod compare;
 pub mod object;
 #[rustfmt::skip]
 pub mod schema;
