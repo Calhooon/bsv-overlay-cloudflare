@@ -1097,6 +1097,20 @@ pub trait PotStorage {
         Ok(Vec::new())
     }
 
+    /// bsv-low #986 (READ-986 item 2(b)): the janitor's SECOND candidate set, rows the discovery and confirmation
+    /// passes left classifiable and unclassified: SPENT, CONFIRMED (`spent_confirmed`), a DECODED COVENANT lock
+    /// (`lock_kind = 'covenant'` with its params) carrying NO CURRENT verdict (none, or one keyed to another
+    /// pointer than `spending_txid`: the reader's own `verdictTxid == spendingTxid` guard reads both as none),
+    /// and whose spender's BEEF the store HOLDS (`get_beef(spending_txid)` answers): a row whose spender bytes are
+    /// absent is NOT a candidate (nothing to classify from; it enters the set when the bytes arrive), and nor is
+    /// an unconfirmed pointer (the discovery pass's own write classifies one while the bytes are in hand; a
+    /// displaceable intent is latched by its confirmation, never by this sweep). RANDOM-sampled, at most `limit`
+    /// (the #284 anti-starvation idiom). Backends that cannot enumerate answer none: the arm is a no-op.
+    async fn find_spent_unclassified(&self, limit: u64) -> Result<Vec<PotRecord>, PotStorageError> {
+        let _ = limit;
+        Ok(Vec::new())
+    }
+
     /// bsv-low #406 backfill candidates: DECODED covenant rows whose CURRENT
     /// verdict group lacks the signer classification (`verdict IS NOT NULL
     /// AND verdict_txid = spending_txid AND settle_signers IS NULL`). These
@@ -2054,6 +2068,30 @@ impl PotStorage for MemoryPotStorage {
             .unwrap()
             .iter()
             .filter(|r| !r.params_decoded)
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    async fn find_spent_unclassified(&self, limit: u64) -> Result<Vec<PotRecord>, PotStorageError> {
+        // bsv-low #986: the D1 predicate, mirrored (`spent_unclassified_candidates_sql`): spent, confirmed, a
+        // decoded covenant lock, no CURRENT verdict, the spender's bytes held.
+        let beefs = self.beefs.lock().unwrap();
+        Ok(self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.spent
+                    && r.spent_confirmed
+                    && r.lock_kind.as_deref() == Some("covenant")
+                    && r.pub_a.is_some()
+                    && (r.verdict.is_none() || r.verdict_txid != r.spending_txid)
+                    && r.spending_txid
+                        .as_deref()
+                        .is_some_and(|s| beefs.contains_key(s))
+            })
             .take(limit as usize)
             .cloned()
             .collect())
