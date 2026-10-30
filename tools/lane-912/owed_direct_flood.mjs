@@ -16,6 +16,14 @@
 // 32, `owed_events_direct_acked_total` up by 32), the queue behind (+32 published, no consumer), and NO `owed_rows`
 // written for them (nothing writes D1's rows in Phase C). Each leg prints its figures; the cell FAILS on either.
 // Reads the tier's exported fleet fixture (RECORD_DOOR_FIXTURE, as the #911 cell does). Every host is sealed.
+// FIX-984 (bsv-low #984): THE CELL OWNS ITS PHASE AND ITS BOOTSTRAP BOUND. The committed render's owed flags
+// (`crates/low-app-layer/wrangler.toml`, top level and `[env.beta.vars]`) are read and printed at the start and never
+// used: each half binds its own (B, then C), so the cell is the same under a committed Phase A, B or C render. The
+// bootstraps take tokens of the fleet budget (`owed-actor:boot-budget`, BOOTSTRAP_PAGES_PER_MINUTE 60 a wall-clock
+// minute): the two halves' 64 pages can fall in one minute, and a page past the 60th waits for the next minute plus
+// its identity's spread (under 30 s), up to 90 s from the request, past the old fixed 60 s poll (the refused land of
+// PR 233, 28 of the second half's 32 pages run). The poll's bound is now read off the budget row before the
+// bootstraps: the pages this minute still holds run at once, the rest at the next minute's edge plus the spread.
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
@@ -54,6 +62,33 @@ const options = phase => ({
   } },
 })
 const start = phase => new Miniflare((convertV4MiniflareOptions ?? (v => v))(options(phase)))
+// the committed render's owed flags, printed and not used (the halves bind their own)
+const renderFlags = (() => {
+  const toml = readFileSync(resolve(root, 'crates/low-app-layer/wrangler.toml'), 'utf8')
+  const out = {}
+  let section = ''
+  for (const line of toml.split('\n')) {
+    const h = line.match(/^\s*\[([^\]]+)\]/)
+    if (h) { section = h[1]; continue }
+    const m = line.match(/^\s*(OWED_ACTOR_READ|OWED_D1_JUDGE|OWED_CONSUMER_CONCURRENCY)\s*=\s*"([^"]*)"/)
+    if (m && (section === 'vars' || section === 'env.beta.vars')) out[`${section}.${m[1]}`] = m[2]
+  }
+  return out
+})()
+console.log(`owed_direct_flood: the committed render's owed flags ${JSON.stringify(renderFlags)}; each half binds its own (d_a Phase B, fix952_a Phase C)`)
+// FIX-984: the fleet budget the bootstraps take from (owed_actor.rs), and the bound of a poll over N one-page bootstraps
+const PAGES_PER_MINUTE = 60
+const SPREAD_MS = 30000
+const BOOT_SLACK_MS = 30000
+const bootBound = async (db, pages) => {
+  const now = Date.now()
+  const row = await db.prepare("SELECT cursor, tickedAtMs FROM owed_belt_state WHERE name='owed-actor:boot-budget'").first()
+  const taken = row && Math.trunc(Number(row.tickedAtMs)) === Math.floor(now / 60000) ? Number(row.cursor) : 0
+  const spill = Math.max(0, taken + pages - PAGES_PER_MINUTE)
+  const minutes = Math.ceil(spill / PAGES_PER_MINUTE)
+  const ms = (spill ? (Math.floor(now / 60000) + minutes) * 60000 - now + SPREAD_MS : 0) + BOOT_SLACK_MS
+  return { taken, spill, ms }
+}
 const files = path => readdirSync(path, { withFileTypes: true }).flatMap(e => e.isDirectory() ? files(resolve(path, e.name)) : [resolve(path, e.name)])
 let mf = start('B')
 try {
@@ -89,10 +124,11 @@ try {
     const like = prefix + '%'
     const marks = (await db.prepare('SELECT COUNT(DISTINCT identity) AS n FROM owed_dirty WHERE identity LIKE ?').bind(like).first()).n
     assert.equal(marks, 32, `${tag}: each seat's marker wrote its mark (the dirty trigger)`)
+    const bound = await bootBound(db, seats.length)
     const tb = Date.now()
     await Promise.all(seats.map(s => actor(s.identity).fetch('http://owed-actor/bootstrap', { method: 'POST', body: JSON.stringify({ identity: s.identity }) })))
-    await poll(`${tag}: the 32 bootstraps`, async () => (await Promise.all(seats.map(s => pinState(s.identity)))).every(p => p.meta.bootstrapped))
-    console.log(`${tag}: 32 seats bootstrapped in ${Date.now() - tb} ms`)
+    await poll(`${tag}: the 32 bootstraps (${bound.taken} tokens of this minute taken before, ${bound.spill} pages past the budget, bound ${bound.ms} ms)`, async () => (await Promise.all(seats.map(s => pinState(s.identity)))).every(p => p.meta.bootstrapped), bound.ms)
+    console.log(`${tag}: 32 seats bootstrapped in ${Date.now() - tb} ms (phase ${phase}; ${bound.taken} tokens of the minute taken before, ${bound.spill} pages waited for the next minute; bound ${bound.ms} ms)`)
     const judgedBefore = new Map()
     for (const s of seats) judgedBefore.set(s.identity, Number((await pinState(s.identity)).meta.judgedAtMs ?? 0))
     const publishedBefore = await counter('owed_events_published_total')
