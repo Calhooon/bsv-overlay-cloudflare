@@ -10702,3 +10702,140 @@ fn fix968_d_the_read_asks_the_actor_its_coverage_of_the_marked_games() {
         BTreeMap::from([("ga".to_string(), 9)])
     );
 }
+
+/// FIX-974 (bsv-low #974; L53's S3): THE MINED WORD IS READ OFF THE SHAPES THE PUBLISH SENDS. A `word` event carries
+/// either the overlay's tracker frame (`facts.frame`: `{txid, kind, body}`, `owed_events_publish::frame_note`) or the
+/// row's facts under `facts.row` (`READ_WORD_SQL`, wrapped `{marks, row}` by the publish). Neither shape holds a word
+/// at `facts.word` or at `facts.frame.word`, which is what `EventCtx::of` read, so no event of L53's 133 cells ever
+/// carried `mined: true` to the actor and the collect-after-mined bar had no sample through the loop. Now the `proof`
+/// frame (the verified bump the overlay notes at `/arc-ingest` MINED, `proof_fetcher::verify_bump_detailed`) IS the
+/// mined word's event; the body carries it, the answer echoes it, and the first apply's note lands
+/// `collectAfterMinedMsP95`. A SEEN frame, a MINED `callback` frame (Arcade's claim over a bump the overlay did not
+/// verify, else the `proof` frame rides) and a row-shaped word event (the tracker's own write: the tick's re-ask, the
+/// POST belt) are not: the class is the callback's road, as the design's bar 3 reads it. RED on 149869bf: `mined`
+/// false on the proof frame (`facts.frame.word` is no field), the bar null.
+#[test]
+fn fix974_a_the_mined_word_is_read_off_the_published_shapes() {
+    let txid = "71fa3ec66d30b961ea9322d3d32d85a8e556633bd32c3e83d64367d640d31d84";
+    // the frame as the overlay's `tracker_events::note` builds it and `frame_note` carries it
+    let frame = |kind: &str, body: Value| json!({"txid": txid, "kind": kind, "body": body});
+    let event = |facts: Value, seq: i64| overlay_discovery::owed_event::OwedEvent {
+        v: overlay_discovery::owed_event::OWED_EVENT_V,
+        seq,
+        source: "word".into(),
+        source_key: txid.into(),
+        facts,
+        at_ms: 1_000,
+    };
+    let proof =
+        crate::owed_events_publish::frame_note(&frame("proof", json!({"merklePath": "00"})))
+            .unwrap();
+    assert_eq!((proof.source.as_str(), proof.key.as_str()), ("word", txid));
+    let proof_ev = event(proof.held.clone().unwrap(), 7);
+    assert!(proof_ev.frame().is_some(), "{}", proof_ev.facts);
+    let ctx = EventCtx::of(&proof_ev);
+    assert!(
+        ctx.mined,
+        "a proof frame is the mined word's event: {}",
+        proof_ev.facts
+    );
+    // not the mined word's: a SEEN frame, a MINED callback frame, a submit frame, a row-shaped word event
+    for (kind, body) in [
+        ("seen", json!({"source": "arcade", "at": 1})),
+        ("callback", json!({"txStatus": "MINED", "merklePath": "00"})),
+        ("submit", Value::Null),
+    ] {
+        let n = crate::owed_events_publish::frame_note(&frame(kind, body)).unwrap();
+        assert!(!EventCtx::of(&event(n.held.unwrap(), 8)).mined, "{kind}");
+    }
+    let row = |word: &str| json!({"marks": 1, "row": {"word": word, "tier": "chain", "height": 973211, "proofRoot": "ab", "headerHash": "cd", "hintSource": null, "hintAt": null, "updatedAt": 1}});
+    assert!(
+        !EventCtx::of(&event(row("mined"), 9)).mined,
+        "the tracker's own write is not the callback's road"
+    );
+    assert!(!EventCtx::of(&event(row("seen"), 10)).mined);
+    let mut other = proof_ev.clone();
+    other.source = "pot".into();
+    assert!(!EventCtx::of(&other).mined, "only a word event");
+    // the shapes are the publish's own (the overlay's source, compiled here as `owed_events_publish`)
+    let publish: String = include_str!("../../../overlay-cloudflare/src/owed_events.rs")
+        .split_whitespace()
+        .collect();
+    assert!(
+        publish.contains("json!({\"marks\":marks,\"row\":facts})"),
+        "the publish wraps a row's facts under `row`"
+    );
+    assert!(
+        publish.contains("held:Some(json!({\"frame\":frame})),"),
+        "a frame rides under `frame`"
+    );
+    assert!(crate::owed_events_publish::READ_WORD_SQL.contains("json_object('word',word,"));
+    let events: String = include_str!("../../../overlay-cloudflare/src/tracker_events.rs")
+        .split_whitespace()
+        .collect();
+    assert!(events.contains(
+        "json!({\"txid\":txid.to_ascii_lowercase(),\"kind\":kind,\"body\":body.unwrap_or(Value::Null)})"
+    ));
+    let fetcher: String = include_str!("../../../overlay-cloudflare/src/proof_fetcher.rs")
+        .split_whitespace()
+        .collect();
+    assert!(
+        fetcher.contains(
+            "BumpVerdict::Valid=>{crate::tracker_events::note(txid,\"proof\",Some(serde_json::json!({\"merklePath\":bump_hex})),);"
+        ),
+        "the proof frame is noted for a verified bump alone"
+    );
+    // the body carries it, the object echoes it and notes the bar, the caller's note is the sample
+    let body = apply_body("owner", &["g1".to_string()], &ctx, Some(973_211));
+    assert_eq!(body["mined"], json!(true), "{body}");
+    let object: String = include_str!("object.rs").split_whitespace().collect();
+    assert!(object.contains("answer[\"mined\"]=json!(body.mined);"));
+    assert!(object.contains("ifbody.mined{bars.collect_after_mined.note(now.saturating_sub(at));}"));
+    let answer = json!({"identity": "owner", "applied": true, "firstApply": true, "warmAtBirth": true, "atMs": 1_000, "judgedAtMs": 1_300, "applyMs": 40, "mined": body["mined"]});
+    let mut pending = PendingBars::default();
+    pending.note_answer("direct", &answer);
+    assert_eq!(
+        pending.visible.get("mined").map(Vec::len),
+        Some(1),
+        "the mined class's visible sample: {:?}",
+        pending.visible
+    );
+    assert_eq!(
+        pending.visible.get("direct").map(Vec::len),
+        Some(1),
+        "and the direct class's first visibility"
+    );
+    let mut bars = Bars::default();
+    note_answer_into(&mut bars, &answer);
+    assert_eq!(bars.served(2_000)["collectAfterMinedMsP95"], json!(300));
+}
+
+/// FIX-974 (bsv-low #974): A DUPE NEVER SAMPLES THE MINED BAR, NOR DOES A REDELIVERY OR A COLD-BORN EVENT: a covered
+/// dupe (`applied: false`), an applied redelivery (`firstApply: false`) and an event born before the actor's bootstrap
+/// (`warmAtBirth: false`) of a mined word's event add nothing to the `mined` class or the bar, in the caller's pending
+/// bars and in the isolate's served bars alike (#952's rule: one sample an event, at its first apply); the served key
+/// stands whatever the samples. Green on 149869bf (the guard the fix keeps).
+#[test]
+fn fix974_b_a_dupe_never_samples_the_mined_bar() {
+    let mut pending = PendingBars::default();
+    let mut bars = Bars::default();
+    for answer in [
+        json!({"identity": "owner", "applied": false, "rounds": 0, "atMs": 1_000, "judgedAtMs": 1_300, "applyMs": 4, "mined": true}),
+        json!({"identity": "owner", "applied": true, "firstApply": false, "warmAtBirth": true, "atMs": 1_000, "judgedAtMs": 1_300, "applyMs": 40, "mined": true}),
+        json!({"identity": "owner", "applied": true, "firstApply": true, "warmAtBirth": false, "atMs": 1_000, "judgedAtMs": 1_300, "applyMs": 40, "mined": true}),
+    ] {
+        pending.note_answer("queue", &answer);
+        note_answer_into(&mut bars, &answer);
+    }
+    assert!(
+        pending.visible.get("mined").is_none_or(Vec::is_empty),
+        "{:?}",
+        pending.visible
+    );
+    let served = bars.served(2_000);
+    assert_eq!(served["collectAfterMinedMsP95"], Value::Null);
+    assert!(
+        served.get("collectAfterMinedMsP95").is_some(),
+        "the served key stands"
+    );
+}

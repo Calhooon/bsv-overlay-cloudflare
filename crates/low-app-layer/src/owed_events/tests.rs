@@ -732,3 +732,154 @@ fn fold12_c_each_identitys_apply_carries_its_own_also_events() {
     let one = coalesced_event_of(&[(&a1, &pa1)]).unwrap();
     assert!(one.by_identity.is_empty() && one.also.is_empty());
 }
+
+/// FIX-974 (bsv-low #974; L53's S3): THE MINED FRAME TAKES THE DIRECT ROAD. The overlay's `/arc-ingest` MINED push
+/// rides as a `word` event carrying the `proof` frame, and the direct pass left EVERY frame to the consumer (its
+/// ingest is the tracker's write), so the mined word's first apply could only be the queue's delivery and its sample
+/// the backlog's lag (L53: the consumer 6,000 messages behind; and `mined` never read, no sample at all). Now a frame
+/// that is the mined word's (`owed_actor::mined_word_event`) is INGESTED through the port first (the tracker's write,
+/// whose trigger marks the seat the txid's spend names), then planned and called as any direct event, its answer noted
+/// into the `mined` class; a SEEN frame stays the consumer's, untouched; a mined frame whose ingest faults is left to
+/// the queue, uncalled. New API (`DirectPort::ingest_frame`, `DirectReport::mined_frames`): does not compile on
+/// 149869bf, whose pass answers `left_to_queue: 2, calls: 0` for the same two events.
+#[tokio::test]
+async fn fix974_c_the_mined_frame_takes_the_direct_road() {
+    struct FramePort<'a> {
+        db: &'a SqliteSql,
+        fail_ingest: bool,
+        ingested: RefCell<Vec<Value>>,
+        bodies: RefCell<Vec<Value>>,
+    }
+    impl DirectPort for FramePort<'_> {
+        async fn subjects(&self, ev: &OwedEvent) -> Result<Vec<(String, Vec<String>)>, String> {
+            Ok(plan_with(self.db, ev, false).await?.subjects())
+        }
+        async fn ingest_frame(&self, frame: &Value) -> Result<(), String> {
+            if self.fail_ingest {
+                return Err("tracker write faulted".into());
+            }
+            // the tracker's write: the word's trigger marks the seat whose hop the txid spends
+            let txid = frame["txid"].as_str().unwrap().to_string();
+            mark(self.db, "g1", "word", &txid, T0);
+            self.ingested.borrow_mut().push(frame.clone());
+            Ok(())
+        }
+        async fn call(&self, body: Value) -> Result<Value, String> {
+            self.bodies.borrow_mut().push(body.clone());
+            Ok(
+                json!({"identity": body["identity"], "applied": true, "firstApply": true, "warmAtBirth": true, "atMs": body["atMs"], "judgedAtMs": T0 + 420, "applyMs": 30, "mined": body["mined"]}),
+            )
+        }
+    }
+    let txid = "71fa3ec66d30b961ea9322d3d32d85a8e556633bd32c3e83d64367d640d31d84";
+    let frame_event = |kind: &str, body: Value, seq: i64| {
+        let n = publish::frame_note(&json!({"txid": txid, "kind": kind, "body": body})).unwrap();
+        OwedEvent {
+            v: owed_event::OWED_EVENT_V,
+            seq,
+            source: n.source,
+            source_key: n.key,
+            facts: n.held.unwrap(),
+            at_ms: T0,
+        }
+    };
+    let events = || {
+        vec![
+            frame_event("proof", json!({"merklePath": "00"}), 7),
+            frame_event("seen", json!({"source": "arcade", "at": T0}), 8),
+        ]
+    };
+    // the proof frame ingested, planned off the mark its ingest made, called with `mined`, sampled once
+    let db = SqliteSql::migrated();
+    let port = FramePort {
+        db: &db,
+        fail_ingest: false,
+        ingested: RefCell::new(Vec::new()),
+        bodies: RefCell::new(Vec::new()),
+    };
+    let mined_before = crate::owed_actor::pending_bars_snapshot()
+        .visible
+        .get("mined")
+        .map_or(0, Vec::len);
+    let report = direct_with(&port, events(), Some(973_211)).await;
+    assert_eq!(
+        (
+            report.events,
+            report.calls,
+            report.left_to_queue,
+            report.mined_frames,
+            report.faults
+        ),
+        (1, 1, 1, 1, 0),
+        "{report:?}"
+    );
+    assert_eq!(
+        port.ingested.borrow().len(),
+        1,
+        "the proof frame ingested, the seen frame left to the consumer"
+    );
+    assert_eq!(port.ingested.borrow()[0]["kind"], json!("proof"));
+    let body = port.bodies.borrow()[0].clone();
+    assert_eq!(
+        (
+            body["mined"].clone(),
+            body["kind"].clone(),
+            body["seq"].clone(),
+            body["atMs"].clone(),
+            body["class"].clone(),
+            body["identity"].clone(),
+            body["games"].clone()
+        ),
+        (
+            json!(true),
+            json!("word"),
+            json!(7),
+            json!(T0),
+            json!("direct"),
+            json!(ID),
+            json!(["g1"])
+        ),
+        "{body}"
+    );
+    let mined_after = crate::owed_actor::pending_bars_snapshot()
+        .visible
+        .get("mined")
+        .map_or(0, Vec::len);
+    assert_eq!(
+        mined_after - mined_before,
+        1,
+        "the first apply's note into the mined class"
+    );
+    // a mined frame whose ingest faults is the queue's: nothing called, nothing marked
+    let db = SqliteSql::migrated();
+    let port = FramePort {
+        db: &db,
+        fail_ingest: true,
+        ingested: RefCell::new(Vec::new()),
+        bodies: RefCell::new(Vec::new()),
+    };
+    let report = direct_with(&port, events(), Some(973_211)).await;
+    assert_eq!(
+        (
+            report.events,
+            report.calls,
+            report.left_to_queue,
+            report.mined_frames
+        ),
+        (0, 0, 2, 0),
+        "{report:?}"
+    );
+    assert_eq!(int(&db, "SELECT COUNT(*) FROM owed_dirty"), 0);
+    // the worker's port ingests through the consumer's own ingest
+    let src: String = include_str!("../owed_events.rs")
+        .split_whitespace()
+        .collect();
+    let worker = &src[src.find("implDirectPortforWorkerDirect{").unwrap()..];
+    assert!(worker.contains(
+        "asyncfningest_frame(&self,frame:&Value)->Result<(),String>{ingest_frame(&self.env,frame).await}"
+    ));
+    let pass = &src[src.find("pubasyncfndirect_with_class(").unwrap()..];
+    assert!(pass.contains(
+        "if!crate::owed_actor::mined_word_event(&ev)||port.ingest_frame(frame).await.is_err(){report.left_to_queue+=1;continue;}"
+    ));
+}
