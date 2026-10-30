@@ -121,7 +121,13 @@ impl BoardView {
         }
     }
 
-    async fn serve_fetch(&self, req: Request) -> Result<Response> {
+    async fn serve_fetch(&self, mut req: Request) -> Result<Response> {
+        // bsv-low #989: the fleet's push gate (`push_coalesce::PUSH_GATE_ACTOR`): every first-party push to a seat is
+        // coalesced here, under one seat bucket a seat and one sender bucket.
+        if req.path() == crate::push_coalesce::PUSH_GATE_PATH {
+            let text = req.text().await?;
+            return crate::push_coalesce::serve_gate(&self.env, &text).await;
+        }
         let url = req.url()?;
         if req.path() == "/owed-drain" {
             let _turn = self.owed_turn.lock().await;

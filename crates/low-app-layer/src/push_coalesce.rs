@@ -535,7 +535,219 @@ impl PushPort for WorkerPush<'_> {
     }
 }
 
-/// THE helper every first-party push to a seat calls: the isolate's coalescer under the env's knobs.
+/// bsv-low #989 (lane FIX-989, L54's S2): the ONE place a first-party push to a seat is submitted to a coalescer.
+///
+/// L54 read the relay's refusals at 06:55Z: `541 sends, and an identity makes at most 100 in the window`, the count
+/// rising across recipients (the SENDER's minute, the app layer's one key), refused in 27 of 40 sampled lines inside
+/// an `OwedActor` (18 distinct objects) and the rest in the Worker's fetch isolates. PR 194's coalescer was on that
+/// path, but it lives per ISOLATE: every owed actor (one Durable Object per seat, each in an isolate of its own) and
+/// every fetch isolate kept its own seat and sender buckets, so each passed its own 40 and 80 and the fleet sent 541.
+/// Its stated limit ("two isolates pushing at the same moment can still pass 100") was the whole fleet once the
+/// actors pushed. So a push is now FORWARDED to one gate, the `BOARD_VIEW` object named [`PUSH_GATE_ACTOR`], whose
+/// isolate's coalescer is the fleet's: one seat bucket a seat and one sender bucket, whatever the producer (the
+/// actor's `owed-changed`, the D1 judge's beside it in Phase B, the pot hook's `pot`), so the actor's and the D1
+/// judge's pushes of one judgement coalesce under one key. A push in the gate's own isolate (the gate, or another
+/// `BoardView` object sharing it: the same cell) is submitted there. With no `BOARD_VIEW` binding the isolate's
+/// coalescer stands, as before #989. A gate that faults answers `Failed` for its pushes and never sends around it
+/// (the pot hook's park re-drives its event; an `owed-changed` costs the seat its next event's re-read).
+pub const PUSH_GATE_ACTOR: &str = "push-gate:v1";
+/// The gate's route on its object.
+pub const PUSH_GATE_PATH: &str = "/push-gate";
+/// The pushes one forward carries (a flush of the isolate's queue is cut into bodies of this many).
+pub const PUSH_GATE_BODY_MAX: usize = 256;
+
+/// One push as it rides to the gate.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatePush {
+    pub recipient: String,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    pub body: Value,
+}
+
+/// What a forward to the gate came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Forwarded {
+    /// One answer a push, in order.
+    Answers(Vec<Answer>),
+    /// No gate is bound: the isolate's coalescer.
+    Unbound,
+    /// The gate did not answer (or answered something else): every push `Failed`, never sent around it.
+    Fault(String),
+}
+
+/// Where this isolate's pushes go.
+#[allow(async_fn_in_trait)]
+pub trait SeatGate {
+    /// The gate lives in this isolate: its coalescer is this isolate's cell.
+    fn hosted_here(&self) -> bool;
+    async fn forward(&self, pushes: Vec<GatePush>) -> Forwarded;
+}
+
+impl Answer {
+    pub fn word(self) -> &'static str {
+        match self {
+            Answer::Sent => "sent",
+            Answer::BudgetRefused => "budget",
+            Answer::Failed => "failed",
+            Answer::NotConfigured => "not-configured",
+        }
+    }
+    pub fn of_word(w: &str) -> Option<Self> {
+        Some(match w {
+            "sent" => Answer::Sent,
+            "budget" => Answer::BudgetRefused,
+            "failed" => Answer::Failed,
+            "not-configured" => Answer::NotConfigured,
+            _ => return None,
+        })
+    }
+}
+
+/// The pushes submitted to `cell`, together, one answer each in order.
+pub async fn submit_all<P: PushPort>(
+    cell: &RefCell<Coalescer>,
+    port: &P,
+    knobs: &Knobs,
+    pushes: Vec<GatePush>,
+) -> Vec<Answer> {
+    futures_util::future::join_all(pushes.into_iter().map(|p| async move {
+        submit(
+            cell,
+            port,
+            knobs,
+            &p.recipient,
+            p.message_id.as_deref(),
+            p.body,
+        )
+        .await
+    }))
+    .await
+}
+
+/// THE route of a seat's pushes (bsv-low #989): to the gate when it is elsewhere, to `cell` when it is here or
+/// unbound. One answer a push, in order.
+pub async fn deliver<P: PushPort, G: SeatGate>(
+    cell: &RefCell<Coalescer>,
+    port: &P,
+    gate: &G,
+    knobs: &Knobs,
+    pushes: Vec<GatePush>,
+) -> Vec<Answer> {
+    if pushes.is_empty() {
+        return Vec::new();
+    }
+    if gate.hosted_here() {
+        return submit_all(cell, port, knobs, pushes).await;
+    }
+    let n = pushes.len();
+    match gate.forward(pushes.clone()).await {
+        Forwarded::Answers(a) if a.len() == n => a,
+        Forwarded::Answers(a) => {
+            port.log(&format!(
+                "[push] gate answered {} for {n} pushes; every one failed",
+                a.len()
+            ));
+            vec![Answer::Failed; n]
+        }
+        Forwarded::Unbound => submit_all(cell, port, knobs, pushes).await,
+        Forwarded::Fault(why) => {
+            port.log(&format!("[push] gate fault for {n} pushes: {why}"));
+            vec![Answer::Failed; n]
+        }
+    }
+}
+
+thread_local! {
+    /// This isolate hosts the gate (set by the gate's first request): its pushes are submitted to the isolate's cell.
+    static GATE_HOSTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The worker's gate: the `BOARD_VIEW` object named [`PUSH_GATE_ACTOR`].
+pub struct WorkerGate<'a> {
+    pub env: &'a worker::Env,
+}
+
+impl SeatGate for WorkerGate<'_> {
+    fn hosted_here(&self) -> bool {
+        GATE_HOSTED.with(|h| h.get())
+    }
+    async fn forward(&self, pushes: Vec<GatePush>) -> Forwarded {
+        let Ok(ns) = self.env.durable_object("BOARD_VIEW") else {
+            return Forwarded::Unbound;
+        };
+        let stub = match ns
+            .id_from_name(PUSH_GATE_ACTOR)
+            .and_then(|id| id.get_stub())
+        {
+            Ok(s) => s,
+            Err(e) => return Forwarded::Fault(e.to_string()),
+        };
+        let body = json!({ "pushes": pushes }).to_string();
+        let mut init = worker::RequestInit::new();
+        init.with_method(worker::Method::Post)
+            .with_body(Some(body.into()));
+        let req = match worker::Request::new_with_init(
+            &format!("https://board-view{PUSH_GATE_PATH}"),
+            &init,
+        ) {
+            Ok(r) => r,
+            Err(e) => return Forwarded::Fault(e.to_string()),
+        };
+        let mut resp = match stub.fetch_with_request(req).await {
+            Ok(r) => r,
+            Err(e) => return Forwarded::Fault(e.to_string()),
+        };
+        let status = resp.status_code();
+        let text = resp.text().await.unwrap_or_default();
+        if status != 200 {
+            return Forwarded::Fault(format!("HTTP {status}"));
+        }
+        answers_of(&text).map_or_else(
+            || Forwarded::Fault("an answer that does not read".into()),
+            Forwarded::Answers,
+        )
+    }
+}
+
+/// PURE: the gate's answer body, `{"answers": ["sent", ...]}`.
+pub fn answers_of(text: &str) -> Option<Vec<Answer>> {
+    serde_json::from_str::<Value>(text)
+        .ok()?
+        .get("answers")?
+        .as_array()?
+        .iter()
+        .map(|a| a.as_str().and_then(Answer::of_word))
+        .collect()
+}
+
+/// THE GATE (bsv-low #989): the `/push-gate` request of the object named [`PUSH_GATE_ACTOR`]. Marks the isolate as
+/// the gate's, submits the pushes to the isolate's coalescer and answers when every one came to something.
+pub async fn serve_gate(env: &worker::Env, text: &str) -> worker::Result<worker::Response> {
+    GATE_HOSTED.with(|h| h.set(true));
+    let pushes: Vec<GatePush> = match serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| v.get("pushes").cloned())
+        .and_then(|p| serde_json::from_value(p).ok())
+    {
+        Some(p) => p,
+        None => return worker::Response::error("pushes", 400),
+    };
+    let knobs = Knobs::from_env(env);
+    let port = WorkerPush { env };
+    let cell: &'static RefCell<Coalescer> = ISOLATE.with(|c| *c);
+    let answers = if crate::internal_events::relay_configured(env) {
+        submit_all(cell, &port, &knobs, pushes).await
+    } else {
+        vec![Answer::NotConfigured; pushes.len()]
+    };
+    worker::Response::from_json(
+        &json!({ "answers": answers.iter().map(|a| a.word()).collect::<Vec<_>>() }),
+    )
+}
+
+/// THE helper every first-party push to a seat calls: through the fleet's gate ([`deliver`]) under the env's knobs.
 pub async fn push_to_seat(
     env: &worker::Env,
     recipient: &str,
@@ -548,13 +760,26 @@ pub async fn push_to_seat(
     if !crate::internal_events::relay_configured(env) {
         return first_party_push_answer_raw(env, recipient, message_id, body).await;
     }
+    let push = GatePush {
+        recipient: recipient.to_string(),
+        message_id: message_id.map(str::to_string),
+        body,
+    };
+    deliver_env(env, vec![push])
+        .await
+        .first()
+        .copied()
+        .unwrap_or(Answer::Failed)
+        .delivery()
+}
+
+/// The worker's [`deliver`]: the isolate's cell, the relay port, the `BOARD_VIEW` gate.
+async fn deliver_env(env: &worker::Env, pushes: Vec<GatePush>) -> Vec<Answer> {
     let knobs = Knobs::from_env(env);
     let port = WorkerPush { env };
     // The cell is the isolate's; `submit` never holds its borrow across an await.
     let cell: &'static RefCell<Coalescer> = ISOLATE.with(|c| *c);
-    submit(cell, &port, &knobs, recipient, message_id, body)
-        .await
-        .delivery()
+    deliver(cell, &port, &WorkerGate { env }, &knobs, pushes).await
 }
 
 async fn first_party_push_answer_raw(
@@ -634,12 +859,31 @@ pub async fn flush_queued(env: worker::Env) {
     if pushes.is_empty() {
         return;
     }
-    futures_util::future::join_all(pushes.into_iter().map(|(identity, body)| {
-        let env = &env;
-        async move {
-            push_to_seat(env, &identity, None, body).await;
-        }
-    }))
+    if !crate::internal_events::relay_configured(&env) {
+        futures_util::future::join_all(pushes.into_iter().map(|(identity, body)| {
+            let env = &env;
+            async move {
+                first_party_push_answer_raw(env, &identity, None, body).await;
+            }
+        }))
+        .await;
+        return;
+    }
+    // bsv-low #989: through the fleet's gate, a body of at most PUSH_GATE_BODY_MAX pushes a forward.
+    let pushes: Vec<GatePush> = pushes
+        .into_iter()
+        .map(|(recipient, body)| GatePush {
+            recipient,
+            message_id: None,
+            body,
+        })
+        .collect();
+    let env = &env;
+    futures_util::future::join_all(
+        pushes
+            .chunks(PUSH_GATE_BODY_MAX)
+            .map(|chunk| deliver_env(env, chunk.to_vec())),
+    )
     .await;
 }
 

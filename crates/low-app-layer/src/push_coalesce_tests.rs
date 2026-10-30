@@ -375,12 +375,13 @@ async fn fix935_e_many_seats_share_the_senders_bucket() {
 fn fix935_f_every_push_to_a_seat_calls_the_helper() {
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     let judge = squash(include_str!("owed_judge.rs"));
-    // FIX-935-FOLD: the judge QUEUES its push; the queue is flushed through `push_to_seat` (`flush_queued`).
+    // FIX-935-FOLD: the judge QUEUES its push; the queue is flushed through the gate's `deliver` (`flush_queued`,
+    // bsv-low #989: it was `push_to_seat` a push).
     assert!(judge.contains(&squash(
         "crate::push_coalesce::queue_seat_push(identity, body);"
     )));
     assert!(squash(include_str!("push_coalesce.rs"))
-        .contains(&squash("push_to_seat(env, &identity, None, body).await;")));
+        .contains(&squash(".map(|chunk| deliver_env(env, chunk.to_vec())),")));
     assert!(!judge.contains("first_party_push"));
     let hook = squash(include_str!("pot_hook.rs"));
     assert!(hook.contains(&squash(
@@ -462,4 +463,277 @@ fn fix935_fold_no_coalescing_wait_in_an_answer_path() {
     assert!(flush.starts_with(&squash(
         "fn flush_counters_if_due(&self) { self.flush_pushes();"
     )));
+}
+
+/// bsv-low #989's model gate: forwards into ONE coalescer (the gate's isolate), as `WorkerGate` forwards to the
+/// `BOARD_VIEW` object named `PUSH_GATE_ACTOR`; `unbound` is the base's rule (every isolate its own coalescer).
+struct ModelGate {
+    gate: Option<(Rc<RefCell<Coalescer>>, Rc<Fake>)>,
+    forwards: RefCell<usize>,
+}
+
+/// The gate's own isolate: its pushes go to its cell.
+struct Here;
+impl SeatGate for Here {
+    fn hosted_here(&self) -> bool {
+        true
+    }
+    async fn forward(&self, _: Vec<GatePush>) -> Forwarded {
+        unreachable!("the gate never forwards")
+    }
+}
+
+impl SeatGate for ModelGate {
+    fn hosted_here(&self) -> bool {
+        false
+    }
+    async fn forward(&self, pushes: Vec<GatePush>) -> Forwarded {
+        let Some((cell, fake)) = &self.gate else {
+            return Forwarded::Unbound;
+        };
+        *self.forwards.borrow_mut() += 1;
+        Forwarded::Answers(deliver(cell, &**fake, &Here, &Knobs::default(), pushes).await)
+    }
+}
+
+fn seat_of(i: usize) -> String {
+    format!("02{:064x}", i + 1)
+}
+
+/// L54's burst, shaped from the beta lines of 06:54:59.9Z to 06:55:59Z: the owed actor of each seat (its OWN isolate,
+/// one Durable Object a seat) pushes one `owed-changed` an event, p22's 90 in one second; beside them the Worker's
+/// fetch isolates push the same seats' `owed-changed` (the D1 judge in Phase B) and `pot`. Returns the relay fake and
+/// every coalescer's tally summed.
+async fn l54_burst(through_gate: bool) -> (Rc<Fake>, Tally, Vec<Answer>, usize) {
+    const SEATS: usize = 30;
+    const P22_EVENTS: u64 = 90;
+    const SEAT_EVENTS: u64 = 10;
+    const FETCH_ISOLATES: usize = 4;
+    let fake = Fake::new();
+    let gate_cell = Rc::new(RefCell::new(Coalescer::default()));
+    let gate = Rc::new(ModelGate {
+        gate: through_gate.then(|| (gate_cell.clone(), fake.clone())),
+        forwards: RefCell::new(0),
+    });
+    let actors: Vec<_> = (0..SEATS)
+        .map(|_| Rc::new(RefCell::new(Coalescer::default())))
+        .collect();
+    let fetches: Vec<_> = (0..FETCH_ISOLATES)
+        .map(|_| Rc::new(RefCell::new(Coalescer::default())))
+        .collect();
+    let t0 = Instant::now();
+    let mut hs = Vec::new();
+    for (s, actor) in actors.iter().enumerate() {
+        let events = if s == 0 { P22_EVENTS } else { SEAT_EVENTS };
+        for e in 0..events {
+            let at = t0 + Duration::from_millis(e * 1_000 / events);
+            let (fake, gate, cell, seat) = (fake.clone(), gate.clone(), actor.clone(), seat_of(s));
+            hs.push(tokio::task::spawn_local(async move {
+                tokio::time::sleep_until(at).await;
+                let body = crate::owed::owed_changed_event_body(&seat, "actor", 1, e as i64);
+                let push = GatePush {
+                    recipient: seat,
+                    message_id: None,
+                    body,
+                };
+                deliver(&cell, &*fake, &*gate, &Knobs::default(), vec![push]).await
+            }));
+        }
+        for (f, fetch) in fetches.iter().enumerate() {
+            let at = t0 + Duration::from_millis(100 + f as u64 * 200);
+            let (fake, gate, cell, seat) = (fake.clone(), gate.clone(), fetch.clone(), seat_of(s));
+            hs.push(tokio::task::spawn_local(async move {
+                tokio::time::sleep_until(at).await;
+                let pushes = vec![
+                    GatePush {
+                        recipient: seat.clone(),
+                        message_id: None,
+                        body: crate::owed::owed_changed_event_body(
+                            &seat,
+                            "judge",
+                            1,
+                            1_000 + f as i64,
+                        ),
+                    },
+                    GatePush {
+                        recipient: seat.clone(),
+                        message_id: Some(format!("pot-{s}-{f}")),
+                        body: crate::internal_events::pot_event_body(
+                            &hex::encode([s as u8 + 1; 32]),
+                            0,
+                            json!({}),
+                            f as u64,
+                        ),
+                    },
+                ];
+                deliver(&cell, &*fake, &*gate, &Knobs::default(), pushes).await
+            }));
+        }
+    }
+    let mut answers = Vec::new();
+    for h in hs {
+        answers.extend(h.await.unwrap());
+    }
+    let mut t = Tally::default();
+    for c in actors
+        .iter()
+        .chain(fetches.iter())
+        .chain(std::iter::once(&gate_cell))
+    {
+        let x = c.borrow().tally;
+        t.coalesced += x.coalesced;
+        t.held += x.held;
+        t.refused_budget += x.refused_budget;
+        t.given_up += x.given_up;
+        t.windows += x.windows;
+    }
+    let forwards = *gate.forwards.borrow();
+    (fake, t, answers, forwards)
+}
+
+/// bsv-low #989 (L54's S2): the actor's per-event `owed-changed` and the fetch isolates' pushes, each producer in its
+/// own isolate, reach the relay ONLY through the fleet's one coalescer: p22's 90 events in one second are at most two
+/// sends (the leading edge and the window's newest state), no 60 s carries more than the relay's 100, nothing is
+/// refused or given up, and every seat's newest `owed-changed` is delivered. RED with the gate unbound (the base:
+/// each isolate's own coalescer): refused at the relay and given up.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fix989_a_the_actors_burst_goes_through_one_coalescer_under_the_relays_budget() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (fake, t, answers, forwards) = l54_burst(true).await;
+            let calls = fake.calls.borrow().clone();
+            let p22 = seat_of(0);
+            let p22_owed = calls
+                .iter()
+                .filter(|c| c.1 == p22 && c.2["kind"] == "owed-changed")
+                .count();
+            let max_minute = fake.window.borrow().values().copied().max().unwrap_or(0);
+            println!(
+                "fix989_a: {} relay calls, {} refused, the busiest minute {max_minute}, p22 owed-changed {p22_owed}, {forwards} forwards, {t:?}",
+                calls.len(),
+                fake.refused()
+            );
+            assert_eq!(fake.refused(), 0, "no ERR_SEND_BUDGET at the relay");
+            assert_eq!(t.given_up, 0, "nothing given up: {t:?}");
+            assert!(max_minute <= RELAY_SENDS_PER_MIN, "{max_minute} sends in one relay minute");
+            assert!(forwards > 0, "every producer forwards to the gate");
+            assert!(p22_owed <= 2, "p22's 90 events are at most two sends: {p22_owed}");
+            assert!(answers.iter().all(|a| *a == Answer::Sent), "every push answered delivered");
+            for s in 0..30 {
+                let seat = seat_of(s);
+                let last = calls
+                    .iter()
+                    .rfind(|c| c.1 == seat && c.2["kind"] == "owed-changed" && c.3 == Answer::Sent)
+                    .unwrap_or_else(|| panic!("seat {s} got no owed-changed"));
+                let all: Vec<_> = calls
+                    .iter()
+                    .filter(|c| c.1 == seat && c.2["kind"] == "owed-changed")
+                    .collect();
+                assert_eq!(last.0, all.last().unwrap().0, "seat {s}: the newest state goes last");
+            }
+        })
+        .await;
+}
+
+/// The control of `fix989_a`: the same burst with the gate unbound (the base's rule, `push_to_seat` submitting to
+/// its own isolate's coalescer) is refused at the relay and given up, the shape of L54's `541 sends`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fix989_b_the_same_burst_per_isolate_is_refused_and_given_up() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (fake, t, _, forwards) = l54_burst(false).await;
+            let max_minute = fake.window.borrow().values().copied().max().unwrap_or(0);
+            println!(
+                "fix989_b (per isolate): {} refused, the busiest minute {max_minute}, {t:?}",
+                fake.refused()
+            );
+            assert_eq!(forwards, 0);
+            assert!(fake.refused() > 0 && t.given_up > 0, "{t:?}");
+            assert!(max_minute > RELAY_SENDS_PER_MIN);
+        })
+        .await;
+}
+
+/// A gate that faults sends nothing around itself: every push `Failed` (the pot hook parks and re-drives its event),
+/// no relay call; the gate's answer body reads back.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fix989_c_a_gate_fault_never_sends_around_the_gate() {
+    struct Faulty;
+    impl SeatGate for Faulty {
+        fn hosted_here(&self) -> bool {
+            false
+        }
+        async fn forward(&self, _: Vec<GatePush>) -> Forwarded {
+            Forwarded::Fault("HTTP 500".into())
+        }
+    }
+    let fake = Fake::new();
+    let cell = RefCell::new(Coalescer::default());
+    let push = GatePush {
+        recipient: SEAT.into(),
+        message_id: None,
+        body: owed(1),
+    };
+    let a = deliver(
+        &cell,
+        &*fake,
+        &Faulty,
+        &Knobs::default(),
+        vec![push.clone(), push],
+    )
+    .await;
+    assert_eq!(a, vec![Answer::Failed, Answer::Failed]);
+    assert!(
+        fake.calls.borrow().is_empty(),
+        "no relay call around the gate"
+    );
+    assert!(fake.logs.borrow()[0].contains("gate fault"));
+    let words: Vec<_> = [
+        Answer::Sent,
+        Answer::BudgetRefused,
+        Answer::Failed,
+        Answer::NotConfigured,
+    ]
+    .iter()
+    .map(|a| a.word())
+    .collect();
+    assert_eq!(
+        answers_of(&json!({ "answers": words }).to_string()),
+        Some(vec![
+            Answer::Sent,
+            Answer::BudgetRefused,
+            Answer::Failed,
+            Answer::NotConfigured
+        ])
+    );
+    assert_eq!(answers_of(r#"{"answers":["nope"]}"#), None);
+}
+
+/// The wiring: `push_to_seat` and the queue's flush both go through `deliver` over the `BOARD_VIEW` gate; the gate's
+/// route submits to its isolate's cell; the actor's push is queued and flushed (never sent around the helper); no
+/// push site calls the relay's raw `/push` but the unconfigured short-cut.
+#[test]
+fn fix989_d_every_push_reaches_the_relay_through_the_gate() {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let me = squash(include_str!("push_coalesce.rs"));
+    assert!(me.contains(&squash(
+        "deliver(cell, &port, &WorkerGate { env }, &knobs, pushes).await"
+    )));
+    assert!(me.contains(&squash("deliver_env(env, vec![push])")));
+    assert!(me.contains(&squash(".map(|chunk| deliver_env(env, chunk.to_vec())),")));
+    assert!(me.contains(&squash(".id_from_name(PUSH_GATE_ACTOR)")));
+    assert!(me.contains(&squash("GATE_HOSTED.with(|h| h.set(true));")));
+    let view = squash(include_str!("board_view.rs"));
+    assert!(view.contains(&squash(
+        "if req.path() == crate::push_coalesce::PUSH_GATE_PATH { let text = req.text().await?; return crate::push_coalesce::serve_gate(&self.env, &text).await; }"
+    )));
+    let actor = squash(include_str!("owed_actor/object.rs"));
+    assert!(actor.contains(&squash(
+        "crate::push_coalesce::queue_seat_push(&identity, push);"
+    )));
+    assert!(!actor.contains("first_party_push"));
+    // The relay's raw `/push` is reached by the coalescer's port and the unconfigured short-cut only.
+    assert_eq!(me.matches("first_party_push_answer(").count(), 2);
 }
