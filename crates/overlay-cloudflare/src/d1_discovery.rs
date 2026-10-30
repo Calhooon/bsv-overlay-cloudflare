@@ -1570,6 +1570,14 @@ impl PotRow {
     }
 }
 
+/// bsv-low #986 (the FIX-986 lens's NIT-1): one `pot_records` row read by `POT_RECORD_COLUMNS`, as D1 answers it
+/// (a JSON object, numbers as numbers), mapped to the `PotRecord` every backfill candidate scan hands its pass: the
+/// D1 backend's own `PotRow::into_record`, exposed so a native pin feeds the classifier the row the scan read back,
+/// never a record it rebuilt.
+pub fn pot_record_of_d1_row(row: serde_json::Value) -> Result<PotRecord, serde_json::Error> {
+    serde_json::from_value::<PotRow>(row).map(PotRow::into_record)
+}
+
 /// The full pot_records column list (#284) for reads that need the decoded
 /// fields (`get_spent_status`, the backfill candidate scan).
 const POT_RECORD_COLUMNS: &str = "txid, outputIndex, spent, spendingTxid, spentConfirmed, \
@@ -2137,7 +2145,19 @@ pub fn settle_signers_candidates_sql(limit: u64) -> String {
 /// candidate): a row whose spender bytes are absent is NOT a candidate and
 /// costs this scan nothing until they arrive; an unconfirmed pointer is not
 /// one either (the discovery pass classifies it inline while the bytes are
-/// in hand, its confirmation latches it). RANDOM-sampled, at most `limit`
+/// in hand, its confirmation latches it). The gate is the FLAG, narrower than
+/// D1's serving bar (`logic::is_confirmed_landing_with_proof`: the flag, OR
+/// the spender's verified proof, OR the spender seen AND final; the FIX-986
+/// lens's LOW-1), by choice: a row D1 serves through one of the other two
+/// arms is spent and unconfirmed, so it is the confirmation pass's own
+/// candidate (`pot_spent_unconfirmed_sql`), which latches its group under
+/// the pointer CAS on the tick it confirms the spend; until then the actor
+/// withholds the press (the safe direction), never serves one. Read here,
+/// the two arms are an OR over the whole partial index, and on the fleet
+/// fixture that index holds 8,097 unconfirmed rows none of which is a
+/// landing by any arm: every tick would walk them all and probe each
+/// spender three times for nothing (measured; pinned by
+/// `fix986f_l1_the_unflagged_landings_are_the_chases_candidates`). RANDOM-sampled, at most `limit`
 /// (the #284 anti-starvation idiom). The first four terms are the partial
 /// index `idx_pot_spent_unclassified`'s own WHERE, repeated verbatim so the
 /// planner takes it (pinned under real SQLite, with and without ANALYZE);
@@ -15320,6 +15340,38 @@ mod tests {
                 None,
                 true,
             ); // no decoded params
+               // the lens's LOW-1, stated: an unflagged landing by D1's other two arms (the spender's verified proof;
+               // the spender seen and final) is NOT a second-set candidate (it is the confirmation pass's, pinned in
+               // `fix986f_l1_the_unflagged_landings_are_the_chases_candidates`)
+            for (b, proof, seen, fin) in [(0xa9u8, true, false, false), (0xaa, false, true, true)] {
+                seed(
+                    &conn,
+                    &mk(b),
+                    &mk(b + 0x10),
+                    "covenant",
+                    Some(&pk),
+                    false,
+                    None,
+                    true,
+                );
+                conn.execute(
+                    "UPDATE pot_beefs SET proof_verified = ?2 WHERE txid = ?1",
+                    rusqlite::params![mk(b + 0x10), i64::from(proof)],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE pot_records SET spenderFinal = ?2 WHERE txid = ?1",
+                    rusqlite::params![mk(b), i64::from(fin)],
+                )
+                .unwrap();
+                if seen {
+                    conn.execute(
+                        "INSERT INTO network_seen (txid, seenAt) VALUES (?1, 1)",
+                        [mk(b + 0x10)],
+                    )
+                    .unwrap();
+                }
+            }
             let sql = spent_unclassified_candidates_sql(16);
             let mut got: Vec<(String, String)> = conn
                 .prepare(&sql)
@@ -15386,6 +15438,86 @@ mod tests {
             assert!(sql.contains(&format!("WHERE {SPENT_UNCLASSIFIED_INDEX_PREDICATE} ")));
             assert_eq!(crate::d1::OVERLAY_MIGRATIONS.last(), Some(index));
             assert_eq!(crate::d1::OVERLAY_MIGRATIONS.len(), 475);
+        }
+
+        /// THE FIX-986 LENS'S LOW-1, STATED AND PINNED. D1 serves a row's verdict under the app layer's money-view
+        /// bar (`logic::is_confirmed_landing_with_proof`: the flag, OR the spender's verified proof, OR the spender
+        /// seen AND final; `d1_hot_bounds::fix986f_l1` holds the SQL arms below equal to that function). Over every
+        /// combination of the four facts (16 rows, the spender's bytes held, no verdict): the second set takes exactly
+        /// the FLAGGED rows, and every landing it leaves is a candidate of the confirmation pass
+        /// (`pot_spent_unconfirmed_sql`, whose chase latches the group under the pointer CAS on the tick it confirms,
+        /// pinned by `proof_fetcher::tests::fix986::fix986_b`), so no row D1 serves is reached by neither pass. RED
+        /// against a second set aligned to the bar without the chase's coverage dropped: the set would take 13.
+        #[test]
+        fn fix986f_l1_the_unflagged_landings_are_the_chases_candidates() {
+            let conn = migrated();
+            let pk = "02".to_string() + &"aa".repeat(32);
+            let (mut flagged, mut unflagged_landings) = (Vec::new(), Vec::new());
+            for bits in 0u8..16 {
+                let (flag, proof, seen, fin) =
+                    (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+                let (pot, spender) = (format!("e8{bits:062x}"), format!("e9{bits:062x}"));
+                seed(
+                    &conn,
+                    &pot,
+                    &spender,
+                    "covenant",
+                    Some(&pk),
+                    flag,
+                    None,
+                    true,
+                );
+                conn.execute(
+                    "UPDATE pot_beefs SET proof_verified = ?2 WHERE txid = ?1",
+                    rusqlite::params![spender, i64::from(proof)],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE pot_records SET spenderFinal = ?2 WHERE txid = ?1",
+                    rusqlite::params![pot, i64::from(fin)],
+                )
+                .unwrap();
+                if seen {
+                    conn.execute(
+                        "INSERT INTO network_seen (txid, seenAt) VALUES (?1, 1)",
+                        [&spender],
+                    )
+                    .unwrap();
+                }
+                if flag {
+                    flagged.push(pot);
+                } else if proof || (seen && fin) {
+                    unflagged_landings.push(pot);
+                }
+            }
+            let read = |sql: &str| -> Vec<String> {
+                let mut v: Vec<String> = conn
+                    .prepare(sql)
+                    .unwrap()
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                v.sort();
+                v
+            };
+            assert_eq!(
+                read(&spent_unclassified_candidates_sql(100)),
+                flagged,
+                "the second set is the flag"
+            );
+            assert_eq!(
+                unflagged_landings.len(),
+                5,
+                "the proof (4) and the seen-and-final pair without it (1)"
+            );
+            let chase = read(&pot_spent_unconfirmed_sql(100, 0));
+            for pot in &unflagged_landings {
+                assert!(
+                    chase.contains(pot),
+                    "{pot}: a landing the second set leaves is the chase's candidate"
+                );
+            }
         }
     }
 }
