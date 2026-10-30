@@ -380,23 +380,32 @@ impl LookupService for PotLookupService {
         // `classify_pot_spend`: the covenant asserts `ctx.utxo.value ==
         // stakeA + stakeB` in-script, so a funding value that disagrees is
         // not the pot the params describe → no verdict.
-        let (admitted, record_read_faulted) =
-            match self.storage.get_spent_status(txid, output_index).await {
-                Ok(r) => (r, false),
-                Err(e) => {
-                    debug!("POT: record read for verdict classification failed — no verdict: {e}");
-                    (None, true)
-                }
-            };
+        // bsv-low #936 (the FIX-936 lens's LOW-1): a record read that FAULTS
+        // is "not now", never "no record": the hook answers the fault, so
+        // the engine keeps the coin unapplied (#657) and the replay tells
+        // the hook again. Proceeding (as before the fold) let a genuinely
+        // half-written pot's only spend land with the coin deleted and no
+        // record, a loss no replay could reach.
+        let admitted = self
+            .storage
+            .get_spent_status(txid, output_index)
+            .await
+            .map_err(|e| {
+                LookupServiceError::StorageError(format!(
+                    "pot record read for {txid}:{output_index} faulted (not now, bsv-low #936): {e}"
+                ))
+            })?;
         // bsv-low #936: a held output whose record the read ANSWERED absent
-        // is recorded from the spender's bytes BEFORE its pointer is written
-        // (the module docs). A read that FAULTED records nothing: the pot may
-        // well be recorded, and an admit-path byte write would reset its
-        // verified-proof latch; the pointer is then the no-op it was, and
-        // the hook is told again by the replay.
+        // is recorded from the spender's bytes (or the engine's stored copy)
+        // BEFORE its pointer is written (the module docs). A record without
+        // its bytes (a heal or an admission cut at the byte write) has them
+        // written now (the lens's LOW-3).
         let admitted = match admitted {
-            Some(record) => Some(record),
-            None if record_read_faulted => None,
+            Some(record) => {
+                self.complete_held_output_bytes(txid, output_index, topic, &spending_tx)
+                    .await?;
+                Some(record)
+            }
             None => {
                 self.record_held_output_from_spender(txid, output_index, topic, &spending_tx)
                     .await?
@@ -727,22 +736,20 @@ impl LookupService for PotLookupService {
 }
 
 impl PotLookupService {
-    /// bsv-low #936: the spend of `txid:output_index` under `topic` names
-    /// an outpoint this index never recorded while the engine HELD it (the
-    /// module docs). Record it from the spender's own bytes through the
-    /// admission hook itself (one writer, its shape gate included), and
-    /// answer the record; `Ok(None)` when the spender's bytes do not carry
-    /// the source transaction, or the hook wrote nothing (not the topic's
-    /// shape). A storage fault is the hook's fault, as the admission's own
-    /// is.
-    async fn record_held_output_from_spender(
+    /// bsv-low #936: the pot's own atomic BEEF, named `txid`, for the spend
+    /// of `txid:output_index`: from the source the spender's bytes CARRY,
+    /// else (the lens's LOW-2: a proven spender, txid-only ancestry) from
+    /// the ENGINE's stored copy (`PotStorage::held_transaction_beef`).
+    /// Either is hash-bound: its subject's id must be `txid`. `Ok(None)`
+    /// when neither yields it; a fault of the stored copy's read is the
+    /// hook's fault ("not now", as the record read's is).
+    async fn held_output_bytes(
         &self,
         txid: &str,
         output_index: u32,
-        topic: &str,
         spending_tx: &Transaction,
-    ) -> Result<Option<PotRecord>, LookupServiceError> {
-        let source = spending_tx
+    ) -> Result<Option<Vec<u8>>, LookupServiceError> {
+        let carried = spending_tx
             .inputs
             .iter()
             .find(|i| {
@@ -752,33 +759,121 @@ impl PotLookupService {
                     && i.source_output_index == output_index
             })
             .and_then(|i| i.source_transaction.as_deref());
-        let Some(source) = source else {
-            debug!(
-                "POT: the spend of {txid}:{output_index} under {topic} names an outpoint this \
-                 index never recorded and the spender's bytes do not carry its transaction: \
-                 nothing recorded (bsv-low #936)"
-            );
-            return Ok(None);
+        let (from, beef) = match carried {
+            Some(source) => {
+                match source.to_beef(true) {
+                    Ok(bytes) => ("the spender's carried source", bytes),
+                    Err(e) => {
+                        debug!("POT: the carried source of {txid}:{output_index} did not serialize: {e}");
+                        return Ok(None);
+                    }
+                }
+            }
+            None => match self
+                .storage
+                .held_transaction_beef(txid)
+                .await
+                .map_err(|e| {
+                    LookupServiceError::StorageError(format!(
+                        "the engine's copy of {txid} faulted (not now, bsv-low #936): {e}"
+                    ))
+                })? {
+                Some(bytes) => ("the engine's stored copy", bytes),
+                None => {
+                    debug!(
+                        "POT: the spend of {txid}:{output_index} names an outpoint this index \
+                         holds no bytes for, the spender does not carry its transaction and \
+                         the engine holds no copy: nothing recorded (bsv-low #936)"
+                    );
+                    return Ok(None);
+                }
+            },
         };
-        let source_txid = source.id();
-        if !source_txid.eq_ignore_ascii_case(txid) {
-            debug!("POT: the carried source of {txid}:{output_index} is {source_txid}: nothing recorded");
-            return Ok(None);
-        }
-        // The pot's own BEEF out of the spender's: the carried transaction
-        // and whatever ancestry the spender's body carries for it, named.
-        let atomic_beef = match source
-            .to_beef(true)
-            .and_then(|bytes| beef_limits::parse_beef(&bytes, &beef_limits::DISCOVERY_BEEF_LIMITS))
-            .and_then(|mut beef| beef.to_binary_atomic(&source_txid))
+        let atomic = match beef_limits::parse_beef(&beef, &beef_limits::DISCOVERY_BEEF_LIMITS)
+            .and_then(|mut beef| beef.to_binary_atomic(txid))
         {
             Ok(bytes) => bytes,
             Err(e) => {
-                debug!(
-                    "POT: the carried source of {txid}:{output_index} did not re-serialize: {e}"
-                );
+                debug!("POT: {from} of {txid}:{output_index} did not re-serialize: {e}");
                 return Ok(None);
             }
+        };
+        match beef_limits::transaction_from_beef(&atomic, None, &beef_limits::DISCOVERY_BEEF_LIMITS)
+        {
+            Ok(tx) if tx.id().eq_ignore_ascii_case(txid) => Ok(Some(atomic)),
+            Ok(tx) => {
+                debug!(
+                    "POT: {from} of {txid}:{output_index} is {}: nothing recorded",
+                    tx.id()
+                );
+                Ok(None)
+            }
+            Err(e) => {
+                debug!("POT: {from} of {txid}:{output_index} did not parse: {e}");
+                Ok(None)
+            }
+        }
+    }
+
+    /// bsv-low #936 (the FIX-936 lens's LOW-3): a pot RECORDED without its
+    /// bytes (a heal or an admission whose byte write faulted after its
+    /// record landed: a replay then finds the record and the heal does not
+    /// run) has its bytes written at the spend. One probe read; a write
+    /// only when the store holds no bytes for `txid` (so no stored row,
+    /// verified or not, is ever touched). A fault is the hook's fault.
+    async fn complete_held_output_bytes(
+        &self,
+        txid: &str,
+        output_index: u32,
+        topic: &str,
+        spending_tx: &Transaction,
+    ) -> Result<(), LookupServiceError> {
+        let held = self.storage.has_beef(txid).await.map_err(|e| {
+            LookupServiceError::StorageError(format!(
+                "pot bytes probe for {txid} faulted (not now, bsv-low #936): {e}"
+            ))
+        })?;
+        if held {
+            return Ok(());
+        }
+        let Some(atomic) = self
+            .held_output_bytes(txid, output_index, spending_tx)
+            .await?
+        else {
+            return Ok(());
+        };
+        self.storage
+            .store_beef(txid, &atomic)
+            .await
+            .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
+        warn!(
+            "POT: {txid}:{output_index} under {topic} was recorded without its bytes: written at \
+             its spend by {} (bsv-low #936, LOW-3)",
+            spending_tx.id()
+        );
+        Ok(())
+    }
+
+    /// bsv-low #936: the spend of `txid:output_index` under `topic` names
+    /// an outpoint this index never recorded while the engine HELD it (the
+    /// module docs). Record it from the pot's own bytes (the spender's
+    /// carried source, else the engine's stored copy) through the admission
+    /// hook itself (one writer, its shape gate included), and answer the
+    /// record; `Ok(None)` when neither yields the bytes, or the hook wrote
+    /// nothing (not the topic's shape). A storage fault is the hook's
+    /// fault, as the admission's own is.
+    async fn record_held_output_from_spender(
+        &self,
+        txid: &str,
+        output_index: u32,
+        topic: &str,
+        spending_tx: &Transaction,
+    ) -> Result<Option<PotRecord>, LookupServiceError> {
+        let Some(atomic_beef) = self
+            .held_output_bytes(txid, output_index, spending_tx)
+            .await?
+        else {
+            return Ok(None);
         };
         self.output_admitted_by_topic(&OutputAdmittedByTopic::WholeTx {
             atomic_beef,
@@ -3022,6 +3117,190 @@ mod tests {
             assert_eq!(hop_rec.lock_kind.as_deref(), Some("p2pkh"));
             assert!(hop_rec.spent);
             assert_eq!(hop_rec.spending_txid.as_deref(), Some(join.id().as_str()));
+        }
+
+        /// The FIX-936 lens's LOW-1, through the real engine: the JOIN's
+        /// write cut at the hook, then its refund's spend hook meets a
+        /// FAULTED record read. The read is "not now": the refund does not
+        /// land, the engine keeps the JOIN's coin (#657's notification
+        /// fault), and the replay records the pot and spends it. RED on
+        /// 5eb071da: the faulted read proceeded, the refund landed, the coin
+        /// was deleted with no record, and the replay was a dupe.
+        #[tokio::test]
+        async fn fix936f_l1_a_faulted_record_read_at_the_spend_is_not_now_and_the_replay_records_the_pot(
+        ) {
+            let f = fixture();
+            let p = real_params();
+            let join = real_funding_tx(0x41, &p);
+            let join_txid = join.id();
+            cut_at_the_hook(
+                f.engine
+                    .submit_with_report(&tagged(&join), SubmitMode::HistoricalTxNoSpv),
+                &f.reached,
+            );
+            assert!(coin_held(&f.store, &join_txid).await);
+
+            let refund = refund_of(&join, &p);
+            let refund_txid = refund.id();
+            f.pots.fault_next_spent_status_reads(1);
+            let first = f
+                .engine
+                .submit_with_report(&tagged(&refund), SubmitMode::HistoricalTxNoSpv)
+                .await;
+            let landed = matches!(&first, Ok((_, r)) if r.is_durable());
+            assert!(
+                !landed,
+                "a faulted record read is not now, never a landed spend: {first:?}"
+            );
+            assert!(
+                coin_held(&f.store, &join_txid).await,
+                "the engine keeps the pot's coin for the replay"
+            );
+            assert!(!applied(&f.store, &refund_txid).await);
+
+            // The replay (the queue's): the read answers, the pot is recorded.
+            let (_, report) = f
+                .engine
+                .submit_with_report(&tagged(&refund), SubmitMode::HistoricalTxNoSpv)
+                .await
+                .unwrap();
+            assert!(report.is_durable(), "the replay landed: {report:?}");
+            let rec = f
+                .pots
+                .get_spent_status(&join_txid, 0)
+                .await
+                .unwrap()
+                .expect("the replay records the cut pot (bsv-low #936, LOW-1)");
+            assert!(rec.spent);
+            assert_eq!(rec.spending_txid.as_deref(), Some(refund_txid.as_str()));
+            assert!(f.pots.get_beef(&join_txid).await.unwrap().is_some());
+            assert!(!coin_held(&f.store, &join_txid).await);
+        }
+
+        /// The lens's LOW-2: a held pot whose spender does NOT carry its
+        /// source (a proven spender, txid-only ancestry) is recorded from
+        /// the ENGINE's stored copy of the pot's transaction, hash-bound to
+        /// the outpoint; a stored copy naming another transaction records
+        /// nothing; no copy at all records nothing (the hook as before).
+        /// RED on 5eb071da with the store's hook grafted: nothing recorded.
+        #[tokio::test]
+        async fn fix936f_l2_a_spender_without_the_pots_bytes_records_it_from_the_engines_copy() {
+            let (svc, pots) = make_service_with_storage();
+            let p = real_params();
+
+            // (1) The engine's copy is the pot's own BEEF.
+            let pot = real_funding_tx(0x42, &p);
+            let bare = spender_paying(&pot.id(), 0, &[(2400, p2pkh_lock(&p.pay_pkh_a))]);
+            assert!(bare.inputs[0].source_transaction.is_none());
+            pots.hold_transaction_beef(&pot.id(), &beef_of(&pot));
+            svc.output_spent(&spent(&pot.id(), 0, beef_of(&bare)))
+                .await
+                .unwrap();
+            let rec = pots
+                .get_spent_status(&pot.id(), 0)
+                .await
+                .unwrap()
+                .expect("recorded from the engine's stored copy (bsv-low #936, LOW-2)");
+            assert!(rec.spent);
+            assert_eq!(rec.spending_txid.as_deref(), Some(bare.id().as_str()));
+            assert_eq!(rec.decoded_covenant_params(), Some(p.clone()));
+            let stored = pots
+                .get_beef(&pot.id())
+                .await
+                .unwrap()
+                .expect("the pot's bytes under its own txid");
+            assert_eq!(
+                beef_limits::transaction_from_beef(
+                    &stored,
+                    None,
+                    &beef_limits::DISCOVERY_BEEF_LIMITS
+                )
+                .unwrap()
+                .id(),
+                pot.id()
+            );
+
+            // (2) A copy under the pot's txid that is another transaction:
+            // the hash binding refuses it, nothing recorded.
+            let other_pot = real_funding_tx(0x43, &p);
+            let decoy = real_funding_tx(0x44, &p);
+            let bare2 = spender_paying(&other_pot.id(), 0, &[(2400, p2pkh_lock(&p.pay_pkh_a))]);
+            pots.hold_transaction_beef(&other_pot.id(), &beef_of(&decoy));
+            svc.output_spent(&spent(&other_pot.id(), 0, beef_of(&bare2)))
+                .await
+                .unwrap();
+            assert!(pots
+                .get_spent_status(&other_pot.id(), 0)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(pots
+                .get_spent_status(&decoy.id(), 0)
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        /// The lens's LOW-3: a pot RECORDED without its bytes (a heal or an
+        /// admission whose byte write faulted after its record landed) gets
+        /// its bytes at the spend, from the spender's carried source. Both
+        /// shapes: (1) the heal itself cut at its byte write, then its
+        /// replay; (2) an admission cut at its byte write, then the spend.
+        /// A recorded pot WITH bytes keeps them (fix936_c (4)). RED on
+        /// 5eb071da: the record present, the heal skipped, no bytes.
+        #[tokio::test]
+        async fn fix936f_l3_a_pot_recorded_without_its_bytes_gets_them_at_the_spend() {
+            let (svc, pots) = make_service_with_storage();
+            let p = real_params();
+
+            // (1) The heal's own window: record lands, bytes fault.
+            let pot = real_funding_tx(0x45, &p);
+            let refund = refund_of(&pot, &p);
+            pots.fault_next_beef_writes(1);
+            assert!(
+                svc.output_spent(&spent(&pot.id(), 0, beef_of(&refund)))
+                    .await
+                    .is_err(),
+                "the heal's byte fault is the hook's fault"
+            );
+            assert!(pots.get_spent_status(&pot.id(), 0).await.unwrap().is_some());
+            assert!(pots.get_beef(&pot.id()).await.unwrap().is_none());
+            svc.output_spent(&spent(&pot.id(), 0, beef_of(&refund)))
+                .await
+                .unwrap();
+            let rec = pots.get_spent_status(&pot.id(), 0).await.unwrap().unwrap();
+            assert_eq!(rec.spending_txid.as_deref(), Some(refund.id().as_str()));
+            assert!(
+                pots.get_beef(&pot.id()).await.unwrap().is_some(),
+                "the replay completes the heal's bytes (bsv-low #936, LOW-3)"
+            );
+
+            // (2) An admission whose byte write faulted, then its spend.
+            let known = real_funding_tx(0x46, &p);
+            pots.fault_next_beef_writes(1);
+            assert!(svc
+                .output_admitted_by_topic(&admit(beef_of(&known), 0))
+                .await
+                .is_err());
+            assert!(pots.get_beef(&known.id()).await.unwrap().is_none());
+            svc.output_spent(&spent(&known.id(), 0, beef_of(&refund_of(&known, &p))))
+                .await
+                .unwrap();
+            let bytes = pots
+                .get_beef(&known.id())
+                .await
+                .unwrap()
+                .expect("the spend completes a recorded pot's missing bytes (LOW-3)");
+            assert_eq!(
+                beef_limits::transaction_from_beef(
+                    &bytes,
+                    None,
+                    &beef_limits::DISCOVERY_BEEF_LIMITS
+                )
+                .unwrap()
+                .id(),
+                known.id()
+            );
         }
     }
 }

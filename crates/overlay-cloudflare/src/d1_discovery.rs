@@ -3536,6 +3536,33 @@ impl PotStorage for D1PotStorage {
         Ok(row.and_then(|r| crate::d1::beef_of_hex_column(r.beef)))
     }
 
+    /// bsv-low #936 (the FIX-936 lens's LOW-3): the store's own probe
+    /// (length and latch, no bytes), the statement `store_beef` reads first.
+    async fn has_beef(&self, txid: &str) -> Result<bool, PotStorageError> {
+        let row: Option<BeefLenRow> = Query::new(POT_BEEF_PROBE_SQL)
+            .bind(txid)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(row.is_some())
+    }
+
+    /// bsv-low #936 (the FIX-936 lens's LOW-2): the engine's own stored
+    /// BEEF of a held coin's transaction, the shared database's
+    /// `transactions` row (the abort's statement), read only on the spend
+    /// of an outpoint this index holds no row or no bytes for.
+    async fn held_transaction_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError> {
+        let key = txid.to_ascii_lowercase();
+        let row: Option<BeefHexRow> = Query::new(crate::admission_abort::STORED_BEEF_SQL)
+            .bind(key.as_str())
+            .fetch_optional(&self.db)
+            .await
+            .map_err(pot_err)?;
+        Ok(row
+            .and_then(|r| crate::d1::beef_of_hex_column(r.beef))
+            .filter(|b| !b.is_empty()))
+    }
+
     async fn find_pot_beefs_for_proof_check(
         &self,
         limit: u64,
@@ -14918,5 +14945,127 @@ mod tests {
             demote_at("p10", "s10", None),
             "a height-less confirmation judged height-less: NULL-safe IS"
         );
+    }
+
+    /// bsv-low #936 (the FIX-936 lens's NOTE-2): the heal's statements in
+    /// the heal's order, the shipped strings under real SQLite with the
+    /// overlay's migrations. (1) The engine's stored copy is read back by
+    /// `held_transaction_beef`'s statement (LOW-2). (2) An ABSENT pot: the
+    /// probe answers no row, the record and the admit write land, the
+    /// pointer marks it spent, the row is unverified. (3) The pointer over
+    /// an absent record writes nothing (the fault branch's no-op the lens
+    /// read). (4) A VERIFIED row answers the probe present, so the LOW-3
+    /// completion writes nothing over it; the admission's record upsert on
+    /// a spent row leaves its spend state.
+    #[test]
+    fn fix936f_n2_the_heal_path_statements_under_real_sqlite() {
+        use rusqlite::OptionalExtension;
+        let conn = sqlite_with_migrations();
+        let probe = |txid: &str| -> Option<(i64, Option<i64>)> {
+            conn.query_row(POT_BEEF_PROBE_SQL, [txid], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+            })
+            .optional()
+            .unwrap()
+        };
+
+        // (1) The engine's copy, read as `held_transaction_beef` reads it.
+        let engine_beef = vec![0x01u8, 0x00, 0xbe, 0xef, 0x42];
+        conn.execute(
+            "INSERT INTO transactions (txid, beef) VALUES (?1, ?2)",
+            rusqlite::params!["aa936", engine_beef],
+        )
+        .unwrap();
+        let hex: Option<String> = conn
+            .query_row(crate::admission_abort::STORED_BEEF_SQL, ["aa936"], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            crate::d1::beef_of_hex_column(hex).as_deref(),
+            Some(engine_beef.as_slice())
+        );
+        let none: Option<Option<String>> = conn
+            .query_row(crate::admission_abort::STORED_BEEF_SQL, ["bb936"], |r| {
+                r.get(0)
+            })
+            .optional()
+            .unwrap();
+        assert!(none.is_none(), "no engine row: no copy");
+
+        // (2) The heal over an absent pot.
+        assert!(probe("p936").is_none(), "has_beef: absent");
+        exec_store(
+            &conn,
+            "p936",
+            0,
+            100,
+            Some("covenant"),
+            Some("02aa"),
+            Some(1250),
+            Some(2500),
+            1,
+        );
+        conn.execute(
+            POT_BEEF_ADMIT_WRITE_SQL,
+            rusqlite::params![
+                "p936",
+                vec![0xbeu8, 0xef, 0x01],
+                "p936",
+                100i64,
+                0i64,
+                "p936"
+            ],
+        )
+        .unwrap();
+        exec_mark_spent(&conn, "p936", 0, "r936", false, None, None);
+        let (spent, spender): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT spent, spendingTxid FROM pot_records WHERE txid = 'p936' AND outputIndex = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((spent, spender.as_deref()), (1, Some("r936")));
+        assert_eq!(probe("p936"), Some((3, Some(0))), "recorded, unverified");
+
+        // (3) The pointer over an absent record is a no-op, never a row.
+        exec_mark_spent(&conn, "q936", 0, "r936", false, None, None);
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pot_records WHERE txid = 'q936'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+
+        // (4) A verified row is present to the probe: nothing completes it.
+        conn.execute(
+            POT_BEEF_VERIFIED_WRITE_SQL,
+            rusqlite::params!["v936", vec![0xbeu8, 0xef, 0x02, 0x03], 200i64, 900_000i64],
+        )
+        .unwrap();
+        assert_eq!(probe("v936"), Some((4, Some(1))));
+        // The admission's record upsert over a SPENT row keeps its spend.
+        exec_store(
+            &conn,
+            "p936",
+            0,
+            300,
+            Some("covenant"),
+            Some("02aa"),
+            Some(1250),
+            Some(2500),
+            1,
+        );
+        let (spent, spender): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT spent, spendingTxid FROM pot_records WHERE txid = 'p936' AND outputIndex = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((spent, spender.as_deref()), (1, Some("r936")));
     }
 }
