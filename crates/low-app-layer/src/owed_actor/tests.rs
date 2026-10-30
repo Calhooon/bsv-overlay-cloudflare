@@ -1777,7 +1777,7 @@ async fn d2_actor_b_fold2_m3_a_stranger_read_mints_no_actor() {
         .find(&squash("if !known_to_d1(&snapshot) {"))
         .expect("the D1 gate");
     let call = read
-        .find(&squash("call_rows(env, identity, READ_WALL_MS)"))
+        .find(&squash("call_rows(env, identity, READ_WALL_MS, &marked)"))
         .expect("the actor's call");
     assert!(gate < call, "D1 is asked before the actor");
     let fetch = &object[object.find("asyncfnfetch(").unwrap()..];
@@ -10217,4 +10217,488 @@ async fn fix964_c_the_issues_line_with_the_verdicts_mark_queued_is_held() {
         .split_whitespace()
         .collect::<String>();
     assert!(lever.contains("view[\"heldByLag\"]=json!(held_by_lag(&view,&pending));"));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// FIX-968 (bsv-low #968, Wave E row E3): THE D1-MARK READ GATE named and decided (`owed_read::Snapshot::
+// withholding_mark`). L53 S1: in Phase B the actor-served read withheld a press for as long as the serial consumer
+// lagged (36 passes of "re-judging: a downgrade of this game is recorded and not yet judged" over a row the
+// writer's direct call had already re-judged in the actor). The rule now: a press is withheld only by a DOWNGRADE
+// mark the served judge has not applied; a plain mark never withholds; a downgrade mark at or below the actor's
+// covered generation (its last apply read the record after the mark) withholds nothing. Each pin uses API this lane
+// adds (`Snapshot::covered`, `withholding_mark`, `COVERED_BY_GAME_SQL`, `covered_of`) and does not compile on
+// 149869bf; `fix968_b`'s covered leg is the behaviour RED there (the press withheld with the mark pending).
+// ---------------------------------------------------------------------------------------------------------------
+
+/// The actor-served read as `object::read_snapshot` builds it, natively: D1's state and pending marks
+/// (`owed_read::read_with(.., false)`), the actor's rows, and the actor's covered generations of the marked games
+/// through the shipped `COVERED_BY_GAME_SQL` and `covered_of`.
+fn fix968_served_by_actor(w: &WithActor) -> Value {
+    let mut snapshot =
+        futures_executor_block(crate::owed_read::read_with(&w.d1, "owner", false)).unwrap();
+    snapshot.joined = fix968_rows(&w.actor, ROWS_SQL, vec![Bind::Text("owner".into())]);
+    let marked: Vec<String> = snapshot
+        .downgrades
+        .keys()
+        .map(|g| g.to_ascii_lowercase())
+        .take(COVERED_ASK_MAX)
+        .collect();
+    let covered = if marked.is_empty() {
+        Vec::new()
+    } else {
+        fix968_rows(
+            &w.actor,
+            COVERED_BY_GAME_SQL,
+            vec![Bind::Text(json!(marked).to_string())],
+        )
+    };
+    snapshot.covered = covered_of(&json!({ "covered": covered }));
+    snapshot.body("owner", Some(TIP), &BTreeMap::new()).unwrap()
+}
+
+/// The D1-served read (`OWED_ACTOR_READ` off): D1's rows, the same gate over an empty `covered`.
+fn fix968_served_by_d1(w: &WithActor) -> Value {
+    let snapshot = futures_executor_block(crate::owed_read::read(&w.d1, "owner")).unwrap();
+    snapshot.body("owner", Some(TIP), &BTreeMap::new()).unwrap()
+}
+
+fn fix968_rows(db: &SqliteSql, sql: &str, binds: Vec<Bind>) -> Vec<Value> {
+    futures_executor_block(db.run_batch(vec![Stmt::new(sql, binds)]))
+        .unwrap()
+        .remove(0)
+        .rows
+}
+
+fn fix968_facts<'a>(body: &'a Value, outpoint: &str) -> &'a Value {
+    fix968_facts_opt(body, outpoint).unwrap_or_else(|| panic!("no row {outpoint} in {body}"))
+}
+
+/// A row the judgement may have taken out of the list (a hop a stranger spent).
+fn fix968_facts_opt<'a>(body: &'a Value, outpoint: &str) -> Option<&'a Value> {
+    body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["outpoint"] == outpoint)
+        .map(|r| &r["facts"])
+}
+
+fn fix968_mark(w: &WithActor, game: &str, source: &str, key: &str, downgrade: i64) -> i64 {
+    w.d1.conn
+        .execute(
+            "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs,downgrade) VALUES ('owner',?1,?2,?3,?4,?5)",
+            rusqlite::params![game, source, key, w.d1.now_ms() as i64, downgrade],
+        )
+        .unwrap();
+    w.d1.conn.last_insert_rowid()
+}
+
+fn fix968_pending(w: &WithActor) -> i64 {
+    w.d1.conn
+        .query_row(
+            "SELECT COUNT(*) FROM owed_dirty WHERE identity='owner'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// The writer's DIRECT call (D2-ACTOR-D): the actor applies the game from the record as it stands and records its
+/// coverage; in Phase B it acknowledges nothing (the consumer's D1 judge does), in Phase C a walled caller does not
+/// either (FIX-956 item 3 acknowledges only after an answer it received).
+async fn fix968_direct(w: &WithActor, games: &[String], seq: i64) {
+    let (report, _) = apply(
+        &w.d1,
+        &w.actor,
+        &Fakes,
+        "owner",
+        games,
+        Some(("pot", seq)),
+        Some(TIP),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        report.applied_games.len(),
+        games.len(),
+        "the direct call applied the games"
+    );
+}
+
+const FIX968_PRESS: &str = "b300000000000000000000000000000000000000000000000000000000000000:0";
+
+async fn fix968_phase(d1_judges: bool) -> WithActor {
+    WithActor {
+        d1: d1_judge(&stranded()).await,
+        actor: mirror(),
+        d1_judges,
+        event: None,
+        actor_reads: true,
+        actor_fails: Cell::new(false),
+    }
+}
+
+/// (a) A pending NON-downgrade mark never withholds the actor-served press: a party filing's, a tip's and an age
+/// mark on the press's game are counted in `pending` and change no row; the gate names none of them.
+#[tokio::test]
+async fn fix968_a_a_pending_non_downgrade_mark_never_withholds_the_actor_served_press() {
+    let w = fix968_phase(true).await;
+    let games = games_of(&w.d1, "owner");
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    let body = fix968_served_by_actor(&w);
+    assert_eq!(
+        fix968_facts(&body, FIX968_PRESS)["claimable"],
+        true,
+        "{body}"
+    );
+    let game = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["outpoint"] == FIX968_PRESS)
+        .unwrap()["gameId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for (source, key) in [
+        ("party", "p1"),
+        ("tip", "gate"),
+        ("age", "age"),
+        ("sweep", "s1"),
+    ] {
+        fix968_mark(&w, &game, source, key, 0);
+    }
+    assert_eq!(fix968_pending(&w), 4);
+    let snapshot = crate::owed_read::read_with(&w.d1, "owner", false)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.pending, 4);
+    assert!(snapshot.downgrades.is_empty(), "{:?}", snapshot.downgrades);
+    assert_eq!(
+        snapshot.withholding_mark(&game),
+        None,
+        "the gate names no plain mark"
+    );
+    let body = fix968_served_by_actor(&w);
+    let facts = fix968_facts(&body, FIX968_PRESS);
+    assert_eq!(
+        facts["claimable"], true,
+        "a plain mark delays no press: {facts}"
+    );
+    assert!(facts.get("refresh").is_none(), "{facts}");
+    assert_eq!(
+        body["pending"], 4,
+        "the count still says what is being re-judged: {body}"
+    );
+    // the D1-served read reads the same rule
+    let facts = fix968_facts(&fix968_served_by_d1(&w), FIX968_PRESS).clone();
+    assert_eq!(facts["claimable"], true, "{facts}");
+}
+
+/// (b) THE DECISION, Phase B. A pending DOWNGRADE mark the actor has NOT applied withholds the press with its
+/// reason (as D2-L1 built it); the same mark once the writer's direct call applied the actor (its covered generation
+/// at or past the mark's) withholds nothing although the consumer has not acknowledged it (RED on 149869bf: the
+/// press withheld, `claimable: false`, `refresh: "pending"`); a downgrade mark written AFTER that apply withholds
+/// again; the consumer's delivery (actor, then the D1 judge's acknowledgement) lifts it. The D1-served read keeps
+/// withholding on every pending downgrade mark: its judge has not judged it. A REAL competitor applied directly is
+/// served as the actor judged it (no press, no `refresh`): covered means the row IS the record's judgement.
+#[tokio::test]
+async fn fix968_b_a_downgrade_mark_the_actor_applied_serves_the_press_one_it_has_not_withholds() {
+    let w = fix968_phase(true).await;
+    let games = games_of(&w.d1, "owner");
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    assert_eq!(fix968_pending(&w), 0);
+    let body = fix968_served_by_actor(&w);
+    assert_eq!(
+        fix968_facts(&body, FIX968_PRESS)["claimable"],
+        true,
+        "{body}"
+    );
+    let game = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["outpoint"] == FIX968_PRESS)
+        .unwrap()["gameId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 1. a downgrade-class mark the actor has not applied (the admission's class, D4-L1): withheld, as today
+    let g1 = fix968_mark(&w, &game, "pot", "aa00:0", 1);
+    let snapshot = crate::owed_read::read_with(&w.d1, "owner", false)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.downgrades.get(&game),
+        Some(&vec![(g1, "pot".to_string())]),
+        "PENDING_SQL carries the mark's generation"
+    );
+    let facts = fix968_facts(&fix968_served_by_actor(&w), FIX968_PRESS).clone();
+    assert_eq!(facts["claimable"], false, "uncovered: withheld: {facts}");
+    assert_eq!(facts["refresh"], "pending");
+    assert_eq!(facts["pendingSource"], "pot");
+    assert_eq!(facts["claimableBeforePending"], true);
+    assert_eq!(
+        facts["claimReason"],
+        crate::owed_read::PENDING_DOWNGRADE_REASON
+    );
+
+    // 2. the writer's direct call applies the actor; Phase B's direct call acknowledges nothing, the mark stays
+    fix968_direct(&w, std::slice::from_ref(&game), 7).await;
+    assert_eq!(
+        fix968_pending(&w),
+        1,
+        "the consumer has not acknowledged the mark"
+    );
+    let covered = covered_of(
+        &json!({"covered": fix968_rows(&w.actor, COVERED_BY_GAME_SQL, vec![Bind::Text(json!([game.to_ascii_lowercase()]).to_string())])}),
+    );
+    assert!(
+        covered
+            .get(&game.to_ascii_lowercase())
+            .is_some_and(|c| *c >= g1),
+        "the apply read the record after the mark: {covered:?} against {g1}"
+    );
+    let body = fix968_served_by_actor(&w);
+    let facts = fix968_facts(&body, FIX968_PRESS);
+    assert_eq!(
+        facts["claimable"], true,
+        "a downgrade mark the actor applied withholds nothing (RED on 149869bf): {facts}"
+    );
+    assert!(facts.get("refresh").is_none(), "{facts}");
+    assert_eq!(
+        body["pending"], 1,
+        "the count is still the consumer's backlog: {body}"
+    );
+    // the D1-served read: its judge has not judged the mark, so it withholds (`covered` is empty there)
+    let d1 = fix968_facts(&fix968_served_by_d1(&w), FIX968_PRESS).clone();
+    assert_eq!(
+        d1["claimable"], false,
+        "the D1 read withholds on every pending downgrade: {d1}"
+    );
+    assert_eq!(d1["pendingSource"], "pot");
+
+    // 3. a downgrade mark written AFTER the apply: above the covered generation, withheld again
+    let g2 = fix968_mark(&w, &game, "eviction", "dd00", 1);
+    assert!(g2 > g1);
+    let facts = fix968_facts(&fix968_served_by_actor(&w), FIX968_PRESS).clone();
+    assert_eq!(
+        facts["claimable"], false,
+        "a mark past the apply withholds: {facts}"
+    );
+    assert_eq!(
+        facts["pendingSource"], "eviction",
+        "the newest uncovered mark's source: {facts}"
+    );
+    assert_eq!(
+        facts["claimReason"],
+        crate::owed_read::PENDING_DOWNGRADE_REASON
+    );
+
+    // 4. the consumer's delivery: the actor applies (covering g2), the D1 judge acknowledges both marks
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    assert_eq!(fix968_pending(&w), 0);
+    let facts = fix968_facts(&fix968_served_by_actor(&w), FIX968_PRESS).clone();
+    assert_eq!(facts["claimable"], true, "{facts}");
+    assert!(facts.get("refresh").is_none());
+
+    // 5. a REAL competitor (the trigger's downgrade mark), applied directly: served as judged, no press, no refresh
+    w.d1.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
+    assert_eq!(
+        w.d1.conn
+            .query_row(
+                "SELECT COUNT(*) FROM owed_dirty WHERE identity='owner' AND downgrade=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "the index's spend is a downgrade-class mark"
+    );
+    let before = fix968_facts(&fix968_served_by_actor(&w), FIX968_PRESS).clone();
+    assert_eq!(
+        before["claimable"], false,
+        "not yet applied: withheld: {before}"
+    );
+    assert_eq!(before["refresh"], "pending");
+    fix968_direct(&w, std::slice::from_ref(&game), 8).await;
+    assert!(fix968_pending(&w) >= 1, "still unacknowledged");
+    let body = fix968_served_by_actor(&w);
+    if let Some(facts) = fix968_facts_opt(&body, FIX968_PRESS) {
+        assert_ne!(
+            facts["claimable"], true,
+            "the actor's own judgement downgraded it: {facts}"
+        );
+        assert!(
+            facts.get("refresh").is_none(),
+            "served as judged, not as re-judging: {facts}"
+        );
+    }
+}
+
+/// (c) PHASE C (`OWED_D1_JUDGE=false`), pinned apart. The triggers still write `owed_dirty` (they know no flag);
+/// the consumer's `as_the_judge` acknowledges the applied games' marks; the actor-served read consults the marks
+/// through the same gate: a downgrade mark the actor has not applied withholds (the actor unreachable), one it
+/// applied by a direct call whose caller walled (no acknowledgement) withholds nothing, a plain mark never does;
+/// and the D1-served read serves NO press at all once a Phase C acknowledgement stamped `owed-actor-judged`
+/// (NEW-M3), the gate never reached.
+#[tokio::test]
+async fn fix968_c_phase_c_the_marks_are_written_acknowledged_and_read_through_the_one_gate() {
+    let w = fix968_phase(false).await;
+    let games = games_of(&w.d1, "owner");
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    assert_eq!(fix968_pending(&w), 0, "Phase C's acknowledgement");
+    let body = fix968_served_by_actor(&w);
+    assert_eq!(
+        fix968_facts(&body, FIX968_PRESS)["claimable"],
+        true,
+        "{body}"
+    );
+    let game = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["outpoint"] == FIX968_PRESS)
+        .unwrap()["gameId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // NEW-M3: the D1 read serves no press after a Phase C acknowledgement, before the rollback's stamp
+    let d1 = fix968_facts(&fix968_served_by_d1(&w), FIX968_PRESS).clone();
+    assert_eq!(d1["claimable"], false, "{d1}");
+    assert_eq!(d1["pendingSource"], "owed-v3");
+    assert_eq!(d1["claimReason"], crate::owed_read::ROLLBACK_PENDING_REASON);
+
+    // a plain mark: counted, no withhold
+    fix968_mark(&w, &game, "party", "p1", 0);
+    let body = fix968_served_by_actor(&w);
+    assert_eq!(
+        fix968_facts(&body, FIX968_PRESS)["claimable"],
+        true,
+        "{body}"
+    );
+    assert_eq!(body["pending"], 1);
+    w.d1.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+
+    // a downgrade mark the actor has not applied (the actor out of reach): withheld
+    let g1 = fix968_mark(&w, &game, "pot", "aa00:0", 1);
+    w.actor_fails.set(true);
+    assert!(crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .is_err());
+    assert_eq!(
+        fix968_pending(&w),
+        1,
+        "a faulted delivery acknowledges nothing"
+    );
+    let facts = fix968_facts(&fix968_served_by_actor(&w), FIX968_PRESS).clone();
+    assert_eq!(facts["claimable"], false, "{facts}");
+    assert_eq!(
+        facts["claimReason"],
+        crate::owed_read::PENDING_DOWNGRADE_REASON
+    );
+    // the direct call lands in the actor, its caller walled: no acknowledgement, the mark covered
+    w.actor_fails.set(false);
+    fix968_direct(&w, std::slice::from_ref(&game), 9).await;
+    assert_eq!(fix968_pending(&w), 1);
+    let facts = fix968_facts(&fix968_served_by_actor(&w), FIX968_PRESS).clone();
+    assert_eq!(
+        facts["claimable"], true,
+        "covered: the press stands in Phase C too: {facts}"
+    );
+    assert!(facts.get("refresh").is_none());
+    let snapshot = crate::owed_read::read_with(&w.d1, "owner", false)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.downgrades.get(&game).map(Vec::len), Some(1));
+    assert_eq!(
+        snapshot.withholding_mark(&game),
+        Some("pot"),
+        "with no covered answer the gate withholds"
+    );
+
+    // the real competitor: the trigger writes its downgrade mark under Phase C too; the consumer acknowledges it
+    w.d1.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
+    assert_eq!(
+        w.d1.conn
+            .query_row(
+                "SELECT COUNT(*) FROM owed_dirty WHERE identity='owner' AND downgrade=1 AND generation>?1",
+                [g1],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "the trigger knows no flag"
+    );
+    let facts = fix968_facts(&fix968_served_by_actor(&w), FIX968_PRESS).clone();
+    assert_eq!(
+        facts["claimable"], false,
+        "the spend is not applied yet: withheld: {facts}"
+    );
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    assert_eq!(
+        fix968_pending(&w),
+        0,
+        "as_the_judge acknowledged the applied games' marks"
+    );
+    let body = fix968_served_by_actor(&w);
+    if let Some(facts) = fix968_facts_opt(&body, FIX968_PRESS) {
+        assert_ne!(facts["claimable"], true, "{facts}");
+        assert!(facts.get("refresh").is_none(), "{facts}");
+    }
+}
+
+/// (d) The read's wiring: `read_snapshot` names the downgrade-marked games to the actor and keeps its covered
+/// answer; `/rows` answers them from the shipped statement and writes nothing; the answer's parse.
+#[test]
+fn fix968_d_the_read_asks_the_actor_its_coverage_of_the_marked_games() {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    let read = &object[object.find("pub(crate)asyncfnread_snapshot(").unwrap()..];
+    let read = &read[..read.find("pubasyncfncall_bootstrap(").unwrap()];
+    assert!(read.contains(&squash(
+        "let marked: Vec<String> = snapshot.downgrades.keys().cloned().collect();"
+    )));
+    assert!(read.contains(&squash("call_rows(env, identity, READ_WALL_MS, &marked)")));
+    assert!(read.contains(&squash("snapshot.covered = covered_of(&answer);")));
+    let rows_route = &object[object.find("asyncfnrows_route(").unwrap()
+        ..object.find("asyncfnbootstrap_page(").unwrap()];
+    assert!(rows_route.contains("COVERED_BY_GAME_SQL"));
+    assert!(rows_route.contains(&squash("\"covered\": covered,")));
+    assert!(!rows_route.contains("put_meta") && !rows_route.contains("set_alarm"));
+    let call = &object[object.find("pubasyncfncall_rows(").unwrap()..];
+    assert!(call.contains(".take(COVERED_ASK_MAX)"));
+    assert_eq!(
+        covered_of(
+            &json!({"covered": [{"game": "G1", "seq": 12}, {"game": "g2", "seq": 3.0}, {"game": 7}]})
+        ),
+        BTreeMap::from([("g1".to_string(), 12), ("g2".to_string(), 3)])
+    );
+    assert!(covered_of(&json!({"fresh": true})).is_empty());
+    // the statement's shape on a mirror
+    let m = mirror();
+    m.conn
+        .execute_batch("INSERT INTO applied(kind,seq,game,atMs) VALUES ('covered',5,'ga',1),('covered',9,'ga',2),('covered',4,'gb',3),('covered-tip',99,'ga',4)")
+        .unwrap();
+    let rows = fix968_rows(
+        &m,
+        COVERED_BY_GAME_SQL,
+        vec![Bind::Text("[\"ga\",\"gc\"]".into())],
+    );
+    assert_eq!(
+        covered_of(&json!({"covered": rows})),
+        BTreeMap::from([("ga".to_string(), 9)])
+    );
 }
