@@ -2092,6 +2092,10 @@ pub struct MissingSpendSummary {
     pub join_hop_inputs_deferred: usize,
     /// Pot candidates whose JOIN the pass's read budget left unread this pass (a candidate again after its backoff).
     pub join_hop_pots_deferred: usize,
+    /// bsv-low #986 (FIX-986): of `discovered`, the covenant spends whose VERDICT GROUP rode the pointer's write,
+    /// classified from the spender's held BEEF (`stored_spend_verdict`); the rest carry none until their bytes
+    /// arrive (the confirmation pass or the janitor's backfill latches it then).
+    pub verdicts: usize,
 }
 
 /// Per tick: at most this many stale unspent pots, none younger than an hour
@@ -2210,10 +2214,61 @@ pub async fn discover_spends_for_outpoints(
     summary
 }
 
+/// bsv-low #986 (READ-986 item 2(b), FIX-986): the #284 VERDICT GROUP of `rec`'s spend by `spender`, classified
+/// from the spender's DURABLE bytes by the ONE classifier every verdict writer calls
+/// (`overlay_discovery::pot::classify_record_spend`: the row's decoded params and funded value, the spend's own
+/// input for the outpoint, the four mandated exits, #406's WHO SIGNED). The evidence, in order: the row is a
+/// decoded covenant with its funded value (else no read is made: a bare pot never carries a stored verdict); the
+/// store HOLDS a BEEF for `spender` (`get_beef`); it parses HASH-BOUND to `spender` (`transaction_from_beef`
+/// selects by the txid computed from the raw bytes, so the bytes are that transaction and no other); and the
+/// outputs match one exit. `None` on any miss: the caller writes no verdict, and the row stays what it was (the
+/// janitor's second candidate set, `find_spent_unclassified`, takes it once its bytes are held and its spend
+/// confirmed). The passes that call it (the discovery pass's spend write, the confirmation pass's chase and
+/// displacement, the backfill) hold the durable bytes by construction, so a pair not verified is CONCLUDED
+/// (`SpendVerdict::write_concluded`, `'unresolved'`), as the signers backfill concludes it.
+async fn stored_spend_verdict(
+    pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
+    rec: &overlay_discovery::pot::storage::PotRecord,
+    spender: &str,
+) -> Option<overlay_discovery::pot::SpendVerdict> {
+    rec.decoded_covenant_params()?;
+    rec.pot_sats?;
+    let beef = pot_storage.get_beef(spender).await.ok().flatten()?;
+    classify_stored_spend(rec, spender, &beef)
+}
+
+/// bsv-low #986: [`stored_spend_verdict`]'s pure half, over the spender's stored BEEF `beef` already read: the
+/// parse HASH-BOUND to `spender` (`transaction_from_beef` selects the subject by the txid computed from its raw
+/// bytes, under the stored-bytes limits), then the ONE classifier (`overlay_discovery::pot::classify_record_spend`).
+/// `pub` so the app layer's differential pin (bsv-low #986 item 3) replays the janitor's latch over its own record
+/// with the shipped parse and classifier, never a second spelling.
+pub fn classify_stored_spend(
+    rec: &overlay_discovery::pot::storage::PotRecord,
+    spender: &str,
+    beef: &[u8],
+) -> Option<overlay_discovery::pot::SpendVerdict> {
+    let spending_tx =
+        beef_limits::transaction_from_beef(beef, Some(spender), &beef_limits::STORED_BEEF_LIMITS)
+            .ok()?;
+    overlay_discovery::pot::classify_record_spend(rec, &spending_tx)
+}
+
+/// bsv-low #986: does `rec` carry a verdict group keyed to its LIVE pointer (the reader's `verdictTxid ==
+/// spendingTxid` guard)? A stale group (another pointer's) reads as none, as every reader reads it.
+fn has_current_verdict(rec: &overlay_discovery::pot::storage::PotRecord) -> bool {
+    rec.verdict.is_some()
+        && rec
+            .verdict_txid
+            .as_deref()
+            .zip(rec.spending_txid.as_deref())
+            .is_some_and(|(v, s)| v.eq_ignore_ascii_case(s))
+}
+
 /// ONE candidate of the discovery pass (shared by the scheduled pass and the
 /// §H4 by-outpoints pass): examine-stamp, the hint ladder, the script rung
 /// for a pot row, the binding raw, then `mark_spent` as an UNCONFIRMED
-/// pointer the confirmation pass proves.
+/// pointer the confirmation pass proves (bsv-low #986: with its VERDICT
+/// GROUP when the spender's BEEF is already held).
 async fn discover_spend_for_row(
     pot_storage: &dyn overlay_discovery::pot::storage::PotStorage,
     fetcher: &dyn overlay_engine::gasp::AncestorFetcher,
@@ -2390,13 +2445,19 @@ async fn discover_spend_for_row(
             }
         }
     }
+    // bsv-low #986 (READ-986 item 2(b)): a spend found by the couriers is classified like one presented at the
+    // door, when its bytes are already held: the verdict group rides the SAME statement as the pointer (the door's
+    // atomicity; a group can never name another spender than the pointer it rode in with). With no bytes held the
+    // pointer is written bare, as before, and the confirmation pass or the janitor's second candidate set latches
+    // the group once they are.
+    let verdict = stored_spend_verdict(pot_storage, &rec, &spender).await;
     match pot_storage
         .mark_spent(
             &rec.txid,
             rec.output_index,
             &spender,
             false,
-            None,
+            verdict.as_ref().map(|g| g.write_concluded()),
             None,
             None,
         )
@@ -2404,6 +2465,9 @@ async fn discover_spend_for_row(
     {
         Ok(()) => {
             summary.discovered += 1;
+            if verdict.is_some() {
+                summary.verdicts += 1;
+            }
             // bsv-low #523 (M26): a spend this pass DISCOVERED is a pot change in this pass (the spender came
             // from outside our own broadcast); the caller's flush ships it (`pot_changes`). `D1PotStorage` notes
             // the same write (the set dedupes): the pass's own note makes the rule hold over any storage.
@@ -3098,6 +3162,10 @@ pub struct SpendConfirmSummary {
     /// faults, plus hints that FAILED the content-addressed input binding (a
     /// lying or garbled indexer answer — refused, logged, never written).
     pub displace_faults: usize,
+    /// bsv-low #986 (FIX-986): VERDICT GROUPS latched this tick onto rows this pass confirmed or displaced that
+    /// carried none for their live pointer, classified from the spender's held BEEF (the chase) or the proven
+    /// bytes in hand (the displacement), under the pointer CAS (`mark_verdict_for_spender`).
+    pub verdicts: usize,
     /// OBSERVABILITY ONLY (bounded to 5): the spending txids actually sampled
     /// this tick. Lets an operator check the candidates against a block explorer
     /// to tell "the chaser is broken" from "this backlog is genuinely
@@ -3252,6 +3320,32 @@ pub async fn complete_spend_confirmations(
                         // (a tower-broadcast refund confirmed here and its seat's owed list heard nothing for
                         // 26 minutes); the caller's flush ships it (`pot_changes`)
                         crate::pot_changes::note(&rec.txid, rec.output_index);
+                        // bsv-low #986 (READ-986 item 2(b)): a confirmed spend that carries no verdict for its
+                        // live pointer (the discovery pass wrote it bare: no bytes were held then) is classified
+                        // now from the spender's held BEEF, under the same pointer CAS the backfill uses (a
+                        // moved pointer makes it a no-op; nothing else is touched). Still no bytes: the janitor's
+                        // second candidate set takes the row once they arrive.
+                        if !has_current_verdict(&rec) {
+                            if let Some(group) =
+                                stored_spend_verdict(pot_storage, &rec, spending_txid).await
+                            {
+                                match pot_storage
+                                    .mark_verdict_for_spender(
+                                        &rec.txid,
+                                        rec.output_index,
+                                        spending_txid,
+                                        group.write_concluded(),
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => summary.verdicts += 1,
+                                    Err(e) => push_log(&format!(
+                                        "[spend-confirm] {}:{} verdict write failed (the backfill retries): {e}",
+                                        rec.txid, rec.output_index
+                                    )),
+                                }
+                            }
+                        }
                     }
                     Ok(false) => {
                         summary.cas_missed += 1;
@@ -3430,6 +3524,31 @@ pub async fn complete_spend_confirmations(
                 summary.displaced += 1;
                 // bsv-low #523: a displacement latches a confirmed spend under another spender, a pot change
                 crate::pot_changes::note(&rec.txid, rec.output_index);
+                // bsv-low #986 (READ-986 item 2(b)): the displaced-in spender's verdict group, from the PROVEN
+                // bytes in hand (content-addressed to `actual` by the binding read; the id is checked again
+                // here), under the new pointer's CAS. The stale group keyed to the old pointer stays behind,
+                // neutralized by every reader's guard, exactly as before.
+                if let Some(group) = Transaction::from_hex(&raw)
+                    .ok()
+                    .filter(|tx| tx.id().eq_ignore_ascii_case(&actual))
+                    .and_then(|tx| overlay_discovery::pot::classify_record_spend(&rec, &tx))
+                {
+                    match pot_storage
+                        .mark_verdict_for_spender(
+                            &rec.txid,
+                            rec.output_index,
+                            &actual,
+                            group.write_concluded(),
+                        )
+                        .await
+                    {
+                        Ok(()) => summary.verdicts += 1,
+                        Err(e) => push_log(&format!(
+                            "[spend-confirm] {}:{} displaced-spender verdict write failed (the backfill retries): {e}",
+                            rec.txid, rec.output_index
+                        )),
+                    }
+                }
                 // The row ENDED this tick confirmed — it is not still
                 // unconfirmed, and ops reads must not double-count it.
                 summary.still_unconfirmed = summary.still_unconfirmed.saturating_sub(1);
@@ -3484,6 +3603,12 @@ pub struct ParamsBackfillSummary {
     /// Rows skipped because their funding BEEF is missing/unparseable —
     /// they STAY candidates (retried forever, bounded per tick).
     pub missing_beef: usize,
+    /// bsv-low #986 (READ-986 item 2(b)): the SECOND candidate set looked at this tick: spent, confirmed, decoded
+    /// covenant rows carrying no CURRENT verdict whose spender's BEEF is held (`find_spent_unclassified`).
+    pub spent_unclassified: usize,
+    /// Of `spent_unclassified`, the rows whose verdict group this tick latched (counted in `verdicts` too); the
+    /// rest matched no mandated exit and stay candidates (logged by outpoint, at most `limit` a tick).
+    pub spent_classified: usize,
 }
 
 /// Lazily decode the #284 columns for pre-migration `pot_records` rows
@@ -3520,11 +3645,7 @@ pub async fn backfill_decoded_params(
     limit: u64,
 ) -> ParamsBackfillSummary {
     use overlay_discovery::pot::storage::PotRecord;
-    use overlay_discovery::pot::storage::VerdictWrite;
-    use overlay_discovery::pot::{
-        classify_covenant, extract_covenant_params, is_bare_2of3_lock, is_p2pkh_script,
-        settle_signers_for_spend, RawTx, SettleSigners,
-    };
+    use overlay_discovery::pot::{extract_covenant_params, is_bare_2of3_lock, is_p2pkh_script};
 
     let mut summary = ParamsBackfillSummary::default();
     let candidates = match pot_storage.find_params_undecoded(limit).await {
@@ -3615,53 +3736,21 @@ pub async fn backfill_decoded_params(
         summary.decoded += 1;
 
         // 4. Verdict backfill for an already-spent covenant row whose
-        //    spender BEEF we hold.
-        let (Some(params), Some(pot_sats), true, Some(spending_txid)) = (
-            covenant_params,
-            decoded.pot_sats,
-            row.spent,
-            row.spending_txid.as_deref(),
-        ) else {
+        //    spender BEEF we hold: the ONE classifier every verdict writer
+        //    calls (bsv-low #986, `stored_spend_verdict`: conservation, the
+        //    spend's own input, the mandated exits, #406's WHO SIGNED from
+        //    the durable bytes, so a no-pair answer latches 'unresolved' —
+        //    re-derived and concluded, never re-scanned).
+        if !(row.spent && covenant_params.is_some()) {
             continue;
-        };
-        if params.stake_a.checked_add(params.stake_b) != Some(pot_sats) {
-            continue; // conservation failed — never classify
         }
-        let Ok(Some(spender_beef)) = pot_storage.get_beef(spending_txid).await else {
-            continue; // no spender bytes — the read-path fallback covers it
-        };
-        let Ok(spending_tx) = beef_limits::transaction_from_beef(
-            &spender_beef,
-            Some(spending_txid),
-            &beef_limits::STORED_BEEF_LIMITS,
-        ) else {
+        let Some(spending_txid) = row.spending_txid.as_deref() else {
             continue;
         };
-        let Some((pot_input_index, pot_input_sequence)) =
-            spending_tx.inputs.iter().enumerate().find_map(|(n, i)| {
-                (i.source_txid
-                    .as_deref()
-                    .is_some_and(|t| t.eq_ignore_ascii_case(&row.txid))
-                    && i.source_output_index == row.output_index)
-                    .then_some((n, i.sequence))
-            })
-        else {
-            continue; // the recorded spender does not spend this outpoint
+        let Some(group) = stored_spend_verdict(pot_storage, &decoded, spending_txid).await else {
+            continue; // no spender bytes (the second set takes it when they arrive), or no mandated exit
         };
-        let Some(spender) = RawTx::from_transaction(&spending_tx) else {
-            continue;
-        };
-        let Some(verdict) = classify_covenant(&params, &spender, pot_input_sequence) else {
-            continue; // non-template spend — honestly unresolved
-        };
-        // bsv-low #406: WHO SIGNED, from the durable spender bytes. This pass
-        // holds the bytes by construction, so a no-pair answer latches
-        // 'unresolved' (re-derived and concluded — never re-scanned), while a
-        // verifying pair latches the wire value. Both ride the verdict CAS.
-        let signers =
-            settle_signers_for_spend(&params, pot_sats, &spending_tx.to_binary(), pot_input_index)
-                .map(SettleSigners::as_str)
-                .unwrap_or("unresolved");
+        let group = group.write_concluded();
         // GUARDED CAS write (gate MEDIUM-2, 2026-07-28): the candidate read
         // and this write are separated by several awaits, so the pointer may
         // have MOVED (e.g. a reorg-confirmed S2 landed). A plain mark_spent
@@ -3676,15 +3765,7 @@ pub async fn backfill_decoded_params(
         // a moved pointer makes it a no-op and the read-path fallback (or a
         // later tick, if this row re-enters via its spender) covers it.
         if let Err(e) = pot_storage
-            .mark_verdict_for_spender(
-                &row.txid,
-                row.output_index,
-                spending_txid,
-                VerdictWrite {
-                    verdict: verdict.as_str(),
-                    settle_signers: Some(signers),
-                },
-            )
+            .mark_verdict_for_spender(&row.txid, row.output_index, spending_txid, group)
             .await
         {
             push_log(&format!(
@@ -3693,6 +3774,61 @@ pub async fn backfill_decoded_params(
             ));
         } else {
             summary.verdicts += 1;
+        }
+    }
+
+    // bsv-low #986 (READ-986 item 2(b), FIX-986): the SECOND candidate set.
+    // A spend the discovery pass found and the confirmation pass proved
+    // carried no verdict (neither wrote one before this fold, and this pass
+    // skipped a decoded row), so a pre-signed refund broadcast at its
+    // recovery height outside the door stayed unclassified for good: D1's
+    // results view classified it per request from the spender's BEEF, the
+    // owed actor (no bytes held) served it `unresolved`. The candidates are
+    // the rows both judges must agree on: spent, CONFIRMED, a decoded
+    // covenant lock, no CURRENT verdict, the spender's BEEF HELD (the
+    // store's predicate, `find_spent_unclassified`; a row whose bytes are
+    // absent is not read, an unconfirmed pointer is not one either). Each
+    // is classified by the same function as the door's hook and latched
+    // under the pointer CAS; one that matches no mandated exit is honestly
+    // unresolved, logged, and stays a candidate (RANDOM-sampled, bounded).
+    let unclassified = match pot_storage.find_spent_unclassified(limit).await {
+        Ok(c) => c,
+        Err(e) => {
+            push_log(&format!(
+                "[params-backfill] unclassified-spend candidate scan failed: {e}"
+            ));
+            return summary;
+        }
+    };
+    summary.spent_unclassified = unclassified.len();
+    for row in unclassified {
+        let Some(spending_txid) = row.spending_txid.as_deref() else {
+            continue;
+        };
+        let Some(group) = stored_spend_verdict(pot_storage, &row, spending_txid).await else {
+            push_log(&format!(
+                "[params-backfill] {}:{} spent by {spending_txid}: its held bytes match no mandated exit (left unclassified)",
+                row.txid, row.output_index
+            ));
+            continue;
+        };
+        match pot_storage
+            .mark_verdict_for_spender(
+                &row.txid,
+                row.output_index,
+                spending_txid,
+                group.write_concluded(),
+            )
+            .await
+        {
+            Ok(()) => {
+                summary.verdicts += 1;
+                summary.spent_classified += 1;
+            }
+            Err(e) => push_log(&format!(
+                "[params-backfill] {}:{} verdict write failed: {e}",
+                row.txid, row.output_index
+            )),
         }
     }
 
@@ -11670,5 +11806,448 @@ pub(crate) mod tests {
         // an unknown subject is refused
         assert!(assemble_ancestry_beef(&"00".repeat(32), &entries).is_err());
         assert!(raw_input_txids("zz").is_err());
+    }
+
+    // ── bsv-low #986 (READ-986 item 2(b), FIX-986): every pass latches the VERDICT GROUP from the held bytes ──
+    //
+    // Family D of READ-986: a pre-signed refund broadcast at its recovery height outside the overlay's door is
+    // found by the discovery pass (a pointer with NO verdict), proved by the confirmation pass (still none), and
+    // the janitor skipped the decoded row, so D1's results view classified it per request from the spender's BEEF
+    // while the owed actor (no bytes held) served `unresolved`. These pins hold each writer to the stored column.
+    mod fix986 {
+        use super::*;
+        use overlay_discovery::pot::storage::{
+            MemoryPotStorage, PotRecord, PotStorage, VerdictWrite,
+        };
+        use overlay_discovery::pot::CovenantParams;
+
+        /// The pot's pre-signed REFUND (the T_refund exit: each seat's stake less its fee share, nLockTime at
+        /// `lock_time`, the pot input non-final), signed by `signers` over the real covenant lock's BIP-143 digest
+        /// as the network validated it. `(beef, txid, raw hex)`.
+        fn signed_refund_beef(
+            pot_txid: &str,
+            p: &CovenantParams,
+            pot_sats: u64,
+            signers: &[&bsv_rs::primitives::ec::PrivateKey],
+            lock_time: u32,
+        ) -> (Vec<u8>, String, String) {
+            use bsv_rs::primitives::bsv::sighash::{
+                compute_sighash_for_signing, parse_transaction, SighashParams, SIGHASH_ALL,
+                SIGHASH_FORKID,
+            };
+            use bsv_rs::script::{LockingScript, UnlockingScript};
+            use bsv_rs::transaction::{Beef, TransactionInput, TransactionOutput};
+            let lock = covenant_lock(p);
+            let fee_b = p.fee_sats / 2;
+            let fee_a = p.fee_sats - fee_b;
+            let outs = [
+                (p.stake_a - fee_a, p2pkh_script(&p.pay_pkh_a)),
+                (p.stake_b - fee_b, p2pkh_script(&p.pay_pkh_b)),
+            ];
+            let build = |unlock: Option<&[u8]>| {
+                let mut tx = Transaction::new();
+                let mut input = TransactionInput::new(pot_txid.to_string(), 0);
+                input.sequence = 0xffff_fffe;
+                if let Some(u) = unlock {
+                    input.unlocking_script = Some(UnlockingScript::from_binary(u).unwrap());
+                }
+                tx.add_input(input).unwrap();
+                for (sats, out_lock) in &outs {
+                    tx.add_output(TransactionOutput {
+                        satoshis: Some(*sats),
+                        locking_script: LockingScript::from_binary(out_lock).unwrap(),
+                        change: false,
+                    })
+                    .unwrap();
+                }
+                tx.lock_time = lock_time;
+                tx
+            };
+            let raw = build(None).to_binary();
+            let parsed = parse_transaction(&raw).unwrap();
+            let digest = compute_sighash_for_signing(&SighashParams {
+                version: parsed.version,
+                inputs: &parsed.inputs,
+                outputs: &parsed.outputs,
+                locktime: parsed.locktime,
+                input_index: 0,
+                subscript: &lock,
+                satoshis: pot_sats,
+                scope: SIGHASH_ALL | SIGHASH_FORKID,
+            });
+            let mut unlock = vec![0x00];
+            for sk in signers {
+                let mut der = sk.sign(&digest).unwrap().to_der();
+                der.push((SIGHASH_ALL | SIGHASH_FORKID) as u8);
+                unlock.push(der.len() as u8);
+                unlock.extend_from_slice(&der);
+            }
+            let tx = build(Some(&unlock));
+            let txid = tx.id();
+            let raw_hex = tx.to_hex();
+            let mut beef = Beef::new();
+            beef.merge_transaction(tx);
+            (beef.to_binary(), txid, raw_hex)
+        }
+
+        fn group_of(r: &PotRecord) -> (Option<&str>, Option<&str>, Option<&str>) {
+            (
+                r.verdict.as_deref(),
+                r.verdict_txid.as_deref(),
+                r.settle_signers.as_deref(),
+            )
+        }
+
+        /// (a) THE DISCOVERY PASS: a spend the couriers name, bound by its raw, whose BEEF the store already holds
+        /// is recorded WITH its verdict group in the pointer's own write (the door's atomicity): `refund`, keyed to
+        /// the spender, WHO SIGNED `coop` from the spend's own signatures against the committed triple. A pot whose
+        /// spender bytes are absent is recorded bare, as before, and the summary counts the difference. RED on
+        /// main: `mark_spent(.., None, ..)`, the group `(None, None, None)` on both (and no `verdicts` field).
+        #[tokio::test]
+        async fn fix986_a_the_discovery_pass_latches_the_verdict_group_when_the_spenders_beef_is_held(
+        ) {
+            let store = MemoryPotStorage::new();
+            let (keys, p) = real_key_params();
+            let pot_held = hex::encode([0x86u8; 32]);
+            let pot_bare = hex::encode([0x87u8; 32]);
+            for pot in [&pot_held, &pot_bare] {
+                store
+                    .store_record(&pre406_row(pot, &p, 2500))
+                    .await
+                    .unwrap();
+            }
+            let (beef, refund, raw) =
+                signed_refund_beef(&pot_held, &p, 2500, &[&keys[0], &keys[1]], 900_040);
+            store.store_beef(&refund, &beef).await.unwrap();
+            let (_, refund_bare, raw_bare) =
+                signed_refund_beef(&pot_bare, &p, 2500, &[&keys[0], &keys[1]], 900_040);
+            let fetcher = MockProofFetcher {
+                spender_hints: [
+                    ((pot_held.clone(), 0u32), refund.clone()),
+                    ((pot_bare.clone(), 0u32), refund_bare.clone()),
+                ]
+                .into_iter()
+                .collect(),
+                binding_raw: [(refund.clone(), raw), (refund_bare.clone(), raw_bare)]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let s = discover_spends_for_outpoints(
+                &store,
+                &fetcher,
+                &[(pot_held.clone(), 0), (pot_bare.clone(), 0)],
+            )
+            .await;
+            assert_eq!((s.discovered, s.verdicts), (2, 1), "{s:?}");
+            let held = store.get_spent_status(&pot_held, 0).await.unwrap().unwrap();
+            assert!(held.spent && !held.spent_confirmed);
+            assert_eq!(held.spending_txid.as_deref(), Some(refund.as_str()));
+            assert_eq!(
+                group_of(&held),
+                (Some("refund"), Some(refund.as_str()), Some("coop")),
+                "the verdict group rode the pointer's write, from the held bytes: {held:?}"
+            );
+            let bare = store.get_spent_status(&pot_bare, 0).await.unwrap().unwrap();
+            assert!(bare.spent && bare.spending_txid.as_deref() == Some(refund_bare.as_str()));
+            assert_eq!(
+                group_of(&bare),
+                (None, None, None),
+                "no bytes held: the pointer is written bare and the group waits for them"
+            );
+        }
+
+        /// (b) THE CONFIRMATION PASS: the chase confirms a bare pointer (the discovery pass's, written before the
+        /// bytes arrived) and latches its verdict group from the BEEF held since, under the pointer CAS; a row that
+        /// already carries a group for its live pointer is left as it is; a row whose bytes are still absent is
+        /// confirmed bare (the backfill's second set takes it). And the DISPLACEMENT arm: the proven bytes in hand
+        /// classify the displaced-in spender under the NEW pointer. RED on main: the chase and the displacement
+        /// write no verdict (`(None, None, None)` after both).
+        #[tokio::test]
+        async fn fix986_b_the_confirmation_pass_latches_the_verdict_group_on_a_bare_pointer() {
+            let store = MemoryPotStorage::new();
+            let (keys, p) = real_key_params();
+            let pot_held = hex::encode([0x88u8; 32]);
+            let pot_kept = hex::encode([0x89u8; 32]);
+            let pot_absent = hex::encode([0x8au8; 32]);
+            let mut minable = std::collections::HashSet::new();
+            for pot in [&pot_held, &pot_kept, &pot_absent] {
+                store
+                    .store_record(&pre406_row(pot, &p, 2500))
+                    .await
+                    .unwrap();
+            }
+            // the discovery pass's bare pointer, then the bytes
+            let (beef, refund, _) =
+                signed_refund_beef(&pot_held, &p, 2500, &[&keys[1], &keys[2]], 900_040);
+            store
+                .mark_spent(&pot_held, 0, &refund, false, None, None, None)
+                .await
+                .unwrap();
+            store.store_beef(&refund, &beef).await.unwrap();
+            minable.insert(refund.clone());
+            // a door-written group for its live pointer: kept as it is
+            let (beef_k, refund_k, _) =
+                signed_refund_beef(&pot_kept, &p, 2500, &[&keys[0], &keys[1]], 900_040);
+            store
+                .mark_spent(
+                    &pot_kept,
+                    0,
+                    &refund_k,
+                    false,
+                    Some(VerdictWrite::bare("refund")),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            store.store_beef(&refund_k, &beef_k).await.unwrap();
+            minable.insert(refund_k.clone());
+            // bytes absent: confirmed bare
+            let (_, refund_a, _) =
+                signed_refund_beef(&pot_absent, &p, 2500, &[&keys[0], &keys[1]], 900_040);
+            store
+                .mark_spent(&pot_absent, 0, &refund_a, false, None, None, None)
+                .await
+                .unwrap();
+            minable.insert(refund_a.clone());
+            let fetcher = MockProofFetcher {
+                minable,
+                ..Default::default()
+            };
+            let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+            assert_eq!((s.scanned, s.confirmed, s.verdicts), (3, 3, 1), "{s:?}");
+            let held = store.get_spent_status(&pot_held, 0).await.unwrap().unwrap();
+            assert!(held.spent_confirmed);
+            assert_eq!(
+                group_of(&held),
+                (Some("refund"), Some(refund.as_str()), Some("tower-b")),
+                "the chase classified the bare pointer from the held bytes: {held:?}"
+            );
+            let kept = store.get_spent_status(&pot_kept, 0).await.unwrap().unwrap();
+            assert_eq!(
+                group_of(&kept),
+                (Some("refund"), Some(refund_k.as_str()), None),
+                "a group keyed to the live pointer is not rewritten (its signers stay the signers backfill's)"
+            );
+            let absent = store
+                .get_spent_status(&pot_absent, 0)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(absent.spent_confirmed);
+            assert_eq!(group_of(&absent), (None, None, None));
+
+            // THE DISPLACEMENT ARM: a parked claim displaced by the mined refund, its verdict from the proven bytes.
+            let pot_d = hex::encode([0x8bu8; 32]);
+            store
+                .store_record(&pre406_row(&pot_d, &p, 2500))
+                .await
+                .unwrap();
+            pot_with_parked_claim(&store, &pot_d, "parkedClaim").await;
+            let (_, actual, raw) =
+                signed_refund_beef(&pot_d, &p, 2500, &[&keys[0], &keys[1]], 900_040);
+            let fetcher = MockProofFetcher {
+                minable: [actual.clone()].into_iter().collect(),
+                spender_hints: [((pot_d.clone(), 0u32), actual.clone())]
+                    .into_iter()
+                    .collect(),
+                binding_raw: [(actual.clone(), raw)].into_iter().collect(),
+                real_bumps: [(actual.clone(), single_tx_bump(&actual, 901_000).to_hex())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let s = complete_spend_confirmations(&store, &fetcher, 20, 0).await;
+            assert_eq!((s.displaced, s.verdicts), (1, 1), "{s:?}");
+            let d = store.get_spent_status(&pot_d, 0).await.unwrap().unwrap();
+            assert_eq!(d.spending_txid.as_deref(), Some(actual.as_str()));
+            assert_eq!(
+                group_of(&d),
+                (Some("refund"), Some(actual.as_str()), Some("coop")),
+                "the displaced-in spender's group, from the proven bytes in hand: {d:?}"
+            );
+        }
+
+        /// (c) THE BACKFILL'S SECOND CANDIDATE SET: the 27-shaped rows of READ-986 (spent, confirmed, a decoded
+        /// covenant, no current verdict, the spender's BEEF held) are latched; a row whose spender bytes are ABSENT
+        /// is not a candidate and never latched; an UNCONFIRMED pointer is not one either; a STALE group (keyed to
+        /// a displaced pointer) is a candidate and is re-keyed to the live spender; a BARE pot and a row holding a
+        /// current group are not candidates. Termination: the next pass finds no candidate. RED on main: the set
+        /// does not exist (`find_spent_unclassified`), the 27-shaped row keeps `(None, None, None)`.
+        #[tokio::test]
+        async fn fix986_c_the_backfill_takes_confirmed_unclassified_covenant_rows_and_never_an_absent_or_unconfirmed_one(
+        ) {
+            let store = MemoryPotStorage::new();
+            let (keys, p) = real_key_params();
+            let mk = |b: u8| hex::encode([b; 32]);
+            let (shaped, absent, unconfirmed, stale, bare, current) =
+                (mk(0x91), mk(0x92), mk(0x93), mk(0x94), mk(0x95), mk(0x96));
+            for pot in [&shaped, &absent, &unconfirmed, &stale, &current] {
+                store
+                    .store_record(&pre406_row(pot, &p, 2500))
+                    .await
+                    .unwrap();
+            }
+            let refund_of =
+                |pot: &str| signed_refund_beef(pot, &p, 2500, &[&keys[0], &keys[1]], 900_040);
+            // (i) the 27-shaped row: discovered bare, confirmed bare, the bytes held
+            let (beef, r_shaped, _) = refund_of(&shaped);
+            store
+                .mark_spent(&shaped, 0, &r_shaped, true, None, Some(900_040), None)
+                .await
+                .unwrap();
+            store.store_beef(&r_shaped, &beef).await.unwrap();
+            // (ii) confirmed, no bytes
+            let (_, r_absent, _) = refund_of(&absent);
+            store
+                .mark_spent(&absent, 0, &r_absent, true, None, Some(900_040), None)
+                .await
+                .unwrap();
+            // (iii) unconfirmed, bytes held
+            let (beef_u, r_unconf, _) = refund_of(&unconfirmed);
+            store
+                .mark_spent(&unconfirmed, 0, &r_unconf, false, None, None, None)
+                .await
+                .unwrap();
+            store.store_beef(&r_unconf, &beef_u).await.unwrap();
+            // (iv) a stale group: the door's `winner-a` keyed to a claim, then the chain's spender confirmed over it
+            let (beef_s, r_stale, _) = refund_of(&stale);
+            store
+                .mark_spent(
+                    &stale,
+                    0,
+                    "parkedClaim",
+                    false,
+                    Some(VerdictWrite::bare("winner-a")),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            store
+                .mark_spent(&stale, 0, &r_stale, true, None, Some(900_041), None)
+                .await
+                .unwrap();
+            store.store_beef(&r_stale, &beef_s).await.unwrap();
+            let s0 = store.get_spent_status(&stale, 0).await.unwrap().unwrap();
+            assert_eq!(
+                group_of(&s0),
+                (Some("winner-a"), Some("parkedClaim"), None),
+                "the premise: a group keyed to the displaced claim"
+            );
+            // (v) a bare 2-of-3 pot, spent, confirmed, bytes held: never a stored verdict
+            let mut bare_lock = vec![0x52];
+            for seed in [0x02u8, 0x03, 0x04] {
+                bare_lock.push(33);
+                bare_lock.extend_from_slice(&[seed; 33]);
+            }
+            bare_lock.push(0x53);
+            bare_lock.push(0xae);
+            store
+                .store_record(&PotRecord {
+                    txid: bare.clone(),
+                    output_index: 0,
+                    params_decoded: true,
+                    lock_kind: Some("bare".into()),
+                    pot_sats: Some(4000),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let (beef_b, r_bare, _) = refund_of(&bare);
+            store
+                .mark_spent(&bare, 0, &r_bare, true, None, Some(900_040), None)
+                .await
+                .unwrap();
+            store.store_beef(&r_bare, &beef_b).await.unwrap();
+            // (vi) a current group
+            let (beef_c, r_cur, _) = refund_of(&current);
+            store
+                .mark_spent(
+                    &current,
+                    0,
+                    &r_cur,
+                    true,
+                    Some(VerdictWrite::bare("refund")),
+                    Some(900_040),
+                    None,
+                )
+                .await
+                .unwrap();
+            store.store_beef(&r_cur, &beef_c).await.unwrap();
+
+            let s = backfill_decoded_params(&store, 20).await;
+            assert_eq!(
+                (
+                    s.scanned,
+                    s.spent_unclassified,
+                    s.spent_classified,
+                    s.verdicts
+                ),
+                (0, 2, 2, 2),
+                "the second set is the shaped row and the stale one: {s:?}"
+            );
+            let r = store.get_spent_status(&shaped, 0).await.unwrap().unwrap();
+            assert_eq!(
+                group_of(&r),
+                (Some("refund"), Some(r_shaped.as_str()), Some("coop")),
+                "the 27-shaped row is latched from its held bytes: {r:?}"
+            );
+            assert!(
+                r.spent_confirmed && r.spent_height == Some(900_040),
+                "nothing else touched"
+            );
+            let r = store.get_spent_status(&stale, 0).await.unwrap().unwrap();
+            assert_eq!(
+                group_of(&r),
+                (Some("refund"), Some(r_stale.as_str()), Some("coop")),
+                "the stale group is re-keyed to the live spender: {r:?}"
+            );
+            for (pot, why) in [
+                (&absent, "no bytes held"),
+                (&unconfirmed, "an unconfirmed pointer"),
+            ] {
+                let r = store.get_spent_status(pot, 0).await.unwrap().unwrap();
+                assert_eq!(group_of(&r), (None, None, None), "{why}: never latched");
+            }
+            let r = store.get_spent_status(&bare, 0).await.unwrap().unwrap();
+            assert_eq!(
+                group_of(&r),
+                (None, None, None),
+                "a bare pot never carries a verdict"
+            );
+            let r = store.get_spent_status(&current, 0).await.unwrap().unwrap();
+            assert_eq!(
+                group_of(&r),
+                (Some("refund"), Some(r_cur.as_str()), None),
+                "a current group is not a candidate"
+            );
+            // TERMINATION: the latched rows leave the set; the absent and unconfirmed ones were never in it.
+            let s2 = backfill_decoded_params(&store, 20).await;
+            assert_eq!((s2.spent_unclassified, s2.verdicts), (0, 0), "{s2:?}");
+            // THE PURE HALF the app layer's differential pin replays: the parse hash-bound to the spender, then the
+            // one classifier; another txid's bytes or a foreign spender classify nothing.
+            let rec = store.get_spent_status(&shaped, 0).await.unwrap().unwrap();
+            let g =
+                classify_stored_spend(&rec, &r_shaped, &beef).expect("the shipped bytes classify");
+            assert_eq!(
+                g.write_concluded(),
+                VerdictWrite {
+                    verdict: "refund",
+                    settle_signers: Some("coop")
+                }
+            );
+            assert_eq!(
+                classify_stored_spend(&rec, &r_absent, &beef),
+                None,
+                "not the named spender's bytes"
+            );
+            assert_eq!(
+                classify_stored_spend(&rec, &r_shaped, &beef_u),
+                None,
+                "another spend's bytes"
+            );
+        }
     }
 }

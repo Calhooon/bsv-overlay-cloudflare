@@ -100,6 +100,7 @@ pub mod lowfund_topic_manager;
 pub mod released_evidence;
 pub mod reorg;
 pub mod spend_signers;
+pub mod spend_verdict;
 pub mod storage;
 pub mod topic_manager;
 
@@ -113,6 +114,9 @@ pub use covenant::{
     TEMPLATE_RAKE_DIVISOR,
 };
 pub use spend_signers::{classify_spend_signers, settle_signers_for_spend, SettleSigners};
+// bsv-low #986 (FIX-986): the ONE classifier of a spend into its verdict group, shared by the door's hook, the
+// discovery and confirmation passes and the janitor's backfill.
+pub use spend_verdict::{classify_pot_spend_tx, classify_record_spend, SpendVerdict};
 // bsv-low #468: the one payout measure, shared by the live `outputSpent` hook and the historic backfill.
 pub use lookup_service::spend_payouts;
 

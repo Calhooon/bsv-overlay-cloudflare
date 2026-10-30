@@ -643,7 +643,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// first two and the column: deploy the overlay first (its certified count at 473), then the app layer.
 /// 473 to 474 for bsv-low #986 (FIX-986-COMPARE-2): `owed_actor_compare`, the app layer's standing fresh compare of
 /// each owed actor (its ring writes it, `/health/invariants.owedActor.fleetCompare` reads it): the overlay first.
-pub const OVERLAY_MIGRATION_COUNT: usize = 474;
+/// 474 to 475 for bsv-low #986 (FIX-986): `idx_pot_spent_unclassified`, the partial index of the params
+/// backfill's second verdict candidate set (`d1_discovery::spent_unclassified_candidates_sql`). Index only.
+pub const OVERLAY_MIGRATION_COUNT: usize = 475;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2468,6 +2470,14 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // 474: bsv-low #986 (FIX-986-COMPARE-2, READ-986 item 4): the app layer's standing compare of each owed actor
     // against a fresh D1 judgement, one row per identity.
     crate::owed_events::ACTOR_COMPARE_CREATE,
+    // 475: bsv-low #986 (READ-986 item 2(b), FIX-986): the janitor's second verdict
+    // candidate scan (`spent_unclassified_candidates_sql`) reads the spent
+    // covenant pots carrying no CURRENT verdict through this partial index
+    // (its WHERE is `SPENT_UNCLASSIFIED_INDEX_PREDICATE`, repeated verbatim by
+    // the scan), never the table: the set is the unclassified backlog (123
+    // rows on beta at the fold) and drains as the scan latches each row's
+    // verdict group from its spender's held BEEF. Additive; `IF NOT EXISTS`.
+    "CREATE INDEX IF NOT EXISTS idx_pot_spent_unclassified ON pot_records(spentConfirmed) WHERE spent = 1 AND lockKind = 'covenant' AND (verdict IS NULL OR verdictTxid IS NOT spendingTxid)",
 ];
 
 // =============================================================================

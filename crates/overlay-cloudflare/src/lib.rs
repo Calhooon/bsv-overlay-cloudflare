@@ -1788,6 +1788,12 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
     answer["pot_block_time_stamped"] = serde_json::json!(ps.block_time_stamped);
     answer["pot_block_time_held"] = serde_json::json!(ps.block_time_held);
     answer["tx_early_gasp"] = serde_json::json!(tx_early_gasp);
+    // bsv-low #986 (FIX-986): the verdict groups the chase and the displacement latched onto rows that carried
+    // none for their live pointer, and the backfill's second candidate set (spent, confirmed, decoded covenant
+    // rows with no current verdict whose spender BEEF is held) looked at this tick and those it latched.
+    answer["spends_verdicts"] = serde_json::json!(ss.verdicts);
+    answer["params_spent_unclassified"] = serde_json::json!(bf.spent_unclassified);
+    answer["params_spent_classified"] = serde_json::json!(bf.spent_classified);
     // bsv-low #649 D3-H1: the shared parked drain's pass (`null`: no app layer configured, nothing read); set apart
     // from the literal above, which sits at `json!`'s recursion limit.
     answer["change_parked"] = change_parked.unwrap_or(serde_json::Value::Null);
