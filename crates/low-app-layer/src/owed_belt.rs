@@ -1415,20 +1415,29 @@ pub async fn arm(env: &worker::Env) -> worker::Result<()> {
     Ok(())
 }
 
-/// FIX-986 (READ-986 item 4): the fleet compare's ring actor (`owed_actor::compare::FLEET_COMPARE_ACTOR`) asked to
-/// keep its alarm, as [`arm`] asks the belt's.
+/// FIX-986 (READ-986 item 4): the fleet compare's ring actors (`owed_actor::compare::shard_actor_name`, one a shard,
+/// FIX-998) asked to keep their alarms, as [`arm`] asks the belt's; every shard asked, the first refusal named.
 pub async fn arm_fleet_compare(env: &worker::Env) -> worker::Result<()> {
-    let stub = env
-        .durable_object("BOARD_VIEW")?
-        .id_from_name(crate::owed_actor::compare::FLEET_COMPARE_ACTOR)?
-        .get_stub()?;
-    let response = stub
-        .fetch_with_str("https://board-view/owed-fleet-compare-arm")
-        .await?;
-    if response.status_code() != 200 {
-        return Err(worker::Error::RustError(
-            "owed fleet compare arm refused".into(),
-        ));
+    let shards = crate::owed_actor::compare::shards_env(env);
+    let ns = env.durable_object("BOARD_VIEW")?;
+    let mut refused = Vec::new();
+    for k in 0..shards {
+        let stub = ns
+            .id_from_name(&crate::owed_actor::compare::shard_actor_name(k))?
+            .get_stub()?;
+        let response = stub
+            .fetch_with_str(&format!(
+                "https://board-view/owed-fleet-compare-arm?shard={k}"
+            ))
+            .await?;
+        if response.status_code() != 200 {
+            refused.push(k);
+        }
+    }
+    if !refused.is_empty() {
+        return Err(worker::Error::RustError(format!(
+            "owed fleet compare arm refused for shards {refused:?}"
+        )));
     }
     Ok(())
 }

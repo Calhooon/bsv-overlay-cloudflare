@@ -26,10 +26,15 @@ for (const method of ['GET', 'POST']) {
   const refused = await fetch(`${base}/internal/owed-actor-compare`, { method, body: method === 'POST' ? '{}' : undefined })
   assert.equal(refused.status, 401, `${method}: the lever is bearer-gated`)
 }
-const tick = await call('POST', { tick: true })
-console.log('owed-fleet-compare-tick', JSON.stringify({ ...tick.cost, report: tick.body }))
-assert.ok(tick.body.compared >= 1, 'the ring compared')
-assert.ok(tick.body.statements <= 800, `the tick's own budget: ${tick.body.statements}`)
+// FIX-998 (bsv-low #998): the ring runs in shards, each its own actor's tick (its own invocation); one tick of each
+// shard, the cell's cost the heaviest shard's tick.
+const first = await call('POST', { tick: true, shard: 0 })
+const ticks = [first]
+for (let shard = 1; shard < (first.body.shards ?? 1); shard++) ticks.push(await call('POST', { tick: true, shard }))
+const tick = ticks.reduce((a, b) => (b.cost.reads > a.cost.reads ? b : a))
+console.log('owed-fleet-compare-tick', JSON.stringify({ ...tick.cost, shards: ticks.map((t) => t.body) }))
+assert.ok(ticks.reduce((n, t) => n + t.body.compared, 0) >= 1, 'the ring compared')
+for (const t of ticks) assert.ok(t.body.statements <= 800, `the tick's own budget: ${t.body.statements}`)
 const one = await call('POST', { identity: seat })
 console.log('owed-fleet-compare-one', JSON.stringify({ ...one.cost, partial: one.body.partial, fault: one.body.fault }))
 assert.equal(one.body.identity, seat)

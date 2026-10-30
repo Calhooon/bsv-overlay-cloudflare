@@ -361,15 +361,32 @@ pub fn upsert_stmt(row: &CompareRow) -> Stmt {
 // ---------------------------------------------------------------------------------------------------------------------
 // The scheduled ring (READ-986 item 4).
 
-/// The ring's driver: a `BOARD_VIEW` actor of its own (this name), whose alarm is the ring's tick every
-/// [`FLEET_COMPARE_TICK_MS`], armed by every cron as the belt is (`owed_belt::arm`'s watchdog). Its own Durable
-/// Object invocation, so the tick's D1 statements never share the belt alarm's per-invocation bound.
+/// The ring's driver: `BOARD_VIEW` actors of its own, one a SHARD ([`shard_actor_name`]: shard 0 keeps this name, so
+/// the actor PR 241 armed is shard 0), whose alarm is the shard's tick every [`FLEET_COMPARE_TICK_MS`], armed by every
+/// cron as the belt is (`owed_belt::arm`'s watchdog). Each its own Durable Object invocation, so a tick's D1 statements
+/// never share the belt alarm's per-invocation bound, nor another shard's.
+///
+/// FIX-998 (bsv-low #998): beta's ticks compared 1 to 4 identities each (stopped on the wall or the statements), a
+/// revolution over 153 identities in about 65 minutes. One fresh compare of the fleet fixture's weight is about 505
+/// statements (`fix986c2_e`), so ONE invocation holds ONE such compare under the 800-statement budget and D1's 1,000:
+/// a revolution of 153 needs about 153 invocations whatever the per-tick count says. The ring now runs
+/// [`FLEET_COMPARE_SHARDS`] shards (the identity space split by its first byte past the key's `02`/`03` prefix,
+/// [`shard_segments`]), each ticking every 10 s under an 8 s wall: 4 x 60 = 240 invocations in ten minutes, a
+/// revolution of 153 fixture-weight seats (553 statements each) in 48 ticks, 480 s (`fix998_a`; 24 ticks at beta's
+/// 250). A shard that wraps RESTS until [`FLEET_COMPARE_REVOLUTION_FLOOR_MS`] after its revolution began, so the
+/// ring compares the fleet once about every nine minutes, never faster, whatever its speed: the D1 cost is one fresh
+/// compare an identity a revolution, as the brief's ten minutes assumed (the shards and the short tick buy the speed,
+/// never more revolutions).
 pub const FLEET_COMPARE_ACTOR: &str = "owed-fleet-compare";
-pub const FLEET_COMPARE_TICK_MS: i64 = 60_000;
-/// The identities one tick compares by default (the render var [`PER_TICK_VAR`] sets another, 0 pauses the ring, at
-/// most [`FLEET_COMPARE_PER_TICK_MAX`]): beta's 153 in ten ticks, ten minutes, when the tick's statement budget holds
-/// sixteen; a tick of heavy seats stops sooner on [`FLEET_COMPARE_STATEMENTS_PER_TICK`] and the revolution takes longer
-/// (a seat of the fleet fixture's weight, about 500 statements, is one a tick).
+pub const FLEET_COMPARE_TICK_MS: i64 = 10_000;
+/// The shards by default (the render var [`SHARDS_VAR`] sets another, 1 to [`FLEET_COMPARE_SHARDS_MAX`]).
+pub const FLEET_COMPARE_SHARDS: usize = 4;
+pub const FLEET_COMPARE_SHARDS_MAX: usize = 16;
+pub const SHARDS_VAR: &str = "OWED_FLEET_COMPARE_SHARDS";
+/// A shard that wrapped compares nothing until this long after its revolution began.
+pub const FLEET_COMPARE_REVOLUTION_FLOOR_MS: i64 = 540_000;
+/// The identities one shard's tick compares at most (the render var [`PER_TICK_VAR`] sets another, 0 pauses the ring,
+/// at most [`FLEET_COMPARE_PER_TICK_MAX`]); the statement budget and the wall stop a tick of heavy seats sooner.
 pub const FLEET_COMPARE_PER_TICK: usize = 16;
 pub const FLEET_COMPARE_PER_TICK_MAX: usize = 64;
 pub const PER_TICK_VAR: &str = "OWED_FLEET_COMPARE_PER_TICK";
@@ -377,20 +394,125 @@ pub const PER_TICK_VAR: &str = "OWED_FLEET_COMPARE_PER_TICK";
 /// this tick (at least [`FLEET_COMPARE_IDENTITY_RESERVE`]) would pass it. D1's per-invocation bound is 1,000.
 pub const FLEET_COMPARE_STATEMENTS_PER_TICK: usize = 800;
 pub const FLEET_COMPARE_IDENTITY_RESERVE: usize = 80;
-/// The tick's wall: no identity is started past it.
-pub const FLEET_COMPARE_WALL_MS: u64 = 20_000;
-/// The ring's place in the belt's ledger: `{after, revolution, revolutionStartedAtMs, lastRevolutionMs, lastTickAt}`.
+/// The tick's wall: no identity is started past it (under the tick, so a tick usually ends before its next alarm).
+pub const FLEET_COMPARE_WALL_MS: u64 = 8_000;
+/// The ring's place in the belt's ledger, one row a shard ([`ring_state_name`]): `{after, revolution,
+/// revolutionStartedAtMs, lastRevolutionMs, lastTickAt, restUntilMs}`. One shard keeps PR 241's name.
 pub const RING_NAME: &str = "fleet-compare:ring";
-pub const RING_READ_SQL: &str =
-    "SELECT cursor FROM owed_belt_state WHERE name='fleet-compare:ring'";
-/// The ring's identities: the set `GET /internal/owed-actor-identities` pages (every identity of `owed_state`, a party, a
-/// hop marker or a released hop's evidence), `?2` of them past `?1` in key order, walked by SEEKS: each step the least of
-/// four `MIN(identity)` seeks past the last (the reconcile's `RECONCILE_NEXT_SQL`, on `owed_state`'s key and the three
-/// identity indexes), so a tick reads about four index entries an identity, never the union (the budget tier measured
-/// the union's page at 551 rows on its small seed).
-pub const RING_IDENTITIES_SQL: &str = "WITH RECURSIVE walk(identity,n) AS (SELECT (SELECT MIN(i) FROM (SELECT (SELECT MIN(identity) FROM owed_state WHERE identity>?1) AS i UNION ALL SELECT (SELECT MIN(identity) FROM potparty_records WHERE identity>?1) UNION ALL SELECT (SELECT MIN(identity) FROM hopparty_records WHERE identity>?1) UNION ALL SELECT (SELECT MIN(identity) FROM released_hop_evidence WHERE identity>?1))),1 UNION ALL SELECT (SELECT MIN(i) FROM (SELECT (SELECT MIN(identity) FROM owed_state WHERE identity>walk.identity) AS i UNION ALL SELECT (SELECT MIN(identity) FROM potparty_records WHERE identity>walk.identity) UNION ALL SELECT (SELECT MIN(identity) FROM hopparty_records WHERE identity>walk.identity) UNION ALL SELECT (SELECT MIN(identity) FROM released_hop_evidence WHERE identity>walk.identity))),n+1 FROM walk WHERE walk.identity IS NOT NULL AND n<?2) SELECT identity FROM walk WHERE identity IS NOT NULL";
-/// At the end of a revolution, the rows of identities it did not compare (gone from the list) are dropped.
-pub const RING_PRUNE_SQL: &str = "DELETE FROM owed_actor_compare WHERE comparedAtMs<?1";
+pub const RING_READ_SQL: &str = "SELECT cursor FROM owed_belt_state WHERE name=?1";
+/// Every shard's row, one range of the ledger's key.
+pub const RING_SHARDS_READ_SQL: &str = "SELECT name,cursor FROM owed_belt_state WHERE name>='fleet-compare:ring' AND name<'fleet-compare:rinh' ORDER BY name";
+/// The ring's identities: the set `GET /internal/owed-actor-identities` pages (every identity of `owed_state`, a party,
+/// a hop marker or a released hop's evidence), `?2` of them past `?1` and at most `?3` in key order, walked by SEEKS:
+/// each step the least of four `MIN(identity)` seeks past the last (the reconcile's `RECONCILE_NEXT_SQL`, on
+/// `owed_state`'s key and the three identity indexes), so a tick reads about four index entries an identity, never the
+/// union (the budget tier measured the union's page at 551 rows on its small seed). `?3` closes a shard's segment.
+pub const RING_IDENTITIES_SQL: &str = "WITH RECURSIVE walk(identity,n) AS (SELECT (SELECT MIN(i) FROM (SELECT (SELECT MIN(identity) FROM owed_state WHERE identity>?1 AND identity<=?3) AS i UNION ALL SELECT (SELECT MIN(identity) FROM potparty_records WHERE identity>?1 AND identity<=?3) UNION ALL SELECT (SELECT MIN(identity) FROM hopparty_records WHERE identity>?1 AND identity<=?3) UNION ALL SELECT (SELECT MIN(identity) FROM released_hop_evidence WHERE identity>?1 AND identity<=?3))),1 UNION ALL SELECT (SELECT MIN(i) FROM (SELECT (SELECT MIN(identity) FROM owed_state WHERE identity>walk.identity AND identity<=?3) AS i UNION ALL SELECT (SELECT MIN(identity) FROM potparty_records WHERE identity>walk.identity AND identity<=?3) UNION ALL SELECT (SELECT MIN(identity) FROM hopparty_records WHERE identity>walk.identity AND identity<=?3) UNION ALL SELECT (SELECT MIN(identity) FROM released_hop_evidence WHERE identity>walk.identity AND identity<=?3))),n+1 FROM walk WHERE walk.identity IS NOT NULL AND n<?2) SELECT identity FROM walk WHERE identity IS NOT NULL";
+/// At the end of a shard's revolution, the rows of its identities it did not compare (gone from the list) are dropped:
+/// its two segments, `(?2, ?3]` and `(?4, ?5]`.
+pub const RING_PRUNE_SQL: &str = "DELETE FROM owed_actor_compare WHERE comparedAtMs<?1 AND ((identity>?2 AND identity<=?3) OR (identity>?4 AND identity<=?5))";
+/// The key past every identity: the last segment's upper bound.
+pub const RING_KEY_END: &str = "\u{10FFFF}";
+
+/// The shard count from the render var: unset or unreadable the default, clamped to 1 ..= [`FLEET_COMPARE_SHARDS_MAX`].
+pub fn shards_of(var: Option<&str>) -> usize {
+    var.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(FLEET_COMPARE_SHARDS)
+        .clamp(1, FLEET_COMPARE_SHARDS_MAX)
+}
+
+/// The render's shard count ([`SHARDS_VAR`], [`shards_of`]).
+pub fn shards_env(env: &worker::Env) -> usize {
+    shards_of(env.var(SHARDS_VAR).ok().map(|v| v.to_string()).as_deref())
+}
+
+/// The Durable Object name of shard `k` (shard 0 keeps [`FLEET_COMPARE_ACTOR`]).
+pub fn shard_actor_name(k: usize) -> String {
+    if k == 0 {
+        FLEET_COMPARE_ACTOR.to_string()
+    } else {
+        format!("{FLEET_COMPARE_ACTOR}:{k}")
+    }
+}
+
+/// The ledger row of shard `k` of `n` (one shard keeps [`RING_NAME`], PR 241's row).
+pub fn ring_state_name(k: usize, n: usize) -> String {
+    if n <= 1 {
+        RING_NAME.to_string()
+    } else {
+        format!("{RING_NAME}:{k}/{n}")
+    }
+}
+
+/// PURE: the key segments of shard `k` of `n`, each `(lo, hi]` in key order. The key space is cut at `2n` bounds: the
+/// `02` keys at `02xx` for `xx` = `j * 256 / n`, the `03` keys likewise, so a compressed key's shard is its first byte
+/// past the prefix (uniform: an x coordinate's first byte); segment `j` goes to shard `j mod n`, so each shard owns one
+/// `02` segment and one `03` segment, and a key outside them (below `02`, past `03ff`) falls in the first or the last.
+/// Every key is in exactly one segment.
+pub fn shard_segments(k: usize, n: usize) -> [(String, String); 2] {
+    let n = n.max(1);
+    let bound = |j: usize| -> String {
+        if j == 0 {
+            String::new()
+        } else if j == n {
+            "03".to_string()
+        } else if j == 2 * n {
+            RING_KEY_END.to_string()
+        } else if j < n {
+            format!("02{:02x}", j * 256 / n)
+        } else {
+            format!("03{:02x}", (j - n) * 256 / n)
+        }
+    };
+    [(bound(k), bound(k + 1)), (bound(k + n), bound(k + n + 1))]
+}
+
+/// PURE: the fleet's ring from its shards' rows (`name`, parsed `cursor`), as the route serves it: `revolution` the
+/// least of the shards' (a revolution completes when every shard has wrapped; 0 while a shard has a row missing),
+/// `lastRevolutionMs` the longest of the shards' last revolutions (null until every shard has one), `lastTickAt` the
+/// latest, `ringCursor` shard 0's cursor, and each shard's own under `shards`. One shard is PR 241's ring unchanged.
+pub fn fleet_ring(rows: &[(String, Value)], n: usize) -> Value {
+    let n = n.max(1);
+    let shards: Vec<Value> = (0..n)
+        .map(|k| {
+            let name = ring_state_name(k, n);
+            rows.iter()
+                .find(|(r, _)| *r == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Value::Null)
+        })
+        .collect();
+    let all = shards.iter().all(Value::is_object);
+    let revolution = if all {
+        shards
+            .iter()
+            .map(|s| s["revolution"].as_i64().unwrap_or(0))
+            .min()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let last: Option<Vec<i64>> = shards
+        .iter()
+        .map(|s| s["lastRevolutionMs"].as_i64())
+        .collect();
+    let last_tick = shards.iter().filter_map(|s| s["lastTickAt"].as_i64()).max();
+    json!({
+        "after": shards[0]["after"],
+        "revolution": revolution,
+        "lastRevolutionMs": last.and_then(|l| l.into_iter().max()),
+        "lastTickAt": last_tick,
+        "shardCount": n,
+        "shards": shards.iter().enumerate().map(|(k, s)| json!({
+            "shard": k,
+            "after": s["after"],
+            "revolution": s["revolution"],
+            "lastRevolutionMs": s["lastRevolutionMs"],
+            "lastTickAt": s["lastTickAt"],
+            "restUntilMs": s["restUntilMs"],
+        })).collect::<Vec<_>>(),
+    })
+}
 
 /// The per-tick setting from the render var: unset or unreadable the default, clamped to
 /// [`FLEET_COMPARE_PER_TICK_MAX`].
@@ -505,22 +627,62 @@ pub struct RingReport {
     pub stopped: Option<&'static str>,
 }
 
-/// THE RING'S TICK (READ-986 item 4): up to `per_tick` identities past the ring's cursor (the identities list, in key
-/// order), each through [`fresh_compare`], each row written WITH the cursor in one batch (so a tick the platform ends
-/// resumes after the last identity written); stopped before an identity the tick's statement budget or wall would not
-/// hold. A short page wraps the ring (`revolution` + 1) and drops the rows the revolution did not refresh. The Phase C
-/// flip is observed here (`owed-actor:phase-c`): the D1 judge seen off with no open period opens one at `now`, seen on
-/// with one open closes it. `elapsed` reads the tick's wall.
+/// One identity's compare as the ring makes it: production's is [`FreshCompare`] ([`compare_one`]); a pin gives the
+/// ring a compare of a measured weight (`fix998_a`) so it counts the ring's own ticks, budgets and cursors.
+pub(crate) trait RingCompare {
+    async fn compare<J: JudgeDb>(&self, m: &Metered<'_, J>, identity: &str, now: i64)
+        -> CompareRow;
+}
+/// The ring's compare in production: [`compare_one`].
+pub(crate) struct FreshCompare;
+impl RingCompare for FreshCompare {
+    async fn compare<J: JudgeDb>(
+        &self,
+        m: &Metered<'_, J>,
+        identity: &str,
+        now: i64,
+    ) -> CompareRow {
+        compare_one(m, identity, now).await.0
+    }
+}
+
+/// THE RING'S TICK (READ-986 item 4; FIX-998's shards): one tick of shard `shard` of `shards` ([`ring_tick_with`] over
+/// [`FreshCompare`]).
 pub async fn ring_tick(
     db: &impl JudgeDb,
     now: i64,
+    shard: usize,
+    shards: usize,
     per_tick: usize,
     elapsed: impl Fn() -> u64,
 ) -> Result<RingReport, String> {
+    ring_tick_with(db, now, shard, shards, per_tick, elapsed, &FreshCompare).await
+}
+
+/// One shard's tick: up to `per_tick` identities of the shard's segments ([`shard_segments`]) past its cursor (the
+/// identities list, in key order), each compared, each row written WITH the cursor in one batch (so a tick the platform
+/// ends resumes after the last identity written); stopped before an identity the tick's statement budget or wall would
+/// not hold. A short page past the shard's last segment wraps it (`revolution` + 1), drops the rows of its segments the
+/// revolution did not refresh, and RESTS it until [`FLEET_COMPARE_REVOLUTION_FLOOR_MS`] after the revolution began
+/// (`restUntilMs`; a resting tick compares nothing, `stopped` "resting"). The Phase C flip is observed here
+/// (`owed-actor:phase-c`): the D1 judge seen off with no open period opens one at `now`, seen on with one open closes
+/// it. `elapsed` reads the tick's wall.
+pub(crate) async fn ring_tick_with<J: JudgeDb>(
+    db: &J,
+    now: i64,
+    shard: usize,
+    shards: usize,
+    per_tick: usize,
+    elapsed: impl Fn() -> u64,
+    comparer: &impl RingCompare,
+) -> Result<RingReport, String> {
+    let shards = shards.max(1);
+    let name = ring_state_name(shard, shards);
+    let segments = shard_segments(shard, shards);
     let m = Metered::new(db);
     let mut read = m
         .run_batch(vec![
-            Stmt::new(RING_READ_SQL, vec![]),
+            Stmt::new(RING_READ_SQL, vec![Bind::Text(name.clone())]),
             Stmt::new(PHASE_C_READ_SQL, vec![]),
         ])
         .await?
@@ -565,26 +727,62 @@ pub async fn ring_tick(
     }
     let mut report = RingReport::default();
     ring["lastTickAt"] = json!(now);
-    if per_tick == 0 {
-        report.stopped = Some("paused");
-        m.run_batch(vec![state(RING_NAME, &ring)]).await?;
+    let rest_until = ring["restUntilMs"].as_i64();
+    if per_tick == 0 || rest_until.is_some_and(|r| now < r) {
+        report.stopped = Some(if per_tick == 0 { "paused" } else { "resting" });
+        m.run_batch(vec![state(&name, &ring)]).await?;
         report.statements = m.statements.get();
+        report.cursor = ring["after"].as_str().unwrap_or_default().to_string();
         return Ok(report);
     }
+    if let Some(r) = rest_until {
+        // The rest is over: the next revolution begins at its end.
+        ring.as_object_mut().map(|o| o.remove("restUntilMs"));
+        ring["revolutionStartedAtMs"] = json!(r);
+    }
     let after = ring["after"].as_str().unwrap_or_default().to_string();
-    let ids: Vec<String> = m
-        .run_batch(vec![Stmt::new(
-            RING_IDENTITIES_SQL,
-            vec![Bind::Text(after.clone()), Bind::Int(per_tick as i64)],
-        )])
-        .await?
-        .into_iter()
-        .next()
-        .map(|o| o.rows)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|r| r["identity"].as_str().map(str::to_string))
-        .collect();
+    // The segment the cursor is in (a cursor in none, the shard's start).
+    let first = if after.is_empty() {
+        0
+    } else {
+        segments
+            .iter()
+            .position(|(lo, hi)| after.as_str() > lo.as_str() && after.as_str() <= hi.as_str())
+            .unwrap_or(0)
+    };
+    let mut ids: Vec<String> = Vec::new();
+    let mut exhausted = false;
+    for (j, (lo, hi)) in segments.iter().enumerate().skip(first) {
+        let from = if j == first && !after.is_empty() {
+            after.clone()
+        } else {
+            lo.clone()
+        };
+        let need = per_tick - ids.len();
+        let page: Vec<String> = m
+            .run_batch(vec![Stmt::new(
+                RING_IDENTITIES_SQL,
+                vec![
+                    Bind::Text(from),
+                    Bind::Int(need as i64),
+                    Bind::Text(hi.clone()),
+                ],
+            )])
+            .await?
+            .into_iter()
+            .next()
+            .map(|o| o.rows)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| r["identity"].as_str().map(str::to_string))
+            .collect();
+        let short = page.len() < need;
+        ids.extend(page);
+        if !short {
+            break;
+        }
+        exhausted = j + 1 == segments.len();
+    }
     let mut cursor = after;
     let mut largest = FLEET_COMPARE_IDENTITY_RESERVE;
     let mut all_done = true;
@@ -605,7 +803,7 @@ pub async fn ring_tick(
             cursor = id.clone();
             continue;
         }
-        let (row, _) = compare_one(&m, id, now).await;
+        let row = comparer.compare(&m, id, now).await;
         if row.diff_count.is_some_and(|n| n > 0) {
             report.diffs += 1;
         }
@@ -614,24 +812,38 @@ pub async fn ring_tick(
         }
         cursor = id.clone();
         ring["after"] = json!(cursor);
-        m.run_batch(vec![upsert_stmt(&row), state(RING_NAME, &ring)])
+        m.run_batch(vec![upsert_stmt(&row), state(&name, &ring)])
             .await?;
         largest = largest.max(m.statements.get() - used);
         report.compared.push(id.clone());
     }
     let mut end = Vec::new();
-    if all_done && ids.len() < per_tick {
-        // The revolution's end: wrap, and drop what it did not refresh.
+    if all_done && exhausted {
+        // The shard's revolution's end: wrap, drop what it did not refresh, rest.
         report.wrapped = true;
         let started = ring["revolutionStartedAtMs"].as_i64().unwrap_or(now);
-        end.push(Stmt::new(RING_PRUNE_SQL, vec![Bind::Int(started)]));
+        let [(lo0, hi0), (lo1, hi1)] = segments;
+        end.push(Stmt::new(
+            RING_PRUNE_SQL,
+            vec![
+                Bind::Int(started),
+                Bind::Text(lo0),
+                Bind::Text(hi0),
+                Bind::Text(lo1),
+                Bind::Text(hi1),
+            ],
+        ));
         cursor = String::new();
         ring["revolution"] = json!(ring["revolution"].as_i64().unwrap_or(0) + 1);
         ring["lastRevolutionMs"] = json!(now - started);
-        ring["revolutionStartedAtMs"] = json!(now);
+        let rest = started + FLEET_COMPARE_REVOLUTION_FLOOR_MS;
+        if rest > now {
+            ring["restUntilMs"] = json!(rest);
+        }
+        ring["revolutionStartedAtMs"] = json!(rest.max(now));
     }
     ring["after"] = json!(cursor);
-    end.push(state(RING_NAME, &ring));
+    end.push(state(&name, &ring));
     m.run_batch(end).await?;
     report.cursor = cursor;
     report.statements = m.statements.get();
@@ -718,6 +930,8 @@ pub fn compare_answer(
         "revolution": ring["revolution"],
         "lastRevolutionMs": ring["lastRevolutionMs"],
         "lastTickAt": ring["lastTickAt"],
+        "shardCount": ring["shardCount"],
+        "shards": ring["shards"],
         "next": next,
     });
     if narrowed {
@@ -742,6 +956,7 @@ pub async fn read_answer(
     after: &str,
     identity: &str,
     now: i64,
+    shards: usize,
 ) -> Result<Value, String> {
     let mut out = db
         .run_batch(vec![
@@ -754,7 +969,7 @@ pub async fn read_answer(
                     Bind::Text(identity.to_string()),
                 ],
             ),
-            Stmt::new(RING_READ_SQL, vec![]),
+            Stmt::new(RING_SHARDS_READ_SQL, vec![]),
         ])
         .await?
         .into_iter();
@@ -763,15 +978,19 @@ pub async fn read_answer(
         .and_then(|o| o.rows.into_iter().next())
         .unwrap_or_default();
     let page = out.next().map(|o| o.rows).unwrap_or_default();
-    let ring = out
+    let rows: Vec<(String, Value)> = out
         .next()
-        .and_then(|o| o.rows.into_iter().next())
-        .and_then(|r| {
-            r["cursor"]
+        .map(|o| o.rows)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            let cursor = r["cursor"]
                 .as_str()
-                .and_then(|c| serde_json::from_str(c).ok())
+                .and_then(|c| serde_json::from_str(c).ok())?;
+            Some((r["name"].as_str()?.to_string(), cursor))
         })
-        .unwrap_or(Value::Null);
+        .collect();
+    let ring = fleet_ring(&rows, shards);
     Ok(compare_answer(
         &summary,
         &page,

@@ -11771,7 +11771,7 @@ async fn fix986c2_b_the_ring_covers_every_identity_once_a_revolution_and_resumes
     let mut now = NOW_MS as i64;
     let mut ticks = Vec::new();
     loop {
-        let r = compare::ring_tick(&port, now, 3, || 0).await.unwrap();
+        let r = compare::ring_tick(&port, now, 0, 1, 3, || 0).await.unwrap();
         assert!(
             r.statements <= compare::FLEET_COMPARE_STATEMENTS_PER_TICK,
             "{r:?}"
@@ -11816,6 +11816,13 @@ async fn fix986c2_b_the_ring_covers_every_identity_once_a_revolution_and_resumes
         "the flip observed once, at the first tick"
     );
     assert!(phase_c["endedAtMs"].is_null());
+    // FIX-998: the wrapped ring rests until its floor after the revolution began; a tick inside it compares nothing.
+    let resting = compare::ring_tick(&port, now, 0, 1, 3, || 0).await.unwrap();
+    assert!(
+        resting.compared.is_empty() && resting.stopped == Some("resting"),
+        "{resting:?}"
+    );
+    now = NOW_MS as i64 + compare::FLEET_COMPARE_REVOLUTION_FLOOR_MS;
     // A tick the platform ends: its first read and two identities land (each identity: the compare's reads and its
     // row with the cursor), then the record faults.
     let per_identity = {
@@ -11825,10 +11832,10 @@ async fn fix986c2_b_the_ring_covers_every_identity_once_a_revolution_and_resumes
         d1.batches.get() - before + 1
     };
     port.die_after.set(2 + 2 * per_identity);
-    let dead = compare::ring_tick(&port, now, 3, || 0).await;
+    let dead = compare::ring_tick(&port, now, 0, 1, 3, || 0).await;
     assert!(dead.is_err(), "the platform ended the tick");
     port.die_after.set(u32::MAX);
-    let r = compare::ring_tick(&port, now + 60_000, 3, || 0)
+    let r = compare::ring_tick(&port, now + 60_000, 0, 1, 3, || 0)
         .await
         .unwrap();
     assert_eq!(
@@ -11837,12 +11844,12 @@ async fn fix986c2_b_the_ring_covers_every_identity_once_a_revolution_and_resumes
         "the next tick resumes after the last identity written: {r:?}"
     );
     // Paused: nothing compared, the cursor held.
-    let paused = compare::ring_tick(&port, now + 120_000, 0, || 0)
+    let paused = compare::ring_tick(&port, now + 120_000, 0, 1, 0, || 0)
         .await
         .unwrap();
     assert!(paused.compared.is_empty() && paused.stopped == Some("paused"));
     // The wall: no identity started past it.
-    let walled = compare::ring_tick(&port, now + 180_000, 3, || {
+    let walled = compare::ring_tick(&port, now + 180_000, 0, 1, 3, || {
         compare::FLEET_COMPARE_WALL_MS + 1
     })
     .await
@@ -11859,7 +11866,7 @@ async fn fix986c2_b_the_ring_covers_every_identity_once_a_revolution_and_resumes
     let mut t = now + 240_000;
     let mut wraps = 0;
     while wraps < 2 {
-        let r = compare::ring_tick(&port, t, 3, || 0).await.unwrap();
+        let r = compare::ring_tick(&port, t, 0, 1, 3, || 0).await.unwrap();
         wraps += usize::from(r.wrapped);
         t += 60_000;
     }
@@ -11870,7 +11877,7 @@ async fn fix986c2_b_the_ring_covers_every_identity_once_a_revolution_and_resumes
     assert_eq!(fix986_compared(&d1).len(), 6);
     // The D1 judge seen on again closes the flip.
     port.judges = true;
-    compare::ring_tick(&port, t, 3, || 0).await.unwrap();
+    compare::ring_tick(&port, t, 0, 1, 3, || 0).await.unwrap();
     let phase_c: Value = serde_json::from_str(
         &d1.conn
             .query_row(
@@ -11890,7 +11897,7 @@ async fn fix986c2_b_the_ring_covers_every_identity_once_a_revolution_and_resumes
         .find("storage.set_alarm(crate::owed_actor::compare::FLEET_COMPARE_TICK_MS).await?;")
         .unwrap();
     let tick = alarm
-        .find("returncrate::owed_actor::object::fleet_compare_tick_env(&self.env).await;")
+        .find("returncrate::owed_actor::object::fleet_compare_tick_env(&self.env,shard).await;")
         .unwrap();
     assert!(rearm < tick, "re-armed before the tick runs");
     assert!(board.contains("req.path()==\"/owed-fleet-compare-arm\""));
@@ -11938,7 +11945,7 @@ async fn fix986c2_c_the_rings_row_is_the_routes_compare() {
         route["diffFields"][0]["fields"]["sats"],
         json!({"d1": 20190, "actor": 20191})
     );
-    let r = compare::ring_tick(&port, NOW_MS as i64, 16, || 0)
+    let r = compare::ring_tick(&port, NOW_MS as i64, 0, 1, 16, || 0)
         .await
         .unwrap();
     assert_eq!(r.diffs, 1, "{r:?}");
@@ -11966,7 +11973,7 @@ async fn fix986c2_c_the_rings_row_is_the_routes_compare() {
         .unwrap();
     assert_eq!(posted["outpoints"], outpoints);
     // The standing GET's shape.
-    let got = compare::read_answer(&d1, "", "", NOW_MS as i64 + 60_000)
+    let got = compare::read_answer(&d1, "", "", NOW_MS as i64 + 60_000, 1)
         .await
         .unwrap();
     for k in [
@@ -11991,7 +11998,7 @@ async fn fix986c2_c_the_rings_row_is_the_routes_compare() {
         route["diffFields"][0]["fields"]
     );
     assert_eq!(got["comparedWithinMs"], json!(60_000));
-    let narrowed = compare::read_answer(&d1, "", &ids[0], NOW_MS as i64)
+    let narrowed = compare::read_answer(&d1, "", &ids[0], NOW_MS as i64, 1)
         .await
         .unwrap();
     assert_eq!(narrowed["row"]["identity"], json!(ids[0]));
@@ -12014,7 +12021,7 @@ async fn fix986c2_c_the_rings_row_is_the_routes_compare() {
     compare::compare_now(&port, &target, NOW_MS as i64 + 2)
         .await
         .unwrap();
-    let got = compare::read_answer(&d1, "", "", NOW_MS as i64 + 3)
+    let got = compare::read_answer(&d1, "", "", NOW_MS as i64 + 3, 1)
         .await
         .unwrap();
     assert!(got["diffs"].as_array().unwrap().is_empty(), "{got}");
@@ -12144,7 +12151,18 @@ async fn fix986c2_f_the_rings_identity_page_is_seeks_over_the_identity_list() {
         d1.conn
             .prepare(sql)
             .unwrap()
-            .query_map(rusqlite::params![after, n], |r| r.get(0))
+            .query_map(
+                rusqlite::params_from_iter(
+                    [json!(after), json!(n), json!(compare::RING_KEY_END)]
+                        .iter()
+                        .take(if sql.contains("?3") { 3 } else { 2 })
+                        .map(|v| match v {
+                            Value::String(s) => rusqlite::types::Value::Text(s.clone()),
+                            v => rusqlite::types::Value::Integer(v.as_i64().unwrap()),
+                        }),
+                ),
+                |r| r.get(0),
+            )
             .unwrap()
             .map(Result::unwrap)
             .collect()
@@ -12167,7 +12185,9 @@ async fn fix986c2_f_the_rings_identity_page_is_seeks_over_the_identity_list() {
     let steps = |sql: &str| -> i32 {
         let mut st = d1.conn.prepare(sql).unwrap();
         let n = st
-            .query_map(rusqlite::params!["", 16], |r| r.get::<_, String>(0))
+            .query_map(rusqlite::params!["", 16, compare::RING_KEY_END], |r| {
+                r.get::<_, String>(0)
+            })
             .unwrap()
             .count();
         assert_eq!(n, 16);
@@ -12190,6 +12210,384 @@ async fn fix986c2_f_the_rings_identity_page_is_seeks_over_the_identity_list() {
         after, before,
         "a page of the ring reads its page, not the list"
     );
+}
+
+// ── bsv-low #998 (FIX-998-RING): the fleet compare ring covers the fleet in about ten minutes ──
+
+/// A spread identity: `02`/`03` and 32 bytes of a fixed pseudo-random stream (splitmix64), so the keys fall across
+/// every shard as an x coordinate's first byte does.
+fn fix998_key(k: usize) -> String {
+    let mut x = 0x998u64.wrapping_add(k as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut hex = format!("0{}", 2 + k % 2);
+    for _ in 0..4 {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        hex.push_str(&format!("{:016x}", z ^ (z >> 31)));
+    }
+    hex
+}
+
+/// A compare of a measured weight: `weight` D1 statements through the ring's metered port (in batches of 16, as the
+/// judge's hydration runs), `latency_ms` of the tick's wall, no difference.
+struct Fix998Weighted<'c> {
+    weight: usize,
+    latency_ms: u64,
+    clock: &'c Cell<u64>,
+}
+impl compare::RingCompare for Fix998Weighted<'_> {
+    async fn compare<J: JudgeDb>(
+        &self,
+        m: &compare::Metered<'_, J>,
+        identity: &str,
+        now: i64,
+    ) -> compare::CompareRow {
+        let mut left = self.weight;
+        while left > 0 {
+            let n = left.min(16);
+            m.run_batch((0..n).map(|_| Stmt::new("SELECT 1", vec![])).collect())
+                .await
+                .unwrap();
+            left -= n;
+        }
+        self.clock.set(self.clock.get() + self.latency_ms);
+        compare::CompareRow {
+            identity: identity.to_string(),
+            compared_at_ms: now,
+            diff_count: Some(0),
+            held_by_lag_count: Some(0),
+            stale_d1_count: Some(0),
+            tip_lag_count: Some(0),
+            outpoints: json!([]),
+            d1_digest: None,
+            actor_digest: None,
+            fault: None,
+            partial: false,
+        }
+    }
+}
+
+/// The ticks one revolution of the whole ring takes over `d1`'s identities: every shard ticked at each tick (each its
+/// own alarm), until every shard has wrapped once. Each identity compared exactly once, no tick past its statement
+/// budget (nor D1's 1,000). Answered (ticks, the worst tick's statements).
+#[allow(clippy::needless_range_loop)] // every shard ticks at each tick, by its index
+async fn fix998_revolution(
+    port: &Fix986<'_>,
+    ids: &[String],
+    shards: usize,
+    weight: usize,
+    latency_ms: u64,
+) -> (usize, usize) {
+    let clock = Cell::new(0u64);
+    let weighted = Fix998Weighted {
+        weight,
+        latency_ms,
+        clock: &clock,
+    };
+    let mut wrapped = vec![false; shards];
+    let mut seen: Vec<String> = Vec::new();
+    let mut worst = 0;
+    let mut ticks = 0;
+    let mut t = NOW_MS as i64;
+    while !wrapped.iter().all(|w| *w) {
+        ticks += 1;
+        assert!(ticks <= 1_000, "the ring never wrapped");
+        for k in 0..shards {
+            if wrapped[k] {
+                continue;
+            }
+            clock.set(0);
+            let r = compare::ring_tick_with(port, t, k, shards, 16, || clock.get(), &weighted)
+                .await
+                .unwrap();
+            assert!(
+                r.statements <= compare::FLEET_COMPARE_STATEMENTS_PER_TICK,
+                "shard {k}: {r:?}"
+            );
+            worst = worst.max(r.statements);
+            seen.extend(r.compared);
+            wrapped[k] |= r.wrapped;
+        }
+        t += compare::FLEET_COMPARE_TICK_MS;
+    }
+    seen.sort();
+    let mut want = ids.to_vec();
+    want.sort();
+    assert_eq!(seen, want, "every identity once a revolution, in one shard");
+    (ticks, worst)
+}
+
+/// (fix998_a) bsv-low #998: A REVOLUTION OVER 153 IDENTITIES OF THE FLEET FIXTURE'S WEIGHT FITS TEN MINUTES OF TICKS.
+/// The weight is measured: the fresh compare of the frozen fleet's heaviest seat (`fix986c2_e`'s whale, 553
+/// statements at 64 games), and each compare also spends beta's measured wall (5 s an identity: 1 to 4 a 20 s tick).
+/// 153 spread identities (beta's count), the shipped shards, tick, wall and statement budget: every shard ticked at
+/// each [`compare::FLEET_COMPARE_TICK_MS`] until each has wrapped, the ticks counted (never a wall-clock sleep). RED on
+/// PR 241's ring (one shard, a minute's tick): 153 ticks, 153 minutes.
+#[tokio::test]
+async fn fix998_a_a_revolution_of_153_fixture_weight_identities_fits_ten_minutes() {
+    let f = fixtures()
+        .into_iter()
+        .find(|f| f.name == "d1_fleet")
+        .unwrap();
+    let fleet = d1_judge(&f).await;
+    let fleet_port = Fix986 {
+        d1: &fleet,
+        actors: BTreeMap::new(),
+        judges: true,
+        die_after: Cell::new(u32::MAX),
+    };
+    let mut weight = 0;
+    for id in &f.identities {
+        let m = compare::Metered::new(&fleet_port);
+        compare::fresh_compare(&m, id, Err("no actor (pin)".into()))
+            .await
+            .unwrap();
+        weight = weight.max(m.statements.get());
+    }
+    assert!(weight > 500, "the fixture's weight {weight}");
+    let ids: Vec<String> = (0..153).map(fix998_key).collect();
+    let d1 = seeded(&Fixture {
+        name: "fix998 ring",
+        seed: ids
+            .iter()
+            .enumerate()
+            .map(|(k, id)| format!("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,sigValid) VALUES ('{id}','x','g{k}','{}',0,900100,'00','{}',1,1,1)", h("998a", k), h("998b", k)))
+            .collect(),
+        identities: ids.clone(),
+    });
+    let port = Fix986 {
+        d1: &d1,
+        actors: BTreeMap::new(),
+        judges: false,
+        die_after: Cell::new(u32::MAX),
+    };
+    let shards = compare::shards_of(None);
+    let (ticks, worst) = fix998_revolution(&port, &ids, shards, weight, 5_000).await;
+    let revolution_ms = ticks as i64 * compare::FLEET_COMPARE_TICK_MS;
+    println!(
+        "fix998_a: weight {weight} statements an identity, {shards} shards, a revolution of 153 in {ticks} ticks of {} ms = {revolution_ms} ms, the worst tick {worst} statements",
+        compare::FLEET_COMPARE_TICK_MS
+    );
+    assert!(
+        revolution_ms <= 600_000,
+        "a revolution of 153 in {ticks} ticks, {revolution_ms} ms"
+    );
+    assert!(
+        revolution_ms <= compare::FLEET_COMPARE_REVOLUTION_FLOOR_MS,
+        "the walk ends inside the rest floor, so the ring paces at the floor: {revolution_ms} ms"
+    );
+    // Beta's own weight (100 to 250 statements an identity): the same ring, sooner.
+    let d1b = seeded(&Fixture {
+        name: "fix998 ring beta",
+        seed: ids
+            .iter()
+            .enumerate()
+            .map(|(k, id)| format!("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,sigValid) VALUES ('{id}','x','g{k}','{}',0,900100,'00','{}',1,1,1)", h("998a", k), h("998b", k)))
+            .collect(),
+        identities: ids.clone(),
+    });
+    let port_b = Fix986 {
+        d1: &d1b,
+        actors: BTreeMap::new(),
+        judges: false,
+        die_after: Cell::new(u32::MAX),
+    };
+    let (ticks_b, _) = fix998_revolution(&port_b, &ids, shards, 250, 5_000).await;
+    println!("fix998_a: at beta's 250 statements, {ticks_b} ticks");
+    assert!(ticks_b <= ticks);
+}
+
+/// The ring's fleet with SPREAD keys ([`fix998_key`]): `fix986_fleet`'s seats (one old verified hop marker over an
+/// index-unspent hop each), each seat's actor judged.
+async fn fix998_fleet(n: usize) -> (SqliteSql, Vec<String>, BTreeMap<String, SqliteSql>) {
+    let made = (NOW_MS / 1000) as i64 - 7_200;
+    let ids: Vec<String> = (0..n).map(fix998_key).collect();
+    let mut seed = Vec::new();
+    for (k, id) in ids.iter().enumerate() {
+        let hop = h("b998", k);
+        seed.push(format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{hop}',0,0,{made},'p2pkh')"));
+        seed.push(format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('{id}','other','{}',0,20190,'seat','00','00',2,'{hop}',1,{made},1)", h("9e98", k)));
+    }
+    let d1 = seeded(&Fixture {
+        name: "fix998 fleet",
+        seed,
+        identities: ids.clone(),
+    });
+    let mut actors = BTreeMap::new();
+    for id in &ids {
+        let (local, _) = actor_judge(&d1, id).await;
+        actors.insert(id.clone(), local);
+    }
+    d1.conn.execute("DELETE FROM owed_dirty", []).unwrap();
+    (d1, ids, actors)
+}
+
+/// The route's answer without its clock: every `comparedAtMs`, the ages and the ring's own state (cursor, ticks,
+/// revolution times, shards) taken out.
+fn fix998_unclocked(mut v: Value) -> Value {
+    fn strip(v: &mut Value) {
+        match v {
+            Value::Object(o) => {
+                o.remove("comparedAtMs");
+                o.values_mut().for_each(strip);
+            }
+            Value::Array(a) => a.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    for k in [
+        "comparedWithinMs",
+        "newestComparedAtMs",
+        "ringCursor",
+        "lastRevolutionMs",
+        "lastTickAt",
+        "shardCount",
+        "shards",
+    ] {
+        v.as_object_mut().unwrap().remove(k);
+    }
+    strip(&mut v);
+    v
+}
+
+/// (fix998_b) bsv-low #998: THE SHARDED SUMMARY EQUALS THE UNSHARDED ONE. Two copies of one 12-seat fleet with spread
+/// keys, one seat's actor planted different: PR 241's one ring (one shard) to its wrap, and four shards each to its
+/// wrap, the real compare ([`compare::ring_tick`]); the standing route's answers equal (counts, the differing
+/// identity, its outpoints and fields, no faults), the clock and the ring's own state taken out; each shard compared
+/// only its own identities, all of them once; the fleet's `revolution` is 0 until the LAST shard wraps, then 1, and
+/// `lastRevolutionMs` the longest shard's.
+#[tokio::test]
+#[allow(clippy::needless_range_loop)] // every shard ticks at each tick, by its index
+async fn fix998_b_the_sharded_summary_equals_the_unsharded_one() {
+    let mut answers = Vec::new();
+    for shards in [1usize, 4] {
+        let (d1, ids, actors) = fix998_fleet(12).await;
+        actors[&ids[5]]
+            .conn
+            .execute("UPDATE owed_rows SET sats=sats+1 WHERE identity=?1", [&ids[5]])
+            .unwrap();
+        let port = Fix986 {
+            d1: &d1,
+            actors,
+            judges: false,
+            die_after: Cell::new(u32::MAX),
+        };
+        let mut wrapped = vec![false; shards];
+        let mut seen = Vec::new();
+        let mut t = NOW_MS as i64;
+        while !wrapped.iter().all(|w| *w) {
+            for k in 0..shards {
+                if wrapped[k] {
+                    continue;
+                }
+                let r = compare::ring_tick(&port, t, k, shards, 2, || 0).await.unwrap();
+                for id in &r.compared {
+                    let own = compare::shard_segments(k, shards)
+                        .iter()
+                        .any(|(lo, hi)| id.as_str() > lo.as_str() && id.as_str() <= hi.as_str());
+                    assert!(own, "shard {k} compared {id}, not its own");
+                }
+                seen.extend(r.compared);
+                wrapped[k] |= r.wrapped;
+                let fleet = compare::read_answer(&d1, "", "", t, shards).await.unwrap();
+                let want = i64::from(wrapped.iter().all(|w| *w));
+                assert_eq!(fleet["revolution"], json!(want), "{fleet}");
+                assert_eq!(fleet["lastRevolutionMs"].is_null(), want == 0, "{fleet}");
+            }
+            t += compare::FLEET_COMPARE_TICK_MS;
+        }
+        seen.sort();
+        let mut all = ids.clone();
+        all.sort();
+        assert_eq!(seen, all, "{shards} shards: every identity once");
+        let answer = compare::read_answer(&d1, "", "", t, shards).await.unwrap();
+        assert_eq!(answer["identities"], json!(12));
+        assert_eq!(answer["identitiesDiffering"], json!(1), "{answer}");
+        assert_eq!(answer["shards"].as_array().unwrap().len(), shards);
+        let longest = answer["shards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["lastRevolutionMs"].as_i64())
+            .max();
+        assert_eq!(answer["lastRevolutionMs"].as_i64(), longest);
+        answers.push(fix998_unclocked(answer));
+    }
+    assert_eq!(answers[0], answers[1], "the sharded summary is the unsharded one");
+}
+
+/// (fix998_c) The shards partition the key space: for 1 to 16 shards every key (spread identities, the boundaries
+/// themselves, keys below `02` and past `03ff`, a non-hex key) is in exactly one segment of exactly one shard; one shard
+/// is PR 241's whole ring under its row's name; the renders' setting is clamped; a missing shard row holds the fleet's
+/// revolution at 0.
+#[test]
+fn fix998_c_the_shards_partition_the_key_space() {
+    let mut keys: Vec<String> = (0..400).map(fix998_key).collect();
+    for k in ["01ff", "02", "0200", "0240", "02ff", "03", "0300", "0380", "03ff", "04", "other", "zz"] {
+        keys.push(k.to_string());
+    }
+    keys.push(format!("03{}", "f".repeat(64)));
+    keys.push(format!("02{}", "0".repeat(64)));
+    for n in 1..=compare::FLEET_COMPARE_SHARDS_MAX {
+        for key in &keys {
+            let owners: Vec<(usize, usize)> = (0..n)
+                .flat_map(|k| {
+                    compare::shard_segments(k, n)
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(_, (lo, hi))| key.as_str() > lo.as_str() && key.as_str() <= hi.as_str())
+                        .map(move |(j, _)| (k, j))
+                })
+                .collect();
+            assert_eq!(owners.len(), 1, "{n} shards: {key} in {owners:?}");
+        }
+    }
+    let spread: Vec<usize> = (0..4)
+        .map(|k| {
+            keys.iter()
+                .take(400)
+                .filter(|key| {
+                    compare::shard_segments(k, 4)
+                        .iter()
+                        .any(|(lo, hi)| key.as_str() > lo.as_str() && key.as_str() <= hi.as_str())
+                })
+                .count()
+        })
+        .collect();
+    assert!(spread.iter().all(|n| *n > 60), "the keys spread: {spread:?}");
+    assert_eq!(compare::ring_state_name(0, 1), compare::RING_NAME);
+    assert_eq!(compare::ring_state_name(2, 4), "fleet-compare:ring:2/4");
+    assert_eq!(compare::shard_actor_name(0), compare::FLEET_COMPARE_ACTOR);
+    assert_eq!(compare::shards_of(None), 4);
+    assert_eq!(compare::shards_of(Some("0")), 1);
+    assert_eq!(compare::shards_of(Some("99")), compare::FLEET_COMPARE_SHARDS_MAX);
+    assert_eq!(compare::shards_of(Some("x")), 4);
+    let row = |rev: i64, last: Option<i64>| json!({"after": "", "revolution": rev, "lastRevolutionMs": last, "lastTickAt": 7});
+    let two = |a: Value, b: Value| -> Value {
+        compare::fleet_ring(
+            &[
+                (compare::ring_state_name(0, 2), a),
+                (compare::ring_state_name(1, 2), b),
+            ],
+            2,
+        )
+    };
+    let r = two(row(2, Some(300)), row(1, Some(500)));
+    assert_eq!((r["revolution"].clone(), r["lastRevolutionMs"].clone()), (json!(1), json!(500)));
+    let r = two(row(1, Some(300)), row(0, None));
+    assert_eq!((r["revolution"].clone(), r["lastRevolutionMs"].clone()), (json!(0), Value::Null));
+    let r = compare::fleet_ring(&[(compare::ring_state_name(0, 2), row(3, Some(1)))], 2);
+    assert_eq!(r["revolution"], json!(0), "a shard with no row yet");
+    let one = compare::fleet_ring(&[(compare::RING_NAME.to_string(), row(3, Some(9)))], 1);
+    assert_eq!((one["revolution"].clone(), one["lastRevolutionMs"].clone()), (json!(3), json!(9)));
+    // The wiring: every cron arms every shard; a shard past the count retires; the alarm passes its shard.
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let belt = squash(include_str!("../owed_belt.rs"));
+    assert!(belt.contains("forkin0..shards{"));
+    assert!(belt.contains("crate::owed_actor::compare::shard_actor_name(k)"));
+    let board = squash(include_str!("../board_view.rs"));
+    assert!(board.contains("ifshard>=crate::owed_actor::compare::shards_env(&self.env){storage.delete_all().await?;"));
 }
 
 // ── bsv-low #986 (READ-986 item 3, FIX-986): the actor's facts for a game equal the D1 read's by construction ──
