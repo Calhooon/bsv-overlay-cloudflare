@@ -10,6 +10,11 @@
 //       (`owed_events_published_total` up by 32; no consumer), `owed_actor_direct_calls_total` 32.
 // RED on `046b721e`: the hook published and called no actor: no `judgedAtMs` moved ("timed out: the 32 actors' first
 // visibility").
+// FIX-952 (lane FIX-952-PHASE-C, bsv-low #952): fix952_a, THE SAME FLOOD IN PHASE C (`OWED_D1_JUDGE=false`,
+// `OWED_ACTOR_READ=true`, the actor the one writer) on the same persisted state with 32 fresh seats: each visible
+// under 1 s by the direct call, which in Phase C also ACKNOWLEDGES the marks it applied (`owed_dirty` empty for the
+// 32, `owed_events_direct_acked_total` up by 32), the queue behind (+32 published, no consumer), and NO `owed_rows`
+// written for them (nothing writes D1's rows in Phase C). Each leg prints its figures; the cell FAILS on either.
 // Reads the tier's exported fleet fixture (RECORD_DOOR_FIXTURE, as the #911 cell does). Every host is sealed.
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
@@ -30,7 +35,7 @@ const state = resolve(scratch, 'state')
 const SEALED = 'http://127.0.0.1:9'
 const TOKEN = 'ci-internal-tok'
 const paths = ['tools/lane-912/owed_actor_alarm_worker.mjs', 'crates/low-app-layer/build/worker/shim.mjs', 'crates/low-app-layer/build/index.js', 'crates/low-app-layer/build/index_bg.wasm']
-const options = {
+const options = phase => ({
   name: 'owed-direct-flood', resourcePersistencePath: state, defaultPersistRoot: state, modulesRoot: root,
   modules: paths.map(path => ({ path: root + path, type: path.endsWith('.wasm') ? 'CompiledWasm' : 'ESModule', contents: readFileSync(path.includes('/build/') ? path.replace('crates/low-app-layer/build', build) : root + path) })),
   compatibilityDate: '2024-12-01', compatibilityFlags: ['nodejs_compat'],
@@ -39,17 +44,18 @@ const options = {
   kvNamespaces: { OWED_COPY: 'owed-copy-952' },
   // the queue BEHIND: a producer, no consumer here (the direct call is the only judge of this flood)
   queueProducers: { OWED_EVENTS: { queueName: 'low-owed-events' } },
-  bindings: { AUTH_ENFORCE: 'false', SESSION_LANE: 'false', INTERNAL_TOKEN: TOKEN, COURIER_SINK: SEALED, ARCADE_URL: SEALED, CORROBORATOR_URL: SEALED, RELAY_URL: SEALED, DUAL_BROADCAST: 'off', OWED_D1_JUDGE: 'true', OWED_ACTOR_READ: 'false' },
+  // Phase B (the D1 judge writes `owed_rows`, the actor's rows served) or Phase C (the actor the one writer)
+  bindings: { AUTH_ENFORCE: 'false', SESSION_LANE: 'false', INTERNAL_TOKEN: TOKEN, COURIER_SINK: SEALED, ARCADE_URL: SEALED, CORROBORATOR_URL: SEALED, RELAY_URL: SEALED, DUAL_BROADCAST: 'off', OWED_D1_JUDGE: phase === 'C' ? 'false' : 'true', OWED_ACTOR_READ: 'true', OWED_CONSUMER_CONCURRENCY: phase === 'C' ? '4' : '1' },
   serviceBindings: { CHAINTRACKS: async request => {
     const path = new URL(request.url).pathname
     if (path === '/getPresentHeight') return Response.json({ status: 'success', value: 900000 })
     if (path === '/findChainTipHeaderHex' || path === '/findHeaderHexForHeight') return Response.json({ status: 'success', value: { height: 900000, hash: 'ab'.repeat(32), merkleRoot: 'cd'.repeat(32), time: Math.floor(Date.now() / 1000) } })
     return new Response('{}', { status: 404 })
   } },
-}
-const start = () => new Miniflare((convertV4MiniflareOptions ?? (v => v))(options))
+})
+const start = phase => new Miniflare((convertV4MiniflareOptions ?? (v => v))(options(phase)))
 const files = path => readdirSync(path, { withFileTypes: true }).flatMap(e => e.isDirectory() ? files(resolve(path, e.name)) : [resolve(path, e.name)])
-let mf = start()
+let mf = start('B')
 try {
   await (await mf.getD1Database('OVERLAY_DB')).prepare('SELECT 1').first()
   await mf.dispose()
@@ -57,62 +63,84 @@ try {
   assert(dbFile, 'the local D1 database exists')
   cpSync(fixture.sqlite, dbFile)
   for (const suffix of ['-wal', '-shm']) rmSync(dbFile + suffix, { force: true })
-  mf = start()
-  const db = await mf.getD1Database('OVERLAY_DB')
-  const ns = await mf.getDurableObjectNamespace('OWED_ACTOR')
-  const actor = id => ns.get(ns.idFromName(id))
-  const pinState = async id => (await actor(id).fetch('http://owed-actor/pin/state')).json()
-  const poll = async (what, fn, ms = 60000) => {
-    const end = Date.now() + ms
-    do { const v = await fn(); if (v) return v; await new Promise(r => setTimeout(r, 25)) } while (Date.now() < end)
-    assert.fail('timed out: ' + what)
-  }
-  const counter = async name => (await db.prepare('SELECT value FROM ops_counters WHERE name=?').bind(name).first())?.value ?? 0
-  // (1) 32 one-game seats: a copy of one fixture hop marker each, under a fresh identity, game and outpoint.
   const hex = (prefix, n, len) => prefix + n.toString(16).padStart(len - prefix.length, '0')
-  const seats = Array.from({ length: 32 }, (_, i) => ({ identity: hex('02fe', i, 66), game: hex('fe', i, 64), txid: hex('fd', i, 64) }))
-  const template = await db.prepare('SELECT * FROM hopparty_records LIMIT 1').first()
-  assert(template, 'the fixture holds a hop marker')
-  const cols = Object.keys(template)
-  for (const s of seats) {
-    const row = { ...template, identity: s.identity, gameId: s.game, txid: s.txid, outputIndex: 0, createdAt: Math.floor(Date.now() / 1000) }
-    await db.prepare(`INSERT INTO hopparty_records (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`).bind(...cols.map(c => row[c])).run()
+  // ONE FLOOD under one phase: 32 fresh one-game seats (a copy of one fixture hop marker each, under a fresh identity,
+  // game and outpoint), their actors bootstrapped, four hook bodies at once, each identity's first visibility.
+  const flood = async (tag, phase, prefix) => {
+    mf = start(phase)
+    const db = await mf.getD1Database('OVERLAY_DB')
+    const ns = await mf.getDurableObjectNamespace('OWED_ACTOR')
+    const actor = id => ns.get(ns.idFromName(id))
+    const pinState = async id => (await actor(id).fetch('http://owed-actor/pin/state')).json()
+    const poll = async (what, fn, ms = 60000) => {
+      const end = Date.now() + ms
+      do { const v = await fn(); if (v) return v; await new Promise(r => setTimeout(r, 25)) } while (Date.now() < end)
+      assert.fail('timed out: ' + what)
+    }
+    const counter = async name => (await db.prepare('SELECT value FROM ops_counters WHERE name=?').bind(name).first())?.value ?? 0
+    const seats = Array.from({ length: 32 }, (_, i) => ({ identity: hex(prefix, i, 66), game: hex(prefix.slice(2), i, 64), txid: hex(prefix.slice(2) === 'fe' ? 'fd' : 'fb', i, 64) }))
+    const template = await db.prepare('SELECT * FROM hopparty_records LIMIT 1').first()
+    assert(template, 'the fixture holds a hop marker')
+    const cols = Object.keys(template)
+    for (const s of seats) {
+      const row = { ...template, identity: s.identity, gameId: s.game, txid: s.txid, outputIndex: 0, createdAt: Math.floor(Date.now() / 1000) }
+      await db.prepare(`INSERT INTO hopparty_records (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`).bind(...cols.map(c => row[c])).run()
+    }
+    const like = prefix + '%'
+    const marks = (await db.prepare('SELECT COUNT(DISTINCT identity) AS n FROM owed_dirty WHERE identity LIKE ?').bind(like).first()).n
+    assert.equal(marks, 32, `${tag}: each seat's marker wrote its mark (the dirty trigger)`)
+    const tb = Date.now()
+    await Promise.all(seats.map(s => actor(s.identity).fetch('http://owed-actor/bootstrap', { method: 'POST', body: JSON.stringify({ identity: s.identity }) })))
+    await poll(`${tag}: the 32 bootstraps`, async () => (await Promise.all(seats.map(s => pinState(s.identity)))).every(p => p.meta.bootstrapped))
+    console.log(`${tag}: 32 seats bootstrapped in ${Date.now() - tb} ms`)
+    const judgedBefore = new Map()
+    for (const s of seats) judgedBefore.set(s.identity, Number((await pinState(s.identity)).meta.judgedAtMs ?? 0))
+    const publishedBefore = await counter('owed_events_published_total')
+    const callsBefore = await counter('owed_actor_direct_calls_total')
+    const ackedBefore = await counter('owed_events_direct_acked_total')
+    // (2) the flood: four hook bodies at once, eight identities each
+    const t0 = Date.now()
+    const answers = await Promise.all([0, 1, 2, 3].map(k => mf.dispatchFetch('http://app/internal/hop-changed', {
+      method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ identities: seats.slice(8 * k, 8 * k + 8).map(s => s.identity) }),
+    })))
+    const answeredMs = Date.now() - t0
+    for (const a of answers) assert.equal(a.status, 200, `${tag}: the hook answered: ${await a.text()}`)
+    // (3) each actor's first visibility
+    const seen = new Map()
+    await poll(`${tag}: the 32 actors' first visibility`, async () => {
+      await Promise.all(seats.filter(s => !seen.has(s.identity)).map(async s => {
+        const j = Number((await pinState(s.identity)).meta.judgedAtMs ?? 0)
+        if (j > judgedBefore.get(s.identity)) seen.set(s.identity, j - t0)
+      }))
+      return seen.size === 32
+    }, 20000)
+    const ms = [...seen.values()].sort((a, b) => a - b)
+    console.log(`${tag}: the hooks answered in ${answeredMs} ms; first visibility of 32 identities: p50 ${ms[15]} ms, max ${ms[31]} ms`)
+    assert(ms[31] < 1000, `${tag}: each identity's rows visible under 1 s of its write: max ${ms[31]} ms (${JSON.stringify(ms)})`)
+    // the queue behind: every event published (no consumer ran), every call counted
+    await poll(`${tag}: the counters`, async () => (await counter('owed_events_published_total')) - publishedBefore >= 32 && (await counter('owed_actor_direct_calls_total')) - callsBefore >= 32, 10000)
+    const published = (await counter('owed_events_published_total')) - publishedBefore
+    const calls = (await counter('owed_actor_direct_calls_total')) - callsBefore
+    if (phase === 'C') {
+      // FIX-952 (fix952_a): in Phase C the direct call is the judgement: it acknowledges the marks it applied, and
+      // nothing writes D1's owed_rows for these seats (the actor is the one writer)
+      await poll(`${tag}: the marks acknowledged by the direct call`, async () => (await db.prepare('SELECT COUNT(*) AS n FROM owed_dirty WHERE identity LIKE ?').bind(like).first()).n === 0, 10000)
+      const acked = (await counter('owed_events_direct_acked_total')) - ackedBefore
+      assert(acked >= 32, `${tag}: the direct call acknowledged the 32 marks: +${acked}`)
+      const rows = (await db.prepare('SELECT COUNT(*) AS n FROM owed_rows WHERE identity LIKE ?').bind(like).first()).n
+      assert.equal(rows, 0, `${tag}: no owed_rows written in Phase C (the actor is the one writer)`)
+      console.log(`PASS fix952_a: Phase C, 32 frames for 32 identities, each visible under 1 s (max ${ms[31]} ms) by the direct call, which acknowledged their marks (+${acked}); the queue behind (+${published} published, no consumer); no owed_rows written; +${calls} direct calls`)
+    } else {
+      console.log(`PASS d_a: 32 frames for 32 identities, each visible under 1 s (max ${ms[31]} ms) by the direct call; the queue behind (+${published} published, no consumer); +${calls} direct calls`)
+    }
+    await Promise.race([mf.dispose(), new Promise(r => setTimeout(r, 15000))])
+    mf = null
   }
-  const marks = (await db.prepare("SELECT COUNT(DISTINCT identity) AS n FROM owed_dirty WHERE identity LIKE '02fe%'").first()).n
-  assert.equal(marks, 32, 'each seat\'s marker wrote its mark (the dirty trigger)')
-  const tb = Date.now()
-  await Promise.all(seats.map(s => actor(s.identity).fetch('http://owed-actor/bootstrap', { method: 'POST', body: JSON.stringify({ identity: s.identity }) })))
-  await poll('the 32 bootstraps', async () => (await Promise.all(seats.map(s => pinState(s.identity)))).every(p => p.meta.bootstrapped))
-  console.log(`d_a: 32 seats bootstrapped in ${Date.now() - tb} ms`)
-  const judgedBefore = new Map()
-  for (const s of seats) judgedBefore.set(s.identity, Number((await pinState(s.identity)).meta.judgedAtMs ?? 0))
-  const publishedBefore = await counter('owed_events_published_total')
-  const callsBefore = await counter('owed_actor_direct_calls_total')
-  // (2) the flood: four hook bodies at once, eight identities each
-  const t0 = Date.now()
-  const answers = await Promise.all([0, 1, 2, 3].map(k => mf.dispatchFetch('http://app/internal/hop-changed', {
-    method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ identities: seats.slice(8 * k, 8 * k + 8).map(s => s.identity) }),
-  })))
-  const answeredMs = Date.now() - t0
-  for (const a of answers) assert.equal(a.status, 200, `the hook answered: ${await a.text()}`)
-  // (3) each actor's first visibility
-  const seen = new Map()
-  await poll('the 32 actors\' first visibility', async () => {
-    await Promise.all(seats.filter(s => !seen.has(s.identity)).map(async s => {
-      const j = Number((await pinState(s.identity)).meta.judgedAtMs ?? 0)
-      if (j > judgedBefore.get(s.identity)) seen.set(s.identity, j - t0)
-    }))
-    return seen.size === 32
-  }, 20000)
-  const ms = [...seen.values()].sort((a, b) => a - b)
-  console.log(`d_a: the hooks answered in ${answeredMs} ms; first visibility of 32 identities: p50 ${ms[15]} ms, max ${ms[31]} ms`)
-  assert(ms[31] < 1000, `each identity's rows visible under 1 s of its write: max ${ms[31]} ms (${JSON.stringify(ms)})`)
-  // the queue behind: every event published (no consumer ran), every call counted
-  await poll('the counters', async () => (await counter('owed_events_published_total')) - publishedBefore >= 32 && (await counter('owed_actor_direct_calls_total')) - callsBefore >= 32, 10000)
-  console.log(`PASS d_a: 32 frames for 32 identities, each visible under 1 s (max ${ms[31]} ms) by the direct call; the queue behind (+${(await counter('owed_events_published_total')) - publishedBefore} published, no consumer); +${(await counter('owed_actor_direct_calls_total')) - callsBefore} direct calls`)
+  await flood('d_a', 'B', '02fe')
+  await flood('fix952_a', 'C', '02fc')
 } finally {
-  await Promise.race([mf.dispose(), new Promise(r => setTimeout(r, 15000))])
+  if (mf) await Promise.race([mf.dispose(), new Promise(r => setTimeout(r, 15000))])
   rmSync(scratch, { recursive: true, force: true })
 }
 process.exit(0)

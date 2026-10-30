@@ -76,6 +76,35 @@ pub fn consumer_concurrency_refused(n: u32, d1_judges: bool) -> bool {
     n > CONSUMER_MAX_CONCURRENCY && d1_judges
 }
 
+/// FIX-952 (bsv-low #952, item 3): the consumer's concurrency in PHASE C (`OWED_D1_JUDGE=false`): the render's pair,
+/// `max_concurrency` in the `low-owed-events` consumer block and `OWED_CONSUMER_CONCURRENCY` in `[vars]`, moved
+/// TOGETHER by the Phase C deploy (the two commented `PHASE C:` lines in each render of `wrangler.toml` are the
+/// lever's exact edit, pinned equal to this constant).
+///
+/// WHY FOUR. In Phase C the consumer makes NO D1 judge call and writes no `owed_rows`: per event it reads the pair's
+/// marks (2 statements, one round trip), the marks' bound (1), calls the identity's actor once (the DO serialises the
+/// identity; the actor's seq orders its events) and acknowledges the marks in one batch (4 statements); the batch's
+/// identities go at once ([`JUDGE_IDENTITIES_AT_ONCE`]), so one consumer clears a batch of 16 in about one actor
+/// apply and three D1 round trips (1 to 3 s under the loop's load): about 320 to 960 events a minute a consumer.
+/// Four consumers cover the L53 peak (243 a minute, record 1547) at least five times over, while the actor applies
+/// in flight stay at most 4 x 16 = 64, the direct pass's own fan-out ([`DIRECT_EVENTS_MAX`]): no more of the actors'
+/// compound D1 reads land behind the alarm's batches (record 1537) than one direct pass already puts there. Why not
+/// more: each further consumer adds 16 concurrent actor applies, each a D1 round trip, for a backlog four already
+/// drain faster than the loop fills it. WHY N CONSUMERS CANNOT RACE ON D1 IN C: they write no `owed_rows` (the actor
+/// is the one writer, in its own SQLite); their only D1 writes are the acknowledgement's deletes of marks at or below
+/// a generation each read before its own call ([`crate::owed_actor::phase_c_ack_statements`]), idempotent and
+/// monotone whatever their order, and the two restart statements, idempotent.
+pub const CONSUMER_CONCURRENCY_PHASE_C: u32 = 4;
+/// PURE: the consumer concurrency a render's phase takes: 1 while the D1 judge writes `owed_rows` (A and B:
+/// [`CONSUMER_MAX_CONCURRENCY`]), [`CONSUMER_CONCURRENCY_PHASE_C`] with it off (C).
+pub fn consumer_concurrency_for(d1_judges: bool) -> u32 {
+    if d1_judges {
+        CONSUMER_MAX_CONCURRENCY
+    } else {
+        CONSUMER_CONCURRENCY_PHASE_C
+    }
+}
+
 /// The pair's marks, oldest generation first (`idx_owed_dirty_source_key`; the source filtered in the index's row),
 /// the marks of a HELD subject left out (D2-ACTOR-A-DELTA-2's NEW2-M1: its subject memo's hold runs past `?4`, one
 /// primary-key probe of `owed_belt_state` a mark), so a held subject never takes a place of the 64.
@@ -343,23 +372,37 @@ pub fn stale_memo_faults(cursor: &Value, now_ms: i64) -> i64 {
 }
 
 thread_local! {
-    /// LOW-1 (the second delta lens): the subject memos of the judge call in flight, so a message the wall drops
+    /// LOW-1 (the second delta lens): the subject memos of the judge calls in flight, so a message the wall drops
     /// notes THOSE subjects, never the pair (a judge that outlasts the wall every time is one identity's, not its
-    /// pair's neighbours').
+    /// pair's neighbours'). FIX-952 (bsv-low #952): a SET, since a pass delivers its identities at once
+    /// ([`judge_plan`]): each identity's chunk enters when its call starts and leaves when it answers, and the wall's
+    /// branch takes whatever is still in flight across them.
     static IN_FLIGHT: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The subject memos of the judge call in flight (taken: the wall's branch).
+/// The subject memos of the judge calls in flight (taken: the wall's branch).
 pub fn take_in_flight() -> Vec<String> {
     IN_FLIGHT.with(|f| std::mem::take(&mut *f.borrow_mut()))
 }
 
-fn set_in_flight(identity: &str, games: &[String]) {
+/// One identity's chunk enters the in-flight set (its judge call starts).
+fn enter_in_flight(identity: &str, games: &[String]) {
     IN_FLIGHT.with(|f| {
-        *f.borrow_mut() = games
-            .iter()
-            .map(|g| subject_memo_name(identity, g))
-            .collect();
+        f.borrow_mut()
+            .extend(games.iter().map(|g| subject_memo_name(identity, g)));
+    });
+}
+
+/// One identity's chunk leaves the in-flight set (its judge call answered).
+fn leave_in_flight(identity: &str, games: &[String]) {
+    IN_FLIGHT.with(|f| {
+        let mut f = f.borrow_mut();
+        for g in games {
+            let name = subject_memo_name(identity, g);
+            if let Some(i) = f.iter().position(|x| *x == name) {
+                f.swap_remove(i);
+            }
+        }
     });
 }
 
@@ -536,7 +579,7 @@ pub async fn deliver(
         // D2-ACTOR-E (bsv-low #954): with the bound, the txids its marks name, for the deferred narrowed apply (the
         // D1 judge acknowledges those marks before the actor reads).
         let (bound, marks_touch) = owed_judge::marks_bound_keys(db, identity, games).await?;
-        db.note_marks_touch(marks_touch);
+        db.note_marks_touch(identity, marks_touch);
         let report =
             owed_judge::judge_subjects_acked_to(db, identity, games, "owed-events", bound).await?;
         // The D2-ACTOR-B lens's MEDIUM-6: Phase A's apply and compare run after the batch (`ctx.wait_until`), never
@@ -816,7 +859,18 @@ fn memo_holds(memos: &[Value]) -> BTreeMap<String, i64> {
 /// (`age`/`age`, `tip`/`gate`, `tip`/`untipped`, `backfill`/`owed-v2`) are never stopped by one poisoned subject.
 /// `Err` only when NOTHING landed and some subject faulted: the pair's own memo and hold (the consumer's) then cover
 /// a pair whose every subject faults (a D1 or chaintracks outage). A landed subject's memo is cleared.
+///
+/// FIX-952 (bsv-low #952, item 3; the L53 fold's S1 and S2, records 1544 to 1548): the plan's IDENTITIES are
+/// delivered AT ONCE, [`JUDGE_IDENTITIES_AT_ONCE`] at a time ([`judge_identity`] each, over `buffer_unordered`), so a
+/// batch of 16 messages for 16 identities costs about ONE identity's delivery (in Phase B the actor's apply then the
+/// D1 judge's commit, [`crate::owed_actor::actor_then_d1`]), not sixteen in a row: at 33 pairs the serial pass took
+/// 61 to 70 s a batch of 16 against the 60 s wall and cleared about 15 events a minute of 243. WITHIN one identity
+/// its chunks stay sequential (one D1 writer of its rows at a time: HIGH-3's order, the actor before the
+/// acknowledgement, holds per identity), and the per-identity state the pass keeps (the judge's marks-touch, the
+/// in-flight set) is keyed by identity. The outcome is the same whatever the completion order: each identity's
+/// landed and faulted subjects, its cleared memos and its first fault are merged after every identity answered.
 pub async fn judge_plan(db: &impl JudgeDb, plan: Plan) -> Result<Routed, String> {
+    use futures_util::StreamExt as _;
     let Plan {
         order,
         games,
@@ -846,83 +900,29 @@ pub async fn judge_plan(db: &impl JudgeDb, plan: Plan) -> Result<Routed, String>
         )
     };
     let now = db.now_ms() as i64;
+    // FIX-952: every identity of the pass at once (bounded), each one's chunks in order
+    let judged: Vec<IdentityJudged> =
+        futures_util::stream::iter(order.into_iter().map(|identity| {
+            let list = games.get(&identity).cloned().unwrap_or_default();
+            judge_identity(db, identity, list, &memos, now, &held)
+        }))
+        .buffer_unordered(JUDGE_IDENTITIES_AT_ONCE)
+        .collect()
+        .await;
     let mut landed = 0usize;
     let mut cleared: Vec<String> = Vec::new();
     let mut first_fault: Option<String> = None;
-    let marks_of = |identity: &str, chunk: &[String]| -> usize {
-        chunk
-            .iter()
-            .map(|g| {
-                held.get(&(identity.to_owned(), g.clone()))
-                    .copied()
-                    .unwrap_or(0)
-            })
-            .sum()
-    };
-    for identity in order {
-        let mut list: Vec<String> = Vec::new();
-        for g in &games[&identity] {
-            if memos
-                .get(&subject_memo_name(&identity, g))
-                .is_some_and(|until| *until > now)
-            {
-                out.held += 1;
-            } else {
-                list.push(g.clone());
-            }
-        }
-        for chunk in list.chunks(owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION) {
-            set_in_flight(&identity, chunk);
-            let delivered = deliver(db, &identity, chunk).await;
-            set_in_flight(&identity, &[]);
-            let singles: Vec<&[String]> = match delivered {
-                Ok(report) => {
-                    landed += 1;
-                    out.subjects += report.subjects;
-                    out.marks += marks_of(&identity, chunk);
-                    out.landed
-                        .extend(chunk.iter().map(|g| (identity.clone(), g.clone())));
-                    cleared.extend(
-                        chunk
-                            .iter()
-                            .map(|g| subject_memo_name(&identity, g))
-                            .filter(|n| memos.contains_key(n)),
-                    );
-                    continue;
-                }
-                Err(e) if chunk.len() == 1 => {
-                    out.faults += 1;
-                    out.faulted.push((identity.clone(), chunk[0].clone()));
-                    let name = subject_memo_name(&identity, &chunk[0]);
-                    let _ = note_fault_named(db, &name, &e).await;
-                    first_fault.get_or_insert(e);
-                    continue;
-                }
-                Err(_) => chunk.chunks(1).collect(),
-            };
-            for one in singles {
-                let name = subject_memo_name(&identity, &one[0]);
-                set_in_flight(&identity, one);
-                let delivered = deliver(db, &identity, one).await;
-                set_in_flight(&identity, &[]);
-                match delivered {
-                    Ok(report) => {
-                        landed += 1;
-                        out.subjects += report.subjects;
-                        out.marks += marks_of(&identity, one);
-                        out.landed.push((identity.clone(), one[0].clone()));
-                        if memos.contains_key(&name) {
-                            cleared.push(name);
-                        }
-                    }
-                    Err(e) => {
-                        out.faults += 1;
-                        out.faulted.push((identity.clone(), one[0].clone()));
-                        let _ = note_fault_named(db, &name, &e).await;
-                        first_fault.get_or_insert(e);
-                    }
-                }
-            }
+    for j in judged {
+        landed += j.landed_calls;
+        out.subjects += j.subjects;
+        out.marks += j.marks;
+        out.held += j.held;
+        out.faults += j.faulted.len();
+        out.landed.extend(j.landed);
+        out.faulted.extend(j.faulted);
+        cleared.extend(j.cleared);
+        if first_fault.is_none() {
+            first_fault = j.first_fault;
         }
     }
     if !cleared.is_empty() {
@@ -945,6 +945,115 @@ pub async fn judge_plan(db: &impl JudgeDb, plan: Plan) -> Result<Routed, String>
         }
     }
     Ok(out)
+}
+
+/// FIX-952 (bsv-low #952, item 3): how many of a pass's identities [`judge_plan`] delivers at once: the batch's own
+/// size ([`CONSUMER_BATCH_MAX`], 16 messages, each naming an identity or two), so a batch's identities all go at once
+/// and a wider merged plan (several identities a message) goes in rounds of 16. The direct pass already calls up to
+/// [`DIRECT_EVENTS_MAX`] actors at once (`join_all`); this is the consumer's half of the same shape.
+pub const JUDGE_IDENTITIES_AT_ONCE: usize = CONSUMER_BATCH_MAX;
+
+/// One identity's outcome of a judge pass ([`judge_identity`]), merged by [`judge_plan`] after every identity answered.
+#[derive(Debug, Default)]
+struct IdentityJudged {
+    /// Judge calls that landed (a pass with none and a fault is the pass's `Err`).
+    landed_calls: usize,
+    subjects: usize,
+    marks: usize,
+    /// Subjects skipped under their subject hold.
+    held: usize,
+    landed: Vec<(String, String)>,
+    faulted: Vec<(String, String)>,
+    /// A landed subject's memo, to clear.
+    cleared: Vec<String>,
+    first_fault: Option<String>,
+}
+
+/// One identity's games through [`deliver`], 16 a call, each chunk in order (one D1 writer of its rows at a time): a
+/// faulting chunk judged again one subject at a time, a held subject skipped, a faulting one noted on its own memo
+/// (NEW-M1's rule, unchanged by FIX-952: only the identities run beside each other now).
+async fn judge_identity(
+    db: &impl JudgeDb,
+    identity: String,
+    games: Vec<String>,
+    memos: &BTreeMap<String, i64>,
+    now: i64,
+    held: &BTreeMap<(String, String), usize>,
+) -> IdentityJudged {
+    let mut out = IdentityJudged::default();
+    let marks_of = |chunk: &[String]| -> usize {
+        chunk
+            .iter()
+            .map(|g| {
+                held.get(&(identity.clone(), g.clone()))
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .sum()
+    };
+    let mut list: Vec<String> = Vec::new();
+    for g in &games {
+        if memos
+            .get(&subject_memo_name(&identity, g))
+            .is_some_and(|until| *until > now)
+        {
+            out.held += 1;
+        } else {
+            list.push(g.clone());
+        }
+    }
+    for chunk in list.chunks(owed_judge::OWED_JUDGE_SUBJECTS_PER_INVOCATION) {
+        enter_in_flight(&identity, chunk);
+        let delivered = deliver(db, &identity, chunk).await;
+        leave_in_flight(&identity, chunk);
+        let singles: Vec<&[String]> = match delivered {
+            Ok(report) => {
+                out.landed_calls += 1;
+                out.subjects += report.subjects;
+                out.marks += marks_of(chunk);
+                out.landed
+                    .extend(chunk.iter().map(|g| (identity.clone(), g.clone())));
+                out.cleared.extend(
+                    chunk
+                        .iter()
+                        .map(|g| subject_memo_name(&identity, g))
+                        .filter(|n| memos.contains_key(n)),
+                );
+                continue;
+            }
+            Err(e) if chunk.len() == 1 => {
+                out.faulted.push((identity.clone(), chunk[0].clone()));
+                let name = subject_memo_name(&identity, &chunk[0]);
+                let _ = note_fault_named(db, &name, &e).await;
+                out.first_fault.get_or_insert(e);
+                continue;
+            }
+            Err(_) => chunk.chunks(1).collect(),
+        };
+        for one in singles {
+            let name = subject_memo_name(&identity, &one[0]);
+            enter_in_flight(&identity, one);
+            let delivered = deliver(db, &identity, one).await;
+            leave_in_flight(&identity, one);
+            match delivered {
+                Ok(report) => {
+                    out.landed_calls += 1;
+                    out.subjects += report.subjects;
+                    out.marks += marks_of(one);
+                    out.landed.push((identity.clone(), one[0].clone()));
+                    if memos.contains_key(&name) {
+                        out.cleared.push(name);
+                    }
+                }
+                Err(e) => {
+                    out.faulted.push((identity.clone(), one[0].clone()));
+                    let _ = note_fault_named(db, &name, &e).await;
+                    out.first_fault.get_or_insert(e);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// One `(source, sourceKey)` pair the sweep re-publishes.

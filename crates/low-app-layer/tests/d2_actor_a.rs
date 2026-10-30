@@ -1075,11 +1075,14 @@ async fn d2_actor_a_fold3_low1_low2_the_wall_notes_its_subjects_and_a_stale_memo
     let c = serde_json::json!({"faults": 9, "heldUntilMs": 1_000});
     assert_eq!(owed_events::stale_memo_faults(&c, 1_000 + owed_events::FAULT_HOLD_CAP_MS), 9);
     assert_eq!(owed_events::stale_memo_faults(&c, 1_001 + owed_events::FAULT_HOLD_CAP_MS), 0);
-    // the wiring: every judge call sets its subjects in flight; the wall's branch takes them
+    // the wiring: every judge call enters its subjects into the in-flight set and leaves it when it answers (FIX-952:
+    // a set, the pass's identities delivered at once); the wall's branch takes them
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     let src = squash(include_str!("../src/owed_events.rs"));
-    assert_eq!(src.matches("set_in_flight(&identity,chunk);").count(), 1);
-    assert_eq!(src.matches("set_in_flight(&identity,one);").count(), 1);
+    assert_eq!(src.matches("enter_in_flight(&identity,chunk);").count(), 1);
+    assert_eq!(src.matches("leave_in_flight(&identity,chunk);").count(), 1);
+    assert_eq!(src.matches("enter_in_flight(&identity,one);").count(), 1);
+    assert_eq!(src.matches("leave_in_flight(&identity,one);").count(), 1);
     assert!(src.contains("letin_flight=take_in_flight();"));
     // D2-ACTOR-B-FOLD-11: both arms call one rule, `wall_fate` (the subjects in flight, else the pair)
     assert!(src.contains("matchnote_wall_subjects(db,in_flight).await{"));

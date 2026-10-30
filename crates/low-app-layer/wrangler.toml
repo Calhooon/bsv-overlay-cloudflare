@@ -56,8 +56,19 @@ OWED_ACTOR_READ = "false"
 OWED_D1_JUDGE = "true"
 # D2-ACTOR-D (bsv-low #952): the `owed-events` consumer's concurrency, the cutover doc's knob: "1" while the D1 judge
 # writes `owed_rows` (Phases A and B: two consumers judging one identity's games are two D1 writers); Phase C (the
-# actor the one writer, each identity serialised by its own Durable Object) may raise it, moved WITH the consumer's
+# actor the one writer, each identity serialised by its own Durable Object) raises it, moved WITH the consumer's
 # `max_concurrency` below (pinned equal; the consumer names a value above 1 while `OWED_D1_JUDGE` is on, every batch).
+# FIX-952 (bsv-low #952): THE ONE-WRITER RULE PER PHASE. A (`OWED_ACTOR_READ=false`, `OWED_D1_JUDGE=true`): the D1
+# judge writes `owed_rows` (the consumer's delivery and the drain), the actor writes its own SQLite beside it. B
+# (`true`, `true`): the D1 judge still writes `owed_rows` (the rollback's mirror), the actor's rows are served; the
+# actor applies before the D1 judge acknowledges. C (`true`, `false`): the actor is the ONE writer, in its own
+# Durable Object per identity; nothing writes `owed_rows`, and the consumer makes no D1 judge call. So in A and B
+# the concurrency is 1 (two consumers would be two D1 writers of one identity's rows); in C it is 4 (each identity
+# serialised by its object, its events ordered by the actor's `seq`, never by the queue; the consumers' only D1
+# writes are the idempotent acknowledgements of marks each read before its own call). The Phase C deploy's edit of
+# THIS render is the next commented line (with the consumer block's below), pinned equal to
+# `owed_events::CONSUMER_CONCURRENCY_PHASE_C`:
+# PHASE C: OWED_CONSUMER_CONCURRENCY = "4"
 OWED_CONSUMER_CONCURRENCY = "1"
 # D2-ACTOR-B-FOLD-15: D1's re-judge's games a tick after a JUDGE_VERSION move (at most 32; "0" pauses). The lever
 # `POST /internal/owed-rejudge {"gamesPerTick": N}` (bearer INTERNAL_TOKEN) overrides it with no deploy.
@@ -300,6 +311,12 @@ dead_letter_queue = "low-owed-events-dlq"
 # D2-ACTOR-D (bsv-low #952): ONE consumer while the D1 judge writes `owed_rows` (Phases A and B): two consumers
 # judging one identity's games would be two D1 writers, the first's stale rows committed over the second's. Equal to
 # `OWED_CONSUMER_CONCURRENCY` in [vars] (pinned); Phase C's cutover moves both together.
+# FIX-952 (bsv-low #952): in Phase C (`OWED_D1_JUDGE=false`) the consumer writes no `owed_rows` and makes no D1 judge
+# call (the actor is the one writer, each identity serialised by its own Durable Object), so N consumers cannot race
+# on D1: the Phase C deploy's edit of THIS line is the next commented line (with `[vars]`' above), pinned equal to
+# `owed_events::CONSUMER_CONCURRENCY_PHASE_C`. Within one consumer the batch's identities are delivered at once
+# (`owed_events::JUDGE_IDENTITIES_AT_ONCE`, FIX-952) in every phase.
+# PHASE C: max_concurrency = 4
 max_concurrency = 1
 
 # LOW-3: the owed events' dead letters, parked in D1 (`owed_event_dead_letters`,
@@ -328,8 +345,19 @@ OWED_ACTOR_READ = "false"
 OWED_D1_JUDGE = "true"
 # D2-ACTOR-D (bsv-low #952): the `owed-events` consumer's concurrency, the cutover doc's knob: "1" while the D1 judge
 # writes `owed_rows` (Phases A and B: two consumers judging one identity's games are two D1 writers); Phase C (the
-# actor the one writer, each identity serialised by its own Durable Object) may raise it, moved WITH the consumer's
+# actor the one writer, each identity serialised by its own Durable Object) raises it, moved WITH the consumer's
 # `max_concurrency` below (pinned equal; the consumer names a value above 1 while `OWED_D1_JUDGE` is on, every batch).
+# FIX-952 (bsv-low #952): THE ONE-WRITER RULE PER PHASE. A (`OWED_ACTOR_READ=false`, `OWED_D1_JUDGE=true`): the D1
+# judge writes `owed_rows` (the consumer's delivery and the drain), the actor writes its own SQLite beside it. B
+# (`true`, `true`): the D1 judge still writes `owed_rows` (the rollback's mirror), the actor's rows are served; the
+# actor applies before the D1 judge acknowledges. C (`true`, `false`): the actor is the ONE writer, in its own
+# Durable Object per identity; nothing writes `owed_rows`, and the consumer makes no D1 judge call. So in A and B
+# the concurrency is 1 (two consumers would be two D1 writers of one identity's rows); in C it is 4 (each identity
+# serialised by its object, its events ordered by the actor's `seq`, never by the queue; the consumers' only D1
+# writes are the idempotent acknowledgements of marks each read before its own call). The Phase C deploy's edit of
+# THIS render is the next commented line (with the consumer block's below), pinned equal to
+# `owed_events::CONSUMER_CONCURRENCY_PHASE_C`:
+# PHASE C: OWED_CONSUMER_CONCURRENCY = "4"
 OWED_CONSUMER_CONCURRENCY = "1"
 # D2-ACTOR-B-FOLD-15: D1's re-judge's games a tick after a JUDGE_VERSION move (at most 32; "0" pauses). The lever
 # `POST /internal/owed-rejudge {"gamesPerTick": N}` (bearer INTERNAL_TOKEN) overrides it with no deploy.
@@ -448,6 +476,12 @@ dead_letter_queue = "low-owed-events-beta-dlq"
 # D2-ACTOR-D (bsv-low #952): ONE consumer while the D1 judge writes `owed_rows` (Phases A and B): two consumers
 # judging one identity's games would be two D1 writers, the first's stale rows committed over the second's. Equal to
 # `OWED_CONSUMER_CONCURRENCY` in [vars] (pinned); Phase C's cutover moves both together.
+# FIX-952 (bsv-low #952): in Phase C (`OWED_D1_JUDGE=false`) the consumer writes no `owed_rows` and makes no D1 judge
+# call (the actor is the one writer, each identity serialised by its own Durable Object), so N consumers cannot race
+# on D1: the Phase C deploy's edit of THIS line is the next commented line (with `[vars]`' above), pinned equal to
+# `owed_events::CONSUMER_CONCURRENCY_PHASE_C`. Within one consumer the batch's identities are delivered at once
+# (`owed_events::JUDGE_IDENTITIES_AT_ONCE`, FIX-952) in every phase.
+# PHASE C: max_concurrency = 4
 max_concurrency = 1
 
 # LOW-3: the owed events' dead letters, parked in D1 (`owed_event_dead_letters`,
