@@ -28,6 +28,8 @@
 #[allow(dead_code)]
 #[path = "support/owed_db.rs"]
 mod owed_db;
+#[path = "support/owed_render.rs"]
+mod owed_render;
 
 use low_app_layer::owed_actor;
 use low_app_layer::owed_events::{self, DirectPort, Fate};
@@ -281,7 +283,10 @@ async fn fix952_c_phase_b_a_batch_of_16_identities_applies_within_about_one_judg
 /// tables, the 16 actors were called once each, the marks are acknowledged (the actor is the one writer), and the
 /// D1 statements an event are counted and printed (the Phase C concurrency's cost). Then the Phase C render pair: the
 /// constant, its rule by phase, and the two `PHASE C:` lines in each render of `wrangler.toml` (the lever's exact
-/// edit) equal to it.
+/// edit) equal to it. The LIVE lines (PR 233, bsv-low #984): one consumer at a time unless the D1 judge is off,
+/// read per environment from the committed render (the live block's `max_concurrency` equal to
+/// `OWED_CONSUMER_CONCURRENCY`, both 1 or `OWED_D1_JUDGE = "false"`; prod at 1 with the judge on), and a judge-on
+/// render at 4 refused.
 #[tokio::test(flavor = "current_thread")]
 async fn fix952_d_phase_c_the_consumer_makes_no_judge_call_and_writes_no_owed_rows() {
     let db = Db::new();
@@ -401,9 +406,33 @@ async fn fix952_d_phase_c_the_consumer_makes_no_judge_call_and_writes_no_owed_ro
         .lines()
         .filter(|l| l.starts_with("OWED_CONSUMER_CONCURRENCY = \""))
         .count();
+    assert_eq!(live_lines, 2, "the live knob in both renders");
+    for env in ["", "env.beta."] {
+        let p = owed_render::env_phase(render, env);
+        assert_eq!(
+            owed_render::breaches(&p),
+            Vec::<String>::new(),
+            "{env}: one consumer at a time unless the D1 judge is off: {p:?}"
+        );
+        assert!(
+            !consumer_concurrency_refused(
+                p.concurrency_var.unwrap_or(1),
+                p.d1_judge.as_deref() != Some("false")
+            ),
+            "{env}: the consumer's own rule honours the render: {p:?}"
+        );
+    }
+    let prod = owed_render::env_phase(render, "");
     assert_eq!(
-        live_lines, 2,
-        "the live knob stays 1 in both renders until the Phase C deploy"
+        (prod.live_max, prod.d1_judge.as_deref()),
+        (Some(CONSUMER_MAX_CONCURRENCY), Some("true")),
+        "prod (Phase A): one consumer, the D1 judge on"
+    );
+    let inverse = owed_render::env_phase(owed_render::JUDGE_ON_AT_FOUR, "");
+    assert!(
+        !owed_render::breaches(&inverse).is_empty()
+            && consumer_concurrency_refused(inverse.concurrency_var.unwrap_or(1), true),
+        "a judge-on render at 4 is refused: {inverse:?}"
     );
     let mut consumer_blocks = 0;
     for block in render.split("[[") {
@@ -422,10 +451,6 @@ async fn fix952_d_phase_c_the_consumer_makes_no_judge_call_and_writes_no_owed_ro
                 "\n# PHASE C: max_concurrency = {CONSUMER_CONCURRENCY_PHASE_C}\n"
             )),
             "the Phase C line in the live consumer block: {block}"
-        );
-        assert!(
-            block.contains(&format!("\nmax_concurrency = {CONSUMER_MAX_CONCURRENCY}\n")),
-            "the live block stays at 1 until the Phase C deploy: {block}"
         );
     }
     assert_eq!(consumer_blocks, 2, "prod and beta");
