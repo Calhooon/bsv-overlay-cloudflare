@@ -4,6 +4,8 @@
 #[allow(dead_code)]
 #[path = "support/owed_db.rs"]
 mod owed_db;
+#[path = "support/owed_render.rs"]
+mod owed_render;
 
 use low_app_layer::{owed_events, owed_events_publish as publish};
 use overlay_discovery::owed_event::{self, OwedEvent};
@@ -350,7 +352,10 @@ fn spend_the_hop(db: &Db, hop: &str) {
 /// and committing AFTER the second event's judge: the interleaving two concurrent consumers make. Its rows are the
 /// first's stale ones over the second's, with every mark acknowledged (nothing pending withholds the press): the
 /// class `max_concurrency = 1` excludes. Run one at a time (the configured consumer), the second event's rows stand.
-/// The renders: every `owed-events` consumer of both app-layer environments (and its dead letters') is ONE at a time.
+/// The renders: every `owed-events` consumer of both app-layer environments is one at a time unless the D1 judge is
+/// off (PR 233, bsv-low #984: beta's committed Phase C render runs 4 with `OWED_D1_JUDGE = "false"`, the actor the
+/// one writer); its dead letters' consumer is one at a time in every phase; prod (Phase A) reads 1 with the judge on.
+/// And the inverse: a render at 4 with the judge on is refused.
 #[tokio::test(flavor = "current_thread")]
 async fn d2_actor_a_fold_m1_one_consumer_at_a_time_derives_the_second_events_rows() {
     let hop = owed_db::hop(7);
@@ -408,26 +413,32 @@ async fn d2_actor_a_fold_m1_one_consumer_at_a_time_derives_the_second_events_row
         "two at a time: the first event's stale rows stand over the second's"
     );
 
-    // the renders: one consumer at a time for the queue and its dead letters, in both environments
+    // the renders: one consumer at a time for the queue unless the D1 judge is off, its dead letters always one
     let render = include_str!("../wrangler.toml");
     for env in ["", "env.beta."] {
-        let head = format!("[[{env}queues.consumers]]");
-        let blocks: Vec<&str> = render.split("[[").collect();
-        let owed: Vec<&&str> = blocks
-            .iter()
-            .filter(|b| b.starts_with(&head[2..]) && b.contains("owed-events"))
-            .collect();
-        assert_eq!(owed.len(), 2, "{env}: the queue's consumer and its dead letters'");
-        for block in owed {
-            assert!(
-                block.contains(&format!(
-                    "max_concurrency = {}",
-                    low_app_layer::owed_events::CONSUMER_MAX_CONCURRENCY
-                )),
-                "{env}: one consumer at a time: {block}"
-            );
-        }
+        let p = owed_render::env_phase(render, env);
+        assert_eq!(
+            owed_render::breaches(&p),
+            Vec::<String>::new(),
+            "{env}: one consumer at a time unless the D1 judge is off: {p:?}"
+        );
     }
+    let prod = owed_render::env_phase(render, "");
+    assert_eq!(
+        (prod.live_max, prod.d1_judge.as_deref()),
+        (
+            Some(low_app_layer::owed_events::CONSUMER_MAX_CONCURRENCY),
+            Some("true")
+        ),
+        "prod (Phase A): one consumer, the D1 judge on"
+    );
+    let inverse = owed_render::breaches(&owed_render::env_phase(owed_render::JUDGE_ON_AT_FOUR, ""));
+    assert!(
+        inverse
+            .iter()
+            .any(|b| b.contains("one consumer at a time unless the D1 judge is off")),
+        "concurrency 4 with the D1 judge on is refused: {inverse:?}"
+    );
 }
 
 /// MEDIUM-2 (the D2-ACTOR-A lens): A PAIR WHOSE JUDGE FAULTS FOR GOOD COSTS A BOUNDED, BACKING-OFF NUMBER OF ATTEMPTS
