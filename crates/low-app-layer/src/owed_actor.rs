@@ -840,6 +840,13 @@ pub struct ApplyReport {
     pub asks: usize,
     /// D2-ACTOR-B-FOLD-14: a bootstrap page's games and their `at`, in the page's order ([`ApplyOpts::page`]).
     pub page: Vec<(String, i64)>,
+    /// FIX-960 (bsv-low #960, the tenth delta lens's NEW10-L1): the greatest generation of the games' marks this
+    /// apply's closure READ, in the same snapshot as (or just before) the record's rows: a mark at or below it was
+    /// written before the read, so its source change is in what the apply judged. Answered `readGeneration`; `None`
+    /// (absent from the answer) where no marks were read with the rows, where the closure took more than one round
+    /// (a later round's snapshot is newer than the number), and on a dupe. The reconcile cuts its held partition at it
+    /// ([`HELD_GAMES_SQL`]).
+    pub read_generation: Option<i64>,
 }
 
 /// The decoded facts of a copied BEEF row: the pot's own (`pot`, `pot_beefs` only) and the stored order's.
@@ -1554,6 +1561,7 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
         // games, read nowhere yet, are the next round's).
         pre = Some((k, rows));
         covered = Some(bound);
+        report.read_generation = Some(bound);
     }
     if let (true, Some(touch)) = (warm, &opts.touch) {
         // The warm mirror's WHOLE key set, every family, beside the event's keys (FOLD-11, NEW6-M1: no family is
@@ -1593,6 +1601,7 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
             .filter_map(|m| m["generation"].as_i64())
             .max()
             .unwrap_or(0);
+        report.read_generation = Some(bound);
         if marks
             .iter()
             .any(|m| FULL_SOURCES.contains(&m["source"].as_str().unwrap_or("")))
@@ -1658,6 +1667,7 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
                 report.read_ms += local.now_ms().saturating_sub(t);
                 if first && narrow.is_none() {
                     covered = bound;
+                    report.read_generation = bound;
                 }
                 (read_keys, read)
             }
@@ -1708,6 +1718,10 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
     };
     report.txids = keys.txids.len();
     report.narrowed = narrow.is_some();
+    if report.rounds > 1 {
+        // FIX-960: a later round read a newer snapshot than the marks' number names.
+        report.read_generation = None;
+    }
     let t = local.now_ms();
     report.rows = commit_fixpoint(local, &me, staged).await?;
     report.write_ms += local.now_ms().saturating_sub(t);
@@ -1874,7 +1888,7 @@ pub async fn commit_fixpoint<L: SqlPort>(
 /// The answer of one apply (the object's `/apply`, the pins' harness): the actor's rows, the redelivery verdict, the
 /// games the event has applied.
 pub fn answer_of(report: &ApplyReport, rows: Vec<Value>) -> Value {
-    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply, "misses": report.misses, "narrowed": report.narrowed, "coalesced": report.coalesced, "readMs": report.read_ms, "judgeMs": report.judge_ms, "writeMs": report.write_ms, "waitMs": report.wait_ms, "outsideMs": report.outside_ms, "asksQueued": report.asks})
+    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply, "misses": report.misses, "narrowed": report.narrowed, "coalesced": report.coalesced, "readMs": report.read_ms, "judgeMs": report.judge_ms, "writeMs": report.write_ms, "waitMs": report.wait_ms, "outsideMs": report.outside_ms, "asksQueued": report.asks, "readGeneration": report.read_generation})
 }
 
 /// D2-ACTOR-E (bsv-low #954) item 4: was the event born on a WARM actor (written at or after the actor's bootstrap
@@ -2429,6 +2443,11 @@ pub async fn apply_burst<R: SqlPort, L: SqlPort, O: Outside>(
         report.write_ms = reports.iter().map(|r| r.write_ms).sum();
         report.outside_ms = reports.iter().map(|r| r.outside_ms).sum();
         report.asks = reports.iter().map(|r| r.asks).sum();
+        // FIX-960: the pass's read generation only when every chunk read the record at the same one.
+        report.read_generation = match reports.first().map(|r| r.read_generation) {
+            Some(g) if reports.iter().all(|r| r.read_generation == g) => g,
+            _ => None,
+        };
         report.applied_games = lowered(&item.games);
         report.first_apply = first;
         report.skipped = false;
@@ -5007,7 +5026,8 @@ async fn reconcile_fresh(
     // D2-ACTOR-B-FOLD-16 (NEW9-M1): the games a mark holds at the START explain only the actor's stored rows against
     // its re-apply (`missed`); both fresh judgements read the record after such a mark, so they never excuse a
     // difference between the two (`disagree`). Only a mark written WHILE the two judged (`during`, above the bound)
-    // does: the delivery compare's NEW2-L1 rule.
+    // does: the delivery compare's NEW2-L1 rule. FIX-960: and only one the actor's closure READ (at most its
+    // `readGeneration`): a mark written after its read is neither judgement's input, so it excuses nothing.
     let start: BTreeSet<String> = marks
         .iter()
         .filter_map(|m| m["gameId"].as_str().map(str::to_string))
@@ -5029,9 +5049,14 @@ async fn reconcile_fresh(
         return Ok(report);
     }
     report.judged = judge.len();
-    // The actor fresh, at the same tip (the port's: the reconcile's served tip).
-    let fresh_actor: Vec<Value> = match db.actor_apply(&identity, judge, "reconcile").await {
-        Ok(Some(a)) if !is_held(&a) => a["rows"].as_array().cloned().unwrap_or_default(),
+    // The actor fresh, at the same tip (the port's: the reconcile's served tip). FIX-960: with the greatest mark
+    // generation its closure read, where the held partition is cut (HELD_GAMES_SQL's one rule).
+    let answer = db.actor_apply(&identity, judge, "reconcile").await;
+    let (fresh_actor, actor_read): (Vec<Value>, i64) = match answer {
+        Ok(Some(a)) if !is_held(&a) => (
+            a["rows"].as_array().cloned().unwrap_or_default(),
+            crate::owed_events::ms_of(&a["readGeneration"]).unwrap_or(i64::MAX),
+        ),
         Ok(Some(_)) => {
             db.log(&format!(
                 "[owed-actor] reconcile {identity}: the actor holds (bootstrapping), no compare"
@@ -5063,6 +5088,7 @@ async fn reconcile_fresh(
                 Bind::Text(identity.clone()),
                 Bind::Text(judge_json),
                 Bind::Int(bound),
+                Bind::Int(actor_read),
             ],
         ),
     ];
@@ -6076,10 +6102,25 @@ pub async fn actor_then_d1(
     Ok(report)
 }
 
-/// The games of `?2` (a JSON array) holding a mark of `?1`'s above the acknowledgement bound `?3`: Phase B's compare
-/// (the second delta lens's NEW2-L1); since FIX-964 the reconcile's alone (the delivery's compare reads
-/// [`PENDING_MARKS_SQL`]).
-pub const HELD_GAMES_SQL: &str = "SELECT DISTINCT gameId FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2)) AND generation>?3";
+/// The games of `?2` (a JSON array) holding a mark of `?1`'s above the acknowledgement bound `?3` and at most `?4`:
+/// Phase B's compare (the second delta lens's NEW2-L1); since FIX-964 the reconcile's alone (the delivery's compare
+/// reads [`PENDING_MARKS_SQL`]).
+///
+/// THE ONE RULE (FIX-960, bsv-low #960; the tenth delta lens's NEW10-L1), for both compares: a pending mark explains a
+/// difference between two fresh judgements only when ONE of them read its change and the other did not, i.e. its
+/// generation is above what the EARLIER reader read and at most what the LATER reader read. A mark neither read
+/// (written after the later reader's read) explains nothing: the two judged one record, so their difference is a
+/// judge disagreement. A mark both read explains nothing either. The reconcile judges D1 first and the actor second,
+/// so `?3` is the bound read before D1's judge and `?4` the actor's own answer, the greatest generation its closure
+/// read (`readGeneration`, [`ApplyReport::read_generation`]); an answer without one (an older object build, a
+/// closure of more than one round) binds `?4` past every generation, FOLD-16's rule. The delivery compare
+/// ([`PENDING_MARKS_SQL`]) runs the other order (the actor, then D1), so its earlier reader's number is the bound and
+/// its later reader is the D1 judge, which answers no read generation: its `whileMarks` stay open above (NEW2-L1's
+/// accepted tail). FIX-964's `lagMarks` (at or below the bound, still pending, older than the compare) are the
+/// delivery's own class: the actor's stored rows predating a backlog, not two fresh reads; the reconcile compares
+/// fresh with fresh and has none. Stated: a mark written between the bound's read and D1's judge read is read by
+/// both and still held here (the bound is read one round trip before D1's judge), the residual this cut leaves.
+pub const HELD_GAMES_SQL: &str = "SELECT DISTINCT gameId FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2)) AND generation>?3 AND generation<=?4";
 
 /// FIX-964 (bsv-low #964): the delivery compare's ONE read of `owed_dirty` (the queue's unacknowledged set, lane A),
 /// per compared game of `?1`'s (`?2`, a JSON array): `whileMarks` the marks above the acknowledgement bound `?3`
