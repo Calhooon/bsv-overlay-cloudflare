@@ -7035,9 +7035,10 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     };
     // D2-ACTOR-B-FOLD-6: the owed actor's health snapshot rides the consumer row's statement (one row more, no
     // statement more: the land tier's `health-dirty-snapshot`).
-    let (owed_events_body, actor_snapshot) = match D1Sql::of(&ctx.env) {
-        Ok(sql) => crate::owed_events::health_and_actor(&sql, &dirty).await,
-        Err(_) => (serde_json::Value::Null, None),
+    // FIX-998-SERVE (bsv-low #998): the fleet compare's public counts, the ring's snapshot row, a third row of it.
+    let (owed_events_body, actor_snapshot, fleet_compare) = match D1Sql::of(&ctx.env) {
+        Ok(sql) => crate::owed_events::health_actor_fleet(&sql, &dirty).await,
+        Err(_) => (serde_json::Value::Null, None, serde_json::Value::Null),
     };
     body["owedEvents"] = owed_events_body;
     body["owed"]["dirty"] = dirty;
@@ -7065,6 +7066,9 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     body["owedActor"]["d1Judge"] = serde_json::json!(d1_judges);
     body["owedActor"]["bound"] =
         serde_json::json!(ctx.env.durable_object(crate::owed_actor::BINDING).is_ok());
+    // FIX-998-SERVE: `owedActor.fleetCompare` {identities, diffs, heldByLag, oldestCompareAgeMs, revolution,
+    // lastRevolutionMs, lastTickAt, faults, ..}, the summary route's figures (`null` before the ring's first tick).
+    body["owedActor"]["fleetCompare"] = fleet_compare;
     // The flags at the design's named place (the harness reads `owedActor.flags.OWED_ACTOR_READ`).
     body["owedActor"]["flags"] = serde_json::json!({
         crate::owed_actor::READ_FLAG: body["owedActor"]["readFlag"],

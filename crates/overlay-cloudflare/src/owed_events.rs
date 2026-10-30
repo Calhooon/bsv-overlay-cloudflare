@@ -720,7 +720,7 @@ pub async fn publish_before_answer(env: &worker::Env, frames: Vec<Value>) -> Vec
 /// `owed_belt_state`'s primary key, the pairs and subjects whose judge faulted), and the parked letters by status (at
 /// most [`DEAD_LETTERS_MAX`] rows). These were five statements of the app layer's `/health` (the budget tier's
 /// `health-dirty-snapshot` red); the app layer's `/health.owedEvents` keeps the ages only.
-pub const HEALTH_STATE_SQL: &str = "SELECT (SELECT cursor FROM owed_belt_state WHERE name='owed-events:consumer') AS consumer,(SELECT json_object('rows',COUNT(*),'held',COALESCE(SUM(json_extract(cursor,'$.heldUntilMs')>?1),0),'maxFaults',MAX(json_extract(cursor,'$.faults'))) FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;') AS memo,(SELECT json_object('name',name,'cursor',json(cursor)) FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;' ORDER BY tickedAtMs DESC LIMIT 1) AS lastMemo,(SELECT json_group_object(status,n) FROM (SELECT status,COUNT(*) AS n FROM owed_event_dead_letters GROUP BY status)) AS letters,(SELECT json_object('identities',COUNT(*),'diffs',COALESCE(SUM(diffCount>0),0),'heldByLag',COALESCE(SUM(heldByLagCount>0),0),'faults',COALESCE(SUM(fault IS NOT NULL),0),'oldest',MIN(comparedAtMs)) FROM owed_actor_compare) AS fleetCompare";
+pub const HEALTH_STATE_SQL: &str = "SELECT (SELECT cursor FROM owed_belt_state WHERE name='owed-events:consumer') AS consumer,(SELECT json_object('rows',COUNT(*),'held',COALESCE(SUM(json_extract(cursor,'$.heldUntilMs')>?1),0),'maxFaults',MAX(json_extract(cursor,'$.faults'))) FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;') AS memo,(SELECT json_object('name',name,'cursor',json(cursor)) FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;' ORDER BY tickedAtMs DESC LIMIT 1) AS lastMemo,(SELECT json_group_object(status,n) FROM (SELECT status,COUNT(*) AS n FROM owed_event_dead_letters GROUP BY status)) AS letters,(SELECT cursor FROM owed_belt_state WHERE name='fleet-compare:health') AS fleetCompare";
 
 /// FIX-986 (bsv-low #986, READ-986 item 4; migration 474): the app layer's standing compare of each identity's owed
 /// actor against a FRESH D1 judgement (`low-app-layer` `owed_actor::compare`), one row per identity, written by its
@@ -730,29 +730,59 @@ pub const HEALTH_STATE_SQL: &str = "SELECT (SELECT cursor FROM owed_belt_state W
 /// `/health/invariants.owedActor.fleetCompare` ([`HEALTH_STATE_SQL`]'s `fleetCompare`).
 pub const ACTOR_COMPARE_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_actor_compare (identity TEXT PRIMARY KEY, comparedAtMs INTEGER NOT NULL, diffCount INTEGER, heldByLagCount INTEGER, staleD1Count INTEGER, tipLagCount INTEGER, outpoints TEXT NOT NULL DEFAULT '[]', d1Digest TEXT, actorDigest TEXT, fault TEXT, partial INTEGER NOT NULL DEFAULT 0)";
 
-/// PURE (FIX-986): `/health/invariants.owedActor.fleetCompare` from [`HEALTH_STATE_SQL`]'s `fleetCompare` column
-/// (`{identities, diffs, heldByLag, faults, oldest}`): the identities compared, those differing, those a pending mark
-/// holds, the faults, and the oldest compare's age.
-pub fn fleet_compare_view(row: &Value, now: i64) -> Value {
-    let v: Value = row["fleetCompare"]
-        .as_str()
-        .and_then(|c| serde_json::from_str(c).ok())
-        .unwrap_or(Value::Null);
-    let n = |k: &str| {
-        v[k].as_i64()
-            .or_else(|| v[k].as_f64().map(|f| f as i64))
-            .unwrap_or(0)
+/// FIX-998-SERVE (bsv-low #998, #986): the fleet compare's PUBLIC counts, one row of the belt's ledger the app layer's
+/// ring writes ([`FLEET_COMPARE_HEALTH_SQL`]) and both public reads serve as one primary-key row: the app layer's
+/// `/health.owedActor.fleetCompare` (its consumer statement's third row) and the overlay's
+/// `/health/invariants.owedActor.fleetCompare` ([`HEALTH_STATE_SQL`]'s `fleetCompare`). Neither public route walks the
+/// compare table or the ring's rows per request (the budget tier's rows-read ceilings): the ring folds them at most
+/// once a minute fleet-wide, and at every shard's wrap.
+pub const FLEET_COMPARE_HEALTH_NAME: &str = "fleet-compare:health";
+/// The snapshot is rewritten at most once in this many ms (a wrap forces it).
+pub const FLEET_COMPARE_HEALTH_EVERY_MS: i64 = 60_000;
+/// The snapshot's write, ONE statement at `?1` (now), `?2` the gate (0 forces), `?3` the shard count, `?4` shard 0's
+/// ledger name, `?5` the LIKE of the shards' names (`low-app-layer` `owed_actor::compare::ring_state_name`): the
+/// summary route's aggregate over `owed_actor_compare` (its `COMPARE_SUMMARY_SQL`, the same terms) and its fold of the
+/// shards' rows (`compare::fleet_ring`: `revolution` the least of the shards' and 0 while a shard has no row,
+/// `lastRevolutionMs` the longest and null until every shard has one, `lastTickAt` the latest; a row that is not a JSON
+/// object is no row). A skipped write (inside the gate) composes nothing: the select list is evaluated only for the
+/// row the gate passes.
+pub const FLEET_COMPARE_HEALTH_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) SELECT 'fleet-compare:health',json_object('asOfMs',CAST(?1 AS INTEGER),'shardCount',CAST(?3 AS INTEGER),'summary',(SELECT json_object('identities',COUNT(*),'diffs',COALESCE(SUM(diffCount>0),0),'heldByLag',COALESCE(SUM(heldByLagCount>0),0),'staleD1',COALESCE(SUM(staleD1Count),0),'faults',COALESCE(SUM(fault IS NOT NULL),0),'oldest',MIN(comparedAtMs),'newest',MAX(comparedAtMs)) FROM owed_actor_compare),'ring',(SELECT json_object('rows',COUNT(*),'revolution',CASE WHEN COUNT(*)=?3 THEN MIN(COALESCE(json_extract(cursor,'$.revolution'),0)) ELSE 0 END,'lastRevolutionMs',CASE WHEN COUNT(json_extract(cursor,'$.lastRevolutionMs'))=?3 THEN MAX(json_extract(cursor,'$.lastRevolutionMs')) END,'lastTickAt',MAX(json_extract(cursor,'$.lastTickAt')),'after',(SELECT json_extract(cursor,'$.after') FROM owed_belt_state WHERE name=?4 AND json_valid(cursor) AND json_type(cursor)='object')) FROM owed_belt_state WHERE name>='fleet-compare:ring' AND name<'fleet-compare:rinh' AND name LIKE ?5 AND json_valid(cursor) AND json_type(cursor)='object')),?1 WHERE NOT (?2>0 AND EXISTS (SELECT 1 FROM owed_belt_state WHERE name='fleet-compare:health' AND tickedAtMs>?1-?2)) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+
+/// PURE (FIX-998-SERVE): the served `owedActor.fleetCompare` from the snapshot's cursor ([`FLEET_COMPARE_HEALTH_SQL`]),
+/// at `now`: `{identities, diffs, heldByLag, faults, oldestCompareAgeMs, revolution, lastRevolutionMs, lastTickAt,
+/// staleD1, shardCount, asOfMs}`, the summary route's figures under the public names (`diffs` its
+/// `identitiesDiffering`, `heldByLag` its `identitiesHeldByLag`, `oldestCompareAgeMs` its `comparedWithinMs`, `faults`
+/// its `faultCount`). `null` when no snapshot was written (no ring tick yet, or the row unreadable): never a zero.
+pub fn fleet_compare_health_view(cursor: Option<&str>, now: i64) -> Value {
+    let Some(v) = cursor
+        .and_then(|c| serde_json::from_str::<Value>(c).ok())
+        .filter(Value::is_object)
+    else {
+        return Value::Null;
     };
-    let oldest = v["oldest"]
-        .as_i64()
-        .or_else(|| v["oldest"].as_f64().map(|f| f as i64));
+    let ms = |x: &Value| x.as_i64().or_else(|| x.as_f64().map(|f| f as i64));
+    let sum = &v["summary"];
+    let ring = &v["ring"];
+    let n = |k: &str| ms(&sum[k]).map_or(Value::Null, |x| json!(x));
     json!({
         "identities": n("identities"),
         "diffs": n("diffs"),
         "heldByLag": n("heldByLag"),
         "faults": n("faults"),
-        "oldestCompareAgeMs": oldest.map(|o| now.saturating_sub(o)),
+        "staleD1": n("staleD1"),
+        "oldestCompareAgeMs": ms(&sum["oldest"]).map(|o| now - o),
+        "revolution": ms(&ring["revolution"]),
+        "lastRevolutionMs": ms(&ring["lastRevolutionMs"]),
+        "lastTickAt": ms(&ring["lastTickAt"]),
+        "shardCount": ms(&v["shardCount"]),
+        "asOfMs": ms(&v["asOfMs"]),
     })
+}
+
+/// `/health/invariants.owedActor.fleetCompare` from [`HEALTH_STATE_SQL`]'s `fleetCompare` column (the snapshot's
+/// cursor, [`fleet_compare_health_view`]).
+pub fn fleet_compare_view(row: &Value, now: i64) -> Value {
+    fleet_compare_health_view(row["fleetCompare"].as_str(), now)
 }
 
 /// The served view of one [`HEALTH_STATE_SQL`] row: `{consumer, faultMemo {rows, held, maxFaults, last}, deadLetters}`.

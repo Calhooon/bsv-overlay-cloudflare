@@ -587,15 +587,15 @@
       "censusKey": null
     },
     "health-dirty-snapshot": {
-      "route": "GET /health: one backlog:dirty snapshot lookup plus the two existing chain-event health reads, with the 10-second memo expired. Linux workerd on the populated fleet fixture, FIX-CADENCE-GAUGES. D2-ACTOR-A-FOLD-4 (bsv-low #911): plus /health.owedEvents' one consumer-row primary-key read (the owed_belt_state row owed-events:consumer); its dirty snapshot is the same read owed.dirty serves, and the fault memo, dead letters and the family's other totals are the overlay's /health/invariants.owedEvents (one statement). D2-ACTOR-A-FOLD-5: plus publishedTotal and consumedTotal, one ops_counters statement keyed by the two names (two rows, in the consumer row's batch), so no ceiling moves. D2-ACTOR-B-FOLD-6 (bsv-low #912): plus /health.owedActor, the snapshot row owed-actor:health its writers fold at most once a minute (the consumer's batch, the actor's meter flush, the bootstrap lever's coverage fold), read as the consumer statement's second primary-key row (one row more, no statement more), never the class rows, counters and owed_state count per request.",
+      "route": "GET /health: one backlog:dirty snapshot lookup plus the two existing chain-event health reads, with the 10-second memo expired. Linux workerd on the populated fleet fixture, FIX-CADENCE-GAUGES. D2-ACTOR-A-FOLD-4 (bsv-low #911): plus /health.owedEvents' one consumer-row primary-key read (the owed_belt_state row owed-events:consumer); its dirty snapshot is the same read owed.dirty serves, and the fault memo, dead letters and the family's other totals are the overlay's /health/invariants.owedEvents (one statement). D2-ACTOR-A-FOLD-5: plus publishedTotal and consumedTotal, one ops_counters statement keyed by the two names (two rows, in the consumer row's batch), so no ceiling moves. D2-ACTOR-B-FOLD-6 (bsv-low #912): plus /health.owedActor, the snapshot row owed-actor:health its writers fold at most once a minute (the consumer's batch, the actor's meter flush, the bootstrap lever's coverage fold), read as the consumer statement's second primary-key row (one row more, no statement more), never the class rows, counters and owed_state count per request. FIX-998-SERVE (bsv-low #998): plus /health.owedActor.fleetCompare, the ring's snapshot row fleet-compare:health, a third key of the consumer statement's IN list (no statement more): measured 8 reads, the consumer statement's largest 3 (its three key probes), on LANE_BASE 41730, 2026-10-30; the ceiling moves 7 to 8 by that one probe (the brief: a public route reads the counts, never the compare table).",
       "measured": {
-        "reads": 5,
+        "reads": 8,
         "writes": 0,
         "stmts": 5,
-        "maxReads": 2
+        "maxReads": 3
       },
       "ceiling": {
-        "reads": 7,
+        "reads": 8,
         "writes": 0,
         "stmts": 5,
         "maxReads": 5
