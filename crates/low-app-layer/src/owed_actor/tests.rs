@@ -8066,6 +8066,9 @@ struct Fold13<'a> {
     commits: Cell<u32>,
     /// FOLD-16: a game whose mark the actor's apply writes to the record WHILE the two judge (taken once).
     mark_during: RefCell<Vec<String>>,
+    /// FIX-960: a game whose mark lands AFTER the actor's closure read the record and before the reconcile's held
+    /// read (taken once): neither judgement's input.
+    mark_after: RefCell<Vec<String>>,
 }
 impl SqlPort for Fold13<'_> {
     async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
@@ -8141,7 +8144,7 @@ impl JudgeDb for Fold13<'_> {
                 )
                 .unwrap();
         }
-        apply(
+        let (report, _) = apply(
             self.d1,
             self.actor,
             &Fakes,
@@ -8152,7 +8155,19 @@ impl JudgeDb for Fold13<'_> {
             self.actor_era.unwrap_or(self.era),
         )
         .await?;
-        self.actor_stored(identity).await
+        for g in self.mark_after.borrow_mut().drain(..) {
+            self.d1
+                .conn
+                .execute(
+                    "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,?2,'word','after',1)",
+                    rusqlite::params![identity, g],
+                )
+                .unwrap();
+        }
+        // The object's answer: its rows and the generation its closure read (`answer_of`).
+        let mut answer = self.actor_stored(identity).await?.unwrap_or_default();
+        answer["readGeneration"] = answer_of(&report, Vec::new())["readGeneration"].clone();
+        Ok(Some(answer))
     }
 }
 
@@ -8204,6 +8219,7 @@ async fn fold13_a_the_reconcile_judges_d1_fresh_and_never_counts_a_stale_row() {
         die_after: Cell::new(u32::MAX),
         commits: Cell::new(0),
         mark_during: RefCell::new(Vec::new()),
+        mark_after: RefCell::new(Vec::new()),
     };
     let r = reconcile_step(&p, NOW_MS as i64).await.unwrap().unwrap();
     assert_eq!(
@@ -8263,6 +8279,7 @@ async fn fold13_a_the_reconcile_judges_d1_fresh_and_never_counts_a_stale_row() {
         die_after: Cell::new(u32::MAX),
         commits: Cell::new(0),
         mark_during: RefCell::new(Vec::new()),
+        mark_after: RefCell::new(Vec::new()),
     };
     apply(
         &d1,
@@ -8374,6 +8391,7 @@ async fn fold13_b_a_version_move_rejudges_every_identity_once_and_moves_the_stam
         die_after: Cell::new(u32::MAX),
         commits: Cell::new(0),
         mark_during: RefCell::new(Vec::new()),
+        mark_after: RefCell::new(Vec::new()),
     };
     let t0 = NOW_MS as i64;
     let (_, reports) = fold13_run(&p, t0).await;
@@ -8973,6 +8991,7 @@ fn fold15_port<'a>(d1: &'a SqliteSql, actor: &'a SqliteSql) -> Fold13<'a> {
         die_after: Cell::new(u32::MAX),
         commits: Cell::new(0),
         mark_during: RefCell::new(Vec::new()),
+        mark_after: RefCell::new(Vec::new()),
     }
 }
 
@@ -9419,7 +9438,7 @@ async fn fold15_e_the_pace_is_a_lever_and_zero_pauses_with_the_cursor_kept() {
 /// One reconcile of `fold13_a`'s planted judge disagreement (D1 writes the hop press off under the era, the actor's
 /// closure under no era keeps it), the identity's games holding `start` marks before the reconcile and `during` marks
 /// written by the actor's re-apply (while the two judge). Answers (diff, reconcileDiffs, heldDiffs, the lines).
-async fn fold16_a_run(start: bool, during: bool) -> (bool, u64, u64, Vec<String>) {
+async fn fold16_a_run(start: bool, during: bool, after: bool) -> (bool, u64, u64, Vec<String>) {
     let made = (NOW_MS / 1000) as i64 - 8 * 86_400;
     let era = (made + 5 * 86_400) * 1000;
     let d1 = seeded(&fold11_g_fixture(made));
@@ -9463,6 +9482,9 @@ async fn fold16_a_run(start: bool, during: bool) -> (bool, u64, u64, Vec<String>
     if during {
         *p.mark_during.borrow_mut() = games.clone();
     }
+    if after {
+        *p.mark_after.borrow_mut() = games.clone();
+    }
     let r = reconcile_step(&p, NOW_MS as i64).await.unwrap().unwrap();
     assert_eq!(r.identity, "owner");
     let lines: Vec<String> = d1
@@ -9488,14 +9510,14 @@ async fn fold16_a_run(start: bool, during: bool) -> (bool, u64, u64, Vec<String>
 /// `d57bc0fa0` at the start mark: `left: 0 right: 1` (the disagreement counted held).
 #[tokio::test]
 async fn fold16_a_a_start_mark_never_holds_a_judge_disagreement() {
-    let control = fold16_a_run(false, false).await;
+    let control = fold16_a_run(false, false, false).await;
     eprintln!("fold16_a control: {control:?}");
     assert_eq!(
         (control.0, control.1, control.2),
         (true, 1, 0),
         "the control is a STOP"
     );
-    let start = fold16_a_run(true, false).await;
+    let start = fold16_a_run(true, false, false).await;
     eprintln!("fold16_a start mark: {start:?}");
     assert_eq!(
         start.1, 1,
@@ -9509,7 +9531,7 @@ async fn fold16_a_a_start_mark_never_holds_a_judge_disagreement() {
         "{:?}",
         start.3
     );
-    let during = fold16_a_run(false, true).await;
+    let during = fold16_a_run(false, true, false).await;
     eprintln!("fold16_a mark during the judge: {during:?}");
     assert_eq!(
         (during.1, during.2),
@@ -9517,6 +9539,38 @@ async fn fold16_a_a_start_mark_never_holds_a_judge_disagreement() {
         "a mark written while they judged holds it: {during:?}"
     );
     assert!(during.3.iter().any(|l| l.contains("held mark; not a STOP")));
+}
+
+/// (fix960_a) bsv-low #960, the tenth delta lens's NEW10-L1: A MARK THE ACTOR'S CLOSURE NEVER READ EXCUSES NOTHING.
+/// `fold16_a`'s planted judge disagreement with a mark written AFTER the actor's re-apply read the record and BEFORE
+/// the reconcile's held read (a generation above the bound and above the actor's `readGeneration`): neither fresh
+/// judgement read it, so the difference is a STOP (`reconcileDiffs` 1, `heldDiffs` 0, "a judge disagreement"). The
+/// held side is kept: a mark written while the actor read (at most its `readGeneration`) still holds (`fold16_a`'s
+/// during leg), and so does the same mark beside it. RED on `1ab40c95` with `readGeneration` grafted inert (the held
+/// read uncut): `left: (0, 1) right: (1, 0)`, the disagreement filed as held.
+#[tokio::test]
+async fn fix960_a_a_mark_after_the_actors_read_never_holds_a_disagreement() {
+    let after = fold16_a_run(false, false, true).await;
+    eprintln!("fix960_a mark after the actor's read: {after:?}");
+    assert_eq!(
+        (after.1, after.2),
+        (1, 0),
+        "a mark neither judgement read is a STOP: {after:?}"
+    );
+    assert!(after.0);
+    assert!(
+        after.3.iter().any(|l| l.contains("a judge disagreement"))
+            && !after.3.iter().any(|l| l.contains("held mark")),
+        "{:?}",
+        after.3
+    );
+    let both = fold16_a_run(false, true, true).await;
+    eprintln!("fix960_a marks during and after: {both:?}");
+    assert_eq!(
+        (both.1, both.2),
+        (0, 1),
+        "a mark the actor read still holds it: {both:?}"
+    );
 }
 
 /// A direct port over the SQLite record (the drain's direct pass): each event's subjects read from its marks
