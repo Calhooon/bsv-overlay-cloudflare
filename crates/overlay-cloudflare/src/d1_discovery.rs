@@ -2968,6 +2968,27 @@ impl PotStorage for D1PotStorage {
         ))
     }
 
+    /// bsv-low #936: the heal's one line in the Worker's logs
+    /// (`worker-logs.py --grep "recorded at its spend"`); the discovery
+    /// crate's `tracing` lines have no subscriber here.
+    fn note_recorded_at_spend(
+        &self,
+        txid: &str,
+        output_index: u32,
+        topic: &str,
+        spending_txid: &str,
+    ) {
+        let msg = format!(
+            "[pot-index] {txid}:{output_index} under {topic} recorded at its spend by \
+             {spending_txid}: the engine held the coin with no index row (its admission \
+             write was cut after the engine's insert; bsv-low #936)"
+        );
+        #[cfg(target_arch = "wasm32")]
+        worker::console_warn!("{msg}");
+        #[cfg(not(target_arch = "wasm32"))]
+        eprintln!("{msg}");
+    }
+
     async fn network_seen_for(&self, txids: &[String]) -> Result<Vec<bool>, PotStorageError> {
         if txids.is_empty() {
             return Ok(Vec::new());
