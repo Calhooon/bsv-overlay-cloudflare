@@ -3751,8 +3751,10 @@ pub fn served_bars(now_ms: u64) -> Value {
 }
 
 /// THE DURABLE BARS (the D2-ACTOR-B lens's MEDIUM-7): each answer's samples by CLASS, `direct` (a writer's direct
-/// call), `queue` (the consumer's delivery, Phase A's deferred apply included) and `mined` (a `mined` word's event,
-/// the collect-after-mined bar), kept in the belt's ledger, one row a class (`owed-actor:bars:<class>`, its `cursor`
+/// call), `queue` (the consumer's delivery, Phase A's deferred apply included) and `mined` (the MINED word's event,
+/// the overlay's `proof` frame at `/arc-ingest` MINED, [`mined_word_event`]; the collect-after-mined bar, its sample
+/// the event's write time to the judgement at its FIRST apply, on the direct road since FIX-974, bsv-low #974), kept
+/// in the belt's ledger, one row a class (`owed-actor:bars:<class>`, its `cursor`
 /// the last [`METER_SAMPLES`] of each meter), so `/health.owedActor` serves the FLEET's figures whatever isolate it
 /// lands on. An isolate adds its samples at most once a [`BARS_FLUSH_EVERY_MS`] or every [`BARS_FLUSH_SAMPLES`]
 /// (one read and one batch). The `queue` row also carries the actor's OWN oldest unapplied event: the oldest write
@@ -5543,6 +5545,8 @@ pub struct EventCtx {
     pub kind: String,
     pub seq: i64,
     pub at_ms: i64,
+    /// FIX-974 (bsv-low #974): the MINED word's event (the overlay's `proof` frame, [`mined_word_event`]): the
+    /// collect-after-mined bar's sample at its first apply.
     pub mined: bool,
     /// D2-ACTOR-E (bsv-low #954): the txids the event's write named, its source key and its facts (the row's own
     /// columns the publish read: a pot's spender, a party's pot, a hop's evidence); `None` for an event that names
@@ -5621,16 +5625,32 @@ pub fn event_txids(ev: &overlay_discovery::owed_event::OwedEvent) -> Option<Vec<
     txids_in_value(&ev.facts, &mut out);
     Some(out.into_iter().collect())
 }
+/// FIX-974 (bsv-low #974): the tracker frame kind that IS the mined word: `proof`, the bump the overlay's
+/// `/arc-ingest` MINED arm verified against chaintracks (`proof_fetcher::verify_bump_detailed`'s `Valid` arm alone
+/// notes it), the one frame of that push the publish carries.
+pub const MINED_FRAME_KIND: &str = "proof";
+
+/// PURE (FIX-974, bsv-low #974; L53's S3): is this event the MINED word's, the collect-after-mined bar's sample? A
+/// `word` event carrying the overlay's `proof` frame (`facts.frame`, `{txid, kind, body}` as `tracker_events::note`
+/// builds it and `owed_events_publish::frame_note` carries it): Arcade's MINED callback on the spend, the road the
+/// design's bar 3 reads (the callback's `at` is the event's write time). Not the mined word's: a SEEN or submit frame,
+/// a MINED `callback` frame (Arcade's claim over a bump the overlay did not verify; else the `proof` frame rides), and
+/// a row-shaped `word` event (`facts.row`, `READ_WORD_SQL`: the tracker's own write, the tick's re-ask or the POST
+/// belt, whatever its word). As built, `EventCtx::of` read `facts.word` and `facts.frame.word`, fields no published
+/// shape holds, so no event of L53's 133 cells carried `mined: true` and the bar had no sample through the loop.
+pub fn mined_word_event(ev: &overlay_discovery::owed_event::OwedEvent) -> bool {
+    ev.frame()
+        .is_some_and(|f| f["kind"].as_str() == Some(MINED_FRAME_KIND))
+}
+
 impl EventCtx {
     pub fn of(ev: &overlay_discovery::owed_event::OwedEvent) -> Self {
-        let word = ev.facts["word"]
-            .as_str()
-            .or_else(|| ev.facts["frame"]["word"].as_str());
         Self {
             kind: ev.source.clone(),
             seq: ev.seq,
             at_ms: ev.at_ms,
-            mined: ev.source == "word" && word == Some("mined"),
+            // FIX-974: the mined word's event is the proof frame's (`mined_word_event`)
+            mined: mined_word_event(ev),
             txids: event_txids(ev),
             also: Vec::new(),
             by_identity: BTreeMap::new(),

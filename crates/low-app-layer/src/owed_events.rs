@@ -2447,7 +2447,12 @@ pub async fn health_and_actor(db: &impl SqlPort, dirty: &Value) -> (Value, Optio
 // `owed_actor_direct_calls_total`; none fails the write (the write committed and answered before). The queue message
 // goes regardless; its delivery names the consumer's acknowledgement bound, so a delivery the direct call covered is a
 // DUPE the actor answers from its seq check (`owed_actor::COVERED_SQL`). A `word` event carrying a frame is left to
-// the consumer: its ingest is the tracker's own write (its marks do not exist until then).
+// the consumer: its ingest is the tracker's own write (its marks do not exist until then), EXCEPT the MINED word's
+// frame (FIX-974, bsv-low #974: the overlay's `/arc-ingest` push, `owed_actor::mined_word_event`), which the pass
+// ingests through the port first (`DirectPort::ingest_frame`, the consumer's own `ingest_frame`) and then plans and
+// calls as any direct event, so the collect-after-mined bar's sample is the first apply on the writer's road (the
+// callback's `at` to the judgement) and never the queue's backlog; the consumer's later delivery of that event is a
+// covered dupe or a redelivery, which samples nothing.
 //
 // FIX-956 (bsv-low #956) item 3: in PHASE C ONLY (`OWED_D1_JUDGE=false`: the actor is the one writer, its apply IS
 // the judgement) a call the actor answered APPLIED acknowledges the marks of the games it names applied, up to the
@@ -2467,8 +2472,12 @@ pub struct DirectReport {
     pub walls: u64,
     pub faults: u64,
     pub held: u64,
-    /// Events past [`DIRECT_EVENTS_MAX`] or carrying a frame: the queue's alone.
+    /// Events past [`DIRECT_EVENTS_MAX`], carrying a frame that is not the mined word's (or whose ingest faulted),
+    /// or `txfacts`: the queue's alone.
     pub left_to_queue: usize,
+    /// FIX-974 (bsv-low #974): the MINED word's frames this pass ingested and called (the collect-after-mined
+    /// bar's road).
+    pub mined_frames: u64,
     /// D2-ACTOR-B-FOLD-10 (item 8): the first fault's text (a wall's or a refusal's), for the operator's line.
     pub first_fault: Option<String>,
     /// FIX-956 item 3 (Phase C only): games whose marks the pass acknowledged after their apply landed.
@@ -2608,6 +2617,12 @@ pub trait DirectPort {
     async fn subjects(&self, ev: &OwedEvent) -> Result<Vec<(String, Vec<String>)>, String>;
     /// One apply body to the identity's actor, under the direct call's wall.
     async fn call(&self, body: Value) -> Result<Value, String>;
+    /// FIX-974 (bsv-low #974): the ingest of the MINED word's frame (the tracker's own write, whose trigger marks the
+    /// pair this pass then plans) before its direct call. A port that ingests no frame answers `Err`, and the frame
+    /// stays the consumer's.
+    async fn ingest_frame(&self, _frame: &Value) -> Result<(), String> {
+        Err("this port ingests no frame".into())
+    }
     /// FIX-956 item 3: does a landed direct apply acknowledge its marks? Phase C only (the D1 judge OFF: the actor is
     /// the one writer, its apply IS the judgement). In Phases A and B the marks drive the consumer's D1 judge, whose
     /// rows are served, so the direct call acknowledges nothing there.
@@ -2681,9 +2696,22 @@ pub async fn direct_with_class(
     let mut report = DirectReport::default();
     let mut subjects_of = Vec::new();
     for (n, ev) in events.into_iter().enumerate() {
-        if n >= DIRECT_EVENTS_MAX || ev.frame().is_some() || ev.source == owed_event::TXFACTS {
+        if n >= DIRECT_EVENTS_MAX || ev.source == owed_event::TXFACTS {
             report.left_to_queue += 1;
             continue;
+        }
+        if let Some(frame) = ev.frame() {
+            // FIX-974 (bsv-low #974): the MINED word's frame (the overlay's `/arc-ingest` push) is ingested here,
+            // the tracker's write whose trigger marks the pair, then planned and called as any direct event, so its
+            // first apply is the writer's road and its sample the time since the callback, never the queue's lag.
+            // Every other frame stays the consumer's (its ingest is the tracker's write; its marks do not exist until
+            // then), and a frame whose ingest faults is the consumer's too (the queue message carries it).
+            if !crate::owed_actor::mined_word_event(&ev) || port.ingest_frame(frame).await.is_err()
+            {
+                report.left_to_queue += 1;
+                continue;
+            }
+            report.mined_frames += 1;
         }
         report.events += 1;
         let Ok(subjects) = port.subjects(&ev).await else {
@@ -2759,6 +2787,10 @@ impl DirectPort for WorkerDirect {
             crate::owed_actor::DIRECT_CALL_WALL_MS,
         )
         .await
+    }
+    /// FIX-974: the consumer's own ingest (`ingest_frame`: the tracker's write, the `word` note forgotten).
+    async fn ingest_frame(&self, frame: &Value) -> Result<(), String> {
+        ingest_frame(&self.env, frame).await
     }
     fn acks(&self) -> bool {
         !crate::owed_actor::d1_judge_on(
