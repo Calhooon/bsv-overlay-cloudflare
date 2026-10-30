@@ -239,7 +239,7 @@ pub fn horizon_of(cursor: &Value) -> Option<i64> {
 /// The consumer's row, and beside it (D2-ACTOR-B-FOLD-6, the land tier's `health-dirty-snapshot`) the owed actor's
 /// health snapshot (`owed_actor::HEALTH_SNAPSHOT_NAME`): two primary-key rows in one statement, so `/health.owedActor`
 /// adds one row read and no statement.
-pub const HEALTH_CONSUMER_SQL: &str = "SELECT name,cursor,tickedAtMs FROM owed_belt_state WHERE name IN ('owed-events:consumer','owed-actor:health')";
+pub const HEALTH_CONSUMER_SQL: &str = "SELECT name,cursor,tickedAtMs FROM owed_belt_state WHERE name IN ('owed-events:consumer','owed-actor:health','fleet-compare:health')";
 /// D2-ACTOR-A-FOLD-5 (bsv-low #911, E2): the queue's two totals `/health.owedEvents` serves (the harness's
 /// `owed-queue-backlog` row reads published minus consumed there): two primary-key rows of `ops_counters`, never the
 /// family's whole counter read.
@@ -2507,6 +2507,15 @@ pub async fn health(db: &impl SqlPort, dirty: &Value) -> Value {
 /// [`health`] and the owed actor's health snapshot read by the same statement (`None` before its first write or on a
 /// fault).
 pub async fn health_and_actor(db: &impl SqlPort, dirty: &Value) -> (Value, Option<Value>) {
+    let (body, actor, _) = health_actor_fleet(db, dirty).await;
+    (body, actor)
+}
+
+/// [`health_and_actor`] and FIX-998-SERVE's `owedActor.fleetCompare` (bsv-low #998): the fleet compare's public counts,
+/// the ring's snapshot row (`owed_events_publish::FLEET_COMPARE_HEALTH_NAME`) read as the consumer statement's third
+/// primary-key row (no statement more), served by `owed_events_publish::fleet_compare_health_view` (`null` before the
+/// ring's first tick or on a fault).
+pub async fn health_actor_fleet(db: &impl SqlPort, dirty: &Value) -> (Value, Option<Value>, Value) {
     let read = db
         .run_batch(vec![
             Stmt {
@@ -2553,7 +2562,11 @@ pub async fn health_and_actor(db: &impl SqlPort, dirty: &Value) -> (Value, Optio
         "horizonAgeMs": horizon.map(|h| (db.now_ms() as i64 - h).max(0)),
         "totals": "/health/invariants.owedEvents",
     });
-    (body, actor)
+    let fleet = publish::fleet_compare_health_view(
+        row(publish::FLEET_COMPARE_HEALTH_NAME),
+        db.now_ms() as i64,
+    );
+    (body, actor, fleet)
 }
 
 // ---- D2-ACTOR-D (bsv-low #952; the design's section 7, bar 2 as amended 2026-10-27): THE DIRECT CALL ----

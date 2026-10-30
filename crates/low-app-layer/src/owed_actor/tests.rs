@@ -3443,7 +3443,7 @@ async fn d2_actor_b_fold6_the_health_read_is_one_snapshot_row_within_the_ceiling
         "the health route's owed statements {:?}: (rows, scanned) {costs:?}",
         named.iter().map(|n| n.0).collect::<Vec<_>>()
     );
-    assert!(route.contains("owed_events::health_and_actor"));
+    assert!(route.contains("owed_events::health_actor_fleet"));
     // The snapshot is ONE of the consumer statement's rows.
     db.run_batch(vec![health_snapshot_stmt(9, true)])
         .await
@@ -12027,7 +12027,10 @@ async fn fix986c2_c_the_rings_row_is_the_routes_compare() {
     assert!(got["diffs"].as_array().unwrap().is_empty(), "{got}");
     assert_eq!(got["heldByLag"][0]["identity"], json!(target));
     assert_eq!(got["heldByLag"][0]["outpoints"][0]["outpoint"], json!(op));
-    // The overlay's `/health/invariants.owedActor.fleetCompare`: its statement's aggregate over the same table.
+    // The overlay's `/health/invariants.owedActor.fleetCompare`: the ring's snapshot of the same table (FIX-998-SERVE).
+    d1.run_batch(vec![compare::fleet_health_stmt(NOW_MS as i64 + 4, 1, true)])
+        .await
+        .unwrap();
     let state = d1
         .run_batch(vec![Stmt::new(
             crate::owed_events_publish::HEALTH_STATE_SQL,
@@ -12588,6 +12591,217 @@ fn fix998_c_the_shards_partition_the_key_space() {
     assert!(belt.contains("crate::owed_actor::compare::shard_actor_name(k)"));
     let board = squash(include_str!("../board_view.rs"));
     assert!(board.contains("ifshard>=crate::owed_actor::compare::shards_env(&self.env){storage.delete_all().await?;"));
+}
+
+// ── FIX-998-SERVE (bsv-low #998, #986): the fleet compare's public counts on `/health` and `/health/invariants` ──
+
+/// The overlay's `/health/invariants.owedActor.fleetCompare` over `d1` at `now` (its one shipped statement).
+async fn fix998s_invariants(d1: &SqliteSql, now: i64) -> Value {
+    let state = d1
+        .run_batch(vec![Stmt::new(
+            crate::owed_events_publish::HEALTH_STATE_SQL,
+            vec![Bind::Int(now)],
+        )])
+        .await
+        .unwrap()[0]
+        .rows[0]
+        .clone();
+    crate::owed_events_publish::fleet_compare_view(&state, now)
+}
+
+/// (fix998s_a) FIX-998-SERVE: THE HEALTH COUNTS ARE THE SUMMARY'S. Over `fix998_b`'s 12-seat fleet (one seat's actor
+/// planted different), one shard and four, at EVERY tick of the ring to the fleet's wrap: the snapshot written at that
+/// tick ([`compare::fleet_health_stmt`]) and read by the app layer's `/health` (`owed_events::health_actor_fleet`, the
+/// consumer statement's third row) and by the overlay's `/health/invariants` (`HEALTH_STATE_SQL`) serves the standing
+/// route's figures under the public names: `identities`, `diffs` (= `identitiesDiffering`), `heldByLag`
+/// (= `identitiesHeldByLag`), `oldestCompareAgeMs` (= `comparedWithinMs`), `faults` (= `faultCount`), `staleD1`,
+/// `revolution` (0 until the LAST shard wraps), `lastRevolutionMs`, `lastTickAt`, `shardCount`. Before the ring's first
+/// tick both serve `null`, never a zero.
+#[tokio::test]
+#[allow(clippy::needless_range_loop)] // every shard ticks at each tick, by its index
+async fn fix998s_a_the_health_counts_are_the_summarys() {
+    for shards in [1usize, 4] {
+        let (d1, ids, actors) = fix998_fleet(12).await;
+        actors[&ids[5]]
+            .conn
+            .execute(
+                "UPDATE owed_rows SET sats=sats+1 WHERE identity=?1",
+                [&ids[5]],
+            )
+            .unwrap();
+        let port = Fix986 {
+            d1: &d1,
+            actors,
+            judges: false,
+            die_after: Cell::new(u32::MAX),
+        };
+        let mut t = NOW_MS as i64;
+        d1.now.set(t as u64);
+        let (_, _, fleet) = crate::owed_events::health_actor_fleet(&d1, &Value::Null).await;
+        assert_eq!(fleet, Value::Null, "no ring tick yet: /health serves null");
+        assert_eq!(
+            fix998s_invariants(&d1, t).await,
+            Value::Null,
+            "and /health/invariants"
+        );
+        let mut wrapped = vec![false; shards];
+        let mut checked = 0;
+        while !wrapped.iter().all(|w| *w) {
+            for k in 0..shards {
+                if wrapped[k] {
+                    continue;
+                }
+                let r = compare::ring_tick(&port, t, k, shards, 2, || 0)
+                    .await
+                    .unwrap();
+                wrapped[k] |= r.wrapped;
+                let at = t + 1;
+                d1.run_batch(vec![compare::fleet_health_stmt(at, shards, true)])
+                    .await
+                    .unwrap();
+                d1.now.set(at as u64 + 7);
+                let now = at + 7;
+                let (_, _, fleet) = crate::owed_events::health_actor_fleet(&d1, &Value::Null).await;
+                let summary = compare::read_answer(&d1, "", "", now, shards)
+                    .await
+                    .unwrap();
+                for (public, route) in [
+                    ("identities", "identities"),
+                    ("diffs", "identitiesDiffering"),
+                    ("heldByLag", "identitiesHeldByLag"),
+                    ("oldestCompareAgeMs", "comparedWithinMs"),
+                    ("faults", "faultCount"),
+                    ("staleD1", "staleD1"),
+                    ("revolution", "revolution"),
+                    ("lastRevolutionMs", "lastRevolutionMs"),
+                    ("lastTickAt", "lastTickAt"),
+                    ("shardCount", "shardCount"),
+                ] {
+                    assert_eq!(
+                        fleet[public], summary[route],
+                        "{shards} shards, tick at {t}, shard {k}: /health {public} against the route's {route}\n{fleet}\n{summary}"
+                    );
+                }
+                assert_eq!(fleet["asOfMs"], json!(at));
+                assert_eq!(
+                    fix998s_invariants(&d1, now).await,
+                    fleet,
+                    "/health/invariants serves the same object"
+                );
+                checked += 1;
+            }
+            t += compare::FLEET_COMPARE_TICK_MS;
+        }
+        let (_, _, fleet) = crate::owed_events::health_actor_fleet(&d1, &Value::Null).await;
+        assert_eq!(
+            (
+                fleet["identities"].clone(),
+                fleet["diffs"].clone(),
+                fleet["revolution"].clone()
+            ),
+            (json!(12), json!(1), json!(1)),
+            "{fleet}"
+        );
+        assert!(checked > shards, "{checked} ticks checked");
+    }
+}
+
+/// (fix998s_b) FIX-998-SERVE: THE RING WRITES THE SNAPSHOT, AND THE PUBLIC READ IS ONE CHEAP ROW. The ring's own ticks
+/// write it (no forced write in the pin): the first tick at once, a tick inside the minute leaves it, the WRAP forces
+/// it (the fleet's `revolution` 1 at the wrap's own tick), a tick past the minute rewrites it. A skipped write composes
+/// nothing (no full-scan step over 2,000 compare rows; the forced write's control scans them). The public reads: the
+/// app layer's consumer statement answers three primary-key rows and scans nothing, and the overlay's statement no
+/// longer reads `owed_actor_compare` (its walk is the ring's, once a minute).
+#[tokio::test]
+async fn fix998s_b_the_ring_writes_the_snapshot_and_the_public_read_is_one_row() {
+    let (d1, ids, actors) = fix998_fleet(3).await;
+    let port = Fix986 {
+        d1: &d1,
+        actors,
+        judges: false,
+        die_after: Cell::new(u32::MAX),
+    };
+    let snap = |d1: &SqliteSql| -> Option<Value> {
+        d1.conn
+            .query_row(
+                "SELECT cursor FROM owed_belt_state WHERE name=?1",
+                [crate::owed_events_publish::FLEET_COMPARE_HEALTH_NAME],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .map(|c| serde_json::from_str(&c).unwrap())
+    };
+    let t0 = NOW_MS as i64;
+    let r = compare::ring_tick(&port, t0, 0, 1, 1, || 0).await.unwrap();
+    assert!(!r.wrapped);
+    assert_eq!(
+        snap(&d1).unwrap()["asOfMs"],
+        json!(t0),
+        "the first tick writes it"
+    );
+    let mut t = t0;
+    loop {
+        t += compare::FLEET_COMPARE_TICK_MS;
+        let r = compare::ring_tick(&port, t, 0, 1, 1, || 0).await.unwrap();
+        let s = snap(&d1).unwrap();
+        if r.wrapped {
+            assert_eq!(s["asOfMs"], json!(t), "the wrap forces it");
+            assert_eq!(s["ring"]["revolution"], json!(1));
+            assert_eq!(s["summary"]["identities"], json!(ids.len()));
+            break;
+        }
+        assert_eq!(s["asOfMs"], json!(t0), "a tick inside the minute leaves it");
+        assert!(t - t0 < 60_000);
+    }
+    let wrap_at = t;
+    t += 60_001;
+    compare::ring_tick(&port, t, 0, 1, 1, || 0).await.unwrap();
+    assert_eq!(
+        snap(&d1).unwrap()["asOfMs"],
+        json!(t),
+        "past the minute it is rewritten"
+    );
+    assert!(t > wrap_at);
+    // The skipped write composes nothing.
+    d1.conn
+        .execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<2000) INSERT INTO owed_actor_compare(identity,comparedAtMs,diffCount) SELECT printf('04%064x',i),1,0 FROM n",
+        )
+        .unwrap();
+    let scans = |now: i64, every: i64| -> i32 {
+        let mut st = d1
+            .conn
+            .prepare(crate::owed_events_publish::FLEET_COMPARE_HEALTH_SQL)
+            .unwrap();
+        st.execute(rusqlite::params![
+            now,
+            every,
+            1,
+            compare::RING_NAME,
+            compare::RING_NAME
+        ])
+        .unwrap();
+        st.get_status(rusqlite::StatementStatus::FullscanStep)
+    };
+    assert_eq!(scans(t + 1, 60_000), 0, "a skipped write scans nothing");
+    assert!(
+        scans(t + 2, 0) >= 2_000,
+        "the forced write's control walks the table"
+    );
+    // The public reads.
+    let mut st = d1
+        .conn
+        .prepare(crate::owed_events::HEALTH_CONSUMER_SQL)
+        .unwrap();
+    let rows = st.query_map([], |_| Ok(())).unwrap().count();
+    assert!(rows <= 3);
+    assert_eq!(st.get_status(rusqlite::StatementStatus::FullscanStep), 0);
+    assert!(!crate::owed_events_publish::HEALTH_STATE_SQL.contains("owed_actor_compare"));
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let routes = squash(include_str!("../routes.rs"));
+    assert!(routes.contains("body[\"owedActor\"][\"fleetCompare\"]=fleet_compare;"));
+    let ring = squash(include_str!("compare.rs"));
+    assert!(ring.contains("end.push(fleet_health_stmt(now,shards,report.wrapped));"));
 }
 
 // ── bsv-low #986 (READ-986 item 3, FIX-986): the actor's facts for a game equal the D1 read's by construction ──

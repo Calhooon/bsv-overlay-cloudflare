@@ -514,6 +514,32 @@ pub fn fleet_ring(rows: &[(String, Value)], n: usize) -> Value {
     })
 }
 
+/// FIX-998-SERVE (bsv-low #998): the public counts' snapshot write (`owed_events_publish::FLEET_COMPARE_HEALTH_SQL`),
+/// carried by every tick's last batch: rewritten at most once a minute fleet-wide, `force`d at a shard's wrap; the
+/// shards' rows named as [`ring_state_name`] names them for `shards`.
+pub fn fleet_health_stmt(now: i64, shards: usize, force: bool) -> Stmt {
+    let shards = shards.max(1);
+    let pattern = if shards <= 1 {
+        RING_NAME.to_string()
+    } else {
+        format!("{RING_NAME}:%/{shards}")
+    };
+    Stmt::new(
+        crate::owed_events_publish::FLEET_COMPARE_HEALTH_SQL,
+        vec![
+            Bind::Int(now),
+            Bind::Int(if force {
+                0
+            } else {
+                crate::owed_events_publish::FLEET_COMPARE_HEALTH_EVERY_MS
+            }),
+            Bind::Int(shards as i64),
+            Bind::Text(ring_state_name(0, shards)),
+            Bind::Text(pattern),
+        ],
+    )
+}
+
 /// The per-tick setting from the render var: unset or unreadable the default, clamped to
 /// [`FLEET_COMPARE_PER_TICK_MAX`].
 pub fn per_tick_of(var: Option<&str>) -> usize {
@@ -730,7 +756,11 @@ pub(crate) async fn ring_tick_with<J: JudgeDb>(
     let rest_until = ring["restUntilMs"].as_i64();
     if per_tick == 0 || rest_until.is_some_and(|r| now < r) {
         report.stopped = Some(if per_tick == 0 { "paused" } else { "resting" });
-        m.run_batch(vec![state(&name, &ring)]).await?;
+        m.run_batch(vec![
+            state(&name, &ring),
+            fleet_health_stmt(now, shards, false),
+        ])
+        .await?;
         report.statements = m.statements.get();
         report.cursor = ring["after"].as_str().unwrap_or_default().to_string();
         return Ok(report);
@@ -844,6 +874,8 @@ pub(crate) async fn ring_tick_with<J: JudgeDb>(
     }
     ring["after"] = json!(cursor);
     end.push(state(&name, &ring));
+    // FIX-998-SERVE: the public counts, folded after this tick's rows (forced at a wrap, else once a minute).
+    end.push(fleet_health_stmt(now, shards, report.wrapped));
     m.run_batch(end).await?;
     report.cursor = cursor;
     report.statements = m.statements.get();
