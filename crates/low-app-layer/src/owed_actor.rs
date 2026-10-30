@@ -48,6 +48,7 @@ use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+pub mod compare;
 pub mod object;
 #[rustfmt::skip]
 pub mod schema;

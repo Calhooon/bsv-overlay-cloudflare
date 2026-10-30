@@ -91,3 +91,7 @@ d1 "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<39) INS
 # one second-class row due now inside the walk's window (after the flood's identities): an index-unspent sweep's re-look
 d1 "INSERT INTO owed_rows(identity,outpoint,family,gameId,facts,updatedAtMs,judgedAtMs,claimable,probeTip,beltDueAtMs) VALUES ('floodzz-second', printf('eeee%060x:0',0), 'hop-stranded', 'e0000', json_object('claim','sweep-hop','claimable',json('true'),'status','unspent','chainProbe','index-unspent'), $flood_at, $flood_at, 1, 900000, $flood_at)" > "$out/fleet-plant-second.json"
 node tools/lane-893/owed_belt_fleet.mjs "http://127.0.0.1:$port" "http://127.0.0.1:$standin" "$token" | tee -a "$out/measurements.log"
+# FIX-986-COMPARE-2 (bsv-low #986, READ-986 items 1 and 4): the standing fresh compare's tick, one identity and the read
+# (`owed-fleet-compare-*`), over the same seed: the lived-in seat is its heaviest identity.
+seat=$(d1 "SELECT identity FROM owed_rows WHERE length(identity)=66 GROUP BY identity ORDER BY COUNT(*) DESC LIMIT 1" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["results"][0]["identity"])')
+node tools/lane-893/owed_fleet_compare.mjs "http://127.0.0.1:$port" "$token" "$seat" | tee -a "$out/measurements.log"

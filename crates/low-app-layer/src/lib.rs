@@ -299,6 +299,13 @@ async fn scheduled(_event: worker::ScheduledEvent, env: Env, ctx: worker::Schedu
         {
             worker::console_warn!("[owed-belt] watchdog arm failed: {error}");
         }
+        // FIX-986 (READ-986 item 4): the fleet compare's ring is its own actor's alarm; every cron arms it the same way.
+        if let Err(error) = meter_owed
+            .phase("owed.compare_arm", owed_belt::arm_fleet_compare(&env_owed))
+            .await
+        {
+            worker::console_warn!("[owed-fleet-compare] watchdog arm failed: {error}");
+        }
         pass_meter::end_task(&meter_owed, routes::D1Sql::of(&env_owed).ok().as_ref()).await;
     });
     // bsv-low #893 section 6.1: the one-time `owed-v2` backfill, its own task under its own 20 s wall (3 s for the
@@ -532,6 +539,12 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // D2-ACTOR-B-FOLD-8 (the captain's item 10): one actor's rows beside the D1 judge's, read only.
     if req.method() == worker::Method::Get && req.path() == "/internal/owed-actor-rows" {
         return owed_actor::object::rows_lever(req, &env).await;
+    }
+    // FIX-986 (READ-986 item 4): the standing compare, the ring's rows (GET) and one identity re-compared now (POST).
+    if (req.method() == worker::Method::Get || req.method() == worker::Method::Post)
+        && req.path() == "/internal/owed-actor-compare"
+    {
+        return owed_actor::object::compare_lever(req, &env).await;
     }
     if req.method() == worker::Method::Post && req.path() == "/internal/owed-actor-reset" {
         return owed_actor::object::reset_lever(req, &env).await;

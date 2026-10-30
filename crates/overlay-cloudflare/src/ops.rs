@@ -1902,7 +1902,12 @@ async fn owed_events_consumer_view(db: &D1Database, now: i64) -> serde_json::Val
         .fetch_optional::<serde_json::Value>(db)
         .await
     {
-        Ok(Some(r)) => crate::owed_events::health_state_view(&r),
+        Ok(Some(r)) => {
+            let mut v = crate::owed_events::health_state_view(&r);
+            // FIX-986: the standing fresh compare's counts ride the same statement.
+            v["fleetCompare"] = crate::owed_events::fleet_compare_view(&r, now);
+            v
+        }
         Ok(None) => serde_json::Value::Null,
         Err(e) => json!({ "readable": false, "fault": e }),
     }
@@ -2169,6 +2174,8 @@ pub async fn health_invariants(
     body["owedBelt"] = crate::applayer_counters::owed_belt_view(&counters);
     // bsv-low #912: the app layer's owed actor, its compares, direct calls, sampled reconcile and belt questions.
     body["owedActor"] = crate::applayer_counters::owed_actor_view(&counters);
+    // FIX-986 (READ-986 item 4): the standing fresh compare's counts, read in the owed events' one state statement.
+    body["owedActor"]["fleetCompare"] = owed_events_consumer["fleetCompare"].clone();
     // bsv-low #935: the app layer's first-party pushes, coalesced per seat under the relay's send budget.
     body["push"] = crate::applayer_counters::push_view(&counters);
     // bsv-low #781, #778 (B-FLEET-4): the app layer's last scheduled pass, its wall and each phase's wall, as the

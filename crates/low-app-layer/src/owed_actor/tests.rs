@@ -4982,11 +4982,11 @@ async fn d2_actor_b_fold8_i_the_rows_lever_serves_the_reconciles_diff() {
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     let object = squash(include_str!("object.rs"));
     let lever = &object[object.find("pubasyncfnrows_lever(").unwrap()
-        ..object.find("pubasyncfnidentities_lever(").unwrap()];
+        ..object.find("pubasyncfncompare_lever(").unwrap()];
     assert!(lever.starts_with(&squash("pub async fn rows_lever(req: Request, env: &Env) -> Result<Response> { if !crate::internal_events::internal_bearer_ok(&req, env) { return Response::error(\"unauthorized\", 401); }")));
-    assert!(lever.contains("RECONCILE_D1_ROWS_SQL"));
+    // FIX-986 (READ-986 item 1): the D1 side is a FRESH judgement (`compare::fresh_compare`), never the stored rows.
     assert!(lever.contains("call_stored_answer(env,&me,READ_WALL_MS)"));
-    assert!(lever.contains("rows_view(&me,actor,&d1,"));
+    assert!(lever.contains("super::compare::fresh_compare(&judge,&me,actor)"));
     assert!(!lever.contains("INSERT") && !lever.contains("DELETE") && !lever.contains("UPDATE"));
     let lib = squash(include_str!("../lib.rs"));
     assert!(lib.contains("req.path()==\"/internal/owed-actor-rows\"{returnowed_actor::object::rows_lever(req,&env).await;"));
@@ -8530,9 +8530,8 @@ async fn fold13_c_the_route_and_the_reconcile_name_a_stale_d1() {
     assert_eq!(view["d1Rejudge"]["passed"], json!(false));
     assert_eq!(view["d1Rejudge"]["stamp"]["running"], json!(JUDGE_VERSION));
     let squash = |s: &str| s.split_whitespace().collect::<String>();
-    let object = squash(include_str!("object.rs"));
-    let lever = &object[object.find("pubasyncfnrows_lever(").unwrap()
-        ..object.find("pubasyncfnidentities_lever(").unwrap()];
+    // FIX-986: the rows lever's reads are the one compare's (`compare::fresh_compare`).
+    let lever = squash(include_str!("compare.rs"));
     assert!(lever.contains("Stmt::new(D1_JUDGED_UNDER_SQL,vec![Bind::Text(me.clone())])"));
     // The reconcile: a stale D1 row before the fleet re-judge passed the identity.
     let w = WithActor {
@@ -10278,7 +10277,8 @@ async fn fix964_c_the_issues_line_with_the_verdicts_mark_queued_is_held() {
     // With the mark consumed the same difference is no lag.
     d1.conn.execute("DELETE FROM owed_dirty", []).unwrap();
     assert!(held_by_lag(&view, &[]).is_empty());
-    let lever = include_str!("object.rs")
+    // FIX-986: the rows lever's compare is `compare::fresh_compare`, which names the backlog's differences.
+    let lever = include_str!("compare.rs")
         .split_whitespace()
         .collect::<String>();
     assert!(lever.contains("view[\"heldByLag\"]=json!(held_by_lag(&view,&pending));"));
@@ -11490,4 +11490,704 @@ fn fix988_b_a_courier_bytes_payout_asks_its_hop_until_the_sweep_mines_then_its_h
         of(json!({"creditKind": "courier-bytes"})),
         Some(crate::owed_belt::Ask::Home)
     ));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// FIX-986-COMPARE-2 (bsv-low #986; READ-986 items 1 and 4): the operator route judges D1 FRESH; the standing ring.
+
+/// The compare's port: the record as the D1 judge reads it (`d1`), each identity's actor as its mirror (`actors`),
+/// the phase's flag, and a record that faults after `die_after` more calls (a tick the platform ends).
+struct Fix986<'a> {
+    d1: &'a SqliteSql,
+    actors: BTreeMap<String, SqliteSql>,
+    judges: bool,
+    die_after: Cell<u32>,
+}
+impl SqlPort for Fix986<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        if self.die_after.get() == 0 {
+            return Err("the invocation ended (pin)".into());
+        }
+        self.die_after.set(self.die_after.get() - 1);
+        self.d1.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.d1.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.d1.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.d1.log(l);
+    }
+}
+impl JudgeDb for Fix986<'_> {
+    fn tip(&self) -> Option<u64> {
+        Some(TIP)
+    }
+    async fn word_views(
+        &self,
+        rows: &BTreeMap<String, crate::tracker_host::stored::Row>,
+    ) -> Result<BTreeMap<String, Value>, String> {
+        Fakes.word_views(rows).await
+    }
+    async fn canonical_root(&self, _: u64) -> Option<String> {
+        None
+    }
+    async fn push(&self, _: &str, _: Value) {}
+    fn d1_judges(&self) -> bool {
+        self.judges
+    }
+    async fn actor_stored(&self, identity: &str) -> Result<Option<Value>, String> {
+        let Some(actor) = self.actors.get(identity) else {
+            return Ok(None);
+        };
+        let rows = actor
+            .run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.into())])])
+            .await?;
+        Ok(Some(
+            json!({"rows": rows[0].rows.clone(), "bootstrapped": true, "held": 0}),
+        ))
+    }
+}
+
+/// The D1 rows of one identity as `ROWS_SQL` reads them (the route's stored side).
+async fn fix986_rows(db: &SqliteSql, identity: &str) -> Vec<Value> {
+    db.run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.into())])])
+        .await
+        .unwrap()[0]
+        .rows
+        .clone()
+}
+
+/// (fix986c2_a) READ-986 item 1: THE ROUTE'S D1 SIDE IS A FRESH JUDGEMENT. The class A shape of the 2026-10-30 fleet
+/// compare: D1's stored rows judged (the `owed-v3` pass), the seat's HELD collected filing written after them (the
+/// door's content key, `record_post::held_content_key`, the fold's gate), the actor applying it (its payout retired),
+/// and in Phase C nothing re-judging D1. The route's compare (`compare::fresh_compare`, what `rows_lever` serves)
+/// judges D1 fresh: the payout is gone from its D1 side too, so no `diff`; the stored row rides beside in `d1Stored`,
+/// `stale`, named in `staleOutpoints`; nothing is written to D1 (`owed_rows`, `owed_state`, `owed_dirty` byte equal).
+/// RED on `5f149853` (the route's rule there: `rows_view` over D1's STORED rows): the payout named in `diff`.
+#[tokio::test]
+async fn fix986c2_a_the_routes_d1_side_is_a_fresh_judgement() {
+    let f = fixtures()
+        .into_iter()
+        .find(|f| f.name == "d1_fleet")
+        .unwrap();
+    let d1 = d1_judge(&f).await;
+    // A seat with a claimable payout naming the transaction that pays it (`payTxid`).
+    let (id, row) = f
+        .identities
+        .iter()
+        .find_map(|id| {
+            let mut q = d1.conn.prepare("SELECT outpoint,gameId,json_extract(facts,'$.payTxid') FROM owed_rows WHERE identity=?1 AND family='payout' AND json_extract(facts,'$.payTxid') IS NOT NULL ORDER BY outpoint LIMIT 1").unwrap();
+            q.query_row([id], |r| Ok((id.clone(), (r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))).ok()
+        })
+        .expect("a fleet seat holds a payout naming its paying transaction");
+    let (outpoint, game, pay) = row;
+    // The seat's held filing, as the door writes it, AFTER D1's stored judgement.
+    let key = crate::record_post::held_content_key(&crate::record_post::HeldMarker {
+        game_id: hex::decode(&game).unwrap().try_into().unwrap(),
+        identity_key: hex::decode(&id).unwrap(),
+        pay_txid: hex::decode(&pay).unwrap().try_into().unwrap(),
+        sig: Vec::new(),
+    });
+    // through the door's own insert (the column's one writer, `record_post::COLLECTED_FILE_SQL`)
+    d1.conn
+        .execute(
+            crate::record_post::COLLECTED_FILE_SQL,
+            rusqlite::params![
+                id,
+                game,
+                key,
+                0,
+                Option::<String>::None,
+                (NOW_MS / 1000) as i64,
+                pay
+            ],
+        )
+        .unwrap();
+    // Phase C: the dirty marks the filing wrote are the actor's; D1's stored rows are left as they were.
+    d1.conn.execute("DELETE FROM owed_dirty", []).unwrap();
+    let (local, _) = actor_judge(&d1, &id).await;
+    assert!(
+        !fix986_rows(&local, &id)
+            .await
+            .iter()
+            .any(|r| r["outpoint"] == outpoint.as_str()),
+        "the actor applied the filing: its payout retired"
+    );
+    let stored_before = stored(&d1, &id);
+    let snapshot = |db: &SqliteSql| -> (i64, i64, i64) {
+        db.conn
+            .query_row("SELECT (SELECT COUNT(*) FROM owed_rows),(SELECT COUNT(*) FROM owed_state),(SELECT COUNT(*) FROM owed_dirty)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+    };
+    let counts_before = snapshot(&d1);
+    let port = Fix986 {
+        d1: &d1,
+        actors: BTreeMap::from([(id.clone(), local)]),
+        judges: false,
+        die_after: Cell::new(u32::MAX),
+    };
+    let actor = compare::actor_answer(&port, &id).await;
+    let view = compare::fresh_compare(&port, &id, actor).await.unwrap();
+    assert!(
+        !view["diff"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o == outpoint.as_str()),
+        "a fresh D1 judgement agrees with the actor: the payout is no diff: {}",
+        view["diff"]
+    );
+    assert_eq!(view["d1"]["fresh"], json!(true));
+    assert!(
+        !view["d1"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["outpoint"] == outpoint.as_str()),
+        "the fresh D1 side retires the payout"
+    );
+    let stored_row = view["d1Stored"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["outpoint"] == outpoint.as_str())
+        .cloned()
+        .expect("the stored row rides beside");
+    assert_eq!(stored_row["stale"], json!(true), "Phase C: no writer");
+    assert!(stored_row["judgedAtMs"].is_number());
+    assert_eq!(view["d1Stored"]["stale"], json!(true));
+    assert_eq!(view["d1Stored"]["d1Judges"], json!(false));
+    assert!(view["d1Stored"]["staleOutpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|o| o == outpoint.as_str()));
+    // The names and shapes kept, over the fresh side.
+    for k in [
+        "diff",
+        "tipLag",
+        "tipLagTips",
+        "digests",
+        "heldByLag",
+        "d1JudgedUnder",
+        "d1Rejudge",
+        "actor",
+    ] {
+        assert!(!view[k].is_null(), "{k} served");
+    }
+    assert_eq!(
+        view["digests"]["d1"],
+        json!(rows_digest(view["d1"]["rows"].as_array().unwrap()))
+    );
+    // Nothing written: the fresh judgement is a scratch set.
+    assert_eq!(stored(&d1, &id), stored_before);
+    assert_eq!(snapshot(&d1), counts_before);
+    // The fresh rows are the judge's own write, by construction: the same identity judged into a copy of the record
+    // stores them byte for byte (`owed_judge::stored_row_of` is the write's binds).
+    let games = games_of(&d1, &id);
+    let fresh = crate::owed_judge::judge_fresh_rows(&d1, &id, &games)
+        .await
+        .unwrap();
+    d1.conn
+        .execute("DELETE FROM owed_rows WHERE identity=?1", [&id])
+        .unwrap();
+    for chunk in games.chunks(16) {
+        crate::owed_judge::judge_subjects(&d1, &id, chunk, "fix986")
+            .await
+            .unwrap();
+    }
+    let written = fix986_rows(&d1, &id).await;
+    let strip = |rows: &[Value]| -> Vec<Value> {
+        rows.iter()
+            .map(|r| {
+                let mut r = r.clone();
+                r.as_object_mut().unwrap().remove("judgedAtMs");
+                r
+            })
+            .collect()
+    };
+    assert_eq!(
+        strip(&fresh),
+        strip(&written),
+        "the fresh rows are the write's"
+    );
+}
+
+/// The ring's fleet: `n` hex seats, each one old verified hop marker over an index-unspent hop (a `hop-stranded`
+/// row each), and each seat's actor judged.
+async fn fix986_fleet(n: usize) -> (SqliteSql, Vec<String>, BTreeMap<String, SqliteSql>) {
+    let made = (NOW_MS / 1000) as i64 - 7_200;
+    let ids: Vec<String> = (0..n).map(|k| format!("02{:064x}", 0x9860 + k)).collect();
+    let mut seed = Vec::new();
+    for (k, id) in ids.iter().enumerate() {
+        let hop = h("b986", k);
+        seed.push(format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{hop}',0,0,{made},'p2pkh')"));
+        seed.push(format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('{id}','other','{}',0,20190,'seat','00','00',2,'{hop}',1,{made},1)", h("9e86", k)));
+    }
+    let d1 = seeded(&Fixture {
+        name: "fix986 ring",
+        seed,
+        identities: ids.clone(),
+    });
+    let mut actors = BTreeMap::new();
+    for id in &ids {
+        let (local, _) = actor_judge(&d1, id).await;
+        assert_eq!(fix986_rows(&local, id).await.len(), 1, "one row a seat");
+        actors.insert(id.clone(), local);
+    }
+    // Phase C: the seed's marks are the actor's, acknowledged; D1's stored rows were never judged.
+    d1.conn.execute("DELETE FROM owed_dirty", []).unwrap();
+    (d1, ids, actors)
+}
+
+fn fix986_compared(d1: &SqliteSql) -> Vec<(String, i64)> {
+    d1.conn
+        .prepare("SELECT identity,comparedAtMs FROM owed_actor_compare ORDER BY identity")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// (fix986c2_b) READ-986 item 4: THE RING COVERS EVERY IDENTITY ONCE A REVOLUTION AND RESUMES ITS CURSOR. Seven seats
+/// at three a tick: ticks of 3, 3 and 1 (the short page wraps: revolution 1, the cursor back to the start), each seat
+/// compared once; a tick the platform ends after its second identity's write resumes at the third; a paused ring
+/// (0 a tick) compares nothing; a revolution drops the row of an identity gone from the list. The Phase C flip is
+/// observed once and closed when the D1 judge is seen on again. The tick's statements are counted and bounded.
+#[tokio::test]
+async fn fix986c2_b_the_ring_covers_every_identity_once_a_revolution_and_resumes() {
+    let (d1, ids, actors) = fix986_fleet(7).await;
+    let mut port = Fix986 {
+        d1: &d1,
+        actors,
+        judges: false,
+        die_after: Cell::new(u32::MAX),
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let mut now = NOW_MS as i64;
+    let mut ticks = Vec::new();
+    loop {
+        let r = compare::ring_tick(&port, now, 3, || 0).await.unwrap();
+        assert!(
+            r.statements <= compare::FLEET_COMPARE_STATEMENTS_PER_TICK,
+            "{r:?}"
+        );
+        seen.extend(r.compared.clone());
+        ticks.push(r.compared.len());
+        now += 60_000;
+        if r.wrapped {
+            assert_eq!(r.cursor, "");
+            break;
+        }
+        assert_eq!(&r.cursor, r.compared.last().unwrap());
+    }
+    assert_eq!(ticks, vec![3, 3, 1]);
+    assert_eq!(seen, ids, "every identity once, in key order");
+    assert_eq!(fix986_compared(&d1).len(), 7);
+    let ring: Value = serde_json::from_str(
+        &d1.conn
+            .query_row(
+                "SELECT cursor FROM owed_belt_state WHERE name='fleet-compare:ring'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ring["revolution"], json!(1));
+    assert_eq!(ring["after"], json!(""));
+    let phase_c: Value = serde_json::from_str(
+        &d1.conn
+            .query_row(
+                "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:phase-c'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        phase_c["sinceMs"],
+        json!(NOW_MS as i64),
+        "the flip observed once, at the first tick"
+    );
+    assert!(phase_c["endedAtMs"].is_null());
+    // A tick the platform ends: its first read and two identities land (each identity: the compare's reads and its
+    // row with the cursor), then the record faults.
+    let per_identity = {
+        // the record's calls of one identity's compare, plus its write
+        let before = d1.batches.get();
+        let _ = compare::compare_one(&port, &ids[0], now).await;
+        d1.batches.get() - before + 1
+    };
+    port.die_after.set(2 + 2 * per_identity);
+    let dead = compare::ring_tick(&port, now, 3, || 0).await;
+    assert!(dead.is_err(), "the platform ended the tick");
+    port.die_after.set(u32::MAX);
+    let r = compare::ring_tick(&port, now + 60_000, 3, || 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.compared.first(),
+        Some(&ids[2]),
+        "the next tick resumes after the last identity written: {r:?}"
+    );
+    // Paused: nothing compared, the cursor held.
+    let paused = compare::ring_tick(&port, now + 120_000, 0, || 0)
+        .await
+        .unwrap();
+    assert!(paused.compared.is_empty() && paused.stopped == Some("paused"));
+    // The wall: no identity started past it.
+    let walled = compare::ring_tick(&port, now + 180_000, 3, || {
+        compare::FLEET_COMPARE_WALL_MS + 1
+    })
+    .await
+    .unwrap();
+    assert!(walled.compared.is_empty() && walled.stopped == Some("wall"));
+    // An identity gone from the list: its row dropped at the end of the next whole revolution.
+    let gone = ids[6].clone();
+    d1.conn
+        .execute("DELETE FROM hopparty_records WHERE identity=?1", [&gone])
+        .unwrap();
+    d1.conn
+        .execute("DELETE FROM owed_state WHERE identity=?1", [&gone])
+        .unwrap();
+    let mut t = now + 240_000;
+    let mut wraps = 0;
+    while wraps < 2 {
+        let r = compare::ring_tick(&port, t, 3, || 0).await.unwrap();
+        wraps += usize::from(r.wrapped);
+        t += 60_000;
+    }
+    assert!(
+        !fix986_compared(&d1).iter().any(|(i, _)| *i == gone),
+        "the gone identity's row dropped"
+    );
+    assert_eq!(fix986_compared(&d1).len(), 6);
+    // The D1 judge seen on again closes the flip.
+    port.judges = true;
+    compare::ring_tick(&port, t, 3, || 0).await.unwrap();
+    let phase_c: Value = serde_json::from_str(
+        &d1.conn
+            .query_row(
+                "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:phase-c'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(phase_c["endedAtMs"], json!(t));
+    // The ring's tick wiring: its own actor's minute alarm, set before the tick; every cron arms it.
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let board = squash(include_str!("../board_view.rs"));
+    let alarm = &board[board.find("asyncfnserve_alarm(&self)").unwrap()..];
+    let rearm = alarm
+        .find("storage.set_alarm(crate::owed_actor::compare::FLEET_COMPARE_TICK_MS).await?;")
+        .unwrap();
+    let tick = alarm
+        .find("returncrate::owed_actor::object::fleet_compare_tick_env(&self.env).await;")
+        .unwrap();
+    assert!(rearm < tick, "re-armed before the tick runs");
+    assert!(board.contains("req.path()==\"/owed-fleet-compare-arm\""));
+    let lib = squash(include_str!("../lib.rs"));
+    assert!(lib.contains(".phase(\"owed.compare_arm\",owed_belt::arm_fleet_compare(&env_owed))"));
+    let object = squash(include_str!("object.rs"));
+    assert!(object.contains("super::compare::ring_tick(&judge,started"));
+    assert_eq!(compare::per_tick_of(None), 16);
+    assert_eq!(compare::per_tick_of(Some("0")), 0);
+    assert_eq!(
+        compare::per_tick_of(Some("500")),
+        compare::FLEET_COMPARE_PER_TICK_MAX
+    );
+    assert_eq!(compare::per_tick_of(Some("x")), 16);
+}
+
+/// (fix986c2_c) ONE FUNCTION: the ring's written row for an identity is the route's compare of it. One seat's actor
+/// planted different (its row's sats one more): the route's view (`fresh_compare`, as `rows_lever` serves it) names
+/// the outpoint and the field; the ring's row names the same outpoint, the same fields and the same digests; the POST
+/// re-compare writes the same row; `GET` serves it under `diffs`, a held one under `heldByLag`, and the overlay's
+/// `/health/invariants` counts read it. A pending mark on the game moves it from `diffs` to `heldByLag`.
+#[tokio::test]
+async fn fix986c2_c_the_rings_row_is_the_routes_compare() {
+    let (d1, ids, actors) = fix986_fleet(3).await;
+    let target = ids[1].clone();
+    actors[&target]
+        .conn
+        .execute(
+            "UPDATE owed_rows SET sats=sats+1 WHERE identity=?1",
+            [&target],
+        )
+        .unwrap();
+    let port = Fix986 {
+        d1: &d1,
+        actors,
+        judges: false,
+        die_after: Cell::new(u32::MAX),
+    };
+    let route = compare::fresh_compare(&port, &target, compare::actor_answer(&port, &target).await)
+        .await
+        .unwrap();
+    let op = route["diff"][0].as_str().unwrap().to_string();
+    assert_eq!(route["diff"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        route["diffFields"][0]["fields"]["sats"],
+        json!({"d1": 20190, "actor": 20191})
+    );
+    let r = compare::ring_tick(&port, NOW_MS as i64, 16, || 0)
+        .await
+        .unwrap();
+    assert_eq!(r.diffs, 1, "{r:?}");
+    let row: (i64, i64, String, String, String) = d1
+        .conn
+        .query_row(
+            "SELECT diffCount,heldByLagCount,outpoints,d1Digest,actorDigest FROM owed_actor_compare WHERE identity=?1",
+            [&target],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    let outpoints: Value = serde_json::from_str(&row.2).unwrap();
+    assert_eq!((row.0, row.1), (1, 0));
+    assert_eq!(outpoints[0]["outpoint"], json!(op));
+    assert_eq!(outpoints[0]["fields"], route["diffFields"][0]["fields"]);
+    assert_eq!(json!(row.3), route["digests"]["d1"]);
+    assert_eq!(json!(row.4), route["digests"]["actor"]);
+    // The row of `compare_row_of` over the route's view is the ring's, field for field.
+    let of_route = compare::compare_row_of(&target, NOW_MS as i64, Ok(&route));
+    assert_eq!(of_route.outpoints, outpoints);
+    assert_eq!(of_route.diff_count, Some(row.0));
+    // The POST re-compare writes the same.
+    let posted = compare::compare_now(&port, &target, NOW_MS as i64 + 1)
+        .await
+        .unwrap();
+    assert_eq!(posted["outpoints"], outpoints);
+    // The standing GET's shape.
+    let got = compare::read_answer(&d1, "", "", NOW_MS as i64 + 60_000)
+        .await
+        .unwrap();
+    for k in [
+        "identities",
+        "comparedWithinMs",
+        "diffs",
+        "heldByLag",
+        "staleD1",
+        "ringCursor",
+        "lastTickAt",
+        "next",
+        "faults",
+    ] {
+        assert!(got.get(k).is_some(), "{k} served: {got}");
+    }
+    assert_eq!(got["identities"], json!(3));
+    assert_eq!(got["diffs"].as_array().unwrap().len(), 1);
+    assert_eq!(got["diffs"][0]["identity"], json!(target));
+    assert_eq!(got["diffs"][0]["diffCount"], json!(1));
+    assert_eq!(
+        got["diffs"][0]["outpoints"][0]["fields"],
+        route["diffFields"][0]["fields"]
+    );
+    assert_eq!(got["comparedWithinMs"], json!(60_000));
+    let narrowed = compare::read_answer(&d1, "", &ids[0], NOW_MS as i64)
+        .await
+        .unwrap();
+    assert_eq!(narrowed["row"]["identity"], json!(ids[0]));
+    assert_eq!(narrowed["row"]["diffCount"], json!(0));
+    // A pending mark on the game: the difference is held by the backlog, not counted a diff.
+    let game: String = d1
+        .conn
+        .query_row(
+            "SELECT gameId FROM hopparty_records WHERE identity=?1",
+            [&target],
+            |r| r.get(0),
+        )
+        .unwrap();
+    d1.conn
+        .execute(
+            "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,?2,'hop','pin',1)",
+            rusqlite::params![target, game],
+        )
+        .unwrap();
+    compare::compare_now(&port, &target, NOW_MS as i64 + 2)
+        .await
+        .unwrap();
+    let got = compare::read_answer(&d1, "", "", NOW_MS as i64 + 3)
+        .await
+        .unwrap();
+    assert!(got["diffs"].as_array().unwrap().is_empty(), "{got}");
+    assert_eq!(got["heldByLag"][0]["identity"], json!(target));
+    assert_eq!(got["heldByLag"][0]["outpoints"][0]["outpoint"], json!(op));
+    // The overlay's `/health/invariants.owedActor.fleetCompare`: its statement's aggregate over the same table.
+    let state = d1
+        .run_batch(vec![Stmt::new(
+            crate::owed_events_publish::HEALTH_STATE_SQL,
+            vec![Bind::Int(NOW_MS as i64)],
+        )])
+        .await
+        .unwrap()[0]
+        .rows[0]
+        .clone();
+    let health = crate::owed_events_publish::fleet_compare_view(&state, NOW_MS as i64 + 10);
+    assert_eq!(health["identities"], json!(3));
+    assert_eq!(health["diffs"], json!(0));
+    assert_eq!(health["heldByLag"], json!(1));
+    assert!(health["oldestCompareAgeMs"].as_i64().unwrap() >= 10);
+}
+
+/// (fix986c2_d) The routes' shapes and their bearer: `rows_lever` and `compare_lever` refuse without the bearer before
+/// any read; the rows lever calls the one compare (no stored-rows compare left in it); `lib.rs` routes both verbs.
+#[test]
+fn fix986c2_d_the_routes_call_the_one_compare_behind_the_bearer() {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let object = squash(include_str!("object.rs"));
+    for (start, end) in [
+        ("pubasyncfnrows_lever(", "pubasyncfncompare_lever("),
+        (
+            "pubasyncfncompare_lever(",
+            "pubasyncfnfleet_compare_tick_env(",
+        ),
+    ] {
+        let lever = &object[object.find(start).unwrap()..object.find(end).unwrap()];
+        let bearer = lever
+            .find("if!crate::internal_events::internal_bearer_ok(&req,env){returnResponse::error(\"unauthorized\",401);}")
+            .expect("the bearer");
+        for read in [
+            "D1Sql::of(",
+            "D1Judge::new(",
+            "call_stored_answer(",
+            "run_batch(",
+        ] {
+            if let Some(at) = lever.find(read) {
+                assert!(bearer < at, "{start}: 401 before {read}");
+            }
+        }
+    }
+    let rows = &object[object.find("pubasyncfnrows_lever(").unwrap()
+        ..object.find("pubasyncfncompare_lever(").unwrap()];
+    assert!(rows.contains("super::compare::fresh_compare(&judge,&me,actor)"));
+    assert!(
+        !rows.contains("RECONCILE_D1_ROWS_SQL"),
+        "no stored-rows compare"
+    );
+    let compare_src = squash(include_str!("compare.rs"));
+    assert!(
+        compare_src.contains("letfresh=crate::owed_judge::judge_fresh_rows(db,&me,&games).await?;")
+    );
+    assert!(compare_src.contains("letmutview=rows_view(&me,actor,&fresh,"));
+    let lib = squash(include_str!("../lib.rs"));
+    assert!(lib.contains("&&req.path()==\"/internal/owed-actor-compare\"{returnowed_actor::object::compare_lever(req,&env).await;}"));
+}
+
+/// (fix986c2_e) The cost of one fresh compare, in D1 statements, over the frozen fleet's seats (the whale and the
+/// lived-in seat past [`compare::FRESH_COMPARE_GAMES_MAX`] games, compared `partial`): each under D1's per-invocation
+/// bound (1,000) with room, so the route's one compare and the ring's first identity of a tick always fit; printed.
+#[tokio::test]
+async fn fix986c2_e_one_fresh_compare_fits_one_invocation() {
+    let f = fixtures()
+        .into_iter()
+        .find(|f| f.name == "d1_fleet")
+        .unwrap();
+    let d1 = d1_judge(&f).await;
+    let mut worst = 0;
+    for id in &f.identities {
+        let port = Fix986 {
+            d1: &d1,
+            actors: BTreeMap::new(),
+            judges: true,
+            die_after: Cell::new(u32::MAX),
+        };
+        let m = compare::Metered::new(&port);
+        let view = compare::fresh_compare(&m, id, Err("no actor (pin)".into()))
+            .await
+            .unwrap();
+        let n = m.statements.get();
+        println!(
+            "fix986c2_e {id}: {n} statements, games {}",
+            view["d1"]["games"]
+        );
+        worst = worst.max(n);
+    }
+    assert!(
+        worst + compare::FLEET_COMPARE_IDENTITY_RESERVE <= 1_000,
+        "one compare {worst} statements"
+    );
+    // The ring spends no hydration on an identity it cannot compare: no actor (or one not bootstrapped) is the
+    // row's fault, with no statement run.
+    let port = Fix986 {
+        d1: &d1,
+        actors: BTreeMap::new(),
+        judges: true,
+        die_after: Cell::new(u32::MAX),
+    };
+    let m = compare::Metered::new(&port);
+    let (row, view) = compare::compare_one(&m, &f.identities[0], NOW_MS as i64).await;
+    assert_eq!(row.fault.as_deref(), Some("actor: no owed actor bound"));
+    assert!(view.is_none());
+    assert_eq!(m.statements.get(), 0);
+}
+
+/// (fix986c2_f) The ring's identity page is the identity list's (`object::RESET_IDENTITIES_SQL`, what
+/// `GET /internal/owed-actor-identities` pages) walked by index seeks: the same identities in the same order, every
+/// page's VM steps flat beside 2,000 more identities (the union read every identity past the cursor before its LIMIT).
+/// RED with the union's page put back (the budget tier read 551 rows a tick with it).
+#[tokio::test]
+async fn fix986c2_f_the_rings_identity_page_is_seeks_over_the_identity_list() {
+    let f = fixtures()
+        .into_iter()
+        .find(|f| f.name == "d1_fleet")
+        .unwrap();
+    let d1 = d1_judge(&f).await;
+    let page = |sql: &str, after: &str, n: i64| -> Vec<String> {
+        d1.conn
+            .prepare(sql)
+            .unwrap()
+            .query_map(rusqlite::params![after, n], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let all = page(object::RESET_IDENTITIES_SQL, "", 100_000);
+    assert!(all.len() > 4, "{}", all.len());
+    for (after, n) in [
+        ("", 3),
+        ("", 100_000),
+        (all[2].as_str(), 2),
+        (all.last().unwrap().as_str(), 5),
+    ] {
+        assert_eq!(
+            page(compare::RING_IDENTITIES_SQL, after, n),
+            page(object::RESET_IDENTITIES_SQL, after, n),
+            "after {after:?}, {n}"
+        );
+    }
+    // Flat in the identity list's size: a page of 16 costs the same VM steps beside 2,000 more identities.
+    let steps = |sql: &str| -> i32 {
+        let mut st = d1.conn.prepare(sql).unwrap();
+        let n = st
+            .query_map(rusqlite::params!["", 16], |r| r.get::<_, String>(0))
+            .unwrap()
+            .count();
+        assert_eq!(n, 16);
+        st.get_status(rusqlite::StatementStatus::VmStep)
+    };
+    let before = steps(compare::RING_IDENTITIES_SQL);
+    for k in 0..2_000 {
+        d1.conn
+            .execute(
+                "INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,sigValid) VALUES (?1,'x','g',?2,0,900100,'00',?2,1,1,0)",
+                rusqlite::params![format!("03ff{k:062x}"), format!("{k:064x}")],
+            )
+            .unwrap();
+    }
+    let after = steps(compare::RING_IDENTITIES_SQL);
+    println!(
+        "fix986c2_f RING_IDENTITIES_SQL: {before} VM steps, {after} beside 2,000 more identities"
+    );
+    assert_eq!(
+        after, before,
+        "a page of the ring reads its page, not the list"
+    );
 }

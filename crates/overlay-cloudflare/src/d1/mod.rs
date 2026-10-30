@@ -641,7 +641,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// `owed_event_dead_letters` (the `owed-events` DLQ's parked letters), `idx_released_missing_hop` (the `hop` event's
 /// facts read) and `worker_cost_daily.queueOps` (the cost bar's queue family). The app layer reads and writes the
 /// first two and the column: deploy the overlay first (its certified count at 473), then the app layer.
-pub const OVERLAY_MIGRATION_COUNT: usize = 473;
+/// 473 to 474 for bsv-low #986 (FIX-986-COMPARE-2): `owed_actor_compare`, the app layer's standing fresh compare of
+/// each owed actor (its ring writes it, `/health/invariants.owedActor.fleetCompare` reads it): the overlay first.
+pub const OVERLAY_MIGRATION_COUNT: usize = 474;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2463,6 +2465,9 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::owed_events::DEAD_LETTERS_CREATE,
     crate::owed_events::RELEASED_MISSING_HOP_INDEX,
     crate::d1_ledger::COST_DAILY_QUEUE_ALTER,
+    // 474: bsv-low #986 (FIX-986-COMPARE-2, READ-986 item 4): the app layer's standing compare of each owed actor
+    // against a fresh D1 judgement, one row per identity.
+    crate::owed_events::ACTOR_COMPARE_CREATE,
 ];
 
 // =============================================================================

@@ -150,6 +150,16 @@ impl BoardView {
             }
             return Response::ok("held");
         }
+        // FIX-986 (READ-986 item 4): the fleet compare's ring actor, armed by every cron as the belt is.
+        if req.path() == "/owed-fleet-compare-arm" {
+            let storage = self.state.storage();
+            storage.put("owed-fleet-compare", true).await?;
+            if storage.get_alarm().await?.is_none() {
+                storage.set_alarm(0).await?;
+                return Response::ok("armed");
+            }
+            return Response::ok("held");
+        }
         // The deferred owed walk is retired (#893: the read is one lookup, the belt asks the chain); a stale caller
         // is answered, never served the board.
         if req.path() == "/owed-deferred" || req.path() == "/owed-deferred-note" {
@@ -226,6 +236,17 @@ impl BoardView {
     /// Any other actor's alarm (a deferred walk armed before the retirement) clears its storage and ends.
     async fn serve_alarm(&self) -> Result<Response> {
         let storage = self.state.storage();
+        // FIX-986: the fleet compare's ring ticks every minute, its next alarm set before the tick.
+        if storage
+            .get::<bool>("owed-fleet-compare")
+            .await?
+            .unwrap_or(false)
+        {
+            storage
+                .set_alarm(crate::owed_actor::compare::FLEET_COMPARE_TICK_MS)
+                .await?;
+            return crate::owed_actor::object::fleet_compare_tick_env(&self.env).await;
+        }
         if !storage.get::<bool>("owed-belt").await?.unwrap_or(false) {
             storage.delete_all().await?;
             return Response::ok("retired deferred owed alarm");

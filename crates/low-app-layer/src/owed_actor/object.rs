@@ -1706,9 +1706,12 @@ pub const RESET_IDENTITIES_SQL: &str = "SELECT identity FROM (SELECT identity FR
 pub const RESET_PER_CALL: usize = 50;
 
 /// THE OPERATOR'S ROWS LEVER (the captain's item 10, D2-ACTOR-B-FOLD-8): `GET /internal/owed-actor-rows?identity=`
-/// (bearer `INTERNAL_TOKEN`), ONE identity a call, no write: the actor's state and stored rows (`/stored`, the
-/// reconcile's read) beside D1's stored rows ([`RECONCILE_D1_ROWS_SQL`], the reconcile's), and the outpoints that
-/// differ ([`diff_rows`]) with both [`rows_digest`]s ([`rows_view`]): exactly what the reconcile compares.
+/// (bearer `INTERNAL_TOKEN`), ONE identity a call: the actor's state and stored rows (`/stored`, the reconcile's read)
+/// against the D1 judge's FRESH judgement of the identity's games (FIX-986, bsv-low #986, READ-986 item 1:
+/// [`super::compare::fresh_compare`], the one compare the standing route and its ring call; nothing written), and the
+/// outpoints that differ ([`diff_rows`]) with both [`rows_digest`]s ([`rows_view`]). D1's STORED rows ride beside as
+/// `d1Stored`, each labelled `stale` (the D1 judge off, or judged before the last Phase C flip): until FIX-986 they
+/// were the compare's D1 side, and Phase C leaves them with no writer (42 of READ-986's 46 were that).
 pub async fn rows_lever(req: Request, env: &Env) -> Result<Response> {
     if !crate::internal_events::internal_bearer_ok(&req, env) {
         return Response::error("unauthorized", 401);
@@ -1721,35 +1724,113 @@ pub async fn rows_lever(req: Request, env: &Env) -> Result<Response> {
     else {
         return Response::error("identity is not a 66-hex key", 400);
     };
-    let db = crate::routes::D1Sql::of(env)?;
-    let mut read = db
-        .run_batch(vec![
-            Stmt::new(RECONCILE_D1_ROWS_SQL, vec![Bind::Text(me.clone())]),
-            // D2-ACTOR-B-FOLD-13 (bsv-low #958): which judge version D1's rows are (the stamp, `computedAtMs`).
-            Stmt::new(D1_JUDGED_UNDER_SQL, vec![Bind::Text(me.clone())]),
-            // FIX-964 (bsv-low #964): the identity's pending marks, so a difference the backlog explains is named.
-            Stmt::new(LEVER_PENDING_SQL, vec![Bind::Text(me.clone())]),
-        ])
-        .await
-        .map_err(Error::RustError)?
-        .into_iter();
-    let d1 = read.next().map(|o| o.rows).unwrap_or_default();
-    let under = read
-        .next()
-        .and_then(|o| o.rows.into_iter().next())
-        .unwrap_or_default();
-    let pending = read.next().map(|o| o.rows).unwrap_or_default();
-    let stamp = rejudge_state_of(Some(&json!({"cursor": under["stamp"]})));
+    let tip = crate::owed_events::tip_memoised(env, false).await;
+    let judge =
+        crate::owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))?;
     let actor = call_stored_answer(env, &me, READ_WALL_MS).await;
-    let mut view = rows_view(
-        &me,
-        actor,
-        &d1,
-        stamp.as_ref(),
-        json_ms(&under["computedAtMs"]).map(|c| c as i64),
+    match super::compare::fresh_compare(&judge, &me, actor).await {
+        Ok(view) => Response::from_json(&view),
+        Err(e) => Response::error(
+            format!("the fresh D1 judgement faulted, no compare: {e}"),
+            503,
+        ),
+    }
+}
+
+/// THE STANDING COMPARE (FIX-986, READ-986 item 4): `GET /internal/owed-actor-compare?after=&identity=` (bearer
+/// `INTERNAL_TOKEN`, 401 before any read) serves the ring's stored compares ([`super::compare::read_answer`]: the
+/// fleet's counts, the identities whose actor differs from a fresh D1 judgement with their outpoints and fields, those
+/// a pending mark holds, the faults, the ring's cursor and last tick, 64 rows a page); `POST {"identity": "<id>"}`
+/// re-compares one identity now through the ring's own function and writes its row; `POST {"tick": true}` runs one
+/// tick of the ring ([`fleet_compare_tick_env`], the alarm's function).
+pub async fn compare_lever(mut req: Request, env: &Env) -> Result<Response> {
+    if !crate::internal_events::internal_bearer_ok(&req, env) {
+        return Response::error("unauthorized", 401);
+    }
+    let now = Date::now().as_millis() as i64;
+    if req.method() == Method::Post {
+        let body: Value = match req.json().await {
+            Ok(b) => b,
+            Err(e) => return Response::error(format!("bad compare body: {e}"), 400),
+        };
+        // `{"tick": true}`: one tick of the ring on demand (the operator's, and the budget tier's), its own function.
+        if body["tick"] == true {
+            return fleet_compare_tick_env(env).await;
+        }
+        let Some(me) = body["identity"].as_str().and_then(actor_name) else {
+            return Response::error("identity is not a 66-hex key", 400);
+        };
+        let tip = crate::owed_events::tip_memoised(env, false).await;
+        let judge = crate::owed_judge::D1Judge::new(
+            env,
+            tip,
+            crate::routes::written_off_before_ms_env(env),
+        )?;
+        return match super::compare::compare_now(&judge, &me, now).await {
+            Ok(a) => Response::from_json(&a),
+            Err(e) => Response::error(format!("compare: {e}"), 503),
+        };
+    }
+    let url = req.url()?;
+    let param = |k: &str| {
+        url.query_pairs()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default()
+    };
+    let identity = match param("identity") {
+        i if i.is_empty() => String::new(),
+        i => match actor_name(&i) {
+            Some(n) => n,
+            None => return Response::error("identity is not a 66-hex key", 400),
+        },
+    };
+    let db = crate::routes::D1Sql::of(env)?;
+    match super::compare::read_answer(&db, &param("after"), &identity, now).await {
+        Ok(a) => Response::from_json(&a),
+        Err(e) => Response::error(format!("compare read: {e}"), 503),
+    }
+}
+
+/// The ring's tick in its own actor's alarm (FIX-986, READ-986 item 4): the D1 judge's port under the served tip
+/// and the era, the render's per-tick setting.
+pub async fn fleet_compare_tick_env(env: &Env) -> Result<Response> {
+    let started = Date::now().as_millis();
+    let tip = crate::owed_events::tip_memoised(env, false).await;
+    let judge =
+        crate::owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))?;
+    let per_tick = super::compare::per_tick_of(
+        env.var(super::compare::PER_TICK_VAR)
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
     );
-    view["heldByLag"] = json!(held_by_lag(&view, &pending));
-    Response::from_json(&view)
+    match super::compare::ring_tick(&judge, started as i64, per_tick, || {
+        Date::now().as_millis().saturating_sub(started)
+    })
+    .await
+    {
+        Ok(r) => {
+            console_log!(
+                "[owed-fleet-compare] compared {} diffs {} faults {} statements {} cursor {:?} wrapped {} stopped {:?}",
+                r.compared.len(),
+                r.diffs,
+                r.faults,
+                r.statements,
+                r.cursor,
+                r.wrapped,
+                r.stopped
+            );
+            Response::from_json(&json!({
+                "compared": r.compared.len(), "diffs": r.diffs, "faults": r.faults,
+                "statements": r.statements, "cursor": r.cursor, "wrapped": r.wrapped, "stopped": r.stopped,
+            }))
+        }
+        Err(e) => {
+            console_warn!("[owed-fleet-compare] tick faulted: {e}");
+            Response::error(e, 503)
+        }
+    }
 }
 
 pub async fn identities_lever(req: Request, env: &Env) -> Result<Response> {
