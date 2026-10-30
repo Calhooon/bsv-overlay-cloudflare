@@ -305,6 +305,12 @@ pub fn rests_on_unconfirmed_find(facts: &Value) -> bool {
         && facts["spentConfirmed"] != true
 }
 
+/// FIX-988: a payout row whose spend is seen and not mined (`owed::derive_owed_rows`: `chainWait: "block"` exactly
+/// while the sweep is unconfirmed).
+pub fn payout_waits_on_block(facts: &Value) -> bool {
+    facts["chainWait"] == "block"
+}
+
 pub fn ask_of(c: &Candidate) -> Option<Ask> {
     let fact = |k: &str| {
         c.facts[k]
@@ -313,6 +319,13 @@ pub fn ask_of(c: &Candidate) -> Option<Ask> {
             .map(str::to_ascii_lowercase)
     };
     match c.family.as_str() {
+        // FIX-988 (bsv-low #988, L54's S3): a courier-bytes payout whose sweep is not yet confirmed waits on the
+        // SWEEP's block, which only the hop's spend answers (the courier's mined word on the outpoint the row is
+        // keyed by); its home outputs are a confirmed sweep's alone (`owed::courier_home_outputs`), so a home ask
+        // answered nothing and re-armed with no call, for good.
+        "payout" if c.facts["creditKind"] == "courier-bytes" && payout_waits_on_block(&c.facts) => {
+            split_outpoint(&c.outpoint).map(|(txid, vout)| Ask::Outpoint { txid, vout })
+        }
         "payout" if c.facts["creditKind"] == "courier-bytes" => Some(Ask::Home),
         "unbound" if rests_on_unconfirmed_find(&c.facts) => {
             split_outpoint(&c.outpoint).map(|(txid, vout)| Ask::Outpoint { txid, vout })

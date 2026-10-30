@@ -816,7 +816,7 @@ pub(crate) mod pins {
     }
 
     /// The tip the fold-7 finding judged the captured pair at (its seats' recovery height is 970,758).
-    const FOLD8_TIP: u64 = 971_000;
+    pub(crate) const FOLD8_TIP: u64 = 971_000;
     /// The finding's three identities, and the cached-press seat of the synthetic missing-bytes JOIN beside them.
     const FOLD8_TWIN_ONLY: &str =
         "030d9e9fbe045a8130f190b103609c8a6bf13b1887d5c4f15e2f918d68aca8ad67";
@@ -831,7 +831,7 @@ pub(crate) mod pins {
     }
 
     /// Every pass of the shipped `owed-v2` backfill to its stamp, then the shipped drain to empty.
-    pub(super) async fn backfill_to_the_stamp(
+    pub(crate) async fn backfill_to_the_stamp(
         judge: &SqliteSql,
     ) -> Vec<crate::owed_backfill::BackfillReport> {
         judge.conn.execute_batch(&format!(
@@ -950,20 +950,19 @@ pub(crate) mod pins {
     /// The seat of the captured pair 13 that pays its committed home (`pubA` 023186e1..., `payPkhA` 3e7bb94f...) and
     /// its hop. In hand 3's shape (D2-OWED-HOME-MARKER) it has NO party row, live or evicted, only its VERIFIED hop
     /// marker; its hop is swept around the overlay to the committed home, the sweep's bytes a courier's.
-    const HOME_MARKER_SEAT: &str = FOLD8_TWIN_ONLY;
+    pub(crate) const HOME_MARKER_SEAT: &str = FOLD8_TWIN_ONLY;
     const HOME_MARKER_KEY: &str =
         "023186e1d618b96dca2583a21aa8c5e2227ba49f3f671f59e3f2be1c346ed41763";
     const HOME_MARKER_PKH: &str = "3e7bb94f261568ca8d457d8b4f935b0a3f8ccf89";
-    const HOME_MARKER_HOP: &str =
+    pub(crate) const HOME_MARKER_HOP: &str =
         "9b238eed0177c714b1f9a608243e8f1bf79e35e9597110f83cefa1b658785c62";
-    const HOME_MARKER_GAME: &str =
+    pub(crate) const HOME_MARKER_GAME: &str =
         "9d88aaaa348acae127efd08e133822201ecae56513831c37124837f3ef9ae17f";
 
-    /// Hand 3's rows over the captured pair 13: the seat's party rows gone, its verified marker, the courier sweep.
-    fn home_marker_seed() -> (Vec<String>, String) {
+    /// Hand 3's courier sweep: the seat's hop to its committed home (FIX-988's pin serves its raw to the belt).
+    pub(crate) fn home_marker_sweep() -> bsv_rs::transaction::Transaction {
         use bsv_rs::script::LockingScript;
         use bsv_rs::transaction::{Transaction, TransactionInput, TransactionOutput};
-        let mut seed = l23::l23_r2_route_rows(NOW_MS / 1000);
         let pkh: [u8; 20] = hex::decode(HOME_MARKER_PKH).unwrap().try_into().unwrap();
         let mut sweep = Transaction::new();
         sweep
@@ -975,6 +974,13 @@ pub(crate) mod pins {
                 .unwrap(),
             change: false,
         });
+        sweep
+    }
+
+    /// Hand 3's rows over the captured pair 13: the seat's party rows gone, its verified marker, the courier sweep.
+    pub(crate) fn home_marker_seed() -> (Vec<String>, String) {
+        let mut seed = l23::l23_r2_route_rows(NOW_MS / 1000);
+        let sweep = home_marker_sweep();
         let sweep_txid = sweep.id();
         let bytes = crate::owed::StoredSpenderBytes::from_parts(
             &[(HOME_MARKER_HOP.to_string(), 0)],

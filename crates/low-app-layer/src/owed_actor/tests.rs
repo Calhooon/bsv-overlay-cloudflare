@@ -520,8 +520,9 @@ impl SqlPort for WithActor {
     }
 }
 impl JudgeDb for WithActor {
+    /// The record's tip (TIP unless a pin moves it: FIX-988's captured pair is judged at its own tip).
     fn tip(&self) -> Option<u64> {
-        Some(TIP)
+        self.d1.tip.get()
     }
     async fn word_views(
         &self,
@@ -605,7 +606,7 @@ impl WithActor {
             identity,
             games,
             event,
-            Some(TIP),
+            self.d1.tip.get(),
             None,
             !self.d1_judges,
             bound,
@@ -11309,4 +11310,184 @@ async fn fix982_a_the_unapplied_figure_is_the_oldest_held_or_faulted_event_in_ev
     // The route hands the figure the mark's age only to name it; no phase flag reaches it.
     let routes: String = include_str!("../routes.rs").split_whitespace().collect();
     assert!(routes.contains("body[\"owedActor\"]=crate::owed_actor::health_body(actor_snapshot.as_ref(),worker::Date::now().as_millis(),&body[\"owedEvents\"][\"oldestUnackedMarkAgeMs\"],);"));
+}
+
+/// FIX-988 (bsv-low #988, L54's S3): PHASE C, A COURIER-BYTES PAYOUT WHOSE SWEEP IS SEEN BUT NOT MINED IS ASKED AT ITS
+/// DUE DATE AND CONFIRMS ON THE COURIER'S MINED WORD. Pair 17's hand: the seat's hop swept to its committed home by a
+/// courier-only sweep, unconfirmed. The actor judges the `payout` `courier-bytes` row ("seen but not mined"), dates it
+/// and publishes its ask; D1's `owed_rows` hold nothing (one writer). The sweep mines; at the due date the belt's
+/// shipped tick reads the ask, asks the HOP's spend through its gate (the courier's word: spent by the sweep,
+/// confirmed), writes the find and hands it back; the actor's row says the no-credit sentence (confirmed).
+/// RED on 1ab40c95: the ask was `home`, whose courier home outputs are only a CONFIRMED sweep's, so it answered
+/// nothing, re-armed with no courier call, and the row stayed "seen but not mined" for good (beta's 07:17Z, 07:29Z and
+/// 07:53Z ticks: `rearmed=2 calls=0`).
+#[tokio::test]
+async fn fix988_a_courier_bytes_payout_unconfirmed_is_asked_at_its_due_date_and_confirms() {
+    use crate::owed_walk_frozen::pins::{
+        backfill_to_the_stamp, home_marker_seed, home_marker_sweep, FOLD8_TIP, HOME_MARKER_GAME,
+        HOME_MARKER_HOP, HOME_MARKER_SEAT,
+    };
+    let (seed, sweep_txid) = home_marker_seed();
+    let d1 = seeded(&Fixture {
+        name: "fix988",
+        seed,
+        identities: vec![HOME_MARKER_SEAT.into()],
+    });
+    d1.tip.set(Some(FOLD8_TIP));
+    // the sweep seen, not mined
+    d1.conn
+        .execute_batch("UPDATE hop_chain_probes SET spentConfirmed=0")
+        .unwrap();
+    // the eviction's evidence (the backfill's evidence phase), then Phase C: no D1 row, no pending mark
+    d1.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+    backfill_to_the_stamp(&d1).await;
+    d1.conn
+        .execute_batch("DELETE FROM owed_rows; DELETE FROM owed_dirty;")
+        .unwrap();
+    let w = WithActor {
+        d1,
+        actor: mirror(),
+        d1_judges: false,
+        event: None,
+        actor_reads: true,
+        actor_fails: Cell::new(false),
+    };
+    w.actor.now.set(w.d1.now.get());
+    let games = vec![HOME_MARKER_GAME.to_string()];
+    crate::owed_events::deliver(&w, HOME_MARKER_SEAT, &games)
+        .await
+        .unwrap();
+    let hop = format!("{HOME_MARKER_HOP}:0");
+    let row = |db: &SqliteSql| -> (String, Value, Option<i64>) {
+        db.conn
+            .query_row(
+                "SELECT family,facts,beltDueAtMs FROM owed_rows WHERE identity=?1 AND outpoint=?2",
+                [HOME_MARKER_SEAT, hop.as_str()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        serde_json::from_str(&r.get::<_, String>(1)?).unwrap(),
+                        r.get(2)?,
+                    ))
+                },
+            )
+            .unwrap_or_else(|e| panic!("the actor's row of the hop: {e}"))
+    };
+    let (family, facts, due) = row(&w.actor);
+    assert_eq!(
+        (
+            family.as_str(),
+            facts["creditKind"].as_str(),
+            facts["claimReason"].as_str()
+        ),
+        (
+            "payout",
+            Some("courier-bytes"),
+            Some(crate::owed::UNCONFIRMED_PAYOUT_REASON)
+        ),
+        "{facts}"
+    );
+    let due = due.expect("the actor dates the courier-bytes payout");
+    let d1_rows: i64 =
+        w.d1.conn
+            .query_row("SELECT COUNT(*) FROM owed_rows", [], |r| r.get(0))
+            .unwrap();
+    assert_eq!(d1_rows, 0, "Phase C: owed_rows has no writer");
+    assert!(
+        asks_of(&w.d1)
+            .iter()
+            .any(|(n, _, d)| *n == crate::owed_belt::ask_name(HOME_MARKER_SEAT, &hop) && *d == due),
+        "the actor publishes the row's ask at its due date: {:?}",
+        asks_of(&w.d1)
+    );
+    // Before its due date the belt asks nothing of it.
+    let idle = crate::owed_belt::tick(&w, &Couriers::default())
+        .await
+        .unwrap();
+    assert_eq!((idle.candidates, idle.calls), (0, 0), "{idle:?}");
+    // The sweep mines; the ask comes due.
+    let at = due as u64 + 1;
+    w.d1.now.set(at);
+    w.actor.now.set(at);
+    let sweep = home_marker_sweep();
+    assert_eq!(sweep.id(), sweep_txid);
+    let courier = Couriers {
+        answers: vec![
+            (
+                format!("{HOME_MARKER_HOP}/0/spent"),
+                (
+                    200,
+                    json!({"txid": sweep_txid, "vin": 0, "status": "confirmed"})
+                        .to_string()
+                        .into_bytes(),
+                ),
+            ),
+            (
+                format!("tx/{sweep_txid}/hex"),
+                (200, hex::encode(sweep.to_binary()).into_bytes()),
+            ),
+        ],
+        ..Default::default()
+    };
+    let report = crate::owed_belt::tick(&w, &courier).await.unwrap();
+    assert_eq!(report.candidates, 1, "{report:?}");
+    assert!(report.calls >= 1, "the belt asked a courier: {report:?}");
+    assert!(report.write_faults.is_empty(), "{report:?}");
+    assert!(report.found >= 1 && report.handed_back >= 1, "{report:?}");
+    assert!(
+        courier
+            .calls
+            .borrow()
+            .iter()
+            .any(|u| u.contains(&format!("{HOME_MARKER_HOP}/0/spent"))),
+        "{:?}",
+        courier.calls.borrow()
+    );
+    let (family, facts, _) = row(&w.actor);
+    assert_eq!(
+        (
+            family.as_str(),
+            facts["creditKind"].as_str(),
+            facts["claimReason"].as_str()
+        ),
+        (
+            "payout",
+            Some("courier-bytes"),
+            Some(crate::owed::COURIER_BYTES_NO_CREDIT_REASON)
+        ),
+        "the actor's row confirms on the courier's mined word: {facts}"
+    );
+    let d1_rows: i64 =
+        w.d1.conn
+            .query_row("SELECT COUNT(*) FROM owed_rows", [], |r| r.get(0))
+            .unwrap();
+    assert_eq!(d1_rows, 0, "still one writer");
+    // The confirmed row's next question is its home (the ask follows the actor's row).
+    let (_, ask, _) = asks_of(&w.d1)
+        .into_iter()
+        .find(|(n, _, _)| *n == crate::owed_belt::ask_name(HOME_MARKER_SEAT, &hop))
+        .expect("the confirmed payout keeps its home ask");
+    assert_eq!(ask["question"]["ask"], json!("home"), "{ask}");
+}
+
+/// FIX-988 (b): the ask of a courier-bytes payout follows its sweep's block, in every phase (`ask_of` is the belt's
+/// one rule): seen and not mined, the hop's spend (the outpoint the row is keyed by); confirmed, its home. RED on
+/// 1ab40c95: `home` for both.
+#[test]
+fn fix988_b_a_courier_bytes_payout_asks_its_hop_until_the_sweep_mines_then_its_home() {
+    let hop = format!("{}:0", "ab".repeat(32));
+    let of = |facts: Value| {
+        crate::owed_belt::ask_of(&crate::owed_belt::candidate_of(&json!({
+            "identity": "owner", "outpoint": hop, "gameId": "g", "family": "payout",
+            "facts": facts.to_string(), "beltDueAtMs": 1, "judgedAtMs": 0,
+        })))
+    };
+    assert!(matches!(
+        of(json!({"creditKind": "courier-bytes", "chainWait": "block"})),
+        Some(crate::owed_belt::Ask::Outpoint { ref txid, vout: 0 }) if *txid == "ab".repeat(32)
+    ));
+    assert!(matches!(
+        of(json!({"creditKind": "courier-bytes"})),
+        Some(crate::owed_belt::Ask::Home)
+    ));
 }
