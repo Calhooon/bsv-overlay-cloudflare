@@ -11310,3 +11310,546 @@ async fn fix982_a_the_unapplied_figure_is_the_oldest_held_or_faulted_event_in_ev
     let routes: String = include_str!("../routes.rs").split_whitespace().collect();
     assert!(routes.contains("body[\"owedActor\"]=crate::owed_actor::health_body(actor_snapshot.as_ref(),worker::Date::now().as_millis(),&body[\"owedEvents\"][\"oldestUnackedMarkAgeMs\"],);"));
 }
+
+// ── bsv-low #986 (READ-986 item 3, FIX-986): the actor's facts for a game equal the D1 read's by construction ──
+//
+// READ-986 family D: a pre-signed refund broadcast at its recovery height outside the overlay's door, found by the
+// discovery pass and proved by the confirmation pass, carries no stored `pot_records.verdict`. D1's results view
+// classifies it per request from the spender's BEEF (`results::classify_from_columns`); the actor's mirror holds no
+// BEEF bytes, so it serves `unbound` / `outcome unresolved` where D1 serves `payout refund claimable`. The fold's
+// 2(b) makes the stored column the one source both read: the janitor's second candidate set latches the verdict
+// group, the row lands as a `pot` event and every actor applies it (no `JUDGE_VERSION` move, item 5).
+mod fix986 {
+    use super::*;
+    use bsv_rs::primitives::ec::PrivateKey;
+    use bsv_rs::script::LockingScript;
+    use bsv_rs::transaction::{
+        Beef, MerklePath, MerklePathLeaf, Transaction, TransactionInput, TransactionOutput,
+    };
+    use overlay_discovery::pot::storage::PotRecord;
+    use overlay_discovery::pot::{p2pkh_lock, CovenantParams, PotVerdict};
+
+    fn id_a() -> String {
+        format!("02{}", "a1".repeat(32))
+    }
+    fn id_b() -> String {
+        format!("03{}", "b2".repeat(32))
+    }
+    fn key(scalar: u8) -> PrivateKey {
+        let mut b = [0u8; 32];
+        b[31] = scalar;
+        PrivateKey::from_bytes(&b).unwrap()
+    }
+    /// A real covenant's committed params (the seats' settle keys real, so the seat attribution matches them).
+    fn params() -> CovenantParams {
+        CovenantParams {
+            pub_a: key(1).public_key().to_compressed(),
+            pub_b: key(2).public_key().to_compressed(),
+            pub_tower: key(3).public_key().to_compressed(),
+            pay_pkh_a: [0x11; 20],
+            pay_pkh_b: [0x22; 20],
+            rake_pkh: [0x33; 20],
+            stake_a: 10_000,
+            stake_b: 10_000,
+            fee_sats: 200,
+            recovery_height: 899_900,
+        }
+    }
+    const POT_SATS: u64 = 20_000;
+    const SPENT_HEIGHT: u64 = TIP - 50;
+
+    /// The pot's pre-signed REFUND as the tower broadcast it at the recovery height: the T_refund exit (each
+    /// seat's stake less its fee share), nLockTime at the committed height, the pot input non-final. Unsigned:
+    /// the classifier reads outputs, lock time and sequence; the signers conclude `'unresolved'`.
+    fn refund_tx(p: &CovenantParams, pot: &str) -> Transaction {
+        let mut tx = Transaction::new();
+        let mut input = TransactionInput::new(pot.to_string(), 0);
+        input.sequence = 0xffff_fffe;
+        tx.inputs.push(input);
+        let fee_b = p.fee_sats / 2;
+        let fee_a = p.fee_sats - fee_b;
+        for (sats, pkh) in [
+            (p.stake_a - fee_a, p.pay_pkh_a),
+            (p.stake_b - fee_b, p.pay_pkh_b),
+        ] {
+            tx.outputs.push(TransactionOutput {
+                satoshis: Some(sats),
+                locking_script: LockingScript::from_binary(&p2pkh_lock(&pkh)).unwrap(),
+                change: false,
+            });
+        }
+        tx.lock_time = p.recovery_height as u32;
+        tx
+    }
+
+    /// The winner-A settle (the T_a exit: the rake, then the net to seat A's home).
+    fn settle_a_tx(p: &CovenantParams, pot: &str) -> Transaction {
+        let mut tx = Transaction::new();
+        tx.inputs.push(TransactionInput::new(pot.to_string(), 0));
+        let net = POT_SATS - p.fee_sats;
+        let rake = POT_SATS / overlay_discovery::pot::TEMPLATE_RAKE_DIVISOR;
+        for (sats, pkh) in [(rake, p.rake_pkh), (net - rake, p.pay_pkh_a)] {
+            tx.outputs.push(TransactionOutput {
+                satoshis: Some(sats),
+                locking_script: LockingScript::from_binary(&p2pkh_lock(&pkh)).unwrap(),
+                change: false,
+            });
+        }
+        tx
+    }
+
+    /// The spender's stored BEEF with its verified bump (the confirmation pass's proof), as `pot_beefs` holds it.
+    fn beef_hex(tx: &Transaction, height: u64) -> String {
+        let mut beef = Beef::new();
+        let i = beef.merge_bump(
+            MerklePath::new(
+                height as u32,
+                vec![vec![MerklePathLeaf::new_txid(0, tx.id())]],
+            )
+            .unwrap(),
+        );
+        beef.merge_raw_tx(tx.to_binary(), Some(i));
+        hex::encode(beef.to_binary())
+    }
+
+    /// The pot's row as the record holds it after the discovery pass (`spendDiscoveryAt`), the confirmation pass
+    /// (`spentConfirmed`, `spentHeight`) and the admission's decode (`paramsDecoded`, the ten params): `verdict`
+    /// NULL unless `verdict` names the door's group.
+    fn pot_row_sql(
+        p: &CovenantParams,
+        pot: &str,
+        spender: &str,
+        made: i64,
+        verdict: Option<(&str, &str)>,
+    ) -> String {
+        let (v, vt, ss) = match verdict {
+            Some((v, s)) => (format!("'{v}'"), format!("'{spender}'"), format!("'{s}'")),
+            None => ("NULL".into(), "NULL".into(), "NULL".into()),
+        };
+        format!(
+            "INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,spentConfirmed,spentHeight,spenderFinal,createdAt,lockKind,paramsDecoded,pubA,pubB,pubTower,payPkhA,payPkhB,rakePkh,stakeA,stakeB,feeSats,recoveryHeight,potSats,verdict,verdictTxid,settleSigners,spendDiscoveryAt) \
+             VALUES ('{pot}',0,1,'{spender}',1,{SPENT_HEIGHT},0,{made},'covenant',1,'{}','{}','{}','{}','{}','{}',{},{},{},{},{POT_SATS},{v},{vt},{ss},{})",
+            hex::encode(p.pub_a),
+            hex::encode(p.pub_b),
+            hex::encode(p.pub_tower),
+            hex::encode(p.pay_pkh_a),
+            hex::encode(p.pay_pkh_b),
+            hex::encode(p.rake_pkh),
+            p.stake_a,
+            p.stake_b,
+            p.fee_sats,
+            p.recovery_height,
+            made + 3_600,
+        )
+    }
+
+    /// Both seats' verified party rows (`sigValid 1`, each seat's committed settle key).
+    fn party_rows_sql(p: &CovenantParams, game: &str, pot: &str, made: i64) -> Vec<String> {
+        [(id_a(), id_b(), p.pub_a, 1usize), (id_b(), id_a(), p.pub_b, 2)]
+            .into_iter()
+            .map(|(me, other, seat, n)| {
+                format!(
+                    "INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,sigValid,seatSettlePubkey,seatSigHex) \
+                     VALUES ('{me}','{other}','{game}','{pot}',0,{},'00','{}',1,{made},1,'{}','00')",
+                    p.recovery_height,
+                    h("e6", n),
+                    hex::encode(seat)
+                )
+            })
+            .collect()
+    }
+
+    /// FAMILY D as beta's record holds it: the covenant pot (`paramsDecoded 1`, `verdict NULL`), spent by the
+    /// pre-signed refund the discovery pass found and the confirmation pass proved (`spentConfirmed 1`,
+    /// `spentHeight`), the spender's `pot_beefs` row `proof_verified 1`, no result marker, both seats verified.
+    fn discovered_refund_fixture() -> (Fixture, String, String, Transaction, CovenantParams) {
+        let p = params();
+        let made = (NOW_MS / 1000) as i64 - 7_200;
+        let pot = h("c9", 0x86);
+        let game = h("9a", 0x86);
+        let refund = refund_tx(&p, &pot);
+        let r = refund.id();
+        let mut seed = vec![pot_row_sql(&p, &pot, &r, made, None)];
+        seed.extend(party_rows_sql(&p, &game, &pot, made));
+        seed.push(format!(
+            "INSERT INTO pot_beefs(txid,beef,createdAt,has_proof,proof_verified,proofHeight) VALUES ('{r}',x'{}',{},1,1,{SPENT_HEIGHT})",
+            beef_hex(&refund, SPENT_HEIGHT),
+            made + 3_700
+        ));
+        (
+            Fixture {
+                name: "fix986 a discovery-found refund with no stored verdict",
+                seed,
+                identities: vec![id_a(), id_b()],
+            },
+            pot,
+            r,
+            refund,
+            p,
+        )
+    }
+
+    /// CLASS A: a won settle the identity itself files as collected (the door's held filing, its content key and
+    /// `payTxid`), the door's own verdict group stored; before the filing the premise, the payout row.
+    /// `(fixture, pot txid, game id, settle txid)`.
+    fn collected_fixture() -> (Fixture, String, String, String) {
+        let p = params();
+        let made = (NOW_MS / 1000) as i64 - 7_200;
+        let pot = h("ca", 0x87);
+        let game = h("9a", 0x87);
+        let settle = settle_a_tx(&p, &pot);
+        let s = settle.id();
+        let mut seed = vec![pot_row_sql(&p, &pot, &s, made, Some(("winner-a", "coop")))];
+        seed.extend(party_rows_sql(&p, &game, &pot, made));
+        seed.push(format!(
+            "INSERT INTO pot_beefs(txid,beef,createdAt,has_proof,proof_verified,proofHeight) VALUES ('{s}',x'{}',{},1,1,{SPENT_HEIGHT})",
+            beef_hex(&settle, SPENT_HEIGHT),
+            made + 100
+        ));
+        (
+            Fixture {
+                name: "fix986 a collected won settle",
+                seed,
+                identities: vec![id_a(), id_b()],
+            },
+            pot,
+            game,
+            s,
+        )
+    }
+
+    /// The identity's COLLECTED filing of its won settle, written as the door writes it (`record_post`'s own
+    /// statement, the ONE writer of the column; `i492_dn1` holds every other source to that): the held content
+    /// key as the row's txid, no signature column, the settle as `payTxid`.
+    fn file_collected(db: &SqliteSql, game: &str, settle: &str) {
+        let key = crate::record_post::held_content_key(&crate::record_post::HeldMarker {
+            game_id: hex::decode(game).unwrap().try_into().unwrap(),
+            identity_key: hex::decode(id_a()).unwrap(),
+            pay_txid: hex::decode(settle).unwrap().try_into().unwrap(),
+            sig: Vec::new(),
+        });
+        let made = (NOW_MS / 1000) as i64 - 7_200 + 3_000;
+        db.conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    id_a(),
+                    game,
+                    key,
+                    0i64,
+                    Option::<String>::None,
+                    made,
+                    settle
+                ],
+            )
+            .unwrap();
+    }
+
+    fn row_of(
+        db: &SqliteSql,
+        identity: &str,
+        outpoint: &str,
+    ) -> Option<(String, Option<i64>, Value, Option<String>)> {
+        db.conn
+            .query_row(
+                "SELECT family,claimable,facts,reason FROM owed_rows WHERE identity=?1 AND outpoint=?2",
+                [identity, outpoint],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        serde_json::from_str(&r.get::<_, String>(2)?).unwrap(),
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .ok()
+    }
+
+    /// The reconcile's own digest (`rows_digest` over `ROWS_SQL`'s rows), the comparison the compare route makes.
+    async fn digest(db: &SqliteSql, identity: &str) -> String {
+        let rows = db
+            .run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.into())])])
+            .await
+            .unwrap();
+        rows_digest(&rows[0].rows)
+    }
+
+    /// THE JANITOR'S LATCH replayed natively with the shipped pieces: the candidate scan
+    /// (`spent_unclassified_candidates_sql`), the parse and the one classifier (`classify_stored_spend`), and the
+    /// pointer CAS (`verdict_cas_sql`), as `backfill_decoded_params`'s second loop runs them on D1. Answers the
+    /// candidates it found.
+    fn janitor_latch(db: &SqliteSql, p: &CovenantParams) -> Vec<(String, String)> {
+        use bsv_overlay_cloudflare::d1_discovery::{
+            spent_unclassified_candidates_sql, verdict_cas_sql,
+        };
+        let sql = spent_unclassified_candidates_sql(16);
+        let candidates: Vec<(String, u32, String)> = db
+            .conn
+            .prepare(&sql)
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, u32>(1)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut latched = Vec::new();
+        for (txid, vout, spender) in candidates {
+            let beef: Vec<u8> = db
+                .conn
+                .query_row(
+                    "SELECT beef FROM pot_beefs WHERE txid=?1",
+                    [&spender],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let rec = PotRecord {
+                txid: txid.clone(),
+                output_index: vout,
+                spent: true,
+                spending_txid: Some(spender.clone()),
+                spent_confirmed: true,
+                params_decoded: true,
+                lock_kind: Some("covenant".into()),
+                pub_a: Some(hex::encode(p.pub_a)),
+                pub_b: Some(hex::encode(p.pub_b)),
+                pub_tower: Some(hex::encode(p.pub_tower)),
+                pay_pkh_a: Some(hex::encode(p.pay_pkh_a)),
+                pay_pkh_b: Some(hex::encode(p.pay_pkh_b)),
+                rake_pkh: Some(hex::encode(p.rake_pkh)),
+                stake_a: Some(p.stake_a),
+                stake_b: Some(p.stake_b),
+                fee_sats: Some(p.fee_sats),
+                recovery_height: Some(p.recovery_height),
+                pot_sats: Some(POT_SATS),
+                ..Default::default()
+            };
+            let group =
+                bsv_overlay_cloudflare::proof_fetcher::classify_stored_spend(&rec, &spender, &beef)
+                    .expect("the held bytes classify");
+            assert_eq!(group.verdict, PotVerdict::Refund);
+            let w = group.write_concluded();
+            let changed = db
+                .conn
+                .execute(
+                    verdict_cas_sql(),
+                    rusqlite::params![w.verdict, &spender, w.settle_signers, &txid, vout, &spender],
+                )
+                .unwrap();
+            assert_eq!(changed, 1, "the CAS hits the live pointer");
+            latched.push((txid, spender));
+        }
+        latched
+    }
+
+    /// (d) THE DIFFERENTIAL PIN over a discovery-found spend. The premise, today's disagreement (and the fixture's
+    /// before the latch, after the fold too): D1 serves `payout refund claimable` (classified per request from the
+    /// spender's BEEF), the actor `unbound` with "the spend is not classified yet (no verdict)", the digests
+    /// differ. The janitor's second candidate set names the pot and nothing else; its latch, replayed with the
+    /// shipped scan, classifier and CAS, writes `refund` keyed to the spender; D1 judged again and the actor applying
+    /// the verdict row as a `pot` event (no bootstrap, no version move) store the same rows byte for byte and the
+    /// same digest, `payout refund claimable` on both; an actor bootstrapped after the latch (seat B) the same. RED
+    /// on main: the scan does not exist (the pin does not compile); with the latch skipped, the premise's digests
+    /// stand apart (`unbound` against `payout`).
+    #[tokio::test]
+    async fn fix986_d_the_actor_and_d1_agree_on_a_discovery_found_spend_once_its_verdict_is_latched(
+    ) {
+        let (f, pot, refund, _, p) = discovered_refund_fixture();
+        let d1 = d1_judge(&f).await;
+        let (a, b) = (id_a(), id_b());
+        let key = format!("{pot}:0");
+        let (actor, _) = actor_judge(&d1, &a).await;
+        // THE PREMISE: the same record, two judgements.
+        let d1_row = row_of(&d1, &a, &key).expect("D1 holds a row for the pot");
+        assert_eq!(
+            (
+                d1_row.0.as_str(),
+                d1_row.1,
+                d1_row.2["verdict"].clone(),
+                d1_row.2["outcome"].clone(),
+                d1_row.2["claim"].clone()
+            ),
+            (
+                "payout",
+                Some(1),
+                json!("refund"),
+                json!("refund"),
+                json!("internalize")
+            ),
+            "D1 classifies the found spend from the spender's BEEF: {d1_row:?}"
+        );
+        let actor_row = row_of(&actor, &a, &key).expect("the actor holds a row for the pot");
+        assert_eq!(
+            (
+                actor_row.0.as_str(),
+                actor_row.1,
+                actor_row.2["outcome"].clone(),
+                actor_row.3.as_deref()
+            ),
+            (
+                "unbound",
+                None,
+                json!("unresolved"),
+                Some("the spend is not classified yet (no verdict)")
+            ),
+            "the actor holds no bytes to classify from: {actor_row:?}"
+        );
+        assert_ne!(digest(&actor, &a).await, digest(&d1, &a).await);
+        assert_ne!(stored(&actor, &a), stored(&d1, &a));
+
+        // THE JANITOR'S LATCH: the candidate set is the pot and nothing else, and the group lands.
+        let latched = janitor_latch(&d1, &p);
+        assert_eq!(latched, vec![(pot.clone(), refund.clone())]);
+        let group: (Option<String>, Option<String>, Option<String>) = d1
+            .conn
+            .query_row(
+                "SELECT verdict,verdictTxid,settleSigners FROM pot_records WHERE txid=?1 AND outputIndex=0",
+                [&pot],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            group,
+            (
+                Some("refund".into()),
+                Some(refund.clone()),
+                Some("unresolved".into())
+            )
+        );
+        assert!(
+            janitor_latch(&d1, &p).is_empty(),
+            "a latched row leaves the candidate set"
+        );
+
+        // THE VERDICT ROW IS A `pot` EVENT: D1 judged again; the warm actor applies it (no bootstrap).
+        for id in [&a, &b] {
+            for chunk in games_of(&d1, id).chunks(16) {
+                crate::owed_judge::judge_subjects(&d1, id, chunk, "d1")
+                    .await
+                    .unwrap();
+            }
+        }
+        apply(
+            &d1,
+            &actor,
+            &Fakes,
+            &a,
+            &games_of(&d1, &a),
+            Some(("pot", 2)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored(&actor, &a), stored(&d1, &a), "byte for byte");
+        assert_eq!(
+            digest(&actor, &a).await,
+            digest(&d1, &a).await,
+            "the compare's digest"
+        );
+        let row = row_of(&d1, &a, &key).unwrap();
+        assert_eq!(
+            (
+                row.0.as_str(),
+                row.1,
+                row.2["verdict"].clone(),
+                row.2["settleSigners"].clone(),
+                row.2["claimable"].clone()
+            ),
+            (
+                "payout",
+                Some(1),
+                json!("refund"),
+                json!("unresolved"),
+                json!(true)
+            ),
+            "{row:?}"
+        );
+        assert_eq!(row_of(&actor, &a, &key).unwrap(), row);
+        // seat B: an actor bootstrapped after the latch reads the stored column as D1 does
+        let (actor_b, _) = actor_judge(&d1, &b).await;
+        assert_eq!(stored(&actor_b, &b), stored(&d1, &b));
+        assert_eq!(digest(&actor_b, &b).await, digest(&d1, &b).await);
+        let row_b = row_of(&d1, &b, &key).unwrap();
+        assert_eq!(
+            (row_b.0.as_str(), row_b.1),
+            ("payout", Some(1)),
+            "{row_b:?}"
+        );
+    }
+
+    /// (e) THE CONTROLS, GREEN on both sides before and after the fold: CLASS C, a hop swept by a filed sweep the
+    /// index proves (`fold11_sweep_fixture`), `payout hop-sweep` on both; CLASS A, a won settle the identity filed
+    /// as collected: the payout row before the filing (the premise), no row on either side with it, the digests
+    /// equal in both states.
+    #[tokio::test]
+    async fn fix986_e_a_hop_sweep_filing_and_a_collected_filing_agree_on_both_sides() {
+        // CLASS C
+        let d1 = d1_judge(&fold11_sweep_fixture()).await;
+        let (actor, _) = actor_judge(&d1, "owner").await;
+        let hop = format!("{FOLD9_HOP}:0");
+        let row = row_of(&d1, "owner", &hop).expect("the swept hop's payout");
+        assert_eq!(
+            (row.0.as_str(), row.2["claim"].clone()),
+            ("payout", json!("internalize")),
+            "{row:?}"
+        );
+        assert_eq!(row.2["sweepSource"], json!("hopsweep-filing"), "{row:?}");
+        assert_eq!(stored(&actor, "owner"), stored(&d1, "owner"));
+        assert_eq!(digest(&actor, "owner").await, digest(&d1, "owner").await);
+        // CLASS A: the premise, then the filing
+        let (a, _) = (id_a(), id_b());
+        let (f, pot, game, settle) = collected_fixture();
+        let d1 = d1_judge(&f).await;
+        let key = format!("{pot}:0");
+        let row = row_of(&d1, &a, &key).expect("the won settle's payout before the filing");
+        assert_eq!(
+            (
+                row.0.as_str(),
+                row.1,
+                row.2["outcome"].clone(),
+                row.2["verdict"].clone()
+            ),
+            ("payout", Some(1), json!("won"), json!("winner-a")),
+            "{row:?}"
+        );
+        let (actor, _) = actor_judge(&d1, &a).await;
+        assert_eq!(stored(&actor, &a), stored(&d1, &a));
+        // THE FILING through the door's own statement, then D1 judged again and the warm actor applying the
+        // filing's event: a verified collected payout is no row on either side.
+        file_collected(&d1, &game, &settle);
+        for chunk in games_of(&d1, &a).chunks(16) {
+            crate::owed_judge::judge_subjects(&d1, &a, chunk, "d1")
+                .await
+                .unwrap();
+        }
+        assert!(
+            row_of(&d1, &a, &key).is_none(),
+            "a verified collected payout is no row: {:?}",
+            stored(&d1, &a)
+        );
+        apply(
+            &d1,
+            &actor,
+            &Fakes,
+            &a,
+            &games_of(&d1, &a),
+            Some(("collected", 2)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored(&actor, &a), stored(&d1, &a));
+        assert_eq!(digest(&actor, &a).await, digest(&d1, &a).await);
+        // and an actor bootstrapped after the filing
+        let (actor, _) = actor_judge(&d1, &a).await;
+        assert_eq!(stored(&actor, &a), stored(&d1, &a));
+        assert_eq!(digest(&actor, &a).await, digest(&d1, &a).await);
+    }
+}

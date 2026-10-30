@@ -419,48 +419,16 @@ impl LookupService for PotLookupService {
                     .await?
             }
         };
-        let verdict = match admitted.as_ref() {
-            Some(record) => record.decoded_covenant_params().and_then(|params| {
-                let pot_sats = record.pot_sats?;
-                if params.stake_a.checked_add(params.stake_b)? != pot_sats {
-                    return None; // conservation failed — never classify
-                }
-                // The spend notification names the spent outpoint; find
-                // the spending tx's OWN input for it (the index feeds the
-                // #406 sighash, the sequence the refund height-gate).
-                let (pot_input_index, pot_input_sequence) =
-                    spending_tx.inputs.iter().enumerate().find_map(|(n, i)| {
-                        (i.source_txid
-                            .as_deref()
-                            .is_some_and(|t| t.eq_ignore_ascii_case(txid))
-                            && i.source_output_index == output_index)
-                            .then_some((n, i.sequence))
-                    })?;
-                let spender = crate::pot::RawTx::from_transaction(&spending_tx)?;
-                let v = crate::pot::classify_covenant(&params, &spender, pot_input_sequence)?;
-                // #406: WHO SIGNED — the spend's signatures verified
-                // against the committed key triple over the network's own
-                // BIP-143 digest (the lock is rebuilt from the committed
-                // params; a rebuild that drifts can only fail to verify,
-                // never mis-attribute). `None` = not established — the
-                // group still writes, and the backfill retries once from
-                // the durable spender BEEF.
-                let signers = crate::pot::settle_signers_for_spend(
-                    &params,
-                    pot_sats,
-                    &spending_tx.to_binary(),
-                    pot_input_index,
-                );
-                Some((v, signers))
-            }),
-            None => None, // never admitted — mark_spent is a no-op anyway
-        };
-        // The #284 verdict + #406 signers travel as ONE group (typed so the
-        // signers can never be written without the verdict they ride with).
-        let verdict_write = verdict.map(|(v, s)| crate::pot::storage::VerdictWrite {
-            verdict: v.as_str(),
-            settle_signers: s.map(crate::pot::SettleSigners::as_str),
-        });
+        // bsv-low #986 (FIX-986): the ONE classifier every verdict writer calls (`pot::classify_record_spend`:
+        // conservation, the spend's own input for the outpoint, `classify_covenant`, then #406's WHO SIGNED from
+        // the spend's signatures against the committed triple over the BIP-143 digest). The door writes a pair not
+        // established as NULL ("not established"; the signers backfill retries once from the durable spender
+        // BEEF), and the #284 verdict + #406 signers travel as ONE group (typed so the signers can never be
+        // written without the verdict they ride with).
+        let verdict_write = admitted
+            .as_ref()
+            .and_then(|record| crate::pot::classify_record_spend(record, &spending_tx))
+            .map(|group| group.write());
 
         // bsv-low #371: latch the spender's BYTES-FINALITY once, at record
         // time, from the tx we already parsed (epoch Rule 25 — never re-parse

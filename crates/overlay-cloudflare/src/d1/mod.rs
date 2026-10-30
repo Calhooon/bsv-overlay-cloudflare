@@ -641,7 +641,7 @@ pub fn migration_list_fingerprint() -> u32 {
 /// `owed_event_dead_letters` (the `owed-events` DLQ's parked letters), `idx_released_missing_hop` (the `hop` event's
 /// facts read) and `worker_cost_daily.queueOps` (the cost bar's queue family). The app layer reads and writes the
 /// first two and the column: deploy the overlay first (its certified count at 473), then the app layer.
-pub const OVERLAY_MIGRATION_COUNT: usize = 473;
+pub const OVERLAY_MIGRATION_COUNT: usize = 474;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2463,6 +2463,14 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::owed_events::DEAD_LETTERS_CREATE,
     crate::owed_events::RELEASED_MISSING_HOP_INDEX,
     crate::d1_ledger::COST_DAILY_QUEUE_ALTER,
+    // bsv-low #986 (READ-986 item 2(b), FIX-986): the janitor's second verdict
+    // candidate scan (`spent_unclassified_candidates_sql`) reads the spent
+    // covenant pots carrying no CURRENT verdict through this partial index
+    // (its WHERE is `SPENT_UNCLASSIFIED_INDEX_PREDICATE`, repeated verbatim by
+    // the scan), never the table: the set is the unclassified backlog (123
+    // rows on beta at the fold) and drains as the scan latches each row's
+    // verdict group from its spender's held BEEF. Additive; `IF NOT EXISTS`.
+    "CREATE INDEX IF NOT EXISTS idx_pot_spent_unclassified ON pot_records(spentConfirmed) WHERE spent = 1 AND lockKind = 'covenant' AND (verdict IS NULL OR verdictTxid IS NOT spendingTxid)",
 ];
 
 // =============================================================================

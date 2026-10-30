@@ -182,6 +182,7 @@ pub const MIRROR_DDL: &[&str] = &[
     r#"CREATE INDEX IF NOT EXISTS idx_pot_signers_pending ON pot_records(verdict) WHERE verdict IS NOT NULL AND settleSigners IS NULL"#,
     r#"CREATE INDEX IF NOT EXISTS idx_pot_spending ON pot_records(spendingTxid)"#,
     r#"CREATE INDEX IF NOT EXISTS idx_pot_spending_lower ON pot_records(lower(spendingTxid))"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_pot_spent_unclassified ON pot_records(spentConfirmed) WHERE spent = 1 AND lockKind = 'covenant' AND (verdict IS NULL OR verdictTxid IS NOT spendingTxid)"#,
     r#"CREATE INDEX IF NOT EXISTS idx_pot_spent_unconfirmed ON pot_records(spent, spentConfirmed)"#,
     r#"CREATE INDEX IF NOT EXISTS idx_pot_unspent_created ON pot_records(createdAt, lockKind) WHERE spent = 0"#,
     r#"CREATE INDEX IF NOT EXISTS idx_pot_unspent_recovery ON pot_records(spent, recoveryHeight) WHERE recoveryHeight IS NOT NULL"#,
@@ -307,7 +308,7 @@ pub const BLOBS: &[(&str, &str)] = &[
     ("transactions", "beef"),
 ];
 /// The schema's digest, held in the actor's `meta` (`schema`): a mirror built under another is dropped and rebuilt.
-pub const DIGEST: &str = "34c1bc2324b4762410b7b3436fb4782f64fdc2a99edd5aa7be9db8b964e6e6c2";
+pub const DIGEST: &str = "b045ad5183a91c85716961e252e6ea671e192fe0f717824738450a2db166e2be";
 
 pub fn columns(table: &str) -> &'static [&'static str] {
     COLUMNS
