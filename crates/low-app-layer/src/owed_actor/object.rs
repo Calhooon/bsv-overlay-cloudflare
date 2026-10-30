@@ -267,6 +267,10 @@ pub struct ApplyBody {
     /// the apply reads exactly those rows ([`apply_with`]). Absent: the whole closure (an older caller, a tip alarm).
     #[serde(default)]
     pub txids: Option<Vec<String>>,
+    /// FIX-983 (bsv-low #983): the caller's fan-out, the actors its pass calls at once (the direct pass's bodies, the
+    /// consumer batch's identities): at [`FLOOD_CONCURRENCY`] or more the sample is the stress class's (`flood`).
+    #[serde(default)]
+    pub concurrent: Option<u32>,
 }
 
 #[durable_object]
@@ -480,6 +484,7 @@ impl DurableObject for OwedActor {
                         also: Vec::new(),
                         also_at_ms: Vec::new(),
                         txids: None,
+                        concurrent: None,
                     };
                     async move {
                         self.apply_route(body)
@@ -504,6 +509,9 @@ impl DurableObject for OwedActor {
             }
             self.arm_tip_alarm(&local, tip).await;
         }
+        // FIX-983: the asks the alarm's applies queued (the bootstrap's pages and drain, the tip window) are published
+        // after the alarm, with the bars' flush.
+        self.after_apply(0);
         Response::ok("ok")
     }
 }
@@ -904,11 +912,9 @@ impl OwedActor {
             answer["ackSeq"] = json!(self.meta(META_ACK));
             return Response::from_json(&answer);
         }
-        if report.misses > 0 {
-            record
-                .counters(vec![(COUNTERS[27].into(), report.misses as u64)])
-                .await;
-        }
+        // FIX-983: the closure misses' counter is deferred with the rest of the record work that is not the apply's
+        // ([`OwedActor::after_apply`]).
+        let misses = report.misses;
         // D2-ACTOR-E item 4: the rows' visibility is sampled only for an event born on a WARM actor (written after
         // its bootstrap's stamp): a held event's drain is the cold bar's, and an event the sweep re-published while
         // the actor held (or that waited out its bootstrap in the queue) is the cold path's, never a warm sample.
@@ -1008,11 +1014,34 @@ impl OwedActor {
         // call), then marks the answer noted so the caller adds no second sample.
         // An apply with no event (the tip alarm's window) is no delivery: its caller notes nothing, nor does it.
         if samples {
-            note_answer_as(bars_class(body.class.as_deref()), &answer);
-            flush_bars(&record, now, false).await;
+            note_answer_as(bars_class(body.class.as_deref(), body.concurrent), &answer);
             answer["noted"] = json!(true);
         }
+        // FIX-983 (bsv-low #983): the record work that is not the apply's own (the belt asks the apply queued, the
+        // misses' counter, the bars' flush) runs AFTER the answer, so neither the measured apply nor the writer's
+        // direct call waits for a record round trip that is not the judgement's.
+        self.after_apply(misses);
         Response::from_json(&answer)
+    }
+
+    /// FIX-983 (bsv-low #983): the record work after an answer, under the object's `wait_until`: the asks lane's
+    /// drain ([`drain_lane_once`]: one record batch a queued apply, in the turns' order, one drain at a time an
+    /// isolate), the closure misses' counter, then the bars' flush when due. Called at the end of every apply and
+    /// every alarm (the tip window's and the bootstrap's applies queue asks too).
+    fn after_apply(&self, misses: usize) {
+        let env = self.env.clone();
+        self.state.wait_until(async move {
+            let Ok(record) = crate::routes::D1Sql::of(&env) else {
+                return;
+            };
+            if misses > 0 {
+                record
+                    .counters(vec![(COUNTERS[27].into(), misses as u64)])
+                    .await;
+            }
+            drain_lane_once(&record).await;
+            flush_bars(&record, Date::now().as_millis(), false).await;
+        });
     }
 
     /// D2-ACTOR-E: a narrowed apply records its coverage only in Phases B and C ([`ApplyOpts::narrow_covers`]).

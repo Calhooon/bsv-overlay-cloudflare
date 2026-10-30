@@ -7052,7 +7052,6 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     body["owedActor"] = crate::owed_actor::health_body(
         actor_snapshot.as_ref(),
         worker::Date::now().as_millis(),
-        d1_judges,
         &body["owedEvents"]["oldestUnackedMarkAgeMs"],
     );
     body["owedActor"]["readFlag"] = serde_json::json!(crate::owed_actor::flag_on(

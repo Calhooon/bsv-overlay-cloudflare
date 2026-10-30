@@ -617,6 +617,19 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// A plan of these subjects alone (the pins': FIX-983's consumer fan-out).
+    #[cfg(test)]
+    pub fn of_subjects(subjects: Vec<(String, Vec<String>)>) -> Plan {
+        let mut p = Plan::default();
+        for (id, games) in subjects {
+            if !p.order.contains(&id) {
+                p.order.push(id.clone());
+            }
+            p.games.entry(id).or_default().extend(games);
+        }
+        p
+    }
+
     /// No subject to judge (and no continuation).
     pub fn is_empty(&self) -> bool {
         self.order.is_empty() && !self.more
@@ -900,6 +913,8 @@ pub async fn judge_plan(db: &impl JudgeDb, plan: Plan) -> Result<Routed, String>
         )
     };
     let now = db.now_ms() as i64;
+    // FIX-983 (bsv-low #983): the batch's fan-out, named on each actor body (the stress class's rule).
+    db.note_concurrency(order.len().min(JUDGE_IDENTITIES_AT_ONCE) as u32);
     // FIX-952: every identity of the pass at once (bounded), each one's chunks in order
     let judged: Vec<IdentityJudged> =
         futures_util::stream::iter(order.into_iter().map(|identity| {
@@ -2830,8 +2845,12 @@ pub async fn direct_with_class(
         subjects_of.push((crate::owed_actor::EventCtx::of(&ev), subjects));
     }
     let mut bodies = coalesce_direct(subjects_of, tip);
+    // FIX-983 (bsv-low #983): the pass's fan-out rides each body; at `FLOOD_CONCURRENCY` or more the object samples
+    // the call into the stress class (`flood`), apart from the warm hand's `direct`.
+    let fan_out = bodies.len() as u32;
     for b in &mut bodies {
         b["class"] = json!(class);
+        b["concurrent"] = json!(fan_out);
     }
     report.calls = bodies.len() as u64;
     // FIX-956 item 3: in Phase C each body's acknowledgement bound, read BEFORE its call (a mark written after it is
@@ -2866,7 +2885,10 @@ pub async fn direct_with_class(
             // D2-ACTOR-B-FOLD-7: a held answer is neither a fault nor a sample (the actor counts it).
             Ok(a) if crate::owed_actor::is_held(&a) => report.held += 1,
             Ok(_) if class == crate::owed_actor::SWEEP_CLASS => {}
-            Ok(a) => crate::owed_actor::note_answer_as("direct", &a),
+            Ok(a) => crate::owed_actor::note_answer_as(
+                crate::owed_actor::bars_class(Some("direct"), Some(fan_out)),
+                &a,
+            ),
             Err(e) => {
                 if is_wall(&e) {
                     report.walls += 1;

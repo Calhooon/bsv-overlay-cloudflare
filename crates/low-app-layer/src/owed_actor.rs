@@ -45,7 +45,7 @@
 use crate::owed_judge::{FactsFrom, JudgeDb, TxFacts};
 use crate::pot_hook::{Bind, SqlPort, Stmt, StmtOut};
 use serde_json::{json, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub mod object;
@@ -493,6 +493,9 @@ pub struct Held {
     pub roots: RefCell<HashMap<u64, Option<String>>>,
     /// An answer the last judgement asked that no round took: the closure did not reach its fixpoint for it.
     pub missed: RefCell<bool>,
+    /// FIX-983 (bsv-low #983): the time the outside (CHAINTRACKS) was awaited for this apply, on the local clock: the
+    /// apply's `outsideMs` stage, so the judge stage is the derivation and the mirror's own reads.
+    pub outside_ms: Cell<u64>,
 }
 
 /// The actor's [`JudgeDb`]: the judge's SQL on the mirror, the facts from `txfacts`, the outside asked through
@@ -531,9 +534,34 @@ impl<L: SqlPort, O: Outside> JudgeDb for ActorJudge<'_, L, O> {
         rows: &BTreeMap<String, crate::tracker_host::stored::Row>,
     ) -> Result<BTreeMap<String, Value>, String> {
         if let Some(o) = self.outside {
-            let v = o.word_views(rows).await?;
-            self.held.views.borrow_mut().extend(v.clone());
-            return Ok(v);
+            // FIX-983 (bsv-low #983): the outside is asked ONCE PER APPLY for a key: a later round of the same apply
+            // (milliseconds after) takes the held answer, so a two-round apply no longer asks CHAINTRACKS twice for
+            // every word; the ask's time is the apply's `outsideMs` stage.
+            let mut out: BTreeMap<String, Value> = BTreeMap::new();
+            let mut ask: BTreeMap<String, crate::tracker_host::stored::Row> = BTreeMap::new();
+            {
+                let held = self.held.views.borrow();
+                for (k, row) in rows {
+                    match held.get(k) {
+                        Some(v) => {
+                            out.insert(k.clone(), v.clone());
+                        }
+                        None => {
+                            ask.insert(k.clone(), row.clone());
+                        }
+                    }
+                }
+            }
+            if !ask.is_empty() {
+                let t = self.local.now_ms();
+                let v = o.word_views(&ask).await?;
+                self.held
+                    .outside_ms
+                    .set(self.held.outside_ms.get() + self.local.now_ms().saturating_sub(t));
+                self.held.views.borrow_mut().extend(v.clone());
+                out.extend(v);
+            }
+            return Ok(out);
         }
         let held = self.held.views.borrow();
         let mut out = BTreeMap::new();
@@ -549,7 +577,14 @@ impl<L: SqlPort, O: Outside> JudgeDb for ActorJudge<'_, L, O> {
     }
     async fn canonical_root(&self, height: u64) -> Option<String> {
         if let Some(o) = self.outside {
+            if let Some(r) = self.held.roots.borrow().get(&height) {
+                return r.clone();
+            }
+            let t = self.local.now_ms();
             let r = o.canonical_root(height).await;
+            self.held
+                .outside_ms
+                .set(self.held.outside_ms.get() + self.local.now_ms().saturating_sub(t));
             self.held.roots.borrow_mut().insert(height, r.clone());
             return r;
         }
@@ -797,6 +832,12 @@ pub struct ApplyReport {
     pub judge_ms: u64,
     pub write_ms: u64,
     pub wait_ms: u64,
+    /// FIX-983 (bsv-low #983): the outside's (CHAINTRACKS) awaits, asked once per apply ([`ActorJudge`]), apart from
+    /// the judge stage, which is then the derivation and the mirror's own reads.
+    pub outside_ms: u64,
+    /// FIX-983: the belt asks this apply QUEUED for the lane ([`queue_belt_asks`]; none when its dated rows did not
+    /// move), published after the answer, never inside the measured apply.
+    pub asks: usize,
     /// D2-ACTOR-B-FOLD-14: a bootstrap page's games and their `at`, in the page's order ([`ApplyOpts::page`]).
     pub page: Vec<(String, i64)>,
 }
@@ -1739,10 +1780,12 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
         report.write_ms += local.now_ms().saturating_sub(t);
     }
     report.applied_games.extend(games);
-    // FOLD-14 item 2: the judge's stage is the rest of the apply (the judge's rounds over the mirror, its outside
-    // reads, the local key walks), so the three stages sum to the apply's own time.
+    // FOLD-14 item 2: the judge's stage is the rest of the apply (the judge's rounds over the mirror, the local key
+    // walks), so the stages sum to the apply's own time. FIX-983 (bsv-low #983): the outside's awaits are their own
+    // stage (`outsideMs`, asked once per apply), so the judge stage is the derivation and the mirror's own reads.
     let total = local.now_ms().saturating_sub(started_ms);
-    report.judge_ms = total.saturating_sub(report.read_ms + report.write_ms);
+    report.outside_ms = held.outside_ms.get();
+    report.judge_ms = total.saturating_sub(report.read_ms + report.write_ms + report.outside_ms);
     Ok((report, pushes))
 }
 
@@ -1831,7 +1874,7 @@ pub async fn commit_fixpoint<L: SqlPort>(
 /// The answer of one apply (the object's `/apply`, the pins' harness): the actor's rows, the redelivery verdict, the
 /// games the event has applied.
 pub fn answer_of(report: &ApplyReport, rows: Vec<Value>) -> Value {
-    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply, "misses": report.misses, "narrowed": report.narrowed, "coalesced": report.coalesced, "readMs": report.read_ms, "judgeMs": report.judge_ms, "writeMs": report.write_ms, "waitMs": report.wait_ms})
+    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply, "misses": report.misses, "narrowed": report.narrowed, "coalesced": report.coalesced, "readMs": report.read_ms, "judgeMs": report.judge_ms, "writeMs": report.write_ms, "waitMs": report.wait_ms, "outsideMs": report.outside_ms, "asksQueued": report.asks})
 }
 
 /// D2-ACTOR-E (bsv-low #954) item 4: was the event born on a WARM actor (written at or after the actor's bootstrap
@@ -1945,39 +1988,131 @@ pub const ASKS_CLEAR_SQL: &str = "DELETE FROM owed_belt_state WHERE name>=?1 AND
 /// One ask, rewritten only when its question moved (an unchanged re-publish keeps the belt's backoff).
 pub const ASK_PUT_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,?2,?3) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs WHERE owed_belt_state.cursor IS NOT excluded.cursor";
 
-/// PUBLISH THE BELT'S QUESTIONS (HIGH-3, Phase C): every dated row of the judged games is a `belt-ask` in the belt's
-/// ledger ([`crate::owed_belt::ask_of_row`]), and an ask no dated row names any more is taken out; ONE record batch.
-/// The actor asks no courier: the belt singleton does, at its cadence, through its one gate. Returns the asks held.
-pub async fn publish_belt_asks<R: SqlPort, L: SqlPort>(
-    record: &R,
+/// THE ASKS LANE (FIX-983, bsv-low #983). Until this fold the belt's questions were PUBLISHED inside the measured
+/// apply, in the object's turn: a record batch (the clear and one put an ask) and a counters round trip per apply,
+/// folded into the judge stage by the coalesced pass (beta's flood minute: the apply's wall p95 3,649 ms against a
+/// CPU p95 of 135 ms; on the fixture a warm Phase C apply made 3 record round trips where Phase B made 1). Now the
+/// apply QUEUES its asks here, inside the turn (so the lane's order is the turns' order and a later apply's asks are
+/// never overwritten by an earlier one's), and the OBJECT drains the lane after its answer (`wait_until`), one
+/// record batch a queued apply, the asks counted once a drain. An apply whose dated rows did not move since the
+/// last publish of its games queues nothing (the per-game digest in the mirror's `meta`, [`ask_digest_name`]); a
+/// drained batch that FAULTED marks its identity ([`ASK_FAULTED`]) so its next apply publishes every game again.
+///
+/// The lane is this isolate's (several actors of one class may share an isolate: the FIFO keeps each identity's
+/// order and a batch is self-contained); the native pins drain it as the object does ([`drain_ask_lane`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AskBatch {
+    pub identity: String,
+    pub games: Vec<String>,
+    pub stmts: Vec<Stmt>,
+    pub asks: usize,
+}
+thread_local! {
+    static ASK_LANE: RefCell<std::collections::VecDeque<AskBatch>> = RefCell::default();
+    /// The identities whose last drained batch faulted: their next apply publishes every game again.
+    static ASK_FAULTED: RefCell<BTreeSet<String>> = RefCell::default();
+}
+/// The lane's batches, taken (the object's drain and the pins).
+pub fn take_ask_batches() -> Vec<AskBatch> {
+    ASK_LANE.with(|l| l.borrow_mut().drain(..).collect())
+}
+pub fn ask_lane_len() -> usize {
+    ASK_LANE.with(|l| l.borrow().len())
+}
+/// The mirror's `meta` key of one game's last published asks (the sha256 of the asks' JSON).
+pub fn ask_digest_name(game: &str) -> String {
+    format!("askdigest:{}", game.to_ascii_lowercase())
+}
+/// The asks of these games in the mirror's `meta` (`?1` the JSON of the games' digest names).
+const ASK_DIGESTS_SQL: &str =
+    "SELECT name,value FROM meta WHERE name IN (SELECT value FROM json_each(?1))";
+
+/// QUEUE THE BELT'S QUESTIONS (HIGH-3, Phase C; FIX-983): every dated row of the judged games is a `belt-ask` for the
+/// belt's ledger ([`crate::owed_belt::ask_of_row`]), and an ask no dated row names any more is taken out; the games
+/// whose asks did not move since their last publish are left out, and a batch is queued on the lane only for the
+/// rest (none when nothing moved). The actor asks no courier: the belt singleton does, at its cadence, through its
+/// one gate. Returns the asks queued (0: nothing queued).
+pub async fn queue_belt_asks<L: SqlPort>(
     local: &L,
     me: &str,
     games: &[String],
 ) -> Result<usize, String> {
     let me = me.to_ascii_lowercase();
     let games: Vec<String> = games.iter().map(|g| g.to_ascii_lowercase()).collect();
+    if games.is_empty() {
+        return Ok(0);
+    }
     let gj = json!(games).to_string();
-    let rows = local
-        .run_batch(vec![Stmt::new(
-            ASK_ROWS_SQL,
-            vec![Bind::Text(me.clone()), Bind::Text(gj.clone())],
-        )])
+    let digest_names: Vec<String> = games.iter().map(|g| ask_digest_name(g)).collect();
+    let mut read = local
+        .run_batch(vec![
+            Stmt::new(
+                ASK_ROWS_SQL,
+                vec![Bind::Text(me.clone()), Bind::Text(gj.clone())],
+            ),
+            Stmt::new(
+                ASK_DIGESTS_SQL,
+                vec![Bind::Text(json!(digest_names).to_string())],
+            ),
+        ])
         .await?
-        .into_iter()
+        .into_iter();
+    let rows = read.next().map(|o| o.rows).unwrap_or_default();
+    let stored: BTreeMap<String, String> = read
         .next()
         .map(|o| o.rows)
-        .unwrap_or_default();
-    let asks: Vec<(String, Value, i64)> = rows
+        .unwrap_or_default()
         .iter()
-        .filter_map(|r| crate::owed_belt::ask_of_row(&me, r))
+        .filter_map(|r| Some((r["name"].as_str()?.to_string(), r["value"].as_str()?.to_string())))
         .collect();
+    // Every game of a faulted identity is published again (its last drain did not land).
+    let refresh = ASK_FAULTED.with(|f| f.borrow_mut().remove(&me));
+    let mut per_game: BTreeMap<String, Vec<(String, Value, i64)>> =
+        games.iter().map(|g| (g.clone(), Vec::new())).collect();
+    for r in &rows {
+        if let (Some(g), Some(ask)) = (
+            r["gameId"].as_str().map(str::to_ascii_lowercase),
+            crate::owed_belt::ask_of_row(&me, r),
+        ) {
+            per_game.entry(g).or_default().push(ask);
+        }
+    }
+    let mut changed: Vec<String> = Vec::new();
+    let mut digests: Vec<Stmt> = Vec::new();
+    let mut asks: Vec<(String, Value, i64)> = Vec::new();
+    for (g, list) in per_game {
+        let digest = hex::encode(bsv_rs::primitives::hash::sha256(
+            json!(list
+                .iter()
+                .map(|(n, b, d)| json!([n, b, d]))
+                .collect::<Vec<_>>())
+            .to_string()
+            .as_bytes(),
+        ));
+        let name = ask_digest_name(&g);
+        let moved = match stored.get(&name) {
+            None => !list.is_empty(),
+            Some(d) => d != &digest,
+        };
+        if refresh || moved {
+            digests.push(Stmt::new(
+                META_PUT_SQL,
+                vec![Bind::Text(name), Bind::Text(digest)],
+            ));
+            changed.push(g);
+            asks.extend(list);
+        }
+    }
+    if changed.is_empty() {
+        return Ok(0);
+    }
     let names: Vec<&String> = asks.iter().map(|(n, _, _)| n).collect();
     let mut stmts = vec![Stmt::new(
         ASKS_CLEAR_SQL,
         vec![
             Bind::Text(format!("{}{me} ", crate::owed_belt::BELT_ASK_PREFIX)),
             Bind::Text(format!("{}{me}!", crate::owed_belt::BELT_ASK_PREFIX)),
-            Bind::Text(gj),
+            Bind::Text(json!(changed).to_string()),
             Bind::Text(json!(names).to_string()),
         ],
     )];
@@ -1991,17 +2126,58 @@ pub async fn publish_belt_asks<R: SqlPort, L: SqlPort>(
             ],
         ));
     }
-    record.run_batch(stmts).await?;
-    if !asks.is_empty() {
-        record
-            .counters(vec![(COUNTERS[8].to_string(), asks.len() as u64)])
-            .await;
-    }
-    Ok(asks.len())
+    // The digests first (the mirror's, inside the turn): a drain that faults puts the identity back on the refresh
+    // set, so an optimistic digest never hides a missing publish for longer than one apply.
+    local.run_batch(digests).await?;
+    let n = asks.len();
+    ASK_LANE.with(|l| {
+        l.borrow_mut().push_back(AskBatch {
+            identity: me,
+            games: changed,
+            stmts,
+            asks: n,
+        })
+    });
+    Ok(n)
 }
 
-/// [`apply_in_turn`], then (Phase C, `publish`) the asks of the games published INSIDE the same turn, so a later
-/// apply's asks are never overwritten by an earlier one's.
+/// What one drain of the lane did (the object's `wait_until`, the pins).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AsksDrained {
+    pub batches: usize,
+    pub asks: usize,
+    pub faults: usize,
+}
+/// DRAIN THE LANE (FIX-983): every queued batch in order, one record batch each; a batch that faults is logged and
+/// dropped (its identity marked for a full re-publish at its next apply), the rest go on; the asks that landed are
+/// counted ONCE (`owed_actor_belt_asks_total`), never a counters round trip per apply.
+pub async fn drain_ask_lane<R: SqlPort>(record: &R) -> AsksDrained {
+    let mut out = AsksDrained::default();
+    for batch in take_ask_batches() {
+        out.batches += 1;
+        match record.run_batch(batch.stmts).await {
+            Ok(_) => out.asks += batch.asks,
+            Err(e) => {
+                out.faults += 1;
+                ASK_FAULTED.with(|f| f.borrow_mut().insert(batch.identity.clone()));
+                record.log(&format!(
+                    "[owed-actor] belt asks of {} not published ({} game(s)): {e}",
+                    batch.identity,
+                    batch.games.len()
+                ));
+            }
+        }
+    }
+    if out.asks > 0 {
+        record
+            .counters(vec![(COUNTERS[8].to_string(), out.asks as u64)])
+            .await;
+    }
+    out
+}
+
+/// [`apply_in_turn`], then (Phase C, `publish`) the asks of the games QUEUED inside the same turn (FIX-983: the lane,
+/// drained by the object after its answer), so a later apply's asks are never overwritten by an earlier one's.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_and_publish_in_turn<R: SqlPort, L: SqlPort, O: Outside>(
     turn: &futures_util::lock::Mutex<()>,
@@ -2067,7 +2243,7 @@ pub async fn apply_event_in_turn<R: SqlPort, L: SqlPort, O: Outside>(
     report.first_apply = first;
     report.wait_ms = wait_ms;
     if publish {
-        publish_belt_asks(record, local, me, games).await?;
+        report.asks = queue_belt_asks(local, me, games).await?;
     }
     Ok((report, pushes))
 }
@@ -2217,7 +2393,10 @@ pub async fn apply_burst<R: SqlPort, L: SqlPort, O: Outside>(
         };
         let applied = apply_with(record, local, outside, me, chunk, None, tip, era_ms, &opts).await;
         let applied = match applied {
-            Ok(a) if publish => publish_belt_asks(record, local, me, chunk).await.map(|_| a),
+            Ok((mut a, p)) if publish => queue_belt_asks(local, me, chunk).await.map(|n| {
+                a.asks = n;
+                (a, p)
+            }),
             other => other,
         };
         match applied {
@@ -2248,6 +2427,8 @@ pub async fn apply_burst<R: SqlPort, L: SqlPort, O: Outside>(
         report.read_ms = reports.iter().map(|r| r.read_ms).sum();
         report.judge_ms = reports.iter().map(|r| r.judge_ms).sum();
         report.write_ms = reports.iter().map(|r| r.write_ms).sum();
+        report.outside_ms = reports.iter().map(|r| r.outside_ms).sum();
+        report.asks = reports.iter().map(|r| r.asks).sum();
         report.applied_games = lowered(&item.games);
         report.first_apply = first;
         report.skipped = false;
@@ -2288,8 +2469,9 @@ pub async fn apply_coalesced<R: SqlPort, L: SqlPort, O: Outside>(
     let joined = |r: BurstResult| {
         r.map(|(mut report, p)| {
             let total = local.now_ms().saturating_sub(entered);
-            report.wait_ms =
-                total.saturating_sub(report.read_ms + report.judge_ms + report.write_ms);
+            report.wait_ms = total.saturating_sub(
+                report.read_ms + report.judge_ms + report.write_ms + report.outside_ms,
+            );
             (report, p)
         })
     };
@@ -2330,12 +2512,14 @@ pub async fn apply_coalesced<R: SqlPort, L: SqlPort, O: Outside>(
     burst.answer(others);
     mine.unwrap_or_else(|| Err("owed actor: the burst answered no result for its own event".into()))
         .map(|(mut report, p)| {
-            // FOLD-14 item 2: the holder waited for the turn; the pass's own checks and asks are the judge's stage.
+            // FOLD-14 item 2: the holder waited for the turn; the pass's own checks are the judge's stage (FIX-983:
+            // the asks are QUEUED, not published, inside the pass: microseconds, never a record round trip).
             let end = local.now_ms();
             report.wait_ms = turned.saturating_sub(entered);
             let pass = end.saturating_sub(turned);
-            report.judge_ms +=
-                pass.saturating_sub(report.read_ms + report.judge_ms + report.write_ms);
+            report.judge_ms += pass.saturating_sub(
+                report.read_ms + report.judge_ms + report.write_ms + report.outside_ms,
+            );
             (report, p)
         })
 }
@@ -2736,7 +2920,7 @@ pub async fn drain_held<R: SqlPort, L: SqlPort, O: Outside>(
             }
             let (_, pushes) = apply(record, local, outside, me, chunk, None, tip, era_ms).await?;
             if publish {
-                publish_belt_asks(record, local, me, chunk).await?;
+                queue_belt_asks(local, me, chunk).await?;
             }
             drain.pushes.extend(pushes);
             done.extend(chunk.iter().cloned());
@@ -2850,7 +3034,7 @@ pub async fn bootstrap_step<R: SqlPort, L: SqlPort, O: Outside>(
             apply_with(record, local, outside, me, &[], None, tip, era_ms, &opts).await?;
         if publish && !report.page.is_empty() {
             let games: Vec<String> = report.page.iter().map(|(g, _)| g.clone()).collect();
-            publish_belt_asks(record, local, me, &games).await?;
+            queue_belt_asks(local, me, &games).await?;
         }
         report.page
     };
@@ -3761,7 +3945,14 @@ pub fn served_bars(now_ms: u64) -> Value {
 /// time of an event whose actor apply faulted in this isolate with no later apply of that identity landed.
 /// D2-ACTOR-B-FOLD-7 (the captain's item 7): `cold`, one sample a cold actor, the first held event's write time to
 /// its held events applied; its `visible` ring alone (never the warm `queue` and `direct` bars).
-pub const BAR_CLASSES: [&str; 4] = ["direct", "queue", "mined", "cold"];
+pub const BAR_CLASSES: [&str; 5] = ["direct", "queue", "mined", "cold", "flood"];
+/// FIX-983 (bsv-low #983): THE STRESS CLASS. A pass that calls this many actors at once (the publisher's direct pass
+/// over a burst of identities, a consumer batch of that many identities) is a FLOOD: its samples go to the `flood`
+/// class row, apart from `direct` and `queue`, so the design's two bars (`classes.direct.applyMsP95` under 300 ms,
+/// `rowsVisibleDirectMsP95` under 1 s) read a WARM HAND (a hand's two seats, a quiet batch) and the flood's figures
+/// are served beside them (`classes.flood`, `rowsVisibleFloodMsP95`). The caller names its fan-out on the body
+/// (`concurrent`); the object classes the sample ([`bars_class`]).
+pub const FLOOD_CONCURRENCY: u32 = 8;
 /// D2-ACTOR-D (bsv-low #952): the queue's backstop lag bar, named in the health block (`backstopLagBarMs`): an event
 /// the writer's direct call did not land is visible within this long of its write through the queue.
 pub const BACKSTOP_LAG_BAR_MS: u64 = 60_000;
@@ -3770,7 +3961,7 @@ pub const BARS_FLUSH_SAMPLES: usize = 64;
 pub fn bars_state_name(class: &str) -> String {
     format!("owed-actor:bars:{class}")
 }
-pub const BARS_READ_SQL: &str = "SELECT name,cursor,tickedAtMs FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold')";
+pub const BARS_READ_SQL: &str = "SELECT name,cursor,tickedAtMs FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold','owed-actor:bars:flood')";
 
 /// This isolate's samples not yet added to the durable rows.
 #[derive(Debug, Default, Clone)]
@@ -3838,8 +4029,13 @@ pub fn reconcile_apply_body(
     body
 }
 
-/// NEW5-L5 (D2-ACTOR-B-FOLD-10): the bars class an object notes its own answer under (`direct`, else `queue`).
-pub fn bars_class(class: Option<&str>) -> &'static str {
+/// NEW5-L5 (D2-ACTOR-B-FOLD-10): the bars class an object notes its own answer under (`direct`, else `queue`);
+/// FIX-983 (bsv-low #983): `flood` when the caller's pass fanned out to [`FLOOD_CONCURRENCY`] actors or more
+/// (`concurrent`, the body's), whatever its road.
+pub fn bars_class(class: Option<&str>, concurrent: Option<u32>) -> &'static str {
+    if concurrent.is_some_and(|n| n >= FLOOD_CONCURRENCY) {
+        return "flood";
+    }
     match class {
         Some("direct") => "direct",
         _ => "queue",
@@ -4048,11 +4244,13 @@ pub const JUDGE_VERSION: &str = "fold11-2026-10-29";
 /// within the object's own work before and after the apply: the event's facts, the coalesced events' checks).
 /// FIX-962 (bsv-low #962): the `cold` class row's ring of bootstrap page work ([`PendingBars::cold_page`]).
 pub const COLD_PAGE_RING: &str = "page";
-pub const APPLY_STAGES: [(&str, &str); 4] = [
+pub const APPLY_STAGES: [(&str, &str); 5] = [
     ("readMs", "read"),
     ("judgeMs", "judge"),
     ("writeMs", "write"),
     ("waitMs", "wait"),
+    // FIX-983 (bsv-low #983): the outside's awaits (CHAINTRACKS, once per apply), apart from the judge's derivation.
+    ("outsideMs", "outside"),
 ];
 
 pub fn merge_bars_row(
@@ -4273,6 +4471,8 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
     }
     let (mined, _, _) = ring("mined", "visible");
     let (cold, _, _) = ring("cold", "visible");
+    // FIX-983: the flood's first visibility, apart from the warm hand's.
+    let (flood_visible, _, _) = ring("flood", "visible");
     let classes: serde_json::Map<String, Value> = BAR_CLASSES
         .iter()
         .map(|c| {
@@ -4302,6 +4502,9 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
         "rowsVisibleMsP95": first_visible.quantile(0.95),
         "rowsVisibleMsMax": first_visible.max(),
         "rowsVisibleDirectMsP95": direct_visible.quantile(0.95),
+        // FIX-983 (bsv-low #983): the stress class's figures, served apart (never in the two bars above).
+        "rowsVisibleFloodMsP95": flood_visible.quantile(0.95),
+        "floodConcurrency": FLOOD_CONCURRENCY,
         // The queue's own first applies (the events the direct call missed): the durable backstop's lag, its bar.
         "backstopLagMsP95": queue_visible.quantile(0.95),
         "backstopLagMsMax": queue_visible.max(),
@@ -4326,7 +4529,7 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
 /// (`owed_events::HEALTH_CONSUMER_SQL`).
 macro_rules! health_select {
     () => {
-        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding,(SELECT cursor FROM owed_belt_state WHERE name='owed-judge:version') AS d1Rejudge"
+        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold','owed-actor:bars:flood')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding,(SELECT cursor FROM owed_belt_state WHERE name='owed-judge:version') AS d1Rejudge"
     };
 }
 pub const HEALTH_SQL: &str = health_select!();
@@ -4369,12 +4572,7 @@ pub fn health_snapshot_of(cursor: Option<&str>) -> Option<Value> {
 /// the durable compare totals (MEDIUM-8: Phase B's gate), the bootstraps beside the identities holding rows
 /// (MEDIUM-1: Phase B's other gate), and the oldest unapplied event's age: the actor's OWN in Phases A and B, the
 /// fleet's oldest un-acked mark in Phase C (where the marks are acknowledged after the actor applied).
-pub fn health_body(
-    read: Option<&Value>,
-    now: u64,
-    d1_judges: bool,
-    d1_oldest_unacked: &Value,
-) -> Value {
+pub fn health_body(read: Option<&Value>, now: u64, d1_oldest_unacked: &Value) -> Value {
     let mut body = served_bars(now);
     body["isolate"] = body.clone();
     // A field of the snapshot: the composition's text (a `json_group_*` column) or the JSON itself.
@@ -4461,13 +4659,60 @@ pub fn health_body(
     // D2-ACTOR-B-FOLD-7 (item 5): D1 binds every number as a JS number (a REAL), so a row written before the fold
     // holds `asOfMs` as `1793190803706.0`; read either form.
     body["asOfMs"] = json!(read.and_then(|r| json_ms(&r["asOfMs"])));
-    body["oldestUnappliedEventAgeMs"] = if d1_judges {
-        fleet["actorOldestUnappliedEventAgeMs"].clone()
-    } else {
-        d1_oldest_unacked.clone()
-    };
+    // FIX-982 (bsv-low #982): in EVERY phase the oldest event an actor holds unapplied ([`unapplied_event_age`]): the
+    // oldest hold (`holding.oldestAtMs`: an actor not bootstrapped, its events held) or the oldest write time of an
+    // event whose apply faulted with no later apply of its identity landed (the queue row's `oldestUnappliedAtMs`,
+    // noted by the consumer and the direct pass in every phase). Never a D1 mark: Phase C read the fleet's oldest
+    // un-acked `owed_dirty` mark, and Phase C's marks are the reconcile's, the age repair's and the sweep's, waiting
+    // for the sweep's stalled bound (600 s with a quiet consumer; beta read 590 s with `holding` 0): no event an actor
+    // holds. The mark's age is served beside, named for what it is.
+    let held_age = json_ms(&holding["oldestAtMs"]).map(|a| now.saturating_sub(a));
+    let faulted_age = fleet["actorOldestUnappliedEventAgeMs"].as_u64();
+    let (age, source) = unapplied_event_age(held_age, faulted_age);
+    body["oldestUnappliedEventAgeMs"] = json!(age);
+    body["oldestUnappliedEventSource"] = json!(source);
+    body["oldestUnackedMarkAgeMs"] = d1_oldest_unacked.clone();
     body["healthRead"] = json!(read.is_some());
     body
+}
+
+/// PURE (FIX-982, bsv-low #982): the oldest unapplied event's age and its source: the older of the oldest HELD event
+/// (an actor not bootstrapped) and the oldest FAULTED apply's event (no later apply of its identity landed); `None`
+/// with neither (every event applied).
+pub fn unapplied_event_age(
+    held_age_ms: Option<u64>,
+    faulted_age_ms: Option<u64>,
+) -> (Option<u64>, Option<&'static str>) {
+    match (held_age_ms, faulted_age_ms) {
+        (Some(h), Some(f)) if f > h => (Some(f), Some("faulted")),
+        (Some(h), _) => (Some(h), Some("held")),
+        (None, Some(f)) => (Some(f), Some("faulted")),
+        (None, None) => (None, None),
+    }
+}
+
+thread_local! {
+    /// FIX-983: one drain of the asks lane at a time an isolate ([`drain_lane_once`]).
+    static LANE_DRAINING: Cell<bool> = const { Cell::new(false) };
+}
+/// FIX-983: drain the lane unless a drain is running in this isolate (that one takes what was queued meanwhile: it
+/// drains until the lane is empty before it lets go). Answers what THIS call drained.
+pub async fn drain_lane_once<R: SqlPort>(record: &R) -> AsksDrained {
+    if LANE_DRAINING.with(|d| d.replace(true)) {
+        return AsksDrained::default();
+    }
+    let mut out = AsksDrained::default();
+    loop {
+        let d = drain_ask_lane(record).await;
+        out.batches += d.batches;
+        out.asks += d.asks;
+        out.faults += d.faults;
+        if ask_lane_len() == 0 {
+            break;
+        }
+    }
+    LANE_DRAINING.with(|d| d.set(false));
+    out
 }
 
 /// THE BOOTSTRAP'S COVERAGE (the delta lens's NEW-L3): one row of the belt's ledger (`owed-actor:coverage`), folded
