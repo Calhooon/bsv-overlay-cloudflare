@@ -13,7 +13,8 @@ pub const STATE_SQL: &str =
     "SELECT computedAtMs,rows,truncated,recomputeSeq,tip FROM owed_state WHERE identity=?1";
 /// The identity's pending marks: their count, and (the second delta lens's D2-L1) the games holding an undrained mark
 /// of the DOWNGRADE class (the third delta lens's D3-L1: the mark's own `downgrade`, written by the trigger: the index
-/// recording a spend, a pot row deleted, an eviction; a `pot` stamp, facts fill or re-present is not one), over the
+/// recording a spend, a pot row deleted, an eviction; a `pot` stamp, facts fill or re-present is not one), each with
+/// its source and its GENERATION (FIX-968: the gate compares it with the actor's covered generation, below), over the
 /// covering UNIQUE index's identity prefix and the row. The count already visits every pending mark of the identity, so naming
 /// them adds no row and no statement. A mark still in `owed_dirty` is one no judge has acknowledged since it was
 /// written (the judge deletes `generation <= seen` for each subject it judges), so its presence is what "newer than the
@@ -25,7 +26,7 @@ pub const STATE_SQL: &str =
 /// acknowledgement (`owed_actor::PHASE_C_MARK_SQL`), and `owedV3`, the re-judge's stamp, which that acknowledgement
 /// deletes. While the first stands without the second, D1's `owed_rows` are the rows of the Phase C flip, not a
 /// judgement, and the D1 read serves no press from them.
-pub const PENDING_SQL: &str = "SELECT COUNT(*) AS pending,json_group_array(CASE WHEN downgrade=1 THEN json_array(gameId,source) END) AS downgrades,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-actor-judged') AS actorJudged,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-v3') AS owedV3 FROM owed_dirty WHERE identity=?1";
+pub const PENDING_SQL: &str = "SELECT COUNT(*) AS pending,json_group_array(CASE WHEN downgrade=1 THEN json_array(gameId,source,generation) END) AS downgrades,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-actor-judged') AS actorJudged,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-v3') AS owedV3 FROM owed_dirty WHERE identity=?1";
 /// The served reason of a press withheld over a pending downgrade (D2-L1).
 pub const PENDING_DOWNGRADE_REASON: &str =
     "re-judging: a downgrade of this game is recorded and not yet judged; the press waits for the judgement";
@@ -45,8 +46,13 @@ pub struct Snapshot {
     pub known: bool,
     /// NEW-M3: the D1 read of a database a Phase C actor judged, before the `owed-v3` re-judge stamped: no press.
     pub rollback_pending: bool,
-    /// The games holding an undrained downgrade-class mark, each with its source (D2-L1).
-    pub downgrades: BTreeMap<String, String>,
+    /// The games holding an undrained downgrade-class mark (D2-L1), each mark's `(generation, source)` (FIX-968).
+    pub downgrades: BTreeMap<String, Vec<(i64, String)>>,
+    /// FIX-968 (bsv-low #968): the actor's COVERED generation per game (lowercased), from its `/rows` answer
+    /// (`owed_actor::COVERED_BY_GAME_SQL`: the greatest `applied` `covered` seq of the game, the marks bound its
+    /// last apply read the record at). Empty on the D1 read (`rows: true`) and where the actor answered none: then
+    /// every pending downgrade mark withholds, as before FIX-968.
+    pub covered: BTreeMap<String, i64>,
 }
 
 fn number(value: &Value) -> Option<u64> {
@@ -116,9 +122,13 @@ pub async fn read_with(db: &impl SqlPort, identity: &str, rows: bool) -> Result<
         .unwrap_or(Value::Null);
     for mark in named.as_array().into_iter().flatten() {
         if let (Some(game), Some(source)) = (mark[0].as_str(), mark[1].as_str()) {
+            // FIX-968: a generation the row does not carry (an older statement's answer) reads as the greatest, so
+            // the mark withholds as before (the safe direction).
+            let generation = mark[2].as_i64().unwrap_or(i64::MAX);
             downgrades
                 .entry(game.to_owned())
-                .or_insert_with(|| source.to_owned());
+                .or_insert_with(Vec::new)
+                .push((generation, source.to_owned()));
         }
     }
     let state = batch.pop().unwrap().rows.into_iter().next();
@@ -140,6 +150,7 @@ pub async fn read_with(db: &impl SqlPort, identity: &str, rows: bool) -> Result<
                 .unwrap_or(0)
                 == 0,
         downgrades,
+        covered: BTreeMap::new(),
     };
     if snapshot.state.is_none() {
         snapshot.joined.clear();
@@ -162,6 +173,52 @@ pub async fn read_with(db: &impl SqlPort, identity: &str, rows: bool) -> Result<
 }
 
 impl Snapshot {
+    /// THE D1-MARK READ GATE (bsv-low #968, lane FIX-968; the second delta lens's D2-L1 as narrowed). The ONE
+    /// predicate a claimable row passes before its press is served, in every phase: the answer is `Some(source)`,
+    /// the press withheld as re-judging ([`PENDING_DOWNGRADE_REASON`]), when `game` holds a pending mark that is
+    ///
+    /// 1. of the DOWNGRADE class (`owed_dirty.downgrade = 1`, the trigger's own class: the index recording a spend, a
+    ///    pot row admitted or deleted, an eviction, a word refusing its transaction), never a plain mark (a filing's,
+    ///    a tip's, a wanted, an age, a stamp, a facts fill: those are counted in `pending` and withhold nothing), AND
+    /// 2. one the JUDGE WHOSE ROWS ARE SERVED has not applied:
+    ///    - the D1 read (`OWED_ACTOR_READ` off, Phase A; `rows: true`): every pending downgrade mark. The D1 judge's
+    ///      own commit acknowledges the marks it judged (`ACK_DIRTY_SQL`), so a pending one is unjudged by the judge
+    ///      whose rows this read serves ([`Snapshot::covered`] is empty here).
+    ///    - the actor's read (`OWED_ACTOR_READ` on, Phases B and C): a pending downgrade mark whose `generation` is
+    ///      GREATER than the actor's covered generation for the game (the marks bound its last apply read the record
+    ///      at, recorded as `applied` `covered`, answered on `/rows` as `covered`). A mark at or below it was written
+    ///      before that read (generations are AUTOINCREMENT), so the row served IS the record's judgement after the
+    ///      write; withholding its press would cost the player the consumer's lag for nothing (L53 S1: 36 passes of
+    ///      "re-judging" over a row the actor had already re-judged, the mark waiting on the serial consumer). A game
+    ///      with no covered generation (the actor never applied it, the actor answered none, an older object build)
+    ///      withholds as before: the safe direction.
+    ///
+    /// THE MONEY RULE: a press on a row a downgrade would retract is the one to withhold (the actor has not read the
+    /// write: its row predates the spend, the admission, the eviction, the refusal); a press delayed by a mark the
+    /// served judge has already applied, or by any non-downgrade mark, is money the player cannot collect for the
+    /// length of a backlog, with nothing to gain.
+    ///
+    /// PHASE C (the D1 judge off): `owed_dirty` is still written by the overlay's triggers on every source write (the
+    /// triggers know no flag), acknowledged by the consumer's Phase C batch (`owed_actor::as_the_judge`, the games
+    /// the actor applied, up to the generation read before its call) and by a direct apply that landed (FIX-956
+    /// item 3); the actor's apply reads the marks only for the bound it records as `covered`; and the actor-served
+    /// read consults them through [`PENDING_SQL`] and this gate, the same rule as Phase B. The D1 read in Phase C
+    /// serves no press at all until the rollback's `owed-v3` stamp ([`ROLLBACK_PENDING_REASON`], NEW-M3), checked
+    /// before this gate.
+    pub fn withholding_mark(&self, game: &str) -> Option<&str> {
+        let marks = self.downgrades.get(game)?;
+        let covered = self
+            .covered
+            .get(&game.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(i64::MIN);
+        marks
+            .iter()
+            .filter(|(generation, _)| *generation > covered)
+            .max_by_key(|(generation, _)| *generation)
+            .map(|(_, source)| source.as_str())
+    }
+
     /// A claimable sweep always needs the present tip: without it the read withholds the press (HIGH-1).
     pub fn needs_tip(&self) -> bool {
         self.joined.iter().any(|r| {
@@ -267,8 +324,9 @@ impl Snapshot {
                     reason = row.reason;
                 }
                 // The second delta lens's D2-L1 (the captain's ruling): a read never does work, but never serves a
-                // press over a pending downgrade. A game holding an undrained downgrade-class mark serves its press
-                // withheld as re-judging; the drain's judgement lifts it.
+                // press over a pending downgrade. A game holding an undrained downgrade-class mark the served judge
+                // has not applied serves its press withheld as re-judging (THE GATE, `Snapshot::withholding_mark`,
+                // FIX-968); the judge's acknowledgement, or the actor's own apply of the mark, lifts it.
                 // NEW-M3: D1's rows after a Phase C actor judged, before the `owed-v3` re-judge: no press.
                 if self.rollback_pending && facts["claimable"] == Value::Bool(true) {
                     facts["claimable"] = json!(false);
@@ -282,7 +340,7 @@ impl Snapshot {
                 if facts["claimable"] == Value::Bool(true) {
                     if let Some(source) = joined["gameId"]
                         .as_str()
-                        .and_then(|game| self.downgrades.get(game))
+                        .and_then(|game| self.withholding_mark(game))
                     {
                         facts["claimable"] = json!(false);
                         facts["claimableBeforePending"] = json!(true);

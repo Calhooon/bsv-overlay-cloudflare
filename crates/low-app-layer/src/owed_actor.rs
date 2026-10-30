@@ -625,6 +625,32 @@ pub const COVERED_TIP_CLEAR_SQL: &str =
 /// How many of `?2` (a JSON array of games) an apply covered at or past the bound `?1` and whose LAST apply judged at
 /// a tip at least `?3` (`-1`: the delivery names no tip).
 pub const COVERED_SQL: &str = "SELECT COUNT(*) AS n FROM (SELECT DISTINCT value AS g FROM json_each(?2)) j WHERE EXISTS (SELECT 1 FROM applied a WHERE a.kind='covered' AND a.seq>=?1 AND a.game=j.g) AND EXISTS (SELECT 1 FROM applied t WHERE t.kind='covered-tip' AND t.seq>=?3 AND t.game=j.g)";
+/// FIX-968 (bsv-low #968): the actor's COVERED generation per game (lowercased) for the games `?1` (a JSON array)
+/// names: the greatest `applied` `covered` seq of each, the marks bound its last apply read the record at. Answered
+/// on `GET /rows?covered=<games>` as `covered: [{game, seq}]` and read by the D1-mark read gate
+/// (`owed_read::Snapshot::withholding_mark`): a pending downgrade mark at or below it was judged by the actor whose
+/// rows the read serves. No new index (the actor's digest does not move): the `covered` rows of one identity over
+/// their seven days.
+pub const COVERED_BY_GAME_SQL: &str = "SELECT lower(game) AS game, MAX(seq) AS seq FROM applied WHERE kind='covered' AND lower(game) IN (SELECT value FROM json_each(?1)) GROUP BY lower(game)";
+/// FIX-968: the most games one read asks the actor's coverage of (the games holding a pending downgrade mark, in
+/// `BTreeMap` order); a game past it is not asked and withholds as before.
+pub const COVERED_ASK_MAX: usize = 64;
+/// FIX-968, PURE: the actor's `/rows` answer's `covered` rows (`[{game, seq}]`, [`COVERED_BY_GAME_SQL`]) as the
+/// read's map (game lowercased to its covered generation); an answer without them (an older object build, a fresh
+/// object) is empty, so every pending downgrade mark withholds as before.
+pub fn covered_of(answer: &Value) -> BTreeMap<String, i64> {
+    answer["covered"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            Some((
+                r["game"].as_str()?.to_ascii_lowercase(),
+                r["seq"].as_i64().or_else(|| r["seq"].as_f64().map(|f| f as i64))?,
+            ))
+        })
+        .collect()
+}
 /// The tip an apply records, or a delivery is compared at ([`COVERED_TIP_KIND`]): `-1` for none.
 pub fn covered_tip(tip: Option<u64>) -> i64 {
     tip.map_or(-1, |t| t.min(i64::MAX as u64) as i64)

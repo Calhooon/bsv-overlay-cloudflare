@@ -346,7 +346,19 @@ impl DurableObject for OwedActor {
                     .query_pairs()
                     .find(|(k, _)| k == "identity")
                     .map(|(_, v)| v.to_string());
-                self.rows_route(identity).await
+                // FIX-968: the games whose covered generation the read asks (comma-joined, at most COVERED_ASK_MAX).
+                let covered: Vec<String> = url
+                    .query_pairs()
+                    .find(|(k, _)| k == "covered")
+                    .map(|(_, v)| {
+                        v.split(',')
+                            .filter(|g| !g.is_empty())
+                            .take(COVERED_ASK_MAX)
+                            .map(str::to_ascii_lowercase)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.rows_route(identity, covered).await
             }
             // The reconcile's read (MEDIUM-10): the stored rows, the words stripped as stored, no apply.
             (Method::Get, "/stored") => {
@@ -1070,7 +1082,7 @@ impl OwedActor {
     /// tables; the read replaces every word column with D1's, MEDIUM-4) and the state row. It WRITES NOTHING (the
     /// D2-ACTOR-B lens's MEDIUM-3): an actor not bootstrapped answers `bootstrapped: false` (and whether its bootstrap
     /// is armed); the read's caller arms it by `/bootstrap`.
-    async fn rows_route(&self, identity: Option<String>) -> Result<Response> {
+    async fn rows_route(&self, identity: Option<String>, covered: Vec<String>) -> Result<Response> {
         let local = self.local();
         let me = self
             .meta(META_IDENTITY)
@@ -1088,6 +1100,21 @@ impl OwedActor {
                 .and_then(|c| c.to_array::<Value>().ok())
                 .unwrap_or_default()
         };
+        // FIX-968 (bsv-low #968): the covered generation of each game the read names (`?covered=`, the games holding
+        // a pending downgrade mark), for the D1-mark read gate; none asked, none answered. Read only, as the rest.
+        let covered: Vec<Value> = if covered.is_empty() {
+            Vec::new()
+        } else {
+            local
+                .sql
+                .exec(
+                    COVERED_BY_GAME_SQL,
+                    vec![SqlStorageValue::from(json!(covered).to_string())],
+                )
+                .ok()
+                .and_then(|c| c.to_array::<Value>().ok())
+                .unwrap_or_default()
+        };
         Response::from_json(&json!({
             "identity": me,
             "fresh": false,
@@ -1095,6 +1122,7 @@ impl OwedActor {
             "bootstrapArmed": armed,
             "joined": read(crate::owed_read::ROWS_SQL),
             "state": read(crate::owed_read::STATE_SQL).first(),
+            "covered": covered,
             "ackSeq": self.meta(META_ACK).and_then(|s| s.parse::<i64>().ok()),
             "judgedAtMs": self.meta(META_JUDGED_AT).and_then(|s| s.parse::<u64>().ok()),
         }))
@@ -1317,14 +1345,32 @@ pub async fn call_rows(
     env: &Env,
     identity: &str,
     wall_ms: u64,
+    covered: &[String],
 ) -> std::result::Result<Value, String> {
     let stub = stub_of(env, identity).ok_or("no owed actor for this identity")?;
     let name = actor_name(identity).unwrap_or_default();
+    // FIX-968: the games holding a pending downgrade mark, whose covered generation the gate compares (lowercase hex
+    // game ids, comma-joined; at most `COVERED_ASK_MAX`).
+    let covered: Vec<String> = covered
+        .iter()
+        .take(COVERED_ASK_MAX)
+        .map(|g| g.to_ascii_lowercase())
+        .filter(|g| {
+            !g.is_empty()
+                && g.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+        .collect();
+    let url = if covered.is_empty() {
+        format!("https://owed-actor/rows?identity={name}")
+    } else {
+        format!(
+            "https://owed-actor/rows?identity={name}&covered={}",
+            covered.join(",")
+        )
+    };
     let call = async {
-        let mut resp = stub
-            .fetch_with_str(&format!("https://owed-actor/rows?identity={name}"))
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut resp = stub.fetch_with_str(&url).await.map_err(|e| e.to_string())?;
         resp.json::<Value>().await.map_err(|e| e.to_string())
     };
     let wall = Delay::from(std::time::Duration::from_millis(wall_ms));
@@ -1427,7 +1473,11 @@ pub(crate) async fn read_snapshot(
         db.counters(vec![(COUNTERS[11].into(), 1)]).await;
         return Ok(ActorRead::Rows(snapshot));
     }
-    let answer = match call_rows(env, identity, READ_WALL_MS).await {
+    // FIX-968 (bsv-low #968): the games holding a pending downgrade mark are named to the actor, which answers the
+    // covered generation of each (`COVERED_BY_GAME_SQL`); the D1-mark read gate (`Snapshot::withholding_mark`)
+    // withholds a press only over a mark above it.
+    let marked: Vec<String> = snapshot.downgrades.keys().cloned().collect();
+    let answer = match call_rows(env, identity, READ_WALL_MS, &marked).await {
         Ok(a) => a,
         Err(e) => {
             console_log!("[owed-actor] read {identity}: {e}");
@@ -1440,6 +1490,7 @@ pub(crate) async fn read_snapshot(
             )));
         }
     };
+    snapshot.covered = covered_of(&answer);
     if answer["bootstrapped"] != true {
         if answer["bootstrapArmed"] != true {
             if let Err(e) = call_bootstrap(env, identity, READ_WALL_MS).await {

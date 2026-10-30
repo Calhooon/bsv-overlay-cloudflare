@@ -1442,6 +1442,7 @@ pub(crate) fn assert_fixture_roundtrip(i: &OwedInputs<'_>) {
         known: false,
         rollback_pending: false,
         downgrades: BTreeMap::new(),
+        covered: BTreeMap::new(),
     };
     let empty = BTreeMap::new();
     let mut served = snapshot
