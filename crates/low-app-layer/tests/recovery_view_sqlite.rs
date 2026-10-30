@@ -855,6 +855,7 @@ fn the_outcome_word_is_the_results_derivation_reused_not_respelled() {
         game_id_binding: low_app_layer::results::PotBinding::Unknown,
         verdict: Some(low_app_layer::results::PotVerdict::WinnerA),
         settle_signers: None,
+        signers_pending: false,
         outcome: low_app_layer::results::Outcome::Won,
         outcome_source: Some("chain+seatkey"),
         at_height: Some(958_700),
