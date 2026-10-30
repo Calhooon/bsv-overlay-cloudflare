@@ -2237,7 +2237,7 @@ async fn stored_spend_verdict(
     classify_stored_spend(rec, spender, &beef)
 }
 
-/// bsv-low #986: [`stored_spend_verdict`]'s pure half, over the spender's stored BEEF `beef` already read: the
+/// bsv-low #986: `stored_spend_verdict`'s pure half, over the spender's stored BEEF `beef` already read: the
 /// parse HASH-BOUND to `spender` (`transaction_from_beef` selects the subject by the txid computed from its raw
 /// bytes, under the stored-bytes limits), then the ONE classifier (`overlay_discovery::pot::classify_record_spend`).
 /// `pub` so the app layer's differential pin (bsv-low #986 item 3) replays the janitor's latch over its own record
