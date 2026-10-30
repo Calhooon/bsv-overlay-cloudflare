@@ -300,7 +300,96 @@ fn fix986_the_unclassified_scan_reads_its_partial_index_and_no_fleet_table() {
         0,
         "no full-scan step"
     );
+    // NOTE-3 (the FIX-986 lens): the scan's cost is its CONFIRMED backlog's, never the fleet's. The same two
+    // candidates seeded into an EMPTY migrated database cost the shipped scan the same VM steps as inside the fleet
+    // (whose partial index holds 8,097 unconfirmed rows the range never reads), so the tick's read is bounded by the
+    // confirmed unclassified rows it drains, each one index entry and one primary-key probe, whatever the fleet holds.
+    let fleet_steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+    drop(stmt);
+    let alone = Connection::open_in_memory().unwrap();
+    migrate(&alone, OVERLAY_MIGRATIONS);
+    for i in 0u8..2 {
+        let (pot, spender) = (format!("f8{i:062x}"), format!("f9{i:062x}"));
+        let verdict = if i == 0 {
+            "NULL, NULL"
+        } else {
+            "'winner-a', 'ff'"
+        };
+        alone
+            .execute_batch(&format!(
+                "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed, lockKind, pubA, paramsDecoded, verdict, verdictTxid, createdAt) \
+                 VALUES ('{pot}', 1, 1, '{spender}', 1, 'covenant', '{pk}', 1, {verdict}, 1); \
+                 INSERT INTO pot_beefs (txid, beef, createdAt) VALUES ('{spender}', x'00', 1)"
+            ))
+            .unwrap();
+    }
+    let mut stmt = alone.prepare(&sql).unwrap();
+    assert_eq!(stmt.query_map([], |_| Ok(())).unwrap().count(), 2);
+    let alone_steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+    println!("fix986 scan VM steps: {fleet_steps} in the fleet, {alone_steps} over its two candidates alone");
+    assert_eq!(
+        fleet_steps, alone_steps,
+        "the scan reads its backlog, not the fleet"
+    );
+    drop(stmt);
     assert_no_fleet_scan_analyzed(&db, "unclassified", &spent_unclassified_candidates_sql(16));
+}
+
+/// bsv-low #986, the FIX-986 lens's LOW-1, stated: the overlay's second verdict candidate set is gated on the FLAG,
+/// narrower than the app layer's money-view bar (`logic::is_confirmed_landing_with_proof`, what `results` serves a
+/// verdict under). Over every combination of the four facts (16 rows, the spender's bytes held, no verdict): the bar
+/// is the flag OR the proof OR (seen AND final), the three arms the overlay's coverage pin
+/// (`d1_discovery::tests::fix986::fix986f_l1_the_unflagged_landings_are_the_chases_candidates`) hands to the
+/// confirmation pass when the flag is down; and the second set takes exactly the flagged rows.
+#[test]
+fn fix986f_l1_the_second_set_is_the_flag_and_the_bar_is_the_three_arms() {
+    use bsv_overlay_cloudflare::d1_discovery::spent_unclassified_candidates_sql;
+    let db = Connection::open_in_memory().unwrap();
+    migrate(&db, OVERLAY_MIGRATIONS);
+    let pk = format!("02{}", "ab".repeat(32));
+    let mut flagged = Vec::new();
+    for bits in 0u8..16 {
+        let (confirmed, proof, seen, fin) =
+            (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+        assert_eq!(
+            low_app_layer::logic::is_confirmed_landing_with_proof(
+                Some(confirmed),
+                Some(proof),
+                Some(seen),
+                Some(fin)
+            ),
+            confirmed || proof || (seen && fin),
+            "the bar's arms at {bits:04b}"
+        );
+        let (pot, spender) = (format!("e8{bits:062x}"), format!("e9{bits:062x}"));
+        db.execute_batch(&format!(
+            "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed, spenderFinal, lockKind, pubA, paramsDecoded, createdAt) \
+             VALUES ('{pot}', 0, 1, '{spender}', {}, {}, 'covenant', '{pk}', 1, 1); \
+             INSERT INTO pot_beefs (txid, beef, createdAt, proof_verified) VALUES ('{spender}', x'00', 1, {});",
+            i64::from(confirmed),
+            i64::from(fin),
+            i64::from(proof),
+        ))
+        .unwrap();
+        if seen {
+            db.execute(
+                "INSERT INTO network_seen (txid, seenAt) VALUES (?1, 1)",
+                [&spender],
+            )
+            .unwrap();
+        }
+        if confirmed {
+            flagged.push(pot);
+        }
+    }
+    let mut stmt = db.prepare(&spent_unclassified_candidates_sql(100)).unwrap();
+    let mut got: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    got.sort();
+    assert_eq!(got, flagged, "the second set is the flag");
 }
 
 #[test]
