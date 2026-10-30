@@ -4253,8 +4253,11 @@ pub fn lib_rev() -> &'static str {
 /// BY HAND, in the commit that changes what an actor stores for the same record: the judge (`owed::derive_owed_rows`,
 /// `owed_judge`), its hydration, the mirror's closure or read ([`apply_with`], [`FAMILIES`]), the actor's own tables.
 /// A change of cost, bars, routing or logs moves nothing. Moved by FOLD-11 itself (NEW6-M1 changes the warm read).
-/// The fleet bars stay keyed by [`lib_rev`] (a build's own samples).
-pub const JUDGE_VERSION: &str = "fold11-2026-10-29";
+/// The fleet bars stay keyed by [`lib_rev`] (a build's own samples). Moved by FIX-997 (bsv-low #997): the mirror's
+/// `txfacts` carry the classifier's input and the bump's height, so a spend with no stored verdict is judged from them
+/// (it was `unresolved` in the actor); every actor re-judges once under the bootstrap pace, and D1's fleet re-judge
+/// (FOLD-13) runs once with the D1 judge on.
+pub const JUDGE_VERSION: &str = "fix997-2026-10-30";
 
 /// One class row after this isolate's samples: the stored rings with the new samples appended, the last
 /// [`METER_SAMPLES`] kept; `unapplied` (the queue row only) the oldest unapplied write time, `Some(None)` cleared. A

@@ -12517,15 +12517,16 @@ mod fix986 {
         latched
     }
 
-    /// (d) THE DIFFERENTIAL PIN over a discovery-found spend. The premise, today's disagreement (and the fixture's
-    /// before the latch, after the fold too): D1 serves `payout refund claimable` (classified per request from the
-    /// spender's BEEF), the actor `unbound` with "the spend is not classified yet (no verdict)", the digests
-    /// differ. The janitor's second candidate set names the pot and nothing else; its latch, replayed with the
+    /// (d) THE DIFFERENTIAL PIN over a discovery-found spend. The premise, since FIX-997 (bsv-low #997): before the
+    /// latch D1 serves `payout refund claimable` (classified per request from the spender's BEEF) and the actor the
+    /// same rows from the spender's facts, `settleSigners` null and `signersPending` true (it was `unbound` "the
+    /// spend is not classified yet (no verdict)", the digests apart, until FIX-997). The janitor's second candidate set names the pot and nothing else; its latch, replayed with the
     /// shipped scan, classifier and CAS, writes `refund` keyed to the spender; D1 judged again and the actor applying
     /// the verdict row as a `pot` event (no bootstrap, no version move) store the same rows byte for byte and the
     /// same digest, `payout refund claimable` on both; an actor bootstrapped after the latch (seat B) the same. RED
     /// on main: the scan does not exist (the pin does not compile); with the latch skipped, the premise's digests
-    /// stand apart (`unbound` against `payout`).
+    /// stood apart (`unbound` against `payout`) until FIX-997, whose premise is RED on its base (`left: ("payout",
+    /// Some(1), ..) right: ("unbound", None, ..)` with the old assertion).
     #[tokio::test]
     async fn fix986_d_the_actor_and_d1_agree_on_a_discovery_found_spend_once_its_verdict_is_latched(
     ) {
@@ -12553,24 +12554,23 @@ mod fix986 {
             ),
             "D1 classifies the found spend from the spender's BEEF: {d1_row:?}"
         );
-        let actor_row = row_of(&actor, &a, &key).expect("the actor holds a row for the pot");
+        // FIX-997 (bsv-low #997): THE PREMISE MOVED. Before the latch the actor classifies the spend from its facts
+        // as D1 does from the bytes (it was `unbound` "the spend is not classified yet (no verdict)", the digests
+        // apart): the same rows, the exit served and the signers pending the store.
+        assert_eq!(
+            stored(&actor, &a),
+            stored(&d1, &a),
+            "the actor judges from its facts as D1 from its bytes"
+        );
+        assert_eq!(digest(&actor, &a).await, digest(&d1, &a).await);
         assert_eq!(
             (
-                actor_row.0.as_str(),
-                actor_row.1,
-                actor_row.2["outcome"].clone(),
-                actor_row.3.as_deref()
+                d1_row.2["settleSigners"].clone(),
+                d1_row.2["signersPending"].clone()
             ),
-            (
-                "unbound",
-                None,
-                json!("unresolved"),
-                Some("the spend is not classified yet (no verdict)")
-            ),
-            "the actor holds no bytes to classify from: {actor_row:?}"
+            (Value::Null, json!(true)),
+            "the signers are the stored group's alone: {d1_row:?}"
         );
-        assert_ne!(digest(&actor, &a).await, digest(&d1, &a).await);
-        assert_ne!(stored(&actor, &a), stored(&d1, &a));
 
         // THE JANITOR'S LATCH: the candidate set is the pot and nothing else, and the group lands.
         let latched = janitor_latch(&d1);
@@ -12721,5 +12721,165 @@ mod fix986 {
         let (actor, _) = actor_judge(&d1, &a).await;
         assert_eq!(stored(&actor, &a), stored(&d1, &a));
         assert_eq!(digest(&actor, &a).await, digest(&d1, &a).await);
+    }
+
+    /// FIX-997 (bsv-low #997, READ-986 item 2(a), the parity follow-up): a spend whose verdict is NOT stored is
+    /// classified the same in the actor as in D1, from the transaction's FACTS (each input's sequence, the lock time,
+    /// each output's script, the bump's height: `TxFacts::raw`, `TxFacts::bump_height`), never from bytes the mirror
+    /// does not hold. The signers are the stored group's alone: a facts-classified row serves its exit with
+    /// `settleSigners` null and `signersPending` true, never a guessed signer set.
+    mod fix997 {
+        use super::*;
+
+        /// (a) THE DIFFERENTIAL PIN WITH THE JANITOR'S LATCH SKIPPED: the found refund, `verdict` NULL; the actor
+        /// and D1 store the same rows byte for byte, `payout refund claimable` on both, `settleSigners` null and
+        /// `signersPending` true; after the latch both serve the stored group (`unresolved`) and no pending mark.
+        /// RED on main: the actor `unbound` "the spend is not classified yet (no verdict)" against D1's payout.
+        #[tokio::test]
+        async fn fix997_a_the_actor_classifies_an_unlatched_spend_from_its_facts_as_d1_does() {
+            let (f, pot, refund, _, _) = discovered_refund_fixture();
+            let d1 = d1_judge(&f).await;
+            let (a, b) = (id_a(), id_b());
+            let key = format!("{pot}:0");
+            for id in [&a, &b] {
+                let (actor, _) = actor_judge(&d1, id).await;
+                assert_eq!(
+                    stored(&actor, id),
+                    stored(&d1, id),
+                    "byte for byte, no latch"
+                );
+                assert_eq!(digest(&actor, id).await, digest(&d1, id).await);
+                let row = row_of(&actor, id, &key).expect("the actor holds the pot's row");
+                assert_eq!(
+                    (
+                        row.0.as_str(),
+                        row.1,
+                        row.2["verdict"].clone(),
+                        row.2["outcome"].clone(),
+                        row.2["settleSigners"].clone(),
+                        row.2["signersPending"].clone(),
+                    ),
+                    (
+                        "payout",
+                        Some(1),
+                        json!("refund"),
+                        json!("refund"),
+                        Value::Null,
+                        json!(true)
+                    ),
+                    "the exit from facts, the signers pending the store: {row:?}"
+                );
+            }
+            // the latch: the stored group is served, nothing pending, both sides equal
+            assert_eq!(janitor_latch(&d1), vec![(pot.clone(), refund.clone())]);
+            for id in [&a, &b] {
+                for chunk in games_of(&d1, id).chunks(16) {
+                    crate::owed_judge::judge_subjects(&d1, id, chunk, "d1")
+                        .await
+                        .unwrap();
+                }
+                let (actor, _) = actor_judge(&d1, id).await;
+                assert_eq!(stored(&actor, id), stored(&d1, id));
+                let row = row_of(&actor, id, &key).unwrap();
+                assert_eq!(
+                    (
+                        row.2["settleSigners"].clone(),
+                        row.2["signersPending"].clone()
+                    ),
+                    (json!("unresolved"), Value::Null),
+                    "{row:?}"
+                );
+            }
+        }
+
+        /// (b) THE `spentHeight`-NULL CLASS: a confirmed spend with its stored group current and its proven height
+        /// absent from the row, the spender's verified BEEF carrying a bump: both judges serve the bump's height
+        /// (`atHeight`) and equal rows. RED on main: the actor's `atHeight` null against D1's bump height.
+        #[tokio::test]
+        async fn fix997_b_a_null_spent_height_reads_the_bumps_height_on_both_sides() {
+            let p = params();
+            let made = (NOW_MS / 1000) as i64 - 7_200;
+            let pot = h("cb", 0x88);
+            let game = h("9a", 0x88);
+            let refund = refund_tx(&p, &pot);
+            let r = refund.id();
+            let mut seed = vec![pot_row_sql(
+                &p,
+                &pot,
+                &r,
+                made,
+                Some(("refund", "unresolved")),
+            )];
+            seed.push(format!(
+                "UPDATE pot_records SET spentHeight=NULL WHERE txid='{pot}'"
+            ));
+            seed.extend(party_rows_sql(&p, &game, &pot, made));
+            seed.push(format!(
+                "INSERT INTO pot_beefs(txid,beef,createdAt,has_proof,proof_verified,proofHeight) VALUES ('{r}',x'{}',{},1,1,{SPENT_HEIGHT})",
+                beef_hex(&refund, SPENT_HEIGHT),
+                made + 3_700
+            ));
+            let f = Fixture {
+                name: "fix997 a confirmed spend whose spentHeight is NULL",
+                seed,
+                identities: vec![id_a(), id_b()],
+            };
+            let d1 = d1_judge(&f).await;
+            let key = format!("{pot}:0");
+            for id in [id_a(), id_b()] {
+                let (actor, _) = actor_judge(&d1, &id).await;
+                let at: Option<i64> = d1
+                    .conn
+                    .query_row(
+                        "SELECT atHeight FROM owed_rows WHERE identity=?1 AND outpoint=?2",
+                        [&id, &key],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(at, Some(SPENT_HEIGHT as i64), "D1 reads the bump's height");
+                assert_eq!(
+                    stored(&actor, &id),
+                    stored(&d1, &id),
+                    "the actor reads it from facts"
+                );
+                assert_eq!(digest(&actor, &id).await, digest(&d1, &id).await);
+            }
+        }
+
+        /// (c) THE FACTS' SHAPE AND THE VERSION: the decoded spender carries the classifier's whole input (its
+        /// inputs with their sequences, its outputs with their scripts, its lock time) and its bump's height, round
+        /// trip through the mirror's JSON; facts written before the move parse with neither (the classifier then
+        /// answers nothing, as before, until the closure re-decodes them). `JUDGE_VERSION` moved once; the actor's
+        /// own tables' version (the schema digest's part) does not move: the `txfacts` row is JSON text.
+        #[test]
+        fn fix997_c_the_facts_carry_the_classifiers_input_and_the_version_moved() {
+            let p = params();
+            let pot = h("cc", 0x89);
+            let refund = refund_tx(&p, &pot);
+            let f = crate::owed_judge::facts_of_beefs(
+                &refund.id(),
+                [beef_hex(&refund, SPENT_HEIGHT).as_str()],
+            )
+            .expect("the BEEF carries the refund");
+            assert_eq!(
+                f.raw,
+                overlay_discovery::pot::RawTx::from_transaction(&refund),
+                "the classifier's input, whole"
+            );
+            assert_eq!(f.raw.as_ref().unwrap().lock_time, p.recovery_height as u32);
+            assert_eq!(f.raw.as_ref().unwrap().inputs[0].sequence, 0xffff_fffe);
+            assert_eq!(f.bump_height, Some(SPENT_HEIGHT));
+            let back = crate::owed_judge::TxFacts::from_json(&f.to_json()).unwrap();
+            assert_eq!(back, f, "round trip through the mirror's JSON");
+            let mut old = f.to_json();
+            old.as_object_mut().unwrap().remove("raw");
+            old.as_object_mut().unwrap().remove("bumpHeight");
+            let old =
+                crate::owed_judge::TxFacts::from_json(&old).expect("pre-move facts still parse");
+            assert_eq!((old.raw, old.bump_height), (None, None));
+            assert_eq!(old.inputs, f.inputs);
+            assert_eq!(JUDGE_VERSION, "fix997-2026-10-30", "moved once by FIX-997");
+            assert_eq!(ACTOR_TABLES_VERSION, "applied-per-game-1", "no table moves");
+        }
     }
 }

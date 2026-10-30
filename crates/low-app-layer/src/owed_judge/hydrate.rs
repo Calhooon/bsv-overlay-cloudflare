@@ -255,6 +255,9 @@ pub(crate) async fn hydrate_filings(
         .await?;
         hop_rows.extend(rows.into_iter().map(routes::HopsViewRowD1::into_row));
     }
+    for r in &mut result_rows {
+        decode_result_row(db, r).await?;
+    }
     let words: Vec<_> = result_rows
         .iter()
         .filter_map(|r| r.spending_txid.clone())
@@ -1036,17 +1039,36 @@ pub enum FactsFrom {
 /// The facts of one transaction the judge reads: its inputs (lowercase `txid`, vout) and its outputs as
 /// `routes::spender_outputs_of` reads them (no spend word). The D1 judge decodes them from the stored BEEF at each
 /// read; the actor (`owed_actor`) keeps them decoded and never holds the bytes.
+///
+/// FIX-997 (bsv-low #997, READ-986 item 2(a)): `raw` is the classifier's whole input (`overlay_discovery`'s `RawTx`:
+/// each input's outpoint and SEQUENCE, each output's satoshis and LOCKING SCRIPT, the LOCK TIME), so the results
+/// view classifies a spend whose verdict is not stored from the facts (`results::DecodedTx`) on both judges, and
+/// `bump_height` the height of the BUMP the BEEF carries for it (structural: served only under the row's verified
+/// latch, as `results::verified_beef_block_height`). Facts written before the move carry neither (`None`): the
+/// classifier answers nothing for them, as before, until the closure decodes the BEEF again. WHO SIGNED is not a
+/// fact (the BIP-143 digest needs the raw bytes): a facts-classified row's signers are the stored group's alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxFacts {
     pub inputs: Vec<(String, u32)>,
     pub outputs: Vec<owed::SpenderOutput>,
+    pub raw: Option<overlay_discovery::pot::RawTx>,
+    pub bump_height: Option<u64>,
 }
 impl TxFacts {
     pub fn of_tx(tx: &bsv_rs::transaction::Transaction) -> Self {
         Self {
             inputs: routes::spender_inputs_of(tx),
             outputs: routes::spender_outputs_of(tx),
+            raw: overlay_discovery::pot::RawTx::from_transaction(tx),
+            bump_height: None,
         }
+    }
+    /// FIX-997: the results view's decoded form of this transaction (`None` for facts written before the move).
+    pub fn decoded(self) -> Option<crate::results::DecodedTx> {
+        Some(crate::results::DecodedTx {
+            raw: self.raw?,
+            bump_height: self.bump_height,
+        })
     }
     /// `owed::join_spends_outpoint`'s answer over the decoded inputs.
     pub fn spends(&self, hop: &str, vout: u32) -> bool {
@@ -1062,9 +1084,46 @@ impl TxFacts {
         )
     }
     pub fn to_json(&self) -> Value {
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "inputs": self.inputs.iter().map(|(t, v)| serde_json::json!([t, v])).collect::<Vec<_>>(),
             "outputs": self.outputs.iter().map(|o| serde_json::json!([o.vout, o.pkh_hex, o.sats, o.pot_lock])).collect::<Vec<_>>(),
+        });
+        if let Some(raw) = &self.raw {
+            v["raw"] = serde_json::json!({
+                "inputs": raw.inputs.iter().map(|i| serde_json::json!([i.prev_txid, i.prev_vout, i.sequence])).collect::<Vec<_>>(),
+                "outputs": raw.outputs.iter().map(|(sats, lock)| serde_json::json!([sats, hex::encode(lock)])).collect::<Vec<_>>(),
+                "lockTime": raw.lock_time,
+            });
+        }
+        if let Some(h) = self.bump_height {
+            v["bumpHeight"] = serde_json::json!(h);
+        }
+        v
+    }
+    /// FIX-997: the `raw` part of [`TxFacts::to_json`]; absent (facts written before the move) is `None`, a
+    /// malformed one too (never a partial classifier input).
+    fn raw_of_json(v: &Value) -> Option<overlay_discovery::pot::RawTx> {
+        let r = v.get("raw")?;
+        let inputs = r["inputs"]
+            .as_array()?
+            .iter()
+            .map(|i| {
+                Some(overlay_discovery::pot::RawInput {
+                    prev_txid: i[0].as_str()?.to_string(),
+                    prev_vout: u32::try_from(i[1].as_u64()?).ok()?,
+                    sequence: u32::try_from(i[2].as_u64()?).ok()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let outputs = r["outputs"]
+            .as_array()?
+            .iter()
+            .map(|o| Some((o[0].as_u64()?, hex::decode(o[1].as_str()?).ok()?)))
+            .collect::<Option<Vec<_>>>()?;
+        Some(overlay_discovery::pot::RawTx {
+            inputs,
+            outputs,
+            lock_time: u32::try_from(r["lockTime"].as_u64()?).ok()?,
         })
     }
     pub fn from_json(v: &Value) -> Option<Self> {
@@ -1086,8 +1145,38 @@ impl TxFacts {
                 })
             })
             .collect::<Option<Vec<_>>>()?;
-        Some(Self { inputs, outputs })
+        Some(Self {
+            inputs,
+            outputs,
+            raw: Self::raw_of_json(v),
+            bump_height: v["bumpHeight"].as_u64(),
+        })
     }
+}
+
+/// FIX-997 (bsv-low #997, READ-986 item 2(a)): the results view's two BEEF columns served from the transactions'
+/// FACTS on both judges. Where the view selected a BEEF (`fundingBeef` for a row with no decoded params,
+/// `spenderBeef` where the stored verdict is not current or the proven height is missing, both `pot_beefs`), the
+/// judge reads that transaction's facts from the same table (`FactsFrom::PotBeefs`: the D1 judge decodes the BEEF at
+/// the read, the actor serves its mirror's `txfacts`, decoded at the copy) into `results::DecodedTx` and drops the
+/// hex, so the classification and the bump's height are one function of one decode on both sides. A transaction
+/// the BEEF does not carry whole decodes to nothing, as its hex did.
+async fn decode_result_row(db: &impl JudgeDb, r: &mut results::ResultsRow) -> Result<(), String> {
+    if r.spender_beef_hex.take().is_some() {
+        if let Some(s) = r.spending_txid.as_deref() {
+            r.spender_decoded = db
+                .tx_facts(&s.to_ascii_lowercase(), FactsFrom::PotBeefs)
+                .await?
+                .and_then(TxFacts::decoded);
+        }
+    }
+    if r.funding_beef_hex.take().is_some() {
+        r.funding_decoded = db
+            .tx_facts(&r.pot_txid.to_ascii_lowercase(), FactsFrom::PotBeefs)
+            .await?
+            .and_then(TxFacts::decoded);
+    }
+    Ok(())
 }
 
 /// The SQL a stored transaction's BEEFs are read by, in `FactsFrom`'s order.
@@ -1105,8 +1194,19 @@ pub fn facts_of_beefs<'a>(txid: &str, beefs: impl IntoIterator<Item = &'a str>) 
             )
             .ok()
         })
-        .find_map(|b| b.find_txid(txid).and_then(|t| t.tx().cloned()))
-        .map(|tx| TxFacts::of_tx(&tx))
+        .find_map(|b| {
+            let btx = b.find_txid(txid)?;
+            let tx = btx.tx().cloned()?;
+            // FIX-997: the height of the bump the BEEF carries for it (as `results::beef_block_height` reads it)
+            let bump_height = btx
+                .bump_index()
+                .and_then(|i| b.bumps.get(i))
+                .map(|m| u64::from(m.block_height));
+            Some(TxFacts {
+                bump_height,
+                ..TxFacts::of_tx(&tx)
+            })
+        })
 }
 
 pub(super) async fn stored_tx_facts(
