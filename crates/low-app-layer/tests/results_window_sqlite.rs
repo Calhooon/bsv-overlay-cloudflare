@@ -841,6 +841,8 @@ fn query_results_rows(conn: &Connection, identity: &str) -> Vec<ResultsRow> {
             spender_fee_sats: None,
             spender_pay_a_sats: None,
             spender_pay_b_sats: None,
+            funding_decoded: None,
+            spender_decoded: None,
         })
     })
     .unwrap()
