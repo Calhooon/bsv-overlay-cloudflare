@@ -458,6 +458,70 @@
       },
       "censusKey": null
     },
+    "owed-fleet-compare-tick": {
+      "route": "POST /internal/owed-actor-compare {\"tick\": true}: one tick of the standing fresh compare's ring (FIX-986-COMPARE-2, bsv-low #986, READ-986 item 4) over the belt tier's seed after its cells: the ring's state and the Phase C flip read, the identity page walked by index seeks (RING_IDENTITIES_SQL; the union page it replaced read 555 rows here), 2 hex identities, each recorded as a fault (the tier binds no owed actor: no fresh judgement is made for an identity the ring cannot compare), each row written with the cursor, the revolution wrapped. A production tick's fresh judgement per identity is the `owed-actor-rows-fresh` cell's",
+      "measured": {
+        "reads": 60,
+        "writes": 8,
+        "stmts": 9,
+        "maxReads": 56
+      },
+      "ceiling": {
+        "reads": 90,
+        "writes": 12,
+        "stmts": 14,
+        "maxReads": 84
+      },
+      "censusKey": null
+    },
+    "owed-fleet-compare-one": {
+      "route": "POST /internal/owed-actor-compare {\"identity\"}: the lived-in seat re-compared now; no owed actor bound in the tier, so its row is the fault with no judgement, one upsert (FIX-986-COMPARE-2)",
+      "measured": {
+        "reads": 1,
+        "writes": 1,
+        "stmts": 1,
+        "maxReads": 1
+      },
+      "ceiling": {
+        "reads": 2,
+        "writes": 2,
+        "stmts": 2,
+        "maxReads": 2
+      },
+      "censusKey": null
+    },
+    "owed-actor-rows-fresh": {
+      "route": "GET /internal/owed-actor-rows?identity=<the lived-in seat>: the operator's route judges D1 FRESH (FIX-986-COMPARE-2, READ-986 item 1): one batch of its reads (the stored rows, the judged-under stamp, the pending marks, the identity's games, the Phase C flip), then the D1 judge's hydration of 64 of the seat's 270 games (partial) in four hydrations of 16, writing nothing; what one identity of the ring costs in production",
+      "measured": {
+        "reads": 6849,
+        "writes": 0,
+        "stmts": 341,
+        "maxReads": 2311
+      },
+      "ceiling": {
+        "reads": 10274,
+        "writes": 1,
+        "stmts": 512,
+        "maxReads": 3467
+      },
+      "censusKey": null
+    },
+    "owed-fleet-compare-read": {
+      "route": "GET /internal/owed-actor-compare: the standing compare's three reads (the fleet's aggregate, a page of 64 rows worth naming, the ring's state) (FIX-986-COMPARE-2)",
+      "measured": {
+        "reads": 5,
+        "writes": 0,
+        "stmts": 3,
+        "maxReads": 2
+      },
+      "ceiling": {
+        "reads": 8,
+        "writes": 1,
+        "stmts": 5,
+        "maxReads": 3
+      },
+      "censusKey": null
+    },
     "owed-backfill-evidence": {
       "route": "POST /internal/owed-backfill-pass?evidence=1 (lane D2-OWED-FOLD-8): the owed-v2 backfill's evidence phase alone, over the seed's ten open evictions made before the eviction writer (the captured beta pair 13 with its JOIN's bytes: two evidence rows by the writer's own statements; the synthetic JOIN with none: its two released hops named for two verified seats, four missing-evidence rows; eight noise evictions with no verified seat: nothing written), one page, the cursor saved in each eviction's batch, the done mark. Per open eviction: 17.1 reads, 5.9 writes, 5.8 statements",
       "measured": {

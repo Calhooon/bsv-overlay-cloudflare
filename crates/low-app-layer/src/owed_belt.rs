@@ -1415,6 +1415,24 @@ pub async fn arm(env: &worker::Env) -> worker::Result<()> {
     Ok(())
 }
 
+/// FIX-986 (READ-986 item 4): the fleet compare's ring actor (`owed_actor::compare::FLEET_COMPARE_ACTOR`) asked to
+/// keep its alarm, as [`arm`] asks the belt's.
+pub async fn arm_fleet_compare(env: &worker::Env) -> worker::Result<()> {
+    let stub = env
+        .durable_object("BOARD_VIEW")?
+        .id_from_name(crate::owed_actor::compare::FLEET_COMPARE_ACTOR)?
+        .get_stub()?;
+    let response = stub
+        .fetch_with_str("https://board-view/owed-fleet-compare-arm")
+        .await?;
+    if response.status_code() != 200 {
+        return Err(worker::Error::RustError(
+            "owed fleet compare arm refused".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// The scheduled pass's drain runs in the very same actor as the alarm's. The actor serializes both turns.
 pub async fn drain(env: &worker::Env) -> worker::Result<()> {
     let mut response = env

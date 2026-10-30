@@ -841,26 +841,7 @@ pub async fn judge_with_write_bounded(
         if &i.identity != id {
             return Err("filing changed the judgement identity".into());
         }
-        let mut rows = derive_owed_rows(&i.as_inputs());
-        rows.retain(|r| games.contains(&r.game_id));
-        crate::owed::merge_markerless_faults(
-            &mut rows,
-            i.markerless_faults
-                .iter()
-                .filter(|f| games.contains(&f.game_id))
-                .cloned()
-                .collect(),
-        );
-        // The old walk's display marks after its derivation, in its order (the walk-against-judge pin holds them).
-        for row in &mut rows {
-            crate::routes::mark_pending_spender(row, None, i.now_ms);
-        }
-        crate::hops_view::mark_refused_word_rows(&mut rows, &i.refused_words, &i.proofs_set_aside);
-        crate::hops_view::mark_reorg_grace_rows(&mut rows, &i.grace_words);
-        hydrate::finish_rows(db, &mut rows).await?;
-        crate::owed::sort_rows_for_service(&mut rows);
-        let cut = rows.len() > crate::owed::OWED_MAX_ROWS;
-        rows.truncate(crate::owed::OWED_MAX_ROWS);
+        let (rows, cut) = judged_rows(db, i, games).await?;
         plan.push(Stmt {
             sql: GAME_DELETE_SQL.into(),
             binds: vec![Bind::Text(id.clone()), Bind::Text(json!(games).to_string())],
@@ -944,6 +925,138 @@ pub async fn judge_with_write_bounded(
     }))
     .await;
     Ok(report)
+}
+
+/// The rows the judge derives for `games` of `i` (its subjects alone), in service order, cut at
+/// [`crate::owed::OWED_MAX_ROWS`] (`true` when cut). ONE derivation: the judge's write ([`judge_with_write_bounded`])
+/// and its fresh judgement without a write ([`judge_fresh_rows`], FIX-986) both call it.
+pub(crate) async fn judged_rows(
+    db: &impl JudgeDb,
+    i: &JudgeInputs,
+    games: &[String],
+) -> Result<(Vec<OwedRow>, bool), String> {
+    let mut rows = derive_owed_rows(&i.as_inputs());
+    rows.retain(|r| games.contains(&r.game_id));
+    crate::owed::merge_markerless_faults(
+        &mut rows,
+        i.markerless_faults
+            .iter()
+            .filter(|f| games.contains(&f.game_id))
+            .cloned()
+            .collect(),
+    );
+    // The old walk's display marks after its derivation, in its order (the walk-against-judge pin holds them).
+    for row in &mut rows {
+        crate::routes::mark_pending_spender(row, None, i.now_ms);
+    }
+    crate::hops_view::mark_refused_word_rows(&mut rows, &i.refused_words, &i.proofs_set_aside);
+    crate::hops_view::mark_reorg_grace_rows(&mut rows, &i.grace_words);
+    hydrate::finish_rows(db, &mut rows).await?;
+    crate::owed::sort_rows_for_service(&mut rows);
+    let cut = rows.len() > crate::owed::OWED_MAX_ROWS;
+    rows.truncate(crate::owed::OWED_MAX_ROWS);
+    Ok((rows, cut))
+}
+
+/// The columns of the judge's row write (`row_statements`' first statement), in its bind order.
+const ROW_WRITE_COLUMNS: [&str; 15] = [
+    "identity",
+    "outpoint",
+    "family",
+    "gameId",
+    "sats",
+    "opponentIdentity",
+    "atHeight",
+    "facts",
+    "updatedAtMs",
+    "reason",
+    "judgedAtMs",
+    "claimable",
+    "gateHeight",
+    "beltDueAtMs",
+    "probeTip",
+];
+
+/// PURE (FIX-986): the row exactly as the judge's write would store it, in the shape `owed_actor::ROWS_SQL` reads a
+/// stored row (its columns; `updatedAtMs` is not among them): built from the write's OWN binds (`row_statements`),
+/// so a fresh judgement and a stored one are one spelling.
+pub fn stored_row_of(
+    row: &OwedRow,
+    stamp: i64,
+    judged_tip: Option<u64>,
+    evidence: Option<&JudgeInputs>,
+) -> Value {
+    let write = row_statements(row, stamp, judged_tip, evidence);
+    let mut out = serde_json::Map::new();
+    for (col, bind) in ROW_WRITE_COLUMNS.iter().zip(&write[0].binds) {
+        if *col == "updatedAtMs" {
+            continue;
+        }
+        out.insert(
+            (*col).to_string(),
+            match bind {
+                Bind::Text(t) => json!(t),
+                Bind::Int(n) => json!(n),
+                Bind::Null => Value::Null,
+            },
+        );
+    }
+    Value::Object(out)
+}
+
+/// FIX-986 (bsv-low #986, READ-986 item 1): THE D1 JUDGE'S FRESH JUDGEMENT OF `games`, WRITING NOTHING. The judge's
+/// own hydration and derivation ([`judged_rows`], 16 games a hydration as every judge call), each row as the write
+/// would store it ([`stored_row_of`]), ranked at the identity's ceiling as `CEILING_DELETE_SQL` ranks it and sorted by
+/// outpoint as `owed_actor::ROWS_SQL` reads them: the D1 side of the operator's compare, where D1's STORED rows
+/// (Phase C leaves them with no writer) are a snapshot, never a judgement. No mark is read or acknowledged, no state
+/// row, no push.
+pub async fn judge_fresh_rows(
+    db: &impl JudgeDb,
+    identity: &str,
+    games: &[String],
+) -> Result<Vec<Value>, String> {
+    let identity = identity.to_ascii_lowercase();
+    let mut games: Vec<String> = games.iter().map(|g| g.to_ascii_lowercase()).collect();
+    games.sort();
+    games.dedup();
+    let mut ranked: Vec<Value> = Vec::new();
+    for chunk in games.chunks(OWED_JUDGE_SUBJECTS_PER_INVOCATION) {
+        let chunk = chunk.to_vec();
+        let i = db.hydrate(&identity, &chunk).await?;
+        let (rows, _) = judged_rows(db, &i, &chunk).await?;
+        for row in rows {
+            let stored = stored_row_of(&row, i.now_ms, i.tip, Some(&i));
+            ranked.retain(|s| s["outpoint"] != stored["outpoint"]);
+            ranked.push(stored);
+        }
+    }
+    // `CEILING_DELETE_SQL`'s order: family, atHeight descending, outpoint; the first 500 stand.
+    let family_rank = |f: &str| match f {
+        "payout" => 0,
+        "refund-due" => 1,
+        "hop-stranded" => 2,
+        "in-progress" => 3,
+        _ => 4,
+    };
+    ranked.sort_by(|a, b| {
+        let key = |r: &Value| {
+            (
+                family_rank(r["family"].as_str().unwrap_or_default()),
+                std::cmp::Reverse(r["atHeight"].as_i64().unwrap_or(0)),
+                r["outpoint"].as_str().unwrap_or_default().to_string(),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+    ranked.truncate(crate::owed::OWED_MAX_ROWS);
+    let mut out = ranked;
+    out.sort_by(|a, b| {
+        a["outpoint"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["outpoint"].as_str().unwrap_or_default())
+    });
+    Ok(out)
 }
 
 /// The spender a row names, in the belt's order (`owed_belt::ask_of`).
@@ -1143,6 +1256,12 @@ pub const IDENTITY_GAMES_AFTER_SQL: &str = concat!(
     "SELECT gameId,at FROM (SELECT gameId,COALESCE(at,0) AS at FROM (",
     identity_games!(),
     ")) WHERE at<?2 OR (at=?2 AND gameId>?3) ORDER BY at DESC,gameId LIMIT 32"
+);
+/// FIX-986 (bsv-low #986): every game of an identity, newest first, at most `?2` (the fresh compare's pick).
+pub const IDENTITY_GAMES_NEWEST_SQL: &str = concat!(
+    "SELECT gameId FROM (",
+    identity_games!(),
+    " LIMIT ?2) WHERE 1"
 );
 /// bsv-low #912 (MEDIUM-9, the `owed-v3` re-judge): an identity's games past `?2` in game order, `?3` a page.
 pub const IDENTITY_GAMES_BY_ID_SQL: &str = concat!(

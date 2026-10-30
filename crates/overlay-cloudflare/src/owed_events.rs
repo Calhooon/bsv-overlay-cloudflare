@@ -720,7 +720,40 @@ pub async fn publish_before_answer(env: &worker::Env, frames: Vec<Value>) -> Vec
 /// `owed_belt_state`'s primary key, the pairs and subjects whose judge faulted), and the parked letters by status (at
 /// most [`DEAD_LETTERS_MAX`] rows). These were five statements of the app layer's `/health` (the budget tier's
 /// `health-dirty-snapshot` red); the app layer's `/health.owedEvents` keeps the ages only.
-pub const HEALTH_STATE_SQL: &str = "SELECT (SELECT cursor FROM owed_belt_state WHERE name='owed-events:consumer') AS consumer,(SELECT json_object('rows',COUNT(*),'held',COALESCE(SUM(json_extract(cursor,'$.heldUntilMs')>?1),0),'maxFaults',MAX(json_extract(cursor,'$.faults'))) FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;') AS memo,(SELECT json_object('name',name,'cursor',json(cursor)) FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;' ORDER BY tickedAtMs DESC LIMIT 1) AS lastMemo,(SELECT json_group_object(status,n) FROM (SELECT status,COUNT(*) AS n FROM owed_event_dead_letters GROUP BY status)) AS letters";
+pub const HEALTH_STATE_SQL: &str = "SELECT (SELECT cursor FROM owed_belt_state WHERE name='owed-events:consumer') AS consumer,(SELECT json_object('rows',COUNT(*),'held',COALESCE(SUM(json_extract(cursor,'$.heldUntilMs')>?1),0),'maxFaults',MAX(json_extract(cursor,'$.faults'))) FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;') AS memo,(SELECT json_object('name',name,'cursor',json(cursor)) FROM owed_belt_state WHERE name>='owed-events:fault:' AND name<'owed-events:fault;' ORDER BY tickedAtMs DESC LIMIT 1) AS lastMemo,(SELECT json_group_object(status,n) FROM (SELECT status,COUNT(*) AS n FROM owed_event_dead_letters GROUP BY status)) AS letters,(SELECT json_object('identities',COUNT(*),'diffs',COALESCE(SUM(diffCount>0),0),'heldByLag',COALESCE(SUM(heldByLagCount>0),0),'faults',COALESCE(SUM(fault IS NOT NULL),0),'oldest',MIN(comparedAtMs)) FROM owed_actor_compare) AS fleetCompare";
+
+/// FIX-986 (bsv-low #986, READ-986 item 4; migration 474): the app layer's standing compare of each identity's owed
+/// actor against a FRESH D1 judgement (`low-app-layer` `owed_actor::compare`), one row per identity, written by its
+/// ring (a bounded page a minute) and its one-identity lever: the differences no pending mark holds (`diffCount`),
+/// those one holds (`heldByLagCount`), the stored D1 rows the fresh judgement moved (`staleD1Count`), the tip lags, the
+/// differing outpoints with their fields (JSON, at most 32), both digests, or the compare's fault. Served counts on
+/// `/health/invariants.owedActor.fleetCompare` ([`HEALTH_STATE_SQL`]'s `fleetCompare`).
+pub const ACTOR_COMPARE_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_actor_compare (identity TEXT PRIMARY KEY, comparedAtMs INTEGER NOT NULL, diffCount INTEGER, heldByLagCount INTEGER, staleD1Count INTEGER, tipLagCount INTEGER, outpoints TEXT NOT NULL DEFAULT '[]', d1Digest TEXT, actorDigest TEXT, fault TEXT, partial INTEGER NOT NULL DEFAULT 0)";
+
+/// PURE (FIX-986): `/health/invariants.owedActor.fleetCompare` from [`HEALTH_STATE_SQL`]'s `fleetCompare` column
+/// (`{identities, diffs, heldByLag, faults, oldest}`): the identities compared, those differing, those a pending mark
+/// holds, the faults, and the oldest compare's age.
+pub fn fleet_compare_view(row: &Value, now: i64) -> Value {
+    let v: Value = row["fleetCompare"]
+        .as_str()
+        .and_then(|c| serde_json::from_str(c).ok())
+        .unwrap_or(Value::Null);
+    let n = |k: &str| {
+        v[k].as_i64()
+            .or_else(|| v[k].as_f64().map(|f| f as i64))
+            .unwrap_or(0)
+    };
+    let oldest = v["oldest"]
+        .as_i64()
+        .or_else(|| v["oldest"].as_f64().map(|f| f as i64));
+    json!({
+        "identities": n("identities"),
+        "diffs": n("diffs"),
+        "heldByLag": n("heldByLag"),
+        "faults": n("faults"),
+        "oldestCompareAgeMs": oldest.map(|o| now.saturating_sub(o)),
+    })
+}
 
 /// The served view of one [`HEALTH_STATE_SQL`] row: `{consumer, faultMemo {rows, held, maxFaults, last}, deadLetters}`.
 pub fn health_state_view(row: &Value) -> Value {

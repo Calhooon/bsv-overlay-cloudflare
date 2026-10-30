@@ -1326,6 +1326,17 @@
    "why": "never the only copy of the intent: the letter's marks stay in owed_dirty and the un-acked sweep re-publishes them; a lost row loses an operator's view only"
   },
   {
+   "name": "owed_actor_compare",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {"overlay-cloudflare": ["CREATE"]},
+   "readers": ["overlay-cloudflare"],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the standing fresh compare of each identity's owed actor (bsv-low #986, FIX-986-COMPARE-2, READ-986 item 4): one row per identity, the actor's stored rows against the D1 judge's FRESH judgement of its games (nothing written by that judgement), the differences no pending mark holds, those one holds, the stored D1 rows the fresh judgement moved, the tip lags, at most 32 differing outpoints with their fields, both digests or the compare's fault; written by the app layer's ring (its own actor's minute alarm, a bounded page) and its one-identity lever (`POST /internal/owed-actor-compare`), the rows a revolution did not refresh dropped at its end; read by `GET /internal/owed-actor-compare` and the overlay's `/health/invariants.owedActor.fleetCompare` counts",
+   "why": "a measurement, re-derived by the next revolution of the ring (about ten minutes on beta): transient"
+  },
+  {
    "name": "submit_refusals",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",
