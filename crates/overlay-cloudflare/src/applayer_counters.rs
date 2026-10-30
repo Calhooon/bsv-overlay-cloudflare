@@ -154,6 +154,29 @@ pub const OWED_ACTOR: [&str; 32] = [
     "owed_d1_rejudge_faults_total",
 ];
 
+/// bsv-low #986 (migration 474): the app layer's fleet compare, one row per actor identity, written by its ring (one
+/// step a minute on its own actor's alarm, a fresh D1 judgement of every game each) and its hand lever
+/// (`POST /internal/owed-actor-compare`); pruned of identities that left the registry at each revolution's end.
+pub const OWED_ACTOR_COMPARE_CREATE: &str = "CREATE TABLE IF NOT EXISTS owed_actor_compare (identity TEXT PRIMARY KEY, comparedAtMs INTEGER NOT NULL, diffCount INTEGER, heldByLagCount INTEGER NOT NULL DEFAULT 0, tipLagCount INTEGER NOT NULL DEFAULT 0, outpoints TEXT NOT NULL DEFAULT '[]', d1Digest TEXT, actorDigest TEXT, games INTEGER NOT NULL DEFAULT 0, gamesCut INTEGER NOT NULL DEFAULT 0, error TEXT)";
+/// `/health/invariants.owedActor.fleetCompare`'s counts, one statement (the app layer's summary reads the same
+/// counts, `owed_actor::compare::SUMMARY_SQL`).
+pub const FLEET_COMPARE_SQL: &str = "SELECT COUNT(*) AS identities,COALESCE(SUM(CASE WHEN diffCount>0 AND heldByLagCount=0 THEN 1 ELSE 0 END),0) AS diffs,COALESCE(SUM(CASE WHEN heldByLagCount>0 THEN 1 ELSE 0 END),0) AS heldByLag,MIN(comparedAtMs) AS oldestAtMs FROM owed_actor_compare";
+
+/// PURE: `fleetCompare` {`identities`, `diffs`, `heldByLag`, `oldestCompareAgeMs`} over [`FLEET_COMPARE_SQL`]'s row
+/// (`null` age with no row).
+pub fn fleet_compare_view(row: &serde_json::Value, now: i64) -> serde_json::Value {
+    let n = |k: &str| {
+        row.get(k)
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+    };
+    serde_json::json!({
+        "identities": n("identities").unwrap_or(0),
+        "diffs": n("diffs").unwrap_or(0),
+        "heldByLag": n("heldByLag").unwrap_or(0),
+        "oldestCompareAgeMs": n("oldestAtMs").map(|o| now.saturating_sub(o).max(0)),
+    })
+}
+
 /// bsv-low #912: `/health/invariants.owedActor`, the actor's durable totals: the Phase A compares and their diffs,
 /// its faults, the writers' direct calls, the sampled digest reconcile (64 identities a day on the belt's alarm) and
 /// Phase C's belt questions.

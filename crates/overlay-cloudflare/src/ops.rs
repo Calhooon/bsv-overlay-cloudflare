@@ -1993,6 +1993,8 @@ pub async fn health_invariants(
         applayer_pass = applayer_scheduled_pass_view(db),
         chain_feed = crate::chain_feed::health_json(db),
         owed_events_consumer = owed_events_consumer_view(db, now),
+        fleet_compare = Query::new(crate::applayer_counters::FLEET_COMPARE_SQL)
+            .fetch_optional::<serde_json::Value>(db),
     }
 
     let hb: Option<HeartbeatRow> = hb.ok().flatten();
@@ -2169,6 +2171,12 @@ pub async fn health_invariants(
     body["owedBelt"] = crate::applayer_counters::owed_belt_view(&counters);
     // bsv-low #912: the app layer's owed actor, its compares, direct calls, sampled reconcile and belt questions.
     body["owedActor"] = crate::applayer_counters::owed_actor_view(&counters);
+    // bsv-low #986: the fleet compare's counts (the app layer's ring and hand lever write the rows); `readable: false`
+    // = the table is unreadable (before migration 474).
+    body["owedActor"]["fleetCompare"] = match fleet_compare {
+        Ok(row) => crate::applayer_counters::fleet_compare_view(&row.unwrap_or_default(), now),
+        Err(e) => json!({ "readable": false, "fault": e }),
+    };
     // bsv-low #935: the app layer's first-party pushes, coalesced per seat under the relay's send budget.
     body["push"] = crate::applayer_counters::push_view(&counters);
     // bsv-low #781, #778 (B-FLEET-4): the app layer's last scheduled pass, its wall and each phase's wall, as the

@@ -1326,6 +1326,17 @@
    "why": "never the only copy of the intent: the letter's marks stay in owed_dirty and the un-acked sweep re-publishes them; a lost row loses an operator's view only"
   },
   {
+   "name": "owed_actor_compare",
+   "database": "low-overlay-db",
+   "owner": "low-app-layer",
+   "writers": {"overlay-cloudflare": ["CREATE"]},
+   "readers": ["overlay-cloudflare"],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the fleet compare (bsv-low #986, the owner's ruling of record 1565): one row per actor identity, its last compare of the actor's stored rows against a fresh D1 judgement (diff, held-by-lag and tip-lag counts, up to 32 differing outpoints, both digests, the games judged and cut, the actor's error), written by the app layer's ring (one step a minute on its own BOARD_VIEW actor's alarm) and its hand lever (POST /internal/owed-actor-compare); a revolution's end deletes the rows its compares did not write; served by GET /internal/owed-actor-compare and, counts only, /health/invariants.owedActor.fleetCompare",
+   "why": "a measurement only: the next revolution writes every row again from the record and the actors"
+  },
+  {
    "name": "submit_refusals",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",

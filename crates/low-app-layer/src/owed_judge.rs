@@ -841,26 +841,7 @@ pub async fn judge_with_write_bounded(
         if &i.identity != id {
             return Err("filing changed the judgement identity".into());
         }
-        let mut rows = derive_owed_rows(&i.as_inputs());
-        rows.retain(|r| games.contains(&r.game_id));
-        crate::owed::merge_markerless_faults(
-            &mut rows,
-            i.markerless_faults
-                .iter()
-                .filter(|f| games.contains(&f.game_id))
-                .cloned()
-                .collect(),
-        );
-        // The old walk's display marks after its derivation, in its order (the walk-against-judge pin holds them).
-        for row in &mut rows {
-            crate::routes::mark_pending_spender(row, None, i.now_ms);
-        }
-        crate::hops_view::mark_refused_word_rows(&mut rows, &i.refused_words, &i.proofs_set_aside);
-        crate::hops_view::mark_reorg_grace_rows(&mut rows, &i.grace_words);
-        hydrate::finish_rows(db, &mut rows).await?;
-        crate::owed::sort_rows_for_service(&mut rows);
-        let cut = rows.len() > crate::owed::OWED_MAX_ROWS;
-        rows.truncate(crate::owed::OWED_MAX_ROWS);
+        let (rows, cut) = derive_judged(db, i, games).await?;
         plan.push(Stmt {
             sql: GAME_DELETE_SQL.into(),
             binds: vec![Bind::Text(id.clone()), Bind::Text(json!(games).to_string())],
@@ -944,6 +925,129 @@ pub async fn judge_with_write_bounded(
     }))
     .await;
     Ok(report)
+}
+
+/// The judge's derivation of one identity's games over its hydrated inputs, its display marks and its 500-row cut:
+/// what [`judge_with_write_bounded`] commits and [`fresh_rows`] answers (one function, never a copy).
+async fn derive_judged(
+    db: &impl JudgeDb,
+    i: &JudgeInputs,
+    games: &[String],
+) -> Result<(Vec<OwedRow>, bool), String> {
+    let mut rows = derive_owed_rows(&i.as_inputs());
+    rows.retain(|r| games.contains(&r.game_id));
+    crate::owed::merge_markerless_faults(
+        &mut rows,
+        i.markerless_faults
+            .iter()
+            .filter(|f| games.contains(&f.game_id))
+            .cloned()
+            .collect(),
+    );
+    // The old walk's display marks after its derivation, in its order (the walk-against-judge pin holds them).
+    for row in &mut rows {
+        crate::routes::mark_pending_spender(row, None, i.now_ms);
+    }
+    crate::hops_view::mark_refused_word_rows(&mut rows, &i.refused_words, &i.proofs_set_aside);
+    crate::hops_view::mark_reorg_grace_rows(&mut rows, &i.grace_words);
+    hydrate::finish_rows(db, &mut rows).await?;
+    crate::owed::sort_rows_for_service(&mut rows);
+    let cut = rows.len() > crate::owed::OWED_MAX_ROWS;
+    rows.truncate(crate::owed::OWED_MAX_ROWS);
+    Ok((rows, cut))
+}
+
+/// The columns of the judge's row write (`row_statements`' first statement), in its bind order.
+const ROW_WRITE_COLUMNS: [&str; 15] = [
+    "identity",
+    "outpoint",
+    "family",
+    "gameId",
+    "sats",
+    "opponentIdentity",
+    "atHeight",
+    "facts",
+    "updatedAtMs",
+    "reason",
+    "judgedAtMs",
+    "claimable",
+    "gateHeight",
+    "beltDueAtMs",
+    "probeTip",
+];
+
+/// PURE: the stored row a row write would leave (the columns `owed_actor::ROWS_SQL` reads), read off the write's own
+/// binds, so the fresh rows are the commit's by construction.
+fn stored_of_write(write: &Stmt) -> Value {
+    let mut m = serde_json::Map::new();
+    for (col, bind) in ROW_WRITE_COLUMNS.iter().zip(&write.binds) {
+        if *col == "updatedAtMs" {
+            continue;
+        }
+        m.insert(
+            (*col).to_string(),
+            match bind {
+                Bind::Text(t) => json!(t),
+                Bind::Int(n) => json!(n),
+                Bind::Null => Value::Null,
+            },
+        );
+    }
+    Value::Object(m)
+}
+
+/// The ceiling's order (`CEILING_DELETE_SQL`'s ORDER BY) over stored rows.
+fn ceiling_rank(r: &Value) -> (u8, i64, String) {
+    let family = match r["family"].as_str().unwrap_or_default() {
+        "payout" => 0,
+        "refund-due" => 1,
+        "hop-stranded" => 2,
+        "in-progress" => 3,
+        _ => 4,
+    };
+    (
+        family,
+        -r["atHeight"].as_i64().unwrap_or(0),
+        r["outpoint"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+/// bsv-low #986 (the fleet compare): THE D1 JUDGE'S FRESH ROWS OF `games` WITHOUT A WRITE. The identity's games are
+/// hydrated [`OWED_JUDGE_SUBJECTS_PER_INVOCATION`] at a time and derived as the judge derives them
+/// ([`derive_judged`]), and each row is the row write the judge's commit would make ([`stored_of_write`] over
+/// `row_statements`), keyed by outpoint (a later game's write replaces an earlier one's, as the commit's UPSERT does),
+/// cut at the identity's 500-row ceiling in the ceiling's order, sorted by outpoint (`owed_actor::ROWS_SQL`'s order).
+/// Reads only: no row, no state, no acknowledgement and no push is written, so it runs in Phase C, where nothing
+/// writes D1's `owed_rows`. Stated: the ceiling ranks over the judged games alone (the commit's ranks over every
+/// stored row of the identity, which a fresh judgement of every game equals).
+pub async fn fresh_rows(
+    db: &impl JudgeDb,
+    identity: &str,
+    games: &[String],
+) -> Result<Vec<Value>, String> {
+    let id = identity.to_ascii_lowercase();
+    let games: Vec<String> = games.iter().map(|g| g.to_ascii_lowercase()).collect();
+    let mut by_outpoint: BTreeMap<String, Value> = BTreeMap::new();
+    for chunk in games.chunks(OWED_JUDGE_SUBJECTS_PER_INVOCATION) {
+        let inputs = db.hydrate(&id, chunk).await?;
+        let (rows, _) = derive_judged(db, &inputs, chunk).await?;
+        for row in &rows {
+            let writes = row_statements(row, inputs.now_ms, inputs.tip, Some(&inputs));
+            if let Some(w) = writes.first() {
+                let stored = stored_of_write(w);
+                if let Some(o) = stored["outpoint"].as_str() {
+                    by_outpoint.insert(o.to_string(), stored.clone());
+                }
+            }
+        }
+    }
+    let mut rows: Vec<Value> = by_outpoint.into_values().collect();
+    if rows.len() > crate::owed::OWED_MAX_ROWS {
+        rows.sort_by_key(ceiling_rank);
+        rows.truncate(crate::owed::OWED_MAX_ROWS);
+        rows.sort_by(|a, b| a["outpoint"].as_str().cmp(&b["outpoint"].as_str()));
+    }
+    Ok(rows)
 }
 
 /// The spender a row names, in the belt's order (`owed_belt::ask_of`).
