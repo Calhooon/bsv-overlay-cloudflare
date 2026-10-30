@@ -629,7 +629,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     worker::console_log!(
         "Scheduled: spend-confirmation (pot_records) ; scanned={} confirmed={} \
          still_unconfirmed={} fetch_failed={} tracker_faults={} cas_missed={} cas_errors={} \
-         displaced={} displace_attempts={} displace_faults={}",
+         displaced={} displace_attempts={} displace_faults={} verdicts={}",
         spend_summary.scanned,
         spend_summary.confirmed,
         spend_summary.still_unconfirmed,
@@ -640,6 +640,7 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         spend_summary.displaced,
         spend_summary.displace_attempts,
         spend_summary.displace_faults,
+        spend_summary.verdicts,
     );
     // bsv-low W4 (2026-09-04): spends the index never saw ; bounded, oldest
     // initial, on a fetcher of its OWN (the initial tick on beta shared the
@@ -658,9 +659,10 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     )
     .await;
     worker::console_log!(
-        "Scheduled: missing-spend discovery (pot_records) ; scanned={} discovered={} by_script={} no_hint={} unbound={} faults={} write_errors={} hop_rows={} new_era={} join_hops_marked={} join_hop_reads={} join_hop_inputs_deferred={} join_hop_pots_deferred={} couriers={:?}",
+        "Scheduled: missing-spend discovery (pot_records) ; scanned={} discovered={} verdicts={} by_script={} no_hint={} unbound={} faults={} write_errors={} hop_rows={} new_era={} join_hops_marked={} join_hop_reads={} join_hop_inputs_deferred={} join_hop_pots_deferred={} couriers={:?}",
         missing.scanned,
         missing.discovered,
+        missing.verdicts,
         missing.by_script,
         missing.no_hint,
         missing.unbound,
@@ -725,11 +727,13 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
     .await;
     worker::console_log!(
         "Scheduled: params-backfill (pot_records) ; scanned={} decoded={} verdicts={} \
-         missing_beef={}",
+         missing_beef={} unclassified={} classified={}",
         backfill_summary.scanned,
         backfill_summary.decoded,
         backfill_summary.verdicts,
         backfill_summary.missing_beef,
+        backfill_summary.spent_unclassified,
+        backfill_summary.spent_classified,
     );
 
     // 4a. bsv-low #406: settleSigners historic backfill ; attach WHO SIGNED

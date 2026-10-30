@@ -250,6 +250,59 @@ fn w16_644_the_backfill_candidates_are_the_old_set_and_read_no_whole_table() {
     }
 }
 
+/// bsv-low #986 (READ-986 item 2(b), FIX-986): the janitor's second verdict candidate scan (spent, confirmed,
+/// decoded covenant rows with no current verdict whose spender BEEF is held) reads its partial index
+/// (`idx_pot_spent_unclassified`), never the fleet's `pot_records` (14,719 rows here), and answers the set the whole
+/// table answers; the fleet seed's 8,097 spent covenant pots carry no verdict and no spender BEEF, so none is a
+/// candidate and none is read past the index. RED on the base: the statement does not exist.
+#[test]
+fn fix986_the_unclassified_scan_reads_its_partial_index_and_no_fleet_table() {
+    use bsv_overlay_cloudflare::d1_discovery::spent_unclassified_candidates_sql;
+    let db = fixture();
+    // two candidates among the fleet (vout 1, read by no identity view): the 27-shaped row and a stale group
+    let pk = format!("02{}", "ab".repeat(32));
+    for (i, verdict) in [(0u8, "NULL"), (1, "'winner-a', 'ff'")] {
+        let (pot, spender) = (format!("f8{i:062x}"), format!("f9{i:062x}"));
+        let (verdict, verdict_txid) = match verdict.split_once(", ") {
+            Some((v, t)) => (v.to_string(), t.to_string()),
+            None => ("NULL".to_string(), "NULL".to_string()),
+        };
+        db.execute_batch(&format!(
+            "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed, lockKind, pubA, paramsDecoded, verdict, verdictTxid, createdAt) \
+             VALUES ('{pot}', 1, 1, '{spender}', 1, 'covenant', '{pk}', 1, {verdict}, {verdict_txid}, 1); \
+             INSERT INTO pot_beefs (txid, beef, createdAt) VALUES ('{spender}', x'00', 1)"
+        ))
+        .unwrap();
+    }
+    let sql = spent_unclassified_candidates_sql(1_000_000);
+    let old = sql.replacen("INDEXED BY idx_pot_spent_unclassified", "NOT INDEXED", 1);
+    assert_ne!(old, sql);
+    let (new_rows, old_rows) = (sorted(rows(&db, &sql, &[])), sorted(rows(&db, &old, &[])));
+    assert_eq!(
+        new_rows.len(),
+        2,
+        "the two seeded candidates, none of the fleet: {new_rows:?}"
+    );
+    assert_eq!(new_rows, old_rows, "the candidate set is the whole table's");
+    let details = plan(&db, &sql);
+    println!("fix986 plan: {details:?}");
+    assert_no_fleet_scan("unclassified", &details);
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("pot_records USING INDEX idx_pot_spent_unclassified")),
+        "{details:?}"
+    );
+    let mut stmt = db.prepare(&sql).unwrap();
+    let _ = stmt.query_map([], |_| Ok(())).unwrap().count();
+    assert_eq!(
+        stmt.get_status(rusqlite::StatementStatus::FullscanStep),
+        0,
+        "no full-scan step"
+    );
+    assert_no_fleet_scan_analyzed(&db, "unclassified", &spent_unclassified_candidates_sql(16));
+}
+
 #[test]
 fn w16_643_the_tip_mark_reads_due_rows_by_gate_index() {
     use low_app_layer::owed_judge::MARK_TIP_SQL;

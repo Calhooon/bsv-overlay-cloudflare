@@ -2126,6 +2126,43 @@ pub fn settle_signers_candidates_sql(limit: u64) -> String {
     )
 }
 
+/// bsv-low #986 (READ-986 item 2(b), FIX-986): the janitor's SECOND verdict
+/// candidate scan, the rows the discovery and confirmation passes left
+/// classifiable and unclassified. A candidate is SPENT and CONFIRMED, a
+/// DECODED COVENANT lock (`lockKind = 'covenant'` with its params: `pubA`
+/// stands for the ten), carries NO CURRENT verdict (`verdict IS NULL`, or a
+/// group keyed to another pointer than the live one: the reader's own
+/// `verdictTxid == spendingTxid` guard reads both as none), and its
+/// spender's BEEF is HELD (`EXISTS pot_beefs`, one primary-key probe per
+/// candidate): a row whose spender bytes are absent is NOT a candidate and
+/// costs this scan nothing until they arrive; an unconfirmed pointer is not
+/// one either (the discovery pass classifies it inline while the bytes are
+/// in hand, its confirmation latches it). RANDOM-sampled, at most `limit`
+/// (the #284 anti-starvation idiom). The first four terms are the partial
+/// index `idx_pot_spent_unclassified`'s own WHERE, repeated verbatim so the
+/// planner takes it (pinned under real SQLite, with and without ANALYZE);
+/// its rows are the spent covenant pots without a current verdict, a set
+/// that drains as this scan latches them. `INDEXED BY` names it: a stat-less
+/// planner (D1 never runs ANALYZE) takes the composite
+/// `idx_pot_spent_unconfirmed (spent=?, spentConfirmed=?)` for the two
+/// equality terms otherwise, every confirmed spent row read per tick (the
+/// `reorg_reconcile_statements_real_sqlite` trap). A const-shaped helper so
+/// the real-SQLite pins execute the production string.
+pub fn spent_unclassified_candidates_sql(limit: u64) -> String {
+    format!(
+        "SELECT {POT_RECORD_COLUMNS} FROM pot_records INDEXED BY idx_pot_spent_unclassified \
+         WHERE {SPENT_UNCLASSIFIED_INDEX_PREDICATE} \
+           AND spentConfirmed = 1 AND pubA IS NOT NULL \
+           AND EXISTS (SELECT 1 FROM pot_beefs sb WHERE sb.txid = pot_records.spendingTxid) \
+         ORDER BY RANDOM() LIMIT {limit}"
+    )
+}
+
+/// The WHERE of the partial index `idx_pot_spent_unclassified` (bsv-low #986), byte for byte as the migration
+/// writes it (pinned: `fix986_the_candidate_scan_is_the_partial_indexs_predicate`); the candidate scan repeats it.
+pub const SPENT_UNCLASSIFIED_INDEX_PREDICATE: &str =
+    "spent = 1 AND lockKind = 'covenant' AND (verdict IS NULL OR verdictTxid IS NOT spendingTxid)";
+
 /// SQL for one batched spent-status chunk (bsv-low #289): a single
 /// row-value `IN (VALUES …)` query replacing `n` individual
 /// `get_spent_status` round trips. Factored out so the real-SQLite test
@@ -3075,6 +3112,16 @@ impl PotStorage for D1PotStorage {
              WHERE paramsDecoded = 0 ORDER BY RANDOM() LIMIT {limit}"
         );
         let rows: Vec<PotRow> = Query::new(sql).fetch_all(&self.db).await.map_err(pot_err)?;
+        Ok(rows.into_iter().map(PotRow::into_record).collect())
+    }
+
+    async fn find_spent_unclassified(&self, limit: u64) -> Result<Vec<PotRecord>, PotStorageError> {
+        // bsv-low #986: the second verdict candidate set, on its partial index — see
+        // `spent_unclassified_candidates_sql` (the shipped string).
+        let rows: Vec<PotRow> = Query::new(spent_unclassified_candidates_sql(limit))
+            .fetch_all(&self.db)
+            .await
+            .map_err(pot_err)?;
         Ok(rows.into_iter().map(PotRow::into_record).collect())
     }
 
@@ -15130,5 +15177,215 @@ mod tests {
             )
             .unwrap();
         assert_eq!((spent, spender.as_deref()), (1, Some("r936")));
+    }
+
+    // ── bsv-low #986 (READ-986 item 2(b), FIX-986): the second verdict candidate scan under real SQLite ──
+    mod fix986 {
+        use super::*;
+
+        fn migrated() -> rusqlite::Connection {
+            let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+            for sql in crate::d1::OVERLAY_MIGRATIONS {
+                if let Err(e) = conn.execute_batch(sql) {
+                    assert!(
+                        e.to_string()
+                            .to_ascii_lowercase()
+                            .contains("duplicate column"),
+                        "production migration failed under real SQLite: {e}\n{sql}"
+                    );
+                }
+            }
+            conn
+        }
+
+        fn plan(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+            stmt.query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        }
+
+        /// One spent covenant row of the shapes the scan decides between; `beef` stores the spender's row.
+        #[allow(clippy::too_many_arguments)]
+        fn seed(
+            conn: &rusqlite::Connection,
+            pot: &str,
+            spender: &str,
+            lock_kind: &str,
+            pub_a: Option<&str>,
+            confirmed: bool,
+            verdict: Option<(&str, &str)>,
+            beef: bool,
+        ) {
+            conn.execute(
+                "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed, lockKind, pubA, \
+                 paramsDecoded, verdict, verdictTxid, createdAt) VALUES (?1, 0, 1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 1)",
+                rusqlite::params![
+                    pot,
+                    spender,
+                    i64::from(confirmed),
+                    lock_kind,
+                    pub_a,
+                    verdict.map(|v| v.0),
+                    verdict.map(|v| v.1),
+                ],
+            )
+            .unwrap();
+            if beef {
+                conn.execute(
+                    "INSERT INTO pot_beefs (txid, beef, createdAt) VALUES (?1, x'00', 1)",
+                    [spender],
+                )
+                .unwrap();
+            }
+        }
+
+        /// THE CANDIDATE SET on the shipped migrations: the 27-shaped row (spent, confirmed, a decoded covenant,
+        /// no verdict, the spender's BEEF held) and a row whose group is keyed to a DISPLACED pointer are the
+        /// candidates; a row whose spender bytes are absent, an unconfirmed pointer, a current group, a bare pot, a
+        /// hop and a covenant row with no decoded params are not. The plan takes the partial index
+        /// `idx_pot_spent_unclassified` and walks no table, measured stat-less (as D1 runs) and after ANALYZE; the
+        /// index's WHERE is the scan's own predicate, byte for byte. RED on main: neither the statement nor the
+        /// index exists.
+        #[test]
+        fn fix986_the_candidate_scan_is_the_partial_indexs_predicate_and_reads_no_table() {
+            let conn = migrated();
+            let pk = "02".to_string() + &"aa".repeat(32);
+            let mk = |b: u8| hex::encode([b; 32]);
+            // the 27-shaped row of READ-986
+            seed(
+                &conn,
+                &mk(0xa1),
+                &mk(0xb1),
+                "covenant",
+                Some(&pk),
+                true,
+                None,
+                true,
+            );
+            // a stale group, keyed to the claim the chain's spender displaced
+            seed(
+                &conn,
+                &mk(0xa2),
+                &mk(0xb2),
+                "covenant",
+                Some(&pk),
+                true,
+                Some(("winner-a", &mk(0xc2))),
+                true,
+            );
+            // not candidates
+            seed(
+                &conn,
+                &mk(0xa3),
+                &mk(0xb3),
+                "covenant",
+                Some(&pk),
+                true,
+                None,
+                false,
+            ); // bytes absent
+            seed(
+                &conn,
+                &mk(0xa4),
+                &mk(0xb4),
+                "covenant",
+                Some(&pk),
+                false,
+                None,
+                true,
+            ); // unconfirmed
+            seed(
+                &conn,
+                &mk(0xa5),
+                &mk(0xb5),
+                "covenant",
+                Some(&pk),
+                true,
+                Some(("refund", &mk(0xb5))),
+                true,
+            ); // current
+            seed(&conn, &mk(0xa6), &mk(0xb6), "bare", None, true, None, true); // a bare pot
+            seed(&conn, &mk(0xa7), &mk(0xb7), "p2pkh", None, true, None, true); // a hop
+            seed(
+                &conn,
+                &mk(0xa8),
+                &mk(0xb8),
+                "covenant",
+                None,
+                true,
+                None,
+                true,
+            ); // no decoded params
+            let sql = spent_unclassified_candidates_sql(16);
+            let mut got: Vec<(String, String)> = conn
+                .prepare(&sql)
+                .unwrap()
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(3)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            got.sort();
+            assert_eq!(
+                got,
+                vec![(mk(0xa1), mk(0xb1)), (mk(0xa2), mk(0xb2))],
+                "the candidates are the 27-shaped row and the stale group"
+            );
+            // the same set as the table read whole (the index decides the plan, never the rows)
+            let whole = sql.replacen("INDEXED BY idx_pot_spent_unclassified", "NOT INDEXED", 1);
+            assert_ne!(whole, sql);
+            let mut old: Vec<(String, String)> = conn
+                .prepare(&whole)
+                .unwrap()
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(3)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            old.sort();
+            assert_eq!(got, old);
+            let stats: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_stat1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stats, 0, "measured without ANALYZE first, as D1 runs");
+            for pass in ["stat-less", "analyzed"] {
+                let lines = plan(&conn, &sql);
+                let joined = lines.join("\n");
+                assert!(
+                    joined.contains("pot_records USING INDEX idx_pot_spent_unclassified"),
+                    "{pass}: the scan takes its partial index: {lines:?}"
+                );
+                assert!(
+                    !lines.iter().any(|l| l.starts_with("SCAN pot_records")),
+                    "{pass}: no table walk: {lines:?}"
+                );
+                let mut stmt = conn.prepare(&sql).unwrap();
+                let _ = stmt.query_map([], |_| Ok(())).unwrap().count();
+                assert_eq!(
+                    stmt.get_status(rusqlite::StatementStatus::FullscanStep),
+                    0,
+                    "{pass}: no full-scan step"
+                );
+                conn.execute_batch("ANALYZE").unwrap();
+            }
+            // the index's WHERE is the scan's predicate, byte for byte, and the migration is the list's last
+            let index = crate::d1::OVERLAY_MIGRATIONS
+                .iter()
+                .find(|m| m.contains("idx_pot_spent_unclassified"))
+                .expect("the partial index is a shipped migration");
+            assert!(
+                index.ends_with(&format!(" WHERE {SPENT_UNCLASSIFIED_INDEX_PREDICATE}")),
+                "{index}"
+            );
+            assert!(sql.contains(&format!("WHERE {SPENT_UNCLASSIFIED_INDEX_PREDICATE} ")));
+            assert_eq!(crate::d1::OVERLAY_MIGRATIONS.last(), Some(index));
+            assert_eq!(crate::d1::OVERLAY_MIGRATIONS.len(), 475);
+        }
     }
 }
