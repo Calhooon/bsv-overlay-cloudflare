@@ -30,6 +30,29 @@
 //! unretained coin is cleaned up. `pot_beefs` is OURS (mirrors how
 //! `pot_records` survives eviction) and is the durable source
 //! `low-app-layer`'s `/beef/:txid` serves.
+//!
+//! # A held pot with no row here is recorded at its spend (bsv-low #936)
+//!
+//! The engine tells this service of a spend only for a coin the TOPIC
+//! HOLDS (`Engine::submit`'s previous coins), so a spent outpoint with no
+//! record here is an output the topic admitted whose admission hook never
+//! ran: the write was cut between the engine's `insert_output` and this
+//! service's `store_record` (beta 2026-10-27, the JOIN `fad01028...`: the
+//! gated request cancelled by the client while it owned the write; since
+//! overlay PR 188 the write is owned by `wait_until`, and the platform's
+//! own cut of that task remains). The spender's admission then records the
+//! pot's transaction applied and deletes its coin (#559's H2), which made
+//! the half write permanent: an applied row over no output, no
+//! `pot_records`, no `pot_beefs`, no eviction record, and the owed list
+//! never saw the refund. So `output_spent` records such a pot FIRST, from
+//! the spender's own bytes (a valid BEEF carries its input's source
+//! transaction), through the admission hook itself (its shape gate
+//! included), then writes the pointer: the pot stands recorded and spent
+//! exactly as a whole write leaves it. An absent source (txid-only
+//! ancestry) leaves the hook as it was. A pot recorded without its bytes
+//! (a cut between `store_record` and `store_beef`) is not healed here: a
+//! byte write on the admit path resets the verified-proof latch, so it is
+//! never made on a recorded pot.
 
 use async_trait::async_trait;
 use bsv_rs::transaction::{ChainTracker, MerklePath, Transaction};
@@ -37,7 +60,7 @@ use overlay_engine::beef_limits;
 use overlay_engine::lookup_service::{LookupService, LookupServiceError};
 use overlay_engine::types::*;
 use std::rc::Rc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::is_pot_covenant_script;
 use super::storage::{PotQuery, PotRecord, PotStorage};
@@ -357,11 +380,26 @@ impl LookupService for PotLookupService {
         // `classify_pot_spend`: the covenant asserts `ctx.utxo.value ==
         // stakeA + stakeB` in-script, so a funding value that disagrees is
         // not the pot the params describe → no verdict.
-        let admitted = match self.storage.get_spent_status(txid, output_index).await {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("POT: record read for verdict classification failed — no verdict: {e}");
-                None
+        let (admitted, record_read_faulted) =
+            match self.storage.get_spent_status(txid, output_index).await {
+                Ok(r) => (r, false),
+                Err(e) => {
+                    debug!("POT: record read for verdict classification failed — no verdict: {e}");
+                    (None, true)
+                }
+            };
+        // bsv-low #936: a held output whose record the read ANSWERED absent
+        // is recorded from the spender's bytes BEFORE its pointer is written
+        // (the module docs). A read that FAULTED records nothing: the pot may
+        // well be recorded, and an admit-path byte write would reset its
+        // verified-proof latch; the pointer is then the no-op it was, and
+        // the hook is told again by the replay.
+        let admitted = match admitted {
+            Some(record) => Some(record),
+            None if record_read_faulted => None,
+            None => {
+                self.record_held_output_from_spender(txid, output_index, topic, &spending_tx)
+                    .await?
             }
         };
         let verdict = match admitted.as_ref() {
@@ -685,6 +723,86 @@ impl LookupService for PotLookupService {
             ),
             ..Default::default()
         }
+    }
+}
+
+impl PotLookupService {
+    /// bsv-low #936: the spend of `txid:output_index` under `topic` names
+    /// an outpoint this index never recorded while the engine HELD it (the
+    /// module docs). Record it from the spender's own bytes through the
+    /// admission hook itself (one writer, its shape gate included), and
+    /// answer the record; `Ok(None)` when the spender's bytes do not carry
+    /// the source transaction, or the hook wrote nothing (not the topic's
+    /// shape). A storage fault is the hook's fault, as the admission's own
+    /// is.
+    async fn record_held_output_from_spender(
+        &self,
+        txid: &str,
+        output_index: u32,
+        topic: &str,
+        spending_tx: &Transaction,
+    ) -> Result<Option<PotRecord>, LookupServiceError> {
+        let source = spending_tx
+            .inputs
+            .iter()
+            .find(|i| {
+                i.source_txid
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case(txid))
+                    && i.source_output_index == output_index
+            })
+            .and_then(|i| i.source_transaction.as_deref());
+        let Some(source) = source else {
+            debug!(
+                "POT: the spend of {txid}:{output_index} under {topic} names an outpoint this \
+                 index never recorded and the spender's bytes do not carry its transaction: \
+                 nothing recorded (bsv-low #936)"
+            );
+            return Ok(None);
+        };
+        let source_txid = source.id();
+        if !source_txid.eq_ignore_ascii_case(txid) {
+            debug!("POT: the carried source of {txid}:{output_index} is {source_txid}: nothing recorded");
+            return Ok(None);
+        }
+        // The pot's own BEEF out of the spender's: the carried transaction
+        // and whatever ancestry the spender's body carries for it, named.
+        let atomic_beef = match source
+            .to_beef(true)
+            .and_then(|bytes| beef_limits::parse_beef(&bytes, &beef_limits::DISCOVERY_BEEF_LIMITS))
+            .and_then(|mut beef| beef.to_binary_atomic(&source_txid))
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                debug!(
+                    "POT: the carried source of {txid}:{output_index} did not re-serialize: {e}"
+                );
+                return Ok(None);
+            }
+        };
+        self.output_admitted_by_topic(&OutputAdmittedByTopic::WholeTx {
+            atomic_beef,
+            output_index,
+            topic: topic.to_string(),
+            off_chain_values: None,
+        })
+        .await?;
+        let recorded = self
+            .storage
+            .get_spent_status(txid, output_index)
+            .await
+            .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
+        if recorded.is_some() {
+            let spending_txid = spending_tx.id();
+            warn!(
+                "POT: {txid}:{output_index} under {topic} was held by the engine with no record \
+                 here (its admission write was cut after the engine's insert): recorded from the \
+                 spender {spending_txid}'s bytes before its spend pointer (bsv-low #936)"
+            );
+            self.storage
+                .note_recorded_at_spend(txid, output_index, topic, &spending_txid);
+        }
+        Ok(recorded)
     }
 }
 
@@ -2471,5 +2589,439 @@ mod tests {
             matches!(err, LookupServiceError::InvalidQuery(_)),
             "expected InvalidQuery, got {err:?}"
         );
+    }
+
+    /// bsv-low #936 (loop 52's S4, beta 2026-10-27): the JOIN `fad01028...`
+    /// was admitted PENDING and SEEN-latched, and at 17:5xZ D1 held its
+    /// `tm_pot` applied row over ZERO outputs, no `pot_records`, no
+    /// `pot_beefs`, no eviction record. READ-936 named the two steps: the
+    /// gated request was cancelled by the client while it owned the engine
+    /// write, which stopped AFTER the engine's `insert_output` and BEFORE
+    /// this service's `store_record` (a held coin, no index row, no applied
+    /// row); the refund's admission at 16:26Z then found the coin, recorded
+    /// the JOIN applied (#559's H2) and deleted it. These pins reproduce the
+    /// two steps on the engine over a cut lookup hook and hold the fix: the
+    /// spend hook, told of a spend the engine made of a coin the TOPIC HELD
+    /// with no record here, records the pot from the spender's own bytes
+    /// before it writes the pointer, so the pot stands recorded and spent by
+    /// its refund, exactly as a whole write leaves it.
+    mod fix936 {
+        use super::*;
+        use overlay_engine::builder::EngineBuilder;
+        use overlay_engine::engine::Engine;
+        use overlay_engine::storage::memory::MemoryStorage;
+        use overlay_engine::storage::Storage;
+        use overlay_engine::types::{AppliedTransaction, SubmitMode, TaggedBEEF};
+        use std::cell::Cell;
+        use std::future::Future;
+        use std::task::{Context, Poll};
+
+        const TOPIC: &str = "tm_pot";
+
+        /// `ls_pot` behind a door that HANGS the first admission hook it is
+        /// told: the engine's write then stops exactly where the cancelled
+        /// request's did on beta (after `insert_output`, before
+        /// `store_record`), and dropping the submit's future is the cut.
+        struct CutOnce {
+            inner: PotLookupService,
+            armed: Cell<bool>,
+            reached: Rc<Cell<bool>>,
+        }
+
+        #[async_trait(?Send)]
+        impl LookupService for CutOnce {
+            fn admission_mode(&self) -> AdmissionMode {
+                self.inner.admission_mode()
+            }
+            fn spend_notification_mode(&self) -> SpendNotificationMode {
+                self.inner.spend_notification_mode()
+            }
+            fn reads_off_chain_values(&self, topic: &str) -> bool {
+                self.inner.reads_off_chain_values(topic)
+            }
+            async fn output_admitted_by_topic(
+                &self,
+                payload: &OutputAdmittedByTopic,
+            ) -> Result<(), LookupServiceError> {
+                if self.armed.replace(false) {
+                    self.reached.set(true);
+                    std::future::pending::<()>().await;
+                }
+                self.inner.output_admitted_by_topic(payload).await
+            }
+            async fn output_spent(&self, payload: &OutputSpent) -> Result<(), LookupServiceError> {
+                self.inner.output_spent(payload).await
+            }
+            async fn output_evicted(
+                &self,
+                txid: &str,
+                output_index: u32,
+            ) -> Result<(), LookupServiceError> {
+                self.inner.output_evicted(txid, output_index).await
+            }
+            async fn lookup(
+                &self,
+                question: &LookupQuestion,
+            ) -> Result<LookupResult, LookupServiceError> {
+                self.inner.lookup(question).await
+            }
+            async fn get_documentation(&self) -> String {
+                self.inner.get_documentation().await
+            }
+            async fn get_metadata(&self) -> ServiceMetadata {
+                self.inner.get_metadata().await
+            }
+        }
+
+        struct Fixture {
+            engine: Engine,
+            store: Rc<MemoryStorage>,
+            pots: Rc<MemoryPotStorage>,
+            reached: Rc<Cell<bool>>,
+        }
+
+        /// A real engine over `tm_pot` and `ls_pot` (the production pair),
+        /// the service's first admission hook armed to hang.
+        fn fixture() -> Fixture {
+            let store = Rc::new(MemoryStorage::new());
+            let pots = Rc::new(MemoryPotStorage::new());
+            let reached = Rc::new(Cell::new(false));
+            let svc = CutOnce {
+                inner: PotLookupService::new(pots.clone()),
+                armed: Cell::new(true),
+                reached: reached.clone(),
+            };
+            let engine = EngineBuilder::new(Box::new(store.clone()))
+                .with_topic(
+                    TOPIC,
+                    Box::new(crate::pot::topic_manager::PotTopicManager::new()),
+                )
+                .with_lookup("ls_pot", Box::new(svc))
+                .build();
+            Fixture {
+                engine,
+                store,
+                pots,
+                reached,
+            }
+        }
+
+        fn tagged(tx: &Tx) -> TaggedBEEF {
+            TaggedBEEF::new(beef_of(tx), vec![TOPIC.into()])
+        }
+
+        /// Drive `fut` until it is Pending with the cut hook reached, then
+        /// DROP it: the write's cut, as the platform's cancel left it. A
+        /// future that completes first is the test's failure (nothing cut).
+        fn cut_at_the_hook<F: Future>(fut: F, reached: &Cell<bool>) {
+            let mut fut = Box::pin(fut);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            for _ in 0..64 {
+                match fut.as_mut().poll(&mut cx) {
+                    Poll::Ready(_) => panic!("the write completed: nothing was cut"),
+                    Poll::Pending if reached.get() => return,
+                    Poll::Pending => continue,
+                }
+            }
+            panic!("the write never reached the admission hook");
+        }
+
+        async fn applied(store: &MemoryStorage, txid: &str) -> bool {
+            store
+                .does_applied_transaction_exist(&AppliedTransaction {
+                    txid: txid.into(),
+                    topic: TOPIC.into(),
+                })
+                .await
+                .unwrap()
+        }
+
+        async fn coin_held(store: &MemoryStorage, txid: &str) -> bool {
+            store
+                .find_output(txid, 0, Some(TOPIC), None, false)
+                .await
+                .unwrap()
+                .is_some()
+        }
+
+        /// The pre-signed refund of `pot` (the spender the live shape had):
+        /// the whole pot less the fee to seat A's committed home, the pot's
+        /// own transaction carried as its input's source, as every valid
+        /// BEEF carries it.
+        fn refund_of(pot: &Tx, p: &CovenantParams) -> Tx {
+            let mut refund = spender_paying(&pot.id(), 0, &[(2400, p2pkh_lock(&p.pay_pkh_a))]);
+            refund.inputs[0].source_transaction = Some(Box::new(pot.clone()));
+            refund
+        }
+
+        /// The two steps of the live shape, then the index after the fix:
+        /// the JOIN's write cut at the hook (the coin held, no row here, no
+        /// applied row), the SEEN latch, the refund admitted whole (the JOIN
+        /// recorded applied by H2, its coin deleted: the engine's normal end
+        /// state of every spent pot), and the index holding the pot
+        /// RECORDED and SPENT by the refund with the JOIN's bytes under its
+        /// txid. RED on 1ab40c95 at the record: `None`.
+        #[tokio::test]
+        async fn fix936_a_a_write_cut_at_the_hook_then_its_refund_leaves_the_pot_recorded() {
+            let f = fixture();
+            let p = real_params();
+            let join = real_funding_tx(0x36, &p);
+            let join_txid = join.id();
+
+            // Step 1: the gated write, cut between the engine's insert and
+            // this service's store.
+            cut_at_the_hook(
+                f.engine
+                    .submit_with_report(&tagged(&join), SubmitMode::HistoricalTxNoSpv),
+                &f.reached,
+            );
+            assert!(
+                coin_held(&f.store, &join_txid).await,
+                "the engine holds the coin"
+            );
+            assert!(!applied(&f.store, &join_txid).await, "no applied row yet");
+            assert!(
+                f.pots
+                    .get_spent_status(&join_txid, 0)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the half write: no pot_records row"
+            );
+            assert!(
+                f.pots.get_beef(&join_txid).await.unwrap().is_none(),
+                "the half write: no pot_beefs row"
+            );
+            // The pending watch's SEEN latch lands on the worker's own table,
+            // keyed by txid; it stands whatever the index holds.
+            f.pots.mark_network_seen(&join_txid);
+
+            // Step 2: the refund's admission, whole.
+            let refund = refund_of(&join, &p);
+            let refund_txid = refund.id();
+            let (_, report) = f
+                .engine
+                .submit_with_report(&tagged(&refund), SubmitMode::HistoricalTxNoSpv)
+                .await
+                .unwrap();
+            assert!(report.is_durable(), "the refund's write landed: {report:?}");
+            assert_eq!(report.applied_topics, vec![TOPIC.to_string()]);
+
+            // The engine's end state is every spent pot's: the JOIN recorded
+            // applied by the spender (H2), its coin deleted, the refund applied.
+            assert!(
+                applied(&f.store, &join_txid).await,
+                "H2 recorded the JOIN applied"
+            );
+            assert!(
+                !coin_held(&f.store, &join_txid).await,
+                "the coin is deleted"
+            );
+            assert!(
+                f.store
+                    .find_outputs_for_transaction(&join_txid, false)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "an applied row over zero outputs is a spent pot's normal shape"
+            );
+            assert!(applied(&f.store, &refund_txid).await);
+
+            // The index (RED on 1ab40c95): the pot recorded, spent by the
+            // refund, its params decoded from its own lock, its bytes held.
+            let rec = f
+                .pots
+                .get_spent_status(&join_txid, 0)
+                .await
+                .unwrap()
+                .expect("the pot the engine admitted is recorded (bsv-low #936)");
+            assert!(rec.spent, "spent by its refund");
+            assert_eq!(rec.spending_txid.as_deref(), Some(refund_txid.as_str()));
+            assert_eq!(rec.lock_kind.as_deref(), Some("covenant"));
+            assert_eq!(rec.decoded_covenant_params(), Some(p));
+            assert_eq!(rec.pot_sats, Some(2500));
+            let pot_beef = f
+                .pots
+                .get_beef(&join_txid)
+                .await
+                .unwrap()
+                .expect("the JOIN's bytes under its own txid");
+            assert_eq!(
+                beef_limits::transaction_from_beef(
+                    &pot_beef,
+                    None,
+                    &beef_limits::DISCOVERY_BEEF_LIMITS
+                )
+                .unwrap()
+                .id(),
+                join_txid,
+                "the stored bytes name the pot"
+            );
+            assert!(
+                f.pots.get_beef(&refund_txid).await.unwrap().is_some(),
+                "the refund's bytes under its txid, as before"
+            );
+        }
+
+        /// The ledger and the rows agree for every pot the engine recorded
+        /// applied: one JOIN written whole and one cut at the hook, each
+        /// spent by its refund; every applied `tm_pot` row of a covenant
+        /// transaction has its record here, spent by its spender. RED on
+        /// 1ab40c95 for the cut one.
+        #[tokio::test]
+        async fn fix936_b_the_index_holds_every_pot_the_engine_recorded_applied() {
+            let f = fixture();
+            let p = real_params();
+            let cut = real_funding_tx(0x37, &p);
+            let whole = real_funding_tx(0x38, &p);
+            cut_at_the_hook(
+                f.engine
+                    .submit_with_report(&tagged(&cut), SubmitMode::HistoricalTxNoSpv),
+                &f.reached,
+            );
+            let (_, report) = f
+                .engine
+                .submit_with_report(&tagged(&whole), SubmitMode::HistoricalTxNoSpv)
+                .await
+                .unwrap();
+            assert!(report.is_durable(), "{report:?}");
+
+            let mut spenders = Vec::new();
+            for pot in [&cut, &whole] {
+                let refund = refund_of(pot, &p);
+                let (_, report) = f
+                    .engine
+                    .submit_with_report(&tagged(&refund), SubmitMode::HistoricalTxNoSpv)
+                    .await
+                    .unwrap();
+                assert!(report.is_durable(), "{report:?}");
+                spenders.push((pot.id(), refund.id()));
+            }
+
+            for (pot_txid, refund_txid) in spenders {
+                assert!(applied(&f.store, &pot_txid).await, "{pot_txid} is applied");
+                assert!(!coin_held(&f.store, &pot_txid).await);
+                let rec = f
+                    .pots
+                    .get_spent_status(&pot_txid, 0)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| {
+                        panic!("{pot_txid}: applied in {TOPIC} with no record (bsv-low #936)")
+                    });
+                assert!(rec.spent);
+                assert_eq!(rec.spending_txid.as_deref(), Some(refund_txid.as_str()));
+                assert!(f.pots.get_beef(&pot_txid).await.unwrap().is_some());
+            }
+            assert_eq!(f.pots.record_count(), 2);
+        }
+
+        /// The hook alone: a spend of an outpoint this index never recorded
+        /// is recorded from the spender's bytes, through the admission
+        /// writer and its shape gate, once; a spender whose bytes do not
+        /// carry the source records nothing (the hook as before); a carried
+        /// source whose output is not the topic's shape records nothing; a
+        /// recorded pot is untouched (its bytes stay the admitted ones); and
+        /// the hop arm records a held hop spent by its JOIN. RED on 1ab40c95
+        /// at the first record.
+        #[tokio::test]
+        async fn fix936_c_the_spend_hook_records_a_held_pot_from_the_spenders_bytes() {
+            let (svc, pots) = make_service_with_storage();
+            let p = real_params();
+
+            // (1) A never-recorded pot, its refund carrying it: recorded,
+            // spent, its bytes stored; told twice, one record, one pointer.
+            let pot = real_funding_tx(0x39, &p);
+            let refund = refund_of(&pot, &p);
+            for _ in 0..2 {
+                svc.output_spent(&spent(&pot.id(), 0, beef_of(&refund)))
+                    .await
+                    .unwrap();
+            }
+            let rec = pots
+                .get_spent_status(&pot.id(), 0)
+                .await
+                .unwrap()
+                .expect("recorded from the spender's bytes (bsv-low #936)");
+            assert!(rec.spent);
+            assert_eq!(rec.spending_txid.as_deref(), Some(refund.id().as_str()));
+            assert_eq!(rec.decoded_covenant_params(), Some(p.clone()));
+            assert_eq!(pots.record_count(), 1);
+            assert_eq!(pots.beef_count(), 2, "the pot's bytes and the refund's");
+
+            // (2) A spender that does not carry its source: nothing recorded.
+            let bare = spender_paying(
+                &real_funding_tx(0x3a, &p).id(),
+                0,
+                &[(2400, p2pkh_lock(&p.pay_pkh_a))],
+            );
+            let bare_pot = bare.inputs[0].source_txid.clone().unwrap();
+            svc.output_spent(&spent(&bare_pot, 0, beef_of(&bare)))
+                .await
+                .unwrap();
+            assert!(pots.get_spent_status(&bare_pot, 0).await.unwrap().is_none());
+            assert!(pots.get_beef(&bare_pot).await.unwrap().is_none());
+
+            // (3) A carried source whose spent output is P2PKH under tm_pot:
+            // the shape gate refuses the record, as at an admission.
+            let mut plain = Tx::new();
+            plain
+                .add_input(TransactionInput::new(hex::encode([0x3b; 32]), 0))
+                .unwrap();
+            plain.add_output(p2pkh_output()).unwrap();
+            let mut plain_spend = settle_tx(&plain.id(), 0);
+            plain_spend.inputs[0].source_transaction = Some(Box::new(plain.clone()));
+            svc.output_spent(&spent(&plain.id(), 0, beef_of(&plain_spend)))
+                .await
+                .unwrap();
+            assert!(pots
+                .get_spent_status(&plain.id(), 0)
+                .await
+                .unwrap()
+                .is_none());
+
+            // (4) A recorded pot is untouched: its bytes stay the admitted ones.
+            let known = real_funding_tx(0x3c, &p);
+            let admitted_bytes = beef_of(&known);
+            svc.output_admitted_by_topic(&admit(admitted_bytes.clone(), 0))
+                .await
+                .unwrap();
+            svc.output_spent(&spent(&known.id(), 0, beef_of(&refund_of(&known, &p))))
+                .await
+                .unwrap();
+            assert_eq!(
+                pots.get_beef(&known.id()).await.unwrap().as_deref(),
+                Some(admitted_bytes.as_slice())
+            );
+
+            // (5) The hop arm: a held P2PKH hop spent by a JOIN that carries
+            // it, under tm_lowfund, recorded `p2pkh` and spent by the JOIN.
+            let mut hop = Tx::new();
+            hop.add_input(TransactionInput::new(hex::encode([0x3d; 32]), 0))
+                .unwrap();
+            hop.add_output(p2pkh_output()).unwrap();
+            let mut join = Tx::new();
+            join.add_input(TransactionInput::new(hop.id(), 0)).unwrap();
+            join.inputs[0].source_transaction = Some(Box::new(hop.clone()));
+            join.add_output(make_covenant_output(&dummy_params()))
+                .unwrap();
+            svc.output_spent(&OutputSpent::WholeTx {
+                txid: hop.id(),
+                output_index: 0,
+                topic: "tm_lowfund".into(),
+                spending_atomic_beef: beef_of(&join),
+                off_chain_values: None,
+            })
+            .await
+            .unwrap();
+            let hop_rec = pots
+                .get_spent_status(&hop.id(), 0)
+                .await
+                .unwrap()
+                .expect("the held hop recorded from the JOIN's bytes");
+            assert_eq!(hop_rec.lock_kind.as_deref(), Some("p2pkh"));
+            assert!(hop_rec.spent);
+            assert_eq!(hop_rec.spending_txid.as_deref(), Some(join.id().as_str()));
+        }
     }
 }

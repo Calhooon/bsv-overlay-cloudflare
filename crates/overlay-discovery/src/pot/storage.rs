@@ -606,6 +606,22 @@ pub trait PotStorage {
         Ok(vec![false; txids.len()])
     }
 
+    /// bsv-low #936: `ls_pot` recorded `txid:output_index` under `topic` at
+    /// its SPEND by `spending_txid`, from the spender's bytes, because the
+    /// engine held the coin and this store had no row for it (its admission
+    /// write was cut after the engine's insert; `pot::lookup_service`'s
+    /// module docs). A note, never a write: the default does nothing; the
+    /// D1 backend prints one console line, so the heal is read in the
+    /// Worker's logs (the discovery crate's `tracing` lines are not).
+    fn note_recorded_at_spend(
+        &self,
+        _txid: &str,
+        _output_index: u32,
+        _topic: &str,
+        _spending_txid: &str,
+    ) {
+    }
+
     /// bsv-low #621 (L5): [`Self::network_seen_for`] with each latch's witness (the broadcaster and its time),
     /// ALIGNED index-for-index; `None` = unwitnessed. The default derives it from `network_seen_for` with no
     /// source or time (a store that does not keep them); the D1 backend reads [`network_seen_by_batch_sql`].
