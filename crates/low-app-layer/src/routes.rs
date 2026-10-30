@@ -2800,6 +2800,8 @@ pub(crate) struct ResultsRowD1 {
 impl ResultsRowD1 {
     pub(crate) fn into_row(self) -> crate::results::ResultsRow {
         crate::results::ResultsRow {
+            funding_decoded: None,
+            spender_decoded: None,
             settle_signers: self.settle_signers,
             identity: self.identity,
             game_id: self.game_id,

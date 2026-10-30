@@ -161,14 +161,31 @@ pub struct PotSpendFacts<'a> {
 pub fn classify_pot_spend(f: &PotSpendFacts) -> Option<PotVerdict> {
     let funding = parse_raw_tx_verified(f.funding_raw, f.pot_txid)?;
     let spender = parse_raw_tx_verified(f.spender_raw, f.spender_txid)?;
+    classify_pot_spend_parsed(
+        &funding,
+        &spender,
+        f.pot_txid,
+        f.pot_vout,
+        f.marker_recovery_height,
+    )
+}
 
+/// [`classify_pot_spend`] over the two transactions already parsed and bound to their txids (the hash-verified raw
+/// bytes, or FIX-997's decoded facts, which the BEEF's own txid binds): one rule for both.
+fn classify_pot_spend_parsed(
+    funding: &RawTx,
+    spender: &RawTx,
+    pot_txid: &str,
+    pot_vout: u32,
+    marker_recovery_height: Option<u32>,
+) -> Option<PotVerdict> {
     // The recorded spender must ACTUALLY spend the pot outpoint.
     let pot_input = spender
         .inputs
         .iter()
-        .find(|i| i.prev_txid.eq_ignore_ascii_case(f.pot_txid) && i.prev_vout == f.pot_vout)?;
+        .find(|i| i.prev_txid.eq_ignore_ascii_case(pot_txid) && i.prev_vout == pot_vout)?;
 
-    let (pot_sats, pot_lock) = spender_pot_prevout(&funding, f.pot_vout)?;
+    let (pot_sats, pot_lock) = spender_pot_prevout(funding, pot_vout)?;
 
     if let Some(p) = extract_covenant_params(&pot_lock) {
         // The covenant asserts `ctx.utxo.value == stakeA + stakeB` in-script;
@@ -176,15 +193,15 @@ pub fn classify_pot_spend(f: &PotSpendFacts) -> Option<PotVerdict> {
         if p.stake_a.checked_add(p.stake_b)? != pot_sats {
             return None;
         }
-        return classify_covenant(&p, &spender, pot_input.sequence);
+        return classify_covenant(&p, spender, pot_input.sequence);
     }
 
     if is_bare_2of3_lock(&pot_lock) {
         return classify_bare_refund(
-            &spender,
+            spender,
             pot_input.sequence,
             pot_sats,
-            f.marker_recovery_height,
+            marker_recovery_height,
         );
     }
 
@@ -222,11 +239,40 @@ fn classify_from_columns(
     let sraw =
         crate::logic::extract_raw_tx_hex(&sb, settle_lc).and_then(|h| hex::decode(h).ok())?;
     let spender = parse_raw_tx_verified(&sraw, settle_lc)?;
+    classify_from_columns_parsed(params, pot_sats, pot_txid_lc, pot_vout, &spender)
+}
+
+/// [`classify_from_columns`] over the spender already parsed and bound to its txid (the hash-verified raw, or
+/// FIX-997's decoded facts): the same bars, one rule.
+fn classify_from_columns_parsed(
+    params: &CovenantParams,
+    pot_sats: Option<u64>,
+    pot_txid_lc: &str,
+    pot_vout: u32,
+    spender: &RawTx,
+) -> Option<PotVerdict> {
+    if params.stake_a.checked_add(params.stake_b)? != pot_sats? {
+        return None; // conservation failed — the params do not describe this pot
+    }
     let pot_input = spender
         .inputs
         .iter()
         .find(|i| i.prev_txid.eq_ignore_ascii_case(pot_txid_lc) && i.prev_vout == pot_vout)?;
-    classify_covenant(params, &spender, pot_input.sequence)
+    classify_covenant(params, spender, pot_input.sequence)
+}
+
+/// FIX-997 (bsv-low #997, READ-986 item 2(a)): a stored transaction's DECODED form, the results view's input in
+/// place of a BEEF column: the classifier's whole input (`raw`: each input's outpoint and sequence, each output's
+/// satoshis and locking script, the lock time), bound to its txid by the BEEF it was decoded from, and the height of
+/// the bump that BEEF carries for it (`bump_height`, structural: served only under the row's verified latch, as
+/// [`verified_beef_block_height`]). The owed judge fills it on BOTH judges from the transaction's facts
+/// (`owed_judge::TxFacts`: the D1 judge decodes `pot_beefs` at the read, the actor serves its mirror's `txfacts`),
+/// so a spend whose verdict is not stored classifies the same in the actor as in D1. The signers cannot be decoded
+/// (#406's BIP-143 digest needs the raw bytes): a row classified from it serves `signers_pending`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedTx {
+    pub raw: RawTx,
+    pub bump_height: Option<u64>,
 }
 
 /// Bare-era (pre-covenant) pots: classify ONLY the pre-signed nLockTime
@@ -1317,6 +1363,11 @@ pub struct ResultsRow {
     /// like the pair above (served under the same pointer guard).
     pub spender_pay_a_sats: Option<u64>,
     pub spender_pay_b_sats: Option<u64>,
+    /// FIX-997: the FUNDING and the SPENDER decoded ([`DecodedTx`]), filled by the owed judge from the
+    /// transactions' facts in place of `funding_beef_hex` / `spender_beef_hex` (which it then leaves `None`); the
+    /// `/results` route leaves them `None` and reads the BEEF columns as before.
+    pub funding_decoded: Option<DecodedTx>,
+    pub spender_decoded: Option<DecodedTx>,
 }
 
 impl ResultsRow {
@@ -1638,6 +1689,11 @@ pub struct ResultEntry {
     /// the enforcedWithheldReplay cell was structurally red for exactly
     /// that (six-layer diagnosis, decision log addendum 15).
     pub settle_signers: Option<String>,
+    /// FIX-997 (bsv-low #997): `verdict` was classified from the spend (its bytes, or the owed judge's decoded facts),
+    /// not read from the stored group: the EXIT is served and `settle_signers` stays `None`, PENDING the store (the
+    /// signers are #406's BIP-143 check over the raw bytes, which facts cannot answer; the janitor's latch writes
+    /// them). Never a guessed signer set.
+    pub signers_pending: bool,
     /// The per-identity outcome (see [`derive_outcome`]).
     pub outcome: Outcome,
     /// How `outcome` was derived: `"chain"` (seat-symmetric verdict),
@@ -1883,9 +1939,15 @@ pub fn covenant_params_by_pot(
             out.insert(key, p);
             continue;
         }
-        // Fallback (legacy un-backfilled rows): the hash-verified funding
-        // bytes, exactly as pre-#284.
-        if let Some(p) = beef_covenant_params(r.funding_beef_hex.as_deref(), &key.0, r.pot_vout) {
+        // FIX-997: the funding decoded (the owed judge's facts), else the
+        // hash-verified funding bytes, exactly as pre-#284.
+        let decoded = r.funding_decoded.as_ref().and_then(|d| {
+            spender_pot_prevout(&d.raw, r.pot_vout)
+                .and_then(|(_, lock)| extract_covenant_params(&lock))
+        });
+        if let Some(p) = decoded
+            .or_else(|| beef_covenant_params(r.funding_beef_hex.as_deref(), &key.0, r.pot_vout))
+        {
             out.insert(key, p);
         }
     }
@@ -2047,6 +2109,9 @@ pub fn assemble_results(
         let row_params = params_by_pot.get(&(pot_txid_lc.clone(), r.pot_vout));
         let mut verdict = None;
         let mut settle_signers: Option<String> = None;
+        // FIX-997: the verdict was classified from the spend (bytes or facts), not read from the stored group: the
+        // exit is served, the signers are pending the store (never guessed).
+        let mut signers_pending = false;
         let mut at_height = None;
         let mut seat = None;
         // #323 defect 1 — the spend must be CONFIRMED before any verdict,
@@ -2102,8 +2167,18 @@ pub fn assemble_results(
             //    but the params columns answer): classify per-request from
             //    the hash-verified spender bytes against the column params —
             //    no funding BLOB needed (the SQL didn't even fetch it).
+            let stored_verdict = verdict.is_some();
             if verdict.is_none() {
-                if let (Some(p), Some(sb_hex)) = (&column_params, &r.spender_beef_hex) {
+                if let (Some(p), Some(d)) = (&column_params, &r.spender_decoded) {
+                    // FIX-997: the spender's facts (the owed judge, both judges)
+                    verdict = classify_from_columns_parsed(
+                        p,
+                        r.pot_sats,
+                        &pot_txid_lc,
+                        r.pot_vout,
+                        &d.raw,
+                    );
+                } else if let (Some(p), Some(sb_hex)) = (&column_params, &r.spender_beef_hex) {
                     verdict = classify_from_columns(
                         p,
                         r.pot_sats,
@@ -2118,7 +2193,18 @@ pub fn assemble_results(
             //    columns): both BEEFs, exactly the pre-#284 path, including
             //    the bare-pot marker-hint refund rule.
             if verdict.is_none() && column_params.is_none() {
-                if let (Some(fb_hex), Some(sb_hex)) = (&r.funding_beef_hex, &r.spender_beef_hex) {
+                if let (Some(f), Some(sp)) = (&r.funding_decoded, &r.spender_decoded) {
+                    // FIX-997: both transactions' facts (the owed judge, both judges)
+                    verdict = classify_pot_spend_parsed(
+                        &f.raw,
+                        &sp.raw,
+                        &pot_txid_lc,
+                        r.pot_vout,
+                        Some(r.recovery_height),
+                    );
+                } else if let (Some(fb_hex), Some(sb_hex)) =
+                    (&r.funding_beef_hex, &r.spender_beef_hex)
+                {
                     if let (Some(fb), Some(sb)) = (
                         crate::logic::decode_beef_hex(fb_hex),
                         crate::logic::decode_beef_hex(sb_hex),
@@ -2146,9 +2232,15 @@ pub fn assemble_results(
             // structural bump on an unverified row can be attacker-
             // fabricated; proofless/unverified BEEFs honestly yield None —
             // never a guess).
+            signers_pending = !stored_verdict && verdict.is_some();
             at_height = r.spent_height;
             if at_height.is_none() {
-                if let Some(sb) = r
+                // FIX-997: the decoded spender's bump, under the same verified latch
+                if let Some(d) = &r.spender_decoded {
+                    at_height = d
+                        .bump_height
+                        .filter(|_| r.spender_proof_verified == Some(true));
+                } else if let Some(sb) = r
                     .spender_beef_hex
                     .as_deref()
                     .and_then(crate::logic::decode_beef_hex)
@@ -2297,6 +2389,7 @@ pub fn assemble_results(
             game_id_binding,
             verdict,
             settle_signers,
+            signers_pending,
             outcome,
             outcome_source,
             at_height,
@@ -5594,6 +5687,7 @@ mod tests {
         let k = keys_fixture();
         let e = ResultEntry {
             settle_signers: None,
+            signers_pending: false,
             game_id: tx(0x01),
             pot_txid: tx(0x02),
             pot_vout: 0,
@@ -5683,6 +5777,7 @@ mod tests {
         let me = ident(0xaa);
         let base = ResultEntry {
             settle_signers: None,
+            signers_pending: false,
             game_id: tx(0x01),
             pot_txid: tx(0x02),
             pot_vout: 0,
@@ -5750,6 +5845,7 @@ mod tests {
         let me = ident(0xaa);
         let e = ResultEntry {
             settle_signers: None,
+            signers_pending: false,
             game_id: tx(0x01),
             pot_txid: tx(0x02),
             pot_vout: 0,
@@ -5803,6 +5899,7 @@ mod tests {
         let me = ident(0xaa);
         let e = ResultEntry {
             settle_signers: None,
+            signers_pending: false,
             game_id: tx(0x01),
             pot_txid: tx(0x02),
             pot_vout: 0,
@@ -5898,6 +5995,7 @@ mod tests {
         let me = ident(0xaa);
         let e = ResultEntry {
             settle_signers: None,
+            signers_pending: false,
             game_id: tx(0x01),
             pot_txid: tx(0x02),
             pot_vout: 0,
@@ -5974,6 +6072,7 @@ mod tests {
         let me = ident(0xaa);
         let e = ResultEntry {
             settle_signers: None,
+            signers_pending: false,
             game_id: tx(0x01),
             pot_txid: tx(0x02),
             pot_vout: 0,

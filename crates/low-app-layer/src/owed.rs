@@ -1844,6 +1844,11 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             "settleTxid": e.settle_txid,
             "committedKeys": crate::results::CommittedKeys::to_json(e.committed_keys.as_ref()),
         });
+        // FIX-997 (bsv-low #997): a verdict classified from the spend, not the stored group: the exit is served, the
+        // signers are pending the store (`settleSigners` null). Absent on every other row (no stored row moves).
+        if e.signers_pending {
+            base_facts["signersPending"] = json!(true);
+        }
         owed_words(
             i,
             &mut base_facts,
@@ -3471,6 +3476,7 @@ pub(crate) mod tests {
             game_id_binding: PotBinding::Chain,
             verdict,
             settle_signers: Some("coop".into()),
+            signers_pending: false,
             outcome,
             outcome_source: Some("chain+seatkey"),
             at_height: if spent == Some(true) {
