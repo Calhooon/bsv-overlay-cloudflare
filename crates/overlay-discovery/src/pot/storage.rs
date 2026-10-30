@@ -622,6 +622,23 @@ pub trait PotStorage {
     ) {
     }
 
+    /// bsv-low #936 (the FIX-936 lens's LOW-3): whether this store holds
+    /// bytes for `txid` (a `pot_beefs` row). The default reads them whole;
+    /// the D1 backend probes the row without its bytes.
+    async fn has_beef(&self, txid: &str) -> Result<bool, PotStorageError> {
+        Ok(self.get_beef(txid).await?.is_some())
+    }
+
+    /// bsv-low #936 (the lens's LOW-2): the ENGINE's own stored BEEF of
+    /// `txid` (the `transactions` row its insert wrote), for a held coin
+    /// whose spender does not carry its source. Read only on the spend of
+    /// an outpoint this store holds no row (or no bytes) for. The default
+    /// is a store with no engine copy: `None`; the D1 backend reads the
+    /// shared database's `transactions` row.
+    async fn held_transaction_beef(&self, _txid: &str) -> Result<Option<Vec<u8>>, PotStorageError> {
+        Ok(None)
+    }
+
     /// bsv-low #621 (L5): [`Self::network_seen_for`] with each latch's witness (the broadcaster and its time),
     /// ALIGNED index-for-index; `None` = unwitnessed. The default derives it from `network_seen_for` with no
     /// source or time (a store that does not keep them); the D1 backend reads [`network_seen_by_batch_sql`].
@@ -1385,6 +1402,13 @@ pub struct MemoryPotStorage {
     unprovable: std::sync::Mutex<std::collections::HashSet<String>>,
     /// bsv-low #470 PRE557: the confirming block's header time per pot txid (`pot_records.blockTime`).
     pub block_times: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// TEST HOOKS (bsv-low #936, the lens's LOW-1 and LOW-3): how many of
+    /// the next `get_spent_status` reads and `store_beef` writes fault.
+    fault_spent_status_reads: std::sync::Mutex<u32>,
+    fault_beef_writes: std::sync::Mutex<u32>,
+    /// TEST HOOK (bsv-low #936, LOW-2): the engine's stored copy per txid
+    /// (`held_transaction_beef`), the memory twin of `transactions.beef`.
+    held_transactions: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
 }
 
 // bsv-stack-lean #134: the in-memory store; a poisoned lock is a failed test
@@ -1466,6 +1490,34 @@ impl MemoryPotStorage {
     /// bsv-low E649 L6 fold: every later ledger read faults.
     pub fn fault_evictions(&self) {
         *self.evictions.lock().unwrap() = Some(Err(()));
+    }
+
+    /// TEST HOOK (bsv-low #936): the next `n` `get_spent_status` reads fault.
+    pub fn fault_next_spent_status_reads(&self, n: u32) {
+        *self.fault_spent_status_reads.lock().unwrap() = n;
+    }
+
+    /// TEST HOOK (bsv-low #936): the next `n` `store_beef` writes fault.
+    pub fn fault_next_beef_writes(&self, n: u32) {
+        *self.fault_beef_writes.lock().unwrap() = n;
+    }
+
+    /// TEST HOOK (bsv-low #936): the engine's stored BEEF of `txid`.
+    pub fn hold_transaction_beef(&self, txid: &str, beef: &[u8]) {
+        self.held_transactions
+            .lock()
+            .unwrap()
+            .insert(txid.to_ascii_lowercase(), beef.to_vec());
+    }
+
+    /// One injected fault of `counter`, if any is left.
+    fn take_fault(counter: &std::sync::Mutex<u32>, what: &str) -> Result<(), PotStorageError> {
+        let mut left = counter.lock().unwrap();
+        if *left > 0 {
+            *left -= 1;
+            return Err(PotStorageError::Database(format!("injected {what} fault")));
+        }
+        Ok(())
     }
 
     /// How many pot BEEFs the store holds.
@@ -2091,6 +2143,7 @@ impl PotStorage for MemoryPotStorage {
         txid: &str,
         output_index: u32,
     ) -> Result<Option<PotRecord>, PotStorageError> {
+        Self::take_fault(&self.fault_spent_status_reads, "pot record read")?;
         Ok(self
             .records
             .lock()
@@ -2101,6 +2154,7 @@ impl PotStorage for MemoryPotStorage {
     }
 
     async fn store_beef(&self, txid: &str, beef: &[u8]) -> Result<(), PotStorageError> {
+        Self::take_fault(&self.fault_beef_writes, "pot beef write")?;
         // Empty is rejected — never store unusable bytes.
         if beef.is_empty() {
             return Ok(());
@@ -2135,6 +2189,15 @@ impl PotStorage for MemoryPotStorage {
 
     async fn get_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError> {
         Ok(self.beefs.lock().unwrap().get(txid).cloned())
+    }
+
+    async fn held_transaction_beef(&self, txid: &str) -> Result<Option<Vec<u8>>, PotStorageError> {
+        Ok(self
+            .held_transactions
+            .lock()
+            .unwrap()
+            .get(&txid.to_ascii_lowercase())
+            .cloned())
     }
 
     async fn find_pot_beefs_for_proof_check(
