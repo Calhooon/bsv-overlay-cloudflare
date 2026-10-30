@@ -622,9 +622,27 @@ pub trait PotStorage {
     ) {
     }
 
+    /// bsv-low #936 (the FIX-936 lens 3's NIT-3): the completion arm's
+    /// note, `note_recorded_at_spend`'s twin: `ls_pot` wrote the bytes of a
+    /// pot RECORDED without them at its spend by `spending_txid`. A note,
+    /// never a write: the default does nothing; the D1 backend prints one
+    /// console line.
+    fn note_bytes_completed_at_spend(
+        &self,
+        _txid: &str,
+        _output_index: u32,
+        _topic: &str,
+        _spending_txid: &str,
+    ) {
+    }
+
     /// bsv-low #936 (the FIX-936 lens's LOW-3): whether this store holds
     /// bytes for `txid` (a `pot_beefs` row). The default reads them whole;
-    /// the D1 backend probes the row without its bytes.
+    /// the D1 backend probes the row without its bytes. PRESENCE, not
+    /// length (lens 3's NIT-2): a row whose blob is empty would answer
+    /// present and never be completed; no writer stores one (`beef BLOB
+    /// NOT NULL`, the admit write needs a longer non-empty body, the
+    /// verified writer stores the compacted bytes).
     async fn has_beef(&self, txid: &str) -> Result<bool, PotStorageError> {
         Ok(self.get_beef(txid).await?.is_some())
     }
@@ -1500,6 +1518,18 @@ impl MemoryPotStorage {
     /// TEST HOOK (bsv-low #936): the next `n` `store_beef` writes fault.
     pub fn fault_next_beef_writes(&self, n: u32) {
         *self.fault_beef_writes.lock().unwrap() = n;
+    }
+
+    /// TEST HOOK (bsv-low #936, lens 3's LOW-1): take `txid:output_index`'s
+    /// record out of the store, as the eviction's shadow move takes the
+    /// `pot_records` row to its twin (its first table); `pot_beefs` is not a
+    /// moved table and stays. Answers the record taken.
+    pub fn take_record(&self, txid: &str, output_index: u32) -> Option<PotRecord> {
+        let mut records = self.records.lock().unwrap();
+        let at = records
+            .iter()
+            .position(|r| r.txid == txid && r.output_index == output_index)?;
+        Some(records.remove(at))
     }
 
     /// TEST HOOK (bsv-low #936): the engine's stored BEEF of `txid`.
