@@ -48,11 +48,19 @@
 //! the spender's own bytes (a valid BEEF carries its input's source
 //! transaction), through the admission hook itself (its shape gate
 //! included), then writes the pointer: the pot stands recorded and spent
-//! exactly as a whole write leaves it. An absent source (txid-only
-//! ancestry) leaves the hook as it was. A pot recorded without its bytes
-//! (a cut between `store_record` and `store_beef`) is not healed here: a
-//! byte write on the admit path resets the verified-proof latch, so it is
-//! never made on a recorded pot.
+//! exactly as a whole write leaves it. A spender that does not carry the
+//! source (txid-only ancestry) has the pot recorded from the ENGINE's
+//! stored copy (`PotStorage::held_transaction_beef`), hash-bound to the
+//! outpoint either way. A pot recorded without its bytes (a cut between
+//! `store_record` and `store_beef`) has them written at its spend (a
+//! verified row is never written over). A faulted record read is "not
+//! now". The heal writes NOTHING while the eviction ledger holds the txid
+//! OPEN (lens 3's LOW-1: a spend straddling the shadow move, a
+//! readmission whose `pot_records` copy back faulted): no guard re-evicts
+//! a heal, and the readmission's restore brings the real row back. A
+//! healed record's `createdAt` (and its bytes') is the SPEND's time, not
+//! the admission's (lens 3's NOTE-5): ordering and history only, never
+//! across an era (a wipe removes the engine's coin).
 
 use async_trait::async_trait;
 use bsv_rs::transaction::{ChainTracker, MerklePath, Transaction};
@@ -815,6 +823,44 @@ impl PotLookupService {
         }
     }
 
+    /// bsv-low #936 (the FIX-936 lens 3's LOW-1): whether the eviction
+    /// ledger holds `txid` OPEN, asked on the heal path only (a record or
+    /// bytes absent), never on the common spend. Two half-done ledger
+    /// states put a held coin with no record in front of this hook: a
+    /// spend straddling the shadow move (`pot_records` moved first, the
+    /// coin still held) and a readmission whose `pot_records` copy back
+    /// faulted (the coin restored, the ledger open). No guard re-evicts a
+    /// heal (the write-side guard names the subject, `guard_landed` the
+    /// landed bodies), so the heal writes nothing under an open marker:
+    /// the pointer is then the no-op it was before #936, and the
+    /// readmission's restore brings the real row back with its history.
+    /// The ledger read is [`PotStorage::evictions_for`] (one primary-key
+    /// statement on D1; a store that serves no ledger answers `None`, and
+    /// heals as before). A faulted read is the hook's fault ("not now").
+    async fn heal_under_open_eviction(&self, txid: &str) -> Result<bool, LookupServiceError> {
+        let key = txid.to_ascii_lowercase();
+        let rows = self
+            .storage
+            .evictions_for(std::slice::from_ref(&key))
+            .await
+            .map_err(|e| {
+                LookupServiceError::StorageError(format!(
+                    "eviction ledger read for {txid} faulted on the heal path (not now, \
+                     bsv-low #936): {e}"
+                ))
+            })?;
+        let open = rows.is_some_and(|rows| {
+            super::storage::open_eviction_hides_row(rows.first().and_then(|e| e.as_ref()))
+        });
+        if open {
+            warn!(
+                "POT: {txid} is under an OPEN eviction: the spend's heal writes nothing (the \
+                 readmission restores its row; bsv-low #936, lens 3 LOW-1)"
+            );
+        }
+        Ok(open)
+    }
+
     /// bsv-low #936 (the FIX-936 lens's LOW-3): a pot RECORDED without its
     /// bytes (a heal or an admission whose byte write faulted after its
     /// record landed: a replay then finds the record and the heal does not
@@ -833,7 +879,7 @@ impl PotLookupService {
                 "pot bytes probe for {txid} faulted (not now, bsv-low #936): {e}"
             ))
         })?;
-        if held {
+        if held || self.heal_under_open_eviction(txid).await? {
             return Ok(());
         }
         let Some(atomic) = self
@@ -846,11 +892,13 @@ impl PotLookupService {
             .store_beef(txid, &atomic)
             .await
             .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
+        let spending_txid = spending_tx.id();
         warn!(
             "POT: {txid}:{output_index} under {topic} was recorded without its bytes: written at \
-             its spend by {} (bsv-low #936, LOW-3)",
-            spending_tx.id()
+             its spend by {spending_txid} (bsv-low #936, LOW-3)"
         );
+        self.storage
+            .note_bytes_completed_at_spend(txid, output_index, topic, &spending_txid);
         Ok(())
     }
 
@@ -869,6 +917,9 @@ impl PotLookupService {
         topic: &str,
         spending_tx: &Transaction,
     ) -> Result<Option<PotRecord>, LookupServiceError> {
+        if self.heal_under_open_eviction(txid).await? {
+            return Ok(None);
+        }
         let Some(atomic_beef) = self
             .held_output_bytes(txid, output_index, spending_tx)
             .await?
@@ -2778,12 +2829,17 @@ mod tests {
         /// A real engine over `tm_pot` and `ls_pot` (the production pair),
         /// the service's first admission hook armed to hang.
         fn fixture() -> Fixture {
+            fixture_armed(true)
+        }
+
+        /// The same pair; `armed: false` admits the first write whole.
+        fn fixture_armed(armed: bool) -> Fixture {
             let store = Rc::new(MemoryStorage::new());
             let pots = Rc::new(MemoryPotStorage::new());
             let reached = Rc::new(Cell::new(false));
             let svc = CutOnce {
                 inner: PotLookupService::new(pots.clone()),
-                armed: Cell::new(true),
+                armed: Cell::new(armed),
                 reached: reached.clone(),
             };
             let engine = EngineBuilder::new(Box::new(store.clone()))
@@ -3300,6 +3356,208 @@ mod tests {
                 .unwrap()
                 .id(),
                 known.id()
+            );
+        }
+
+        /// The FIX-936 lens 3's LOW-1: the heal writes the pot's index rows
+        /// below the eviction ledger, and no guard re-evicts a heal (the
+        /// write-side guard names the subject, `guard_landed` the landed
+        /// bodies). Two real half-done ledger states put a spend's hook in
+        /// front of a held coin with no record and an OPEN ledger row.
+        ///
+        /// (1) THE STRADDLE: the JOIN admitted whole; the eviction's marker
+        /// opened and its first table (`pot_records`) moved to the twin
+        /// while the engine still holds the coin (`outputs` is the second
+        /// table; a spend whose validation read the coin before it). The
+        /// refund's hook must record NOTHING under the open marker: the
+        /// pointer is the no-op it was before #936, and the readmission's
+        /// restore brings the real row back. RED on e8866847: the heal
+        /// recorded the pot live, spent by the refund, under the open ledger.
+        #[tokio::test]
+        async fn fix936f2_l1_a_straddled_eviction_is_never_healed_under_its_open_marker() {
+            let f = fixture_armed(false);
+            let p = real_params();
+            let join = real_funding_tx(0x51, &p);
+            let join_txid = join.id();
+            let (_, report) = f
+                .engine
+                .submit_with_report(&tagged(&join), SubmitMode::HistoricalTxNoSpv)
+                .await
+                .unwrap();
+            assert!(report.is_durable(), "the JOIN admitted whole: {report:?}");
+            assert!(f
+                .pots
+                .get_spent_status(&join_txid, 0)
+                .await
+                .unwrap()
+                .is_some());
+
+            // The eviction: the marker FIRST, then pot_records to its twin.
+            f.pots.record_eviction(&join_txid, 1_000, None);
+            let twin = f.pots.take_record(&join_txid, 0);
+            assert!(twin.is_some(), "the shadow move's first table");
+            assert!(
+                coin_held(&f.store, &join_txid).await,
+                "outputs not yet moved"
+            );
+
+            let refund = refund_of(&join, &p);
+            let (_, report) = f
+                .engine
+                .submit_with_report(&tagged(&refund), SubmitMode::HistoricalTxNoSpv)
+                .await
+                .unwrap();
+            assert!(
+                report.is_durable(),
+                "the spend lands as before #936: {report:?}"
+            );
+            assert!(
+                f.pots
+                    .get_spent_status(&join_txid, 0)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "nothing healed under an OPEN eviction (bsv-low #936, lens 3 LOW-1)"
+            );
+        }
+
+        /// The LOW-1's second state, AN INCOMPLETE READMISSION: the eviction
+        /// complete (the record in its twin, the coin moved), then the
+        /// readmission's restore copies `outputs` back while its
+        /// `pot_records` copy faulted (`restore_twins` continues past a
+        /// faulted table): the coin held again, no record, the ledger OPEN
+        /// (`admit_fast_readmit_incomplete_total`). A spend meanwhile must
+        /// heal nothing, or the next restore's `INSERT OR IGNORE` keeps the
+        /// heal's row and drops the twin's history. RED on e8866847: healed.
+        #[tokio::test]
+        async fn fix936f2_l1_an_incomplete_readmission_is_never_healed_under_its_open_marker() {
+            let f = fixture_armed(false);
+            let p = real_params();
+            let join = real_funding_tx(0x52, &p);
+            let join_txid = join.id();
+            let (_, report) = f
+                .engine
+                .submit_with_report(&tagged(&join), SubmitMode::HistoricalTxNoSpv)
+                .await
+                .unwrap();
+            assert!(report.is_durable());
+
+            // The eviction, complete: marker, record and coin moved.
+            f.pots.record_eviction(&join_txid, 1_000, None);
+            assert!(f.pots.take_record(&join_txid, 0).is_some());
+            let coin = f
+                .store
+                .find_output(&join_txid, 0, Some(TOPIC), None, false)
+                .await
+                .unwrap()
+                .expect("the held coin");
+            f.store.delete_output(&join_txid, 0, TOPIC).await.unwrap();
+            assert!(!coin_held(&f.store, &join_txid).await);
+            // The readmission's restore: `outputs` copied back, the
+            // `pot_records` copy faulted, the ledger left OPEN.
+            f.store.insert_output(&coin).await.unwrap();
+            assert!(coin_held(&f.store, &join_txid).await);
+
+            let refund = refund_of(&join, &p);
+            let (_, report) = f
+                .engine
+                .submit_with_report(&tagged(&refund), SubmitMode::HistoricalTxNoSpv)
+                .await
+                .unwrap();
+            assert!(report.is_durable(), "{report:?}");
+            assert!(
+                f.pots
+                    .get_spent_status(&join_txid, 0)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "nothing healed while the readmission is incomplete (lens 3 LOW-1)"
+            );
+        }
+
+        /// The fold's edges: (1) a READMITTED ledger row (`readmittedAt`
+        /// set) is held, so a cut pot under it is healed as before; (2) the
+        /// ledger read faulting on the heal path is the hook's fault ("not
+        /// now", the coin kept, the replay heals); (3) a RECORDED pot without
+        /// its bytes under an open marker gets no bytes (the completion arm
+        /// is a heal too); (4) the common spend (record and bytes held)
+        /// never reads the ledger: its fault cannot reach it.
+        #[tokio::test]
+        async fn fix936f2_l1_the_ledger_guard_reads_only_on_the_heal_path() {
+            // (1) and (2) over the real engine.
+            let f = fixture();
+            let p = real_params();
+            let join = real_funding_tx(0x53, &p);
+            let join_txid = join.id();
+            cut_at_the_hook(
+                f.engine
+                    .submit_with_report(&tagged(&join), SubmitMode::HistoricalTxNoSpv),
+                &f.reached,
+            );
+            f.pots.fault_evictions();
+            let refund = refund_of(&join, &p);
+            let first = f
+                .engine
+                .submit_with_report(&tagged(&refund), SubmitMode::HistoricalTxNoSpv)
+                .await;
+            assert!(
+                !matches!(&first, Ok((_, r)) if r.is_durable()),
+                "a faulted ledger read on the heal path is not now: {first:?}"
+            );
+            assert!(coin_held(&f.store, &join_txid).await);
+            f.pots.record_eviction(&join_txid, 1_000, Some(2_000));
+            let (_, report) = f
+                .engine
+                .submit_with_report(&tagged(&refund), SubmitMode::HistoricalTxNoSpv)
+                .await
+                .unwrap();
+            assert!(report.is_durable(), "{report:?}");
+            let rec = f
+                .pots
+                .get_spent_status(&join_txid, 0)
+                .await
+                .unwrap()
+                .expect("a readmitted ledger row is held: the cut pot is healed");
+            assert_eq!(rec.spending_txid.as_deref(), Some(refund.id().as_str()));
+
+            // (3) The completion arm under an open marker.
+            let (svc, pots) = make_service_with_storage();
+            let known = real_funding_tx(0x54, &p);
+            pots.fault_next_beef_writes(1);
+            assert!(svc
+                .output_admitted_by_topic(&admit(beef_of(&known), 0))
+                .await
+                .is_err());
+            assert!(pots
+                .get_spent_status(&known.id(), 0)
+                .await
+                .unwrap()
+                .is_some());
+            pots.record_eviction(&known.id(), 1_000, None);
+            svc.output_spent(&spent(&known.id(), 0, beef_of(&refund_of(&known, &p))))
+                .await
+                .unwrap();
+            assert!(
+                pots.get_beef(&known.id()).await.unwrap().is_none(),
+                "no bytes written under an open marker (lens 3 LOW-1)"
+            );
+
+            // (4) The common spend reads no ledger.
+            let (svc, pots) = make_service_with_storage();
+            let whole = real_funding_tx(0x55, &p);
+            svc.output_admitted_by_topic(&admit(beef_of(&whole), 0))
+                .await
+                .unwrap();
+            pots.fault_evictions();
+            svc.output_spent(&spent(&whole.id(), 0, beef_of(&refund_of(&whole, &p))))
+                .await
+                .unwrap();
+            assert!(
+                pots.get_spent_status(&whole.id(), 0)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .spent
             );
         }
     }
