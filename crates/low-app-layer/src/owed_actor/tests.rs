@@ -355,7 +355,11 @@ impl Outside for SlowOutside {
 /// lands after the second's.
 #[tokio::test]
 async fn d2_actor_b_two_events_under_a_slow_chaintracks_derive_the_newer_rows() {
+    // FIX-983: the outside is asked only for word rows the record holds (an empty ask is no ask), so the pin seeds a
+    // word for every spender the judge reads.
+    const SPENDER_WORDS: &str = "INSERT OR IGNORE INTO tx_words(txid,word,tier,updated_at) SELECT DISTINCT spendingTxid,'seen','hint',1 FROM pot_records WHERE spendingTxid IS NOT NULL";
     let record = d1_judge(&stranded()).await;
+    record.conn.execute_batch(SPENDER_WORDS).unwrap();
     let games = games_of(&record, "owner");
     let actor = mirror();
     apply(
@@ -372,6 +376,7 @@ async fn d2_actor_b_two_events_under_a_slow_chaintracks_derive_the_newer_rows() 
     .unwrap();
     let older = stored(&actor, "owner");
     let control_record = d1_judge(&stranded()).await;
+    control_record.conn.execute_batch(SPENDER_WORDS).unwrap();
     control_record
         .conn
         .execute_batch(SPENT_BY_A_STRANGER)
@@ -552,7 +557,10 @@ impl JudgeDb for WithActor {
     fn event_seq(&self) -> Option<i64> {
         self.event.map(|(_, s)| s)
     }
-    /// As the object's `/apply`: the apply in its turn, Phase C's asks published inside it.
+    fn note_concurrency(&self, n: u32) {
+        NOTED_CONCURRENCY.with(|c| c.set(n));
+    }
+    /// As the object's `/apply`: the apply in its turn, Phase C's asks queued inside it and drained after.
     async fn actor_apply(
         &self,
         identity: &str,
@@ -607,12 +615,18 @@ impl WithActor {
         if NEW_H1_INJECT.with(|c| c.replace(false)) {
             self.d1.conn.execute_batch(SPENT_BY_A_STRANGER).unwrap();
         }
+        // FIX-983: the object drains the asks lane after its answer (`after_apply`); the port does it here.
+        drain_ask_lane(&self.d1).await;
         let rows = self
             .actor
             .run_batch(vec![Stmt::new(ROWS_SQL, vec![Bind::Text(identity.into())])])
             .await?;
         Ok(Some(answer_of(&report, rows[0].rows.clone())))
     }
+}
+thread_local! {
+    /// FIX-983: the fan-out the consumer's pass noted on the port ([`JudgeDb::note_concurrency`]).
+    static NOTED_CONCURRENCY: Cell<u32> = const { Cell::new(0) };
 }
 
 /// A delivery that answers the actor's stored rows without applying (the planted-diff compare).
@@ -844,7 +858,7 @@ fn d2_actor_b_the_bars_are_served_and_the_counters_seeded() {
         .split_whitespace()
         .collect::<String>();
     assert!(routes.contains(
-        &"body[\"owedActor\"] = crate::owed_actor::health_body( actor_snapshot.as_ref(), worker::Date::now().as_millis(), d1_judges, &body[\"owedEvents\"][\"oldestUnackedMarkAgeMs\"], );"
+        &"body[\"owedActor\"] = crate::owed_actor::health_body( actor_snapshot.as_ref(), worker::Date::now().as_millis(), &body[\"owedEvents\"][\"oldestUnackedMarkAgeMs\"], );"
             .split_whitespace()
             .collect::<String>()
     ));
@@ -2068,7 +2082,7 @@ async fn d2_actor_b_fold2_m7_the_bars_are_the_fleets() {
         .remove(0)
         .rows
         .remove(0);
-    let served = health_body(Some(&read), 10_000, true, &json!(99));
+    let served = health_body(Some(&read), 10_000, &json!(99));
     assert_eq!(served["rowsVisibleMsP95"], json!(290), "{served}");
     assert_eq!(served["rowsVisibleDirectMsP95"], json!(90));
     assert_eq!(served["collectAfterMinedMsP95"], json!(290));
@@ -2088,10 +2102,12 @@ async fn d2_actor_b_fold2_m7_the_bars_are_the_fleets() {
         (json!(40), json!(2), json!(1), json!(3))
     );
     assert!(served["activeIdentities"].as_u64().unwrap() >= 1);
+    // FIX-982 (bsv-low #982): the figure is the actor's own in EVERY phase; the un-acked mark is served beside it.
+    let c = health_body(Some(&read), 10_000, &json!(99));
     assert_eq!(
-        health_body(Some(&read), 10_000, false, &json!(99))["oldestUnappliedEventAgeMs"],
-        json!(99),
-        "Phase C: D1's un-acked mark"
+        (c["oldestUnappliedEventAgeMs"].clone(), c["oldestUnappliedEventSource"].clone(), c["oldestUnackedMarkAgeMs"].clone()),
+        (json!(7_000), json!("faulted"), json!(99)),
+        "the figure is the actor's own, the mark named apart"
     );
     // A later apply of the identity clears its unapplied age.
     let mut b = PendingBars::default();
@@ -2106,7 +2122,7 @@ async fn d2_actor_b_fold2_m7_the_bars_are_the_fleets() {
         .rows
         .remove(0);
     assert_eq!(
-        health_body(Some(&read), 10_000, true, &Value::Null)["oldestUnappliedEventAgeMs"],
+        health_body(Some(&read), 10_000, &Value::Null)["oldestUnappliedEventAgeMs"],
         Value::Null
     );
     // The ring keeps the last 256.
@@ -2790,7 +2806,6 @@ fn d2_actor_b_fold3_lows() {
             &json!({"coverage": clean.to_string(), "counters": json!({"owed_actor_deferred_total": 4, "owed_actor_deferred_done_total": 3}).to_string()}),
         ),
         1,
-        true,
         &Value::Null,
     );
     assert_eq!(health["coverage"]["complete"], json!(true));
@@ -3454,7 +3469,7 @@ async fn d2_actor_b_fold6_the_snapshot_is_written_at_most_once_a_minute() {
             .map(|c| serde_json::from_str(&c).unwrap())
             .unwrap_or(Value::Null)
     };
-    let compared = |v: &Value| health_body(Some(v), 0, true, &Value::Null)["comparedTotal"].clone();
+    let compared = |v: &Value| health_body(Some(v), 0, &Value::Null)["comparedTotal"].clone();
     db.run_batch(vec![health_snapshot_stmt(1_000_000, false)])
         .await
         .unwrap();
@@ -3548,12 +3563,12 @@ async fn d2_actor_b_fold6_the_served_keys_are_the_pre_fold_bodys() {
         .remove(0)
         .rows
         .remove(0);
-    let before = health_body(Some(&pre), 2_000, true, &json!(99));
+    let before = health_body(Some(&pre), 2_000, &json!(99));
     db.run_batch(vec![health_snapshot_stmt(1_500, true)])
         .await
         .unwrap();
     let (_, snap) = crate::owed_events::health_and_actor(&db, &Value::Null).await;
-    let after = health_body(snap.as_ref(), 2_000, true, &json!(99));
+    let after = health_body(snap.as_ref(), 2_000, &json!(99));
     let keys = |v: &Value| {
         v.as_object()
             .unwrap()
@@ -3604,7 +3619,7 @@ async fn d2_actor_b_fold6_the_served_keys_are_the_pre_fold_bodys() {
     assert_eq!(after["comparedTotal"], json!(10));
     assert_eq!(after["activeIdentities"], json!(600));
     assert_eq!(after["coverage"]["complete"], json!(true));
-    let none = health_body(None, 2_000, true, &json!(99));
+    let none = health_body(None, 2_000, &json!(99));
     assert_eq!(keys(&none), keys(&after));
     for k in [
         "asOfMs",
@@ -4111,13 +4126,13 @@ fn d2_actor_b_fold7_f_as_of_ms_is_the_snapshots_stamp() {
         )
         .unwrap();
     let snap = health_snapshot_of(Some(&cursor)).unwrap();
-    let body = health_body(Some(&snap), now + 5, true, &Value::Null);
+    let body = health_body(Some(&snap), now + 5, &Value::Null);
     assert_eq!(body["asOfMs"], json!(now), "{cursor}");
     assert_eq!(body["healthRead"], json!(true));
     // A row written before the fold (a REAL in the JSON) is read as its stamp too.
     let old = json!({"asOfMs": now as f64, "bars": "[]", "counters": "{}"});
     assert_eq!(
-        health_body(Some(&old), now, true, &Value::Null)["asOfMs"],
+        health_body(Some(&old), now, &Value::Null)["asOfMs"],
         json!(now)
     );
 }
@@ -4189,7 +4204,6 @@ async fn d2_actor_b_fold7_g_the_cold_figure_is_noted_once_from_the_first_held_ev
     let body = health_body(
         health_snapshot_of(Some(&cursor)).as_ref(),
         NOW_MS,
-        true,
         &Value::Null,
     );
     assert_eq!(body["coldMsP95"], json!(10_000));
@@ -4422,7 +4436,6 @@ async fn d2_actor_b_fold8_b_a_stuck_actor_is_counted_served_and_parked() {
     let body = health_body(
         health_snapshot_of(Some(&cursor)).as_ref(),
         NOW_MS + 90_000,
-        true,
         &Value::Null,
     );
     assert_eq!(body["holding"], json!({"count": 1, "oldestMs": 90_000}));
@@ -4571,7 +4584,6 @@ fn d2_actor_b_fold8_e_flushed_at_ms_is_an_integer() {
     let body = health_body(
         health_snapshot_of(Some(&cursor)).as_ref(),
         at + 2,
-        true,
         &Value::Null,
     );
     assert_eq!(
@@ -6750,7 +6762,7 @@ fn fold10_g_a_builds_replace_carries_the_oldest_unapplied() {
 fn fold10_h_the_object_notes_its_own_first_apply() {
     let answer = json!({"applied": true, "firstApply": true, "identity": "owner", "atMs": 1_000, "judgedAtMs": 1_300, "applyMs": 40});
     let mut object = PendingBars::default();
-    object.note_answer(bars_class(Some("direct")), &answer);
+    object.note_answer(bars_class(Some("direct"), None), &answer);
     assert_eq!(object.visible.get("direct").map(Vec::len), Some(1));
     let mut noted = answer.clone();
     noted["noted"] = json!(true);
@@ -6765,13 +6777,13 @@ fn fold10_h_the_object_notes_its_own_first_apply() {
         caller.unapplied.is_empty(),
         "the caller's unapplied bookkeeping kept"
     );
-    assert_eq!(bars_class(None), "queue");
-    assert_eq!(bars_class(Some("tip")), "queue");
+    assert_eq!(bars_class(None, None), "queue");
+    assert_eq!(bars_class(Some("tip"), None), "queue");
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     let object = squash(include_str!("object.rs"));
     let route = &object[object.find("asyncfnapply_route(").unwrap()..];
     let note = route
-        .find("ifsamples{note_answer_as(bars_class(body.class.as_deref()),&answer);flush_bars(&record,now,false).await;answer[\"noted\"]=json!(true);}")
+        .find("ifsamples{note_answer_as(bars_class(body.class.as_deref(),body.concurrent),&answer);answer[\"noted\"]=json!(true);}")
         .expect("the object notes its own answer");
     assert!(route.contains("letsamples=samples_bars(body.at_ms,body.class.as_deref());"), "the note is gated by samples_bars (FOLD-16 item 5)");
     assert!(
@@ -8389,7 +8401,6 @@ async fn fold13_b_a_version_move_rejudges_every_identity_once_and_moves_the_stam
     let body = health_body(
         health_snapshot_of(Some(&snap)).as_ref(),
         NOW_MS,
-        true,
         &Value::Null,
     );
     assert_eq!(
@@ -9365,7 +9376,6 @@ async fn fold15_e_the_pace_is_a_lever_and_zero_pauses_with_the_cursor_kept() {
     let body = health_body(
         health_snapshot_of(Some(&snap)).as_ref(),
         NOW_MS,
-        true,
         &Value::Null,
     );
     assert_eq!(
@@ -9745,7 +9755,7 @@ async fn fold16_c_the_reconcile_and_the_sweep_sample_nothing_into_the_writers_ba
     ));
     let object: String = include_str!("object.rs").split_whitespace().collect();
     assert!(object.contains("letsamples=samples_bars(body.at_ms,body.class.as_deref());ifsamples{letmutbars=self.bars.borrow_mut();"));
-    assert!(object.contains("ifsamples{note_answer_as(bars_class(body.class.as_deref()),&answer);"));
+    assert!(object.contains("ifsamples{note_answer_as(bars_class(body.class.as_deref(),body.concurrent),&answer);"));
     let events_src: String = include_str!("../owed_events.rs")
         .split_whitespace()
         .collect();
@@ -10838,4 +10848,411 @@ fn fix974_b_a_dupe_never_samples_the_mined_bar() {
         served.get("collectAfterMinedMsP95").is_some(),
         "the served key stands"
     );
+}
+
+// ---- FIX-983 and FIX-982 (bsv-low #983, #982; Wave E row E3) ----
+
+/// An outside that counts what the judge asks of it (the calls, the word keys, the roots).
+struct CountingOutside(Cell<usize>, Cell<usize>, Cell<usize>);
+impl Outside for CountingOutside {
+    async fn word_views(
+        &self,
+        rows: &BTreeMap<String, crate::tracker_host::stored::Row>,
+    ) -> Result<BTreeMap<String, Value>, String> {
+        self.0.set(self.0.get() + 1);
+        self.1.set(self.1.get() + rows.len());
+        Fakes.word_views(rows).await
+    }
+    async fn canonical_root(&self, h: u64) -> Option<String> {
+        self.2.set(self.2.get() + 1);
+        Fakes.canonical_root(h).await
+    }
+}
+
+/// A record whose belt-ask publish faults (the clear's statement), every other statement answered.
+struct AsksDown<'a>(&'a SqliteSql);
+impl SqlPort for AsksDown<'_> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        if stmts.iter().any(|s| s.sql == ASKS_CLEAR_SQL) {
+            return Err("D1 is down (pin)".into());
+        }
+        self.0.run_batch(stmts).await
+    }
+    async fn counters(&self, d: Vec<(String, u64)>) {
+        self.0.counters(d).await;
+    }
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    fn log(&self, l: &str) {
+        self.0.log(l);
+    }
+}
+
+/// The stranded fixture (a hand's six games, one dated row) bootstrapped into a warm, stamped mirror.
+async fn fix983_warm_hand() -> (SqliteSql, SqliteSql, Vec<String>) {
+    let record = seeded(&stranded());
+    let games = games_of(&record, "owner");
+    let local = mirror();
+    for chunk in games.chunks(GAMES_PER_APPLY) {
+        apply(&record, &local, &Fakes, "owner", chunk, Some(("bootstrap", 1)), Some(TIP), None)
+            .await
+            .unwrap();
+    }
+    local
+        .conn
+        .execute_batch("INSERT INTO meta(name,value) VALUES ('bootstrapped','1') ON CONFLICT(name) DO NOTHING")
+        .unwrap();
+    (record, local, games)
+}
+fn fix983_event(games: &[String], seq: i64) -> HeldEvent {
+    HeldEvent {
+        kind: Some("pot".into()),
+        seq: Some(seq),
+        games: games.to_vec(),
+        at_ms: Some(NOW_MS - 50),
+        mined: false,
+        tip: Some(TIP),
+        held_at_ms: NOW_MS,
+        bound: None,
+        touch: Some(vec![]),
+    }
+}
+
+/// (fix983_a) THE PHASE C APPLY MAKES NO RECORD CALL OF ITS OWN PAST PHASE B'S (bsv-low #983). On the stranded hand
+/// (six games, one dated row), a warm apply of one game: in Phase B ONE record batch (the marked read); in Phase C
+/// the SAME ONE, its belt ask QUEUED on the lane (one batch, one ask) and published by the object's drain after the
+/// answer, counted once a drain; a second Phase C apply whose dated rows did not move queues nothing; a drain that
+/// faults marks the identity, so its next apply publishes every game again. RED on a31436e6 (the probe of this
+/// lane, base API): the Phase C apply made 2 record batches (3 statements) and a counters round trip where Phase B
+/// made 1 batch of 1 statement, inside the measured apply: `left: 2 right: 1`.
+#[tokio::test]
+async fn fix983_a_the_phase_c_apply_makes_no_record_call_past_phase_bs_and_queues_its_asks() {
+    let (record, local, games) = fix983_warm_hand().await;
+    let turn = futures_util::lock::Mutex::new(());
+    let game = &games[0..1];
+    let counted = Counting(&record, Cell::new(0), Cell::new(0));
+    let b0 = record.batches.get();
+    let r = apply_or_hold(&turn, &counted, &local, &Fakes, "owner", &fix983_event(game, 2), None, false)
+        .await
+        .unwrap();
+    let (batches_b, stmts_b) = (record.batches.get() - b0, counted.2.get());
+    let Applied::Done(report_b, _) = r else { panic!("held") };
+    assert_eq!(report_b.asks, 0, "Phase B queues no ask");
+    assert_eq!(ask_lane_len(), 0);
+    let counted = Counting(&record, Cell::new(0), Cell::new(0));
+    let b0 = record.batches.get();
+    let r = apply_or_hold(&turn, &counted, &local, &Fakes, "owner", &fix983_event(game, 3), None, true)
+        .await
+        .unwrap();
+    let (batches_c, stmts_c) = (record.batches.get() - b0, counted.2.get());
+    let Applied::Done(report_c, _) = r else { panic!("held") };
+    eprintln!(
+        "fix983_a: warm apply of one game of {}: Phase B {batches_b} record batch(es), {stmts_b} statement(s); Phase C {batches_c} batch(es), {stmts_c} statement(s), {} ask(s) queued, lane {}",
+        games.len(),
+        report_c.asks,
+        ask_lane_len()
+    );
+    assert_eq!(
+        (batches_c, stmts_c),
+        (batches_b, stmts_b),
+        "the Phase C apply makes record calls of its own"
+    );
+    assert_eq!((batches_b, stmts_b), (1, 1), "a warm apply is one record read");
+    assert_eq!(report_c.asks, 1, "the dated row's ask is queued");
+    assert_eq!(ask_lane_len(), 1, "one batch for the apply");
+    assert!(asks_of(&record).is_empty(), "nothing published inside the apply");
+    // The object's drain: one record batch for the queued apply, the asks counted once.
+    let counted = Counting(&record, Cell::new(0), Cell::new(0));
+    let c0 = record.counter(COUNTERS[8]);
+    let drained = drain_lane_once(&counted).await;
+    assert_eq!(drained, AsksDrained { batches: 1, asks: 1, faults: 0 });
+    assert_eq!(counted.2.get(), 2, "the clear and one put, one batch");
+    assert_eq!(record.counter(COUNTERS[8]) - c0, 1, "counted once a drain");
+    let hop = format!("{STRANDED_HOP}:0");
+    assert!(
+        asks_of(&record).iter().any(|(n, _, _)| *n == crate::owed_belt::ask_name("owner", &hop)),
+        "the stranded hop's ask is published by the drain: {:?}",
+        asks_of(&record)
+    );
+    // Nothing moved: the next Phase C apply queues nothing and makes the one record read.
+    let counted = Counting(&record, Cell::new(0), Cell::new(0));
+    let b0 = record.batches.get();
+    let r = apply_or_hold(&turn, &counted, &local, &Fakes, "owner", &fix983_event(game, 4), None, true)
+        .await
+        .unwrap();
+    let Applied::Done(report, _) = r else { panic!("held") };
+    assert_eq!((record.batches.get() - b0, counted.2.get(), report.asks, ask_lane_len()), (1, 1, 0, 0));
+    // A drain that faults marks the identity: the next apply publishes the game again.
+    record.conn.execute_batch("DELETE FROM owed_belt_state WHERE name LIKE 'belt-ask:%'").unwrap();
+    local
+        .conn
+        .execute_batch("DELETE FROM meta WHERE name LIKE 'askdigest:%'")
+        .unwrap();
+    apply_or_hold(&turn, &record, &local, &Fakes, "owner", &fix983_event(game, 5), None, true)
+        .await
+        .unwrap();
+    assert_eq!(ask_lane_len(), 1);
+    let down = drain_lane_once(&AsksDown(&record)).await;
+    assert_eq!(down, AsksDrained { batches: 1, asks: 0, faults: 1 });
+    assert!(asks_of(&record).is_empty());
+    let r = apply_or_hold(&turn, &record, &local, &Fakes, "owner", &fix983_event(game, 6), None, true)
+        .await
+        .unwrap();
+    let Applied::Done(report, _) = r else { panic!("held") };
+    assert_eq!(report.asks, 1, "the faulted identity publishes every game again");
+    assert_eq!(drain_lane_once(&record).await, AsksDrained { batches: 1, asks: 1, faults: 0 });
+    assert!(!asks_of(&record).is_empty());
+}
+
+/// (fix983_b) A WARM HAND'S APPLY IS UNDER THE BAR ON THE FIXTURE (bsv-low #983). The stranded hand, warm, in Phase C:
+/// five applies of one game timed on the real clock (the judge's stage the derivation and the mirror's reads; the
+/// outside asked once; the asks queued, not published) stay under the design's 300 ms apply bar in a RELEASE build
+/// (a debug build prints them). The stages sum to the apply and name the outside apart (`outsideMs`).
+#[tokio::test]
+async fn fix983_b_a_warm_hand_apply_is_under_the_bar() {
+    let (record, local, games) = fix983_warm_hand().await;
+    let turn = futures_util::lock::Mutex::new(());
+    let game = &games[0..1];
+    let mut walls: Vec<u128> = Vec::new();
+    for seq in 10..15 {
+        let t0 = std::time::Instant::now();
+        let r = apply_or_hold(&turn, &record, &local, &Fakes, "owner", &fix983_event(game, seq), None, true)
+            .await
+            .unwrap();
+        walls.push(t0.elapsed().as_millis());
+        let Applied::Done(report, _) = r else { panic!("held") };
+        let a = answer_of(&report, Vec::new());
+        assert!(a["outsideMs"].as_u64().is_some() && a["asksQueued"].as_u64().is_some());
+        take_ask_batches();
+    }
+    walls.sort_unstable();
+    eprintln!(
+        "fix983_b: warm Phase C applies of one game of {}: wall ms sorted {walls:?} ({} build)",
+        games.len(),
+        if cfg!(debug_assertions) { "debug" } else { "release" }
+    );
+    if !cfg!(debug_assertions) {
+        assert!(
+            walls[walls.len() - 1] < 300,
+            "a warm hand's apply is under the 300 ms bar: {walls:?}"
+        );
+    }
+}
+
+/// (fix983_c) THE OUTSIDE IS ASKED ONCE PER APPLY (bsv-low #983). The stranded hand with a word row for every spender
+/// the judge reads: a cold apply of its games takes more than one round, and the outside (the word views, CHAINTRACKS
+/// on the worker) is asked ONCE for the words, not once per round; the ask's time is the apply's `outsideMs` stage.
+/// RED on a31436e6: the outside asked every round (`left: 2 right: 1`).
+#[tokio::test]
+async fn fix983_c_the_outside_is_asked_once_per_apply() {
+    let record = seeded(&stranded());
+    record
+        .conn
+        .execute_batch("INSERT OR IGNORE INTO tx_words(txid,word,tier,updated_at) SELECT DISTINCT spendingTxid,'seen','hint',1 FROM pot_records WHERE spendingTxid IS NOT NULL")
+        .unwrap();
+    let games = games_of(&record, "owner");
+    let out = CountingOutside(Cell::new(0), Cell::new(0), Cell::new(0));
+    let local = mirror();
+    let (report, _) = apply(&record, &local, &out, "owner", &games, Some(("pot", 9)), Some(TIP), None)
+        .await
+        .unwrap();
+    eprintln!(
+        "fix983_c: cold apply of {} games: rounds {}, outside calls {}, word keys {}, roots {}, outsideMs {}",
+        games.len(),
+        report.rounds,
+        out.0.get(),
+        out.1.get(),
+        out.2.get(),
+        report.outside_ms
+    );
+    assert!(report.rounds >= 2, "the pin needs a multi-round apply: {}", report.rounds);
+    assert!(out.1.get() > 0, "the judge asked for words");
+    assert_eq!(out.0.get(), 1, "the outside is asked once per apply, not once per round");
+    // The ask's keys are the words the judge read, each once.
+    let words: usize = record
+        .conn
+        .query_row("SELECT COUNT(*) FROM tx_words", [], |r| r.get::<_, i64>(0))
+        .unwrap() as usize;
+    assert!(out.1.get() <= words);
+}
+
+/// (fix983_d) THE FLOOD IS SERVED APART (bsv-low #983). A pass that fans out to [`FLOOD_CONCURRENCY`] actors or more
+/// (the flood leg's 32 identities, a consumer batch of 16) is the STRESS class: its samples go to `classes.flood`
+/// (`rowsVisibleFloodMsP95` beside), never into `classes.direct`, `rowsVisibleDirectMsP95` or the first-visibility
+/// bar; a hand's pass (two seats) stays `direct`. The direct pass names its fan-out on every body (`concurrent`), the
+/// consumer's pass notes its batch's on the port, and the object classes by it. RED on a31436e6: no body carries a
+/// fan-out and every sample is `direct` (`bars_class` takes one argument there; the pin does not compile).
+#[tokio::test]
+async fn fix983_d_the_flood_is_served_apart() {
+    assert_eq!(FLOOD_CONCURRENCY, 8);
+    assert_eq!(bars_class(Some("direct"), Some(32)), "flood");
+    assert_eq!(bars_class(Some("direct"), Some(8)), "flood");
+    assert_eq!(bars_class(Some("direct"), Some(7)), "direct");
+    assert_eq!(bars_class(Some("direct"), Some(2)), "direct");
+    assert_eq!(bars_class(Some("direct"), None), "direct");
+    assert_eq!(bars_class(None, Some(16)), "flood");
+    assert_eq!(bars_class(None, Some(1)), "queue");
+    assert_eq!(bars_class(None, None), "queue");
+    // The fleet's bars: a flood's samples apart from the hand's.
+    let d1 = SqliteSql::migrated();
+    let mut p = PendingBars::default();
+    p.note_answer("direct", &json!({"identity": "hand", "applyMs": 120, "atMs": 1_000, "judgedAtMs": 1_400, "applied": true, "firstApply": true}));
+    p.note_answer("queue", &json!({"identity": "q", "applyMs": 90, "atMs": 1_000, "judgedAtMs": 1_900, "applied": true, "firstApply": true}));
+    for n in 0..32u64 {
+        p.note_answer("flood", &json!({"identity": format!("f{n}"), "applyMs": 3_000 + n, "atMs": 1_000, "judgedAtMs": 5_000 + n, "applied": true, "firstApply": true}));
+    }
+    flush_bars_from(&d1, 10_000, &p).await.unwrap();
+    let rows: Vec<Value> = d1
+        .run_batch(vec![Stmt::new(BARS_READ_SQL, vec![])])
+        .await
+        .unwrap()
+        .remove(0)
+        .rows;
+    assert_eq!(rows.len(), 3, "three class rows: {rows:?}");
+    let bars = fleet_bars(&rows, 10_000, lib_rev());
+    assert_eq!(bars["classes"]["direct"]["applyMsP95"], json!(120));
+    assert_eq!(bars["classes"]["direct"]["applySamples"], json!(1));
+    assert_eq!(bars["rowsVisibleDirectMsP95"], json!(400));
+    assert_eq!(bars["rowsVisibleMsP95"], json!(900), "the first visibility is the warm hand's and the queue's");
+    assert_eq!(bars["applyMsP95"], json!(120));
+    assert_eq!(bars["classes"]["flood"]["applySamples"], json!(32));
+    assert_eq!(bars["classes"]["flood"]["applyMsP95"], json!(3_030));
+    assert_eq!(bars["rowsVisibleFloodMsP95"], json!(4_030));
+    assert_eq!(bars["floodConcurrency"], json!(FLOOD_CONCURRENCY));
+    // The direct pass names its fan-out on every body.
+    let events: Vec<overlay_discovery::owed_event::OwedEvent> = (0..3)
+        .map(|i| {
+            serde_json::from_value(json!({"v": 1, "seq": 500 + i, "source": "hop",
+                "sourceKey": format!("{}:0", h("b9", i)), "facts": null, "atMs": NOW_MS}))
+            .unwrap()
+        })
+        .collect();
+    let port = Fold16Sampled(RefCell::new(Vec::new()));
+    let r = crate::owed_events::direct_with(&port, events, Some(TIP)).await;
+    {
+        let bodies = port.0.borrow();
+        assert_eq!(r.calls as usize, bodies.len());
+        assert!(!bodies.is_empty());
+        assert!(
+            bodies.iter().all(|b| b["concurrent"] == json!(bodies.len())),
+            "every body names the pass's fan-out: {bodies:?}"
+        );
+    }
+    // The consumer's pass notes its batch's fan-out on the port (bounded by the identities it delivers at once).
+    let w = WithActor {
+        d1: seeded(&stranded()),
+        actor: mirror(),
+        d1_judges: false,
+        event: Some(("pot", 7)),
+        actor_reads: false,
+        actor_fails: Cell::new(false),
+    };
+    let subjects: Vec<(String, Vec<String>)> = (0..40)
+        .map(|i| (format!("02{i:064x}"), vec!["g".to_string()]))
+        .collect();
+    NOTED_CONCURRENCY.with(|c| c.set(0));
+    let _ = crate::owed_events::judge_plan(&w, crate::owed_events::Plan::of_subjects(subjects[..3].to_vec())).await;
+    assert_eq!(NOTED_CONCURRENCY.with(|c| c.get()), 3);
+    let _ = crate::owed_events::judge_plan(&w, crate::owed_events::Plan::of_subjects(subjects)).await;
+    assert_eq!(
+        NOTED_CONCURRENCY.with(|c| c.get()),
+        crate::owed_events::JUDGE_IDENTITIES_AT_ONCE as u32
+    );
+    // The wiring: the D1 judge's body carries it; the object classes its own note by it.
+    let judge: String = include_str!("../owed_judge.rs").split_whitespace().collect();
+    assert!(judge.contains("body[\"concurrent\"]=json!(self.concurrent.get());"));
+    let object: String = include_str!("object.rs").split_whitespace().collect();
+    assert!(object.contains("note_answer_as(bars_class(body.class.as_deref(),body.concurrent),&answer);"));
+}
+
+/// (fix983_e) THE RECORD WORK THAT IS NOT THE APPLY'S RUNS AFTER THE ANSWER (bsv-low #983): the object's `/apply`
+/// defers the asks lane's drain, the misses' counter and the bars' flush to `wait_until` ([`OwedActor::after_apply`]),
+/// and its alarm drains the lane too; the stage rings carry `outside`; the consumer's Phase C delivery and the direct
+/// pass note a faulted apply's event ([`note_actor_fault`], the unapplied figure's source in every phase). Source pins
+/// (wasm32 only).
+#[test]
+fn fix983_e_the_object_defers_the_record_work_that_is_not_the_applys() {
+    let object: String = include_str!("object.rs").split_whitespace().collect();
+    assert!(object.contains("self.after_apply(misses);Response::from_json(&answer)"));
+    assert!(object.contains("self.state.wait_until(asyncmove{letOk(record)=crate::routes::D1Sql::of(&env)else{return;};ifmisses>0{record.counters(vec![(COUNTERS[27].into(),missesasu64)]).await;}drain_lane_once(&record).await;flush_bars(&record,Date::now().as_millis(),false).await;});"));
+    assert!(object.contains("self.after_apply(0);Response::ok(\"ok\")"));
+    assert!(!object.contains("flush_bars(&record,now,false).await;answer[\"noted\"]"));
+    assert!(APPLY_STAGES.iter().any(|(f, r)| *f == "outsideMs" && *r == "outside"));
+    let actor: String = include_str!("../owed_actor.rs").split_whitespace().collect();
+    assert!(actor.contains("note_actor_fault(&id,db.event_at_ms());returnErr(e);"), "Phase C's delivery notes a faulted apply");
+    let events: String = include_str!("../owed_events.rs").split_whitespace().collect();
+    assert!(events.contains("b[\"concurrent\"]=json!(fan_out);"));
+    assert!(events.contains("db.note_concurrency(order.len().min(JUDGE_IDENTITIES_AT_ONCE)asu32);"));
+}
+
+/// (fix982_a) THE UNAPPLIED FIGURE IS THE ACTOR'S IN EVERY PHASE (bsv-low #982). `oldestUnappliedEventAgeMs` is the
+/// oldest event an actor holds unapplied: the oldest HELD event (an actor not bootstrapped, `holding.oldestAtMs`) or
+/// the oldest event whose apply FAULTED with no later apply of its identity landed (the queue row's
+/// `oldestUnappliedAtMs`, noted by the consumer and the direct pass), whichever is older, its source named; a D1
+/// mark is never one (the reconcile's `backfill` marks, the age repair's, the sweep's: Phase C's dirty backlog, 590 s
+/// on beta with `holding` 0), and its age is served beside as `oldestUnackedMarkAgeMs`. RED on a31436e6: with the D1
+/// judge off the figure was the un-acked mark's age (`left: 590000 right: null`).
+#[tokio::test]
+async fn fix982_a_the_unapplied_figure_is_the_oldest_held_or_faulted_event_in_every_phase() {
+    assert_eq!(unapplied_event_age(None, None), (None, None));
+    assert_eq!(unapplied_event_age(Some(90_000), None), (Some(90_000), Some("held")));
+    assert_eq!(unapplied_event_age(None, Some(7_000)), (Some(7_000), Some("faulted")));
+    assert_eq!(unapplied_event_age(Some(5_000), Some(7_000)), (Some(7_000), Some("faulted")));
+    assert_eq!(unapplied_event_age(Some(90_000), Some(7_000)), (Some(90_000), Some("held")));
+    let d1 = SqliteSql::migrated();
+    let now = 1_000_000u64;
+    async fn snapshot(d1: &SqliteSql, now: u64) -> Value {
+        d1.run_batch(vec![health_snapshot_stmt(now, true)]).await.unwrap();
+        let cursor: String = d1
+            .conn
+            .query_row("SELECT cursor FROM owed_belt_state WHERE name='owed-actor:health'", [], |r| r.get(0))
+            .unwrap();
+        health_snapshot_of(Some(&cursor)).unwrap()
+    }
+    // Every event applied, a dirty mark 590 s old (Phase C's reconcile driver): no unapplied event, whatever the phase.
+    let mark = json!(590_000);
+    let body = health_body(Some(&snapshot(&d1, now).await), now, &mark);
+    assert_eq!(
+        (body["oldestUnappliedEventAgeMs"].clone(), body["oldestUnappliedEventSource"].clone(), body["oldestUnackedMarkAgeMs"].clone()),
+        (Value::Null, Value::Null, json!(590_000)),
+        "a mark is no unapplied event: {body}"
+    );
+    // A faulted apply's event (the consumer's or the direct pass's note), no later apply of its identity landed.
+    let mut p = PendingBars::default();
+    p.note_fault("owner", Some(now - 7_000));
+    flush_bars_from(&d1, now, &p).await.unwrap();
+    let body = health_body(Some(&snapshot(&d1, now).await), now, &mark);
+    assert_eq!(
+        (body["oldestUnappliedEventAgeMs"].clone(), body["oldestUnappliedEventSource"].clone()),
+        (json!(7_000), json!("faulted"))
+    );
+    // An actor holding its events (not bootstrapped) since 90 s: the older of the two, named.
+    d1.conn
+        .execute(
+            "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-actor:holding:owner','{}',?1)",
+            [now - 90_000],
+        )
+        .unwrap();
+    let body = health_body(Some(&snapshot(&d1, now).await), now, &mark);
+    assert_eq!(
+        (body["oldestUnappliedEventAgeMs"].clone(), body["oldestUnappliedEventSource"].clone(), body["holding"]["oldestMs"].clone()),
+        (json!(90_000), json!("held"), json!(90_000))
+    );
+    // The hold ends and a later apply of the identity lands: nothing unapplied, the mark still named apart.
+    d1.conn
+        .execute_batch("DELETE FROM owed_belt_state WHERE name='owed-actor:holding:owner'")
+        .unwrap();
+    let mut p = PendingBars::default();
+    p.note_fault("owner", Some(now - 7_000));
+    p.note_answer("queue", &json!({"identity": "owner", "applyMs": 1, "applied": true}));
+    flush_bars_from(&d1, now, &p).await.unwrap();
+    let body = health_body(Some(&snapshot(&d1, now).await), now, &mark);
+    assert_eq!(
+        (body["oldestUnappliedEventAgeMs"].clone(), body["oldestUnappliedEventSource"].clone(), body["oldestUnackedMarkAgeMs"].clone()),
+        (Value::Null, Value::Null, json!(590_000))
+    );
+    // The route hands the figure the mark's age only to name it; no phase flag reaches it.
+    let routes: String = include_str!("../routes.rs").split_whitespace().collect();
+    assert!(routes.contains("body[\"owedActor\"]=crate::owed_actor::health_body(actor_snapshot.as_ref(),worker::Date::now().as_millis(),&body[\"owedEvents\"][\"oldestUnackedMarkAgeMs\"],);"));
 }

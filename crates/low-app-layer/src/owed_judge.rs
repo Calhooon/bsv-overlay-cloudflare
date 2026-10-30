@@ -242,6 +242,10 @@ pub trait JudgeDb: SqlPort {
     fn event_at_ms(&self) -> Option<u64> {
         None
     }
+    /// FIX-983 (bsv-low #983): the pass's fan-out (the identities the consumer's batch delivers at once), named on
+    /// each actor body as `concurrent`: at `owed_actor::FLOOD_CONCURRENCY` or more the object samples the call into
+    /// the stress class. The default keeps nothing (the native judges, no actor bound).
+    fn note_concurrency(&self, _n: u32) {}
     /// bsv-low #912: the identity's actor applies the games (`owed_actor::object::call_apply`); `None` where no
     /// actor is bound (the native judges, a render without the class).
     async fn actor_deliver(
@@ -318,6 +322,8 @@ pub struct D1Judge {
     /// ([`JudgeDb::note_marks_touch`]), BY IDENTITY (FIX-952: the batch's identities are delivered at once); a value
     /// of `None`: a mark asked for the whole closure.
     marks_touch: std::cell::RefCell<std::collections::BTreeMap<String, Option<Vec<String>>>>,
+    /// FIX-983: the batch's fan-out ([`JudgeDb::note_concurrency`]), on each actor body as `concurrent`.
+    concurrent: std::cell::Cell<u32>,
 }
 impl D1Judge {
     pub fn new(env: &worker::Env, tip: Option<u64>, era_ms: Option<i64>) -> worker::Result<Self> {
@@ -327,6 +333,7 @@ impl D1Judge {
             era_ms,
             event: None,
             marks_touch: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            concurrent: std::cell::Cell::new(1),
             d1_judges: crate::owed_actor::d1_judge_on(
                 env.var(crate::owed_actor::D1_JUDGE_FLAG)
                     .ok()
@@ -417,6 +424,9 @@ impl JudgeDb for D1Judge {
     fn event_at_ms(&self) -> Option<u64> {
         self.event.as_ref().map(|e| e.at_ms.max(0) as u64)
     }
+    fn note_concurrency(&self, n: u32) {
+        self.concurrent.set(n.max(1));
+    }
     async fn actor_deliver(
         &self,
         identity: &str,
@@ -441,6 +451,7 @@ impl JudgeDb for D1Judge {
         }
         let mut body = crate::owed_actor::apply_body(identity, games, &event, self.tip);
         body["bound"] = json!(bound);
+        body["concurrent"] = json!(self.concurrent.get());
         crate::owed_actor::object::call_apply(
             &self.sql.env,
             &body,
