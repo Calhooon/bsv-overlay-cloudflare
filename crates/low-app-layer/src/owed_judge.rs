@@ -301,6 +301,16 @@ pub trait JudgeDb: SqlPort {
     {
         hydrate::stored_tx_facts(self, txid, from).await
     }
+    /// FIX-997 (bsv-low #997): the facts of a transaction the results view selected a `pot_beefs` BEEF for (`hex`,
+    /// the view's own column). The D1 judge decodes the hex it already read (no statement: the view's read is the
+    /// read); the actor serves its mirror's `txfacts` of that same row (`pot`), decoded at the copy by the same
+    /// decoder ([`facts_of_beefs`]).
+    async fn result_tx_facts(&self, txid: &str, hex: &str) -> Result<Option<TxFacts>, String>
+    where
+        Self: Sized,
+    {
+        Ok(facts_of_beefs(txid, [hex]))
+    }
     async fn hydrate(&self, identity: &str, games: &[String]) -> Result<JudgeInputs, String>
     where
         Self: Sized,

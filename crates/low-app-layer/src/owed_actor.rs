@@ -600,6 +600,10 @@ impl<L: SqlPort, O: Outside> JudgeDb for ActorJudge<'_, L, O> {
     async fn push(&self, identity: &str, body: Value) {
         self.pushes.borrow_mut().push((identity.to_string(), body));
     }
+    /// FIX-997: the mirror holds no bytes (the view's hex is empty): the `pot` facts decoded from that row at the copy.
+    async fn result_tx_facts(&self, txid: &str, _hex: &str) -> Result<Option<TxFacts>, String> {
+        self.tx_facts(txid, FactsFrom::PotBeefs).await
+    }
     async fn tx_facts(&self, txid: &str, from: FactsFrom) -> Result<Option<TxFacts>, String> {
         let sql = match from {
             FactsFrom::PotBeefs => TXFACTS_POT_SQL,

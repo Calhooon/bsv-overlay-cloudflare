@@ -1157,22 +1157,22 @@ impl TxFacts {
 /// FIX-997 (bsv-low #997, READ-986 item 2(a)): the results view's two BEEF columns served from the transactions'
 /// FACTS on both judges. Where the view selected a BEEF (`fundingBeef` for a row with no decoded params,
 /// `spenderBeef` where the stored verdict is not current or the proven height is missing, both `pot_beefs`), the
-/// judge reads that transaction's facts from the same table (`FactsFrom::PotBeefs`: the D1 judge decodes the BEEF at
-/// the read, the actor serves its mirror's `txfacts`, decoded at the copy) into `results::DecodedTx` and drops the
-/// hex, so the classification and the bump's height are one function of one decode on both sides. A transaction
+/// judge takes that transaction's facts from the same row (`JudgeDb::result_tx_facts`: the D1 judge decodes the hex
+/// the view read, no statement added; the actor serves its mirror's `pot` facts, decoded at the copy by the same
+/// decoder) into `results::DecodedTx` and drops the hex, so the classification and the bump's height are one function of one decode on both sides. A transaction
 /// the BEEF does not carry whole decodes to nothing, as its hex did.
 async fn decode_result_row(db: &impl JudgeDb, r: &mut results::ResultsRow) -> Result<(), String> {
-    if r.spender_beef_hex.take().is_some() {
+    if let Some(hex) = r.spender_beef_hex.take() {
         if let Some(s) = r.spending_txid.as_deref() {
             r.spender_decoded = db
-                .tx_facts(&s.to_ascii_lowercase(), FactsFrom::PotBeefs)
+                .result_tx_facts(&s.to_ascii_lowercase(), &hex)
                 .await?
                 .and_then(TxFacts::decoded);
         }
     }
-    if r.funding_beef_hex.take().is_some() {
+    if let Some(hex) = r.funding_beef_hex.take() {
         r.funding_decoded = db
-            .tx_facts(&r.pot_txid.to_ascii_lowercase(), FactsFrom::PotBeefs)
+            .result_tx_facts(&r.pot_txid.to_ascii_lowercase(), &hex)
             .await?
             .and_then(TxFacts::decoded);
     }
