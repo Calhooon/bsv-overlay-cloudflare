@@ -341,8 +341,8 @@ name = "low-app-layer-beta"
 [env.beta.vars]
 # bsv-low #912 (D2-ACTOR-B): Phase B's read flag (the actor's rows served) and Phase C's (the D1 judge off). Off and
 # on until E4: Phase A, the actor applies beside the D1 judge and its rows are compared.
-OWED_ACTOR_READ = "false"
-OWED_D1_JUDGE = "true"
+OWED_ACTOR_READ = "true"
+OWED_D1_JUDGE = "false"
 # D2-ACTOR-D (bsv-low #952): the `owed-events` consumer's concurrency, the cutover doc's knob: "1" while the D1 judge
 # writes `owed_rows` (Phases A and B: two consumers judging one identity's games are two D1 writers); Phase C (the
 # actor the one writer, each identity serialised by its own Durable Object) raises it, moved WITH the consumer's
@@ -358,7 +358,7 @@ OWED_D1_JUDGE = "true"
 # THIS render is the next commented line (with the consumer block's below), pinned equal to
 # `owed_events::CONSUMER_CONCURRENCY_PHASE_C`:
 # PHASE C: OWED_CONSUMER_CONCURRENCY = "4"
-OWED_CONSUMER_CONCURRENCY = "1"
+OWED_CONSUMER_CONCURRENCY = "4"
 # D2-ACTOR-B-FOLD-15: D1's re-judge's games a tick after a JUDGE_VERSION move (at most 32; "0" pauses). The lever
 # `POST /internal/owed-rejudge {"gamesPerTick": N}` (bearer INTERNAL_TOKEN) overrides it with no deploy.
 OWED_D1_REJUDGE_GAMES_PER_TICK = "32"
@@ -482,7 +482,7 @@ dead_letter_queue = "low-owed-events-beta-dlq"
 # `owed_events::CONSUMER_CONCURRENCY_PHASE_C`. Within one consumer the batch's identities are delivered at once
 # (`owed_events::JUDGE_IDENTITIES_AT_ONCE`, FIX-952) in every phase.
 # PHASE C: max_concurrency = 4
-max_concurrency = 1
+max_concurrency = 4
 
 # LOW-3: the owed events' dead letters, parked in D1 (`owed_event_dead_letters`,
 # park first, ack after) and re-driven by the overlay's lever

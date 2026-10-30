@@ -5469,7 +5469,7 @@ async fn d2_actor_d_e_an_out_of_order_seq_is_held_and_filled() {
 }
 
 /// The concurrency knob (bsv-low #952, item 3): `OWED_CONSUMER_CONCURRENCY` in each render equals the consumer's
-/// `max_concurrency`, 1 in both environments today; a value past 1 is refused while the D1 judge writes.
+/// `max_concurrency`: 1 on prod, 4 on beta since the Phase C render (bsv-low record 1550); a value past 1 is refused while the D1 judge writes.
 #[test]
 fn d2_actor_d_the_consumer_concurrency_knob_moves_with_the_config() {
     use crate::owed_events::{consumer_concurrency_of, consumer_concurrency_refused};
@@ -5487,7 +5487,7 @@ fn d2_actor_d_the_consumer_concurrency_knob_moves_with_the_config() {
         .filter(|l| l.starts_with(&var_line))
         .map(|l| consumer_concurrency_of(l.split('"').nth(1)))
         .collect();
-    assert_eq!(vars, vec![1, 1], "prod and beta");
+    assert_eq!(vars, vec![1, 4], "prod and beta (beta at Phase C with the consumer concurrency 4, the owner's ruling of bsv-low record 1550; prod still Phase A at 1)");
     for (env, var) in ["", "env.beta."].iter().zip(vars) {
         let head = format!("{env}queues.consumers]]");
         let block = render
