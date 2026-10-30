@@ -459,12 +459,12 @@
       "censusKey": null
     },
     "owed-fleet-compare-tick": {
-      "route": "POST /internal/owed-actor-compare {\"tick\": true}: one tick of the standing fresh compare's ring (FIX-986-COMPARE-2, bsv-low #986, READ-986 item 4) over the belt tier's seed after its cells: the ring's state and the Phase C flip read, the identity page walked by index seeks (RING_IDENTITIES_SQL; the union page it replaced read 555 rows here), 2 hex identities, each recorded as a fault (the tier binds no owed actor: no fresh judgement is made for an identity the ring cannot compare), each row written with the cursor, the revolution wrapped. A production tick's fresh judgement per identity is the `owed-actor-rows-fresh` cell's",
+      "route": "POST /internal/owed-actor-compare {\"tick\": true}: one tick of the standing fresh compare's ring (FIX-986-COMPARE-2, bsv-low #986, READ-986 item 4) over the belt tier's seed after its cells: the ring's state and the Phase C flip read, the identity page walked by index seeks (RING_IDENTITIES_SQL; the union page it replaced read 555 rows here), 2 hex identities, each recorded as a fault (the tier binds no owed actor: no fresh judgement is made for an identity the ring cannot compare), each row written with the cursor, the revolution wrapped. A production tick's fresh judgement per identity is the `owed-actor-rows-fresh` cell's. FIX-998 (bsv-low #998): the ring runs in 4 shards, the cell ticks each and records the heaviest shard's tick (each its own invocation)",
       "measured": {
         "reads": 60,
-        "writes": 8,
-        "stmts": 9,
-        "maxReads": 56
+        "writes": 5,
+        "stmts": 8,
+        "maxReads": 46
       },
       "ceiling": {
         "reads": 90,
@@ -507,18 +507,18 @@
       "censusKey": null
     },
     "owed-fleet-compare-read": {
-      "route": "GET /internal/owed-actor-compare: the standing compare's three reads (the fleet's aggregate, a page of 64 rows worth naming, the ring's state) (FIX-986-COMPARE-2)",
+      "route": "GET /internal/owed-actor-compare: the standing compare's three reads (the fleet's aggregate, a page of 64 rows worth naming, the ring's state) (FIX-986-COMPARE-2). FIX-998: the ring's state is every shard's row, one range of the ledger's key (4 rows)",
       "measured": {
-        "reads": 5,
+        "reads": 8,
         "writes": 0,
         "stmts": 3,
-        "maxReads": 2
+        "maxReads": 4
       },
       "ceiling": {
-        "reads": 8,
+        "reads": 12,
         "writes": 1,
         "stmts": 5,
-        "maxReads": 3
+        "maxReads": 6
       },
       "censusKey": null
     },

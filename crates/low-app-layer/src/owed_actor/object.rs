@@ -1755,7 +1755,8 @@ pub async fn compare_lever(mut req: Request, env: &Env) -> Result<Response> {
         };
         // `{"tick": true}`: one tick of the ring on demand (the operator's, and the budget tier's), its own function.
         if body["tick"] == true {
-            return fleet_compare_tick_env(env).await;
+            let shard = body["shard"].as_u64().unwrap_or(0) as usize;
+            return fleet_compare_tick_env(env, shard).await;
         }
         let Some(me) = body["identity"].as_str().and_then(actor_name) else {
             return Response::error("identity is not a 66-hex key", 400);
@@ -1786,15 +1787,24 @@ pub async fn compare_lever(mut req: Request, env: &Env) -> Result<Response> {
         },
     };
     let db = crate::routes::D1Sql::of(env)?;
-    match super::compare::read_answer(&db, &param("after"), &identity, now).await {
+    match super::compare::read_answer(
+        &db,
+        &param("after"),
+        &identity,
+        now,
+        super::compare::shards_env(env),
+    )
+    .await
+    {
         Ok(a) => Response::from_json(&a),
         Err(e) => Response::error(format!("compare read: {e}"), 503),
     }
 }
 
-/// The ring's tick in its own actor's alarm (FIX-986, READ-986 item 4): the D1 judge's port under the served tip
-/// and the era, the render's per-tick setting.
-pub async fn fleet_compare_tick_env(env: &Env) -> Result<Response> {
+/// One shard's tick in its own actor's alarm (FIX-986, READ-986 item 4; FIX-998's shards): the D1 judge's port under
+/// the served tip and the era, the render's per-tick and shard settings. A shard past the render's count compares
+/// nothing.
+pub async fn fleet_compare_tick_env(env: &Env, shard: usize) -> Result<Response> {
     let started = Date::now().as_millis();
     let tip = crate::owed_events::tip_memoised(env, false).await;
     let judge =
@@ -1805,14 +1815,20 @@ pub async fn fleet_compare_tick_env(env: &Env) -> Result<Response> {
             .map(|v| v.to_string())
             .as_deref(),
     );
-    match super::compare::ring_tick(&judge, started as i64, per_tick, || {
+    let shards = super::compare::shards_env(env);
+    if shard >= shards {
+        return Response::error(format!("shard {shard} of {shards}"), 400);
+    }
+    match super::compare::ring_tick(&judge, started as i64, shard, shards, per_tick, || {
         Date::now().as_millis().saturating_sub(started)
     })
     .await
     {
         Ok(r) => {
             console_log!(
-                "[owed-fleet-compare] compared {} diffs {} faults {} statements {} cursor {:?} wrapped {} stopped {:?}",
+                "[owed-fleet-compare] shard {}/{} compared {} diffs {} faults {} statements {} cursor {:?} wrapped {} stopped {:?}",
+                shard,
+                shards,
                 r.compared.len(),
                 r.diffs,
                 r.faults,
@@ -1822,7 +1838,7 @@ pub async fn fleet_compare_tick_env(env: &Env) -> Result<Response> {
                 r.stopped
             );
             Response::from_json(&json!({
-                "compared": r.compared.len(), "diffs": r.diffs, "faults": r.faults,
+                "shard": shard, "shards": shards, "compared": r.compared.len(), "diffs": r.diffs, "faults": r.faults,
                 "statements": r.statements, "cursor": r.cursor, "wrapped": r.wrapped, "stopped": r.stopped,
             }))
         }
