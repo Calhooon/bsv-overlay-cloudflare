@@ -2989,6 +2989,25 @@ impl PotStorage for D1PotStorage {
         eprintln!("{msg}");
     }
 
+    /// bsv-low #936 (the FIX-936 lens 3's NIT-3): the completion arm's line
+    /// (`worker-logs.py --grep "bytes written at its spend"`).
+    fn note_bytes_completed_at_spend(
+        &self,
+        txid: &str,
+        output_index: u32,
+        topic: &str,
+        spending_txid: &str,
+    ) {
+        let msg = format!(
+            "[pot-index] {txid}:{output_index} under {topic} bytes written at its spend by \
+             {spending_txid}: the pot was recorded without them (bsv-low #936)"
+        );
+        #[cfg(target_arch = "wasm32")]
+        worker::console_warn!("{msg}");
+        #[cfg(not(target_arch = "wasm32"))]
+        eprintln!("{msg}");
+    }
+
     async fn network_seen_for(&self, txids: &[String]) -> Result<Vec<bool>, PotStorageError> {
         if txids.is_empty() {
             return Ok(Vec::new());
@@ -14993,7 +15012,39 @@ mod tests {
             .unwrap();
         assert!(none.is_none(), "no engine row: no copy");
 
-        // (2) The heal over an absent pot.
+        // (2) The heal over an absent pot, from its FIRST statement: the
+        // record read (`get_spent_status`) answers no row (lens 3's NIT-1).
+        let record_read = format!(
+            "SELECT {POT_RECORD_COLUMNS} FROM pot_records WHERE txid = ? AND outputIndex = ?"
+        );
+        let recorded = |txid: &str| -> bool {
+            conn.query_row(&record_read, rusqlite::params![txid, 0i64], |_| Ok(()))
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(!recorded("p936"), "the record read: absent");
+        // The heal path's ledger read (lens 3's LOW-1), `evictions_for`'s
+        // statement: no row heals; an OPEN row (`readmittedAt` NULL) does
+        // not; a readmitted row does.
+        let ledger_sql = overlay_discovery::pot::storage::evictions_by_txid_sql(1);
+        let ledger = |txid: &str| -> Option<Option<i64>> {
+            conn.query_row(&ledger_sql, [txid], |r| r.get::<_, Option<i64>>(2))
+                .optional()
+                .unwrap()
+        };
+        assert_eq!(ledger("p936"), None, "no ledger row: the heal runs");
+        conn.execute(
+            "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved) VALUES ('e936', 'x', 1, NULL, 1), ('r936e', 'x', 1, 2, 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            ledger("e936"),
+            Some(None),
+            "an OPEN row: the heal writes nothing"
+        );
+        assert_eq!(ledger("r936e"), Some(Some(2)), "a readmitted row: held");
         assert!(probe("p936").is_none(), "has_beef: absent");
         exec_store(
             &conn,
@@ -15005,6 +15056,18 @@ mod tests {
             Some(1250),
             Some(2500),
             1,
+        );
+        // The admission's two best-effort statements, in its order.
+        conn.execute(
+            pot_funding_facts_fill_sql(),
+            rusqlite::params![321i64, 79i64, "p936", 0i64],
+        )
+        .unwrap();
+        conn.execute(lb_pot_flip_sql(), ["p936", "p936", "p936"])
+            .unwrap();
+        assert!(
+            recorded("p936"),
+            "the hook's re-read finds the healed record"
         );
         conn.execute(
             POT_BEEF_ADMIT_WRITE_SQL,
