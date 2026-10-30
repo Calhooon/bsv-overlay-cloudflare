@@ -233,8 +233,11 @@ pub trait JudgeDb: SqlPort {
     }
     /// D2-ACTOR-E (bsv-low #954): Phase A's D1 judge tells its actor deliveries the txids of the marks it is about
     /// to acknowledge (`None`: a mark asks for the whole closure), so the actor's narrowed apply, deferred or inline,
-    /// reads their rows itself. The default keeps nothing (no actor bound).
-    fn note_marks_touch(&self, _marks_touch: Option<Vec<String>>) {}
+    /// reads their rows itself. The default keeps nothing (no actor bound). FIX-952 (bsv-low #952): keyed by the
+    /// `identity` whose delivery noted them, since one judge serves a batch's identities AT ONCE (`judge_plan`): a
+    /// single slot let identity B's marks replace A's between A's note and A's deferred apply, and A's narrowed read
+    /// would have missed the rows A's own marks named.
+    fn note_marks_touch(&self, _identity: &str, _marks_touch: Option<Vec<String>>) {}
     /// The write time of the event this judge serves (the actor's own oldest-unapplied age, MEDIUM-7).
     fn event_at_ms(&self) -> Option<u64> {
         None
@@ -311,9 +314,10 @@ pub struct D1Judge {
     event: Option<crate::owed_actor::EventCtx>,
     d1_judges: bool,
     actor_reads: bool,
-    /// D2-ACTOR-E: the txids of the marks this delivery's D1 judge acknowledges ([`JudgeDb::note_marks_touch`]);
-    /// `Some(None)`: a mark asked for the whole closure.
-    marks_touch: std::cell::RefCell<Option<Option<Vec<String>>>>,
+    /// D2-ACTOR-E: the txids of the marks each identity's delivery's D1 judge acknowledges
+    /// ([`JudgeDb::note_marks_touch`]), BY IDENTITY (FIX-952: the batch's identities are delivered at once); a value
+    /// of `None`: a mark asked for the whole closure.
+    marks_touch: std::cell::RefCell<std::collections::BTreeMap<String, Option<Vec<String>>>>,
 }
 impl D1Judge {
     pub fn new(env: &worker::Env, tip: Option<u64>, era_ms: Option<i64>) -> worker::Result<Self> {
@@ -322,7 +326,7 @@ impl D1Judge {
             tip,
             era_ms,
             event: None,
-            marks_touch: std::cell::RefCell::new(None),
+            marks_touch: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             d1_judges: crate::owed_actor::d1_judge_on(
                 env.var(crate::owed_actor::D1_JUDGE_FLAG)
                     .ok()
@@ -340,11 +344,17 @@ impl D1Judge {
         self.event = Some(event);
         self
     }
-    /// D2-ACTOR-E: the event as its actor delivery carries it: its own txids and those of the marks the D1 judge
-    /// acknowledges ([`JudgeDb::note_marks_touch`]); `None` txids (the whole closure) when either asks for it.
-    fn delivered_event(&self) -> Option<crate::owed_actor::EventCtx> {
+    /// D2-ACTOR-E: the event as `identity`'s actor delivery carries it: its own txids and those of the marks the D1
+    /// judge acknowledges for THAT identity ([`JudgeDb::note_marks_touch`]); `None` txids (the whole closure) when
+    /// either asks for it.
+    fn delivered_event(&self, identity: &str) -> Option<crate::owed_actor::EventCtx> {
         let mut event = self.event.clone()?;
-        if let Some(marks) = self.marks_touch.borrow().clone() {
+        if let Some(marks) = self
+            .marks_touch
+            .borrow()
+            .get(&identity.to_ascii_lowercase())
+            .cloned()
+        {
             event.txids = match (event.txids.take(), marks) {
                 (Some(mut t), Some(more)) => {
                     t.extend(more);
@@ -382,11 +392,13 @@ impl JudgeDb for D1Judge {
     fn actor_reads(&self) -> bool {
         self.actor_reads
     }
-    fn note_marks_touch(&self, marks_touch: Option<Vec<String>>) {
-        *self.marks_touch.borrow_mut() = Some(marks_touch);
+    fn note_marks_touch(&self, identity: &str, marks_touch: Option<Vec<String>>) {
+        self.marks_touch
+            .borrow_mut()
+            .insert(identity.to_ascii_lowercase(), marks_touch);
     }
     fn defer_actor(&self, identity: &str, games: &[String], bound: Option<i64>) -> bool {
-        let Some(event) = self.delivered_event() else {
+        let Some(event) = self.delivered_event(identity) else {
             return false;
         };
         if self.actor_reads || crate::owed_actor::object::stub_of(&self.sql.env, identity).is_none()
@@ -421,7 +433,7 @@ impl JudgeDb for D1Judge {
         games: &[String],
         bound: Option<i64>,
     ) -> Result<Option<Value>, String> {
-        let Some(event) = self.delivered_event() else {
+        let Some(event) = self.delivered_event(identity) else {
             return Ok(None);
         };
         if crate::owed_actor::object::stub_of(&self.sql.env, identity).is_none() {

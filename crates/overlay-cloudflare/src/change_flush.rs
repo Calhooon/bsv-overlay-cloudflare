@@ -685,6 +685,22 @@ impl FlushPort for WorkerFlush<'_> {
 pub const OWED_DIRECT_BODY_MAX: usize = 64;
 /// The wall of one hand-off POST (the app layer answers before it calls any actor).
 pub const OWED_DIRECT_POST_WALL_MS: u64 = 2_000;
+
+/// What one hand-off did ([`ship_owed_direct_with`]): the POSTs made, the chunks that walled or were refused (each
+/// one fault, `owed_actor_direct_faults_total`), the events a fault left to the queue, and the operator's lines
+/// (the caller logs them; this function never does, so a native pin runs it).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OwedDirectShipped {
+    /// The POSTs made (one a chunk of at most [`OWED_DIRECT_BODY_MAX`] events).
+    pub posts: usize,
+    /// The chunks that walled, were refused or were never started: each one fault.
+    pub faults: u64,
+    /// The events those chunks carried: the queue's alone now.
+    pub left_to_queue: usize,
+    /// The operator's lines, for the caller to log.
+    pub lines: Vec<String>,
+}
+
 /// D2-ACTOR-D (bsv-low #952; the design's bar 2 as amended: "the writer calls the identity's actor directly after its
 /// answer, the queue is the durable backstop"): the overlay's flush point hands its published events (the direct set
 /// `owed_events::publish_env` held, [`crate::owed_events::take_direct`]) to the app layer, which calls each identity's
@@ -696,6 +712,12 @@ pub const OWED_DIRECT_POST_WALL_MS: u64 = 2_000;
 /// [`OWED_DIRECT_POST_WALL_MS`] from its start and the flush's own `deadline_ms` (it was 2 s a chunk, after which the
 /// flush computed its 20 s wall: up to 8 chunks of 2 s stacked on it). A chunk not started inside it is left to the
 /// queue, logged and counted as one fault.
+///
+/// FIX-952 (bsv-low #952, item 1): the hand-off is [`ship_owed_direct_with`] over the transport, the clock and the
+/// timer, so the pin `fix952_e` runs the shipped chunking, wall and fault rule natively with the app layer's own
+/// route body parser and direct pass on the other side of a fake binding; this wrapper supplies the `APP_LAYER`
+/// binding's POST ([`post_body_answer`]: the bearer `INTERNAL_TOKEN` the binding's caller holds), the platform clock
+/// and `Delay`, and logs the lines.
 pub async fn ship_owed_direct(env: &Env, deadline_ms: u64) {
     let events = crate::owed_events::take_direct();
     if events.is_empty() {
@@ -708,45 +730,85 @@ pub async fn ship_owed_direct(env: &Env, deadline_ms: u64) {
         );
         return;
     };
-    let mut faults = 0u64;
-    let end = owed_direct_end(Date::now().as_millis(), deadline_ms);
+    let shipped = ship_owed_direct_with(
+        events,
+        |body| {
+            post_body_answer(
+                env,
+                &url,
+                &token,
+                "/internal/owed-direct",
+                "owed-direct",
+                body,
+            )
+        },
+        || Date::now().as_millis(),
+        deadline_ms,
+        |ms| Delay::from(std::time::Duration::from_millis(ms)),
+    )
+    .await;
+    for line in &shipped.lines {
+        console_log!("{line}");
+    }
+    if shipped.faults > 0 {
+        crate::owed_events::bump(env, &[("owed_actor_direct_faults_total", shipped.faults)]).await;
+    }
+}
+
+/// THE HAND-OFF over its ports (FIX-952): `events` chunked at [`OWED_DIRECT_BODY_MAX`], each chunk ONE body
+/// `{"events": [<the queue's own message text>, ...]}` (every event as it rides the queue: its `seq`, `atMs`, source
+/// and facts, so the app layer's actor call carries the queue delivery's key) POSTed through `post` (`Ok`: a 2xx;
+/// `Err`: refused), under ONE wall: the earlier of [`OWED_DIRECT_POST_WALL_MS`] from the first `now_ms()` and
+/// `deadline_ms` ([`owed_direct_end`]); a chunk not started inside it is left to the queue. Each walled, refused or
+/// unstarted chunk is one fault and one line.
+pub async fn ship_owed_direct_with<P, Fut, C, S, Sleep>(
+    events: Vec<overlay_discovery::owed_event::OwedEvent>,
+    mut post: P,
+    now_ms: C,
+    deadline_ms: u64,
+    sleep: S,
+) -> OwedDirectShipped
+where
+    P: FnMut(String) -> Fut,
+    Fut: Future<Output = std::result::Result<String, ()>>,
+    C: Fn() -> u64,
+    S: Fn(u64) -> Sleep,
+    Sleep: Future<Output = ()>,
+{
+    let mut out = OwedDirectShipped::default();
+    let end = owed_direct_end(now_ms(), deadline_ms);
     for (n, chunk) in events.chunks(OWED_DIRECT_BODY_MAX).enumerate() {
-        let left = end.saturating_sub(Date::now().as_millis());
+        let left = end.saturating_sub(now_ms());
         if left == 0 {
             let rest = events.len() - n * OWED_DIRECT_BODY_MAX;
-            console_log!(
+            out.lines.push(format!(
                 "[owed-direct] the hand-off's wall fell: {rest} event(s) left to the queue"
-            );
-            faults += 1;
+            ));
+            out.faults += 1;
+            out.left_to_queue += rest;
             break;
         }
         let body =
             serde_json::json!({"events": chunk.iter().map(|e| e.encode()).collect::<Vec<_>>()})
                 .to_string();
-        let post = std::pin::pin!(post_body_answer(
-            env,
-            &url,
-            &token,
-            "/internal/owed-direct",
-            "owed-direct",
-            body
-        ));
-        let wall = std::pin::pin!(Delay::from(std::time::Duration::from_millis(left)));
-        match futures_util::future::select(post, wall).await {
-            futures_util::future::Either::Left((Ok(_), _)) => {}
-            futures_util::future::Either::Left((Err(()), _)) => faults += 1,
-            futures_util::future::Either::Right(_) => {
-                console_log!(
+        out.posts += 1;
+        match crate::race_or_deadline(post(body), sleep(left)).await {
+            Some(Ok(_)) => {}
+            Some(Err(())) => {
+                out.faults += 1;
+                out.left_to_queue += chunk.len();
+            }
+            None => {
+                out.lines.push(format!(
                     "[owed-direct] the hand-off passed its {OWED_DIRECT_POST_WALL_MS} ms wall: {} event(s) left to the queue",
                     chunk.len()
-                );
-                faults += 1;
+                ));
+                out.faults += 1;
+                out.left_to_queue += chunk.len();
             }
         }
     }
-    if faults > 0 {
-        crate::owed_events::bump(env, &[("owed_actor_direct_faults_total", faults)]).await;
-    }
+    out
 }
 
 /// PURE (NEW5-L3): the hand-off's end, the earlier of [`OWED_DIRECT_POST_WALL_MS`] from `now_ms` and the flush's

@@ -5061,7 +5061,7 @@ async fn d2_actor_b_fold8_j_phase_a_counts_a_mark_between_the_judges_apart() {
     let events = squash(include_str!("../owed_events.rs"));
     // D2-ACTOR-D (bsv-low #952): the bound also bounds the D1 judge's acknowledgement and names the actor's seq check.
     // D2-ACTOR-E (bsv-low #954): with the bound, the txids its marks name, told to the actor's delivery.
-    assert!(events.contains(&squash("let (bound, marks_touch) = owed_judge::marks_bound_keys(db, identity, games).await?; db.note_marks_touch(marks_touch); let report = owed_judge::judge_subjects_acked_to(db, identity, games, \"owed-events\", bound).await?;")));
+    assert!(events.contains(&squash("let (bound, marks_touch) = owed_judge::marks_bound_keys(db, identity, games).await?; db.note_marks_touch(identity, marks_touch); let report = owed_judge::judge_subjects_acked_to(db, identity, games, \"owed-events\", bound).await?;")));
     assert!(events.contains(&squash("if !db.defer_actor(identity, games, Some(bound)) { crate::owed_actor::beside(db, identity, games, Some(bound)).await; }")));
     let actor = squash(include_str!("../owed_actor.rs"));
     assert!(actor.contains(&squash(
