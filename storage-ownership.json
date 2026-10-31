@@ -166,7 +166,7 @@
   {
    "file": "crates/low-app-layer/src/owed_actor.rs",
    "op": "SELECT",
-   "count": 10,
+   "count": 13,
    "crate": "low-app-layer",
    "statements": [
     "json_each(?5) k CROSS JOIN {} t ON t.outpoint>=k.value AND t.outpoint<k.value||'~'",
@@ -178,7 +178,10 @@
     "SELECT rowid FROM {} WHERE {c} IN (SELECT value FROM json_each(?4))",
     "SELECT {} FROM {}",
     "SELECT {} FROM {}",
-    "SELECT t.rowid AS r FROM {} AND t.identity=?1"
+    "SELECT t.rowid AS r FROM {} AND t.identity=?1",
+    "(SELECT p.value||kt.value AS value FROM json_each('{}') p CROSS JOIN {keys} kt UNION SELECT 'reorg-clear')",
+    "json((SELECT json_group_array(json(r)) FROM (SELECT DISTINCT {} AS r FROM {})))",
+    "CASE WHEN y.payload IS NULL THEN NULL ELSE json_object('hw',(SELECT seq FROM sqlite_sequence WHERE name='owed_dirty'),'k"
    ],
    "tables": [
     "collected_markers_v2",
@@ -206,7 +209,7 @@
     "transactions",
     "tx_words"
    ],
-   "why": "bsv-low #912: the owed actor's closure reads each mirrored family of the record by its key columns (FAMILIES: the identity and its games, txids, hop marker rowids, the probe memo's ranges), the same selections then run on the actor's mirror"
+   "why": "bsv-low #912: the owed actor's closure reads each mirrored family of the record by its key columns (FAMILIES: the identity and its games, txids, hop marker rowids, the probe memo's ranges), the same selections then run on the actor's mirror; D2-ACTOR-F-FOLD (bsv-low #959, item 4): the carried CLOSURE (`closure_column`) is the same selections over the txids a carried payload names, read in the app layer's publish statement"
   },
   {
    "file": "crates/overlay-cloudflare/src/eviction_write.rs",

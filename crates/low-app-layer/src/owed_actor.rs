@@ -1614,6 +1614,9 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
     })
 }
 
+/// A bootstrap page's first read: its keys, its rows, the marks' bound and the record's high-water.
+type PagedRead = (Keys, Vec<Vec<Value>>, i64, Option<i64>);
+
 /// The record, its calls counted ([`apply_with`]).
 struct CountedRecord<'a, R: SqlPort> {
     inner: &'a R,
@@ -1651,7 +1654,7 @@ async fn apply_counted<R: SqlPort, L: SqlPort, O: Outside>(
     let mut report = ApplyReport::default();
     let started_ms = local.now_ms();
     // FOLD-14: a bootstrap page reads its games in its first round's record call.
-    let mut paged: Option<(Keys, Vec<Vec<Value>>, i64, Option<i64>)> = None;
+    let mut paged: Option<PagedRead> = None;
     let page_games: Vec<String>;
     let games = match &opts.page {
         Some((at, after)) => {
