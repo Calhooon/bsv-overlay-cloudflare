@@ -13640,12 +13640,14 @@ async fn fix1004_c_an_actor_mid_bootstrap_is_armed_by_the_read_and_reads_pending
 /// wiring passes the phase.
 #[test]
 fn fix1004_d_the_unframed_sources_are_the_statements_and_the_drain_passes_the_phase() {
+    // FIX-1004-FOLD: three `<>` terms, never `NOT IN` (an ephemeral table D1 counts a row read a mark).
     let list = crate::owed_read::UNFRAMED_SOURCES
         .iter()
-        .map(|s| format!("'{s}'"))
+        .map(|s| format!("source<>'{s}'"))
         .collect::<Vec<_>>()
-        .join(",");
-    assert!(crate::owed_read::PENDING_SQL.contains(&format!("source NOT IN ({list})")));
+        .join(" AND ");
+    assert!(crate::owed_read::PENDING_SQL.contains(&format!("CASE WHEN {list} THEN")));
+    assert!(!crate::owed_read::PENDING_SQL.contains(" NOT IN "));
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     let belt = squash(include_str!("../owed_belt.rs"));
     assert!(belt.contains(&squash(

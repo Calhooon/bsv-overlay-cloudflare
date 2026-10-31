@@ -1204,3 +1204,54 @@ fn fix492_the_home_spent_read_answers_by_key() {
         );
     }
 }
+
+/// lane FIX-1004-FOLD (bsv-low #1004): the first `/owed` read's pending count reads each of the identity's marks ONCE.
+/// PR 246 grew `PENDING_SQL` a `framed` aggregate over `source NOT IN ('age','backfill','wanted')`; SQLite codes that
+/// list as an ephemeral table (`OpenEphemeral`) probed once a mark (`Found`), and D1 counts each probe a row read: the
+/// budget tier's `owed-first-read` read its largest statement 37 against its ceiling of 29 (19 on main). Over the
+/// fleet fixture, for the identity holding the most marks, the shipped statement opens no ephemeral table and its VM
+/// steps stay within the pre-#1004 statement's (no `framed` column) by a constant per mark.
+#[test]
+fn fix1004f_the_pending_read_probes_no_ephemeral_table() {
+    use rusqlite::StatementStatus;
+    let db = fixture();
+    let (identity, marks): (String, i64) = db
+        .query_row(
+            "SELECT identity,COUNT(*) AS n FROM owed_dirty GROUP BY identity ORDER BY n DESC,identity LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        marks >= 8,
+        "the fleet holds an identity with marks: {marks}"
+    );
+    let sql = low_app_layer::owed_read::PENDING_SQL;
+    let mut explain = db.prepare(&format!("EXPLAIN {sql}")).unwrap();
+    let opcodes: Vec<String> = explain
+        .query_map([identity.as_str()], |r| r.get::<_, String>(1))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    drop(explain);
+    assert!(
+        !opcodes.iter().any(|o| o == "OpenEphemeral" || o == "Found"),
+        "the pending count probes an ephemeral table once a mark (D1 counts each a row read): {opcodes:?}"
+    );
+    let steps = |sql: &str| {
+        let mut stmt = db.prepare(sql).unwrap();
+        let mut rows = stmt.query([identity.as_str()]).unwrap();
+        while rows.next().unwrap().is_some() {}
+        drop(rows);
+        stmt.get_status(StatementStatus::VmStep) as i64
+    };
+    let base = "SELECT COUNT(*) AS pending,json_group_array(CASE WHEN downgrade=1 THEN json_array(gameId,source,generation) END) AS downgrades,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-actor-judged') AS actorJudged,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-v3') AS owedV3 FROM owed_dirty WHERE identity=?1";
+    let (shipped, before) = (steps(sql), steps(base));
+    println!(
+        "fix1004f: {marks} marks, PENDING_SQL {shipped} VM steps, the pre-#1004 statement {before}"
+    );
+    assert!(
+        shipped <= before + 16 * marks,
+        "the framed aggregate costs a constant per mark: {shipped} against {before} over {marks} marks"
+    );
+}
