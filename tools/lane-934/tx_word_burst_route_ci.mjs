@@ -118,6 +118,7 @@ AUTH_ENFORCE = "false"
 SESSION_LANE = "false"
 COURIER_SINK = "http://127.0.0.1:${STANDIN}"
 INTERNAL_TOKEN = "${TOKEN}"
+OWED_FLEET_COMPARE_PER_TICK = "0"
 [[services]]
 binding = "CHAINTRACKS"
 service = "lane934-chaintracks"

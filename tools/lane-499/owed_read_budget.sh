@@ -51,6 +51,7 @@ compatibility_date = "2024-12-01"
 AUTH_ENFORCE = "false"
 SESSION_LANE = "false"
 COURIER_SINK = "http://127.0.0.1:9"
+OWED_FLEET_COMPARE_PER_TICK = "0"
 [[d1_databases]]
 binding = "OVERLAY_DB"
 database_name = "low-overlay-db"

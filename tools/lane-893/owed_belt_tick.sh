@@ -40,6 +40,9 @@ AUTH_ENFORCE = "false"
 SESSION_LANE = "false"
 COURIER_SINK = "http://127.0.0.1:$standin"
 INTERNAL_TOKEN = "$token"
+# FIX-TIER-RING: the fleet compare ring runs here, its own cells (`owed-fleet-compare-*`) measure it; every other
+# tier worker renders it paused (0).
+OWED_FLEET_COMPARE_PER_TICK = "16"
 [[services]]
 binding = "CHAINTRACKS"
 service = "owed-belt-chaintracks"

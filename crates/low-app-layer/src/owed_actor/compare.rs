@@ -497,7 +497,19 @@ pub fn fleet_ring(rows: &[(String, Value)], n: usize) -> Value {
         .map(|s| s["lastRevolutionMs"].as_i64())
         .collect();
     let last_tick = shards.iter().filter_map(|s| s["lastTickAt"].as_i64()).max();
+    // FIX-TIER-RING: the shards' transient tick faults by kind, summed.
+    let mut tick_faults = serde_json::Map::new();
+    for s in &shards {
+        if let Some(o) = s["tickFaults"].as_object() {
+            for (k, v) in o {
+                let n = tick_faults.get(k).and_then(Value::as_i64).unwrap_or(0)
+                    + v.as_i64().unwrap_or(0);
+                tick_faults.insert(k.clone(), json!(n));
+            }
+        }
+    }
     json!({
+        "tickFaults": tick_faults,
         "after": shards[0]["after"],
         "revolution": revolution,
         "lastRevolutionMs": last.and_then(|l| l.into_iter().max()),
@@ -510,6 +522,8 @@ pub fn fleet_ring(rows: &[(String, Value)], n: usize) -> Value {
             "lastRevolutionMs": s["lastRevolutionMs"],
             "lastTickAt": s["lastTickAt"],
             "restUntilMs": s["restUntilMs"],
+            "tickFaults": s["tickFaults"],
+            "lastFault": s["lastFault"],
         })).collect::<Vec<_>>(),
     })
 }
@@ -651,6 +665,39 @@ pub struct RingReport {
     pub cursor: String,
     pub wrapped: bool,
     pub stopped: Option<&'static str>,
+    /// FIX-TIER-RING: the kind of a transient D1 fault that ended the tick ([`transient_fault_kind`]), `stopped` then
+    /// "busy"; counted on the shard's ring row (`tickFaults.<kind>`) and backed off by the alarm ([`busy_backoff_ms`]).
+    pub fault_kind: Option<&'static str>,
+}
+
+/// FIX-TIER-RING (bsv-low #998's follow-up): a D1 fault a later tick can outlive, by its kind: `busy` for the local
+/// SQLite's lock (`SQLITE_BUSY`, "database is locked": `wrangler dev`'s D1, which Cloudflare's serialised D1 never
+/// answers), `transient` for D1's own retryable faults (overloaded, a lost connection, a storage timeout, a reset).
+/// Anything else is no transient fault (`None`): the tick's `Err` as before.
+pub fn transient_fault_kind(e: &str) -> Option<&'static str> {
+    let l = e.to_ascii_lowercase();
+    if l.contains("sqlite_busy") || l.contains("database is locked") {
+        Some("busy")
+    } else if l.contains("overloaded")
+        || l.contains("network connection lost")
+        || l.contains("storage operation exceeded timeout")
+        || l.contains("storage caused object to be reset")
+        || l.contains("internal error in d1")
+    {
+        Some("transient")
+    } else {
+        None
+    }
+}
+
+/// The most consecutive busy ticks the back-off doubles over: the shard's next alarm after its `n`th consecutive busy
+/// tick ([`busy_backoff_ms`]) is [`FLEET_COMPARE_TICK_MS`] doubled up to this many times (10 s to 160 s).
+pub const FLEET_COMPARE_BUSY_BACKOFF_DOUBLINGS: u32 = 4;
+
+/// PURE: the shard's next alarm after its `n`th consecutive busy tick (`n` >= 1): the tick doubled per busy tick,
+/// bounded at 2^[`FLEET_COMPARE_BUSY_BACKOFF_DOUBLINGS`] ticks; `n` 0 is the plain tick.
+pub fn busy_backoff_ms(n: u32) -> i64 {
+    FLEET_COMPARE_TICK_MS << n.min(FLEET_COMPARE_BUSY_BACKOFF_DOUBLINGS)
 }
 
 /// One identity's compare as the ring makes it: production's is [`FreshCompare`] ([`compare_one`]); a pin gives the
@@ -694,6 +741,77 @@ pub async fn ring_tick(
 /// (`owed-actor:phase-c`): the D1 judge seen off with no open period opens one at `now`, seen on with one open closes
 /// it. `elapsed` reads the tick's wall.
 pub(crate) async fn ring_tick_with<J: JudgeDb>(
+    db: &J,
+    now: i64,
+    shard: usize,
+    shards: usize,
+    per_tick: usize,
+    elapsed: impl Fn() -> u64,
+    comparer: &impl RingCompare,
+) -> Result<RingReport, String> {
+    let result = ring_tick_inner(db, now, shard, shards, per_tick, elapsed, comparer).await;
+    let e = match result {
+        Ok(r) => return Ok(r),
+        Err(e) => e,
+    };
+    let Some(kind) = transient_fault_kind(&e) else {
+        return Err(e);
+    };
+    // FIX-TIER-RING: a transient fault ends the tick, never the shard: the identities written so far keep their rows
+    // and the cursor (each written with its row), the fault is counted on the shard's ring row (best effort: the
+    // count's own write may meet the same lock, and is then lost), and the alarm backs off (`busy_backoff_ms`).
+    let shards = shards.max(1);
+    let name = ring_state_name(shard, shards);
+    let count = async {
+        let mut ring = db
+            .run_batch(vec![Stmt::new(
+                RING_READ_SQL,
+                vec![Bind::Text(name.clone())],
+            )])
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|o| o.rows.into_iter().next())
+            .and_then(|r| {
+                r["cursor"]
+                    .as_str()
+                    .and_then(|c| serde_json::from_str::<Value>(c).ok())
+            })
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({"after": "", "revolution": 0, "revolutionStartedAtMs": now}));
+        let n = ring["tickFaults"][kind].as_i64().unwrap_or(0) + 1;
+        if !ring["tickFaults"].is_object() {
+            ring["tickFaults"] = json!({});
+        }
+        ring["tickFaults"][kind] = json!(n);
+        ring["lastFault"] =
+            json!({"kind": kind, "atMs": now, "error": e.chars().take(160).collect::<String>()});
+        ring["lastTickAt"] = json!(now);
+        db.run_batch(vec![Stmt::new(
+            crate::owed_belt::STATE_SQL,
+            vec![
+                Bind::Text(name.clone()),
+                Bind::Text(ring.to_string()),
+                Bind::Int(now),
+            ],
+        )])
+        .await
+        .map(|_| ())
+    };
+    if let Err(c) = count.await {
+        db.log(&format!(
+            "[owed-fleet-compare] shard {shard}/{shards} {kind} fault not counted: {c}"
+        ));
+    }
+    Ok(RingReport {
+        faults: 1,
+        stopped: Some("busy"),
+        fault_kind: Some(kind),
+        ..RingReport::default()
+    })
+}
+
+async fn ring_tick_inner<J: JudgeDb>(
     db: &J,
     now: i64,
     shard: usize,
@@ -964,6 +1082,7 @@ pub fn compare_answer(
         "lastTickAt": ring["lastTickAt"],
         "shardCount": ring["shardCount"],
         "shards": ring["shards"],
+        "tickFaults": ring["tickFaults"],
         "next": next,
     });
     if narrowed {
