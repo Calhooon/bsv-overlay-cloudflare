@@ -181,6 +181,26 @@ fn stored(db: &SqliteSql, identity: &str) -> Vec<String> {
         .collect()
 }
 
+/// [`stored`] without the belt date (`beltDueAtMs`, `facts.beltNextAtMs`): FIX-1018's kept date is no judge input.
+fn stored_undated(db: &SqliteSql, identity: &str) -> Vec<String> {
+    let mut q = db.conn.prepare("SELECT json_array(outpoint,family,gameId,sats,opponentIdentity,atHeight,json_remove(facts,'$.beltNextAtMs'),reason,judgedAtMs,claimable,gateHeight,probeTip) FROM owed_rows WHERE identity=?1 ORDER BY outpoint").unwrap();
+    q.query_map([identity], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn belt_dates(db: &SqliteSql, identity: &str) -> Vec<Option<i64>> {
+    let mut q = db
+        .conn
+        .prepare("SELECT beltDueAtMs FROM owed_rows WHERE identity=?1 ORDER BY outpoint")
+        .unwrap();
+    q.query_map([identity], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
 fn h(prefix: &str, n: usize) -> String {
     format!("{prefix}{n:0>width$x}", width = 64 - prefix.len())
 }
@@ -5912,7 +5932,14 @@ async fn fold9_d_both_judges_agree_on_the_found_spend_after_the_memos_expiry() {
     }
     let d1 = fold9_row(&w.d1, &key).unwrap();
     assert_eq!(fold9_judgement(&d1), fold9_judgement(&at_find), "d1 {d1:?}");
-    assert_eq!(stored(&local, "owner"), stored(&w.d1, "owner"));
+    // FIX-1018: the D1 judge re-judges over its stored rows and keeps each unasked row's EARLIER belt date, where the
+    // fresh actor dates fresh: the judgement is byte for byte the same without the date (no judge input), and D1's
+    // kept date is never the later.
+    assert_eq!(stored_undated(&local, "owner"), stored_undated(&w.d1, "owner"));
+    assert!(belt_dates(&w.d1, "owner")
+        .iter()
+        .zip(belt_dates(&local, "owner"))
+        .all(|(d1, actor)| d1.is_none() == actor.is_none() && *d1 <= actor));
     // The fixture as the record holds it (the finding's shape), whole rows.
     let f = fold9_fixture();
     let d1 = d1_judge(&f).await;
@@ -14259,5 +14286,233 @@ fn fix1009_b_a_verdict_or_press_difference_at_two_tips_is_still_a_diff() {
             (Some(1), Some(0)),
             "{name}: {row:?}"
         );
+    }
+}
+
+/// FIX-1018 (bsv-low #1018, L56's S4): A RE-JUDGE NEVER MOVES AN OVERDUE ROW'S BELT DATE FORWARD WITHOUT ITS ASK.
+/// Pair 17's hand (FIX-988's fixture: the seat's hop swept to its committed home by a courier-only sweep, the
+/// `payout` `courier-bytes` row dated by the real actor). At 07:25:38Z a re-judge wrote a fresh `beltNextAtMs` of
+/// exactly plus 600,000 ms over rows already past their date and not yet asked, and the belt took only the row that
+/// judge did not re-date. RED on 99e456a6: the re-judge's date is `now + 600000`, the published ask re-dated with it.
+mod fix1018 {
+    use super::*;
+    use crate::owed_walk_frozen::pins::{
+        backfill_to_the_stamp, home_marker_seed, home_marker_sweep, FOLD8_TIP, HOME_MARKER_GAME,
+        HOME_MARKER_HOP, HOME_MARKER_SEAT,
+    };
+
+    fn hop() -> String {
+        format!("{HOME_MARKER_HOP}:0")
+    }
+
+    /// The seat's dated row (`beltDueAtMs`, `facts.beltNextAtMs`) in `db`.
+    fn dated(db: &SqliteSql) -> (Option<i64>, Value) {
+        db.conn
+            .query_row(
+                "SELECT beltDueAtMs,facts FROM owed_rows WHERE identity=?1 AND outpoint=?2",
+                [HOME_MARKER_SEAT, hop().as_str()],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        serde_json::from_str::<Value>(&r.get::<_, String>(1)?).unwrap()["beltNextAtMs"].clone(),
+                    ))
+                },
+            )
+            .unwrap_or_else(|e| panic!("the seat's row: {e}"))
+    }
+
+    fn ask_due(d1: &SqliteSql) -> Option<(Value, i64)> {
+        asks_of(d1)
+            .into_iter()
+            .find(|(n, _, _)| *n == crate::owed_belt::ask_name(HOME_MARKER_SEAT, &hop()))
+            .map(|(_, a, d)| (a, d))
+    }
+
+    /// The hand dated, the sweep seen and not mined; Phase C (`d1_judges` false) or Phase A.
+    async fn hand(d1_judges: bool) -> (WithActor, i64) {
+        let (seed, _) = home_marker_seed();
+        let d1 = seeded(&Fixture {
+            name: "fix1018",
+            seed,
+            identities: vec![HOME_MARKER_SEAT.into()],
+        });
+        d1.tip.set(Some(FOLD8_TIP));
+        d1.conn
+            .execute_batch("UPDATE hop_chain_probes SET spentConfirmed=0")
+            .unwrap();
+        d1.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        backfill_to_the_stamp(&d1).await;
+        d1.conn
+            .execute_batch("DELETE FROM owed_rows; DELETE FROM owed_dirty;")
+            .unwrap();
+        let w = WithActor {
+            d1,
+            actor: mirror(),
+            d1_judges,
+            event: None,
+            actor_reads: true,
+            actor_fails: Cell::new(false),
+        };
+        w.actor.now.set(w.d1.now.get());
+        rejudge(&w).await;
+        let judge = if d1_judges { &w.d1 } else { &w.actor };
+        let (due, facts_due) = dated(judge);
+        let due = due.expect("the courier-bytes payout is dated");
+        assert_eq!(facts_due, json!(due));
+        (w, due)
+    }
+
+    fn at(w: &WithActor, t: i64) {
+        w.d1.now.set(t as u64);
+        w.actor.now.set(t as u64);
+    }
+
+    /// An event of the game that re-judges it (a fresh mark: beta's 07:25:38Z burst of re-published pairs), then its
+    /// delivery through the shipped consumer path (a delivery with no new mark is a covered dupe and judges nothing).
+    async fn rejudge(w: &WithActor) {
+        w.d1.conn
+            .execute(
+                "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,?2,'age','age',?3) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs",
+                rusqlite::params![HOME_MARKER_SEAT, HOME_MARKER_GAME, w.d1.now.get() as i64],
+            )
+            .unwrap();
+        let games = vec![HOME_MARKER_GAME.to_string()];
+        crate::owed_events::deliver(w, HOME_MARKER_SEAT, &games)
+            .await
+            .unwrap();
+        let judged: i64 = (if w.d1_judges { &w.d1 } else { &w.actor })
+            .conn
+            .query_row(
+                "SELECT judgedAtMs FROM owed_rows WHERE identity=?1 AND outpoint=?2",
+                [HOME_MARKER_SEAT, hop().as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(judged, w.d1.now.get() as i64, "the event re-judged the row");
+    }
+
+    fn mined_courier() -> Couriers {
+        let sweep = home_marker_sweep();
+        let txid = sweep.id();
+        Couriers {
+            answers: vec![
+                (
+                    format!("{HOME_MARKER_HOP}/0/spent"),
+                    (
+                        200,
+                        json!({"txid": txid, "vin": 0, "status": "confirmed"})
+                            .to_string()
+                            .into_bytes(),
+                    ),
+                ),
+                (
+                    format!("tx/{txid}/hex"),
+                    (200, hex::encode(sweep.to_binary()).into_bytes()),
+                ),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// PHASE C: an overdue, never-asked row keeps its date across a re-judge (the actor's row, its facts and the
+    /// published ask); the belt then asks it at its date, and the ask's find dates it fresh.
+    #[tokio::test]
+    async fn fix1018_a_a_rejudge_keeps_an_overdue_date_and_the_belts_ask_moves_it() {
+        let (w, due) = hand(false).await;
+        assert_eq!(ask_due(&w.d1).map(|(_, d)| d), Some(due));
+        // Past the date, not asked: an event re-judges the game (beta's 07:25:38Z burst).
+        let late = due + 111_000;
+        at(&w, late);
+        rejudge(&w).await;
+        assert_eq!(
+            dated(&w.actor),
+            (Some(due), json!(due)),
+            "a re-judge keeps the overdue date (it wrote {} on the base)",
+            late + 600_000
+        );
+        let (ask, ticked) = ask_due(&w.d1).expect("the ask stands");
+        assert_eq!((ask["dueAtMs"].clone(), ticked), (json!(due), due), "{ask}");
+        // The belt's tick at the kept date takes it and asks.
+        let report = crate::owed_belt::tick(&w, &mined_courier()).await.unwrap();
+        assert_eq!(report.candidates, 1, "the belt takes the kept date: {report:?}");
+        assert!(report.found >= 1 && report.handed_back >= 1, "{report:?}");
+        let (moved, facts_moved) = dated(&w.actor);
+        let moved = moved.expect("still dated (its home ask)");
+        assert!(
+            moved > late,
+            "the belt's ask stamps the next date ({moved} after {late})"
+        );
+        assert_eq!(facts_moved, json!(moved));
+        // The ledger at the new date, or the belt's own backoff past it (a look that changed nothing).
+        let (_, ticked) = ask_due(&w.d1).expect("the home ask");
+        assert!(ticked >= moved, "{ticked} before {moved}");
+        // The next re-judge, inside the new date, keeps it.
+        at(&w, late + 60_000);
+        rejudge(&w).await;
+        assert_eq!(dated(&w.actor).0, Some(moved));
+    }
+
+    /// PHASE C: an ask no rung answered re-arms the ledger past the row's date; a re-judge (the date kept, its
+    /// question moved) keeps the belt's re-arm, never the past date again (so a re-judge buys no re-ask each tick).
+    #[tokio::test]
+    async fn fix1018_b_an_unanswered_asks_rearm_survives_a_rejudge() {
+        let (w, due) = hand(false).await;
+        let late = due + 5_000;
+        at(&w, late);
+        let report = crate::owed_belt::tick(&w, &Couriers::default()).await.unwrap();
+        assert_eq!((report.candidates, report.rearmed), (1, 1), "{report:?}");
+        let (_, rearmed) = ask_due(&w.d1).unwrap();
+        assert!(rearmed > late, "{rearmed}");
+        at(&w, late + 30_000);
+        rejudge(&w).await;
+        assert_eq!(dated(&w.actor).0, Some(due), "the row's date is kept");
+        let (ask, ticked) = ask_due(&w.d1).unwrap();
+        assert_eq!(ask["dueAtMs"], json!(due));
+        assert_eq!(ticked, rearmed, "the belt's re-arm stands over a re-publish of the same date");
+        let idle = crate::owed_belt::tick(&w, &Couriers::default()).await.unwrap();
+        assert_eq!(idle.candidates, 0, "nothing re-asked before the re-arm: {idle:?}");
+    }
+
+    /// PHASE A (the D1 judge writes `owed_rows`): the same rule on the D1 judge's rows and the belt's due set.
+    #[tokio::test]
+    async fn fix1018_c_the_d1_judge_keeps_an_overdue_date_and_the_belts_ask_moves_it() {
+        let (w, due) = hand(true).await;
+        let late = due + 111_000;
+        at(&w, late);
+        rejudge(&w).await;
+        assert_eq!(dated(&w.d1), (Some(due), json!(due)), "the D1 judge keeps the date");
+        let report = crate::owed_belt::tick(&w, &mined_courier()).await.unwrap();
+        assert_eq!(report.candidates, 1, "{report:?}");
+        assert!(report.found >= 1, "{report:?}");
+        let moved = dated(&w.d1).0.expect("dated");
+        assert!(moved > late, "the ask stamps the next date ({moved} after {late})");
+    }
+
+    /// The rule, and the date is no judge input (the differential digests read the judgement without it).
+    #[test]
+    fn fix1018_d_the_kept_date() {
+        use crate::owed_judge::kept_belt_due;
+        assert_eq!(kept_belt_due(Some(9), Some(5), false), Some(5));
+        assert_eq!(kept_belt_due(Some(3), Some(5), false), Some(3));
+        assert_eq!(kept_belt_due(Some(9), Some(5), true), Some(9));
+        assert_eq!(kept_belt_due(None, Some(5), false), None);
+        assert_eq!(kept_belt_due(Some(9), None, false), Some(9));
+        {
+            let _s = crate::owed_judge::belt_asked_scope("AB", &["X:0".to_string()]);
+            assert!(crate::owed_judge::belt_asked_now("ab").contains("x:0"));
+        }
+        assert!(crate::owed_judge::belt_asked_now("ab").is_empty());
+        assert!(CLOCK_FACTS.contains(&"beltNextAtMs"));
+        // FIX-1018-FOLD: the rule is applied INSIDE the row's upsert over the row it updates (the date and the facts'
+        // copy), and the game delete runs after the upserts sparing the written outpoints: no read of the stored dates.
+        use crate::owed_judge::{GAME_DELETE_SQL, KEPT_DUE_SQL, ROW_UPSERT_SQL};
+        assert_eq!(ROW_UPSERT_SQL.matches(KEPT_DUE_SQL).count(), 2);
+        assert!(ROW_UPSERT_SQL.contains("THEN owed_rows.beltDueAtMs ELSE excluded.beltDueAtMs END"));
+        assert!(GAME_DELETE_SQL.ends_with("AND outpoint NOT IN (SELECT value FROM json_each(?3))"));
+        // The asked outpoints reach the actor's object and its scope (the worker's path, not run natively).
+        let judge: String = include_str!("../owed_judge.rs").split_whitespace().collect();
+        assert!(judge.contains("letasked=belt_asked_now(identity);if!asked.is_empty(){body[\"beltAsked\"]=json!(asked);}"));
+        let object: String = include_str!("object.rs").split_whitespace().collect();
+        assert!(object.contains("let_asked=crate::owed_judge::belt_asked_scope(&me,&body.belt_asked);"));
     }
 }

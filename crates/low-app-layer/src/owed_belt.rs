@@ -1127,6 +1127,9 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
         gate.begin_outpoint();
         let before = gate.state.borrow().tick_calls;
         let found = ask(db, &gate, &c, now).await;
+        // FIX-1018 (bsv-low #1018): the belt ASKED this outpoint, so its find's judge (the D1 judge's, and the actor's
+        // through the hand-back's `beltAsked`) dates it fresh; every other dated row keeps its earlier date.
+        let _asked = owed_judge::belt_asked_scope(&c.identity, std::slice::from_ref(&c.outpoint));
         if gate.state.borrow().tick_calls > before {
             report.asked += 1;
         }

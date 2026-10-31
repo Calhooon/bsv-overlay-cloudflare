@@ -271,6 +271,10 @@ pub struct ApplyBody {
     /// consumer batch's identities): at [`FLOOD_CONCURRENCY`] or more the sample is the stress class's (`flood`).
     #[serde(default)]
     pub concurrent: Option<u32>,
+    /// FIX-1018 (bsv-low #1018): the outpoints the belt just ASKED (its find's hand-back): this apply dates them fresh,
+    /// every other dated row keeps the earlier of its stored and fresh dates (`owed_judge::kept_belt_due`).
+    #[serde(default)]
+    pub belt_asked: Vec<String>,
 }
 
 #[durable_object]
@@ -485,6 +489,7 @@ impl DurableObject for OwedActor {
                         also_at_ms: Vec::new(),
                         txids: None,
                         concurrent: None,
+                        belt_asked: Vec::new(),
                     };
                     async move {
                         self.apply_route(body)
@@ -859,6 +864,8 @@ impl OwedActor {
             bound: body.bound,
             touch: body.txids.clone(),
         };
+        // FIX-1018: the belt's asked outpoints, for the judge of this apply (and any apply of `me` it waits on).
+        let _asked = crate::owed_judge::belt_asked_scope(&me, &body.belt_asked);
         // D2-ACTOR-B-FOLD-7: an actor without `bootstrapped` holds the event and arms its bootstrap (never a closure
         // over a mirror the bootstrap has not filled); a bootstrapped one whose closure meets its bound re-arms.
         let applied = apply_or_hold_in(
