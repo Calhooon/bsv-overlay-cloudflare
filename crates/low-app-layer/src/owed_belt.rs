@@ -1470,7 +1470,7 @@ pub async fn drain_env(
         let tip = crate::routes::chaintracks_present_height_env(env, "owed").await.ok();
         let judge = owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))?;
         if repair_age {
-            if let Err(error) = crate::owed_backfill::mark_aged(&judge).await {
+            if let Err(error) = crate::owed_backfill::mark_aged_in(&judge, owed_judge::JudgeDb::d1_judges(&judge)).await {
                 worker::console_warn!("[owed] age re-mark deferred: {error}");
             }
         }

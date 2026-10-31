@@ -26,7 +26,17 @@ pub const STATE_SQL: &str =
 /// acknowledgement (`owed_actor::PHASE_C_MARK_SQL`), and `owedV3`, the re-judge's stamp, which that acknowledgement
 /// deletes. While the first stands without the second, D1's `owed_rows` are the rows of the Phase C flip, not a
 /// judgement, and the D1 read serves no press from them.
-pub const PENDING_SQL: &str = "SELECT COUNT(*) AS pending,json_group_array(CASE WHEN downgrade=1 THEN json_array(gameId,source,generation) END) AS downgrades,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-actor-judged') AS actorJudged,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-v3') AS owedV3 FROM owed_dirty WHERE identity=?1";
+///
+/// bsv-low #1004 (lane FIX-1004, L55 S4): `framed`, every mark an EVENT carries (`gameId`, `generation`), i.e. every
+/// source but [`UNFRAMED_SOURCES`]: the actor's read counts only those of them its last apply has not covered
+/// ([`Snapshot::actor_pending`]), never D1's whole count.
+pub const PENDING_SQL: &str = "SELECT COUNT(*) AS pending,json_group_array(CASE WHEN downgrade=1 THEN json_array(gameId,source,generation) END) AS downgrades,json_group_array(CASE WHEN source NOT IN ('age','backfill','wanted') THEN json_array(gameId,generation) END) AS framed,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-actor-judged') AS actorJudged,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-v3') AS owedV3 FROM owed_dirty WHERE identity=?1";
+/// bsv-low #1004: the mark sources no writer's event carries. An `age` mark (the drain's daily re-mark of D1 rows
+/// judged a day ago: in Phase C D1's `owed_rows` have no writer, so the same oldest subjects were re-marked on every
+/// scheduled pass), a `backfill` mark (the one-time backfill, a wanted envelope's rest, the reconcile's rest) and a
+/// `wanted` envelope are acknowledged only when the sweep re-publishes them past its horizon, minutes later: they are
+/// the reconcile's work, never an event the actor owes the read. Pinned equal to [`PENDING_SQL`]'s list.
+pub const UNFRAMED_SOURCES: [&str; 3] = ["age", "backfill", "wanted"];
 /// The served reason of a press withheld over a pending downgrade (D2-L1).
 pub const PENDING_DOWNGRADE_REASON: &str =
     "re-judging: a downgrade of this game is recorded and not yet judged; the press waits for the judgement";
@@ -53,6 +63,8 @@ pub struct Snapshot {
     /// last apply read the record at). Empty on the D1 read (`rows: true`) and where the actor answered none: then
     /// every pending downgrade mark withholds, as before FIX-968.
     pub covered: BTreeMap<String, i64>,
+    /// bsv-low #1004: every pending mark an event carries (`PENDING_SQL`'s `framed`): its game and generation.
+    pub framed: Vec<(String, i64)>,
 }
 
 fn number(value: &Value) -> Option<u64> {
@@ -131,6 +143,19 @@ pub async fn read_with(db: &impl SqlPort, identity: &str, rows: bool) -> Result<
                 .push((generation, source.to_owned()));
         }
     }
+    let framed_marks: Value = marks
+        .as_ref()
+        .and_then(|r| r["framed"].as_str())
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|e| format!("owed pending framed marks: {e}"))?
+        .unwrap_or(Value::Null);
+    let framed = framed_marks
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| Some((m[0].as_str()?.to_owned(), m[1].as_i64().unwrap_or(i64::MAX))))
+        .collect();
     let state = batch.pop().unwrap().rows.into_iter().next();
     let mut snapshot = Snapshot {
         joined: batch.pop().unwrap().rows,
@@ -151,6 +176,7 @@ pub async fn read_with(db: &impl SqlPort, identity: &str, rows: bool) -> Result<
                 == 0,
         downgrades,
         covered: BTreeMap::new(),
+        framed,
     };
     if snapshot.state.is_none() {
         snapshot.joined.clear();
@@ -173,6 +199,41 @@ pub async fn read_with(db: &impl SqlPort, identity: &str, rows: bool) -> Result<
 }
 
 impl Snapshot {
+    /// bsv-low #1004 (lane FIX-1004, L55 S4): the `pending` the ACTOR's read serves (`OWED_ACTOR_READ`, Phases B and
+    /// C): the events the actor whose rows are served has not applied, i.e. the [`Snapshot::framed`] marks above the
+    /// actor's covered generation of their game (a mark at or below it was written before the actor's last apply read
+    /// the record: applied, its acknowledgement only late). A mark of [`UNFRAMED_SOURCES`] is never counted: no event
+    /// carries it to the actor, and in Phase C nothing acknowledges it before the sweep (L55 pair 18: a fresh device
+    /// read `pending 1` and no rows for 2.3 minutes over the drain's `age` mark). A game the actor answered no covered
+    /// generation for counts every framed mark of it (the safe direction).
+    pub fn actor_pending(&self) -> u64 {
+        self.framed
+            .iter()
+            .filter(|(game, generation)| {
+                *generation
+                    > self
+                        .covered
+                        .get(&game.to_ascii_lowercase())
+                        .copied()
+                        .unwrap_or(i64::MIN)
+            })
+            .count() as u64
+    }
+
+    /// The games the actor's read names for their covered generation: the downgrade games (FIX-968) and the games of
+    /// every framed mark (#1004), lowercased, deduplicated, the downgrade games FIRST (the read asks at most
+    /// `owed_actor::COVERED_ASK_MAX`; a game past it is counted pending and withholds, the safe direction).
+    pub fn actor_marked_games(&self) -> Vec<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.downgrades
+            .keys()
+            .chain(self.framed.iter().map(|(g, _)| g))
+            .filter(|g| !g.is_empty())
+            .map(|g| g.to_ascii_lowercase())
+            .filter(|g| seen.insert(g.clone()))
+            .collect()
+    }
+
     /// THE D1-MARK READ GATE (bsv-low #968, lane FIX-968; the second delta lens's D2-L1 as narrowed). The ONE
     /// predicate a claimable row passes before its press is served, in every phase: the answer is `Some(source)`,
     /// the press withheld as re-judging ([`PENDING_DOWNGRADE_REASON`]), when `game` holds a pending mark that is

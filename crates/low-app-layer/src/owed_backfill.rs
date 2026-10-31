@@ -1037,6 +1037,15 @@ pub async fn mark_aged(db: &impl SqlPort) -> Result<u64, String> {
     age_repair(db).await.map(|r| r.marked)
 }
 
+/// The scheduled drain's age repair under the phase (bsv-low #1004, lane FIX-1004, L55 S4). With the D1 judge OFF
+/// (Phase C) the `age` marks are NOT written: they are taken from D1's `owed_rows.judgedAtMs`, which no writer moves
+/// in Phase C, so the same oldest 128 subjects were re-marked on every scheduled pass, each mark waiting minutes for
+/// the sweep's re-publish (no event carries it) while the actor's read counted it `pending`. The rest of the repair
+/// (the skipped evictions' retry, the marker repair, the find evidence) runs in every phase.
+pub async fn mark_aged_in(db: &impl SqlPort, d1_judges: bool) -> Result<u64, String> {
+    age_repair_in(db, d1_judges).await.map(|r| r.marked)
+}
+
 /// The age repair (risk 8.2's third repair, run by the scheduled drain on every pass): the aged and keyless rows
 /// re-marked, then the skipped evictions retried (D2-OWED-FOLD-10). A skip a day old is retried, at most
 /// [`OWED_SKIPPED_EVICTION_RETRIES_PER_PASS`] a pass, oldest first, by the phase's own [`evidence_one`] (its reads,
@@ -1044,8 +1053,13 @@ pub async fn mark_aged(db: &impl SqlPort) -> Result<u64, String> {
 /// fault skips it again from now (counted `owed_backfill_skipped_evictions_total`, logged). Every pass that reads a
 /// skip names the still skipped on its line. Its caller races the whole repair; each retry's write is one batch.
 pub async fn age_repair(db: &impl SqlPort) -> Result<AgeRepair, String> {
+    age_repair_in(db, true).await
+}
+
+/// [`age_repair`] with the age marks written only while `mark_age` (the D1 judge on; bsv-low #1004).
+pub async fn age_repair_in(db: &impl SqlPort, mark_age: bool) -> Result<AgeRepair, String> {
     let mut repair = AgeRepair::default();
-    let marks = age_marks(db).await;
+    let marks = if mark_age { age_marks(db).await } else { Ok(0) };
     if let Ok(marked) = marks {
         repair.marked = marked;
     }
@@ -1460,7 +1474,7 @@ mod tests {
         let belt = squash(include_str!("owed_belt.rs"));
         let aged = belt
             .find(&squash(
-                "if repair_age { if let Err(error) = crate::owed_backfill::mark_aged(&judge).await",
+                "if repair_age { if let Err(error) = crate::owed_backfill::mark_aged_in(&judge, owed_judge::JudgeDb::d1_judges(&judge)).await",
             ))
             .unwrap();
         let drain = belt
