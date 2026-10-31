@@ -405,13 +405,17 @@ fn now_ms_isolate() -> u64 {
     }
 }
 
-/// bsv-low #1017: the gate's hold snapshot, one row of the belt's ledger (`owed_belt_state`), read by `/health` as a
-/// primary-key row of `owed_events::HEALTH_CONSUMER_SQL` (no statement more).
-pub const GATE_HOLD_NAME: &str = "push-gate:hold";
-/// The gate rewrites its snapshot at most this often (and only after it sent).
-pub const GATE_HOLD_WRITE_EVERY_MS: u64 = 10_000;
-/// The snapshot's write: `?1` the figures' JSON, `?2` the time.
-pub const GATE_HOLD_WRITE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('push-gate:hold',?1,CAST(?2 AS INTEGER)) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+/// bsv-low #1017 (FIX-1017-FOLD: the land tier's `health-dirty-snapshot`): the gate's hold costs `/health` NO D1
+/// read. The figures live where the pushes are, in the gate object's own isolate coalescer; the gate answers them on
+/// [`PUSH_GATE_HOLD_PATH`] ([`gate_hold_answer`]) and a fetch isolate's `/health` asks it at most once every
+/// [`GATE_HOLD_MEMO_MS`] ([`gate_hold_served`], its [`HoldMemo`]), bounded at [`GATE_HOLD_READ_WALL_MS`]; a read that
+/// faults serves the last answer with its age, or `null` with none. Stated: the figures are the gate isolate's, so a
+/// gate the platform evicted answers no samples until it pushes again (`overBar` `null`).
+pub const PUSH_GATE_HOLD_PATH: &str = "/push-gate/hold";
+/// A fetch isolate asks the gate for its hold at most this often.
+pub const GATE_HOLD_MEMO_MS: u64 = 10_000;
+/// The gate's answer is awaited at most this long by `/health`.
+pub const GATE_HOLD_READ_WALL_MS: u64 = 500;
 
 /// PURE: the snapshot's cursor for the figures at `now`.
 pub fn gate_hold_cursor(f: &HoldFigures, now: u64) -> String {
@@ -425,7 +429,7 @@ pub fn gate_hold_cursor(f: &HoldFigures, now: u64) -> String {
     .to_string()
 }
 
-/// PURE: `/health.push.gate` from the snapshot row's cursor (`None` before the gate's first write): the hold's p50,
+/// PURE: `/health.push.gate` from the gate's answer (`None`: no gate answered, ever, in this isolate): the hold's p50,
 /// p95 and max over the minute before `asOfMs`, its samples, the bar and whether the p95 is over it (`null` with no
 /// sample), the snapshot's age at `now`.
 pub fn gate_hold_view(cursor: Option<&str>, now: u64) -> Value {
@@ -451,29 +455,107 @@ pub fn gate_hold_view(cursor: Option<&str>, now: u64) -> Value {
     })
 }
 
-thread_local! {
-    static GATE_HOLD_WRITTEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+/// The gate's answer at `now`: its figures over the trailing minute, as [`gate_hold_cursor`] writes them.
+pub fn gate_hold_answer(cell: &RefCell<Coalescer>, now: u64) -> String {
+    let f = cell.borrow_mut().hold_figures(now);
+    gate_hold_cursor(&f, now)
 }
 
-/// The gate's snapshot statement when one is due at `now` (at most every [`GATE_HOLD_WRITE_EVERY_MS`], only with a
-/// sample in the minute), marking it written.
-pub fn gate_hold_stmt_due(cell: &RefCell<Coalescer>, now: u64) -> Option<crate::pot_hook::Stmt> {
-    let last = GATE_HOLD_WRITTEN.with(|w| w.get());
-    if now < last.saturating_add(GATE_HOLD_WRITE_EVERY_MS) {
-        return None;
+/// A fetch isolate's memo of the gate's last answer.
+#[derive(Debug, Default)]
+pub struct HoldMemo {
+    /// The answer and when this isolate read it.
+    pub answer: Option<(String, u64)>,
+    /// When this isolate last asked the gate (answered or not).
+    pub asked_at: Option<u64>,
+}
+
+/// Where `/health` reads the gate's hold: the gate itself (an object fetch), never D1.
+#[allow(async_fn_in_trait)]
+pub trait HoldSource {
+    /// The gate hosted in this isolate: its answer at once, no fetch.
+    fn hosted(&self, now: u64) -> Option<String>;
+    /// The gate's answer over its object, `None` on a fault, no binding or past the wall.
+    async fn ask(&self) -> Option<String>;
+}
+
+/// `/health.push.gate`: the hosted gate's figures, else the memo while it is younger than [`GATE_HOLD_MEMO_MS`],
+/// else one ask of the gate (a fault keeps the last answer, served with its age).
+pub async fn gate_hold_served<S: HoldSource>(memo: &RefCell<HoldMemo>, src: &S, now: u64) -> Value {
+    if let Some(answer) = src.hosted(now) {
+        return gate_hold_view(Some(&answer), now);
     }
-    let f = cell.borrow_mut().hold_figures(now);
-    if f.samples == 0 {
-        return None;
+    let due = memo
+        .borrow()
+        .asked_at
+        .is_none_or(|at| now >= at.saturating_add(GATE_HOLD_MEMO_MS));
+    if due {
+        memo.borrow_mut().asked_at = Some(now);
+        if let Some(answer) = src.ask().await {
+            memo.borrow_mut().answer = Some((answer, now));
+        }
     }
-    GATE_HOLD_WRITTEN.with(|w| w.set(now));
-    Some(crate::pot_hook::Stmt {
-        sql: GATE_HOLD_WRITE_SQL.into(),
-        binds: vec![
-            crate::pot_hook::Bind::Text(gate_hold_cursor(&f, now)),
-            crate::pot_hook::Bind::Int(now as i64),
-        ],
-    })
+    let m = memo.borrow();
+    gate_hold_view(m.answer.as_ref().map(|(a, _)| a.as_str()), now)
+}
+
+thread_local! {
+    /// The isolate's memo, leaked once so `/health`'s future can hold it across the ask.
+    static GATE_HOLD_MEMO: &'static RefCell<HoldMemo> = Box::leak(Box::new(RefCell::new(HoldMemo::default())));
+}
+
+/// The worker's [`HoldSource`]: the isolate's own cell when it hosts the gate, else the `BOARD_VIEW` object named
+/// [`PUSH_GATE_ACTOR`] at [`PUSH_GATE_HOLD_PATH`].
+pub struct WorkerHoldSource<'a> {
+    pub env: &'a worker::Env,
+}
+
+impl HoldSource for WorkerHoldSource<'_> {
+    fn hosted(&self, now: u64) -> Option<String> {
+        GATE_HOSTED
+            .with(|h| h.get())
+            .then(|| ISOLATE.with(|c| gate_hold_answer(c, now)))
+    }
+    async fn ask(&self) -> Option<String> {
+        let ns = self.env.durable_object("BOARD_VIEW").ok()?;
+        let stub = ns
+            .id_from_name(PUSH_GATE_ACTOR)
+            .and_then(|id| id.get_stub())
+            .ok()?;
+        let read = async move {
+            let mut resp = stub
+                .fetch_with_str(&format!("https://board-view{PUSH_GATE_HOLD_PATH}"))
+                .await
+                .ok()?;
+            if resp.status_code() != 200 {
+                return None;
+            }
+            resp.text().await.ok()
+        };
+        let wall = worker::Delay::from(core::time::Duration::from_millis(GATE_HOLD_READ_WALL_MS));
+        futures_util::pin_mut!(read, wall);
+        match futures_util::future::select(read, wall).await {
+            futures_util::future::Either::Left((answer, _)) => answer,
+            futures_util::future::Either::Right(_) => None,
+        }
+    }
+}
+
+/// `/health.push.gate` in the worker (no D1 read: [`gate_hold_served`]).
+pub async fn gate_hold_health(env: &worker::Env) -> Value {
+    let src = WorkerHoldSource { env };
+    let now = worker::Date::now().as_millis();
+    // The memo is the isolate's; its borrow is never held across the ask.
+    let memo: &'static RefCell<HoldMemo> = GATE_HOLD_MEMO.with(|m| *m);
+    gate_hold_served(memo, &src, now).await
+}
+
+/// The gate's `/push-gate/hold` request: its figures from the isolate's coalescer.
+pub fn serve_gate_hold() -> worker::Result<worker::Response> {
+    let answer = ISOLATE.with(|c| gate_hold_answer(c, now_ms_isolate()));
+    let mut resp = worker::Response::ok(answer)?;
+    resp.headers_mut().set("content-type", "application/json")?;
+    Ok(resp)
 }
 
 /// bsv-low #1002: the states queued AHEAD of `ticket` (`None`: a state not yet queued, behind every queued one) that
@@ -1077,18 +1159,6 @@ pub async fn serve_gate(env: &worker::Env, text: &str) -> worker::Result<worker:
     } else {
         vec![Answer::NotConfigured; pushes.len()]
     };
-    // bsv-low #1017: the gate's per-seat hold, served on `/health.push.gate` (best effort: a fault logs).
-    if let Some(stmt) = gate_hold_stmt_due(cell, port.now_ms()) {
-        use crate::pot_hook::SqlPort;
-        match crate::routes::D1Sql::of(env) {
-            Ok(sql) => {
-                if let Err(e) = sql.run_batch(vec![stmt]).await {
-                    port.log(&format!("[push] gate hold snapshot write fault: {e}"));
-                }
-            }
-            Err(e) => port.log(&format!("[push] gate hold snapshot: no OVERLAY_DB: {e}")),
-        }
-    }
     worker::Response::from_json(
         &json!({ "answers": answers.iter().map(|a| a.word()).collect::<Vec<_>>() }),
     )

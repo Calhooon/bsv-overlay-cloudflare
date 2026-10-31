@@ -7036,15 +7036,9 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     // D2-ACTOR-B-FOLD-6: the owed actor's health snapshot rides the consumer row's statement (one row more, no
     // statement more: the land tier's `health-dirty-snapshot`).
     // FIX-998-SERVE (bsv-low #998): the fleet compare's public counts, the ring's snapshot row, a third row of it.
-    // bsv-low #1017: the push gate's hold snapshot, a fourth row of it (`push.gate`).
-    let (owed_events_body, actor_snapshot, fleet_compare, push_gate) = match D1Sql::of(&ctx.env) {
-        Ok(sql) => crate::owed_events::health_actor_fleet_push(&sql, &dirty).await,
-        Err(_) => (
-            serde_json::Value::Null,
-            None,
-            serde_json::Value::Null,
-            serde_json::Value::Null,
-        ),
+    let (owed_events_body, actor_snapshot, fleet_compare) = match D1Sql::of(&ctx.env) {
+        Ok(sql) => crate::owed_events::health_actor_fleet(&sql, &dirty).await,
+        Err(_) => (serde_json::Value::Null, None, serde_json::Value::Null),
     };
     body["owedEvents"] = owed_events_body;
     body["owed"]["dirty"] = dirty;
@@ -7087,8 +7081,9 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     body["couriers"] = crate::courier::health_json();
     // bsv-low #935: this isolate's push coalescer (the durable totals are the overlay's `/health/invariants.push`).
     body["push"] = crate::push_coalesce::health_json();
-    // bsv-low #1017: the fleet's gate's per-seat hold over the minute (p50, p95, max) against its 5 s bar.
-    body["push"]["gate"] = push_gate;
+    // bsv-low #1017: the fleet's gate's per-seat hold over the minute (p50, p95, max) against its 5 s bar, asked of
+    // the gate object at most every 10 s an isolate, never D1 (FIX-1017-FOLD, the tier's `health-dirty-snapshot`).
+    body["push"]["gate"] = crate::push_coalesce::gate_hold_health(&ctx.env).await;
     body["trackerReask"] = crate::tracker_host::pacing::health_json();
     // bsv-low #862 (L7-DEPTH): the spend depth the served words carry (`spendDepth`), its source and the var as set.
     body["spendDepth"] = crate::tracker_host::runtime::spend_depth_health_json(
