@@ -139,8 +139,11 @@ fn pin5_the_size_cap_the_age_sweep_and_the_row_cap_sweep_all_bound_the_store() {
     )
     .unwrap();
     // cutoff 2_000: the row stamped 1_000 is older, the row stamped 5_000 is fresh
-    db.execute(OWED_SPENDER_BYTES_SWEEP_SQL, params![2_000_i64, 256_i64])
-        .unwrap();
+    // bsv-low #1010: the sweep answers the txids it deleted (each noted `bytes` by its caller).
+    assert_eq!(
+        swept(&db, OWED_SPENDER_BYTES_SWEEP_SQL, 2_000, 256),
+        vec!["aa".repeat(32)]
+    );
     assert_eq!(count(&db), 1);
     let kept: String = db
         .query_row("SELECT txid FROM owed_spender_bytes", [], |r| r.get(0))
@@ -161,8 +164,11 @@ fn pin5_the_size_cap_the_age_sweep_and_the_row_cap_sweep_all_bound_the_store() {
         .unwrap();
     }
     assert_eq!(count(&db), 5);
-    db.execute(OWED_SPENDER_BYTES_CAP_SWEEP_SQL, params![2_i64, 256_i64])
-        .unwrap();
+    assert_eq!(
+        swept(&db, OWED_SPENDER_BYTES_CAP_SWEEP_SQL, 2, 256).len(),
+        3,
+        "the cap sweep answers the three it deleted"
+    );
     assert_eq!(count(&db), 2, "only the newest `cap` rows remain");
     // the two kept are the NEWEST stamps (3, 4)
     let mut keys: Vec<String> = db
@@ -210,4 +216,17 @@ fn pin6_the_store_read_seeks_the_primary_key_never_scans_the_table() {
         joined.contains("owed_spender_bytes"),
         "the plan names the table: {joined}"
     );
+}
+
+/// A sweep as the scheduled pass runs it (`RETURNING txid`): the txids it deleted, sorted.
+fn swept(db: &rusqlite::Connection, sql: &str, a: i64, b: i64) -> Vec<String> {
+    let mut out: Vec<String> = db
+        .prepare(sql)
+        .unwrap()
+        .query_map(params![a, b], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    out.sort();
+    out
 }

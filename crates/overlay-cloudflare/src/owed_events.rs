@@ -123,6 +123,17 @@ pub const READ_WORD_SQL: &str = row_and_payload!("CASE WHEN COUNT(*)>0 THEN json
 pub const READ_BEEF_SQL: &str = marks_and!("SELECT COALESCE((SELECT json_object('hasProof',has_proof,'proofVerified',proof_verified,'proofHeight',proofHeight,'structurallyUnprovable',structurally_unprovable,'createdAt',createdAt) FROM pot_beefs WHERE txid=?3),(SELECT json_object('hasProof',has_proof,'proofHeight',proofHeight,'store','transactions') FROM transactions WHERE txid=?3))");
 /// `refusal` (`hopTxid:hopVout`).
 pub const READ_REFUSAL_SQL: &str = row_and_payload!("CASE WHEN COUNT(*)>0 THEN json_object('refusedTxid',refusedTxid,'reason',reason,'refusedAt',refusedAt) END", "json_array(json_object('t','submit_refusals','c',json_array('hopTxid','hopVout'),'k',json_array(json_array(?3,?4)),'r',json_group_array(json_object('__rowid',rowid,'hopTxid',hopTxid,'hopVout',hopVout,'refusedTxid',refusedTxid,'reason',reason,'refusedAt',refusedAt))))", "FROM submit_refusals WHERE hopTxid=?3 AND hopVout=?4");
+/// FIX-1010 (bsv-low #1010): `hand` (the marker's `txid`): the hand's verdict and its game. No row is carried: the
+/// event's apply takes the narrowed read.
+pub const READ_HAND_SQL: &str = marks_and!("SELECT json_group_array(json_object('gameId',gameId,'identity',identity,'potTxid',potTxid,'rowValid',rowValid,'outputIndex',outputIndex)) FROM hand_markers WHERE txid=?3");
+/// FIX-1010: `proof` (an on-chain bundle's `txid`, or a posted bundle's game): the bundles' verdicts. No row carried.
+pub const READ_PROOF_SQL: &str = marks_and!("SELECT json_object('markers',(SELECT json_group_array(json_object('gameId',gameId,'winner',winner,'bundleValid',bundleValid,'outputIndex',outputIndex)) FROM proof_markers WHERE txid=?3),'posts',(SELECT json_group_array(json_object('winner',winner,'bundleValid',bundleValid,'createdAt',createdAt)) FROM proof_posts WHERE gameId=?3))");
+/// FIX-1010: `probe` (the row's own key: `<txid>.<vout>`, `<txid>:<vout>`, `proofmined:<txid>.<height>`): the row as
+/// it stands (NULL once deleted, the clear's and the sweep's case). No row carried.
+pub const READ_PROBE_SQL: &str = marks_and!("SELECT json_object('probedAtMs',probedAtMs,'spent',spent,'spendingTxid',spendingTxid,'spentConfirmed',spentConfirmed) FROM hop_chain_probes WHERE outpoint=?2");
+/// FIX-1010: `bytes` (a spender's `txid`): whether its bytes are held (none once swept). No row carried.
+pub const READ_BYTES_SQL: &str =
+    marks_and!("SELECT json_object('held',COUNT(*)) FROM owed_spender_bytes WHERE txid=?3");
 /// `identity` (the hook's identity-only note): does the identity hold any mark? (The D2-ACTOR-A lens's LOW-6: an
 /// identity with nothing pending is not sent.) One covering-index probe; no facts.
 pub const READ_IDENTITY_SQL: &str = "SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM owed_dirty INDEXED BY idx_owed_dirty_identity_marked WHERE identity=?2 AND ?1='identity' LIMIT 1)) AS marks,NULL AS facts";
@@ -145,6 +156,10 @@ pub fn read_sql(source: &str) -> Option<&'static str> {
         "word" => READ_WORD_SQL,
         "beef" => READ_BEEF_SQL,
         "refusal" => READ_REFUSAL_SQL,
+        "hand" => READ_HAND_SQL,
+        "proof" => READ_PROOF_SQL,
+        "probe" => READ_PROBE_SQL,
+        "bytes" => READ_BYTES_SQL,
         owed_event::ROUTE_IDENTITY => READ_IDENTITY_SQL,
         s if owed_event::OWN_SOURCES.contains(&s) => READ_MARKS_SQL,
         _ => return None,

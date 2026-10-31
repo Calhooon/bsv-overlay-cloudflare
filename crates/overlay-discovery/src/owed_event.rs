@@ -26,7 +26,7 @@ pub const OWED_EVENT_V: u32 = 1;
 /// Every `owed_dirty.source` a trigger writes, with the table whose write marks it (the 32 triggers of
 /// `overlay-cloudflare::derived_owed_triggers`, read at test time by the overlay's pin, never a hand-fed list there).
 /// A writer publishes `(source, key)` for exactly the pair its row's trigger marks.
-pub const TRIGGER_SOURCES: [(&str, &str); 16] = [
+pub const TRIGGER_SOURCES: [(&str, &str); 21] = [
     ("pot_records", "pot"),
     ("potparty_records", "party"),
     ("hopparty_records", "hop"),
@@ -44,6 +44,16 @@ pub const TRIGGER_SOURCES: [(&str, &str); 16] = [
     ("owed_spender_bytes", "word"),
     // FIX-1001 (bsv-low #1001): a transaction's proof (`transactions.has_proof`, `proofHeight`), keyed by its txid.
     ("transactions", "beef"),
+    // FIX-1010 (bsv-low #1010): the families no trigger marked. A hand marker and a proof bundle (on-chain or posted),
+    // keyed by the marker's txid (a posted bundle by its game); a probe row (`hop_chain_probes`: a memo, the belt's
+    // evidence, a proof latch), keyed by its own key and marked by its writers' statements in their batch (the
+    // overlay's reorg clear and TTL sweep), never a trigger: the judge writes that table itself.
+    ("hand_markers", "hand"),
+    ("proof_markers", "proof"),
+    ("proof_posts", "proof"),
+    ("hop_chain_probes", "probe"),
+    // FIX-1010: a spender's bytes swept (its own pair: `word` carries the word's row, never the bytes).
+    ("owed_spender_bytes", "bytes"),
 ];
 
 /// The `refund` source (named where a store's first string literal must stay its statement).

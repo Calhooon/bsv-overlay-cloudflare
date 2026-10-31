@@ -407,3 +407,250 @@ pub const POT_UPDATE_FILERS: &str = trigger!(
         )
     )
 );
+
+// FIX-1010 (bsv-low #1010; the D2-ACTOR-F lens's LOW-1): the actor's families written by statements no trigger marked.
+// Appended (never an edit of a shipped trigger). Each marks the subjects whose judgement reads the row, under the pair
+// its writer notes, so the write's own event reaches the actor (the direct call, the queue behind it) and its apply
+// takes the narrowed read: none of these sources carries its row, so a carried apply never stands in for them.
+macro_rules! game_subjects {
+    ($row:literal) => {
+        concat!(
+            "SELECT pp.identity,pp.gameId FROM potparty_records pp INDEXED BY idx_potparty_game_identity WHERE pp.gameId=", $row, ".gameId ",
+            "UNION ALL SELECT hp.identity,hp.gameId FROM hopparty_records hp INDEXED BY idx_hopparty_game WHERE hp.gameId=", $row, ".gameId"
+        )
+    };
+}
+/// A hand marker admitted (`hand_write::hand_insert_query`): the hands every seat of its game reads (`results`), the
+/// marker's own identity and the evicted twins of its pot (a twin-only seat's game) beside the game's live seats.
+pub const HAND_INSERT: &str = trigger!(
+    "hand_markers",
+    insert,
+    INSERT,
+    mark!(
+        "hand",
+        "NEW.txid",
+        created_at!("NEW"),
+        concat!(
+            game_subjects!("NEW"),
+            " UNION ALL SELECT pp.identity,pp.gameId FROM potparty_records_evicted pp INDEXED BY idx_evicted_party_pot WHERE pp.potTxid=NEW.potTxid ",
+            "UNION ALL ",
+            own_subject!("NEW")
+        )
+    )
+);
+/// The hand re-latch pass (`hand_write::hand_relatch_query`): its `rowValid` verdict moved.
+pub const HAND_UPDATE: &str = trigger!(
+    "hand_markers",
+    update,
+    "UPDATE OF rowValid",
+    mark!(
+        "hand",
+        "NEW.txid",
+        created_at!("NEW"),
+        concat!(
+            game_subjects!("NEW"),
+            " UNION ALL SELECT pp.identity,pp.gameId FROM potparty_records_evicted pp INDEXED BY idx_evicted_party_pot WHERE pp.potTxid=NEW.potTxid ",
+            "UNION ALL ",
+            own_subject!("NEW")
+        ),
+        " WHERE OLD.rowValid IS NOT NEW.rowValid"
+    )
+);
+/// An on-chain proof bundle admitted (`PROOF_ADMIT_WRITE_SQL`): the proven hands of its game.
+pub const PROOF_INSERT: &str = trigger!(
+    "proof_markers",
+    insert,
+    INSERT,
+    mark!(
+        "proof",
+        "NEW.txid",
+        created_at!("NEW"),
+        concat!(
+            game_subjects!("NEW"),
+            " UNION ALL SELECT NEW.winner,NEW.gameId"
+        )
+    )
+);
+/// A posted proof bundle (`proof_post::PROOF_POST_WRITE_SQL`, `INSERT OR REPLACE`: its INSERT fires), keyed by game.
+pub const PROOF_POST_INSERT: &str = trigger!(
+    "proof_posts",
+    insert,
+    INSERT,
+    mark!(
+        "proof",
+        "NEW.gameId",
+        created_at!("NEW"),
+        concat!(
+            game_subjects!("NEW"),
+            " UNION ALL SELECT NEW.winner,NEW.gameId"
+        )
+    )
+);
+/// The result re-latch pass (`result_write::result_relatch_query`, which noted `result` and found no mark): its claim
+/// tier moved. A tier lowered or withdrawn is a downgrade (the winner's payout rests on it).
+pub const RESULT_UPDATE: &str = trigger!(
+    "result_markers_v2",
+    update,
+    "UPDATE OF claimValid",
+    mark!(
+        class "(COALESCE(NEW.claimValid,-1) < COALESCE(OLD.claimValid,-1))",
+        "result",
+        "NEW.txid",
+        created_at!("NEW"),
+        "SELECT NEW.winner AS identity,NEW.gameId AS gameId UNION ALL SELECT NEW.loser,NEW.gameId",
+        " WHERE OLD.claimValid IS NOT NEW.claimValid"
+    )
+);
+/// A transaction's row deleted (the engine's deep delete of a spent coin's transaction, the eviction's shadow move):
+/// the filed sweeps it pays and the parties of a pot it is, as its proof's triggers mark them. A proof deleted with
+/// its row is a downgrade.
+pub const TX_DELETE: &str = trigger!(
+    "transactions",
+    delete,
+    DELETE,
+    mark!(
+        class "(OLD.has_proof IS 1)",
+        "beef",
+        "OLD.txid",
+        "COALESCE(OLD.created_at * 1000, strftime('%s','now') * 1000)",
+        "SELECT s.identity,s.gameId FROM hopsweep_records s INDEXED BY idx_hopsweep_sweep WHERE s.sweepTxid=OLD.txid \
+         UNION ALL SELECT pp.identity,pp.gameId FROM potparty_records pp INDEXED BY idx_potparty_pot WHERE pp.potTxid=OLD.txid"
+    )
+);
+/// A party filed or admitted: the OTHER seats of its pot (`results::seat_markers_sql` reads both seats' rows), which
+/// `PARTY_INSERT` (the filer's own subject) never marked. The same pair, so the publish carries the row to them too.
+pub const PARTY_INSERT_SEATS: &str = trigger!(
+    "potparty_records",
+    insert_seats,
+    INSERT,
+    mark!(
+        "party",
+        "NEW.txid",
+        created_at!("NEW"),
+        "SELECT pp.identity,pp.gameId FROM potparty_records pp INDEXED BY idx_potparty_pot WHERE pp.potTxid=NEW.potTxid AND pp.potVout=NEW.potVout AND (pp.identity IS NOT NEW.identity OR pp.gameId IS NOT NEW.gameId)"
+    )
+);
+/// A party re-latched (its `sigValid`, its seat's columns): the other seats of its pot, only when a column the seat
+/// read holds moved (an unchanged re-latch marks nothing). A verdict withdrawn is a downgrade.
+pub const PARTY_UPDATE_SEATS: &str = trigger!(
+    "potparty_records",
+    update_seats,
+    "UPDATE OF sigValid,seatSettlePubkey,seatSigHex,sigHex,recoveryHeight",
+    mark!(
+        class "(OLD.sigValid IS 1 AND NEW.sigValid IS NOT 1)",
+        "party",
+        "NEW.txid",
+        created_at!("NEW"),
+        "SELECT pp.identity,pp.gameId FROM potparty_records pp INDEXED BY idx_potparty_pot WHERE pp.potTxid=NEW.potTxid AND pp.potVout=NEW.potVout AND (pp.identity IS NOT NEW.identity OR pp.gameId IS NOT NEW.gameId)",
+        " WHERE OLD.sigValid IS NOT NEW.sigValid OR OLD.seatSettlePubkey IS NOT NEW.seatSettlePubkey OR OLD.seatSigHex IS NOT NEW.seatSigHex OR OLD.sigHex IS NOT NEW.sigHex OR OLD.recoveryHeight IS NOT NEW.recoveryHeight"
+    )
+);
+/// The seat derivation (`derive_pot_*`, `pot_hop_seats`): a pot whose committed keys are known seats EVERY hop marker
+/// whose settle key is one of them, and the owed judge's belt reads a seat's held pots for an index-unspent hop
+/// (`owed::JOIN_SEAT_POTS_SQL`); `pot_subjects` names only the markers of hops the index already holds spent by the
+/// pot. These mark the seated markers' games from the source (`idx_hopparty_seat`), never the derived rows, so the
+/// triggers' order does not matter. The pot's own pair; a seat made or taken is a downgrade (a JOIN may spend the hop).
+macro_rules! seat_subjects {
+    ($row:literal) => {
+        concat!(
+            "SELECT hp.identity,hp.gameId FROM hopparty_records hp INDEXED BY idx_hopparty_seat WHERE hp.seatSettlePubkey IN (",
+            $row, ".pubA,", $row, ".pubB)"
+        )
+    };
+}
+/// A pot admitted (or readmitted) with its committed keys.
+pub const POT_SEATS_INSERT: &str = trigger!(
+    "pot_records",
+    insert_seats,
+    INSERT,
+    mark!(
+        class "1",
+        "pot",
+        "NEW.txid || ':' || NEW.outputIndex",
+        created_at!("NEW"),
+        seat_subjects!("NEW"),
+        " WHERE NEW.pubA IS NOT NULL AND NEW.pubB IS NOT NULL"
+    )
+);
+/// A pot's committed keys decoded or moved (the params backfill), or its key moved. `UPDATE OF` keeps it out of every
+/// other `pot_records` UPDATE's prepared program (the #674 nomem bound, `lb674_nomem_*`: 256 KiB).
+pub const POT_SEATS_UPDATE: &str = trigger!(
+    "pot_records",
+    update_seats,
+    "UPDATE OF pubA,pubB,txid,outputIndex",
+    mark!(
+        class "1",
+        "pot",
+        "NEW.txid || ':' || NEW.outputIndex",
+        created_at!("NEW"),
+        seat_subjects!("NEW"),
+        " WHERE NEW.pubA IS NOT NULL AND NEW.pubB IS NOT NULL AND (OLD.pubA IS NOT NEW.pubA OR OLD.pubB IS NOT NEW.pubB OR OLD.txid<>NEW.txid OR OLD.outputIndex<>NEW.outputIndex)"
+    )
+);
+/// A pot deleted (the eviction's shadow move): its seats go with it.
+pub const POT_SEATS_DELETE: &str = trigger!(
+    "pot_records",
+    delete_seats,
+    DELETE,
+    mark!(
+        class "1",
+        "pot",
+        "OLD.txid || ':' || OLD.outputIndex",
+        created_at!("OLD"),
+        seat_subjects!("OLD"),
+        " WHERE OLD.pubA IS NOT NULL AND OLD.pubB IS NOT NULL"
+    )
+);
+/// A seated pot's bytes stored (`store_beef`): the belt reads a seat's held JOIN from them, so the markers it seats
+/// re-judge (`BEEF_INSERT` names the pot's parties alone). The derived seats are read here: they were made by the pot's
+/// own earlier write, never this statement.
+pub const BEEF_SEATS_INSERT: &str = trigger!(
+    "pot_beefs",
+    insert_seats,
+    INSERT,
+    mark!(
+        "beef",
+        "NEW.txid",
+        created_at!("NEW"),
+        "SELECT hp.identity,hp.gameId FROM pot_hop_seats s CROSS JOIN hopparty_records hp ON hp.rowid=s.markerRowid WHERE s.potTxid=NEW.txid"
+    )
+);
+/// The stored rows whose word roles name `$txid` (the rows whose served judgement read that word or those bytes).
+macro_rules! word_rows {
+    ($txid:literal) => {
+        concat!(
+            "SELECT r.identity,r.gameId FROM owed_row_words w INDEXED BY idx_owed_row_words_txid CROSS JOIN owed_rows r ON r.identity=w.identity AND r.outpoint=w.outpoint WHERE w.txid=",
+            $txid
+        )
+    };
+}
+/// The tracker's stranger-projection sweep (`tracker_host::stored::SWEEP`, eight days): a word the rows read is gone.
+/// A mined word deleted is a downgrade (a confirmation rested on it). Its pair is the word's; the publish carries the
+/// emptied domain.
+pub const WORD_DELETE: &str = trigger!(
+    "tx_words",
+    delete,
+    DELETE,
+    mark!(
+        class "(OLD.word IS 'mined')",
+        "word",
+        "OLD.txid",
+        "OLD.updated_at",
+        word_rows!("OLD.txid")
+    )
+);
+/// The spender-bytes sweeps (`owed::OWED_SPENDER_BYTES_SWEEP_SQL`, the row cap's): a spender's bytes the rows classified
+/// from are gone. Its own pair (`bytes`), which carries no row, so its event takes the narrowed read. A downgrade (the
+/// classification withdrawn).
+pub const SPENDER_BYTES_DELETE: &str = trigger!(
+    "owed_spender_bytes",
+    delete,
+    DELETE,
+    mark!(
+        class "1",
+        "bytes",
+        "OLD.txid",
+        "OLD.createdAtMs",
+        word_rows!("OLD.txid")
+    )
+);

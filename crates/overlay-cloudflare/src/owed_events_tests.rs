@@ -175,11 +175,26 @@ mod pins {
             "owed_dirty_transactions_proof_insert" => (format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES('{ID}','{GAME}','{HOP}',1,'{SPENDER}','00','sweep0',0,1); DELETE FROM owed_dirty; INSERT OR REPLACE INTO transactions(txid,beef,has_proof,proofHeight) VALUES('{SPENDER}',x'00',1,5)"), "beef", SPENDER.into()),
             "owed_dirty_transactions_proof_update" => (format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES('{ID}','{GAME}','{HOP}',1,'{SPENDER}','00','sweep0',0,1); INSERT INTO transactions(txid,beef,has_proof) VALUES('{SPENDER}',x'00',0); DELETE FROM owed_dirty; UPDATE transactions SET has_proof=1,proofHeight=5 WHERE txid='{SPENDER}'"), "beef", SPENDER.into()),
             "owed_dirty_pot_records_update_filers" => (format!("DELETE FROM hopparty_records; INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,createdAt) VALUES('{HOP}',1,1,'{SPENDER}',1); INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES('{ID}','{GAME}','{HOP}',1,'{SPENDER}','00','sweep0',0,1); DELETE FROM owed_dirty; UPDATE pot_records SET spentConfirmed=1,spentHeight=5 WHERE txid='{HOP}'"), "pot", format!("{HOP}:1")),
+            // FIX-1010 (bsv-low #1010): the families no trigger marked, and a party's other seats
+            "owed_dirty_hand_markers_insert" => (format!("INSERT INTO hand_markers(gameId,identity,potTxid,cardsHex,txid,outputIndex,createdAt) VALUES('{GAME}','{ID}','{POT}','c','hand0',0,1)"), "hand", "hand0".into()),
+            "owed_dirty_hand_markers_update" => (format!("INSERT INTO hand_markers(gameId,identity,potTxid,cardsHex,txid,outputIndex,createdAt) VALUES('{GAME}','{ID}','{POT}','c','hand0',0,1); DELETE FROM owed_dirty; UPDATE hand_markers SET rowValid=1 WHERE txid='hand0'"), "hand", "hand0".into()),
+            "owed_dirty_proof_markers_insert" => (format!("INSERT INTO proof_markers(gameId,winner,sigHex,bundle,txid,outputIndex,createdAt) VALUES('{GAME}','{ID}','s',x'00','proof0',0,1)"), "proof", "proof0".into()),
+            "owed_dirty_proof_posts_insert" => (format!("INSERT OR REPLACE INTO proof_posts(gameId,winner,sigHex,bundle,createdAt,bundleValid) VALUES('{GAME}','{ID}','s',x'00',1,1)"), "proof", GAME.into()),
+            "owed_dirty_result_markers_v2_update" => (format!("INSERT INTO result_markers_v2(gameId,winner,loser,txid,outputIndex,createdAt) VALUES('{GAME}','{ID}','opp','result0',0,1); DELETE FROM owed_dirty; UPDATE result_markers_v2 SET claimValid=2 WHERE txid='result0'"), "result", "result0".into()),
+            "owed_dirty_transactions_delete" => (format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES('{ID}','{GAME}','{HOP}',1,'{SPENDER}','00','sweep0',0,1); INSERT INTO transactions(txid,beef,has_proof) VALUES('{SPENDER}',x'00',1); DELETE FROM owed_dirty; DELETE FROM transactions WHERE txid='{SPENDER}'"), "beef", SPENDER.into()),
+            "owed_dirty_potparty_records_insert_seats" => (format!("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt) VALUES('opp','{ID}','{GAME}','{POT}',0,1,'00','party1',0,1)"), "party", "party1".into()),
+            "owed_dirty_potparty_records_update_seats" => (format!("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt) VALUES('opp','{ID}','{GAME}','{POT}',0,1,'00','party1',0,1); DELETE FROM owed_dirty; UPDATE potparty_records SET sigValid=1 WHERE txid='party1'"), "party", "party1".into()),
+            "owed_dirty_pot_records_insert_seats" => (format!("DELETE FROM pot_records; DELETE FROM owed_dirty; INSERT INTO pot_records(txid,outputIndex,spent,createdAt,pubA,pubB) VALUES('{POT}',0,0,1,'k','z')"), "pot", pot),
+            "owed_dirty_pot_records_update_seats" => (format!("UPDATE pot_records SET pubA='k',pubB='z' WHERE txid='{POT}'"), "pot", pot),
+            "owed_dirty_pot_records_delete_seats" => (format!("UPDATE pot_records SET pubA='k',pubB='z' WHERE txid='{POT}'; DELETE FROM owed_dirty; DELETE FROM pot_records WHERE txid='{POT}'"), "pot", pot),
+            "owed_dirty_pot_beefs_insert_seats" => (format!("UPDATE pot_records SET pubA='k',pubB='z' WHERE txid='{POT}'; DELETE FROM owed_dirty; INSERT INTO pot_beefs(txid,beef,createdAt) VALUES('{POT}',x'00',1)"), "beef", POT.into()),
+            "owed_dirty_tx_words_delete" => (format!("INSERT INTO tx_words(txid,word,tier,updated_at) VALUES('{SPENDER}','mined','chain',1); DELETE FROM owed_dirty; DELETE FROM tx_words WHERE txid='{SPENDER}'"), "word", SPENDER.into()),
+            "owed_dirty_owed_spender_bytes_delete" => (format!("INSERT INTO owed_spender_bytes(txid,bytesJson,createdAtMs) VALUES('{SPENDER}','{{}}',1); DELETE FROM owed_dirty; DELETE FROM owed_spender_bytes WHERE txid='{SPENDER}'"), "bytes", SPENDER.into()),
             _ => return None,
         })
     }
 
-    /// The 32 triggers, read from the shipped source at test time (never a hand-fed list): each trigger's name.
+    /// The 46 triggers, read from the shipped source at test time (never a hand-fed list): each trigger's name.
     fn shipped_triggers() -> Vec<String> {
         let src = include_str!("derived_owed_triggers.rs");
         let mut out = Vec::new();
@@ -206,7 +221,7 @@ mod pins {
     #[test]
     fn d2_actor_a_a_each_trigger_pair_noted_publishes_one_event_with_its_rows_facts() {
         let triggers = shipped_triggers();
-        assert_eq!(triggers.len(), 32, "the trigger list: {triggers:?}");
+        assert_eq!(triggers.len(), 46, "the trigger list: {triggers:?}");
         for trigger in &triggers {
             let (sql, source, key) = write_of(trigger)
                 .unwrap_or_else(|| panic!("{trigger}: no writer's note is pinned for it"));
@@ -246,7 +261,7 @@ mod pins {
                 (source, key.as_str())
             );
             assert!(sent.facts["marks"].as_i64().unwrap() >= 1, "{trigger}");
-            if !trigger.ends_with("_delete") && !trigger.contains("missing") && source != "word" {
+            if !trigger.contains("_delete") && !trigger.contains("missing") && source != "word" {
                 assert!(
                     !sent.facts["row"].is_null(),
                     "{trigger}: the row's facts: {}",
@@ -254,6 +269,153 @@ mod pins {
                 );
             }
         }
+    }
+
+    /// FIX-1010 (bsv-low #1010; the D2-ACTOR-F lens's LOW-1): THE PROBE ROWS' WRITERS MARK IN THEIR BATCH AND FRAME.
+    /// The overlay's reorg clear and TTL sweep, each run as its batch runs it (the marks, then the framed delete) on the
+    /// real record: the clear marks the hop's marker for its confirmed evidence and memo, the pot's party for the
+    /// pot's memo and the spender's owed rows for a proof latch, each a downgrade; the sweep marks the evidence of an
+    /// evicted hop alone (an aged memo no judge reads marks nothing); the keys the delete answers are the pairs the
+    /// writer notes, and each publishes one event. RED with the marks dropped from the batch (the shipped clear alone
+    /// marks nothing: `left: 0`).
+    #[test]
+    fn fix1010_a_the_probe_writers_mark_in_their_batch_and_frame() {
+        use crate::hop_probe_memos::*;
+        let run_batch = |db: &Sqlite, mark: &str, framed: &str, bind: Option<i64>| -> Vec<String> {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            match bind {
+                Some(b) => tx.execute(mark, [b]).unwrap(),
+                None => tx.execute(mark, []).unwrap(),
+            };
+            let mut q = tx.prepare(framed).unwrap();
+            let keys: Vec<String> = match bind {
+                Some(b) => q
+                    .query_map([b], |r| r.get(0))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect(),
+                None => q
+                    .query_map([], |r| r.get(0))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect(),
+            };
+            drop(q);
+            tx.commit().unwrap();
+            keys
+        };
+        let latch = format!("proofmined:{SPENDER}.5");
+        let plant = |db: &Sqlite, key: &str, at: i64, confirmed: i64| {
+            db.conn
+                .execute(
+                    "INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed) VALUES(?1,?2,1,?3,?4)",
+                    rusqlite::params![key, at, SPENDER, confirmed],
+                )
+                .unwrap();
+        };
+        let marks = |db: &Sqlite| -> Vec<(String, String, String, i64)> {
+            let mut q = db
+                .conn
+                .prepare("SELECT identity,source,sourceKey,downgrade FROM owed_dirty ORDER BY identity,sourceKey")
+                .unwrap();
+            q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        // the clear
+        let db = Sqlite::migrated();
+        seed(&db);
+        let evidence = format!("{HOP}:1");
+        let memo = format!("{POT}.0");
+        plant(&db, &evidence, 1, 1);
+        plant(&db, &memo, 1, 1);
+        plant(&db, &latch, 1, 1);
+        plant(&db, &format!("{HOP}.1"), 1, 0); // unconfirmed: the clear keeps it
+        assert_eq!(
+            db.conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(),
+            3
+        );
+        assert_eq!(db.marks().len(), 0, "the shipped clear alone marks nothing");
+        let db = Sqlite::migrated();
+        seed(&db);
+        plant(&db, &evidence, 1, 1);
+        plant(&db, &memo, 1, 1);
+        plant(&db, &latch, 1, 1);
+        plant(&db, &format!("{HOP}.1"), 1, 0);
+        let mut deleted = run_batch(
+            &db,
+            HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
+            HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL,
+            None,
+        );
+        deleted.sort();
+        let mut want = vec![evidence.clone(), memo.clone(), latch.clone()];
+        want.sort();
+        assert_eq!(deleted, want);
+        assert_eq!(
+            marks(&db),
+            vec![
+                (ID.to_string(), "probe".to_string(), memo.clone(), 1),
+                (ID.to_string(), "probe".to_string(), evidence.clone(), 1),
+                (ID.to_string(), "probe".to_string(), latch.clone(), 1),
+            ],
+            "the hop's marker, the pot's party, the spender's owed row: each a downgrade"
+        );
+        let noted: Vec<Noted> = deleted
+            .iter()
+            .filter(|k| noted_key(false, k))
+            .map(|k| Noted {
+                source: PROBE_SOURCE.into(),
+                key: k.clone(),
+                held: None,
+            })
+            .collect();
+        assert_eq!(noted.len(), 3);
+        let report = run(publish_with(&db, noted));
+        assert_eq!(
+            (report.fault, report.sent.len()),
+            (None, 3),
+            "one event a key"
+        );
+        // the sweep: an evicted hop's evidence (no index row for it) and an aged memo
+        let db = Sqlite::migrated();
+        seed(&db);
+        plant(&db, &evidence, 1, 1);
+        plant(&db, &format!("{HOP}.1"), 1, 0);
+        plant(&db, &latch, 1, 1); // a latch: never swept
+        let deleted = run_batch(
+            &db,
+            HOP_PROBE_MEMO_EXPIRE_MARK_SQL,
+            HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL,
+            Some(10),
+        );
+        assert_eq!(deleted.len(), 2, "{deleted:?}");
+        assert_eq!(
+            marks(&db),
+            vec![(ID.to_string(), "probe".to_string(), evidence.clone(), 1)],
+            "only the evidence a judge still reads is marked"
+        );
+        let noted: Vec<&String> = deleted.iter().filter(|k| noted_key(true, k)).collect();
+        assert_eq!(noted, vec![&evidence]);
+        // evidence whose index row stands is never swept, so never marked
+        let db = Sqlite::migrated();
+        seed(&db);
+        db.conn
+            .execute_batch(&format!(
+                "INSERT INTO pot_records(txid,outputIndex,spent,createdAt) VALUES('{HOP}',1,0,1)"
+            ))
+            .unwrap();
+        db.conn.execute("DELETE FROM owed_dirty", []).unwrap();
+        plant(&db, &evidence, 1, 1);
+        assert!(run_batch(
+            &db,
+            HOP_PROBE_MEMO_EXPIRE_MARK_SQL,
+            HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL,
+            Some(10)
+        )
+        .is_empty());
+        assert!(marks(&db).is_empty());
     }
 
     /// The text of the function whose signature starts with `sig` in `src`: from the signature to the first line that
@@ -290,6 +452,7 @@ mod pins {
                 "owed_write" => include_str!("../../low-app-layer/src/record_post/owed_write.rs"),
                 "handfile" => include_str!("../../low-app-layer/src/handfile.rs"),
                 "runtime" => include_str!("../../low-app-layer/src/tracker_host/runtime.rs"),
+                "routes" => include_str!("../../low-app-layer/src/routes.rs"),
                 _ => unreachable!(),
             }
         };
@@ -335,6 +498,18 @@ mod pins {
             ("beef", include_str!("d1_storage.rs"), "async fn mark_transaction_proven(&self", r#"note("beef","#),
             ("beef", include_str!("reorg_sweep.rs"), "async fn unprove(", r#"note("beef","#),
             ("pot", include_str!("reorg_sweep.rs"), "pub async fn unmined_hint(", "crate::pot_changes::note(&rec.txid,rec.output_index);"),
+            // FIX-1010 (bsv-low #1010): the families no trigger marked, each writer
+            ("hand", disc, "pub fn hand_insert_query(", r#"note("hand","#),
+            ("hand", disc, "pub fn hand_relatch_query(", r#"note("hand","#),
+            ("proof", disc, "async fn store_record(&self, record: &ProofRecord)", r#"note("proof","#),
+            ("proof", include_str!("../../low-app-layer/src/proof_post.rs"), "pub async fn proof_post(", "owed_events_publish::note(PROOF_POST_SOURCE,"),
+            ("beef", include_str!("d1_storage.rs"), "async fn delete_output(", r#"note("beef", txid);"#),
+            ("probe", include_str!("hop_probe_memos.rs"), "async fn marked_delete(", "crate::owed_events::note(PROBE_SOURCE,&d.outpoint);"),
+            ("probe", include_str!("hop_probe_memos.rs"), "pub async fn clear_on_reorg(", "HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL"),
+            ("probe", include_str!("hop_probe_memos.rs"), "pub async fn expire(", "HOP_PROBE_MEMO_EXPIRE_MARK_SQL,HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL"),
+            ("word", app("runtime"), "pub async fn tick(", r#"note("word", &gone.txid);"#),
+            ("bytes", app("routes"), "fn note_swept_bytes(", "note(crate::owed::SPENDER_BYTES_SOURCE,&g.txid);"),
+            ("bytes", app("routes"), "pub async fn sweep_owed_spender_bytes(", "Ok(gone)=>note_swept_bytes(&gone),"),
         ];
         for (source, src, sig, note) in writers {
             let body = fn_body(src, sig);
@@ -368,8 +543,25 @@ mod pins {
         // every trigger source but the word's spender bytes has a noting writer here
         for (_, source) in owed_event::TRIGGER_SOURCES {
             assert!(
-                ["pot", "party", "hop", "refund", "result", "collected", "sweep", "eviction", "seen", "word", "beef", "refusal"]
-                    .contains(&source),
+                [
+                    "pot",
+                    "party",
+                    "hop",
+                    "refund",
+                    "result",
+                    "collected",
+                    "sweep",
+                    "eviction",
+                    "seen",
+                    "word",
+                    "beef",
+                    "refusal",
+                    "hand",
+                    "proof",
+                    "probe",
+                    "bytes"
+                ]
+                .contains(&source),
                 "{source}"
             );
         }

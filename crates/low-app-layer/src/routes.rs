@@ -5919,11 +5919,10 @@ pub async fn sweep_owed_spender_bytes(env: &worker::Env) {
         .prepare(crate::owed::OWED_SPENDER_BYTES_SWEEP_SQL)
         .bind(&[JsValue::from_f64(cutoff as f64), JsValue::from_f64(limit)])
     {
-        Ok(stmt) => {
-            if let Err(e) = stmt.counted_run().await {
-                console_warn!("[owed] spender-bytes age sweep failed: {e}");
-            }
-        }
+        Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<Swept>()) {
+            Ok(gone) => note_swept_bytes(&gone),
+            Err(e) => console_warn!("[owed] spender-bytes age sweep failed: {e}"),
+        },
         Err(e) => console_warn!("[owed] spender-bytes age sweep bind failed: {e}"),
     }
     // the row-cap sweep (belt): the oldest rows beyond the ceiling, bounded this pass
@@ -5933,14 +5932,31 @@ pub async fn sweep_owed_spender_bytes(env: &worker::Env) {
             JsValue::from_f64(crate::owed::OWED_SPENDER_BYTES_ROW_CAP as f64),
             JsValue::from_f64(limit),
         ]) {
-        Ok(stmt) => {
-            if let Err(e) = stmt.counted_run().await {
-                console_warn!("[owed] spender-bytes cap sweep failed: {e}");
-            }
-        }
+        Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<Swept>()) {
+            Ok(gone) => note_swept_bytes(&gone),
+            Err(e) => console_warn!("[owed] spender-bytes cap sweep failed: {e}"),
+        },
         Err(e) => console_warn!("[owed] spender-bytes cap sweep bind failed: {e}"),
     }
     crate::owed::note_spender_store_sweep_pass();
+    // FIX-1010 (bsv-low #1010): the swept bytes' pairs, published and their actors called (the queue behind them)
+    if crate::owed_events::configured(env).await {
+        crate::owed_events::publish_noted(env).await;
+        crate::owed_events::direct_held(env).await;
+    }
+}
+
+/// A row the spender-bytes sweeps deleted (their `RETURNING txid`).
+#[derive(serde::Deserialize)]
+struct Swept {
+    txid: String,
+}
+
+/// FIX-1010: each swept spender's pair (`bytes`; its row's trigger marked the stored rows that read it).
+fn note_swept_bytes(gone: &[Swept]) {
+    for g in gone {
+        crate::owed_events_publish::note(crate::owed::SPENDER_BYTES_SOURCE, &g.txid);
+    }
 }
 
 pub(crate) fn spender_outputs_of(

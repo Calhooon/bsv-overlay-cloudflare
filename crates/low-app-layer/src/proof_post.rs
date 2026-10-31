@@ -180,6 +180,9 @@ pub fn verify_proof_post(
     })
 }
 
+/// FIX-1010 (bsv-low #1010): the pair a posted bundle's trigger marks (`proof`, keyed by its game).
+pub const PROOF_POST_SOURCE: &str = "proof";
+
 /// The write: one row per (game, poster); a later post by the same poster
 /// REPLACES (a newer signed bundle supersedes). 11 binds. Pub for the
 /// REAL-SQLite harness.
@@ -338,6 +341,15 @@ pub async fn proof_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resul
         ])?
         .counted_run()
         .await?;
+    // FIX-1010 (bsv-low #1010): the row's trigger marked its game's seats; their pair is published before the answer
+    // and the seats' actors called after it (the queue the backstop), as the records door does.
+    if crate::owed_events::configured(&ctx.env).await {
+        crate::owed_events_publish::note(PROOF_POST_SOURCE, &verified.game_id);
+        crate::owed_events::publish_noted(&ctx.env).await;
+        if let Some(wait) = &ctx.data.wait {
+            crate::owed_events::schedule_direct(&ctx.env, wait);
+        }
+    }
     crate::routes::json_response(
         serde_json::json!({
             "ok": true,

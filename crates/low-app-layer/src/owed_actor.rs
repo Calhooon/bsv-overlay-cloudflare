@@ -1915,7 +1915,10 @@ pub async fn apply<R: SqlPort, L: SqlPort, O: Outside>(
 /// unmarked families alone over the whole key set was the lens's narrower shape; it is not taken because the set of
 /// families every writer marks for every identity that reaches them is empty on inspection (partial triggers: the
 /// BEEF's delete, `network_seen`'s delete, a word's other columns; cross-identity txid keys), so the narrowing kept
-/// is the statement count, never the rows. A key the judgement then names that the mirror
+/// is the statement count, never the rows. Since FIX-1010 (bsv-low #1010) the rule holds of the CARRIED apply too
+/// (D2-ACTOR-F, which reads no record): every writer of the families no trigger marked now marks the subjects that
+/// read it and frames its pair, and those pairs carry no row, so the write's own event takes this narrowed read
+/// ([`carried`]'s module doc names them). A key the judgement then names that the mirror
 /// has not read is a MISS: read in its own round (its keys alone), counted (`owed_actor_closure_misses_total`).
 /// Any other apply (a cold game, no `touch`, a mark of [`FULL_SOURCES`]) reads the whole closure as before, in one
 /// statement a round (it was 24), and stamps its games warm; a warm apply that meets a mark of [`FULL_SOURCES`] takes

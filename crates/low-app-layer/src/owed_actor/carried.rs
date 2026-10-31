@@ -8,9 +8,13 @@
 //!
 //! What a carried apply is, and is not:
 //! - It is a FIRST VISIBILITY, never a coverage: it records no `covered` generation (the seq check's dupe), so the
-//!   queue's delivery of the same event is applied again by the narrowed D1 read, which covers it and refreshes any
-//!   write no mark carried (the sixth delta lens's NEW6-M1 class). The direct call that carried it acknowledges
-//!   nothing (Phase C's direct acknowledgement reads a bound from D1; a carried body skips it).
+//!   queue's delivery of the same event is applied again by the narrowed D1 read, which covers it. It does not refresh
+//!   the families its rows do not name, and need not: since FIX-1010 (bsv-low #1010, the D2-ACTOR-F lens's LOW-1)
+//!   every writer of the actor's families marks the subjects that read it and frames its pair (the reorg clear and
+//!   the TTL sweep of `hop_chain_probes` in their batch, the hand and proof markers, the result re-latch, a
+//!   transaction's row deleted, a party's other seats, the seat derivation by settle key), and none of those pairs
+//!   carries a row, so each such write's own event takes the narrowed read. The direct call that carried it
+//!   acknowledges nothing (Phase C's direct acknowledgement reads a bound from D1; a carried body skips it).
 //! - It records EXACTLY the marks whose rows it applied (`applied` kind [`PAYLOAD_MARK_KIND`], seq the generation):
 //!   the read's gate counts those marks applied and every other pending mark as before (`owed_read::Snapshot`).
 //! - A carried row never overwrites a newer one: an item is skipped where the actor already holds the same domain at
