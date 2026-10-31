@@ -31,6 +31,8 @@ if [ -z "${OWED_BELT_BUILD:-}" ]; then
   worker-build crates/low-app-layer --release --out-dir "$build" > "$out/build.log" 2>&1
 fi
 token=belt-tier-$(date -u +%s)
+# FIX-TIER-RING: the fleet compare ring runs in this worker (OWED_FLEET_COMPARE_PER_TICK 16), its own cells
+# (owed-fleet-compare-*) measure it; every other tier worker renders it paused (0).
 cat > "$out/wrangler.toml" <<EOF
 name = "owed-belt-tick"
 main = "$build/worker/shim.mjs"
@@ -40,8 +42,6 @@ AUTH_ENFORCE = "false"
 SESSION_LANE = "false"
 COURIER_SINK = "http://127.0.0.1:$standin"
 INTERNAL_TOKEN = "$token"
-# FIX-TIER-RING: the fleet compare ring runs here, its own cells (`owed-fleet-compare-*`) measure it; every other
-# tier worker renders it paused (0).
 OWED_FLEET_COMPARE_PER_TICK = "16"
 [[services]]
 binding = "CHAINTRACKS"
