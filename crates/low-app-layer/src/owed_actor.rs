@@ -957,34 +957,54 @@ pub const BOUND_COLUMN: &str = "(SELECT MAX(generation) FROM owed_dirty WHERE id
 /// `docs/CUTOVER-D2-ACTOR-2026-10-28.md`, its rollback section).
 pub const HW_COLUMN: &str = "(SELECT seq FROM sqlite_sequence WHERE name='owed_dirty') AS hw";
 
-/// D2-ACTOR-F-FOLD-2 (the delta lens's LOW-1 and NIT-2): the mirror's columns that hold a 64-hex value that is NO
-/// key of any family the actor reads: a MINED word's `proof_root` and `header_hash` (a merkle root and a block hash,
-/// new on every proof), its `proof_hex` (a merkle path) and `legacy_body` (the tracker's stored body, read by the
-/// judge only for its terminal flags), and a refusal's `refusedTxid` (no judge statement reads by it:
-/// `owed_judge::hydrate::DOOR_REFUSAL_SQL` reads a refusal by its HOP). A value in one of these never becomes a key, in
-/// a mirror row, a judge statement's answer, or a carried payload ([`txids_in_row`]), so a MINED word or a refusal
-/// makes no miss round. Pinned against every judge statement (`fold2_low1_*`): none filters or joins by one of them.
-pub const NOT_KEY_COLUMNS: [&str; 5] = [
-    "proof_root",
-    "header_hash",
-    "proof_hex",
-    "legacy_body",
-    "refusedTxid",
+/// D2-ACTOR-F-FOLD-3 (the second delta lens's NIT-1): THE KEY COLUMNS. A row's keys are read from these columns ONLY,
+/// never from free text: every txid key column of a mirrored family ([`FAMILIES`]' `Txid` keys), the columns that name
+/// another family's key (`spendingTxid`, `sweepTxid`, `payTxid`, `settleTxid`, `verdictTxid`, a probe's `outpoint`,
+/// a mark's `sourceKey`), the judge's own aliases of them (`markerTxid`), and the structured columns whose JSON names
+/// outpoints the judge reads by (`releasedSpends`, an eviction's; `bytesJson`, a spender's decoded inputs; `facts`, a
+/// transaction's decoded facts and the judge's own rows). Every other column is never a key, whatever it holds: a
+/// MINED word's `proof_root`, `header_hash`, `proof_hex`, `legacy_body` and `hint_source`, a refusal's `reason` and
+/// `refusedTxid` (no judge statement reads by it), `network_seen.seenSource`, the markers' signatures and cards. The
+/// pin `fold3_nit1_*` names them: every family's txid key is here, and every other schema column is not.
+pub const KEY_COLUMNS: [&str; 13] = [
+    "txid",
+    "potTxid",
+    "hopTxid",
+    "markerTxid",
+    "spendingTxid",
+    "sweepTxid",
+    "payTxid",
+    "settleTxid",
+    "verdictTxid",
+    "outpoint",
+    "sourceKey",
+    "releasedSpends",
+    "bytesJson",
 ];
+/// The structured columns read whole (their JSON names keys at any depth): beside [`KEY_COLUMNS`]' `releasedSpends`
+/// and `bytesJson`, a transaction's decoded `facts`.
+pub const KEY_STRUCTURED_COLUMNS: [&str; 1] = ["facts"];
 
-/// THE ONE KEY RULE (the delta lens's LOW-1 and NIT-2): the txids a row (an object of columns) names: every maximal
-/// 64-hex run of every value ([`txids_in_value`]) but those of [`NOT_KEY_COLUMNS`]. The mirror's key walk
-/// (`keys_of_mirror`), the judge's answers (`Noting`) and the closure's key set ([`closure_keys`]) read rows by it, so
-/// the closure reads exactly the keys the actor's miss round would.
-/// An object's key in [`NOT_KEY_COLUMNS`] is skipped at any depth (a word's facts hold its row under `row`).
+/// THE ONE KEY RULE (the delta lens's LOW-1 and NIT-2; inverted by D2-ACTOR-F-FOLD-3, the second delta lens's NIT-1):
+/// the txids a row (an object of columns) names: every maximal 64-hex run ([`txids_in_value`]) of the values of its
+/// [`KEY_COLUMNS`] and [`KEY_STRUCTURED_COLUMNS`] alone. Any other column's text names no key; an object or array
+/// under another name is walked for its own key columns (a word's facts hold its row under `row`). The mirror's key
+/// walk (`keys_of_mirror`), the judge's answers (`Noting`; every text BIND the judge sends is scanned whole as
+/// before) and the closure's key set ([`closure_keys`]) read rows by it, so the closure reads exactly the keys the
+/// actor's miss round would.
 pub fn txids_in_row(r: &Value, out: &mut BTreeSet<String>) {
     match r {
-        Value::Object(m) => m
-            .iter()
-            .filter(|(k, _)| !NOT_KEY_COLUMNS.contains(&k.as_str()))
-            .for_each(|(_, v)| txids_in_row(v, out)),
+        Value::Object(m) => {
+            for (k, v) in m {
+                if KEY_COLUMNS.contains(&k.as_str()) || KEY_STRUCTURED_COLUMNS.contains(&k.as_str())
+                {
+                    txids_in_value(v, out);
+                } else if v.is_object() || v.is_array() {
+                    txids_in_row(v, out);
+                }
+            }
+        }
         Value::Array(a) => a.iter().for_each(|x| txids_in_row(x, out)),
-        Value::String(s) => txids_in(s, out),
         _ => {}
     }
 }
@@ -1018,12 +1038,39 @@ pub fn closure_keys(payload: &Value) -> BTreeSet<String> {
     out
 }
 
-/// The closure's statement of one family (`?1` the keys, `?2` the probe prefixes, `?3` [`CLOSURE_BEEF_MAX_BYTES`],
-/// `?4` [`CLOSURE_ROW_MAX_WEIGHT`]): each row as the record's read answers it (`r`, nested arrays, [`row_json`]'s
-/// order) only when its weight is under the bound, else NULL; a BEEF's hex only when its length is under the bound
-/// (`__len` its length); `k`, the row's key values (its txid columns, a probe's outpoint), always. The key set is
-/// MATERIALIZED once a statement; every arm is a txid-indexed seek (`fold2_medium2_*` pins the plans).
-pub fn closure_select(f: &Family) -> String {
+/// D2-ACTOR-F-FOLD-3 (the second delta lens's MEDIUM-1, the captain's ruling): the sources whose carried FILING may
+/// name a key beyond the event's own (a party filing its pot and marker, a collected marker its payout, a result its
+/// settle, a sweep its sweep transaction, a refund its pot). Only such an event's direct pass reads a closure; a SEEN,
+/// a word, a refusal and every other carrier read none (their keys are the event's own, which a warm mirror holds;
+/// a cold one reads its own miss once).
+pub const CLOSURE_FILING_SOURCES: [&str; 5] = ["party", "collected", "result", "sweep", "refund"];
+/// The most keys one pass's closure statement reads (the second delta lens's NIT-2): past it the keys are NOT
+/// CARRIED (an event naming one reads the record at its miss round).
+pub const PASS_CLOSURE_KEYS_MAX: usize = 32;
+/// The most bytes one family's answer of the pass's closure statement builds (`?5`, the running weight of its rows):
+/// half D1's 2,000,000 byte value bound, so the statement's every value stays under it whatever the keys' rows hold.
+/// A row past the running bound is answered with no row (its txids NOT CARRIED).
+pub const CLOSURE_FAMILY_MAX_BYTES: i64 = 1_000_000;
+
+/// PURE (FOLD-3): the closure keys of an event the direct pass reads a closure for: a carried filing
+/// ([`CLOSURE_FILING_SOURCES`]) whose payload names a key beyond the event's own source key; `None` otherwise.
+pub fn closure_wanted(ev: &overlay_discovery::owed_event::OwedEvent) -> Option<BTreeSet<String>> {
+    if !CLOSURE_FILING_SOURCES.contains(&ev.source.as_str()) {
+        return None;
+    }
+    let keys = closure_keys(ev.facts.get("payload")?);
+    let mut own = BTreeSet::new();
+    txids_in(&ev.source_key, &mut own);
+    keys.iter().any(|k| !own.contains(k)).then_some(keys)
+}
+
+/// One family's arm of the pass's closure statement (`k` the keys, `p` their probe ranges, `?3`
+/// [`CLOSURE_BEEF_MAX_BYTES`], `?4` [`CLOSURE_ROW_MAX_WEIGHT`], `?5` [`CLOSURE_FAMILY_MAX_BYTES`]): a scalar subquery
+/// answering the family's rows as one JSON array of `[rowid, row, keys]`, `row` (nested arrays, [`row_json`]'s order)
+/// only when its weight is under `?4` AND the family's running weight is under `?5`, else NULL; a BEEF's hex only when
+/// its length is under `?3` (its length last); `keys` the row's key values (its txid columns, a probe's outpoint). Every
+/// arm is a txid-indexed seek of the MATERIALIZED key set (`fold3_medium1_c` pins the plan).
+fn closure_arm(f: &Family) -> String {
     let (exprs, _) = compound_columns(f);
     let exprs: Vec<String> = exprs
         .into_iter()
@@ -1048,6 +1095,12 @@ pub fn closure_select(f: &Family) -> String {
             format!("{w}*COALESCE(length(CAST(t.{c} AS BLOB)),0)")
         })
         .collect();
+    let weight = format!("({})", weight.join("+"));
+    let beef_w = if f.beef {
+        "+CASE WHEN length(t.beef)<=?3 THEN 2*COALESCE(length(t.beef),0) ELSE 0 END"
+    } else {
+        ""
+    };
     let key_cols: Vec<String> = f
         .keys
         .iter()
@@ -1064,65 +1117,81 @@ pub fn closure_select(f: &Family) -> String {
         .replace("json_each(?4)", "json_each('[]')")
         .replace("?1", "''");
     format!(
-        "WITH k AS MATERIALIZED (SELECT value FROM json_each(?1)),p AS MATERIALIZED (SELECT x.value||k.value AS value FROM json_each(?2) x CROSS JOIN k) SELECT DISTINCT t.rowid AS i,CASE WHEN {}<=?4 THEN json_array({}) END AS r,json_array({}) AS k FROM {from}",
-        weight.join("+"),
+        "(SELECT json_group_array(json_array(ci,CASE WHEN crun<=?5 THEN json(cr) END,json(ck))) FROM (SELECT ci,cr,ck,SUM(cw) OVER (ORDER BY ci ROWS UNBOUNDED PRECEDING) AS crun FROM (SELECT DISTINCT t.rowid AS ci,CASE WHEN {weight}<=?4 THEN json_array({}) END AS cr,json_array({}) AS ck,CASE WHEN {weight}<=?4 THEN {weight} ELSE 0 END{beef_w}+64 AS cw FROM {from})))",
         calls.join(","),
         key_cols.join(",")
     )
 }
 
-/// The closure's high-water statement, the first of its batch (one transaction: the same snapshot as the rows).
-pub const CLOSURE_HW_SQL: &str = "SELECT seq AS hw FROM sqlite_sequence WHERE name='owed_dirty'";
+/// D2-ACTOR-F-FOLD-3 (the second delta lens's MEDIUM-1, the captain's ruling): the pass's ONE closure statement: the
+/// record's high-water (`hw`, [`HW_COLUMN`]'s read) and every family's rows of the union of the pass's keys (`f<n>`,
+/// [`closure_arm`]), one snapshot, one round trip. `?1` the keys, `?2` [`PROBE_PREFIXES`]. No compound SELECT (D1
+/// refuses one past 5 terms): each family a scalar subquery, as [`aggregate_select`].
+pub fn pass_closure_select() -> String {
+    let arms: Vec<String> = FAMILIES
+        .iter()
+        .enumerate()
+        .map(|(n, f)| format!("{} AS f{n}", closure_arm(f)))
+        .collect();
+    format!(
+        "WITH k AS MATERIALIZED (SELECT value FROM json_each(?1)),p AS MATERIALIZED (SELECT x.value||k.value AS value FROM json_each(?2) x CROSS JOIN k) SELECT {HW_COLUMN},{}",
+        arms.join(",")
+    )
+}
 
-/// PURE (D2-ACTOR-F-FOLD-2, the delta lens's MEDIUM-1 and MEDIUM-2): the closure's batch for a carried payload: the
-/// high-water, then one statement a family, in [`FAMILIES`]' order (one transaction: one snapshot), and the key set.
-/// `None` when the payload names no key. Its OWN batch, never the publish's (the direct pass runs it after the
-/// writer's answer): a fault costs only the closure, and no value it builds can pass D1's bound.
-///
-/// Every family is read, the one the payload carries among them (the delta lens's MEDIUM-2 asked it left out): a
-/// closure round REPLACES each family's domain of its miss keys (`write_round_of`'s delete), so a family left out would
-/// take the carried rows with it; off the door its rows are a txid-indexed seek of a few keys.
-pub fn closure_statements(payload: &Value) -> Option<(Vec<Stmt>, BTreeSet<String>)> {
-    let keys = closure_keys(payload);
-    if keys.is_empty() {
+/// PURE (FOLD-3): the pass's closure statement over the union of its events' keys, the first [`PASS_CLOSURE_KEYS_MAX`] in
+/// order; answers it and the keys it reads. `None` with no key.
+pub fn pass_closure_statement(keys: &BTreeSet<String>) -> Option<(Stmt, BTreeSet<String>)> {
+    let read: BTreeSet<String> = keys.iter().take(PASS_CLOSURE_KEYS_MAX).cloned().collect();
+    if read.is_empty() {
         return None;
     }
     let binds = vec![
-        Bind::Text(json!(keys).to_string()),
+        Bind::Text(json!(read).to_string()),
         Bind::Text(json!(PROBE_PREFIXES).to_string()),
         Bind::Int(CLOSURE_BEEF_MAX_BYTES),
         Bind::Int(CLOSURE_ROW_MAX_WEIGHT),
+        Bind::Int(CLOSURE_FAMILY_MAX_BYTES),
     ];
-    let mut stmts = vec![Stmt::new(CLOSURE_HW_SQL, Vec::new())];
-    stmts.extend(FAMILIES.iter().map(|f| fitted(closure_select(f), &binds)));
-    Some((stmts, keys))
+    Some((fitted(pass_closure_select(), &binds), read))
 }
 
-/// PURE (D2-ACTOR-F-FOLD-2): the closure out of its batch's answers: `{hw, keys, notCarried, f}`, `f` one array a
-/// family of its rows as OBJECTS of the mirror's columns and `__rowid`. A BEEF family's row carries its DECODED facts
-/// (`__facts`, the [`crate::owed_judge::TxFacts`] the judge reads, decoded here by the copy's own decoder) and never
-/// its bytes. `notCarried`: the txids of a row whose weight passed the bound, of a BEEF past
+/// PURE (FOLD-3): one event's closure out of the pass statement's answer (`row`): `{hw, keys, notCarried, f}` over the
+/// event's own `keys`, `f` one array a family of the rows naming one of them, as OBJECTS of the mirror's columns and
+/// `__rowid`. A BEEF family's row carries its DECODED facts (`__facts`, the [`crate::owed_judge::TxFacts`] the judge
+/// reads) and never its bytes. `notCarried`: the event's keys the statement did not read (past
+/// [`PASS_CLOSURE_KEYS_MAX`]), and the txids of a row past its weight bound or the family's running bound, of a BEEF past
 /// [`CLOSURE_BEEF_MAX_BYTES`], or whose facts alone pass [`CLOSURE_MAX_BYTES`]; a miss naming one of them reads the
 /// record ([`ClosureRead::rows_of`]). `None` past [`CLOSURE_MAX_BYTES`].
-pub fn closure_of(keys: &BTreeSet<String>, outs: &[StmtOut]) -> Option<Value> {
-    let hw = outs.first()?.rows.first().map_or(0, |r| hw_of(&r["hw"]));
-    let mut not_carried: BTreeSet<String> = BTreeSet::new();
+pub fn closure_for(keys: &BTreeSet<String>, read: &BTreeSet<String>, row: &Value) -> Option<Value> {
+    let hw = hw_of(&row["hw"]);
+    let mut not_carried: BTreeSet<String> = keys.difference(read).cloned().collect();
     let mut fams: Vec<Value> = Vec::with_capacity(FAMILIES.len());
-    for (f, out) in FAMILIES.iter().zip(outs.iter().skip(1)) {
+    for (n, f) in FAMILIES.iter().enumerate() {
         let names: Vec<String> = compound_columns(f)
             .1
             .into_iter()
             .chain(f.beef.then(|| "__len".to_string()))
             .collect();
+        let got = json_of(&row[format!("f{n}")]).ok()?;
         let mut rows = Vec::new();
-        for row in &out.rows {
-            let mut over = || {
-                txids_in_value(&json_of(&row["k"]).unwrap_or(Value::Null), &mut not_carried);
+        for el in got.as_array()? {
+            let mut row_keys = BTreeSet::new();
+            txids_in_value(&el[2], &mut row_keys);
+            if row_keys.is_disjoint(keys) {
+                continue;
+            }
+            // a JSON row a CASE handed back as its text is parsed (SQLite keeps no JSON subtype through every arm)
+            let parsed = match &el[1] {
+                Value::String(t) => serde_json::from_str::<Value>(t).unwrap_or(Value::Null),
+                other => other.clone(),
             };
-            let r = match json_of(&row["r"]) {
-                Ok(r @ Value::Array(_)) => r,
+            let r = match parsed {
+                r @ Value::Array(_) => r,
+                // the row passed its weight or the family's running bound (D2-ACTOR-F-FOLD-3: a NULL is never an
+                // empty row)
                 _ => {
-                    over();
+                    not_carried.extend(row_keys);
                     continue;
                 }
             };
@@ -1135,7 +1204,7 @@ pub fn closure_of(keys: &BTreeSet<String>, outs: &[StmtOut]) -> Option<Value> {
                 let len = hw_of(&obj["__len"]);
                 let hex = obj["__beef"].as_str().map(str::to_string);
                 if hex.is_none() && len > 0 {
-                    over();
+                    not_carried.extend(row_keys);
                     continue;
                 }
                 let facts = hex
@@ -1146,7 +1215,7 @@ pub fn closure_of(keys: &BTreeSet<String>, outs: &[StmtOut]) -> Option<Value> {
                     .as_ref()
                     .is_some_and(|v| v.to_string().len() > CLOSURE_MAX_BYTES)
                 {
-                    over();
+                    not_carried.extend(row_keys);
                     continue;
                 }
                 if let Value::Object(m) = &mut obj {
@@ -1159,20 +1228,32 @@ pub fn closure_of(keys: &BTreeSet<String>, outs: &[StmtOut]) -> Option<Value> {
         }
         fams.push(Value::Array(rows));
     }
-    if fams.len() != FAMILIES.len() {
-        return None;
-    }
     let v = json!({"hw": hw, "keys": keys, "notCarried": not_carried, "f": fams});
     (v.to_string().len() <= CLOSURE_MAX_BYTES).then_some(v)
 }
 
-/// D2-ACTOR-F-FOLD-2: the carried closure of an event's `facts` (its `payload`), read from the record in its OWN batch
-/// ([`closure_statements`], [`closure_of`]). `None` when the event carries no payload, names no key, the read faults,
-/// or the closure passes its bound: the actor's miss round then reads the record once, as it would with no closure.
+/// D2-ACTOR-F-FOLD-3: the pass statement's one answer row from the record (ONE call); `None` on a fault (the pass's
+/// closures are then none: each actor's miss round reads the record once, as it would with no closure).
+pub async fn read_pass_closure(record: &impl SqlPort, stmt: Stmt) -> Option<Value> {
+    record
+        .run_batch(vec![stmt])
+        .await
+        .ok()?
+        .into_iter()
+        .next()?
+        .rows
+        .into_iter()
+        .next()
+}
+
+/// The carried closure of ONE event's `facts` (its `payload`), through the pass's statement over its keys alone: the
+/// pins' and an operator's single-event read. `None` when the event carries no payload, names no key, the read
+/// faults, or the closure passes its bound.
 pub async fn read_closure(record: &impl SqlPort, facts: &Value) -> Option<Value> {
-    let (stmts, keys) = closure_statements(facts.get("payload")?)?;
-    let outs = record.run_batch(stmts).await.ok()?;
-    closure_of(&keys, &outs)
+    let keys = closure_keys(facts.get("payload")?);
+    let (stmt, read) = pass_closure_statement(&keys)?;
+    let row = read_pass_closure(record, stmt).await?;
+    closure_for(&keys, &read, &row)
 }
 
 /// D2-ACTOR-F-FOLD (item 4): one carried closure, parsed ([`closure_of`]'s answer): the high-water, the txids it
@@ -1222,6 +1303,20 @@ impl ClosureRead {
             not_carried: strings("notCarried").unwrap_or_default(),
             rows,
         })
+    }
+
+    /// PURE (D2-ACTOR-F-FOLD-3): another closure of the SAME snapshot (its high-water) folded in: the keys and the
+    /// not-carried txids united, each family's rows united by `__rowid`.
+    pub fn merge(&mut self, other: ClosureRead) {
+        self.keys.extend(other.keys);
+        self.not_carried.extend(other.not_carried);
+        for (mine, theirs) in self.rows.iter_mut().zip(other.rows) {
+            for r in theirs {
+                if !mine.iter().any(|m| m["__rowid"] == r["__rowid"]) {
+                    mine.push(r);
+                }
+            }
+        }
     }
 
     /// PURE: the closure's rows of the domains of `txids` (each family's rows whose txid key column, or probe
@@ -2206,7 +2301,12 @@ async fn apply_counted<R: SqlPort, L: SqlPort, O: Outside>(
             crate::owed_judge::judge_subjects(&judge, &me, chunk, "owed-actor").await?;
         }
         let pushes = judge.pushes.take();
-        next.txids.extend(noting.seen.take());
+        // D2-ACTOR-F-FOLD-3 (NIT-1): the judge binds the apply's own GAMES (a game id is 64 hex); a game id is no txid
+        // key unless a key column of a row the walk read names it (then `next` holds it already). The deny-list rule
+        // read every `gameId` column as a key, so the walk fetched them and the binds' copy was covered.
+        let mut seen = noting.seen.take();
+        seen.retain(|t| next.txids.contains(t) || !games.iter().any(|g| g.eq_ignore_ascii_case(t)));
+        next.txids.extend(seen);
         if next.txids.len() > CLOSURE_KEYS_MAX {
             return Err(format!(
                 "{CLOSURE_BOUND}{me} passed {CLOSURE_KEYS_MAX} txids"
@@ -2359,10 +2459,19 @@ async fn closure_round<L: SqlPort>(
     if !read.markers.is_empty() || read.txids.is_empty() {
         return Ok(None);
     }
-    let Some((rows, hw)) = c
-        .closures
-        .iter()
-        .filter_map(ClosureRead::of)
+    // D2-ACTOR-F-FOLD-3: the closures of one snapshot (one pass statement: one high-water) are one closure, so a body
+    // coalescing several filings of the pass takes its miss round from their union
+    let mut by_hw: BTreeMap<i64, ClosureRead> = BTreeMap::new();
+    for cl in c.closures.iter().filter_map(ClosureRead::of) {
+        match by_hw.get_mut(&cl.hw) {
+            Some(held) => held.merge(cl),
+            None => {
+                by_hw.insert(cl.hw, cl);
+            }
+        }
+    }
+    let Some((rows, hw)) = by_hw
+        .values()
         .filter_map(|cl| Some((cl.rows_of(&read.txids)?, cl.hw)))
         .max_by_key(|(_, hw)| *hw)
     else {
@@ -4969,13 +5078,16 @@ pub const JUDGE_VERSION: &str = "fix997-2026-10-30";
 /// within the object's own work before and after the apply: the event's facts, the coalesced events' checks).
 /// FIX-962 (bsv-low #962): the `cold` class row's ring of bootstrap page work ([`PendingBars::cold_page`]).
 pub const COLD_PAGE_RING: &str = "page";
-pub const APPLY_STAGES: [(&str, &str); 5] = [
+pub const APPLY_STAGES: [(&str, &str); 6] = [
     ("readMs", "read"),
     ("judgeMs", "judge"),
     ("writeMs", "write"),
     ("waitMs", "wait"),
     // FIX-983 (bsv-low #983): the outside's awaits (CHAINTRACKS, once per apply), apart from the judge's derivation.
     ("outsideMs", "outside"),
+    // D2-ACTOR-F-FOLD-3 (the second delta lens's MEDIUM-1): the direct pass's ONE closure statement, before the call
+    // (a carried filing's answer alone carries it; outside `applyMs`, which it precedes).
+    ("closureMs", "closure"),
 ];
 
 pub fn merge_bars_row(
@@ -5254,7 +5366,7 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
 /// (`owed_events::HEALTH_CONSUMER_SQL`).
 macro_rules! health_select {
     () => {
-        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold','owed-actor:bars:flood')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding,(SELECT cursor FROM owed_belt_state WHERE name='owed-judge:version') AS d1Rejudge"
+        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold','owed-actor:bars:flood')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding,(SELECT cursor FROM owed_belt_state WHERE name='owed-judge:version') AS d1Rejudge"
     };
 }
 pub const HEALTH_SQL: &str = health_select!();
@@ -5373,8 +5485,7 @@ pub fn health_body(read: Option<&Value>, now: u64, d1_oldest_unacked: &Value) ->
     };
     // D2-ACTOR-D (bsv-low #952): the writers' direct calls (every owed frame's publisher), and those that met their
     // wall or faulted (the queue's message is the backstop of each).
-    body["direct"] =
-        json!({"calls": n(COUNTERS[3]), "walls": n(COUNTERS[25]), "faults": n(COUNTERS[4])});
+    body["direct"] = json!({"calls": n(COUNTERS[3]), "walls": n(COUNTERS[25]), "faults": n(COUNTERS[4]), "closures": n(COUNTERS[32])});
     // NEW-L3: Phase B's gate is COVERAGE, the bootstrap lever's last full pass (`complete`, `contiguous`, `uncovered`
     // 0), never `bootstraps` against `activeIdentities` (two counts).
     body["coverage"] = field("coverage");
@@ -6458,7 +6569,7 @@ mod tests;
 /// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
 /// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
 /// (MEDIUM-9).
-pub const COUNTERS: [&str; 32] = [
+pub const COUNTERS: [&str; 33] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -6511,6 +6622,9 @@ pub const COUNTERS: [&str; 32] = [
     "owed_actor_reconcile_stale_total",
     "owed_d1_rejudge_identities_total",
     "owed_d1_rejudge_faults_total",
+    // D2-ACTOR-F-FOLD-3 (the second delta lens's NIT-3): the carried filings whose direct pass read their closure (the
+    // pass's ONE statement), served `/health.owedActor.direct.closures`.
+    "owed_actor_direct_closures_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;

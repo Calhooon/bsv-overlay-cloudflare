@@ -159,6 +159,10 @@ pub struct Carried {
     /// carried apply reads its new keys from one of these instead of the record.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub closures: Vec<Value>,
+    /// D2-ACTOR-F-FOLD-3 (the second delta lens's MEDIUM-1): the time of the direct pass's ONE closure statement
+    /// (`facts.closureMs`), served as the direct class's `closure` stage beside the apply's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closure_ms: Option<u64>,
 }
 
 /// PURE: an event's carried subjects (`facts.subjects`), grouped by identity (lowercased) in the order the marks name
@@ -240,6 +244,7 @@ impl Carried {
             items,
             marks,
             closures,
+            closure_ms: facts["closureMs"].as_u64(),
         })
     }
 
@@ -270,6 +275,7 @@ impl Carried {
                 self.closures.push(c);
             }
         }
+        self.closure_ms = self.closure_ms.max(other.closure_ms);
     }
 }
 
