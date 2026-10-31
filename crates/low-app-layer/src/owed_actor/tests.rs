@@ -14653,8 +14653,8 @@ mod d2_actor_f {
         record
             .conn
             .execute(
-                "INSERT INTO collected_markers_v2(identity,gameId,txid,outputIndex,sigHex,createdAt,payTxid) VALUES ('owner',?1,?2,0,'00',?3,?4)",
-                rusqlite::params![games[9], marker, (NOW_MS / 1000) as i64, pay],
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params!["owner", games[9], marker, 0, "00", (NOW_MS / 1000) as i64, pay],
             )
             .unwrap();
         mark(&record, &games[9], "collected", &marker);
@@ -14774,7 +14774,8 @@ mod d2_actor_f {
         let t = |p: &str| h(p, 1);
         let seeds = [
             ("party", t("e1"), format!("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,sigValid) VALUES ('{id}','other','{g}','{}',0,1,'00','{}',1,1,1)", t("c1"), t("e1"))),
-            ("collected", t("e2"), format!("INSERT INTO collected_markers_v2(identity,gameId,txid,outputIndex,sigHex,createdAt,payTxid) VALUES ('{id}','{g}','{}',0,'00',1,'{}')", t("e2"), t("a2"))),
+            // the door's own insert (`i492_dn1`: the door is the one writer of `payTxid`), run below
+            ("collected", t("e2"), String::new()),
             ("refund", t("e3"), format!("INSERT INTO potrefund_records(identity,gameId,potTxid,potVout,refundRawHex,sigHex,txid,outputIndex,createdAt) VALUES ('{id}','{g}','{}',0,'00','00','{}',0,1)", t("c1"), t("e3"))),
             ("result", t("e4"), format!("INSERT INTO result_markers_v2(gameId,winner,loser,potTxid,settleTxid,winnerSigHex,loserSigHex,txid,outputIndex,createdAt) VALUES ('{g}','{id}','other','{}','{}','00','00','{}',0,1)", t("c1"), t("a4"), t("e4"))),
             ("sweep", t("e5"), format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES ('{id}','{g}','{}',0,'{}','00','{}',0,1)", t("b5"), t("a5"), t("e5"))),
@@ -14783,7 +14784,17 @@ mod d2_actor_f {
             ("refusal", format!("{}:0", t("b5")), format!("INSERT INTO submit_refusals(hopTxid,hopVout,refusedTxid,reason,refusedAt) VALUES ('{}',0,'{}','x',1)", t("b5"), t("a6"))),
         ];
         for (source, key, seed) in seeds {
-            record.conn.execute_batch(&seed).unwrap_or_else(|e| panic!("{source}: {e}"));
+            if source == "collected" {
+                record
+                    .conn
+                    .execute(
+                        crate::record_post::COLLECTED_FILE_SQL,
+                        rusqlite::params![id, g, t("e2"), 0, "00", 1, t("a2")],
+                    )
+                    .unwrap();
+            } else {
+                record.conn.execute_batch(&seed).unwrap_or_else(|e| panic!("{source}: {e}"));
+            }
             record
                 .conn
                 .execute(
@@ -15112,8 +15123,8 @@ mod d2_actor_f_fold {
         record
             .conn
             .execute(
-                "INSERT INTO collected_markers_v2(identity,gameId,txid,outputIndex,sigHex,createdAt,payTxid) VALUES ('owner',?1,?2,0,'00',?3,?4)",
-                rusqlite::params![games[9], marker, (NOW_MS / 1000) as i64, pay],
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params!["owner", games[9], marker, 0, "00", (NOW_MS / 1000) as i64, pay],
             )
             .unwrap();
         mark(&record, &games[9], "collected", &marker);
@@ -15149,8 +15160,8 @@ mod d2_actor_f_fold {
         record
             .conn
             .execute(
-                "INSERT INTO collected_markers_v2(identity,gameId,txid,outputIndex,sigHex,createdAt,payTxid) VALUES ('owner',?1,?2,0,'00',?3,?4)",
-                rusqlite::params![games[9], marker, (NOW_MS / 1000) as i64, pay],
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params!["owner", games[9], marker, 0, "00", (NOW_MS / 1000) as i64, pay],
             )
             .unwrap();
         record
@@ -15236,8 +15247,8 @@ mod d2_actor_f_fold {
         record
             .conn
             .execute(
-                "INSERT INTO collected_markers_v2(identity,gameId,txid,outputIndex,sigHex,createdAt,payTxid) VALUES ('owner',?1,?2,0,'00',?3,?4)",
-                rusqlite::params![games[9], m1, (NOW_MS / 1000) as i64, pay],
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params!["owner", games[9], m1, 0, "00", (NOW_MS / 1000) as i64, pay],
             )
             .unwrap();
         mark(&record, &games[9], "collected", &m1);
@@ -15375,8 +15386,8 @@ mod d2_actor_f_fold {
         record
             .conn
             .execute(
-                "INSERT INTO collected_markers_v2(identity,gameId,txid,outputIndex,sigHex,createdAt,payTxid) VALUES ('owner',?1,?2,0,'00',?3,?4)",
-                rusqlite::params![games[9], marker, (NOW_MS / 1000) as i64, pay],
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params!["owner", games[9], marker, 0, "00", (NOW_MS / 1000) as i64, pay],
             )
             .unwrap();
         record
