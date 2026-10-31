@@ -1823,8 +1823,7 @@ impl Engine {
             }
 
             if refused_topics.contains(&v.topic) {
-                // A check refusal must be checked again on a later submit, not
-                // remembered as a predecessor fault by this Engine.
+                self.hold_unapplied(&txid, &v.topic, "lookup check refused, nothing applied");
                 continue;
             }
 
