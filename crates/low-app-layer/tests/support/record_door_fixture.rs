@@ -386,7 +386,28 @@ fn export_record_door_fixture() {
             script(&[HELD_TAG, &seat.game_id, &id, &pay, &sig]),
             seat.poster(),
         );
-        carried_seats.push(json!({"identity": seat.poster(), "game": gid, "pay": hex::encode(pay), "payBeefBytes": pay_beef_bytes, "first": first[0], "held": first[1]}));
+        // the delta lens's LOW-2: seat 1 files one more NEW filing after the bars' minute (its warm actor's apply
+        // flushes the isolate's pending samples, the flood's among them)
+        let extra = if n == 1 {
+            let pay = [0xb0u8; 32];
+            let sig = sign(
+                &seat.w,
+                collected_protocol(),
+                &gid,
+                &held_challenge(&gid, &seat.poster(), &hex::encode(pay)),
+            );
+            add(
+                &mut first,
+                "carried-extra",
+                RecordKind::Collected,
+                script(&[HELD_TAG, &seat.game_id, &id, &pay, &sig]),
+                seat.poster(),
+            );
+            first[2].clone()
+        } else {
+            serde_json::Value::Null
+        };
+        carried_seats.push(json!({"identity": seat.poster(), "game": gid, "pay": hex::encode(pay), "payBeefBytes": pay_beef_bytes, "first": first[0], "held": first[1], "extra": extra}));
     }
     db.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
     let _ = std::fs::remove_file(&sqlite);
