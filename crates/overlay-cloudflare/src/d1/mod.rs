@@ -647,7 +647,12 @@ pub fn migration_list_fingerprint() -> u32 {
 /// backfill's second verdict candidate set (`d1_discovery::spent_unclassified_candidates_sql`). Index only.
 /// 475 to 479 for bsv-low #1001 (FIX-1001): `idx_hopsweep_sweep` and three appended `owed_dirty` triggers
 /// (`owed_dirty_transactions_proof_insert`, `_proof_update`, `owed_dirty_pot_records_update_filers`).
-pub const OVERLAY_MIGRATION_COUNT: usize = 479;
+/// 479 to 493 for bsv-low #1010 (FIX-1010): fourteen appended `owed_dirty` triggers (`owed_dirty_hand_markers_insert`,
+/// `_update`, `owed_dirty_proof_markers_insert`, `owed_dirty_proof_posts_insert`, `owed_dirty_result_markers_v2_update`,
+/// `owed_dirty_transactions_delete`, `owed_dirty_potparty_records_insert_seats`, `_update_seats`,
+/// `owed_dirty_pot_records_insert_seats`, `_update_seats`, `_delete_seats`, `owed_dirty_pot_beefs_insert_seats`, `owed_dirty_tx_words_delete`, `owed_dirty_owed_spender_bytes_delete`). Triggers only: the actor's mirror digest
+/// does not move (its DDL holds the families' tables and indexes, no trigger).
+pub const OVERLAY_MIGRATION_COUNT: usize = 493;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2488,6 +2493,27 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::derived_owed::write_time::TX_PROOF_INSERT,
     crate::derived_owed::write_time::TX_PROOF_UPDATE,
     crate::derived_owed::write_time::POT_UPDATE_FILERS,
+    // 480..487: bsv-low #1010 (FIX-1010, the D2-ACTOR-F lens's LOW-1): the actor's families written by statements no
+    // trigger marked mark the subjects that read them, so each write's own event reaches the actor: a hand marker
+    // (admitted, re-latched), an on-chain proof bundle, a posted one, the result re-latch (which noted and found no
+    // mark), a transaction's row deleted, and a party's OTHER seats (the seat markers both seats read). New triggers,
+    // none edited. (`hop_chain_probes` is marked by its writers' own batches: `hop_probe_memos`.)
+    crate::derived_owed::write_time::HAND_INSERT,
+    crate::derived_owed::write_time::HAND_UPDATE,
+    crate::derived_owed::write_time::PROOF_INSERT,
+    crate::derived_owed::write_time::PROOF_POST_INSERT,
+    crate::derived_owed::write_time::RESULT_UPDATE,
+    crate::derived_owed::write_time::TX_DELETE,
+    crate::derived_owed::write_time::PARTY_INSERT_SEATS,
+    crate::derived_owed::write_time::PARTY_UPDATE_SEATS,
+    // 488..491: the seat derivation's markers (`pot_hop_seats` by settle key), from the pot's own write and its bytes'.
+    crate::derived_owed::write_time::POT_SEATS_INSERT,
+    crate::derived_owed::write_time::POT_SEATS_UPDATE,
+    crate::derived_owed::write_time::POT_SEATS_DELETE,
+    crate::derived_owed::write_time::BEEF_SEATS_INSERT,
+    // 492..493: the app layer's age sweeps of the words and the spender bytes the rows read.
+    crate::derived_owed::write_time::WORD_DELETE,
+    crate::derived_owed::write_time::SPENDER_BYTES_DELETE,
 ];
 
 // =============================================================================

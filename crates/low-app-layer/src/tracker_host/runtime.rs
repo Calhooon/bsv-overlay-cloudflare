@@ -987,10 +987,17 @@ pub async fn tick(env: &worker::Env) -> worker::Result<()> {
     let db = env.d1("OVERLAY_DB")?;
     // Catch up on the scheduled path only; no read gains a schema statement.
     db.prepare(stored::AGE_INDEX).counted_run().await?;
-    db.prepare(stored::SWEEP)
+    // FIX-1010 (bsv-low #1010): the words it deleted marked the stored rows that read them (their trigger); each is
+    // noted, published by this tick's publish below and its actors called (the direct pass), the queue behind it
+    for gone in db
+        .prepare(stored::SWEEP_FRAMED)
         .bind(&[JsValue::from_f64(now.saturating_sub(8 * 86400) as f64)])?
-        .counted_run()
-        .await?;
+        .counted_all()
+        .await?
+        .results::<Subject>()?
+    {
+        crate::owed_events_publish::note("word", &gone.txid);
+    }
     crate::courier::note_presence("tracker_stranger_sweep_pass_total");
     let rows = db
         .prepare(stored::DUE)

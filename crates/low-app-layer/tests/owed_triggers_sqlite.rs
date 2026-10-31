@@ -478,7 +478,8 @@ fn paths(f: &Fixture) -> Result<(), String> {
             1.into(),
             1.into(),
         ],
-        marks("party", "filed:party", &["alice"]),
+        // bsv-low #1010: the pot's OTHER seat re-judges too (`owed_dirty_potparty_records_insert_seats`).
+        marks("party", "filed:party", &["alice", "bob"]),
     )?;
     f.check(
         "filed hop",
@@ -875,6 +876,219 @@ fn paths(f: &Fixture) -> Result<(), String> {
     )?;
     word_paths(f)?;
     fix1001_paths(f)?;
+    fix1010_paths(f, &b, &result)?;
+    Ok(())
+}
+
+fn marks_in(game: &str, source: &str, key: &str, identities: &[&str]) -> Vec<Mark> {
+    let mut out: Vec<_> = identities
+        .iter()
+        .map(|id| ((*id).into(), game.into(), source.into(), key.into()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// bsv-low #1010 (FIX-1010): the writers of the actor's families that no trigger marked before, each through its
+/// production statement. The seat derivation's markers are a marker in ANOTHER game (carol, `game2`), so the seat
+/// triggers' marks never coincide with a party's (each trigger removed alone loses a mark).
+fn fix1010_paths(f: &Fixture, b: &PotpartyRecord, result: &ResultRecord) -> Result<(), String> {
+    use low_app_layer::{owed, proof_post, tracker_host::stored};
+    // The game's live seats by this point: alice and bob's parties and `word_paths`' six word-arm seats (the hop
+    // marker was deleted above).
+    let seats = [
+        "alice",
+        "bob",
+        "word-arm-hop-funding",
+        "word-arm-hop-spender",
+        "word-arm-link-funding",
+        "word-arm-link-spender",
+        "word-arm-party-funding",
+        "word-arm-party-spender",
+    ];
+    let with = |extra: &'static str| {
+        let mut ids = seats.to_vec();
+        ids.push(extra);
+        ids
+    };
+    // A hand marker admitted, then re-latched: its game's live seats and its own identity.
+    let hand = overlay_discovery::hand::storage::HandRecord {
+        game_id: "game".into(),
+        identity: "dave".into(),
+        pot_txid: "pot".into(),
+        cards_hex: "0001020304".into(),
+        txid: "hand".into(),
+        output_index: 0,
+        sig_hex: Some("00".into()),
+    };
+    let want = marks("hand", "hand", &with("dave"));
+    f.check_query(
+        "hand admission",
+        discovery::hand_write::hand_insert_query(&hand, 1).query(),
+        want.clone(),
+    )?;
+    f.execute(
+        "UPDATE hand_markers SET rowValid = NULL WHERE txid = ?1",
+        vec!["hand".to_string().into()],
+    );
+    f.check_query(
+        "hand relatch",
+        discovery::hand_write::hand_relatch_query(&hand).query(),
+        want,
+    )?;
+    // An on-chain proof bundle, then a posted one: the game's seats and the winner.
+    f.check(
+        "proof admission",
+        discovery::PROOF_ADMIT_WRITE_SQL,
+        vec![
+            "game".to_string().into(),
+            "erin".to_string().into(),
+            "00".to_string().into(),
+            Value::Blob(vec![0]),
+            "AA==".to_string().into(),
+            "proof".to_string().into(),
+            0.into(),
+            1.into(),
+            1.into(),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ],
+        marks("proof", "proof", &with("erin")),
+    )?;
+    f.check(
+        "proof post",
+        proof_post::PROOF_POST_WRITE_SQL,
+        vec![
+            "game".to_string().into(),
+            "erin".to_string().into(),
+            "00".to_string().into(),
+            Value::Blob(vec![0]),
+            1.into(),
+            1.into(),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ],
+        marks("proof", "game", &with("erin")),
+    )?;
+    // The result re-latch (its tier moved).
+    f.execute(
+        "UPDATE result_markers_v2 SET claimValid = 9 WHERE txid = ?1",
+        vec![result.txid.clone().into()],
+    );
+    f.check_query(
+        "result relatch",
+        discovery::result_write::result_relatch_query(result).query(),
+        marks("result", &result.txid, &["alice", "bob"]),
+    )?;
+    // A party re-latched: its own row and the pot's other seat.
+    f.execute(
+        "UPDATE potparty_records SET sigValid = 9 WHERE txid = ?1",
+        vec![b.txid.clone().into()],
+    );
+    let mut want = marks("party", &b.txid, &["alice", "bob"]);
+    want.sort();
+    f.check_query(
+        "party relatch reaches the other seat",
+        discovery::potparty_write::potparty_relatch_query(b).query(),
+        want,
+    )?;
+    // A transaction's row deleted by the engine's deep delete: the pot's parties.
+    f.execute(
+        "INSERT OR REPLACE INTO transactions (txid, beef, has_proof) VALUES (?1, x'00', 1)",
+        vec!["pot".to_string().into()],
+    );
+    let deep = sql_literal(
+        include_str!("../../overlay-cloudflare/src/d1_storage.rs"),
+        "DELETE FROM transactions WHERE txid = ?",
+    );
+    f.check(
+        "transaction deleted",
+        &deep,
+        vec!["pot".to_string().into()],
+        marks("beef", "pot", &["alice", "bob"]),
+    )?;
+    // The seat derivation: carol's marker (game2) is seated by a pot whose committed keys are decoded after its
+    // admission, then the pot's bytes, then the pot evicted.
+    let carol = HoppartyRecord {
+        identity: "carol".into(),
+        opponent_identity: "other".into(),
+        game_id: "game2".into(),
+        seat_settle_pubkey: "03ee".into(),
+        txid: "hop2".into(),
+        ..hop()
+    };
+    f.query(discovery::hopparty_write::hopparty_insert_query(&carol, 1).query());
+    let mut keyless = pot_binds("pot2", "covenant");
+    keyless[7] = Value::Null;
+    keyless[8] = Value::Null;
+    f.execute(discovery::store_record_sql(), keyless);
+    let mut keyed = pot_binds("pot2", "covenant");
+    keyed[7] = "03ee".to_string().into();
+    keyed[8] = "03ff".to_string().into();
+    f.check(
+        "pot keys decoded seat a marker",
+        discovery::store_record_sql(),
+        keyed,
+        marks_in("game2", "pot", "pot2:0", &["carol"]),
+    )?;
+    let beef_admit = literal(DISCOVERY, "pub(crate) const POT_BEEF_ADMIT_WRITE_SQL:");
+    f.check(
+        "seated pot's bytes",
+        &beef_admit,
+        vec![
+            "pot2".to_string().into(),
+            Value::Blob(vec![0]),
+            "pot2".to_string().into(),
+            1.into(),
+            0.into(),
+            "pot2".to_string().into(),
+        ],
+        marks_in("game2", "beef", "pot2", &["carol"]),
+    )?;
+    f.execute(
+        admit_fast::OPEN_EVICTION_MARKER_SQL,
+        vec![
+            "pot2".to_string().into(),
+            "rejected".to_string().into(),
+            4000.into(),
+        ],
+    );
+    let want = marks_in("game2", "pot", "pot2:0", &["carol"]);
+    f.clear();
+    let seen = f.seed_marks(&want);
+    let moved = run(admit_fast::shadow_move_passes(
+        &Shadow(f),
+        "pot2",
+        "rejected",
+        4000,
+        false,
+    ));
+    assert!(moved.incomplete.is_empty(), "{:?}", moved.incomplete);
+    f.check_marks("seated pot evicted", &want, seen)?;
+    // The age sweeps of the words and the spender bytes the stored rows read.
+    // `settle` is a recorded pot spender whose word is still live, so the sweep spares it (bsv-low #757); `pay` and
+    // `word_paths`' funding row's word go, each marking the stored rows that read it.
+    let mut want = marks("word", "pay", &["alice"]);
+    want.extend(marks("word", "word-funding-row", &["word-arm-row"]));
+    want.sort();
+    f.check(
+        "word sweep",
+        stored::SWEEP_FRAMED,
+        vec![i64::MAX.into()],
+        want,
+    )?;
+    f.check(
+        "spender bytes sweep",
+        owed::OWED_SPENDER_BYTES_SWEEP_SQL,
+        vec![i64::MAX.into(), 256.into()],
+        marks("bytes", "pay", &["alice"]),
+    )?;
     Ok(())
 }
 
@@ -933,7 +1147,12 @@ fn fix1001_paths(f: &Fixture) -> Result<(), String> {
     f.check(
         "the chase confirms the hop for its markerless filer",
         discovery::confirm_spend_cas_sql(),
-        vec![10.into(), "hop2".to_string().into(), 0.into(), "sweep2".to_string().into()],
+        vec![
+            10.into(),
+            "hop2".to_string().into(),
+            0.into(),
+            "sweep2".to_string().into(),
+        ],
         marks("pot", "hop2:0", &["dave"]),
     )?;
     Ok(())
@@ -1056,7 +1275,7 @@ fn owed893_word_compound_selects_fit_d1s_five_term_limit() {
 fn owed893_each_word_arm_removed_alone_turns_its_source_write_red() {
     let schema = Fixture::new(None);
     let triggers: Vec<(String, String)> = schema.db.prepare(
-        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'owed_dirty_tx_words_%' ORDER BY name"
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'owed_dirty_tx_words_%' AND name <> 'owed_dirty_tx_words_delete' ORDER BY name"
     ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect();
     assert_eq!(triggers.len(), 4);
     for (name, sql) in triggers {
@@ -1300,6 +1519,12 @@ fn eviction_paths(f: &Fixture) -> Result<(), String> {
     restored.extend(marks("refund", "filed:refund", &["alice", "bob"]));
     restored.extend(marks("result", "result", &["alice", "bob"]));
     restored.extend(marks("result", "filed:result", &["alice", "bob"]));
+    // bsv-low #1010: each restored party marks the pot's other seats already restored
+    // (`owed_dirty_potparty_records_insert_seats`), and the restored pot the hop marker its committed keys seat
+    // (`owed_dirty_pot_records_insert_seats`, a downgrade).
+    restored.extend(marks("party", "party-b", &["alice"]));
+    restored.extend(marks("party", "filed:party", &["bob"]));
+    restored.extend(marks("pot", "pot:0", &["alice"]));
     restored.sort();
     f.clear();
     let seen = f.seed_marks(&restored);
@@ -1500,8 +1725,8 @@ fn owed893_each_source_trigger_removed_or_not_advanced_alone_turns_the_productio
         .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
     assert_eq!(
         names.len(),
-        32,
-        "fifteen source tables (released_hop_evidence_missing, D2-OWED-FOLD-8's, the fifteenth), refusal UPSERT's UPDATE and two word triggers per verb; FIX-1001's three (transactions' proof insert and update, a hop row's markerless filers)"
+        46,
+        "fifteen source tables (released_hop_evidence_missing, D2-OWED-FOLD-8's, the fifteenth), refusal UPSERT's UPDATE and two word triggers per verb; FIX-1001's three (transactions' proof insert and update, a hop row's markerless filers); FIX-1010's fourteen (hand markers insert and update, proof markers, proof posts, the result re-latch, a transaction deleted, a party's other seats on insert and update, the seat derivation's pot insert, update and delete and its bytes, the word and spender-bytes sweeps)"
     );
     for name in names {
         let err = paths(&Fixture::new(Some(&name)))
@@ -1621,7 +1846,10 @@ fn owed893_a_faulted_remark_rolls_back_the_source_and_generation() {
         })
         .unwrap();
     assert!(after.0 > before.0);
-    assert!((written_at..=database_now_ms(&f.db)).contains(&after.1), "a successful re-mark uses its write time, not createdAt=2");
+    assert!(
+        (written_at..=database_now_ms(&f.db)).contains(&after.1),
+        "a successful re-mark uses its write time, not createdAt=2"
+    );
 }
 
 #[test]
@@ -1660,7 +1888,10 @@ fn owed893_a_word_upsert_advances_a_coalesced_generation() {
             generation > seen,
             "re-mark generation {generation} must be newer than {seen}"
         );
-        assert!((written_at..=database_now_ms(&f.db)).contains(&marked_at), "the word mark uses its write time, not updated_at={at}");
+        assert!(
+            (written_at..=database_now_ms(&f.db)).contains(&marked_at),
+            "the word mark uses its write time, not updated_at={at}"
+        );
         seen = generation;
     }
 }

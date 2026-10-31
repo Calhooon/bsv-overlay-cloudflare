@@ -881,12 +881,16 @@ pub const OWED_SPENDER_BYTES_SELECT_SQL: &str =
     "SELECT txid, bytesJson FROM owed_spender_bytes WHERE txid IN (SELECT value FROM json_each(?1))";
 /// The age sweep (the existing janitor's shape, `tracker_host::stored::SWEEP`): a bounded DELETE of rows older than
 /// the retention, run in the scheduled pass. `?1` the cutoff ms, `?2` the per-pass limit.
+/// FIX-1010 (bsv-low #1010): the pair a swept spender's bytes' trigger marks.
+pub const SPENDER_BYTES_SOURCE: &str = "bytes";
+/// FIX-1010 (bsv-low #1010): it answers the txids it deleted (each noted `bytes`; the row's trigger marked the stored
+/// rows that read them).
 pub const OWED_SPENDER_BYTES_SWEEP_SQL: &str =
-    "DELETE FROM owed_spender_bytes WHERE txid IN (SELECT txid FROM owed_spender_bytes WHERE createdAtMs < ?1 ORDER BY createdAtMs, txid LIMIT ?2)";
+    "DELETE FROM owed_spender_bytes WHERE txid IN (SELECT txid FROM owed_spender_bytes WHERE createdAtMs < ?1 ORDER BY createdAtMs, txid LIMIT ?2) RETURNING txid";
 /// The row-cap sweep: delete the OLDEST rows beyond the count ceiling, bounded per pass. `?1` the ceiling (OFFSET),
 /// `?2` the per-pass limit. A guard against a high write-rate outrunning the age sweep; the age sweep is the primary.
 pub const OWED_SPENDER_BYTES_CAP_SWEEP_SQL: &str =
-    "DELETE FROM owed_spender_bytes WHERE txid IN (SELECT txid FROM owed_spender_bytes ORDER BY createdAtMs DESC, txid LIMIT ?2 OFFSET ?1)";
+    "DELETE FROM owed_spender_bytes WHERE txid IN (SELECT txid FROM owed_spender_bytes ORDER BY createdAtMs DESC, txid LIMIT ?2 OFFSET ?1) RETURNING txid";
 /// Eight days, as the tracker's stranger-projection sweep (`tracker_host::stored::SWEEP`). A spender's bytes outlive
 /// every honest recompute window of its hop many times over; past it an un-revisited row is dead weight.
 pub const OWED_SPENDER_BYTES_RETENTION_MS: i64 = 8 * 86_400_000;

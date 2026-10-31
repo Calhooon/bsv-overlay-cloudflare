@@ -16867,3 +16867,576 @@ mod d2_actor_f_fold3 {
         assert!(matches!(stmt.binds[4], Bind::Int(n) if n == CLOSURE_FAMILY_BYTES_PER_FILING));
     }
 }
+
+/// FIX-1010 (bsv-low #1010; the D2-ACTOR-F lens's LOW-1): EVERY WRITER OF THE ACTOR'S FAMILIES MARKS AND FRAMES. The
+/// families no trigger marked (the probe rows' reorg clear and TTL sweep, the hand and proof markers, the result
+/// re-latch, a transaction's row deleted, a party's other seats) are refreshed in the warm mirror only by an apply that
+/// takes the narrowed read; since D2-ACTOR-F a carried apply does not, so after such a write a carried event judged
+/// from a stale mirror. Each pin runs the write on the record (real SQLite, the overlay's migrations and triggers),
+/// publishes the writer's pair through the shipped publish (one batch, as the writer's flush), applies the event to the
+/// REAL warm actor as its direct call does (its subjects from its marks, its txids its touch), and holds the actor's
+/// stored rows equal to a FRESH D1 judgement of every game: FOLD-11's rule on the direct call, without the exception.
+mod fix1010 {
+    use super::*;
+    use crate::owed_events_publish as publish;
+    use bsv_overlay_cloudflare::hop_probe_memos as memos;
+    use overlay_discovery::owed_event::OwedEvent;
+
+    /// The pair published as its writer's flush publishes it; `None` when the publish sent nothing (no mark).
+    pub(super) async fn published(
+        record: &SqliteSql,
+        source: &str,
+        key: &str,
+    ) -> Option<OwedEvent> {
+        let port = crate::owed_events::SqlPublish {
+            db: record,
+            send: |_b: Vec<String>| async { Ok::<(), String>(()) },
+        };
+        let out = publish::publish_with(
+            &port,
+            vec![publish::Noted {
+                source: source.into(),
+                key: key.to_ascii_lowercase(),
+                held: None,
+            }],
+        )
+        .await;
+        assert!(out.fault.is_none(), "{:?}", out.fault);
+        out.sent.into_iter().next()
+    }
+
+    /// The event's direct call on `owner`'s actor: its subjects from its marks, its txids the touch, its carried rows
+    /// when `carry` (else the narrowed read).
+    pub(super) async fn direct(
+        record: &SqliteSql,
+        local: &SqliteSql,
+        ev: &OwedEvent,
+        carry: bool,
+    ) -> ApplyReport {
+        let subjects = crate::owed_events::plan_with(record, ev, false)
+            .await
+            .unwrap()
+            .subjects();
+        let games: Vec<String> = subjects
+            .into_iter()
+            .filter(|(me, _)| me == "owner")
+            .flat_map(|(_, g)| g)
+            .collect();
+        assert!(
+            !games.is_empty(),
+            "({}, {}): the event names none of owner's games",
+            ev.source,
+            ev.source_key
+        );
+        let e = EventCtx::of(ev);
+        let opts = ApplyOpts {
+            touch: e.txids.clone(),
+            carried: if carry {
+                e.carried.get("owner").cloned()
+            } else {
+                None
+            },
+            ..ApplyOpts::default()
+        };
+        apply_with(
+            record,
+            local,
+            &Fakes,
+            "owner",
+            &games,
+            Some((ev.source.as_str(), ev.seq)),
+            Some(TIP),
+            None,
+            &opts,
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    /// A fresh D1 judgement of every game of `owner`.
+    pub(super) async fn fresh_d1(d1: &SqliteSql) {
+        for chunk in games_of(d1, "owner").chunks(16) {
+            crate::owed_judge::judge_subjects(d1, "owner", chunk, "d1")
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The write's pairs, each published (it must be: the write marked it) and applied by its direct call; then the
+    /// actor equals the fresh D1 judgement.
+    async fn reaches_the_actor(d1: &SqliteSql, local: &SqliteSql, pairs: &[(&str, String)]) {
+        for (source, key) in pairs {
+            let ev = published(d1, source, key).await.unwrap_or_else(|| {
+                panic!("({source}, {key}): the publish sent nothing: the write marked no subject")
+            });
+            assert!(ev.facts["marks"].as_i64().unwrap_or(0) >= 1, "{}", ev.facts);
+            let report = direct(d1, local, &ev, false).await;
+            assert!(
+                report.narrowed,
+                "({source}, {key}): the event's apply took the narrowed read: {report:?}"
+            );
+        }
+        fresh_d1(d1).await;
+        assert_eq!(
+            stored_rows_no_clock(local),
+            stored_rows_no_clock(d1),
+            "the actor is the fresh D1 judgement"
+        );
+    }
+
+    /// The overlay's batch (the marks, then the framed delete) as `hop_probe_memos::marked_delete` runs it; the keys
+    /// the writer notes.
+    fn probe_batch(
+        d1: &SqliteSql,
+        mark: &str,
+        framed: &str,
+        bind: Option<i64>,
+        expire: bool,
+    ) -> Vec<String> {
+        let tx = d1.conn.unchecked_transaction().unwrap();
+        let p: Vec<rusqlite::types::Value> = bind
+            .map(rusqlite::types::Value::Integer)
+            .into_iter()
+            .collect();
+        tx.execute(mark, rusqlite::params_from_iter(p.iter()))
+            .unwrap();
+        let keys: Vec<String> = tx
+            .prepare(framed)
+            .unwrap()
+            .query_map(rusqlite::params_from_iter(p.iter()), |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        tx.commit().unwrap();
+        keys.into_iter()
+            .filter(|k| memos::noted_key(expire, k))
+            .collect()
+    }
+
+    /// (fix1010_a) THE LENS'S LOW-1 SHAPE: beta's #953 hop, the evidence `<hop>:0` CONFIRMED, both judges `unbound`,
+    /// the game warm; the overlay's reorg clear deletes the evidence; then a CARRIED filing of the same game (a collected
+    /// marker, the records door's statement), applied from its rows with no narrowed read. The clear's own event (its
+    /// pair `probe`, the evidence's key) reached the actor first, so the carried apply judges the refreshed mirror and
+    /// both judges serve the press. RED on 006e6f24 (the shipped clear marks nothing, nothing is published: "the
+    /// publish sent nothing"); RED with the marks dropped from the batch, the same.
+    #[tokio::test]
+    async fn fix1010_a_a_reorg_clear_then_a_carried_filing_is_the_d1_judges() {
+        let d1 = d1_judge(&fold9_fixture()).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        let hop = format!("{FOLD9_HOP}:0");
+        assert_eq!(fold9_row(&d1, &hop).unwrap().0, "unbound");
+        let keys = probe_batch(
+            &d1,
+            memos::HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
+            memos::HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL,
+            None,
+            false,
+        );
+        assert_eq!(keys, vec![hop.clone()], "the confirmed evidence, noted");
+        let downgrade: i64 = d1
+            .conn
+            .query_row(
+                "SELECT downgrade FROM owed_dirty WHERE source='probe' AND sourceKey=?1",
+                [&hop],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(downgrade, 1, "a confirmed word cleared is a downgrade");
+        let pairs: Vec<(&str, String)> = keys.into_iter().map(|k| ("probe", k)).collect();
+        reaches_the_actor(&d1, &local, &pairs).await;
+        let d1_row = fold9_row(&d1, &hop).unwrap();
+        assert_eq!(
+            (d1_row.0.as_str(), d1_row.1),
+            ("hop-stranded", Some(1)),
+            "{d1_row:?}"
+        );
+        // the carried filing after it (LOW-1's road: no narrowed read)
+        let game = h("9f", 1);
+        let marker = h("a1", 31);
+        d1.conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    "owner",
+                    game,
+                    marker,
+                    0,
+                    "00",
+                    (NOW_MS / 1000) as i64,
+                    h("a2", 31)
+                ],
+            )
+            .unwrap();
+        let ev = published(&d1, "collected", &marker)
+            .await
+            .expect("the filing marks");
+        let report = direct(&d1, &local, &ev, true).await;
+        assert!(
+            report.carried,
+            "the filing applied from its carried rows: {report:?}"
+        );
+        fresh_d1(&d1).await;
+        assert_eq!(stored_rows_no_clock(&local), stored_rows_no_clock(&d1));
+        assert_eq!(
+            fold9_judgement(&fold9_row(&local, &hop).unwrap()),
+            fold9_judgement(&fold9_row(&d1, &hop).unwrap())
+        );
+    }
+
+    /// (fix1010_a0) THE PREMISE, LOW-1 AS THE LENS STATED IT: the same clear as the base's shipped statement alone (no
+    /// marks, so no event), then the carried filing: the carried apply judges the unrefreshed mirror and stores
+    /// `unbound` where the fresh D1 judgement serves the press. Kept so the mismatch the marks cure stays visible.
+    #[tokio::test]
+    async fn fix1010_a0_without_the_clears_event_the_carried_apply_is_stale() {
+        let d1 = d1_judge(&fold9_fixture()).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        d1.conn
+            .execute(memos::HOP_PROBE_MEMO_REORG_CLEAR_SQL, [])
+            .unwrap();
+        let marker = h("a1", 31);
+        d1.conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    "owner",
+                    h("9f", 1),
+                    marker,
+                    0,
+                    "00",
+                    (NOW_MS / 1000) as i64,
+                    h("a2", 31)
+                ],
+            )
+            .unwrap();
+        let ev = published(&d1, "collected", &marker).await.unwrap();
+        assert!(direct(&d1, &local, &ev, true).await.carried);
+        fresh_d1(&d1).await;
+        let hop = format!("{FOLD9_HOP}:0");
+        assert_eq!(
+            fold9_row(&local, &hop).unwrap().0,
+            "unbound",
+            "the actor kept the cleared evidence's word"
+        );
+        assert_eq!(fold9_row(&d1, &hop).unwrap().0, "hop-stranded");
+    }
+
+    /// (fix1010_b) THE TTL SWEEP OF AN EVICTED HOP'S EVIDENCE: the hop's index row gone (its own `pot` event applied),
+    /// the evidence aged past the window; the sweep deletes it and marks the hop's marker (a memo no judge reads marks
+    /// nothing), its event reaches the actor, and the actor is the fresh D1 judgement. RED on 006e6f24: the sweep marks
+    /// nothing.
+    #[tokio::test]
+    async fn fix1010_b_the_ttl_sweep_of_evidence_reaches_the_actor() {
+        let d1 = d1_judge(&fold9_fixture()).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        d1.conn
+            .execute("DELETE FROM pot_records WHERE txid=?1", [FOLD9_HOP])
+            .unwrap();
+        reaches_the_actor(&d1, &local, &[("pot", format!("{FOLD9_HOP}:0"))]).await;
+        d1.conn
+            .execute(&format!("INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spentConfirmed) VALUES ('{FOLD9_HOP}.0',1,0,NULL)"), [])
+            .unwrap();
+        let keys = probe_batch(
+            &d1,
+            memos::HOP_PROBE_MEMO_EXPIRE_MARK_SQL,
+            memos::HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL,
+            Some(NOW_MS as i64),
+            true,
+        );
+        assert_eq!(
+            keys,
+            vec![format!("{FOLD9_HOP}:0")],
+            "the evidence noted, the aged memo not"
+        );
+        let pairs: Vec<(&str, String)> = keys.into_iter().map(|k| ("probe", k)).collect();
+        reaches_the_actor(&d1, &local, &pairs).await;
+    }
+
+    /// (fix1010_c) THE HAND AND PROOF MARKERS: a hand marker of the seat's game admitted then re-latched, an on-chain
+    /// proof bundle and a posted one, each through its writer's statement on the record: each marks the game's seat and
+    /// its event reaches the actor. RED on 006e6f24: no trigger, no `hand` / `proof` source ("the publish sent
+    /// nothing").
+    #[tokio::test]
+    async fn fix1010_c_the_hand_and_proof_markers_reach_the_actor() {
+        let d1 = d1_judge(&fold11_sweep_fixture()).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        let game = h("9f", 1);
+        let hand = h("ab", 1);
+        d1.conn
+            .execute(
+                "INSERT OR IGNORE INTO hand_markers (gameId, identity, potTxid, cardsHex, txid, outputIndex, sigHex, createdAt, rowValid) VALUES (?1,'owner',?2,'0102',?3,0,'00',?4,0)",
+                rusqlite::params![game, h("ac", 1), hand, (NOW_MS / 1000) as i64],
+            )
+            .unwrap();
+        reaches_the_actor(&d1, &local, &[("hand", hand.clone())]).await;
+        d1.conn
+            .execute(
+                "UPDATE hand_markers SET rowValid = ? WHERE txid = ? AND outputIndex = ?",
+                rusqlite::params![1, hand, 0],
+            )
+            .unwrap();
+        reaches_the_actor(&d1, &local, &[("hand", hand.clone())]).await;
+        let proof = h("ad", 1);
+        d1.conn
+            .execute(
+                bsv_overlay_cloudflare::d1_discovery::PROOF_ADMIT_WRITE_SQL,
+                rusqlite::params![
+                    game,
+                    "owner",
+                    "00",
+                    vec![0u8],
+                    Option::<String>::None,
+                    proof,
+                    0,
+                    (NOW_MS / 1000) as i64,
+                    1,
+                    0,
+                    "aa",
+                    "bb",
+                    "0102",
+                    "0304"
+                ],
+            )
+            .unwrap();
+        reaches_the_actor(&d1, &local, &[("proof", proof)]).await;
+        d1.conn
+            .execute(
+                crate::proof_post::PROOF_POST_WRITE_SQL,
+                rusqlite::params![
+                    game,
+                    "owner",
+                    "00",
+                    vec![0u8],
+                    (NOW_MS / 1000) as i64,
+                    1,
+                    0,
+                    "aa",
+                    "bb",
+                    "0102",
+                    "0304"
+                ],
+            )
+            .unwrap();
+        reaches_the_actor(&d1, &local, &[(crate::proof_post::PROOF_POST_SOURCE, game)]).await;
+    }
+
+    /// (fix1010_d) THE RESULT RE-LATCH: `result_relatch_query` noted `result` and its UPDATE marked nothing, so the
+    /// publish skipped it. A result of the seat's game admitted, then its tier re-latched: the re-latch marks both
+    /// players and its event (carrying its row) reaches the actor. RED on 006e6f24: "the publish sent nothing".
+    #[tokio::test]
+    async fn fix1010_d_the_result_relatch_reaches_the_actor() {
+        let d1 = d1_judge(&fold11_sweep_fixture()).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        let game = h("9f", 1);
+        let result = h("ae", 1);
+        d1.conn
+            .execute(
+                "INSERT INTO result_markers_v2(gameId,winner,loser,potTxid,txid,outputIndex,createdAt,claimValid) VALUES (?1,'owner','other',?2,?3,0,?4,2)",
+                rusqlite::params![game, h("ac", 1), result, (NOW_MS / 1000) as i64],
+            )
+            .unwrap();
+        reaches_the_actor(&d1, &local, &[("result", result.clone())]).await;
+        d1.conn
+            .execute(
+                "UPDATE result_markers_v2 SET claimValid = ? WHERE txid = ? AND outputIndex = ?",
+                rusqlite::params![0, result, 0],
+            )
+            .unwrap();
+        let downgrade: i64 = d1
+            .conn
+            .query_row(
+                "SELECT downgrade FROM owed_dirty WHERE source='result' AND sourceKey=?1",
+                [&result],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(downgrade, 1, "a tier lowered is a downgrade");
+        reaches_the_actor(&d1, &local, &[("result", result)]).await;
+    }
+
+    /// (fix1010_e) A TRANSACTION'S ROW DELETED: the filed sweep's payout rests on its `transactions` row's proof; the
+    /// engine's deep delete takes the row, the trigger marks the sweep's filer (a downgrade), and the actor withdraws
+    /// what the fresh D1 judgement withdraws. RED on 006e6f24: the delete marks nothing.
+    #[tokio::test]
+    async fn fix1010_e_a_transactions_delete_reaches_the_actor() {
+        let d1 = d1_judge(&fold11_sweep_fixture()).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        let before = stored_rows_no_clock(&d1);
+        let (_, s) = fold9_spend(FOLD9_HOP);
+        assert_eq!(
+            d1.conn
+                .execute("DELETE FROM transactions WHERE txid = ?", [&s])
+                .unwrap(),
+            1
+        );
+        reaches_the_actor(&d1, &local, &[("beef", s)]).await;
+        assert_ne!(
+            stored_rows_no_clock(&d1),
+            before,
+            "the deleted proof moves D1's judgement"
+        );
+    }
+
+    /// (fix1010_f) AN OPPONENT'S PARTY REACHES THE SEAT: the seat's own party row on a pot, then the opponent's party
+    /// on the same pot (the seat markers both seats read). `PARTY_INSERT` marked the filer alone; the seats' trigger
+    /// marks the seat under the same pair, so the publish names the seat and CARRIES the opponent's row to it, and its
+    /// carried apply is the fresh D1 judgement. RED on 006e6f24: the event names none of owner's games.
+    #[tokio::test]
+    async fn fix1010_f_an_opponents_party_reaches_the_seat() {
+        let made = (NOW_MS / 1000) as i64 - 3_600;
+        let (pot, game) = (h("c3", 1), h("9e", 1));
+        let party = |who: &str, opp: &str, txid: &str, key: &str| {
+            format!("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,seatSettlePubkey,seatSigHex,sigValid) VALUES ('{who}','{opp}','{game}','{pot}',0,900100,'00','{txid}',0,{made},'{key}','00',1)")
+        };
+        let d1 = d1_judge(&Fixture {
+            name: "fix1010 a seat's pot",
+            seed: vec![
+                format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind,paramsDecoded,recoveryHeight) VALUES ('{pot}',0,0,{made},'covenant',1,900100)"),
+                party("owner", "other", &h("c4", 1), "ka"),
+            ],
+            identities: vec!["owner".into()],
+        })
+        .await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        let theirs = h("c4", 2);
+        d1.conn
+            .execute_batch(&party("other", "owner", &theirs, "kb"))
+            .unwrap();
+        let ev = published(&d1, "party", &theirs)
+            .await
+            .expect("the filing marks");
+        let report = direct(&d1, &local, &ev, true).await;
+        assert!(
+            report.carried,
+            "the opponent's row carried to the seat: {report:?}"
+        );
+        fresh_d1(&d1).await;
+        assert_eq!(stored_rows_no_clock(&local), stored_rows_no_clock(&d1));
+        // its re-latch (the verdict withdrawn) too: a downgrade for the seat
+        d1.conn
+            .execute(
+                "UPDATE potparty_records SET sigValid=0 WHERE txid=?1",
+                [&theirs],
+            )
+            .unwrap();
+        let downgrade: i64 = d1
+            .conn
+            .query_row("SELECT downgrade FROM owed_dirty WHERE identity='owner' AND source='party' AND sourceKey=?1", [&theirs], |r| r.get(0))
+            .unwrap();
+        assert_eq!(downgrade, 1);
+        let ev = published(&d1, "party", &theirs)
+            .await
+            .expect("the re-latch marks");
+        direct(&d1, &local, &ev, true).await;
+        fresh_d1(&d1).await;
+        assert_eq!(stored_rows_no_clock(&local), stored_rows_no_clock(&d1));
+    }
+
+    /// (fix1010_g) THE SEAT DERIVATION: the seat's hop the index holds UNSPENT, then a JOIN pot admitted whose committed
+    /// keys name the seat's settle key (its stored bytes spend the hop: FIX-837's belt reads the seat's held pots). The
+    /// derivation seats the marker (`pot_hop_seats`), and the pot's own triggers marked only the markers of hops the
+    /// index holds spent by it; the seats' trigger marks the seat under the pot's pair, so the pot's event reaches the
+    /// seat's actor and the actor is the fresh D1 judgement. RED on 006e6f24: the event names none of owner's games.
+    #[tokio::test]
+    async fn fix1010_g_a_pot_seating_the_marker_reaches_the_seat() {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{Beef, Transaction, TransactionInput, TransactionOutput};
+        let made = (NOW_MS / 1000) as i64 - 7_200;
+        let hop = h("b6", 1);
+        let d1 = d1_judge(&Fixture {
+            name: "fix1010 an index-unspent hop",
+            seed: vec![
+                format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{hop}',0,0,{made},'p2pkh')"),
+                format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('owner','other','{}',0,20190,'seat','00','00',2,'{hop}',1,{made},1)", h("9c", 1)),
+            ],
+            identities: vec!["owner".into()],
+        })
+        .await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        let mut join = Transaction::new();
+        join.inputs.push(TransactionInput::new(hop.clone(), 0));
+        join.outputs.push(TransactionOutput {
+            satoshis: Some(40_000),
+            locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(
+                &[0x5a; 20],
+            ))
+            .unwrap(),
+            change: false,
+        });
+        let mut beef = Beef::new();
+        beef.merge_raw_tx(join.to_binary(), None);
+        let j = join.id();
+        d1.conn
+            .execute_batch(&format!(
+                "INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind,paramsDecoded,recoveryHeight,pubA,pubB) VALUES ('{j}',0,0,{made},'covenant',1,900100,'seat','kb')"
+            ))
+            .unwrap();
+        let seated: i64 = d1
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pot_hop_seats WHERE potTxid=?1",
+                [&j],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(seated, 1, "the derivation seated the marker");
+        reaches_the_actor(&d1, &local, &[("pot", format!("{j}:0"))]).await;
+        // its bytes after it (the belt reads the seat's JOIN from them)
+        d1.conn
+            .execute_batch(&format!(
+                "INSERT INTO pot_beefs(txid,beef,createdAt) VALUES ('{j}',x'{}',{made})",
+                hex::encode(beef.to_binary())
+            ))
+            .unwrap();
+        reaches_the_actor(&d1, &local, &[("beef", j.clone())]).await;
+    }
+
+    /// (fix1010_h) THE APP LAYER'S AGE SWEEPS: the spender's bytes (`owed::OWED_SPENDER_BYTES_SWEEP_SQL`) and its word
+    /// (`tracker_host::stored::SWEEP_FRAMED`), each deleted by the shipped statement: each marks the stored rows that
+    /// read it, its keys are the pairs the sweep notes, and its event reaches the actor (the word's CARRIES its emptied
+    /// domain: the carried apply deletes the mirror's row). RED on 006e6f24: neither delete marks.
+    #[tokio::test]
+    async fn fix1010_h_the_age_sweeps_reach_the_actor() {
+        let d1 = d1_judge(&fold9_fixture()).await;
+        let (_, s) = fold9_spend(FOLD9_HOP);
+        d1.conn
+            .execute(
+                "INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'seen','hint',1)",
+                [&s],
+            )
+            .unwrap();
+        fresh_d1(&d1).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        let gone: Vec<String> = d1
+            .conn
+            .prepare(crate::owed::OWED_SPENDER_BYTES_SWEEP_SQL)
+            .unwrap()
+            .query_map(rusqlite::params![i64::MAX, 256], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(gone, vec![s.clone()]);
+        reaches_the_actor(
+            &d1,
+            &local,
+            &[(crate::owed::SPENDER_BYTES_SOURCE, s.clone())],
+        )
+        .await;
+        let gone: Vec<String> = d1
+            .conn
+            .prepare(crate::tracker_host::stored::SWEEP_FRAMED)
+            .unwrap()
+            .query_map([i64::MAX], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(gone, vec![s.clone()]);
+        let ev = published(&d1, "word", &s)
+            .await
+            .expect("the word's delete marks the rows that read it");
+        let report = direct(&d1, &local, &ev, true).await;
+        assert!(report.carried, "the emptied domain carried: {report:?}");
+        fresh_d1(&d1).await;
+        assert_eq!(stored_rows_no_clock(&local), stored_rows_no_clock(&d1));
+    }
+}

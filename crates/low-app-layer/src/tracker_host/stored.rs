@@ -263,13 +263,22 @@ pub const BACKFILL_SAVE: &str = "INSERT INTO tracker_backfill(version,cursor,com
 /// [`SWEEP`] and [`DUE`] read the same two tables, the spender arm only while its word still matters.
 pub const LIVE_HOLD: &str = "SELECT 1 AS held FROM transactions WHERE txid = lower(?1) UNION ALL SELECT 1 AS held FROM pot_records WHERE spendingTxid = lower(?1) LIMIT 1";
 
+/// The sweep's statement, [`SWEEP`] and [`SWEEP_FRAMED`] (one spelling).
+macro_rules! sweep_sql {
+    ($tail:literal) => {
+        concat!("DELETE FROM tx_words WHERE txid IN (SELECT w.txid FROM tx_words w WHERE w.updated_at < ?1 AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) AND NOT EXISTS (SELECT 1 FROM pot_records p WHERE p.spendingTxid=w.txid AND w.word IN ('unknown','built','announced','seen') AND COALESCE(json_extract(w.legacy_body,'$.trackerTerminal'),0) = 0) ORDER BY w.updated_at,w.txid LIMIT 64)", $tail)
+    };
+}
 /// Expire stranger projections after eight days. Outside this sweep: a subject with a `transactions` row (main's arm,
 /// byte for byte), and (bsv-low #757) a recorded pot or hop spender whose word is not yet mined or terminal: the
 /// spender arm holds only while [`DUE`] would still refresh the row (`unknown`, `built`, `announced`, `seen`, not
 /// `trackerTerminal`). Once the spender is mined (the index's own proof then decides its owed row), stale, abandoned
 /// or terminal, its row ages out at eight days as on main, so `pot_records`' permanent pointers buy no permanent row
 /// and no walk (the FIX-757 lens's MEDIUM-1; pinned by `tests/i757_sweep_walk.rs`).
-pub const SWEEP: &str = "DELETE FROM tx_words WHERE txid IN (SELECT w.txid FROM tx_words w WHERE w.updated_at < ?1 AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.txid=w.txid) AND NOT EXISTS (SELECT 1 FROM pot_records p WHERE p.spendingTxid=w.txid AND w.word IN ('unknown','built','announced','seen') AND COALESCE(json_extract(w.legacy_body,'$.trackerTerminal'),0) = 0) ORDER BY w.updated_at,w.txid LIMIT 64)";
+pub const SWEEP: &str = sweep_sql!("");
+/// FIX-1010 (bsv-low #1010): [`SWEEP`] as the tick runs it, answering the words it deleted (each noted `word`; the
+/// row's trigger marked the stored rows that read it).
+pub const SWEEP_FRAMED: &str = sweep_sql!(" RETURNING txid");
 
 /// Only live held subjects buy scheduled refreshes (the same hold as [`SWEEP`]: its spender arm's word filter is this
 /// statement's own, so a spender DUE stops refreshing is one SWEEP no longer spares). A

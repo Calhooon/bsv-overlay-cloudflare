@@ -665,6 +665,8 @@ impl Storage for D1Storage {
                 .execute(&self.db)
                 .await
                 .map_err(d1_err)?;
+            // FIX-1010 (bsv-low #1010): the row's trigger marked the sweeps it pays and a pot's parties
+            crate::owed_events::note("beef", txid);
         }
 
         Ok(())

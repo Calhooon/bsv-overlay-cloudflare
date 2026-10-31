@@ -59,6 +59,42 @@ use worker::{console_log, D1Database};
 
 use crate::reorg_sweep::{ProofLegSummary, ReorgSweepSummary, ReverifyPassSummary};
 
+/// Rule 1's predicate (one spelling for the clear, its marks and its framed delete).
+macro_rules! clear_pred {
+    () => {
+        "spentConfirmed = 1 AND outpoint NOT LIKE 'homeproof:%' AND outpoint NOT LIKE 'homecursor:%'"
+    };
+}
+
+/// Rule 2's predicate (one spelling for the sweep, its marks and its framed delete).
+macro_rules! expire_pred {
+    () => {
+        "probedAtMs <= ? AND outpoint <> 'reorg-clear.0' AND outpoint NOT LIKE 'homeproof:%' AND outpoint NOT LIKE 'homecursor:%' AND outpoint NOT LIKE 'proofmined:%' AND NOT (substr(outpoint,65,1)=':' AND EXISTS (SELECT 1 FROM pot_records p WHERE p.txid=substr(hop_chain_probes.outpoint,1,64) AND p.outputIndex=CAST(substr(hop_chain_probes.outpoint,66) AS INTEGER)))"
+    };
+}
+
+/// FIX-1010 (bsv-low #1010; the D2-ACTOR-F lens's LOW-1): the subjects of the probe rows `g` holds, marked under the
+/// pair (`probe`, the row's key) in the writer's own batch: a hop memo's or evidence's outpoint (`<txid>.<vout>`,
+/// `<txid>:<vout>`) names the hop's markers, the sweeps filed for it, its released evidence and the parties of a pot it
+/// is; a proof latch (`proofmined:<spender>.<height>`) names the owed rows whose word roles name its spender. A
+/// confirmed word deleted is a downgrade (a payout rested on it). Not a trigger: the app layer's judge writes this table
+/// itself (its latches, the belt's memos and evidence, in the judgement's own batch), and a trigger would mark the
+/// judge's own output. One scan of the table (`g`, materialized), then index probes; at most 5 compound terms (D1).
+macro_rules! probe_marks {
+    ($pred:expr) => {
+        concat!(
+            "WITH g AS MATERIALIZED (SELECT outpoint,spentConfirmed FROM hop_chain_probes WHERE ", $pred, ") ",
+            "INSERT INTO owed_dirty (identity,gameId,source,sourceKey,markedAtMs,downgrade) SELECT s.identity,s.gameId,'probe',s.k,strftime('%s','now') * 1000,s.c FROM (",
+            "SELECT hp.identity AS identity,hp.gameId AS gameId,g.outpoint AS k,(g.spentConfirmed IS 1) AS c FROM g CROSS JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=substr(g.outpoint,1,64) AND hp.hopVout=CAST(substr(g.outpoint,66) AS INTEGER) WHERE substr(g.outpoint,65,1) IN ('.',':') ",
+            "UNION ALL SELECT f.identity,f.gameId,g.outpoint,(g.spentConfirmed IS 1) FROM g CROSS JOIN hopsweep_records f INDEXED BY idx_hopsweep_hop ON f.hopTxid=substr(g.outpoint,1,64) AND f.hopVout=CAST(substr(g.outpoint,66) AS INTEGER) WHERE substr(g.outpoint,65,1) IN ('.',':') ",
+            "UNION ALL SELECT e.identity,e.gameId,g.outpoint,(g.spentConfirmed IS 1) FROM g CROSS JOIN released_hop_evidence e ON e.hopTxid=substr(g.outpoint,1,64) AND e.hopVout=CAST(substr(g.outpoint,66) AS INTEGER) WHERE substr(g.outpoint,65,1) IN ('.',':') ",
+            "UNION ALL SELECT pp.identity,pp.gameId,g.outpoint,(g.spentConfirmed IS 1) FROM g CROSS JOIN potparty_records pp INDEXED BY idx_potparty_pot ON pp.potTxid=substr(g.outpoint,1,64) AND pp.potVout=CAST(substr(g.outpoint,66) AS INTEGER) WHERE substr(g.outpoint,65,1) IN ('.',':') ",
+            "UNION ALL SELECT r.identity,r.gameId,g.outpoint,(g.spentConfirmed IS 1) FROM g CROSS JOIN owed_row_words w INDEXED BY idx_owed_row_words_txid ON w.txid=substr(g.outpoint,12,64) CROSS JOIN owed_rows r ON r.identity=w.identity AND r.outpoint=w.outpoint WHERE g.outpoint LIKE 'proofmined:%'",
+            ") s WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,source=excluded.source,sourceKey=excluded.sourceKey,markedAtMs=excluded.markedAtMs,downgrade=MAX(owed_dirty.downgrade,excluded.downgrade)"
+        )
+    };
+}
+
 /// The longest window any reader passes for a memo (the app layer's `PROBE_MEMO_CONFIRMED_MAX_AGE_MS`): two hours.
 pub const HOP_PROBE_MEMO_TTL_MS: i64 = 2 * 60 * 60_000;
 
@@ -80,7 +116,17 @@ pub const HOP_PROBE_MEMO_REORG_DEMOTED_PREFIXES: [&str; 1] = ["proofmined:"];
 /// Rule 1: every memo that recorded a CONFIRMED spend, never the app layer's own rows (a latch written from a
 /// confirmed probe carries `spentConfirmed = 1` too).
 pub const HOP_PROBE_MEMO_REORG_CLEAR_SQL: &str =
-    "DELETE FROM hop_chain_probes WHERE spentConfirmed = 1 AND outpoint NOT LIKE 'homeproof:%' AND outpoint NOT LIKE 'homecursor:%'";
+    concat!("DELETE FROM hop_chain_probes WHERE ", clear_pred!());
+
+/// FIX-1010: rule 1's marks, the first statement of the clear's batch.
+pub const HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL: &str = probe_marks!(clear_pred!());
+/// FIX-1010: rule 1's delete as the batch runs it, answering the keys it deleted (each noted `probe`, so its event
+/// reaches the actor).
+pub const HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL: &str = concat!(
+    "DELETE FROM hop_chain_probes WHERE ",
+    clear_pred!(),
+    " RETURNING outpoint"
+);
 
 /// Rule 2: every memo no reader honours (bind: `now - HOP_PROBE_MEMO_TTL_MS`; the reader refuses
 /// `age >= window`, so the row read exactly at the bound goes too: the lens's N2), never the reorg tombstone,
@@ -89,7 +135,29 @@ pub const HOP_PROBE_MEMO_REORG_CLEAR_SQL: &str =
 /// has a dot; `low-app-layer` `hops_view::probe_evidence_key`) while the outpoint's index row stands: evidence, not a
 /// memo, so its age is no reason to forget it; one whose index row is gone (evicted) ages out as a memo does.
 pub const HOP_PROBE_MEMO_EXPIRE_SQL: &str =
-    "DELETE FROM hop_chain_probes WHERE probedAtMs <= ? AND outpoint <> 'reorg-clear.0' AND outpoint NOT LIKE 'homeproof:%' AND outpoint NOT LIKE 'homecursor:%' AND outpoint NOT LIKE 'proofmined:%' AND NOT (substr(outpoint,65,1)=':' AND EXISTS (SELECT 1 FROM pot_records p WHERE p.txid=substr(hop_chain_probes.outpoint,1,64) AND p.outputIndex=CAST(substr(hop_chain_probes.outpoint,66) AS INTEGER)))";
+    concat!("DELETE FROM hop_chain_probes WHERE ", expire_pred!());
+
+/// FIX-1010: rule 2's marks. Only the EVIDENCE a reader still honours is marked (`<txid>:<vout>`, whose index row is
+/// gone: an evicted hop's); a memo past the window is read by no judge, so its delete moves no judgement.
+pub const HOP_PROBE_MEMO_EXPIRE_MARK_SQL: &str =
+    probe_marks!(concat!(expire_pred!(), " AND substr(outpoint,65,1)=':'"));
+/// FIX-1010: rule 2's delete as the batch runs it, answering the keys it deleted.
+pub const HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL: &str = concat!(
+    "DELETE FROM hop_chain_probes WHERE ",
+    expire_pred!(),
+    " RETURNING outpoint"
+);
+
+/// FIX-1010: the deleted keys whose pair the writer notes (each may hold a mark its batch wrote): the clear's every
+/// hop memo, evidence and proof latch; the sweep's evidence alone (the only rows its marks name). A key noted with no
+/// mark is read by the publish and not sent.
+pub fn noted_key(expire: bool, outpoint: &str) -> bool {
+    match outpoint.as_bytes().get(64) {
+        Some(b':') => true,
+        Some(b'.') => !expire,
+        _ => !expire && outpoint.starts_with("proofmined:"),
+    }
+}
 
 /// Rule 3: the tombstone's key in `hop_chain_probes.outpoint`. It has the memo key's shape (`<txid>.<vout>`)
 /// with a txid no transaction has, so the app layer reads it in the same `IN` read as the memos it judges (one
@@ -173,6 +241,48 @@ async fn delete(db: &D1Database, sql: &str, binds: &[JsValue]) -> Result<u64, St
         .unwrap_or(0) as u64)
 }
 
+#[derive(serde::Deserialize)]
+struct Deleted {
+    outpoint: String,
+}
+
+/// FIX-1010: one batch, the marks first then the delete that answers its keys (D1 runs a batch as one transaction: a
+/// deleted row's subjects are marked or nothing is deleted); each key a mark may name is noted `probe` for the
+/// invocation's publish (its event reaches the actor by the direct call, the queue behind it). Returns the rows deleted.
+async fn marked_delete(
+    db: &D1Database,
+    mark_sql: &str,
+    framed_sql: &str,
+    binds: &[JsValue],
+    expire: bool,
+) -> Result<u64, String> {
+    let prep = |sql: &str| -> Result<worker::D1PreparedStatement, String> {
+        let stmt = db.prepare(sql);
+        if binds.is_empty() {
+            Ok(stmt)
+        } else {
+            stmt.bind(binds).map_err(|e| e.to_string())
+        }
+    };
+    let out = crate::d1_ledger::counted_batch(db, vec![prep(mark_sql)?, prep(framed_sql)?])
+        .await
+        .map_err(|e| e.to_string())?;
+    let deleted: Vec<Deleted> = out
+        .get(1)
+        .ok_or("the framed delete answered nothing")?
+        .results()
+        .map_err(|e| e.to_string())?;
+    for d in &deleted {
+        if noted_key(expire, &d.outpoint) {
+            crate::owed_events::note(PROBE_SOURCE, &d.outpoint);
+        }
+    }
+    Ok(deleted.len() as u64)
+}
+
+/// FIX-1010: the `owed_dirty` source of a probe row's marks (`overlay_discovery::owed_event::TRIGGER_SOURCES`).
+pub const PROBE_SOURCE: &str = "probe";
+
 /// Rules 1 and 3, run by a reorg pass with its outcome in hand: no evidence, no write. Logged and counted; a fault is
 /// logged and costs the memo's own window, nothing else. Returns the memos cleared.
 pub async fn clear_on_reorg(db: &D1Database, origin: &str, evidence: bool) -> u64 {
@@ -190,7 +300,15 @@ pub async fn clear_on_reorg(db: &D1Database, origin: &str, evidence: bool) -> u6
     {
         console_log!("[hop-probe-memos] ({origin}) reorg tombstone write FAILED (a memo re-written right after this clear keeps the long window): {e}");
     }
-    match delete(db, HOP_PROBE_MEMO_REORG_CLEAR_SQL, &[]).await {
+    match marked_delete(
+        db,
+        HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
+        HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL,
+        &[],
+        false,
+    )
+    .await
+    {
         Ok(cleared) => {
             console_log!("[hop-probe-memos] ({origin}) reorg evidence: cleared {cleared} confirmed memo(s); the next owed walk re-probes them");
             crate::ops::bump_counter(db, COUNTER_HOP_PROBE_MEMOS_CLEARED, cleared).await;
@@ -206,7 +324,15 @@ pub async fn clear_on_reorg(db: &D1Database, origin: &str, evidence: bool) -> u6
 /// Rule 2, on every block-event pass. Returns the memos deleted.
 pub async fn expire(db: &D1Database, now_ms: i64) -> u64 {
     let bound = (now_ms - HOP_PROBE_MEMO_TTL_MS) as f64;
-    match delete(db, HOP_PROBE_MEMO_EXPIRE_SQL, &[JsValue::from_f64(bound)]).await {
+    match marked_delete(
+        db,
+        HOP_PROBE_MEMO_EXPIRE_MARK_SQL,
+        HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL,
+        &[JsValue::from_f64(bound)],
+        true,
+    )
+    .await
+    {
         Ok(expired) => {
             if expired > 0 {
                 console_log!("[hop-probe-memos] ttl: deleted {expired} memo(s) older than {HOP_PROBE_MEMO_TTL_MS} ms");
@@ -474,9 +600,18 @@ mod tests {
         let src = include_str!("hop_probe_memos.rs");
         let src = &src[..src.find("#[cfg(test)]").unwrap()];
         let body = &src[src.find("pub async fn clear_on_reorg(").unwrap()..];
+        // FIX-1010: the clear runs as its batch (the marks, then the framed delete), the same predicate as the clear
         assert!(
             body.find("HOP_PROBE_MEMO_REORG_MARK_SQL").unwrap()
-                < body.find("HOP_PROBE_MEMO_REORG_CLEAR_SQL").unwrap()
+                < body.find("HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL").unwrap()
+        );
+        assert_eq!(
+            HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL,
+            format!("{HOP_PROBE_MEMO_REORG_CLEAR_SQL} RETURNING outpoint")
+        );
+        assert_eq!(
+            HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL,
+            format!("{HOP_PROBE_MEMO_EXPIRE_SQL} RETURNING outpoint")
         );
     }
 

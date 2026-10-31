@@ -4181,6 +4181,8 @@ pub mod hand_write {
     /// serving verdict, never an admission decision — `tm_hand` admits
     /// exactly what it admitted before).
     pub fn hand_insert_query(record: &HandRecord, created_at: i64) -> LatchedHandInsert {
+        // FIX-1010 (bsv-low #1010): the row's trigger marks its game's seats; the pair is published with the write
+        crate::owed_events::note("hand", &record.txid);
         let row_valid = overlay_discovery::hand::validity::row_valid(record);
         LatchedHandInsert {
             query: Query::new(
@@ -4222,6 +4224,7 @@ pub mod hand_write {
 
     /// THE hand re-latch write for `record`, its verdict re-derived here.
     pub fn hand_relatch_query(record: &HandRecord) -> LatchedHandRelatch {
+        crate::owed_events::note("hand", &record.txid);
         let row_valid = overlay_discovery::hand::validity::row_valid(record);
         LatchedHandRelatch {
             query: Query::new(
@@ -7474,7 +7477,10 @@ impl ProofStorage for D1ProofStorage {
             .bind(record.loser_cards_hex.as_deref())
             .execute(&self.db)
             .await
-            .map_err(proof_err)
+            .map_err(proof_err)?;
+        // FIX-1010 (bsv-low #1010): the row's trigger marked its game's seats; the pair is published with the write
+        crate::owed_events::note("proof", &record.txid);
+        Ok(())
     }
 
     async fn list_for_game_winner(
