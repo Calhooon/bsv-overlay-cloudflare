@@ -521,22 +521,24 @@ pub const TX_DELETE: &str = trigger!(
 /// pot's COMMITTED seats, never by every party row a stranger filed on the pot. `results::seat_markers_sql` reads a
 /// pot's party rows only under the two settle keys its lock committed (`pot_records.pubA`, `pubB`), so a row whose
 /// own key is not one of them (a keyless v1 filing, a stranger's own key) changes no seat's judgement and marks nobody
-/// here: the filer's key is checked first, on NEW, before any row is read. A row under a committed key is read by
+/// here: a keyless row is refused on NEW alone (`$filer_has_key`, a term naming no table, which SQLite tests once
+/// before any loop: the tier's keyless stranger filing reads nothing more). A row under a committed key is read by
 /// the OTHER seat's judgement: the opponent the row names, marked only when that identity holds its own VERIFIED row
-/// (`sigValid = 1`) on this pot under a committed key, read by `idx_party_verified_identity` (an index seek on the
-/// opponent, its verdict and the pot) and the pot by its primary key, at most two rows. A stranger naming a victim
+/// (`sigValid = 1`) on this pot under a committed key, the opponent first by `idx_party_verified_identity` (a seek on
+/// the opponent, its verdict and the pot), the pot by its primary key only when such a row exists: at most two rows
+/// (each an index entry and its row in D1's count). A stranger naming a victim
 /// marks the victim only when the victim IS a seat of the pot, one mark a filing; the strangers already on the pot
 /// are never read. As first built (0c80ed5c) the trigger read and marked every other party row of the pot
 /// (`idx_potparty_pot`): K rows and K marks a filing on a pot of K rows, refused by the budget tier's
 /// `record-potparty-filing` (7 rows in one statement against 3). Edited in place: migrations 480 to 493 shipped on
-/// no D1. `$filer_key` is the filer's key test over `p` (the update's is OLD's or NEW's).
+/// no D1. `$filer_key` is the filer's committed-key test over `p` (the update's is OLD's or NEW's).
 macro_rules! party_seat_subjects {
-    ($filer_key:literal) => {
+    ($filer_has_key:literal, $filer_key:literal) => {
         concat!(
-            "SELECT pp.identity,pp.gameId FROM pot_records p CROSS JOIN potparty_records pp INDEXED BY idx_party_verified_identity ",
-            "ON pp.identity=NEW.opponentIdentity AND pp.sigValid=1 AND lower(pp.potTxid)=lower(p.txid) AND pp.potVout=p.outputIndex ",
-            "AND pp.seatSettlePubkey IS NOT NULL AND pp.seatSettlePubkey IN (p.pubA,p.pubB) ",
-            "WHERE p.txid=NEW.potTxid AND p.outputIndex=NEW.potVout AND ", $filer_key,
+            "SELECT pp.identity,pp.gameId FROM potparty_records pp INDEXED BY idx_party_verified_identity CROSS JOIN pot_records p ",
+            "ON p.txid=NEW.potTxid AND p.outputIndex=NEW.potVout ",
+            "WHERE ", $filer_has_key, " AND pp.identity=NEW.opponentIdentity AND pp.sigValid=1 AND lower(pp.potTxid)=lower(NEW.potTxid) ",
+            "AND pp.potVout=NEW.potVout AND pp.seatSettlePubkey IS NOT NULL AND pp.seatSettlePubkey IN (p.pubA,p.pubB) AND ", $filer_key,
             " AND (pp.identity IS NOT NEW.identity OR pp.gameId IS NOT NEW.gameId)"
         )
     };
@@ -551,7 +553,10 @@ pub const PARTY_INSERT_SEATS: &str = trigger!(
         "party",
         "NEW.txid",
         created_at!("NEW"),
-        party_seat_subjects!("NEW.seatSettlePubkey IN (p.pubA,p.pubB)")
+        party_seat_subjects!(
+            "NEW.seatSettlePubkey IS NOT NULL",
+            "NEW.seatSettlePubkey IN (p.pubA,p.pubB)"
+        )
     )
 );
 /// A party re-latched (its `sigValid`, its seat's columns): the other seat of its pot, only when a column the seat
@@ -566,7 +571,10 @@ pub const PARTY_UPDATE_SEATS: &str = trigger!(
         "party",
         "NEW.txid",
         created_at!("NEW"),
-        party_seat_subjects!("(NEW.seatSettlePubkey IN (p.pubA,p.pubB) OR OLD.seatSettlePubkey IN (p.pubA,p.pubB))"),
+        party_seat_subjects!(
+            "(NEW.seatSettlePubkey IS NOT NULL OR OLD.seatSettlePubkey IS NOT NULL)",
+            "(NEW.seatSettlePubkey IN (p.pubA,p.pubB) OR OLD.seatSettlePubkey IN (p.pubA,p.pubB))"
+        ),
         " WHERE OLD.sigValid IS NOT NEW.sigValid OR OLD.seatSettlePubkey IS NOT NEW.seatSettlePubkey OR OLD.seatSigHex IS NOT NEW.seatSigHex OR OLD.sigHex IS NOT NEW.sigHex OR OLD.recoveryHeight IS NOT NEW.recoveryHeight"
     )
 );

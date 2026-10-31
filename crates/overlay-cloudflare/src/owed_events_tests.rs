@@ -771,8 +771,8 @@ mod pins {
     /// keyless stranger filing naming A (the tier's shape) marks only its own pair; a stranger under a committed key
     /// naming A marks A and itself, no stranger; a stranger naming a stranger who holds a verified row under its own key
     /// marks nobody else; B's own filing reaches A, A's re-latch reaches B (the two seats, exactly). The insert's VM
-    /// steps are the same over 5 and 200 strangers, and the trigger's read is two index seeks (the pot by its key, the
-    /// opponent's verified row): no SCAN. RED on 0c80ed5c: every stranger on the pot marked and the steps growing.
+    /// steps are the same over 5 and 200 strangers, and the trigger's read is two index seeks (the opponent's verified
+    /// row, then the pot by its key): no SCAN. RED on 0c80ed5c: every stranger on the pot marked and the steps growing.
     #[test]
     fn fix1010_budget_a_party_filing_marks_the_pots_committed_seat_alone() {
         const P: &str = "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1";
@@ -897,6 +897,14 @@ mod pins {
             .map(Result::unwrap)
             .collect();
         assert!(plan.iter().all(|l| !l.starts_with("SCAN")), "{plan:?}");
+        // the opponent first, the pot only past a verified opponent row (the land tier's keyless filing reads
+        // neither: its key is refused on NEW before the loop)
+        assert!(
+            plan.len() == 2
+                && plan[0].contains("pp USING INDEX idx_party_verified_identity")
+                && plan[1].contains("p USING"),
+            "{plan:?}"
+        );
         assert!(
             plan.iter().any(|l| l
                 .contains("idx_party_verified_identity (identity=? AND sigValid=? AND <expr>=?)")),
