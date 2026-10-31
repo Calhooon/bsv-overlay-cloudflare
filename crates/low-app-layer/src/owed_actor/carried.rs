@@ -51,7 +51,7 @@ pub const PAYLOAD_GEN_CLEAR_SQL: &str =
 pub const HELD_GENERATION_SQL: &str = "SELECT MAX(seq) AS g FROM applied WHERE (kind='payload-gen' AND game=?1) OR (kind IN ('read','covered') AND game IN (SELECT value FROM json_each(?2))) OR (kind='read-key' AND game IN (SELECT value FROM json_each(?3)))";
 
 /// D2-ACTOR-F-FOLD (the lens's MEDIUM-2): THE OPEN MARK. An apply writes the mirror before its fixpoint (each round's
-/// `write_round`, the carried upsert), so an apply that faults leaves rows naming keys no read covered. Every apply's
+/// `write_round_of`, the carried upsert), so an apply that faults leaves rows naming keys no read covered. Every apply's
 /// FIRST local statement marks its games open (`applied` kind [`OPEN_KIND`], seq 0); the LAST statement of its last
 /// batch clears them. A carried apply is taken only for games none of which is open: an open game is the narrowed
 /// read, whose closure reads every key the mirror names.
@@ -131,6 +131,11 @@ impl CarriedItem {
 pub struct Carried {
     pub items: Vec<CarriedItem>,
     pub marks: Vec<(String, i64)>,
+    /// D2-ACTOR-F-FOLD (item 4): each event's carried CLOSURE (`facts.closure`, `owed_actor::closure_column`): the
+    /// record's rows of every mirrored family for the txids the payload names, at one high-water. A miss round of a
+    /// carried apply reads its new keys from one of these instead of the record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closures: Vec<Value>,
 }
 
 /// PURE: an event's carried subjects (`facts.subjects`), grouped by identity (lowercased) in the order the marks name
@@ -204,7 +209,15 @@ impl Carried {
                 games: games.clone(),
             });
         }
-        (!items.is_empty()).then_some(Carried { items, marks })
+        let closures = match &facts["closure"] {
+            Value::Null => Vec::new(),
+            c => vec![c.clone()],
+        };
+        (!items.is_empty()).then_some(Carried {
+            items,
+            marks,
+            closures,
+        })
     }
 
     /// PURE: merge another event's carried rows for the same identity (a coalesced body): a domain carried twice keeps
@@ -227,6 +240,11 @@ impl Carried {
         for m in other.marks {
             if !self.marks.contains(&m) {
                 self.marks.push(m);
+            }
+        }
+        for c in other.closures {
+            if !self.closures.contains(&c) {
+                self.closures.push(c);
             }
         }
     }

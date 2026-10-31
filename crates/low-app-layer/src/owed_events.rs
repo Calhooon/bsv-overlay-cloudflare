@@ -2618,7 +2618,8 @@ pub struct DirectReport {
     /// D2-ACTOR-B-FOLD-10 (item 8): the first fault's text (a wall's or a refusal's), for the operator's line.
     pub first_fault: Option<String>,
     /// FIX-956 item 3 (Phase C only): games whose marks the pass acknowledged after their apply landed.
-    pub acked: u64,    /// D2-ACTOR-F (bsv-low #959): events whose subjects and rows the publish carried (no marks read here).
+    pub acked: u64,
+    /// D2-ACTOR-F (bsv-low #959): events whose subjects and rows the publish carried (no marks read here).
     pub carried: u64,
 }
 
@@ -2746,8 +2747,9 @@ pub fn coalesce_direct(
             let mut b = crate::owed_actor::apply_body(&id, chunk, &e, tip);
             b["class"] = json!("direct");
             // D2-ACTOR-F: the rows the identity's events carried (every one of them), for the actor's apply with no
-            // record read
-            if let Some(carried) = &c.carried {
+            // record read. The lens's NIT-2: each chunk's body carries the chunk's own items (an item names its
+            // games, as `apply_burst` filters), so an identity past one chunk keeps the carried path in each.
+            if let Some(carried) = chunk_carried(c.carried.as_ref(), chunk) {
                 b["carried"] = json!(carried);
             }
             if !c.also.is_empty() {
@@ -2757,6 +2759,21 @@ pub fn coalesce_direct(
         }
     }
     bodies
+}
+
+/// PURE (the lens's NIT-2): the carried rows of one chunk's body: the items naming one of the chunk's games, every
+/// mark and closure kept (the apply records the marks of its own games); `None` when no item names one.
+pub fn chunk_carried(
+    carried: Option<&crate::owed_actor::carried::Carried>,
+    chunk: &[String],
+) -> Option<crate::owed_actor::carried::Carried> {
+    let mut c = carried?.clone();
+    c.items.retain(|i| {
+        i.games
+            .iter()
+            .any(|g| chunk.iter().any(|x| x.eq_ignore_ascii_case(g)))
+    });
+    (!c.items.is_empty()).then_some(c)
 }
 
 /// PURE: a direct call's error is its WALL (`object::call_apply`'s "no answer in" words), else a fault.

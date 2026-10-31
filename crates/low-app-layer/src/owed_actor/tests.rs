@@ -14642,7 +14642,9 @@ mod d2_actor_f {
 
     /// (f_b) A CARRIED ROW NAMING A KEY THE MIRROR NEVER READ IS ONE READ (the cold miss, never two): a collected
     /// filing for game 9 names its marker's txid and a payout txid the mirror holds nothing of; the carried apply reads
-    /// those keys alone in one record call and stores the cold apply's rows.
+    /// those keys alone in one record call and stores the cold apply's rows. Since D2-ACTOR-F-FOLD (item 4) this is
+    /// an event WITHOUT its carried closure (the overlay's publish, or a closure past the payload's bound): with it,
+    /// `d2_actor_f_fold::fold_l2_a_new_filing_reads_no_d1`.
     #[tokio::test]
     async fn d2_actor_f_b_a_new_key_is_one_read() {
         let (record, local, games) = e_warm_seat(40).await;
@@ -14656,7 +14658,8 @@ mod d2_actor_f {
             )
             .unwrap();
         mark(&record, &games[9], "collected", &marker);
-        let ev = published(&record, "collected", &marker).await;
+        let mut ev = published(&record, "collected", &marker).await;
+        assert!(ev.facts.as_object_mut().unwrap().remove("closure").is_some());
         let (report, calls) = applied(&record, &local, &games[9..10], &ev, true).await;
         assert!(report.carried);
         assert_eq!(calls, 1, "the new keys are one record read");
@@ -15018,6 +15021,38 @@ mod d2_actor_f_fold {
         assert_eq!(read, hw);
     }
 
+    /// (fold_m1_c) THE BOUND IS THE RECORD'S HIGH-WATER, NOT A PENDING MARK: the newer SEEN's mark acknowledged
+    /// BEFORE any actor read (Phase A: the D1 judge's acknowledgement), then the game's narrowed read (no mark
+    /// pending: the pending marks' maximum would be the bootstrap's), then the older event's carried call: skipped.
+    /// RED with the bound the pending marks' maximum, the greatest kept (`left: "old" right: "new"`).
+    #[tokio::test]
+    async fn fold_m1_c_the_bound_is_the_high_water_when_the_newer_mark_was_acked_unread() {
+        let (record, local, games) = e_warm_seat(20).await;
+        let pot = h("c8", 7);
+        record
+            .conn
+            .execute(
+                "INSERT INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'old','arcade',1)",
+                [&pot],
+            )
+            .unwrap();
+        mark(&record, &games[7], "seen", &pot);
+        let older = published(&record, "seen", &pot).await;
+        record
+            .conn
+            .execute("UPDATE network_seen SET seenAt='new' WHERE txid=?1", [&pot])
+            .unwrap();
+        mark(&record, &games[7], "seen", &pot);
+        let newer = published(&record, "seen", &pot).await;
+        record.conn.execute("DELETE FROM owed_dirty", []).unwrap(); // acknowledged before the actor read
+        let seen = "SELECT seenAt FROM network_seen WHERE txid=?1";
+        applied(&record, &local, &games[7..8], &newer, false).await.unwrap();
+        assert_eq!(one(&local, seen, &pot), "new");
+        let late = applied(&record, &local, &games[7..8], &older, true).await.unwrap();
+        assert!(late.carried);
+        assert_eq!(one(&local, seen, &pot), "new", "an older carried row overwrote the newer one");
+    }
+
     /// (fold_m1_b) A MISS ROUND'S BOUND IS PER KEY: a carried collected filing names a payout txid the mirror never
     /// read; its miss round reads that txid's word (`new`) at the record's high-water. A late carried call of the
     /// word's OLDER write (published before it moved) is above the game's read bound but below that key's: skipped,
@@ -15056,6 +15091,163 @@ mod d2_actor_f_fold {
         assert_eq!(one(&local, word, &pay), "new", "the miss read's newer row was replaced");
     }
 
+    /// (fold_l2_a) A NEW FILING REACHES ZERO READS (the lens's LOW-2, the lane's next step): a collected filing naming
+    /// a marker txid and a payout txid the warm mirror never read, published by the app layer's publish (its carried
+    /// closure: the record's rows of every family for the txids the payload names, the payout's word among them, at
+    /// one high-water) is applied with NO record call, and stores exactly the cold apply's rows; the payout's word is
+    /// in the mirror, and the per-key bound of the closure is recorded. The same event without the closure is one
+    /// record call (`d2_actor_f_b`). RED on 3223be64: `left: 1 right: 0` (no closure is carried).
+    #[tokio::test]
+    async fn fold_l2_a_new_filing_reads_no_d1() {
+        let (record, local, games) = e_warm_seat(40).await;
+        let marker = h("a1", 9);
+        let pay = h("a2", 9);
+        record
+            .conn
+            .execute(
+                "INSERT INTO collected_markers_v2(identity,gameId,txid,outputIndex,sigHex,createdAt,payTxid) VALUES ('owner',?1,?2,0,'00',?3,?4)",
+                rusqlite::params![games[9], marker, (NOW_MS / 1000) as i64, pay],
+            )
+            .unwrap();
+        record
+            .conn
+            .execute("INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'mined','chain',1)", [&pay])
+            .unwrap();
+        mark(&record, &games[9], "collected", &marker);
+        let ev = published(&record, "collected", &marker).await;
+        assert!(ev.facts["closure"].is_object(), "the filing carries its closure: {}", ev.facts);
+        let b0 = record.batches.get();
+        let r = applied(&record, &local, &games[9..10], &ev, true).await.unwrap();
+        let calls = record.batches.get() - b0;
+        eprintln!("fold_l2_a: a new filing's record calls {calls}, closure rounds {}, rounds {}", r.closure_rounds, r.rounds);
+        assert!(r.carried && r.closure_rounds >= 1, "{r:?}");
+        assert_eq!(calls, 0, "a new filing reads no D1");
+        let words: i64 = local
+            .conn
+            .query_row("SELECT COUNT(*) FROM tx_words WHERE txid=?1", [&pay], |r| r.get(0))
+            .unwrap();
+        assert_eq!(words, 1, "the payout's word came with the closure");
+        let c = mirror();
+        apply(&record, &c, &Fakes, "owner", &[games[9].clone()], None, Some(TIP), None)
+            .await
+            .unwrap();
+        assert_eq!(stored_game(&local, "owner", &games[9]), stored_game(&c, "owner", &games[9]));
+        let key: i64 = local
+            .conn
+            .query_row("SELECT MAX(seq) FROM applied WHERE kind='read-key' AND game=?1", [&pay], |r| r.get(0))
+            .unwrap();
+        assert!(key > 0, "the closure's high-water is the payout's per-key bound");
+    }
+
+    /// (fold_l2_b) A CLOSURE OLDER THAN THE MIRROR'S READ OF A KEY IS NOT TAKEN: the payout's word is in the mirror
+    /// as a miss read left it (`new`, its per-key bound at the record's high-water) but no mirror row names the payout
+    /// any more; a late event's closure (published before the word moved: `old`) names it again. Its miss round reads
+    /// the record for the payout, never the older closure: the mirror keeps `new`, one record call. RED with the
+    /// per-key check of the closure dropped (the closure's `old` taken, no record call).
+    #[tokio::test]
+    async fn fold_l2_b_an_older_closure_never_replaces_a_newer_read() {
+        let (record, local, games) = e_warm_seat(20).await;
+        let pay = h("a2", 9);
+        let m1 = h("a1", 9);
+        record
+            .conn
+            .execute("INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'old','hint',1)", [&pay])
+            .unwrap();
+        record
+            .conn
+            .execute(
+                "INSERT INTO collected_markers_v2(identity,gameId,txid,outputIndex,sigHex,createdAt,payTxid) VALUES ('owner',?1,?2,0,'00',?3,?4)",
+                rusqlite::params![games[9], m1, (NOW_MS / 1000) as i64, pay],
+            )
+            .unwrap();
+        mark(&record, &games[9], "collected", &m1);
+        let late = published(&record, "collected", &m1).await; // its closure holds the word 'old'
+        let late_hw = late.facts["closure"]["hw"].as_i64().unwrap();
+        record
+            .conn
+            .execute("UPDATE tx_words SET word='new' WHERE txid=?1", [&pay])
+            .unwrap();
+        mark(&record, &games[9], "word", &pay);
+        // the mirror as a newer miss read left the payout: its word, its per-key bound past the closure's
+        local
+            .conn
+            .execute("INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'new','hint',2)", [&pay])
+            .unwrap();
+        local
+            .conn
+            .execute(
+                "INSERT INTO applied(kind,seq,game,atMs) VALUES ('read-key',?1,?2,1)",
+                rusqlite::params![late_hw + 1, pay],
+            )
+            .unwrap();
+        let b0 = record.batches.get();
+        let r = applied(&record, &local, &games[9..10], &late, true).await.unwrap();
+        let word = "SELECT word FROM tx_words WHERE txid=?1";
+        assert!(r.carried, "{r:?}");
+        assert_eq!(one(&local, word, &pay), "new", "an older closure replaced a newer read");
+        assert_eq!(r.closure_rounds, 0);
+        assert_eq!(record.batches.get() - b0, 1, "the payout read from the record");
+    }
+
+    /// (fold_nit2) EACH CHUNK'S BODY CARRIES ITS OWN ITEMS: an identity whose pass names 70 games (two chunks of 64 and
+    /// 6), its carried item naming game 66 alone, is two bodies: the first carries nothing (no item names its games:
+    /// the narrowed read, as it would have answered "names no game of the apply"), the second carries the item. RED on
+    /// 3223be64's rule (every chunk the identity's whole `Carried`: the first body carries an item it cannot take).
+    #[test]
+    fn fold_nit2_each_chunk_carries_its_own_items() {
+        let games: Vec<String> = (0..70).map(|i| format!("g{i:02}")).collect();
+        let item = carried::CarriedItem {
+            t: "network_seen".into(),
+            c: vec!["txid".into()],
+            k: vec![json!([h("c8", 66)]).to_string()],
+            r: vec![],
+            g: 9,
+            games: vec!["g66".into()],
+        };
+        let c = carried::Carried {
+            items: vec![item],
+            marks: vec![("g66".into(), 9)],
+            closures: vec![],
+        };
+        let e = EventCtx {
+            kind: "seen".into(),
+            seq: 1,
+            at_ms: 1,
+            mined: false,
+            txids: Some(vec![h("c8", 66)]),
+            also: vec![],
+            by_identity: Default::default(),
+            carried: [("owner".to_string(), c)].into_iter().collect(),
+        };
+        let bodies = crate::owed_events::coalesce_direct(vec![(e, vec![("owner".into(), games)])], Some(TIP));
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].get("carried").is_none(), "the first chunk carries an item naming none of its games");
+        assert_eq!(bodies[1]["carried"]["items"][0]["games"], json!(["g66"]));
+    }
+
+    /// (fold_nit3) NO WRITER MOVES A PARTY ROW'S `potTxid` (the lens's NIT-3, the premise `READ_PARTY_SQL` states):
+    /// every production `UPDATE potparty_records` sets `sigValid` alone. RED when a writer that moves the row's pot is
+    /// added (the party's carried links would then miss the old pot's).
+    #[test]
+    fn fold_nit3_no_writer_moves_a_partys_pot() {
+        let mut seen = 0;
+        for (name, src) in [
+            ("d1_discovery.rs", include_str!("../../../overlay-cloudflare/src/d1_discovery.rs")),
+            ("eviction_write.rs", include_str!("../../../overlay-cloudflare/src/eviction_write.rs")),
+        ] {
+            let prod = src.split("\n#[cfg(test)]").next().unwrap();
+            for (i, _) in prod.match_indices("UPDATE potparty_records SET") {
+                seen += 1;
+                let rest = &prod[i + "UPDATE potparty_records SET".len()..];
+                let set = &rest[..rest.find("WHERE").unwrap_or(rest.len()).min(200)];
+                let set: String = set.chars().filter(|c| !c.is_whitespace() && *c != '\\').collect();
+                assert!(set.starts_with("sigValid=?") || set.starts_with("sigValid="), "{name}: {set}");
+                assert!(!set.contains("potTxid"), "{name}: a writer moves a party's pot: {set}");
+            }
+        }
+        assert!(seen >= 1, "the production writers were read");
+    }
+
     /// (fold_m2) THE LENS'S MEDIUM-2, committed (`lens_f_a_faulted_carried_apply_leaves_keys_never_read`): a carried
     /// collected filing whose miss read FAULTS has upserted its marker (naming a payout txid) into the mirror; the
     /// next carried apply of the game is not taken (the game was left open) and the narrowed read reads the payout's
@@ -15078,7 +15270,9 @@ mod d2_actor_f_fold {
             .execute("INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'mined','chain',1)", [&pay])
             .unwrap();
         mark(&record, &games[9], "collected", &marker);
-        let ev = published(&record, "collected", &marker).await;
+        // the lens's shape: an event whose new keys are the record's read (no carried closure), that read faulting
+        let mut ev = published(&record, "collected", &marker).await;
+        ev.facts.as_object_mut().unwrap().remove("closure");
         let dead = FaultAfter(&record, Cell::new(0), 0);
         let first = applied(&dead, &local, &games[9..10], &ev, true).await;
         assert!(first.is_err(), "the miss read faulted: {first:?}");
