@@ -16447,7 +16447,7 @@ mod d2_actor_f_fold3 {
         let mine = BTreeSet::from([hop.clone()]);
         let (stmt, read) = pass_closure_statement(&mine, 1).unwrap();
         let row = read_pass_closure(&record, stmt).await.unwrap();
-        let c = ClosureRead::of(&closure_for(&mine, &read, &row).unwrap()).unwrap();
+        let c = ClosureRead::of(&closure_for(&mine, &read, &row).unwrap().unwrap()).unwrap();
         assert!(c.not_carried.contains(&hop), "{c:?}");
         let n = FAMILIES
             .iter()
@@ -16463,7 +16463,7 @@ mod d2_actor_f_fold3 {
         let mut wide = keys.clone();
         wide.insert(hop.clone());
         let (_, read) = pass_closure_statement(&wide, 1).unwrap();
-        let c = ClosureRead::of(&closure_for(&wide, &read, &row).unwrap()).unwrap();
+        let c = ClosureRead::of(&closure_for(&wide, &read, &row).unwrap().unwrap()).unwrap();
         assert!(wide
             .iter()
             .filter(|k| !read.contains(*k))
@@ -16675,12 +16675,43 @@ mod d2_actor_f_fold3 {
         assert!(port.calls.borrow()[0].2, "the body carries the closure");
     }
 
+    /// The filing's real closure answer (`seen_and_filing`'s record), its first family holding a row of the filing's
+    /// keys copied until the event's closure passes `CLOSURE_MAX_BYTES`: an answer of the statement's shape that
+    /// `closure_for` DECLINES for its size.
+    async fn oversized_answer() -> Value {
+        let (record, _local, games) = e_warm_seat(20).await;
+        let marker = collected(&record, &games, 12);
+        let filing = published(&record, "collected", &marker).await;
+        let keys = closure_wanted(&filing).unwrap();
+        let (stmt, read) = pass_closure_statement(&keys, 1).unwrap();
+        let mut row = read_pass_closure(&record, stmt).await.unwrap();
+        let fam = (0..FAMILIES.len())
+            .find(|n| {
+                json_of(&row[format!("f{n}")])
+                    .ok()
+                    .and_then(|v| v.as_array().cloned())
+                    .is_some_and(|a| !a.is_empty())
+            })
+            .expect("the filing's closure holds a row");
+        let col = format!("f{fam}");
+        let mut els = json_of(&row[&col]).unwrap().as_array().unwrap().clone();
+        let one = els[0].clone();
+        while els.len() * one.to_string().len() < 2 * CLOSURE_MAX_BYTES {
+            els.push(one.clone());
+        }
+        row[&col] = Value::Array(els);
+        assert!(closure_for(&keys, &read, &row).unwrap().is_none(), "the answer is past the closure's bound");
+        row
+    }
+
     /// (fold4_low2) THE THIRD DELTA LENS'S LOW-2: A FAULTED OR DECLINED CLOSURE READ IS COUNTED, SERVED AND LOGGED. A
     /// read that faults is `closure_faults` 1 with its text, logged once a minute an isolate; an answer `closure_for`
-    /// declines is `closure_declines` 1; both counters are in both Workers' lists, the health snapshot's and
+    /// declines (since the fourth delta lens's NIT-1 a closure past `CLOSURE_MAX_BYTES`, never a broken answer) is
+    /// `closure_declines` 1; both counters are in both Workers' lists, the health snapshot's and
     /// `/health/invariants.owedActor`; the Worker's pass bumps both. New API (does not compile on 44e2f992).
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn fold4_low2_a_faulted_and_declined_closures_are_counted_and_served() {
+        let oversized = oversized_answer().await;
         let (events, _) = seen_and_filing().await;
         let port = WallPort {
             closure: Some(Err("D1_ERROR: the statement timed out".into())),
@@ -16694,7 +16725,7 @@ mod d2_actor_f_fold3 {
         assert!(crate::owed_events::closure_fault_line(&r, 30_000, Some(1_000)).is_none());
         assert!(crate::owed_events::closure_fault_line(&r, 61_000, Some(1_000)).is_some());
         let port = WallPort {
-            closure: Some(Ok(json!({"hw": 1, "f0": "{"}))),
+            closure: Some(Ok(oversized)),
             start: tokio::time::Instant::now(),
             calls: RefCell::default(),
         };
@@ -16717,6 +16748,87 @@ mod d2_actor_f_fold3 {
         assert!(src.contains("log_closure_fault(&report,"));
         let src: String = include_str!("../owed_actor.rs").split_whitespace().collect();
         assert!(src.contains("\"closureFaults\":n(COUNTERS[33]),\"closureDeclines\":n(COUNTERS[34])"));
+    }
+
+    /// (nits_nit1) THE FOURTH DELTA LENS'S NIT-1: AN ANSWER NOT OF THE STATEMENT'S SHAPE IS A FAULT, NEVER A DECLINE. A
+    /// family column that does not parse, one that is not an array and one that is missing are each `closure_faults` 1
+    /// naming the column, `closure_declines` 0, the filing called with no closure. RED on 1fcbf2d5's rule (a broken
+    /// answer counted a decline: `left: (0, 1, 0) right: (1, 0, 0)`).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn nits_nit1_a_malformed_closure_answer_is_a_fault() {
+        let (events, games) = seen_and_filing().await;
+        for (answer, says) in [
+            (json!({"hw": 1, "f0": "{"}), "does not read"),
+            (json!({"hw": 1, "f0": {"not": "rows"}}), "is not an array"),
+            (json!({"hw": 1}), "f0"),
+        ] {
+            let port = WallPort {
+                closure: Some(Ok(answer.clone())),
+                start: tokio::time::Instant::now(),
+                calls: RefCell::default(),
+            };
+            let r = crate::owed_events::direct_with(&port, events.clone(), Some(TIP)).await;
+            assert_eq!((r.closure_faults, r.closure_declines, r.closures), (1, 0, 0), "{answer}: {r:?}");
+            assert!(r.closure_fault.as_deref().is_some_and(|f| f.contains(says)), "{answer}: {r:?}");
+            let calls = port.calls.borrow();
+            let filing = calls.iter().find(|(_, g, _)| g.contains(&games[12])).expect("the filing is called");
+            assert!(!filing.2, "the filing goes on with no closure");
+        }
+    }
+
+    /// (nits_nit2) THE FOURTH DELTA LENS'S NIT-2: THE CLOSURE STAGE INCLUDES THE READS THAT WALLED OR FAULTED. Each
+    /// filing's body carries the read's `closureMs` whatever its outcome: the wall's 2,000 ms, a fault's time, a
+    /// decline's; the SEEN's body (no read) carries none. RED on 1fcbf2d5's rule (the time only beside a closure).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn nits_nit2_a_walled_or_faulted_read_carries_its_time() {
+        struct MsPort(WallPort, RefCell<Vec<(Vec<String>, Option<u64>)>>);
+        impl crate::owed_events::DirectPort for MsPort {
+            async fn subjects(
+                &self,
+                ev: &overlay_discovery::owed_event::OwedEvent,
+            ) -> Result<Vec<(String, Vec<String>)>, String> {
+                self.0.subjects(ev).await
+            }
+            async fn call(&self, body: Value) -> Result<Value, String> {
+                let games: Vec<String> = body["games"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|g| g.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                self.1.borrow_mut().push((games, body["carried"]["closure_ms"].as_u64()));
+                self.0.call(body).await
+            }
+            async fn closure_read(&self, stmt: Stmt) -> Result<Value, String> {
+                self.0.closure_read(stmt).await
+            }
+            async fn sleep_ms(&self, ms: u64) {
+                self.0.sleep_ms(ms).await
+            }
+            fn now_ms(&self) -> u64 {
+                self.0.now_ms()
+            }
+        }
+        let (events, games) = seen_and_filing().await;
+        for (closure, want) in [
+            (None, DIRECT_CALL_WALL_MS),
+            (Some(Err("D1_ERROR: overloaded".to_string())), 0),
+            (Some(Ok(json!({"hw": 1, "f0": "{"}))), 0),
+        ] {
+            let port = MsPort(
+                WallPort {
+                    closure,
+                    start: tokio::time::Instant::now(),
+                    calls: RefCell::default(),
+                },
+                RefCell::default(),
+            );
+            let r = crate::owed_events::direct_with(&port, events.clone(), Some(TIP)).await;
+            assert_eq!(r.closure_faults, 1, "{r:?}");
+            let bodies = port.1.borrow();
+            let filing = bodies.iter().find(|(g, _)| g.contains(&games[12])).expect("the filing's body");
+            assert_eq!(filing.1, Some(want), "{bodies:?}");
+            let seen = bodies.iter().find(|(g, _)| g.contains(&games[7])).expect("the SEEN's body");
+            assert_eq!(seen.1, None, "{bodies:?}");
+        }
     }
 
     /// (fold4_nit1) THE THIRD DELTA LENS'S NIT-1: THE PASS'S STATEMENT STAYS UNDER D1'S 100,000 BYTE STATEMENT LIMIT
