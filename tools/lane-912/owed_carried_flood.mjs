@@ -15,10 +15,15 @@
 //   (3) each actor's apply of its held filing answers `carried: true`, `recordCalls: 0`, `readMs: 0` (no D1 call:
 //       the payout's keys came with the closure, `closureRounds` at least 1), and its stages; the cell prints the
 //       door's `enqueue;dur` (its `Server-Timing`, the publish inside `publish_before_answer`) and answer times, the
-//       apply and first visibility figures each answer gave;
-//   (4) (the delta lens's LOW-2) it waits out the bars' minute, files seat 1's extra NEW filing (its warm actor's
-//       apply flushes the isolate's pending samples, the flood's among them, and the health snapshot in their batch),
-//       and asserts `/health.owedActor` SERVES non-null p95s, `classes.direct.closureMsP95` among them, and
+//       apply and first visibility figures each answer gave (workerd moves `Date.now()` only on I/O and the 32 doors
+//       and actors share one process, so the door's and the visibility figures are one value each, printed as "all 32
+//       by", not a distribution: the fourth delta lens's NIT-3);
+//   (4) (the delta lens's LOW-2) it waits out the bars' minute, files seat 1's extra NEW filing (seat 1's own warm
+//       actor's apply flushes THAT OBJECT's pending samples, its flood apply and this filing's, and the health snapshot
+//       in their batch: each OwedActor holds its own pending bars and flushes them only at its own next answer after
+//       the minute, so the other 31 actors' flood samples are NOT served here; the fourth delta lens's NIT-3), and
+//       asserts `/health.owedActor` SERVES non-null p95s over at least one sample, `classes.direct.closureMsP95` among
+//       them, printing the served sample counts, and
 //       `owed_actor_direct_closures_total` moved by exactly the flood's 32 with no closure fault (D2-ACTOR-F-FOLD-4)
 //       (`stages.{read,wait,judge,write}MsP95`, `classes.direct` with samples), printed beside the answers' figures.
 // RED on 3223be64 (no closure carried): every held filing's apply makes one record call ("recordCalls 1").
@@ -132,7 +137,7 @@ try {
   const visible = got.map(a => a.at - t0)
   console.log(`f_cell: the doors answered the 32 held filings in ${answeredMs} ms; applies carried ${carried}/32, record calls ${JSON.stringify([...new Set(calls)])}, closure rounds ${JSON.stringify([...new Set(got.map(a => a.closureRounds))])}`)
   console.log(`f_cell: stages ms: read ${fig(read)}; wait ${fig(wait)}; judge ${fig(judge)}; write ${fig(write)}; outside ${fig(outside)}`)
-  console.log(`f_cell: apply ms ${fig(apply)}; first visibility ms (the answer's time less the flood's start) ${fig(visible)}`)
+  console.log(`f_cell: apply ms ${fig(apply)}; all 32 visible by ${Math.max(...visible)} ms (the answer's time less the flood's start; workerd's clock moves only on I/O: ${fig(visible)})`)
   assert.equal(carried, 32, `every held filing took the carried path: ${JSON.stringify(got)}`)
   assert(calls.every(c => c === 0), `no apply made a record call: ${JSON.stringify(calls)}`)
   assert(read.every(r => r === 0), `readMs 0 on the warm path: ${JSON.stringify(read)}`)
@@ -153,8 +158,9 @@ try {
   }
   // (4) the served stages (the delta lens's LOW-2): the fleet's bars are flushed at most once a minute an isolate and
   // the health snapshot at most once a minute fleet-wide, so the cell waits the minute out, files one more filing (its
-  // direct pass flushes the isolate's pending samples, the flood's among them, and the snapshot in their batch), and
-  // asserts the SERVED figures are numbers
+  // seat 1's own actor flushes ITS pending samples, its flood apply and this filing's, and the snapshot in their batch;
+  // the other 31 actors flush theirs only at their own next answer), and asserts the SERVED figures are numbers over at
+  // least one sample
   const extra = seats.find(s => s.extra)?.extra
   assert(extra, 'the fixture holds seat 1’s extra filing')
   await new Promise(r => setTimeout(r, 62000))
@@ -174,8 +180,11 @@ try {
     return ['readMsP95', 'waitMsP95', 'judgeMsP95', 'writeMsP95'].every(k => typeof st[k] === 'number' && typeof d[k] === 'number') && typeof d.closureMsP95 === 'number' && d.applySamples > 0 && h
   }, 70000).catch(e => { console.log(`f_cell: last /health.owedActor ${JSON.stringify(last)}`); throw e })
   const st = health.owedActor.stages
+  const direct = health.owedActor.classes.direct
+  assert(direct.applySamples >= 1 && direct.visibleSamples >= 1, `the served direct class holds samples: ${JSON.stringify(direct)}`)
+  console.log(`f_cell: SERVED samples: classes.direct applySamples ${direct.applySamples}, visibleSamples ${direct.visibleSamples} (seat 1's own actor's; the other 31 actors' flood samples are unflushed here)`)
   console.log(`f_cell: SERVED /health.owedActor.stages ${JSON.stringify(st)}; classes.direct ${JSON.stringify(health.owedActor.classes.direct)}; record ${JSON.stringify({ enqueueMsP50: health.record?.enqueueMsP50, enqueueMsP95: health.record?.enqueueMsP95 })}`)
-  console.log(`PASS f_cell: 32 new filings for 32 identities (one payout a ~20 KB stored BEEF) applied from their carried rows and closures with no D1 read (record calls 0, readMs 0); door enqueue ${fig(enq)} ms; apply ${fig(apply)} ms, first visibility ${fig(visible)} ms; served stages read p95 ${st.readMsP95}, judge p95 ${st.judgeMsP95}; served classes.direct.closureMsP95 ${health.owedActor.classes.direct.closureMsP95}; directClosures ${directClosures}`)
+  console.log(`PASS f_cell: 32 new filings for 32 identities (one payout a ~20 KB stored BEEF) applied from their carried rows and closures with no D1 read (record calls 0, readMs 0); door enqueue ${fig(enq)} ms; apply ${fig(apply)} ms, all 32 visible by ${Math.max(...visible)} ms; served stages (${direct.applySamples} samples) read p95 ${st.readMsP95}, judge p95 ${st.judgeMsP95}; served classes.direct.closureMsP95 ${health.owedActor.classes.direct.closureMsP95}; directClosures ${directClosures}`)
 } finally {
   if (mf) await Promise.race([mf.dispose(), new Promise(r => setTimeout(r, 15000))])
   rmSync(scratch, { recursive: true, force: true })

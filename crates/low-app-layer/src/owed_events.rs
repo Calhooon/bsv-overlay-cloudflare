@@ -2990,6 +2990,11 @@ pub async fn direct_with_class(
             .map(|(ev, subjects)| (crate::owed_actor::EventCtx::of(ev), subjects.clone()))
             .collect()
     };
+    // The fourth delta lens's NIT-5, stated: the split makes an identity holding both a filing and a non-filing event in
+    // one pass TWO bodies (two applies, serialised by its turn), and `fan_out` counts it twice, so a pass reaches
+    // `FLOOD_CONCURRENCY` slightly sooner. Sound: the non-filing body's apply judges over a mirror without the filing's
+    // rows (the pre-filing judgement, what two passes a moment apart give), the filing's mark is a plain mark (nothing
+    // withheld between), and the filing's body then re-judges the game.
     let rest_bodies = coalesce_direct(ctx_of(&rest), tip);
     // the filings' bodies are coalesced after their closure (it rides each event's facts); their count, for the pass's
     // fan-out, does not depend on it (one body an identity and chunk)
@@ -3017,16 +3022,27 @@ pub async fn direct_with_class(
             let ms = port.now_ms().saturating_sub(started);
             step.calls = 1;
             step.ms = Some(ms);
+            // the fourth delta lens's NIT-2: every filing carries the read's time whatever its outcome (a walled read
+            // at the wall's), so the served `closure` stage includes the reads that walled or faulted; the outcome is
+            // the counters'
+            for ((ev, _), _) in filings.iter_mut() {
+                ev.facts["closureMs"] = json!(ms);
+            }
             match row {
                 Ok(row) => {
                     for ((ev, _), keys) in filings.iter_mut() {
                         match crate::owed_actor::closure_for(keys, &read, &row) {
-                            Some(c) => {
+                            Ok(Some(c)) => {
                                 ev.facts["closure"] = c;
-                                ev.facts["closureMs"] = json!(ms);
                                 step.closures += 1;
                             }
-                            None => step.declines += 1,
+                            Ok(None) => step.declines += 1,
+                            // the fourth delta lens's NIT-1: an answer not of the statement's shape is a FAULT (the
+                            // read is broken for every filing alike: one fault, its text), never a decline
+                            Err(e) => {
+                                step.faults = 1;
+                                step.fault.get_or_insert(e);
+                            }
                         }
                     }
                 }

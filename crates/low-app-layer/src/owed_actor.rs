@@ -1187,8 +1187,14 @@ pub fn pass_closure_statement(
 /// reads) and never its bytes. `notCarried`: the event's keys the statement did not read (past
 /// [`PASS_CLOSURE_KEYS_MAX`]), and the txids of a row past its weight bound or the family's running bound, of a BEEF past
 /// [`CLOSURE_BEEF_MAX_BYTES`], or whose facts alone pass [`CLOSURE_MAX_BYTES`]; a miss naming one of them reads the
-/// record ([`ClosureRead::rows_of`]). `None` past [`CLOSURE_MAX_BYTES`].
-pub fn closure_for(keys: &BTreeSet<String>, read: &BTreeSet<String>, row: &Value) -> Option<Value> {
+/// record ([`ClosureRead::rows_of`]). `Ok(None)` past [`CLOSURE_MAX_BYTES`] (a DECLINE); `Err` where the answer is not
+/// the statement's shape (a family column missing, not JSON or not an array: a FAULT, the fourth delta lens's NIT-1, so a
+/// broken statement is never counted as closures too big).
+pub fn closure_for(
+    keys: &BTreeSet<String>,
+    read: &BTreeSet<String>,
+    row: &Value,
+) -> Result<Option<Value>, String> {
     let hw = hw_of(&row["hw"]);
     let mut not_carried: BTreeSet<String> = keys.difference(read).cloned().collect();
     let mut fams: Vec<Value> = Vec::with_capacity(FAMILIES.len());
@@ -1198,9 +1204,18 @@ pub fn closure_for(keys: &BTreeSet<String>, read: &BTreeSet<String>, row: &Value
             .into_iter()
             .chain(f.beef.then(|| "__len".to_string()))
             .collect();
-        let got = json_of(&row[format!("f{n}")]).ok()?;
+        let col = format!("f{n}");
+        // a NULL family is an empty one (no row named a key); an ABSENT column is the statement's shape broken
+        let cell = row
+            .get(&col)
+            .ok_or_else(|| format!("the closure answer has no {col} ({})", f.table))?;
+        let got = json_of(cell)
+            .map_err(|e| format!("the closure answer's {col} ({}) does not read: {e}", f.table))?;
+        let els = got
+            .as_array()
+            .ok_or_else(|| format!("the closure answer's {col} ({}) is not an array", f.table))?;
         let mut rows = Vec::new();
-        for el in got.as_array()? {
+        for el in els {
             let mut row_keys = BTreeSet::new();
             txids_in_value(&el[2], &mut row_keys);
             if row_keys.is_disjoint(keys) {
@@ -1254,7 +1269,7 @@ pub fn closure_for(keys: &BTreeSet<String>, read: &BTreeSet<String>, row: &Value
         fams.push(Value::Array(rows));
     }
     let v = json!({"hw": hw, "keys": keys, "notCarried": not_carried, "f": fams});
-    (v.to_string().len() <= CLOSURE_MAX_BYTES).then_some(v)
+    Ok((v.to_string().len() <= CLOSURE_MAX_BYTES).then_some(v))
 }
 
 /// D2-ACTOR-F-FOLD-3: the pass statement's one answer row from the record (ONE call); `None` on a fault (the pass's
@@ -1276,7 +1291,7 @@ pub async fn read_closure(record: &impl SqlPort, facts: &Value) -> Option<Value>
     let keys = closure_keys(facts.get("payload")?);
     let (stmt, read) = pass_closure_statement(&keys, 1)?;
     let row = read_pass_closure(record, stmt).await.ok()?;
-    closure_for(&keys, &read, &row)
+    closure_for(&keys, &read, &row).ok().flatten()
 }
 
 /// D2-ACTOR-F-FOLD (item 4): one carried closure, parsed ([`closure_of`]'s answer): the high-water, the txids it
@@ -5109,7 +5124,10 @@ pub const APPLY_STAGES: [(&str, &str); 6] = [
     // FIX-983 (bsv-low #983): the outside's awaits (CHAINTRACKS, once per apply), apart from the judge's derivation.
     ("outsideMs", "outside"),
     // D2-ACTOR-F-FOLD-3 (the second delta lens's MEDIUM-1): the direct pass's ONE closure statement, before the call
-    // (a carried filing's answer alone carries it; outside `applyMs`, which it precedes).
+    // (a carried filing's answer alone carries it; outside `applyMs`, which it precedes). The fourth delta lens's
+    // NIT-2: every filing after a read carries its time, the reads that walled (at the wall's 2,000 ms), faulted or were
+    // declined included, so a D1 stall shows in this stage; their OUTCOME is in `direct.closureFaults` and
+    // `direct.closureDeclines`, read beside it.
     ("closureMs", "closure"),
 ];
 
