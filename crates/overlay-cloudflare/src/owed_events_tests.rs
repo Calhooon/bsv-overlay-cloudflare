@@ -334,7 +334,8 @@ mod pins {
         plant(&db, &format!("{HOP}.1"), 1, 0); // unconfirmed: the clear keeps it
         assert_eq!(
             db.conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(),
-            3
+            2,
+            "the memo and the latch; the evidence is demoted, never deleted (bsv-low #1027)"
         );
         assert_eq!(db.marks().len(), 0, "the shipped clear alone marks nothing");
         let db = Sqlite::migrated();
@@ -343,16 +344,28 @@ mod pins {
         plant(&db, &memo, 1, 1);
         plant(&db, &latch, 1, 1);
         plant(&db, &format!("{HOP}.1"), 1, 0);
+        // bsv-low #1027: the batch's framed writes, the memos' delete then the evidence's demotion; the marks run once
         let mut deleted = run_batch(
             &db,
             HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
-            HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL,
+            HOP_PROBE_MEMO_REORG_CLEAR_FRAMED[0],
             None,
         );
+        let demoted: Vec<String> = db
+            .conn
+            .prepare(HOP_PROBE_MEMO_REORG_CLEAR_FRAMED[1])
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         deleted.sort();
-        let mut want = vec![evidence.clone(), memo.clone(), latch.clone()];
+        let mut want = vec![memo.clone(), latch.clone()];
         want.sort();
         assert_eq!(deleted, want);
+        assert_eq!(demoted, vec![evidence.clone()]);
+        let mut deleted: Vec<String> = deleted.into_iter().chain(demoted).collect();
+        deleted.sort();
         assert_eq!(
             marks(&db),
             vec![
@@ -505,8 +518,8 @@ mod pins {
             ("proof", include_str!("../../low-app-layer/src/proof_post.rs"), "pub async fn proof_post(", "owed_events_publish::note(PROOF_POST_SOURCE,"),
             ("beef", include_str!("d1_storage.rs"), "async fn delete_output(", r#"note("beef", txid);"#),
             ("probe", include_str!("hop_probe_memos.rs"), "async fn marked_delete(", "crate::owed_events::note(PROBE_SOURCE,&d.outpoint);"),
-            ("probe", include_str!("hop_probe_memos.rs"), "pub async fn clear_on_reorg(", "HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL"),
-            ("probe", include_str!("hop_probe_memos.rs"), "pub async fn expire(", "HOP_PROBE_MEMO_EXPIRE_MARK_SQL,HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL"),
+            ("probe", include_str!("hop_probe_memos.rs"), "pub async fn clear_on_reorg(", "HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,&HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,"),
+            ("probe", include_str!("hop_probe_memos.rs"), "pub async fn expire(", "HOP_PROBE_MEMO_EXPIRE_MARK_SQL,&[HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL],"),
             ("word", app("runtime"), "pub async fn tick(", r#"note("word", &gone.txid);"#),
             ("bytes", app("routes"), "fn note_swept_bytes(", "note(crate::owed::SPENDER_BYTES_SOURCE,&g.txid);"),
             ("bytes", app("routes"), "pub async fn sweep_owed_spender_bytes(", "Ok(gone)=>note_swept_bytes(&gone),"),

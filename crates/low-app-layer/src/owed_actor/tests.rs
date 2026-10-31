@@ -7570,8 +7570,8 @@ async fn fold11_both_judge_on(
 }
 
 /// (fold11_a) NEW6-M1, THE LENS'S SCRATCH SHAPE: beta's #953 hop (index unspent, the evidence `<hop>:0` CONFIRMED),
-/// both judges `unbound` and the game warm; then the overlay's reorg clear (the shipped statement) deletes the
-/// confirmed evidence and marks nothing; then one ordinary event naming another txid. The warm actor's narrowed apply
+/// both judges `unbound` and the game warm; then the overlay's reorg clear (the statement as it shipped then) deletes
+/// the confirmed evidence and marks nothing; then one ordinary event naming another txid. The warm actor's narrowed apply
 /// stores the D1 judge's rows: `hop-stranded`, `index-unspent`, the press. RED on `26f7443c6`: the actor keeps
 /// `unbound`, spent, no press (`narrowed true, misses 0`).
 #[tokio::test]
@@ -7591,12 +7591,11 @@ async fn fold11_a_a_warm_apply_after_an_unmarked_reorg_clear_is_the_d1_judges() 
             .unwrap()
     };
     let marked = marks(&d1);
+    // the base's reorg clear as it ran on 26f7443c6: the confirmed evidence deleted by a statement that marks nothing
+    // (since bsv-low #1027 the shipped clear demotes the evidence instead; this pin keeps NEW6-M1's unmarked write)
     let cleared = d1
         .conn
-        .execute(
-            bsv_overlay_cloudflare::hop_probe_memos::HOP_PROBE_MEMO_REORG_CLEAR_SQL,
-            [],
-        )
+        .execute(crate::hops_view::PROBE_EVIDENCE_CLEAR_SQL, [&hop])
         .unwrap();
     assert_eq!(cleared, 1, "the confirmed evidence");
     assert_eq!(marks(&d1), marked, "the reorg clear marks nothing");
@@ -16987,10 +16986,10 @@ mod fix1010 {
 
     /// The overlay's batch (the marks, then the framed delete) as `hop_probe_memos::marked_delete` runs it; the keys
     /// the writer notes.
-    fn probe_batch(
+    pub(super) fn probe_batch(
         d1: &SqliteSql,
         mark: &str,
-        framed: &str,
+        framed: &[&str],
         bind: Option<i64>,
         expire: bool,
     ) -> Vec<String> {
@@ -17001,13 +17000,16 @@ mod fix1010 {
             .collect();
         tx.execute(mark, rusqlite::params_from_iter(p.iter()))
             .unwrap();
-        let keys: Vec<String> = tx
-            .prepare(framed)
-            .unwrap()
-            .query_map(rusqlite::params_from_iter(p.iter()), |r| r.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
+        let mut keys: Vec<String> = Vec::new();
+        for sql in framed {
+            keys.extend(
+                tx.prepare(sql)
+                    .unwrap()
+                    .query_map(rusqlite::params_from_iter(p.iter()), |r| r.get(0))
+                    .unwrap()
+                    .map(Result::unwrap),
+            );
+        }
         tx.commit().unwrap();
         keys.into_iter()
             .filter(|k| memos::noted_key(expire, k))
@@ -17018,7 +17020,8 @@ mod fix1010 {
     /// the game warm; the overlay's reorg clear deletes the evidence; then a CARRIED filing of the same game (a collected
     /// marker, the records door's statement), applied from its rows with no narrowed read. The clear's own event (its
     /// pair `probe`, the evidence's key) reached the actor first, so the carried apply judges the refreshed mirror and
-    /// both judges serve the press. RED on 006e6f24 (the shipped clear marks nothing, nothing is published: "the
+    /// both judges serve the same row (since bsv-low #1027 the clear DEMOTES the evidence, so that row is `unbound`,
+    /// spent and not confirmed, never the press it served when the clear deleted it). RED on 006e6f24 (the shipped clear marks nothing, nothing is published: "the
     /// publish sent nothing"); RED with the marks dropped from the batch, the same.
     #[tokio::test]
     async fn fix1010_a_a_reorg_clear_then_a_carried_filing_is_the_d1_judges() {
@@ -17029,11 +17032,15 @@ mod fix1010 {
         let keys = probe_batch(
             &d1,
             memos::HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
-            memos::HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL,
+            &memos::HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,
             None,
             false,
         );
-        assert_eq!(keys, vec![hop.clone()], "the confirmed evidence, noted");
+        assert_eq!(
+            keys,
+            vec![hop.clone()],
+            "the confirmed evidence, demoted and noted"
+        );
         let downgrade: i64 = d1
             .conn
             .query_row(
@@ -17045,10 +17052,17 @@ mod fix1010 {
         assert_eq!(downgrade, 1, "a confirmed word cleared is a downgrade");
         let pairs: Vec<(&str, String)> = keys.into_iter().map(|k| ("probe", k)).collect();
         reaches_the_actor(&d1, &local, &pairs).await;
+        // bsv-low #1027: the clear takes the evidence's confirmation, never the spend it records, so both judges hold
+        // the hop spent and not confirmed: no press (it was `hop-stranded`, claimable, over the courier-found spend)
         let d1_row = fold9_row(&d1, &hop).unwrap();
         assert_eq!(
-            (d1_row.0.as_str(), d1_row.1),
-            ("hop-stranded", Some(1)),
+            (
+                d1_row.0.as_str(),
+                d1_row.1,
+                d1_row.2["chainProbe"].clone(),
+                d1_row.2["spentConfirmed"].clone()
+            ),
+            ("unbound", None, json!("spent"), Value::Null),
             "{d1_row:?}"
         );
         // the carried filing after it (LOW-1's road: no narrowed read)
@@ -17091,8 +17105,12 @@ mod fix1010 {
     async fn fix1010_a0_without_the_clears_event_the_carried_apply_is_stale() {
         let d1 = d1_judge(&fold9_fixture()).await;
         let (local, _) = actor_judge(&d1, "owner").await;
+        // an UNMARKED delete of the evidence (the base's reorg clear, before FIX-1010's marks and #1027's demotion)
         d1.conn
-            .execute(memos::HOP_PROBE_MEMO_REORG_CLEAR_SQL, [])
+            .execute(
+                crate::hops_view::PROBE_EVIDENCE_CLEAR_SQL,
+                [format!("{FOLD9_HOP}:0")],
+            )
             .unwrap();
         let marker = h("a1", 31);
         d1.conn
@@ -17139,7 +17157,7 @@ mod fix1010 {
         let keys = probe_batch(
             &d1,
             memos::HOP_PROBE_MEMO_EXPIRE_MARK_SQL,
-            memos::HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL,
+            &[memos::HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL],
             Some(NOW_MS as i64),
             true,
         );
@@ -17635,5 +17653,150 @@ mod fix959 {
                 100.0 * beef as f64 / total.max(1) as f64
             );
         }
+    }
+}
+
+// ---- FIX-1027 (bsv-low #1027, window D's fleet compare): a reorg keeps the belt's find in the record ----
+
+mod fix1027 {
+    use super::fix1010::{direct, fresh_d1, probe_batch, published};
+    use super::*;
+    use bsv_overlay_cloudflare::hop_probe_memos as memos;
+
+    fn rows(db: &SqliteSql) -> Vec<Value> {
+        db.conn.prepare("SELECT json_object('outpoint',outpoint,'family',family,'gameId',gameId,'sats',sats,'opponentIdentity',opponentIdentity,'atHeight',atHeight,'reason',reason,'facts',facts,'claimable',claimable) FROM owed_rows WHERE identity='owner' ORDER BY outpoint").unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap().map(|s| serde_json::from_str::<Value>(&s.unwrap()).unwrap()).collect()
+    }
+
+    /// The stored row as the belt's tick reads its candidate (`owed_belt::CANDIDATES_SQL`).
+    fn candidate(db: &SqliteSql, outpoint: &str) -> crate::owed_belt::Candidate {
+        let v = db
+            .conn
+            .query_row(crate::owed_belt::CANDIDATES_SQL, ["owner", outpoint], |r| {
+                Ok(json!({
+                    "identity": r.get::<_, String>(0)?,
+                    "outpoint": r.get::<_, String>(1)?,
+                    "gameId": r.get::<_, String>(2)?,
+                    "family": r.get::<_, String>(3)?,
+                    "facts": r.get::<_, String>(4)?,
+                    "reason": r.get::<_, Option<String>>(5)?,
+                    "probeTip": r.get::<_, Option<i64>>(6)?,
+                    "beltDueAtMs": r.get::<_, Option<i64>>(7)?,
+                    "judgedAtMs": r.get::<_, Option<i64>>(8)?,
+                    "claimable": r.get::<_, Option<i64>>(9)?,
+                }))
+            })
+            .unwrap();
+        crate::owed_belt::candidate_of(&v)
+    }
+
+    /// (fix1027_a) THE FINDING (bsv-low #1027, record 1703): beta's shape 1, a stranded hop the index holds unspent,
+    /// the belt's find of its spend by a stranger durable in the record (the evidence `<hop>:0`, CONFIRMED, and the
+    /// spender's bytes), both judges `unbound` and the actor warm. Then a reorg pass's clear, the overlay's batch as
+    /// `hop_probe_memos::clear_on_reorg` runs it (beta's ran at 2026-10-31 22:16:17Z), its events applied by their
+    /// direct calls, and the D1 judge FRESH. Both fresh sides hold the spend (`unbound`, `chainProbe: "spent"`, the
+    /// stranger named, `spentConfirmed` null, claimable null), their rows' digests equal with no diff and no tip lag,
+    /// and the belt asks the OUTPOINT for the confirmation the reorg took. RED on 91eb883b's rule (the clear deleted the
+    /// evidence): the D1 judge `hop-stranded`, `index-unspent`, `sweep-hop`, `sign-here`, claimable 1, the press over a
+    /// spend the chain holds.
+    #[tokio::test]
+    async fn fix1027_a_after_a_reorg_both_fresh_judges_hold_the_belts_find() {
+        let d1 = d1_judge(&fold9_fixture()).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        let hop = format!("{FOLD9_HOP}:0");
+        let (_, spender) = fold9_spend(FOLD9_HOP);
+        assert_eq!(fold9_row(&d1, &hop).unwrap().0, "unbound", "the premise");
+        let keys = probe_batch(
+            &d1,
+            memos::HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
+            &memos::HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,
+            None,
+            false,
+        );
+        assert_eq!(keys, vec![hop.clone()], "the evidence's pair, noted");
+        for k in &keys {
+            let ev = published(&d1, "probe", k)
+                .await
+                .expect("the clear marked the hop's seat");
+            direct(&d1, &local, &ev, false).await;
+        }
+        fresh_d1(&d1).await;
+        let d1_row = fold9_row(&d1, &hop).unwrap();
+        assert_eq!(
+            (
+                d1_row.0.as_str(),
+                d1_row.1,
+                d1_row.2["chainProbe"].clone(),
+                d1_row.2["chainSpender"].clone(),
+                d1_row.2["spentConfirmed"].clone(),
+                d1_row.2["claim"].clone(),
+            ),
+            (
+                "unbound",
+                None,
+                json!("spent"),
+                json!(spender),
+                Value::Null,
+                Value::Null
+            ),
+            "the fresh D1 judgement holds the courier-found spend: {d1_row:?}"
+        );
+        let actor_row = fold9_row(&local, &hop).unwrap();
+        assert_eq!(fold9_judgement(&actor_row), fold9_judgement(&d1_row));
+        let (a, b) = (rows(&d1), rows(&local));
+        assert_eq!(rows_digest(&a), rows_digest(&b), "the digests equal");
+        assert!(diff_rows(&a, &b).is_empty());
+        assert!(
+            tip_derived_rows(&a, &b).is_empty(),
+            "no tip lag excuses anything"
+        );
+        for db in [&d1, &local] {
+            let c = candidate(db, &hop);
+            assert_ne!(c.claimable, Some(true), "never a press: {c:?}");
+            assert!(c.due_at_ms.is_some(), "dated for the belt: {c:?}");
+            assert_eq!(
+                crate::owed_belt::ask_of(&c),
+                Some(crate::owed_belt::Ask::Outpoint {
+                    txid: FOLD9_HOP.into(),
+                    vout: 0
+                }),
+                "the belt asks the outpoint for the confirmation the reorg took"
+            );
+        }
+    }
+
+    /// (fix1027_c) THE D1 JUDGE AND COURIER EVIDENCE: over a hop the index holds unspent, evidence of a spend in the
+    /// record (confirmed, the live-race word `spentConfirmed` 0, or unknown after a reorg) is never a press; the same
+    /// hop whose evidence a belt look retired (`hops_view::PROBE_EVIDENCE_CLEAR_SQL`, the look that found it unspent)
+    /// is the owner's sweep again. Green on 91eb883b (the judge's rule was never the defect; this holds it).
+    #[tokio::test]
+    async fn fix1027_c_the_d1_judge_offers_no_press_over_courier_evidence_and_does_without_it() {
+        let hop = format!("{FOLD9_HOP}:0");
+        for confirmed in [Some(1), Some(0), None] {
+            let d1 = d1_judge(&fold9_fixture()).await;
+            d1.conn
+                .execute(
+                    "UPDATE hop_chain_probes SET spentConfirmed=?2 WHERE outpoint=?1",
+                    rusqlite::params![hop, confirmed],
+                )
+                .unwrap();
+            fresh_d1(&d1).await;
+            let row = fold9_row(&d1, &hop).unwrap();
+            assert_eq!(
+                (row.0.as_str(), row.1, row.2["chainProbe"].clone()),
+                ("unbound", None, json!("spent")),
+                "spentConfirmed {confirmed:?}: {row:?}"
+            );
+        }
+        let d1 = d1_judge(&fold9_fixture()).await;
+        d1.conn
+            .execute(crate::hops_view::PROBE_EVIDENCE_CLEAR_SQL, [&hop])
+            .unwrap();
+        fresh_d1(&d1).await;
+        let row = fold9_row(&d1, &hop).unwrap();
+        assert_eq!(
+            (row.0.as_str(), row.1, row.2["chainProbe"].clone()),
+            ("hop-stranded", Some(1), json!("index-unspent")),
+            "{row:?}"
+        );
     }
 }
