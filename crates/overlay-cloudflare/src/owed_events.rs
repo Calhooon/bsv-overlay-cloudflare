@@ -517,11 +517,12 @@ pub const CARRIERS: [&str; 8] = [
     "refusal",
 ];
 
-/// D2-ACTOR-F-FOLD (item 4): the statement a note's read runs: the Worker's own (`crate::owed_closure::statement`:
-/// the app layer adds the carried CLOSURE to each carrier's statement, the overlay adds nothing), else [`read_sql`]'s.
-/// Its placeholders are [`read_sql`]'s (the closure names none), so [`read_args`] holds for both.
+/// The statement a note's read runs ([`read_sql`]'s). D2-ACTOR-F-FOLD-2 (the delta lens's MEDIUM-1 and MEDIUM-2): no
+/// CLOSURE rides the publish any more (the fold read it in each carrier's statement at the door: a BEEF past D1's
+/// value bound faulted the whole publish batch, and the door's statement did about 50 times the work). The app layer's
+/// direct pass reads it after the writer's answer, in its own batch (`owed_actor::read_closure`).
 pub fn statement_of(source: &str) -> Option<&'static str> {
-    crate::owed_closure::statement(source).or_else(|| read_sql(source))
+    read_sql(source)
 }
 
 /// PURE: does this note read its row at publish? (A held fact, an identity route and an unknown source do not.)
@@ -529,16 +530,15 @@ pub fn reads_row(n: &Noted) -> bool {
     n.held.is_none() && read_sql(&n.source).is_some()
 }
 
-/// D2-ACTOR-F (bsv-low #959): the most bytes one event's carried rows may take (its `payload` and, since
-/// D2-ACTOR-F-FOLD, its `closure`, serialized together). The event rides a queue message (128 KB) and the overlay's
-/// `/internal/owed-direct` body: past this the closure is dropped first (the actor reads the new keys from D1, one
-/// call), then the payload (the actor's narrowed D1 read, as before); a hop sweep's raw or a word's proof is a few KB,
-/// a page never is.
+/// D2-ACTOR-F (bsv-low #959): the most bytes one event's carried rows (its `payload`) may take. The event rides a
+/// queue message (128 KB) and the overlay's `/internal/owed-direct` body: past this the payload is dropped (the
+/// actor's narrowed D1 read, as before); a hop sweep's raw or a word's proof is a few KB, a page never is.
 ///
 /// The lens's NIT-4, the bodies this bounds: one coalesced direct `/apply` body carries the merged rows of every
-/// event of its identity in the pass (at most `DIRECT_EVENTS_MAX`, 64, events: 64 x 32 KB, about 2 MB), and the
-/// overlay's `POST /internal/owed-direct` body at most `OWED_DIRECT_BODY_MAX` (64) events, each with its facts: about
-/// 2 MB as well. Both are inside the platform's request body limit (100 MB on the paid plan) and the 128 MB isolate;
+/// event of its identity in the pass (at most `DIRECT_EVENTS_MAX`, 64, events), each with its payload and, since
+/// D2-ACTOR-F-FOLD-2, the closure the direct pass read for it (`owed_actor::CLOSURE_MAX_BYTES`, 32 KB, never on the
+/// queue): 64 x 64 KB, about 4 MB; the overlay's `POST /internal/owed-direct` body at most `OWED_DIRECT_BODY_MAX` (64)
+/// events, each with its facts and no closure: about 2 MB. Both are inside the platform's request body limit (100 MB on the paid plan) and the 128 MB isolate;
 /// neither is a queue message (the queue carries one event a message, under 128 KB).
 pub const PAYLOAD_MAX_BYTES: usize = 32_768;
 
@@ -567,12 +567,6 @@ pub fn carry_payload(row: &Value, facts: &mut Value) {
     let payload_bytes = payload.to_string().len();
     if !named || !items || payload_bytes > PAYLOAD_MAX_BYTES {
         return;
-    }
-    // D2-ACTOR-F-FOLD (item 4): the closure, where the statement read one and it fits beside the payload
-    if let Some(closure) = parse(&row["closure"]).filter(|c| c.is_object()) {
-        if payload_bytes + closure.to_string().len() <= PAYLOAD_MAX_BYTES {
-            facts["closure"] = closure;
-        }
     }
     facts["subjects"] = subjects;
     facts["payload"] = payload;

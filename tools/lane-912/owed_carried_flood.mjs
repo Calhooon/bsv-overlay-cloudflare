@@ -8,14 +8,17 @@
 //       bootstrapped, which holds it and bootstraps by its own alarms, then applies the held event (a cold full read:
 //       the game is then WARM and closed);
 //   (2) the flood: the 32 seats' `held` filings at once, each a NEW filing (a marker txid and a payout txid no row of
-//       the record named before): the door writes and publishes, the publish's carrier statement carries the row and
-//       its CLOSURE (the record's rows of every mirrored family for the txids the row names, at one high-water), and
-//       the direct call after the answer hands both to the actor;
+//       the record named before; seat 0's payout holds a stored BEEF of about 20 KB, the rest none): the door writes
+//       and publishes (the carrier statement carries the row, never a closure: D2-ACTOR-F-FOLD-2), answers, and its
+//       direct call after the answer reads the CLOSURE in its own batch (the record's rows of every mirrored family
+//       for the txids the row names, at one high-water, a BEEF as its DECODED facts) and hands both to the actor;
 //   (3) each actor's apply of its held filing answers `carried: true`, `recordCalls: 0`, `readMs: 0` (no D1 call:
-//       the payout's keys came with the closure, `closureRounds` at least 1), and its stages; the cell prints the apply
-//       (read + wait + judge + write + outside) and first visibility figures it reads, and asserts `/health.owedActor`
-//       serves the stages (`stages.{read,wait,judge,write}MsP95`, `classes.direct`: the fleet's bars, flushed at most
-//       once a minute an isolate, so their figures are printed as last flushed, not asserted).
+//       the payout's keys came with the closure, `closureRounds` at least 1), and its stages; the cell prints the
+//       door's `enqueue;dur` (its `Server-Timing`, the publish inside `publish_before_answer`) and answer times, the
+//       apply and first visibility figures each answer gave;
+//   (4) (the delta lens's LOW-2) it waits out the bars' minute, files one more filing (its direct pass flushes the
+//       isolate's bars and the health snapshot), and asserts `/health.owedActor` SERVES non-null p95s
+//       (`stages.{read,wait,judge,write}MsP95`, `classes.direct` with samples), printed beside the answers' figures.
 // RED on 3223be64 (no closure carried): every held filing's apply makes one record call ("recordCalls 1").
 // Reads the tier's exported fleet fixture (RECORD_DOOR_FIXTURE, as the #911 cell does). Every host is sealed.
 import assert from 'node:assert/strict'
@@ -83,10 +86,14 @@ try {
   const call = (path, init) => mf.dispatchFetch('http://app' + path, init)
   await call('/health') // cold schema work belongs to boot
   const file = async s => {
+    const t = Date.now()
     const r = await call(`/record?kind=${s.kind}&identity=${s.identity}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(s.body) })
     const body = await r.json()
     assert.equal(r.status, 200, JSON.stringify(body))
     assert.deepEqual(body, s.answer, 'the door’s answer body is unchanged')
+    const timing = r.headers.get('server-timing') ?? ''
+    const enqueue = Number((timing.match(/enqueue;dur=(\d+)/) ?? [])[1])
+    return { answerMs: Date.now() - t, enqueue, timing }
   }
   const seats = fixture.carriedSeats
   // (1) the first filings, one after another (each a cold apply, its actor bootstrapping by its own alarms)
@@ -100,9 +107,13 @@ try {
   const before = new Map()
   for (const s of seats) before.set(s.identity, (await answers(s.identity)).length)
   // (2) the flood: the 32 held filings at once
+  assert(seats.some(s => s.payBeefBytes > 15000), 'one seat’s payout holds a realistic stored BEEF')
   const t0 = Date.now()
-  await Promise.all(seats.map(s => file(s.held)))
+  const doors = await Promise.all(seats.map(s => file(s.held)))
   const answeredMs = Date.now() - t0
+  const enq = doors.map(d => d.enqueue)
+  assert(enq.every(Number.isFinite), `every door answer carries enqueue;dur: ${JSON.stringify(doors.map(d => d.timing))}`)
+  console.log(`f_cell: the door under the flood: enqueue;dur ms ${fig(enq)}; answer ms ${fig(doors.map(d => d.answerMs))}`)
   // (3) each actor's apply of its held filing
   const got = await poll('the 32 held filings applied', async () => {
     const out = await Promise.all(seats.map(async s => (await answers(s.identity)).slice(before.get(s.identity)).find(a => a.applied && (a.appliedGames ?? []).includes(s.game))))
@@ -125,17 +136,23 @@ try {
     const rows = await (await actor(s.identity).fetch('http://owed-actor/pin/applied?kind=read-key')).json()
     assert(rows.rows.some(r => r.game === s.pay), `${s.identity}: the payout read at the closure's high-water`)
   }
-  // the served stages: /health.owedActor serves each stage's p95 (`stages`, `classes.direct`); its figures are the
-  // fleet's bars, which an isolate flushes at most once a minute, so the cell asserts what is SERVED and reads the
-  // figures above from each apply's own answer
-  const health = await (await call('/health')).json()
-  const st = health.owedActor?.stages ?? {}
-  for (const k of ['readMsP95', 'waitMsP95', 'judgeMsP95', 'writeMsP95']) {
-    assert(k in st, `/health.owedActor.stages serves ${k}: ${JSON.stringify(st)}`)
-    assert(k in (health.owedActor.classes?.direct ?? {}), `/health.owedActor.classes.direct serves ${k}`)
-  }
-  console.log(`f_cell: served /health.owedActor.stages ${JSON.stringify(st)}; classes.direct ${JSON.stringify(health.owedActor.classes.direct)} (the fleet's bars as last flushed)`)
-  console.log(`PASS f_cell: 32 new filings for 32 identities applied from their carried rows and closures with no D1 read (record calls 0, readMs 0); apply ${fig(apply)} ms, first visibility ${fig(visible)} ms`)
+  // (4) the served stages (the delta lens's LOW-2): the fleet's bars are flushed at most once a minute an isolate and
+  // the health snapshot at most once a minute fleet-wide, so the cell waits the minute out, files one more filing (its
+  // direct pass flushes the isolate's pending samples, the flood's among them, and the snapshot in their batch), and
+  // asserts the SERVED figures are numbers
+  const extra = fixture.scenarios.find(x => x.kind === 'collected' || x.kind === 'potparty')
+  assert(extra, 'the fixture holds one more /record scenario')
+  await new Promise(r => setTimeout(r, 62000))
+  await file(extra)
+  const health = await poll('/health.owedActor serves the flood’s stages', async () => {
+    const h = await (await call('/health')).json()
+    const st = h.owedActor?.stages ?? {}
+    const d = h.owedActor?.classes?.direct ?? {}
+    return ['readMsP95', 'waitMsP95', 'judgeMsP95', 'writeMsP95'].every(k => typeof st[k] === 'number' && typeof d[k] === 'number') && d.applySamples > 0 && h
+  }, 20000)
+  const st = health.owedActor.stages
+  console.log(`f_cell: SERVED /health.owedActor.stages ${JSON.stringify(st)}; classes.direct ${JSON.stringify(health.owedActor.classes.direct)}; record ${JSON.stringify({ enqueueMsP50: health.record?.enqueueMsP50, enqueueMsP95: health.record?.enqueueMsP95 })}`)
+  console.log(`PASS f_cell: 32 new filings for 32 identities (one payout a ~20 KB stored BEEF) applied from their carried rows and closures with no D1 read (record calls 0, readMs 0); door enqueue ${fig(enq)} ms; apply ${fig(apply)} ms, first visibility ${fig(visible)} ms; served stages read p95 ${st.readMsP95}, judge p95 ${st.judgeMsP95}`)
 } finally {
   if (mf) await Promise.race([mf.dispose(), new Promise(r => setTimeout(r, 15000))])
   rmSync(scratch, { recursive: true, force: true })
