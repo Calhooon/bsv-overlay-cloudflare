@@ -1144,18 +1144,14 @@ async fn fix1017_c_a_sustained_burst_sends_its_set_within_every_hold_bar() {
         .await;
 }
 
-/// (fix1017_d) THE SERVED FIGURE. The gate writes its hold over the trailing minute to one row of the belt's ledger
-/// at most every 10 s and only with a sample; `/health` reads it as a primary-key row of the consumer statement it
-/// already runs (no statement more) and serves `push.gate` {holdMsP50, holdMsP95, holdMsMax, samples, barMs,
-/// overBar, ageMs}; `null` before the gate's first write. New API: does not compile on main.
+/// (fix1017_d) THE SERVED FIGURE. The gate answers its hold over the trailing minute from its own coalescer;
+/// `/health` serves `push.gate` {holdMsP50, holdMsP95, holdMsMax, samples, barMs, overBar, ageMs} from it, asking the
+/// gate at most every 10 s an isolate, a fault serving the last answer with its age, `null` with none. New API: does
+/// not compile on main.
 #[test]
 fn fix1017_d_the_gates_hold_is_served_on_health() {
     let cell = RefCell::new(Coalescer::default());
     let t = BASE_MS;
-    assert!(
-        gate_hold_stmt_due(&cell, t).is_none(),
-        "no sample, no write"
-    );
     for (i, h) in [0u64, 100, 2_000, 4_000, 6_000].into_iter().enumerate() {
         cell.borrow_mut().note_send(t + i as u64, Some(h));
     }
@@ -1164,18 +1160,9 @@ fn fix1017_d_the_gates_hold_is_served_on_health() {
         (f.samples, f.hold_ms_p50, f.hold_ms_p95, f.hold_ms_max),
         (5, 2_000, 6_000, 6_000)
     );
-    let stmt = gate_hold_stmt_due(&cell, t + 10).expect("a write is due");
-    assert_eq!(stmt.sql, GATE_HOLD_WRITE_SQL);
-    assert!(
-        gate_hold_stmt_due(&cell, t + 5_000).is_none(),
-        "at most every 10 s"
-    );
-    assert!(gate_hold_stmt_due(&cell, t + 10 + GATE_HOLD_WRITE_EVERY_MS).is_some());
-    // Past the minute the samples age out.
-    assert_eq!(cell.borrow_mut().hold_figures(t + 70_000).samples, 0);
     // The view.
     assert_eq!(gate_hold_view(None, t), Value::Null);
-    let v = gate_hold_view(Some(&gate_hold_cursor(&f, t)), t + 3_000);
+    let v = gate_hold_view(Some(&gate_hold_answer(&cell, t + 10)), t + 3_010);
     assert_eq!(v["holdMsP95"], 6_000);
     assert_eq!(v["holdMsP50"], 2_000);
     assert_eq!(v["holdMsMax"], 6_000);
@@ -1184,17 +1171,101 @@ fn fix1017_d_the_gates_hold_is_served_on_health() {
     assert_eq!(v["ageMs"], 3_000);
     let quiet = gate_hold_view(Some(&gate_hold_cursor(&HoldFigures::default(), t)), t);
     assert_eq!(quiet["overBar"], Value::Null, "no sample is no verdict");
-    // A REAL-bound stamp reads (D1 binds a JS number).
-    let real = r#"{"asOfMs":1790000000000.0,"samples":2,"holdMsP50":10.0,"holdMsP95":20.0,"holdMsMax":20.0}"#;
-    assert_eq!(gate_hold_view(Some(real), t)["holdMsP95"], 20);
-    // The wiring: the gate writes after its pushes; `/health` reads the row in its existing statement.
-    assert!(crate::owed_events::HEALTH_CONSUMER_SQL.contains(&format!("'{GATE_HOLD_NAME}'")));
+    // Past the minute the samples age out.
+    assert_eq!(cell.borrow_mut().hold_figures(t + 70_000).samples, 0);
+}
+
+/// A gate the test answers: hosted or not, its answers in order (`None` a fault), each ask counted.
+struct GateFake {
+    hosted: Option<String>,
+    answers: RefCell<VecDeque<Option<String>>>,
+    asks: RefCell<u32>,
+}
+
+impl HoldSource for GateFake {
+    fn hosted(&self, _now: u64) -> Option<String> {
+        self.hosted.clone()
+    }
+    async fn ask(&self) -> Option<String> {
+        *self.asks.borrow_mut() += 1;
+        self.answers.borrow_mut().pop_front().flatten()
+    }
+}
+
+/// (fix1017_fold) THE HOLD COSTS `/health` NO D1 READ (FIX-1017-FOLD; the land tier refused PR 253 at
+/// `health-dirty-snapshot`, 9 reads against its ceiling of 8, the gate's snapshot a fourth row of the consumer
+/// statement). The figures are the gate's own (an object fetch, memoised 10 s an isolate, a fault keeping the last
+/// answer); the consumer statement names no gate row, `/health` reads the gate through `gate_hold_health`, and the
+/// gate writes nothing to D1. The tier's `health-dirty-snapshot` row (8 reads, 5 statements) is this pin on D1.
+#[tokio::test]
+async fn fix1017_fold_the_gates_hold_is_read_from_the_gate_never_d1() {
+    let t = BASE_MS;
+    let cell = RefCell::new(Coalescer::default());
+    cell.borrow_mut().note_send(t, Some(3_000));
+    let answer = gate_hold_answer(&cell, t);
+    // Hosted: the isolate's own figures, no ask.
+    let hosted = GateFake {
+        hosted: Some(answer.clone()),
+        answers: RefCell::default(),
+        asks: RefCell::new(0),
+    };
+    let memo = RefCell::new(HoldMemo::default());
+    assert_eq!(
+        gate_hold_served(&memo, &hosted, t).await["holdMsMax"],
+        3_000
+    );
+    assert_eq!(*hosted.asks.borrow(), 0);
+    // Not hosted: one ask, then the memo for 10 s, then an ask whose fault keeps the last answer and its age.
+    let gate = GateFake {
+        hosted: None,
+        answers: RefCell::new(VecDeque::from([Some(answer.clone()), None, Some(answer)])),
+        asks: RefCell::new(0),
+    };
+    let memo = RefCell::new(HoldMemo::default());
+    assert_eq!(gate_hold_served(&memo, &gate, t).await["holdMsP95"], 3_000);
+    assert_eq!(
+        gate_hold_served(&memo, &gate, t + GATE_HOLD_MEMO_MS - 1).await["ageMs"],
+        GATE_HOLD_MEMO_MS - 1
+    );
+    assert_eq!(*gate.asks.borrow(), 1, "memoised for 10 s");
+    let stale = gate_hold_served(&memo, &gate, t + GATE_HOLD_MEMO_MS).await;
+    assert_eq!(
+        (stale["holdMsP95"].clone(), stale["ageMs"].clone()),
+        (json!(3_000), json!(GATE_HOLD_MEMO_MS))
+    );
+    assert_eq!(*gate.asks.borrow(), 2);
+    gate_hold_served(&memo, &gate, t + 2 * GATE_HOLD_MEMO_MS).await;
+    assert_eq!(*gate.asks.borrow(), 3);
+    // A gate that never answered: null.
+    let dead = GateFake {
+        hosted: None,
+        answers: RefCell::new(VecDeque::from([None])),
+        asks: RefCell::new(0),
+    };
+    assert_eq!(
+        gate_hold_served(&RefCell::new(HoldMemo::default()), &dead, t).await,
+        Value::Null
+    );
+    // The wiring: no D1 on either side.
+    assert!(
+        !crate::owed_events::HEALTH_CONSUMER_SQL.contains("push-gate"),
+        "no gate row in /health's statement"
+    );
     let squash = |s: &str| s.split_whitespace().collect::<String>();
-    let gate = squash(include_str!("push_coalesce.rs"));
-    let serve = &gate[gate.find("pubasyncfnserve_gate(").unwrap()..];
+    let gate_src = squash(include_str!("push_coalesce.rs"));
+    let serve = &gate_src[gate_src.find("pubasyncfnserve_gate(").unwrap()..];
     let serve = &serve[..serve.find("pubasyncfnpush_to_seat(").unwrap()];
-    assert!(serve.contains("gate_hold_stmt_due(cell,port.now_ms())"));
+    assert!(
+        !serve.contains("D1Sql") && !serve.contains("run_batch"),
+        "the gate writes nothing to D1"
+    );
+    let hold = &gate_src[gate_src.find("pubconstPUSH_GATE_HOLD_PATH").unwrap()..];
+    let hold = &hold[..hold.find("pubasyncfnserve_gate(").unwrap()];
+    assert!(!hold.contains("D1Sql") && !hold.contains("OVERLAY_DB") && !hold.contains("run_batch"));
     let routes = squash(include_str!("routes.rs"));
-    assert!(routes.contains("owed_events::health_actor_fleet_push(&sql,&dirty)"));
-    assert!(routes.contains("body[\"push\"][\"gate\"]=push_gate;"));
+    assert!(routes.contains(
+        "body[\"push\"][\"gate\"]=crate::push_coalesce::gate_hold_health(&ctx.env).await;"
+    ));
+    let board = squash(include_str!("board_view.rs"));
+    assert!(board.contains("ifreq.path()==crate::push_coalesce::PUSH_GATE_HOLD_PATH{returncrate::push_coalesce::serve_gate_hold();"));
 }

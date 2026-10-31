@@ -128,6 +128,10 @@ impl BoardView {
     async fn serve_fetch(&self, mut req: Request) -> Result<Response> {
         // bsv-low #989: the fleet's push gate (`push_coalesce::PUSH_GATE_ACTOR`): every first-party push to a seat is
         // coalesced here, under one seat bucket a seat and one sender bucket.
+        // bsv-low #1017 (FIX-1017-FOLD): the gate's per-seat hold, from its own coalescer (no D1).
+        if req.path() == crate::push_coalesce::PUSH_GATE_HOLD_PATH {
+            return crate::push_coalesce::serve_gate_hold();
+        }
         if req.path() == crate::push_coalesce::PUSH_GATE_PATH {
             let text = req.text().await?;
             return crate::push_coalesce::serve_gate(&self.env, &text).await;
