@@ -14642,9 +14642,9 @@ mod d2_actor_f {
 
     /// (f_b) A CARRIED ROW NAMING A KEY THE MIRROR NEVER READ IS ONE READ (the cold miss, never two): a collected
     /// filing for game 9 names its marker's txid and a payout txid the mirror holds nothing of; the carried apply reads
-    /// those keys alone in one record call and stores the cold apply's rows. Since D2-ACTOR-F-FOLD (item 4) this is
-    /// an event WITHOUT its carried closure (the overlay's publish, or a closure past the payload's bound): with it,
-    /// `d2_actor_f_fold::fold_l2_a_new_filing_reads_no_d1`.
+    /// those keys alone in one record call and stores the cold apply's rows. This is the event as the publish sends it
+    /// (since D2-ACTOR-F-FOLD-2 no closure rides the publish; the direct pass reads it after the answer): with the
+    /// direct pass's closure, `d2_actor_f_fold::fold_l2_a_new_filing_reads_no_d1`.
     #[tokio::test]
     async fn d2_actor_f_b_a_new_key_is_one_read() {
         let (record, local, games) = e_warm_seat(40).await;
@@ -14658,8 +14658,11 @@ mod d2_actor_f {
             )
             .unwrap();
         mark(&record, &games[9], "collected", &marker);
-        let mut ev = published(&record, "collected", &marker).await;
-        assert!(ev.facts.as_object_mut().unwrap().remove("closure").is_some());
+        let ev = published(&record, "collected", &marker).await;
+        assert!(
+            ev.facts.get("closure").is_none(),
+            "D2-ACTOR-F-FOLD-2: no closure rides the publish (the direct pass reads it)"
+        );
         let (report, calls) = applied(&record, &local, &games[9..10], &ev, true).await;
         assert!(report.carried);
         assert_eq!(calls, 1, "the new keys are one record read");
@@ -14939,7 +14942,16 @@ mod d2_actor_f_fold {
         )
         .await;
         assert!(out.fault.is_none(), "{:?}", out.fault);
-        out.sent.into_iter().next().expect("the note was sent")
+        let mut ev = out.sent.into_iter().next().expect("the note was sent");
+        assert!(
+            ev.facts.get("closure").is_none(),
+            "D2-ACTOR-F-FOLD-2: no closure rides the publish"
+        );
+        // the direct pass's closure read, after the writer's answer, in its own batch (`DirectPort::closure`)
+        if let Some(c) = read_closure(record, &ev.facts).await {
+            ev.facts["closure"] = c;
+        }
+        ev
     }
 
     fn mark(record: &SqliteSql, game: &str, source: &str, key: &str) {
@@ -15435,5 +15447,447 @@ mod d2_actor_f_fold {
             .unwrap();
         assert!(again.carried && !again.was_open);
         assert_eq!(record.batches.get() - b0, 0);
+    }
+
+    /// D1's value bound (`SQLITE_LIMIT_LENGTH` 2,000,000 bytes) on a pin's record: a string or BLOB a statement
+    /// builds past it faults the statement (`SQLITE_TOOBIG`), as D1 faults it.
+    #[allow(unsafe_code)]
+    fn d1_length_limit(record: &SqliteSql) {
+        // SAFETY: the handle is the live connection's, used on this thread only, for one documented limit call.
+        unsafe {
+            rusqlite::ffi::sqlite3_limit(
+                record.conn.handle(),
+                rusqlite::ffi::SQLITE_LIMIT_LENGTH,
+                2_000_000,
+            );
+        }
+    }
+
+    /// (fold2_medium1) THE DELTA LENS'S MEDIUM-1: A LARGE STORED BEEF POISONS NO PUBLISH, AND THE CLOSURE DECLINES IT.
+    /// Under D1's 2,000,000 byte value bound: a stranger's 1.1 MB BEEF stored in `transactions` (the ungated
+    /// `/submit`'s shape) and a `held` marker naming it as its payout, published in ONE publish beside an honest filing:
+    /// both are sent, no fault (the publish carries no closure). The direct pass's closure read (its own batch) does
+    /// not fault either: its BEEF test reads the length, never the hex, and names the payout NOT CARRIED, so a miss
+    /// naming it takes no closure (the record's read), while the honest filing's closure is carried and its apply
+    /// reads no D1. (The actor's own record read of a BEEF past 1 MB is past D1's bound on every fallback, its
+    /// `hex(beef)`: the stranger's own game, pre-existing, stated in the PR as a follow-up.) RED on
+    /// 006e6f24 (the closure in the carrier's statement): the publish faults, `string or blob too big`, both notes
+    /// unsent.
+    #[tokio::test]
+    async fn fold2_medium1_a_large_beef_poisons_no_publish_and_the_closure_declines_it() {
+        let (record, local, games) = e_warm_seat(20).await;
+        d1_length_limit(&record);
+        let (m_big, pay_big) = (h("a1", 9), h("a2", 9));
+        let (m_ok, pay_ok) = (h("a1", 10), h("a2", 10));
+        record
+            .conn
+            .execute(
+                "INSERT INTO transactions(txid,beef,has_proof,created_at) VALUES (?1,zeroblob(1100000),0,1)",
+                [&pay_big],
+            )
+            .unwrap();
+        for (g, m, p) in [(9, &m_big, &pay_big), (10, &m_ok, &pay_ok)] {
+            record
+                .conn
+                .execute(
+                    crate::record_post::COLLECTED_FILE_SQL,
+                    rusqlite::params!["owner", games[g], m, 0, "00", (NOW_MS / 1000) as i64, p],
+                )
+                .unwrap();
+            mark(&record, &games[g], "collected", m);
+        }
+        let port = crate::owed_events::SqlPublish {
+            db: &record,
+            send: |_b: Vec<String>| async { Ok::<(), String>(()) },
+        };
+        let notes = [&m_big, &m_ok]
+            .iter()
+            .map(|m| publish::Noted {
+                source: "collected".into(),
+                key: (*m).clone(),
+                held: None,
+            })
+            .collect();
+        let out = publish::publish_with(&port, notes).await;
+        assert!(out.fault.is_none(), "the publish faulted: {:?}", out.fault);
+        assert_eq!(
+            out.sent.len(),
+            2,
+            "both pairs are published: {:?}",
+            out.unsent
+        );
+        let ev = out
+            .sent
+            .into_iter()
+            .find(|e| e.source_key == m_big)
+            .expect("the stranger's pair");
+        assert!(ev.facts.get("closure").is_none());
+        let closure = read_closure(&record, &ev.facts)
+            .await
+            .expect("the closure's own read does not fault under D1's bound");
+        let not: Vec<&str> = closure["notCarried"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            not,
+            vec![pay_big.as_str()],
+            "the large BEEF's txid is not carried"
+        );
+        assert!(
+            closure.to_string().len() <= CLOSURE_MAX_BYTES
+                && !closure.to_string().contains(
+                    "00000000000000000000000000000000000000000000000000000000000000000000"
+                ),
+            "no BEEF bytes ride the closure"
+        );
+        let cl = ClosureRead::of(&closure).unwrap();
+        assert!(
+            cl.rows_of(&[pay_big.clone()].into_iter().collect())
+                .is_none(),
+            "a miss naming the not-carried txid takes no closure (the record's read)"
+        );
+        // the honest pair beside it: its closure carried, its new filing applied with no record call
+        let mut ok = publish::publish_with(
+            &port,
+            vec![publish::Noted {
+                source: "collected".into(),
+                key: m_ok.clone(),
+                held: None,
+            }],
+        )
+        .await
+        .sent
+        .into_iter()
+        .next()
+        .unwrap();
+        ok.facts["closure"] = read_closure(&record, &ok.facts).await.unwrap();
+        let b0 = record.batches.get();
+        let r = applied(&record, &local, &games[10..11], &ok, true)
+            .await
+            .unwrap();
+        assert!(r.carried && r.closure_rounds >= 1, "{r:?}");
+        assert_eq!(
+            record.batches.get() - b0,
+            0,
+            "the honest filing reads no D1"
+        );
+        let _ = (&ev, &local);
+    }
+
+    /// (fold2_medium1_b) A BEEF UNDER THE BOUND IS CARRIED AS ITS DECODED FACTS, NEVER ITS BYTES: the collected
+    /// filing's payout holds a real ~20 KB BEEF (the payout and its unproven parent, `realistic_payout_beef`); the
+    /// closure's `transactions` row carries `__facts` (the payout's inputs and outputs, the copy's own decoder) and no
+    /// `__beef`; the carried apply takes it with no record call and stores in its mirror the same `txfacts` and rows a
+    /// cold apply stores.
+    #[tokio::test]
+    async fn fold2_medium1_b_a_beef_rides_as_its_decoded_facts() {
+        let (record, local, games) = e_warm_seat(20).await;
+        d1_length_limit(&record);
+        let (txid, beef) = crate::record_post::door_pins::realistic_payout_beef();
+        let pay = hex::encode(txid);
+        assert!(beef.len() > 19_000, "{}", beef.len());
+        record
+            .conn
+            .execute(
+                "INSERT INTO transactions(txid,beef,has_proof,created_at) VALUES (?1,?2,0,1)",
+                rusqlite::params![pay, beef],
+            )
+            .unwrap();
+        let marker = h("a1", 9);
+        record
+            .conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    "owner",
+                    games[9],
+                    marker,
+                    0,
+                    "00",
+                    (NOW_MS / 1000) as i64,
+                    pay
+                ],
+            )
+            .unwrap();
+        mark(&record, &games[9], "collected", &marker);
+        let ev = published(&record, "collected", &marker).await;
+        let closure = &ev.facts["closure"];
+        let n = FAMILIES
+            .iter()
+            .position(|f| f.table == "transactions")
+            .unwrap();
+        let row = &closure["f"][n][0];
+        assert_eq!(row["txid"], json!(pay));
+        assert!(
+            row.get("__beef").is_none() && row["__facts"].is_object(),
+            "{row}"
+        );
+        assert!(
+            closure.to_string().len() < 4_000,
+            "the facts, not the 20 KB: {}",
+            closure.to_string().len()
+        );
+        let b0 = record.batches.get();
+        let r = applied(&record, &local, &games[9..10], &ev, true)
+            .await
+            .unwrap();
+        assert!(r.carried && r.closure_rounds >= 1, "{r:?}");
+        assert_eq!(record.batches.get() - b0, 0, "no record call");
+        let c = mirror();
+        apply(
+            &record,
+            &c,
+            &Fakes,
+            "owner",
+            &[games[9].clone()],
+            None,
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        let facts = "SELECT facts FROM txfacts WHERE txid=?1 AND src='stored'";
+        assert_eq!(one(&local, facts, &pay), one(&c, facts, &pay));
+        assert_eq!(
+            stored_game(&local, "owner", &games[9]),
+            stored_game(&c, "owner", &games[9])
+        );
+    }
+
+    /// (fold2_medium2) THE DELTA LENS'S MEDIUM-2: THE DOOR'S STATEMENT IS THE CARRIER'S ALONE, AND THE CLOSURE SEEKS.
+    /// Every carrier's publish statement is `read_sql`'s (no closure text, the pre-fold statement); the closure's batch
+    /// (off the door, the direct pass's) materializes its key set once a statement, and every statement's plan is a seek (no `SCAN` of a mirrored table: the key CTE and its prefixes
+    /// are the only scans). Its cost printed (VM steps, full-scan steps). RED on 006e6f24: the publish statement is
+    /// `with_closure`'s (`... AS closure FROM (...) y`).
+    #[tokio::test]
+    async fn fold2_medium2_the_door_is_the_carriers_statement_and_the_closure_seeks() {
+        for s in publish::CARRIERS {
+            let st = publish::statement_of(s).unwrap();
+            assert_eq!(Some(st), publish::read_sql(s), "{s}");
+            assert!(
+                !st.contains("closure") && !st.contains("sqlite_sequence"),
+                "{s}: {st}"
+            );
+        }
+        let (record, _local, games) = e_warm_seat(20).await;
+        let marker = h("a1", 9);
+        let pay = h("a2", 9);
+        record
+            .conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    "owner",
+                    games[9],
+                    marker,
+                    0,
+                    "00",
+                    (NOW_MS / 1000) as i64,
+                    pay
+                ],
+            )
+            .unwrap();
+        mark(&record, &games[9], "collected", &marker);
+        let ev = published(&record, "collected", &marker).await;
+        let (stmts, keys) = closure_statements(&ev.facts["payload"]).unwrap();
+        assert!(keys.contains(&pay) && keys.contains(&marker), "{keys:?}");
+        assert_eq!(stmts.len(), 1 + FAMILIES.len());
+        let tables: Vec<&str> = FAMILIES.iter().map(|f| f.table).collect();
+        let (mut steps, mut scans) = (0i64, 0i64);
+        for st in &stmts[1..] {
+            assert!(st.sql.starts_with("WITH k AS MATERIALIZED"), "{}", st.sql);
+            let mut q = record
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", st.sql))
+                .unwrap();
+            let binds: Vec<rusqlite::types::Value> = st
+                .binds
+                .iter()
+                .map(|b| match b {
+                    Bind::Text(t) => rusqlite::types::Value::Text(t.clone()),
+                    Bind::Int(n) => rusqlite::types::Value::Integer(*n),
+                    Bind::Null => rusqlite::types::Value::Null,
+                })
+                .collect();
+            let plan: Vec<String> = q
+                .query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            for d in &plan {
+                let scanned = d
+                    .strip_prefix("SCAN ")
+                    .map(|t| t.split(' ').next().unwrap_or(""));
+                assert!(
+                    !scanned.is_some_and(|t| tables.contains(&t)),
+                    "a closure statement scans a mirrored table: {d}\n{}",
+                    st.sql
+                );
+            }
+            let mut q = record.conn.prepare(&st.sql).unwrap();
+            let _: Vec<Value> = q
+                .query_map(rusqlite::params_from_iter(binds.iter()), |_| {
+                    Ok(Value::Null)
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            steps += i64::from(q.get_status(rusqlite::StatementStatus::VmStep));
+            scans += i64::from(q.get_status(rusqlite::StatementStatus::FullscanStep));
+        }
+        eprintln!(
+            "fold2_medium2: the door's collected statement {} bytes; the closure (off the door) {} statements, {steps} VM steps, {scans} full-scan steps",
+            publish::read_sql("collected").unwrap().len(),
+            stmts.len()
+        );
+    }
+
+    /// (fold2_low1) THE DELTA LENS'S LOW-1: A MINED WORD AND A REFUSAL MAKE NO MISS. A `tx_words` MINED row of the
+    /// game's pot (its `proof_root` and `header_hash` new 64-hex values) and a `submit_refusals` row of the game's hop
+    /// (its `refusedTxid` a txid no row names), each published and carried as the writer carries it, are applied with
+    /// no miss round and no record call: the actor's one key rule (`txids_in_row`) reads no key out of a
+    /// `NOT_KEY_COLUMNS` column. And no judge statement filters or joins by one of those columns (each appears in the
+    /// judge's SQL only as a selected column), so no key the judge needs is lost. RED on 006e6f24's rule (every 64-hex
+    /// run of every column a key): `misses` 1 (the closure round for the root and the hash), and with no closure one
+    /// record call.
+    #[tokio::test]
+    async fn fold2_low1_a_mined_word_and_a_refusal_make_no_miss() {
+        let (record, local, games) = e_warm_seat(20).await;
+        let pot = h("c8", 7);
+        record
+            .conn
+            .execute(
+                "INSERT INTO tx_words(txid,word,tier,height,proof_root,proof_height,proof_hex,header_hash,updated_at) VALUES (?1,'mined','chain',900001,?2,900001,'00',?3,5) ON CONFLICT(txid) DO UPDATE SET word='mined',tier='chain',height=900001,proof_root=excluded.proof_root,header_hash=excluded.header_hash,updated_at=5",
+                rusqlite::params![pot, h("e1", 7), h("e2", 7)],
+            )
+            .unwrap();
+        mark(&record, &games[7], "word", &pot);
+        let word = published(&record, "word", &pot).await;
+        assert!(word.facts.get("payload").is_some(), "{}", word.facts);
+        let hop = h("b8", 8);
+        record
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO submit_refusals(hopTxid,hopVout,refusedTxid,reason,refusedAt) VALUES (?1,0,?2,'script-refused',?3)",
+                rusqlite::params![hop, h("e3", 8), NOW_MS as i64],
+            )
+            .unwrap();
+        let key = format!("{hop}:0");
+        mark(&record, &games[8], "refusal", &key);
+        let refusal = published(&record, "refusal", &key).await;
+        assert!(refusal.facts.get("payload").is_some(), "{}", refusal.facts);
+        for (ev, g) in [(&word, 7usize), (&refusal, 8)] {
+            for closure in [true, false] {
+                let mut ev = ev.clone();
+                if !closure {
+                    ev.facts.as_object_mut().unwrap().remove("closure");
+                }
+                let b0 = record.batches.get();
+                let r = applied(&record, &local, &games[g..g + 1], &ev, true)
+                    .await
+                    .unwrap();
+                assert!(r.carried, "{}: {r:?}", ev.source);
+                assert_eq!(
+                    (r.misses, r.closure_rounds),
+                    (0, 0),
+                    "{} (closure {closure}): {r:?}",
+                    ev.source
+                );
+                assert_eq!(
+                    record.batches.get() - b0,
+                    0,
+                    "{}: no record call",
+                    ev.source
+                );
+            }
+        }
+        // the judge never reads by a NOT_KEY column
+        let judge = [
+            include_str!("../owed_judge.rs"),
+            include_str!("../owed_judge/hydrate.rs"),
+            include_str!("../owed_judge/rank.rs"),
+            include_str!("../owed_judge/writers.rs"),
+            include_str!("../owed.rs"),
+        ]
+        .concat()
+        .replace(' ', "");
+        for c in NOT_KEY_COLUMNS {
+            for op in ["=", "IN(", "<", ">"] {
+                for side in [format!("{c}{op}"), format!(".{c}{op}")] {
+                    assert!(
+                        !judge.contains(&side),
+                        "a judge statement reads by {c}: `{side}`"
+                    );
+                }
+            }
+        }
+    }
+
+    /// (fold2_nit3) THE DELTA LENS'S NIT-3: A CLOSURE OLDER THAN ANY ITEM THE APPLY WROTE IS NOT TAKEN, whatever txids
+    /// that item is keyed by: a collected filing's event and a LATER SEEN of the game's pot (a key the mirror holds, so
+    /// no miss names it) coalesced into one body; the collected closure's high-water is below the SEEN item's
+    /// generation, so it is declined and the miss reads the record once. RED on 006e6f24's rule (an item counted only
+    /// when keyed by a miss txid: the older closure taken, no record call).
+    #[tokio::test]
+    async fn fold2_nit3_a_closure_older_than_any_applied_item_is_not_taken() {
+        let (record, local, games) = e_warm_seat(20).await;
+        let (marker, pay) = (h("a1", 9), h("a2", 9));
+        record
+            .conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    "owner",
+                    games[9],
+                    marker,
+                    0,
+                    "00",
+                    (NOW_MS / 1000) as i64,
+                    pay
+                ],
+            )
+            .unwrap();
+        mark(&record, &games[9], "collected", &marker);
+        let ev = published(&record, "collected", &marker).await;
+        let hw = ev.facts["closure"]["hw"].as_i64().unwrap();
+        let pot = h("c8", 9);
+        record
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'2026-10-30 00:00:00','arcade',?2)",
+                rusqlite::params![pot, NOW_MS as i64],
+            )
+            .unwrap();
+        mark(&record, &games[9], "seen", &pot);
+        let seen = published(&record, "seen", &pot).await;
+        let g = seen.facts["subjects"][0][2].as_i64().unwrap();
+        assert!(
+            g > hw,
+            "the SEEN is newer than the collected closure: {g} {hw}"
+        );
+        let mut opts = opts_of(&ev, true);
+        let mut merged = opts.carried.take().unwrap();
+        merged.merge(carried::Carried::of_event(&seen.facts, "owner").unwrap());
+        opts.carried = Some(merged);
+        let b0 = record.batches.get();
+        let (r, _) = apply_with(
+            &record,
+            &local,
+            &Fakes,
+            "owner",
+            &games[9..10],
+            Some(("collected", ev.seq)),
+            Some(TIP),
+            None,
+            &opts,
+        )
+        .await
+        .unwrap();
+        assert!(r.carried, "{r:?}");
+        assert_eq!(r.closure_rounds, 0, "an older closure taken: {r:?}");
+        assert_eq!(record.batches.get() - b0, 1);
     }
 }

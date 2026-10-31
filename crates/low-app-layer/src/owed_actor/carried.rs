@@ -35,6 +35,16 @@ pub const PAYLOAD_GEN_KIND: &str = "payload-gen";
 /// greatest PENDING mark's generation, written delete-then-insert, so it fell to 0 once the marks were acknowledged
 /// and a late older carried row passed the guard and replaced a newer row. Now the high-water, the greatest per game
 /// kept and never lowered ([`read_bound_statements`]).
+///
+/// THE PREMISE (D2-ACTOR-F-FOLD-2, the delta lens's NIT-1): the bound is per GAME, so it is honoured for every carried
+/// item of that game, including a domain the read never named. It holds where a mark is acknowledged only after an
+/// actor read whose key set included its txid (`mk_t`): Phases B and C (the actor applies first, the acknowledgement
+/// follows under its bound). In PHASE A the D1 judge acknowledges first, so a later narrowed read of the game can
+/// record a high-water past a filing whose txid it never named, and that filing's late carried call is then skipped
+/// as held and its marks recorded applied. Phase A serves no actor row, and the event's queue delivery (a narrowed read
+/// over the mirror's whole key set and the event's own txids) applies it; so the residual is a Phase A compare's
+/// one-delivery lag, never a served row. Recording the bound per KEY from the read's `keys` answer was not taken: every
+/// read path would then write a row per key it read (hundreds a full apply).
 pub const READ_BOUND_KIND: &str = "read";
 /// The `applied` kind of a MISS round's bound per KEY (game the txid, seq the high-water that round read it at): a
 /// miss reads only its new keys, so its snapshot bounds those keys' domains alone, never the game's.
@@ -59,6 +69,12 @@ pub const OPEN_KIND: &str = "open";
 /// How many of the games are open (`?1` the games).
 pub const OPEN_COUNT_SQL: &str = "SELECT COUNT(*) AS n FROM applied WHERE kind='open' AND game IN (SELECT value FROM json_each(?1))";
 /// The games marked open (`?1` the games, `?2` now).
+///
+/// The delta lens's NIT-4, stated: the mark is per GAME, while a txid-keyed domain (`tx_words`, `network_seen`,
+/// `pot_records`) is shared between an identity's games, so an apply that faults over game A leaves a shared row a
+/// warm game B's carried apply then reads without the open mark. Unreached: no carried item writes a shared domain
+/// naming a key no read covered (a carried SEEN, word or pot row names its own txid, which a read of its game already
+/// named), and the shared row is the record's own, read whole by the faulted apply's own round.
 pub const OPEN_MARK_SQL: &str = "INSERT INTO applied(kind,seq,game,atMs) SELECT 'open',0,value,?2 FROM json_each(?1) WHERE 1 ON CONFLICT(kind,seq,game) DO UPDATE SET atMs=excluded.atMs";
 /// The games' open mark cleared (`?1` the games): the last statement of a whole apply.
 pub const OPEN_CLEAR_SQL: &str =

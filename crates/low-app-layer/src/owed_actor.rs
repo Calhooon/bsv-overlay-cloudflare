@@ -467,7 +467,7 @@ impl<L: SqlPort> SqlPort for Noting<'_, L> {
         let out = self.local.run_batch(stmts).await?;
         let mut seen = self.seen.borrow_mut();
         for o in &out {
-            o.rows.iter().for_each(|r| txids_in_value(r, &mut seen));
+            o.rows.iter().for_each(|r| txids_in_row(r, &mut seen));
         }
         Ok(out)
     }
@@ -883,9 +883,13 @@ fn facts_rows(
         let Some(txid) = r["txid"].as_str().map(str::to_ascii_lowercase) else {
             continue;
         };
-        let facts = r["__beef"]
-            .as_str()
-            .and_then(|h| crate::owed_judge::facts_of_beefs(&txid, [h]));
+        // D2-ACTOR-F-FOLD-2: a closure's BEEF row carries its DECODED facts (`__facts`), never its bytes
+        let facts = match r.get("__facts") {
+            Some(f) => crate::owed_judge::TxFacts::from_json(f),
+            None => r["__beef"]
+                .as_str()
+                .and_then(|h| crate::owed_judge::facts_of_beefs(&txid, [h])),
+        };
         if family.table == "pot_beefs" {
             pending.insert((txid.clone(), "pot"), (seq, facts.clone()));
         }
@@ -943,63 +947,247 @@ pub const BOUND_COLUMN: &str = "(SELECT MAX(generation) FROM owed_dirty WHERE id
 /// so every write whose mark's generation is at or below it committed before this snapshot and is in the rows read.
 /// A read's carried-row guard ([`carried::READ_BOUND_KIND`]) is this number, never the pending marks' maximum (which
 /// fell to 0 once the marks were acknowledged, so a late older carried row passed the guard).
+///
+/// D2-ACTOR-F-FOLD-2 (the delta lens's LOW-3): REMOTE D1 SERVES IT. The captain probed beta's D1 read-only on
+/// 2026-10-31 (bsv-low ledger record 1632): `SELECT seq FROM sqlite_sequence WHERE name='owed_dirty'` answered one row
+/// (seq 223,842, one row read), so the authorizer admits the table and the read stands. THE RESTORE RULE: a Time
+/// Travel restore of the D1 the app layer reads sets `sqlite_sequence` back while each actor's mirror keeps its higher
+/// `read` bounds (a carried item below them would be skipped as held), so a restore is followed by the actors' reset
+/// (the wipe's step 4a: `POST /internal/owed-actor-reset` over every identity), never a plain resume (bsv-low's
+/// `docs/CUTOVER-D2-ACTOR-2026-10-28.md`, its rollback section).
 pub const HW_COLUMN: &str = "(SELECT seq FROM sqlite_sequence WHERE name='owed_dirty') AS hw";
 
-/// D2-ACTOR-F-FOLD (item 4, the lens's LOW-2): THE CARRIED CLOSURE. The rows the record holds, in every family the
-/// actor mirrors, for the txids a carried payload's rows NAME (every 64-hex text value of `y.payload`, as
-/// [`txids_in_value`] reads a mirror row), read in the SAME statement as the payload and its marks (no statement added
-/// to the publish's batch): each family's selection over those txids alone (no game, no marker: the miss round's
-/// read, `read_round` with no games), and the record's high-water ([`HW_COLUMN`]) of that snapshot. A NEW filing's
-/// apply then reads its new keys from the carried closure instead of the record: no D1 call. A SQL expression over
-/// the derived table `y` (the carrier's own statement); `NULL` where the statement carried no payload.
-pub fn closure_column() -> String {
-    let keys = "(SELECT DISTINCT lower(value) AS value FROM json_tree(y.payload) WHERE type='text' AND length(value)=64 AND NOT (lower(value) GLOB '*[^0-9a-f]*'))";
-    let probes = format!(
-        "(SELECT p.value||kt.value AS value FROM json_each('{}') p CROSS JOIN {keys} kt UNION SELECT 'reorg-clear')",
-        json!(PROBE_PREFIXES)
-    );
-    let families: Vec<String> = FAMILIES
+/// D2-ACTOR-F-FOLD-2 (the delta lens's LOW-1 and NIT-2): the mirror's columns that hold a 64-hex value that is NO
+/// key of any family the actor reads: a MINED word's `proof_root` and `header_hash` (a merkle root and a block hash,
+/// new on every proof), its `proof_hex` (a merkle path) and `legacy_body` (the tracker's stored body, read by the
+/// judge only for its terminal flags), and a refusal's `refusedTxid` (no judge statement reads by it:
+/// `owed_judge::hydrate::DOOR_REFUSAL_SQL` reads a refusal by its HOP). A value in one of these never becomes a key, in
+/// a mirror row, a judge statement's answer, or a carried payload ([`txids_in_row`]), so a MINED word or a refusal
+/// makes no miss round. Pinned against every judge statement (`fold2_low1_*`): none filters or joins by one of them.
+pub const NOT_KEY_COLUMNS: [&str; 5] = [
+    "proof_root",
+    "header_hash",
+    "proof_hex",
+    "legacy_body",
+    "refusedTxid",
+];
+
+/// THE ONE KEY RULE (the delta lens's LOW-1 and NIT-2): the txids a row (an object of columns) names: every maximal
+/// 64-hex run of every value ([`txids_in_value`]) but those of [`NOT_KEY_COLUMNS`]. The mirror's key walk
+/// (`keys_of_mirror`), the judge's answers (`Noting`) and the closure's key set ([`closure_keys`]) read rows by it, so
+/// the closure reads exactly the keys the actor's miss round would.
+/// An object's key in [`NOT_KEY_COLUMNS`] is skipped at any depth (a word's facts hold its row under `row`).
+pub fn txids_in_row(r: &Value, out: &mut BTreeSet<String>) {
+    match r {
+        Value::Object(m) => m
+            .iter()
+            .filter(|(k, _)| !NOT_KEY_COLUMNS.contains(&k.as_str()))
+            .for_each(|(_, v)| txids_in_row(v, out)),
+        Value::Array(a) => a.iter().for_each(|x| txids_in_row(x, out)),
+        Value::String(s) => txids_in(s, out),
+        _ => {}
+    }
+}
+
+/// D2-ACTOR-F-FOLD-2 (the delta lens's MEDIUM-1): the most bytes of one stored BEEF the closure reads to DECODE (its
+/// facts are carried, never its bytes); a BEEF past it is never read (its hex is never built: the statement tests
+/// `length(beef)` before `hex(beef)`), and its txid is NOT CARRIED. 512 KB of hex, a quarter of D1's 2,000,000 byte
+/// value bound.
+pub const CLOSURE_BEEF_MAX_BYTES: i64 = 262_144;
+/// The most bytes one carried closure takes (it rides the writer's direct body only, never a queue message): past it
+/// the closure is dropped and the actor reads the new keys once.
+pub const CLOSURE_MAX_BYTES: usize = 32_768;
+/// The bound on one row's value before it is built: the sum, over its columns, of the bytes of a text value six times
+/// (JSON's worst escape, `\u00XX`) and of a blob twice (its hex). A row past it is never built; its txids are NOT
+/// CARRIED. So no value the closure's statements build can pass D1's bound.
+pub const CLOSURE_ROW_MAX_WEIGHT: i64 = 6 * CLOSURE_MAX_BYTES as i64;
+
+/// PURE (D2-ACTOR-F-FOLD-2): the closure's key set: the txids the payload's rows name by [`txids_in_row`], the rule
+/// the actor's own key walk reads them by (each item's `r`, JSON text of a row object).
+pub fn closure_keys(payload: &Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for it in payload.as_array().into_iter().flatten() {
+        for r in it["r"].as_array().into_iter().flatten() {
+            let row = match r {
+                Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+                other => other.clone(),
+            };
+            txids_in_row(&row, &mut out);
+        }
+    }
+    out
+}
+
+/// The closure's statement of one family (`?1` the keys, `?2` the probe prefixes, `?3` [`CLOSURE_BEEF_MAX_BYTES`],
+/// `?4` [`CLOSURE_ROW_MAX_WEIGHT`]): each row as the record's read answers it (`r`, nested arrays, [`row_json`]'s
+/// order) only when its weight is under the bound, else NULL; a BEEF's hex only when its length is under the bound
+/// (`__len` its length); `k`, the row's key values (its txid columns, a probe's outpoint), always. The key set is
+/// MATERIALIZED once a statement; every arm is a txid-indexed seek (`fold2_medium2_*` pins the plans).
+pub fn closure_select(f: &Family) -> String {
+    let (exprs, _) = compound_columns(f);
+    let exprs: Vec<String> = exprs
+        .into_iter()
+        .map(|e| {
+            if e == "hex(t.beef)" {
+                "CASE WHEN length(t.beef)<=?3 THEN hex(t.beef) END".to_string()
+            } else {
+                e
+            }
+        })
+        .chain(f.beef.then(|| "length(t.beef)".to_string()))
+        .collect();
+    let calls: Vec<String> = exprs
+        .chunks(COMPOUND_ARGS_PER_CALL)
+        .map(|c| format!("json_array({})", c.join(",")))
+        .collect();
+    let weight: Vec<String> = schema::columns(f.table)
         .iter()
-        .map(|f| {
-            format!(
-                "json((SELECT json_group_array(json(r)) FROM (SELECT DISTINCT {} AS r FROM {})))",
-                row_json(f),
-                selection(f)
-            )
-            .replace("json_each(?3)", keys)
-            .replace("json_each(?5)", &probes)
-            .replace("json_each(?2)", "json_each('[]')")
-            .replace("json_each(?4)", "json_each('[]')")
-            .replace("?1", "''")
+        .filter(|c| !(f.beef && **c == "beef"))
+        .map(|c| {
+            let w = if schema::is_blob(f.table, c) { 2 } else { 6 };
+            format!("{w}*COALESCE(length(CAST(t.{c} AS BLOB)),0)")
         })
         .collect();
+    let key_cols: Vec<String> = f
+        .keys
+        .iter()
+        .filter_map(|k| match k {
+            Txid(c) => Some(format!("t.{c}")),
+            ProbeRange => Some("t.outpoint".to_string()),
+            _ => None,
+        })
+        .collect();
+    let from = selection(f)
+        .replace("json_each(?3)", "k")
+        .replace("json_each(?5) k", "p k")
+        .replace("json_each(?2)", "json_each('[]')")
+        .replace("json_each(?4)", "json_each('[]')")
+        .replace("?1", "''");
     format!(
-        "CASE WHEN y.payload IS NULL THEN NULL ELSE json_object('hw',(SELECT seq FROM sqlite_sequence WHERE name='owed_dirty'),'keys',(SELECT json_group_array(value) FROM {keys}),'f',json_array({})) END",
-        families.join(",")
+        "WITH k AS MATERIALIZED (SELECT value FROM json_each(?1)),p AS MATERIALIZED (SELECT x.value||k.value AS value FROM json_each(?2) x CROSS JOIN k) SELECT DISTINCT t.rowid AS i,CASE WHEN {}<=?4 THEN json_array({}) END AS r,json_array({}) AS k FROM {from}",
+        weight.join("+"),
+        calls.join(","),
+        key_cols.join(",")
     )
 }
 
-/// D2-ACTOR-F-FOLD (item 4): the carrier statement with its closure ([`closure_column`]): the shared statement as a
-/// derived table, every column it answers kept.
-pub fn with_closure(base: &str) -> String {
-    format!(
-        "SELECT y.marks AS marks,y.facts AS facts,y.subjects AS subjects,y.payload AS payload,{} AS closure FROM ({base}) y",
-        closure_column()
-    )
+/// The closure's high-water statement, the first of its batch (one transaction: the same snapshot as the rows).
+pub const CLOSURE_HW_SQL: &str = "SELECT seq AS hw FROM sqlite_sequence WHERE name='owed_dirty'";
+
+/// PURE (D2-ACTOR-F-FOLD-2, the delta lens's MEDIUM-1 and MEDIUM-2): the closure's batch for a carried payload: the
+/// high-water, then one statement a family, in [`FAMILIES`]' order (one transaction: one snapshot), and the key set.
+/// `None` when the payload names no key. Its OWN batch, never the publish's (the direct pass runs it after the
+/// writer's answer): a fault costs only the closure, and no value it builds can pass D1's bound.
+///
+/// Every family is read, the one the payload carries among them (the delta lens's MEDIUM-2 asked it left out): a
+/// closure round REPLACES each family's domain of its miss keys (`write_round_of`'s delete), so a family left out would
+/// take the carried rows with it; off the door its rows are a txid-indexed seek of a few keys.
+pub fn closure_statements(payload: &Value) -> Option<(Vec<Stmt>, BTreeSet<String>)> {
+    let keys = closure_keys(payload);
+    if keys.is_empty() {
+        return None;
+    }
+    let binds = vec![
+        Bind::Text(json!(keys).to_string()),
+        Bind::Text(json!(PROBE_PREFIXES).to_string()),
+        Bind::Int(CLOSURE_BEEF_MAX_BYTES),
+        Bind::Int(CLOSURE_ROW_MAX_WEIGHT),
+    ];
+    let mut stmts = vec![Stmt::new(CLOSURE_HW_SQL, Vec::new())];
+    stmts.extend(FAMILIES.iter().map(|f| fitted(closure_select(f), &binds)));
+    Some((stmts, keys))
 }
 
-/// D2-ACTOR-F-FOLD (item 4): one carried closure, parsed ([`closure_column`]'s answer): the high-water, the txids it
-/// read, and each family's rows as the record's read answers them ([`row_of`]).
+/// PURE (D2-ACTOR-F-FOLD-2): the closure out of its batch's answers: `{hw, keys, notCarried, f}`, `f` one array a
+/// family of its rows as OBJECTS of the mirror's columns and `__rowid`. A BEEF family's row carries its DECODED facts
+/// (`__facts`, the [`crate::owed_judge::TxFacts`] the judge reads, decoded here by the copy's own decoder) and never
+/// its bytes. `notCarried`: the txids of a row whose weight passed the bound, of a BEEF past
+/// [`CLOSURE_BEEF_MAX_BYTES`], or whose facts alone pass [`CLOSURE_MAX_BYTES`]; a miss naming one of them reads the
+/// record ([`ClosureRead::rows_of`]). `None` past [`CLOSURE_MAX_BYTES`].
+pub fn closure_of(keys: &BTreeSet<String>, outs: &[StmtOut]) -> Option<Value> {
+    let hw = outs.first()?.rows.first().map_or(0, |r| hw_of(&r["hw"]));
+    let mut not_carried: BTreeSet<String> = BTreeSet::new();
+    let mut fams: Vec<Value> = Vec::with_capacity(FAMILIES.len());
+    for (f, out) in FAMILIES.iter().zip(outs.iter().skip(1)) {
+        let names: Vec<String> = compound_columns(f)
+            .1
+            .into_iter()
+            .chain(f.beef.then(|| "__len".to_string()))
+            .collect();
+        let mut rows = Vec::new();
+        for row in &out.rows {
+            let mut over = || {
+                txids_in_value(&json_of(&row["k"]).unwrap_or(Value::Null), &mut not_carried);
+            };
+            let r = match json_of(&row["r"]) {
+                Ok(r @ Value::Array(_)) => r,
+                _ => {
+                    over();
+                    continue;
+                }
+            };
+            let mut obj = row_of(&names, &r);
+            if f.beef {
+                let txid = obj["txid"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let len = hw_of(&obj["__len"]);
+                let hex = obj["__beef"].as_str().map(str::to_string);
+                if hex.is_none() && len > 0 {
+                    over();
+                    continue;
+                }
+                let facts = hex
+                    .as_deref()
+                    .and_then(|h| crate::owed_judge::facts_of_beefs(&txid, [h]))
+                    .map(|t| t.to_json());
+                if facts
+                    .as_ref()
+                    .is_some_and(|v| v.to_string().len() > CLOSURE_MAX_BYTES)
+                {
+                    over();
+                    continue;
+                }
+                if let Value::Object(m) = &mut obj {
+                    m.remove("__beef");
+                    m.remove("__len");
+                    m.insert("__facts".into(), facts.unwrap_or(Value::Null));
+                }
+            }
+            rows.push(obj);
+        }
+        fams.push(Value::Array(rows));
+    }
+    if fams.len() != FAMILIES.len() {
+        return None;
+    }
+    let v = json!({"hw": hw, "keys": keys, "notCarried": not_carried, "f": fams});
+    (v.to_string().len() <= CLOSURE_MAX_BYTES).then_some(v)
+}
+
+/// D2-ACTOR-F-FOLD-2: the carried closure of an event's `facts` (its `payload`), read from the record in its OWN batch
+/// ([`closure_statements`], [`closure_of`]). `None` when the event carries no payload, names no key, the read faults,
+/// or the closure passes its bound: the actor's miss round then reads the record once, as it would with no closure.
+pub async fn read_closure(record: &impl SqlPort, facts: &Value) -> Option<Value> {
+    let (stmts, keys) = closure_statements(facts.get("payload")?)?;
+    let outs = record.run_batch(stmts).await.ok()?;
+    closure_of(&keys, &outs)
+}
+
+/// D2-ACTOR-F-FOLD (item 4): one carried closure, parsed ([`closure_of`]'s answer): the high-water, the txids it
+/// read, those it read and did NOT carry, and each family's rows.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClosureRead {
     pub hw: i64,
     pub keys: BTreeSet<String>,
+    pub not_carried: BTreeSet<String>,
     pub rows: Vec<Vec<Value>>,
 }
 
 impl ClosureRead {
-    /// PURE: the closure out of an event's `facts.closure`; `None` when absent or not the mirror's shape (one array
-    /// a family).
+    /// PURE: the closure out of an event's `facts.closure`; `None` when absent or not the mirror's shape (one entry a
+    /// family).
     pub fn of(v: &Value) -> Option<ClosureRead> {
         let v = match v {
             Value::String(s) => serde_json::from_str::<Value>(s).ok()?,
@@ -1010,50 +1198,62 @@ impl ClosureRead {
         if f.len() != FAMILIES.len() {
             return None;
         }
-        let names: Vec<Vec<String>> = FAMILIES.iter().map(|f| compound_columns(f).1).collect();
-        let mut rows = vec![Vec::new(); FAMILIES.len()];
-        for (n, fam) in f.iter().enumerate() {
-            for r in json_of(fam).ok()?.as_array()? {
-                rows[n].push(row_of(&names[n], r));
-            }
+        let mut rows = Vec::with_capacity(FAMILIES.len());
+        for fam in f {
+            rows.push(
+                fam.as_array()?
+                    .iter()
+                    .filter(|r| r.is_object())
+                    .cloned()
+                    .collect(),
+            );
         }
-        let keys = v["keys"]
-            .as_array()?
-            .iter()
-            .filter_map(|k| k.as_str().map(str::to_string))
-            .collect();
+        let strings = |k: &str| -> Option<BTreeSet<String>> {
+            Some(
+                v[k].as_array()?
+                    .iter()
+                    .filter_map(|k| k.as_str().map(str::to_string))
+                    .collect(),
+            )
+        };
         Some(ClosureRead {
             hw: hw_of(&v["hw"]),
-            keys,
+            keys: strings("keys")?,
+            not_carried: strings("notCarried").unwrap_or_default(),
             rows,
         })
     }
 
     /// PURE: the closure's rows of the domains of `txids` (each family's rows whose txid key column, or probe
-    /// outpoint, names one of them), for a miss round's write; `None` when it did not read every one of them.
+    /// outpoint, names one of them), for a miss round's write; `None` when it did not read every one of them, or did
+    /// not carry one (MEDIUM-1 of the delta lens: that miss reads the record).
     pub fn rows_of(&self, txids: &BTreeSet<String>) -> Option<Vec<Vec<Value>>> {
-        if !txids.is_subset(&self.keys) {
+        if !txids.is_subset(&self.keys) || txids.iter().any(|t| self.not_carried.contains(t)) {
             return None;
         }
-        let mut out = vec![Vec::new(); FAMILIES.len()];
+        let mut out = Vec::with_capacity(FAMILIES.len());
         for (n, f) in FAMILIES.iter().enumerate() {
+            let mut rows = Vec::new();
             for r in &self.rows[n] {
                 let inside = f.keys.iter().any(|k| match k {
-                    Txid(c) => r[*c].as_str().is_some_and(|v| txids.contains(&v.to_ascii_lowercase())),
-                    // never the reorg tombstone: the closure's snapshot may predate one the mirror holds
+                    Txid(c) => r[*c]
+                        .as_str()
+                        .is_some_and(|v| txids.contains(&v.to_ascii_lowercase())),
+                    // never the reorg tombstone: the closure reads none
                     ProbeRange => r["outpoint"].as_str().is_some_and(|o| {
                         txids.iter().any(|t| {
-                                PROBE_PREFIXES.iter().any(|p| {
-                                    o.to_ascii_lowercase().starts_with(&format!("{p}{t}"))
-                                })
-                            })
+                            PROBE_PREFIXES
+                                .iter()
+                                .any(|p| o.to_ascii_lowercase().starts_with(&format!("{p}{t}")))
+                        })
                     }),
                     _ => false,
                 });
                 if inside {
-                    out[n].push(r.clone());
+                    rows.push(r.clone());
                 }
             }
+            out.push(rows);
         }
         Some(out)
     }
@@ -1481,7 +1681,7 @@ async fn keys_of_mirror(
                 // FOLD-7: a pot row's own txid is its key; its SPENDER is a key only where the judge names it.
                 txids_in_value(&r["txid"], &mut into.txids);
             } else {
-                txids_in_value(r, &mut into.txids);
+                txids_in_row(r, &mut into.txids);
             }
         }
     }
@@ -2144,8 +2344,9 @@ async fn apply_counted<R: SqlPort, L: SqlPort, O: Outside>(
 }
 
 /// D2-ACTOR-F-FOLD (item 4): a carried apply's miss round from a carried closure: the rows of `read`'s keys and the
-/// closure's high-water, or `None` (the record's read): no closure read every key, the round names a marker, an item
-/// this apply wrote for one of the keys is newer than the closure, or the mirror read one of them at or past it.
+/// closure's high-water, or `None` (the record's read): no closure read every key (or one did not carry one,
+/// MEDIUM-1 of the delta lens), the round names a marker, an item this apply wrote is newer than the closure (the
+/// delta lens's NIT-3: ANY item, not only one keyed by a miss txid), or the mirror read one of them at or past it.
 async fn closure_round<L: SqlPort>(
     local: &L,
     carried: &Option<carried::Carried>,
@@ -2167,10 +2368,7 @@ async fn closure_round<L: SqlPort>(
     else {
         return Ok(None);
     };
-    if items
-        .iter()
-        .any(|i| i.g > hw && i.key_txids().iter().any(|t| read.txids.contains(t)))
-    {
+    if items.iter().any(|i| i.g > hw) {
         return Ok(None);
     }
     let txids: Vec<&String> = read.txids.iter().collect();
@@ -6411,8 +6609,10 @@ pub fn event_txids(ev: &overlay_discovery::owed_event::OwedEvent) -> Option<Vec<
     if let Some(f) = facts.as_object_mut() {
         f.remove("payload");
         f.remove("subjects");
+        // D2-ACTOR-F-FOLD-2: the closure the direct pass attached is the closure's, never the write's touch
+        f.remove("closure");
     }
-    txids_in_value(&facts, &mut out);
+    txids_in_row(&facts, &mut out);
     Some(out.into_iter().collect())
 }
 /// FIX-974 (bsv-low #974): the tracker frame kind that IS the mined word: `proof`, the bump the overlay's

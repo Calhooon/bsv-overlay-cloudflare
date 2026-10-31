@@ -2621,6 +2621,8 @@ pub struct DirectReport {
     pub acked: u64,
     /// D2-ACTOR-F (bsv-low #959): events whose subjects and rows the publish carried (no marks read here).
     pub carried: u64,
+    /// D2-ACTOR-F-FOLD-2: carried events this pass read a closure for ([`DirectPort::closure`]).
+    pub closures: u64,
 }
 
 /// D2-ACTOR-B-FOLD-10 (item 8): the direct path's fault line is logged at most once in this many ms an isolate.
@@ -2808,6 +2810,13 @@ pub trait DirectPort {
     async fn ack(&self, _stmts: Vec<Stmt>) -> Result<(), String> {
         Ok(())
     }
+    /// D2-ACTOR-F-FOLD-2 (the delta lens's MEDIUM-1 and MEDIUM-2): the carried CLOSURE of an event that carries its
+    /// row (`owed_actor::read_closure`), read here, after the writer's answer, in its own batch: never the publish's,
+    /// so a fault or a value past D1's bound costs only the closure. `None` (the default): the actor's miss round reads
+    /// the record once.
+    async fn closure(&self, _facts: &Value) -> Option<Value> {
+        None
+    }
 }
 
 /// FIX-956 item 3: the bound of [`DirectPort::bound`] over a [`SqlPort`] (`owed_judge::MARKS_SQL`, as the consumer's
@@ -2866,7 +2875,7 @@ pub async fn direct_with_class(
 ) -> DirectReport {
     let mut report = DirectReport::default();
     let mut subjects_of = Vec::new();
-    for (n, ev) in events.into_iter().enumerate() {
+    for (n, mut ev) in events.into_iter().enumerate() {
         if n >= DIRECT_EVENTS_MAX || ev.source == owed_event::TXFACTS {
             report.left_to_queue += 1;
             continue;
@@ -2899,6 +2908,11 @@ pub async fn direct_with_class(
         };
         if ev.facts.get("payload").is_some() {
             report.carried += 1;
+            // D2-ACTOR-F-FOLD-2: the closure, read after the answer (it rides this body only, never the queue)
+            if let Some(c) = port.closure(&ev.facts).await {
+                ev.facts["closure"] = c;
+                report.closures += 1;
+            }
         }
         subjects_of.push((crate::owed_actor::EventCtx::of(&ev), subjects));
     }
@@ -2996,6 +3010,9 @@ impl DirectPort for WorkerDirect {
     }
     async fn ack(&self, stmts: Vec<Stmt>) -> Result<(), String> {
         self.sql.run_batch(stmts).await.map(|_| ())
+    }
+    async fn closure(&self, facts: &Value) -> Option<Value> {
+        crate::owed_actor::read_closure(&self.sql, facts).await
     }
 }
 

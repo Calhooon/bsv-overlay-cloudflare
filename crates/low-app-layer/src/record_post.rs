@@ -2428,7 +2428,7 @@ pub async fn record_post(mut req: Request, ctx: RouteContext<AuthState>) -> Resu
 
 #[cfg(test)]
 #[path = "../tests/support/record_door_fixture.rs"]
-mod door_pins;
+pub(crate) mod door_pins;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

@@ -65,7 +65,6 @@ mod courier_counters;
 pub mod migration_emitter;
 pub mod ops;
 pub mod owed_events;
-pub mod owed_closure;
 pub mod peer_crawler;
 pub mod pot_changes;
 pub mod proof_fetcher;

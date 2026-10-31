@@ -359,7 +359,20 @@ fn export_record_door_fixture() {
             script(&[b"LOW/collected/v1", &seat.game_id, &id, &sig]),
             seat.poster(),
         );
-        let pay = [0xa0u8.wrapping_add(n); 32];
+        // D2-ACTOR-F-FOLD-2 (the delta lens's LOW-2): seat 0's payout holds a stored BEEF of a realistic size (about
+        // 20 KB: the payout and its unproven parent), the rest none; the closure decodes it and carries its facts.
+        let (pay, pay_beef_bytes) = if n == 0 {
+            let (txid, beef) = realistic_payout_beef();
+            db.conn
+                .execute(
+                    "INSERT INTO transactions(txid,beef,has_proof,created_at) VALUES (?1,?2,0,2000)",
+                    rusqlite::params![hex::encode(txid), beef],
+                )
+                .unwrap();
+            (txid, beef.len())
+        } else {
+            ([0xa0u8.wrapping_add(n); 32], 0)
+        };
         let sig = sign(
             &seat.w,
             collected_protocol(),
@@ -373,7 +386,7 @@ fn export_record_door_fixture() {
             script(&[HELD_TAG, &seat.game_id, &id, &pay, &sig]),
             seat.poster(),
         );
-        carried_seats.push(json!({"identity": seat.poster(), "game": gid, "pay": hex::encode(pay), "first": first[0], "held": first[1]}));
+        carried_seats.push(json!({"identity": seat.poster(), "game": gid, "pay": hex::encode(pay), "payBeefBytes": pay_beef_bytes, "first": first[0], "held": first[1]}));
     }
     db.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
     let _ = std::fs::remove_file(&sqlite);
@@ -383,4 +396,51 @@ fn export_record_door_fixture() {
         serde_json::to_vec_pretty(&json!({"sqlite":sqlite,"scenarios":scenarios,"carriedSeats":carried_seats})).unwrap(),
     )
     .unwrap();
+}
+
+/// D2-ACTOR-F-FOLD-2 (the delta lens's LOW-2): a payout and its unproven parent as one BEEF of about 20 KB (the
+/// parent's output a 19,900 byte data script, the payout a one-input, one-output spend of it): the txid of the payout
+/// and the BEEF's bytes.
+pub(crate) fn realistic_payout_beef() -> ([u8; 32], Vec<u8>) {
+    use bsv_rs::transaction::{Transaction, TransactionInput, TransactionOutput};
+    let mut parent = Transaction::new();
+    parent
+        .add_input(TransactionInput {
+            source_txid: Some(hex::encode([0x12u8; 32])),
+            source_output_index: 0,
+            unlocking_script: Some(bsv_rs::script::UnlockingScript::from_hex("00").unwrap()),
+            sequence: 0xffff_ffff,
+            ..Default::default()
+        })
+        .unwrap();
+    let mut data = vec![0x00u8, 0x6a, 0x4d];
+    data.extend_from_slice(&19_900u16.to_le_bytes());
+    data.extend(std::iter::repeat_n(0x5au8, 19_900));
+    parent
+        .add_output(TransactionOutput {
+            satoshis: Some(20_000),
+            locking_script: bsv_rs::script::LockingScript::from_hex(&hex::encode(&data)).unwrap(),
+            change: false,
+        })
+        .unwrap();
+    let mut pay = Transaction::new();
+    pay.add_input(TransactionInput {
+        source_txid: Some(parent.id()),
+        source_output_index: 0,
+        unlocking_script: Some(bsv_rs::script::UnlockingScript::from_hex("00").unwrap()),
+        sequence: 0xffff_ffff,
+        ..Default::default()
+    })
+    .unwrap();
+    pay.add_output(TransactionOutput {
+        satoshis: Some(19_800),
+        locking_script: bsv_rs::script::LockingScript::from_hex("51").unwrap(),
+        change: false,
+    })
+    .unwrap();
+    let txid: [u8; 32] = hex::decode(pay.id()).unwrap().try_into().unwrap();
+    let mut beef = bsv_rs::transaction::Beef::new();
+    beef.merge_transaction(parent);
+    beef.merge_transaction(pay);
+    (txid, beef.to_binary())
 }
