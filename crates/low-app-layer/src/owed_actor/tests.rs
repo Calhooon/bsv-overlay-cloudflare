@@ -8694,7 +8694,7 @@ async fn fold14_a_a_warm_apply_is_one_record_read() {
         .rows
         .iter()
         .for_each(|m| txids_in_value(&m["sourceKey"], &mut two.txids));
-    let (rows_two, _) = read_round(&record, "owner", game, &two, false)
+    let (rows_two, _, _) = read_round(&record, "owner", game, &two, false)
         .await
         .unwrap();
     let one = read_marked(&record, "owner", game, &n, None)
@@ -14898,5 +14898,209 @@ mod d2_actor_f {
         let r = crate::owed_events::direct_with(&port, vec![plain], Some(TIP)).await;
         assert_eq!((port.subjects.get(), port.bounds.get(), r.carried), (1, 1, 0));
         assert!(port.bodies.borrow()[1].get("carried").is_none());
+    }
+}
+
+// ---- D2-ACTOR-F-FOLD (the lens `docs/audit/D2-ACTOR-F-lens-2026-10-31.md`, bsv-low #959) ----
+mod d2_actor_f_fold {
+    use super::*;
+    use crate::owed_events_publish as publish;
+
+    async fn published(record: &SqliteSql, source: &str, key: &str) -> overlay_discovery::owed_event::OwedEvent {
+        let port = crate::owed_events::SqlPublish {
+            db: record,
+            send: |_b: Vec<String>| async { Ok::<(), String>(()) },
+        };
+        let out = publish::publish_with(
+            &port,
+            vec![publish::Noted {
+                source: source.into(),
+                key: key.into(),
+                held: None,
+            }],
+        )
+        .await;
+        assert!(out.fault.is_none(), "{:?}", out.fault);
+        out.sent.into_iter().next().expect("the note was sent")
+    }
+
+    fn mark(record: &SqliteSql, game: &str, source: &str, key: &str) {
+        record
+            .conn
+            .execute(
+                "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner',?1,?2,?3,1) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=(SELECT COALESCE(MAX(generation),0)+1 FROM owed_dirty)",
+                [game, source, key],
+            )
+            .unwrap();
+    }
+
+    fn opts_of(ev: &overlay_discovery::owed_event::OwedEvent, carry: bool) -> ApplyOpts {
+        let e = EventCtx::of(ev);
+        ApplyOpts {
+            touch: e.txids.clone(),
+            carried: if carry { e.carried.get("owner").cloned() } else { None },
+            ..ApplyOpts::default()
+        }
+    }
+
+    async fn applied<R: SqlPort>(
+        record: &R,
+        local: &SqliteSql,
+        games: &[String],
+        ev: &overlay_discovery::owed_event::OwedEvent,
+        carry: bool,
+    ) -> Result<ApplyReport, String> {
+        apply_with(
+            record,
+            local,
+            &Fakes,
+            "owner",
+            games,
+            Some((ev.source.as_str(), ev.seq)),
+            Some(TIP),
+            None,
+            &opts_of(ev, carry),
+        )
+        .await
+        .map(|(r, _)| r)
+    }
+
+    fn one(l: &SqliteSql, sql: &str, key: &str) -> String {
+        l.conn.query_row(sql, [key], |r| r.get(0)).unwrap()
+    }
+
+    /// (fold_m1) THE LENS'S MEDIUM-1, committed (`lens_f_read_bound_regresses_under_an_acked_mark`): two SEENs of one
+    /// pot (`old`, then `new`), each published as the writer publishes it; the newer applied by the narrowed read,
+    /// its mark ACKNOWLEDGED, the game applied once more by the narrowed read (no mark pending), then the OLDER
+    /// event's carried call arrives: it is skipped, the mirror keeps `new`. RED on 3223be64 (the lens's run: the
+    /// read's bound the pending marks' maximum, 0 once acknowledged: `left: "old" right: "new"`); RED with the bound
+    /// put back to the pending marks' maximum.
+    #[tokio::test]
+    async fn fold_m1_a_late_older_carried_row_never_replaces_a_newer_one_after_the_ack() {
+        let (record, local, games) = e_warm_seat(20).await;
+        let pot = h("c8", 7);
+        record
+            .conn
+            .execute(
+                "INSERT INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'old','arcade',1)",
+                [&pot],
+            )
+            .unwrap();
+        mark(&record, &games[7], "seen", &pot);
+        let older = published(&record, "seen", &pot).await;
+        record
+            .conn
+            .execute("UPDATE network_seen SET seenAt='new' WHERE txid=?1", [&pot])
+            .unwrap();
+        mark(&record, &games[7], "seen", &pot);
+        let newer = published(&record, "seen", &pot).await;
+        let seen = "SELECT seenAt FROM network_seen WHERE txid=?1";
+        applied(&record, &local, &games[7..8], &newer, false).await.unwrap();
+        assert_eq!(one(&local, seen, &pot), "new");
+        record.conn.execute("DELETE FROM owed_dirty", []).unwrap(); // the acknowledgement
+        applied(&record, &local, &games[7..8], &newer, false).await.unwrap(); // no mark pending
+        let late = applied(&record, &local, &games[7..8], &older, true).await.unwrap();
+        assert!(late.carried, "the late call took the carried path: {late:?}");
+        assert_eq!(one(&local, seen, &pot), "new", "an older carried row overwrote the newer one");
+        // the bound kept is the record's high-water, the greatest, never lowered
+        let read: i64 = local
+            .conn
+            .query_row(
+                "SELECT MAX(seq) FROM applied WHERE kind='read' AND game=?1",
+                [games[7].to_ascii_lowercase()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let hw: i64 = record
+            .conn
+            .query_row("SELECT seq FROM sqlite_sequence WHERE name='owed_dirty'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(read, hw);
+    }
+
+    /// (fold_m1_b) A MISS ROUND'S BOUND IS PER KEY: a carried collected filing names a payout txid the mirror never
+    /// read; its miss round reads that txid's word (`new`) at the record's high-water. A late carried call of the
+    /// word's OLDER write (published before it moved) is above the game's read bound but below that key's: skipped,
+    /// the mirror keeps `new`. RED with the `read-key` arm dropped from the guard.
+    #[tokio::test]
+    async fn fold_m1_b_a_miss_reads_bound_guards_its_keys() {
+        let (record, local, games) = e_warm_seat(20).await;
+        let pay = h("a2", 9);
+        let marker = h("a1", 9);
+        record
+            .conn
+            .execute("INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'old','hint',1)", [&pay])
+            .unwrap();
+        mark(&record, &games[9], "word", &pay);
+        let older = published(&record, "word", &pay).await;
+        record
+            .conn
+            .execute("UPDATE tx_words SET word='new' WHERE txid=?1", [&pay])
+            .unwrap();
+        mark(&record, &games[9], "word", &pay);
+        record
+            .conn
+            .execute(
+                "INSERT INTO collected_markers_v2(identity,gameId,txid,outputIndex,sigHex,createdAt,payTxid) VALUES ('owner',?1,?2,0,'00',?3,?4)",
+                rusqlite::params![games[9], marker, (NOW_MS / 1000) as i64, pay],
+            )
+            .unwrap();
+        mark(&record, &games[9], "collected", &marker);
+        let filing = published(&record, "collected", &marker).await;
+        let r = applied(&record, &local, &games[9..10], &filing, true).await.unwrap();
+        assert!(r.carried && r.misses >= 1, "{r:?}");
+        let word = "SELECT word FROM tx_words WHERE txid=?1";
+        assert_eq!(one(&local, word, &pay), "new");
+        let late = applied(&record, &local, &games[9..10], &older, true).await.unwrap();
+        assert!(late.carried);
+        assert_eq!(one(&local, word, &pay), "new", "the miss read's newer row was replaced");
+    }
+
+    /// (fold_m2) THE LENS'S MEDIUM-2, committed (`lens_f_a_faulted_carried_apply_leaves_keys_never_read`): a carried
+    /// collected filing whose miss read FAULTS has upserted its marker (naming a payout txid) into the mirror; the
+    /// next carried apply of the game is not taken (the game was left open) and the narrowed read reads the payout's
+    /// word. RED on 3223be64 (the lens's run: `carried=true calls=0`, the word never read); RED with the open mark
+    /// ignored.
+    #[tokio::test]
+    async fn fold_m2_a_faulted_apply_leaves_its_games_open_and_the_next_reads() {
+        let (record, local, games) = e_warm_seat(40).await;
+        let marker = h("a1", 9);
+        let pay = h("a2", 9);
+        record
+            .conn
+            .execute(
+                "INSERT INTO collected_markers_v2(identity,gameId,txid,outputIndex,sigHex,createdAt,payTxid) VALUES ('owner',?1,?2,0,'00',?3,?4)",
+                rusqlite::params![games[9], marker, (NOW_MS / 1000) as i64, pay],
+            )
+            .unwrap();
+        record
+            .conn
+            .execute("INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'mined','chain',1)", [&pay])
+            .unwrap();
+        mark(&record, &games[9], "collected", &marker);
+        let ev = published(&record, "collected", &marker).await;
+        let dead = FaultAfter(&record, Cell::new(0), 0);
+        let first = applied(&dead, &local, &games[9..10], &ev, true).await;
+        assert!(first.is_err(), "the miss read faulted: {first:?}");
+        let b0 = record.batches.get();
+        let r = applied(&record, &local, &games[9..10], &ev, true).await.unwrap();
+        let calls = record.batches.get() - b0;
+        let words: i64 = local
+            .conn
+            .query_row("SELECT COUNT(*) FROM tx_words WHERE txid=?1", [&pay], |r| r.get(0))
+            .unwrap();
+        assert!(r.was_open && !r.carried && r.narrowed, "an open game is the narrowed read: {r:?}");
+        assert!(calls >= 1);
+        assert_eq!(words, 1, "the payout's word was never read");
+        let open: i64 = local
+            .conn
+            .query_row("SELECT COUNT(*) FROM applied WHERE kind='open'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(open, 0, "the whole apply closed its games");
+        // and closed, the next carried apply of the game reads no D1
+        let b0 = record.batches.get();
+        let again = applied(&record, &local, &games[9..10], &ev, true).await.unwrap();
+        assert!(again.carried && !again.was_open);
+        assert_eq!(record.batches.get() - b0, 0);
     }
 }
