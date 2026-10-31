@@ -2618,7 +2618,8 @@ pub struct DirectReport {
     /// D2-ACTOR-B-FOLD-10 (item 8): the first fault's text (a wall's or a refusal's), for the operator's line.
     pub first_fault: Option<String>,
     /// FIX-956 item 3 (Phase C only): games whose marks the pass acknowledged after their apply landed.
-    pub acked: u64,
+    pub acked: u64,    /// D2-ACTOR-F (bsv-low #959): events whose subjects and rows the publish carried (no marks read here).
+    pub carried: u64,
 }
 
 /// D2-ACTOR-B-FOLD-10 (item 8): the direct path's fault line is logged at most once in this many ms an isolate.
@@ -2665,6 +2666,8 @@ struct Coalesced {
     also: Vec<(String, i64)>,
     /// D2-ACTOR-E: the txids every event's write named (`None` once one names no row: the whole closure).
     txids: Option<Vec<String>>,
+    /// D2-ACTOR-F: the rows every event carried for the identity (`None` once one carries none).
+    carried: Option<crate::owed_actor::carried::Carried>,
 }
 
 /// PURE (NEW5-L3, D2-ACTOR-B-FOLD-10): the pass's events' subjects merged into ONE call body an identity (per
@@ -2690,6 +2693,14 @@ pub fn coalesce_direct(
                 }
             }
             c.mined |= e.mined;
+            c.carried = match (c.first.is_none(), c.carried.take(), e.carried.get(&id)) {
+                (true, _, own) => own.cloned(),
+                (false, Some(mut held), Some(own)) => {
+                    held.merge(own.clone());
+                    Some(held)
+                }
+                _ => None,
+            };
             c.txids = match (c.first.is_none(), c.txids.take(), &e.txids) {
                 (true, _, t) => t.clone(),
                 (false, Some(mut t), Some(more)) => {
@@ -2729,10 +2740,16 @@ pub fn coalesce_direct(
             txids: c.txids.clone(),
             also: Vec::new(),
             by_identity: Default::default(),
+            carried: Default::default(),
         };
         for chunk in c.games.chunks(crate::owed_actor::GAMES_PER_APPLY) {
             let mut b = crate::owed_actor::apply_body(&id, chunk, &e, tip);
             b["class"] = json!("direct");
+            // D2-ACTOR-F: the rows the identity's events carried (every one of them), for the actor's apply with no
+            // record read
+            if let Some(carried) = &c.carried {
+                b["carried"] = json!(carried);
+            }
             if !c.also.is_empty() {
                 b["also"] = json!(c.also);
             }
@@ -2851,10 +2868,21 @@ pub async fn direct_with_class(
             report.mined_frames += 1;
         }
         report.events += 1;
-        let Ok(subjects) = port.subjects(&ev).await else {
-            report.left_to_queue += 1;
-            continue;
+        // D2-ACTOR-F (bsv-low #959): an event that carries its row names its subjects too (its pair's marks, read in
+        // the publish's own statement): no D1 read here. Any other event reads its marks as before.
+        let subjects = match crate::owed_actor::carried::carried_subjects(&ev.facts) {
+            Some(s) => s,
+            None => match port.subjects(&ev).await {
+                Ok(s) => s,
+                Err(_) => {
+                    report.left_to_queue += 1;
+                    continue;
+                }
+            },
         };
+        if ev.facts.get("payload").is_some() {
+            report.carried += 1;
+        }
         subjects_of.push((crate::owed_actor::EventCtx::of(&ev), subjects));
     }
     let mut bodies = coalesce_direct(subjects_of, tip);
@@ -2875,7 +2903,9 @@ pub async fn direct_with_class(
             .as_array()
             .map(|a| a.iter().filter_map(|g| g.as_str().map(str::to_owned)).collect())
             .unwrap_or_default();
-        bounds.push(if port.acks() {
+        // D2-ACTOR-F: a carried body acknowledges nothing (its apply covers nothing; the queue's delivery is the
+        // narrowed read that covers the event and acknowledges it), so no bound is read for it.
+        bounds.push(if port.acks() && b.get("carried").is_none() {
             port.bound(&id, &games).await.ok().map(|seen| (id, games, seen))
         } else {
             None

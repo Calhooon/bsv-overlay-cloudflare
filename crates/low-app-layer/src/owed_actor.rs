@@ -48,6 +48,7 @@ use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+pub mod carried;
 pub mod compare;
 pub mod object;
 #[rustfmt::skip]
@@ -852,6 +853,10 @@ pub struct ApplyReport {
     /// (a later round's snapshot is newer than the number), and on a dupe. The reconcile cuts its held partition at it
     /// ([`HELD_GAMES_SQL`]).
     pub read_generation: Option<i64>,
+    /// D2-ACTOR-F (bsv-low #959): the apply judged from the rows its event carried, with no record read of its own
+    /// (a key the carried rows named that the mirror had never read is still read: a miss). It covers nothing
+    /// (`covered` is the D1 read's): the queue's delivery of the event is applied again by the narrowed read.
+    pub carried: bool,
 }
 
 /// The decoded facts of a copied BEEF row: the pot's own (`pot`, `pot_beefs` only) and the stored order's.
@@ -1371,6 +1376,10 @@ pub struct ApplyOpts {
     /// the same record call as its first round ([`page_select`]); `games` is ignored. The page's games and their
     /// `at` are answered on [`ApplyReport::page`].
     pub page: Option<(i64, String)>,
+    /// D2-ACTOR-F (bsv-low #959): the rows the event's write changed, carried by the writer's direct call
+    /// ([`carried::Carried`]): over warm games they are upserted into the mirror and the games judged from it with no
+    /// record read; `None` (or any item the mirror cannot take as it stands) is the narrowed read, as before.
+    pub carried: Option<carried::Carried>,
 }
 
 /// THE APPLY: the closure over `games` of `me`, then the last judgement over the mirror with the outside held.
@@ -1559,6 +1568,29 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
     };
     let mut narrow: Option<Keys> = None;
     let mut covered: Option<i64> = None;
+    // D2-ACTOR-F: the bound of this apply's own record read (every phase), recorded per game as `read` so a carried row
+    // older than it is never upserted over what the read held.
+    let mut read_bound: Option<i64> = None;
+    // D2-ACTOR-F (bsv-low #959): the carried rows, over warm games: upserted into the mirror, and the first round's
+    // read is the mirror itself (no record call). `None`: the narrowed read below, as before.
+    let carried_applied: Option<(Vec<carried::CarriedItem>, Vec<(String, i64)>)> =
+        match (warm && opts.page.is_none(), &opts.carried) {
+            (true, Some(c)) => {
+                let t = local.now_ms();
+                let up = carried_upsert(local, &games, c).await;
+                report.write_ms += local.now_ms().saturating_sub(t);
+                match up {
+                    Ok(applied) => Some(applied),
+                    Err(e) => {
+                        local.log(&format!(
+                            "[owed-actor] {me}: the carried rows not taken ({e}): the narrowed read"
+                        ));
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
     // D2-ACTOR-B-FOLD-14 (bsv-low #954 item 9): the first round's read, made with the marks in ONE record call.
     let mut pre: Option<(Keys, Vec<Vec<Value>>)> = None;
     if let Some((k, rows, bound)) = paged {
@@ -1567,8 +1599,9 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
         pre = Some((k, rows));
         covered = Some(bound);
         report.read_generation = Some(bound);
+        read_bound = Some(bound);
     }
-    if let (true, Some(touch)) = (warm, &opts.touch) {
+    if let (true, Some(touch), None) = (warm, &opts.touch, &carried_applied) {
         // The warm mirror's WHOLE key set, every family, beside the event's keys (FOLD-11, NEW6-M1: no family is
         // narrowed to the event's rows, because no family's every writer marks every identity its rows reach) and,
         // inside the statement, the marks' keys (their bound is what this apply covers: every mark it counts names a
@@ -1607,6 +1640,7 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
             .max()
             .unwrap_or(0);
         report.read_generation = Some(bound);
+        read_bound = Some(bound);
         if marks
             .iter()
             .any(|m| FULL_SOURCES.contains(&m["source"].as_str().unwrap_or("")))
@@ -1631,6 +1665,12 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
     }
     // What the record was read for in this apply (a later round reads only the keys past it).
     let mut fetched = Keys::default();
+    if carried_applied.is_some() {
+        // D2-ACTOR-F: every key the mirror's rows named before the carried rows was read by an earlier apply (each
+        // apply ends at a fixpoint over what it read), so the first round's read is the mirror; a key the carried rows
+        // name that is not among them is the next round's record read (a miss).
+        fetched = keys.clone();
+    }
     let mut first = true;
     let (staged, mut pushes) = loop {
         if report.rounds >= CLOSURE_ROUNDS_MAX {
@@ -1653,10 +1693,13 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
                 Vec::new(),
             ),
         };
-        if !first || narrow.is_none() {
+        if !first || (narrow.is_none() && carried_applied.is_none()) {
             report.misses += 1;
         }
+        let carried_round = first && carried_applied.is_some();
         let (read_keys, read) = match pre.take() {
+            // D2-ACTOR-F: the carried round reads nothing; its rows are already in the mirror.
+            _ if carried_round => (Keys::default(), Vec::new()),
             // FOLD-14: the marked read was this round's (its key set is a superset of the mirror's).
             Some((k, rows)) if first => (k, rows),
             _ => {
@@ -1673,16 +1716,19 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
                 if first && narrow.is_none() {
                     covered = bound;
                     report.read_generation = bound;
+                    read_bound = bound;
                 }
                 (read_keys, read)
             }
         };
         report.record_rows += read.iter().map(Vec::len).sum::<usize>();
-        let t = local.now_ms();
-        local
-            .run_batch(write_round(&me, &read_games, &read_keys, &read, seq))
-            .await?;
-        report.write_ms += local.now_ms().saturating_sub(t);
+        if !carried_round {
+            let t = local.now_ms();
+            local
+                .run_batch(write_round(&me, &read_games, &read_keys, &read, seq))
+                .await?;
+            report.write_ms += local.now_ms().saturating_sub(t);
+        }
         fetched.txids.extend(read_keys.txids.iter().cloned());
         fetched.markers.extend(read_keys.markers.iter().copied());
         first = false;
@@ -1723,6 +1769,11 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
     };
     report.txids = keys.txids.len();
     report.narrowed = narrow.is_some();
+    report.carried = carried_applied.is_some();
+    if report.carried {
+        // a carried apply read no marks with the record (the reconcile's held partition is uncut)
+        report.read_generation = None;
+    }
     if report.rounds > 1 {
         // FIX-960: a later round read a newer snapshot than the marks' number names.
         report.read_generation = None;
@@ -1734,7 +1785,31 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
         push["rows"] = json!(report.rows);
     }
     let mut marks = Vec::new();
-    if narrow.is_none() {
+    if let Some((items, carried_marks)) = &carried_applied {
+        let applied: Vec<&carried::CarriedItem> = items.iter().collect();
+        let own: Vec<(String, i64)> = carried_marks
+            .iter()
+            .filter(|(g, _)| games.contains(&g.to_ascii_lowercase()))
+            .cloned()
+            .collect();
+        marks.extend(carried::record_statements(&applied, &own, now));
+    }
+    if let Some(b) = read_bound {
+        marks.push(Stmt::new(
+            carried::READ_BOUND_CLEAR_SQL,
+            vec![Bind::Text(json!(games).to_string())],
+        ));
+        marks.push(Stmt::new(
+            APPLIED_SQL,
+            vec![
+                Bind::Text(carried::READ_BOUND_KIND.into()),
+                Bind::Int(b),
+                Bind::Int(now),
+                Bind::Text(json!(games).to_string()),
+            ],
+        ));
+    }
+    if narrow.is_none() && carried_applied.is_none() {
         marks.push(Stmt::new(
             FULL_STAMP_SQL,
             vec![Bind::Int(now), Bind::Text(json!(games).to_string())],
@@ -1806,6 +1881,54 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
     report.outside_ms = held.outside_ms.get();
     report.judge_ms = total.saturating_sub(report.read_ms + report.write_ms + report.outside_ms);
     Ok((report, pushes))
+}
+
+/// D2-ACTOR-F (bsv-low #959): the carried rows into the mirror, every item validated first ([`carried::item_statements`]:
+/// any item the mirror cannot take as it stands is the whole path's `Err`, never a partial upsert), then each item whose
+/// domain the actor already holds at or past its generation skipped ([`carried::HELD_GENERATION_SQL`]: an earlier
+/// carried item, or a record read of one of its games at or past it, held the write already), the rest written in one
+/// batch. Answers the items written and the marks the call carried (every mark is applied: a skipped item's rows are
+/// in the mirror at or past its generation). `Err` when an item names no game of this apply.
+async fn carried_upsert<L: SqlPort>(
+    local: &L,
+    games: &[String],
+    c: &carried::Carried,
+) -> Result<(Vec<carried::CarriedItem>, Vec<(String, i64)>), String> {
+    let mut staged: Vec<(&carried::CarriedItem, Vec<Stmt>)> = Vec::new();
+    for it in &c.items {
+        if !it.games.iter().any(|g| games.contains(&g.to_ascii_lowercase())) {
+            return Err(format!("a carried {} item names no game of the apply", it.t));
+        }
+        staged.push((it, carried::item_statements(it)?));
+    }
+    let held = local
+        .run_batch(
+            staged
+                .iter()
+                .map(|(it, _)| {
+                    let games: Vec<String> = it.games.iter().map(|g| g.to_ascii_lowercase()).collect();
+                    Stmt::new(
+                        carried::HELD_GENERATION_SQL,
+                        vec![Bind::Text(it.domain()), Bind::Text(json!(games).to_string())],
+                    )
+                })
+                .collect(),
+        )
+        .await?;
+    let mut write = Vec::new();
+    let mut applied = Vec::new();
+    for ((it, stmts), out) in staged.into_iter().zip(held) {
+        let newest = out.rows.first().and_then(|r| r["g"].as_i64());
+        if newest.is_some_and(|n| n >= it.g) {
+            continue;
+        }
+        write.extend(stmts);
+        applied.push(it.clone());
+    }
+    if !write.is_empty() {
+        local.run_batch(write).await?;
+    }
+    Ok((applied, c.marks.clone()))
 }
 
 /// The identity's judged rows, copied aside before the fixpoint's commit (HIGH-2): every row of the identity, since
@@ -1893,7 +2016,7 @@ pub async fn commit_fixpoint<L: SqlPort>(
 /// The answer of one apply (the object's `/apply`, the pins' harness): the actor's rows, the redelivery verdict, the
 /// games the event has applied.
 pub fn answer_of(report: &ApplyReport, rows: Vec<Value>) -> Value {
-    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply, "misses": report.misses, "narrowed": report.narrowed, "coalesced": report.coalesced, "readMs": report.read_ms, "judgeMs": report.judge_ms, "writeMs": report.write_ms, "waitMs": report.wait_ms, "outsideMs": report.outside_ms, "asksQueued": report.asks, "readGeneration": report.read_generation})
+    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply, "misses": report.misses, "narrowed": report.narrowed, "coalesced": report.coalesced, "readMs": report.read_ms, "judgeMs": report.judge_ms, "writeMs": report.write_ms, "waitMs": report.wait_ms, "outsideMs": report.outside_ms, "asksQueued": report.asks, "readGeneration": report.read_generation, "carried": report.carried})
 }
 
 /// D2-ACTOR-E (bsv-low #954) item 4: was the event born on a WARM actor (written at or after the actor's bootstrap
@@ -2278,6 +2401,8 @@ pub struct BurstItem {
     pub tip: Option<u64>,
     pub bound: Option<i64>,
     pub touch: Option<Vec<String>>,
+    /// D2-ACTOR-F: the rows the event's write changed ([`ApplyOpts::carried`]).
+    pub carried: Option<carried::Carried>,
 }
 
 type BurstResult = Result<(ApplyReport, Vec<(String, Value)>), String>;
@@ -2381,7 +2506,17 @@ pub async fn apply_burst<R: SqlPort, L: SqlPort, O: Outside>(
     let mut union: Vec<String> = Vec::new();
     let mut touch: Option<Vec<String>> = Some(Vec::new());
     let mut tip: Option<u64> = None;
+    // D2-ACTOR-F: the pass carries rows only when EVERY event of it does (one event that names no row is the record's
+    // read for the whole pass, which reads every carried row anyway).
+    let mut carried_all: Option<carried::Carried> = Some(carried::Carried::default());
     for (_, item, _) in &live {
+        carried_all = match (carried_all, &item.carried) {
+            (Some(mut c), Some(more)) => {
+                c.merge(more.clone());
+                Some(c)
+            }
+            _ => None,
+        };
         for g in lowered(&item.games) {
             if !union.contains(&g) {
                 union.push(g);
@@ -2412,6 +2547,16 @@ pub async fn apply_burst<R: SqlPort, L: SqlPort, O: Outside>(
             narrow_covers,
             also: events,
             page: None,
+            carried: carried_all
+                .clone()
+                .filter(|c| !c.items.is_empty())
+                .map(|mut c| {
+                    // the chunk's items alone (an item names its games), every mark kept (the apply records its own)
+                    c.items
+                        .retain(|i| i.games.iter().any(|g| chunk.contains(&g.to_ascii_lowercase())));
+                    c
+                })
+                .filter(|c| !c.items.is_empty()),
         };
         let applied = apply_with(record, local, outside, me, chunk, None, tip, era_ms, &opts).await;
         let applied = match applied {
@@ -2444,6 +2589,7 @@ pub async fn apply_burst<R: SqlPort, L: SqlPort, O: Outside>(
         report.misses = reports.iter().map(|r| r.misses).sum();
         report.record_rows = reports.iter().map(|r| r.record_rows).sum();
         report.narrowed = reports.iter().all(|r| r.narrowed);
+        report.carried = reports.iter().all(|r| r.carried);
         report.coalesced = passes;
         // FOLD-14 item 2: the pass's stages, every chunk's (each event of the pass answered the same pass).
         report.read_ms = reports.iter().map(|r| r.read_ms).sum();
@@ -2645,6 +2791,10 @@ pub struct HeldEvent {
     /// event's drain reads the whole closure).
     #[serde(default, skip_serializing)]
     pub touch: Option<Vec<String>>,
+    /// D2-ACTOR-F: the rows the event's write carried ([`ApplyOpts::carried`]); never stored with a held event (its
+    /// drain reads the whole closure).
+    #[serde(default, skip_serializing)]
+    pub carried: Option<carried::Carried>,
 }
 impl HeldEvent {
     pub fn name(&self) -> String {
@@ -2755,6 +2905,7 @@ pub async fn apply_or_hold_in<R: SqlPort, L: SqlPort, O: Outside>(
                 tip,
                 bound: ev.bound,
                 touch: ev.touch.clone(),
+                carried: ev.carried.clone(),
             };
             apply_coalesced(
                 burst,
@@ -4076,6 +4227,7 @@ pub fn reconcile_apply_body(
         txids: None,
         also: Vec::new(),
         by_identity: Default::default(),
+        carried: Default::default(),
     };
     let mut body = apply_body(identity, games, &e, tip);
     body["seq"] = Value::Null;
@@ -5872,6 +6024,10 @@ pub struct EventCtx {
     /// delivery, carried as it stands. One `also` served every identity of the batch, so an event naming another
     /// identity read as a first apply in each actor and was sampled once per identity.
     pub by_identity: BTreeMap<String, Vec<(String, i64, i64, bool)>>,
+    /// D2-ACTOR-F (bsv-low #959): the rows the event's write changed, per identity its marks name
+    /// ([`carried::Carried::of_event`]); empty for an event that carries none. Only the writer's direct call sends
+    /// them ([`crate::owed_events::coalesce_direct`]); the queue's delivery is the narrowed read.
+    pub carried: BTreeMap<String, carried::Carried>,
 }
 
 impl EventCtx {
@@ -5931,7 +6087,14 @@ pub fn event_txids(ev: &overlay_discovery::owed_event::OwedEvent) -> Option<Vec<
     }
     let mut out = BTreeSet::new();
     txids_in(&ev.source_key, &mut out);
-    txids_in_value(&ev.facts, &mut out);
+    // D2-ACTOR-F: the carried rows and their marks are not the event's touch (the narrowed read's keys stay the
+    // write's own facts, as before)
+    let mut facts = ev.facts.clone();
+    if let Some(f) = facts.as_object_mut() {
+        f.remove("payload");
+        f.remove("subjects");
+    }
+    txids_in_value(&facts, &mut out);
     Some(out.into_iter().collect())
 }
 /// FIX-974 (bsv-low #974): the tracker frame kind that IS the mined word: `proof`, the bump the overlay's
@@ -5963,6 +6126,11 @@ impl EventCtx {
             txids: event_txids(ev),
             also: Vec::new(),
             by_identity: BTreeMap::new(),
+            carried: carried::carried_subjects(&ev.facts)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(id, _)| Some((id.clone(), carried::Carried::of_event(&ev.facts, &id)?)))
+                .collect(),
         }
     }
 }
