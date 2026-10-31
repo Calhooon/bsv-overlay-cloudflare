@@ -1001,6 +1001,26 @@ pub(crate) mod pins {
         (seed, sweep_txid)
     }
 
+    /// FIX-1001 (bsv-low #1001, L55's S2): the captured pair 13's twin-only seat (030d9e9f..., NO hop marker: its
+    /// hop is its eviction's released evidence) FILES its sweep of the hop (9b238eed...:0) to its committed home, the
+    /// discovery pass's pointer names the sweep (unconfirmed) and the engine holds the sweep's bytes unproven
+    /// (`transactions.has_proof` 0). Answers the rows, the sweep's txid and the filing's.
+    pub(crate) fn fix1001_seed() -> (Vec<String>, String) {
+        let mut seed = l23::l23_r2_route_rows(NOW_MS / 1000);
+        let sweep = home_marker_sweep();
+        let s = sweep.id();
+        let mut beef = bsv_rs::transaction::Beef::new();
+        beef.merge_raw_tx(sweep.to_binary(), None);
+        let made = NOW_MS / 1000 - 3_600;
+        seed.push(format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES ('{HOME_MARKER_SEAT}','{HOME_MARKER_GAME}','{HOME_MARKER_HOP}',0,'{s}','{}','{}',0,{made})", hex::encode(sweep.to_binary()), "f1".repeat(32)));
+        seed.push(format!(
+            "INSERT INTO transactions(txid,beef,has_proof,created_at) VALUES ('{s}',x'{}',0,{made})",
+            hex::encode(beef.to_binary())
+        ));
+        seed.push(format!("UPDATE pot_records SET spent=1,spendingTxid='{s}',spentConfirmed=0 WHERE txid='{HOME_MARKER_HOP}' AND outputIndex=0"));
+        (seed, s)
+    }
+
     fn home_marker_row(judge: &SqliteSql) -> (String, serde_json::Value, Option<String>) {
         judge
             .conn

@@ -645,7 +645,9 @@ pub fn migration_list_fingerprint() -> u32 {
 /// each owed actor (its ring writes it, `/health/invariants.owedActor.fleetCompare` reads it): the overlay first.
 /// 474 to 475 for bsv-low #986 (FIX-986): `idx_pot_spent_unclassified`, the partial index of the params
 /// backfill's second verdict candidate set (`d1_discovery::spent_unclassified_candidates_sql`). Index only.
-pub const OVERLAY_MIGRATION_COUNT: usize = 475;
+/// 475 to 479 for bsv-low #1001 (FIX-1001): `idx_hopsweep_sweep` and three appended `owed_dirty` triggers
+/// (`owed_dirty_transactions_proof_insert`, `_proof_update`, `owed_dirty_pot_records_update_filers`).
+pub const OVERLAY_MIGRATION_COUNT: usize = 479;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2478,6 +2480,14 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // rows on beta at the fold) and drains as the scan latches each row's
     // verdict group from its spender's held BEEF. Additive; `IF NOT EXISTS`.
     "CREATE INDEX IF NOT EXISTS idx_pot_spent_unclassified ON pot_records(spentConfirmed) WHERE spent = 1 AND lockKind = 'covenant' AND (verdict IS NULL OR verdictTxid IS NOT spendingTxid)",
+    // 476..479: bsv-low #1001 (FIX-1001, L55's S2): every writer of a hop's spend confirmation marks the seats the
+    // judge reads it for. The filed sweeps by their sweep (the index the transactions triggers read), the sweep's
+    // proof in `transactions` (no trigger marked it: the actor never heard the `index-proof`), and a hop row's update
+    // naming its markerless seats (a filing, the eviction's released evidence). New triggers, none edited.
+    crate::derived_owed::HOPSWEEP_SWEEP_INDEX,
+    crate::derived_owed::write_time::TX_PROOF_INSERT,
+    crate::derived_owed::write_time::TX_PROOF_UPDATE,
+    crate::derived_owed::write_time::POT_UPDATE_FILERS,
 ];
 
 // =============================================================================

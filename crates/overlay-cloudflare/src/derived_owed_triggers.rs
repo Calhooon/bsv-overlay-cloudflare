@@ -349,3 +349,61 @@ pub const RELEASED_HOP_MISSING_INSERT: &str = trigger!(
 pub const SPENDER_BYTES_INSERT: &str = trigger!("owed_spender_bytes", insert, "INSERT",
     mark!("word", "NEW.txid", "NEW.createdAtMs",
         "SELECT r.identity,r.gameId FROM owed_row_words w INDEXED BY idx_owed_row_words_txid CROSS JOIN owed_rows r ON r.identity=w.identity AND r.outpoint=w.outpoint WHERE w.txid=NEW.txid"));
+
+// FIX-1001 (bsv-low #1001, L55's S2): the spend confirmation's writers the triggers above did not reach. Appended
+// (never an edit of a shipped trigger): each one is a NEW trigger beside the shipped ones, marking the pair its writer
+// already notes, so the consumer's routing read finds the subjects the judge reads them for.
+macro_rules! tx_proof_subjects {
+    () => {
+        "SELECT s.identity,s.gameId FROM hopsweep_records s INDEXED BY idx_hopsweep_sweep WHERE s.sweepTxid=NEW.txid \
+         UNION ALL SELECT pp.identity,pp.gameId FROM potparty_records pp INDEXED BY idx_potparty_pot WHERE pp.potTxid=NEW.txid"
+    };
+}
+/// The engine's verified stitch of a transaction's proof (`update_transaction_beef`'s `INSERT OR REPLACE`, which fires
+/// INSERT): the filed sweeps it pays (`hopsweep_records.sweepTxid`: the owed judge's `index-proof`, its
+/// `sweepProofHeight`) and the parties of a pot it is. Only a write that lands a proof marks.
+pub const TX_PROOF_INSERT: &str = trigger!(
+    "transactions",
+    proof_insert,
+    INSERT,
+    mark!(
+        "beef",
+        "NEW.txid",
+        "NEW.created_at * 1000",
+        tx_proof_subjects!(),
+        " WHERE NEW.has_proof=1"
+    )
+);
+/// The proof latched, re-anchored or withdrawn in place (`mark_transaction_proven(_at)`, the reorg sweep's
+/// `TRANSACTION_UNPROVE_SQL`): a withdrawal is a downgrade (it takes the `index-proof` press away).
+pub const TX_PROOF_UPDATE: &str = trigger!(
+    "transactions",
+    proof_update,
+    "UPDATE OF has_proof,proofHeight",
+    mark!(
+        class "(OLD.has_proof=1 AND NEW.has_proof IS NOT 1)",
+        "beef",
+        "NEW.txid",
+        "NEW.created_at * 1000",
+        tx_proof_subjects!(),
+        " WHERE OLD.has_proof IS NOT NEW.has_proof OR OLD.proofHeight IS NOT NEW.proofHeight"
+    )
+);
+/// A hop's index row moved (the confirmation chase's `spentConfirmed` / `spentHeight` latch, a pointer written,
+/// displaced or demoted): beside `POT_UPDATE`'s subjects (the hop's markers), the seats whose claim on the hop is a
+/// FILED SWEEP or the eviction's RELEASED EVIDENCE, which hold no marker (L55's twin-only seat). The same pair.
+pub const POT_UPDATE_FILERS: &str = trigger!(
+    "pot_records",
+    update_filers,
+    UPDATE,
+    mark!(
+        class "(OLD.spent IS NOT NEW.spent OR OLD.spendingTxid IS NOT NEW.spendingTxid OR OLD.spentConfirmed IS NOT NEW.spentConfirmed OR OLD.txid<>NEW.txid OR OLD.outputIndex<>NEW.outputIndex)",
+        "pot",
+        "NEW.txid || ':' || NEW.outputIndex",
+        created_at!("NEW"),
+        concat!(
+            "SELECT s.identity,s.gameId FROM hopsweep_records s INDEXED BY idx_hopsweep_hop WHERE s.hopTxid=NEW.txid AND s.hopVout=NEW.outputIndex ",
+            "UNION ALL SELECT r.identity,r.gameId FROM released_hop_evidence r WHERE r.hopTxid=NEW.txid AND r.hopVout=NEW.outputIndex"
+        )
+    )
+);

@@ -742,7 +742,13 @@ impl Storage for D1Storage {
             .bind(proof_height.map_or(crate::d1::QVal::Null, crate::d1::QVal::Float))
             .execute(&self.db)
             .await
-            .map_err(d1_err)
+            .map_err(d1_err)?;
+        // bsv-low #1001 (FIX-1001): a stitch that lands the proof is the owed event of the transaction's proof (the
+        // `transactions` trigger's pair: a filed sweep's `index-proof`), published at the invocation's flush point
+        if has_proof == 1 {
+            crate::owed_events::note("beef", txid);
+        }
+        Ok(())
     }
 
     async fn mark_transaction_proven_at(
@@ -765,6 +771,8 @@ impl Storage for D1Storage {
             .execute(&self.db)
             .await
             .map_err(d1_err)?;
+        // bsv-low #1001 (FIX-1001): the latch is the owed event of the transaction's proof (the `transactions` pair)
+        crate::owed_events::note("beef", txid);
         // bsv-low #451 (the second gate's MEDIUM-3b): confirm beats the latch — and the verdict memo
         Query::new(crate::proof_fetcher::TX_ANY_VERDICT_DELETE_SQL)
             .bind(txid)
@@ -793,6 +801,8 @@ impl Storage for D1Storage {
         .execute(&self.db)
         .await
         .map_err(d1_err)?;
+        // bsv-low #1001 (FIX-1001): the latch is the owed event of the transaction's proof (the `transactions` pair)
+        crate::owed_events::note("beef", txid);
         // bsv-low #451 (the second gate's MEDIUM-3b): confirm beats the latch — and the verdict memo
         Query::new(crate::proof_fetcher::TX_ANY_VERDICT_DELETE_SQL)
             .bind(txid)

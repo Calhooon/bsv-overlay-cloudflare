@@ -81,6 +81,7 @@ pub const MIRROR_DDL: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS hopsweep_records (identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, sweepTxid TEXT NOT NULL, sweepRawHex TEXT NOT NULL, txid TEXT NOT NULL, outputIndex INTEGER NOT NULL, createdAt INTEGER, PRIMARY KEY (txid, outputIndex))"#,
     r#"CREATE INDEX IF NOT EXISTS idx_hopsweep_hop ON hopsweep_records(hopTxid, hopVout)"#,
     r#"CREATE INDEX IF NOT EXISTS idx_hopsweep_identity ON hopsweep_records(identity)"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_hopsweep_sweep ON hopsweep_records(sweepTxid)"#,
     r#"CREATE TABLE IF NOT EXISTS released_hop_evidence (hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, identity TEXT NOT NULL, gameId TEXT NOT NULL, potTxid TEXT NOT NULL, seatSettlePubkey TEXT NOT NULL, hopSats INTEGER NOT NULL, evictedAt INTEGER NOT NULL, PRIMARY KEY (hopTxid, hopVout, identity))"#,
     r#"CREATE INDEX IF NOT EXISTS idx_released_hop_evidence_identity_game ON released_hop_evidence(identity, gameId)"#,
     r#"CREATE TABLE IF NOT EXISTS released_hop_evidence_missing (identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, potTxid TEXT NOT NULL, evictedAt INTEGER NOT NULL, bytesRead INTEGER NOT NULL, PRIMARY KEY (identity, gameId, hopTxid, hopVout))"#,
@@ -308,7 +309,7 @@ pub const BLOBS: &[(&str, &str)] = &[
     ("transactions", "beef"),
 ];
 /// The schema's digest, held in the actor's `meta` (`schema`): a mirror built under another is dropped and rebuilt.
-pub const DIGEST: &str = "b045ad5183a91c85716961e252e6ea671e192fe0f717824738450a2db166e2be";
+pub const DIGEST: &str = "db7361b4f1234f32b734c39b494aa2789603f5b07cae2dbd486a2ff99f15b027";
 
 pub fn columns(table: &str) -> &'static [&'static str] {
     COLUMNS
