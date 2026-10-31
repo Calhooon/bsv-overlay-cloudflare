@@ -3931,14 +3931,15 @@ async fn d2_actor_b_fold7_c_a_bootstrapped_actor_past_the_bound_rearms_and_holds
     let turn = futures_util::lock::Mutex::new(());
     let (_, _, _) = fold7_bootstrap(&turn, &record, &local, "owner").await;
     assert!(fold7_meta(&local, "bootstrapped").is_some());
-    // The record grows: game 5's hop names a chain of 20 word rows.
+    // The record grows: game 5's hop names a chain of 20 word rows (each names the next in a column the key rule
+    // reads: since D2-ACTOR-F-FOLD-2 `legacy_body` is one of `NOT_KEY_COLUMNS`, never a key).
     let hop = h("b8", 5);
     let mut chain = vec![hop.clone()];
     chain.extend((0..20).map(|i| h("fa", i)));
     for w in chain.windows(2) {
         record.conn.execute(
-            "INSERT OR REPLACE INTO tx_words(txid,word,tier,updated_at,legacy_body) VALUES (?1,'seen','hint',1,?2)",
-            [&w[0], &format!("{{\"next\":\"{}\"}}", w[1])],
+            "INSERT OR REPLACE INTO tx_words(txid,word,tier,updated_at,hint_source) VALUES (?1,'seen','hint',1,?2)",
+            [&w[0], &w[1]],
         ).unwrap();
     }
     let ev = fold7_event("word", 31, &games[5..6], NOW_MS - 100);
@@ -3963,8 +3964,8 @@ async fn d2_actor_b_fold7_c_a_bootstrapped_actor_past_the_bound_rearms_and_holds
     let reference = seeded(&f);
     for w in chain.windows(2) {
         reference.conn.execute(
-            "INSERT OR REPLACE INTO tx_words(txid,word,tier,updated_at,legacy_body) VALUES (?1,'seen','hint',1,?2)",
-            [&w[0], &format!("{{\"next\":\"{}\"}}", w[1])],
+            "INSERT OR REPLACE INTO tx_words(txid,word,tier,updated_at,hint_source) VALUES (?1,'seen','hint',1,?2)",
+            [&w[0], &w[1]],
         ).unwrap();
     }
     for chunk in games.chunks(16) {
