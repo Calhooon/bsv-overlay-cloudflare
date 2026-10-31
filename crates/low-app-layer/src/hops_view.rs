@@ -1163,8 +1163,9 @@ pub const PROBE_MEMO_UPSERT_SQL: &str = "INSERT INTO hop_chain_probes (outpoint,
 /// (`<txid>:<vout>`, a colon where the memo has a dot), with the same columns (`spent` 1, `spendingTxid`,
 /// `spentConfirmed`, `tipHeight`, `probedAtMs` the time of the look). The overlay's TTL sweep leaves such a row while
 /// the outpoint's index row (`pot_records`) stands, and `owed::PROOF_LATCH_MOVED_DELETE_SQL` never names it (its keys
-/// are `proofmined:` latches); the reorg clear still takes a CONFIRMED one (a chain word a reorg may unmake: the hop is
-/// then judged by the index and the belt asks again). The judge reads it for every hop it judges, after the memo
+/// are `proofmined:` latches); the reorg clear takes a CONFIRMED one's confirmation and keeps the spend (bsv-low #1027,
+/// the overlay's `HOP_PROBE_MEMO_REORG_DEMOTE_SQL`: a reorg may unmake a confirmation, and the belt asks the outpoint
+/// again; deleting the row put the index's `unspent` and its press over a spend the chain held). The judge reads it for every hop it judges, after the memo
 /// (`owed_judge::hydrate`: a hop with no memo is judged on its evidence, served as a memo that is not fresh), so the
 /// D1 judge and the actor, whose closure reaches it by the hop's txid (`owed_actor::Key::ProbeRange`) and the spender's
 /// bytes by the txid it names, judge the same spend whatever the memo's age. A belt look that finds the outpoint

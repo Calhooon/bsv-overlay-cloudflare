@@ -17,7 +17,9 @@
 //!    evidence every memo with `spentConfirmed = 1` is deleted (the superset of the memos at the orphaned
 //!    heights) and the next owed walk re-probes them, eight per recompute. A pass that scanned and left every row
 //!    standing is NOT evidence: the routine sweep runs every block, and clearing on it would unmake the memo.
-//!    An unconfirmed spend and an unspent word keep their own five minutes.
+//!    An unconfirmed spend and an unspent word keep their own five minutes. The belt's EVIDENCE of a spend
+//!    (`<txid>:<vout>`, bsv-low #953) is not deleted: its confirmation is taken (`spentConfirmed` NULL) and the
+//!    spend it records stands until a belt look says otherwise (bsv-low #1027, [`HOP_PROBE_MEMO_REORG_DEMOTE_SQL`]).
 //! 2. **The TTL the contract states.** No reader honours a memo older than the confirmed window, so a row past
 //!    it is dead weight: every block-event pass deletes them ([`HOP_PROBE_MEMO_TTL_MS`], pinned equal to the app
 //!    layer's longest window from its tests, which link this crate).
@@ -114,17 +116,47 @@ pub const HOP_PROBE_MEMO_APP_LAYER_PREFIXES: [&str; 2] = ["homeproof:", "homecur
 pub const HOP_PROBE_MEMO_REORG_DEMOTED_PREFIXES: [&str; 1] = ["proofmined:"];
 
 /// Rule 1: every memo that recorded a CONFIRMED spend, never the app layer's own rows (a latch written from a
-/// confirmed probe carries `spentConfirmed = 1` too).
-pub const HOP_PROBE_MEMO_REORG_CLEAR_SQL: &str =
-    concat!("DELETE FROM hop_chain_probes WHERE ", clear_pred!());
+/// confirmed probe carries `spentConfirmed = 1` too), and never the belt's EVIDENCE of a spend (`<txid>:<vout>`,
+/// [`HOP_PROBE_MEMO_REORG_DEMOTE_SQL`] demotes it instead: bsv-low #1027).
+pub const HOP_PROBE_MEMO_REORG_CLEAR_SQL: &str = concat!(
+    "DELETE FROM hop_chain_probes WHERE ",
+    clear_pred!(),
+    " AND substr(outpoint,65,1)<>':'"
+);
 
-/// FIX-1010: rule 1's marks, the first statement of the clear's batch.
+/// bsv-low #1027 (lane FIX-1027-BELT-FIND-RECORD): A REORG UNMAKES A CONFIRMATION, NOT THE FIND OF A SPEND. The belt's
+/// evidence (`<txid>:<vout>`, `low-app-layer` `hops_view::probe_evidence_key`) is the record's only word that a
+/// courier saw the hop spent by a transaction the index does not hold. Rule 1 deleted it with the memos, so after any
+/// reorg pass the D1 judge read the hop by the index alone (`index-unspent`, the sweep press) over a spend the chain
+/// holds, until a belt look found it again; and with the D1 judge off nothing dates that look, so the record lost the
+/// spend for good (beta, 2026-10-31 22:16:17Z: 65 outpoints of six identities, the fleet compare's diffs). Now the
+/// clear keeps the evidence and takes only its confirmation (`spentConfirmed` NULL, unknown): both judges read the hop
+/// spent and not confirmed (`unbound`, no press), and the belt asks the OUTPOINT for it at its backoff
+/// (`owed_belt::rests_on_unconfirmed_find`): a look that finds it confirmed again restores the word, one that finds it
+/// unspent deletes the row (`PROBE_EVIDENCE_CLEAR_SQL`) and the press returns. Answers the keys it demoted (each
+/// noted `probe`, its mark written by [`HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL`] in the same batch).
+pub const HOP_PROBE_MEMO_REORG_DEMOTE_SQL: &str = concat!(
+    "UPDATE hop_chain_probes SET spentConfirmed=NULL WHERE ",
+    clear_pred!(),
+    " AND substr(outpoint,65,1)=':' RETURNING outpoint"
+);
+
+/// bsv-low #1027: rule 1's framed writes in the batch's order after the marks, as [`clear_on_reorg`] runs them (the
+/// memos deleted, then the belt's evidence demoted); each answers its keys.
+pub const HOP_PROBE_MEMO_REORG_CLEAR_FRAMED: [&str; 2] = [
+    HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL,
+    HOP_PROBE_MEMO_REORG_DEMOTE_SQL,
+];
+
+/// FIX-1010: rule 1's marks, the first statement of the clear's batch (the memos it deletes and the evidence it
+/// demotes: a confirmation withdrawn is a downgrade either way).
 pub const HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL: &str = probe_marks!(clear_pred!());
 /// FIX-1010: rule 1's delete as the batch runs it, answering the keys it deleted (each noted `probe`, so its event
 /// reaches the actor).
 pub const HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL: &str = concat!(
     "DELETE FROM hop_chain_probes WHERE ",
     clear_pred!(),
+    " AND substr(outpoint,65,1)<>':'",
     " RETURNING outpoint"
 );
 
@@ -246,16 +278,17 @@ struct Deleted {
     outpoint: String,
 }
 
-/// FIX-1010: one batch, the marks first then the delete that answers its keys (D1 runs a batch as one transaction: a
-/// deleted row's subjects are marked or nothing is deleted); each key a mark may name is noted `probe` for the
-/// invocation's publish (its event reaches the actor by the direct call, the queue behind it). Returns the rows deleted.
+/// FIX-1010: one batch, the marks first then the framed writes that answer their keys (D1 runs a batch as one
+/// transaction: a written row's subjects are marked or nothing is written); each key a mark may name is noted `probe`
+/// for the invocation's publish (its event reaches the actor by the direct call, the queue behind it). The framed
+/// writes take the same binds (the clear's: none; the sweep's: its bound). Returns the rows each framed write answered.
 async fn marked_delete(
     db: &D1Database,
     mark_sql: &str,
-    framed_sql: &str,
+    framed: &[&str],
     binds: &[JsValue],
     expire: bool,
-) -> Result<u64, String> {
+) -> Result<Vec<u64>, String> {
     let prep = |sql: &str| -> Result<worker::D1PreparedStatement, String> {
         let stmt = db.prepare(sql);
         if binds.is_empty() {
@@ -264,20 +297,28 @@ async fn marked_delete(
             stmt.bind(binds).map_err(|e| e.to_string())
         }
     };
-    let out = crate::d1_ledger::counted_batch(db, vec![prep(mark_sql)?, prep(framed_sql)?])
+    let mut stmts = vec![prep(mark_sql)?];
+    for sql in framed {
+        stmts.push(prep(sql)?);
+    }
+    let out = crate::d1_ledger::counted_batch(db, stmts)
         .await
         .map_err(|e| e.to_string())?;
-    let deleted: Vec<Deleted> = out
-        .get(1)
-        .ok_or("the framed delete answered nothing")?
-        .results()
-        .map_err(|e| e.to_string())?;
-    for d in &deleted {
-        if noted_key(expire, &d.outpoint) {
-            crate::owed_events::note(PROBE_SOURCE, &d.outpoint);
+    let mut counts = Vec::with_capacity(framed.len());
+    for n in 1..=framed.len() {
+        let written: Vec<Deleted> = out
+            .get(n)
+            .ok_or("a framed write answered nothing")?
+            .results()
+            .map_err(|e| e.to_string())?;
+        for d in &written {
+            if noted_key(expire, &d.outpoint) {
+                crate::owed_events::note(PROBE_SOURCE, &d.outpoint);
+            }
         }
+        counts.push(written.len() as u64);
     }
-    Ok(deleted.len() as u64)
+    Ok(counts)
 }
 
 /// FIX-1010: the `owed_dirty` source of a probe row's marks (`overlay_discovery::owed_event::TRIGGER_SOURCES`).
@@ -303,14 +344,17 @@ pub async fn clear_on_reorg(db: &D1Database, origin: &str, evidence: bool) -> u6
     match marked_delete(
         db,
         HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
-        HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL,
+        &HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,
         &[],
         false,
     )
     .await
     {
-        Ok(cleared) => {
-            console_log!("[hop-probe-memos] ({origin}) reorg evidence: cleared {cleared} confirmed memo(s); the next owed walk re-probes them");
+        Ok(counts) => {
+            let at = |n: usize| counts.get(n).copied().unwrap_or(0);
+            let (deleted, demoted) = (at(0), at(1));
+            let cleared = deleted + demoted;
+            console_log!("[hop-probe-memos] ({origin}) reorg evidence: cleared {deleted} confirmed memo(s), demoted {demoted} belt evidence row(s) to unconfirmed (bsv-low #1027); the next owed walk re-probes them");
             crate::ops::bump_counter(db, COUNTER_HOP_PROBE_MEMOS_CLEARED, cleared).await;
             cleared
         }
@@ -327,13 +371,14 @@ pub async fn expire(db: &D1Database, now_ms: i64) -> u64 {
     match marked_delete(
         db,
         HOP_PROBE_MEMO_EXPIRE_MARK_SQL,
-        HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL,
+        &[HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL],
         &[JsValue::from_f64(bound)],
         true,
     )
     .await
     {
-        Ok(expired) => {
+        Ok(counts) => {
+            let expired = counts.first().copied().unwrap_or(0);
             if expired > 0 {
                 console_log!("[hop-probe-memos] ttl: deleted {expired} memo(s) older than {HOP_PROBE_MEMO_TTL_MS} ms");
                 crate::ops::bump_counter(db, COUNTER_HOP_PROBE_MEMOS_EXPIRED, expired).await;
@@ -836,5 +881,103 @@ mod tests {
         );
         // and it runs after the pass (the tombstone's stamp is the heal's time), on the 200 arm only
         assert!(route.find("crate::reorg_sweep::handle_reorg(").unwrap() < clears[0].0);
+    }
+
+    /// bsv-low #1027 (lane FIX-1027-BELT-FIND-RECORD), the clear's batch as [`clear_on_reorg`] runs it over the
+    /// SHIPPED schema (real SQLite): the marks, then [`HOP_PROBE_MEMO_REORG_CLEAR_FRAMED`] in order. A confirmed memo
+    /// and a proof latch are deleted as before; the belt's EVIDENCE of a spend (`<txid>:<vout>`) is KEPT with its
+    /// spender and its confirmation taken (`spentConfirmed` NULL); the marks name the evidence's subject once, a
+    /// downgrade; a second clear demotes nothing (idempotent) and an unconfirmed evidence row is never touched. RED on
+    /// 91eb883b's rule (the framed list grafted as the base's one delete): the evidence deleted, `left: []`.
+    #[test]
+    fn fix1027_b_a_reorg_demotes_the_belts_evidence_and_never_deletes_it() {
+        let conn = db();
+        let hop = "b9".repeat(32);
+        let spender = "e5".repeat(32);
+        conn.execute_batch(&format!(
+            "INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{hop}',0,0,1,'p2pkh'); \
+             INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('owner','other','g',0,20190,'seat','00','00',2,'{hop}',1,1,1); \
+             DELETE FROM owed_dirty"
+        ))
+        .unwrap();
+        let evidence = format!("{hop}:0");
+        let live_race = format!("{}:0", "c7".repeat(32));
+        plant(&conn, &evidence, 1_000, true, Some(true));
+        plant(&conn, &format!("{hop}.0"), 1_000, true, Some(true));
+        plant(
+            &conn,
+            &format!("proofmined:{spender}.5"),
+            1_000,
+            true,
+            Some(true),
+        );
+        plant(&conn, &live_race, 1_000, true, Some(false));
+        let run = |conn: &rusqlite::Connection| -> Vec<Vec<String>> {
+            let tx = conn.unchecked_transaction().unwrap();
+            tx.execute(HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL, []).unwrap();
+            let out = HOP_PROBE_MEMO_REORG_CLEAR_FRAMED
+                .iter()
+                .map(|sql| {
+                    let mut q = tx.prepare(sql).unwrap();
+                    let keys: Vec<String> = q
+                        .query_map([], |r| r.get(0))
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .collect();
+                    keys
+                })
+                .collect();
+            tx.commit().unwrap();
+            out
+        };
+        let written = run(&conn);
+        let demoted: Vec<String> = written.iter().skip(1).flatten().cloned().collect();
+        assert_eq!(demoted, vec![evidence.clone()], "the evidence demoted");
+        let row: (i64, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT spent,spendingTxid,spentConfirmed FROM hop_chain_probes WHERE outpoint=?1",
+                [&evidence],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (1, Some(spender.clone()), None),
+            "the spend stands, its confirmation taken"
+        );
+        assert_eq!(
+            held(&conn),
+            vec![evidence.clone(), live_race.clone()],
+            "the memo and the latch deleted, the unconfirmed evidence untouched"
+        );
+        let mut q = conn
+            .prepare(
+                "SELECT identity,source,sourceKey,downgrade FROM owed_dirty WHERE sourceKey=?1",
+            )
+            .unwrap();
+        let marks: Vec<(String, String, String, i64)> = q
+            .query_map([&evidence], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            marks,
+            vec![("owner".into(), "probe".into(), evidence.clone(), 1)],
+            "the writer's own pair, once, a downgrade (the seed's own marks cleared first)"
+        );
+        assert!(
+            run(&conn).iter().all(Vec::is_empty),
+            "a second clear writes nothing"
+        );
+        // the clear's writer runs the list as its batch
+        let src = include_str!("hop_probe_memos.rs");
+        let src = &src[..src.find("#[cfg(test)]").unwrap()];
+        let body: String = src[src.find("pub async fn clear_on_reorg(").unwrap()..]
+            .split_whitespace()
+            .collect();
+        assert!(body
+            .contains("HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,&HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,"));
     }
 }
