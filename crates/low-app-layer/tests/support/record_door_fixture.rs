@@ -337,12 +337,50 @@ fn export_record_door_fixture() {
         md_sweep_script(&hs::identity(&w), &hs::GID, &raw),
         hex::encode(hs::identity(&w)),
     );
+    // D2-ACTOR-F-FOLD (bsv-low #959): 32 SEATS FOR THE CARRIED FLOOD (`tools/lane-912/owed_carried_flood.mjs`), each
+    // its own identity and game: a first `collected` filing (the cold apply that warms the game) and a `held` filing
+    // naming a payout txid no row of the record names yet (a NEW filing: its new keys come with the carried closure).
+    let mut carried_seats = Vec::new();
+    for n in 0..32u8 {
+        let seat = Hand::new(100 + n);
+        let gid = hex::encode(seat.game_id);
+        let id = seat.identity();
+        let mut first = Vec::new();
+        let sig = sign(
+            &seat.w,
+            collected_protocol(),
+            &gid,
+            &collected_challenge(&gid, &seat.poster()),
+        );
+        add(
+            &mut first,
+            "carried-first",
+            RecordKind::Collected,
+            script(&[b"LOW/collected/v1", &seat.game_id, &id, &sig]),
+            seat.poster(),
+        );
+        let pay = [0xa0u8.wrapping_add(n); 32];
+        let sig = sign(
+            &seat.w,
+            collected_protocol(),
+            &gid,
+            &held_challenge(&gid, &seat.poster(), &hex::encode(pay)),
+        );
+        add(
+            &mut first,
+            "carried-held",
+            RecordKind::Collected,
+            script(&[HELD_TAG, &seat.game_id, &id, &pay, &sig]),
+            seat.poster(),
+        );
+        carried_seats.push(json!({"identity": seat.poster(), "game": gid, "pay": hex::encode(pay), "first": first[0], "held": first[1]}));
+    }
     db.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
     let _ = std::fs::remove_file(&sqlite);
     db.conn.execute("VACUUM INTO ?1", [&sqlite]).unwrap();
     std::fs::write(
         path,
-        serde_json::to_vec_pretty(&json!({"sqlite":sqlite,"scenarios":scenarios})).unwrap(),
+        serde_json::to_vec_pretty(&json!({"sqlite":sqlite,"scenarios":scenarios,"carriedSeats":carried_seats})).unwrap(),
     )
     .unwrap();
 }

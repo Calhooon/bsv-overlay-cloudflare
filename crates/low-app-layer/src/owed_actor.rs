@@ -868,6 +868,8 @@ pub struct ApplyReport {
     pub was_open: bool,
     /// D2-ACTOR-F-FOLD (item 4): miss rounds read from the event's carried closure (no record call).
     pub closure_rounds: u32,
+    /// D2-ACTOR-F-FOLD: the record calls the apply made (the warm carried path's 0).
+    pub record_calls: u32,
 }
 
 /// The decoded facts of a copied BEEF row: the pot's own (`pot`, `pot_beefs` only) and the stored order's.
@@ -1599,6 +1601,52 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
     era_ms: Option<i64>,
     opts: &ApplyOpts,
 ) -> Result<(ApplyReport, Vec<(String, Value)>), String> {
+    // D2-ACTOR-F-FOLD: every record call of the apply counted (`recordCalls`: the warm carried path's 0, on the real
+    // path as natively)
+    let counted = CountedRecord {
+        inner: record,
+        calls: Cell::new(0),
+    };
+    let out = apply_counted(&counted, local, outside, me, games, kind_seq, tip, era_ms, opts).await;
+    out.map(|(mut r, p)| {
+        r.record_calls = counted.calls.get();
+        (r, p)
+    })
+}
+
+/// The record, its calls counted ([`apply_with`]).
+struct CountedRecord<'a, R: SqlPort> {
+    inner: &'a R,
+    calls: Cell<u32>,
+}
+impl<R: SqlPort> SqlPort for CountedRecord<'_, R> {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        self.calls.set(self.calls.get() + 1);
+        self.inner.run_batch(stmts).await
+    }
+    async fn counters(&self, deltas: Vec<(String, u64)>) {
+        self.inner.counters(deltas).await
+    }
+    fn now_ms(&self) -> u64 {
+        self.inner.now_ms()
+    }
+    fn log(&self, line: &str) {
+        self.inner.log(line)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_counted<R: SqlPort, L: SqlPort, O: Outside>(
+    record: &R,
+    local: &L,
+    outside: &O,
+    me: &str,
+    games: &[String],
+    kind_seq: Option<(&str, i64)>,
+    tip: Option<u64>,
+    era_ms: Option<i64>,
+    opts: &ApplyOpts,
+) -> Result<(ApplyReport, Vec<(String, Value)>), String> {
     let me = me.to_ascii_lowercase();
     let mut report = ApplyReport::default();
     let started_ms = local.now_ms();
@@ -2281,7 +2329,7 @@ pub async fn commit_fixpoint<L: SqlPort>(
 /// The answer of one apply (the object's `/apply`, the pins' harness): the actor's rows, the redelivery verdict, the
 /// games the event has applied.
 pub fn answer_of(report: &ApplyReport, rows: Vec<Value>) -> Value {
-    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply, "misses": report.misses, "narrowed": report.narrowed, "coalesced": report.coalesced, "readMs": report.read_ms, "judgeMs": report.judge_ms, "writeMs": report.write_ms, "waitMs": report.wait_ms, "outsideMs": report.outside_ms, "asksQueued": report.asks, "readGeneration": report.read_generation, "carried": report.carried, "closureRounds": report.closure_rounds})
+    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply, "misses": report.misses, "narrowed": report.narrowed, "coalesced": report.coalesced, "readMs": report.read_ms, "judgeMs": report.judge_ms, "writeMs": report.write_ms, "waitMs": report.wait_ms, "outsideMs": report.outside_ms, "asksQueued": report.asks, "readGeneration": report.read_generation, "carried": report.carried, "closureRounds": report.closure_rounds, "recordCalls": report.record_calls})
 }
 
 /// D2-ACTOR-E (bsv-low #954) item 4: was the event born on a WARM actor (written at or after the actor's bootstrap
@@ -2855,6 +2903,8 @@ pub async fn apply_burst<R: SqlPort, L: SqlPort, O: Outside>(
         report.record_rows = reports.iter().map(|r| r.record_rows).sum();
         report.narrowed = reports.iter().all(|r| r.narrowed);
         report.carried = reports.iter().all(|r| r.carried);
+        report.closure_rounds = reports.iter().map(|r| r.closure_rounds).sum();
+        report.record_calls = reports.iter().map(|r| r.record_calls).sum();
         report.coalesced = passes;
         // FOLD-14 item 2: the pass's stages, every chunk's (each event of the pass answered the same pass).
         report.read_ms = reports.iter().map(|r| r.read_ms).sum();
