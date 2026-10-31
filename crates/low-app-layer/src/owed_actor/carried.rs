@@ -1,6 +1,6 @@
 //! D2-ACTOR-F (bsv-low #959; `DESIGN-D2-ACTOR-2026-10-26.md` sections 3 to 7: "the event carries the write's
 //! facts"): THE CARRIED ROW. A writer's publish reads, in the statement that already reads its pair's facts and mark
-//! count (`owed_events_publish::marks_and_payload`, one statement, so none added to the door's batch), the pair's marks
+//! count (`owed_events_publish::row_and_payload!` and `READ_PARTY_SQL`, one statement, so none added to the door's batch), the pair's marks
 //! by name (`subjects`: `[identity, gameId, generation]`) and the mirror's rows of every table its write changed
 //! (`payload`: items `{t, c, k, r}`, the WHOLE domain `c = k` of table `t` as the record holds it). The writer's direct
 //! call carries both to each identity's actor ([`Carried::of_event`], per identity), and a WARM actor upserts the rows

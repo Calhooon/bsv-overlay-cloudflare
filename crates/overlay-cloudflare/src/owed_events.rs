@@ -66,7 +66,7 @@ macro_rules! marks_and {
     };
 }
 
-/// D2-ACTOR-F (bsv-low #959): [`marks_and`] for a source that CARRIES ITS ROW: two more columns in the SAME statement
+/// D2-ACTOR-F (bsv-low #959): a source that CARRIES ITS ROW (`row_and_payload!`, `READ_PARTY_SQL`): two more columns in the SAME statement
 /// (no statement added to the publish batch, so none to the door's): `subjects`, the pair's marks named
 /// (`[identity, gameId, generation]`, read in the same transaction as the row, so the row is the record after every
 /// one of them), and `payload`, the mirror's rows of every table the write changed, each an item
@@ -74,19 +74,8 @@ macro_rules! marks_and {
 /// record holds it (`__rowid` and every column the actor's mirror stores, `low-app-layer` `owed_actor::schema`,
 /// pinned there column for column). `payload` is NULL where the statement cannot name the whole domain (a party
 /// marker whose rows are gone: its links' change is not readable from it).
-macro_rules! marks_and_payload {
-    ($facts:expr, $payload:expr) => {
-        concat!(
-            "SELECT (SELECT COUNT(*) FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey=?2 AND source=?1) AS marks,(",
-            $facts,
-            ") AS facts,(SELECT json_group_array(json_array(identity,gameId,generation)) FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey=?2 AND source=?1) AS subjects,(",
-            $payload,
-            ") AS payload"
-        )
-    };
-}
-
-/// D2-ACTOR-F: [`marks_and_payload`] for a source whose write changes ONE table's domain, read ONCE: the pair's marks in
+///
+/// The carried read for a source whose write changes ONE table's domain, read ONCE: the pair's marks in
 /// one scan of `owed_dirty` (their count is the array's length) and the row's facts and payload in one scan of the
 /// table (`$facts` and `$payload` aggregates over it), so the statement reads the rows [`marks_and`] read and no more
 /// (the budget tier's per-statement ceilings).
@@ -522,7 +511,7 @@ pub fn reads_row(n: &Noted) -> bool {
 pub const PAYLOAD_MAX_BYTES: usize = 32_768;
 
 /// PURE (D2-ACTOR-F): the carried row of one read, into the event's facts: `subjects` (the pair's marks named) and
-/// `payload` (the rows, [`marks_and_payload`]) when the statement answered both, every subject names a game, and the
+/// `payload` (the rows) when the statement answered both, every subject names a game, and the
 /// payload fits [`PAYLOAD_MAX_BYTES`]; otherwise neither (the actor's narrowed D1 read, as before). A source whose
 /// statement carries no row answers no such column and is left as it was.
 pub fn carry_payload(row: &Value, facts: &mut Value) {
