@@ -71,7 +71,11 @@ pub fn read_bound_statements(kind: &str, bound: i64, names: &[String], now: i64)
     vec![
         Stmt::new(
             READ_BOUND_TRIM_SQL,
-            vec![Bind::Text(kind.into()), Bind::Int(bound), Bind::Text(names.clone())],
+            vec![
+                Bind::Text(kind.into()),
+                Bind::Int(bound),
+                Bind::Text(names.clone()),
+            ],
         ),
         Stmt::new(
             super::APPLIED_SQL,
@@ -109,7 +113,10 @@ impl CarriedItem {
         for k in &self.k {
             if let Ok(key) = key_tuple(k) {
                 for v in key {
-                    if let Some(t) = v.as_str().filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit())) {
+                    if let Some(t) = v
+                        .as_str()
+                        .filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+                    {
                         out.insert(t.to_ascii_lowercase());
                     }
                 }

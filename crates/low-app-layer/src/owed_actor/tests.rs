@@ -14909,7 +14909,11 @@ mod d2_actor_f_fold {
     use super::*;
     use crate::owed_events_publish as publish;
 
-    async fn published(record: &SqliteSql, source: &str, key: &str) -> overlay_discovery::owed_event::OwedEvent {
+    async fn published(
+        record: &SqliteSql,
+        source: &str,
+        key: &str,
+    ) -> overlay_discovery::owed_event::OwedEvent {
         let port = crate::owed_events::SqlPublish {
             db: record,
             send: |_b: Vec<String>| async { Ok::<(), String>(()) },
@@ -14941,7 +14945,11 @@ mod d2_actor_f_fold {
         let e = EventCtx::of(ev);
         ApplyOpts {
             touch: e.txids.clone(),
-            carried: if carry { e.carried.get("owner").cloned() } else { None },
+            carried: if carry {
+                e.carried.get("owner").cloned()
+            } else {
+                None
+            },
             ..ApplyOpts::default()
         }
     }
@@ -14998,13 +15006,26 @@ mod d2_actor_f_fold {
         mark(&record, &games[7], "seen", &pot);
         let newer = published(&record, "seen", &pot).await;
         let seen = "SELECT seenAt FROM network_seen WHERE txid=?1";
-        applied(&record, &local, &games[7..8], &newer, false).await.unwrap();
+        applied(&record, &local, &games[7..8], &newer, false)
+            .await
+            .unwrap();
         assert_eq!(one(&local, seen, &pot), "new");
         record.conn.execute("DELETE FROM owed_dirty", []).unwrap(); // the acknowledgement
-        applied(&record, &local, &games[7..8], &newer, false).await.unwrap(); // no mark pending
-        let late = applied(&record, &local, &games[7..8], &older, true).await.unwrap();
-        assert!(late.carried, "the late call took the carried path: {late:?}");
-        assert_eq!(one(&local, seen, &pot), "new", "an older carried row overwrote the newer one");
+        applied(&record, &local, &games[7..8], &newer, false)
+            .await
+            .unwrap(); // no mark pending
+        let late = applied(&record, &local, &games[7..8], &older, true)
+            .await
+            .unwrap();
+        assert!(
+            late.carried,
+            "the late call took the carried path: {late:?}"
+        );
+        assert_eq!(
+            one(&local, seen, &pot),
+            "new",
+            "an older carried row overwrote the newer one"
+        );
         // the bound kept is the record's high-water, the greatest, never lowered
         let read: i64 = local
             .conn
@@ -15016,7 +15037,11 @@ mod d2_actor_f_fold {
             .unwrap();
         let hw: i64 = record
             .conn
-            .query_row("SELECT seq FROM sqlite_sequence WHERE name='owed_dirty'", [], |r| r.get(0))
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name='owed_dirty'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(read, hw);
     }
@@ -15046,11 +15071,19 @@ mod d2_actor_f_fold {
         let newer = published(&record, "seen", &pot).await;
         record.conn.execute("DELETE FROM owed_dirty", []).unwrap(); // acknowledged before the actor read
         let seen = "SELECT seenAt FROM network_seen WHERE txid=?1";
-        applied(&record, &local, &games[7..8], &newer, false).await.unwrap();
+        applied(&record, &local, &games[7..8], &newer, false)
+            .await
+            .unwrap();
         assert_eq!(one(&local, seen, &pot), "new");
-        let late = applied(&record, &local, &games[7..8], &older, true).await.unwrap();
+        let late = applied(&record, &local, &games[7..8], &older, true)
+            .await
+            .unwrap();
         assert!(late.carried);
-        assert_eq!(one(&local, seen, &pot), "new", "an older carried row overwrote the newer one");
+        assert_eq!(
+            one(&local, seen, &pot),
+            "new",
+            "an older carried row overwrote the newer one"
+        );
     }
 
     /// (fold_m1_b) A MISS ROUND'S BOUND IS PER KEY: a carried collected filing names a payout txid the mirror never
@@ -15064,7 +15097,10 @@ mod d2_actor_f_fold {
         let marker = h("a1", 9);
         record
             .conn
-            .execute("INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'old','hint',1)", [&pay])
+            .execute(
+                "INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'old','hint',1)",
+                [&pay],
+            )
             .unwrap();
         mark(&record, &games[9], "word", &pay);
         let older = published(&record, "word", &pay).await;
@@ -15082,13 +15118,21 @@ mod d2_actor_f_fold {
             .unwrap();
         mark(&record, &games[9], "collected", &marker);
         let filing = published(&record, "collected", &marker).await;
-        let r = applied(&record, &local, &games[9..10], &filing, true).await.unwrap();
+        let r = applied(&record, &local, &games[9..10], &filing, true)
+            .await
+            .unwrap();
         assert!(r.carried && r.misses >= 1, "{r:?}");
         let word = "SELECT word FROM tx_words WHERE txid=?1";
         assert_eq!(one(&local, word, &pay), "new");
-        let late = applied(&record, &local, &games[9..10], &older, true).await.unwrap();
+        let late = applied(&record, &local, &games[9..10], &older, true)
+            .await
+            .unwrap();
         assert!(late.carried);
-        assert_eq!(one(&local, word, &pay), "new", "the miss read's newer row was replaced");
+        assert_eq!(
+            one(&local, word, &pay),
+            "new",
+            "the miss read's newer row was replaced"
+        );
     }
 
     /// (fold_l2_a) A NEW FILING REACHES ZERO READS (the lens's LOW-2, the lane's next step): a collected filing naming
@@ -15111,32 +15155,65 @@ mod d2_actor_f_fold {
             .unwrap();
         record
             .conn
-            .execute("INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'mined','chain',1)", [&pay])
+            .execute(
+                "INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'mined','chain',1)",
+                [&pay],
+            )
             .unwrap();
         mark(&record, &games[9], "collected", &marker);
         let ev = published(&record, "collected", &marker).await;
-        assert!(ev.facts["closure"].is_object(), "the filing carries its closure: {}", ev.facts);
+        assert!(
+            ev.facts["closure"].is_object(),
+            "the filing carries its closure: {}",
+            ev.facts
+        );
         let b0 = record.batches.get();
-        let r = applied(&record, &local, &games[9..10], &ev, true).await.unwrap();
+        let r = applied(&record, &local, &games[9..10], &ev, true)
+            .await
+            .unwrap();
         let calls = record.batches.get() - b0;
-        eprintln!("fold_l2_a: a new filing's record calls {calls}, closure rounds {}, rounds {}", r.closure_rounds, r.rounds);
+        eprintln!(
+            "fold_l2_a: a new filing's record calls {calls}, closure rounds {}, rounds {}",
+            r.closure_rounds, r.rounds
+        );
         assert!(r.carried && r.closure_rounds >= 1, "{r:?}");
         assert_eq!(calls, 0, "a new filing reads no D1");
         let words: i64 = local
             .conn
-            .query_row("SELECT COUNT(*) FROM tx_words WHERE txid=?1", [&pay], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM tx_words WHERE txid=?1", [&pay], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(words, 1, "the payout's word came with the closure");
         let c = mirror();
-        apply(&record, &c, &Fakes, "owner", &[games[9].clone()], None, Some(TIP), None)
-            .await
-            .unwrap();
-        assert_eq!(stored_game(&local, "owner", &games[9]), stored_game(&c, "owner", &games[9]));
+        apply(
+            &record,
+            &c,
+            &Fakes,
+            "owner",
+            &[games[9].clone()],
+            None,
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stored_game(&local, "owner", &games[9]),
+            stored_game(&c, "owner", &games[9])
+        );
         let key: i64 = local
             .conn
-            .query_row("SELECT MAX(seq) FROM applied WHERE kind='read-key' AND game=?1", [&pay], |r| r.get(0))
+            .query_row(
+                "SELECT MAX(seq) FROM applied WHERE kind='read-key' AND game=?1",
+                [&pay],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert!(key > 0, "the closure's high-water is the payout's per-key bound");
+        assert!(
+            key > 0,
+            "the closure's high-water is the payout's per-key bound"
+        );
     }
 
     /// (fold_l2_b) A CLOSURE OLDER THAN THE MIRROR'S READ OF A KEY IS NOT TAKEN: the payout's word is in the mirror
@@ -15151,7 +15228,10 @@ mod d2_actor_f_fold {
         let m1 = h("a1", 9);
         record
             .conn
-            .execute("INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'old','hint',1)", [&pay])
+            .execute(
+                "INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'old','hint',1)",
+                [&pay],
+            )
             .unwrap();
         record
             .conn
@@ -15171,7 +15251,10 @@ mod d2_actor_f_fold {
         // the mirror as a newer miss read left the payout: its word, its per-key bound past the closure's
         local
             .conn
-            .execute("INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'new','hint',2)", [&pay])
+            .execute(
+                "INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'new','hint',2)",
+                [&pay],
+            )
             .unwrap();
         local
             .conn
@@ -15181,12 +15264,22 @@ mod d2_actor_f_fold {
             )
             .unwrap();
         let b0 = record.batches.get();
-        let r = applied(&record, &local, &games[9..10], &late, true).await.unwrap();
+        let r = applied(&record, &local, &games[9..10], &late, true)
+            .await
+            .unwrap();
         let word = "SELECT word FROM tx_words WHERE txid=?1";
         assert!(r.carried, "{r:?}");
-        assert_eq!(one(&local, word, &pay), "new", "an older closure replaced a newer read");
+        assert_eq!(
+            one(&local, word, &pay),
+            "new",
+            "an older closure replaced a newer read"
+        );
         assert_eq!(r.closure_rounds, 0);
-        assert_eq!(record.batches.get() - b0, 1, "the payout read from the record");
+        assert_eq!(
+            record.batches.get() - b0,
+            1,
+            "the payout read from the record"
+        );
     }
 
     /// (fold_nit2) EACH CHUNK'S BODY CARRIES ITS OWN ITEMS: an identity whose pass names 70 games (two chunks of 64 and
@@ -15219,9 +15312,15 @@ mod d2_actor_f_fold {
             by_identity: Default::default(),
             carried: [("owner".to_string(), c)].into_iter().collect(),
         };
-        let bodies = crate::owed_events::coalesce_direct(vec![(e, vec![("owner".into(), games)])], Some(TIP));
+        let bodies = crate::owed_events::coalesce_direct(
+            vec![(e, vec![("owner".into(), games)])],
+            Some(TIP),
+        );
         assert_eq!(bodies.len(), 2);
-        assert!(bodies[0].get("carried").is_none(), "the first chunk carries an item naming none of its games");
+        assert!(
+            bodies[0].get("carried").is_none(),
+            "the first chunk carries an item naming none of its games"
+        );
         assert_eq!(bodies[1]["carried"]["items"][0]["games"], json!(["g66"]));
     }
 
@@ -15232,17 +15331,32 @@ mod d2_actor_f_fold {
     fn fold_nit3_no_writer_moves_a_partys_pot() {
         let mut seen = 0;
         for (name, src) in [
-            ("d1_discovery.rs", include_str!("../../../overlay-cloudflare/src/d1_discovery.rs")),
-            ("eviction_write.rs", include_str!("../../../overlay-cloudflare/src/eviction_write.rs")),
+            (
+                "d1_discovery.rs",
+                include_str!("../../../overlay-cloudflare/src/d1_discovery.rs"),
+            ),
+            (
+                "eviction_write.rs",
+                include_str!("../../../overlay-cloudflare/src/eviction_write.rs"),
+            ),
         ] {
             let prod = src.split("\n#[cfg(test)]").next().unwrap();
             for (i, _) in prod.match_indices("UPDATE potparty_records SET") {
                 seen += 1;
                 let rest = &prod[i + "UPDATE potparty_records SET".len()..];
                 let set = &rest[..rest.find("WHERE").unwrap_or(rest.len()).min(200)];
-                let set: String = set.chars().filter(|c| !c.is_whitespace() && *c != '\\').collect();
-                assert!(set.starts_with("sigValid=?") || set.starts_with("sigValid="), "{name}: {set}");
-                assert!(!set.contains("potTxid"), "{name}: a writer moves a party's pot: {set}");
+                let set: String = set
+                    .chars()
+                    .filter(|c| !c.is_whitespace() && *c != '\\')
+                    .collect();
+                assert!(
+                    set.starts_with("sigValid=?") || set.starts_with("sigValid="),
+                    "{name}: {set}"
+                );
+                assert!(
+                    !set.contains("potTxid"),
+                    "{name}: a writer moves a party's pot: {set}"
+                );
             }
         }
         assert!(seen >= 1, "the production writers were read");
@@ -15267,7 +15381,10 @@ mod d2_actor_f_fold {
             .unwrap();
         record
             .conn
-            .execute("INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'mined','chain',1)", [&pay])
+            .execute(
+                "INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'mined','chain',1)",
+                [&pay],
+            )
             .unwrap();
         mark(&record, &games[9], "collected", &marker);
         // the lens's shape: an event whose new keys are the record's read (no carried closure), that read faulting
@@ -15277,23 +15394,34 @@ mod d2_actor_f_fold {
         let first = applied(&dead, &local, &games[9..10], &ev, true).await;
         assert!(first.is_err(), "the miss read faulted: {first:?}");
         let b0 = record.batches.get();
-        let r = applied(&record, &local, &games[9..10], &ev, true).await.unwrap();
+        let r = applied(&record, &local, &games[9..10], &ev, true)
+            .await
+            .unwrap();
         let calls = record.batches.get() - b0;
         let words: i64 = local
             .conn
-            .query_row("SELECT COUNT(*) FROM tx_words WHERE txid=?1", [&pay], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM tx_words WHERE txid=?1", [&pay], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert!(r.was_open && !r.carried && r.narrowed, "an open game is the narrowed read: {r:?}");
+        assert!(
+            r.was_open && !r.carried && r.narrowed,
+            "an open game is the narrowed read: {r:?}"
+        );
         assert!(calls >= 1);
         assert_eq!(words, 1, "the payout's word was never read");
         let open: i64 = local
             .conn
-            .query_row("SELECT COUNT(*) FROM applied WHERE kind='open'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM applied WHERE kind='open'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(open, 0, "the whole apply closed its games");
         // and closed, the next carried apply of the game reads no D1
         let b0 = record.batches.get();
-        let again = applied(&record, &local, &games[9..10], &ev, true).await.unwrap();
+        let again = applied(&record, &local, &games[9..10], &ev, true)
+            .await
+            .unwrap();
         assert!(again.carried && !again.was_open);
         assert_eq!(record.batches.get() - b0, 0);
     }
