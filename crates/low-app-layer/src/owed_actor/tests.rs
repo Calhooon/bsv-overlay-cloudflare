@@ -14101,3 +14101,163 @@ mod fix1001 {
         assert_eq!(d1_rows, 0, "Phase C: owed_rows has no writer");
     }
 }
+
+// ---- FIX-1009 (bsv-low #1009): a courier probe's word at the older tip against the fresh tip's degradation is a
+// TIP LAG, never a diff ----
+
+/// The captured pair of bsv-low #1009 (beta, 2026-10-31 04:42Z, identity 02a4b3a69…, outpoint b89b0e34…:0): both
+/// `hop-stranded`, claimable, the same claim and reason; the actor's row judged at 973,422 carries the courier's
+/// `unspent` taken at that tip, D1's fresh judgement at 973,423 the #669 / #808 (b) degrade of the same probe
+/// (`index-unspent`, `tipMoved`, `servedTip`).
+fn fix1009_row(fresh: bool) -> Value {
+    let tip = if fresh { 973_423 } else { 973_422 };
+    let mut facts = json!({"claim": "sweep-hop", "claimable": true, "chainProbe": "unspent",
+        "chainProbeTip": 973_422, "chainProbeAgeMs": 61_000, "hopSats": 20_190, "marker": "b89b0e34",
+        "tip": tip});
+    if fresh {
+        facts["chainProbe"] = json!("index-unspent");
+        facts["tipMoved"] = json!(true);
+        facts["servedTip"] = json!(973_423);
+        facts["chainProbeAgeMs"] = json!(729_000);
+    }
+    json!({"outpoint": "b89b0e34:0", "family": "hop-stranded", "gameId": "0b7c11aa", "sats": 20_190,
+        "opponentIdentity": "03d1e5", "atHeight": null, "reason": null, "claimable": 1, "probeTip": tip,
+        "facts": facts.to_string()})
+}
+
+/// A [`fresh_compare`]-shaped view of one pair, as the fleet ring stores it.
+fn fix1009_view(d1: &Value, actor: &Value) -> Value {
+    let mut view = rows_view(
+        "02a4b3a6",
+        Ok(json!({"rows": [actor.clone()], "bootstrapped": true})),
+        std::slice::from_ref(d1),
+        None,
+        None,
+    );
+    view["heldByLag"] = json!([]);
+    view["d1Stored"] = json!({"staleOutpoints": []});
+    view
+}
+
+/// (fix1009_a) THE CAPTURED PAIR IS A TIP LAG. `tip_derived_rows` names it (both orders: the reconcile's stored and
+/// fresh actor rows meet the same shape), the route serves it under `tipLag` with both tips and no `diff`, and the
+/// fleet compare's row counts it held by lag (`identitiesHeldByLag`), never differing. RED on 2a0de260: the route's
+/// `diff` names `b89b0e34:0` and the stored row's `diffCount` is 1.
+#[test]
+fn fix1009_a_the_captured_pair_is_a_tip_lag_held_by_lag() {
+    let (d1, actor) = (fix1009_row(true), fix1009_row(false));
+    let op = "b89b0e34:0".to_string();
+    assert_eq!(
+        diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)),
+        vec![op.clone()],
+        "the pair differs before the rule"
+    );
+    assert_eq!(
+        tip_derived_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)),
+        vec![op.clone()]
+    );
+    assert_eq!(
+        tip_derived_rows(std::slice::from_ref(&actor), std::slice::from_ref(&d1)),
+        vec![op.clone()]
+    );
+    let view = fix1009_view(&d1, &actor);
+    assert_eq!(view["diff"], json!([]), "{}", view["diff"]);
+    assert_eq!(view["tipLag"], json!([op]));
+    assert_eq!(view["tipLagTips"]["d1"], json!([973_423]));
+    assert_eq!(view["tipLagTips"]["actor"], json!([973_422]));
+    let row = compare::compare_row_of("02a4b3a6", 1, Ok(&view));
+    assert_eq!(
+        (row.diff_count, row.held_by_lag_count, row.tip_lag_count),
+        (Some(0), Some(1), Some(1)),
+        "{row:?}"
+    );
+    assert_eq!(row.outpoints[0]["outpoint"], json!(op));
+    assert_eq!(row.outpoints[0]["held"], json!(true));
+    assert_eq!(row.outpoints[0]["tipLag"], json!(true));
+    // The fleet's answer: held by lag, not differing.
+    let page = vec![
+        json!({"identity": "02a4b3a6", "comparedAtMs": 1, "diffCount": 0, "heldByLagCount": 1,
+        "staleD1Count": 0, "tipLagCount": 1, "outpoints": row.outpoints.to_string(), "partial": 0}),
+    ];
+    let answer = compare::compare_answer(
+        &json!({"identities": 1, "diffs": 0, "heldByLag": 1, "staleD1": 0, "faults": 0, "oldest": 1, "newest": 1}),
+        &page,
+        &json!({}),
+        2,
+        false,
+    );
+    assert_eq!(answer["diffs"], json!([]));
+    assert_eq!(
+        answer["heldByLag"][0]["outpoints"][0]["outpoint"],
+        json!(op)
+    );
+}
+
+/// (fix1009_b) THE RULE IS NARROW. At the same two tips, a pair whose verdict (family), press (`claimable`, the
+/// claim) or reason differs is still a diff; so is a probe-less `index-unspent` (no `tipMoved`) against a corroborated
+/// `unspent`, a degrade whose `chainProbeTip` differs from the other side's, and a degrade whose `servedTip` is not
+/// past its `chainProbeTip`. Green on 2a0de260 (the guard against a rule that reads every chainProbe move a lag).
+#[test]
+fn fix1009_b_a_verdict_or_press_difference_at_two_tips_is_still_a_diff() {
+    let op = "b89b0e34:0".to_string();
+    let edit = |f: &dyn Fn(&mut Value, &mut Value)| -> (Value, Value) {
+        let (mut d1, mut actor) = (fix1009_row(true), fix1009_row(false));
+        f(&mut d1, &mut actor);
+        (d1, actor)
+    };
+    let facts = |r: &mut Value, k: &str, v: Value| {
+        let mut f: Value = serde_json::from_str(r["facts"].as_str().unwrap()).unwrap();
+        if v.is_null() {
+            f.as_object_mut().unwrap().remove(k);
+        } else {
+            f[k] = v;
+        }
+        r["facts"] = json!(f.to_string());
+    };
+    let cases: Vec<(&str, (Value, Value))> = vec![
+        ("family", edit(&|_, a| a["family"] = json!("unbound"))),
+        ("claimable", edit(&|_, a| a["claimable"] = json!(0))),
+        (
+            "facts.claimable",
+            edit(&|_, a| facts(a, "claimable", json!(false))),
+        ),
+        (
+            "facts.claim",
+            edit(&|_, a| facts(a, "claim", json!("internalize"))),
+        ),
+        (
+            "reason",
+            edit(&|_, a| a["reason"] = json!("another reason")),
+        ),
+        (
+            "probe-less",
+            edit(&|d, _| {
+                facts(d, "tipMoved", Value::Null);
+                facts(d, "servedTip", Value::Null);
+            }),
+        ),
+        (
+            "chainProbeTip",
+            edit(&|_, a| facts(a, "chainProbeTip", json!(973_421))),
+        ),
+        (
+            "servedTip not past",
+            edit(&|d, _| facts(d, "servedTip", json!(973_422))),
+        ),
+        (
+            "spent probe",
+            edit(&|_, a| facts(a, "chainProbe", json!("spent"))),
+        ),
+    ];
+    for (name, (d1, actor)) in cases {
+        let view = fix1009_view(&d1, &actor);
+        assert_eq!(view["diff"], json!([op]), "{name}: {}", view["diff"]);
+        assert_eq!(view["tipLag"], json!([]), "{name}");
+        let row = compare::compare_row_of("02a4b3a6", 1, Ok(&view));
+        assert_eq!(
+            (row.diff_count, row.held_by_lag_count),
+            (Some(1), Some(0)),
+            "{name}: {row:?}"
+        );
+    }
+}

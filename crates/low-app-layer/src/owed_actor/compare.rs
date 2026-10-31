@@ -308,9 +308,12 @@ pub fn compare_row_of(identity: &str, now: i64, view: Result<&Value, &str>) -> C
     let diff = strs(&view["diff"]);
     let held: BTreeSet<String> = strs(&view["heldByLag"]).into_iter().collect();
     let fields = view["diffFields"].as_array().cloned().unwrap_or_default();
+    // FIX-1009 (bsv-low #1009): a TIP LAG ([`super::tip_derived_rows`], the route's `tipLag`) is a difference the
+    // judged tips explain, never a STOP: it is held by lag (counted in `heldByLagCount`, so the fleet's
+    // `identitiesHeldByLag`, never `identitiesDiffering`), its outpoint named `held` and `tipLag`.
+    let tip_lag = strs(&view["tipLag"]);
     let outpoints: Vec<Value> = diff
         .iter()
-        .take(COMPARE_ROW_OUTPOINTS_MAX)
         .map(|o| {
             json!({
                 "outpoint": o,
@@ -318,14 +321,16 @@ pub fn compare_row_of(identity: &str, now: i64, view: Result<&Value, &str>) -> C
                 "fields": fields.iter().find(|f| f["outpoint"] == o.as_str()).map_or(Value::Null, |f| f["fields"].clone()),
             })
         })
+        .chain(tip_lag.iter().map(|o| json!({"outpoint": o, "held": true, "tipLag": true, "fields": Value::Null})))
+        .take(COMPARE_ROW_OUTPOINTS_MAX)
         .collect();
     CompareRow {
         identity: identity.to_string(),
         compared_at_ms: now,
         diff_count: Some(diff.iter().filter(|o| !held.contains(*o)).count() as i64),
-        held_by_lag_count: Some(held.len() as i64),
+        held_by_lag_count: Some((held.len() + tip_lag.len()) as i64),
         stale_d1_count: Some(strs(&view["d1Stored"]["staleOutpoints"]).len() as i64),
-        tip_lag_count: Some(strs(&view["tipLag"]).len() as i64),
+        tip_lag_count: Some(tip_lag.len() as i64),
         outpoints: json!(outpoints),
         d1_digest: view["digests"]["d1"].as_str().map(str::to_string),
         actor_digest: view["digests"]["actor"].as_str().map(str::to_string),
