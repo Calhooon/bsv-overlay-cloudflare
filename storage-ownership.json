@@ -179,7 +179,7 @@
     "SELECT {} FROM {}",
     "SELECT {} FROM {}",
     "SELECT t.rowid AS r FROM {} AND t.identity=?1",
-    "WITH k AS MATERIALIZED (SELECT value FROM json_each(?1)),p AS MATERIALIZED (SELECT x.value||k.value AS value FROM json_e"
+    "(SELECT json_group_array(json_array(ci,CASE WHEN crun<=?5 THEN json(cr) END,json(ck))) FROM (SELECT ci,cr,ck,SUM(cw) OVE"
    ],
    "tables": [
     "collected_markers_v2",
@@ -207,7 +207,7 @@
     "transactions",
     "tx_words"
    ],
-   "why": "bsv-low #912: the owed actor's closure reads each mirrored family of the record by its key columns (FAMILIES: the identity and its games, txids, hop marker rowids, the probe memo's ranges), the same selections then run on the actor's mirror; D2-ACTOR-F-FOLD (bsv-low #959, item 4): the carried CLOSURE (`closure_select`) is the same selections over the txids a carried payload names; since D2-ACTOR-F-FOLD-2 read by the app layer's direct pass in its own batch after the writer's answer, never in the publish"
+   "why": "bsv-low #912: the owed actor's closure reads each mirrored family of the record by its key columns (FAMILIES: the identity and its games, txids, hop marker rowids, the probe memo's ranges), the same selections then run on the actor's mirror; D2-ACTOR-F-FOLD (bsv-low #959, item 4): the carried CLOSURE (`closure_arm`, one scalar subquery a family of the pass's ONE statement since D2-ACTOR-F-FOLD-3) is the same selections over the union of the txids a direct pass's carried filings name; read by the app layer's direct pass after the writer's answer, never in the publish or the sweep"
   },
   {
    "file": "crates/overlay-cloudflare/src/eviction_write.rs",

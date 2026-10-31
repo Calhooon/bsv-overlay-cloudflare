@@ -3931,14 +3931,14 @@ async fn d2_actor_b_fold7_c_a_bootstrapped_actor_past_the_bound_rearms_and_holds
     let turn = futures_util::lock::Mutex::new(());
     let (_, _, _) = fold7_bootstrap(&turn, &record, &local, "owner").await;
     assert!(fold7_meta(&local, "bootstrapped").is_some());
-    // The record grows: game 5's hop names a chain of 20 word rows (each names the next in a column the key rule
-    // reads: since D2-ACTOR-F-FOLD-2 `legacy_body` is one of `NOT_KEY_COLUMNS`, never a key).
+    // The record grows: game 5's hop names a chain of 20 probe rows (each names the next in a KEY column, its
+    // `spendingTxid`: since D2-ACTOR-F-FOLD-3 the key rule reads key columns only, never a word's `hint_source`).
     let hop = h("b8", 5);
     let mut chain = vec![hop.clone()];
     chain.extend((0..20).map(|i| h("fa", i)));
     for w in chain.windows(2) {
         record.conn.execute(
-            "INSERT OR REPLACE INTO tx_words(txid,word,tier,updated_at,hint_source) VALUES (?1,'seen','hint',1,?2)",
+            "INSERT OR REPLACE INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES (?1||':0',1,1,?2,0,1)",
             [&w[0], &w[1]],
         ).unwrap();
     }
@@ -6914,7 +6914,7 @@ fn fold10_j_a_state_judged_under_another_build_bootstraps_again() {
     let actor = squash(include_str!("../owed_actor.rs"));
     assert!(actor.contains("body[\"rejudged\"]=n(COUNTERS[26]);"));
     assert!(
-        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total'))AScounters")
+        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total'))AScounters")
     );
 }
 
@@ -8941,7 +8941,9 @@ async fn fold14_c_the_apply_stages_sum_to_the_apply_and_are_served() {
     assert!(joined > 0, "a caller waited in the turn");
     // Served: the answer, the class's ring, the fleet's p95 per class and over the classes.
     let a = answer_of(&answers[0].0, Vec::new());
-    for (field, _) in APPLY_STAGES {
+    // D2-ACTOR-F-FOLD-3: `closureMs` is the direct pass's (the caller's), answered by the object only for a carried
+    // filing's body
+    for (field, _) in APPLY_STAGES.iter().filter(|(f, _)| *f != "closureMs") {
         assert!(a[field].as_u64().is_some(), "{field} answered");
     }
     let mut pending = PendingBars::default();
@@ -14948,9 +14950,12 @@ mod d2_actor_f_fold {
             ev.facts.get("closure").is_none(),
             "D2-ACTOR-F-FOLD-2: no closure rides the publish"
         );
-        // the direct pass's closure read, after the writer's answer, in its own batch (`DirectPort::closure`)
-        if let Some(c) = read_closure(record, &ev.facts).await {
-            ev.facts["closure"] = c;
+        // the direct pass's closure read, after the writer's answer (`DirectPort::closure_read`): since
+        // D2-ACTOR-F-FOLD-3 only for a carried filing naming a key beyond its own (`closure_wanted`)
+        if closure_wanted(&ev).is_some() {
+            if let Some(c) = read_closure(record, &ev.facts).await {
+                ev.facts["closure"] = c;
+            }
         }
         ev
     }
@@ -15325,6 +15330,7 @@ mod d2_actor_f_fold {
             items: vec![item],
             marks: vec![("g66".into(), 9)],
             closures: vec![],
+            closure_ms: None,
         };
         let e = EventCtx {
             kind: "seen".into(),
@@ -15693,12 +15699,14 @@ mod d2_actor_f_fold {
             .unwrap();
         mark(&record, &games[9], "collected", &marker);
         let ev = published(&record, "collected", &marker).await;
-        let (stmts, keys) = closure_statements(&ev.facts["payload"]).unwrap();
+        // D2-ACTOR-F-FOLD-3: the pass's ONE closure statement (it was a batch of 25)
+        let keys = closure_wanted(&ev).expect("a collected filing names its payout");
         assert!(keys.contains(&pay) && keys.contains(&marker), "{keys:?}");
-        assert_eq!(stmts.len(), 1 + FAMILIES.len());
+        let (stmt, _) = pass_closure_statement(&keys).unwrap();
+        let stmts = vec![stmt];
         let tables: Vec<&str> = FAMILIES.iter().map(|f| f.table).collect();
         let (mut steps, mut scans) = (0i64, 0i64);
-        for st in &stmts[1..] {
+        for st in &stmts {
             assert!(st.sql.starts_with("WITH k AS MATERIALIZED"), "{}", st.sql);
             let mut q = record
                 .conn
@@ -15815,7 +15823,16 @@ mod d2_actor_f_fold {
         ]
         .concat()
         .replace(' ', "");
-        for c in NOT_KEY_COLUMNS {
+        // D2-ACTOR-F-FOLD-3 (NIT-1): the hex-bearing columns that are no key column (`KEY_COLUMNS`)
+        for c in [
+            "proof_root",
+            "header_hash",
+            "proof_hex",
+            "legacy_body",
+            "refusedTxid",
+            "hint_source",
+            "seenSource",
+        ] {
             for op in ["=", "IN(", "<", ">"] {
                 for side in [format!("{c}{op}"), format!(".{c}{op}")] {
                     assert!(
@@ -15890,5 +15907,626 @@ mod d2_actor_f_fold {
         assert!(r.carried, "{r:?}");
         assert_eq!(r.closure_rounds, 0, "an older closure taken: {r:?}");
         assert_eq!(record.batches.get() - b0, 1);
+    }
+}
+
+// ---- D2-ACTOR-F-FOLD-3 (the second delta lens `docs/audit/D2-ACTOR-F-delta-2-2026-10-31.md`, bsv-low #959) ----
+mod d2_actor_f_fold3 {
+    use super::*;
+    use crate::owed_events_publish as publish;
+    use std::time::Instant;
+
+    async fn published(
+        record: &SqliteSql,
+        source: &str,
+        key: &str,
+    ) -> overlay_discovery::owed_event::OwedEvent {
+        let port = crate::owed_events::SqlPublish {
+            db: record,
+            send: |_b: Vec<String>| async { Ok::<(), String>(()) },
+        };
+        let out = publish::publish_with(
+            &port,
+            vec![publish::Noted {
+                source: source.into(),
+                key: key.into(),
+                held: None,
+            }],
+        )
+        .await;
+        assert!(out.fault.is_none(), "{:?}", out.fault);
+        out.sent.into_iter().next().expect("the note was sent")
+    }
+
+    fn mark(record: &SqliteSql, game: &str, source: &str, key: &str) {
+        record
+            .conn
+            .execute(
+                "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner',?1,?2,?3,1) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=(SELECT COALESCE(MAX(generation),0)+1 FROM owed_dirty)",
+                [game, source, key],
+            )
+            .unwrap();
+    }
+
+    /// A new collected filing for game `k` (its marker and a payout txid the mirror never read, the payout's word).
+    fn collected(record: &SqliteSql, games: &[String], k: usize) -> String {
+        let (marker, pay) = (h("a1", k), h("a2", k));
+        record
+            .conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    "owner",
+                    games[k],
+                    marker,
+                    0,
+                    "00",
+                    (NOW_MS / 1000) as i64,
+                    pay
+                ],
+            )
+            .unwrap();
+        record
+            .conn
+            .execute(
+                "INSERT INTO tx_words(txid,word,tier,updated_at) VALUES (?1,'mined','chain',1)",
+                [&pay],
+            )
+            .unwrap();
+        mark(record, &games[k], "collected", &marker);
+        marker
+    }
+
+    /// The direct pass's port over the REAL actor and the record, as `WorkerDirect` is over D1: the marks by
+    /// `plan_with`, the pass's closure by `read_pass_closure` (each counted), each call the actor's `apply_with` of the
+    /// body as the object parses it (its carried rows, its txids, its event).
+    struct RecordDirect<'a> {
+        record: &'a SqliteSql,
+        local: &'a SqliteSql,
+        closure_reads: Cell<u32>,
+        closure_us: RefCell<Vec<u64>>,
+        reports: RefCell<Vec<ApplyReport>>,
+        start: Instant,
+    }
+    impl<'a> RecordDirect<'a> {
+        fn new(record: &'a SqliteSql, local: &'a SqliteSql) -> Self {
+            RecordDirect {
+                record,
+                local,
+                closure_reads: Cell::new(0),
+                closure_us: RefCell::default(),
+                reports: RefCell::default(),
+                start: Instant::now(),
+            }
+        }
+    }
+    impl crate::owed_events::DirectPort for RecordDirect<'_> {
+        async fn subjects(
+            &self,
+            ev: &overlay_discovery::owed_event::OwedEvent,
+        ) -> Result<Vec<(String, Vec<String>)>, String> {
+            Ok(crate::owed_events::plan_with(self.record, ev, false)
+                .await?
+                .subjects())
+        }
+        async fn call(&self, body: Value) -> Result<Value, String> {
+            let me = body["identity"].as_str().unwrap_or_default().to_string();
+            let games: Vec<String> = body["games"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|g| g.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let kind = body["kind"].as_str().unwrap_or("direct").to_string();
+            let seq = body["seq"].as_i64().unwrap_or(0);
+            let opts = ApplyOpts {
+                touch: serde_json::from_value(body["txids"].clone()).ok(),
+                carried: serde_json::from_value(body["carried"].clone()).ok(),
+                ..ApplyOpts::default()
+            };
+            let (r, _) = apply_with(
+                self.record,
+                self.local,
+                &Fakes,
+                &me,
+                &games,
+                Some((kind.as_str(), seq)),
+                Some(TIP),
+                None,
+                &opts,
+            )
+            .await?;
+            let mut answer = answer_of(&r, Vec::new());
+            if let Some(ms) = opts.carried.as_ref().and_then(|c| c.closure_ms) {
+                answer["closureMs"] = json!(ms);
+            }
+            self.reports.borrow_mut().push(r);
+            Ok(answer)
+        }
+        async fn closure_read(&self, stmt: Stmt) -> Option<Value> {
+            self.closure_reads.set(self.closure_reads.get() + 1);
+            let t = Instant::now();
+            let row = read_pass_closure(self.record, stmt).await;
+            self.closure_us
+                .borrow_mut()
+                .push(t.elapsed().as_micros() as u64);
+            row
+        }
+        fn now_ms(&self) -> u64 {
+            self.start.elapsed().as_millis() as u64
+        }
+    }
+
+    /// (fold3_medium1_a) THE SECOND DELTA LENS'S MEDIUM-1 (the captain's ruling 1): A WARM SEEN, A WORD AND A REFUSAL
+    /// READ NO CLOSURE AND NO D1 IN THE DIRECT PASS. `d2_actor_f_a` extended to the pass: on a warm seat, the network's
+    /// SEEN of game 7's pot, a MINED word of game 8's pot and a refusal of game 9's hop, each published as the writer
+    /// publishes it (carried), go through the shipped direct pass over the record-counting port (its subjects, its
+    /// closure and the actor's apply): ZERO record calls for the whole pass, no closure statement, every apply warm with
+    /// no miss. RED on a0834e27 by behaviour: its pass read a 25-statement closure batch for EVERY carried event (three
+    /// here, `DirectReport::closures` 3) before any call; RED against `closure_wanted` answering every carrier's keys
+    /// (the base's rule): "seen: no closure is wanted".
+    #[tokio::test]
+    async fn fold3_medium1_a_warm_seen_word_and_refusal_read_no_closure_in_the_direct_pass() {
+        let (record, local, games) = e_warm_seat(20).await;
+        let pot = h("c8", 7);
+        record
+            .conn
+            .execute(
+                "INSERT INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'2026-10-30 00:00:00','arcade',?2)",
+                rusqlite::params![pot, NOW_MS as i64],
+            )
+            .unwrap();
+        mark(&record, &games[7], "seen", &pot);
+        let pot8 = h("c8", 8);
+        record
+            .conn
+            .execute(
+                "INSERT INTO tx_words(txid,word,tier,height,proof_root,proof_height,proof_hex,header_hash,updated_at) VALUES (?1,'mined','chain',900001,?2,900001,'00',?3,5) ON CONFLICT(txid) DO UPDATE SET word='mined',tier='chain',height=900001,proof_root=excluded.proof_root,header_hash=excluded.header_hash,updated_at=5",
+                rusqlite::params![pot8, h("e1", 8), h("e2", 8)],
+            )
+            .unwrap();
+        mark(&record, &games[8], "word", &pot8);
+        let hop = h("b8", 9);
+        record
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO submit_refusals(hopTxid,hopVout,refusedTxid,reason,refusedAt) VALUES (?1,0,?2,?3,?4)",
+                rusqlite::params![hop, h("e3", 9), format!("double spend by {}", h("e4", 9)), NOW_MS as i64],
+            )
+            .unwrap();
+        let key = format!("{hop}:0");
+        mark(&record, &games[9], "refusal", &key);
+        let events = vec![
+            published(&record, "seen", &pot).await,
+            published(&record, "word", &pot8).await,
+            published(&record, "refusal", &key).await,
+        ];
+        for ev in &events {
+            assert!(ev.facts.get("payload").is_some(), "{}: carried", ev.source);
+            assert!(
+                closure_wanted(ev).is_none(),
+                "{}: no closure is wanted",
+                ev.source
+            );
+        }
+        let port = RecordDirect::new(&record, &local);
+        let b0 = record.batches.get();
+        let r = crate::owed_events::direct_with(&port, events, Some(TIP)).await;
+        let calls = record.batches.get() - b0;
+        eprintln!(
+            "fold3_medium1_a: a pass of a warm SEEN, word and refusal: {calls} record calls, {r:?}"
+        );
+        assert_eq!((r.carried, r.faults, r.walls), (3, 0, 0), "{r:?}");
+        assert_eq!(
+            (port.closure_reads.get(), r.closure_calls),
+            (0, 0),
+            "no closure statement"
+        );
+        assert_eq!(r.closures, 0);
+        for rep in port.reports.borrow().iter() {
+            assert!(
+                rep.carried && rep.misses == 0 && rep.closure_rounds == 0,
+                "{rep:?}"
+            );
+        }
+        assert_eq!(
+            calls, 0,
+            "the warm SEEN, word and refusal: the whole direct pass reads no D1"
+        );
+    }
+
+    /// (fold3_medium1_b) THE CAPTAIN'S RULING 2: THE PASS'S CLOSURES ARE ONE STATEMENT. Three NEW collected filings (each
+    /// naming a payout the mirror never read) and a warm SEEN in one direct pass (the overlay's hand-off shape): ONE
+    /// closure statement over the union of the filings' keys (the record's whole cost of the pass: one call), each
+    /// filing's apply takes its closure (`closureRounds` 1, no record call), the SEEN none, and each game's stored rows
+    /// equal a cold apply's from the record. The closure's time rides each filing's body (`closureMs`) and its answer,
+    /// served as the direct class's `closure` stage; `closures` 3. RED on a0834e27 by behaviour: three closure batches
+    /// of 25 statements, read one after another before any call; RED against a closure read per filing (the base's
+    /// loop) beside the pass's: "one closure statement for the pass", `left: 4 right: 1`.
+    #[tokio::test]
+    async fn fold3_medium1_b_a_pass_of_new_filings_reads_one_closure_statement() {
+        let (record, local, games) = e_warm_seat(20).await;
+        let mut events = Vec::new();
+        for k in [9usize, 10, 11] {
+            let marker = collected(&record, &games, k);
+            events.push(published(&record, "collected", &marker).await);
+        }
+        let pot = h("c8", 7);
+        record
+            .conn
+            .execute(
+                "INSERT INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'2026-10-30 00:00:00','arcade',?2)",
+                rusqlite::params![pot, NOW_MS as i64],
+            )
+            .unwrap();
+        mark(&record, &games[7], "seen", &pot);
+        events.push(published(&record, "seen", &pot).await);
+        let port = RecordDirect::new(&record, &local);
+        let (b0, s0) = (record.batches.get(), record.stmts.get());
+        let r = crate::owed_events::direct_with(&port, events, Some(TIP)).await;
+        let (calls, stmts) = (record.batches.get() - b0, record.stmts.get() - s0);
+        eprintln!("fold3_medium1_b: 3 new filings and a SEEN: {calls} record calls, {stmts} statements; {r:?}");
+        assert_eq!(
+            port.closure_reads.get(),
+            1,
+            "one closure statement for the pass"
+        );
+        assert_eq!((r.closure_calls, r.closures, r.carried), (1, 3, 4), "{r:?}");
+        assert!(r.closure_ms.is_some());
+        assert_eq!(
+            (calls, stmts),
+            (1, 1),
+            "the pass's whole record cost: one statement"
+        );
+        let reports = port.reports.borrow().clone();
+        assert_eq!(reports.len(), 1, "one identity, one coalesced body");
+        assert!(
+            reports[0].carried && reports[0].closure_rounds >= 1,
+            "{:?}",
+            reports[0]
+        );
+        for k in [7usize, 9, 10, 11] {
+            let c = mirror();
+            apply(
+                &record,
+                &c,
+                &Fakes,
+                "owner",
+                &[games[k].clone()],
+                None,
+                Some(TIP),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                stored_game(&local, "owner", &games[k]),
+                stored_game(&c, "owner", &games[k]),
+                "game {k}"
+            );
+        }
+        // the stage: the answer's `closureMs`, served as the direct class's `closure` p95
+        let mut bars = PendingBars::default();
+        bars.note_answer(
+            "direct",
+            &json!({"applied": true, "applyMs": 5, "readMs": 0, "closureMs": 7}),
+        );
+        assert_eq!(bars.stages.get(&("direct", "closure")), Some(&vec![7]));
+        assert!(APPLY_STAGES.contains(&("closureMs", "closure")));
+    }
+
+    /// (fold3_medium2) THE SECOND DELTA LENS'S MEDIUM-2 (the captain's ruling 3): THE SWEEP'S PASS READS NO CLOSURE, and
+    /// the drain's figure re-measured with CARRIED pairs. 80 collected filings (carriers naming a payout) whose marks
+    /// waited past a tick: the sweep takes 64, re-publishes them (each carried), and its direct pass under
+    /// `SWEEP_CLASS` reads no closure statement (each swept event's actor reads its own miss once); the drain's
+    /// statements (the sweep's tick, its publish batch, the pass, the bars' flush, the backlog snapshot, the counter
+    /// deltas) are printed and held under NEW9-L1's 280. RED on a0834e27 by behaviour: 64 closure batches of 25
+    /// statements in the alarm (about 1,600); RED against the sweep's pass reading closures: `left: (1, 1, 64) right:
+    /// (0, 0, 0)` (one statement, 64 closures, in the alarm).
+    #[tokio::test]
+    async fn fold3_medium2_the_sweep_reads_no_closure_and_the_drain_stays_bounded() {
+        let d1 = SqliteSql::migrated();
+        let now: i64 = 1_800_000_000_000;
+        d1.now.set(now as u64);
+        for i in 0..80usize {
+            let (marker, pay) = (h("a1", i), h("a2", i));
+            let id = format!("02{:064x}", i);
+            d1.conn
+                .execute(
+                    crate::record_post::COLLECTED_FILE_SQL,
+                    rusqlite::params![
+                        id,
+                        format!("g{i}"),
+                        marker,
+                        0,
+                        "00",
+                        now / 1000,
+                        pay
+                    ],
+                )
+                .unwrap();
+            d1.conn
+                .execute(
+                    "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,?2,'collected',?3,?4) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET markedAtMs=excluded.markedAtMs",
+                    rusqlite::params![id, format!("g{i}"), marker, now - 3_600_000],
+                )
+                .unwrap();
+        }
+        let s0 = d1.stmts.get();
+        let swept = crate::owed_events::sweep_tick(&d1, now).await.unwrap();
+        let pairs = swept.pairs.clone();
+        assert_eq!(pairs.len(), 64, "a full sweep");
+        let port = crate::owed_events::SqlPublish {
+            db: &d1,
+            send: |_: Vec<String>| async { Ok::<(), String>(()) },
+        };
+        let report =
+            crate::owed_events_publish::publish_with(&port, crate::owed_events::notes_of(&pairs))
+                .await;
+        assert!(report.fault.is_none());
+        let carried = report
+            .sent
+            .iter()
+            .filter(|e| e.facts.get("payload").is_some())
+            .count();
+        assert_eq!(carried, 64, "every swept pair is a carried filing");
+        assert!(
+            report.sent.iter().all(|e| closure_wanted(e).is_some()),
+            "each names its payout"
+        );
+        let local = mirror();
+        let direct = RecordDirect::new(&d1, &local);
+        let r = crate::owed_events::direct_with_class(
+            &direct,
+            report.sent.clone(),
+            Some(TIP),
+            SWEEP_CLASS,
+        )
+        .await;
+        assert_eq!(
+            (direct.closure_reads.get(), r.closure_calls, r.closures),
+            (0, 0, 0),
+            "{r:?}"
+        );
+        let pass_record = d1.stmts.get() - s0;
+        crate::owed_actor::flush_bars(&d1, now as u64, true).await;
+        crate::owed_judge::snapshot_dirty(&d1).await.unwrap();
+        let drain = d1.stmts.get() - s0 + 12;
+        eprintln!(
+            "fold3_medium2: a full 64-pair sweep of carried filings: the drain {drain} statements (to the pass's end {pass_record}, the 64 actors' own miss reads among them in this native port), no closure"
+        );
+        // The Worker's actors read their misses in their OWN invocations (the Durable Object's), never the alarm's:
+        // the alarm's own statements are the drain less the actors' applies.
+        let actors: u32 = direct
+            .reports
+            .borrow()
+            .iter()
+            .map(|a| a.record_calls)
+            .sum();
+        let alarm = drain - actors;
+        eprintln!("fold3_medium2: the actors' own record calls {actors}; the alarm's drain {alarm} statements");
+        assert!(
+            alarm <= 280,
+            "the drain inside the belt alarm stays NEW9-L1's figure: {alarm}"
+        );
+    }
+
+    /// (fold3_nit1) THE SECOND DELTA LENS'S NIT-1 (the captain's ruling 4): THE KEY RULE READS KEY COLUMNS ONLY. Every
+    /// family's txid key column is a key column; the columns of the mirrored tables read as keys are exactly the ones
+    /// named here; a 64-hex value in any other column (a refusal's `reason`, a word's `hint_source`, a SEEN's
+    /// `seenSource`, a marker's signature) is no key. RED on a0834e27's deny-list rule: the reason's competing txid read
+    /// as a key (`left: {.., "e4.."} right: {hop}`).
+    #[test]
+    fn fold3_nit1_the_key_rule_reads_key_columns_only() {
+        for f in FAMILIES {
+            for k in f.keys {
+                if let Txid(c) = k {
+                    assert!(KEY_COLUMNS.contains(c), "{}.{c} is a key column", f.table);
+                }
+            }
+        }
+        let mut named: Vec<String> = Vec::new();
+        for f in FAMILIES {
+            for c in schema::columns(f.table) {
+                if KEY_COLUMNS.contains(c) || KEY_STRUCTURED_COLUMNS.contains(c) {
+                    named.push(format!("{}.{c}", f.table));
+                }
+            }
+        }
+        let expected = [
+            "potparty_records.potTxid",
+            "potparty_records.txid",
+            "hopparty_records.txid",
+            "potparty_records_evicted.potTxid",
+            "potparty_records_evicted.txid",
+            "collected_markers_v2.txid",
+            "collected_markers_v2.payTxid",
+            "hopsweep_records.hopTxid",
+            "hopsweep_records.sweepTxid",
+            "hopsweep_records.txid",
+            "released_hop_evidence.hopTxid",
+            "released_hop_evidence.potTxid",
+            "released_hop_evidence_missing.hopTxid",
+            "released_hop_evidence_missing.potTxid",
+            "potrefund_records.potTxid",
+            "potrefund_records.txid",
+            "result_markers_v2.potTxid",
+            "result_markers_v2.settleTxid",
+            "result_markers_v2.txid",
+            "hand_markers.potTxid",
+            "hand_markers.txid",
+            "proof_markers.txid",
+            "hop_pot_links.potTxid",
+            "pot_hop_seats.potTxid",
+            "pot_records.txid",
+            "pot_records.spendingTxid",
+            "pot_records.verdictTxid",
+            "pot_records_evicted.txid",
+            "pot_records_evicted.spendingTxid",
+            "pot_records_evicted.verdictTxid",
+            "pot_evictions.txid",
+            "pot_evictions.releasedSpends",
+            "submit_refusals.hopTxid",
+            "network_seen.txid",
+            "owed_spender_bytes.txid",
+            "owed_spender_bytes.bytesJson",
+            "tx_words.txid",
+            "hop_chain_probes.outpoint",
+            "hop_chain_probes.spendingTxid",
+            "pot_beefs.txid",
+            "transactions.txid",
+        ];
+        assert_eq!(named, expected, "the key columns of the mirrored tables");
+        let (hop, other) = (h("b8", 1), h("e4", 1));
+        let mut keys = BTreeSet::new();
+        txids_in_row(
+            &json!({"hopTxid": hop, "hopVout": 0, "refusedTxid": h("e3", 1), "reason": format!("double spend by {other}"), "refusedAt": 1}),
+            &mut keys,
+        );
+        assert_eq!(
+            keys,
+            BTreeSet::from([hop.clone()]),
+            "a refusal's text names no key"
+        );
+        let mut keys = BTreeSet::new();
+        txids_in_row(
+            &json!({"marks": 1, "row": {"txid": hop, "hint_source": other, "legacy_body": other, "proof_root": other}}),
+            &mut keys,
+        );
+        assert_eq!(
+            keys,
+            BTreeSet::from([hop.clone()]),
+            "a word's row: its txid alone"
+        );
+        let mut keys = BTreeSet::new();
+        txids_in_row(
+            &json!({"txid": hop, "seenSource": other, "facts": {"inputs": [[other, 0, 1]]}}),
+            &mut keys,
+        );
+        assert_eq!(
+            keys,
+            BTreeSet::from([hop, other]),
+            "decoded facts are a structured key column"
+        );
+    }
+
+    /// (fold3_nit2) THE SECOND DELTA LENS'S NIT-2: THE PASS'S CLOSURE READS AT MOST 32 KEYS, and a row past its bound is
+    /// NOT CARRIED (never carried as an empty row). 40 keys: the statement binds the first 32, an event naming a key
+    /// past them has it in `notCarried` (that miss reads the record). A refusal whose `reason` passes the row weight
+    /// bound is answered with no row and its hop txid is not carried. RED on a0834e27 (`closure_of`): such a row was
+    /// carried as an EMPTY object (`json_of` reads a NULL as an empty array), so its miss took the closure's nothing.
+    #[tokio::test]
+    async fn fold3_nit2_the_closure_caps_its_keys_and_never_carries_an_empty_row() {
+        let keys: BTreeSet<String> = (0..40).map(|i| h("d0", i)).collect();
+        let (stmt, read) = pass_closure_statement(&keys).unwrap();
+        assert_eq!(read.len(), PASS_CLOSURE_KEYS_MAX);
+        let bound: Vec<String> = match &stmt.binds[0] {
+            Bind::Text(t) => serde_json::from_str(t).unwrap(),
+            _ => panic!(),
+        };
+        assert_eq!(bound.len(), 32);
+        let record = SqliteSql::migrated();
+        let hop = h("b8", 3);
+        record
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO submit_refusals(hopTxid,hopVout,refusedTxid,reason,refusedAt) VALUES (?1,0,?2,?3,1)",
+                rusqlite::params![hop, h("e3", 3), "x".repeat(40_000)],
+            )
+            .unwrap();
+        let mine = BTreeSet::from([hop.clone()]);
+        let (stmt, read) = pass_closure_statement(&mine).unwrap();
+        let row = read_pass_closure(&record, stmt).await.unwrap();
+        let c = ClosureRead::of(&closure_for(&mine, &read, &row).unwrap()).unwrap();
+        assert!(c.not_carried.contains(&hop), "{c:?}");
+        let n = FAMILIES
+            .iter()
+            .position(|f| f.table == "submit_refusals")
+            .unwrap();
+        assert!(
+            c.rows[n].is_empty(),
+            "no empty row carried: {:?}",
+            c.rows[n]
+        );
+        assert_eq!(c.rows_of(&mine), None, "the miss reads the record");
+        // a key past the 32 is not carried
+        let mut wide = keys.clone();
+        wide.insert(hop.clone());
+        let (_, read) = pass_closure_statement(&wide).unwrap();
+        let c = ClosureRead::of(&closure_for(&wide, &read, &row).unwrap()).unwrap();
+        assert!(wide
+            .iter()
+            .filter(|k| !read.contains(*k))
+            .all(|k| c.not_carried.contains(k)));
+    }
+
+    /// (fold3_nit3) THE SECOND DELTA LENS'S NIT-3: `closures` IS COUNTED AND SERVED: the Worker's pass adds
+    /// `owed_actor_direct_closures_total` (both Workers' lists), `/health.owedActor.direct.closures` and the overlay's
+    /// `/health/invariants.owedActor.directClosures` serve it.
+    #[test]
+    fn fold3_nit3_the_closures_are_counted_and_served() {
+        assert_eq!(COUNTERS[32], "owed_actor_direct_closures_total");
+        assert!(bsv_overlay_cloudflare::applayer_counters::OWED_ACTOR.contains(&COUNTERS[32]));
+        let view =
+            bsv_overlay_cloudflare::applayer_counters::owed_actor_view(&json!({COUNTERS[32]: 4}));
+        assert_eq!(view["directClosures"], 4);
+        assert!(HEALTH_SNAPSHOT_SQL.contains("'owed_actor_direct_closures_total'"));
+        let src: String = include_str!("../owed_events.rs")
+            .split_whitespace()
+            .collect();
+        assert!(src.contains("(crate::owed_actor::COUNTERS[32],report.closures)"));
+        let src: String = include_str!("../owed_actor.rs")
+            .split_whitespace()
+            .collect();
+        assert!(src.contains("\"closures\":n(COUNTERS[32])"));
+    }
+
+    /// (fold3_flood) THE CAPTAIN'S ITEM 5, NATIVELY: 32 SYNCHRONIZED NEW FILINGS (a collected filing each, naming a
+    /// payout the mirror never read), each through the door's publish (the enqueue), then its writer's own direct pass
+    /// (the closure statement, the actor's apply), on one warm seat over native SQLite. Printed: the enqueue, the
+    /// closure stage, the apply and its stages, the first visibility (the publish's start to the apply's end), p50 and
+    /// p95, in microseconds; the warm SEEN's D1 calls are `fold3_medium1_a`'s (0). Native SQLite is one process: the
+    /// D1 round trip (#959's 719 ms read p95 under the flood) is not here.
+    #[tokio::test]
+    async fn fold3_flood_32_synchronized_filings_natively() {
+        let (record, local, games) = e_warm_seat(40).await;
+        let markers: Vec<String> = (0..32).map(|k| collected(&record, &games, k + 4)).collect();
+        let (mut enq, mut clo, mut app, mut vis, mut calls) =
+            (vec![], vec![], vec![], vec![], vec![]);
+        for m in &markers {
+            let t0 = Instant::now();
+            let ev = published(&record, "collected", m).await;
+            enq.push(t0.elapsed().as_micros() as u64);
+            let port = RecordDirect::new(&record, &local);
+            let b0 = record.batches.get();
+            let t1 = Instant::now();
+            let r = crate::owed_events::direct_with(&port, vec![ev], Some(TIP)).await;
+            app.push(
+                t1.elapsed().as_micros() as u64 - port.closure_us.borrow().iter().sum::<u64>(),
+            );
+            vis.push(t0.elapsed().as_micros() as u64);
+            clo.extend(port.closure_us.borrow().iter().copied());
+            calls.push(record.batches.get() - b0);
+            assert_eq!((r.closure_calls, r.closures), (1, 1), "{r:?}");
+            let rep = &port.reports.borrow()[0];
+            assert!(rep.carried && rep.record_calls == 0, "{rep:?}");
+        }
+        let q = |v: &mut Vec<u64>, p: f64| {
+            v.sort_unstable();
+            v[((v.len() as f64 * p).ceil() as usize)
+                .saturating_sub(1)
+                .min(v.len() - 1)]
+        };
+        eprintln!(
+            "fold3_flood (native, us): enqueue p50 {} p95 {}; closure p50 {} p95 {}; apply p50 {} p95 {}; first visibility p50 {} p95 {}; record calls a filing {:?}",
+            q(&mut enq, 0.5), q(&mut enq, 0.95), q(&mut clo, 0.5), q(&mut clo, 0.95),
+            q(&mut app, 0.5), q(&mut app, 0.95), q(&mut vis, 0.5), q(&mut vis, 0.95), calls.iter().max()
+        );
+        assert!(
+            calls.iter().all(|c| *c == 1),
+            "each filing's pass: one record call (its closure)"
+        );
     }
 }

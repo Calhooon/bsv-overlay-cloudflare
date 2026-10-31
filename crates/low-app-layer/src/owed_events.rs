@@ -2621,8 +2621,13 @@ pub struct DirectReport {
     pub acked: u64,
     /// D2-ACTOR-F (bsv-low #959): events whose subjects and rows the publish carried (no marks read here).
     pub carried: u64,
-    /// D2-ACTOR-F-FOLD-2: carried events this pass read a closure for ([`DirectPort::closure`]).
+    /// D2-ACTOR-F-FOLD-3: the carried filings this pass gave a closure ([`DirectPort::closure_read`], the pass's ONE
+    /// statement), counted `owed_actor_direct_closures_total`.
     pub closures: u64,
+    /// D2-ACTOR-F-FOLD-3: the pass's closure statement's time, when it read one (the direct class's `closure` stage).
+    pub closure_ms: Option<u64>,
+    /// D2-ACTOR-F-FOLD-3: the record calls the pass's closure made (0 or 1).
+    pub closure_calls: u64,
 }
 
 /// D2-ACTOR-B-FOLD-10 (item 8): the direct path's fault line is logged at most once in this many ms an isolate.
@@ -2810,12 +2815,16 @@ pub trait DirectPort {
     async fn ack(&self, _stmts: Vec<Stmt>) -> Result<(), String> {
         Ok(())
     }
-    /// D2-ACTOR-F-FOLD-2 (the delta lens's MEDIUM-1 and MEDIUM-2): the carried CLOSURE of an event that carries its
-    /// row (`owed_actor::read_closure`), read here, after the writer's answer, in its own batch: never the publish's,
-    /// so a fault or a value past D1's bound costs only the closure. `None` (the default): the actor's miss round reads
-    /// the record once.
-    async fn closure(&self, _facts: &Value) -> Option<Value> {
+    /// D2-ACTOR-F-FOLD-3 (the second delta lens's MEDIUM-1, the captain's ruling): the pass's ONE closure statement
+    /// (`owed_actor::pass_closure_statement`: every family's rows of the union of the pass's carried filings' keys,
+    /// one snapshot), read after the writer's answer in one round trip; its answer row, or `None` (a fault, or a port
+    /// that reads none: each actor's miss round then reads the record once).
+    async fn closure_read(&self, _stmt: Stmt) -> Option<Value> {
         None
+    }
+    /// The port's clock (the closure stage's time); 0 for a port with none.
+    fn now_ms(&self) -> u64 {
+        0
     }
 }
 
@@ -2874,8 +2883,8 @@ pub async fn direct_with_class(
     class: &'static str,
 ) -> DirectReport {
     let mut report = DirectReport::default();
-    let mut subjects_of = Vec::new();
-    for (n, mut ev) in events.into_iter().enumerate() {
+    let mut kept: Vec<(OwedEvent, Subjects)> = Vec::new();
+    for (n, ev) in events.into_iter().enumerate() {
         if n >= DIRECT_EVENTS_MAX || ev.source == owed_event::TXFACTS {
             report.left_to_queue += 1;
             continue;
@@ -2908,14 +2917,42 @@ pub async fn direct_with_class(
         };
         if ev.facts.get("payload").is_some() {
             report.carried += 1;
-            // D2-ACTOR-F-FOLD-2: the closure, read after the answer (it rides this body only, never the queue)
-            if let Some(c) = port.closure(&ev.facts).await {
-                ev.facts["closure"] = c;
-                report.closures += 1;
+        }
+        kept.push((ev, subjects));
+    }
+    // D2-ACTOR-F-FOLD-3 (the second delta lens's MEDIUM-1 and MEDIUM-2, the captain's ruling): a closure only for a
+    // carried FILING naming a key beyond its own (`owed_actor::closure_wanted`), and the pass's closures in ONE
+    // statement over the union of their keys (the first `PASS_CLOSURE_KEYS_MAX`), one round trip, before the calls; the
+    // drain's sweep pass reads none (a swept event's actor reads its own miss once).
+    if class != crate::owed_actor::SWEEP_CLASS {
+        let wanted: Vec<Option<std::collections::BTreeSet<String>>> = kept
+            .iter()
+            .map(|(ev, _)| crate::owed_actor::closure_wanted(ev))
+            .collect();
+        let union: std::collections::BTreeSet<String> =
+            wanted.iter().flatten().flatten().cloned().collect();
+        if let Some((stmt, read)) = crate::owed_actor::pass_closure_statement(&union) {
+            let started = port.now_ms();
+            let row = port.closure_read(stmt).await;
+            let ms = port.now_ms().saturating_sub(started);
+            report.closure_calls += 1;
+            report.closure_ms = Some(ms);
+            if let Some(row) = row {
+                for ((ev, _), keys) in kept.iter_mut().zip(&wanted) {
+                    let Some(keys) = keys else { continue };
+                    if let Some(c) = crate::owed_actor::closure_for(keys, &read, &row) {
+                        ev.facts["closure"] = c;
+                        ev.facts["closureMs"] = json!(ms);
+                        report.closures += 1;
+                    }
+                }
             }
         }
-        subjects_of.push((crate::owed_actor::EventCtx::of(&ev), subjects));
     }
+    let subjects_of: Vec<_> = kept
+        .iter()
+        .map(|(ev, subjects)| (crate::owed_actor::EventCtx::of(ev), subjects.clone()))
+        .collect();
     let mut bodies = coalesce_direct(subjects_of, tip);
     // FIX-983 (bsv-low #983): the pass's fan-out rides each body; at `FLOOD_CONCURRENCY` or more the object samples
     // the call into the stress class (`flood`), apart from the warm hand's `direct`.
@@ -3011,8 +3048,11 @@ impl DirectPort for WorkerDirect {
     async fn ack(&self, stmts: Vec<Stmt>) -> Result<(), String> {
         self.sql.run_batch(stmts).await.map(|_| ())
     }
-    async fn closure(&self, facts: &Value) -> Option<Value> {
-        crate::owed_actor::read_closure(&self.sql, facts).await
+    async fn closure_read(&self, stmt: Stmt) -> Option<Value> {
+        crate::owed_actor::read_pass_closure(&self.sql, stmt).await
+    }
+    fn now_ms(&self) -> u64 {
+        worker::Date::now().as_millis()
     }
 }
 
@@ -3049,6 +3089,7 @@ pub async fn direct_events_as(
         (crate::owed_actor::COUNTERS[3], report.calls),
         (crate::owed_actor::COUNTERS[4], report.faults),
         (crate::owed_actor::COUNTERS[25], report.walls),
+        (crate::owed_actor::COUNTERS[32], report.closures),
         (publish::COUNTER_DIRECT_ACKED, report.acked),
     ]
     .into_iter()

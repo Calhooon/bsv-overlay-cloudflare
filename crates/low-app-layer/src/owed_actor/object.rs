@@ -1022,6 +1022,11 @@ impl OwedActor {
         answer["applyMs"] = json!(now.saturating_sub(started));
         answer["ackSeq"] = json!(self.meta(META_ACK));
         answer["warmAtBirth"] = json!(warm_at_birth);
+        // D2-ACTOR-F-FOLD-3 (the second delta lens's MEDIUM-1): the direct pass's ONE closure statement, timed by the
+        // caller before this call, served as the direct class's `closure` stage (outside `applyMs`: it precedes it).
+        if let Some(ms) = body.carried.as_ref().and_then(|c| c.closure_ms) {
+            answer["closureMs"] = json!(ms);
+        }
         // NEW6-L1: the delivery's visibility samples, one an event ([`event_visibility`]), read by the bars' note.
         answer["visibleMs"] = json!(visible);
         // NEW5-L5: the object notes its own samples into the fleet's bars (the caller may be gone: a walled direct
