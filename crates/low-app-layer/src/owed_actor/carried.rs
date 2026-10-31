@@ -197,7 +197,7 @@ pub fn item_statements(it: &CarriedItem) -> Result<Vec<Stmt>, String> {
             .collect::<Vec<_>>()
             .join(" AND ");
     for k in &it.k {
-        let key: Vec<Value> = serde_json::from_str(k).map_err(|e| format!("carried key: {e}"))?;
+        let key = key_tuple(k)?;
         if key.len() != it.c.len() {
             return Err(format!("carried key {k} is not {} wide", it.c.len()));
         }
@@ -224,7 +224,7 @@ pub fn item_statements(it: &CarriedItem) -> Result<Vec<Stmt>, String> {
         }
         // the row is in its own domain (a row outside it would survive the next carried delete)
         let inside = it.k.iter().any(|k| {
-            serde_json::from_str::<Vec<Value>>(k).is_ok_and(|key| {
+            key_tuple(k).is_ok_and(|key| {
                 it.c.iter()
                     .zip(&key)
                     .all(|(c, v)| same(&row[c.as_str()], v))
@@ -238,6 +238,14 @@ pub fn item_statements(it: &CarriedItem) -> Result<Vec<Stmt>, String> {
         out.push(Stmt::new(super::insert_sql(family), b));
     }
     Ok(out)
+}
+
+/// One key tuple (JSON text): an array of the key columns' values, or a one-column key's bare value.
+fn key_tuple(k: &str) -> Result<Vec<Value>, String> {
+    match serde_json::from_str::<Value>(k).map_err(|e| format!("carried key: {e}"))? {
+        Value::Array(a) => Ok(a),
+        v => Ok(vec![v]),
+    }
 }
 
 /// A key value and a column's value are the same value (a number and its text are not: the record's own types).
