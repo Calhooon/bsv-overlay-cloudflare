@@ -3528,7 +3528,9 @@ pub fn judged_tip(r: &Value) -> Option<i64> {
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or(Value::Null);
     let n = |v: &Value| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64));
-    n(&facts["tip"]).or_else(|| n(&r["probeTip"]))
+    n(&facts["tip"])
+        .or_else(|| n(&r["probeTip"]))
+        .or_else(|| n(&facts["servedTip"]))
 }
 
 /// PURE (D2-ACTOR-B-FOLD-15, NEW8-M1): the outpoints [`diff_rows`] reads different whose difference is ONLY
@@ -3543,6 +3545,7 @@ pub fn tip_derived_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
             for k in TIP_DERIVED_FACTS {
                 m.remove(k);
             }
+            probe_degrade_undone(m);
         }
         r["facts"] = json!(facts.to_string());
         r
@@ -3562,6 +3565,30 @@ pub fn tip_derived_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
             _ => false,
         })
         .collect()
+}
+
+/// FIX-1009 (bsv-low #1009): PURE, the #669 / #808 (b) degrade of a hop's courier probe UNDONE in a row's compared
+/// facts. A courier `"unspent"` taken at `chainProbeTip` is served by a judge whose tip is past it as
+/// `chainProbe: "index-unspent"` with `tipMoved: true` and `servedTip` (`owed::derive_owed_rows`' index-unspent arm):
+/// nothing moved but the served tip. So a row carrying exactly that (`index-unspent`, `tipMoved` true, a
+/// `chainProbeTip` below its `servedTip`) compares as the probe's own word at its tip (`unspent`, the two tip facts
+/// taken out); a row of the other side that states the probe's word with no move compares the same, and the
+/// remaining facts (`chainProbeTip`, the claim, `claimable`, the filed sweep) and the row's family, reason and
+/// claimable must still be equal for [`tip_derived_rows`] to read the pair a tip lag. An `index-unspent` with no
+/// probe (the courier silent, no `tipMoved`) is never undone: against a corroborated `unspent` it stays a diff.
+fn probe_degrade_undone(m: &mut serde_json::Map<String, Value>) {
+    let n = |v: Option<&Value>| v.and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
+    let degraded = m.get("chainProbe").and_then(Value::as_str) == Some("index-unspent")
+        && m.get("tipMoved") == Some(&json!(true))
+        && matches!(
+            (n(m.get("chainProbeTip")), n(m.get("servedTip"))),
+            (Some(probe), Some(served)) if probe < served
+        );
+    if degraded {
+        m.insert("chainProbe".into(), json!("unspent"));
+        m.remove("tipMoved");
+        m.remove("servedTip");
+    }
 }
 
 /// The distinct tips the rows of `outpoints` were judged at, on one side (the route's `tipLagTips`).
