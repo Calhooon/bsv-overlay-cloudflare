@@ -82,10 +82,13 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     // bsv-low #986 (FIX-986, READ-986 item 2(b)) appends one: `idx_pot_spent_unclassified`, the params backfill's
     // second verdict candidate set; the 474 before it are untouched.
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..474]), 3_293_095_810);
-    const COUNT: usize = 475;
+    // bsv-low #1001 (FIX-1001) appends four: `idx_hopsweep_sweep` and three `owed_dirty` triggers (a transaction's
+    // proof inserted and updated, a hop row's markerless filers); the 475 before them are untouched.
+    assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..475]), 4_238_311_408);
+    const COUNT: usize = 479;
     assert_eq!(OVERLAY_MIGRATIONS.len(), COUNT);
     assert_eq!(d1::OVERLAY_MIGRATION_COUNT, COUNT);
-    const FINGERPRINT: u32 = 4_238_311_408;
+    const FINGERPRINT: u32 = 3_349_521_383;
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT, "the certified fingerprint");
     assert_eq!(d1::migration_list_fingerprint(), FINGERPRINT);
     assert_eq!(fingerprint(OVERLAY_MIGRATIONS), FINGERPRINT);

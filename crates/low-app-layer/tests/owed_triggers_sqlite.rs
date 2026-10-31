@@ -874,6 +874,68 @@ fn paths(f: &Fixture) -> Result<(), String> {
         marks("hop", "hop:0", &["alice"]),
     )?;
     word_paths(f)?;
+    fix1001_paths(f)?;
+    Ok(())
+}
+
+/// FIX-1001 (bsv-low #1001, L55's S2): a filed sweep's proof and a hop row's confirmation reach a filer that holds no
+/// hop marker (the exclusive subject: no other trigger names `dave`), through each shipped writer.
+fn fix1001_paths(f: &Fixture) -> Result<(), String> {
+    use bsv_overlay_cloudflare::d1_storage as storage;
+    use low_app_layer::hopsweep;
+    f.check(
+        "markerless filer's sweep",
+        hopsweep::HOPSWEEP_FILE_SQL,
+        vec![
+            "dave".to_string().into(),
+            "game".to_string().into(),
+            "hop2".to_string().into(),
+            0.into(),
+            "sweep2".to_string().into(),
+            "00".to_string().into(),
+            "filed:sweep2".to_string().into(),
+            0.into(),
+            1.into(),
+        ],
+        marks("sweep", "filed:sweep2", &["dave"]),
+    )?;
+    f.execute(
+        "INSERT INTO transactions (txid, beef, has_proof, created_at) VALUES ('sweep2', x'00', 0, 1)",
+        vec![],
+    );
+    f.check(
+        "the sweep's proof stitched",
+        storage::UPDATE_TX_BEEF_SQL,
+        vec![
+            "sweep2".to_string().into(),
+            Value::Blob(vec![0]),
+            1.into(),
+            Value::Real(10.0),
+        ],
+        marks("beef", "sweep2", &["dave"]),
+    )?;
+    f.check(
+        "the sweep's proof refuted",
+        storage::TRANSACTION_UNPROVE_SQL,
+        vec!["sweep2".to_string().into()],
+        marks("beef", "sweep2", &["dave"]),
+    )?;
+    f.check(
+        "the sweep's proof latched",
+        storage::MARK_TX_PROVEN_AT_SQL,
+        vec![Value::Real(10.0), "sweep2".to_string().into()],
+        marks("beef", "sweep2", &["dave"]),
+    )?;
+    f.execute(
+        "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed, createdAt, lockKind) VALUES ('hop2', 0, 1, 'sweep2', 0, 1, 'p2pkh')",
+        vec![],
+    );
+    f.check(
+        "the chase confirms the hop for its markerless filer",
+        discovery::confirm_spend_cas_sql(),
+        vec![10.into(), "hop2".to_string().into(), 0.into(), "sweep2".to_string().into()],
+        marks("pot", "hop2:0", &["dave"]),
+    )?;
     Ok(())
 }
 
@@ -1438,8 +1500,8 @@ fn owed893_each_source_trigger_removed_or_not_advanced_alone_turns_the_productio
         .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
     assert_eq!(
         names.len(),
-        29,
-        "fifteen source tables (released_hop_evidence_missing, D2-OWED-FOLD-8's, the fifteenth), refusal UPSERT's UPDATE and two word triggers per verb"
+        32,
+        "fifteen source tables (released_hop_evidence_missing, D2-OWED-FOLD-8's, the fifteenth), refusal UPSERT's UPDATE and two word triggers per verb; FIX-1001's three (transactions' proof insert and update, a hop row's markerless filers)"
     );
     for name in names {
         let err = paths(&Fixture::new(Some(&name)))

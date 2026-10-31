@@ -663,8 +663,9 @@ mod tests {
             .copied()
             .filter(|s| s.starts_with("CREATE TRIGGER IF NOT EXISTS owed_dirty_"))
             .collect();
-        // The 29 shipped triggers plus their 29 appended write-time replacements.
-        assert_eq!(dirty.len(), 58);
+        // The 29 shipped triggers plus their 29 appended write-time replacements, and FIX-1001's three appended
+        // triggers (bsv-low #1001: the transactions proof insert and update, the hop row's markerless filers).
+        assert_eq!(dirty.len(), 61);
         for sql in dirty {
             let file = crate::migration_emitter::part_body(&[sql]);
             assert_eq!(split_wrangler_454(&file), [sql], "{sql}");

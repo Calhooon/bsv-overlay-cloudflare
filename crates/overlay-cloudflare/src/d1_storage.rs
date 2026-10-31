@@ -210,7 +210,7 @@ pub(crate) const INSERT_OUTPUT_TX_GASP_SQL: &str =
 /// bsv-low M19 round 2 (review M4): `?4` = the block height the stitched
 /// bump anchors the tx to (the sweep's transactions leg windows by it), NULL
 /// when the write carries no proof.
-pub(crate) const UPDATE_TX_BEEF_SQL: &str =
+pub const UPDATE_TX_BEEF_SQL: &str =
     "INSERT OR REPLACE INTO transactions (txid, beef, has_proof, created_at, retired_ms, retired_reason, proofHeight, admission_origin) \
      VALUES (?1, ?2, ?3, COALESCE((SELECT created_at FROM transactions WHERE txid = ?1), unixepoch()), \
              CASE WHEN ?3 = 1 THEN NULL ELSE (SELECT retired_ms FROM transactions WHERE txid = ?1) END, \
