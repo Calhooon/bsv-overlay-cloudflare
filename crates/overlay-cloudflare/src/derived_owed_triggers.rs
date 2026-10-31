@@ -543,7 +543,7 @@ macro_rules! party_seat_subjects {
         )
     };
 }
-/// A party filed or admitted: the other seat of its pot ([`party_seat_subjects`]), which `PARTY_INSERT` (the filer's
+/// A party filed or admitted: the other seat of its pot (`party_seat_subjects`), which `PARTY_INSERT` (the filer's
 /// own subject) never marked. The same pair, so the publish carries the row to it too.
 pub const PARTY_INSERT_SEATS: &str = trigger!(
     "potparty_records",
