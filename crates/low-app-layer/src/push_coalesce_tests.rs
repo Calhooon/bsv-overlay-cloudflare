@@ -737,3 +737,200 @@ fn fix989_d_every_push_reaches_the_relay_through_the_gate() {
     // The relay's raw `/push` is reached by the coalescer's port and the unconfigured short-cut only.
     assert_eq!(me.matches("first_party_push_answer(").count(), 2);
 }
+
+/// bsv-low #1002 (L55 S3, identityDown pair 10): one pot's two seats under a SATURATED sender minute. The fleet's gate
+/// is one coalescer; `HOT` other seats keep it busy (an owed-changed every `HOT_EVERY_MS` each, the fleet's other
+/// hands), so the sender bucket pays about one push a second, the rate the relay counted in that minute (10 `/push`
+/// calls in each 10 s, 22:50:40Z to 22:51:00Z). At `HAND_MS` the pot hook's announce forwards the pot's `pot` event to
+/// both seats in one body; the seats' owed actors push `owed-changed` at `HAND_MS` + 2, 4 and 6 s. Returns, per seat
+/// of the pot, the first delivery of each kind (ms after `t0`), and the hot seats' worst wait.
+async fn l55_hand() -> (Vec<(Option<u64>, Option<u64>)>, u64, Rc<Fake>) {
+    const HOT: usize = 6;
+    const HOT_EVERY_MS: u64 = 410;
+    const SPAN_MS: u64 = 40_000;
+    const HAND_MS: u64 = 10_000;
+    let fake = Fake::new();
+    let cell = Rc::new(RefCell::new(Coalescer::default()));
+    let gate = Rc::new(ModelGate {
+        gate: Some((cell.clone(), fake.clone())),
+        forwards: RefCell::new(0),
+    });
+    let t0 = Instant::now();
+    let mut hs = Vec::new();
+    for h in 0..HOT {
+        let seat = seat_of(100 + h);
+        for e in 0..SPAN_MS / HOT_EVERY_MS {
+            let at = t0 + Duration::from_millis(e * HOT_EVERY_MS + h as u64 * 37);
+            let (fake, gate, seat) = (fake.clone(), gate.clone(), seat.clone());
+            let local = Rc::new(RefCell::new(Coalescer::default()));
+            hs.push(tokio::task::spawn_local(async move {
+                tokio::time::sleep_until(at).await;
+                let body = crate::owed::owed_changed_event_body(&seat, "actor", 1, e as i64);
+                let push = GatePush {
+                    recipient: seat,
+                    message_id: None,
+                    body,
+                };
+                deliver(&local, &*fake, &*gate, &Knobs::default(), vec![push]).await
+            }));
+        }
+    }
+    let (a, b) = (seat_of(0), seat_of(1));
+    {
+        let (fake, gate, a, b) = (fake.clone(), gate.clone(), a.clone(), b.clone());
+        let local = Rc::new(RefCell::new(Coalescer::default()));
+        hs.push(tokio::task::spawn_local(async move {
+            tokio::time::sleep_until(t0 + Duration::from_millis(HAND_MS)).await;
+            let pot =
+                crate::internal_events::pot_event_body(&hex::encode([0xbd; 32]), 0, json!({}), 1);
+            let pushes = [a, b]
+                .into_iter()
+                .map(|seat| GatePush {
+                    message_id: Some(format!("pot-{seat}")),
+                    recipient: seat,
+                    body: pot.clone(),
+                })
+                .collect();
+            deliver(&local, &*fake, &*gate, &Knobs::default(), pushes).await
+        }));
+    }
+    for seat in [a.clone(), b.clone()] {
+        for e in 1..=3u64 {
+            let at = t0 + Duration::from_millis(HAND_MS + e * 2_000);
+            let (fake, gate, seat) = (fake.clone(), gate.clone(), seat.clone());
+            let local = Rc::new(RefCell::new(Coalescer::default()));
+            hs.push(tokio::task::spawn_local(async move {
+                tokio::time::sleep_until(at).await;
+                let body = crate::owed::owed_changed_event_body(&seat, "owed-actor", 2, e as i64);
+                let push = GatePush {
+                    recipient: seat,
+                    message_id: None,
+                    body,
+                };
+                deliver(&local, &*fake, &*gate, &Knobs::default(), vec![push]).await
+            }));
+        }
+    }
+    let mut answers = Vec::new();
+    for h in hs {
+        answers.extend(h.await.unwrap());
+    }
+    let calls = fake.calls.borrow().clone();
+    let start = BASE_MS;
+    assert!(
+        answers.iter().all(|a| *a == Answer::Sent),
+        "every push answered delivered"
+    );
+    let first = |seat: &str, kind: &str| {
+        calls
+            .iter()
+            .find(|c| c.1 == seat && c.2["kind"] == kind && c.3 == Answer::Sent)
+            .map(|c| c.0 - start)
+    };
+    let seats = [a, b]
+        .iter()
+        .map(|s| (first(s, "pot"), first(s, "owed-changed")))
+        .collect();
+    // The hot seats' worst wait: from a push to the next delivery of that seat at or after it.
+    let mut worst = 0;
+    for h in 0..HOT {
+        let seat = seat_of(100 + h);
+        let sent: Vec<u64> = calls
+            .iter()
+            .filter(|c| c.1 == seat && c.3 == Answer::Sent)
+            .map(|c| c.0 - start)
+            .collect();
+        for e in 0..SPAN_MS / HOT_EVERY_MS {
+            let at = e * HOT_EVERY_MS + h as u64 * 37;
+            if let Some(t) = sent.iter().find(|t| **t >= at) {
+                worst = worst.max(t - at);
+            }
+        }
+    }
+    (seats, worst, fake)
+}
+
+/// bsv-low #1002: BOTH seats of one pot receive the pot's `pot` event and an `owed-changed` while the hand is on,
+/// under a sender minute the fleet keeps full, and no seat waits out the hold bound. The sender bucket is served first
+/// come, first served across seats ([`take`]'s queue): eight seats with a state each wait at most about eight sends
+/// (a second each) and a window. RED on main's rule (the token to whichever waiter woke first after a refill, a quiet
+/// seat's leading edge jumping the held states): a seat of the pot loses each race until its hold bound forces it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fix1002_a_both_seats_of_one_pot_get_their_events_under_a_saturated_sender_minute() {
+    const HAND_MS: u64 = 10_000;
+    const BOUND_MS: u64 = 10_000;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (seats, worst, fake) = l55_hand().await;
+            println!(
+                "fix1002_a: seats (pot, owed-changed) ms {seats:?}, the hot seats' worst wait {worst} ms, {} relay calls, {} refused",
+                fake.calls.borrow().len(),
+                fake.refused()
+            );
+            assert_eq!(fake.refused(), 0, "no ERR_SEND_BUDGET at the relay");
+            for (i, (pot, owed)) in seats.iter().enumerate() {
+                let pot = pot.unwrap_or_else(|| panic!("seat {i} never got the pot event"));
+                let owed = owed.unwrap_or_else(|| panic!("seat {i} never got an owed-changed"));
+                assert!(
+                    pot <= HAND_MS + BOUND_MS,
+                    "seat {i}: the pot event {} ms after the hook's announce",
+                    pot - HAND_MS
+                );
+                assert!(
+                    owed <= HAND_MS + 2_000 + BOUND_MS,
+                    "seat {i}: the first owed-changed {} ms after the actor's push",
+                    owed - HAND_MS - 2_000
+                );
+            }
+            assert!(
+                worst < PUSH_HOLD_WINDOWS_MAX as u64 * PUSH_COALESCE_MS_DEFAULT,
+                "a hot seat waited {worst} ms, its hold bound"
+            );
+        })
+        .await;
+}
+
+/// bsv-low #1002, the window's half: a seat pushed twice a window (an owed actor's `owed-changed` an event, L55's p22
+/// at 22:50:46.6Z, 48.6, 50.6), with the sender bucket idle, so every other push lands at the end of the window a
+/// waiting state is on. That state goes at that end, carrying the newest, never postponed by the push that replaces
+/// it. RED on main's rule (a push at or
+/// after the window's end opened a new window over the waiting state, so the waiter woke superseded): one send at the
+/// leading edge and the next only after the pushes stopped.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fix1002_b_a_seat_pushed_twice_a_window_is_sent_every_window() {
+    const PUSHES: u64 = 30;
+    const EVERY_MS: u64 = PUSH_COALESCE_MS_DEFAULT / 2;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let fake = Fake::new();
+            let cell = Rc::new(RefCell::new(Coalescer::default()));
+            let t0 = Instant::now();
+            let mut hs = Vec::new();
+            for e in 0..PUSHES {
+                let at = t0 + Duration::from_millis(e * EVERY_MS);
+                let (fake, cell) = (fake.clone(), cell.clone());
+                hs.push(tokio::task::spawn_local(async move {
+                    tokio::time::sleep_until(at).await;
+                    submit(&cell, &*fake, &Knobs::default(), SEAT, None, owed(e)).await
+                }));
+            }
+            for h in hs {
+                assert_eq!(h.await.unwrap(), Answer::Sent);
+            }
+            let sent: Vec<u64> = fake.delivered().iter().map(|(t, _)| t - BASE_MS).collect();
+            println!("fix1002_b: sends at {sent:?}");
+            let gaps: Vec<u64> = sent.windows(2).map(|w| w[1] - w[0]).collect();
+            assert!(
+                gaps.iter().all(|g| *g <= 2 * PUSH_COALESCE_MS_DEFAULT),
+                "a gap past two windows between sends: {gaps:?}"
+            );
+            assert_eq!(
+                fake.delivered().last().unwrap().1["computedAtMs"],
+                PUSHES as i64 - 1,
+                "the newest state goes last"
+            );
+        })
+        .await;
+}
