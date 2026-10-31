@@ -219,6 +219,9 @@ impl Bucket {
 #[derive(Debug, Clone)]
 struct Pending {
     seq: u64,
+    /// bsv-low #1002: the state's place in the sender bucket's queue, taken when its key first waited and kept when a
+    /// newer state of the key replaces it (coalescing never sends a seat to the back).
+    ticket: u64,
     body: Value,
     message_id: Option<String>,
 }
@@ -237,6 +240,7 @@ pub struct Coalescer {
     seats: BTreeMap<String, Seat>,
     sender: Option<Bucket>,
     seq: u64,
+    ticket: u64,
     /// This coalescer's own counts (the isolate's are the statics; the pins read these).
     pub tally: Tally,
 }
@@ -302,8 +306,52 @@ pub fn health_json() -> Value {
     })
 }
 
-/// Take one token of both buckets, or none (the state waits).
-fn take(c: &mut Coalescer, identity: &str, knobs: &Knobs, now: u64) -> bool {
+/// bsv-low #1002: the states queued AHEAD of `ticket` (`None`: a state not yet queued, behind every queued one) that
+/// the sender bucket must still cover: older, still waited on (their seat's window was set within the last window
+/// and a second: a submitter whose future was dropped leaves its entry, which stops counting), and payable by their
+/// own seat's bucket (a seat over its own minute holds no one else back). The caller's own entry is never counted.
+fn ahead(
+    c: &Coalescer,
+    identity: &str,
+    key: Option<&str>,
+    ticket: Option<u64>,
+    knobs: &Knobs,
+    now: u64,
+) -> usize {
+    let live_after = now.saturating_sub(knobs.window_ms + 1_000);
+    c.seats
+        .iter()
+        .filter(|(_, s)| s.window_end >= live_after)
+        .filter(|(id, s)| {
+            s.bucket.as_ref().is_none_or(|b| {
+                let mut b = b.clone();
+                b.refill(knobs.per_identity_per_min, now);
+                b.tokens >= 1.0
+            }) || id.as_str() == identity
+        })
+        .flat_map(|(id, s)| s.pending.iter().map(move |(k, p)| (id, k, p)))
+        .filter(|(id, k, p)| {
+            !(id.as_str() == identity && Some(k.as_str()) == key)
+                && ticket.is_none_or(|t| p.ticket < t)
+        })
+        .count()
+}
+
+/// Take one token of both buckets, or none (the state waits). bsv-low #1002: the sender bucket is served FIRST COME,
+/// FIRST SERVED across seats: a state pays only when the bucket also covers every live state queued ahead of it
+/// ([`ahead`]). Until L55 the token went to whichever waiter woke first after a refill (or to a quiet seat's leading
+/// edge, which jumped every held state), so under a saturated sender minute one seat of a pot took a send every
+/// window while the other lost each race to its hold bound (L55 pair 10: p22 six `/push` calls 22:50:46Z to
+/// 22:50:58Z, p21 its first at 22:51:15.9Z).
+fn take(
+    c: &mut Coalescer,
+    identity: &str,
+    key: Option<&str>,
+    ticket: Option<u64>,
+    knobs: &Knobs,
+    now: u64,
+) -> bool {
+    let queued = ahead(c, identity, key, ticket, knobs, now) as f64;
     let sender = c
         .sender
         .get_or_insert_with(|| Bucket::full(knobs.sender_per_min, now));
@@ -313,7 +361,7 @@ fn take(c: &mut Coalescer, identity: &str, knobs: &Knobs, now: u64) -> bool {
         .bucket
         .get_or_insert_with(|| Bucket::full(knobs.per_identity_per_min, now));
     mine.refill(knobs.per_identity_per_min, now);
-    if sender.tokens >= 1.0 && mine.tokens >= 1.0 {
+    if sender.tokens >= 1.0 + queued && mine.tokens >= 1.0 {
         sender.tokens -= 1.0;
         mine.tokens -= 1.0;
         true
@@ -387,7 +435,7 @@ pub async fn submit<P: PushPort>(
             .seats
             .get(&identity)
             .is_none_or(|s| s.window_end <= now && !s.pending.contains_key(&key));
-        if quiet && take(&mut c, &identity, knobs, now) {
+        if quiet && take(&mut c, &identity, None, None, knobs, now) {
             c.seats.entry(identity.clone()).or_default().window_end = now + knobs.window_ms;
             true
         } else {
@@ -405,26 +453,34 @@ pub async fn submit<P: PushPort>(
         }
     }
     // Pending: the newest state of the key wins.
-    let (seq, replaced) = {
+    let (seq, ticket, replaced) = {
         let mut c = cell.borrow_mut();
         c.seq += 1;
         let seq = c.seq;
+        c.ticket += 1;
+        let fresh = c.ticket;
         let seat = c.seats.entry(identity.clone()).or_default();
+        let ticket = seat.pending.get(&key).map_or(fresh, |p| p.ticket);
         let replaced = seat
             .pending
             .insert(
                 key.clone(),
                 Pending {
                     seq,
+                    ticket,
                     body,
                     message_id: message_id.map(str::to_string),
                 },
             )
             .is_some();
-        if seat.window_end <= now {
+        // bsv-low #1002: a state that REPLACES a waiting one keeps the window its waiter is on (an ended one is
+        // taken at once). Until L55 a push landing at or after the window's end opened a new one, the waiter woke
+        // superseded, and a seat pushed about once a window (an owed actor's event every 2 s) was postponed for as
+        // long as its pushes kept coming.
+        if !replaced && seat.window_end <= now {
             seat.window_end = now + knobs.window_ms.max(1);
         }
-        (seq, replaced)
+        (seq, ticket, replaced)
     };
     if replaced {
         note(cell, Which::Coalesced);
@@ -452,7 +508,7 @@ pub async fn submit<P: PushPort>(
             if !mine {
                 // Superseded: a newer state of the key took it over (and its submitter delivers it).
                 Step::Carried
-            } else if take(&mut c, &identity, knobs, now)
+            } else if take(&mut c, &identity, Some(&key), Some(ticket), knobs, now)
                 || (held_windows >= PUSH_HOLD_WINDOWS_MAX && force(&mut c, &identity))
             {
                 let seat = c.seats.entry(identity.clone()).or_default();
