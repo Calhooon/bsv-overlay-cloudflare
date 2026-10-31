@@ -884,7 +884,9 @@ async fn fix1002_a_both_seats_of_one_pot_get_their_events_under_a_saturated_send
                 );
             }
             assert!(
-                worst < PUSH_HOLD_WINDOWS_MAX as u64 * PUSH_COALESCE_MS_DEFAULT,
+                // bsv-low #1017: the bound #1002 read is the absolute one (the hot seats here keep the relay's own
+                // minute full, so their holds pass the 4 s bar and are served over it on `/health.push.gate`).
+                worst < PUSH_HOLD_WINDOWS_RELAY_FULL as u64 * PUSH_COALESCE_MS_DEFAULT,
                 "a hot seat waited {worst} ms, its hold bound"
             );
         })
@@ -933,4 +935,266 @@ async fn fix1002_b_a_seat_pushed_twice_a_window_is_sent_every_window() {
             );
         })
         .await;
+}
+
+// ── bsv-low #1017 (L56 S3, identityDown pair 10): the hold ends on a new kind or after two windows ──
+
+/// The key a push delivers under (its pot outpoint's for a `pot`).
+fn kind_key(body: &Value) -> String {
+    coalesce_key(body).unwrap_or_default()
+}
+
+/// The 33-pair burst on the fleet's ONE gate (L56's loop shape): 33 pairs, 66 seats, one hand a pair started every
+/// `STAGGER_MS`; each hand announces its pot's `pot` event to both seats (the JOIN), the seats' owed actors push an
+/// `owed-changed` at +2, +4 and +6 s, the settle's `pot` event at +8 s and a last `owed-changed` at +10 s, every
+/// producer in its own isolate forwarding to the gate. Returns every push's delivery latency (its send time to the
+/// first delivery of its seat and key at or after it), the relay fake and the gate's cell.
+async fn l56_burst() -> (Vec<u64>, Rc<Fake>, Rc<RefCell<Coalescer>>) {
+    const PAIRS: usize = 33;
+    const STAGGER_MS: u64 = 6_000;
+    let fake = Fake::new();
+    let cell = Rc::new(RefCell::new(Coalescer::default()));
+    let gate = Rc::new(ModelGate {
+        gate: Some((cell.clone(), fake.clone())),
+        forwards: RefCell::new(0),
+    });
+    let t0 = Instant::now();
+    let mut hs = Vec::new();
+    let mut pushes: Vec<(u64, String, String)> = Vec::new();
+    for p in 0..PAIRS {
+        let hand = p as u64 * STAGGER_MS;
+        let seats = [seat_of(2 * p), seat_of(2 * p + 1)];
+        let pot = crate::internal_events::pot_event_body(
+            &hex::encode([p as u8 + 1; 32]),
+            0,
+            json!({}),
+            1,
+        );
+        let mut events: Vec<(u64, String, Value)> = Vec::new();
+        for seat in &seats {
+            events.push((hand, seat.clone(), pot.clone()));
+            events.push((hand + 8_000, seat.clone(), pot.clone()));
+            for (n, at) in [2_000u64, 4_000, 6_000, 10_000].into_iter().enumerate() {
+                let body = crate::owed::owed_changed_event_body(seat, "owed-actor", 2, n as i64);
+                events.push((hand + at, seat.clone(), body));
+            }
+        }
+        for (at, seat, body) in events {
+            pushes.push((at, seat.clone(), kind_key(&body)));
+            let (fake, gate) = (fake.clone(), gate.clone());
+            let local = Rc::new(RefCell::new(Coalescer::default()));
+            hs.push(tokio::task::spawn_local(async move {
+                tokio::time::sleep_until(t0 + Duration::from_millis(at)).await;
+                let push = GatePush {
+                    recipient: seat,
+                    message_id: None,
+                    body,
+                };
+                deliver(&local, &*fake, &*gate, &Knobs::default(), vec![push]).await
+            }));
+        }
+    }
+    for h in hs {
+        for a in h.await.unwrap() {
+            assert_eq!(a, Answer::Sent, "every push answered delivered");
+        }
+    }
+    let calls = fake.calls.borrow().clone();
+    let latencies = pushes
+        .iter()
+        .map(|(at, seat, key)| {
+            calls
+                .iter()
+                .filter(|c| &c.1 == seat && &kind_key(&c.2) == key && c.3 == Answer::Sent)
+                .map(|c| c.0 - BASE_MS)
+                .find(|t| *t >= *at)
+                .unwrap_or_else(|| panic!("{seat} {key} at {at} was never delivered"))
+                - at
+        })
+        .collect();
+    (latencies, fake, cell)
+}
+
+fn p95(mut v: Vec<u64>) -> (u64, u64, u64) {
+    v.sort_unstable();
+    let at = |q: f64| v[((q * v.len() as f64).ceil() as usize).clamp(1, v.len()) - 1];
+    (at(0.5), at(0.95), *v.last().unwrap())
+}
+
+/// (fix1017_a) THE 33-PAIR BURST: every seat's `pot` and `owed-changed` reaches the relay within the hold bar (p95
+/// and max under 5 s), the relay refuses nothing and no minute carries past its 100. RED on main (the hold 10
+/// windows, a state forced only after 20 s): the fleet's demand sits past the sender bucket's 80 a minute and under
+/// the relay's 100, so main's first-come queue grows through the burst and its holds run to the 20 s bound (L56's 18
+/// to 26 s).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fix1017_a_a_33_pair_burst_reaches_every_seat_within_the_hold_bar() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (lat, fake, gate) = l56_burst().await;
+            let max_minute = fake.window.borrow().values().copied().max().unwrap_or(0);
+            let (p50, p95, max) = p95(lat.clone());
+            println!(
+                "fix1017_a: {} pushes, {} relay calls, {} refused, busiest relay minute {max_minute}, delivery ms p50 {p50} p95 {p95} max {max}",
+                lat.len(),
+                fake.calls.borrow().len(),
+                fake.refused()
+            );
+            assert_eq!(fake.refused(), 0, "no ERR_SEND_BUDGET at the relay");
+            assert!(max_minute <= 100, "{max_minute} sends in one relay minute");
+            assert!(p95 <= 5_000, "the delivery p95 {p95} ms is past the 5 s bar");
+            assert!(max <= 5_000, "a seat's push waited {max} ms");
+            // The gate's own figures (what `/health.push.gate` serves) read the same minute under the bar.
+            let f = gate.borrow_mut().hold_figures(fake.now_ms());
+            println!("fix1017_a: the gate's hold over its last minute {f:?}");
+            assert!(f.samples > 0 && f.hold_ms_p95 <= PUSH_HOLD_BAR_MS, "{f:?}");
+        })
+        .await;
+}
+
+/// (fix1017_b) THE NEW KIND ENDS THE HOLD. A sender bucket kept spent (4 a minute: one token held), the relay's
+/// line wide open: a seat's `owed-changed` is held at its window's end; a `pot` event for the seat at 2.5 s sends
+/// BOTH at once (the coalesced set), its waiter answered delivered. RED on main: the pot waits behind the held
+/// owed-changed for the bucket's refill or the 20 s bound.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fix1017_b_a_new_kind_behind_a_held_state_sends_the_seats_set_at_once() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let fake = Fake::new();
+            let cell = Rc::new(RefCell::new(Coalescer::default()));
+            let knobs = Knobs::parse(None, None, Some("4"));
+            let t0 = Instant::now();
+            let mut hs = Vec::new();
+            for (at, body) in [(0u64, owed(0)), (500, owed(1)), (2_500, pot(0xab, 1))] {
+                let (fake, cell) = (fake.clone(), cell.clone());
+                hs.push(tokio::task::spawn_local(async move {
+                    tokio::time::sleep_until(t0 + Duration::from_millis(at)).await;
+                    submit(&cell, &*fake, &knobs, SEAT, None, body).await
+                }));
+            }
+            for h in hs {
+                assert_eq!(h.await.unwrap(), Answer::Sent);
+            }
+            let sent: Vec<(u64, String)> = fake
+                .delivered()
+                .iter()
+                .map(|(t, b)| (t - BASE_MS, b["kind"].as_str().unwrap().to_string()))
+                .collect();
+            println!("fix1017_b: sends {sent:?}");
+            let at = |k: &str, n: usize| sent.iter().filter(|s| s.1 == k).nth(n).map(|s| s.0);
+            assert_eq!(at("owed-changed", 0), Some(0), "the leading edge");
+            assert_eq!(at("pot", 0), Some(2_500), "the pot goes when it arrives");
+            assert_eq!(
+                at("owed-changed", 1),
+                Some(2_500),
+                "the held owed-changed goes with it"
+            );
+            assert_eq!(
+                fake.delivered().last().unwrap().1["kind"],
+                "pot",
+                "nothing left behind"
+            );
+        })
+        .await;
+}
+
+/// (fix1017_c) A SUSTAINED BURST SENDS EVERY HOLD WITH THE COALESCED SET, never past the relay's line. One seat, two
+/// keys pushed every 300 ms for a minute, the sender bucket at 4 a minute: each key goes at least every two windows
+/// (its hold bar), carrying its newest state. RED on main: held to the 20 s bound between sends.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fix1017_c_a_sustained_burst_sends_its_set_within_every_hold_bar() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let fake = Fake::new();
+            let cell = Rc::new(RefCell::new(Coalescer::default()));
+            let knobs = Knobs::parse(None, None, Some("4"));
+            let t0 = Instant::now();
+            let mut hs = Vec::new();
+            for e in 0..200u64 {
+                let (fake, cell) = (fake.clone(), cell.clone());
+                let body = if e % 2 == 0 { owed(e) } else { pot(0xcd, e) };
+                hs.push(tokio::task::spawn_local(async move {
+                    tokio::time::sleep_until(t0 + Duration::from_millis(e * 300)).await;
+                    submit(&cell, &*fake, &knobs, SEAT, None, body).await
+                }));
+            }
+            for h in hs {
+                assert_eq!(h.await.unwrap(), Answer::Sent);
+            }
+            assert_eq!(fake.refused(), 0);
+            for kind in ["owed-changed", "pot"] {
+                let t: Vec<u64> = fake
+                    .delivered()
+                    .iter()
+                    .filter(|(_, b)| b["kind"] == kind)
+                    .map(|(t, _)| t - BASE_MS)
+                    .collect();
+                let gaps: Vec<u64> = t.windows(2).map(|w| w[1] - w[0]).collect();
+                println!("fix1017_c: {kind} sends {} gaps {gaps:?}", t.len());
+                assert!(
+                    gaps.iter().all(|g| *g <= 3 * PUSH_COALESCE_MS_DEFAULT),
+                    "{kind}: a gap past the hold bar and its window: {gaps:?}"
+                );
+            }
+            let f = cell.borrow_mut().hold_figures(fake.now_ms());
+            assert!(f.hold_ms_max <= 2 * PUSH_COALESCE_MS_DEFAULT, "{f:?}");
+        })
+        .await;
+}
+
+/// (fix1017_d) THE SERVED FIGURE. The gate writes its hold over the trailing minute to one row of the belt's ledger
+/// at most every 10 s and only with a sample; `/health` reads it as a primary-key row of the consumer statement it
+/// already runs (no statement more) and serves `push.gate` {holdMsP50, holdMsP95, holdMsMax, samples, barMs,
+/// overBar, ageMs}; `null` before the gate's first write. New API: does not compile on main.
+#[test]
+fn fix1017_d_the_gates_hold_is_served_on_health() {
+    let cell = RefCell::new(Coalescer::default());
+    let t = BASE_MS;
+    assert!(
+        gate_hold_stmt_due(&cell, t).is_none(),
+        "no sample, no write"
+    );
+    for (i, h) in [0u64, 100, 2_000, 4_000, 6_000].into_iter().enumerate() {
+        cell.borrow_mut().note_send(t + i as u64, Some(h));
+    }
+    let f = cell.borrow_mut().hold_figures(t + 10);
+    assert_eq!(
+        (f.samples, f.hold_ms_p50, f.hold_ms_p95, f.hold_ms_max),
+        (5, 2_000, 6_000, 6_000)
+    );
+    let stmt = gate_hold_stmt_due(&cell, t + 10).expect("a write is due");
+    assert_eq!(stmt.sql, GATE_HOLD_WRITE_SQL);
+    assert!(
+        gate_hold_stmt_due(&cell, t + 5_000).is_none(),
+        "at most every 10 s"
+    );
+    assert!(gate_hold_stmt_due(&cell, t + 10 + GATE_HOLD_WRITE_EVERY_MS).is_some());
+    // Past the minute the samples age out.
+    assert_eq!(cell.borrow_mut().hold_figures(t + 70_000).samples, 0);
+    // The view.
+    assert_eq!(gate_hold_view(None, t), Value::Null);
+    let v = gate_hold_view(Some(&gate_hold_cursor(&f, t)), t + 3_000);
+    assert_eq!(v["holdMsP95"], 6_000);
+    assert_eq!(v["holdMsP50"], 2_000);
+    assert_eq!(v["holdMsMax"], 6_000);
+    assert_eq!(v["barMs"], PUSH_HOLD_BAR_MS);
+    assert_eq!(v["overBar"], true);
+    assert_eq!(v["ageMs"], 3_000);
+    let quiet = gate_hold_view(Some(&gate_hold_cursor(&HoldFigures::default(), t)), t);
+    assert_eq!(quiet["overBar"], Value::Null, "no sample is no verdict");
+    // A REAL-bound stamp reads (D1 binds a JS number).
+    let real = r#"{"asOfMs":1790000000000.0,"samples":2,"holdMsP50":10.0,"holdMsP95":20.0,"holdMsMax":20.0}"#;
+    assert_eq!(gate_hold_view(Some(real), t)["holdMsP95"], 20);
+    // The wiring: the gate writes after its pushes; `/health` reads the row in its existing statement.
+    assert!(crate::owed_events::HEALTH_CONSUMER_SQL.contains(&format!("'{GATE_HOLD_NAME}'")));
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let gate = squash(include_str!("push_coalesce.rs"));
+    let serve = &gate[gate.find("pubasyncfnserve_gate(").unwrap()..];
+    let serve = &serve[..serve.find("pubasyncfnpush_to_seat(").unwrap()];
+    assert!(serve.contains("gate_hold_stmt_due(cell,port.now_ms())"));
+    let routes = squash(include_str!("routes.rs"));
+    assert!(routes.contains("owed_events::health_actor_fleet_push(&sql,&dirty)"));
+    assert!(routes.contains("body[\"push\"][\"gate\"]=push_gate;"));
 }

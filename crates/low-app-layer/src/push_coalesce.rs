@@ -24,8 +24,9 @@
 //! leading edge) and opens a window; a push inside the window replaces the pending state of its key (the newest
 //! wins, so it carries the newest `computedAtMs` / `at`) and the newest submitter delivers it at the window's end.
 //! A state the buckets cannot pay for at the window's end is HELD to the next window, never dropped: the newest
-//! state of every key always goes, at most [`PUSH_HOLD_WINDOWS_MAX`] windows late (then it is sent regardless,
-//! counted held). No Durable Object: the state lives in the isolate, because the push is a wake-up the client
+//! state of every key always goes, at most [`PUSH_HOLD_WINDOWS_MAX`] windows late (then it is sent regardless of the
+//! buckets, under the relay's own line; counted held). bsv-low #1017: a NEW kind arriving behind a held state sends the
+//! seat's set at once, and the gate serves its per-seat hold on `/health.push.gate`. No Durable Object: the state lives in the isolate, because the push is a wake-up the client
 //! answers by re-reading `/owed` or `/results` (a lost window costs latency, never a fact), and an actor call per
 //! push would put a subrequest and an actor's single thread in front of every judgement for the sake of a trigger.
 //!
@@ -57,9 +58,28 @@ pub const PUSH_SENDER_BUDGET_PER_MIN_VAR: &str = "PUSH_SENDER_BUDGET_PER_MIN";
 pub const RELAY_SENDS_PER_MIN: u64 = 100;
 /// A refused `ERR_SEND_BUDGET` state is tried again at the next window this many times, then given up.
 pub const PUSH_BUDGET_RETRY_WINDOWS: u32 = 3;
-/// A held state waits at most this many windows for a bucket, then is sent regardless (never dropped; inside the
-/// platform's 30 s `wait_until` at the default window).
-pub const PUSH_HOLD_WINDOWS_MAX: u32 = 10;
+/// bsv-low #1017 (L56 S3, the captain's ruling): THE HOLD BAR. A held state waits at most this many windows (4 s at
+/// the default window) for the buckets, then is sent regardless of them, so a seat's first-party event is never held
+/// behind the fleet's. It was 10 (20 s, L56 read 18 to 26 s). The one line it does not cross is the RELAY's own minute
+/// ([`relay_line`]): a state forced past the buckets goes only while the trailing 60 s holds fewer sends than that
+/// line, else it is held one more window (a relay refusal would cost it three retries and a give-up).
+pub const PUSH_HOLD_WINDOWS_MAX: u32 = 2;
+/// The absolute bound: past this many windows a state is sent regardless of the relay's line too (never held for
+/// good; inside the platform's 30 s `wait_until` at the default window). Reached only while the relay's minute is
+/// full, which `/health.push.gate` shows as a hold past its bar.
+pub const PUSH_HOLD_WINDOWS_RELAY_FULL: u32 = 10;
+/// bsv-low #1017: the sends kept under the relay's [`RELAY_SENDS_PER_MIN`] in any trailing 60 s by a state sent past
+/// the buckets (the relay's window is tumbling; a trailing count under its line keeps every tumbling one under it).
+pub const RELAY_HEADROOM: u64 = 5;
+/// bsv-low #1017: the per-seat hold bar `/health.push.gate` reads its p95 against (the fleet invariants row's).
+pub const PUSH_HOLD_BAR_MS: u64 = 5_000;
+/// The trailing span the hold figures and the relay line are read over.
+pub const PUSH_TRAIL_MS: u64 = 60_000;
+
+/// The sends any trailing 60 s may carry through this coalescer: the relay's 100 less [`RELAY_HEADROOM`].
+pub const fn relay_line() -> u64 {
+    RELAY_SENDS_PER_MIN - RELAY_HEADROOM
+}
 
 pub const COUNTER_COALESCED: &str = "push_coalesced_total";
 pub const COUNTER_HELD: &str = "push_held_total";
@@ -222,6 +242,11 @@ struct Pending {
     /// bsv-low #1002: the state's place in the sender bucket's queue, taken when its key first waited and kept when a
     /// newer state of the key replaces it (coalescing never sends a seat to the back).
     ticket: u64,
+    /// bsv-low #1017: when the oldest push this state carries arrived (kept when a newer state replaces it): its hold
+    /// is measured from here.
+    since: u64,
+    /// bsv-low #1017: the buckets refused this key's state at least one window end (it is HELD, not coalescing).
+    held: bool,
     body: Value,
     message_id: Option<String>,
 }
@@ -241,8 +266,66 @@ pub struct Coalescer {
     sender: Option<Bucket>,
     seq: u64,
     ticket: u64,
+    /// bsv-low #1017: every relay call this coalescer made in the trailing 60 s (the relay line's count).
+    sent: std::collections::VecDeque<u64>,
+    /// bsv-low #1017: each trigger state's hold (its send less its `since`; a leading edge 0) in the trailing 60 s,
+    /// `(sent at, hold ms)`.
+    holds: std::collections::VecDeque<(u64, u64)>,
     /// This coalescer's own counts (the isolate's are the statics; the pins read these).
     pub tally: Tally,
+}
+
+/// The hold figures over a trailing minute, as `/health.push` serves them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoldFigures {
+    pub samples: u64,
+    pub hold_ms_p50: u64,
+    pub hold_ms_p95: u64,
+    pub hold_ms_max: u64,
+}
+
+impl Coalescer {
+    fn prune(&mut self, now: u64) {
+        let from = now.saturating_sub(PUSH_TRAIL_MS);
+        while self.sent.front().is_some_and(|t| *t <= from) {
+            self.sent.pop_front();
+        }
+        while self.holds.front().is_some_and(|(t, _)| *t <= from) {
+            self.holds.pop_front();
+        }
+    }
+    /// The relay's line has room for one more send now.
+    fn relay_room(&mut self, now: u64) -> bool {
+        self.prune(now);
+        (self.sent.len() as u64) < relay_line()
+    }
+    fn note_send(&mut self, now: u64, hold: Option<u64>) {
+        self.prune(now);
+        self.sent.push_back(now);
+        if let Some(h) = hold {
+            self.holds.push_back((now, h));
+        }
+    }
+    /// PURE over the trailing minute at `now`: the per-seat hold's p50, p95 and max (nearest rank).
+    pub fn hold_figures(&mut self, now: u64) -> HoldFigures {
+        self.prune(now);
+        let mut h: Vec<u64> = self.holds.iter().map(|(_, h)| *h).collect();
+        h.sort_unstable();
+        let rank = |q: f64| -> u64 {
+            if h.is_empty() {
+                return 0;
+            }
+            let i = ((q * h.len() as f64).ceil() as usize).clamp(1, h.len()) - 1;
+            h[i]
+        };
+        HoldFigures {
+            samples: h.len() as u64,
+            hold_ms_p50: rank(0.50),
+            hold_ms_p95: rank(0.95),
+            hold_ms_max: h.last().copied().unwrap_or(0),
+        }
+    }
 }
 
 /// The five counts, as `/health/invariants.push` serves them.
@@ -303,6 +386,93 @@ pub fn health_json() -> Value {
         "refusedBudget": REFUSED_BUDGET.load(Ordering::Relaxed),
         "givenUp": GIVEN_UP.load(Ordering::Relaxed),
         "windows": WINDOWS.load(Ordering::Relaxed),
+        // bsv-low #1017: this isolate's per-seat hold over the trailing minute (the gate's is `push.gate`).
+        "hold": ISOLATE.with(|c| c.borrow_mut().hold_figures(now_ms_isolate())),
+    })
+}
+
+fn now_ms_isolate() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        worker::Date::now().as_millis()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
+/// bsv-low #1017: the gate's hold snapshot, one row of the belt's ledger (`owed_belt_state`), read by `/health` as a
+/// primary-key row of `owed_events::HEALTH_CONSUMER_SQL` (no statement more).
+pub const GATE_HOLD_NAME: &str = "push-gate:hold";
+/// The gate rewrites its snapshot at most this often (and only after it sent).
+pub const GATE_HOLD_WRITE_EVERY_MS: u64 = 10_000;
+/// The snapshot's write: `?1` the figures' JSON, `?2` the time.
+pub const GATE_HOLD_WRITE_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('push-gate:hold',?1,CAST(?2 AS INTEGER)) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs";
+
+/// PURE: the snapshot's cursor for the figures at `now`.
+pub fn gate_hold_cursor(f: &HoldFigures, now: u64) -> String {
+    json!({
+        "asOfMs": now,
+        "samples": f.samples,
+        "holdMsP50": f.hold_ms_p50,
+        "holdMsP95": f.hold_ms_p95,
+        "holdMsMax": f.hold_ms_max,
+    })
+    .to_string()
+}
+
+/// PURE: `/health.push.gate` from the snapshot row's cursor (`None` before the gate's first write): the hold's p50,
+/// p95 and max over the minute before `asOfMs`, its samples, the bar and whether the p95 is over it (`null` with no
+/// sample), the snapshot's age at `now`.
+pub fn gate_hold_view(cursor: Option<&str>, now: u64) -> Value {
+    let Some(v) = cursor.and_then(|c| serde_json::from_str::<Value>(c).ok()) else {
+        return Value::Null;
+    };
+    let n = |k: &str| v[k].as_u64().or_else(|| v[k].as_f64().map(|f| f as u64));
+    let samples = n("samples").unwrap_or(0);
+    let p95 = n("holdMsP95");
+    let as_of = n("asOfMs");
+    json!({
+        "holdMsP50": n("holdMsP50"),
+        "holdMsP95": p95,
+        "holdMsMax": n("holdMsMax"),
+        "samples": samples,
+        "trailMs": PUSH_TRAIL_MS,
+        "barMs": PUSH_HOLD_BAR_MS,
+        "overBar": if samples == 0 { Value::Null } else { json!(p95.unwrap_or(0) > PUSH_HOLD_BAR_MS) },
+        "holdWindowsMax": PUSH_HOLD_WINDOWS_MAX,
+        "relayLine": relay_line(),
+        "asOfMs": as_of,
+        "ageMs": as_of.map(|a| now.saturating_sub(a)),
+    })
+}
+
+thread_local! {
+    static GATE_HOLD_WRITTEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The gate's snapshot statement when one is due at `now` (at most every [`GATE_HOLD_WRITE_EVERY_MS`], only with a
+/// sample in the minute), marking it written.
+pub fn gate_hold_stmt_due(cell: &RefCell<Coalescer>, now: u64) -> Option<crate::pot_hook::Stmt> {
+    let last = GATE_HOLD_WRITTEN.with(|w| w.get());
+    if now < last.saturating_add(GATE_HOLD_WRITE_EVERY_MS) {
+        return None;
+    }
+    let f = cell.borrow_mut().hold_figures(now);
+    if f.samples == 0 {
+        return None;
+    }
+    GATE_HOLD_WRITTEN.with(|w| w.set(now));
+    Some(crate::pot_hook::Stmt {
+        sql: GATE_HOLD_WRITE_SQL.into(),
+        binds: vec![
+            crate::pot_hook::Bind::Text(gate_hold_cursor(&f, now)),
+            crate::pot_hook::Bind::Int(now as i64),
+        ],
     })
 }
 
@@ -351,6 +521,10 @@ fn take(
     knobs: &Knobs,
     now: u64,
 ) -> bool {
+    // bsv-low #1017: nothing paid goes past the relay's line either.
+    if !c.relay_room(now) {
+        return false;
+    }
     let queued = ahead(c, identity, key, ticket, knobs, now) as f64;
     let sender = c
         .sender
@@ -368,6 +542,17 @@ fn take(
     } else {
         false
     }
+}
+
+/// bsv-low #1017: the state of `key` has waited [`PUSH_HOLD_WINDOWS_MAX`] windows since the oldest push it carries
+/// (4 s at the default window): its hold ends.
+fn held_past_bar(c: &Coalescer, identity: &str, key: &str, knobs: &Knobs, now: u64) -> bool {
+    c.seats
+        .get(identity)
+        .and_then(|s| s.pending.get(key))
+        .is_some_and(|p| {
+            now.saturating_sub(p.since) >= u64::from(PUSH_HOLD_WINDOWS_MAX) * knobs.window_ms.max(1)
+        })
 }
 
 /// Past the hold bound a state is sent regardless: it still spends a token of both buckets (they may go below
@@ -414,7 +599,8 @@ pub async fn submit<P: PushPort>(
 ) -> Answer {
     let identity = recipient.to_ascii_lowercase();
     let Some(key) = coalesce_key(&body) else {
-        // Not a trigger: passes through, uncoalesced and unheld.
+        // Not a trigger: passes through, uncoalesced and unheld (counted on the relay's line).
+        cell.borrow_mut().note_send(port.now_ms(), None);
         let a = port.send(&identity, message_id, body).await;
         if a == Answer::BudgetRefused {
             note(cell, Which::RefusedBudget);
@@ -437,6 +623,7 @@ pub async fn submit<P: PushPort>(
             .is_none_or(|s| s.window_end <= now && !s.pending.contains_key(&key));
         if quiet && take(&mut c, &identity, None, None, knobs, now) {
             c.seats.entry(identity.clone()).or_default().window_end = now + knobs.window_ms;
+            c.note_send(now, Some(0));
             true
         } else {
             false
@@ -453,14 +640,21 @@ pub async fn submit<P: PushPort>(
         }
     }
     // Pending: the newest state of the key wins.
-    let (seq, ticket, replaced) = {
+    let (seq, ticket, replaced, new_kind) = {
         let mut c = cell.borrow_mut();
         c.seq += 1;
         let seq = c.seq;
         c.ticket += 1;
         let fresh = c.ticket;
+        let now = port.now_ms();
         let seat = c.seats.entry(identity.clone()).or_default();
         let ticket = seat.pending.get(&key).map_or(fresh, |p| p.ticket);
+        let since = seat.pending.get(&key).map_or(now, |p| p.since);
+        let held = seat.pending.get(&key).is_some_and(|p| p.held);
+        // bsv-low #1017: a NEW kind behind a HELD state (a `pot` behind a held `owed-changed`, another pot's event)
+        // ends the seat's hold: this submitter sends the seat's set below, at once. A state still in its first
+        // window is coalescing, not held: a new kind beside it waits for that window's end with it.
+        let new_kind = !seat.pending.contains_key(&key) && seat.pending.values().any(|p| p.held);
         let replaced = seat
             .pending
             .insert(
@@ -468,6 +662,8 @@ pub async fn submit<P: PushPort>(
                 Pending {
                     seq,
                     ticket,
+                    since,
+                    held,
                     body,
                     message_id: message_id.map(str::to_string),
                 },
@@ -480,18 +676,34 @@ pub async fn submit<P: PushPort>(
         if !replaced && seat.window_end <= now {
             seat.window_end = now + knobs.window_ms.max(1);
         }
-        (seq, ticket, replaced)
+        (seq, ticket, replaced, new_kind)
     };
     if replaced {
         note(cell, Which::Coalesced);
     }
+    if new_kind {
+        if let Some(a) = release_seat(cell, port, knobs, &identity, &key, seq).await {
+            return a;
+        }
+    }
     let mut held_windows = 0u32;
     loop {
+        // bsv-low #1017: the waiter wakes at its seat's window end, or at its state's hold bar if sooner (the bar is
+        // measured from the oldest push the state carries, not on the window grid).
         let end = cell
             .borrow()
             .seats
             .get(&identity)
-            .map(|s| s.window_end)
+            .map(|s| {
+                let bar = s
+                    .pending
+                    .get(&key)
+                    .filter(|p| p.seq == seq)
+                    .map_or(u64::MAX, |p| {
+                        p.since + u64::from(PUSH_HOLD_WINDOWS_MAX) * knobs.window_ms.max(1)
+                    });
+                s.window_end.min(bar)
+            })
             .unwrap_or(0);
         let now = port.now_ms();
         if end > now {
@@ -509,18 +721,26 @@ pub async fn submit<P: PushPort>(
                 // Superseded: a newer state of the key took it over (and its submitter delivers it).
                 Step::Carried
             } else if take(&mut c, &identity, Some(&key), Some(ticket), knobs, now)
-                || (held_windows >= PUSH_HOLD_WINDOWS_MAX && force(&mut c, &identity))
+                || (held_past_bar(&c, &identity, &key, knobs, now)
+                    && (c.relay_room(now) || held_windows >= PUSH_HOLD_WINDOWS_RELAY_FULL)
+                    && force(&mut c, &identity))
             {
                 let seat = c.seats.entry(identity.clone()).or_default();
                 seat.window_end = now + knobs.window_ms;
                 match seat.pending.remove(&key) {
-                    Some(p) => Step::Send(p),
+                    Some(p) => {
+                        c.note_send(now, Some(now.saturating_sub(p.since)));
+                        Step::Send(p)
+                    }
                     None => Step::Carried,
                 }
             } else {
                 // HELD to the next window: never dropped.
                 let seat = c.seats.entry(identity.clone()).or_default();
                 seat.window_end = now + knobs.window_ms.max(1);
+                if let Some(p) = seat.pending.get_mut(&key) {
+                    p.held = true;
+                }
                 Step::Held
             }
         };
@@ -563,6 +783,65 @@ pub async fn submit<P: PushPort>(
         seat.pending.insert(key.clone(), Pending { seq, ..p });
         seat.window_end = port.now_ms() + knobs.window_ms.max(1);
     }
+}
+
+/// bsv-low #1017: a NEW kind arrived at a seat holding states: the seat's whole pending set goes now, past the
+/// buckets (each still spends a token, so what follows waits for it), while the relay's line has room; a state the
+/// line cannot carry stays pending for its own waiter. The submitter of the new kind answers with its own state's
+/// relay answer (`None`: its state stayed pending or was refused, it waits as any). A refused state goes back to its
+/// waiter's retries. The released states' waiters find their state
+/// gone and answer delivered (carried), as a coalesced state does.
+async fn release_seat<P: PushPort>(
+    cell: &RefCell<Coalescer>,
+    port: &P,
+    knobs: &Knobs,
+    identity: &str,
+    key: &str,
+    seq: u64,
+) -> Option<Answer> {
+    let now = port.now_ms();
+    let batch: Vec<(String, Pending)> = {
+        let mut c = cell.borrow_mut();
+        let keys: Vec<String> = c
+            .seats
+            .get(identity)
+            .map(|s| s.pending.keys().cloned().collect())
+            .unwrap_or_default();
+        let mut batch = Vec::new();
+        for k in keys {
+            if !c.relay_room(now) {
+                break;
+            }
+            force(&mut c, identity);
+            let seat = c.seats.entry(identity.to_string()).or_default();
+            if let Some(p) = seat.pending.remove(&k) {
+                seat.window_end = now + knobs.window_ms;
+                c.note_send(now, Some(now.saturating_sub(p.since)));
+                batch.push((k, p));
+            }
+        }
+        batch
+    };
+    let mut mine = None;
+    for (k, p) in batch {
+        note(cell, Which::Window);
+        let a = port
+            .send(identity, p.message_id.as_deref(), p.body.clone())
+            .await;
+        if a == Answer::BudgetRefused {
+            // Back to its own waiter (its retries), unless a newer state of its key arrived meanwhile.
+            note(cell, Which::RefusedBudget);
+            let mut c = cell.borrow_mut();
+            let seat = c.seats.entry(identity.to_string()).or_default();
+            seat.pending.entry(k).or_insert(p);
+            continue;
+        }
+        if k == key && p.seq == seq {
+            mine = Some(a);
+        }
+    }
+    tidy(&mut cell.borrow_mut(), identity, knobs, port.now_ms());
+    mine
 }
 
 enum Step {
@@ -798,6 +1077,18 @@ pub async fn serve_gate(env: &worker::Env, text: &str) -> worker::Result<worker:
     } else {
         vec![Answer::NotConfigured; pushes.len()]
     };
+    // bsv-low #1017: the gate's per-seat hold, served on `/health.push.gate` (best effort: a fault logs).
+    if let Some(stmt) = gate_hold_stmt_due(cell, port.now_ms()) {
+        use crate::pot_hook::SqlPort;
+        match crate::routes::D1Sql::of(env) {
+            Ok(sql) => {
+                if let Err(e) = sql.run_batch(vec![stmt]).await {
+                    port.log(&format!("[push] gate hold snapshot write fault: {e}"));
+                }
+            }
+            Err(e) => port.log(&format!("[push] gate hold snapshot: no OVERLAY_DB: {e}")),
+        }
+    }
     worker::Response::from_json(
         &json!({ "answers": answers.iter().map(|a| a.word()).collect::<Vec<_>>() }),
     )
