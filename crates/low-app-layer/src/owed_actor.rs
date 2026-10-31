@@ -2004,8 +2004,11 @@ pub const ASK_ROWS_SQL: &str = "SELECT outpoint,gameId,family,facts,reason,probe
 /// The identity's asks of these games that no dated row names any more (`?1`, `?2` the identity's range of the
 /// ledger's key, `?3` the games, `?4` the asks kept): taken out of the belt's ledger.
 pub const ASKS_CLEAR_SQL: &str = "DELETE FROM owed_belt_state WHERE name>=?1 AND name<?2 AND json_extract(cursor,'$.question.gameId') IN (SELECT value FROM json_each(?3)) AND name NOT IN (SELECT value FROM json_each(?4))";
-/// One ask, rewritten only when its question moved (an unchanged re-publish keeps the belt's backoff).
-pub const ASK_PUT_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,?2,?3) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=excluded.tickedAtMs WHERE owed_belt_state.cursor IS NOT excluded.cursor";
+/// One ask, rewritten only when its question moved (an unchanged re-publish keeps the belt's backoff). FIX-1018: a
+/// question that moved with the SAME due date (a re-judge keeps an unasked row's date, `owed_judge::kept_belt_due`)
+/// keeps the belt's own later date (its re-arm or backoff after a look), so a re-judge never re-dates the ledger past
+/// the belt's word nor before it.
+pub const ASK_PUT_SQL: &str = "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) VALUES (?1,?2,?3) ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor,tickedAtMs=CASE WHEN json_extract(owed_belt_state.cursor,'$.dueAtMs')=excluded.tickedAtMs AND owed_belt_state.tickedAtMs>excluded.tickedAtMs THEN owed_belt_state.tickedAtMs ELSE excluded.tickedAtMs END WHERE owed_belt_state.cursor IS NOT excluded.cursor";
 
 /// THE ASKS LANE (FIX-983, bsv-low #983). Until this fold the belt's questions were PUBLISHED inside the measured
 /// apply, in the object's turn: a record batch (the clear and one put an ask) and a counters round trip per apply,

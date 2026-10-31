@@ -173,7 +173,10 @@ pub const REQUIRED_GAME_INDEX_NAMES: [&str; 2] = [
 ];
 pub const MARK_WANTED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,'','wanted','wanted',strftime('%s','now') * 1000) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
 /// A judge's per-game delete, over `idx_owed_rows_identity_game` (the D2-OWED lens's LOW-2).
-pub const GAME_DELETE_SQL: &str = "DELETE FROM owed_rows WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))";
+/// Run AFTER the judgement's row upserts (FIX-1018): it takes the judged games' rows the judgement did not write
+/// (?3, a JSON list of the written outpoints), so a rewritten row is UPDATED in place and its stored belt date is
+/// still there for the upsert's kept-date rule; the delete-then-insert it replaces needed a read of the dates first.
+pub const GAME_DELETE_SQL: &str = "DELETE FROM owed_rows WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2)) AND outpoint NOT IN (SELECT value FROM json_each(?3))";
 /// The identity's state row, created once with its rows counted; the row triggers keep `rows` from then on.
 pub const STATE_CREATE_SQL: &str = "INSERT INTO owed_state(identity,computedAtMs,tip,rows,stale,truncated,recomputeSeq) SELECT ?1,?2,NULL,(SELECT COUNT(*) FROM owed_rows WHERE identity=?1),0,0,0 WHERE NOT EXISTS (SELECT 1 FROM owed_state WHERE identity=?1)";
 /// The stored ceiling, read only when the kept count is past it: the state row is the outer loop, so under the
@@ -185,6 +188,82 @@ pub const STATE_UPDATE_SQL: &str = "UPDATE owed_state SET computedAtMs=MAX(compu
 /// source statements raised, ?4 a JSON list of `[source, sourceKey]`.
 pub const ACK_DIRTY_SQL: &str = "DELETE FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2)) AND (generation<=?3 OR EXISTS (SELECT 1 FROM json_each(?4) m WHERE json_extract(m.value,'$[0]')=owed_dirty.source AND json_extract(m.value,'$[1]')=owed_dirty.sourceKey))";
 pub const MARKS_SQL: &str = "SELECT generation,source,sourceKey FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))";
+thread_local! {
+    /// FIX-1018: the outpoints the belt has JUST ASKED, per identity (a multiset: one entry a live scope).
+    static BELT_ASKED: std::cell::RefCell<HashMap<String, Vec<String>>> = std::cell::RefCell::default();
+}
+/// FIX-1018: while this scope lives, a judge of `identity` dates the asked outpoints FRESH (the ask stamps the next
+/// date); every other dated row keeps the earlier of its stored and fresh dates. The belt holds one around its find's
+/// judge and hand-back; the owed actor's object holds one around an apply whose body names `beltAsked`
+/// ([`belt_asked_now`] is what the D1 port's `actor_apply` sends). Keyed by identity, so another identity's apply
+/// interleaving in the isolate is untouched; another apply of the same identity inside the scope dates the asked
+/// outpoints fresh too (the ask did happen).
+pub struct BeltAskedScope {
+    identity: String,
+    outpoints: Vec<String>,
+}
+pub fn belt_asked_scope(identity: &str, outpoints: &[String]) -> BeltAskedScope {
+    let identity = identity.to_ascii_lowercase();
+    let outpoints: Vec<String> = outpoints.iter().map(|o| o.to_ascii_lowercase()).collect();
+    BELT_ASKED.with(|m| {
+        m.borrow_mut()
+            .entry(identity.clone())
+            .or_default()
+            .extend(outpoints.iter().cloned())
+    });
+    BeltAskedScope {
+        identity,
+        outpoints,
+    }
+}
+impl Drop for BeltAskedScope {
+    fn drop(&mut self) {
+        BELT_ASKED.with(|m| {
+            let mut m = m.borrow_mut();
+            if let Some(list) = m.get_mut(&self.identity) {
+                for o in &self.outpoints {
+                    if let Some(n) = list.iter().position(|x| x == o) {
+                        list.swap_remove(n);
+                    }
+                }
+                if list.is_empty() {
+                    m.remove(&self.identity);
+                }
+            }
+        });
+    }
+}
+/// FIX-1018: the outpoints of `identity` a live [`BeltAskedScope`] names.
+pub fn belt_asked_now(identity: &str) -> BTreeSet<String> {
+    BELT_ASKED.with(|m| {
+        m.borrow()
+            .get(&identity.to_ascii_lowercase())
+            .map(|l| l.iter().cloned().collect())
+            .unwrap_or_default()
+    })
+}
+/// FIX-1018: the kept-date rule inside the row's upsert ([`ROW_UPSERT_SQL`]): the stored row of the same game keeps
+/// its EARLIER date unless ?16 (the belt just asked this outpoint) or either date is NULL ([`kept_belt_due`]). The
+/// `DO UPDATE` reads the row it replaces, so the rule costs no statement.
+macro_rules! kept_due {
+    () => {
+        "(?16=0 AND owed_rows.gameId=excluded.gameId AND owed_rows.beltDueAtMs IS NOT NULL AND excluded.beltDueAtMs IS NOT NULL AND owed_rows.beltDueAtMs<excluded.beltDueAtMs)"
+    };
+}
+pub const KEPT_DUE_SQL: &str = kept_due!();
+/// One judged row's write; its `facts.beltNextAtMs` follows the kept date.
+pub const ROW_UPSERT_SQL: &str = concat!("INSERT INTO owed_rows(identity,outpoint,family,gameId,sats,opponentIdentity,atHeight,facts,updatedAtMs,reason,judgedAtMs,claimable,gateHeight,beltDueAtMs,probeTip) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) ON CONFLICT(identity,outpoint) DO UPDATE SET family=excluded.family,gameId=excluded.gameId,sats=excluded.sats,opponentIdentity=excluded.opponentIdentity,atHeight=excluded.atHeight,facts=CASE WHEN ", kept_due!(), " THEN json_set(excluded.facts,'$.beltNextAtMs',owed_rows.beltDueAtMs) ELSE excluded.facts END,updatedAtMs=excluded.updatedAtMs,reason=excluded.reason,judgedAtMs=excluded.judgedAtMs,claimable=excluded.claimable,gateHeight=excluded.gateHeight,beltDueAtMs=CASE WHEN ", kept_due!(), " THEN owed_rows.beltDueAtMs ELSE excluded.beltDueAtMs END,probeTip=excluded.probeTip");
+/// FIX-1018: the date a re-judge writes. A fresh `None` is `None` (nothing to ask); an outpoint the belt just asked
+/// takes its fresh date; any other row keeps the EARLIER of its stored and fresh dates, so an overdue row stays due
+/// until its look. The date is no judge input: the judgement's rows and facts are the same either way. The write
+/// applies this rule INSIDE the row's upsert ([`KEPT_DUE_SQL`], over the row it updates), so it costs the judge's
+/// batch no statement; this function is the rule's statement for the pins.
+pub fn kept_belt_due(fresh: Option<i64>, stored: Option<i64>, asked: bool) -> Option<i64> {
+    match (fresh, stored) {
+        (Some(f), Some(s)) if !asked => Some(f.min(s)),
+        (f, _) => f,
+    }
+}
 /// The wanted envelopes, oldest first: an envelope's source key is the constant `wanted` (the D2-OWED fold), so the
 /// source-key index finds them, and one wanted mark stays five physical D1 writes (ruling 1, bsv-low record 1277).
 pub const WANTED_ENVELOPES_SQL: &str = "SELECT identity,generation FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey='wanted' AND source='wanted' AND gameId='' ORDER BY markedAtMs,generation LIMIT ?1";
@@ -525,6 +604,11 @@ impl JudgeDb for D1Judge {
             crate::owed_actor::apply_body(identity, games, &event, tip)
         };
         body["seq"] = Value::Null;
+        // FIX-1018: the outpoints the belt just asked reach the actor's judge (the object's scope over its apply).
+        let asked = belt_asked_now(identity);
+        if !asked.is_empty() {
+            body["beltAsked"] = json!(asked);
+        }
         crate::owed_actor::object::call_apply(
             &self.sql.env,
             &body,
@@ -852,13 +936,21 @@ pub async fn judge_with_write_bounded(
             return Err("filing changed the judgement identity".into());
         }
         let (rows, cut) = judged_rows(db, i, games).await?;
+        // FIX-1018: the outpoints the belt just asked are dated fresh; every other row keeps its earlier stored date.
+        let asked = belt_asked_now(id);
+        for row in &rows {
+            let fresh = asked.contains(&row.outpoint.to_ascii_lowercase());
+            plan.extend(row_statements(row, i.now_ms, i.tip, Some(i), fresh));
+        }
+        let written: Vec<&str> = rows.iter().map(|r| r.outpoint.as_str()).collect();
         plan.push(Stmt {
             sql: GAME_DELETE_SQL.into(),
-            binds: vec![Bind::Text(id.clone()), Bind::Text(json!(games).to_string())],
+            binds: vec![
+                Bind::Text(id.clone()),
+                Bind::Text(json!(games).to_string()),
+                Bind::Text(json!(written).to_string()),
+            ],
         });
-        for row in &rows {
-            plan.extend(row_statements(row, i.now_ms, i.tip, Some(i)));
-        }
         if let Some(moved) = crate::owed::moved_proof_latch_delete_bind(&i.moved_latches) {
             plan.push(Stmt {
                 sql: crate::owed::PROOF_LATCH_MOVED_DELETE_SQL.into(),
@@ -996,7 +1088,7 @@ pub fn stored_row_of(
     judged_tip: Option<u64>,
     evidence: Option<&JudgeInputs>,
 ) -> Value {
-    let write = row_statements(row, stamp, judged_tip, evidence);
+    let write = row_statements(row, stamp, judged_tip, evidence, true);
     let mut out = serde_json::Map::new();
     for (col, bind) in ROW_WRITE_COLUMNS.iter().zip(&write[0].binds) {
         if *col == "updatedAtMs" {
@@ -1131,6 +1223,7 @@ fn row_statements(
     stamp: i64,
     judged_tip: Option<u64>,
     evidence: Option<&JudgeInputs>,
+    fresh_due: bool,
 ) -> Vec<Stmt> {
     let mut row = row.clone();
     let mut words = BTreeMap::new();
@@ -1175,6 +1268,7 @@ fn row_statements(
     let claimable = row.facts["claimable"].as_bool().map(i64::from);
     let gate = row.facts["recoveryHeight"].as_i64();
     let probe = judged_tip.map(|t| t as i64);
+    // FIX-1018: the fresh date; the upsert keeps the row's earlier stored one unless `fresh_due` ([`KEPT_DUE_SQL`]).
     let due = belt_due(&row, stamp, evidence);
     strip_words(&mut row);
     if let Some(facts) = row.facts.as_object_mut() {
@@ -1182,7 +1276,7 @@ fn row_statements(
     }
     let int = |n: Option<i64>| n.map_or(Bind::Null, Bind::Int);
     let opt = |s: &Option<String>| s.clone().map_or(Bind::Null, Bind::Text);
-    let mut out=vec![Stmt{sql:"INSERT INTO owed_rows(identity,outpoint,family,gameId,sats,opponentIdentity,atHeight,facts,updatedAtMs,reason,judgedAtMs,claimable,gateHeight,beltDueAtMs,probeTip) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) ON CONFLICT(identity,outpoint) DO UPDATE SET family=excluded.family,gameId=excluded.gameId,sats=excluded.sats,opponentIdentity=excluded.opponentIdentity,atHeight=excluded.atHeight,facts=excluded.facts,updatedAtMs=excluded.updatedAtMs,reason=excluded.reason,judgedAtMs=excluded.judgedAtMs,claimable=excluded.claimable,gateHeight=excluded.gateHeight,beltDueAtMs=excluded.beltDueAtMs,probeTip=excluded.probeTip".into(),binds:vec![Bind::Text(row.identity.clone()),Bind::Text(row.outpoint.clone()),Bind::Text(row.family.as_str().into()),Bind::Text(row.game_id),int(row.sats.map(|v|v as i64)),opt(&row.opponent_identity),int(row.at_height.map(|v|v as i64)),Bind::Text(row.facts.to_string()),Bind::Int(stamp),opt(&row.reason),Bind::Int(stamp),int(claimable),int(gate),int(due),int(probe)]}];
+    let mut out=vec![Stmt{sql:ROW_UPSERT_SQL.into(),binds:vec![Bind::Text(row.identity.clone()),Bind::Text(row.outpoint.clone()),Bind::Text(row.family.as_str().into()),Bind::Text(row.game_id),int(row.sats.map(|v|v as i64)),opt(&row.opponent_identity),int(row.at_height.map(|v|v as i64)),Bind::Text(row.facts.to_string()),Bind::Int(stamp),opt(&row.reason),Bind::Int(stamp),int(claimable),int(gate),int(due),int(probe),Bind::Int(i64::from(fresh_due))]}];
     // UPSERT can replace a representative's game, so clear roles even when the subject delete did not find it.
     out.push(Stmt {
         sql: "DELETE FROM owed_row_words WHERE identity=?1 AND outpoint=?2".into(),
@@ -1526,7 +1620,7 @@ pub(crate) fn assert_fixture_roundtrip(i: &OwedInputs<'_>) {
     let mut new = schema();
     let tx = new.transaction().unwrap();
     for r in &derived {
-        for stmt in row_statements(r, i.now_ms, i.tip, None) {
+        for stmt in row_statements(r, i.now_ms, i.tip, None, true) {
             tx.execute(
                 &stmt.sql,
                 rusqlite::params_from_iter(stmt.binds.into_iter().map(bind)),
