@@ -239,7 +239,7 @@ pub fn horizon_of(cursor: &Value) -> Option<i64> {
 /// The consumer's row, and beside it (D2-ACTOR-B-FOLD-6, the land tier's `health-dirty-snapshot`) the owed actor's
 /// health snapshot (`owed_actor::HEALTH_SNAPSHOT_NAME`): two primary-key rows in one statement, so `/health.owedActor`
 /// adds one row read and no statement.
-pub const HEALTH_CONSUMER_SQL: &str = "SELECT name,cursor,tickedAtMs FROM owed_belt_state WHERE name IN ('owed-events:consumer','owed-actor:health','fleet-compare:health')";
+pub const HEALTH_CONSUMER_SQL: &str = "SELECT name,cursor,tickedAtMs FROM owed_belt_state WHERE name IN ('owed-events:consumer','owed-actor:health','fleet-compare:health','push-gate:hold')";
 /// D2-ACTOR-A-FOLD-5 (bsv-low #911, E2): the queue's two totals `/health.owedEvents` serves (the harness's
 /// `owed-queue-backlog` row reads published minus consumed there): two primary-key rows of `ops_counters`, never the
 /// family's whole counter read.
@@ -2516,6 +2516,17 @@ pub async fn health_and_actor(db: &impl SqlPort, dirty: &Value) -> (Value, Optio
 /// primary-key row (no statement more), served by `owed_events_publish::fleet_compare_health_view` (`null` before the
 /// ring's first tick or on a fault).
 pub async fn health_actor_fleet(db: &impl SqlPort, dirty: &Value) -> (Value, Option<Value>, Value) {
+    let (body, actor, fleet, _) = health_actor_fleet_push(db, dirty).await;
+    (body, actor, fleet)
+}
+
+/// [`health_actor_fleet`] and bsv-low #1017's `push.gate`: the push gate's hold snapshot, the consumer statement's
+/// fourth primary-key row (`push_coalesce::GATE_HOLD_NAME`, no statement more), served by
+/// `push_coalesce::gate_hold_view` (`null` before the gate's first write or on a fault).
+pub async fn health_actor_fleet_push(
+    db: &impl SqlPort,
+    dirty: &Value,
+) -> (Value, Option<Value>, Value, Value) {
     let read = db
         .run_batch(vec![
             Stmt {
@@ -2566,7 +2577,11 @@ pub async fn health_actor_fleet(db: &impl SqlPort, dirty: &Value) -> (Value, Opt
         row(publish::FLEET_COMPARE_HEALTH_NAME),
         db.now_ms() as i64,
     );
-    (body, actor, fleet)
+    let gate = crate::push_coalesce::gate_hold_view(
+        row(crate::push_coalesce::GATE_HOLD_NAME),
+        db.now_ms(),
+    );
+    (body, actor, fleet, gate)
 }
 
 // ---- D2-ACTOR-D (bsv-low #952; the design's section 7, bar 2 as amended 2026-10-27): THE DIRECT CALL ----
