@@ -11951,7 +11951,7 @@ async fn fix986c2_b_the_ring_covers_every_identity_once_a_revolution_and_resumes
         .find("storage.set_alarm(crate::owed_actor::compare::FLEET_COMPARE_TICK_MS).await?;")
         .unwrap();
     let tick = alarm
-        .find("returncrate::owed_actor::object::fleet_compare_tick_env(&self.env,shard).await;")
+        .find("matchcrate::owed_actor::object::fleet_compare_tick_env(&self.env,shard).await{")
         .unwrap();
     assert!(rearm < tick, "re-armed before the tick runs");
     assert!(board.contains("req.path()==\"/owed-fleet-compare-arm\""));
