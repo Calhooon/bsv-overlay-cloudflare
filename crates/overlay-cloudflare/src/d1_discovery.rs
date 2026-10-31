@@ -15436,8 +15436,9 @@ mod tests {
                 "{index}"
             );
             assert!(sql.contains(&format!("WHERE {SPENT_UNCLASSIFIED_INDEX_PREDICATE} ")));
-            assert_eq!(crate::d1::OVERLAY_MIGRATIONS.last(), Some(index));
-            assert_eq!(crate::d1::OVERLAY_MIGRATIONS.len(), 475);
+            // the 475th migration (FIX-1001 appended four after it)
+            assert_eq!(crate::d1::OVERLAY_MIGRATIONS.get(474), Some(index));
+            assert!(crate::d1::OVERLAY_MIGRATIONS.len() >= 475);
         }
 
         /// THE FIX-986 LENS'S LOW-1, STATED AND PINNED. D1 serves a row's verdict under the app layer's money-view
