@@ -14843,9 +14843,11 @@ mod d2_actor_f {
             .unwrap();
         let exact = carried::covered_exact_of(&json!({"coveredExact": rows[0].rows}));
         assert!(exact[&games[2].to_ascii_lowercase()].contains(&g));
-        let mut s = crate::owed_read::Snapshot::default();
-        s.covered_exact = exact;
-        s.framed = vec![(games[2].clone(), g), (games[2].clone(), g + 1)];
+        let mut s = crate::owed_read::Snapshot {
+            covered_exact: exact,
+            framed: vec![(games[2].clone(), g), (games[2].clone(), g + 1)],
+            ..Default::default()
+        };
         s.downgrades.insert(games[2].clone(), vec![(g, "seen".into())]);
         assert_eq!(s.actor_pending(), 1, "the carried mark is applied; the other is pending");
         assert_eq!(s.withholding_mark(&games[2]), None, "a downgrade the actor applied withholds nothing");

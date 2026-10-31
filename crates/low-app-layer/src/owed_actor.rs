@@ -1573,7 +1573,7 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
     let mut read_bound: Option<i64> = None;
     // D2-ACTOR-F (bsv-low #959): the carried rows, over warm games: upserted into the mirror, and the first round's
     // read is the mirror itself (no record call). `None`: the narrowed read below, as before.
-    let carried_applied: Option<(Vec<carried::CarriedItem>, Vec<(String, i64)>)> =
+    let carried_applied: Option<CarriedApplied> =
         match (warm && opts.page.is_none(), &opts.carried) {
             (true, Some(c)) => {
                 let t = local.now_ms();
@@ -1883,6 +1883,9 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
     Ok((report, pushes))
 }
 
+/// D2-ACTOR-F: what a carried upsert applied: the items written, the marks the call carried.
+type CarriedApplied = (Vec<carried::CarriedItem>, Vec<(String, i64)>);
+
 /// D2-ACTOR-F (bsv-low #959): the carried rows into the mirror, every item validated first ([`carried::item_statements`]:
 /// any item the mirror cannot take as it stands is the whole path's `Err`, never a partial upsert), then each item whose
 /// domain the actor already holds at or past its generation skipped ([`carried::HELD_GENERATION_SQL`]: an earlier
@@ -1893,7 +1896,7 @@ async fn carried_upsert<L: SqlPort>(
     local: &L,
     games: &[String],
     c: &carried::Carried,
-) -> Result<(Vec<carried::CarriedItem>, Vec<(String, i64)>), String> {
+) -> Result<CarriedApplied, String> {
     let mut staged: Vec<(&carried::CarriedItem, Vec<Stmt>)> = Vec::new();
     for it in &c.items {
         if !it.games.iter().any(|g| games.contains(&g.to_ascii_lowercase())) {
