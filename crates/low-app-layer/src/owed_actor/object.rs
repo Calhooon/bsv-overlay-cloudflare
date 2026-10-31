@@ -1486,6 +1486,33 @@ pub fn known_to_d1(snapshot: &crate::owed_read::Snapshot) -> bool {
     snapshot.state.is_some() || snapshot.wanted || snapshot.known
 }
 
+/// The actor-side calls of the actor-served read ([`read_snapshot_with`]): the object's `/rows`, its `/bootstrap`, the
+/// KV display copy and the log. The Worker's is [`EnvReadActor`]; the pins run the same read over the real actor
+/// fixture (bsv-low #1004).
+pub(crate) trait ReadActorPort {
+    async fn rows(&self, identity: &str, covered: &[String]) -> std::result::Result<Value, String>;
+    async fn bootstrap(&self, identity: &str) -> std::result::Result<Value, String>;
+    async fn kv_copy(&self, identity: &str) -> Option<Value>;
+    fn log(&self, line: &str);
+}
+
+/// The Worker's [`ReadActorPort`]: the identity's Durable Object under [`READ_WALL_MS`], the KV copy of this era.
+pub(crate) struct EnvReadActor<'a>(pub &'a Env);
+impl ReadActorPort for EnvReadActor<'_> {
+    async fn rows(&self, identity: &str, covered: &[String]) -> std::result::Result<Value, String> {
+        call_rows(self.0, identity, READ_WALL_MS, covered).await
+    }
+    async fn bootstrap(&self, identity: &str) -> std::result::Result<Value, String> {
+        call_bootstrap(self.0, identity, READ_WALL_MS).await
+    }
+    async fn kv_copy(&self, identity: &str) -> Option<Value> {
+        read_kv_copy(self.0, identity).await
+    }
+    fn log(&self, line: &str) {
+        console_log!("{line}");
+    }
+}
+
 /// Phase B's read (`OWED_ACTOR_READ`). FIRST D1's state and pending marks (LOW-5: never D1's rows): an identity D1
 /// does not know is answered from D1 as before, no actor called and none minted (MEDIUM-3, counted
 /// `owed_actor_unknown_reads_total`). Then the actor's rows joined with D1's words, D1's pending marks kept. An actor
@@ -1497,6 +1524,18 @@ pub(crate) async fn read_snapshot(
     db: &crate::routes::D1Sql,
     identity: &str,
 ) -> std::result::Result<ActorRead, String> {
+    read_snapshot_with(db, &EnvReadActor(env), identity).await
+}
+
+/// [`read_snapshot`] over its ports. bsv-low #1004 (lane FIX-1004, L55 S4): the served `pending` is the ACTOR's
+/// (`Snapshot::actor_pending`): the event-carried marks above the actor's covered generation of their game, never
+/// D1's whole mark count (a fresh device read `pending 1` and no rows for 2.3 minutes in Phase C over the drain's
+/// `age` mark, which no event carries and only the sweep re-publishes).
+pub(crate) async fn read_snapshot_with(
+    db: &impl SqlPort,
+    actor: &impl ReadActorPort,
+    identity: &str,
+) -> std::result::Result<ActorRead, String> {
     let mut snapshot = crate::owed_read::read_with(db, identity, false).await?;
     if !known_to_d1(&snapshot) {
         db.counters(vec![(COUNTERS[11].into(), 1)]).await;
@@ -1504,13 +1543,13 @@ pub(crate) async fn read_snapshot(
     }
     // FIX-968 (bsv-low #968): the games holding a pending downgrade mark are named to the actor, which answers the
     // covered generation of each (`COVERED_BY_GAME_SQL`); the D1-mark read gate (`Snapshot::withholding_mark`)
-    // withholds a press only over a mark above it.
-    let marked: Vec<String> = snapshot.downgrades.keys().cloned().collect();
-    let answer = match call_rows(env, identity, READ_WALL_MS, &marked).await {
+    // withholds a press only over a mark above it. #1004: the games of every event-carried mark too, for `pending`.
+    let marked: Vec<String> = snapshot.actor_marked_games();
+    let answer = match actor.rows(identity, &marked).await {
         Ok(a) => a,
         Err(e) => {
-            console_log!("[owed-actor] read {identity}: {e}");
-            let copy = read_kv_copy(env, identity).await;
+            actor.log(&format!("[owed-actor] read {identity}: {e}"));
+            let copy = actor.kv_copy(identity).await;
             return Ok(ActorRead::Fallback(fallback_body(
                 identity,
                 copy.as_ref(),
@@ -1522,11 +1561,11 @@ pub(crate) async fn read_snapshot(
     snapshot.covered = covered_of(&answer);
     if answer["bootstrapped"] != true {
         if answer["bootstrapArmed"] != true {
-            if let Err(e) = call_bootstrap(env, identity, READ_WALL_MS).await {
-                console_log!("[owed-actor] bootstrap {identity}: {e}");
+            if let Err(e) = actor.bootstrap(identity).await {
+                actor.log(&format!("[owed-actor] bootstrap {identity}: {e}"));
             }
         }
-        let copy = read_kv_copy(env, identity).await;
+        let copy = actor.kv_copy(identity).await;
         return Ok(ActorRead::Fallback(fallback_body(
             identity,
             copy.as_ref(),
@@ -1534,6 +1573,7 @@ pub(crate) async fn read_snapshot(
             "owed-actor-bootstrap",
         )));
     }
+    snapshot.pending = snapshot.actor_pending();
     let mut joined: Vec<Value> = answer["joined"].as_array().cloned().unwrap_or_default();
     let txids = word_txids(&joined);
     let words = if txids.is_empty() {

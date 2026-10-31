@@ -1792,7 +1792,7 @@ async fn d2_actor_b_fold2_m3_a_stranger_read_mints_no_actor() {
         .find(&squash("if !known_to_d1(&snapshot) {"))
         .expect("the D1 gate");
     let call = read
-        .find(&squash("call_rows(env, identity, READ_WALL_MS, &marked)"))
+        .find(&squash("actor.rows(identity, &marked)"))
         .expect("the actor's call");
     assert!(gate < call, "D1 is asked before the actor");
     let fetch = &object[object.find("asyncfnfetch(").unwrap()..];
@@ -10295,30 +10295,74 @@ async fn fix964_c_the_issues_line_with_the_verdicts_mark_queued_is_held() {
 // 149869bf; `fix968_b`'s covered leg is the behaviour RED there (the press withheld with the mark pending).
 // ---------------------------------------------------------------------------------------------------------------
 
-/// The actor-served read as `object::read_snapshot` builds it, natively: D1's state and pending marks
-/// (`owed_read::read_with(.., false)`), the actor's rows, and the actor's covered generations of the marked games
-/// through the shipped `COVERED_BY_GAME_SQL` and `covered_of`.
+/// The actor-served read through the SHIPPED `object::read_snapshot_with` (bsv-low #1004: it was rebuilt here by
+/// hand), its actor port over the real actor fixture: `/rows`' own statements (`ROWS_SQL`, `STATE_SQL`,
+/// `COVERED_BY_GAME_SQL`) on the actor's SQLite.
+struct FixtureActor<'a> {
+    w: &'a WithActor,
+    bootstrapped: bool,
+    armed: Cell<bool>,
+    bootstraps: Cell<u32>,
+}
+impl crate::owed_actor::object::ReadActorPort for FixtureActor<'_> {
+    async fn rows(&self, identity: &str, covered: &[String]) -> Result<Value, String> {
+        let me = vec![Bind::Text(identity.into())];
+        let covered: Vec<String> = covered.iter().take(COVERED_ASK_MAX).cloned().collect();
+        let covered = if covered.is_empty() {
+            Vec::new()
+        } else {
+            fix968_rows(
+                &self.w.actor,
+                COVERED_BY_GAME_SQL,
+                vec![Bind::Text(json!(covered).to_string())],
+            )
+        };
+        Ok(json!({
+            "bootstrapped": self.bootstrapped,
+            "bootstrapArmed": self.armed.get(),
+            "joined": fix968_rows(&self.w.actor, ROWS_SQL, me.clone()),
+            "state": fix968_rows(&self.w.actor, crate::owed_read::STATE_SQL, me).first(),
+            "covered": covered,
+        }))
+    }
+    async fn bootstrap(&self, _: &str) -> Result<Value, String> {
+        self.armed.set(true);
+        self.bootstraps.set(self.bootstraps.get() + 1);
+        Ok(json!({"armed": true}))
+    }
+    async fn kv_copy(&self, _: &str) -> Option<Value> {
+        None
+    }
+    fn log(&self, _: &str) {}
+}
+
+fn fixture_actor(w: &WithActor, bootstrapped: bool) -> FixtureActor<'_> {
+    FixtureActor {
+        w,
+        bootstrapped,
+        armed: Cell::new(false),
+        bootstraps: Cell::new(0),
+    }
+}
+
+/// The served `/owed` body of the actor's read (`read_snapshot_with`, then `Snapshot::body` as the route builds it;
+/// the fallback's own body when the actor's rows are not served).
+fn fix1004_served(w: &WithActor, actor: &FixtureActor<'_>) -> Value {
+    match futures_executor_block(crate::owed_actor::object::read_snapshot_with(
+        w, actor, "owner",
+    ))
+    .unwrap()
+    {
+        crate::owed_actor::object::ActorRead::Rows(snapshot) => {
+            snapshot.body("owner", Some(TIP), &BTreeMap::new()).unwrap()
+        }
+        crate::owed_actor::object::ActorRead::Fallback(Fallback::Display(b))
+        | crate::owed_actor::object::ActorRead::Fallback(Fallback::Unavailable(b)) => b,
+    }
+}
+
 fn fix968_served_by_actor(w: &WithActor) -> Value {
-    let mut snapshot =
-        futures_executor_block(crate::owed_read::read_with(&w.d1, "owner", false)).unwrap();
-    snapshot.joined = fix968_rows(&w.actor, ROWS_SQL, vec![Bind::Text("owner".into())]);
-    let marked: Vec<String> = snapshot
-        .downgrades
-        .keys()
-        .map(|g| g.to_ascii_lowercase())
-        .take(COVERED_ASK_MAX)
-        .collect();
-    let covered = if marked.is_empty() {
-        Vec::new()
-    } else {
-        fix968_rows(
-            &w.actor,
-            COVERED_BY_GAME_SQL,
-            vec![Bind::Text(json!(marked).to_string())],
-        )
-    };
-    snapshot.covered = covered_of(&json!({ "covered": covered }));
-    snapshot.body("owner", Some(TIP), &BTreeMap::new()).unwrap()
+    fix1004_served(w, &fixture_actor(w, true))
 }
 
 /// The D1-served read (`OWED_ACTOR_READ` off): D1's rows, the same gate over an empty `covered`.
@@ -10455,8 +10499,8 @@ async fn fix968_a_a_pending_non_downgrade_mark_never_withholds_the_actor_served_
     );
     assert!(facts.get("refresh").is_none(), "{facts}");
     assert_eq!(
-        body["pending"], 4,
-        "the count still says what is being re-judged: {body}"
+        body["pending"], 3,
+        "the count says what the actor has not applied; the age mark is no event's (bsv-low #1004): {body}"
     );
     // the D1-served read reads the same rule
     let facts = fix968_facts(&fix968_served_by_d1(&w), FIX968_PRESS).clone();
@@ -10538,8 +10582,8 @@ async fn fix968_b_a_downgrade_mark_the_actor_applied_serves_the_press_one_it_has
     );
     assert!(facts.get("refresh").is_none(), "{facts}");
     assert_eq!(
-        body["pending"], 1,
-        "the count is still the consumer's backlog: {body}"
+        body["pending"], 0,
+        "the actor applied the mark; its acknowledgement is the consumer's backlog, not the read's (bsv-low #1004): {body}"
     );
     // the D1-served read: its judge has not judged the mark, so it withholds (`covered` is empty there)
     let d1 = fix968_facts(&fix968_served_by_d1(&w), FIX968_PRESS).clone();
@@ -10734,9 +10778,9 @@ fn fix968_d_the_read_asks_the_actor_its_coverage_of_the_marked_games() {
     let read = &object[object.find("pub(crate)asyncfnread_snapshot(").unwrap()..];
     let read = &read[..read.find("pubasyncfncall_bootstrap(").unwrap()];
     assert!(read.contains(&squash(
-        "let marked: Vec<String> = snapshot.downgrades.keys().cloned().collect();"
+        "let marked: Vec<String> = snapshot.actor_marked_games();"
     )));
-    assert!(read.contains(&squash("call_rows(env, identity, READ_WALL_MS, &marked)")));
+    assert!(read.contains(&squash("actor.rows(identity, &marked)")));
     assert!(read.contains(&squash("snapshot.covered = covered_of(&answer);")));
     let rows_route = &object[object.find("asyncfnrows_route(").unwrap()
         ..object.find("asyncfnbootstrap_page(").unwrap()];
@@ -13494,4 +13538,120 @@ mod fix986 {
             assert_eq!(ACTOR_TABLES_VERSION, "applied-per-game-1", "no table moves");
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// FIX-1004 (bsv-low #1004, L55 S4; owedFleetRead pair 18, p37's fresh device at 22:58:35Z): `/owed` served
+// `pending 1` and no rows for 2.3 minutes in Phase C with the queue level. The mark it counted: the scheduled drain's
+// `age` mark (`owed_backfill::AGE_MARK_SQL`), taken from D1's `owed_rows.judgedAtMs`, which no writer moves in Phase C,
+// so the same oldest 128 subjects (a lived-in seat's old games among them) were re-marked on every scheduled pass; no
+// event carries it, so its only acknowledger in Phase C is the sweep's re-publish past its horizon (minutes), then the
+// consumer's Phase C batch after the actor's apply. Now: the actor's read counts only the event-carried marks the
+// actor has not covered (`Snapshot::actor_pending`), and Phase C writes no `age` mark (`mark_aged_in`).
+// ---------------------------------------------------------------------------------------------------------------
+
+fn fix1004_game(w: &WithActor) -> String {
+    games_of(&w.d1, "owner")
+        .into_iter()
+        .next()
+        .expect("the fixture's owner has a game")
+}
+
+/// (a) Phase C, a fresh device over a STALE D1 mark (the drain's `age` mark, standing as L55's did): the read serves
+/// the actor's rows at once with `pending 0`; and Phase C's drain writes no new `age` mark from D1's unmoved rows.
+/// RED on 1ab40c95's rule: `pending 1` (D1's whole count), and the drain's re-mark wrote the subjects again.
+#[tokio::test]
+async fn fix1004_a_a_fresh_device_in_phase_c_reads_the_actors_rows_and_pending_0_over_a_stale_d1_mark() {
+    let w = fix968_phase(false).await;
+    let games = games_of(&w.d1, "owner");
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    assert_eq!(fix968_pending(&w), 0, "Phase C acknowledged the delivery's marks");
+    let served = fix968_served_by_actor(&w);
+    let rows = served["rows"].as_array().unwrap().len();
+    assert!(rows > 0, "{served}");
+    // D1's owed_rows as Phase C leaves them: judged before the flip, older than a day, no writer since.
+    w.d1.conn
+        .execute(
+            "UPDATE owed_rows SET judgedAtMs=?1 WHERE identity='owner'",
+            rusqlite::params![w.d1.now_ms() as i64 - 2 * crate::owed_backfill::OWED_AGE_REMARK_AFTER_MS],
+        )
+        .unwrap();
+    // The drain's re-mark under Phase C writes nothing.
+    let marked = crate::owed_backfill::mark_aged_in(&w.d1, false).await.unwrap();
+    assert_eq!(marked, 0, "Phase C writes no age mark from D1's unmoved rows");
+    assert_eq!(fix968_pending(&w), 0);
+    // The stale mark L55 read (an `age` mark written before this build, standing until the sweep).
+    fix968_mark(&w, &fix1004_game(&w), "age", "age", 0);
+    assert_eq!(fix968_pending(&w), 1);
+    let body = fix968_served_by_actor(&w);
+    assert_eq!(body["pending"], 0, "no event the actor owes: {body}");
+    assert!(body.get("retryAfterMs").is_none(), "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), rows, "{body}");
+    // Phase A and B keep the age repair (its judge acknowledges the marks it judges).
+    assert!(crate::owed_backfill::mark_aged_in(&w.d1, true).await.unwrap() > 0);
+}
+
+/// (b) An event the actor has NOT applied reads `pending 1` until the apply, then `pending 0` (the acknowledgement may
+/// come later: the read counts the actor's coverage, never D1's ack). Phase B (nothing acknowledges a direct call).
+/// RED on 1ab40c95's rule after the apply: `pending 1` (D1's mark, unacknowledged).
+#[tokio::test]
+async fn fix1004_b_an_unapplied_frame_reads_pending_1_until_the_actors_apply() {
+    let w = fix968_phase(true).await;
+    let games = games_of(&w.d1, "owner");
+    crate::owed_events::deliver(&w, "owner", &games)
+        .await
+        .unwrap();
+    assert_eq!(fix968_served_by_actor(&w)["pending"], 0);
+    let game = fix1004_game(&w);
+    fix968_mark(&w, &game, "party", "p9", 0);
+    let body = fix968_served_by_actor(&w);
+    assert_eq!(body["pending"], 1, "the frame is unapplied: {body}");
+    assert_eq!(body["retryAfterMs"], 1500);
+    fix968_direct(&w, std::slice::from_ref(&game), 41).await;
+    assert_eq!(fix968_pending(&w), 1, "D1's mark still unacknowledged");
+    let body = fix968_served_by_actor(&w);
+    assert_eq!(body["pending"], 0, "applied by the actor: {body}");
+    // A mark the actor never applied (a game it has no coverage of) counts, the safe direction.
+    fix968_mark(&w, "never-applied-game", "pot", "cc00:0", 0);
+    assert_eq!(fix968_served_by_actor(&w)["pending"], 1);
+}
+
+/// (c) An actor mid-bootstrap: the read arms its bootstrap once and serves the design's answer (section 6: "until it
+/// completes the actor serves `pending: true` and the KV copy"; no copy, the 503 body naming `pending: true`), never
+/// `rows: []` and never D1's mark count. Not the brief's "first page's rows": the design keeps a partial list display
+/// only, so no press is served off a page whose held events are not yet applied.
+#[tokio::test]
+async fn fix1004_c_an_actor_mid_bootstrap_is_armed_by_the_read_and_reads_pending() {
+    let w = fix968_phase(false).await;
+    let actor = fixture_actor(&w, false);
+    let body = fix1004_served(&w, &actor);
+    assert_eq!(actor.bootstraps.get(), 1, "the read arms the bootstrap");
+    assert_eq!(body["pending"], true, "{body}");
+    assert!(body["rows"].is_null(), "never rows: [] by silence: {body}");
+    assert_eq!(body["source"], "owed-actor-bootstrap");
+    let again = fix1004_served(&w, &actor);
+    assert_eq!(actor.bootstraps.get(), 1, "an armed bootstrap is not armed again");
+    assert_eq!(again["pending"], true);
+}
+
+/// (d) The mark sources no event carries are one list (`UNFRAMED_SOURCES`), equal to `PENDING_SQL`'s; the drain's
+/// wiring passes the phase.
+#[test]
+fn fix1004_d_the_unframed_sources_are_the_statements_and_the_drain_passes_the_phase() {
+    let list = crate::owed_read::UNFRAMED_SOURCES
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert!(crate::owed_read::PENDING_SQL.contains(&format!("source NOT IN ({list})")));
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let belt = squash(include_str!("../owed_belt.rs"));
+    assert!(belt.contains(&squash(
+        "crate::owed_backfill::mark_aged_in(&judge, owed_judge::JudgeDb::d1_judges(&judge))"
+    )));
+    let object = squash(include_str!("object.rs"));
+    let read = &object[object.find("pub(crate)asyncfnread_snapshot_with(").unwrap()..];
+    assert!(read.contains(&squash("snapshot.pending = snapshot.actor_pending();")));
 }
