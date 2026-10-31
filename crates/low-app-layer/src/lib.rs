@@ -159,6 +159,7 @@ pub mod owed_events;
 /// bsv-low #911 (D2-ACTOR-A): the owed events' publish, the overlay's own source compiled here (one plan, one shape).
 #[path = "../../overlay-cloudflare/src/owed_events.rs"]
 pub mod owed_events_publish;
+pub mod owed_closure;
 pub mod owed_judge;
 pub mod owed_read;
 pub mod pass_meter;

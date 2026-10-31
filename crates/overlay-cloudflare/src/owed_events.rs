@@ -97,6 +97,10 @@ macro_rules! row_and_payload {
 pub const READ_POT_SQL: &str = marks_and!("SELECT json_object('txid',txid,'vout',outputIndex,'spent',spent,'spendingTxid',spendingTxid,'spentConfirmed',spentConfirmed,'spentHeight',spentHeight,'lockKind',lockKind,'potSats',potSats,'recoveryHeight',recoveryHeight,'verdict',verdict,'createdAt',createdAt) FROM pot_records WHERE txid=?3 AND outputIndex=?4");
 /// `party` (the marker's `txid`). D2-ACTOR-F: its marks, its rows and the rows' pots read once each, its links by
 /// those pots (`hop_pot_links`, the `derive_party_*` triggers' domain); no payload when the party rows are gone.
+/// The lens's NIT-3, stated: the links' domain is the CURRENT rows' `potTxid`. `derive_party_update` re-derives the
+/// OLD pot's links too, so a party UPDATE that moved a row's `potTxid` would carry an incomplete domain (the old
+/// pot's links unrefreshed in the mirror until the event's queue delivery reads them). No writer moves `potTxid`: the
+/// records door inserts a party row once, and the overlay's party writers set `sigValid` and the seat's columns only.
 pub const READ_PARTY_SQL: &str = "SELECT json_array_length(x.j) AS marks,json_extract(x.r,'$[0]') AS facts,x.j AS subjects,CASE WHEN json_extract(x.r,'$[1]') IS NOT NULL THEN json_array(json_object('t','potparty_records','c',json_array('txid'),'k',json_array(json_array(?3)),'r',json(json_extract(x.r,'$[1]'))),json_object('t','hop_pot_links','c',json_array('potTxid'),'k',json(json_extract(x.r,'$[2]')),'r',(SELECT json_group_array(json_object('__rowid',l.rowid,'identity',l.identity,'createdAt',l.createdAt,'potTxid',l.potTxid,'potVout',l.potVout,'markerRowid',l.markerRowid)) FROM json_each(json_extract(x.r,'$[2]')) CROSS JOIN hop_pot_links l INDEXED BY idx_hop_pot_links_pot ON l.potTxid=json_each.value))) END AS payload FROM (SELECT (SELECT json_group_array(json_array(identity,gameId,generation)) FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey=?2 AND source=?1) AS j,(SELECT json_array(json_group_array(json_object('identity',identity,'opponentIdentity',opponentIdentity,'gameId',gameId,'potTxid',potTxid,'potVout',potVout,'recoveryHeight',recoveryHeight,'seatSettlePubkey',seatSettlePubkey,'sigValid',sigValid,'outputIndex',outputIndex)),CASE WHEN COUNT(*)>0 THEN json_group_array(json_object('__rowid',rowid,'identity',identity,'opponentIdentity',opponentIdentity,'gameId',gameId,'potTxid',potTxid,'potVout',potVout,'recoveryHeight',recoveryHeight,'sigHex',sigHex,'txid',txid,'outputIndex',outputIndex,'createdAt',createdAt,'seatSettlePubkey',seatSettlePubkey,'seatSigHex',seatSigHex,'sigValid',sigValid)) END,json_group_array(DISTINCT potTxid)) FROM potparty_records WHERE txid=?3) AS r) x";
 /// `hop` (`txid:hopVout`): the hop's markers, its released evidence and its missing-evidence rows.
 pub const READ_HOP_SQL: &str = marks_and!("SELECT json_object('markers',(SELECT json_group_array(json_object('identity',identity,'opponentIdentity',opponentIdentity,'gameId',gameId,'hopSats',hopSats,'seatSettlePubkey',seatSettlePubkey,'markerValid',markerValid,'outputIndex',outputIndex)) FROM hopparty_records INDEXED BY idx_hopparty_hop WHERE txid=?3 AND hopVout=?4),'released',(SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'potTxid',potTxid,'seatSettlePubkey',seatSettlePubkey,'hopSats',hopSats,'evictedAt',evictedAt)) FROM released_hop_evidence WHERE hopTxid=?3 AND hopVout=?4),'missing',(SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'potTxid',potTxid,'evictedAt',evictedAt,'bytesRead',bytesRead)) FROM released_hop_evidence_missing INDEXED BY idx_released_missing_hop WHERE hopTxid=?3 AND hopVout=?4))");
@@ -500,14 +504,42 @@ pub fn read_args(n: &Noted) -> Vec<Arg> {
     args
 }
 
+/// D2-ACTOR-F: the sources whose statement carries the row ([`carry_payload`]): the rest take the narrowed read
+/// (`pot`, `hop` and `eviction` move rows of other identities' markers through their triggers; `beef` is bytes).
+pub const CARRIERS: [&str; 8] = [
+    "party",
+    "collected",
+    "refund",
+    "result",
+    "sweep",
+    "seen",
+    "word",
+    "refusal",
+];
+
+/// D2-ACTOR-F-FOLD (item 4): the statement a note's read runs: the Worker's own (`crate::owed_closure::statement`:
+/// the app layer adds the carried CLOSURE to each carrier's statement, the overlay adds nothing), else [`read_sql`]'s.
+/// Its placeholders are [`read_sql`]'s (the closure names none), so [`read_args`] holds for both.
+pub fn statement_of(source: &str) -> Option<&'static str> {
+    crate::owed_closure::statement(source).or_else(|| read_sql(source))
+}
+
 /// PURE: does this note read its row at publish? (A held fact, an identity route and an unknown source do not.)
 pub fn reads_row(n: &Noted) -> bool {
     n.held.is_none() && read_sql(&n.source).is_some()
 }
 
-/// D2-ACTOR-F (bsv-low #959): the most bytes one event's carried rows may take (its `payload` serialized). The event
-/// rides a queue message (128 KB) and the overlay's `/internal/owed-direct` body: past this the row is not carried and
-/// the actor reads it from D1 as before (a hop sweep's raw or a word's proof is a few KB; a page never is).
+/// D2-ACTOR-F (bsv-low #959): the most bytes one event's carried rows may take (its `payload` and, since
+/// D2-ACTOR-F-FOLD, its `closure`, serialized together). The event rides a queue message (128 KB) and the overlay's
+/// `/internal/owed-direct` body: past this the closure is dropped first (the actor reads the new keys from D1, one
+/// call), then the payload (the actor's narrowed D1 read, as before); a hop sweep's raw or a word's proof is a few KB,
+/// a page never is.
+///
+/// The lens's NIT-4, the bodies this bounds: one coalesced direct `/apply` body carries the merged rows of every
+/// event of its identity in the pass (at most `DIRECT_EVENTS_MAX`, 64, events: 64 x 32 KB, about 2 MB), and the
+/// overlay's `POST /internal/owed-direct` body at most `OWED_DIRECT_BODY_MAX` (64) events, each with its facts: about
+/// 2 MB as well. Both are inside the platform's request body limit (100 MB on the paid plan) and the 128 MB isolate;
+/// neither is a queue message (the queue carries one event a message, under 128 KB).
 pub const PAYLOAD_MAX_BYTES: usize = 32_768;
 
 /// PURE (D2-ACTOR-F): the carried row of one read, into the event's facts: `subjects` (the pair's marks named) and
@@ -517,7 +549,7 @@ pub const PAYLOAD_MAX_BYTES: usize = 32_768;
 pub fn carry_payload(row: &Value, facts: &mut Value) {
     let parse = |v: &Value| match v {
         Value::String(s) => serde_json::from_str::<Value>(s).ok(),
-        Value::Array(_) => Some(v.clone()),
+        Value::Array(_) | Value::Object(_) => Some(v.clone()),
         _ => None,
     };
     let (Some(subjects), Some(payload)) = (parse(&row["subjects"]), parse(&row["payload"])) else {
@@ -532,8 +564,15 @@ pub fn carry_payload(row: &Value, facts: &mut Value) {
             })
     });
     let items = payload.as_array().is_some_and(|p| !p.is_empty());
-    if !named || !items || payload.to_string().len() > PAYLOAD_MAX_BYTES {
+    let payload_bytes = payload.to_string().len();
+    if !named || !items || payload_bytes > PAYLOAD_MAX_BYTES {
         return;
+    }
+    // D2-ACTOR-F-FOLD (item 4): the closure, where the statement read one and it fits beside the payload
+    if let Some(closure) = parse(&row["closure"]).filter(|c| c.is_object()) {
+        if payload_bytes + closure.to_string().len() <= PAYLOAD_MAX_BYTES {
+            facts["closure"] = closure;
+        }
     }
     facts["subjects"] = subjects;
     facts["payload"] = payload;
@@ -556,7 +595,7 @@ pub async fn publish_with(port: &impl PublishPort, mut notes: Vec<Noted>) -> Pub
         vec![Arg::Int(notes.len() as i64), Arg::Int(now)],
     )];
     for n in notes.iter().filter(|n| reads_row(n)) {
-        stmts.push((read_sql(&n.source).unwrap_or(READ_MARKS_SQL), read_args(n)));
+        stmts.push((statement_of(&n.source).unwrap_or(READ_MARKS_SQL), read_args(n)));
     }
     let rows = match port.run_reads(stmts).await {
         Ok(rows) => rows,

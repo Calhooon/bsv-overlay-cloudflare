@@ -393,11 +393,16 @@ pub struct Keys {
 }
 impl Keys {
     fn binds(&self, me: &str, games: &[String]) -> Vec<Bind> {
+        self.binds_of(me, games, true)
+    }
+    /// The binds, the reorg tombstone's probe range among them or not (a carried closure's write leaves the
+    /// mirror's tombstone as it stands).
+    fn binds_of(&self, me: &str, games: &[String], reorg: bool) -> Vec<Bind> {
         let probes: Vec<String> = self
             .txids
             .iter()
             .flat_map(|t| PROBE_PREFIXES.iter().map(move |p| format!("{p}{t}")))
-            .chain(std::iter::once("reorg-clear".to_string()))
+            .chain(reorg.then(|| "reorg-clear".to_string()))
             .collect();
         vec![
             Bind::Text(me.to_string()),
@@ -861,6 +866,8 @@ pub struct ApplyReport {
     pub carried: bool,
     /// D2-ACTOR-F-FOLD (MEDIUM-2): a game of the apply was left open by an apply that did not end.
     pub was_open: bool,
+    /// D2-ACTOR-F-FOLD (item 4): miss rounds read from the event's carried closure (no record call).
+    pub closure_rounds: u32,
 }
 
 /// The decoded facts of a copied BEEF row: the pot's own (`pot`, `pot_beefs` only) and the stored order's.
@@ -935,6 +942,120 @@ pub const BOUND_COLUMN: &str = "(SELECT MAX(generation) FROM owed_dirty WHERE id
 /// A read's carried-row guard ([`carried::READ_BOUND_KIND`]) is this number, never the pending marks' maximum (which
 /// fell to 0 once the marks were acknowledged, so a late older carried row passed the guard).
 pub const HW_COLUMN: &str = "(SELECT seq FROM sqlite_sequence WHERE name='owed_dirty') AS hw";
+
+/// D2-ACTOR-F-FOLD (item 4, the lens's LOW-2): THE CARRIED CLOSURE. The rows the record holds, in every family the
+/// actor mirrors, for the txids a carried payload's rows NAME (every 64-hex text value of `y.payload`, as
+/// [`txids_in_value`] reads a mirror row), read in the SAME statement as the payload and its marks (no statement added
+/// to the publish's batch): each family's selection over those txids alone (no game, no marker: the miss round's
+/// read, `read_round` with no games), and the record's high-water ([`HW_COLUMN`]) of that snapshot. A NEW filing's
+/// apply then reads its new keys from the carried closure instead of the record: no D1 call. A SQL expression over
+/// the derived table `y` (the carrier's own statement); `NULL` where the statement carried no payload.
+pub fn closure_column() -> String {
+    let keys = "(SELECT DISTINCT lower(value) AS value FROM json_tree(y.payload) WHERE type='text' AND length(value)=64 AND NOT (lower(value) GLOB '*[^0-9a-f]*'))";
+    let probes = format!(
+        "(SELECT p.value||kt.value AS value FROM json_each('{}') p CROSS JOIN {keys} kt UNION SELECT 'reorg-clear')",
+        json!(PROBE_PREFIXES)
+    );
+    let families: Vec<String> = FAMILIES
+        .iter()
+        .map(|f| {
+            format!(
+                "json((SELECT json_group_array(json(r)) FROM (SELECT DISTINCT {} AS r FROM {})))",
+                row_json(f),
+                selection(f)
+            )
+            .replace("json_each(?3)", keys)
+            .replace("json_each(?5)", &probes)
+            .replace("json_each(?2)", "json_each('[]')")
+            .replace("json_each(?4)", "json_each('[]')")
+            .replace("?1", "''")
+        })
+        .collect();
+    format!(
+        "CASE WHEN y.payload IS NULL THEN NULL ELSE json_object('hw',(SELECT seq FROM sqlite_sequence WHERE name='owed_dirty'),'keys',(SELECT json_group_array(value) FROM {keys}),'f',json_array({})) END",
+        families.join(",")
+    )
+}
+
+/// D2-ACTOR-F-FOLD (item 4): the carrier statement with its closure ([`closure_column`]): the shared statement as a
+/// derived table, every column it answers kept.
+pub fn with_closure(base: &str) -> String {
+    format!(
+        "SELECT y.marks AS marks,y.facts AS facts,y.subjects AS subjects,y.payload AS payload,{} AS closure FROM ({base}) y",
+        closure_column()
+    )
+}
+
+/// D2-ACTOR-F-FOLD (item 4): one carried closure, parsed ([`closure_column`]'s answer): the high-water, the txids it
+/// read, and each family's rows as the record's read answers them ([`row_of`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ClosureRead {
+    pub hw: i64,
+    pub keys: BTreeSet<String>,
+    pub rows: Vec<Vec<Value>>,
+}
+
+impl ClosureRead {
+    /// PURE: the closure out of an event's `facts.closure`; `None` when absent or not the mirror's shape (one array
+    /// a family).
+    pub fn of(v: &Value) -> Option<ClosureRead> {
+        let v = match v {
+            Value::String(s) => serde_json::from_str::<Value>(s).ok()?,
+            Value::Object(_) => v.clone(),
+            _ => return None,
+        };
+        let f = v["f"].as_array()?;
+        if f.len() != FAMILIES.len() {
+            return None;
+        }
+        let names: Vec<Vec<String>> = FAMILIES.iter().map(|f| compound_columns(f).1).collect();
+        let mut rows = vec![Vec::new(); FAMILIES.len()];
+        for (n, fam) in f.iter().enumerate() {
+            for r in json_of(fam).ok()?.as_array()? {
+                rows[n].push(row_of(&names[n], r));
+            }
+        }
+        let keys = v["keys"]
+            .as_array()?
+            .iter()
+            .filter_map(|k| k.as_str().map(str::to_string))
+            .collect();
+        Some(ClosureRead {
+            hw: hw_of(&v["hw"]),
+            keys,
+            rows,
+        })
+    }
+
+    /// PURE: the closure's rows of the domains of `txids` (each family's rows whose txid key column, or probe
+    /// outpoint, names one of them), for a miss round's write; `None` when it did not read every one of them.
+    pub fn rows_of(&self, txids: &BTreeSet<String>) -> Option<Vec<Vec<Value>>> {
+        if !txids.is_subset(&self.keys) {
+            return None;
+        }
+        let mut out = vec![Vec::new(); FAMILIES.len()];
+        for (n, f) in FAMILIES.iter().enumerate() {
+            for r in &self.rows[n] {
+                let inside = f.keys.iter().any(|k| match k {
+                    Txid(c) => r[*c].as_str().is_some_and(|v| txids.contains(&v.to_ascii_lowercase())),
+                    // never the reorg tombstone: the closure's snapshot may predate one the mirror holds
+                    ProbeRange => r["outpoint"].as_str().is_some_and(|o| {
+                        txids.iter().any(|t| {
+                                PROBE_PREFIXES.iter().any(|p| {
+                                    o.to_ascii_lowercase().starts_with(&format!("{p}{t}"))
+                                })
+                            })
+                    }),
+                    _ => false,
+                });
+                if inside {
+                    out[n].push(r.clone());
+                }
+            }
+        }
+        Some(out)
+    }
+}
 
 /// D2-ACTOR-E (bsv-low #954): ONE record statement for the families of a round (it was one statement a family, 24):
 /// each family's selection a scalar subquery answering its rows as one JSON array (`f<n>`, `n` its index in
@@ -1250,14 +1371,17 @@ async fn read_round(
 }
 
 /// The mirror's write of one round: each family's domain replaced by the record's rows, the BEEFs' facts decoded.
-fn write_round(
+/// The reorg tombstone's domain is replaced with the read's (`reorg`), or left as the mirror holds it (a carried
+/// closure's round).
+fn write_round_of(
     me: &str,
     games: &[String],
     keys: &Keys,
     read: &[Vec<Value>],
     seq: i64,
+    reorg: bool,
 ) -> Vec<Stmt> {
-    let binds = keys.binds(me, games);
+    let binds = keys.binds_of(me, games, reorg);
     let mut out = Vec::new();
     let mut facts = BTreeMap::new();
     for (f, rows) in FAMILIES.iter().zip(read) {
@@ -1745,7 +1869,21 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
             report.misses += 1;
         }
         let carried_round = first && carried_applied.is_some();
+        // D2-ACTOR-F-FOLD (item 4): a carried apply's miss round takes its new keys from the event's carried closure
+        // when one read them all at a high-water no newer row of theirs in the mirror passes.
+        let closure: Option<(Vec<Vec<Value>>, i64)> = if !first && carried_applied.is_some() {
+            closure_round(local, &opts.carried, &carried_applied, &read_keys).await?
+        } else {
+            None
+        };
+        let closure_round_hw = closure.as_ref().map(|(_, hw)| *hw);
         let (read_keys, read) = match pre.take() {
+            _ if closure.is_some() => {
+                let (rows, hw) = closure.expect("checked");
+                report.closure_rounds += 1;
+                miss_reads.push((read_keys.txids.iter().cloned().collect(), hw));
+                (read_keys, rows)
+            }
             // D2-ACTOR-F: the carried round reads nothing; its rows are already in the mirror.
             _ if carried_round => (Keys::default(), Vec::new()),
             // FOLD-14: the marked read was this round's (its key set is a superset of the mirror's).
@@ -1781,7 +1919,14 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
         if !carried_round {
             let t = local.now_ms();
             local
-                .run_batch(write_round(&me, &read_games, &read_keys, &read, seq))
+                .run_batch(write_round_of(
+                    &me,
+                    &read_games,
+                    &read_keys,
+                    &read,
+                    seq,
+                    closure_round_hw.is_none(),
+                ))
                 .await?;
             report.write_ms += local.now_ms().saturating_sub(t);
         }
@@ -1947,6 +2092,55 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
     Ok((report, pushes))
 }
 
+/// D2-ACTOR-F-FOLD (item 4): a carried apply's miss round from a carried closure: the rows of `read`'s keys and the
+/// closure's high-water, or `None` (the record's read): no closure read every key, the round names a marker, an item
+/// this apply wrote for one of the keys is newer than the closure, or the mirror read one of them at or past it.
+async fn closure_round<L: SqlPort>(
+    local: &L,
+    carried: &Option<carried::Carried>,
+    applied: &Option<CarriedApplied>,
+    read: &Keys,
+) -> Result<Option<(Vec<Vec<Value>>, i64)>, String> {
+    let (Some(c), Some((items, _))) = (carried, applied) else {
+        return Ok(None);
+    };
+    if !read.markers.is_empty() || read.txids.is_empty() {
+        return Ok(None);
+    }
+    let Some((rows, hw)) = c
+        .closures
+        .iter()
+        .filter_map(ClosureRead::of)
+        .filter_map(|cl| Some((cl.rows_of(&read.txids)?, cl.hw)))
+        .max_by_key(|(_, hw)| *hw)
+    else {
+        return Ok(None);
+    };
+    if items
+        .iter()
+        .any(|i| i.g > hw && i.key_txids().iter().any(|t| read.txids.contains(t)))
+    {
+        return Ok(None);
+    }
+    let txids: Vec<&String> = read.txids.iter().collect();
+    let held = local
+        .run_batch(vec![Stmt::new(
+            CLOSURE_HELD_SQL,
+            vec![Bind::Text(json!(txids).to_string())],
+        )])
+        .await?
+        .first()
+        .and_then(|o| o.rows.first())
+        .and_then(|r| r["g"].as_i64());
+    if held.is_some_and(|g| g >= hw) {
+        return Ok(None);
+    }
+    Ok(Some((rows, hw)))
+}
+
+/// D2-ACTOR-F-FOLD (item 4): the newest per-key read bound the mirror holds of these txids (`?1`).
+pub const CLOSURE_HELD_SQL: &str = "SELECT MAX(seq) AS g FROM applied WHERE kind='read-key' AND game IN (SELECT value FROM json_each(?1))";
+
 /// D2-ACTOR-F: what a carried upsert applied: the items written, the marks the call carried.
 type CarriedApplied = (Vec<carried::CarriedItem>, Vec<(String, i64)>);
 
@@ -2087,7 +2281,7 @@ pub async fn commit_fixpoint<L: SqlPort>(
 /// The answer of one apply (the object's `/apply`, the pins' harness): the actor's rows, the redelivery verdict, the
 /// games the event has applied.
 pub fn answer_of(report: &ApplyReport, rows: Vec<Value>) -> Value {
-    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply, "misses": report.misses, "narrowed": report.narrowed, "coalesced": report.coalesced, "readMs": report.read_ms, "judgeMs": report.judge_ms, "writeMs": report.write_ms, "waitMs": report.wait_ms, "outsideMs": report.outside_ms, "asksQueued": report.asks, "readGeneration": report.read_generation, "carried": report.carried})
+    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply, "misses": report.misses, "narrowed": report.narrowed, "coalesced": report.coalesced, "readMs": report.read_ms, "judgeMs": report.judge_ms, "writeMs": report.write_ms, "waitMs": report.wait_ms, "outsideMs": report.outside_ms, "asksQueued": report.asks, "readGeneration": report.read_generation, "carried": report.carried, "closureRounds": report.closure_rounds})
 }
 
 /// D2-ACTOR-E (bsv-low #954) item 4: was the event born on a WARM actor (written at or after the actor's bootstrap
