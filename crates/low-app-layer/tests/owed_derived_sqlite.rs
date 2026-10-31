@@ -86,12 +86,13 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     // proof inserted and updated, a hop row's markerless filers); the 475 before them are untouched.
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..475]), 4_238_311_408);
     // bsv-low #1010 (FIX-1010) appends fourteen `owed_dirty` triggers (the actor's families written by statements no
-    // trigger marked); the 479 before them are untouched.
+    // trigger marked); the 479 before them are untouched. FIX-1010-BUDGET edited the two party seat triggers (486,
+    // 487) in place: shipped on no D1.
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..479]), 3_349_521_383);
     const COUNT: usize = 493;
     assert_eq!(OVERLAY_MIGRATIONS.len(), COUNT);
     assert_eq!(d1::OVERLAY_MIGRATION_COUNT, COUNT);
-    const FINGERPRINT: u32 = 2_350_949_467;
+    const FINGERPRINT: u32 = 2_741_125_461;
     assert_eq!(
         d1::migration_list_fingerprint(),
         FINGERPRINT,

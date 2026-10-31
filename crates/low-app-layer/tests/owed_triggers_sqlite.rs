@@ -237,7 +237,9 @@ impl Fixture {
 fn seat(id: &str, txid: &str) -> PotpartyRecord {
     PotpartyRecord {
         identity: id.into(),
-        opponent_identity: "other".into(),
+        // The seats name each other, as a pot's two seats do: the seat trigger reaches the opponent a row names
+        // (FIX-1010-BUDGET), never every row on the pot.
+        opponent_identity: if id == "alice" { "bob" } else { "alice" }.into(),
         game_id: "game".into(),
         pot_txid: "pot".into(),
         pot_vout: 0,
@@ -318,6 +320,13 @@ fn paths(f: &Fixture) -> Result<(), String> {
         marks("party", "party-a", &["alice"]),
     )?;
     f.query(discovery::potparty_write::potparty_insert_query(&b, 1).query());
+    // Alice's seat verified, as a real pot's seats are (the fixture's signatures are not real, so the latch wrote
+    // 0): the seat triggers reach only a verified seat under a committed key (FIX-1010-BUDGET), so bob's writes
+    // reach alice and alice's reach no one (bob stays unverified, as every other path of the fixture reads him).
+    f.execute(
+        "UPDATE potparty_records SET sigValid = 1 WHERE txid = 'party-a'",
+        vec![],
+    );
     f.check_query(
         "hop admission",
         discovery::hopparty_write::hopparty_insert_query(&hp, 1).query(),
@@ -478,8 +487,9 @@ fn paths(f: &Fixture) -> Result<(), String> {
             1.into(),
             1.into(),
         ],
-        // bsv-low #1010: the pot's OTHER seat re-judges too (`owed_dirty_potparty_records_insert_seats`).
-        marks("party", "filed:party", &["alice", "bob"]),
+        // bsv-low #1010: the pot's other seat re-judges too (`owed_dirty_potparty_records_insert_seats`) only when it
+        // is a verified seat (FIX-1010-BUDGET): bob is not, so alice's filing marks alice alone.
+        marks("party", "filed:party", &["alice"]),
     )?;
     f.check(
         "filed hop",
@@ -1519,11 +1529,10 @@ fn eviction_paths(f: &Fixture) -> Result<(), String> {
     restored.extend(marks("refund", "filed:refund", &["alice", "bob"]));
     restored.extend(marks("result", "result", &["alice", "bob"]));
     restored.extend(marks("result", "filed:result", &["alice", "bob"]));
-    // bsv-low #1010: each restored party marks the pot's other seats already restored
-    // (`owed_dirty_potparty_records_insert_seats`), and the restored pot the hop marker its committed keys seat
+    // bsv-low #1010: each restored party marks the pot's other seat already restored when it is a verified seat
+    // (`owed_dirty_potparty_records_insert_seats`, FIX-1010-BUDGET: party-b reaches alice, alice's rows reach no one), and the restored pot the hop marker its committed keys seat
     // (`owed_dirty_pot_records_insert_seats`, a downgrade).
     restored.extend(marks("party", "party-b", &["alice"]));
-    restored.extend(marks("party", "filed:party", &["bob"]));
     restored.extend(marks("pot", "pot:0", &["alice"]));
     restored.sort();
     f.clear();
