@@ -6914,7 +6914,7 @@ fn fold10_j_a_state_judged_under_another_build_bootstraps_again() {
     let actor = squash(include_str!("../owed_actor.rs"));
     assert!(actor.contains("body[\"rejudged\"]=n(COUNTERS[26]);"));
     assert!(
-        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total'))AScounters")
+        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total'))AScounters")
     );
 }
 
@@ -16748,7 +16748,7 @@ mod d2_actor_f_fold3 {
     fn fold4_nit2_the_family_bound_follows_the_filings() {
         assert_eq!(closure_family_bound(0), CLOSURE_FAMILY_BYTES_PER_FILING);
         assert_eq!(closure_family_bound(1), CLOSURE_FAMILY_BYTES_PER_FILING);
-        assert!(CLOSURE_FAMILY_BYTES_PER_FILING < CLOSURE_FAMILY_MAX_BYTES);
+        const { assert!(CLOSURE_FAMILY_BYTES_PER_FILING < CLOSURE_FAMILY_MAX_BYTES) };
         assert_eq!(closure_family_bound(2), CLOSURE_FAMILY_MAX_BYTES);
         let keys: BTreeSet<String> = [h("a1", 1)].into_iter().collect();
         let (stmt, _) = pass_closure_statement(&keys, 1).unwrap();
