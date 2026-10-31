@@ -262,7 +262,7 @@ impl TopicManager for AdmitsSpendable {
         _previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         _mode: SubmitMode,
-        _context: &TopicAdmittanceContext,
+        _context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         Ok(AdmittanceInstructions {
             outputs_to_admit: (0..tx.outputs.len() as u32 - 1).collect(),

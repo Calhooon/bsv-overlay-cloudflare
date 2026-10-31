@@ -13,6 +13,14 @@ use async_trait::async_trait;
 
 use crate::types::{AppliedTransaction, Outpoint, Output};
 
+mod admission;
+#[cfg(any(test, feature = "memory-storage"))]
+mod memory_admission;
+pub use admission::{
+    AdmissionUnit, CommitError, Committed, Guard, GuardId, OutboxEvent, PreconditionVerdict,
+    RecordKey, StagedWrite, SubmitStage,
+};
+
 /// A stored transaction's txid plus its serialized BEEF bytes.
 ///
 /// Returned by [`Storage::find_transactions_for_proof_check`] so the engine can
@@ -31,6 +39,21 @@ pub struct TransactionBeef {
 /// (Cloudflare Workers D1).
 #[async_trait(?Send)]
 pub trait Storage {
+    /// Proposed admission entry point; names remain subject to keeper review.
+    /// Backends must override this to provide atomic admission.
+    fn begin_admission(&self) -> Box<dyn AdmissionUnit + '_> {
+        Box::new(admission::CompatibilityUnit::new(self))
+    }
+
+    /// Proposed journal status: pending admissions are not landed predecessors.
+    async fn admission_pending(&self, _txid: &str) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+    /// Proposed per-request replay. True means the journal is closed.
+    async fn drain_admission(&self, _txid: &str) -> Result<bool, StorageError> {
+        Ok(true)
+    }
+
     // ========================================================================
     // Write operations
     // ========================================================================
@@ -412,6 +435,16 @@ pub struct PeerSyncHealth {
 /// `Box<dyn Storage>` over the same instance. Pure delegation, no semantics.
 #[async_trait(?Send)]
 impl<T: Storage + ?Sized> Storage for std::rc::Rc<T> {
+    async fn admission_pending(&self, txid: &str) -> Result<bool, StorageError> {
+        (**self).admission_pending(txid).await
+    }
+    async fn drain_admission(&self, txid: &str) -> Result<bool, StorageError> {
+        (**self).drain_admission(txid).await
+    }
+
+    fn begin_admission(&self) -> Box<dyn AdmissionUnit + '_> {
+        (**self).begin_admission()
+    }
     async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
         (**self).insert_output(output).await
     }
@@ -624,6 +657,7 @@ pub enum StorageError {
 
 #[cfg(any(test, feature = "memory-storage"))]
 pub mod memory {
+    pub use super::memory_admission::{MemoryGuard, MemoryOutboxRow, MemoryWrite};
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -633,10 +667,12 @@ pub mod memory {
     /// NOT suitable for production — no persistence, no concurrency beyond Mutex.
     #[derive(Debug, Default)]
     pub struct MemoryStorage {
+        pub(super) admission_rows: Mutex<super::memory_admission::AdmissionRows>,
+        pub(super) admission_seams: Mutex<super::memory_admission::AdmissionSeams>,
         /// outputs keyed by (txid, outputIndex, topic)
-        outputs: Mutex<HashMap<(String, u32, String), Output>>,
+        pub(super) outputs: Mutex<HashMap<(String, u32, String), Output>>,
         /// BEEF data keyed by txid
-        transactions: Mutex<HashMap<String, Vec<u8>>>,
+        pub(super) transactions: Mutex<HashMap<String, Vec<u8>>>,
         /// txids whose `has_proof` flag is set. Models the real D1
         /// `transactions.has_proof` column (overlay migration 0010), which is
         /// the source of truth for `find_transactions_for_proof_check` — NOT a
@@ -644,20 +680,20 @@ pub mod memory {
         /// something explicitly proves it, so a BEEF that already carries a
         /// proof but is not in this set is still returned as a candidate — the
         /// exact window-clog the cron must clear via `mark_transaction_proven`.
-        proven: Mutex<std::collections::HashSet<String>>,
+        pub(super) proven: Mutex<std::collections::HashSet<String>>,
         /// applied transactions keyed by (txid, topic)
-        applied: Mutex<HashMap<(String, String), bool>>,
+        pub(super) applied: Mutex<HashMap<(String, String), bool>>,
         /// GASP sync state keyed by (host, topic)
         sync_state: Mutex<HashMap<(String, String), u64>>,
         /// Deterministic logical clock (seconds) for the push-primary backstop
         /// age gate — models the D1 backend's `unixepoch()`. Tests advance it
         /// with [`MemoryStorage::advance_clock`]; no wall clock is ever read
         /// (wasm-safe, deterministic).
-        clock_secs: Mutex<u64>,
+        pub(super) clock_secs: Mutex<u64>,
         /// First-store stamp (clock seconds) per txid — models the D1
         /// `transactions.created_at` column. A txid ABSENT here has UNKNOWN
         /// age and is treated as OLD (eligible) — the fail-safe direction.
-        created_at: Mutex<HashMap<String, u64>>,
+        pub(super) created_at: Mutex<HashMap<String, u64>>,
         /// GASP peer health keyed by (host, topic) —
         /// `(consecutive_failures, last_attempt_at_clock_secs)`. Models the
         /// D1 `gasp_peer_health` table (bsv-low#302); the logical clock
@@ -824,6 +860,26 @@ pub mod memory {
 
     #[async_trait(?Send)]
     impl Storage for MemoryStorage {
+        async fn admission_pending(&self, txid: &str) -> Result<bool, StorageError> {
+            Ok(self.has_admission_journal(txid))
+        }
+        async fn drain_admission(&self, txid: &str) -> Result<bool, StorageError> {
+            let (paused, chunk) = {
+                let seams = self.admission_seams.lock().unwrap();
+                (
+                    seams.decision_only,
+                    seams.statement_bound.unwrap_or(usize::MAX).max(1),
+                )
+            };
+            if !paused {
+                self.drain_admission_journals(chunk)?;
+            }
+            Ok(!self.has_admission_journal(txid))
+        }
+
+        fn begin_admission(&self) -> Box<dyn AdmissionUnit + '_> {
+            Box::new(super::memory_admission::MemoryAdmission::new(self))
+        }
         async fn insert_output(&self, output: &Output) -> Result<(), StorageError> {
             let key = (
                 output.txid.clone(),

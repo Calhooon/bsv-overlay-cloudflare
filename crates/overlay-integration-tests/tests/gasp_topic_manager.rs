@@ -204,7 +204,7 @@ impl TopicManager for HeadChainManager {
         previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        _context: &TopicAdmittanceContext,
+        _context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         if mode == SubmitMode::HistoricalTx {
             assert!(tx.merkle_path.is_some(), "the dry run carries the proof");
@@ -423,7 +423,7 @@ impl TopicManager for DefaultInputsManager {
         _previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         _mode: SubmitMode,
-        _context: &TopicAdmittanceContext,
+        _context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         Ok(AdmittanceInstructions::default())
     }
@@ -554,7 +554,7 @@ impl TopicManager for ProbeManager {
         previous_coins: &[u8],
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        _context: &TopicAdmittanceContext,
+        _context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         self.admissions.borrow_mut().push(AdmissionCall {
             txid: tx.id(),
@@ -1064,7 +1064,7 @@ impl TopicManager for DecoyHeadManager {
         previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        _context: &TopicAdmittanceContext,
+        _context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         // The same rule in every mode (bsv-low #551): the anchor replay runs
         // it under `historical-tx` with the coins of its own set.
@@ -1661,7 +1661,7 @@ impl TopicManager for AdmitsOutputZero {
         _previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        _context: &TopicAdmittanceContext,
+        _context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         if mode == SubmitMode::HistoricalTxNoSpv {
             self.0.borrow_mut().admitted.push(tx.id());
@@ -2083,7 +2083,7 @@ impl TopicManager for RetainingHeadManager {
         previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        _context: &TopicAdmittanceContext,
+        _context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         if mode == SubmitMode::HistoricalTx && !previous_coins.is_empty() {
             self.replay
@@ -2617,7 +2617,7 @@ impl TopicManager for RecordedHeadManager {
         previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        _context: &TopicAdmittanceContext,
+        _context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let extends_head = previous_coins
             .chunks_exact(4)
@@ -3121,7 +3121,7 @@ impl<M: TopicManager> TopicManager for StatefulHead<M> {
         previous_coins: &[u8],
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        context: &TopicAdmittanceContext,
+        context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let call = ContextCall {
             txid: tx.id(),
@@ -3782,7 +3782,7 @@ impl<M: TopicManager> TopicManager for NotNow<M> {
         previous_coins: &[u8],
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        context: &TopicAdmittanceContext,
+        context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let this_call = if self.in_replay {
             context.dry_run && !previous_coins.is_empty()
@@ -6016,7 +6016,7 @@ impl TopicManager for TipShapeManager {
         _previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         _mode: SubmitMode,
-        _context: &TopicAdmittanceContext,
+        _context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let is_tip = tx.outputs.first().is_some_and(|o| o.get_satoshis() == 777);
         Ok(AdmittanceInstructions {
@@ -6351,7 +6351,7 @@ impl TopicManager for ShapeHeadManager {
         _previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         _mode: SubmitMode,
-        _context: &TopicAdmittanceContext,
+        _context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         Ok(AdmittanceInstructions {
             outputs_to_admit: if tx.outputs.len() == 1 {
@@ -6702,7 +6702,7 @@ impl<M: TopicManager> TopicManager for Nameless<M> {
         previous_coins: &[u8],
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        context: &TopicAdmittanceContext,
+        context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         self.0
             .identify_admissible_outputs(tx, previous_coins, off_chain_values, mode, context)
@@ -6990,7 +6990,7 @@ impl TopicManager for NamesEveryInput {
         previous_coins: &[u8],
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        context: &TopicAdmittanceContext,
+        context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         ShapeHeadManager { names: true }
             .identify_admissible_outputs(tx, previous_coins, off_chain_values, mode, context)
@@ -7253,7 +7253,7 @@ impl<M: TopicManager> TopicManager for Recorded<M> {
         previous_coins: &[u8],
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        context: &TopicAdmittanceContext,
+        context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         self.calls.borrow_mut().push((tx.id(), context.dry_run));
         self.rule
@@ -10295,7 +10295,7 @@ impl TopicManager for AdmitsZeroNamesFirst {
         _previous_coins: &[u8],
         _off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        _context: &TopicAdmittanceContext,
+        _context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         if mode == SubmitMode::HistoricalTxNoSpv {
             self.0.borrow_mut().admitted.push(tx.id());

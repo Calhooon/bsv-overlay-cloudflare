@@ -20,6 +20,8 @@ use crate::storage::{Storage, StorageError};
 use crate::topic_manager::{TopicManager, TopicManagerError};
 use crate::types::*;
 
+mod legacy_admission;
+
 /// Controls how much spend history to include in lookup responses.
 ///
 /// Maps to the TS `historySelector` parameter which can be a number
@@ -64,6 +66,7 @@ pub struct Engine {
     managers: HashMap<String, Box<dyn TopicManager>>,
     lookup_services: HashMap<String, Box<dyn LookupService>>,
     storage: Box<dyn Storage>,
+    submit_stage: Option<Box<dyn crate::storage::SubmitStage>>,
     advertiser: Option<Box<dyn Advertiser>>,
     broadcaster: Option<Box<dyn Broadcaster>>,
     arc_broadcaster: Option<Box<dyn ArcBroadcaster>>,
@@ -155,9 +158,8 @@ pub type LandingGuard = std::rc::Rc<dyn Fn(&str, &str) -> LandingGuardFuture>;
 /// dropped ALONE and reported as that call's fault: the submit runs on to
 /// its end as for any storage fault. Once the deadline is due no further
 /// call is started (each answers "no answer" at once), so a transaction
-/// costs at most its budget, and once more for the undo
-/// ([`CallBound::renew`]).
-struct CallBound {
+/// costs at most its budget.
+pub struct CallBound {
     sleep: SleepFactory,
     budget_ms: u64,
     deadline: std::cell::RefCell<SleepFuture>,
@@ -167,29 +169,26 @@ struct CallBound {
 impl CallBound {
     fn new(sleep: &SleepFactory, budget_ms: u64) -> Self {
         Self {
-            deadline: std::cell::RefCell::new(sleep(budget_ms)),
             sleep: sleep.clone(),
             budget_ms,
+            deadline: std::cell::RefCell::new(sleep(budget_ms)),
             due: std::cell::Cell::new(false),
         }
     }
 
-    /// A fresh allowance of the same length, for the undo of a faulted
-    /// submit: the calls that put the store back as it was found must not be
-    /// refused because the deadline the fault answered to has passed.
     fn renew(&self) {
         *self.deadline.borrow_mut() = (self.sleep)(self.budget_ms);
         self.due.set(false);
     }
 
     /// Whether a call under this bound went unanswered (or was not started
-    /// because one had) since the last [`CallBound::renew`].
-    fn is_due(&self) -> bool {
+    /// because one had) during this submit.
+    pub fn is_due(&self) -> bool {
         self.due.get()
     }
 
     /// `call`, or `None` when the deadline fell due first.
-    async fn call<T>(&self, call: impl std::future::Future<Output = T>) -> Option<T> {
+    pub async fn call<T>(&self, call: impl std::future::Future<Output = T>) -> Option<T> {
         if self.due.get() {
             return None;
         }
@@ -234,6 +233,20 @@ async fn stored<T>(
 }
 
 /// A lookup hook under `bound`, its error as the report carries it.
+async fn staged(
+    bound: Option<&CallBound>,
+    call: impl std::future::Future<Output = Result<(), crate::lookup_service::LookupRefusal>>,
+) -> Result<(), crate::lookup_service::LookupRefusal> {
+    match bound {
+        Some(bound) => bound.call(call).await.unwrap_or_else(|| {
+            Err(crate::lookup_service::LookupRefusal::Transient(
+                "staging unanswered".into(),
+            ))
+        }),
+        None => call.await,
+    }
+}
+
 async fn hooked(
     bound: Option<&CallBound>,
     call: impl std::future::Future<Output = Result<(), LookupServiceError>>,
@@ -443,16 +456,41 @@ pub struct MutationFault {
     pub error: String,
 }
 
-/// What Phase 3 actually landed for a submit — the durability report.
-///
-/// `applied_topics` are the topics whose EVERY write (and lookup-service
-/// notification) succeeded and were therefore recorded in
-/// `applied_transactions`. A topic with any fault is deliberately NOT
-/// recorded: the dedup in Phase 1 would otherwise turn a replay into a
-/// no-op and make the loss permanent (the ordering was already
-/// write-then-record; the record is now conditional on the writes).
+/// Proposed typed refusal, for keeper review. No admission writes landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionRefusal {
+    pub topic: String,
+    pub site: &'static str,
+    pub reason: String,
+    pub class: String,
+    pub kind: Option<String>,
+}
+/// Proposed runtime migration inventory for health.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdmissionShape {
+    pub atomic: bool,
+    pub staged: Vec<String>,
+    pub bridged: Vec<String>,
+    pub staged_count: usize,
+    pub bridged_count: usize,
+}
+
+/// The decision and durability of a submit. Under atomic admission, a refusal
+/// leaves all admission tables unchanged. Applied topics survive after-commit
+/// bridge faults, which are counted separately. An open journal is a durable
+/// decision but is not landed for GASP or the successor rule.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MutationReport {
+    /// The actual subject, including a carried predecessor's own submit.
+    pub subject_txid: String,
+    /// Topics judged for this unit; available to SubmitStage before commit.
+    pub judged_topics: Vec<String>,
+    pub refused: Option<AdmissionRefusal>,
+    pub unanswered: bool,
+    pub journaled: Option<String>,
+    pub admission_bytes: u64,
+    pub memory_bytes: u64,
+    pub after_commit_faults: Vec<MutationFault>,
     pub faults: Vec<MutationFault>,
     pub applied_topics: Vec<String>,
     /// Topics this (txid, topic) pair had ALREADY been applied under — the
@@ -495,6 +533,28 @@ pub struct RenotifyReport {
 }
 
 impl MutationReport {
+    fn lookup_refusal(
+        &mut self,
+        topic: &str,
+        site: &'static str,
+        error: crate::lookup_service::LookupRefusal,
+    ) {
+        match error {
+            crate::lookup_service::LookupRefusal::Deterministic(reason) => {
+                self.refused = Some(AdmissionRefusal {
+                    topic: topic.into(),
+                    site,
+                    reason,
+                    class: "deterministic".into(),
+                    kind: None,
+                });
+            }
+            crate::lookup_service::LookupRefusal::Transient(reason) => {
+                self.fault(topic, site, reason);
+            }
+        }
+    }
+
     fn fault(&mut self, topic: &str, site: &'static str, error: String) {
         self.faults.push(MutationFault {
             topic: topic.to_string(),
@@ -508,6 +568,9 @@ impl MutationReport {
     #[must_use]
     pub fn is_durable(&self) -> bool {
         self.faults.is_empty()
+            && self.refused.is_none()
+            && !self.unanswered
+            && self.journaled.is_none()
     }
 
     /// One log line naming every fault (`topic/site: error`), each error
@@ -690,6 +753,7 @@ type Validated = (
     Transaction,
     String,
     Option<WalkCouldNotRun>,
+    u64,
 );
 
 /// Which limb of the [`DoorBudget`] a submit's own walk went past (bsv-low
@@ -844,6 +908,32 @@ pub(crate) fn script_census(
 }
 
 impl Engine {
+    /// Proposed route-stage registration; the keeper owns the name.
+    pub fn set_submit_stage(&mut self, stage: Box<dyn crate::storage::SubmitStage>) {
+        self.submit_stage = Some(stage);
+    }
+    /// Proposed runtime admission shape for the host's health response.
+    pub fn admission_shape(&self) -> AdmissionShape {
+        let mut staged = Vec::new();
+        let mut bridged = Vec::new();
+        for (name, service) in &self.lookup_services {
+            if service.is_staged() {
+                staged.push(name.clone());
+            } else {
+                bridged.push(name.clone());
+            }
+        }
+        staged.sort();
+        bridged.sort();
+        AdmissionShape {
+            atomic: self.storage.begin_admission().is_atomic(),
+            staged_count: staged.len(),
+            bridged_count: bridged.len(),
+            staged,
+            bridged,
+        }
+    }
+
     /// Page size used by `/requestSyncResponse` when the (public) caller
     /// omits `limit`. A bounded page is not lossy for a conforming
     /// initiator: ours ([`crate::gasp::GASPSync`]) keeps requesting pages
@@ -973,6 +1063,7 @@ impl Engine {
             managers,
             lookup_services,
             storage,
+            submit_stage: None,
             advertiser,
             broadcaster,
             arc_broadcaster,
@@ -1351,7 +1442,7 @@ impl Engine {
         // A validate-only call admits nothing: a dry run by its own name. A
         // manager that writes on admission must not write here, or the real
         // submit that follows meets a head this call already advanced.
-        let (_validations, steak, _tx, _txid, _could_not_run) = self
+        let (_validations, steak, _tx, _txid, _could_not_run, _memory) = self
             .run_validation(
                 tagged_beef,
                 mode,
@@ -1540,18 +1631,43 @@ impl Engine {
         question_reads: &mut usize,
         policy: WalkBreachPolicy,
     ) -> Result<Counted, EngineError> {
+        if !self.storage.begin_admission().is_atomic() {
+            if self.submit_stage.is_some()
+                || self
+                    .lookup_services
+                    .values()
+                    .any(|service| service.is_staged())
+            {
+                return Err(EngineError::StorageError(
+                    "staged components require an atomic admission backend".into(),
+                ));
+            }
+            return self
+                .submit_legacy_counted_inner(
+                    tagged_beef,
+                    mode,
+                    bound,
+                    finalize,
+                    walked,
+                    question_reads,
+                    policy,
+                )
+                .await;
+        }
         // A submit is a real admission, never a dry run; a carried
         // predecessor's is judged dry until its topic is known not to wait.
         let carried = walked.is_some();
+        let mut unit = self.storage.begin_admission();
         let context = if carried {
             TopicAdmittanceContext::DRY_RUN
         } else {
-            TopicAdmittanceContext::default()
+            TopicAdmittanceContext::with_unit(&mut *unit)
         };
-        let (mut validations, mut steak, tx, txid, could_not_run) = self
+        let (mut validations, mut steak, tx, txid, could_not_run, walk_memory) = self
             .run_validation(tagged_beef, mode, &context, bound, walked, policy)
             .await?;
         let mut report = MutationReport {
+            subject_txid: txid.clone(),
             walk_could_not_run: could_not_run,
             ..MutationReport::default()
         };
@@ -1597,534 +1713,430 @@ impl Engine {
                 &mut report.landed_predecessors,
                 landing,
                 &mut report.landed_walks_could_not_run,
+                &context,
             )
             .await;
-        // A carried predecessor's topic that does not wait is judged again,
-        // for real: what it admits is this call's word, over the same coins.
-        if carried {
-            for v in &mut validations {
-                if v.is_dupe || v.failed || v.read_fault.is_some() || waits.contains_key(&v.topic) {
-                    continue;
-                }
-                match self
-                    .judge(
-                        &tx,
-                        &v.topic,
-                        &v.previous_coins,
-                        tagged_beef.off_chain_values.as_deref(),
-                        mode,
-                        &TopicAdmittanceContext::default(),
-                        bound,
-                    )
-                    .await
-                {
-                    Ok(admittance) => v.admittance = admittance,
-                    Err(e) => {
-                        error!("Error validating topic {} during submit: {e}", v.topic);
-                        v.failed = true;
-                        v.previous_coins.clear();
-                        v.previous_outputs.clear();
-                        v.admittance = AdmittanceInstructions::default();
-                    }
-                }
-                steak.insert(v.topic.clone(), v.admittance.clone());
-            }
-        }
-
-        // =================================================================
-        // PHASE 3: MUTATE STORAGE
-        // =================================================================
+        // Every topic stages into the same unit. Any refusal drops all of it.
         for v in &validations {
             if v.is_dupe {
-                report.deduped_topics.push(v.topic.clone());
-                continue;
-            }
-            // A failed topic comes first, a read fault of it included: a
-            // previous-coin read that faulted and a manager that then ERRED
-            // is a failed topic with a durable report, no fault and no
-            // replay. Parity: the reference fails the topic and never
-            // replays. Nothing was written, so the store is as it was.
-            if v.failed {
-                continue;
-            }
-
-            let topic = &v.topic;
-            let admittance = &v.admittance;
-            let faults_before = report.faults.len();
-
-            // A validation read that faulted: the manager judged without a
-            // coin the store may hold, so NOTHING is written on that
-            // judgement (the lens fold of 2026-10-07). Writing its outputs
-            // would leave them beside the unseen coin, for a successor to
-            // spend before the replay deletes it.
-            if let Some((read, err)) = &v.read_fault {
-                report.fault(topic, read, err.clone());
-                self.hold_unapplied(&txid, topic, "a validation read faulted, nothing written");
-                continue;
-            }
-
-            // bsv-low #559 and lane E1D: a topic that found no coin while a
-            // predecessor's landing is unknown is "not now", recorded
-            // nowhere ([`Engine::successors_waiting`]).
-            if let Some(not_now) = waits.get(topic) {
-                report.fault(topic, "predecessor_not_landed", not_now.clone());
-                self.hold_unapplied(
-                    &txid,
-                    topic,
-                    &format!("found no coin and its predecessor {not_now}"),
-                );
-                continue;
-            }
-
-            // ── Handle stale vs retained previous coins ──
-            let mut outputs_consumed: Vec<Outpoint> = Vec::new();
-            let mut stale_coins: Vec<&Output> = Vec::new();
-
-            for (coin_idx, prev_output) in v.previous_outputs.iter().enumerate() {
-                let input_index = v.previous_coins[coin_idx];
-                if admittance.coins_to_retain.contains(&input_index) {
-                    // Retained: track as consumed (will update consumedBy later)
-                    outputs_consumed
-                        .push(Outpoint::new(&prev_output.txid, prev_output.output_index));
-                } else {
-                    // Not retained: mark as stale for deletion
-                    stale_coins.push(prev_output);
+                match stored(bound, self.storage.drain_admission(&txid)).await {
+                    Ok(true) => report.deduped_topics.push(v.topic.clone()),
+                    Ok(false) => report.journaled = Some(txid.clone()),
+                    Err(e) => report.fault(&v.topic, "admission.drain", e.to_string()),
                 }
             }
-
-            // Update STEAK with removed coins
-            if let Some(steak_entry) = steak.get_mut(topic) {
-                steak_entry.coins_removed = Some(
-                    stale_coins
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, _)| {
-                            // Map back to input indices
-                            v.previous_coins.get(i).copied()
-                        })
-                        .collect(),
-                );
+            if let Some((site, reason)) = &v.read_fault {
+                report.fault(&v.topic, site, reason.clone());
             }
-
-            // ── Mark previous outputs as spent + notify lookup services ──
-            // A mark that faults does not skip the notification (the
-            // reference skips it): the coin is spent whatever the row says,
-            // a stale one is deleted below and its lookup services must
-            // know. The mark of a RETAINED coin is part of what landed: that
-            // row stays, and left unspent it would be listed as a UTXO
-            // beside the output that consumed it.
-            let mut retained_mark_faulted = false;
-            for (prev_idx, prev_output) in v.previous_outputs.iter().enumerate() {
-                if let Err(e) = stored(
+            if let Some(reason) = waits.get(&v.topic) {
+                report.fault(&v.topic, "predecessor_not_landed", reason.clone());
+            }
+        }
+        if !report.faults.is_empty() || report.journaled.is_some() {
+            return Ok((steak, report, blocked));
+        }
+        if let Some(v) = validations.iter().find(|v| v.failed) {
+            report.refused = Some(AdmissionRefusal {
+                topic: v.topic.clone(),
+                site: "topic_manager",
+                reason: "topic manager refused admission".into(),
+                class: "deterministic".into(),
+                kind: None,
+            });
+            return Ok((steak, report, blocked));
+        }
+        if validations.iter().all(|v| v.is_dupe) {
+            return Ok((steak, report, blocked));
+        }
+        unit.set_memory_allowance(
+            self.walk_budget
+                .max_memory_bytes
+                .saturating_sub(walk_memory),
+        );
+        // A carried body is judged dry until its predecessors are ready.
+        // Normal submits already staged their manager judgement above.
+        for v in &mut validations {
+            if !carried || v.is_dupe {
+                continue;
+            }
+            let context = TopicAdmittanceContext::with_unit(&mut *unit);
+            match self
+                .judge(
+                    &tx,
+                    &v.topic,
+                    &v.previous_coins,
+                    tagged_beef.off_chain_values.as_deref(),
+                    mode,
+                    &context,
                     bound,
-                    self.storage.mark_utxo_as_spent(
-                        &prev_output.txid,
-                        prev_output.output_index,
-                        topic,
-                    ),
                 )
                 .await
-                {
-                    error!("Error marking UTXO as spent: {e}");
-                    report.fault(topic, "mark_utxo_as_spent", e.to_string());
-                    retained_mark_faulted |= admittance
-                        .coins_to_retain
-                        .contains(&v.previous_coins[prev_idx]);
+            {
+                Ok(admittance) => {
+                    v.admittance = admittance;
+                    steak.insert(v.topic.clone(), v.admittance.clone());
                 }
-
-                // The input index within tx.inputs that spends this previous output.
-                let spending_input_idx = v.previous_coins[prev_idx] as usize;
-
-                // Notify all lookup services about the spent output
-                for ls in self.lookup_services.values() {
+                Err(e) => {
+                    report.refused = Some(AdmissionRefusal {
+                        topic: v.topic.clone(),
+                        site: "topic_manager",
+                        reason: e.to_string(),
+                        class: "deterministic".into(),
+                        kind: None,
+                    });
+                    return Ok((steak, report, blocked));
+                }
+            }
+        }
+        let mut notifications: HashMap<String, (Vec<OutputAdmittedByTopic>, Vec<OutputSpent>)> =
+            HashMap::new();
+        let mut deleted = Vec::new();
+        for v in &validations {
+            if v.is_dupe {
+                continue;
+            }
+            let topic = &v.topic;
+            let mut consumed = Vec::new();
+            let mut stale = Vec::new();
+            let mut removed = Vec::new();
+            for (i, previous) in v.previous_outputs.iter().enumerate() {
+                if v.admittance.coins_to_retain.contains(&v.previous_coins[i]) {
+                    consumed.push(Outpoint::new(&previous.txid, previous.output_index));
+                } else {
+                    stale.push(previous.clone());
+                    removed.push(v.previous_coins[i]);
+                }
+            }
+            if let Some(entry) = steak.get_mut(topic) {
+                entry.coins_removed = Some(removed);
+            }
+            for (i, previous) in v.previous_outputs.iter().enumerate() {
+                if unit.is_atomic() {
+                    unit.require(crate::storage::Guard::OutputHeldUnspent {
+                        txid: previous.txid.clone(),
+                        output_index: previous.output_index,
+                        topic: topic.clone(),
+                    });
+                }
+                unit.mark_spent(&previous.txid, previous.output_index, topic);
+                for (name, ls) in &self.lookup_services {
+                    let input_index = v.previous_coins[i];
                     let payload = match ls.spend_notification_mode() {
                         SpendNotificationMode::None => OutputSpent::None {
-                            txid: prev_output.txid.clone(),
-                            output_index: prev_output.output_index,
+                            txid: previous.txid.clone(),
+                            output_index: previous.output_index,
                             topic: topic.clone(),
                         },
                         SpendNotificationMode::Txid => OutputSpent::Txid {
-                            txid: prev_output.txid.clone(),
-                            output_index: prev_output.output_index,
+                            txid: previous.txid.clone(),
+                            output_index: previous.output_index,
                             topic: topic.clone(),
                             spending_txid: txid.clone(),
                         },
-                        SpendNotificationMode::Script => {
-                            // Extract unlocking script and sequence from the spending input
-                            let input = &tx.inputs[spending_input_idx];
-                            let unlocking_script = input
+                        SpendNotificationMode::Script => OutputSpent::Script {
+                            txid: previous.txid.clone(),
+                            output_index: previous.output_index,
+                            topic: topic.clone(),
+                            spending_txid: txid.clone(),
+                            input_index,
+                            unlocking_script: tx.inputs[input_index as usize]
                                 .unlocking_script
                                 .as_ref()
                                 .map(bsv_rs::UnlockingScript::to_binary)
-                                .unwrap_or_default();
-                            OutputSpent::Script {
-                                txid: prev_output.txid.clone(),
-                                output_index: prev_output.output_index,
-                                topic: topic.clone(),
-                                spending_txid: txid.clone(),
-                                input_index: spending_input_idx as u32,
-                                unlocking_script,
-                                sequence_number: input.sequence,
-                                off_chain_values: tagged_beef.off_chain_values.clone(),
-                            }
-                        }
+                                .unwrap_or_default(),
+                            sequence_number: tx.inputs[input_index as usize].sequence,
+                            off_chain_values: tagged_beef.off_chain_values.clone(),
+                        },
                         SpendNotificationMode::WholeTx => OutputSpent::WholeTx {
-                            txid: prev_output.txid.clone(),
-                            output_index: prev_output.output_index,
+                            txid: previous.txid.clone(),
+                            output_index: previous.output_index,
                             topic: topic.clone(),
                             spending_atomic_beef: subject_named_beef.clone(),
                             off_chain_values: tagged_beef.off_chain_values.clone(),
                         },
                     };
-                    if let Err(e) = hooked(bound, ls.output_spent(&payload)).await {
-                        error!("Error notifying lookup service of spent output: {e}");
-                        report.fault(topic, "lookup_service.output_spent", e);
+                    if let Err(e) = staged(bound, ls.stage_spent(&payload, &mut *unit)).await {
+                        report.lookup_refusal(topic, "lookup_service.stage_spent", e);
+                        return Ok((steak, report, blocked));
                     }
+                    notifications
+                        .entry(name.clone())
+                        .or_default()
+                        .1
+                        .push(payload);
                 }
             }
-            if retained_mark_faulted {
-                self.hold_unapplied(
-                    &txid,
-                    topic,
-                    "the spent mark of a retained coin faulted, nothing inserted",
-                );
-                continue;
-            }
-
-            // ── Insert admitted outputs ──
-            // The inserts stop at the first one that faults: what follows is
-            // the undo, not the rest of the transaction.
-            let mut new_utxos: Vec<Outpoint> = Vec::new();
-            let mut attempted: Vec<u32> = Vec::new();
-            let mut insert_faulted = false;
-
-            for &output_index in &admittance.outputs_to_admit {
-                let (script_bytes, sats) =
-                    if let Some(tx_output) = tx.outputs.get(output_index as usize) {
-                        (
-                            tx_output.locking_script.to_binary(),
-                            tx_output.get_satoshis(),
-                        )
-                    } else {
-                        (Vec::new(), 0)
-                    };
-
-                let output = Output {
+            let mut new_outputs = Vec::new();
+            for &index in &v.admittance.outputs_to_admit {
+                let (script, satoshis) = tx
+                    .outputs
+                    .get(index as usize)
+                    .map(|o| (o.locking_script.to_binary(), o.get_satoshis()))
+                    .unwrap_or_default();
+                unit.insert_output(&Output {
                     txid: txid.clone(),
-                    output_index,
-                    output_script: script_bytes,
-                    satoshis: sats,
+                    output_index: index,
+                    output_script: script.clone(),
+                    satoshis,
                     topic: topic.clone(),
                     spent: false,
-                    outputs_consumed: outputs_consumed.clone(),
-                    consumed_by: Vec::new(),
+                    outputs_consumed: consumed.clone(),
+                    consumed_by: vec![],
                     beef: Some(tagged_beef.beef.clone()),
                     block_height: None,
                     score: Some(current_timestamp_ms()),
-                };
-
-                attempted.push(output_index);
-                if let Err(e) = stored(bound, self.storage.insert_output(&output)).await {
-                    error!("Error inserting output for topic {topic}: {e}");
-                    report.fault(topic, "insert_output", e.to_string());
-                    insert_faulted = true;
-                    break;
-                }
-
-                new_utxos.push(Outpoint::new(&txid, output_index));
-
-                // Notify lookup services
-                for ls in self.lookup_services.values() {
-                    let (ls_script, ls_sats) =
-                        if let Some(tx_out) = tx.outputs.get(output_index as usize) {
-                            (tx_out.locking_script.to_binary(), tx_out.get_satoshis())
-                        } else {
-                            (Vec::new(), 0)
-                        };
-
+                });
+                new_outputs.push(Outpoint::new(&txid, index));
+                for (name, ls) in &self.lookup_services {
                     let payload = match ls.admission_mode() {
                         AdmissionMode::LockingScript => OutputAdmittedByTopic::LockingScript {
                             txid: txid.clone(),
-                            output_index,
+                            output_index: index,
                             topic: topic.clone(),
-                            satoshis: ls_sats,
-                            locking_script: ls_script,
+                            satoshis,
+                            locking_script: script.clone(),
                             off_chain_values: tagged_beef.off_chain_values.clone(),
                         },
                         AdmissionMode::WholeTx => OutputAdmittedByTopic::WholeTx {
                             atomic_beef: subject_named_beef.clone(),
-                            output_index,
+                            output_index: index,
                             topic: topic.clone(),
                             off_chain_values: tagged_beef.off_chain_values.clone(),
                         },
                     };
-
-                    if let Err(e) = hooked(bound, ls.output_admitted_by_topic(&payload)).await {
-                        error!("Error notifying lookup service: {e}");
-                        report.fault(topic, "lookup_service.output_admitted_by_topic", e);
+                    if let Err(e) = staged(bound, ls.stage_admitted(&payload, &mut *unit)).await {
+                        report.lookup_refusal(topic, "lookup_service.stage_admitted", e);
+                        return Ok((steak, report, blocked));
                     }
+                    notifications
+                        .entry(name.clone())
+                        .or_default()
+                        .0
+                        .push(payload);
                 }
             }
-
-            // An insert faulted: the transaction did not land, so NOTHING of
-            // it stays (the lens fold of 2026-10-07, F1). The previous coins
-            // are kept (#559: with the delete first, one faulted insert left
-            // a non-retaining head chain with NO head) and the outputs that
-            // were inserted are taken out again, the faulted one included (a
-            // backend's insert can fault after its row landed). Left in,
-            // they could be spent and deleted by a successor before the
-            // replay, and the replay, which still finds the previous coin,
-            // would insert them a second time: a spent head back among the
-            // UTXOs for good.
-            if insert_faulted {
-                if let Some(bound) = bound {
-                    bound.renew();
-                }
-                self.undo_inserts(&txid, topic, &attempted, bound, &mut report)
-                    .await;
-                self.hold_unapplied(
-                    &txid,
-                    topic,
-                    &format!(
-                        "an insert faulted: {} previous coin(s) kept, nothing of it held",
-                        stale_coins.len()
-                    ),
-                );
-                continue;
-            }
-
-            // ── Delete stale outputs recursively ──
-            // AFTER the inserts, and once every one of them landed (bsv-low
-            // #559 and the lens fold of 2026-10-07, F1). The reference
-            // deletes first (`applyTopicStorageMutation`: `removeStaleOutputs`,
-            // then `admitOutput`), catches a throw per topic and never
-            // replays; here a fault is survived and replayed, so the order
-            // is ours, an addition. The delete does NOT wait for a clean
-            // report (c9921ee did, and one faulted mark or notification
-            // after the insert then left the stale coin beside the new
-            // output for good: two unspent heads): a fault of the mark, of
-            // a notification, deletes as the reference does.
-            //
-            // Before a stale coin is deleted its transaction is recorded as
-            // applied in the topic (the delta fold of 2026-10-07, H2; an
-            // addition, one idempotent write per deleted coin). A held coin
-            // proves the inserts of its transaction landed, but that
-            // transaction may have no applied row (a fault after its
-            // inserts withheld it, or its insert landed after its timeout),
-            // and then its replay is judged again: a manager that admits it
-            // with NO previous coin (the opener of a chain) had it inserted
-            // a second time, unspent, beside the output that spent it, for
-            // good. With the row its replay is a dupe. A record that faults
-            // leaves its coin undeleted: that is a delete fault, below.
-            let due_before_the_delete = bound.is_some_and(CallBound::is_due);
-            let mut delete_faulted = false;
-            let mut delete_started = false;
-            for stale in &stale_coins {
-                let spent_coin_tx = AppliedTransaction {
-                    txid: stale.txid.clone(),
-                    topic: topic.clone(),
-                };
-                if let Err(e) = stored(
-                    bound,
-                    self.storage.insert_applied_transaction(&spent_coin_tx),
-                )
-                .await
-                {
-                    error!(
-                        "Error recording {} as applied before its coin is deleted from topic {topic}: {e}",
-                        stale.txid
-                    );
-                    report.fault(topic, "record_spent_coin_applied", e.to_string());
-                    delete_faulted = true;
+            let mut visited = HashSet::new();
+            while let Some(output) = stale.pop() {
+                if !visited.insert((
+                    output.txid.clone(),
+                    output.output_index,
+                    output.topic.clone(),
+                )) {
                     continue;
                 }
-                self.not_landed
-                    .borrow_mut()
-                    .remove(&(stale.txid.clone(), topic.clone()));
-                match stored(
-                    bound,
-                    self.storage.find_output(
-                        &stale.txid,
-                        stale.output_index,
-                        Some(topic),
-                        None,
-                        false,
-                    ),
-                )
-                .await
-                {
-                    Ok(Some(stale_output)) => {
-                        delete_started = true;
-                        if let Err(e) = self.delete_utxo_deep(&stale_output, bound).await {
-                            error!("Error deleting stale output for topic {topic}: {e}");
-                            report.fault(topic, "delete_utxo_deep", e.to_string());
-                            delete_faulted = true;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        error!("Error reading stale output for topic {topic}: {e}");
-                        report.fault(topic, "find_output", e.to_string());
-                        delete_faulted = true;
-                    }
+                if output.consumed_by.is_empty() {
+                    unit.delete_output(&output.txid, output.output_index, &output.topic);
+                    deleted.push((
+                        output.txid.clone(),
+                        output.output_index,
+                        output.topic.clone(),
+                    ));
                 }
-            }
-
-            // A fault here, and what it leaves. The store is put back as it
-            // was found (the inserts undone, the replay does the whole
-            // transaction) only when NO delete was started: the fault is of
-            // H2's record or of the read before the delete, the call
-            // answered, and EVERY stale coin is read back still held.
-            //
-            // Once a delete was STARTED nothing is undone, whether it
-            // answered or not (the delta fold of 2026-10-07, H1, for a call
-            // that did not answer; the second delta fold, M1, for one that
-            // answered an error). A statement can land after its caller was
-            // told it failed, as after its caller stopped waiting: the coin
-            // is read back held now and is deleted a moment later, and the
-            // undo then left the chain with no head, for good, for a manager
-            // that needs the previous coin. So the outputs stay, the stale
-            // coin stays (marked spent) until its delete lands or is done
-            // again, and there is no applied row. Since H2 every order from
-            // there converges. The replay first, the delete never landed:
-            // the coin is found, the manager admits again, the inserts are
-            // no-ops, the delete is done and the row written. The replay
-            // first, the delete landed late: no previous coin, so a manager
-            // that needs one admits nothing and the transaction is recorded
-            // with its outputs held. A successor first: it recorded this
-            // transaction as applied (H2) and the replay is a dupe; the
-            // stale coin's spent row is then left behind, no UTXO.
-            //
-            // A call that did not ANSWER before any delete (the record, the
-            // read) undoes nothing either: it is not known what it did. A
-            // deadline that was already due BEFORE the first of these calls
-            // started nothing here, so the coins are certainly held and the
-            // store is put back.
-            if delete_faulted {
-                let unanswered = !due_before_the_delete && bound.is_some_and(CallBound::is_due);
-                if let Some(bound) = bound {
-                    bound.renew();
-                }
-                let mut all_held = !unanswered && !delete_started;
-                for stale in &stale_coins {
-                    if !all_held {
-                        break;
-                    }
-                    let read = stored(
+                for parent in &output.outputs_consumed {
+                    match stored(
                         bound,
-                        self.storage.find_output(
-                            &stale.txid,
-                            stale.output_index,
-                            Some(topic),
-                            None,
-                            false,
-                        ),
-                    )
-                    .await;
-                    if !matches!(read, Ok(Some(_))) {
-                        all_held = false;
-                        break;
-                    }
-                }
-                if all_held {
-                    self.undo_inserts(&txid, topic, &attempted, bound, &mut report)
-                        .await;
-                }
-                self.hold_unapplied(
-                    &txid,
-                    topic,
-                    if all_held {
-                        "no delete of a stale coin was started: the coins are held, its outputs taken out"
-                    } else if unanswered {
-                        "the delete of a stale coin did not answer: nothing undone, its outputs stay"
-                    } else if delete_started {
-                        "the delete of a stale coin faulted: nothing undone, its outputs stay"
-                    } else {
-                        "no delete was started and a stale coin was not read back held: nothing undone, its outputs stay"
-                    },
-                );
-                continue;
-            }
-
-            // ── Update consumedBy on retained previous outputs ──
-            for consumed_outpoint in &outputs_consumed {
-                let consumed_output = match stored(
-                    bound,
-                    self.storage.find_output(
-                        &consumed_outpoint.txid,
-                        consumed_outpoint.output_index,
-                        Some(topic),
-                        None,
-                        false,
-                    ),
-                )
-                .await
-                {
-                    Ok(Some(o)) => o,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        error!("Error reading consumed output for topic {topic}: {e}");
-                        report.fault(topic, "find_output", e.to_string());
-                        continue;
-                    }
-                };
-                {
-                    let mut new_consumed_by = consumed_output.consumed_by.clone();
-                    for new_utxo in &new_utxos {
-                        if !new_consumed_by.iter().any(|c| {
-                            c.txid == new_utxo.txid && c.output_index == new_utxo.output_index
-                        }) {
-                            new_consumed_by.push(new_utxo.clone());
-                        }
-                    }
-                    if let Err(e) = stored(
-                        bound,
-                        self.storage.update_consumed_by(
-                            &consumed_outpoint.txid,
-                            consumed_outpoint.output_index,
-                            topic,
-                            &new_consumed_by,
-                        ),
+                        unit.find_output(&parent.txid, parent.output_index, Some(topic)),
                     )
                     .await
                     {
-                        error!("Error updating consumedBy: {e}");
-                        report.fault(topic, "update_consumed_by", e.to_string());
+                        Ok(Some(mut retained)) => {
+                            retained.consumed_by.retain(|p| {
+                                p.txid != output.txid || p.output_index != output.output_index
+                            });
+                            unit.update_consumed_by(
+                                &retained.txid,
+                                retained.output_index,
+                                topic,
+                                &retained.consumed_by,
+                            );
+                            stale.push(retained);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            report.fault(topic, "find_output", e.to_string());
+                            return Ok((steak, report, blocked));
+                        }
                     }
                 }
             }
-
-            // Record applied transaction — ONLY when every write above
-            // landed. A faulted topic stays unrecorded so the Phase-1 dedup
-            // cannot turn its replay into a no-op (S2).
-            if report.faults.len() > faults_before {
-                self.hold_unapplied(
-                    &txid,
-                    topic,
-                    &format!(
-                        "{} mutation fault(s); a replay of these bytes re-applies",
-                        report.faults.len() - faults_before
-                    ),
-                );
-                continue;
+            for previous in &v.previous_outputs {
+                if !consumed
+                    .iter()
+                    .any(|o| o.txid == previous.txid && o.output_index == previous.output_index)
+                {
+                    continue;
+                }
+                let mut by = previous.consumed_by.clone();
+                for outpoint in &new_outputs {
+                    if !by.contains(outpoint) {
+                        by.push(outpoint.clone());
+                    }
+                }
+                unit.update_consumed_by(&previous.txid, previous.output_index, topic, &by);
             }
-            let tx_record = AppliedTransaction {
+            unit.record_applied(&AppliedTransaction {
                 txid: txid.clone(),
                 topic: topic.clone(),
-            };
-            match stored(bound, self.storage.insert_applied_transaction(&tx_record)).await {
-                Ok(()) => {
-                    report.applied_topics.push(topic.clone());
-                    self.not_landed
-                        .borrow_mut()
-                        .remove(&(txid.clone(), topic.clone()));
+            });
+        }
+        report.judged_topics = validations
+            .iter()
+            .filter(|v| !v.is_dupe)
+            .map(|v| v.topic.clone())
+            .collect();
+        if let Some(stage) = &self.submit_stage {
+            stage.stage(&report, &mut *unit);
+        }
+        report.admission_bytes = unit.charge();
+        report.memory_bytes = walk_memory.saturating_add(report.admission_bytes);
+        let topics: Vec<_> = validations
+            .iter()
+            .filter(|v| !v.is_dupe)
+            .map(|v| v.topic.clone())
+            .collect();
+        let guards = unit.guards();
+        match unit.commit(bound).await {
+            Ok(crate::storage::Committed::Batch) => report.applied_topics = topics.clone(),
+            Ok(crate::storage::Committed::Journaled { journal }) => {
+                match stored(bound, self.storage.drain_admission(&txid)).await {
+                    Ok(true) => report.applied_topics = topics.clone(),
+                    Ok(false) => {
+                        report.journaled = Some(journal);
+                        return Ok((steak, report, blocked));
+                    }
+                    Err(e) => {
+                        report.journaled = Some(journal);
+                        report.fault("", "admission.drain", e.to_string());
+                        return Ok((steak, report, blocked));
+                    }
                 }
-                Err(e) => {
-                    error!("Error inserting applied transaction for topic {topic}: {e}");
-                    report.fault(topic, "insert_applied_transaction", e.to_string());
-                    self.not_landed
-                        .borrow_mut()
-                        .insert((txid.clone(), topic.clone()));
+            }
+            Err(
+                crate::storage::CommitError::Dedup
+                | crate::storage::CommitError::Precondition {
+                    verdict: crate::storage::PreconditionVerdict::Replay,
+                    ..
+                },
+            ) => {
+                for topic in topics {
+                    report.deduped_topics.push(topic.clone());
+                    steak.insert(topic, AdmittanceInstructions::default());
+                }
+                return Ok((steak, report, blocked));
+            }
+            Err(crate::storage::CommitError::Precondition { guard, mut verdict }) => {
+                if let Some(crate::storage::Guard::Backend { owner, check, .. }) = guards
+                    .iter()
+                    .find(|(id, _)| *id == guard)
+                    .map(|(_, guard)| guard)
+                {
+                    verdict = if let Some(manager) = self.managers.get(owner) {
+                        match bound {
+                            Some(bound) => bound
+                                .call(manager.guard_lost(check.as_ref()))
+                                .await
+                                .unwrap_or(crate::storage::PreconditionVerdict::NotNow {
+                                    reason: "guard verdict unanswered".into(),
+                                }),
+                            None => manager.guard_lost(check.as_ref()).await,
+                        }
+                    } else {
+                        crate::storage::PreconditionVerdict::NotNow {
+                            reason: "guard owner unavailable".into(),
+                        }
+                    };
+                }
+                if let Some(crate::storage::Guard::OutputHeldUnspent { topic, .. }) = guards
+                    .iter()
+                    .find(|(id, _)| *id == guard)
+                    .map(|(_, guard)| guard)
+                {
+                    let fresh = self
+                        .validate_topic(
+                            &tx,
+                            &txid,
+                            topic,
+                            tagged_beef.off_chain_values.as_deref(),
+                            mode,
+                            &TopicAdmittanceContext::DRY_RUN,
+                            bound,
+                        )
+                        .await;
+                    if fresh.is_dupe {
+                        verdict = crate::storage::PreconditionVerdict::Replay;
+                    } else if let Some((_, reason)) = fresh.read_fault {
+                        verdict = crate::storage::PreconditionVerdict::NotNow { reason };
+                    }
+                }
+                match verdict {
+                    crate::storage::PreconditionVerdict::Contest { kind, reason } => {
+                        report.refused = Some(AdmissionRefusal {
+                            topic: topics.first().cloned().unwrap_or_default(),
+                            site: "admission.precondition",
+                            reason,
+                            class: "deterministic".into(),
+                            kind: Some(kind),
+                        });
+                    }
+                    crate::storage::PreconditionVerdict::NotNow { reason } => {
+                        report.fault("", "predecessor_not_landed", reason);
+                    }
+                    crate::storage::PreconditionVerdict::Replay => {
+                        for topic in &topics {
+                            report.deduped_topics.push(topic.clone());
+                            steak.insert(topic.clone(), AdmittanceInstructions::default());
+                        }
+                    }
+                }
+                return Ok((steak, report, blocked));
+            }
+            Err(crate::storage::CommitError::Unanswered) => {
+                report.unanswered = true;
+                for topic in topics {
+                    self.not_landed.borrow_mut().insert((txid.clone(), topic));
+                }
+                report.fault("", "admission.commit", "unanswered".into());
+                return Ok((steak, report, blocked));
+            }
+            Err(crate::storage::CommitError::Storage(e)) => {
+                report.fault(
+                    topics.first().map_or("", String::as_str),
+                    "admission.commit",
+                    e.to_string(),
+                );
+                return Ok((steak, report, blocked));
+            }
+        }
+        for topic in &topics {
+            self.not_landed
+                .borrow_mut()
+                .remove(&(txid.clone(), topic.clone()));
+        }
+        for (name, (admitted, spent)) in notifications {
+            let ls = &self.lookup_services[&name];
+            if let Err(e) = hooked(bound, ls.after_commit(&admitted, &spent)).await {
+                report.after_commit_faults.push(MutationFault {
+                    topic: name,
+                    site: if ls.is_staged() {
+                        "after_commit"
+                    } else {
+                        "bridged_after_commit"
+                    },
+                    error: e.clone(),
+                });
+            }
+        }
+        for (txid, index, topic) in deleted {
+            for (name, ls) in &self.lookup_services {
+                if let Err(e) = ls
+                    .output_no_longer_retained_in_history(&txid, index, &topic)
+                    .await
+                {
+                    report.after_commit_faults.push(MutationFault {
+                        topic: name.clone(),
+                        site: "bridged_after_commit",
+                        error: e.to_string(),
+                    });
                 }
             }
         }
@@ -2201,6 +2213,7 @@ impl Engine {
         landed: &mut Vec<(String, String)>,
         landing: Landing,
         landed_breaches: &mut Vec<WalkCouldNotRun>,
+        context: &TopicAdmittanceContext<'_>,
     ) -> HashMap<String, String> {
         let mut waits = HashMap::new();
         let spent: Vec<(String, u32)> = tx
@@ -2325,7 +2338,7 @@ impl Engine {
                                 &topic,
                                 off_chain_values,
                                 mode,
-                                &TopicAdmittanceContext::default(),
+                                context,
                                 bound,
                             )
                             .await;
@@ -2516,51 +2529,6 @@ impl Engine {
             }
         }
         Ok(())
-    }
-
-    /// A topic of a submit that is NOT recorded as applied: logged, and
-    /// remembered for the successor rule (`not_landed`).
-    fn hold_unapplied(&self, txid: &str, topic: &str, why: &str) {
-        warn!("topic {topic}: {txid}: {why}; applied_transactions NOT recorded (bsv-low #559)");
-        self.not_landed
-            .borrow_mut()
-            .insert((txid.to_string(), topic.to_string()));
-    }
-
-    /// Take out again the outputs a faulted submit inserted (bsv-low #559,
-    /// the lens fold of 2026-10-07, F1), so that nothing of a transaction
-    /// that did not land is held. Only a row nobody has touched since is
-    /// deleted: unspent and consumed by nothing. A plain delete, not the
-    /// deep one: the row's retained inputs were not pointed at it yet. A
-    /// fault here is reported (`undo_insert_output`) and the row stays: the
-    /// limit of an undo made of separate calls.
-    async fn undo_inserts(
-        &self,
-        txid: &str,
-        topic: &str,
-        output_indices: &[u32],
-        bound: Option<&CallBound>,
-        report: &mut MutationReport,
-    ) {
-        for &output_index in output_indices {
-            let row = stored(
-                bound,
-                self.storage
-                    .find_output(txid, output_index, Some(topic), None, false),
-            )
-            .await;
-            let undone = match row {
-                Ok(Some(row)) if !row.spent && row.consumed_by.is_empty() => {
-                    stored(bound, self.storage.delete_output(txid, output_index, topic)).await
-                }
-                Ok(_) => Ok(()),
-                Err(e) => Err(e),
-            };
-            if let Err(e) = undone {
-                error!("Error taking {txid}.{output_index} out of topic {topic} again: {e}");
-                report.fault(topic, "undo_insert_output", e.to_string());
-            }
-        }
     }
 
     /// The store's own answer to "has a predecessor of `tx` not landed?"
@@ -2813,6 +2781,11 @@ impl Engine {
             }
             spent += 1;
             *question_reads += 1;
+            match stored(bound, self.storage.admission_pending(&candidate)).await {
+                Ok(true) => return wait(format!("{candidate} has an open admission journal")),
+                Ok(false) => {}
+                Err(e) => return unread(e),
+            }
             match stored(bound, self.storage.does_applied_transaction_exist(&record)).await {
                 Ok(false) => {}
                 Ok(true) => continue,
@@ -3033,6 +3006,7 @@ impl Engine {
         subject_txid: &str,
         trusted: &HashSet<String>,
         budget: DoorBudget,
+        memory: Option<&std::cell::Cell<u64>>,
     ) -> Result<Option<WalkCouldNotRun>, EngineError> {
         // A structural fault is the reference walk's `SpvError`.
         let spv =
@@ -3050,7 +3024,11 @@ impl Engine {
             trusted,
             &mut trace,
         ) {
-            Ok(_) => {}
+            Ok(stats) => {
+                if let Some(memory) = memory {
+                    memory.set(stats.memory_bytes);
+                }
+            }
             // The interpreter's verdict, the reference's refusal: unchanged.
             Err(refused @ EngineError::ScriptVerificationFailed { .. }) => return Err(refused),
             // A structural fault (a source missing, the value rule, ...):
@@ -3223,7 +3201,7 @@ impl Engine {
         topic: &str,
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        context: &TopicAdmittanceContext,
+        context: &TopicAdmittanceContext<'_>,
         bound: Option<&CallBound>,
     ) -> TopicValidation {
         let tx_record = AppliedTransaction {
@@ -3260,6 +3238,29 @@ impl Engine {
             }
         };
 
+        if is_dupe && !context.dry_run {
+            match stored(bound, self.storage.drain_admission(txid)).await {
+                Ok(true) => {}
+                result => {
+                    return TopicValidation {
+                        topic: topic.into(),
+                        is_dupe: false,
+                        previous_coins: vec![],
+                        previous_outputs: vec![],
+                        admittance: AdmittanceInstructions::default(),
+                        failed: false,
+                        read_fault: Some((
+                            "admission.drain",
+                            match result {
+                                Ok(false) => "journal still open".into(),
+                                Err(e) => e.to_string(),
+                                _ => unreachable!(),
+                            },
+                        )),
+                    }
+                }
+            }
+        }
         if is_dupe {
             return TopicValidation {
                 topic: topic.to_string(),
@@ -3363,7 +3364,7 @@ impl Engine {
         previous_coins: &[u32],
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        context: &TopicAdmittanceContext,
+        context: &TopicAdmittanceContext<'_>,
         bound: Option<&CallBound>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let manager = &self.managers[topic];
@@ -3373,7 +3374,10 @@ impl Engine {
             .collect::<Vec<u8>>();
         // Under a finalize submit's bound a manager that does not answer
         // is a manager that failed: nothing is written for the topic.
-        bounded(
+        if let Some(unit) = &context.unit {
+            unit.borrow_mut().restart_topic(topic);
+        }
+        let judged = bounded(
             bound,
             manager.identify_admissible_outputs(
                 // The ONE engine parse of the submitted BEEF, shared by
@@ -3390,7 +3394,11 @@ impl Engine {
         )
         .await
         .map_err(TopicManagerError::Other)
-        .and_then(|judged| judged)
+        .and_then(|judged| judged);
+        if let Some(unit) = &context.unit {
+            unit.borrow_mut().end_topic();
+        }
+        judged
     }
 
     /// Whether the door may land a carried predecessor into `topic` (the
@@ -3414,7 +3422,7 @@ impl Engine {
         &self,
         tagged_beef: &TaggedBEEF,
         mode: SubmitMode,
-        context: &TopicAdmittanceContext,
+        context: &TopicAdmittanceContext<'_>,
         bound: Option<&CallBound>,
         walked: Option<&HashSet<String>>,
         policy: WalkBreachPolicy,
@@ -3467,6 +3475,7 @@ impl Engine {
         // E592 lens fold, H1, [`WalkBreachPolicy`]): "not now" before any
         // manager is asked, or, under `NetworkAccepted`, this submit goes on
         // as under `HistoricalTxNoSpv` and the report says so.
+        let memory = std::cell::Cell::new(0);
         let mut could_not_run = None;
         if mode != SubmitMode::HistoricalTxNoSpv {
             match walked {
@@ -3479,6 +3488,7 @@ impl Engine {
                         &txid,
                         trusted.unwrap_or(&HashSet::new()),
                         self.walk_budget,
+                        Some(&memory),
                     )
                     .await?;
                 }
@@ -3649,7 +3659,7 @@ impl Engine {
             }
         }
 
-        Ok((validations, steak, tx, txid, could_not_run))
+        Ok((validations, steak, tx, txid, could_not_run, memory.get()))
     }
 
     // ========================================================================
@@ -4754,6 +4764,8 @@ impl Engine {
             .await
             .map_err(|e| EngineError::StorageError(e.to_string()))?;
         let mut report = RenotifyReport::default();
+        let mut unit = self.storage.begin_admission();
+        let mut notifications: HashMap<String, Vec<OutputAdmittedByTopic>> = HashMap::new();
         for output in outputs.iter().filter(|o| o.topic == topic) {
             report.outputs += 1;
             report.vouts.push(output.output_index);
@@ -4791,10 +4803,47 @@ impl Engine {
                         }
                     }
                 };
-                match ls.output_admitted_by_topic(&payload).await {
-                    Ok(()) => report.notified += 1,
-                    Err(e) => report.faults.push(format!("{name}: {e}")),
+                match ls.stage_admitted(&payload, &mut *unit).await {
+                    Ok(()) => {
+                        notifications.entry(name.clone()).or_default().push(payload);
+                    }
+                    Err(e) => {
+                        report.faults.push(format!("{name}: {e}"));
+                        return Ok(report);
+                    }
                 }
+            }
+        }
+        if !report.faults.is_empty() {
+            return Ok(report);
+        }
+        match unit.commit(None).await {
+            Ok(crate::storage::Committed::Batch) => {}
+            Ok(crate::storage::Committed::Journaled { .. }) => {
+                if !self
+                    .storage
+                    .drain_admission(&txid)
+                    .await
+                    .map_err(|e| EngineError::StorageError(e.to_string()))?
+                {
+                    report.faults.push("renotify journal still open".into());
+                    return Ok(report);
+                }
+            }
+            Err(e) => {
+                report.faults.push(e.to_string());
+                return Ok(report);
+            }
+        }
+        for (name, admitted) in notifications {
+            match self.lookup_services[&name]
+                .after_commit(&admitted, &[])
+                .await
+            {
+                Ok(()) => report.notified += admitted.len() as u32,
+                Err(e) => report
+                    .faults
+                    .push(format!("{name}: bridged_after_commit: {e}")),
             }
         }
         Ok(report)
@@ -5682,6 +5731,7 @@ pub(crate) async fn verify_spv_like_the_reference(
         subject_txid,
         &HashSet::new(),
         budget,
+        None,
     )
     .await
 }
@@ -5697,9 +5747,18 @@ async fn verify_spv_trusting(
     subject_txid: &str,
     trusted: &HashSet<String>,
     budget: DoorBudget,
+    memory: Option<&std::cell::Cell<u64>>,
 ) -> Result<Option<WalkCouldNotRun>, EngineError> {
     if verify_scripts {
-        Engine::verify_beef_linear(chain_tracker, beef_bytes, subject_txid, trusted, budget).await
+        Engine::verify_beef_linear(
+            chain_tracker,
+            beef_bytes,
+            subject_txid,
+            trusted,
+            budget,
+            memory,
+        )
+        .await
     } else {
         Engine::verify_spv_structurally(chain_tracker, beef_bytes)
             .await
@@ -6170,7 +6229,7 @@ mod tests {
             _previous_coins: &[u8],
             _off_chain_values: Option<&[u8]>,
             _mode: SubmitMode,
-            _context: &TopicAdmittanceContext,
+            _context: &TopicAdmittanceContext<'_>,
         ) -> Result<AdmittanceInstructions, TopicManagerError> {
             Ok(AdmittanceInstructions {
                 outputs_to_admit: self.admit_indices.clone(),
@@ -6365,7 +6424,7 @@ mod tests {
                 _previous_coins: &[u8],
                 _off_chain_values: Option<&[u8]>,
                 _mode: SubmitMode,
-                _context: &TopicAdmittanceContext,
+                _context: &TopicAdmittanceContext<'_>,
             ) -> Result<AdmittanceInstructions, TopicManagerError> {
                 *self.0.borrow_mut() = Some(tx.id());
                 Ok(AdmittanceInstructions {

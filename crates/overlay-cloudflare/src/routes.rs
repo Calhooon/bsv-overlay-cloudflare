@@ -513,6 +513,9 @@ async fn build_health_response(
         all_checks.retain(|c| c.get("scope").and_then(|v| v.as_str()) == Some(scope));
     }
 
+    // Read the runtime trait inventory from the registered engine. Failure to
+    // construct it is an unavailable inventory, never an atomicity claim.
+    let admission = crate::build_engine_from_env(env).await.ok().map(|engine| engine.admission_shape());
     let body = serde_json::json!({
         "status": "ok",
         "live": true,
@@ -528,6 +531,7 @@ async fn build_health_response(
             "lookupServiceCount": services.len(),
         },
         "checks": all_checks,
+        "admission": admission,
         "build": bsv_worker_build_info::build_json!(),
     });
     json_ok(&body)

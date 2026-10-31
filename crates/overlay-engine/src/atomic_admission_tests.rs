@@ -29,7 +29,7 @@ impl TopicManager for RegistryManager {
         previous: &[u8],
         _: Option<&[u8]>,
         _: SubmitMode,
-        _: &TopicAdmittanceContext,
+        _: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         // TYPE 2 over the held coin; TYPE 1 if a refused attempt deleted it.
         Ok(AdmittanceInstructions {
@@ -58,7 +58,7 @@ impl TopicManager for ProofManager {
         _: &[u8],
         _: Option<&[u8]>,
         _: SubmitMode,
-        _: &TopicAdmittanceContext,
+        _: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         Ok(AdmittanceInstructions {
             outputs_to_admit: vec![2],
@@ -76,6 +76,18 @@ impl TopicManager for ProofManager {
 struct RefusingLookup(Index);
 #[async_trait(?Send)]
 impl LookupService for RefusingLookup {
+    fn is_staged(&self) -> bool { true }
+    async fn stage_admitted(&self, payload: &OutputAdmittedByTopic, unit: &mut dyn crate::storage::AdmissionUnit) -> Result<(), crate::lookup_service::LookupRefusal> {
+        let OutputAdmittedByTopic::LockingScript { txid, output_index, topic, .. } = payload else { unreachable!() };
+        if topic == REGISTRY && *output_index == 2 {
+            return Err(crate::lookup_service::LookupRefusal::Deterministic(REFUSAL.into()));
+        }
+        unit.stage(crate::storage::StagedWrite::new(super::MemoryWrite::Increment {
+            table: "lookup_index".into(), key: format!("{txid}:{output_index}:{topic}")
+        }, (txid.len() + topic.len() + 4) as u64));
+        Ok(())
+    }
+    async fn after_commit(&self, _: &[OutputAdmittedByTopic], _: &[OutputSpent]) -> Result<(), LookupServiceError> { Ok(()) }
     fn admission_mode(&self) -> AdmissionMode {
         AdmissionMode::LockingScript
     }
@@ -126,6 +138,7 @@ impl LookupService for RefusingLookup {
 // transactions, applied rows, metadata, sync/deferred tables and the LS index.
 fn snapshot(store: &MemoryStorage, index: &Index) -> Vec<u8> {
     let mut tables = BTreeMap::new();
+    tables.insert("admission", store.admission_snapshot());
     macro_rules! rows {
         ($name:expr, $value:expr) => {{
             let held = $value.lock().unwrap();
@@ -229,17 +242,12 @@ async fn fixture() -> (Engine, Rc<MemoryStorage>, Index, TaggedBEEF, String) {
 }
 
 fn refused(report: &MutationReport) {
-    assert_eq!(
-        report.faults.len(),
-        1,
-        "fixture must reach exactly the intended refusal"
-    );
-    assert_eq!(report.faults[0].topic, REGISTRY);
-    assert_eq!(
-        report.faults[0].site,
-        "lookup_service.output_admitted_by_topic"
-    );
-    assert_eq!(report.faults[0].error, REFUSAL);
+    assert!(report.faults.is_empty());
+    let refusal = report.refused.as_ref().expect("deterministic refusal");
+    assert_eq!(refusal.topic, REGISTRY);
+    assert_eq!(refusal.site, "lookup_service.stage_admitted");
+    assert_eq!(refusal.class, "deterministic");
+    assert_eq!(refusal.reason, REFUSAL);
 }
 
 #[tokio::test]

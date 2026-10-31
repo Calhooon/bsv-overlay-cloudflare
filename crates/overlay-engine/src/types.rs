@@ -196,8 +196,10 @@ pub enum SyncTarget {
 /// real admission) or `TopicAdmittanceContext::DRY_RUN`, so a later field is
 /// not a breaking change for a manager.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TopicAdmittanceContext {
+#[derive(Default)]
+pub struct TopicAdmittanceContext<'a> {
+    /// Proposed unit channel for the keeper. None on every dry judgement.
+    pub unit: Option<std::cell::RefCell<&'a mut dyn crate::storage::AdmissionUnit>>,
     /// `true`: the engine is only ASKING what the manager would admit (the
     /// GASP walk over a peer's node, the anchor replay of a peer's graph) and
     /// nothing is admitted on this call. The manager must leave NO durable
@@ -209,9 +211,18 @@ pub struct TopicAdmittanceContext {
     pub dry_run: bool,
 }
 
-impl TopicAdmittanceContext {
+impl<'a> TopicAdmittanceContext<'a> {
+    pub fn with_unit(unit: &'a mut dyn crate::storage::AdmissionUnit) -> Self {
+        Self {
+            dry_run: false,
+            unit: Some(std::cell::RefCell::new(unit)),
+        }
+    }
     /// The context of a dry run (`dry_run: true`).
-    pub const DRY_RUN: Self = Self { dry_run: true };
+    pub const DRY_RUN: Self = Self {
+        dry_run: true,
+        unit: None,
+    };
 }
 
 /// Mode for transaction submission to the Engine.

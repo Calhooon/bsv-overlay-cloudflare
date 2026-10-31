@@ -61,7 +61,7 @@ impl TopicManager for ProofTopicManager {
         _off_chain_values: Option<&[u8]>,
         _mode: SubmitMode,
         // Pure: this manager holds no state, so a dry run is the same work.
-        _context: &TopicAdmittanceContext,
+        _context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         let mut outputs_to_admit = Vec::new();
 

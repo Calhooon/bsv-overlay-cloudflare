@@ -94,7 +94,7 @@ impl TopicManager for AdmitOutputZero {
         _: &[u8],
         _: Option<&[u8]>,
         _: SubmitMode,
-        _context: &TopicAdmittanceContext,
+        _context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         Ok(AdmittanceInstructions {
             outputs_to_admit: vec![0],
@@ -955,7 +955,7 @@ impl TopicManager for AdmitsOneOutput {
         _: &[u8],
         _: Option<&[u8]>,
         _: SubmitMode,
-        _context: &TopicAdmittanceContext,
+        _context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError> {
         if tx.outputs.len() != 1 {
             return Ok(AdmittanceInstructions::default());

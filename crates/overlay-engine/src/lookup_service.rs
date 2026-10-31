@@ -16,6 +16,16 @@ use crate::types::{
 #[cfg(test)]
 use crate::types::UTXOReference;
 
+/// Proposed refusal classes for the keeper. A deterministic refusal changes no
+/// admission state; a transient refusal invites a later attempt.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LookupRefusal {
+    #[error("{0}")]
+    Deterministic(String),
+    #[error("{0}")]
+    Transient(String),
+}
+
 /// Indexes overlay outputs and answers lookup queries.
 ///
 /// Implementations handle specific types of data — e.g., SHIPLookupService
@@ -25,6 +35,53 @@ use crate::types::UTXOReference;
 /// etc.) during transaction processing, and `lookup()` when clients query.
 #[async_trait(?Send)]
 pub trait LookupService {
+    /// Proposed runtime migration flag for the keeper, exposed by health.
+    fn is_staged(&self) -> bool {
+        false
+    }
+
+    /// Proposed staged hook. Never call a legacy writing hook here.
+    async fn stage_admitted(
+        &self,
+        _payload: &OutputAdmittedByTopic,
+        _unit: &mut dyn crate::storage::AdmissionUnit,
+    ) -> Result<(), LookupRefusal> {
+        Ok(())
+    }
+
+    /// Proposed staged spent hook. Writes and events belong to the unit.
+    async fn stage_spent(
+        &self,
+        _payload: &OutputSpent,
+        _unit: &mut dyn crate::storage::AdmissionUnit,
+    ) -> Result<(), LookupRefusal> {
+        Ok(())
+    }
+
+    /// Proposed post-commit bridge. Its failure is counted with the applied
+    /// row kept. Staged services override this for their external effects.
+    async fn after_commit(
+        &self,
+        admitted: &[OutputAdmittedByTopic],
+        spent: &[OutputSpent],
+    ) -> Result<(), LookupServiceError> {
+        if self.is_staged() {
+            return Ok(());
+        }
+        let mut first = None;
+        for payload in spent {
+            if let Err(e) = self.output_spent(payload).await {
+                first.get_or_insert(e);
+            }
+        }
+        for payload in admitted {
+            if let Err(e) = self.output_admitted_by_topic(payload).await {
+                first.get_or_insert(e);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
     /// How the Engine should deliver data when an output is admitted.
     /// - `LockingScript`: provides txid, outputIndex, topic, satoshis, locking script
     /// - `WholeTx`: provides the entire Atomic BEEF
@@ -61,8 +118,10 @@ pub trait LookupService {
     /// Payload shape depends on `admission_mode()`.
     async fn output_admitted_by_topic(
         &self,
-        payload: &OutputAdmittedByTopic,
-    ) -> Result<(), LookupServiceError>;
+        _payload: &OutputAdmittedByTopic,
+    ) -> Result<(), LookupServiceError> {
+        Ok(())
+    }
 
     /// Called when a previously-admitted UTXO is spent.
     ///

@@ -20,6 +20,14 @@ use crate::types::{
 /// token transfers.
 #[async_trait(?Send)]
 pub trait TopicManager {
+    /// Proposed keeper-facing guard classifier. Fresh reads only. A lost
+    /// head race must return Contest, terminal for the submitted bytes.
+    async fn guard_lost(&self, _check: &dyn std::any::Any) -> crate::storage::PreconditionVerdict {
+        crate::storage::PreconditionVerdict::NotNow {
+            reason: "guard verdict unavailable".into(),
+        }
+    }
+
     /// Examine a transaction and return instructions indicating which
     /// outputs should be admitted into this topic.
     ///
@@ -62,7 +70,7 @@ pub trait TopicManager {
         previous_coins: &[u8],
         off_chain_values: Option<&[u8]>,
         mode: SubmitMode,
-        context: &TopicAdmittanceContext,
+        context: &TopicAdmittanceContext<'_>,
     ) -> Result<AdmittanceInstructions, TopicManagerError>;
 
     /// Identify which inputs are needed to validate this transaction for GASP sync.
@@ -142,7 +150,7 @@ mod tests {
             _previous_coins: &[u8],
             _off_chain_values: Option<&[u8]>,
             _mode: SubmitMode,
-            _context: &TopicAdmittanceContext,
+            _context: &TopicAdmittanceContext<'_>,
         ) -> Result<AdmittanceInstructions, TopicManagerError> {
             Ok(AdmittanceInstructions {
                 outputs_to_admit: vec![0, 1, 2],
@@ -175,7 +183,7 @@ mod tests {
             _previous_coins: &[u8],
             _off_chain_values: Option<&[u8]>,
             _mode: SubmitMode,
-            _context: &TopicAdmittanceContext,
+            _context: &TopicAdmittanceContext<'_>,
         ) -> Result<AdmittanceInstructions, TopicManagerError> {
             Ok(AdmittanceInstructions::default())
         }
