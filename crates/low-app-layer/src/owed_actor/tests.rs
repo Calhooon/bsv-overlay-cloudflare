@@ -15875,7 +15875,7 @@ mod d2_actor_f_fold {
         record
             .conn
             .execute(
-                "INSERT OR REPLACE INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'2026-10-30 00:00:00','arcade',?2)",
+                "INSERT INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'2026-10-30 00:00:00','arcade',?2) ON CONFLICT(txid) DO UPDATE SET seenAt=excluded.seenAt, seenSource=excluded.seenSource, sourceAtMs=excluded.sourceAtMs",
                 rusqlite::params![pot, NOW_MS as i64],
             )
             .unwrap();
