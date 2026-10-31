@@ -431,10 +431,18 @@ mod pins {
                 .unwrap()
                 .map(Result::unwrap)
                 .collect();
+            // D2-ACTOR-F: a carried source reads its marks and its row once each into a one-row co-routine over a
+            // constant row (`row_and_payload!`); scanning THAT co-routine reads no table, so it is allowed by name
+            // and only where the plan built it (every table is still a SEARCH)
+            let coroutines: Vec<String> = plan
+                .iter()
+                .filter_map(|l| l.strip_prefix("CO-ROUTINE ").map(str::to_string))
+                .collect();
             assert!(
                 plan.iter().all(|l| !l.starts_with("SCAN")
                     || l.contains("json_each")
-                    || l.contains("CONSTANT")),
+                    || l.contains("CONSTANT")
+                    || coroutines.iter().any(|c| l == &format!("SCAN {c}"))),
                 "{source}: a facts read scans: {plan:?}"
             );
         }
