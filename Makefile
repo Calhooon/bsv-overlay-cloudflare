@@ -522,6 +522,10 @@ ci-d1-board: gate-output-dirs
 # RUNTIME is also SEALED (`MINIFLARE_WORKERD_PATH` = `tools/lane-731/workerd-sealed.sh`, `sandbox-exec` with
 # `loopback-only.sb`): a missed ask fails closed instead of reaching mainnet; `D1_EGRESS_SEAL=0` runs unsealed (the
 # guard still reds). A red cell prints the guard's verdict over the logs so far.
+# FIX-TIER-RING (bsv-low #998's follow-up): every tier app layer renders `OWED_FLEET_COMPARE_PER_TICK=0`, the fleet
+# compare ring PAUSED, so no cell meets its ten-second shard writes on the local SQLite (which answers SQLITE_BUSY where
+# Cloudflare's D1 serialises); the ring's own cells (`owed-fleet-compare-*`, in tools/lane-893/owed_belt_tick.sh) render
+# it at 16. Pinned by `fix_tier_ring_a` (owed_actor/tests.rs).
 ci-d1-budget: gate-output-dirs
 	@if [ "$${OWED_READ_ONLY:-0}" = "1" ]; then exec bash tools/lane-499/owed_read_budget.sh; fi; \
 	if [ "$${OWED_BELT_ONLY:-0}" = "1" ]; then exec bash tools/lane-893/owed_belt_tick.sh; fi; \
@@ -611,6 +615,7 @@ ci-d1-budget: gate-output-dirs
 	    --var AUTH_ENFORCE:false --var SESSION_LANE:false \
 	    --var INTERNAL_TOKEN:ci-internal-tok \
 	    --var COURIER_SINK:http://127.0.0.1:9 \
+	    --var OWED_FLEET_COMPARE_PER_TICK:0 \
 	) > "$$app_log" 2>&1 & \
 	job_pids="$$job_pids $$!"; \
 	wait_up http://127.0.0.1:$$PA/health "$$app_log" "app layer"; \

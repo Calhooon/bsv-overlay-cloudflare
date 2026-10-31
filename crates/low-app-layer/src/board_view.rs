@@ -86,6 +86,10 @@ impl DurableObject for BoardView {
     }
 }
 
+/// FIX-TIER-RING: a fleet compare shard's consecutive busy ticks, in its own storage (never D1, whose lock it backs
+/// off from).
+const FLEET_COMPARE_BUSY_KEY: &str = "owed-fleet-compare-busy";
+
 impl BoardView {
     /// bsv-low #731: the owed belt asks couriers from this actor's isolate, which may never have run the front
     /// door's entry, so the actor installs the courier sink itself.
@@ -262,7 +266,41 @@ impl BoardView {
             storage
                 .set_alarm(crate::owed_actor::compare::FLEET_COMPARE_TICK_MS)
                 .await?;
-            return crate::owed_actor::object::fleet_compare_tick_env(&self.env, shard).await;
+            // FIX-TIER-RING: a tick never throws out of the alarm (its next alarm is already set), and a tick a
+            // transient D1 fault ended (`faultKind`, a local `SQLITE_BUSY` above all) moves its next alarm out by
+            // `busy_backoff_ms` of its consecutive busy ticks, reset by the next tick that is not.
+            let mut response =
+                match crate::owed_actor::object::fleet_compare_tick_env(&self.env, shard).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        console_warn!("[owed-fleet-compare] shard {shard} tick threw: {e}");
+                        return Response::error(format!("fleet compare tick: {e}"), 503);
+                    }
+                };
+            let busy = match response.cloned() {
+                Ok(mut c) => c
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .is_some_and(|b| b["faultKind"].is_string()),
+                Err(_) => false,
+            };
+            let streak = storage
+                .get::<u32>(FLEET_COMPARE_BUSY_KEY)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            if busy {
+                let n = streak.saturating_add(1);
+                storage.put(FLEET_COMPARE_BUSY_KEY, n).await?;
+                storage
+                    .set_alarm(crate::owed_actor::compare::busy_backoff_ms(n))
+                    .await?;
+            } else if streak > 0 {
+                storage.delete(FLEET_COMPARE_BUSY_KEY).await?;
+            }
+            return Ok(response);
         }
         if !storage.get::<bool>("owed-belt").await?.unwrap_or(false) {
             storage.delete_all().await?;

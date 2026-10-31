@@ -11539,6 +11539,12 @@ fn fix988_b_a_courier_bytes_payout_asks_its_hop_until_the_sweep_mines_then_its_h
 // ---------------------------------------------------------------------------------------------------------------------
 // FIX-986-COMPARE-2 (bsv-low #986; READ-986 items 1 and 4): the operator route judges D1 FRESH; the standing ring.
 
+thread_local! {
+    /// The text `Fix986`'s record faults with, and whether the fault is ONCE (the record answers again after it):
+    /// "the invocation ended" for good by default; FIX-TIER-RING's pins set a local SQLite's `SQLITE_BUSY`.
+    static FIX986_FAULT: Cell<(&'static str, bool)> = const { Cell::new(("the invocation ended (pin)", false)) };
+}
+
 /// The compare's port: the record as the D1 judge reads it (`d1`), each identity's actor as its mirror (`actors`),
 /// the phase's flag, and a record that faults after `die_after` more calls (a tick the platform ends).
 struct Fix986<'a> {
@@ -11550,7 +11556,11 @@ struct Fix986<'a> {
 impl SqlPort for Fix986<'_> {
     async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
         if self.die_after.get() == 0 {
-            return Err("the invocation ended (pin)".into());
+            let (text, once) = FIX986_FAULT.with(Cell::get);
+            if once {
+                self.die_after.set(u32::MAX);
+            }
+            return Err(text.into());
         }
         self.die_after.set(self.die_after.get() - 1);
         self.d1.run_batch(stmts).await
@@ -12846,6 +12856,163 @@ async fn fix998s_b_the_ring_writes_the_snapshot_and_the_public_read_is_one_row()
     assert!(routes.contains("body[\"owedActor\"][\"fleetCompare\"]=fleet_compare;"));
     let ring = squash(include_str!("compare.rs"));
     assert!(ring.contains("end.push(fleet_health_stmt(now,shards,report.wrapped));"));
+}
+
+// ── FIX-TIER-RING (bsv-low #998's follow-up): the tier pauses the ring; a busy shard backs off, never faults ──
+
+/// pr247's own stderr line (the land of 2026-10-31T01:06Z), as `wrangler dev`'s D1 answers it.
+const FIX_TIER_RING_BUSY: &str = "D1_ERROR: internal error; workerd/util/sqlite.c++:901: failed: SQLite failed; dbErrorMessage(prepareResult, db) = database is locked: SQLITE_BUSY";
+
+/// (fix_tier_ring_a) THE BUDGET TIER RENDERS THE RING PAUSED. Every tier app layer (the Makefile's, the #934 cell's,
+/// the owed read and backfill tiers') renders `OWED_FLEET_COMPARE_PER_TICK` 0, which pauses the ring
+/// (`per_tick_of`); the belt tier, where the ring's own cells run, renders 16; the production and beta render sets
+/// none (the default, 16).
+#[test]
+fn fix_tier_ring_a_the_tier_renders_the_ring_paused() {
+    let var = compare::PER_TICK_VAR;
+    assert_eq!(var, "OWED_FLEET_COMPARE_PER_TICK");
+    assert_eq!(compare::per_tick_of(Some("0")), 0, "0 pauses the ring");
+    let makefile = include_str!("../../../../Makefile");
+    let target = makefile
+        .split("\nci-d1-budget: gate-output-dirs\n")
+        .nth(1)
+        .expect("the tier's target");
+    let app = target
+        .split("( cd crates/low-app-layer && exec env $$seal npx wrangler dev")
+        .nth(1)
+        .expect("the tier's app layer launch");
+    let launch = &app[..app.find(") > \"$$app_log\"").expect("the launch's end")];
+    assert!(
+        launch.contains(&format!("--var {var}:0 ")),
+        "the tier's app layer renders the ring paused: {launch}"
+    );
+    for (cell, text) in [
+        (
+            "lane-934",
+            include_str!("../../../../tools/lane-934/tx_word_burst_route_ci.mjs"),
+        ),
+        (
+            "owed read",
+            include_str!("../../../../tools/lane-499/owed_read_budget.sh"),
+        ),
+        (
+            "owed backfill",
+            include_str!("../../../../tools/lane-893/owed_backfill_pass.sh"),
+        ),
+    ] {
+        assert!(
+            text.contains(&format!("\n{var} = \"0\"\n")),
+            "{cell} renders the ring paused"
+        );
+    }
+    let belt = include_str!("../../../../tools/lane-893/owed_belt_tick.sh");
+    assert!(
+        belt.contains(&format!("\n{var} = \"16\"\n")),
+        "the ring's own cells render it running"
+    );
+    assert!(belt.contains("node tools/lane-893/owed_fleet_compare.mjs"));
+    let renders = include_str!("../../wrangler.toml");
+    assert!(
+        !renders.contains(var),
+        "the prod and beta renders are untouched"
+    );
+}
+
+/// (fix_tier_ring_b) A SHARD WHOSE WRITE ANSWERS SQLITE_BUSY ENDS ITS TICK, COUNTS THE FAULT AND BACKS OFF. The
+/// tick's first write (the Phase C flip it observes) meets the local SQLite's lock once: the tick answers `Ok`, stopped
+/// "busy", one fault of kind `busy`, counted on the shard's ring row and served on the route's `tickFaults`; the
+/// next tick compares as before. A fault that is not transient stays the tick's `Err`. The alarm's back-off doubles
+/// from the tick to 160 s and the alarm never throws. RED on main: the tick answered the BUSY as its `Err`.
+#[tokio::test]
+async fn fix_tier_ring_b_a_busy_write_ends_the_tick_counts_and_backs_off() {
+    assert_eq!(
+        compare::transient_fault_kind(FIX_TIER_RING_BUSY),
+        Some("busy")
+    );
+    assert_eq!(
+        compare::transient_fault_kind(
+            "D1_ERROR: D1 DB is overloaded. Requests queued for too long."
+        ),
+        Some("transient")
+    );
+    assert_eq!(
+        compare::transient_fault_kind("the invocation ended (pin)"),
+        None
+    );
+    let (d1, ids, actors) = fix986_fleet(3).await;
+    let port = Fix986 {
+        d1: &d1,
+        actors,
+        judges: false,
+        die_after: Cell::new(1),
+    };
+    FIX986_FAULT.with(|f| f.set((FIX_TIER_RING_BUSY, true)));
+    let now = NOW_MS as i64;
+    let busy = compare::ring_tick(&port, now, 0, 1, 3, || 0).await;
+    FIX986_FAULT.with(|f| f.set(("the invocation ended (pin)", false)));
+    let busy = busy.expect("a busy write ends the tick, never as its Err");
+    assert_eq!(
+        (
+            busy.stopped,
+            busy.fault_kind,
+            busy.faults,
+            busy.compared.len()
+        ),
+        (Some("busy"), Some("busy"), 1, 0),
+        "{busy:?}"
+    );
+    let ring: Value = serde_json::from_str(
+        &d1.conn
+            .query_row(
+                "SELECT cursor FROM owed_belt_state WHERE name='fleet-compare:ring'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        ring["tickFaults"]["busy"], 1,
+        "counted on the shard's row: {ring}"
+    );
+    assert_eq!(ring["lastFault"]["kind"], "busy");
+    let next = compare::ring_tick(&port, now + 10_000, 0, 1, 3, || 0)
+        .await
+        .unwrap();
+    assert_eq!(next.compared, ids, "the next tick compares as before");
+    assert_eq!(next.fault_kind, None);
+    let answer = compare::read_answer(&d1, "", "", now + 20_000, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        answer["tickFaults"]["busy"], 1,
+        "served: {}",
+        answer["tickFaults"]
+    );
+    assert_eq!(answer["shards"][0]["tickFaults"]["busy"], 1);
+    // A fault that is not transient stays the tick's Err (the platform ended it).
+    port.die_after.set(0);
+    assert!(compare::ring_tick(&port, now + 30_000, 0, 1, 3, || 0)
+        .await
+        .is_err());
+    // The alarm's back-off: the tick doubled per consecutive busy tick, bounded; reset by a tick that is not.
+    assert_eq!(compare::busy_backoff_ms(0), compare::FLEET_COMPARE_TICK_MS);
+    assert_eq!(compare::busy_backoff_ms(1), 20_000);
+    assert_eq!(compare::busy_backoff_ms(4), 160_000);
+    assert_eq!(compare::busy_backoff_ms(40), 160_000);
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let alarm = squash(include_str!("../board_view.rs"));
+    assert!(alarm.contains("matchcrate::owed_actor::object::fleet_compare_tick_env(&self.env,shard).await{Ok(r)=>r,Err(e)=>{"), "the alarm never throws the tick");
+    assert!(
+        alarm.contains(".set_alarm(crate::owed_actor::compare::busy_backoff_ms(n))"),
+        "a busy tick backs off"
+    );
+    assert!(
+        alarm.contains("storage.delete(FLEET_COMPARE_BUSY_KEY)"),
+        "reset by a tick that is not busy"
+    );
+    let object = squash(include_str!("object.rs"));
+    assert!(object.contains("\"faultKind\":r.fault_kind,"));
 }
 
 // ── bsv-low #986 (READ-986 item 3, FIX-986): the actor's facts for a game equal the D1 read's by construction ──
