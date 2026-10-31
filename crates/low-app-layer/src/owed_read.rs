@@ -29,8 +29,11 @@ pub const STATE_SQL: &str =
 ///
 /// bsv-low #1004 (lane FIX-1004, L55 S4): `framed`, every mark an EVENT carries (`gameId`, `generation`), i.e. every
 /// source but [`UNFRAMED_SOURCES`]: the actor's read counts only those of them its last apply has not covered
-/// ([`Snapshot::actor_pending`]), never D1's whole count.
-pub const PENDING_SQL: &str = "SELECT COUNT(*) AS pending,json_group_array(CASE WHEN downgrade=1 THEN json_array(gameId,source,generation) END) AS downgrades,json_group_array(CASE WHEN source NOT IN ('age','backfill','wanted') THEN json_array(gameId,generation) END) AS framed,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-actor-judged') AS actorJudged,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-v3') AS owedV3 FROM owed_dirty WHERE identity=?1";
+/// ([`Snapshot::actor_pending`]), never D1's whole count. The list is three `<>` terms, never `NOT IN`: an IN list
+/// is an ephemeral table SQLite probes once a mark, and D1 counts each probe a row read (the budget tier's
+/// `owed-first-read`, lane FIX-1004-FOLD: the largest statement 19 to 37 with `NOT IN`, pinned by
+/// `fix1004f_the_pending_read_probes_no_ephemeral_table`).
+pub const PENDING_SQL: &str = "SELECT COUNT(*) AS pending,json_group_array(CASE WHEN downgrade=1 THEN json_array(gameId,source,generation) END) AS downgrades,json_group_array(CASE WHEN source<>'age' AND source<>'backfill' AND source<>'wanted' THEN json_array(gameId,generation) END) AS framed,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-actor-judged') AS actorJudged,(SELECT COUNT(*) FROM view_derivation_state WHERE name='owed-v3') AS owedV3 FROM owed_dirty WHERE identity=?1";
 /// bsv-low #1004: the mark sources no writer's event carries. An `age` mark (the drain's daily re-mark of D1 rows
 /// judged a day ago: in Phase C D1's `owed_rows` have no writer, so the same oldest subjects were re-marked on every
 /// scheduled pass), a `backfill` mark (the one-time backfill, a wanted envelope's rest, the reconcile's rest) and a
