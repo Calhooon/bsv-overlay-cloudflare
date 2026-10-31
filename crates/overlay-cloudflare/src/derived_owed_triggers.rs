@@ -517,8 +517,32 @@ pub const TX_DELETE: &str = trigger!(
          UNION ALL SELECT pp.identity,pp.gameId FROM potparty_records pp INDEXED BY idx_potparty_pot WHERE pp.potTxid=OLD.txid"
     )
 );
-/// A party filed or admitted: the OTHER seats of its pot (`results::seat_markers_sql` reads both seats' rows), which
-/// `PARTY_INSERT` (the filer's own subject) never marked. The same pair, so the publish carries the row to them too.
+/// The seat a party row's filing reaches (bsv-low #1010; FIX-1010-BUDGET): the OTHER seat of its pot, bounded by the
+/// pot's COMMITTED seats, never by every party row a stranger filed on the pot. `results::seat_markers_sql` reads a
+/// pot's party rows only under the two settle keys its lock committed (`pot_records.pubA`, `pubB`), so a row whose
+/// own key is not one of them (a keyless v1 filing, a stranger's own key) changes no seat's judgement and marks nobody
+/// here: the filer's key is checked first, on NEW, before any row is read. A row under a committed key is read by
+/// the OTHER seat's judgement: the opponent the row names, marked only when that identity holds its own VERIFIED row
+/// (`sigValid = 1`) on this pot under a committed key, read by `idx_party_verified_identity` (an index seek on the
+/// opponent, its verdict and the pot) and the pot by its primary key, at most two rows. A stranger naming a victim
+/// marks the victim only when the victim IS a seat of the pot, one mark a filing; the strangers already on the pot
+/// are never read. As first built (0c80ed5c) the trigger read and marked every other party row of the pot
+/// (`idx_potparty_pot`): K rows and K marks a filing on a pot of K rows, refused by the budget tier's
+/// `record-potparty-filing` (7 rows in one statement against 3). Edited in place: migrations 480 to 493 shipped on
+/// no D1. `$filer_key` is the filer's key test over `p` (the update's is OLD's or NEW's).
+macro_rules! party_seat_subjects {
+    ($filer_key:literal) => {
+        concat!(
+            "SELECT pp.identity,pp.gameId FROM pot_records p CROSS JOIN potparty_records pp INDEXED BY idx_party_verified_identity ",
+            "ON pp.identity=NEW.opponentIdentity AND pp.sigValid=1 AND lower(pp.potTxid)=lower(p.txid) AND pp.potVout=p.outputIndex ",
+            "AND pp.seatSettlePubkey IS NOT NULL AND pp.seatSettlePubkey IN (p.pubA,p.pubB) ",
+            "WHERE p.txid=NEW.potTxid AND p.outputIndex=NEW.potVout AND ", $filer_key,
+            " AND (pp.identity IS NOT NEW.identity OR pp.gameId IS NOT NEW.gameId)"
+        )
+    };
+}
+/// A party filed or admitted: the other seat of its pot ([`party_seat_subjects`]), which `PARTY_INSERT` (the filer's
+/// own subject) never marked. The same pair, so the publish carries the row to it too.
 pub const PARTY_INSERT_SEATS: &str = trigger!(
     "potparty_records",
     insert_seats,
@@ -527,11 +551,12 @@ pub const PARTY_INSERT_SEATS: &str = trigger!(
         "party",
         "NEW.txid",
         created_at!("NEW"),
-        "SELECT pp.identity,pp.gameId FROM potparty_records pp INDEXED BY idx_potparty_pot WHERE pp.potTxid=NEW.potTxid AND pp.potVout=NEW.potVout AND (pp.identity IS NOT NEW.identity OR pp.gameId IS NOT NEW.gameId)"
+        party_seat_subjects!("NEW.seatSettlePubkey IN (p.pubA,p.pubB)")
     )
 );
-/// A party re-latched (its `sigValid`, its seat's columns): the other seats of its pot, only when a column the seat
-/// read holds moved (an unchanged re-latch marks nothing). A verdict withdrawn is a downgrade.
+/// A party re-latched (its `sigValid`, its seat's columns): the other seat of its pot, only when a column the seat
+/// reads moved (an unchanged re-latch marks nothing) and the row's key, before or after, is committed. A verdict
+/// withdrawn is a downgrade.
 pub const PARTY_UPDATE_SEATS: &str = trigger!(
     "potparty_records",
     update_seats,
@@ -541,7 +566,7 @@ pub const PARTY_UPDATE_SEATS: &str = trigger!(
         "party",
         "NEW.txid",
         created_at!("NEW"),
-        "SELECT pp.identity,pp.gameId FROM potparty_records pp INDEXED BY idx_potparty_pot WHERE pp.potTxid=NEW.potTxid AND pp.potVout=NEW.potVout AND (pp.identity IS NOT NEW.identity OR pp.gameId IS NOT NEW.gameId)",
+        party_seat_subjects!("(NEW.seatSettlePubkey IN (p.pubA,p.pubB) OR OLD.seatSettlePubkey IN (p.pubA,p.pubB))"),
         " WHERE OLD.sigValid IS NOT NEW.sigValid OR OLD.seatSettlePubkey IS NOT NEW.seatSettlePubkey OR OLD.seatSigHex IS NOT NEW.seatSigHex OR OLD.sigHex IS NOT NEW.sigHex OR OLD.recoveryHeight IS NOT NEW.recoveryHeight"
     )
 );

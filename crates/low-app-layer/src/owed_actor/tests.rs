@@ -17291,7 +17291,9 @@ mod fix1010 {
         let d1 = d1_judge(&Fixture {
             name: "fix1010 a seat's pot",
             seed: vec![
-                format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind,paramsDecoded,recoveryHeight) VALUES ('{pot}',0,0,{made},'covenant',1,900100)"),
+                // The pot commits the two seats' keys (FIX-1010-BUDGET: the seat trigger reaches only a verified seat
+                // under a committed key).
+                format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind,paramsDecoded,recoveryHeight,pubA,pubB) VALUES ('{pot}',0,0,{made},'covenant',1,900100,'ka','kb')"),
                 party("owner", "other", &h("c4", 1), "ka"),
             ],
             identities: vec!["owner".into()],

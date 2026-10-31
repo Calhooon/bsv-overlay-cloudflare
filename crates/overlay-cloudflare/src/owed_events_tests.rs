@@ -182,8 +182,8 @@ mod pins {
             "owed_dirty_proof_posts_insert" => (format!("INSERT OR REPLACE INTO proof_posts(gameId,winner,sigHex,bundle,createdAt,bundleValid) VALUES('{GAME}','{ID}','s',x'00',1,1)"), "proof", GAME.into()),
             "owed_dirty_result_markers_v2_update" => (format!("INSERT INTO result_markers_v2(gameId,winner,loser,txid,outputIndex,createdAt) VALUES('{GAME}','{ID}','opp','result0',0,1); DELETE FROM owed_dirty; UPDATE result_markers_v2 SET claimValid=2 WHERE txid='result0'"), "result", "result0".into()),
             "owed_dirty_transactions_delete" => (format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES('{ID}','{GAME}','{HOP}',1,'{SPENDER}','00','sweep0',0,1); INSERT INTO transactions(txid,beef,has_proof) VALUES('{SPENDER}',x'00',1); DELETE FROM owed_dirty; DELETE FROM transactions WHERE txid='{SPENDER}'"), "beef", SPENDER.into()),
-            "owed_dirty_potparty_records_insert_seats" => (format!("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt) VALUES('opp','{ID}','{GAME}','{POT}',0,1,'00','party1',0,1)"), "party", "party1".into()),
-            "owed_dirty_potparty_records_update_seats" => (format!("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt) VALUES('opp','{ID}','{GAME}','{POT}',0,1,'00','party1',0,1); DELETE FROM owed_dirty; UPDATE potparty_records SET sigValid=1 WHERE txid='party1'"), "party", "party1".into()),
+            "owed_dirty_potparty_records_insert_seats" => (format!("UPDATE pot_records SET pubA='k',pubB='z' WHERE txid='{POT}'; UPDATE potparty_records SET seatSettlePubkey='k',sigValid=1 WHERE txid='party0'; DELETE FROM owed_dirty; INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,seatSettlePubkey,txid,outputIndex,createdAt) VALUES('opp','{ID}','{GAME}','{POT}',0,1,'00','z','party1',0,1)"), "party", "party1".into()),
+            "owed_dirty_potparty_records_update_seats" => (format!("UPDATE pot_records SET pubA='k',pubB='z' WHERE txid='{POT}'; UPDATE potparty_records SET seatSettlePubkey='k',sigValid=1 WHERE txid='party0'; INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,seatSettlePubkey,txid,outputIndex,createdAt) VALUES('opp','{ID}','{GAME}','{POT}',0,1,'00','z','party1',0,1); DELETE FROM owed_dirty; UPDATE potparty_records SET sigValid=1 WHERE txid='party1'"), "party", "party1".into()),
             "owed_dirty_pot_records_insert_seats" => (format!("DELETE FROM pot_records; DELETE FROM owed_dirty; INSERT INTO pot_records(txid,outputIndex,spent,createdAt,pubA,pubB) VALUES('{POT}',0,0,1,'k','z')"), "pot", pot),
             "owed_dirty_pot_records_update_seats" => (format!("UPDATE pot_records SET pubA='k',pubB='z' WHERE txid='{POT}'"), "pot", pot),
             "owed_dirty_pot_records_delete_seats" => (format!("UPDATE pot_records SET pubA='k',pubB='z' WHERE txid='{POT}'; DELETE FROM owed_dirty; DELETE FROM pot_records WHERE txid='{POT}'"), "pot", pot),
@@ -763,5 +763,153 @@ mod pins {
         assert!(lib.contains(
             "crate::owed_events::publish_before_answer(&env, crate::tracker_events::drain()).await"
         ));
+    }
+
+    /// FIX-1010-BUDGET (bsv-low #1010, the land's `record-potparty-filing` refusal): A PARTY FILING MARKS THE POT'S
+    /// COMMITTED SEAT ALONE, IN A BOUNDED READ. A pot committing `ka`/`kb`, its two verified seats A and B, and a pile of
+    /// stranger rows (unverified copies of a committed key, verified rows under their own keys, keyless rows, naming A or B; a verified row under a committed key is that key's holder, a seat, since its seat signature needs the key). Then: a
+    /// keyless stranger filing naming A (the tier's shape) marks only its own pair; a stranger under a committed key
+    /// naming A marks A and itself, no stranger; a stranger naming a stranger who holds a verified row under its own key
+    /// marks nobody else; B's own filing reaches A, A's re-latch reaches B (the two seats, exactly). The insert's VM
+    /// steps are the same over 5 and 200 strangers, and the trigger's read is two index seeks (the pot by its key, the
+    /// opponent's verified row): no SCAN. RED on 0c80ed5c: every stranger on the pot marked and the steps growing.
+    #[test]
+    fn fix1010_budget_a_party_filing_marks_the_pots_committed_seat_alone() {
+        const P: &str = "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1";
+        let party = |id: &str, opp: &str, key: Option<&str>, valid: i64, txid: &str| {
+            format!(
+                "INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,seatSettlePubkey,txid,outputIndex,createdAt,sigValid) VALUES('{id}','{opp}','g','{P}',0,1,'00',{},'{txid}',0,1,{valid});",
+                key.map_or("NULL".to_string(), |k| format!("'{k}'"))
+            )
+        };
+        let setup = |strangers: usize| -> Sqlite {
+            let db = Sqlite::migrated();
+            let mut sql = format!(
+                "INSERT INTO pot_records(txid,outputIndex,spent,createdAt,pubA,pubB) VALUES('{P}',0,0,1,'ka','kb');"
+            );
+            sql += &party("A", "B", Some("ka"), 1, "pa");
+            sql += &party("B", "A", Some("kb"), 1, "pb");
+            for i in 0..strangers {
+                let (key, valid, opp) = match i % 5 {
+                    0 => (Some("ka"), 0, "A"),
+                    1 => (Some("kb"), 0, "B"),
+                    2 => (Some("ks"), 1, "A"),
+                    3 => (None, 0, "B"),
+                    _ => (Some("kt"), 1, "B"),
+                };
+                sql += &party(&format!("S{i}"), opp, key, valid, &format!("s{i}"));
+            }
+            sql += "DELETE FROM owed_dirty;";
+            db.conn.execute_batch(&sql).unwrap();
+            db
+        };
+        let marked = |db: &Sqlite, txid: &str| -> std::collections::BTreeSet<String> {
+            db.marks()
+                .into_iter()
+                .filter(|(_, _, s, k)| s == "party" && k == txid)
+                .map(|(i, ..)| i)
+                .collect()
+        };
+        let set = |ids: &[&str]| {
+            ids.iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let db = setup(5);
+        db.conn
+            .execute_batch(&party("X1", "A", None, 0, "x1"))
+            .unwrap();
+        assert_eq!(
+            marked(&db, "x1"),
+            set(&["X1"]),
+            "a keyless filing reaches no seat (the tier's shape)"
+        );
+        db.conn
+            .execute_batch(&party("X2", "A", Some("ka"), 0, "x2"))
+            .unwrap();
+        assert_eq!(
+            marked(&db, "x2"),
+            set(&["A", "X2"]),
+            "a stranger under a committed key: seat A, no stranger"
+        );
+        db.conn
+            .execute_batch(&party("X3", "S2", Some("kb"), 0, "x3"))
+            .unwrap();
+        assert_eq!(
+            marked(&db, "x3"),
+            set(&["X3"]),
+            "a stranger's verified row under its own key is no seat"
+        );
+        // The honest pair: B files again (its second game row), A's row re-latched.
+        let db = setup(5);
+        db.conn
+            .execute_batch(&format!(
+                "INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,seatSettlePubkey,txid,outputIndex,createdAt,sigValid) VALUES('B','A','g2','{P}',0,1,'00','kb','pb2',0,2,1);"
+            ))
+            .unwrap();
+        assert_eq!(marked(&db, "pb2"), set(&["A", "B"]), "B's filing reaches A");
+        db.conn.execute_batch("DELETE FROM owed_dirty; UPDATE potparty_records SET recoveryHeight=2 WHERE txid='pa';").unwrap();
+        let both: std::collections::BTreeSet<String> = db
+            .marks()
+            .into_iter()
+            .filter(|(_, _, s, k)| s == "party" && k == "pa")
+            .map(|(i, ..)| i)
+            .collect();
+        assert_eq!(
+            both,
+            set(&["A", "B"]),
+            "A's re-latch reaches B: the two seats, exactly"
+        );
+        // Flat in the pile: one filing's VM steps over 5 and over 200 strangers.
+        let steps = |strangers: usize| -> i64 {
+            let db = setup(strangers);
+            let mut q = db
+                .conn
+                .prepare(&party("X9", "A", Some("ka"), 0, "x9"))
+                .unwrap();
+            q.raw_execute().unwrap();
+            q.get_status(rusqlite::StatementStatus::VmStep) as i64
+        };
+        let (small, large) = (steps(5), steps(200));
+        assert_eq!(
+            small, large,
+            "a filing's cost does not follow the pot's pile: {small} against {large}"
+        );
+        // The trigger's read: two seeks, no scan.
+        let subjects = crate::derived_owed::write_time::PARTY_INSERT_SEATS;
+        let select = &subjects[subjects.find("FROM (").unwrap() + "FROM (".len()
+            ..subjects.find(") s WHERE").unwrap()];
+        let bound = select
+            .replace("NEW.opponentIdentity", "'A'")
+            .replace("NEW.identity", "'X'")
+            .replace("NEW.gameId", "'g'")
+            .replace("NEW.potTxid", &format!("'{P}'"))
+            .replace("NEW.potVout", "0")
+            .replace("NEW.seatSettlePubkey", "'ka'");
+        let db = setup(5);
+        let mut q = db
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {bound}"))
+            .unwrap();
+        let plan: Vec<String> = q
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(plan.iter().all(|l| !l.starts_with("SCAN")), "{plan:?}");
+        assert!(
+            plan.iter().any(|l| l
+                .contains("idx_party_verified_identity (identity=? AND sigValid=? AND <expr>=?)")),
+            "{plan:?}"
+        );
+        let rows: Vec<String> = db
+            .conn
+            .prepare(bound.as_str())
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows, vec!["A".to_string()]);
     }
 }
