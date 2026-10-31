@@ -29,17 +29,61 @@ use std::collections::BTreeSet;
 pub const PAYLOAD_MARK_KIND: &str = "payload-mark";
 /// The `applied` kind of a carried domain's generation (seq the generation, game the domain's name, [`CarriedItem::domain`]).
 pub const PAYLOAD_GEN_KIND: &str = "payload-gen";
-/// The `applied` kind of a D1 read's bound per game (seq the marks' bound it read the record at): any apply that read
-/// the record, in every phase (`covered` is written only where the narrowed apply may cover).
+/// The `applied` kind of a D1 read's bound per game: seq the record's HIGH-WATER of `owed_dirty` at the apply's first
+/// record read (`owed_actor::HW_COLUMN`, the AUTOINCREMENT's last generation, in the same statement as the rows), any
+/// apply that read the games' whole key set, in every phase. D2-ACTOR-F-FOLD (the lens's MEDIUM-1): it was the
+/// greatest PENDING mark's generation, written delete-then-insert, so it fell to 0 once the marks were acknowledged
+/// and a late older carried row passed the guard and replaced a newer row. Now the high-water, the greatest per game
+/// kept and never lowered ([`read_bound_statements`]).
 pub const READ_BOUND_KIND: &str = "read";
-/// A game's last read bound replaced (`?1` the games): before the new one.
-pub const READ_BOUND_CLEAR_SQL: &str =
-    "DELETE FROM applied WHERE kind='read' AND game IN (SELECT value FROM json_each(?1))";
+/// The `applied` kind of a MISS round's bound per KEY (game the txid, seq the high-water that round read it at): a
+/// miss reads only its new keys, so its snapshot bounds those keys' domains alone, never the game's.
+pub const READ_KEY_KIND: &str = "read-key";
+/// A read bound's rows below the new one trimmed (`?1` the kind, `?2` the new bound, `?3` the games or keys): the
+/// greatest kept, never lowered.
+pub const READ_BOUND_TRIM_SQL: &str =
+    "DELETE FROM applied WHERE kind=?1 AND seq<?2 AND game IN (SELECT value FROM json_each(?3))";
 /// A carried domain's generation replaced (`?1` the domains).
 pub const PAYLOAD_GEN_CLEAR_SQL: &str =
     "DELETE FROM applied WHERE kind='payload-gen' AND game IN (SELECT value FROM json_each(?1))";
-/// The newest the actor holds of one carried item: `?1` its domain, `?2` its games (lowercased). One row, `g`.
-pub const HELD_GENERATION_SQL: &str = "SELECT MAX(seq) AS g FROM applied WHERE (kind='payload-gen' AND game=?1) OR (kind IN ('read','covered') AND game IN (SELECT value FROM json_each(?2)))";
+/// The newest the actor holds of one carried item: `?1` its domain, `?2` its games (lowercased), `?3` the txids its
+/// keys name (a miss round's per-key bound). One row, `g`.
+pub const HELD_GENERATION_SQL: &str = "SELECT MAX(seq) AS g FROM applied WHERE (kind='payload-gen' AND game=?1) OR (kind IN ('read','covered') AND game IN (SELECT value FROM json_each(?2))) OR (kind='read-key' AND game IN (SELECT value FROM json_each(?3)))";
+
+/// D2-ACTOR-F-FOLD (the lens's MEDIUM-2): THE OPEN MARK. An apply writes the mirror before its fixpoint (each round's
+/// `write_round`, the carried upsert), so an apply that faults leaves rows naming keys no read covered. Every apply's
+/// FIRST local statement marks its games open (`applied` kind [`OPEN_KIND`], seq 0); the LAST statement of its last
+/// batch clears them. A carried apply is taken only for games none of which is open: an open game is the narrowed
+/// read, whose closure reads every key the mirror names.
+pub const OPEN_KIND: &str = "open";
+/// How many of the games are open (`?1` the games).
+pub const OPEN_COUNT_SQL: &str = "SELECT COUNT(*) AS n FROM applied WHERE kind='open' AND game IN (SELECT value FROM json_each(?1))";
+/// The games marked open (`?1` the games, `?2` now).
+pub const OPEN_MARK_SQL: &str = "INSERT INTO applied(kind,seq,game,atMs) SELECT 'open',0,value,?2 FROM json_each(?1) WHERE 1 ON CONFLICT(kind,seq,game) DO UPDATE SET atMs=excluded.atMs";
+/// The games' open mark cleared (`?1` the games): the last statement of a whole apply.
+pub const OPEN_CLEAR_SQL: &str =
+    "DELETE FROM applied WHERE kind='open' AND game IN (SELECT value FROM json_each(?1))";
+
+/// PURE: a read bound recorded (`kind` [`READ_BOUND_KIND`] per game or [`READ_KEY_KIND`] per txid): the lower rows
+/// trimmed, the bound inserted (a lower one than held is inserted beside the greater and changes no `MAX`).
+pub fn read_bound_statements(kind: &str, bound: i64, names: &[String], now: i64) -> Vec<Stmt> {
+    let names = json!(names).to_string();
+    vec![
+        Stmt::new(
+            READ_BOUND_TRIM_SQL,
+            vec![Bind::Text(kind.into()), Bind::Int(bound), Bind::Text(names.clone())],
+        ),
+        Stmt::new(
+            super::APPLIED_SQL,
+            vec![
+                Bind::Text(kind.into()),
+                Bind::Int(bound),
+                Bind::Int(now),
+                Bind::Text(names),
+            ],
+        ),
+    ]
+}
 /// FIX-968's coverage beside the carried marks: the exact generations a carried apply applied above the game's
 /// covered generation (`?1` the games, lowercased). Answered on `/rows` as `coveredExact: [{game, seq}]`.
 pub const COVERED_EXACT_BY_GAME_SQL: &str = "SELECT lower(p.game) AS game, p.seq AS seq FROM applied p WHERE p.kind='payload-mark' AND lower(p.game) IN (SELECT value FROM json_each(?1)) AND p.seq>COALESCE((SELECT MAX(c.seq) FROM applied c WHERE c.kind='covered' AND lower(c.game)=lower(p.game)),-1)";
@@ -59,6 +103,21 @@ pub struct CarriedItem {
 }
 
 impl CarriedItem {
+    /// The txids the item's keys name (lowercased): a miss round's per-key bound is read for them.
+    pub fn key_txids(&self) -> Vec<String> {
+        let mut out = BTreeSet::new();
+        for k in &self.k {
+            if let Ok(key) = key_tuple(k) {
+                for v in key {
+                    if let Some(t) = v.as_str().filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit())) {
+                        out.insert(t.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
     /// The domain's name in `applied` (the table, its key columns and the sorted keys).
     pub fn domain(&self) -> String {
         let mut k = self.k.clone();

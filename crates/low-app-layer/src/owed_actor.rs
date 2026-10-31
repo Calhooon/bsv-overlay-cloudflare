@@ -641,7 +641,9 @@ pub const APPLIED_CREATE: &str = "CREATE TABLE IF NOT EXISTS applied (kind TEXT 
 pub const META_CREATE: &str = "CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value TEXT)";
 pub const APPLIED_SQL: &str = "INSERT INTO applied(kind,seq,game,atMs) SELECT ?1,?2,value,?3 FROM json_each(?4) WHERE 1 ON CONFLICT DO NOTHING";
 /// LOW-2 (the D2-ACTOR-B lens): the redelivery rows older than [`APPLIED_KEEP_MS`] go.
-pub const APPLIED_PRUNE_SQL: &str = "DELETE FROM applied WHERE atMs<?1";
+/// D2-ACTOR-F-FOLD: never an open mark ([`carried::OPEN_KIND`]): a game an apply left open stays open until an apply of
+/// it ends, whatever its age.
+pub const APPLIED_PRUNE_SQL: &str = "DELETE FROM applied WHERE atMs<?1 AND kind<>'open'";
 pub const APPLIED_KEEP_MS: i64 = 7 * 86_400_000;
 
 /// D2-ACTOR-D (bsv-low #952): THE COVERAGE of an apply. Every apply reads, BEFORE its closure reads the record, the
@@ -857,6 +859,8 @@ pub struct ApplyReport {
     /// (a key the carried rows named that the mirror had never read is still read: a miss). It covers nothing
     /// (`covered` is the D1 read's): the queue's delivery of the event is applied again by the narrowed read.
     pub carried: bool,
+    /// D2-ACTOR-F-FOLD (MEDIUM-2): a game of the apply was left open by an apply that did not end.
+    pub was_open: bool,
 }
 
 /// The decoded facts of a copied BEEF row: the pot's own (`pot`, `pot_beefs` only) and the stored order's.
@@ -925,11 +929,18 @@ fn row_json(f: &Family) -> String {
 /// statement (one snapshot) as the rows (D2-ACTOR-D's coverage).
 pub const BOUND_COLUMN: &str = "(SELECT MAX(generation) FROM owed_dirty WHERE identity=?1 AND gameId IN (SELECT value FROM json_each(?2))) AS b";
 
+/// D2-ACTOR-F-FOLD (the lens's MEDIUM-1): the record's HIGH-WATER of `owed_dirty`, read in the SAME statement as the
+/// rows: the AUTOINCREMENT's last generation ever minted (`sqlite_sequence`, never lowered by an acknowledgement),
+/// so every write whose mark's generation is at or below it committed before this snapshot and is in the rows read.
+/// A read's carried-row guard ([`carried::READ_BOUND_KIND`]) is this number, never the pending marks' maximum (which
+/// fell to 0 once the marks were acknowledged, so a late older carried row passed the guard).
+pub const HW_COLUMN: &str = "(SELECT seq FROM sqlite_sequence WHERE name='owed_dirty') AS hw";
+
 /// D2-ACTOR-E (bsv-low #954): ONE record statement for the families of a round (it was one statement a family, 24):
 /// each family's selection a scalar subquery answering its rows as one JSON array (`f<n>`, `n` its index in
 /// [`FAMILIES`]); with `bound` the marks' bound beside them. No compound SELECT (D1 refuses one past 5 terms).
 pub fn aggregate_select(bound: bool, families: &[usize]) -> String {
-    let mut cols: Vec<String> = Vec::new();
+    let mut cols: Vec<String> = vec![HW_COLUMN.into()];
     if bound {
         cols.push(BOUND_COLUMN.into());
     }
@@ -984,13 +995,14 @@ pub fn page_select() -> String {
 fn marked_select_of(ctes: &str, head: &str) -> String {
     let all: Vec<usize> = (0..FAMILIES.len()).collect();
     let rest = aggregate_select(false, &all);
+    let rest = rest.strip_prefix("SELECT ").unwrap_or(&rest);
     let rest = rest
-        .strip_prefix("SELECT ")
-        .unwrap_or(&rest)
+        .strip_prefix(&format!("{HW_COLUMN},"))
+        .unwrap_or(rest)
         .replace("json_each(?3)", "mk_t")
         .replace("json_each(?5)", "mk_p");
     format!(
-        "WITH {ctes},mk_t AS MATERIALIZED (SELECT value FROM json_each(?3) UNION SELECT v FROM (SELECT {MARK_TXID_EXPR} AS v FROM mk_m) WHERE length(v)=64 AND NOT (v GLOB '*[^0-9a-f]*')),mk_p AS MATERIALIZED (SELECT value FROM json_each(?5) UNION SELECT x.value||mk_t.value FROM mk_t CROSS JOIN json_each(?6) x) SELECT {head}(SELECT json_group_array(json_array(generation,source,sourceKey)) FROM mk_m) AS marks,(SELECT json_group_array(value) FROM mk_t) AS keys,{rest}"
+        "WITH {ctes},mk_t AS MATERIALIZED (SELECT value FROM json_each(?3) UNION SELECT v FROM (SELECT {MARK_TXID_EXPR} AS v FROM mk_m) WHERE length(v)=64 AND NOT (v GLOB '*[^0-9a-f]*')),mk_p AS MATERIALIZED (SELECT value FROM json_each(?5) UNION SELECT x.value||mk_t.value FROM mk_t CROSS JOIN json_each(?6) x) SELECT {head}{HW_COLUMN},(SELECT json_group_array(json_array(generation,source,sourceKey)) FROM mk_m) AS marks,(SELECT json_group_array(value) FROM mk_t) AS keys,{rest}"
     )
 }
 
@@ -1004,6 +1016,8 @@ pub struct MarkedRead {
     pub rows: Vec<Vec<Value>>,
     /// The page's games and their `at` (a page read only).
     pub games: Vec<(String, i64)>,
+    /// The record's high-water of `owed_dirty` at the read ([`HW_COLUMN`]).
+    pub hw: Option<i64>,
 }
 
 /// The marked read ([`marked_select`], or [`page_select`] with `page`): ONE record call. `Ok(None)` when a value
@@ -1081,6 +1095,7 @@ async fn read_marked(
         keys: read,
         rows,
         games: page_games,
+        hw: Some(hw_of(&row["hw"])),
     }))
 }
 
@@ -1118,6 +1133,13 @@ fn row_of(names: &[String], r: &Value) -> Value {
     Value::Object(obj)
 }
 
+/// The high-water column's value ([`HW_COLUMN`]): NULL (no mark ever minted) is 0; a REAL is its value.
+fn hw_of(v: &Value) -> i64 {
+    v.as_i64()
+        .or_else(|| v.as_f64().map(|f| f as i64))
+        .unwrap_or(0)
+}
+
 fn json_of(v: &Value) -> Result<Value, String> {
     match v {
         Value::String(s) => serde_json::from_str(s).map_err(|e| format!("owed actor: {e}")),
@@ -1140,7 +1162,7 @@ async fn read_round(
     games: &[String],
     keys: &Keys,
     bound: bool,
-) -> Result<(Vec<Vec<Value>>, Option<i64>), String> {
+) -> Result<(Vec<Vec<Value>>, Option<i64>, i64), String> {
     let binds = keys.binds(me, games);
     let names: Vec<Vec<String>> = FAMILIES.iter().map(|f| compound_columns(f).1).collect();
     let all: Vec<usize> = (0..FAMILIES.len()).collect();
@@ -1169,7 +1191,7 @@ async fn read_round(
                 .and_then(|o| o.rows.into_iter().next())
                 .unwrap_or(Value::Null);
             let b = take_aggregate(&row, &all, &mut out)?;
-            return Ok((out, b));
+            return Ok((out, b, hw_of(&row["hw"])));
         }
         Err(e) if too_big(&e) => record.log(&format!(
             "[owed-actor] {me}: the record's read passed a value bound ({e}): the BEEFs row by row"
@@ -1198,7 +1220,7 @@ async fn read_round(
                 };
                 out[n as usize].push(row_of(cols, &json_of(&r["r"])?));
             }
-            return Ok((out, b));
+            return Ok((out, b, hw_of(&row["hw"])));
         }
         Err(e) if too_big(&e) => record.log(&format!(
             "[owed-actor] {me}: a family passed a value bound ({e}): one statement a family"
@@ -1210,19 +1232,21 @@ async fn read_round(
         .iter()
         .map(|f| fitted(copy_select(f), &binds))
         .collect();
-    if bound {
-        stmts.push(fitted(format!("SELECT {BOUND_COLUMN}"), &binds));
-    }
+    // MEDIUM-1: the high-water in the same batch (one transaction), beside the bound.
+    stmts.push(fitted(format!("SELECT {HW_COLUMN},{BOUND_COLUMN}"), &binds));
     let o = record.run_batch(stmts).await?;
     let mut b = None;
+    let mut hw = 0;
     for (n, o) in o.into_iter().enumerate() {
         if n == FAMILIES.len() {
-            b = o.rows.first().map(|r| r["b"].as_i64().unwrap_or(0));
+            let r = o.rows.first().cloned().unwrap_or(Value::Null);
+            hw = hw_of(&r["hw"]);
+            b = bound.then(|| r["b"].as_i64().unwrap_or(0));
         } else {
             out[n] = o.rows;
         }
     }
-    Ok((out, b))
+    Ok((out, b, hw))
 }
 
 /// The mirror's write of one round: each family's domain replaced by the record's rows, the BEEFs' facts decoded.
@@ -1455,7 +1479,7 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
     let mut report = ApplyReport::default();
     let started_ms = local.now_ms();
     // FOLD-14: a bootstrap page reads its games in its first round's record call.
-    let mut paged: Option<(Keys, Vec<Vec<Value>>, i64)> = None;
+    let mut paged: Option<(Keys, Vec<Vec<Value>>, i64, Option<i64>)> = None;
     let page_games: Vec<String>;
     let games = match &opts.page {
         Some((at, after)) => {
@@ -1470,7 +1494,7 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
                         .filter_map(|m| m["generation"].as_i64())
                         .max()
                         .unwrap_or(0);
-                    paged = Some((m.keys, m.rows, bound));
+                    paged = Some((m.keys, m.rows, bound, m.hw));
                     m.games
                 }
                 None => record
@@ -1566,15 +1590,37 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
             .is_some_and(|n| n as usize >= games.len()),
         _ => false,
     };
+    // D2-ACTOR-F-FOLD (the lens's MEDIUM-2): were these games left open by an apply that did not end (its rows name
+    // keys no read covered)? Then marked open: this apply's first local write, cleared by its last.
+    let open = local
+        .run_batch(vec![
+            Stmt::new(
+                carried::OPEN_COUNT_SQL,
+                vec![Bind::Text(json!(games).to_string())],
+            ),
+            Stmt::new(
+                carried::OPEN_MARK_SQL,
+                vec![Bind::Text(json!(games).to_string()), Bind::Int(now)],
+            ),
+        ])
+        .await?
+        .first()
+        .and_then(|o| o.rows.first())
+        .and_then(|r| r["n"].as_i64())
+        .unwrap_or(1)
+        > 0;
+    report.was_open = open;
     let mut narrow: Option<Keys> = None;
     let mut covered: Option<i64> = None;
     // D2-ACTOR-F: the bound of this apply's own record read (every phase), recorded per game as `read` so a carried row
     // older than it is never upserted over what the read held.
     let mut read_bound: Option<i64> = None;
+    // MEDIUM-1: each miss round's keys and the high-water it read them at (`read-key` rows, per txid).
+    let mut miss_reads: Vec<(Vec<String>, i64)> = Vec::new();
     // D2-ACTOR-F (bsv-low #959): the carried rows, over warm games: upserted into the mirror, and the first round's
     // read is the mirror itself (no record call). `None`: the narrowed read below, as before.
     let carried_applied: Option<CarriedApplied> =
-        match (warm && opts.page.is_none(), &opts.carried) {
+        match (warm && !open && opts.page.is_none(), &opts.carried) {
             (true, Some(c)) => {
                 let t = local.now_ms();
                 let up = carried_upsert(local, &games, c).await;
@@ -1593,13 +1639,13 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
         };
     // D2-ACTOR-B-FOLD-14 (bsv-low #954 item 9): the first round's read, made with the marks in ONE record call.
     let mut pre: Option<(Keys, Vec<Vec<Value>>)> = None;
-    if let Some((k, rows, bound)) = paged {
+    if let Some((k, rows, bound, hw)) = paged {
         // The page's first round: its games' families over the page's marks' keys (the mirror's own keys for those
         // games, read nowhere yet, are the next round's).
         pre = Some((k, rows));
         covered = Some(bound);
         report.read_generation = Some(bound);
-        read_bound = Some(bound);
+        read_bound = hw;
     }
     if let (true, Some(touch), None) = (warm, &opts.touch, &carried_applied) {
         // The warm mirror's WHOLE key set, every family, beside the event's keys (FOLD-11, NEW6-M1: no family is
@@ -1615,7 +1661,10 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
         let marked = read_marked(record, &me, &games, &n, None).await?;
         report.read_ms += local.now_ms().saturating_sub(t);
         let (marks, read) = match marked {
-            Some(m) => (m.marks, Some((m.keys, m.rows))),
+            Some(m) => {
+                read_bound = m.hw;
+                (m.marks, Some((m.keys, m.rows)))
+            }
             None => {
                 // A value past D1's bound: the marks, then the sequential read and its own fallbacks.
                 let t = local.now_ms();
@@ -1640,7 +1689,6 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
             .max()
             .unwrap_or(0);
         report.read_generation = Some(bound);
-        read_bound = Some(bound);
         if marks
             .iter()
             .any(|m| FULL_SOURCES.contains(&m["source"].as_str().unwrap_or("")))
@@ -1704,7 +1752,7 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
             Some((k, rows)) if first => (k, rows),
             _ => {
                 let t = local.now_ms();
-                let (read, bound) = read_round(
+                let (read, bound, hw) = read_round(
                     record,
                     &me,
                     &read_games,
@@ -1716,7 +1764,15 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
                 if first && narrow.is_none() {
                     covered = bound;
                     report.read_generation = bound;
-                    read_bound = bound;
+                }
+                if first {
+                    // MEDIUM-1: the apply's FIRST record read is of the games' whole key set (the full closure, or
+                    // the narrowed read's mirror keys beside the event's): its high-water bounds every key the
+                    // mirror names after this apply (a later round reads newer snapshots).
+                    read_bound = read_bound.or(Some(hw));
+                } else {
+                    // A later round (a miss) read only its new keys, at its own high-water: per key.
+                    miss_reads.push((read_keys.txids.iter().cloned().collect(), hw));
                 }
                 (read_keys, read)
             }
@@ -1794,20 +1850,24 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
             .collect();
         marks.extend(carried::record_statements(&applied, &own, now));
     }
-    if let Some(b) = read_bound {
-        marks.push(Stmt::new(
-            carried::READ_BOUND_CLEAR_SQL,
-            vec![Bind::Text(json!(games).to_string())],
+    if let Some(b) = read_bound.filter(|_| carried_applied.is_none()) {
+        // MEDIUM-1: the greatest kept, never lowered (the lower rows trimmed, never the greater).
+        marks.extend(carried::read_bound_statements(
+            carried::READ_BOUND_KIND,
+            b,
+            &games,
+            now,
         ));
-        marks.push(Stmt::new(
-            APPLIED_SQL,
-            vec![
-                Bind::Text(carried::READ_BOUND_KIND.into()),
-                Bind::Int(b),
-                Bind::Int(now),
-                Bind::Text(json!(games).to_string()),
-            ],
-        ));
+    }
+    for (txids, hw) in &miss_reads {
+        if !txids.is_empty() {
+            marks.extend(carried::read_bound_statements(
+                carried::READ_KEY_KIND,
+                *hw,
+                txids,
+                now,
+            ));
+        }
     }
     if narrow.is_none() && carried_applied.is_none() {
         marks.push(Stmt::new(
@@ -1868,11 +1928,15 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
             vec![Bind::Int(now - APPLIED_KEEP_MS)],
         ));
     }
-    if !marks.is_empty() {
-        let t = local.now_ms();
-        local.run_batch(marks).await?;
-        report.write_ms += local.now_ms().saturating_sub(t);
-    }
+    // MEDIUM-2: the apply ended; its games' open mark cleared, the batch's LAST statement (a DO batch is not atomic:
+    // a fault before it leaves the games open).
+    marks.push(Stmt::new(
+        carried::OPEN_CLEAR_SQL,
+        vec![Bind::Text(json!(games).to_string())],
+    ));
+    let t = local.now_ms();
+    local.run_batch(marks).await?;
+    report.write_ms += local.now_ms().saturating_sub(t);
     report.applied_games.extend(games);
     // FOLD-14 item 2: the judge's stage is the rest of the apply (the judge's rounds over the mirror, the local key
     // walks), so the stages sum to the apply's own time. FIX-983 (bsv-low #983): the outside's awaits are their own
@@ -1912,7 +1976,11 @@ async fn carried_upsert<L: SqlPort>(
                     let games: Vec<String> = it.games.iter().map(|g| g.to_ascii_lowercase()).collect();
                     Stmt::new(
                         carried::HELD_GENERATION_SQL,
-                        vec![Bind::Text(it.domain()), Bind::Text(json!(games).to_string())],
+                        vec![
+                            Bind::Text(it.domain()),
+                            Bind::Text(json!(games).to_string()),
+                            Bind::Text(json!(it.key_txids()).to_string()),
+                        ],
                     )
                 })
                 .collect(),
