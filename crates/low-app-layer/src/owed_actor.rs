@@ -966,6 +966,12 @@ pub const HW_COLUMN: &str = "(SELECT seq FROM sqlite_sequence WHERE name='owed_d
 /// MINED word's `proof_root`, `header_hash`, `proof_hex`, `legacy_body` and `hint_source`, a refusal's `reason` and
 /// `refusedTxid` (no judge statement reads by it), `network_seen.seenSource`, the markers' signatures and cards. The
 /// pin `fold3_nit1_*` names them: every family's txid key is here, and every other schema column is not.
+///
+/// THE ONE EXCEPTION (D2-ACTOR-F-FOLD-4, the third delta lens's NIT-3): the judge's text BINDS are scanned whole, LESS
+/// the apply's own game ids (`Noting`'s answers): a game id is `Key::Game`, never a txid, so a bound txid equal to one
+/// of the apply's games is not fetched as a key. It holds while no judge statement binds a game id against a txid
+/// column (none does: a game id is bound only against `gameId`); a statement that did would need its txid named by a
+/// key column of a row the walk read, or the exception removed (`apply_with`'s `seen.retain`).
 pub const KEY_COLUMNS: [&str; 13] = [
     "txid",
     "potTxid",
@@ -1051,6 +1057,18 @@ pub const PASS_CLOSURE_KEYS_MAX: usize = 32;
 /// half D1's 2,000,000 byte value bound, so the statement's every value stays under it whatever the keys' rows hold.
 /// A row past the running bound is answered with no row (its txids NOT CARRIED).
 pub const CLOSURE_FAMILY_MAX_BYTES: i64 = 1_000_000;
+/// D2-ACTOR-F-FOLD-4 (the third delta lens's NIT-2): the running bound one FILING buys a family: the heaviest single
+/// row the statement builds (a row at [`CLOSURE_ROW_MAX_WEIGHT`] beside a BEEF of [`CLOSURE_BEEF_MAX_BYTES`] read as
+/// hex, and the row's 64), so a row a filing could keep is never cut by the bound; the kept size is
+/// [`CLOSURE_MAX_BYTES`] an event, so a family needs no more than this a filing.
+pub const CLOSURE_FAMILY_BYTES_PER_FILING: i64 =
+    CLOSURE_ROW_MAX_WEIGHT + 2 * CLOSURE_BEEF_MAX_BYTES + 64;
+/// PURE (FOLD-4): a family's running bound for a pass of `filings` (`?5`): [`CLOSURE_FAMILY_BYTES_PER_FILING`] a
+/// filing, at most [`CLOSURE_FAMILY_MAX_BYTES`].
+pub fn closure_family_bound(filings: usize) -> i64 {
+    (CLOSURE_FAMILY_BYTES_PER_FILING.saturating_mul(filings.max(1) as i64))
+        .min(CLOSURE_FAMILY_MAX_BYTES)
+}
 
 /// PURE (FOLD-3): the closure keys of an event the direct pass reads a closure for: a carried filing
 /// ([`CLOSURE_FILING_SOURCES`]) whose payload names a key beyond the event's own source key; `None` otherwise.
@@ -1116,10 +1134,13 @@ fn closure_arm(f: &Family) -> String {
         .replace("json_each(?2)", "json_each('[]')")
         .replace("json_each(?4)", "json_each('[]')")
         .replace("?1", "''");
+    // D2-ACTOR-F-FOLD-4 (the third delta lens's NIT-1): the row's weight is computed ONCE (`w.cw0`, over the family's
+    // selected rowids), then each row read back by its rowid (`CROSS JOIN`: the order forced, a primary-key search)
     format!(
-        "(SELECT json_group_array(json_array(ci,CASE WHEN crun<=?5 THEN json(cr) END,json(ck))) FROM (SELECT ci,cr,ck,SUM(cw) OVER (ORDER BY ci ROWS UNBOUNDED PRECEDING) AS crun FROM (SELECT DISTINCT t.rowid AS ci,CASE WHEN {weight}<=?4 THEN json_array({}) END AS cr,json_array({}) AS ck,CASE WHEN {weight}<=?4 THEN {weight} ELSE 0 END{beef_w}+64 AS cw FROM {from})))",
+        "(SELECT json_group_array(json_array(ci,CASE WHEN crun<=?5 THEN json(cr) END,json(ck))) FROM (SELECT ci,cr,ck,SUM(cw) OVER (ORDER BY ci ROWS UNBOUNDED PRECEDING) AS crun FROM (SELECT w.wi AS ci,CASE WHEN w.cw0<=?4 THEN json_array({}) END AS cr,json_array({}) AS ck,CASE WHEN w.cw0<=?4 THEN w.cw0 ELSE 0 END{beef_w}+64 AS cw FROM (SELECT DISTINCT t.rowid AS wi,{weight} AS cw0 FROM {from}) w CROSS JOIN {} t ON t.rowid=w.wi)))",
         calls.join(","),
-        key_cols.join(",")
+        key_cols.join(","),
+        f.table
     )
 }
 
@@ -1140,8 +1161,12 @@ pub fn pass_closure_select() -> String {
 }
 
 /// PURE (FOLD-3): the pass's closure statement over the union of its events' keys, the first [`PASS_CLOSURE_KEYS_MAX`] in
-/// order; answers it and the keys it reads. `None` with no key.
-pub fn pass_closure_statement(keys: &BTreeSet<String>) -> Option<(Stmt, BTreeSet<String>)> {
+/// order, each family's running bound [`closure_family_bound`] of the pass's `filings` (FOLD-4); answers it and the
+/// keys it reads. `None` with no key.
+pub fn pass_closure_statement(
+    keys: &BTreeSet<String>,
+    filings: usize,
+) -> Option<(Stmt, BTreeSet<String>)> {
     let read: BTreeSet<String> = keys.iter().take(PASS_CLOSURE_KEYS_MAX).cloned().collect();
     if read.is_empty() {
         return None;
@@ -1151,7 +1176,7 @@ pub fn pass_closure_statement(keys: &BTreeSet<String>) -> Option<(Stmt, BTreeSet
         Bind::Text(json!(PROBE_PREFIXES).to_string()),
         Bind::Int(CLOSURE_BEEF_MAX_BYTES),
         Bind::Int(CLOSURE_ROW_MAX_WEIGHT),
-        Bind::Int(CLOSURE_FAMILY_MAX_BYTES),
+        Bind::Int(closure_family_bound(filings)),
     ];
     Some((fitted(pass_closure_select(), &binds), read))
 }
@@ -1234,16 +1259,14 @@ pub fn closure_for(keys: &BTreeSet<String>, read: &BTreeSet<String>, row: &Value
 
 /// D2-ACTOR-F-FOLD-3: the pass statement's one answer row from the record (ONE call); `None` on a fault (the pass's
 /// closures are then none: each actor's miss round reads the record once, as it would with no closure).
-pub async fn read_pass_closure(record: &impl SqlPort, stmt: Stmt) -> Option<Value> {
+pub async fn read_pass_closure(record: &impl SqlPort, stmt: Stmt) -> Result<Value, String> {
     record
         .run_batch(vec![stmt])
-        .await
-        .ok()?
-        .into_iter()
-        .next()?
-        .rows
+        .await?
         .into_iter()
         .next()
+        .and_then(|o| o.rows.into_iter().next())
+        .ok_or_else(|| "the closure statement answered no row".to_string())
 }
 
 /// The carried closure of ONE event's `facts` (its `payload`), through the pass's statement over its keys alone: the
@@ -1251,8 +1274,8 @@ pub async fn read_pass_closure(record: &impl SqlPort, stmt: Stmt) -> Option<Valu
 /// faults, or the closure passes its bound.
 pub async fn read_closure(record: &impl SqlPort, facts: &Value) -> Option<Value> {
     let keys = closure_keys(facts.get("payload")?);
-    let (stmt, read) = pass_closure_statement(&keys)?;
-    let row = read_pass_closure(record, stmt).await?;
+    let (stmt, read) = pass_closure_statement(&keys, 1)?;
+    let row = read_pass_closure(record, stmt).await.ok()?;
     closure_for(&keys, &read, &row)
 }
 
@@ -5366,7 +5389,7 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
 /// (`owed_events::HEALTH_CONSUMER_SQL`).
 macro_rules! health_select {
     () => {
-        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold','owed-actor:bars:flood')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding,(SELECT cursor FROM owed_belt_state WHERE name='owed-judge:version') AS d1Rejudge"
+        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold','owed-actor:bars:flood')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding,(SELECT cursor FROM owed_belt_state WHERE name='owed-judge:version') AS d1Rejudge"
     };
 }
 pub const HEALTH_SQL: &str = health_select!();
@@ -5485,7 +5508,7 @@ pub fn health_body(read: Option<&Value>, now: u64, d1_oldest_unacked: &Value) ->
     };
     // D2-ACTOR-D (bsv-low #952): the writers' direct calls (every owed frame's publisher), and those that met their
     // wall or faulted (the queue's message is the backstop of each).
-    body["direct"] = json!({"calls": n(COUNTERS[3]), "walls": n(COUNTERS[25]), "faults": n(COUNTERS[4]), "closures": n(COUNTERS[32])});
+    body["direct"] = json!({"calls": n(COUNTERS[3]), "walls": n(COUNTERS[25]), "faults": n(COUNTERS[4]), "closures": n(COUNTERS[32]), "closureFaults": n(COUNTERS[33]), "closureDeclines": n(COUNTERS[34])});
     // NEW-L3: Phase B's gate is COVERAGE, the bootstrap lever's last full pass (`complete`, `contiguous`, `uncovered`
     // 0), never `bootstraps` against `activeIdentities` (two counts).
     body["coverage"] = field("coverage");
@@ -6569,7 +6592,7 @@ mod tests;
 /// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
 /// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
 /// (MEDIUM-9).
-pub const COUNTERS: [&str; 33] = [
+pub const COUNTERS: [&str; 35] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -6625,6 +6648,10 @@ pub const COUNTERS: [&str; 33] = [
     // D2-ACTOR-F-FOLD-3 (the second delta lens's NIT-3): the carried filings whose direct pass read their closure (the
     // pass's ONE statement), served `/health.owedActor.direct.closures`.
     "owed_actor_direct_closures_total",
+    // D2-ACTOR-F-FOLD-4 (the third delta lens's LOW-2): the direct passes whose closure read faulted or passed its wall,
+    // and the filings whose answered closure was declined (past its bound); each filing then read its own miss.
+    "owed_actor_direct_closure_faults_total",
+    "owed_actor_direct_closure_declines_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;

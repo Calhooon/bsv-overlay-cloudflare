@@ -18,7 +18,8 @@
 //       apply and first visibility figures each answer gave;
 //   (4) (the delta lens's LOW-2) it waits out the bars' minute, files seat 1's extra NEW filing (its warm actor's
 //       apply flushes the isolate's pending samples, the flood's among them, and the health snapshot in their batch),
-//       and asserts `/health.owedActor` SERVES non-null p95s
+//       and asserts `/health.owedActor` SERVES non-null p95s, `classes.direct.closureMsP95` among them, and
+//       `owed_actor_direct_closures_total` moved by exactly the flood's 32 with no closure fault (D2-ACTOR-F-FOLD-4)
 //       (`stages.{read,wait,judge,write}MsP95`, `classes.direct` with samples), printed beside the answers' figures.
 // RED on 3223be64 (no closure carried): every held filing's apply makes one record call ("recordCalls 1").
 // Reads the tier's exported fleet fixture (RECORD_DOOR_FIXTURE, as the #911 cell does). Every host is sealed.
@@ -109,6 +110,10 @@ try {
   for (const s of seats) before.set(s.identity, (await answers(s.identity)).length)
   // (2) the flood: the 32 held filings at once
   assert(seats.some(s => s.payBeefBytes > 15000), 'one seat’s payout holds a realistic stored BEEF')
+  // D2-ACTOR-F-FOLD-4 (the third delta lens's LOW-2): the closure counters, read before and after the flood
+  const counter = async name => Number((await db.prepare('SELECT value FROM ops_counters WHERE name=?1').bind(name).first())?.value ?? 0)
+  const closuresBefore = await counter('owed_actor_direct_closures_total')
+  const closureFaultsBefore = await counter('owed_actor_direct_closure_faults_total')
   const t0 = Date.now()
   const doors = await Promise.all(seats.map(s => file(s.held)))
   const answeredMs = Date.now() - t0
@@ -132,6 +137,15 @@ try {
   assert(calls.every(c => c === 0), `no apply made a record call: ${JSON.stringify(calls)}`)
   assert(read.every(r => r === 0), `readMs 0 on the warm path: ${JSON.stringify(read)}`)
   assert(got.every(a => a.closureRounds >= 1), 'each new filing’s keys came with its closure')
+  // each pass's counters are flushed after its calls: the flood's 32 filings each given a closure, none faulted
+  const directClosures = await poll('the flood’s 32 closures counted', async () => {
+    const n = (await counter('owed_actor_direct_closures_total')) - closuresBefore
+    return n >= 32 && n
+  }, 20000)
+  const closureFaults = (await counter('owed_actor_direct_closure_faults_total')) - closureFaultsBefore
+  console.log(`f_cell: directClosures ${directClosures} (the flood's), closure faults ${closureFaults}`)
+  assert.equal(directClosures, 32, 'directClosures counts the flood’s 32 filings')
+  assert.equal(closureFaults, 0, 'no closure read faulted')
   // the payout's keys are in each mirror at the closure's high-water (its per-key bound)
   for (const s of seats.slice(0, 4)) {
     const rows = await (await actor(s.identity).fetch('http://owed-actor/pin/applied?kind=read-key')).json()
@@ -157,11 +171,11 @@ try {
     last = h.owedActor
     const st = h.owedActor?.stages ?? {}
     const d = h.owedActor?.classes?.direct ?? {}
-    return ['readMsP95', 'waitMsP95', 'judgeMsP95', 'writeMsP95'].every(k => typeof st[k] === 'number' && typeof d[k] === 'number') && d.applySamples > 0 && h
+    return ['readMsP95', 'waitMsP95', 'judgeMsP95', 'writeMsP95'].every(k => typeof st[k] === 'number' && typeof d[k] === 'number') && typeof d.closureMsP95 === 'number' && d.applySamples > 0 && h
   }, 70000).catch(e => { console.log(`f_cell: last /health.owedActor ${JSON.stringify(last)}`); throw e })
   const st = health.owedActor.stages
   console.log(`f_cell: SERVED /health.owedActor.stages ${JSON.stringify(st)}; classes.direct ${JSON.stringify(health.owedActor.classes.direct)}; record ${JSON.stringify({ enqueueMsP50: health.record?.enqueueMsP50, enqueueMsP95: health.record?.enqueueMsP95 })}`)
-  console.log(`PASS f_cell: 32 new filings for 32 identities (one payout a ~20 KB stored BEEF) applied from their carried rows and closures with no D1 read (record calls 0, readMs 0); door enqueue ${fig(enq)} ms; apply ${fig(apply)} ms, first visibility ${fig(visible)} ms; served stages read p95 ${st.readMsP95}, judge p95 ${st.judgeMsP95}`)
+  console.log(`PASS f_cell: 32 new filings for 32 identities (one payout a ~20 KB stored BEEF) applied from their carried rows and closures with no D1 read (record calls 0, readMs 0); door enqueue ${fig(enq)} ms; apply ${fig(apply)} ms, first visibility ${fig(visible)} ms; served stages read p95 ${st.readMsP95}, judge p95 ${st.judgeMsP95}; served classes.direct.closureMsP95 ${health.owedActor.classes.direct.closureMsP95}; directClosures ${directClosures}`)
 } finally {
   if (mf) await Promise.race([mf.dispose(), new Promise(r => setTimeout(r, 15000))])
   rmSync(scratch, { recursive: true, force: true })

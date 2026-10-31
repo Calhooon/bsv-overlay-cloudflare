@@ -15702,7 +15702,7 @@ mod d2_actor_f_fold {
         // D2-ACTOR-F-FOLD-3: the pass's ONE closure statement (it was a batch of 25)
         let keys = closure_wanted(&ev).expect("a collected filing names its payout");
         assert!(keys.contains(&pay) && keys.contains(&marker), "{keys:?}");
-        let (stmt, _) = pass_closure_statement(&keys).unwrap();
+        let (stmt, _) = pass_closure_statement(&keys, 1).unwrap();
         let stmts = vec![stmt];
         let tables: Vec<&str> = FAMILIES.iter().map(|f| f.table).collect();
         let (mut steps, mut scans) = (0i64, 0i64);
@@ -16045,7 +16045,7 @@ mod d2_actor_f_fold3 {
             self.reports.borrow_mut().push(r);
             Ok(answer)
         }
-        async fn closure_read(&self, stmt: Stmt) -> Option<Value> {
+        async fn closure_read(&self, stmt: Stmt) -> Result<Value, String> {
             self.closure_reads.set(self.closure_reads.get() + 1);
             let t = Instant::now();
             let row = read_pass_closure(self.record, stmt).await;
@@ -16142,7 +16142,8 @@ mod d2_actor_f_fold3 {
     /// closure statement over the union of the filings' keys (the record's whole cost of the pass: one call), each
     /// filing's apply takes its closure (`closureRounds` 1, no record call), the SEEN none, and each game's stored rows
     /// equal a cold apply's from the record. The closure's time rides each filing's body (`closureMs`) and its answer,
-    /// served as the direct class's `closure` stage; `closures` 3. RED on a0834e27 by behaviour: three closure batches
+    /// served as the direct class's `closure` stage; `closures` 3. Since FOLD-4 the SEEN is its own body, called before the
+    /// closure answers, and the filings one body after it. RED on a0834e27 by behaviour: three closure batches
     /// of 25 statements, read one after another before any call; RED against a closure read per filing (the base's
     /// loop) beside the pass's: "one closure statement for the pass", `left: 4 right: 1`.
     #[tokio::test]
@@ -16180,12 +16181,19 @@ mod d2_actor_f_fold3 {
             (1, 1),
             "the pass's whole record cost: one statement"
         );
+        // D2-ACTOR-F-FOLD-4 (the third delta lens's LOW-1): the SEEN wants no closure, so it is called at once in a body
+        // of its own; the three filings follow the closure in one coalesced body (amended: one body before the fold)
         let reports = port.reports.borrow().clone();
-        assert_eq!(reports.len(), 1, "one identity, one coalesced body");
+        assert_eq!(reports.len(), 2, "the SEEN's body at once, the filings' after the closure");
         assert!(
-            reports[0].carried && reports[0].closure_rounds >= 1,
-            "{:?}",
+            reports[0].carried && reports[0].closure_rounds == 0,
+            "the SEEN's body first, no closure: {:?}",
             reports[0]
+        );
+        assert!(
+            reports[1].carried && reports[1].closure_rounds >= 1,
+            "{:?}",
+            reports[1]
         );
         for k in [7usize, 9, 10, 11] {
             let c = mirror();
@@ -16420,7 +16428,7 @@ mod d2_actor_f_fold3 {
     #[tokio::test]
     async fn fold3_nit2_the_closure_caps_its_keys_and_never_carries_an_empty_row() {
         let keys: BTreeSet<String> = (0..40).map(|i| h("d0", i)).collect();
-        let (stmt, read) = pass_closure_statement(&keys).unwrap();
+        let (stmt, read) = pass_closure_statement(&keys, 1).unwrap();
         assert_eq!(read.len(), PASS_CLOSURE_KEYS_MAX);
         let bound: Vec<String> = match &stmt.binds[0] {
             Bind::Text(t) => serde_json::from_str(t).unwrap(),
@@ -16437,7 +16445,7 @@ mod d2_actor_f_fold3 {
             )
             .unwrap();
         let mine = BTreeSet::from([hop.clone()]);
-        let (stmt, read) = pass_closure_statement(&mine).unwrap();
+        let (stmt, read) = pass_closure_statement(&mine, 1).unwrap();
         let row = read_pass_closure(&record, stmt).await.unwrap();
         let c = ClosureRead::of(&closure_for(&mine, &read, &row).unwrap()).unwrap();
         assert!(c.not_carried.contains(&hop), "{c:?}");
@@ -16454,7 +16462,7 @@ mod d2_actor_f_fold3 {
         // a key past the 32 is not carried
         let mut wide = keys.clone();
         wide.insert(hop.clone());
-        let (_, read) = pass_closure_statement(&wide).unwrap();
+        let (_, read) = pass_closure_statement(&wide, 1).unwrap();
         let c = ClosureRead::of(&closure_for(&wide, &read, &row).unwrap()).unwrap();
         assert!(wide
             .iter()
@@ -16528,5 +16536,222 @@ mod d2_actor_f_fold3 {
             calls.iter().all(|c| *c == 1),
             "each filing's pass: one record call (its closure)"
         );
+    }
+
+    // ---- D2-ACTOR-F-FOLD-4 (the third delta lens `docs/audit/D2-ACTOR-F-delta-3-2026-10-31.md`) ----
+
+    /// A scripted direct port for the closure's wall: each call answered at once and recorded (its virtual time, its
+    /// games, whether its body carries a closure); the closure read answers as scripted (`None`: never); the wall is
+    /// tokio's (paused) clock.
+    struct WallPort {
+        closure: Option<Result<Value, String>>,
+        start: tokio::time::Instant,
+        calls: RefCell<Vec<(u64, Vec<String>, bool)>>,
+    }
+    impl crate::owed_events::DirectPort for WallPort {
+        async fn subjects(
+            &self,
+            _ev: &overlay_discovery::owed_event::OwedEvent,
+        ) -> Result<Vec<(String, Vec<String>)>, String> {
+            Err("every event of the pin carries its subjects".into())
+        }
+        async fn call(&self, body: Value) -> Result<Value, String> {
+            let games: Vec<String> = body["games"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|g| g.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let closure = body["carried"]["closures"]
+                .as_array()
+                .is_some_and(|c| !c.is_empty());
+            self.calls.borrow_mut().push((
+                self.start.elapsed().as_millis() as u64,
+                games,
+                closure,
+            ));
+            Ok(json!({"applied": true, "appliedGames": body["games"]}))
+        }
+        async fn closure_read(&self, _stmt: Stmt) -> Result<Value, String> {
+            match &self.closure {
+                Some(r) => r.clone(),
+                None => futures_util::future::pending().await,
+            }
+        }
+        async fn sleep_ms(&self, ms: u64) {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await
+        }
+        fn now_ms(&self) -> u64 {
+            self.start.elapsed().as_millis() as u64
+        }
+    }
+
+    /// The warm seat's SEEN of game 7's pot and a NEW collected filing of game 12 (its payout never read), each as the
+    /// writer publishes it.
+    async fn seen_and_filing() -> (Vec<overlay_discovery::owed_event::OwedEvent>, Vec<String>) {
+        let (record, _local, games) = e_warm_seat(20).await;
+        let pot = h("c8", 7);
+        record
+            .conn
+            .execute(
+                "INSERT INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'2026-10-30 00:00:00','arcade',?2)",
+                rusqlite::params![pot, NOW_MS as i64],
+            )
+            .unwrap();
+        mark(&record, &games[7], "seen", &pot);
+        let marker = collected(&record, &games, 12);
+        let seen = published(&record, "seen", &pot).await;
+        let filing = published(&record, "collected", &marker).await;
+        assert!(closure_wanted(&seen).is_none());
+        assert!(closure_wanted(&filing).is_some(), "the filing wants a closure");
+        (vec![filing, seen], games)
+    }
+
+    /// (fold4_low1) THE THIRD DELTA LENS'S LOW-1: AN EVENT THAT WANTS NO CLOSURE NEVER WAITS ON ONE, AND THE CLOSURE
+    /// READ HAS A WALL. A pass of a filing (published FIRST) and a warm SEEN of the same seat, the closure port never
+    /// answering: the SEEN's call is made and answered at once (virtual 0 ms), the filing's at the wall
+    /// (`DIRECT_CALL_WALL_MS`) with no closure (its actor reads its own miss once), the read counted a closure fault
+    /// naming its wall. RED against 44e2f992's rule grafted (the closure read awaited before every call, no wall): the
+    /// pass never ends ("the SEEN's call was made inside the wall: []").
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fold4_low1_a_warm_seen_is_called_while_the_closure_never_answers() {
+        let (events, games) = seen_and_filing().await;
+        let port = WallPort {
+            closure: None,
+            start: tokio::time::Instant::now(),
+            calls: RefCell::default(),
+        };
+        let wall = DIRECT_CALL_WALL_MS;
+        let pass = crate::owed_events::direct_with(&port, events, Some(TIP));
+        let mut pass = std::pin::pin!(pass);
+        let half = tokio::time::sleep(std::time::Duration::from_millis(wall / 2));
+        tokio::select! {
+            _ = &mut pass => panic!("the pass ended before the closure's wall"),
+            _ = half => {}
+        }
+        {
+            let calls = port.calls.borrow();
+            assert!(
+                calls.iter().any(|(at, g, c)| *at == 0 && g.contains(&games[7]) && !c),
+                "the SEEN's call was made inside the wall: {calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|(_, g, _)| g.contains(&games[12])),
+                "the filing waits on its closure: {calls:?}"
+            );
+        }
+        let r = tokio::time::timeout(std::time::Duration::from_millis(wall * 2), pass)
+            .await
+            .expect("the closure read is raced against its wall");
+        let calls = port.calls.borrow();
+        let filing = calls
+            .iter()
+            .find(|(_, g, _)| g.contains(&games[12]))
+            .expect("the filing is called past the wall");
+        assert_eq!((filing.0, filing.2), (wall, false), "{calls:?}");
+        assert_eq!(
+            (r.calls, r.faults, r.walls, r.closure_calls, r.closure_faults, r.closures),
+            (2, 0, 0, 1, 1, 0),
+            "{r:?}"
+        );
+        assert!(r.closure_fault.as_deref().is_some_and(|f| f.contains("wall")), "{r:?}");
+        assert_eq!(r.closure_ms, Some(wall));
+    }
+
+    /// (fold4_low1_b) the closure that answers in time is still taken: the filing's body carries it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fold4_low1_b_a_closure_in_time_rides_the_filings_body() {
+        let (record, _local, games) = e_warm_seat(20).await;
+        let marker = collected(&record, &games, 12);
+        let filing = published(&record, "collected", &marker).await;
+        let keys = closure_wanted(&filing).unwrap();
+        let (stmt, _) = pass_closure_statement(&keys, 1).unwrap();
+        let row = read_pass_closure(&record, stmt).await.unwrap();
+        let port = WallPort {
+            closure: Some(Ok(row)),
+            start: tokio::time::Instant::now(),
+            calls: RefCell::default(),
+        };
+        let r = crate::owed_events::direct_with(&port, vec![filing], Some(TIP)).await;
+        assert_eq!((r.closures, r.closure_faults, r.closure_declines), (1, 0, 0), "{r:?}");
+        assert!(port.calls.borrow()[0].2, "the body carries the closure");
+    }
+
+    /// (fold4_low2) THE THIRD DELTA LENS'S LOW-2: A FAULTED OR DECLINED CLOSURE READ IS COUNTED, SERVED AND LOGGED. A
+    /// read that faults is `closure_faults` 1 with its text, logged once a minute an isolate; an answer `closure_for`
+    /// declines is `closure_declines` 1; both counters are in both Workers' lists, the health snapshot's and
+    /// `/health/invariants.owedActor`; the Worker's pass bumps both. New API (does not compile on 44e2f992).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fold4_low2_a_faulted_and_declined_closures_are_counted_and_served() {
+        let (events, _) = seen_and_filing().await;
+        let port = WallPort {
+            closure: Some(Err("D1_ERROR: the statement timed out".into())),
+            start: tokio::time::Instant::now(),
+            calls: RefCell::default(),
+        };
+        let r = crate::owed_events::direct_with(&port, events.clone(), Some(TIP)).await;
+        assert_eq!((r.closure_faults, r.closure_declines, r.closures), (1, 0, 0), "{r:?}");
+        let line = crate::owed_events::closure_fault_line(&r, 1_000, None).expect("a line");
+        assert!(line.contains("direct closure fault: D1_ERROR"), "{line}");
+        assert!(crate::owed_events::closure_fault_line(&r, 30_000, Some(1_000)).is_none());
+        assert!(crate::owed_events::closure_fault_line(&r, 61_000, Some(1_000)).is_some());
+        let port = WallPort {
+            closure: Some(Ok(json!({"hw": 1, "f0": "{"}))),
+            start: tokio::time::Instant::now(),
+            calls: RefCell::default(),
+        };
+        let r = crate::owed_events::direct_with(&port, events, Some(TIP)).await;
+        assert_eq!((r.closure_faults, r.closure_declines, r.closures), (0, 1, 0), "{r:?}");
+        assert!(r.closure_fault.is_none());
+        assert_eq!(COUNTERS[33], "owed_actor_direct_closure_faults_total");
+        assert_eq!(COUNTERS[34], "owed_actor_direct_closure_declines_total");
+        for c in [COUNTERS[33], COUNTERS[34]] {
+            assert!(bsv_overlay_cloudflare::applayer_counters::OWED_ACTOR.contains(&c));
+            assert!(HEALTH_SNAPSHOT_SQL.contains(&format!("'{c}'")));
+        }
+        let view = bsv_overlay_cloudflare::applayer_counters::owed_actor_view(
+            &json!({COUNTERS[33]: 2, COUNTERS[34]: 3}),
+        );
+        assert_eq!((view["directClosureFaults"].clone(), view["directClosureDeclines"].clone()), (json!(2), json!(3)));
+        let src: String = include_str!("../owed_events.rs").split_whitespace().collect();
+        assert!(src.contains("(crate::owed_actor::COUNTERS[33],report.closure_faults)"));
+        assert!(src.contains("(crate::owed_actor::COUNTERS[34],report.closure_declines)"));
+        assert!(src.contains("log_closure_fault(&report,"));
+        let src: String = include_str!("../owed_actor.rs").split_whitespace().collect();
+        assert!(src.contains("\"closureFaults\":n(COUNTERS[33]),\"closureDeclines\":n(COUNTERS[34])"));
+    }
+
+    /// (fold4_nit1) THE THIRD DELTA LENS'S NIT-1: THE PASS'S STATEMENT STAYS UNDER D1'S 100,000 BYTE STATEMENT LIMIT
+    /// (rusqlite enforces none), each family's weight computed ONCE (it was three times: 54,152 bytes on 44e2f992).
+    #[test]
+    fn fold4_nit1_the_closure_statement_is_under_d1s_limit_and_weighs_once() {
+        let sql = pass_closure_select();
+        eprintln!("fold4_nit1: the pass's closure statement is {} bytes", sql.len());
+        assert!(sql.len() < 90_000, "{} bytes", sql.len());
+        for f in FAMILIES.iter() {
+            let arm = closure_arm(f);
+            let weighed = schema::columns(f.table)
+                .iter()
+                .filter(|c| !(f.beef && **c == "beef"))
+                .count();
+            assert_eq!(
+                arm.matches("*COALESCE(length(CAST(t.").count(),
+                weighed,
+                "{}: each column weighed once",
+                f.table
+            );
+        }
+    }
+
+    /// (fold4_nit2) THE THIRD DELTA LENS'S NIT-2: A FAMILY'S RUNNING BOUND FOLLOWS THE PASS'S FILINGS (the heaviest row
+    /// one filing can keep, a BEEF of `CLOSURE_BEEF_MAX_BYTES` beside a row at `CLOSURE_ROW_MAX_WEIGHT`), at most 1 MB;
+    /// the statement binds it as `?5`.
+    #[test]
+    fn fold4_nit2_the_family_bound_follows_the_filings() {
+        assert_eq!(closure_family_bound(0), CLOSURE_FAMILY_BYTES_PER_FILING);
+        assert_eq!(closure_family_bound(1), CLOSURE_FAMILY_BYTES_PER_FILING);
+        assert!(CLOSURE_FAMILY_BYTES_PER_FILING < CLOSURE_FAMILY_MAX_BYTES);
+        assert_eq!(closure_family_bound(2), CLOSURE_FAMILY_MAX_BYTES);
+        let keys: BTreeSet<String> = [h("a1", 1)].into_iter().collect();
+        let (stmt, _) = pass_closure_statement(&keys, 1).unwrap();
+        assert!(matches!(stmt.binds[4], Bind::Int(n) if n == CLOSURE_FAMILY_BYTES_PER_FILING));
     }
 }

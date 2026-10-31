@@ -2628,6 +2628,13 @@ pub struct DirectReport {
     pub closure_ms: Option<u64>,
     /// D2-ACTOR-F-FOLD-3: the record calls the pass's closure made (0 or 1).
     pub closure_calls: u64,
+    /// D2-ACTOR-F-FOLD-4 (the third delta lens's LOW-2): the pass's closure read that faulted or passed its wall (0 or
+    /// 1), counted `owed_actor_direct_closure_faults_total`; its text for the operator's line.
+    pub closure_faults: u64,
+    pub closure_fault: Option<String>,
+    /// FOLD-4: the filings whose closure the read answered but `closure_for` declined (past `CLOSURE_MAX_BYTES`),
+    /// counted `owed_actor_direct_closure_declines_total`.
+    pub closure_declines: u64,
 }
 
 /// D2-ACTOR-B-FOLD-10 (item 8): the direct path's fault line is logged at most once in this many ms an isolate.
@@ -2656,6 +2663,34 @@ pub fn log_direct_fault(report: &DirectReport, now_ms: u64, log: impl Fn(&str)) 
     let last = DIRECT_FAULT_LOGGED.with(std::cell::Cell::get);
     if let Some(line) = direct_fault_line(report, now_ms, last) {
         DIRECT_FAULT_LOGGED.with(|c| c.set(Some(now_ms)));
+        log(&line);
+    }
+}
+
+thread_local! {
+    static CLOSURE_FAULT_LOGGED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+/// PURE (D2-ACTOR-F-FOLD-4, the third delta lens's LOW-2): the operator's line for a pass's faulted closure read
+/// (`[owed-actor] direct closure fault: <text>`), when one is due at `now_ms` after the last at `last_ms` (once a
+/// minute an isolate, [`DIRECT_FAULT_LOG_EVERY_MS`]).
+pub fn closure_fault_line(
+    report: &DirectReport,
+    now_ms: u64,
+    last_ms: Option<u64>,
+) -> Option<String> {
+    let text = report.closure_fault.as_deref()?;
+    if last_ms.is_some_and(|l| now_ms.saturating_sub(l) < DIRECT_FAULT_LOG_EVERY_MS) {
+        return None;
+    }
+    Some(format!(
+        "[owed-actor] direct closure fault: {text} (the pass's filings read their own miss)"
+    ))
+}
+/// The closure fault line, logged through its own once-a-minute gate.
+pub fn log_closure_fault(report: &DirectReport, now_ms: u64, log: impl Fn(&str)) {
+    let last = CLOSURE_FAULT_LOGGED.with(std::cell::Cell::get);
+    if let Some(line) = closure_fault_line(report, now_ms, last) {
+        CLOSURE_FAULT_LOGGED.with(|c| c.set(Some(now_ms)));
         log(&line);
     }
 }
@@ -2817,10 +2852,15 @@ pub trait DirectPort {
     }
     /// D2-ACTOR-F-FOLD-3 (the second delta lens's MEDIUM-1, the captain's ruling): the pass's ONE closure statement
     /// (`owed_actor::pass_closure_statement`: every family's rows of the union of the pass's carried filings' keys,
-    /// one snapshot), read after the writer's answer in one round trip; its answer row, or `None` (a fault, or a port
-    /// that reads none: each actor's miss round then reads the record once).
-    async fn closure_read(&self, _stmt: Stmt) -> Option<Value> {
-        None
+    /// one snapshot), read after the writer's answer in one round trip; its answer row, or the fault (or a port that
+    /// reads none: each actor's miss round then reads the record once).
+    async fn closure_read(&self, _stmt: Stmt) -> Result<Value, String> {
+        Err("this port reads no closure".into())
+    }
+    /// D2-ACTOR-F-FOLD-4 (the third delta lens's LOW-1): a timer of `ms` (the closure read's wall). A port with none
+    /// never answers (no wall).
+    async fn sleep_ms(&self, _ms: u64) {
+        futures_util::future::pending::<()>().await
     }
     /// The port's clock (the closure stage's time); 0 for a port with none.
     fn now_ms(&self) -> u64 {
@@ -2922,46 +2962,142 @@ pub async fn direct_with_class(
     }
     // D2-ACTOR-F-FOLD-3 (the second delta lens's MEDIUM-1 and MEDIUM-2, the captain's ruling): a closure only for a
     // carried FILING naming a key beyond its own (`owed_actor::closure_wanted`), and the pass's closures in ONE
-    // statement over the union of their keys (the first `PASS_CLOSURE_KEYS_MAX`), one round trip, before the calls; the
-    // drain's sweep pass reads none (a swept event's actor reads its own miss once).
-    if class != crate::owed_actor::SWEEP_CLASS {
-        let wanted: Vec<Option<std::collections::BTreeSet<String>>> = kept
-            .iter()
-            .map(|(ev, _)| crate::owed_actor::closure_wanted(ev))
-            .collect();
+    // statement over the union of their keys (the first `PASS_CLOSURE_KEYS_MAX`), one round trip; the drain's sweep
+    // pass reads none (a swept event's actor reads its own miss once).
+    // D2-ACTOR-F-FOLD-4 (the third delta lens's LOW-1): the events that want no closure are called AT ONCE; the closure
+    // read runs beside them, raced against `DIRECT_CALL_WALL_MS` (past it the filings go on with none: each actor
+    // reads its own miss once, as on a fault), and the filings' bodies follow it.
+    let wanted: Vec<Option<std::collections::BTreeSet<String>>> = kept
+        .iter()
+        .map(|(ev, _)| {
+            if class == crate::owed_actor::SWEEP_CLASS {
+                None
+            } else {
+                crate::owed_actor::closure_wanted(ev)
+            }
+        })
+        .collect();
+    let mut filings: Vec<((OwedEvent, Subjects), std::collections::BTreeSet<String>)> = Vec::new();
+    let mut rest: Vec<(OwedEvent, Subjects)> = Vec::new();
+    for (k, w) in kept.into_iter().zip(wanted) {
+        match w {
+            Some(keys) => filings.push((k, keys)),
+            None => rest.push(k),
+        }
+    }
+    let ctx_of = |v: &[(OwedEvent, Subjects)]| -> Vec<_> {
+        v.iter()
+            .map(|(ev, subjects)| (crate::owed_actor::EventCtx::of(ev), subjects.clone()))
+            .collect()
+    };
+    let rest_bodies = coalesce_direct(ctx_of(&rest), tip);
+    // the filings' bodies are coalesced after their closure (it rides each event's facts); their count, for the pass's
+    // fan-out, does not depend on it (one body an identity and chunk)
+    let filing_events: Vec<(OwedEvent, Subjects)> = filings.iter().map(|(k, _)| k.clone()).collect();
+    let fan_out = (rest_bodies.len() + coalesce_direct(ctx_of(&filing_events), tip).len()) as u32;
+    let immediate = call_bodies(port, rest_bodies, class, fan_out);
+    let after_closure = async {
+        let mut step = ClosureStep::default();
         let union: std::collections::BTreeSet<String> =
-            wanted.iter().flatten().flatten().cloned().collect();
-        if let Some((stmt, read)) = crate::owed_actor::pass_closure_statement(&union) {
+            filings.iter().flat_map(|(_, keys)| keys.iter().cloned()).collect();
+        let n_filings = filings.len();
+        if let Some((stmt, read)) = crate::owed_actor::pass_closure_statement(&union, n_filings) {
             let started = port.now_ms();
-            let row = port.closure_read(stmt).await;
+            let row = {
+                let read_fut = std::pin::pin!(port.closure_read(stmt));
+                let wall = std::pin::pin!(port.sleep_ms(crate::owed_actor::DIRECT_CALL_WALL_MS));
+                match futures_util::future::select(read_fut, wall).await {
+                    futures_util::future::Either::Left((r, _)) => r,
+                    futures_util::future::Either::Right(_) => Err(format!(
+                        "the closure read passed its wall ({} ms)",
+                        crate::owed_actor::DIRECT_CALL_WALL_MS
+                    )),
+                }
+            };
             let ms = port.now_ms().saturating_sub(started);
-            report.closure_calls += 1;
-            report.closure_ms = Some(ms);
-            if let Some(row) = row {
-                for ((ev, _), keys) in kept.iter_mut().zip(&wanted) {
-                    let Some(keys) = keys else { continue };
-                    if let Some(c) = crate::owed_actor::closure_for(keys, &read, &row) {
-                        ev.facts["closure"] = c;
-                        ev.facts["closureMs"] = json!(ms);
-                        report.closures += 1;
+            step.calls = 1;
+            step.ms = Some(ms);
+            match row {
+                Ok(row) => {
+                    for ((ev, _), keys) in filings.iter_mut() {
+                        match crate::owed_actor::closure_for(keys, &read, &row) {
+                            Some(c) => {
+                                ev.facts["closure"] = c;
+                                ev.facts["closureMs"] = json!(ms);
+                                step.closures += 1;
+                            }
+                            None => step.declines += 1,
+                        }
                     }
+                }
+                Err(e) => {
+                    step.faults = 1;
+                    step.fault = Some(e);
                 }
             }
         }
+        let events: Vec<(OwedEvent, Subjects)> = filings.into_iter().map(|(k, _)| k).collect();
+        let bodies = coalesce_direct(ctx_of(&events), tip);
+        (step, call_bodies(port, bodies, class, fan_out).await)
+    };
+    let (now, (step, later)) = futures_util::future::join(immediate, after_closure).await;
+    report.closure_calls = step.calls;
+    report.closure_ms = step.ms;
+    report.closures = step.closures;
+    report.closure_declines = step.declines;
+    report.closure_faults = step.faults;
+    report.closure_fault = step.fault;
+    for o in [now, later] {
+        report.calls += o.calls;
+        report.walls += o.walls;
+        report.faults += o.faults;
+        report.held += o.held;
+        report.acked += o.acked;
+        if report.first_fault.is_none() {
+            report.first_fault = o.first_fault;
+        }
     }
-    let subjects_of: Vec<_> = kept
-        .iter()
-        .map(|(ev, subjects)| (crate::owed_actor::EventCtx::of(ev), subjects.clone()))
-        .collect();
-    let mut bodies = coalesce_direct(subjects_of, tip);
+    report
+}
+
+/// FOLD-4: the pass's closure step (its one statement, raced against the direct wall).
+#[derive(Debug, Default)]
+struct ClosureStep {
+    calls: u64,
+    ms: Option<u64>,
+    closures: u64,
+    declines: u64,
+    faults: u64,
+    fault: Option<String>,
+}
+
+/// FOLD-4: what a set of direct bodies' calls did.
+#[derive(Debug, Default)]
+struct CallsDone {
+    calls: u64,
+    walls: u64,
+    faults: u64,
+    held: u64,
+    acked: u64,
+    first_fault: Option<String>,
+}
+
+/// The direct calls of `bodies` at once (`join_all`), each body stamped with the pass's class and fan-out; in Phase C
+/// each body's acknowledgement bound read BEFORE its call (FIX-956 item 3) and its applied games acknowledged after.
+async fn call_bodies(
+    port: &impl DirectPort,
+    mut bodies: Vec<Value>,
+    class: &'static str,
+    fan_out: u32,
+) -> CallsDone {
+    let mut done = CallsDone::default();
     // FIX-983 (bsv-low #983): the pass's fan-out rides each body; at `FLOOD_CONCURRENCY` or more the object samples
     // the call into the stress class (`flood`), apart from the warm hand's `direct`.
-    let fan_out = bodies.len() as u32;
     for b in &mut bodies {
         b["class"] = json!(class);
         b["concurrent"] = json!(fan_out);
     }
-    report.calls = bodies.len() as u64;
+    done.calls = bodies.len() as u64;
     // FIX-956 item 3: in Phase C each body's acknowledgement bound, read BEFORE its call (a mark written after it is
     // left for the queue's delivery)
     let mut bounds: Vec<Option<(String, Vec<String>, i64)>> = Vec::with_capacity(bodies.len());
@@ -2989,12 +3125,12 @@ pub async fn direct_with_class(
                     .await
                     .is_ok()
             {
-                report.acked += applied.len() as u64;
+                done.acked += applied.len() as u64;
             }
         }
         match answer {
             // D2-ACTOR-B-FOLD-7: a held answer is neither a fault nor a sample (the actor counts it).
-            Ok(a) if crate::owed_actor::is_held(&a) => report.held += 1,
+            Ok(a) if crate::owed_actor::is_held(&a) => done.held += 1,
             Ok(_) if class == crate::owed_actor::SWEEP_CLASS => {}
             Ok(a) => crate::owed_actor::note_answer_as(
                 crate::owed_actor::bars_class(Some("direct"), Some(fan_out)),
@@ -3002,15 +3138,15 @@ pub async fn direct_with_class(
             ),
             Err(e) => {
                 if is_wall(&e) {
-                    report.walls += 1;
+                    done.walls += 1;
                 } else {
-                    report.faults += 1;
+                    done.faults += 1;
                 }
-                report.first_fault.get_or_insert(e);
+                done.first_fault.get_or_insert(e);
             }
         }
     }
-    report
+    done
 }
 
 /// The Worker's direct port: D1's marks and the actor's binding.
@@ -3048,8 +3184,11 @@ impl DirectPort for WorkerDirect {
     async fn ack(&self, stmts: Vec<Stmt>) -> Result<(), String> {
         self.sql.run_batch(stmts).await.map(|_| ())
     }
-    async fn closure_read(&self, stmt: Stmt) -> Option<Value> {
+    async fn closure_read(&self, stmt: Stmt) -> Result<Value, String> {
         crate::owed_actor::read_pass_closure(&self.sql, stmt).await
+    }
+    async fn sleep_ms(&self, ms: u64) {
+        worker::Delay::from(std::time::Duration::from_millis(ms)).await
     }
     fn now_ms(&self) -> u64 {
         worker::Date::now().as_millis()
@@ -3085,11 +3224,17 @@ pub async fn direct_events_as(
     log_direct_fault(&report, worker::Date::now().as_millis(), |l| {
         worker::console_warn!("{l} (the queue's messages are their backstop)");
     });
+    // FOLD-4 (the third delta lens's LOW-2): the closure read's fault, once a minute an isolate.
+    log_closure_fault(&report, worker::Date::now().as_millis(), |l| {
+        worker::console_warn!("{l}");
+    });
     let deltas: Vec<(String, u64)> = [
         (crate::owed_actor::COUNTERS[3], report.calls),
         (crate::owed_actor::COUNTERS[4], report.faults),
         (crate::owed_actor::COUNTERS[25], report.walls),
         (crate::owed_actor::COUNTERS[32], report.closures),
+        (crate::owed_actor::COUNTERS[33], report.closure_faults),
+        (crate::owed_actor::COUNTERS[34], report.closure_declines),
         (publish::COUNTER_DIRECT_ACKED, report.acked),
     ]
     .into_iter()
