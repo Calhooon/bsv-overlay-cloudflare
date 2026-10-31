@@ -66,6 +66,10 @@ pub struct Snapshot {
     /// last apply read the record at). Empty on the D1 read (`rows: true`) and where the actor answered none: then
     /// every pending downgrade mark withholds, as before FIX-968.
     pub covered: BTreeMap<String, i64>,
+    /// D2-ACTOR-F (bsv-low #959): the EXACT generations above [`Snapshot::covered`] whose rows a carried apply applied
+    /// (`owed_actor::carried::COVERED_EXACT_BY_GAME_SQL`, answered `coveredExact`): such a mark is applied, every
+    /// other mark above the covered generation is not (the gate and `pending` count it, as before).
+    pub covered_exact: BTreeMap<String, std::collections::BTreeSet<i64>>,
     /// bsv-low #1004: every pending mark an event carries (`PENDING_SQL`'s `framed`): its game and generation.
     pub framed: Vec<(String, i64)>,
 }
@@ -179,6 +183,7 @@ pub async fn read_with(db: &impl SqlPort, identity: &str, rows: bool) -> Result<
                 == 0,
         downgrades,
         covered: BTreeMap::new(),
+        covered_exact: BTreeMap::new(),
         framed,
     };
     if snapshot.state.is_none() {
@@ -212,15 +217,19 @@ impl Snapshot {
     pub fn actor_pending(&self) -> u64 {
         self.framed
             .iter()
-            .filter(|(game, generation)| {
-                *generation
-                    > self
-                        .covered
-                        .get(&game.to_ascii_lowercase())
-                        .copied()
-                        .unwrap_or(i64::MIN)
-            })
+            .filter(|(game, generation)| !self.applied_by_actor(game, *generation))
             .count() as u64
+    }
+
+    /// Did the actor whose rows are served apply the mark `generation` of `game`: at or below its covered generation
+    /// (FIX-968), or one of the exact marks a carried apply applied (D2-ACTOR-F)?
+    pub fn applied_by_actor(&self, game: &str, generation: i64) -> bool {
+        let game = game.to_ascii_lowercase();
+        generation <= self.covered.get(&game).copied().unwrap_or(i64::MIN)
+            || self
+                .covered_exact
+                .get(&game)
+                .is_some_and(|s| s.contains(&generation))
     }
 
     /// The games the actor's read names for their covered generation: the downgrade games (FIX-968) and the games of
@@ -271,14 +280,9 @@ impl Snapshot {
     /// before this gate.
     pub fn withholding_mark(&self, game: &str) -> Option<&str> {
         let marks = self.downgrades.get(game)?;
-        let covered = self
-            .covered
-            .get(&game.to_ascii_lowercase())
-            .copied()
-            .unwrap_or(i64::MIN);
         marks
             .iter()
-            .filter(|(generation, _)| *generation > covered)
+            .filter(|(generation, _)| !self.applied_by_actor(game, *generation))
             .max_by_key(|(generation, _)| *generation)
             .map(|(_, source)| source.as_str())
     }

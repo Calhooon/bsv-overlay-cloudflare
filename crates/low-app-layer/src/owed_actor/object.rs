@@ -275,6 +275,11 @@ pub struct ApplyBody {
     /// every other dated row keeps the earlier of its stored and fresh dates (`owed_judge::kept_belt_due`).
     #[serde(default)]
     pub belt_asked: Vec<String>,
+    /// D2-ACTOR-F (bsv-low #959): the rows the event's write changed, carried by the writer's direct call
+    /// ([`super::carried::Carried`]). Taken only on a call that names no acknowledgement bound (a direct call: the
+    /// queue's delivery is the narrowed read, which covers the event).
+    #[serde(default)]
+    pub carried: Option<super::carried::Carried>,
 }
 
 #[durable_object]
@@ -490,6 +495,7 @@ impl DurableObject for OwedActor {
                         txids: None,
                         concurrent: None,
                         belt_asked: Vec::new(),
+                        carried: None,
                     };
                     async move {
                         self.apply_route(body)
@@ -863,6 +869,7 @@ impl OwedActor {
             held_at_ms: started,
             bound: body.bound,
             touch: body.txids.clone(),
+            carried: body.carried.clone().filter(|_| body.bound.is_none()),
         };
         // FIX-1018: the belt's asked outpoints, for the judge of this apply (and any apply of `me` it waits on).
         let _asked = crate::owed_judge::belt_asked_scope(&me, &body.belt_asked);
@@ -1151,6 +1158,20 @@ impl OwedActor {
                 .and_then(|c| c.to_array::<Value>().ok())
                 .unwrap_or_default()
         };
+        // D2-ACTOR-F (bsv-low #959): the exact marks a carried apply applied above each game's covered generation.
+        let covered_exact: Vec<Value> = if covered.is_empty() {
+            Vec::new()
+        } else {
+            local
+                .sql
+                .exec(
+                    super::carried::COVERED_EXACT_BY_GAME_SQL,
+                    vec![SqlStorageValue::from(json!(covered).to_string())],
+                )
+                .ok()
+                .and_then(|c| c.to_array::<Value>().ok())
+                .unwrap_or_default()
+        };
         Response::from_json(&json!({
             "identity": me,
             "fresh": false,
@@ -1159,6 +1180,7 @@ impl OwedActor {
             "joined": read(crate::owed_read::ROWS_SQL),
             "state": read(crate::owed_read::STATE_SQL).first(),
             "covered": covered,
+            "coveredExact": covered_exact,
             "ackSeq": self.meta(META_ACK).and_then(|s| s.parse::<i64>().ok()),
             "judgedAtMs": self.meta(META_JUDGED_AT).and_then(|s| s.parse::<u64>().ok()),
         }))
@@ -1566,6 +1588,7 @@ pub(crate) async fn read_snapshot_with(
         }
     };
     snapshot.covered = covered_of(&answer);
+    snapshot.covered_exact = super::carried::covered_exact_of(&answer);
     if answer["bootstrapped"] != true {
         if answer["bootstrapArmed"] != true {
             if let Err(e) = actor.bootstrap(identity).await {

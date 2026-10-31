@@ -590,6 +590,7 @@ impl JudgeDb for D1Judge {
             txids: None,
             also: Vec::new(),
             by_identity: Default::default(),
+            carried: Default::default(),
         };
         // bsv-low #953 item 6: every apply the belt's port makes carries the served tip (the consumer's own).
         let tip = match self.tip {
@@ -1681,6 +1682,7 @@ pub(crate) fn assert_fixture_roundtrip(i: &OwedInputs<'_>) {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let snapshot = crate::owed_read::Snapshot {
+        covered_exact: Default::default(),
         joined,
         state: Some(json!({"computedAtMs":i.now_ms,"tip":i.tip,"truncated":0})),
         pending: 0,

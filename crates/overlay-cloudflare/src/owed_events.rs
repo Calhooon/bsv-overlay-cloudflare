@@ -66,31 +66,51 @@ macro_rules! marks_and {
     };
 }
 
+/// D2-ACTOR-F (bsv-low #959): [`marks_and`] for a source that CARRIES ITS ROW: two more columns in the SAME statement
+/// (no statement added to the publish batch, so none to the door's): `subjects`, the pair's marks named
+/// (`[identity, gameId, generation]`, read in the same transaction as the row, so the row is the record after every
+/// one of them), and `payload`, the mirror's rows of every table the write changed, each an item
+/// `{t: table, c: [key columns], k: [[key values]], r: [rows]}` whose rows are the WHOLE domain `c = k` of `t` as the
+/// record holds it (`__rowid` and every column the actor's mirror stores, `low-app-layer` `owed_actor::schema`,
+/// pinned there column for column). `payload` is NULL where the statement cannot name the whole domain (a party
+/// marker whose rows are gone: its links' change is not readable from it).
+macro_rules! marks_and_payload {
+    ($facts:expr, $payload:expr) => {
+        concat!(
+            "SELECT (SELECT COUNT(*) FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey=?2 AND source=?1) AS marks,(",
+            $facts,
+            ") AS facts,(SELECT json_group_array(json_array(identity,gameId,generation)) FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey=?2 AND source=?1) AS subjects,(",
+            $payload,
+            ") AS payload"
+        )
+    };
+}
+
 /// `pot` (`txid:vout`): the pot row's own columns (no bytes).
 pub const READ_POT_SQL: &str = marks_and!("SELECT json_object('txid',txid,'vout',outputIndex,'spent',spent,'spendingTxid',spendingTxid,'spentConfirmed',spentConfirmed,'spentHeight',spentHeight,'lockKind',lockKind,'potSats',potSats,'recoveryHeight',recoveryHeight,'verdict',verdict,'createdAt',createdAt) FROM pot_records WHERE txid=?3 AND outputIndex=?4");
 /// `party` (the marker's `txid`).
-pub const READ_PARTY_SQL: &str = marks_and!("SELECT json_group_array(json_object('identity',identity,'opponentIdentity',opponentIdentity,'gameId',gameId,'potTxid',potTxid,'potVout',potVout,'recoveryHeight',recoveryHeight,'seatSettlePubkey',seatSettlePubkey,'sigValid',sigValid,'outputIndex',outputIndex)) FROM potparty_records WHERE txid=?3");
+pub const READ_PARTY_SQL: &str = marks_and_payload!("SELECT json_group_array(json_object('identity',identity,'opponentIdentity',opponentIdentity,'gameId',gameId,'potTxid',potTxid,'potVout',potVout,'recoveryHeight',recoveryHeight,'seatSettlePubkey',seatSettlePubkey,'sigValid',sigValid,'outputIndex',outputIndex)) FROM potparty_records WHERE txid=?3", "SELECT CASE WHEN EXISTS (SELECT 1 FROM potparty_records WHERE txid=?3) THEN json_array(json_object('t','potparty_records','c',json_array('txid'),'k',json_array(json_array(?3)),'r',(SELECT json_group_array(json_object('__rowid',rowid,'identity',identity,'opponentIdentity',opponentIdentity,'gameId',gameId,'potTxid',potTxid,'potVout',potVout,'recoveryHeight',recoveryHeight,'sigHex',sigHex,'txid',txid,'outputIndex',outputIndex,'createdAt',createdAt,'seatSettlePubkey',seatSettlePubkey,'seatSigHex',seatSigHex,'sigValid',sigValid)) FROM potparty_records WHERE txid=?3)),json_object('t','hop_pot_links','c',json_array('potTxid'),'k',(SELECT json_group_array(json_array(potTxid)) FROM (SELECT DISTINCT potTxid FROM potparty_records WHERE txid=?3)),'r',(SELECT json_group_array(json_object('__rowid',rowid,'identity',identity,'createdAt',createdAt,'potTxid',potTxid,'potVout',potVout,'markerRowid',markerRowid)) FROM hop_pot_links WHERE potTxid IN (SELECT potTxid FROM potparty_records WHERE txid=?3)))) END");
 /// `hop` (`txid:hopVout`): the hop's markers, its released evidence and its missing-evidence rows.
 pub const READ_HOP_SQL: &str = marks_and!("SELECT json_object('markers',(SELECT json_group_array(json_object('identity',identity,'opponentIdentity',opponentIdentity,'gameId',gameId,'hopSats',hopSats,'seatSettlePubkey',seatSettlePubkey,'markerValid',markerValid,'outputIndex',outputIndex)) FROM hopparty_records INDEXED BY idx_hopparty_hop WHERE txid=?3 AND hopVout=?4),'released',(SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'potTxid',potTxid,'seatSettlePubkey',seatSettlePubkey,'hopSats',hopSats,'evictedAt',evictedAt)) FROM released_hop_evidence WHERE hopTxid=?3 AND hopVout=?4),'missing',(SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'potTxid',potTxid,'evictedAt',evictedAt,'bytesRead',bytesRead)) FROM released_hop_evidence_missing INDEXED BY idx_released_missing_hop WHERE hopTxid=?3 AND hopVout=?4))");
 /// `refund` (the backup's `txid`).
-pub const READ_REFUND_SQL: &str = marks_and!("SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'potTxid',potTxid,'potVout',potVout,'refundValid',refundValid,'outputIndex',outputIndex)) FROM potrefund_records WHERE txid=?3");
+pub const READ_REFUND_SQL: &str = marks_and_payload!("SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'potTxid',potTxid,'potVout',potVout,'refundValid',refundValid,'outputIndex',outputIndex)) FROM potrefund_records WHERE txid=?3", "SELECT json_array(json_object('t','potrefund_records','c',json_array('txid'),'k',json_array(json_array(?3)),'r',(SELECT json_group_array(json_object('__rowid',rowid,'identity',identity,'gameId',gameId,'potTxid',potTxid,'potVout',potVout,'refundRawHex',refundRawHex,'sigHex',sigHex,'txid',txid,'outputIndex',outputIndex,'createdAt',createdAt,'refundValid',refundValid)) FROM potrefund_records WHERE txid=?3)))");
 /// `result` (the marker's `txid`).
-pub const READ_RESULT_SQL: &str = marks_and!("SELECT json_group_array(json_object('gameId',gameId,'winner',winner,'loser',loser,'potTxid',potTxid,'settleTxid',settleTxid,'claimValid',claimValid,'outputIndex',outputIndex)) FROM result_markers_v2 WHERE txid=?3");
+pub const READ_RESULT_SQL: &str = marks_and_payload!("SELECT json_group_array(json_object('gameId',gameId,'winner',winner,'loser',loser,'potTxid',potTxid,'settleTxid',settleTxid,'claimValid',claimValid,'outputIndex',outputIndex)) FROM result_markers_v2 WHERE txid=?3", "SELECT json_array(json_object('t','result_markers_v2','c',json_array('txid'),'k',json_array(json_array(?3)),'r',(SELECT json_group_array(json_object('__rowid',rowid,'gameId',gameId,'winner',winner,'loser',loser,'potTxid',potTxid,'settleTxid',settleTxid,'winnerSigHex',winnerSigHex,'loserSigHex',loserSigHex,'txid',txid,'outputIndex',outputIndex,'createdAt',createdAt,'cardsHex',cardsHex,'claimValid',claimValid)) FROM result_markers_v2 WHERE txid=?3)))");
 /// `collected` (the marker's `txid`).
-pub const READ_COLLECTED_SQL: &str = marks_and!("SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'payTxid',payTxid,'outputIndex',outputIndex)) FROM collected_markers_v2 WHERE txid=?3");
+pub const READ_COLLECTED_SQL: &str = marks_and_payload!("SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'payTxid',payTxid,'outputIndex',outputIndex)) FROM collected_markers_v2 WHERE txid=?3", "SELECT json_array(json_object('t','collected_markers_v2','c',json_array('txid'),'k',json_array(json_array(?3)),'r',(SELECT json_group_array(json_object('__rowid',rowid,'identity',identity,'gameId',gameId,'txid',txid,'outputIndex',outputIndex,'sigHex',sigHex,'createdAt',createdAt,'payTxid',payTxid)) FROM collected_markers_v2 WHERE txid=?3)))");
 /// `sweep` (the filing's `txid`; the raw bytes are not read).
-pub const READ_SWEEP_SQL: &str = marks_and!("SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'hopTxid',hopTxid,'hopVout',hopVout,'sweepTxid',sweepTxid,'outputIndex',outputIndex)) FROM hopsweep_records WHERE txid=?3");
+pub const READ_SWEEP_SQL: &str = marks_and_payload!("SELECT json_group_array(json_object('identity',identity,'gameId',gameId,'hopTxid',hopTxid,'hopVout',hopVout,'sweepTxid',sweepTxid,'outputIndex',outputIndex)) FROM hopsweep_records WHERE txid=?3", "SELECT json_array(json_object('t','hopsweep_records','c',json_array('txid'),'k',json_array(json_array(?3)),'r',(SELECT json_group_array(json_object('__rowid',rowid,'identity',identity,'gameId',gameId,'hopTxid',hopTxid,'hopVout',hopVout,'sweepTxid',sweepTxid,'sweepRawHex',sweepRawHex,'txid',txid,'outputIndex',outputIndex,'createdAt',createdAt)) FROM hopsweep_records WHERE txid=?3)))");
 /// `eviction` (the evicted `txid`).
 pub const READ_EVICTION_SQL: &str = marks_and!("SELECT json_object('reason',reason,'evictedAt',evictedAt,'readmittedAt',readmittedAt,'rowsMoved',rowsMoved,'releasedSpends',json(COALESCE(releasedSpends,'[]'))) FROM pot_evictions WHERE txid=?3");
 /// `seen` (the witnessed `txid`).
-pub const READ_SEEN_SQL: &str = marks_and!("SELECT json_object('seenAt',seenAt,'seenSource',seenSource,'sourceAtMs',sourceAtMs) FROM network_seen WHERE txid=?3");
+pub const READ_SEEN_SQL: &str = marks_and_payload!("SELECT json_object('seenAt',seenAt,'seenSource',seenSource,'sourceAtMs',sourceAtMs) FROM network_seen WHERE txid=?3", "SELECT json_array(json_object('t','network_seen','c',json_array('txid'),'k',json_array(json_array(?3)),'r',(SELECT json_group_array(json_object('__rowid',rowid,'txid',txid,'seenAt',seenAt,'seenSource',seenSource,'sourceAtMs',sourceAtMs)) FROM network_seen WHERE txid=?3)))");
 /// `word` (the `txid`): the word, never its legacy body (MEDIUM-4: the words and their recheck stay the read's).
-pub const READ_WORD_SQL: &str = marks_and!("SELECT json_object('word',word,'tier',tier,'height',height,'proofRoot',proof_root,'headerHash',header_hash,'hintSource',hint_source,'hintAt',hint_at,'updatedAt',updated_at) FROM tx_words WHERE txid=?3");
+pub const READ_WORD_SQL: &str = marks_and_payload!("SELECT json_object('word',word,'tier',tier,'height',height,'proofRoot',proof_root,'headerHash',header_hash,'hintSource',hint_source,'hintAt',hint_at,'updatedAt',updated_at) FROM tx_words WHERE txid=?3", "SELECT json_array(json_object('t','tx_words','c',json_array('txid'),'k',json_array(json_array(?3)),'r',(SELECT json_group_array(json_object('__rowid',rowid,'txid',txid,'word',word,'tier',tier,'height',height,'proof_root',proof_root,'proof_height',proof_height,'proof_hex',proof_hex,'header_hash',header_hash,'hint_source',hint_source,'hint_at',hint_at,'updated_at',updated_at,'legacy_body',legacy_body)) FROM tx_words WHERE txid=?3)))");
 /// `beef` (the `txid`): the proof flags, never the bytes: the pot store's row, else (FIX-1001, a filed sweep's proof)
 /// the engine's `transactions` row.
 pub const READ_BEEF_SQL: &str = marks_and!("SELECT COALESCE((SELECT json_object('hasProof',has_proof,'proofVerified',proof_verified,'proofHeight',proofHeight,'structurallyUnprovable',structurally_unprovable,'createdAt',createdAt) FROM pot_beefs WHERE txid=?3),(SELECT json_object('hasProof',has_proof,'proofHeight',proofHeight,'store','transactions') FROM transactions WHERE txid=?3))");
 /// `refusal` (`hopTxid:hopVout`).
-pub const READ_REFUSAL_SQL: &str = marks_and!("SELECT json_object('refusedTxid',refusedTxid,'reason',reason,'refusedAt',refusedAt) FROM submit_refusals WHERE hopTxid=?3 AND hopVout=?4");
+pub const READ_REFUSAL_SQL: &str = marks_and_payload!("SELECT json_object('refusedTxid',refusedTxid,'reason',reason,'refusedAt',refusedAt) FROM submit_refusals WHERE hopTxid=?3 AND hopVout=?4", "SELECT json_array(json_object('t','submit_refusals','c',json_array('hopTxid','hopVout'),'k',json_array(json_array(?3,?4)),'r',(SELECT json_group_array(json_object('__rowid',rowid,'hopTxid',hopTxid,'hopVout',hopVout,'refusedTxid',refusedTxid,'reason',reason,'refusedAt',refusedAt)) FROM submit_refusals WHERE hopTxid=?3 AND hopVout=?4)))");
 /// `identity` (the hook's identity-only note): does the identity hold any mark? (The D2-ACTOR-A lens's LOW-6: an
 /// identity with nothing pending is not sent.) One covering-index probe; no facts.
 pub const READ_IDENTITY_SQL: &str = "SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM owed_dirty INDEXED BY idx_owed_dirty_identity_marked WHERE identity=?2 AND ?1='identity' LIMIT 1)) AS marks,NULL AS facts";
@@ -477,6 +497,40 @@ pub fn reads_row(n: &Noted) -> bool {
     n.held.is_none() && read_sql(&n.source).is_some()
 }
 
+/// D2-ACTOR-F (bsv-low #959): the most bytes one event's carried rows may take (its `payload` serialized). The event
+/// rides a queue message (128 KB) and the overlay's `/internal/owed-direct` body: past this the row is not carried and
+/// the actor reads it from D1 as before (a hop sweep's raw or a word's proof is a few KB; a page never is).
+pub const PAYLOAD_MAX_BYTES: usize = 32_768;
+
+/// PURE (D2-ACTOR-F): the carried row of one read, into the event's facts: `subjects` (the pair's marks named) and
+/// `payload` (the rows, [`marks_and_payload`]) when the statement answered both, every subject names a game, and the
+/// payload fits [`PAYLOAD_MAX_BYTES`]; otherwise neither (the actor's narrowed D1 read, as before). A source whose
+/// statement carries no row answers no such column and is left as it was.
+pub fn carry_payload(row: &Value, facts: &mut Value) {
+    let parse = |v: &Value| match v {
+        Value::String(s) => serde_json::from_str::<Value>(s).ok(),
+        Value::Array(_) => Some(v.clone()),
+        _ => None,
+    };
+    let (Some(subjects), Some(payload)) = (parse(&row["subjects"]), parse(&row["payload"])) else {
+        return;
+    };
+    let named = subjects.as_array().is_some_and(|s| {
+        !s.is_empty()
+            && s.iter().all(|m| {
+                m[0].as_str().is_some_and(|i| !i.is_empty())
+                    && m[1].as_str().is_some_and(|g| !g.is_empty())
+                    && m[2].as_i64().is_some()
+            })
+    });
+    let items = payload.as_array().is_some_and(|p| !p.is_empty());
+    if !named || !items || payload.to_string().len() > PAYLOAD_MAX_BYTES {
+        return;
+    }
+    facts["subjects"] = subjects;
+    facts["payload"] = payload;
+}
+
 /// THE PUBLISH, transport injected (the Workers' ports and the pins run exactly this): at most
 /// [`owed_event::PUBLISH_MAX`] notes (the rest answered `unsent`, for the caller's next publish or the sweep), the
 /// seq and the rows in ONE batch, then the sends, 100 a batch.
@@ -531,7 +585,11 @@ pub async fn publish_with(port: &impl PublishPort, mut notes: Vec<Noted>) -> Pub
                 .and_then(|r| r["facts"].as_str())
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
                 .unwrap_or(Value::Null);
-            json!({ "marks": marks, "row": facts })
+            let mut facts = json!({ "marks": marks, "row": facts });
+            if let Some(row) = &row {
+                carry_payload(row, &mut facts);
+            }
+            facts
         } else {
             Value::Null
         };

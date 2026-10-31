@@ -3763,6 +3763,7 @@ fn fold7_meta(local: &SqliteSql, name: &str) -> Option<String> {
 
 fn fold7_event(kind: &str, seq: i64, games: &[String], at_ms: u64) -> HeldEvent {
     HeldEvent {
+        carried: Default::default(),
         kind: Some(kind.into()),
         seq: Some(seq),
         games: games.to_vec(),
@@ -6209,6 +6210,7 @@ async fn fold9_g_a_reconcile_reapply_keeps_the_judged_tip() {
     );
     let games = games_of(&record, "owner");
     let ev = HeldEvent {
+        carried: Default::default(),
         kind: Some("reconcile".into()),
         seq: None,
         games: games.clone(),
@@ -6385,6 +6387,7 @@ async fn fold10_a_a_stale_tip_direct_apply_never_makes_the_blocks_delivery_a_dup
         .unwrap();
     d_mark(&w2, &g0[0], "gate");
     let tipless = HeldEvent {
+        carried: Default::default(),
         kind: Some("tip".into()),
         seq: Some(12),
         games: g0.clone(),
@@ -6711,6 +6714,7 @@ async fn fold10_f_a_burst_for_one_identity_is_one_call() {
         .map(|n| {
             (
                 EventCtx {
+                    carried: Default::default(),
                     kind: "pot".into(),
                     seq: n,
                     at_ms: 1,
@@ -7197,6 +7201,7 @@ async fn d2_actor_e_b_a_burst_of_64_events_for_one_identity_is_two_judge_passes(
     let yielding = Yielding(&record);
     let calls = (0..64).map(|k| {
         let item = BurstItem {
+            carried: Default::default(),
             games: vec![games[k].clone()],
             kind_seq: Some(("pot".into(), 100 + k as i64)),
             tip: Some(TIP),
@@ -8887,6 +8892,7 @@ async fn fold14_c_the_apply_stages_sum_to_the_apply_and_are_served() {
     let turn = futures_util::lock::Mutex::new(());
     let yielding = Yielding(&record);
     let item = |k: usize| BurstItem {
+        carried: Default::default(),
         games: vec![games[k].clone()],
         kind_seq: Some(("pot".into(), 200 + k as i64)),
         tip: Some(TIP),
@@ -11033,6 +11039,7 @@ async fn fix983_warm_hand() -> (SqliteSql, SqliteSql, Vec<String>) {
 }
 fn fix983_event(games: &[String], seq: i64) -> HeldEvent {
     HeldEvent {
+        carried: Default::default(),
         kind: Some("pot".into()),
         seq: Some(seq),
         games: games.to_vec(),
@@ -14514,5 +14521,380 @@ mod fix1018 {
         assert!(judge.contains("letasked=belt_asked_now(identity);if!asked.is_empty(){body[\"beltAsked\"]=json!(asked);}"));
         let object: String = include_str!("object.rs").split_whitespace().collect();
         assert!(object.contains("let_asked=crate::owed_judge::belt_asked_scope(&me,&body.belt_asked);"));
+    }
+}
+
+// ---- D2-ACTOR-F (bsv-low #959): the frame and the direct call carry the writer's row ----
+mod d2_actor_f {
+    use super::*;
+    use crate::owed_events_publish as publish;
+    use carried::{Carried, CarriedItem};
+
+    /// One note published over the record exactly as a writer's flush publishes it (the shared statement, one batch).
+    async fn published(record: &SqliteSql, source: &str, key: &str) -> overlay_discovery::owed_event::OwedEvent {
+        let port = crate::owed_events::SqlPublish {
+            db: record,
+            send: |_b: Vec<String>| async { Ok::<(), String>(()) },
+        };
+        let out = publish::publish_with(
+            &port,
+            vec![publish::Noted {
+                source: source.into(),
+                key: key.into(),
+                held: None,
+            }],
+        )
+        .await;
+        assert!(out.fault.is_none(), "{:?}", out.fault);
+        out.sent.into_iter().next().expect("the note was sent")
+    }
+
+    /// The mark the source row's trigger writes (upserted: a trigger that wrote it already moves its generation).
+    fn mark(record: &SqliteSql, game: &str, source: &str, key: &str) {
+        record
+            .conn
+            .execute(
+                "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner',?1,?2,?3,1) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=(SELECT COALESCE(MAX(generation),0)+1 FROM owed_dirty)",
+                [game, source, key],
+            )
+            .unwrap();
+    }
+
+    fn opts_of(ev: &overlay_discovery::owed_event::OwedEvent, carry: bool) -> ApplyOpts {
+        let e = EventCtx::of(ev);
+        ApplyOpts {
+            touch: e.txids.clone(),
+            carried: if carry { e.carried.get("owner").cloned() } else { None },
+            ..ApplyOpts::default()
+        }
+    }
+
+    async fn applied(
+        record: &SqliteSql,
+        local: &SqliteSql,
+        games: &[String],
+        ev: &overlay_discovery::owed_event::OwedEvent,
+        carry: bool,
+    ) -> (ApplyReport, u64) {
+        let b0 = record.batches.get();
+        let (report, _) = apply_with(
+            record,
+            local,
+            &Fakes,
+            "owner",
+            games,
+            Some((ev.source.as_str(), ev.seq)),
+            Some(TIP),
+            None,
+            &opts_of(ev, carry),
+        )
+        .await
+        .unwrap();
+        (report, (record.batches.get() - b0) as u64)
+    }
+
+    async fn cold(record: &SqliteSql, game: &str) -> Vec<String> {
+        let c = mirror();
+        apply(record, &c, &Fakes, "owner", &[game.to_string()], None, Some(TIP), None)
+            .await
+            .unwrap();
+        stored_game(&c, "owner", game)
+    }
+
+    /// (f_a) A WARM APPLY OF A CARRIED WRITE READS NO D1: on a 40-game warm seat, the network's SEEN of game 7's pot
+    /// (`network_seen`, a key the mirror read) published as the writer publishes it carries its subjects and its row;
+    /// the actor upserts the row and judges game 7 with ZERO record calls, and stores exactly the rows a cold full
+    /// apply stores from the record. The same event without its row (main's direct call, the narrowed read) makes one
+    /// record call: RED on main, where no frame carries a row (`left: 1 right: 0`).
+    #[tokio::test]
+    async fn d2_actor_f_a_warm_carried_apply_reads_no_d1() {
+        let (record, local, games) = e_warm_seat(40).await;
+        let pot = h("c8", 7);
+        record
+            .conn
+            .execute(
+                "INSERT INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'2026-10-30 00:00:00','arcade',?2)",
+                rusqlite::params![pot, NOW_MS as i64],
+            )
+            .unwrap();
+        mark(&record, &games[7], "seen", &pot);
+        let ev = published(&record, "seen", &pot).await;
+        assert!(ev.facts.get("payload").is_some(), "the seen pair carries its row: {}", ev.facts);
+        let e = EventCtx::of(&ev);
+        assert!(e.carried.contains_key("owner"));
+        // main's road first, on a copy of the warm mirror: one record call
+        let main_mirror = mirror();
+        for chunk in games.chunks(GAMES_PER_APPLY) {
+            apply(&record, &main_mirror, &Fakes, "owner", chunk, Some(("bootstrap", 1)), Some(TIP), None)
+                .await
+                .unwrap();
+        }
+        let (r_main, calls_main) = applied(&record, &main_mirror, &games[7..8], &ev, false).await;
+        assert!(!r_main.carried);
+        let (report, calls) = applied(&record, &local, &games[7..8], &ev, true).await;
+        eprintln!("f_a: the warm apply's record calls: narrowed {calls_main}, carried {calls} (read {} ms)", report.read_ms);
+        assert_eq!(calls_main, 1, "main's warm apply is one record read");
+        assert!(report.carried && report.misses == 0);
+        assert_eq!(calls, 0, "a warm carried apply reads no D1");
+        assert_eq!(stored_game(&local, "owner", &games[7]), cold(&record, &games[7]).await);
+        assert_eq!(stored_game(&local, "owner", &games[7]), stored_game(&main_mirror, "owner", &games[7]));
+    }
+
+    /// (f_b) A CARRIED ROW NAMING A KEY THE MIRROR NEVER READ IS ONE READ (the cold miss, never two): a collected
+    /// filing for game 9 names its marker's txid and a payout txid the mirror holds nothing of; the carried apply reads
+    /// those keys alone in one record call and stores the cold apply's rows.
+    #[tokio::test]
+    async fn d2_actor_f_b_a_new_key_is_one_read() {
+        let (record, local, games) = e_warm_seat(40).await;
+        let marker = h("a1", 9);
+        let pay = h("a2", 9);
+        record
+            .conn
+            .execute(
+                "INSERT INTO collected_markers_v2(identity,gameId,txid,outputIndex,sigHex,createdAt,payTxid) VALUES ('owner',?1,?2,0,'00',?3,?4)",
+                rusqlite::params![games[9], marker, (NOW_MS / 1000) as i64, pay],
+            )
+            .unwrap();
+        mark(&record, &games[9], "collected", &marker);
+        let ev = published(&record, "collected", &marker).await;
+        let (report, calls) = applied(&record, &local, &games[9..10], &ev, true).await;
+        assert!(report.carried);
+        assert_eq!(calls, 1, "the new keys are one record read");
+        assert_eq!(stored_game(&local, "owner", &games[9]), cold(&record, &games[9]).await);
+    }
+
+    /// (f_c) AN OLDER CARRIED ROW NEVER OVERWRITES A NEWER ONE: the seat's seen of game 7 published twice (the second
+    /// after the row moved), applied newer first, then the older: the older item is skipped and the mirror keeps the
+    /// newer row. And a record read at or past the payload's generation (the narrowed read) wins over it too.
+    #[tokio::test]
+    async fn d2_actor_f_c_the_generation_guard() {
+        let (record, local, games) = e_warm_seat(20).await;
+        let pot = h("c8", 7);
+        record
+            .conn
+            .execute(
+                "INSERT INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'old','arcade',1)",
+                [&pot],
+            )
+            .unwrap();
+        mark(&record, &games[7], "seen", &pot);
+        let older = published(&record, "seen", &pot).await;
+        record
+            .conn
+            .execute("UPDATE network_seen SET seenAt='new' WHERE txid=?1", [&pot])
+            .unwrap();
+        mark(&record, &games[7], "seen", &pot);
+        let newer = published(&record, "seen", &pot).await;
+        let seen_at = |l: &SqliteSql| -> String {
+            l.conn
+                .query_row("SELECT seenAt FROM network_seen WHERE txid=?1", [&pot], |r| r.get(0))
+                .unwrap()
+        };
+        applied(&record, &local, &games[7..8], &newer, true).await;
+        assert_eq!(seen_at(&local), "new");
+        let (r, calls) = applied(&record, &local, &games[7..8], &older, true).await;
+        assert!(r.carried && calls == 0);
+        assert_eq!(seen_at(&local), "new", "an older carried row is never upserted over a newer one");
+        // a narrowed read at the newer generation, then the older row again: still the read's
+        let local2 = mirror();
+        for chunk in games.chunks(GAMES_PER_APPLY) {
+            apply(&record, &local2, &Fakes, "owner", chunk, Some(("bootstrap", 1)), Some(TIP), None)
+                .await
+                .unwrap();
+        }
+        applied(&record, &local2, &games[7..8], &newer, false).await;
+        applied(&record, &local2, &games[7..8], &older, true).await;
+        assert_eq!(seen_at(&local2), "new", "a record read at or past the generation wins");
+    }
+
+    /// (f_d) ANY DOUBT IS THE D1 READ: a carried row whose columns are not the mirror's, a table the mirror does not
+    /// hold, a row outside its own domain: the carried path is not taken and the apply is the narrowed read.
+    #[tokio::test]
+    async fn d2_actor_f_d_a_shape_the_mirror_cannot_take_is_the_narrowed_read() {
+        let (record, local, games) = e_warm_seat(12).await;
+        let pot = h("c8", 3);
+        record
+            .conn
+            .execute(
+                "INSERT INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'x','arcade',1)",
+                [&pot],
+            )
+            .unwrap();
+        mark(&record, &games[3], "seen", &pot);
+        let ev = published(&record, "seen", &pot).await;
+        let good = EventCtx::of(&ev).carried["owner"].clone();
+        let bend = |f: &dyn Fn(&mut CarriedItem)| {
+            let mut c: Carried = good.clone();
+            f(&mut c.items[0]);
+            c
+        };
+        let bad = [
+            bend(&|i| i.r = vec![json!({"__rowid": 1, "txid": pot}).to_string()]),
+            bend(&|i| i.t = "owed_rows".into()),
+            bend(&|i| i.k = vec![json!([h("dd", 1)]).to_string()]),
+            bend(&|i| i.t = "pot_beefs".into()),
+        ];
+        for c in bad {
+            assert!(carried::item_statements(&c.items[0]).is_err());
+            let b0 = record.batches.get();
+            let (r, _) = apply_with(
+                &record,
+                &local,
+                &Fakes,
+                "owner",
+                &games[3..4],
+                None,
+                Some(TIP),
+                None,
+                &ApplyOpts {
+                    touch: EventCtx::of(&ev).txids,
+                    carried: Some(c),
+                    ..ApplyOpts::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!r.carried && r.narrowed);
+            assert_eq!(record.batches.get() - b0, 1);
+        }
+    }
+
+    /// (f_e) EVERY CARRIED STATEMENT NAMES THE MIRROR'S COLUMNS, column for column: each carrier's payload, published
+    /// over the migrated record, is items of mirror tables whose rows carry `__rowid` and exactly
+    /// `schema::columns(table)`, and every item passes the actor's own check. RED when a migration moves a carried
+    /// table and the publish's column list was not moved with it.
+    #[tokio::test]
+    async fn d2_actor_f_e_the_carried_columns_are_the_mirrors() {
+        let record = SqliteSql::migrated();
+        let g = "game-1";
+        let id = "owner";
+        let t = |p: &str| h(p, 1);
+        let seeds = [
+            ("party", t("e1"), format!("INSERT INTO potparty_records(identity,opponentIdentity,gameId,potTxid,potVout,recoveryHeight,sigHex,txid,outputIndex,createdAt,sigValid) VALUES ('{id}','other','{g}','{}',0,1,'00','{}',1,1,1)", t("c1"), t("e1"))),
+            ("collected", t("e2"), format!("INSERT INTO collected_markers_v2(identity,gameId,txid,outputIndex,sigHex,createdAt,payTxid) VALUES ('{id}','{g}','{}',0,'00',1,'{}')", t("e2"), t("a2"))),
+            ("refund", t("e3"), format!("INSERT INTO potrefund_records(identity,gameId,potTxid,potVout,refundRawHex,sigHex,txid,outputIndex,createdAt) VALUES ('{id}','{g}','{}',0,'00','00','{}',0,1)", t("c1"), t("e3"))),
+            ("result", t("e4"), format!("INSERT INTO result_markers_v2(gameId,winner,loser,potTxid,settleTxid,winnerSigHex,loserSigHex,txid,outputIndex,createdAt) VALUES ('{g}','{id}','other','{}','{}','00','00','{}',0,1)", t("c1"), t("a4"), t("e4"))),
+            ("sweep", t("e5"), format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES ('{id}','{g}','{}',0,'{}','00','{}',0,1)", t("b5"), t("a5"), t("e5"))),
+            ("seen", t("c1"), format!("INSERT INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES ('{}','x','arcade',1)", t("c1"))),
+            ("word", t("c1"), format!("INSERT INTO tx_words(txid,word,tier,updated_at) VALUES ('{}','seen','hint',1)", t("c1"))),
+            ("refusal", format!("{}:0", t("b5")), format!("INSERT INTO submit_refusals(hopTxid,hopVout,refusedTxid,reason,refusedAt) VALUES ('{}',0,'{}','x',1)", t("b5"), t("a6"))),
+        ];
+        for (source, key, seed) in seeds {
+            record.conn.execute_batch(&seed).unwrap_or_else(|e| panic!("{source}: {e}"));
+            record
+                .conn
+                .execute(
+                    "INSERT OR IGNORE INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES (?1,?2,?3,?4,1)",
+                    [id, g, source, key.as_str()],
+                )
+                .unwrap();
+            let ev = published(&record, source, &key).await;
+            let c = Carried::of_event(&ev.facts, id).unwrap_or_else(|| panic!("{source} carries its row: {}", ev.facts));
+            assert!(!c.items.is_empty(), "{source}");
+            for it in &c.items {
+                let stmts = carried::item_statements(it).unwrap_or_else(|e| panic!("{source}: {e}"));
+                let rows: Vec<Value> = it.r.iter().map(|r| serde_json::from_str(r).unwrap()).collect();
+                if it.t != "hop_pot_links" {
+                    assert!(!rows.is_empty(), "{source}: {} rows", it.t);
+                }
+                for r in &rows {
+                    let mut got: Vec<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();
+                    got.retain(|k| *k != "__rowid");
+                    got.sort();
+                    let mut want: Vec<&str> = schema::columns(&it.t).to_vec();
+                    want.sort();
+                    assert_eq!(got, want, "{source}: {}", it.t);
+                }
+                assert!(!stmts.is_empty());
+            }
+            // the carried subjects are the pair's marks (a result's trigger marks both its parties)
+            assert!(carried::carried_subjects(&ev.facts)
+                .unwrap()
+                .contains(&(id.to_string(), vec![g.to_string()])));
+        }
+        // a source whose write moves rows it cannot name carries none (`pot`, `eviction`, `hop`, `beef`)
+        for source in ["pot", "hop", "eviction", "beef"] {
+            let sql = publish::read_sql(source).unwrap();
+            assert!(!sql.contains("AS payload"), "{source} takes the narrowed read");
+        }
+    }
+
+    /// (f_f) THE READ COUNTS A CARRIED MARK APPLIED, AND ONLY IT: the exact generation a carried apply recorded is
+    /// applied for the read's `pending` and the downgrade gate; a mark above the covered generation it did not carry
+    /// still withholds.
+    #[tokio::test]
+    async fn d2_actor_f_f_the_read_counts_the_carried_mark_alone() {
+        let (record, local, games) = e_warm_seat(12).await;
+        let pot = h("c8", 2);
+        record
+            .conn
+            .execute("INSERT INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'x','arcade',1)", [&pot])
+            .unwrap();
+        mark(&record, &games[2], "seen", &pot);
+        let ev = published(&record, "seen", &pot).await;
+        applied(&record, &local, &games[2..3], &ev, true).await;
+        let g = ev.facts["subjects"][0][2].as_i64().unwrap();
+        let rows = local
+            .run_batch(vec![Stmt::new(
+                carried::COVERED_EXACT_BY_GAME_SQL,
+                vec![Bind::Text(json!([games[2].to_ascii_lowercase()]).to_string())],
+            )])
+            .await
+            .unwrap();
+        let exact = carried::covered_exact_of(&json!({"coveredExact": rows[0].rows}));
+        assert!(exact[&games[2].to_ascii_lowercase()].contains(&g));
+        let mut s = crate::owed_read::Snapshot::default();
+        s.covered_exact = exact;
+        s.framed = vec![(games[2].clone(), g), (games[2].clone(), g + 1)];
+        s.downgrades.insert(games[2].clone(), vec![(g, "seen".into())]);
+        assert_eq!(s.actor_pending(), 1, "the carried mark is applied; the other is pending");
+        assert_eq!(s.withholding_mark(&games[2]), None, "a downgrade the actor applied withholds nothing");
+        s.downgrades.insert(games[2].clone(), vec![(g, "seen".into()), (g + 1, "pot".into())]);
+        assert_eq!(s.withholding_mark(&games[2]), Some("pot"));
+    }
+
+    /// (f_g) THE DIRECT PASS OF A CARRIED EVENT READS NO MARKS AND ACKNOWLEDGES NOTHING: its subjects are the event's
+    /// own, its body carries the rows, no Phase C bound is read for it; an event that carries none reads its marks.
+    #[tokio::test]
+    async fn d2_actor_f_g_the_direct_pass_of_a_carried_event_reads_nothing() {
+        struct Port {
+            subjects: Cell<u32>,
+            bounds: Cell<u32>,
+            bodies: RefCell<Vec<Value>>,
+        }
+        impl crate::owed_events::DirectPort for Port {
+            async fn subjects(&self, _ev: &overlay_discovery::owed_event::OwedEvent) -> Result<Vec<(String, Vec<String>)>, String> {
+                self.subjects.set(self.subjects.get() + 1);
+                Ok(vec![("owner".into(), vec!["g2".into()])])
+            }
+            async fn call(&self, body: Value) -> Result<Value, String> {
+                self.bodies.borrow_mut().push(body.clone());
+                Ok(json!({"applied": true, "appliedGames": body["games"]}))
+            }
+            fn acks(&self) -> bool {
+                true
+            }
+            async fn bound(&self, _i: &str, _g: &[String]) -> Result<i64, String> {
+                self.bounds.set(self.bounds.get() + 1);
+                Ok(9)
+            }
+        }
+        let record = SqliteSql::migrated();
+        let pot = h("c1", 1);
+        record.conn.execute("INSERT INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'x','a',1)", [&pot]).unwrap();
+        record.conn.execute("INSERT OR IGNORE INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner','g1','seen',?1,1)", [&pot]).unwrap();
+        let carried_ev = published(&record, "seen", &pot).await;
+        let mut plain = carried_ev.clone();
+        plain.source = "pot".into();
+        plain.source_key = format!("{pot}:0");
+        plain.facts = json!({"marks": 1, "row": null});
+        plain.seq += 1;
+        let port = Port { subjects: Cell::new(0), bounds: Cell::new(0), bodies: RefCell::default() };
+        let r = crate::owed_events::direct_with(&port, vec![carried_ev], Some(TIP)).await;
+        assert_eq!((port.subjects.get(), port.bounds.get(), r.carried, r.acked), (0, 0, 1, 0));
+        assert!(port.bodies.borrow()[0].get("carried").is_some());
+        let r = crate::owed_events::direct_with(&port, vec![plain], Some(TIP)).await;
+        assert_eq!((port.subjects.get(), port.bounds.get(), r.carried), (1, 1, 0));
+        assert!(port.bodies.borrow()[1].get("carried").is_none());
     }
 }
