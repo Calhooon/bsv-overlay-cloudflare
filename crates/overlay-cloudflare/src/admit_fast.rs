@@ -454,6 +454,133 @@ pub async fn record_conflict_spender(
     Ok(hit)
 }
 
+/// One spend Arcade's own terminal word names (bsv-low #1016): the outpoint the evicted tx tried to spend and the
+/// competing txid that already spent it (`<txid>:<vout> utxo already spent by tx <competitor>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArcadeNamedSpend {
+    /// The outpoint's txid, lowercase.
+    pub txid: String,
+    /// The outpoint's output index.
+    pub vout: u32,
+    /// The competitor Arcade names, lowercase.
+    pub competitor: String,
+}
+
+fn hex64(s: &str) -> Option<String> {
+    let h = s.get(..64)?;
+    let next_is_hex = s.as_bytes().get(64).is_some_and(u8::is_ascii_hexdigit);
+    (h.bytes().all(|b| b.is_ascii_hexdigit()) && !next_is_hex).then(|| h.to_ascii_lowercase())
+}
+
+/// PURE (bsv-low #1016): the spends an eviction's reason names on ARCADE'S LIVE word. Only a reason whose text after
+/// its first `(` is the evidence check's `arcade live ` (a corroborated refusal on Arcade's own fatal word,
+/// [`evidence_verdict_of`]) names anything: a recorded word (the public `/arc-ingest` bearer's text, `arcade faulted,
+/// recorded ...`), an absence, the ladder's or the retire pass's reasons name nothing. In that text each
+/// `<txid>:<vout> utxo [already] spent by tx <competitor>` (Arcade's `UTXO_SPENT`, the same form under
+/// `DOUBLE_SPEND_ATTEMPTED`; the door's scrub drops `already`) is one spend, deduped. A competitor named without its
+/// outpoint names nothing (the row stays as today).
+pub fn arcade_named_spends(reason: &str) -> Vec<ArcadeNamedSpend> {
+    let Some((_, inner)) = reason.split_once('(') else {
+        return Vec::new();
+    };
+    if !inner.starts_with("arcade live ") {
+        return Vec::new();
+    }
+    let toks: Vec<&str> = inner.split_whitespace().collect();
+    let mut out: Vec<ArcadeNamedSpend> = Vec::new();
+    for i in 0..toks.len() {
+        if toks.get(i..i + 3) != Some(&["spent", "by", "tx"][..]) {
+            continue;
+        }
+        let Some(competitor) = toks.get(i + 3).and_then(|t| hex64(t)) else {
+            continue;
+        };
+        // the outpoint is the token before `utxo [already]`
+        let mut j = i;
+        while j > 0 && matches!(toks[j - 1], "already" | "utxo") {
+            j -= 1;
+        }
+        let Some((txid, vout)) = j
+            .checked_sub(1)
+            .and_then(|k| toks[k].rsplit_once(':'))
+            .and_then(|(t, v)| Some((hex64(t)?, v.parse::<u32>().ok()?)))
+        else {
+            continue;
+        };
+        let spend = ArcadeNamedSpend {
+            txid,
+            vout,
+            competitor,
+        };
+        if !out.contains(&spend) {
+            out.push(spend);
+        }
+    }
+    out
+}
+
+/// bsv-low #1016: before the eviction on Arcade's live terminal word that NAMES a competitor, write that competitor
+/// as the named outpoint's UNCONFIRMED spender (#605's [`record_conflict_spender`], the conflict pass's own write:
+/// its downgrade mark by the row's trigger, its `pot` frame by its note, the #186 chaser to latch or displace it), so
+/// an index-unspent hop's sweep press is withheld at once instead of standing until the belt's look (L56 pair 13: the
+/// dead sweep's `UTXO_SPENT ... by tx <competitor>` recorded nothing on the hop). Answers the re-pointed outpoints,
+/// which the eviction's ledger must still name (`releasedSpends`, the E606 lens's M1). Bound to the evicted tx's own
+/// bytes (`beef`, the stored copy): a named outpoint the subject does not consume, a competitor equal to the subject,
+/// or no bytes names nothing. A record that faults is logged and skipped: the eviction goes on (the chaser and the
+/// belt still converge the hop).
+pub async fn repoint_arcade_named(
+    db: &dyn ShadowDb,
+    evicted: &str,
+    reason: &str,
+    beef: Option<&[u8]>,
+) -> Vec<ReleasedSpend> {
+    let named = arcade_named_spends(reason);
+    if named.is_empty() {
+        return Vec::new();
+    }
+    let evicted = evicted.to_ascii_lowercase();
+    let Some(subject) = beef.and_then(|b| {
+        beef_limits::transaction_from_beef(b, Some(&evicted), &beef_limits::STORED_BEEF_LIMITS).ok()
+    }) else {
+        crate::proof_fetcher::push_log(&format!(
+            "[admit-fast] evict {evicted}: Arcade names {} spent input(s) but the subject's bytes are not held; nothing re-pointed",
+            named.len()
+        ));
+        return Vec::new();
+    };
+    let mut repointed = Vec::new();
+    for n in named {
+        let consumed = subject.inputs.iter().any(|i| {
+            i.source_output_index == n.vout
+                && i.source_txid
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case(&n.txid))
+        });
+        if !consumed || n.competitor == evicted {
+            continue;
+        }
+        match record_conflict_spender(db, &n.txid, n.vout, &evicted, &n.competitor).await {
+            Ok(true) => {
+                crate::proof_fetcher::push_log(&format!(
+                    "[admit-fast] evict {evicted}: {}:{} re-pointed to Arcade's named competitor {} (unconfirmed)",
+                    n.txid, n.vout, n.competitor
+                ));
+                repointed.push(ReleasedSpend {
+                    table: "pot_records".into(),
+                    txid: n.txid,
+                    vout: n.vout,
+                });
+            }
+            Ok(false) => {}
+            Err(e) => crate::proof_fetcher::push_log(&format!(
+                "[admit-fast] evict {evicted}: re-point of {}:{} to {} faulted: {e}",
+                n.txid, n.vout, n.competitor
+            )),
+        }
+    }
+    repointed
+}
+
 /// Re-mark the spends a readmitted tx had left (the ledger row's list): a
 /// `pot_records` row only where nothing newer spent it. Best-effort.
 async fn remark_spends(
@@ -1488,7 +1615,18 @@ pub async fn evict_txid_everywhere(
     reason: &str,
     asked_ms: u64,
 ) -> EvictionOutcome {
-    evict_txid_everywhere_repointed(db, txid, reason, asked_ms, &[]).await
+    // bsv-low #1016: Arcade's live word that names a competitor re-points its outpoint first (the bytes are read only
+    // when the reason names one)
+    let beef = if arcade_named_spends(reason).is_empty() {
+        None
+    } else {
+        crate::admission_abort::AbortRows::stored_beef(db, &txid.to_ascii_lowercase())
+            .await
+            .ok()
+            .flatten()
+    };
+    let repointed = repoint_arcade_named(db, txid, reason, beef.as_deref()).await;
+    evict_txid_everywhere_repointed(db, txid, reason, asked_ms, &repointed).await
 }
 
 /// [`evict_txid_everywhere`] for the conflict pass (bsv-low #605, the E606 lens's M1): `repointed` are the outpoints
