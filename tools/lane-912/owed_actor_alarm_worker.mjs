@@ -10,8 +10,20 @@ export class AlarmPin {
     this.state = state
     this.fired = 0
     this.inner = new OwedActor(state, env)
+    this.answers = []
   }
   async fetch(req) {
+    if (new URL(req.url).pathname === '/apply' && req.method === 'POST') {
+      // D2-ACTOR-F-FOLD (bsv-low #959): each apply's answer kept as the actor gave it (its stages, its record calls),
+      // the response itself unchanged
+      const res = await this.inner.fetch(req)
+      try {
+        const a = await res.clone().json()
+        this.answers.push({ at: Date.now(), carried: a.carried, recordCalls: a.recordCalls, closureRounds: a.closureRounds, readMs: a.readMs, waitMs: a.waitMs, judgeMs: a.judgeMs, writeMs: a.writeMs, outsideMs: a.outsideMs, rounds: a.rounds, applied: a.applied, firstApply: a.firstApply, visibleMs: a.visibleMs, appliedGames: a.appliedGames })
+      } catch {}
+      return res
+    }
+    if (new URL(req.url).pathname === '/pin/answers') return Response.json({ answers: this.answers })
     if (new URL(req.url).pathname === '/pin/state') {
       let meta = {}
       try { meta = Object.fromEntries(this.state.storage.sql.exec('SELECT name,value FROM meta').toArray().map(r => [r.name, r.value])) } catch {}
