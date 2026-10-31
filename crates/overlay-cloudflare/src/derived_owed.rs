@@ -93,6 +93,8 @@ pub const ROWS_COUNT_DELETE: &str = "CREATE TRIGGER IF NOT EXISTS owed_rows_coun
 /// writes, ruling 1), and since MEDIUM-1 the drain reads neither of these two (its age order is
 /// `idx_owed_dirty_identity_marked`, an identity's prefix the UNIQUE key's index).
 pub const DIRTY_MARKED_DROP: &str = "DROP INDEX IF EXISTS idx_owed_dirty_marked";
+/// FIX-1001 (bsv-low #1001): a transaction's proof write finds the sweeps filed for it (`TX_PROOF_INSERT`/`_UPDATE`).
+pub const HOPSWEEP_SWEEP_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_hopsweep_sweep ON hopsweep_records(sweepTxid)";
 /// The backlog snapshot uses a new name: a rolling old worker can still execute DIRTY_MARKED_DROP.
 pub const DIRTY_BACKLOG_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_owed_dirty_backlog ON owed_dirty(markedAtMs)";
 /// See [`DIRTY_MARKED_DROP`].

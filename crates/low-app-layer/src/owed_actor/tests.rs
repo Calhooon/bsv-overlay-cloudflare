@@ -13824,3 +13824,280 @@ fn fix1004_d_the_unframed_sources_are_the_statements_and_the_drain_passes_the_ph
     let read = &object[object.find("pub(crate)asyncfnread_snapshot_with(").unwrap()..];
     assert!(read.contains(&squash("snapshot.pending = snapshot.actor_pending();")));
 }
+
+/// FIX-1001 (bsv-low #1001, L55's S2): EVERY WRITER OF A HOP'S SPEND CONFIRMATION REACHES THE OWED ACTOR. L55's seat
+/// 030d9e9f... (the captured pair 13's twin-only seat: NO hop marker, its hop 9b238eed...:0 its eviction's released
+/// evidence) filed its sweep of the hop home; the actor judged the payout "seen but not mined" and kept it 30 minutes
+/// after the index proved the sweep, with the queue drained, where a fresh bootstrap read it claimable. Each pin runs
+/// the writer's SHIPPED statement on the record (real SQLite, the overlay's migrations and triggers), the pair the
+/// writer notes (the overlay's source pin `d2_actor_a_fold_m3_every_production_writer_of_a_trigger_table_notes_its_pair` holds the notes) through the shipped
+/// publish, then the shipped direct pass (or the consumer's delivery) into the REAL actor (its mirror, its closure, its
+/// judge), Phase C (no D1 judge: the actor is the one writer).
+mod fix1001 {
+    use super::*;
+    use crate::owed_walk_frozen::pins::{
+        backfill_to_the_stamp, fix1001_seed, FOLD8_TIP, HOME_MARKER_HOP, HOME_MARKER_SEAT,
+    };
+
+    const PROOF_HEIGHT: u64 = FOLD8_TIP - 2;
+
+    /// The record after the backfill and the drain, then Phase C (no D1 row, no pending mark), and the seat's actor
+    /// bootstrapped over it.
+    async fn phase_c() -> (SqliteSql, SqliteSql, String) {
+        let (seed, s) = fix1001_seed();
+        let d1 = seeded(&Fixture {
+            name: "fix1001",
+            seed,
+            identities: vec![HOME_MARKER_SEAT.into()],
+        });
+        d1.tip.set(Some(FOLD8_TIP));
+        d1.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        backfill_to_the_stamp(&d1).await;
+        d1.conn
+            .execute_batch("DELETE FROM owed_rows; DELETE FROM owed_dirty;")
+            .unwrap();
+        let local = mirror();
+        local.now.set(d1.now.get());
+        for chunk in games_of(&d1, HOME_MARKER_SEAT).chunks(GAMES_PER_APPLY) {
+            apply(
+                &d1,
+                &local,
+                &Fakes,
+                HOME_MARKER_SEAT,
+                chunk,
+                Some(("bootstrap", 1)),
+                Some(FOLD8_TIP),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        (d1, local, s)
+    }
+
+    /// The actor's row of the hop: family, the stored `claimable`, `atHeight`, facts.
+    fn row(db: &SqliteSql) -> (String, Option<i64>, Option<i64>, Value) {
+        db.conn
+            .query_row(
+                "SELECT family,claimable,atHeight,facts FROM owed_rows WHERE identity=?1 AND outpoint=?2",
+                [HOME_MARKER_SEAT, &format!("{HOME_MARKER_HOP}:0")],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        serde_json::from_str(&r.get::<_, String>(3)?).unwrap(),
+                    ))
+                },
+            )
+            .unwrap_or_else(|e| panic!("the actor's row of the hop: {e}"))
+    }
+
+    /// The writer's pair through the shipped publish (one batch: the seq, the marks and the row's facts).
+    async fn publish(
+        d1: &SqliteSql,
+        source: &str,
+        key: &str,
+    ) -> crate::owed_events_publish::Published {
+        let port = crate::owed_events::SqlPublish {
+            db: d1,
+            send: |_: Vec<String>| async { Ok::<(), String>(()) },
+        };
+        crate::owed_events_publish::publish_with(
+            &port,
+            vec![crate::owed_events_publish::Noted {
+                source: source.into(),
+                key: key.to_ascii_lowercase(),
+                held: None,
+            }],
+        )
+        .await
+    }
+
+    /// The direct pass's port over the REAL actor: each event's subjects from its marks (`plan_with`, as
+    /// `WorkerDirect`), each call the actor's apply of the body's identity and games under the event's key.
+    struct ActorDirect<'a> {
+        record: &'a SqliteSql,
+        local: &'a SqliteSql,
+        fails: bool,
+    }
+    impl crate::owed_events::DirectPort for ActorDirect<'_> {
+        async fn subjects(
+            &self,
+            ev: &overlay_discovery::owed_event::OwedEvent,
+        ) -> Result<Vec<(String, Vec<String>)>, String> {
+            Ok(crate::owed_events::plan_with(self.record, ev, false)
+                .await?
+                .subjects())
+        }
+        async fn call(&self, body: Value) -> Result<Value, String> {
+            if self.fails {
+                return Err("owed actor answered 503: the direct call faulted".into());
+            }
+            let me = body["identity"].as_str().unwrap_or_default().to_string();
+            let games: Vec<String> = body["games"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|g| g.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let kind = body["kind"].as_str().unwrap_or("direct").to_string();
+            let seq = body["seq"].as_i64().unwrap_or(0);
+            let (r, _) = apply(
+                self.record,
+                self.local,
+                &Fakes,
+                &me,
+                &games,
+                Some((kind.as_str(), seq)),
+                body["tip"].as_u64().or(Some(FOLD8_TIP)),
+                None,
+            )
+            .await?;
+            Ok(json!({"applied": true, "firstApply": true, "appliedGames": r.applied_games}))
+        }
+    }
+
+    fn assert_seen_not_mined(local: &SqliteSql) {
+        let (family, claimable, at, facts) = row(local);
+        assert_eq!(
+            (family.as_str(), claimable, at, facts["claimReason"].as_str()),
+            ("payout", Some(0), None, Some(crate::owed::UNCONFIRMED_PAYOUT_REASON)),
+            "L55's starting row: {facts}"
+        );
+    }
+
+    /// (fix1001_a) THE SWEEP'S PROOF (`transactions.has_proof`, `proofHeight`: the engine's `mark_transaction_proven_at`,
+    /// the shipped `MARK_TX_PROVEN_AT_SQL`, as the proof completion and the `/arc-ingest` MINED stitch latch it) reaches
+    /// the actor through the direct pass: `payout claimable 1`, `atHeight` the proof's height, `index-proof`.
+    /// RED on cc38e1a9: no trigger marks a `transactions` write, so the publish skips the pair (`sent 0, skipped 1`)
+    /// and the actor keeps "seen but not mined".
+    #[tokio::test]
+    async fn fix1001_a_the_sweeps_proof_reaches_the_actor_by_the_direct_call() {
+        let (d1, local, s) = phase_c().await;
+        assert_seen_not_mined(&local);
+        let n = d1
+            .conn
+            .execute(
+                bsv_overlay_cloudflare::d1_storage::MARK_TX_PROVEN_AT_SQL,
+                rusqlite::params![PROOF_HEIGHT as f64, &s],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        let report = publish(&d1, "beef", &s).await;
+        assert_eq!(
+            (report.sent.len(), report.skipped),
+            (1, 0),
+            "the sweep's proof is an owed event: {report:?}"
+        );
+        let direct = ActorDirect {
+            record: &d1,
+            local: &local,
+            fails: false,
+        };
+        let d = crate::owed_events::direct_with(&direct, report.sent.clone(), Some(FOLD8_TIP)).await;
+        assert_eq!((d.calls, d.faults), (1, 0), "{d:?}");
+        let (family, claimable, at, facts) = row(&local);
+        assert_eq!(
+            (family.as_str(), claimable, at, facts["confirmedSource"].as_str()),
+            ("payout", Some(1), Some(PROOF_HEIGHT as i64), Some("index-proof")),
+            "the index-proven payout: {facts}"
+        );
+        assert_eq!(facts["sweepProofHeight"], json!(PROOF_HEIGHT));
+        // the reverse: the reorg sweep's refutation (`TRANSACTION_UNPROVE_SQL`) withdraws it the same road
+        d1.conn
+            .execute(bsv_overlay_cloudflare::d1_storage::TRANSACTION_UNPROVE_SQL, [&s])
+            .unwrap();
+        let report = publish(&d1, "beef", &s).await;
+        assert_eq!(report.sent.len(), 1, "{report:?}");
+        crate::owed_events::direct_with(&direct, report.sent.clone(), Some(FOLD8_TIP)).await;
+        assert_seen_not_mined(&local);
+    }
+
+    /// (fix1001_b) THE CONFIRMATION PASS'S CHASE (`complete_spend_confirmations`' `mark_confirmed_for_spender`, the
+    /// shipped `confirm_spend_cas_sql`) latching `spentConfirmed` and `spentHeight` on the HOP's row, its writer's
+    /// `pot` note: the seat holds no hop marker (its link to the hop is its filing and its released evidence), and the
+    /// confirmation reaches its actor: `payout claimable 1`. RED on cc38e1a9: the `pot_records` trigger's subjects
+    /// (the hop's markers, the pot's parties, the derived links) name no one for this hop, so the pair is skipped.
+    #[tokio::test]
+    async fn fix1001_b_the_chases_hop_confirmation_reaches_a_markerless_filer() {
+        let (d1, local, s) = phase_c().await;
+        assert_seen_not_mined(&local);
+        let hit: String = d1
+            .conn
+            .query_row(
+                bsv_overlay_cloudflare::d1_discovery::confirm_spend_cas_sql(),
+                rusqlite::params![PROOF_HEIGHT as i64, HOME_MARKER_HOP, 0, &s],
+                |r| r.get(0),
+            )
+            .expect("the chase's CAS hits the pointer");
+        assert_eq!(hit, HOME_MARKER_HOP);
+        let report = publish(&d1, "pot", &format!("{HOME_MARKER_HOP}:0")).await;
+        assert_eq!(
+            (report.sent.len(), report.skipped),
+            (1, 0),
+            "the hop's confirmation names the filer: {report:?}"
+        );
+        let direct = ActorDirect {
+            record: &d1,
+            local: &local,
+            fails: false,
+        };
+        let d = crate::owed_events::direct_with(&direct, report.sent.clone(), Some(FOLD8_TIP)).await;
+        assert_eq!((d.calls, d.faults), (1, 0), "{d:?}");
+        let (family, claimable, _, facts) = row(&local);
+        assert_eq!(
+            (family.as_str(), claimable),
+            ("payout", Some(1)),
+            "the index-confirmed payout: {facts}"
+        );
+    }
+
+    /// (fix1001_c) THE FRAME ALONE: the direct call faulted, and the queue's message (the same event) is delivered by
+    /// the consumer (`route`, Phase C: the actor's apply, no D1 judge) within its bound: the same row. RED on cc38e1a9:
+    /// no message was sent.
+    #[tokio::test]
+    async fn fix1001_c_the_frame_alone_lands_through_the_consumer() {
+        let (d1, local, s) = phase_c().await;
+        assert_seen_not_mined(&local);
+        d1.conn
+            .execute(
+                bsv_overlay_cloudflare::d1_storage::MARK_TX_PROVEN_AT_SQL,
+                rusqlite::params![PROOF_HEIGHT as f64, &s],
+            )
+            .unwrap();
+        let report = publish(&d1, "beef", &s).await;
+        assert_eq!(report.sent.len(), 1, "{report:?}");
+        let d = crate::owed_events::direct_with(
+            &ActorDirect {
+                record: &d1,
+                local: &local,
+                fails: true,
+            },
+            report.sent.clone(),
+            Some(FOLD8_TIP),
+        )
+        .await;
+        assert_eq!(d.faults, 1, "{d:?}");
+        assert_seen_not_mined(&local);
+        let w = WithActor {
+            d1,
+            actor: local,
+            d1_judges: false,
+            event: None,
+            actor_reads: true,
+            actor_fails: Cell::new(false),
+        };
+        let routed = crate::owed_events::route(&w, &report.sent[0]).await.unwrap();
+        assert!(routed.faulted.is_empty(), "{routed:?}");
+        let (family, claimable, at, facts) = row(&w.actor);
+        assert_eq!(
+            (family.as_str(), claimable, at),
+            ("payout", Some(1), Some(PROOF_HEIGHT as i64)),
+            "{facts}"
+        );
+        let d1_rows: i64 =
+            w.d1.conn
+                .query_row("SELECT COUNT(*) FROM owed_rows", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(d1_rows, 0, "Phase C: owed_rows has no writer");
+    }
+}

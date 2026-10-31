@@ -1073,8 +1073,10 @@ impl ProvenTxStore for D1ProvenTxStore<'_> {
             .bind(txid)
             .execute(self.0)
             .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        // bsv-low #1001 (FIX-1001): the refutation withdraws a filed sweep's `index-proof`: its owed event
+        crate::owed_events::note("beef", txid);
+        Ok(())
     }
 }
 
@@ -1357,6 +1359,9 @@ pub async fn unmined_hint(
                 {
                     Ok(true) => {
                         summary.demoted += 1;
+                        // bsv-low #1001 (FIX-1001): the demotion is a pot change (its trigger marked it; the flush
+                        // publishes the owed event and calls the actors)
+                        crate::pot_changes::note(&rec.txid, rec.output_index);
                         push_log(&format!(
                             "[arc-ingest] {}:{} demoted to SEEN — Arcade reports {spender} reorg_unmined and chaintracks refutes its stored bump",
                             rec.txid, rec.output_index

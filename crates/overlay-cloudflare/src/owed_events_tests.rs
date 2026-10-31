@@ -170,11 +170,16 @@ mod pins {
             "owed_dirty_released_hop_evidence_insert" => (format!("INSERT INTO released_hop_evidence(hopTxid,hopVout,identity,gameId,potTxid,seatSettlePubkey,hopSats,evictedAt) VALUES('{HOP}',1,'{ID}','{GAME}','{POT}','k',1000,1)"), "hop", hop),
             "owed_dirty_released_hop_evidence_missing_insert" => (format!("INSERT INTO released_hop_evidence_missing(identity,gameId,hopTxid,hopVout,potTxid,evictedAt,bytesRead) VALUES('{ID}','{GAME}','{HOP}',1,'{POT}',1,0)"), "hop", hop),
             "owed_dirty_owed_spender_bytes_insert" => (format!("INSERT INTO owed_spender_bytes(txid,bytesJson,createdAtMs) VALUES('{SPENDER}','{{}}',1)"), "word", SPENDER.into()),
+            // FIX-1001 (bsv-low #1001): a filed sweep's proof, stitched (INSERT OR REPLACE) and latched in place; a hop
+            // row's confirmation for its markerless filer
+            "owed_dirty_transactions_proof_insert" => (format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES('{ID}','{GAME}','{HOP}',1,'{SPENDER}','00','sweep0',0,1); DELETE FROM owed_dirty; INSERT OR REPLACE INTO transactions(txid,beef,has_proof,proofHeight) VALUES('{SPENDER}',x'00',1,5)"), "beef", SPENDER.into()),
+            "owed_dirty_transactions_proof_update" => (format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES('{ID}','{GAME}','{HOP}',1,'{SPENDER}','00','sweep0',0,1); INSERT INTO transactions(txid,beef,has_proof) VALUES('{SPENDER}',x'00',0); DELETE FROM owed_dirty; UPDATE transactions SET has_proof=1,proofHeight=5 WHERE txid='{SPENDER}'"), "beef", SPENDER.into()),
+            "owed_dirty_pot_records_update_filers" => (format!("DELETE FROM hopparty_records; INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,createdAt) VALUES('{HOP}',1,1,'{SPENDER}',1); INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES('{ID}','{GAME}','{HOP}',1,'{SPENDER}','00','sweep0',0,1); DELETE FROM owed_dirty; UPDATE pot_records SET spentConfirmed=1,spentHeight=5 WHERE txid='{HOP}'"), "pot", format!("{HOP}:1")),
             _ => return None,
         })
     }
 
-    /// The 29 triggers, read from the shipped source at test time (never a hand-fed list): each trigger's name.
+    /// The 32 triggers, read from the shipped source at test time (never a hand-fed list): each trigger's name.
     fn shipped_triggers() -> Vec<String> {
         let src = include_str!("derived_owed_triggers.rs");
         let mut out = Vec::new();
@@ -201,7 +206,7 @@ mod pins {
     #[test]
     fn d2_actor_a_a_each_trigger_pair_noted_publishes_one_event_with_its_rows_facts() {
         let triggers = shipped_triggers();
-        assert_eq!(triggers.len(), 29, "the trigger list: {triggers:?}");
+        assert_eq!(triggers.len(), 32, "the trigger list: {triggers:?}");
         for trigger in &triggers {
             let (sql, source, key) = write_of(trigger)
                 .unwrap_or_else(|| panic!("{trigger}: no writer's note is pinned for it"));
@@ -324,6 +329,12 @@ mod pins {
             ("party", app("handfile"), "pub async fn handfile_post(", r#"note("party","#),
             ("refund", app("handfile"), "pub async fn handfile_post(", "owed_write::note_events(&VerifiedRecord::Potrefund("),
             ("word", app("runtime"), "async fn event_held(", r#"note("word","#),
+            // FIX-1001 (bsv-low #1001): the transaction's proof (a filed sweep's `index-proof`), each of its writers
+            ("beef", include_str!("d1_storage.rs"), "async fn update_transaction_beef(", r#"if has_proof == 1 { crate::owed_events::note("beef", txid); }"#),
+            ("beef", include_str!("d1_storage.rs"), "async fn mark_transaction_proven_at(", r#"note("beef","#),
+            ("beef", include_str!("d1_storage.rs"), "async fn mark_transaction_proven(&self", r#"note("beef","#),
+            ("beef", include_str!("reorg_sweep.rs"), "async fn unprove(", r#"note("beef","#),
+            ("pot", include_str!("reorg_sweep.rs"), "pub async fn unmined_hint(", "crate::pot_changes::note(&rec.txid,rec.output_index);"),
         ];
         for (source, src, sig, note) in writers {
             let body = fn_body(src, sig);

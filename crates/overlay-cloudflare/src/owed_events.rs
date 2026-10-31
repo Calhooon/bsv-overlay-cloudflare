@@ -86,8 +86,9 @@ pub const READ_EVICTION_SQL: &str = marks_and!("SELECT json_object('reason',reas
 pub const READ_SEEN_SQL: &str = marks_and!("SELECT json_object('seenAt',seenAt,'seenSource',seenSource,'sourceAtMs',sourceAtMs) FROM network_seen WHERE txid=?3");
 /// `word` (the `txid`): the word, never its legacy body (MEDIUM-4: the words and their recheck stay the read's).
 pub const READ_WORD_SQL: &str = marks_and!("SELECT json_object('word',word,'tier',tier,'height',height,'proofRoot',proof_root,'headerHash',header_hash,'hintSource',hint_source,'hintAt',hint_at,'updatedAt',updated_at) FROM tx_words WHERE txid=?3");
-/// `beef` (the `txid`): the proof flags, never the bytes.
-pub const READ_BEEF_SQL: &str = marks_and!("SELECT json_object('hasProof',has_proof,'proofVerified',proof_verified,'proofHeight',proofHeight,'structurallyUnprovable',structurally_unprovable,'createdAt',createdAt) FROM pot_beefs WHERE txid=?3");
+/// `beef` (the `txid`): the proof flags, never the bytes: the pot store's row, else (FIX-1001, a filed sweep's proof)
+/// the engine's `transactions` row.
+pub const READ_BEEF_SQL: &str = marks_and!("SELECT COALESCE((SELECT json_object('hasProof',has_proof,'proofVerified',proof_verified,'proofHeight',proofHeight,'structurallyUnprovable',structurally_unprovable,'createdAt',createdAt) FROM pot_beefs WHERE txid=?3),(SELECT json_object('hasProof',has_proof,'proofHeight',proofHeight,'store','transactions') FROM transactions WHERE txid=?3))");
 /// `refusal` (`hopTxid:hopVout`).
 pub const READ_REFUSAL_SQL: &str = marks_and!("SELECT json_object('refusedTxid',refusedTxid,'reason',reason,'refusedAt',refusedAt) FROM submit_refusals WHERE hopTxid=?3 AND hopVout=?4");
 /// `identity` (the hook's identity-only note): does the identity hold any mark? (The D2-ACTOR-A lens's LOW-6: an

@@ -5,7 +5,7 @@
 //! crate's tests and by both Workers' tests).
 //!
 //! The event is keyed on the SOURCE ROW, never on an identity (the audit's HIGH-1): `source` and `sourceKey` are
-//! exactly the pair the 29 triggers of `overlay-cloudflare::derived_owed` write into `owed_dirty` (the trigger knows
+//! exactly the pair the 32 triggers of `overlay-cloudflare::derived_owed` write into `owed_dirty` (the trigger knows
 //! the fan-out to identities, in SQL; the writer holds the row). The consumer reads the marks of that pair, judges
 //! their subjects and acknowledges them after the judge wrote.
 //!
@@ -23,10 +23,10 @@ use serde_json::{json, Value};
 /// The shape's version.
 pub const OWED_EVENT_V: u32 = 1;
 
-/// Every `owed_dirty.source` a trigger writes, with the table whose write marks it (the 29 triggers of
+/// Every `owed_dirty.source` a trigger writes, with the table whose write marks it (the 32 triggers of
 /// `overlay-cloudflare::derived_owed_triggers`, read at test time by the overlay's pin, never a hand-fed list there).
 /// A writer publishes `(source, key)` for exactly the pair its row's trigger marks.
-pub const TRIGGER_SOURCES: [(&str, &str); 15] = [
+pub const TRIGGER_SOURCES: [(&str, &str); 16] = [
     ("pot_records", "pot"),
     ("potparty_records", "party"),
     ("hopparty_records", "hop"),
@@ -42,6 +42,8 @@ pub const TRIGGER_SOURCES: [(&str, &str); 15] = [
     ("released_hop_evidence", "hop"),
     ("released_hop_evidence_missing", "hop"),
     ("owed_spender_bytes", "word"),
+    // FIX-1001 (bsv-low #1001): a transaction's proof (`transactions.has_proof`, `proofHeight`), keyed by its txid.
+    ("transactions", "beef"),
 ];
 
 /// The `refund` source (named where a store's first string literal must stay its statement).
