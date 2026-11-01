@@ -33,8 +33,11 @@
 //!    confirmed memo read before `clear + HOP_PROBE_MEMO_REORG_GRACE_MS` the short window every other word has
 //!    (five minutes) instead of the two hours (`low-app-layer` `split_probe_targets_after_reorg`): inside the
 //!    grace the walk keeps asking; a memo read after it is trusted as before. The tombstone is written BEFORE
-//!    the delete and judged without a lower bound, so a confirmed memo the delete missed (a fault, or a walk
-//!    that read the couriers before the clear and wrote after it) is held to the short window too. The TTL
+//!    the delete and carries the clear's REACH (bsv-low #1042): a confirmed word taken before it is held to the
+//!    grace only where the reach covers its height (the delete missed it: a fault, or a find that read the couriers
+//!    before the clear and wrote after it); one below the reach is the clear's own verdict and keeps its
+//!    confirmation (`low-app-layer` `hops_view::clear_unless_survived`). Before #1042 it was judged without a lower
+//!    bound, which since #1027 round 2 refused the confirmations the reach-scoped clear had kept. The TTL
 //!    sweep never deletes it (a memo read in the grace's last minute is still inside its two hours when the
 //!    tombstone would age out).
 //!
@@ -118,14 +121,17 @@ macro_rules! expire_pred {
 /// judge's own output. One scan of the table (`g`, materialized), then index probes; at most 5 compound terms (D1).
 macro_rules! probe_marks {
     ($pred:expr) => {
+        probe_marks!($pred, "(g.spentConfirmed IS 1)")
+    };
+    ($pred:expr, $down:expr) => {
         concat!(
             "WITH g AS MATERIALIZED (SELECT outpoint,spentConfirmed FROM hop_chain_probes WHERE ", $pred, ") ",
             "INSERT INTO owed_dirty (identity,gameId,source,sourceKey,markedAtMs,downgrade) SELECT s.identity,s.gameId,'probe',s.k,strftime('%s','now') * 1000,s.c FROM (",
-            "SELECT hp.identity AS identity,hp.gameId AS gameId,g.outpoint AS k,(g.spentConfirmed IS 1) AS c FROM g CROSS JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=substr(g.outpoint,1,64) AND hp.hopVout=CAST(substr(g.outpoint,66) AS INTEGER) WHERE substr(g.outpoint,65,1) IN ('.',':') ",
-            "UNION ALL SELECT f.identity,f.gameId,g.outpoint,(g.spentConfirmed IS 1) FROM g CROSS JOIN hopsweep_records f INDEXED BY idx_hopsweep_hop ON f.hopTxid=substr(g.outpoint,1,64) AND f.hopVout=CAST(substr(g.outpoint,66) AS INTEGER) WHERE substr(g.outpoint,65,1) IN ('.',':') ",
-            "UNION ALL SELECT e.identity,e.gameId,g.outpoint,(g.spentConfirmed IS 1) FROM g CROSS JOIN released_hop_evidence e ON e.hopTxid=substr(g.outpoint,1,64) AND e.hopVout=CAST(substr(g.outpoint,66) AS INTEGER) WHERE substr(g.outpoint,65,1) IN ('.',':') ",
-            "UNION ALL SELECT pp.identity,pp.gameId,g.outpoint,(g.spentConfirmed IS 1) FROM g CROSS JOIN potparty_records pp INDEXED BY idx_potparty_pot ON pp.potTxid=substr(g.outpoint,1,64) AND pp.potVout=CAST(substr(g.outpoint,66) AS INTEGER) WHERE substr(g.outpoint,65,1) IN ('.',':') ",
-            "UNION ALL SELECT r.identity,r.gameId,g.outpoint,(g.spentConfirmed IS 1) FROM g CROSS JOIN owed_row_words w INDEXED BY idx_owed_row_words_txid ON w.txid=substr(g.outpoint,12,64) CROSS JOIN owed_rows r ON r.identity=w.identity AND r.outpoint=w.outpoint WHERE g.outpoint LIKE 'proofmined:%'",
+            "SELECT hp.identity AS identity,hp.gameId AS gameId,g.outpoint AS k,", $down, " AS c FROM g CROSS JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=substr(g.outpoint,1,64) AND hp.hopVout=CAST(substr(g.outpoint,66) AS INTEGER) WHERE substr(g.outpoint,65,1) IN ('.',':') ",
+            "UNION ALL SELECT f.identity,f.gameId,g.outpoint,", $down, " FROM g CROSS JOIN hopsweep_records f INDEXED BY idx_hopsweep_hop ON f.hopTxid=substr(g.outpoint,1,64) AND f.hopVout=CAST(substr(g.outpoint,66) AS INTEGER) WHERE substr(g.outpoint,65,1) IN ('.',':') ",
+            "UNION ALL SELECT e.identity,e.gameId,g.outpoint,", $down, " FROM g CROSS JOIN released_hop_evidence e ON e.hopTxid=substr(g.outpoint,1,64) AND e.hopVout=CAST(substr(g.outpoint,66) AS INTEGER) WHERE substr(g.outpoint,65,1) IN ('.',':') ",
+            "UNION ALL SELECT pp.identity,pp.gameId,g.outpoint,", $down, " FROM g CROSS JOIN potparty_records pp INDEXED BY idx_potparty_pot ON pp.potTxid=substr(g.outpoint,1,64) AND pp.potVout=CAST(substr(g.outpoint,66) AS INTEGER) WHERE substr(g.outpoint,65,1) IN ('.',':') ",
+            "UNION ALL SELECT r.identity,r.gameId,g.outpoint,", $down, " FROM g CROSS JOIN owed_row_words w INDEXED BY idx_owed_row_words_txid ON w.txid=substr(g.outpoint,12,64) CROSS JOIN owed_rows r ON r.identity=w.identity AND r.outpoint=w.outpoint WHERE g.outpoint LIKE 'proofmined:%'",
             ") s WHERE 1 ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,source=excluded.source,sourceKey=excluded.sourceKey,markedAtMs=excluded.markedAtMs,downgrade=MAX(owed_dirty.downgrade,excluded.downgrade)"
         )
     };
@@ -207,10 +213,21 @@ pub const HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL: &str = concat!(
 pub const HOP_PROBE_MEMO_EXPIRE_SQL: &str =
     concat!("DELETE FROM hop_chain_probes WHERE ", expire_pred!());
 
-/// FIX-1010: rule 2's marks. Only the EVIDENCE a reader still honours is marked (`<txid>:<vout>`, whose index row is
-/// gone: an evicted hop's); a memo past the window is read by no judge, so its delete moves no judgement.
-pub const HOP_PROBE_MEMO_EXPIRE_MARK_SQL: &str =
-    probe_marks!(concat!(expire_pred!(), " AND substr(outpoint,65,1)=':'"));
+/// FIX-1010: rule 2's marks: the EVIDENCE a reader still honours (`<txid>:<vout>`, whose index row is gone: an evicted
+/// hop's; a confirmed one a downgrade, as before), and since bsv-low #1042 every hop MEMO (`<txid>.<vout>`) whose delete
+/// moves a judgement. FIX-1010 read a memo past the window as read by no judge; the judge reads every memo of its hops
+/// whatever its age (`low-app-layer` `hops_view::stale_memo_word`: an old unspent memo is `unspent-stale`, or the
+/// pending chain-wait of a word taken below the tip), so its delete changes the row with no event and the actor's row
+/// went stale behind the D1 judge's. A memo the belt's evidence repeats word for word (the same find: spent, spender,
+/// confirmation, height and stamp) moves nothing (the judge reads the evidence in its place) and is not marked. A
+/// memo's mark is PLAIN: a memo leaving reads no confirmation away that the evidence does not keep.
+pub const HOP_PROBE_MEMO_EXPIRE_MARK_SQL: &str = probe_marks!(
+    concat!(
+        expire_pred!(),
+        " AND (substr(outpoint,65,1)=':' OR (substr(outpoint,65,1)='.' AND NOT EXISTS (SELECT 1 FROM hop_chain_probes e WHERE e.outpoint=substr(hop_chain_probes.outpoint,1,64)||':'||substr(hop_chain_probes.outpoint,66) AND e.spent IS hop_chain_probes.spent AND e.spendingTxid IS hop_chain_probes.spendingTxid AND e.spentConfirmed IS hop_chain_probes.spentConfirmed AND e.tipHeight IS hop_chain_probes.tipHeight AND e.probedAtMs IS hop_chain_probes.probedAtMs)))"
+    ),
+    "(substr(g.outpoint,65,1)=':' AND g.spentConfirmed IS 1)"
+);
 /// FIX-1010: rule 2's delete as the batch runs it, answering the keys it deleted.
 pub const HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL: &str = concat!(
     "DELETE FROM hop_chain_probes WHERE ",
@@ -219,12 +236,11 @@ pub const HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL: &str = concat!(
 );
 
 /// FIX-1010: the deleted keys whose pair the writer notes (each may hold a mark its batch wrote): the clear's every
-/// hop memo, evidence and proof latch; the sweep's evidence alone (the only rows its marks name). A key noted with no
-/// mark is read by the publish and not sent.
+/// hop memo, evidence and proof latch; the sweep's evidence and hop memos (bsv-low #1042: its marks name both). A key
+/// noted with no mark (a memo the evidence repeats) is read by the publish and not sent.
 pub fn noted_key(expire: bool, outpoint: &str) -> bool {
     match outpoint.as_bytes().get(64) {
-        Some(b':') => true,
-        Some(b'.') => !expire,
+        Some(b':' | b'.') => true,
         _ => !expire && outpoint.starts_with("proofmined:"),
     }
 }
@@ -238,10 +254,14 @@ pub const HOP_PROBE_MEMO_REORG_MARK: &str = "reorg-clear.0";
 /// average, and well past the couriers' own lag behind a reorg (their indexers follow the tip within a block).
 pub const HOP_PROBE_MEMO_REORG_GRACE_MS: i64 = 30 * 60_000;
 
-/// Rule 3: stamp the tombstone (bind: now, ms). `spent = 0` and no confirmed word: the clear above never
-/// deletes it, and a reader that met it as a memo would read "unspent", the safe word. The stamp only grows.
-pub const HOP_PROBE_MEMO_REORG_MARK_SQL: &str = "INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed) VALUES ('reorg-clear.0', ?, 0, NULL, NULL) \
-     ON CONFLICT(outpoint) DO UPDATE SET probedAtMs = MAX(hop_chain_probes.probedAtMs, excluded.probedAtMs)";
+/// Rule 3: stamp the tombstone (binds: now, ms; the clear's REACH, its floor). `spent = 0` and no confirmed word: the
+/// clear above never deletes it, and a reader that met it as a memo would read "unspent", the safe word. The stamp only
+/// grows, and the reach is the newest stamp's (`tipHeight`, written as an integer: D1 binds a JS number as a REAL).
+/// bsv-low #1042: the app layer judges a word taken before the stamp and below the reach (`clear_pred!`'s complement)
+/// as one the clear left standing (`low-app-layer` `hops_view::clear_unless_survived`); with no reach on the row (a
+/// tombstone stamped before #1042) it holds every word taken before the stamp to the grace, as before.
+pub const HOP_PROBE_MEMO_REORG_MARK_SQL: &str = "INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed, tipHeight) VALUES ('reorg-clear.0', ?1, 0, NULL, NULL, CAST(?2 AS INTEGER)) \
+     ON CONFLICT(outpoint) DO UPDATE SET tipHeight = CASE WHEN excluded.probedAtMs >= hop_chain_probes.probedAtMs THEN excluded.tipHeight ELSE hop_chain_probes.tipHeight END, probedAtMs = MAX(hop_chain_probes.probedAtMs, excluded.probedAtMs)";
 
 /// Confirmed memos a reorg pass cleared (served on `/health/invariants.arcadeReorg.probeMemosCleared` and with
 /// the counters). Round 2's NIT-1: the lifetime row MIXES two meanings across the FIX-1027 deploy: before it the clear
@@ -415,8 +435,8 @@ pub fn sweep_reach(
 /// The race, stated (round 2's NOTE-2): the batch is one D1 transaction, so a belt find whose courier look was taken
 /// before the reorg and whose write lands after this batch stands confirmed, as on the base (which deleted only rows
 /// already written); it is bounded by one look (the belt writes at most 8 finds a 120 s tick, each from a look made in
-/// that tick) and healed by the next reorg evidence that reaches its height; the memos' grace tombstone (rule 3) is not
-/// read for evidence rows.
+/// that tick) and healed by the next reorg evidence that reaches its height. The app layer reads the belt's evidence
+/// under the tombstone as it reads a memo (bsv-low #1042): a word taken before the stamp and below its reach stands.
 pub async fn clear_on_reorg(db: &D1Database, origin: &str, reach: ReorgReach) -> u64 {
     let Some(floor) = reach else {
         return 0;
@@ -426,7 +446,7 @@ pub async fn clear_on_reorg(db: &D1Database, origin: &str, reach: ReorgReach) ->
     if let Err(e) = delete(
         db,
         HOP_PROBE_MEMO_REORG_MARK_SQL,
-        &[JsValue::from_f64(now_ms)],
+        &[JsValue::from_f64(now_ms), JsValue::from_f64(floor as f64)],
     )
     .await
     {
@@ -601,7 +621,7 @@ mod tests {
         plant(&conn, "young.0", now - 60_000, false, None);
         plant(&conn, "ancient.0", 5, false, None);
         // the reorg tombstone is not a memo: the sweep never takes it, however old (rule 3)
-        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![7])
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![7, 0])
             .unwrap();
         let expired = conn
             .execute(
@@ -720,7 +740,7 @@ mod tests {
             .unwrap()
         };
         plant(&conn, "a.0", 1_000, true, Some(true));
-        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![5_000])
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![5_000, 0])
             .unwrap();
         assert_eq!(
             conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, [0]).unwrap(),
@@ -729,10 +749,10 @@ mod tests {
         );
         assert_eq!(held(&conn), vec![HOP_PROBE_MEMO_REORG_MARK]);
         assert_eq!(stamp(&conn), 5_000);
-        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![9_000])
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![9_000, 0])
             .unwrap();
         assert_eq!(stamp(&conn), 9_000, "a later clear moves it");
-        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![6_000])
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![6_000, 0])
             .unwrap();
         assert_eq!(
             stamp(&conn),
