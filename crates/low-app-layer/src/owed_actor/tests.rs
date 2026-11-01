@@ -17692,7 +17692,7 @@ mod fix1027 {
     /// (fix1027_a) THE FINDING (bsv-low #1027, record 1703): beta's shape 1, a stranded hop the index holds unspent,
     /// the belt's find of its spend by a stranger durable in the record (the evidence `<hop>:0`, CONFIRMED, and the
     /// spender's bytes), both judges `unbound` and the actor warm. Then a reorg pass's clear, the overlay's batch as
-    /// `hop_probe_memos::clear_on_reorg` runs it (beta's ran at 2026-10-31 22:16:17Z), its events applied by their
+    /// `hop_probe_memos::clear_on_reorg` runs it (beta's cron clear of 2026-10-31 14:01:48Z deleted 101 such rows), its events applied by their
     /// direct calls, and the D1 judge FRESH. Both fresh sides hold the spend (`unbound`, `chainProbe: "spent"`, the
     /// stranger named, `spentConfirmed` null, claimable null), their rows' digests equal with no diff and no tip lag,
     /// and the belt asks the OUTPOINT for the confirmation the reorg took. RED on 91eb883b's rule (the clear deleted the
@@ -17762,6 +17762,131 @@ mod fix1027 {
                 "the belt asks the outpoint for the confirmation the reorg took"
             );
         }
+    }
+
+    /// (fix1027f_1b) THE CAPTAIN'S ITEM 1b, THE RE-ASK LEVER: beta's 14:01:48Z shape, the evidence of a stranger's
+    /// spend DELETED with no mark (99e456a6's clear, before FIX-1010), so the warm actor keeps `unbound` and the fresh
+    /// D1 judgement offers the sweep (the fleet compare's diff). In Phase C the belt's tick asks nothing for it (no
+    /// actor ask names it). `owed_belt::reask` over that outpoint asks its spend, writes the evidence, the memo, the
+    /// spender's bytes and the `hop` mark, and hands the find back to the actor: both fresh sides then hold the spend
+    /// (`unbound`, `chainProbe: "spent"`, the stranger named), their digests equal, no diff. A malformed entry is
+    /// skipped, named. New API (b1ed75bc has no lever: there the tick's `asked: 0` is the end of it).
+    #[tokio::test]
+    async fn fix1027f_1b_the_reask_lever_restores_lost_evidence_and_both_fresh_sides_agree() {
+        let hop = format!("{FOLD9_HOP}:0");
+        let (spend, spender) = fold9_spend(FOLD9_HOP);
+        let d1 = d1_judge(&fold9_fixture()).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        assert_eq!(fold9_row(&local, &hop).unwrap().0, "unbound", "the premise");
+        d1.conn
+            .execute(crate::hops_view::PROBE_EVIDENCE_CLEAR_SQL, [&hop])
+            .unwrap();
+        fresh_d1(&d1).await;
+        let lost = fold9_row(&d1, &hop).unwrap();
+        assert_eq!(
+            (lost.0.as_str(), lost.1),
+            ("hop-stranded", Some(1)),
+            "the finding: the fresh D1 judgement presses: {lost:?}"
+        );
+        assert!(!diff_rows(&rows(&d1), &rows(&local)).is_empty(), "the diff");
+        let w = WithActor {
+            d1,
+            actor: local,
+            d1_judges: false,
+            event: None,
+            actor_reads: true,
+            actor_fails: Cell::new(false),
+        };
+        crate::owed_events_publish::drain();
+        let idle = crate::owed_belt::tick(&w, &Couriers::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            (idle.candidates, idle.asked),
+            (0, 0),
+            "Phase C's tick asks nothing for it"
+        );
+        let courier = Couriers {
+            answers: vec![
+                (
+                    format!("{FOLD9_HOP}/0/spent"),
+                    (
+                        200,
+                        json!({"txid": spender, "vin": 0, "status": "confirmed"})
+                            .to_string()
+                            .into_bytes(),
+                    ),
+                ),
+                (
+                    format!("tx/{spender}/hex"),
+                    (200, hex::encode(spend.to_binary()).into_bytes()),
+                ),
+            ],
+            ..Default::default()
+        };
+        let r = crate::owed_belt::reask(
+            &w,
+            &courier,
+            &[
+                ("owner".into(), hop.clone()),
+                ("owner".into(), "not-an-outpoint".into()),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                r.tick.candidates,
+                r.tick.asked,
+                r.tick.found,
+                r.tick.handed_back
+            ),
+            (1, 1, 1, 1),
+            "{r:?}"
+        );
+        assert!(r.tick.write_faults.is_empty(), "{r:?}");
+        assert_eq!(r.skipped.len(), 1, "{r:?}");
+        let ev: String = w
+            .d1
+            .conn
+            .query_row(
+                "SELECT json_array(spent,spendingTxid,spentConfirmed) FROM hop_chain_probes WHERE outpoint=?1",
+                [&hop],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&ev).unwrap(),
+            json!([1, spender, 1]),
+            "the evidence written"
+        );
+        let marked: i64 = w
+            .d1
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM owed_dirty WHERE identity='owner' AND source='hop' AND sourceKey=?1",
+                [&hop],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marked, 1, "the writer's pair marked");
+        fresh_d1(&w.d1).await;
+        let d1_row = fold9_row(&w.d1, &hop).unwrap();
+        assert_eq!(
+            (
+                d1_row.0.as_str(),
+                d1_row.1,
+                d1_row.2["chainProbe"].clone(),
+                d1_row.2["chainSpender"].clone()
+            ),
+            ("unbound", None, json!("spent"), json!(spender)),
+            "{d1_row:?}"
+        );
+        let actor_row = fold9_row(&w.actor, &hop).unwrap();
+        assert_eq!(fold9_judgement(&actor_row), fold9_judgement(&d1_row));
+        let (a, b) = (rows(&w.d1), rows(&w.actor));
+        assert_eq!(rows_digest(&a), rows_digest(&b), "the digests equal");
+        assert!(diff_rows(&a, &b).is_empty());
     }
 
     /// (fix1027_c) THE D1 JUDGE AND COURIER EVIDENCE: over a hop the index holds unspent, evidence of a spend in the
