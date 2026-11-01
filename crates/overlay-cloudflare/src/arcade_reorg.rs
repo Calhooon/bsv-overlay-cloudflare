@@ -2580,7 +2580,8 @@ pub(crate) mod tests {
     /// release. An event faulting for `fault_ceiling` passes, or held for
     /// `held_ceiling` passes, is finished as unresolved (counted) so the
     /// events behind it move; the operator can release the pending event
-    /// at once (`skipPending`).
+    /// at once (`skipPending`). bsv-low #1027 round 3 (LOW-2): each release hands the probe clear the released event's
+    /// own height (`reach_floor`), RED with both release arms' floor raised by one (round 3's M5).
     #[tokio::test]
     async fn the_ceiling_releases_a_stuck_event_and_so_can_the_operator() {
         let store = MemoryPotStorage::new();
@@ -2635,6 +2636,12 @@ pub(crate) mod tests {
             (s.skipped_unresolved, s.events_finished()),
             (1, 1),
             "released at the ceiling: {s:?}"
+        );
+        // bsv-low #1027 round 3 (LOW-2): a release at the ceiling hands the probe clear its orphaned height
+        assert_eq!(
+            s.reach_floor,
+            Some(965_771),
+            "the fault ceiling's floor: {s:?}"
         );
         let released_key = events
             .iter()
@@ -2719,6 +2726,11 @@ pub(crate) mod tests {
             "released at the held ceiling; the budget of one event is spent by the release: {s:?}"
         );
         assert_eq!(
+            s.reach_floor,
+            Some(965_773),
+            "the held ceiling's floor: {s:?}"
+        );
+        assert_eq!(
             state2.state().cursor.as_ref().map(|c| c.hash.as_str()),
             Some(CANONICAL_965773)
         );
@@ -2760,6 +2772,11 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(s.released_by_operator, 1, "{s:?}");
+        assert_eq!(
+            s.reach_floor,
+            Some(965_771),
+            "the operator's release hands its orphaned height (round 3, LOW-2): {s:?}"
+        );
         assert!(
             s.events_finished() >= 2,
             "the release, then the next events: {s:?}"

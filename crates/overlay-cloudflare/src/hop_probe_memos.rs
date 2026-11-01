@@ -63,17 +63,44 @@ use worker::{console_log, D1Database};
 use crate::reorg_sweep::{ProofLegSummary, ReorgSweepSummary, ReverifyPassSummary};
 
 /// Rule 1's predicate (one spelling for the clear, its marks and its framed writes). Bind `?1`: the REACH of the reorg,
-/// the lowest height the pass can have unmade ([`ReorgReach`], 0 for the whole table). bsv-low #1027 round 2
-/// (MEDIUM-1): a row whose spend was confirmed below the reach stands, because no reorg from the reach unmakes a block
-/// below it. A memo's and the belt's evidence's height is the tip the look was taken at (`tipHeight`, written by every
-/// look: the spend's block is at or below it), so `tipHeight >= ?1` is the superset of the rows the reorg can have
-/// unmade; a row with no `tipHeight` (the one-time seed's `spentConfirmed` unknown, an older writer) is taken as before.
-/// A proof latch (`proofmined:<spender>.<height>`) carries its block's height in its key and is read by that.
+/// the lowest height the pass can have unmade ([`ReorgReach`], 0 for the whole table; every caller hands the first
+/// ORPHANED height, not the common ancestor). bsv-low #1027 round 2 (MEDIUM-1): a row whose spend was confirmed below
+/// the reach stands, because no reorg from the reach unmakes a block below it. A memo's and the belt's evidence's
+/// height (`tipHeight`) is chaintracks' VERIFIED header tip when the look was taken (`low-app-layer` `owed_belt`
+/// `probe_find(.., db.tip())`), and the confirmation is a courier's word, so the spend's block is NOT at or below
+/// `tipHeight`: the verified tip trails the couriers by a block while headers verify, more while chaintracks
+/// re-validates (the ENGINE-TIP-896 section of CLAUDE.md), and a find of a spend in block B can carry `tipHeight`
+/// B - 1. Round 3 (MEDIUM-1): the evidence arm therefore allows for that lag, `tipHeight + lag >= ?1` with the lag
+/// [`REORG_TIP_LAG_BLOCKS`], in the predicate and not at the callers (one spelling, and a caller's `floor - lag` would lower the latch
+/// arm too). A row with no `tipHeight` (the one-time seed's `spentConfirmed` unknown, an older writer) is taken as
+/// before. A proof latch (`proofmined:<spender>.<height>`) carries its PROOF'S OWN checked block height in its key
+/// (the latch writer keys by the proof's `height`, never a tip), so it is compared with the reach EXACTLY, no lag.
 macro_rules! clear_pred {
     () => {
-        "spentConfirmed = 1 AND outpoint NOT LIKE 'homeproof:%' AND outpoint NOT LIKE 'homecursor:%' AND (CASE WHEN outpoint LIKE 'proofmined:%' THEN CAST(substr(outpoint,77) AS INTEGER) >= ?1 ELSE (tipHeight IS NULL OR tipHeight >= ?1) END)"
+        concat!(
+            "spentConfirmed = 1 AND outpoint NOT LIKE 'homeproof:%' AND outpoint NOT LIKE 'homecursor:%' AND (CASE WHEN outpoint LIKE 'proofmined:%' THEN CAST(substr(outpoint,77) AS INTEGER) >= ?1 ELSE (tipHeight IS NULL OR tipHeight + ",
+            reorg_tip_lag!(),
+            " >= ?1) END)"
+        )
     };
 }
+
+/// The lag's literal inside the predicate's text, pinned equal to [`REORG_TIP_LAG_BLOCKS`].
+macro_rules! reorg_tip_lag {
+    () => {
+        "6"
+    };
+}
+
+/// bsv-low #1027 round 3 (MEDIUM-1): the blocks the VERIFIED header tip a look records (`tipHeight`) may trail the
+/// block the courier calls its spend confirmed in, allowed for by the clear's evidence arm (`clear_pred!`). Six, the
+/// app layer's `owed::LATCH_RECHECK_DEPTH`: it covers the one block the verified tip trails while headers verify and a
+/// short re-validation. The residual, stated: a look taken while the verified tip trailed the spend's block by MORE
+/// than six, AND a reorg reaching exactly those blocks, keeps a stale confirmation (a press withheld, never a press
+/// made) until a deeper clear reaches its row. The cost: each clear also moves the rows of the looks taken in the six
+/// blocks below its floor (a routine sweep's clear reaches three blocks plus six; bounded by the belt's 8 finds a 120 s
+/// tick, about 40 finds a block).
+pub const REORG_TIP_LAG_BLOCKS: u64 = 6;
 
 /// Rule 2's predicate (one spelling for the sweep, its marks and its framed delete).
 macro_rules! expire_pred {
@@ -1260,5 +1287,63 @@ mod tests {
             None,
             "a sweep that left every row standing"
         );
+    }
+
+    /// bsv-low #1027 round 3 (MEDIUM-1 and LOW-1, `docs/audit/FIX-1027-REVIEW-3-2026-11-01.md`): THE CLEAR ALLOWS FOR
+    /// THE VERIFIED TIP'S LAG. A look's `tipHeight` is the verified header tip, which can trail the block the courier
+    /// confirms the spend in, so evidence confirmed by looks at `tipHeight` = floor, floor - 1 and floor - lag is
+    /// demoted and marked, and at floor - lag - 1 stands; a proof latch keyed by its proof's own block height is
+    /// compared exactly: at the floor deleted, at floor - 1 kept. RED on 0ab42913's predicate (`tipHeight >= ?1`): the
+    /// row at floor - 1 stands. RED with `>=` made `>` (round 3's M6): the row at floor - lag and the latch at the
+    /// floor stand.
+    #[test]
+    fn fix1027f3_m1_the_clear_allows_for_the_verified_tips_lag() {
+        assert_eq!(
+            reorg_tip_lag!().parse::<u64>().unwrap(),
+            REORG_TIP_LAG_BLOCKS,
+            "the predicate's literal is the named constant"
+        );
+        let conn = db();
+        let floor: i64 = 971_100;
+        let lag = REORG_TIP_LAG_BLOCKS as i64;
+        let ev = |c: &str| format!("{}:0", c.repeat(32));
+        let insert = |outpoint: &str, tip: Option<i64>| {
+            conn.execute(
+                "INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed, tipHeight) VALUES (?1, 1000, 1, ?2, 1, ?3)",
+                rusqlite::params![outpoint, "e5".repeat(32), tip],
+            )
+            .unwrap();
+        };
+        let (at_floor, below_one, at_lag, past_lag) = (ev("a1"), ev("b2"), ev("c3"), ev("d4"));
+        insert(&at_floor, Some(floor));
+        insert(&below_one, Some(floor - 1));
+        insert(&at_lag, Some(floor - lag));
+        insert(&past_lag, Some(floor - lag - 1));
+        let latch = |h: i64| format!("proofmined:{}.{h}", "f6".repeat(32));
+        insert(&latch(floor), None);
+        insert(&latch(floor - 1), None);
+        conn.execute("DELETE FROM owed_dirty", []).unwrap();
+        let written = clear_batch(&conn, floor);
+        let mut demoted = written[1].clone();
+        demoted.sort();
+        assert_eq!(
+            demoted,
+            vec![at_floor.clone(), below_one.clone(), at_lag.clone()],
+            "evidence from looks at the floor, one block under it and the lag under it is demoted"
+        );
+        let confirmed: Option<i64> = conn
+            .query_row(
+                "SELECT spentConfirmed FROM hop_chain_probes WHERE outpoint=?1",
+                [&past_lag],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(confirmed, Some(1), "a look past the lag stands confirmed");
+        assert_eq!(
+            written[0],
+            vec![latch(floor)],
+            "a latch is compared by its proof's own height, exactly"
+        );
+        assert!(held(&conn).contains(&latch(floor - 1)));
     }
 }
