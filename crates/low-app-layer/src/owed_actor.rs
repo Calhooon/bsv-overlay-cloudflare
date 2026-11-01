@@ -541,7 +541,7 @@ impl ViewMemo {
 /// A MINED word's view is the live recheck's held in the [`ViewMemo`] while fresh; else the view against the row's own
 /// recorded header ([`crate::tracker_host::stored::Row::recorded_view`]: the header the tracker verified when it wrote
 /// the word), the row then held in `deferred` for the live recheck AFTER the apply (the object's alarm,
-/// [`recheck_moved`]), which re-applies the games of a word whose live header moved. A row that is not mined is its
+/// [`recheck_pass`]), which re-applies the games of a word whose live header moved. A row that is not mined is its
 /// own view (it reads no header). A row whose recorded view does not check is asked of `inner` at once. `now_ms` is the
 /// apply's start; `fresh` asks every row and root of `inner` (a `tip` event's apply, the recheck's own re-apply).
 ///
@@ -554,9 +554,11 @@ impl ViewMemo {
 /// construction for the word input. The D1 judge rechecks every word live; the actor reads a mined word from the
 /// memo's held live view (at most [`WORD_VIEW_MEMO_MS`], 30 s, old) or its recorded header, so the two differ while a
 /// reorg has replaced the word's header and neither the memo's entry has expired nor the actor's post-apply recheck
-/// (`object::RECHECK_DELAY_MS`, about 1 s after the apply; on a faulted read its backoff, at most
-/// [`RECHECK_BACKOFF_MAX_MS`]) has re-applied the game, nor the tracker has demoted the word: up to 30 s plus the
-/// recheck's delay. Nothing marks it (no held-mark exclusion applies): a compare in that window counts a judge
+/// ([`RECHECK_DELAY_MS`], about 1 s after the apply) has re-applied the game, nor the tracker has demoted the word:
+/// 30 s plus the recheck's delay; under a CHAINTRACKS fault three faulted reads (about 7 s of backoff,
+/// [`RECHECK_FAULTS_CONSERVATIVE`], D2-ACTOR-G-FOLD-2's LOW-A) and then the conservative judgement until a read
+/// checks (the games re-applied fresh, each faulted word read `cannotCheck` and withheld as the D1 judge withholds
+/// it, and asked live on every later apply). Nothing marks it (no held-mark exclusion applies): a compare in that window counts a judge
 /// disagreement. The unbounded case the lens found (HIGH-1: a header chaintracks no longer serves, a live
 /// `cannotCheck` the recheck ignored) is closed: an unserved header is a move ([`header_unavailable`]), its held view
 /// forgotten, and the word asked live on every later apply ([`MemoOutside::live_only`]) until a live view checks; what
@@ -575,6 +577,10 @@ pub struct MemoOutside<'a, O: Outside> {
     /// The txids `inner` was asked for in this apply whose live view checked (the object takes them out of
     /// `recheckLive`).
     pub live_checked: RefCell<BTreeSet<String>>,
+    /// D2-ACTOR-G-FOLD-2 (the delta lens's LOW-B): the txids of [`MemoOutside::live_only`] whose row this apply read
+    /// no longer `mined` (the tracker demoted the word): taken out of `recheckLive` by [`after_apply_recheck`], so a
+    /// dead entry never holds a place there.
+    pub live_demoted: RefCell<BTreeSet<String>>,
 }
 impl<'a, O: Outside> MemoOutside<'a, O> {
     pub fn new(inner: &'a O, memo: &'a ViewMemo, now_ms: u64, fresh: bool) -> Self {
@@ -586,6 +592,7 @@ impl<'a, O: Outside> MemoOutside<'a, O> {
             deferred: RefCell::default(),
             live_only: BTreeSet::new(),
             live_checked: RefCell::default(),
+            live_demoted: RefCell::default(),
         }
     }
     /// HIGH-1: the txids asked live whatever the memo and the recorded header say ([`MemoOutside::live_only`]).
@@ -785,6 +792,259 @@ pub fn recheck_moved(
     recheck_outcome(rows, live, memo, now).moved
 }
 
+/// D2-ACTOR-G-FOLD-2: the `meta` row of the held recheck (`{rows, games, faults, conservative}`), the alarm's
+/// post-apply recheck ([`recheck_pass`]).
+pub const META_RECHECK: &str = "recheck";
+/// D2-ACTOR-G-FOLD-1 (the lens's HIGH-1): the txids asked live on every apply until a live view checks
+/// ([`MemoOutside::live_only`]).
+pub const META_RECHECK_LIVE: &str = "recheckLive";
+/// D2-ACTOR-G: the apply kind of the recheck's re-apply (it asks every word live).
+pub const RECHECK_KIND: &str = "recheck";
+/// D2-ACTOR-G: how long after an apply its live recheck runs (the alarm; the KV copy's own interval).
+pub const RECHECK_DELAY_MS: u64 = 1_000;
+/// D2-ACTOR-G-FOLD-2 (the delta lens's LOW-A): the consecutive faulted reads of a held recheck after which its games
+/// are judged CONSERVATIVELY: re-applied fresh (the live ask reads `cannotCheck` and withholds, as the D1 judge does)
+/// and its faulted txids asked live on every later apply (`recheckLive`) until a read checks.
+pub const RECHECK_FAULTS_CONSERVATIVE: u64 = 3;
+
+/// D2-ACTOR-G-FOLD-2 (the delta lens's MEDIUM-A): what the actor's recheck needs of its object, so its state
+/// transitions run in ONE place ([`apply_outside`], [`after_apply_recheck`], [`recheck_pass`]) and the object holds
+/// none of its own: its `meta` rows, the live CHAINTRACKS read, an apply of games under a kind (the object's
+/// `apply_route`, which builds its outside through [`apply_outside`] and settles through [`after_apply_recheck`]), the
+/// recheck's alarm (an earlier alarm wins), the counters and the log. The object implements it over its SQLite
+/// (`object::ObjectRecheck`); the pins over native SQLite and a model chain.
+#[allow(async_fn_in_trait)]
+pub trait RecheckPort {
+    fn meta_get(&self, name: &str) -> Option<String>;
+    fn meta_put(&self, name: &str, value: &str);
+    fn meta_delete(&self, name: &str);
+    /// The live views of `rows` (CHAINTRACKS).
+    async fn live_views(
+        &self,
+        rows: &BTreeMap<String, crate::tracker_host::stored::Row>,
+    ) -> Result<BTreeMap<String, Value>, String>;
+    /// An apply of `games` under `kind` (the recheck's re-apply is [`RECHECK_KIND`]).
+    async fn apply(&self, kind: &str, games: &[String]) -> Result<(), String>;
+    /// The recheck's alarm `delay_ms` from now, unless an earlier one is set.
+    async fn alarm_in(&self, delay_ms: u64);
+    async fn count(&self, counter: &str, n: u64);
+    fn log(&self, line: &str);
+    fn now_ms(&self) -> u64;
+}
+
+/// MEDIUM-A: the txids the port's actor asks live on every apply (`recheckLive`; empty when absent or unreadable).
+pub fn live_only_of<P: RecheckPort>(port: &P) -> BTreeSet<String> {
+    port.meta_get(META_RECHECK_LIVE)
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default()
+}
+
+/// MEDIUM-A: THE apply's outside, the one the object builds: the isolate's memo over `inner`, fresh for a `tip` event
+/// and the recheck's own re-apply, and `recheckLive` read from the port ([`MemoOutside::live_only`]).
+pub fn apply_outside<'a, P: RecheckPort, O: Outside>(
+    port: &P,
+    inner: &'a O,
+    memo: &'a ViewMemo,
+    now_ms: u64,
+    kind: Option<&str>,
+) -> MemoOutside<'a, O> {
+    MemoOutside::new(
+        inner,
+        memo,
+        now_ms,
+        matches!(kind, Some("tip" | RECHECK_KIND)),
+    )
+    .with_live_only(live_only_of(port))
+}
+
+/// MEDIUM-A and LOW-B: `recheckLive` with `add` merged (at most [`RECHECK_HELD_MAX`]) and `remove` taken out, the row
+/// deleted when empty. Answers the txids of `add` past the room (counted `owed_actor_recheck_live_overflow_total` by
+/// its callers: never silent).
+pub fn update_live_only<P: RecheckPort>(
+    port: &P,
+    add: &BTreeSet<String>,
+    remove: &BTreeSet<String>,
+) -> u64 {
+    let before = live_only_of(port);
+    let remove: BTreeSet<String> = remove.iter().map(|k| k.to_ascii_lowercase()).collect();
+    let mut set = before.clone();
+    set.retain(|k| !remove.contains(k));
+    let mut overflow = 0;
+    for k in add {
+        let k = k.to_ascii_lowercase();
+        if set.contains(&k) {
+            continue;
+        }
+        if set.len() < RECHECK_HELD_MAX {
+            set.insert(k);
+        } else {
+            overflow += 1;
+        }
+    }
+    if set != before {
+        if set.is_empty() {
+            port.meta_delete(META_RECHECK_LIVE);
+        } else {
+            port.meta_put(META_RECHECK_LIVE, &json!(set).to_string());
+        }
+    }
+    overflow
+}
+
+/// LOW-B: [`update_live_only`], its overflow counted and logged.
+async fn update_live_only_counted<P: RecheckPort>(
+    port: &P,
+    add: &BTreeSet<String>,
+    remove: &BTreeSet<String>,
+) {
+    let overflow = update_live_only(port, add, remove);
+    if overflow > 0 {
+        port.log(&format!(
+            "[owed-actor] recheck: {overflow} txid(s) past recheckLive's room, judged on their recorded header"
+        ));
+        port.count(COUNTERS[37], overflow).await;
+    }
+}
+
+/// MEDIUM-A: the recheck's settle after an apply that judged with `outside` (built by [`apply_outside`]): the mined rows
+/// it judged on their recorded header held for the live recheck ([`recheck_merge`], the rows past its room counted
+/// `owed_actor_recheck_dropped_total`) and the alarm set [`RECHECK_DELAY_MS`] from now (an earlier alarm wins); the
+/// txids asked live whose view checked, and (LOW-B) those whose word the tracker demoted, taken out of `recheckLive`.
+pub async fn after_apply_recheck<P: RecheckPort, O: Outside>(
+    port: &P,
+    outside: &MemoOutside<'_, O>,
+    games: &[String],
+) {
+    let deferred = outside.deferred.take();
+    if !deferred.is_empty() {
+        let current = port
+            .meta_get(META_RECHECK)
+            .and_then(|v| serde_json::from_str(&v).ok());
+        let (held, dropped) = recheck_merge(current, deferred, games);
+        port.meta_put(META_RECHECK, &held.to_string());
+        if dropped > 0 {
+            port.log(&format!(
+                "[owed-actor] recheck: {dropped} row(s) past the held recheck's room, not rechecked"
+            ));
+            port.count(COUNTERS[36], dropped).await;
+        }
+        port.alarm_in(RECHECK_DELAY_MS).await;
+    }
+    let mut out = outside.live_checked.take();
+    out.extend(outside.live_demoted.take());
+    update_live_only_counted(port, &BTreeSet::new(), &out).await;
+}
+
+/// MEDIUM-A: what one [`recheck_pass`] did (the pins read it).
+#[derive(Debug, Default)]
+pub struct RecheckPass {
+    pub outcome: RecheckOutcome,
+    /// The held recheck's consecutive faulted reads after the pass.
+    pub faults: u64,
+    /// LOW-A: the pass judged the held games conservatively (the [`RECHECK_FAULTS_CONSERVATIVE`]th faulted read).
+    pub conservative: bool,
+    /// The games re-applied under [`RECHECK_KIND`].
+    pub reapplied: Vec<String>,
+}
+
+/// MEDIUM-A: THE alarm's live recheck, every transition of it: the held rows asked of the port's CHAINTRACKS read in
+/// one snapshot ([`recheck_outcome`], the checked views held in the memo); settled AFTER the read ([`recheck_settle`]:
+/// a faulted read and each row it could not judge held again under the backoff alarm, counted
+/// `owed_actor_recheck_faults_total`; a row an apply merged during the read stays); an unserved header's txid added to
+/// `recheckLive`, a checked one taken out; and the held games re-applied once, fresh, through the port when a word
+/// moved under its live header or its header is no longer served (the lens's HIGH-1).
+///
+/// LOW-A, the faulted recheck's bound: at the [`RECHECK_FAULTS_CONSERVATIVE`]th consecutive faulted read the held
+/// games are re-applied fresh (each faulted word then reads `cannotCheck` and withholds, as the D1 judge does) and
+/// the faulted txids asked live on every later apply; the backoff goes on, and the first read that checks them takes
+/// them out and re-applies the games again (the word restored).
+pub async fn recheck_pass<P: RecheckPort>(port: &P, memo: &ViewMemo) -> RecheckPass {
+    let mut pass = RecheckPass::default();
+    let Some(held) = port.meta_get(META_RECHECK) else {
+        return pass;
+    };
+    let held: Value = serde_json::from_str(&held).unwrap_or(Value::Null);
+    let rows: BTreeMap<String, crate::tracker_host::stored::Row> =
+        serde_json::from_value(held["rows"].clone()).unwrap_or_default();
+    let games: Vec<String> = serde_json::from_value(held["games"].clone()).unwrap_or_default();
+    let was_conservative = held["conservative"].as_bool() == Some(true);
+    if rows.is_empty() {
+        port.meta_delete(META_RECHECK);
+        return pass;
+    }
+    let (outcome, read_fault) = match port.live_views(&rows).await {
+        Ok(live) => (recheck_outcome(&rows, &live, memo, port.now_ms()), None),
+        Err(e) => (
+            RecheckOutcome {
+                faulted: rows.clone(),
+                ..Default::default()
+            },
+            Some(e),
+        ),
+    };
+    let current = port
+        .meta_get(META_RECHECK)
+        .and_then(|v| serde_json::from_str(&v).ok());
+    pass.faults = match recheck_settle(current, &rows, &outcome.faulted, read_fault.is_some()) {
+        Some((mut still, delay)) => {
+            let faults = still["faults"].as_u64().unwrap_or(0);
+            still["conservative"] = json!(faults >= RECHECK_FAULTS_CONSERVATIVE);
+            port.meta_put(META_RECHECK, &still.to_string());
+            port.alarm_in(delay).await;
+            faults
+        }
+        None => {
+            port.meta_delete(META_RECHECK);
+            0
+        }
+    };
+    pass.conservative = !outcome.faulted.is_empty() && pass.faults >= RECHECK_FAULTS_CONSERVATIVE;
+    let mut add = outcome.unavailable.clone();
+    if pass.conservative {
+        add.extend(outcome.faulted.keys().map(|k| k.to_ascii_lowercase()));
+    }
+    update_live_only_counted(port, &add, &outcome.checked).await;
+    if read_fault.is_some() || !outcome.faulted.is_empty() {
+        port.log(&format!(
+            "[owed-actor] recheck: {} of {} row(s) not judged ({}): held again{}",
+            outcome.faulted.len(),
+            rows.len(),
+            read_fault.as_deref().unwrap_or("cannot check"),
+            if pass.conservative {
+                " (judged conservatively)"
+            } else {
+                ""
+            }
+        ));
+        port.count(COUNTERS[35], 1).await;
+    }
+    let reapply = !outcome.moved.is_empty()
+        || (pass.conservative && !was_conservative)
+        || (was_conservative && !outcome.checked.is_empty());
+    pass.outcome = outcome;
+    if !reapply || games.is_empty() {
+        return pass;
+    }
+    port.log(&format!(
+        "[owed-actor] recheck: {} word(s) moved under the live header ({}){}: re-applying {} game(s)",
+        pass.outcome.moved.len(),
+        pass.outcome.moved.iter().take(3).cloned().collect::<Vec<_>>().join(","),
+        if pass.conservative && !was_conservative {
+            ", the faulted reads judged conservatively"
+        } else {
+            ""
+        },
+        games.len()
+    ));
+    for chunk in games.chunks(GAMES_PER_APPLY) {
+        if let Err(e) = port.apply(RECHECK_KIND, chunk).await {
+            port.log(&format!("[owed-actor] recheck: the re-apply: {e}"));
+        }
+    }
+    pass.reapplied = games;
+    pass
+}
+
 impl<O: Outside> Outside for MemoOutside<'_, O> {
     async fn word_views(
         &self,
@@ -800,6 +1060,11 @@ impl<O: Outside> Outside for MemoOutside<'_, O> {
                     continue;
                 }
                 if row.word != "mined" {
+                    // LOW-B: a word the tracker demoted leaves `recheckLive`
+                    let lc = k.to_ascii_lowercase();
+                    if self.live_only.contains(&lc) {
+                        self.live_demoted.borrow_mut().insert(lc);
+                    }
                     out.insert(k.clone(), row.view());
                     continue;
                 }
@@ -6132,7 +6397,7 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
 /// (`owed_events::HEALTH_CONSUMER_SQL`).
 macro_rules! health_select {
     () => {
-        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold','owed-actor:bars:flood')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total','owed_actor_recheck_faults_total','owed_actor_recheck_dropped_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding,(SELECT cursor FROM owed_belt_state WHERE name='owed-judge:version') AS d1Rejudge"
+        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold','owed-actor:bars:flood')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total','owed_actor_recheck_faults_total','owed_actor_recheck_dropped_total','owed_actor_recheck_live_overflow_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding,(SELECT cursor FROM owed_belt_state WHERE name='owed-judge:version') AS d1Rejudge"
     };
 }
 pub const HEALTH_SQL: &str = health_select!();
@@ -6253,7 +6518,7 @@ pub fn health_body(read: Option<&Value>, now: u64, d1_oldest_unacked: &Value) ->
     // wall or faulted (the queue's message is the backstop of each).
     body["direct"] = json!({"calls": n(COUNTERS[3]), "walls": n(COUNTERS[25]), "faults": n(COUNTERS[4]), "closures": n(COUNTERS[32]), "closureFaults": n(COUNTERS[33]), "closureDeclines": n(COUNTERS[34])});
     // D2-ACTOR-G-FOLD-1 (MEDIUM-1): the live rechecks whose read faulted and the rows past the held recheck's room.
-    body["recheck"] = json!({"faults": n(COUNTERS[35]), "dropped": n(COUNTERS[36])});
+    body["recheck"] = json!({"faults": n(COUNTERS[35]), "dropped": n(COUNTERS[36]), "liveOverflow": n(COUNTERS[37])});
     // NEW-L3: Phase B's gate is COVERAGE, the bootstrap lever's last full pass (`complete`, `contiguous`, `uncovered`
     // 0), never `bootstraps` against `activeIdentities` (two counts).
     body["coverage"] = field("coverage");
@@ -7337,7 +7602,7 @@ mod tests;
 /// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
 /// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
 /// (MEDIUM-9).
-pub const COUNTERS: [&str; 37] = [
+pub const COUNTERS: [&str; 38] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -7401,6 +7666,8 @@ pub const COUNTERS: [&str; 37] = [
     // backed off), and the rows an apply judged on their recorded header that the held recheck had no room for.
     "owed_actor_recheck_faults_total",
     "owed_actor_recheck_dropped_total",
+    // D2-ACTOR-G-FOLD-2 (the delta lens's LOW-B): the txids past `recheckLive`'s room (judged on their recorded header).
+    "owed_actor_recheck_live_overflow_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;

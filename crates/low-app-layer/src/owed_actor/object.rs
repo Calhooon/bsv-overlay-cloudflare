@@ -49,18 +49,10 @@ const META_JUDGED_REV: &str = "judgedLibRev";
 const META_TIP_JUDGED: &str = "tipJudged";
 /// NEW2-L5: the tip window's carried faults ([`tip_window`]), a JSON object of game to consecutive faults.
 const META_TIP_FAULTS: &str = "tipFaults";
-/// D2-ACTOR-G (bsv-low #1031): the mined rows an apply judged on their recorded header and their games, for the live
-/// recheck the alarm runs ([`OwedActor::run_recheck`]).
-const META_RECHECK: &str = "recheck";
-/// D2-ACTOR-G-FOLD-1 (the lens's HIGH-1): the txids whose header the live recheck found unserved, asked live on every
-/// apply until a live view checks ([`crate::owed_actor::MemoOutside::live_only`]).
-const META_RECHECK_LIVE: &str = "recheckLive";
-/// D2-ACTOR-G: the apply kind of the recheck's re-apply (it asks every word live).
-pub const RECHECK_KIND: &str = "recheck";
-/// D2-ACTOR-G: how long after an apply its live recheck runs (the alarm; the KV copy's own interval).
-pub const RECHECK_DELAY_MS: u64 = 1_000;
-/// D2-ACTOR-G: the most rows one actor holds for its recheck (the rows past it counted since D2-ACTOR-G-FOLD-1).
-pub const RECHECK_ROWS_MAX: usize = crate::owed_actor::RECHECK_HELD_MAX;
+// D2-ACTOR-G-FOLD-2 (the delta lens's MEDIUM-A): the recheck's `meta` rows (`META_RECHECK`, `META_RECHECK_LIVE`),
+// its kind (`RECHECK_KIND`) and its delay (`RECHECK_DELAY_MS`) live in the module beside its one state machine
+// (`recheck_pass`, `apply_outside`, `after_apply_recheck` over `RecheckPort`); this object implements the port.
+
 /// LOW-6: the bootstrap's first keyset cursor (`[at, gameId]` of the last page; this one precedes every game).
 pub const BOOT_CURSOR_START: &str = "[9223372036854775807,\"\"]";
 /// The bootstrap's keyset from its stored cursor (anything that is not one, the HIGH-4 re-arm's `0` included, is
@@ -541,6 +533,101 @@ impl DurableObject for OwedActor {
     }
 }
 
+/// D2-ACTOR-G-FOLD-2 (the delta lens's MEDIUM-A): the object's [`crate::owed_actor::RecheckPort`]: its `meta` rows over
+/// its SQLite, the live read over CHAINTRACKS ([`EnvOutside`]), an apply through its own `apply_route` (which builds
+/// its outside by [`crate::owed_actor::apply_outside`] and settles by [`crate::owed_actor::after_apply_recheck`]), the
+/// recheck's alarm (an earlier alarm wins), the record's counters and the log.
+pub struct ObjectRecheck<'a> {
+    obj: &'a OwedActor,
+    local: &'a DoSql,
+    /// The re-apply's tip, read once a pass.
+    tip: std::cell::Cell<Option<Option<u64>>>,
+}
+impl<'a> ObjectRecheck<'a> {
+    fn new(obj: &'a OwedActor, local: &'a DoSql) -> Self {
+        ObjectRecheck {
+            obj,
+            local,
+            tip: std::cell::Cell::new(None),
+        }
+    }
+}
+impl crate::owed_actor::RecheckPort for ObjectRecheck<'_> {
+    fn meta_get(&self, name: &str) -> Option<String> {
+        self.obj.meta(name)
+    }
+    fn meta_put(&self, name: &str, value: &str) {
+        self.obj.put_meta(self.local, name, value);
+    }
+    fn meta_delete(&self, name: &str) {
+        let _ = self.local.sql.exec(
+            "DELETE FROM meta WHERE name=?1",
+            vec![SqlStorageValue::from(name.to_string())],
+        );
+    }
+    async fn live_views(
+        &self,
+        rows: &BTreeMap<String, crate::tracker_host::stored::Row>,
+    ) -> std::result::Result<BTreeMap<String, Value>, String> {
+        EnvOutside(&self.obj.env).word_views(rows).await
+    }
+    async fn apply(&self, kind: &str, games: &[String]) -> std::result::Result<(), String> {
+        let identity = self
+            .obj
+            .meta(META_IDENTITY)
+            .ok_or_else(|| "no identity held".to_string())?;
+        let tip = match self.tip.get() {
+            Some(t) => t,
+            None => {
+                let t = crate::owed_events::tip_memoised(&self.obj.env, true).await;
+                self.tip.set(Some(t));
+                t
+            }
+        };
+        let body = ApplyBody {
+            identity,
+            games: games.to_vec(),
+            kind: Some(kind.into()),
+            seq: None,
+            at_ms: None,
+            tip,
+            txfacts: Vec::new(),
+            mined: false,
+            bound: None,
+            class: None,
+            also: Vec::new(),
+            also_at_ms: Vec::new(),
+            txids: None,
+            concurrent: None,
+            belt_asked: Vec::new(),
+            carried: None,
+        };
+        let resp = self
+            .obj
+            .apply_route(body)
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.status_code() >= 400 {
+            return Err(format!("the apply answered {}", resp.status_code()));
+        }
+        Ok(())
+    }
+    async fn alarm_in(&self, delay_ms: u64) {
+        self.obj.recheck_alarm_in(delay_ms).await;
+    }
+    async fn count(&self, counter: &str, n: u64) {
+        if let Ok(record) = crate::routes::D1Sql::of(&self.obj.env) {
+            record.counters(vec![(counter.to_string(), n)]).await;
+        }
+    }
+    fn log(&self, line: &str) {
+        console_log!("{line}");
+    }
+    fn now_ms(&self) -> u64 {
+        Date::now().as_millis()
+    }
+}
+
 impl OwedActor {
     fn local(&self) -> DoSql {
         let local = DoSql::of(&self.state);
@@ -803,30 +890,6 @@ impl OwedActor {
         }
     }
 
-    /// D2-ACTOR-G (bsv-low #1031): the rows an apply judged on their recorded header ([`crate::owed_actor::MemoOutside`])
-    /// held in `meta` (merged with any not yet rechecked, at most [`RECHECK_ROWS_MAX`], the rows
-    /// past it counted, D2-ACTOR-G-FOLD-1's MEDIUM-1) beside their games, and the alarm set [`RECHECK_DELAY_MS`] from
-    /// now unless an earlier one is set.
-    async fn defer_recheck(
-        &self,
-        local: &DoSql,
-        rows: BTreeMap<String, crate::tracker_host::stored::Row>,
-        games: &[String],
-    ) {
-        let current = self
-            .meta(META_RECHECK)
-            .and_then(|v| serde_json::from_str(&v).ok());
-        let (held, dropped) = crate::owed_actor::recheck_merge(current, rows, games);
-        self.put_meta(local, META_RECHECK, &held.to_string());
-        if dropped > 0 {
-            console_log!("[owed-actor] recheck: {dropped} row(s) past the held recheck's room, not rechecked");
-            if let Ok(record) = crate::routes::D1Sql::of(&self.env) {
-                record.counters(vec![(COUNTERS[36].into(), dropped)]).await;
-            }
-        }
-        self.recheck_alarm_in(RECHECK_DELAY_MS).await;
-    }
-
     /// The recheck's alarm `delay` from now, unless an earlier one is set.
     async fn recheck_alarm_in(&self, delay: u64) {
         let at = Date::now().as_millis() + delay;
@@ -836,140 +899,13 @@ impl OwedActor {
         }
     }
 
-    /// D2-ACTOR-G-FOLD-1 (HIGH-1): the txids this actor asks live on every apply (`recheckLive`).
-    fn live_only(&self) -> BTreeSet<String> {
-        self.meta(META_RECHECK_LIVE)
-            .and_then(|v| serde_json::from_str(&v).ok())
-            .unwrap_or_default()
-    }
-
-    /// HIGH-1: `recheckLive` with `add` merged (at most [`RECHECK_ROWS_MAX`]) and `remove` taken
-    /// out; the row deleted when empty.
-    fn update_live_only(&self, local: &DoSql, add: &BTreeSet<String>, remove: &BTreeSet<String>) {
-        let before = self.live_only();
-        if add.is_empty() && remove.iter().all(|k| !before.contains(k)) {
-            return;
-        }
-        let mut set = before;
-        for k in add {
-            if set.len() < crate::owed_actor::RECHECK_HELD_MAX {
-                set.insert(k.to_ascii_lowercase());
-            }
-        }
-        for k in remove {
-            set.remove(&k.to_ascii_lowercase());
-        }
-        if set.is_empty() {
-            let _ = local
-                .sql
-                .exec("DELETE FROM meta WHERE name='recheckLive'", None);
-        } else {
-            self.put_meta(local, META_RECHECK_LIVE, &json!(set).to_string());
-        }
-    }
-
-    /// D2-ACTOR-G: the alarm's live recheck ([`crate::owed_actor::recheck_outcome`]): the held rows asked of
-    /// CHAINTRACKS in one snapshot, held in the isolate's memo; a word whose live view moved (or whose header is no
-    /// longer served, D2-ACTOR-G-FOLD-1's HIGH-1) re-applies the held games once, fresh (its apply asks every word
-    /// live). D2-ACTOR-G-FOLD-1 (MEDIUM-1): the held rows are settled AFTER the read ([`crate::owed_actor::recheck_settle`]):
-    /// a read that faults, and each row it could not judge, is held again under a backoff alarm and counted
-    /// (`owed_actor_recheck_faults_total`); a row an apply merged during the read stays.
+    /// D2-ACTOR-G (bsv-low #1031): the alarm's live recheck of the mined words the applies judged on their recorded
+    /// header. D2-ACTOR-G-FOLD-2 (the delta lens's MEDIUM-A): every transition is [`crate::owed_actor::recheck_pass`]'s
+    /// over this object's port ([`ObjectRecheck`]); the object holds none of its own.
     async fn run_recheck(&self, local: &DoSql) {
-        let Some(held) = self.meta(META_RECHECK) else {
-            return;
-        };
-        let held: Value = serde_json::from_str(&held).unwrap_or(Value::Null);
-        let rows: BTreeMap<String, crate::tracker_host::stored::Row> =
-            serde_json::from_value(held["rows"].clone()).unwrap_or_default();
-        let games: Vec<String> = serde_json::from_value(held["games"].clone()).unwrap_or_default();
-        if rows.is_empty() {
-            let _ = local
-                .sql
-                .exec("DELETE FROM meta WHERE name='recheck'", None);
-            return;
-        }
         let memo = crate::owed_actor::VIEW_MEMO.with(std::rc::Rc::clone);
-        let (outcome, read_fault) = match EnvOutside(&self.env).word_views(&rows).await {
-            Ok(live) => (
-                crate::owed_actor::recheck_outcome(&rows, &live, &memo, Date::now().as_millis()),
-                None,
-            ),
-            Err(e) => (
-                crate::owed_actor::RecheckOutcome {
-                    faulted: rows.clone(),
-                    ..Default::default()
-                },
-                Some(e),
-            ),
-        };
-        let current = self
-            .meta(META_RECHECK)
-            .and_then(|v| serde_json::from_str(&v).ok());
-        match crate::owed_actor::recheck_settle(
-            current,
-            &rows,
-            &outcome.faulted,
-            read_fault.is_some(),
-        ) {
-            Some((still, delay)) => {
-                self.put_meta(local, META_RECHECK, &still.to_string());
-                self.recheck_alarm_in(delay).await;
-            }
-            None => {
-                let _ = local
-                    .sql
-                    .exec("DELETE FROM meta WHERE name='recheck'", None);
-            }
-        }
-        self.update_live_only(local, &outcome.unavailable, &outcome.checked);
-        if read_fault.is_some() || !outcome.faulted.is_empty() {
-            console_log!(
-                "[owed-actor] recheck: {} of {} row(s) not judged ({}): held again",
-                outcome.faulted.len(),
-                rows.len(),
-                read_fault.as_deref().unwrap_or("cannot check")
-            );
-            if let Ok(record) = crate::routes::D1Sql::of(&self.env) {
-                record.counters(vec![(COUNTERS[35].into(), 1)]).await;
-            }
-        }
-        let moved = outcome.moved;
-        let Some(identity) = self.meta(META_IDENTITY) else {
-            return;
-        };
-        if moved.is_empty() || games.is_empty() {
-            return;
-        }
-        console_log!(
-            "[owed-actor] recheck {identity}: {} word(s) moved under the live header ({}): re-applying {} game(s)",
-            moved.len(),
-            moved.iter().take(3).cloned().collect::<Vec<_>>().join(","),
-            games.len()
-        );
-        let tip = crate::owed_events::tip_memoised(&self.env, true).await;
-        for chunk in games.chunks(GAMES_PER_APPLY) {
-            let body = ApplyBody {
-                identity: identity.clone(),
-                games: chunk.to_vec(),
-                kind: Some(RECHECK_KIND.into()),
-                seq: None,
-                at_ms: None,
-                tip,
-                txfacts: Vec::new(),
-                mined: false,
-                bound: None,
-                class: None,
-                also: Vec::new(),
-                also_at_ms: Vec::new(),
-                txids: None,
-                concurrent: None,
-                belt_asked: Vec::new(),
-                carried: None,
-            };
-            if let Err(e) = self.apply_route(body).await {
-                console_log!("[owed-actor] recheck {identity}: the re-apply: {e}");
-            }
-        }
+        let port = ObjectRecheck::new(self, local);
+        crate::owed_actor::recheck_pass(&port, &memo).await;
     }
 
     /// Phase C (`OWED_D1_JUDGE=false`): the D1 rows are not dated, so the actor publishes its belt questions.
@@ -1059,13 +995,15 @@ impl OwedActor {
         // D2-ACTOR-G (bsv-low #1031): the isolate's word-view memo over CHAINTRACKS (a `tip` event asks fresh).
         let memo = crate::owed_actor::VIEW_MEMO.with(std::rc::Rc::clone);
         let env_outside = EnvOutside(&self.env);
-        let outside = crate::owed_actor::MemoOutside::new(
+        // D2-ACTOR-G-FOLD-2 (MEDIUM-A): the outside the recheck's state machine builds (`recheckLive` read there)
+        let port = ObjectRecheck::new(self, &local);
+        let outside = crate::owed_actor::apply_outside(
+            &port,
             &env_outside,
             &memo,
             started,
-            matches!(body.kind.as_deref(), Some("tip" | RECHECK_KIND)),
-        )
-        .with_live_only(self.live_only());
+            body.kind.as_deref(),
+        );
         // D2-ACTOR-B-FOLD-7: an actor without `bootstrapped` holds the event and arms its bootstrap (never a closure
         // over a mirror the bootstrap has not filled); a bootstrapped one whose closure meets its bound re-arms.
         let applied = apply_or_hold_in(
@@ -1121,13 +1059,9 @@ impl OwedActor {
         }
         // D2-ACTOR-G (bsv-low #1031): the mined words this apply judged on their recorded header are rechecked LIVE by
         // the alarm, a second from now (the earlier alarm wins), never inside the apply
-        let deferred = outside.deferred.take();
-        if !deferred.is_empty() {
-            self.defer_recheck(&local, deferred, &body.games).await;
-        }
-        // HIGH-1: a word asked live whose view now checks is judged on its recorded header again
-        let checked = outside.live_checked.take();
-        self.update_live_only(&local, &BTreeSet::new(), &checked);
+        // (and, HIGH-1, a word asked live whose view now checks, or LOW-B whose word was demoted, leaves `recheckLive`):
+        // the recheck's own settle (D2-ACTOR-G-FOLD-2, MEDIUM-A)
+        crate::owed_actor::after_apply_recheck(&port, &outside, &body.games).await;
         // FIX-983: the closure misses' counter is deferred with the rest of the record work that is not the apply's
         // ([`OwedActor::after_apply`]).
         let misses = report.misses;

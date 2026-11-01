@@ -6914,7 +6914,7 @@ fn fold10_j_a_state_judged_under_another_build_bootstraps_again() {
     let actor = squash(include_str!("../owed_actor.rs"));
     assert!(actor.contains("body[\"rejudged\"]=n(COUNTERS[26]);"));
     assert!(
-        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total','owed_actor_recheck_faults_total','owed_actor_recheck_dropped_total'))AScounters")
+        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total','owed_actor_recheck_faults_total','owed_actor_recheck_dropped_total','owed_actor_recheck_live_overflow_total'))AScounters")
     );
 }
 
@@ -18286,6 +18286,9 @@ mod d2_actor_g {
         headers: RefCell<BTreeMap<u32, (String, String)>>,
         clock: &'a Cell<u64>,
         asks: Cell<usize>,
+        /// D2-ACTOR-G-FOLD-2 (LOW-A): CHAINTRACKS faulting: the tip read answers an error, so every mined word's live
+        /// view is `cannotCheck` `Headers(..)` (a fault, never an unserved header).
+        fault: Cell<bool>,
     }
     impl Outside for Chain<'_> {
         async fn word_views(
@@ -18293,7 +18296,11 @@ mod d2_actor_g {
             rows: &BTreeMap<String, Row>,
         ) -> Result<BTreeMap<String, Value>, String> {
             let snap = HeaderSnapshot {
-                tip: Ok(1_000_000),
+                tip: if self.fault.get() {
+                    Err(bsv_tracker::HeaderError("503".into()))
+                } else {
+                    Ok(1_000_000)
+                },
                 headers: self
                     .headers
                     .borrow()
@@ -18388,6 +18395,7 @@ mod d2_actor_g {
             ),
             clock,
             asks: Cell::new(0),
+            fault: Cell::new(false),
         }
     }
 
@@ -19096,20 +19104,140 @@ mod d2_actor_g {
             headers: RefCell::new(BTreeMap::from([(POT_H, (h("aa", 1), pot))])),
             clock,
             asks: Cell::new(0),
+            fault: Cell::new(false),
         };
         (record, id, games, chain)
     }
 
-    /// (gf1_high1) D2-ACTOR-G-FOLD-1, THE LENS'S HIGH-1: A MINED WORD WHOSE HEADER CHAINTRACKS NO LONGER SERVES IS
-    /// JUDGED AS THE D1 JUDGE JUDGES IT. A refund press resting on the pot's checked mined word; the warm actor and the
-    /// D1 judge both press while the header is served (the premise). The header at the word's height is then removed
-    /// (the verified tip's re-validation, an invalidated tip header, the #896 class): the fresh D1 judgement withholds
-    /// (`funding-not-held`: a `cannotCheck` mined is no landing). The actor's apply judges the word on its RECORDED
-    /// header (it always checks) and presses; its live recheck after the apply now counts the unserved header as MOVED
-    /// and re-applies the game fresh, so the actor's rows EQUAL the D1 judge's (no press). The txid is then asked live
-    /// on every later apply (`recheckLive`), never judged on its recorded header, until a live view checks: the header
-    /// served again, both sides press again. RED on b2ffbfb6 (`recheck_moved` dropped a `cannotCheck` live view): the
-    /// actor kept the press the D1 judge withheld.
+    /// D2-ACTOR-G-FOLD-2 (the delta lens's MEDIUM-A): the recheck's port over the pins' native SQLite: the mirror's
+    /// `meta` rows, the model chain's live read, an apply through the SHIPPED wiring ([`port_apply`]: the outside the
+    /// object builds, [`apply_outside`], then [`after_apply_recheck`]), the alarms, counters and lines recorded.
+    struct TestRecheck<'a> {
+        record: &'a SqliteSql,
+        local: &'a SqliteSql,
+        chain: &'a Chain<'a>,
+        memo: &'a ViewMemo,
+        id: String,
+        clock: &'a Cell<u64>,
+        alarms: RefCell<Vec<u64>>,
+        counted: RefCell<Vec<(String, u64)>>,
+        lines: RefCell<Vec<String>>,
+        applies: RefCell<Vec<(String, Vec<String>)>>,
+    }
+    impl<'a> TestRecheck<'a> {
+        fn new(
+            record: &'a SqliteSql,
+            local: &'a SqliteSql,
+            chain: &'a Chain<'a>,
+            memo: &'a ViewMemo,
+            id: &str,
+            clock: &'a Cell<u64>,
+        ) -> Self {
+            TestRecheck {
+                record,
+                local,
+                chain,
+                memo,
+                id: id.to_string(),
+                clock,
+                alarms: RefCell::default(),
+                counted: RefCell::default(),
+                lines: RefCell::default(),
+                applies: RefCell::default(),
+            }
+        }
+        fn counted(&self, name: &str) -> u64 {
+            self.counted
+                .borrow()
+                .iter()
+                .filter(|(k, _)| k == name)
+                .map(|(_, n)| n)
+                .sum()
+        }
+    }
+    impl RecheckPort for TestRecheck<'_> {
+        fn meta_get(&self, name: &str) -> Option<String> {
+            self.local
+                .conn
+                .query_row(META_GET_SQL, [name], |r| r.get(0))
+                .ok()
+        }
+        fn meta_put(&self, name: &str, value: &str) {
+            self.local
+                .conn
+                .execute(META_PUT_SQL, [name, value])
+                .unwrap();
+        }
+        fn meta_delete(&self, name: &str) {
+            self.local
+                .conn
+                .execute("DELETE FROM meta WHERE name=?1", [name])
+                .unwrap();
+        }
+        async fn live_views(
+            &self,
+            rows: &BTreeMap<String, Row>,
+        ) -> Result<BTreeMap<String, Value>, String> {
+            self.chain.word_views(rows).await
+        }
+        async fn apply(&self, kind: &str, games: &[String]) -> Result<(), String> {
+            self.applies
+                .borrow_mut()
+                .push((kind.to_string(), games.to_vec()));
+            port_apply(self, kind, None, games).await
+        }
+        async fn alarm_in(&self, delay_ms: u64) {
+            self.alarms.borrow_mut().push(delay_ms);
+        }
+        async fn count(&self, counter: &str, n: u64) {
+            self.counted.borrow_mut().push((counter.to_string(), n));
+        }
+        fn log(&self, line: &str) {
+            self.lines.borrow_mut().push(line.to_string());
+        }
+        fn now_ms(&self) -> u64 {
+            self.clock.get()
+        }
+    }
+
+    /// An apply as the object's `apply_route` makes it: the outside [`apply_outside`] builds over the port (the
+    /// isolate's memo over CHAINTRACKS, `recheckLive` read from `meta`), the actor's apply, then
+    /// [`after_apply_recheck`] (the held recheck, `recheckLive`'s removals).
+    async fn port_apply(
+        port: &TestRecheck<'_>,
+        kind: &str,
+        kind_seq: Option<(&str, i64)>,
+        games: &[String],
+    ) -> Result<(), String> {
+        let out = apply_outside(port, port.chain, port.memo, port.clock.get(), Some(kind));
+        apply(
+            port.record,
+            port.local,
+            &out,
+            &port.id,
+            games,
+            kind_seq,
+            Some(TIP),
+            None,
+        )
+        .await?;
+        after_apply_recheck(port, &out, games).await;
+        Ok(())
+    }
+
+    /// (gf1_high1) D2-ACTOR-G-FOLD-1, THE LENS'S HIGH-1, DRIVEN THROUGH THE SHIPPED RECHECK (D2-ACTOR-G-FOLD-2, the
+    /// delta lens's MEDIUM-A): A MINED WORD WHOSE HEADER CHAINTRACKS NO LONGER SERVES IS JUDGED AS THE D1 JUDGE JUDGES
+    /// IT. A refund press resting on the pot's checked mined word; the warm actor and the D1 judge both press while the
+    /// header is served (the premise). The header at the word's height is then removed (the verified tip's
+    /// re-validation, an invalidated tip header, the #896 class): the fresh D1 judgement withholds (`funding-not-held`).
+    /// Every step below is the shipped state machine over its port ([`TestRecheck`]): an apply judges the word on its
+    /// RECORDED header (it always checks) and presses, and holds it for the recheck; [`recheck_pass`] counts the
+    /// unserved header as MOVED, re-applies the game fresh THROUGH THE PORT and adds the txid to `recheckLive`, so the
+    /// actor's rows EQUAL the D1 judge's (no press); the next apply reads `recheckLive` ([`apply_outside`]) and asks the
+    /// word live (no press, nothing held); the header served again, the live view checks, the txid leaves `recheckLive`
+    /// ([`after_apply_recheck`]) and both sides press. RED against the delta lens's mutant (`apply_outside` without
+    /// `with_live_only`: the third apply judges the recorded header and presses) and against `recheck_pass`'s re-apply
+    /// removed (the actor keeps the press the D1 judge withholds).
     #[tokio::test]
     async fn gf1_high1_an_unserved_header_is_judged_as_the_d1_judge_judges_it() {
         let clock = Cell::new(NOW_MS);
@@ -19119,18 +19247,19 @@ mod d2_actor_g {
             chain: &ch,
         };
         let local = mirror();
-        apply(
-            &record,
-            &local,
-            &ch,
-            &id,
-            &games,
-            Some(("bootstrap", 1)),
-            Some(TIP),
-            None,
-        )
-        .await
-        .unwrap();
+        let memo = ViewMemo::default();
+        let port = TestRecheck::new(&record, &local, &ch, &memo, &id, &clock);
+        let pot = hex::encode(crate::record_post::tests::POT_TXID);
+        port_apply(&port, "bootstrap", Some(("bootstrap", 1)), &games)
+            .await
+            .unwrap();
+        assert!(
+            port.meta_get(META_RECHECK).is_some(),
+            "held for the recheck"
+        );
+        let pass = recheck_pass(&port, &memo).await;
+        assert!(pass.reapplied.is_empty(), "the header served: {pass:?}");
+        assert!(port.meta_get(META_RECHECK).is_none());
         crate::owed_judge::judge_subjects(&d1, &id, &games, "d1")
             .await
             .unwrap();
@@ -19141,8 +19270,9 @@ mod d2_actor_g {
             rows_of(&local, &id)
         );
         assert_eq!(rows_of(&local, &id), rows_of(&record, &id));
-        // the header at the word's height is no longer served
+        // the header at the word's height is no longer served; the memo's checked view has expired
         ch.headers.borrow_mut().remove(&POT_H);
+        clock.set(clock.get() + WORD_VIEW_MEMO_MS + 1);
         crate::owed_judge::judge_subjects(&d1, &id, &games, "d1")
             .await
             .unwrap();
@@ -19152,81 +19282,58 @@ mod d2_actor_g {
             d1_rows.iter().any(|r| r.contains("funding-not-held")),
             "{d1_rows:#?}"
         );
-        // the actor's apply (the object's outside: the isolate's memo over CHAINTRACKS) judges the recorded header
-        let memo = ViewMemo::default();
-        let out = actor_outside(&ch, &memo, clock.get());
-        apply(
-            &record,
-            &local,
-            &out,
-            &id,
-            &games,
-            Some(("pot", 2)),
-            Some(TIP),
-            None,
-        )
-        .await
-        .unwrap();
-        let held = out.deferred.take();
-        let pot = hex::encode(crate::record_post::tests::POT_TXID);
-        assert!(held.contains_key(&pot), "judged on its recorded header");
-        // the live recheck after the apply, as the object runs it
-        let live = ch.word_views(&held).await.unwrap();
-        assert!(header_unavailable(&live[&pot]), "{}", live[&pot]);
-        let outcome = recheck_outcome(&held, &live, &memo, clock.get());
-        assert!(outcome.faulted.is_empty(), "{outcome:?}");
-        if !outcome.moved.is_empty() {
-            let fresh = MemoOutside::new(&ch, &memo, clock.get(), true);
-            apply(&record, &local, &fresh, &id, &games, None, Some(TIP), None)
-                .await
-                .unwrap();
-        }
+        // the actor's apply judges the recorded header (the residual N-A: its first apply after the header left)
+        port_apply(&port, "pot", Some(("pot", 2)), &games)
+            .await
+            .unwrap();
+        assert_eq!(
+            presses(&rows_of(&local, &id)),
+            1,
+            "judged on its recorded header"
+        );
+        let held: Value = serde_json::from_str(&port.meta_get(META_RECHECK).unwrap()).unwrap();
+        assert!(held["rows"].get(&pot).is_some(), "{held}");
+        // the alarm's recheck, as the object runs it
+        let pass = recheck_pass(&port, &memo).await;
+        assert!(pass.outcome.faulted.is_empty(), "{pass:?}");
+        assert_eq!(
+            pass.outcome.unavailable,
+            [pot.clone()].into_iter().collect()
+        );
         assert_eq!(
             rows_of(&local, &id),
             d1_rows,
             "the actor's rows are the D1 judge's after its recheck (both Awaiting, no press)"
         );
+        assert_eq!(
+            port.applies.borrow().last().map(|(k, _)| k.as_str()),
+            Some(RECHECK_KIND),
+            "re-applied through the port"
+        );
         assert_eq!(presses(&rows_of(&local, &id)), 0);
-        assert_eq!(outcome.unavailable, [pot.clone()].into_iter().collect());
-        // the next apply asks the word live (recheckLive): no recorded judgement, no deferral, still equal
+        assert_eq!(live_only_of(&port), [pot.clone()].into_iter().collect());
+        // the next apply reads `recheckLive`: the word asked live, no recorded judgement, nothing held, still equal
         let asks = ch.asks.get();
-        let out =
-            actor_outside(&ch, &memo, clock.get()).with_live_only(outcome.unavailable.clone());
-        apply(
-            &record,
-            &local,
-            &out,
-            &id,
-            &games,
-            Some(("pot", 3)),
-            Some(TIP),
-            None,
-        )
-        .await
-        .unwrap();
+        port_apply(&port, "pot", Some(("pot", 3)), &games)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows_of(&local, &id),
+            d1_rows,
+            "an apply after the recheck asks the word live (recheckLive), never its recorded header"
+        );
         assert_eq!(ch.asks.get(), asks + 1, "asked live");
-        assert!(out.deferred.borrow().is_empty());
-        assert!(out.live_checked.borrow().is_empty());
-        assert_eq!(rows_of(&local, &id), d1_rows);
-        // the header served again: the live answer checks, both sides press, the mark taken out
+        assert!(port.meta_get(META_RECHECK).is_none(), "nothing held");
+        assert_eq!(live_only_of(&port), [pot.clone()].into_iter().collect());
+        // the header served again: the live answer checks, both sides press, the txid taken out of `recheckLive`
         ch.headers
             .borrow_mut()
             .insert(POT_H, (h("aa", 1), pot.clone()));
-        let out =
-            actor_outside(&ch, &memo, clock.get()).with_live_only(outcome.unavailable.clone());
-        apply(
-            &record,
-            &local,
-            &out,
-            &id,
-            &games,
-            Some(("pot", 4)),
-            Some(TIP),
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(*out.live_checked.borrow(), outcome.unavailable);
+        port_apply(&port, "pot", Some(("pot", 4)), &games)
+            .await
+            .unwrap();
+        assert!(live_only_of(&port).is_empty());
+        assert!(port.meta_get(META_RECHECK_LIVE).is_none());
         crate::owed_judge::judge_subjects(&d1, &id, &games, "d1")
             .await
             .unwrap();
@@ -19234,12 +19341,162 @@ mod d2_actor_g {
         assert_eq!(rows_of(&local, &id), rows_of(&record, &id));
     }
 
+    /// (gf2_low_a) D2-ACTOR-G-FOLD-2, THE DELTA LENS'S LOW-A: A FAULTED RECHECK IS BOUNDED. CHAINTRACKS faults (every
+    /// live view `cannotCheck` `Headers(..)`): the fresh D1 judgement reads the word `cannotCheck` and withholds. The
+    /// actor's apply judged it on its recorded header and presses; its first two faulted rechecks hold it again under
+    /// the backoff (1 s, 2 s) with the press standing; the THIRD ([`RECHECK_FAULTS_CONSERVATIVE`]) re-applies the game
+    /// fresh through the port (the press withheld, the rows the D1 judge's) and puts the txid in `recheckLive`, so the
+    /// next apply asks it live and withholds too; the first read that checks takes it out and re-applies the game: the
+    /// word restored, the press back on both sides. RED against `recheck_pass` without the conservative re-apply (the
+    /// actor pressed after three faulted reads); the port's API does not exist on 7c44a253.
+    #[tokio::test]
+    async fn gf2_low_a_three_faulted_rechecks_withhold_as_the_d1_judge_does() {
+        let clock = Cell::new(NOW_MS);
+        let (record, id, games, ch) = refund_on_a_mined_word(&clock).await;
+        let d1 = D1Live {
+            db: &record,
+            chain: &ch,
+        };
+        let local = mirror();
+        let memo = ViewMemo::default();
+        let port = TestRecheck::new(&record, &local, &ch, &memo, &id, &clock);
+        let pot = hex::encode(crate::record_post::tests::POT_TXID);
+        port_apply(&port, "bootstrap", Some(("bootstrap", 1)), &games)
+            .await
+            .unwrap();
+        recheck_pass(&port, &memo).await;
+        assert_eq!(presses(&rows_of(&local, &id)), 1, "the premise");
+        // CHAINTRACKS faults; the memo's checked view has expired
+        ch.fault.set(true);
+        clock.set(clock.get() + WORD_VIEW_MEMO_MS + 1);
+        crate::owed_judge::judge_subjects(&d1, &id, &games, "d1")
+            .await
+            .unwrap();
+        let d1_rows = rows_of(&record, &id);
+        assert_eq!(presses(&d1_rows), 0, "the D1 judge withholds: {d1_rows:#?}");
+        port_apply(&port, "pot", Some(("pot", 2)), &games)
+            .await
+            .unwrap();
+        assert_eq!(
+            presses(&rows_of(&local, &id)),
+            1,
+            "judged on its recorded header"
+        );
+        for (k, delay) in [(1u64, 1_000u64), (2, 2_000)] {
+            let pass = recheck_pass(&port, &memo).await;
+            assert_eq!(pass.faults, k);
+            assert!(!pass.conservative && pass.reapplied.is_empty(), "{pass:?}");
+            assert_eq!(port.alarms.borrow().last(), Some(&delay));
+            assert_eq!(presses(&rows_of(&local, &id)), 1, "fault {k}: held again");
+        }
+        let pass = recheck_pass(&port, &memo).await;
+        assert_eq!(pass.faults, RECHECK_FAULTS_CONSERVATIVE);
+        assert!(pass.conservative, "{pass:?}");
+        assert_eq!(
+            port.alarms.borrow().last(),
+            Some(&4_000),
+            "the backoff goes on"
+        );
+        assert_eq!(
+            rows_of(&local, &id),
+            d1_rows,
+            "the third faulted read: the conservative judgement, the D1 judge's rows"
+        );
+        assert_eq!(presses(&rows_of(&local, &id)), 0);
+        assert_eq!(live_only_of(&port), [pot.clone()].into_iter().collect());
+        // a later apply asks the word live and withholds; a fourth faulted read re-applies nothing more
+        port_apply(&port, "pot", Some(("pot", 3)), &games)
+            .await
+            .unwrap();
+        assert_eq!(rows_of(&local, &id), d1_rows);
+        let pass = recheck_pass(&port, &memo).await;
+        assert!(pass.conservative && pass.reapplied.is_empty(), "{pass:?}");
+        // the fault clears: the held read checks, the txid leaves `recheckLive`, the game re-applied: the word restored
+        ch.fault.set(false);
+        let pass = recheck_pass(&port, &memo).await;
+        assert_eq!(pass.faults, 0);
+        assert!(!pass.reapplied.is_empty(), "{pass:?}");
+        assert!(port.meta_get(META_RECHECK).is_none());
+        assert!(live_only_of(&port).is_empty());
+        crate::owed_judge::judge_subjects(&d1, &id, &games, "d1")
+            .await
+            .unwrap();
+        assert_eq!(presses(&rows_of(&local, &id)), 1);
+        assert_eq!(rows_of(&local, &id), rows_of(&record, &id));
+        assert!(port.counted(COUNTERS[35]) >= 4);
+    }
+
+    /// (gf2_low_b) D2-ACTOR-G-FOLD-2, THE DELTA LENS'S LOW-B: `recheckLive`'s overflow is counted and its dead entries
+    /// leave. (i) `recheckLive` full ([`RECHECK_HELD_MAX`] txids): the recheck that finds the pot's header unserved
+    /// cannot add it, and counts it `owed_actor_recheck_live_overflow_total` (it was dropped silently). (ii) the pot's
+    /// txid in `recheckLive` and its word demoted by the tracker (no longer `mined`): the next apply that reads the
+    /// demotion takes it out ([`MemoOutside::live_demoted`], [`after_apply_recheck`]). RED against the overflow left
+    /// uncounted and against the demoted entries kept.
+    #[tokio::test]
+    async fn gf2_low_b_recheck_live_overflow_is_counted_and_a_demoted_word_leaves() {
+        let clock = Cell::new(NOW_MS);
+        let (record, id, games, ch) = refund_on_a_mined_word(&clock).await;
+        let local = mirror();
+        let memo = ViewMemo::default();
+        let port = TestRecheck::new(&record, &local, &ch, &memo, &id, &clock);
+        let pot = hex::encode(crate::record_post::tests::POT_TXID);
+        port_apply(&port, "bootstrap", Some(("bootstrap", 1)), &games)
+            .await
+            .unwrap();
+        recheck_pass(&port, &memo).await;
+        // (i) recheckLive full, the header unserved
+        let full: BTreeSet<String> = (0..RECHECK_HELD_MAX).map(|k| h("e1", k)).collect();
+        port.meta_put(META_RECHECK_LIVE, &json!(full).to_string());
+        ch.headers.borrow_mut().remove(&POT_H);
+        clock.set(clock.get() + WORD_VIEW_MEMO_MS + 1);
+        port_apply(&port, "pot", Some(("pot", 2)), &games)
+            .await
+            .unwrap();
+        let pass = recheck_pass(&port, &memo).await;
+        assert_eq!(
+            pass.outcome.unavailable,
+            [pot.clone()].into_iter().collect()
+        );
+        assert_eq!(live_only_of(&port), full, "no room");
+        assert_eq!(COUNTERS[37], "owed_actor_recheck_live_overflow_total");
+        assert_eq!(port.counted(COUNTERS[37]), 1, "the overflow counted");
+        assert!(
+            port.lines
+                .borrow()
+                .iter()
+                .any(|l| l.contains("recheckLive's room")),
+            "{:?}",
+            port.lines.borrow()
+        );
+        // (ii) the pot's txid in recheckLive; the tracker demotes the word
+        port.meta_put(
+            META_RECHECK_LIVE,
+            &json!([pot.clone(), h("e1", 0)]).to_string(),
+        );
+        // the tracker's demotion of a mined word (the reorg's `stale`, the one word the upsert lets replace `mined`)
+        assert_eq!(
+            record
+                .conn
+                .execute("UPDATE tx_words SET word='stale' WHERE txid=?1", [&pot])
+                .unwrap(),
+            1
+        );
+        port_apply(&port, "word", Some(("word", 3)), &games)
+            .await
+            .unwrap();
+        assert_eq!(
+            live_only_of(&port),
+            [h("e1", 0)].into_iter().collect(),
+            "a demoted word leaves recheckLive at the apply that reads the demotion"
+        );
+    }
+
     /// (gf1_m1) D2-ACTOR-G-FOLD-1, THE LENS'S MEDIUM-1: A RECHECK THAT FAULTS IS HELD AGAIN, NEVER DROPPED. The held
     /// recheck is settled AFTER the read ([`recheck_settle`]): a read that answered an error holds every row again
     /// under a doubling backoff (1 s, 2 s, .. at most 300 s); a row the read could not judge for a cause other than an
     /// unserved header (`Headers(..)`: a transport or snapshot fault) is held again, the rest taken out; a row an apply
     /// merged during the read stays; a clean read deletes the row (`None`). The merge counts the rows past its room
-    /// ([`recheck_merge`], `owed_actor_recheck_dropped_total`); the object settles after its read (source). New API: on
+    /// ([`recheck_merge`], `owed_actor_recheck_dropped_total`); the object's settle is [`recheck_pass`]'s, executed by gf1_high1 and gf2_low_a (D2-ACTOR-G-FOLD-2). New API: on
     /// b2ffbfb6 the object deleted the held rows before the read and the merge stopped at 256 with no count.
     #[test]
     fn gf1_m1_a_faulted_recheck_is_held_again() {
@@ -19329,21 +19586,7 @@ mod d2_actor_g {
             dropped, 1,
             "a held row is replaced, a new one past the room counted"
         );
-        // the object settles after its read
-        let src = include_str!("object.rs");
-        let body = &src[src.find("async fn run_recheck").unwrap()..];
-        let read = body.find("word_views(&rows)").unwrap();
-        let before = &body[..read];
-        let del = before
-            .find("DELETE FROM meta WHERE name='recheck'")
-            .unwrap();
-        assert!(
-            before[..del].contains("if rows.is_empty()"),
-            "the held rows are deleted before the read only when there are none"
-        );
-        assert!(body[read..].contains("recheck_settle("));
-        assert!(body[read..].contains("COUNTERS[35]"));
-        assert!(src.contains("COUNTERS[36].into(), dropped"));
+        // the object's own wiring is executed by gf1_high1 and gf2_low_a through the shipped `recheck_pass`
         assert_eq!(COUNTERS[35], "owed_actor_recheck_faults_total");
         assert_eq!(COUNTERS[36], "owed_actor_recheck_dropped_total");
     }
@@ -19513,12 +19756,14 @@ mod d2_actor_g {
         assert_eq!(narrowed(&local), held);
     }
 
-    /// (gf1_n2) THE LENS'S N2: A ONE-IDENTITY BURST OF 32 EVENTS IS VISIBLE UNDER THE 1,000 MS BAR. 32 carried SEENs of
-    /// 32 games of one warm seat (each pot mined), all written at once, applied one after another through the actor's
-    /// outside as the turn serializes them: each event's first visibility (its write to its apply's end, on the model's
-    /// clock, a record call 400 ms and a CHAINTRACKS ask 300 ms) is under 1,000 ms, the burst's last included.
+    /// (gf1_n2) THE LENS'S N2, RESTATED (D2-ACTOR-G-FOLD-2, the delta lens's N-B): NO I/O IN A WARM CARRIED APPLY OF A
+    /// 32-EVENT BURST. 32 carried SEENs of 32 games of one warm seat (each pot mined), all written at once, applied one
+    /// after another through the actor's outside as the turn serializes them: not one record call and not one
+    /// CHAINTRACKS ask. The model's clock moves only on those calls (a record call 400 ms, an ask 300 ms), so it does
+    /// not move at all: this pins the absence of I/O, never a wall time. The loop's bar is read on beta by
+    /// `spec-owed-actor-bars` (its ceilings 3,000 ms apply and 5,000 ms visibility, the owner's ruling of 2026-11-01).
     #[tokio::test]
-    async fn gf1_n2_a_one_identity_burst_of_32_is_visible_under_the_bar() {
+    async fn gf1_n2_no_io_in_a_warm_carried_apply_of_a_32_event_burst() {
         let (record, local, games) = mined_seat(32).await;
         let clock = &local.now;
         let ch = chain(32, clock);
@@ -19551,14 +19796,10 @@ mod d2_actor_g {
             assert!(r.carried, "{r:?}");
             vis.push(clock.get() - written);
         }
-        let worst = *vis.iter().max().unwrap();
-        let p = p95(&mut vis);
-        eprintln!(
-            "gf1_n2: the 32-event burst's first visibility p95 {p} ms, max {worst} ms (virtual)"
-        );
+        assert_eq!(ch.asks.get(), 0, "no CHAINTRACKS ask");
         assert!(
-            worst < 1_000,
-            "the burst's last event visible in {worst} ms"
+            vis.iter().all(|v| *v == 0),
+            "no record call and no ask: the model's clock never moved: {vis:?}"
         );
     }
 }
