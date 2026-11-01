@@ -17140,9 +17140,9 @@ mod fix1010 {
     }
 
     /// (fix1010_b) THE TTL SWEEP OF AN EVICTED HOP'S EVIDENCE: the hop's index row gone (its own `pot` event applied),
-    /// the evidence aged past the window; the sweep deletes it and marks the hop's marker (a memo no judge reads marks
-    /// nothing), its event reaches the actor, and the actor is the fresh D1 judgement. RED on 006e6f24: the sweep marks
-    /// nothing.
+    /// the evidence aged past the window; the sweep deletes it and marks the hop's marker (and, since bsv-low #1042, the
+    /// aged memo beside it, which a judge reads), each event reaches the actor, and the actor is the fresh D1 judgement.
+    /// RED on 006e6f24: the sweep marks nothing.
     #[tokio::test]
     async fn fix1010_b_the_ttl_sweep_of_evidence_reaches_the_actor() {
         let d1 = d1_judge(&fold9_fixture()).await;
@@ -17161,10 +17161,14 @@ mod fix1010 {
             Some(NOW_MS as i64),
             true,
         );
+        // bsv-low #1042: the aged memo is read by the judge too (`stale_memo_word`) and the evidence does not repeat
+        // it, so it is marked and noted beside the evidence
+        let mut keys = keys;
+        keys.sort();
         assert_eq!(
             keys,
-            vec![format!("{FOLD9_HOP}:0")],
-            "the evidence noted, the aged memo not"
+            vec![format!("{FOLD9_HOP}.0"), format!("{FOLD9_HOP}:0")],
+            "the evidence and the aged memo, each noted"
         );
         let pairs: Vec<(&str, String)> = keys.into_iter().map(|k| ("probe", k)).collect();
         reaches_the_actor(&d1, &local, &pairs).await;
@@ -18447,5 +18451,263 @@ mod fix1041 {
                 json!("unspent-stale")
             ]
         );
+    }
+}
+
+// ---- FIX-1042 (bsv-low #1042): the D1 judge's answer does not change when an input ages out ----
+
+mod fix1042 {
+    use super::fix1010::{fresh_d1, probe_batch, published};
+    use super::*;
+    use bsv_overlay_cloudflare::hop_probe_memos as memos;
+
+    fn rows_of(db: &SqliteSql, identity: &str) -> Vec<Value> {
+        db.conn.prepare("SELECT json_object('outpoint',outpoint,'family',family,'gameId',gameId,'sats',sats,'opponentIdentity',opponentIdentity,'atHeight',atHeight,'reason',reason,'facts',facts,'claimable',claimable) FROM owed_rows WHERE identity=?1 ORDER BY outpoint").unwrap().query_map([identity], |r| r.get::<_, String>(0)).unwrap().map(|s| serde_json::from_str::<Value>(&s.unwrap()).unwrap()).collect()
+    }
+
+    /// A reorg pass's clear as `hop_probe_memos::clear_on_reorg` runs it: the tombstone stamped at `at_ms` with the
+    /// pass's REACH, then the marks and the framed writes at that floor. Answers the keys it moved (noted).
+    fn clear_at(db: &SqliteSql, at_ms: i64, reach: u64) -> Vec<String> {
+        db.conn
+            .execute(
+                memos::HOP_PROBE_MEMO_REORG_MARK_SQL,
+                rusqlite::params![at_ms as f64, reach as f64],
+            )
+            .unwrap();
+        probe_batch(
+            db,
+            memos::HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
+            &memos::HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,
+            Some(reach as i64),
+            false,
+        )
+    }
+
+    /// The tracker's eight-day stranger sweep (`tracker_host::stored::SWEEP_FRAMED`), past every word's age.
+    fn sweep_words(db: &SqliteSql) -> Vec<String> {
+        db.conn
+            .prepare(crate::tracker_host::stored::SWEEP_FRAMED)
+            .unwrap()
+            .query_map([i64::MAX], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// The overlay's TTL sweep as its batch runs it (the marks, then the framed delete), at the record's clock.
+    fn expire_memos(db: &SqliteSql) -> Vec<String> {
+        probe_batch(
+            db,
+            memos::HOP_PROBE_MEMO_EXPIRE_MARK_SQL,
+            &[memos::HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL],
+            Some(db.now.get() as i64 - memos::HOP_PROBE_MEMO_TTL_MS),
+            true,
+        )
+    }
+
+    /// beta's shape 1 (the fold9 hop): the belt's find of a stranger's spend CONFIRMED in the evidence row, taken three
+    /// hours ago at `TIP - 18`; beside it the find's memo (`<hop>.0`, the same word) and the spender's word row.
+    fn shape1() -> Fixture {
+        let mut f = fold9_fixture();
+        let found = NOW_MS as i64 - 3 * 3_600_000;
+        let (_, s) = fold9_spend(FOLD9_HOP);
+        f.seed.push(format!("INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES ('{FOLD9_HOP}.0',{found},1,'{s}',1,{})", TIP - 18));
+        f.seed.push(format!(
+            "INSERT INTO tx_words(txid,word,tier,updated_at) VALUES ('{s}','unknown','hint',1)"
+        ));
+        f
+    }
+
+    fn confirmation(db: &SqliteSql, hop: &str) -> (String, Value, Value) {
+        let r = fold9_row(db, hop).unwrap();
+        (
+            r.0,
+            r.2["spentConfirmed"].clone(),
+            r.2["spenderPresence"].clone(),
+        )
+    }
+
+    /// (fix1042_a) THE FINDING (beta 2026-11-01, the fleet compare's 36 hop outpoints): a hop the index holds unspent,
+    /// the belt's find of a stranger's spend CONFIRMED in the evidence, judged `spentConfirmed: true` with no
+    /// `spenderPresence`. Then three deletions and stamps no event of the hop's carries: a reorg pass's clear an hour
+    /// after the find whose reach (`TIP - 3`) is above the find's height (the clear leaves the evidence standing), the
+    /// spender's word row swept, the find's memo expired. The fresh D1 judgement is unchanged. RED with the judge's
+    /// rule reverted to 9dff935b's (the tombstone refused every confirmed word taken before it, no lower bound):
+    /// `left: ("unbound", Null, {"source": "spent-any", "tier": "pending", "word": "spent", ..})` (beta's row read
+    /// `spent-outside`: its seat's home is known).
+    #[tokio::test]
+    async fn fix1042_a_a_belt_confirmed_spend_survives_a_clear_out_of_reach_a_word_sweep_and_a_memo_expiry(
+    ) {
+        let d1 = d1_judge(&shape1()).await;
+        let hop = format!("{FOLD9_HOP}:0");
+        let before = confirmation(&d1, &hop);
+        assert_eq!(
+            before,
+            ("unbound".into(), json!(true), Value::Null),
+            "the premise: judged confirmed by the belt's find"
+        );
+        let found = NOW_MS as i64 - 3 * 3_600_000;
+        assert!(
+            clear_at(&d1, found + 3_600_000, TIP - 3).is_empty(),
+            "the clear's reach is above the find: it moves nothing"
+        );
+        assert_eq!(sweep_words(&d1).len(), 1, "the spender's word row swept");
+        let expired = expire_memos(&d1);
+        assert_eq!(expired, vec![format!("{FOLD9_HOP}.0")], "the memo expired");
+        assert!(
+            published(&d1, "probe", &expired[0]).await.is_none(),
+            "the evidence repeats the memo: no judgement moves, nothing marked"
+        );
+        fresh_d1(&d1).await;
+        assert_eq!(
+            confirmation(&d1, &hop),
+            before,
+            "the fresh D1 judgement is unchanged by the three"
+        );
+        // a clear whose reach covers the find still takes its confirmation (bsv-low #1027), and a word taken after a
+        // clear is still held to the grace: both rules stand
+        let db = d1_judge(&shape1()).await;
+        let mut moved = clear_at(&db, found + 3_600_000, TIP - 20);
+        moved.sort();
+        assert_eq!(moved, vec![format!("{FOLD9_HOP}.0"), hop.clone()]);
+        fresh_d1(&db).await;
+        assert_eq!(
+            confirmation(&db, &hop).1,
+            Value::Null,
+            "inside the reach: demoted"
+        );
+        let db = d1_judge(&shape1()).await;
+        assert!(clear_at(&db, found - 60_000, TIP - 3).is_empty());
+        fresh_d1(&db).await;
+        assert_eq!(
+            confirmation(&db, &hop).1,
+            Value::Null,
+            "a word taken after the clear, inside its grace: refused its confirmation"
+        );
+    }
+
+    /// (fix1042_c) THE COMPARE AT ZERO ACROSS THE DELETIONS: the actor judged before them (its rows stored, no event
+    /// applied since) against the D1 judge FRESH after the clear out of reach, the word sweep and the memo expiry: equal
+    /// rows, equal digests, no diff and no tip lag. RED with the judge's rule reverted to 9dff935b's: the 36-row diff
+    /// shape, `facts.spentConfirmed` actor true against D1 null and `facts.spenderPresence` actor null against D1
+    /// pending (`fresh_compare`'s `diff_rows` over the same rows).
+    #[tokio::test]
+    async fn fix1042_c_the_compare_reads_zero_across_both_deletions_for_a_row_judged_before_them() {
+        let d1 = d1_judge(&shape1()).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        let found = NOW_MS as i64 - 3 * 3_600_000;
+        clear_at(&d1, found + 3_600_000, TIP - 3);
+        sweep_words(&d1);
+        expire_memos(&d1);
+        fresh_d1(&d1).await;
+        let (a, b) = (rows_of(&d1, "owner"), rows_of(&local, "owner"));
+        assert!(!a.is_empty());
+        let diff = diff_rows(&a, &b);
+        assert!(diff.is_empty(), "the compare at zero: {diff:?}");
+        assert_eq!(rows_digest(&a), rows_digest(&b), "the digests equal");
+        assert!(
+            tip_derived_rows(&a, &b).is_empty(),
+            "no tip lag excuses anything"
+        );
+    }
+
+    /// (fix1042_b) beta's 30 payout rows (two seats, 15 games each, 20,169 sats): a FINISHED game, the seat's own
+    /// courier-only sweep of its hop to its committed home (FIX-988's hand over the captured pair 13), the belt's find
+    /// of it CONFIRMED in the evidence, and the home's spend PROVEN (the home latch, `homeproof:<sweep>.0`): no row on
+    /// either side. Then a reorg clear out of the find's reach and the sweep's word swept: the fresh D1 judgement still
+    /// holds no row, and the actor's stored rows equal it. RED with the judge's rule reverted to 9dff935b's: the fresh
+    /// D1 judgement brings the game back as `payout` awaiting (`claimable` 0, 20,000 sats here), the actor no row.
+    #[tokio::test]
+    async fn fix1042_b_a_finished_game_stays_absent_across_a_clear_out_of_reach_and_its_swept_word()
+    {
+        use crate::owed_walk_frozen::pins::{
+            backfill_to_the_stamp, home_marker_seed, FOLD8_TIP, HOME_MARKER_HOP, HOME_MARKER_SEAT,
+        };
+        let seat = HOME_MARKER_SEAT;
+        let (mut seed, sweep) = home_marker_seed();
+        let hop = format!("{HOME_MARKER_HOP}:0");
+        let found = NOW_MS as i64 - 3 * 3_600_000;
+        seed.push(format!(
+            "UPDATE hop_chain_probes SET outpoint='{hop}',tipHeight={},probedAtMs={found} WHERE outpoint='{HOME_MARKER_HOP}.0'",
+            FOLD8_TIP - 18
+        ));
+        seed.push(format!(
+            "INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed) VALUES ('{}{sweep}.0',{},1,'{}',0)",
+            crate::owed::HOME_SPEND_LATCH_PREFIX,
+            found + 600_000,
+            "ab".repeat(32)
+        ));
+        seed.push(format!(
+            "INSERT INTO tx_words(txid,word,tier,updated_at) VALUES ('{sweep}','mined','chain',1)"
+        ));
+        let d1 = seeded(&Fixture {
+            name: "fix1042 a finished courier-swept game",
+            seed,
+            identities: vec![seat.into()],
+        });
+        d1.tip.set(Some(FOLD8_TIP));
+        d1.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        backfill_to_the_stamp(&d1).await;
+        async fn judge_d1(d1: &SqliteSql, seat: &str) {
+            for chunk in games_of(d1, seat).chunks(16) {
+                crate::owed_judge::judge_subjects(d1, seat, chunk, "d1")
+                    .await
+                    .unwrap();
+            }
+        }
+        judge_d1(&d1, seat).await;
+        let local = mirror();
+        local.now.set(d1.now.get());
+        for chunk in games_of(&d1, seat).chunks(GAMES_PER_APPLY) {
+            apply(
+                &d1,
+                &local,
+                &Fakes,
+                seat,
+                chunk,
+                Some(("bootstrap", 1)),
+                Some(FOLD8_TIP),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let hop_row = |db: &SqliteSql| -> Option<(String, Option<i64>, Option<i64>)> {
+            db.conn
+                .query_row(
+                    "SELECT family,claimable,sats FROM owed_rows WHERE identity=?1 AND outpoint=?2",
+                    [seat, hop.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok()
+        };
+        assert_eq!(
+            (hop_row(&d1), hop_row(&local)),
+            (None, None),
+            "the premise: a finished game, no row on either side"
+        );
+        let moved = clear_at(&d1, found + 3_600_000, FOLD8_TIP - 3);
+        assert!(
+            !moved.contains(&hop),
+            "the clear's reach is above the find: it leaves the evidence: {moved:?}"
+        );
+        let kept: Option<i64> = d1
+            .conn
+            .query_row(
+                "SELECT spentConfirmed FROM hop_chain_probes WHERE outpoint=?1",
+                [hop.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, Some(1), "the evidence stands confirmed");
+        assert_eq!(
+            sweep_words(&d1),
+            vec![sweep.clone()],
+            "the sweep's word swept"
+        );
+        judge_d1(&d1, seat).await;
+        assert_eq!(hop_row(&d1), None, "the fresh D1 judgement: still no row");
+        let (a, b) = (rows_of(&d1, seat), rows_of(&local, seat));
+        assert!(diff_rows(&a, &b).is_empty(), "the compare at zero");
     }
 }

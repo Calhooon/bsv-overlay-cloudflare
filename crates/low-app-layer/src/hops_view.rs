@@ -959,6 +959,49 @@ pub fn confirmation_refused(m: &ProbeMemo, reorg_clear_at_ms: Option<i64>) -> bo
     m.spent && confirmed_in_reorg_grace(m.spent_confirmed, m.probed_at_ms, reorg_clear_at_ms)
 }
 
+/// PURE (bsv-low #1042): the REACH of the overlay's last reorg clear, the tombstone's `tipHeight` (the overlay's
+/// `hop_probe_memos::HOP_PROBE_MEMO_REORG_MARK_SQL` stamps it with the floor the clear ran under), or `None` (no
+/// tombstone read, or one stamped before the reach was: every word taken before it is held to the grace, the rule
+/// before #1042).
+pub fn reorg_clear_reach(memos: &[ProbeMemo]) -> Option<u64> {
+    memos
+        .iter()
+        .filter(|m| m.outpoint == PROBE_MEMO_REORG_MARK)
+        .max_by_key(|m| m.probed_at_ms)
+        .and_then(|m| m.tip_height)
+}
+
+/// PURE (bsv-low #1042): THE CLEAR THIS WORD IS JUDGED UNDER. A word TAKEN BEFORE the clear whose height the clear's
+/// reach did not cover was in the table when the clear ran and was left standing by it (the overlay's `clear_pred!`:
+/// a row is moved when its `tipHeight` is unknown or `tipHeight + REORG_TIP_LAG_BLOCKS >= reach`, the lag pinned equal
+/// to [`crate::owed::LATCH_RECHECK_DEPTH`]), so no reorg the clear knew of unmade it: it is judged as if no clear had
+/// run (`None`). Every other word is judged under the clear as before: one taken after it (a courier that had not seen
+/// the reorg yet), one inside the reach (the clear moved it, or its batch faulted, or a find written after it), one
+/// with no height, and every word under a tombstone with no reach.
+///
+/// Until #1042 the grace had no lower bound, so after ANY clear every confirmed word taken before it lost its
+/// confirmation for good (beta, 2026-11-01: the 18:16Z tombstone refused 66 rows of the belt's evidence taken that
+/// morning, confirmed below the clear's reach and kept by the clear itself, and the D1 judge served them "not mined
+/// yet" where the actors, judged before the stamp moved, kept the confirmation: the fleet compare's diffs). That rule
+/// was right while a clear deleted every confirmed memo; since bsv-low #1027 round 2 a clear moves only what its reorg
+/// can have unmade, so a confirmed word older than the clear is the clear's own verdict.
+pub fn clear_unless_survived(
+    m: &ProbeMemo,
+    reorg_clear_at_ms: Option<i64>,
+    reach: Option<u64>,
+) -> Option<i64> {
+    let survived = reorg_clear_at_ms.is_some_and(|at| m.probed_at_ms < at)
+        && reach.is_some_and(|r| {
+            m.tip_height
+                .is_some_and(|t| t.saturating_add(crate::owed::LATCH_RECHECK_DEPTH) < r)
+        });
+    if survived {
+        None
+    } else {
+        reorg_clear_at_ms
+    }
+}
+
 /// PURE (bsv-low #484, delta fold 2, D2-M1): THE GRACE NARROWS THE CLAIMABLE WORD, NEVER THE CONTRADICTION.
 /// `refused_words` is the walk's past-budget hops whose memo [`stale_memo_word`] served without its confirmation
 /// (hop outpoint `txid:vout` to the spender the memo names, lowercase). A refused word that names a DIFFERENT
@@ -2735,7 +2778,7 @@ mod tests {
         assert_eq!(reorg_clear_at(&read()), None, "no reorg yet: no tombstone");
         assert!(answered_at(t0), "the long window, as before");
         // THE CLEAR at t0 (the overlay's reorg pass): the tombstone first, then the delete
-        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![t0])
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![t0, 0])
             .unwrap();
         assert_eq!(
             conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, [0]).unwrap(),
@@ -2781,7 +2824,7 @@ mod tests {
         // a later reorg moves the grace; the tombstone outlives the TTL sweep
         conn.execute(
             HOP_PROBE_MEMO_REORG_MARK_SQL,
-            rusqlite::params![t0 + 200 * min],
+            rusqlite::params![t0 + 200 * min, 0],
         )
         .unwrap();
         conn.execute(
@@ -3126,7 +3169,7 @@ mod tests {
             )
             .unwrap();
         }
-        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![t0])
+        conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![t0, 0])
             .unwrap();
         // THE ROUTE'S READ (`routes::read_probe_memos`): the candidates and the tombstone, statement by statement
         let read = |targets: &[(String, u32)]| -> Vec<ProbeMemo> {

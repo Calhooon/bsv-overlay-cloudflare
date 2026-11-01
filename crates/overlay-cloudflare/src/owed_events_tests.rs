@@ -275,7 +275,7 @@ mod pins {
     /// The overlay's reorg clear and TTL sweep, each run as its batch runs it (the marks, then the framed delete) on the
     /// real record: the clear marks the hop's marker for its confirmed evidence and memo, the pot's party for the
     /// pot's memo and the spender's owed rows for a proof latch, each a downgrade; the sweep marks the evidence of an
-    /// evicted hop alone (an aged memo no judge reads marks nothing); the keys the delete answers are the pairs the
+    /// evicted hop and (bsv-low #1042) every aged hop memo the evidence does not repeat; the keys the delete answers are the pairs the
     /// writer notes, and each publishes one event. RED with the marks dropped from the batch (the shipped clear alone
     /// marks nothing: `left: 0`).
     #[test]
@@ -406,13 +406,22 @@ mod pins {
             Some(10),
         );
         assert_eq!(deleted.len(), 2, "{deleted:?}");
-        assert_eq!(
-            marks(&db),
-            vec![(ID.to_string(), "probe".to_string(), evidence.clone(), 1)],
-            "only the evidence a judge still reads is marked"
-        );
-        let noted: Vec<&String> = deleted.iter().filter(|k| noted_key(true, k)).collect();
-        assert_eq!(noted, vec![&evidence]);
+        // bsv-low #1042: the aged memo the evidence does not repeat is read by the judge too (`stale_memo_word`), so its
+        // delete is marked, PLAIN; the evidence keeps its downgrade
+        let mut want = vec![
+            (ID.to_string(), "probe".to_string(), evidence.clone(), 1),
+            (ID.to_string(), "probe".to_string(), format!("{HOP}.1"), 0),
+        ];
+        want.sort();
+        let mut got = marks(&db);
+        got.sort();
+        assert_eq!(got, want, "every probe row a judge still reads is marked");
+        let mut noted: Vec<&String> = deleted.iter().filter(|k| noted_key(true, k)).collect();
+        noted.sort();
+        let memo1 = format!("{HOP}.1");
+        let mut want_noted = vec![&evidence, &memo1];
+        want_noted.sort();
+        assert_eq!(noted, want_noted);
         // evidence whose index row stands is never swept, so never marked
         let db = Sqlite::migrated();
         seed(&db);
@@ -431,6 +440,136 @@ mod pins {
         )
         .is_empty());
         assert!(marks(&db).is_empty());
+    }
+
+    /// bsv-low #1042: THE TTL SWEEP MARKS EVERY HOP MEMO WHOSE DELETE MOVES A JUDGEMENT, PLAIN, AND NONE THE BELT'S
+    /// EVIDENCE REPEATS. The judge reads a hop memo whatever its age (`low-app-layer` `hops_view::stale_memo_word`), so an
+    /// aged unspent memo leaving turns `unspent-stale` (or the chain-wait of a word taken below the tip) into the index's
+    /// word with no event: FIX-1010's sweep marked evidence alone, and the actor's row went stale behind the D1 judge's.
+    /// A memo the same find wrote beside its evidence (spent, spender, confirmation, height, stamp) is read again from
+    /// the evidence, so its delete is not marked. RED on 461d7946's sweep marks: the unspent memo unmarked (`left: []`).
+    #[test]
+    fn fix1042_the_sweep_marks_an_aged_memo_a_judge_reads_and_not_one_the_evidence_repeats() {
+        use crate::hop_probe_memos::*;
+        let sweep = |db: &Sqlite| -> Vec<String> {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            tx.execute(HOP_PROBE_MEMO_EXPIRE_MARK_SQL, [10]).unwrap();
+            let mut q = tx.prepare(HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL).unwrap();
+            let keys: Vec<String> = q
+                .query_map([10], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            drop(q);
+            tx.commit().unwrap();
+            keys
+        };
+        let row = |db: &Sqlite, key: &str, spent: i64, confirmed: Option<i64>, tip: Option<i64>| {
+            db.conn
+                .execute(
+                    "INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES(?1,1,?2,?3,?4,?5)",
+                    rusqlite::params![key, spent, (spent == 1).then_some(SPENDER), confirmed, tip],
+                )
+                .unwrap();
+        };
+        let marks = |db: &Sqlite| -> Vec<(String, i64)> {
+            let mut q = db
+                .conn
+                .prepare("SELECT sourceKey,downgrade FROM owed_dirty WHERE identity=?1 ORDER BY sourceKey")
+                .unwrap();
+            q.query_map([ID], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let memo = format!("{HOP}.1");
+        // the hop's index row stands, so its evidence is never swept: only the memo leaves
+        let standing = |db: &Sqlite| {
+            db.conn
+                .execute_batch(&format!(
+                    "INSERT INTO pot_records(txid,outputIndex,spent,createdAt) VALUES('{HOP}',1,0,1); DELETE FROM owed_dirty;"
+                ))
+                .unwrap();
+        };
+        // an aged UNSPENT memo, no evidence: the judge read it; its delete is marked, plain
+        let db = Sqlite::migrated();
+        seed(&db);
+        standing(&db);
+        row(&db, &memo, 0, None, Some(900));
+        assert_eq!(sweep(&db), vec![memo.clone()]);
+        assert_eq!(
+            marks(&db),
+            vec![(memo.clone(), 0)],
+            "a plain mark: nothing downgrades"
+        );
+        assert!(noted_key(true, &memo), "the writer notes the memo's pair");
+        // an aged CONFIRMED memo the evidence repeats word for word: the judge reads the evidence in its place
+        let db = Sqlite::migrated();
+        seed(&db);
+        standing(&db);
+        row(&db, &memo, 1, Some(1), Some(900));
+        row(&db, &format!("{HOP}:1"), 1, Some(1), Some(900));
+        assert_eq!(sweep(&db), vec![memo.clone()]);
+        assert!(
+            marks(&db).is_empty(),
+            "the evidence repeats it: no judgement moves"
+        );
+        // the same memo with a confirmation the evidence lost (a reorg demoted it): the memo's word moves, marked plain
+        let db = Sqlite::migrated();
+        seed(&db);
+        standing(&db);
+        row(&db, &memo, 1, Some(1), Some(900));
+        row(&db, &format!("{HOP}:1"), 1, None, Some(900));
+        assert_eq!(sweep(&db), vec![memo.clone()]);
+        assert_eq!(marks(&db), vec![(memo.clone(), 0)]);
+    }
+
+    /// bsv-low #1042: THE TOMBSTONE CARRIES THE CLEAR'S REACH, an INTEGER even when D1 binds it as a REAL, the newest
+    /// stamp's; an older stamp keeps neither its time nor its reach. The app layer reads it as `tipHeight`
+    /// (`hops_view::reorg_clear_reach`) and judges a word taken before the stamp and below the reach as one the clear
+    /// left standing. RED on 461d7946's tombstone statement: one bind, no reach (`tipHeight` NULL).
+    #[test]
+    fn fix1042_the_tombstone_carries_the_clears_reach_as_an_integer() {
+        use crate::hop_probe_memos::*;
+        let db = Sqlite::migrated();
+        let read = |db: &Sqlite| -> (i64, Option<i64>, String) {
+            db.conn
+                .query_row(
+                    "SELECT probedAtMs,tipHeight,typeof(tipHeight) FROM hop_chain_probes WHERE outpoint=?1",
+                    [HOP_PROBE_MEMO_REORG_MARK],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        db.conn
+            .execute(
+                HOP_PROBE_MEMO_REORG_MARK_SQL,
+                rusqlite::params![5_000.0_f64, 973_600.0_f64],
+            )
+            .unwrap();
+        assert_eq!(read(&db), (5_000, Some(973_600), "integer".to_string()));
+        db.conn
+            .execute(
+                HOP_PROBE_MEMO_REORG_MARK_SQL,
+                rusqlite::params![4_000.0_f64, 100.0_f64],
+            )
+            .unwrap();
+        assert_eq!(
+            read(&db),
+            (5_000, Some(973_600), "integer".to_string()),
+            "an older stamp moves nothing"
+        );
+        db.conn
+            .execute(
+                HOP_PROBE_MEMO_REORG_MARK_SQL,
+                rusqlite::params![9_000.0_f64, 973_700.0_f64],
+            )
+            .unwrap();
+        assert_eq!(
+            read(&db),
+            (9_000, Some(973_700), "integer".to_string()),
+            "the newest clear's reach"
+        );
     }
 
     /// The text of the function whose signature starts with `sig` in `src`: from the signature to the first line that

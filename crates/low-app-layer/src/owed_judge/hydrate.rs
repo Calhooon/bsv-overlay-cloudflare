@@ -742,6 +742,8 @@ async fn hydrate_evidence(
         }
     }
     let clear = hops_view::reorg_clear_at(&memos);
+    // bsv-low #1042: a word the last clear left standing (taken before it, below its reach) is judged with no clear
+    let reach = hops_view::reorg_clear_reach(&memos);
     let fresh = hops_view::split_probe_targets_at_tip(
         &hop_pairs,
         &memos,
@@ -761,6 +763,7 @@ async fn hydrate_evidence(
         if let Some((t, v)) = m.outpoint.rsplit_once('.') {
             if let Ok(v) = v.parse::<u32>() {
                 if hop_pairs.contains(&(t.to_string(), v)) {
+                    let clear = hops_view::clear_unless_survived(m, clear, reach);
                     let mut word = hops_view::stale_memo_word(m, i.now_ms, clear, i.tip);
                     // The memo is the most recent chain evidence. Its freshness is told, never an outward probe.
                     let fresh = fresh_keys.contains(&owed::outpoint_key(t, v));
