@@ -1429,8 +1429,20 @@ mod tests {
         let bare = "cd".repeat(32);
         let readmitted = "ef".repeat(32);
         storage.serve_evictions();
-        storage.record_eviction_classed(&classed, 5, None, Some(crate::pot::storage::EVICTED_WORD), Some("missing-parent"));
-        storage.record_eviction_classed(&bare, 6, None, Some(crate::pot::storage::EVICTED_WORD), None);
+        storage.record_eviction_classed(
+            &classed,
+            5,
+            None,
+            Some(crate::pot::storage::EVICTED_WORD),
+            Some("missing-parent"),
+        );
+        storage.record_eviction_classed(
+            &bare,
+            6,
+            None,
+            Some(crate::pot::storage::EVICTED_WORD),
+            None,
+        );
         storage.record_eviction_classed(&readmitted, 7, Some(8), None, Some("double-spend"));
         let arr = spent_status(
             &svc,
@@ -1449,8 +1461,14 @@ mod tests {
             arr[2]["evicted"],
             serde_json::json!({"at": 7, "word": null, "readmittedAt": 8})
         );
-        assert_eq!(crate::pot::storage::refusal_class_word(Some("policy")), Some("policy"));
-        assert_eq!(crate::pot::storage::refusal_class_word(Some("Policy")), None);
+        assert_eq!(
+            crate::pot::storage::refusal_class_word(Some("policy")),
+            Some("policy")
+        );
+        assert_eq!(
+            crate::pot::storage::refusal_class_word(Some("Policy")),
+            None
+        );
         assert_eq!(crate::pot::storage::refusal_class_word(None), None);
     }
 
