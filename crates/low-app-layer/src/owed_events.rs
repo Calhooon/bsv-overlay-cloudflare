@@ -45,7 +45,7 @@
 //! [`SWEPT_WINDOW_SQL`]: NEW7-L1).
 use crate::owed_events_publish as publish;
 use crate::owed_judge::{self, JudgeDb};
-use crate::pot_hook::{Bind, SqlPort, Stmt};
+use crate::pot_hook::{Bind, SqlPort, Stmt, StmtOut};
 use overlay_discovery::owed_event::{self, OwedEvent};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -742,47 +742,12 @@ pub async fn plan_with(db: &impl SqlPort, ev: &OwedEvent, expand: bool) -> Resul
     let limit = ROUTE_READ_LIMIT as i64;
     let now = db.now_ms() as i64;
     // NEW2-M1 (the second delta lens): the unheld marks and the held count, one batch
-    let (marks_sql, held_sql, binds) = if ev.source == owed_event::ROUTE_IDENTITY {
-        (
-            ROUTE_IDENTITY_SQL,
-            ROUTE_IDENTITY_HELD_SQL,
-            vec![
-                Bind::Text(ev.source_key.clone()),
-                Bind::Int(limit),
-                Bind::Int(now),
-            ],
-        )
-    } else {
-        (
-            ROUTE_MARKS_SQL,
-            ROUTE_HELD_SQL,
-            vec![
-                Bind::Text(ev.source.clone()),
-                Bind::Text(ev.source_key.clone()),
-                Bind::Int(limit),
-                Bind::Int(now),
-            ],
-        )
-    };
     let mut read = db
-        .run_batch(vec![
-            Stmt {
-                sql: marks_sql.into(),
-                binds: binds.clone(),
-            },
-            Stmt {
-                sql: held_sql.into(),
-                binds,
-            },
-        ])
+        .run_batch(plan_read_stmts(ev, now, false))
         .await?
         .into_iter();
     let mut marks = read.next().map(|o| o.rows).unwrap_or_default();
-    let held_subjects = read
-        .next()
-        .and_then(|o| o.rows.first().and_then(|r| r["n"].as_i64()))
-        .unwrap_or(0)
-        .max(0) as usize;
+    let held_subjects = held_count(read.next());
     let mut more = marks.len() >= ROUTE_READ_LIMIT;
     // A wanted envelope (the read's own mark, no game) is expanded first, then routed by its identity.
     let envelopes: Vec<(String, i64)> = marks
@@ -810,11 +775,72 @@ pub async fn plan_with(db: &impl SqlPort, ev: &OwedEvent, expand: bool) -> Resul
         more |= expanded.len() >= ROUTE_READ_LIMIT;
         marks.extend(expanded);
     }
+    Ok(plan_of_marks(&marks, held_subjects, more))
+}
+
+/// FIX-959 (bsv-low #959, the warm read's (a)): an event's plan read, the marks then the held count (two statements);
+/// with `bounds`, a third: each game those marks name with the greatest generation of ALL its marks
+/// ([`GAME_BOUNDS_OF_PAIR_SQL`], [`GAME_BOUNDS_OF_IDENTITY_SQL`]: `owed_judge::MARKS_SQL`'s bound per game, read in the
+/// same snapshot as the marks, so before any call).
+fn plan_read_stmts(ev: &OwedEvent, now: i64, bounds: bool) -> Vec<Stmt> {
+    let limit = ROUTE_READ_LIMIT as i64;
+    let (marks_sql, held_sql, bounds_sql, binds) = if ev.source == owed_event::ROUTE_IDENTITY {
+        (
+            ROUTE_IDENTITY_SQL,
+            ROUTE_IDENTITY_HELD_SQL,
+            GAME_BOUNDS_OF_IDENTITY_SQL,
+            vec![
+                Bind::Text(ev.source_key.clone()),
+                Bind::Int(limit),
+                Bind::Int(now),
+            ],
+        )
+    } else {
+        (
+            ROUTE_MARKS_SQL,
+            ROUTE_HELD_SQL,
+            GAME_BOUNDS_OF_PAIR_SQL,
+            vec![
+                Bind::Text(ev.source.clone()),
+                Bind::Text(ev.source_key.clone()),
+                Bind::Int(limit),
+                Bind::Int(now),
+            ],
+        )
+    };
+    let mut out = vec![
+        Stmt {
+            sql: marks_sql.into(),
+            binds: binds.clone(),
+        },
+        Stmt {
+            sql: held_sql.into(),
+            binds: binds.clone(),
+        },
+    ];
+    if bounds {
+        out.push(Stmt {
+            sql: bounds_sql.into(),
+            binds,
+        });
+    }
+    out
+}
+
+/// The held count of a plan read's second statement.
+fn held_count(out: Option<StmtOut>) -> usize {
+    out.and_then(|o| o.rows.first().and_then(|r| r["n"].as_i64()))
+        .unwrap_or(0)
+        .max(0) as usize
+}
+
+/// PURE: a plan from its marks (an envelope's empty game left out), its held count and its `more`.
+fn plan_of_marks(marks: &[Value], held_subjects: usize, mut more: bool) -> Plan {
     let mut order: Vec<String> = Vec::new();
     let mut games: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut counted = 0usize;
     let mut held: BTreeMap<(String, String), usize> = BTreeMap::new();
-    for m in &marks {
+    for m in marks {
         let (Some(identity), Some(game)) = (m["identity"].as_str(), m["gameId"].as_str()) else {
             continue;
         };
@@ -838,13 +864,141 @@ pub async fn plan_with(db: &impl SqlPort, ev: &OwedEvent, expand: bool) -> Resul
         list.push(game.to_owned());
         counted += 1;
     }
-    Ok(Plan {
+    Plan {
         order,
         games,
         held,
         more,
         held_subjects,
-    })
+    }
+}
+
+/// FIX-959: each `(identity, game)` the pair's unheld marks name ([`ROUTE_MARKS_SQL`]'s window, the same binds) with
+/// the greatest generation of every mark of that game ([`owed_judge::MARKS_SQL`]'s bound, per game).
+pub const GAME_BOUNDS_OF_PAIR_SQL: &str = "SELECT d.identity,d.gameId,MAX(d.generation) AS g FROM (SELECT DISTINCT identity,gameId FROM (SELECT identity,gameId,generation FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey=?2 AND source=?1 AND NOT EXISTS (SELECT 1 FROM owed_belt_state WHERE name='owed-events:fault:subject '||identity||'/'||gameId AND json_extract(cursor,'$.heldUntilMs')>?4) ORDER BY generation LIMIT ?3) WHERE gameId<>'') s JOIN owed_dirty d ON d.identity=s.identity AND d.gameId=s.gameId GROUP BY d.identity,d.gameId";
+/// FIX-959: [`GAME_BOUNDS_OF_PAIR_SQL`] for an identity route ([`ROUTE_IDENTITY_SQL`]'s window, the same binds).
+pub const GAME_BOUNDS_OF_IDENTITY_SQL: &str = "SELECT d.identity,d.gameId,MAX(d.generation) AS g FROM (SELECT DISTINCT identity,gameId FROM (SELECT identity,gameId,generation FROM owed_dirty INDEXED BY idx_owed_dirty_identity_marked WHERE identity=?1 AND NOT EXISTS (SELECT 1 FROM owed_belt_state WHERE name='owed-events:fault:subject '||identity||'/'||gameId AND json_extract(cursor,'$.heldUntilMs')>?3) ORDER BY markedAtMs,generation LIMIT ?2) WHERE gameId<>'') s JOIN owed_dirty d ON d.identity=s.identity AND d.gameId=s.gameId GROUP BY d.identity,d.gameId";
+
+/// FIX-959: the games' bounds a pass read with its marks, `(identity lowercase, game)` to the greatest generation.
+pub type GameBounds = BTreeMap<(String, String), i64>;
+
+/// FIX-959 (bsv-low #959, the warm read's (a)): the direct pass's marks of EVERY non-carried event in ONE D1 batch
+/// (it was one round trip an event, in a row), and with `bounds` each named game's acknowledgement bound in the same
+/// batch (Phase C: it was one more round trip a body, in a row, before the calls). Writes nothing (no envelope is
+/// expanded: the writer's direct call never was). A batch that faults answers its fault for every event (each the
+/// queue's, as a faulted read was).
+pub async fn direct_subjects_many(
+    db: &impl SqlPort,
+    events: &[OwedEvent],
+    bounds: bool,
+) -> (Vec<Result<Subjects, String>>, GameBounds) {
+    let now = db.now_ms() as i64;
+    let per = if bounds { 3 } else { 2 };
+    let mut stmts = Vec::new();
+    for ev in events {
+        if ev.source != owed_event::TXFACTS {
+            stmts.extend(plan_read_stmts(ev, now, bounds));
+        }
+    }
+    if stmts.is_empty() {
+        return (
+            events.iter().map(|_| Ok(Vec::new())).collect(),
+            GameBounds::new(),
+        );
+    }
+    let outs = match db.run_batch(stmts).await {
+        Ok(o) => o,
+        Err(e) => {
+            return (
+                events.iter().map(|_| Err(e.clone())).collect(),
+                GameBounds::new(),
+            )
+        }
+    };
+    let mut outs = outs.into_iter();
+    let mut game_bounds = GameBounds::new();
+    let mut answers = Vec::with_capacity(events.len());
+    for ev in events {
+        if ev.source == owed_event::TXFACTS {
+            answers.push(Ok(Vec::new()));
+            continue;
+        }
+        let chunk: Vec<StmtOut> = outs.by_ref().take(per).collect();
+        if chunk.len() < per {
+            answers.push(Err("the marks' batch answered short".into()));
+            continue;
+        }
+        let mut chunk = chunk.into_iter();
+        let marks = chunk.next().map(|o| o.rows).unwrap_or_default();
+        let held = held_count(chunk.next());
+        let more = marks.len() >= ROUTE_READ_LIMIT;
+        if let Some(b) = chunk.next() {
+            for r in b.rows {
+                if let (Some(id), Some(g), Some(n)) = (
+                    r["identity"].as_str(),
+                    r["gameId"].as_str(),
+                    r["g"].as_i64(),
+                ) {
+                    let e = game_bounds
+                        .entry((id.to_ascii_lowercase(), g.to_ascii_lowercase()))
+                        .or_insert(n);
+                    *e = (*e).max(n);
+                }
+            }
+        }
+        answers.push(Ok(plan_of_marks(&marks, held, more).subjects()));
+    }
+    (answers, game_bounds)
+}
+
+/// FIX-959: every `(identity, games)`'s acknowledgement bound in ONE batch ([`direct_bound`]'s statement each); a
+/// batch that faults answers its fault for each.
+pub async fn direct_bounds_many(
+    db: &impl SqlPort,
+    asks: &[(String, Vec<String>)],
+) -> Vec<Result<i64, String>> {
+    if asks.is_empty() {
+        return Vec::new();
+    }
+    let stmts: Vec<Stmt> = asks
+        .iter()
+        .map(|(id, games)| {
+            Stmt::new(
+                owed_judge::MARKS_SQL,
+                vec![
+                    Bind::Text(id.to_ascii_lowercase()),
+                    Bind::Text(json!(games).to_string()),
+                ],
+            )
+        })
+        .collect();
+    match db.run_batch(stmts).await {
+        Ok(outs) if outs.len() == asks.len() => outs
+            .into_iter()
+            .map(|o| {
+                Ok(o.rows
+                    .iter()
+                    .filter_map(|m| m["generation"].as_i64())
+                    .max()
+                    .unwrap_or(0))
+            })
+            .collect(),
+        Ok(_) => asks
+            .iter()
+            .map(|_| Err("the bounds' batch answered short".into()))
+            .collect(),
+        Err(e) => asks.iter().map(|_| Err(e.clone())).collect(),
+    }
+}
+
+/// PURE (FIX-959): a body's bound from the pass's per-game bounds, when every game of it was read with the marks (else
+/// `None`: the body's bound is read apart, [`direct_bounds_many`]; a carried event's games are never in the map).
+pub fn bound_of_games(bounds: &GameBounds, identity: &str, games: &[String]) -> Option<i64> {
+    let id = identity.to_ascii_lowercase();
+    games
+        .iter()
+        .map(|g| bounds.get(&(id.clone(), g.to_ascii_lowercase())).copied())
+        .try_fold(0i64, |acc, b| b.map(|b| acc.max(b)))
 }
 
 /// The held-until (ms) of each memo row read, by its name.
@@ -2846,6 +3000,29 @@ pub trait DirectPort {
     async fn bound(&self, _identity: &str, _games: &[String]) -> Result<i64, String> {
         Ok(0)
     }
+    /// FIX-959 (bsv-low #959, the warm read's (a)): every event's subjects in ONE read, and with `bounds` each named
+    /// game's acknowledgement bound beside them ([`direct_subjects_many`] over D1). The default is the shape before
+    /// the lane: one [`DirectPort::subjects`] call an event, in a row, and no bound (each body's read apart).
+    async fn subjects_many(
+        &self,
+        events: &[OwedEvent],
+        _bounds: bool,
+    ) -> (Vec<Result<Subjects, String>>, GameBounds) {
+        let mut out = Vec::with_capacity(events.len());
+        for ev in events {
+            out.push(self.subjects(ev).await);
+        }
+        (out, GameBounds::new())
+    }
+    /// FIX-959: the bounds of the bodies the pass's marks did not cover, in ONE read ([`direct_bounds_many`]). The
+    /// default: one [`DirectPort::bound`] call a body, in a row.
+    async fn bounds_many(&self, asks: &[(String, Vec<String>)]) -> Vec<Result<i64, String>> {
+        let mut out = Vec::with_capacity(asks.len());
+        for (id, games) in asks {
+            out.push(self.bound(id, games).await);
+        }
+        out
+    }
     /// Run the acknowledgement's batch.
     async fn ack(&self, _stmts: Vec<Stmt>) -> Result<(), String> {
         Ok(())
@@ -2922,8 +3099,10 @@ pub async fn direct_with_class(
     tip: Option<u64>,
     class: &'static str,
 ) -> DirectReport {
+    use futures_util::FutureExt as _;
     let mut report = DirectReport::default();
-    let mut kept: Vec<(OwedEvent, Subjects)> = Vec::new();
+    // Each event in order: its subjects when it carries them (no read), else `None` (read with the others below).
+    let mut slots: Vec<(OwedEvent, Option<Subjects>)> = Vec::new();
     for (n, ev) in events.into_iter().enumerate() {
         if n >= DIRECT_EVENTS_MAX || ev.source == owed_event::TXFACTS {
             report.left_to_queue += 1;
@@ -2944,45 +3123,48 @@ pub async fn direct_with_class(
         }
         report.events += 1;
         // D2-ACTOR-F (bsv-low #959): an event that carries its row names its subjects too (its pair's marks, read in
-        // the publish's own statement): no D1 read here. Any other event reads its marks as before.
-        let subjects = match crate::owed_actor::carried::carried_subjects(&ev.facts) {
-            Some(s) => s,
-            None => match port.subjects(&ev).await {
-                Ok(s) => s,
-                Err(_) => {
-                    report.left_to_queue += 1;
-                    continue;
-                }
-            },
-        };
-        if ev.facts.get("payload").is_some() {
+        // the publish's own statement): no D1 read here. Any other event reads its marks with the others.
+        let carried = crate::owed_actor::carried::carried_subjects(&ev.facts);
+        if carried.is_some() && ev.facts.get("payload").is_some() {
             report.carried += 1;
         }
-        kept.push((ev, subjects));
+        slots.push((ev, carried));
     }
+    // FIX-959 (bsv-low #959, the warm read's (a)): the marks of EVERY event that carries none in ONE D1 batch (they
+    // were one round trip an event, in a row), and in Phase C each named game's acknowledgement bound in that same
+    // batch (one more round trip a body, in a row, before the calls). The read is shared: the immediate calls wait on
+    // it alone, the filings' calls on it and the closure read, which run at once.
+    let pending: Vec<OwedEvent> = slots
+        .iter()
+        .filter(|(_, s)| s.is_none())
+        .map(|(ev, _)| ev.clone())
+        .collect();
+    let with_bounds = port.acks() && !pending.is_empty();
+    let marks = async { port.subjects_many(&pending, with_bounds).await }.shared();
     // D2-ACTOR-F-FOLD-3 (the second delta lens's MEDIUM-1 and MEDIUM-2, the captain's ruling): a closure only for a
     // carried FILING naming a key beyond its own (`owed_actor::closure_wanted`), and the pass's closures in ONE
     // statement over the union of their keys (the first `PASS_CLOSURE_KEYS_MAX`), one round trip; the drain's sweep
     // pass reads none (a swept event's actor reads its own miss once).
-    // D2-ACTOR-F-FOLD-4 (the third delta lens's LOW-1): the events that want no closure are called AT ONCE; the closure
-    // read runs beside them, raced against `DIRECT_CALL_WALL_MS` (past it the filings go on with none: each actor
-    // reads its own miss once, as on a fault), and the filings' bodies follow it.
-    let wanted: Vec<Option<std::collections::BTreeSet<String>>> = kept
-        .iter()
-        .map(|(ev, _)| {
-            if class == crate::owed_actor::SWEEP_CLASS {
-                None
-            } else {
-                crate::owed_actor::closure_wanted(ev)
-            }
-        })
-        .collect();
+    // D2-ACTOR-F-FOLD-4 (the third delta lens's LOW-1): the events that want no closure are called AT ONCE (once the
+    // marks are read); the closure read runs beside them, raced against `DIRECT_CALL_WALL_MS` (past it the filings go
+    // on with none: each actor reads its own miss once, as on a fault), and the filings' bodies follow it.
     let mut filings: Vec<((OwedEvent, Subjects), std::collections::BTreeSet<String>)> = Vec::new();
-    let mut rest: Vec<(OwedEvent, Subjects)> = Vec::new();
-    for (k, w) in kept.into_iter().zip(wanted) {
-        match w {
-            Some(keys) => filings.push((k, keys)),
-            None => rest.push(k),
+    // the rest, in order: an index into the marks' answers for an event that read them
+    let mut rest_slots: Vec<(OwedEvent, Result<Subjects, usize>)> = Vec::new();
+    let mut pending_at = 0usize;
+    for (ev, subjects) in slots {
+        let wanted = if class == crate::owed_actor::SWEEP_CLASS {
+            None
+        } else {
+            crate::owed_actor::closure_wanted(&ev)
+        };
+        match (subjects, wanted) {
+            (Some(s), Some(keys)) => filings.push(((ev, s), keys)),
+            (Some(s), None) => rest_slots.push((ev, Ok(s))),
+            (None, _) => {
+                rest_slots.push((ev, Err(pending_at)));
+                pending_at += 1;
+            }
         }
     }
     let ctx_of = |v: &[(OwedEvent, Subjects)]| -> Vec<_> {
@@ -2990,17 +3172,45 @@ pub async fn direct_with_class(
             .map(|(ev, subjects)| (crate::owed_actor::EventCtx::of(ev), subjects.clone()))
             .collect()
     };
+    // the filings' bodies are coalesced after their closure (it rides each event's facts); their count, for the pass's
+    // fan-out, does not depend on it (one body an identity and chunk)
+    let filing_events: Vec<(OwedEvent, Subjects)> = filings.iter().map(|(k, _)| k.clone()).collect();
+    let filing_bodies = coalesce_direct(ctx_of(&filing_events), tip).len();
+    // The rest's events once the marks are read (a faulted read: that event is the queue's), and the pass's fan-out.
+    let resolve = {
+        let marks = marks.clone();
+        let rest_slots = &rest_slots;
+        async move {
+            let (answers, bounds) = marks.await;
+            let mut rest: Vec<(OwedEvent, Subjects)> = Vec::new();
+            let mut left = 0usize;
+            for (ev, s) in rest_slots {
+                match s {
+                    Ok(s) => rest.push((ev.clone(), s.clone())),
+                    Err(i) => match answers.get(*i) {
+                        Some(Ok(s)) => rest.push((ev.clone(), s.clone())),
+                        _ => left += 1,
+                    },
+                }
+            }
+            let bodies = coalesce_direct(ctx_of(&rest), tip);
+            let fan_out = (bodies.len() + filing_bodies) as u32;
+            (bodies, fan_out, bounds, left)
+        }
+    }
+    .shared();
     // The fourth delta lens's NIT-5, stated: the split makes an identity holding both a filing and a non-filing event in
     // one pass TWO bodies (two applies, serialised by its turn), and `fan_out` counts it twice, so a pass reaches
     // `FLOOD_CONCURRENCY` slightly sooner. Sound: the non-filing body's apply judges over a mirror without the filing's
     // rows (the pre-filing judgement, what two passes a moment apart give), the filing's mark is a plain mark (nothing
     // withheld between), and the filing's body then re-judges the game.
-    let rest_bodies = coalesce_direct(ctx_of(&rest), tip);
-    // the filings' bodies are coalesced after their closure (it rides each event's facts); their count, for the pass's
-    // fan-out, does not depend on it (one body an identity and chunk)
-    let filing_events: Vec<(OwedEvent, Subjects)> = filings.iter().map(|(k, _)| k.clone()).collect();
-    let fan_out = (rest_bodies.len() + coalesce_direct(ctx_of(&filing_events), tip).len()) as u32;
-    let immediate = call_bodies(port, rest_bodies, class, fan_out);
+    let immediate = {
+        let resolve = resolve.clone();
+        async move {
+            let (bodies, fan_out, bounds, left) = resolve.await;
+            (call_bodies(port, bodies, class, fan_out, &bounds).await, left)
+        }
+    };
     let after_closure = async {
         let mut step = ClosureStep::default();
         let union: std::collections::BTreeSet<String> =
@@ -3054,9 +3264,16 @@ pub async fn direct_with_class(
         }
         let events: Vec<(OwedEvent, Subjects)> = filings.into_iter().map(|(k, _)| k).collect();
         let bodies = coalesce_direct(ctx_of(&events), tip);
-        (step, call_bodies(port, bodies, class, fan_out).await)
+        // the fan-out is the pass's (the marks' read gives the rest's count); a filing's body acknowledges nothing
+        let fan_out = if bodies.is_empty() {
+            0
+        } else {
+            resolve.clone().await.1
+        };
+        (step, call_bodies(port, bodies, class, fan_out, &GameBounds::new()).await)
     };
-    let (now, (step, later)) = futures_util::future::join(immediate, after_closure).await;
+    let ((now, left), (step, later)) = futures_util::future::join(immediate, after_closure).await;
+    report.left_to_queue += left;
     report.closure_calls = step.calls;
     report.closure_ms = step.ms;
     report.closures = step.closures;
@@ -3105,6 +3322,7 @@ async fn call_bodies(
     mut bodies: Vec<Value>,
     class: &'static str,
     fan_out: u32,
+    read: &GameBounds,
 ) -> CallsDone {
     let mut done = CallsDone::default();
     // FIX-983 (bsv-low #983): the pass's fan-out rides each body; at `FLOOD_CONCURRENCY` or more the object samples
@@ -3115,9 +3333,12 @@ async fn call_bodies(
     }
     done.calls = bodies.len() as u64;
     // FIX-956 item 3: in Phase C each body's acknowledgement bound, read BEFORE its call (a mark written after it is
-    // left for the queue's delivery)
+    // left for the queue's delivery). FIX-959: from the pass's marks' batch where it read every game of the body
+    // (`read`, the same snapshot as the marks), else every other body's in ONE batch (they were one read a body, in a
+    // row).
     let mut bounds: Vec<Option<(String, Vec<String>, i64)>> = Vec::with_capacity(bodies.len());
-    for b in &bodies {
+    let mut asks: Vec<(usize, String, Vec<String>)> = Vec::new();
+    for (i, b) in bodies.iter().enumerate() {
         let id = b["identity"].as_str().unwrap_or_default().to_owned();
         let games: Vec<String> = b["games"]
             .as_array()
@@ -3125,11 +3346,24 @@ async fn call_bodies(
             .unwrap_or_default();
         // D2-ACTOR-F: a carried body acknowledges nothing (its apply covers nothing; the queue's delivery is the
         // narrowed read that covers the event and acknowledges it), so no bound is read for it.
-        bounds.push(if port.acks() && b.get("carried").is_none() {
-            port.bound(&id, &games).await.ok().map(|seen| (id, games, seen))
+        if !port.acks() || b.get("carried").is_some() {
+            bounds.push(None);
+        } else if let Some(seen) = bound_of_games(read, &id, &games) {
+            bounds.push(Some((id, games, seen)));
         } else {
-            None
-        });
+            bounds.push(None);
+            asks.push((i, id, games));
+        }
+    }
+    if !asks.is_empty() {
+        let pairs: Vec<(String, Vec<String>)> =
+            asks.iter().map(|(_, id, g)| (id.clone(), g.clone())).collect();
+        let answers = port.bounds_many(&pairs).await;
+        for ((i, id, games), seen) in asks.into_iter().zip(answers) {
+            if let Ok(seen) = seen {
+                bounds[i] = Some((id, games, seen));
+            }
+        }
     }
     let answers = futures_util::future::join_all(bodies.into_iter().map(|b| port.call(b))).await;
     for (answer, bound) in answers.into_iter().zip(bounds) {
@@ -3196,6 +3430,18 @@ impl DirectPort for WorkerDirect {
     }
     async fn bound(&self, identity: &str, games: &[String]) -> Result<i64, String> {
         direct_bound(&self.sql, identity, games).await
+    }
+    /// FIX-959: one D1 batch for every event's marks (and in Phase C its games' bounds).
+    async fn subjects_many(
+        &self,
+        events: &[OwedEvent],
+        bounds: bool,
+    ) -> (Vec<Result<Subjects, String>>, GameBounds) {
+        direct_subjects_many(&self.sql, events, bounds).await
+    }
+    /// FIX-959: one D1 batch for the bodies' bounds the marks did not cover.
+    async fn bounds_many(&self, asks: &[(String, Vec<String>)]) -> Vec<Result<i64, String>> {
+        direct_bounds_many(&self.sql, asks).await
     }
     async fn ack(&self, stmts: Vec<Stmt>) -> Result<(), String> {
         self.sql.run_batch(stmts).await.map(|_| ())

@@ -17442,3 +17442,198 @@ mod fix1010 {
         assert_eq!(stored_rows_no_clock(&local), stored_rows_no_clock(&d1));
     }
 }
+
+/// FIX-959 (bsv-low #959, the warm read's (c)): warmth no longer expires mid-hand. A hand's MINED word and collect
+/// arrive about 10 minutes after its JOIN; with warmth at 600 s their applies were FULL reads of the whole closure (2 to
+/// 4 sequential D1 statements). Since FOLD-11 a warm game's narrowed read re-reads every family over the mirror's
+/// whole key set, so the window bounds no drift: it is a day ([`FULL_REFRESH_EVERY_MS`]), and the event 11 minutes
+/// later takes the narrowed read, ONE record statement. RED on 91eb883b (600 s): `narrowed: false`, the full read.
+mod fix959 {
+    use super::*;
+
+    #[tokio::test]
+    async fn fix959_c_an_event_eleven_minutes_after_the_join_takes_the_narrowed_read() {
+        let (record, local, games) = e_warm_seat(32).await;
+        let touch = ApplyOpts {
+            touch: Some(vec![h("b8", 3)]),
+            ..ApplyOpts::default()
+        };
+        let once = |at: u64| {
+            let (record, local, games, touch) = (&record, &local, &games, &touch);
+            async move {
+                local.now.set(at);
+                let counted = Counting(record, Cell::new(0), Cell::new(0));
+                let r = apply_with(
+                    &counted,
+                    local,
+                    &Fakes,
+                    "owner",
+                    &games[3..4],
+                    None,
+                    Some(TIP),
+                    None,
+                    touch,
+                )
+                .await
+                .unwrap()
+                .0;
+                (r.narrowed, r.rounds, counted.2.get())
+            }
+        };
+        let t0 = local.now.get();
+        assert!(once(t0).await.0, "the bootstrapped game is warm");
+        let eleven = once(t0 + 11 * 60_000).await;
+        eprintln!("fix959_c: 11 minutes later (narrowed, rounds, record statements) = {eleven:?}");
+        assert_eq!(
+            (eleven.0, eleven.2),
+            (true, 1),
+            "the hand's later event is the narrowed read, one record statement"
+        );
+        // the window is still bounded: a day later the closure is walked again
+        let day = once(t0 + FULL_REFRESH_EVERY_MS as u64 + 60_000).await;
+        assert!(!day.0, "past the window the whole closure: {day:?}");
+        const { assert!(FULL_REFRESH_EVERY_MS >= 6 * 3_600_000) };
+    }
+
+    /// (item 2) THE BARS NAME THE READ PATH. Three direct answers (a carried, a narrowed and a full apply, as
+    /// `answer_of` shapes them) through the isolate's pending bars, the shipped flush and the fleet's view: each path's
+    /// apply and visibility rings served apart under `classes.direct.paths`, the class's own p95 over all three
+    /// unchanged. New API on 91eb883b (the bars kept no flag).
+    #[tokio::test]
+    async fn fix959_d_the_bars_serve_each_samples_read_path() {
+        let answer = |carried: bool, narrowed: bool, apply: u64, seen: u64| json!({"applied": true, "firstApply": true, "carried": carried, "narrowed": narrowed, "applyMs": apply, "atMs": NOW_MS, "judgedAtMs": NOW_MS + seen});
+        let mut pending = PendingBars::default();
+        pending.note_answer("direct", &answer(true, false, 4, 40));
+        pending.note_answer("direct", &answer(false, true, 300, 700));
+        pending.note_answer("direct", &answer(false, false, 900, 2_000));
+        assert_eq!(read_path(&answer(true, true, 1, 1)), "carried");
+        let d1 = seeded(&Fixture {
+            name: "empty",
+            seed: Vec::new(),
+            identities: Vec::new(),
+        });
+        flush_bars_from(&d1, NOW_MS, &pending).await.unwrap();
+        let rows = d1
+            .run_batch(vec![Stmt::new(BARS_READ_SQL, vec![])])
+            .await
+            .unwrap()[0]
+            .rows
+            .clone();
+        let fleet = fleet_bars(&rows, NOW_MS, lib_rev());
+        let paths = &fleet["classes"]["direct"]["paths"];
+        eprintln!("fix959_d: {paths}");
+        for (p, apply, seen) in [
+            ("carried", 4, 40),
+            ("narrowed", 300, 700),
+            ("full", 900, 2_000),
+        ] {
+            assert_eq!(
+                (
+                    paths[p]["applySamples"].clone(),
+                    paths[p]["applyMsP95"].clone(),
+                    paths[p]["visibleMsP95"].clone()
+                ),
+                (json!(1), json!(apply), json!(seen)),
+                "{p}"
+            );
+        }
+        assert_eq!(fleet["classes"]["direct"]["applySamples"], json!(3));
+    }
+
+    /// The record port of [`fix959_e_the_marked_reads_answer_bytes_on_the_fleets_whale`]: every answer's bytes, the
+    /// stored BEEFs' hex apart.
+    struct Weighing<'a>(&'a SqliteSql, Cell<usize>, Cell<usize>, Cell<usize>);
+    impl SqlPort for Weighing<'_> {
+        async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+            self.3.set(self.3.get() + stmts.len());
+            let out = self.0.run_batch(stmts).await?;
+            fn beef_hex(v: &Value) -> usize {
+                // a row is positional (`compound_columns`); a stored BEEF's hex is the value with a BEEF's magic
+                match v {
+                    Value::Object(m) => m.values().map(beef_hex).sum(),
+                    Value::Array(a) => a.iter().map(beef_hex).sum(),
+                    Value::String(t) if t.starts_with('[') || t.starts_with('{') => {
+                        serde_json::from_str::<Value>(t).map_or(0, |v| beef_hex(&v))
+                    }
+                    Value::String(t)
+                        if ["0100BEEF", "0200BEEF", "01010101"]
+                            .iter()
+                            .any(|m| t.to_ascii_uppercase().starts_with(m)) =>
+                    {
+                        t.len()
+                    }
+                    _ => 0,
+                }
+            }
+            for o in &out {
+                for r in &o.rows {
+                    self.1.set(self.1.get() + r.to_string().len());
+                    self.2.set(self.2.get() + beef_hex(r));
+                }
+            }
+            Ok(out)
+        }
+        async fn counters(&self, d: Vec<(String, u64)>) {
+            self.0.counters(d).await;
+        }
+        fn now_ms(&self) -> u64 {
+            self.0.now_ms()
+        }
+        fn log(&self, l: &str) {
+            self.0.log(l);
+        }
+    }
+
+    /// (b)'s FIRST STEP (the reading's "measure first"): the warm narrowed read's answer bytes on the frozen fleet's
+    /// whale, its stored BEEFs' hex apart from the rest, one game and 16 games an apply after the bootstrap. Printed
+    /// for the lane's evidence; it decides whether (b) is built. `--ignored` (the whale's bootstrap is slow in debug).
+    #[tokio::test]
+    #[ignore]
+    async fn fix959_e_the_marked_reads_answer_bytes_on_the_fleets_whale() {
+        let f = fixtures()
+            .into_iter()
+            .find(|f| f.name == "d1_fleet")
+            .unwrap();
+        let record = d1_judge(&f).await;
+        let id = &f.identities[0];
+        let games = games_of(&record, id);
+        let local = mirror();
+        for chunk in games.chunks(GAMES_PER_APPLY) {
+            apply(&record, &local, &Fakes, id, chunk, None, Some(TIP), None)
+                .await
+                .unwrap();
+        }
+        let held = record
+            .run_batch(vec![Stmt::new(
+                "SELECT (SELECT COUNT(*) FROM pot_beefs) AS pb,(SELECT COALESCE(SUM(length(beef)),0) FROM pot_beefs) AS pbb,(SELECT COUNT(*) FROM transactions) AS tx,(SELECT COALESCE(SUM(length(beef)),0) FROM transactions) AS txb",
+                vec![],
+            )])
+            .await
+            .unwrap()[0]
+            .rows[0]
+            .clone();
+        eprintln!("fix959_e: the fixture's stored BEEFs: {held}");
+        let touch = ApplyOpts {
+            touch: Some(Vec::new()),
+            ..ApplyOpts::default()
+        };
+        for n in [1usize, 16] {
+            let mut rows = Vec::new();
+            for chunk in games.chunks(n).take(8) {
+                let w = Weighing(&record, Cell::new(0), Cell::new(0), Cell::new(0));
+                let (r, _) =
+                    apply_with(&w, &local, &Fakes, id, chunk, None, Some(TIP), None, &touch)
+                        .await
+                        .unwrap();
+                rows.push((r.narrowed, r.rounds, w.3.get(), w.1.get(), w.2.get()));
+            }
+            let total: usize = rows.iter().map(|r| r.3).sum();
+            let beef: usize = rows.iter().map(|r| r.4).sum();
+            eprintln!(
+                "fix959_e: {n} game(s) an apply, 8 applies of the whale ({} games): (narrowed, rounds, record statements, answer bytes, BEEF hex bytes) {rows:?}; BEEF hex {beef} of {total} bytes ({:.1} %)",
+                games.len(),
+                100.0 * beef as f64 / total.max(1) as f64
+            );
+        }
+    }
+}
