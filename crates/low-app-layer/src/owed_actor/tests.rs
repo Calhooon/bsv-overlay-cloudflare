@@ -18226,4 +18226,15 @@ mod fix1027 {
             "{row:?}"
         );
     }
+
+    /// Round 4's NIT-1 (`docs/audit/FIX-1027-REVIEW-4-2026-11-01.md`): the clear's lag is the app layer's latch recheck
+    /// depth, tied here across the crates and not by two literals that can drift apart in silence.
+    #[test]
+    fn fix1027f4_the_clears_tip_lag_is_the_latch_recheck_depth() {
+        assert_eq!(
+            memos::REORG_TIP_LAG_BLOCKS,
+            crate::owed::LATCH_RECHECK_DEPTH,
+            "the clear allows for the verified tip's lag by the same depth the latch recheck walks"
+        );
+    }
 }
