@@ -9,6 +9,12 @@ fn owed_read_has_no_work_or_clock() {
         .split("async fn gather_result_entries(")
         .next()
         .unwrap();
+    // FIX-1041 (bsv-low #1041): the ONE clock the read takes is its own instant, stamped on the snapshot so the rows'
+    // clock facts (the chain word's age and its `-stale` suffix) are served as of the read; a projection, never work.
+    // Any other clock read in the route is still refused.
+    let stamp = "snapshot.read_at_ms = Some(worker::Date::now().as_millis());";
+    assert_eq!(route.matches(stamp).count(), 1, "the read stamps its instant once");
+    let route = route.replace(stamp, "");
     for forbidden in [
         "Date::now",
         "wait_until",

@@ -3298,7 +3298,7 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
     }
     let db = D1Sql::of(&ctx.env)?;
     // bsv-low #912 (Phase B, `OWED_ACTOR_READ`): the actor's rows, the words joined from D1 as below.
-    let snapshot = if crate::owed_actor::flag_on(
+    let mut snapshot = if crate::owed_actor::flag_on(
         ctx.env
             .var(crate::owed_actor::READ_FLAG)
             .ok()
@@ -3332,6 +3332,8 @@ pub async fn owed(req: Request, ctx: RouteContext<AuthState>) -> Result<Response
             }
         }
     };
+    // FIX-1041 (bsv-low #1041): the read's instant, so the rows' clock facts are served as of it.
+    snapshot.read_at_ms = Some(worker::Date::now().as_millis());
     let tip = if snapshot.needs_tip() {
         crate::beef_guard::present_tip(&ctx.env).await
     } else {
