@@ -333,7 +333,9 @@ mod pins {
         plant(&db, &latch, 1, 1);
         plant(&db, &format!("{HOP}.1"), 1, 0); // unconfirmed: the clear keeps it
         assert_eq!(
-            db.conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(),
+            db.conn
+                .execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, [0])
+                .unwrap(),
             2,
             "the memo and the latch; the evidence is demoted, never deleted (bsv-low #1027)"
         );
@@ -349,13 +351,13 @@ mod pins {
             &db,
             HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
             HOP_PROBE_MEMO_REORG_CLEAR_FRAMED[0],
-            None,
+            Some(0),
         );
         let demoted: Vec<String> = db
             .conn
             .prepare(HOP_PROBE_MEMO_REORG_CLEAR_FRAMED[1])
             .unwrap()
-            .query_map([], |r| r.get(0))
+            .query_map([0], |r| r.get(0))
             .unwrap()
             .map(Result::unwrap)
             .collect();

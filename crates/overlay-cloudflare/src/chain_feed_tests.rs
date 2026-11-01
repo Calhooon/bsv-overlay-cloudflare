@@ -735,7 +735,7 @@ fn e620_g_the_feed_is_wired_as_the_reorg_word_and_d7_is_gated() {
     assert!(!feed_consume.contains("reverify_window_with("));
     assert!(feed_consume.contains("decode_envelope(&bytes)"));
     let run = &feed[feed.find("pubasyncfnrun_chain_feed_pass(").unwrap()..];
-    assert!(run.contains("crate::hop_probe_memos::clear_on_reorg(db,origin,crate::hop_probe_memos::feed_pass_rejudged(&s),)"));
+    assert!(run.contains("crate::hop_probe_memos::clear_on_reorg(db,origin,crate::hop_probe_memos::feed_pass_rejudged(&s).then(||s.reach_floor.unwrap_or(0)),)"));
     assert!(run.contains("for(name,n)ins.reorg_totals()"));
 
     let tick = squash(include_str!("tick.rs"));
@@ -1507,4 +1507,60 @@ async fn delta_d1_a_stop_whose_write_did_not_land_hands_arcades_listing_back() {
             "{what}, the write faulted: nothing recorded, D7 is the input: {faulted:?}"
         );
     }
+}
+
+/// bsv-low #1027 round 2 (MEDIUM-1): THE FEED AND D7 HAND THE PROBE CLEAR THEIR LOWEST WINDOW. A reorg from 101 reaches
+/// 101; an `invalidated` (whose word carries no height) reaches the window's floor below the verified tip
+/// (`tip - INVALIDATED_DEPTH`); a pass of tips reaches nothing; D7's orphan at 101 reaches 101. `run_chain_feed_pass`
+/// and `run_arcade_reorg_pass` hand that floor to `hop_probe_memos::clear_on_reorg` (their source pins). New API (the
+/// field does not exist on 4a1cdbdc).
+#[tokio::test]
+async fn fix1027f2_m1_the_feed_and_d7_hand_the_clear_their_lowest_window() {
+    let store = MemoryPotStorage::new();
+    let txs = MemoryTxStore::default();
+    let ladder = CourierStub::none();
+    let reorg = pass(
+        &Journal::of(&[(41, FORK), (42, REORG), (43, TIP)]),
+        &Row::default(),
+        &store,
+        &txs,
+        &Roots::at(102),
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("40".into()),
+    )
+    .await;
+    assert!(crate::hop_probe_memos::feed_pass_rejudged(&reorg), "{reorg:?}");
+    assert_eq!(reorg.reach_floor, Some(101), "{reorg:?}");
+    let invalidated = pass(
+        &Journal::of(&[(41, INVALIDATED)]),
+        &Row::default(),
+        &store,
+        &txs,
+        &MockChainTracker::new(1_000),
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("40".into()),
+    )
+    .await;
+    assert_eq!(invalidated.applied, 1, "{invalidated:?}");
+    assert_eq!(
+        invalidated.reach_floor,
+        Some(1_000 - crate::chain_feed::INVALIDATED_DEPTH),
+        "no height on the word: the window's floor"
+    );
+    let tips = pass(
+        &Journal::of(&[(41, TIP), (42, TIP_AGE)]),
+        &Row::default(),
+        &store,
+        &txs,
+        &Roots::at(102),
+        &ladder,
+        limits(2, 50, 12),
+        &Start::At("40".into()),
+    )
+    .await;
+    assert_eq!(tips.reach_floor, None, "{tips:?}");
+    let d7 = d7_pass(&store, &txs, &Roots::at(102), &ladder).await;
+    assert_eq!(d7.reach_floor, Some(101), "{d7:?}");
 }

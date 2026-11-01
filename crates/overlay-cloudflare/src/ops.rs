@@ -921,7 +921,9 @@ pub async fn arcade_reorg_view(db: &D1Database) -> serde_json::Value {
 
 /// PURE (bsv-low #484): the reorg view carries how many CONFIRMED hop probe memos the reorg passes have cleared
 /// (`hop_probe_memos`; the lifetime counter, 0 until the first), beside the cursor that says where the judge is,
-/// and (bsv-low #1027) how many of the belt's evidence rows they demoted.
+/// and (bsv-low #1027) how many of the belt's evidence rows they demoted. `probeMemosCleared` is a lifetime total
+/// that mixes two meanings across the FIX-1027 deploy (round 2's NIT-1): before it the evidence rows a clear deleted
+/// were counted in it too; after it, memos and latches only, the evidence counted in `probeEvidenceDemoted`.
 pub fn with_probe_memos_cleared(
     mut view: serde_json::Value,
     counters: &serde_json::Value,

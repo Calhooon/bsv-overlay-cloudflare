@@ -17033,7 +17033,7 @@ mod fix1010 {
             &d1,
             memos::HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
             &memos::HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,
-            None,
+            Some(0),
             false,
         );
         assert_eq!(
@@ -17709,7 +17709,7 @@ mod fix1027 {
             &d1,
             memos::HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
             &memos::HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,
-            None,
+            Some(0),
             false,
         );
         assert_eq!(keys, vec![hop.clone()], "the evidence's pair, noted");
@@ -17887,6 +17887,281 @@ mod fix1027 {
         let (a, b) = (rows(&w.d1), rows(&w.actor));
         assert_eq!(rows_digest(&a), rows_digest(&b), "the digests equal");
         assert!(diff_rows(&a, &b).is_empty());
+    }
+
+    /// (fix1027f2_l2) ROUND 2'S LOW-2: the re-ask lever asks only a hop a VERIFIED marker (or the eviction's released
+    /// evidence) names for the identity, as the belt dates only verified rows. The fold9 hop under an UNVERIFIED marker
+    /// (`markerValid = 0`), its evidence lost: the lever skips it BY NAME and makes no courier call. RED on 4a1cdbdc
+    /// (the marker arm read any marker): the outpoint asked, `left: (1, 1, 3)` (three courier calls).
+    #[tokio::test]
+    async fn fix1027f2_l2_the_reask_lever_skips_an_unverified_markers_outpoint_by_name() {
+        let hop = format!("{FOLD9_HOP}:0");
+        let d1 = seeded(&fold9_fixture());
+        d1.conn
+            .execute_batch("UPDATE hopparty_records SET markerValid=0")
+            .unwrap();
+        d1.conn
+            .execute(crate::hops_view::PROBE_EVIDENCE_CLEAR_SQL, [&hop])
+            .unwrap();
+        let w = WithActor {
+            d1,
+            actor: mirror(),
+            d1_judges: false,
+            event: None,
+            actor_reads: true,
+            actor_fails: Cell::new(false),
+        };
+        let courier = Couriers::default();
+        let r = crate::owed_belt::reask(&w, &courier, &[("owner".into(), hop.clone())])
+            .await
+            .unwrap();
+        assert_eq!(
+            (r.tick.candidates, r.tick.asked, courier.calls.borrow().len()),
+            (0, 0, 0),
+            "nothing asked: {r:?}"
+        );
+        assert_eq!(
+            r.skipped,
+            vec![(
+                "owner".to_string(),
+                hop,
+                "no verified hop marker or released evidence names it".to_string()
+            )]
+        );
+    }
+
+    /// (fix1027f2_l1) ROUND 2'S LOW-1 on the fold9 fixture: the seat's hop swept by a sweep to the hop marker's
+    /// committed key (its hash160), the belt's evidence of that spend CONFIRMED, and a collected row naming the sweep.
+    /// The fold9 seat has no pot binding a committed home, so both judges read it `unbound` ("cannot match to a home")
+    /// with the sweep named, before and after. Then the reorg clear's batch (reach 0, the widest a clear reaches), its
+    /// events applied directly, the D1 judge FRESH: both store the same rows (digests equal, no diff, no tip lag) and
+    /// the hop's row is never a press (stored claim and the belt's candidate). Beta's shape 2 proper (the home known,
+    /// the held filing verified, no row) is `fix1027f2_l1b`. Green on 4a1cdbdc too (stated: at reach 0 the statements
+    /// are 4a1cdbdc's): the demoted evidence still names the spender, so neither judge reads the hop by the index alone.
+    #[tokio::test]
+    async fn fix1027f2_l1_an_own_sweep_collected_under_a_demotion_is_never_a_press() {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{Transaction, TransactionInput, TransactionOutput};
+        const KEY: &str = "023186e1d618b96dca2583a21aa8c5e2227ba49f3f671f59e3f2be1c346ed41763";
+        const PKH: &str = "3e7bb94f261568ca8d457d8b4f935b0a3f8ccf89";
+        let pkh: [u8; 20] = hex::decode(PKH).unwrap().try_into().unwrap();
+        let mut sweep = Transaction::new();
+        sweep
+            .inputs
+            .push(TransactionInput::new(FOLD9_HOP.to_string(), 0));
+        sweep.outputs.push(TransactionOutput {
+            satoshis: Some(20_000),
+            locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(&pkh))
+                .unwrap(),
+            change: false,
+        });
+        let s = sweep.id();
+        let made = (NOW_MS / 1000) as i64 - 4 * 3_600;
+        let found = NOW_MS as i64 - 3 * 3_600_000;
+        let game = h("9f", 1);
+        let bytes = crate::owed::StoredSpenderBytes::from_parts(
+            &crate::routes::spender_inputs_of(&sweep),
+            &crate::routes::spender_outputs_of(&sweep),
+        )
+        .to_json_capped()
+        .unwrap();
+        let fixture = Fixture {
+            name: "fix1027f2 shape 2: an own sweep, collected",
+            seed: vec![
+                format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{FOLD9_HOP}',0,0,{made},'p2pkh')"),
+                format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('owner','other','{game}',0,20190,'{KEY}','00','00',2,'{FOLD9_HOP}',1,{made},1)"),
+                format!("INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES ('{FOLD9_HOP}:0',{found},1,'{s}',1,{})", TIP - 18),
+                format!("INSERT INTO owed_spender_bytes(txid,bytesJson,createdAtMs) VALUES ('{s}','{bytes}',{found})"),
+                format!("INSERT INTO network_seen(txid,seenAt) VALUES ('{s}',{})", found / 1000),
+            ],
+            identities: vec!["owner".into()],
+        };
+        let d1 = seeded(&fixture);
+        // a collected row naming the sweep, written by the door's own statement (`i492_dn1`)
+        d1.conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    "owner",
+                    game,
+                    h("c0", 1),
+                    0i64,
+                    Option::<String>::None,
+                    made + 3_000,
+                    s
+                ],
+            )
+            .unwrap();
+        for chunk in games_of(&d1, "owner").chunks(16) {
+            crate::owed_judge::judge_subjects(&d1, "owner", chunk, "d1")
+                .await
+                .unwrap();
+        }
+        let (local, _) = actor_judge(&d1, "owner").await;
+        let hop = format!("{FOLD9_HOP}:0");
+        let before = fold9_row(&d1, &hop);
+        let keys = probe_batch(
+            &d1,
+            memos::HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
+            &memos::HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,
+            Some(0),
+            false,
+        );
+        assert_eq!(keys, vec![hop.clone()], "the own sweep's evidence, demoted and noted");
+        for k in &keys {
+            let ev = published(&d1, "probe", k)
+                .await
+                .expect("the clear marked the hop's seat");
+            direct(&d1, &local, &ev, false).await;
+        }
+        fresh_d1(&d1).await;
+        let (a, b) = (rows(&d1), rows(&local));
+        assert_eq!(rows_digest(&a), rows_digest(&b), "the digests equal: {a:?} / {b:?}");
+        assert!(diff_rows(&a, &b).is_empty());
+        assert!(tip_derived_rows(&a, &b).is_empty(), "no tip lag excuses anything");
+        for db in [&d1, &local] {
+            if let Some(r) = fold9_row(db, &hop) {
+                assert_ne!(r.1, Some(1), "never a press: {r:?} (before the clear: {before:?})");
+                let c = candidate(db, &hop);
+                assert_ne!(c.claimable, Some(true), "never a press: {c:?}");
+            }
+        }
+        println!("fix1027f2_l1: before {before:?}; after {:?}", fold9_row(&d1, &hop));
+    }
+
+    /// (fix1027f2_l1b) ROUND 2'S LOW-1 on a hand whose home IS known: the captured pair 13's seat (FIX-988's hand,
+    /// the hop marker's committed key, the eviction's released evidence) swept its hop to its committed home by a
+    /// courier-only sweep, the belt's evidence of that spend CONFIRMED (`<hop>:0`, the sweep), and the seat's COLLECTED
+    /// filing naming the sweep (the door's held content key): beta's shape 2, no row on either side. Then the reorg
+    /// clear's batch at reach 0, the clear's events applied by the actor's narrowed read, the D1 judge FRESH: the seat's
+    /// rows equal on both sides (stored rows, no clock) and the hop still has no row, so no press. Green on 4a1cdbdc too (stated: at reach 0
+    /// the statements are 4a1cdbdc's): the collected filing ends the payout whatever the sweep's confirmation, and the
+    /// demoted evidence still names the sweep.
+    #[tokio::test]
+    async fn fix1027f2_l1b_shape_2_an_own_sweep_collected_on_a_known_home_stays_no_press() {
+        use crate::owed_walk_frozen::pins::{
+            backfill_to_the_stamp, home_marker_seed, FOLD8_TIP, HOME_MARKER_GAME, HOME_MARKER_HOP,
+            HOME_MARKER_SEAT,
+        };
+        let seat = HOME_MARKER_SEAT;
+        let (mut seed, sweep) = home_marker_seed();
+        let hop = format!("{HOME_MARKER_HOP}:0");
+        seed.push(format!(
+            "UPDATE hop_chain_probes SET outpoint='{hop}',tipHeight={} WHERE outpoint='{HOME_MARKER_HOP}.0'",
+            FOLD8_TIP - 18
+        ));
+        // the door's held filing: its row key is the content key of (game, identity, the sweep)
+        let key = crate::record_post::held_content_key(&crate::record_post::HeldMarker {
+            game_id: hex::decode(HOME_MARKER_GAME).unwrap().try_into().unwrap(),
+            identity_key: hex::decode(seat).unwrap(),
+            pay_txid: hex::decode(&sweep).unwrap().try_into().unwrap(),
+            sig: Vec::new(),
+        });
+        let d1 = seeded(&Fixture {
+            name: "fix1027f2 shape 2 on a known home",
+            seed,
+            identities: vec![seat.into()],
+        });
+        // written by the door's own statement (`i492_dn1`: the door is the one writer of `payTxid`)
+        d1.conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    seat,
+                    HOME_MARKER_GAME,
+                    key,
+                    0i64,
+                    Option::<String>::None,
+                    (NOW_MS / 1000) as i64 - 600,
+                    sweep
+                ],
+            )
+            .unwrap();
+        d1.tip.set(Some(FOLD8_TIP));
+        d1.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        backfill_to_the_stamp(&d1).await;
+        async fn judge_d1(d1: &SqliteSql, seat: &str) {
+            for chunk in games_of(d1, seat).chunks(16) {
+                crate::owed_judge::judge_subjects(d1, seat, chunk, "d1")
+                    .await
+                    .unwrap();
+            }
+        }
+        judge_d1(&d1, seat).await;
+        let local = mirror();
+        local.now.set(d1.now.get());
+        for chunk in games_of(&d1, seat).chunks(GAMES_PER_APPLY) {
+            apply(&d1, &local, &Fakes, seat, chunk, Some(("bootstrap", 1)), Some(FOLD8_TIP), None)
+                .await
+                .unwrap();
+        }
+        let stored = |db: &SqliteSql| -> Vec<String> {
+            let mut q = db.conn.prepare("SELECT json_array(outpoint,family,gameId,sats,opponentIdentity,atHeight,reason,claimable,json_extract(facts,'$.claim'),json_extract(facts,'$.chainSpender')) FROM owed_rows WHERE identity=?1 ORDER BY outpoint").unwrap();
+            q.query_map([seat], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        let hop_row = |db: &SqliteSql| -> Option<(String, Option<i64>)> {
+            db.conn
+                .query_row(
+                    "SELECT family,claimable FROM owed_rows WHERE identity=?1 AND outpoint=?2",
+                    [seat, hop.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok()
+        };
+        let before = (hop_row(&d1), hop_row(&local));
+        let keys = probe_batch(
+            &d1,
+            memos::HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
+            &memos::HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,
+            Some(0),
+            false,
+        );
+        assert!(keys.contains(&hop), "the sweep's evidence demoted and noted: {keys:?}");
+        assert_eq!(before, (None, None), "the premise, beta's shape 2: no row on either side");
+        let mut applied = 0;
+        for k in &keys {
+            let Some(ev) = published(&d1, "probe", k).await else {
+                continue;
+            };
+            let subjects = crate::owed_events::plan_with(&d1, &ev, false)
+                .await
+                .unwrap()
+                .subjects();
+            let games: Vec<String> = subjects
+                .into_iter()
+                .filter(|(me, _)| me == seat)
+                .flat_map(|(_, g)| g)
+                .collect();
+            if games.is_empty() {
+                continue;
+            }
+            let e = EventCtx::of(&ev);
+            let opts = ApplyOpts {
+                touch: e.txids.clone(),
+                ..ApplyOpts::default()
+            };
+            apply_with(
+                &d1,
+                &local,
+                &Fakes,
+                seat,
+                &games,
+                Some((ev.source.as_str(), ev.seq)),
+                Some(FOLD8_TIP),
+                None,
+                &opts,
+            )
+            .await
+            .unwrap();
+            applied += 1;
+        }
+        assert!(applied >= 1, "the clear's event reached the seat's actor");
+        judge_d1(&d1, seat).await;
+        assert_eq!(stored(&local), stored(&d1), "both fresh judges store the seat's same rows");
+        for (who, row) in [("d1", hop_row(&d1)), ("actor", hop_row(&local))] {
+            assert_eq!(row, None, "{who}: still no row, never a press over the demoted own sweep");
+        }
+        println!("fix1027f2_l1b: before {before:?}; after d1 {:?} actor {:?}", hop_row(&d1), hop_row(&local));
     }
 
     /// (fix1027_c) THE D1 JUDGE AND COURIER EVIDENCE: over a hop the index holds unspent, evidence of a spend in the

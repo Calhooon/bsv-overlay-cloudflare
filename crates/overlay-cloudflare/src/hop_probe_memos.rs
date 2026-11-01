@@ -62,10 +62,16 @@ use worker::{console_log, D1Database};
 
 use crate::reorg_sweep::{ProofLegSummary, ReorgSweepSummary, ReverifyPassSummary};
 
-/// Rule 1's predicate (one spelling for the clear, its marks and its framed delete).
+/// Rule 1's predicate (one spelling for the clear, its marks and its framed writes). Bind `?1`: the REACH of the reorg,
+/// the lowest height the pass can have unmade ([`ReorgReach`], 0 for the whole table). bsv-low #1027 round 2
+/// (MEDIUM-1): a row whose spend was confirmed below the reach stands, because no reorg from the reach unmakes a block
+/// below it. A memo's and the belt's evidence's height is the tip the look was taken at (`tipHeight`, written by every
+/// look: the spend's block is at or below it), so `tipHeight >= ?1` is the superset of the rows the reorg can have
+/// unmade; a row with no `tipHeight` (the one-time seed's `spentConfirmed` unknown, an older writer) is taken as before.
+/// A proof latch (`proofmined:<spender>.<height>`) carries its block's height in its key and is read by that.
 macro_rules! clear_pred {
     () => {
-        "spentConfirmed = 1 AND outpoint NOT LIKE 'homeproof:%' AND outpoint NOT LIKE 'homecursor:%'"
+        "spentConfirmed = 1 AND outpoint NOT LIKE 'homeproof:%' AND outpoint NOT LIKE 'homecursor:%' AND (CASE WHEN outpoint LIKE 'proofmined:%' THEN CAST(substr(outpoint,77) AS INTEGER) >= ?1 ELSE (tipHeight IS NULL OR tipHeight >= ?1) END)"
     };
 }
 
@@ -211,7 +217,10 @@ pub const HOP_PROBE_MEMO_REORG_MARK_SQL: &str = "INSERT INTO hop_chain_probes (o
      ON CONFLICT(outpoint) DO UPDATE SET probedAtMs = MAX(hop_chain_probes.probedAtMs, excluded.probedAtMs)";
 
 /// Confirmed memos a reorg pass cleared (served on `/health/invariants.arcadeReorg.probeMemosCleared` and with
-/// the counters).
+/// the counters). Round 2's NIT-1: the lifetime row MIXES two meanings across the FIX-1027 deploy: before it the clear
+/// deleted the belt's evidence too and counted it here; after it this counts memos and latches only and the evidence
+/// is [`COUNTER_HOP_PROBE_EVIDENCE_DEMOTED`]. The row is not reset, so a drop in its rate at the deploy is a change of
+/// meaning, not of reorgs.
 pub const COUNTER_HOP_PROBE_MEMOS_CLEARED: &str = "hop_probe_memos_cleared_by_reorg_total";
 /// bsv-low #1027 (the review's LOW-1): the belt's evidence rows a reorg pass DEMOTED (kept, `spentConfirmed` NULL),
 /// counted apart from the memos it deleted so `probeMemosCleared` keeps its meaning (served beside it on
@@ -333,12 +342,58 @@ async fn marked_delete(
 /// FIX-1010: the `owed_dirty` source of a probe row's marks (`overlay_discovery::owed_event::TRIGGER_SOURCES`).
 pub const PROBE_SOURCE: &str = "probe";
 
-/// Rules 1 and 3, run by a reorg pass with its outcome in hand: no evidence, no write. Logged and counted; a fault is
-/// logged and costs the memo's own window, nothing else. Returns the memos cleared.
-pub async fn clear_on_reorg(db: &D1Database, origin: &str, evidence: bool) -> u64 {
-    if !evidence {
-        return 0;
+/// bsv-low #1027 round 2 (MEDIUM-1): the floor a reorg pass hands the clear, the lowest height it can have unmade
+/// (`None`: no evidence, no write). Each pass names its own: the operator's `fromHeight`, the block event's
+/// `reorgFrom` and the sweep's windows ([`sweep_reach`]), the chain feed's and D7's lowest window judged
+/// (`FeedPassSummary::reach_floor`, `ArcadePassSummary::reach_floor`). A pass that re-judged and names no height
+/// hands 0 (the whole table, the rule before this fold: never a confirmation kept on a guess). Since the fold a clear
+/// demotes only what its reorg can have unmade: on beta's figures (334 evidence rows, 11 clears on 2026-10-31) every
+/// clear demoted every confirmed row, about 3,670 outpoint asks a day against the belt's 5,760; a routine sweep's
+/// clear now reaches three blocks.
+pub type ReorgReach = Option<u64>;
+
+/// PURE (bsv-low #1027 round 2): the reach of a block-event pass's evidence: the announced `reorgFrom`, and the lowest
+/// window the routine sweep walked when it re-judged (every leg's `lo`; with no window recorded, `tip - depth`).
+pub fn sweep_reach(
+    reorg_from: Option<u64>,
+    demotion_rejudged: bool,
+    sweep: &ReorgSweepSummary,
+    tip: u64,
+    depth: u64,
+) -> ReorgReach {
+    let swept = sweep_rejudged(sweep).then(|| {
+        [
+            sweep.spenders_window,
+            sweep.pot_beefs_window,
+            sweep.transactions_window,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|(lo, _)| lo)
+        .min()
+        .unwrap_or_else(|| tip.saturating_sub(depth))
+    });
+    let announced = reorg_from.or_else(|| demotion_rejudged.then_some(0));
+    match (announced, swept) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
     }
+}
+
+/// Rules 1 and 3, run by a reorg pass with its outcome in hand: no evidence (`reach` `None`), no write; else the rows
+/// confirmed at or above the reach (`clear_pred!`). Logged and counted; a fault is logged and costs the memo's own
+/// window, nothing else. Returns the rows the clear moved: the memos and latches DELETED plus the belt's evidence rows
+/// DEMOTED (the review's NIT-2; no caller reads it).
+///
+/// The race, stated (round 2's NOTE-2): the batch is one D1 transaction, so a belt find whose courier look was taken
+/// before the reorg and whose write lands after this batch stands confirmed, as on the base (which deleted only rows
+/// already written); it is bounded by one look (the belt writes at most 8 finds a 120 s tick, each from a look made in
+/// that tick) and healed by the next reorg evidence that reaches its height; the memos' grace tombstone (rule 3) is not
+/// read for evidence rows.
+pub async fn clear_on_reorg(db: &D1Database, origin: &str, reach: ReorgReach) -> u64 {
+    let Some(floor) = reach else {
+        return 0;
+    };
     // rule 3: the tombstone FIRST (a memo the delete misses is then held to the short window by its stamp)
     let now_ms = worker::Date::now().as_millis() as f64;
     if let Err(e) = delete(
@@ -354,7 +409,7 @@ pub async fn clear_on_reorg(db: &D1Database, origin: &str, evidence: bool) -> u6
         db,
         HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
         &HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,
-        &[],
+        &[JsValue::from_f64(floor as f64)],
         false,
     )
     .await
@@ -364,8 +419,9 @@ pub async fn clear_on_reorg(db: &D1Database, origin: &str, evidence: bool) -> u6
             let (deleted, demoted) = (at(0), at(1));
             // the review's LOW-2, stated: each demoted row is dated due now by both judges and the belt asks its
             // OUTPOINT (8 a 120 s tick, 24 calls), owners' and strangers' spends alike: a reorg that unmade a
-            // stranger's spend gives the owner's press back only through that look, so none is deferred
-            console_log!("[hop-probe-memos] ({origin}) reorg evidence: cleared {deleted} confirmed memo(s), demoted {demoted} belt evidence row(s) to unconfirmed (bsv-low #1027); the belt re-asks the demoted outpoints, 8 a tick, and the memos' readers ask again");
+            // stranger's spend gives the owner's press back only through that look, so none is deferred; round 2's
+            // MEDIUM-1: only rows at or above the reach are demoted, so `demoted` is the belt's load from this clear
+            console_log!("[hop-probe-memos] ({origin}) reorg evidence from height {floor}: cleared {deleted} confirmed memo(s), demoted {demoted} belt evidence row(s) to unconfirmed (bsv-low #1027); the belt re-asks the demoted outpoints, 8 a tick, and the memos' readers ask again; rows confirmed below {floor} stand");
             crate::ops::bump_counter(db, COUNTER_HOP_PROBE_MEMOS_CLEARED, deleted).await;
             crate::ops::bump_counter(db, COUNTER_HOP_PROBE_EVIDENCE_DEMOTED, demoted).await;
             deleted + demoted
@@ -437,6 +493,28 @@ mod tests {
         .unwrap();
     }
 
+    /// The clear's batch as [`clear_on_reorg`] runs it, under one transaction: the marks, then
+    /// [`HOP_PROBE_MEMO_REORG_CLEAR_FRAMED`] in order, every statement bound to the reach `floor`; each framed write's keys.
+    fn clear_batch(conn: &rusqlite::Connection, floor: i64) -> Vec<Vec<String>> {
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute(HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL, [floor])
+            .unwrap();
+        let out = HOP_PROBE_MEMO_REORG_CLEAR_FRAMED
+            .iter()
+            .map(|sql| {
+                let mut q = tx.prepare(sql).unwrap();
+                let keys: Vec<String> = q
+                    .query_map([floor], |r| r.get(0))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                keys
+            })
+            .collect();
+        tx.commit().unwrap();
+        out
+    }
+
     fn held(conn: &rusqlite::Connection) -> Vec<String> {
         let mut stmt = conn
             .prepare("SELECT outpoint FROM hop_chain_probes ORDER BY outpoint")
@@ -457,11 +535,11 @@ mod tests {
         plant(&conn, "c.0", 1_000, true, None);
         plant(&conn, "d.0", 1_000, false, None);
         plant(&conn, "e.1", 9_000, true, Some(true));
-        let cleared = conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap();
+        let cleared = conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, [0]).unwrap();
         assert_eq!(cleared, 2, "both confirmed memos, whatever their age");
         assert_eq!(held(&conn), vec!["b.0", "c.0", "d.0"]);
         assert_eq!(
-            conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(),
+            conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, [0]).unwrap(),
             0,
             "idempotent"
         );
@@ -539,7 +617,7 @@ mod tests {
         plant(&conn, "a.0", 5, true, Some(true));
         plant(&conn, "b.0", 5, true, None);
         assert_eq!(
-            conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(),
+            conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, [0]).unwrap(),
             1,
             "the confirmed memo, not the confirmed latch"
         );
@@ -587,14 +665,15 @@ mod tests {
         );
         assert_eq!(held(&conn), vec![latch]);
         assert_eq!(
-            conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(),
+            conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, [0]).unwrap(),
             1,
             "a reorg demotes the latch"
         );
         assert!(held(&conn).is_empty());
         for prefix in HOP_PROBE_MEMO_REORG_DEMOTED_PREFIXES {
             assert!(HOP_PROBE_MEMO_EXPIRE_SQL.contains(&format!("outpoint NOT LIKE '{prefix}%'")));
-            assert!(!HOP_PROBE_MEMO_REORG_CLEAR_SQL.contains(prefix));
+            // round 2: the clear reads the latch's height from its key, never spares the prefix
+            assert!(!HOP_PROBE_MEMO_REORG_CLEAR_SQL.contains(&format!("NOT LIKE '{prefix}%'")));
             assert!(!prefix.contains(['%', '_']), "no LIKE wildcard in a prefix");
         }
     }
@@ -617,7 +696,7 @@ mod tests {
         conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![5_000])
             .unwrap();
         assert_eq!(
-            conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(),
+            conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, [0]).unwrap(),
             1,
             "the confirmed memo, not the tombstone"
         );
@@ -878,10 +957,10 @@ mod tests {
             squash(&rest[..end.min(rest.find("\npub fn ").unwrap_or(rest.len()))])
         };
         let arcade = body("run_arcade_reorg_pass");
-        assert!(arcade.contains(&squash("crate::hop_probe_memos::clear_on_reorg(db, origin, crate::hop_probe_memos::arcade_pass_rejudged(&s)).await")), "the D7 pass");
+        assert!(arcade.contains(&squash("crate::hop_probe_memos::clear_on_reorg(db, origin, crate::hop_probe_memos::arcade_pass_rejudged(&s).then(|| s.reach_floor.unwrap_or(0))).await")), "the D7 pass");
         let tip = body("internal_tip_changed");
         assert!(
-            tip.contains(&squash("reorg_from.is_some() || crate::hop_probe_memos::reverify_rejudged(&demotion) || crate::hop_probe_memos::sweep_rejudged(&sweep)")),
+            tip.contains(&squash("crate::hop_probe_memos::sweep_reach(reorg_from, crate::hop_probe_memos::reverify_rejudged(&demotion), &sweep, height, REORG_SWEEP_DEPTH)")),
             "the R2 legs of the block-event pass"
         );
         assert!(
@@ -893,7 +972,7 @@ mod tests {
         let operator = body("internal_reorg");
         assert!(
             operator.contains(&squash(
-                "crate::hop_probe_memos::clear_on_reorg(db, \"operator\", true).await"
+                "crate::hop_probe_memos::clear_on_reorg(db, \"operator\", Some(trigger.from_height)).await"
             )),
             "the operator's window"
         );
@@ -943,7 +1022,7 @@ mod tests {
         assert_eq!(clears.len(), 1, "one clear in the operator's route");
         assert!(
             route.contains(&squash(
-                r#"crate::hop_probe_memos::clear_on_reorg(db, "operator", true).await"#
+                r#"crate::hop_probe_memos::clear_on_reorg(db, "operator", Some(trigger.from_height)).await"#
             )),
             "the operator's window clears unconditionally"
         );
@@ -984,24 +1063,7 @@ mod tests {
             Some(true),
         );
         plant(&conn, &live_race, 1_000, true, Some(false));
-        let run = |conn: &rusqlite::Connection| -> Vec<Vec<String>> {
-            let tx = conn.unchecked_transaction().unwrap();
-            tx.execute(HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL, []).unwrap();
-            let out = HOP_PROBE_MEMO_REORG_CLEAR_FRAMED
-                .iter()
-                .map(|sql| {
-                    let mut q = tx.prepare(sql).unwrap();
-                    let keys: Vec<String> = q
-                        .query_map([], |r| r.get(0))
-                        .unwrap()
-                        .map(Result::unwrap)
-                        .collect();
-                    keys
-                })
-                .collect();
-            tx.commit().unwrap();
-            out
-        };
+        let run = |conn: &rusqlite::Connection| clear_batch(conn, 0);
         let written = run(&conn);
         let demoted: Vec<String> = written.iter().skip(1).flatten().cloned().collect();
         assert_eq!(demoted, vec![evidence.clone()], "the evidence demoted");
@@ -1051,5 +1113,152 @@ mod tests {
             .collect();
         assert!(body
             .contains("HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,&HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,"));
+    }
+
+    /// bsv-low #1027 round 2 (MEDIUM-1, `docs/audit/FIX-1027-REVIEW-2-2026-11-01.md`): A CLEAR REACHES WHAT ITS REORG
+    /// CAN HAVE UNMADE. The clear's batch over the SHIPPED schema (real SQLite) with the reach `H` = 980: the belt's
+    /// evidence confirmed at or above `H` (its look's `tipHeight`), and evidence with no `tipHeight`, is demoted and
+    /// marked; evidence confirmed below `H` stays confirmed, unmarked (so neither judge dates it for a look); a memo and
+    /// a proof latch (read by the height in its key) are deleted only at or above `H`. A block-event pass whose word
+    /// carries no height reaches the sweep's window ([`sweep_reach`]: its lowest leg's `lo`, else `tip - depth`), the
+    /// announced `reorgFrom` below it, and with no evidence nothing. The belt's load from a clear is the `demoted` its
+    /// line counts: here 2 of 3 confirmed evidence rows. RED on 4a1cdbdc's rule (the scope term made inert, `?1 = ?1`,
+    /// the base's clear with the bind): every confirmed row demoted, `left: [.., "a1..:0", ..]`.
+    #[test]
+    fn fix1027f2_m1_a_clear_demotes_only_the_rows_its_reorg_can_have_unmade() {
+        let conn = db();
+        let ev = |c: &str| format!("{}:0", c.repeat(32));
+        let insert = |outpoint: &str, confirmed: Option<i64>, tip: Option<i64>| {
+            conn.execute(
+                "INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed, tipHeight) VALUES (?1, 1000, 1, ?2, ?3, ?4)",
+                rusqlite::params![outpoint, "e5".repeat(32), confirmed, tip],
+            )
+            .unwrap();
+        };
+        let (deep, shallow, untipped, unconfirmed) = (ev("a1"), ev("b2"), ev("c3"), ev("d4"));
+        insert(&deep, Some(1), Some(950));
+        insert(&shallow, Some(1), Some(990));
+        insert(&untipped, Some(1), None);
+        insert(&unconfirmed, None, Some(995));
+        let (memo_deep, memo_shallow) = (
+            format!("{}.0", "a1".repeat(32)),
+            format!("{}.0", "b2".repeat(32)),
+        );
+        insert(&memo_deep, Some(1), Some(950));
+        insert(&memo_shallow, Some(1), Some(985));
+        let latch = |h: u64| format!("proofmined:{}.{h}", "f6".repeat(32));
+        insert(&latch(940), Some(1), None);
+        insert(&latch(996), Some(1), None);
+        for (hop, vout) in [("a1", 0), ("b2", 0), ("c3", 0)] {
+            conn.execute(
+                "INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('owner','other',?1,?2,20190,'seat','00','00',2,?3,1,1,1)",
+                rusqlite::params![format!("g-{hop}"), vout, hop.repeat(32)],
+            )
+            .unwrap();
+        }
+        conn.execute("DELETE FROM owed_dirty", []).unwrap();
+        let confirmed = |o: &str| -> Option<i64> {
+            conn.query_row(
+                "SELECT spentConfirmed FROM hop_chain_probes WHERE outpoint=?1",
+                [o],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let written = clear_batch(&conn, 980);
+        let mut deleted = written[0].clone();
+        deleted.sort();
+        let mut demoted = written[1].clone();
+        demoted.sort();
+        assert_eq!(
+            demoted,
+            vec![shallow.clone(), untipped.clone()],
+            "the evidence at or above the reach, and the untipped, demoted"
+        );
+        assert_eq!(
+            confirmed(&deep),
+            Some(1),
+            "evidence confirmed below the reach stands"
+        );
+        assert_eq!(
+            confirmed(&unconfirmed),
+            None,
+            "an unconfirmed row untouched"
+        );
+        assert_eq!(
+            deleted,
+            vec![memo_shallow.clone(), latch(996)],
+            "memos and latches only at or above the reach"
+        );
+        let held_rows = held(&conn);
+        assert!(held_rows.contains(&memo_deep) && held_rows.contains(&latch(940)));
+        let mut marked: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT sourceKey FROM owed_dirty WHERE source='probe' ORDER BY sourceKey",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        marked.sort();
+        let mut want = vec![shallow.clone(), untipped.clone(), memo_shallow.clone()];
+        want.sort();
+        assert_eq!(
+            marked, want,
+            "only the rows the clear moved are marked: the deep evidence is never dated"
+        );
+        assert!(
+            clear_batch(&conn, 980).iter().all(Vec::is_empty),
+            "idempotent"
+        );
+        // the reach of 0 (a pass that names no height) is the base's whole table
+        assert_eq!(clear_batch(&conn, 0)[1], vec![deep.clone()]);
+
+        // the block event's reach: a word with no height reaches the sweep's window
+        let swept = |window: Option<(u64, u64)>| ReorgSweepSummary {
+            spenders: ReverifyPassSummary {
+                stale: 1,
+                ..Default::default()
+            },
+            spenders_window: window,
+            ..Default::default()
+        };
+        assert_eq!(
+            sweep_reach(None, false, &swept(Some((997, 1000))), 1000, 3),
+            Some(997)
+        );
+        assert_eq!(
+            sweep_reach(None, false, &swept(None), 1000, 3),
+            Some(997),
+            "tip less the depth"
+        );
+        assert_eq!(
+            sweep_reach(Some(980), true, &swept(Some((997, 1000))), 1000, 3),
+            Some(980)
+        );
+        assert_eq!(
+            sweep_reach(Some(980), true, &ReorgSweepSummary::default(), 1000, 3),
+            Some(980)
+        );
+        assert_eq!(
+            sweep_reach(None, false, &ReorgSweepSummary::default(), 1000, 3),
+            None,
+            "no evidence, no clear"
+        );
+        assert_eq!(
+            sweep_reach(None, true, &ReorgSweepSummary::default(), 1000, 3),
+            Some(0),
+            "a re-judge that names no height: the whole table"
+        );
+        let quiet = ReorgSweepSummary {
+            spenders_window: Some((997, 1000)),
+            ..Default::default()
+        };
+        assert_eq!(
+            sweep_reach(None, false, &quiet, 1000, 3),
+            None,
+            "a sweep that left every row standing"
+        );
     }
 }

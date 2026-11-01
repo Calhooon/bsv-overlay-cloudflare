@@ -2604,7 +2604,7 @@ mod tests {
             "the word `swept_home` reads as claimable"
         );
         // a reorg event over the sweep's height: the overlay's reorg pass clears
-        let cleared = conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap();
+        let cleared = conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, [0]).unwrap();
         assert_eq!(cleared, 1, "the confirmed memo is gone");
         // the next walk re-probes the swept hop, and only it
         let (answered, to_probe) = walk(&read(&targets));
@@ -2737,7 +2737,10 @@ mod tests {
         // THE CLEAR at t0 (the overlay's reorg pass): the tombstone first, then the delete
         conn.execute(HOP_PROBE_MEMO_REORG_MARK_SQL, rusqlite::params![t0])
             .unwrap();
-        assert_eq!(conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, []).unwrap(), 1);
+        assert_eq!(
+            conn.execute(HOP_PROBE_MEMO_REORG_CLEAR_SQL, [0]).unwrap(),
+            1
+        );
         assert_eq!(reorg_clear_at(&read()), Some(t0));
         assert!(
             !answered_at(t0 + 5_000),

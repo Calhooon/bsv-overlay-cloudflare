@@ -322,10 +322,16 @@ pub async fn internal_tip_changed(
     // announced reorg, a targeted demotion, or a row the routine sweep re-judged clears the CONFIRMED memos;
     // a sweep that left every row standing clears nothing. Then the table's TTL, every block.
     if let Some(db) = ops_db {
-        let evidence = reorg_from.is_some()
-            || crate::hop_probe_memos::reverify_rejudged(&demotion)
-            || crate::hop_probe_memos::sweep_rejudged(&sweep);
-        crate::hop_probe_memos::clear_on_reorg(db, "tip-changed", evidence).await;
+        // bsv-low #1027 round 2 (MEDIUM-1): the clear reaches what this pass's evidence can have unmade, the announced
+        // `reorgFrom` and the sweep's windows, never the whole table on a routine re-judge
+        let reach = crate::hop_probe_memos::sweep_reach(
+            reorg_from,
+            crate::hop_probe_memos::reverify_rejudged(&demotion),
+            &sweep,
+            height,
+            REORG_SWEEP_DEPTH,
+        );
+        crate::hop_probe_memos::clear_on_reorg(db, "tip-changed", reach).await;
         crate::hop_probe_memos::expire(db, worker::Date::now().as_millis() as i64).await;
     }
     let fetcher = crate::courier_fetcher(env, tracker).with_budget(TIP_PASS_BUDGET);
@@ -557,7 +563,7 @@ pub async fn run_arcade_reorg_pass(
     crate::hop_probe_memos::clear_on_reorg(
         db,
         origin,
-        crate::hop_probe_memos::arcade_pass_rejudged(&s),
+        crate::hop_probe_memos::arcade_pass_rejudged(&s).then(|| s.reach_floor.unwrap_or(0)),
     )
     .await;
     console_log!(
@@ -825,7 +831,7 @@ pub async fn internal_reorg(
         // `reorg_from` is in the block-event pass: the CONFIRMED probe memos are cleared whether or not a pot row
         // moved (a reorg both feeds missed that orphaned only a hop sweep leaves no pot row at its height to
         // re-judge, and this route is its documented heal).
-        crate::hop_probe_memos::clear_on_reorg(db, "operator", true).await;
+        crate::hop_probe_memos::clear_on_reorg(db, "operator", Some(trigger.from_height)).await;
     }
     console_log!(
         "POST /internal/reorg {}..={} limit={} -> 200 (scanned={} standing={} demoted={} demoted_blind={} demote_missed={} faults={} errors={} drained={})",
