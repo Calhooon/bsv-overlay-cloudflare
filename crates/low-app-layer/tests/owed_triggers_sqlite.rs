@@ -1067,6 +1067,7 @@ fn fix1010_paths(f: &Fixture, b: &PotpartyRecord, result: &ResultRecord) -> Resu
             "pot2".to_string().into(),
             "rejected".to_string().into(),
             4000.into(),
+            Value::Null,
         ],
     );
     let want = marks_in("game2", "pot", "pot2:0", &["carol"]);
@@ -1464,6 +1465,7 @@ fn eviction_paths(f: &Fixture) -> Result<(), String> {
             "pot".to_string().into(),
             "rejected".to_string().into(),
             4000.into(),
+            Value::Null,
         ],
         marks("eviction", "pot", &["alice", "bob"]),
     )?;

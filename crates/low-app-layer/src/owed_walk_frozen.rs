@@ -763,7 +763,8 @@ pub(crate) mod pins {
                 rusqlite::params![
                     pot,
                     "REJECTED (arcade live REJECTED: bad script)",
-                    (NOW_MS - 60_000) as i64
+                    (NOW_MS - 60_000) as i64,
+                    Option::<&str>::None
                 ],
             )
             .unwrap();

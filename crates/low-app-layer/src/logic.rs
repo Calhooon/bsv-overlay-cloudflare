@@ -214,6 +214,9 @@ pub enum ServedEviction {
         at: i64,
         readmitted_at: Option<i64>,
         chain_word: Option<&'static str>,
+        /// bsv-low #1019: the refusal's class the ledger recorded at the write (`None`: no class), served as
+        /// `evicted.class` beside the word while open, ADDITIVE (absent when `None`).
+        refusal_class: Option<&'static str>,
     },
 }
 
@@ -233,10 +236,12 @@ impl ServedEviction {
                 at,
                 readmitted_at,
                 chain_word,
+                refusal_class,
             } => Some(overlay_discovery::pot::storage::served_eviction_value(
                 *at,
                 *readmitted_at,
                 *chain_word,
+                *refusal_class,
             )),
         }
     }
@@ -250,6 +255,8 @@ pub struct EvictionLedgerRow {
     pub readmitted_at: Option<i64>,
     /// bsv-low #621: the ledger row's `reason` (its chain word is read from it).
     pub reason: String,
+    /// bsv-low #1019: the ledger row's recorded `refusalClass` (`None`: NULL), served only as a vocabulary word.
+    pub refusal_class: Option<String>,
 }
 
 /// bsv-low E649 L6: the `/utxo-status` ledger read, one statement per chunk of DISTINCT txids. `txid IN`
@@ -287,6 +294,9 @@ pub fn attach_evictions(entries: &mut [OutpointStatus], rows: &[EvictionLedgerRo
             evicted_at: r.evicted_at,
             readmitted_at: r.readmitted_at,
             chain_word: overlay_discovery::pot::storage::eviction_chain_word(&r.reason),
+            refusal_class: overlay_discovery::pot::storage::refusal_class_word(
+                r.refusal_class.as_deref(),
+            ),
         });
         if overlay_discovery::pot::storage::open_eviction_hides_row(entry.as_ref()) {
             *e = OutpointStatus::unknown(&Outpoint {
@@ -299,6 +309,7 @@ pub fn attach_evictions(entries: &mut [OutpointStatus], rows: &[EvictionLedgerRo
                 at: r.evicted_at,
                 readmitted_at: r.readmitted_at,
                 chain_word: r.chain_word,
+                refusal_class: r.refusal_class,
             },
             None => ServedEviction::NoRow,
         };

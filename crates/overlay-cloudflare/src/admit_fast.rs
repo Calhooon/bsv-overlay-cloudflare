@@ -908,10 +908,14 @@ pub async fn shadow_move_passes(
 /// stamp nor resets the ledger; a row READMITTED BEFORE this pass's stamp is re-opened with the new stamp (the
 /// chain overruled a courier, then the network refused it again); a readmission stamped AFTER this pass's stamp
 /// (`?3`) is KEPT — the chain's word landed under the pass, which yields to it (round 2 of the gate, NEW-1).
+/// bsv-low #1019: `?4` is the refusal's class (`eviction_class::eviction_refusal_class` of `?2`, one of
+/// `REFUSAL_CLASSES` or NULL), written under the reason's own rule, so the stored class is always the stored
+/// reason's. The CLOSE never writes it: the OPEN precedes it in every production batch, with the same reason.
 /// PURE: the SQL, pinned under real SQLite below.
-pub const OPEN_EVICTION_MARKER_SQL: &str = "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved, releasedSpends) VALUES (?1, ?2, ?3, NULL, 0, '[]') \
+pub const OPEN_EVICTION_MARKER_SQL: &str = "INSERT INTO pot_evictions (txid, reason, evictedAt, readmittedAt, rowsMoved, releasedSpends, refusalClass) VALUES (?1, ?2, ?3, NULL, 0, '[]', ?4) \
      ON CONFLICT(txid) DO UPDATE SET \
      reason = CASE WHEN pot_evictions.readmittedAt IS NOT NULL AND pot_evictions.readmittedAt > ?3 THEN pot_evictions.reason ELSE excluded.reason END, \
+     refusalClass = CASE WHEN pot_evictions.readmittedAt IS NOT NULL AND pot_evictions.readmittedAt > ?3 THEN pot_evictions.refusalClass ELSE excluded.refusalClass END, \
      evictedAt = CASE WHEN pot_evictions.readmittedAt IS NULL OR pot_evictions.readmittedAt > ?3 THEN pot_evictions.evictedAt ELSE excluded.evictedAt END, \
      rowsMoved = CASE WHEN pot_evictions.readmittedAt IS NULL OR pot_evictions.readmittedAt > ?3 THEN pot_evictions.rowsMoved ELSE 0 END, \
      releasedSpends = CASE WHEN pot_evictions.readmittedAt IS NULL OR pot_evictions.readmittedAt > ?3 THEN pot_evictions.releasedSpends ELSE '[]' END, \
@@ -1492,6 +1496,8 @@ async fn evict_core_with_abort(
                 QVal::Text(txid.to_string()),
                 QVal::Text(reason.to_string()),
                 QVal::Int(now_ms as i64),
+                // bsv-low #1019: the refusal's class, as `eviction_write::open_marker` binds it
+                crate::eviction_class::eviction_refusal_class(reason).into(),
             ],
         )
         .await
@@ -4568,7 +4574,7 @@ mod tests {
         let open = |at: i64, reason: &str| {
             conn.execute(
                 OPEN_EVICTION_MARKER_SQL,
-                rusqlite::params![&pot, reason, at],
+                rusqlite::params![&pot, reason, at, Option::<&str>::None],
             )
             .unwrap()
         };
@@ -5552,7 +5558,7 @@ mod tests {
         let pot = "ab".repeat(32);
         conn.execute(
             OPEN_EVICTION_MARKER_SQL,
-            rusqlite::params![&pot, "REJECTED (a)", 1_000i64],
+            rusqlite::params![&pot, "REJECTED (a)", 1_000i64, Option::<&str>::None],
         )
         .unwrap();
         // the chain's word lands under the pass: readmittedAt 1_500 > the pass's 1_000
@@ -5577,7 +5583,7 @@ mod tests {
         // a marker with an OLDER stamp keeps the readmission AND its reason (round 3, NIT 6)
         conn.execute(
             OPEN_EVICTION_MARKER_SQL,
-            rusqlite::params![&pot, "REJECTED (late)", 1_100i64],
+            rusqlite::params![&pot, "REJECTED (late)", 1_100i64, Option::<&str>::None],
         )
         .unwrap();
         let (kept_reason, kept_at): (String, Option<i64>) = conn
@@ -5732,7 +5738,7 @@ mod tests {
         db.conn
             .execute(
                 OPEN_EVICTION_MARKER_SQL,
-                rusqlite::params![&pot, "REJECTED", 1_000i64],
+                rusqlite::params![&pot, "REJECTED", 1_000i64, Option::<&str>::None],
             )
             .unwrap();
         let pot_c = pot.clone();
@@ -5797,7 +5803,7 @@ mod tests {
         db.conn
             .execute(
                 OPEN_EVICTION_MARKER_SQL,
-                rusqlite::params![&pot, "REJECTED", 900i64],
+                rusqlite::params![&pot, "REJECTED", 900i64, Option::<&str>::None],
             )
             .unwrap();
         db.conn

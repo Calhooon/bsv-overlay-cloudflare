@@ -360,6 +360,8 @@ async fn read_eviction_ledger(
         readmitted_at: Option<f64>,
         #[serde(default)]
         reason: Option<String>,
+        #[serde(rename = "refusalClass", default)]
+        refusal_class: Option<String>,
     }
     let mut out = Vec::new();
     for chunk in txids.chunks(crate::logic::D1_CHUNK_OUTPOINTS) {
@@ -377,6 +379,7 @@ async fn read_eviction_ledger(
                 evicted_at: r.evicted_at as i64,
                 readmitted_at: r.readmitted_at.map(|v| v as i64),
                 reason: r.reason.unwrap_or_default(),
+                refusal_class: r.refusal_class,
             })),
             Err(e) => {
                 console_warn!(

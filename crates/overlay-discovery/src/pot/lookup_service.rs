@@ -682,6 +682,7 @@ impl LookupService for PotLookupService {
                         r.evicted_at,
                         r.readmitted_at,
                         r.chain_word,
+                        r.refusal_class,
                     ),
                     None => serde_json::Value::Null,
                 };
@@ -1307,6 +1308,7 @@ mod tests {
             evicted_at: 1,
             readmitted_at: None,
             chain_word: None,
+            refusal_class: None,
         };
         let closed = EvictionLedgerEntry {
             readmitted_at: Some(2),
@@ -1415,6 +1417,41 @@ mod tests {
             (serde_json::json!(false), serde_json::Value::Null)
         );
         assert!(arr[3]["networkSeen"].is_null() && arr[3]["networkSeenBy"].is_null());
+    }
+
+    /// bsv-low #1019: `ls_pot spentStatus` serves the ledger's recorded refusal class beside the word through the one
+    /// projection (`served_eviction_value`): present only when it is a word and the eviction is open; a null class
+    /// serves the three keys as before.
+    #[tokio::test]
+    async fn fix1019_spent_status_serves_the_class_beside_the_word() {
+        let (svc, storage) = make_service_with_storage();
+        let classed = "ab".repeat(32);
+        let bare = "cd".repeat(32);
+        let readmitted = "ef".repeat(32);
+        storage.serve_evictions();
+        storage.record_eviction_classed(&classed, 5, None, Some(crate::pot::storage::EVICTED_WORD), Some("missing-parent"));
+        storage.record_eviction_classed(&bare, 6, None, Some(crate::pot::storage::EVICTED_WORD), None);
+        storage.record_eviction_classed(&readmitted, 7, Some(8), None, Some("double-spend"));
+        let arr = spent_status(
+            &svc,
+            serde_json::json!([{"txid": classed, "vout": 0}, {"txid": bare, "vout": 0}, {"txid": readmitted, "vout": 0}]),
+        )
+        .await;
+        assert_eq!(
+            arr[0]["evicted"],
+            serde_json::json!({"at": 5, "word": "rejected", "readmittedAt": null, "class": "missing-parent"})
+        );
+        assert_eq!(
+            arr[1]["evicted"],
+            serde_json::json!({"at": 6, "word": "rejected", "readmittedAt": null})
+        );
+        assert_eq!(
+            arr[2]["evicted"],
+            serde_json::json!({"at": 7, "word": null, "readmittedAt": 8})
+        );
+        assert_eq!(crate::pot::storage::refusal_class_word(Some("policy")), Some("policy"));
+        assert_eq!(crate::pot::storage::refusal_class_word(Some("Policy")), None);
+        assert_eq!(crate::pot::storage::refusal_class_word(None), None);
     }
 
     /// bsv-low #621 (L5): the served eviction word is the chain word the eviction rests on: `conflicted` for the

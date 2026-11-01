@@ -49,6 +49,7 @@ fn utxo_status_word(db: &Connection, txid: &str) -> serde_json::Value {
                 evicted_at: r.get(1)?,
                 readmitted_at: r.get(2)?,
                 reason: r.get(3)?,
+                refusal_class: r.get(4)?,
             })
         })
         .unwrap()
@@ -64,13 +65,16 @@ fn utxo_status_word(db: &Connection, txid: &str) -> serde_json::Value {
 /// (`d1_discovery::evictions_for`: the reason through `eviction_chain_word`), the one projection.
 fn ls_pot_word(db: &Connection, txid: &str) -> serde_json::Value {
     let sql = overlay_discovery::pot::storage::evictions_by_txid_sql(1);
-    let (at, readmitted, reason): (i64, Option<i64>, Option<String>) = db
-        .query_row(&sql, [txid], |r| Ok((r.get(1)?, r.get(2)?, r.get(3)?)))
+    let (at, readmitted, reason, class): (i64, Option<i64>, Option<String>, Option<String>) = db
+        .query_row(&sql, [txid], |r| {
+            Ok((r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
         .unwrap();
     served_eviction_value(
         at,
         readmitted,
         eviction_chain_word(reason.as_deref().unwrap_or("")),
+        overlay_discovery::pot::storage::refusal_class_word(class.as_deref()),
     )
 }
 

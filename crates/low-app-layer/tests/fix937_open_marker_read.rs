@@ -36,7 +36,7 @@ fn pot(i: u32) -> String {
 fn open_marker(db: &Connection, txid: &str, reason: &str) {
     db.execute(
         OPEN_EVICTION_MARKER_SQL,
-        params![txid, reason, 1_760_000_000_000_i64],
+        params![txid, reason, 1_760_000_000_000_i64, Option::<&str>::None],
     )
     .unwrap();
 }
@@ -127,6 +127,7 @@ fn utxo_status(db: &Connection, ops: &[Outpoint]) -> Served {
                     evicted_at: r.get(1)?,
                     readmitted_at: r.get(2)?,
                     reason: r.get(3)?,
+                    refusal_class: r.get(4)?,
                 })
             })
             .unwrap()

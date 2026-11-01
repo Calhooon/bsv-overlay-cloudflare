@@ -652,7 +652,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// `owed_dirty_transactions_delete`, `owed_dirty_potparty_records_insert_seats`, `_update_seats`,
 /// `owed_dirty_pot_records_insert_seats`, `_update_seats`, `_delete_seats`, `owed_dirty_pot_beefs_insert_seats`, `owed_dirty_tx_words_delete`, `owed_dirty_owed_spender_bytes_delete`). Triggers only: the actor's mirror digest
 /// does not move (its DDL holds the families' tables and indexes, no trigger).
-pub const OVERLAY_MIGRATION_COUNT: usize = 493;
+/// 493 to 494 for bsv-low #1019 (FIX-1019): `pot_evictions.refusalClass`, the refusal's class the eviction's OPEN
+/// marker records at the write (`eviction_class`), read by `/utxo-status` and `ls_pot spentStatus` beside the
+/// chain word. A COLUMN of a mirrored family: the owed actor's schema digest moves (each actor rebuilds once).
+pub const OVERLAY_MIGRATION_COUNT: usize = 494;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2514,6 +2517,8 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // 492..493: the app layer's age sweeps of the words and the spender bytes the rows read.
     crate::derived_owed::write_time::WORD_DELETE,
     crate::derived_owed::write_time::SPENDER_BYTES_DELETE,
+    // 494: bsv-low #1019, the eviction's refusal class, recorded by the OPEN marker (`OPEN_EVICTION_MARKER_SQL`).
+    "ALTER TABLE pot_evictions ADD COLUMN refusalClass TEXT",
 ];
 
 // =============================================================================
