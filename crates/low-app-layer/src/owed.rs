@@ -451,6 +451,52 @@ pub struct HopChainWord {
     pub predates_tip: bool,
 }
 
+/// FIX-1041 (bsv-low #1041): PURE, THE CHAIN RUNG'S UNSPENT WORD AT AN INSTANT, from the memo's age at that instant:
+/// `unspent-stale` when the age is outside the fresh window (`hops_view::PROBE_MEMO_MAX_AGE_MS`, the window the judge's
+/// split reads an unspent memo by, `split_probe_targets_at_tip`: at or past it, or a memo from the future), else
+/// `unspent`; no age (a probe made this judgement, the belt's find) is `unspent`. The suffix is a CLOCK fact (the
+/// memo's age against a `now`), so it is derived wherever a `now` is: the judge's own word below, and the read's
+/// ([`age_unspent_probe_at_read`]) over the stored age advanced to the read, so a stored row serves what the judge
+/// would serve at the read's instant.
+pub fn unspent_chain_probe(age_ms: Option<i64>) -> &'static str {
+    match age_ms {
+        Some(age) if !(0..crate::hops_view::PROBE_MEMO_MAX_AGE_MS).contains(&age) => {
+            "unspent-stale"
+        }
+        _ => "unspent",
+    }
+}
+
+/// FIX-1041 (bsv-low #1041): PURE, a stored row's unspent chain word AT THE READ. A row whose `chainProbe` is the
+/// rung's unspent word (`unspent` or `unspent-stale`) and whose judgement time is known (`judgedAtMs`, the stored
+/// row's column) is served `chainProbeAgeMs` advanced to the read (the stored age, `0` when the judge's word carried
+/// none, plus `read_at_ms - judged_at_ms`, never negative) and the word [`unspent_chain_probe`] of that age: the time
+/// facts derived at the read, never frozen at the apply. A row with no judgement time, or a read with no instant
+/// (`None`: the fallback copy, a pin that names none), is served as stored. Every other word is untouched.
+pub fn age_unspent_probe_at_read(
+    facts: &mut Value,
+    judged_at_ms: Option<u64>,
+    read_at_ms: Option<u64>,
+) {
+    if !matches!(
+        facts["chainProbe"].as_str(),
+        Some("unspent" | "unspent-stale")
+    ) {
+        return;
+    }
+    let (Some(judged), Some(read)) = (judged_at_ms, read_at_ms) else {
+        return;
+    };
+    let stored = facts["chainProbeAgeMs"]
+        .as_i64()
+        .or_else(|| facts["chainProbeAgeMs"].as_f64().map(|f| f as i64))
+        .unwrap_or(0);
+    let elapsed = i64::try_from(read.saturating_sub(judged)).unwrap_or(i64::MAX);
+    let age = stored.saturating_add(elapsed);
+    facts["chainProbeAgeMs"] = json!(age);
+    facts["chainProbe"] = json!(unspent_chain_probe(Some(age)));
+}
+
 /// A VALID filed refund for one pot (`potrefund_records.refundValid = 1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidRefund {
@@ -2594,8 +2640,8 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                     Some(w) if w.looked && w.spent == Some(false) && !w.predates_tip => {
                         facts["claim"] = json!("sweep-hop");
                         facts["claimable"] = json!(true);
-                        facts["chainProbe"] =
-                            json!(if w.stale { "unspent-stale" } else { "unspent" });
+                        // FIX-1041: the suffix from the word's age, by the one function the read derives it with
+                        facts["chainProbe"] = json!(unspent_chain_probe(w.age_ms));
                         if let Some(age) = w.age_ms {
                             facts["chainProbeAgeMs"] = json!(age);
                         }

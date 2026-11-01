@@ -18238,3 +18238,214 @@ mod fix1027 {
         );
     }
 }
+
+// ---- FIX-1041 (bsv-low #1041, the fleet compare's revolutions 146 and 147): the stale suffix is a clock fact ----
+
+mod fix1041 {
+    use super::*;
+    use crate::hops_view::PROBE_MEMO_MAX_AGE_MS;
+
+    const HOP: &str = "b410000000000000000000000000000000000000000000000000000000000000";
+    /// The memo's age at the judges' first judgement (`NOW_MS`): inside the fresh window.
+    const AGE_AT_JUDGE: i64 = 60_000;
+
+    /// A stranded hop the index holds unspent, its verified marker four hours old, and the chain rung's UNSPENT memo
+    /// taken [`AGE_AT_JUDGE`] before `NOW_MS` at the judges' tip (beta's row: `unspent`, claimable, one outpoint).
+    fn fixture() -> Fixture {
+        let made = (NOW_MS / 1000) as i64 - 4 * 3_600;
+        let probed = NOW_MS as i64 - AGE_AT_JUDGE;
+        Fixture {
+            name: "fix1041 unspent memo",
+            seed: vec![
+                format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{HOP}',0,0,{made},'p2pkh')"),
+                format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('owner','other','{}',0,20190,'seat','00','00',2,'{HOP}',1,{made},1)", h("9e", 1)),
+                format!("INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES ('{HOP}.0',{probed},0,NULL,NULL,{TIP})"),
+            ],
+            identities: vec!["owner".into()],
+        }
+    }
+
+    fn rows(db: &SqliteSql) -> Vec<Value> {
+        db.conn.prepare("SELECT json_object('outpoint',outpoint,'family',family,'gameId',gameId,'sats',sats,'opponentIdentity',opponentIdentity,'atHeight',atHeight,'reason',reason,'facts',facts,'claimable',claimable) FROM owed_rows WHERE identity='owner' ORDER BY outpoint").unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap().map(|s| serde_json::from_str::<Value>(&s.unwrap()).unwrap()).collect()
+    }
+
+    /// The D1 judge FRESH at `at`: every game of the identity judged at that instant.
+    async fn d1_fresh_at(d1: &SqliteSql, at: u64) {
+        d1.now.set(at);
+        for chunk in games_of(d1, "owner").chunks(16) {
+            crate::owed_judge::judge_subjects(d1, "owner", chunk, "d1")
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Both judges at `NOW_MS` (the memo fresh), then the D1 side's record and clock only move on.
+    async fn judged() -> WithActor {
+        let d1 = d1_judge(&fixture()).await;
+        let (actor, _) = actor_judge(&d1, "owner").await;
+        WithActor {
+            d1,
+            actor,
+            d1_judges: true,
+            event: None,
+            actor_reads: true,
+            actor_fails: Cell::new(false),
+        }
+    }
+
+    fn hop_row(body: &Value) -> Value {
+        body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["outpoint"] == format!("{HOP}:0"))
+            .cloned()
+            .unwrap_or_else(|| panic!("no hop row: {body}"))
+    }
+
+    /// The served `/owed` body as the route builds it at `read_at`: the actor's rows (`read_snapshot_with`) or D1's
+    /// (`owed_read::read`), the read's instant stamped as `routes::owed` stamps it.
+    fn served_at(w: &WithActor, by_actor: bool, read_at: u64) -> Value {
+        let mut snapshot = if by_actor {
+            match futures_executor_block(crate::owed_actor::object::read_snapshot_with(
+                w,
+                &fixture_actor(w, true),
+                "owner",
+            ))
+            .unwrap()
+            {
+                crate::owed_actor::object::ActorRead::Rows(s) => s,
+                other => panic!("the actor's rows are not served: {other:?}"),
+            }
+        } else {
+            futures_executor_block(crate::owed_read::read(&w.d1, "owner")).unwrap()
+        };
+        snapshot.read_at_ms = Some(read_at);
+        snapshot.body("owner", Some(TIP), &BTreeMap::new()).unwrap()
+    }
+
+    /// (fix1041_a) THE COMPARE OVER THE CLOCK: the actor's stored row judged at `NOW_MS` (`unspent`, the memo 60 s old)
+    /// against a FRESH D1 judgement one second past the window (`unspent-stale`): the same judgement, no diff. RED on
+    /// 9dff935b: `chainProbe` differs, the outpoint named.
+    #[tokio::test]
+    async fn fix1041_a_the_compare_reads_the_stale_suffix_as_the_clock() {
+        let w = judged().await;
+        let key = format!("{HOP}:0");
+        let actor = rows(&w.actor);
+        let a = actor
+            .iter()
+            .find(|r| r["outpoint"] == key.as_str())
+            .unwrap();
+        let af: Value = serde_json::from_str(a["facts"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            (af["chainProbe"].clone(), a["claimable"].clone()),
+            (json!("unspent"), json!(1)),
+            "{a}"
+        );
+        let past = NOW_MS + (PROBE_MEMO_MAX_AGE_MS - AGE_AT_JUDGE) as u64 + 1_000;
+        d1_fresh_at(&w.d1, past).await;
+        let d1 = rows(&w.d1);
+        let d = d1.iter().find(|r| r["outpoint"] == key.as_str()).unwrap();
+        let df: Value = serde_json::from_str(d["facts"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            (df["chainProbe"].clone(), d["claimable"].clone()),
+            (json!("unspent-stale"), json!(1)),
+            "the fresh D1 judgement past the window: {d}"
+        );
+        assert_eq!(
+            diff_rows(&d1, &actor),
+            Vec::<String>::new(),
+            "the suffix is the clock, not the judgement"
+        );
+        // the base word is still compared: an `unspent` against a `spent` stays a diff
+        let mut spent = actor.clone();
+        for r in &mut spent {
+            if r["outpoint"] == key.as_str() {
+                let mut f: Value = serde_json::from_str(r["facts"].as_str().unwrap()).unwrap();
+                f["chainProbe"] = json!("spent");
+                r["facts"] = json!(f.to_string());
+            }
+        }
+        assert_eq!(diff_rows(&d1, &spent), vec![key]);
+    }
+
+    /// (fix1041_b) THE ACTOR'S READ AT THAT INSTANT serves the word the D1 judge serves: `unspent-stale`, the age
+    /// advanced to the read (the stored 60 s plus the 241 s since the judgement). RED on 9dff935b (the read stamp grafted
+    /// inert): `unspent`, the age frozen at 60,000.
+    #[tokio::test]
+    async fn fix1041_b_the_actors_read_serves_the_word_at_the_read() {
+        let w = judged().await;
+        let past = NOW_MS + (PROBE_MEMO_MAX_AGE_MS - AGE_AT_JUDGE) as u64 + 1_000;
+        let row = hop_row(&served_at(&w, true, past));
+        assert_eq!(
+            (
+                row["facts"]["chainProbe"].clone(),
+                row["facts"]["chainProbeAgeMs"].clone(),
+                row["facts"]["claimable"].clone()
+            ),
+            (
+                json!("unspent-stale"),
+                json!(PROBE_MEMO_MAX_AGE_MS + 1_000),
+                json!(true)
+            ),
+            "{row}"
+        );
+        // with no read instant the row is served as stored
+        let mut snapshot = match futures_executor_block(
+            crate::owed_actor::object::read_snapshot_with(&w, &fixture_actor(&w, true), "owner"),
+        )
+        .unwrap()
+        {
+            crate::owed_actor::object::ActorRead::Rows(s) => s,
+            other => panic!("{other:?}"),
+        };
+        snapshot.read_at_ms = None;
+        let stored = hop_row(&snapshot.body("owner", Some(TIP), &BTreeMap::new()).unwrap());
+        assert_eq!(
+            (
+                stored["facts"]["chainProbe"].clone(),
+                stored["facts"]["chainProbeAgeMs"].clone()
+            ),
+            (json!("unspent"), json!(AGE_AT_JUDGE))
+        );
+        // the route stamps the read's instant
+        let routes = include_str!("../routes.rs");
+        let owed = &routes[routes.find("pub async fn owed(").unwrap()..];
+        let owed = &owed[..owed.find("\n}\n").unwrap()];
+        assert!(
+            owed.contains("snapshot.read_at_ms = Some(worker::Date::now().as_millis());"),
+            "the route stamps the read's instant"
+        );
+    }
+
+    /// (fix1041_c) THE DIFFERENTIAL: at three instants (the memo fresh, exactly at the window, past it), the D1 judge
+    /// FRESH at that instant and the actor's read (judged once, at `NOW_MS`) at that instant serve the hop's row field
+    /// for field, and the D1 judge's own read at the instant serves the same. Set aside, stated: `ageMs` (the hop's own
+    /// age), frozen at the actor's judgement (the same rule's next fact, not this lane's). RED on 9dff935b (the read
+    /// stamp grafted inert): at the window and past it the actor serves `unspent` and the judgement's age.
+    #[tokio::test]
+    async fn fix1041_c_both_judges_serve_the_same_row_at_each_instant() {
+        let w = judged().await;
+        let window = (PROBE_MEMO_MAX_AGE_MS - AGE_AT_JUDGE) as u64;
+        let mut words = Vec::new();
+        for at in [NOW_MS + 10_000, NOW_MS + window, NOW_MS + window + 1_000] {
+            d1_fresh_at(&w.d1, at).await;
+            let strip = |mut r: Value| {
+                r["facts"].as_object_mut().unwrap().remove("ageMs");
+                r
+            };
+            let by_d1 = strip(hop_row(&served_at(&w, false, at)));
+            let by_actor = strip(hop_row(&served_at(&w, true, at)));
+            assert_eq!(by_actor, by_d1, "at {at}");
+            words.push(by_actor["facts"]["chainProbe"].clone());
+        }
+        assert_eq!(
+            words,
+            vec![
+                json!("unspent"),
+                json!("unspent-stale"),
+                json!("unspent-stale")
+            ]
+        );
+    }
+}

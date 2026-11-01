@@ -4162,6 +4162,12 @@ pub const ROWS_SQL: &str = "SELECT identity,outpoint,family,gameId,sats,opponent
 /// D2-ACTOR-B-FOLD-11 (bsv-low #957 item 2): `tip`, the judge's input tip `owed.rs` writes into several families' facts,
 /// is the judgement's clock too (the verdict a tip moves is compared apart: `claimable`, `blocksToGate`, `tipUnknown`).
 pub const CLOCK_FACTS: [&str; 5] = ["ageMs", "chainProbeAgeMs", "beltNextAtMs", "asOfMs", "tip"];
+/// FIX-1041 (bsv-low #1041): the CLOCK SUFFIXES of a stored word, `(fact, suffix)`: `chainProbe`'s `-stale` is the
+/// memo's age past the fresh window (`owed::unspent_chain_probe`), derived from `chainProbeAgeMs` and the judge's
+/// `now`, so a row judged while the memo was fresh and one judged after it aged are one judgement. The word is
+/// compared without the suffix (`unspent` against `unspent`); the base word, `claimable` and every other fact still
+/// compared.
+pub const CLOCK_SUFFIXES: [(&str, &str); 1] = [("chainProbe", "-stale")];
 /// FIX-963 (bsv-low #963): the OBSERVATION STAMPS inside a stored fact, `(fact, key)`: the instant a word was seen,
 /// not the word. `spenderPresence.at` is the one a stored row carries: `routes::mark_pending_spender` takes the
 /// answer's `observed_at_ms`, else the judge's own `now_ms` less `chainProbeAgeMs`, and with no probe age (an
@@ -4182,6 +4188,16 @@ pub fn compared_facts(row: &Value) -> Value {
         for (fact, k) in STAMP_FACTS {
             if let Some(o) = m.get_mut(fact).and_then(Value::as_object_mut) {
                 o.remove(k);
+            }
+        }
+        for (fact, suffix) in CLOCK_SUFFIXES {
+            let base = m
+                .get(fact)
+                .and_then(Value::as_str)
+                .and_then(|w| w.strip_suffix(suffix))
+                .map(str::to_owned);
+            if let Some(base) = base {
+                m.insert(fact.into(), json!(base));
             }
         }
     }

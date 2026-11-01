@@ -72,6 +72,10 @@ pub struct Snapshot {
     pub covered_exact: BTreeMap<String, std::collections::BTreeSet<i64>>,
     /// bsv-low #1004: every pending mark an event carries (`PENDING_SQL`'s `framed`): its game and generation.
     pub framed: Vec<(String, i64)>,
+    /// FIX-1041 (bsv-low #1041): the READ's instant (the route's clock). With it each row's unspent chain word and its
+    /// age are served as of the read (`owed::age_unspent_probe_at_read` over the row's `judgedAtMs`); `None` serves
+    /// the stored facts as stored (the display copy, a snapshot no route stamped).
+    pub read_at_ms: Option<u64>,
 }
 
 fn number(value: &Value) -> Option<u64> {
@@ -185,6 +189,7 @@ pub async fn read_with(db: &impl SqlPort, identity: &str, rows: bool) -> Result<
         covered: BTreeMap::new(),
         covered_exact: BTreeMap::new(),
         framed,
+        read_at_ms: None,
     };
     if snapshot.state.is_none() {
         snapshot.joined.clear();
@@ -360,6 +365,13 @@ impl Snapshot {
                 // bsv-low #893 section 5: the belt's next look at this row, as the judge or the belt dated it (null:
                 // the index or a checked word decides the row, nothing is owed the chain).
                 object.insert("beltNextAtMs".into(), json!(number(&joined["beltDueAtMs"])));
+                // FIX-1041 (bsv-low #1041): the chain word's age and its `-stale` suffix are clock facts: derived at
+                // the read from the stored age and the row's judgement time, both judges' rows alike.
+                owed::age_unspent_probe_at_read(
+                    &mut facts,
+                    number(&joined["judgedAtMs"]),
+                    self.read_at_ms,
+                );
                 // bsv-low #669 (the D2-OWED lens's HIGH-1): the read-time freshness gate, per row. A claimable sweep
                 // rests on the tip it was judged at (`probeTip`; NULL is unknown); a block since, or a present tip that
                 // cannot be read, degrades it IN THE SERVED BODY to a pending chain-wait, never a dead sweep.
