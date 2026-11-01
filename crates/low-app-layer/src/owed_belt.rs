@@ -157,6 +157,8 @@ pub const COUNTER_TICKS: &str = "owed_belt_ticks_total";
 pub const COUNTER_ASKED: &str = "owed_belt_asked_total";
 pub const COUNTER_FOUND: &str = "owed_belt_found_total";
 pub const COUNTER_DUE: &str = "owed_belt_due_total";
+/// FIX-1027-FOLD-1: the outpoints the operator's re-ask lever ([`reask`]) asked.
+pub const COUNTER_REASKED: &str = "owed_belt_reasked_total";
 pub fn fault_counter(rung: usize) -> String {
     format!(
         "owed_belt_faults_{}_total",
@@ -172,6 +174,7 @@ pub fn counter_names() -> Vec<String> {
         COUNTER_DUE.to_owned(),
     ];
     v.extend((0..RUNGS.len()).map(fault_counter));
+    v.push(COUNTER_REASKED.to_owned());
     v
 }
 
@@ -1092,6 +1095,250 @@ async fn rearm_ask(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut Tick
     }
 }
 
+/// FIX-1027-FOLD-1 (bsv-low #1027, the captain's item 1b): the re-ask lever's bound, one tick's outpoints a call (the
+/// gate's 24 courier calls and 3 an outpoint bound the calls, as the tick's).
+pub const OWED_BELT_REASK_MAX: usize = OWED_BELT_OUTPOINTS_PER_TICK;
+
+/// The game a hop belongs to for the identity: its hop marker, else the eviction's released evidence (a hop whose
+/// game no source names is not asked). Binds: identity, hop txid, vout.
+pub const REASK_GAME_SQL: &str = "SELECT gameId FROM hopparty_records WHERE txid=?2 AND hopVout=?3 AND identity=?1 UNION ALL SELECT gameId FROM released_hop_evidence WHERE hopTxid=?2 AND hopVout=?3 AND identity=?1 LIMIT 1";
+
+/// What one re-ask call did: the tick's report over the named outpoints, and the ones it could not ask.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReaskReport {
+    pub tick: TickReport,
+    /// `(identity, outpoint, why)`: past the bound, not an outpoint, no game named, the game read faulted.
+    pub skipped: Vec<(String, String, String)>,
+}
+
+/// FIX-1027-FOLD-1: THE RE-ASK OF NAMED HOP OUTPOINTS. The evidence a reorg clear DELETED before #1027 (beta's cron
+/// clear of 2026-10-31 14:01:48Z, 101 rows, unmarked on 99e456a6) is asked by nothing: in Phase C the belt reads the
+/// actors' published asks, and an actor that judged the spend `spent-elsewhere` (or retired the hop's payout) dates no
+/// look. This pass asks each named `(identity, outpoint)` its OUTPOINT, at most [`OWED_BELT_REASK_MAX`] a call through
+/// one [`Gate`], and writes each answer exactly as the tick does ([`ask_one`]): a spend found is the #953 evidence row,
+/// the memo, the spender's bytes and the `hop` mark, handed back to the actor (Phase C) or judged in the batch (A, B);
+/// an unspent answer retires the evidence. Asks nothing without a chain tip. The operator's road: page the fleet
+/// compare's `diffs[].outpoints` into `POST /internal/owed-belt-reask`, then read the compare again.
+pub async fn reask<C: Courier>(
+    db: &impl JudgeDb,
+    courier: &C,
+    asks: &[(String, String)],
+) -> Result<ReaskReport, String> {
+    let now = db.now_ms() as i64;
+    let mut out = ReaskReport::default();
+    if db.tip().is_none() {
+        out.tick.no_tip = true;
+        db.log("[owed-belt] re-ask: no chain tip, nothing asked");
+        return Ok(out);
+    }
+    let phase_c = !db.d1_judges();
+    let gate = Gate::new(courier);
+    for (n, (identity, outpoint)) in asks.iter().enumerate() {
+        let skip = |why: &str| (identity.clone(), outpoint.clone(), why.to_owned());
+        if n >= OWED_BELT_REASK_MAX {
+            out.skipped.push(skip("past the call's bound"));
+            continue;
+        }
+        let Some((txid, vout)) = split_outpoint(outpoint) else {
+            out.skipped.push(skip("not an outpoint"));
+            continue;
+        };
+        let identity = identity.to_ascii_lowercase();
+        let game = match db
+            .run_batch(vec![Stmt {
+                sql: REASK_GAME_SQL.into(),
+                binds: vec![
+                    Bind::Text(identity.clone()),
+                    Bind::Text(txid.clone()),
+                    Bind::Int(i64::from(vout)),
+                ],
+            }])
+            .await
+        {
+            Ok(o) => o
+                .into_iter()
+                .next()
+                .and_then(|o| o.rows.into_iter().next())
+                .and_then(|r| r["gameId"].as_str().map(str::to_owned)),
+            Err(e) => {
+                out.skipped
+                    .push(skip(&format!("the game read faulted: {e}")));
+                continue;
+            }
+        };
+        let Some(game_id) = game else {
+            out.skipped
+                .push(skip("no hop marker or released evidence names it"));
+            continue;
+        };
+        if gate.spent() {
+            out.tick.left += 1;
+            continue;
+        }
+        // An Outpoint ask (`ask_of`'s default arm), whatever the stored row says: the record lost the evidence the
+        // stored row was judged on, so only the outpoint's spend can restore it.
+        let c = Candidate {
+            identity,
+            outpoint: owed::outpoint_key(&txid, vout),
+            game_id,
+            family: "hop-stranded".into(),
+            facts: Value::Object(Default::default()),
+            claimable: None,
+            reason: None,
+            probe_tip: None,
+            due_at_ms: None,
+            judged_at_ms: None,
+        };
+        out.tick.candidates += 1;
+        ask_one(db, &gate, &c, now, phase_c, &mut out.tick).await;
+    }
+    let state = gate.state.borrow().clone();
+    out.tick.calls = state.tick_calls;
+    out.tick.faults = state.fault_counts;
+    let mut deltas = vec![
+        (COUNTER_REASKED.to_owned(), out.tick.asked as u64),
+        (COUNTER_FOUND.to_owned(), out.tick.found as u64),
+    ];
+    if out.tick.handed_back > 0 {
+        deltas.push((
+            crate::owed_actor::COUNTERS[9].to_owned(),
+            out.tick.handed_back as u64,
+        ));
+    }
+    for (rung, n) in out.tick.faults.iter().enumerate() {
+        if *n > 0 {
+            deltas.push((fault_counter(rung), *n));
+        }
+    }
+    db.counters(deltas).await;
+    db.log(&format!(
+        "[owed-belt] re-ask: candidates={} asked={} found={} skipped={} left={} calls={} faults={:?} write_faults={}",
+        out.tick.candidates,
+        out.tick.asked,
+        out.tick.found,
+        out.skipped.len(),
+        out.tick.left,
+        out.tick.calls,
+        out.tick.faults,
+        out.tick.write_faults.len()
+    ));
+    Ok(out)
+}
+
+/// One candidate's ask and what its answer writes, as the tick runs it (and the re-ask lever, FIX-1027-FOLD-1): the
+/// ask through the gate, then per phase the find written and handed back (C), the actor then the D1 judge (B), or the
+/// D1 judge with the find in its batch (A); an unanswered ask re-armed.
+async fn ask_one<C: Courier>(
+    db: &impl JudgeDb,
+    gate: &Gate<'_, C>,
+    c: &Candidate,
+    now: i64,
+    asks: bool,
+    report: &mut TickReport,
+) {
+    gate.begin_outpoint();
+    let before = gate.state.borrow().tick_calls;
+    let found = ask(db, gate, c, now).await;
+    // FIX-1018 (bsv-low #1018): the belt ASKED this outpoint, so its find's judge (the D1 judge's, and the actor's
+    // through the hand-back's `beltAsked`) dates it fresh; every other dated row keeps its earlier date.
+    let _asked = owed_judge::belt_asked_scope(&c.identity, std::slice::from_ref(&c.outpoint));
+    if gate.state.borrow().tick_calls > before {
+        report.asked += 1;
+    }
+    let subject = Subject {
+        identity: c.identity.clone(),
+        game_id: c.game_id.clone(),
+    };
+    if asks {
+        match found {
+            Ok(Some(find)) => ask_find(db, c, &find, now, report).await,
+            Ok(None) => rearm_ask(db, c, now, report).await,
+            Err(e) => {
+                db.log(&format!("[owed-belt] {} ask faulted: {e}", c.outpoint));
+                report.write_faults.push((c.outpoint.clone(), e));
+                rearm_ask(db, c, now, report).await;
+            }
+        }
+        return;
+    }
+    match found {
+        // Phase B (the D2-ACTOR-B lens's HIGH-3): the find's facts land alone, the actor applies them, and only
+        // then the D1 judge (whose batch acknowledges the marks the facts wrote): an actor fault keeps them, so
+        // the read withholds the game's presses and the sweep re-publishes the pair.
+        Ok(Some(find)) if db.actor_reads() => {
+            match phase_b_find(db, c, &subject, &find, now).await {
+                Ok(()) => {
+                    report.found += 1;
+                    report.handed_back += 1;
+                    backoff(db, c, now, report).await;
+                }
+                Err(e) => {
+                    db.log(&format!("[owed-belt] {} find faulted: {e}", c.outpoint));
+                    report.write_faults.push((c.outpoint.clone(), e));
+                    rearm(db, c, now, report).await;
+                }
+            }
+        }
+        Ok(Some(find)) => {
+            let writes = find.statements(now);
+            let identity = c.identity.clone();
+            // bsv-low #953: the D1 judge reads the find in this batch, so it acknowledges the find's own mark
+            // here (D-H1 (c): nothing left dirty); the actor is called directly below. In Phase C (no D1 judge)
+            // the mark stands for the consumer to carry to the actor.
+            let owned = find.owned_mark();
+            let judged =
+                owed_judge::judge_with_write(db, &[subject], "belt", writes, &owned, |inputs| {
+                    for i in inputs.iter_mut().filter(|i| i.identity == identity) {
+                        find.apply(i);
+                    }
+                    Ok(())
+                })
+                .await;
+            match judged {
+                Ok(_) => {
+                    report.found += 1;
+                    find.note();
+                    // Phase A: the find reaches the actor too (it was judged only in D1 and re-published by
+                    // the sweep); its fault is counted, never the find's.
+                    match db
+                        .actor_apply(&c.identity, std::slice::from_ref(&c.game_id), "belt-find")
+                        .await
+                    {
+                        Ok(Some(answer)) => {
+                            report.handed_back += 1;
+                            crate::owed_actor::note_answer(&answer);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            db.counters(vec![(crate::owed_actor::COUNTERS[2].into(), 1)])
+                                .await;
+                            db.log(&format!(
+                                "[owed-actor] FAULT {} (belt-find): {e}",
+                                c.identity
+                            ));
+                        }
+                    }
+                    backoff(db, c, now, report).await;
+                }
+                Err(e) => {
+                    db.log(&format!(
+                        "[owed-belt] {} find's write faulted: {e}",
+                        c.outpoint
+                    ));
+                    report.write_faults.push((c.outpoint.clone(), e));
+                    rearm(db, c, now, report).await;
+                }
+            }
+        }
+        Ok(None) => rearm(db, c, now, report).await,
+        Err(e) => {
+            db.log(&format!("[owed-belt] {} ask faulted: {e}", c.outpoint));
+            report.write_faults.push((c.outpoint.clone(), e));
+            rearm(db, c, now, report).await;
+        }
+    }
+}
+
 pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickReport, String> {
     let now = db.now_ms() as i64;
     // Without a chain tip a find's memo carries no tip and its judgement withholds every tip-dependent claim (TIP-877),
@@ -1124,111 +1371,8 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
             report.left += 1;
             continue;
         }
-        gate.begin_outpoint();
-        let before = gate.state.borrow().tick_calls;
-        let found = ask(db, &gate, &c, now).await;
-        // FIX-1018 (bsv-low #1018): the belt ASKED this outpoint, so its find's judge (the D1 judge's, and the actor's
-        // through the hand-back's `beltAsked`) dates it fresh; every other dated row keeps its earlier date.
-        let _asked = owed_judge::belt_asked_scope(&c.identity, std::slice::from_ref(&c.outpoint));
-        if gate.state.borrow().tick_calls > before {
-            report.asked += 1;
-        }
         cursor = Some(c.outpoint.clone());
-        let subject = Subject {
-            identity: c.identity.clone(),
-            game_id: c.game_id.clone(),
-        };
-        if asks {
-            match found {
-                Ok(Some(find)) => ask_find(db, &c, &find, now, &mut report).await,
-                Ok(None) => rearm_ask(db, &c, now, &mut report).await,
-                Err(e) => {
-                    db.log(&format!("[owed-belt] {} ask faulted: {e}", c.outpoint));
-                    report.write_faults.push((c.outpoint.clone(), e));
-                    rearm_ask(db, &c, now, &mut report).await;
-                }
-            }
-            continue;
-        }
-        match found {
-            // Phase B (the D2-ACTOR-B lens's HIGH-3): the find's facts land alone, the actor applies them, and only
-            // then the D1 judge (whose batch acknowledges the marks the facts wrote): an actor fault keeps them, so
-            // the read withholds the game's presses and the sweep re-publishes the pair.
-            Ok(Some(find)) if db.actor_reads() => {
-                match phase_b_find(db, &c, &subject, &find, now).await {
-                    Ok(()) => {
-                        report.found += 1;
-                        report.handed_back += 1;
-                        backoff(db, &c, now, &mut report).await;
-                    }
-                    Err(e) => {
-                        db.log(&format!("[owed-belt] {} find faulted: {e}", c.outpoint));
-                        report.write_faults.push((c.outpoint.clone(), e));
-                        rearm(db, &c, now, &mut report).await;
-                    }
-                }
-            }
-            Ok(Some(find)) => {
-                let writes = find.statements(now);
-                let identity = c.identity.clone();
-                // bsv-low #953: the D1 judge reads the find in this batch, so it acknowledges the find's own mark
-                // here (D-H1 (c): nothing left dirty); the actor is called directly below. In Phase C (no D1 judge)
-                // the mark stands for the consumer to carry to the actor.
-                let owned = find.owned_mark();
-                let judged = owed_judge::judge_with_write(
-                    db,
-                    &[subject],
-                    "belt",
-                    writes,
-                    &owned,
-                    |inputs| {
-                        for i in inputs.iter_mut().filter(|i| i.identity == identity) {
-                            find.apply(i);
-                        }
-                        Ok(())
-                    },
-                )
-                .await;
-                match judged {
-                    Ok(_) => {
-                        report.found += 1;
-                        find.note();
-                        // Phase A: the find reaches the actor too (it was judged only in D1 and re-published by
-                        // the sweep); its fault is counted, never the find's.
-                        match db
-                            .actor_apply(&c.identity, std::slice::from_ref(&c.game_id), "belt-find")
-                            .await
-                        {
-                            Ok(Some(answer)) => {
-                                report.handed_back += 1;
-                                crate::owed_actor::note_answer(&answer);
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                db.counters(vec![(crate::owed_actor::COUNTERS[2].into(), 1)])
-                                    .await;
-                                db.log(&format!(
-                                    "[owed-actor] FAULT {} (belt-find): {e}",
-                                    c.identity
-                                ));
-                            }
-                        }
-                        backoff(db, &c, now, &mut report).await;
-                    }
-                    Err(e) => {
-                        db.log(&format!("[owed-belt] {} find's write faulted: {e}", c.outpoint));
-                        report.write_faults.push((c.outpoint.clone(), e));
-                        rearm(db, &c, now, &mut report).await;
-                    }
-                }
-            }
-            Ok(None) => rearm(db, &c, now, &mut report).await,
-            Err(e) => {
-                db.log(&format!("[owed-belt] {} ask faulted: {e}", c.outpoint));
-                report.write_faults.push((c.outpoint.clone(), e));
-                rearm(db, &c, now, &mut report).await;
-            }
-        }
+        ask_one(db, &gate, &c, now, asks, &mut report).await;
     }
     let state = gate.state.borrow().clone();
     report.calls = state.tick_calls;
@@ -1363,7 +1507,10 @@ async fn backoff(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickRe
         .await
     {
         Ok(_) => report.backed_off += 1,
-        Err(e) => db.log(&format!("[owed-belt] backoff of {} faulted: {e}", c.outpoint)),
+        Err(e) => db.log(&format!(
+            "[owed-belt] backoff of {} faulted: {e}",
+            c.outpoint
+        )),
     }
 }
 
@@ -1455,7 +1602,9 @@ pub async fn drain(env: &worker::Env) -> worker::Result<()> {
         .await?;
     if response.status_code() != 200 {
         return Err(worker::Error::RustError(format!(
-            "owed drain refused ({}): {}", response.status_code(), response.text().await?
+            "owed drain refused ({}): {}",
+            response.status_code(),
+            response.text().await?
         )));
     }
     Ok(())
@@ -1470,10 +1619,16 @@ pub async fn drain_env(
     let deadline = crate::routes::worker_deadline(OWED_DRAIN_WALL_MS, OWED_DRAIN_RESERVE_MS);
     let work = async {
         crate::schema::ensure_latch_columns(env).await;
-        let tip = crate::routes::chaintracks_present_height_env(env, "owed").await.ok();
-        let judge = owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))?;
+        let tip = crate::routes::chaintracks_present_height_env(env, "owed")
+            .await
+            .ok();
+        let judge =
+            owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env))?;
         if repair_age {
-            if let Err(error) = crate::owed_backfill::mark_aged_in(&judge, owed_judge::JudgeDb::d1_judges(&judge)).await {
+            if let Err(error) =
+                crate::owed_backfill::mark_aged_in(&judge, owed_judge::JudgeDb::d1_judges(&judge))
+                    .await
+            {
                 worker::console_warn!("[owed] age re-mark deferred: {error}");
             }
         }
@@ -1491,7 +1646,8 @@ pub async fn drain_env(
             });
         }
         owed_judge::drain_dirty(&judge, owed_judge::OWED_DIRTY_SUBJECTS_PER_PASS)
-            .await.map_err(worker::Error::RustError)
+            .await
+            .map_err(worker::Error::RustError)
     };
     let result = deadline.run_reserving(work).await;
     // Outside the judge's wall: even a timed-out drain must publish its remaining backlog.
@@ -1503,7 +1659,10 @@ pub async fn drain_env(
     match result {
         Some(Ok(report)) => {
             for (_, error) in &report.faults {
-                worker::console_warn!("[owed] {} judgement deferred: {error}", if repair_age { "scheduled" } else { "alarm" });
+                worker::console_warn!(
+                    "[owed] {} judgement deferred: {error}",
+                    if repair_age { "scheduled" } else { "alarm" }
+                );
             }
             Ok(report)
         }
@@ -1593,7 +1752,10 @@ pub async fn alarm_env(
         }
     };
     let walls = meter.task_done().expect("one alarm task");
-    worker::console_log!("{}", walls.line().replace("[scheduled-pass]", "[owed-alarm]"));
+    worker::console_log!(
+        "{}",
+        walls.line().replace("[scheduled-pass]", "[owed-alarm]")
+    );
     worker::Response::from_json(&serde_json::json!({
         "drain": drain, "tick": tick, "d1Rejudge": rejudge, "reconcile": reconcile,
         "wallMs": walls.wall_ms(),
@@ -1658,6 +1820,72 @@ pub async fn d1_rejudge_env(
     .await
 }
 
+/// FIX-1027-FOLD-1: `POST /internal/owed-belt-reask` (bearer `INTERNAL_TOKEN`), body
+/// `{"asks": [{"identity": "<66 hex>", "outpoint": "<txid>:<vout>"}, ...]}`, 1 to [`OWED_BELT_REASK_MAX`] entries (more
+/// is a 400, not clamped): one bounded [`reask`] pass, its finds published and called directly as the tick's are.
+pub async fn reask_lever(
+    mut req: worker::Request,
+    env: &worker::Env,
+) -> worker::Result<worker::Response> {
+    if !crate::internal_events::internal_bearer_ok(&req, env) {
+        return worker::Response::error("unauthorized", 401);
+    }
+    let body: Value = match req.json().await {
+        Ok(b) => b,
+        Err(_) => return worker::Response::error("body: {\"asks\": [{identity, outpoint}]}", 400),
+    };
+    let asks: Vec<(String, String)> = body["asks"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    Some((
+                        e["identity"].as_str()?.to_owned(),
+                        e["outpoint"].as_str()?.to_owned(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if asks.is_empty() || asks.len() > OWED_BELT_REASK_MAX {
+        return worker::Response::error(
+            format!("asks: 1 to {OWED_BELT_REASK_MAX} entries of {{identity, outpoint}}"),
+            400,
+        );
+    }
+    crate::schema::ensure_latch_columns(env).await;
+    let tip = crate::routes::chaintracks_present_height_env(env, "owed")
+        .await
+        .ok();
+    let judge =
+        match owed_judge::D1Judge::new(env, tip, crate::routes::written_off_before_ms_env(env)) {
+            Ok(j) => j,
+            Err(e) => return worker::Response::error(format!("owed belt re-ask: {e}"), 503),
+        };
+    let report = reask(&judge, &WorkerCourier, &asks).await;
+    if crate::owed_events::configured(env).await {
+        crate::owed_events::publish_noted(env).await;
+        crate::owed_events::direct_held(env).await;
+    }
+    match report {
+        Ok(r) => worker::Response::from_json(&serde_json::json!({
+            "candidates": r.tick.candidates,
+            "asked": r.tick.asked,
+            "found": r.tick.found,
+            "rearmed": r.tick.rearmed,
+            "left": r.tick.left,
+            "calls": r.tick.calls,
+            "faults": {"woc": r.tick.faults[0], "bitails": r.tick.faults[1], "bananablocks": r.tick.faults[2], "other": r.tick.faults[3]},
+            "writeFaults": r.tick.write_faults.len(),
+            "handedBack": r.tick.handed_back,
+            "noTip": r.tick.no_tip,
+            "skipped": r.skipped.iter().map(|(i, o, w)| serde_json::json!({"identity": i, "outpoint": o, "why": w})).collect::<Vec<_>>(),
+            "bound": OWED_BELT_REASK_MAX,
+        })),
+        Err(e) => worker::Response::error(format!("owed belt re-ask faulted: {e}"), 503),
+    }
+}
+
 /// `POST /internal/owed-belt-tick` (bearer `INTERNAL_TOKEN`): one tick, answered with its report.
 pub async fn lever(req: worker::Request, env: &worker::Env) -> worker::Result<worker::Response> {
     if !crate::internal_events::internal_bearer_ok(&req, env) {
@@ -1685,6 +1913,26 @@ mod tests {
     fn squash(s: &str) -> String {
         s.split_whitespace().collect()
     }
+    /// FIX-1027-FOLD-1: the re-ask lever is routed, bearer-gated before its body, bounded at one tick's outpoints,
+    /// and publishes and calls its finds as the tick does; its count is seeded by the overlay.
+    #[test]
+    fn fix1027f_1b_the_reask_lever_is_routed_gated_and_bounded() {
+        let lib = squash(include_str!("lib.rs"));
+        assert!(lib.contains(&squash(
+            "req.path() == \"/internal/owed-belt-reask\" { let resp = owed_belt::reask_lever(req, &env).await;"
+        )));
+        let me = squash(include_str!("owed_belt.rs"));
+        let lever = &me[me.find("pubasyncfnreask_lever(").unwrap()..];
+        let lever = &lever[..lever.find("pubasyncfnlever(").unwrap()];
+        let gate = lever.find("internal_bearer_ok(&req,env)").unwrap();
+        assert!(gate < lever.find("req.json()").unwrap(), "the bearer first");
+        assert!(lever.contains("asks.len()>OWED_BELT_REASK_MAX"));
+        assert!(lever.contains("crate::owed_events::publish_noted(env).await;"));
+        assert!(lever.contains("crate::owed_events::direct_held(env).await;"));
+        assert_eq!(super::OWED_BELT_REASK_MAX, 8);
+        assert!(super::counter_names().contains(&super::COUNTER_REASKED.to_owned()));
+    }
+
     /// The alarm and its watchdog: the belt actor's alarm sets its next alarm BEFORE the tick, the cron arms it.
     #[test]
     fn owed893_belt_the_alarm_rearms_before_its_tick_and_the_cron_is_its_watchdog() {

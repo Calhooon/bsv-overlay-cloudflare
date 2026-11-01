@@ -5663,6 +5663,36 @@ pub(crate) mod tests {
         }
     }
 
+    /// bsv-low #1027, the review's NOTE-2: #517's contradiction reads a rival's CONFIRMATION, so a rival whose
+    /// evidence a reorg demoted (`spentConfirmed` NULL) no longer outranks the index's proof of the filed sweep, as a
+    /// rival whose row the old clear deleted did not; with the tracker's words read the rival's checked `mined` word
+    /// decides (`tracker_confirmed_by_other`), never the courier's flag. A belt look that confirms it again restores it.
+    #[test]
+    fn fix1027f_n2_a_demoted_rival_contradicts_no_filed_sweep_a_confirmed_one_does() {
+        let (sweep, rival) = (tx(0x0a), tx(0x0b));
+        let h = hop(HopStatus::Unspent, None, None);
+        let word = |confirmed: Option<bool>| HopChainWord {
+            looked: true,
+            spent: Some(true),
+            spending_txid: Some(rival.clone()),
+            spent_confirmed: confirmed,
+            stale: false,
+            age_ms: None,
+            probe_tip: None,
+            predates_tip: false,
+        };
+        assert!(confirmed_by_other(&h, Some(&word(Some(true))), &sweep));
+        assert!(
+            !confirmed_by_other(&h, Some(&word(None)), &sweep),
+            "demoted"
+        );
+        assert!(!confirmed_by_other(&h, None, &sweep), "deleted (the base)");
+        assert!(
+            !confirmed_by_other(&h, Some(&word(Some(true))), &rival),
+            "the filed sweep itself is no rival"
+        );
+    }
+
     #[test]
     fn a_hop_unspent_past_the_window_is_stranded_with_a_sweep_claim_a_young_one_is_in_progress_with_rejoin(
     ) {

@@ -920,7 +920,8 @@ pub async fn arcade_reorg_view(db: &D1Database) -> serde_json::Value {
 }
 
 /// PURE (bsv-low #484): the reorg view carries how many CONFIRMED hop probe memos the reorg passes have cleared
-/// (`hop_probe_memos`; the lifetime counter, 0 until the first), beside the cursor that says where the judge is.
+/// (`hop_probe_memos`; the lifetime counter, 0 until the first), beside the cursor that says where the judge is,
+/// and (bsv-low #1027) how many of the belt's evidence rows they demoted.
 pub fn with_probe_memos_cleared(
     mut view: serde_json::Value,
     counters: &serde_json::Value,
@@ -928,6 +929,10 @@ pub fn with_probe_memos_cleared(
     if view.is_object() {
         view["probeMemosCleared"] = json!(counters
             .get(crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_CLEARED)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0));
+        view["probeEvidenceDemoted"] = json!(counters
+            .get(crate::hop_probe_memos::COUNTER_HOP_PROBE_EVIDENCE_DEMOTED)
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0));
     }
@@ -1714,6 +1719,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         COUNTER_ADMIT_FAST_CONFLICT_HELD,
         // bsv-low #484: the probe-memo invalidation reads 0 until a reorg (or the TTL) clears one.
         crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_CLEARED,
+        // bsv-low #1027: the belt's evidence a reorg demoted, apart from the memos it cleared
+        crate::hop_probe_memos::COUNTER_HOP_PROBE_EVIDENCE_DEMOTED,
         crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_EXPIRED,
         // the merged lens's LOW-3: the app layer's faulted memo reads (it writes the row)
         crate::hop_probe_memos::COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS,

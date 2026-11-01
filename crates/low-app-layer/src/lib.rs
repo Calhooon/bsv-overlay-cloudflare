@@ -563,6 +563,12 @@ async fn serve(req: Request, env: Env, ctx: Context) -> Result<Response> {
     if req.method() == worker::Method::Post && req.path() == "/internal/owed-v3-pass" {
         return owed_actor::owed_v3_lever(req, &env).await;
     }
+    // FIX-1027-FOLD-1 (bsv-low #1027): the operator's bounded re-ask of named hop outpoints
+    if req.method() == worker::Method::Post && req.path() == "/internal/owed-belt-reask" {
+        let resp = owed_belt::reask_lever(req, &env).await;
+        push_coalesce::flush_after(&ctx, &env);
+        return resp;
+    }
     if req.method() == worker::Method::Post && req.path() == "/internal/owed-belt-tick" {
         let resp = owed_belt::lever(req, &env).await;
         push_coalesce::flush_after(&ctx, &env);

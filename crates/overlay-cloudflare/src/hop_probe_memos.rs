@@ -15,7 +15,8 @@
 //!    to the rows it judges. What a pass does know is that a reorg HAPPENED: it re-judged a row (a demotion, a
 //!    re-anchor, a refuted proof), an announce named a reorg range, or an Arcade orphan event was applied. On that
 //!    evidence every memo with `spentConfirmed = 1` is deleted (the superset of the memos at the orphaned
-//!    heights) and the next owed walk re-probes them, eight per recompute. A pass that scanned and left every row
+//!    heights) and their readers ask the couriers again (the owed walk is retired, bsv-low #893: the belt asks,
+//!    eight outpoints a tick). A pass that scanned and left every row
 //!    standing is NOT evidence: the routine sweep runs every block, and clearing on it would unmake the memo.
 //!    An unconfirmed spend and an unspent word keep their own five minutes. The belt's EVIDENCE of a spend
 //!    (`<txid>:<vout>`, bsv-low #953) is not deleted: its confirmation is taken (`spentConfirmed` NULL) and the
@@ -124,12 +125,16 @@ pub const HOP_PROBE_MEMO_REORG_CLEAR_SQL: &str = concat!(
     " AND substr(outpoint,65,1)<>':'"
 );
 
-/// bsv-low #1027 (lane FIX-1027-BELT-FIND-RECORD): A REORG UNMAKES A CONFIRMATION, NOT THE FIND OF A SPEND. The belt's
+/// bsv-low #1027 (lane FIX-1027-BELT-FIND-RECORD): A REORG MAKES A PROOF STALE, NEVER ABSENT (the tracker charter's
+/// rule, its word `proof_stale`): it unmakes a confirmation, not the find of a spend, so deleting the row was a trust
+/// error of the overlay's (a stale word read as no word) and this demotion is the rule, not a patch. The belt's
 /// evidence (`<txid>:<vout>`, `low-app-layer` `hops_view::probe_evidence_key`) is the record's only word that a
 /// courier saw the hop spent by a transaction the index does not hold. Rule 1 deleted it with the memos, so after any
 /// reorg pass the D1 judge read the hop by the index alone (`index-unspent`, the sweep press) over a spend the chain
 /// holds, until a belt look found it again; and with the D1 judge off nothing dates that look, so the record lost the
-/// spend for good (beta, 2026-10-31 22:16:17Z: 65 outpoints of six identities, the fleet compare's diffs). Now the
+/// spend for good (beta, 2026-10-31 14:01:48Z, the cron's clear of 101 confirmed rows on 99e456a6, before FIX-1010
+/// marked the clear: 65 outpoints of six identities, the fleet compare's diffs; their actors, never told, kept the
+/// spend they had judged). Now the
 /// clear keeps the evidence and takes only its confirmation (`spentConfirmed` NULL, unknown): both judges read the hop
 /// spent and not confirmed (`unbound`, no press), and the belt asks the OUTPOINT for it at its backoff
 /// (`owed_belt::rests_on_unconfirmed_find`): a look that finds it confirmed again restores the word, one that finds it
@@ -208,6 +213,10 @@ pub const HOP_PROBE_MEMO_REORG_MARK_SQL: &str = "INSERT INTO hop_chain_probes (o
 /// Confirmed memos a reorg pass cleared (served on `/health/invariants.arcadeReorg.probeMemosCleared` and with
 /// the counters).
 pub const COUNTER_HOP_PROBE_MEMOS_CLEARED: &str = "hop_probe_memos_cleared_by_reorg_total";
+/// bsv-low #1027 (the review's LOW-1): the belt's evidence rows a reorg pass DEMOTED (kept, `spentConfirmed` NULL),
+/// counted apart from the memos it deleted so `probeMemosCleared` keeps its meaning (served beside it on
+/// `/health/invariants.arcadeReorg.probeEvidenceDemoted`, seeded at 0).
+pub const COUNTER_HOP_PROBE_EVIDENCE_DEMOTED: &str = "hop_probe_evidence_demoted_by_reorg_total";
 /// Memos the TTL sweep deleted.
 pub const COUNTER_HOP_PROBE_MEMOS_EXPIRED: &str = "hop_probe_memos_expired_total";
 
@@ -353,10 +362,13 @@ pub async fn clear_on_reorg(db: &D1Database, origin: &str, evidence: bool) -> u6
         Ok(counts) => {
             let at = |n: usize| counts.get(n).copied().unwrap_or(0);
             let (deleted, demoted) = (at(0), at(1));
-            let cleared = deleted + demoted;
-            console_log!("[hop-probe-memos] ({origin}) reorg evidence: cleared {deleted} confirmed memo(s), demoted {demoted} belt evidence row(s) to unconfirmed (bsv-low #1027); the next owed walk re-probes them");
-            crate::ops::bump_counter(db, COUNTER_HOP_PROBE_MEMOS_CLEARED, cleared).await;
-            cleared
+            // the review's LOW-2, stated: each demoted row is dated due now by both judges and the belt asks its
+            // OUTPOINT (8 a 120 s tick, 24 calls), owners' and strangers' spends alike: a reorg that unmade a
+            // stranger's spend gives the owner's press back only through that look, so none is deferred
+            console_log!("[hop-probe-memos] ({origin}) reorg evidence: cleared {deleted} confirmed memo(s), demoted {demoted} belt evidence row(s) to unconfirmed (bsv-low #1027); the belt re-asks the demoted outpoints, 8 a tick, and the memos' readers ask again");
+            crate::ops::bump_counter(db, COUNTER_HOP_PROBE_MEMOS_CLEARED, deleted).await;
+            crate::ops::bump_counter(db, COUNTER_HOP_PROBE_EVIDENCE_DEMOTED, demoted).await;
+            deleted + demoted
         }
         Err(e) => {
             console_log!("[hop-probe-memos] ({origin}) reorg clear FAILED (the confirmed memos stand for their window): {e}");
@@ -773,6 +785,66 @@ mod tests {
         assert_eq!(
             COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS,
             "applayer_probe_memo_read_faults_total"
+        );
+    }
+
+    /// bsv-low #1027, the review's LOW-1: the evidence a reorg DEMOTES is its own counter, seeded and served beside
+    /// `probeMemosCleared`, which keeps counting the memos the clear deleted and nothing else; the line names the belt.
+    #[test]
+    fn fix1027f_l1_demotions_are_counted_apart_and_served_beside_the_cleared() {
+        let view = serde_json::json!({ "readable": true });
+        let none = crate::ops::with_probe_memos_cleared(view.clone(), &serde_json::json!({}));
+        assert_eq!(none["probeEvidenceDemoted"], 0, "served from 0");
+        let some = crate::ops::with_probe_memos_cleared(
+            view,
+            &serde_json::json!({ COUNTER_HOP_PROBE_MEMOS_CLEARED: 1, COUNTER_HOP_PROBE_EVIDENCE_DEMOTED: 101 }),
+        );
+        assert_eq!(
+            (
+                some["probeMemosCleared"].clone(),
+                some["probeEvidenceDemoted"].clone()
+            ),
+            (serde_json::json!(1), serde_json::json!(101))
+        );
+        assert_eq!(
+            COUNTER_HOP_PROBE_EVIDENCE_DEMOTED,
+            "hop_probe_evidence_demoted_by_reorg_total"
+        );
+        let ops = include_str!("ops.rs");
+        assert!(
+            ops.contains("crate::hop_probe_memos::COUNTER_HOP_PROBE_EVIDENCE_DEMOTED,"),
+            "seeded at 0 in `read_counters`"
+        );
+        let src: String = include_str!("hop_probe_memos.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        for needle in [
+            "bump_counter(db,COUNTER_HOP_PROBE_MEMOS_CLEARED,deleted)",
+            "bump_counter(db,COUNTER_HOP_PROBE_EVIDENCE_DEMOTED,demoted)",
+        ] {
+            assert!(src.contains(needle), "the clear bumps `{needle}`");
+        }
+        assert!(
+            !src.contains("thenextowedwalkre-probesthem\");")
+                && src.contains("thebeltre-asksthedemotedoutpoints"),
+            "the clear's line names the belt, not the retired walk"
+        );
+    }
+
+    /// bsv-low #1027, the review's NIT-1: the statement the clear RUNS is the pinned one plus its answer, so the
+    /// #484 pins over `HOP_PROBE_MEMO_REORG_CLEAR_SQL` hold the production delete.
+    #[test]
+    fn fix1027f_nit1_the_framed_clear_is_the_pinned_clear_answering_its_keys() {
+        assert_eq!(
+            HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL,
+            format!("{HOP_PROBE_MEMO_REORG_CLEAR_SQL} RETURNING outpoint")
+        );
+        assert_eq!(
+            HOP_PROBE_MEMO_REORG_CLEAR_FRAMED[0],
+            HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL
         );
     }
 
