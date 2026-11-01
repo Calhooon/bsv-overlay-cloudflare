@@ -18008,6 +18008,20 @@ mod fix1027 {
             false,
         );
         assert_eq!(keys, vec![hop.clone()], "the own sweep's evidence, demoted and noted");
+        let evidence = |db: &SqliteSql| -> (Option<String>, Option<i64>) {
+            db.conn
+                .query_row(
+                    "SELECT spendingTxid,spentConfirmed FROM hop_chain_probes WHERE outpoint=?1",
+                    [hop.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            evidence(&d1),
+            (Some(s.clone()), None),
+            "round 3 (NIT-1): the demoted evidence still names the sweep, its confirmation taken"
+        );
         for k in &keys {
             let ev = published(&d1, "probe", k)
                 .await
@@ -18117,6 +18131,19 @@ mod fix1027 {
             false,
         );
         assert!(keys.contains(&hop), "the sweep's evidence demoted and noted: {keys:?}");
+        let evidence: (Option<String>, Option<i64>) = d1
+            .conn
+            .query_row(
+                "SELECT spendingTxid,spentConfirmed FROM hop_chain_probes WHERE outpoint=?1",
+                [hop.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            evidence,
+            (Some(sweep.clone()), None),
+            "round 3 (NIT-1): the demoted evidence still names the sweep, its confirmation taken"
+        );
         assert_eq!(before, (None, None), "the premise, beta's shape 2: no row on either side");
         let mut applied = 0;
         for k in &keys {
