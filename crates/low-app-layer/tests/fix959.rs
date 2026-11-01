@@ -4,7 +4,8 @@
 //! - `fix959_a`: the writer's direct pass over the loop's non-carried events (three pair events, the shape every
 //!   source but `identity` reads, a pot's and a hop's alike, and the hop hook's identity event) for two identities, in PHASE C (the bounds read): ONE D1 batch before the first actor call (the marks of
 //!   every event and each body's acknowledgement bound together), so the first call is one round trip after the
-//!   pass begins; each body's bound equals the per-body read (`direct_bound`) and its marks are acknowledged. RED with
+//!   pass begins; each body's bound equals the per-body read (`direct_bound`), asserted value for value (review
+//!   round 1's LOW-1: RED with `MAX(d.generation)+1000` in both bound statements), and its marks are acknowledged. RED with
 //!   the port's two batched reads removed (the trait's defaults, the base's rule: one read an event, then one a body,
 //!   in a row): 6 batches and 600 ms before the first call.
 //! - `fix959_b`: Phase A/B (no acknowledgement): one batch, no bound statement in it.
@@ -162,6 +163,20 @@ async fn fix959_a_phase_c_the_direct_pass_reads_marks_and_bounds_in_one_batch() 
         "a pot, hop and identity event each: {n_events}"
     );
     let want_bounds = per_body_bounds(&db, &expect).await;
+    // the review's LOW-1: each body's bound from the ONE batch equals the per-body read (`direct_bound`), the value
+    // that decides which marks Phase C acknowledges (an inflated bound acknowledges marks the actor never read)
+    let (_, batched) = owed_events::direct_subjects_many(&db, &events, true).await;
+    let got_bounds: Vec<i64> = expect
+        .iter()
+        .map(|(id, games)| {
+            owed_events::bound_of_games(&batched, id, games)
+                .unwrap_or_else(|| panic!("every game of {id} read with the marks: {batched:?}"))
+        })
+        .collect();
+    assert_eq!(
+        got_bounds, want_bounds,
+        "the batched bound is the per-body read's, body by body"
+    );
     let port = Port {
         sql: SlowD1 {
             db: &db,

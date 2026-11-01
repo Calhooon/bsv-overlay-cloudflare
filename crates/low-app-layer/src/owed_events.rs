@@ -875,6 +875,12 @@ fn plan_of_marks(marks: &[Value], held_subjects: usize, mut more: bool) -> Plan 
 
 /// FIX-959: each `(identity, game)` the pair's unheld marks name ([`ROUTE_MARKS_SQL`]'s window, the same binds) with
 /// the greatest generation of every mark of that game ([`owed_judge::MARKS_SQL`]'s bound, per game).
+///
+/// Stated (review round 1's NIT-1): the statement repeats the marks statement's window as its subquery, so the window
+/// is read twice an event (and twice again for a duplicate event of one pair), and then every mark of each named game.
+/// The games cannot be taken from the marks statement's answer: both ride ONE batch, read before either answers, and a
+/// second batch is the round trip (a) removes. The cost is at most `ROUTE_READ_LIMIT` window rows more an event plus
+/// the named games' marks, index searches all (`fix959_b` pins the plans); the budget tier's figures hold.
 pub const GAME_BOUNDS_OF_PAIR_SQL: &str = "SELECT d.identity,d.gameId,MAX(d.generation) AS g FROM (SELECT DISTINCT identity,gameId FROM (SELECT identity,gameId,generation FROM owed_dirty INDEXED BY idx_owed_dirty_source_key WHERE sourceKey=?2 AND source=?1 AND NOT EXISTS (SELECT 1 FROM owed_belt_state WHERE name='owed-events:fault:subject '||identity||'/'||gameId AND json_extract(cursor,'$.heldUntilMs')>?4) ORDER BY generation LIMIT ?3) WHERE gameId<>'') s JOIN owed_dirty d ON d.identity=s.identity AND d.gameId=s.gameId GROUP BY d.identity,d.gameId";
 /// FIX-959: [`GAME_BOUNDS_OF_PAIR_SQL`] for an identity route ([`ROUTE_IDENTITY_SQL`]'s window, the same binds).
 pub const GAME_BOUNDS_OF_IDENTITY_SQL: &str = "SELECT d.identity,d.gameId,MAX(d.generation) AS g FROM (SELECT DISTINCT identity,gameId FROM (SELECT identity,gameId,generation FROM owed_dirty INDEXED BY idx_owed_dirty_identity_marked WHERE identity=?1 AND NOT EXISTS (SELECT 1 FROM owed_belt_state WHERE name='owed-events:fault:subject '||identity||'/'||gameId AND json_extract(cursor,'$.heldUntilMs')>?3) ORDER BY markedAtMs,generation LIMIT ?2) WHERE gameId<>'') s JOIN owed_dirty d ON d.identity=s.identity AND d.gameId=s.gameId GROUP BY d.identity,d.gameId";

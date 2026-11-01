@@ -5170,6 +5170,10 @@ pub fn read_path(answer: &Value) -> &'static str {
 /// FIX-959: the read paths, each with its apply ring and its visibility ring on a class's bars row.
 pub const READ_PATHS: [&str; 3] = ["carried", "narrowed", "full"];
 /// FIX-959: the rings of [`READ_PATHS`], by name (`applyCarried`, .., `visibleFull`).
+///
+/// Stated (review round 1's NIT-3): each `owed-actor:bars:<class>` row grows by these six rings, at most 6 x
+/// [`METER_SAMPLES`] (256) samples, about 6 to 8 KB a class row; the health snapshot carries every bars row and
+/// `/health` parses it. Rows read are unchanged; the bytes are bounded by [`METER_SAMPLES`].
 pub const PATH_RINGS: [(&str, &str, &str); 6] = [
     ("carried", "apply", "applyCarried"),
     ("narrowed", "apply", "applyNarrowed"),
