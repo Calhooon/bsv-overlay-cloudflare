@@ -275,9 +275,17 @@ pub struct ArcadePassSummary {
     /// (newest last, bounded): the heights the operator owes an
     /// `/internal/reorg` run.
     pub unresolved: Vec<UnresolvedEvent>,
+    /// bsv-low #1027 round 2 (MEDIUM-1): the lowest orphaned height this pass judged or released; the reach of the
+    /// probe clear (`hop_probe_memos::clear_on_reorg`).
+    pub reach_floor: Option<u64>,
 }
 
 impl ArcadePassSummary {
+    /// bsv-low #1027 round 2: an orphaned height this pass judged or released lowers the clear's reach.
+    fn note_reach(&mut self, height: u64) {
+        self.reach_floor = Some(self.reach_floor.map_or(height, |f| f.min(height)));
+    }
+
     /// Confirmed rows whose anchor moved without a demotion (the ladder's
     /// canonical proof replaced the refuted bump, or a standing bump's
     /// height was corrected).
@@ -433,6 +441,7 @@ where
                 return out;
             }
             out.released_by_operator += 1;
+            out.note_reach(key.height);
         }
     }
     let mut feed_events: Option<Vec<OrphanEvent>> = None;
@@ -457,6 +466,7 @@ where
                     break;
                 }
                 out.skipped_unresolved += 1;
+                out.note_reach(key.height);
                 finished += 1;
                 continue;
             }
@@ -599,6 +609,7 @@ where
                 // ── the three legs at the orphaned height, each one bounded page ──
                 let mut progress = pending;
                 let h = ev.height;
+                out.note_reach(h);
                 let legs = judge_window_legs(
                     pot_storage,
                     tx_store,

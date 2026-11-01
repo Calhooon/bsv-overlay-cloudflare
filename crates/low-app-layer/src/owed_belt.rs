@@ -1099,9 +1099,10 @@ async fn rearm_ask(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut Tick
 /// gate's 24 courier calls and 3 an outpoint bound the calls, as the tick's).
 pub const OWED_BELT_REASK_MAX: usize = OWED_BELT_OUTPOINTS_PER_TICK;
 
-/// The game a hop belongs to for the identity: its hop marker, else the eviction's released evidence (a hop whose
-/// game no source names is not asked). Binds: identity, hop txid, vout.
-pub const REASK_GAME_SQL: &str = "SELECT gameId FROM hopparty_records WHERE txid=?2 AND hopVout=?3 AND identity=?1 UNION ALL SELECT gameId FROM released_hop_evidence WHERE hopTxid=?2 AND hopVout=?3 AND identity=?1 LIMIT 1";
+/// The game a hop belongs to for the identity: its VERIFIED hop marker (`markerValid = 1`, round 2's LOW-2: the belt
+/// dates only a row whose evidence verifies, `owed_judge::belt_due`), else the eviction's released evidence (a hop
+/// whose game no such source names is not asked, skipped by name). Binds: identity, hop txid, vout.
+pub const REASK_GAME_SQL: &str = "SELECT gameId FROM hopparty_records WHERE txid=?2 AND hopVout=?3 AND identity=?1 AND markerValid=1 UNION ALL SELECT gameId FROM released_hop_evidence WHERE hopTxid=?2 AND hopVout=?3 AND identity=?1 LIMIT 1";
 
 /// What one re-ask call did: the tick's report over the named outpoints, and the ones it could not ask.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1119,6 +1120,13 @@ pub struct ReaskReport {
 /// the memo, the spender's bytes and the `hop` mark, handed back to the actor (Phase C) or judged in the batch (A, B);
 /// an unspent answer retires the evidence. Asks nothing without a chain tip. The operator's road: page the fleet
 /// compare's `diffs[].outpoints` into `POST /internal/owed-belt-reask`, then read the compare again.
+///
+/// A ONE-TIME REPAIR, never a routine road (round 2's LOW-2): it exists for the evidence the pre-FIX-1010 clears
+/// deleted UNMARKED (no event, no actor told). Since FIX-1010 every clear marks and since #1027 a clear demotes rather
+/// than deletes, so no write loses evidence without an event and the belt's own dating asks every look the judges
+/// owe; once the fleet compare's diffs from that class are asked, the lever has no further use. An outpoint off the
+/// compare's list costs one look's courier calls and a re-judge of that identity's game, never fabricated evidence
+/// (only a courier's spent answer writes evidence).
 pub async fn reask<C: Courier>(
     db: &impl JudgeDb,
     courier: &C,
@@ -1168,7 +1176,7 @@ pub async fn reask<C: Courier>(
         };
         let Some(game_id) = game else {
             out.skipped
-                .push(skip("no hop marker or released evidence names it"));
+                .push(skip("no verified hop marker or released evidence names it"));
             continue;
         };
         if gate.spent() {

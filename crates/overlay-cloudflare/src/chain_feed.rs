@@ -412,6 +412,10 @@ pub struct FeedPassSummary {
     pub stopped: Option<String>,
     /// The state after the pass, as written (or as read, when nothing was).
     pub state: Option<FeedState>,
+    /// bsv-low #1027 round 2 (MEDIUM-1): the lowest height of a window this pass judged or released (`lo`: an
+    /// invalidation's is the window's floor below the verified tip, [`INVALIDATED_DEPTH`]); the reach of the probe
+    /// clear (`hop_probe_memos::clear_on_reorg`).
+    pub reach_floor: Option<u64>,
 }
 
 impl FeedPassSummary {
@@ -711,6 +715,7 @@ where
     loop {
         // ── the selecting event in hand ──
         if let Some(mut pending) = state.pending.clone() {
+            out.reach_floor = Some(out.reach_floor.map_or(pending.lo, |f| f.min(pending.lo)));
             if pending.fault_passes >= limits.fault_ceiling {
                 push_log(&format!(
                     "[chain-feed] RELEASED at the fault ceiling: the {} at cursor {} ({}..={}) finished unresolved and recorded; its rows are the operator's: POST /internal/reorg {{\"fromHeight\": {}, \"toHeight\": {}}}",
@@ -1212,7 +1217,7 @@ pub async fn run_chain_feed_pass(
     crate::hop_probe_memos::clear_on_reorg(
         db,
         origin,
-        crate::hop_probe_memos::feed_pass_rejudged(&s),
+        crate::hop_probe_memos::feed_pass_rejudged(&s).then(|| s.reach_floor.unwrap_or(0)),
     )
     .await;
     worker::console_log!(
