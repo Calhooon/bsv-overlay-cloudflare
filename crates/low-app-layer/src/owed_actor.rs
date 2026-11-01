@@ -870,6 +870,9 @@ pub struct ApplyReport {
     pub closure_rounds: u32,
     /// D2-ACTOR-F-FOLD: the record calls the apply made (the warm carried path's 0).
     pub record_calls: u32,
+    /// D2-ACTOR-G (bsv-low #1031): the record STATEMENTS this apply ran (each call's batch counted whole): the bars'
+    /// `statements` ring, so a window reads the read's cost beside its time.
+    pub record_statements: u32,
 }
 
 /// The decoded facts of a copied BEEF row: the pot's own (`pot`, `pot_beefs` only) and the stored order's.
@@ -1022,11 +1025,23 @@ pub fn txids_in_row(r: &Value, out: &mut BTreeSet<String>) {
 pub const CLOSURE_BEEF_MAX_BYTES: i64 = 262_144;
 /// The most bytes one carried closure takes (it rides the writer's direct body only, never a queue message): past it
 /// the closure is dropped and the actor reads the new keys once.
-pub const CLOSURE_MAX_BYTES: usize = 32_768;
+///
+/// D2-ACTOR-G (bsv-low #1031): 256 KiB (it was 32 KiB). L57's loop declined 420 of the 426 closures it read: a filing's
+/// closure holds its pot's two stored BEEFs' decoded facts (each output's full locking script: the 3,150 byte covenant
+/// is 6,300 hex characters in each), its parties' signatures and the spender bytes rows its keys name, so the honest
+/// hand passed 32 KiB, and every decline was the closure statement spent for nothing AND the actor's own miss read of
+/// the same keys inside its apply (a D1 round trip, `readMs`, on the carried path). The pass keeps at most
+/// [`PASS_CLOSURES_MAX_BYTES`] of closures over all its filings.
+pub const CLOSURE_MAX_BYTES: usize = 262_144;
+/// D2-ACTOR-G: the most closure bytes one direct pass keeps over all its filings (their bodies ride one pass's DO
+/// calls): a filing whose closure would pass it is declined (its actor reads its own miss once).
+pub const PASS_CLOSURES_MAX_BYTES: usize = 2_097_152;
 /// The bound on one row's value before it is built: the sum, over its columns, of the bytes of a text value six times
 /// (JSON's worst escape, `\u00XX`) and of a blob twice (its hex). A row past it is never built; its txids are NOT
-/// CARRIED. So no value the closure's statements build can pass D1's bound.
-pub const CLOSURE_ROW_MAX_WEIGHT: i64 = 6 * CLOSURE_MAX_BYTES as i64;
+/// CARRIED. So no value the closure's statements build can pass D1's bound. D2-ACTOR-G: 384 KiB, six times 64 KiB of
+/// text (it was six times the kept size, 192 KiB); a literal now, so the heaviest row one filing can keep (this beside
+/// a BEEF's hex of at most 512 KiB, [`CLOSURE_FAMILY_BYTES_PER_FILING`]) stays under one family's bound.
+pub const CLOSURE_ROW_MAX_WEIGHT: i64 = 393_216;
 
 /// PURE (D2-ACTOR-F-FOLD-2): the closure's key set: the txids the payload's rows name by [`txids_in_row`], the rule
 /// the actor's own key walk reads them by (each item's `r`, JSON text of a row object).
@@ -1430,6 +1445,130 @@ pub fn marked_select() -> String {
     )
 }
 
+/// D2-ACTOR-G (bsv-low #1031 with #959 (b)): the WARM narrowed read without the BEEF bytes the mirror already decoded.
+/// [`marked_select`] with each BEEF family's `hex(t.beef)` answered NULL where the txid's stored BEEFs are the ones the
+/// mirror last read: `?7` the lengths it holds, `{txid: {"p": pot_beefs, "t": transactions}}` (`-1` for no row,
+/// [`HELD_BEEF_LENS_SQL`]), compared for BOTH families of the txid in each family's arm, so the two rows of a txid are
+/// re-read together or skipped together (the mirror's `pot` and `stored` facts are one decision over both). A length
+/// that moved (a proof merged into a BEEF, a BEEF replaced, a row added or deleted) re-reads both, and every apply but
+/// the warm narrowed one (a full read, a page, a miss round, a fallback) reads the bytes as before.
+///
+/// D2-ACTOR-G-FOLD-1 (the lens's LOW-1): the length alone held a same-length re-anchor (a reorg's new BUMP of the
+/// same depth and height varint) on the old `bumpHeight` (FIX-997, read for `atHeight`) for up to a day. The facts'
+/// one BUMP-derived value is the height of the subject's own bump, so the hold also compares that height's bytes in
+/// place ([`bump_mark`]: `pb` / `tb`, the 1-based offset of the subject bump's height varint and its hex, `[]` for a
+/// subject with no bump): a moved height re-reads both families. A `len` row with no mark (one written before the
+/// fold, or bytes whose bump the mark could not place) re-reads. Stated: a re-anchor that keeps the length, the
+/// subject's bump height and its offset changes no fact the mirror holds.
+pub fn marked_select_held() -> String {
+    let plain = marked_select();
+    let parts: Vec<&str> = plain.split("hex(t.beef)").collect();
+    let beefs: Vec<&Family> = FAMILIES.iter().filter(|f| f.beef).collect();
+    assert_eq!(
+        parts.len(),
+        beefs.len() + 1,
+        "one BEEF expression a BEEF family"
+    );
+    let mut out = String::from(parts[0]);
+    for (f, rest) in beefs.iter().zip(&parts[1..]) {
+        assert!(
+            matches!(f.table, "pot_beefs" | "transactions"),
+            "a held BEEF expression a BEEF family"
+        );
+        out.push_str(held_beef_expr(f));
+        out.push_str(rest);
+    }
+    out
+}
+
+/// D2-ACTOR-G: one BEEF family's bytes in the warm narrowed read: NULL where both of its txid's lengths are the held.
+fn held_beef_expr(f: &Family) -> &'static str {
+    if f.table == "pot_beefs" {
+        HELD_POT_BEEF_EXPR
+    } else {
+        HELD_TRANSACTIONS_BEEF_EXPR
+    }
+}
+/// D2-ACTOR-G-FOLD-1 (LOW-1): the mark `$k` (`pb` or `tb`) holds of the bytes `$b`: an array, empty (no bump) or
+/// whose hex at its offset is the bytes' own.
+macro_rules! held_bump_mark {
+    ($b:literal, $k:literal) => {
+        concat!(
+            "(json_type(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "')='array' AND (json_array_length(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "')=0 OR hex(substr(",
+            $b,
+            ",json_extract(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "[0]'),length(json_extract(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "[1]'))/2))=json_extract(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "[1]')))"
+        )
+    };
+}
+/// D2-ACTOR-G: `pot_beefs`' bytes in the warm narrowed read ([`marked_select_held`]); D2-ACTOR-G-FOLD-1: and the
+/// subject bump's height in place in both families ([`bump_mark`]).
+pub const HELD_POT_BEEF_EXPR: &str = concat!(
+    "CASE WHEN length(t.beef)=json_extract(?7,'$.\"'||t.txid||'\".p') AND COALESCE((SELECT length(x.beef) FROM transactions x WHERE x.txid=t.txid),-1)=json_extract(?7,'$.\"'||t.txid||'\".t') AND ",
+    held_bump_mark!("t.beef", "pb"),
+    " AND COALESCE((SELECT ",
+    held_bump_mark!("x.beef", "tb"),
+    " FROM transactions x WHERE x.txid=t.txid),1) THEN NULL ELSE hex(t.beef) END"
+);
+/// D2-ACTOR-G: `transactions`' bytes in the warm narrowed read ([`marked_select_held`]); D2-ACTOR-G-FOLD-1: and the
+/// subject bump's height in place in both families ([`bump_mark`]).
+pub const HELD_TRANSACTIONS_BEEF_EXPR: &str = concat!(
+    "CASE WHEN length(t.beef)=json_extract(?7,'$.\"'||t.txid||'\".t') AND COALESCE((SELECT length(x.beef) FROM pot_beefs x WHERE x.txid=t.txid),-1)=json_extract(?7,'$.\"'||t.txid||'\".p') AND ",
+    held_bump_mark!("t.beef", "tb"),
+    " AND COALESCE((SELECT ",
+    held_bump_mark!("x.beef", "pb"),
+    " FROM pot_beefs x WHERE x.txid=t.txid),1) THEN NULL ELSE hex(t.beef) END"
+);
+
+/// PURE (D2-ACTOR-G-FOLD-1, the lens's LOW-1): where `bytes` (a stored BEEF of `txid`) hold the height of the subject's
+/// own bump: `[offset, hex]`, the 1-based offset of the bump's height varint (its serialization found in the bytes) and
+/// the varint's hex; `[]` when the subject carries no bump; `null` when the bytes do not parse, name no such
+/// transaction, or the bump's serialization is not found (the hold then re-reads: fail closed).
+pub fn bump_mark(txid: &str, bytes: &[u8]) -> Value {
+    let Ok(b) = overlay_engine::beef_limits::parse_beef(
+        bytes,
+        &overlay_engine::beef_limits::APP_BEEF_LIMITS,
+    ) else {
+        return Value::Null;
+    };
+    let Some(btx) = b.find_txid(txid) else {
+        return Value::Null;
+    };
+    let Some(bump) = btx.bump_index().and_then(|i| b.bumps.get(i)) else {
+        return json!([]);
+    };
+    let bin = bump.to_binary();
+    let h = bump.block_height;
+    let vlen = match h {
+        0..=0xfc => 1,
+        0xfd..=0xffff => 3,
+        _ => 5,
+    };
+    if bin.len() < vlen {
+        return Value::Null;
+    }
+    match bytes.windows(bin.len()).position(|w| w == bin.as_slice()) {
+        Some(at) => json!([at + 1, hex::encode_upper(&bytes[at..at + vlen])]),
+        None => Value::Null,
+    }
+}
+
+/// D2-ACTOR-G: the BEEF lengths the mirror last read of `?1`'s txids (the `len` rows of `txfacts`, written by
+/// [`write_round_of`] beside the facts they were decoded from), as `{txid: {"p", "t"}}`.
+pub const HELD_BEEF_LENS_SQL: &str = "SELECT json_group_object(txid,json(facts)) AS m FROM txfacts WHERE src='len' AND txid IN (SELECT value FROM json_each(?1))";
+/// D2-ACTOR-G: the `len` rows of `?1`'s txids dropped (a BEEF re-read, gone, or carried as facts by a closure).
+pub const HELD_BEEF_LENS_DELETE_SQL: &str =
+    "DELETE FROM txfacts WHERE src='len' AND txid IN (SELECT value FROM json_each(?1))";
+
 /// D2-ACTOR-B-FOLD-14: the BOOTSTRAP PAGE's first round in ONE statement (it was the page's games read, then the
 /// apply's first read over them): the page's games a CTE (`mk_g`, [`crate::owed_judge::IDENTITY_GAMES_AFTER_SQL`]
 /// with its `?2` and `?3` moved to `?7` and `?8`), every family's selection and the marks over them; answered
@@ -1484,16 +1623,22 @@ async fn read_marked(
     games: &[String],
     keys: &Keys,
     page: Option<(i64, &str)>,
+    held_lens: Option<&str>,
 ) -> Result<Option<MarkedRead>, String> {
     let mut binds = keys.binds(me, games);
     binds.push(Bind::Text(json!(PROBE_PREFIXES).to_string()));
-    let sql = match page {
-        Some((at, after)) => {
+    let sql = match (page, held_lens) {
+        (Some((at, after)), _) => {
             binds.push(Bind::Int(at));
             binds.push(Bind::Text(after.into()));
             page_select()
         }
-        None => marked_select(),
+        // D2-ACTOR-G: the warm narrowed read skips the BEEFs the mirror holds
+        (None, Some(lens)) => {
+            binds.push(Bind::Text(lens.into()));
+            marked_select_held()
+        }
+        (None, None) => marked_select(),
     };
     let row = match record.run_batch(vec![fitted(sql, &binds)]).await {
         Ok(o) => o
@@ -1719,6 +1864,76 @@ fn write_round_of(
     let binds = keys.binds_of(me, games, reorg);
     let mut out = Vec::new();
     let mut facts = BTreeMap::new();
+    // D2-ACTOR-G (bsv-low #1031): the BEEF rows the warm narrowed read did not re-read (`__beef` NULL, no `__facts`:
+    // [`marked_select_held`]) keep the facts and the lengths the mirror holds; every other read BEEF row's length is
+    // held beside its facts (`txfacts` `len`), and a closure's (facts, no bytes) drops it.
+    let mut skipped: BTreeSet<String> = BTreeSet::new();
+    let mut lens: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    // D2-ACTOR-G-FOLD-1 (LOW-1): each read BEEF's subject bump height in place ([`bump_mark`]), `pb` and `tb`
+    let mut marks: BTreeMap<String, (Value, Value)> = BTreeMap::new();
+    for (f, rows) in FAMILIES.iter().zip(read) {
+        if !f.beef {
+            continue;
+        }
+        for r in rows {
+            let Some(txid) = r["txid"].as_str().map(str::to_ascii_lowercase) else {
+                continue;
+            };
+            if r.get("__facts").is_some() {
+                continue;
+            }
+            match r["__beef"].as_str() {
+                Some(h) => {
+                    let mark = hex::decode(h)
+                        .map(|b| bump_mark(&txid, &b))
+                        .unwrap_or(Value::Null);
+                    let m = marks.entry(txid.clone()).or_insert((json!([]), json!([])));
+                    let e = lens.entry(txid).or_insert((-1, -1));
+                    let n = (h.len() / 2) as i64;
+                    if f.table == "pot_beefs" {
+                        e.0 = n;
+                        m.0 = mark;
+                    } else {
+                        e.1 = n;
+                        m.1 = mark;
+                    }
+                }
+                None => {
+                    skipped.insert(txid);
+                }
+            }
+        }
+    }
+    let dropped: Vec<&String> = keys
+        .txids
+        .iter()
+        .filter(|t| !skipped.contains(*t))
+        .collect();
+    if !dropped.is_empty() {
+        out.push(Stmt::new(
+            HELD_BEEF_LENS_DELETE_SQL,
+            vec![Bind::Text(json!(dropped).to_string())],
+        ));
+    }
+    for (txid, (p, t)) in &lens {
+        if !skipped.contains(txid) {
+            out.push(Stmt::new(
+                TXFACTS_UPSERT_SQL,
+                vec![
+                    Bind::Text(txid.clone()),
+                    Bind::Text("len".into()),
+                    Bind::Text({
+                        let (pb, tb) = marks
+                            .get(txid)
+                            .cloned()
+                            .unwrap_or((Value::Null, Value::Null));
+                        json!({"p": p, "t": t, "pb": pb, "tb": tb}).to_string()
+                    }),
+                    Bind::Int(seq),
+                ],
+            ));
+        }
+    }
     for (f, rows) in FAMILIES.iter().zip(read) {
         out.push(fitted(
             format!(
@@ -1741,7 +1956,16 @@ fn write_round_of(
             out.push(Stmt::new(insert_sql(f), b));
         }
         if f.beef {
-            facts_rows(f, rows, seq, &mut facts);
+            let decoded: Vec<Value> = rows
+                .iter()
+                .filter(|r| {
+                    r["txid"]
+                        .as_str()
+                        .is_none_or(|t| !skipped.contains(&t.to_ascii_lowercase()))
+                })
+                .cloned()
+                .collect();
+            facts_rows(f, &decoded, seq, &mut facts);
         }
     }
     let beef_txids: Vec<String> = facts
@@ -1947,10 +2171,12 @@ pub async fn apply_with<R: SqlPort, L: SqlPort, O: Outside>(
     let counted = CountedRecord {
         inner: record,
         calls: Cell::new(0),
+        statements: Cell::new(0),
     };
     let out = apply_counted(&counted, local, outside, me, games, kind_seq, tip, era_ms, opts).await;
     out.map(|(mut r, p)| {
         r.record_calls = counted.calls.get();
+        r.record_statements = counted.statements.get();
         (r, p)
     })
 }
@@ -1962,10 +2188,14 @@ type PagedRead = (Keys, Vec<Vec<Value>>, i64, Option<i64>);
 struct CountedRecord<'a, R: SqlPort> {
     inner: &'a R,
     calls: Cell<u32>,
+    /// D2-ACTOR-G (bsv-low #1031): the statements those calls ran (`recordStatements`).
+    statements: Cell<u32>,
 }
 impl<R: SqlPort> SqlPort for CountedRecord<'_, R> {
     async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
         self.calls.set(self.calls.get() + 1);
+        self.statements
+            .set(self.statements.get() + stmts.len() as u32);
         self.inner.run_batch(stmts).await
     }
     async fn counters(&self, deltas: Vec<(String, u64)>) {
@@ -2001,7 +2231,7 @@ async fn apply_counted<R: SqlPort, L: SqlPort, O: Outside>(
         Some((at, after)) => {
             let t = local.now_ms();
             let marked =
-                read_marked(record, &me, &[], &Keys::default(), Some((*at, after))).await?;
+                read_marked(record, &me, &[], &Keys::default(), Some((*at, after)), None).await?;
             let page = match marked {
                 Some(m) => {
                     let bound = m
@@ -2173,8 +2403,24 @@ async fn apply_counted<R: SqlPort, L: SqlPort, O: Outside>(
             markers: keys.markers.clone(),
         };
         touch.iter().for_each(|t| txids_in(t, &mut n.txids));
+        // D2-ACTOR-G (bsv-low #1031, #959 (b)): the BEEF lengths the mirror last read, so the record's read answers
+        // no bytes the mirror already decoded (a local read: no record call)
+        let lens = local
+            .run_batch(vec![Stmt::new(
+                HELD_BEEF_LENS_SQL,
+                vec![Bind::Text(json!(n.txids).to_string())],
+            )])
+            .await?
+            .first()
+            .and_then(|o| o.rows.first())
+            .and_then(|r| match &r["m"] {
+                Value::String(s) => Some(s.clone()),
+                Value::Object(_) => Some(r["m"].to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "{}".to_string());
         let t = local.now_ms();
-        let marked = read_marked(record, &me, &games, &n, None).await?;
+        let marked = read_marked(record, &me, &games, &n, None, Some(&lens)).await?;
         report.read_ms += local.now_ms().saturating_sub(t);
         let (marks, read) = match marked {
             Some(m) => {
@@ -2685,7 +2931,7 @@ pub async fn commit_fixpoint<L: SqlPort>(
 /// The answer of one apply (the object's `/apply`, the pins' harness): the actor's rows, the redelivery verdict, the
 /// games the event has applied.
 pub fn answer_of(report: &ApplyReport, rows: Vec<Value>) -> Value {
-    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply, "misses": report.misses, "narrowed": report.narrowed, "coalesced": report.coalesced, "readMs": report.read_ms, "judgeMs": report.judge_ms, "writeMs": report.write_ms, "waitMs": report.wait_ms, "outsideMs": report.outside_ms, "asksQueued": report.asks, "readGeneration": report.read_generation, "carried": report.carried, "closureRounds": report.closure_rounds, "recordCalls": report.record_calls})
+    json!({"rows": rows, "rounds": report.rounds, "txids": report.txids, "recordRows": report.record_rows, "missed": report.missed, "appliedGames": report.applied_games, "applied": !report.skipped, "firstApply": report.first_apply, "misses": report.misses, "narrowed": report.narrowed, "coalesced": report.coalesced, "readMs": report.read_ms, "judgeMs": report.judge_ms, "writeMs": report.write_ms, "waitMs": report.wait_ms, "outsideMs": report.outside_ms, "asksQueued": report.asks, "readGeneration": report.read_generation, "carried": report.carried, "closureRounds": report.closure_rounds, "recordCalls": report.record_calls, "recordStatements": report.record_statements})
 }
 
 /// D2-ACTOR-E (bsv-low #954) item 4: was the event born on a WARM actor (written at or after the actor's bootstrap
@@ -3261,6 +3507,7 @@ pub async fn apply_burst<R: SqlPort, L: SqlPort, O: Outside>(
         report.carried = reports.iter().all(|r| r.carried);
         report.closure_rounds = reports.iter().map(|r| r.closure_rounds).sum();
         report.record_calls = reports.iter().map(|r| r.record_calls).sum();
+        report.record_statements = reports.iter().map(|r| r.record_statements).sum();
         report.coalesced = passes;
         // FOLD-14 item 2: the pass's stages, every chunk's (each event of the pass answered the same pass).
         report.read_ms = reports.iter().map(|r| r.read_ms).sum();
@@ -3514,6 +3761,9 @@ pub async fn held_tip<L: SqlPort>(local: &L, me: &str) -> Option<u64> {
 /// How one apply ended: applied, or HELD (the actor not bootstrapped; `rearmed`, a bootstrapped actor whose closure
 /// met its bound and un-stamped itself).
 #[derive(Debug)]
+// D2-ACTOR-G: `ApplyReport` grew by its statement count; a held answer is rare and boxing the report would allocate on
+// every apply.
+#[allow(clippy::large_enum_variant)]
 pub enum Applied {
     Done(ApplyReport, Vec<(String, Value)>),
     Held { rearmed: bool },
@@ -4964,6 +5214,12 @@ impl PendingBars {
                     self.stages.entry((class, ring)).or_default().push(v);
                 }
             }
+            if let Some(v) = answer["recordStatements"].as_u64() {
+                self.stages
+                    .entry((class, path_ring(path, "statements")))
+                    .or_default()
+                    .push(v);
+            }
         }
         // D2-ACTOR-D: the rows' visibility once per event, at its first apply ([`samples_visible`]).
         // D2-ACTOR-B-FOLD-11 (NEW6-L1): an answer that names its samples (`visibleMs`, one an event of a coalesced
@@ -5154,7 +5410,7 @@ pub const JUDGE_VERSION: &str = "fix997-2026-10-30";
 /// within the object's own work before and after the apply: the event's facts, the coalesced events' checks).
 /// FIX-962 (bsv-low #962): the `cold` class row's ring of bootstrap page work ([`PendingBars::cold_page`]).
 pub const COLD_PAGE_RING: &str = "page";
-pub const APPLY_STAGES: [(&str, &str); 6] = [
+pub const APPLY_STAGES: [(&str, &str); 7] = [
     ("readMs", "read"),
     ("judgeMs", "judge"),
     ("writeMs", "write"),
@@ -5167,6 +5423,9 @@ pub const APPLY_STAGES: [(&str, &str); 6] = [
     // declined included, so a D1 stall shows in this stage; their OUTCOME is in `direct.closureFaults` and
     // `direct.closureDeclines`, read beside it.
     ("closureMs", "closure"),
+    // D2-ACTOR-G (bsv-low #1031): not a time: the record statements the apply ran (`recordStatements`), so the next
+    // window reads the D1 read's cost per apply, not only its time (`recordStatementsP95`).
+    ("recordStatements", "statements"),
 ];
 
 /// FIX-959 (bsv-low #959; the reading's "the bars drop those flags"): the READ PATH of an apply sample, from its answer:
@@ -5185,6 +5444,13 @@ pub fn read_path(answer: &Value) -> &'static str {
 }
 /// FIX-959: the read paths, each with its apply ring and its visibility ring on a class's bars row.
 pub const READ_PATHS: [&str; 3] = ["carried", "narrowed", "full"];
+/// D2-ACTOR-G (bsv-low #1031): the read paths' statement rings (`statementsCarried`, ..), served
+/// `paths.<path>.recordStatementsP95`.
+pub const PATH_STATEMENT_RINGS: [(&str, &str, &str); 3] = [
+    ("carried", "statements", "statementsCarried"),
+    ("narrowed", "statements", "statementsNarrowed"),
+    ("full", "statements", "statementsFull"),
+];
 /// FIX-959: the rings of [`READ_PATHS`], by name (`applyCarried`, .., `visibleFull`).
 ///
 /// Stated (review round 1's NIT-3): each `owed-actor:bars:<class>` row grows by these six rings, at most 6 x
@@ -5201,6 +5467,7 @@ pub const PATH_RINGS: [(&str, &str, &str); 6] = [
 fn path_ring(path: &str, meter: &str) -> &'static str {
     PATH_RINGS
         .iter()
+        .chain(&PATH_STATEMENT_RINGS)
         .find(|(p, m, _)| *p == path && *m == meter)
         .map_or("applyFull", |(_, _, r)| r)
 }
@@ -5326,8 +5593,8 @@ pub async fn flush_bars_from(
                 )
             })
             .collect();
-        // FIX-959: the read paths' rings.
-        for (_, _, ring) in PATH_RINGS {
+        // FIX-959: the read paths' rings (D2-ACTOR-G: and their statement rings).
+        for (_, _, ring) in PATH_RINGS.iter().chain(&PATH_STATEMENT_RINGS) {
             staged.push((
                 ring,
                 pending
@@ -5452,9 +5719,10 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
                 .map(|p| {
                     let a = ring(c, path_ring(p, "apply")).0;
                     let v = ring(c, path_ring(p, "visible")).0;
+                    let st = ring(c, path_ring(p, "statements")).0;
                     (
                         (*p).to_string(),
-                        json!({"applySamples": a.samples.len(), "applyMsP95": a.quantile(0.95), "visibleSamples": v.samples.len(), "visibleMsP95": v.quantile(0.95)}),
+                        json!({"applySamples": a.samples.len(), "applyMsP95": a.quantile(0.95), "visibleSamples": v.samples.len(), "visibleMsP95": v.quantile(0.95), "recordStatementsP95": st.quantile(0.95)}),
                     )
                 })
                 .collect();
