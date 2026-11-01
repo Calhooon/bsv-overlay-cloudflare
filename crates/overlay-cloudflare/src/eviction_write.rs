@@ -162,11 +162,19 @@ pub(crate) fn plan_pairs(snapshot: &Snapshot, txid: &str) -> Vec<(&'static str, 
     out
 }
 
-pub(crate) fn plan(snapshot: &Snapshot, txid: &str, reason: &str, now_ms: u64) -> Vec<Query> {
-    let mut out = vec![Query::new(OPEN_EVICTION_MARKER_SQL)
+/// THE OPEN marker as every production write binds it (bsv-low #1019): the txid, the reason, the stamp and the
+/// refusal's CLASS of that reason (`eviction_class::eviction_refusal_class`), so the ledger records the class at
+/// the write, in the marker's own statement (no statement more, no trigger fired twice).
+pub(crate) fn open_marker(txid: &str, reason: &str, now_ms: u64) -> Query {
+    Query::new(OPEN_EVICTION_MARKER_SQL)
         .bind(txid)
         .bind(reason)
-        .bind(now_ms)];
+        .bind(now_ms)
+        .bind(crate::eviction_class::eviction_refusal_class(reason))
+}
+
+pub(crate) fn plan(snapshot: &Snapshot, txid: &str, reason: &str, now_ms: u64) -> Vec<Query> {
+    let mut out = vec![open_marker(txid, reason, now_ms)];
     out.push(Query::new(READMISSION_FENCE_SQL).bind(txid));
     for (table, keys) in MOVED_TABLES {
         let Some((_, cols)) = snapshot.tables.iter().find(|(name, _)| name == table) else {
@@ -315,12 +323,7 @@ pub(crate) async fn evict(
 ) -> (EvictionCore, Option<PendingAbort>, Vec<ReleasedSpend>) {
     let mut core = EvictionCore::default();
     let mut released = Vec::new();
-    if let Err(e) = Query::new(OPEN_EVICTION_MARKER_SQL)
-        .bind(txid)
-        .bind(reason)
-        .bind(now_ms)
-        .execute(db)
-        .await
+    if let Err(e) = open_marker(txid, reason, now_ms).execute(db).await
     {
         core.faults.push(format!("open marker: {e}"));
         return (core, None, released);
@@ -657,10 +660,7 @@ mod tests {
         // Opening a later eviction cannot make the earlier evidence active again.
         execute(
             &f.db,
-            &[Query::new(OPEN_EVICTION_MARKER_SQL)
-                .bind(f.join.as_str())
-                .bind("REJECTED")
-                .bind(3_000u64)],
+            &[open_marker(f.join.as_str(), "REJECTED", 3_000)],
         )
         .unwrap();
         assert_eq!(active(&f), 0);
@@ -1039,5 +1039,41 @@ mod tests {
         let writer = &writer[..writer.find("\n}\n").unwrap()];
         assert!(writer.contains("let queries = plan(&snapshot, txid, reason, now_ms)"));
         assert!(writer.contains("crate::d1_ledger::counted_batch(db, statements)"));
+    }
+
+    fn refusal_class(f: &Fixture) -> Option<String> {
+        f.db.query_row(
+            "SELECT refusalClass FROM pot_evictions WHERE txid=?1",
+            [f.join.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// bsv-low #1019 (c): every eviction arm's reason, written through the SHIPPED plan (the OPEN marker's own
+    /// statement, `open_marker`) under real SQLite with the overlay's migrations, records its class; the stored
+    /// class follows the stored reason when a later eviction re-opens a readmitted row, and a readmission stamped
+    /// after the pass keeps both. Both production OPEN sites bind through `open_marker`.
+    #[test]
+    fn fix1019_c_each_arm_writes_its_class_at_the_write() {
+        for (arm, reason, want) in crate::eviction_class::tests::arm_reasons() {
+            let f = fixture();
+            execute(&f.db, &plan(&f.snapshot, &f.join, &reason, 1_000)).unwrap();
+            assert_eq!(refusal_class(&f).as_deref(), want, "{arm}");
+        }
+        let f = fixture();
+        execute(&f.db, &plan(&f.snapshot, &f.join, "REJECTED (arcade live DOUBLE_SPEND_ATTEMPTED: ; both indexers absent)", 1_000)).unwrap();
+        assert_eq!(refusal_class(&f).as_deref(), Some("double-spend"));
+        // readmitted at 2,000; a pass stamped before it yields: the reason and the class are kept
+        execute(&f.db, &[Query::new(crate::admit_fast::READMIT_EVICTION_SQL).bind(2_000u64).bind(f.join.as_str())]).unwrap();
+        execute(&f.db, &[open_marker(&f.join, "SEEN_ON_NETWORK (arcade missing, both indexers absent)", 1_500)]).unwrap();
+        assert_eq!(refusal_class(&f).as_deref(), Some("double-spend"), "a newer readmission keeps the class");
+        // a fresh refusal after the readmission re-opens the row with its own reason's class
+        execute(&f.db, &[open_marker(&f.join, "SEEN_ON_NETWORK (arcade missing, both indexers absent)", 3_000)]).unwrap();
+        assert_eq!(refusal_class(&f).as_deref(), Some("absence"));
+        let src = include_str!("eviction_write.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert_eq!(prod.matches("Query::new(OPEN_EVICTION_MARKER_SQL)").count(), 1, "one OPEN site: open_marker");
+        assert_eq!(prod.matches("open_marker(txid, reason, now_ms)").count(), 2, "both production OPEN writes");
     }
 }

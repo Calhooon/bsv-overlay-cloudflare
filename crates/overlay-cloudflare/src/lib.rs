@@ -41,6 +41,7 @@ pub mod door_words;
 pub mod ef;
 pub mod ef_deferred;
 pub mod error;
+pub mod eviction_class;
 mod eviction_write;
 mod gasp_cost;
 pub mod gasp_deferred;

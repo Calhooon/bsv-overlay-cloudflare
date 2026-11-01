@@ -226,7 +226,7 @@ pub const MIRROR_DDL: &[&str] = &[
   spenderPayBSats INT
 , blockTime INTEGER)"#,
     r#"CREATE INDEX IF NOT EXISTS idx_evicted_pot_txid ON pot_records_evicted(txid)"#,
-    r#"CREATE TABLE IF NOT EXISTS pot_evictions (txid TEXT PRIMARY KEY, reason TEXT NOT NULL, evictedAt INTEGER NOT NULL, readmittedAt INTEGER, rowsMoved INTEGER NOT NULL DEFAULT 0, releasedSpends TEXT)"#,
+    r#"CREATE TABLE IF NOT EXISTS pot_evictions (txid TEXT PRIMARY KEY, reason TEXT NOT NULL, evictedAt INTEGER NOT NULL, readmittedAt INTEGER, rowsMoved INTEGER NOT NULL DEFAULT 0, releasedSpends TEXT, refusalClass TEXT)"#,
     r#"CREATE TABLE IF NOT EXISTS submit_refusals (hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, refusedTxid TEXT NOT NULL, reason TEXT NOT NULL, refusedAt INTEGER NOT NULL, PRIMARY KEY (hopTxid, hopVout))"#,
     r#"CREATE INDEX IF NOT EXISTS idx_submit_refusals_at ON submit_refusals(refusedAt)"#,
     r#"CREATE TABLE IF NOT EXISTS network_seen (txid TEXT PRIMARY KEY, seenAt INTEGER, seenSource TEXT, sourceAtMs INTEGER)"#,
@@ -289,7 +289,7 @@ pub const COLUMNS: &[(&str, &[&str])] = &[
     ("pot_hop_seats", &["potTxid", "potVout", "markerRowid"]),
     ("pot_records", &["txid", "outputIndex", "spent", "spendingTxid", "createdAt", "spentConfirmed", "spentAt", "lockKind", "pubA", "pubB", "pubTower", "payPkhA", "payPkhB", "rakePkh", "stakeA", "stakeB", "feeSats", "recoveryHeight", "potSats", "paramsDecoded", "verdict", "verdictTxid", "spentHeight", "firstSpentAt", "spenderFinal", "settleSigners", "fundingSizeBytes", "fundingFeeSats", "spenderFactsTxid", "spenderSizeBytes", "spenderFeeSats", "spendDiscoveryAt", "spenderPayASats", "spenderPayBSats", "blockTime"]),
     ("pot_records_evicted", &["af_evictedAt", "af_reason", "txid", "outputIndex", "spent", "spendingTxid", "createdAt", "spentConfirmed", "spentAt", "lockKind", "pubA", "pubB", "pubTower", "payPkhA", "payPkhB", "rakePkh", "stakeA", "stakeB", "feeSats", "recoveryHeight", "potSats", "paramsDecoded", "verdict", "verdictTxid", "spentHeight", "firstSpentAt", "spenderFinal", "settleSigners", "fundingSizeBytes", "fundingFeeSats", "spenderFactsTxid", "spenderSizeBytes", "spenderFeeSats", "spendDiscoveryAt", "spenderPayASats", "spenderPayBSats", "blockTime"]),
-    ("pot_evictions", &["txid", "reason", "evictedAt", "readmittedAt", "rowsMoved", "releasedSpends"]),
+    ("pot_evictions", &["txid", "reason", "evictedAt", "readmittedAt", "rowsMoved", "releasedSpends", "refusalClass"]),
     ("submit_refusals", &["hopTxid", "hopVout", "refusedTxid", "reason", "refusedAt"]),
     ("network_seen", &["txid", "seenAt", "seenSource", "sourceAtMs"]),
     ("owed_spender_bytes", &["txid", "bytesJson", "createdAtMs"]),
@@ -309,7 +309,7 @@ pub const BLOBS: &[(&str, &str)] = &[
     ("transactions", "beef"),
 ];
 /// The schema's digest, held in the actor's `meta` (`schema`): a mirror built under another is dropped and rebuilt.
-pub const DIGEST: &str = "db7361b4f1234f32b734c39b494aa2789603f5b07cae2dbd486a2ff99f15b027";
+pub const DIGEST: &str = "23d18b191498d166103fd2b78e05039cdc214b5b74c489ee4826d29558af3ac2";
 
 pub fn columns(table: &str) -> &'static [&'static str] {
     COLUMNS

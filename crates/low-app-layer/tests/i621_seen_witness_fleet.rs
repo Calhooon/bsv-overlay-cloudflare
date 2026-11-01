@@ -109,6 +109,7 @@ fn served() -> Value {
                 evicted_at: r.get(1)?,
                 readmitted_at: r.get(2)?,
                 reason: r.get(3)?,
+                refusal_class: r.get(4)?,
             })
         })
         .unwrap()

@@ -2222,6 +2222,9 @@ struct EvictionRow {
     /// bsv-low #621: the eviction's reason, read for its chain word (`eviction_chain_word`).
     #[serde(default)]
     reason: Option<String>,
+    /// bsv-low #1019: the refusal class the ledger recorded at the write (`refusal_class_word`).
+    #[serde(rename = "refusalClass", default)]
+    refusal_class: Option<String>,
 }
 
 /// One `network_seen` row with its witness (bsv-low #621, `network_seen_by_batch_sql`).
@@ -3015,6 +3018,9 @@ impl PotStorage for D1PotStorage {
                         readmitted_at: row.readmitted_at.map(|v| v as i64),
                         chain_word: overlay_discovery::pot::storage::eviction_chain_word(
                             row.reason.as_deref().unwrap_or(""),
+                        ),
+                        refusal_class: overlay_discovery::pot::storage::refusal_class_word(
+                            row.refusal_class.as_deref(),
                         ),
                     },
                 );

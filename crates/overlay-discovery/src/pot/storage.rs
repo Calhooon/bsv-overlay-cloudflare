@@ -285,6 +285,42 @@ pub struct EvictionLedgerEntry {
     /// `rejected` (Arcade's own terminal word on the bytes), `conflicted` (a competitor spending the pot's own input,
     /// confirmed), `None` (an eviction on ABSENCE alone, or a reason no producer writes).
     pub chain_word: Option<&'static str>,
+    /// bsv-low #1019: the refusal's CLASS the ledger recorded at the write (`pot_evictions.refusalClass`), read by
+    /// [`refusal_class_word`]: one of [`REFUSAL_CLASSES`], `None` for a row written before the column, a reason the
+    /// classifier names no class for, or a stored value outside the vocabulary. DISPLAY and classification only:
+    /// nothing admits, presses or readmits on it.
+    pub refusal_class: Option<&'static str>,
+}
+
+/// bsv-low #1019: an eviction whose missing input or parent Arcade named (`TX_MISSING_PARENT`, `Missing inputs`, its
+/// orphan view).
+pub const REFUSAL_CLASS_MISSING_PARENT: &str = "missing-parent";
+/// bsv-low #1019: a double spend: Arcade's DOUBLE_SPEND_ATTEMPTED, a refusal naming a competitor (`UTXO_SPENT (70)`,
+/// `TX_CONFLICTING (36)`), or the conflict pass's confirmed competitor.
+pub const REFUSAL_CLASS_DOUBLE_SPEND: &str = "double-spend";
+/// bsv-low #1019: a non-final refusal (`TX_LOCK_TIME (35)`), evicted once past #836's bound.
+pub const REFUSAL_CLASS_NON_FINAL: &str = "non-final";
+/// bsv-low #1019: a policy refusal (`TX_POLICY`, a fee too low).
+pub const REFUSAL_CLASS_POLICY: &str = "policy";
+/// bsv-low #1019: an eviction on ABSENCE alone (Arcade missing or faulted, a fault-filled recorded word, the retire
+/// pass), both indexers absent: no Arcade word of its own on the bytes.
+pub const REFUSAL_CLASS_ABSENCE: &str = "absence";
+
+/// bsv-low #1019: the bounded vocabulary of `evicted.class`. A reader keys on these words, never on text; nothing
+/// outside them is ever stored or served (a reason no rule names is `null`, never a new word).
+pub const REFUSAL_CLASSES: [&str; 5] = [
+    REFUSAL_CLASS_MISSING_PARENT,
+    REFUSAL_CLASS_DOUBLE_SPEND,
+    REFUSAL_CLASS_NON_FINAL,
+    REFUSAL_CLASS_POLICY,
+    REFUSAL_CLASS_ABSENCE,
+];
+
+/// PURE (bsv-low #1019): a stored `refusalClass` as a vocabulary word; anything else (NULL, a value outside
+/// [`REFUSAL_CLASSES`]) is `None`, so the wire never carries a word the vocabulary does not hold.
+pub fn refusal_class_word(stored: Option<&str>) -> Option<&'static str> {
+    let stored = stored?;
+    REFUSAL_CLASSES.iter().copied().find(|c| *c == stored)
 }
 
 /// The served word of an OPEN eviction: bsv-tracker 0.2.2's `Word::Rejected`, wire `rejected`. A readmitted
@@ -349,16 +385,25 @@ pub fn eviction_chain_word(reason: &str) -> Option<&'static str> {
 /// The ONE projection of a ledger row on the wire (`/utxo-status.evicted`, `ls_pot spentStatus.evicted`):
 /// `{at, word, readmittedAt}`, `word` the eviction's chain word while open (`rejected` / `conflicted`; `null` for
 /// an eviction on absence alone, bsv-low #621) and `null` once readmitted.
+///
+/// bsv-low #1019 (ADDITIVE): `class`, the refusal's class while the eviction is OPEN (one of [`REFUSAL_CLASSES`]),
+/// is a fourth key present ONLY when it is a word: a null class (a row written before the column, a reason no rule
+/// names) and every readmitted row serve exactly the three keys above, byte for byte as before.
 pub fn served_eviction_value(
     at: i64,
     readmitted_at: Option<i64>,
     chain_word: Option<&'static str>,
+    refusal_class: Option<&'static str>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "at": at,
         "word": if readmitted_at.is_none() { chain_word } else { None },
         "readmittedAt": readmitted_at,
-    })
+    });
+    if let (None, Some(class)) = (readmitted_at, refusal_class) {
+        v["class"] = serde_json::Value::String(class.to_string());
+    }
+    v
 }
 
 /// bsv-low #621 (L5): the `network_seen` latch's witness for one txid: the broadcaster that said SEEN and its
@@ -420,7 +465,7 @@ pub fn evictions_by_txid_sql(n: usize) -> String {
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("SELECT lower(txid) AS txid, evictedAt, readmittedAt, reason FROM pot_evictions WHERE txid IN ({marks})")
+    format!("SELECT lower(txid) AS txid, evictedAt, readmittedAt, reason, refusalClass FROM pot_evictions WHERE txid IN ({marks})")
 }
 
 /// Txids per ledger statement (D1 binds at most 100).
@@ -1503,6 +1548,18 @@ impl MemoryPotStorage {
         readmitted_at: Option<i64>,
         chain_word: Option<&'static str>,
     ) {
+        self.record_eviction_classed(txid, evicted_at, readmitted_at, chain_word, None);
+    }
+
+    /// bsv-low #1019: a ledger row resting on `chain_word` with its recorded refusal class.
+    pub fn record_eviction_classed(
+        &self,
+        txid: &str,
+        evicted_at: i64,
+        readmitted_at: Option<i64>,
+        chain_word: Option<&'static str>,
+        refusal_class: Option<&'static str>,
+    ) {
         let mut g = self.evictions.lock().unwrap();
         if !matches!(*g, Some(Ok(_))) {
             *g = Some(Ok(Default::default()));
@@ -1514,6 +1571,7 @@ impl MemoryPotStorage {
                     evicted_at,
                     readmitted_at,
                     chain_word,
+                    refusal_class,
                 },
             );
         }

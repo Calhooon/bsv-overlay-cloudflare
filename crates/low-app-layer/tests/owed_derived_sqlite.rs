@@ -89,10 +89,12 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     // trigger marked); the 479 before them are untouched. FIX-1010-BUDGET edited the two party seat triggers (486,
     // 487) in place: shipped on no D1.
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..479]), 3_349_521_383);
-    const COUNT: usize = 493;
+    // bsv-low #1019 (FIX-1019) appends one: `pot_evictions.refusalClass`; the 493 before it are untouched.
+    assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..493]), 1_079_544_940);
+    const COUNT: usize = 494;
     assert_eq!(OVERLAY_MIGRATIONS.len(), COUNT);
     assert_eq!(d1::OVERLAY_MIGRATION_COUNT, COUNT);
-    const FINGERPRINT: u32 = 1_079_544_940;
+    const FINGERPRINT: u32 = 4_194_370_199;
     assert_eq!(
         d1::migration_list_fingerprint(),
         FINGERPRINT,
