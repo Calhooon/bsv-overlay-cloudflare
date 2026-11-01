@@ -113,7 +113,7 @@ pub const OWED_BELT: [&str; 9] = [
 /// bsv-low #912 (lane D2-ACTOR-B): the app layer's owed actor (`low_app_layer::owed_actor::COUNTERS`, pinned equal
 /// there): its Phase A compares against the D1 judge, the diffs, its faults, the direct calls, the reconcile.
 /// The last two (Phase C, HIGH-3): the `belt-ask`s the actors published, the belt's finds handed back to an actor.
-pub const OWED_ACTOR: [&str; 35] = [
+pub const OWED_ACTOR: [&str; 37] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -160,6 +160,10 @@ pub const OWED_ACTOR: [&str; 35] = [
     // and the filings whose answered closure was declined (past its bound); each filing then read its own miss.
     "owed_actor_direct_closure_faults_total",
     "owed_actor_direct_closure_declines_total",
+    // D2-ACTOR-G-FOLD-1 (the lens's MEDIUM-1): the actor's live rechecks whose read faulted, and the rows past the
+    // held recheck's room.
+    "owed_actor_recheck_faults_total",
+    "owed_actor_recheck_dropped_total",
 ];
 
 /// bsv-low #912: `/health/invariants.owedActor`, the actor's durable totals: the Phase A compares and their diffs,
@@ -183,6 +187,10 @@ pub fn owed_actor_view(counters: &serde_json::Value) -> serde_json::Value {
         "directClosureFaults": n("owed_actor_direct_closure_faults_total"),
         "directClosureDeclines": n("owed_actor_direct_closure_declines_total"),
         "closureMisses": n("owed_actor_closure_misses_total"),
+        "recheck": {
+            "faults": n("owed_actor_recheck_faults_total"),
+            "dropped": n("owed_actor_recheck_dropped_total"),
+        },
         "reconcile": {
             "compared": n("owed_actor_reconcile_compared_total"),
             "diffs": n("owed_actor_reconcile_diffs_total"),

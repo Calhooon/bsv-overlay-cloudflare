@@ -549,6 +549,18 @@ impl ViewMemo {
 /// word (the chain-event intake, which rewrites the row and so its key) the actor judges the word as the tracker
 /// recorded it, until its post-apply recheck (about a second later) re-applies the game; the D1 judge rechecked it
 /// inside its judgement. The read (`GET /owed`) rechecks every word it serves, as before.
+///
+/// THE COMPARE RESIDUAL (D2-ACTOR-G-FOLD-1, the lens's MEDIUM-2), by name: the fleet compare is NOT zero by
+/// construction for the word input. The D1 judge rechecks every word live; the actor reads a mined word from the
+/// memo's held live view (at most [`WORD_VIEW_MEMO_MS`], 30 s, old) or its recorded header, so the two differ while a
+/// reorg has replaced the word's header and neither the memo's entry has expired nor the actor's post-apply recheck
+/// (`object::RECHECK_DELAY_MS`, about 1 s after the apply; on a faulted read its backoff, at most
+/// [`RECHECK_BACKOFF_MAX_MS`]) has re-applied the game, nor the tracker has demoted the word: up to 30 s plus the
+/// recheck's delay. Nothing marks it (no held-mark exclusion applies): a compare in that window counts a judge
+/// disagreement. The unbounded case the lens found (HIGH-1: a header chaintracks no longer serves, a live
+/// `cannotCheck` the recheck ignored) is closed: an unserved header is a move ([`header_unavailable`]), its held view
+/// forgotten, and the word asked live on every later apply ([`MemoOutside::live_only`]) until a live view checks; what
+/// remains of it is the first apply's recorded judgement until that recheck (the delay above).
 pub struct MemoOutside<'a, O: Outside> {
     pub inner: &'a O,
     pub memo: &'a ViewMemo,
@@ -556,6 +568,13 @@ pub struct MemoOutside<'a, O: Outside> {
     pub fresh: bool,
     /// The mined rows judged on their recorded header, for the live recheck after the apply (txid to row).
     pub deferred: RefCell<BTreeMap<String, crate::tracker_host::stored::Row>>,
+    /// D2-ACTOR-G-FOLD-1 (the lens's HIGH-1): the txids this actor's live recheck found UNSERVED at their proof height
+    /// ([`header_unavailable`]), held in its `meta` (`recheckLive`): a mined word among them is asked of `inner` on every
+    /// apply (never judged on its recorded header, which always checks), until a live view of it checks.
+    pub live_only: BTreeSet<String>,
+    /// The txids `inner` was asked for in this apply whose live view checked (the object takes them out of
+    /// `recheckLive`).
+    pub live_checked: RefCell<BTreeSet<String>>,
 }
 impl<'a, O: Outside> MemoOutside<'a, O> {
     pub fn new(inner: &'a O, memo: &'a ViewMemo, now_ms: u64, fresh: bool) -> Self {
@@ -565,7 +584,14 @@ impl<'a, O: Outside> MemoOutside<'a, O> {
             now_ms,
             fresh,
             deferred: RefCell::default(),
+            live_only: BTreeSet::new(),
+            live_checked: RefCell::default(),
         }
+    }
+    /// HIGH-1: the txids asked live whatever the memo and the recorded header say ([`MemoOutside::live_only`]).
+    pub fn with_live_only(mut self, live_only: BTreeSet<String>) -> Self {
+        self.live_only = live_only;
+        self
     }
 }
 impl ViewMemo {
@@ -585,28 +611,178 @@ impl ViewMemo {
             }
         }
     }
+    /// HIGH-1: drop the held views of `rows` (a live recheck found their header unserved: a checked view held before
+    /// is no longer the chain's).
+    pub fn forget(&self, rows: &BTreeMap<String, crate::tracker_host::stored::Row>) {
+        let mut held = self.views.borrow_mut();
+        for (k, row) in rows {
+            held.remove(&ViewMemo::key(k, row));
+        }
+    }
+}
+
+/// D2-ACTOR-G-FOLD-1 (the lens's HIGH-1): a live view that says chaintracks serves NO active header at the word's
+/// proof height (bsv-tracker's `CheckError::Unavailable`, rendered `Unavailable(<height>)`: the verified tip below the
+/// height, an invalidated tip header, the #896 class). The D1 judge reads such a mined word as `Awaiting`
+/// (`owed::checked_tracker_mined`, `owed::coin_landing`), while the row's recorded view always checks, so it is a
+/// MOVE, never "could not check". A `Headers(..)` answer (a transport or snapshot fault) is a fault, retried.
+pub fn header_unavailable(v: &Value) -> bool {
+    v.get("cannotCheck")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.starts_with("Unavailable("))
+}
+
+/// D2-ACTOR-G-FOLD-1: what one live recheck found of the rows it held.
+#[derive(Debug, Default)]
+pub struct RecheckOutcome {
+    /// The txids whose games are re-applied: a live view that checked and differs from the recorded one, or one whose
+    /// header is unserved ([`header_unavailable`], the lens's HIGH-1).
+    pub moved: BTreeSet<String>,
+    /// The txids whose header is unserved: asked live on every later apply (`recheckLive`) until a view checks.
+    pub unavailable: BTreeSet<String>,
+    /// The txids whose live view checked (taken out of `recheckLive`).
+    pub checked: BTreeSet<String>,
+    /// The rows the read could not judge (no live view, or `cannotCheck` that is not [`header_unavailable`]): held
+    /// again for the next recheck (MEDIUM-1).
+    pub faulted: BTreeMap<String, crate::tracker_host::stored::Row>,
+}
+
+/// PURE (D2-ACTOR-G-FOLD-1): the live recheck after an apply, [`RecheckOutcome`] of `live` (the CHAINTRACKS views of
+/// the `deferred` rows); the checked views held in the memo, an unserved header's held view forgotten.
+pub fn recheck_outcome(
+    rows: &BTreeMap<String, crate::tracker_host::stored::Row>,
+    live: &BTreeMap<String, Value>,
+    memo: &ViewMemo,
+    now: u64,
+) -> RecheckOutcome {
+    memo.remember(rows, live, now);
+    let mut out = RecheckOutcome::default();
+    let mut gone = BTreeMap::new();
+    for (k, row) in rows {
+        match live.get(k) {
+            Some(v) if v.get("cannotCheck").is_none_or(Value::is_null) => {
+                out.checked.insert(k.clone());
+                if row.recorded_view().ok().as_ref() != Some(v) {
+                    out.moved.insert(k.clone());
+                }
+            }
+            Some(v) if header_unavailable(v) => {
+                out.unavailable.insert(k.clone());
+                out.moved.insert(k.clone());
+                gone.insert(k.clone(), row.clone());
+            }
+            _ => {
+                out.faulted.insert(k.clone(), row.clone());
+            }
+        }
+    }
+    memo.forget(&gone);
+    out
+}
+
+/// D2-ACTOR-G-FOLD-1 (MEDIUM-1): the recheck's backoff after a faulted read: [`RECHECK_FAULT_BASE_MS`] doubling per
+/// consecutive fault, at most [`RECHECK_BACKOFF_MAX_MS`].
+pub const RECHECK_FAULT_BASE_MS: u64 = 1_000;
+pub const RECHECK_BACKOFF_MAX_MS: u64 = 300_000;
+/// D2-ACTOR-G-FOLD-1: the most rows one actor holds for its recheck (and txids in `recheckLive`); a row past it is
+/// counted `owed_actor_recheck_dropped_total`.
+pub const RECHECK_HELD_MAX: usize = 256;
+
+/// PURE (D2-ACTOR-G-FOLD-1, MEDIUM-1): `rows` and `games` merged into the held recheck (`meta.recheck`, `{rows,
+/// games, faults}`), at most [`RECHECK_HELD_MAX`] rows; the answer's count is the rows past it (counted, never silent).
+/// A row already held is replaced by the newer one.
+pub fn recheck_merge(
+    held: Option<Value>,
+    rows: BTreeMap<String, crate::tracker_host::stored::Row>,
+    games: &[String],
+) -> (Value, u64) {
+    let mut held = held
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({"rows": {}, "games": []}));
+    if !held["rows"].is_object() {
+        held["rows"] = json!({});
+    }
+    let mut dropped = 0;
+    for (k, row) in rows {
+        let m = held["rows"].as_object().map_or(0, |m| m.len());
+        if m >= RECHECK_HELD_MAX && held["rows"].get(&k).is_none() {
+            dropped += 1;
+            continue;
+        }
+        held["rows"][k] = json!(row);
+    }
+    let mut gs: BTreeSet<String> = held["games"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|g| g.as_str().map(str::to_string))
+        .collect();
+    gs.extend(games.iter().map(|g| g.to_ascii_lowercase()));
+    held["games"] = json!(gs);
+    (held, dropped)
+}
+
+/// PURE (D2-ACTOR-G-FOLD-1, MEDIUM-1): the held recheck after a read, from `current` (re-read AFTER the read, so a
+/// row an apply merged meanwhile stays): each row the read `handled` taken out when it is the row read, every row of
+/// `faulted` held again; `read_faulted` (the read answered an error) or any faulted row adds one to `faults`. `None`
+/// when no row is left (the meta row deleted), else the value to hold and the alarm's delay: the backoff after a
+/// fault ([`RECHECK_FAULT_BASE_MS`] doubling, at most [`RECHECK_BACKOFF_MAX_MS`]), else `RECHECK_FAULT_BASE_MS` (rows
+/// merged during the read).
+pub fn recheck_settle(
+    current: Option<Value>,
+    handled: &BTreeMap<String, crate::tracker_host::stored::Row>,
+    faulted: &BTreeMap<String, crate::tracker_host::stored::Row>,
+    read_faulted: bool,
+) -> Option<(Value, u64)> {
+    let mut held = current
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({"rows": {}, "games": []}));
+    if let Some(m) = held["rows"].as_object_mut() {
+        for (k, row) in handled {
+            if m.get(k) == Some(&json!(row)) {
+                m.remove(k);
+            }
+        }
+    } else {
+        held["rows"] = json!({});
+    }
+    for (k, row) in faulted {
+        if held["rows"].get(k).is_none() {
+            held["rows"][k] = json!(row);
+        }
+    }
+    let faults = if read_faulted || !faulted.is_empty() {
+        held["faults"].as_u64().unwrap_or(0) + 1
+    } else {
+        0
+    };
+    held["faults"] = json!(faults);
+    if held["rows"].as_object().is_none_or(|m| m.is_empty()) {
+        return None;
+    }
+    let delay = if faults == 0 {
+        RECHECK_FAULT_BASE_MS
+    } else {
+        RECHECK_FAULT_BASE_MS
+            .saturating_mul(1u64 << (faults - 1).min(20))
+            .min(RECHECK_BACKOFF_MAX_MS)
+    };
+    Some((held, delay))
 }
 
 /// PURE (D2-ACTOR-G): the live recheck after an apply: `live` (the CHAINTRACKS views of the `deferred` rows) held in
-/// the memo, and the txids whose live view checked and differs from the view the apply judged them by (the recorded
-/// header's): their games are re-applied. A live view that could not check (`cannotCheck`: a CHAINTRACKS fault, a
-/// changing snapshot) moves nothing.
+/// the memo, and the txids whose games are re-applied: a live view that checked and differs from the view the apply
+/// judged them by (the recorded header's), or (D2-ACTOR-G-FOLD-1, the lens's HIGH-1) one whose header chaintracks no
+/// longer serves ([`header_unavailable`]: the D1 judge reads it `Awaiting`, the recorded view mined). A live view that
+/// could not check for any other cause (a CHAINTRACKS fault, a changing snapshot) moves nothing and is held again
+/// ([`recheck_outcome`]'s `faulted`, MEDIUM-1).
 pub fn recheck_moved(
     rows: &BTreeMap<String, crate::tracker_host::stored::Row>,
     live: &BTreeMap<String, Value>,
     memo: &ViewMemo,
     now: u64,
 ) -> BTreeSet<String> {
-    memo.remember(rows, live, now);
-    rows.iter()
-        .filter(|(k, row)| {
-            live.get(*k).is_some_and(|v| {
-                v.get("cannotCheck").is_none_or(Value::is_null)
-                    && row.recorded_view().ok().as_ref() != Some(v)
-            })
-        })
-        .map(|(k, _)| k.clone())
-        .collect()
+    recheck_outcome(rows, live, memo, now).moved
 }
 
 impl<O: Outside> Outside for MemoOutside<'_, O> {
@@ -625,6 +801,12 @@ impl<O: Outside> Outside for MemoOutside<'_, O> {
                 }
                 if row.word != "mined" {
                     out.insert(k.clone(), row.view());
+                    continue;
+                }
+                // HIGH-1: a word whose header this actor's recheck found unserved is asked live, never judged on its
+                // recorded header (which always checks) nor on a view held before
+                if self.live_only.contains(&k.to_ascii_lowercase()) {
+                    ask.insert(k.clone(), row.clone());
                     continue;
                 }
                 if let Some((v, _)) = held
@@ -650,6 +832,11 @@ impl<O: Outside> Outside for MemoOutside<'_, O> {
         }
         let got = self.inner.word_views(&ask).await?;
         self.memo.remember(&ask, &got, self.now_ms);
+        self.live_checked.borrow_mut().extend(
+            got.iter()
+                .filter(|(_, v)| v.get("cannotCheck").is_none_or(Value::is_null))
+                .map(|(k, _)| k.to_ascii_lowercase()),
+        );
         out.extend(got);
         Ok(out)
     }
@@ -1639,11 +1826,15 @@ pub fn marked_select() -> String {
 /// [`HELD_BEEF_LENS_SQL`]), compared for BOTH families of the txid in each family's arm, so the two rows of a txid are
 /// re-read together or skipped together (the mirror's `pot` and `stored` facts are one decision over both). A length
 /// that moved (a proof merged into a BEEF, a BEEF replaced, a row added or deleted) re-reads both, and every apply but
-/// the warm narrowed one (a full read, a page, a miss round, a fallback) reads the bytes as before. Stated: a BEEF
-/// replaced by different bytes of EXACTLY the same length for the same txid is not re-read until the game's next full
-/// read (`FULL_REFRESH_EVERY_MS`); its facts are of the same transaction (the txid binds the inputs and the outputs),
-/// so what could differ is only the bump a replacement carried, which the proof latches the judge reads beside it
-/// decide.
+/// the warm narrowed one (a full read, a page, a miss round, a fallback) reads the bytes as before.
+///
+/// D2-ACTOR-G-FOLD-1 (the lens's LOW-1): the length alone held a same-length re-anchor (a reorg's new BUMP of the
+/// same depth and height varint) on the old `bumpHeight` (FIX-997, read for `atHeight`) for up to a day. The facts'
+/// one BUMP-derived value is the height of the subject's own bump, so the hold also compares that height's bytes in
+/// place ([`bump_mark`]: `pb` / `tb`, the 1-based offset of the subject bump's height varint and its hex, `[]` for a
+/// subject with no bump): a moved height re-reads both families. A `len` row with no mark (one written before the
+/// fold, or bytes whose bump the mark could not place) re-reads. Stated: a re-anchor that keeps the length, the
+/// subject's bump height and its offset changes no fact the mirror holds.
 pub fn marked_select_held() -> String {
     let plain = marked_select();
     let parts: Vec<&str> = plain.split("hex(t.beef)").collect();
@@ -1673,10 +1864,78 @@ fn held_beef_expr(f: &Family) -> &'static str {
         HELD_TRANSACTIONS_BEEF_EXPR
     }
 }
-/// D2-ACTOR-G: `pot_beefs`' bytes in the warm narrowed read ([`marked_select_held`]).
-pub const HELD_POT_BEEF_EXPR: &str = "CASE WHEN length(t.beef)=json_extract(?7,'$.\"'||t.txid||'\".p') AND COALESCE((SELECT length(x.beef) FROM transactions x WHERE x.txid=t.txid),-1)=json_extract(?7,'$.\"'||t.txid||'\".t') THEN NULL ELSE hex(t.beef) END";
-/// D2-ACTOR-G: `transactions`' bytes in the warm narrowed read ([`marked_select_held`]).
-pub const HELD_TRANSACTIONS_BEEF_EXPR: &str = "CASE WHEN length(t.beef)=json_extract(?7,'$.\"'||t.txid||'\".t') AND COALESCE((SELECT length(x.beef) FROM pot_beefs x WHERE x.txid=t.txid),-1)=json_extract(?7,'$.\"'||t.txid||'\".p') THEN NULL ELSE hex(t.beef) END";
+/// D2-ACTOR-G-FOLD-1 (LOW-1): the mark `$k` (`pb` or `tb`) holds of the bytes `$b`: an array, empty (no bump) or
+/// whose hex at its offset is the bytes' own.
+macro_rules! held_bump_mark {
+    ($b:literal, $k:literal) => {
+        concat!(
+            "(json_type(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "')='array' AND (json_array_length(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "')=0 OR hex(substr(",
+            $b,
+            ",json_extract(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "[0]'),length(json_extract(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "[1]'))/2))=json_extract(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "[1]')))"
+        )
+    };
+}
+/// D2-ACTOR-G: `pot_beefs`' bytes in the warm narrowed read ([`marked_select_held`]); D2-ACTOR-G-FOLD-1: and the
+/// subject bump's height in place in both families ([`bump_mark`]).
+pub const HELD_POT_BEEF_EXPR: &str = concat!(
+    "CASE WHEN length(t.beef)=json_extract(?7,'$.\"'||t.txid||'\".p') AND COALESCE((SELECT length(x.beef) FROM transactions x WHERE x.txid=t.txid),-1)=json_extract(?7,'$.\"'||t.txid||'\".t') AND ",
+    held_bump_mark!("t.beef", "pb"),
+    " AND COALESCE((SELECT ",
+    held_bump_mark!("x.beef", "tb"),
+    " FROM transactions x WHERE x.txid=t.txid),1) THEN NULL ELSE hex(t.beef) END"
+);
+/// D2-ACTOR-G: `transactions`' bytes in the warm narrowed read ([`marked_select_held`]); D2-ACTOR-G-FOLD-1: and the
+/// subject bump's height in place in both families ([`bump_mark`]).
+pub const HELD_TRANSACTIONS_BEEF_EXPR: &str = concat!(
+    "CASE WHEN length(t.beef)=json_extract(?7,'$.\"'||t.txid||'\".t') AND COALESCE((SELECT length(x.beef) FROM pot_beefs x WHERE x.txid=t.txid),-1)=json_extract(?7,'$.\"'||t.txid||'\".p') AND ",
+    held_bump_mark!("t.beef", "tb"),
+    " AND COALESCE((SELECT ",
+    held_bump_mark!("x.beef", "pb"),
+    " FROM pot_beefs x WHERE x.txid=t.txid),1) THEN NULL ELSE hex(t.beef) END"
+);
+
+/// PURE (D2-ACTOR-G-FOLD-1, the lens's LOW-1): where `bytes` (a stored BEEF of `txid`) hold the height of the subject's
+/// own bump: `[offset, hex]`, the 1-based offset of the bump's height varint (its serialization found in the bytes) and
+/// the varint's hex; `[]` when the subject carries no bump; `null` when the bytes do not parse, name no such
+/// transaction, or the bump's serialization is not found (the hold then re-reads: fail closed).
+pub fn bump_mark(txid: &str, bytes: &[u8]) -> Value {
+    let Ok(b) = overlay_engine::beef_limits::parse_beef(
+        bytes,
+        &overlay_engine::beef_limits::APP_BEEF_LIMITS,
+    ) else {
+        return Value::Null;
+    };
+    let Some(btx) = b.find_txid(txid) else {
+        return Value::Null;
+    };
+    let Some(bump) = btx.bump_index().and_then(|i| b.bumps.get(i)) else {
+        return json!([]);
+    };
+    let bin = bump.to_binary();
+    let h = bump.block_height;
+    let vlen = match h {
+        0..=0xfc => 1,
+        0xfd..=0xffff => 3,
+        _ => 5,
+    };
+    if bin.len() < vlen {
+        return Value::Null;
+    }
+    match bytes.windows(bin.len()).position(|w| w == bin.as_slice()) {
+        Some(at) => json!([at + 1, hex::encode_upper(&bytes[at..at + vlen])]),
+        None => Value::Null,
+    }
+}
 
 /// D2-ACTOR-G: the BEEF lengths the mirror last read of `?1`'s txids (the `len` rows of `txfacts`, written by
 /// [`write_round_of`] beside the facts they were decoded from), as `{txid: {"p", "t"}}`.
@@ -1985,6 +2244,8 @@ fn write_round_of(
     // held beside its facts (`txfacts` `len`), and a closure's (facts, no bytes) drops it.
     let mut skipped: BTreeSet<String> = BTreeSet::new();
     let mut lens: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    // D2-ACTOR-G-FOLD-1 (LOW-1): each read BEEF's subject bump height in place ([`bump_mark`]), `pb` and `tb`
+    let mut marks: BTreeMap<String, (Value, Value)> = BTreeMap::new();
     for (f, rows) in FAMILIES.iter().zip(read) {
         if !f.beef {
             continue;
@@ -1998,12 +2259,18 @@ fn write_round_of(
             }
             match r["__beef"].as_str() {
                 Some(h) => {
+                    let mark = hex::decode(h)
+                        .map(|b| bump_mark(&txid, &b))
+                        .unwrap_or(Value::Null);
+                    let m = marks.entry(txid.clone()).or_insert((json!([]), json!([])));
                     let e = lens.entry(txid).or_insert((-1, -1));
                     let n = (h.len() / 2) as i64;
                     if f.table == "pot_beefs" {
                         e.0 = n;
+                        m.0 = mark;
                     } else {
                         e.1 = n;
+                        m.1 = mark;
                     }
                 }
                 None => {
@@ -2030,7 +2297,13 @@ fn write_round_of(
                 vec![
                     Bind::Text(txid.clone()),
                     Bind::Text("len".into()),
-                    Bind::Text(json!({"p": p, "t": t}).to_string()),
+                    Bind::Text({
+                        let (pb, tb) = marks
+                            .get(txid)
+                            .cloned()
+                            .unwrap_or((Value::Null, Value::Null));
+                        json!({"p": p, "t": t, "pb": pb, "tb": tb}).to_string()
+                    }),
                     Bind::Int(seq),
                 ],
             ));
@@ -5859,7 +6132,7 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
 /// (`owed_events::HEALTH_CONSUMER_SQL`).
 macro_rules! health_select {
     () => {
-        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold','owed-actor:bars:flood')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding,(SELECT cursor FROM owed_belt_state WHERE name='owed-judge:version') AS d1Rejudge"
+        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold','owed-actor:bars:flood')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total','owed_actor_recheck_faults_total','owed_actor_recheck_dropped_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding,(SELECT cursor FROM owed_belt_state WHERE name='owed-judge:version') AS d1Rejudge"
     };
 }
 pub const HEALTH_SQL: &str = health_select!();
@@ -5979,6 +6252,8 @@ pub fn health_body(read: Option<&Value>, now: u64, d1_oldest_unacked: &Value) ->
     // D2-ACTOR-D (bsv-low #952): the writers' direct calls (every owed frame's publisher), and those that met their
     // wall or faulted (the queue's message is the backstop of each).
     body["direct"] = json!({"calls": n(COUNTERS[3]), "walls": n(COUNTERS[25]), "faults": n(COUNTERS[4]), "closures": n(COUNTERS[32]), "closureFaults": n(COUNTERS[33]), "closureDeclines": n(COUNTERS[34])});
+    // D2-ACTOR-G-FOLD-1 (MEDIUM-1): the live rechecks whose read faulted and the rows past the held recheck's room.
+    body["recheck"] = json!({"faults": n(COUNTERS[35]), "dropped": n(COUNTERS[36])});
     // NEW-L3: Phase B's gate is COVERAGE, the bootstrap lever's last full pass (`complete`, `contiguous`, `uncovered`
     // 0), never `bootstraps` against `activeIdentities` (two counts).
     body["coverage"] = field("coverage");
@@ -7062,7 +7337,7 @@ mod tests;
 /// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
 /// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
 /// (MEDIUM-9).
-pub const COUNTERS: [&str; 35] = [
+pub const COUNTERS: [&str; 37] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -7122,6 +7397,10 @@ pub const COUNTERS: [&str; 35] = [
     // and the filings whose answered closure was declined (past its bound); each filing then read its own miss.
     "owed_actor_direct_closure_faults_total",
     "owed_actor_direct_closure_declines_total",
+    // D2-ACTOR-G-FOLD-1 (the lens's MEDIUM-1): the live rechecks whose read faulted (the rows held again, the alarm
+    // backed off), and the rows an apply judged on their recorded header that the held recheck had no room for.
+    "owed_actor_recheck_faults_total",
+    "owed_actor_recheck_dropped_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;

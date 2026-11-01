@@ -6914,7 +6914,7 @@ fn fold10_j_a_state_judged_under_another_build_bootstraps_again() {
     let actor = squash(include_str!("../owed_actor.rs"));
     assert!(actor.contains("body[\"rejudged\"]=n(COUNTERS[26]);"));
     assert!(
-        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total'))AScounters")
+        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total','owed_actor_recheck_faults_total','owed_actor_recheck_dropped_total'))AScounters")
     );
 }
 
@@ -19010,5 +19010,555 @@ mod d2_actor_g {
         assert_eq!(d["paths"]["narrowed"]["recordStatementsP95"], 1);
         assert_eq!(d["paths"]["full"]["recordStatementsP95"], 3);
         assert_eq!(bars["stages"]["recordStatementsP95"], 3);
+    }
+
+    /// The D1 judge with the live chain's word views (the worker's `runtime::views` over CHAINTRACKS), over the record.
+    struct D1Live<'a> {
+        db: &'a SqliteSql,
+        chain: &'a Chain<'a>,
+    }
+    impl SqlPort for D1Live<'_> {
+        async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+            self.db.run_batch(stmts).await
+        }
+        async fn counters(&self, d: Vec<(String, u64)>) {
+            self.db.counters(d).await;
+        }
+        fn now_ms(&self) -> u64 {
+            self.db.now_ms()
+        }
+        fn log(&self, l: &str) {
+            self.db.log(l);
+        }
+    }
+    impl crate::owed_judge::JudgeDb for D1Live<'_> {
+        fn tip(&self) -> Option<u64> {
+            self.db.tip.get()
+        }
+        async fn word_views(
+            &self,
+            rows: &BTreeMap<String, Row>,
+        ) -> Result<BTreeMap<String, Value>, String> {
+            self.chain.word_views(rows).await
+        }
+        async fn canonical_root(&self, _: u64) -> Option<String> {
+            None
+        }
+        async fn push(&self, _: &str, _: Value) {}
+    }
+
+    fn rows_of(db: &SqliteSql, id: &str) -> Vec<String> {
+        let mut q = db.conn.prepare("SELECT json_array(outpoint,family,gameId,sats,opponentIdentity,atHeight,facts,reason,claimable,gateHeight,beltDueAtMs,probeTip) FROM owed_rows WHERE identity=?1 ORDER BY outpoint").unwrap();
+        q.query_map([id], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+    fn presses(rows: &[String]) -> usize {
+        rows.iter()
+            .filter(|r| serde_json::from_str::<Value>(r).unwrap()[8] == 1)
+            .count()
+    }
+
+    /// The pot's funding height in [`gf1_high1_an_unserved_header_is_judged_as_the_d1_judge_judges_it`].
+    const POT_H: u32 = 899_000;
+
+    /// A seat's refund press that RESTS on the pot's checked mined word: d3n1_a's indexed pot, the seat, its filed
+    /// backup, the recovery gate open, NO `network_seen` latch and no verified proof (FIX-831: the press needs the
+    /// tracker's CHECKED `mined` word of the funding), the pot's word mined at [`POT_H`]; the chain serving its header.
+    async fn refund_on_a_mined_word<'a>(
+        clock: &'a Cell<u64>,
+    ) -> (SqliteSql, String, Vec<String>, Chain<'a>) {
+        use crate::record_post::{self, tests as rp, RecordKind};
+        let record = SqliteSql::migrated();
+        record.now.set(NOW_MS);
+        record.tip.set(Some(TIP));
+        let victim = rp::wallet(0x46);
+        let id = hex::encode(rp::identity(&victim));
+        let game = [0x7c; 32];
+        rp::md_index_the_pot(&record);
+        rp::md_seat(&record, &id, &game);
+        let pot = hex::encode(rp::POT_TXID);
+        let row = mined(&pot, POT_H, &h("aa", 1));
+        record
+            .run_batch(vec![crate::tracker_host::chain_events::upsert_stmt(&row)])
+            .await
+            .unwrap();
+        let script = rp::potrefund_script(&victim, &game, &rp::presigned_refund());
+        let mut filing =
+            record_post::verify_record_post(RecordKind::Potrefund, &script, &id).unwrap();
+        record_post::file_verified(&record, &mut filing, &id, (NOW_MS / 1000) as i64)
+            .await
+            .unwrap();
+        let games = games_of(&record, &id);
+        assert!(!games.is_empty());
+        let chain = Chain {
+            headers: RefCell::new(BTreeMap::from([(POT_H, (h("aa", 1), pot))])),
+            clock,
+            asks: Cell::new(0),
+        };
+        (record, id, games, chain)
+    }
+
+    /// (gf1_high1) D2-ACTOR-G-FOLD-1, THE LENS'S HIGH-1: A MINED WORD WHOSE HEADER CHAINTRACKS NO LONGER SERVES IS
+    /// JUDGED AS THE D1 JUDGE JUDGES IT. A refund press resting on the pot's checked mined word; the warm actor and the
+    /// D1 judge both press while the header is served (the premise). The header at the word's height is then removed
+    /// (the verified tip's re-validation, an invalidated tip header, the #896 class): the fresh D1 judgement withholds
+    /// (`funding-not-held`: a `cannotCheck` mined is no landing). The actor's apply judges the word on its RECORDED
+    /// header (it always checks) and presses; its live recheck after the apply now counts the unserved header as MOVED
+    /// and re-applies the game fresh, so the actor's rows EQUAL the D1 judge's (no press). The txid is then asked live
+    /// on every later apply (`recheckLive`), never judged on its recorded header, until a live view checks: the header
+    /// served again, both sides press again. RED on b2ffbfb6 (`recheck_moved` dropped a `cannotCheck` live view): the
+    /// actor kept the press the D1 judge withheld.
+    #[tokio::test]
+    async fn gf1_high1_an_unserved_header_is_judged_as_the_d1_judge_judges_it() {
+        let clock = Cell::new(NOW_MS);
+        let (record, id, games, ch) = refund_on_a_mined_word(&clock).await;
+        let d1 = D1Live {
+            db: &record,
+            chain: &ch,
+        };
+        let local = mirror();
+        apply(
+            &record,
+            &local,
+            &ch,
+            &id,
+            &games,
+            Some(("bootstrap", 1)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        crate::owed_judge::judge_subjects(&d1, &id, &games, "d1")
+            .await
+            .unwrap();
+        assert_eq!(
+            presses(&rows_of(&local, &id)),
+            1,
+            "the premise: the refund press rests on the checked mined word: {:#?}",
+            rows_of(&local, &id)
+        );
+        assert_eq!(rows_of(&local, &id), rows_of(&record, &id));
+        // the header at the word's height is no longer served
+        ch.headers.borrow_mut().remove(&POT_H);
+        crate::owed_judge::judge_subjects(&d1, &id, &games, "d1")
+            .await
+            .unwrap();
+        let d1_rows = rows_of(&record, &id);
+        assert_eq!(presses(&d1_rows), 0, "the D1 judge withholds: {d1_rows:#?}");
+        assert!(
+            d1_rows.iter().any(|r| r.contains("funding-not-held")),
+            "{d1_rows:#?}"
+        );
+        // the actor's apply (the object's outside: the isolate's memo over CHAINTRACKS) judges the recorded header
+        let memo = ViewMemo::default();
+        let out = actor_outside(&ch, &memo, clock.get());
+        apply(
+            &record,
+            &local,
+            &out,
+            &id,
+            &games,
+            Some(("pot", 2)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        let held = out.deferred.take();
+        let pot = hex::encode(crate::record_post::tests::POT_TXID);
+        assert!(held.contains_key(&pot), "judged on its recorded header");
+        // the live recheck after the apply, as the object runs it
+        let live = ch.word_views(&held).await.unwrap();
+        assert!(header_unavailable(&live[&pot]), "{}", live[&pot]);
+        let outcome = recheck_outcome(&held, &live, &memo, clock.get());
+        assert!(outcome.faulted.is_empty(), "{outcome:?}");
+        if !outcome.moved.is_empty() {
+            let fresh = MemoOutside::new(&ch, &memo, clock.get(), true);
+            apply(&record, &local, &fresh, &id, &games, None, Some(TIP), None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            rows_of(&local, &id),
+            d1_rows,
+            "the actor's rows are the D1 judge's after its recheck (both Awaiting, no press)"
+        );
+        assert_eq!(presses(&rows_of(&local, &id)), 0);
+        assert_eq!(outcome.unavailable, [pot.clone()].into_iter().collect());
+        // the next apply asks the word live (recheckLive): no recorded judgement, no deferral, still equal
+        let asks = ch.asks.get();
+        let out =
+            actor_outside(&ch, &memo, clock.get()).with_live_only(outcome.unavailable.clone());
+        apply(
+            &record,
+            &local,
+            &out,
+            &id,
+            &games,
+            Some(("pot", 3)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ch.asks.get(), asks + 1, "asked live");
+        assert!(out.deferred.borrow().is_empty());
+        assert!(out.live_checked.borrow().is_empty());
+        assert_eq!(rows_of(&local, &id), d1_rows);
+        // the header served again: the live answer checks, both sides press, the mark taken out
+        ch.headers
+            .borrow_mut()
+            .insert(POT_H, (h("aa", 1), pot.clone()));
+        let out =
+            actor_outside(&ch, &memo, clock.get()).with_live_only(outcome.unavailable.clone());
+        apply(
+            &record,
+            &local,
+            &out,
+            &id,
+            &games,
+            Some(("pot", 4)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*out.live_checked.borrow(), outcome.unavailable);
+        crate::owed_judge::judge_subjects(&d1, &id, &games, "d1")
+            .await
+            .unwrap();
+        assert_eq!(presses(&rows_of(&local, &id)), 1);
+        assert_eq!(rows_of(&local, &id), rows_of(&record, &id));
+    }
+
+    /// (gf1_m1) D2-ACTOR-G-FOLD-1, THE LENS'S MEDIUM-1: A RECHECK THAT FAULTS IS HELD AGAIN, NEVER DROPPED. The held
+    /// recheck is settled AFTER the read ([`recheck_settle`]): a read that answered an error holds every row again
+    /// under a doubling backoff (1 s, 2 s, .. at most 300 s); a row the read could not judge for a cause other than an
+    /// unserved header (`Headers(..)`: a transport or snapshot fault) is held again, the rest taken out; a row an apply
+    /// merged during the read stays; a clean read deletes the row (`None`). The merge counts the rows past its room
+    /// ([`recheck_merge`], `owed_actor_recheck_dropped_total`); the object settles after its read (source). New API: on
+    /// b2ffbfb6 the object deleted the held rows before the read and the merge stopped at 256 with no count.
+    #[test]
+    fn gf1_m1_a_faulted_recheck_is_held_again() {
+        let a = mined(&h("c8", 1), 900_001, &h("aa", 1));
+        let b = mined(&h("c8", 2), 900_002, &h("aa", 2));
+        let c = mined(&h("c8", 3), 900_003, &h("aa", 3));
+        let rows: BTreeMap<String, Row> = [
+            (h("c8", 1), a.clone()),
+            (h("c8", 2), b.clone()),
+            (h("c8", 3), c.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let (held, dropped) = recheck_merge(None, rows.clone(), &["G1".into()]);
+        assert_eq!(dropped, 0);
+        assert_eq!(held["games"], json!(["g1"]));
+        // a read that faulted: every row held again, the backoff doubling to its cap
+        let mut current = held.clone();
+        for (k, want) in [(1u32, 1_000u64), (2, 2_000), (3, 4_000), (12, 300_000)] {
+            while current["faults"].as_u64().unwrap_or(0) + 1 < u64::from(k) {
+                current["faults"] = json!(current["faults"].as_u64().unwrap_or(0) + 1);
+            }
+            let (next, delay) =
+                recheck_settle(Some(current.clone()), &rows, &rows, true).expect("held again");
+            assert_eq!(next["rows"].as_object().unwrap().len(), 3);
+            assert_eq!(next["faults"], k, "{next}");
+            assert_eq!(delay, want, "fault {k}");
+            current = next;
+        }
+        // one row cannot be checked (a header fault), one header unserved, one checked: the first alone held again
+        let memo = ViewMemo::default();
+        let live: BTreeMap<String, Value> = [
+            (h("c8", 1), json!({"word": "mined", "verifyPath": null, "cannotCheck": "Headers(HeaderError(\"503\"))"})),
+            (h("c8", 2), json!({"word": "mined", "verifyPath": null, "cannotCheck": "Unavailable(900002)"})),
+            (h("c8", 3), c.recorded_view().unwrap()),
+        ]
+        .into_iter()
+        .collect();
+        let o = recheck_outcome(&rows, &live, &memo, NOW_MS);
+        assert_eq!(
+            o.faulted.keys().cloned().collect::<Vec<_>>(),
+            vec![h("c8", 1)]
+        );
+        assert_eq!(o.moved, [h("c8", 2)].into_iter().collect());
+        assert_eq!(o.unavailable, [h("c8", 2)].into_iter().collect());
+        assert_eq!(o.checked, [h("c8", 3)].into_iter().collect());
+        // a row an apply merged during the read stays beside the re-held one
+        let d = mined(&h("c8", 4), 900_004, &h("aa", 4));
+        let (during, _) = recheck_merge(
+            Some(held.clone()),
+            [(h("c8", 4), d)].into_iter().collect(),
+            &["g2".into()],
+        );
+        let (next, delay) = recheck_settle(Some(during), &rows, &o.faulted, false).unwrap();
+        let mut kept: Vec<String> = next["rows"].as_object().unwrap().keys().cloned().collect();
+        kept.sort();
+        assert_eq!(kept, vec![h("c8", 1), h("c8", 4)]);
+        assert_eq!((next["faults"].as_u64(), delay), (Some(1), 1_000));
+        // a row the apply replaced during the read (a newer row of the same txid) is not taken out
+        let mut a2 = a.clone();
+        a2.hint_at = Some(7.0);
+        let (during, _) = recheck_merge(
+            Some(held.clone()),
+            [(h("c8", 1), a2)].into_iter().collect(),
+            &[],
+        );
+        let (next, _) = recheck_settle(Some(during), &rows, &BTreeMap::new(), false).unwrap();
+        assert_eq!(next["rows"].as_object().unwrap().len(), 1);
+        assert_eq!(next["faults"], 0);
+        // a clean read of every row: deleted
+        assert!(recheck_settle(Some(held.clone()), &rows, &BTreeMap::new(), false).is_none());
+        // the merge past its room: counted, a held row replaced in place
+        let many: BTreeMap<String, Row> = (0..RECHECK_HELD_MAX + 5)
+            .map(|k| (h("d1", k), a.clone()))
+            .collect();
+        let (full, dropped) = recheck_merge(None, many, &[]);
+        assert_eq!(dropped, 5);
+        assert_eq!(full["rows"].as_object().unwrap().len(), RECHECK_HELD_MAX);
+        let (_, dropped) = recheck_merge(
+            Some(full),
+            [(h("d1", 0), b.clone()), (h("d2", 0), b)]
+                .into_iter()
+                .collect(),
+            &[],
+        );
+        assert_eq!(
+            dropped, 1,
+            "a held row is replaced, a new one past the room counted"
+        );
+        // the object settles after its read
+        let src = include_str!("object.rs");
+        let body = &src[src.find("async fn run_recheck").unwrap()..];
+        let read = body.find("word_views(&rows)").unwrap();
+        let before = &body[..read];
+        let del = before
+            .find("DELETE FROM meta WHERE name='recheck'")
+            .unwrap();
+        assert!(
+            before[..del].contains("if rows.is_empty()"),
+            "the held rows are deleted before the read only when there are none"
+        );
+        assert!(body[read..].contains("recheck_settle("));
+        assert!(body[read..].contains("COUNTERS[35]"));
+        assert!(src.contains("COUNTERS[36].into(), dropped"));
+        assert_eq!(COUNTERS[35], "owed_actor_recheck_faults_total");
+        assert_eq!(COUNTERS[36], "owed_actor_recheck_dropped_total");
+    }
+
+    /// A BEEF of the payout's subject alone, proven by a coinbase-shaped bump at `height` (root = its txid).
+    fn proven_beef(height: u32) -> (String, Vec<u8>) {
+        use bsv_rs::transaction::Beef;
+        let (txid, beef) = crate::record_post::door_pins::realistic_payout_beef();
+        let txid = hex::encode(txid);
+        let mut b = Beef::from_binary(&beef).unwrap();
+        let raw = b.find_txid_mut(&txid).unwrap().raw_tx_or_compute().unwrap();
+        let mut p = Beef::new();
+        let i = p.merge_bump(MerklePath::from_coinbase_txid(&txid, height));
+        p.merge_raw_tx(raw, Some(i));
+        (txid, p.to_binary())
+    }
+
+    /// (gf1_l1) D2-ACTOR-G-FOLD-1, THE LENS'S LOW-1: A SAME-LENGTH RE-ANCHOR REFRESHES THE FACTS. The payout's stored
+    /// BEEF (both families) proven at 899,000, read by the warm mirror (`bumpHeight` 899,000). A reorg re-anchors it at
+    /// 899,001: the new BEEF is EXACTLY the same length. The warm narrowed read re-reads both families (the subject
+    /// bump's height in place, [`bump_mark`]) and the facts are a cold apply's (`bumpHeight` 899,001); bytes that keep
+    /// the height are still held. RED with b2ffbfb6's length-only hold: the facts keep 899,000.
+    #[tokio::test]
+    async fn gf1_l1_a_same_length_re_anchor_refreshes_the_facts() {
+        let record = seeded(&fold7_chained_seat(8));
+        let (pay, old) = proven_beef(899_000);
+        let (_, new) = proven_beef(899_001);
+        assert_eq!(old.len(), new.len(), "a same-length re-anchor");
+        assert_ne!(old, new);
+        assert!(
+            bump_mark(&pay, &old)
+                .as_array()
+                .is_some_and(|a| a.len() == 2),
+            "{}",
+            bump_mark(&pay, &old)
+        );
+        for (t, sql) in [
+            (
+                "transactions",
+                "INSERT INTO transactions(txid,beef,has_proof,created_at) VALUES (?1,?2,0,1)",
+            ),
+            (
+                "pot_beefs",
+                "INSERT INTO pot_beefs(txid,beef) VALUES (?1,?2)",
+            ),
+        ] {
+            let _ = t;
+            record
+                .conn
+                .execute(sql, rusqlite::params![pay, old])
+                .unwrap();
+        }
+        let games = games_of(&record, "owner");
+        record
+            .conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    "owner",
+                    games[5],
+                    h("a1", 5),
+                    0,
+                    "00",
+                    (NOW_MS / 1000) as i64,
+                    pay
+                ],
+            )
+            .unwrap();
+        let local = mirror();
+        apply(
+            &record,
+            &local,
+            &Fakes,
+            "owner",
+            &games,
+            Some(("bootstrap", 1)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        let facts = |l: &SqliteSql| -> Vec<(String, String)> {
+            let mut q = l
+                .conn
+                .prepare("SELECT src,facts FROM txfacts WHERE txid=?1 AND src IN ('pot','stored') ORDER BY src")
+                .unwrap();
+            q.query_map([&pay], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(facts(&local).len(), 2);
+        assert!(
+            facts(&local).iter().all(|(_, f)| f.contains("899000")),
+            "{:?}",
+            facts(&local)
+        );
+        let narrowed = |local: &SqliteSql| {
+            let hop = e_write(&record, &games, 5);
+            let bytes = Bytes {
+                inner: &record,
+                bytes: Cell::new(0),
+            };
+            let r = futures_util::FutureExt::now_or_never(apply_with(
+                &bytes,
+                local,
+                &Fakes,
+                "owner",
+                &games[5..6],
+                Some(("pot", 1)),
+                Some(TIP),
+                None,
+                &ApplyOpts {
+                    touch: Some([hop].into_iter().collect()),
+                    ..ApplyOpts::default()
+                },
+            ))
+            .expect("a native apply never waits")
+            .unwrap()
+            .0;
+            assert!(r.narrowed, "{r:?}");
+            bytes.bytes.get()
+        };
+        // the same bytes: held, not re-read
+        let held = narrowed(&local);
+        let again = narrowed(&local);
+        assert_eq!(held, again, "the same bytes are held, read twice alike");
+        // the re-anchor: same length, a new height
+        for t in ["transactions", "pot_beefs"] {
+            record
+                .conn
+                .execute(
+                    &format!("UPDATE {t} SET beef=?2 WHERE txid=?1"),
+                    rusqlite::params![pay, new],
+                )
+                .unwrap();
+        }
+        let reread = narrowed(&local);
+        eprintln!(
+            "gf1_l1: held {held} answer bytes, the re-anchor's read {reread} (the BEEF {} bytes)",
+            new.len()
+        );
+        assert!(
+            reread >= held + 4 * new.len(),
+            "both families' hex re-read: {reread} against {held}"
+        );
+        let cold = mirror();
+        apply(
+            &record,
+            &cold,
+            &Fakes,
+            "owner",
+            &games[5..6],
+            None,
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(facts(&local), facts(&cold));
+        assert!(
+            facts(&local).iter().all(|(_, f)| f.contains("899001")),
+            "{:?}",
+            facts(&local)
+        );
+        // and held again after
+        assert_eq!(narrowed(&local), held);
+    }
+
+    /// (gf1_n2) THE LENS'S N2: A ONE-IDENTITY BURST OF 32 EVENTS IS VISIBLE UNDER THE 1,000 MS BAR. 32 carried SEENs of
+    /// 32 games of one warm seat (each pot mined), all written at once, applied one after another through the actor's
+    /// outside as the turn serializes them: each event's first visibility (its write to its apply's end, on the model's
+    /// clock, a record call 400 ms and a CHAINTRACKS ask 300 ms) is under 1,000 ms, the burst's last included.
+    #[tokio::test]
+    async fn gf1_n2_a_one_identity_burst_of_32_is_visible_under_the_bar() {
+        let (record, local, games) = mined_seat(32).await;
+        let clock = &local.now;
+        let ch = chain(32, clock);
+        let memo = ViewMemo::default();
+        let loaded = Loaded {
+            inner: &record,
+            clock,
+        };
+        let mut evs = Vec::new();
+        for k in 0..32 {
+            evs.push(seen(&record, &games, k).await);
+        }
+        let written = clock.get();
+        let mut vis = Vec::new();
+        for (k, ev) in evs.iter().enumerate() {
+            let out = actor_outside(&ch, &memo, clock.get());
+            let (r, _) = apply_with(
+                &loaded,
+                &local,
+                &out,
+                "owner",
+                &games[k..k + 1],
+                Some(("seen", ev.seq)),
+                Some(TIP),
+                None,
+                &opts_of(ev),
+            )
+            .await
+            .unwrap();
+            assert!(r.carried, "{r:?}");
+            vis.push(clock.get() - written);
+        }
+        let worst = *vis.iter().max().unwrap();
+        let p = p95(&mut vis);
+        eprintln!(
+            "gf1_n2: the 32-event burst's first visibility p95 {p} ms, max {worst} ms (virtual)"
+        );
+        assert!(
+            worst < 1_000,
+            "the burst's last event visible in {worst} ms"
+        );
     }
 }

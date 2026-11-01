@@ -3249,15 +3249,17 @@ pub async fn direct_with_class(
                     // D2-ACTOR-G (bsv-low #1031): the pass's kept closures, bounded over all its filings
                     let mut kept = 0usize;
                     for ((ev, _), keys) in filings.iter_mut() {
-                        match crate::owed_actor::closure_for(keys, &read, &row) {
-                            Ok(Some(c))
-                                if kept + c.to_string().len()
-                                    > crate::owed_actor::PASS_CLOSURES_MAX_BYTES =>
+                        // D2-ACTOR-G-FOLD-1 (the lens's LOW-2): each closure serialized once to weigh it
+                        match crate::owed_actor::closure_for(keys, &read, &row)
+                            .map(|c| c.map(|c| (c.to_string().len(), c)))
+                        {
+                            Ok(Some((n, _)))
+                                if kept + n > crate::owed_actor::PASS_CLOSURES_MAX_BYTES =>
                             {
                                 step.declines += 1;
                             }
-                            Ok(Some(c)) => {
-                                kept += c.to_string().len();
+                            Ok(Some((n, c))) => {
+                                kept += n;
                                 ev.facts["closure"] = c;
                                 step.closures += 1;
                             }
