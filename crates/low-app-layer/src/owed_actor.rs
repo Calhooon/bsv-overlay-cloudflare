@@ -1830,7 +1830,12 @@ const JUDGED_TXIDS_SQL: &str = "SELECT r.outpoint,r.facts,w.txid FROM owed_rows 
 /// latched or withdrawn, the TTL sweep, an opponent's party row) is read by the game's next apply whatever its event.
 /// What warmth still decides: a warm game's closure is already walked, so its first round reads the event's new keys
 /// beside the mirror's (no miss round for them) and its coverage bound comes from the marks read before it.
-pub const FULL_REFRESH_EVERY_MS: i64 = 600_000;
+/// FIX-959 (bsv-low #959, the warm read's (c)): a DAY (it was 600 s). A hand's MINED word and collect arrive about
+/// ten minutes after its JOIN, so at 600 s they landed past the edge and were full reads of the whole closure (2 to 4
+/// sequential D1 statements). What the longer window gives up is the periodic re-walk of the closure from the
+/// judgement's own keys (`JUDGED_TXIDS_SQL`) between full reads; a new key still arrives as a miss round, and the age
+/// repair and the fresh-compare ring stay its belt.
+pub const FULL_REFRESH_EVERY_MS: i64 = 86_400_000;
 /// The kind of the `applied` rows that stamp a game's last full refresh (`seq` 0, `atMs` the refresh).
 pub const FULL_KIND: &str = "full";
 /// The full refresh's stamp, one row a game.
@@ -4929,8 +4934,14 @@ impl PendingBars {
             }
             return;
         }
+        // FIX-959: the sample's read path, its own ring beside the class's
+        let path = read_path(answer);
         if let Some(ms) = answer["applyMs"].as_u64() {
             self.apply.entry(class).or_default().push(ms);
+            self.stages
+                .entry((class, path_ring(path, "apply")))
+                .or_default()
+                .push(ms);
             self.noted += 1;
             for (field, ring) in APPLY_STAGES {
                 if let Some(v) = answer[field].as_u64() {
@@ -4942,8 +4953,12 @@ impl PendingBars {
         // D2-ACTOR-B-FOLD-11 (NEW6-L1): an answer that names its samples (`visibleMs`, one an event of a coalesced
         // delivery) is sampled by them; the mined bar stays its own event's.
         if let Some(each) = answer["visibleMs"].as_array() {
-            let v = self.visible.entry(class).or_default();
-            v.extend(each.iter().filter_map(Value::as_u64));
+            let got: Vec<u64> = each.iter().filter_map(Value::as_u64).collect();
+            self.visible.entry(class).or_default().extend(&got);
+            self.stages
+                .entry((class, path_ring(path, "visible")))
+                .or_default()
+                .extend(got);
         }
         if let (true, Some(at), Some(judged)) = (
             samples_visible(answer),
@@ -4953,6 +4968,10 @@ impl PendingBars {
             let ms = judged.saturating_sub(at);
             if answer["visibleMs"].is_null() {
                 self.visible.entry(class).or_default().push(ms);
+                self.stages
+                    .entry((class, path_ring(path, "visible")))
+                    .or_default()
+                    .push(ms);
             }
             if answer["mined"] == true {
                 self.visible.entry("mined").or_default().push(ms);
@@ -5134,6 +5153,38 @@ pub const APPLY_STAGES: [(&str, &str); 6] = [
     ("closureMs", "closure"),
 ];
 
+/// FIX-959 (bsv-low #959; the reading's "the bars drop those flags"): the READ PATH of an apply sample, from its answer:
+/// `carried` (D2-ACTOR-F: the event's rows carried, the mirror its first round, `recordCalls` 0 unless a miss),
+/// `narrowed` (a warm game's one marked statement) or `full` (a cold or expired game, or an event that names no row:
+/// the whole closure). Each class keeps an apply ring and a visibility ring a path ([`PATH_RINGS`]), served as
+/// `classes.<class>.paths.<path>` beside the class's p95s, so a window's read names what it measured.
+pub fn read_path(answer: &Value) -> &'static str {
+    if answer["carried"] == true {
+        "carried"
+    } else if answer["narrowed"] == true {
+        "narrowed"
+    } else {
+        "full"
+    }
+}
+/// FIX-959: the read paths, each with its apply ring and its visibility ring on a class's bars row.
+pub const READ_PATHS: [&str; 3] = ["carried", "narrowed", "full"];
+/// FIX-959: the rings of [`READ_PATHS`], by name (`applyCarried`, .., `visibleFull`).
+pub const PATH_RINGS: [(&str, &str, &str); 6] = [
+    ("carried", "apply", "applyCarried"),
+    ("narrowed", "apply", "applyNarrowed"),
+    ("full", "apply", "applyFull"),
+    ("carried", "visible", "visibleCarried"),
+    ("narrowed", "visible", "visibleNarrowed"),
+    ("full", "visible", "visibleFull"),
+];
+fn path_ring(path: &str, meter: &str) -> &'static str {
+    PATH_RINGS
+        .iter()
+        .find(|(p, m, _)| *p == path && *m == meter)
+        .map_or("applyFull", |(_, _, r)| r)
+}
+
 pub fn merge_bars_row(
     stored: Option<&str>,
     apply: &[u64],
@@ -5255,6 +5306,17 @@ pub async fn flush_bars_from(
                 )
             })
             .collect();
+        // FIX-959: the read paths' rings.
+        for (_, _, ring) in PATH_RINGS {
+            staged.push((
+                ring,
+                pending
+                    .stages
+                    .get(&(class, ring))
+                    .cloned()
+                    .unwrap_or_default(),
+            ));
+        }
         // FIX-962: the cold row's page ring.
         if class == "cold" {
             staged.push((COLD_PAGE_RING, pending.cold_page.clone()));
@@ -5364,6 +5426,19 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
             for (field, r) in APPLY_STAGES {
                 out[format!("{field}P95")] = json!(ring(c, r).0.quantile(0.95));
             }
+            // FIX-959: each read path's samples and p95s (a window's read names what it measured)
+            let paths: serde_json::Map<String, Value> = READ_PATHS
+                .iter()
+                .map(|p| {
+                    let a = ring(c, path_ring(p, "apply")).0;
+                    let v = ring(c, path_ring(p, "visible")).0;
+                    (
+                        (*p).to_string(),
+                        json!({"applySamples": a.samples.len(), "applyMsP95": a.quantile(0.95), "visibleSamples": v.samples.len(), "visibleMsP95": v.quantile(0.95)}),
+                    )
+                })
+                .collect();
+            out["paths"] = Value::Object(paths);
             // FIX-962: the cold bootstrap's page work beside its cold time.
             if *c == "cold" {
                 let (p, _, _) = ring(c, COLD_PAGE_RING);
