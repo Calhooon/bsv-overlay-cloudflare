@@ -229,8 +229,10 @@ pub(crate) fn arm_reasons() -> Vec<(&'static str, String, Option<&'static str>)>
         ("absence, arcade missing", format!("SEEN_ON_NETWORK ({})", absent(ArcadeLook::Missing)), Some("absence")),
         ("absence, arcade faulted", format!("REJECTED ({})", absent(ArcadeLook::Fault)), Some("absence")),
         ("absence, recorded word behind a fault", format!("REJECTED ({})", absent(ArcadeLook::Recorded("REJECTED".into(), L55_GIVE_UP.into()))), Some("absence")),
-        // the retire pass ends a ghost pot: absence, on both of its arms
-        ("retire pass, live terminal arm", retire_eviction_reason(&fatal("REJECTED", L55_GIVE_UP)), Some("absence")),
+        // the retire pass ends a ghost pot: Arcade's live terminal word keeps its own class however the reason opens
+        // (round 1's NOTE-1); the absence arm is absence
+        ("retire pass, live terminal arm", retire_eviction_reason(&fatal("REJECTED", L55_GIVE_UP)), Some("missing-parent")),
+        ("retire pass, absence arm", retire_eviction_reason(&absent(ArcadeLook::Missing)), Some("absence")),
         // a reason no producer writes
         ("no producer", "fixture".to_string(), None),
     ]
