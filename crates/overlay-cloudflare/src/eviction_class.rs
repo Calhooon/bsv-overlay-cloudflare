@@ -139,14 +139,16 @@ pub fn eviction_refusal_class(reason: &str) -> Option<&'static str> {
     if reason.starts_with("input ") && reason.contains(CONFLICT_REASON_MARK) {
         return Some(REFUSAL_CLASS_DOUBLE_SPEND);
     }
-    if ABSENCE_REASON_MARKS.iter().any(|m| reason.contains(m)) {
-        return Some(REFUSAL_CLASS_ABSENCE);
-    }
+    // Arcade's own live word first (round 1's NOTE-1): a retire reason that carries `arcade live {word}` is the
+    // network's terminal word, not an absence, however the reason opens.
     if let Some((word, extra)) = live_word(reason) {
         return refusal_class_of(word, extra);
     }
     if let Some(inner) = ladder_inner(reason) {
         return refusal_class_of(leading_word(inner).unwrap_or("REJECTED"), inner);
+    }
+    if ABSENCE_REASON_MARKS.iter().any(|m| reason.contains(m)) {
+        return Some(REFUSAL_CLASS_ABSENCE);
     }
     None
 }
