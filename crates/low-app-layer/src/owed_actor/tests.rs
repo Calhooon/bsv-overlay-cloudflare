@@ -8697,7 +8697,7 @@ async fn fold14_a_a_warm_apply_is_one_record_read() {
     let (rows_two, _, _) = read_round(&record, "owner", game, &two, false)
         .await
         .unwrap();
-    let one = read_marked(&record, "owner", game, &n, None)
+    let one = read_marked(&record, "owner", game, &n, None, None)
         .await
         .unwrap()
         .expect("no value past D1's bound");
@@ -16440,7 +16440,8 @@ mod d2_actor_f_fold3 {
             .conn
             .execute(
                 "INSERT OR REPLACE INTO submit_refusals(hopTxid,hopVout,refusedTxid,reason,refusedAt) VALUES (?1,0,?2,?3,1)",
-                rusqlite::params![hop, h("e3", 3), "x".repeat(40_000)],
+                // D2-ACTOR-G: past the row weight bound at 384 KiB (six times 70,000 bytes of text)
+                rusqlite::params![hop, h("e3", 3), "x".repeat(70_000)],
             )
             .unwrap();
         let mine = BTreeSet::from([hop.clone()]);
@@ -18236,5 +18237,778 @@ mod fix1027 {
             crate::owed::LATCH_RECHECK_DEPTH,
             "the clear allows for the verified tip's lag by the same depth the latch recheck walks"
         );
+    }
+}
+
+/// D2-ACTOR-G (bsv-low #1031 with #959 (b) and #954): THE DIRECT CLASS'S APPLY UNDER ITS BARS. Each pin runs the REAL
+/// actor (`apply_with`) over native SQLite on FOLD-7's chained seat, its clock the mirror's (`SqliteSql::now`) moved
+/// by a model of the loop's load: every record call 400 ms (L57's `readMsP95` 395), every CHAINTRACKS ask for a mined
+/// word 300 ms (L57's `outsideMsP95` 301), so an apply's elapsed virtual time is what those awaits cost it.
+mod d2_actor_g {
+    use super::*;
+    use crate::owed_events_publish as publish;
+    use crate::tracker_host::stored::Row;
+    use crate::tracker_host::HeaderSnapshot;
+    use bsv_rs::transaction::MerklePath;
+    use bsv_tracker::{Evidence, Header, Input, Params, Proof, State};
+
+    /// The model's cost of one record call and of one CHAINTRACKS ask, in virtual ms.
+    const RECORD_MS: u64 = 400;
+    const ASK_MS: u64 = 300;
+
+    /// A mined row at `height`, its proof a coinbase path (root = txid), checked against a header named `hash`.
+    fn mined(id: &str, height: u32, hash: &str) -> Row {
+        let mut s = State::new(id);
+        let snap = HeaderSnapshot {
+            tip: Ok(height),
+            headers: BTreeMap::from([(
+                height,
+                Ok(Some(Header {
+                    hash: hash.into(),
+                    merkle_root: id.into(),
+                })),
+            )]),
+        };
+        s.step(
+            &Params { age_threshold: 60 },
+            &snap,
+            Input::Evidence(Evidence::Proof(
+                Proof::new(id, MerklePath::from_coinbase_txid(id, height)).unwrap(),
+            )),
+        )
+        .unwrap();
+        Row::from_state(&s, 100, None)
+    }
+
+    /// The chain the model's CHAINTRACKS serves: the header at each height (hash, root), its tip; each ask of a
+    /// mined word costs [`ASK_MS`] on `clock`, as the worker's `views` reads the tip, the heights and the tip again.
+    struct Chain<'a> {
+        headers: RefCell<BTreeMap<u32, (String, String)>>,
+        clock: &'a Cell<u64>,
+        asks: Cell<usize>,
+    }
+    impl Outside for Chain<'_> {
+        async fn word_views(
+            &self,
+            rows: &BTreeMap<String, Row>,
+        ) -> Result<BTreeMap<String, Value>, String> {
+            let snap = HeaderSnapshot {
+                tip: Ok(1_000_000),
+                headers: self
+                    .headers
+                    .borrow()
+                    .iter()
+                    .map(|(h, (hash, root))| {
+                        (
+                            *h,
+                            Ok(Some(Header {
+                                hash: hash.clone(),
+                                merkle_root: root.clone(),
+                            })),
+                        )
+                    })
+                    .collect(),
+            };
+            if rows.values().any(|r| r.word == "mined") {
+                self.asks.set(self.asks.get() + 1);
+                self.clock.set(self.clock.get() + ASK_MS);
+            }
+            Ok(rows
+                .iter()
+                .map(|(k, r)| (k.clone(), r.rechecked(&snap).unwrap()))
+                .collect())
+        }
+        async fn canonical_root(&self, _: u64) -> Option<String> {
+            None
+        }
+    }
+
+    /// The record under the model's load: each call [`RECORD_MS`] on `clock`.
+    struct Loaded<'a> {
+        inner: &'a SqliteSql,
+        clock: &'a Cell<u64>,
+    }
+    impl SqlPort for Loaded<'_> {
+        async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+            self.clock.set(self.clock.get() + RECORD_MS);
+            self.inner.run_batch(stmts).await
+        }
+        async fn counters(&self, d: Vec<(String, u64)>) {
+            self.inner.counters(d).await;
+        }
+        fn now_ms(&self) -> u64 {
+            self.clock.get()
+        }
+        fn log(&self, l: &str) {
+            self.inner.log(l);
+        }
+    }
+
+    /// The height of game `k`'s pot word.
+    fn height_of(k: usize) -> u32 {
+        900_000 + k as u32
+    }
+
+    /// FOLD-7's chained seat of `n` games, each game's pot MINED in `tx_words` (a real coinbase proof at its height),
+    /// read whole by a warm mirror; the chain serving each pot's header.
+    async fn mined_seat(n: usize) -> (SqliteSql, SqliteSql, Vec<String>) {
+        let record = seeded(&fold7_chained_seat(n));
+        for k in 0..n {
+            let row = mined(&h("c8", k), height_of(k), &h("aa", k));
+            record
+                .run_batch(vec![crate::tracker_host::chain_events::upsert_stmt(&row)])
+                .await
+                .unwrap();
+        }
+        let games = games_of(&record, "owner");
+        let local = mirror();
+        for chunk in games.chunks(GAMES_PER_APPLY) {
+            apply(
+                &record,
+                &local,
+                &Fakes,
+                "owner",
+                chunk,
+                Some(("bootstrap", 1)),
+                Some(TIP),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        (record, local, games)
+    }
+
+    fn chain<'a>(n: usize, clock: &'a Cell<u64>) -> Chain<'a> {
+        Chain {
+            headers: RefCell::new(
+                (0..n)
+                    .map(|k| (height_of(k), (h("aa", k), h("c8", k))))
+                    .collect(),
+            ),
+            clock,
+            asks: Cell::new(0),
+        }
+    }
+
+    fn mark(record: &SqliteSql, game: &str, source: &str, key: &str) {
+        record
+            .conn
+            .execute(
+                "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner',?1,?2,?3,1) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=(SELECT COALESCE(MAX(generation),0)+1 FROM owed_dirty)",
+                [game, source, key],
+            )
+            .unwrap();
+    }
+
+    async fn published(
+        record: &SqliteSql,
+        source: &str,
+        key: &str,
+    ) -> overlay_discovery::owed_event::OwedEvent {
+        let port = crate::owed_events::SqlPublish {
+            db: record,
+            send: |_b: Vec<String>| async { Ok::<(), String>(()) },
+        };
+        let out = publish::publish_with(
+            &port,
+            vec![publish::Noted {
+                source: source.into(),
+                key: key.into(),
+                held: None,
+            }],
+        )
+        .await;
+        assert!(out.fault.is_none(), "{:?}", out.fault);
+        out.sent.into_iter().next().expect("the note was sent")
+    }
+
+    /// The network's SEEN of game `k`'s pot, as the writer publishes it (a carried event).
+    async fn seen(
+        record: &SqliteSql,
+        games: &[String],
+        k: usize,
+    ) -> overlay_discovery::owed_event::OwedEvent {
+        let pot = h("c8", k);
+        record
+            .conn
+            .execute(
+                "INSERT INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'2026-10-30 00:00:00','arcade',?2) ON CONFLICT(txid) DO UPDATE SET sourceAtMs=network_seen.sourceAtMs+1",
+                rusqlite::params![pot, NOW_MS as i64],
+            )
+            .unwrap();
+        mark(record, &games[k], "seen", &pot);
+        published(record, "seen", &pot).await
+    }
+
+    fn opts_of(ev: &overlay_discovery::owed_event::OwedEvent) -> ApplyOpts {
+        let e = EventCtx::of(ev);
+        ApplyOpts {
+            touch: e.txids.clone(),
+            carried: e.carried.get("owner").cloned(),
+            ..ApplyOpts::default()
+        }
+    }
+
+    /// The actor's outside as the object builds it: the isolate's memo over CHAINTRACKS (`object.rs`).
+    fn actor_outside<'a>(
+        inner: &'a Chain<'a>,
+        memo: &'a ViewMemo,
+        now: u64,
+    ) -> MemoOutside<'a, Chain<'a>> {
+        MemoOutside::new(inner, memo, now, false)
+    }
+
+    fn p95(v: &mut [u64]) -> u64 {
+        v.sort_unstable();
+        v[((v.len() as f64 * 0.95).ceil() as usize)
+            .saturating_sub(1)
+            .min(v.len() - 1)]
+    }
+
+    /// (g_a) A ONE-IDENTITY BURST APPLIES AT THE CARRIED COST (#954): 16 carried SEENs of 16 games of one warm seat, each
+    /// game's pot a mined word, applied one after another through the turn as the object's burst does, each through
+    /// the actor's outside: NO CHAINTRACKS ask and NO record call inside any apply, every apply's virtual time 0 (p95
+    /// under the 300 ms bar), each game's stored rows a cold apply's. The live recheck runs after the applies over the
+    /// rows they held back: one ask, nothing moved. RED on 461d7946 (the object handed the apply CHAINTRACKS itself,
+    /// `actor_outside` returning `inner`): every apply asks once, p95 300 ms.
+    #[tokio::test]
+    async fn g_a_a_one_identity_burst_applies_with_no_await() {
+        let (record, local, games) = mined_seat(16).await;
+        let clock = &local.now;
+        let ch = chain(16, clock);
+        let memo = ViewMemo::default();
+        let loaded = Loaded {
+            inner: &record,
+            clock,
+        };
+        let mut times = Vec::new();
+        let mut held: BTreeMap<String, Row> = BTreeMap::new();
+        for k in 0..16 {
+            let ev = seen(&record, &games, k).await;
+            let out = actor_outside(&ch, &memo, clock.get());
+            let t0 = clock.get();
+            let (r, _) = apply_with(
+                &loaded,
+                &local,
+                &out,
+                "owner",
+                &games[k..k + 1],
+                Some(("seen", ev.seq)),
+                Some(TIP),
+                None,
+                &opts_of(&ev),
+            )
+            .await
+            .unwrap();
+            times.push(clock.get() - t0);
+            assert!(r.carried && r.record_calls == 0, "{r:?}");
+            held.extend(out.deferred.take());
+        }
+        let p = p95(&mut times);
+        eprintln!(
+            "g_a: the burst's apply p95 {p} ms (virtual), CHAINTRACKS asks {}",
+            ch.asks.get()
+        );
+        assert_eq!(ch.asks.get(), 0, "no CHAINTRACKS ask inside an apply");
+        assert!(
+            p < 300,
+            "the burst's apply p95 {p} ms is under the 300 ms bar"
+        );
+        assert!(
+            !held.is_empty(),
+            "the mined words were judged on their recorded header"
+        );
+        // the live recheck after the applies: one ask, nothing moved, the views held for the next apply
+        let live = ch.word_views(&held).await.unwrap();
+        assert!(recheck_moved(&held, &live, &memo, clock.get()).is_empty());
+        assert_eq!(ch.asks.get(), 1);
+        for k in [0, 7, 15] {
+            let c = mirror();
+            apply(
+                &record,
+                &c,
+                &Fakes,
+                "owner",
+                &games[k..k + 1],
+                None,
+                Some(TIP),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                stored_game(&local, "owner", &games[k]),
+                stored_game(&c, "owner", &games[k])
+            );
+        }
+    }
+
+    /// (g_a2) A 32-IDENTITY FLOOD: 32 warm seats (one game each, its pot mined), each one carried SEEN applied through
+    /// the actor's outside: no apply awaits anything, p95 0. RED on 461d7946 (`actor_outside` returning `inner`): each
+    /// apply asks CHAINTRACKS once, p95 300 ms.
+    #[tokio::test]
+    async fn g_a2_a_32_identity_flood_applies_under_the_bar() {
+        let mut times = Vec::new();
+        let mut asks = 0;
+        for _ in 0..32 {
+            let (record, local, games) = mined_seat(1).await;
+            let clock = &local.now;
+            let ch = chain(1, clock);
+            let memo = ViewMemo::default();
+            let ev = seen(&record, &games, 0).await;
+            let out = actor_outside(&ch, &memo, clock.get());
+            let loaded = Loaded {
+                inner: &record,
+                clock,
+            };
+            let t0 = clock.get();
+            let (r, _) = apply_with(
+                &loaded,
+                &local,
+                &out,
+                "owner",
+                &games[0..1],
+                Some(("seen", ev.seq)),
+                Some(TIP),
+                None,
+                &opts_of(&ev),
+            )
+            .await
+            .unwrap();
+            assert!(r.carried, "{r:?}");
+            times.push(clock.get() - t0);
+            asks += ch.asks.get();
+        }
+        let p = p95(&mut times);
+        eprintln!("g_a2: the flood's apply p95 {p} ms (virtual), CHAINTRACKS asks {asks}");
+        assert!(
+            p < 300,
+            "the flood's apply p95 {p} ms is under the 300 ms bar"
+        );
+    }
+
+    /// (g_b) A MOVED HEADER IS SEEN AFTER THE APPLY, NEVER MISSED: game 3's pot block replaced at its height (a reorg
+    /// the tracker has not yet written into the word's row). The carried apply judges the word on its recorded header
+    /// (as the tracker recorded it, no ask); the live recheck after it finds the word moved, and the re-apply (fresh,
+    /// the object's `recheck` kind) stores exactly the rows a fresh judgement over the live chain stores. The memo then
+    /// holds the live view, so the next apply's judgement is the live one with no ask.
+    #[tokio::test]
+    async fn g_b_a_moved_header_is_rechecked_after_the_apply() {
+        let (record, local, games) = mined_seat(4).await;
+        let clock = &local.now;
+        let ch = chain(4, clock);
+        let memo = ViewMemo::default();
+        ch.headers
+            .borrow_mut()
+            .insert(height_of(3), (h("bb", 3), h("dd", 3)));
+        let ev = seen(&record, &games, 3).await;
+        let out = actor_outside(&ch, &memo, clock.get());
+        apply_with(
+            &record,
+            &local,
+            &out,
+            "owner",
+            &games[3..4],
+            Some(("seen", ev.seq)),
+            Some(TIP),
+            None,
+            &opts_of(&ev),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ch.asks.get(), 0);
+        let held = out.deferred.take();
+        assert!(held.contains_key(&h("c8", 3)));
+        let live = ch.word_views(&held).await.unwrap();
+        assert_eq!(live[&h("c8", 3)]["word"], "stale");
+        let moved = recheck_moved(&held, &live, &memo, clock.get());
+        assert_eq!(moved, [h("c8", 3)].into_iter().collect::<BTreeSet<_>>());
+        // the re-apply asks fresh; a fresh judgement over the live chain stores the same rows
+        let fresh = MemoOutside::new(&ch, &memo, clock.get(), true);
+        apply_with(
+            &record,
+            &local,
+            &fresh,
+            "owner",
+            &games[3..4],
+            None,
+            Some(TIP),
+            None,
+            &ApplyOpts::default(),
+        )
+        .await
+        .unwrap();
+        let c = mirror();
+        apply(
+            &record,
+            &c,
+            &ch,
+            "owner",
+            &games[3..4],
+            None,
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stored_game(&local, "owner", &games[3]),
+            stored_game(&c, "owner", &games[3])
+        );
+        // the next apply takes the live view from the memo, with no ask
+        let asks = ch.asks.get();
+        let ev = seen(&record, &games, 3).await;
+        let out = actor_outside(&ch, &memo, clock.get());
+        apply_with(
+            &record,
+            &local,
+            &out,
+            "owner",
+            &games[3..4],
+            Some(("seen", ev.seq)),
+            Some(TIP),
+            None,
+            &opts_of(&ev),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ch.asks.get(), asks, "the memo answers the live view");
+        assert!(out.deferred.borrow().is_empty());
+        assert_eq!(
+            stored_game(&local, "owner", &games[3]),
+            stored_game(&c, "owner", &games[3])
+        );
+    }
+
+    /// (g_c) THE RECORDED VIEW IS THE LIVE RECHECK'S: for a mined row whose header chaintracks still serves, the view
+    /// against the row's own recorded header equals the live recheck's at any tip at or above it, byte for byte; a
+    /// replaced header or a lower tip is a difference the recheck names; a word not mined is its own view.
+    #[test]
+    fn g_c_the_recorded_view_is_the_live_recheck() {
+        let row = mined(&h("c8", 1), 900_001, &h("aa", 1));
+        let live = |tip: u32, hash: &str, root: &str| HeaderSnapshot {
+            tip: Ok(tip),
+            headers: BTreeMap::from([(
+                900_001,
+                Ok(Some(Header {
+                    hash: hash.into(),
+                    merkle_root: root.into(),
+                })),
+            )]),
+        };
+        for tip in [900_001, 900_002, 1_000_000] {
+            assert_eq!(
+                row.recorded_view().unwrap(),
+                row.rechecked(&live(tip, &h("aa", 1), &h("c8", 1))).unwrap(),
+                "tip {tip}"
+            );
+        }
+        assert_ne!(
+            row.recorded_view().unwrap(),
+            row.rechecked(&live(1_000_000, &h("bb", 1), &h("dd", 1)))
+                .unwrap()
+        );
+        assert_ne!(
+            row.recorded_view().unwrap(),
+            row.rechecked(&live(900_000, &h("aa", 1), &h("c8", 1)))
+                .unwrap()
+        );
+        let mut seen_row = row.clone();
+        seen_row.word = "seen".into();
+        seen_row.tier = "hint".into();
+        assert_eq!(seen_row.recorded_view().unwrap(), seen_row.view());
+    }
+
+    /// The record's answers' bytes (every row of every statement, as JSON text).
+    struct Bytes<'a> {
+        inner: &'a SqliteSql,
+        bytes: Cell<usize>,
+    }
+    impl SqlPort for Bytes<'_> {
+        async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+            let out = self.inner.run_batch(stmts).await?;
+            let n: usize = out
+                .iter()
+                .flat_map(|o| &o.rows)
+                .map(|r| r.to_string().len())
+                .sum();
+            self.bytes.set(self.bytes.get() + n);
+            Ok(out)
+        }
+        async fn counters(&self, d: Vec<(String, u64)>) {
+            self.inner.counters(d).await;
+        }
+        fn now_ms(&self) -> u64 {
+            self.inner.now_ms()
+        }
+        fn log(&self, l: &str) {
+            self.inner.log(l);
+        }
+    }
+
+    /// (g_d) THE WARM NARROWED READ RE-READS NO HELD BEEF (#959 (b)): game 5's collected marker names a payout whose
+    /// stored BEEF is real (~20 KB, both stored families), read by the warm mirror. A pot event of game 5 (not carried:
+    /// the narrowed read) is ONE record statement whose answer carries none of the BEEF's hex, and the mirror's facts
+    /// stay those a cold apply decodes. Then the BEEF's bytes move (its proof merged: here, its length): the next
+    /// narrowed read re-reads both families' bytes and the facts are a cold apply's again. RED on 461d7946 (the marked
+    /// read without the held lengths, `marked_select`): the answer carries the hex, past 40,000 bytes.
+    #[tokio::test]
+    async fn g_d_the_warm_narrowed_read_rereads_no_held_beef() {
+        let record = seeded(&fold7_chained_seat(8));
+        let (txid, beef) = crate::record_post::door_pins::realistic_payout_beef();
+        let pay = hex::encode(txid);
+        for t in ["transactions", "pot_beefs"] {
+            let sql = if t == "transactions" {
+                "INSERT INTO transactions(txid,beef,has_proof,created_at) VALUES (?1,?2,0,1)"
+            } else {
+                "INSERT INTO pot_beefs(txid,beef) VALUES (?1,?2)"
+            };
+            record
+                .conn
+                .execute(sql, rusqlite::params![pay, beef])
+                .unwrap();
+        }
+        let games = games_of(&record, "owner");
+        record
+            .conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    "owner",
+                    games[5],
+                    h("a1", 5),
+                    0,
+                    "00",
+                    (NOW_MS / 1000) as i64,
+                    pay
+                ],
+            )
+            .unwrap();
+        let local = mirror();
+        apply(
+            &record,
+            &local,
+            &Fakes,
+            "owner",
+            &games,
+            Some(("bootstrap", 1)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        let facts = |l: &SqliteSql| -> Vec<(String, String)> {
+            let mut q = l
+                .conn
+                .prepare("SELECT src,facts FROM txfacts WHERE txid=?1 AND src IN ('pot','stored') ORDER BY src")
+                .unwrap();
+            q.query_map([&pay], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let cold = |rec: &SqliteSql| {
+            let c = mirror();
+            futures_util::FutureExt::now_or_never(apply(
+                rec,
+                &c,
+                &Fakes,
+                "owner",
+                &games[5..6],
+                None,
+                Some(TIP),
+                None,
+            ))
+            .expect("a native apply never waits")
+            .unwrap();
+            c
+        };
+        assert_eq!(facts(&local), facts(&cold(&record)));
+        assert_eq!(
+            facts(&local).len(),
+            2,
+            "the pot and stored facts of the payout"
+        );
+        let narrowed = |record: &SqliteSql, local: &SqliteSql| {
+            let hop = e_write(record, &games, 5);
+            let bytes = Bytes {
+                inner: record,
+                bytes: Cell::new(0),
+            };
+            let r = futures_util::FutureExt::now_or_never(apply_with(
+                &bytes,
+                local,
+                &Fakes,
+                "owner",
+                &games[5..6],
+                Some(("pot", 1)),
+                Some(TIP),
+                None,
+                &ApplyOpts {
+                    touch: Some([hop].into_iter().collect()),
+                    ..ApplyOpts::default()
+                },
+            ))
+            .expect("a native apply never waits")
+            .unwrap()
+            .0;
+            (r, bytes.bytes.get())
+        };
+        let (r, bytes) = narrowed(&record, &local);
+        eprintln!(
+            "g_d: the warm narrowed read: {} record call(s), {} statement(s), {bytes} answer bytes",
+            r.record_calls, r.record_statements
+        );
+        assert!(
+            r.narrowed && r.record_calls == 1 && r.record_statements == 1,
+            "{r:?}"
+        );
+        assert!(
+            bytes < beef.len(),
+            "the answer carries none of the {} BEEF bytes' hex: {bytes}",
+            beef.len()
+        );
+        assert_eq!(
+            facts(&local),
+            facts(&cold(&record)),
+            "the held facts are a cold apply's"
+        );
+        // the bytes move: the next narrowed read re-reads both families
+        record
+            .conn
+            .execute(
+                "UPDATE transactions SET beef=?2 WHERE txid=?1",
+                rusqlite::params![pay, [beef.clone(), vec![0u8]].concat()],
+            )
+            .unwrap();
+        let (_, bytes) = narrowed(&record, &local);
+        assert!(
+            bytes > 2 * beef.len(),
+            "the moved BEEF re-read with its twin: {bytes}"
+        );
+        assert_eq!(facts(&local), facts(&cold(&record)));
+        assert_eq!(
+            stored_game(&local, "owner", &games[5]),
+            stored_game(&cold(&record), "owner", &games[5])
+        );
+    }
+
+    /// (g_e) A FILING'S CLOSURE PAST 32 KIB IS CARRIED (L57: 420 of 426 declined): a NEW collected filing whose payout
+    /// names a 40 KB spender-bytes row, through the shipped direct pass over the record and the REAL actor: its closure
+    /// is read and kept, and the actor's apply makes NO record call. RED on 461d7946 (`CLOSURE_MAX_BYTES` 32 KiB): the
+    /// closure is declined and the apply reads its miss (`left: (0, 1) right: (1, 0)`).
+    #[tokio::test]
+    async fn g_e_a_filing_closure_past_32_kib_is_carried() {
+        let (record, local, games) = e_warm_seat(20).await;
+        let (marker, pay) = (h("a1", 12), h("a2", 12));
+        record
+            .conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    "owner",
+                    games[12],
+                    marker,
+                    0,
+                    "00",
+                    (NOW_MS / 1000) as i64,
+                    pay
+                ],
+            )
+            .unwrap();
+        record
+            .conn
+            .execute(
+                "INSERT INTO owed_spender_bytes(txid,bytesJson,createdAtMs) VALUES (?1,?2,1)",
+                rusqlite::params![pay, json!({"raw": "ab".repeat(20_000)}).to_string()],
+            )
+            .unwrap();
+        mark(&record, &games[12], "collected", &marker);
+        let ev = published(&record, "collected", &marker).await;
+        assert!(closure_wanted(&ev).is_some());
+        let keys = closure_wanted(&ev).unwrap();
+        let (stmt, read) = pass_closure_statement(&keys, 1).unwrap();
+        let row = read_pass_closure(&record, stmt).await.unwrap();
+        let mut ev = ev;
+        let closure = closure_for(&keys, &read, &row).unwrap();
+        let kept = closure.is_some();
+        if let Some(c) = closure {
+            assert!(
+                c.to_string().len() > 32_768,
+                "the closure passes the old bound: {}",
+                c.to_string().len()
+            );
+            ev.facts["closure"] = c;
+        }
+        let b0 = record.batches.get();
+        let (r, _) = apply_with(
+            &record,
+            &local,
+            &Fakes,
+            "owner",
+            &games[12..13],
+            Some(("collected", ev.seq)),
+            Some(TIP),
+            None,
+            &opts_of(&ev),
+        )
+        .await
+        .unwrap();
+        let calls = record.batches.get() - b0;
+        assert_eq!(
+            (kept as u32, calls),
+            (1, 0),
+            "kept and no record call ({r:?})"
+        );
+        let c = mirror();
+        apply(
+            &record,
+            &c,
+            &Fakes,
+            "owner",
+            &games[12..13],
+            None,
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stored_game(&local, "owner", &games[12]),
+            stored_game(&c, "owner", &games[12])
+        );
+    }
+
+    /// (g_f) THE STATEMENTS RING (#1031 item 4): each answer names its record statements (`recordStatements`), the
+    /// class's ring and each read path's are served (`classes.<class>.recordStatementsP95`,
+    /// `paths.<path>.recordStatementsP95`), beside the paths' apply and visibility rings.
+    #[tokio::test]
+    async fn g_f_the_statements_ring_is_served() {
+        let record = mirror();
+        let mut pending = PendingBars::default();
+        for (path, st) in [("carried", 0u64), ("narrowed", 1), ("full", 3)] {
+            let a = json!({"applied": true, "applyMs": 5, "readMs": 1, "judgeMs": 1, "writeMs": 1, "waitMs": 1, "outsideMs": 0,
+                "recordStatements": st, "carried": path == "carried", "narrowed": path == "narrowed"});
+            pending.note_answer("direct", &a);
+        }
+        record
+            .conn
+            .execute_batch("CREATE TABLE IF NOT EXISTS owed_belt_state (name TEXT PRIMARY KEY, cursor TEXT, tickedAtMs INTEGER); CREATE TABLE IF NOT EXISTS ops_counters (name TEXT PRIMARY KEY, value INTEGER); CREATE TABLE IF NOT EXISTS owed_state (identity TEXT PRIMARY KEY, rows INTEGER)")
+            .ok();
+        let _ = flush_bars_from(&record, NOW_MS, &pending).await;
+        let rows: Vec<Value> = record
+            .run_batch(vec![Stmt::new(BARS_READ_SQL, vec![])])
+            .await
+            .unwrap()
+            .remove(0)
+            .rows;
+        let bars = fleet_bars(&rows, NOW_MS, lib_rev());
+        let d = &bars["classes"]["direct"];
+        assert_eq!(d["recordStatementsP95"], 3, "{d}");
+        assert_eq!(d["paths"]["carried"]["recordStatementsP95"], 0);
+        assert_eq!(d["paths"]["narrowed"]["recordStatementsP95"], 1);
+        assert_eq!(d["paths"]["full"]["recordStatementsP95"], 3);
+        assert_eq!(bars["stages"]["recordStatementsP95"], 3);
     }
 }

@@ -49,6 +49,15 @@ const META_JUDGED_REV: &str = "judgedLibRev";
 const META_TIP_JUDGED: &str = "tipJudged";
 /// NEW2-L5: the tip window's carried faults ([`tip_window`]), a JSON object of game to consecutive faults.
 const META_TIP_FAULTS: &str = "tipFaults";
+/// D2-ACTOR-G (bsv-low #1031): the mined rows an apply judged on their recorded header and their games, for the live
+/// recheck the alarm runs ([`OwedActor::run_recheck`]).
+const META_RECHECK: &str = "recheck";
+/// D2-ACTOR-G: the apply kind of the recheck's re-apply (it asks every word live).
+pub const RECHECK_KIND: &str = "recheck";
+/// D2-ACTOR-G: how long after an apply its live recheck runs (the alarm; the KV copy's own interval).
+pub const RECHECK_DELAY_MS: u64 = 1_000;
+/// D2-ACTOR-G: the most rows one actor holds for its recheck.
+pub const RECHECK_ROWS_MAX: usize = 256;
 /// LOW-6: the bootstrap's first keyset cursor (`[at, gameId]` of the last page; this one precedes every game).
 pub const BOOT_CURSOR_START: &str = "[9223372036854775807,\"\"]";
 /// The bootstrap's keyset from its stored cursor (anything that is not one, the HIGH-4 re-arm's `0` included, is
@@ -456,6 +465,8 @@ impl DurableObject for OwedActor {
         if self.meta(META_KV_DIRTY).as_deref() == Some("1") {
             self.write_kv_copy(&local).await;
         }
+        // D2-ACTOR-G (bsv-low #1031): the live recheck of the mined words the applies judged on their recorded header
+        self.run_recheck(&local).await;
         // MEDIUM-4: the tip alarm judges the gates in `(tipJudged, tip]` and the courier-dated sweeps below the tip,
         // then arms at the next gate (never a re-judge of every open gate each ten minutes).
         // NEW4-L4: never while the bootstrap's cursor stands (the drain judges at the tip, and a re-armed actor's
@@ -789,6 +800,108 @@ impl OwedActor {
         }
     }
 
+    /// D2-ACTOR-G (bsv-low #1031): the rows an apply judged on their recorded header ([`crate::owed_actor::MemoOutside`])
+    /// held in `meta` (merged with any not yet rechecked, at most [`RECHECK_ROWS_MAX`]) beside their games, and the
+    /// alarm set [`RECHECK_DELAY_MS`] from now unless an earlier one is set.
+    async fn defer_recheck(
+        &self,
+        local: &DoSql,
+        rows: BTreeMap<String, crate::tracker_host::stored::Row>,
+        games: &[String],
+    ) {
+        let mut held: Value = self
+            .meta(META_RECHECK)
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_else(|| json!({"rows": {}, "games": []}));
+        for (k, row) in rows {
+            if held["rows"]
+                .as_object()
+                .is_some_and(|m| m.len() >= RECHECK_ROWS_MAX)
+            {
+                break;
+            }
+            held["rows"][k] = json!(row);
+        }
+        let mut gs: BTreeSet<String> = held["games"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|g| g.as_str().map(str::to_string))
+            .collect();
+        gs.extend(games.iter().map(|g| g.to_ascii_lowercase()));
+        held["games"] = json!(gs);
+        self.put_meta(local, META_RECHECK, &held.to_string());
+        let at = Date::now().as_millis() + RECHECK_DELAY_MS;
+        let alarm = self.state.storage().get_alarm().await.ok().flatten();
+        if alarm.is_none_or(|h| h > at as i64) {
+            self.alarm_at(at).await;
+        }
+    }
+
+    /// D2-ACTOR-G: the alarm's live recheck ([`crate::owed_actor::recheck_moved`]): the held rows asked of CHAINTRACKS
+    /// in one snapshot, held in the isolate's memo; a word whose live view moved re-applies the held games once, fresh
+    /// (its apply asks every word live). A fault of the read keeps nothing (the next apply judges again).
+    async fn run_recheck(&self, local: &DoSql) {
+        let Some(held) = self.meta(META_RECHECK) else {
+            return;
+        };
+        let _ = local
+            .sql
+            .exec("DELETE FROM meta WHERE name='recheck'", None);
+        let held: Value = serde_json::from_str(&held).unwrap_or(Value::Null);
+        let rows: BTreeMap<String, crate::tracker_host::stored::Row> =
+            serde_json::from_value(held["rows"].clone()).unwrap_or_default();
+        let games: Vec<String> = serde_json::from_value(held["games"].clone()).unwrap_or_default();
+        if rows.is_empty() {
+            return;
+        }
+        let live = match EnvOutside(&self.env).word_views(&rows).await {
+            Ok(v) => v,
+            Err(e) => {
+                console_log!("[owed-actor] recheck: {e}");
+                return;
+            }
+        };
+        let memo = crate::owed_actor::VIEW_MEMO.with(std::rc::Rc::clone);
+        let moved = crate::owed_actor::recheck_moved(&rows, &live, &memo, Date::now().as_millis());
+        let Some(identity) = self.meta(META_IDENTITY) else {
+            return;
+        };
+        if moved.is_empty() || games.is_empty() {
+            return;
+        }
+        console_log!(
+            "[owed-actor] recheck {identity}: {} word(s) moved under the live header ({}): re-applying {} game(s)",
+            moved.len(),
+            moved.iter().take(3).cloned().collect::<Vec<_>>().join(","),
+            games.len()
+        );
+        let tip = crate::owed_events::tip_memoised(&self.env, true).await;
+        for chunk in games.chunks(GAMES_PER_APPLY) {
+            let body = ApplyBody {
+                identity: identity.clone(),
+                games: chunk.to_vec(),
+                kind: Some(RECHECK_KIND.into()),
+                seq: None,
+                at_ms: None,
+                tip,
+                txfacts: Vec::new(),
+                mined: false,
+                bound: None,
+                class: None,
+                also: Vec::new(),
+                also_at_ms: Vec::new(),
+                txids: None,
+                concurrent: None,
+                belt_asked: Vec::new(),
+                carried: None,
+            };
+            if let Err(e) = self.apply_route(body).await {
+                console_log!("[owed-actor] recheck {identity}: the re-apply: {e}");
+            }
+        }
+    }
+
     /// Phase C (`OWED_D1_JUDGE=false`): the D1 rows are not dated, so the actor publishes its belt questions.
     fn publishes_asks(&self) -> bool {
         !d1_judge_on(self.env.var(D1_JUDGE_FLAG).ok().map(|v| v.to_string()))
@@ -873,6 +986,15 @@ impl OwedActor {
         };
         // FIX-1018: the belt's asked outpoints, for the judge of this apply (and any apply of `me` it waits on).
         let _asked = crate::owed_judge::belt_asked_scope(&me, &body.belt_asked);
+        // D2-ACTOR-G (bsv-low #1031): the isolate's word-view memo over CHAINTRACKS (a `tip` event asks fresh).
+        let memo = crate::owed_actor::VIEW_MEMO.with(std::rc::Rc::clone);
+        let env_outside = EnvOutside(&self.env);
+        let outside = crate::owed_actor::MemoOutside::new(
+            &env_outside,
+            &memo,
+            started,
+            matches!(body.kind.as_deref(), Some("tip" | RECHECK_KIND)),
+        );
         // D2-ACTOR-B-FOLD-7: an actor without `bootstrapped` holds the event and arms its bootstrap (never a closure
         // over a mirror the bootstrap has not filled); a bootstrapped one whose closure meets its bound re-arms.
         let applied = apply_or_hold_in(
@@ -880,7 +1002,7 @@ impl OwedActor {
             &self.turn,
             &record,
             &local,
-            &EnvOutside(&self.env),
+            &outside,
             &me,
             &ev,
             crate::routes::written_off_before_ms_env(&self.env),
@@ -925,6 +1047,12 @@ impl OwedActor {
             answer["applyMs"] = json!(now.saturating_sub(started));
             answer["ackSeq"] = json!(self.meta(META_ACK));
             return Response::from_json(&answer);
+        }
+        // D2-ACTOR-G (bsv-low #1031): the mined words this apply judged on their recorded header are rechecked LIVE by
+        // the alarm, a second from now (the earlier alarm wins), never inside the apply
+        let deferred = outside.deferred.take();
+        if !deferred.is_empty() {
+            self.defer_recheck(&local, deferred, &body.games).await;
         }
         // FIX-983: the closure misses' counter is deferred with the rest of the record work that is not the apply's
         // ([`OwedActor::after_apply`]).

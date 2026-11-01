@@ -58,6 +58,36 @@ impl Row {
         }
         view
     }
+    /// D2-ACTOR-G (bsv-low #1031): the view [`Row::rechecked`] gives against the row's OWN recorded header (the header
+    /// at its proof height the tracker verified it against when it wrote the word, `restored_state`'s snapshot), with
+    /// no network read: equal to the live recheck's view while chaintracks still serves that header at that height
+    /// (the state's step reads the header at the proof height and nothing of the tip's depth). A row that is not
+    /// mined is its [`Row::view`]. The owed actor judges with it inside its apply and asks the live header after its
+    /// answer (`owed_actor::MemoOutside`).
+    pub fn recorded_view(&self) -> Result<Value, String> {
+        if self.word != "mined" {
+            return Ok(self.view());
+        }
+        let height = self
+            .proof_height
+            .map(|h| h as u32)
+            .ok_or("missing stored proof height")?;
+        let own = HeaderSnapshot {
+            tip: Ok(height),
+            headers: BTreeMap::from([(
+                height,
+                Ok(Some(Header {
+                    hash: self.header_hash.clone().ok_or("missing stored header")?,
+                    merkle_root: self.proof_root.clone().ok_or("missing stored root")?,
+                })),
+            )]),
+        };
+        let view = self.rechecked(&own)?;
+        if view.get("cannotCheck").is_some_and(|v| !v.is_null()) {
+            return Err("the recorded header does not check".into());
+        }
+        Ok(view)
+    }
     /// bsv-low #598 (the B-OWED-2 lens's HIGH-1): the terminal Arcade hint the row's producer marked
     /// (`runtime::mark_terminal`: `trackerTerminal`, `trackerTerminalWord`), served on [`Row::view`] as the additive
     /// `terminalHint` (absent on every unmarked row, so those views are byte for byte as before): `rejected`,
