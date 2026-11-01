@@ -8697,7 +8697,7 @@ async fn fold14_a_a_warm_apply_is_one_record_read() {
     let (rows_two, _, _) = read_round(&record, "owner", game, &two, false)
         .await
         .unwrap();
-    let one = read_marked(&record, "owner", game, &n, None)
+    let one = read_marked(&record, "owner", game, &n, None, None)
         .await
         .unwrap()
         .expect("no value past D1's bound");
@@ -16440,7 +16440,8 @@ mod d2_actor_f_fold3 {
             .conn
             .execute(
                 "INSERT OR REPLACE INTO submit_refusals(hopTxid,hopVout,refusedTxid,reason,refusedAt) VALUES (?1,0,?2,?3,1)",
-                rusqlite::params![hop, h("e3", 3), "x".repeat(40_000)],
+                // D2-ACTOR-G: past the row weight bound at 384 KiB (six times 70,000 bytes of text)
+                rusqlite::params![hop, h("e3", 3), "x".repeat(70_000)],
             )
             .unwrap();
         let mine = BTreeSet::from([hop.clone()]);
@@ -18709,5 +18710,1155 @@ mod fix1042 {
         assert_eq!(hop_row(&d1), None, "the fresh D1 judgement: still no row");
         let (a, b) = (rows_of(&d1, seat), rows_of(&local, seat));
         assert!(diff_rows(&a, &b).is_empty(), "the compare at zero");
+    }
+}
+/// D2-ACTOR-G-CUT (bsv-low #1031 with #959 (b) and #954; overlay PR 260 cut to its read-cost pieces): THE ACTOR JUDGES
+/// AS THE D1 JUDGE JUDGES, ASKING CHAINTRACKS LIVE INSIDE ITS APPLY AS MAIN DOES. Each pin runs the REAL actor
+/// (`apply_with`) over native SQLite, its clock the mirror's (`SqliteSql::now`) moved by a model of the loop's load:
+/// every record call 400 ms (L57's `readMsP95` 395), every CHAINTRACKS ask for a mined word 300 ms (L57's
+/// `outsideMsP95` 301). Kept from PR 260: the closure carried (256 KiB a filing, 2 MiB a pass), the held-BEEF skip
+/// (by both lengths and the subject bump's height bytes) and the `recordStatements` ring. Not kept: the recorded-header
+/// judgement, the word-view memo and the post-apply recheck (the three ensemble lenses of 2026-11-01).
+mod d2_actor_g {
+    use super::*;
+    use crate::owed_events_publish as publish;
+    use crate::tracker_host::stored::Row;
+    use crate::tracker_host::HeaderSnapshot;
+    use bsv_rs::transaction::MerklePath;
+    use bsv_tracker::{Evidence, Header, Input, Params, Proof, State};
+
+    /// The model's cost of one record call and of one CHAINTRACKS ask, in virtual ms.
+    const RECORD_MS: u64 = 400;
+    const ASK_MS: u64 = 300;
+
+    /// A mined row at `height`, its proof a coinbase path (root = txid), checked against a header named `hash`.
+    fn mined(id: &str, height: u32, hash: &str) -> Row {
+        let mut s = State::new(id);
+        let snap = HeaderSnapshot {
+            tip: Ok(height),
+            headers: BTreeMap::from([(
+                height,
+                Ok(Some(Header {
+                    hash: hash.into(),
+                    merkle_root: id.into(),
+                })),
+            )]),
+        };
+        s.step(
+            &Params { age_threshold: 60 },
+            &snap,
+            Input::Evidence(Evidence::Proof(
+                Proof::new(id, MerklePath::from_coinbase_txid(id, height)).unwrap(),
+            )),
+        )
+        .unwrap();
+        Row::from_state(&s, 100, None)
+    }
+
+    /// The chain the model's CHAINTRACKS serves: the header at each height (hash, root), its tip; each ask of a
+    /// mined word costs [`ASK_MS`] on `clock`, as the worker's `views` reads the tip, the heights and the tip again.
+    struct Chain<'a> {
+        headers: RefCell<BTreeMap<u32, (String, String)>>,
+        clock: &'a Cell<u64>,
+        asks: Cell<usize>,
+        /// D2-ACTOR-G-FOLD-2 (LOW-A): CHAINTRACKS faulting: the tip read answers an error, so every mined word's live
+        /// view is `cannotCheck` `Headers(..)` (a fault, never an unserved header).
+        fault: Cell<bool>,
+    }
+    impl Outside for Chain<'_> {
+        async fn word_views(
+            &self,
+            rows: &BTreeMap<String, Row>,
+        ) -> Result<BTreeMap<String, Value>, String> {
+            let snap = HeaderSnapshot {
+                tip: if self.fault.get() {
+                    Err(bsv_tracker::HeaderError("503".into()))
+                } else {
+                    Ok(1_000_000)
+                },
+                headers: self
+                    .headers
+                    .borrow()
+                    .iter()
+                    .map(|(h, (hash, root))| {
+                        (
+                            *h,
+                            Ok(Some(Header {
+                                hash: hash.clone(),
+                                merkle_root: root.clone(),
+                            })),
+                        )
+                    })
+                    .collect(),
+            };
+            if rows.values().any(|r| r.word == "mined") {
+                self.asks.set(self.asks.get() + 1);
+                self.clock.set(self.clock.get() + ASK_MS);
+            }
+            Ok(rows
+                .iter()
+                .map(|(k, r)| (k.clone(), r.rechecked(&snap).unwrap()))
+                .collect())
+        }
+        async fn canonical_root(&self, _: u64) -> Option<String> {
+            None
+        }
+    }
+
+    /// The record under the model's load: each call [`RECORD_MS`] on `clock`.
+    struct Loaded<'a> {
+        inner: &'a SqliteSql,
+        clock: &'a Cell<u64>,
+    }
+    impl SqlPort for Loaded<'_> {
+        async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+            self.clock.set(self.clock.get() + RECORD_MS);
+            self.inner.run_batch(stmts).await
+        }
+        async fn counters(&self, d: Vec<(String, u64)>) {
+            self.inner.counters(d).await;
+        }
+        fn now_ms(&self) -> u64 {
+            self.clock.get()
+        }
+        fn log(&self, l: &str) {
+            self.inner.log(l);
+        }
+    }
+
+    /// The height of game `k`'s pot word.
+    fn height_of(k: usize) -> u32 {
+        900_000 + k as u32
+    }
+
+    /// FOLD-7's chained seat of `n` games, each game's pot MINED in `tx_words` (a real coinbase proof at its height),
+    /// read whole by a warm mirror; the chain serving each pot's header.
+    async fn mined_seat(n: usize) -> (SqliteSql, SqliteSql, Vec<String>) {
+        let record = seeded(&fold7_chained_seat(n));
+        for k in 0..n {
+            let row = mined(&h("c8", k), height_of(k), &h("aa", k));
+            record
+                .run_batch(vec![crate::tracker_host::chain_events::upsert_stmt(&row)])
+                .await
+                .unwrap();
+        }
+        let games = games_of(&record, "owner");
+        let local = mirror();
+        for chunk in games.chunks(GAMES_PER_APPLY) {
+            apply(
+                &record,
+                &local,
+                &Fakes,
+                "owner",
+                chunk,
+                Some(("bootstrap", 1)),
+                Some(TIP),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        (record, local, games)
+    }
+
+    fn chain<'a>(n: usize, clock: &'a Cell<u64>) -> Chain<'a> {
+        Chain {
+            headers: RefCell::new(
+                (0..n)
+                    .map(|k| (height_of(k), (h("aa", k), h("c8", k))))
+                    .collect(),
+            ),
+            clock,
+            asks: Cell::new(0),
+            fault: Cell::new(false),
+        }
+    }
+
+    fn mark(record: &SqliteSql, game: &str, source: &str, key: &str) {
+        record
+            .conn
+            .execute(
+                "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) VALUES ('owner',?1,?2,?3,1) ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=(SELECT COALESCE(MAX(generation),0)+1 FROM owed_dirty)",
+                [game, source, key],
+            )
+            .unwrap();
+    }
+
+    async fn published(
+        record: &SqliteSql,
+        source: &str,
+        key: &str,
+    ) -> overlay_discovery::owed_event::OwedEvent {
+        let port = crate::owed_events::SqlPublish {
+            db: record,
+            send: |_b: Vec<String>| async { Ok::<(), String>(()) },
+        };
+        let out = publish::publish_with(
+            &port,
+            vec![publish::Noted {
+                source: source.into(),
+                key: key.into(),
+                held: None,
+            }],
+        )
+        .await;
+        assert!(out.fault.is_none(), "{:?}", out.fault);
+        out.sent.into_iter().next().expect("the note was sent")
+    }
+
+    /// The network's SEEN of game `k`'s pot, as the writer publishes it (a carried event).
+    async fn seen(
+        record: &SqliteSql,
+        games: &[String],
+        k: usize,
+    ) -> overlay_discovery::owed_event::OwedEvent {
+        let pot = h("c8", k);
+        record
+            .conn
+            .execute(
+                "INSERT INTO network_seen(txid,seenAt,seenSource,sourceAtMs) VALUES (?1,'2026-10-30 00:00:00','arcade',?2) ON CONFLICT(txid) DO UPDATE SET sourceAtMs=network_seen.sourceAtMs+1",
+                rusqlite::params![pot, NOW_MS as i64],
+            )
+            .unwrap();
+        mark(record, &games[k], "seen", &pot);
+        published(record, "seen", &pot).await
+    }
+
+    fn opts_of(ev: &overlay_discovery::owed_event::OwedEvent) -> ApplyOpts {
+        let e = EventCtx::of(ev);
+        ApplyOpts {
+            touch: e.txids.clone(),
+            carried: e.carried.get("owner").cloned(),
+            ..ApplyOpts::default()
+        }
+    }
+
+    fn p95(v: &mut [u64]) -> u64 {
+        v.sort_unstable();
+        v[((v.len() as f64 * 0.95).ceil() as usize)
+            .saturating_sub(1)
+            .min(v.len() - 1)]
+    }
+
+    /// The record's answers' bytes (every row of every statement, as JSON text).
+    struct Bytes<'a> {
+        inner: &'a SqliteSql,
+        bytes: Cell<usize>,
+    }
+    impl SqlPort for Bytes<'_> {
+        async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+            let out = self.inner.run_batch(stmts).await?;
+            let n: usize = out
+                .iter()
+                .flat_map(|o| &o.rows)
+                .map(|r| r.to_string().len())
+                .sum();
+            self.bytes.set(self.bytes.get() + n);
+            Ok(out)
+        }
+        async fn counters(&self, d: Vec<(String, u64)>) {
+            self.inner.counters(d).await;
+        }
+        fn now_ms(&self) -> u64 {
+            self.inner.now_ms()
+        }
+        fn log(&self, l: &str) {
+            self.inner.log(l);
+        }
+    }
+
+    /// (g_d) THE WARM NARROWED READ RE-READS NO HELD BEEF (#959 (b)): game 5's collected marker names a payout whose
+    /// stored BEEF is real (~20 KB, both stored families), read by the warm mirror. A pot event of game 5 (not carried:
+    /// the narrowed read) is ONE record statement whose answer carries none of the BEEF's hex, and the mirror's facts
+    /// stay those a cold apply decodes. Then the BEEF's bytes move (its proof merged: here, its length): the next
+    /// narrowed read re-reads both families' bytes and the facts are a cold apply's again. RED on 461d7946 (the marked
+    /// read without the held lengths, `marked_select`): the answer carries the hex, past 40,000 bytes.
+    #[tokio::test]
+    async fn g_d_the_warm_narrowed_read_rereads_no_held_beef() {
+        let record = seeded(&fold7_chained_seat(8));
+        let (txid, beef) = crate::record_post::door_pins::realistic_payout_beef();
+        let pay = hex::encode(txid);
+        for t in ["transactions", "pot_beefs"] {
+            let sql = if t == "transactions" {
+                "INSERT INTO transactions(txid,beef,has_proof,created_at) VALUES (?1,?2,0,1)"
+            } else {
+                "INSERT INTO pot_beefs(txid,beef) VALUES (?1,?2)"
+            };
+            record
+                .conn
+                .execute(sql, rusqlite::params![pay, beef])
+                .unwrap();
+        }
+        let games = games_of(&record, "owner");
+        record
+            .conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    "owner",
+                    games[5],
+                    h("a1", 5),
+                    0,
+                    "00",
+                    (NOW_MS / 1000) as i64,
+                    pay
+                ],
+            )
+            .unwrap();
+        let local = mirror();
+        apply(
+            &record,
+            &local,
+            &Fakes,
+            "owner",
+            &games,
+            Some(("bootstrap", 1)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        let facts = |l: &SqliteSql| -> Vec<(String, String)> {
+            let mut q = l
+                .conn
+                .prepare("SELECT src,facts FROM txfacts WHERE txid=?1 AND src IN ('pot','stored') ORDER BY src")
+                .unwrap();
+            q.query_map([&pay], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let cold = |rec: &SqliteSql| {
+            let c = mirror();
+            futures_util::FutureExt::now_or_never(apply(
+                rec,
+                &c,
+                &Fakes,
+                "owner",
+                &games[5..6],
+                None,
+                Some(TIP),
+                None,
+            ))
+            .expect("a native apply never waits")
+            .unwrap();
+            c
+        };
+        assert_eq!(facts(&local), facts(&cold(&record)));
+        assert_eq!(
+            facts(&local).len(),
+            2,
+            "the pot and stored facts of the payout"
+        );
+        let narrowed = |record: &SqliteSql, local: &SqliteSql| {
+            let hop = e_write(record, &games, 5);
+            let bytes = Bytes {
+                inner: record,
+                bytes: Cell::new(0),
+            };
+            let r = futures_util::FutureExt::now_or_never(apply_with(
+                &bytes,
+                local,
+                &Fakes,
+                "owner",
+                &games[5..6],
+                Some(("pot", 1)),
+                Some(TIP),
+                None,
+                &ApplyOpts {
+                    touch: Some([hop].into_iter().collect()),
+                    ..ApplyOpts::default()
+                },
+            ))
+            .expect("a native apply never waits")
+            .unwrap()
+            .0;
+            (r, bytes.bytes.get())
+        };
+        let (r, bytes) = narrowed(&record, &local);
+        eprintln!(
+            "g_d: the warm narrowed read: {} record call(s), {} statement(s), {bytes} answer bytes",
+            r.record_calls, r.record_statements
+        );
+        assert!(
+            r.narrowed && r.record_calls == 1 && r.record_statements == 1,
+            "{r:?}"
+        );
+        assert!(
+            bytes < beef.len(),
+            "the answer carries none of the {} BEEF bytes' hex: {bytes}",
+            beef.len()
+        );
+        assert_eq!(
+            facts(&local),
+            facts(&cold(&record)),
+            "the held facts are a cold apply's"
+        );
+        // the bytes move: the next narrowed read re-reads both families
+        record
+            .conn
+            .execute(
+                "UPDATE transactions SET beef=?2 WHERE txid=?1",
+                rusqlite::params![pay, [beef.clone(), vec![0u8]].concat()],
+            )
+            .unwrap();
+        let (_, bytes) = narrowed(&record, &local);
+        assert!(
+            bytes > 2 * beef.len(),
+            "the moved BEEF re-read with its twin: {bytes}"
+        );
+        assert_eq!(facts(&local), facts(&cold(&record)));
+        assert_eq!(
+            stored_game(&local, "owner", &games[5]),
+            stored_game(&cold(&record), "owner", &games[5])
+        );
+    }
+
+    /// (g_e) A FILING'S CLOSURE PAST 32 KIB IS CARRIED (L57: 420 of 426 declined): a NEW collected filing whose payout
+    /// names a 40 KB spender-bytes row, through the shipped direct pass over the record and the REAL actor: its closure
+    /// is read and kept, and the actor's apply makes NO record call. RED on 461d7946 (`CLOSURE_MAX_BYTES` 32 KiB): the
+    /// closure is declined and the apply reads its miss (`left: (0, 1) right: (1, 0)`).
+    #[tokio::test]
+    async fn g_e_a_filing_closure_past_32_kib_is_carried() {
+        let (record, local, games) = e_warm_seat(20).await;
+        let (marker, pay) = (h("a1", 12), h("a2", 12));
+        record
+            .conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    "owner",
+                    games[12],
+                    marker,
+                    0,
+                    "00",
+                    (NOW_MS / 1000) as i64,
+                    pay
+                ],
+            )
+            .unwrap();
+        record
+            .conn
+            .execute(
+                "INSERT INTO owed_spender_bytes(txid,bytesJson,createdAtMs) VALUES (?1,?2,1)",
+                rusqlite::params![pay, json!({"raw": "ab".repeat(20_000)}).to_string()],
+            )
+            .unwrap();
+        mark(&record, &games[12], "collected", &marker);
+        let ev = published(&record, "collected", &marker).await;
+        assert!(closure_wanted(&ev).is_some());
+        let keys = closure_wanted(&ev).unwrap();
+        let (stmt, read) = pass_closure_statement(&keys, 1).unwrap();
+        let row = read_pass_closure(&record, stmt).await.unwrap();
+        let mut ev = ev;
+        let closure = closure_for(&keys, &read, &row).unwrap();
+        let kept = closure.is_some();
+        if let Some(c) = closure {
+            assert!(
+                c.to_string().len() > 32_768,
+                "the closure passes the old bound: {}",
+                c.to_string().len()
+            );
+            ev.facts["closure"] = c;
+        }
+        let b0 = record.batches.get();
+        let (r, _) = apply_with(
+            &record,
+            &local,
+            &Fakes,
+            "owner",
+            &games[12..13],
+            Some(("collected", ev.seq)),
+            Some(TIP),
+            None,
+            &opts_of(&ev),
+        )
+        .await
+        .unwrap();
+        let calls = record.batches.get() - b0;
+        assert_eq!(
+            (kept as u32, calls),
+            (1, 0),
+            "kept and no record call ({r:?})"
+        );
+        let c = mirror();
+        apply(
+            &record,
+            &c,
+            &Fakes,
+            "owner",
+            &games[12..13],
+            None,
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stored_game(&local, "owner", &games[12]),
+            stored_game(&c, "owner", &games[12])
+        );
+    }
+
+    /// (g_f) THE STATEMENTS RING (#1031 item 4): each answer names its record statements (`recordStatements`), the
+    /// class's ring and each read path's are served (`classes.<class>.recordStatementsP95`,
+    /// `paths.<path>.recordStatementsP95`), beside the paths' apply and visibility rings.
+    #[tokio::test]
+    async fn g_f_the_statements_ring_is_served() {
+        let record = mirror();
+        let mut pending = PendingBars::default();
+        for (path, st) in [("carried", 0u64), ("narrowed", 1), ("full", 3)] {
+            let a = json!({"applied": true, "applyMs": 5, "readMs": 1, "judgeMs": 1, "writeMs": 1, "waitMs": 1, "outsideMs": 0,
+                "recordStatements": st, "carried": path == "carried", "narrowed": path == "narrowed"});
+            pending.note_answer("direct", &a);
+        }
+        record
+            .conn
+            .execute_batch("CREATE TABLE IF NOT EXISTS owed_belt_state (name TEXT PRIMARY KEY, cursor TEXT, tickedAtMs INTEGER); CREATE TABLE IF NOT EXISTS ops_counters (name TEXT PRIMARY KEY, value INTEGER); CREATE TABLE IF NOT EXISTS owed_state (identity TEXT PRIMARY KEY, rows INTEGER)")
+            .ok();
+        let _ = flush_bars_from(&record, NOW_MS, &pending).await;
+        let rows: Vec<Value> = record
+            .run_batch(vec![Stmt::new(BARS_READ_SQL, vec![])])
+            .await
+            .unwrap()
+            .remove(0)
+            .rows;
+        let bars = fleet_bars(&rows, NOW_MS, lib_rev());
+        let d = &bars["classes"]["direct"];
+        assert_eq!(d["recordStatementsP95"], 3, "{d}");
+        assert_eq!(d["paths"]["carried"]["recordStatementsP95"], 0);
+        assert_eq!(d["paths"]["narrowed"]["recordStatementsP95"], 1);
+        assert_eq!(d["paths"]["full"]["recordStatementsP95"], 3);
+        assert_eq!(bars["stages"]["recordStatementsP95"], 3);
+    }
+
+    /// The D1 judge with the live chain's word views (the worker's `runtime::views` over CHAINTRACKS), over the record.
+    struct D1Live<'a> {
+        db: &'a SqliteSql,
+        chain: &'a Chain<'a>,
+    }
+    impl SqlPort for D1Live<'_> {
+        async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+            self.db.run_batch(stmts).await
+        }
+        async fn counters(&self, d: Vec<(String, u64)>) {
+            self.db.counters(d).await;
+        }
+        fn now_ms(&self) -> u64 {
+            self.db.now_ms()
+        }
+        fn log(&self, l: &str) {
+            self.db.log(l);
+        }
+    }
+    impl crate::owed_judge::JudgeDb for D1Live<'_> {
+        fn tip(&self) -> Option<u64> {
+            self.db.tip.get()
+        }
+        async fn word_views(
+            &self,
+            rows: &BTreeMap<String, Row>,
+        ) -> Result<BTreeMap<String, Value>, String> {
+            self.chain.word_views(rows).await
+        }
+        async fn canonical_root(&self, _: u64) -> Option<String> {
+            None
+        }
+        async fn push(&self, _: &str, _: Value) {}
+    }
+
+    fn rows_of(db: &SqliteSql, id: &str) -> Vec<String> {
+        let mut q = db.conn.prepare("SELECT json_array(outpoint,family,gameId,sats,opponentIdentity,atHeight,facts,reason,claimable,gateHeight,beltDueAtMs,probeTip) FROM owed_rows WHERE identity=?1 ORDER BY outpoint").unwrap();
+        q.query_map([id], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+    fn presses(rows: &[String]) -> usize {
+        rows.iter()
+            .filter(|r| serde_json::from_str::<Value>(r).unwrap()[8] == 1)
+            .count()
+    }
+
+    /// The pot's funding height in [`gf1_high1_an_unserved_header_is_judged_as_the_d1_judge_judges_it`].
+    const POT_H: u32 = 899_000;
+
+    /// A seat's refund press that RESTS on the pot's checked mined word: d3n1_a's indexed pot, the seat, its filed
+    /// backup, the recovery gate open, NO `network_seen` latch and no verified proof (FIX-831: the press needs the
+    /// tracker's CHECKED `mined` word of the funding), the pot's word mined at [`POT_H`]; the chain serving its header.
+    async fn refund_on_a_mined_word<'a>(
+        clock: &'a Cell<u64>,
+    ) -> (SqliteSql, String, Vec<String>, Chain<'a>) {
+        use crate::record_post::{self, tests as rp, RecordKind};
+        let record = SqliteSql::migrated();
+        record.now.set(NOW_MS);
+        record.tip.set(Some(TIP));
+        let victim = rp::wallet(0x46);
+        let id = hex::encode(rp::identity(&victim));
+        let game = [0x7c; 32];
+        rp::md_index_the_pot(&record);
+        rp::md_seat(&record, &id, &game);
+        let pot = hex::encode(rp::POT_TXID);
+        let row = mined(&pot, POT_H, &h("aa", 1));
+        record
+            .run_batch(vec![crate::tracker_host::chain_events::upsert_stmt(&row)])
+            .await
+            .unwrap();
+        let script = rp::potrefund_script(&victim, &game, &rp::presigned_refund());
+        let mut filing =
+            record_post::verify_record_post(RecordKind::Potrefund, &script, &id).unwrap();
+        record_post::file_verified(&record, &mut filing, &id, (NOW_MS / 1000) as i64)
+            .await
+            .unwrap();
+        let games = games_of(&record, &id);
+        assert!(!games.is_empty());
+        let chain = Chain {
+            headers: RefCell::new(BTreeMap::from([(POT_H, (h("aa", 1), pot))])),
+            clock,
+            asks: Cell::new(0),
+            fault: Cell::new(false),
+        };
+        (record, id, games, chain)
+    }
+
+    /// A BEEF of the payout's subject alone, proven by a coinbase-shaped bump at `height` (root = its txid).
+    fn proven_beef(height: u32) -> (String, Vec<u8>) {
+        use bsv_rs::transaction::Beef;
+        let (txid, beef) = crate::record_post::door_pins::realistic_payout_beef();
+        let txid = hex::encode(txid);
+        let mut b = Beef::from_binary(&beef).unwrap();
+        let raw = b.find_txid_mut(&txid).unwrap().raw_tx_or_compute().unwrap();
+        let mut p = Beef::new();
+        let i = p.merge_bump(MerklePath::from_coinbase_txid(&txid, height));
+        p.merge_raw_tx(raw, Some(i));
+        (txid, p.to_binary())
+    }
+
+    /// (gf1_l1) D2-ACTOR-G-FOLD-1, THE LENS'S LOW-1: A SAME-LENGTH RE-ANCHOR REFRESHES THE FACTS. The payout's stored
+    /// BEEF (both families) proven at 899,000, read by the warm mirror (`bumpHeight` 899,000). A reorg re-anchors it at
+    /// 899,001: the new BEEF is EXACTLY the same length. The warm narrowed read re-reads both families (the subject
+    /// bump's height in place, [`bump_mark`]) and the facts are a cold apply's (`bumpHeight` 899,001); bytes that keep
+    /// the height are still held. RED with b2ffbfb6's length-only hold: the facts keep 899,000.
+    #[tokio::test]
+    async fn gf1_l1_a_same_length_re_anchor_refreshes_the_facts() {
+        let record = seeded(&fold7_chained_seat(8));
+        let (pay, old) = proven_beef(899_000);
+        let (_, new) = proven_beef(899_001);
+        assert_eq!(old.len(), new.len(), "a same-length re-anchor");
+        assert_ne!(old, new);
+        assert!(
+            bump_mark(&pay, &old)
+                .as_array()
+                .is_some_and(|a| a.len() == 2),
+            "{}",
+            bump_mark(&pay, &old)
+        );
+        for (t, sql) in [
+            (
+                "transactions",
+                "INSERT INTO transactions(txid,beef,has_proof,created_at) VALUES (?1,?2,0,1)",
+            ),
+            (
+                "pot_beefs",
+                "INSERT INTO pot_beefs(txid,beef) VALUES (?1,?2)",
+            ),
+        ] {
+            let _ = t;
+            record
+                .conn
+                .execute(sql, rusqlite::params![pay, old])
+                .unwrap();
+        }
+        let games = games_of(&record, "owner");
+        record
+            .conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    "owner",
+                    games[5],
+                    h("a1", 5),
+                    0,
+                    "00",
+                    (NOW_MS / 1000) as i64,
+                    pay
+                ],
+            )
+            .unwrap();
+        let local = mirror();
+        apply(
+            &record,
+            &local,
+            &Fakes,
+            "owner",
+            &games,
+            Some(("bootstrap", 1)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        let facts = |l: &SqliteSql| -> Vec<(String, String)> {
+            let mut q = l
+                .conn
+                .prepare("SELECT src,facts FROM txfacts WHERE txid=?1 AND src IN ('pot','stored') ORDER BY src")
+                .unwrap();
+            q.query_map([&pay], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(facts(&local).len(), 2);
+        assert!(
+            facts(&local).iter().all(|(_, f)| f.contains("899000")),
+            "{:?}",
+            facts(&local)
+        );
+        let narrowed = |local: &SqliteSql| {
+            let hop = e_write(&record, &games, 5);
+            let bytes = Bytes {
+                inner: &record,
+                bytes: Cell::new(0),
+            };
+            let r = futures_util::FutureExt::now_or_never(apply_with(
+                &bytes,
+                local,
+                &Fakes,
+                "owner",
+                &games[5..6],
+                Some(("pot", 1)),
+                Some(TIP),
+                None,
+                &ApplyOpts {
+                    touch: Some([hop].into_iter().collect()),
+                    ..ApplyOpts::default()
+                },
+            ))
+            .expect("a native apply never waits")
+            .unwrap()
+            .0;
+            assert!(r.narrowed, "{r:?}");
+            bytes.bytes.get()
+        };
+        // the same bytes: held, not re-read
+        let held = narrowed(&local);
+        let again = narrowed(&local);
+        assert_eq!(held, again, "the same bytes are held, read twice alike");
+        // the re-anchor: same length, a new height
+        for t in ["transactions", "pot_beefs"] {
+            record
+                .conn
+                .execute(
+                    &format!("UPDATE {t} SET beef=?2 WHERE txid=?1"),
+                    rusqlite::params![pay, new],
+                )
+                .unwrap();
+        }
+        let reread = narrowed(&local);
+        eprintln!(
+            "gf1_l1: held {held} answer bytes, the re-anchor's read {reread} (the BEEF {} bytes)",
+            new.len()
+        );
+        assert!(
+            reread >= held + 4 * new.len(),
+            "both families' hex re-read: {reread} against {held}"
+        );
+        let cold = mirror();
+        apply(
+            &record,
+            &cold,
+            &Fakes,
+            "owner",
+            &games[5..6],
+            None,
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(facts(&local), facts(&cold));
+        assert!(
+            facts(&local).iter().all(|(_, f)| f.contains("899001")),
+            "{:?}",
+            facts(&local)
+        );
+        // and held again after
+        assert_eq!(narrowed(&local), held);
+    }
+
+    /// The CONTROL outside of [`g_rule_the_actor_judges_a_mined_word_as_the_d1_judge_does`]: a mined word judged on its
+    /// OWN recorded header (the header the tracker verified it against when it wrote the word), never asked: PR 260's
+    /// first-apply judgement, which the cut deletes. A word not mined is its own view.
+    struct Recorded<'a>(&'a Chain<'a>);
+    fn recorded(r: &Row) -> Value {
+        if r.word != "mined" {
+            return r.view();
+        }
+        let height = r.proof_height.expect("a mined row's height") as u32;
+        let own = HeaderSnapshot {
+            tip: Ok(height),
+            headers: BTreeMap::from([(
+                height,
+                Ok(Some(Header {
+                    hash: r.header_hash.clone().expect("its header"),
+                    merkle_root: r.proof_root.clone().expect("its root"),
+                })),
+            )]),
+        };
+        r.rechecked(&own).unwrap()
+    }
+    impl Outside for Recorded<'_> {
+        async fn word_views(
+            &self,
+            rows: &BTreeMap<String, Row>,
+        ) -> Result<BTreeMap<String, Value>, String> {
+            let _ = self.0;
+            Ok(rows.iter().map(|(k, r)| (k.clone(), recorded(r))).collect())
+        }
+        async fn canonical_root(&self, _: u64) -> Option<String> {
+            None
+        }
+    }
+
+    /// (g_rule) THE ONE RULE, A DIFFERENTIAL: the actor judges a mined word as the D1 judge judges it for the same
+    /// evidence. A refund press that rests on the pot's CHECKED mined word (FIX-831: no SEEN latch, no verified proof;
+    /// `refund_on_a_mined_word`), the warm actor and the D1 judge over the same record, at the same instant, with the
+    /// same CHAINTRACKS answers: the header SERVED (both press), UNSERVED (the #896 class: both withhold,
+    /// `funding-not-held`), FAULTED (`cannotCheck` `Headers(..)`: both withhold) and served again (both press). At each
+    /// the actor's stored rows equal the D1 judge's field for field, and the actor asked CHAINTRACKS once inside its
+    /// apply (main's `EnvOutside`). The control: an actor judging its recorded header ([`Recorded`]) presses where the D1
+    /// judge withholds, so the pin tells the two rules apart. RED with the actor's outside the recorded one (the line
+    /// marked `the actor's outside`, PR 260's first-apply judgement): `unserved: the actor's rows are the D1 judge's`
+    /// (the actor's `present-refund` claimable against the D1 judge's `funding-not-held`).
+    #[tokio::test]
+    async fn g_rule_the_actor_judges_a_mined_word_as_the_d1_judge_does() {
+        let clock = Cell::new(NOW_MS);
+        let (record, id, games, ch) = refund_on_a_mined_word(&clock).await;
+        let pot = hex::encode(crate::record_post::tests::POT_TXID);
+        let d1 = D1Live {
+            db: &record,
+            chain: &ch,
+        };
+        let out = &ch; // the actor's outside
+        let local = mirror();
+        apply(
+            &record,
+            &local,
+            out,
+            &id,
+            &games,
+            Some(("bootstrap", 1)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut asked = Vec::new();
+        for (seq, (state, want)) in [
+            ("served", 1),
+            ("unserved", 0),
+            ("faulted", 0),
+            ("served again", 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            match state {
+                "unserved" => {
+                    ch.headers.borrow_mut().remove(&POT_H);
+                }
+                "faulted" => {
+                    ch.headers
+                        .borrow_mut()
+                        .insert(POT_H, (h("aa", 1), pot.clone()));
+                    ch.fault.set(true);
+                }
+                _ => {
+                    ch.headers
+                        .borrow_mut()
+                        .insert(POT_H, (h("aa", 1), pot.clone()));
+                    ch.fault.set(false);
+                }
+            }
+            let asks = ch.asks.get();
+            apply(
+                &record,
+                &local,
+                out,
+                &id,
+                &games,
+                Some(("pot", seq as i64 + 2)),
+                Some(TIP),
+                None,
+            )
+            .await
+            .unwrap();
+            let actor_asks = ch.asks.get() - asks;
+            crate::owed_judge::judge_subjects(&d1, &id, &games, "d1")
+                .await
+                .unwrap();
+            let d1_rows = rows_of(&record, &id);
+            assert_eq!(
+                rows_of(&local, &id),
+                d1_rows,
+                "{state}: the actor's rows are the D1 judge's"
+            );
+            assert_eq!(
+                presses(&d1_rows),
+                want,
+                "{state}: the D1 judge's presses: {d1_rows:#?}"
+            );
+            if want == 0 && state == "unserved" {
+                assert!(
+                    d1_rows.iter().any(|r| r.contains("funding-not-held")),
+                    "{d1_rows:#?}"
+                );
+            }
+            asked.push(actor_asks);
+            // the control: the recorded header's judgement presses where the D1 judge withholds
+            let c = mirror();
+            apply(
+                &record,
+                &c,
+                &Recorded(&ch),
+                &id,
+                &games,
+                Some(("bootstrap", 1)),
+                Some(TIP),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                presses(&rows_of(&c, &id)),
+                1,
+                "{state}: the control presses on its recorded header"
+            );
+            if want == 0 {
+                assert_ne!(
+                    rows_of(&c, &id),
+                    d1_rows,
+                    "{state}: the control differs, so the pin tells the rules apart"
+                );
+            }
+        }
+        assert_eq!(
+            asked,
+            [1, 1, 1, 1],
+            "the actor asked CHAINTRACKS live once inside each apply"
+        );
+    }
+
+    /// (g_asks) THE ASK COUNT, AS MAIN'S: a warm seat of 32 games (each game's pot a mined word), 32 carried SEENs, one
+    /// a game, applied one after another as the turn serializes them, each through the outside main's object builds
+    /// (`EnvOutside`, here the model chain): the 32 applies ask CHAINTRACKS exactly 32 times (one ask an apply that
+    /// judges a mined word, FIX-983 holding it across that apply's rounds) and make NO record call (the carried path,
+    /// D2-ACTOR-F), each game's rows a cold apply's. This restates PR 260's `gf1_n2` (which pinned 0 asks under the
+    /// deleted word-view memo): the burst reads no record, and it asks the chain live. RED with the actor's outside
+    /// the recorded one (PR 260's first apply, the line marked `the actor's outside`): `left: 0 right: 32`.
+    #[tokio::test]
+    async fn g_asks_a_carried_burst_of_32_asks_chaintracks_32_times_and_reads_no_record() {
+        let (record, local, games) = mined_seat(32).await;
+        let clock = &local.now;
+        let ch = chain(32, clock);
+        let out = &ch; // the actor's outside
+        let loaded = Loaded {
+            inner: &record,
+            clock,
+        };
+        let mut events = Vec::new();
+        for k in 0..32 {
+            events.push(seen(&record, &games, k).await);
+        }
+        let mut times = Vec::new();
+        for (k, ev) in events.iter().enumerate() {
+            let t0 = clock.get();
+            let (r, _) = apply_with(
+                &loaded,
+                &local,
+                out,
+                "owner",
+                &games[k..k + 1],
+                Some(("seen", ev.seq)),
+                Some(TIP),
+                None,
+                &opts_of(ev),
+            )
+            .await
+            .unwrap();
+            times.push(clock.get() - t0);
+            assert!(r.carried, "{r:?}");
+            assert_eq!(
+                (r.record_calls, r.record_statements),
+                (0, 0),
+                "no record call in a warm carried apply: {r:?}"
+            );
+        }
+        let p = p95(&mut times);
+        eprintln!(
+            "g_asks: 32 carried applies, CHAINTRACKS asks {}, apply p95 {p} ms (virtual: one ask {ASK_MS} ms)",
+            ch.asks.get()
+        );
+        assert_eq!(ch.asks.get(), 32, "one live CHAINTRACKS ask an apply");
+        for k in [0, 15, 31] {
+            let c = mirror();
+            apply(
+                &record,
+                &c,
+                &Fakes,
+                "owner",
+                &games[k..k + 1],
+                None,
+                Some(TIP),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                stored_game(&local, "owner", &games[k]),
+                stored_game(&c, "owner", &games[k])
+            );
+        }
+    }
+
+    /// A second warm mirror of the seat (its bootstrap, as [`mined_seat`]'s).
+    async fn warm(record: &SqliteSql, games: &[String]) -> SqliteSql {
+        let local = mirror();
+        for chunk in games.chunks(GAMES_PER_APPLY) {
+            apply(
+                record,
+                &local,
+                &Fakes,
+                "owner",
+                chunk,
+                Some(("bootstrap", 1)),
+                Some(TIP),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        local
+    }
+
+    /// (g_m) THE DIRECT CLASS'S FIGURES, KEPT AGAINST MAIN, under the model (a record call 400 ms, a CHAINTRACKS ask
+    /// 300 ms, nothing else moving the clock): a warm seat of 20 games, each pot a mined word; 16 carried SEENs (games 0
+    /// to 15) and 4 NEW collected filings (games 16 to 19) whose payout names a 40 KB spender-bytes row, so each
+    /// filing's closure passes main's 32 KiB. Two warm mirrors over the same record: MAIN's arm applies each filing
+    /// without its closure (main's `CLOSURE_MAX_BYTES` declines it: the closure statement was spent, then the apply
+    /// reads its miss), the KEPT arm with it. Both arms ask CHAINTRACKS once an apply (the rule). A filing's visibility
+    /// adds its closure statement (one record call, both arms); a SEEN reads none. Printed; asserted: the kept arm no
+    /// slower, both under the owner's ceilings (apply 3,000 ms, visible 5,000 ms, record 1752). The held-BEEF skip
+    /// moves bytes, not calls, so the model does not see it (`g_d` pins its bytes).
+    #[tokio::test]
+    async fn g_m_the_direct_class_kept_against_main_under_the_model() {
+        let (record, kept, games) = mined_seat(20).await;
+        let main = warm(&record, &games).await;
+        let clock = Cell::new(NOW_MS);
+        let ch = chain(20, &clock);
+        let loaded = Loaded {
+            inner: &record,
+            clock: &clock,
+        };
+        let (mut apply_kept, mut apply_main, mut vis_kept, mut vis_main) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut events = Vec::new();
+        for k in 0..16 {
+            events.push((seen(&record, &games, k).await, None));
+        }
+        for (k, game) in games.iter().enumerate().skip(16) {
+            let (marker, pay) = (h("a1", k), h("a2", k));
+            record
+                .conn
+                .execute(
+                    crate::record_post::COLLECTED_FILE_SQL,
+                    rusqlite::params!["owner", game, marker, 0, "00", (NOW_MS / 1000) as i64, pay],
+                )
+                .unwrap();
+            record
+                .conn
+                .execute(
+                    "INSERT INTO owed_spender_bytes(txid,bytesJson,createdAtMs) VALUES (?1,?2,1)",
+                    rusqlite::params![pay, json!({"raw": "ab".repeat(20_000)}).to_string()],
+                )
+                .unwrap();
+            mark(&record, game, "collected", &marker);
+            let ev = published(&record, "collected", &marker).await;
+            let keys = closure_wanted(&ev).expect("a filing wants its closure");
+            let (stmt, read) = pass_closure_statement(&keys, 1).unwrap();
+            let row = read_pass_closure(&record, stmt).await.unwrap();
+            let c = closure_for(&keys, &read, &row)
+                .unwrap()
+                .expect("kept under 256 KiB");
+            assert!(c.to_string().len() > 32_768, "main's 32 KiB declines it");
+            events.push((ev, Some(c)));
+        }
+        for (i, (ev, closure)) in events.iter().enumerate() {
+            let k = i;
+            let closure_ms = if closure.is_some() { RECORD_MS } else { 0 };
+            for (arm, local) in [("main", &main), ("kept", &kept)] {
+                let mut ev = ev.clone();
+                if arm == "kept" {
+                    if let Some(c) = closure {
+                        ev.facts["closure"] = c.clone();
+                    }
+                }
+                let t0 = clock.get();
+                let asks = ch.asks.get();
+                let (r, _) = apply_with(
+                    &loaded,
+                    local,
+                    &ch,
+                    "owner",
+                    &games[k..k + 1],
+                    Some((
+                        if closure.is_some() {
+                            "collected"
+                        } else {
+                            "seen"
+                        },
+                        ev.seq,
+                    )),
+                    Some(TIP),
+                    None,
+                    &opts_of(&ev),
+                )
+                .await
+                .unwrap();
+                let ms = clock.get() - t0;
+                assert_eq!(ch.asks.get() - asks, 1, "{arm}: one live ask an apply");
+                if closure.is_some() {
+                    assert_eq!(
+                        r.record_calls,
+                        u32::from(arm == "main"),
+                        "{arm}: the filing's miss read only without its closure: {r:?}"
+                    );
+                }
+                let (a, v) = if arm == "main" {
+                    (&mut apply_main, &mut vis_main)
+                } else {
+                    (&mut apply_kept, &mut vis_kept)
+                };
+                a.push(ms);
+                v.push(ms + closure_ms);
+            }
+            assert_eq!(
+                stored_game(&kept, "owner", &games[k]),
+                stored_game(&main, "owner", &games[k])
+            );
+        }
+        let (am, ak, vm, vk) = (
+            p95(&mut apply_main),
+            p95(&mut apply_kept),
+            p95(&mut vis_main),
+            p95(&mut vis_kept),
+        );
+        let filing_main = vis_main.iter().max().copied().unwrap_or(0);
+        eprintln!(
+            "g_m (virtual ms, 20 events, 16 SEENs + 4 filings past 32 KiB): apply p95 main {am} kept {ak}; visible p95 main {vm} kept {vk}; a filing visible main {filing_main} kept {}",
+            vis_kept.iter().max().copied().unwrap_or(0)
+        );
+        assert!(ak <= am && vk <= vm);
+        assert!(ak < 3_000 && vk < 5_000);
     }
 }
