@@ -2841,6 +2841,8 @@ impl ResultsRowD1 {
             spender_proof_verified: self.spender_proof_verified.map(|v| v != 0.0),
             spender_seen: self.spender_seen.map(|v| v != 0.0),
             spender_final: self.spender_final.map(|v| v != 0.0),
+            // bsv-low #1048: never read from D1; the route's bytes arm sets it
+            index_signers: None,
             funding_size_bytes: self.funding_size_bytes.map(|v| v as u64),
             funding_fee_sats: self.funding_fee_sats.map(|v| v as u64),
             spender_facts_txid: self.spender_facts_txid,
@@ -3494,9 +3496,10 @@ async fn gather_result_rows(
     // replayed here from its retained bytes, bounded). BEST-EFFORT, same
     // discipline as hand markers: a fault leaves the marker path in charge.
     let proof_hands = results_proof_hands(db, &game_ids).await;
-    // bsv-low #1048: a recorded, final spend whose bytes the index holds is decided by its signers, never by the
-    // network's SEEN alone (`results::index_bytes_landing`). The public route only; no statement added.
-    crate::results::apply_index_bytes_arm(&mut rows);
+    // bsv-low #1048: a recorded, final spend whose held bytes classify against the committed triple (WHO SIGNED,
+    // `results::index_bytes_landing`) lands without the network's SEEN; no SEEN latch is written. The public route
+    // only; no statement added.
+    crate::results::apply_index_bytes_arm(&mut rows, &params_by_pot);
 
     Ok((
         crate::results::assemble_results(

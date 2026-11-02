@@ -1945,7 +1945,13 @@ pub fn is_confirmed_landing(status: &OutpointStatus) -> bool {
 ///    attacker-planted never-broadcast spend pointer from the ungated
 ///    public `/submit` would publish a fabricated verdict (epoch Rule 21's
 ///    worked-example defeat). `None` on either (pre-#371 rows) degrades to
-///    the merkle arms — honest, self-draining.
+///    the merkle arms — honest, self-draining. Beside this bar, and on the
+///    public `/results` route alone, bsv-low #1048's bytes arm
+///    (`results::apply_index_bytes_arm`) lands a FINAL spend with no SEEN
+///    only when the bytes the index holds CLASSIFY against the committed
+///    triple (WHO SIGNED, #406's BIP-143 check): a planted pointer the
+///    committed keys did not sign stays withheld, and no SEEN latch is
+///    written from bytes.
 ///
 /// # Why this is hoisted (#323, the fourth instance of one pattern)
 ///
