@@ -793,9 +793,9 @@ async fn hydrate_evidence(
             Bind::Int(i64::from(*vout)),
             Bind::Text(i.identity.clone()),
         ];
-        for r in read::<Value>(db,"SELECT s.sweepTxid,s.sweepRawHex,t.has_proof,t.proofHeight FROM hopsweep_records s INDEXED BY idx_hopsweep_hop LEFT JOIN transactions t ON t.txid=s.sweepTxid WHERE s.hopTxid=?1 AND s.hopVout=?2 AND s.identity=?3 ORDER BY s.createdAt DESC,s.rowid DESC",binds).await? {
+        for r in read::<Value>(db,"SELECT s.sweepTxid,s.sweepRawHex,s.createdAt,t.has_proof,t.proofHeight FROM hopsweep_records s INDEXED BY idx_hopsweep_hop LEFT JOIN transactions t ON t.txid=s.sweepTxid WHERE s.hopTxid=?1 AND s.hopVout=?2 AND s.identity=?3 ORDER BY s.createdAt DESC,s.rowid DESC",binds).await? {
             let raw=text(&r,"sweepRawHex");
-            all_sweeps.entry(owed::outpoint_key(hop,*vout)).or_default().push(crate::hopsweep::FiledHopSweep{sweep_txid:text(&r,"sweepTxid"),pays_sats:crate::hopsweep::sweep_output_sats(&raw),raw_hex:raw,index_proven:flag(&r,"has_proof")==Some(true),index_proof_height:r["proofHeight"].as_u64()});
+            all_sweeps.entry(owed::outpoint_key(hop,*vout)).or_default().push(crate::hopsweep::FiledHopSweep{sweep_txid:text(&r,"sweepTxid"),pays_sats:crate::hopsweep::sweep_output_sats(&raw),raw_hex:raw,index_proven:flag(&r,"has_proof")==Some(true),index_proof_height:r["proofHeight"].as_u64(),filed_at_ms:r["createdAt"].as_i64().or_else(|| r["createdAt"].as_f64().map(|t| t as i64)).filter(|t| *t>0).map(|t| t.saturating_mul(1000))});
         }
         // Both the refusal and the JOIN-seat fallback start at the selected hop's key.
         for r in read::<Value>(
@@ -871,6 +871,9 @@ async fn hydrate_evidence(
                     pays_sats: crate::hopsweep::sweep_output_sats(&r.sweep_raw_hex),
                     index_proven: proof.is_some_and(|p| flag(p, "has_proof") == Some(true)),
                     index_proof_height: proof.and_then(|p| p["proofHeight"].as_u64()),
+                    // FIX-1057 (item 8): the filing being written now; the door stamps `createdAt` in seconds, so
+                    // the judge reads the same second the record will hold
+                    filed_at_ms: Some(i.now_ms.div_euclid(1000) * 1000),
                 },
             );
         }

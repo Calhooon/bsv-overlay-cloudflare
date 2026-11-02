@@ -4887,7 +4887,8 @@ pub fn tip_derived_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
 /// wait's end is the judgement's clock (`owed::SWEEP_LANDING_WAIT_MS` after the sweep's last hint), so the two are one
 /// record judged at two instants, a CLOCK LAG read with the tip's ([`tip_derived_rows`]), never a STOP. Any other
 /// difference (another sweep, another game, a landing on both sides that differs, a later side still inside the wait,
-/// a row with no judgement time) stays a difference.
+/// a row with no judgement time) stays a difference. FIX-1057 (item 6): and the two verdicts are read, the earlier the
+/// wait and the later the press it gives back; any other verdict on either side is a difference.
 fn landing_lag(x: &Value, y: &Value) -> bool {
     let facts = |r: &Value| -> Value {
         r["facts"]
@@ -4901,7 +4902,21 @@ fn landing_lag(x: &Value, y: &Value) -> bool {
         let same = ["family", "gameId", "sats", "opponentIdentity"]
             .iter()
             .all(|k| landing[*k] == later[*k]);
-        same && lf["sweepLanding"] == true
+        // FIX-1057 (bsv-low #1057 item 6; round 3's C LOW-1): BOTH VERDICTS READ. The earlier side is the wait (no
+        // claim, not claimable) and the later side is exactly the press the wait's end gives back: the filed sweep's
+        // own bytes (`sweep-hop`, claimable, `sweepRawHex`, `sweepSource` the filing) in a claimable row. A later row
+        // withheld for another reason, or pressing anything else, on the same sweep is a judge disagreement (a STOP),
+        // never a clock lag.
+        let claimable_row = |r: &Value| r["claimable"] == true || r["claimable"] == 1;
+        let waits = lf["claim"].is_null() && lf["claimable"] == false && !claimable_row(landing);
+        let presses = pf["claim"] == "sweep-hop"
+            && pf["claimable"] == true
+            && pf["sweepRawHex"].is_string()
+            && pf["sweepSource"] == "hopsweep-filing"
+            && claimable_row(later);
+        same && waits
+            && presses
+            && lf["sweepLanding"] == true
             && pf.get("sweepLanding").is_none()
             && lf["sweepTxid"].is_string()
             && lf["sweepTxid"] == pf["sweepTxid"]

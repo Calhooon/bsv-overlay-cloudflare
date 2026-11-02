@@ -311,6 +311,10 @@ pub struct FiledHopSweep {
     pub index_proven: bool,
     /// The block the verified bump names (`transactions.proofHeight`), when recorded.
     pub index_proof_height: Option<u64>,
+    /// FIX-1057 (bsv-low #1057 item 8): when the door took the filing (`hopsweep_records.createdAt`, seconds, in ms):
+    /// the fixed origin of the landing wait's ABSOLUTE bound (`owed::SWEEP_LANDING_MAX_MS`). Written once by the
+    /// door, never renewed. `None` where the record holds no stamp: no landing wait (the press).
+    pub filed_at_ms: Option<i64>,
 }
 
 /// The sweep's total output value (a sweep is 1-in/1-out: the hop minus the fee).
@@ -775,6 +779,7 @@ pub(crate) mod tests {
             pays_sats: Some(20_000),
             index_proven: proven,
             index_proof_height: proven.then_some(967_696),
+            filed_at_ms: None,
         };
         assert_eq!(pick_filed_sweep(f("aa", false), vec![]).sweep_txid, "aa");
         assert_eq!(

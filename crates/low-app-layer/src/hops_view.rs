@@ -3047,6 +3047,7 @@ mod tests {
                     pays_sats: Some(20_000),
                     index_proven,
                     index_proof_height: Some(899_990),
+                    filed_at_ms: None,
                 },
             )]);
             let set_aside =
@@ -3419,6 +3420,7 @@ mod tests {
                     pays_sats: Some(20_000),
                     index_proven,
                     index_proof_height: None,
+                    filed_at_ms: None,
                 },
             )])
         };

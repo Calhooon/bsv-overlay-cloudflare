@@ -374,13 +374,24 @@ pub fn cap_to_landing_end(facts: &Value, now_ms: i64, due: i64) -> i64 {
 /// take all eight). And the reserved places are the second class's AS A WHOLE: the rows that are not young take them
 /// first, and a young row takes what they leave, so under a first-class flood a young row keeps a reserved place (main
 /// gave L58's courier-bytes payout one, before it was young).
+///
+/// FIX-1057 (bsv-low #1057 item 3; round 3's B LOW-1, A NOTE-3 (b)): THE RESERVED PLACES ARE SPLIT when both kinds
+/// are due. Under a first-class flood with two or more second-class rows that are not young due, fold 2 gave them
+/// both reserved places and a young row none (`places(6, 2, 1)` was `(6, 2, 0)`), and when that young row was the
+/// first identity walked the walk's cursor stayed on it every tick. Now the young rows keep ONE of the two reserved
+/// places whenever a young row and a row that is not young are both due (`(6, 1, 1)`): so whenever a class of the
+/// second has a due row it has a place, and the first row walked (whichever kind) is always given its turn, so the
+/// cursor never freezes on it. Its cost, stated: under a first-class flood the second class's rows that are not young
+/// drain one a tick (not two) while young rows are due, each sweep's young rows bounded at 15 looks.
 pub fn places(first: usize, second: usize, young: usize) -> (usize, usize, usize) {
     let total = OWED_BELT_OUTPOINTS_PER_TICK;
     let reserved = (second + young).min(OWED_BELT_SECOND_CLASS_RESERVED);
     let first_n = first.min(total - reserved);
     let left = total - first_n;
+    // the reserved places the rows that are not young hold: all of them, less one a young row keeps when both are due
+    let held = second.min(reserved - usize::from(young > 0 && second > 0 && reserved > 1));
     let young_n = young
-        .min(left - second.min(reserved))
+        .min(left - held)
         .min(OWED_BELT_YOUNG_PER_TICK.max(left.saturating_sub(second)));
     let second_n = second.min(left - young_n);
     (first_n, second_n, young_n)
@@ -389,6 +400,19 @@ pub fn places(first: usize, second: usize, young: usize) -> (usize, usize, usize
 /// FIX-1049: a young miss's next look, the belt's next tick.
 pub fn young_due(now_ms: i64) -> i64 {
     now_ms + OWED_BELT_TICK_MS
+}
+
+/// FIX-1057 (bsv-low #1057 item 7; round 3's C LOW-2): THE ONE DATING RULE of a row's next look, which the four sites
+/// call (the judge's `owed_judge::belt_due`, Phase A's [`backoff`], Phase C's [`ask_backoff`], and [`rearm_due`] for
+/// both phases' unanswered looks): a young miss ([`young_miss`]) is looked at on the belt's next tick
+/// ([`young_due`]); any other row at `base_due` (the site's own period), never past a landing wait's end
+/// ([`cap_to_landing_end`]). A change to the rule moves every phase at once.
+pub fn next_look(facts: &Value, now_ms: i64, base_due: i64) -> i64 {
+    if young_miss(facts, now_ms) {
+        young_due(now_ms)
+    } else {
+        cap_to_landing_end(facts, now_ms, base_due)
+    }
 }
 
 /// FIX-988: a payout row whose spend is seen and not mined (`owed::derive_owed_rows`: `chainWait: "block"` exactly
@@ -538,8 +562,10 @@ impl Find {
         out.extend(self.mark(now_ms));
         out
     }
-    /// The same facts the statements write, into the judge's hydrated inputs.
-    pub fn apply(&self, i: &mut owed_judge::JudgeInputs) {
+    /// The same facts the statements write, into the judge's hydrated inputs. `now_ms` is the stamp
+    /// [`Find::statements`] binds (FIX-1057, bsv-low #1057 item 4; round 3's B LOW-2): the first sight a new spender's
+    /// bytes get is the record's own `createdAtMs`, never the hydration's clock (a later read of `now_ms`).
+    pub fn apply(&self, i: &mut owed_judge::JudgeInputs, now_ms: i64) {
         for (k, w) in &self.hop_words {
             i.hop_chain.insert(k.clone(), w.clone());
         }
@@ -549,7 +575,7 @@ impl Find {
             // where `statements` writes the bytes (`to_json_capped`), so the first sight is the record's own stamp and
             // no judge serves one the record does not hold (the actor, and every later judgement, would read none)
             if b.to_json_capped().is_some() {
-                i.spender_first_seen.entry(txid.clone()).or_insert(i.now_ms);
+                i.spender_first_seen.entry(txid.clone()).or_insert(now_ms);
             }
             i.spender_inputs.insert(txid.clone(), b.inputs.clone());
             i.spender_outputs.insert(txid.clone(), b.to_outputs());
@@ -1222,17 +1248,16 @@ async fn ask_backoff(
         .as_str()
         .and_then(|f| serde_json::from_str(f).ok())
         .unwrap_or(Value::Null);
-    if young_miss(&facts, now) {
-        set_ask_due(db, c, young_due(now)).await;
-        return;
-    }
+    // a young miss is dated by [`next_look`] whatever the look's shape; any other row only when the look changed
+    // nothing (its period doubles)
+    let young = young_miss(&facts, now);
     let before = look_shape(&c.family, &c.facts, c.reason.as_deref());
     let after = look_shape(
         row["family"].as_str().unwrap_or_default(),
         &facts,
         row["reason"].as_str(),
     );
-    if before != after {
+    if !young && before != after {
         return;
     }
     let period = backoff_period(c.due_at_ms, c.judged_at_ms, (base_due - now).max(1));
@@ -1241,11 +1266,12 @@ async fn ask_backoff(
             sql: ASK_DUE_SQL.into(),
             binds: vec![
                 Bind::Text(ask_name(&c.identity, &c.outpoint)),
-                Bind::Int(cap_to_landing_end(&facts, now, now + period)),
+                Bind::Int(next_look(&facts, now, now + period)),
             ],
         }])
         .await
     {
+        Ok(_) if young => {}
         Ok(_) => report.backed_off += 1,
         Err(e) => db.log(&format!(
             "[owed-belt] backoff of {} faulted: {e}",
@@ -1263,11 +1289,7 @@ async fn rearm_ask(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut Tick
 /// FIX-1049: an unanswered look's next date: the next tick for a young miss ([`young_miss`]), else
 /// [`unanswered_period`], never past a landing wait's end ([`cap_to_landing_end`]).
 pub fn rearm_due(c: &Candidate, now: i64) -> i64 {
-    if young_miss(&c.facts, now) {
-        young_due(now)
-    } else {
-        cap_to_landing_end(&c.facts, now, now + unanswered_period(now, c.judged_at_ms))
-    }
+    next_look(&c.facts, now, now + unanswered_period(now, c.judged_at_ms))
 }
 
 /// Phase C: set one ask's next look in the ledger.
@@ -1429,6 +1451,29 @@ pub async fn reask<C: Courier>(
     Ok(out)
 }
 
+/// FIX-1049-FOLD-2 (fold 5; the round-2 ensemble's B LOW-4), made one pure function by FIX-1057 (bsv-low #1057 item
+/// 2; round 3's A LOW-2): a landing wait at or past its end is judged on this look whether a rung answered or not.
+/// The press it gives back needs no new fact (the clock passed the wait), so an unanswered look (`Ok(None)`) and a
+/// look whose ask FAULTED (`Err`, named in the answer's second half for the log) are both an empty find of the row's
+/// subject ([`Find::of_subject`]: its mark, its judgement, its event, each phase's own road), never only a re-arm that
+/// leaves the row saying "waiting" until a rung answers or the age repair runs. A find, and every row whose wait has
+/// not ended, pass unchanged. Stated (round 3's B NOTE-3): a landing row asks its OUTPOINT, whose ask never answers
+/// `Err` today (only a payout's home ask hydrates); the arm stands for any ask that may, and is run by its pin.
+pub fn ended_wait_look(
+    found: Result<Option<Find>, String>,
+    c: &Candidate,
+    now: i64,
+) -> (Result<Option<Find>, String>, Option<String>) {
+    if !landing_ended(&c.facts, now) {
+        return (found, None);
+    }
+    match found {
+        Ok(Some(find)) => (Ok(Some(find)), None),
+        Ok(None) => (Ok(Some(Find::of_subject(c))), None),
+        Err(e) => (Ok(Some(Find::of_subject(c))), Some(e)),
+    }
+}
+
 /// One candidate's ask and what its answer writes, as the tick runs it (and the re-ask lever, FIX-1027-FOLD-1): the
 /// ask through the gate, then per phase the find written and handed back (C), the actor then the D1 judge (B), or the
 /// D1 judge with the find in its batch (A); an unanswered ask re-armed.
@@ -1442,21 +1487,13 @@ async fn ask_one<C: Courier>(
 ) {
     gate.begin_outpoint();
     let before = gate.state.borrow().tick_calls;
-    let found = match ask(db, gate, c, now).await {
-        // FIX-1049-FOLD-2 (fold 5; the round-2 ensemble's B LOW-4): a landing wait at or past its end is judged on
-        // this look whether a rung answered or not: the press it gives back needs no new fact (the clock passed the
-        // wait), so an unanswered look is an empty find of the row's subject (its mark, its judgement, its event),
-        // never only a re-arm that leaves the row saying "waiting" until a rung answers or the age repair runs.
-        Ok(None) if landing_ended(&c.facts, now) => Ok(Some(Find::of_subject(c))),
-        Err(e) if landing_ended(&c.facts, now) => {
-            db.log(&format!(
-                "[owed-belt] {} ask faulted, its landing wait ended: judged on the stored evidence: {e}",
-                c.outpoint
-            ));
-            Ok(Some(Find::of_subject(c)))
-        }
-        other => other,
-    };
+    let (found, fault) = ended_wait_look(ask(db, gate, c, now).await, c, now);
+    if let Some(e) = fault {
+        db.log(&format!(
+            "[owed-belt] {} ask faulted, its landing wait ended: judged on the stored evidence: {e}",
+            c.outpoint
+        ));
+    }
     // FIX-1018 (bsv-low #1018): the belt ASKED this outpoint, so its find's judge (the D1 judge's, and the actor's
     // through the hand-back's `beltAsked`) dates it fresh; every other dated row keeps its earlier date.
     let _asked = owed_judge::belt_asked_scope(&c.identity, std::slice::from_ref(&c.outpoint));
@@ -1507,7 +1544,7 @@ async fn ask_one<C: Courier>(
             let judged =
                 owed_judge::judge_with_write(db, &[subject], "belt", writes, &owned, |inputs| {
                     for i in inputs.iter_mut().filter(|i| i.identity == identity) {
-                        find.apply(i);
+                        find.apply(i, now);
                     }
                     Ok(())
                 })
@@ -1713,35 +1750,21 @@ async fn backoff(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickRe
         .as_str()
         .and_then(|f| serde_json::from_str(f).ok())
         .unwrap_or(Value::Null);
-    if young_miss(&facts, now) {
-        let stmt = Stmt {
-            sql: BACKOFF_SQL.into(),
-            binds: vec![
-                Bind::Text(c.identity.clone()),
-                Bind::Text(c.outpoint.clone()),
-                Bind::Int(young_due(now)),
-            ],
-        };
-        if let Err(e) = db.run_batch(vec![stmt]).await {
-            db.log(&format!(
-                "[owed-belt] young re-ask of {} faulted: {e}",
-                c.outpoint
-            ));
-        }
-        return;
-    }
+    // a young miss is dated by [`next_look`] whatever the look's shape; any other row only when the look changed
+    // nothing (its period doubles)
+    let young = young_miss(&facts, now);
     let before = look_shape(&c.family, &c.facts, c.reason.as_deref());
     let now_shape = look_shape(
         row["family"].as_str().unwrap_or_default(),
         &facts,
         row["reason"].as_str(),
     );
-    if before != now_shape {
+    if !young && before != now_shape {
         return;
     }
     let period = backoff_period(c.due_at_ms, c.judged_at_ms, (base_due - now).max(1));
     let mut binds = binds;
-    binds.push(Bind::Int(cap_to_landing_end(&facts, now, now + period)));
+    binds.push(Bind::Int(next_look(&facts, now, now + period)));
     match db
         .run_batch(vec![Stmt {
             sql: BACKOFF_SQL.into(),
@@ -1749,6 +1772,7 @@ async fn backoff(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickRe
         }])
         .await
     {
+        Ok(_) if young => {}
         Ok(_) => report.backed_off += 1,
         Err(e) => db.log(&format!(
             "[owed-belt] backoff of {} faulted: {e}",
@@ -2268,10 +2292,18 @@ mod tests {
             (6, 0, 2),
             "a first-class flood leaves young the second class's reserved places"
         );
+        // FIX-1057 (item 3): when both kinds are due under a flood, the reserved places are split, one each (it was
+        // `(6, 2, 0)`: a young row walked first got no place and the cursor froze on it)
         assert_eq!(
             places(8, 2, 8),
+            (6, 1, 1),
+            "the reserved places split, one to the rows that are not young, one to the young"
+        );
+        assert_eq!(places(6, 2, 1), (6, 1, 1), "round 3's B shape");
+        assert_eq!(
+            places(8, 2, 0),
             (6, 2, 0),
-            "the reserved places are the rows that are not young first"
+            "no young row: both to the others"
         );
         assert_eq!(places(8, 1, 8), (6, 1, 1));
         assert_eq!(places(0, 6, 8), (0, 4, 4), "half each");
@@ -2297,10 +2329,16 @@ mod tests {
                             "a young row keeps the reserved places: {first} {young}"
                         );
                     }
+                    // FIX-1057 (item 3): the rows that are not young hold the reserved places, less the one a young row
+                    // keeps when both are due; so each kind with a due row has a place, and the first row walked is
+                    // always given its turn (the walk's cursor never freezes on it)
+                    let kept = usize::from(young > 0 && second > 0);
                     assert!(
-                        s >= second.min(OWED_BELT_SECOND_CLASS_RESERVED),
-                        "the reserved places held"
+                        s >= second.min(OWED_BELT_SECOND_CLASS_RESERVED - kept),
+                        "the reserved places held: {first} {second} {young}"
                     );
+                    assert!(second == 0 || s >= 1, "{first} {second} {young}");
+                    assert!(young == 0 || y >= 1, "{first} {second} {young}");
                 }
             }
         }
@@ -2328,7 +2366,7 @@ mod tests {
         assert_eq!(written, 1, "the capped bytes are not written");
         let mut i = owed_judge::JudgeInputs::default();
         i.now_ms = 7;
-        find.apply(&mut i);
+        find.apply(&mut i, 7);
         assert_eq!(i.spender_first_seen.get("small"), Some(&7));
         assert_eq!(
             i.spender_first_seen.get("big"),
@@ -2371,5 +2409,137 @@ mod tests {
             cap_to_landing_end(&json!({"sweepLandingUntilMs": 5_000}), 1_000, 9_000),
             9_000
         );
+    }
+
+    /// FIX-1057 item 2 (round 3's A LOW-2): the ended-wait judgement's every arm, run. Past its end an unanswered look
+    /// (`Ok(None)`) and a FAULTED ask (`Err`, its text handed back for the log) are both the empty find of the row's
+    /// subject; a find passes as it is; inside the wait (and on a row that is no landing) every answer passes
+    /// unchanged. RED with the `Err` arm made to pass the fault through (`(Err(e), None)`): "a faulted ask past the
+    /// end is judged on the stored evidence".
+    #[test]
+    fn fix1057_2_the_ended_wait_judges_an_unanswered_and_a_faulted_ask() {
+        use super::*;
+        let c = |facts: Value| Candidate {
+            identity: "owner".into(),
+            outpoint: format!("{}:0", "ab".repeat(32)),
+            game_id: "g".into(),
+            family: "hop-stranded".into(),
+            facts,
+            claimable: Some(false),
+            reason: None,
+            probe_tip: None,
+            due_at_ms: None,
+            judged_at_ms: None,
+        };
+        let ended = c(serde_json::json!({"sweepLanding": true, "sweepLandingUntilMs": 5_000}));
+        let subject = Some(("owner".to_string(), "g".to_string(), ended.outpoint.clone()));
+        let (found, fault) = ended_wait_look(Err("read fault".into()), &ended, 5_000);
+        assert_eq!(
+            (found.map(|f| f.map(|f| f.subject)), fault),
+            (Ok(Some(subject.clone())), Some("read fault".to_string())),
+            "a faulted ask past the end is judged on the stored evidence"
+        );
+        let (found, fault) = ended_wait_look(Ok(None), &ended, 5_000);
+        assert_eq!(
+            (found.map(|f| f.map(|f| f.subject)), fault),
+            (Ok(Some(subject)), None),
+            "an unanswered look past the end is the empty find of its subject"
+        );
+        let mut find = Find::default();
+        find.cleared.push("k".into());
+        let (found, _) = ended_wait_look(Ok(Some(find)), &ended, 5_000);
+        assert_eq!(
+            found.unwrap().unwrap().cleared,
+            vec!["k".to_string()],
+            "a find passes as it is"
+        );
+        // inside the wait, and a row that is no landing: unchanged
+        for (row, now) in [(&ended, 4_999), (&c(serde_json::json!({})), 9_000)] {
+            let (found, fault) = ended_wait_look(Err("e".into()), row, now);
+            assert_eq!((found.map(|_| ()), fault), (Err("e".to_string()), None));
+            let (found, fault) = ended_wait_look(Ok(None), row, now);
+            assert!(matches!(found, Ok(None)) && fault.is_none());
+        }
+    }
+
+    /// FIX-1057 item 4 (round 3's B LOW-2): `Find::apply` gives a new spender's bytes the stamp its statements bind,
+    /// never the inputs' clock; a first sight the record already holds stands. RED with `or_insert(i.now_ms)`:
+    /// `left: Some(999) right: Some(7)`.
+    #[test]
+    fn fix1057_4_a_finds_first_sight_is_the_stamp_its_statements_bind() {
+        use super::*;
+        let bytes = crate::owed::StoredSpenderBytes::from_parts(&[("ab".repeat(32), 0)], &[]);
+        let find = Find {
+            bytes: vec![("new".into(), bytes.clone()), ("held".into(), bytes)],
+            ..Find::default()
+        };
+        let stamp = find
+            .statements(7)
+            .iter()
+            .find(|s| s.sql == crate::owed::OWED_SPENDER_BYTES_UPSERT_SQL)
+            .map(|s| s.binds[2].clone());
+        assert!(matches!(stamp, Some(crate::pot_hook::Bind::Int(7))));
+        let mut i = owed_judge::JudgeInputs::default();
+        i.now_ms = 999;
+        i.spender_first_seen.insert("held".into(), 3);
+        find.apply(&mut i, 7);
+        assert_eq!(i.spender_first_seen.get("new"), Some(&7));
+        assert_eq!(
+            i.spender_first_seen.get("held"),
+            Some(&3),
+            "the record's own stamp stands"
+        );
+    }
+
+    /// FIX-1057 item 7 (round 3's C LOW-2): ONE dating rule. `next_look` is young's next tick, else the base capped at
+    /// a landing's end; and the four sites (the judge's `belt_due`, Phase A's `backoff`, Phase C's `ask_backoff`,
+    /// `rearm_due`) call it, while `young_due` and `cap_to_landing_end` are called nowhere else. RED against any site
+    /// that dates by its own copy (e.g. `ask_backoff` binding `young_due(now)`): "one dating rule".
+    #[test]
+    fn fix1057_7_one_dating_rule_at_the_four_sites() {
+        use super::*;
+        use serde_json::json;
+        let young = json!({"sweepLanding": true, "sweepLandingUntilMs": 9_000_000, "sweepFirstSeenAtMs": 1_000});
+        assert_eq!(next_look(&young, 2_000, 5_000_000), young_due(2_000));
+        let landing = json!({"sweepLanding": true, "sweepLandingUntilMs": 5_000});
+        assert_eq!(next_look(&landing, 1_000, 9_000), 5_000);
+        assert_eq!(next_look(&json!({}), 1_000, 9_000), 9_000);
+        // each top-level fn's body, from its signature to its closing brace at column 0
+        let belt_src = include_str!("owed_belt.rs");
+        let belt_src = &belt_src[..belt_src.find("#[cfg(test)]").unwrap()];
+        let judge_src = include_str!("owed_judge.rs");
+        let judge_src = &judge_src[..judge_src.find("#[cfg(test)]").unwrap_or(judge_src.len())];
+        let body = |src: &'static str, f: &str| -> &'static str {
+            let at = src
+                .find(&format!("fn {f}("))
+                .unwrap_or_else(|| panic!("{f}"));
+            let rest = &src[at..];
+            &rest[..rest.find("\n}\n").unwrap()]
+        };
+        for f in ["backoff", "ask_backoff", "rearm_due"] {
+            assert!(
+                body(belt_src, f).contains("next_look("),
+                "one dating rule: {f} calls next_look"
+            );
+        }
+        assert!(
+            body(judge_src, "belt_due").contains("owed_belt::next_look("),
+            "one dating rule: belt_due calls next_look"
+        );
+        let inside = body(belt_src, "next_look");
+        for (src, name) in [(belt_src, "owed_belt.rs"), (judge_src, "owed_judge.rs")] {
+            for f in ["young_due(", "cap_to_landing_end("] {
+                let calls = src.matches(f).count() - src.matches(&format!("fn {f}")).count();
+                let allowed = if name == "owed_belt.rs" {
+                    inside.matches(f).count()
+                } else {
+                    0
+                };
+                assert_eq!(
+                    calls, allowed,
+                    "one dating rule: {f} called outside next_look in {name}"
+                );
+            }
+        }
     }
 }
