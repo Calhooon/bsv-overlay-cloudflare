@@ -16176,7 +16176,7 @@ mod d2_actor_f_fold3 {
     }
 
     /// A new collected filing for game `k` (its marker and a payout txid the mirror never read, the payout's word).
-    fn collected(record: &SqliteSql, games: &[String], k: usize) -> String {
+    pub(super) fn collected(record: &SqliteSql, games: &[String], k: usize) -> String {
         let (marker, pay) = (h("a1", k), h("a2", k));
         record
             .conn
@@ -20316,6 +20316,486 @@ mod d2_actor_g {
         );
         assert!(ak <= am && vk <= vm);
         assert!(ak < 3_000 && vk < 5_000);
+    }
+
+    // ---- FIX-1045 (bsv-low #1045: the CUT-263 ensemble's LOWs) ----
+
+    /// The record's answers, each call's rows as JSON text (the held read's answer is the narrowed apply's first).
+    struct Answers<'a> {
+        inner: &'a SqliteSql,
+        out: RefCell<Vec<String>>,
+    }
+    impl SqlPort for Answers<'_> {
+        async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+            let out = self.inner.run_batch(stmts).await?;
+            self.out.borrow_mut().push(
+                out.iter()
+                    .flat_map(|o| &o.rows)
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            Ok(out)
+        }
+        async fn counters(&self, d: Vec<(String, u64)>) {
+            self.inner.counters(d).await;
+        }
+        fn now_ms(&self) -> u64 {
+            self.inner.now_ms()
+        }
+        fn log(&self, l: &str) {
+            self.inner.log(l);
+        }
+    }
+
+    /// The fold's seat: game 5's collected marker names a payout `pay` whose stored BEEF is `beef` in BOTH families,
+    /// read whole by a warm mirror at seq 10.
+    async fn held_seat(pay: &str, beef: &[u8]) -> (SqliteSql, SqliteSql, Vec<String>) {
+        let record = seeded(&fold7_chained_seat(8));
+        for sql in [
+            "INSERT INTO transactions(txid,beef,has_proof,created_at) VALUES (?1,?2,0,1)",
+            "INSERT INTO pot_beefs(txid,beef) VALUES (?1,?2)",
+        ] {
+            record
+                .conn
+                .execute(sql, rusqlite::params![pay, beef])
+                .unwrap();
+        }
+        let games = games_of(&record, "owner");
+        record
+            .conn
+            .execute(
+                crate::record_post::COLLECTED_FILE_SQL,
+                rusqlite::params![
+                    "owner",
+                    games[5],
+                    h("a1", 5),
+                    0,
+                    "00",
+                    (NOW_MS / 1000) as i64,
+                    pay
+                ],
+            )
+            .unwrap();
+        let local = mirror();
+        apply(
+            &record,
+            &local,
+            &Fakes,
+            "owner",
+            &games,
+            Some(("bootstrap", 10)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        (record, local, games)
+    }
+
+    /// The `pot` and `stored` facts the mirror holds of `pay`.
+    fn pay_facts(l: &SqliteSql, pay: &str) -> Vec<(String, String)> {
+        let mut q = l
+            .conn
+            .prepare("SELECT src,facts FROM txfacts WHERE txid=?1 AND src IN ('pot','stored') ORDER BY src")
+            .unwrap();
+        q.query_map([pay], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// A cold apply's facts of `pay` over the record as it stands.
+    fn cold_facts(record: &SqliteSql, games: &[String], pay: &str) -> Vec<(String, String)> {
+        let c = mirror();
+        futures_util::FutureExt::now_or_never(apply(
+            record,
+            &c,
+            &Fakes,
+            "owner",
+            &games[5..6],
+            None,
+            Some(TIP),
+            None,
+        ))
+        .expect("a native apply never waits")
+        .unwrap();
+        pay_facts(&c, pay)
+    }
+
+    /// One warm narrowed apply of game 5 at `seq` (a pot event, not carried); the record's answers, call by call.
+    fn narrowed_at(
+        record: &SqliteSql,
+        local: &SqliteSql,
+        games: &[String],
+        seq: i64,
+    ) -> (ApplyReport, Vec<String>) {
+        let hop = e_write(record, games, 5);
+        let port = Answers {
+            inner: record,
+            out: RefCell::default(),
+        };
+        let r = futures_util::FutureExt::now_or_never(apply_with(
+            &port,
+            local,
+            &Fakes,
+            "owner",
+            &games[5..6],
+            Some(("pot", seq)),
+            Some(TIP),
+            None,
+            &ApplyOpts {
+                touch: Some([hop].into_iter().collect()),
+                ..ApplyOpts::default()
+            },
+        ))
+        .expect("a native apply never waits")
+        .unwrap()
+        .0;
+        assert!(r.narrowed, "{r:?}");
+        (r, port.out.into_inner())
+    }
+
+    /// `pay`'s BEEF in `table` set to `bytes`.
+    fn set_beef(record: &SqliteSql, table: &str, pay: &str, bytes: &[u8]) {
+        record
+            .conn
+            .execute(
+                &format!("UPDATE {table} SET beef=?2 WHERE txid=?1"),
+                rusqlite::params![pay, bytes],
+            )
+            .unwrap();
+    }
+
+    /// (fix1045_a) THE PASS BOUND (A LOW-2, B LOW-2, C LOW-2) AND ONE SERIALIZATION A CLOSURE (C LOW-4). Nine NEW
+    /// collected filings of one seat in one direct pass, the closure read answering each a closure of about 236 KB
+    /// (under `CLOSURE_MAX_BYTES` alone): the first eight are KEPT (about 1.9 MB), the ninth would pass
+    /// `PASS_CLOSURES_MAX_BYTES` (2 MiB) and is DECLINED, counted `closure_declines`, and rides its body with no
+    /// closure (its actor reads its own miss: the cold path). Each closure is serialized ONCE in the pass
+    /// (`closure_serialized_len`, nine for nine). RED with the bound's guard made `false &&` (nine kept, none declined),
+    /// and with the pass weighing each kept closure again (eighteen serializations).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fix1045_a_the_pass_bound_declines_the_rest_and_weighs_each_closure_once() {
+        struct PassPort {
+            row: Value,
+            start: tokio::time::Instant,
+            closures: RefCell<Vec<usize>>,
+        }
+        impl crate::owed_events::DirectPort for PassPort {
+            async fn subjects(
+                &self,
+                _ev: &overlay_discovery::owed_event::OwedEvent,
+            ) -> Result<Vec<(String, Vec<String>)>, String> {
+                Err("every event of the pin carries its subjects".into())
+            }
+            async fn call(&self, body: Value) -> Result<Value, String> {
+                let n = body["carried"]["closures"].as_array().map_or(0, Vec::len);
+                self.closures.borrow_mut().push(n);
+                Ok(json!({"applied": true, "appliedGames": body["games"]}))
+            }
+            async fn closure_read(&self, _stmt: Stmt) -> Result<Value, String> {
+                Ok(self.row.clone())
+            }
+            async fn sleep_ms(&self, ms: u64) {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await
+            }
+            fn now_ms(&self) -> u64 {
+                self.start.elapsed().as_millis() as u64
+            }
+        }
+        let (record, _local, games) = e_warm_seat(20).await;
+        let mut events = Vec::new();
+        for k in 10..19 {
+            let marker = super::d2_actor_f_fold3::collected(&record, &games, k);
+            events.push(published(&record, "collected", &marker).await);
+        }
+        let all: Vec<BTreeSet<String>> = events
+            .iter()
+            .map(|e| closure_wanted(e).expect("a filing"))
+            .collect();
+        let union: BTreeSet<String> = all.iter().flatten().cloned().collect();
+        let (stmt, read) = pass_closure_statement(&union, all.len()).unwrap();
+        let mut row = read_pass_closure(&record, stmt).await.unwrap();
+        // each filing's closure padded with one row naming its own marker, in a family that is no BEEF's
+        let fam = FAMILIES.iter().position(|f| !f.beef).unwrap();
+        let col = format!("f{fam}");
+        let mut els = json_of(&row[&col])
+            .unwrap()
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for (n, k) in (10..19).enumerate() {
+            let marker = h("a1", k);
+            assert!(
+                all[n].contains(&marker),
+                "the filing's closure names its marker"
+            );
+            els.push(json!([0, [["x".repeat(236_000)]], marker]));
+        }
+        row[&col] = Value::Array(els);
+        for keys in &all {
+            let (n, _) = closure_weighed(keys, &read, &row)
+                .unwrap()
+                .expect("each closure alone fits");
+            assert!(n > 236_000 && n <= CLOSURE_MAX_BYTES, "{n}");
+        }
+        let port = PassPort {
+            row,
+            start: tokio::time::Instant::now(),
+            closures: RefCell::default(),
+        };
+        CLOSURE_SERIALIZES.with(|c| c.set(0));
+        let r = crate::owed_events::direct_with(&port, events, Some(TIP)).await;
+        let serialized = CLOSURE_SERIALIZES.with(std::cell::Cell::get);
+        assert_eq!(
+            (r.closures, r.closure_declines, r.closure_faults),
+            (8, 1, 0),
+            "eight kept under the pass's 2 MiB, the ninth declined: {r:?}"
+        );
+        assert_eq!(
+            port.closures.borrow().iter().sum::<usize>(),
+            8,
+            "the declined filing's body carries no closure (its actor reads its own miss)"
+        );
+        assert_eq!(serialized, 9, "each closure serialized once in the pass");
+    }
+
+    /// (fix1045_b) THE LEN ROW'S DELETE (B LOW-2, its probe pin `lensb_a_lagged_len_row_keeps_an_intermediate_reads_facts`):
+    /// the `len` row is seq-guarded and the facts are not, so only the delete before each re-read keeps the two in
+    /// step. A bootstrap at seq 10 of B1 (899,000), a narrowed apply at seq 1 of B2 (899,001), then B1 again at seq 11:
+    /// the warm facts are a cold apply's. RED with `HELD_BEEF_LENS_DELETE_SQL`'s push removed (the warm mirror keeps
+    /// 899,001 against the cold apply's 899,000).
+    #[tokio::test]
+    async fn fix1045_b_a_lagged_len_row_never_holds_an_intermediate_reads_facts() {
+        let (pay, b1) = proven_beef(899_000);
+        let (_, b2) = proven_beef(899_001);
+        let (record, local, games) = held_seat(&pay, &b1).await;
+        for t in ["transactions", "pot_beefs"] {
+            set_beef(&record, t, &pay, &b2);
+        }
+        narrowed_at(&record, &local, &games, 1);
+        assert!(pay_facts(&local, &pay)
+            .iter()
+            .all(|(_, f)| f.contains("899001")));
+        for t in ["transactions", "pot_beefs"] {
+            set_beef(&record, t, &pay, &b1);
+        }
+        narrowed_at(&record, &local, &games, 11);
+        assert_eq!(
+            pay_facts(&local, &pay),
+            cold_facts(&record, &games, &pay),
+            "the warm mirror's facts are a cold apply's"
+        );
+    }
+
+    /// (fix1045_c) BOTH FAMILIES TOGETHER (A LOW-1, B LOW-2's M3): with ONE family's bytes moved (its length), the held
+    /// read's own answer carries BOTH families' hex, in both directions. RED with the pot arm's transactions length
+    /// removed (the transactions-moved direction) and with the transactions arm's pot length removed (the pot-moved
+    /// direction).
+    #[tokio::test]
+    async fn fix1045_c_one_family_moved_re_reads_both() {
+        let (pay, beef) = proven_beef(899_000);
+        for moved in ["transactions", "pot_beefs"] {
+            let (record, local, games) = held_seat(&pay, &beef).await;
+            let (r, held) = narrowed_at(&record, &local, &games, 11);
+            let hex = hex::encode_upper(&beef);
+            assert_eq!(
+                (r.record_calls, held[0].matches(&hex).count()),
+                (1, 0),
+                "{moved}: held"
+            );
+            set_beef(&record, moved, &pay, &[beef.clone(), vec![0u8]].concat());
+            let (r, answers) = narrowed_at(&record, &local, &games, 12);
+            // the unmoved bytes' hex is a prefix of the moved bytes': two matches when both rows are re-read
+            assert_eq!(
+                (r.record_calls, answers[0].matches(&hex).count()),
+                (1, 2),
+                "{moved} moved: the held read itself re-reads both families"
+            );
+            assert_eq!(
+                pay_facts(&local, &pay),
+                cold_facts(&record, &games, &pay),
+                "{moved}"
+            );
+        }
+    }
+
+    /// (fix1045_d) A DISAGREEMENT FAILS CLOSED (A LOW-1): the held statement given a MUTANT transactions arm that
+    /// compares no pot length (M9), the pot's bytes moved by length only: the held read answers the pot re-read and
+    /// its twin held, the apply reads AGAIN with every BEEF's bytes (a second record call) and the facts are a cold
+    /// apply's. RED with the re-read removed (the pot's new bytes thrown away: the old facts kept).
+    #[tokio::test]
+    async fn fix1045_d_a_disagreement_of_the_arms_re_reads_with_the_bytes() {
+        let (pay, beef) = proven_beef(899_000);
+        let (record, local, games) = held_seat(&pay, &beef).await;
+        let cross = "COALESCE((SELECT length(x.beef) FROM pot_beefs x WHERE x.txid=t.txid),-1)=json_extract(?7,'$.\"'||t.txid||'\".p') AND ";
+        assert_eq!(HELD_TRANSACTIONS_BEEF_EXPR.matches(cross).count(), 1);
+        let mutant = marked_select_held().replace(cross, "");
+        assert_ne!(mutant, marked_select_held());
+        narrowed_at(&record, &local, &games, 11);
+        set_beef(
+            &record,
+            "pot_beefs",
+            &pay,
+            &[beef.clone(), vec![0u8]].concat(),
+        );
+        HELD_SQL_OVERRIDE.with(|o| *o.borrow_mut() = Some(mutant));
+        let (r, answers) = narrowed_at(&record, &local, &games, 12);
+        HELD_SQL_OVERRIDE.with(|o| *o.borrow_mut() = None);
+        let hex = hex::encode_upper(&beef);
+        assert_eq!(
+            answers[0].matches(&hex).count(),
+            1,
+            "the mutant held the twin: a disagreement"
+        );
+        let beefs: Vec<usize> = (0..FAMILIES.len()).filter(|n| FAMILIES[*n].beef).collect();
+        let mut rows: Vec<Vec<Value>> = vec![Vec::new(); FAMILIES.len()];
+        rows[beefs[0]].push(json!({"txid": pay, "__beef": Value::Null}));
+        rows[beefs[1]].push(json!({"txid": pay, "__beef": Value::Null}));
+        assert!(!held_read_disagrees(&rows), "both held: no disagreement");
+        rows[beefs[1]][0]["__beef"] = json!("00");
+        assert!(
+            held_read_disagrees(&rows),
+            "one held, one read: a disagreement"
+        );
+        assert_eq!(
+            pay_facts(&local, &pay),
+            cold_facts(&record, &games, &pay),
+            "never stale facts"
+        );
+        assert_eq!(r.record_calls, 2, "the read made again: {r:?}");
+        assert_eq!(
+            answers[1].matches(&hex).count(),
+            2,
+            "the second read carries both families' bytes"
+        );
+    }
+
+    /// The payout's BEEF proven by TWO bumps (at `h0` and `h1`), its subject pointing at bump `at`.
+    fn two_bump_beef(h0: u32, h1: u32, at: usize) -> (String, Vec<u8>) {
+        use bsv_rs::transaction::Beef;
+        let (txid, beef) = crate::record_post::door_pins::realistic_payout_beef();
+        let txid = hex::encode(txid);
+        let mut b = Beef::from_binary(&beef).unwrap();
+        let raw = b.find_txid_mut(&txid).unwrap().raw_tx_or_compute().unwrap();
+        let mut p = Beef::new();
+        assert_eq!(p.merge_bump(MerklePath::from_coinbase_txid(&txid, h0)), 0);
+        assert_eq!(p.merge_bump(MerklePath::from_coinbase_txid(&txid, h1)), 1);
+        p.merge_raw_tx(raw, Some(at));
+        (txid, p.to_binary())
+    }
+
+    /// (fix1045_e) THE HELD MARK FROM THE CURRENT BYTES (B LOW-1): a same-length rewrite that keeps the old bump's
+    /// bytes in place and REPOINTS the subject's bump index (bump 0 at 899,000 to bump 1 at 899,500) refreshes the
+    /// facts; the subject's own entry ([`entry_mark`]: its raw's edge, its bump flag and index) is held beside the
+    /// height. RED on f7ec4e4c's mark (the height at its old offset alone: the facts keep 899,000).
+    #[tokio::test]
+    async fn fix1045_e_a_repointed_bump_index_refreshes_the_facts() {
+        let (pay, old) = two_bump_beef(899_000, 899_500, 0);
+        let (_, new) = two_bump_beef(899_000, 899_500, 1);
+        assert_eq!(old.len(), new.len(), "a same-length rewrite");
+        assert_eq!(bump_mark(&pay, &old).as_array().map(Vec::len), Some(2));
+        let at = bump_mark(&pay, &old)[0].as_u64().unwrap() as usize - 1;
+        assert_eq!(
+            old[at..at + 3],
+            new[at..at + 3],
+            "the old bump's height bytes stay in place"
+        );
+        let (eo, en) = (entry_mark(&pay, &old), entry_mark(&pay, &new));
+        // a V2 BEEF: the entry's format byte (01, raw and bump index) and the index precede the raw
+        assert!(
+            eo[1].as_str().is_some_and(|x| x.starts_with("0100")),
+            "{eo}"
+        );
+        assert!(
+            en[1].as_str().is_some_and(|x| x.starts_with("0101")),
+            "{en}"
+        );
+        assert_eq!(eo[0], en[0], "the entry in place: only its index moved");
+        let (record, local, games) = held_seat(&pay, &old).await;
+        assert!(pay_facts(&local, &pay)
+            .iter()
+            .all(|(_, f)| f.contains("899000")));
+        let (_, held) = narrowed_at(&record, &local, &games, 11);
+        assert_eq!(held[0].matches(&hex::encode_upper(&old)).count(), 0, "held");
+        for t in ["transactions", "pot_beefs"] {
+            set_beef(&record, t, &pay, &new);
+        }
+        narrowed_at(&record, &local, &games, 12);
+        let cold = cold_facts(&record, &games, &pay);
+        assert!(cold.iter().all(|(_, f)| f.contains("899500")), "{cold:?}");
+        assert_eq!(
+            pay_facts(&local, &pay),
+            cold,
+            "the repointed index refreshes the facts"
+        );
+        // a subject with NO bump: its entry's flag is the current bytes' word too
+        let (txid, plain) = crate::record_post::door_pins::realistic_payout_beef();
+        let m = entry_mark(&hex::encode(txid), &plain);
+        assert!(
+            m[1].as_str()
+                .is_some_and(|x| x.starts_with("00") || x.ends_with("00"))
+                && m[0].as_u64().is_some(),
+            "{m}"
+        );
+    }
+
+    /// (fix1045_f) THE DECODER'S VERSION IN THE MARK'S KEY (C LOW-3): a held txid whose `len` row was written by an
+    /// OLDER decoder (`v` one below [`TXFACTS_DECODER_VERSION`], its facts that decoder's) is re-read and decoded by
+    /// this build at the next narrowed read, with no `JUDGE_VERSION` move; a `len` row with no `v` likewise. RED with
+    /// the version's comparison removed from both arms (the older decoder's facts held).
+    #[tokio::test]
+    async fn fix1045_f_a_moved_decoder_version_refreshes_the_facts() {
+        let (pay, beef) = proven_beef(899_000);
+        for older in [json!(TXFACTS_DECODER_VERSION - 1), Value::Null] {
+            let (record, local, games) = held_seat(&pay, &beef).await;
+            let v: i64 = local
+                .conn
+                .query_row(
+                    "SELECT json_extract(facts,'$.v') FROM txfacts WHERE txid=?1 AND src='len'",
+                    [&pay],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                v, TXFACTS_DECODER_VERSION,
+                "the len row carries the decoder's version"
+            );
+            // an older build's row: its version and its own facts (here a bumpHeight it decoded otherwise)
+            local
+                .conn
+                .execute(
+                    "UPDATE txfacts SET facts=json_set(facts,'$.v',json(?2)) WHERE txid=?1 AND src='len'",
+                    rusqlite::params![pay, older.to_string()],
+                )
+                .unwrap();
+            local
+                .conn
+                .execute(
+                    "UPDATE txfacts SET facts=replace(facts,'899000','1') WHERE txid=?1 AND src IN ('pot','stored')",
+                    [&pay],
+                )
+                .unwrap();
+            assert_ne!(pay_facts(&local, &pay), cold_facts(&record, &games, &pay));
+            let (_, answers) = narrowed_at(&record, &local, &games, 11);
+            assert_eq!(
+                answers[0].matches(&hex::encode_upper(&beef)).count(),
+                2,
+                "{older}: re-read"
+            );
+            assert_eq!(
+                pay_facts(&local, &pay),
+                cold_facts(&record, &games, &pay),
+                "{older}"
+            );
+            // and held again under this build's version
+            let (_, held) = narrowed_at(&record, &local, &games, 12);
+            assert_eq!(
+                held[0].matches(&hex::encode_upper(&beef)).count(),
+                0,
+                "{older}: held again"
+            );
+        }
     }
 }
 

@@ -2793,7 +2793,9 @@ pub struct DirectReport {
     pub closure_faults: u64,
     pub closure_fault: Option<String>,
     /// FOLD-4: the filings whose closure the read answered but `closure_for` declined (past `CLOSURE_MAX_BYTES`),
-    /// counted `owed_actor_direct_closure_declines_total`.
+    /// counted `owed_actor_direct_closure_declines_total`. FIX-1045 (the CUT-263 ensemble's C LOW-2), stated: the count
+    /// ALSO holds the filings declined because the pass's kept closures would pass `PASS_CLOSURES_MAX_BYTES` (2 MiB):
+    /// both are "this filing's actor reads its own miss", so a window reading `closureDeclines` reads the two together.
     pub closure_declines: u64,
 }
 
@@ -3249,10 +3251,9 @@ pub async fn direct_with_class(
                     // D2-ACTOR-G (bsv-low #1031): the pass's kept closures, bounded over all its filings
                     let mut kept = 0usize;
                     for ((ev, _), keys) in filings.iter_mut() {
-                        // D2-ACTOR-G-FOLD-1 (the lens's LOW-2): each closure serialized once to weigh it
-                        match crate::owed_actor::closure_for(keys, &read, &row)
-                            .map(|c| c.map(|c| (c.to_string().len(), c)))
-                        {
+                        // D2-ACTOR-G-FOLD-1 (the lens's LOW-2), FIX-1045 (C LOW-4): each closure serialized ONCE, by
+                        // `closure_weighed`, which answers the length it weighed against `CLOSURE_MAX_BYTES`
+                        match crate::owed_actor::closure_weighed(keys, &read, &row) {
                             Ok(Some((n, _)))
                                 if kept + n > crate::owed_actor::PASS_CLOSURES_MAX_BYTES =>
                             {
