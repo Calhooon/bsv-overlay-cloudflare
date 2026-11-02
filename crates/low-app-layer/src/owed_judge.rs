@@ -658,6 +658,8 @@ pub struct JudgeInputs {
     pub hop_sweeps: HashMap<String, crate::hopsweep::FiledHopSweep>,
     pub evicted_pots: HashSet<String>,
     pub spender_outputs: HashMap<String, Vec<crate::owed::SpenderOutput>>,
+    /// FIX-1049-FOLD-1: spender txid -> `owed_spender_bytes.createdAtMs` (the first time the record held its bytes).
+    pub spender_first_seen: HashMap<String, i64>,
     pub spender_inputs: HashMap<String, Vec<(String, u32)>>,
     pub courier_spenders: HashSet<String>,
     pub my_pkh_by_game: HashMap<String, String>,
@@ -704,6 +706,7 @@ impl JudgeInputs {
             hop_sweeps: &self.hop_sweeps,
             evicted_pots: &self.evicted_pots,
             spender_outputs: &self.spender_outputs,
+            spender_first_seen: &self.spender_first_seen,
             spender_inputs: &self.spender_inputs,
             courier_spenders: &self.courier_spenders,
             my_pkh_by_game: &self.my_pkh_by_game,
@@ -1192,12 +1195,20 @@ fn belt_due(row: &OwedRow, stamp: i64, evidence: Option<&JudgeInputs>) -> Option
         return None;
     }
     match row.family {
-        // FIX-1049 (bsv-low #1049): a swept hop's young landing wait is looked at on the belt's next tick, and the
-        // served `beltNextAtMs` says so (the cell's bar reads the belt's own date)
-        OwedFamily::HopStranded if crate::owed_belt::young_miss(&row.facts, stamp) => {
+        // FIX-1049 (bsv-low #1049), as folded: a row waiting on a sweep the couriers named, inside its young window
+        // (`owed_belt::young_miss`: the first sight of the sweep's bytes, never renewed), is looked at on the belt's
+        // next tick, and the served `beltNextAtMs` says so (the cell's bar reads the belt's own date)
+        OwedFamily::HopStranded | OwedFamily::Payout
+            if crate::owed_belt::young_miss(&row.facts, stamp) =>
+        {
             Some(crate::owed_belt::young_due(stamp))
         }
-        OwedFamily::HopStranded => Some(stamp + 600_000),
+        // FIX-1049-FOLD-1 (fold 2): a landing wait is looked at by its end, the look that gives the press back
+        OwedFamily::HopStranded => Some(crate::owed_belt::cap_to_landing_end(
+            &row.facts,
+            stamp,
+            stamp + 600_000,
+        )),
         // NEW5-M2 (D2-ACTOR-B-FOLD-10): a hop row resting on a courier find of an unconfirmed spend is re-asked at
         // the outpoint (`owed_belt::rests_on_unconfirmed_find`), whatever bytes are held: a spend that never mines
         // is retired by that look, and the honest sweep press comes back.

@@ -11550,6 +11550,187 @@ async fn fix988_a_courier_bytes_payout_unconfirmed_is_asked_at_its_due_date_and_
     assert_eq!(ask["question"]["ask"], json!("home"), "{ask}");
 }
 
+/// FIX-1049-FOLD-1 (fold 4, the ensemble's A NOTE-1: L58 pair 17's own shape; and fold 3's bound, Phase C's young
+/// branch with it, B LOW-2, C LOW-3): an UNFILED sweep the belt found through a courier (a courier-bytes payout, the
+/// sweep seen and not mined) whose bytes the record first held a minute ago is re-asked at its hop on the belt's NEXT
+/// tick, in Phase C (the actor's ask, `ask_backoff`) and in Phase A (the D1 judge's row, `backoff`), while the
+/// explorers keep saying "unconfirmed"; the window runs from that first sight, which a later find and a later tracker
+/// hint never renew, so the row is looked at young at most 15 times and then backs off. RED on ee8b6753: the judge
+/// dates it 600 s out (`left: .. right: ..+120000`).
+#[tokio::test]
+async fn fix1049f1_f_l58s_courier_bytes_payout_is_re_asked_on_the_next_tick_for_30_minutes() {
+    use crate::owed_walk_frozen::pins::{
+        backfill_to_the_stamp, home_marker_seed, home_marker_sweep, FOLD8_TIP, HOME_MARKER_GAME,
+        HOME_MARKER_HOP, HOME_MARKER_SEAT,
+    };
+    let hop = format!("{HOME_MARKER_HOP}:0");
+    for phase_c in [true, false] {
+        let (seed, sweep_txid) = home_marker_seed();
+        let d1 = seeded(&Fixture {
+            name: "fix1049f1",
+            seed,
+            identities: vec![HOME_MARKER_SEAT.into()],
+        });
+        d1.tip.set(Some(FOLD8_TIP));
+        let first = d1.now.get() as i64 - 60_000;
+        d1.conn
+            .execute_batch(&format!(
+                "UPDATE hop_chain_probes SET spentConfirmed=0; \
+                 UPDATE owed_spender_bytes SET createdAtMs={first} WHERE txid='{sweep_txid}';"
+            ))
+            .unwrap();
+        d1.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        backfill_to_the_stamp(&d1).await;
+        d1.conn
+            .execute_batch("DELETE FROM owed_rows; DELETE FROM owed_dirty;")
+            .unwrap();
+        let w = WithActor {
+            d1,
+            actor: mirror(),
+            d1_judges: !phase_c,
+            event: None,
+            actor_reads: phase_c,
+            actor_fails: Cell::new(false),
+        };
+        w.actor.now.set(w.d1.now.get());
+        let games = vec![HOME_MARKER_GAME.to_string()];
+        crate::owed_events::deliver(&w, HOME_MARKER_SEAT, &games)
+            .await
+            .unwrap();
+        let judged = if phase_c { &w.actor } else { &w.d1 };
+        let row = || -> (String, Value, Option<i64>) {
+            judged
+                .conn
+                .query_row(
+                    "SELECT family,facts,beltDueAtMs FROM owed_rows WHERE identity=?1 AND outpoint=?2",
+                    [HOME_MARKER_SEAT, hop.as_str()],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            serde_json::from_str(&r.get::<_, String>(1)?).unwrap(),
+                            r.get(2)?,
+                        ))
+                    },
+                )
+                .unwrap_or_else(|e| panic!("the row of the hop: {e}"))
+        };
+        // the next look as the belt will take it: the ask's date in Phase C, the row's in Phase A
+        let next = || -> i64 {
+            if phase_c {
+                asks_of(&w.d1)
+                    .into_iter()
+                    .find(|(n, _, _)| *n == crate::owed_belt::ask_name(HOME_MARKER_SEAT, &hop))
+                    .map(|(_, _, d)| d)
+                    .expect("the ask")
+            } else {
+                row().2.expect("the row's date")
+            }
+        };
+        let (family, facts, due) = row();
+        assert_eq!(
+            (
+                family.as_str(),
+                facts["creditKind"].as_str(),
+                facts["chainWait"].as_str()
+            ),
+            ("payout", Some("courier-bytes"), Some("block")),
+            "phase_c {phase_c}: {facts}"
+        );
+        assert_eq!(facts["sweepFirstSeenAtMs"], json!(first), "the first sight");
+        let now = w.d1.now.get() as i64;
+        assert_eq!(
+            due,
+            Some(now + crate::owed_belt::OWED_BELT_TICK_MS),
+            "phase_c {phase_c}: the judge dates the young block wait for the belt's next tick"
+        );
+        // the explorers keep saying "spent, unconfirmed": a miss of the block, every tick for 40 minutes
+        let sweep = home_marker_sweep();
+        let courier = Couriers {
+            answers: vec![
+                (
+                    format!("{HOME_MARKER_HOP}/0/spent"),
+                    (
+                        200,
+                        json!({"txid": sweep_txid, "vin": 0, "status": "unconfirmed"})
+                            .to_string()
+                            .into_bytes(),
+                    ),
+                ),
+                (
+                    format!("tx/{sweep_txid}/hex"),
+                    (200, hex::encode(sweep.to_binary()).into_bytes()),
+                ),
+            ],
+            ..Default::default()
+        };
+        let (mut young_looks, mut looks) = (0, 0);
+        let mut at = now;
+        while at < first + 40 * 60_000 {
+            at += crate::owed_belt::OWED_BELT_TICK_MS;
+            w.d1.now.set(at as u64);
+            w.actor.now.set(at as u64);
+            if at == first + 20 * 60_000 + 60_000 {
+                // a later broadcaster hint on the sweep: the window does not move
+                w.d1.conn
+                    .execute_batch(&format!(
+                        "INSERT INTO tx_words(txid,word,tier,hint_source,hint_at,updated_at) VALUES ('{sweep_txid}','seen','hint','arcade',{},{}) \
+                         ON CONFLICT(txid) DO UPDATE SET hint_at=excluded.hint_at,updated_at=excluded.updated_at",
+                        at / 1000,
+                        at / 1000
+                    ))
+                    .unwrap();
+            }
+            let report = crate::owed_belt::tick(&w, &courier).await.unwrap();
+            assert!(report.write_faults.is_empty(), "{report:?}");
+            if report.candidates == 0 {
+                continue;
+            }
+            looks += 1;
+            young_looks += report.young_rows;
+            let young = at - first < crate::owed_belt::OWED_BELT_YOUNG_MISS_MS;
+            assert_eq!(
+                report.young_rows,
+                usize::from(young),
+                "phase_c {phase_c} at +{}s: {report:?}",
+                (at - first) / 1000
+            );
+            let (family, facts, _) = row();
+            assert_eq!(
+                (family.as_str(), facts["chainWait"].as_str()),
+                ("payout", Some("block"))
+            );
+            if young {
+                assert_eq!(
+                    next(),
+                    at + crate::owed_belt::OWED_BELT_TICK_MS,
+                    "phase_c {phase_c} at +{}s: a young miss is asked again on the next tick",
+                    (at - first) / 1000
+                );
+            } else {
+                assert!(
+                    next() >= at + 600_000,
+                    "phase_c {phase_c}: past the window the look backs off: {}",
+                    next() - at
+                );
+            }
+        }
+        assert!(
+            young_looks
+                <= (crate::owed_belt::OWED_BELT_YOUNG_MISS_MS / crate::owed_belt::OWED_BELT_TICK_MS)
+                    as usize,
+            "phase_c {phase_c}: at most 15 young looks, {young_looks}"
+        );
+        assert!(
+            young_looks >= 13,
+            "phase_c {phase_c}: the window was used: {young_looks}"
+        );
+        assert!(
+            looks <= young_looks + 2,
+            "phase_c {phase_c}: then backs off: {looks}"
+        );
+    }
+}
+
 /// FIX-988 (b): the ask of a courier-bytes payout follows its sweep's block, in every phase (`ask_of` is the belt's
 /// one rule): seen and not mined, the hop's spend (the outpoint the row is keyed by); confirmed, its home. RED on
 /// 1ab40c95: `home` for both.

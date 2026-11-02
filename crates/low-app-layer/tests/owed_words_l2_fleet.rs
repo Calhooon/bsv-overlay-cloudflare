@@ -236,6 +236,7 @@ fn owed(pages: &[Vec<HopsViewRow>], views: &BTreeMap<String, Value>, l2: bool) -
         hop_sweeps: &sweeps,
         evicted_pots: &none,
         spender_outputs: &outs,
+        spender_first_seen: &Default::default(),
         spender_inputs: &ins,
         courier_spenders: &none,
         my_pkh_by_game: &pkhs,

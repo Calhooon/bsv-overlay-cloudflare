@@ -369,32 +369,87 @@ pub const SWEEP_TIP_MOVED_REASON: &str =
 pub const SWEEP_TIP_UNKNOWN_REASON: &str =
     "the chain tip is unavailable; the hop probe's freshness is unknown";
 /// FIX-1049 (bsv-low #1049): a stranded hop whose filed sweep a broadcaster holds (the tracker's live word on it):
-/// the sweep's landing wait, the spender named, never a second press.
+/// the sweep's landing wait, the spender named, the press withheld until the wait ends ([`SWEEP_LANDING_WAIT_MS`]).
 pub const SWEEP_LANDING_REASON: &str =
     "the hop's sweep is on the network and has not reached the explorers or a block yet; waiting for it to land";
+/// FIX-1049-FOLD-1 (the ensemble's A MEDIUM-2, B NOTE-1): THE WAIT HAS AN EXIT. A landing wait holds this long after
+/// the sweep's LAST broadcaster word (the tracker word's `at`: every hint moves it, so a sweep a broadcaster keeps
+/// answering about keeps its wait, and one no broadcaster speaks of any more loses it): six blocks of 600 s. Past it
+/// the row presses again, and the press is the FILED sweep's own bytes (`sweepRawHex`): the same transaction
+/// re-presented, never a second spend, which is the remedy for a sweep a mempool dropped. A refused word, a word the
+/// tracker swept, `unknown`, `abandoned`, `built` or a word with no hint time ends it at once (the word's own mark
+/// re-judges the row). The belt looks at the row by the wait's end (`owed_belt::cap_to_landing_end`), so the press
+/// comes back on that look.
+pub const SWEEP_LANDING_WAIT_MS: i64 = 3_600_000;
 
 /// FIX-1049 (bsv-low #1049): is this tracker word a LIVE spender, one a broadcaster holds (`announced`, `seen`) or the
-/// chain named (`mined`, checked or not, `stale`), and not refused (a chain-tier `rejected` or `conflicted`, or the
-/// producer's `terminalHint`, [`funding_refusal_word`]'s reading)? `unknown`, `abandoned` and `built` are not: no
+/// chain named (`mined`, checked or not, `stale`), and not refused? FIX-1049-FOLD-1 (C LOW-2): "refused" is
+/// [`word_refusal`], [`funding_refusal_word`]'s one reading (a chain-tier `rejected` or `conflicted`, or the producer's
+/// `terminalHint`), so a later change to it moves both. `unknown`, `abandoned` and `built` are not live: no
 /// broadcaster holds those bytes, so a press is what puts them on the network.
 pub fn spender_word_live(word: &Value) -> bool {
     let live = matches!(
         word["word"].as_str(),
         Some("announced" | "seen" | "mined" | "stale")
     );
-    live && !word["terminalHint"].is_string()
+    live && word_refusal(word).is_none()
 }
 
-/// FIX-1049: the hop's filed sweep and its word, when the tracker holds that word live ([`spender_word_live`]).
-fn live_filed_sweep<'a>(
+/// FIX-1049-FOLD-1: the hop's filed sweep's landing wait, when its tracker word is live ([`spender_word_live`]) and
+/// its last hint is younger than [`SWEEP_LANDING_WAIT_MS`]: the word and the hint's time in ms. `None` (the press) for
+/// no word, a word not live, a word with no hint time, and a wait past its bound.
+fn landing_wait<'a>(
     i: &'a OwedInputs,
-    outpoint: &str,
-) -> Option<(&'a crate::hopsweep::FiledHopSweep, &'a Value)> {
-    let filed = i.hop_sweeps.get(outpoint)?;
+    filed: &crate::hopsweep::FiledHopSweep,
+) -> Option<(&'a Value, i64)> {
     let word = i
         .spender_words?
         .get(&filed.sweep_txid.to_ascii_lowercase())?;
-    spender_word_live(word).then_some((filed, word))
+    let at_ms = word["at"].as_i64().filter(|a| *a > 0)?.saturating_mul(1000);
+    (spender_word_live(word) && i.now_ms.saturating_sub(at_ms) < SWEEP_LANDING_WAIT_MS)
+        .then_some((word, at_ms))
+}
+
+/// FIX-1049-FOLD-1 (C answer 1, LOW-1: ONE guard): the filed-sweep block of a stranded hop's press, inside the two
+/// press arms (the couriers' fresh `unspent`, the index's `unspent`), which the chain's spent arm precedes by the
+/// match's own order. With a filing whose sweep is in its landing wait ([`landing_wait`]) the row is the wait instead
+/// of the press (answers `true`): no claim, `chainWait: "block"`, `sweepLanding`, the hint's time and the wait's end,
+/// the spender's word, no press bytes. Otherwise the filed bytes ride the press, or the press signs here.
+fn sweep_press_or_landing(i: &OwedInputs, facts: &mut Value, outpoint: &str) -> bool {
+    let Some(f) = i.hop_sweeps.get(outpoint) else {
+        facts["sweepSource"] = json!("sign-here");
+        return false;
+    };
+    facts["sweepTxid"] = json!(f.sweep_txid);
+    facts["sweepSource"] = json!("hopsweep-filing");
+    let Some((_, at_ms)) = landing_wait(i, f) else {
+        facts["sweepRawHex"] = json!(f.raw_hex);
+        return false;
+    };
+    facts["claim"] = Value::Null;
+    facts["claimable"] = json!(false);
+    facts["chainWait"] = json!("block");
+    facts["sweepLanding"] = json!(true);
+    // the sweep's last broadcaster word (the tracker word's `at`) and the wait's end: the belt looks by then
+    facts["sweepLandingAtMs"] = json!(at_ms);
+    facts["sweepLandingUntilMs"] = json!(at_ms + SWEEP_LANDING_WAIT_MS);
+    first_seen_fact(i, facts, &f.sweep_txid);
+    owed_words(i, facts, Some(&f.sweep_txid), None);
+    true
+}
+
+/// FIX-1049-FOLD-1 (fold 3, A LOW-1, B LOW-1, C MEDIUM-2): `sweepFirstSeenAtMs`, the FIRST time the record held the
+/// sweep's bytes (`owed_spender_bytes.createdAtMs`: the belt's first find of it through a courier, written once, ON
+/// CONFLICT DO NOTHING, never renewed by a later find or a later hint). The belt's young window runs from it
+/// (`owed_belt::young_miss`). Absent where the record holds no bytes of the sweep: no young window.
+fn first_seen_fact(i: &OwedInputs, facts: &mut Value, sweep_txid: &str) {
+    if let Some(at) = i
+        .spender_first_seen
+        .get(&sweep_txid.to_ascii_lowercase())
+        .filter(|at| **at > 0)
+    {
+        facts["sweepFirstSeenAtMs"] = json!(at);
+    }
 }
 
 /// The families, in the order the page lists them.
@@ -629,6 +684,9 @@ pub struct OwedInputs<'a> {
     pub evicted_pots: &'a HashSet<String>,
     /// non-pot spender txid (lowercase) → its outputs as the index's stored bytes show them (bounded per recompute).
     pub spender_outputs: &'a HashMap<String, Vec<SpenderOutput>>,
+    /// FIX-1049-FOLD-1: spender txid (lowercase) -> when the record first held its bytes (`owed_spender_bytes`'s
+    /// write-once `createdAtMs`): the sweep's first sight, which the belt's young window runs from.
+    pub spender_first_seen: &'a HashMap<String, i64>,
     /// Every parsed spender's INPUT outpoints (index-held or courier-supplied): a story stands only for a hop the
     /// transaction consumes — a pointer (the index's, a courier's, a planted row's) the bytes refute is judged as
     /// bytes never read, per hop (the delta-verify's NEW-4 and its round-2 asymmetry).
@@ -782,7 +840,11 @@ pub fn funding_refusal_word(
     words: Option<&std::collections::BTreeMap<String, Value>>,
     txid: &str,
 ) -> Option<&'static str> {
-    let w = words?.get(&txid.to_ascii_lowercase())?;
+    word_refusal(words?.get(&txid.to_ascii_lowercase())?)
+}
+/// The one reading of a refused tracker word ([`funding_refusal_word`] for one word view): a chain-tier `rejected` or
+/// `conflicted`, else the producer's `terminalHint` on a word that is not `mined`.
+pub fn word_refusal(w: &Value) -> Option<&'static str> {
     let chain = w["tier"] == "chain";
     if chain && w["word"] == "rejected" {
         return Some("rejected");
@@ -952,7 +1014,7 @@ pub const OWED_SPENDER_BYTES_UPSERT_SQL: &str =
     "INSERT INTO owed_spender_bytes (txid, bytesJson, createdAtMs) VALUES (?1, ?2, ?3) ON CONFLICT(txid) DO NOTHING";
 /// Read the store for the pass's named spenders in ONE statement (the txids as a JSON array), by the PRIMARY KEY.
 pub const OWED_SPENDER_BYTES_SELECT_SQL: &str =
-    "SELECT txid, bytesJson FROM owed_spender_bytes WHERE txid IN (SELECT value FROM json_each(?1))";
+    "SELECT txid, bytesJson, createdAtMs FROM owed_spender_bytes WHERE txid IN (SELECT value FROM json_each(?1))";
 /// The age sweep (the existing janitor's shape, `tracker_host::stored::SWEEP`): a bounded DELETE of rows older than
 /// the retention, run in the scheduled pass. `?1` the cutoff ms, `?2` the per-pass limit.
 /// FIX-1010 (bsv-low #1010): the pair a swept spender's bytes' trigger marks.
@@ -2305,6 +2367,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
             if !swept.confirmed {
                 facts["claimReason"] = json!(UNCONFIRMED_PAYOUT_REASON);
                 facts["chainWait"] = json!("block");
+                // FIX-1049-FOLD-1 (fold 4, L58 pair 17): the sweep's first sight, which the belt's young window on
+                // this block wait runs from (`owed_belt::young_miss`)
+                first_seen_fact(i, &mut facts, &swept.sweep_txid);
             }
             if swept.courier_confirmed {
                 // the COURIER-RUNG lens fold (L2): the courier's confirmed is served, as a hint, never a press (the
@@ -2621,12 +2686,6 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                         facts["doorRefusal"] = json!(door.as_str());
                     }
                 }
-                // FIX-1049: the filed sweep live at a broadcaster, where an arm below would press
-                let landing = live_filed_sweep(i, &outpoint).filter(|_| {
-                    h.status == HopStatus::Unspent
-                        || chain
-                            .is_some_and(|w| w.looked && w.spent == Some(false) && !w.predates_tip)
-                });
                 match chain {
                     // bsv-low #808 (loop 41, pair 13): the chain's "unspent" was taken BELOW this walk's tip and the
                     // budget left no fresh ask (`hops_view::memo_predates_tip`): a block has arrived since, and it may
@@ -2671,45 +2730,6 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             reason: Some(SWEEP_TIP_MOVED_REASON.to_string()),
                         });
                     }
-                    // FIX-1049 (bsv-low #1049, L58 pair 17's `stale-strand-press`): the hop's FILED sweep is live at
-                    // a broadcaster (the tracker's word, [`spender_word_live`]) while the couriers and the index have
-                    // not seen it spend the hop yet: the sweep's landing wait, the spender named, never a press (a
-                    // second sweep would be a double spend the network refuses). Only where the arms below would
-                    // press; a chain word of spent keeps its own arm above.
-                    _ if landing.is_some() => {
-                        let Some((filed, word)) = landing else {
-                            continue;
-                        };
-                        facts["claim"] = Value::Null;
-                        facts["claimable"] = json!(false);
-                        facts["chainWait"] = json!("block");
-                        facts["sweepLanding"] = json!(true);
-                        // when a broadcaster first took the sweep (the word's `at`, seconds), in ms: the belt's young
-                        // window runs from it (`owed_belt::young_miss`); the stored row keeps it, the joined word not
-                        if let Some(at) = word["at"].as_u64().filter(|a| *a > 0) {
-                            facts["sweepLandingAtMs"] = json!(at.saturating_mul(1000));
-                        }
-                        facts["chainProbe"] = json!(match chain {
-                            Some(w) if w.looked && w.spent == Some(false) && !w.predates_tip => {
-                                unspent_chain_probe(w.age_ms)
-                            }
-                            _ => "index-unspent",
-                        });
-                        facts["sweepTxid"] = json!(filed.sweep_txid);
-                        facts["sweepSource"] = json!("hopsweep-filing");
-                        owed_words(i, &mut facts, Some(&filed.sweep_txid), None);
-                        rows.push(OwedRow {
-                            identity: me.clone(),
-                            outpoint,
-                            family: OwedFamily::HopStranded,
-                            game_id: game,
-                            sats: Some(h.hop_sats),
-                            opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
-                            at_height: None,
-                            facts,
-                            reason: Some(SWEEP_LANDING_REASON.to_string()),
-                        });
-                    }
                     Some(w) if w.looked && w.spent == Some(false) && !w.predates_tip => {
                         facts["claim"] = json!("sweep-hop");
                         facts["claimable"] = json!(true);
@@ -2723,17 +2743,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             facts["chainProbeTip"] = json!(pt);
                         }
                         // the FILED sweep rides the row when this identity filed one (any device presses it as it
-                        // is); without one the press signs a sweep on the device that owns the key
-                        match i.hop_sweeps.get(&outpoint) {
-                            Some(f) => {
-                                facts["sweepRawHex"] = json!(f.raw_hex);
-                                facts["sweepTxid"] = json!(f.sweep_txid);
-                                facts["sweepSource"] = json!("hopsweep-filing");
-                            }
-                            None => {
-                                facts["sweepSource"] = json!("sign-here");
-                            }
-                        }
+                        // is); without one the press signs a sweep on the device that owns the key. FIX-1049: a
+                        // filed sweep in its landing wait makes the row the wait instead of the press.
+                        let landing = sweep_press_or_landing(i, &mut facts, &outpoint);
                         rows.push(OwedRow {
                             identity: me.clone(),
                             outpoint,
@@ -2743,7 +2755,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
                             at_height: None,
                             facts,
-                            reason: if evicted {
+                            reason: if landing {
+                                Some(SWEEP_LANDING_REASON.to_string())
+                            } else if evicted {
                                 Some(JOIN_REFUSED_REASON.to_string())
                             } else {
                                 door_refused.map(|door| door.sentence().to_string())
@@ -2819,17 +2833,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             }
                         }
                         // the FILED sweep rides the row when this identity filed one; without one the press signs a
-                        // sweep on the device that owns the key (the same source block as the corroborated arm above)
-                        match i.hop_sweeps.get(&outpoint) {
-                            Some(f) => {
-                                facts["sweepRawHex"] = json!(f.raw_hex);
-                                facts["sweepTxid"] = json!(f.sweep_txid);
-                                facts["sweepSource"] = json!("hopsweep-filing");
-                            }
-                            None => {
-                                facts["sweepSource"] = json!("sign-here");
-                            }
-                        }
+                        // sweep on the device that owns the key (the same source block as the corroborated arm above,
+                        // the landing wait's one guard with it)
+                        let landing = sweep_press_or_landing(i, &mut facts, &outpoint);
                         rows.push(OwedRow {
                             identity: me.clone(),
                             outpoint,
@@ -2839,7 +2845,9 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
                             at_height: None,
                             facts,
-                            reason: if evicted {
+                            reason: if landing {
+                                Some(SWEEP_LANDING_REASON.to_string())
+                            } else if evicted {
                                 Some(JOIN_REFUSED_REASON.to_string())
                             } else {
                                 door_refused.map(|door| door.sentence().to_string())
@@ -4856,6 +4864,7 @@ pub(crate) mod tests {
             evicted_hop_outpoints: &NONE,
             door_refused_hop_outpoints: &NO_DOOR,
             spender_outputs: &NO_SPENDERS,
+            spender_first_seen: &NO_FIRST_SEEN,
             spender_inputs: &NO_INPUTS,
             courier_spenders: &NONE,
             my_pkh_by_game: &NO_PKHS,
@@ -4871,6 +4880,8 @@ pub(crate) mod tests {
     static NO_DOOR: std::sync::LazyLock<HashMap<String, DoorRefusal>> =
         std::sync::LazyLock::new(HashMap::new);
     static NO_INPUTS: std::sync::LazyLock<HashMap<String, Vec<(String, u32)>>> =
+        std::sync::LazyLock::new(HashMap::new);
+    static NO_FIRST_SEEN: std::sync::LazyLock<HashMap<String, i64>> =
         std::sync::LazyLock::new(HashMap::new);
     static NO_PKHS: std::sync::LazyLock<HashMap<String, String>> =
         std::sync::LazyLock::new(HashMap::new);
@@ -9349,7 +9360,7 @@ pub(crate) mod tests {
         let word = |w: &str| {
             std::collections::BTreeMap::from([(
                 sweep.clone(),
-                json!({"word": w, "tier": "hint", "verifyPath": null, "at": 899_000}),
+                json!({"word": w, "tier": "hint", "verifyPath": null, "at": 1_800_000_000 - 60}),
             )])
         };
         for chain in [&no_chain, &courier_unspent] {
@@ -9370,7 +9381,7 @@ pub(crate) mod tests {
                 );
                 assert_eq!(r.facts["chainWait"], "block", "{live}");
                 assert_eq!(r.facts["sweepLanding"], true, "{live}");
-                assert_eq!(r.facts["sweepLandingAtMs"], 899_000_000, "{live}");
+                assert_eq!(r.facts["sweepLandingAtMs"], 1_799_999_940_000_i64, "{live}");
                 assert_eq!(r.facts["sweepTxid"], sweep.as_str(), "{live}");
                 assert_eq!(r.facts["spenderWord"]["word"], live, "{live}");
                 assert!(
@@ -9411,5 +9422,116 @@ pub(crate) mod tests {
         let rows = derive_and_pin(&i);
         assert_eq!(rows[0].facts["sweepSource"], "sign-here");
         assert_eq!(rows[0].facts["claimable"], true);
+    }
+
+    /// FIX-1049-FOLD-1 (fold 1; ensemble A MEDIUM-1, B MEDIUM-1, C MEDIUM-1): THE CHAIN'S SPENT ARM FIRST. A hop the
+    /// couriers show SPENT by another transaction (a competitor, confirmed or not, or the JOIN the index lags on) is
+    /// served by the spent arm, whatever the hop's filed sweep's word: never "your sweep is landing", the rival named,
+    /// the sats never shown twice beside the pot. RED on ee8b6753: the landing wait served over the spent word.
+    #[test]
+    fn fix1049f1_a_the_chains_spent_word_outranks_a_live_filed_sweep() {
+        let (v, c) = (HashMap::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let (sweep, rival, pot) = (tx(0x0c), tx(0x0d), tx(0x0e));
+        let sweeps = filed(&key, &sweep);
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let words = std::collections::BTreeMap::from([(
+            sweep.clone(),
+            json!({"word": "seen", "tier": "hint", "verifyPath": null, "at": 1_800_000_000 - 60}),
+        )]);
+        for confirmed in [Some(true), Some(false), None] {
+            let spent = chain_confirmed(&key, true, Some(true), Some(&rival), confirmed);
+            let no_pots = HashSet::new();
+            let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+            i.hop_sweeps = &sweeps;
+            i.hop_chain = &spent;
+            i.spender_words = Some(&words);
+            let rows = derive_and_pin(&i);
+            assert_eq!(rows.len(), 1, "{confirmed:?}");
+            let r = &rows[0];
+            assert_eq!(
+                (
+                    r.family,
+                    r.facts["chainProbe"].clone(),
+                    r.facts["chainSpender"].clone()
+                ),
+                (OwedFamily::Unbound, json!("spent"), json!(rival)),
+                "{confirmed:?}: the chain's spent word, the rival named"
+            );
+            assert!(r.facts.get("sweepLanding").is_none(), "{confirmed:?}");
+            assert_ne!(r.reason.as_deref(), Some(SWEEP_LANDING_REASON));
+        }
+        // the JOIN took it (a pot the index lags on): the pot's own row tells the story, never a stranded hop with sats
+        let spent = chain_confirmed(&key, true, Some(true), Some(&pot), Some(true));
+        let pots = HashSet::from([pot.clone()]);
+        let mut i = inputs(&[], &[], &old, &v, &c, &pots, Some(900_000));
+        i.hop_sweeps = &sweeps;
+        i.hop_chain = &spent;
+        i.spender_words = Some(&words);
+        let rows = derive_and_pin(&i);
+        assert!(
+            rows.iter().all(|r| r.family != OwedFamily::HopStranded),
+            "the JOIN's hop is no landing wait: {rows:?}"
+        );
+        assert!(rows.iter().all(|r| r.facts.get("sweepLanding").is_none()));
+    }
+
+    /// FIX-1049-FOLD-1 (fold 2; ensemble A MEDIUM-2, B NOTE-1): THE WAIT HAS AN EXIT. The landing wait holds while
+    /// the sweep's last broadcaster word is younger than `SWEEP_LANDING_WAIT_MS` and states its end
+    /// (`sweepLandingUntilMs`); past it the row presses again with the FILED bytes (the same transaction re-presented),
+    /// and a live word with no hint time is no wait. RED on ee8b6753: a dead sweep's hop withheld for good.
+    #[test]
+    fn fix1049f1_b_a_dead_sweeps_hop_presses_again_after_the_wait() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        let sweeps = filed(&key, &sweep);
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let now_s: i64 = 1_800_000_000;
+        let wait_s = SWEEP_LANDING_WAIT_MS / 1000;
+        let judged = |at: Value| {
+            let words = std::collections::BTreeMap::from([(
+                sweep.clone(),
+                json!({"word": "seen", "tier": "hint", "verifyPath": null, "at": at}),
+            )]);
+            let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+            i.hop_sweeps = &sweeps;
+            i.spender_words = Some(&words);
+            derive_and_pin(&i).remove(0)
+        };
+        let r = judged(json!(now_s - wait_s + 1));
+        assert_eq!(r.facts["sweepLanding"], true, "inside the wait");
+        assert_eq!(r.facts["claimable"], false);
+        assert_eq!(
+            r.facts["sweepLandingUntilMs"],
+            json!((now_s + 1) * 1000),
+            "the wait states its end"
+        );
+        for (what, at) in [
+            ("at the bound", json!(now_s - wait_s)),
+            ("past the bound", json!(now_s - 3 * wait_s)),
+            ("no hint time", Value::Null),
+        ] {
+            let r = judged(at);
+            assert_eq!(
+                (r.facts["claim"].clone(), r.facts["claimable"].clone()),
+                (json!("sweep-hop"), json!(true)),
+                "{what}: the press is back"
+            );
+            assert_eq!(
+                r.facts["sweepRawHex"],
+                "0100".repeat(20),
+                "{what}: the filed bytes"
+            );
+            assert!(r.facts.get("sweepLanding").is_none(), "{what}");
+        }
     }
 }

@@ -171,6 +171,7 @@ fn fleet_served_bodies_are_byte_identical_before_and_after_derivation() {
                 hop_sweeps: &Default::default(),
                 evicted_pots: &Default::default(),
                 spender_outputs: &Default::default(),
+                spender_first_seen: &Default::default(),
                 spender_inputs: &Default::default(),
                 courier_spenders: &Default::default(),
                 my_pkh_by_game: &Default::default(),

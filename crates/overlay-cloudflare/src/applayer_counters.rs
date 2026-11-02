@@ -96,9 +96,11 @@ const IDENTITY_OUTCOMES: [&str; 4] = [
 ];
 
 /// bsv-low #893 section 5: the app layer's owed belt (`low_app_layer::owed_belt::counter_names`, pinned equal there).
-/// The backlog `owed_belt_due_total` is a gauge the tick SETS; the rest are totals it adds.
+/// The backlog `owed_belt_due_total` and `owed_belt_young_rows_total` are gauges the tick SETS; the rest are totals
+/// it adds.
 /// bsv-low #1027 (FIX-1027-FOLD-1): `owed_belt_reasked_total`, the outpoints the operator's re-ask lever asked.
-/// bsv-low #1049 (FIX-1049): `owed_belt_young_reasked_total`, the young misses the belt re-asked on its next tick.
+/// bsv-low #1049 (FIX-1049-FOLD-1): `owed_belt_young_rows_total`, a gauge the tick SETS: the rows it looked at in
+/// their young window (each once), never a count of re-dates.
 pub const OWED_BELT: [&str; 10] = [
     "owed_belt_ticks_total",
     "owed_belt_asked_total",
@@ -109,7 +111,7 @@ pub const OWED_BELT: [&str; 10] = [
     "owed_belt_faults_bananablocks_total",
     "owed_belt_faults_other_total",
     "owed_belt_reasked_total",
-    "owed_belt_young_reasked_total",
+    "owed_belt_young_rows_total",
 ];
 
 /// bsv-low #912 (lane D2-ACTOR-B): the app layer's owed actor (`low_app_layer::owed_actor::COUNTERS`, pinned equal
@@ -288,7 +290,7 @@ pub fn owed_belt_view(counters: &serde_json::Value) -> serde_json::Value {
         "found": n("owed_belt_found_total"),
         "due": n("owed_belt_due_total"),
         "reasked": n("owed_belt_reasked_total"),
-        "youngReasked": n("owed_belt_young_reasked_total"),
+        "youngRows": n("owed_belt_young_rows_total"),
         "faults": {
             "woc": n("owed_belt_faults_woc_total"),
             "bitails": n("owed_belt_faults_bitails_total"),
