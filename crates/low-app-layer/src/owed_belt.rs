@@ -39,10 +39,16 @@ pub const OWED_BELT_UNANSWERED_RETRY_MS: i64 = 300_000;
 /// A look that changed nothing (the D2-OWED lens's HIGH-3) doubles its row's period, to this ceiling (6 h). The
 /// judge's own dating (a source write, a tip) starts it again at the family's base period.
 pub const OWED_BELT_BACKOFF_MAX_MS: i64 = 6 * 3_600_000;
-/// FIX-1049 (bsv-low #1049, L58 pair 17): how long after a broadcaster first took the spender a miss on its outpoint
-/// is YOUNG ([`young_miss`]): three blocks' worth. Inside it the belt re-asks on its next tick; past it the back-off
-/// runs as for any look that changed nothing, so a sweep that never lands costs at most 15 extra looks.
+/// FIX-1049 (bsv-low #1049, L58 pair 17): how long after the record FIRST held the sweep's bytes (its first sight,
+/// `sweepFirstSeenAtMs`: `owed_spender_bytes.createdAtMs`, written once) a look at its hop is YOUNG ([`young_miss`]):
+/// three blocks' worth. Inside it the belt re-asks on its next tick; past it the back-off runs as for any look that
+/// changed nothing. The stamp is never renewed (a later find keeps it, ON CONFLICT DO NOTHING), so one sweep costs at
+/// most `OWED_BELT_YOUNG_MISS_MS / OWED_BELT_TICK_MS` = 15 young looks while the record holds its bytes (8 days, the
+/// store's retention; a row swept and written again starts a new window, 15 looks more).
 pub const OWED_BELT_YOUNG_MISS_MS: i64 = 1_800_000;
+/// FIX-1049-FOLD-1 (fold 5, A NOTE-2, B RISK): young looks take at most half of a tick's places and never the second
+/// class's reserved ones ([`places`]).
+pub const OWED_BELT_YOUNG_PER_TICK: usize = OWED_BELT_OUTPOINTS_PER_TICK / 2;
 /// The rung's circuit: this many faults in one tick close it for the rest of the tick (`tracker_host::pacing`'s 3).
 pub const OWED_BELT_RUNG_FAULTS: u8 = 3;
 /// The singleton actor's name in `BOARD_VIEW` (fleet-wide: one belt whatever the number of readers or isolates).
@@ -163,8 +169,11 @@ pub const COUNTER_FOUND: &str = "owed_belt_found_total";
 pub const COUNTER_DUE: &str = "owed_belt_due_total";
 /// FIX-1027-FOLD-1: the outpoints the operator's re-ask lever ([`reask`]) asked.
 pub const COUNTER_REASKED: &str = "owed_belt_reasked_total";
-/// FIX-1049: the young misses re-asked on the next tick ([`young_miss`]).
-pub const COUNTER_YOUNG_REASKED: &str = "owed_belt_young_reasked_total";
+/// FIX-1049-FOLD-1 (fold 6, C NOTE-1): a GAUGE, set each tick: the ROWS the tick looked at in their young window
+/// ([`young_miss`]), each once, whatever path re-dated it. A count of rows in a young wait, never of re-dates.
+pub const COUNTER_YOUNG_ROWS: &str = "owed_belt_young_rows_total";
+/// The young-rows gauge's statement (`?1` the rows).
+pub const YOUNG_GAUGE_SQL: &str = "INSERT INTO ops_counters(name,value) VALUES ('owed_belt_young_rows_total',?1) ON CONFLICT(name) DO UPDATE SET value=excluded.value";
 pub fn fault_counter(rung: usize) -> String {
     format!(
         "owed_belt_faults_{}_total",
@@ -181,7 +190,7 @@ pub fn counter_names() -> Vec<String> {
     ];
     v.extend((0..RUNGS.len()).map(fault_counter));
     v.push(COUNTER_REASKED.to_owned());
-    v.push(COUNTER_YOUNG_REASKED.to_owned());
+    v.push(COUNTER_YOUNG_ROWS.to_owned());
     v
 }
 
@@ -315,18 +324,47 @@ pub fn rests_on_unconfirmed_find(facts: &Value) -> bool {
         && facts["spentConfirmed"] != true
 }
 
-/// FIX-1049 (bsv-low #1049, L58 pair 17): is a miss on this row's outpoint YOUNG? The row is a swept hop's landing
-/// wait (`sweepLanding`, `owed::derive_owed_rows`: the hop's filed sweep live at a broadcaster by the tracker's word,
-/// [`owed::spender_word_live`], the couriers and the index not yet showing it spend the hop) whose sweep a
-/// broadcaster first took (`sweepLandingAtMs`, the word's `at`) less than [`OWED_BELT_YOUNG_MISS_MS`] ago. Such a miss is the
-/// network's relay, not an answer: the belt asks again on its next tick, never after the 300 s floor or a doubled
-/// period. A miss with no live word (or an old one) backs off as before.
+/// FIX-1049 (bsv-low #1049, L58 pair 17), as folded (FIX-1049-FOLD-1, folds 3 and 4): is a look at this row's
+/// outpoint YOUNG? The row waits on a spender the COURIERS named for the hop's outpoint, filed or not (the belt's own
+/// find of the live spender is the hint): a courier-bytes payout whose sweep is seen and not mined
+/// ([`payout_waits_on_block`], FIX-988's ask at the hop), or a swept hop's landing wait (`sweepLanding`) whose sweep's bytes the record holds;
+/// and the record first held that sweep's bytes (`sweepFirstSeenAtMs`, written once, never renewed by a later find
+/// or hint) less than [`OWED_BELT_YOUNG_MISS_MS`] ago. Such a miss is the network's relay, not an answer: the belt
+/// asks again on its next tick, never after the 300 s floor or a doubled period. A row with no first sight (a landing
+/// wait only the tracker names), or an old one, backs off as before.
 pub fn young_miss(facts: &Value, now_ms: i64) -> bool {
-    facts["sweepLanding"] == true
-        && facts["sweepLandingAtMs"]
+    let waits = facts["sweepLanding"] == true
+        || (facts["creditKind"] == "courier-bytes" && payout_waits_on_block(facts));
+    waits
+        && facts["sweepFirstSeenAtMs"]
             .as_i64()
             .filter(|at| *at > 0)
             .is_some_and(|at| (0..OWED_BELT_YOUNG_MISS_MS).contains(&now_ms.saturating_sub(at)))
+}
+
+/// FIX-1049-FOLD-1 (fold 2): a landing wait's next look is never later than the wait's end (`sweepLandingUntilMs`),
+/// so the look that re-judges the row past it gives the press back; any other row's date is `due` as computed.
+pub fn cap_to_landing_end(facts: &Value, now_ms: i64, due: i64) -> i64 {
+    match facts["sweepLandingUntilMs"].as_i64() {
+        Some(end) if facts["sweepLanding"] == true && end > now_ms => due.min(end),
+        _ => due,
+    }
+}
+
+/// FIX-1049-FOLD-1 (fold 5, A NOTE-2, B RISK): the tick's places by class with the young looks known: the first
+/// class's due, the second class's due that are not young, and its young ones. [`class_places`]'s rule, the second
+/// class's reserved places held for the rows that are NOT young (a young look only re-asks a miss, never the look a
+/// press or a downgrade waits on), the young looks at most [`OWED_BELT_YOUNG_PER_TICK`] of the second class's other
+/// places, and the rows that are not young the rest. Answers (first, second not young, young). With no young row it
+/// is [`class_places`] exactly.
+pub fn places(first: usize, second: usize, young: usize) -> (usize, usize, usize) {
+    let total = OWED_BELT_OUTPOINTS_PER_TICK;
+    let reserved = second.min(OWED_BELT_SECOND_CLASS_RESERVED);
+    let first_n = first.min(total - reserved);
+    let left = total - first_n;
+    let young_n = young.min(OWED_BELT_YOUNG_PER_TICK).min(left - reserved);
+    let second_n = second.min(left - young_n);
+    (first_n, second_n, young_n)
 }
 
 /// FIX-1049: a young miss's next look, the belt's next tick.
@@ -479,6 +517,9 @@ impl Find {
             i.hop_chain.insert(k.clone(), w.clone());
         }
         for (txid, b) in &self.bytes {
+            // FIX-1049-FOLD-1: the statement's ON CONFLICT DO NOTHING keeps a held row's stamp; a new row's is the
+            // judgement's instant, the one `statements` binds
+            i.spender_first_seen.entry(txid.clone()).or_insert(i.now_ms);
             i.spender_inputs.insert(txid.clone(), b.inputs.clone());
             i.spender_outputs.insert(txid.clone(), b.to_outputs());
             i.courier_spenders.insert(txid.clone());
@@ -657,8 +698,8 @@ pub struct TickReport {
     pub no_tip: bool,
     /// bsv-low #912 (Phase C): finds handed back to their actor as a `belt-find` event.
     pub handed_back: usize,
-    /// FIX-1049: young misses ([`young_miss`]) dated for the next tick instead of the back-off.
-    pub young_reasked: usize,
+    /// FIX-1049-FOLD-1 (fold 6): the ROWS this tick looked at in their young window ([`young_miss`]), each once.
+    pub young_rows: usize,
 }
 
 /// The tick's places by class (the third delta lens's D3-M1, the ruling: no class owns the whole tick), given each
@@ -695,7 +736,6 @@ async fn due_candidates(db: &impl JudgeDb, now: i64, tip: u64) -> Result<Vec<Val
         out.into_iter().next().map(|o| o.rows).unwrap_or_default()
     };
     let text = |r: &Value, k: &str| r[k].as_str().map(str::to_owned);
-    let mut chosen: Vec<(String, String)> = Vec::new();
     // The first class: the block-dated courier-only sweeps, by due time then identity, round-robin by identity.
     let mut sweeps: Vec<(i64, String, String)> = first(
         db.run_batch(vec![Stmt {
@@ -740,7 +780,6 @@ async fn due_candidates(db: &impl JudgeDb, now: i64, tip: u64) -> Result<Vec<Val
         }
     }
     // The second class: the walk, run on every tick (the third delta lens's D3-M1: no class owns the whole tick).
-    let mut reads = Vec::new();
     let cursor = first(
         db.run_batch(vec![Stmt {
             sql: "SELECT cursor FROM owed_belt_state WHERE name='belt:identities'".into(),
@@ -815,54 +854,102 @@ async fn due_candidates(db: &impl JudgeDb, now: i64, tip: u64) -> Result<Vec<Val
             if in_first.contains(&(id.clone(), outpoint.to_owned())) {
                 continue;
             }
-            if second_class.len() < OWED_BELT_OUTPOINTS_PER_TICK {
+            // FIX-1049-FOLD-1 (fold 5): twice a tick's worth, so the places a young look may not take are filled by
+            // the next turns' rows that are not young
+            if second_class.len() < 2 * OWED_BELT_OUTPOINTS_PER_TICK {
                 second_class.push((at, id.clone(), outpoint.to_owned()));
             }
         }
     }
-    // The places (D3-M1): the second class is given at least its reserved places whenever it holds a due row, the
-    // first class the rest; a class with nothing due yields its places to the other.
-    let (first_n, second_n) = class_places(first_class.len(), second_class.len());
-    chosen.extend(first_class.into_iter().take(first_n));
-    second_class.truncate(second_n);
-    // The next tick starts after the last identity this one gave a turn (the whole walk when none was given one and
-    // the second class was not cut short by its places).
-    let last = second_class
-        .iter()
-        .map(|(at, _, _)| *at)
-        .max()
-        .and_then(|at| identities.get(at).cloned())
-        .or(walked_to);
-    chosen.extend(
-        second_class
+    // The candidates' rows, read by primary key: every first-class row and every second-class turn (at most a tick's
+    // worth each), so the places know which second-class rows are young (FIX-1049-FOLD-1, fold 5).
+    let read = |pairs: Vec<(String, String)>| async move {
+        if pairs.is_empty() {
+            return Ok::<_, String>(Vec::new());
+        }
+        let stmts = pairs
+            .iter()
+            .map(|(id, outpoint)| Stmt {
+                sql: CANDIDATES_SQL.into(),
+                binds: vec![Bind::Text(id.clone()), Bind::Text(outpoint.clone())],
+            })
+            .collect();
+        Ok(db
+            .run_batch(stmts)
+            .await?
             .into_iter()
-            .map(|(_, id, outpoint)| (id, outpoint)),
-    );
+            .map(|o| o.rows.into_iter().next())
+            .collect::<Vec<_>>())
+    };
+    let first_rows = read(first_class).await?;
+    let second_rows = read(
+        second_class
+            .iter()
+            .map(|(_, id, outpoint)| (id.clone(), outpoint.clone()))
+            .collect(),
+    )
+    .await?;
+    let young_of = |r: &Option<Value>| {
+        r.as_ref().is_some_and(|r| {
+            let facts: Value = r["facts"]
+                .as_str()
+                .and_then(|f| serde_json::from_str(f).ok())
+                .unwrap_or(Value::Null);
+            young_miss(&facts, now)
+        })
+    };
+    let young = second_rows.iter().filter(|r| young_of(r)).count();
+    // The places (D3-M1, and fold 5): the second class is given at least its reserved places whenever it holds a due
+    // row that is not young, the first class the rest; young looks at most half, in the places left.
+    let (first_n, second_n, young_n) = places(first_rows.len(), second_rows.len() - young, young);
+    let mut chosen: Vec<Value> = first_rows.into_iter().take(first_n).flatten().collect();
+    let (mut old_taken, mut young_taken) = (0, 0);
+    let mut given: Vec<usize> = Vec::new();
+    let mut held_back: Option<usize> = None;
+    for ((at, _, _), row) in second_class.iter().zip(second_rows) {
+        let is_young = young_of(&row);
+        let take = if is_young {
+            young_taken < young_n && {
+                young_taken += 1;
+                true
+            }
+        } else {
+            old_taken < second_n && {
+                old_taken += 1;
+                true
+            }
+        };
+        if take {
+            given.push(*at);
+            chosen.extend(row);
+        } else if is_young {
+            held_back = Some(held_back.map_or(*at, |h| h.min(*at)));
+        }
+    }
+    // The next tick starts after the last identity this one gave a turn (the whole walk when none was given one and
+    // the second class was not cut short by its places). FIX-1049-FOLD-1: never past an identity whose young look the
+    // places held back (D-L1: no identity holding a due row is passed unserved), so the next tick starts at it.
+    let last = match held_back {
+        Some(0) => None,
+        Some(p) => identities.get(p - 1).cloned(),
+        None => given
+            .iter()
+            .max()
+            .and_then(|at| identities.get(*at).cloned())
+            .or(walked_to),
+    };
     if let Some(last) = last {
-        reads.push(Stmt {
+        db.run_batch(vec![Stmt {
             sql: STATE_SQL.into(),
             binds: vec![
                 Bind::Text(OWED_BELT_WALK_STATE_NAME.into()),
                 Bind::Text(last),
                 Bind::Int(now),
             ],
-        });
+        }])
+        .await?;
     }
-    if chosen.is_empty() && reads.is_empty() {
-        return Ok(Vec::new());
-    }
-    let skip = reads.len();
-    reads.extend(chosen.iter().map(|(id, outpoint)| Stmt {
-        sql: CANDIDATES_SQL.into(),
-        binds: vec![Bind::Text(id.clone()), Bind::Text(outpoint.clone())],
-    }));
-    Ok(db
-        .run_batch(reads)
-        .await?
-        .into_iter()
-        .skip(skip)
-        .filter_map(|o| o.rows.into_iter().next())
-        .collect())
+    Ok(chosen)
 }
 
 /// A candidate row ([`CANDIDATES_SQL`]'s shape; an ask's question read into it) as the tick reads it.
@@ -930,6 +1017,15 @@ async fn ask_candidates(db: &impl JudgeDb, now: i64) -> Result<Vec<Value>, Strin
             None => groups.push((id, vec![n])),
         }
     }
+    // FIX-1049-FOLD-1 (fold 5): the young asks at most half of the places, and never the places the rows that are
+    // not young take ([`places`] with no first class).
+    let young: Vec<bool> = due
+        .iter()
+        .map(|(_, ask)| young_miss(&ask["question"]["facts"], now))
+        .collect();
+    let young_due_n = young.iter().filter(|y| **y).count();
+    let (_, old_n, young_n) = places(0, due.len() - young_due_n, young_due_n);
+    let (mut old_taken, mut young_taken) = (0, 0);
     let mut taken: Vec<usize> = Vec::new();
     'turns: for turn in 0..OWED_BELT_OUTPOINTS_PER_TICK {
         for (_, at) in &groups {
@@ -937,7 +1033,20 @@ async fn ask_candidates(db: &impl JudgeDb, now: i64) -> Result<Vec<Value>, Strin
                 if taken.len() == OWED_BELT_OUTPOINTS_PER_TICK {
                     break 'turns;
                 }
-                taken.push(*n);
+                let room = if young[*n] {
+                    young_taken < young_n && {
+                        young_taken += 1;
+                        true
+                    }
+                } else {
+                    old_taken < old_n && {
+                        old_taken += 1;
+                        true
+                    }
+                };
+                if room {
+                    taken.push(*n);
+                }
             }
         }
     }
@@ -1079,7 +1188,7 @@ async fn ask_backoff(
         .and_then(|f| serde_json::from_str(f).ok())
         .unwrap_or(Value::Null);
     if young_miss(&facts, now) {
-        set_ask_due(db, c, young_due(now), report, true).await;
+        set_ask_due(db, c, young_due(now)).await;
         return;
     }
     let before = look_shape(&c.family, &c.facts, c.reason.as_deref());
@@ -1097,7 +1206,7 @@ async fn ask_backoff(
             sql: ASK_DUE_SQL.into(),
             binds: vec![
                 Bind::Text(ask_name(&c.identity, &c.outpoint)),
-                Bind::Int(now + period),
+                Bind::Int(cap_to_landing_end(&facts, now, now + period)),
             ],
         }])
         .await
@@ -1111,30 +1220,23 @@ async fn ask_backoff(
 }
 
 async fn rearm_ask(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickReport) {
-    let (due, young) = rearm_due(c, now);
-    if set_ask_due(db, c, due, report, young).await {
+    if set_ask_due(db, c, rearm_due(c, now)).await {
         report.rearmed += 1;
     }
 }
 
 /// FIX-1049: an unanswered look's next date: the next tick for a young miss ([`young_miss`]), else
-/// [`unanswered_period`]. Answers the date and whether it was young.
-pub fn rearm_due(c: &Candidate, now: i64) -> (i64, bool) {
+/// [`unanswered_period`], never past a landing wait's end ([`cap_to_landing_end`]).
+pub fn rearm_due(c: &Candidate, now: i64) -> i64 {
     if young_miss(&c.facts, now) {
-        (young_due(now), true)
+        young_due(now)
     } else {
-        (now + unanswered_period(now, c.judged_at_ms), false)
+        cap_to_landing_end(&c.facts, now, now + unanswered_period(now, c.judged_at_ms))
     }
 }
 
-/// Phase C: set one ask's next look in the ledger (`young`: counted a young re-ask).
-async fn set_ask_due(
-    db: &impl JudgeDb,
-    c: &Candidate,
-    due: i64,
-    report: &mut TickReport,
-    young: bool,
-) -> bool {
+/// Phase C: set one ask's next look in the ledger.
+async fn set_ask_due(db: &impl JudgeDb, c: &Candidate, due: i64) -> bool {
     let stmt = Stmt {
         sql: ASK_DUE_SQL.into(),
         binds: vec![
@@ -1143,12 +1245,7 @@ async fn set_ask_due(
         ],
     };
     match db.run_batch(vec![stmt]).await {
-        Ok(_) => {
-            if young {
-                report.young_reasked += 1;
-            }
-            true
-        }
+        Ok(_) => true,
         Err(e) => {
             db.log(&format!(
                 "[owed-belt] re-arm of {} faulted: {e}",
@@ -1275,12 +1372,6 @@ pub async fn reask<C: Courier>(
         deltas.push((
             crate::owed_actor::COUNTERS[9].to_owned(),
             out.tick.handed_back as u64,
-        ));
-    }
-    if out.tick.young_reasked > 0 {
-        deltas.push((
-            COUNTER_YOUNG_REASKED.to_owned(),
-            out.tick.young_reasked as u64,
         ));
     }
     for (rung, n) in out.tick.faults.iter().enumerate() {
@@ -1450,6 +1541,9 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
             continue;
         }
         cursor = Some(c.outpoint.clone());
+        if young_miss(&c.facts, now) {
+            report.young_rows += 1;
+        }
         ask_one(db, &gate, &c, now, asks, &mut report).await;
     }
     let state = gate.state.borrow().clone();
@@ -1474,6 +1568,10 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
                 .into(),
                 binds: vec![Bind::Int(now)],
             },
+            Stmt {
+                sql: YOUNG_GAUGE_SQL.into(),
+                binds: vec![Bind::Int(report.young_rows as i64)],
+            },
         ])
         .await;
     if let Err(e) = close {
@@ -1490,12 +1588,6 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
             report.handed_back as u64,
         ));
     }
-    if report.young_reasked > 0 {
-        deltas.push((
-            COUNTER_YOUNG_REASKED.to_owned(),
-            report.young_reasked as u64,
-        ));
-    }
     for (rung, n) in report.faults.iter().enumerate() {
         if *n > 0 {
             deltas.push((fault_counter(rung), *n));
@@ -1508,7 +1600,7 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
         report.asked,
         report.found,
         report.rearmed,
-        report.young_reasked,
+        report.young_rows,
         report.left,
         report.calls,
         report.faults,
@@ -1581,13 +1673,13 @@ async fn backoff(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickRe
                 Bind::Int(young_due(now)),
             ],
         };
-        return match db.run_batch(vec![stmt]).await {
-            Ok(_) => report.young_reasked += 1,
-            Err(e) => db.log(&format!(
+        if let Err(e) = db.run_batch(vec![stmt]).await {
+            db.log(&format!(
                 "[owed-belt] young re-ask of {} faulted: {e}",
                 c.outpoint
-            )),
-        };
+            ));
+        }
+        return;
     }
     let before = look_shape(&c.family, &c.facts, c.reason.as_deref());
     let now_shape = look_shape(
@@ -1600,7 +1692,7 @@ async fn backoff(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickRe
     }
     let period = backoff_period(c.due_at_ms, c.judged_at_ms, (base_due - now).max(1));
     let mut binds = binds;
-    binds.push(Bind::Int(now + period));
+    binds.push(Bind::Int(cap_to_landing_end(&facts, now, now + period)));
     match db
         .run_batch(vec![Stmt {
             sql: BACKOFF_SQL.into(),
@@ -1627,7 +1719,7 @@ pub fn unanswered_period(now: i64, judged_at_ms: Option<i64>) -> i64 {
 }
 
 async fn rearm(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickReport) {
-    let (due, young) = rearm_due(c, now);
+    let due = rearm_due(c, now);
     let stmt = Stmt {
         sql: REARM_SQL.into(),
         binds: vec![
@@ -1637,12 +1729,7 @@ async fn rearm(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickRepo
         ],
     };
     match db.run_batch(vec![stmt]).await {
-        Ok(_) => {
-            report.rearmed += 1;
-            if young {
-                report.young_reasked += 1;
-            }
-        }
+        Ok(_) => report.rearmed += 1,
         Err(e) => db.log(&format!(
             "[owed-belt] re-arm of {} faulted: {e}",
             c.outpoint
@@ -2064,5 +2151,107 @@ mod tests {
         // one fleet-wide actor
         let me = squash(include_str!("owed_belt.rs"));
         assert!(me.contains(&squash(".id_from_name(OWED_BELT_ACTOR)?")));
+    }
+
+    /// FIX-1049-FOLD-1 (fold 3; A LOW-2): the young window's value and edge. A look 29 min 59 s after the sweep's
+    /// first sight is young, at 30 min it is not; the window keys on the first sight (`sweepFirstSeenAtMs`), never on
+    /// a hint's time (`sweepLandingAtMs`, which a later hint moves); and it covers a courier-bytes payout waiting on its
+    /// block (the L58 shape) and a landing wait, nothing else.
+    #[test]
+    fn fix1049f1_c_the_young_window_runs_from_the_first_sight_to_30_minutes() {
+        use super::*;
+        use serde_json::json;
+        assert_eq!(OWED_BELT_YOUNG_MISS_MS, 1_800_000);
+        assert_eq!(
+            OWED_BELT_YOUNG_MISS_MS / OWED_BELT_TICK_MS,
+            15,
+            "15 young looks at most"
+        );
+        let first = 1_000_000_000_000_i64;
+        let payout = json!({"creditKind": "courier-bytes", "chainWait": "block", "sweepFirstSeenAtMs": first});
+        let landing =
+            json!({"sweepLanding": true, "chainWait": "block", "sweepFirstSeenAtMs": first});
+        for facts in [&payout, &landing] {
+            assert!(young_miss(facts, first), "at the first sight");
+            assert!(young_miss(facts, first + 1_799_999), "29:59");
+            assert!(!young_miss(facts, first + 1_800_000), "30:00");
+            assert!(!young_miss(facts, first - 1), "a clock behind the stamp");
+        }
+        // a later hint moves the landing's hint time, never its first sight
+        let renewed = json!({"sweepLanding": true, "sweepLandingAtMs": first + 1_799_000, "sweepFirstSeenAtMs": first});
+        assert!(!young_miss(&renewed, first + 1_800_000));
+        // no first sight: no young window (a landing only the tracker names)
+        assert!(!young_miss(
+            &json!({"sweepLanding": true, "sweepLandingAtMs": first}),
+            first
+        ));
+        // a confirmed payout, a filed payout, and any other row: never young
+        for facts in [
+            json!({"creditKind": "courier-bytes", "sweepFirstSeenAtMs": first}),
+            json!({"creditKind": "hopsweep-filing", "chainWait": "block", "sweepFirstSeenAtMs": first}),
+            json!({"chainWait": "block", "sweepFirstSeenAtMs": first}),
+        ] {
+            assert!(!young_miss(&facts, first), "{facts}");
+        }
+    }
+
+    /// FIX-1049-FOLD-1 (fold 5; A NOTE-2, B RISK): young looks never take the second class's reserved places and
+    /// never more than half of a tick's eight; with no young row the places are D3-M1's `class_places` exactly.
+    #[test]
+    fn fix1049f1_d_young_looks_take_half_the_places_and_never_the_reserved_ones() {
+        use super::*;
+        for first in 0..=8 {
+            for second in 0..=8 {
+                let (f, s) = class_places(first, second);
+                assert_eq!(places(first, second, 0), (f, s, 0), "{first} {second}");
+            }
+        }
+        assert_eq!(places(0, 0, 8), (0, 0, 4), "half at most");
+        assert_eq!(
+            places(8, 0, 8),
+            (8, 0, 0),
+            "a first-class flood leaves young nothing"
+        );
+        assert_eq!(
+            places(8, 2, 8),
+            (6, 2, 0),
+            "the reserved places are the rows that are not young"
+        );
+        assert_eq!(places(8, 1, 8), (7, 1, 0));
+        assert_eq!(places(0, 6, 8), (0, 4, 4), "half each");
+        assert_eq!(places(0, 16, 1), (0, 7, 1));
+        assert_eq!(places(2, 1, 8), (2, 1, 4));
+        for first in 0..=8 {
+            for second in 0..=8 {
+                for young in 0..=8 {
+                    let (f, s, y) = places(first, second, young);
+                    assert!(f + s + y <= OWED_BELT_OUTPOINTS_PER_TICK);
+                    assert!(y <= OWED_BELT_YOUNG_PER_TICK);
+                    assert!(
+                        s >= second.min(OWED_BELT_SECOND_CLASS_RESERVED),
+                        "the reserved places held"
+                    );
+                }
+            }
+        }
+    }
+
+    /// FIX-1049-FOLD-1 (fold 2): a landing wait's next look is never past its end; any other row's date is untouched.
+    #[test]
+    fn fix1049f1_e_a_landing_waits_next_look_is_by_its_end() {
+        use super::*;
+        use serde_json::json;
+        let facts = json!({"sweepLanding": true, "sweepLandingUntilMs": 5_000});
+        assert_eq!(cap_to_landing_end(&facts, 1_000, 9_000), 5_000);
+        assert_eq!(cap_to_landing_end(&facts, 1_000, 4_000), 4_000);
+        assert_eq!(
+            cap_to_landing_end(&facts, 6_000, 9_000),
+            9_000,
+            "past its end: the row is judged again"
+        );
+        assert_eq!(
+            cap_to_landing_end(&json!({"sweepLandingUntilMs": 5_000}), 1_000, 9_000),
+            9_000
+        );
     }
 }

@@ -2903,6 +2903,7 @@ mod tests {
             evicted_hop_outpoints: &none,
             door_refused_hop_outpoints: &no_door_refusals,
             spender_outputs: &no_spenders,
+            spender_first_seen: &Default::default(),
             spender_inputs: &no_inputs,
             courier_spenders: &none,
             my_pkh_by_game: &no_pkhs,

@@ -910,6 +910,9 @@ async fn hydrate_evidence(
             .and_then(owed::StoredSpenderBytes::from_json)
         {
             let sp = text(&r, "txid");
+            if let Some(at) = r["createdAtMs"].as_i64() {
+                i.spender_first_seen.insert(sp.clone(), at);
+            }
             i.courier_spenders.insert(sp.clone());
             i.spender_inputs.insert(sp.clone(), bytes.inputs.clone());
             i.spender_outputs.insert(sp, bytes.to_outputs());
