@@ -233,7 +233,7 @@ const measured = {}
 }
 
 // bsv-low #723: /spent-any's index-proof read (`hopsweep::sweep_proofs_sql`) at its most outpoints. Twenty fresh
-// probe memos name twenty of the fleet's PROVEN transactions as spenders with no confirmed word, so every row is a
+// probe memos (the route's own cache, keyed `spentany:<txid>.<vout>` since bsv-low #1043) name twenty of the fleet's PROVEN transactions as spenders with no confirmed word, so every row is a
 // known spend and the one statement reads the index's proofs (`spentConfirmedSource: "index-proof"`).
 {
   const crate = fileURLToPath(new URL('../../crates/low-app-layer/', import.meta.url))
@@ -241,7 +241,7 @@ const measured = {}
   const proven = JSON.parse(wr(['--json', '--command', 'SELECT lower(txid) AS txid FROM transactions WHERE has_proof = 1 ORDER BY txid LIMIT 20']).toString())[0].results.map((r) => r.txid)
   const subject = (i) => 'e7' + i.toString(16).padStart(62, '0')
   const now = Date.now()
-  wr(['--command', proven.map((sp, i) => `INSERT OR REPLACE INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed) VALUES ('${subject(i)}.0', ${now}, 1, '${sp}', NULL);`).join(' ')])
+  wr(['--command', proven.map((sp, i) => `INSERT OR REPLACE INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed) VALUES ('spentany:${subject(i)}.0', ${now}, 1, '${sp}', NULL);`).join(' ')])
   const ops = proven.map((_, i) => `${subject(i)}.0`).join(',')
   const r = await get(APP, `/spent-any?outpoints=${ops}`)
   let sourced = 0

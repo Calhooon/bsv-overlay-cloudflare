@@ -242,7 +242,7 @@ pub const FAMILIES: &[Family] = &[
 ];
 
 /// The probe memo prefixes a txid key reaches (`owed::HOME_SPEND_LATCH_PREFIX`, `owed::PROOF_MINED_LATCH_PREFIX`).
-const PROBE_PREFIXES: [&str; 3] = [
+pub(crate) const PROBE_PREFIXES: [&str; 3] = [
     "",
     crate::owed::HOME_SPEND_LATCH_PREFIX,
     crate::owed::PROOF_MINED_LATCH_PREFIX,
