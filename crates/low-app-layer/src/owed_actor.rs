@@ -1210,6 +1210,17 @@ pub fn closure_for(
     read: &BTreeSet<String>,
     row: &Value,
 ) -> Result<Option<Value>, String> {
+    closure_weighed(keys, read, row).map(|c| c.map(|(_, v)| v))
+}
+
+/// FIX-1045 (bsv-low #1045, the CUT-263 ensemble's C LOW-4): [`closure_for`] with the closure's serialized length, the
+/// one weighing that decides its bound, so the direct pass's [`PASS_CLOSURES_MAX_BYTES`] adds the length measured here
+/// and serializes no closure a second time.
+pub fn closure_weighed(
+    keys: &BTreeSet<String>,
+    read: &BTreeSet<String>,
+    row: &Value,
+) -> Result<Option<(usize, Value)>, String> {
     let hw = hw_of(&row["hw"]);
     let mut not_carried: BTreeSet<String> = keys.difference(read).cloned().collect();
     let mut fams: Vec<Value> = Vec::with_capacity(FAMILIES.len());
@@ -1284,7 +1295,21 @@ pub fn closure_for(
         fams.push(Value::Array(rows));
     }
     let v = json!({"hw": hw, "keys": keys, "notCarried": not_carried, "f": fams});
-    Ok((v.to_string().len() <= CLOSURE_MAX_BYTES).then_some(v))
+    let n = closure_serialized_len(&v);
+    Ok((n <= CLOSURE_MAX_BYTES).then_some((n, v)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// FIX-1045: the closures [`closure_serialized_len`] weighed (the pin counts one a filing).
+    pub static CLOSURE_SERIALIZES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// FIX-1045: a closure's serialized length, the ONE serialization a closure is weighed by.
+pub fn closure_serialized_len(v: &Value) -> usize {
+    #[cfg(test)]
+    CLOSURE_SERIALIZES.with(|c| c.set(c.get() + 1));
+    v.to_string().len()
 }
 
 /// D2-ACTOR-F-FOLD-3: the pass statement's one answer row from the record (ONE call); `None` on a fault (the pass's
@@ -1460,6 +1485,11 @@ pub fn marked_select() -> String {
 /// subject with no bump): a moved height re-reads both families. A `len` row with no mark (one written before the
 /// fold, or bytes whose bump the mark could not place) re-reads. Stated: a re-anchor that keeps the length, the
 /// subject's bump height and its offset changes no fact the mirror holds.
+///
+/// FIX-1045 (bsv-low #1045): the hold also compares the subject's OWN entry in place ([`entry_mark`], `pe` / `te`: a
+/// same-length rewrite that gives the subject a bump or repoints its index re-reads) and the facts decoder's version
+/// ([`TXFACTS_DECODER_VERSION`], `v`); a read whose two families disagree is made again with the bytes
+/// ([`held_read_disagrees`]). What it saves is the hex in the answer (bytes, not calls).
 pub fn marked_select_held() -> String {
     let plain = marked_select();
     let parts: Vec<&str> = plain.split("hex(t.beef)").collect();
@@ -1479,6 +1509,22 @@ pub fn marked_select_held() -> String {
         out.push_str(rest);
     }
     out
+}
+
+#[cfg(test)]
+thread_local! {
+    /// FIX-1045: a pin's stand-in for the held statement (a MUTANT of an arm, to show the apply's re-read fails closed
+    /// when the two arms disagree); unset, [`marked_select_held`].
+    pub static HELD_SQL_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The warm narrowed read's statement ([`marked_select_held`]).
+fn held_select() -> String {
+    #[cfg(test)]
+    if let Some(s) = HELD_SQL_OVERRIDE.with(|o| o.borrow().clone()) {
+        return s;
+    }
+    marked_select_held()
 }
 
 /// D2-ACTOR-G: one BEEF family's bytes in the warm narrowed read: NULL where both of its txid's lengths are the held.
@@ -1510,22 +1556,79 @@ macro_rules! held_bump_mark {
         )
     };
 }
+/// FIX-1045 (bsv-low #1045, the CUT-263 ensemble's B LOW-1): the entry mark `$k` (`pe` or `te`) holds of the bytes
+/// `$b`: a two-element array whose hex at its offset is the bytes' own ([`entry_mark`]: the subject's own entry, its
+/// raw's edge, its bump flag and its bump index). Anything else (absent, `null`, `[]`) re-reads.
+macro_rules! held_entry_mark {
+    ($b:literal, $k:literal) => {
+        concat!(
+            "(json_type(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "')='array' AND json_array_length(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "')=2 AND hex(substr(",
+            $b,
+            ",json_extract(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "[0]'),length(json_extract(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "[1]'))/2))=json_extract(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "[1]'))"
+        )
+    };
+}
+/// FIX-1045 (bsv-low #1045, the CUT-263 ensemble's C LOW-3): THE FACTS DECODER'S VERSION, held in each `len` row
+/// (`v`) and compared by the warm narrowed read: a change of what [`crate::owed_judge::facts_of_beefs`] decodes (a
+/// new field of `TxFacts`, a changed parse) MOVES THIS, and every held txid is then re-read and decoded by the new
+/// build at its game's next narrowed read, with no `JUDGE_VERSION` move. A `len` row with no `v` (written before
+/// FIX-1045) re-reads.
+macro_rules! txfacts_decoder_version {
+    () => {
+        1
+    };
+}
+/// FIX-1045: [`txfacts_decoder_version!`] as a value (the `len` row's `v`).
+pub const TXFACTS_DECODER_VERSION: i64 = txfacts_decoder_version!();
+/// The decoder's version held in the `len` row of the arm's txid (`?7`, [`HELD_BEEF_LENS_SQL`]).
+macro_rules! held_decoder_version {
+    () => {
+        concat!(
+            "json_extract(?7,'$.\"'||t.txid||'\".v')=",
+            txfacts_decoder_version!()
+        )
+    };
+}
 /// D2-ACTOR-G: `pot_beefs`' bytes in the warm narrowed read ([`marked_select_held`]); D2-ACTOR-G-FOLD-1: and the
-/// subject bump's height in place in both families ([`bump_mark`]).
+/// subject bump's height in place in both families ([`bump_mark`]); FIX-1045: and the subject's own entry in place in
+/// both families ([`entry_mark`]), and the facts decoder's version.
 pub const HELD_POT_BEEF_EXPR: &str = concat!(
     "CASE WHEN length(t.beef)=json_extract(?7,'$.\"'||t.txid||'\".p') AND COALESCE((SELECT length(x.beef) FROM transactions x WHERE x.txid=t.txid),-1)=json_extract(?7,'$.\"'||t.txid||'\".t') AND ",
+    held_decoder_version!(),
+    " AND ",
     held_bump_mark!("t.beef", "pb"),
+    " AND ",
+    held_entry_mark!("t.beef", "pe"),
     " AND COALESCE((SELECT ",
     held_bump_mark!("x.beef", "tb"),
+    " AND ",
+    held_entry_mark!("x.beef", "te"),
     " FROM transactions x WHERE x.txid=t.txid),1) THEN NULL ELSE hex(t.beef) END"
 );
 /// D2-ACTOR-G: `transactions`' bytes in the warm narrowed read ([`marked_select_held`]); D2-ACTOR-G-FOLD-1: and the
-/// subject bump's height in place in both families ([`bump_mark`]).
+/// subject bump's height in place in both families ([`bump_mark`]); FIX-1045: and the subject's own entry in place in
+/// both families ([`entry_mark`]), and the facts decoder's version.
 pub const HELD_TRANSACTIONS_BEEF_EXPR: &str = concat!(
     "CASE WHEN length(t.beef)=json_extract(?7,'$.\"'||t.txid||'\".t') AND COALESCE((SELECT length(x.beef) FROM pot_beefs x WHERE x.txid=t.txid),-1)=json_extract(?7,'$.\"'||t.txid||'\".p') AND ",
+    held_decoder_version!(),
+    " AND ",
     held_bump_mark!("t.beef", "tb"),
+    " AND ",
+    held_entry_mark!("t.beef", "te"),
     " AND COALESCE((SELECT ",
     held_bump_mark!("x.beef", "pb"),
+    " AND ",
+    held_entry_mark!("x.beef", "pe"),
     " FROM pot_beefs x WHERE x.txid=t.txid),1) THEN NULL ELSE hex(t.beef) END"
 );
 
@@ -1534,36 +1637,109 @@ pub const HELD_TRANSACTIONS_BEEF_EXPR: &str = concat!(
 /// the varint's hex; `[]` when the subject carries no bump; `null` when the bytes do not parse, name no such
 /// transaction, or the bump's serialization is not found (the hold then re-reads: fail closed).
 pub fn bump_mark(txid: &str, bytes: &[u8]) -> Value {
+    held_marks(txid, bytes).0
+}
+
+/// PURE (FIX-1045, the CUT-263 ensemble's B LOW-1): where `bytes` (a stored BEEF of `txid`) hold the subject's OWN
+/// entry: `[offset, hex]`, the 1-based offset and the hex of the entry's bump marker (`00` for no bump, `01` and the
+/// bump index's varint for one: the same bytes in BEEF V1, after the raw, and V2, before it) with the raw's adjacent
+/// edge (up to [`ENTRY_MARK_RAW_EDGE`] bytes: its last in V1, its first in V2); `null` when the bytes do not parse, the
+/// subject carries no raw, or its entry is not found (re-reads). The bump height alone ([`bump_mark`]) held a rewrite
+/// that keeps the length and the old bump's bytes in place while the subject GAINS a bump or its INDEX moves to
+/// another bump; the entry's marker is the current bytes' word on both.
+pub fn entry_mark(txid: &str, bytes: &[u8]) -> Value {
+    held_marks(txid, bytes).1
+}
+
+/// FIX-1045: the raw's edge an entry mark holds beside the bump marker (an anchor of the subject's own bytes).
+pub const ENTRY_MARK_RAW_EDGE: usize = 32;
+
+/// The two marks of one parse ([`bump_mark`], [`entry_mark`]).
+fn held_marks(txid: &str, bytes: &[u8]) -> (Value, Value) {
     let Ok(b) = overlay_engine::beef_limits::parse_beef(
         bytes,
         &overlay_engine::beef_limits::APP_BEEF_LIMITS,
     ) else {
-        return Value::Null;
+        return (Value::Null, Value::Null);
     };
     let Some(btx) = b.find_txid(txid) else {
-        return Value::Null;
+        return (Value::Null, Value::Null);
     };
-    let Some(bump) = btx.bump_index().and_then(|i| b.bumps.get(i)) else {
-        return json!([]);
+    let bump_index = btx.bump_index();
+    let height = match bump_index.and_then(|i| b.bumps.get(i)) {
+        None if bump_index.is_some() => Value::Null,
+        None => json!([]),
+        Some(bump) => {
+            let bin = bump.to_binary();
+            let vlen = match bump.block_height {
+                0..=0xfc => 1,
+                0xfd..=0xffff => 3,
+                _ => 5,
+            };
+            match find(bytes, &bin) {
+                Some(at) => json!([at + 1, hex::encode_upper(&bytes[at..at + vlen])]),
+                None => Value::Null,
+            }
+        }
     };
-    let bin = bump.to_binary();
-    let h = bump.block_height;
-    let vlen = match h {
-        0..=0xfc => 1,
-        0xfd..=0xffff => 3,
-        _ => 5,
-    };
-    if bin.len() < vlen {
-        return Value::Null;
+    let entry = btx.raw_tx().map_or(Value::Null, |raw| {
+        let mut marker = vec![u8::from(bump_index.is_some())];
+        if let Some(i) = bump_index {
+            let mut w = bsv_rs::primitives::encoding::Writer::new();
+            w.write_var_int(i as u64);
+            marker.extend(w.into_bytes());
+        }
+        let edge = raw.len().min(ENTRY_MARK_RAW_EDGE);
+        let v1 = [raw, marker.as_slice()].concat();
+        let v2 = [marker.as_slice(), raw].concat();
+        if let Some(at) = find(bytes, &v1) {
+            let from = at + raw.len() - edge;
+            json!([from + 1, hex::encode_upper(&bytes[from..at + v1.len()])])
+        } else if let Some(at) = find(bytes, &v2) {
+            json!([
+                at + 1,
+                hex::encode_upper(&bytes[at..at + marker.len() + edge])
+            ])
+        } else {
+            Value::Null
+        }
+    });
+    (height, entry)
+}
+
+/// The first offset of `needle` in `bytes`.
+fn find(bytes: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return None;
     }
-    match bytes.windows(bin.len()).position(|w| w == bin.as_slice()) {
-        Some(at) => json!([at + 1, hex::encode_upper(&bytes[at..at + vlen])]),
-        None => Value::Null,
+    bytes.windows(needle.len()).position(|w| w == needle)
+}
+
+/// PURE (FIX-1045, the CUT-263 ensemble's A LOW-1): a txid of the read whose BEEF rows came back neither all held
+/// (`__beef` NULL) nor all re-read: the two families' arms disagreed.
+pub fn held_read_disagrees(read: &[Vec<Value>]) -> bool {
+    let mut seen: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+    for (f, rows) in FAMILIES.iter().zip(read) {
+        if !f.beef {
+            continue;
+        }
+        for r in rows {
+            let Some(txid) = r["txid"].as_str() else {
+                continue;
+            };
+            let e = seen.entry(txid.to_ascii_lowercase()).or_default();
+            if r["__beef"].is_null() {
+                e.0 = true;
+            } else {
+                e.1 = true;
+            }
+        }
     }
+    seen.values().any(|(held, read)| *held && *read)
 }
 
 /// D2-ACTOR-G: the BEEF lengths the mirror last read of `?1`'s txids (the `len` rows of `txfacts`, written by
-/// [`write_round_of`] beside the facts they were decoded from), as `{txid: {"p", "t"}}`.
+/// [`write_round_of`] beside the facts they were decoded from), as `{txid: {"p", "t", "pb", "tb", "pe", "te", "v"}}`.
 pub const HELD_BEEF_LENS_SQL: &str = "SELECT json_group_object(txid,json(facts)) AS m FROM txfacts WHERE src='len' AND txid IN (SELECT value FROM json_each(?1))";
 /// D2-ACTOR-G: the `len` rows of `?1`'s txids dropped (a BEEF re-read, gone, or carried as facts by a closure).
 pub const HELD_BEEF_LENS_DELETE_SQL: &str =
@@ -1636,7 +1812,7 @@ async fn read_marked(
         // D2-ACTOR-G: the warm narrowed read skips the BEEFs the mirror holds
         (None, Some(lens)) => {
             binds.push(Bind::Text(lens.into()));
-            marked_select_held()
+            held_select()
         }
         (None, None) => marked_select(),
     };
@@ -1869,8 +2045,9 @@ fn write_round_of(
     // held beside its facts (`txfacts` `len`), and a closure's (facts, no bytes) drops it.
     let mut skipped: BTreeSet<String> = BTreeSet::new();
     let mut lens: BTreeMap<String, (i64, i64)> = BTreeMap::new();
-    // D2-ACTOR-G-FOLD-1 (LOW-1): each read BEEF's subject bump height in place ([`bump_mark`]), `pb` and `tb`
-    let mut marks: BTreeMap<String, (Value, Value)> = BTreeMap::new();
+    // D2-ACTOR-G-FOLD-1 (LOW-1): each read BEEF's subject bump height in place ([`bump_mark`]), `pb` and `tb`;
+    // FIX-1045: and its own entry in place ([`entry_mark`]), `pe` and `te`
+    let mut marks: BTreeMap<String, [Value; 4]> = BTreeMap::new();
     for (f, rows) in FAMILIES.iter().zip(read) {
         if !f.beef {
             continue;
@@ -1884,18 +2061,25 @@ fn write_round_of(
             }
             match r["__beef"].as_str() {
                 Some(h) => {
-                    let mark = hex::decode(h)
-                        .map(|b| bump_mark(&txid, &b))
-                        .unwrap_or(Value::Null);
-                    let m = marks.entry(txid.clone()).or_insert((json!([]), json!([])));
+                    let (height, entry) = hex::decode(h)
+                        .map(|b| held_marks(&txid, &b))
+                        .unwrap_or((Value::Null, Value::Null));
+                    let m = marks.entry(txid.clone()).or_insert([
+                        json!([]),
+                        json!([]),
+                        json!([]),
+                        json!([]),
+                    ]);
                     let e = lens.entry(txid).or_insert((-1, -1));
                     let n = (h.len() / 2) as i64;
                     if f.table == "pot_beefs" {
                         e.0 = n;
-                        m.0 = mark;
+                        m[0] = height;
+                        m[2] = entry;
                     } else {
                         e.1 = n;
-                        m.1 = mark;
+                        m[1] = height;
+                        m[3] = entry;
                     }
                 }
                 None => {
@@ -1923,11 +2107,9 @@ fn write_round_of(
                     Bind::Text(txid.clone()),
                     Bind::Text("len".into()),
                     Bind::Text({
-                        let (pb, tb) = marks
-                            .get(txid)
-                            .cloned()
-                            .unwrap_or((Value::Null, Value::Null));
-                        json!({"p": p, "t": t, "pb": pb, "tb": tb}).to_string()
+                        let [pb, tb, pe, te] = marks.get(txid).cloned().unwrap_or_default();
+                        json!({"p": p, "t": t, "pb": pb, "tb": tb, "pe": pe, "te": te, "v": TXFACTS_DECODER_VERSION})
+                            .to_string()
                     }),
                     Bind::Int(seq),
                 ],
@@ -2420,7 +2602,20 @@ async fn apply_counted<R: SqlPort, L: SqlPort, O: Outside>(
             })
             .unwrap_or_else(|| "{}".to_string());
         let t = local.now_ms();
-        let marked = read_marked(record, &me, &games, &n, None, Some(&lens)).await?;
+        let mut marked = read_marked(record, &me, &games, &n, None, Some(&lens)).await?;
+        // FIX-1045 (bsv-low #1045, the CUT-263 ensemble's A LOW-1): a txid one of whose BEEF rows came back held and
+        // the other re-read is a DISAGREEMENT of the two arms (they compare the same things today, so never on the
+        // shipped statement): FAIL CLOSED, the read made again with every BEEF's bytes, never stale facts kept beside
+        // new ones.
+        if marked
+            .as_ref()
+            .is_some_and(|m| held_read_disagrees(&m.rows))
+        {
+            record.log(&format!(
+                "[owed-actor] {me}: the held read's two BEEF families disagree: read again with the bytes"
+            ));
+            marked = read_marked(record, &me, &games, &n, None, None).await?;
+        }
         report.read_ms += local.now_ms().saturating_sub(t);
         let (marks, read) = match marked {
             Some(m) => {
