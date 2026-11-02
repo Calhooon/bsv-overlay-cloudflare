@@ -739,15 +739,27 @@ pub async fn plan_with(db: &impl SqlPort, ev: &OwedEvent, expand: bool) -> Resul
     if ev.source == owed_event::TXFACTS {
         return Ok(Plan::default());
     }
-    let limit = ROUTE_READ_LIMIT as i64;
     let now = db.now_ms() as i64;
     // NEW2-M1 (the second delta lens): the unheld marks and the held count, one batch
     let mut read = db
         .run_batch(plan_read_stmts(ev, now, false))
         .await?
         .into_iter();
-    let mut marks = read.next().map(|o| o.rows).unwrap_or_default();
+    let marks = read.next().map(|o| o.rows).unwrap_or_default();
     let held_subjects = held_count(read.next());
+    plan_finish(db, marks, held_subjects, expand, now).await
+}
+
+/// A plan from its read (the marks and the held count): a wanted envelope (the read's own mark, no game) expanded
+/// first when `expand`, then routed by its identity. [`plan_with`] and [`plans_many`] share it.
+async fn plan_finish(
+    db: &impl SqlPort,
+    mut marks: Vec<Value>,
+    held_subjects: usize,
+    expand: bool,
+    now: i64,
+) -> Result<Plan, String> {
+    let limit = ROUTE_READ_LIMIT as i64;
     let mut more = marks.len() >= ROUTE_READ_LIMIT;
     // A wanted envelope (the read's own mark, no game) is expanded first, then routed by its identity.
     let envelopes: Vec<(String, i64)> = marks
@@ -776,6 +788,115 @@ pub async fn plan_with(db: &impl SqlPort, ev: &OwedEvent, expand: bool) -> Resul
         marks.extend(expanded);
     }
     Ok(plan_of_marks(&marks, held_subjects, more))
+}
+
+/// FIX-954 (bsv-low #954, the flood leg): the consumer batch's plans, every message's marks and held count in ONE D1
+/// batch (they were one round trip a message, in a row: sixteen round trips before the batch's first judge), then each
+/// plan finished as [`plan_with`] finishes it (a wanted envelope expanded, `expand`). A batch that faults is the
+/// whole batch's fault (the caller judges it one message at a time, as a faulted plan read was).
+pub async fn plans_many(
+    db: &impl SqlPort,
+    evs: &[&OwedEvent],
+    expand: bool,
+) -> Result<Vec<Plan>, String> {
+    let now = db.now_ms() as i64;
+    let stmts: Vec<Stmt> = evs
+        .iter()
+        .filter(|ev| ev.source != owed_event::TXFACTS)
+        .flat_map(|ev| plan_read_stmts(ev, now, false))
+        .collect();
+    let outs = match stmts.is_empty() {
+        true => Vec::new(),
+        false => db.run_batch(stmts).await?,
+    };
+    let mut outs = outs.into_iter();
+    let mut plans = Vec::with_capacity(evs.len());
+    for ev in evs {
+        if ev.source == owed_event::TXFACTS {
+            plans.push(Plan::default());
+            continue;
+        }
+        let (Some(marks), held) = (outs.next(), outs.next()) else {
+            return Err("the plans' batch answered short".into());
+        };
+        plans.push(plan_finish(db, marks.rows, held_count(held), expand, now).await?);
+    }
+    Ok(plans)
+}
+
+/// FIX-954: how many of a consumer batch's frames are ingested at once (each the tracker's write, about three D1
+/// round trips: the live hold, the stored row, the write). They were ingested one after another, a batch of sixteen
+/// word frames about forty-eight round trips before its first judge; at eight, two waves. Frames of ONE txid stay in
+/// message order, one after another ([`frame_groups`]).
+pub const INGEST_FRAMES_AT_ONCE: usize = 8;
+
+/// FIX-954: the consumer's ingest of a `word` event's frame, over a port so the pins run the batch's ingest as
+/// shipped ([`ingest_frames`]).
+#[allow(async_fn_in_trait)]
+pub trait FrameIngest {
+    async fn ingest_frame(&self, frame: &Value) -> Result<(), String>;
+}
+
+/// PURE (FIX-954): the batch's frame-carrying messages grouped by the frame's txid (lowercased), each group in message
+/// order, the groups in the order of their first message; a frame naming no txid is a group of its own.
+pub fn frame_groups(evs: &[&OwedEvent]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<(Option<String>, Vec<usize>)> = Vec::new();
+    for (i, ev) in evs.iter().enumerate() {
+        let Some(frame) = ev.frame() else {
+            continue;
+        };
+        let txid = frame["txid"].as_str().map(str::to_ascii_lowercase);
+        match groups.iter_mut().find(|(t, _)| t.is_some() && *t == txid) {
+            Some((_, g)) => g.push(i),
+            None => groups.push((txid, vec![i])),
+        }
+    }
+    groups.into_iter().map(|(_, g)| g).collect()
+}
+
+/// FIX-954: the batch's frames ingested, [`INGEST_FRAMES_AT_ONCE`] txids at a time, each txid's frames in message
+/// order. Every group runs to its end (an ingest is the tracker's idempotent write); the first fault is answered, and
+/// the caller then judges the batch one message at a time (each message's own ingest again), as before. Each frame's
+/// `word` note is taken back right after its own ingest landed ([`publish::forget`]), as main's loop did.
+pub async fn ingest_frames(port: &impl FrameIngest, evs: &[&OwedEvent]) -> Result<(), String> {
+    use futures_util::StreamExt as _;
+    let results: Vec<Result<(), String>> =
+        futures_util::stream::iter(frame_groups(evs).into_iter().map(|group| async move {
+            for i in group {
+                if let Some(frame) = evs[i].frame() {
+                    port.ingest_frame(frame).await?;
+                    // the frame's `word` note taken back at once (the message routes its own pair), as main's loop did
+                    publish::forget(&evs[i].source, &evs[i].source_key);
+                }
+            }
+            Ok(())
+        }))
+        .buffer_unordered(INGEST_FRAMES_AT_ONCE)
+        .collect()
+        .await;
+    results.into_iter().collect()
+}
+
+/// FIX-954: the coalesced batch's steps before its judge, over ports so the pins run them as shipped: the frames
+/// ingested ([`ingest_frames`]), the plans read in one batch ([`plans_many`], the wanted envelopes expanded), then
+/// [`batch_core`]. What is judged is unchanged: the judge reads the record at its own time, after every frame landed.
+pub async fn consume_batch_with<S, I, D, F, W>(
+    db: &S,
+    ingest: &I,
+    evs: &[&OwedEvent],
+    make: impl FnOnce(Option<crate::owed_actor::EventCtx>, bool) -> F,
+    wall: W,
+) -> Result<BatchOutcome, String>
+where
+    S: SqlPort,
+    I: FrameIngest,
+    D: owed_judge::JudgeDb,
+    F: std::future::Future<Output = Result<D, String>>,
+    W: std::future::Future<Output = ()>,
+{
+    ingest_frames(ingest, evs).await?;
+    let plans = plans_many(db, evs, true).await?;
+    batch_core(db, evs, &plans, make, wall).await
 }
 
 /// FIX-959 (bsv-low #959, the warm read's (a)): an event's plan read, the marks then the held count (two statements);
@@ -2227,18 +2348,8 @@ where
 /// message's bound, under the batch's one wall, each message's fate by its own plan. `Err`: the caller handles the
 /// batch one message at a time (each message's fault memo, its own wall).
 pub async fn consume_batch(env: &worker::Env, evs: &[&OwedEvent]) -> Result<BatchOutcome, String> {
-    for ev in evs {
-        if let Some(frame) = ev.frame() {
-            ingest_frame(env, frame).await?;
-            publish::forget(&ev.source, &ev.source_key);
-        }
-    }
     crate::schema::ensure_latch_columns(env).await;
     let sql = crate::routes::D1Sql::of(env).map_err(|e| e.to_string())?;
-    let mut plans = Vec::with_capacity(evs.len());
-    for ev in evs {
-        plans.push(plan(&sql, ev).await?);
-    }
     let make = |ctx: Option<crate::owed_actor::EventCtx>, fresh: bool| async move {
         let tip = tip_memoised(env, fresh).await;
         let mut judge =
@@ -2250,7 +2361,9 @@ pub async fn consume_batch(env: &worker::Env, evs: &[&OwedEvent]) -> Result<Batc
         Ok(judge)
     };
     let wall = worker::Delay::from(std::time::Duration::from_millis(CONSUMER_MESSAGE_WALL_MS));
-    let outcome = batch_core(&sql, evs, &plans, make, wall).await?;
+    // FIX-954: the frames (txids at once), then the plans in one batch, then the judge ([`consume_batch_with`]). The
+    // latch columns' ensure (idempotent schema) now runs before the ingests; no ingest reads it.
+    let outcome = consume_batch_with(&sql, &EnvIngest(env), evs, make, wall).await?;
     let mut continued = false;
     for (ev, fate) in evs.iter().zip(&outcome.fates) {
         if matches!(
@@ -2270,6 +2383,14 @@ pub async fn consume_batch(env: &worker::Env, evs: &[&OwedEvent]) -> Result<Batc
     // NEW5-L2: only the batch's own publishes (its continuations, its frames' words) are the queue's alone.
     let _ = publish::take_direct_where(|held| evs.iter().any(|ev| consumer_owns(ev, held)));
     Ok(outcome)
+}
+
+/// FIX-954: the consumer's frame ingest over the Worker's bindings ([`ingest_frame`]).
+struct EnvIngest<'a>(&'a worker::Env);
+impl FrameIngest for EnvIngest<'_> {
+    async fn ingest_frame(&self, frame: &Value) -> Result<(), String> {
+        ingest_frame(self.0, frame).await
+    }
 }
 
 /// The Worker's `queue` handler: the `owed-events` consumer, or its dead letter queue's park.
