@@ -32,13 +32,24 @@ pub const PHASE_C_NAME: &str = "owed-actor:phase-c";
 pub const PHASE_C_READ_SQL: &str =
     "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:phase-c'";
 
-/// The games a compare judges ([`FRESH_COMPARE_GAMES_MAX`]): the rows' games first (sorted), then the identity's
-/// games in the order given (newest first); `(picked, total)`, `total` the union's size.
+/// The games a compare judges ([`FRESH_COMPARE_GAMES_MAX`]): the games of the identity's PENDING re-reads first
+/// (`first`, FIX-1056: a pending outpoint is re-read when its game is judged, so its game is judged before any other),
+/// then the rows' games (sorted), then the identity's games in the order given (newest first); `(picked, total)`,
+/// `total` the union's size.
 pub fn pick_games(
+    first: &[String],
     rows: &[&[Value]],
     identity_games: &[String],
     max: usize,
 ) -> (Vec<String>, usize) {
+    let mut picked: Vec<String> = Vec::new();
+    let mut all: BTreeSet<String> = BTreeSet::new();
+    for g in first {
+        let g = g.to_ascii_lowercase();
+        if !g.is_empty() && all.insert(g.clone()) {
+            picked.push(g);
+        }
+    }
     let mut from_rows: BTreeSet<String> = BTreeSet::new();
     for side in rows {
         for r in side.iter() {
@@ -47,8 +58,11 @@ pub fn pick_games(
             }
         }
     }
-    let mut picked: Vec<String> = from_rows.iter().cloned().collect();
-    let mut all: BTreeSet<String> = from_rows;
+    for g in from_rows {
+        if all.insert(g.clone()) {
+            picked.push(g);
+        }
+    }
     for g in identity_games {
         let g = g.to_ascii_lowercase();
         if all.insert(g.clone()) {
@@ -169,6 +183,9 @@ pub async fn fresh_compare(
                 vec![Bind::Text(me.clone()), Bind::Int(4_096)],
             ),
             Stmt::new(PHASE_C_READ_SQL, vec![]),
+            // FIX-1056: the identity's stored compare, read once here: its pending outpoints' games are judged first
+            // ([`pick_games`]), and the re-read classifies against it ([`CompareRow::prior`], no second read).
+            Stmt::new(PRIORS_SQL, vec![Bind::Text(json!([me]).to_string())]),
         ])
         .await?
         .into_iter();
@@ -185,12 +202,21 @@ pub async fn fresh_compare(
         .and_then(|r| r["cursor"].as_str())
         .and_then(|c| serde_json::from_str(c).ok())
         .unwrap_or(Value::Null);
+    let prior = prior_of(&next()).unwrap_or(json!([]));
+    let pending_games: Vec<String> = prior
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["pendingReread"] == true)
+        .filter_map(|p| p["gameId"].as_str().map(str::to_string))
+        .collect();
     let actor_rows: Vec<Value> = actor
         .as_ref()
         .ok()
         .and_then(|a| a["rows"].as_array().cloned())
         .unwrap_or_default();
     let (games, total) = pick_games(
+        &pending_games,
         &[&actor_rows, &stored],
         &identity_games,
         FRESH_COMPARE_GAMES_MAX,
@@ -222,6 +248,12 @@ pub async fn fresh_compare(
     view["d1"]["fresh"] = json!(true);
     view["d1"]["tip"] = json!(db.tip());
     view["d1"]["games"] = json!({"judged": games.len(), "total": total, "partial": partial});
+    if partial {
+        // FIX-1056: the games a partial compare judged, so a pending outpoint of a game it left out stays pending.
+        view["d1"]["games"]["judgedGames"] = json!(games);
+    }
+    // FIX-1056: the identity's stored compare outpoints as read before this compare (the re-read's prior).
+    view["storedCompare"] = prior;
     let stored_marked: Vec<Value> = stored
         .iter()
         .map(|r| {
@@ -272,6 +304,14 @@ pub struct CompareRow {
     /// FIX-1046-FOLD-1 (MEDIUM-1): each outpoint on either side, the print of its D1 row and of its actor row
     /// ([`row_print`], `absent` for no row): what the re-read reads to tell which side moved. Not stored.
     pub prints: std::collections::BTreeMap<String, (String, String)>,
+    /// FIX-1056: each outpoint on either side, its row's game (the D1 row's, else the actor's). Not stored.
+    pub games: std::collections::BTreeMap<String, String>,
+    /// FIX-1056: the games a PARTIAL compare judged (`None`: every game of the identity was judged). A pending outpoint
+    /// whose game is not here was not read, and stays pending. Not stored.
+    pub judged_games: Option<BTreeSet<String>>,
+    /// FIX-1056: the identity's stored compare outpoints as [`fresh_compare`] read them (`None`: not read, the re-read
+    /// reads them). Not stored.
+    pub prior: Option<Value>,
 }
 
 /// PURE: the stored row of one [`fresh_compare`] answer (`Ok`), or of its fault. An actor that did not answer, or
@@ -290,6 +330,9 @@ pub fn compare_row_of(identity: &str, now: i64, view: Result<&Value, &str>) -> C
         fault: Some(fault),
         partial: false,
         prints: Default::default(),
+        games: Default::default(),
+        judged_games: None,
+        prior: None,
     };
     let view = match view {
         Ok(v) => v,
@@ -330,6 +373,7 @@ pub fn compare_row_of(identity: &str, now: i64, view: Result<&Value, &str>) -> C
     // FIX-1046-FOLD-1 (LOW-1, MEDIUM-1's cut): every difference is kept here, uncut; [`classify_reread`] cuts the
     // stored list after it has classified the whole set, so no difference is classed by its absence from a cut list.
     let mut prints: std::collections::BTreeMap<String, (String, String)> = Default::default();
+    let mut games: std::collections::BTreeMap<String, String> = Default::default();
     let side = |v: &Value| v.as_array().cloned().unwrap_or_default();
     for (k, rows) in [side(&view["d1"]["rows"]), side(&view["actor"]["rows"])]
         .iter()
@@ -339,6 +383,11 @@ pub fn compare_row_of(identity: &str, now: i64, view: Result<&Value, &str>) -> C
             let Some(o) = r["outpoint"].as_str() else {
                 continue;
             };
+            if let Some(g) = r["gameId"].as_str().filter(|g| !g.is_empty()) {
+                games
+                    .entry(o.to_string())
+                    .or_insert_with(|| g.to_ascii_lowercase());
+            }
             let e = prints
                 .entry(o.to_string())
                 .or_insert_with(|| (ABSENT_PRINT.into(), ABSENT_PRINT.into()));
@@ -362,6 +411,17 @@ pub fn compare_row_of(identity: &str, now: i64, view: Result<&Value, &str>) -> C
         fault: None,
         partial: view["d1"]["games"]["partial"] == true,
         prints,
+        games,
+        judged_games: (view["d1"]["games"]["partial"] == true).then(|| {
+            view["d1"]["games"]["judgedGames"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .collect()
+        }),
+        prior: view.get("storedCompare").cloned(),
     }
 }
 
@@ -515,6 +575,9 @@ pub const COMPARE_ROW_STATE_MAX: usize = 128;
 ///   (or a prior with no prints): `bothMoved`, COUNTED.
 /// - The whole differing set is classified before the stored list is cut, so an outpoint is never classed by its
 ///   absence from a cut list; `diffCount` counts every counted difference, listed or not (LOW-1).
+/// - FIX-1056 (bsv-low #1056, the second review's LOW-1): a prior `pendingReread` outpoint whose game a PARTIAL
+///   compare did not judge (`judged_games`) was not read on either side: it stays `pendingReread` as stored (never a
+///   clear, never counted), and the next compare judges its game first. Each pending entry carries its `gameId`.
 ///
 /// `heldByLagCount` is unchanged (the marks and the tips). A fault row is returned as it is.
 pub fn classify_reread(
@@ -562,13 +625,32 @@ pub fn classify_reread(
             o["seenAtMs"] = json!(pending_since.unwrap_or(now));
             o["d1At"] = pending_prior.map_or(json!(d1), |p| p["d1At"].clone());
             o["actorAt"] = pending_prior.map_or(json!(actor), |p| p["actorAt"].clone());
+            if let Some(g) = row.games.get(&key) {
+                o["gameId"] = json!(g);
+            }
             pending.push(o);
         }
     }
+    // FIX-1056 (LOW-1): the pending outpoints whose game this read did not judge (a partial compare left it out):
+    // neither side was read, so nothing about them is a clear. Each stays `pendingReread` exactly as stored, and its
+    // game is judged first by the next compare ([`pick_games`]). One stored before FIX-1056 names no game: under a
+    // partial compare it cannot be known judged, so its state is dropped (counted neither way; a difference that still
+    // stands is seen afresh when its game is judged).
+    let mut unread: Vec<Value> = Vec::new();
     for p in prior.iter().filter(|p| p["pendingReread"] == true) {
         let key = p["outpoint"].as_str().unwrap_or_default();
         if current.iter().any(|o| o["outpoint"] == key) {
             continue;
+        }
+        if let Some(judged) = &row.judged_games {
+            match p["gameId"].as_str() {
+                Some(g) if judged.contains(&g.to_ascii_lowercase()) => {}
+                Some(_) => {
+                    unread.push(p.clone());
+                    continue;
+                }
+                None => continue,
+            }
         }
         let (d1_now, actor_now) = print_of(key);
         let (d1_at, actor_at) = (p["d1At"].as_str(), p["actorAt"].as_str());
@@ -609,6 +691,13 @@ pub fn classify_reread(
             stateful.push(o);
         }
     }
+    // FIX-1056: an unread pending outpoint keeps its state while there is room; past the bound it is dropped, never
+    // counted (it was not read).
+    for o in unread {
+        if stateful.len() < COMPARE_ROW_STATE_MAX {
+            stateful.push(o);
+        }
+    }
     let mut out: Vec<Value> = Vec::new();
     let mut kept_state = 0usize;
     for o in stateful.into_iter().chain(moved).chain(named).chain(held) {
@@ -637,8 +726,9 @@ fn prior_of(rows: &[Value]) -> Option<Value> {
 }
 
 /// FIX-1046: one compare's row classified ([`classify_reread`]). A fault row is returned as it is and reads nothing;
-/// any other row first reads the identity's prior stored row, one statement ([`PRIORS_SQL`]), so a tick whose
-/// compares fault (no actor bound, not bootstrapped) costs no statement more than before.
+/// any other row classifies against the prior [`fresh_compare`] read in its own batch (FIX-1056), or, a row without
+/// one, first reads the identity's prior stored row, one statement ([`PRIORS_SQL`]), so a tick whose compares fault (no
+/// actor bound, not bootstrapped) costs no statement more than before.
 async fn classified(
     db: &impl SqlPort,
     raw: CompareRow,
@@ -647,6 +737,9 @@ async fn classified(
 ) -> Result<CompareRow, String> {
     if raw.fault.is_some() {
         return Ok(raw);
+    }
+    if let Some(prior) = raw.prior.clone() {
+        return Ok(classify_reread(raw, Some(&prior), now, window));
     }
     let rows = db
         .run_batch(vec![Stmt::new(
@@ -1258,8 +1351,13 @@ async fn ring_tick_inner<J: JudgeDb>(
         }
     }
     if per_tick == 0 || resting || report.stopped.is_some() {
-        if !resting && !report.rereads.is_empty() && report.stopped == Some("statements") {
+        if !resting
+            && !report.rereads.is_empty()
+            && matches!(report.stopped, Some("statements") | Some("wall"))
+        {
             // FIX-1046-FOLD-1 (LOW-3): the re-reads spent the tick; the forward walk goes first next tick.
+            // FIX-1056 (the second review's LOW-2): a stop on the WALL inside the re-reads owes it exactly as a stop on
+            // the statements does (slow re-reads, an actor out of reach, are bounded by the wall alone).
             ring["forwardOwed"] = json!(true);
         }
         if report.stopped.is_none() {
@@ -1436,16 +1534,21 @@ fn queue_json(queue: &[(String, i64)]) -> Value {
         .collect::<Vec<_>>())
 }
 
-/// `owed_actor_compare_held_by_apply_total`: one identity's cleared outpoints, written as its row is written
-/// (FIX-1046-FOLD-1, LOW-4: a tick that dies after a row keeps that row's count; none when none). Best effort, as
-/// every counter.
+/// `owed_actor_compare_held_by_apply_total` and `owed_actor_compare_judge_moved_total` (FIX-1056, the second review's
+/// NOTE-1: a judge-side clear lives one revolution on its row; the counter keeps it): one identity's cleared outpoints
+/// by side, written as its row is written (FIX-1046-FOLD-1, LOW-4: a tick that dies after a row keeps that row's
+/// counts; none when none). Best effort, as every counter.
 async fn held_by_apply_counted(m: &impl SqlPort, row: &CompareRow) {
-    if row.held_by_apply() > 0 {
-        m.counters(vec![(
-            super::COUNTERS[35].to_string(),
-            row.held_by_apply() as u64,
-        )])
-        .await;
+    let counts: Vec<(String, u64)> = [
+        (super::COUNTERS[35], row.held_by_apply()),
+        (super::COUNTERS[36], row.judge_moved()),
+    ]
+    .into_iter()
+    .filter(|(_, n)| *n > 0)
+    .map(|(c, n)| (c.to_string(), n as u64))
+    .collect();
+    if !counts.is_empty() {
+        m.counters(counts).await;
     }
 }
 
@@ -1653,19 +1756,20 @@ pub async fn compare_now(db: &impl JudgeDb, identity: &str, now: i64) -> Result<
     let (row, window) = if raw.fault.is_some() {
         (raw, None)
     } else {
-        let mut read = db
-            .run_batch(vec![
-                Stmt::new(VISIBILITY_READ_SQL, vec![]),
-                Stmt::new(
-                    PRIORS_SQL,
-                    vec![Bind::Text(json!([raw.identity]).to_string())],
-                ),
-            ])
-            .await?
-            .into_iter()
-            .map(|o| o.rows);
+        // FIX-1056: the prior [`fresh_compare`] read in its own batch is used; a row without one reads it here.
+        let mut stmts = vec![Stmt::new(VISIBILITY_READ_SQL, vec![])];
+        if raw.prior.is_none() {
+            stmts.push(Stmt::new(
+                PRIORS_SQL,
+                vec![Bind::Text(json!([raw.identity]).to_string())],
+            ));
+        }
+        let mut read = db.run_batch(stmts).await?.into_iter().map(|o| o.rows);
         let window = reread_window_of(&read.next().unwrap_or_default(), now);
-        let prior = prior_of(&read.next().unwrap_or_default());
+        let prior = match raw.prior.clone() {
+            Some(p) => Some(p),
+            None => prior_of(&read.next().unwrap_or_default()),
+        };
         (
             classify_reread(raw, prior.as_ref(), now, window),
             Some(window),
