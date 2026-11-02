@@ -12250,7 +12250,12 @@ async fn fix986c2_c_the_rings_row_is_the_routes_compare() {
     assert_eq!(json!(row.4), route["digests"]["actor"]);
     // The row of `compare_row_of` over the route's view is the ring's, field for field.
     let of_route = compare::compare_row_of(&target, NOW_MS as i64, Ok(&route));
-    assert_eq!(of_route.outpoints, outpoints);
+    // FIX-1056-FOLD-1: the classified (stored) entry also names its game; the raw row's carries no state.
+    let mut ungamed = outpoints.clone();
+    for o in ungamed.as_array_mut().unwrap() {
+        o.as_object_mut().unwrap().remove("gameId");
+    }
+    assert_eq!(of_route.outpoints, ungamed);
     assert_eq!(of_route.diff_count, Some(row.0));
     // The POST re-compare writes the same.
     let posted = compare::compare_now(&port, &target, NOW_MS as i64 + 1)
@@ -12559,6 +12564,9 @@ impl compare::RingCompare for Fix998Weighted<'_> {
             games: Default::default(),
             judged_games: None,
             prior: None,
+            unjudged: Default::default(),
+            next_offset: 0,
+            cleared: None,
         }
     }
 }
@@ -22423,5 +22431,291 @@ mod fix1056 {
             &json!({crate::owed_actor::COUNTERS[36]: 1}),
         );
         assert_eq!(view["judgeMovedDiffs"], json!(1));
+    }
+
+    /// [`raw`] with the outpoints either side holds in a game the partial compare did not judge.
+    fn raw_u(
+        d1: &[(&str, &str, i64)],
+        actor: &[(&str, &str, i64)],
+        now: i64,
+        judged: &[&str],
+        unjudged: &[&str],
+    ) -> compare::CompareRow {
+        let mut r = raw(d1, actor, now, Some(judged));
+        r.unjudged = unjudged.iter().map(|o| o.to_string()).collect();
+        r
+    }
+
+    /// (fix1056f_m1) THE REVIEW'S MEDIUM-1: A COUNTED DIFFERENCE OF A GAME A PARTIAL COMPARE DID NOT JUDGE IS CARRIED.
+    /// `bb:0` (actor-only, game `g64`) is seen pending, then counted at its re-read. A partial compare that judged `g1`
+    /// alone reads neither side of it: carried counted and unchanged (`diffCount` 1), as many compares as it takes; a
+    /// compare that judges `g64` and finds both sides equal ends it. An entry stored before the fold (no `gameId`) is
+    /// carried while no side is read in a judged game, and ends when one is. RED on dae3fed9 (the review's lens pin
+    /// `rv1056_r1`: `left: Some(0) right: Some(1)`, outpoints `[]`).
+    #[test]
+    fn fix1056f_m1_a_counted_difference_of_an_unjudged_game_is_carried() {
+        let t = NOW_MS as i64;
+        let first = compare::classify_reread(raw(&[], &[("bb:0", "g64", 2)], t, None), None, t, W);
+        assert_eq!(first.pending_reread(), 1);
+        let counted = compare::classify_reread(
+            raw(&[], &[("bb:0", "g64", 2)], t + 2 * W, None),
+            Some(&first.outpoints),
+            t + 2 * W,
+            W,
+        );
+        assert_eq!(counted.diff_count, Some(1), "counted at its re-read");
+        assert_eq!(
+            of(&counted, "bb:0")["gameId"],
+            json!("g64"),
+            "a counted entry names its game"
+        );
+        let mut prior = counted.outpoints.clone();
+        for k in 3..6 {
+            let later = compare::classify_reread(
+                raw(&[], &[], t + k * W, Some(&["g1"])),
+                Some(&prior),
+                t + k * W,
+                W,
+            );
+            assert_eq!(
+                later.diff_count,
+                Some(1),
+                "a counted difference the compare did not judge is no clear: {}",
+                later.outpoints
+            );
+            assert_eq!(
+                of(&later, "bb:0"),
+                of(&counted, "bb:0"),
+                "carried as stored"
+            );
+            prior = later.outpoints.clone();
+        }
+        // The same entry when an actor row of it sits in an unjudged game, whatever game the entry names.
+        let moved = compare::classify_reread(
+            raw_u(&[], &[], t + 6 * W, &["g64"], &["bb:0"]),
+            Some(&prior),
+            t + 6 * W,
+            W,
+        );
+        assert_eq!(moved.diff_count, Some(1), "{}", moved.outpoints);
+        // A compare that judges g64 and finds both sides equal: the clear.
+        let judged = compare::classify_reread(
+            raw(
+                &[("bb:0", "g64", 2)],
+                &[("bb:0", "g64", 2)],
+                t + 7 * W,
+                Some(&["g64"]),
+            ),
+            Some(&prior),
+            t + 7 * W,
+            W,
+        );
+        assert_eq!(judged.diff_count, Some(0), "{}", judged.outpoints);
+        // An entry stored before the fold names no game: carried until a side is read in a judged game.
+        let mut old = counted.outpoints.clone();
+        old[0].as_object_mut().unwrap().remove("gameId");
+        let carried = compare::classify_reread(
+            raw(&[], &[], t + 3 * W, Some(&["g1"])),
+            Some(&old),
+            t + 3 * W,
+            W,
+        );
+        assert_eq!(carried.diff_count, Some(1), "{}", carried.outpoints);
+        let read = compare::classify_reread(
+            raw(
+                &[("bb:0", "g1", 2)],
+                &[("bb:0", "g1", 2)],
+                t + 3 * W,
+                Some(&["g1"]),
+            ),
+            Some(&old),
+            t + 3 * W,
+            W,
+        );
+        assert_eq!(read.diff_count, Some(0), "{}", read.outpoints);
+    }
+
+    /// (fix1056f_m2) THE REVIEW'S MEDIUM-2 (its lens pin `rv1056_r4`): 33 STANDING DIFFERENCES AND 8 JUDGE-SIDE CLEARS.
+    /// Each clear is counted (`judge_moved()` 8, the counter's source), stays counted in `diffCount` (41), and is kept
+    /// on the stored list past the 32 it names with their fields (so the served class sees it). RED on dae3fed9:
+    /// `judge_moved()` 0 (the clears fell past the cut).
+    #[test]
+    fn fix1056f_m2_judge_moved_past_the_cut_is_counted_whole() {
+        let t = NOW_MS as i64;
+        let names: Vec<String> = (0..41).map(|i| format!("{i:02x}:0")).collect();
+        let actor: Vec<(&str, &str, i64)> = names.iter().map(|o| (o.as_str(), "g1", 2)).collect();
+        let first = compare::classify_reread(raw(&[], &actor, t, None), None, t, W);
+        assert_eq!(first.pending_reread(), 41);
+        let d1: Vec<(&str, &str, i64)> =
+            names[33..].iter().map(|o| (o.as_str(), "g1", 2)).collect();
+        let later = compare::classify_reread(
+            raw(&d1, &actor, t + 2 * W, None),
+            Some(&first.outpoints),
+            t + 2 * W,
+            W,
+        );
+        assert_eq!(
+            later.diff_count,
+            Some(41),
+            "33 standing + 8 judgeMoved counted"
+        );
+        assert_eq!(
+            later.judge_moved(),
+            8,
+            "the counter's source names every judgeMoved clear"
+        );
+        let flagged = later
+            .outpoints
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["judgeMoved"] == true)
+            .count();
+        assert_eq!(flagged, 8, "every clear kept on the stored list");
+        // The actor-side clears, likewise.
+        let held: Vec<(&str, &str, i64)> =
+            names[..33].iter().map(|o| (o.as_str(), "g1", 2)).collect();
+        let d1_all: Vec<(&str, &str, i64)> = names.iter().map(|o| (o.as_str(), "g1", 9)).collect();
+        let first = compare::classify_reread(raw(&d1_all, &actor, t, None), None, t, W);
+        let mut caught: Vec<(&str, &str, i64)> = held.iter().map(|(o, g, _)| (*o, *g, 2)).collect();
+        caught.extend(names[33..].iter().map(|o| (o.as_str(), "g1", 9)));
+        let later = compare::classify_reread(
+            raw(&d1_all, &caught, t + 2 * W, None),
+            Some(&first.outpoints),
+            t + 2 * W,
+            W,
+        );
+        assert_eq!(later.held_by_apply(), 8, "{}", later.outpoints);
+    }
+
+    /// (fix1056f_l2) THE REVIEW'S LOW-2 (its lens pin `rv1056_r3`): a pending outpoint whose actor row moved to a game
+    /// the partial compare did not judge is not read: it stays pending, never filed `heldByApply`. RED on dae3fed9.
+    #[test]
+    fn fix1056f_l2_a_pending_row_that_moved_game_is_no_clear() {
+        let t = NOW_MS as i64;
+        let first = compare::classify_reread(raw(&[], &[("cc:0", "g1", 2)], t, None), None, t, W);
+        assert_eq!(of(&first, "cc:0")["gameId"], json!("g1"));
+        let later = compare::classify_reread(
+            raw_u(&[], &[], t + 2 * W, &["g1"], &["cc:0"]),
+            Some(&first.outpoints),
+            t + 2 * W,
+            W,
+        );
+        assert_eq!(
+            (
+                later.held_by_apply(),
+                later.pending_reread(),
+                later.diff_count
+            ),
+            (0, 1, Some(0)),
+            "neither side of cc:0 was read: {}",
+            later.outpoints
+        );
+    }
+
+    /// (fix1056f_l1) THE REVIEW'S LOW-1: THE WINDOW ROTATES AND THE PARTIAL IDENTITY IS SERVED. The rotation over 150
+    /// games with one pending game and 64 places covers every game in `ceil(149 / 63)` = 3 compares; through the shipped
+    /// [`compare::fresh_compare`] over the fleet's whale, each compare's row stores its next offset (the `partial`
+    /// column), the next compare reads it and judges the next window, every game judged within
+    /// `ceil(total / 64)` + 1 compares; the summary and the public snapshot serve the identity as `partial`. New API.
+    #[tokio::test]
+    async fn fix1056f_l1_the_window_rotates_and_partial_is_served() {
+        let games: Vec<String> = (0..150).map(|i| format!("g{i:03}")).collect();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut offset = 0;
+        for _ in 0..3 {
+            let (picked, total, next) =
+                compare::pick_games_rotating(&["g149".to_string()], &[], &games, 64, offset);
+            assert_eq!((picked.len(), total, picked[0].as_str()), (64, 150, "g149"));
+            seen.extend(picked);
+            offset = next;
+        }
+        assert_eq!(seen.len(), 150, "every game judged in three compares");
+        assert_eq!(
+            compare::pick_games(&[], &[], &games, 64).0,
+            compare::pick_games_rotating(&[], &[], &games, 64, 0).0,
+            "offset 0 is the base's window"
+        );
+        let f = fixtures()
+            .into_iter()
+            .find(|f| f.name == "d1_fleet")
+            .unwrap();
+        let d1 = d1_judge(&f).await;
+        let port = Fix986 {
+            d1: &d1,
+            actors: BTreeMap::new(),
+            judges: true,
+            die_after: Cell::new(u32::MAX),
+        };
+        let mut whale = None;
+        for id in &f.identities {
+            let view = compare::fresh_compare(&port, id, Err("no actor (pin)".into()))
+                .await
+                .unwrap();
+            if view["d1"]["games"]["partial"] == true {
+                whale = Some(id.clone());
+                break;
+            }
+        }
+        let id = whale.expect("a partial identity in the fleet");
+        let mut judged_all: BTreeSet<String> = BTreeSet::new();
+        let mut total = 0usize;
+        let mut firsts = Vec::new();
+        for k in 0..24 {
+            let mut view = compare::fresh_compare(&port, &id, Err("no actor (pin)".into()))
+                .await
+                .unwrap();
+            total = view["d1"]["games"]["total"].as_u64().unwrap() as usize;
+            let judged: Vec<String> = view["d1"]["games"]["judgedGames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|g| g.as_str().unwrap().to_string())
+                .collect();
+            firsts.push(judged[0].clone());
+            judged_all.extend(judged);
+            view["actor"] = json!({"rows": [], "bootstrapped": true});
+            let row = compare::compare_row_of(&id, NOW_MS as i64 + k, Ok(&view));
+            assert!(row.partial);
+            assert_eq!(compare::partial_column(&row), 1 + row.next_offset as i64);
+            d1.run_batch(vec![compare::upsert_stmt(&row)])
+                .await
+                .unwrap();
+            if judged_all.len() == total {
+                break;
+            }
+        }
+        assert_eq!(judged_all.len(), total, "the rotation judged every game");
+        assert!(
+            firsts.len() <= total.div_ceil(compare::FRESH_COMPARE_GAMES_MAX) + 1,
+            "{firsts:?}"
+        );
+        let summary: i64 = d1
+            .conn
+            .query_row(compare::COMPARE_SUMMARY_SQL, [], |r| r.get("partial"))
+            .unwrap();
+        assert_eq!(summary, 1);
+        d1.conn
+            .prepare(crate::owed_events_publish::FLEET_COMPARE_HEALTH_SQL)
+            .unwrap()
+            .execute(rusqlite::params![
+                NOW_MS as i64,
+                0,
+                1,
+                compare::RING_NAME,
+                compare::RING_NAME
+            ])
+            .unwrap();
+        let cursor: String = d1
+            .conn
+            .query_row(
+                "SELECT cursor FROM owed_belt_state WHERE name='fleet-compare:health'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let served =
+            crate::owed_events_publish::fleet_compare_health_view(Some(&cursor), NOW_MS as i64);
+        assert_eq!(served["partial"], json!(1), "{served}");
     }
 }
