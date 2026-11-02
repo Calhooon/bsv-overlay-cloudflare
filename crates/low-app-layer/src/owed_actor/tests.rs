@@ -21913,3 +21913,80 @@ mod fix1046f {
         assert_eq!(d1.counter(crate::owed_actor::COUNTERS[35]), 1);
     }
 }
+
+/// FIX-1057-FOLD-1 (the FIX-1057 ensemble's C LOW-2, its DELETE): the compare's landing lag reads the judge's ONE
+/// spelling of each shape. Over a wait-then-press pair (the lag), and every change of a key either shape reads, the
+/// excuse follows the predicates exactly: `landing_lag` is `owed::is_landing_wait` of the earlier side and
+/// `owed::is_filed_sweep_press` of the later, beside the rows' own `claimable`, the same sweep and the end between the
+/// two judgements. RED when `landing_lag` re-spells a shape and the copy drops a term (e.g. no `sweepRawHex`):
+/// "the excuse follows the predicates: the press without sweepRawHex".
+#[test]
+fn fix1057f1_1_the_landing_lag_reads_the_judges_one_spelling() {
+    let sweep = "cd".repeat(32);
+    let row = |claimable: i64, judged: i64, facts: Value| {
+        json!({"family": "hop-stranded", "gameId": "g", "sats": 1000, "opponentIdentity": "o",
+               "claimable": claimable, "judgedAtMs": judged, "facts": facts.to_string()})
+    };
+    let wait = json!({"sweepLanding": true, "claim": null, "claimable": false, "sweepTxid": sweep,
+                      "sweepLandingUntilMs": 200});
+    let press = json!({"claim": "sweep-hop", "claimable": true, "sweepRawHex": "0100",
+                       "sweepSource": crate::owed::SWEEP_SOURCE_FILING, "sweepTxid": sweep});
+    assert!(crate::owed::is_landing_wait(&wait) && crate::owed::is_filed_sweep_press(&press));
+    assert!(landing_lag(
+        &row(0, 100, wait.clone()),
+        &row(1, 300, press.clone())
+    ));
+    assert!(
+        landing_lag(&row(1, 300, press.clone()), &row(0, 100, wait.clone())),
+        "either order"
+    );
+    let changes: Vec<(&str, &str, Value)> = vec![
+        ("claim", "internalize", json!("internalize")),
+        ("claimable", "not claimable", json!(false)),
+        ("sweepRawHex", "without sweepRawHex", Value::Null),
+        ("sweepSource", "signed here", json!("sign-here")),
+        ("sweepLanding", "still a wait", json!(true)),
+    ];
+    for (k, what, v) in &changes {
+        let mut p = press.clone();
+        if v.is_null() {
+            p.as_object_mut().unwrap().remove(*k);
+        } else {
+            p[*k] = v.clone();
+        }
+        assert_eq!(
+            landing_lag(&row(0, 100, wait.clone()), &row(1, 300, p.clone())),
+            crate::owed::is_filed_sweep_press(&p),
+            "the excuse follows the predicates: the press {what}"
+        );
+        assert!(!crate::owed::is_filed_sweep_press(&p), "{what}");
+    }
+    for (k, what, v) in [
+        ("sweepLanding", "no landing", Value::Null),
+        ("claim", "a claim", json!("sweep-hop")),
+        ("claimable", "claimable", json!(true)),
+    ] {
+        let mut w = wait.clone();
+        if v.is_null() {
+            w.as_object_mut().unwrap().remove(k);
+        } else {
+            w[k] = v;
+        }
+        assert_eq!(
+            landing_lag(&row(0, 100, w.clone()), &row(1, 300, press.clone())),
+            crate::owed::is_landing_wait(&w),
+            "the excuse follows the predicates: the wait with {what}"
+        );
+        assert!(!crate::owed::is_landing_wait(&w), "{what}");
+    }
+    // the rows' own column and the clock stay landing_lag's
+    assert!(!landing_lag(
+        &row(1, 100, wait.clone()),
+        &row(1, 300, press.clone())
+    ));
+    assert!(!landing_lag(
+        &row(0, 100, wait.clone()),
+        &row(0, 300, press.clone())
+    ));
+    assert!(!landing_lag(&row(0, 250, wait), &row(1, 300, press)));
+}

@@ -935,7 +935,7 @@ async fn fix1049f2_1b_a_cut_row_is_looked_at_on_the_next_tick() {
 
 /// FIX-1049-FOLD-2 (fold 4; B LOW-2; lens B's P3): a landing wait (no first sight) looked at again and again inside
 /// its wait, the couriers still answering unspent: the back-off doubles, and the row's next look never passes the
-/// wait's end. RED with `cap_to_landing_end` taken out of the back-off: the look at +4,800 s past the end at +3,540 s.
+/// wait's end. RED with the landing cap taken out of the back-off's date: the look at +4,800 s past the end at +3,540 s.
 #[tokio::test]
 async fn fix1049f2_4_the_backoff_never_dates_a_landing_past_its_end() {
     let (db, outpoint) = landing("seen", 60, None).await;
@@ -1433,6 +1433,16 @@ async fn fix1057_4_the_finds_first_sight_is_the_records_stamp() {
         Some(at as i64),
         "the record's stamp is the tick's instant"
     );
+    // FIX-1057-FOLD-1 (the ensemble's C LOW-1): one clock read a tick, passed down: the find's judgement is stamped
+    // at the tick's instant, never the hydration's later read (the clock here moves a second a batch). RED with
+    // `Find::apply` leaving `i.now_ms` as hydrated: the row's `judgedAtMs` past the tick's.
+    assert_eq!(
+        db.int(&format!(
+            "SELECT judgedAtMs FROM owed_rows WHERE outpoint='{outpoint}'"
+        )),
+        at as i64,
+        "the find's judgement is at the tick's instant"
+    );
     let (family, facts, _) = row_of(&db, &outpoint);
     assert!(
         facts.get("sweepFirstSeenAtMs").is_some(),
@@ -1443,6 +1453,70 @@ async fn fix1057_4_the_finds_first_sight_is_the_records_stamp() {
         stamp,
         "the row's first sight is the record's own stamp: {facts}"
     );
+}
+
+/// FIX-1057-FOLD-1 (the FIX-1057 ensemble's C LOW-3, A LOW-1, B LOW-1): THE FIGURE THAT TELLS A STARVED CLASS. Over
+/// fix1057_3's flood (64 first-class rows, a young landing walked first, two older second-class rows due since t=1),
+/// each tick SETS the oldest due row's age per class it read (`owed_belt_oldest_due_age_ms_*`, the age plus one), so
+/// the older second-class row the places cut shows its age grown by the tick on the next; and a tick that reads no
+/// young row sets that class to 0 (none). New API (no such gauge on 5f24a4eb); RED with the gauges' binds held at 0:
+/// "the second class's oldest due age".
+#[tokio::test]
+async fn fix1057f1_3_the_tick_serves_each_classs_oldest_due_age() {
+    let db = seeded().await;
+    landing_into(&db, "a0", 0, "announced", 60, Some(60)).await;
+    landing_into(&db, "b0", 1, "announced", 60, None).await;
+    landing_into(&db, "b1", 2, "announced", 60, None).await;
+    db.exec("UPDATE owed_rows SET beltDueAtMs=1 WHERE identity IN ('a0','b0','b1')");
+    db.exec("UPDATE owed_rows SET probeTip=899999, claimable=1, facts=json_set(facts,'$.status','unknown') WHERE identity='owner'");
+    let gauge = |db: &Db, class: &str| {
+        db.int(&format!(
+            "SELECT value FROM ops_counters WHERE name='owed_belt_oldest_due_age_ms_{class}'"
+        ))
+    };
+    let first_due = db.int(
+        "SELECT MIN(beltDueAtMs) FROM owed_rows WHERE identity='owner' AND beltDueAtMs IS NOT NULL",
+    );
+    let report = belt::tick(&db, &unspent()).await.unwrap();
+    let now = NOW as i64;
+    assert_eq!(report.young_rows, 1, "{report:?}");
+    assert_eq!(
+        gauge(&db, "second"),
+        now,
+        "the second class's oldest due age (the age plus one)"
+    );
+    assert_eq!(gauge(&db, "young"), now, "the young class's");
+    assert_eq!(
+        gauge(&db, "first"),
+        now - first_due + 1,
+        "the first class's"
+    );
+    // the next tick: the row the places cut has waited a tick more
+    let next = NOW + belt::OWED_BELT_TICK_MS as u64;
+    db.now.set(next);
+    let report = belt::tick(&db, &unspent()).await.unwrap();
+    assert_eq!(
+        gauge(&db, "second"),
+        next as i64,
+        "the cut row's age grew by the tick: {report:?}"
+    );
+    if report.young_rows == 0 {
+        assert_eq!(gauge(&db, "young"), 0, "no young row read: none");
+    }
+    // the served view: the age, null for none
+    let mut counters = serde_json::Map::new();
+    for class in ["first", "second", "young"] {
+        counters.insert(
+            format!("owed_belt_oldest_due_age_ms_{class}"),
+            json!(gauge(&db, class)),
+        );
+    }
+    let ages = (gauge(&db, "second") - 1, gauge(&db, "young"));
+    let view = bsv_overlay_cloudflare::applayer_counters::owed_belt_view(&Value::Object(counters));
+    assert_eq!(view["oldestDueAgeMs"]["second"], json!(ages.0), "{view}");
+    if ages.1 == 0 {
+        assert_eq!(view["oldestDueAgeMs"]["young"], Value::Null, "{view}");
+    }
 }
 
 /// FIX-1057 item 5 (round 3's B LOW-3): PHASE C's young cap in `ask_candidates`. Eight young landing asks (`a*`,

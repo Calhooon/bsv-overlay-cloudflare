@@ -408,7 +408,7 @@ pub(crate) async fn hydrate_filings(
         let rows: Vec<Value> = read(db, OPEN_EVICTED_POTS_SQL, vec![json_bind(&unknown)]).await?;
         i.evicted_pots.extend(rows.iter().map(|r| text(r, "txid")));
     }
-    hydrate_evidence(db, &mut i, games, filings).await?;
+    hydrate_evidence(db, &mut i, games, filings, stamp).await?;
     Ok(i)
 }
 
@@ -658,6 +658,7 @@ async fn hydrate_evidence(
     i: &mut JudgeInputs,
     games: &[String],
     filings: &[crate::record_post::VerifiedRecord],
+    stamp: i64,
 ) -> Result<(), String> {
     let bound = vec![Bind::Text(i.identity.clone()), json_bind(&games)];
     for r in read::<Value>(db, COLLECTED_SQL, bound).await? {
@@ -871,9 +872,12 @@ async fn hydrate_evidence(
                     pays_sats: crate::hopsweep::sweep_output_sats(&r.sweep_raw_hex),
                     index_proven: proof.is_some_and(|p| flag(p, "has_proof") == Some(true)),
                     index_proof_height: proof.and_then(|p| p["proofHeight"].as_u64()),
-                    // FIX-1057 (item 8): the filing being written now; the door stamps `createdAt` in seconds, so
-                    // the judge reads the same second the record will hold
-                    filed_at_ms: Some(i.now_ms.div_euclid(1000) * 1000),
+                    // FIX-1057 (item 8): the filing being written now. FIX-1057-FOLD-1 (the ensemble's C LOW-1):
+                    // its stamp is the caller's `stamp` (the seconds the door binds into `createdAt`, the one clock
+                    // the parties and results of this hydration carry too), never re-derived from the judge's clock.
+                    // Stated (B NOTE-2): the one production caller ([`hydrate`]) passes no filing, so this arm runs
+                    // only where a caller hands the write's own records in.
+                    filed_at_ms: Some(stamp.saturating_mul(1000)),
                 },
             );
         }
