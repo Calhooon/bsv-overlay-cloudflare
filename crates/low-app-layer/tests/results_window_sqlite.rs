@@ -831,6 +831,8 @@ fn query_results_rows(conn: &Connection, identity: &str) -> Vec<ResultsRow> {
             // #371 — the third-arm inputs, read through the REAL SQL.
             spender_seen: r.get::<_, Option<i64>>("spenderSeen")?.map(|v| v != 0),
             spender_final: r.get::<_, Option<i64>>("spenderFinal")?.map(|v| v != 0),
+            // bsv-low #1048: never read from D1; the route's bytes arm sets it.
+            index_signers: None,
             // bsv-low P4 slice 2 — NOT selected by results_sql either (same
             // byte-identical rule); filled by the PAGE OVERLAY below exactly
             // as the route fills them.
@@ -4281,4 +4283,100 @@ fn a_posted_proof_serves_both_hands_with_no_marker_on_chain() {
         Some("151c1d2d31")
     );
     assert_eq!(entries[0].hands_source, Some("proof"));
+}
+
+/// bsv-low #1048 (FIX-1048-STACK-FOLD-1, the review's LOW-2) over the SHIPPED read: a recorded, FINAL settle the
+/// network never called SEEN, its stored verdict group of THIS pointer carrying the signers the overlay's classifier
+/// names for the real bytes, is resolved by the public route's bytes arm; the next read after the chaser's
+/// displacement (the pointer on a rival: the group is the old pointer's, the BEEF join follows the rival) and after
+/// the eviction's shadow move (the live `pot_records` row taken) is unresolved again. No SEEN latch is written.
+#[test]
+fn fix1048_g_the_bytes_arm_follows_the_indexs_pointer_through_a_displacement_and_an_eviction() {
+    use low_app_layer::results::{apply_index_bytes_arm, Outcome};
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let p = enforced_pot_columns();
+    let settle_raw = hex::decode(ENFORCED_SETTLE_HEX.trim()).unwrap();
+    let settle = low_app_layer::results::parse_raw_tx_verified(&settle_raw, ENFORCED_SETTLE_TXID)
+        .expect("the real settle hashes to its txid");
+    let input = settle
+        .inputs
+        .iter()
+        .position(|i| i.prev_txid.eq_ignore_ascii_case(ENFORCED_FUNDING_TXID) && i.prev_vout == 0)
+        .expect("the settle spends the pot");
+    let signers = overlay_discovery::pot::settle_signers_for_spend(&p, 4000, &settle_raw, input)
+        .expect("the real settle's signers classify against the committed triple");
+    insert_decoded_pot(
+        &conn,
+        ENFORCED_FUNDING_TXID,
+        Some(ENFORCED_SETTLE_TXID),
+        &p,
+        4000,
+        Some("winner-a"),
+        Some(ENFORCED_SETTLE_TXID),
+        None,
+        false, // the index's proof has not landed
+    );
+    conn.execute(
+        "UPDATE pot_records SET spenderFinal = 1, settleSigners = ?1 WHERE txid = ?2",
+        params![signers.as_str(), ENFORCED_FUNDING_TXID],
+    )
+    .unwrap();
+    file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
+    let read = |conn: &Connection| {
+        let mut rows = query_results_rows(conn, &victim);
+        apply_page_overlay_like_the_route(conn, &mut rows);
+        let params_by_pot = covenant_params_by_pot(&rows);
+        apply_index_bytes_arm(&mut rows, &params_by_pot);
+        let seen: Vec<Option<bool>> = rows.iter().map(|r| r.spender_seen).collect();
+        (
+            assemble_like_the_route(
+                &victim,
+                rows,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+            ),
+            seen,
+        )
+    };
+    let (e, seen) = read(&conn);
+    assert_eq!(
+        e[0].verdict,
+        Some(PotVerdict::WinnerA),
+        "resolved on the held bytes' signers"
+    );
+    assert_eq!(e[0].settle_signers.as_deref(), Some(signers.as_str()));
+    assert_eq!(seen, vec![Some(false)], "no SEEN latch written from bytes");
+
+    // The chaser's displacement: the pointer moves to a rival whose bytes are not held.
+    conn.execute(
+        "UPDATE pot_records SET spendingTxid = ?1 WHERE txid = ?2",
+        params![h64(0xe1), ENFORCED_FUNDING_TXID],
+    )
+    .unwrap();
+    let (e, _) = read(&conn);
+    assert_eq!(
+        (e[0].verdict, e[0].outcome),
+        (None, Outcome::Unresolved),
+        "a displaced pointer retracts the outcome on the next read"
+    );
+
+    // Back on the settle, then the eviction's shadow move takes the live row.
+    conn.execute(
+        "UPDATE pot_records SET spendingTxid = ?1 WHERE txid = ?2",
+        params![ENFORCED_SETTLE_TXID, ENFORCED_FUNDING_TXID],
+    )
+    .unwrap();
+    assert_eq!(read(&conn).0[0].verdict, Some(PotVerdict::WinnerA));
+    conn.execute(
+        "DELETE FROM pot_records WHERE txid = ?1",
+        params![ENFORCED_FUNDING_TXID],
+    )
+    .unwrap();
+    let (e, _) = read(&conn);
+    assert_eq!(
+        (e[0].verdict, e[0].outcome),
+        (None, Outcome::Unresolved),
+        "an evicted spend is unresolved on the next read"
+    );
 }
