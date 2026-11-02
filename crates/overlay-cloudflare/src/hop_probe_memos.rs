@@ -221,12 +221,21 @@ pub const HOP_PROBE_MEMO_EXPIRE_SQL: &str =
 /// went stale behind the D1 judge's. A memo the belt's evidence repeats word for word (the same find: spent, spender,
 /// confirmation, height and stamp) moves nothing (the judge reads the evidence in its place) and is not marked. A
 /// memo's mark is PLAIN: a memo leaving reads no confirmation away that the evidence does not keep.
-pub const HOP_PROBE_MEMO_EXPIRE_MARK_SQL: &str = probe_marks!(
-    concat!(
-        expire_pred!(),
-        " AND (substr(outpoint,65,1)=':' OR (substr(outpoint,65,1)='.' AND NOT EXISTS (SELECT 1 FROM hop_chain_probes e WHERE e.outpoint=substr(hop_chain_probes.outpoint,1,64)||':'||substr(hop_chain_probes.outpoint,66) AND e.spent IS hop_chain_probes.spent AND e.spendingTxid IS hop_chain_probes.spendingTxid AND e.spentConfirmed IS hop_chain_probes.spentConfirmed AND e.tipHeight IS hop_chain_probes.tipHeight AND e.probedAtMs IS hop_chain_probes.probedAtMs)))"
+///
+/// bsv-low #1044 (the FIX-1042 ensemble's LOW-3, lens B): the statement ANSWERS THE KEYS IT MARKED (`RETURNING
+/// sourceKey`, one row a mark, deduplicated by the writer), and the sweep notes only those ([`sweep_notes`]): a memo the
+/// evidence repeats, or one of an outpoint no identity holds a row on, is deleted and counted
+/// ([`COUNTER_HOP_PROBE_MEMOS_EXPIRED_UNNOTED`]), never read by the publish. It noted every deleted key (up to the
+/// publish's 256 statements a pass), each read and skipped.
+pub const HOP_PROBE_MEMO_EXPIRE_MARK_SQL: &str = concat!(
+    probe_marks!(
+        concat!(
+            expire_pred!(),
+            " AND (substr(outpoint,65,1)=':' OR (substr(outpoint,65,1)='.' AND NOT EXISTS (SELECT 1 FROM hop_chain_probes e WHERE e.outpoint=substr(hop_chain_probes.outpoint,1,64)||':'||substr(hop_chain_probes.outpoint,66) AND e.spent IS hop_chain_probes.spent AND e.spendingTxid IS hop_chain_probes.spendingTxid AND e.spentConfirmed IS hop_chain_probes.spentConfirmed AND e.tipHeight IS hop_chain_probes.tipHeight AND e.probedAtMs IS hop_chain_probes.probedAtMs)))"
+        ),
+        "(substr(g.outpoint,65,1)=':' AND g.spentConfirmed IS 1)"
     ),
-    "(substr(g.outpoint,65,1)=':' AND g.spentConfirmed IS 1)"
+    " RETURNING sourceKey"
 );
 /// FIX-1010: rule 2's delete as the batch runs it, answering the keys it deleted.
 pub const HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL: &str = concat!(
@@ -235,14 +244,36 @@ pub const HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL: &str = concat!(
     " RETURNING outpoint"
 );
 
-/// FIX-1010: the deleted keys whose pair the writer notes (each may hold a mark its batch wrote): the clear's every
-/// hop memo, evidence and proof latch; the sweep's evidence and hop memos (bsv-low #1042: its marks name both). A key
-/// noted with no mark (a memo the evidence repeats) is read by the publish and not sent.
+/// FIX-1010: the deleted keys whose pair the writer MAY note (each may hold a mark its batch wrote): the clear's every
+/// hop memo, evidence and proof latch; the sweep's evidence and hop memos (bsv-low #1042: its marks name both). The
+/// clear notes each such key (a key noted with no mark is read by the publish and not sent); the sweep notes only the
+/// keys its marks answered ([`sweep_notes`], bsv-low #1044).
 pub fn noted_key(expire: bool, outpoint: &str) -> bool {
     match outpoint.as_bytes().get(64) {
         Some(b':' | b'.') => true,
         _ => !expire && outpoint.starts_with("proofmined:"),
     }
+}
+
+/// bsv-low #1044: the sweep's notes from its batch: the deleted keys its marks statement answered (a key a judge
+/// reads, [`HOP_PROBE_MEMO_EXPIRE_MARK_SQL`]), in the delete's order, once each; and how many deleted keys it did NOT
+/// note (no mark: a memo the evidence repeats, an outpoint no identity holds a row on), counted
+/// [`COUNTER_HOP_PROBE_MEMOS_EXPIRED_UNNOTED`]. The marks are a subset of the deletes (one predicate, one transaction).
+pub fn sweep_notes(deleted: &[String], marked: &[String]) -> (Vec<String>, u64) {
+    let marked: std::collections::HashSet<&str> = marked.iter().map(String::as_str).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut noted = Vec::new();
+    let mut unnoted = 0u64;
+    for k in deleted {
+        if noted_key(true, k) && marked.contains(k.as_str()) {
+            if seen.insert(k.as_str()) {
+                noted.push(k.clone());
+            }
+        } else {
+            unnoted += 1;
+        }
+    }
+    (noted, unnoted)
 }
 
 /// Rule 3: the tombstone's key in `hop_chain_probes.outpoint`. It has the memo key's shape (`<txid>.<vout>`)
@@ -254,14 +285,35 @@ pub const HOP_PROBE_MEMO_REORG_MARK: &str = "reorg-clear.0";
 /// average, and well past the couriers' own lag behind a reorg (their indexers follow the tip within a block).
 pub const HOP_PROBE_MEMO_REORG_GRACE_MS: i64 = 30 * 60_000;
 
+/// Rule 3's grace as a literal inside the tombstone's statement, pinned equal to [`HOP_PROBE_MEMO_REORG_GRACE_MS`].
+macro_rules! reorg_grace_ms {
+    () => {
+        "1800000"
+    };
+}
+
 /// Rule 3: stamp the tombstone (binds: now, ms; the clear's REACH, its floor). `spent = 0` and no confirmed word: the
 /// clear above never deletes it, and a reader that met it as a memo would read "unspent", the safe word. The stamp only
-/// grows, and the reach is the newest stamp's (`tipHeight`, written as an integer: D1 binds a JS number as a REAL).
-/// bsv-low #1042: the app layer judges a word taken before the stamp and below the reach (`clear_pred!`'s complement)
-/// as one the clear left standing (`low-app-layer` `hops_view::clear_unless_survived`); with no reach on the row (a
-/// tombstone stamped before #1042) it holds every word taken before the stamp to the grace, as before.
-pub const HOP_PROBE_MEMO_REORG_MARK_SQL: &str = "INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed, tipHeight) VALUES ('reorg-clear.0', ?1, 0, NULL, NULL, CAST(?2 AS INTEGER)) \
-     ON CONFLICT(outpoint) DO UPDATE SET tipHeight = CASE WHEN excluded.probedAtMs >= hop_chain_probes.probedAtMs THEN excluded.tipHeight ELSE hop_chain_probes.tipHeight END, probedAtMs = MAX(hop_chain_probes.probedAtMs, excluded.probedAtMs)";
+/// grows (`tipHeight` written as an integer: D1 binds a JS number as a REAL). bsv-low #1042: the app layer judges a
+/// word taken before the stamp and below the reach (`clear_pred!`'s complement) as one the clear left standing
+/// (`low-app-layer` `hops_view::clear_unless_survived`); with no reach on the row (a tombstone stamped before #1042)
+/// it holds every word taken before the stamp to the grace, as before.
+///
+/// bsv-low #1044 (the FIX-1042 ensemble's LOW-1, lenses A and B): THE REACH IS THE DEEPEST STILL INSIDE THE GRACE. A
+/// confirmed word an earlier clear refused (taken inside its grace from a courier that had not seen the reorg, a find
+/// written after its batch, a batch that faulted) is refused for good under that clear; a later, SHALLOWER clear whose
+/// reach is above the word's height would read it as one that clear left standing and serve its confirmation again,
+/// with no write and no event. So while the two stamps are less than the grace apart the row keeps the LOWER floor
+/// (`min`, and a NULL reach, the whole table, stays NULL: SQLite's two-argument `min` answers NULL), whichever stamp
+/// is newer; a clear that comes a grace or more after the last keeps its own reach (the reach resets). The window
+/// slides with the stamp: a run of clears each inside the last one's grace keeps the deepest of them all, the
+/// conservative side (a word in that reach is refused, dated for the belt's look).
+pub const HOP_PROBE_MEMO_REORG_MARK_SQL: &str = concat!(
+    "INSERT INTO hop_chain_probes (outpoint, probedAtMs, spent, spendingTxid, spentConfirmed, tipHeight) VALUES ('reorg-clear.0', ?1, 0, NULL, NULL, CAST(?2 AS INTEGER)) ",
+    "ON CONFLICT(outpoint) DO UPDATE SET tipHeight = CASE WHEN abs(excluded.probedAtMs - hop_chain_probes.probedAtMs) < ",
+    reorg_grace_ms!(),
+    " THEN min(hop_chain_probes.tipHeight, excluded.tipHeight) WHEN excluded.probedAtMs >= hop_chain_probes.probedAtMs THEN excluded.tipHeight ELSE hop_chain_probes.tipHeight END, probedAtMs = MAX(hop_chain_probes.probedAtMs, excluded.probedAtMs)"
+);
 
 /// Confirmed memos a reorg pass cleared (served on `/health/invariants.arcadeReorg.probeMemosCleared` and with
 /// the counters). Round 2's NIT-1: the lifetime row MIXES two meanings across the FIX-1027 deploy: before it the clear
@@ -275,6 +327,9 @@ pub const COUNTER_HOP_PROBE_MEMOS_CLEARED: &str = "hop_probe_memos_cleared_by_re
 pub const COUNTER_HOP_PROBE_EVIDENCE_DEMOTED: &str = "hop_probe_evidence_demoted_by_reorg_total";
 /// Memos the TTL sweep deleted.
 pub const COUNTER_HOP_PROBE_MEMOS_EXPIRED: &str = "hop_probe_memos_expired_total";
+/// bsv-low #1044: the rows the TTL sweep deleted that it did NOT note for the publish (no judge reads them: [`sweep_notes`]),
+/// a part of [`COUNTER_HOP_PROBE_MEMOS_EXPIRED`]; seeded at 0.
+pub const COUNTER_HOP_PROBE_MEMOS_EXPIRED_UNNOTED: &str = "hop_probe_memos_expired_unnoted_total";
 
 /// Memo reads of the APP LAYER that faulted (the merged lens's LOW-3): it writes this row, the overlay seeds it at
 /// 0 and serves it on `/health/invariants.counters` with the rest (`low-app-layer`
@@ -346,14 +401,16 @@ struct Deleted {
 /// FIX-1010: one batch, the marks first then the framed writes that answer their keys (D1 runs a batch as one
 /// transaction: a written row's subjects are marked or nothing is written); each key a mark may name is noted `probe`
 /// for the invocation's publish (its event reaches the actor by the direct call, the queue behind it). The framed
-/// writes take the same binds (the clear's: none; the sweep's: its bound). Returns the rows each framed write answered.
+/// writes take the same binds (the clear's: none; the sweep's: its bound). Returns the rows each framed write answered,
+/// and the deleted keys left unnoted. bsv-low #1044: the sweep (`expire`) notes only the keys its marks statement
+/// answered ([`sweep_notes`]); the clear notes every key [`noted_key`] names.
 async fn marked_delete(
     db: &D1Database,
     mark_sql: &str,
     framed: &[&str],
     binds: &[JsValue],
     expire: bool,
-) -> Result<Vec<u64>, String> {
+) -> Result<(Vec<u64>, u64), String> {
     let prep = |sql: &str| -> Result<worker::D1PreparedStatement, String> {
         let stmt = db.prepare(sql);
         if binds.is_empty() {
@@ -369,21 +426,46 @@ async fn marked_delete(
     let out = crate::d1_ledger::counted_batch(db, stmts)
         .await
         .map_err(|e| e.to_string())?;
+    let marked: Vec<String> = if expire {
+        #[derive(serde::Deserialize)]
+        struct Marked {
+            #[serde(rename = "sourceKey")]
+            source_key: String,
+        }
+        let rows: Vec<Marked> = out
+            .first()
+            .ok_or("the marks answered nothing")?
+            .results()
+            .map_err(|e| e.to_string())?;
+        rows.into_iter().map(|m| m.source_key).collect()
+    } else {
+        Vec::new()
+    };
     let mut counts = Vec::with_capacity(framed.len());
+    let mut unnoted = 0u64;
     for n in 1..=framed.len() {
         let written: Vec<Deleted> = out
             .get(n)
             .ok_or("a framed write answered nothing")?
             .results()
             .map_err(|e| e.to_string())?;
-        for d in &written {
-            if noted_key(expire, &d.outpoint) {
-                crate::owed_events::note(PROBE_SOURCE, &d.outpoint);
-            }
+        let keys: Vec<String> = written.into_iter().map(|d| d.outpoint).collect();
+        let noted = if expire {
+            let (noted, left) = sweep_notes(&keys, &marked);
+            unnoted += left;
+            noted
+        } else {
+            keys.iter()
+                .filter(|k| noted_key(false, k))
+                .cloned()
+                .collect()
+        };
+        for k in &noted {
+            crate::owed_events::note(PROBE_SOURCE, k);
         }
-        counts.push(written.len() as u64);
+        counts.push(keys.len() as u64);
     }
-    Ok(counts)
+    Ok((counts, unnoted))
 }
 
 /// FIX-1010: the `owed_dirty` source of a probe row's marks (`overlay_discovery::owed_event::TRIGGER_SOURCES`).
@@ -461,7 +543,7 @@ pub async fn clear_on_reorg(db: &D1Database, origin: &str, reach: ReorgReach) ->
     )
     .await
     {
-        Ok(counts) => {
+        Ok((counts, _)) => {
             let at = |n: usize| counts.get(n).copied().unwrap_or(0);
             let (deleted, demoted) = (at(0), at(1));
             // the review's LOW-2, stated: each demoted row is dated due now by both judges and the belt asks its
@@ -492,11 +574,14 @@ pub async fn expire(db: &D1Database, now_ms: i64) -> u64 {
     )
     .await
     {
-        Ok(counts) => {
+        Ok((counts, unnoted)) => {
             let expired = counts.first().copied().unwrap_or(0);
             if expired > 0 {
-                console_log!("[hop-probe-memos] ttl: deleted {expired} memo(s) older than {HOP_PROBE_MEMO_TTL_MS} ms");
+                // bsv-low #1044: only the keys a judge reads (the marked ones) go to the publish; the rest are counted
+                console_log!("[hop-probe-memos] ttl: deleted {expired} memo(s) older than {HOP_PROBE_MEMO_TTL_MS} ms, {unnoted} of them unnoted (no judge reads them)");
                 crate::ops::bump_counter(db, COUNTER_HOP_PROBE_MEMOS_EXPIRED, expired).await;
+                crate::ops::bump_counter(db, COUNTER_HOP_PROBE_MEMOS_EXPIRED_UNNOTED, unnoted)
+                    .await;
             }
             expired
         }
@@ -900,9 +985,8 @@ mod tests {
         let ops = include_str!("ops.rs");
         // bsv-low #838: the view is read in the invariants' one join, then merged with the counters
         assert!(ops.contains("arcade_reorg = arcade_reorg_view(db),"));
-        assert!(
-            ops.contains("let arcade_reorg = with_probe_memos_cleared(arcade_reorg, &counters);")
-        );
+        assert!(ops
+            .contains("let mut arcade_reorg = with_probe_memos_cleared(arcade_reorg, &counters);"));
         // the merged lens's LOW-3: the app layer's faulted memo reads are a seeded row of the same surface
         assert!(
             ops.contains("crate::hop_probe_memos::COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS,"),

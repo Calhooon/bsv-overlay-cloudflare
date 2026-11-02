@@ -283,9 +283,10 @@ mod pins {
         use crate::hop_probe_memos::*;
         let run_batch = |db: &Sqlite, mark: &str, framed: &str, bind: Option<i64>| -> Vec<String> {
             let tx = db.conn.unchecked_transaction().unwrap();
+            // bsv-low #1044: the sweep's marks answer their keys (`RETURNING sourceKey`): run as a query
             match bind {
-                Some(b) => tx.execute(mark, [b]).unwrap(),
-                None => tx.execute(mark, []).unwrap(),
+                Some(b) => mark_keys(&tx, mark, [b]),
+                None => mark_keys(&tx, mark, []),
             };
             let mut q = tx.prepare(framed).unwrap();
             let keys: Vec<String> = match bind {
@@ -453,7 +454,7 @@ mod pins {
         use crate::hop_probe_memos::*;
         let sweep = |db: &Sqlite| -> Vec<String> {
             let tx = db.conn.unchecked_transaction().unwrap();
-            tx.execute(HOP_PROBE_MEMO_EXPIRE_MARK_SQL, [10]).unwrap();
+            mark_keys(&tx, HOP_PROBE_MEMO_EXPIRE_MARK_SQL, [10]);
             let mut q = tx.prepare(HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL).unwrap();
             let keys: Vec<String> = q
                 .query_map([10], |r| r.get(0))
@@ -541,35 +542,300 @@ mod pins {
                 )
                 .unwrap()
         };
+        // bsv-low #1044: stamps a grace or more apart, so the reach is the newest stamp's (inside the grace it is the
+        // deepest: `fix1044_a`)
+        let g = HOP_PROBE_MEMO_REORG_GRACE_MS as f64;
+        let t = 10.0 * g;
         db.conn
             .execute(
                 HOP_PROBE_MEMO_REORG_MARK_SQL,
-                rusqlite::params![5_000.0_f64, 973_600.0_f64],
+                rusqlite::params![t, 973_600.0_f64],
             )
             .unwrap();
-        assert_eq!(read(&db), (5_000, Some(973_600), "integer".to_string()));
+        assert_eq!(read(&db), (t as i64, Some(973_600), "integer".to_string()));
         db.conn
             .execute(
                 HOP_PROBE_MEMO_REORG_MARK_SQL,
-                rusqlite::params![4_000.0_f64, 100.0_f64],
-            )
-            .unwrap();
-        assert_eq!(
-            read(&db),
-            (5_000, Some(973_600), "integer".to_string()),
-            "an older stamp moves nothing"
-        );
-        db.conn
-            .execute(
-                HOP_PROBE_MEMO_REORG_MARK_SQL,
-                rusqlite::params![9_000.0_f64, 973_700.0_f64],
+                rusqlite::params![t - g, 100.0_f64],
             )
             .unwrap();
         assert_eq!(
             read(&db),
-            (9_000, Some(973_700), "integer".to_string()),
-            "the newest clear's reach"
+            (t as i64, Some(973_600), "integer".to_string()),
+            "an older stamp a grace back moves nothing"
         );
+        db.conn
+            .execute(
+                HOP_PROBE_MEMO_REORG_MARK_SQL,
+                rusqlite::params![t + g, 973_700.0_f64],
+            )
+            .unwrap();
+        assert_eq!(
+            read(&db),
+            ((t + g) as i64, Some(973_700), "integer".to_string()),
+            "a clear a grace after the last: its own reach"
+        );
+    }
+
+    /// bsv-low #1044 (the FIX-1042 ensemble's LOW-1, lenses A and B): THE TOMBSTONE KEEPS THE DEEPEST REACH STILL INSIDE
+    /// THE GRACE. A deep clear then a shallower one ten minutes later: the row holds the deep floor at the later stamp
+    /// (the app layer's `hops_view::fix1044_a` judges a word in the deep reach still refused); an older stamp inside the
+    /// grace with a deeper floor deepens it and leaves the stamp; a NULL reach (a pre-#1042 tombstone, the whole table)
+    /// stays NULL inside the grace; a clear a grace or more after the last resets the reach to its own. The grace's
+    /// literal is the constant. RED on f7ec4e4c's statement (the newest reach): `left: (.., Some(1010), ..) right: (..,
+    /// Some(990), ..)`.
+    #[test]
+    fn fix1044_a_the_tombstone_keeps_the_deepest_reach_inside_the_grace() {
+        use crate::hop_probe_memos::*;
+        assert!(
+            HOP_PROBE_MEMO_REORG_MARK_SQL
+                .contains(&format!("< {} THEN min(", HOP_PROBE_MEMO_REORG_GRACE_MS)),
+            "the grace's literal is the constant"
+        );
+        let read = |db: &Sqlite| -> (i64, Option<i64>) {
+            db.conn
+                .query_row(
+                    "SELECT probedAtMs,tipHeight FROM hop_chain_probes WHERE outpoint=?1",
+                    [HOP_PROBE_MEMO_REORG_MARK],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        let stamp = |db: &Sqlite, at: i64, reach: Option<f64>| {
+            db.conn
+                .execute(
+                    HOP_PROBE_MEMO_REORG_MARK_SQL,
+                    rusqlite::params![at as f64, reach],
+                )
+                .unwrap();
+        };
+        let g = HOP_PROBE_MEMO_REORG_GRACE_MS;
+        let t = 1_790_000_000_000_i64;
+        let min = 60_000_i64;
+        let db = Sqlite::migrated();
+        stamp(&db, t, Some(990.0));
+        stamp(&db, t + 10 * min, Some(1_010.0));
+        assert_eq!(
+            read(&db),
+            (t + 10 * min, Some(990)),
+            "the deep reach holds at the later stamp"
+        );
+        stamp(&db, t + 20 * min, Some(1_020.0));
+        assert_eq!(
+            read(&db),
+            (t + 20 * min, Some(990)),
+            "the window slides with the stamp"
+        );
+        stamp(&db, t + 15 * min, Some(980.0));
+        assert_eq!(
+            read(&db),
+            (t + 20 * min, Some(980)),
+            "an older stamp inside the grace deepens, never moves back"
+        );
+        stamp(&db, t + 20 * min + g - 1, Some(1_030.0));
+        assert_eq!(
+            read(&db),
+            (t + 20 * min + g - 1, Some(980)),
+            "one ms inside the grace: still the deepest"
+        );
+        stamp(&db, t + 20 * min + 2 * g, Some(1_040.0));
+        assert_eq!(
+            read(&db),
+            (t + 20 * min + 2 * g, Some(1_040)),
+            "a grace after the last: the reach resets"
+        );
+        // a pre-#1042 tombstone (no reach, the whole table) stays the whole table inside the grace
+        let db = Sqlite::migrated();
+        stamp(&db, t, None);
+        stamp(&db, t + min, Some(1_010.0));
+        assert_eq!(read(&db), (t + min, None), "a NULL reach is the deepest");
+        stamp(&db, t + min + g, Some(1_010.0));
+        assert_eq!(
+            read(&db),
+            (t + min + g, Some(1_010)),
+            "and it resets after the grace"
+        );
+    }
+
+    /// bsv-low #1044 (the FIX-1042 ensemble's LOW-3, lens B): THE SWEEP NOTES ONLY THE MEMOS A JUDGE READS, AND COUNTS
+    /// THE REST, per pass. One sweep over four aged rows: an unspent memo of a hop with a marker (marked: noted), the
+    /// evidence of an evicted hop (marked: noted), a memo the evidence repeats word for word (unmarked) and a memo of an
+    /// outpoint no identity holds a row on (unmarked): two noted, two counted. The marks answer their keys
+    /// (`RETURNING sourceKey`, one per mark: deduplicated). RED with `sweep_notes` noting every deleted key (f7ec4e4c's
+    /// rule): `left: ([.., ..], 0) right: (.., 2)`.
+    #[test]
+    fn fix1044_c_the_sweep_notes_only_the_marked_memos_and_counts_the_rest() {
+        use crate::hop_probe_memos::*;
+        let db = Sqlite::migrated();
+        seed(&db);
+        // the hop's index row stands, so its evidence stays; the second hop (vout 2) has its evidence and a repeat memo
+        let other = "4444444444444444444444444444444444444444444444444444444444444444";
+        db.conn
+            .execute_batch(&format!(
+                "INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt) VALUES('{ID}','opp','{GAME}',2,1000,'k','s','i',3,'{HOP}',1,1);\
+                 INSERT INTO pot_records(txid,outputIndex,spent,createdAt) VALUES('{HOP}',2,0,1);\
+                 DELETE FROM owed_dirty;"
+            ))
+            .unwrap();
+        let row = |key: &str, spent: i64, confirmed: Option<i64>| {
+            db.conn
+                .execute(
+                    "INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES(?1,1,?2,?3,?4,900)",
+                    rusqlite::params![key, spent, (spent == 1).then_some(SPENDER), confirmed],
+                )
+                .unwrap();
+        };
+        let marked_memo = format!("{HOP}.1");
+        let evicted_evidence = format!("{HOP}:1");
+        let repeat_memo = format!("{HOP}.2");
+        let stray_memo = format!("{other}.0");
+        row(&marked_memo, 0, None);
+        row(&evicted_evidence, 1, Some(1));
+        row(&repeat_memo, 1, Some(1));
+        row(&format!("{HOP}:2"), 1, Some(1));
+        row(&stray_memo, 0, None);
+        let tx = db.conn.unchecked_transaction().unwrap();
+        let marked = mark_keys(&tx, HOP_PROBE_MEMO_EXPIRE_MARK_SQL, [10]);
+        let deleted: Vec<String> = tx
+            .prepare(HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL)
+            .unwrap()
+            .query_map([10], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        tx.commit().unwrap();
+        assert_eq!(
+            deleted.len(),
+            4,
+            "every aged row but the standing evidence: {deleted:?}"
+        );
+        let (mut noted, unnoted) = sweep_notes(&deleted, &marked);
+        noted.sort();
+        let mut want = vec![marked_memo.clone(), evicted_evidence.clone()];
+        want.sort();
+        assert_eq!(
+            (noted.clone(), unnoted),
+            (want, 2),
+            "two noted, two counted"
+        );
+        // one key once, whatever the number of marks it carries
+        let twice: Vec<String> = marked.iter().chain(marked.iter()).cloned().collect();
+        assert_eq!(sweep_notes(&deleted, &twice).0.len(), 2);
+        // the shipped writer: the sweep notes through `sweep_notes`, counts the rest and serves the count from 0
+        let src: String = include_str!("hop_probe_memos.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        for needle in [
+            "letnoted=ifexpire{let(noted,left)=sweep_notes(&keys,&marked);",
+            "bump_counter(db,COUNTER_HOP_PROBE_MEMOS_EXPIRED_UNNOTED,unnoted)",
+            "RETURNINGsourceKey",
+        ] {
+            assert!(src.contains(needle), "the sweep: `{needle}`");
+        }
+        assert!(include_str!("ops.rs")
+            .contains("crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_EXPIRED_UNNOTED,"));
+        assert_eq!(
+            COUNTER_HOP_PROBE_MEMOS_EXPIRED_UNNOTED,
+            "hop_probe_memos_expired_unnoted_total"
+        );
+    }
+
+    /// bsv-low #1044 (the FIX-1042 ensemble's LOW-4, lens C): `/health/invariants.reorgClear` {`at`, `reach`,
+    /// `memosCleared`, `evidenceDemoted`} rides the reorg view's ONE statement (no statement added to the invariants
+    /// read): one row always (no state row, no tombstone), each source a primary-key probe; lifted to the top of the
+    /// body. New API: does not compile on f7ec4e4c.
+    #[test]
+    fn fix1044_d_the_reorg_clear_is_served_from_the_reorg_views_one_statement() {
+        use crate::hop_probe_memos::*;
+        let db = Sqlite::migrated();
+        let read = |db: &Sqlite| -> (Option<String>, Option<i64>, Option<i64>) {
+            db.conn
+                .query_row(crate::ops::ARCADE_REORG_VIEW_SQL, ["events"], |r| {
+                    Ok((r.get(0)?, r.get(3)?, r.get(4)?))
+                })
+                .unwrap()
+        };
+        assert_eq!(read(&db), (None, None, None), "one row before anything ran");
+        db.conn
+            .execute(
+                HOP_PROBE_MEMO_REORG_MARK_SQL,
+                rusqlite::params![7_000.0_f64, 990.0_f64],
+            )
+            .unwrap();
+        assert_eq!(
+            read(&db),
+            (None, Some(7_000), Some(990)),
+            "the tombstone without a state row"
+        );
+        let plan: Vec<String> = db
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                crate::ops::ARCADE_REORG_VIEW_SQL
+            ))
+            .unwrap()
+            .query_map(["events"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter()
+                .all(|l| !l.starts_with("SCAN arcade_reorg_state")
+                    && !l.starts_with("SCAN hop_chain_probes")),
+            "primary-key probes only: {plan:?}"
+        );
+        let mut view =
+            serde_json::json!({ "readable": true, "reorgClear": { "at": 7_000, "reach": 990 } });
+        let served = crate::ops::reorg_clear_view(
+            &mut view,
+            &serde_json::json!({ COUNTER_HOP_PROBE_MEMOS_CLEARED: 3, COUNTER_HOP_PROBE_EVIDENCE_DEMOTED: 5 }),
+        );
+        assert_eq!(
+            served,
+            serde_json::json!({ "at": 7_000, "reach": 990, "memosCleared": 3, "evidenceDemoted": 5 })
+        );
+        assert!(
+            view.get("reorgClear").is_none(),
+            "lifted out of the reorg view"
+        );
+        let none = crate::ops::reorg_clear_view(
+            &mut serde_json::json!({ "readable": false }),
+            &serde_json::json!({}),
+        );
+        assert_eq!(
+            none,
+            serde_json::json!({ "at": null, "reach": null, "memosCleared": 0, "evidenceDemoted": 0 })
+        );
+        let ops: String = include_str!("ops.rs").split_whitespace().collect();
+        for needle in [
+            "letreorg_clear=reorg_clear_view(&mutarcade_reorg,&counters);",
+            "body[\"reorgClear\"]=reorg_clear;",
+            "Query::new(ARCADE_REORG_VIEW_SQL)",
+        ] {
+            assert!(ops.contains(needle), "the invariants body: `{needle}`");
+        }
+    }
+
+    /// bsv-low #1044: a probe row's marks statement run as the batch runs it, whether or not it answers its keys (the
+    /// sweep's `RETURNING sourceKey`; the clear's answers none): the keys it answered, in order.
+    fn mark_keys<P: rusqlite::Params>(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: P,
+    ) -> Vec<String> {
+        let mut q = conn.prepare(sql).unwrap();
+        let cols = q.column_count();
+        let mut rows = q.query(params).unwrap();
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().unwrap() {
+            if cols > 0 {
+                out.push(r.get(0).unwrap());
+            }
+        }
+        out
     }
 
     /// The text of the function whose signature starts with `sig` in `src`: from the signature to the first line that
@@ -658,7 +924,7 @@ mod pins {
             ("proof", disc, "async fn store_record(&self, record: &ProofRecord)", r#"note("proof","#),
             ("proof", include_str!("../../low-app-layer/src/proof_post.rs"), "pub async fn proof_post(", "owed_events_publish::note(PROOF_POST_SOURCE,"),
             ("beef", include_str!("d1_storage.rs"), "async fn delete_output(", r#"note("beef", txid);"#),
-            ("probe", include_str!("hop_probe_memos.rs"), "async fn marked_delete(", "crate::owed_events::note(PROBE_SOURCE,&d.outpoint);"),
+            ("probe", include_str!("hop_probe_memos.rs"), "async fn marked_delete(", "crate::owed_events::note(PROBE_SOURCE,k);"),
             ("probe", include_str!("hop_probe_memos.rs"), "pub async fn clear_on_reorg(", "HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,&HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,"),
             ("probe", include_str!("hop_probe_memos.rs"), "pub async fn expire(", "HOP_PROBE_MEMO_EXPIRE_MARK_SQL,&[HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL],"),
             ("word", app("runtime"), "pub async fn tick(", r#"note("word", &gone.txid);"#),

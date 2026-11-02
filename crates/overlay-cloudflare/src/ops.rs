@@ -885,38 +885,92 @@ pub async fn index_janitor_backlog(db: &D1Database) -> serde_json::Value {
     }
 }
 
+/// bsv-low #1044 (the FIX-1042 ensemble's LOW-4, lens C): the consumer's state row and the reorg TOMBSTONE in ONE
+/// statement, so `/health/invariants.reorgClear` costs the invariants read no statement: always one row (the
+/// one-row source), the state row and the tombstone (`hop_chain_probes` `reorg-clear.0`) each a primary-key probe.
+pub const ARCADE_REORG_VIEW_SQL: &str = "SELECT s.state AS state, s.version AS version, s.updatedAt AS updatedAt, t.probedAtMs AS clearAt, t.tipHeight AS clearReach FROM (SELECT 1 AS one) o LEFT JOIN arcade_reorg_state s ON s.name = ?1 LEFT JOIN hop_chain_probes t ON t.outpoint = 'reorg-clear.0'";
+
 /// bsv-low M19B-G1: the consumer's state row for `/health/invariants`.
 /// `{readable, everRan, cursor, pending, updatedAtMs}`: the cursor is the
 /// last Arcade orphan event finished (`{orphanedAt, height, hash}`), the
-/// pending event the one in progress with its `heldPasses`.
+/// pending event the one in progress with its `heldPasses`. bsv-low #1044: the view also carries `reorgClear`
+/// {`at`, `reach`} (the tombstone's stamp and reach, null before the first clear), lifted to the top of the body by
+/// [`reorg_clear_view`].
 pub async fn arcade_reorg_view(db: &D1Database) -> serde_json::Value {
     #[derive(serde::Deserialize)]
     struct Row {
-        state: String,
+        #[serde(default)]
+        state: Option<String>,
         #[serde(default)]
         version: Option<f64>,
         #[serde(rename = "updatedAt", default)]
         updated_at: Option<f64>,
+        #[serde(rename = "clearAt", default)]
+        clear_at: Option<f64>,
+        #[serde(rename = "clearReach", default)]
+        clear_reach: Option<f64>,
     }
-    let row: Result<Option<Row>, _> =
-        Query::new(crate::d1_discovery::arcade_reorg_state_view_sql())
-            .bind(crate::arcade_reorg::ARCADE_STATE_NAME)
-            .fetch_optional(db)
-            .await;
-    match row {
+    let row: Result<Option<Row>, _> = Query::new(ARCADE_REORG_VIEW_SQL)
+        .bind(crate::arcade_reorg::ARCADE_STATE_NAME)
+        .fetch_optional(db)
+        .await;
+    let clear = |r: &Row| {
+        json!({
+            "at": r.clear_at.map(|v| v.max(0.0) as i64),
+            "reach": r.clear_reach.map(|v| v.max(0.0) as u64),
+        })
+    };
+    let mut view = match &row {
         Err(_) => json!({ "readable": false, "everRan": false }),
         Ok(None) => json!({ "readable": true, "everRan": false, "cursor": null, "pending": null }),
-        Ok(Some(r)) => {
-            match overlay_discovery::pot::arcade_events::ConsumerState::from_json(&r.state) {
-                Ok(state) => arcade_reorg_state_json(
-                    &state,
-                    r.updated_at.map(|v| v.max(0.0) as i64),
-                    r.version.map(|v| v.max(0.0) as u64),
-                ),
-                Err(e) => json!({ "readable": false, "everRan": true, "error": e }),
-            }
+        Ok(Some(Row { state: None, .. })) => {
+            json!({ "readable": true, "everRan": false, "cursor": null, "pending": null })
         }
+        Ok(Some(
+            r @ Row {
+                state: Some(state), ..
+            },
+        )) => match overlay_discovery::pot::arcade_events::ConsumerState::from_json(state) {
+            Ok(state) => arcade_reorg_state_json(
+                &state,
+                r.updated_at.map(|v| v.max(0.0) as i64),
+                r.version.map(|v| v.max(0.0) as u64),
+            ),
+            Err(e) => json!({ "readable": false, "everRan": true, "error": e }),
+        },
+    };
+    if let (Some(o), Ok(Some(r))) = (view.as_object_mut(), &row) {
+        o.insert("reorgClear".to_string(), clear(r));
     }
+    view
+}
+
+/// PURE (bsv-low #1044, the FIX-1042 ensemble's LOW-4): `/health/invariants.reorgClear` {`at`, `reach`,
+/// `memosCleared`, `evidenceDemoted`}: the last clear's stamp and the reach its tombstone holds (the deepest inside the
+/// grace, `hop_probe_memos::HOP_PROBE_MEMO_REORG_MARK_SQL`; null before the first clear, or a pre-#1042 tombstone's
+/// reach), beside the lifetime counts of what the clears moved. Taken OUT of the reorg view (`reorgClear`, which
+/// [`arcade_reorg_view`] reads in its one statement), so a reader sees when a clear ran and how far it reached without
+/// the fleet compare. An unreadable view serves `at` and `reach` null.
+pub fn reorg_clear_view(
+    view: &mut serde_json::Value,
+    counters: &serde_json::Value,
+) -> serde_json::Value {
+    let read = view
+        .as_object_mut()
+        .and_then(|o| o.remove("reorgClear"))
+        .unwrap_or_else(|| json!({ "at": null, "reach": null }));
+    let count = |name: &str| {
+        counters
+            .get(name)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    json!({
+        "at": read["at"],
+        "reach": read["reach"],
+        "memosCleared": count(crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_CLEARED),
+        "evidenceDemoted": count(crate::hop_probe_memos::COUNTER_HOP_PROBE_EVIDENCE_DEMOTED),
+    })
 }
 
 /// PURE (bsv-low #484): the reorg view carries how many CONFIRMED hop probe memos the reorg passes have cleared
@@ -1724,6 +1778,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         // bsv-low #1027: the belt's evidence a reorg demoted, apart from the memos it cleared
         crate::hop_probe_memos::COUNTER_HOP_PROBE_EVIDENCE_DEMOTED,
         crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_EXPIRED,
+        // bsv-low #1044: the swept rows no judge reads, deleted and not noted for the publish
+        crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_EXPIRED_UNNOTED,
         // the merged lens's LOW-3: the app layer's faulted memo reads (it writes the row)
         crate::hop_probe_memos::COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS,
         // bsv-low #436: the app layer's own counts of what a body carried past its cap (it writes these rows);
@@ -2069,7 +2125,9 @@ pub async fn health_invariants(
         .map_or(-1, |r| r.c.max(0.0) as i64);
 
     let status = if strict && dead { 503 } else { 200 };
-    let arcade_reorg = with_probe_memos_cleared(arcade_reorg, &counters);
+    let mut arcade_reorg = with_probe_memos_cleared(arcade_reorg, &counters);
+    // bsv-low #1044: the last clear and its reach, lifted out of the reorg view (assigned after the big `json!`)
+    let reorg_clear = reorg_clear_view(&mut arcade_reorg, &counters);
     let mut index_janitor = index_janitor;
     // 2026-09-04: the courier rungs' lifetime ok/fault/skipped, at a glance.
     index_janitor["couriers"] = couriers_view(&counters);
@@ -2201,6 +2259,7 @@ pub async fn health_invariants(
     body["gaspSpeedFault"] = gasp_speed["fault"].clone();
     // bsv-low #668: the pots-room push totals + p50/p95 latency, beside the raw `pots_push_*` counters.
     body["potsPush"] = pots_push;
+    body["reorgClear"] = reorg_clear;
     body["gaspDead"] = counters
         .get(crate::gasp_deferred::COUNTER_GASP_DEAD)
         .cloned()
