@@ -1131,13 +1131,10 @@ pub fn probe_memo_key(txid: &str, vout: u32) -> String {
 }
 
 /// PURE: the memo a fresh probe leaves behind — only a KNOWN answer with a spent verdict; anything else is `None`.
-/// It records no tip ([`probe_memo_at_tip`] is the owed walk's).
-pub fn probe_memo_of(
-    txid: &str,
-    vout: u32,
-    probe: &ChainSpendProbe,
-    now_ms: i64,
-) -> Option<ProbeMemo> {
+/// It records no tip ([`probe_memo_at_tip`] is the owed walk's). PRIVATE since bsv-low #1043's fold (the ensemble's
+/// LOW-1): it builds the JUDGE'S key, the exact wrong write for a public read, so nothing outside this module can
+/// call it; the route's memo is [`SpentAnyMemo`], which only [`spent_any_memo_of`] constructs.
+fn probe_memo_of(txid: &str, vout: u32, probe: &ChainSpendProbe, now_ms: i64) -> Option<ProbeMemo> {
     probe_memo_at_tip(txid, vout, probe, now_ms, None)
 }
 
@@ -1181,17 +1178,53 @@ pub fn spent_any_memo_key(txid: &str, vout: u32) -> String {
     format!("{SPENT_ANY_MEMO_PREFIX}{}", probe_memo_key(txid, vout))
 }
 
+/// #1043's fold (the ensemble's LOW-1): the ONE memo `/spent-any` may write. Its field is private, so a value exists
+/// only through [`spent_any_memo_of`], whose key is [`spent_any_memo_key`]; the route's writer
+/// (`routes::write_spent_any_memos`) takes this type alone and its statement is [`spent_any_memo_upsert`], so a
+/// judge-keyed [`ProbeMemo`] cannot reach the route's write: the wrong key does not compile there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpentAnyMemo(ProbeMemo);
+
+impl SpentAnyMemo {
+    /// The stored key (`spentany:<txid>.<vout>`).
+    pub fn key(&self) -> &str {
+        &self.0.outpoint
+    }
+}
+
 /// PURE (#1043): the memo `/spent-any` writes for a fresh probe, under its own key ([`probe_memo_of`]'s rule).
 pub fn spent_any_memo_of(
     txid: &str,
     vout: u32,
     probe: &ChainSpendProbe,
     now_ms: i64,
-) -> Option<ProbeMemo> {
-    probe_memo_of(txid, vout, probe, now_ms).map(|m| ProbeMemo {
-        outpoint: spent_any_memo_key(txid, vout),
-        ..m
+) -> Option<SpentAnyMemo> {
+    probe_memo_of(txid, vout, probe, now_ms).map(|m| {
+        SpentAnyMemo(ProbeMemo {
+            outpoint: spent_any_memo_key(txid, vout),
+            ..m
+        })
     })
+}
+
+/// PURE (#1043's fold): the route's one upsert of its memo ([`PROBE_MEMO_UPSERT_SQL`], the key the memo carries).
+pub fn spent_any_memo_upsert(m: &SpentAnyMemo) -> crate::pot_hook::Stmt {
+    use crate::pot_hook::Bind;
+    let m = &m.0;
+    crate::pot_hook::Stmt::new(
+        PROBE_MEMO_UPSERT_SQL,
+        vec![
+            Bind::Text(m.outpoint.clone()),
+            Bind::Int(m.probed_at_ms),
+            Bind::Int(i64::from(m.spent)),
+            m.spending_txid.clone().map_or(Bind::Null, Bind::Text),
+            m.spent_confirmed
+                .map_or(Bind::Null, |v| Bind::Int(i64::from(v))),
+            m.tip_height.map_or(Bind::Null, |t| {
+                Bind::Int(i64::try_from(t).unwrap_or(i64::MAX))
+            }),
+        ],
+    )
 }
 
 /// PURE (#1043): the route's memo read for `targets`, the keys each statement binds, chunked as the memo read is.
@@ -3326,28 +3359,20 @@ mod tests {
             .find("asyncfnread_probe_memos(")
             .expect("the memo read")..];
         let body = &body[..body
-            .find("asyncfnwrite_probe_memos(")
-            .expect("the memo write follows")];
+            .find("pub(crate)fnspent_any_fresh_memo(")
+            .expect("the memo construction follows")];
+        // the read is one batch of the plan's statements over the port; any fault empties it, counted
         assert!(body.contains(&squash(
-            "for keys in crate::hops_view::spent_any_memo_read_chunks(targets) {"
+            "crate::hops_view::spent_any_memo_read_chunks(targets).into_iter()"
         )));
-        assert!(body.contains(&squash(
-            "db.prepare(crate::hops_view::probe_memo_read_sql(keys.len())).bind(&binds)"
-        )));
-        assert_eq!(
-            body.matches("returnVec::new();").count(),
-            2,
-            "a failed statement empties the whole read: the tombstone is never the only part lost"
-        );
-        // the merged lens's LOW-3: each of the two fault arms is counted before it answers empty
-        assert_eq!(
-            body.matches("probe_memo_read_faulted(db).await;returnVec::new();")
-                .count(),
-            2,
-            "a faulted read is counted, never only logged"
+        assert!(body.contains(&squash("crate::hops_view::probe_memo_read_sql(keys.len())")));
+        assert!(body.contains(&squash("for out in port.run_batch(stmts).await? {")));
+        assert!(
+            body.contains(&squash("probe_memo_read_faulted(&sql.db).await;Vec::new()")),
+            "a failed statement empties the whole read, counted: the tombstone is never the only part lost"
         );
         assert!(
-            !body.contains("targets.len())).bind"),
+            !body.contains("targets.len())).bind") && !body.contains("targets.len()),"),
             "no statement binds every target"
         );
     }

@@ -18946,10 +18946,7 @@ mod fix1042 {
 mod fix1043 {
     use super::fix1010::{fresh_d1, probe_batch};
     use super::*;
-    use crate::hops_view::{
-        probe_memo_read_sql, spent_any_memo_answered, spent_any_memo_of,
-        spent_any_memo_read_chunks, ChainSpendProbe, ProbeMemo, PROBE_MEMO_UPSERT_SQL,
-    };
+    use crate::hops_view::ProbeMemo;
     use bsv_overlay_cloudflare::hop_probe_memos as memos;
 
     fn rows_of(db: &SqliteSql) -> Vec<Value> {
@@ -18962,54 +18959,76 @@ mod fix1043 {
             .unwrap()
     }
 
-    /// `GET /spent-any`'s write as the route makes it (`routes.rs`: `hops_view::spent_any_memo_of` of the ladder's
-    /// answer, one `PROBE_MEMO_UPSERT_SQL` a fresh memo), for a stranger's CONFIRMED spend of `hop:0`. Answers the key.
-    fn route_write(db: &SqliteSql, hop: &str, spender: &str) -> String {
-        let probe = ChainSpendProbe {
-            known: true,
-            spent: Some(true),
-            spending_txid: Some(spender.to_string()),
-            spent_confirmed: Some(true),
-        };
-        let m = spent_any_memo_of(hop, 0, &probe, db.now.get() as i64).unwrap();
-        db.conn
-            .execute(
-                PROBE_MEMO_UPSERT_SQL,
-                rusqlite::params![
-                    m.outpoint,
-                    m.probed_at_ms,
-                    m.spent,
-                    m.spending_txid,
-                    m.spent_confirmed,
-                    m.tip_height.map(|t| t as i64)
-                ],
-            )
-            .unwrap();
-        m.outpoint
+    /// `GET /spent-any`'s write THROUGH THE ROUTE'S OWN FUNCTIONS (#1043's fold, the ensemble's LOW-1): the
+    /// handler's memo construction (`routes::spent_any_fresh_memo`) and its writer (`routes::write_spent_any_memos`)
+    /// over the SQLite port, for a stranger's CONFIRMED spend of `hop:0`. Answers the stored key, read from the table.
+    async fn route_write(db: &SqliteSql, hop: &str, spender: &str) -> String {
+        let m = crate::routes::spent_any_fresh_memo(
+            hop,
+            0,
+            true,
+            Some(true),
+            Some(spender.to_string()),
+            Some(true),
+            db.now.get() as i64,
+        )
+        .unwrap();
+        let before: Vec<String> = all_memo_keys(db);
+        crate::routes::write_spent_any_memos(db, &[m]).await;
+        let after = all_memo_keys(db);
+        let new: Vec<&String> = after.iter().filter(|k| !before.contains(k)).collect();
+        assert_eq!(new.len(), 1, "the route's write stored one row: {new:?}");
+        new[0].clone()
     }
 
-    /// The route's own read (`routes::read_probe_memos`): its keys, then each row keyed back for its plan.
-    fn route_read(db: &SqliteSql, targets: &[(String, u32)]) -> Vec<ProbeMemo> {
-        let mut out = Vec::new();
-        for keys in spent_any_memo_read_chunks(targets) {
-            let mut q = db.conn.prepare(&probe_memo_read_sql(keys.len())).unwrap();
-            out.extend(
-                q.query_map(rusqlite::params_from_iter(keys.iter()), |r| {
-                    Ok(ProbeMemo {
-                        outpoint: r.get(0)?,
-                        probed_at_ms: r.get(1)?,
-                        spent: r.get(2)?,
-                        spending_txid: r.get(3)?,
-                        spent_confirmed: r.get(4)?,
-                        tip_height: r.get::<_, Option<i64>>(5)?.map(|t| t as u64),
-                    })
-                })
-                .unwrap()
-                .map(Result::unwrap)
-                .map(spent_any_memo_answered),
-            );
-        }
-        out
+    fn all_memo_keys(db: &SqliteSql) -> Vec<String> {
+        db.conn
+            .prepare("SELECT outpoint FROM hop_chain_probes ORDER BY outpoint")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// The route's own read (`routes::read_spent_any_memos`, the handler's read over the port).
+    async fn route_read(db: &SqliteSql, targets: &[(String, u32)]) -> Vec<ProbeMemo> {
+        crate::routes::read_spent_any_memos(db, targets)
+            .await
+            .unwrap()
+    }
+
+    /// (fix1043f_l1) THE ROUTE'S OWN WRITE AND READ, AS SHIPPED (the FIX-1043 ensemble's LOW-1, lens C's mutant M1 and
+    /// lens B's M4 and M6): the handler's construction and writer store the route's key, `spentany:<hop>.0`, and
+    /// nothing under the judge's `<hop>.0`; the handler's read finds it and keys it back for the plan, which answers
+    /// the target from it. RED with the writer's statement or the construction keyed by the judge's key (the type
+    /// gate bypassed inside `hops_view`), and with the read's `spent_any_memo_answered` dropped. The construction put
+    /// back to `probe_memo_of` at the route does not compile: that function is private to `hops_view`, and the
+    /// writer takes `SpentAnyMemo` alone.
+    #[tokio::test]
+    async fn fix1043f_l1_the_routes_shipped_write_and_read_keep_their_own_key() {
+        let d1 = d1_judge(&stranded()).await;
+        let (_, spender) = fold9_spend(STRANDED_HOP);
+        let key = route_write(&d1, STRANDED_HOP, &spender).await;
+        assert_eq!(key, format!("spentany:{STRANDED_HOP}.0"), "the stored key");
+        assert!(
+            !all_memo_keys(&d1).contains(&format!("{STRANDED_HOP}.0")),
+            "no judge key is written"
+        );
+        let targets = [(STRANDED_HOP.to_string(), 0u32)];
+        let read = route_read(&d1, &targets).await;
+        assert_eq!(
+            read.iter().map(|m| m.outpoint.as_str()).collect::<Vec<_>>(),
+            vec![format!("{STRANDED_HOP}.0").as_str()],
+            "the read keys the route's row back for its plan"
+        );
+        let (answered, ask) = crate::tracker_host::runtime::spent_any_memo_plan(
+            &targets,
+            &read,
+            d1.now.get() as i64,
+            &Default::default(),
+        );
+        assert_eq!((answered.len(), ask.len()), (1, 0), "the cache answers");
     }
 
     /// (fix1043_a) THE FINDING: a stranded hop the index holds unspent, its memo long gone, judged the owner's
@@ -19032,12 +19051,12 @@ mod fix1043 {
         );
         let marks_before = marks(&d1);
         let (_, spender) = fold9_spend(STRANDED_HOP);
-        let key = route_write(&d1, STRANDED_HOP, &spender);
+        let key = route_write(&d1, STRANDED_HOP, &spender).await;
         // the route's cache serves the route
         let targets = [(STRANDED_HOP.to_string(), 0u32)];
         let (answered, ask) = crate::tracker_host::runtime::spent_any_memo_plan(
             &targets,
-            &route_read(&d1, &targets),
+            &route_read(&d1, &targets).await,
             d1.now.get() as i64,
             &Default::default(),
         );
@@ -19075,7 +19094,7 @@ mod fix1043 {
         let d1 = d1_judge(&stranded()).await;
         let digest = rows_digest(&rows_of(&d1));
         let (_, spender) = fold9_spend(STRANDED_HOP);
-        let key = route_write(&d1, STRANDED_HOP, &spender);
+        let key = route_write(&d1, STRANDED_HOP, &spender).await;
         let targets = [(STRANDED_HOP.to_string(), 0u32)];
         let judge_keys: Vec<String> = crate::hops_view::probe_memo_read_chunks(&targets)
             .concat()
@@ -19115,7 +19134,7 @@ mod fix1043 {
             .unwrap();
         assert_eq!(gone, 0, "the clear took the route's confirmed memo");
         // the TTL sweep ages a route memo: unmarked, unnoted
-        let key = route_write(&d1, STRANDED_HOP, &spender);
+        let key = route_write(&d1, STRANDED_HOP, &spender).await;
         d1.now.set(d1.now.get() + 3 * 3_600_000);
         let noted = probe_batch(
             &d1,

@@ -4417,52 +4417,56 @@ struct ProbeMemoRow {
 /// only part lost). A fault is COUNTED (the merged lens's LOW-3, `probe_memo_read_faulted`): the empty answer costs
 /// the pass its grace mark, its latches and its cursor.
 async fn read_probe_memos(
-    db: &worker::D1Database,
+    sql: &D1Sql,
     targets: &[(String, u32)],
 ) -> Vec<crate::hops_view::ProbeMemo> {
-    let mut rows: Vec<ProbeMemoRow> = Vec::new();
-    for keys in crate::hops_view::spent_any_memo_read_chunks(targets) {
-        let binds: Vec<JsValue> = keys.iter().map(|k| JsValue::from_str(k)).collect();
-        match db
-            .prepare(crate::hops_view::probe_memo_read_sql(keys.len()))
-            .bind(&binds)
-        {
-            Ok(stmt) => match stmt
-                .counted_all()
-                .await
-                .and_then(|r| r.results::<ProbeMemoRow>())
-            {
-                Ok(chunk) => rows.extend(chunk),
-                Err(e) => {
-                    console_warn!(
-                        "[spent-any] probe memo read failed ({} targets): {e}",
-                        targets.len()
-                    );
-                    probe_memo_read_faulted(db).await;
-                    return Vec::new();
-                }
-            },
-            Err(e) => {
-                console_warn!(
-                    "[spent-any] probe memo bind failed ({} targets): {e}",
-                    targets.len()
-                );
-                probe_memo_read_faulted(db).await;
-                return Vec::new();
-            }
+    match read_spent_any_memos(sql, targets).await {
+        Ok(memos) => memos,
+        Err(e) => {
+            console_warn!(
+                "[spent-any] probe memo read failed ({} targets): {e}",
+                targets.len()
+            );
+            probe_memo_read_faulted(&sql.db).await;
+            Vec::new()
         }
     }
-    rows.into_iter()
-        .map(|r| crate::hops_view::ProbeMemo {
-            outpoint: r.outpoint,
-            probed_at_ms: r.probed_at_ms,
-            spent: r.spent != 0,
-            spending_txid: r.spending_txid,
-            spent_confirmed: r.spent_confirmed.map(|v| v != 0),
-            tip_height: r.tip_height.and_then(|t| u64::try_from(t).ok()),
+}
+
+/// bsv-low #1043's fold: `/spent-any`'s memo read over the SQL port, the route's own and its pins' (one batch, the
+/// statements `hops_view::spent_any_memo_read_chunks` keys; a fault of any is `Err`, all or nothing). Each row is
+/// keyed back for the route's plan by `hops_view::spent_any_memo_answered`: the read half of the route's ONE pair
+/// (`spent_any_memo_read_chunks` / `spent_any_memo_answered`; the write half is [`write_spent_any_memos`]).
+pub(crate) async fn read_spent_any_memos<P: crate::pot_hook::SqlPort>(
+    port: &P,
+    targets: &[(String, u32)],
+) -> std::result::Result<Vec<crate::hops_view::ProbeMemo>, String> {
+    let stmts: Vec<crate::pot_hook::Stmt> = crate::hops_view::spent_any_memo_read_chunks(targets)
+        .into_iter()
+        .map(|keys| {
+            crate::pot_hook::Stmt::new(
+                crate::hops_view::probe_memo_read_sql(keys.len()),
+                keys.into_iter().map(crate::pot_hook::Bind::Text).collect(),
+            )
         })
-        .map(crate::hops_view::spent_any_memo_answered)
-        .collect()
+        .collect();
+    let mut memos = Vec::new();
+    for out in port.run_batch(stmts).await? {
+        for row in out.rows {
+            let r: ProbeMemoRow = serde_json::from_value(row).map_err(|e| e.to_string())?;
+            memos.push(crate::hops_view::spent_any_memo_answered(
+                crate::hops_view::ProbeMemo {
+                    outpoint: r.outpoint,
+                    probed_at_ms: r.probed_at_ms,
+                    spent: r.spent != 0,
+                    spending_txid: r.spending_txid,
+                    spent_confirmed: r.spent_confirmed.map(|v| v != 0),
+                    tip_height: r.tip_height.and_then(|t| u64::try_from(t).ok()),
+                },
+            ));
+        }
+    }
+    Ok(memos)
 }
 
 /// The merged lens's LOW-3: one faulted memo read, counted under its own name: on this isolate
@@ -4485,41 +4489,46 @@ async fn probe_memo_read_faulted(db: &worker::D1Database) {
     }
 }
 
-/// The fresh memos, ONE batch of upserts. Fail-soft: a failure only forgets (logged).
-async fn write_probe_memos(db: &worker::D1Database, memos: &[crate::hops_view::ProbeMemo]) {
-    let mut stmts = Vec::with_capacity(memos.len());
-    for m in memos {
-        let binds = [
-            JsValue::from_str(&m.outpoint),
-            JsValue::from_f64(m.probed_at_ms as f64),
-            JsValue::from_f64(if m.spent { 1.0 } else { 0.0 }),
-            m.spending_txid
-                .as_deref()
-                .map(JsValue::from_str)
-                .unwrap_or(JsValue::NULL),
-            m.spent_confirmed
-                .map(|v| JsValue::from_f64(if v { 1.0 } else { 0.0 }))
-                .unwrap_or(JsValue::NULL),
-            m.tip_height
-                .map(|t| JsValue::from_f64(t as f64))
-                .unwrap_or(JsValue::NULL),
-        ];
-        match db
-            .prepare(crate::hops_view::PROBE_MEMO_UPSERT_SQL)
-            .bind(&binds)
-        {
-            Ok(s) => stmts.push(s),
-            Err(e) => console_warn!("[spent-any] probe memo bind failed for {}: {e}", m.outpoint),
-        }
-    }
-    if stmts.is_empty() {
+/// bsv-low #1043's fold: the route's memo construction, ONE function the handler and its pins call: the ladder's
+/// answer for `txid_lc:vout` as the route's own memo (`hops_view::spent_any_memo_of`, the only constructor of
+/// [`crate::hops_view::SpentAnyMemo`]), `None` for an answer no memo holds.
+pub(crate) fn spent_any_fresh_memo(
+    txid_lc: &str,
+    vout: u32,
+    known: bool,
+    spent: Option<bool>,
+    spending_txid: Option<String>,
+    spent_confirmed: Option<bool>,
+    now_ms: i64,
+) -> Option<crate::hops_view::SpentAnyMemo> {
+    let probe = crate::hops_view::ChainSpendProbe {
+        known,
+        spent,
+        spending_txid,
+        spent_confirmed,
+    };
+    crate::hops_view::spent_any_memo_of(txid_lc, vout, &probe, now_ms)
+}
+
+/// The fresh memos, ONE batch of upserts over the SQL port (`D1Sql` in the route, the pins' SQLite port). Fail-soft:
+/// a failure only forgets (logged). It takes the route's memo type alone (#1043's fold): a judge-keyed
+/// `hops_view::ProbeMemo` does not compile here, so a public read cannot write a judgement's input.
+pub(crate) async fn write_spent_any_memos<P: crate::pot_hook::SqlPort>(
+    port: &P,
+    memos: &[crate::hops_view::SpentAnyMemo],
+) {
+    if memos.is_empty() {
         return;
     }
-    if let Err(e) = crate::d1_ledger::counted_batch(db, stmts).await {
-        console_warn!(
+    let stmts = memos
+        .iter()
+        .map(crate::hops_view::spent_any_memo_upsert)
+        .collect();
+    if let Err(e) = port.run_batch(stmts).await {
+        port.log(&format!(
             "[spent-any] probe memo write failed ({} rows): {e}",
             memos.len()
-        );
+        ));
     }
 }
 
@@ -5717,9 +5726,10 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         .filter(|op| !verdicts.iter().any(|m| m.txid == op.db_txid()))
         .map(|op| (op.db_txid(), op.vout))
         .collect();
-    let memos = match ctx.env.d1("OVERLAY_DB") {
-        Ok(db) => read_probe_memos(&db, &probe_targets).await,
-        Err(_) => Vec::new(),
+    let memo_sql = D1Sql::of(&ctx.env).ok();
+    let memos = match &memo_sql {
+        Some(sql) => read_probe_memos(sql, &probe_targets).await,
+        None => Vec::new(),
     };
     let (memo_answers, _) = crate::tracker_host::runtime::spent_any_memo_plan(
         &probe_targets,
@@ -5727,7 +5737,7 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         now_ms,
         &Default::default(),
     );
-    let mut fresh: Vec<crate::hops_view::ProbeMemo> = Vec::new();
+    let mut fresh: Vec<crate::hops_view::SpentAnyMemo> = Vec::new();
     let mut terminals = Vec::with_capacity(outpoints.len());
     for op in &outpoints {
         let txid_lc = op.db_txid();
@@ -5764,14 +5774,15 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
                 crate::results::SPENT_ANY_CACHE_TTL_MS,
             )
             .await;
-            let probe = crate::hops_view::ChainSpendProbe {
-                known: row.known,
-                spent: row.spent,
-                spending_txid: row.spending_txid.clone(),
-                spent_confirmed: row.spent_confirmed,
-            };
-            if let Some(m) = crate::hops_view::spent_any_memo_of(&txid_lc, op.vout, &probe, now_ms)
-            {
+            if let Some(m) = spent_any_fresh_memo(
+                &txid_lc,
+                op.vout,
+                row.known,
+                row.spent,
+                row.spending_txid.clone(),
+                row.spent_confirmed,
+                now_ms,
+            ) {
                 fresh.push(m);
             }
             row
@@ -5793,10 +5804,8 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         });
     }
 
-    if !fresh.is_empty() {
-        if let Ok(db) = ctx.env.d1("OVERLAY_DB") {
-            write_probe_memos(&db, &fresh).await;
-        }
+    if let Some(sql) = &memo_sql {
+        write_spent_any_memos(sql, &fresh).await;
     }
     // Look up the served pointer, including a freshly probed replacement, and (bsv-low #617) each entry's own
     // creating txid for its `fundingWord`.
