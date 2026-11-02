@@ -8239,7 +8239,7 @@ pub(crate) mod tests {
     #[test]
     fn the_budget_wait_promises_a_credit_only_on_a_row_that_can_be_offered_one() {
         use crate::hops_view::{
-            confirmation_refused, mark_refused_word_rows, probe_memo_of,
+            confirmation_refused, mark_refused_word_rows, probe_memo_at_tip,
             set_aside_proofs_a_refused_word_contradicts, stale_memo_word, ChainSpendProbe,
             ProbeMemo, CHAIN_WORD_AWAITS_PROBE_CONTRADICTED_REASON,
             CHAIN_WORD_AWAITS_PROBE_NO_CREDIT_REASON, CHAIN_WORD_AWAITS_PROBE_REASON,
@@ -8257,7 +8257,7 @@ pub(crate) mod tests {
         )];
         let pkhs: HashMap<String, String> = [(tx(0x01), my_pkh.clone())].into_iter().collect();
         let memo_naming = |spender: &str| -> ProbeMemo {
-            probe_memo_of(
+            probe_memo_at_tip(
                 &tx(0x07),
                 0,
                 &ChainSpendProbe {
@@ -8267,6 +8267,7 @@ pub(crate) mod tests {
                     spent_confirmed: Some(true),
                 },
                 read_at,
+                None,
             )
             .expect("a known answer is memoised")
         };
@@ -9244,7 +9245,7 @@ pub(crate) mod tests {
     /// With no walk tip the rule is off (the read-time gate's `Unknown` arm degrades the sweep instead).
     #[test]
     fn pin808_b_a_memo_at_or_above_the_tip_answers_and_a_tipless_one_is_asked() {
-        use crate::hops_view::{memo_predates_tip, probe_memo_at_tip, probe_memo_of};
+        use crate::hops_view::{memo_predates_tip, probe_memo_at_tip};
         let (h, now) = (971_994u64, 10_000_000i64);
         let conn = memo_db();
         write_memos(
@@ -9269,7 +9270,7 @@ pub(crate) mod tests {
         let conn = memo_db();
         write_memos(
             &conn,
-            &[probe_memo_of(&tx(0x07), 0, &unspent_probe808(), now - 60_000).unwrap()],
+            &[probe_memo_at_tip(&tx(0x07), 0, &unspent_probe808(), now - 60_000, None).unwrap()],
         );
         assert_eq!(
             walk808(&conn, h, true, now),
