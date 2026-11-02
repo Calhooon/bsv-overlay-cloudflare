@@ -747,17 +747,28 @@ pub async fn plan_with(db: &impl SqlPort, ev: &OwedEvent, expand: bool) -> Resul
         .into_iter();
     let marks = read.next().map(|o| o.rows).unwrap_or_default();
     let held_subjects = held_count(read.next());
-    plan_finish(db, marks, held_subjects, expand, now).await
+    plan_finish(
+        db,
+        marks,
+        held_subjects,
+        expand,
+        now,
+        &mut std::collections::BTreeSet::new(),
+    )
+    .await
 }
 
 /// A plan from its read (the marks and the held count): a wanted envelope (the read's own mark, no game) expanded
-/// first when `expand`, then routed by its identity. [`plan_with`] and [`plans_many`] share it.
+/// first when `expand`, then routed by its identity. [`plan_with`] and [`plans_many`] share it. An envelope in
+/// `expanded` (an earlier message of the same batch expanded it, and its expansion deleted it) is neither expanded nor
+/// routed again: main's later read of the pair found it gone (FIX-954-FOLD-1, the ensemble's LOW-1).
 async fn plan_finish(
     db: &impl SqlPort,
     mut marks: Vec<Value>,
     held_subjects: usize,
     expand: bool,
     now: i64,
+    expanded: &mut std::collections::BTreeSet<(String, i64)>,
 ) -> Result<Plan, String> {
     let limit = ROUTE_READ_LIMIT as i64;
     let mut more = marks.len() >= ROUTE_READ_LIMIT;
@@ -773,6 +784,9 @@ async fn plan_finish(
         })
         .collect();
     for (identity, generation) in envelopes.iter().filter(|_| expand) {
+        if !expanded.insert((identity.clone(), *generation)) {
+            continue;
+        }
         owed_judge::expand_wanted(db, identity, *generation).await?;
         let expanded = rows(
             db,
@@ -793,33 +807,52 @@ async fn plan_finish(
 /// FIX-954 (bsv-low #954, the flood leg): the consumer batch's plans, every message's marks and held count in ONE D1
 /// batch (they were one round trip a message, in a row: sixteen round trips before the batch's first judge), then each
 /// plan finished as [`plan_with`] finishes it (a wanted envelope expanded, `expand`). A batch that faults is the
-/// whole batch's fault (the caller judges it one message at a time, as a faulted plan read was).
+/// whole batch's fault (the caller judges it one message at a time, as a faulted plan read was). A pair named by
+/// several messages of the batch is read ONCE (FIX-954-FOLD-1, the ensemble's LOW-1: the same pair in one snapshot
+/// answers the same marks), and a wanted envelope is expanded once, by its first message ([`plan_finish`]).
 pub async fn plans_many(
     db: &impl SqlPort,
     evs: &[&OwedEvent],
     expand: bool,
 ) -> Result<Vec<Plan>, String> {
     let now = db.now_ms() as i64;
-    let stmts: Vec<Stmt> = evs
-        .iter()
-        .filter(|ev| ev.source != owed_event::TXFACTS)
-        .flat_map(|ev| plan_read_stmts(ev, now, false))
-        .collect();
+    // each message's read: the index of its pair among the batch's distinct pairs (`None`: a txfacts event, no read)
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    let mut read_of: Vec<Option<usize>> = Vec::with_capacity(evs.len());
+    let mut stmts: Vec<Stmt> = Vec::new();
+    for ev in evs {
+        if ev.source == owed_event::TXFACTS {
+            read_of.push(None);
+            continue;
+        }
+        let pair = (ev.source.as_str(), ev.source_key.as_str());
+        let k = match pairs.iter().position(|p| *p == pair) {
+            Some(k) => k,
+            None => {
+                pairs.push(pair);
+                stmts.extend(plan_read_stmts(ev, now, false));
+                pairs.len() - 1
+            }
+        };
+        read_of.push(Some(k));
+    }
     let outs = match stmts.is_empty() {
         true => Vec::new(),
         false => db.run_batch(stmts).await?,
     };
-    let mut outs = outs.into_iter();
+    if outs.len() != 2 * pairs.len() {
+        return Err("the plans' batch answered short".into());
+    }
+    let mut expanded = std::collections::BTreeSet::new();
     let mut plans = Vec::with_capacity(evs.len());
-    for ev in evs {
-        if ev.source == owed_event::TXFACTS {
+    for k in read_of {
+        let Some(k) = k else {
             plans.push(Plan::default());
             continue;
-        }
-        let (Some(marks), held) = (outs.next(), outs.next()) else {
-            return Err("the plans' batch answered short".into());
         };
-        plans.push(plan_finish(db, marks.rows, held_count(held), expand, now).await?);
+        let marks = outs[2 * k].rows.clone();
+        let held = held_count(Some(outs[2 * k + 1].clone()));
+        plans.push(plan_finish(db, marks, held, expand, now, &mut expanded).await?);
     }
     Ok(plans)
 }
@@ -827,7 +860,9 @@ pub async fn plans_many(
 /// FIX-954: how many of a consumer batch's frames are ingested at once (each the tracker's write, about three D1
 /// round trips: the live hold, the stored row, the write). They were ingested one after another, a batch of sixteen
 /// word frames about forty-eight round trips before its first judge; at eight, two waves. Frames of ONE txid stay in
-/// message order, one after another ([`frame_groups`]).
+/// message order, one after another ([`frame_groups`]). A `callback` frame's ingest also makes an Arcade GET, and a
+/// Worker invocation holds at most six simultaneous outbound connections, so above six those ingests wait at the
+/// runtime, never fail (FIX-954-FOLD-1, the ensemble C's NOTE-2; D1 binding calls are not that pool).
 pub const INGEST_FRAMES_AT_ONCE: usize = 8;
 
 /// FIX-954: the consumer's ingest of a `word` event's frame, over a port so the pins run the batch's ingest as
