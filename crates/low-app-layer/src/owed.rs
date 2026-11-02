@@ -383,6 +383,14 @@ pub const SWEEP_LANDING_REASON: &str =
 /// re-judges the row). The belt looks at the row by the wait's end (`owed_belt::cap_to_landing_end`), so the press
 /// comes back on that look.
 pub const SWEEP_LANDING_WAIT_MS: i64 = 3_600_000;
+/// FIX-1057 (bsv-low #1057 item 8; round 3's B NOTE-1): THE WAIT'S ABSOLUTE BOUND. The wait follows the newest hint of
+/// any source ([`SWEEP_LANDING_WAIT_MS`] after it), so a source that kept hinting held it for as long as it hinted.
+/// It now ends no later than this long after the door took the FILING (`hopsweep_records.createdAt`, written once by
+/// the door, never renewed; [`crate::hopsweep::FiledHopSweep::filed_at_ms`]): six hours, 36 blocks of 600 s, a wall
+/// clock. Whatever any source keeps saying, the press (the filed bytes, never a second spend) is back six hours after
+/// the filing at the latest. A filing whose stamp the record does not hold has no wait (the door stamps every one).
+/// Stated: a sweep filed long before its broadcast has its wait cut short; the press then re-presents the same bytes.
+pub const SWEEP_LANDING_MAX_MS: i64 = 6 * 3_600_000;
 
 /// FIX-1049 (bsv-low #1049): is this tracker word a LIVE spender, one a broadcaster holds (`announced`, `seen`) or the
 /// chain named (`mined`, checked or not, `stale`), and not refused? FIX-1049-FOLD-1 (C LOW-2): "refused" is
@@ -398,18 +406,28 @@ pub fn spender_word_live(word: &Value) -> bool {
 }
 
 /// FIX-1049-FOLD-1: the hop's filed sweep's landing wait, when its tracker word is live ([`spender_word_live`]) and
-/// its last hint is younger than [`SWEEP_LANDING_WAIT_MS`]: the word and the hint's time in ms. `None` (the press) for
-/// no word, a word not live, a word with no hint time, and a wait past its bound.
+/// the clock is before the wait's end ([`landing_end`]): the word, the hint's time and the end, in ms. `None` (the
+/// press) for no word, a word not live, a word with no hint time, a filing with no stamp (FIX-1057), and a wait past
+/// its end.
 fn landing_wait<'a>(
     i: &'a OwedInputs,
     filed: &crate::hopsweep::FiledHopSweep,
-) -> Option<(&'a Value, i64)> {
+) -> Option<(&'a Value, i64, i64)> {
     let word = i
         .spender_words?
         .get(&filed.sweep_txid.to_ascii_lowercase())?;
     let at_ms = word["at"].as_i64().filter(|a| *a > 0)?.saturating_mul(1000);
-    (spender_word_live(word) && i.now_ms.saturating_sub(at_ms) < SWEEP_LANDING_WAIT_MS)
-        .then_some((word, at_ms))
+    let end = landing_end(at_ms, filed.filed_at_ms?);
+    (spender_word_live(word) && i.now_ms < end).then_some((word, at_ms, end))
+}
+
+/// FIX-1057 (item 8): a landing wait's END, the earlier of [`SWEEP_LANDING_WAIT_MS`] after the sweep's last hint
+/// (`at_ms`) and [`SWEEP_LANDING_MAX_MS`] after its filing (`filed_at_ms`): the one end the wait holds to and the row
+/// states (`sweepLandingUntilMs`).
+pub fn landing_end(at_ms: i64, filed_at_ms: i64) -> i64 {
+    at_ms
+        .saturating_add(SWEEP_LANDING_WAIT_MS)
+        .min(filed_at_ms.saturating_add(SWEEP_LANDING_MAX_MS))
 }
 
 /// FIX-1049-FOLD-1 (C answer 1, LOW-1: ONE guard): the filed-sweep block of a stranded hop's press, inside the two
@@ -424,7 +442,7 @@ fn sweep_press_or_landing(i: &OwedInputs, facts: &mut Value, outpoint: &str) -> 
     };
     facts["sweepTxid"] = json!(f.sweep_txid);
     facts["sweepSource"] = json!("hopsweep-filing");
-    let Some((_, at_ms)) = landing_wait(i, f) else {
+    let Some((_, at_ms, end)) = landing_wait(i, f) else {
         facts["sweepRawHex"] = json!(f.raw_hex);
         return false;
     };
@@ -432,9 +450,9 @@ fn sweep_press_or_landing(i: &OwedInputs, facts: &mut Value, outpoint: &str) -> 
     facts["claimable"] = json!(false);
     facts["chainWait"] = json!("block");
     facts["sweepLanding"] = json!(true);
-    // the sweep's last broadcaster word (the tracker word's `at`) and the wait's end: the belt looks by then
+    // the sweep's last hint of any source (the tracker word's `at`) and the wait's end: the belt looks by then
     facts["sweepLandingAtMs"] = json!(at_ms);
-    facts["sweepLandingUntilMs"] = json!(at_ms + SWEEP_LANDING_WAIT_MS);
+    facts["sweepLandingUntilMs"] = json!(end);
     first_seen_fact(i, facts, &f.sweep_txid);
     owed_words(i, facts, Some(&f.sweep_txid), None);
     true
@@ -4963,6 +4981,7 @@ pub(crate) mod tests {
                 pays_sats: Some(20_000),
                 index_proven: false,
                 index_proof_height: None,
+                filed_at_ms: Some(1_800_000_000_000 - 120_000),
             },
         );
         m
@@ -8295,6 +8314,7 @@ pub(crate) mod tests {
                                 pays_sats: Some(20_000),
                                 index_proven: true,
                                 index_proof_height: Some(899_990),
+                                filed_at_ms: None,
                             },
                         )
                     })
@@ -9484,7 +9504,7 @@ pub(crate) mod tests {
     }
 
     /// FIX-1049-FOLD-1 (fold 2; ensemble A MEDIUM-2, B NOTE-1): THE WAIT HAS AN EXIT. The landing wait holds while
-    /// the sweep's last broadcaster word is younger than `SWEEP_LANDING_WAIT_MS` and states its end
+    /// the sweep's last hint of any source is younger than `SWEEP_LANDING_WAIT_MS` and states its end
     /// (`sweepLandingUntilMs`); past it the row presses again with the FILED bytes (the same transaction re-presented),
     /// and a live word with no hint time is no wait. RED on ee8b6753: a dead sweep's hop withheld for good.
     #[test]
@@ -9536,5 +9556,67 @@ pub(crate) mod tests {
             );
             assert!(r.facts.get("sweepLanding").is_none(), "{what}");
         }
+    }
+
+    /// FIX-1057 item 8 (round 3's B NOTE-1): THE WAIT'S ABSOLUTE BOUND. A filed sweep whose last hint is a minute old
+    /// (a source keeps hinting) is a landing wait only until six hours after the FILING (`filed_at_ms`), and the end the
+    /// row states is the earlier bound; a filing with no stamp is no wait. RED on abf78cb4's rule (the end the last hint
+    /// plus an hour, no filing bound): "six hours after the filing the press is back whatever the hints".
+    #[test]
+    fn fix1057_8_the_wait_ends_six_hours_after_the_filing() {
+        assert_eq!(SWEEP_LANDING_MAX_MS, 6 * 3_600_000, "36 blocks of 600 s");
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let now: i64 = 1_800_000_000_000;
+        let words = std::collections::BTreeMap::from([(
+            sweep.clone(),
+            json!({"word": "seen", "tier": "hint", "verifyPath": null, "at": now / 1000 - 60}),
+        )]);
+        let judged = |filed_at_ms: Option<i64>| {
+            let mut sweeps = filed(&key, &sweep);
+            sweeps.get_mut(&key).unwrap().filed_at_ms = filed_at_ms;
+            let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+            i.hop_sweeps = &sweeps;
+            i.spender_words = Some(&words);
+            derive_and_pin(&i).remove(0)
+        };
+        let r = judged(Some(now - SWEEP_LANDING_MAX_MS + 300_000));
+        assert_eq!(r.facts["sweepLanding"], true, "inside the bound");
+        assert_eq!(
+            r.facts["sweepLandingUntilMs"],
+            json!(now + 300_000),
+            "the end is the filing's bound, before the hint's"
+        );
+        let r = judged(Some(now - 120_000));
+        assert_eq!(
+            r.facts["sweepLandingUntilMs"],
+            json!(now - 60_000 + SWEEP_LANDING_WAIT_MS),
+            "a young filing: the hint's end"
+        );
+        for (what, filed_at_ms) in [
+            ("at the bound", Some(now - SWEEP_LANDING_MAX_MS)),
+            ("past the bound", Some(now - 2 * SWEEP_LANDING_MAX_MS)),
+            ("no filing stamp", None),
+        ] {
+            let r = judged(filed_at_ms);
+            assert_eq!(
+                (r.facts["claim"].clone(), r.facts["claimable"].clone()),
+                (json!("sweep-hop"), json!(true)),
+                "{what}: six hours after the filing the press is back whatever the hints"
+            );
+            assert_eq!(
+                r.facts["sweepRawHex"],
+                "0100".repeat(20),
+                "{what}: the filed bytes"
+            );
+        }
+        assert_eq!(landing_end(5, 0), 5 + SWEEP_LANDING_WAIT_MS);
+        assert_eq!(landing_end(SWEEP_LANDING_MAX_MS, 0), SWEEP_LANDING_MAX_MS);
     }
 }

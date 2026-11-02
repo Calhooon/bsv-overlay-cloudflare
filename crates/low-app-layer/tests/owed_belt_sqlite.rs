@@ -26,6 +26,9 @@ struct Db {
     counters: RefCell<BTreeMap<String, u64>>,
     now: Cell<u64>,
     tip: Cell<Option<u64>>,
+    /// FIX-1057 (item 4): the clock moves this much after each batch (0: still), so a stamp bound before a read and a
+    /// clock read after it differ, as on a Worker.
+    step: Cell<u64>,
 }
 impl Db {
     fn new() -> Self {
@@ -44,6 +47,7 @@ impl Db {
             counters: RefCell::new(BTreeMap::new()),
             now: Cell::new(NOW),
             tip: Cell::new(Some(900_000)),
+            step: Cell::new(0),
         }
     }
     fn exec(&self, sql: &str) {
@@ -101,6 +105,7 @@ impl SqlPort for Db {
             });
         }
         tx.commit().map_err(|e| e.to_string())?;
+        self.now.set(self.now.get() + self.step.get());
         Ok(out)
     }
     async fn counters(&self, deltas: Vec<(String, u64)>) {
@@ -611,12 +616,25 @@ async fn landing_into(
     age_s: i64,
     seen_s: Option<i64>,
 ) -> String {
+    landing_filed(db, identity, n, word, age_s, seen_s, 2 * 3_600).await
+}
+/// [`landing_into`] with the filing taken `filed_s` seconds before NOW (`hopsweep_records.createdAt`).
+async fn landing_filed(
+    db: &Db,
+    identity: &str,
+    n: usize,
+    word: &str,
+    age_s: i64,
+    seen_s: Option<i64>,
+    filed_s: i64,
+) -> String {
     let made = (NOW as i64 - 2 * HOUR) / 1000;
+    let filed = NOW as i64 / 1000 - filed_s;
     let h = hop(1049 + n);
     let game = format!("g{}", 1049 + n);
     let (sweep, raw) = spender_of(&h);
     db.exec(&format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{h}',0,0,{made},'p2pkh'); INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('{identity}','other','{game}',0,20190,'seat','00','00',2,'{h}',1,{made},1);"));
-    db.exec(&format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES ('{identity}','{game}','{h}',0,'{sweep}','{}','e5{:062x}',0,{made})", hex::encode(&raw), 1049 + n));
+    db.exec(&format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES ('{identity}','{game}','{h}',0,'{sweep}','{}','e5{:062x}',0,{filed})", hex::encode(&raw), 1049 + n));
     db.exec(&format!("INSERT INTO tx_words(txid,word,tier,hint_source,hint_at,updated_at) VALUES ('{sweep}','{word}','hint','arcade',{},{})", NOW as i64 / 1000 - age_s, NOW as i64 / 1000));
     if let Some(seen) = seen_s {
         db.exec(&format!(
@@ -1080,4 +1098,426 @@ async fn fix1049f2_3_the_compare_reads_the_waits_end_as_the_judgements_clock() {
         json!([outpoint]),
         "another sweep is a real difference: {view}"
     );
+    // FIX-1057 item 6 (round 3's C LOW-1, its probe P1): THE PREDICATE READS BOTH VERDICTS. The same sweep, the
+    // later side withheld for another reason (no claim, not claimable, another reason): a judge disagreement, a STOP,
+    // never a clock lag. RED on abf78cb4: `tipLag` named it and `diff` was `[]`.
+    for withheld in [
+        json!({"claim": null, "claimable": false, "claimReason": "another reason"}),
+        json!({"claim": "sweep-hop", "claimable": false}),
+        json!({"claim": "internalize", "claimable": true}),
+    ] {
+        let mut other = fresh_past.clone();
+        let mut facts: Value = serde_json::from_str(other[0]["facts"].as_str().unwrap()).unwrap();
+        for (k, v) in withheld.as_object().unwrap() {
+            facts[k] = v.clone();
+        }
+        other[0]["facts"] = json!(facts.to_string());
+        if withheld["claimable"] == false {
+            other[0]["claimable"] = json!(0);
+            other[0]["reason"] = json!("another reason");
+        }
+        let view = rows_view("owner", Ok(json!({"rows": inside})), &other, None, None);
+        assert_eq!(
+            view["diff"],
+            json!([outpoint]),
+            "a later verdict that is not the wait's press is a STOP ({withheld}): {view}"
+        );
+        assert_eq!(
+            view["tipLag"],
+            json!([]),
+            "never a lag ({withheld}): {view}"
+        );
+    }
+}
+
+// ── FIX-1057 (bsv-low #1057): PR 264's LOWs, every bound of the belt pinned ─────────────────────────────────────────
+
+/// PHASE C over the shipped tick: the same record, the D1 judge off (`d1_judges` false), so the tick reads the actors'
+/// asks (`ask_candidates`), writes a find's facts alone and hands it back (`ask_find`), and dates the ask from the
+/// actor's answer (`ask_backoff`). The actor is a stand-in over the same SQLite: it judges the game's marks with the
+/// shipped judge (its own rows), publishes its dated rows' asks through the shipped `ask_of_row` and `ASK_PUT_SQL`, and
+/// answers its rows (`owed_actor::ROWS_SQL`), as the object does.
+struct PhaseC(Db);
+impl SqlPort for PhaseC {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        self.0.run_batch(stmts).await
+    }
+    async fn counters(&self, deltas: Vec<(String, u64)>) {
+        self.0.counters(deltas).await
+    }
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    fn log(&self, _: &str) {}
+}
+impl JudgeDb for PhaseC {
+    fn tip(&self) -> Option<u64> {
+        self.0.tip()
+    }
+    async fn word_views(
+        &self,
+        rows: &BTreeMap<String, low_app_layer::tracker_host::stored::Row>,
+    ) -> Result<BTreeMap<String, Value>, String> {
+        self.0.word_views(rows).await
+    }
+    async fn canonical_root(&self, h: u64) -> Option<String> {
+        self.0.canonical_root(h).await
+    }
+    async fn push(&self, _: &str, _: Value) {}
+    fn d1_judges(&self) -> bool {
+        false
+    }
+    async fn actor_apply(
+        &self,
+        identity: &str,
+        games: &[String],
+        _kind: &str,
+    ) -> Result<Option<Value>, String> {
+        Ok(Some(actor_apply(&self.0, identity, games).await))
+    }
+}
+/// The stand-in actor's apply: judge the marks, publish the game's asks, answer the identity's rows.
+async fn actor_apply(db: &Db, identity: &str, games: &[String]) -> Value {
+    while db.int("SELECT COUNT(*) FROM owed_dirty") > 0 {
+        let r = judge::drain_dirty(db, 64).await.unwrap();
+        assert!(r.faults.is_empty(), "{:?}", r.faults);
+    }
+    let dated = db
+        .run_batch(vec![Stmt {
+            sql: low_app_layer::owed_actor::ASK_ROWS_SQL.into(),
+            binds: vec![
+                Bind::Text(identity.into()),
+                Bind::Text(json!(games).to_string()),
+            ],
+        }])
+        .await
+        .unwrap()
+        .remove(0)
+        .rows;
+    let puts = dated
+        .iter()
+        .filter_map(|r| belt::ask_of_row(identity, r))
+        .map(|(name, body, due)| Stmt {
+            sql: low_app_layer::owed_actor::ASK_PUT_SQL.into(),
+            binds: vec![
+                Bind::Text(name),
+                Bind::Text(body.to_string()),
+                Bind::Int(due),
+            ],
+        })
+        .collect::<Vec<_>>();
+    if !puts.is_empty() {
+        db.run_batch(puts).await.unwrap();
+    }
+    let rows = db
+        .run_batch(vec![Stmt {
+            sql: low_app_layer::owed_actor::ROWS_SQL.into(),
+            binds: vec![Bind::Text(identity.into())],
+        }])
+        .await
+        .unwrap()
+        .remove(0)
+        .rows;
+    json!({ "rows": rows })
+}
+fn ask_due_of(db: &Db, identity: &str, outpoint: &str) -> Option<i64> {
+    db.opt(&format!(
+        "SELECT tickedAtMs FROM owed_belt_state WHERE name='{}'",
+        belt::ask_name(identity, outpoint)
+    ))
+}
+fn game_of(outpoint: &str, db: &Db) -> String {
+    db.conn
+        .borrow()
+        .query_row(
+            &format!("SELECT gameId FROM owed_rows WHERE outpoint='{outpoint}'"),
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+}
+fn unspent() -> Fake {
+    let fake = Fake::default();
+    *fake.default_spent.borrow_mut() = Some((404, b"{}".to_vec()));
+    fake
+}
+fn all_429() -> Fake {
+    let fake = Fake::default();
+    for host in ["whatsonchain.com", "bananablocks.com", "bitails.io"] {
+        fake.on(host, Some((429, b"{}".to_vec())));
+    }
+    fake
+}
+
+/// FIX-1057 item 1 (round 3's A LOW-1): PHASE C's back-off never dates a landing past its end. The `fix1049f2_4`
+/// shape through the ask ledger: a landing wait (no first sight) looked at again and again inside its wait, the
+/// couriers answering unspent: the ask's next look doubles and never passes the wait's end, and the last look inside
+/// it is dated at its end. RED with the cap taken out of `ask_backoff` (`now + period` bound in place of
+/// `next_look`): the third look dated +4,080 s, past the end at +3,540 s.
+#[tokio::test]
+async fn fix1057_1_phase_c_backoff_never_dates_a_landing_past_its_end() {
+    let db = PhaseC(Db::new());
+    let outpoint = landing_into(&db.0, "owner", 0, "seen", 60, None).await;
+    let game = game_of(&outpoint, &db.0);
+    actor_apply(&db.0, "owner", std::slice::from_ref(&game)).await;
+    let end = row_of(&db.0, &outpoint).1["sweepLandingUntilMs"]
+        .as_i64()
+        .unwrap();
+    let mut due = ask_due_of(&db.0, "owner", &outpoint);
+    assert_eq!(
+        due,
+        Some(NOW as i64 + 600_000),
+        "the ask published at the family's base date"
+    );
+    let mut looks = 0;
+    while let Some(d) = due {
+        if d >= end || looks > 20 {
+            break;
+        }
+        db.0.now.set(d as u64);
+        let report = belt::tick(&db, &unspent()).await.unwrap();
+        assert_eq!(
+            (report.candidates, report.handed_back),
+            (1, 1),
+            "{report:?}"
+        );
+        looks += 1;
+        let nd = ask_due_of(&db.0, "owner", &outpoint);
+        assert!(
+            nd.unwrap() <= end,
+            "phase C: the next look +{} s is past the wait's end +{} s",
+            (nd.unwrap() - NOW as i64) / 1000,
+            (end - NOW as i64) / 1000
+        );
+        due = nd;
+    }
+    assert!(looks >= 3, "the back-off doubled before the end: {looks}");
+    assert_eq!(
+        due,
+        Some(end),
+        "the last look inside the wait is dated at its end"
+    );
+    assert_eq!(
+        db.0.int("SELECT COUNT(*) FROM owed_rows WHERE json_extract(facts,'$.sweepLanding')=1"),
+        1,
+        "still the wait inside it"
+    );
+}
+
+/// FIX-1057 item 2 (round 3's A LOW-2): PHASE C's hand-back of an ended wait with no courier answer. A landing wait
+/// whose ask comes due at its end; every rung answers 429: the look is an empty find of the row's subject, written to
+/// the record alone, handed back to the actor (`belt-find`), whose judgement at the look's instant gives the press back
+/// (the filed bytes riding it). RED with `ended_wait_look`'s `Ok(None)` arm made to pass the answer through: the ask
+/// re-armed and the row still the wait.
+#[tokio::test]
+async fn fix1057_2_phase_c_hands_an_ended_wait_back_with_no_courier_answer() {
+    let db = PhaseC(Db::new());
+    let outpoint = landing_into(&db.0, "owner", 0, "seen", 55 * 60, None).await;
+    let game = game_of(&outpoint, &db.0);
+    actor_apply(&db.0, "owner", std::slice::from_ref(&game)).await;
+    let end = row_of(&db.0, &outpoint).1["sweepLandingUntilMs"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        ask_due_of(&db.0, "owner", &outpoint),
+        Some(end),
+        "asked at the wait's end"
+    );
+    db.0.now.set(end as u64);
+    let fake = all_429();
+    let report = belt::tick(&db, &fake).await.unwrap();
+    assert_eq!(
+        (
+            report.candidates,
+            report.found,
+            report.handed_back,
+            report.rearmed
+        ),
+        (1, 1, 1, 0),
+        "the ended wait is handed back with no answer: {report:?}"
+    );
+    assert!(report.write_faults.is_empty(), "{report:?}");
+    let (family, facts, _) = row_of(&db.0, &outpoint);
+    assert_eq!(family, "hop-stranded");
+    assert_eq!(
+        (facts["claim"].clone(), facts["claimable"].clone()),
+        (json!("sweep-hop"), json!(true)),
+        "the actor's row presses again: {facts}"
+    );
+    assert!(facts["sweepRawHex"].is_string(), "the filed bytes ride it");
+    assert!(facts.get("sweepLanding").is_none());
+}
+
+/// FIX-1057 item 3 (round 3's B LOW-1, its P1 shape): a young landing walked FIRST (`a0`), two older landings that
+/// are not young (`b0`, `b1`), and a first-class flood (the 64 `owner` rows block-dated, courier-only). The young row
+/// keeps one of the second class's reserved places (it is asked on the first tick), the walk's cursor moves (it never
+/// freezes on the first identity), and the older row the places cut is asked on the next tick. RED on abf78cb4 (fold 2's
+/// places, `(6, 2, 0)`): "young rows asked: 0", the cursor "" (no write: every tick restarts at a0).
+#[tokio::test]
+async fn fix1057_3_a_young_row_walked_first_keeps_a_place_under_a_first_class_flood() {
+    let db = seeded().await;
+    let a0 = landing_into(&db, "a0", 0, "announced", 60, Some(60)).await;
+    let b0 = landing_into(&db, "b0", 1, "announced", 60, None).await;
+    let b1 = landing_into(&db, "b1", 2, "announced", 60, None).await;
+    db.exec("UPDATE owed_rows SET beltDueAtMs=1 WHERE identity IN ('a0','b0','b1')");
+    db.exec("UPDATE owed_rows SET probeTip=899999, claimable=1, facts=json_set(facts,'$.status','unknown') WHERE identity='owner'");
+    let fake = unspent();
+    let report = belt::tick(&db, &fake).await.unwrap();
+    let asked = |fake: &Fake, outpoint: &str| {
+        let txid = outpoint.split(':').next().unwrap().to_string();
+        fake.calls.borrow().iter().any(|u| u.contains(&txid))
+    };
+    assert_eq!(
+        report.candidates,
+        belt::OWED_BELT_OUTPOINTS_PER_TICK,
+        "{report:?}"
+    );
+    assert_eq!(report.young_rows, 1, "young rows asked: {report:?}");
+    assert!(
+        asked(&fake, &a0),
+        "the young row walked first is asked on the first tick"
+    );
+    let cursor = cursor_of(&db);
+    assert!(!cursor.is_empty(), "the walk's cursor moved: {cursor:?}");
+    assert_eq!(
+        [asked(&fake, &b0), asked(&fake, &b1)],
+        [true, false],
+        "one reserved place to the rows that are not young, in walk order"
+    );
+    // the next tick: the cut older row is next
+    db.now.set(NOW + belt::OWED_BELT_TICK_MS as u64);
+    let fake = unspent();
+    belt::tick(&db, &fake).await.unwrap();
+    assert!(
+        asked(&fake, &b1),
+        "the row the places cut is asked on the next tick"
+    );
+}
+
+/// FIX-1057 item 4 (round 3's B LOW-2): the find's own judgement serves the RECORD's first sight. A landing wait (no
+/// first sight); the belt's look finds the hop spent by its filed sweep, unconfirmed, and writes the sweep's bytes
+/// (`owed_spender_bytes.createdAtMs`, the tick's instant); the clock moves a second after each batch, so the judge's
+/// hydration reads a later clock. The row judged in the find's batch states the record's stamp. RED on abf78cb4:
+/// `left: Some(1790000601000) right: Some(1790000600000)` class (the hydration clock).
+#[tokio::test]
+async fn fix1057_4_the_finds_first_sight_is_the_records_stamp() {
+    let (db, outpoint) = landing("seen", 60, None).await;
+    let hop_txid = outpoint.split(':').next().unwrap().to_string();
+    let (sweep, raw) = spender_of(&hop_txid);
+    let fake = Fake::default();
+    *fake.default_spent.borrow_mut() = Some((404, b"{}".to_vec()));
+    fake.on(
+        &format!("{hop_txid}/0/spent"),
+        Some((
+            200,
+            json!({"txid": sweep, "vin": 0, "status": "unconfirmed"})
+                .to_string()
+                .into_bytes(),
+        )),
+    );
+    fake.on(
+        &format!("tx/{sweep}/hex"),
+        Some((200, hex::encode(&raw).into_bytes())),
+    );
+    let at = NOW + 600_000;
+    db.now.set(at);
+    db.step.set(1_000);
+    let report = belt::tick(&db, &fake).await.unwrap();
+    db.step.set(0);
+    assert_eq!(report.found, 1, "{report:?}");
+    let stamp = db.opt(&format!(
+        "SELECT createdAtMs FROM owed_spender_bytes WHERE txid='{sweep}'"
+    ));
+    assert_eq!(
+        stamp,
+        Some(at as i64),
+        "the record's stamp is the tick's instant"
+    );
+    let (family, facts, _) = row_of(&db, &outpoint);
+    assert!(
+        facts.get("sweepFirstSeenAtMs").is_some(),
+        "the row states a first sight: {family} {facts}"
+    );
+    assert_eq!(
+        facts["sweepFirstSeenAtMs"].as_i64(),
+        stamp,
+        "the row's first sight is the record's own stamp: {facts}"
+    );
+}
+
+/// FIX-1057 item 5 (round 3's B LOW-3): PHASE C's young cap in `ask_candidates`. Eight young landing asks (`a*`,
+/// walked first) beside six that are not young (`z*`), all due: the tick takes four of each (`places(0, 6, 8)`).
+/// RED with the cap removed (`room` always true): the eight young asks take every place, `left: (8, 8)`.
+#[tokio::test]
+async fn fix1057_5_phase_c_young_asks_take_at_most_half_a_tick() {
+    let db = PhaseC(Db::new());
+    let mut n = 0;
+    let mut games = Vec::new();
+    for i in 0..8 {
+        let o = landing_into(&db.0, &format!("a{i}"), n, "announced", 60, Some(60)).await;
+        games.push((format!("a{i}"), game_of(&o, &db.0)));
+        n += 1;
+    }
+    for i in 0..6 {
+        let o = landing_into(&db.0, &format!("z{i}"), n, "announced", 60, None).await;
+        games.push((format!("z{i}"), game_of(&o, &db.0)));
+        n += 1;
+    }
+    for (identity, game) in &games {
+        actor_apply(&db.0, identity, std::slice::from_ref(game)).await;
+    }
+    db.0.exec(
+        "UPDATE owed_belt_state SET tickedAtMs=1 WHERE name>='belt-ask:' AND name<'belt-ask;'",
+    );
+    assert_eq!(
+        db.0.int(
+            "SELECT COUNT(*) FROM owed_belt_state WHERE name>='belt-ask:' AND name<'belt-ask;'"
+        ),
+        14
+    );
+    let report = belt::tick(&db, &unspent()).await.unwrap();
+    assert_eq!(
+        (report.candidates, report.young_rows),
+        (
+            belt::OWED_BELT_OUTPOINTS_PER_TICK,
+            belt::OWED_BELT_YOUNG_PER_TICK
+        ),
+        "four young asks and four that are not young: {report:?}"
+    );
+}
+
+/// FIX-1057 item 8 (round 3's B NOTE-1): THE WAIT'S ABSOLUTE BOUND, through the shipped judge and belt. A filing
+/// taken 5 h 55 min ago whose sweep a source keeps hinting (the last hint a minute old, renewed before the look): the
+/// wait states its end at six hours after the filing, the belt looks there, and the press is back although the last
+/// hint is a minute old. RED on abf78cb4 (the end the hint's time plus an hour): the row still the wait at the look.
+#[tokio::test]
+async fn fix1057_8_the_wait_ends_six_hours_after_the_filing_whatever_the_hints() {
+    let db = Db::new();
+    let outpoint = landing_filed(&db, "owner", 0, "seen", 60, None, 5 * 3_600 + 55 * 60).await;
+    let (_, facts, due) = row_of(&db, &outpoint);
+    let end = NOW as i64 + 5 * 60_000;
+    assert_eq!(facts["sweepLanding"], true, "inside the wait: {facts}");
+    assert_eq!(
+        facts["sweepLandingUntilMs"],
+        json!(end),
+        "six hours after the filing"
+    );
+    assert_eq!(due, Some(end), "the look comes at the bound");
+    let hop_txid = outpoint.split(':').next().unwrap().to_string();
+    let (sweep, _) = spender_of(&hop_txid);
+    // a source keeps speaking of the sweep: the last hint a minute before the look
+    db.exec(&format!(
+        "UPDATE tx_words SET hint_at={} WHERE txid='{sweep}'",
+        end / 1000 - 60
+    ));
+    db.now.set(end as u64);
+    let report = belt::tick(&db, &unspent()).await.unwrap();
+    assert_eq!(report.candidates, 1, "{report:?}");
+    let (_, facts, _) = row_of(&db, &outpoint);
+    assert_eq!(
+        (facts["claim"].clone(), facts["claimable"].clone()),
+        (json!("sweep-hop"), json!(true)),
+        "past the bound the press is back whatever the hints: {facts}"
+    );
+    assert!(facts["sweepRawHex"].is_string(), "the filed bytes ride it");
 }

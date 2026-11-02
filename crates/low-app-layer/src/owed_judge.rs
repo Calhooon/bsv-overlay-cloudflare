@@ -1198,17 +1198,16 @@ fn belt_due(row: &OwedRow, stamp: i64, evidence: Option<&JudgeInputs>) -> Option
         // FIX-1049 (bsv-low #1049), as folded: a row waiting on a sweep the couriers named, inside its young window
         // (`owed_belt::young_miss`: the first sight of the sweep's bytes, never renewed), is looked at on the belt's
         // next tick, and the served `beltNextAtMs` says so (the cell's bar reads the belt's own date)
-        OwedFamily::HopStranded | OwedFamily::Payout
-            if crate::owed_belt::young_miss(&row.facts, stamp) =>
-        {
-            Some(crate::owed_belt::young_due(stamp))
-        }
-        // FIX-1049-FOLD-1 (fold 2): a landing wait is looked at by its end, the look that gives the press back
-        OwedFamily::HopStranded => Some(crate::owed_belt::cap_to_landing_end(
+        // FIX-1049-FOLD-1 (fold 2): a landing wait is looked at by its end, the look that gives the press back.
+        // FIX-1057 (item 7): both through the belt's one dating rule (`owed_belt::next_look`)
+        OwedFamily::HopStranded => Some(crate::owed_belt::next_look(
             &row.facts,
             stamp,
             stamp + 600_000,
         )),
+        OwedFamily::Payout if crate::owed_belt::young_miss(&row.facts, stamp) => Some(
+            crate::owed_belt::next_look(&row.facts, stamp, stamp + 600_000),
+        ),
         // NEW5-M2 (D2-ACTOR-B-FOLD-10): a hop row resting on a courier find of an unconfirmed spend is re-asked at
         // the outpoint (`owed_belt::rests_on_unconfirmed_find`), whatever bytes are held: a spend that never mines
         // is retired by that look, and the honest sweep press comes back.
