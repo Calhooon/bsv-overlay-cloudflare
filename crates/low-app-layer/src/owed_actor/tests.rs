@@ -6914,7 +6914,7 @@ fn fold10_j_a_state_judged_under_another_build_bootstraps_again() {
     let actor = squash(include_str!("../owed_actor.rs"));
     assert!(actor.contains("body[\"rejudged\"]=n(COUNTERS[26]);"));
     assert!(
-        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total'))AScounters")
+        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total','owed_actor_compare_held_by_apply_total'))AScounters")
     );
 }
 
@@ -11913,13 +11913,13 @@ async fn fix986c2_b_the_ring_covers_every_identity_once_a_revolution_and_resumes
         "{resting:?}"
     );
     now = NOW_MS as i64 + compare::FLEET_COMPARE_REVOLUTION_FLOOR_MS;
-    // A tick the platform ends: its first read and two identities land (each identity: the compare's reads and its
-    // row with the cursor), then the record faults.
+    // A tick the platform ends: its first reads (the ring's, the page) and two identities land (each identity: the
+    // compare's reads, its prior row read (FIX-1046) and its row with the cursor), then the record faults.
     let per_identity = {
-        // the record's calls of one identity's compare, plus its write
+        // the record's calls of one identity's compare, plus its prior row's read and its write
         let before = d1.batches.get();
         let _ = compare::compare_one(&port, &ids[0], now).await;
-        d1.batches.get() - before + 1
+        d1.batches.get() - before + 2
     };
     port.die_after.set(2 + 2 * per_identity);
     let dead = compare::ring_tick(&port, now, 0, 1, 3, || 0).await;
@@ -12035,10 +12035,24 @@ async fn fix986c2_c_the_rings_row_is_the_routes_compare() {
         route["diffFields"][0]["fields"]["sats"],
         json!({"d1": 20190, "actor": 20191})
     );
+    // FIX-1046: the first read holds the difference `pendingReread` (counted neither way); the re-read past the
+    // visibility window (no bars served: the cap), on the resting shard's next tick, finds it standing: counted.
     let r = compare::ring_tick(&port, NOW_MS as i64, 0, 1, 16, || 0)
         .await
         .unwrap();
+    assert_eq!((r.diffs, r.pending_reread), (0, 1), "{r:?}");
+    let r = compare::ring_tick(
+        &port,
+        NOW_MS as i64 + compare::REREAD_WINDOW_CAP_MS,
+        0,
+        1,
+        16,
+        || 0,
+    )
+    .await
+    .unwrap();
     assert_eq!(r.diffs, 1, "{r:?}");
+    assert_eq!(r.rereads, vec![target.clone()]);
     let row: (i64, i64, String, String, String) = d1
         .conn
         .query_row(
@@ -12061,7 +12075,10 @@ async fn fix986c2_c_the_rings_row_is_the_routes_compare() {
     let posted = compare::compare_now(&port, &target, NOW_MS as i64 + 1)
         .await
         .unwrap();
-    assert_eq!(posted["outpoints"], outpoints);
+    assert_eq!(
+        posted["outpoints"], outpoints,
+        "a counted difference that stands stays counted"
+    );
     // The standing GET's shape.
     let got = compare::read_answer(&d1, "", "", NOW_MS as i64 + 60_000, 1)
         .await
@@ -12518,6 +12535,27 @@ async fn fix998_fleet(n: usize) -> (SqliteSql, Vec<String>, BTreeMap<String, Sql
 
 /// The route's answer without its clock: every `comparedAtMs`, the ages and the ring's own state (cursor, ticks,
 /// revolution times, shards) taken out.
+/// FIX-1046: every shard ticked past the visibility window (the cap: the fixtures serve no bars) until no identity is
+/// left `pendingReread`, so a planted difference has had its re-read.
+#[allow(clippy::needless_range_loop)]
+async fn fix1046_settle(port: &Fix986<'_>, t: &mut i64, shards: usize) {
+    for _ in 0..4 {
+        *t += compare::REREAD_WINDOW_CAP_MS;
+        for k in 0..shards {
+            compare::ring_tick(port, *t, k, shards, 2, || 0)
+                .await
+                .unwrap();
+        }
+        let a = compare::read_answer(port.d1, "", "", *t, shards)
+            .await
+            .unwrap();
+        if a["identitiesPendingReread"] == json!(0) {
+            return;
+        }
+    }
+    panic!("a re-read never settled");
+}
+
 fn fix998_unclocked(mut v: Value) -> Value {
     fn strip(v: &mut Value) {
         match v {
@@ -12581,7 +12619,8 @@ async fn fix998_b_the_sharded_summary_equals_the_unsharded_one() {
                         .any(|(lo, hi)| id.as_str() > lo.as_str() && id.as_str() <= hi.as_str());
                     assert!(own, "shard {k} compared {id}, not its own");
                 }
-                seen.extend(r.compared);
+                // FIX-1046: a re-read is the second read of an identity, not the revolution's.
+                seen.extend(r.compared.into_iter().filter(|id| !r.rereads.contains(id)));
                 wrapped[k] |= r.wrapped;
                 let fleet = compare::read_answer(&d1, "", "", t, shards).await.unwrap();
                 let want = i64::from(wrapped.iter().all(|w| *w));
@@ -12594,6 +12633,7 @@ async fn fix998_b_the_sharded_summary_equals_the_unsharded_one() {
         let mut all = ids.clone();
         all.sort();
         assert_eq!(seen, all, "{shards} shards: every identity once");
+        fix1046_settle(&port, &mut t, shards).await;
         let answer = compare::read_answer(&d1, "", "", t, shards).await.unwrap();
         assert_eq!(answer["identities"], json!(12));
         assert_eq!(answer["identitiesDiffering"], json!(1), "{answer}");
@@ -12759,6 +12799,8 @@ async fn fix998s_a_the_health_counts_are_the_summarys() {
                     ("identities", "identities"),
                     ("diffs", "identitiesDiffering"),
                     ("heldByLag", "identitiesHeldByLag"),
+                    ("heldByApply", "identitiesHeldByApply"),
+                    ("pendingReread", "identitiesPendingReread"),
                     ("oldestCompareAgeMs", "comparedWithinMs"),
                     ("faults", "faultCount"),
                     ("staleD1", "staleD1"),
@@ -12782,6 +12824,10 @@ async fn fix998s_a_the_health_counts_are_the_summarys() {
             }
             t += compare::FLEET_COMPARE_TICK_MS;
         }
+        fix1046_settle(&port, &mut t, shards).await;
+        d1.run_batch(vec![compare::fleet_health_stmt(t, shards, true)])
+            .await
+            .unwrap();
         let (_, _, fleet) = crate::owed_events::health_actor_fleet(&d1, &Value::Null).await;
         assert_eq!(
             (
@@ -19861,4 +19907,321 @@ mod d2_actor_g {
         assert!(ak <= am && vk <= vm);
         assert!(ak < 3_000 && vk < 5_000);
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// FIX-1046 (bsv-low #1046; L58's fold, record 1777): the fleet compare re-reads a differing identity after the
+// actor's visibility window; a difference that clears is `heldByApply`, named and never counted.
+
+/// The actor's health snapshot serving `rowsVisibleMsP95` = `p95` (one direct-class bars row of this build).
+fn fix1046_served_p95(d1: &SqliteSql, p95: u64) {
+    let bars = json!([{
+        "name": "owed-actor:bars:direct",
+        "cursor": json!({"libRev": crate::owed_actor::lib_rev(), "visible": [p95]}).to_string(),
+        "tickedAtMs": NOW_MS,
+    }]);
+    d1.conn
+        .execute(
+            "INSERT OR REPLACE INTO owed_belt_state(name,cursor,tickedAtMs) VALUES ('owed-actor:health',?1,?2)",
+            rusqlite::params![json!({"asOfMs": NOW_MS, "bars": bars}).to_string(), NOW_MS as i64],
+        )
+        .unwrap();
+}
+
+fn fix1046_row(d1: &SqliteSql, id: &str) -> (i64, Value) {
+    d1.conn
+        .query_row(
+            "SELECT diffCount,outpoints FROM owed_actor_compare WHERE identity=?1",
+            [id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .map(|(n, o)| (n, serde_json::from_str(&o).unwrap()))
+        .unwrap()
+}
+
+fn fix1046_queue(d1: &SqliteSql) -> Vec<String> {
+    let ring: Value = serde_json::from_str(
+        &d1.conn
+            .query_row(
+                "SELECT cursor FROM owed_belt_state WHERE name='fleet-compare:ring'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    ring["rereads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e["identity"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// (fix1046_a) THE APPLY'S LAG IS HELD BY APPLY, NEVER A DIFF. L58's shape: the fresh D1 judgement reads a write the
+/// actor has not applied yet (the seat's actor row one behind: its sats one more, as the D1 judge's old judgement
+/// stood), the ring's tick reads at that instant; the actor's apply lands ONE SECOND later. The served
+/// `rowsVisibleMsP95` is L58's 1,492 ms, so the window is the 5 s floor ([`compare::reread_window_ms`]). The first
+/// read holds the outpoint `pendingReread` (diffs 0, the identity queued); a tick inside the window re-reads nothing;
+/// the re-read at the window finds no difference: the outpoint `heldByApply` on the row, diffs 0, the counter
+/// `owed_actor_compare_held_by_apply_total` 1, the standing route's `identitiesHeldByApply` 1 and
+/// `identitiesDiffering` 0, and both public health reads `heldByApply` 1, `diffs` 0. RED under the base's rule
+/// (`classify_reread` made a pass-through, every unheld difference counted at its first read): the first tick counts
+/// the identity a diff.
+#[tokio::test]
+async fn fix1046_a_a_difference_the_actors_apply_clears_is_held_by_apply() {
+    assert_eq!(compare::reread_window_ms(Some(1_492)), 5_000);
+    assert_eq!(compare::reread_window_ms(Some(4_000)), 8_000);
+    assert_eq!(compare::reread_window_ms(Some(20_000)), 30_000);
+    assert_eq!(
+        compare::reread_window_ms(None),
+        compare::REREAD_WINDOW_CAP_MS
+    );
+    let (d1, ids, actors) = fix986_fleet(3).await;
+    fix1046_served_p95(&d1, 1_492);
+    let target = ids[1].clone();
+    let port = Fix986 {
+        d1: &d1,
+        actors,
+        judges: false,
+        die_after: Cell::new(u32::MAX),
+    };
+    let lag = |delta: i64| {
+        port.actors[&target]
+            .conn
+            .execute(
+                "UPDATE owed_rows SET sats=sats+?2 WHERE identity=?1",
+                rusqlite::params![target, delta],
+            )
+            .unwrap();
+    };
+    lag(1);
+    let t = NOW_MS as i64;
+    let r = compare::ring_tick(&port, t, 0, 1, 16, || 0).await.unwrap();
+    assert_eq!(r.window_ms, 5_000, "{r:?}");
+    assert_eq!(
+        (r.diffs, r.pending_reread, r.held_by_apply),
+        (0, 1, 0),
+        "{r:?}"
+    );
+    let (n, ops) = fix1046_row(&d1, &target);
+    assert_eq!(n, 0, "a first read counts nothing: {ops}");
+    assert_eq!(ops[0]["pendingReread"], json!(true));
+    assert_eq!(ops[0]["seenAtMs"], json!(t));
+    assert_eq!(fix1046_queue(&d1), vec![target.clone()]);
+    // The actor's apply lands a second after the D1 write.
+    lag(-1);
+    let early = compare::ring_tick(&port, t + 4_999, 0, 1, 16, || 0)
+        .await
+        .unwrap();
+    assert!(
+        early.rereads.is_empty(),
+        "not due inside the window: {early:?}"
+    );
+    let r = compare::ring_tick(&port, t + 5_000, 0, 1, 16, || 0)
+        .await
+        .unwrap();
+    assert_eq!(r.rereads, vec![target.clone()], "{r:?}");
+    assert_eq!(
+        (r.diffs, r.pending_reread, r.held_by_apply),
+        (0, 0, 1),
+        "{r:?}"
+    );
+    let (n, ops) = fix1046_row(&d1, &target);
+    assert_eq!(n, 0);
+    assert_eq!(ops.as_array().unwrap().len(), 1, "{ops}");
+    assert_eq!(ops[0]["heldByApply"], json!(true));
+    assert_eq!(ops[0]["held"], json!(true));
+    assert!(fix1046_queue(&d1).is_empty());
+    assert_eq!(d1.counter(crate::owed_actor::COUNTERS[35]), 1);
+    assert_eq!(
+        crate::owed_actor::COUNTERS[35],
+        "owed_actor_compare_held_by_apply_total"
+    );
+    assert!(bsv_overlay_cloudflare::applayer_counters::OWED_ACTOR
+        .contains(&crate::owed_actor::COUNTERS[35]));
+    let got = compare::read_answer(&d1, "", "", t + 5_001, 1)
+        .await
+        .unwrap();
+    assert_eq!(got["identitiesDiffering"], json!(0), "{got}");
+    assert_eq!(got["identitiesHeldByApply"], json!(1), "{got}");
+    assert_eq!(got["identitiesPendingReread"], json!(0), "{got}");
+    assert!(got["diffs"].as_array().unwrap().is_empty());
+    assert!(
+        got["heldByLag"].as_array().unwrap().is_empty(),
+        "never held by lag: {got}"
+    );
+    assert_eq!(got["heldByApply"][0]["identity"], json!(target));
+    assert_eq!(got["heldByApply"][0]["heldByApplyCount"], json!(1));
+    d1.run_batch(vec![compare::fleet_health_stmt(t + 5_002, 1, true)])
+        .await
+        .unwrap();
+    d1.now.set((t + 5_003) as u64);
+    let (_, _, fleet) = crate::owed_events::health_actor_fleet(&d1, &Value::Null).await;
+    assert_eq!(
+        (fleet["diffs"].clone(), fleet["heldByApply"].clone()),
+        (json!(0), json!(1)),
+        "{fleet}"
+    );
+    assert_eq!(fix998s_invariants(&d1, t + 5_003).await, fleet);
+    let view = bsv_overlay_cloudflare::applayer_counters::owed_actor_view(
+        &json!({crate::owed_actor::COUNTERS[35]: 1}),
+    );
+    assert_eq!(view["heldByApplyDiffs"], json!(1));
+}
+
+/// (fix1046_b) A DIFFERENCE THAT STANDS AFTER THE WINDOW IS A DIFF. The seat's actor differs and never catches up:
+/// the first read `pendingReread`; the operator's POST a second later (inside the window) still counts nothing; the
+/// re-read at the window counts it (diffs 1, the outpoint `held: false` with its fields, no `heldByApply`, the counter
+/// 0); a later read where it still differs keeps it counted. RED under the base's rule: the first tick counts it.
+#[tokio::test]
+async fn fix1046_b_a_difference_that_stands_past_the_window_counts() {
+    let (d1, ids, actors) = fix986_fleet(3).await;
+    fix1046_served_p95(&d1, 1_492);
+    let target = ids[2].clone();
+    actors[&target]
+        .conn
+        .execute(
+            "UPDATE owed_rows SET sats=sats+1 WHERE identity=?1",
+            [&target],
+        )
+        .unwrap();
+    let port = Fix986 {
+        d1: &d1,
+        actors,
+        judges: false,
+        die_after: Cell::new(u32::MAX),
+    };
+    let t = NOW_MS as i64;
+    let r = compare::ring_tick(&port, t, 0, 1, 16, || 0).await.unwrap();
+    assert_eq!((r.diffs, r.pending_reread), (0, 1), "{r:?}");
+    let posted = compare::compare_now(&port, &target, t + 1_000)
+        .await
+        .unwrap();
+    assert_eq!(posted["diffCount"], json!(0), "inside the window: {posted}");
+    assert_eq!(posted["pendingRereadCount"], json!(1));
+    assert_eq!(
+        posted["outpoints"][0]["seenAtMs"],
+        json!(t),
+        "the first sight kept"
+    );
+    let r = compare::ring_tick(&port, t + 5_000, 0, 1, 16, || 0)
+        .await
+        .unwrap();
+    assert_eq!(r.rereads, vec![target.clone()]);
+    assert_eq!(
+        (r.diffs, r.pending_reread, r.held_by_apply),
+        (1, 0, 0),
+        "{r:?}"
+    );
+    let (n, ops) = fix1046_row(&d1, &target);
+    assert_eq!(n, 1);
+    assert_eq!(ops[0]["held"], json!(false));
+    assert!(ops[0].get("pendingReread").is_none() && ops[0].get("heldByApply").is_none());
+    assert_eq!(
+        ops[0]["fields"]["sats"],
+        json!({"d1": 20190, "actor": 20191})
+    );
+    assert_eq!(d1.counter(crate::owed_actor::COUNTERS[35]), 0);
+    let posted = compare::compare_now(&port, &target, t + 6_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        posted["diffCount"],
+        json!(1),
+        "a counted difference that stands stays counted"
+    );
+    let got = compare::read_answer(&d1, "", "", t + 6_001, 1)
+        .await
+        .unwrap();
+    assert_eq!(got["identitiesDiffering"], json!(1));
+    assert_eq!(got["identitiesHeldByApply"], json!(0));
+    assert_eq!(got["diffs"][0]["identity"], json!(target));
+}
+
+/// A ring compare of the real fresh compare plus `burn` statements of its own: a re-read the tick's statement budget
+/// cannot afford after the first.
+struct Fix1046Heavy {
+    burn: usize,
+}
+impl compare::RingCompare for Fix1046Heavy {
+    async fn compare<J: JudgeDb>(
+        &self,
+        m: &compare::Metered<'_, J>,
+        identity: &str,
+        now: i64,
+    ) -> compare::CompareRow {
+        let mut left = self.burn;
+        while left > 0 {
+            let n = left.min(16);
+            m.run_batch((0..n).map(|_| Stmt::new("SELECT 1", vec![])).collect())
+                .await
+                .unwrap();
+            left -= n;
+        }
+        compare::compare_one(m, identity, now).await.0
+    }
+}
+
+/// (fix1046_c) A TICK THAT CANNOT AFFORD A RE-READ LEAVES IT PENDING AND COUNTS NOTHING. Two seats differ for good and
+/// are both due their re-read at one tick; each compare there costs 700 statements more, so the tick re-reads the
+/// first (counted) and stops on its budget before the second (`stopped` "statements"): the second's row stays
+/// `pendingReread` with diffs 0, it stays queued, and the tick counts only the first. A tick past its wall re-reads
+/// nothing and moves nothing. The next tick that can afford it counts the second. RED under the base's rule: the
+/// first tick counts both.
+#[tokio::test]
+async fn fix1046_c_a_reread_the_tick_cannot_afford_stays_pending_and_counts_nothing() {
+    let (d1, ids, actors) = fix986_fleet(3).await;
+    fix1046_served_p95(&d1, 1_492);
+    for id in [&ids[0], &ids[1]] {
+        actors[id]
+            .conn
+            .execute("UPDATE owed_rows SET sats=sats+1 WHERE identity=?1", [id])
+            .unwrap();
+    }
+    let port = Fix986 {
+        d1: &d1,
+        actors,
+        judges: false,
+        die_after: Cell::new(u32::MAX),
+    };
+    let t = NOW_MS as i64;
+    let r = compare::ring_tick(&port, t, 0, 1, 16, || 0).await.unwrap();
+    assert_eq!((r.diffs, r.pending_reread), (0, 2), "{r:?}");
+    let walled = compare::ring_tick(&port, t + 5_000, 0, 1, 16, || {
+        compare::FLEET_COMPARE_WALL_MS + 1
+    })
+    .await
+    .unwrap();
+    assert_eq!(walled.stopped, Some("wall"), "{walled:?}");
+    assert!(walled.rereads.is_empty() && walled.diffs == 0);
+    assert_eq!(fix1046_queue(&d1).len(), 2);
+    let heavy = Fix1046Heavy { burn: 700 };
+    let r = compare::ring_tick_with(&port, t + 5_000, 0, 1, 16, || 0, &heavy)
+        .await
+        .unwrap();
+    assert_eq!(r.stopped, Some("statements"), "{r:?}");
+    assert_eq!(r.rereads, vec![ids[0].clone()]);
+    assert_eq!(r.diffs, 1, "only the re-read the tick afforded: {r:?}");
+    assert!(
+        r.statements <= compare::FLEET_COMPARE_STATEMENTS_PER_TICK,
+        "{r:?}"
+    );
+    let (n, ops) = fix1046_row(&d1, &ids[1]);
+    assert_eq!(n, 0, "the unread identity counts nothing: {ops}");
+    assert_eq!(ops[0]["pendingReread"], json!(true));
+    assert_eq!(fix1046_queue(&d1), vec![ids[1].clone()]);
+    let got = compare::read_answer(&d1, "", "", t + 5_001, 1)
+        .await
+        .unwrap();
+    assert_eq!(got["identitiesDiffering"], json!(1));
+    assert_eq!(got["identitiesPendingReread"], json!(1));
+    assert_eq!(got["pendingReread"][0]["identity"], json!(ids[1]));
+    let r = compare::ring_tick(&port, t + 15_000, 0, 1, 16, || 0)
+        .await
+        .unwrap();
+    assert_eq!(r.rereads, vec![ids[1].clone()]);
+    assert_eq!(r.diffs, 1, "{r:?}");
+    assert_eq!(fix1046_row(&d1, &ids[1]).0, 1);
+    assert!(fix1046_queue(&d1).is_empty());
 }

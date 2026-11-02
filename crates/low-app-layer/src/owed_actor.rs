@@ -5773,7 +5773,7 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
 /// (`owed_events::HEALTH_CONSUMER_SQL`).
 macro_rules! health_select {
     () => {
-        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold','owed-actor:bars:flood')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding,(SELECT cursor FROM owed_belt_state WHERE name='owed-judge:version') AS d1Rejudge"
+        "SELECT (SELECT json_group_array(json_object('name',name,'cursor',cursor,'tickedAtMs',CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name IN ('owed-actor:bars:direct','owed-actor:bars:queue','owed-actor:bars:mined','owed-actor:bars:cold','owed-actor:bars:flood')) AS bars,(SELECT json_group_object(name,value) FROM ops_counters WHERE name IN ('owed_actor_compared_total','owed_actor_diffs_total','owed_actor_faults_total','owed_actor_reconcile_diffs_total','owed_actor_bootstraps_total','owed_actor_unknown_reads_total','owed_actor_epoch_resets_total','owed_actor_deferred_total','owed_v3_identities_total','owed_v3_rows_total','owed_actor_deferred_done_total','owed_actor_compare_held_total','owed_actor_tip_faults_total','owed_actor_tip_parked_total','owed_actor_schema_partial_total','owed_actor_apply_held_total','owed_actor_closure_rearmed_total','owed_actor_alarm_rearmed_total','owed_actor_bootstrap_faults_total','owed_actor_direct_calls_total','owed_actor_direct_faults_total','owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total','owed_actor_compare_held_by_apply_total')) AS counters,(SELECT COUNT(*) FROM owed_state WHERE rows>0) AS activeIdentities,(SELECT cursor FROM owed_belt_state WHERE name='owed-actor:coverage') AS coverage,(SELECT json_object('count',COUNT(*),'oldestAtMs',MIN(CAST(tickedAtMs AS INTEGER))) FROM owed_belt_state WHERE name>='owed-actor:holding:' AND name<'owed-actor:holding;') AS holding,(SELECT cursor FROM owed_belt_state WHERE name='owed-judge:version') AS d1Rejudge"
     };
 }
 pub const HEALTH_SQL: &str = health_select!();
@@ -6976,7 +6976,7 @@ mod tests;
 /// reads of an identity D1 does not know, answered without an actor (MEDIUM-3), the actors reset on an epoch move
 /// (MEDIUM-5), the Phase A applies run off the consumer (MEDIUM-6), and the `owed-v3` re-judge's identities and rows
 /// (MEDIUM-9).
-pub const COUNTERS: [&str; 35] = [
+pub const COUNTERS: [&str; 36] = [
     "owed_actor_compared_total",
     "owed_actor_diffs_total",
     "owed_actor_faults_total",
@@ -7036,6 +7036,9 @@ pub const COUNTERS: [&str; 35] = [
     // and the filings whose answered closure was declined (past its bound); each filing then read its own miss.
     "owed_actor_direct_closure_faults_total",
     "owed_actor_direct_closure_declines_total",
+    // FIX-1046 (bsv-low #1046): the fleet compare's outpoints whose difference cleared on its re-read after the actor's
+    // visibility window (`heldByApply`, the apply's lag): named, never a diff.
+    "owed_actor_compare_held_by_apply_total",
 ];
 /// The consumer's call to the actor (the queue's delivery), bounded under the message's wall.
 pub const CONSUMER_CALL_WALL_MS: u64 = 20_000;

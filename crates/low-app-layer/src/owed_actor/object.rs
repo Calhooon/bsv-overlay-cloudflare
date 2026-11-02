@@ -1901,11 +1901,15 @@ pub async fn fleet_compare_tick_env(env: &Env, shard: usize) -> Result<Response>
     {
         Ok(r) => {
             console_log!(
-                "[owed-fleet-compare] shard {}/{} compared {} diffs {} faults {} statements {} cursor {:?} wrapped {} stopped {:?} faultKind {:?}",
+                "[owed-fleet-compare] shard {}/{} compared {} diffs {} rereads {} heldByApply {} pendingReread {} windowMs {} faults {} statements {} cursor {:?} wrapped {} stopped {:?} faultKind {:?}",
                 shard,
                 shards,
                 r.compared.len(),
                 r.diffs,
+                r.rereads.len(),
+                r.held_by_apply,
+                r.pending_reread,
+                r.window_ms,
                 r.faults,
                 r.statements,
                 r.cursor,
@@ -1915,6 +1919,7 @@ pub async fn fleet_compare_tick_env(env: &Env, shard: usize) -> Result<Response>
             );
             Response::from_json(&json!({
                 "shard": shard, "shards": shards, "compared": r.compared.len(), "diffs": r.diffs, "faults": r.faults,
+                "rereads": r.rereads, "heldByApply": r.held_by_apply, "pendingReread": r.pending_reread, "windowMs": r.window_ms,
                 "statements": r.statements, "cursor": r.cursor, "wrapped": r.wrapped, "stopped": r.stopped,
                 "faultKind": r.fault_kind,
             }))
