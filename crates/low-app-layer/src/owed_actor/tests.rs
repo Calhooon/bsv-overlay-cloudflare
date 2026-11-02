@@ -17227,8 +17227,20 @@ mod fix1010 {
             .map(rusqlite::types::Value::Integer)
             .into_iter()
             .collect();
-        tx.execute(mark, rusqlite::params_from_iter(p.iter()))
-            .unwrap();
+        // bsv-low #1044: the sweep's marks answer the keys they marked (`RETURNING sourceKey`), and the sweep notes
+        // only those (`hop_probe_memos::sweep_notes`); the clear's marks answer nothing
+        let marked: Vec<String> = {
+            let mut q = tx.prepare(mark).unwrap();
+            let cols = q.column_count();
+            let mut rows = q.query(rusqlite::params_from_iter(p.iter())).unwrap();
+            let mut out = Vec::new();
+            while let Some(r) = rows.next().unwrap() {
+                if cols > 0 {
+                    out.push(r.get::<_, String>(0).unwrap());
+                }
+            }
+            out
+        };
         let mut keys: Vec<String> = Vec::new();
         for sql in framed {
             keys.extend(
@@ -17240,9 +17252,13 @@ mod fix1010 {
             );
         }
         tx.commit().unwrap();
-        keys.into_iter()
-            .filter(|k| memos::noted_key(expire, k))
-            .collect()
+        if expire {
+            memos::sweep_notes(&keys, &marked).0
+        } else {
+            keys.into_iter()
+                .filter(|k| memos::noted_key(expire, k))
+                .collect()
+        }
     }
 
     /// (fix1010_a) THE LENS'S LOW-1 SHAPE: beta's #953 hop, the evidence `<hop>:0` CONFIRMED, both judges `unbound`,
@@ -18781,12 +18797,27 @@ mod fix1042 {
             "the clear's reach is above the find: it moves nothing"
         );
         assert_eq!(sweep_words(&d1).len(), 1, "the spender's word row swept");
-        let expired = expire_memos(&d1);
-        assert_eq!(expired, vec![format!("{FOLD9_HOP}.0")], "the memo expired");
+        let noted = expire_memos(&d1);
+        // bsv-low #1044: the evidence repeats the memo, so the sweep's marks name nothing and it notes nothing
         assert!(
-            published(&d1, "probe", &expired[0]).await.is_none(),
-            "the evidence repeats the memo: no judgement moves, nothing marked"
+            noted.is_empty(),
+            "the evidence repeats the memo: no judgement moves, nothing marked or noted: {noted:?}"
         );
+        assert!(
+            published(&d1, "probe", &format!("{FOLD9_HOP}.0"))
+                .await
+                .is_none(),
+            "nothing to publish for it"
+        );
+        let left: i64 = d1
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM hop_chain_probes WHERE outpoint=?1",
+                [format!("{FOLD9_HOP}.0")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "the memo expired");
         fresh_d1(&d1).await;
         assert_eq!(
             confirmation(&d1, &hop),

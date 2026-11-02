@@ -3694,3 +3694,342 @@ mod tests {
         assert_eq!(probe_memo_read_sql(3), "SELECT outpoint, probedAtMs, spent, spendingTxid, spentConfirmed, tipHeight FROM hop_chain_probes WHERE outpoint IN (?, ?, ?)");
     }
 }
+
+/// bsv-low #1044: the FIX-1042 ensemble's LOW-1 and LOW-2 (lenses A, B, C) over the overlay's shipped statements under
+/// real SQLite: the clear's predicate (`clear_pred!`, run as the clear's own framed delete and demotion) and the judge's
+/// complement ([`clear_unless_survived`]) are held to ONE truth by a differential over the same rows, and each edge of
+/// the complement has its own pin, RED under its own mutant.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod fix1044 {
+    use super::*;
+    use bsv_overlay_cloudflare::hop_probe_memos::{
+        HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL, HOP_PROBE_MEMO_REORG_DEMOTE_SQL,
+        HOP_PROBE_MEMO_REORG_GRACE_MS, HOP_PROBE_MEMO_REORG_MARK_SQL,
+    };
+
+    /// The tombstone's stamp: not a whole second, so a judge comparing seconds is seen.
+    const AT: i64 = 1_790_000_000_500;
+    const REACH: u64 = 1_000;
+
+    fn db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS {
+            if let Err(e) = conn.execute_batch(sql) {
+                assert!(
+                    e.to_string()
+                        .to_ascii_lowercase()
+                        .contains("duplicate column"),
+                    "production migration failed under real SQLite: {e}\n{sql}"
+                );
+            }
+        }
+        conn
+    }
+
+    /// One planted word: a confirmed spend taken at `taken`, its look's verified tip `tip`.
+    #[derive(Clone, Copy, Debug)]
+    struct Word {
+        taken: i64,
+        tip: Option<u64>,
+    }
+
+    fn txid(i: usize, evidence: bool) -> String {
+        format!("{:063x}{}", i, if evidence { "e" } else { "a" })
+    }
+
+    /// The tombstone stamped by the shipped statement as D1 binds it (each number a REAL), the clear's two framed
+    /// writes run at `floor` (the memos deleted, the evidence demoted), then the route's read
+    /// ([`probe_memo_read_sql`]) of every word and the tombstone, mapped as the judge maps a row (a `tipHeight` that
+    /// is not a whole non-negative number is no height). Answers, per word: (moved by the clear as a memo, moved as
+    /// evidence, the judge's survival over the word as read BEFORE the clear).
+    fn run(
+        stamps: &[(i64, Option<u64>)],
+        floor: Option<u64>,
+        words: &[Word],
+    ) -> Vec<(bool, bool, bool)> {
+        let conn = db();
+        for (i, w) in words.iter().enumerate() {
+            for evidence in [false, true] {
+                let key = if evidence {
+                    format!("{}:0", txid(i, true))
+                } else {
+                    format!("{}.0", txid(i, false))
+                };
+                conn.execute(
+                    "INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES(?1,?2,1,?3,1,?4)",
+                    rusqlite::params![key, w.taken, "e5".repeat(32), w.tip.map(|t| t as i64)],
+                )
+                .unwrap();
+            }
+        }
+        for (at, reach) in stamps {
+            conn.execute(
+                HOP_PROBE_MEMO_REORG_MARK_SQL,
+                rusqlite::params![*at as f64, reach.map(|r| r as f64)],
+            )
+            .unwrap();
+        }
+        let read = |conn: &rusqlite::Connection| -> Vec<ProbeMemo> {
+            let mut keys: Vec<String> = (0..words.len())
+                .map(|i| format!("{}.0", txid(i, false)))
+                .collect();
+            keys.push(PROBE_MEMO_REORG_MARK.to_string());
+            let mut q = conn.prepare(&probe_memo_read_sql(keys.len())).unwrap();
+            let rows = q
+                .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
+                    Ok(ProbeMemo {
+                        outpoint: r.get(0)?,
+                        probed_at_ms: r.get(1)?,
+                        spent: r.get(2)?,
+                        spending_txid: r.get(3)?,
+                        spent_confirmed: r.get(4)?,
+                        tip_height: r
+                            .get::<_, Option<i64>>(5)?
+                            .and_then(|v| u64::try_from(v).ok()),
+                    })
+                })
+                .unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        let memos = read(&conn);
+        let at = reorg_clear_at(&memos);
+        let reach = reorg_clear_reach(&memos);
+        let survived: Vec<bool> = (0..words.len())
+            .map(|i| {
+                let key = format!("{}.0", txid(i, false));
+                let m = memos.iter().find(|m| m.outpoint == key).unwrap();
+                clear_unless_survived(m, at, reach).is_none()
+            })
+            .collect();
+        let moved = |sql: &str| -> Vec<String> {
+            match floor {
+                Some(f) => conn
+                    .prepare(sql)
+                    .unwrap()
+                    .query_map([f as f64], |r| r.get(0))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        let deleted = moved(HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL);
+        let demoted = moved(HOP_PROBE_MEMO_REORG_DEMOTE_SQL);
+        (0..words.len())
+            .map(|i| {
+                (
+                    deleted.contains(&format!("{}.0", txid(i, false))),
+                    demoted.contains(&format!("{}:0", txid(i, true))),
+                    survived[i],
+                )
+            })
+            .collect()
+    }
+
+    /// The one truth: a word the judge reads as one the clear left standing is exactly a word taken strictly before
+    /// the stamp, under a tombstone with a reach, that the clear's own statements did NOT move (as a memo and as
+    /// evidence alike). Asserted per row, with the row named.
+    fn assert_one_truth(stamps: &[(i64, Option<u64>)], floor: Option<u64>, words: &[Word]) {
+        let at = stamps.iter().map(|s| s.0).max().unwrap();
+        for (w, (memo_moved, evidence_moved, survived)) in
+            words.iter().zip(run(stamps, floor, words))
+        {
+            assert_eq!(
+                memo_moved, evidence_moved,
+                "{w:?}: one predicate for memos and evidence"
+            );
+            let truth = w.taken < at && floor.is_some() && !memo_moved;
+            assert_eq!(
+                survived, truth,
+                "{w:?} under stamps {stamps:?}, floor {floor:?}: the judge's survival is the clear's complement \
+                 (moved {memo_moved})"
+            );
+        }
+    }
+
+    /// THE DIFFERENTIAL (lens A's grid, lens C's one truth): `tipHeight` NULL and `reach - 8 ..= reach + 1`, taken a
+    /// millisecond before, at and after the stamp, under a tombstone with a reach of 0, of `REACH`, and with none (a
+    /// pre-#1042 tombstone). Any disagreement between the SQL predicate and the Rust complement is RED, row named.
+    #[test]
+    fn fix1044_b_the_clears_predicate_and_the_judges_complement_are_one_truth() {
+        let mut words = Vec::new();
+        for taken in [AT - 1, AT, AT + 1] {
+            words.push(Word { taken, tip: None });
+            for tip in REACH - 8..=REACH + 1 {
+                words.push(Word {
+                    taken,
+                    tip: Some(tip),
+                });
+            }
+        }
+        for reach in [Some(0), Some(REACH), None] {
+            assert_one_truth(&[(AT, reach)], reach, &words);
+        }
+    }
+
+    /// EDGE: the floor. The clear moves `tipHeight + 6 >= reach`, so the word at `reach - 6` is moved and refused and the
+    /// word at `reach - 7` stands and survives. RED under `t + LAG <= r` (the `reach - 6` word survives a clear that
+    /// moved it) and under the lag dropped (`t < r`).
+    #[test]
+    fn fix1044_b_edge_the_floor() {
+        let words = [
+            Word {
+                taken: AT - 1,
+                tip: Some(REACH - 7),
+            },
+            Word {
+                taken: AT - 1,
+                tip: Some(REACH - 6),
+            },
+            Word {
+                taken: AT - 1,
+                tip: Some(REACH),
+            },
+        ];
+        let got: Vec<(bool, bool)> = run(&[(AT, Some(REACH))], Some(REACH), &words)
+            .into_iter()
+            .map(|(m, _, s)| (m, s))
+            .collect();
+        assert_eq!(got, vec![(false, true), (true, false), (true, false)]);
+        assert_one_truth(&[(AT, Some(REACH))], Some(REACH), &words);
+    }
+
+    /// EDGE: a tombstone with no reach (stamped before #1042, the deploy window). The judge holds every word taken
+    /// before it to the grace: none survives, the word far below any floor included. RED under `reach.map_or(true, ..)`.
+    #[test]
+    fn fix1044_b_edge_a_null_reach() {
+        let words = [
+            Word {
+                taken: AT - 1,
+                tip: Some(1),
+            },
+            Word {
+                taken: AT - 1,
+                tip: None,
+            },
+        ];
+        let got: Vec<bool> = run(&[(AT, None)], None, &words)
+            .into_iter()
+            .map(|r| r.2)
+            .collect();
+        assert_eq!(got, vec![false, false]);
+    }
+
+    /// EDGE: a word with no tip (the one-time seed's evidence, an older writer). The clear moves it whatever its reach,
+    /// so it never survives. RED under `m.tip_height.map_or(true, ..)`.
+    #[test]
+    fn fix1044_b_edge_a_word_with_no_tip() {
+        let words = [Word {
+            taken: AT - 1,
+            tip: None,
+        }];
+        let got = run(&[(AT, Some(REACH))], Some(REACH), &words);
+        assert_eq!(got, vec![(true, true, false)]);
+    }
+
+    /// EDGE: the stamp's unit. The tombstone is written in milliseconds as D1 binds them (a REAL) and read back as an
+    /// integer; a word taken ONE millisecond before it survives, one taken at it or after does not. RED under a judge
+    /// comparing seconds (`m.probed_at_ms / 1000 < at / 1000`: the millisecond-before word is refused), under `<=`
+    /// (the word at the stamp survives) and under a stamp read in another unit (`at * 1000`: words after it survive).
+    #[test]
+    fn fix1044_b_edge_the_stamps_unit() {
+        let below = Some(REACH - 20);
+        let words = [
+            Word {
+                taken: AT - 1,
+                tip: below,
+            },
+            Word {
+                taken: AT,
+                tip: below,
+            },
+            Word {
+                taken: AT + 1,
+                tip: below,
+            },
+            Word {
+                taken: AT + 1_000,
+                tip: below,
+            },
+        ];
+        let got: Vec<bool> = run(&[(AT, Some(REACH))], Some(REACH), &words)
+            .into_iter()
+            .map(|r| r.2)
+            .collect();
+        assert_eq!(got, vec![true, false, false, false]);
+    }
+
+    /// LOW-1 (lenses A and B): A LATER, SHALLOWER CLEAR NEVER UN-REFUSES AN EARLIER DEEPER CLEAR'S WORD. Clear 1 at T,
+    /// floor 990; a courier that had not seen the reorg answers CONFIRMED five minutes later at tip 1,000 (inside clear
+    /// 1's reach and grace: refused). Clear 2 ten minutes after clear 1, floor 1,010: the word is below clear 2's reach
+    /// and taken before its stamp, so on the newest reach alone it read as one clear 2 left standing and its
+    /// confirmation was served again with no event. The tombstone keeps the deepest reach inside the grace, so it stays
+    /// refused; a clear a grace after the last resets the reach and the word is that clear's verdict. RED on
+    /// f7ec4e4c's tombstone statement: `the word stays refused after the shallower clear`.
+    #[test]
+    fn fix1044_a_a_shallower_clear_never_unrefuses_a_deeper_clears_word() {
+        let min = 60_000_i64;
+        let word = Word {
+            taken: AT + 5 * min,
+            tip: Some(1_000),
+        };
+        let judged = |stamps: &[(i64, Option<u64>)]| -> bool {
+            let conn = db();
+            conn.execute(
+                "INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES(?1,?2,1,?3,1,?4)",
+                rusqlite::params![format!("{}.0", txid(0, false)), word.taken, "e5".repeat(32), 1_000_i64],
+            )
+            .unwrap();
+            for (at, reach) in stamps {
+                conn.execute(
+                    HOP_PROBE_MEMO_REORG_MARK_SQL,
+                    rusqlite::params![*at as f64, reach.map(|r| r as f64)],
+                )
+                .unwrap();
+            }
+            let keys = [
+                format!("{}.0", txid(0, false)),
+                PROBE_MEMO_REORG_MARK.to_string(),
+            ];
+            let mut q = conn.prepare(&probe_memo_read_sql(2)).unwrap();
+            let memos: Vec<ProbeMemo> = q
+                .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
+                    Ok(ProbeMemo {
+                        outpoint: r.get(0)?,
+                        probed_at_ms: r.get(1)?,
+                        spent: r.get(2)?,
+                        spending_txid: r.get(3)?,
+                        spent_confirmed: r.get(4)?,
+                        tip_height: r
+                            .get::<_, Option<i64>>(5)?
+                            .and_then(|v| u64::try_from(v).ok()),
+                    })
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let m = memos.iter().find(|m| m.outpoint == keys[0]).unwrap();
+            let clear = clear_unless_survived(m, reorg_clear_at(&memos), reorg_clear_reach(&memos));
+            confirmation_refused(m, clear)
+        };
+        assert!(judged(&[(AT, Some(990))]), "refused under the deep clear");
+        assert!(
+            judged(&[(AT, Some(990)), (AT + 10 * min, Some(1_010))]),
+            "the word stays refused after the shallower clear"
+        );
+        assert!(
+            judged(&[
+                (AT, Some(990)),
+                (AT + 10 * min, Some(1_010)),
+                (AT + 20 * min, Some(1_020))
+            ]),
+            "a run of clears inside each other's grace keeps the deepest"
+        );
+        let g = HOP_PROBE_MEMO_REORG_GRACE_MS;
+        assert!(
+            !judged(&[(AT, Some(990)), (AT + 10 * min + g, Some(1_010))]),
+            "a clear a grace after the last: its own reach, the word below it is its verdict"
+        );
+    }
+}
