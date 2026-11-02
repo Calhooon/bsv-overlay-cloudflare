@@ -102,7 +102,9 @@ const IDENTITY_OUTCOMES: [&str; 4] = [
 /// bsv-low #1049 (FIX-1049-FOLD-1): `owed_belt_young_rows`, a gauge the tick SETS: the rows it looked at in
 /// their young window (each once), never a count of re-dates; named without `_total` since FIX-1049-FOLD-2 (the
 /// round-2 ensemble's C NOTE-3: a gauge is no total; never shipped under the old name).
-pub const OWED_BELT: [&str; 10] = [
+/// bsv-low #1057 (FIX-1057-FOLD-1): `owed_belt_oldest_due_age_ms_{first,second,young}`, gauges the tick SETS: the
+/// age of the oldest due row it read by class PLUS ONE, `0` with none (served `oldestDueAgeMs`: the age, `null` for 0).
+pub const OWED_BELT: [&str; 13] = [
     "owed_belt_ticks_total",
     "owed_belt_asked_total",
     "owed_belt_found_total",
@@ -113,6 +115,9 @@ pub const OWED_BELT: [&str; 10] = [
     "owed_belt_faults_other_total",
     "owed_belt_reasked_total",
     "owed_belt_young_rows",
+    "owed_belt_oldest_due_age_ms_first",
+    "owed_belt_oldest_due_age_ms_second",
+    "owed_belt_oldest_due_age_ms_young",
 ];
 
 /// bsv-low #912 (lane D2-ACTOR-B): the app layer's owed actor (`low_app_layer::owed_actor::COUNTERS`, pinned equal
@@ -285,6 +290,7 @@ pub fn owed_belt_view(counters: &serde_json::Value) -> serde_json::Value {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0)
     };
+    let age = |k: &str| n(k).checked_sub(1);
     serde_json::json!({
         "ticks": n("owed_belt_ticks_total"),
         "asked": n("owed_belt_asked_total"),
@@ -292,6 +298,13 @@ pub fn owed_belt_view(counters: &serde_json::Value) -> serde_json::Value {
         "due": n("owed_belt_due_total"),
         "reasked": n("owed_belt_reasked_total"),
         "youngRows": n("owed_belt_young_rows"),
+        // bsv-low #1057 (FIX-1057-FOLD-1): the oldest due row's age per class as the last tick read it; `null` for a
+        // class it read none of, and before any tick (the gauge is the age plus one; a seeded 0 is no age)
+        "oldestDueAgeMs": {
+            "first": age("owed_belt_oldest_due_age_ms_first"),
+            "second": age("owed_belt_oldest_due_age_ms_second"),
+            "young": age("owed_belt_oldest_due_age_ms_young"),
+        },
         "faults": {
             "woc": n("owed_belt_faults_woc_total"),
             "bitails": n("owed_belt_faults_bitails_total"),

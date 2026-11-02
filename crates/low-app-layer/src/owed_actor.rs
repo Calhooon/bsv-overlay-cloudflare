@@ -4904,21 +4904,15 @@ fn landing_lag(x: &Value, y: &Value) -> bool {
             .all(|k| landing[*k] == later[*k]);
         // FIX-1057 (bsv-low #1057 item 6; round 3's C LOW-1): BOTH VERDICTS READ. The earlier side is the wait (no
         // claim, not claimable) and the later side is exactly the press the wait's end gives back: the filed sweep's
-        // own bytes (`sweep-hop`, claimable, `sweepRawHex`, `sweepSource` the filing) in a claimable row. A later row
-        // withheld for another reason, or pressing anything else, on the same sweep is a judge disagreement (a STOP),
-        // never a clock lag.
+        // own bytes in a claimable row. A later row withheld for another reason, or pressing anything else, on the
+        // same sweep is a judge disagreement (a STOP), never a clock lag. FIX-1057-FOLD-1 (the ensemble's C LOW-2):
+        // both shapes are the judge's ONE spelling (`owed::is_landing_wait`, `owed::is_filed_sweep_press`), read
+        // here, never re-spelled; the row's own `claimable` column beside them.
         let claimable_row = |r: &Value| r["claimable"] == true || r["claimable"] == 1;
-        let waits = lf["claim"].is_null() && lf["claimable"] == false && !claimable_row(landing);
-        let presses = pf["claim"] == "sweep-hop"
-            && pf["claimable"] == true
-            && pf["sweepRawHex"].is_string()
-            && pf["sweepSource"] == "hopsweep-filing"
-            && claimable_row(later);
+        let waits = crate::owed::is_landing_wait(&lf) && !claimable_row(landing);
+        let presses = crate::owed::is_filed_sweep_press(&pf) && claimable_row(later);
         same && waits
             && presses
-            && lf["sweepLanding"] == true
-            && pf.get("sweepLanding").is_none()
-            && lf["sweepTxid"].is_string()
             && lf["sweepTxid"] == pf["sweepTxid"]
             && match (
                 n(&lf["sweepLandingUntilMs"]),

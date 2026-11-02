@@ -380,7 +380,7 @@ pub const SWEEP_LANDING_REASON: &str =
 /// the row presses again, and the press is the FILED sweep's own bytes (`sweepRawHex`): the same transaction
 /// re-presented, never a second spend, which is the remedy for a sweep a mempool dropped. A refused word, a word the
 /// tracker swept, `unknown`, `abandoned`, `built` or a word with no hint time ends it at once (the word's own mark
-/// re-judges the row). The belt looks at the row by the wait's end (`owed_belt::cap_to_landing_end`), so the press
+/// re-judges the row). The belt looks at the row by the wait's end (`owed_belt::next_look`), so the press
 /// comes back on that look.
 pub const SWEEP_LANDING_WAIT_MS: i64 = 3_600_000;
 /// FIX-1057 (bsv-low #1057 item 8; round 3's B NOTE-1): THE WAIT'S ABSOLUTE BOUND. The wait follows the newest hint of
@@ -390,6 +390,10 @@ pub const SWEEP_LANDING_WAIT_MS: i64 = 3_600_000;
 /// clock. Whatever any source keeps saying, the press (the filed bytes, never a second spend) is back six hours after
 /// the filing at the latest. A filing whose stamp the record does not hold has no wait (the door stamps every one).
 /// Stated: a sweep filed long before its broadcast has its wait cut short; the press then re-presents the same bytes.
+/// FIX-1057-FOLD-1 (the ensemble's C NOTE-1): six hours is no mempool fact (a node keeps a transaction for days); it
+/// equals the belt's back-off ceiling (`owed_belt::OWED_BELT_BACKOFF_MAX_MS`) ON PURPOSE, so a row past the bound is
+/// looked at no less often than any backed-off row, and what it releases is idempotent (the same filed bytes
+/// re-presented: a node that holds them answers a duplicate, one that dropped them takes them again).
 pub const SWEEP_LANDING_MAX_MS: i64 = 6 * 3_600_000;
 
 /// FIX-1049 (bsv-low #1049): is this tracker word a LIVE spender, one a broadcaster holds (`announced`, `seen`) or the
@@ -430,6 +434,30 @@ pub fn landing_end(at_ms: i64, filed_at_ms: i64) -> i64 {
         .min(filed_at_ms.saturating_add(SWEEP_LANDING_MAX_MS))
 }
 
+/// The press's source when it rides the FILED sweep's own bytes (`sweepSource`).
+pub const SWEEP_SOURCE_FILING: &str = "hopsweep-filing";
+
+/// FIX-1057-FOLD-1 (the FIX-1057 ensemble's C LOW-2, its DELETE): THE ONE SPELLING of the press a stranded hop's
+/// filed sweep gives (what [`sweep_press_or_landing`] leaves on a press arm's facts with a filing and no wait): the
+/// `sweep-hop` claim, claimable, the filed bytes (`sweepRawHex`), its source the filing, no landing wait. The compare
+/// (`owed_actor::landing_lag`) reads the shape through this, never a copy.
+pub fn is_filed_sweep_press(facts: &Value) -> bool {
+    facts["claim"] == "sweep-hop"
+        && facts["claimable"] == true
+        && facts["sweepRawHex"].is_string()
+        && facts["sweepSource"] == SWEEP_SOURCE_FILING
+        && facts.get("sweepLanding").is_none()
+}
+
+/// FIX-1057-FOLD-1: THE ONE SPELLING of a landing wait's facts ([`sweep_press_or_landing`] answering `true`): no
+/// claim, not claimable, `sweepLanding`, the filed sweep named.
+pub fn is_landing_wait(facts: &Value) -> bool {
+    facts["sweepLanding"] == true
+        && facts["claim"].is_null()
+        && facts["claimable"] == false
+        && facts["sweepTxid"].is_string()
+}
+
 /// FIX-1049-FOLD-1 (C answer 1, LOW-1: ONE guard): the filed-sweep block of a stranded hop's press, inside the two
 /// press arms (the couriers' fresh `unspent`, the index's `unspent`), which the chain's spent arm precedes by the
 /// match's own order. With a filing whose sweep is in its landing wait ([`landing_wait`]) the row is the wait instead
@@ -441,7 +469,7 @@ fn sweep_press_or_landing(i: &OwedInputs, facts: &mut Value, outpoint: &str) -> 
         return false;
     };
     facts["sweepTxid"] = json!(f.sweep_txid);
-    facts["sweepSource"] = json!("hopsweep-filing");
+    facts["sweepSource"] = json!(SWEEP_SOURCE_FILING);
     let Some((_, at_ms, end)) = landing_wait(i, f) else {
         facts["sweepRawHex"] = json!(f.raw_hex);
         return false;
@@ -9618,5 +9646,57 @@ pub(crate) mod tests {
         }
         assert_eq!(landing_end(5, 0), 5 + SWEEP_LANDING_WAIT_MS);
         assert_eq!(landing_end(SWEEP_LANDING_MAX_MS, 0), SWEEP_LANDING_MAX_MS);
+    }
+
+    /// FIX-1057-FOLD-1 (the FIX-1057 ensemble's C LOW-2): the press a filed sweep gives and its landing wait are the
+    /// JUDGE'S shapes, read by one predicate each ([`is_filed_sweep_press`], [`is_landing_wait`]), which the compare's
+    /// `landing_lag` calls. Derived here through `derive_owed_rows` (the fix1057_8 fixture): the wait inside the bound,
+    /// the press past it; each satisfies its own predicate and not the other's, and a press with no filing (the
+    /// sign-here press) is neither. RED when the judge's shape moves without the predicate (a press the predicate does
+    /// not read is a STOP the compare would then call a lag, or the reverse).
+    #[test]
+    fn fix1057f1_1_the_press_and_the_wait_are_one_spelling() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let now: i64 = 1_800_000_000_000;
+        let words = std::collections::BTreeMap::from([(
+            sweep.clone(),
+            json!({"word": "seen", "tier": "hint", "verifyPath": null, "at": now / 1000 - 60}),
+        )]);
+        let judged = |filed_at_ms: Option<i64>, with_filing: bool| {
+            let mut sweeps = filed(&key, &sweep);
+            sweeps.get_mut(&key).unwrap().filed_at_ms = filed_at_ms;
+            if !with_filing {
+                sweeps.clear();
+            }
+            let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+            i.hop_sweeps = &sweeps;
+            i.spender_words = Some(&words);
+            derive_and_pin(&i).remove(0)
+        };
+        let wait = judged(Some(now - 120_000), true);
+        assert!(is_landing_wait(&wait.facts), "the wait: {}", wait.facts);
+        assert!(!is_filed_sweep_press(&wait.facts), "{}", wait.facts);
+        let press = judged(Some(now - 2 * SWEEP_LANDING_MAX_MS), true);
+        assert!(
+            is_filed_sweep_press(&press.facts),
+            "the press: {}",
+            press.facts
+        );
+        assert!(!is_landing_wait(&press.facts), "{}", press.facts);
+        assert_eq!(press.facts["sweepTxid"], wait.facts["sweepTxid"]);
+        let sign_here = judged(None, false);
+        assert_eq!(sign_here.facts["claim"], "sweep-hop", "{}", sign_here.facts);
+        assert!(
+            !is_filed_sweep_press(&sign_here.facts) && !is_landing_wait(&sign_here.facts),
+            "a press that signs here is no filed press: {}",
+            sign_here.facts
+        );
     }
 }
