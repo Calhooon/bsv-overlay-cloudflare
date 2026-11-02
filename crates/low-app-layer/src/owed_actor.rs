@@ -1655,64 +1655,89 @@ pub fn entry_mark(txid: &str, bytes: &[u8]) -> Value {
 pub const ENTRY_MARK_RAW_EDGE: usize = 32;
 
 /// The two marks of one parse ([`bump_mark`], [`entry_mark`]).
+///
+/// FIX-1045-FOLD-1 (the FIX-1045 ensemble's A LOW-1, B LOW-1, C LOW-3): the marks are PLACED by one linear walk of
+/// the bytes (bsv-rs's [`bsv_rs::transaction::BeefStream`]), never found by a search: the subject's bump is the
+/// `bump_index`-th BUMP element (its leading byte is its height varint) and the subject's entry is the subject's
+/// own `Tx` element (its raw at the element's offset), its marker after the raw in V1 and before it in V2 by the
+/// stream's version word. A search for `raw || marker` anchored a V2 subject followed by an entry of the same bump
+/// index on the NEXT entry's marker (a same-length repoint held with a stale `bumpHeight`), and was quadratic in
+/// the subject's size on bytes an ancestor repeats. Bytes the walk does not place (the marker not where the frame
+/// puts it, a bump index past the BUMPs, the walk refusing) are `null`: the hold re-reads.
 fn held_marks(txid: &str, bytes: &[u8]) -> (Value, Value) {
-    let Ok(b) = overlay_engine::beef_limits::parse_beef(
-        bytes,
-        &overlay_engine::beef_limits::APP_BEEF_LIMITS,
-    ) else {
-        return (Value::Null, Value::Null);
-    };
-    let Some(btx) = b.find_txid(txid) else {
-        return (Value::Null, Value::Null);
-    };
-    let bump_index = btx.bump_index();
-    let height = match bump_index.and_then(|i| b.bumps.get(i)) {
-        None if bump_index.is_some() => Value::Null,
-        None => json!([]),
-        Some(bump) => {
-            let bin = bump.to_binary();
-            let vlen = match bump.block_height {
-                0..=0xfc => 1,
-                0xfd..=0xffff => 3,
-                _ => 5,
-            };
-            match find(bytes, &bin) {
-                Some(at) => json!([at + 1, hex::encode_upper(&bytes[at..at + vlen])]),
-                None => Value::Null,
-            }
-        }
-    };
-    let entry = btx.raw_tx().map_or(Value::Null, |raw| {
-        let mut marker = vec![u8::from(bump_index.is_some())];
-        if let Some(i) = bump_index {
-            let mut w = bsv_rs::primitives::encoding::Writer::new();
-            w.write_var_int(i as u64);
-            marker.extend(w.into_bytes());
-        }
-        let edge = raw.len().min(ENTRY_MARK_RAW_EDGE);
-        let v1 = [raw, marker.as_slice()].concat();
-        let v2 = [marker.as_slice(), raw].concat();
-        if let Some(at) = find(bytes, &v1) {
-            let from = at + raw.len() - edge;
-            json!([from + 1, hex::encode_upper(&bytes[from..at + v1.len()])])
-        } else if let Some(at) = find(bytes, &v2) {
-            json!([
-                at + 1,
-                hex::encode_upper(&bytes[at..at + marker.len() + edge])
-            ])
-        } else {
-            Value::Null
-        }
-    });
-    (height, entry)
-}
-
-/// The first offset of `needle` in `bytes`.
-fn find(bytes: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > bytes.len() {
-        return None;
+    use bsv_rs::transaction::{BeefStream, Element, BEEF_V1};
+    let nulls = (Value::Null, Value::Null);
+    if overlay_engine::beef_limits::parse_beef(bytes, &overlay_engine::beef_limits::APP_BEEF_LIMITS)
+        .is_err()
+    {
+        return nulls;
     }
-    bytes.windows(needle.len()).position(|w| w == needle)
+    let mut stream = BeefStream::new(bytes);
+    let mut bumps: Vec<(usize, u64)> = Vec::new();
+    let mut subject: Option<(usize, usize, Option<u64>)> = None;
+    loop {
+        match stream.next_element() {
+            Ok(Some(Element::Bump(b))) => bumps.push((b.offset as usize, b.block_height)),
+            Ok(Some(Element::Tx {
+                offset,
+                txid: t,
+                bump_index,
+                body,
+            })) if subject.is_none()
+                && bsv_rs::transaction::beef_stream::display_hex(&t).eq_ignore_ascii_case(txid) =>
+            {
+                subject = Some((offset as usize, body.raw.len(), bump_index));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => return nulls,
+        }
+    }
+    let Some((at, len, bump_index)) = subject else {
+        return nulls;
+    };
+    let height = match bump_index {
+        None => json!([]),
+        Some(i) => match bumps.get(i as usize) {
+            None => Value::Null,
+            Some(&(off, h)) => {
+                let vlen = match h {
+                    0..=0xfc => 1,
+                    0xfd..=0xffff => 3,
+                    0x1_0000..=0xffff_ffff => 5,
+                    _ => 9,
+                };
+                bytes
+                    .get(off..off + vlen)
+                    .map_or(Value::Null, |v| json!([off + 1, hex::encode_upper(v)]))
+            }
+        },
+    };
+    let mut marker = vec![u8::from(bump_index.is_some())];
+    if let Some(i) = bump_index {
+        let mut w = bsv_rs::primitives::encoding::Writer::new();
+        w.write_var_int(i);
+        marker.extend(w.into_bytes());
+    }
+    let edge = len.min(ENTRY_MARK_RAW_EDGE);
+    let (from, to, marker_at) = if stream.version() == Some(BEEF_V1) {
+        (at + len - edge, at + len + marker.len(), at + len)
+    } else {
+        let Some(m) = at.checked_sub(marker.len()) else {
+            return (height, Value::Null);
+        };
+        (m, at + edge, m)
+    };
+    let entry = match (
+        bytes.get(from..to),
+        bytes.get(marker_at..marker_at + marker.len()),
+    ) {
+        (Some(mark), Some(m)) if m == marker.as_slice() => {
+            json!([from + 1, hex::encode_upper(mark)])
+        }
+        _ => Value::Null,
+    };
+    (height, entry)
 }
 
 /// PURE (FIX-1045, the CUT-263 ensemble's A LOW-1): a txid of the read whose BEEF rows came back neither all held
