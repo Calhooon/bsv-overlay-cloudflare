@@ -39,6 +39,10 @@ pub const OWED_BELT_UNANSWERED_RETRY_MS: i64 = 300_000;
 /// A look that changed nothing (the D2-OWED lens's HIGH-3) doubles its row's period, to this ceiling (6 h). The
 /// judge's own dating (a source write, a tip) starts it again at the family's base period.
 pub const OWED_BELT_BACKOFF_MAX_MS: i64 = 6 * 3_600_000;
+/// FIX-1049 (bsv-low #1049, L58 pair 17): how long after a broadcaster first took the spender a miss on its outpoint
+/// is YOUNG ([`young_miss`]): three blocks' worth. Inside it the belt re-asks on its next tick; past it the back-off
+/// runs as for any look that changed nothing, so a sweep that never lands costs at most 15 extra looks.
+pub const OWED_BELT_YOUNG_MISS_MS: i64 = 1_800_000;
 /// The rung's circuit: this many faults in one tick close it for the rest of the tick (`tracker_host::pacing`'s 3).
 pub const OWED_BELT_RUNG_FAULTS: u8 = 3;
 /// The singleton actor's name in `BOARD_VIEW` (fleet-wide: one belt whatever the number of readers or isolates).
@@ -159,6 +163,8 @@ pub const COUNTER_FOUND: &str = "owed_belt_found_total";
 pub const COUNTER_DUE: &str = "owed_belt_due_total";
 /// FIX-1027-FOLD-1: the outpoints the operator's re-ask lever ([`reask`]) asked.
 pub const COUNTER_REASKED: &str = "owed_belt_reasked_total";
+/// FIX-1049: the young misses re-asked on the next tick ([`young_miss`]).
+pub const COUNTER_YOUNG_REASKED: &str = "owed_belt_young_reasked_total";
 pub fn fault_counter(rung: usize) -> String {
     format!(
         "owed_belt_faults_{}_total",
@@ -175,6 +181,7 @@ pub fn counter_names() -> Vec<String> {
     ];
     v.extend((0..RUNGS.len()).map(fault_counter));
     v.push(COUNTER_REASKED.to_owned());
+    v.push(COUNTER_YOUNG_REASKED.to_owned());
     v
 }
 
@@ -306,6 +313,25 @@ pub fn rests_on_unconfirmed_find(facts: &Value) -> bool {
     facts["hopTxid"].is_string()
         && facts["chainProbe"] == "spent"
         && facts["spentConfirmed"] != true
+}
+
+/// FIX-1049 (bsv-low #1049, L58 pair 17): is a miss on this row's outpoint YOUNG? The row is a swept hop's landing
+/// wait (`sweepLanding`, `owed::derive_owed_rows`: the hop's filed sweep live at a broadcaster by the tracker's word,
+/// [`owed::spender_word_live`], the couriers and the index not yet showing it spend the hop) whose sweep a
+/// broadcaster first took (`sweepLandingAtMs`, the word's `at`) less than [`OWED_BELT_YOUNG_MISS_MS`] ago. Such a miss is the
+/// network's relay, not an answer: the belt asks again on its next tick, never after the 300 s floor or a doubled
+/// period. A miss with no live word (or an old one) backs off as before.
+pub fn young_miss(facts: &Value, now_ms: i64) -> bool {
+    facts["sweepLanding"] == true
+        && facts["sweepLandingAtMs"]
+            .as_i64()
+            .filter(|at| *at > 0)
+            .is_some_and(|at| (0..OWED_BELT_YOUNG_MISS_MS).contains(&now_ms.saturating_sub(at)))
+}
+
+/// FIX-1049: a young miss's next look, the belt's next tick.
+pub fn young_due(now_ms: i64) -> i64 {
+    now_ms + OWED_BELT_TICK_MS
 }
 
 /// FIX-988: a payout row whose spend is seen and not mined (`owed::derive_owed_rows`: `chainWait: "block"` exactly
@@ -631,6 +657,8 @@ pub struct TickReport {
     pub no_tip: bool,
     /// bsv-low #912 (Phase C): finds handed back to their actor as a `belt-find` event.
     pub handed_back: usize,
+    /// FIX-1049: young misses ([`young_miss`]) dated for the next tick instead of the back-off.
+    pub young_reasked: usize,
 }
 
 /// The tick's places by class (the third delta lens's D3-M1, the ruling: no class owns the whole tick), given each
@@ -1050,6 +1078,10 @@ async fn ask_backoff(
         .as_str()
         .and_then(|f| serde_json::from_str(f).ok())
         .unwrap_or(Value::Null);
+    if young_miss(&facts, now) {
+        set_ask_due(db, c, young_due(now), report, true).await;
+        return;
+    }
     let before = look_shape(&c.family, &c.facts, c.reason.as_deref());
     let after = look_shape(
         row["family"].as_str().unwrap_or_default(),
@@ -1079,19 +1111,51 @@ async fn ask_backoff(
 }
 
 async fn rearm_ask(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickReport) {
+    let (due, young) = rearm_due(c, now);
+    if set_ask_due(db, c, due, report, young).await {
+        report.rearmed += 1;
+    }
+}
+
+/// FIX-1049: an unanswered look's next date: the next tick for a young miss ([`young_miss`]), else
+/// [`unanswered_period`]. Answers the date and whether it was young.
+pub fn rearm_due(c: &Candidate, now: i64) -> (i64, bool) {
+    if young_miss(&c.facts, now) {
+        (young_due(now), true)
+    } else {
+        (now + unanswered_period(now, c.judged_at_ms), false)
+    }
+}
+
+/// Phase C: set one ask's next look in the ledger (`young`: counted a young re-ask).
+async fn set_ask_due(
+    db: &impl JudgeDb,
+    c: &Candidate,
+    due: i64,
+    report: &mut TickReport,
+    young: bool,
+) -> bool {
     let stmt = Stmt {
         sql: ASK_DUE_SQL.into(),
         binds: vec![
             Bind::Text(ask_name(&c.identity, &c.outpoint)),
-            Bind::Int(now + unanswered_period(now, c.judged_at_ms)),
+            Bind::Int(due),
         ],
     };
     match db.run_batch(vec![stmt]).await {
-        Ok(_) => report.rearmed += 1,
-        Err(e) => db.log(&format!(
-            "[owed-belt] re-arm of {} faulted: {e}",
-            c.outpoint
-        )),
+        Ok(_) => {
+            if young {
+                report.young_reasked += 1;
+            }
+            true
+        }
+        Err(e) => {
+            db.log(&format!(
+                "[owed-belt] re-arm of {} faulted: {e}",
+                c.outpoint
+            ));
+            false
+        }
     }
 }
 
@@ -1211,6 +1275,12 @@ pub async fn reask<C: Courier>(
         deltas.push((
             crate::owed_actor::COUNTERS[9].to_owned(),
             out.tick.handed_back as u64,
+        ));
+    }
+    if out.tick.young_reasked > 0 {
+        deltas.push((
+            COUNTER_YOUNG_REASKED.to_owned(),
+            out.tick.young_reasked as u64,
         ));
     }
     for (rung, n) in out.tick.faults.iter().enumerate() {
@@ -1420,6 +1490,12 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
             report.handed_back as u64,
         ));
     }
+    if report.young_reasked > 0 {
+        deltas.push((
+            COUNTER_YOUNG_REASKED.to_owned(),
+            report.young_reasked as u64,
+        ));
+    }
     for (rung, n) in report.faults.iter().enumerate() {
         if *n > 0 {
             deltas.push((fault_counter(rung), *n));
@@ -1427,11 +1503,12 @@ pub async fn tick<C: Courier>(db: &impl JudgeDb, courier: &C) -> Result<TickRepo
     }
     db.counters(deltas).await;
     db.log(&format!(
-        "[owed-belt] tick: candidates={} asked={} found={} rearmed={} left={} calls={} faults={:?} write_faults={}",
+        "[owed-belt] tick: candidates={} asked={} found={} rearmed={} young={} left={} calls={} faults={:?} write_faults={}",
         report.candidates,
         report.asked,
         report.found,
         report.rearmed,
+        report.young_reasked,
         report.left,
         report.calls,
         report.faults,
@@ -1495,6 +1572,23 @@ async fn backoff(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickRe
         .as_str()
         .and_then(|f| serde_json::from_str(f).ok())
         .unwrap_or(Value::Null);
+    if young_miss(&facts, now) {
+        let stmt = Stmt {
+            sql: BACKOFF_SQL.into(),
+            binds: vec![
+                Bind::Text(c.identity.clone()),
+                Bind::Text(c.outpoint.clone()),
+                Bind::Int(young_due(now)),
+            ],
+        };
+        return match db.run_batch(vec![stmt]).await {
+            Ok(_) => report.young_reasked += 1,
+            Err(e) => db.log(&format!(
+                "[owed-belt] young re-ask of {} faulted: {e}",
+                c.outpoint
+            )),
+        };
+    }
     let before = look_shape(&c.family, &c.facts, c.reason.as_deref());
     let now_shape = look_shape(
         row["family"].as_str().unwrap_or_default(),
@@ -1533,16 +1627,22 @@ pub fn unanswered_period(now: i64, judged_at_ms: Option<i64>) -> i64 {
 }
 
 async fn rearm(db: &impl JudgeDb, c: &Candidate, now: i64, report: &mut TickReport) {
+    let (due, young) = rearm_due(c, now);
     let stmt = Stmt {
         sql: REARM_SQL.into(),
         binds: vec![
             Bind::Text(c.identity.clone()),
             Bind::Text(c.outpoint.clone()),
-            Bind::Int(now + unanswered_period(now, c.judged_at_ms)),
+            Bind::Int(due),
         ],
     };
     match db.run_batch(vec![stmt]).await {
-        Ok(_) => report.rearmed += 1,
+        Ok(_) => {
+            report.rearmed += 1;
+            if young {
+                report.young_reasked += 1;
+            }
+        }
         Err(e) => db.log(&format!(
             "[owed-belt] re-arm of {} faulted: {e}",
             c.outpoint

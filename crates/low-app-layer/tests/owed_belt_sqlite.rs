@@ -599,3 +599,128 @@ async fn owed893_belt_a_tick_without_a_chain_tip_asks_nothing_and_moves_no_date(
         assert_eq!(memo_of(&db, n), 1, "the first eight by due time");
     }
 }
+
+/// FIX-1049 (bsv-low #1049, L58 pair 17): one stranded hop whose FILED sweep the tracker holds at `word`, first taken
+/// by a broadcaster `age_s` seconds before NOW, judged by the shipped drain at NOW.
+async fn landing(word: &str, age_s: i64) -> (Db, String) {
+    let db = Db::new();
+    let made = (NOW as i64 - 2 * HOUR) / 1000;
+    let h = hop(1049);
+    let (sweep, raw) = spender_of(&h);
+    db.exec(&format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{h}',0,0,{made},'p2pkh'); INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('owner','other','g1049',0,20190,'seat','00','00',2,'{h}',1,{made},1);"));
+    db.exec(&format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES ('owner','g1049','{h}',0,'{sweep}','{}','e5{:062x}',0,{made})", hex::encode(&raw), 1049));
+    db.exec(&format!("INSERT INTO tx_words(txid,word,tier,hint_source,hint_at,updated_at) VALUES ('{sweep}','{word}','hint','arcade',{},{})", NOW as i64 / 1000 - age_s, NOW as i64 / 1000));
+    while db.int("SELECT COUNT(*) FROM owed_dirty") > 0 {
+        let r = judge::drain_dirty(&db, 64).await.unwrap();
+        assert!(r.faults.is_empty(), "{:?}", r.faults);
+    }
+    (db, format!("{h}:0"))
+}
+fn row_of(db: &Db, outpoint: &str) -> (String, Value, Option<i64>) {
+    db.conn
+        .borrow()
+        .query_row(
+            &format!("SELECT family,facts,beltDueAtMs FROM owed_rows WHERE outpoint='{outpoint}'"),
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    serde_json::from_str(&r.get::<_, String>(1)?).unwrap(),
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .unwrap()
+}
+
+/// FIX-1049: a YOUNG miss (the swept hop's filed sweep announced at a broadcaster a minute ago, the couriers not
+/// seeing it spend the hop yet) is re-asked on the belt's NEXT tick, whether the couriers answered unspent or not at
+/// all; the served next-ask date says so; the row never offers a sweep.
+#[tokio::test]
+async fn fix1049_b_a_young_miss_is_re_asked_on_the_next_tick() {
+    let (db, outpoint) = landing("announced", 60).await;
+    let (family, facts, due) = row_of(&db, &outpoint);
+    assert_eq!(family, "hop-stranded");
+    assert_eq!(facts["claimable"], false, "the swept hop offers no sweep");
+    assert_eq!(facts["sweepLanding"], true);
+    let tick = belt::OWED_BELT_TICK_MS;
+    assert_eq!(
+        due,
+        Some(NOW as i64 + tick),
+        "the judge dates the young landing for the next tick"
+    );
+    // the couriers do not see the sweep yet: WoC can look and says unspent, BananaBlocks says unspent (a miss)
+    let fake = Fake::default();
+    *fake.default_spent.borrow_mut() = Some((404, b"{}".to_vec()));
+    let at = NOW + tick as u64;
+    db.now.set(at);
+    let report = belt::tick(&db, &fake).await.unwrap();
+    assert_eq!((report.candidates, report.found), (1, 1), "{report:?}");
+    assert_eq!(report.young_reasked, 1, "{report:?}");
+    let (_, facts, due) = row_of(&db, &outpoint);
+    assert_eq!(facts["claimable"], false);
+    assert_eq!(
+        due,
+        Some(at as i64 + tick),
+        "a young miss is asked again on the next tick, never after the 300 s floor"
+    );
+    assert_eq!(db.counters.borrow()["owed_belt_young_reasked_total"], 1);
+    // no rung answers (every courier 429s): still the next tick
+    let fake = Fake::default();
+    for host in ["whatsonchain.com", "bananablocks.com", "bitails.io"] {
+        fake.on(host, Some((429, b"{}".to_vec())));
+    }
+    let at = at + tick as u64;
+    db.now.set(at);
+    let report = belt::tick(&db, &fake).await.unwrap();
+    assert_eq!(
+        (report.found, report.rearmed, report.young_reasked),
+        (0, 1, 1),
+        "{report:?}"
+    );
+    assert_eq!(row_of(&db, &outpoint).2, Some(at as i64 + tick));
+    assert_eq!(db.counters.borrow()["owed_belt_young_reasked_total"], 2);
+}
+
+/// FIX-1049: the back-off is unchanged for a miss with no young live word: a sweep a broadcaster took an hour ago
+/// (past `OWED_BELT_YOUNG_MISS_MS`), and a stranded hop with no filing, are dated as before.
+#[tokio::test]
+async fn fix1049_c_an_old_miss_backs_off_as_before() {
+    let (db, outpoint) = landing("announced", 3_600).await;
+    let (_, facts, due) = row_of(&db, &outpoint);
+    assert_eq!(
+        facts["claimable"], false,
+        "an old live sweep still offers no sweep"
+    );
+    assert_eq!(due, Some(NOW as i64 + 600_000), "the family's base date");
+    let fake = Fake::default();
+    *fake.default_spent.borrow_mut() = Some((404, b"{}".to_vec()));
+    let at = NOW + 600_000;
+    db.now.set(at);
+    let report = belt::tick(&db, &fake).await.unwrap();
+    assert_eq!((report.found, report.young_reasked), (1, 0), "{report:?}");
+    assert!(
+        row_of(&db, &outpoint).2.unwrap() >= at as i64 + 600_000,
+        "an old miss waits its period: {:?}",
+        row_of(&db, &outpoint).2
+    );
+    // an unanswered old miss: the 300 s floor and its doubling, as before
+    let fake = Fake::default();
+    for host in ["whatsonchain.com", "bananablocks.com", "bitails.io"] {
+        fake.on(host, Some((429, b"{}".to_vec())));
+    }
+    let at = row_of(&db, &outpoint).2.unwrap() as u64;
+    db.now.set(at);
+    let report = belt::tick(&db, &fake).await.unwrap();
+    assert_eq!((report.rearmed, report.young_reasked), (1, 0), "{report:?}");
+    assert!(row_of(&db, &outpoint).2.unwrap() >= at as i64 + belt::OWED_BELT_UNANSWERED_RETRY_MS);
+    // a stranded hop with no filing: the press, its base date, no young re-ask
+    let db = seeded().await;
+    let fake = Fake::default();
+    *fake.default_spent.borrow_mut() = Some((404, b"{}".to_vec()));
+    let report = belt::tick(&db, &fake).await.unwrap();
+    assert_eq!(report.young_reasked, 0, "{report:?}");
+    for n in 0..8 {
+        assert!(due_of(&db, n).unwrap() >= NOW as i64 + 600_000, "hop {n}");
+    }
+}
