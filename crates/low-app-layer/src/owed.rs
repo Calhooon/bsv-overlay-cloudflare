@@ -368,6 +368,34 @@ pub const SWEEP_TIP_MOVED_REASON: &str =
 /// A missing tip cannot establish whether a hop probe is still current.
 pub const SWEEP_TIP_UNKNOWN_REASON: &str =
     "the chain tip is unavailable; the hop probe's freshness is unknown";
+/// FIX-1049 (bsv-low #1049): a stranded hop whose filed sweep a broadcaster holds (the tracker's live word on it):
+/// the sweep's landing wait, the spender named, never a second press.
+pub const SWEEP_LANDING_REASON: &str =
+    "the hop's sweep is on the network and has not reached the explorers or a block yet; waiting for it to land";
+
+/// FIX-1049 (bsv-low #1049): is this tracker word a LIVE spender, one a broadcaster holds (`announced`, `seen`) or the
+/// chain named (`mined`, checked or not, `stale`), and not refused (a chain-tier `rejected` or `conflicted`, or the
+/// producer's `terminalHint`, [`funding_refusal_word`]'s reading)? `unknown`, `abandoned` and `built` are not: no
+/// broadcaster holds those bytes, so a press is what puts them on the network.
+pub fn spender_word_live(word: &Value) -> bool {
+    let live = matches!(
+        word["word"].as_str(),
+        Some("announced" | "seen" | "mined" | "stale")
+    );
+    live && !word["terminalHint"].is_string()
+}
+
+/// FIX-1049: the hop's filed sweep and its word, when the tracker holds that word live ([`spender_word_live`]).
+fn live_filed_sweep<'a>(
+    i: &'a OwedInputs,
+    outpoint: &str,
+) -> Option<(&'a crate::hopsweep::FiledHopSweep, &'a Value)> {
+    let filed = i.hop_sweeps.get(outpoint)?;
+    let word = i
+        .spender_words?
+        .get(&filed.sweep_txid.to_ascii_lowercase())?;
+    spender_word_live(word).then_some((filed, word))
+}
 
 /// The families, in the order the page lists them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -2593,6 +2621,12 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                         facts["doorRefusal"] = json!(door.as_str());
                     }
                 }
+                // FIX-1049: the filed sweep live at a broadcaster, where an arm below would press
+                let landing = live_filed_sweep(i, &outpoint).filter(|_| {
+                    h.status == HopStatus::Unspent
+                        || chain
+                            .is_some_and(|w| w.looked && w.spent == Some(false) && !w.predates_tip)
+                });
                 match chain {
                     // bsv-low #808 (loop 41, pair 13): the chain's "unspent" was taken BELOW this walk's tip and the
                     // budget left no fresh ask (`hops_view::memo_predates_tip`): a block has arrived since, and it may
@@ -2635,6 +2669,45 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             at_height: None,
                             facts,
                             reason: Some(SWEEP_TIP_MOVED_REASON.to_string()),
+                        });
+                    }
+                    // FIX-1049 (bsv-low #1049, L58 pair 17's `stale-strand-press`): the hop's FILED sweep is live at
+                    // a broadcaster (the tracker's word, [`spender_word_live`]) while the couriers and the index have
+                    // not seen it spend the hop yet: the sweep's landing wait, the spender named, never a press (a
+                    // second sweep would be a double spend the network refuses). Only where the arms below would
+                    // press; a chain word of spent keeps its own arm above.
+                    _ if landing.is_some() => {
+                        let Some((filed, word)) = landing else {
+                            continue;
+                        };
+                        facts["claim"] = Value::Null;
+                        facts["claimable"] = json!(false);
+                        facts["chainWait"] = json!("block");
+                        facts["sweepLanding"] = json!(true);
+                        // when a broadcaster first took the sweep (the word's `at`, seconds), in ms: the belt's young
+                        // window runs from it (`owed_belt::young_miss`); the stored row keeps it, the joined word not
+                        if let Some(at) = word["at"].as_u64().filter(|a| *a > 0) {
+                            facts["sweepLandingAtMs"] = json!(at.saturating_mul(1000));
+                        }
+                        facts["chainProbe"] = json!(match chain {
+                            Some(w) if w.looked && w.spent == Some(false) && !w.predates_tip => {
+                                unspent_chain_probe(w.age_ms)
+                            }
+                            _ => "index-unspent",
+                        });
+                        facts["sweepTxid"] = json!(filed.sweep_txid);
+                        facts["sweepSource"] = json!("hopsweep-filing");
+                        owed_words(i, &mut facts, Some(&filed.sweep_txid), None);
+                        rows.push(OwedRow {
+                            identity: me.clone(),
+                            outpoint,
+                            family: OwedFamily::HopStranded,
+                            game_id: game,
+                            sats: Some(h.hop_sats),
+                            opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
+                            at_height: None,
+                            facts,
+                            reason: Some(SWEEP_LANDING_REASON.to_string()),
                         });
                     }
                     Some(w) if w.looked && w.spent == Some(false) && !w.predates_tip => {
@@ -9253,5 +9326,90 @@ pub(crate) mod tests {
             "the rung still downgrades"
         );
         assert_ne!(rows[0].facts["claimable"], true);
+    }
+
+    /// FIX-1049 (bsv-low #1049, L58 pair 17's `stale-strand-press`): a stranded hop whose FILED sweep the tracker holds
+    /// live (`announced`, `seen`, an unchecked `mined`, `stale`) is the sweep's LANDING WAIT, never a claimable sweep:
+    /// the press is withheld and the row names the spender, on the index's `unspent` and on the couriers' `unspent`
+    /// alike (a broadcaster's word ahead of the indexers). A refused word, an `unknown`, an `abandoned`, a `built` or
+    /// no word keeps the press: there the press is what puts the filed sweep on the network.
+    #[test]
+    fn fix1049_a_a_hop_whose_filed_sweep_is_live_offers_no_sweep() {
+        let (v, c, no_pots) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let sweep = tx(0x0c);
+        let sweeps = filed(&key, &sweep);
+        let old = [hop(
+            HopStatus::Unspent,
+            None,
+            Some(HOP_STRANDED_AFTER_MS + 1),
+        )];
+        let courier_unspent = chain_confirmed(&key, true, Some(false), None, None);
+        let no_chain = HashMap::new();
+        let word = |w: &str| {
+            std::collections::BTreeMap::from([(
+                sweep.clone(),
+                json!({"word": w, "tier": "hint", "verifyPath": null, "at": 899_000}),
+            )])
+        };
+        for chain in [&no_chain, &courier_unspent] {
+            for live in ["announced", "seen", "mined", "stale"] {
+                let words = word(live);
+                let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+                i.hop_sweeps = &sweeps;
+                i.hop_chain = chain;
+                i.spender_words = Some(&words);
+                let rows = derive_and_pin(&i);
+                assert_eq!(rows.len(), 1, "{live}");
+                let r = &rows[0];
+                assert_eq!(r.family, OwedFamily::HopStranded, "{live}");
+                assert_eq!(
+                    (r.facts["claim"].clone(), r.facts["claimable"].clone()),
+                    (Value::Null, json!(false)),
+                    "{live}: a swept hop whose sweep is live offers no sweep"
+                );
+                assert_eq!(r.facts["chainWait"], "block", "{live}");
+                assert_eq!(r.facts["sweepLanding"], true, "{live}");
+                assert_eq!(r.facts["sweepLandingAtMs"], 899_000_000, "{live}");
+                assert_eq!(r.facts["sweepTxid"], sweep.as_str(), "{live}");
+                assert_eq!(r.facts["spenderWord"]["word"], live, "{live}");
+                assert!(
+                    r.facts.get("sweepRawHex").is_none(),
+                    "{live}: no press bytes"
+                );
+                assert_eq!(r.reason.as_deref(), Some(SWEEP_LANDING_REASON), "{live}");
+            }
+            let mut refused = word("rejected");
+            refused.get_mut(&sweep).unwrap()["tier"] = json!("chain");
+            let mut hinted = word("seen");
+            hinted.get_mut(&sweep).unwrap()["terminalHint"] = json!("rejected");
+            let none = std::collections::BTreeMap::new();
+            for (what, words) in [
+                ("rejected", refused),
+                ("a terminal hint", hinted),
+                ("unknown", word("unknown")),
+                ("abandoned", word("abandoned")),
+                ("built", word("built")),
+                ("no word", none),
+            ] {
+                let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+                i.hop_sweeps = &sweeps;
+                i.hop_chain = chain;
+                i.spender_words = Some(&words);
+                let rows = derive_and_pin(&i);
+                assert_eq!(rows[0].facts["claim"], "sweep-hop", "{what}");
+                assert_eq!(rows[0].facts["claimable"], true, "{what}: the press stands");
+                assert_eq!(rows[0].facts["sweepRawHex"], "0100".repeat(20), "{what}");
+            }
+        }
+        // no filing: the press signs here, as before (nothing names a spender)
+        let none = std::collections::BTreeMap::new();
+        let empty = HashMap::new();
+        let mut i = inputs(&[], &[], &old, &v, &c, &no_pots, Some(900_000));
+        i.hop_sweeps = &empty;
+        i.spender_words = Some(&none);
+        let rows = derive_and_pin(&i);
+        assert_eq!(rows[0].facts["sweepSource"], "sign-here");
+        assert_eq!(rows[0].facts["claimable"], true);
     }
 }

@@ -1192,6 +1192,11 @@ fn belt_due(row: &OwedRow, stamp: i64, evidence: Option<&JudgeInputs>) -> Option
         return None;
     }
     match row.family {
+        // FIX-1049 (bsv-low #1049): a swept hop's young landing wait is looked at on the belt's next tick, and the
+        // served `beltNextAtMs` says so (the cell's bar reads the belt's own date)
+        OwedFamily::HopStranded if crate::owed_belt::young_miss(&row.facts, stamp) => {
+            Some(crate::owed_belt::young_due(stamp))
+        }
         OwedFamily::HopStranded => Some(stamp + 600_000),
         // NEW5-M2 (D2-ACTOR-B-FOLD-10): a hop row resting on a courier find of an unconfirmed spend is re-asked at
         // the outpoint (`owed_belt::rests_on_unconfirmed_find`), whatever bytes are held: a spend that never mines
