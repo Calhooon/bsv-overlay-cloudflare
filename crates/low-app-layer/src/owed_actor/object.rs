@@ -1901,15 +1901,19 @@ pub async fn fleet_compare_tick_env(env: &Env, shard: usize) -> Result<Response>
     {
         Ok(r) => {
             console_log!(
-                "[owed-fleet-compare] shard {}/{} compared {} diffs {} rereads {} heldByApply {} pendingReread {} windowMs {} faults {} statements {} cursor {:?} wrapped {} stopped {:?} faultKind {:?}",
+                "[owed-fleet-compare] shard {}/{} compared {} diffs {} rereads {} heldByApply {} judgeMoved {} pendingReread {} windowMs {} rereadStatements {}/{} rereadsYielded {} faults {} statements {} cursor {:?} wrapped {} stopped {:?} faultKind {:?}",
                 shard,
                 shards,
                 r.compared.len(),
                 r.diffs,
                 r.rereads.len(),
                 r.held_by_apply,
+                r.judge_moved,
                 r.pending_reread,
                 r.window_ms,
+                r.reread_statements,
+                crate::owed_actor::compare::FLEET_COMPARE_REREAD_STATEMENTS,
+                r.rereads_yielded,
                 r.faults,
                 r.statements,
                 r.cursor,
@@ -1919,7 +1923,8 @@ pub async fn fleet_compare_tick_env(env: &Env, shard: usize) -> Result<Response>
             );
             Response::from_json(&json!({
                 "shard": shard, "shards": shards, "compared": r.compared.len(), "diffs": r.diffs, "faults": r.faults,
-                "rereads": r.rereads, "heldByApply": r.held_by_apply, "pendingReread": r.pending_reread, "windowMs": r.window_ms,
+                "rereads": r.rereads, "heldByApply": r.held_by_apply, "judgeMoved": r.judge_moved, "pendingReread": r.pending_reread, "windowMs": r.window_ms,
+                "rereadStatements": r.reread_statements, "rereadStatementsMax": crate::owed_actor::compare::FLEET_COMPARE_REREAD_STATEMENTS, "rereadsYielded": r.rereads_yielded,
                 "statements": r.statements, "cursor": r.cursor, "wrapped": r.wrapped, "stopped": r.stopped,
                 "faultKind": r.fault_kind,
             }))
