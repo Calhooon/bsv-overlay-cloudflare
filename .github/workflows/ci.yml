@@ -1,8 +1,22 @@
 # Shared Worker gate: PR head, read-only token, pinned Rust, cached cargo.
-# Host clippy covers all targets; wasm clippy covers libraries because SQLite dev tests are native.
-# The lint bar (bsv-stack-lean #137 to #145) adds machete (non-blocking), msrv, secrets, docs and
-# actionlint; the protection requires test, fmt, clippy and wasm32 until the keeper adds them.
-# Every action is pinned by commit sha.
+# Two jobs, two required contexts (bsv-low #1068): `lint` (fmt, clippy, actionlint, docs, scrub,
+# secrets, locks; machete non-blocking) and `checks` (the repository's own checks, test, msrv,
+# wasm32). Each former job is a named step; every step runs whatever an earlier one answered
+# (`!cancelled()`), so a red names its step and hides no other. Host clippy covers all targets;
+# wasm clippy covers libraries because SQLite dev tests are native. The lint bar is
+# bsv-stack-lean #137 to #145. Every action is pinned by commit sha.
+#
+# One cached build a job (bsv-low #1067): rust-cache keyed by both Cargo.locks and the rustc
+# version (its default key), no debuginfo, no incremental. The linker is rust-lld already:
+# Rust 1.90 made it the default for x86_64-unknown-linux-gnu, and both toolchains here (1.95.0,
+# the MSRV's 1.91.0) are past it; wasm32 always links with rust-lld. Tests run under
+# cargo-nextest (a prebuilt binary, its sha256 pinned, never built), every binary's tests in one
+# pool; doctests, which nextest does not run, keep `cargo test --doc`.
+#
+# One run a change (bsv-low #1069): `pull_request` gates the PR head; the push to main of a tree
+# a green PR head already gated (strict protection plus a rebase merge give the same tree)
+# builds the cache main's PRs restore and runs no test (`checks`' `gated` step); any other push
+# to main, and the release's call, runs everything.
 name: ci
 'on':
   pull_request: null
@@ -18,195 +32,34 @@ concurrency:
   cancel-in-progress: true
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 jobs:
-  test:
-    name: test
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-    - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-      with:
-        toolchain: 1.95.0
-        components: rustfmt, clippy
-        targets: wasm32-unknown-unknown
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      with:
-        workspaces: '. -> target
-
-          workers -> workers/target'
-    - run: bash scripts/check-config-ids.sh --self-test
-    - run: bash scripts/check-config-ids.sh
-    - run: python3 scripts/check-storage-ownership.py --self-test
-    - run: python3 scripts/check-storage-ownership.py
-    - run: bash scripts/check-workspaces.sh
-    - run: cargo test --workspace --features bsv-overlay-engine/memory-storage --no-fail-fast
-    - run: cargo test --manifest-path workers/Cargo.toml --workspace --no-fail-fast
-  fmt:
-    name: fmt
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-    - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-      with:
-        toolchain: 1.95.0
-        components: rustfmt, clippy
-        targets: wasm32-unknown-unknown
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      with:
-        workspaces: '. -> target
-
-          workers -> workers/target'
-    - run: cargo fmt --all -- --check
-    # Workers workspace formatting belongs to the separate K1 hygiene commit.
-  clippy:
-    name: clippy
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-    - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-      with:
-        toolchain: 1.95.0
-        components: rustfmt, clippy
-        targets: wasm32-unknown-unknown
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      with:
-        workspaces: '. -> target
-
-          workers -> workers/target'
-    - run: cargo clippy --workspace --all-targets --features bsv-overlay-engine/memory-storage -- -D warnings
-    - run: cargo clippy --manifest-path workers/Cargo.toml --workspace --all-targets -- -D warnings
-    - run: cargo clippy -p bsv-overlay-engine -p bsv-overlay-discovery --target wasm32-unknown-unknown --lib --
-        -D warnings
-    - run: cargo clippy --manifest-path workers/Cargo.toml --workspace --target wasm32-unknown-unknown --lib --
-        -D warnings
-  wasm32:
-    name: wasm32
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-    - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-      with:
-        toolchain: 1.95.0
-        components: rustfmt, clippy
-        targets: wasm32-unknown-unknown
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      with:
-        workspaces: '. -> target
-
-          workers -> workers/target'
-    - run: cargo build -p bsv-overlay-engine -p bsv-overlay-discovery --release --target wasm32-unknown-unknown
-        --lib
-    - run: cargo build --manifest-path workers/Cargo.toml --workspace --release --target wasm32-unknown-unknown
-        --lib
-  machete:
-    name: machete
-    runs-on: ubuntu-latest
-    # Unused dependencies (bsv-stack-lean #137): non-blocking until the keeper
-    # names it a required context.
-    continue-on-error: true
-    steps:
-    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-    - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-      with:
-        toolchain: 1.95.0
-    - run: cargo install cargo-machete --version 0.9.2 --locked --root "$RUNNER_TEMP/tools"
-    - run: '"$RUNNER_TEMP/tools/bin/cargo-machete" --with-metadata .'
-  msrv:
-    name: msrv
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-    - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-      with:
-        toolchain: 1.91.0
-        targets: wasm32-unknown-unknown
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      with:
-        workspaces: '. -> target
-
-          workers -> workers/target'
-    # The MSRV checked (bsv-stack-lean #139): the declaration is the toolchain
-    # above, and every target of both workspaces checks at it.
-    - run: grep -qx 'rust-version = "1.91"' Cargo.toml && grep -qx 'rust-version = "1.91"' workers/Cargo.toml
-    - run: cargo check --locked --workspace --all-targets --features bsv-overlay-engine/memory-storage
-    - run: cargo check --locked --manifest-path workers/Cargo.toml --workspace --all-targets
-    - run: cargo check --locked -p bsv-overlay-engine -p bsv-overlay-discovery --target wasm32-unknown-unknown
-        --lib
-    - run: cargo check --locked --manifest-path workers/Cargo.toml --workspace --target wasm32-unknown-unknown
-        --lib
-  secrets:
-    name: secrets
+  lint:
+    name: lint
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
+        # the secrets step scans every commit of the history
         fetch-depth: 0
         persist-credentials: false
-    # The secrets scan (bsv-stack-lean #140): gitleaks 8.28.0 built from its
-    # release source, refused unless the tarball's sha256 is the one Homebrew's
-    # formula pins; the runner's Go builds it, go.sum checks its modules.
-    - name: gitleaks 8.28.0
-      env:
-        GITLEAKS_VERSION: 8.28.0
-        GITLEAKS_SHA256: c681af8aeacacf9d14f7ad97d534cf087f6d2d6fbd50dd02020b0f929b7a1c41
-      run: |
-        curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" "https://github.com/gitleaks/gitleaks/archive/refs/tags/v${GITLEAKS_VERSION}.tar.gz"
-        echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum -c -
-        tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP"
-        cd "$RUNNER_TEMP/gitleaks-${GITLEAKS_VERSION}" && go build -o "$RUNNER_TEMP/gitleaks" .
-    # Every commit of the history and the tree, findings redacted; the
-    # allowlist is .gitleaks.toml's.
-    - run: '"$RUNNER_TEMP/gitleaks" git --redact --no-banner --exit-code 1 .'
-    - run: '"$RUNNER_TEMP/gitleaks" dir --redact --no-banner --exit-code 1 .'
-  docs:
-    name: docs
-    runs-on: ubuntu-latest
-    # Doc warnings denied (bsv-stack-lean #141): both workspaces, the root
-    # one with and without the test-store feature (docs.rs builds without).
-    # low-app-layer is LOW's crate: its own doc warnings are LOW's to fix.
-    env:
-      RUSTDOCFLAGS: -D warnings
-    steps:
-    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-    - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+    - id: toolchain
+      uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
       with:
         toolchain: 1.95.0
+        components: rustfmt, clippy
+        targets: wasm32-unknown-unknown
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         workspaces: '. -> target
 
           workers -> workers/target'
-    - run: cargo doc --locked --no-deps --workspace
-    - run: cargo doc --locked --no-deps --workspace --features bsv-overlay-engine/memory-storage
-    - run: cargo doc --locked --no-deps --manifest-path workers/Cargo.toml --workspace --exclude low-app-layer
-  actionlint:
-    name: actionlint
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      with:
-        persist-credentials: false
-    # actionlint on every workflow (bsv-stack-lean #145): 1.7.12 built from its
-    # release source, refused unless the tarball's sha256 is the one Homebrew's
-    # formula pins; shellcheck on the runner checks the run scripts.
-    - name: actionlint 1.7.12
-      env:
-        ACTIONLINT_VERSION: 1.7.12
-        ACTIONLINT_SHA256: 454800bd4f854592bcfe79b161f71d56e35940eb7016e48a26dd356adc9d400a
-      run: |
-        curl -fsSL -o "$RUNNER_TEMP/actionlint.tar.gz" "https://github.com/rhysd/actionlint/archive/refs/tags/v${ACTIONLINT_VERSION}.tar.gz"
-        echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
-        tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP"
-        cd "$RUNNER_TEMP/actionlint-${ACTIONLINT_VERSION}" && go build -o "$RUNNER_TEMP/actionlint" ./cmd/actionlint
-    - run: '"$RUNNER_TEMP/actionlint"'
-  # One bsv-rs per lock (bsv-stack-lean #182): a committed Cargo.lock holding
-  # two bsv-rs entries fails, the gate a self-merging stack PR stands behind.
-  locks:
-    name: locks
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-    - name: One bsv-rs per committed Cargo.lock
+    # One bsv-rs per lock (bsv-stack-lean #182): a committed Cargo.lock holding
+    # two bsv-rs entries fails, the gate a self-merging stack PR stands behind.
+    - name: locks
+      if: ${{ !cancelled() }}
       run: |
         set -euo pipefail
         status=0
@@ -222,11 +75,191 @@ jobs:
         done < <(git ls-files -z -- 'Cargo.lock' '*/Cargo.lock')
         [ "$found" -gt 0 ] || echo "no committed Cargo.lock"
         exit "$status"
-  scrub:
-    name: scrub
+    - name: scrub
+      if: ${{ !cancelled() }}
+      run: tools/scrub.sh
+    # actionlint on every workflow (bsv-stack-lean #145): 1.7.12 built from its
+    # release source, refused unless the tarball's sha256 is the one Homebrew's
+    # formula pins; shellcheck on the runner checks the run scripts.
+    - name: actionlint
+      if: ${{ !cancelled() }}
+      env:
+        ACTIONLINT_VERSION: 1.7.12
+        ACTIONLINT_SHA256: 454800bd4f854592bcfe79b161f71d56e35940eb7016e48a26dd356adc9d400a
+      run: |
+        set -euo pipefail
+        curl -fsSL -o "$RUNNER_TEMP/actionlint.tar.gz" "https://github.com/rhysd/actionlint/archive/refs/tags/v${ACTIONLINT_VERSION}.tar.gz"
+        echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
+        tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP"
+        (cd "$RUNNER_TEMP/actionlint-${ACTIONLINT_VERSION}" && go build -o "$RUNNER_TEMP/actionlint" ./cmd/actionlint)
+        "$RUNNER_TEMP/actionlint"
+    - name: fmt
+      if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+      run: cargo fmt --all -- --check
+    # Workers workspace formatting belongs to the separate K1 hygiene commit.
+    # The secrets scan (bsv-stack-lean #140): gitleaks 8.28.0 built from its
+    # release source, refused unless the tarball's sha256 is the one Homebrew's
+    # formula pins; the runner's Go builds it, go.sum checks its modules. Every
+    # commit of the history and the tree, findings redacted; the allowlist is
+    # .gitleaks.toml's.
+    - name: secrets
+      if: ${{ !cancelled() }}
+      env:
+        GITLEAKS_VERSION: 8.28.0
+        GITLEAKS_SHA256: c681af8aeacacf9d14f7ad97d534cf087f6d2d6fbd50dd02020b0f929b7a1c41
+      run: |
+        set -euo pipefail
+        curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" "https://github.com/gitleaks/gitleaks/archive/refs/tags/v${GITLEAKS_VERSION}.tar.gz"
+        echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum -c -
+        tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP"
+        (cd "$RUNNER_TEMP/gitleaks-${GITLEAKS_VERSION}" && go build -o "$RUNNER_TEMP/gitleaks" .)
+        "$RUNNER_TEMP/gitleaks" git --redact --no-banner --exit-code 1 .
+        "$RUNNER_TEMP/gitleaks" dir --redact --no-banner --exit-code 1 .
+    - name: clippy
+      if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+      run: |
+        set -euo pipefail
+        status=0
+        cargo clippy --workspace --all-targets --features bsv-overlay-engine/memory-storage -- -D warnings || status=1
+        cargo clippy --manifest-path workers/Cargo.toml --workspace --all-targets -- -D warnings || status=1
+        cargo clippy -p bsv-overlay-engine -p bsv-overlay-discovery --target wasm32-unknown-unknown --lib -- -D warnings || status=1
+        cargo clippy --manifest-path workers/Cargo.toml --workspace --target wasm32-unknown-unknown --lib -- -D warnings || status=1
+        exit "$status"
+    # Doc warnings denied (bsv-stack-lean #141): both workspaces, the root
+    # one with and without the test-store feature (docs.rs builds without).
+    # low-app-layer is LOW's crate: its own doc warnings are LOW's to fix.
+    - name: docs
+      if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+      env:
+        RUSTDOCFLAGS: -D warnings
+      run: |
+        set -euo pipefail
+        status=0
+        cargo doc --locked --no-deps --workspace || status=1
+        cargo doc --locked --no-deps --workspace --features bsv-overlay-engine/memory-storage || status=1
+        cargo doc --locked --no-deps --manifest-path workers/Cargo.toml --workspace --exclude low-app-layer || status=1
+        exit "$status"
+    # Unused dependencies (bsv-stack-lean #137): non-blocking until the keeper
+    # names it a required check.
+    - name: machete
+      if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+      continue-on-error: true
+      run: |
+        set -euo pipefail
+        cargo install cargo-machete --version 0.9.2 --locked --root "$RUNNER_TEMP/tools"
+        "$RUNNER_TEMP/tools/bin/cargo-machete" --with-metadata .
+  checks:
+    name: checks
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # the `gated` step reads the PR a push to main came from, and its checks
+      checks: read
+      pull-requests: read
     steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - id: toolchain
+      uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
       with:
-        persist-credentials: false
-    - run: tools/scrub.sh
+        toolchain: 1.95.0
+        targets: wasm32-unknown-unknown
+    # The MSRV checked (bsv-stack-lean #139): the declaration is this toolchain,
+    # and every target of both workspaces checks at it.
+    - id: msrv-toolchain
+      name: MSRV toolchain 1.91.0
+      run: rustup toolchain install 1.91.0 --profile minimal --target wasm32-unknown-unknown
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        workspaces: '. -> target
+
+          workers -> workers/target'
+    # cargo-nextest 0.9.150, the release's x86_64-unknown-linux-gnu binary,
+    # refused unless the tarball's sha256 is the one the release publishes.
+    - id: nextest
+      name: cargo-nextest 0.9.150
+      env:
+        NEXTEST_VERSION: 0.9.150
+        NEXTEST_SHA256: b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f
+      run: |
+        set -euo pipefail
+        curl -fsSL -o "$RUNNER_TEMP/nextest.tar.gz" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+        echo "${NEXTEST_SHA256}  $RUNNER_TEMP/nextest.tar.gz" | sha256sum -c -
+        tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$HOME/.cargo/bin"
+        cargo nextest --version
+    # A push to main whose tree a green PR head's `checks` already gated runs
+    # the builds (the cache main's PRs restore) and no test; no PR found, a
+    # tree that differs, or no green `checks` on its head runs everything.
+    - id: gated
+      name: gated
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        EVENT: ${{ github.event_name }}
+        REF: ${{ github.ref }}
+      run: |
+        set -euo pipefail
+        gated=false
+        if [ "$EVENT" = push ] && [ "$REF" = refs/heads/main ]; then
+          tree=$(git rev-parse 'HEAD^{tree}')
+          for pr in $(gh api "repos/$GH_REPO/commits/$GITHUB_SHA/pulls" --jq '.[].number' || true); do
+            head=$(gh api "repos/$GH_REPO/pulls/$pr" --jq .head.sha) || continue
+            head_tree=$(gh api "repos/$GH_REPO/git/commits/$head" --jq .tree.sha) || continue
+            green=$(gh api "repos/$GH_REPO/commits/$head/check-runs?check_name=checks&filter=latest" \
+              --jq '[.check_runs[] | select(.conclusion == "success")] | length') || continue
+            echo "#$pr head $head: tree $head_tree, green checks $green; main's tree $tree"
+            if [ "$head_tree" = "$tree" ] && [ "$green" -gt 0 ]; then gated=true; fi
+          done
+        fi
+        echo "gated=$gated" | tee -a "$GITHUB_OUTPUT"
+    - name: config ids
+      if: ${{ !cancelled() }}
+      run: |
+        set -euo pipefail
+        bash scripts/check-config-ids.sh --self-test
+        bash scripts/check-config-ids.sh
+    - name: storage ownership
+      if: ${{ !cancelled() }}
+      run: |
+        set -euo pipefail
+        python3 scripts/check-storage-ownership.py --self-test
+        python3 scripts/check-storage-ownership.py
+    - name: workspaces
+      if: ${{ !cancelled() }}
+      run: bash scripts/check-workspaces.sh
+    - name: test
+      if: ${{ !cancelled() && steps.nextest.outcome == 'success' && steps.gated.outcome == 'success' }}
+      env:
+        GATED: ${{ steps.gated.outputs.gated }}
+      run: |
+        set -euo pipefail
+        if [ "$GATED" = true ]; then
+          echo "the tree is a green PR head's: test binaries built, not run"
+          cargo nextest run --workspace --features bsv-overlay-engine/memory-storage --no-run
+          cargo nextest run --manifest-path workers/Cargo.toml --workspace --no-run
+          exit 0
+        fi
+        status=0
+        cargo nextest run --workspace --features bsv-overlay-engine/memory-storage --no-fail-fast || status=1
+        cargo nextest run --manifest-path workers/Cargo.toml --workspace --no-fail-fast || status=1
+        cargo test --doc --workspace --features bsv-overlay-engine/memory-storage --no-fail-fast || status=1
+        cargo test --doc --manifest-path workers/Cargo.toml --workspace --no-fail-fast || status=1
+        exit "$status"
+    - name: msrv
+      if: ${{ !cancelled() && steps.msrv-toolchain.outcome == 'success' }}
+      run: |
+        set -euo pipefail
+        grep -qx 'rust-version = "1.91"' Cargo.toml && grep -qx 'rust-version = "1.91"' workers/Cargo.toml
+        status=0
+        cargo +1.91.0 check --locked --workspace --all-targets --features bsv-overlay-engine/memory-storage || status=1
+        cargo +1.91.0 check --locked --manifest-path workers/Cargo.toml --workspace --all-targets || status=1
+        cargo +1.91.0 check --locked -p bsv-overlay-engine -p bsv-overlay-discovery --target wasm32-unknown-unknown --lib || status=1
+        cargo +1.91.0 check --locked --manifest-path workers/Cargo.toml --workspace --target wasm32-unknown-unknown --lib || status=1
+        exit "$status"
+    - name: wasm32
+      if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+      run: |
+        set -euo pipefail
+        status=0
+        cargo build -p bsv-overlay-engine -p bsv-overlay-discovery --release --target wasm32-unknown-unknown --lib || status=1
+        cargo build --manifest-path workers/Cargo.toml --workspace --release --target wasm32-unknown-unknown --lib || status=1
+        exit "$status"
