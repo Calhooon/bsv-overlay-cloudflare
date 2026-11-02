@@ -18712,20 +18712,31 @@ mod fix1042 {
 
     /// A reorg pass's clear as `hop_probe_memos::clear_on_reorg` runs it: the tombstone stamped at `at_ms` with the
     /// pass's REACH, then the marks and the framed writes at that floor. Answers the keys it moved (noted).
+    /// bsv-low #1044 fold 1: the tombstone's batch first (the stored tombstone's refusals marked and written, then the
+    /// stamp), as `hop_probe_memos::stamp` runs it; its demoted keys are noted with the clear's.
     fn clear_at(db: &SqliteSql, at_ms: i64, reach: u64) -> Vec<String> {
-        db.conn
-            .execute(
-                memos::HOP_PROBE_MEMO_REORG_MARK_SQL,
-                rusqlite::params![at_ms as f64, reach as f64],
-            )
+        let [marks, demote, mark] = memos::HOP_PROBE_MEMO_REORG_STAMP;
+        let tx = db.conn.unchecked_transaction().unwrap();
+        tx.execute(marks, []).unwrap();
+        let mut keys: Vec<String> = tx
+            .prepare(demote)
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        tx.execute(mark, rusqlite::params![at_ms as f64, reach as f64])
             .unwrap();
-        probe_batch(
+        tx.commit().unwrap();
+        keys.retain(|k| memos::noted_key(false, k));
+        keys.extend(probe_batch(
             db,
             memos::HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
             &memos::HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,
             Some(reach as i64),
             false,
-        )
+        ));
+        keys
     }
 
     /// The tracker's eight-day stranger sweep (`tracker_host::stored::SWEEP_FRAMED`), past every word's age.
@@ -18868,6 +18879,103 @@ mod fix1042 {
         assert!(
             tip_derived_rows(&a, &b).is_empty(),
             "no tip lag excuses anything"
+        );
+    }
+
+    /// (fix1044f1_c) THE FLEET COMPARE AT ZERO ACROSS A CLEAR THAT WOULD HAVE UN-REFUSED (bsv-low #1044 fold 1, the
+    /// FIX-1044 ensemble's one class). The fold9 hop: a deep reorg clear one minute BEFORE the belt's find (reach
+    /// `TIP - 25`), so the find is a courier's word inside the clear's grace and reach: refused, both judges `unbound`
+    /// with no confirmation. The actor is judged there. Then a ROUTINE clear a grace and a minute after the deep one
+    /// (reach `TIP - 3`, above the find): its tombstone resets the reach, so on the stamp alone the fresh D1 judgement
+    /// served the find's confirmation again with no event while the actor kept the refusal (the #1042 class, in the
+    /// un-refusing direction). The routine clear writes the refusal first: the find's evidence and memo kept,
+    /// unconfirmed, marked and noted; their events reach the actor; the fresh D1 judgement equals it, digests equal, no
+    /// diff, no tip lag, and still no confirmation. RED on 03c75ab5 (the stamp's refusals inert): the routine clear
+    /// moves nothing, no event reaches the actor, and the fresh D1 judgement serves the confirmation again: `the
+    /// compare at zero: ["b900..00:0"]`.
+    #[tokio::test]
+    async fn fix1044f1_c_the_compare_reads_zero_across_a_clear_that_resets_the_reach() {
+        let d1 = d1_judge(&shape1()).await;
+        let hop = format!("{FOLD9_HOP}:0");
+        let found = NOW_MS as i64 - 3 * 3_600_000;
+        let deep = found - 60_000;
+        // the deep clear ran before the find was written: on a record holding no find yet it moves nothing; the
+        // find's rows are its late arrival
+        let held = format!("{FOLD9_HOP}%");
+        d1.conn
+            .execute(
+                "CREATE TEMP TABLE found AS SELECT * FROM hop_chain_probes WHERE outpoint LIKE ?1",
+                [&held],
+            )
+            .unwrap();
+        let n: i64 = d1
+            .conn
+            .query_row("SELECT COUNT(*) FROM found", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "the find's evidence and memo");
+        d1.conn
+            .execute(
+                "DELETE FROM hop_chain_probes WHERE outpoint LIKE ?1",
+                [&held],
+            )
+            .unwrap();
+        assert!(clear_at(&d1, deep, TIP - 25).is_empty());
+        d1.conn
+            .execute_batch("INSERT INTO hop_chain_probes SELECT * FROM found; DROP TABLE found")
+            .unwrap();
+        d1.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        fresh_d1(&d1).await;
+        assert_eq!(
+            confirmation(&d1, &hop).1,
+            Value::Null,
+            "the premise: the find inside the deep clear's grace and reach is refused"
+        );
+        let (local, _) = actor_judge(&d1, "owner").await;
+        let mut moved = clear_at(
+            &d1,
+            deep + memos::HOP_PROBE_MEMO_REORG_GRACE_MS + 60_000,
+            TIP - 3,
+        );
+        moved.sort();
+        // every key the clear moved reaches the actor by its event (none moved: no event, nothing applied)
+        let pairs: Vec<(&str, String)> = moved.iter().map(|k| ("probe", k.clone())).collect();
+        for (source, key) in &pairs {
+            let ev = published(&d1, source, key).await.unwrap();
+            super::fix1010::direct(&d1, &local, &ev, false).await;
+        }
+        fresh_d1(&d1).await;
+        let (a, b) = (rows_of(&d1, "owner"), rows_of(&local, "owner"));
+        assert!(!a.is_empty());
+        let diff = diff_rows(&a, &b);
+        assert!(diff.is_empty(), "the compare at zero: {diff:?}");
+        assert_eq!(rows_digest(&a), rows_digest(&b), "the digests equal");
+        assert!(
+            tip_derived_rows(&a, &b).is_empty(),
+            "no tip lag excuses anything"
+        );
+        assert_eq!(
+            confirmation(&d1, &hop).1,
+            Value::Null,
+            "still refused: the routine clear said nothing of the deep reorg's blocks"
+        );
+        assert_eq!(
+            moved,
+            vec![format!("{FOLD9_HOP}.0"), hop.clone()],
+            "the routine clear writes the deep clear's refusal before its tombstone resets"
+        );
+        let unconfirmed: i64 = d1
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM hop_chain_probes WHERE outpoint LIKE ?1 AND spent=1 AND spentConfirmed IS NULL",
+                [format!("{FOLD9_HOP}%")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unconfirmed, 2, "kept, unconfirmed: never deleted");
+        assert_eq!(
+            stored_rows_no_clock(&local),
+            stored_rows_no_clock(&d1),
+            "the actor is the fresh D1 judgement"
         );
     }
 

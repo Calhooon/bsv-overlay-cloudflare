@@ -970,6 +970,7 @@ pub fn reorg_clear_view(
         "reach": read["reach"],
         "memosCleared": count(crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_CLEARED),
         "evidenceDemoted": count(crate::hop_probe_memos::COUNTER_HOP_PROBE_EVIDENCE_DEMOTED),
+        "refusalsWritten": count(crate::hop_probe_memos::COUNTER_HOP_PROBE_REFUSALS_WRITTEN),
     })
 }
 
@@ -1780,6 +1781,8 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
         crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_EXPIRED,
         // bsv-low #1044: the swept rows no judge reads, deleted and not noted for the publish
         crate::hop_probe_memos::COUNTER_HOP_PROBE_MEMOS_EXPIRED_UNNOTED,
+        // bsv-low #1044 fold 1: the last clear's refusals written before its tombstone moved
+        crate::hop_probe_memos::COUNTER_HOP_PROBE_REFUSALS_WRITTEN,
         // the merged lens's LOW-3: the app layer's faulted memo reads (it writes the row)
         crate::hop_probe_memos::COUNTER_APPLAYER_PROBE_MEMO_READ_FAULTS,
         // bsv-low #436: the app layer's own counts of what a body carried past its cap (it writes these rows);
