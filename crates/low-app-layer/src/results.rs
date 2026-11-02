@@ -1914,6 +1914,54 @@ pub fn resolve_winner_hand(
     }
 }
 
+/// PURE (bsv-low #1048, the stack half): the PUBLIC read's landing on the
+/// index's own evidence. A recorded spend (`spent` with a txid pointer) whose
+/// bytes are FINAL (`spenderFinal`, read from the spender's own bytes at the
+/// write) and whose bytes the index HOLDS, either the stored verdict group
+/// computed from THIS pointer (`verdictTxid == spendingTxid`: the exit and its
+/// signers classified from the bytes at the write) or the spender's BEEF
+/// (`pot_beefs`, hash-verified when it is classified), is decided by its
+/// signers: a covenant spend validates only under two of the three committed
+/// settle keys and pays only a mandated template, so the outcome is the
+/// bytes', not the network's word. The network's SEEN is the fast path, the
+/// index's proof (`spentConfirmed`, a verified spender proof) the sure one;
+/// neither is a precondition here.
+///
+/// What stays withheld: a spend the index does not hold the bytes of (a bare
+/// pointer), and a NON-FINAL spend (a pre-signed refund parked before its
+/// height, #323's displaceable intent) until the index's proof lands.
+/// Stated: a final, validly signed spend the network later refuses for a
+/// rival is served resolved until the index's pointer moves (the chaser's
+/// displacement, an eviction), as a SEEN spend was.
+pub fn index_bytes_landing(r: &ResultsRow) -> bool {
+    let Some(settle) = r.spending_txid.as_deref() else {
+        return false;
+    };
+    if r.spent != Some(true) || r.spender_final != Some(true) || !crate::logic::valid_txid(settle) {
+        return false;
+    }
+    let stored_group = r.verdict.is_some()
+        && r.verdict_txid
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case(settle));
+    stored_group || r.spender_beef_hex.is_some()
+}
+
+/// bsv-low #1048: the public `/results` route's third-arm pair. A row
+/// [`index_bytes_landing`] holds takes `(spender_seen, spender_final)` =
+/// `(true, true)`, the pair `owed::apply_word_arm` hands the owed path for a
+/// decided spend, so the shared bar
+/// (`logic::is_confirmed_landing_with_proof`) is unchanged and every other row
+/// is byte for byte what it was. Called by the route alone
+/// (`routes::gather_result_rows`); the owed judgement keeps its coin-word arm.
+pub fn apply_index_bytes_arm(rows: &mut [ResultsRow]) {
+    for r in rows {
+        if index_bytes_landing(r) {
+            r.spender_seen = Some(true);
+        }
+    }
+}
+
 /// Every pot outpoint in `rows` whose funding BEEF hash-verifies, mapped to
 /// its COMMITTED covenant params (`pubA`/`pubB` — the settle keys the lock
 /// itself names). This is what lets `/results` fetch seat markers the way
@@ -5484,6 +5532,217 @@ mod tests {
             assert_eq!(e[0].spent, Some(true));
             assert_eq!(e[0].spent_confirmed, parked);
         }
+    }
+
+    /// bsv-low #1048 (L58 pair 24, lobby-coop's `loserView`): the settle mined, the network never called it SEEN,
+    /// and `/results` served `unresolved` with `spent true` for 240 s. The fixture: a real covenant settle (winner A)
+    /// the index recorded spent with FINAL bytes, unconfirmed, no SEEN latch (its broadcaster's word `announced`).
+    /// The route's arm (`apply_index_bytes_arm`, then the shared assembly) resolves it on the bytes the index holds:
+    /// the spender's BEEF, or the stored verdict group alone.
+    fn fix1048_fixture() -> (String, String, String, impl Fn(&str) -> ResultsRow) {
+        let (ka, pa) = real_key(41);
+        let (kb, pb) = real_key(42);
+        let w_winner = wallet_of(0x51);
+        let w_loser = wallet_of(0x52);
+        let winner = identity_of(&w_winner);
+        let loser = identity_of(&w_loser);
+        let gid = tx(0x01);
+        let params = params_with_keys(&pa, &pb);
+        let lock = covenant_lock(&params);
+        let f_raw = raw_tx(&"11".repeat(32), 0, 0xffff_ffff, &[(1000, lock)], 0);
+        let f_id = bsv_rs::transaction::Transaction::from_binary(&f_raw)
+            .unwrap()
+            .id();
+        let outs = vec![
+            (10u64, p2pkh_lock(&params.rake_pkh)),
+            (980u64, p2pkh_lock(&params.pay_pkh_a)),
+        ];
+        let s_raw = raw_tx(&f_id, 0, 0xffff_ffff, &outs, 0);
+        let s_id = bsv_rs::transaction::Transaction::from_binary(&s_raw)
+            .unwrap()
+            .id();
+        let won = real_seat_marker(&ka, &pa, &w_winner, &winner, &loser, &gid, &f_id, 0);
+        let lost = real_seat_marker(&kb, &pb, &w_loser, &loser, &winner, &gid, &f_id, 0);
+        let (fr, fi, sr, si, w) = (f_raw, f_id, s_raw, s_id.clone(), winner.clone());
+        let row_of = move |who: &str| {
+            let marker = if who == w { &won } else { &lost };
+            ResultsRow {
+                identity: marker.identity.clone(),
+                game_id: gid.clone(),
+                pot_txid: fi.clone(),
+                pot_vout: 0,
+                recovery_height: marker.recovery_height,
+                opponent_identity: marker.opponent_identity.clone(),
+                spent: Some(true),
+                spending_txid: Some(si.clone()),
+                spent_confirmed: Some(false),
+                funding_beef_hex: Some(beef_hex_of(&fr)),
+                spender_beef_hex: Some(beef_hex_of(&sr)),
+                seat_settle_pubkey: Some(marker.seat_settle_pubkey.clone()),
+                seat_sig_hex: Some(marker.seat_sig_hex.clone()),
+                marker_sig_hex: Some(marker.identity_sig_hex.clone()),
+                // `announced`: no SEEN latch; the bytes are final
+                spender_seen: Some(false),
+                spender_final: Some(true),
+                ..Default::default()
+            }
+        };
+        (s_id, winner, loser, row_of)
+    }
+
+    fn fix1048_served(who: &str, mut rows: Vec<ResultsRow>) -> Vec<ResultEntry> {
+        apply_index_bytes_arm(&mut rows);
+        assemble_like_the_route(
+            who,
+            rows,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn fix1048_a_a_final_settle_the_index_holds_resolves_without_seen() {
+        let (s_id, winner, loser, row_of) = fix1048_fixture();
+        // The premise, the route as it was: no SEEN, no proof, no latch: unresolved for both seats.
+        for who in [winner.as_str(), loser.as_str()] {
+            let e = assemble_like_the_route(
+                who,
+                vec![row_of(who)],
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+            );
+            assert_eq!((e[0].verdict, e[0].outcome), (None, Outcome::Unresolved));
+        }
+        // The spender's BEEF held: the winner's view and the LOSER's view resolve.
+        let w = fix1048_served(&winner, vec![row_of(&winner)]);
+        let l = fix1048_served(&loser, vec![row_of(&loser)]);
+        assert_eq!(
+            (w[0].verdict, w[0].outcome, l[0].verdict, l[0].outcome),
+            (
+                Some(PotVerdict::WinnerA),
+                Outcome::Won,
+                Some(PotVerdict::WinnerA),
+                Outcome::Lost
+            ),
+            "a final settle the index holds is decided by its bytes, never only by the network's SEEN"
+        );
+        // The words beside as they are: the pointer unconfirmed, no height invented.
+        assert_eq!(l[0].spent_confirmed, Some(false));
+        assert_eq!(l[0].settle_txid.as_deref(), Some(s_id.as_str()));
+        assert_eq!(l[0].at_height, None, "no height without the index's proof");
+        // The stored verdict group alone (the exit and its signers classified from the bytes at the write; the
+        // spender's BEEF not joined): resolved, the signers served.
+        let grouped = |who: &str| {
+            let mut r = row_of(who);
+            r.spender_beef_hex = None;
+            r.verdict = Some("winner-a".into());
+            r.verdict_txid = Some(s_id.to_ascii_uppercase());
+            r.settle_signers = Some("coop".into());
+            r
+        };
+        let l = fix1048_served(&loser, vec![grouped(&loser)]);
+        assert_eq!(
+            (l[0].verdict, l[0].outcome),
+            (Some(PotVerdict::WinnerA), Outcome::Lost)
+        );
+        assert_eq!(l[0].settle_signers.as_deref(), Some("coop"));
+        let w = fix1048_served(&winner, vec![grouped(&winner)]);
+        assert_eq!(w[0].outcome, Outcome::Won);
+    }
+
+    /// The index's proof and its latch decide with no SEEN, the bytes' finality not read (a mined refund is final
+    /// by its block). The public route reads no tracker word: a final settle whose word is a checked `mined` is
+    /// decided by the bytes arm above whatever the word; the non-final case waits on the index's proof (the
+    /// route's reading of the coin word is #737's).
+    #[test]
+    fn fix1048_b_the_checked_proof_and_the_latch_decide_without_seen() {
+        let (_, winner, loser, row_of) = fix1048_fixture();
+        for (name, proof, latch) in [
+            ("verified proof", Some(true), Some(false)),
+            ("latch", None, Some(true)),
+        ] {
+            for fin in [Some(true), Some(false), None] {
+                let mk = |who: &str| {
+                    let mut r = row_of(who);
+                    r.spender_proof_verified = proof;
+                    r.spent_confirmed = latch;
+                    r.spender_final = fin;
+                    r
+                };
+                let w = fix1048_served(&winner, vec![mk(&winner)]);
+                let l = fix1048_served(&loser, vec![mk(&loser)]);
+                assert_eq!(
+                    (w[0].outcome, l[0].outcome),
+                    (Outcome::Won, Outcome::Lost),
+                    "{name}, final {fin:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fix1048_c_a_spend_the_index_does_not_hold_stays_unresolved() {
+        let (_, winner, loser, row_of) = fix1048_fixture();
+        type Edit = Box<dyn Fn(&mut ResultsRow)>;
+        let cases: Vec<(&str, Edit)> = vec![
+            (
+                "a bare pointer (no bytes, no group)",
+                Box::new(|r| r.spender_beef_hex = None),
+            ),
+            (
+                "a group of another pointer, no bytes",
+                Box::new(|r| {
+                    r.spender_beef_hex = None;
+                    r.verdict = Some("winner-a".into());
+                    r.verdict_txid = Some("ab".repeat(32));
+                }),
+            ),
+            (
+                "non-final bytes (#323's parked intent)",
+                Box::new(|r| r.spender_final = Some(false)),
+            ),
+            ("finality unknown", Box::new(|r| r.spender_final = None)),
+            ("not recorded spent", Box::new(|r| r.spent = None)),
+            ("no pointer", Box::new(|r| r.spending_txid = None)),
+            (
+                "a malformed pointer",
+                Box::new(|r| r.spending_txid = Some("zz".into())),
+            ),
+        ];
+        for (name, edit) in &cases {
+            for who in [winner.as_str(), loser.as_str()] {
+                let mut r = row_of(who);
+                edit(&mut r);
+                assert!(!index_bytes_landing(&r), "{name}");
+                let e = fix1048_served(who, vec![r]);
+                assert_eq!(
+                    (e[0].verdict, e[0].outcome),
+                    (None, Outcome::Unresolved),
+                    "{name} ({who}): nothing invented"
+                );
+            }
+        }
+    }
+
+    /// The wiring: the public route applies the arm before its assembly; the owed judgement does not (it keeps its
+    /// coin-word arm).
+    #[test]
+    fn fix1048_d_the_public_route_alone_applies_the_arm() {
+        let routes = include_str!("routes.rs");
+        let start = routes
+            .find("async fn gather_result_rows(")
+            .expect("the route's gather");
+        let body = &routes[start..];
+        let body = &body[..body.find("\n}\n").expect("the function's end")];
+        let arm = body
+            .find("crate::results::apply_index_bytes_arm(&mut rows);")
+            .expect("the route applies the arm");
+        let assemble = body
+            .find("crate::results::assemble_results(")
+            .expect("the route assembles");
+        assert!(arm < assemble, "the arm precedes the assembly");
+        assert!(!include_str!("owed_judge/hydrate.rs").contains("apply_index_bytes_arm"));
+        assert!(!include_str!("owed.rs").contains("apply_index_bytes_arm"));
     }
 
     /// #323 defect 2 — `/spent-any` must not collapse "we could not look"

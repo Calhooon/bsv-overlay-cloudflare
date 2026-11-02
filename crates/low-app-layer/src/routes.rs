@@ -3494,6 +3494,9 @@ async fn gather_result_rows(
     // replayed here from its retained bytes, bounded). BEST-EFFORT, same
     // discipline as hand markers: a fault leaves the marker path in charge.
     let proof_hands = results_proof_hands(db, &game_ids).await;
+    // bsv-low #1048: a recorded, final spend whose bytes the index holds is decided by its signers, never by the
+    // network's SEEN alone (`results::index_bytes_landing`). The public route only; no statement added.
+    crate::results::apply_index_bytes_arm(&mut rows);
 
     Ok((
         crate::results::assemble_results(
