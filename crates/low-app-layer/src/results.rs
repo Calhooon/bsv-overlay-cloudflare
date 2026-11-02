@@ -1345,13 +1345,14 @@ pub struct ResultsRow {
     /// arms.
     ///
     /// NEVER set from bytes (bsv-low #1048, the review's NOTE-1): the SEEN latch is a broadcaster's word alone. The
-    /// public route's bytes arm writes [`ResultsRow::index_signers`] instead, which the bar ORs in.
+    /// public reads' bytes arm writes [`ResultsRow::index_signers`] instead, which the bar ORs in.
     pub spender_seen: Option<bool>,
     pub spender_final: Option<bool>,
     /// bsv-low #1048: the established pair (`coop`, `tower-a`, `tower-b`) WHO SIGNED this row's recorded, FINAL
     /// spend, read from bytes the index holds (#406's BIP-143 check against the committed triple). Set ONLY by
-    /// [`apply_index_bytes_arm`] on the public `/results` route (never by the owed path, never from a word); `None`
-    /// everywhere else. A row holding it lands (the shared bar's third arm, ORed in) and serves these signers.
+    /// [`apply_index_bytes_arm`] in `routes::gather_result_rows`, which serves the two public reads `/results` and
+    /// `/recovery-view`'s outcome fold (never by the owed path, never from a word); `None` everywhere else. A row
+    /// holding it lands (the shared bar's third arm, ORed in) and serves these signers.
     pub index_signers: Option<String>,
     /// bsv-low P4 slice 2 (2026-09-02): the pot FUNDING tx's own size + exact
     /// fee, decoded once at admission from the admitted BEEF
@@ -1926,6 +1927,12 @@ pub fn resolve_winner_hand(
 /// BEEF (no stored group of the pointer). Each is one BIP-143 digest and at most about 93 ECDSA verifies
 /// (`MAX_SIG_CANDIDATES` 16 against the three committed keys), so a page costs at most 16 such rows; past it a row
 /// waits for the index's proof or its latch (the safe direction, never a guess).
+///
+/// The bound, stated (bsv-low #1058, PR 265's second review NOTE-3; NOT measured on wasm32): a page recomputes at
+/// most 16 x 93 = 1,488 secp256k1 verifies and 16 BIP-143 digests. The rows that reach it hold no stored group of
+/// their pointer, which the overlay's hook writes for every spend whose template classifies, so in practice they are
+/// rare; each read recomputes them (no memo beyond `/results`' BoardView window). The figure on the Worker is a
+/// verify's wasm32 cost times 1,488; it is unmeasured, and it is the platform's CPU limit, never a wrong answer.
 pub const INDEX_SIGNERS_RECOMPUTE_MAX: usize = 16;
 
 /// PURE (bsv-low #1048, the stack half; folded by FIX-1048-STACK-FOLD-1): the PUBLIC read's landing on the index's
@@ -2003,12 +2010,24 @@ fn landed_by_the_shared_bar(r: &ResultsRow) -> bool {
     )
 }
 
-/// bsv-low #1048: the public `/results` route's bytes arm. A row the shared bar does not already land, for which
+/// bsv-low #1048: the public reads' bytes arm. A row the shared bar does not already land, for which
 /// [`index_bytes_landing`] names an established pair, takes [`ResultsRow::index_signers`]; the bar
 /// (`logic::is_confirmed_landing_with_proof`) is unchanged and ORs the field in inside `assemble_results`, so every
 /// other row is byte for byte what it was. Writes NO SEEN latch (`spender_seen` is the broadcaster's word alone).
-/// At most [`INDEX_SIGNERS_RECOMPUTE_MAX`] rows a page are classified from their BEEF. Called by the route alone
-/// (`routes::gather_result_rows`); the owed judgement keeps its coin-word arm.
+/// At most [`INDEX_SIGNERS_RECOMPUTE_MAX`] rows a page are classified from their BEEF. Called by
+/// `routes::gather_result_rows` alone, which serves TWO public reads: `/results` and `/recovery-view`'s outcome fold
+/// (through `gather_result_entries`); the owed judgement keeps its coin-word arm.
+///
+/// THE ONE RULE (bsv-low #1058): the ending narration stands on who signed the CURRENT spend. A stored group is
+/// read only when it is THIS pointer's (`verdictTxid == spendingTxid`); a pointer the chaser re-pointed to a rival
+/// whose bytes the index holds is classified from the rival's own bytes, so a rival nobody signed resolves nothing
+/// (pins `fix1058_a_*`, here and over the shipped `results_sql`).
+///
+/// "The next read", stated (the review's NOTE-1): a retraction (an eviction's shadow move, a displaced pointer)
+/// shows on the next COMPUTE. `/recovery-view` computes per request. `/results` is served from the per-identity
+/// BoardView memo (`board_view::serve_view`): fresh for 10 s (`FRESH_MS`) from memory, then the held copy served at
+/// once while ONE detached refresh runs, so a reader sees the retraction at most about 10 s plus one compute after
+/// the pointer moves (the actor's direct-compute fallback answers `max-age=5`).
 pub fn apply_index_bytes_arm(
     rows: &mut [ResultsRow],
     params_by_pot: &std::collections::HashMap<(String, u32), CovenantParams>,
@@ -2262,7 +2281,7 @@ pub fn assemble_results(
         // for `at.height` two hundred lines below. A parked tx that never
         // mined can never acquire one, so this widens the bar toward CHAIN
         // TRUTH, never away from it.
-        // bsv-low #1048: the public route's bytes arm (`apply_index_bytes_arm`, never the owed path) ORs in a
+        // bsv-low #1048: the public reads' bytes arm (`apply_index_bytes_arm`, never the owed path) ORs in a
         // recorded, final spend whose held bytes classify to an established pair against the committed triple.
         let confirmed_landing = landed_by_the_shared_bar(&r) || r.index_signers.is_some();
         if let (Some(true), true, Some(settle)) = (r.spent, confirmed_landing, settle_lc.as_deref())
@@ -5995,6 +6014,46 @@ mod tests {
         evicted.verdict_txid = None;
         let e = fix1048_served(&loser, vec![evicted]);
         assert_eq!((e[0].verdict, e[0].outcome), (None, Outcome::Unresolved));
+    }
+
+    /// FIX-1058 (bsv-low #1058, PR 265's second review LOW-1; the lens's scratch pin `lens265_a`): the arm's own
+    /// pointer guard. The ending narration stands on who signed the CURRENT spend; a stored group is this pointer's
+    /// only when `verdictTxid == spendingTxid`. The row: the coop settle's group (`winner-a`, `coop`), the pointer
+    /// re-pointed to a rival nobody signed whose bytes the index HOLDS (the BEEF join follows the pointer). The
+    /// rival's own bytes classify to no pair, so nothing resolves and no signers are served. With the guard dropped
+    /// (the old group read as the rival's) the rival's template classifies (the assembly's path 2) and the loser is
+    /// served `Lost`, narrated `coop`.
+    #[test]
+    fn fix1058_a_a_stale_group_never_lends_its_signers_to_a_held_rival() {
+        let (coop_id, _, _, _) = fix1048_fixture();
+        let (rival_id, winner, loser, rival_row_of) =
+            fix1048_fixture_signed(Fix1048Signed::Unsigned);
+        assert_ne!(
+            coop_id, rival_id,
+            "the rival is another spend of the same pot"
+        );
+        for who in [winner.as_str(), loser.as_str()] {
+            let mut r = rival_row_of(who);
+            assert_eq!(r.spending_txid.as_deref(), Some(rival_id.as_str()));
+            assert!(r.spender_beef_hex.is_some(), "the rival's bytes are held");
+            r.verdict = Some("winner-a".into());
+            r.verdict_txid = Some(coop_id.clone());
+            r.settle_signers = Some("coop".into());
+            let params = covenant_params_by_pot(std::slice::from_ref(&r));
+            let p = params.get(&(r.pot_txid.to_ascii_lowercase(), r.pot_vout));
+            assert!(p.is_some(), "the committed params are read");
+            assert_eq!(
+                index_bytes_landing(&r, p, true),
+                None,
+                "{who}: the old pointer's group is not the rival's"
+            );
+            let e = fix1048_served(who, vec![r]);
+            assert_eq!(
+                (e[0].verdict, e[0].outcome, e[0].settle_signers.clone()),
+                (None, Outcome::Unresolved, None),
+                "{who}: a re-pointed rival's held bytes resolve nothing"
+            );
+        }
     }
 
     /// The wiring: the public route applies the arm before its assembly; the owed judgement does not (it keeps its

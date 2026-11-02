@@ -4380,3 +4380,133 @@ fn fix1048_g_the_bytes_arm_follows_the_indexs_pointer_through_a_displacement_and
         "an evicted spend is unresolved on the next read"
     );
 }
+
+/// FIX-1058 (bsv-low #1058, PR 265's second review LOW-1) over the SHIPPED read: the bytes arm's own pointer guard.
+/// The real c571d433 pot carries the stored group of its real settle (`winner-a`, the signers the overlay's
+/// classifier names for those bytes); the chaser re-points it to a RIVAL spend of the same pot, nobody's signature
+/// (the real settle with its unlocking script emptied: the same outputs, another txid), whose BEEF `pot_beefs`
+/// HOLDS, so `results_sql`'s join serves the rival's bytes. The ending narration stands on who signed the CURRENT
+/// spend: the rival classifies to no pair, so the read is unresolved and serves no signers. With the guard dropped
+/// (the old group read as the rival's) the rival's template classifies and the stale signers are served.
+#[test]
+fn fix1058_a_a_stale_group_never_lends_its_signers_to_a_held_rival_over_the_shipped_read() {
+    use low_app_layer::results::{apply_index_bytes_arm, Outcome};
+    let conn = production_schema_db();
+    let victim = format!("02{}", "a1".repeat(32));
+    let p = enforced_pot_columns();
+    let settle_raw = hex::decode(ENFORCED_SETTLE_HEX.trim()).unwrap();
+    let settle = low_app_layer::results::parse_raw_tx_verified(&settle_raw, ENFORCED_SETTLE_TXID)
+        .expect("the real settle hashes to its txid");
+    let input = settle
+        .inputs
+        .iter()
+        .position(|i| i.prev_txid.eq_ignore_ascii_case(ENFORCED_FUNDING_TXID) && i.prev_vout == 0)
+        .expect("the settle spends the pot");
+    let signers = overlay_discovery::pot::settle_signers_for_spend(&p, 4000, &settle_raw, input)
+        .expect("the real settle's signers classify against the committed triple");
+    // The rival: the same spend with no signature.
+    let rival_raw = fix1058_unlock_emptied(&settle_raw, input);
+    let rival_txid = bsv_rs::transaction::Transaction::from_binary(&rival_raw)
+        .unwrap()
+        .id();
+    assert_ne!(rival_txid, ENFORCED_SETTLE_TXID);
+    assert_eq!(
+        overlay_discovery::pot::settle_signers_for_spend(&p, 4000, &rival_raw, input),
+        None,
+        "nobody signed the rival"
+    );
+    insert_decoded_pot(
+        &conn,
+        ENFORCED_FUNDING_TXID,
+        Some(ENFORCED_SETTLE_TXID),
+        &p,
+        4000,
+        Some("winner-a"),
+        Some(ENFORCED_SETTLE_TXID),
+        None,
+        false,
+    );
+    conn.execute(
+        "UPDATE pot_records SET spenderFinal = 1, settleSigners = ?1 WHERE txid = ?2",
+        params![signers.as_str(), ENFORCED_FUNDING_TXID],
+    )
+    .unwrap();
+    insert_beef(
+        &conn,
+        ENFORCED_FUNDING_TXID,
+        &beef_bytes_of(ENFORCED_FUNDING_HEX),
+    );
+    insert_beef(&conn, &rival_txid, &beef_bytes_of(&hex::encode(&rival_raw)));
+    file_marker(&conn, &victim, ENFORCED_FUNDING_TXID, "txHONEST", 1_001);
+    let read = |conn: &Connection| {
+        let mut rows = query_results_rows(conn, &victim);
+        apply_page_overlay_like_the_route(conn, &mut rows);
+        let params_by_pot = covenant_params_by_pot(&rows);
+        apply_index_bytes_arm(&mut rows, &params_by_pot);
+        let signed: Vec<Option<String>> = rows.iter().map(|r| r.index_signers.clone()).collect();
+        let beef: Vec<bool> = rows.iter().map(|r| r.spender_beef_hex.is_some()).collect();
+        (
+            assemble_like_the_route(
+                &victim,
+                rows,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+            ),
+            signed,
+            beef,
+        )
+    };
+    // The premise: on its own pointer the group lands the settle.
+    let (e, signed, _) = read(&conn);
+    assert_eq!(e[0].verdict, Some(PotVerdict::WinnerA));
+    assert_eq!(signed, vec![Some(signers.as_str().to_string())]);
+
+    // The chaser re-points the pot to the held rival.
+    conn.execute(
+        "UPDATE pot_records SET spendingTxid = ?1 WHERE txid = ?2",
+        params![rival_txid, ENFORCED_FUNDING_TXID],
+    )
+    .unwrap();
+    let (e, signed, beef) = read(&conn);
+    assert_eq!(beef, vec![true], "the join serves the rival's held bytes");
+    assert_eq!(
+        signed,
+        vec![None],
+        "the old pointer's group lends no signers"
+    );
+    assert_eq!(
+        (e[0].verdict, e[0].outcome, e[0].settle_signers.clone()),
+        (None, Outcome::Unresolved, None),
+        "a re-pointed rival's held bytes resolve nothing"
+    );
+}
+
+/// The raw transaction with input `index`'s unlocking script emptied (the BIP-143 digest does not cover it, so the
+/// outputs and the outpoint stand; the txid moves).
+fn fix1058_unlock_emptied(raw: &[u8], index: usize) -> Vec<u8> {
+    let varint = |at: usize| -> (usize, usize) {
+        match raw[at] {
+            0xfd => (u16::from_le_bytes([raw[at + 1], raw[at + 2]]) as usize, 3),
+            0xfe => (
+                u32::from_le_bytes([raw[at + 1], raw[at + 2], raw[at + 3], raw[at + 4]]) as usize,
+                5,
+            ),
+            0xff => panic!("an 8-byte varint"),
+            n => (n as usize, 1),
+        }
+    };
+    let (inputs, w) = varint(4);
+    let mut at = 4 + w;
+    for i in 0..inputs {
+        at += 36;
+        let (len, w) = varint(at);
+        if i == index {
+            let mut out = raw[..at].to_vec();
+            out.push(0);
+            out.extend(&raw[at + w + len..]);
+            return out;
+        }
+        at += w + len + 4;
+    }
+    panic!("no input {index}");
+}
