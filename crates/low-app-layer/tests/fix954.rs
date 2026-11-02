@@ -22,6 +22,15 @@
 //!   every identity once (one row each, never two) and acknowledges every mark.
 //! - `fix954_d`: the bound: at most `INGEST_FRAMES_AT_ONCE` ingests in flight; one txid's frames in message order, never
 //!   two at once. RED with the bound removed (sixteen in flight).
+//!
+//! FIX-954-FOLD-1 (the ensemble A, B and C of 2026-11-02; the agreed gap and C's MEDIUM-1):
+//!
+//! - `fix954f_e`: a MIXED batch (two wanted envelopes, the wanted pair twice, an identity event, a word pair twice, a
+//!   txfacts event) planned by `plans_many` answers main's plan for every message, in order, and through
+//!   `consume_batch_with` stores main's rows, every column, with no envelope left. RED with the batch's envelope
+//!   expansion switched off (A's mutant G, B's M1, C's M2) and under a plan-answer swap.
+//! - `fix954f_f`: a frame whose ingest faults ENDS its txid's group: the txid's later frames are not ingested until the
+//!   retry ingests the group again from its first frame (B's M2: RED with the group not ended).
 #[allow(dead_code)]
 #[path = "support/owed_db.rs"]
 mod owed_db;
@@ -82,6 +91,8 @@ struct Ingest<'a> {
     owner: BTreeMap<String, String>,
     ms: u64,
     fail: RefCell<Option<String>>,
+    /// one frame alone faults: (txid, the frame's `n`)
+    fail_frame: RefCell<Option<(String, i64)>>,
     in_flight: Cell<usize>,
     peak: Cell<usize>,
     per_txid: RefCell<BTreeMap<String, usize>>,
@@ -96,6 +107,7 @@ impl<'a> Ingest<'a> {
             owner,
             ms,
             fail: RefCell::new(None),
+            fail_frame: RefCell::new(None),
             in_flight: Cell::new(0),
             peak: Cell::new(0),
             per_txid: RefCell::new(BTreeMap::new()),
@@ -126,6 +138,10 @@ impl FrameIngest for Ingest<'_> {
             .push((txid.clone(), frame["n"].as_i64().unwrap_or(0)));
         if self.fail.borrow().as_deref() == Some(txid.as_str()) {
             return Err(format!("the tracker's write of {txid} faulted"));
+        }
+        let n = frame["n"].as_i64().unwrap_or(0);
+        if self.fail_frame.borrow().as_ref() == Some(&(txid.clone(), n)) {
+            return Err(format!("the tracker's write of {txid} frame {n} faulted"));
         }
         *self.count.borrow_mut().entry(txid.clone()).or_default() += 1;
         if let Some(id) = self.owner.get(&txid) {
@@ -508,4 +524,253 @@ async fn fix954_d_the_ingests_in_flight_are_bounded_and_one_txids_frames_keep_th
         .map(|(_, n)| *n)
         .collect();
     assert_eq!(of3, vec![0, 1, 2], "txid 3's frames in message order");
+}
+
+/// The mixed batch's events over a record holding: X and Y each a stranded hop and a wanted envelope (`mark_wanted`),
+/// W1 and W2 each a stranded hop whose word frame marks it, Z a stranded hop routed by its identity. `x_first` puts
+/// the identity event of X before the wanted pair (main's plans equal message for message) or after it.
+async fn mixed(db: &Db, x_first: bool) -> (Vec<OwedEvent>, BTreeMap<String, String>) {
+    let (x, y, z, w1, w2) = (
+        identity(20),
+        identity(21),
+        identity(22),
+        identity(23),
+        identity(24),
+    );
+    for (k, id) in [&x, &y, &z, &w1, &w2].into_iter().enumerate() {
+        seed_stranded_hop(db, id, "g1", &owed_db::hop(8_000 + k));
+    }
+    // X holds a second game, so its expansion names more than one
+    seed_stranded_hop(db, &x, "g2", &owed_db::hop(8_100));
+    for id in [&x, &y] {
+        low_app_layer::owed_judge::mark_wanted(db, id)
+            .await
+            .unwrap();
+    }
+    let mut owner = BTreeMap::new();
+    owner.insert(word_txid(23), w1.clone());
+    owner.insert(word_txid(24), w2.clone());
+    let ev = |source: &str, key: &str, seq: i64| OwedEvent {
+        v: owed_event::OWED_EVENT_V,
+        seq,
+        source: source.into(),
+        source_key: key.into(),
+        facts: json!({}),
+        at_ms: NOW as i64,
+    };
+    let ident_x = ev(owed_event::ROUTE_IDENTITY, &x, 401);
+    let mut evs = Vec::new();
+    if x_first {
+        evs.push(ident_x.clone());
+    }
+    evs.push(ev("wanted", "wanted", 402));
+    evs.push(word_event(&word_txid(23), 403));
+    evs.push(ev(owed_event::ROUTE_IDENTITY, &z, 404));
+    evs.push(ev("wanted", "wanted", 405));
+    let mut again = word_event(&word_txid(23), 406);
+    again.facts["frame"]["n"] = json!(1);
+    evs.push(again);
+    evs.push(word_event(&word_txid(24), 407));
+    evs.push(ev(owed_event::TXFACTS, &word_txid(24), 408));
+    if !x_first {
+        evs.push(ident_x);
+    }
+    (evs, owner)
+}
+
+fn envelopes(db: &Db) -> i64 {
+    db.int("SELECT COUNT(*) FROM owed_dirty WHERE gameId=''")
+}
+
+/// (e) FIX-954-FOLD-1, THE MIXED BATCH (the ensemble's agreed gap: the batch's wanted-envelope expansion unpinned, A's
+/// mutant G, B's M1, C's M2; C's MEDIUM-1: the plan path on a mixed batch). Over two copies of the record each, the
+/// batch's plans (`ingest_frames`, then `plans_many`) against main's (each frame, then each message's `plan` one at a
+/// time): equal message for message, in order (the identity event of X first: main's later read of the wanted pair
+/// finds X's envelope gone, and the batch expands each envelope once, by its first message); then the whole batch
+/// through `consume_batch_with` against main's plans through `batch_core`, the D1 judge writing: the same rows, every
+/// column, in order, the same marks left, no envelope left. With X's identity event AFTER the wanted pair the batch's
+/// read of X precedes the expansion (a plan main read after it), so only the rows and marks are compared there: what is
+/// judged is the merged plan's, the same subjects.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fix954f_e_a_mixed_batch_plans_and_judges_as_main_with_its_envelopes_expanded() {
+    let t0 = tokio::time::Instant::now();
+    let actors = RefCell::new(Vec::new());
+    for x_first in [true, false] {
+        // the plans, message for message
+        if x_first {
+            let (a, b) = (Db::new(), Db::new());
+            let (evs_a, owner_a) = mixed(&a, true).await;
+            let (evs_b, owner_b) = mixed(&b, true).await;
+            let refs_a: Vec<&OwedEvent> = evs_a.iter().collect();
+            let refs_b: Vec<&OwedEvent> = evs_b.iter().collect();
+            owed_events::ingest_frames(&Ingest::new(&a, owner_a, 0), &refs_a)
+                .await
+                .unwrap();
+            let batch = owed_events::plans_many(&a, &refs_a, true).await.unwrap();
+            let main = serial_plans(&b, &Ingest::new(&b, owner_b, 0), &refs_b).await;
+            assert_eq!(batch.len(), refs_a.len());
+            for (i, (got, want)) in batch.iter().zip(&main).enumerate() {
+                assert_eq!(
+                    got, want,
+                    "message {i} ({}): the batch's plan is main's",
+                    refs_a[i].source
+                );
+            }
+            assert_ne!(
+                batch[1],
+                owed_events::Plan::default(),
+                "the wanted pair plans Y's games"
+            );
+            assert_eq!(
+                batch[4],
+                owed_events::Plan::default(),
+                "the wanted pair again: its envelopes expanded"
+            );
+            assert_eq!(envelopes(&a), 0, "every envelope expanded by the batch");
+        }
+        // the rows
+        let mut dumps = Vec::new();
+        let mut left = Vec::new();
+        for coalesced in [true, false] {
+            let db = Db::new();
+            let (evs, owner) = mixed(&db, x_first).await;
+            let refs: Vec<&OwedEvent> = evs.iter().collect();
+            assert_eq!(envelopes(&db), 2, "two wanted envelopes");
+            let ingest = Ingest::new(&db, owner, 0);
+            let make = |_, _| async {
+                Ok::<Timed, String>(Timed {
+                    db: &db,
+                    d1_ms: 0,
+                    actor_ms: 0,
+                    d1_judges: true,
+                    t0,
+                    actors: &actors,
+                })
+            };
+            let out = if coalesced {
+                owed_events::consume_batch_with(
+                    &db,
+                    &ingest,
+                    &refs,
+                    make,
+                    std::future::pending::<()>(),
+                )
+                .await
+                .unwrap()
+            } else {
+                let plans = serial_plans(&db, &ingest, &refs).await;
+                owed_events::batch_core(&db, &refs, &plans, make, std::future::pending::<()>())
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(out.routed.faults, 0);
+            assert_eq!(
+                envelopes(&db),
+                0,
+                "x_first {x_first}, coalesced {coalesced}: no envelope left"
+            );
+            let d = dump(&db);
+            for k in 20..25 {
+                let id = identity(k);
+                assert!(
+                    db.int(&format!(
+                        "SELECT COUNT(*) FROM owed_rows WHERE identity='{id}'"
+                    )) > 0,
+                    "x_first {x_first}, coalesced {coalesced}: identity {k} judged"
+                );
+            }
+            left.push(db.int("SELECT COUNT(*) FROM owed_dirty"));
+            dumps.push(d);
+        }
+        assert_eq!(
+            dumps[0], dumps[1],
+            "x_first {x_first}: the mixed batch stores main's rows, every column, in order"
+        );
+        assert_eq!(left[0], left[1], "x_first {x_first}: the same marks left");
+    }
+}
+
+/// (f) FIX-954-FOLD-1, B's M2: A FRAME WHOSE INGEST FAULTS ENDS ITS TXID'S GROUP. Txid T carries three frames (`n` 0,
+/// 1, 2); frame 0's ingest faults: frames 1 and 2 are not ingested (a later frame of one txid never lands before an
+/// earlier one), every other txid's frame is, the batch answers the fault and judges nothing. The retry ingests T from
+/// frame 0, in order. RED with the group not ended (frames 1 and 2 ingested after frame 0 faulted).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fix954f_f_a_faulted_frame_ends_its_txids_group() {
+    let db = Db::new();
+    let (mut evs, owner) = sixteen(&db);
+    for n in [1i64, 2] {
+        let mut e = word_event(&word_txid(5), 300 + n);
+        e.facts["frame"]["n"] = json!(n);
+        evs.push(e);
+    }
+    let refs: Vec<&OwedEvent> = evs.iter().collect();
+    let ingest = Ingest::new(&db, owner, INGEST_MS);
+    *ingest.fail_frame.borrow_mut() = Some((word_txid(5), 0));
+    let actors = RefCell::new(Vec::new());
+    let t0 = tokio::time::Instant::now();
+    let make = |_, _| async {
+        Ok::<Timed, String>(Timed {
+            db: &db,
+            d1_ms: 0,
+            actor_ms: 0,
+            d1_judges: true,
+            t0,
+            actors: &actors,
+        })
+    };
+    let Err(err) =
+        owed_events::consume_batch_with(&db, &ingest, &refs, make, std::future::pending::<()>())
+            .await
+    else {
+        panic!("the batch answers the ingest's fault");
+    };
+    assert!(err.contains("frame 0 faulted"), "{err}");
+    let of5 = |ingest: &Ingest<'_>| -> Vec<i64> {
+        ingest
+            .order
+            .borrow()
+            .iter()
+            .filter(|(t, _)| *t == word_txid(5))
+            .map(|(_, n)| *n)
+            .collect()
+    };
+    assert_eq!(
+        of5(&ingest),
+        vec![0],
+        "the txid's group ended at its faulted frame"
+    );
+    for k in (0..16).filter(|k| *k != 5) {
+        assert_eq!(
+            ingest.count.borrow().get(&word_txid(k)).copied(),
+            Some(1),
+            "frame {k} ingested once"
+        );
+    }
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_rows"),
+        0,
+        "nothing judged"
+    );
+    // the retry: the group again from its first frame, in order
+    *ingest.fail_frame.borrow_mut() = None;
+    let make = |_, _| async {
+        Ok::<Timed, String>(Timed {
+            db: &db,
+            d1_ms: 0,
+            actor_ms: 0,
+            d1_judges: true,
+            t0,
+            actors: &actors,
+        })
+    };
+    let out =
+        owed_events::consume_batch_with(&db, &ingest, &refs, make, std::future::pending::<()>())
+            .await
+            .unwrap();
+    assert_eq!((out.routed.subjects, out.routed.faults), (16, 0));
+    assert_eq!(
+        of5(&ingest),
+        vec![0, 0, 1, 2],
+        "the retry ingests the group from its first frame, in order"
+    );
 }
