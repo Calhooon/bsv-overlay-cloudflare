@@ -1163,6 +1163,59 @@ pub fn probe_memo_at_tip(
     })
 }
 
+/// bsv-low #1043 (lane FIX-1043): THE PUBLIC READ'S CACHE IS NOT THE JUDGE'S EVIDENCE. `GET /spent-any` memoises a
+/// courier's answer for its own next answer across isolates (the second gate's LOW-4), and it wrote that memo under the
+/// judge's key (`<txid>.<vout>`, [`probe_memo_key`]) with no `owed_dirty` mark, so a public read (a stranger's
+/// included) moved a judgement input with no event: the D1 judge read the route's word and the actor did not, and the
+/// fleet compare parted. The rule: a judgement rests on durable evidence; a public read writes nothing a judgement
+/// reads. So the route keys its memo `spentany:<txid>.<vout>`: no judge read names it (the D1 judge's
+/// [`probe_memo_read_chunks`] and [`probe_evidence_read_chunks`] keys, the actor's closure ranges over
+/// `owed_actor::PROBE_PREFIXES`), the overlay's TTL sweep ages it (its predicate spares only the app layer's own rows
+/// and the belt's evidence), and the reorg clear deletes it when confirmed (`clear_pred!`, unmarked: no hop key's shape,
+/// so `probe_marks!` and `noted_key` name nothing). The belt's find stays the judge's one courier input (its memo and
+/// evidence, written with its mark).
+pub const SPENT_ANY_MEMO_PREFIX: &str = "spentany:";
+
+/// PURE (#1043): the route's own memo key (`spentany:<txid>.<vout>`, lowercase).
+pub fn spent_any_memo_key(txid: &str, vout: u32) -> String {
+    format!("{SPENT_ANY_MEMO_PREFIX}{}", probe_memo_key(txid, vout))
+}
+
+/// PURE (#1043): the memo `/spent-any` writes for a fresh probe, under its own key ([`probe_memo_of`]'s rule).
+pub fn spent_any_memo_of(
+    txid: &str,
+    vout: u32,
+    probe: &ChainSpendProbe,
+    now_ms: i64,
+) -> Option<ProbeMemo> {
+    probe_memo_of(txid, vout, probe, now_ms).map(|m| ProbeMemo {
+        outpoint: spent_any_memo_key(txid, vout),
+        ..m
+    })
+}
+
+/// PURE (#1043): the route's memo read for `targets`, the keys each statement binds, chunked as the memo read is.
+pub fn spent_any_memo_read_chunks(targets: &[(String, u32)]) -> Vec<Vec<String>> {
+    let keys: Vec<String> = targets
+        .iter()
+        .map(|(txid, vout)| spent_any_memo_key(txid, *vout))
+        .collect();
+    keys.chunks(PROBE_MEMO_READ_CHUNK)
+        .map(<[String]>::to_vec)
+        .collect()
+}
+
+/// PURE (#1043): a memo the route read back, keyed as its plan matches targets (`<txid>.<vout>`).
+pub fn spent_any_memo_answered(m: ProbeMemo) -> ProbeMemo {
+    match m.outpoint.strip_prefix(SPENT_ANY_MEMO_PREFIX) {
+        Some(k) => ProbeMemo {
+            outpoint: k.to_string(),
+            ..m
+        },
+        None => m,
+    }
+}
+
 /// The memo read for `n` outpoints (`IN (?, …)`), column order = `ProbeMemoRow`'s fields.
 pub fn probe_memo_read_sql(n: usize) -> String {
     let marks = std::iter::repeat_n("?", n).collect::<Vec<_>>().join(", ");
@@ -3276,7 +3329,7 @@ mod tests {
             .find("asyncfnwrite_probe_memos(")
             .expect("the memo write follows")];
         assert!(body.contains(&squash(
-            "for keys in crate::hops_view::probe_memo_read_chunks(targets) {"
+            "for keys in crate::hops_view::spent_any_memo_read_chunks(targets) {"
         )));
         assert!(body.contains(&squash(
             "db.prepare(crate::hops_view::probe_memo_read_sql(keys.len())).bind(&binds)"

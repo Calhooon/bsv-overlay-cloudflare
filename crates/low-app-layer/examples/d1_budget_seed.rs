@@ -115,7 +115,7 @@ fn main() {
     let seen = "f2".repeat(32);
     let mined = "f3".repeat(32);
     rows.push(format!("INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, spentConfirmed) VALUES ('{parent}',0,1,'{seen}',1)"));
-    rows.push(format!("INSERT INTO hop_chain_probes (outpoint,probedAtMs,spent,spendingTxid,spentConfirmed) VALUES ('{parent}.0',1,1,'{seen}',1)"));
+    rows.push(format!("INSERT INTO hop_chain_probes (outpoint,probedAtMs,spent,spendingTxid,spentConfirmed) VALUES ('spentany:{parent}.0',1,1,'{seen}',1)"));
     for (id, word, tier, proof) in [
         (&seen, "seen", "hint", None),
         (

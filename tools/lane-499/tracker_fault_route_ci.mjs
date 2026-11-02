@@ -19,7 +19,7 @@ const legacy = (v) => {
   if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).filter(([k]) => !['tracker','spenderWord','coinWord','fundingWord','lock','spendDepth'].includes(k)).map(([k,v]) => [k,legacy(v)]))
   return v
 }
-d1(`UPDATE hop_chain_probes SET probedAtMs=${Date.now()}, spendingTxid='${seen}', spent=1, spentConfirmed=1 WHERE outpoint='${parent}.0'`)
+d1(`UPDATE hop_chain_probes SET probedAtMs=${Date.now()}, spendingTxid='${seen}', spent=1, spentConfirmed=1 WHERE outpoint='spentany:${parent}.0'`)
 const before = []
 for (const path of paths) before.push(await get(path))
 assert.equal(before[0].tracker.word, 'seen', 'fixture has a stored word before the fault')

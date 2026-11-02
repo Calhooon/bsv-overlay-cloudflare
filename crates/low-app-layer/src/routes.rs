@@ -4421,7 +4421,7 @@ async fn read_probe_memos(
     targets: &[(String, u32)],
 ) -> Vec<crate::hops_view::ProbeMemo> {
     let mut rows: Vec<ProbeMemoRow> = Vec::new();
-    for keys in crate::hops_view::probe_memo_read_chunks(targets) {
+    for keys in crate::hops_view::spent_any_memo_read_chunks(targets) {
         let binds: Vec<JsValue> = keys.iter().map(|k| JsValue::from_str(k)).collect();
         match db
             .prepare(crate::hops_view::probe_memo_read_sql(keys.len()))
@@ -4461,6 +4461,7 @@ async fn read_probe_memos(
             spent_confirmed: r.spent_confirmed.map(|v| v != 0),
             tip_height: r.tip_height.and_then(|t| u64::try_from(t).ok()),
         })
+        .map(crate::hops_view::spent_any_memo_answered)
         .collect()
 }
 
@@ -5706,7 +5707,8 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
         read_verdict_memos(&ctx.env, &txids, now_ms).await
     };
     // the second gate's LOW-4 (2026-09-18): the D1 probe memo (`hop_chain_probes`, migration 150) is `/spent-any`'s
-    // durable memo — a KNOWN answer younger than five minutes serves across isolates; a fresh answer is written
+    // durable memo, keyed `spentany:<txid>.<vout>` since bsv-low #1043 (`hops_view::SPENT_ANY_MEMO_PREFIX`: the route's
+    // cache, never the judge's evidence; a public read writes nothing a judgement reads) — a KNOWN answer younger than five minutes serves across isolates; a fresh answer is written
     // back in one batch (a fault never). The press-time read stays honest: a swept outpoint is `spent` for as long
     // as the memo says, and the sweep's broadcast is judged by the network either way.
     let now_ms = worker::Date::now().as_millis() as i64;
@@ -5768,7 +5770,8 @@ pub async fn spent_any(req: Request, ctx: RouteContext<AuthState>) -> Result<Res
                 spending_txid: row.spending_txid.clone(),
                 spent_confirmed: row.spent_confirmed,
             };
-            if let Some(m) = crate::hops_view::probe_memo_of(&txid_lc, op.vout, &probe, now_ms) {
+            if let Some(m) = crate::hops_view::spent_any_memo_of(&txid_lc, op.vout, &probe, now_ms)
+            {
                 fresh.push(m);
             }
             row

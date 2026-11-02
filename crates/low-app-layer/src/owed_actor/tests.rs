@@ -18940,6 +18940,215 @@ mod fix1042 {
         assert!(diff_rows(&a, &b).is_empty(), "the compare at zero");
     }
 }
+
+// ---- FIX-1043 (bsv-low #1043): the public /spent-any read writes nothing a judgement reads ----
+
+mod fix1043 {
+    use super::fix1010::{fresh_d1, probe_batch};
+    use super::*;
+    use crate::hops_view::{
+        probe_memo_read_sql, spent_any_memo_answered, spent_any_memo_of,
+        spent_any_memo_read_chunks, ChainSpendProbe, ProbeMemo, PROBE_MEMO_UPSERT_SQL,
+    };
+    use bsv_overlay_cloudflare::hop_probe_memos as memos;
+
+    fn rows_of(db: &SqliteSql) -> Vec<Value> {
+        db.conn.prepare("SELECT json_object('outpoint',outpoint,'family',family,'gameId',gameId,'sats',sats,'opponentIdentity',opponentIdentity,'atHeight',atHeight,'reason',reason,'facts',facts,'claimable',claimable) FROM owed_rows WHERE identity='owner' ORDER BY outpoint").unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap().map(|s| serde_json::from_str::<Value>(&s.unwrap()).unwrap()).collect()
+    }
+
+    fn marks(db: &SqliteSql) -> i64 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM owed_dirty", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// `GET /spent-any`'s write as the route makes it (`routes.rs`: `hops_view::spent_any_memo_of` of the ladder's
+    /// answer, one `PROBE_MEMO_UPSERT_SQL` a fresh memo), for a stranger's CONFIRMED spend of `hop:0`. Answers the key.
+    fn route_write(db: &SqliteSql, hop: &str, spender: &str) -> String {
+        let probe = ChainSpendProbe {
+            known: true,
+            spent: Some(true),
+            spending_txid: Some(spender.to_string()),
+            spent_confirmed: Some(true),
+        };
+        let m = spent_any_memo_of(hop, 0, &probe, db.now.get() as i64).unwrap();
+        db.conn
+            .execute(
+                PROBE_MEMO_UPSERT_SQL,
+                rusqlite::params![
+                    m.outpoint,
+                    m.probed_at_ms,
+                    m.spent,
+                    m.spending_txid,
+                    m.spent_confirmed,
+                    m.tip_height.map(|t| t as i64)
+                ],
+            )
+            .unwrap();
+        m.outpoint
+    }
+
+    /// The route's own read (`routes::read_probe_memos`): its keys, then each row keyed back for its plan.
+    fn route_read(db: &SqliteSql, targets: &[(String, u32)]) -> Vec<ProbeMemo> {
+        let mut out = Vec::new();
+        for keys in spent_any_memo_read_chunks(targets) {
+            let mut q = db.conn.prepare(&probe_memo_read_sql(keys.len())).unwrap();
+            out.extend(
+                q.query_map(rusqlite::params_from_iter(keys.iter()), |r| {
+                    Ok(ProbeMemo {
+                        outpoint: r.get(0)?,
+                        probed_at_ms: r.get(1)?,
+                        spent: r.get(2)?,
+                        spending_txid: r.get(3)?,
+                        spent_confirmed: r.get(4)?,
+                        tip_height: r.get::<_, Option<i64>>(5)?.map(|t| t as u64),
+                    })
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .map(spent_any_memo_answered),
+            );
+        }
+        out
+    }
+
+    /// (fix1043_a) THE FINDING: a stranded hop the index holds unspent, its memo long gone, judged the owner's
+    /// `hop-stranded` press by both judges. A public `/spent-any` of the hop (anyone's) finds a stranger's confirmed
+    /// spend and memoises it. The route answers its next read from that memo; the FRESH D1 judgement after it is the
+    /// one before it field for field, no mark is written, and the compare against the actor (judged before the read,
+    /// no event since) is at zero. RED on main's rule (the route's memo keyed `<hop>.0`, `hops_view::probe_memo_of`):
+    /// the D1 judge reads the route's word and the row leaves `hop-stranded`.
+    #[tokio::test]
+    async fn fix1043_a_a_public_read_leaves_the_judgement_and_the_compare_unchanged() {
+        let d1 = d1_judge(&stranded()).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        let hop = format!("{STRANDED_HOP}:0");
+        let before = stored_rows_no_clock(&d1);
+        let r = fold9_row(&d1, &hop).unwrap();
+        assert_eq!(
+            (r.0.as_str(), r.1),
+            ("hop-stranded", Some(1)),
+            "the premise: the owner's press"
+        );
+        let marks_before = marks(&d1);
+        let (_, spender) = fold9_spend(STRANDED_HOP);
+        let key = route_write(&d1, STRANDED_HOP, &spender);
+        // the route's cache serves the route
+        let targets = [(STRANDED_HOP.to_string(), 0u32)];
+        let (answered, ask) = crate::tracker_host::runtime::spent_any_memo_plan(
+            &targets,
+            &route_read(&d1, &targets),
+            d1.now.get() as i64,
+            &Default::default(),
+        );
+        assert_eq!(
+            answered.len(),
+            1,
+            "the route's next read is answered from its memo ({key})"
+        );
+        assert!(ask.is_empty());
+        assert_eq!(
+            answered[0].2.spending_txid.as_deref(),
+            Some(spender.as_str())
+        );
+        assert_eq!(marks(&d1), marks_before, "a public read writes no mark");
+        fresh_d1(&d1).await;
+        assert_eq!(
+            stored_rows_no_clock(&d1),
+            before,
+            "the fresh D1 judgement after the public read is the one before it"
+        );
+        let (a, b) = (rows_of(&d1), rows_of(&local));
+        assert!(!a.is_empty());
+        let diff = diff_rows(&a, &b);
+        assert!(diff.is_empty(), "the compare at zero: {diff:?}");
+        assert_eq!(rows_digest(&a), rows_digest(&b));
+    }
+
+    /// (fix1043_b) A STRANGER'S READ WRITES NOTHING THE JUDGE READS, AND NOTHING THE OVERLAY'S PASSES TELL IT OF: the
+    /// route's memo is no key the D1 judge reads (`probe_memo_read_chunks`, `probe_evidence_read_chunks`) nor one the
+    /// actor's closure reaches; the overlay's reorg clear deletes it when confirmed and its TTL sweep ages it, neither
+    /// marking nor noting it; through both the owner's row digest is unchanged. RED on main's key: the judge's read
+    /// names it, and the clear and the sweep mark and note it.
+    #[tokio::test]
+    async fn fix1043_b_a_strangers_read_is_no_judge_input_and_the_overlays_passes_tell_no_one() {
+        let d1 = d1_judge(&stranded()).await;
+        let digest = rows_digest(&rows_of(&d1));
+        let (_, spender) = fold9_spend(STRANDED_HOP);
+        let key = route_write(&d1, STRANDED_HOP, &spender);
+        let targets = [(STRANDED_HOP.to_string(), 0u32)];
+        let judge_keys: Vec<String> = crate::hops_view::probe_memo_read_chunks(&targets)
+            .concat()
+            .into_iter()
+            .chain(crate::hops_view::probe_evidence_read_chunks(&targets).concat())
+            .collect();
+        assert!(
+            !judge_keys.contains(&key),
+            "the judge reads {judge_keys:?}, never {key}"
+        );
+        assert!(
+            !crate::owed_actor::PROBE_PREFIXES
+                .iter()
+                .any(|p| key.starts_with(&format!("{p}{STRANDED_HOP}"))),
+            "the actor's closure never reaches {key}"
+        );
+        fresh_d1(&d1).await;
+        assert_eq!(rows_digest(&rows_of(&d1)), digest);
+        let marks_before = marks(&d1);
+        // the reorg clear (reach 0, the whole table) deletes the confirmed route memo: unmarked, unnoted
+        let noted = probe_batch(
+            &d1,
+            memos::HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL,
+            &memos::HOP_PROBE_MEMO_REORG_CLEAR_FRAMED,
+            Some(0),
+            false,
+        );
+        assert!(noted.is_empty(), "{noted:?}");
+        assert_eq!(marks(&d1), marks_before);
+        let gone: i64 = d1
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM hop_chain_probes WHERE outpoint=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone, 0, "the clear took the route's confirmed memo");
+        // the TTL sweep ages a route memo: unmarked, unnoted
+        let key = route_write(&d1, STRANDED_HOP, &spender);
+        d1.now.set(d1.now.get() + 3 * 3_600_000);
+        let noted = probe_batch(
+            &d1,
+            memos::HOP_PROBE_MEMO_EXPIRE_MARK_SQL,
+            &[memos::HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL],
+            Some(d1.now.get() as i64 - memos::HOP_PROBE_MEMO_TTL_MS),
+            true,
+        );
+        assert!(noted.is_empty(), "{noted:?}");
+        assert_eq!(marks(&d1), marks_before);
+        let gone: i64 = d1
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM hop_chain_probes WHERE outpoint=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone, 0, "the sweep aged the route's memo");
+    }
+
+    /// (fix1043_c) THE BELT'S FIND STILL REACHES THE JUDGE: the same hop, the same stranger's confirmed spend, found by
+    /// the belt's tick (its memo, its evidence, its mark): the D1 judgement leaves `hop-stranded` for the stranger's
+    /// spend.
+    #[tokio::test]
+    async fn fix1043_c_the_belts_find_still_reaches_the_judge() {
+        let (w, spender) = fold9_found().await;
+        let r = fold9_row(&w.d1, &format!("{STRANDED_HOP}:0")).unwrap();
+        assert_ne!(r.0, "hop-stranded", "{r:?}");
+        assert_eq!(r.2["chainSpender"], json!(spender), "{r:?}");
+    }
+}
+
 /// D2-ACTOR-G-CUT (bsv-low #1031 with #959 (b) and #954; overlay PR 260 cut to its read-cost pieces): THE ACTOR JUDGES
 /// AS THE D1 JUDGE JUDGES, ASKING CHAINTRACKS LIVE INSIDE ITS APPLY AS MAIN DOES. Each pin runs the REAL actor
 /// (`apply_with`) over native SQLite, its clock the mirror's (`SqliteSql::now`) moved by a model of the loop's load:
