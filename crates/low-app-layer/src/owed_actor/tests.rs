@@ -6914,7 +6914,7 @@ fn fold10_j_a_state_judged_under_another_build_bootstraps_again() {
     let actor = squash(include_str!("../owed_actor.rs"));
     assert!(actor.contains("body[\"rejudged\"]=n(COUNTERS[26]);"));
     assert!(
-        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total','owed_actor_compare_held_by_apply_total'))AScounters")
+        actor.contains("'owed_actor_direct_walls_total','owed_actor_rejudged_total','owed_actor_compare_tip_lag_total','owed_actor_reconcile_stale_total','owed_d1_rejudge_identities_total','owed_d1_rejudge_faults_total','owed_actor_direct_closures_total','owed_actor_direct_closure_faults_total','owed_actor_direct_closure_declines_total','owed_actor_compare_held_by_apply_total','owed_actor_compare_judge_moved_total'))AScounters")
     );
 }
 
@@ -12556,6 +12556,9 @@ impl compare::RingCompare for Fix998Weighted<'_> {
             fault: None,
             partial: false,
             prints: Default::default(),
+            games: Default::default(),
+            judged_games: None,
+            prior: None,
         }
     }
 }
@@ -22103,4 +22106,322 @@ fn fix1057f1_1_the_landing_lag_reads_the_judges_one_spelling() {
         &row(0, 300, press.clone())
     ));
     assert!(!landing_lag(&row(0, 250, wait), &row(1, 300, press)));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// FIX-1056 (bsv-low #1056; the review `FIX-1046-REVIEW-2-2026-11-02.md`, LOW-1, LOW-2, NOTE-1): nothing the compare did
+// not judge reads as a clear; a wall stop inside the re-reads owes the forward walk; the judge-side clear is counted
+// durably.
+mod fix1056 {
+    use super::*;
+
+    const W: i64 = 5_000;
+
+    fn row(o: &str, game: &str, sats: i64) -> Value {
+        json!({"outpoint": o, "family": "payout", "gameId": game, "sats": sats, "opponentIdentity": null,
+               "atHeight": null, "reason": "r", "facts": "{}", "claimable": 1})
+    }
+
+    /// One compare's raw row over `d1` and `actor` rows (each `(outpoint, game, sats)`), no mark pending; `judged` the
+    /// games a PARTIAL compare judged (`None`: every game).
+    fn raw(
+        d1: &[(&str, &str, i64)],
+        actor: &[(&str, &str, i64)],
+        now: i64,
+        judged: Option<&[&str]>,
+    ) -> compare::CompareRow {
+        let d1: Vec<Value> = d1.iter().map(|(o, g, s)| row(o, g, *s)).collect();
+        let actor: Vec<Value> = actor.iter().map(|(o, g, s)| row(o, g, *s)).collect();
+        let mut view = crate::owed_actor::rows_view(
+            "02aa",
+            Ok(json!({"rows": actor, "bootstrapped": true})),
+            &d1,
+            None,
+            None,
+        );
+        view["heldByLag"] = json!([]);
+        view["diffFields"] = json!([]);
+        if let Some(j) = judged {
+            view["d1"]["games"] = json!({"partial": true, "judgedGames": j});
+        }
+        compare::compare_row_of("02aa", now, Ok(&view))
+    }
+
+    fn of<'a>(row: &'a compare::CompareRow, o: &str) -> &'a Value {
+        row.outpoints
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["outpoint"] == o)
+            .unwrap_or(&Value::Null)
+    }
+
+    /// (fix1056_a) LOW-1: AN OUTPOINT OF A GAME A PARTIAL COMPARE DID NOT JUDGE STAYS PENDING. An actor-only row in game
+    /// `g9` is first seen pending (its entry names `g9`). A later partial compare that judged `g1` alone reads `g9` on
+    /// neither side: the outpoint stays `pendingReread` as stored (its first sight, both prints), no clear, no count,
+    /// even past the window. A read that judged `g9` and finds it equal on both sides is the clear (`heldByApply`: the
+    /// actor's print moved, D1's did not). RED with the unjudged arm made inert (the review's lens pin: filed
+    /// `heldByApply`, neither side read).
+    #[test]
+    fn fix1056_a_a_game_a_partial_compare_left_out_stays_pending() {
+        let t = NOW_MS as i64;
+        let first = compare::classify_reread(raw(&[], &[("aa:0", "g9", 2)], t, None), None, t, W);
+        assert_eq!(first.pending_reread(), 1);
+        assert_eq!(of(&first, "aa:0")["gameId"], json!("g9"));
+        let later = compare::classify_reread(
+            raw(&[], &[], t + 2 * W, Some(&["g1"])),
+            Some(&first.outpoints),
+            t + 2 * W,
+            W,
+        );
+        assert_eq!(
+            (
+                later.held_by_apply(),
+                later.judge_moved(),
+                later.pending_reread(),
+                later.diff_count
+            ),
+            (0, 0, 1, Some(0)),
+            "{}",
+            later.outpoints
+        );
+        assert_eq!(of(&later, "aa:0"), of(&first, "aa:0"), "kept as stored");
+        assert_eq!(later.reread_due_ms(W), Some(t + W), "due at once");
+        let judged = compare::classify_reread(
+            raw(&[], &[], t + 3 * W, Some(&["g9"])),
+            Some(&later.outpoints),
+            t + 3 * W,
+            W,
+        );
+        assert_eq!(
+            (
+                judged.held_by_apply(),
+                judged.pending_reread(),
+                judged.diff_count
+            ),
+            (1, 0, Some(0)),
+            "{}",
+            judged.outpoints
+        );
+        // A whole (not partial) read judges every game: the clear, as before.
+        let whole = compare::classify_reread(
+            raw(&[], &[], t + 3 * W, None),
+            Some(&later.outpoints),
+            t + 3 * W,
+            W,
+        );
+        assert_eq!(whole.held_by_apply(), 1);
+        // A pending entry stored before FIX-1056 names no game: under a partial compare its state is dropped,
+        // counted neither way.
+        let mut old = first.outpoints.clone();
+        old[0].as_object_mut().unwrap().remove("gameId");
+        let dropped = compare::classify_reread(
+            raw(&[], &[], t + 2 * W, Some(&["g1"])),
+            Some(&old),
+            t + 2 * W,
+            W,
+        );
+        assert_eq!(
+            (
+                dropped.held_by_apply(),
+                dropped.pending_reread(),
+                dropped.diff_count
+            ),
+            (0, 0, Some(0)),
+            "{}",
+            dropped.outpoints
+        );
+    }
+
+    /// (fix1056_b) LOW-1's other half, through the shipped [`compare::fresh_compare`] over the frozen fleet's whale
+    /// (past [`compare::FRESH_COMPARE_GAMES_MAX`] games, `partial`): a stored pending outpoint in a game the compare
+    /// would not judge is judged FIRST (its game in `judgedGames`), and the view carries the stored compare as read in
+    /// the same batch (the re-read's prior, no second read). RED with no pending games passed to `pick_games`.
+    #[tokio::test]
+    async fn fix1056_b_a_partial_compare_judges_the_pending_games_first() {
+        let f = fixtures()
+            .into_iter()
+            .find(|f| f.name == "d1_fleet")
+            .unwrap();
+        let d1 = d1_judge(&f).await;
+        let port = Fix986 {
+            d1: &d1,
+            actors: BTreeMap::new(),
+            judges: true,
+            die_after: Cell::new(u32::MAX),
+        };
+        let mut whale = None;
+        for id in &f.identities {
+            let view = compare::fresh_compare(&port, id, Err("no actor (pin)".into()))
+                .await
+                .unwrap();
+            if view["d1"]["games"]["partial"] == true {
+                whale = Some((id.clone(), view));
+                break;
+            }
+        }
+        let (id, base) = whale.expect("a partial identity in the fleet");
+        assert_eq!(base["storedCompare"], json!([]));
+        let judged: BTreeSet<String> = base["d1"]["games"]["judgedGames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g.as_str().unwrap().to_string())
+            .collect();
+        let all: Vec<String> = d1
+            .conn
+            .prepare(compare::COMPARE_GAMES_SQL)
+            .unwrap()
+            .query_map(rusqlite::params![id, 4_096], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let left_out = all
+            .iter()
+            .map(|g| g.to_ascii_lowercase())
+            .find(|g| !judged.contains(g))
+            .expect("a game the partial compare left out");
+        let stored = json!([{"outpoint": format!("{}:0", "ee".repeat(32)), "held": true, "pendingReread": true,
+            "seenAtMs": NOW_MS as i64, "d1At": "absent", "actorAt": "0123456789abcdef", "gameId": left_out}]);
+        d1.conn
+            .execute(
+                "INSERT INTO owed_actor_compare(identity,comparedAtMs,diffCount,outpoints,partial) VALUES (?1,?2,0,?3,1)",
+                rusqlite::params![id, NOW_MS as i64, stored.to_string()],
+            )
+            .unwrap();
+        let m = compare::Metered::new(&port);
+        let view = compare::fresh_compare(&m, &id, Err("no actor (pin)".into()))
+            .await
+            .unwrap();
+        let games = view["d1"]["games"]["judgedGames"].as_array().unwrap();
+        assert_eq!(games[0], json!(left_out), "the pending game first");
+        assert_eq!(games.len(), compare::FRESH_COMPARE_GAMES_MAX);
+        assert_eq!(view["storedCompare"], stored);
+        let mut answered = view.clone();
+        answered["actor"] = json!({"rows": [], "bootstrapped": true});
+        let raw = compare::compare_row_of(&id, NOW_MS as i64, Ok(&answered));
+        assert_eq!(
+            raw.prior,
+            Some(stored),
+            "the re-read's prior, read in the compare's own batch"
+        );
+        assert!(raw.judged_games.unwrap().contains(&left_out));
+    }
+
+    /// (fix1056_c) LOW-2: A WALL STOP INSIDE THE RE-READS OWES THE FORWARD WALK. Eight differing seats at two a tick;
+    /// the first tick queues two re-reads; at their due tick the second meets the 8 s wall (`stopped` "wall", one
+    /// re-read taken, no forward compare): the shard's row owes the forward walk, and the next tick takes no re-read
+    /// (`rereadsYielded`) and compares forward. RED on the base's rule (the review's lens pin: no `forwardOwed`).
+    #[tokio::test]
+    async fn fix1056_c_a_wall_stop_in_the_rereads_owes_the_forward_walk() {
+        let (d1, ids, actors) = fix986_fleet(8).await;
+        fix1046_served_p95(&d1, 1_492);
+        for id in &ids {
+            actors[id]
+                .conn
+                .execute("UPDATE owed_rows SET sats=sats+1 WHERE identity=?1", [id])
+                .unwrap();
+        }
+        let port = Fix986 {
+            d1: &d1,
+            actors,
+            judges: false,
+            die_after: Cell::new(u32::MAX),
+        };
+        let t = NOW_MS as i64;
+        let r = compare::ring_tick(&port, t, 0, 1, 2, || 0).await.unwrap();
+        assert_eq!(r.pending_reread, 2, "{r:?}");
+        let calls = Cell::new(0u32);
+        let slow = || {
+            calls.set(calls.get() + 1);
+            if calls.get() > 1 {
+                compare::FLEET_COMPARE_WALL_MS + 1
+            } else {
+                0
+            }
+        };
+        let r = compare::ring_tick(&port, t + W, 0, 1, 2, slow)
+            .await
+            .unwrap();
+        assert_eq!(r.stopped, Some("wall"), "{r:?}");
+        assert_eq!(r.rereads.len(), 1, "{r:?}");
+        assert!(!r.compared.contains(&ids[2]), "{r:?}");
+        let ring: Value = serde_json::from_str(
+            &d1.conn
+                .query_row(
+                    "SELECT cursor FROM owed_belt_state WHERE name='fleet-compare:ring'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ring["forwardOwed"], json!(true), "{ring}");
+        let r = compare::ring_tick(&port, t + W + 1, 0, 1, 2, || 0)
+            .await
+            .unwrap();
+        assert!(r.rereads_yielded && r.rereads.is_empty(), "{r:?}");
+        assert!(
+            r.compared.contains(&ids[2]),
+            "the forward walk goes first: {r:?}"
+        );
+    }
+
+    /// (fix1056_d) NOTE-1: THE JUDGE-SIDE CLEAR IS COUNTED DURABLY. A seat pending since its first sight, whose stored
+    /// entry names the actor's print as it reads now and a D1 print that has since moved: its re-read at the due tick
+    /// is `judgeMoved` (counted on the row) and bumps `owed_actor_compare_judge_moved_total` by one (the held-by-apply
+    /// counter untouched), served `/health/invariants.owedActor.judgeMovedDiffs`. The counter is the 37th of both
+    /// Workers' lists. New API.
+    #[tokio::test]
+    async fn fix1056_d_a_judge_moved_clear_is_counted_durably() {
+        let (d1, ids, actors) = fix986_fleet(1).await;
+        fix1046_served_p95(&d1, 1_492);
+        let id = &ids[0];
+        actors[id]
+            .conn
+            .execute("UPDATE owed_rows SET sats=sats+1 WHERE identity=?1", [id])
+            .unwrap();
+        let port = Fix986 {
+            d1: &d1,
+            actors,
+            judges: false,
+            die_after: Cell::new(u32::MAX),
+        };
+        let t = NOW_MS as i64;
+        let r = compare::ring_tick(&port, t, 0, 1, 16, || 0).await.unwrap();
+        assert_eq!(r.pending_reread, 1, "{r:?}");
+        port.actors[id]
+            .conn
+            .execute("UPDATE owed_rows SET sats=sats-1 WHERE identity=?1", [id])
+            .unwrap();
+        let (_, mut ops) = fix1046_row(&d1, id);
+        assert_eq!(ops[0]["pendingReread"], json!(true));
+        ops[0]["actorAt"] = ops[0]["d1At"].clone();
+        ops[0]["d1At"] = json!("moved-since");
+        d1.conn
+            .execute(
+                "UPDATE owed_actor_compare SET outpoints=?2 WHERE identity=?1",
+                rusqlite::params![id, ops.to_string()],
+            )
+            .unwrap();
+        let r = compare::ring_tick(&port, t + W, 0, 1, 16, || 0)
+            .await
+            .unwrap();
+        assert_eq!((r.judge_moved, r.held_by_apply), (1, 0), "{r:?}");
+        assert_eq!(fix1046_row(&d1, id).0, 1, "counted on the row");
+        assert_eq!(
+            crate::owed_actor::COUNTERS[36],
+            "owed_actor_compare_judge_moved_total"
+        );
+        assert_eq!(d1.counter(crate::owed_actor::COUNTERS[36]), 1);
+        assert_eq!(d1.counter(crate::owed_actor::COUNTERS[35]), 0);
+        assert_eq!(
+            crate::owed_actor::COUNTERS,
+            bsv_overlay_cloudflare::applayer_counters::OWED_ACTOR
+        );
+        let view = bsv_overlay_cloudflare::applayer_counters::owed_actor_view(
+            &json!({crate::owed_actor::COUNTERS[36]: 1}),
+        );
+        assert_eq!(view["judgeMovedDiffs"], json!(1));
+    }
 }
