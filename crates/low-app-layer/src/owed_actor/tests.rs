@@ -20797,6 +20797,316 @@ mod d2_actor_g {
             );
         }
     }
+
+    // ---- FIX-1045-FOLD-1 (bsv-low #1045, the FIX-1045 ensemble's agreed LOWs) ----
+
+    /// A BEEF of the payout `S` and its parent `P`, written in `order` without a sort (`to_writer`), each entry with
+    /// its bump index, over two bumps (at `h0` and `h1`) that each hold both txids; `v1` the BEEF V1 frame.
+    fn fold_two_entry_beef(
+        order: &[(bool, usize)],
+        h0: u32,
+        h1: u32,
+        v1: bool,
+    ) -> (String, Vec<u8>) {
+        use bsv_rs::transaction::merkle_path::MerklePathLeaf;
+        use bsv_rs::transaction::Beef;
+        let (txid, beef) = crate::record_post::door_pins::realistic_payout_beef();
+        let txid = hex::encode(txid);
+        let mut b = Beef::from_binary(&beef).unwrap();
+        let raw = b.find_txid_mut(&txid).unwrap().raw_tx_or_compute().unwrap();
+        let other = b
+            .txs
+            .iter()
+            .map(|t| t.txid())
+            .find(|t| *t != txid)
+            .expect("a parent");
+        let oraw = b
+            .find_txid_mut(&other)
+            .unwrap()
+            .raw_tx_or_compute()
+            .unwrap();
+        let mut p = if v1 {
+            Beef::with_version(bsv_rs::transaction::BEEF_V1)
+        } else {
+            Beef::new()
+        };
+        for h in [h0, h1] {
+            p.bumps.push(
+                MerklePath::new_unchecked(
+                    h,
+                    vec![vec![
+                        MerklePathLeaf::new_txid(0, txid.clone()),
+                        MerklePathLeaf::new_txid(1, other.clone()),
+                    ]],
+                )
+                .unwrap(),
+            );
+        }
+        for (subject, at) in order {
+            p.merge_raw_tx(if *subject { raw.clone() } else { oraw.clone() }, Some(*at));
+        }
+        let mut w = bsv_rs::primitives::encoding::Writer::new();
+        p.to_writer(&mut w);
+        (txid, w.into_bytes())
+    }
+
+    /// A same-length rewrite of both families from `old` to `new`, read warm: the facts are a cold apply's (and the
+    /// warm read of `old` before it held the bytes).
+    async fn fold_rewrite_refreshes(pay: &str, old: &[u8], new: &[u8], what: &str) {
+        assert_eq!(old.len(), new.len(), "{what}: a same-length rewrite");
+        assert_ne!(old, new, "{what}");
+        let lim = &overlay_engine::beef_limits::APP_BEEF_LIMITS;
+        assert!(
+            overlay_engine::beef_limits::parse_beef(old, lim).is_ok(),
+            "{what}"
+        );
+        assert!(
+            overlay_engine::beef_limits::parse_beef(new, lim).is_ok(),
+            "{what}"
+        );
+        let (record, local, games) = held_seat(pay, old).await;
+        let (r, held) = narrowed_at(&record, &local, &games, 11);
+        assert_eq!(
+            (
+                r.record_calls,
+                held[0].matches(&hex::encode_upper(old)).count()
+            ),
+            (1, 0),
+            "{what}: the unchanged bytes are held"
+        );
+        for t in ["transactions", "pot_beefs"] {
+            set_beef(&record, t, pay, new);
+        }
+        narrowed_at(&record, &local, &games, 12);
+        assert_eq!(
+            pay_facts(&local, pay),
+            cold_facts(&record, &games, pay),
+            "{what}: the warm mirror's facts are a cold apply's"
+        );
+    }
+
+    /// (fold1_a) THE SUBJECT'S OWN ENTRY (A LOW-1, B LOW-1, B's `lensb_1`): a V2 BEEF whose subject is NOT its last
+    /// entry and whose next entry (its parent) carries the same bump index. The mark is the subject's own marker (the
+    /// two bytes before its raw), never the parent's; a same-length rewrite repointing the subject (bump 0 at 899,000
+    /// to bump 1 at 899,500) refreshes the facts. RED on 3778db2c (the `raw || marker` search anchored the parent's
+    /// marker: the warm mirror kept 899,000).
+    #[tokio::test]
+    async fn fold1_a_a_v2_subject_before_a_like_entry_is_marked_at_its_own_entry() {
+        let (pay, old) = fold_two_entry_beef(&[(true, 0), (false, 0)], 899_000, 899_500, false);
+        let (_, new) = fold_two_entry_beef(&[(true, 1), (false, 0)], 899_000, 899_500, false);
+        let f = |b: &[u8]| {
+            crate::owed_judge::facts_of_beefs(&pay, [hex::encode(b).as_str()])
+                .unwrap()
+                .bump_height
+        };
+        assert_eq!((f(&old), f(&new)), (Some(899_000), Some(899_500)));
+        let raw_at = {
+            let raw = bsv_rs::transaction::Beef::from_binary(&old)
+                .unwrap()
+                .find_txid_mut(&pay)
+                .unwrap()
+                .raw_tx_or_compute()
+                .unwrap();
+            old.windows(raw.len()).position(|w| w == raw).unwrap()
+        };
+        let m = entry_mark(&pay, &old);
+        assert_eq!(
+            m[0].as_u64(),
+            Some((raw_at - 2 + 1) as u64),
+            "the subject's own marker, the two bytes before its raw: {m}"
+        );
+        assert!(m[1].as_str().is_some_and(|x| x.starts_with("0100")), "{m}");
+        fold_rewrite_refreshes(&pay, &old, &new, "V2, the subject first").await;
+    }
+
+    /// (fold1_b) THE FRAME'S VERSION PLACES THE MARKER (B LOW-2's M2): in V1 the marker FOLLOWS the raw (the raw's
+    /// last edge, then `01` and the index), in V2 it PRECEDES it; both are placed (never `null`, which would re-read on
+    /// every apply) and both are held when unchanged; a V1 repoint, the subject before and after its parent,
+    /// refreshes. RED with the placement taken from the wrong version (V1 placed as V2: `null`, never held).
+    #[tokio::test]
+    async fn fold1_b_the_version_places_the_marker_v1_and_v2() {
+        for (order_old, order_new, what) in [
+            (
+                [(false, 0), (true, 0)],
+                [(false, 0), (true, 1)],
+                "V1, the subject last",
+            ),
+            (
+                [(true, 0), (false, 0)],
+                [(true, 1), (false, 0)],
+                "V1, the subject first",
+            ),
+        ] {
+            let (pay, old) = fold_two_entry_beef(&order_old, 899_000, 899_500, true);
+            let (_, new) = fold_two_entry_beef(&order_new, 899_000, 899_500, true);
+            let m = entry_mark(&pay, &old);
+            assert!(
+                m[0].is_u64() && m[1].as_str().is_some_and(|x| x.ends_with("0100")),
+                "{what}: V1's marker follows the raw: {m}"
+            );
+            fold_rewrite_refreshes(&pay, &old, &new, what).await;
+        }
+        let (pay, v2) = fold_two_entry_beef(&[(false, 0), (true, 0)], 899_000, 899_500, false);
+        let m = entry_mark(&pay, &v2);
+        assert!(
+            m[0].is_u64() && m[1].as_str().is_some_and(|x| x.starts_with("0100")),
+            "V2's marker precedes the raw: {m}"
+        );
+    }
+
+    /// (fold2) THE RAW'S EDGE IS HELD (B LOW-2's M1): the subject MOVES (V2, `[S, P]` to `[P, S]`, the subject
+    /// repointed to bump 1) while its parent, carrying the subject's old marker (`01 00`), takes the subject's old
+    /// entry: the marker's bytes and the bump's height stay in place, only the raw's edge differs. RED with
+    /// [`ENTRY_MARK_RAW_EDGE`] at 0 (the warm mirror keeps 899,000).
+    #[tokio::test]
+    async fn fold2_the_raw_edge_sees_an_entry_moved_under_a_like_marker() {
+        let (pay, old) = fold_two_entry_beef(&[(true, 0), (false, 0)], 899_000, 899_500, false);
+        let (_, new) = fold_two_entry_beef(&[(false, 0), (true, 1)], 899_000, 899_500, false);
+        let (mo, bo) = (entry_mark(&pay, &old), bump_mark(&pay, &old));
+        let at = mo[0].as_u64().unwrap() as usize - 1;
+        assert_eq!(
+            old[at..at + 2],
+            new[at..at + 2],
+            "a like marker at the old entry"
+        );
+        let bat = bo[0].as_u64().unwrap() as usize - 1;
+        assert_eq!(
+            old[bat..bat + 3],
+            new[bat..bat + 3],
+            "the old bump's height in place"
+        );
+        fold_rewrite_refreshes(&pay, &old, &new, "the entry moved").await;
+    }
+
+    /// (fold3) THE DECODER'S OUTPUT IS FROZEN BY ITS VERSION (A LOW-2, B LOW-3, C LOW-2): a fixed corpus of BEEFs (V1,
+    /// V2, two bumps, the subject before its parent, an unproven ancestry, a txid the bytes do not carry), frozen as
+    /// bytes, and [`crate::owed_judge::facts_of_beefs`]'s JSON of each, frozen under [`TXFACTS_DECODER_VERSION`]. A
+    /// decoder change (a `TxFacts` field, a changed parse, a bsv-rs bump that decodes otherwise) that forgets the version
+    /// move is RED here; a version move re-freezes by name (`TXFACTS_DECODER_FREEZE=1`). Re-run at every bsv-rs bump.
+    #[test]
+    fn fold3_the_decoders_output_is_frozen_under_its_version() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/txfacts_decoder_frozen.json");
+        let decode = |cases: &[(String, String, String)]| -> Vec<Value> {
+            cases
+                .iter()
+                .map(|(name, txid, beef)| {
+                    json!({
+                        "name": name,
+                        "txid": txid,
+                        "beef": beef,
+                        "facts": crate::owed_judge::facts_of_beefs(txid, [beef.as_str()])
+                            .map(|f| f.to_json()),
+                    })
+                })
+                .collect()
+        };
+        if std::env::var("TXFACTS_DECODER_FREEZE").is_ok_and(|v| v == "1") {
+            let (rtx, rbeef) = crate::record_post::door_pins::realistic_payout_beef();
+            let mut cases: Vec<(String, String, String)> = Vec::new();
+            let mut push =
+                |n: &str, t: &str, b: &[u8]| cases.push((n.into(), t.into(), hex::encode(b)));
+            let (p, b) = proven_beef(899_000);
+            push("v2-one-bump", &p, &b);
+            let (p, b) = two_bump_beef(899_000, 899_500, 1);
+            push("v2-two-bumps-index-1", &p, &b);
+            let (p, b) = fold_two_entry_beef(&[(true, 0), (false, 0)], 899_000, 899_500, false);
+            push("v2-subject-before-parent", &p, &b);
+            let (p, b) = fold_two_entry_beef(&[(false, 0), (true, 1)], 899_000, 899_500, true);
+            push("v1-two-bumps", &p, &b);
+            push("realistic-unproven", &hex::encode(rtx), &rbeef);
+            let (_, small) = proven_beef(899_000);
+            push("absent-txid", &"ab".repeat(32), &small);
+            let out = json!({"version": TXFACTS_DECODER_VERSION, "cases": decode(&cases)});
+            std::fs::write(&path, serde_json::to_string_pretty(&out).unwrap() + "\n").unwrap();
+        }
+        let frozen: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the frozen corpus"))
+                .unwrap();
+        assert_eq!(
+            frozen["version"].as_i64(),
+            Some(TXFACTS_DECODER_VERSION),
+            "TXFACTS_DECODER_VERSION moved: re-freeze its output (TXFACTS_DECODER_FREEZE=1) in the same commit"
+        );
+        let cases: Vec<(String, String, String)> = frozen["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["name"].as_str().unwrap().into(),
+                    c["txid"].as_str().unwrap().into(),
+                    c["beef"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        assert!(cases.len() >= 6, "the corpus");
+        for (now, then) in decode(&cases)
+            .iter()
+            .zip(frozen["cases"].as_array().unwrap())
+        {
+            assert_eq!(
+                now["facts"], then["facts"],
+                "the decoder's output moved for {}: move TXFACTS_DECODER_VERSION and re-freeze together",
+                then["name"]
+            );
+        }
+    }
+
+    /// (fold5_a) THE TWIN'S MARKS ARE PINNED (C LOW-1): ONE family's entry moved (the transactions row repointed at
+    /// the same length, the pot row unchanged), then ONE family's bump height moved: each arm sees the other family's
+    /// mark, so the FIRST read re-reads both rows (one record call, both hexes), never the fail-closed second read.
+    /// RED with the twin's `held_entry_mark` (or `held_bump_mark`) removed from both arms: two record calls.
+    #[tokio::test]
+    async fn fold5_a_one_familys_entry_or_bump_moved_re_reads_both_in_one_call() {
+        let (pay, old) = two_bump_beef(899_000, 899_500, 0);
+        let (_, repointed) = two_bump_beef(899_000, 899_500, 1);
+        let (ppay, proven) = proven_beef(899_000);
+        let (_, reanchored) = proven_beef(899_001);
+        assert_eq!(pay, ppay);
+        for (base, moved, what) in [
+            (&old, &repointed, "the entry"),
+            (&proven, &reanchored, "the bump's height"),
+        ] {
+            for table in ["transactions", "pot_beefs"] {
+                let (record, local, games) = held_seat(&pay, base).await;
+                narrowed_at(&record, &local, &games, 11);
+                set_beef(&record, table, &pay, moved);
+                let (r, answers) = narrowed_at(&record, &local, &games, 12);
+                assert_eq!(
+                    (
+                        r.record_calls,
+                        answers[0].matches(&hex::encode_upper(base)).count(),
+                        answers[0].matches(&hex::encode_upper(moved)).count()
+                    ),
+                    (1, 1, 1),
+                    "{what} moved in {table} alone: the first read re-reads both families"
+                );
+                assert_eq!(
+                    pay_facts(&local, &pay),
+                    cold_facts(&record, &games, &pay),
+                    "{what} {table}"
+                );
+            }
+        }
+    }
+
+    /// (fold5_b) THE MARKS ARE PLACED BY A LINEAR WALK (C LOW-3): `held_marks` places both marks from the stream's
+    /// element offsets and searches no bytes (the `raw || marker` search was quadratic on bytes an ancestor repeats).
+    /// RED with a byte search put back.
+    #[test]
+    fn fold5_b_the_marks_are_placed_by_the_walk_never_a_search() {
+        let src = include_str!("../owed_actor.rs");
+        let body = &src[src.find("fn held_marks(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        for search in ["windows(", "find(bytes", "memmem", ".position("] {
+            assert!(
+                !body.contains(search),
+                "held_marks searches the bytes: {search}"
+            );
+        }
+        assert!(body.contains("BeefStream::new(bytes)"));
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
