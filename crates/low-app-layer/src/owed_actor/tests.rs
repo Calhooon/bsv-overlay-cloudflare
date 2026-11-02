@@ -12374,6 +12374,7 @@ impl compare::RingCompare for Fix998Weighted<'_> {
             actor_digest: None,
             fault: None,
             partial: false,
+            prints: Default::default(),
         }
     }
 }
@@ -20224,4 +20225,353 @@ async fn fix1046_c_a_reread_the_tick_cannot_afford_stays_pending_and_counts_noth
     assert_eq!(r.diffs, 1, "{r:?}");
     assert_eq!(fix1046_row(&d1, &ids[1]).0, 1);
     assert!(fix1046_queue(&d1).is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// FIX-1046-FOLD-1 (bsv-low #1046; the review `FIX-1046-REVIEW-1-2026-11-02.md`): the compare names a lag and counts a
+// disagreement. A difference that clears because the ACTOR caught up is the apply's lag (`heldByApply`); one that
+// clears because the D1 JUDGE's answer moved is a disagreement that happened (`judgeMoved`, counted).
+mod fix1046f {
+    use super::*;
+
+    const W: i64 = 5_000;
+
+    fn row(o: &str, sats: i64) -> Value {
+        json!({"outpoint": o, "family": "payout", "gameId": "g1", "sats": sats, "opponentIdentity": null,
+               "atHeight": null, "reason": "r", "facts": "{}", "claimable": 1})
+    }
+
+    /// One compare's raw row over D1's `d1` and the actor's `actor` rows (each `(outpoint, sats)`), as
+    /// [`compare::fresh_compare`]'s view shapes it, no mark pending.
+    fn raw(d1: &[(&str, i64)], actor: &[(&str, i64)], now: i64) -> compare::CompareRow {
+        let d1: Vec<Value> = d1.iter().map(|(o, s)| row(o, *s)).collect();
+        let actor: Vec<Value> = actor.iter().map(|(o, s)| row(o, *s)).collect();
+        let mut view = crate::owed_actor::rows_view(
+            "02aa",
+            Ok(json!({"rows": actor, "bootstrapped": true})),
+            &d1,
+            None,
+            None,
+        );
+        view["heldByLag"] = json!([]);
+        view["diffFields"] = json!(view["diff"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| json!({"outpoint": o, "fields": compare::diff_fields(&d1, &actor, o.as_str().unwrap())}))
+            .collect::<Vec<_>>());
+        compare::compare_row_of("02aa", now, Ok(&view))
+    }
+
+    fn of(r: &compare::CompareRow, o: &str) -> Value {
+        r.outpoints
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["outpoint"] == o)
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// (fix1046f_m1_a) MEDIUM-1, the judge-side clear: the first read sees D1 at 1 and the actor at 2 (pending); at the
+    /// re-read the actor is UNCHANGED at 2 and the D1 judge's answer MOVED to 2 (an input no event carries: a clock
+    /// fact, the reorg tombstone, a memo aging out). A disagreement that happened: counted, `judgeMoved`, never
+    /// `heldByApply`. RED on b1811944 (any clear filed `heldByApply`, diffCount 0).
+    #[test]
+    fn fix1046f_m1_a_a_clear_the_d1_judge_made_is_counted_judge_moved() {
+        let t = NOW_MS as i64;
+        let first = compare::classify_reread(raw(&[("aa:0", 1)], &[("aa:0", 2)], t), None, t, W);
+        assert_eq!(first.diff_count, Some(0));
+        assert_eq!(of(&first, "aa:0")["pendingReread"], json!(true));
+        let again = compare::classify_reread(
+            raw(&[("aa:0", 2)], &[("aa:0", 2)], t + W),
+            Some(&first.outpoints),
+            t + W,
+            W,
+        );
+        let e = of(&again, "aa:0");
+        assert_eq!(
+            (
+                again.diff_count,
+                e["heldByApply"].clone(),
+                e["judgeMoved"].clone(),
+                e["held"].clone()
+            ),
+            (Some(1), Value::Null, json!(true), json!(false)),
+            "{}",
+            again.outpoints
+        );
+        assert_eq!((again.judge_moved(), again.held_by_apply()), (1, 0));
+    }
+
+    /// (fix1046f_m1_b) MEDIUM-1, the actor-side clear: the actor moves from 2 to D1's 1, D1 unchanged: the apply's lag,
+    /// `heldByApply`, counted nothing. And both moved (D1 and the actor each to 3): counted, `bothMoved`. Green on
+    /// b1811944 for the actor's clear (its one class); RED against the mutant that files every clear `judgeMoved`.
+    #[test]
+    fn fix1046f_m1_b_a_clear_the_actor_made_is_held_by_apply_and_both_moved_counts() {
+        let t = NOW_MS as i64;
+        let first = compare::classify_reread(raw(&[("aa:0", 1)], &[("aa:0", 2)], t), None, t, W);
+        let caught = compare::classify_reread(
+            raw(&[("aa:0", 1)], &[("aa:0", 1)], t + W),
+            Some(&first.outpoints),
+            t + W,
+            W,
+        );
+        let e = of(&caught, "aa:0");
+        assert_eq!(
+            (
+                caught.diff_count,
+                e["heldByApply"].clone(),
+                e["held"].clone()
+            ),
+            (Some(0), json!(true), json!(true)),
+            "{}",
+            caught.outpoints
+        );
+        let both = compare::classify_reread(
+            raw(&[("aa:0", 3)], &[("aa:0", 3)], t + W),
+            Some(&first.outpoints),
+            t + W,
+            W,
+        );
+        let e = of(&both, "aa:0");
+        assert_eq!(
+            (
+                both.diff_count,
+                e["bothMoved"].clone(),
+                e["heldByApply"].clone()
+            ),
+            (Some(1), json!(true), Value::Null)
+        );
+        // A row gone from both sides: the actor moved (its row absent) and D1 moved: counted.
+        let gone = compare::classify_reread(raw(&[], &[], t + W), Some(&first.outpoints), t + W, W);
+        assert_eq!(gone.diff_count, Some(1));
+    }
+
+    /// (fix1046f_m1_c) MEDIUM-1, the cut: a pending outpoint that still differs is never classed by its absence from a
+    /// cut list. The first read sees one difference (`zz:0`); the re-read sees it still differing behind 40 others
+    /// that sort first: it is counted (its window passed), never `heldByApply`. RED on b1811944 (the row cut at 32
+    /// before the classification: `zz:0` filed `heldByApply`).
+    #[test]
+    fn fix1046f_m1_c_a_pending_difference_past_the_cut_is_not_held_by_apply() {
+        let t = NOW_MS as i64;
+        let first = compare::classify_reread(raw(&[("zz:0", 1)], &[("zz:0", 2)], t), None, t, W);
+        let names: Vec<String> = (0..40).map(|k| format!("a{k:02}:0")).collect();
+        let mut d1: Vec<(&str, i64)> = names.iter().map(|n| (n.as_str(), 1)).collect();
+        let mut actor: Vec<(&str, i64)> = names.iter().map(|n| (n.as_str(), 2)).collect();
+        d1.push(("zz:0", 1));
+        actor.push(("zz:0", 2));
+        let again =
+            compare::classify_reread(raw(&d1, &actor, t + W), Some(&first.outpoints), t + W, W);
+        assert_eq!(again.held_by_apply(), 0, "{}", again.outpoints);
+        let e = of(&again, "zz:0");
+        assert_eq!(e["held"], json!(false), "counted, still differing: {e}");
+        assert_eq!(again.diff_count, Some(1), "the 40 new ones pending");
+    }
+
+    /// (fix1046f_l1) LOW-1: `diffCount` counts every difference, listed or not. 40 differences, first read all
+    /// pending (each with its state), the re-read past the window counts 40 (the stored list names 32 with their
+    /// fields and keeps the other 8's state). RED on b1811944: 32.
+    #[test]
+    fn fix1046f_l1_the_count_is_every_difference_not_the_listed_32() {
+        let t = NOW_MS as i64;
+        let names: Vec<String> = (0..40).map(|k| format!("b{k:02}:0")).collect();
+        let d1: Vec<(&str, i64)> = names.iter().map(|n| (n.as_str(), 1)).collect();
+        let actor: Vec<(&str, i64)> = names.iter().map(|n| (n.as_str(), 2)).collect();
+        let first = compare::classify_reread(raw(&d1, &actor, t), None, t, W);
+        assert_eq!((first.diff_count, first.pending_reread()), (Some(0), 40));
+        let again =
+            compare::classify_reread(raw(&d1, &actor, t + W), Some(&first.outpoints), t + W, W);
+        assert_eq!(again.diff_count, Some(40), "{}", again.outpoints);
+        let listed = again.outpoints.as_array().unwrap();
+        assert_eq!(listed.len(), 40);
+        assert_eq!(
+            listed.iter().filter(|e| !e["fields"].is_null()).count(),
+            compare::COMPARE_ROW_OUTPOINTS_MAX
+        );
+        // A third read keeps counting all 40 (each has its state).
+        let third = compare::classify_reread(
+            raw(&d1, &actor, t + 2 * W),
+            Some(&again.outpoints),
+            t + 2 * W,
+            W,
+        );
+        assert_eq!(third.diff_count, Some(40));
+        // Past the state bound a new difference has no place: counted at once, never pending for want of one.
+        let names: Vec<String> = (0..compare::COMPARE_ROW_STATE_MAX + 5)
+            .map(|k| format!("c{k:03}:0"))
+            .collect();
+        let d1: Vec<(&str, i64)> = names.iter().map(|n| (n.as_str(), 1)).collect();
+        let actor: Vec<(&str, i64)> = names.iter().map(|n| (n.as_str(), 2)).collect();
+        let wide = compare::classify_reread(raw(&d1, &actor, t), None, t, W);
+        assert_eq!(wide.diff_count, Some(5));
+        assert_eq!(wide.pending_reread(), compare::COMPARE_ROW_STATE_MAX);
+    }
+
+    /// (fix1046f_l2) LOW-2: a FAULT read keeps the stored state. A pending difference is written; a fault row is
+    /// written over it (the actor out of reach); the next good read past the window finds the pending state and
+    /// counts it. While faulted the row is a fault, never `pendingReread` in the summary. NOTE-3: the summary counts
+    /// the PARSED shape (a stored entry written with spaces counts). RED on b1811944: the fault erased the pending
+    /// state (the good read pending again, diffCount 0).
+    #[tokio::test]
+    async fn fix1046f_l2_a_fault_read_keeps_the_pending_state() {
+        let (d1, ids, _actors) = fix986_fleet(1).await;
+        let id = ids[0].clone();
+        let t = NOW_MS as i64;
+        let mut first =
+            compare::classify_reread(raw(&[("aa:0", 1)], &[("aa:0", 2)], t), None, t, W);
+        first.identity = id.clone();
+        d1.run_batch(vec![compare::upsert_stmt(&first)])
+            .await
+            .unwrap();
+        let fault = compare::compare_row_of(&id, t + 1_000, Err("actor out of reach"));
+        d1.run_batch(vec![compare::upsert_stmt(&fault)])
+            .await
+            .unwrap();
+        let got = compare::read_answer(&d1, "", "", t + 1_001, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                got["faultCount"].clone(),
+                got["identitiesPendingReread"].clone()
+            ),
+            (json!(1), json!(0)),
+            "{got}"
+        );
+        let prior = d1
+            .run_batch(vec![Stmt::new(
+                compare::PRIORS_SQL,
+                vec![Bind::Text(json!([id]).to_string())],
+            )])
+            .await
+            .unwrap()[0]
+            .rows
+            .clone();
+        let prior: Value = serde_json::from_str(prior[0]["outpoints"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            prior[0]["pendingReread"],
+            json!(true),
+            "the fault kept it: {prior}"
+        );
+        let mut again = raw(&[("aa:0", 1)], &[("aa:0", 2)], t + W);
+        again.identity = id.clone();
+        let again = compare::classify_reread(again, Some(&prior), t + W, W);
+        assert_eq!(
+            again.diff_count,
+            Some(1),
+            "counted at its re-read: {}",
+            again.outpoints
+        );
+        // NOTE-3: the parsed shape.
+        d1.conn
+            .execute(
+                "UPDATE owed_actor_compare SET fault=NULL,diffCount=0,outpoints=?1",
+                [r#"[{"outpoint": "aa:0", "held": true, "heldByApply": true}]"#],
+            )
+            .unwrap();
+        let got = compare::read_answer(&d1, "", "", t + W, 1).await.unwrap();
+        assert_eq!(got["identitiesHeldByApply"], json!(1), "{got}");
+    }
+
+    async fn differing(n: usize) -> (SqliteSql, Vec<String>, BTreeMap<String, SqliteSql>) {
+        let (d1, ids, actors) = fix986_fleet(n).await;
+        fix1046_served_p95(&d1, 1_492);
+        for id in &ids {
+            actors[id]
+                .conn
+                .execute("UPDATE owed_rows SET sats=sats+1 WHERE identity=?1", [id])
+                .unwrap();
+        }
+        (d1, ids, actors)
+    }
+
+    /// (fix1046f_l3) LOW-3: re-reads take at most a share of a tick the forward walk runs. Eight differing seats at
+    /// two a tick; the first tick queues two re-reads; at their due tick each compare costs about 330 statements: the
+    /// tick re-reads ONE (a second would pass the 400 share) and the forward walk compares the next seat. A tick whose
+    /// re-read (about 730) left the forward walk nothing owes it the next tick: that tick takes no re-read and the
+    /// forward walk compares. RED on b1811944 (two re-reads and no forward compare; the owed tick re-reads again).
+    #[tokio::test]
+    async fn fix1046f_l3_rereads_take_a_share_and_never_starve_the_forward_walk() {
+        let (d1, ids, actors) = differing(8).await;
+        let port = Fix986 {
+            d1: &d1,
+            actors,
+            judges: false,
+            die_after: Cell::new(u32::MAX),
+        };
+        let t = NOW_MS as i64;
+        let r = compare::ring_tick(&port, t, 0, 1, 2, || 0).await.unwrap();
+        assert_eq!(r.compared, vec![ids[0].clone(), ids[1].clone()]);
+        let heavy = Fix1046Heavy { burn: 300 };
+        let r = compare::ring_tick_with(&port, t + W, 0, 1, 2, || 0, &heavy)
+            .await
+            .unwrap();
+        assert_eq!(r.rereads, vec![ids[0].clone()], "{r:?}");
+        assert!(
+            r.compared.contains(&ids[2]),
+            "the forward walk compared: {r:?}"
+        );
+        assert!(
+            r.reread_statements <= compare::FLEET_COMPARE_REREAD_STATEMENTS,
+            "{r:?}"
+        );
+        let heavy = Fix1046Heavy { burn: 700 };
+        let r = compare::ring_tick_with(&port, t + W + 1, 0, 1, 2, || 0, &heavy)
+            .await
+            .unwrap();
+        assert_eq!(r.rereads, vec![ids[1].clone()], "{r:?}");
+        assert_eq!(
+            r.compared,
+            vec![ids[1].clone()],
+            "the forward walk got nothing: {r:?}"
+        );
+        let r = compare::ring_tick_with(&port, t + 2 * W + 1, 0, 1, 2, || 0, &heavy)
+            .await
+            .unwrap();
+        assert!(r.rereads.is_empty(), "the forward walk goes first: {r:?}");
+        assert!(r.rereads_yielded);
+        assert_eq!(r.compared.len(), 1, "{r:?}");
+        assert!(!r.compared.contains(&ids[2]));
+        let got = compare::read_answer(&d1, "", "", t + 2 * W + 2, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            got["rereadStatementsMax"],
+            json!(compare::FLEET_COMPARE_REREAD_STATEMENTS)
+        );
+    }
+
+    /// (fix1046f_l4) LOW-4: the counter is written with each row. Two seats pending; both actors catch up; the
+    /// re-read tick dies after the first seat's row: its `heldByApply` is already counted. RED on b1811944 (the
+    /// counter written once at the tick's end: 0).
+    #[tokio::test]
+    async fn fix1046f_l4_the_counter_is_written_with_each_row() {
+        let (d1, ids, actors) = differing(2).await;
+        let port = Fix986 {
+            d1: &d1,
+            actors,
+            judges: false,
+            die_after: Cell::new(u32::MAX),
+        };
+        let t = NOW_MS as i64;
+        let r = compare::ring_tick(&port, t, 0, 1, 16, || 0).await.unwrap();
+        assert_eq!(r.pending_reread, 2, "{r:?}");
+        for id in &ids {
+            port.actors[id]
+                .conn
+                .execute("UPDATE owed_rows SET sats=sats-1 WHERE identity=?1", [id])
+                .unwrap();
+        }
+        let per_identity = {
+            let before = d1.batches.get();
+            let _ = compare::compare_one(&port, &ids[0], t).await;
+            d1.batches.get() - before + 2
+        };
+        port.die_after.set(1 + per_identity);
+        let dead = compare::ring_tick(&port, t + W, 0, 1, 16, || 0).await;
+        assert!(dead.is_err(), "{dead:?}");
+        assert_eq!(fix1046_row(&d1, &ids[0]).1[0]["heldByApply"], json!(true));
+        assert_eq!(d1.counter(crate::owed_actor::COUNTERS[35]), 1);
+    }
 }

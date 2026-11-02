@@ -269,6 +269,9 @@ pub struct CompareRow {
     pub actor_digest: Option<String>,
     pub fault: Option<String>,
     pub partial: bool,
+    /// FIX-1046-FOLD-1 (MEDIUM-1): each outpoint on either side, the print of its D1 row and of its actor row
+    /// ([`row_print`], `absent` for no row): what the re-read reads to tell which side moved. Not stored.
+    pub prints: std::collections::BTreeMap<String, (String, String)>,
 }
 
 /// PURE: the stored row of one [`fresh_compare`] answer (`Ok`), or of its fault. An actor that did not answer, or
@@ -286,6 +289,7 @@ pub fn compare_row_of(identity: &str, now: i64, view: Result<&Value, &str>) -> C
         actor_digest: None,
         fault: Some(fault),
         partial: false,
+        prints: Default::default(),
     };
     let view = match view {
         Ok(v) => v,
@@ -322,8 +326,29 @@ pub fn compare_row_of(identity: &str, now: i64, view: Result<&Value, &str>) -> C
             })
         })
         .chain(tip_lag.iter().map(|o| json!({"outpoint": o, "held": true, "tipLag": true, "fields": Value::Null})))
-        .take(COMPARE_ROW_OUTPOINTS_MAX)
         .collect();
+    // FIX-1046-FOLD-1 (LOW-1, MEDIUM-1's cut): every difference is kept here, uncut; [`classify_reread`] cuts the
+    // stored list after it has classified the whole set, so no difference is classed by its absence from a cut list.
+    let mut prints: std::collections::BTreeMap<String, (String, String)> = Default::default();
+    let side = |v: &Value| v.as_array().cloned().unwrap_or_default();
+    for (k, rows) in [side(&view["d1"]["rows"]), side(&view["actor"]["rows"])]
+        .iter()
+        .enumerate()
+    {
+        for r in rows {
+            let Some(o) = r["outpoint"].as_str() else {
+                continue;
+            };
+            let e = prints
+                .entry(o.to_string())
+                .or_insert_with(|| (ABSENT_PRINT.into(), ABSENT_PRINT.into()));
+            if k == 0 {
+                e.0 = row_print(r);
+            } else {
+                e.1 = row_print(r);
+            }
+        }
+    }
     CompareRow {
         identity: identity.to_string(),
         compared_at_ms: now,
@@ -336,17 +361,35 @@ pub fn compare_row_of(identity: &str, now: i64, view: Result<&Value, &str>) -> C
         actor_digest: view["digests"]["actor"].as_str().map(str::to_string),
         fault: None,
         partial: view["d1"]["games"]["partial"] == true,
+        prints,
     }
 }
 
+/// FIX-1046-FOLD-1: the print of one side's row of an outpoint (its compared fields, [`super::rows_digest`] of the row
+/// alone, cut to 16 hex), or [`ABSENT_PRINT`] for no row. Two prints are equal exactly when [`diff_rows`] reads the two
+/// rows equal.
+pub fn row_print(row: &Value) -> String {
+    rows_digest(std::slice::from_ref(row))[..16].to_string()
+}
+pub const ABSENT_PRINT: &str = "absent";
+
 /// One compare row written (an upsert by identity).
 pub const COMPARE_UPSERT_SQL: &str = "INSERT INTO owed_actor_compare(identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(identity) DO UPDATE SET comparedAtMs=excluded.comparedAtMs,diffCount=excluded.diffCount,heldByLagCount=excluded.heldByLagCount,staleD1Count=excluded.staleD1Count,tipLagCount=excluded.tipLagCount,outpoints=excluded.outpoints,d1Digest=excluded.d1Digest,actorDigest=excluded.actorDigest,fault=excluded.fault,partial=excluded.partial";
+
+/// FIX-1046-FOLD-1 (LOW-2): a FAULT row written over a stored row keeps that row's `outpoints` (its pending re-reads
+/// and its counted differences): a fault is no read of the rows, so it erases no state; the next good read classifies
+/// against the state the fault left. The counts are the fault's (none), as before. The same statement shape, no read.
+pub const COMPARE_FAULT_UPSERT_SQL: &str = "INSERT INTO owed_actor_compare(identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(identity) DO UPDATE SET comparedAtMs=excluded.comparedAtMs,diffCount=excluded.diffCount,heldByLagCount=excluded.heldByLagCount,staleD1Count=excluded.staleD1Count,tipLagCount=excluded.tipLagCount,d1Digest=excluded.d1Digest,actorDigest=excluded.actorDigest,fault=excluded.fault,partial=excluded.partial";
 
 pub fn upsert_stmt(row: &CompareRow) -> Stmt {
     let int = |n: Option<i64>| n.map_or(Bind::Null, Bind::Int);
     let text = |s: &Option<String>| s.clone().map_or(Bind::Null, Bind::Text);
     Stmt::new(
-        COMPARE_UPSERT_SQL,
+        if row.fault.is_some() {
+            COMPARE_FAULT_UPSERT_SQL
+        } else {
+            COMPARE_UPSERT_SQL
+        },
         vec![
             Bind::Text(row.identity.clone()),
             Bind::Int(row.compared_at_ms),
@@ -435,6 +478,11 @@ impl CompareRow {
     pub fn pending_reread(&self) -> usize {
         self.flagged("pendingReread")
     }
+    /// The outpoints whose difference cleared because the D1 judge's answer moved to the actor's
+    /// (FIX-1046-FOLD-1): counted, named `judgeMoved` beside the count.
+    pub fn judge_moved(&self) -> usize {
+        self.flagged("judgeMoved")
+    }
     /// When every pending outpoint is past the window (the earliest a re-read can settle them all), or `None`.
     pub fn reread_due_ms(&self, window: i64) -> Option<i64> {
         self.outpoints
@@ -448,12 +496,27 @@ impl CompareRow {
     }
 }
 
-/// PURE (FIX-1046): one compare's row classified against the identity's prior stored outpoints (`prior`, the row's
-/// `outpoints` as stored, or none) at `now` under `window`. An unheld difference ([`compare_row_of`]'s `held: false`)
-/// is COUNTED when the prior row counted it, or held it `pendingReread` since a read at least `window` before `now`;
-/// otherwise it is `pendingReread` (`held: true`, `seenAtMs` the first read that saw it). A prior `pendingReread`
-/// outpoint this read does not find differing at all is `heldByApply` (`held: true`). `diffCount` is the counted
-/// differences; `heldByLagCount` is unchanged (the marks and the tips). A fault row is returned as it is.
+/// The differing outpoints a stored row keeps STATE for, at most (FIX-1046-FOLD-1, LOW-1): every counted and every
+/// pending difference up to this bound, beside the [`COMPARE_ROW_OUTPOINTS_MAX`] the row names with their fields. A
+/// difference past it has no state to hold it and is COUNTED (never left pending for want of a place).
+pub const COMPARE_ROW_STATE_MAX: usize = 128;
+
+/// PURE (FIX-1046, folded by FIX-1046-FOLD-1): one compare's row classified against the identity's prior stored
+/// outpoints (`prior`, the row's `outpoints` as stored, or none) at `now` under `window`. THE RULE: the compare names a
+/// lag and counts a disagreement.
+///
+/// - An unheld difference ([`compare_row_of`]'s `held: false`) is COUNTED when the prior row counted it, or held it
+///   `pendingReread` since a read at least `window` before `now`; otherwise it is `pendingReread` (`held: true`,
+///   `seenAtMs` the first read that saw it, `d1At` and `actorAt` the two sides' prints then, [`row_print`]).
+/// - A prior `pendingReread` outpoint this read finds equal on both sides cleared. WHICH SIDE MOVED decides
+///   (MEDIUM-1): the actor's print changed and the D1 print did not, the ACTOR caught up with the D1 judge, the
+///   apply's lag: `heldByApply` (`held: true`, named, never counted); the actor's print did not change, the D1
+///   JUDGE's answer moved to meet it: `judgeMoved` (`held: false`, COUNTED, a disagreement that happened); both moved
+///   (or a prior with no prints): `bothMoved`, COUNTED.
+/// - The whole differing set is classified before the stored list is cut, so an outpoint is never classed by its
+///   absence from a cut list; `diffCount` counts every counted difference, listed or not (LOW-1).
+///
+/// `heldByLagCount` is unchanged (the marks and the tips). A fault row is returned as it is.
 pub fn classify_reread(
     mut row: CompareRow,
     prior: Option<&Value>,
@@ -466,45 +529,102 @@ pub fn classify_reread(
     let prior: Vec<Value> = prior.and_then(Value::as_array).cloned().unwrap_or_default();
     let prior_of = |o: &str| prior.iter().find(|p| p["outpoint"] == o);
     let current: Vec<Value> = row.outpoints.as_array().cloned().unwrap_or_default();
-    let mut out: Vec<Value> = Vec::new();
-    let mut counted = 0i64;
+    let absent = || (ABSENT_PRINT.to_string(), ABSENT_PRINT.to_string());
+    let print_of = |o: &str| row.prints.get(o).cloned().unwrap_or_else(absent);
+    // Counted differences (standing, then the cleared ones a judge moved), pending ones, then the named-only ones.
+    let mut counted: Vec<Value> = Vec::new();
+    let mut moved: Vec<Value> = Vec::new();
+    let mut pending: Vec<Value> = Vec::new();
+    let mut named: Vec<Value> = Vec::new();
+    let mut held: Vec<Value> = Vec::new();
     for mut o in current.iter().cloned() {
         let key = o["outpoint"].as_str().unwrap_or_default().to_string();
         if o["held"] == true {
-            out.push(o);
+            held.push(o);
             continue;
         }
         let p = prior_of(&key);
         let was_counted = p.is_some_and(|p| {
-            p["held"] == false && p["pendingReread"] != true && p["heldByApply"] != true
+            p["held"] == false
+                && p["pendingReread"] != true
+                && p["heldByApply"] != true
+                && p["judgeMoved"] != true
+                && p["bothMoved"] != true
         });
-        let pending_since = p
-            .filter(|p| p["pendingReread"] == true)
-            .and_then(|p| p["seenAtMs"].as_i64());
+        let pending_prior = p.filter(|p| p["pendingReread"] == true);
+        let pending_since = pending_prior.and_then(|p| p["seenAtMs"].as_i64());
         if was_counted || pending_since.is_some_and(|s| s + window <= now) {
-            counted += 1;
-            out.push(o);
+            counted.push(o);
         } else {
+            let (d1, actor) = print_of(&key);
             o["held"] = json!(true);
             o["pendingReread"] = json!(true);
             o["seenAtMs"] = json!(pending_since.unwrap_or(now));
-            out.push(o);
+            o["d1At"] = pending_prior.map_or(json!(d1), |p| p["d1At"].clone());
+            o["actorAt"] = pending_prior.map_or(json!(actor), |p| p["actorAt"].clone());
+            pending.push(o);
         }
     }
     for p in prior.iter().filter(|p| p["pendingReread"] == true) {
         let key = p["outpoint"].as_str().unwrap_or_default();
-        if !current.iter().any(|o| o["outpoint"] == key) {
-            out.push(json!({
-                "outpoint": key,
-                "held": true,
-                "heldByApply": true,
-                "seenAtMs": p["seenAtMs"],
-                "fields": p["fields"],
-            }));
+        if current.iter().any(|o| o["outpoint"] == key) {
+            continue;
+        }
+        let (d1_now, actor_now) = print_of(key);
+        let (d1_at, actor_at) = (p["d1At"].as_str(), p["actorAt"].as_str());
+        let actor_moved = actor_at.is_none_or(|a| a != actor_now);
+        let judge_moved = d1_at.is_none_or(|d| d != d1_now);
+        let mut e = json!({
+            "outpoint": key,
+            "seenAtMs": p["seenAtMs"],
+            "fields": p["fields"],
+        });
+        if actor_moved && !judge_moved {
+            e["held"] = json!(true);
+            e["heldByApply"] = json!(true);
+            named.push(e);
+        } else {
+            e["held"] = json!(false);
+            e[if actor_moved {
+                "bothMoved"
+            } else {
+                "judgeMoved"
+            }] = json!(true);
+            moved.push(e);
         }
     }
-    out.truncate(COMPARE_ROW_OUTPOINTS_MAX);
-    row.diff_count = Some(counted);
+    // The state the row can keep: counted then pending, up to [`COMPARE_ROW_STATE_MAX`]; a pending difference past it
+    // has no place and is counted (never pending for want of one).
+    let mut diff_count = (counted.len() + moved.len()) as i64;
+    let mut stateful: Vec<Value> = counted;
+    for mut o in pending {
+        if stateful.len() < COMPARE_ROW_STATE_MAX {
+            stateful.push(o);
+        } else {
+            diff_count += 1;
+            for k in ["pendingReread", "seenAtMs", "d1At", "actorAt"] {
+                o.as_object_mut().map(|m| m.remove(k));
+            }
+            o["held"] = json!(false);
+            stateful.push(o);
+        }
+    }
+    let mut out: Vec<Value> = Vec::new();
+    let mut kept_state = 0usize;
+    for o in stateful.into_iter().chain(moved).chain(named).chain(held) {
+        let needs_state = o["held"] == false && o["judgeMoved"] != true && o["bothMoved"] != true
+            || o["pendingReread"] == true;
+        if out.len() < COMPARE_ROW_OUTPOINTS_MAX {
+            kept_state += usize::from(needs_state);
+            out.push(o);
+        } else if needs_state && kept_state < COMPARE_ROW_STATE_MAX {
+            kept_state += 1;
+            let mut o = o;
+            o["fields"] = Value::Null;
+            out.push(o);
+        }
+    }
+    row.diff_count = Some(diff_count);
     row.outpoints = json!(out);
     row
 }
@@ -578,6 +698,10 @@ pub const PER_TICK_VAR: &str = "OWED_FLEET_COMPARE_PER_TICK";
 /// this tick (at least [`FLEET_COMPARE_IDENTITY_RESERVE`]) would pass it. D1's per-invocation bound is 1,000.
 pub const FLEET_COMPARE_STATEMENTS_PER_TICK: usize = 800;
 pub const FLEET_COMPARE_IDENTITY_RESERVE: usize = 80;
+/// FIX-1046-FOLD-1 (LOW-3): the statements one tick's due re-reads may spend on a tick the forward walk runs (half the
+/// tick's [`FLEET_COMPARE_STATEMENTS_PER_TICK`]); served on the standing route (`rereadStatementsMax`) and the tick's
+/// line. A resting tick's re-reads take the whole budget (no forward walk to share it with).
+pub const FLEET_COMPARE_REREAD_STATEMENTS: usize = 400;
 /// The tick's wall: no identity is started past it (under the tick, so a tick usually ends before its next alarm).
 pub const FLEET_COMPARE_WALL_MS: u64 = 8_000;
 /// The ring's place in the belt's ledger, one row a shard ([`ring_state_name`]): `{after, revolution,
@@ -858,6 +982,12 @@ pub struct RingReport {
     pub rereads: Vec<String>,
     pub held_by_apply: usize,
     pub pending_reread: usize,
+    /// FIX-1046-FOLD-1: the outpoints this tick counted because the D1 judge's answer moved to the actor's.
+    pub judge_moved: usize,
+    /// FIX-1046-FOLD-1 (LOW-3): the statements this tick's re-reads spent, and whether the re-reads yielded the tick
+    /// to the forward walk (the previous tick's re-reads left it nothing).
+    pub reread_statements: usize,
+    pub rereads_yielded: bool,
     /// The visibility window this tick re-read under ([`reread_window_ms`]).
     pub window_ms: i64,
 }
@@ -1084,9 +1214,17 @@ async fn ring_tick_inner<J: JudgeDb>(
     let mut largest = FLEET_COMPARE_IDENTITY_RESERVE;
     let rest_until = ring["restUntilMs"].as_i64();
     let resting = rest_until.is_some_and(|r| now < r);
-    if per_tick > 0 {
+    // FIX-1046-FOLD-1 (LOW-3): a tick whose re-reads left the forward walk nothing (the previous tick's
+    // `forwardOwed`) takes no re-read: the forward walk goes first, the queue waits one tick.
+    let forward_owed = !resting && ring["forwardOwed"] == true;
+    ring.as_object_mut().map(|o| o.remove("forwardOwed"));
+    report.rereads_yielded = forward_owed;
+    if per_tick > 0 && !forward_owed {
         // The due re-reads first, resting or not, each inside the tick's budget and wall: one the tick cannot afford
-        // stays queued (its row `pendingReread`, counted neither way) for the next tick.
+        // stays queued (its row `pendingReread`, counted neither way) for the next tick. FIX-1046-FOLD-1 (LOW-3): on a
+        // tick the forward walk runs (not resting), the re-reads spend at most [`FLEET_COMPARE_REREAD_STATEMENTS`]
+        // (no re-read is started past it by the largest compare's estimate), so a storm of re-reads never holds the
+        // forward walk still.
         let due: Vec<String> = queue
             .iter()
             .filter(|(_, d)| *d <= now)
@@ -1098,22 +1236,32 @@ async fn ring_tick_inner<J: JudgeDb>(
                 report.stopped = Some("statements");
                 break;
             }
+            if !resting && report.reread_statements + largest > FLEET_COMPARE_REREAD_STATEMENTS {
+                break;
+            }
             if elapsed() > FLEET_COMPARE_WALL_MS {
                 report.stopped = Some("wall");
                 break;
             }
             let raw = comparer.compare(&m, id, now).await;
             let row = classified(&m, raw, now, window).await?;
-            ring_account(&mut report, &row, &mut queue, window);
+            ring_account(&mut report, &row, &mut queue, window, now);
             ring["rereads"] = queue_json(&queue);
             m.run_batch(vec![upsert_stmt(&row), state(&name, &ring)])
                 .await?;
-            largest = largest.max(m.statements.get() - used);
+            held_by_apply_counted(&m, &row).await;
+            let spent = m.statements.get() - used;
+            report.reread_statements += spent;
+            largest = largest.max(spent);
             report.rereads.push(id.clone());
             report.compared.push(id.clone());
         }
     }
     if per_tick == 0 || resting || report.stopped.is_some() {
+        if !resting && !report.rereads.is_empty() && report.stopped == Some("statements") {
+            // FIX-1046-FOLD-1 (LOW-3): the re-reads spent the tick; the forward walk goes first next tick.
+            ring["forwardOwed"] = json!(true);
+        }
         if report.stopped.is_none() {
             report.stopped = Some(if per_tick == 0 { "paused" } else { "resting" });
         }
@@ -1122,7 +1270,6 @@ async fn ring_tick_inner<J: JudgeDb>(
             fleet_health_stmt(now, shards, false),
         ])
         .await?;
-        held_by_apply_counted(&m, &report).await;
         report.statements = m.statements.get();
         report.cursor = ring["after"].as_str().unwrap_or_default().to_string();
         return Ok(report);
@@ -1177,6 +1324,7 @@ async fn ring_tick_inner<J: JudgeDb>(
     }
     let mut cursor = after;
     let mut all_done = true;
+    let mut forward = 0usize;
     for id in &ids {
         let used = m.statements.get();
         if used + largest > FLEET_COMPARE_STATEMENTS_PER_TICK {
@@ -1197,14 +1345,20 @@ async fn ring_tick_inner<J: JudgeDb>(
         }
         let raw = comparer.compare(&m, id, now).await;
         let row = classified(&m, raw, now, window).await?;
-        ring_account(&mut report, &row, &mut queue, window);
+        ring_account(&mut report, &row, &mut queue, window, now);
         ring["rereads"] = queue_json(&queue);
         cursor = id.clone();
         ring["after"] = json!(cursor);
         m.run_batch(vec![upsert_stmt(&row), state(&name, &ring)])
             .await?;
+        held_by_apply_counted(&m, &row).await;
         largest = largest.max(m.statements.get() - used);
         report.compared.push(id.clone());
+        forward += 1;
+    }
+    // FIX-1046-FOLD-1 (LOW-3): re-reads that left the forward walk no compare on a page it had owe it the next tick.
+    if !report.rereads.is_empty() && forward == 0 && !all_done {
+        ring["forwardOwed"] = json!(true);
     }
     let mut end = Vec::new();
     if all_done && exhausted {
@@ -1236,7 +1390,6 @@ async fn ring_tick_inner<J: JudgeDb>(
     // FIX-998-SERVE: the public counts, folded after this tick's rows (forced at a wrap, else once a minute).
     end.push(fleet_health_stmt(now, shards, report.wrapped));
     m.run_batch(end).await?;
-    held_by_apply_counted(&m, &report).await;
     report.cursor = cursor;
     report.statements = m.statements.get();
     Ok(report)
@@ -1249,14 +1402,23 @@ fn ring_account(
     row: &CompareRow,
     queue: &mut Vec<(String, i64)>,
     window: i64,
+    now: i64,
 ) {
     if row.diff_count.is_some_and(|n| n > 0) {
         report.diffs += 1;
     }
     if row.fault.is_some() {
         report.faults += 1;
+        // FIX-1046-FOLD-1 (LOW-2): a fault keeps the stored state (`COMPARE_FAULT_UPSERT_SQL`), so a queued re-read
+        // stays queued, a window later (the stored row still holds its pending outpoints).
+        if let Some(e) = queue.iter_mut().find(|(i, _)| *i == row.identity) {
+            e.1 = now + window;
+            queue.sort_by_key(|(_, d)| *d);
+        }
+        return;
     }
     report.held_by_apply += row.held_by_apply();
+    report.judge_moved += row.judge_moved();
     queue.retain(|(i, _)| *i != row.identity);
     if let Some(due) = row.reread_due_ms(window) {
         report.pending_reread += 1;
@@ -1274,12 +1436,14 @@ fn queue_json(queue: &[(String, i64)]) -> Value {
         .collect::<Vec<_>>())
 }
 
-/// `owed_actor_compare_held_by_apply_total`: the tick's cleared outpoints, one counter write (none when none).
-async fn held_by_apply_counted(m: &impl SqlPort, report: &RingReport) {
-    if report.held_by_apply > 0 {
+/// `owed_actor_compare_held_by_apply_total`: one identity's cleared outpoints, written as its row is written
+/// (FIX-1046-FOLD-1, LOW-4: a tick that dies after a row keeps that row's count; none when none). Best effort, as
+/// every counter.
+async fn held_by_apply_counted(m: &impl SqlPort, row: &CompareRow) {
+    if row.held_by_apply() > 0 {
         m.counters(vec![(
             super::COUNTERS[35].to_string(),
-            report.held_by_apply as u64,
+            row.held_by_apply() as u64,
         )])
         .await;
     }
@@ -1292,9 +1456,9 @@ async fn held_by_apply_counted(m: &impl SqlPort, report: &RingReport) {
 pub const COMPARE_PAGE: usize = 64;
 /// The fleet's counts over every stored compare row, one statement (the overlay's `/health/invariants` reads the same
 /// aggregate in `owed_events::HEALTH_STATE_SQL`).
-pub const COMPARE_SUMMARY_SQL: &str = "SELECT COUNT(*) AS identities,COALESCE(SUM(diffCount>0),0) AS diffs,COALESCE(SUM(heldByLagCount>0),0) AS heldByLag,COALESCE(SUM(instr(outpoints,'\"heldByApply\":true')>0),0) AS heldByApply,COALESCE(SUM(instr(outpoints,'\"pendingReread\":true')>0),0) AS pendingReread,COALESCE(SUM(staleD1Count),0) AS staleD1,COALESCE(SUM(fault IS NOT NULL),0) AS faults,MIN(comparedAtMs) AS oldest,MAX(comparedAtMs) AS newest FROM owed_actor_compare";
+pub const COMPARE_SUMMARY_SQL: &str = "SELECT COUNT(*) AS identities,COALESCE(SUM(diffCount>0),0) AS diffs,COALESCE(SUM(heldByLagCount>0),0) AS heldByLag,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.heldByApply')=1))),0) AS heldByApply,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.pendingReread')=1))),0) AS pendingReread,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.judgeMoved')=1))),0) AS judgeMoved,COALESCE(SUM(staleD1Count),0) AS staleD1,COALESCE(SUM(fault IS NOT NULL),0) AS faults,MIN(comparedAtMs) AS oldest,MAX(comparedAtMs) AS newest FROM owed_actor_compare";
 /// The rows worth naming past `?1` (a difference, a held one or a fault), `?2` a page; `?3` one identity or ''.
-pub const COMPARE_PAGE_SQL: &str = "SELECT identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial FROM owed_actor_compare WHERE identity>?1 AND (?3='' OR identity=?3) AND (diffCount>0 OR heldByLagCount>0 OR fault IS NOT NULL OR instr(outpoints,'\"heldByApply\":true')>0 OR instr(outpoints,'\"pendingReread\":true')>0 OR ?3<>'') ORDER BY identity LIMIT ?2";
+pub const COMPARE_PAGE_SQL: &str = "SELECT identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial FROM owed_actor_compare WHERE identity>?1 AND (?3='' OR identity=?3) AND (diffCount>0 OR heldByLagCount>0 OR fault IS NOT NULL OR (fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.heldByApply')=1)) OR (fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.pendingReread')=1)) OR ?3<>'') ORDER BY identity LIMIT ?2";
 
 /// PURE: the standing route's answer from its three reads (the summary, the page, the ring's state): every identity
 /// whose compare differs (`diffs`: the differences no pending mark holds), whose differences a pending mark holds
@@ -1388,6 +1552,10 @@ pub fn compare_answer(
         // FIX-1046: named, never counted (a difference that cleared on its re-read; one waiting for it).
         "identitiesHeldByApply": n(&summary["heldByApply"]),
         "identitiesPendingReread": n(&summary["pendingReread"]),
+        // FIX-1046-FOLD-1: counted in `identitiesDiffering`, named: a difference that cleared because the D1 judge's
+        // answer moved (each such outpoint `judgeMoved` in `diffs`).
+        "identitiesJudgeMoved": n(&summary["judgeMoved"]),
+        "rereadStatementsMax": FLEET_COMPARE_REREAD_STATEMENTS,
         "comparedWithinMs": json_ms(&summary["oldest"]).map(|o| now - o as i64),
         "newestComparedAtMs": json_ms(&summary["newest"]),
         "staleD1": n(&summary["staleD1"]),
@@ -1504,13 +1672,7 @@ pub async fn compare_now(db: &impl JudgeDb, identity: &str, now: i64) -> Result<
         )
     };
     db.run_batch(vec![upsert_stmt(&row)]).await?;
-    if row.held_by_apply() > 0 {
-        db.counters(vec![(
-            super::COUNTERS[35].to_string(),
-            row.held_by_apply() as u64,
-        )])
-        .await;
-    }
+    held_by_apply_counted(db, &row).await;
     Ok(json!({
         "identity": row.identity,
         "comparedAtMs": row.compared_at_ms,
@@ -1520,6 +1682,7 @@ pub async fn compare_now(db: &impl JudgeDb, identity: &str, now: i64) -> Result<
         "tipLagCount": row.tip_lag_count,
         "heldByApplyCount": row.held_by_apply(),
         "pendingRereadCount": row.pending_reread(),
+        "judgeMovedCount": row.judge_moved(),
         "windowMs": window,
         "outpoints": row.outpoints,
         "fault": row.fault,
