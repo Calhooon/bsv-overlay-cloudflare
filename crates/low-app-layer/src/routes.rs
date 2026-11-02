@@ -3497,8 +3497,8 @@ async fn gather_result_rows(
     // discipline as hand markers: a fault leaves the marker path in charge.
     let proof_hands = results_proof_hands(db, &game_ids).await;
     // bsv-low #1048: a recorded, final spend whose held bytes classify against the committed triple (WHO SIGNED,
-    // `results::index_bytes_landing`) lands without the network's SEEN; no SEEN latch is written. The public route
-    // only; no statement added.
+    // `results::index_bytes_landing`) lands without the network's SEEN; no SEEN latch is written. The two public
+    // reads only (`/results` and `/recovery-view`'s outcome fold, both through this gather); no statement added.
     crate::results::apply_index_bytes_arm(&mut rows, &params_by_pot);
 
     Ok((

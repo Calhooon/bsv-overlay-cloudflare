@@ -1946,7 +1946,8 @@ pub fn is_confirmed_landing(status: &OutpointStatus) -> bool {
 ///    public `/submit` would publish a fabricated verdict (epoch Rule 21's
 ///    worked-example defeat). `None` on either (pre-#371 rows) degrades to
 ///    the merkle arms — honest, self-draining. Beside this bar, and on the
-///    public `/results` route alone, bsv-low #1048's bytes arm
+///    two public reads alone (`/results` and `/recovery-view`'s outcome
+///    fold, both through `routes::gather_result_rows`), bsv-low #1048's bytes arm
 ///    (`results::apply_index_bytes_arm`) lands a FINAL spend with no SEEN
 ///    only when the bytes the index holds CLASSIFY against the committed
 ///    triple (WHO SIGNED, #406's BIP-143 check): a planted pointer the
