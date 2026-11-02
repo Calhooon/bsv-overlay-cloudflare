@@ -4626,7 +4626,8 @@ pub fn judged_tip(r: &Value) -> Option<i64> {
 
 /// PURE (D2-ACTOR-B-FOLD-15, NEW8-M1): the outpoints [`diff_rows`] reads different whose difference is ONLY
 /// tip-derived: the row on both sides, equal once [`TIP_DERIVED_FACTS`] are taken out too, and judged at two
-/// different tips ([`judged_tip`]). A tip lag, never a verdict difference: the operator's route serves them apart
+/// different tips ([`judged_tip`]); or (FIX-1049-FOLD-2, fold 3) only the CLOCK's, a landing wait's end between the
+/// two judgements ([`landing_lag`]). A tip lag, never a verdict difference: the operator's route serves them apart
 /// (`tipLag`) and the reconcile counts an actor's own lag apart (`owed_actor_compare_tip_lag_total`).
 pub fn tip_derived_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
     let strip = |r: &Value| -> Value {
@@ -4651,11 +4652,49 @@ pub fn tip_derived_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
         .into_iter()
         .filter(|o| match (a.get(o), b.get(o)) {
             (Some(x), Some(y)) => {
-                judged_tip(x) != judged_tip(y) && diff_rows(&[strip(x)], &[strip(y)]).is_empty()
+                (judged_tip(x) != judged_tip(y) && diff_rows(&[strip(x)], &[strip(y)]).is_empty())
+                    || landing_lag(x, y)
             }
             _ => false,
         })
         .collect()
+}
+
+/// PURE (FIX-1049-FOLD-2, fold 3; the round-2 ensemble's B LOW-3, the #1041 class): does a pair differ ONLY by a
+/// landing wait's END falling between its two judgements? One side is a filed sweep's landing wait (`sweepLanding`)
+/// judged BEFORE its end (`sweepLandingUntilMs`), the other the same hop's row of the same game, family, value and
+/// opponent naming the same filed sweep (`sweepTxid`), no landing, judged AT OR AFTER that end (`judgedAtMs`): the
+/// wait's end is the judgement's clock (`owed::SWEEP_LANDING_WAIT_MS` after the sweep's last hint), so the two are one
+/// record judged at two instants, a CLOCK LAG read with the tip's ([`tip_derived_rows`]), never a STOP. Any other
+/// difference (another sweep, another game, a landing on both sides that differs, a later side still inside the wait,
+/// a row with no judgement time) stays a difference.
+fn landing_lag(x: &Value, y: &Value) -> bool {
+    let facts = |r: &Value| -> Value {
+        r["facts"]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(Value::Null)
+    };
+    let n = |v: &Value| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64));
+    let ended_between = |landing: &Value, later: &Value| -> bool {
+        let (lf, pf) = (facts(landing), facts(later));
+        let same = ["family", "gameId", "sats", "opponentIdentity"]
+            .iter()
+            .all(|k| landing[*k] == later[*k]);
+        same && lf["sweepLanding"] == true
+            && pf.get("sweepLanding").is_none()
+            && lf["sweepTxid"].is_string()
+            && lf["sweepTxid"] == pf["sweepTxid"]
+            && match (
+                n(&lf["sweepLandingUntilMs"]),
+                n(&landing["judgedAtMs"]),
+                n(&later["judgedAtMs"]),
+            ) {
+                (Some(end), Some(before), Some(after)) => before < end && after >= end,
+                _ => false,
+            }
+    };
+    ended_between(x, y) || ended_between(y, x)
 }
 
 /// FIX-1009 (bsv-low #1009): PURE, the #669 / #808 (b) degrade of a hop's courier probe UNDONE in a row's compared
