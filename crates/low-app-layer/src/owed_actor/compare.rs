@@ -364,6 +364,185 @@ pub fn upsert_stmt(row: &CompareRow) -> Stmt {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// FIX-1046 (bsv-low #1046; L58's fold, record 1777): THE APPLY'S LAG, NAMED AND NEVER COUNTED.
+//
+// Six ring ticks inside L58 each saw one differing identity that agreed on its next read: the fresh D1 judgement and
+// the actor's stored rows read inside the actor's own visibility window (the D1 write landed, the compare read before
+// the actor's apply of the same event landed). THE RULE: a difference no pending mark holds and no tip explains is
+// counted only once it STANDS on a read at least the visibility window ([`reread_window_ms`]) after the read that
+// first saw it. Until then its outpoint is `pendingReread` (named, held, never counted either way); a pending outpoint
+// that a later read no longer finds differing cleared on its re-read: the apply's lag, `heldByApply` (named on that
+// read's row, counted `owed_actor_compare_held_by_apply_total`, never a diff). A difference counted once stays
+// counted for as long as it differs. The state is the stored row's own outpoints (the prior row read by the ring
+// before its compares, [`PRIORS_SQL`]), so the ring's queue of due re-reads (`rereads` on its ledger row) only speeds
+// the re-read: an identity the queue drops, or one compared by the operator's POST, is re-read by the next
+// revolution under the same rule.
+
+/// The visibility window's floor and cap (the issue's rule: twice the served `rowsVisibleMsP95`, floored at 5 s and
+/// capped at 30 s; an unmeasured p95, no sample of this build yet, is the cap: a lag is never counted for want of a
+/// measurement).
+pub const REREAD_WINDOW_FLOOR_MS: i64 = 5_000;
+pub const REREAD_WINDOW_CAP_MS: i64 = 30_000;
+/// The due re-reads one shard's ledger row keeps, at most (the rest are re-read by the next revolution).
+pub const FLEET_COMPARE_REREADS_MAX: usize = 64;
+/// The actor's health snapshot (`owed_actor::HEALTH_SNAPSHOT_NAME`), whose bars serve `rowsVisibleMsP95`.
+pub const VISIBILITY_READ_SQL: &str =
+    "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:health'";
+/// The prior stored rows of the identities a tick compares (`?1` a JSON array of identities).
+pub const PRIORS_SQL: &str = "SELECT identity,outpoints FROM owed_actor_compare WHERE identity IN (SELECT value FROM json_each(?1))";
+
+/// PURE: the visibility window from the served first-visibility p95 (twice it, floored and capped; none, the cap).
+pub fn reread_window_ms(rows_visible_p95: Option<u64>) -> i64 {
+    rows_visible_p95.map_or(REREAD_WINDOW_CAP_MS, |p| {
+        (p.saturating_mul(2).min(i64::MAX as u64) as i64)
+            .clamp(REREAD_WINDOW_FLOOR_MS, REREAD_WINDOW_CAP_MS)
+    })
+}
+
+/// PURE: the window from [`VISIBILITY_READ_SQL`]'s rows: the snapshot's bars folded as `/health` folds them
+/// (`owed_actor::fleet_bars`, this build's rows), its `rowsVisibleMsP95`.
+pub fn reread_window_of(rows: &[Value], now: i64) -> i64 {
+    let cursor: Value = rows
+        .first()
+        .and_then(|r| r["cursor"].as_str())
+        .and_then(|c| serde_json::from_str(c).ok())
+        .unwrap_or(Value::Null);
+    let bars: Vec<Value> = match &cursor["bars"] {
+        Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+        v => v.clone(),
+    }
+    .as_array()
+    .cloned()
+    .unwrap_or_default();
+    let fleet = super::fleet_bars(&bars, now.max(0) as u64, super::lib_rev());
+    reread_window_ms(fleet["rowsVisibleMsP95"].as_u64())
+}
+
+impl CompareRow {
+    fn flagged(&self, flag: &str) -> usize {
+        self.outpoints
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|o| o[flag] == true)
+            .count()
+    }
+    /// The outpoints whose difference cleared on their re-read (FIX-1046): the apply's lag.
+    pub fn held_by_apply(&self) -> usize {
+        self.flagged("heldByApply")
+    }
+    /// The outpoints whose difference waits for its re-read (FIX-1046): counted neither way.
+    pub fn pending_reread(&self) -> usize {
+        self.flagged("pendingReread")
+    }
+    /// When every pending outpoint is past the window (the earliest a re-read can settle them all), or `None`.
+    pub fn reread_due_ms(&self, window: i64) -> Option<i64> {
+        self.outpoints
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|o| o["pendingReread"] == true)
+            .filter_map(|o| o["seenAtMs"].as_i64())
+            .max()
+            .map(|s| s + window)
+    }
+}
+
+/// PURE (FIX-1046): one compare's row classified against the identity's prior stored outpoints (`prior`, the row's
+/// `outpoints` as stored, or none) at `now` under `window`. An unheld difference ([`compare_row_of`]'s `held: false`)
+/// is COUNTED when the prior row counted it, or held it `pendingReread` since a read at least `window` before `now`;
+/// otherwise it is `pendingReread` (`held: true`, `seenAtMs` the first read that saw it). A prior `pendingReread`
+/// outpoint this read does not find differing at all is `heldByApply` (`held: true`). `diffCount` is the counted
+/// differences; `heldByLagCount` is unchanged (the marks and the tips). A fault row is returned as it is.
+pub fn classify_reread(
+    mut row: CompareRow,
+    prior: Option<&Value>,
+    now: i64,
+    window: i64,
+) -> CompareRow {
+    if row.fault.is_some() {
+        return row;
+    }
+    let prior: Vec<Value> = prior.and_then(Value::as_array).cloned().unwrap_or_default();
+    let prior_of = |o: &str| prior.iter().find(|p| p["outpoint"] == o);
+    let current: Vec<Value> = row.outpoints.as_array().cloned().unwrap_or_default();
+    let mut out: Vec<Value> = Vec::new();
+    let mut counted = 0i64;
+    for mut o in current.iter().cloned() {
+        let key = o["outpoint"].as_str().unwrap_or_default().to_string();
+        if o["held"] == true {
+            out.push(o);
+            continue;
+        }
+        let p = prior_of(&key);
+        let was_counted = p.is_some_and(|p| {
+            p["held"] == false && p["pendingReread"] != true && p["heldByApply"] != true
+        });
+        let pending_since = p
+            .filter(|p| p["pendingReread"] == true)
+            .and_then(|p| p["seenAtMs"].as_i64());
+        if was_counted || pending_since.is_some_and(|s| s + window <= now) {
+            counted += 1;
+            out.push(o);
+        } else {
+            o["held"] = json!(true);
+            o["pendingReread"] = json!(true);
+            o["seenAtMs"] = json!(pending_since.unwrap_or(now));
+            out.push(o);
+        }
+    }
+    for p in prior.iter().filter(|p| p["pendingReread"] == true) {
+        let key = p["outpoint"].as_str().unwrap_or_default();
+        if !current.iter().any(|o| o["outpoint"] == key) {
+            out.push(json!({
+                "outpoint": key,
+                "held": true,
+                "heldByApply": true,
+                "seenAtMs": p["seenAtMs"],
+                "fields": p["fields"],
+            }));
+        }
+    }
+    out.truncate(COMPARE_ROW_OUTPOINTS_MAX);
+    row.diff_count = Some(counted);
+    row.outpoints = json!(out);
+    row
+}
+
+/// PURE: the prior stored outpoints from [`PRIORS_SQL`]'s rows (the row's `outpoints` as stored), or none.
+fn prior_of(rows: &[Value]) -> Option<Value> {
+    rows.first()
+        .and_then(|r| r["outpoints"].as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+}
+
+/// FIX-1046: one compare's row classified ([`classify_reread`]). A fault row is returned as it is and reads nothing;
+/// any other row first reads the identity's prior stored row, one statement ([`PRIORS_SQL`]), so a tick whose
+/// compares fault (no actor bound, not bootstrapped) costs no statement more than before.
+async fn classified(
+    db: &impl SqlPort,
+    raw: CompareRow,
+    now: i64,
+    window: i64,
+) -> Result<CompareRow, String> {
+    if raw.fault.is_some() {
+        return Ok(raw);
+    }
+    let rows = db
+        .run_batch(vec![Stmt::new(
+            PRIORS_SQL,
+            vec![Bind::Text(json!([raw.identity]).to_string())],
+        )])
+        .await?
+        .into_iter()
+        .next()
+        .map(|o| o.rows)
+        .unwrap_or_default();
+    let prior = prior_of(&rows);
+    Ok(classify_reread(raw, prior.as_ref(), now, window))
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // The scheduled ring (READ-986 item 4).
 
 /// The ring's driver: `BOARD_VIEW` actors of its own, one a SHARD ([`shard_actor_name`]: shard 0 keeps this name, so
@@ -673,6 +852,14 @@ pub struct RingReport {
     /// FIX-TIER-RING: the kind of a transient D1 fault that ended the tick ([`transient_fault_kind`]), `stopped` then
     /// "busy"; counted on the shard's ring row (`tickFaults.<kind>`) and backed off by the alarm ([`busy_backoff_ms`]).
     pub fault_kind: Option<&'static str>,
+    /// FIX-1046: the identities this tick RE-READ from the shard's queue (also in `compared`), the outpoints whose
+    /// difference cleared on its re-read (`heldByApply`, never a diff), and the identities this tick left
+    /// `pendingReread` (their difference not yet counted either way).
+    pub rereads: Vec<String>,
+    pub held_by_apply: usize,
+    pub pending_reread: usize,
+    /// The visibility window this tick re-read under ([`reread_window_ms`]).
+    pub window_ms: i64,
 }
 
 /// FIX-TIER-RING (bsv-low #998's follow-up): a D1 fault a later tick can outlive, by its kind: `busy` for the local
@@ -833,6 +1020,7 @@ async fn ring_tick_inner<J: JudgeDb>(
         .run_batch(vec![
             Stmt::new(RING_READ_SQL, vec![Bind::Text(name.clone())]),
             Stmt::new(PHASE_C_READ_SQL, vec![]),
+            Stmt::new(VISIBILITY_READ_SQL, vec![]),
         ])
         .await?
         .into_iter();
@@ -847,6 +1035,8 @@ async fn ring_tick_inner<J: JudgeDb>(
     };
     let mut ring = parse(read.next());
     let phase_c = parse(read.next());
+    // FIX-1046: the actor's visibility window, from the snapshot `/health` serves.
+    let window = reread_window_of(&read.next().map(|o| o.rows).unwrap_or_default(), now);
     if !ring.is_object() {
         ring = json!({"after": "", "revolution": 0, "revolutionStartedAtMs": now});
     }
@@ -874,16 +1064,65 @@ async fn ring_tick_inner<J: JudgeDb>(
     if let Some(f) = &flip {
         m.run_batch(vec![state(PHASE_C_NAME, f)]).await?;
     }
-    let mut report = RingReport::default();
+    let mut report = RingReport {
+        window_ms: window,
+        ..RingReport::default()
+    };
     ring["lastTickAt"] = json!(now);
+    // FIX-1046: the shard's queue of re-reads, `[{identity, dueAtMs}]` by due time.
+    let mut queue: Vec<(String, i64)> = ring["rereads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            Some((
+                e["identity"].as_str()?.to_string(),
+                json_ms(&e["dueAtMs"])? as i64,
+            ))
+        })
+        .collect();
+    let mut largest = FLEET_COMPARE_IDENTITY_RESERVE;
     let rest_until = ring["restUntilMs"].as_i64();
-    if per_tick == 0 || rest_until.is_some_and(|r| now < r) {
-        report.stopped = Some(if per_tick == 0 { "paused" } else { "resting" });
+    let resting = rest_until.is_some_and(|r| now < r);
+    if per_tick > 0 {
+        // The due re-reads first, resting or not, each inside the tick's budget and wall: one the tick cannot afford
+        // stays queued (its row `pendingReread`, counted neither way) for the next tick.
+        let due: Vec<String> = queue
+            .iter()
+            .filter(|(_, d)| *d <= now)
+            .map(|(i, _)| i.clone())
+            .collect();
+        for id in &due {
+            let used = m.statements.get();
+            if used + largest > FLEET_COMPARE_STATEMENTS_PER_TICK {
+                report.stopped = Some("statements");
+                break;
+            }
+            if elapsed() > FLEET_COMPARE_WALL_MS {
+                report.stopped = Some("wall");
+                break;
+            }
+            let raw = comparer.compare(&m, id, now).await;
+            let row = classified(&m, raw, now, window).await?;
+            ring_account(&mut report, &row, &mut queue, window);
+            ring["rereads"] = queue_json(&queue);
+            m.run_batch(vec![upsert_stmt(&row), state(&name, &ring)])
+                .await?;
+            largest = largest.max(m.statements.get() - used);
+            report.rereads.push(id.clone());
+            report.compared.push(id.clone());
+        }
+    }
+    if per_tick == 0 || resting || report.stopped.is_some() {
+        if report.stopped.is_none() {
+            report.stopped = Some(if per_tick == 0 { "paused" } else { "resting" });
+        }
         m.run_batch(vec![
             state(&name, &ring),
             fleet_health_stmt(now, shards, false),
         ])
         .await?;
+        held_by_apply_counted(&m, &report).await;
         report.statements = m.statements.get();
         report.cursor = ring["after"].as_str().unwrap_or_default().to_string();
         return Ok(report);
@@ -937,7 +1176,6 @@ async fn ring_tick_inner<J: JudgeDb>(
         exhausted = j + 1 == segments.len();
     }
     let mut cursor = after;
-    let mut largest = FLEET_COMPARE_IDENTITY_RESERVE;
     let mut all_done = true;
     for id in &ids {
         let used = m.statements.get();
@@ -951,18 +1189,16 @@ async fn ring_tick_inner<J: JudgeDb>(
             all_done = false;
             break;
         }
-        // A key with no actor (not 66-hex) is passed by the cursor with no row.
-        if actor_name(id).is_none() {
+        // A key with no actor (not 66-hex) is passed by the cursor with no row; one this tick re-read already holds
+        // this tick's row (FIX-1046).
+        if actor_name(id).is_none() || report.rereads.contains(id) {
             cursor = id.clone();
             continue;
         }
-        let row = comparer.compare(&m, id, now).await;
-        if row.diff_count.is_some_and(|n| n > 0) {
-            report.diffs += 1;
-        }
-        if row.fault.is_some() {
-            report.faults += 1;
-        }
+        let raw = comparer.compare(&m, id, now).await;
+        let row = classified(&m, raw, now, window).await?;
+        ring_account(&mut report, &row, &mut queue, window);
+        ring["rereads"] = queue_json(&queue);
         cursor = id.clone();
         ring["after"] = json!(cursor);
         m.run_batch(vec![upsert_stmt(&row), state(&name, &ring)])
@@ -1000,9 +1236,53 @@ async fn ring_tick_inner<J: JudgeDb>(
     // FIX-998-SERVE: the public counts, folded after this tick's rows (forced at a wrap, else once a minute).
     end.push(fleet_health_stmt(now, shards, report.wrapped));
     m.run_batch(end).await?;
+    held_by_apply_counted(&m, &report).await;
     report.cursor = cursor;
     report.statements = m.statements.get();
     Ok(report)
+}
+
+/// FIX-1046: one classified row into the tick's account and the shard's queue (the identity's old entry dropped, a
+/// new one at its due time while it holds a pending outpoint, at most [`FLEET_COMPARE_REREADS_MAX`] queued).
+fn ring_account(
+    report: &mut RingReport,
+    row: &CompareRow,
+    queue: &mut Vec<(String, i64)>,
+    window: i64,
+) {
+    if row.diff_count.is_some_and(|n| n > 0) {
+        report.diffs += 1;
+    }
+    if row.fault.is_some() {
+        report.faults += 1;
+    }
+    report.held_by_apply += row.held_by_apply();
+    queue.retain(|(i, _)| *i != row.identity);
+    if let Some(due) = row.reread_due_ms(window) {
+        report.pending_reread += 1;
+        if queue.len() < FLEET_COMPARE_REREADS_MAX {
+            queue.push((row.identity.clone(), due));
+            queue.sort_by_key(|(_, d)| *d);
+        }
+    }
+}
+
+fn queue_json(queue: &[(String, i64)]) -> Value {
+    json!(queue
+        .iter()
+        .map(|(i, d)| json!({"identity": i, "dueAtMs": d}))
+        .collect::<Vec<_>>())
+}
+
+/// `owed_actor_compare_held_by_apply_total`: the tick's cleared outpoints, one counter write (none when none).
+async fn held_by_apply_counted(m: &impl SqlPort, report: &RingReport) {
+    if report.held_by_apply > 0 {
+        m.counters(vec![(
+            super::COUNTERS[35].to_string(),
+            report.held_by_apply as u64,
+        )])
+        .await;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1012,9 +1292,9 @@ async fn ring_tick_inner<J: JudgeDb>(
 pub const COMPARE_PAGE: usize = 64;
 /// The fleet's counts over every stored compare row, one statement (the overlay's `/health/invariants` reads the same
 /// aggregate in `owed_events::HEALTH_STATE_SQL`).
-pub const COMPARE_SUMMARY_SQL: &str = "SELECT COUNT(*) AS identities,COALESCE(SUM(diffCount>0),0) AS diffs,COALESCE(SUM(heldByLagCount>0),0) AS heldByLag,COALESCE(SUM(staleD1Count),0) AS staleD1,COALESCE(SUM(fault IS NOT NULL),0) AS faults,MIN(comparedAtMs) AS oldest,MAX(comparedAtMs) AS newest FROM owed_actor_compare";
+pub const COMPARE_SUMMARY_SQL: &str = "SELECT COUNT(*) AS identities,COALESCE(SUM(diffCount>0),0) AS diffs,COALESCE(SUM(heldByLagCount>0),0) AS heldByLag,COALESCE(SUM(instr(outpoints,'\"heldByApply\":true')>0),0) AS heldByApply,COALESCE(SUM(instr(outpoints,'\"pendingReread\":true')>0),0) AS pendingReread,COALESCE(SUM(staleD1Count),0) AS staleD1,COALESCE(SUM(fault IS NOT NULL),0) AS faults,MIN(comparedAtMs) AS oldest,MAX(comparedAtMs) AS newest FROM owed_actor_compare";
 /// The rows worth naming past `?1` (a difference, a held one or a fault), `?2` a page; `?3` one identity or ''.
-pub const COMPARE_PAGE_SQL: &str = "SELECT identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial FROM owed_actor_compare WHERE identity>?1 AND (?3='' OR identity=?3) AND (diffCount>0 OR heldByLagCount>0 OR fault IS NOT NULL OR ?3<>'') ORDER BY identity LIMIT ?2";
+pub const COMPARE_PAGE_SQL: &str = "SELECT identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial FROM owed_actor_compare WHERE identity>?1 AND (?3='' OR identity=?3) AND (diffCount>0 OR heldByLagCount>0 OR fault IS NOT NULL OR instr(outpoints,'\"heldByApply\":true')>0 OR instr(outpoints,'\"pendingReread\":true')>0 OR ?3<>'') ORDER BY identity LIMIT ?2";
 
 /// PURE: the standing route's answer from its three reads (the summary, the page, the ring's state): every identity
 /// whose compare differs (`diffs`: the differences no pending mark holds), whose differences a pending mark holds
@@ -1032,14 +1312,26 @@ pub fn compare_answer(
             .or_else(|| v.as_f64().map(|f| f as i64))
             .unwrap_or(0)
     };
-    let entry = |r: &Value, count_key: &str, count: i64, held: bool| -> Value {
+    // FIX-1046: an outpoint's class: `diff` (counted), `heldByApply`, `pendingReread`, else `heldByLag`.
+    let class_of = |o: &Value| -> &'static str {
+        if o["heldByApply"] == true {
+            "heldByApply"
+        } else if o["pendingReread"] == true {
+            "pendingReread"
+        } else if o["held"] == true {
+            "heldByLag"
+        } else {
+            "diff"
+        }
+    };
+    let entry = |r: &Value, count_key: &str, count: i64, class: &str| -> Value {
         let ops: Vec<Value> = r["outpoints"]
             .as_str()
             .and_then(|s| serde_json::from_str::<Value>(s).ok())
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default()
             .into_iter()
-            .filter(|o| (o["held"] == true) == held)
+            .filter(|o| class_of(o) == class)
             .collect();
         json!({
             "identity": r["identity"],
@@ -1054,6 +1346,8 @@ pub fn compare_answer(
     };
     let mut diffs = Vec::new();
     let mut held = Vec::new();
+    let mut by_apply = Vec::new();
+    let mut pending = Vec::new();
     let mut faults = Vec::new();
     for r in page {
         if let Some(f) = r["fault"].as_str() {
@@ -1061,10 +1355,27 @@ pub fn compare_answer(
             continue;
         }
         if n(&r["diffCount"]) > 0 {
-            diffs.push(entry(r, "diffCount", n(&r["diffCount"]), false));
+            diffs.push(entry(r, "diffCount", n(&r["diffCount"]), "diff"));
         }
         if n(&r["heldByLagCount"]) > 0 {
-            held.push(entry(r, "heldByLagCount", n(&r["heldByLagCount"]), true));
+            held.push(entry(
+                r,
+                "heldByLagCount",
+                n(&r["heldByLagCount"]),
+                "heldByLag",
+            ));
+        }
+        for (class, list) in [
+            ("heldByApply", &mut by_apply),
+            ("pendingReread", &mut pending),
+        ] {
+            let e = entry(r, &format!("{class}Count"), 0, class);
+            let k = e["outpoints"].as_array().map_or(0, Vec::len) as i64;
+            if k > 0 {
+                let mut e = e;
+                e[format!("{class}Count")] = json!(k);
+                list.push(e);
+            }
         }
     }
     let next = (page.len() == COMPARE_PAGE)
@@ -1074,12 +1385,17 @@ pub fn compare_answer(
         "identities": n(&summary["identities"]),
         "identitiesDiffering": n(&summary["diffs"]),
         "identitiesHeldByLag": n(&summary["heldByLag"]),
+        // FIX-1046: named, never counted (a difference that cleared on its re-read; one waiting for it).
+        "identitiesHeldByApply": n(&summary["heldByApply"]),
+        "identitiesPendingReread": n(&summary["pendingReread"]),
         "comparedWithinMs": json_ms(&summary["oldest"]).map(|o| now - o as i64),
         "newestComparedAtMs": json_ms(&summary["newest"]),
         "staleD1": n(&summary["staleD1"]),
         "faultCount": n(&summary["faults"]),
         "diffs": diffs,
         "heldByLag": held,
+        "heldByApply": by_apply,
+        "pendingReread": pending,
         "faults": faults,
         "ringCursor": ring["after"],
         "revolution": ring["revolution"],
@@ -1092,7 +1408,7 @@ pub fn compare_answer(
     });
     if narrowed {
         answer["row"] = page.first().map_or(Value::Null, |r| {
-            let mut e = entry(r, "diffCount", n(&r["diffCount"]), false);
+            let mut e = entry(r, "diffCount", n(&r["diffCount"]), "diff");
             e["heldByLagCount"] = json!(n(&r["heldByLagCount"]));
             e["fault"] = r["fault"].clone();
             e["outpoints"] = r["outpoints"]
@@ -1158,9 +1474,43 @@ pub async fn read_answer(
 
 /// `POST /internal/owed-actor-compare {"identity"}`: one identity compared NOW and its row written (the ring's cursor
 /// not moved); answered the row and the compare's view.
+///
+/// FIX-1046: the row is classified against the identity's prior stored row under the served visibility window
+/// ([`classify_reread`]): a difference this POST first sees is `pendingReread` (no queue entry: the ring's next
+/// revolution re-reads it under the same rule); a pending one past the window that stands is counted, one that cleared
+/// is `heldByApply`.
 pub async fn compare_now(db: &impl JudgeDb, identity: &str, now: i64) -> Result<Value, String> {
-    let (row, view) = compare_one(db, identity, now).await;
+    let (raw, view) = compare_one(db, identity, now).await;
+    // FIX-1046: a fault row is written as it is; any other reads the window and its prior row in one batch.
+    let (row, window) = if raw.fault.is_some() {
+        (raw, None)
+    } else {
+        let mut read = db
+            .run_batch(vec![
+                Stmt::new(VISIBILITY_READ_SQL, vec![]),
+                Stmt::new(
+                    PRIORS_SQL,
+                    vec![Bind::Text(json!([raw.identity]).to_string())],
+                ),
+            ])
+            .await?
+            .into_iter()
+            .map(|o| o.rows);
+        let window = reread_window_of(&read.next().unwrap_or_default(), now);
+        let prior = prior_of(&read.next().unwrap_or_default());
+        (
+            classify_reread(raw, prior.as_ref(), now, window),
+            Some(window),
+        )
+    };
     db.run_batch(vec![upsert_stmt(&row)]).await?;
+    if row.held_by_apply() > 0 {
+        db.counters(vec![(
+            super::COUNTERS[35].to_string(),
+            row.held_by_apply() as u64,
+        )])
+        .await;
+    }
     Ok(json!({
         "identity": row.identity,
         "comparedAtMs": row.compared_at_ms,
@@ -1168,6 +1518,9 @@ pub async fn compare_now(db: &impl JudgeDb, identity: &str, now: i64) -> Result<
         "heldByLagCount": row.held_by_lag_count,
         "staleD1Count": row.stale_d1_count,
         "tipLagCount": row.tip_lag_count,
+        "heldByApplyCount": row.held_by_apply(),
+        "pendingRereadCount": row.pending_reread(),
+        "windowMs": window,
         "outpoints": row.outpoints,
         "fault": row.fault,
         "partial": row.partial,
