@@ -373,8 +373,10 @@ pub const SWEEP_TIP_UNKNOWN_REASON: &str =
 pub const SWEEP_LANDING_REASON: &str =
     "the hop's sweep is on the network and has not reached the explorers or a block yet; waiting for it to land";
 /// FIX-1049-FOLD-1 (the ensemble's A MEDIUM-2, B NOTE-1): THE WAIT HAS AN EXIT. A landing wait holds this long after
-/// the sweep's LAST broadcaster word (the tracker word's `at`: every hint moves it, so a sweep a broadcaster keeps
-/// answering about keeps its wait, and one no broadcaster speaks of any more loses it): six blocks of 600 s. Past it
+/// the sweep's LAST HINT OF ANY SOURCE (the tracker word's `at`, FIX-1049-FOLD-2 restating the round-2 ensemble's C
+/// LOW-2: a broadcaster's word, Arcade's stored GET, or a courier's mempool presence, `courier_presence_hint`; every
+/// hint moves it, so a sweep any of them keeps reporting keeps its wait, a sweep stuck below the fee floor in one
+/// mempool included, and one nobody speaks of any more loses it): six blocks of 600 s, a wall clock. Past it
 /// the row presses again, and the press is the FILED sweep's own bytes (`sweepRawHex`): the same transaction
 /// re-presented, never a second spend, which is the remedy for a sweep a mempool dropped. A refused word, a word the
 /// tracker swept, `unknown`, `abandoned`, `built` or a word with no hint time ends it at once (the word's own mark

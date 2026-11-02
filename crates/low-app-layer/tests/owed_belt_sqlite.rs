@@ -684,7 +684,7 @@ async fn fix1049_b_a_young_miss_is_re_asked_on_the_next_tick() {
         "a young miss is asked again on the next tick, never after the 300 s floor"
     );
     assert_eq!(
-        db.int("SELECT value FROM ops_counters WHERE name='owed_belt_young_rows_total'"),
+        db.int("SELECT value FROM ops_counters WHERE name='owed_belt_young_rows'"),
         1,
         "the gauge: one row in its young window"
     );
@@ -798,5 +798,286 @@ async fn fix1049f1_d_young_looks_take_at_most_half_a_tick() {
         report.young_rows,
         belt::OWED_BELT_YOUNG_PER_TICK,
         "{report:?}"
+    );
+}
+
+fn cursor_of(db: &Db) -> String {
+    db.conn
+        .borrow()
+        .query_row(
+            "SELECT cursor FROM owed_belt_state WHERE name='belt:identities'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap_or_default()
+}
+
+/// FIX-1049-FOLD-2 (fold 1; the round-2 ensemble's B MEDIUM-1, A LOW-1; lens B's P1): D-L1 under young rows. Six
+/// identities `a0..a5` each hold one due landing wait that is NOT young (no first sight), four `z0..z3` one young
+/// landing each, walked after them. The places give the rows that are not young four and the young four, so a4 and a5
+/// get no place this tick while the young z's after them do: the walk's cursor must stay before a4 (no identity holding
+/// a due row is passed unserved). RED on 9eab66d7 (only a cut YOUNG row held the cursor back): "the cursor \"z3\"
+/// passed a4".
+#[tokio::test]
+async fn fix1049f2_1a_the_cursor_never_passes_a_due_row_the_places_cut() {
+    let db = Db::new();
+    let mut n = 0;
+    for i in 0..6 {
+        landing_into(&db, &format!("a{i}"), n, "announced", 60, None).await;
+        n += 1;
+    }
+    for i in 0..4 {
+        landing_into(&db, &format!("z{i}"), n, "announced", 60, Some(60)).await;
+        n += 1;
+    }
+    db.exec("UPDATE owed_rows SET beltDueAtMs=1");
+    let fake = Fake::default();
+    *fake.default_spent.borrow_mut() = Some((404, b"{}".to_vec()));
+    let report = belt::tick(&db, &fake).await.unwrap();
+    let cur = cursor_of(&db);
+    let served_a: Vec<String> = (0..6)
+        .filter(|i| {
+            let o = format!("{}:0", hop(1049 + i));
+            row_of(&db, &o).2 != Some(1)
+        })
+        .map(|i| format!("a{i}"))
+        .collect();
+    assert_eq!(
+        served_a.len(),
+        4,
+        "the places cut two of the a's: {report:?}"
+    );
+    for i in 0..6 {
+        let a = format!("a{i}");
+        if !served_a.contains(&a) {
+            assert!(
+                cur.as_str() < a.as_str(),
+                "the cursor {cur:?} passed {a}, which holds a due row the places cut and was not served"
+            );
+        }
+    }
+}
+
+/// FIX-1049-FOLD-2 (fold 2; B LOW-1, A NOTE-3; lens B's P2): THE YOUNG CAP IDLES NO PLACE. With ONLY young rows due
+/// (eight identities) the tick asks eight: the cap of four binds only while rows that are not young compete for the
+/// places. RED on 9eab66d7: the tick asked 4 and left 4 places idle.
+#[tokio::test]
+async fn fix1049f2_2a_young_rows_alone_take_every_place() {
+    let db = Db::new();
+    for i in 0..8 {
+        landing_into(&db, &format!("y{i}"), i, "announced", 60, Some(60)).await;
+    }
+    db.exec("UPDATE owed_rows SET beltDueAtMs=1");
+    let fake = Fake::default();
+    *fake.default_spent.borrow_mut() = Some((404, b"{}".to_vec()));
+    let report = belt::tick(&db, &fake).await.unwrap();
+    assert_eq!(
+        (report.candidates, report.young_rows),
+        (
+            belt::OWED_BELT_OUTPOINTS_PER_TICK,
+            belt::OWED_BELT_OUTPOINTS_PER_TICK
+        ),
+        "eight due young rows and nothing else due: {report:?}"
+    );
+}
+
+/// FIX-1049-FOLD-2 (fold 1; lens B's P1b): the cost of the pass. Six a's, four young z's and 120 rows that are not
+/// young after them; a tick every 120 s until a4 (cut by the places on the first tick) is looked at: the next tick,
+/// never a revolution of the walk later. RED on 9eab66d7: 17 ticks.
+#[tokio::test]
+async fn fix1049f2_1b_a_cut_row_is_looked_at_on_the_next_tick() {
+    let db = Db::new();
+    let mut n = 0;
+    for i in 0..6 {
+        landing_into(&db, &format!("a{i}"), n, "announced", 60, None).await;
+        n += 1;
+    }
+    for i in 0..4 {
+        landing_into(&db, &format!("z{i}"), n, "announced", 60, Some(60)).await;
+        n += 1;
+    }
+    for i in 0..120 {
+        landing_into(&db, &format!("zm{i:03}"), n, "announced", 60, None).await;
+        n += 1;
+    }
+    db.exec("UPDATE owed_rows SET beltDueAtMs=1");
+    let a4 = format!("{}:0", hop(1049 + 4));
+    let mut ticks = 0;
+    let mut at = NOW;
+    while row_of(&db, &a4).2 == Some(1) && ticks < 200 {
+        let fake = Fake::default();
+        *fake.default_spent.borrow_mut() = Some((404, b"{}".to_vec()));
+        db.now.set(at);
+        belt::tick(&db, &fake).await.unwrap();
+        ticks += 1;
+        at += belt::OWED_BELT_TICK_MS as u64;
+    }
+    assert!(ticks <= 2, "a4 waited {ticks} ticks");
+}
+
+/// FIX-1049-FOLD-2 (fold 4; B LOW-2; lens B's P3): a landing wait (no first sight) looked at again and again inside
+/// its wait, the couriers still answering unspent: the back-off doubles, and the row's next look never passes the
+/// wait's end. RED with `cap_to_landing_end` taken out of the back-off: the look at +4,800 s past the end at +3,540 s.
+#[tokio::test]
+async fn fix1049f2_4_the_backoff_never_dates_a_landing_past_its_end() {
+    let (db, outpoint) = landing("seen", 60, None).await;
+    let (_, facts, mut due) = row_of(&db, &outpoint);
+    let end = facts["sweepLandingUntilMs"].as_i64().unwrap();
+    let mut looks = 0;
+    while let Some(d) = due {
+        if d >= end || looks > 20 {
+            break;
+        }
+        let fake = Fake::default();
+        *fake.default_spent.borrow_mut() = Some((404, b"{}".to_vec()));
+        db.now.set(d as u64);
+        belt::tick(&db, &fake).await.unwrap();
+        looks += 1;
+        let (_, f, nd) = row_of(&db, &outpoint);
+        if f["sweepLanding"] != true {
+            break;
+        }
+        assert!(
+            nd.unwrap() <= end,
+            "the next look +{} s is past the wait's end +{} s",
+            (nd.unwrap() - NOW as i64) / 1000,
+            (end - NOW as i64) / 1000
+        );
+        due = nd;
+    }
+    assert!(looks >= 3, "the back-off doubled before the end: {looks}");
+    assert_eq!(
+        due,
+        Some(end),
+        "the last look inside the wait is dated at its end"
+    );
+}
+
+/// FIX-1049-FOLD-2 (fold 5; B LOW-4, A RISK wait-past-end-unanswered): PAST ITS END THE WAIT RE-JUDGES WITHOUT A
+/// COURIER ANSWER. A filed sweep's landing wait dated for its end; at the belt's look there every rung refuses (429):
+/// the judgement needs no new fact, so the look judges the row anyway and the press is back on the stored evidence
+/// (the filed bytes riding it), never only on a courier's answer or the daily age repair. RED on 9eab66d7: the look
+/// re-armed the row and it still said "waiting" past its end.
+#[tokio::test]
+async fn fix1049f2_5_past_its_end_the_wait_re_judges_with_no_courier_answer() {
+    let (db, outpoint) = landing("seen", 55 * 60, None).await;
+    let (_, facts, due) = row_of(&db, &outpoint);
+    let end = facts["sweepLandingUntilMs"].as_i64().unwrap();
+    assert_eq!(due, Some(end), "the look comes at the wait's end");
+    let fake = Fake::default();
+    for host in ["whatsonchain.com", "bananablocks.com", "bitails.io"] {
+        fake.on(host, Some((429, b"{}".to_vec())));
+    }
+    db.now.set(end as u64);
+    let report = belt::tick(&db, &fake).await.unwrap();
+    assert_eq!(report.candidates, 1, "{report:?}");
+    assert!(report.write_faults.is_empty(), "{report:?}");
+    let (family, facts, _) = row_of(&db, &outpoint);
+    assert_eq!(family, "hop-stranded");
+    assert_eq!(
+        (facts["claim"].clone(), facts["claimable"].clone()),
+        (json!("sweep-hop"), json!(true)),
+        "past the wait the press is back with no courier answer: {facts}"
+    );
+    assert!(facts["sweepRawHex"].is_string(), "the filed bytes ride it");
+    assert_eq!(
+        db.int("SELECT COUNT(*) FROM owed_dirty"),
+        0,
+        "the look's own mark is acknowledged by the judge that read it"
+    );
+    // inside the wait an unanswered look still judges nothing: the row is only re-armed
+    let (db, outpoint) = landing("seen", 60, None).await;
+    let before = row_of(&db, &outpoint);
+    let fake = Fake::default();
+    for host in ["whatsonchain.com", "bananablocks.com", "bitails.io"] {
+        fake.on(host, Some((429, b"{}".to_vec())));
+    }
+    db.now.set(before.2.unwrap() as u64);
+    let report = belt::tick(&db, &fake).await.unwrap();
+    assert_eq!((report.found, report.rearmed), (0, 1), "{report:?}");
+    assert_eq!(row_of(&db, &outpoint).1, before.1, "nothing re-judged");
+}
+
+/// FIX-1049-FOLD-2 (fold 3; B LOW-3, the #1041 class): THE WAIT'S END IS A CLOCK FACT AT THE COMPARE. One record, one
+/// judge (the actor and the D1 judge run one derivation, `owed::derive_owed_rows`): judged inside the wait and judged
+/// again past its end, the two judgements agree with a fresh judgement at the same instant (the operator's compare,
+/// `owed_actor::rows_view`, names no difference); and a row stored inside the wait against a fresh judgement past its
+/// end (the fleet compare's shape: an actor that judged before the end, D1 judged fresh after it) is a CLOCK LAG,
+/// served in `tipLag`, never in `diff` (the STOP). RED on 9eab66d7: `diff` named the outpoint.
+#[tokio::test]
+async fn fix1049f2_3_the_compare_reads_the_waits_end_as_the_judgements_clock() {
+    use low_app_layer::owed_actor::{diff_rows, rows_view};
+    let (db, outpoint) = landing("seen", 55 * 60, None).await;
+    let game = "g1049".to_string();
+    async fn stored(db: &Db) -> Vec<Value> {
+        db.run_batch(vec![Stmt {
+            sql: low_app_layer::owed_actor::ROWS_SQL.into(),
+            binds: vec![Bind::Text("owner".into())],
+        }])
+        .await
+        .unwrap()
+        .remove(0)
+        .rows
+    }
+    let inside = stored(&db).await;
+    assert_eq!(inside.len(), 1, "{inside:?}");
+    let fresh_inside = judge::judge_fresh_rows(&db, "owner", std::slice::from_ref(&game))
+        .await
+        .unwrap();
+    assert!(
+        diff_rows(&fresh_inside, &inside).is_empty(),
+        "inside the wait the two judgements agree"
+    );
+    let end = row_of(&db, &outpoint).1["sweepLandingUntilMs"]
+        .as_i64()
+        .unwrap();
+    db.now.set(end as u64 + 1);
+    let fresh_past = judge::judge_fresh_rows(&db, "owner", std::slice::from_ref(&game))
+        .await
+        .unwrap();
+    assert_eq!(
+        diff_rows(&fresh_past, &inside),
+        vec![outpoint.clone()],
+        "the premise: the verdict moved with the clock alone"
+    );
+    let view = rows_view(
+        "owner",
+        Ok(json!({"rows": inside})),
+        &fresh_past,
+        None,
+        None,
+    );
+    assert_eq!(
+        view["diff"],
+        json!([]),
+        "no STOP across the wait's end: {view}"
+    );
+    assert_eq!(
+        view["tipLag"],
+        json!([outpoint]),
+        "served as the clock's lag: {view}"
+    );
+    // the row stored past the end (the belt's look re-judged it) agrees with the fresh judgement past the end
+    let fake = Fake::default();
+    *fake.default_spent.borrow_mut() = Some((404, b"{}".to_vec()));
+    belt::tick(&db, &fake).await.unwrap();
+    let past = stored(&db).await;
+    let fresh_past = judge::judge_fresh_rows(&db, "owner", std::slice::from_ref(&game))
+        .await
+        .unwrap();
+    assert!(
+        diff_rows(&fresh_past, &past).is_empty(),
+        "past the end the two judgements agree"
+    );
+    // a verdict difference that is NOT the wait's end stays a diff: the same pair with the press's claim changed
+    let mut wrong = fresh_past.clone();
+    let mut facts: Value = serde_json::from_str(wrong[0]["facts"].as_str().unwrap()).unwrap();
+    facts["sweepTxid"] = json!("ff".repeat(32));
+    wrong[0]["facts"] = json!(facts.to_string());
+    let view = rows_view("owner", Ok(json!({"rows": inside})), &wrong, None, None);
+    assert_eq!(
+        view["diff"],
+        json!([outpoint]),
+        "another sweep is a real difference: {view}"
     );
 }

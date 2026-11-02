@@ -46,8 +46,9 @@ pub const OWED_BELT_BACKOFF_MAX_MS: i64 = 6 * 3_600_000;
 /// most `OWED_BELT_YOUNG_MISS_MS / OWED_BELT_TICK_MS` = 15 young looks while the record holds its bytes (8 days, the
 /// store's retention; a row swept and written again starts a new window, 15 looks more).
 pub const OWED_BELT_YOUNG_MISS_MS: i64 = 1_800_000;
-/// FIX-1049-FOLD-1 (fold 5, A NOTE-2, B RISK): young looks take at most half of a tick's places and never the second
-/// class's reserved ones ([`places`]).
+/// FIX-1049-FOLD-1 (fold 5, A NOTE-2, B RISK): young looks take at most half of a tick's places while rows that are
+/// not young compete for them, and never a reserved place such a row wants; as folded (FIX-1049-FOLD-2, fold 2) they
+/// take every place the others leave ([`places`]).
 pub const OWED_BELT_YOUNG_PER_TICK: usize = OWED_BELT_OUTPOINTS_PER_TICK / 2;
 /// The rung's circuit: this many faults in one tick close it for the rest of the tick (`tracker_host::pacing`'s 3).
 pub const OWED_BELT_RUNG_FAULTS: u8 = 3;
@@ -170,10 +171,11 @@ pub const COUNTER_DUE: &str = "owed_belt_due_total";
 /// FIX-1027-FOLD-1: the outpoints the operator's re-ask lever ([`reask`]) asked.
 pub const COUNTER_REASKED: &str = "owed_belt_reasked_total";
 /// FIX-1049-FOLD-1 (fold 6, C NOTE-1): a GAUGE, set each tick: the ROWS the tick looked at in their young window
-/// ([`young_miss`]), each once, whatever path re-dated it. A count of rows in a young wait, never of re-dates.
-pub const COUNTER_YOUNG_ROWS: &str = "owed_belt_young_rows_total";
+/// ([`young_miss`]), each once, whatever path re-dated it. A count of rows in a young wait, never of re-dates; no
+/// `_total` (FIX-1049-FOLD-2, the round-2 ensemble's C NOTE-3: a gauge, never a total).
+pub const COUNTER_YOUNG_ROWS: &str = "owed_belt_young_rows";
 /// The young-rows gauge's statement (`?1` the rows).
-pub const YOUNG_GAUGE_SQL: &str = "INSERT INTO ops_counters(name,value) VALUES ('owed_belt_young_rows_total',?1) ON CONFLICT(name) DO UPDATE SET value=excluded.value";
+pub const YOUNG_GAUGE_SQL: &str = "INSERT INTO ops_counters(name,value) VALUES ('owed_belt_young_rows',?1) ON CONFLICT(name) DO UPDATE SET value=excluded.value";
 pub fn fault_counter(rung: usize) -> String {
     format!(
         "owed_belt_faults_{}_total",
@@ -342,6 +344,15 @@ pub fn young_miss(facts: &Value, now_ms: i64) -> bool {
             .is_some_and(|at| (0..OWED_BELT_YOUNG_MISS_MS).contains(&now_ms.saturating_sub(at)))
 }
 
+/// FIX-1049-FOLD-2 (fold 5): is this row a landing wait whose end (`sweepLandingUntilMs`) the clock has reached? Its
+/// judgement moves with the clock alone, so the belt's look judges it with or without a courier's answer.
+pub fn landing_ended(facts: &Value, now_ms: i64) -> bool {
+    facts["sweepLanding"] == true
+        && facts["sweepLandingUntilMs"]
+            .as_i64()
+            .is_some_and(|end| now_ms >= end)
+}
+
 /// FIX-1049-FOLD-1 (fold 2): a landing wait's next look is never later than the wait's end (`sweepLandingUntilMs`),
 /// so the look that re-judges the row past it gives the press back; any other row's date is `due` as computed.
 pub fn cap_to_landing_end(facts: &Value, now_ms: i64, due: i64) -> i64 {
@@ -357,12 +368,20 @@ pub fn cap_to_landing_end(facts: &Value, now_ms: i64, due: i64) -> i64 {
 /// press or a downgrade waits on), the young looks at most [`OWED_BELT_YOUNG_PER_TICK`] of the second class's other
 /// places, and the rows that are not young the rest. Answers (first, second not young, young). With no young row it
 /// is [`class_places`] exactly.
+///
+/// FIX-1049-FOLD-2 (fold 2; the round-2 ensemble's B LOW-1, A LOW-2): THE CAP IDLES NO PLACE. The half binds only
+/// while rows that are not young compete: young looks also take every place the others leave (young rows alone due
+/// take all eight). And the reserved places are the second class's AS A WHOLE: the rows that are not young take them
+/// first, and a young row takes what they leave, so under a first-class flood a young row keeps a reserved place (main
+/// gave L58's courier-bytes payout one, before it was young).
 pub fn places(first: usize, second: usize, young: usize) -> (usize, usize, usize) {
     let total = OWED_BELT_OUTPOINTS_PER_TICK;
-    let reserved = second.min(OWED_BELT_SECOND_CLASS_RESERVED);
+    let reserved = (second + young).min(OWED_BELT_SECOND_CLASS_RESERVED);
     let first_n = first.min(total - reserved);
     let left = total - first_n;
-    let young_n = young.min(OWED_BELT_YOUNG_PER_TICK).min(left - reserved);
+    let young_n = young
+        .min(left - second.min(reserved))
+        .min(OWED_BELT_YOUNG_PER_TICK.max(left.saturating_sub(second)));
     let second_n = second.min(left - young_n);
     (first_n, second_n, young_n)
 }
@@ -427,6 +446,14 @@ pub struct Find {
     pub home_words: Vec<(String, HomeSpendWord)>,
 }
 impl Find {
+    /// FIX-1049-FOLD-2 (fold 5): the empty find of a candidate's own subject: no fact, only the row's mark and pair, so
+    /// the judge that reads it re-judges the row at the look's instant (each phase's own road, as any find).
+    pub fn of_subject(c: &Candidate) -> Find {
+        Find {
+            subject: Some((c.identity.clone(), c.game_id.clone(), c.outpoint.clone())),
+            ..Find::default()
+        }
+    }
     fn is_empty(&self) -> bool {
         self.memos.is_empty() && self.bytes.is_empty() && self.home_words.is_empty()
     }
@@ -518,8 +545,12 @@ impl Find {
         }
         for (txid, b) in &self.bytes {
             // FIX-1049-FOLD-1: the statement's ON CONFLICT DO NOTHING keeps a held row's stamp; a new row's is the
-            // judgement's instant, the one `statements` binds
-            i.spender_first_seen.entry(txid.clone()).or_insert(i.now_ms);
+            // judgement's instant, the one `statements` binds. FIX-1049-FOLD-2 (the round-2 ensemble's B NOTE-1): only
+            // where `statements` writes the bytes (`to_json_capped`), so the first sight is the record's own stamp and
+            // no judge serves one the record does not hold (the actor, and every later judgement, would read none)
+            if b.to_json_capped().is_some() {
+                i.spender_first_seen.entry(txid.clone()).or_insert(i.now_ms);
+            }
             i.spender_inputs.insert(txid.clone(), b.inputs.clone());
             i.spender_outputs.insert(txid.clone(), b.to_outputs());
             i.courier_spenders.insert(txid.clone());
@@ -905,7 +936,7 @@ async fn due_candidates(db: &impl JudgeDb, now: i64, tip: u64) -> Result<Vec<Val
     let mut chosen: Vec<Value> = first_rows.into_iter().take(first_n).flatten().collect();
     let (mut old_taken, mut young_taken) = (0, 0);
     let mut given: Vec<usize> = Vec::new();
-    let mut held_back: Option<usize> = None;
+    let mut cut: Vec<usize> = Vec::new();
     for ((at, _, _), row) in second_class.iter().zip(second_rows) {
         let is_young = young_of(&row);
         let take = if is_young {
@@ -922,13 +953,17 @@ async fn due_candidates(db: &impl JudgeDb, now: i64, tip: u64) -> Result<Vec<Val
         if take {
             given.push(*at);
             chosen.extend(row);
-        } else if is_young {
-            held_back = Some(held_back.map_or(*at, |h| h.min(*at)));
+        } else {
+            cut.push(*at);
         }
     }
     // The next tick starts after the last identity this one gave a turn (the whole walk when none was given one and
-    // the second class was not cut short by its places). FIX-1049-FOLD-1: never past an identity whose young look the
-    // places held back (D-L1: no identity holding a due row is passed unserved), so the next tick starts at it.
+    // the second class was not cut short by its places). FIX-1049-FOLD-2 (fold 1; the round-2 ensemble's B MEDIUM-1,
+    // A LOW-1): never past an identity holding a due row the places cut and given NO turn this tick, young or not
+    // (D-L1: no identity holding a due row is passed unserved), so the next tick starts at it. Fold 1 of the first
+    // round held the cursor back for a cut YOUNG row only, so a row that is not young, cut while a young row after it
+    // was served, waited a revolution of the walk.
+    let held_back = cut.iter().copied().filter(|at| !given.contains(at)).min();
     let last = match held_back {
         Some(0) => None,
         Some(p) => identities.get(p - 1).cloned(),
@@ -1407,7 +1442,21 @@ async fn ask_one<C: Courier>(
 ) {
     gate.begin_outpoint();
     let before = gate.state.borrow().tick_calls;
-    let found = ask(db, gate, c, now).await;
+    let found = match ask(db, gate, c, now).await {
+        // FIX-1049-FOLD-2 (fold 5; the round-2 ensemble's B LOW-4): a landing wait at or past its end is judged on
+        // this look whether a rung answered or not: the press it gives back needs no new fact (the clock passed the
+        // wait), so an unanswered look is an empty find of the row's subject (its mark, its judgement, its event),
+        // never only a re-arm that leaves the row saying "waiting" until a rung answers or the age repair runs.
+        Ok(None) if landing_ended(&c.facts, now) => Ok(Some(Find::of_subject(c))),
+        Err(e) if landing_ended(&c.facts, now) => {
+            db.log(&format!(
+                "[owed-belt] {} ask faulted, its landing wait ended: judged on the stored evidence: {e}",
+                c.outpoint
+            ));
+            Ok(Some(Find::of_subject(c)))
+        }
+        other => other,
+    };
     // FIX-1018 (bsv-low #1018): the belt ASKED this outpoint, so its find's judge (the D1 judge's, and the actor's
     // through the hand-back's `beltAsked`) dates it fresh; every other dated row keeps its earlier date.
     let _asked = owed_judge::belt_asked_scope(&c.identity, std::slice::from_ref(&c.outpoint));
@@ -2195,8 +2244,11 @@ mod tests {
         }
     }
 
-    /// FIX-1049-FOLD-1 (fold 5; A NOTE-2, B RISK): young looks never take the second class's reserved places and
-    /// never more than half of a tick's eight; with no young row the places are D3-M1's `class_places` exactly.
+    /// FIX-1049-FOLD-1 (fold 5; A NOTE-2, B RISK), as folded (FIX-1049-FOLD-2, fold 2; the round-2 ensemble's B LOW-1,
+    /// A LOW-2): young looks never take a reserved place a row that is not young wants, and never more than half of a
+    /// tick's eight while such rows compete; they take every place the others leave (no place idles), and under a
+    /// first-class flood a young row keeps the second class's reserved places; with no young row the places are D3-M1's
+    /// `class_places` exactly. RED on 9eab66d7: `left: (0, 0, 4) right: (0, 0, 8)` (half the tick idle).
     #[test]
     fn fix1049f1_d_young_looks_take_half_the_places_and_never_the_reserved_ones() {
         use super::*;
@@ -2206,27 +2258,45 @@ mod tests {
                 assert_eq!(places(first, second, 0), (f, s, 0), "{first} {second}");
             }
         }
-        assert_eq!(places(0, 0, 8), (0, 0, 4), "half at most");
+        assert_eq!(
+            places(0, 0, 8),
+            (0, 0, 8),
+            "young rows alone take every place"
+        );
         assert_eq!(
             places(8, 0, 8),
-            (8, 0, 0),
-            "a first-class flood leaves young nothing"
+            (6, 0, 2),
+            "a first-class flood leaves young the second class's reserved places"
         );
         assert_eq!(
             places(8, 2, 8),
             (6, 2, 0),
-            "the reserved places are the rows that are not young"
+            "the reserved places are the rows that are not young first"
         );
-        assert_eq!(places(8, 1, 8), (7, 1, 0));
+        assert_eq!(places(8, 1, 8), (6, 1, 1));
         assert_eq!(places(0, 6, 8), (0, 4, 4), "half each");
         assert_eq!(places(0, 16, 1), (0, 7, 1));
-        assert_eq!(places(2, 1, 8), (2, 1, 4));
+        assert_eq!(places(2, 1, 8), (2, 1, 5), "no place idles");
         for first in 0..=8 {
             for second in 0..=8 {
                 for young in 0..=8 {
                     let (f, s, y) = places(first, second, young);
                     assert!(f + s + y <= OWED_BELT_OUTPOINTS_PER_TICK);
-                    assert!(y <= OWED_BELT_YOUNG_PER_TICK);
+                    assert_eq!(
+                        f + s + y,
+                        (first + second + young).min(OWED_BELT_OUTPOINTS_PER_TICK),
+                        "no place idles: {first} {second} {young}"
+                    );
+                    assert!(
+                        y <= OWED_BELT_YOUNG_PER_TICK || s == second,
+                        "young past half only in places the others leave: {first} {second} {young}"
+                    );
+                    if young > 0 && second == 0 {
+                        assert!(
+                            y >= young.min(OWED_BELT_SECOND_CLASS_RESERVED),
+                            "a young row keeps the reserved places: {first} {young}"
+                        );
+                    }
                     assert!(
                         s >= second.min(OWED_BELT_SECOND_CLASS_RESERVED),
                         "the reserved places held"
@@ -2234,6 +2304,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// FIX-1049-FOLD-2 (fold 6, the round-2 ensemble's B NOTE-1): a find hands its judge a first sight of a spender's
+    /// bytes ONLY where its statements write them: bytes past the store's cap are not kept, so no judge serves a first
+    /// sight the record never holds. RED on 9eab66d7: the capped spender's first sight was the find's instant.
+    #[test]
+    fn fix1049f2_6_a_first_sight_only_where_the_bytes_are_written() {
+        use super::*;
+        let small = crate::owed::StoredSpenderBytes::from_parts(&[("ab".repeat(32), 0)], &[]);
+        let big =
+            crate::owed::StoredSpenderBytes::from_parts(&vec![("cd".repeat(32), 0); 2_000], &[]);
+        assert!(small.to_json_capped().is_some() && big.to_json_capped().is_none());
+        let find = Find {
+            bytes: vec![("small".into(), small), ("big".into(), big)],
+            ..Find::default()
+        };
+        let written = find
+            .statements(7)
+            .iter()
+            .filter(|s| s.sql == crate::owed::OWED_SPENDER_BYTES_UPSERT_SQL)
+            .count();
+        assert_eq!(written, 1, "the capped bytes are not written");
+        let mut i = owed_judge::JudgeInputs::default();
+        i.now_ms = 7;
+        find.apply(&mut i);
+        assert_eq!(i.spender_first_seen.get("small"), Some(&7));
+        assert_eq!(
+            i.spender_first_seen.get("big"),
+            None,
+            "no stamp the record does not hold"
+        );
+    }
+
+    /// FIX-1049-FOLD-2 (fold 5): a landing wait has ended at its end exactly, not a millisecond before; no other row has.
+    #[test]
+    fn fix1049f2_5_landing_ended_at_its_end() {
+        use super::*;
+        let facts = serde_json::json!({"sweepLanding": true, "sweepLandingUntilMs": 5_000});
+        assert!(!landing_ended(&facts, 4_999));
+        assert!(landing_ended(&facts, 5_000));
+        assert!(!landing_ended(
+            &serde_json::json!({"sweepLandingUntilMs": 5_000}),
+            9_000
+        ));
+        assert!(!landing_ended(
+            &serde_json::json!({"sweepLanding": true}),
+            9_000
+        ));
     }
 
     /// FIX-1049-FOLD-1 (fold 2): a landing wait's next look is never past its end; any other row's date is untouched.
