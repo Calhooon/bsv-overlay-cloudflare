@@ -657,6 +657,119 @@ mod pins {
         );
     }
 
+    /// bsv-low #1044 fold 1 (the FIX-1044 ensemble's one class): THE STAMP WRITES THE LAST CLEAR'S REFUSALS BEFORE IT
+    /// MOVES. Clear 1 at T, reach 990, its batch run before any word below; then, written after it: the belt's lagging
+    /// find of the marked hop (`<HOP>:1`, taken T + 5 min at tip 1,000: inside the grace and reach), a below-reach word
+    /// taken after the stamp (T + 1 min, tip 980), a late find taken before the stamp inside the reach (T - 1, tip
+    /// 1,000), a word clear 1 left standing (T - 1, tip 900), a word past the grace, an unconfirmed spend. The next
+    /// stamp (a routine clear a grace later, reach 1,013) demotes exactly the three refused, answers their keys and
+    /// marks the hop's seat as a downgrade, in its one batch, the tombstone LAST; the other three are untouched. RED
+    /// with the stamp's refusals inert (03c75ab5's tombstone write alone): `left: [] right: [.., .., ..]`.
+    #[test]
+    fn fix1044f1_a_the_stamp_writes_the_last_clears_refusals_before_it_moves() {
+        use crate::hop_probe_memos::*;
+        let db = Sqlite::migrated();
+        seed(&db);
+        let stamp = |db: &Sqlite, at: i64, reach: f64| -> Vec<String> {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            let [marks, demote, mark] = HOP_PROBE_MEMO_REORG_STAMP;
+            tx.execute(marks, []).unwrap();
+            let mut keys: Vec<String> = tx
+                .prepare(demote)
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            tx.execute(mark, rusqlite::params![at as f64, reach])
+                .unwrap();
+            tx.commit().unwrap();
+            keys.sort();
+            keys
+        };
+        let g = HOP_PROBE_MEMO_REORG_GRACE_MS;
+        let t = 1_790_000_000_000_i64;
+        let min = 60_000_i64;
+        assert!(
+            stamp(&db, t, 990.0).is_empty(),
+            "no tombstone yet: nothing refused"
+        );
+        let words: [(String, i64, Option<bool>, i64); 6] = [
+            (format!("{HOP}:1"), t + 5 * min, Some(true), 1_000),
+            (format!("{}.0", "b1".repeat(32)), t + min, Some(true), 980),
+            (format!("{}:0", "c1".repeat(32)), t - 1, Some(true), 1_000),
+            (format!("{}.0", "d1".repeat(32)), t - 1, Some(true), 900),
+            (format!("{}.0", "e1".repeat(32)), t + g, Some(true), 1_000),
+            (format!("{}.0", "f1".repeat(32)), t + min, None, 1_000),
+        ];
+        for (k, at, c, tip) in &words {
+            db.conn
+                .execute(
+                    "INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES(?1,?2,1,?3,?4,?5)",
+                    rusqlite::params![k, at, SPENDER, c, tip],
+                )
+                .unwrap();
+        }
+        db.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        let mut want = vec![words[0].0.clone(), words[1].0.clone(), words[2].0.clone()];
+        want.sort();
+        assert_eq!(
+            stamp(&db, t + g + min, 1_013.0),
+            want,
+            "the three refusals written"
+        );
+        let confirmed: Vec<(String, Option<i64>)> = db
+            .conn
+            .prepare("SELECT outpoint,spentConfirmed FROM hop_chain_probes WHERE outpoint<>?1 ORDER BY outpoint")
+            .unwrap()
+            .query_map([HOP_PROBE_MEMO_REORG_MARK], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(confirmed.len(), 6, "kept: none deleted");
+        for (k, c) in &confirmed {
+            let refused = want.contains(k);
+            let planted = words.iter().find(|w| &w.0 == k).unwrap().2;
+            assert_eq!(
+                *c,
+                if refused {
+                    None
+                } else {
+                    planted.map(i64::from)
+                },
+                "{k}"
+            );
+        }
+        let marks: Vec<(String, String, String, i64)> = db
+            .conn
+            .prepare("SELECT identity,source,sourceKey,downgrade FROM owed_dirty")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            marks,
+            vec![(ID.to_string(), "probe".to_string(), format!("{HOP}:1"), 1)],
+            "the hop's seat marked, a downgrade"
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT probedAtMs,tipHeight FROM hop_chain_probes WHERE outpoint=?1",
+                    [HOP_PROBE_MEMO_REORG_MARK],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                )
+                .unwrap(),
+            (t + g + min, 1_013),
+            "the tombstone stamped last: a grace later, its own reach"
+        );
+        assert!(
+            stamp(&db, t + g + 2 * min, 1_013.0).is_empty(),
+            "a second stamp finds nothing left to write"
+        );
+    }
+
     /// bsv-low #1044 (the FIX-1042 ensemble's LOW-3, lens B): THE SWEEP NOTES ONLY THE MEMOS A JUDGE READS, AND COUNTS
     /// THE REST, per pass. One sweep over four aged rows: an unspent memo of a hop with a marker (marked: noted), the
     /// evidence of an evicted hop (marked: noted), a memo the evidence repeats word for word (unmarked) and a memo of an
@@ -791,11 +904,11 @@ mod pins {
             serde_json::json!({ "readable": true, "reorgClear": { "at": 7_000, "reach": 990 } });
         let served = crate::ops::reorg_clear_view(
             &mut view,
-            &serde_json::json!({ COUNTER_HOP_PROBE_MEMOS_CLEARED: 3, COUNTER_HOP_PROBE_EVIDENCE_DEMOTED: 5 }),
+            &serde_json::json!({ COUNTER_HOP_PROBE_MEMOS_CLEARED: 3, COUNTER_HOP_PROBE_EVIDENCE_DEMOTED: 5, COUNTER_HOP_PROBE_REFUSALS_WRITTEN: 2 }),
         );
         assert_eq!(
             served,
-            serde_json::json!({ "at": 7_000, "reach": 990, "memosCleared": 3, "evidenceDemoted": 5 })
+            serde_json::json!({ "at": 7_000, "reach": 990, "memosCleared": 3, "evidenceDemoted": 5, "refusalsWritten": 2 })
         );
         assert!(
             view.get("reorgClear").is_none(),
@@ -807,7 +920,7 @@ mod pins {
         );
         assert_eq!(
             none,
-            serde_json::json!({ "at": null, "reach": null, "memosCleared": 0, "evidenceDemoted": 0 })
+            serde_json::json!({ "at": null, "reach": null, "memosCleared": 0, "evidenceDemoted": 0, "refusalsWritten": 0 })
         );
         let ops: String = include_str!("ops.rs").split_whitespace().collect();
         for needle in [

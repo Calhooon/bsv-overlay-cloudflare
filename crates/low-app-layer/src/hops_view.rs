@@ -3704,8 +3704,9 @@ mod tests {
 mod fix1044 {
     use super::*;
     use bsv_overlay_cloudflare::hop_probe_memos::{
-        HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL, HOP_PROBE_MEMO_REORG_DEMOTE_SQL,
-        HOP_PROBE_MEMO_REORG_GRACE_MS, HOP_PROBE_MEMO_REORG_MARK_SQL,
+        HOP_PROBE_MEMO_REORG_CLEAR_FRAMED, HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL,
+        HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL, HOP_PROBE_MEMO_REORG_DEMOTE_SQL,
+        HOP_PROBE_MEMO_REORG_GRACE_MS, HOP_PROBE_MEMO_REORG_STAMP,
     };
 
     /// The tombstone's stamp: not a whole second, so a judge comparing seconds is seen.
@@ -3738,6 +3739,90 @@ mod fix1044 {
         format!("{:063x}{}", i, if evidence { "e" } else { "a" })
     }
 
+    /// bsv-low #1044 fold 1: the overlay's stamp batch as `clear_on_reorg` runs it (one transaction): the stored
+    /// tombstone's refusals marked and written, then the tombstone stamped as D1 binds it (each number a REAL).
+    /// Answers the keys it demoted.
+    fn stamp(conn: &rusqlite::Connection, at: i64, reach: Option<u64>) -> Vec<String> {
+        let tx = conn.unchecked_transaction().unwrap();
+        let [marks, demote, mark] = HOP_PROBE_MEMO_REORG_STAMP;
+        tx.execute(marks, []).unwrap();
+        let keys: Vec<String> = tx
+            .prepare(demote)
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        tx.execute(mark, rusqlite::params![at as f64, reach.map(|r| r as f64)])
+            .unwrap();
+        tx.commit().unwrap();
+        keys
+    }
+
+    /// bsv-low #1044 fold 1: a whole reorg clear as `clear_on_reorg` runs it: [`stamp`], then the clear's marks and its
+    /// framed writes at `floor`. Answers every key the two batches moved.
+    fn clear(conn: &rusqlite::Connection, at: i64, floor: u64) -> Vec<String> {
+        let mut moved = stamp(conn, at, Some(floor));
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute(HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL, [floor as f64])
+            .unwrap();
+        for sql in HOP_PROBE_MEMO_REORG_CLEAR_FRAMED {
+            moved.extend(
+                tx.prepare(sql)
+                    .unwrap()
+                    .query_map([floor as f64], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .map(Result::unwrap),
+            );
+        }
+        tx.commit().unwrap();
+        moved
+    }
+
+    fn plant(conn: &rusqlite::Connection, key: &str, w: Word) {
+        conn.execute(
+            "INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES(?1,?2,1,?3,1,?4)",
+            rusqlite::params![key, w.taken, "e5".repeat(32), w.tip.map(|t| t as i64)],
+        )
+        .unwrap();
+    }
+
+    /// Per key, as the route reads it with the tombstone (a deleted memo: `(false, false)`): (still confirmed in the table, the judge SERVES its
+    /// confirmation: `clear_unless_survived` then `confirmation_refused`, the D1 judge's and the actor's one rule).
+    fn judged(conn: &rusqlite::Connection, keys: &[String]) -> Vec<(bool, bool)> {
+        let mut all = keys.to_vec();
+        all.push(PROBE_MEMO_REORG_MARK.to_string());
+        let mut q = conn.prepare(&probe_memo_read_sql(all.len())).unwrap();
+        let memos: Vec<ProbeMemo> = q
+            .query_map(rusqlite::params_from_iter(all.iter()), |r| {
+                Ok(ProbeMemo {
+                    outpoint: r.get(0)?,
+                    probed_at_ms: r.get(1)?,
+                    spent: r.get(2)?,
+                    spending_txid: r.get(3)?,
+                    spent_confirmed: r.get(4)?,
+                    tip_height: r
+                        .get::<_, Option<i64>>(5)?
+                        .and_then(|v| u64::try_from(v).ok()),
+                })
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let (at, reach) = (reorg_clear_at(&memos), reorg_clear_reach(&memos));
+        keys.iter()
+            .map(|k| {
+                // a memo the clear deleted (rule 1) is no word: nothing confirmed, nothing served
+                let Some(m) = memos.iter().find(|m| &m.outpoint == k) else {
+                    return (false, false);
+                };
+                let confirmed = m.spent && m.spent_confirmed == Some(true);
+                let refused = confirmation_refused(m, clear_unless_survived(m, at, reach));
+                (confirmed, confirmed && !refused)
+            })
+            .collect()
+    }
+
     /// The tombstone stamped by the shipped statement as D1 binds it (each number a REAL), the clear's two framed
     /// writes run at `floor` (the memos deleted, the evidence demoted), then the route's read
     /// ([`probe_memo_read_sql`]) of every word and the tombstone, mapped as the judge maps a row (a `tipHeight` that
@@ -3764,11 +3849,7 @@ mod fix1044 {
             }
         }
         for (at, reach) in stamps {
-            conn.execute(
-                HOP_PROBE_MEMO_REORG_MARK_SQL,
-                rusqlite::params![*at as f64, reach.map(|r| r as f64)],
-            )
-            .unwrap();
+            stamp(&conn, *at, *reach);
         }
         let read = |conn: &rusqlite::Connection| -> Vec<ProbeMemo> {
             let mut keys: Vec<String> = (0..words.len())
@@ -3960,76 +4041,222 @@ mod fix1044 {
         assert_eq!(got, vec![true, false, false, false]);
     }
 
-    /// LOW-1 (lenses A and B): A LATER, SHALLOWER CLEAR NEVER UN-REFUSES AN EARLIER DEEPER CLEAR'S WORD. Clear 1 at T,
-    /// floor 990; a courier that had not seen the reorg answers CONFIRMED five minutes later at tip 1,000 (inside clear
-    /// 1's reach and grace: refused). Clear 2 ten minutes after clear 1, floor 1,010: the word is below clear 2's reach
-    /// and taken before its stamp, so on the newest reach alone it read as one clear 2 left standing and its
-    /// confirmation was served again with no event. The tombstone keeps the deepest reach inside the grace, so it stays
-    /// refused; a clear a grace after the last resets the reach and the word is that clear's verdict. RED on
-    /// f7ec4e4c's tombstone statement: `the word stays refused after the shallower clear`.
+    /// LOW-1 (lenses A and B) and THE FOLD (bsv-low #1044 fold 1, the FIX-1044 ensemble's one class): A LATER CLEAR
+    /// NEVER UN-REFUSES AN EARLIER CLEAR'S WORD, inside the grace or a grace later. Clear 1 at T, floor 990; a courier
+    /// that had not seen the reorg answers CONFIRMED five minutes later at tip 1,000 (inside clear 1's reach and grace:
+    /// refused). Clear 2 ten minutes after clear 1, floor 1,010, then a run, then a clear a grace after the last (its
+    /// reach resets): the word stays refused at each, and from the first later clear on it is WRITTEN refused (kept,
+    /// unconfirmed, marked), so no tombstone move can serve it again. RED on f7ec4e4c's tombstone statement at the
+    /// shallower clear; RED on 03c75ab5 (the stamp's refusals inert) at `a clear a grace after the last never
+    /// un-refuses it` (lens B's MEDIUM-1).
     #[test]
     fn fix1044_a_a_shallower_clear_never_unrefuses_a_deeper_clears_word() {
         let min = 60_000_i64;
+        let g = HOP_PROBE_MEMO_REORG_GRACE_MS;
+        let key = format!("{}.0", txid(0, false));
         let word = Word {
             taken: AT + 5 * min,
             tip: Some(1_000),
         };
-        let judged = |stamps: &[(i64, Option<u64>)]| -> bool {
+        let run = |clears: &[(i64, u64)]| -> (bool, bool) {
             let conn = db();
-            conn.execute(
-                "INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES(?1,?2,1,?3,1,?4)",
-                rusqlite::params![format!("{}.0", txid(0, false)), word.taken, "e5".repeat(32), 1_000_i64],
-            )
-            .unwrap();
-            for (at, reach) in stamps {
-                conn.execute(
-                    HOP_PROBE_MEMO_REORG_MARK_SQL,
-                    rusqlite::params![*at as f64, reach.map(|r| r as f64)],
-                )
-                .unwrap();
+            clear(&conn, AT, 990);
+            plant(&conn, &key, word);
+            for (at, floor) in clears {
+                clear(&conn, *at, *floor);
             }
-            let keys = [
-                format!("{}.0", txid(0, false)),
-                PROBE_MEMO_REORG_MARK.to_string(),
-            ];
-            let mut q = conn.prepare(&probe_memo_read_sql(2)).unwrap();
-            let memos: Vec<ProbeMemo> = q
-                .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
-                    Ok(ProbeMemo {
-                        outpoint: r.get(0)?,
-                        probed_at_ms: r.get(1)?,
-                        spent: r.get(2)?,
-                        spending_txid: r.get(3)?,
-                        spent_confirmed: r.get(4)?,
-                        tip_height: r
-                            .get::<_, Option<i64>>(5)?
-                            .and_then(|v| u64::try_from(v).ok()),
-                    })
-                })
-                .unwrap()
-                .map(Result::unwrap)
-                .collect();
-            let m = memos.iter().find(|m| m.outpoint == keys[0]).unwrap();
-            let clear = clear_unless_survived(m, reorg_clear_at(&memos), reorg_clear_reach(&memos));
-            confirmation_refused(m, clear)
+            judged(&conn, std::slice::from_ref(&key))[0]
         };
-        assert!(judged(&[(AT, Some(990))]), "refused under the deep clear");
-        assert!(
-            judged(&[(AT, Some(990)), (AT + 10 * min, Some(1_010))]),
-            "the word stays refused after the shallower clear"
+        assert_eq!(run(&[]), (true, false), "refused under the deep clear");
+        let later: [(&str, Vec<(i64, u64)>); 3] = [
+            (
+                "the shallower clear inside the grace",
+                vec![(AT + 10 * min, 1_010)],
+            ),
+            (
+                "a run of clears inside each other's grace",
+                vec![(AT + 10 * min, 1_010), (AT + 20 * min, 1_020)],
+            ),
+            (
+                "a clear a grace after the last",
+                vec![(AT + 10 * min + g, 1_013)],
+            ),
+        ];
+        for (what, clears) in &later {
+            assert!(!run(clears).1, "{what} never un-refuses it");
+        }
+        for (what, clears) in &later {
+            assert_eq!(run(clears), (false, false), "{what} writes it: unconfirmed");
+        }
+    }
+
+    /// Lens B's MEDIUM-1 shape (`lens_b_1_a_routine_clear_a_grace_later_unrefuses_with_no_event`): a deep clear at T
+    /// (reach 990), a lagging courier's confirmed find at T + 5 min (verified tip 1,000: refused), then a ROUTINE clear
+    /// at T + 31 min (reach 1,013, tip - 3) whose own reach does not cover the word. The routine clear WRITES the deep
+    /// clear's refusal (the word kept, unconfirmed, its key answered for its event) before its tombstone resets, so the
+    /// judgement never moves without an event. RED on 03c75ab5 (the stamp's refusals inert): `refused before, refused
+    /// after` (served again, the routine clear moving nothing).
+    #[test]
+    fn fix1044f1_lens_b_1_a_routine_clear_a_grace_later_never_unrefuses() {
+        let min = 60_000_i64;
+        let key = format!("{}:0", txid(1, true));
+        let conn = db();
+        clear(&conn, AT, 990);
+        plant(
+            &conn,
+            &key,
+            Word {
+                taken: AT + 5 * min,
+                tip: Some(1_000),
+            },
         );
+        assert_eq!(judged(&conn, std::slice::from_ref(&key))[0], (true, false));
+        let moved = clear(&conn, AT + 31 * min, 1_013);
         assert!(
-            judged(&[
-                (AT, Some(990)),
-                (AT + 10 * min, Some(1_010)),
-                (AT + 20 * min, Some(1_020))
-            ]),
-            "a run of clears inside each other's grace keeps the deepest"
+            !judged(&conn, std::slice::from_ref(&key))[0].1,
+            "refused before, refused after"
         );
+        assert_eq!(
+            moved,
+            vec![key.clone()],
+            "the refusal is written, by an event"
+        );
+        assert_eq!(judged(&conn, std::slice::from_ref(&key))[0], (false, false));
+    }
+
+    /// Lens B's LOW-1 shape (`lens_b_2_a_below_reach_word_after_the_stamp_flips_at_the_next_clear`): clear 1 at T, reach
+    /// 990; a confirmed find at T + 1 min whose verified tip 980 is below every reach (refused only for being taken
+    /// after the stamp, inside its grace); clear 2 at T + 10 min, reach 1,010 (the tombstone keeps 990). The word is
+    /// written refused at clear 2, never flipped to served with no event. RED on 03c75ab5 (the stamp's refusals inert):
+    /// `never flipped to served`.
+    #[test]
+    fn fix1044f1_lens_b_2_a_below_reach_word_after_the_stamp_never_flips() {
+        let min = 60_000_i64;
+        let key = format!("{}.0", txid(2, false));
+        let conn = db();
+        clear(&conn, AT, 990);
+        plant(
+            &conn,
+            &key,
+            Word {
+                taken: AT + min,
+                tip: Some(980),
+            },
+        );
+        assert_eq!(judged(&conn, std::slice::from_ref(&key))[0], (true, false));
+        let moved = clear(&conn, AT + 10 * min, 1_010);
+        assert!(
+            !judged(&conn, std::slice::from_ref(&key))[0].1,
+            "never flipped to served"
+        );
+        assert_eq!(moved, vec![key.clone()]);
+        assert_eq!(judged(&conn, std::slice::from_ref(&key))[0], (false, false));
+    }
+
+    /// THE TWO-CLEAR DIFFERENTIAL (lens C's `one-truth-single-clear`): the shipped clear (its stamp batch and its
+    /// framed writes) against the judge's complement over TWO clears, the second inside the first's grace and a grace
+    /// after it, at a shallower and a deeper floor. Words of every height around both reaches (and none), taken before
+    /// clear 1 (in the table at it, and as late finds written after its batch) and after it (inside and past its grace),
+    /// each as a memo and as evidence. After each clear: THE ONE TRUTH, the judge serves the confirmation of exactly
+    /// the words still confirmed in the table (no refusal is left implicit in the tombstone for any word it covers);
+    /// across the second clear, NO REFUSAL LAPSES (a word refused before it is refused after it), and the second clear
+    /// moves exactly the words refused before it plus those its own reach covers. RED on 03c75ab5 (the stamp's
+    /// refusals inert): `Word { taken: T + 1 ms, tip: Some(975) }, clear 2 at T+600000 floor 1013: a refusal lapsed
+    /// (before (true, false), after (true, true))` (lens B's LOW-1, inside the grace).
+    #[test]
+    fn fix1044f1_b_two_clears_one_truth_and_no_refusal_lapses() {
+        let min = 60_000_i64;
         let g = HOP_PROBE_MEMO_REORG_GRACE_MS;
-        assert!(
-            !judged(&[(AT, Some(990)), (AT + 10 * min + g, Some(1_010))]),
-            "a clear a grace after the last: its own reach, the word below it is its verdict"
-        );
+        let reach1 = 990_u64;
+        let mut tips: Vec<Option<u64>> = vec![None];
+        tips.extend([975, 983, 984, 990, 1_000, 1_006, 1_007, 1_008, 1_013, 1_020].map(Some));
+        for (second, floor2) in [
+            (AT + 10 * min, 1_013_u64),
+            (AT + 10 * min, 980),
+            (AT + g + min, 1_013),
+            (AT + g + min, 980),
+        ] {
+            let conn = db();
+            let mut before = Vec::new();
+            let mut after = Vec::new();
+            let mut n = 0;
+            let mut key = |evidence: bool| {
+                n += 1;
+                if evidence {
+                    format!("{}:0", txid(n, true))
+                } else {
+                    format!("{}.0", txid(n, false))
+                }
+            };
+            for tip in &tips {
+                for evidence in [false, true] {
+                    before.push((
+                        key(evidence),
+                        Word {
+                            taken: AT - 1,
+                            tip: *tip,
+                        },
+                    ));
+                    for taken in [AT - 1, AT + 1, AT + 5 * min, AT + g - 1, AT + g] {
+                        if taken < second {
+                            after.push((key(evidence), Word { taken, tip: *tip }));
+                        }
+                    }
+                }
+            }
+            for (k, w) in &before {
+                plant(&conn, k, *w);
+            }
+            clear(&conn, AT, reach1);
+            let keys: Vec<String> = before
+                .iter()
+                .chain(&after)
+                .map(|(k, _)| k.clone())
+                .collect();
+            let words: Vec<Word> = before.iter().chain(&after).map(|(_, w)| *w).collect();
+            let planted: Vec<String> = before.iter().map(|(k, _)| k.clone()).collect();
+            for (k, served) in planted.iter().zip(judged(&conn, &planted)) {
+                assert_eq!(served.0, served.1, "{k}: after clear 1, the one truth");
+            }
+            for (k, w) in &after {
+                plant(&conn, k, *w);
+            }
+            let s1 = judged(&conn, &keys);
+            let moved = clear(&conn, second, floor2);
+            let s2 = judged(&conn, &keys);
+            for (i, k) in keys.iter().enumerate() {
+                let ctx = format!(
+                    "{k} {:?}, clear 2 at T{:+} floor {floor2}",
+                    words[i],
+                    second - AT
+                );
+                assert_eq!(s2[i].0, s2[i].1, "{ctx}: after clear 2, the one truth");
+                if s1[i].0 && !s1[i].1 {
+                    assert!(
+                        !s2[i].1,
+                        "{ctx}: a refusal lapsed (before {:?}, after {:?})",
+                        s1[i], s2[i]
+                    );
+                    assert!(
+                        moved.contains(k),
+                        "{ctx}: refused before, so written by clear 2"
+                    );
+                }
+                let in_reach = words[i]
+                    .tip
+                    .is_none_or(|t| t + crate::owed::LATCH_RECHECK_DEPTH >= floor2);
+                if moved.contains(k) {
+                    assert!(
+                        s1[i].0 && (!s1[i].1 || in_reach),
+                        "{ctx}: clear 2 moved only what was refused or what its reach covers"
+                    );
+                } else if s1[i].0 {
+                    assert!(
+                        !in_reach && s1[i].1,
+                        "{ctx}: left standing only when served and out of reach"
+                    );
+                }
+            }
+        }
     }
 }

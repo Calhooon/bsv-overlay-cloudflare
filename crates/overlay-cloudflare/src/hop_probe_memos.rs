@@ -315,6 +315,55 @@ pub const HOP_PROBE_MEMO_REORG_MARK_SQL: &str = concat!(
     " THEN min(hop_chain_probes.tipHeight, excluded.tipHeight) WHEN excluded.probedAtMs >= hop_chain_probes.probedAtMs THEN excluded.tipHeight ELSE hop_chain_probes.tipHeight END, probedAtMs = MAX(hop_chain_probes.probedAtMs, excluded.probedAtMs)"
 );
 
+/// bsv-low #1044 fold 1 (the FIX-1044 ensemble's one class: lens B's MEDIUM-1 and LOW-1, lens A's `unrefuse-on-reset`,
+/// lens C's `gap-lapse`): THE STORED TOMBSTONE'S REFUSALS, as the judge reads them (`low-app-layer`
+/// `hops_view::clear_unless_survived` then `confirmation_refused`): a confirmed spend (a hop memo `<txid>.<vout>` or the
+/// belt's evidence `<txid>:<vout>`) taken before the stamp plus the grace, and NOT one the clear left standing (taken
+/// strictly before the stamp, under a reach, with a height whose `tipHeight + lag` is below it). Such a refusal lived
+/// only in the tombstone's `(stamp, reach)`, re-derived at every read, so the next tombstone write (a clear a grace or
+/// more later resets the reach; any later stamp moves `at` past a word taken inside the old grace) served its
+/// confirmation again with no write and no event. The rule: a judgement rests on durable evidence and never changes
+/// without an event, so each refusal is WRITTEN before the tombstone forgets it ([`HOP_PROBE_MEMO_REORG_STAMP`]).
+/// The proof latches (`proofmined:`) are not read here: the judge reads them through its own unrechecked grace
+/// (`owed::unrechecked_latch_honoured`), the next issue's.
+macro_rules! refused_pred {
+    () => {
+        concat!(
+            "spent = 1 AND spentConfirmed = 1 AND substr(outpoint,65,1) IN ('.',':') AND EXISTS (SELECT 1 FROM hop_chain_probes z WHERE z.outpoint='reorg-clear.0' AND hop_chain_probes.probedAtMs < z.probedAtMs + ",
+            reorg_grace_ms!(),
+            " AND NOT (hop_chain_probes.probedAtMs < z.probedAtMs AND z.tipHeight IS NOT NULL AND hop_chain_probes.tipHeight IS NOT NULL AND hop_chain_probes.tipHeight + ",
+            reorg_tip_lag!(),
+            " < z.tipHeight))"
+        )
+    };
+}
+
+/// bsv-low #1044 fold 1: the stored tombstone's refusals' marks (a confirmation withdrawn is a downgrade), the first
+/// statement of [`HOP_PROBE_MEMO_REORG_STAMP`]. No bind.
+pub const HOP_PROBE_MEMO_REORG_REFUSAL_MARK_SQL: &str = probe_marks!(refused_pred!());
+/// bsv-low #1044 fold 1: the stored tombstone's refusals WRITTEN: each row kept, its confirmation taken
+/// (`spentConfirmed` NULL, unknown), memos and evidence alike (#1027's rule, a stale proof is never an absent one), so
+/// both judges read it as they read it under the stored tombstone (spent, its spender, no confirmation) and the belt
+/// asks the outpoint again; answers the keys it demoted (each noted `probe`). No bind.
+pub const HOP_PROBE_MEMO_REORG_REFUSAL_DEMOTE_SQL: &str = concat!(
+    "UPDATE hop_chain_probes SET spentConfirmed=NULL WHERE ",
+    refused_pred!(),
+    " RETURNING outpoint"
+);
+/// bsv-low #1044 fold 1: rule 3 as one batch (one D1 transaction): the stored tombstone's refusals marked and
+/// written, THEN the tombstone stamped (binds of the last statement only: now, ms; the clear's reach). So a tombstone
+/// write moves no judgement: every word it could have un-refused is unconfirmed already, by an event. A batch that
+/// faults writes neither (the stored tombstone stands, and with it every refusal it holds).
+pub const HOP_PROBE_MEMO_REORG_STAMP: [&str; 3] = [
+    HOP_PROBE_MEMO_REORG_REFUSAL_MARK_SQL,
+    HOP_PROBE_MEMO_REORG_REFUSAL_DEMOTE_SQL,
+    HOP_PROBE_MEMO_REORG_MARK_SQL,
+];
+
+/// bsv-low #1044 fold 1: the rows the stamp's batch demoted (the stored tombstone's refusals written); seeded at 0,
+/// served `/health/invariants.reorgClear.refusalsWritten`.
+pub const COUNTER_HOP_PROBE_REFUSALS_WRITTEN: &str = "hop_probe_refusals_written_by_reorg_total";
+
 /// Confirmed memos a reorg pass cleared (served on `/health/invariants.arcadeReorg.probeMemosCleared` and with
 /// the counters). Round 2's NIT-1: the lifetime row MIXES two meanings across the FIX-1027 deploy: before it the clear
 /// deleted the belt's evidence too and counted it here; after it this counts memos and latches only and the evidence
@@ -375,27 +424,34 @@ pub fn feed_pass_rejudged(s: &crate::chain_feed::FeedPassSummary) -> bool {
         || proof_leg_rejudged(&s.transactions)
 }
 
-async fn delete(db: &D1Database, sql: &str, binds: &[JsValue]) -> Result<u64, String> {
-    let stmt = db.prepare(sql);
-    let stmt = if binds.is_empty() {
-        stmt
-    } else {
-        stmt.bind(binds).map_err(|e| e.to_string())?
-    };
-    let res = crate::d1_ledger::Counted::counted_run(&stmt)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(res
-        .meta()
-        .ok()
-        .flatten()
-        .and_then(|m| m.changes)
-        .unwrap_or(0) as u64)
-}
-
 #[derive(serde::Deserialize)]
 struct Deleted {
     outpoint: String,
+}
+
+/// bsv-low #1044 fold 1: [`HOP_PROBE_MEMO_REORG_STAMP`] as one batch; notes each key it demoted (its mark written in
+/// the same transaction). Returns the refusals written.
+async fn stamp(db: &D1Database, now_ms: f64, floor: u64) -> Result<u64, String> {
+    let [marks, demote, mark] = HOP_PROBE_MEMO_REORG_STAMP;
+    let tomb = db
+        .prepare(mark)
+        .bind(&[JsValue::from_f64(now_ms), JsValue::from_f64(floor as f64)])
+        .map_err(|e| e.to_string())?;
+    let out =
+        crate::d1_ledger::counted_batch(db, vec![db.prepare(marks), db.prepare(demote), tomb])
+            .await
+            .map_err(|e| e.to_string())?;
+    let written: Vec<Deleted> = out
+        .get(1)
+        .ok_or("the refusals' write answered nothing")?
+        .results()
+        .map_err(|e| e.to_string())?;
+    for d in &written {
+        if noted_key(false, &d.outpoint) {
+            crate::owed_events::note(PROBE_SOURCE, &d.outpoint);
+        }
+    }
+    Ok(written.len() as u64)
 }
 
 /// FIX-1010: one batch, the marks first then the framed writes that answer their keys (D1 runs a batch as one
@@ -523,16 +579,19 @@ pub async fn clear_on_reorg(db: &D1Database, origin: &str, reach: ReorgReach) ->
     let Some(floor) = reach else {
         return 0;
     };
-    // rule 3: the tombstone FIRST (a memo the delete misses is then held to the short window by its stamp)
+    // rule 3: the tombstone FIRST (a memo the delete misses is then held to the short window by its stamp), and
+    // before it, in its batch, the stored tombstone's refusals written (bsv-low #1044 fold 1)
     let now_ms = worker::Date::now().as_millis() as f64;
-    if let Err(e) = delete(
-        db,
-        HOP_PROBE_MEMO_REORG_MARK_SQL,
-        &[JsValue::from_f64(now_ms), JsValue::from_f64(floor as f64)],
-    )
-    .await
-    {
-        console_log!("[hop-probe-memos] ({origin}) reorg tombstone write FAILED (a memo re-written right after this clear keeps the long window): {e}");
+    match stamp(db, now_ms, floor).await {
+        Ok(written) => {
+            if written > 0 {
+                console_log!("[hop-probe-memos] ({origin}) reorg tombstone: wrote {written} refusal(s) of the last clear before its stamp moved (bsv-low #1044): each kept unconfirmed, marked, the belt re-asks it");
+            }
+            crate::ops::bump_counter(db, COUNTER_HOP_PROBE_REFUSALS_WRITTEN, written).await;
+        }
+        Err(e) => {
+            console_log!("[hop-probe-memos] ({origin}) reorg tombstone write FAILED (the last tombstone stands with its refusals; a memo re-written right after this clear keeps the long window): {e}");
+        }
     }
     match marked_delete(
         db,
@@ -870,9 +929,11 @@ mod tests {
         let body = &src[src.find("pub async fn clear_on_reorg(").unwrap()..];
         // FIX-1010: the clear runs as its batch (the marks, then the framed delete), the same predicate as the clear
         assert!(
-            body.find("HOP_PROBE_MEMO_REORG_MARK_SQL").unwrap()
+            body.find("stamp(db, now_ms, floor)").unwrap()
                 < body.find("HOP_PROBE_MEMO_REORG_CLEAR_MARK_SQL").unwrap()
         );
+        // bsv-low #1044 fold 1: the tombstone is the LAST statement of its batch, after the refusals it would forget
+        assert_eq!(HOP_PROBE_MEMO_REORG_STAMP[2], HOP_PROBE_MEMO_REORG_MARK_SQL);
         assert_eq!(
             HOP_PROBE_MEMO_REORG_CLEAR_FRAMED_SQL,
             format!("{HOP_PROBE_MEMO_REORG_CLEAR_SQL} RETURNING outpoint")
