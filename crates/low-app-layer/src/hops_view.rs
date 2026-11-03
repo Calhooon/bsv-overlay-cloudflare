@@ -4199,7 +4199,8 @@ mod fix1044 {
                             tip: *tip,
                         },
                     ));
-                    for taken in [AT - 1, AT + 1, AT + 5 * min, AT + g - 1, AT + g] {
+                    // bsv-low #1062 (the FIX-1044 delta lens's LOW-2): `AT`, a late find taken at clear 1's stamp
+                    for taken in [AT - 1, AT, AT + 1, AT + 5 * min, AT + g - 1, AT + g] {
                         if taken < second {
                             after.push((key(evidence), Word { taken, tip: *tip }));
                         }
@@ -4260,5 +4261,115 @@ mod fix1044 {
                 }
             }
         }
+    }
+
+    /// bsv-low #1062 (the FIX-1044 delta lens's LOW-1, its scratch pin stated as the rule): ONCE THE NEXT CLEAR WRITES A
+    /// REFUSAL, THE REFUSED RIVAL WORD NO LONGER SETS ASIDE AN INDEX-PROVEN SWEEP'S PROOF, AND THE CHANGE COMES WITH A
+    /// DOWNGRADE EVENT. Under clear 1 a rival's confirmed word taken inside its grace (T + 5 min, tip 1,000, reach 990)
+    /// is REFUSED, so D2-M1 (`set_aside_proofs_a_refused_word_contradicts`) sets the hop's filed, index-proven sweep's
+    /// proof aside. The next clear (a grace later) WRITES that refusal (`spentConfirmed` NULL, the stamp's batch): the
+    /// word is then a spent, unconfirmed word (no longer "refused"), so the proof stands, as it stands under #1027's
+    /// in-reach demotion (round 2's NOTE-2). Never silent: the stamp answers the key it demoted and marks the hop's
+    /// seat as a DOWNGRADE in the same batch (the event both judges re-judge on), and the belt re-asks the outpoint
+    /// (`rests_on_unconfirmed_find`); a confirmed rival find restores the contradiction by its own write.
+    #[test]
+    fn lows1062_a_a_written_refusal_ends_the_proof_set_aside_by_a_downgrade_event() {
+        let min = 60_000_i64;
+        let g = HOP_PROBE_MEMO_REORG_GRACE_MS;
+        let key = format!("{}.0", txid(7, false));
+        let hop = key.trim_end_matches(".0").to_string();
+        let conn = db();
+        conn.execute_batch(&format!(
+            "INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt) VALUES('seat','opp','g',0,1000,'k','s','i',2,'{hop}',0,1);"
+        ))
+        .unwrap();
+        clear(&conn, AT, 990);
+        plant(
+            &conn,
+            &key,
+            Word {
+                taken: AT + 5 * min,
+                tip: Some(1_000),
+            },
+        );
+        conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        let set_aside = |conn: &rusqlite::Connection| -> (bool, bool) {
+            let all = [key.clone(), PROBE_MEMO_REORG_MARK.to_string()];
+            let mut q = conn.prepare(&probe_memo_read_sql(all.len())).unwrap();
+            let memos: Vec<ProbeMemo> = q
+                .query_map(rusqlite::params_from_iter(all.iter()), |r| {
+                    Ok(ProbeMemo {
+                        outpoint: r.get(0)?,
+                        probed_at_ms: r.get(1)?,
+                        spent: r.get(2)?,
+                        spending_txid: r.get(3)?,
+                        spent_confirmed: r.get(4)?,
+                        tip_height: r
+                            .get::<_, Option<i64>>(5)?
+                            .and_then(|v| u64::try_from(v).ok()),
+                    })
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let (at, reach) = (reorg_clear_at(&memos), reorg_clear_reach(&memos));
+            let m = memos.iter().find(|m| m.outpoint == key).unwrap();
+            let refused = confirmation_refused(m, clear_unless_survived(m, at, reach));
+            let mut words = std::collections::HashMap::new();
+            if refused {
+                words.insert(format!("{hop}:0"), m.spending_txid.clone());
+            }
+            let mut sweeps = std::collections::HashMap::new();
+            sweeps.insert(
+                format!("{hop}:0"),
+                crate::hopsweep::FiledHopSweep {
+                    sweep_txid: "ab".repeat(32),
+                    raw_hex: String::new(),
+                    pays_sats: Some(20_000),
+                    index_proven: true,
+                    index_proof_height: Some(1_000),
+                    filed_at_ms: None,
+                },
+            );
+            let aside = set_aside_proofs_a_refused_word_contradicts(&mut sweeps, &words);
+            (refused, !aside.is_empty())
+        };
+        assert_eq!(
+            set_aside(&conn),
+            (true, true),
+            "under clear 1: refused, the proof set aside"
+        );
+        let moved = clear(&conn, AT + 10 * min + g, 1_013);
+        assert!(
+            moved.contains(&key),
+            "the next clear writes the refusal: {moved:?}"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT spentConfirmed FROM hop_chain_probes WHERE outpoint=?1",
+                [&key],
+                |r| r.get::<_, Option<i64>>(0)
+            )
+            .unwrap(),
+            None,
+            "kept, its confirmation taken"
+        );
+        assert_eq!(
+            set_aside(&conn),
+            (false, false),
+            "a written refusal is no longer refused: the proof stands"
+        );
+        let marks: Vec<(String, String, String, i64)> = conn
+            .prepare("SELECT identity,source,sourceKey,downgrade FROM owed_dirty")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            marks,
+            vec![("seat".to_string(), "probe".to_string(), key.clone(), 1)],
+            "by an event: the seat marked, a downgrade, in the clear's batch"
+        );
     }
 }

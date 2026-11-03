@@ -661,10 +661,12 @@ mod pins {
     /// MOVES. Clear 1 at T, reach 990, its batch run before any word below; then, written after it: the belt's lagging
     /// find of the marked hop (`<HOP>:1`, taken T + 5 min at tip 1,000: inside the grace and reach), a below-reach word
     /// taken after the stamp (T + 1 min, tip 980), a late find taken before the stamp inside the reach (T - 1, tip
-    /// 1,000), a word clear 1 left standing (T - 1, tip 900), a word past the grace, an unconfirmed spend. The next
-    /// stamp (a routine clear a grace later, reach 1,013) demotes exactly the three refused, answers their keys and
-    /// marks the hop's seat as a downgrade, in its one batch, the tombstone LAST; the other three are untouched. RED
-    /// with the stamp's refusals inert (03c75ab5's tombstone write alone): `left: [] right: [.., .., ..]`.
+    /// 1,000), a word clear 1 left standing (T - 1, tip 900), a word past the grace, an unconfirmed spend; and
+    /// (bsv-low #1062) a word taken AT clear 1's stamp below its reach, and two confirmed latches of another key shape.
+    /// The next stamp (a routine clear a grace later, reach 1,013) demotes exactly the four refused, answers their keys
+    /// and marks the hop's seat as a downgrade, in its one batch, the tombstone LAST; the other five are untouched. RED
+    /// with the stamp's refusals inert (03c75ab5's tombstone write alone): `left: [] right: [.., .., ..]`; RED with the
+    /// stamp edge `<` made `<=` (the at-stamp word kept) and with the key-shape filter dropped (both latches demoted).
     #[test]
     fn fix1044f1_a_the_stamp_writes_the_last_clears_refusals_before_it_moves() {
         use crate::hop_probe_memos::*;
@@ -694,13 +696,31 @@ mod pins {
             stamp(&db, t, 990.0).is_empty(),
             "no tombstone yet: nothing refused"
         );
-        let words: [(String, i64, Option<bool>, i64); 6] = [
+        let words: [(String, i64, Option<bool>, i64); 9] = [
             (format!("{HOP}:1"), t + 5 * min, Some(true), 1_000),
             (format!("{}.0", "b1".repeat(32)), t + min, Some(true), 980),
             (format!("{}:0", "c1".repeat(32)), t - 1, Some(true), 1_000),
             (format!("{}.0", "d1".repeat(32)), t - 1, Some(true), 900),
             (format!("{}.0", "e1".repeat(32)), t + g, Some(true), 1_000),
             (format!("{}.0", "f1".repeat(32)), t + min, None, 1_000),
+            // bsv-low #1062 (the FIX-1044 delta lens's LOW-2): a word taken AT clear 1's stamp, below its reach: not
+            // strictly before the stamp, so the judge refuses it (`clear_unless_survived` is strict) and the stamp
+            // writes it. RED with the predicate's `<` made `<=` (the word left confirmed).
+            (format!("{}.0", "a2".repeat(32)), t, Some(true), 900),
+            // bsv-low #1062 (LOW-3): the app layer's own confirmed latches (`homeproof:`, `proofmined:`), inside the
+            // grace: no hop key's shape, so never a refusal of this clear. RED with the key-shape filter dropped.
+            (
+                format!("homeproof:{}", "a3".repeat(32)),
+                t + min,
+                Some(true),
+                1_000,
+            ),
+            (
+                format!("proofmined:{}.1000", "a4".repeat(32)),
+                t + min,
+                Some(true),
+                1_000,
+            ),
         ];
         for (k, at, c, tip) in &words {
             db.conn
@@ -711,12 +731,17 @@ mod pins {
                 .unwrap();
         }
         db.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
-        let mut want = vec![words[0].0.clone(), words[1].0.clone(), words[2].0.clone()];
+        let mut want = vec![
+            words[0].0.clone(),
+            words[1].0.clone(),
+            words[2].0.clone(),
+            words[6].0.clone(),
+        ];
         want.sort();
         assert_eq!(
             stamp(&db, t + g + min, 1_013.0),
             want,
-            "the three refusals written"
+            "the four refusals written"
         );
         let confirmed: Vec<(String, Option<i64>)> = db
             .conn
@@ -726,7 +751,7 @@ mod pins {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(confirmed.len(), 6, "kept: none deleted");
+        assert_eq!(confirmed.len(), words.len(), "kept: none deleted");
         for (k, c) in &confirmed {
             let refused = want.contains(k);
             let planted = words.iter().find(|w| &w.0 == k).unwrap().2;

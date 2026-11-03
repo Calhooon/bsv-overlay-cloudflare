@@ -177,9 +177,15 @@ pub const COUNTER_YOUNG_ROWS: &str = "owed_belt_young_rows";
 /// FIX-1057-FOLD-1 (the FIX-1057 ensemble's C LOW-3, A LOW-1, B LOW-1): GAUGES, set each tick: the AGE (ms) of the
 /// oldest due row the tick READ, by class: the first class (the block-dated courier-only sweeps), the second class's
 /// rows that are not young, and its young rows ([`OldestDue`]). Stored as the age PLUS ONE, `0` where the tick read no
-/// due row of the class (the overlay's counter read clamps a negative to 0; served `null` there, the age otherwise). A class the others starve shows as its age growing tick after tick while `due` does not fall: under a
-/// first-class flood with young rows due, the second class's rows that are not young drain one a tick, and
-/// `oldestDueAgeMs.second` grows by about a tick for every such row queued ahead of the oldest.
+/// due row of the class (the overlay's counter read clamps a negative to 0; served `null` there, the age otherwise).
+/// A class the others starve shows as its age growing tick after tick while `due` does not fall: under a first-class
+/// flood with young rows due, the second class's rows that are not young drain one a tick, and
+/// `oldestDueAgeMs.second` grows by about a tick for every such row queued ahead of the oldest. bsv-low #1063 (the
+/// FIX-1057 delta lens's NOTE-1): the meaning moves with the phase. In Phase C the tick reads the actors' asks
+/// ([`ask_candidates`]), which have no first-class walk: every due ask is second or young, so `first` is always `0`
+/// (served `null`) and the block-dated courier-only sweeps an actor publishes count under `second`. NOTE-2: a tick
+/// with no chain tip returns before the gauge batch, so all three ages (and the young gauge) keep the last tick's
+/// values through a tip outage.
 pub const COUNTER_OLDEST_DUE_FIRST: &str = "owed_belt_oldest_due_age_ms_first";
 pub const COUNTER_OLDEST_DUE_SECOND: &str = "owed_belt_oldest_due_age_ms_second";
 pub const COUNTER_OLDEST_DUE_YOUNG: &str = "owed_belt_oldest_due_age_ms_young";
