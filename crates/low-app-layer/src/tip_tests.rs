@@ -292,16 +292,20 @@ async fn tip877_unavailable_is_named_503_with_and_without_last_known_tip() {
             || AT + 60_123,
         )
         .await;
-        assert_eq!(reply.status, 503);
-        assert_eq!(reply.body["code"], "ERR_TIP_UNAVAILABLE");
-        assert_eq!(reply.body["stale"], true);
-        assert_eq!(reply.retry_after, Some("60"));
         if last_known.is_some() {
+            // bsv-low #1081: a transport fault serves the fresh memo, 200.
+            assert_eq!(reply.status, 200);
+            assert_eq!(reply.body["servedFrom"], "memo");
+            assert_eq!(reply.body["freshness"], "fresh");
             assert_eq!(reply.body["height"], VERIFIED_HEIGHT);
             assert_eq!(reply.body["hash"], tip().hash);
             assert_eq!(reply.body["at"], AT);
             assert_eq!(reply.body["ageMs"], 60_123);
         } else {
+            assert_eq!(reply.status, 503);
+            assert_eq!(reply.body["code"], "ERR_TIP_UNAVAILABLE");
+            assert_eq!(reply.body["stale"], true);
+            assert_eq!(reply.retry_after, Some("60"));
             assert!(reply.body["height"].is_null());
             assert!(reply.body["ageMs"].is_null());
         }
@@ -363,11 +367,20 @@ async fn tip877_http_error_and_malformed_snapshot_cannot_serve_courier_max() {
             || AT + 123,
         )
         .await;
-        assert_eq!(reply.status, 503, "{status}: {frame}");
-        assert_eq!(reply.body["code"], "ERR_TIP_UNAVAILABLE");
+        // bsv-low #1081: the store's 5xx is a read fault, the fresh memo's
+        // case; a frame that does not check is the store's word, a 503.
+        let faulted = status >= 500;
+        assert_eq!(
+            reply.status,
+            if faulted { 200 } else { 503 },
+            "{status}: {frame}"
+        );
         assert_eq!(reply.body["height"], VERIFIED_HEIGHT);
         assert_eq!(reply.body["ageMs"], 123);
-        assert_eq!(reply.body["stale"], true);
+        if !faulted {
+            assert_eq!(reply.body["code"], "ERR_TIP_UNAVAILABLE");
+            assert_eq!(reply.body["stale"], true);
+        }
     }
 }
 
@@ -439,12 +452,13 @@ async fn tip877_last_known_follows_a_lower_verified_tip_and_keeps_its_pass_age()
         || AT + 20,
     )
     .await;
-    assert_eq!(unavailable.status, 503);
+    // bsv-low #1081: the transport fault serves the memo, the lower tip.
+    assert_eq!(unavailable.status, 200);
+    assert_eq!(unavailable.body["servedFrom"], "memo");
     assert_eq!(unavailable.body["height"], VERIFIED_HEIGHT - 2);
     assert_eq!(unavailable.body["hash"], "03".repeat(32));
     assert_eq!(unavailable.body["at"], AT - 1_000);
     assert_eq!(unavailable.body["ageMs"], 20);
-    assert_eq!(unavailable.body["stale"], true);
 }
 
 #[tokio::test]
@@ -478,10 +492,11 @@ async fn tip877_failure_reads_last_known_after_the_await() {
         || AT + 123,
     )
     .await;
-    assert_eq!(reply.status, 503);
+    // bsv-low #1081: the memo learned during the read is served, fresh.
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body["servedFrom"], "memo");
     assert_eq!(reply.body["height"], VERIFIED_HEIGHT);
     assert_eq!(reply.body["ageMs"], 123);
-    assert_eq!(reply.body["stale"], true);
 }
 
 #[tokio::test]
@@ -572,8 +587,17 @@ async fn tip877_fold_pass_frames_and_their_timestamps_must_be_usable() {
             || AT + 123,
         )
         .await;
-        assert_eq!(reply.status, 503, "{status}: {sync}");
-        assert_eq!(reply.body["stale"], true);
+        // bsv-low #1081: the store's 5xx is the fresh memo's case.
+        let faulted = status >= 500;
+        assert_eq!(
+            reply.status,
+            if faulted { 200 } else { 503 },
+            "{status}: {sync}"
+        );
+        assert_eq!(
+            reply.body["stale"],
+            if faulted { Value::Null } else { json!(true) }
+        );
         assert_eq!(reply.body["ageMs"], 123);
     }
     for stamp in [
@@ -626,7 +650,12 @@ async fn tip877_fold_tip_is_bound_to_the_active_header_at_its_height() {
             || AT + 123,
         )
         .await;
-        assert_eq!(reply.status, 503, "{status}: {active}");
+        // bsv-low #1081: the store's 5xx is the fresh memo's case.
+        assert_eq!(
+            reply.status,
+            if status >= 500 { 200 } else { 503 },
+            "{status}: {active}"
+        );
     }
 }
 
@@ -675,4 +704,161 @@ async fn tip877_fold_a_pass_refresh_is_not_read_by_the_proof_snapshot() {
     .await;
     assert_eq!(snapshot.tip_height().unwrap(), VERIFIED_HEIGHT);
     assert_eq!(reads.get(), 0);
+}
+
+// ── bsv-low #1081: a read fault serves the isolate's last fresh snapshot ──
+
+fn memo_at(pass_age_ms: u64) -> VerifiedTip {
+    VerifiedTip {
+        last_pass_at: Some(AT - pass_age_ms),
+        ..tip()
+    }
+}
+
+#[tokio::test]
+async fn fix1081_a_an_aborted_read_with_a_ten_second_old_memo_serves_200_fresh() {
+    // The store canceled the read (L59 pair 29, 20:00:26Z) and the transport
+    // answered an error; the memo's pass is 10 s old.
+    let reply = tip_reply_with(
+        |_| {
+            ready(Err(HeaderError(
+                "canceled: the caller closed the connection before the answer was sent".into(),
+            )))
+        },
+        || Some(memo_at(10_000)),
+        || AT,
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["freshness"], "fresh");
+    assert_eq!(reply.body["ageMs"], 10_000);
+    assert_eq!(reply.body["height"], VERIFIED_HEIGHT);
+    assert_eq!(reply.body["hash"], tip().hash);
+    assert!(reply.body.get("code").is_none());
+    assert_eq!(reply.retry_after, None);
+}
+
+#[tokio::test]
+async fn fix1081_c_a_memo_past_the_bar_serves_503_stale() {
+    let reply = tip_reply_with(
+        |_| ready(Err(HeaderError("transport".into()))),
+        || Some(memo_at(FRESHNESS_MS + 1)),
+        || AT,
+    )
+    .await;
+    assert_eq!(reply.status, 503);
+    assert_eq!(reply.body["freshness"], "stale");
+    assert_eq!(reply.body["code"], "ERR_TIP_UNAVAILABLE");
+    assert_eq!(reply.body["ageMs"], FRESHNESS_MS + 1);
+    assert_eq!(reply.retry_after, Some("60"));
+}
+
+#[tokio::test]
+async fn fix1081_b_a_read_past_the_deadline_serves_the_memo_and_names_it() {
+    let reply = super::tip_reply_within(
+        |_| std::future::pending(),
+        || Some(memo_at(10_000)),
+        || AT,
+        ready(()),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["servedFrom"], "memo");
+    assert_eq!(reply.body["ageMs"], 10_000);
+    let fault = reply.body["readFault"].as_str().unwrap();
+    assert!(fault.contains("3000 ms deadline"), "{fault}");
+    assert!(reply.reason.as_deref().unwrap().contains("deadline"));
+    // No memo: the deadline is the 503's reason.
+    let reply =
+        super::tip_reply_within(|_| std::future::pending(), || None, || AT, ready(())).await;
+    assert_eq!(reply.status, 503);
+    let reason = reply.reason.unwrap();
+    assert!(
+        reason.contains("deadline") && reason.contains("no memo"),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
+async fn fix1081_d_every_503_names_its_reason_and_the_route_logs_it() {
+    // The store's status (a 5xx), the transport, a frame that does not check,
+    // and the freshness bar: each 503 carries its reason in the reply and body.
+    let cases: Vec<(
+        &str,
+        Box<dyn Fn(String) -> Result<(u16, Value), HeaderError>>,
+        Option<VerifiedTip>,
+        &str,
+    )> = vec![
+        (
+            "5xx",
+            Box::new(|route| {
+                if route == "getInfo" {
+                    Ok((503, Value::Null))
+                } else {
+                    response(route, header())
+                }
+            }),
+            None,
+            "getInfo: the store answered HTTP 503",
+        ),
+        (
+            "transport",
+            Box::new(|_| Err(HeaderError("canceled".into()))),
+            Some(memo_at(FRESHNESS_MS + 5)),
+            "the memo is not fresh",
+        ),
+        (
+            "disagree",
+            Box::new(|route| {
+                if route.starts_with("findHeaderHexForHeight?") {
+                    let mut h = header();
+                    h["value"]["hash"] = json!("03".repeat(32));
+                    Ok((200, h))
+                } else {
+                    response(route, header())
+                }
+            }),
+            Some(memo_at(10)),
+            "did not check",
+        ),
+        (
+            "stale",
+            Box::new(|route| response(route, header())),
+            None,
+            "past the 1800000 ms bar",
+        ),
+    ];
+    for (name, get, memo, needle) in cases {
+        let reply = tip_reply_with(
+            |route| ready(get(route)),
+            || memo.clone(),
+            || AT + FRESHNESS_MS + 1,
+        )
+        .await;
+        assert_eq!(reply.status, 503, "{name}: {}", reply.body);
+        let reason = reply.reason.clone().unwrap_or_default();
+        assert!(reason.contains(needle), "{name}: {reason}");
+        assert_eq!(reply.body["reason"], json!(reason), "{name}");
+    }
+    // The handler logs the reason of every answer that carries one.
+    let source = include_str!("routes.rs");
+    let handler = source
+        .split("pub async fn tip(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(
+        handler.contains("log_tip_reply(&reply)"),
+        "the /tip handler logs its reason"
+    );
+    let log = source
+        .split("fn log_tip_reply(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(log.contains("console_warn!(\"[tip] 503 ERR_TIP_UNAVAILABLE: {reason}\")"));
 }

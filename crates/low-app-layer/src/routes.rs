@@ -656,9 +656,13 @@ where
 }
 
 /// `GET /tip`: the proof tracker's verified header tip and its pass age.
-/// An unavailable or over-age snapshot is a named 503, with diagnostics only.
+/// An unavailable or over-age snapshot is a named 503, with diagnostics only;
+/// every 503 logs its reason (bsv-low #1081). A read that faults or passes
+/// [`TIP_READ_DEADLINE_MS`] serves the isolate's last fresh snapshot with its
+/// true age when that snapshot is still fresh.
 pub async fn tip(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response> {
     let reply = tip_reply_env(&ctx.env).await;
+    log_tip_reply(&reply);
     let mut response = json_response(reply.body.to_string(), reply.status)?;
     if let Some(retry_after) = reply.retry_after {
         response.headers_mut().set("Retry-After", retry_after)?;
@@ -666,11 +670,25 @@ pub async fn tip(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response
     Ok(response)
 }
 
+/// The one log line of a `/tip` answer that is not a plain live 200: a 503
+/// names its reason (the read's outcome, the deadline, the store's status, the
+/// freshness bar), and a 200 served from the memo names the read's fault.
+fn log_tip_reply(reply: &TipReply) {
+    if let Some(reason) = &reply.reason {
+        if reply.status == 503 {
+            console_warn!("[tip] 503 ERR_TIP_UNAVAILABLE: {reason}");
+        } else {
+            console_warn!("[tip] {} from the isolate's memo: {reason}", reply.status);
+        }
+    }
+}
+
 async fn tip_reply_env(env: &worker::Env) -> TipReply {
-    tip_reply_with(
+    tip_reply_within(
         |route| async move { crate::tracker_host::chaintracks_get(env, &route).await },
         crate::tracker_host::last_verified_tip,
         || worker::Date::now().as_millis(),
+        worker::Delay::from(core::time::Duration::from_millis(TIP_READ_DEADLINE_MS)),
     )
     .await
 }
@@ -678,13 +696,24 @@ async fn tip_reply_env(env: &worker::Env) -> TipReply {
 const TIP_MAX_AGE_MS: u64 = 30 * 60 * 1_000;
 const TIP_REORG_MARGIN: u32 = 1;
 const TIP_RETRY_AFTER_SECS: &str = "60";
+/// The whole snapshot's deadline (three reads in a row: the tip, `getInfo`,
+/// the active header at the tip's height). The store answers a read in about
+/// 100 to 325 ms at its p95 under the loop's load (bsv-low #1081, the keeper's
+/// figure: about five reads a second, bursts of thirty, none slowed), so three
+/// reads sit well inside it; past it the read is the memo's case, never a
+/// wait for the platform's.
+pub(crate) const TIP_READ_DEADLINE_MS: u64 = 3_000;
 
 struct TipReply {
     status: u16,
     body: serde_json::Value,
     retry_after: Option<&'static str>,
+    /// Why the answer is not a plain live 200 (every 503, and a 200 served
+    /// from the memo); logged by [`log_tip_reply`].
+    reason: Option<String>,
 }
 
+#[cfg(test)]
 async fn tip_reply_with<G, F, L, N>(get: G, last_known: L, now_ms: N) -> TipReply
 where
     G: Fn(String) -> F,
@@ -694,16 +723,109 @@ where
     L: FnOnce() -> Option<crate::tracker_host::VerifiedTip>,
     N: FnOnce() -> u64,
 {
-    let current = crate::tracker_host::tip_snapshot_with(get).await.ok();
+    tip_reply_within(get, last_known, now_ms, std::future::pending::<()>()).await
+}
+
+/// The freshness bar of one snapshot: `Ok` when it may be served, `Err`
+/// naming why it may not. The pass age, then the store's own courier lag.
+fn tip_verdict(
+    tip: &crate::tracker_host::VerifiedTip,
+    now: u64,
+) -> std::result::Result<(), String> {
+    if let Some(at) = tip.last_pass_at {
+        let age = now.saturating_sub(at);
+        if age > TIP_MAX_AGE_MS {
+            return Err(format!(
+                "the store's last pass is {age} ms old, past the {TIP_MAX_AGE_MS} ms bar"
+            ));
+        }
+    }
+    if let Some(seen) = tip.last_seen_height {
+        if seen > tip.height.saturating_add(TIP_REORG_MARGIN) {
+            return Err(format!(
+                "the verified tip {} trails the couriers' seen height {seen} by {} blocks",
+                tip.height,
+                seen - tip.height
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn tip_reply_within<G, F, L, N, D>(get: G, last_known: L, now_ms: N, deadline: D) -> TipReply
+where
+    G: Fn(String) -> F,
+    F: std::future::Future<
+        Output = std::result::Result<(u16, serde_json::Value), bsv_tracker::HeaderError>,
+    >,
+    L: FnOnce() -> Option<crate::tracker_host::VerifiedTip>,
+    N: FnOnce() -> u64,
+    D: std::future::Future<Output = ()>,
+{
+    // A FAULT of the read (a transport error, the store's 5xx, the deadline)
+    // is the memo's case; an answer the store gave that does not check (a
+    // malformed or disagreeing frame, a 404) is not: the store's own word.
+    let fault: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+    let watched = |route: String| {
+        let read = get(route.clone());
+        let fault = &fault;
+        async move {
+            let answer = read.await;
+            let seen = match &answer {
+                Err(e) => Some(format!("{route}: the read failed: {}", e.0)),
+                Ok((status, _)) if *status >= 500 => {
+                    Some(format!("{route}: the store answered HTTP {status}"))
+                }
+                _ => None,
+            };
+            if let Some(seen) = seen {
+                fault.borrow_mut().get_or_insert(seen);
+            }
+            answer
+        }
+    };
+    let snapshot = crate::tracker_host::tip_snapshot_with(watched);
+    futures_util::pin_mut!(snapshot, deadline);
+    let read = match futures_util::future::select(snapshot, deadline).await {
+        futures_util::future::Either::Left((read, _)) => Some(read),
+        futures_util::future::Either::Right(_) => None,
+    };
     let last_known = last_known();
     let now = now_ms();
-    let available = current.as_ref().is_some_and(|tip| {
-        tip.last_pass_at
-            .is_none_or(|at| now.saturating_sub(at) <= TIP_MAX_AGE_MS)
-            && tip
-                .last_seen_height
-                .is_none_or(|height| height <= tip.height.saturating_add(TIP_REORG_MARGIN))
-    });
+    let (current, live_reason, read_fault) = match read {
+        Some(Ok(tip)) => {
+            let verdict = tip_verdict(&tip, now).err();
+            (Some(tip), verdict, None)
+        }
+        Some(Err(e)) => {
+            let fault = fault.borrow().clone();
+            let reason = fault
+                .clone()
+                .unwrap_or_else(|| format!("the snapshot did not check: {}", e.0));
+            (None, Some(reason), fault)
+        }
+        None => {
+            let reason = format!("no answer within the {TIP_READ_DEADLINE_MS} ms deadline");
+            (None, Some(reason.clone()), Some(reason))
+        }
+    };
+    // #1081: a read FAULT serves the last fresh snapshot with its true age,
+    // judged by the same bar; never one without a pass stamp (no age).
+    if let (Some(fault), Some(memo)) = (&read_fault, last_known.as_ref()) {
+        if memo.last_pass_at.is_some() && tip_verdict(memo, now).is_ok() {
+            let mut body = tip_body(Some(memo), now);
+            body["freshness"] = serde_json::json!("fresh");
+            body["servedFrom"] = serde_json::json!("memo");
+            body["readFault"] = serde_json::json!(fault);
+            return TipReply {
+                status: 200,
+                body,
+                retry_after: None,
+                reason: Some(format!("the live read faulted ({fault})")),
+            };
+        }
+    }
+    let available = live_reason.is_none();
     let mut body = tip_body(current.as_ref().or(last_known.as_ref()), now);
     body["freshness"] = serde_json::json!(if !available {
         "stale"
@@ -712,15 +834,27 @@ where
     } else {
         "unknown"
     });
-    if !available {
+    let reason = live_reason.map(|reason| match (&read_fault, &last_known) {
+        (Some(_), None) => format!("{reason}; no memo in this isolate"),
+        (Some(_), Some(memo)) => format!(
+            "{reason}; the memo is not fresh ({})",
+            tip_verdict(memo, now)
+                .err()
+                .unwrap_or_else(|| "it carries no pass stamp".into())
+        ),
+        (None, _) => reason,
+    });
+    if let Some(reason) = &reason {
         body["code"] = serde_json::json!("ERR_TIP_UNAVAILABLE");
         body["error"] = serde_json::json!("verified header tip unavailable");
         body["stale"] = serde_json::json!(true);
+        body["reason"] = serde_json::json!(reason);
     }
     TipReply {
         status: if available { 200 } else { 503 },
         body,
         retry_after: (!available).then_some(TIP_RETRY_AFTER_SECS),
+        reason,
     }
 }
 
