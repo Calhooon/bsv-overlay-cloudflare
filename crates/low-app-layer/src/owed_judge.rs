@@ -114,8 +114,8 @@ pub use hydrate::{
 };
 pub use writers::{
     drain_changed, drain_changed_within, drain_identities, judge_written_word, judge_written_words,
-    mark_tip, write_tip_marks, write_word, DATE_SWEEPS_SQL, MARK_TIP_SQL, MARK_UNTIPPED_SQL,
-    UNTIPPED_MARKS_PER_TIP,
+    mark_tip, write_tip_marks, write_word, DATE_SWEEPS_SQL, MARK_SWEEP_ASKS_SQL, MARK_TIP_SQL,
+    MARK_UNTIPPED_SQL, SWEEP_MARKS_PER_TIP, TIP_MARK_KEYS, UNTIPPED_MARKS_PER_TIP,
 };
 
 pub const OWED_JUDGE_SUBJECTS_PER_INVOCATION: usize = 16;

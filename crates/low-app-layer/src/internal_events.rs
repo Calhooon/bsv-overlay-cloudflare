@@ -705,13 +705,20 @@ pub async fn tip_changed(mut req: Request, env: &Env, ctx: &Context) -> Result<R
     )?;
     // bsv-low #911 (D2-ACTOR-A): the tip's marks written here, judged by the `owed-events` consumer.
     if crate::owed_events::configured(env).await {
-        match crate::owed_judge::write_tip_marks(&judge, height).await {
+        match crate::owed_judge::write_tip_marks(
+            &judge,
+            height,
+            crate::owed_judge::JudgeDb::d1_judges(&judge),
+        )
+        .await
+        {
             Ok(()) => {
-                crate::owed_events::publish_pairs(
-                    env,
-                    &[("tip", "gate".to_string()), ("tip", "untipped".to_string())],
-                )
-                .await;
+                // bsv-low #1087: `tip`/`sweep`, the courier-dependent sweeps judged below the block.
+                let pairs: Vec<(&str, String)> = crate::owed_judge::TIP_MARK_KEYS
+                    .iter()
+                    .map(|key| ("tip", key.to_string()))
+                    .collect();
+                crate::owed_events::publish_pairs(env, &pairs).await;
                 // D2-ACTOR-D (bsv-low #952): the block's gate events' actors called after the answer.
                 crate::owed_events::schedule_direct(env, ctx);
             }

@@ -6437,7 +6437,7 @@ async fn fold10_a_a_stale_tip_direct_apply_never_makes_the_blocks_delivery_a_dup
     let hook = squash(include_str!("../internal_events.rs"));
     let hook = &hook[hook.find("pubasyncfntip_changed(").unwrap()..];
     let seed = hook.find("crate::owed_events::seed_tip(height);").unwrap();
-    assert!(seed < hook.find("write_tip_marks(&judge,height)").unwrap());
+    assert!(seed < hook.find("write_tip_marks(&judge,height,").unwrap());
     assert!(
         seed < hook
             .find("crate::owed_events::schedule_direct(env,ctx);")
@@ -23573,5 +23573,171 @@ mod fix1056f3 {
                 "every difference seen in the lap"
             );
         }
+    }
+}
+
+/// FIX-1087 (bsv-low #1087, L59 S-C, the fleet compare): a courier-dependent `hop-stranded` press (the hop's index
+/// status not `unspent`, its press resting on a courier's `unspent` probe) judged at tip T is RE-JUDGED by the block's
+/// own event at T+1, so the actor's stored row is #669's chain wait from that moment, as a fresh D1 judgement at T+1
+/// reads it, and the fleet compare reads zero across the block. Before: the block marked nothing for it, the actor kept
+/// the press until its belt re-probed (L59: identity 02f1fd09.., hop 8655d53d..:0, judged at 973959, D1 fresh at
+/// 973960). The marks' source is the actors' published belt questions (Phase C, the D1 judge off); in Phases A and B
+/// the D1 judge's stored press stays the belt's first class (the D2 lens's D2-M1 pins) and the block marks none.
+mod fix1087 {
+    use super::fix1010::{fresh_d1, published};
+    use super::*;
+
+    const HOP: &str = "8655d53d00000000000000000000000000000000000000000000000000001087";
+
+    fn courier_sweep_fixture() -> Fixture {
+        let made = (NOW_MS / 1000) as i64 - 7_200;
+        Fixture {
+            name: "a courier-dependent sweep",
+            seed: vec![
+                format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('owner','other','g1087',0,20190,'seat','00','00',2,'{HOP}',1,{made},1)"),
+                format!("INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES ('{HOP}.0',{NOW_MS},0,NULL,NULL,{TIP})"),
+            ],
+            identities: vec!["owner".into()],
+        }
+    }
+
+    fn row(db: &SqliteSql) -> (Option<i64>, Value) {
+        db.conn
+            .query_row(
+                "SELECT claimable,facts FROM owed_rows WHERE identity='owner' AND outpoint=?1",
+                [format!("{HOP}:0")],
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?)),
+            )
+            .map(|(c, f)| (c, serde_json::from_str(&f).unwrap()))
+            .unwrap()
+    }
+
+    /// The actor's dated rows as it publishes them (`owed_belt::ask_of_row`), put in the record's ledger by the
+    /// shipped statement.
+    fn publish_asks(local: &SqliteSql, record: &SqliteSql) -> usize {
+        let rows: Vec<Value> = local
+            .conn
+            .prepare("SELECT json_object('outpoint',outpoint,'beltDueAtMs',beltDueAtMs,'gameId',gameId,'family',family,'facts',facts,'reason',reason,'claimable',claimable,'probeTip',probeTip,'judgedAtMs',judgedAtMs) FROM owed_rows WHERE identity='owner' AND beltDueAtMs IS NOT NULL")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|s| serde_json::from_str(&s.unwrap()).unwrap())
+            .collect();
+        let mut n = 0;
+        for r in &rows {
+            if let Some((name, body, due)) = crate::owed_belt::ask_of_row("owner", r) {
+                record
+                    .conn
+                    .execute(
+                        ASK_PUT_SQL,
+                        rusqlite::params![name, body.to_string(), due],
+                    )
+                    .unwrap();
+                n += 1;
+            }
+        }
+        n
+    }
+
+    async fn the_block_rejudges_the_press(d1_rows_kept: bool) {
+        let d1 = d1_judge(&courier_sweep_fixture()).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        for (side, db) in [("d1", &d1), ("actor", &local)] {
+            let (claimable, facts) = row(db);
+            assert_eq!(
+                (claimable, facts["claim"].clone(), facts["status"].clone()),
+                (Some(1), json!("sweep-hop"), json!("unknown")),
+                "{side}: the premise, a courier-dependent press at T: {facts}"
+            );
+        }
+        // Phase C: the actor's published questions are the record's word (a D1 row left from before the flip, or
+        // none).
+        assert!(publish_asks(&local, &d1) >= 1, "the actor dated the press");
+        if !d1_rows_kept {
+            d1.conn
+                .execute("DELETE FROM owed_rows WHERE identity='owner'", [])
+                .unwrap();
+        }
+        d1.conn.execute("DELETE FROM owed_dirty", []).unwrap();
+        // the block: /internal/tip-changed's marks (the shipped batch) at T+1
+        d1.tip.set(Some(TIP + 1));
+        crate::owed_judge::write_tip_marks(&d1, TIP + 1, false)
+            .await
+            .unwrap();
+        let ev = published(&d1, "tip", "sweep")
+            .await
+            .expect("the block marked the courier-dependent press's game (`tip`/`sweep`)");
+        let games: Vec<String> = crate::owed_events::plan_with(&d1, &ev, false)
+            .await
+            .unwrap()
+            .subjects()
+            .into_iter()
+            .filter(|(me, _)| me == "owner")
+            .flat_map(|(_, g)| g)
+            .collect();
+        assert_eq!(games, vec!["g1087".to_string()]);
+        let e = EventCtx::of(&ev);
+        apply_with(
+            &d1,
+            &local,
+            &Fakes,
+            "owner",
+            &games,
+            Some((ev.source.as_str(), ev.seq)),
+            Some(TIP + 1),
+            None,
+            &ApplyOpts {
+                touch: e.txids.clone(),
+                ..ApplyOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+        let (claimable, facts) = row(&local);
+        assert_eq!(
+            (claimable, facts["claimable"].clone(), facts["chainWait"].clone()),
+            (Some(0), json!(false), json!("block")),
+            "the actor serves #669's chain wait from the block: {facts}"
+        );
+        fresh_d1(&d1).await;
+        // The fleet compare's own reading (`diff_rows`, `rows_digest`, the tip-lag class): zero across the block.
+        let (a, b) = (compared(&d1), compared(&local));
+        assert!(diff_rows(&a, &b).is_empty(), "no difference: {a:?} {b:?}");
+        assert!(tip_derived_rows(&a, &b).is_empty(), "no tip lag excused");
+        assert_eq!(rows_digest(&a), rows_digest(&b), "the digests equal");
+    }
+
+    fn compared(db: &SqliteSql) -> Vec<Value> {
+        db.conn.prepare("SELECT json_object('outpoint',outpoint,'family',family,'gameId',gameId,'sats',sats,'opponentIdentity',opponentIdentity,'atHeight',atHeight,'reason',reason,'facts',facts,'claimable',claimable,'probeTip',probeTip) FROM owed_rows WHERE identity='owner' ORDER BY outpoint").unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap().map(|s| serde_json::from_str::<Value>(&s.unwrap()).unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn fix1087_a_in_phase_c_the_block_rejudges_a_courier_dependent_press() {
+        the_block_rejudges_the_press(false).await;
+        // a D1 row left from before the flip changes nothing
+        the_block_rejudges_the_press(true).await;
+    }
+
+    /// Phases A and B (the D1 judge on): the block marks no `tip`/`sweep`, whatever the ledger holds, so the D1
+    /// judge's stored press keeps its place in the belt's first class (dated due now) and the read degrades it.
+    #[tokio::test]
+    async fn fix1087_b_with_the_d1_judge_on_the_block_marks_no_sweep() {
+        let d1 = d1_judge(&courier_sweep_fixture()).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        assert!(publish_asks(&local, &d1) >= 1);
+        d1.conn.execute("DELETE FROM owed_dirty", []).unwrap();
+        crate::owed_judge::write_tip_marks(&d1, TIP + 1, true)
+            .await
+            .unwrap();
+        let marks: i64 = d1
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM owed_dirty WHERE source='tip' AND sourceKey='sweep'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marks, 0);
+        assert_eq!(row(&d1).0, Some(1), "the D1 press stands for the belt's first class");
     }
 }
