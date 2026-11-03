@@ -1557,8 +1557,9 @@ macro_rules! held_bump_mark {
     };
 }
 /// FIX-1045 (bsv-low #1045, the CUT-263 ensemble's B LOW-1): the entry mark `$k` (`pe` or `te`) holds of the bytes
-/// `$b`: a two-element array whose hex at its offset is the bytes' own ([`entry_mark`]: the subject's own entry, its
-/// raw's edge, its bump flag and its bump index). Anything else (absent, `null`, `[]`) re-reads.
+/// `$b`: a four-element array whose two windows' hex at their offsets are the bytes' own ([`entry_mark`]: the subject's
+/// own entry, its raw's edge beside the marker, its bump flag and its bump index; bsv-low #1061: the raw's other edge).
+/// Anything else (absent, `null`, `[]`, a two-element mark an older build wrote) re-reads.
 macro_rules! held_entry_mark {
     ($b:literal, $k:literal) => {
         concat!(
@@ -1566,7 +1567,7 @@ macro_rules! held_entry_mark {
             $k,
             "')='array' AND json_array_length(?7,'$.\"'||t.txid||'\".",
             $k,
-            "')=2 AND hex(substr(",
+            "')=4 AND hex(substr(",
             $b,
             ",json_extract(?7,'$.\"'||t.txid||'\".",
             $k,
@@ -1574,7 +1575,15 @@ macro_rules! held_entry_mark {
             $k,
             "[1]'))/2))=json_extract(?7,'$.\"'||t.txid||'\".",
             $k,
-            "[1]'))"
+            "[1]') AND hex(substr(",
+            $b,
+            ",json_extract(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "[2]'),length(json_extract(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "[3]'))/2))=json_extract(?7,'$.\"'||t.txid||'\".",
+            $k,
+            "[3]'))"
         )
     };
 }
@@ -1633,7 +1642,7 @@ pub const HELD_TRANSACTIONS_BEEF_EXPR: &str = concat!(
 );
 
 /// PURE (D2-ACTOR-G-FOLD-1, the lens's LOW-1): where `bytes` (a stored BEEF of `txid`) hold the height of the subject's
-/// own bump: `[offset, hex]`, the 1-based offset of the bump's height varint (its serialization found in the bytes) and
+/// own bump: `[offset, hex]`, the 1-based offset of the bump's height varint (its BUMP element placed by the walk) and
 /// the varint's hex; `[]` when the subject carries no bump; `null` when the bytes do not parse, name no such
 /// transaction, or the bump's serialization is not found (the hold then re-reads: fail closed).
 pub fn bump_mark(txid: &str, bytes: &[u8]) -> Value {
@@ -1643,7 +1652,8 @@ pub fn bump_mark(txid: &str, bytes: &[u8]) -> Value {
 /// PURE (FIX-1045, the CUT-263 ensemble's B LOW-1): where `bytes` (a stored BEEF of `txid`) hold the subject's OWN
 /// entry: `[offset, hex]`, the 1-based offset and the hex of the entry's bump marker (`00` for no bump, `01` and the
 /// bump index's varint for one: the same bytes in BEEF V1, after the raw, and V2, before it) with the raw's adjacent
-/// edge (up to [`ENTRY_MARK_RAW_EDGE`] bytes: its last in V1, its first in V2); `null` when the bytes do not parse, the
+/// edge (up to [`ENTRY_MARK_RAW_EDGE`] bytes: its last in V1, its first in V2), then `[offset, hex]` of the raw's OTHER
+/// edge (bsv-low #1061: its first in V1, its last in V2), four elements in all; `null` when the bytes do not parse, the
 /// subject carries no raw, or its entry is not found (re-reads). The bump height alone ([`bump_mark`]) held a rewrite
 /// that keeps the length and the old bump's bytes in place while the subject GAINS a bump or its INDEX moves to
 /// another bump; the entry's marker is the current bytes' word on both.
@@ -1651,7 +1661,11 @@ pub fn entry_mark(txid: &str, bytes: &[u8]) -> Value {
     held_marks(txid, bytes).1
 }
 
-/// FIX-1045: the raw's edge an entry mark holds beside the bump marker (an anchor of the subject's own bytes).
+/// FIX-1045: the raw's edge an entry mark holds beside the bump marker (an anchor of the subject's own bytes), and
+/// (bsv-low #1061) at the raw's other end. 32 is not derived: any nonzero edge sees an entry whose raw differs at it.
+/// Residual, stated: a same-length rewrite that puts, under a like marker at the subject's old entry, a sibling whose
+/// raw equals the subject's over BOTH its first and its last 32 bytes (the same first previous txid and the same
+/// outputs' end and lock time) is held until the game's next full read; no writer stores such a rewrite.
 pub const ENTRY_MARK_RAW_EDGE: usize = 32;
 
 /// The two marks of one parse ([`bump_mark`], [`entry_mark`]).
@@ -1728,12 +1742,27 @@ fn held_marks(txid: &str, bytes: &[u8]) -> (Value, Value) {
         };
         (m, at + edge, m)
     };
+    // bsv-low #1061 (the FIX-1045 delta lens's LOW-1): the raw's OTHER edge too, its head in V1 and its tail in V2.
+    // In V2 the edge beside the marker is the raw's head (its version, input count and first previous txid), which a
+    // sibling spending the same parent shares by construction; the tail (the outputs' end and the lock time) is the
+    // bytes V1's edge already held.
+    let other = if stream.version() == Some(BEEF_V1) {
+        at..at + edge
+    } else {
+        at + len - edge..at + len
+    };
     let entry = match (
         bytes.get(from..to),
         bytes.get(marker_at..marker_at + marker.len()),
+        bytes.get(other.clone()),
     ) {
-        (Some(mark), Some(m)) if m == marker.as_slice() => {
-            json!([from + 1, hex::encode_upper(mark)])
+        (Some(mark), Some(m), Some(o)) if m == marker.as_slice() => {
+            json!([
+                from + 1,
+                hex::encode_upper(mark),
+                other.start + 1,
+                hex::encode_upper(o)
+            ])
         }
         _ => Value::Null,
     };

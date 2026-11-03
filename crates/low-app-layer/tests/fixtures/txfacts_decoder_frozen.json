@@ -196,5 +196,8 @@
       "txid": "abababababababababababababababababababababababababababababababab"
     }
   ],
+  "digests": {
+    "1": "680b0e20240f3ec9521f853877ff6554cf9ded521496ca23668dab34da14f557"
+  },
   "version": 1
 }

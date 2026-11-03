@@ -1401,6 +1401,63 @@ async fn fix1057_3_a_young_row_walked_first_keeps_a_place_under_a_first_class_fl
 /// `left: Some(1790000601000) right: Some(1790000600000)` class (the hydration clock).
 #[tokio::test]
 async fn fix1057_4_the_finds_first_sight_is_the_records_stamp() {
+    first_sight_case(false).await;
+}
+
+/// PHASE B over the shipped tick (bsv-low #1063): the D1 judge on and the actor's rows read (`actor_reads`), so a find
+/// takes `phase_b_find` (its facts alone, the actor applied, then the D1 judge under the bound). The actor is absent
+/// (`actor_apply` answers none): the D1 judge's row is what the pin reads.
+struct PhaseB(Db);
+impl SqlPort for PhaseB {
+    async fn run_batch(&self, stmts: Vec<Stmt>) -> Result<Vec<StmtOut>, String> {
+        self.0.run_batch(stmts).await
+    }
+    async fn counters(&self, deltas: Vec<(String, u64)>) {
+        self.0.counters(deltas).await
+    }
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+    fn log(&self, _: &str) {}
+}
+impl JudgeDb for PhaseB {
+    fn tip(&self) -> Option<u64> {
+        self.0.tip()
+    }
+    async fn word_views(
+        &self,
+        rows: &BTreeMap<String, low_app_layer::tracker_host::stored::Row>,
+    ) -> Result<BTreeMap<String, Value>, String> {
+        self.0.word_views(rows).await
+    }
+    async fn canonical_root(&self, h: u64) -> Option<String> {
+        self.0.canonical_root(h).await
+    }
+    async fn push(&self, _: &str, _: Value) {}
+    fn actor_reads(&self) -> bool {
+        true
+    }
+    async fn actor_apply(
+        &self,
+        _identity: &str,
+        _games: &[String],
+        _kind: &str,
+    ) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+}
+
+/// bsv-low #1063 (the FIX-1057 delta lens's LOW-1): fix1057_4 through PHASE B's find (`phase_b_find`): its judgement
+/// is stamped at the tick's instant and states the record's first sight, under the clock that moves a second a
+/// batch. RED with `phase_b_find`'s `i.now_ms = now` removed (the lens's M5: the hydration's clock, `judgedAtMs` past
+/// the tick's).
+#[tokio::test]
+async fn lows1063_phase_b_finds_first_sight_is_the_records_stamp() {
+    first_sight_case(true).await;
+}
+
+/// fix1057_4's body, Phase A (`Find::apply`) or Phase B (`phase_b_find`).
+async fn first_sight_case(phase_b: bool) {
     let (db, outpoint) = landing("seen", 60, None).await;
     let hop_txid = outpoint.split(':').next().unwrap().to_string();
     let (sweep, raw) = spender_of(&hop_txid);
@@ -1422,9 +1479,16 @@ async fn fix1057_4_the_finds_first_sight_is_the_records_stamp() {
     let at = NOW + 600_000;
     db.now.set(at);
     db.step.set(1_000);
-    let report = belt::tick(&db, &fake).await.unwrap();
+    let (db, report) = if phase_b {
+        let pb = PhaseB(db);
+        let report = belt::tick(&pb, &fake).await.unwrap();
+        (pb.0, report)
+    } else {
+        let report = belt::tick(&db, &fake).await.unwrap();
+        (db, report)
+    };
     db.step.set(0);
-    assert_eq!(report.found, 1, "{report:?}");
+    assert_eq!(report.found, 1, "phase B {phase_b}: {report:?}");
     let stamp = db.opt(&format!(
         "SELECT createdAtMs FROM owed_spender_bytes WHERE txid='{sweep}'"
     ));
@@ -1491,18 +1555,22 @@ async fn fix1057f1_3_the_tick_serves_each_classs_oldest_due_age() {
         now - first_due + 1,
         "the first class's"
     );
-    // the next tick: the row the places cut has waited a tick more
+    // the next tick: the row the places cut has waited a tick more; bsv-low #1063 (the FIX-1057 delta lens's NIT-1):
+    // the young row is dated past it, so this tick reads no young row and the null branch is asserted, never skipped
     let next = NOW + belt::OWED_BELT_TICK_MS as u64;
     db.now.set(next);
+    db.exec(&format!(
+        "UPDATE owed_rows SET beltDueAtMs={} WHERE identity='a0'",
+        next + 10 * belt::OWED_BELT_TICK_MS as u64
+    ));
     let report = belt::tick(&db, &unspent()).await.unwrap();
     assert_eq!(
         gauge(&db, "second"),
         next as i64,
         "the cut row's age grew by the tick: {report:?}"
     );
-    if report.young_rows == 0 {
-        assert_eq!(gauge(&db, "young"), 0, "no young row read: none");
-    }
+    assert_eq!(report.young_rows, 0, "{report:?}");
+    assert_eq!(gauge(&db, "young"), 0, "no young row read: none");
     // the served view: the age, null for none
     let mut counters = serde_json::Map::new();
     for class in ["first", "second", "young"] {
@@ -1514,9 +1582,8 @@ async fn fix1057f1_3_the_tick_serves_each_classs_oldest_due_age() {
     let ages = (gauge(&db, "second") - 1, gauge(&db, "young"));
     let view = bsv_overlay_cloudflare::applayer_counters::owed_belt_view(&Value::Object(counters));
     assert_eq!(view["oldestDueAgeMs"]["second"], json!(ages.0), "{view}");
-    if ages.1 == 0 {
-        assert_eq!(view["oldestDueAgeMs"]["young"], Value::Null, "{view}");
-    }
+    assert_eq!(ages.1, 0, "{view}");
+    assert_eq!(view["oldestDueAgeMs"]["young"], Value::Null, "{view}");
 }
 
 /// FIX-1057 item 5 (round 3's B LOW-3): PHASE C's young cap in `ask_candidates`. Eight young landing asks (`a*`,

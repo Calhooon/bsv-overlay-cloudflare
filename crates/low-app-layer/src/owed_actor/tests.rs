@@ -21117,11 +21117,96 @@ mod d2_actor_g {
         fold_rewrite_refreshes(&pay, &old, &new, "the entry moved").await;
     }
 
+    /// (lows1061_a) A V2 SIBLING UNDER THE RAW'S HEAD (bsv-low #1061, the FIX-1045 delta lens's LOW-1, its probe
+    /// committed): the subject S and a sibling S2 (S with its lock time's last byte flipped: the same length, the same
+    /// first 32 bytes, so the same version, input count and first previous txid) under like markers; old `[S@0, S2@0]`,
+    /// new `[S2@0, S@1]`, the same length. At S's old entry the marker (`01 00`), the raw's head and bump 0's height stay
+    /// in place; only the raw's TAIL differs. The decoder moves S to 899,500, and the warm mirror's facts follow. RED on
+    /// d9d2a641 (the V2 mark held the head alone: the warm mirror kept 899,000).
+    #[tokio::test]
+    async fn lows1061_a_a_v2_sibling_under_the_raws_head_refreshes_the_facts() {
+        use bsv_rs::transaction::merkle_path::MerklePathLeaf;
+        use bsv_rs::transaction::Beef;
+        let (txid, beef) = crate::record_post::door_pins::realistic_payout_beef();
+        let s = hex::encode(txid);
+        let mut b = Beef::from_binary(&beef).unwrap();
+        let raw = b.find_txid_mut(&s).unwrap().raw_tx_or_compute().unwrap();
+        let mut raw2 = raw.clone();
+        let n = raw2.len();
+        raw2[n - 1] ^= 0x01;
+        assert_eq!(
+            raw[..40],
+            raw2[..40],
+            "the sibling shares the subject's head"
+        );
+        let s2 = {
+            let mut p = Beef::new();
+            p.merge_raw_tx(raw2.clone(), None);
+            p.txs[0].txid()
+        };
+        let build = |order: &[(bool, usize)]| -> Vec<u8> {
+            let mut p = Beef::new();
+            for h in [899_000u32, 899_500] {
+                p.bumps.push(
+                    MerklePath::new_unchecked(
+                        h,
+                        vec![vec![
+                            MerklePathLeaf::new_txid(0, s.clone()),
+                            MerklePathLeaf::new_txid(1, s2.clone()),
+                        ]],
+                    )
+                    .unwrap(),
+                );
+            }
+            for (subject, at) in order {
+                p.merge_raw_tx(if *subject { raw.clone() } else { raw2.clone() }, Some(*at));
+            }
+            let mut w = bsv_rs::primitives::encoding::Writer::new();
+            p.to_writer(&mut w);
+            w.into_bytes()
+        };
+        let old = build(&[(true, 0), (false, 0)]);
+        let new = build(&[(false, 0), (true, 1)]);
+        let f = |b: &[u8]| {
+            crate::owed_judge::facts_of_beefs(&s, [hex::encode(b).as_str()])
+                .unwrap()
+                .bump_height
+        };
+        assert_eq!((f(&old), f(&new)), (Some(899_000), Some(899_500)));
+        let (mo, bo) = (entry_mark(&s, &old), bump_mark(&s, &old));
+        let at = mo[0].as_u64().unwrap() as usize - 1;
+        let w = mo[1].as_str().unwrap().len() / 2;
+        assert_eq!(
+            old[at..at + w],
+            new[at..at + w],
+            "the marker and the raw's head in place at the old entry"
+        );
+        let bat = bo[0].as_u64().unwrap() as usize - 1;
+        assert_eq!(
+            old[bat..bat + 3],
+            new[bat..bat + 3],
+            "bump 0's height in place"
+        );
+        fold_rewrite_refreshes(&s, &old, &new, "V2, a sibling under the raw's head").await;
+    }
+
+    /// bsv-low #1061: the digest of a frozen corpus's decoded facts (its names and facts, in order).
+    fn facts_digest(cases: &[Value]) -> String {
+        let facts: Vec<Value> = cases
+            .iter()
+            .map(|c| json!([c["name"], c["facts"]]))
+            .collect();
+        hex::encode(bsv_rs::primitives::hash::sha256(
+            serde_json::to_string(&facts).unwrap().as_bytes(),
+        ))
+    }
+
     /// (fold3) THE DECODER'S OUTPUT IS FROZEN BY ITS VERSION (A LOW-2, B LOW-3, C LOW-2): a fixed corpus of BEEFs (V1,
     /// V2, two bumps, the subject before its parent, an unproven ancestry, a txid the bytes do not carry), frozen as
     /// bytes, and [`crate::owed_judge::facts_of_beefs`]'s JSON of each, frozen under [`TXFACTS_DECODER_VERSION`]. A
     /// decoder change (a `TxFacts` field, a changed parse, a bsv-rs bump that decodes otherwise) that forgets the version
     /// move is RED here; a version move re-freezes by name (`TXFACTS_DECODER_FREEZE=1`). Re-run at every bsv-rs bump.
+    /// bsv-low #1061: and a re-freeze under an UNMOVED version whose output moved is refused (RED, nothing written).
     #[test]
     fn fold3_the_decoders_output_is_frozen_under_its_version() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -21156,7 +21241,29 @@ mod d2_actor_g {
             push("realistic-unproven", &hex::encode(rtx), &rbeef);
             let (_, small) = proven_beef(899_000);
             push("absent-txid", &"ab".repeat(32), &small);
-            let out = json!({"version": TXFACTS_DECODER_VERSION, "cases": decode(&cases)});
+            let decoded = decode(&cases);
+            // bsv-low #1061 (the FIX-1045 delta lens's LOW-2): THE FREEZE REFUSES AN UNMOVED VERSION. The fixture keeps
+            // the digest of each version's output (`digests`, never overwritten); a re-freeze whose output differs
+            // from the one already frozen under this version is refused before anything is written, so a decoder
+            // change cannot be re-frozen in without moving `TXFACTS_DECODER_VERSION`.
+            let prior: Value = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or(Value::Null);
+            let mut digests = prior["digests"].as_object().cloned().unwrap_or_default();
+            let key = TXFACTS_DECODER_VERSION.to_string();
+            let now = facts_digest(&decoded);
+            if let Some(held) = digests.get(&key) {
+                assert_eq!(
+                    held.as_str(),
+                    Some(now.as_str()),
+                    "the decoder's output moved under an unmoved TXFACTS_DECODER_VERSION ({key}): move the version, \
+                     then re-freeze"
+                );
+            }
+            digests.insert(key, json!(now));
+            let out =
+                json!({"version": TXFACTS_DECODER_VERSION, "digests": digests, "cases": decoded});
             std::fs::write(&path, serde_json::to_string_pretty(&out).unwrap() + "\n").unwrap();
         }
         let frozen: Value =
@@ -21180,6 +21287,13 @@ mod d2_actor_g {
             })
             .collect();
         assert!(cases.len() >= 6, "the corpus");
+        // bsv-low #1061: the frozen output is the one this version's digest names (a fixture whose cases were
+        // rewritten by hand, or re-frozen by an older build of this pin, under an unmoved version is RED here)
+        assert_eq!(
+            frozen["digests"][TXFACTS_DECODER_VERSION.to_string()].as_str(),
+            Some(facts_digest(frozen["cases"].as_array().unwrap()).as_str()),
+            "the frozen cases are the output frozen under TXFACTS_DECODER_VERSION {TXFACTS_DECODER_VERSION}"
+        );
         for (now, then) in decode(&cases)
             .iter()
             .zip(frozen["cases"].as_array().unwrap())
