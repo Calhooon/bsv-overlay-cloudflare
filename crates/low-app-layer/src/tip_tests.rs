@@ -935,3 +935,40 @@ async fn fix1077_c_a_broken_link_state_is_stale() {
     assert_eq!(reply.body["freshness"], "fresh");
     assert_eq!(reply.body["lagBlocks"], 1);
 }
+
+// ── bsv-low #1084: the /owed read's words recheck their headers at once ──
+
+/// fix1084_a (L59 S-O): an owed list whose mined words sit at ten distinct heights rechecks them under the burst at
+/// 300 ms a CHAINTRACKS read. The header reads were made one after another (ten in a row between the two tip reads:
+/// 3,600 ms, the read's tail beside the actor's 1.5 s wall and the client's 8 s timeout); they are made at once,
+/// eight at a time, so the step is the two tip reads and two header reads' time (1,200 ms). The snapshot's answer is unchanged.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fix1084_a_the_header_rechecks_of_one_read_run_at_once() {
+    let heights: Vec<u32> = (0..10).map(|n| VERIFIED_HEIGHT - 10 + n).collect();
+    let started = tokio::time::Instant::now();
+    let reads = Cell::new(0u32);
+    let snapshot = headers_with(
+        |route| {
+            reads.set(reads.get() + 1);
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                tracker_response(&route)
+            }
+        },
+        &heights,
+    )
+    .await;
+    let ms = started.elapsed().as_millis() as u64;
+    assert_eq!(snapshot.tip_height().unwrap(), VERIFIED_HEIGHT);
+    for h in &heights {
+        assert!(snapshot.header_at(*h).unwrap().is_some(), "height {h}");
+    }
+    assert_eq!(reads.get(), 12, "two tip reads and one a height");
+    let waves = heights
+        .len()
+        .div_ceil(crate::tracker_host::HEADER_READS_AT_ONCE) as u64;
+    assert!(
+        ms <= (2 + waves) * 300,
+        "the step took {ms} ms of the read's wall: the heights are read one after another"
+    );
+}
