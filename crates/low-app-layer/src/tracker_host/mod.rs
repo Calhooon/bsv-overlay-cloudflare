@@ -19,6 +19,14 @@ pub struct VerifiedTip {
     pub last_pass_at: Option<u64>,
     /// Route-only diagnostic: highest height reported by the most recent courier poll.
     pub last_seen_height: Option<u32>,
+    /// Route-only diagnostic (bsv-low #1077): the store's own courier lag,
+    /// `/getInfo`'s `liveLagBlocks` (the couriers' seen height less its stored
+    /// tip), absent from an older producer.
+    pub live_lag_blocks: Option<u32>,
+    /// Route-only diagnostic (bsv-low #1077): `/getInfo`'s `linkState.linked`
+    /// (chaintracks 0.7.2): `false` is a served chain with a hole the store's
+    /// pass could not heal; absent from an older producer.
+    pub linked: Option<bool>,
 }
 
 thread_local! {
@@ -56,6 +64,8 @@ where
         at: u64::from(time) * 1_000,
         last_pass_at: None,
         last_seen_height: None,
+        live_lag_blocks: None,
+        linked: None,
     })
 }
 
@@ -69,6 +79,11 @@ where
     let mut tip = verified_tip_with(&get).await?;
     let (status, info) = get("getInfo".into()).await?;
     let (served_height, last_pass_at, last_seen_height) = sync_info_response(status, &info)?;
+    // Optional words of a newer producer: absent or unreadable is no word.
+    let live_lag_blocks = info["value"]["liveLagBlocks"]
+        .as_u64()
+        .and_then(|lag| u32::try_from(lag).ok());
+    let linked = info["value"]["linkState"]["linked"].as_bool();
     if served_height != tip.height {
         return Err(HeaderError("tip and sync snapshot heights disagree".into()));
     }
@@ -83,6 +98,8 @@ where
     }
     tip.last_pass_at = last_pass_at;
     tip.last_seen_height = Some(last_seen_height);
+    tip.live_lag_blocks = live_lag_blocks;
+    tip.linked = linked;
     LAST_VERIFIED_TIP.with(|last| *last.borrow_mut() = Some(tip.clone()));
     Ok(tip)
 }

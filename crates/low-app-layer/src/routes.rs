@@ -726,8 +726,24 @@ where
     tip_reply_within(get, last_known, now_ms, std::future::pending::<()>()).await
 }
 
+/// The blocks the verified tip trails the couriers by, in the store's own words
+/// (bsv-low #1077): the larger of `liveLagBlocks` and the seen height less the
+/// verified height (the verified tip can sit below the stored one under the
+/// validation ceiling). `None` when the store named neither.
+fn tip_lag_blocks(tip: &crate::tracker_host::VerifiedTip) -> Option<u32> {
+    let seen = tip
+        .last_seen_height
+        .map(|seen| seen.saturating_sub(tip.height));
+    match (seen, tip.live_lag_blocks) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// The freshness bar of one snapshot: `Ok` when it may be served, `Err`
-/// naming why it may not. The pass age, then the store's own courier lag.
+/// naming why it may not. The pass age, then the store's own courier lag
+/// (bsv-low #1077: "the pass ran" AND "the stored tip is the chain's"), then
+/// its link state.
 fn tip_verdict(
     tip: &crate::tracker_host::VerifiedTip,
     now: u64,
@@ -740,14 +756,14 @@ fn tip_verdict(
             ));
         }
     }
-    if let Some(seen) = tip.last_seen_height {
-        if seen > tip.height.saturating_add(TIP_REORG_MARGIN) {
-            return Err(format!(
-                "the verified tip {} trails the couriers' seen height {seen} by {} blocks",
-                tip.height,
-                seen - tip.height
-            ));
-        }
+    if let Some(lag) = tip_lag_blocks(tip).filter(|lag| *lag > TIP_REORG_MARGIN) {
+        return Err(format!(
+            "the verified tip {} trails the couriers by {lag} blocks (seen {:?}, liveLagBlocks {:?})",
+            tip.height, tip.last_seen_height, tip.live_lag_blocks
+        ));
+    }
+    if tip.linked == Some(false) {
+        return Err("the store's link state is broken (linkState.linked false)".into());
     }
     Ok(())
 }
@@ -814,6 +830,7 @@ where
     if let (Some(fault), Some(memo)) = (&read_fault, last_known.as_ref()) {
         if memo.last_pass_at.is_some() && tip_verdict(memo, now).is_ok() {
             let mut body = tip_body(Some(memo), now);
+            body["lagBlocks"] = serde_json::json!(tip_lag_blocks(memo));
             body["freshness"] = serde_json::json!("fresh");
             body["servedFrom"] = serde_json::json!("memo");
             body["readFault"] = serde_json::json!(fault);
@@ -826,7 +843,9 @@ where
         }
     }
     let available = live_reason.is_none();
-    let mut body = tip_body(current.as_ref().or(last_known.as_ref()), now);
+    let shown = current.as_ref().or(last_known.as_ref());
+    let mut body = tip_body(shown, now);
+    body["lagBlocks"] = serde_json::json!(shown.and_then(tip_lag_blocks));
     body["freshness"] = serde_json::json!(if !available {
         "stale"
     } else if current.as_ref().and_then(|tip| tip.last_pass_at).is_some() {
