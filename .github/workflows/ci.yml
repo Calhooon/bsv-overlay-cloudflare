@@ -173,6 +173,16 @@ jobs:
         workspaces: '. -> target
 
           workers -> workers/target'
+    # The test build's dependencies at opt-level 2 (the bundled SQLite's C, the
+    # curve and hash crates run the suites' hot loops). The workspace's own crates
+    # keep the dev profile: unoptimized, debug assertions and overflow checks on.
+    # Only codegen moves: clippy, docs and the MSRV check build no code with it,
+    # and the wasm32 build is the release profile.
+    - name: dependencies optimized
+      run: |
+        set -euo pipefail
+        printf '[profile.dev.package."*"]\nopt-level = 2\n[profile.test.package."*"]\nopt-level = 2\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+        cat "${CARGO_HOME:-$HOME/.cargo}/config.toml"
     # cargo-nextest 0.9.150, the release's x86_64-unknown-linux-gnu binary,
     # refused unless the tarball's sha256 is the one the release publishes.
     - id: nextest
