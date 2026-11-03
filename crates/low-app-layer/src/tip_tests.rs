@@ -1,4 +1,3 @@
-use super::tip_reply_with;
 use crate::tracker_host::{headers_with, last_verified_tip, VerifiedTip};
 use bsv_rs::transaction::MerklePath;
 use bsv_tracker::{HeaderError, Headers, Proof};
@@ -7,6 +6,21 @@ use std::{
     cell::{Cell, RefCell},
     future::ready,
 };
+
+/// The reply over a live read that never passes its deadline (the tests' own
+/// wrapper of `tip_reply_within`; kept here so `routes.rs`'s production text
+/// ends at its first `#[cfg(test)]`, which several source pins cut at).
+async fn tip_reply_with<G, F, L, N>(get: G, last_known: L, now_ms: N) -> super::TipReply
+where
+    G: Fn(String) -> F,
+    F: std::future::Future<
+        Output = std::result::Result<(u16, serde_json::Value), bsv_tracker::HeaderError>,
+    >,
+    L: FnOnce() -> Option<crate::tracker_host::VerifiedTip>,
+    N: FnOnce() -> u64,
+{
+    super::tip_reply_within(get, last_known, now_ms, std::future::pending::<()>()).await
+}
 
 const AT: u64 = 1_790_000_000_000;
 const VERIFIED_HEIGHT: u32 = 970_001;
