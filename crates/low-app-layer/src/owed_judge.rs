@@ -1006,7 +1006,11 @@ pub async fn judge_with_write_bounded(
         return Ok(report);
     }
     let landed = db.run_batch(plan).await?;
-    report.source_changes = landed.iter().take(source_count).map(|r| r.changes).collect();
+    report.source_changes = landed
+        .iter()
+        .take(source_count)
+        .map(|r| r.changes)
+        .collect();
     // The batch committed: nothing below may fail the call (a filing would land its source statements twice).
     // bsv-low #935: the pushes go together after the loop, so a coalescing window costs the call one wait at most.
     let mut pushes = Vec::new();
@@ -1121,6 +1125,37 @@ pub async fn judge_fresh_rows(
     identity: &str,
     games: &[String],
 ) -> Result<Vec<Value>, String> {
+    judge_fresh_rows_ranked(db, identity, games, true).await
+}
+
+/// FIX-1056-FOLD-3 (bsv-low #1056, review 3's MEDIUM-1): THE CEILING'S ONE KEY, `CEILING_DELETE_SQL`'s order (family,
+/// `atHeight` descending, outpoint) over a row as `owed_actor::ROWS_SQL` reads it, so the D1 judge's fresh judgement,
+/// the stored ceiling and the fleet compare's cut of a partial compare ([`crate::owed_actor::compare::fresh_compare`])
+/// rank by one spelling: a row whose key sorts after the identity's 500th row's is cut.
+pub fn ceiling_key(r: &Value) -> (u8, std::cmp::Reverse<i64>, String) {
+    let family_rank = match r["family"].as_str().unwrap_or_default() {
+        "payout" => 0,
+        "refund-due" => 1,
+        "hop-stranded" => 2,
+        "in-progress" => 3,
+        _ => 4,
+    };
+    (
+        family_rank,
+        std::cmp::Reverse(r["atHeight"].as_i64().unwrap_or(0)),
+        r["outpoint"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+/// [`judge_fresh_rows`], cut at the ceiling over the games given when `cut` (the whole identity's games: the stored
+/// ceiling), or uncut (FIX-1056-FOLD-3: a PARTIAL compare's window, whose ceiling is the whole identity's, read from
+/// the actor's own ranking: a window ranked at 500 over its own games holds rows the identity's ceiling cut).
+pub async fn judge_fresh_rows_ranked(
+    db: &impl JudgeDb,
+    identity: &str,
+    games: &[String],
+    cut: bool,
+) -> Result<Vec<Value>, String> {
     let identity = identity.to_ascii_lowercase();
     let mut games: Vec<String> = games.iter().map(|g| g.to_ascii_lowercase()).collect();
     games.sort();
@@ -1136,25 +1171,11 @@ pub async fn judge_fresh_rows(
             ranked.push(stored);
         }
     }
-    // `CEILING_DELETE_SQL`'s order: family, atHeight descending, outpoint; the first 500 stand.
-    let family_rank = |f: &str| match f {
-        "payout" => 0,
-        "refund-due" => 1,
-        "hop-stranded" => 2,
-        "in-progress" => 3,
-        _ => 4,
-    };
-    ranked.sort_by(|a, b| {
-        let key = |r: &Value| {
-            (
-                family_rank(r["family"].as_str().unwrap_or_default()),
-                std::cmp::Reverse(r["atHeight"].as_i64().unwrap_or(0)),
-                r["outpoint"].as_str().unwrap_or_default().to_string(),
-            )
-        };
-        key(a).cmp(&key(b))
-    });
-    ranked.truncate(crate::owed::OWED_MAX_ROWS);
+    // `CEILING_DELETE_SQL`'s order ([`ceiling_key`]); the first 500 stand.
+    ranked.sort_by_key(ceiling_key);
+    if cut {
+        ranked.truncate(crate::owed::OWED_MAX_ROWS);
+    }
     let mut out = ranked;
     out.sort_by(|a, b| {
         a["outpoint"]
@@ -1292,7 +1313,27 @@ fn row_statements(
     }
     let int = |n: Option<i64>| n.map_or(Bind::Null, Bind::Int);
     let opt = |s: &Option<String>| s.clone().map_or(Bind::Null, Bind::Text);
-    let mut out=vec![Stmt{sql:ROW_UPSERT_SQL.into(),binds:vec![Bind::Text(row.identity.clone()),Bind::Text(row.outpoint.clone()),Bind::Text(row.family.as_str().into()),Bind::Text(row.game_id),int(row.sats.map(|v|v as i64)),opt(&row.opponent_identity),int(row.at_height.map(|v|v as i64)),Bind::Text(row.facts.to_string()),Bind::Int(stamp),opt(&row.reason),Bind::Int(stamp),int(claimable),int(gate),int(due),int(probe),Bind::Int(i64::from(fresh_due))]}];
+    let mut out = vec![Stmt {
+        sql: ROW_UPSERT_SQL.into(),
+        binds: vec![
+            Bind::Text(row.identity.clone()),
+            Bind::Text(row.outpoint.clone()),
+            Bind::Text(row.family.as_str().into()),
+            Bind::Text(row.game_id),
+            int(row.sats.map(|v| v as i64)),
+            opt(&row.opponent_identity),
+            int(row.at_height.map(|v| v as i64)),
+            Bind::Text(row.facts.to_string()),
+            Bind::Int(stamp),
+            opt(&row.reason),
+            Bind::Int(stamp),
+            int(claimable),
+            int(gate),
+            int(due),
+            int(probe),
+            Bind::Int(i64::from(fresh_due)),
+        ],
+    }];
     // UPSERT can replace a representative's game, so clear roles even when the subject delete did not find it.
     out.push(Stmt {
         sql: "DELETE FROM owed_row_words WHERE identity=?1 AND outpoint=?2".into(),
@@ -1363,6 +1404,7 @@ macro_rules! identity_games {
         "SELECT gameId,MAX(at) AS at FROM (SELECT gameId,createdAt*1000 AS at FROM potparty_records WHERE identity=?1 UNION ALL SELECT gameId,createdAt*1000 FROM hopparty_records WHERE identity=?1 UNION ALL SELECT gameId,evictedAt FROM released_hop_evidence WHERE identity=?1 UNION ALL SELECT gameId,evictedAt FROM released_hop_evidence_missing WHERE identity=?1 UNION ALL SELECT gameId,updatedAtMs FROM owed_rows WHERE identity=?1) WHERE gameId<>'' GROUP BY gameId ORDER BY at DESC,gameId"
     };
 }
+pub(crate) use identity_games;
 /// bsv-low #912: every game of an identity, newest first (the actor's bootstrap pages them, `?2` the offset).
 pub const IDENTITY_GAMES_PAGE_SQL: &str = concat!(
     "SELECT gameId FROM (",
@@ -1418,7 +1460,11 @@ fn identity_subjects(marks: &[Value]) -> Vec<String> {
 
 /// A wanted envelope (`gameId` empty) expanded to its identity's newest games (`wanted`) and the rest (`backfill`),
 /// the envelope deleted up to the generation read. The drain's and the `owed-events` consumer's one expansion.
-pub async fn expand_wanted(db: &impl SqlPort, identity: &str, generation: i64) -> Result<(), String> {
+pub async fn expand_wanted(
+    db: &impl SqlPort,
+    identity: &str,
+    generation: i64,
+) -> Result<(), String> {
     db.run_batch(vec![
         Stmt {
             sql: EXPAND_WANTED_SQL.into(),
@@ -1786,7 +1832,9 @@ mod cadence_health_tests {
         db.now.set(900_000);
         assert_eq!(dirty_health(&db).await, Value::Null);
         // A rolling old overlay replays its historical index drop; the new snapshot still works.
-        db.conn.execute_batch(bsv_overlay_cloudflare::derived_owed::DIRTY_MARKED_DROP).unwrap();
+        db.conn
+            .execute_batch(bsv_overlay_cloudflare::derived_owed::DIRTY_MARKED_DROP)
+            .unwrap();
         snapshot_dirty(&db).await.unwrap();
         assert_eq!(
             dirty_health(&db).await,

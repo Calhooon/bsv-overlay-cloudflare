@@ -12377,7 +12377,10 @@ fn fix986c2_d_the_routes_call_the_one_compare_behind_the_bearer() {
     );
     let compare_src = squash(include_str!("compare.rs"));
     assert!(
-        compare_src.contains("letfresh=crate::owed_judge::judge_fresh_rows(db,&me,&games).await?;")
+        compare_src.contains("crate::owed_judge::judge_fresh_rows(db,&me,&games).await?,")
+            && compare_src.contains(
+                "crate::owed_judge::judge_fresh_rows_ranked(db,&me,&games,false).await?;"
+            )
     );
     assert!(compare_src.contains("letmutview=rows_view(&me,actor,&fresh,"));
     let lib = squash(include_str!("../lib.rs"));
@@ -12565,7 +12568,9 @@ impl compare::RingCompare for Fix998Weighted<'_> {
             judged_games: None,
             prior: None,
             unjudged: Default::default(),
-            next_offset: 0,
+            lap: compare::Lap::default(),
+            wrapped: false,
+            zero_held_laps: 0,
             rotations: 0,
         }
     }
@@ -22116,6 +22121,14 @@ fn fix1057f1_1_the_landing_lag_reads_the_judges_one_spelling() {
     assert!(!landing_lag(&row(0, 250, wait), &row(1, 300, press)));
 }
 
+/// FIX-1056-FOLD-3: the shipped keyset pick over every game of an identity (the page [`compare::COMPARE_GAMES_SQL`]
+/// answers past `after`, modelled by [`compare::games_page_of`]).
+fn fix1056_pick(first: &[&str], games: &[String], max: usize, after: &str) -> compare::GamePick {
+    let (page, n) = compare::games_page_of(games, after);
+    let first: Vec<String> = first.iter().map(|g| g.to_string()).collect();
+    compare::pick_games_keyset(&first, &[], &page, n, after, max)
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // FIX-1056 (bsv-low #1056; the review `FIX-1046-REVIEW-2-2026-11-02.md`, LOW-1, LOW-2, NOTE-1): nothing the compare did
 // not judge reads as a clear; a wall stop inside the re-reads owes the forward walk; the judge-side clear is counted
@@ -22639,20 +22652,17 @@ mod fix1056 {
     async fn fix1056f_l1_the_window_rotates_and_partial_is_served() {
         let games: Vec<String> = (0..150).map(|i| format!("g{i:03}")).collect();
         let mut seen: BTreeSet<String> = BTreeSet::new();
-        let mut offset = 0;
+        let mut after = String::new();
         for _ in 0..3 {
-            let (picked, total, next, _) =
-                compare::pick_games_rotating(&["g149".to_string()], &[], &games, 64, offset);
-            assert_eq!((picked.len(), total, picked[0].as_str()), (64, 150, "g149"));
-            seen.extend(picked);
-            offset = next;
+            let p = fix1056_pick(&["g149"], &games, 64, &after);
+            assert_eq!(
+                (p.picked.len(), p.total, p.picked[0].as_str()),
+                (64, 150, "g149")
+            );
+            seen.extend(p.picked);
+            after = p.next_after;
         }
         assert_eq!(seen.len(), 150, "every game judged in three compares");
-        assert_eq!(
-            compare::pick_games(&[], &[], &games, 64).0,
-            compare::pick_games_rotating(&[], &[], &games, 64, 0).0,
-            "offset 0 is the base's window"
-        );
         let f = fixtures()
             .into_iter()
             .find(|f| f.name == "d1_fleet")
@@ -22697,10 +22707,10 @@ mod fix1056 {
             let col = json!(compare::partial_column(&row));
             assert_eq!(
                 (
-                    compare::offset_of_partial(&col),
+                    compare::zero_held_laps_of_partial(&col),
                     compare::rotations_of_partial(&col)
                 ),
-                (row.next_offset, row.rotations)
+                (row.zero_held_laps, row.rotations)
             );
             d1.run_batch(vec![compare::upsert_stmt(&row)])
                 .await
@@ -22784,6 +22794,20 @@ mod fix1056f2 {
         r
     }
 
+    fn stored_lap(d1: &SqliteSql, id: &str) -> compare::Lap {
+        d1.conn
+            .query_row(
+                "SELECT lap FROM owed_actor_compare WHERE identity=?1 AND partial>0",
+                [id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .map_or_else(compare::Lap::default, |t| {
+                compare::Lap::of_column(&json!(t))
+            })
+    }
+
     fn stored_partial(d1: &SqliteSql, id: &str) -> Value {
         d1.conn
             .query_row(
@@ -22838,20 +22862,19 @@ mod fix1056f2 {
             } else {
                 stored_partial(&d1, id)
             };
-            let (picked, total, next, wrapped) = compare::pick_games_rotating(
-                &[],
+            let p = fix1056_pick(
                 &[],
                 &games,
                 compare::FRESH_COMPARE_GAMES_MAX,
-                compare::offset_of_partial(&col),
+                &stored_lap(&d1, id).after,
             );
-            assert_eq!((picked.len(), total), (64, 200));
-            judged.extend(picked);
+            assert_eq!((p.picked.len(), p.total), (64, 200));
+            judged.extend(p.picked);
             good += 1;
             let mut r = raw(&[], &[], NOW_MS as i64 + k, Some(&[]), &[]);
             r.identity = id.into();
-            r.next_offset = next;
-            r.rotations = compare::rotations_of_partial(&col) + u64::from(wrapped);
+            r.lap.after = p.next_after;
+            r.rotations = compare::rotations_of_partial(&col) + u64::from(p.wrapped);
             d1.run_batch(vec![compare::upsert_stmt(&r)]).await.unwrap();
             if judged.len() < 200 {
                 assert_eq!(serve(&d1)["partialUnrotated"], json!(1));
@@ -22875,7 +22898,7 @@ mod fix1056f2 {
         assert_eq!(compare::rotations_of_partial(&col), 1, "{col}");
         let mut r = raw(&[], &[], NOW_MS as i64 + 99, Some(&[]), &[]);
         r.identity = id.into();
-        r.next_offset = compare::offset_of_partial(&col);
+        r.lap = stored_lap(&d1, id);
         r.rotations = 1;
         d1.run_batch(vec![compare::upsert_stmt(&r)]).await.unwrap();
         let served = serve(&d1);
@@ -22895,13 +22918,13 @@ mod fix1056f2 {
             })
             .unwrap();
         assert_eq!(summary, (0, 1), "the route's summary is the snapshot's");
-        // A row written before the fold (1 + offset) reads 0 rotations and its offset.
+        // A row written before FIX-1056 (`partial` 1, a flag) reads 0 rotations and 0 zero-held laps.
         assert_eq!(
             (
-                compare::offset_of_partial(&json!(7)),
-                compare::rotations_of_partial(&json!(7))
+                compare::zero_held_laps_of_partial(&json!(1)),
+                compare::rotations_of_partial(&json!(1))
             ),
-            (6, 0)
+            (0, 0)
         );
         // Under D1's REAL bind the column round-trips.
         crate::pot_hook::tests::INTS_AS_REAL.with(|c| c.set(true));
@@ -22910,11 +22933,12 @@ mod fix1056f2 {
         let col = stored_partial(&d1, id);
         assert_eq!(
             (
-                compare::offset_of_partial(&col),
+                compare::zero_held_laps_of_partial(&col),
                 compare::rotations_of_partial(&col)
             ),
-            (r.next_offset, 1)
+            (r.zero_held_laps, 1)
         );
+        assert_eq!(stored_lap(&d1, id), r.lap, "the lap round-trips");
     }
 
     /// (fix1056f2_n1) THE SECOND REVIEW'S NOTE-1 (its pin `rv2_d_a_pending_game_shifts_the_window`): a pending game is
@@ -22924,12 +22948,11 @@ mod fix1056f2 {
     fn fix1056f2_n1_a_pending_game_never_shifts_the_window() {
         let games: Vec<String> = (0..150).map(|i| format!("g{i:03}")).collect();
         let mut seen: BTreeSet<String> = BTreeSet::new();
-        let mut offset = 0;
+        let mut after = String::new();
         for pend in ["g149", "g010", "g140"] {
-            let (picked, _, next, _) =
-                compare::pick_games_rotating(&[pend.to_string()], &[], &games, 64, offset);
-            seen.extend(picked);
-            offset = next;
+            let p = fix1056_pick(&[pend], &games, 64, &after);
+            seen.extend(p.picked);
+            after = p.next_after;
         }
         assert_eq!(seen.len(), 150);
     }
@@ -23088,5 +23111,357 @@ mod fix1056f2 {
             met > 0,
             "a window judged the actor's game and not the stored one"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// FIX-1056-FOLD-3 (bsv-low #1056; the review `FIX-1056-REVIEW-3-2026-11-02.md`): one ceiling rule for both sides of a
+// partial compare; the rotation by keyset over the game id; the absent carry's restart; the laps read zero; the
+// overflow past the counted bound carried.
+mod fix1056f3 {
+    use super::*;
+
+    const W: i64 = 5_000;
+
+    fn row(o: &str, game: &str, sats: i64) -> Value {
+        json!({"outpoint": o, "family": "payout", "gameId": game, "sats": sats, "opponentIdentity": null,
+               "atHeight": null, "reason": "r", "facts": "{}", "claimable": 1})
+    }
+
+    fn raw(
+        d1: &[Value],
+        actor: &[Value],
+        now: i64,
+        judged: &[&str],
+        unjudged: &[&str],
+    ) -> compare::CompareRow {
+        let mut view = crate::owed_actor::rows_view(
+            "02aa",
+            Ok(json!({"rows": actor, "bootstrapped": true})),
+            d1,
+            None,
+            None,
+        );
+        view["heldByLag"] = json!([]);
+        view["diffFields"] = json!([]);
+        view["d1"]["games"] = json!({"partial": true, "judgedGames": judged});
+        let mut r = compare::compare_row_of("02aa", now, Ok(&view));
+        r.unjudged = unjudged.iter().map(|o| o.to_string()).collect();
+        r
+    }
+
+    async fn whale() -> (Fixture, SqliteSql, String, Vec<String>) {
+        let f = fixtures()
+            .into_iter()
+            .find(|f| f.name == "d1_fleet")
+            .unwrap();
+        let d1 = d1_judge(&f).await;
+        let mut best = (String::new(), Vec::new());
+        for id in &f.identities {
+            let games: Vec<String> = d1
+                .conn
+                .prepare(compare::COMPARE_GAMES_SQL)
+                .unwrap()
+                .query_map(rusqlite::params![id, 4_096], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            if games.len() > best.1.len() {
+                best = (id.clone(), games);
+            }
+        }
+        let (id, games) = best;
+        (f, d1, id, games)
+    }
+
+    /// (fix1056f3_m1) REVIEW 3'S MEDIUM-1 (its pin `rv3_d_a_partial_compares_d1_side_escapes_the_identity_ceiling`):
+    /// ONE CEILING RULE FOR BOTH SIDES. The frozen `d1_fleet` whale (1,033 games, D1 judge on); the actor handed to the
+    /// shipped [`compare::fresh_compare`] holds EXACTLY the D1 judge's whole fresh judgement (its 500 rows at the
+    /// ceiling). Every window of a whole lap reads ZERO (each D1 row the identity's ceiling cuts served `pastCeiling`,
+    /// never a difference); the lap judges every game once and its wrap is counted once. RED on a8f1f3f2 and with
+    /// [`compare::ceiling_cut`] made inert: the first window's `diff` 64 of 64, every one past the actor's 500th key.
+    #[tokio::test]
+    async fn fix1056f3_m1_an_actor_equal_to_d1_reads_zero_on_every_window_of_a_whale() {
+        let (_f, d1, id, games) = whale().await;
+        assert!(games.len() > 1_000, "{} games", games.len());
+        let port = Fix986 {
+            d1: &d1,
+            actors: BTreeMap::new(),
+            judges: true,
+            die_after: Cell::new(u32::MAX),
+        };
+        let whole = crate::owed_judge::judge_fresh_rows(&port, &id, &games)
+            .await
+            .unwrap();
+        assert_eq!(
+            whole.len(),
+            crate::owed::OWED_MAX_ROWS,
+            "the whale is past the ceiling"
+        );
+        let actor = json!({"rows": whole, "bootstrapped": true});
+        let mut judged: BTreeSet<String> = BTreeSet::new();
+        let mut past_total = 0usize;
+        let mut wraps = 0u64;
+        let mut statements = Vec::new();
+        for k in 0..40i64 {
+            let m = compare::Metered::new(&port);
+            let view = compare::fresh_compare(&m, &id, Ok(actor.clone()))
+                .await
+                .unwrap();
+            statements.push(m.statements.get());
+            assert_eq!(view["d1"]["games"]["partial"], json!(true));
+            assert_eq!(
+                view["diff"],
+                json!([]),
+                "compare {k}: an actor equal to D1 reads zero (past the ceiling {})",
+                view["d1"]["pastCeiling"]
+            );
+            past_total += view["d1"]["pastCeiling"].as_array().unwrap().len();
+            judged.extend(
+                view["d1"]["games"]["judgedGames"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|g| g.as_str().unwrap().to_string()),
+            );
+            let row = compare::classify_reread(
+                compare::compare_row_of(&id, NOW_MS as i64 + k, Ok(&view)),
+                view.get("storedCompare"),
+                NOW_MS as i64 + k,
+                W,
+            );
+            assert_eq!(row.diff_count, Some(0));
+            d1.run_batch(vec![compare::upsert_stmt(&row)])
+                .await
+                .unwrap();
+            if row.wrapped {
+                wraps += 1;
+                break;
+            }
+        }
+        assert_eq!(
+            (judged.len(), wraps),
+            (games.len(), 1),
+            "one lap, every game"
+        );
+        assert!(past_total > 0, "the cut is what made the zero");
+        eprintln!(
+            "fix1056f3_m1: {} games, {} compares a lap, {past_total} D1 rows past the ceiling a lap, statements a compare {:?}",
+            games.len(),
+            statements.len(),
+            statements
+        );
+        // The ceiling cut itself: below the ceiling (an actor of 499 rows) nothing is cut.
+        let (kept, past) = compare::ceiling_cut(
+            vec![row("zz:0", "g", 1)],
+            &actor["rows"].as_array().unwrap()[..499],
+            true,
+        );
+        assert_eq!((kept.len(), past.len()), (1, 0));
+    }
+
+    /// (fix1056f3_l1) REVIEW 3'S LOW-1 (its pin `rv3_a_a_backward_move_skips_a_game_and_the_rotation_still_counts`) and
+    /// NOTE-1: THE ROTATION OVER A STABLE LIST. 200 games under 64 places; after the first compare a game is added
+    /// with an id below the cursor, one with an id above it, and a game removed: the lap's wrap is counted only once
+    /// every game present at its start has been judged in it (the one added below the cursor is the next lap's).
+    /// Moving a game in the newest-first order moves nothing (the order is the id). RED against the base's positional
+    /// rotation (a game skipped in the counting lap); new API on a8f1f3f2 (`pick_games_keyset`).
+    #[test]
+    fn fix1056f3_l1_a_lap_judges_every_game_present_at_its_start() {
+        let mut games: Vec<String> = (0..200).map(|i| format!("g{:03}", i * 2)).collect();
+        let at_start: BTreeSet<String> = games.iter().cloned().collect();
+        let mut judged: BTreeSet<String> = BTreeSet::new();
+        let mut after = String::new();
+        let mut compares = 0;
+        loop {
+            let p = fix1056_pick(&[], &games, 64, &after);
+            compares += 1;
+            judged.extend(p.picked.iter().cloned());
+            if compares == 1 {
+                // A game below the cursor (the next lap's), one above it (this lap's), one removed.
+                games.push("g001".into());
+                games.push("g399".into());
+                games.retain(|g| g != "g200");
+            }
+            if p.wrapped {
+                let missed: Vec<&String> = at_start
+                    .iter()
+                    .filter(|g| *g != "g200" && !judged.contains(*g))
+                    .collect();
+                assert!(
+                    missed.is_empty(),
+                    "the wrap counted with {missed:?} unjudged"
+                );
+                assert!(judged.contains("g399"));
+                break;
+            }
+            after = p.next_after;
+            assert!(compares < 10, "the lap ends");
+        }
+        assert_eq!(compares, 4, "ceil(200 / 64) compares a lap");
+        // The next lap starts at the first game: `g001` is judged in it.
+        let p = fix1056_pick(&[], &games, 64, "");
+        assert_eq!(p.picked[0], "g000");
+        assert!(p.picked.contains(&"g001".to_string()));
+        // A cursor that names a game since removed walks on past where it stood.
+        let p = fix1056_pick(&[], &games, 64, "g200");
+        assert_eq!(p.picked[0], "g202");
+    }
+
+    /// (fix1056f3_l3) REVIEW 3'S LOW-3 (its pin `rv3_e_a_side_holding_it_restarts_the_absent_count`; mutant M1
+    /// survived every `fix1056` pin): an absent counted entry (`absentSince` 1) that a side is then seen holding in a
+    /// game not judged (rotation 2) restarts its absent count; absent again at rotation 3, it is still carried (no
+    /// full lap since a side last held it). RED under M1 (the removal skipped): dropped at rotation 3, `Some(0)`.
+    #[test]
+    fn fix1056f3_l3_a_side_holding_it_restarts_the_absent_count() {
+        let t = NOW_MS as i64;
+        let prior = json!([{"outpoint": "x:0", "held": false, "gameId": "gx", "absentSince": 1}]);
+        let mut r = raw(&[], &[], t, &["gy"], &["x:0"]);
+        r.rotations = 2;
+        let r = compare::classify_reread(r, Some(&prior), t, W);
+        assert_eq!(r.diff_count, Some(1));
+        let stored = r.outpoints.clone();
+        assert!(stored[0].get("absentSince").is_none(), "{stored}");
+        let mut r = raw(&[], &[], t + 1, &["gx"], &[]);
+        r.rotations = 3;
+        let r = compare::classify_reread(r, Some(&stored), t + 1, W);
+        assert_eq!(r.diff_count, Some(1), "no full lap since a side held it");
+        assert_eq!(r.outpoints[0]["absentSince"], json!(3));
+    }
+
+    /// (fix1056f3_l2) REVIEW 3'S LOW-2: THE LAPS READ ZERO. A partial identity's `zeroHeldLaps` counts the laps it
+    /// completed with no counted and no pending difference on any compare of the lap: a clean lap counts one, a
+    /// pending difference anywhere resets it to 0 and dirties its lap, the next clean lap counts again. Stored in the
+    /// `partial` column through the shipped upsert under real SQLite and served as `partialZeroHeldLapsMin` by the
+    /// route's summary and the public snapshot. New API on a8f1f3f2.
+    #[tokio::test]
+    async fn fix1056f3_l2_the_laps_read_zero_are_counted_and_served() {
+        let d1 = SqliteSql::migrated();
+        let t = NOW_MS as i64;
+        let mut prior: Value = json!([]);
+        let mut state = (compare::Lap::default(), 0u64, 0u64);
+        // (sides, wrapped) per compare: 0 no rows, 1 a difference (pending), 2 the same outpoint equal on both sides
+        // (the pending one cleared by the actor's apply: named, never counted). Lap 1 clean (two compares), lap 2
+        // dirty in its middle, lap 3 clean.
+        let steps = [
+            (0, false),
+            (0, true),
+            (0, false),
+            (1, false),
+            (2, true),
+            (2, false),
+            (2, true),
+        ];
+        let mut laps = Vec::new();
+        for (k, (sides, wrapped)) in steps.iter().enumerate() {
+            let now = t + k as i64 * 10 * W;
+            let (d1_rows, actor) = match sides {
+                1 => (vec![row("d:0", "g", 1)], vec![row("d:0", "g", 2)]),
+                2 => (vec![row("d:0", "g", 1)], vec![row("d:0", "g", 1)]),
+                _ => (vec![], vec![]),
+            };
+            let mut r = raw(&d1_rows, &actor, now, &["g"], &[]);
+            r.identity = "02f3".into();
+            r.lap = state.0.clone();
+            r.rotations = state.1 + u64::from(*wrapped);
+            r.zero_held_laps = state.2;
+            r.wrapped = *wrapped;
+            let r = compare::classify_reread(r, Some(&prior), now, W);
+            d1.run_batch(vec![compare::upsert_stmt(&r)]).await.unwrap();
+            prior = r.outpoints.clone();
+            state = (r.lap.clone(), r.rotations, r.zero_held_laps);
+            laps.push(r.zero_held_laps);
+        }
+        assert_eq!(laps, vec![0, 1, 1, 0, 0, 0, 1], "{laps:?}");
+        let col: i64 = d1
+            .conn
+            .query_row(
+                "SELECT partial FROM owed_actor_compare WHERE identity='02f3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(compare::zero_held_laps_of_partial(&json!(col)), 1);
+        let summary: i64 = d1
+            .conn
+            .query_row(compare::COMPARE_SUMMARY_SQL, [], |r| {
+                r.get("partialZeroHeldLapsMin")
+            })
+            .unwrap();
+        assert_eq!(summary, 1);
+        d1.conn
+            .prepare(crate::owed_events_publish::FLEET_COMPARE_HEALTH_SQL)
+            .unwrap()
+            .execute(rusqlite::params![
+                t,
+                0,
+                1,
+                compare::RING_NAME,
+                compare::RING_NAME
+            ])
+            .unwrap();
+        let cursor: String = d1
+            .conn
+            .query_row(
+                "SELECT cursor FROM owed_belt_state WHERE name='fleet-compare:health'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let served = crate::owed_events_publish::fleet_compare_health_view(Some(&cursor), t);
+        assert_eq!(served["partialZeroHeldLapsMin"], json!(1), "{served}");
+    }
+
+    /// (fix1056f3_n2) REVIEW 3'S NOTE-2 (its pin `rv3_c_the_2049th_counted_difference_is_a_false_zero`): 2,049 counted
+    /// differences on one partial identity; the 2,049th has no place in the stored list. A later partial compare that
+    /// judges none of their games, and finds every stored one cleared, still reads `diffCount` at least 1 (the
+    /// overflow carried in the lap) until a lap ends with no overflow in it. RED on a8f1f3f2: `diffCount` 0.
+    #[test]
+    fn fix1056f3_n2_the_counted_overflow_is_carried_until_a_clean_lap() {
+        let t = NOW_MS as i64;
+        let n = compare::COMPARE_ROW_COUNTED_MAX + 1;
+        let d1_rows: Vec<Value> = (0..n)
+            .map(|i| row(&format!("o{i:05}:0"), "ga", 1))
+            .collect();
+        let actor: Vec<Value> = (0..n)
+            .map(|i| row(&format!("o{i:05}:0"), "ga", 2))
+            .collect();
+        let prior: Value = json!((0..n)
+            .map(|i| json!({"outpoint": format!("o{i:05}:0"), "held": false, "gameId": "ga"}))
+            .collect::<Vec<_>>());
+        let r =
+            compare::classify_reread(raw(&d1_rows, &actor, t, &["ga"], &[]), Some(&prior), t, W);
+        assert_eq!(r.diff_count, Some(n as i64));
+        assert_eq!(r.lap.overflow, 1);
+        // Every stored one now equal on both sides, the 2,049th (in no list) not among the rows read: the stored list
+        // holds nothing standing.
+        let stored = r.outpoints.clone();
+        let lap = r.lap.clone();
+        let eq: Vec<Value> = (0..n - 1)
+            .map(|i| row(&format!("o{i:05}:0"), "ga", 1))
+            .collect();
+        let mut next = raw(&eq, &eq, t + 1, &["ga"], &[]);
+        next.lap = lap;
+        let next = compare::classify_reread(next, Some(&stored), t + 1, W);
+        assert!(
+            next.diff_count.unwrap() >= 1,
+            "the overflow is carried: {:?}",
+            next.diff_count
+        );
+        // A lap that ends with no overflow in it ends the carry... but this lap overflowed: the wrap keeps it.
+        let mut wrap = raw(&eq, &eq, t + 2, &["ga"], &[]);
+        wrap.lap = next.lap.clone();
+        wrap.wrapped = true;
+        let wrap = compare::classify_reread(wrap, Some(&next.outpoints), t + 2, W);
+        assert!(
+            wrap.diff_count.unwrap() >= 1,
+            "the lap that overflowed ends dirty"
+        );
+        // The next lap, with no overflow, ends it.
+        let mut clean = raw(&eq, &eq, t + 3, &["ga"], &[]);
+        clean.lap = wrap.lap.clone();
+        clean.wrapped = true;
+        let clean = compare::classify_reread(clean, Some(&wrap.outpoints), t + 3, W);
+        assert_eq!(clean.diff_count, Some(0));
     }
 }

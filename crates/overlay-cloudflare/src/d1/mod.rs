@@ -655,7 +655,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 493 to 494 for bsv-low #1019 (FIX-1019): `pot_evictions.refusalClass`, the refusal's class the eviction's OPEN
 /// marker records at the write (`eviction_class`), read by `/utxo-status` and `ls_pot spentStatus` beside the
 /// chain word. A COLUMN of a mirrored family: the owed actor's schema digest moves (each actor rebuilds once).
-pub const OVERLAY_MIGRATION_COUNT: usize = 494;
+/// 494 to 495 for bsv-low #1056 (FIX-1056-FOLD-3): `owed_actor_compare.lap`, a partial identity's lap in the fleet
+/// compare (the keyset cursor over its game ids, the lap's zero and its overflow). Not a mirrored family: no actor
+/// digest moves. The app layer reads it: the overlay first.
+pub const OVERLAY_MIGRATION_COUNT: usize = 495;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2519,6 +2522,8 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::derived_owed::write_time::SPENDER_BYTES_DELETE,
     // 494: bsv-low #1019, the eviction's refusal class, recorded by the OPEN marker (`OPEN_EVICTION_MARKER_SQL`).
     "ALTER TABLE pot_evictions ADD COLUMN refusalClass TEXT",
+    // 495: bsv-low #1056 (FIX-1056-FOLD-3), the fleet compare's lap of a partial identity (its keyset cursor).
+    "ALTER TABLE owed_actor_compare ADD COLUMN lap TEXT",
 ];
 
 // =============================================================================
