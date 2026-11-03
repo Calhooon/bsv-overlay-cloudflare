@@ -21,6 +21,8 @@ fn tip() -> VerifiedTip {
         at: AT,
         last_pass_at: Some(AT),
         last_seen_height: Some(VERIFIED_HEIGHT),
+        live_lag_blocks: None,
+        linked: None,
     }
 }
 
@@ -861,4 +863,75 @@ async fn fix1081_d_every_503_names_its_reason_and_the_route_logs_it() {
         .next()
         .unwrap();
     assert!(log.contains("console_warn!(\"[tip] 503 ERR_TIP_UNAVAILABLE: {reason}\")"));
+}
+
+// ── bsv-low #1077: the freshness carries the store's own courier lag ──
+
+fn info_with(f: impl Fn(&mut Value)) -> Value {
+    let mut sync = info();
+    f(&mut sync["value"]);
+    sync
+}
+
+async fn reply_over_info(sync: Value) -> super::TipReply {
+    tip_reply_with(
+        |route| {
+            ready(if route == "getInfo" {
+                Ok((200, sync.clone()))
+            } else {
+                response(route, header())
+            })
+        },
+        || None,
+        || AT + 20_000,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn fix1077_a_a_young_pass_two_behind_the_seen_tip_serves_stale() {
+    let reply = reply_over_info(info_with(|v| {
+        v["lastSeenHeight"] = json!(VERIFIED_HEIGHT + 2);
+        v["liveLagBlocks"] = json!(2);
+    }))
+    .await;
+    assert_eq!(reply.status, 503);
+    assert_eq!(reply.body["freshness"], "stale");
+    assert_eq!(
+        reply.body["lagBlocks"], 2,
+        "the lag is named: {}",
+        reply.body
+    );
+}
+
+#[tokio::test]
+async fn fix1077_b_the_stores_own_lag_word_is_read_beside_its_seen_height() {
+    // The store's `liveLagBlocks` (seen less its stored tip) says two blocks
+    // where its seen height alone reads none: the larger word stands.
+    let reply = reply_over_info(info_with(|v| v["liveLagBlocks"] = json!(2))).await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.body["freshness"], "stale");
+    assert_eq!(reply.body["lagBlocks"], 2);
+}
+
+#[tokio::test]
+async fn fix1077_c_a_broken_link_state_is_stale() {
+    let reply = reply_over_info(info_with(|v| {
+        v["linkState"] = json!({"from": VERIFIED_HEIGHT - 399, "to": VERIFIED_HEIGHT,
+            "linked": false, "broken": [VERIFIED_HEIGHT - 5], "brokenCount": 1});
+    }))
+    .await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.body["freshness"], "stale");
+    // A linked chain, one block of lag: fresh, the lag named.
+    let reply = reply_over_info(info_with(|v| {
+        v["lastSeenHeight"] = json!(VERIFIED_HEIGHT + 1);
+        v["liveLagBlocks"] = json!(1);
+        v["linkState"] = json!({"from": 1, "to": VERIFIED_HEIGHT, "linked": true,
+            "broken": [], "brokenCount": 0});
+    }))
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["freshness"], "fresh");
+    assert_eq!(reply.body["lagBlocks"], 1);
 }

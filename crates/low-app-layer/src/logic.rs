@@ -3979,6 +3979,8 @@ mod tests {
             at: 123_000,
             last_pass_at: Some(123_500),
             last_seen_height: Some(812_345),
+            live_lag_blocks: None,
+            linked: None,
         };
         let v = tip_body(Some(&tip), 124_001);
         assert_eq!(v["height"], 812_345);
