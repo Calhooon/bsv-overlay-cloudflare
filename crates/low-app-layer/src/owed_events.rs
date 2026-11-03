@@ -2935,6 +2935,10 @@ pub struct DirectReport {
     pub first_fault: Option<String>,
     /// FIX-956 item 3 (Phase C only): games whose marks the pass acknowledged after their apply landed.
     pub acked: u64,
+    /// bsv-low #1085 (L59 S-A): each call that walled or faulted, its identity and its event's write time (`atMs`):
+    /// noted unapplied for the fleet's per-identity row and re-published to the queue at once
+    /// ([`direct_events_as`]), so the backstop does not wait for the sweep.
+    pub unapplied: Vec<(String, Option<u64>)>,
     /// D2-ACTOR-F (bsv-low #959): events whose subjects and rows the publish carried (no marks read here).
     pub carried: u64,
     /// D2-ACTOR-F-FOLD-3: the carried filings this pass gave a closure ([`DirectPort::closure_read`], the pass's ONE
@@ -3460,6 +3464,7 @@ pub async fn direct_with_class(
         report.faults += o.faults;
         report.held += o.held;
         report.acked += o.acked;
+        report.unapplied.extend(o.unapplied);
         if report.first_fault.is_none() {
             report.first_fault = o.first_fault;
         }
@@ -3487,6 +3492,7 @@ struct CallsDone {
     held: u64,
     acked: u64,
     first_fault: Option<String>,
+    unapplied: Vec<(String, Option<u64>)>,
 }
 
 /// The direct calls of `bodies` at once (`join_all`), each body stamped with the pass's class and fan-out; in Phase C
@@ -3539,8 +3545,17 @@ async fn call_bodies(
             }
         }
     }
+    let keys: Vec<(String, Option<u64>)> = bodies
+        .iter()
+        .map(|b| {
+            (
+                b["identity"].as_str().unwrap_or_default().to_owned(),
+                b["atMs"].as_u64(),
+            )
+        })
+        .collect();
     let answers = futures_util::future::join_all(bodies.into_iter().map(|b| port.call(b))).await;
-    for (answer, bound) in answers.into_iter().zip(bounds) {
+    for ((answer, bound), key) in answers.into_iter().zip(bounds).zip(keys) {
         if let (Ok(a), Some((id, games, seen))) = (&answer, &bound) {
             let applied = applied_games(a, games);
             if !applied.is_empty()
@@ -3567,6 +3582,7 @@ async fn call_bodies(
                     done.faults += 1;
                 }
                 done.first_fault.get_or_insert(e);
+                done.unapplied.push(key);
             }
         }
     }
@@ -3678,9 +3694,43 @@ pub async fn direct_events_as(
     .map(|(n, d)| (n.to_string(), d))
     .collect();
     port.sql.counters(deltas).await;
+    // bsv-low #1085 (L59 S-A): a call that walled or faulted is noted unapplied for its identity (the fleet row's
+    // per-identity map, visible on `/health.owedActor.unappliedIdentities` until an apply of it lands), and its
+    // identity is re-published to the queue NOW (one identity event: the consumer judges every pending mark of it), so
+    // the backstop reaches the actor inside the bar, not at the sweep's tick (its stalled bound is 600 s). The event is
+    // the queue's alone: taken back from this isolate's direct set (a held identity would be called directly again,
+    // and wall again, at the next flush).
+    let republish = walled_identities(&report);
+    for (id, at) in &report.unapplied {
+        crate::owed_actor::note_actor_fault(id, *at);
+    }
+    if !republish.is_empty() {
+        let pairs: Vec<(&str, String)> = republish
+            .iter()
+            .map(|id| (owed_event::ROUTE_IDENTITY, id.clone()))
+            .collect();
+        publish_pairs(env, &pairs).await;
+        publish::take_direct_where(|e| {
+            e.source == owed_event::ROUTE_IDENTITY && republish.contains(&e.source_key)
+        });
+    }
     // MEDIUM-7: the direct class's samples into the fleet's durable bars.
     crate::owed_actor::flush_bars(&port.sql, worker::Date::now().as_millis(), false).await;
     report
+}
+
+/// PURE (bsv-low #1085): the identities a pass's walled or faulted calls name, each once, lowercased (the identity
+/// events the pass re-publishes to the queue).
+pub fn walled_identities(report: &DirectReport) -> Vec<String> {
+    let mut out: Vec<String> = report
+        .unapplied
+        .iter()
+        .map(|(id, _)| id.to_ascii_lowercase())
+        .filter(|id| !id.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The invocation's held direct set, called inline (the scheduled word tick: "inline on the scheduled drain").

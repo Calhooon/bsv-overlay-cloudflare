@@ -883,3 +883,47 @@ async fn fix974_c_the_mined_frame_takes_the_direct_road() {
         "if!crate::owed_actor::mined_word_event(&ev)||port.ingest_frame(frame).await.is_err(){report.left_to_queue+=1;continue;}"
     ));
 }
+
+/// fix1085_b (bsv-low #1085, L59 S-A): A DIRECT CALL THAT WALLS (or faults) is reported with its identity and its
+/// event's write time, so the pass notes it unapplied for the fleet's per-identity row and re-publishes the identity
+/// to the queue at once; an answered call is not. The worker's pass does both (source). New API.
+#[tokio::test]
+async fn fix1085_b_a_walled_direct_call_names_its_identity_for_the_backstop() {
+    for (answer, named) in [
+        (Err("owed actor: no answer in 2000 ms".to_string()), true),
+        (Err("owed actor answered 503".to_string()), true),
+        (
+            Ok(json!({"applied": true, "firstApply": true, "appliedGames": ["g1"], "atMs": T0})),
+            false,
+        ),
+    ] {
+        let db = SqliteSql::migrated();
+        let (s, k) = hop();
+        mark(&db, "g1", &s, &k, T0);
+        let port = AckPort {
+            db: &db,
+            phase_c: true,
+            answer: answer.clone(),
+            calls: RefCell::new(0),
+        };
+        let report = direct_with(&port, vec![direct_event()], None).await;
+        if named {
+            assert_eq!(
+                report.unapplied,
+                vec![(ID.to_string(), Some(T0 as u64))],
+                "{answer:?}"
+            );
+            assert_eq!(walled_identities(&report), vec![ID.to_ascii_lowercase()]);
+        } else {
+            assert!(report.unapplied.is_empty(), "{answer:?}");
+        }
+    }
+    let src: String = include_str!("../owed_events.rs")
+        .split_whitespace()
+        .collect();
+    let pass = &src[src.find("pubasyncfndirect_events_as(").unwrap()..];
+    let pass = &pass[..pass.find("pubfnwalled_identities(").unwrap()];
+    assert!(pass.contains("crate::owed_actor::note_actor_fault(id,*at);"));
+    assert!(pass.contains("publish_pairs(env,&pairs).await;"));
+    assert!(pass.contains("publish::take_direct_where("));
+}

@@ -23741,3 +23741,71 @@ mod fix1087 {
         assert_eq!(row(&d1).0, Some(1), "the D1 press stands for the belt's first class");
     }
 }
+
+/// FIX-1085 (bsv-low #1085, L59 S-A): A PER-IDENTITY STALL IS VISIBLE ON THE FLEET'S ROW. Each isolate flushes the queue
+/// row; a stall one isolate noted (a walled or faulted apply of identity X) must survive another isolate's flush that
+/// landed applies of other identities, and must clear only when an apply of X lands (anywhere) after it. Until this
+/// fix the row held one value, each isolate's own minimum: an isolate with nothing unapplied wrote none and cleared X
+/// (L59: pending 2 for at least 163 s while `owed-actor-oldest-unapplied` read empty at every snapshot).
+mod fix1085 {
+    use super::*;
+
+    const X: &str = "02f23c5e00000000000000000000000000000000000000000000000000000001085";
+    const Y: &str = "02f23c5e00000000000000000000000000000000000000000000000000000002085";
+
+    fn fleet(db: &SqliteSql, now: u64) -> Value {
+        let rows: Vec<Value> = db
+            .conn
+            .prepare("SELECT json_object('name',name,'cursor',cursor,'tickedAtMs',tickedAtMs) FROM owed_belt_state WHERE name LIKE 'owed-actor:bars:%'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|s| serde_json::from_str(&s.unwrap()).unwrap())
+            .collect();
+        fleet_bars(&rows, now, lib_rev())
+    }
+
+    fn landed(id: &str, judged: u64) -> Value {
+        json!({"identity": id, "applied": true, "firstApply": true, "applyMs": 40, "atMs": judged - 40, "judgedAtMs": judged})
+    }
+
+    #[tokio::test]
+    async fn fix1085_a_a_stall_one_isolate_noted_survives_another_isolates_flush() {
+        let db = SqliteSql::migrated();
+        let t = 1_800_000_000_000u64;
+        // isolate A: X's direct call walled at t
+        let mut a = PendingBars::default();
+        a.note_fault(X, Some(t));
+        flush_bars_from(&db, t + 1_000, &a).await.unwrap();
+        // isolate B: the queue landed Y's applies, nothing unapplied of its own
+        let mut b = PendingBars::default();
+        b.note_answer("queue", &landed(Y, t + 30_000));
+        flush_bars_from(&db, t + 31_000, &b).await.unwrap();
+        let f = fleet(&db, t + 163_000);
+        assert_eq!(
+            f["actorOldestUnappliedEventAgeMs"],
+            json!(163_000),
+            "the stall another isolate noted is still the fleet's: {f}"
+        );
+        assert_eq!(f["actorUnappliedIdentities"]["count"], 1, "{f}");
+        assert_eq!(f["actorUnappliedIdentities"]["oldest"][0]["identity"], X);
+        // an apply of X judged BEFORE the stall's event clears nothing; one judged after it clears it
+        let mut c = PendingBars::default();
+        c.note_answer("queue", &landed(X, t - 5));
+        flush_bars_from(&db, t + 170_000, &c).await.unwrap();
+        assert_eq!(fleet(&db, t + 171_000)["actorUnappliedIdentities"]["count"], 1);
+        let mut d = PendingBars::default();
+        d.note_answer("direct", &landed(X, t + 180_000));
+        flush_bars_from(&db, t + 181_000, &d).await.unwrap();
+        let f = fleet(&db, t + 182_000);
+        assert_eq!(f["actorOldestUnappliedEventAgeMs"], Value::Null, "{f}");
+        assert_eq!(f["actorUnappliedIdentities"]["count"], 0);
+        // and the served body names it
+        let body = health_body(
+            Some(&json!({"bars": [], "counters": {}})),
+            t,
+            &Value::Null,
+        );
+        assert!(body.get("unappliedIdentities").is_some(), "{body}");
+    }
+}

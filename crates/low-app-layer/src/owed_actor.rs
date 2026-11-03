@@ -5410,8 +5410,14 @@ pub struct PendingBars {
     /// ([`APPLY_STAGES`]), beside `apply`.
     pub stages: BTreeMap<(&'static str, &'static str), Vec<u64>>,
     pub visible: BTreeMap<&'static str, Vec<u64>>,
-    /// identity -> the oldest write time of an event whose apply faulted, no later apply landed.
+    /// identity -> the oldest write time of an event whose apply faulted (or whose direct call walled), no later
+    /// apply landed. bsv-low #1085: merged into the queue row's per-identity map at each flush, then cleared (the row
+    /// holds it; [`merge_unapplied_identities`]).
     pub unapplied: BTreeMap<String, u64>,
+    /// bsv-low #1085: identity -> the latest judgement time of an apply of it that LANDED in this isolate since the
+    /// last flush: at the flush it clears that identity's entries of the row's map written before it, whichever
+    /// isolate noted them.
+    pub landed: BTreeMap<String, u64>,
     /// The queue class's unapplied set moved since the last flush (only then is the row's age rewritten).
     pub queue_touched: bool,
     pub noted: usize,
@@ -5491,9 +5497,8 @@ impl PendingBars {
         // unapplied bookkeeping.
         if answer["noted"] == true {
             if let Some(id) = answer["identity"].as_str() {
-                if self.unapplied.remove(id).is_some() {
-                    self.queue_touched = true;
-                }
+                self.unapplied.remove(id);
+                self.note_landed(id, answer);
             }
             return;
         }
@@ -5547,13 +5552,23 @@ impl PendingBars {
             }
         }
         if let Some(id) = answer["identity"].as_str() {
-            if self.unapplied.remove(id).is_some() {
-                self.queue_touched = true;
-            }
+            self.unapplied.remove(id);
+            self.note_landed(id, answer);
         }
         if class == "queue" {
             self.queue_touched = true;
         }
+    }
+    /// bsv-low #1085: an apply of `identity` landed, judged at the answer's `judgedAtMs` (the object's answers carry
+    /// it); an answer with no time landed after everything this flush knows of (it clears the identity's entries).
+    fn note_landed(&mut self, identity: &str, answer: &Value) {
+        let at = answer["judgedAtMs"].as_u64().unwrap_or(u64::MAX);
+        let e = self
+            .landed
+            .entry(identity.to_ascii_lowercase())
+            .or_insert(at);
+        *e = (*e).max(at);
+        self.queue_touched = true;
     }
     pub fn note_cold(&mut self, ms: u64) {
         self.visible.entry("cold").or_default().push(ms);
@@ -5832,6 +5847,45 @@ pub fn merge_bars_row_staged(
     row.to_string()
 }
 
+/// bsv-low #1085 (L59 S-A): the most identities the queue row's unapplied map holds (the oldest kept).
+pub const UNAPPLIED_IDENTITIES_MAX: usize = 256;
+
+/// PURE (bsv-low #1085): the queue bars row's PER-IDENTITY map of unapplied events (`unappliedByIdentity`: identity
+/// to the oldest write time of an event whose apply faulted or whose direct call walled, no later apply of the
+/// identity landed), merged across isolates: the stored row's map (carried across builds, as the age), this isolate's
+/// faults added (the older time kept), and each identity whose apply landed in this isolate at or after an entry's
+/// time removed. `oldestUnappliedAtMs` is the map's oldest, so a stall one isolate noted is seen by the fleet's row
+/// until an apply of that identity lands anywhere. At most [`UNAPPLIED_IDENTITIES_MAX`] entries, the oldest kept.
+pub fn merge_unapplied_identities(
+    row: &str,
+    stored: Option<&str>,
+    faults: &BTreeMap<String, u64>,
+    landed: &BTreeMap<String, u64>,
+) -> String {
+    let mut row: Value = serde_json::from_str(row).unwrap_or_else(|_| json!({}));
+    let mut map: BTreeMap<String, u64> = stored
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|v| v["unappliedByIdentity"].as_object().cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|(id, at)| json_ms(&at).map(|at| (id, at)))
+        .collect();
+    for (id, at) in faults {
+        let e = map.entry(id.clone()).or_insert(*at);
+        *e = (*e).min(*at);
+    }
+    map.retain(|id, at| landed.get(id).is_none_or(|l| *l < *at));
+    if map.len() > UNAPPLIED_IDENTITIES_MAX {
+        let mut by_age: Vec<(String, u64)> = map.into_iter().collect();
+        by_age.sort_by_key(|(_, at)| *at);
+        by_age.truncate(UNAPPLIED_IDENTITIES_MAX);
+        map = by_age.into_iter().collect();
+    }
+    row["oldestUnappliedAtMs"] = json!(map.values().min());
+    row["unappliedByIdentity"] = json!(map);
+    row.to_string()
+}
+
 /// Add this isolate's samples to the durable rows when due (`force`: whatever the count and the time). A fault
 /// keeps them for the next flush.
 pub async fn flush_bars(db: &impl SqlPort, now: u64, force: bool) {
@@ -5841,9 +5895,15 @@ pub async fn flush_bars(db: &impl SqlPort, now: u64, force: bool) {
     });
     let Some(pending) = pending else { return };
     match flush_bars_from(db, now, &pending).await {
+        // bsv-low #1085: the unapplied set and the landings are in the row's per-identity map now (an isolate that
+        // kept its set re-added a fault another isolate's landing had cleared); a fault noted after the snapshot was
+        // taken stays for the next flush.
         Ok(()) => PENDING_BARS.with(|p| {
             let mut p = p.borrow_mut();
-            let unapplied = std::mem::take(&mut p.unapplied);
+            let unapplied: BTreeMap<String, u64> = std::mem::take(&mut p.unapplied)
+                .into_iter()
+                .filter(|(id, at)| pending.unapplied.get(id) != Some(at))
+                .collect();
             *p = PendingBars {
                 unapplied,
                 last_flush_ms: Some(now),
@@ -5906,24 +5966,35 @@ pub async fn flush_bars_from(
             staged.push((COLD_PAGE_RING, pending.cold_page.clone()));
         }
         let staged: Vec<(&str, &[u64])> = staged.iter().map(|(r, v)| (*r, &v[..])).collect();
-        let unapplied = (class == "queue" && pending.queue_touched)
-            .then(|| pending.unapplied.values().min().copied());
+        // bsv-low #1085: the queue row's age is the fleet's per-identity map's oldest ([`merge_unapplied_identities`]),
+        // never one isolate's own minimum (each isolate's flush overwrote it: one whose set was empty cleared another
+        // isolate's stall, so the row read empty while an identity's marks waited).
+        let unapplied = (class == "queue" && pending.queue_touched).then_some(None);
         let pages = class == "cold" && !pending.cold_page.is_empty();
         if apply.is_empty() && visible.is_empty() && unapplied.is_none() && !pages {
             continue;
+        }
+        let mut merged = merge_bars_row_staged(
+            held(class).as_deref(),
+            &apply,
+            &visible,
+            &staged,
+            unapplied,
+            lib_rev(),
+        );
+        if unapplied.is_some() {
+            merged = merge_unapplied_identities(
+                &merged,
+                held(class).as_deref(),
+                &pending.unapplied,
+                &pending.landed,
+            );
         }
         stmts.push(Stmt::new(
             crate::owed_belt::STATE_SQL,
             vec![
                 Bind::Text(bars_state_name(class)),
-                Bind::Text(merge_bars_row_staged(
-                    held(class).as_deref(),
-                    &apply,
-                    &visible,
-                    &staged,
-                    unapplied,
-                    lib_rev(),
-                )),
+                Bind::Text(merged),
                 Bind::Int(now as i64),
             ],
         ));
@@ -6056,10 +6127,30 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
         "coldMsMax": cold.max(),
         "coldSamples": cold.samples.len(),
         "actorOldestUnappliedEventAgeMs": queue_row["oldestUnappliedAtMs"].as_u64().map(|a| now.saturating_sub(a)),
+        // bsv-low #1085: the identities whose events wait unapplied (a per-identity stall is visible by name).
+        "actorUnappliedIdentities": unapplied_identities(&queue_row["unappliedByIdentity"], now),
         "classes": classes,
         "stages": stage_p95,
         "barsLibRev": rev,
     })
+}
+
+/// bsv-low #1085: the served view of the queue row's per-identity map: the count and the oldest few identities with
+/// their ages (at most 8 named).
+pub fn unapplied_identities(map: &Value, now: u64) -> Value {
+    let mut by_age: Vec<(String, u64)> = map
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(id, at)| json_ms(at).map(|at| (id.clone(), at)))
+        .collect();
+    by_age.sort_by_key(|(_, at)| *at);
+    let oldest: Vec<Value> = by_age
+        .iter()
+        .take(8)
+        .map(|(id, at)| json!({"identity": id, "ageMs": now.saturating_sub(*at)}))
+        .collect();
+    json!({"count": by_age.len(), "oldest": oldest})
 }
 
 /// What `/health.owedActor` serves from the FLEET (MEDIUM-1, MEDIUM-7, MEDIUM-8): the class rows, the actor's durable
@@ -6211,6 +6302,8 @@ pub fn health_body(read: Option<&Value>, now: u64, d1_oldest_unacked: &Value) ->
     let (age, source) = unapplied_event_age(held_age, faulted_age);
     body["oldestUnappliedEventAgeMs"] = json!(age);
     body["oldestUnappliedEventSource"] = json!(source);
+    // bsv-low #1085: the stalled identities by name (the fleet row's per-identity map).
+    body["unappliedIdentities"] = fleet["actorUnappliedIdentities"].clone();
     body["oldestUnackedMarkAgeMs"] = d1_oldest_unacked.clone();
     body["healthRead"] = json!(read.is_some());
     body
