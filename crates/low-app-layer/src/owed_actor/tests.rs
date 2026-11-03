@@ -23464,4 +23464,114 @@ mod fix1056f3 {
         let clean = compare::classify_reread(clean, Some(&wrap.outpoints), t + 3, W);
         assert_eq!(clean.diff_count, Some(0));
     }
+
+    mod fix1056f4 {
+        use super::*;
+
+        /// (fix1056f4_a) REVIEW 4'S LOW-1 (its pin `rv4_a_an_actor_over_its_ceiling_reads_zero_on_a_partial_lap`): AN
+        /// ACTOR OVER ITS CEILING NEVER READS ZERO. The frozen `d1_fleet` whale; the actor handed to the shipped
+        /// [`compare::fresh_compare`] holds the D1 judge's UNCUT judgement's first 501 rows by
+        /// [`crate::owed_judge::ceiling_key`] (its ceiling failed by one row). A whole lap names the 501st as a
+        /// difference in its window and the lap is not certified zero-held. RED on 50087c39 (the edge the actor's
+        /// largest key): a lap of zero, `zeroHeldLaps` 1.
+        #[tokio::test]
+        async fn fix1056f4_a_an_actor_over_its_ceiling_never_reads_zero() {
+            let (_f, d1, id, games) = whale().await;
+            let port = Fix986 {
+                d1: &d1,
+                actors: BTreeMap::new(),
+                judges: true,
+                die_after: Cell::new(u32::MAX),
+            };
+            let mut uncut = crate::owed_judge::judge_fresh_rows_ranked(&port, &id, &games, false)
+                .await
+                .unwrap();
+            assert!(uncut.len() > crate::owed::OWED_MAX_ROWS, "{}", uncut.len());
+            uncut.sort_by_key(crate::owed_judge::ceiling_key);
+            uncut.truncate(crate::owed::OWED_MAX_ROWS + 1);
+            let excess = uncut[crate::owed::OWED_MAX_ROWS]["outpoint"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let actor = json!({"rows": uncut, "bootstrapped": true});
+            let mut named: BTreeSet<String> = BTreeSet::new();
+            let mut zero_held = None;
+            for k in 0..40i64 {
+                let view = compare::fresh_compare(&port, &id, Ok(actor.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(view["d1"]["games"]["partial"], json!(true));
+                named.extend(
+                    view["diff"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|d| d["outpoint"].as_str().or(d.as_str()))
+                        .map(str::to_string),
+                );
+                let row = compare::classify_reread(
+                    compare::compare_row_of(&id, NOW_MS as i64 + k, Ok(&view)),
+                    view.get("storedCompare"),
+                    NOW_MS as i64 + k,
+                    W,
+                );
+                d1.run_batch(vec![compare::upsert_stmt(&row)])
+                    .await
+                    .unwrap();
+                if row.wrapped {
+                    zero_held = Some(row.zero_held_laps);
+                    break;
+                }
+            }
+            assert!(
+                named.contains(&excess),
+                "the actor's 501st row {excess} is a difference: named over a lap {named:?}"
+            );
+            assert_eq!(named.len(), 1, "{named:?}");
+            assert_eq!(zero_held, Some(0), "the lap is not certified zero-held");
+        }
+
+        /// (fix1056f4_b) REVIEW 4'S NOTE-1 (its pin `rv4_c_a_second_overflow_replaces_the_first`): two overflows in one
+        /// lap are counted WHOLE. Compare 1 counts 2,051 in game `ga` (3 past the stored 2,048), compare 2 counts 5 new
+        /// in `gb` beside the 2,048 carried (5 past), compare 3 judges neither: `diffCount` is every difference seen,
+        /// 2,056. RED on 50087c39 (the second overflow replaced the first): 2,053.
+        #[test]
+        fn fix1056f4_b_two_overflows_in_one_lap_are_counted_whole() {
+            let t = NOW_MS as i64;
+            let entry = |o: &str, g: &str| json!({"outpoint": o, "held": false, "gameId": g});
+            let n = compare::COMPARE_ROW_COUNTED_MAX + 3;
+            let a_d1: Vec<Value> = (0..n)
+                .map(|i| row(&format!("a{i:05}:0"), "ga", 1))
+                .collect();
+            let a_ac: Vec<Value> = (0..n)
+                .map(|i| row(&format!("a{i:05}:0"), "ga", 2))
+                .collect();
+            let prior = json!((0..n)
+                .map(|i| entry(&format!("a{i:05}:0"), "ga"))
+                .collect::<Vec<_>>());
+            let c1 =
+                compare::classify_reread(raw(&a_d1, &a_ac, t, &["ga"], &[]), Some(&prior), t, W);
+            assert_eq!((c1.diff_count, c1.lap.overflow), (Some(n as i64), 3));
+            let b_d1: Vec<Value> = (0..5).map(|i| row(&format!("b{i}:0"), "gb", 1)).collect();
+            let b_ac: Vec<Value> = (0..5).map(|i| row(&format!("b{i}:0"), "gb", 2)).collect();
+            let mut prior2 = c1.outpoints.as_array().unwrap().clone();
+            prior2.extend((0..5).map(|i| entry(&format!("b{i}:0"), "gb")));
+            let mut c2 = raw(&b_d1, &b_ac, t + 1, &["gb"], &[]);
+            c2.lap = c1.lap.clone();
+            let c2 = compare::classify_reread(c2, Some(&json!(prior2)), t + 1, W);
+            assert_eq!(
+                c2.diff_count,
+                Some(compare::COMPARE_ROW_COUNTED_MAX as i64 + 5)
+            );
+            assert_eq!(c2.lap.overflow, 8, "the second overflow adds to the first");
+            let mut c3 = raw(&[], &[], t + 2, &["gc"], &[]);
+            c3.lap = c2.lap.clone();
+            let c3 = compare::classify_reread(c3, Some(&c2.outpoints), t + 2, W);
+            assert_eq!(
+                c3.diff_count,
+                Some(n as i64 + 5),
+                "every difference seen in the lap"
+            );
+        }
+    }
 }
