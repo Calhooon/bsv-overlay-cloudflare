@@ -785,12 +785,8 @@ async fn fix1081_b_a_read_past_the_deadline_serves_the_memo_and_names_it() {
 async fn fix1081_d_every_503_names_its_reason_and_the_route_logs_it() {
     // The store's status (a 5xx), the transport, a frame that does not check,
     // and the freshness bar: each 503 carries its reason in the reply and body.
-    let cases: Vec<(
-        &str,
-        Box<dyn Fn(String) -> Result<(u16, Value), HeaderError>>,
-        Option<VerifiedTip>,
-        &str,
-    )> = vec![
+    type Read = Box<dyn Fn(String) -> Result<(u16, Value), HeaderError>>;
+    let cases: Vec<(&str, Read, Option<VerifiedTip>, &str)> = vec![
         (
             "5xx",
             Box::new(|route| {
