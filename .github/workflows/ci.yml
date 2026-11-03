@@ -45,6 +45,25 @@ jobs:
         # the secrets step scans every commit of the history
         fetch-depth: 0
         persist-credentials: false
+    # The secrets scan (bsv-stack-lean #140): gitleaks 8.28.0 built from its
+    # release source, refused unless the tarball's sha256 is the one Homebrew's
+    # formula pins; the runner's Go builds it, go.sum checks its modules. Every
+    # commit of the history and the tree, findings redacted; the allowlist is
+    # .gitleaks.toml's. It runs before the cache is restored: the tree it scans
+    # is the checkout's, never a restored target/.
+    - name: secrets
+      if: ${{ !cancelled() }}
+      env:
+        GITLEAKS_VERSION: 8.28.0
+        GITLEAKS_SHA256: c681af8aeacacf9d14f7ad97d534cf087f6d2d6fbd50dd02020b0f929b7a1c41
+      run: |
+        set -euo pipefail
+        curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" "https://github.com/gitleaks/gitleaks/archive/refs/tags/v${GITLEAKS_VERSION}.tar.gz"
+        echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum -c -
+        tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP"
+        (cd "$RUNNER_TEMP/gitleaks-${GITLEAKS_VERSION}" && go build -o "$RUNNER_TEMP/gitleaks" .)
+        "$RUNNER_TEMP/gitleaks" git --redact --no-banner --exit-code 1 .
+        "$RUNNER_TEMP/gitleaks" dir --redact --no-banner --exit-code 1 .
     - id: toolchain
       uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
       with:
@@ -97,24 +116,6 @@ jobs:
       if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
       run: cargo fmt --all -- --check
     # Workers workspace formatting belongs to the separate K1 hygiene commit.
-    # The secrets scan (bsv-stack-lean #140): gitleaks 8.28.0 built from its
-    # release source, refused unless the tarball's sha256 is the one Homebrew's
-    # formula pins; the runner's Go builds it, go.sum checks its modules. Every
-    # commit of the history and the tree, findings redacted; the allowlist is
-    # .gitleaks.toml's.
-    - name: secrets
-      if: ${{ !cancelled() }}
-      env:
-        GITLEAKS_VERSION: 8.28.0
-        GITLEAKS_SHA256: c681af8aeacacf9d14f7ad97d534cf087f6d2d6fbd50dd02020b0f929b7a1c41
-      run: |
-        set -euo pipefail
-        curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" "https://github.com/gitleaks/gitleaks/archive/refs/tags/v${GITLEAKS_VERSION}.tar.gz"
-        echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum -c -
-        tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP"
-        (cd "$RUNNER_TEMP/gitleaks-${GITLEAKS_VERSION}" && go build -o "$RUNNER_TEMP/gitleaks" .)
-        "$RUNNER_TEMP/gitleaks" git --redact --no-banner --exit-code 1 .
-        "$RUNNER_TEMP/gitleaks" dir --redact --no-banner --exit-code 1 .
     - name: clippy
       if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
       run: |
@@ -168,16 +169,19 @@ jobs:
     - id: msrv-toolchain
       name: MSRV toolchain 1.91.0
       run: rustup toolchain install 1.91.0 --profile minimal --target wasm32-unknown-unknown
+    # The key names the dependency profile below, which rust-cache's own key
+    # (the locks, rustc, the CARGO_ variables) does not see.
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
+        key: deps-opt-2
         workspaces: '. -> target
 
           workers -> workers/target'
     # The test build's dependencies at opt-level 2 (the bundled SQLite's C, the
     # curve and hash crates run the suites' hot loops). The workspace's own crates
     # keep the dev profile: unoptimized, debug assertions and overflow checks on.
-    # Only codegen moves: clippy, docs and the MSRV check build no code with it,
-    # and the wasm32 build is the release profile.
+    # Only the dependencies' codegen moves (the MSRV check emits no code; the
+    # wasm32 build is the release profile, untouched).
     - name: dependencies optimized
       run: |
         set -euo pipefail
