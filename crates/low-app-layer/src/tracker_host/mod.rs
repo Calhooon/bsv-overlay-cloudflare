@@ -208,6 +208,9 @@ pub fn header_response(
         .ok_or_else(|| HeaderError("unverified or malformed header frame".into()))
 }
 
+/// bsv-low #1084: the header reads one snapshot makes at a time (the store answers bursts of thirty in a second).
+pub const HEADER_READS_AT_ONCE: usize = 8;
+
 /// Fetch named heights only. The tip brackets the header fetches; a changing
 /// tip is an unanswerable snapshot and is retried by the host, never trusted.
 pub async fn headers(env: &worker::Env, heights: &[u32]) -> HeaderSnapshot {
@@ -224,15 +227,27 @@ where
     F: std::future::Future<Output = Result<(u16, Value), HeaderError>>,
 {
     retry_snapshot(|| async {
+        use futures_util::StreamExt as _;
         let before = verified_tip_with(&get).await;
-        let mut rows = BTreeMap::new();
-        for height in heights {
-            let row = match get(format!("findHeaderHexForHeight?height={height}")).await {
-                Ok((status, frame)) => header_response(*height, status, &frame),
-                Err(e) => Err(e),
-            };
-            rows.insert(*height, row);
-        }
+        // bsv-low #1084 (L59 S-O): the heights are read AT ONCE, [`HEADER_READS_AT_ONCE`] at a time, between the two
+        // tip reads (they were read one after another: an owed list with mined words at N heights paid N round trips
+        // under the burst, the `/owed` read's tail). The bracket is unchanged: a tip that moved across the reads is
+        // an unanswerable snapshot, retried.
+        let rows: BTreeMap<u32, Result<Option<Header>, HeaderError>> =
+            futures_util::stream::iter(heights.iter().copied())
+                .map(|height| {
+                    let read = get(format!("findHeaderHexForHeight?height={height}"));
+                    async move {
+                        let row = match read.await {
+                            Ok((status, frame)) => header_response(height, status, &frame),
+                            Err(e) => Err(e),
+                        };
+                        (height, row)
+                    }
+                })
+                .buffer_unordered(HEADER_READS_AT_ONCE)
+                .collect()
+                .await;
         let after = verified_tip_with(&get).await;
         let unchanged = matches!((&before, &after), (Ok(a), Ok(b))
             if a.height == b.height && a.hash == b.hash
