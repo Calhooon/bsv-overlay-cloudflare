@@ -616,7 +616,8 @@ impl Lap {
 /// PURE (FIX-1056-FOLD-3, review 3's MEDIUM-1): a partial compare's uncut D1 rows cut at the ACTOR'S ceiling: when the
 /// actor's answer holds the ceiling's 500 rows (its whole identity ranked, [`crate::owed_judge::ceiling_key`]), every
 /// D1 row whose key sorts after the actor's 500th row's key is past the identity's ceiling (returned apart, its
-/// outpoints). Sound in both directions: an actor equal to the D1 judge holds exactly the rows at or before that key,
+/// outpoints). The edge is the 500th key even when the actor holds more (FIX-1056-FOLD-4): an actor over its ceiling
+/// shows its excess as differences. Sound in both directions: an actor equal to the D1 judge holds exactly the rows at or before that key,
 /// so it reads zero; an actor that holds a row the D1 judge does not (or lacks one it holds) at or before the key is a
 /// difference, and an actor whose ceiling a phantom row moved shows that phantom as a difference when its game is
 /// judged (the truth's row it pushed past the ceiling is the only one served apart). An actor with fewer rows, or one
@@ -629,7 +630,15 @@ pub fn ceiling_cut(
     if !actor_ok || actor_rows.len() < crate::owed::OWED_MAX_ROWS {
         return (d1, Vec::new());
     }
-    let Some(edge) = actor_rows.iter().map(crate::owed_judge::ceiling_key).max() else {
+    // FIX-1056-FOLD-4 (review 4's LOW-1): the edge is the actor's 500th key, never its largest. An actor past its
+    // ceiling (its cut failed) would move a largest-key edge with its own excess and read zero; at the 500th, its rows
+    // past the edge stay on its side and are differences (D1 cuts its own copy there, `pastCeiling`).
+    let mut keys: Vec<_> = actor_rows
+        .iter()
+        .map(crate::owed_judge::ceiling_key)
+        .collect();
+    keys.sort();
+    let Some(edge) = keys.into_iter().nth(crate::owed::OWED_MAX_ROWS - 1) else {
         return (d1, Vec::new());
     };
     let (kept, past): (Vec<Value>, Vec<Value>) = d1
@@ -1221,7 +1230,13 @@ pub fn classify_reread(
         // stand.
         let lap = &mut row.lap;
         if overflow_now > 0 {
-            lap.overflow = overflow_now;
+            // FIX-1056-FOLD-4 (review 4's NOTE-1): a second overflow in one lap adds to the first, never replaces it
+            // (each may name games the other's compare did not judge; a sum fails closed).
+            lap.overflow = if lap.overflow_this_lap {
+                lap.overflow.saturating_add(overflow_now)
+            } else {
+                overflow_now
+            };
             lap.overflow_this_lap = true;
         } else {
             if row.wrapped && !lap.overflow_this_lap {
