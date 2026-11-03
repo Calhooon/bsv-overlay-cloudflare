@@ -12566,7 +12566,7 @@ impl compare::RingCompare for Fix998Weighted<'_> {
             prior: None,
             unjudged: Default::default(),
             next_offset: 0,
-            cleared: None,
+            rotations: 0,
         }
     }
 }
@@ -22195,12 +22195,29 @@ mod fix1056 {
         );
         assert_eq!(of(&later, "aa:0"), of(&first, "aa:0"), "kept as stored");
         assert_eq!(later.reread_due_ms(W), Some(t + W), "due at once");
+        // FIX-1056-FOLD-2 (the second review's LOW-2): a partial compare that judged `g9` and finds NO side holding
+        // `aa:0` in a judged game has not read it (the fresh D1 judgement may hold it in a game not judged): still
+        // pending, `absentSince` the rotations then; after two rotations more with no side holding it, the clear.
         let judged = compare::classify_reread(
             raw(&[], &[], t + 3 * W, Some(&["g9"])),
             Some(&later.outpoints),
             t + 3 * W,
             W,
         );
+        assert_eq!(
+            (
+                judged.held_by_apply(),
+                judged.pending_reread(),
+                judged.diff_count
+            ),
+            (0, 1, Some(0)),
+            "{}",
+            judged.outpoints
+        );
+        assert_eq!(of(&judged, "aa:0")["absentSince"], json!(0));
+        let mut late = raw(&[], &[], t + 4 * W, Some(&["g9"]));
+        late.rotations = 2;
+        let judged = compare::classify_reread(late, Some(&judged.outpoints), t + 4 * W, W);
         assert_eq!(
             (
                 judged.held_by_apply(),
@@ -22624,7 +22641,7 @@ mod fix1056 {
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut offset = 0;
         for _ in 0..3 {
-            let (picked, total, next) =
+            let (picked, total, next, _) =
                 compare::pick_games_rotating(&["g149".to_string()], &[], &games, 64, offset);
             assert_eq!((picked.len(), total, picked[0].as_str()), (64, 150, "g149"));
             seen.extend(picked);
@@ -22677,7 +22694,14 @@ mod fix1056 {
             view["actor"] = json!({"rows": [], "bootstrapped": true});
             let row = compare::compare_row_of(&id, NOW_MS as i64 + k, Ok(&view));
             assert!(row.partial);
-            assert_eq!(compare::partial_column(&row), 1 + row.next_offset as i64);
+            let col = json!(compare::partial_column(&row));
+            assert_eq!(
+                (
+                    compare::offset_of_partial(&col),
+                    compare::rotations_of_partial(&col)
+                ),
+                (row.next_offset, row.rotations)
+            );
             d1.run_batch(vec![compare::upsert_stmt(&row)])
                 .await
                 .unwrap();
@@ -22717,5 +22741,352 @@ mod fix1056 {
         let served =
             crate::owed_events_publish::fleet_compare_health_view(Some(&cursor), NOW_MS as i64);
         assert_eq!(served["partial"], json!(1), "{served}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// FIX-1056-FOLD-2 (bsv-low #1056; the review `FIX-1056-REVIEW-2-2026-11-02.md`): a fault never resets the rotation;
+// every counted difference is stored; an entry no side holds in a judged game is not read; a stale stored row marks
+// nothing unjudged; the rotation's completion is served.
+mod fix1056f2 {
+    use super::*;
+
+    const W: i64 = 5_000;
+
+    fn row(o: &str, game: &str, sats: i64) -> Value {
+        json!({"outpoint": o, "family": "payout", "gameId": game, "sats": sats, "opponentIdentity": null,
+               "atHeight": null, "reason": "r", "facts": "{}", "claimable": 1})
+    }
+
+    fn raw(
+        d1: &[(&str, &str, i64)],
+        actor: &[(&str, &str, i64)],
+        now: i64,
+        judged: Option<&[&str]>,
+        unjudged: &[&str],
+    ) -> compare::CompareRow {
+        let d1: Vec<Value> = d1.iter().map(|(o, g, s)| row(o, g, *s)).collect();
+        let actor: Vec<Value> = actor.iter().map(|(o, g, s)| row(o, g, *s)).collect();
+        let mut view = crate::owed_actor::rows_view(
+            "02aa",
+            Ok(json!({"rows": actor, "bootstrapped": true})),
+            &d1,
+            None,
+            None,
+        );
+        view["heldByLag"] = json!([]);
+        view["diffFields"] = json!([]);
+        if let Some(j) = judged {
+            view["d1"]["games"] = json!({"partial": true, "judgedGames": j});
+        }
+        let mut r = compare::compare_row_of("02aa", now, Ok(&view));
+        r.unjudged = unjudged.iter().map(|o| o.to_string()).collect();
+        r
+    }
+
+    fn stored_partial(d1: &SqliteSql, id: &str) -> Value {
+        d1.conn
+            .query_row(
+                "SELECT partial FROM owed_actor_compare WHERE identity=?1",
+                [id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| json!(n))
+            .unwrap()
+    }
+
+    /// (fix1056f2_m1) THE SECOND REVIEW'S MEDIUM-1 (its pin `rv2_b_a_fault_keeps_the_rotation`): A FAULT NEVER RESETS
+    /// THE ROTATION. A 200-game identity under 64 places: each good compare reads the stored `partial` column (the
+    /// offset and the completed rotations), judges its window and writes its row through the shipped
+    /// [`compare::upsert_stmt`] under real SQLite; after each, a FAULT row is written the same way (the actor out of
+    /// reach). Every game is judged within `ceil(200 / 64)` = 4 good compares and the rotation completes; the
+    /// summary and the public snapshot serve the rotation's completion (`partialUnrotated` 1 before it, 0 after,
+    /// `partialRotationsMin` 1). RED on 88522d1b (the fault writes `partial` 0: `judged 64` of 200, every window the
+    /// first).
+    #[tokio::test]
+    async fn fix1056f2_m1_a_fault_keeps_the_rotation() {
+        let d1 = SqliteSql::migrated();
+        let id = "02f2";
+        let games: Vec<String> = (0..200).map(|i| format!("g{i:03}")).collect();
+        let mut judged: BTreeSet<String> = BTreeSet::new();
+        let serve = |d1: &SqliteSql| -> Value {
+            d1.conn
+                .prepare(crate::owed_events_publish::FLEET_COMPARE_HEALTH_SQL)
+                .unwrap()
+                .execute(rusqlite::params![
+                    NOW_MS as i64,
+                    0,
+                    1,
+                    compare::RING_NAME,
+                    compare::RING_NAME
+                ])
+                .unwrap();
+            let cursor: String = d1
+                .conn
+                .query_row(
+                    "SELECT cursor FROM owed_belt_state WHERE name='fleet-compare:health'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            crate::owed_events_publish::fleet_compare_health_view(Some(&cursor), NOW_MS as i64)
+        };
+        let mut good = 0;
+        for k in 0..12i64 {
+            let col = if k == 0 {
+                json!(0)
+            } else {
+                stored_partial(&d1, id)
+            };
+            let (picked, total, next, wrapped) = compare::pick_games_rotating(
+                &[],
+                &[],
+                &games,
+                compare::FRESH_COMPARE_GAMES_MAX,
+                compare::offset_of_partial(&col),
+            );
+            assert_eq!((picked.len(), total), (64, 200));
+            judged.extend(picked);
+            good += 1;
+            let mut r = raw(&[], &[], NOW_MS as i64 + k, Some(&[]), &[]);
+            r.identity = id.into();
+            r.next_offset = next;
+            r.rotations = compare::rotations_of_partial(&col) + u64::from(wrapped);
+            d1.run_batch(vec![compare::upsert_stmt(&r)]).await.unwrap();
+            if judged.len() < 200 {
+                assert_eq!(serve(&d1)["partialUnrotated"], json!(1));
+            }
+            let fault = compare::compare_row_of(id, NOW_MS as i64 + k, Err("actor out of reach"));
+            d1.run_batch(vec![compare::upsert_stmt(&fault)])
+                .await
+                .unwrap();
+            if judged.len() == 200 {
+                break;
+            }
+        }
+        assert_eq!(
+            (judged.len(), good),
+            (200, 4),
+            "judged {} of 200 in {good} good compares",
+            judged.len()
+        );
+        // The good compare after the last fault: the rotation completed, served.
+        let col = stored_partial(&d1, id);
+        assert_eq!(compare::rotations_of_partial(&col), 1, "{col}");
+        let mut r = raw(&[], &[], NOW_MS as i64 + 99, Some(&[]), &[]);
+        r.identity = id.into();
+        r.next_offset = compare::offset_of_partial(&col);
+        r.rotations = 1;
+        d1.run_batch(vec![compare::upsert_stmt(&r)]).await.unwrap();
+        let served = serve(&d1);
+        assert_eq!(
+            (
+                served["partial"].clone(),
+                served["partialUnrotated"].clone(),
+                served["partialRotationsMin"].clone()
+            ),
+            (json!(1), json!(0), json!(1)),
+            "{served}"
+        );
+        let summary: (i64, i64) = d1
+            .conn
+            .query_row(compare::COMPARE_SUMMARY_SQL, [], |r| {
+                Ok((r.get("partialUnrotated")?, r.get("partialRotationsMin")?))
+            })
+            .unwrap();
+        assert_eq!(summary, (0, 1), "the route's summary is the snapshot's");
+        // A row written before the fold (1 + offset) reads 0 rotations and its offset.
+        assert_eq!(
+            (
+                compare::offset_of_partial(&json!(7)),
+                compare::rotations_of_partial(&json!(7))
+            ),
+            (6, 0)
+        );
+        // Under D1's REAL bind the column round-trips.
+        crate::pot_hook::tests::INTS_AS_REAL.with(|c| c.set(true));
+        d1.run_batch(vec![compare::upsert_stmt(&r)]).await.unwrap();
+        crate::pot_hook::tests::INTS_AS_REAL.with(|c| c.set(false));
+        let col = stored_partial(&d1, id);
+        assert_eq!(
+            (
+                compare::offset_of_partial(&col),
+                compare::rotations_of_partial(&col)
+            ),
+            (r.next_offset, 1)
+        );
+    }
+
+    /// (fix1056f2_n1) THE SECOND REVIEW'S NOTE-1 (its pin `rv2_d_a_pending_game_shifts_the_window`): a pending game is
+    /// skipped where it stands, never shifting the window: 150 games, a pending game each compare, three compares
+    /// judge every game (`g064` included at the second). RED on 88522d1b (`g064` not judged in three compares).
+    #[test]
+    fn fix1056f2_n1_a_pending_game_never_shifts_the_window() {
+        let games: Vec<String> = (0..150).map(|i| format!("g{i:03}")).collect();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut offset = 0;
+        for pend in ["g149", "g010", "g140"] {
+            let (picked, _, next, _) =
+                compare::pick_games_rotating(&[pend.to_string()], &[], &games, 64, offset);
+            seen.extend(picked);
+            offset = next;
+        }
+        assert_eq!(seen.len(), 150);
+    }
+
+    /// (fix1056f2_l1) THE SECOND REVIEW'S LOW-1 (its pin `rv2_c_counted_past_the_state_bound_survive_a_partial_compare`):
+    /// 128 counted differences in `ga` and 2 in `gb` (`diffCount` 130); a partial compare that judges `ga` (equal on
+    /// both sides) with `gb`'s outpoints held in a game not judged: the two are carried, `diffCount` 2. RED on
+    /// 88522d1b (`diff Some(0)`, the two never stored).
+    #[test]
+    fn fix1056f2_l1_counted_past_the_state_bound_survive_a_partial_compare() {
+        let t = NOW_MS as i64;
+        let ga: Vec<String> = (0..128).map(|i| format!("a{i:03}:0")).collect();
+        let actor: Vec<(&str, &str, i64)> = ga
+            .iter()
+            .map(|o| (o.as_str(), "ga", 2))
+            .chain([("zz:0", "gb", 2), ("zz:1", "gb", 2)])
+            .collect();
+        let first = compare::classify_reread(raw(&[], &actor, t, None, &[]), None, t, W);
+        let counted = compare::classify_reread(
+            raw(&[], &actor, t + 2 * W, None, &[]),
+            Some(&first.outpoints),
+            t + 2 * W,
+            W,
+        );
+        assert_eq!(counted.diff_count, Some(130));
+        let both: Vec<(&str, &str, i64)> = ga.iter().map(|o| (o.as_str(), "ga", 2)).collect();
+        let later = compare::classify_reread(
+            raw(&both, &both, t + 3 * W, Some(&["ga"]), &["zz:0", "zz:1"]),
+            Some(&counted.outpoints),
+            t + 3 * W,
+            W,
+        );
+        assert_eq!(later.diff_count, Some(2), "{}", later.outpoints);
+        // The counted bound: every counted entry is stored up to COMPARE_ROW_COUNTED_MAX.
+        const { assert!(compare::COMPARE_ROW_COUNTED_MAX >= 2_000) };
+    }
+
+    /// (fix1056f2_l2) THE SECOND REVIEW'S LOW-2 (its pin `rv2_a_a_fresh_side_game_move_is_no_clear`): a counted entry
+    /// (game `g1`, D1 holds it, the actor does not) whose fresh D1 row moved to `g2`: a partial compare that judges
+    /// `g1` alone finds no side holding it in a judged game and nothing unjudged: carried counted (`absentSince` the
+    /// rotations then), not a clear; it ends after two rotations more with no side holding it, or at a whole compare.
+    /// RED on 88522d1b (`left: Some(0) right: Some(1)`).
+    #[test]
+    fn fix1056f2_l2_a_fresh_side_game_move_is_no_clear() {
+        let t = NOW_MS as i64;
+        let first =
+            compare::classify_reread(raw(&[("dd:0", "g1", 2)], &[], t, None, &[]), None, t, W);
+        let counted = compare::classify_reread(
+            raw(&[("dd:0", "g1", 2)], &[], t + 2 * W, None, &[]),
+            Some(&first.outpoints),
+            t + 2 * W,
+            W,
+        );
+        assert_eq!(counted.diff_count, Some(1));
+        let mut p = raw(&[], &[], t + 3 * W, Some(&["g1"]), &[]);
+        p.rotations = 3;
+        let later = compare::classify_reread(p, Some(&counted.outpoints), t + 3 * W, W);
+        assert_eq!(later.diff_count, Some(1), "{}", later.outpoints);
+        assert_eq!(later.outpoints[0]["absentSince"], json!(3));
+        let mut p = raw(&[], &[], t + 4 * W, Some(&["g1"]), &[]);
+        p.rotations = 4;
+        let still = compare::classify_reread(p, Some(&later.outpoints), t + 4 * W, W);
+        assert_eq!(
+            still.diff_count,
+            Some(1),
+            "one rotation is not a whole walk"
+        );
+        let mut p = raw(&[], &[], t + 5 * W, Some(&["g1"]), &[]);
+        p.rotations = 5;
+        let ended = compare::classify_reread(p, Some(&still.outpoints), t + 5 * W, W);
+        assert_eq!(ended.diff_count, Some(0), "{}", ended.outpoints);
+        let whole = compare::classify_reread(
+            raw(&[], &[], t + 5 * W, None, &[]),
+            Some(&later.outpoints),
+            t + 5 * W,
+            W,
+        );
+        assert_eq!(
+            whole.diff_count,
+            Some(0),
+            "a whole compare reads every game"
+        );
+    }
+
+    /// (fix1056f2_l3) THE SECOND REVIEW'S LOW-3 (its pin `rv2_e_two_far_games_never_share_a_window`): in Phase C the
+    /// stored D1 rows are stale, no side of the compare, so an outpoint the actor holds in one game and a frozen stored
+    /// row holds in a far one is NOT marked unjudged when the actor's game is judged and the stored one is not. Through
+    /// the shipped [`compare::fresh_compare`] over the fleet's whale, the D1 judge off, the stored row planted in the
+    /// last-sorting game. RED on 88522d1b (the outpoint in `unjudgedOutpoints` on every such compare).
+    #[tokio::test]
+    async fn fix1056f2_l3_a_stale_stored_row_marks_nothing_unjudged() {
+        let f = fixtures()
+            .into_iter()
+            .find(|f| f.name == "d1_fleet")
+            .unwrap();
+        let d1 = d1_judge(&f).await;
+        let port = Fix986 {
+            d1: &d1,
+            actors: BTreeMap::new(),
+            judges: false,
+            die_after: Cell::new(u32::MAX),
+        };
+        let mut whale = None;
+        for id in &f.identities {
+            let view = compare::fresh_compare(&port, id, Err("no actor (pin)".into()))
+                .await
+                .unwrap();
+            if view["d1"]["games"]["partial"] == true {
+                whale = Some(id.clone());
+                break;
+            }
+        }
+        let id = whale.expect("a partial identity in the fleet");
+        let o = format!("{}:0", "ee".repeat(32));
+        let (ga, gb) = ("0".repeat(64), "f".repeat(64));
+        d1.conn
+            .execute_batch(&format!(
+                "CREATE TEMP TABLE x AS SELECT * FROM owed_rows WHERE identity='{id}' LIMIT 1; \
+                 UPDATE x SET outpoint='{o}', gameId='{gb}'; INSERT INTO owed_rows SELECT * FROM x; DROP TABLE x;"
+            ))
+            .unwrap();
+        let mut a = row(&o, &ga, 2);
+        a["identity"] = json!(id);
+        let mut met = 0;
+        for k in 0..30 {
+            let view = compare::fresh_compare(
+                &port,
+                &id,
+                Ok(json!({"rows": [a.clone()], "bootstrapped": true})),
+            )
+            .await
+            .unwrap();
+            let judged: BTreeSet<String> = view["d1"]["games"]["judgedGames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|g| g.as_str().unwrap().to_string())
+                .collect();
+            if judged.contains(&ga) && !judged.contains(&gb) {
+                met += 1;
+                assert!(
+                    !view["d1"]["games"]["unjudgedOutpoints"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(o)),
+                    "a stale stored row is no side: {}",
+                    view["d1"]["games"]["unjudgedOutpoints"]
+                );
+            }
+            let row = compare::compare_row_of(&id, NOW_MS as i64 + k, Ok(&view));
+            d1.run_batch(vec![compare::upsert_stmt(&row)])
+                .await
+                .unwrap();
+        }
+        assert!(
+            met > 0,
+            "a window judged the actor's game and not the stored one"
+        );
     }
 }

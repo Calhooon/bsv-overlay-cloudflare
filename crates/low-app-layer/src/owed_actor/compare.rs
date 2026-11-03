@@ -42,24 +42,29 @@ pub fn pick_games(
     identity_games: &[String],
     max: usize,
 ) -> (Vec<String>, usize) {
-    let (picked, total, _) = pick_games_rotating(first, rows, identity_games, max, 0);
+    let (picked, total, _, _) = pick_games_rotating(first, rows, identity_games, max, 0);
     (picked, total)
 }
 
-/// FIX-1056-FOLD-1 (the review's LOW-1): [`pick_games`] with the window ROTATED. The pending games first (at most
-/// `max`), then, when the rest (the rows' games sorted, then the identity's games) does not fit the places left, the
-/// rest read from `offset` (mod its length), wrapping; `(picked, total, next)`, `next` the offset the next compare of
-/// this identity starts at (`offset` advanced by the places this compare gave the rest; 0 when everything fit). The
-/// offset rides the stored row's `partial` column ([`CompareRow::next_offset`]), so a partial identity's every game
-/// is judged within `ceil(rest / places)` of its compares (one a revolution), whatever its size; the bound is
-/// approximate while the identity's game list moves between compares (a new game shifts the order by one).
+/// FIX-1056-FOLD-1 (the review's LOW-1), folded by FIX-1056-FOLD-2: [`pick_games`] with the window ROTATED. The
+/// pending games first (at most `max`), then, when the rest does not fit the places left, the rest read from `offset`
+/// (mod its length), wrapping. The rest is the rows' games sorted, then the identity's games, and its positions do NOT
+/// depend on the pending games (the second review's NOTE-1: a pending game is skipped where it stands, the walk
+/// advancing past it, so a pending game never shifts the window over the others). `(picked, total, next, wrapped)`:
+/// `total` the union's size, `next` the offset the next compare of this identity starts at (`offset` advanced by the
+/// positions this compare walked; 0 when everything fit), `wrapped` whether this compare's walk reached the end of
+/// the rest (a ROTATION completed: from offset 0, every position of the rest has been walked once). The offset and
+/// the completed rotations ride the stored row's `partial` column ([`partial_column`]), which a fault row never
+/// writes (the second review's MEDIUM-1), so a partial identity's every game is judged within `ceil(rest / places)`
+/// of its good compares, whatever its size and however its compares fault in between; the bound is approximate
+/// while the identity's game list moves between compares (a new game shifts the order by one).
 pub fn pick_games_rotating(
     first: &[String],
     rows: &[&[Value]],
     identity_games: &[String],
     max: usize,
     offset: usize,
-) -> (Vec<String>, usize, usize) {
+) -> (Vec<String>, usize, usize, bool) {
     let mut picked: Vec<String> = Vec::new();
     let mut all: BTreeSet<String> = BTreeSet::new();
     for g in first {
@@ -76,31 +81,40 @@ pub fn pick_games_rotating(
             }
         }
     }
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut rest: Vec<String> = Vec::new();
-    for g in from_rows {
-        if all.insert(g.clone()) {
-            rest.push(g);
-        }
-    }
-    for g in identity_games {
-        let g = g.to_ascii_lowercase();
-        if all.insert(g.clone()) {
+    for g in from_rows
+        .into_iter()
+        .chain(identity_games.iter().map(|g| g.to_ascii_lowercase()))
+    {
+        if !g.is_empty() && seen.insert(g.clone()) {
+            all.insert(g.clone());
             rest.push(g);
         }
     }
     let total = all.len();
     picked.truncate(max);
     let places = max - picked.len();
-    if rest.len() <= places {
-        picked.extend(rest);
-        return (picked, total, 0);
+    let left: Vec<&String> = rest.iter().filter(|g| !picked.contains(*g)).collect();
+    if left.len() <= places {
+        let left: Vec<String> = left.into_iter().cloned().collect();
+        picked.extend(left);
+        return (picked, total, 0, false);
     }
+    let len = rest.len();
     if places == 0 {
-        return (picked, total, offset % rest.len().max(1));
+        return (picked, total, offset % len, false);
     }
-    let start = offset % rest.len();
-    picked.extend(rest.iter().cycle().skip(start).take(places).cloned());
-    (picked, total, (start + places) % rest.len())
+    let start = offset % len;
+    let mut walked = 0;
+    while picked.len() < max && walked < len {
+        let g = &rest[(start + walked) % len];
+        walked += 1;
+        if !picked.contains(g) {
+            picked.push(g.clone());
+        }
+    }
+    (picked, total, (start + walked) % len, start + walked >= len)
 }
 
 /// A stored D1 row is stale when the D1 judge is off (Phase C: nothing writes `owed_rows`) or it was judged before the
@@ -233,10 +247,14 @@ pub async fn fresh_compare(
         .unwrap_or(Value::Null);
     let prior_rows = next();
     let prior = prior_of(&prior_rows).unwrap_or(json!([]));
-    // FIX-1056-FOLD-1 (LOW-1): the rotation's offset the identity's last partial compare left ([`CompareRow::next_offset`]).
-    let offset = prior_rows
-        .first()
-        .map_or(0, |r| offset_of_partial(&r["partial"]));
+    // FIX-1056-FOLD-1 (LOW-1): the rotation's offset the identity's last partial compare left ([`CompareRow::next_offset`]),
+    // and (FIX-1056-FOLD-2) the rotations it has completed ([`CompareRow::rotations`]).
+    let (offset, rotations_before) = prior_rows.first().map_or((0, 0), |r| {
+        (
+            offset_of_partial(&r["partial"]),
+            rotations_of_partial(&r["partial"]),
+        )
+    });
     let pending_games: Vec<String> = prior
         .as_array()
         .into_iter()
@@ -249,7 +267,7 @@ pub async fn fresh_compare(
         .ok()
         .and_then(|a| a["rows"].as_array().cloned())
         .unwrap_or_default();
-    let (games, total, next_offset) = pick_games_rotating(
+    let (games, total, next_offset, wrapped) = pick_games_rotating(
         &pending_games,
         &[&actor_rows, &stored],
         &identity_games,
@@ -257,6 +275,12 @@ pub async fn fresh_compare(
         offset,
     );
     let partial = total > games.len();
+    let rotations = if partial {
+        rotations_before + u64::from(wrapped)
+    } else {
+        0
+    };
+    let d1_judges = db.d1_judges();
     let judged: BTreeSet<&str> = games.iter().map(String::as_str).collect();
     let within = |rows: &[Value]| -> Vec<Value> {
         rows.iter()
@@ -266,11 +290,18 @@ pub async fn fresh_compare(
     };
     // FIX-1056-FOLD-1 (the review's MEDIUM-1 and LOW-2): the outpoints either side holds in a game this compare did
     // not judge (the actor's rows and D1's stored rows, before `within` drops them): neither side of them was read, so
-    // nothing about them is a clear ([`classify_reread`]), whatever game their stored entry names.
+    // nothing about them is a clear ([`classify_reread`]), whatever game their stored entry names. FIX-1056-FOLD-2
+    // (the second review's LOW-3): a STALE stored row ([`stored_row_stale`]: Phase C, or judged before the flip) is no
+    // side of the compare (the D1 side is the fresh judgement), so it marks nothing unjudged: an outpoint the actor
+    // holds in one game and a frozen stored row in a far one is read whenever the actor's game is judged.
     let unjudged: BTreeSet<String> = if partial {
         actor_rows
             .iter()
-            .chain(stored.iter())
+            .chain(
+                stored
+                    .iter()
+                    .filter(|r| !stored_row_stale(r, d1_judges, &phase_c)),
+            )
             .filter(|r| !judged.contains(r["gameId"].as_str().unwrap_or_default()))
             .filter_map(|r| r["outpoint"].as_str().map(str::to_string))
             .collect()
@@ -292,7 +323,6 @@ pub async fn fresh_compare(
         json_ms(&under["computedAtMs"]).map(|c| c as i64),
     );
     view["heldByLag"] = json!(held_by_lag(&view, &pending));
-    let d1_judges = db.d1_judges();
     view["d1"]["fresh"] = json!(true);
     view["d1"]["tip"] = json!(db.tip());
     view["d1"]["games"] = json!({"judged": games.len(), "total": total, "partial": partial});
@@ -301,6 +331,7 @@ pub async fn fresh_compare(
         view["d1"]["games"]["judgedGames"] = json!(games);
         view["d1"]["games"]["unjudgedOutpoints"] = json!(unjudged);
         view["d1"]["games"]["nextOffset"] = json!(next_offset);
+        view["d1"]["games"]["rotations"] = json!(rotations);
     }
     // FIX-1056: the identity's stored compare outpoints as read before this compare (the re-read's prior).
     view["storedCompare"] = prior;
@@ -368,29 +399,51 @@ pub struct CompareRow {
     /// FIX-1056-FOLD-1 (LOW-1): where the next compare's rotated window starts ([`pick_games_rotating`]); stored in
     /// the `partial` column as `1 + next_offset` on a partial row, 0 on a whole one ([`partial_column`]).
     pub next_offset: usize,
-    /// FIX-1056-FOLD-1 (MEDIUM-2): the clears [`classify_reread`] classified, counted over the WHOLE set before the
-    /// stored list is cut: `(heldByApply, judgeMoved)`. `None` on a row not classified (the flags are read instead).
-    pub cleared: Option<(usize, usize)>,
+    /// FIX-1056-FOLD-2 (the second review's item 3): the rotations this identity's partial compares have COMPLETED
+    /// (each a walk of the window past the end of its rest, [`pick_games_rotating`]'s `wrapped`), counted from its
+    /// last whole compare; stored in the `partial` column beside the offset ([`partial_column`]) and served
+    /// (`partialUnrotated`, `partialRotationsMin`). 0 on a whole compare.
+    pub rotations: u64,
 }
 
-/// FIX-1056-FOLD-1 (LOW-1): the `partial` column's value: 0 for a whole compare, else `1 + next_offset` (so every
-/// reader that reads it as a flag, `partial != 0`, still does).
+/// FIX-1056-FOLD-2: the `partial` column's stride: the column is `1 + next_offset + ROTATION_STRIDE * rotations` on a
+/// partial row. An offset is below the identity's game count (at most 4,096 read, [`COMPARE_GAMES_SQL`]'s bind, plus
+/// the rows' games), far under 2^32; the column stays exact under D1's REAL bind (2^53) up to 2^21 rotations.
+pub const ROTATION_STRIDE: i64 = 1 << 32;
+
+/// FIX-1056-FOLD-1 (LOW-1): the `partial` column's value: 0 for a whole compare, else `1 + next_offset` plus
+/// (FIX-1056-FOLD-2) [`ROTATION_STRIDE`] for each completed rotation (so every reader that reads it as a flag,
+/// `partial != 0`, still does, and a row written before the fold reads 0 rotations).
 pub fn partial_column(row: &CompareRow) -> i64 {
     if row.partial {
-        1 + row.next_offset as i64
+        1 + (row.next_offset as i64 % ROTATION_STRIDE)
+            + ROTATION_STRIDE * (row.rotations.min((i64::MAX / ROTATION_STRIDE - 1) as u64) as i64)
     } else {
         0
     }
 }
 
+fn partial_int(v: &Value) -> i64 {
+    v.as_i64()
+        .or_else(|| v.as_f64().map(|f| f as i64))
+        .unwrap_or(0)
+}
+
 /// FIX-1056-FOLD-1 (LOW-1): the rotation's offset from a stored `partial` column (D1 may answer a REAL): 0 for none.
 pub fn offset_of_partial(v: &Value) -> usize {
-    let n = v
-        .as_i64()
-        .or_else(|| v.as_f64().map(|f| f as i64))
-        .unwrap_or(0);
+    let n = partial_int(v);
     if n > 0 {
-        (n - 1) as usize
+        ((n - 1) % ROTATION_STRIDE) as usize
+    } else {
+        0
+    }
+}
+
+/// FIX-1056-FOLD-2: the completed rotations from a stored `partial` column: 0 for none (or a row written before).
+pub fn rotations_of_partial(v: &Value) -> u64 {
+    let n = partial_int(v);
+    if n > 0 {
+        ((n - 1) / ROTATION_STRIDE) as u64
     } else {
         0
     }
@@ -417,7 +470,7 @@ pub fn compare_row_of(identity: &str, now: i64, view: Result<&Value, &str>) -> C
         prior: None,
         unjudged: BTreeSet::new(),
         next_offset: 0,
-        cleared: None,
+        rotations: 0,
     };
     let view = match view {
         Ok(v) => v,
@@ -515,7 +568,7 @@ pub fn compare_row_of(identity: &str, now: i64, view: Result<&Value, &str>) -> C
             .map(str::to_string)
             .collect(),
         next_offset: view["d1"]["games"]["nextOffset"].as_u64().unwrap_or(0) as usize,
-        cleared: None,
+        rotations: view["d1"]["games"]["rotations"].as_u64().unwrap_or(0),
     }
 }
 
@@ -533,7 +586,10 @@ pub const COMPARE_UPSERT_SQL: &str = "INSERT INTO owed_actor_compare(identity,co
 /// FIX-1046-FOLD-1 (LOW-2): a FAULT row written over a stored row keeps that row's `outpoints` (its pending re-reads
 /// and its counted differences): a fault is no read of the rows, so it erases no state; the next good read classifies
 /// against the state the fault left. The counts are the fault's (none), as before. The same statement shape, no read.
-pub const COMPARE_FAULT_UPSERT_SQL: &str = "INSERT INTO owed_actor_compare(identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(identity) DO UPDATE SET comparedAtMs=excluded.comparedAtMs,diffCount=excluded.diffCount,heldByLagCount=excluded.heldByLagCount,staleD1Count=excluded.staleD1Count,tipLagCount=excluded.tipLagCount,d1Digest=excluded.d1Digest,actorDigest=excluded.actorDigest,fault=excluded.fault,partial=excluded.partial";
+/// FIX-1056-FOLD-2 (the second review's MEDIUM-1): it keeps the stored `partial` too (the rotation's offset and its
+/// completed rotations): a fault is no compare, so it moves no window; a whale that faults now and then still walks
+/// its whole rotation. (Every summary counts `partial` only where `fault IS NULL`.)
+pub const COMPARE_FAULT_UPSERT_SQL: &str = "INSERT INTO owed_actor_compare(identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(identity) DO UPDATE SET comparedAtMs=excluded.comparedAtMs,diffCount=excluded.diffCount,heldByLagCount=excluded.heldByLagCount,staleD1Count=excluded.staleD1Count,tipLagCount=excluded.tipLagCount,d1Digest=excluded.d1Digest,actorDigest=excluded.actorDigest,fault=excluded.fault";
 
 pub fn upsert_stmt(row: &CompareRow) -> Stmt {
     let int = |n: Option<i64>| n.map_or(Bind::Null, Bind::Int);
@@ -626,8 +682,7 @@ impl CompareRow {
     }
     /// The outpoints whose difference cleared on their re-read (FIX-1046): the apply's lag.
     pub fn held_by_apply(&self) -> usize {
-        self.cleared
-            .map_or_else(|| self.flagged("heldByApply"), |(h, _)| h)
+        self.flagged("heldByApply")
     }
     /// The outpoints whose difference waits for its re-read (FIX-1046): counted neither way.
     pub fn pending_reread(&self) -> usize {
@@ -636,8 +691,7 @@ impl CompareRow {
     /// The outpoints whose difference cleared because the D1 judge's answer moved to the actor's
     /// (FIX-1046-FOLD-1): counted, named `judgeMoved` beside the count.
     pub fn judge_moved(&self) -> usize {
-        self.cleared
-            .map_or_else(|| self.flagged("judgeMoved"), |(_, j)| j)
+        self.flagged("judgeMoved")
     }
     /// When every pending outpoint is past the window (the earliest a re-read can settle them all), or `None`.
     pub fn reread_due_ms(&self, window: i64) -> Option<i64> {
@@ -652,10 +706,17 @@ impl CompareRow {
     }
 }
 
-/// The differing outpoints a stored row keeps STATE for, at most (FIX-1046-FOLD-1, LOW-1): every counted and every
-/// pending difference up to this bound, beside the [`COMPARE_ROW_OUTPOINTS_MAX`] the row names with their fields. A
-/// difference past it has no state to hold it and is COUNTED (never left pending for want of a place).
+/// The PENDING differences a stored row keeps state for, at most (FIX-1046-FOLD-1, LOW-1; FIX-1056-FOLD-2: pending
+/// alone), beside the [`COMPARE_ROW_OUTPOINTS_MAX`] the row names with their fields. A pending difference past it has
+/// no state to hold it and is COUNTED (never left pending for want of a place).
 pub const COMPARE_ROW_STATE_MAX: usize = 128;
+/// FIX-1056-FOLD-2 (the second review's LOW-1): the COUNTED differences a stored row keeps, at most. THE BOUND THE
+/// DESIGN ACCEPTS, stated: a counted difference past it is counted on the row that sees it and not stored, so it is
+/// in no list on a later partial compare that does not judge its game (a false zero needs more than 2,048 standing
+/// differences on ONE identity; each judge stores at most 500 rows an identity, the judge's ceiling, so a whole
+/// compare holds at most 1,000 outpoints). About 150 bytes an entry with its fields dropped: about 310 KB at the bound,
+/// under D1's 2 MB row.
+pub const COMPARE_ROW_COUNTED_MAX: usize = 2_048;
 
 /// PURE (FIX-1046, folded by FIX-1046-FOLD-1): one compare's row classified against the identity's prior stored
 /// outpoints (`prior`, the row's `outpoints` as stored, or none) at `now` under `window`. THE RULE: the compare names a
@@ -680,9 +741,14 @@ pub const COMPARE_ROW_STATE_MAX: usize = 128;
 ///   no game named and no side read in a judged game); it ends only on a read that judges its game and finds both
 ///   sides equal. Every unheld entry carries its `gameId`. The same "not read" rule keeps a pending outpoint pending
 ///   (LOW-2: a row that moved to an unjudged game is not read).
-/// - FIX-1056-FOLD-1 (MEDIUM-2): the clears are counted over the whole set ([`CompareRow::cleared`]) before the stored
-///   list is cut, and every cleared entry is kept past the cut (fields dropped), so the counter and the served class
-///   see each one at any number of standing differences.
+/// - FIX-1056-FOLD-1 (MEDIUM-2): every cleared entry is kept past the cut (fields dropped), so the counter and the
+///   served class, both read from the stored flags, see each one at any number of standing differences
+///   (FIX-1056-FOLD-2, the second review's NOTE-2: one mechanism; the separate `cleared` count is gone).
+/// - FIX-1056-FOLD-2 (the second review's LOW-2): under a partial compare an entry no side holds in a judged game is
+///   not read either (the fresh D1 judgement may hold it in a game not judged, which no stored row shows in Phase C):
+///   carried (counted, or pending) with `absentSince`, and ended only after a whole rotation more with no side holding
+///   it in a judged game, or by a whole compare. Every counted entry is stored, up to [`COMPARE_ROW_COUNTED_MAX`]
+///   (LOW-1).
 ///
 /// `heldByLagCount` is unchanged (the marks and the tips). A fault row is returned as it is.
 pub fn classify_reread(
@@ -757,6 +823,24 @@ pub fn classify_reread(
             pending.push(o);
         }
     }
+    // FIX-1056-FOLD-2 (the second review's LOW-2): under a partial compare an entry is POSITIVELY read only when a side
+    // holds its outpoint in a judged game; an entry no side holds in a judged game may sit, on the side no stored row
+    // shows (the fresh D1 judgement's row in Phase C), in a game not judged. It is carried until a whole rotation has
+    // passed with no side holding it in any judged game (`absentSince`, the rotations completed when that was first
+    // seen; it ends at two rotations more: one full walk of the rest since), or a whole compare.
+    let positive = |key: &str| row.judged_games.is_none() || row.games.contains_key(key);
+    let absent_done = |p: &Value| {
+        p["absentSince"]
+            .as_u64()
+            .is_some_and(|s| row.rotations >= s + 2)
+    };
+    let absent_mark = |p: &Value| -> Value {
+        let mut p = p.clone();
+        if !p["absentSince"].is_u64() {
+            p["absentSince"] = json!(row.rotations);
+        }
+        p
+    };
     // FIX-1056-FOLD-1 (MEDIUM-1): a prior COUNTED outpoint this read did not judge is carried counted, as stored.
     for p in prior.iter().filter(|p| counted_entry(p)) {
         let key = p["outpoint"].as_str().unwrap_or_default();
@@ -764,7 +848,14 @@ pub fn classify_reread(
             continue;
         }
         if !read(key, p["gameId"].as_str()) {
-            counted.push(p.clone());
+            let mut p = p.clone();
+            if row.unjudged.contains(key) {
+                // A side holds it (in a game not judged): not absent.
+                p.as_object_mut().map(|m| m.remove("absentSince"));
+            }
+            counted.push(p);
+        } else if !positive(key) && !absent_done(p) {
+            counted.push(absent_mark(p));
         }
     }
     // FIX-1056 (LOW-1): the pending outpoints whose game this read did not judge (a partial compare left it out):
@@ -785,6 +876,11 @@ pub fn classify_reread(
             // An entry naming no game: under a partial compare that read no side of it, its pending state is dropped
             // (counted neither way; a difference that still stands is seen afresh when its game is judged; the
             // review's NOTE-1, transitional: only entries stored before FIX-1056).
+            continue;
+        }
+        if !positive(key) && !absent_done(p) {
+            // FIX-1056-FOLD-2 (LOW-2): no side holds it in a judged game: not read, still pending.
+            unread.push(absent_mark(p));
             continue;
         }
         let (d1_now, actor_now) = print_of(key);
@@ -810,51 +906,54 @@ pub fn classify_reread(
             moved.push(e);
         }
     }
-    // The state the row can keep: counted then pending, up to [`COMPARE_ROW_STATE_MAX`]; a pending difference past it
-    // has no place and is counted (never pending for want of one).
-    let cleared = (
-        named.len(),
-        moved.iter().filter(|o| o["judgeMoved"] == true).count(),
-    );
-    let mut diff_count = (counted.len() + moved.len()) as i64;
-    let mut stateful: Vec<Value> = counted;
+    // FIX-1056-FOLD-2 (the second review's LOW-1): the PENDING state is bounded ([`COMPARE_ROW_STATE_MAX`]); a pending
+    // difference past it has no place and is counted (never pending for want of one). Every COUNTED entry is kept, up
+    // to [`COMPARE_ROW_COUNTED_MAX`] (fields dropped past the [`COMPARE_ROW_OUTPOINTS_MAX`] named): a counted entry
+    // not stored would vanish from the next partial compare that does not judge its game.
+    let mut kept_pending: Vec<Value> = Vec::new();
     for mut o in pending {
-        if stateful.len() < COMPARE_ROW_STATE_MAX {
-            stateful.push(o);
+        if kept_pending.len() < COMPARE_ROW_STATE_MAX {
+            kept_pending.push(o);
         } else {
-            diff_count += 1;
             for k in ["pendingReread", "seenAtMs", "d1At", "actorAt"] {
                 o.as_object_mut().map(|m| m.remove(k));
             }
             o["held"] = json!(false);
-            stateful.push(o);
+            counted.push(o);
         }
     }
     // FIX-1056: an unread pending outpoint keeps its state while there is room; past the bound it is dropped, never
     // counted (it was not read).
     for o in unread {
-        if stateful.len() < COMPARE_ROW_STATE_MAX {
-            stateful.push(o);
+        if kept_pending.len() < COMPARE_ROW_STATE_MAX {
+            kept_pending.push(o);
         }
     }
+    let diff_count = (counted.len() + moved.len()) as i64;
     let mut out: Vec<Value> = Vec::new();
-    let mut kept_state = 0usize;
-    for o in stateful.into_iter().chain(moved).chain(named).chain(held) {
-        let needs_state = o["held"] == false && o["judgeMoved"] != true && o["bothMoved"] != true
-            || o["pendingReread"] == true;
-        // FIX-1056-FOLD-1 (MEDIUM-2): a cleared entry is a class the row serves; kept past the cut (no fields). They
-        // are at most the prior's pending entries, so at most [`COMPARE_ROW_STATE_MAX`].
-        let cleared_entry =
-            o["heldByApply"] == true || o["judgeMoved"] == true || o["bothMoved"] == true;
+    let mut kept_counted = 0usize;
+    let counted_len = counted.len();
+    for (i, o) in counted
+        .into_iter()
+        .chain(kept_pending)
+        .chain(moved)
+        .chain(named)
+        .chain(held)
+        .enumerate()
+    {
+        let is_counted = i < counted_len;
+        // A pending entry (bounded above) and a cleared entry (at most the prior's pending entries, so at most
+        // [`COMPARE_ROW_STATE_MAX`]) are classes the row serves: kept past the cut, fields dropped (FIX-1056-FOLD-1,
+        // MEDIUM-2). A held-by-lag or tip-lag entry is named only within the cut, as before.
+        let kept_past = o["pendingReread"] == true
+            || o["heldByApply"] == true
+            || o["judgeMoved"] == true
+            || o["bothMoved"] == true;
         if out.len() < COMPARE_ROW_OUTPOINTS_MAX {
-            kept_state += usize::from(needs_state);
+            kept_counted += usize::from(is_counted);
             out.push(o);
-        } else if cleared_entry {
-            let mut o = o;
-            o["fields"] = Value::Null;
-            out.push(o);
-        } else if needs_state && kept_state < COMPARE_ROW_STATE_MAX {
-            kept_state += 1;
+        } else if (is_counted && kept_counted < COMPARE_ROW_COUNTED_MAX) || kept_past {
+            kept_counted += usize::from(is_counted);
             let mut o = o;
             o["fields"] = Value::Null;
             out.push(o);
@@ -862,7 +961,6 @@ pub fn classify_reread(
     }
     row.diff_count = Some(diff_count);
     row.outpoints = json!(out);
-    row.cleared = Some(cleared);
     row
 }
 
@@ -1707,7 +1805,7 @@ async fn held_by_apply_counted(m: &impl SqlPort, row: &CompareRow) {
 pub const COMPARE_PAGE: usize = 64;
 /// The fleet's counts over every stored compare row, one statement (the overlay's `/health/invariants` reads the same
 /// aggregate in `owed_events::HEALTH_STATE_SQL`).
-pub const COMPARE_SUMMARY_SQL: &str = "SELECT COUNT(*) AS identities,COALESCE(SUM(diffCount>0),0) AS diffs,COALESCE(SUM(heldByLagCount>0),0) AS heldByLag,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.heldByApply')=1))),0) AS heldByApply,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.pendingReread')=1))),0) AS pendingReread,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.judgeMoved')=1))),0) AS judgeMoved,COALESCE(SUM(staleD1Count),0) AS staleD1,COALESCE(SUM(fault IS NOT NULL),0) AS faults,COALESCE(SUM(fault IS NULL AND partial>0),0) AS partial,MIN(comparedAtMs) AS oldest,MAX(comparedAtMs) AS newest FROM owed_actor_compare";
+pub const COMPARE_SUMMARY_SQL: &str = "SELECT COUNT(*) AS identities,COALESCE(SUM(diffCount>0),0) AS diffs,COALESCE(SUM(heldByLagCount>0),0) AS heldByLag,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.heldByApply')=1))),0) AS heldByApply,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.pendingReread')=1))),0) AS pendingReread,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.judgeMoved')=1))),0) AS judgeMoved,COALESCE(SUM(staleD1Count),0) AS staleD1,COALESCE(SUM(fault IS NOT NULL),0) AS faults,COALESCE(SUM(fault IS NULL AND partial>0),0) AS partial,COALESCE(SUM(fault IS NULL AND partial>0 AND CAST(partial AS INTEGER)<=4294967296),0) AS partialUnrotated,MIN(CASE WHEN fault IS NULL AND partial>0 THEN (CAST(partial AS INTEGER)-1)/4294967296 END) AS partialRotationsMin,MIN(comparedAtMs) AS oldest,MAX(comparedAtMs) AS newest FROM owed_actor_compare";
 /// The rows worth naming past `?1` (a difference, a held one or a fault), `?2` a page; `?3` one identity or ''.
 pub const COMPARE_PAGE_SQL: &str = "SELECT identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial FROM owed_actor_compare WHERE identity>?1 AND (?3='' OR identity=?3) AND (diffCount>0 OR heldByLagCount>0 OR fault IS NOT NULL OR (fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.heldByApply')=1)) OR (fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.pendingReread')=1)) OR ?3<>'') ORDER BY identity LIMIT ?2";
 
@@ -1755,6 +1853,10 @@ pub fn compare_answer(
             "staleD1": n(&r["staleD1Count"]),
             "tipLag": n(&r["tipLagCount"]),
             "partial": n(&r["partial"]) != 0,
+            "rotation": (n(&r["partial"]) != 0).then(|| json!({
+                "offset": offset_of_partial(&r["partial"]),
+                "completed": rotations_of_partial(&r["partial"]),
+            })),
             "digests": {"d1": r["d1Digest"], "actor": r["actorDigest"]},
             "outpoints": ops,
         })
@@ -1809,6 +1911,9 @@ pub fn compare_answer(
         // FIX-1056-FOLD-1 (the review's LOW-1): the identities whose last compare did not judge every game (a
         // partial compare: its zero is over the games judged; the rotation judges the rest on its next compares).
         "identitiesPartial": n(&summary["partial"]),
+        // FIX-1056-FOLD-2 (the second review's item 3): the rotation's completion (each row's `rotation` too).
+        "identitiesPartialUnrotated": n(&summary["partialUnrotated"]),
+        "partialRotationsMin": json_ms(&summary["partialRotationsMin"]),
         "rereadStatementsMax": FLEET_COMPARE_REREAD_STATEMENTS,
         "comparedWithinMs": json_ms(&summary["oldest"]).map(|o| now - o as i64),
         "newestComparedAtMs": json_ms(&summary["newest"]),
