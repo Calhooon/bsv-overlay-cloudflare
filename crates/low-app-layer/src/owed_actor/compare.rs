@@ -25,46 +25,57 @@ use std::collections::BTreeSet;
 /// 64 (the lived-in seat 341, the four fleet seats about 505: the reads follow the rows more than the games), inside
 /// D1's per-invocation bound of 1,000 with the ring's reserve; at 128 the whale was 1,101.
 pub const FRESH_COMPARE_GAMES_MAX: usize = 64;
-/// The identity's games, newest first (the judge's union: `owed_judge::identity_games!`), one statement.
-pub const COMPARE_GAMES_SQL: &str = crate::owed_judge::IDENTITY_GAMES_NEWEST_SQL;
+/// FIX-1056-FOLD-3 (bsv-low #1056, review 3's LOW-1): the identity's games in the ROTATION'S order, one statement: the
+/// games past the identity's keyset cursor (`lap.after` of its stored PARTIAL compare row, `''` with none) in game-id
+/// order, then the games at or before it from the first (the next lap's start), at most `?2` rows, each with the
+/// union's size (`n`, the window count over every game before the limit). Game ids compare lowercased, as the compare
+/// holds them. A game never moves in this order (its id is its place), so a lap walks every game present at its start.
+pub const COMPARE_GAMES_SQL: &str = concat!(
+    "SELECT gameId,n FROM (SELECT lower(gameId) AS gameId,COUNT(*) OVER () AS n FROM (",
+    crate::owed_judge::identity_games!(),
+    ")) ORDER BY CASE WHEN gameId>COALESCE((SELECT json_extract(lap,'$.after') FROM owed_actor_compare WHERE identity=?1 AND partial>0 AND json_valid(lap)),'') THEN 0 ELSE 1 END,gameId LIMIT ?2"
+);
+/// The rotation's page ([`COMPARE_GAMES_SQL`]'s `?2`): at least two windows past any cursor, so a walk of
+/// [`FRESH_COMPARE_GAMES_MAX`] places never reaches the end of a page it was not given whole.
+pub const COMPARE_GAMES_PAGE: usize = 4 * FRESH_COMPARE_GAMES_MAX;
 /// The Phase C flip as the ring observed it (`owed_belt_state` `owed-actor:phase-c`: `{sinceMs, endedAtMs}`).
 pub const PHASE_C_NAME: &str = "owed-actor:phase-c";
 pub const PHASE_C_READ_SQL: &str =
     "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:phase-c'";
 
-/// The games a compare judges ([`FRESH_COMPARE_GAMES_MAX`]): the games of the identity's PENDING re-reads first
-/// (`first`, FIX-1056: a pending outpoint is re-read when its game is judged, so its game is judged before any other),
-/// then the rows' games (sorted), then the identity's games in the order given (newest first); `(picked, total)`,
-/// `total` the union's size. The rotation's offset 0 ([`pick_games_rotating`]).
-pub fn pick_games(
-    first: &[String],
-    rows: &[&[Value]],
-    identity_games: &[String],
-    max: usize,
-) -> (Vec<String>, usize) {
-    let (picked, total, _, _) = pick_games_rotating(first, rows, identity_games, max, 0);
-    (picked, total)
+/// The games one compare judges ([`pick_games_keyset`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GamePick {
+    /// The games judged: the pending games first, then the window in the rotation's order.
+    pub picked: Vec<String>,
+    /// The union's size (the identity's games, the rows' games and the pending games; exact when the page was whole).
+    pub total: usize,
+    /// Whether every game was judged (no rotation: the cursor ends).
+    pub whole: bool,
+    /// The keyset cursor the next compare starts past (the last game this compare walked; `''`, the next lap's start).
+    pub next_after: String,
+    /// Whether this compare's walk passed the last game of the id order: a LAP completed (every game present when the
+    /// lap began, at cursor `''`, has been judged in it; a game added since with a smaller id is the next lap's).
+    pub wrapped: bool,
 }
 
-/// FIX-1056-FOLD-1 (the review's LOW-1), folded by FIX-1056-FOLD-2: [`pick_games`] with the window ROTATED. The
-/// pending games first (at most `max`), then, when the rest does not fit the places left, the rest read from `offset`
-/// (mod its length), wrapping. The rest is the rows' games sorted, then the identity's games, and its positions do NOT
-/// depend on the pending games (the second review's NOTE-1: a pending game is skipped where it stands, the walk
-/// advancing past it, so a pending game never shifts the window over the others). `(picked, total, next, wrapped)`:
-/// `total` the union's size, `next` the offset the next compare of this identity starts at (`offset` advanced by the
-/// positions this compare walked; 0 when everything fit), `wrapped` whether this compare's walk reached the end of
-/// the rest (a ROTATION completed: from offset 0, every position of the rest has been walked once). The offset and
-/// the completed rotations ride the stored row's `partial` column ([`partial_column`]), which a fault row never
-/// writes (the second review's MEDIUM-1), so a partial identity's every game is judged within `ceil(rest / places)`
-/// of its good compares, whatever its size and however its compares fault in between; the bound is approximate
-/// while the identity's game list moves between compares (a new game shifts the order by one).
-pub fn pick_games_rotating(
+/// FIX-1056-FOLD-3 (review 3's LOW-1): the games a compare judges, at most `max`. The games of the identity's PENDING
+/// re-reads first (`first`, FIX-1056: a pending outpoint is re-read when its game is judged), then, when the rest does
+/// not fit, the rest walked by KEYSET over the game id from past `after` (the stored cursor), wrapping to the first
+/// game once it passes the last. The rest is the rows' games and the identity's games ([`COMPARE_GAMES_SQL`]'s `page`
+/// in its order, `count` the identity's game count); a pending game is skipped where it stands (judged already), so
+/// it never shifts the walk. A row's game past the end of a page that was cut is left to a later compare (its place is
+/// not known to be inside what the page read). Replaces FIX-1056-FOLD-1's offset rotation, whose positions moved when
+/// a game moved in the newest-first order (review 3's rv3_a: a game skipped in the lap that counted the wrap).
+pub fn pick_games_keyset(
     first: &[String],
     rows: &[&[Value]],
-    identity_games: &[String],
+    page: &[String],
+    count: usize,
+    after: &str,
     max: usize,
-    offset: usize,
-) -> (Vec<String>, usize, usize, bool) {
+) -> GamePick {
+    let after = after.to_ascii_lowercase();
     let mut picked: Vec<String> = Vec::new();
     let mut all: BTreeSet<String> = BTreeSet::new();
     for g in first {
@@ -73,6 +84,7 @@ pub fn pick_games_rotating(
             picked.push(g);
         }
     }
+    picked.truncate(max);
     let mut from_rows: BTreeSet<String> = BTreeSet::new();
     for side in rows {
         for r in side.iter() {
@@ -81,40 +93,134 @@ pub fn pick_games_rotating(
             }
         }
     }
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut rest: Vec<String> = Vec::new();
-    for g in from_rows
+    let page: Vec<String> = page
+        .iter()
+        .map(|g| g.to_ascii_lowercase())
+        .filter(|g| !g.is_empty())
+        .collect();
+    let complete = page.len() < COMPARE_GAMES_PAGE;
+    let seg1_db: Vec<&String> = page
+        .iter()
+        .filter(|g| g.as_str() > after.as_str())
+        .collect();
+    let seg2_db: Vec<&String> = page
+        .iter()
+        .filter(|g| g.as_str() <= after.as_str())
+        .collect();
+    // The page reads the games past the cursor first: they are all there when the page is whole, or when it went on
+    // past them into the next lap's games.
+    let seg1_complete = complete || !seg2_db.is_empty();
+    let seg1_bound = (!seg1_complete)
+        .then(|| seg1_db.last().map(|g| g.to_string()))
+        .flatten();
+    let seg2_bound = (!complete)
+        .then(|| seg2_db.last().map(|g| g.to_string()))
+        .flatten();
+    let mut seg1: BTreeSet<String> = seg1_db.iter().map(|g| g.to_string()).collect();
+    let mut seg2: BTreeSet<String> = seg2_db.iter().map(|g| g.to_string()).collect();
+    for g in &from_rows {
+        if g.as_str() > after.as_str() {
+            if seg1_bound.as_ref().is_none_or(|b| g <= b) {
+                seg1.insert(g.clone());
+            }
+        } else if complete || seg2_bound.as_ref().is_some_and(|b| g <= b) {
+            seg2.insert(g.clone());
+        }
+    }
+    all.extend(seg1.iter().cloned());
+    all.extend(seg2.iter().cloned());
+    // A row's game is known to lie outside the identity's games only inside the ranges the page read whole.
+    let in_db: BTreeSet<&String> = page.iter().collect();
+    let covered = |g: &String| {
+        if g.as_str() > after.as_str() {
+            seg1_complete || seg1_bound.as_ref().is_some_and(|b| g <= b)
+        } else {
+            complete || seg2_bound.as_ref().is_some_and(|b| g <= b)
+        }
+    };
+    let rows_only = from_rows
+        .iter()
+        .filter(|g| covered(g) && !in_db.contains(g))
+        .count();
+    let total = if complete {
+        all.len()
+    } else {
+        (count + rows_only).max(all.len())
+    };
+    if complete && all.len() <= max {
+        let mut whole = picked.clone();
+        for g in seg1.iter().chain(seg2.iter()) {
+            if !whole.contains(g) {
+                whole.push(g.clone());
+            }
+        }
+        // A whole compare in game order from the first game (the base's window held every game too).
+        let mut rest: Vec<String> = whole.split_off(picked.len().min(whole.len()));
+        rest.sort();
+        whole.extend(rest);
+        return GamePick {
+            picked: whole,
+            total,
+            whole: true,
+            next_after: String::new(),
+            wrapped: false,
+        };
+    }
+    let mut next_after = after.clone();
+    let mut wrapped = false;
+    if picked.len() < max {
+        for g in &seg1 {
+            if picked.len() >= max {
+                break;
+            }
+            next_after = g.clone();
+            if !picked.contains(g) {
+                picked.push(g.clone());
+            }
+        }
+        // Every game past the cursor walked (the page held them all): the lap completed in this compare.
+        if seg1_complete
+            && seg1
+                .iter()
+                .next_back()
+                .is_none_or(|last| *last == next_after)
+        {
+            wrapped = true;
+            next_after = String::new();
+            for g in &seg2 {
+                if picked.len() >= max {
+                    break;
+                }
+                next_after = g.clone();
+                if !picked.contains(g) {
+                    picked.push(g.clone());
+                }
+            }
+        }
+    }
+    GamePick {
+        picked,
+        total,
+        whole: false,
+        next_after,
+        wrapped,
+    }
+}
+
+/// FIX-1056-FOLD-3: the page [`COMPARE_GAMES_SQL`] answers for `games` (every game of an identity) past `after`, and the
+/// count: the statement's order modelled for the pure pins.
+pub fn games_page_of(games: &[String], after: &str) -> (Vec<String>, usize) {
+    let after = after.to_ascii_lowercase();
+    let mut all: Vec<String> = games
+        .iter()
+        .map(|g| g.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>()
         .into_iter()
-        .chain(identity_games.iter().map(|g| g.to_ascii_lowercase()))
-    {
-        if !g.is_empty() && seen.insert(g.clone()) {
-            all.insert(g.clone());
-            rest.push(g);
-        }
-    }
-    let total = all.len();
-    picked.truncate(max);
-    let places = max - picked.len();
-    let left: Vec<&String> = rest.iter().filter(|g| !picked.contains(*g)).collect();
-    if left.len() <= places {
-        let left: Vec<String> = left.into_iter().cloned().collect();
-        picked.extend(left);
-        return (picked, total, 0, false);
-    }
-    let len = rest.len();
-    if places == 0 {
-        return (picked, total, offset % len, false);
-    }
-    let start = offset % len;
-    let mut walked = 0;
-    while picked.len() < max && walked < len {
-        let g = &rest[(start + walked) % len];
-        walked += 1;
-        if !picked.contains(g) {
-            picked.push(g.clone());
-        }
-    }
-    (picked, total, (start + walked) % len, start + walked >= len)
+        .collect();
+    let n = all.len();
+    all.sort_by_key(|g| (g.as_str() <= after.as_str(), g.clone()));
+    all.truncate(COMPARE_GAMES_PAGE);
+    (all, n)
 }
 
 /// A stored D1 row is stale when the D1 judge is off (Phase C: nothing writes `owed_rows`) or it was judged before the
@@ -223,7 +329,7 @@ pub async fn fresh_compare(
             Stmt::new(LEVER_PENDING_SQL, vec![Bind::Text(me.clone())]),
             Stmt::new(
                 COMPARE_GAMES_SQL,
-                vec![Bind::Text(me.clone()), Bind::Int(4_096)],
+                vec![Bind::Text(me.clone()), Bind::Int(COMPARE_GAMES_PAGE as i64)],
             ),
             Stmt::new(PHASE_C_READ_SQL, vec![]),
             // FIX-1056: the identity's stored compare, read once here: its pending outpoints' games are judged first
@@ -236,7 +342,16 @@ pub async fn fresh_compare(
     let stored = next();
     let under = next().into_iter().next().unwrap_or_default();
     let pending = next();
-    let identity_games: Vec<String> = next()
+    let games_page = next();
+    let game_count = games_page
+        .first()
+        .and_then(|r| {
+            r["n"]
+                .as_u64()
+                .or_else(|| r["n"].as_f64().map(|f| f as u64))
+        })
+        .unwrap_or(0) as usize;
+    let identity_games: Vec<String> = games_page
         .iter()
         .filter_map(|r| r["gameId"].as_str().map(str::to_string))
         .collect();
@@ -247,14 +362,21 @@ pub async fn fresh_compare(
         .unwrap_or(Value::Null);
     let prior_rows = next();
     let prior = prior_of(&prior_rows).unwrap_or(json!([]));
-    // FIX-1056-FOLD-1 (LOW-1): the rotation's offset the identity's last partial compare left ([`CompareRow::next_offset`]),
-    // and (FIX-1056-FOLD-2) the rotations it has completed ([`CompareRow::rotations`]).
-    let (offset, rotations_before) = prior_rows.first().map_or((0, 0), |r| {
-        (
-            offset_of_partial(&r["partial"]),
-            rotations_of_partial(&r["partial"]),
-        )
-    });
+    // FIX-1056-FOLD-3 (review 3's LOW-1 and LOW-2): the identity's lap as its last PARTIAL compare left it (the keyset
+    // cursor, the lap's state, [`Lap`]), and the rotations and zero-held laps it has completed; a whole compare left
+    // none (`partial` 0: the next partial compare starts a lap from the first game).
+    let (lap_before, rotations_before, zero_held_before) =
+        prior_rows.first().map_or((Lap::default(), 0, 0), |r| {
+            if partial_int(&r["partial"]) > 0 {
+                (
+                    Lap::of_column(&r["lap"]),
+                    rotations_of_partial(&r["partial"]),
+                    zero_held_laps_of_partial(&r["partial"]),
+                )
+            } else {
+                (Lap::default(), 0, 0)
+            }
+        });
     let pending_games: Vec<String> = prior
         .as_array()
         .into_iter()
@@ -267,14 +389,21 @@ pub async fn fresh_compare(
         .ok()
         .and_then(|a| a["rows"].as_array().cloned())
         .unwrap_or_default();
-    let (games, total, next_offset, wrapped) = pick_games_rotating(
+    let GamePick {
+        picked: games,
+        total,
+        whole,
+        next_after,
+        wrapped,
+    } = pick_games_keyset(
         &pending_games,
         &[&actor_rows, &stored],
         &identity_games,
+        game_count,
+        &lap_before.after,
         FRESH_COMPARE_GAMES_MAX,
-        offset,
     );
-    let partial = total > games.len();
+    let partial = !whole;
     let rotations = if partial {
         rotations_before + u64::from(wrapped)
     } else {
@@ -308,7 +437,21 @@ pub async fn fresh_compare(
     } else {
         BTreeSet::new()
     };
-    let fresh = crate::owed_judge::judge_fresh_rows(db, &me, &games).await?;
+    // FIX-1056-FOLD-3 (review 3's MEDIUM-1): ONE CEILING RULE FOR BOTH SIDES. The actor's rows are its whole identity's
+    // judgement ranked at the 500-row ceiling ([`crate::owed_judge::ceiling_key`]); a partial compare's D1 side is the
+    // window's games, so it is judged UNCUT and cut at the same ceiling: a D1 row whose key sorts after the actor's
+    // 500th row's is one the identity's ceiling cuts (served `pastCeiling`, never a difference). Below the ceiling (the
+    // actor holds fewer than 500 rows) nothing is cut. A whole compare is ranked over every game at the ceiling by the
+    // judge itself. No judge statement more.
+    let (fresh, past_ceiling) = if partial {
+        let uncut = crate::owed_judge::judge_fresh_rows_ranked(db, &me, &games, false).await?;
+        ceiling_cut(uncut, &actor_rows, actor.is_ok())
+    } else {
+        (
+            crate::owed_judge::judge_fresh_rows(db, &me, &games).await?,
+            Vec::new(),
+        )
+    };
     let stored = within(&stored);
     let actor = actor.map(|mut a| {
         a["rows"] = json!(within(&actor_rows));
@@ -330,8 +473,12 @@ pub async fn fresh_compare(
         // FIX-1056: the games a partial compare judged, so a pending outpoint of a game it left out stays pending.
         view["d1"]["games"]["judgedGames"] = json!(games);
         view["d1"]["games"]["unjudgedOutpoints"] = json!(unjudged);
-        view["d1"]["games"]["nextOffset"] = json!(next_offset);
+        view["d1"]["games"]["nextAfter"] = json!(next_after);
+        view["d1"]["games"]["wrapped"] = json!(wrapped);
         view["d1"]["games"]["rotations"] = json!(rotations);
+        view["d1"]["games"]["lapBefore"] = lap_before.to_value();
+        view["d1"]["games"]["zeroHeldLapsBefore"] = json!(zero_held_before);
+        view["d1"]["pastCeiling"] = json!(past_ceiling);
     }
     // FIX-1056: the identity's stored compare outpoints as read before this compare (the re-read's prior).
     view["storedCompare"] = prior;
@@ -396,9 +543,17 @@ pub struct CompareRow {
     /// FIX-1056-FOLD-1 (MEDIUM-1, LOW-2): the outpoints either side holds in a game a PARTIAL compare did not judge
     /// (neither side read). Not stored.
     pub unjudged: BTreeSet<String>,
-    /// FIX-1056-FOLD-1 (LOW-1): where the next compare's rotated window starts ([`pick_games_rotating`]); stored in
-    /// the `partial` column as `1 + next_offset` on a partial row, 0 on a whole one ([`partial_column`]).
-    pub next_offset: usize,
+    /// FIX-1056-FOLD-3 (review 3's LOW-1): the lap after this compare ([`Lap`], its cursor the last game walked,
+    /// [`pick_games_keyset`]); before [`classify_reread`], the lap as the prior compare left it with this compare's
+    /// cursor. Stored in the `lap` column on a partial row.
+    pub lap: Lap,
+    /// FIX-1056-FOLD-3: whether this compare completed a lap ([`GamePick::wrapped`]). Not stored.
+    pub wrapped: bool,
+    /// FIX-1056-FOLD-3 (review 3's LOW-2): the laps this partial identity has completed with zero read throughout
+    /// (no counted and no pending difference on any compare of the lap; reset to 0 by any), stored in the `partial`
+    /// column ([`partial_column`]) and served (`partialZeroHeldLapsMin`): a partial identity's zero covers every game
+    /// only once this is at least 1.
+    pub zero_held_laps: u64,
     /// FIX-1056-FOLD-2 (the second review's item 3): the rotations this identity's partial compares have COMPLETED
     /// (each a walk of the window past the end of its rest, [`pick_games_rotating`]'s `wrapped`), counted from its
     /// last whole compare; stored in the `partial` column beside the offset ([`partial_column`]) and served
@@ -406,17 +561,94 @@ pub struct CompareRow {
     pub rotations: u64,
 }
 
-/// FIX-1056-FOLD-2: the `partial` column's stride: the column is `1 + next_offset + ROTATION_STRIDE * rotations` on a
-/// partial row. An offset is below the identity's game count (at most 4,096 read, [`COMPARE_GAMES_SQL`]'s bind, plus
-/// the rows' games), far under 2^32; the column stays exact under D1's REAL bind (2^53) up to 2^21 rotations.
+/// FIX-1056-FOLD-2: the `partial` column's stride: the column is `1 + zero_held_laps + ROTATION_STRIDE * rotations` on a
+/// partial row (FIX-1056-FOLD-3: the low part was the offset rotation's offset; the keyset cursor rides the `lap`
+/// column, [`Lap`]). The column stays exact under D1's REAL bind (2^53) up to 2^21 rotations.
 pub const ROTATION_STRIDE: i64 = 1 << 32;
 
-/// FIX-1056-FOLD-1 (LOW-1): the `partial` column's value: 0 for a whole compare, else `1 + next_offset` plus
-/// (FIX-1056-FOLD-2) [`ROTATION_STRIDE`] for each completed rotation (so every reader that reads it as a flag,
-/// `partial != 0`, still does, and a row written before the fold reads 0 rotations).
+/// FIX-1056-FOLD-3 (review 3's LOW-1, LOW-2, NOTE-2): a partial identity's LAP, stored in the compare row's `lap`
+/// column (JSON; a fault row keeps it, as it keeps `partial`): the keyset cursor (`after`, the last game walked; `''`
+/// a lap's start), whether every compare of the lap so far read zero (`lapClean`: no counted and no pending
+/// difference), and the counted differences past [`COMPARE_ROW_COUNTED_MAX`] that no list holds (`overflow`, carried
+/// in `diffCount` until a lap ends with no overflow in it, `overflowThisLap`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lap {
+    pub after: String,
+    pub lap_clean: bool,
+    pub overflow: i64,
+    pub overflow_this_lap: bool,
+}
+
+impl Default for Lap {
+    fn default() -> Self {
+        Lap {
+            after: String::new(),
+            lap_clean: true,
+            overflow: 0,
+            overflow_this_lap: false,
+        }
+    }
+}
+
+impl Lap {
+    /// The lap from a stored `lap` column (TEXT JSON, or none: a fresh lap).
+    pub fn of_column(v: &Value) -> Lap {
+        let v: Value = match v {
+            Value::String(t) => serde_json::from_str(t).unwrap_or(Value::Null),
+            other => other.clone(),
+        };
+        if !v.is_object() {
+            return Lap::default();
+        }
+        Lap {
+            after: v["after"].as_str().unwrap_or_default().to_ascii_lowercase(),
+            lap_clean: v["lapClean"] != false,
+            overflow: v["overflow"].as_i64().unwrap_or(0).max(0),
+            overflow_this_lap: v["overflowThisLap"] == true,
+        }
+    }
+    pub fn to_value(&self) -> Value {
+        json!({"after": self.after, "lapClean": self.lap_clean, "overflow": self.overflow,
+               "overflowThisLap": self.overflow_this_lap})
+    }
+}
+
+/// PURE (FIX-1056-FOLD-3, review 3's MEDIUM-1): a partial compare's uncut D1 rows cut at the ACTOR'S ceiling: when the
+/// actor's answer holds the ceiling's 500 rows (its whole identity ranked, [`crate::owed_judge::ceiling_key`]), every
+/// D1 row whose key sorts after the actor's 500th row's key is past the identity's ceiling (returned apart, its
+/// outpoints). Sound in both directions: an actor equal to the D1 judge holds exactly the rows at or before that key,
+/// so it reads zero; an actor that holds a row the D1 judge does not (or lacks one it holds) at or before the key is a
+/// difference, and an actor whose ceiling a phantom row moved shows that phantom as a difference when its game is
+/// judged (the truth's row it pushed past the ceiling is the only one served apart). An actor with fewer rows, or one
+/// that did not answer, cuts nothing.
+pub fn ceiling_cut(
+    d1: Vec<Value>,
+    actor_rows: &[Value],
+    actor_ok: bool,
+) -> (Vec<Value>, Vec<String>) {
+    if !actor_ok || actor_rows.len() < crate::owed::OWED_MAX_ROWS {
+        return (d1, Vec::new());
+    }
+    let Some(edge) = actor_rows.iter().map(crate::owed_judge::ceiling_key).max() else {
+        return (d1, Vec::new());
+    };
+    let (kept, past): (Vec<Value>, Vec<Value>) = d1
+        .into_iter()
+        .partition(|r| crate::owed_judge::ceiling_key(r) <= edge);
+    (
+        kept,
+        past.iter()
+            .filter_map(|r| r["outpoint"].as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+/// The `partial` column's value: 0 for a whole compare, else `1 + zero_held_laps` (FIX-1056-FOLD-3) plus
+/// [`ROTATION_STRIDE`] for each completed rotation (so every reader that reads it as a flag, `partial != 0`, still
+/// does, and a row written before the fold reads 0 rotations and 0 zero-held laps).
 pub fn partial_column(row: &CompareRow) -> i64 {
     if row.partial {
-        1 + (row.next_offset as i64 % ROTATION_STRIDE)
+        1 + (row.zero_held_laps.min((ROTATION_STRIDE - 2) as u64) as i64)
             + ROTATION_STRIDE * (row.rotations.min((i64::MAX / ROTATION_STRIDE - 1) as u64) as i64)
     } else {
         0
@@ -429,11 +661,11 @@ fn partial_int(v: &Value) -> i64 {
         .unwrap_or(0)
 }
 
-/// FIX-1056-FOLD-1 (LOW-1): the rotation's offset from a stored `partial` column (D1 may answer a REAL): 0 for none.
-pub fn offset_of_partial(v: &Value) -> usize {
+/// FIX-1056-FOLD-3 (review 3's LOW-2): the laps completed with zero read throughout, from a stored `partial` column.
+pub fn zero_held_laps_of_partial(v: &Value) -> u64 {
     let n = partial_int(v);
     if n > 0 {
-        ((n - 1) % ROTATION_STRIDE) as usize
+        ((n - 1) % ROTATION_STRIDE) as u64
     } else {
         0
     }
@@ -469,7 +701,9 @@ pub fn compare_row_of(identity: &str, now: i64, view: Result<&Value, &str>) -> C
         judged_games: None,
         prior: None,
         unjudged: BTreeSet::new(),
-        next_offset: 0,
+        lap: Lap::default(),
+        wrapped: false,
+        zero_held_laps: 0,
         rotations: 0,
     };
     let view = match view {
@@ -567,7 +801,17 @@ pub fn compare_row_of(identity: &str, now: i64, view: Result<&Value, &str>) -> C
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect(),
-        next_offset: view["d1"]["games"]["nextOffset"].as_u64().unwrap_or(0) as usize,
+        lap: Lap {
+            after: view["d1"]["games"]["nextAfter"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            ..Lap::of_column(&view["d1"]["games"]["lapBefore"])
+        },
+        wrapped: view["d1"]["games"]["wrapped"] == true,
+        zero_held_laps: view["d1"]["games"]["zeroHeldLapsBefore"]
+            .as_u64()
+            .unwrap_or(0),
         rotations: view["d1"]["games"]["rotations"].as_u64().unwrap_or(0),
     }
 }
@@ -581,15 +825,16 @@ pub fn row_print(row: &Value) -> String {
 pub const ABSENT_PRINT: &str = "absent";
 
 /// One compare row written (an upsert by identity).
-pub const COMPARE_UPSERT_SQL: &str = "INSERT INTO owed_actor_compare(identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(identity) DO UPDATE SET comparedAtMs=excluded.comparedAtMs,diffCount=excluded.diffCount,heldByLagCount=excluded.heldByLagCount,staleD1Count=excluded.staleD1Count,tipLagCount=excluded.tipLagCount,outpoints=excluded.outpoints,d1Digest=excluded.d1Digest,actorDigest=excluded.actorDigest,fault=excluded.fault,partial=excluded.partial";
+pub const COMPARE_UPSERT_SQL: &str = "INSERT INTO owed_actor_compare(identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial,lap) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(identity) DO UPDATE SET comparedAtMs=excluded.comparedAtMs,diffCount=excluded.diffCount,heldByLagCount=excluded.heldByLagCount,staleD1Count=excluded.staleD1Count,tipLagCount=excluded.tipLagCount,outpoints=excluded.outpoints,d1Digest=excluded.d1Digest,actorDigest=excluded.actorDigest,fault=excluded.fault,partial=excluded.partial,lap=excluded.lap";
 
 /// FIX-1046-FOLD-1 (LOW-2): a FAULT row written over a stored row keeps that row's `outpoints` (its pending re-reads
 /// and its counted differences): a fault is no read of the rows, so it erases no state; the next good read classifies
 /// against the state the fault left. The counts are the fault's (none), as before. The same statement shape, no read.
 /// FIX-1056-FOLD-2 (the second review's MEDIUM-1): it keeps the stored `partial` too (the rotation's offset and its
 /// completed rotations): a fault is no compare, so it moves no window; a whale that faults now and then still walks
-/// its whole rotation. (Every summary counts `partial` only where `fault IS NULL`.)
-pub const COMPARE_FAULT_UPSERT_SQL: &str = "INSERT INTO owed_actor_compare(identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(identity) DO UPDATE SET comparedAtMs=excluded.comparedAtMs,diffCount=excluded.diffCount,heldByLagCount=excluded.heldByLagCount,staleD1Count=excluded.staleD1Count,tipLagCount=excluded.tipLagCount,d1Digest=excluded.d1Digest,actorDigest=excluded.actorDigest,fault=excluded.fault";
+/// its whole rotation. (Every summary counts `partial` only where `fault IS NULL`.) FIX-1056-FOLD-3: and its `lap`
+/// (the keyset cursor, the lap's state, [`Lap`]).
+pub const COMPARE_FAULT_UPSERT_SQL: &str = "INSERT INTO owed_actor_compare(identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial,lap) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(identity) DO UPDATE SET comparedAtMs=excluded.comparedAtMs,diffCount=excluded.diffCount,heldByLagCount=excluded.heldByLagCount,staleD1Count=excluded.staleD1Count,tipLagCount=excluded.tipLagCount,d1Digest=excluded.d1Digest,actorDigest=excluded.actorDigest,fault=excluded.fault";
 
 pub fn upsert_stmt(row: &CompareRow) -> Stmt {
     let int = |n: Option<i64>| n.map_or(Bind::Null, Bind::Int);
@@ -612,6 +857,11 @@ pub fn upsert_stmt(row: &CompareRow) -> Stmt {
             text(&row.actor_digest),
             text(&row.fault),
             Bind::Int(partial_column(row)),
+            if row.partial && row.fault.is_none() {
+                Bind::Text(row.lap.to_value().to_string())
+            } else {
+                Bind::Null
+            },
         ],
     )
 }
@@ -642,7 +892,7 @@ pub const FLEET_COMPARE_REREADS_MAX: usize = 64;
 pub const VISIBILITY_READ_SQL: &str =
     "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:health'";
 /// The prior stored rows of the identities a tick compares (`?1` a JSON array of identities).
-pub const PRIORS_SQL: &str = "SELECT identity,outpoints,partial FROM owed_actor_compare WHERE identity IN (SELECT value FROM json_each(?1))";
+pub const PRIORS_SQL: &str = "SELECT identity,outpoints,partial,lap FROM owed_actor_compare WHERE identity IN (SELECT value FROM json_each(?1))";
 
 /// PURE: the visibility window from the served first-visibility p95 (twice it, floored and capped; none, the cap).
 pub fn reread_window_ms(rows_visible_p95: Option<u64>) -> i64 {
@@ -929,9 +1179,10 @@ pub fn classify_reread(
             kept_pending.push(o);
         }
     }
-    let diff_count = (counted.len() + moved.len()) as i64;
+    let mut diff_count = (counted.len() + moved.len()) as i64;
     let mut out: Vec<Value> = Vec::new();
     let mut kept_counted = 0usize;
+    let mut overflow_now = 0i64;
     let counted_len = counted.len();
     for (i, o) in counted
         .into_iter()
@@ -957,7 +1208,44 @@ pub fn classify_reread(
             let mut o = o;
             o["fields"] = Value::Null;
             out.push(o);
+        } else if is_counted {
+            overflow_now += 1;
         }
+    }
+    if row.partial {
+        // FIX-1056-FOLD-3 (review 3's NOTE-2): a counted difference past [`COMPARE_ROW_COUNTED_MAX`] is in no list, so
+        // a later partial compare that does not judge its game would not carry it. Their count is carried in the lap
+        // (`overflow`) and added to `diffCount` on every compare that overflows nothing, until a lap ends in which no
+        // compare overflowed (every game judged with room to store what still stands). An overflowed difference judged
+        // again inside the lap may be counted twice meanwhile: the count fails closed, it never reads 0 while one may
+        // stand.
+        let lap = &mut row.lap;
+        if overflow_now > 0 {
+            lap.overflow = overflow_now;
+            lap.overflow_this_lap = true;
+        } else {
+            if row.wrapped && !lap.overflow_this_lap {
+                lap.overflow = 0;
+            }
+            diff_count += lap.overflow;
+        }
+        // FIX-1056-FOLD-3 (review 3's LOW-2): the laps read zero throughout. Any counted or pending difference resets
+        // the count and dirties the lap; a lap that ends clean counts one; the next lap starts as this compare read.
+        let clean_now = diff_count == 0 && !out.iter().any(|o| o["pendingReread"] == true);
+        if !clean_now {
+            lap.lap_clean = false;
+            row.zero_held_laps = 0;
+        }
+        if row.wrapped {
+            if lap.lap_clean {
+                row.zero_held_laps += 1;
+            }
+            lap.lap_clean = clean_now;
+            lap.overflow_this_lap = overflow_now > 0;
+        }
+    } else {
+        row.lap = Lap::default();
+        row.zero_held_laps = 0;
     }
     row.diff_count = Some(diff_count);
     row.outpoints = json!(out);
@@ -1805,9 +2093,9 @@ async fn held_by_apply_counted(m: &impl SqlPort, row: &CompareRow) {
 pub const COMPARE_PAGE: usize = 64;
 /// The fleet's counts over every stored compare row, one statement (the overlay's `/health/invariants` reads the same
 /// aggregate in `owed_events::HEALTH_STATE_SQL`).
-pub const COMPARE_SUMMARY_SQL: &str = "SELECT COUNT(*) AS identities,COALESCE(SUM(diffCount>0),0) AS diffs,COALESCE(SUM(heldByLagCount>0),0) AS heldByLag,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.heldByApply')=1))),0) AS heldByApply,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.pendingReread')=1))),0) AS pendingReread,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.judgeMoved')=1))),0) AS judgeMoved,COALESCE(SUM(staleD1Count),0) AS staleD1,COALESCE(SUM(fault IS NOT NULL),0) AS faults,COALESCE(SUM(fault IS NULL AND partial>0),0) AS partial,COALESCE(SUM(fault IS NULL AND partial>0 AND CAST(partial AS INTEGER)<=4294967296),0) AS partialUnrotated,MIN(CASE WHEN fault IS NULL AND partial>0 THEN (CAST(partial AS INTEGER)-1)/4294967296 END) AS partialRotationsMin,MIN(comparedAtMs) AS oldest,MAX(comparedAtMs) AS newest FROM owed_actor_compare";
+pub const COMPARE_SUMMARY_SQL: &str = "SELECT COUNT(*) AS identities,COALESCE(SUM(diffCount>0),0) AS diffs,COALESCE(SUM(heldByLagCount>0),0) AS heldByLag,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.heldByApply')=1))),0) AS heldByApply,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.pendingReread')=1))),0) AS pendingReread,COALESCE(SUM((fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.judgeMoved')=1))),0) AS judgeMoved,COALESCE(SUM(staleD1Count),0) AS staleD1,COALESCE(SUM(fault IS NOT NULL),0) AS faults,COALESCE(SUM(fault IS NULL AND partial>0),0) AS partial,COALESCE(SUM(fault IS NULL AND partial>0 AND CAST(partial AS INTEGER)<=4294967296),0) AS partialUnrotated,MIN(CASE WHEN fault IS NULL AND partial>0 THEN (CAST(partial AS INTEGER)-1)/4294967296 END) AS partialRotationsMin,MIN(CASE WHEN fault IS NULL AND partial>0 THEN (CAST(partial AS INTEGER)-1)%4294967296 END) AS partialZeroHeldLapsMin,MIN(comparedAtMs) AS oldest,MAX(comparedAtMs) AS newest FROM owed_actor_compare";
 /// The rows worth naming past `?1` (a difference, a held one or a fault), `?2` a page; `?3` one identity or ''.
-pub const COMPARE_PAGE_SQL: &str = "SELECT identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial FROM owed_actor_compare WHERE identity>?1 AND (?3='' OR identity=?3) AND (diffCount>0 OR heldByLagCount>0 OR fault IS NOT NULL OR (fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.heldByApply')=1)) OR (fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.pendingReread')=1)) OR ?3<>'') ORDER BY identity LIMIT ?2";
+pub const COMPARE_PAGE_SQL: &str = "SELECT identity,comparedAtMs,diffCount,heldByLagCount,staleD1Count,tipLagCount,outpoints,d1Digest,actorDigest,fault,partial,lap FROM owed_actor_compare WHERE identity>?1 AND (?3='' OR identity=?3) AND (diffCount>0 OR heldByLagCount>0 OR fault IS NOT NULL OR (fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.heldByApply')=1)) OR (fault IS NULL AND json_valid(outpoints) AND EXISTS(SELECT 1 FROM json_each(outpoints) WHERE json_extract(value,'$.pendingReread')=1)) OR ?3<>'') ORDER BY identity LIMIT ?2";
 
 /// PURE: the standing route's answer from its three reads (the summary, the page, the ring's state): every identity
 /// whose compare differs (`diffs`: the differences no pending mark holds), whose differences a pending mark holds
@@ -1853,10 +2141,16 @@ pub fn compare_answer(
             "staleD1": n(&r["staleD1Count"]),
             "tipLag": n(&r["tipLagCount"]),
             "partial": n(&r["partial"]) != 0,
-            "rotation": (n(&r["partial"]) != 0).then(|| json!({
-                "offset": offset_of_partial(&r["partial"]),
-                "completed": rotations_of_partial(&r["partial"]),
-            })),
+            "rotation": (n(&r["partial"]) != 0).then(|| {
+                let lap = Lap::of_column(&r["lap"]);
+                json!({
+                    "after": lap.after,
+                    "completed": rotations_of_partial(&r["partial"]),
+                    "zeroHeldLaps": zero_held_laps_of_partial(&r["partial"]),
+                    "lapClean": lap.lap_clean,
+                    "overflow": lap.overflow,
+                })
+            }),
             "digests": {"d1": r["d1Digest"], "actor": r["actorDigest"]},
             "outpoints": ops,
         })
@@ -1914,6 +2208,8 @@ pub fn compare_answer(
         // FIX-1056-FOLD-2 (the second review's item 3): the rotation's completion (each row's `rotation` too).
         "identitiesPartialUnrotated": n(&summary["partialUnrotated"]),
         "partialRotationsMin": json_ms(&summary["partialRotationsMin"]),
+        // FIX-1056-FOLD-3 (review 3's LOW-2): the fewest laps a partial identity has read zero throughout.
+        "partialZeroHeldLapsMin": json_ms(&summary["partialZeroHeldLapsMin"]),
         "rereadStatementsMax": FLEET_COMPARE_REREAD_STATEMENTS,
         "comparedWithinMs": json_ms(&summary["oldest"]).map(|o| now - o as i64),
         "newestComparedAtMs": json_ms(&summary["newest"]),

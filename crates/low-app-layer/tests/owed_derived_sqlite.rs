@@ -91,10 +91,12 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..479]), 3_349_521_383);
     // bsv-low #1019 (FIX-1019) appends one: `pot_evictions.refusalClass`; the 493 before it are untouched.
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..493]), 1_079_544_940);
-    const COUNT: usize = 494;
+    // bsv-low #1056 (FIX-1056-FOLD-3) appends one: `owed_actor_compare.lap`; the 494 before it are untouched.
+    assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..494]), 4_194_370_199);
+    const COUNT: usize = 495;
     assert_eq!(OVERLAY_MIGRATIONS.len(), COUNT);
     assert_eq!(d1::OVERLAY_MIGRATION_COUNT, COUNT);
-    const FINGERPRINT: u32 = 4_194_370_199;
+    const FINGERPRINT: u32 = 1_230_688_588;
     assert_eq!(
         d1::migration_list_fingerprint(),
         FINGERPRINT,
