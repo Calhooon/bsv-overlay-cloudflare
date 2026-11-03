@@ -23,15 +23,38 @@ pub const MARK_UNTIPPED_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,sour
 /// The tipless rows one tip re-marks at most.
 pub const UNTIPPED_MARKS_PER_TIP: usize = 128;
 
+/// bsv-low #1087 (L59 S-C): in Phase C a block RE-JUDGES, in each owed actor, the games whose claimable sweep rests on
+/// a courier probe alone (the hop's index status not `unspent`) judged below it, so the actor's stored row moves to
+/// #669's chain wait at the tip event, as a fresh judgement at the new tip reads it, and not only at the belt's next
+/// look (up to ten minutes; the actor's own tip alarm runs on its clock, a block's time after its last). The source is
+/// the belt-ask ledger the actors publish (`owed_belt::ask_of_row`'s question: the row's family, claimable, probeTip
+/// and facts), a primary key range; the marks are plain (the read degrades such a row by the same rule until the
+/// re-judgement lands). NOT in Phases A and B: there the D1 judge's stored claimable sweep is the belt's first class
+/// (`owed_belt::BELT_SWEEPS_DUE_SQL`, dated due now by [`DATE_SWEEPS_SQL`]) and a re-judgement at the block would take
+/// it out of that class and delay the honest press's look (the D2 lens's D2-M1 pins); the actors publish no asks
+/// there, and the read degrades the stored press. Bounded per tip by [`SWEEP_MARKS_PER_TIP`].
+pub const MARK_SWEEP_ASKS_SQL: &str = "INSERT INTO owed_dirty(identity,gameId,source,sourceKey,markedAtMs) SELECT identity,gameId,'tip','sweep',strftime('%s','now') * 1000 FROM (SELECT DISTINCT json_extract(cursor,'$.identity') AS identity,json_extract(cursor,'$.question.gameId') AS gameId FROM owed_belt_state WHERE name>='belt-ask:' AND name<'belt-ask;' AND json_valid(cursor) AND json_extract(cursor,'$.question.family')='hop-stranded' AND json_extract(cursor,'$.question.claimable')=1 AND json_extract(cursor,'$.question.probeTip')<?1 AND json_extract(cursor,'$.question.facts.status') IS NOT 'unspent' LIMIT ?2) WHERE identity IS NOT NULL AND gameId IS NOT NULL ON CONFLICT(identity,gameId,source,sourceKey) DO UPDATE SET generation=excluded.generation,markedAtMs=excluded.markedAtMs";
+/// The courier-dependent sweeps' games one tip re-marks at most, per source.
+pub const SWEEP_MARKS_PER_TIP: usize = 128;
+/// The tip events' source keys (the block's own marks), as `/internal/tip-changed` publishes them.
+pub const TIP_MARK_KEYS: [&str; 3] = ["gate", "untipped", "sweep"];
+
 pub async fn mark_tip(db: &impl JudgeDb, height: u64) -> Result<DrainReport, String> {
-    write_tip_marks(db, height).await?;
-    drain_changed(db, &[], &["gate".into(), "untipped".into()], "tip").await
+    write_tip_marks(db, height, db.d1_judges()).await?;
+    let keys: Vec<String> = TIP_MARK_KEYS.iter().map(|k| k.to_string()).collect();
+    drain_changed(db, &[], &keys, "tip").await
 }
 
 /// bsv-low #911 (D2-ACTOR-A): the tip's marks and sweep dates alone; the `tip` events' consumer judges them.
-pub async fn write_tip_marks(db: &impl SqlPort, height: u64) -> Result<(), String> {
+/// `d1_judges`: the phase (`OWED_D1_JUDGE`); with the D1 judge off (Phase C) the block also marks the actors'
+/// courier-dependent sweeps ([`MARK_SWEEP_ASKS_SQL`], bsv-low #1087).
+pub async fn write_tip_marks(
+    db: &impl SqlPort,
+    height: u64,
+    d1_judges: bool,
+) -> Result<(), String> {
     let now = db.now_ms() as i64;
-    db.run_batch(vec![
+    let mut batch = vec![
         Stmt {
             sql: MARK_TIP_SQL.into(),
             binds: vec![Bind::Int(height as i64)],
@@ -44,8 +67,17 @@ pub async fn write_tip_marks(db: &impl SqlPort, height: u64) -> Result<(), Strin
             sql: MARK_UNTIPPED_SQL.into(),
             binds: vec![Bind::Int(UNTIPPED_MARKS_PER_TIP as i64)],
         },
-    ])
-    .await?;
+    ];
+    if !d1_judges {
+        batch.push(Stmt {
+            sql: MARK_SWEEP_ASKS_SQL.into(),
+            binds: vec![
+                Bind::Int(height as i64),
+                Bind::Int(SWEEP_MARKS_PER_TIP as i64),
+            ],
+        });
+    }
+    db.run_batch(batch).await?;
     Ok(())
 }
 
