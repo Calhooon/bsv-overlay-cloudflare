@@ -23628,10 +23628,7 @@ mod fix1087 {
             if let Some((name, body, due)) = crate::owed_belt::ask_of_row("owner", r) {
                 record
                     .conn
-                    .execute(
-                        ASK_PUT_SQL,
-                        rusqlite::params![name, body.to_string(), due],
-                    )
+                    .execute(ASK_PUT_SQL, rusqlite::params![name, body.to_string(), due])
                     .unwrap();
                 n += 1;
             }
@@ -23695,7 +23692,11 @@ mod fix1087 {
         .unwrap();
         let (claimable, facts) = row(&local);
         assert_eq!(
-            (claimable, facts["claimable"].clone(), facts["chainWait"].clone()),
+            (
+                claimable,
+                facts["claimable"].clone(),
+                facts["chainWait"].clone()
+            ),
             (Some(0), json!(false), json!("block")),
             "the actor serves #669's chain wait from the block: {facts}"
         );
@@ -23738,7 +23739,11 @@ mod fix1087 {
             )
             .unwrap();
         assert_eq!(marks, 0);
-        assert_eq!(row(&d1).0, Some(1), "the D1 press stands for the belt's first class");
+        assert_eq!(
+            row(&d1).0,
+            Some(1),
+            "the D1 press stands for the belt's first class"
+        );
     }
 }
 
@@ -23793,7 +23798,10 @@ mod fix1085 {
         let mut c = PendingBars::default();
         c.note_answer("queue", &landed(X, t - 5));
         flush_bars_from(&db, t + 170_000, &c).await.unwrap();
-        assert_eq!(fleet(&db, t + 171_000)["actorUnappliedIdentities"]["count"], 1);
+        assert_eq!(
+            fleet(&db, t + 171_000)["actorUnappliedIdentities"]["count"],
+            1
+        );
         let mut d = PendingBars::default();
         d.note_answer("direct", &landed(X, t + 180_000));
         flush_bars_from(&db, t + 181_000, &d).await.unwrap();
@@ -23801,11 +23809,7 @@ mod fix1085 {
         assert_eq!(f["actorOldestUnappliedEventAgeMs"], Value::Null, "{f}");
         assert_eq!(f["actorUnappliedIdentities"]["count"], 0);
         // and the served body names it
-        let body = health_body(
-            Some(&json!({"bars": [], "counters": {}})),
-            t,
-            &Value::Null,
-        );
+        let body = health_body(Some(&json!({"bars": [], "counters": {}})), t, &Value::Null);
         assert!(body.get("unappliedIdentities").is_some(), "{body}");
     }
 }

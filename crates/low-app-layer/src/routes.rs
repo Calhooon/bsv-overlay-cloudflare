@@ -713,19 +713,6 @@ struct TipReply {
     reason: Option<String>,
 }
 
-#[cfg(test)]
-async fn tip_reply_with<G, F, L, N>(get: G, last_known: L, now_ms: N) -> TipReply
-where
-    G: Fn(String) -> F,
-    F: std::future::Future<
-        Output = std::result::Result<(u16, serde_json::Value), bsv_tracker::HeaderError>,
-    >,
-    L: FnOnce() -> Option<crate::tracker_host::VerifiedTip>,
-    N: FnOnce() -> u64,
-{
-    tip_reply_within(get, last_known, now_ms, std::future::pending::<()>()).await
-}
-
 /// The blocks the verified tip trails the couriers by, in the store's own words
 /// (bsv-low #1077): the larger of `liveLagBlocks` and the seen height less the
 /// verified height (the verified tip can sit below the stored one under the
