@@ -11319,7 +11319,7 @@ fn fix983_e_the_object_defers_the_record_work_that_is_not_the_applys() {
     assert!(!object.contains("flush_bars(&record,now,false).await;answer[\"noted\"]"));
     assert!(APPLY_STAGES.iter().any(|(f, r)| *f == "outsideMs" && *r == "outside"));
     let actor: String = include_str!("../owed_actor.rs").split_whitespace().collect();
-    assert!(actor.contains("note_actor_fault(&id,db.event_at_ms());returnErr(e);"), "Phase C's delivery notes a faulted apply");
+    assert!(actor.contains("note_actor_fault(&id,games,db.event_at_ms());returnErr(e);"), "Phase C's delivery notes a faulted apply");
     let events: String = include_str!("../owed_events.rs").split_whitespace().collect();
     assert!(events.contains("b[\"concurrent\"]=json!(fan_out);"));
     assert!(events.contains("db.note_concurrency(order.len().min(JUDGE_IDENTITIES_AT_ONCE)asu32);"));
