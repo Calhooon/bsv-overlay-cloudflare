@@ -1331,7 +1331,7 @@ async fn submit_parts(
         // inconclusive ladder answers 502. Asked AGAIN after the engine write: a write that outran a concurrent
         // eviction's table loop re-evicts what it wrote.
         if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
-            match crate::admit_fast::open_eviction(&ledger_db, &subject_txid).await {
+            match crate::admit_fast::door_open_eviction(&ledger_db, &subject_txid).await {
                 Ok(Some(ev)) => {
                     worker::console_log!(
                         "POST /submit(broadcast-gated): {subject_txid} is under an OPEN eviction (at {} ms — {}); the network's fresh word decides",
@@ -2030,7 +2030,7 @@ async fn submit_parts(
             if let Some(subject) = crate::ef::subject_txid_of(&mut named) {
                 ungated_subject = Some(subject.clone());
                 if let Ok(ledger_db) = env.d1("OVERLAY_DB") {
-                    match crate::admit_fast::open_eviction(&ledger_db, &subject).await {
+                    match crate::admit_fast::door_open_eviction(&ledger_db, &subject).await {
                         Ok(Some(ev)) => {
                             counters.bump(crate::ops::COUNTER_SUBMIT_REFUSED_EVICTED, 1);
                             worker::console_log!(

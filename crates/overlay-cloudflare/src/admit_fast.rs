@@ -1012,6 +1012,100 @@ pub async fn open_eviction(db: &D1Database, txid: &str) -> Result<Option<OpenEvi
     }))
 }
 
+/// bsv-low #1098 (FIX-D1-STORM): the door's per-isolate memo of the ledger's OPEN set. Under L60's launch burst the
+/// door's per-submit read of the ledger faulted 35 and 51 times a minute on D1's overload; the door reads it now only
+/// when an open eviction MAY exist for the subject. One read of the open txids (`OPEN_EVICTION_SET_SQL`, at most
+/// [`DOOR_OPEN_SET_MAX`] + 1 rows) is memoised [`DOOR_OPEN_SET_MEMO_MS`] per isolate: a subject not in the set makes
+/// no per-subject read (answered none), a subject in it (or a set past the bound) is read by `OPEN_EVICTION_SQL` as
+/// before. An eviction opened inside the memo's window is the write-side guard's (#513), asked after the write, as
+/// it was for one opened between the door's read and the write. A memo read that faults is no answer: not memoised,
+/// the caller's `Err` (counted, proceeding or 502 as on a per-subject fault).
+pub const OPEN_EVICTION_SET_SQL: &str =
+    "SELECT txid FROM pot_evictions WHERE readmittedAt IS NULL LIMIT 513";
+/// The open set held whole; past it the memo says "may exist" for every subject.
+pub const DOOR_OPEN_SET_MAX: usize = 512;
+/// How long one isolate trusts its read of the open set.
+pub const DOOR_OPEN_SET_MEMO_MS: f64 = 5_000.0;
+
+/// One isolate's read of the ledger's open set: `None` past [`DOOR_OPEN_SET_MAX`] (every subject may be open).
+#[derive(Debug, Clone, Default)]
+pub struct DoorOpenSetMemo {
+    at_ms: f64,
+    set: Option<std::collections::HashSet<String>>,
+    read: bool,
+}
+
+thread_local! {
+    static DOOR_OPEN_SET: std::cell::RefCell<DoorOpenSetMemo> = std::cell::RefCell::new(DoorOpenSetMemo::default());
+}
+
+/// THE DOOR'S read of an open eviction for `txid`, gated by the memo (bsv-low #1098). Pure over its two reads:
+/// `read_set` (the open txids, at most 513) and `read_one` (the subject's row, `OPEN_EVICTION_SQL`).
+pub async fn door_open_eviction_with<FS, FSF, FO, FOF>(
+    memo: &std::cell::RefCell<DoorOpenSetMemo>,
+    now_ms: f64,
+    txid: &str,
+    read_set: FS,
+    read_one: FO,
+) -> Result<Option<OpenEviction>, String>
+where
+    FS: FnOnce() -> FSF,
+    FSF: std::future::Future<Output = Result<Vec<String>, String>>,
+    FO: FnOnce() -> FOF,
+    FOF: std::future::Future<Output = Result<Option<OpenEviction>, String>>,
+{
+    let txid = txid.to_ascii_lowercase();
+    let fresh = {
+        let m = memo.borrow();
+        m.read && now_ms - m.at_ms < DOOR_OPEN_SET_MEMO_MS && now_ms >= m.at_ms
+    };
+    if !fresh {
+        let rows = read_set().await?;
+        let set = (rows.len() <= DOOR_OPEN_SET_MAX)
+            .then(|| rows.into_iter().map(|t| t.to_ascii_lowercase()).collect());
+        *memo.borrow_mut() = DoorOpenSetMemo {
+            at_ms: now_ms,
+            set,
+            read: true,
+        };
+    }
+    let may_exist = match &memo.borrow().set {
+        Some(set) => set.contains(&txid),
+        None => true,
+    };
+    if !may_exist {
+        return Ok(None);
+    }
+    read_one().await
+}
+
+#[derive(serde::Deserialize)]
+struct OpenTxidRow {
+    txid: String,
+}
+
+/// The worker's wiring of [`door_open_eviction_with`]: the isolate's memo, the clock, the two D1 reads. Called by the
+/// gated door and the ungated arms BEFORE their write; every post-write guard and the queue read `open_eviction`.
+pub async fn door_open_eviction(db: &D1Database, txid: &str) -> Result<Option<OpenEviction>, String> {
+    let now_ms = worker::js_sys::Date::now();
+    let memo = DOOR_OPEN_SET.with(|m| m.clone());
+    let out = door_open_eviction_with(
+        &memo,
+        now_ms,
+        txid,
+        || async {
+            Query::new(OPEN_EVICTION_SET_SQL)
+                .fetch_all::<OpenTxidRow>(db)
+                .await
+                .map(|rows| rows.into_iter().map(|r| r.txid).collect())
+        },
+        || open_eviction(db, txid),
+    )
+    .await;
+    DOOR_OPEN_SET.with(|m| *m.borrow_mut() = memo.into_inner());
+    out
+}
+
 /// THE PRE-WRITE GUARD over what the engine is about to LAND first from a submit's BEEF (bsv-low #575, the E1D
 /// delta-2 fold, L2; installed as `Engine::set_landing_guard` at every engine this worker builds): the subject's
 /// ungated arms refuse an evicted subject before their write, and a landing is refused the same way, at every door.
@@ -9255,5 +9349,105 @@ mod tests {
         assert!(b.contains(
             "let young = if terminal_reads_age(&presence, self.evicted_at_ms.is_some()) {"
         ));
+    }
+}
+
+/// bsv-low #1098 (FIX-D1-STORM) ruling 1: the door reads the ledger per subject only when an open eviction may exist.
+#[cfg(test)]
+mod fix_d1_storm {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    fn ev() -> OpenEviction {
+        OpenEviction {
+            reason: "arcade live REJECTED".into(),
+            evicted_at_ms: 7,
+        }
+    }
+
+    /// A door read over a ledger whose open set is `open`, counting each statement made.
+    async fn door(
+        memo: &RefCell<DoorOpenSetMemo>,
+        now: f64,
+        txid: &str,
+        open: &RefCell<Vec<String>>,
+        set_reads: &Cell<u32>,
+        one_reads: &Cell<u32>,
+    ) -> Result<Option<OpenEviction>, String> {
+        door_open_eviction_with(
+            memo,
+            now,
+            txid,
+            || async {
+                set_reads.set(set_reads.get() + 1);
+                Ok(open.borrow().clone())
+            },
+            || async {
+                one_reads.set(one_reads.get() + 1);
+                Ok(open.borrow().iter().any(|t| t == txid).then(ev))
+            },
+        )
+        .await
+    }
+
+    /// (a) at open count zero a burst of 100 submits in one isolate makes ONE ledger statement, never one a subject
+    /// (on f50d36dd the door's `open_eviction` read is one statement a submit: 100).
+    #[tokio::test]
+    async fn fix_d1_storm_a_at_open_count_zero_the_door_makes_no_per_subject_read() {
+        let memo = RefCell::new(DoorOpenSetMemo::default());
+        let open = RefCell::new(Vec::new());
+        let (sets, ones) = (Cell::new(0), Cell::new(0));
+        for i in 0..100u32 {
+            let txid = format!("{i:064x}");
+            let got = door(&memo, 1_000.0 + f64::from(i) * 40.0, &txid, &open, &sets, &ones).await;
+            assert_eq!(got, Ok(None));
+        }
+        assert_eq!((sets.get(), ones.get()), (1, 0), "one memo read, no per-subject read");
+        // past the window the set is read again, once
+        let _ = door(&memo, 1_000.0 + DOOR_OPEN_SET_MEMO_MS + 1.0, &"ab".repeat(32), &open, &sets, &ones).await;
+        assert_eq!(sets.get(), 2);
+        // a set past its bound reads every subject (the old rule)
+        let memo = RefCell::new(DoorOpenSetMemo::default());
+        let many = RefCell::new((0..=DOOR_OPEN_SET_MAX).map(|i| format!("{i:064x}")).collect::<Vec<_>>());
+        let (sets, ones) = (Cell::new(0), Cell::new(0));
+        let _ = door(&memo, 0.0, &"cd".repeat(32), &many, &sets, &ones).await;
+        assert_eq!((sets.get(), ones.get()), (1, 1));
+        // the wiring: both pre-write reads of the door go through the memo (the post-write guards do not)
+        let routes = include_str!("routes.rs");
+        assert_eq!(routes.matches("admit_fast::door_open_eviction(").count(), 2);
+    }
+
+    /// (b) an open eviction for the subject is still read and answered; one opened after the memo is not seen at the
+    /// door and is caught by the write-side guard (`open_eviction`'s own read, unmemoised); a memo fault is the
+    /// caller's `Err` and is not memoised.
+    #[tokio::test]
+    async fn fix_d1_storm_b_an_open_eviction_is_read_and_a_late_one_is_the_guards() {
+        let subject = "EF".repeat(32);
+        let memo = RefCell::new(DoorOpenSetMemo::default());
+        let open = RefCell::new(vec![subject.to_ascii_lowercase()]);
+        let (sets, ones) = (Cell::new(0), Cell::new(0));
+        let got = door(&memo, 0.0, &subject.to_ascii_lowercase(), &open, &sets, &ones).await;
+        assert_eq!(got, Ok(Some(ev())));
+        assert_eq!((sets.get(), ones.get()), (1, 1));
+        // an eviction opened after the memo's read, inside its window
+        let late = "aa".repeat(32);
+        open.borrow_mut().push(late.clone());
+        let at_door = door(&memo, 1_000.0, &late, &open, &sets, &ones).await;
+        assert_eq!(at_door, Ok(None), "inside the window the door does not see it");
+        // the write-side guard after the write reads the subject's row unmemoised: it catches it
+        let guard = open.borrow().iter().any(|t| *t == late).then(ev);
+        assert_eq!(guard, Some(ev()));
+        // a memo read that faults: Err, nothing memoised, the next submit reads again
+        let memo = RefCell::new(DoorOpenSetMemo::default());
+        let faulted = door_open_eviction_with(
+            &memo,
+            0.0,
+            &late,
+            || async { Err::<Vec<String>, _>("D1_ERROR: D1 DB is overloaded".to_string()) },
+            || async { Ok(None) },
+        )
+        .await;
+        assert!(faulted.is_err());
+        assert!(!memo.borrow().read);
     }
 }
