@@ -25011,4 +25011,23 @@ mod fix1095 {
     fn fix1095f1_e_at_height_is_a_verdict_column() {
         subject_column_differs("atHeight", json!(974_010));
     }
+
+    /// FIX-COMPARE-FACTS-FOLD-1 (R279 LOW-1): a pair of one verdict judged at two tips is named on the rows route
+    /// (`tipLagEqual`, both tips), never in `diff` or `tipLag`.
+    #[test]
+    fn fix1095f1_f_the_route_names_an_equal_verdict_tip_lag() {
+        let d1 = row(d1_facts("index-unspent"), 1);
+        let mut actor = row(actor_facts(), 1);
+        actor["probeTip"] = json!(974_008);
+        let v = view(&d1, &actor);
+        assert_eq!(v["diff"], json!([]), "{v}");
+        assert_eq!(v["tipLag"], json!([]), "{v}");
+        assert_eq!(
+            v["tipLagEqual"],
+            json!({"outpoints": [O], "tips": {"d1": [974_009], "actor": [974_008]}}),
+            "{v}"
+        );
+        let same = view(&d1, &row(actor_facts(), 1));
+        assert_eq!(same["tipLagEqual"]["outpoints"], json!([]));
+    }
 }
