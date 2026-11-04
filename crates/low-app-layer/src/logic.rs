@@ -518,6 +518,27 @@ pub fn apply_belt_evidence(body: &str, evidence: &[crate::hops_view::ProbeMemo])
     }
 }
 
+/// bsv-low #1093 (fold 1, ruling 5): the belt evidence read's fault line is logged at most once a minute an isolate
+/// (`/utxo-status` is a hot public route; a fault served the index's answer alone on every request).
+pub const BELT_EVIDENCE_FAULT_LOG_EVERY_MS: u64 = 60_000;
+
+thread_local! {
+    static BELT_EVIDENCE_FAULT_LOGGED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The belt evidence read's fault line through the isolate's once-a-minute gate; `true` when it was logged.
+pub fn log_belt_evidence_fault(err: &str, now_ms: u64, log: impl Fn(&str)) -> bool {
+    let last = BELT_EVIDENCE_FAULT_LOGGED.with(std::cell::Cell::get);
+    if last.is_some_and(|l| now_ms.saturating_sub(l) < BELT_EVIDENCE_FAULT_LOG_EVERY_MS) {
+        return false;
+    }
+    BELT_EVIDENCE_FAULT_LOGGED.with(|c| c.set(Some(now_ms)));
+    log(&format!(
+        "[utxo-status] belt evidence read failed (the index's answer is served alone; logged once a minute): {err}"
+    ));
+    true
+}
+
 /// The single batched `/utxo-status` SQL: one `(txid = ? AND outputIndex = ?)`
 /// disjunct per requested outpoint (2 binds each, input order). ONE D1 query
 /// answers the whole batch — the query-collapse that replaces per-outpoint

@@ -24355,6 +24355,38 @@ mod fix1093 {
         }
     }
 
+    /// (f) FOLD 1 RULING 5: the evidence read's fault is logged once a minute an isolate, never on every request; the
+    /// route calls the gate. New API (7954f855 logged every fault).
+    #[test]
+    fn fix1093f_the_evidence_fault_is_logged_once_a_minute() {
+        let lines = std::cell::RefCell::new(Vec::<String>::new());
+        let log = |l: &str| lines.borrow_mut().push(l.to_string());
+        let t = 1_800_000_000_000u64;
+        assert!(crate::logic::log_belt_evidence_fault("d1 down", t, log));
+        assert!(!crate::logic::log_belt_evidence_fault(
+            "d1 down",
+            t + 1_000,
+            log
+        ));
+        assert!(!crate::logic::log_belt_evidence_fault(
+            "d1 down",
+            t + 59_999,
+            log
+        ));
+        assert!(crate::logic::log_belt_evidence_fault(
+            "d1 down",
+            t + 60_000,
+            log
+        ));
+        assert_eq!(lines.borrow().len(), 2);
+        assert!(lines.borrow()[0].contains("d1 down"));
+        let src = include_str!("../routes.rs");
+        assert!(
+            src.contains("crate::logic::log_belt_evidence_fault(&e,"),
+            "the route logs through the gate"
+        );
+    }
+
     /// (g) FOLD 1 RULING 3 (the ensemble's C LOW-2 and A LOW-3): 40 pending re-read games beside 32 carried counted
     /// games of an identity of 200 games: the shipped keyset pick judges at most half the window first, the pending
     /// ones before the carried, and the forward walk takes the other half from past the cursor; a first game left out
