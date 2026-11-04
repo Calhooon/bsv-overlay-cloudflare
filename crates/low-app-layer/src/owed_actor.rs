@@ -4684,6 +4684,8 @@ pub const STAMP_FACTS: [(&str, &str); 1] = [("spenderPresence", "at")];
 /// facts `snapshotTip`, `chainProbeTip`, `servedTip`, `tipMoved`, `tipUnknown`; the filed sweep's `sweepSource`,
 /// `sweepTxid`, `sweepRawHex`): carried and served on both sides, never a compare difference by itself. The pairs
 /// equal in the verdict whose facts differ are counted apart ([`facts_differ_rows`], the routes' `factsDiffer`).
+/// FIX-COMPARE-FACTS-FOLD-1 (R279 MEDIUM-1): except a fact that DRIVES a press ([`PRESS_FACTS`]: what it broadcasts or
+/// collects), which is part of the verdict whenever the row offers the press ([`press_of`]).
 pub const VERDICT_COLUMNS: [&str; 7] = [
     "family",
     "gameId",
@@ -4705,15 +4707,99 @@ pub fn verdict_of(row: &Value) -> Value {
         .unwrap_or(Value::Null);
     let mut v: Vec<Value> = VERDICT_COLUMNS.iter().map(|k| row[*k].clone()).collect();
     v.extend(VERDICT_FACTS.iter().map(|k| facts[*k].clone()));
+    v.push(press_of(row).map_or(Value::Null, Value::Object));
     Value::Array(v)
 }
-/// Is `field` (a printed compare field: a column, `facts.<key>`, or `row`) a verdict field?
+/// FIX-COMPARE-FACTS-FOLD-1 (R279 MEDIUM-1): THE PRESS FACTS, the facts that set WHAT a press broadcasts or collects,
+/// as the client's press dispatcher reads them (bsv-low `app/src/lib/owedPress.ts`): `internalize` the paying
+/// transaction (`settleTxid`, else `sweepTxid`; `payTxid`, which the quiet repair files) and the committed home
+/// (`committedKeys`, `mySeat`, `committedPkhForMe`); `present-refund` the pot (`potTxid`, `potVout`); `sweep-hop` the
+/// hop (`hopTxid`, `hopVout`), the JOIN the client reads before it presses (`spendingTxid`, `hopJoinSweepVerdict`), the
+/// FILED bytes broadcast as they are (`sweepRawHex`, compared by their sha256, `sweepTxid`, `sweepSource`) and,
+/// without them, the facts a fresh sweep is signed from (`hopSats`, `seatSettlePubkey`, `hopLockHex`). Part of the
+/// verdict whenever the row OFFERS a press ([`press_of`]): two judges offering one claim from different evidence
+/// differ. A row that offers none keeps them as facts (they explain a withheld press).
+pub const PRESS_FACTS: [&str; 15] = [
+    "settleTxid",
+    "sweepTxid",
+    "payTxid",
+    "committedKeys",
+    "mySeat",
+    "potTxid",
+    "potVout",
+    "hopTxid",
+    "hopVout",
+    "spendingTxid",
+    "sweepSource",
+    "sweepRawHex",
+    "hopSats",
+    "seatSettlePubkey",
+    "hopLockHex",
+];
+/// The press fact compared by its digest, never its bytes (a stored row's print stays bounded).
+pub const PRESS_FACT_DIGESTED: &str = "sweepRawHex";
+/// PURE (FIX-COMPARE-FACTS-FOLD-1): the row's PRESS, its [`PRESS_FACTS`] (`sweepRawHex` as the sha256 of its text),
+/// when the row offers a press: a `facts.claim`, `facts.claimable` not false and the `claimable` column not false or
+/// 0 (the client presses `facts.claimable !== false`). `None` for a row that offers none.
+pub fn press_of(row: &Value) -> Option<serde_json::Map<String, Value>> {
+    let facts: Value = row["facts"]
+        .as_str()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Null);
+    let offers = facts["claim"].as_str().is_some_and(|c| !c.is_empty())
+        && facts["claimable"] != false
+        && row["claimable"] != false
+        && row["claimable"] != 0;
+    if !offers {
+        return None;
+    }
+    Some(
+        PRESS_FACTS
+            .iter()
+            .filter(|k| !facts[**k].is_null())
+            .map(|k| {
+                let v = &facts[*k];
+                let v = match (*k == PRESS_FACT_DIGESTED, v.as_str()) {
+                    (true, Some(hex)) => json!(hex::encode(bsv_rs::primitives::hash::sha256(
+                        hex.to_ascii_lowercase().as_bytes()
+                    ))),
+                    _ => v.clone(),
+                };
+                ((*k).to_string(), v)
+            })
+            .collect(),
+    )
+}
+/// PURE (FIX-COMPARE-FACTS-FOLD-1): the press fields that differ between two rows that BOTH offer a press, by name
+/// (each value as [`press_of`] compares it). A pair where one side offers none differs by its claim or `claimable`,
+/// printed there; its press facts are not printed beside.
+pub fn press_fields_differing(a: &Value, b: &Value) -> Vec<(String, Value, Value)> {
+    let (Some(pa), Some(pb)) = (press_of(a), press_of(b)) else {
+        return Vec::new();
+    };
+    PRESS_FACTS
+        .iter()
+        .filter_map(|k| {
+            let (x, y) = (
+                pa.get(*k).cloned().unwrap_or(Value::Null),
+                pb.get(*k).cloned().unwrap_or(Value::Null),
+            );
+            (x != y).then(|| ((*k).to_string(), x, y))
+        })
+        .collect()
+}
+/// Is `field` (a printed compare field: a column, `facts.<key>`, `press.<key>`, or `row`) a verdict field? A press
+/// field is printed `press.<key>` (FIX-COMPARE-FACTS-FOLD-1), a name no earlier rule printed, so an entry carried
+/// from a rule that counted every fact (`facts.sweepRawHex` on a withheld pair) is still no verdict difference.
 pub fn is_verdict_field(field: &str) -> bool {
     field == "row"
         || VERDICT_COLUMNS.contains(&field)
         || field
             .strip_prefix("facts.")
             .is_some_and(|k| VERDICT_FACTS.contains(&k))
+        || field
+            .strip_prefix("press.")
+            .is_some_and(|k| PRESS_FACTS.contains(&k))
 }
 /// The facts of a stored row as the figure reads them ([`facts_differ_rows`]): the judgement, not its clock (the facts
 /// relative to the judge's `now` taken out, so two judges of one record at two instants read the same). Never a
@@ -5036,6 +5122,9 @@ pub fn diff_detail(d1: &[Value], actor: &[Value], outpoints: &[String]) -> Strin
                             short(&fb[k])
                         ));
                     }
+                }
+                for (k, x, y) in press_fields_differing(a, b) {
+                    f.push(format!("press.{k} d1={} actor={}", short(&x), short(&y)));
                 }
                 f.join(", ")
             }

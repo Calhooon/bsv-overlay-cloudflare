@@ -24568,11 +24568,21 @@ mod fix1095 {
         })
     }
 
+    /// FIX-COMPARE-FACTS-FOLD-1 (R279 MEDIUM-1): both judges offer the same press (the same filed sweep), so only the
+    /// explaining facts differ.
     fn d1_facts(probe: &str) -> Value {
-        json!({"claim": "sweep-hop", "claimable": true, "status": "unspent", "chainProbe": probe})
+        json!({
+            "claim": "sweep-hop",
+            "claimable": true,
+            "status": "unspent",
+            "chainProbe": probe,
+            "sweepSource": "hopsweep-filing",
+            "sweepTxid": "f7fd5ba5",
+            "sweepRawHex": "0100",
+        })
     }
 
-    /// The actor's spelling of the same verdict: the belt's probe word, its snapshot tip and the filed sweep's facts.
+    /// The actor's spelling of the same verdict: the belt's probe word and its snapshot tip, the same filed sweep.
     fn actor_facts() -> Value {
         json!({
             "claim": "sweep-hop",
@@ -24622,6 +24632,29 @@ mod fix1095 {
             assert_eq!(r.diff_count, Some(0), "{:?}", r.outpoints);
             assert_eq!(r.outpoints, json!([]), "nothing printed");
         }
+        // The evidence's own 02f1fd09 shape: NEITHER side offers a press. The actor's stored courier-unspent press
+        // projected at the served tip (`project_compared_rows`, the #669 degrade: claim null, `snapshotTip`, the
+        // filed sweep's facts kept) against the D1 judge's index-unknown predates-tip withhold (`owed.rs`, the
+        // `unspent-predates-tip` arm, which reads no filing). Equal: the filing explains a withheld press.
+        let withheld = |f: Value| {
+            let mut f = f;
+            f["claim"] = Value::Null;
+            f["claimable"] = json!(false);
+            f["chainWait"] = json!("block");
+            f["tipMoved"] = json!(true);
+            f
+        };
+        let mut d1f = withheld(json!({"status": "unknown", "chainProbe": "unspent-predates-tip"}));
+        d1f["chainProbeTip"] = json!(974_008);
+        let d1 = row(d1f, 0);
+        let mut af = withheld(actor_facts());
+        af["status"] = json!("unknown");
+        let actor = row(af, 0);
+        assert!(
+            diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)).is_empty(),
+            "a withheld pair's filing is a fact"
+        );
+        assert_eq!(view(&d1, &actor)["factsDiffer"], json!([O]));
     }
 
     /// (b) a verdict field beside the same facts still differs, and the printed fields are the verdict fields alone.
@@ -24745,7 +24778,15 @@ mod fix1095 {
         for a in port.actors.values() {
             a.conn
                 .execute(
-                    "UPDATE owed_rows SET facts=json_set(facts,'$.chainProbe','unspent','$.snapshotTip',974009,'$.sweepSource','hopsweep-filing','$.sweepTxid','f7fd5ba5','$.sweepRawHex','0100')",
+                    "UPDATE owed_rows SET facts=json_set(facts,'$.chainProbe','unspent','$.snapshotTip',974009)",
+                    [],
+                )
+                .unwrap();
+            // FIX-COMPARE-FACTS-FOLD-1: the filed sweep's facts only where the row offers no press (the evidence's
+            // withheld shape); on a press they are its content and two filings differ (`fold1_*`).
+            a.conn
+                .execute(
+                    "UPDATE owed_rows SET facts=json_set(facts,'$.sweepSource','hopsweep-filing','$.sweepTxid','f7fd5ba5','$.sweepRawHex','0100') WHERE NOT (claimable=1 AND json_extract(facts,'$.claim') IS NOT NULL AND json_extract(facts,'$.claimable') IS NOT 0)",
                     [],
                 )
                 .unwrap();
@@ -24809,5 +24850,132 @@ mod fix1095 {
             "the could-not-judge row, over two literals"
         );
         assert!(hydrate.contains("reason:Some(format!(\"couldnotjudge:{reason}\"))"));
+    }
+
+    /// FIX-COMPARE-FACTS-FOLD-1 (R279 MEDIUM-1): a fact that DRIVES the press is part of the verdict whenever the row
+    /// offers it. R279's three NOT COUNTED probes (filed bytes against sign-here, two filings, two paying
+    /// transactions) and every other press fact each DIFFER on a claimable pair: `diff_rows`, the rows route, the ring's
+    /// row, the digest (the reconcile's heal of stale press bytes), printed `press.<key>` (the bytes by their sha256);
+    /// the same move on a pair that offers no press is EQUAL (an explanation of the withheld press).
+    #[test]
+    fn fix1095f1_a_a_press_fact_on_a_claimable_pair_differs() {
+        let sweep = |source: Option<&str>, txid: Option<&str>, raw: Option<&str>| {
+            let mut f = json!({"claim": "sweep-hop", "claimable": true, "status": "unspent", "chainProbe": "unspent"});
+            for (k, v) in [
+                ("sweepSource", source),
+                ("sweepTxid", txid),
+                ("sweepRawHex", raw),
+            ] {
+                if let Some(v) = v {
+                    f[k] = json!(v);
+                }
+            }
+            f
+        };
+        let internalize = |settle: &str| json!({"claim": "internalize", "claimable": true, "settleTxid": settle, "payTxid": settle});
+        let probes: Vec<(&str, Value, Value, Vec<&str>)> = vec![
+            (
+                // the PR's own 02f1fd09 fixture as it pinned it: both pressing, the actor the owner's filing, D1 none
+                "filed bytes against none",
+                sweep(None, None, None),
+                sweep(Some("hopsweep-filing"), Some("f7fd5ba5"), Some("0100")),
+                vec!["press.sweepRawHex", "press.sweepSource", "press.sweepTxid"],
+            ),
+            (
+                "filed bytes against sign-here",
+                sweep(Some("sign-here"), None, None),
+                sweep(Some("hopsweep-filing"), Some("aa"), Some("0100")),
+                vec!["press.sweepRawHex", "press.sweepSource", "press.sweepTxid"],
+            ),
+            (
+                "two filings",
+                sweep(Some("hopsweep-filing"), Some("aa"), Some("0100")),
+                sweep(Some("hopsweep-filing"), Some("bb"), Some("0200")),
+                vec!["press.sweepRawHex", "press.sweepTxid"],
+            ),
+            (
+                "two paying transactions",
+                internalize("11"),
+                internalize("22"),
+                vec!["press.payTxid", "press.settleTxid"],
+            ),
+        ];
+        for (name, d1f, af, want) in probes {
+            let (d1, actor) = (row(d1f.clone(), 1), row(af.clone(), 1));
+            assert_eq!(
+                diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)),
+                vec![O.to_string()],
+                "{name}: counted"
+            );
+            let fields =
+                compare::diff_fields(std::slice::from_ref(&d1), std::slice::from_ref(&actor), O);
+            let keys: Vec<&String> = fields.as_object().unwrap().keys().collect();
+            assert_eq!(keys, want, "{name}: {fields}");
+            assert!(
+                !fields.to_string().contains("\"0100\""),
+                "{name}: the bytes printed by their digest: {fields}"
+            );
+            let line = diff_detail(
+                std::slice::from_ref(&d1),
+                std::slice::from_ref(&actor),
+                &[O.to_string()],
+            );
+            assert!(line.contains(want[0]), "{name}: {line}");
+            let mut v = view(&d1, &actor);
+            assert_eq!(v["diff"], json!([O]), "{name}: {v}");
+            assert_ne!(v["digests"]["d1"], v["digests"]["actor"], "{name}");
+            v["heldByLag"] = json!([]);
+            v["diffFields"] = json!([{"outpoint": O, "fields": fields}]);
+            let r = compare::compare_row_of("02f1fd09", NOW_MS as i64, Ok(&v));
+            assert_eq!(r.diff_count, Some(1), "{name}: {:?}", r.outpoints);
+            // the same pair offering no press: the facts explain a withhold, equal
+            let off = |mut f: Value| {
+                f["claim"] = Value::Null;
+                f["claimable"] = json!(false);
+                row(f, 0)
+            };
+            assert!(
+                diff_rows(&[off(d1f)], &[off(af)]).is_empty(),
+                "{name}: a withheld pair is equal"
+            );
+        }
+        // every press fact, one at a time, on one side only
+        for k in PRESS_FACTS {
+            let base = json!({"claim": "sweep-hop", "claimable": true});
+            let mut moved = base.clone();
+            moved[k] = json!("x");
+            assert_eq!(
+                diff_rows(&[row(base.clone(), 1)], &[row(moved.clone(), 1)]).len(),
+                1,
+                "{k} on a press"
+            );
+            let (mut b0, mut m0) = (base, moved);
+            for f in [&mut b0, &mut m0] {
+                f["claimable"] = json!(false);
+            }
+            assert!(
+                diff_rows(&[row(b0, 0)], &[row(m0, 0)]).is_empty(),
+                "{k} on a withheld row"
+            );
+        }
+    }
+
+    /// FIX-COMPARE-FACTS-FOLD-1: a carried entry printed by this rule (`press.<key>`) is a verdict difference; one
+    /// printed under the rule that counted every fact (`facts.sweepRawHex`, which a withheld pair printed) is not.
+    #[test]
+    fn fix1095f1_b_a_carried_press_entry_is_kept() {
+        let p = |fields: Value| json!({"outpoint": O, "held": false, "fields": fields});
+        let kept = compare::verdict_entry(&p(
+            json!({"press.sweepTxid": {"d1": "aa", "actor": "bb"}, "facts.chainProbe": {"d1": "a", "actor": "b"}}),
+        ))
+        .expect("a press field is a verdict field");
+        assert_eq!(
+            kept["fields"],
+            json!({"press.sweepTxid": {"d1": "aa", "actor": "bb"}})
+        );
+        assert!(compare::verdict_entry(&p(
+            json!({"facts.sweepRawHex": {"d1": null, "actor": "0100"}})
+        ))
+        .is_none());
     }
 }

@@ -323,6 +323,12 @@ pub fn diff_fields(d1: &[Value], actor: &[Value], outpoint: &str) -> Value {
                     );
                 }
             }
+            for (k, x, y) in super::press_fields_differing(&a, &b) {
+                out.insert(
+                    format!("press.{k}"),
+                    json!({"d1": short(&x), "actor": short(&y)}),
+                );
+            }
         }
         (Some(a), None) => {
             out.insert("row".into(), json!({"d1": "present", "actor": "absent"}));
