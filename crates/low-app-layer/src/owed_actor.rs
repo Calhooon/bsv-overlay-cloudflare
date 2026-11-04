@@ -5410,14 +5410,16 @@ pub struct PendingBars {
     /// ([`APPLY_STAGES`]), beside `apply`.
     pub stages: BTreeMap<(&'static str, &'static str), Vec<u64>>,
     pub visible: BTreeMap<&'static str, Vec<u64>>,
-    /// identity -> the oldest write time of an event whose apply faulted (or whose direct call walled), no later
-    /// apply landed. bsv-low #1085: merged into the queue row's per-identity map at each flush, then cleared (the row
-    /// holds it; [`merge_unapplied_identities`]).
-    pub unapplied: BTreeMap<String, u64>,
-    /// bsv-low #1085: identity -> the latest judgement time of an apply of it that LANDED in this isolate since the
-    /// last flush: at the flush it clears that identity's entries of the row's map written before it, whichever
-    /// isolate noted them.
-    pub landed: BTreeMap<String, u64>,
+    /// (identity, game) -> the oldest write time of an event whose apply faulted (or whose direct call walled) for
+    /// that game of the identity, no later apply of the game landed; the game [`ANY_GAME`] when the fault named none.
+    /// bsv-low #1085: merged into the queue row's per-identity map at each flush, then cleared (the row holds it;
+    /// [`merge_unapplied_identities`]). APP-L59 fold 1 (B LOW-4): keyed by game, so a sibling body's landing does not
+    /// hide the walled one.
+    pub unapplied: BTreeMap<(String, String), u64>,
+    /// bsv-low #1085: (identity, game) -> the latest judgement time of an apply that LANDED that game in this isolate
+    /// since the last flush. APP-L59 fold 1 (C MEDIUM-3): persisted in the row (`landedByIdentity`), so it clears an
+    /// entry written before it whichever isolate's flush comes first.
+    pub landed: BTreeMap<(String, String), u64>,
     /// The queue class's unapplied set moved since the last flush (only then is the row's age rewritten).
     pub queue_touched: bool,
     pub noted: usize,
@@ -5493,11 +5495,15 @@ impl PendingBars {
         if answer["applied"] == false {
             return;
         }
+        // APP-L59 fold 1 (C LOW-4): a HELD answer (the actor cold, the event held unapplied) landed nothing: no
+        // sample, and it never clears a stall.
+        if answer["held"] == true {
+            return;
+        }
         // NEW5-L5: the object already noted this answer's samples itself; the caller keeps only its own isolate's
         // unapplied bookkeeping.
         if answer["noted"] == true {
             if let Some(id) = answer["identity"].as_str() {
-                self.unapplied.remove(id);
                 self.note_landed(id, answer);
             }
             return;
@@ -5552,22 +5558,37 @@ impl PendingBars {
             }
         }
         if let Some(id) = answer["identity"].as_str() {
-            self.unapplied.remove(id);
             self.note_landed(id, answer);
         }
         if class == "queue" {
             self.queue_touched = true;
         }
     }
-    /// bsv-low #1085: an apply of `identity` landed, judged at the answer's `judgedAtMs` (the object's answers carry
-    /// it); an answer with no time landed after everything this flush knows of (it clears the identity's entries).
+    /// bsv-low #1085: an apply of `identity` landed the answer's `appliedGames`, judged at its `judgedAtMs` (the
+    /// object's answers carry both). APP-L59 fold 1: the judgement time stands for the actor's coverage (an apply judged
+    /// at or after an event's write read the record after it); an answer with no judgement time, or no applied game,
+    /// clears nothing (the entry waits for one that does, or for the sweep's bound).
     fn note_landed(&mut self, identity: &str, answer: &Value) {
-        let at = answer["judgedAtMs"].as_u64().unwrap_or(u64::MAX);
-        let e = self
-            .landed
-            .entry(identity.to_ascii_lowercase())
-            .or_insert(at);
-        *e = (*e).max(at);
+        let Some(at) = answer["judgedAtMs"].as_u64() else {
+            return;
+        };
+        let id = identity.to_ascii_lowercase();
+        let games: Vec<String> = answer["appliedGames"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .collect();
+        if games.is_empty() {
+            return;
+        }
+        for g in &games {
+            let e = self.landed.entry((id.clone(), g.clone())).or_insert(at);
+            *e = (*e).max(at);
+        }
+        self.unapplied
+            .retain(|(i, g), t| !(*i == id && (g == ANY_GAME || games.contains(g)) && *t <= at));
         self.queue_touched = true;
     }
     pub fn note_cold(&mut self, ms: u64) {
@@ -5584,15 +5605,24 @@ impl PendingBars {
         self.held += 1;
         self.noted += 1;
     }
-    pub fn note_fault(&mut self, identity: &str, at_ms: Option<u64>) {
-        if let Some(at) = at_ms {
-            let e = self
-                .unapplied
-                .entry(identity.to_ascii_lowercase())
-                .or_insert(at);
+    /// A fault (or a wall) of an apply of `games` of `identity`, its event written at `at_ms`; no games names the
+    /// whole identity ([`ANY_GAME`], cleared by a landing of any game).
+    pub fn note_fault_of(&mut self, identity: &str, games: &[String], at_ms: Option<u64>) {
+        let Some(at) = at_ms else { return };
+        let id = identity.to_ascii_lowercase();
+        let keys: Vec<String> = if games.is_empty() {
+            vec![ANY_GAME.to_string()]
+        } else {
+            games.iter().map(|g| g.to_ascii_lowercase()).collect()
+        };
+        for g in keys {
+            let e = self.unapplied.entry((id.clone(), g)).or_insert(at);
             *e = (*e).min(at);
-            self.queue_touched = true;
         }
+        self.queue_touched = true;
+    }
+    pub fn note_fault(&mut self, identity: &str, at_ms: Option<u64>) {
+        self.note_fault_of(identity, &[], at_ms)
     }
     pub fn due(&self) -> bool {
         self.noted > 0 || self.queue_touched
@@ -5689,8 +5719,8 @@ pub const BOOT_ALARM_SLACK_MS: u64 = 5_000;
 pub const BOOT_ALARM_DEAD_AFTER_MS: u64 =
     2 * 60_000 + BOOTSTRAP_PAGE_DELAY_MS + BOOT_ALARM_SLACK_MS;
 /// An actor apply that faulted: its event is unapplied for the actor until a later apply of the identity lands.
-pub fn note_actor_fault(identity: &str, at_ms: Option<u64>) {
-    PENDING_BARS.with(|p| p.borrow_mut().note_fault(identity, at_ms));
+pub fn note_actor_fault(identity: &str, games: &[String], at_ms: Option<u64>) {
+    PENDING_BARS.with(|p| p.borrow_mut().note_fault_of(identity, games, at_ms));
 }
 
 /// THE FLEET BARS ARE THE BUILD'S (the captain's item 9 of lane D2-ACTOR-B-FOLD-8): each class row names the build
@@ -5847,42 +5877,99 @@ pub fn merge_bars_row_staged(
     row.to_string()
 }
 
-/// bsv-low #1085 (L59 S-A): the most identities the queue row's unapplied map holds (the oldest kept).
+/// bsv-low #1085 (L59 S-A): the most (identity, game) entries the queue row's unapplied map holds (the oldest kept).
 pub const UNAPPLIED_IDENTITIES_MAX: usize = 256;
+/// APP-L59 fold 1 (C MEDIUM-3): the most (identity, game) landings the queue row keeps (the newest kept).
+pub const LANDED_GAMES_MAX: usize = 1_024;
+/// APP-L59 fold 1: the game key of a fault that named no game (the whole identity: any landing of it clears it).
+pub const ANY_GAME: &str = "*";
+/// APP-L59 fold 1 (C MEDIUM-3): an unapplied entry is evicted once its event is older than the sweep's stalled bound
+/// (`owed_events::SWEEP_STALLED_AFTER_MS`, 600 s): past it the drain's sweep re-publishes the identity's marks
+/// whatever the consumer did, so the queue's backstop has it, and the entry is never kept for good. A landing older
+/// than it can clear no live entry and is dropped too.
+pub const UNAPPLIED_EVICT_AFTER_MS: u64 = crate::owed_events::SWEEP_STALLED_AFTER_MS as u64;
 
-/// PURE (bsv-low #1085): the queue bars row's PER-IDENTITY map of unapplied events (`unappliedByIdentity`: identity
-/// to the oldest write time of an event whose apply faulted or whose direct call walled, no later apply of the
-/// identity landed), merged across isolates: the stored row's map (carried across builds, as the age), this isolate's
-/// faults added (the older time kept), and each identity whose apply landed in this isolate at or after an entry's
-/// time removed. `oldestUnappliedAtMs` is the map's oldest, so a stall one isolate noted is seen by the fleet's row
-/// until an apply of that identity lands anywhere. At most [`UNAPPLIED_IDENTITIES_MAX`] entries, the oldest kept.
+/// A stored `{identity: {game: ms}}` map (an older row's `{identity: ms}` reads as the identity's [`ANY_GAME`]).
+fn games_map(v: &Value) -> BTreeMap<(String, String), u64> {
+    let mut out = BTreeMap::new();
+    for (id, inner) in v.as_object().into_iter().flatten() {
+        if let Some(at) = json_ms(inner) {
+            out.insert((id.clone(), ANY_GAME.to_string()), at);
+            continue;
+        }
+        for (g, at) in inner.as_object().into_iter().flatten() {
+            if let Some(at) = json_ms(at) {
+                out.insert((id.clone(), g.clone()), at);
+            }
+        }
+    }
+    out
+}
+
+fn games_json(map: &BTreeMap<(String, String), u64>) -> Value {
+    let mut out = serde_json::Map::new();
+    for ((id, g), at) in map {
+        let e = out.entry(id.clone()).or_insert_with(|| json!({}));
+        e[g.as_str()] = json!(at);
+    }
+    Value::Object(out)
+}
+
+/// PURE (bsv-low #1085; APP-L59 fold 1): the queue bars row's PER-IDENTITY map of unapplied events
+/// (`unappliedByIdentity`: identity, then game ([`ANY_GAME`] for a fault that named none), to the oldest write time
+/// of an event whose apply faulted or whose direct call walled), merged across isolates. The stored row's map, this
+/// isolate's faults added (the older time kept); then every entry an apply LANDED at or after (the row's own
+/// `landedByIdentity`, persisted with this isolate's landings: so a landing clears an entry whichever isolate's flush
+/// comes first, C MEDIUM-3) is removed: the same game, or any game for an [`ANY_GAME`] entry (a sibling body's
+/// landing of another game hides nothing, B LOW-4). An entry or landing older than [`UNAPPLIED_EVICT_AFTER_MS`] at
+/// `now` is evicted. `oldestUnappliedAtMs` is the map's oldest. At most [`UNAPPLIED_IDENTITIES_MAX`] entries (the
+/// oldest kept) and [`LANDED_GAMES_MAX`] landings (the newest kept). Stated: two isolates' flushes that read the row
+/// at once write it last-writer-wins (no compare-and-set); a fault so lost is the sweep's (its 600 s bound), a landing
+/// so lost leaves an entry until another landing or the eviction.
 pub fn merge_unapplied_identities(
     row: &str,
     stored: Option<&str>,
-    faults: &BTreeMap<String, u64>,
-    landed: &BTreeMap<String, u64>,
+    faults: &BTreeMap<(String, String), u64>,
+    landed: &BTreeMap<(String, String), u64>,
+    now: u64,
 ) -> String {
     let mut row: Value = serde_json::from_str(row).unwrap_or_else(|_| json!({}));
-    let mut map: BTreeMap<String, u64> = stored
+    let stored: Value = stored
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
-        .and_then(|v| v["unappliedByIdentity"].as_object().cloned())
-        .into_iter()
-        .flatten()
-        .filter_map(|(id, at)| json_ms(&at).map(|at| (id, at)))
-        .collect();
-    for (id, at) in faults {
-        let e = map.entry(id.clone()).or_insert(*at);
+        .unwrap_or(Value::Null);
+    let mut map = games_map(&stored["unappliedByIdentity"]);
+    let mut lands = games_map(&stored["landedByIdentity"]);
+    for (k, at) in landed {
+        let e = lands.entry(k.clone()).or_insert(*at);
+        *e = (*e).max(*at);
+    }
+    for (k, at) in faults {
+        let e = map.entry(k.clone()).or_insert(*at);
         *e = (*e).min(*at);
     }
-    map.retain(|id, at| landed.get(id).is_none_or(|l| *l < *at));
+    let floor = now.saturating_sub(UNAPPLIED_EVICT_AFTER_MS);
+    lands.retain(|_, at| *at >= floor);
+    map.retain(|(id, g), at| {
+        *at >= floor
+            && !lands
+                .iter()
+                .any(|((li, lg), l)| li == id && (lg == g || g == ANY_GAME) && *l >= *at)
+    });
     if map.len() > UNAPPLIED_IDENTITIES_MAX {
-        let mut by_age: Vec<(String, u64)> = map.into_iter().collect();
+        let mut by_age: Vec<((String, String), u64)> = map.into_iter().collect();
         by_age.sort_by_key(|(_, at)| *at);
         by_age.truncate(UNAPPLIED_IDENTITIES_MAX);
         map = by_age.into_iter().collect();
     }
+    if lands.len() > LANDED_GAMES_MAX {
+        let mut by_age: Vec<((String, String), u64)> = lands.into_iter().collect();
+        by_age.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+        by_age.truncate(LANDED_GAMES_MAX);
+        lands = by_age.into_iter().collect();
+    }
     row["oldestUnappliedAtMs"] = json!(map.values().min());
-    row["unappliedByIdentity"] = json!(map);
+    row["unappliedByIdentity"] = games_json(&map);
+    row["landedByIdentity"] = games_json(&lands);
     row.to_string()
 }
 
@@ -5900,12 +5987,17 @@ pub async fn flush_bars(db: &impl SqlPort, now: u64, force: bool) {
         // taken stays for the next flush.
         Ok(()) => PENDING_BARS.with(|p| {
             let mut p = p.borrow_mut();
-            let unapplied: BTreeMap<String, u64> = std::mem::take(&mut p.unapplied)
+            let unapplied: BTreeMap<(String, String), u64> = std::mem::take(&mut p.unapplied)
                 .into_iter()
-                .filter(|(id, at)| pending.unapplied.get(id) != Some(at))
+                .filter(|(k, at)| pending.unapplied.get(k) != Some(at))
+                .collect();
+            let landed: BTreeMap<(String, String), u64> = std::mem::take(&mut p.landed)
+                .into_iter()
+                .filter(|(k, at)| pending.landed.get(k) != Some(at))
                 .collect();
             *p = PendingBars {
                 unapplied,
+                landed,
                 last_flush_ms: Some(now),
                 ..Default::default()
             };
@@ -5988,6 +6080,7 @@ pub async fn flush_bars_from(
                 held(class).as_deref(),
                 &pending.unapplied,
                 &pending.landed,
+                now,
             );
         }
         stmts.push(Stmt::new(
@@ -6126,7 +6219,7 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
         "coldMsP95": cold.quantile(0.95),
         "coldMsMax": cold.max(),
         "coldSamples": cold.samples.len(),
-        "actorOldestUnappliedEventAgeMs": queue_row["oldestUnappliedAtMs"].as_u64().map(|a| now.saturating_sub(a)),
+        "actorOldestUnappliedEventAgeMs": unapplied_oldest(&queue_row, now).map(|a| now.saturating_sub(a)),
         // bsv-low #1085: the identities whose events wait unapplied (a per-identity stall is visible by name).
         "actorUnappliedIdentities": unapplied_identities(&queue_row["unappliedByIdentity"], now),
         "classes": classes,
@@ -6135,15 +6228,31 @@ pub fn fleet_bars(rows: &[Value], now: u64, rev: &str) -> Value {
     })
 }
 
-/// bsv-low #1085: the served view of the queue row's per-identity map: the count and the oldest few identities with
-/// their ages (at most 8 named).
+/// APP-L59 fold 1 (C MEDIUM-3): the queue row's oldest unapplied event that is still live at `now` (an entry past
+/// [`UNAPPLIED_EVICT_AFTER_MS`] is served as evicted before any flush rewrites the row); a row with no per-identity
+/// map serves its `oldestUnappliedAtMs` as before.
+pub fn unapplied_oldest(queue_row: &Value, now: u64) -> Option<u64> {
+    let map = &queue_row["unappliedByIdentity"];
+    if !map.is_object() {
+        return json_ms(&queue_row["oldestUnappliedAtMs"]);
+    }
+    let floor = now.saturating_sub(UNAPPLIED_EVICT_AFTER_MS);
+    games_map(map).into_values().filter(|at| *at >= floor).min()
+}
+
+/// bsv-low #1085: the served view of the queue row's per-identity map: the count of identities and the oldest few
+/// with their ages (at most 8 named), each identity at its oldest live entry (APP-L59 fold 1: entries past
+/// [`UNAPPLIED_EVICT_AFTER_MS`] are not served).
 pub fn unapplied_identities(map: &Value, now: u64) -> Value {
-    let mut by_age: Vec<(String, u64)> = map
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter_map(|(id, at)| json_ms(at).map(|at| (id.clone(), at)))
-        .collect();
+    let floor = now.saturating_sub(UNAPPLIED_EVICT_AFTER_MS);
+    let mut per: BTreeMap<String, u64> = BTreeMap::new();
+    for ((id, _), at) in games_map(map) {
+        if at >= floor {
+            let e = per.entry(id).or_insert(at);
+            *e = (*e).min(at);
+        }
+    }
+    let mut by_age: Vec<(String, u64)> = per.into_iter().collect();
     by_age.sort_by_key(|(_, at)| *at);
     let oldest: Vec<Value> = by_age
         .iter()
@@ -7620,7 +7729,7 @@ pub async fn beside(db: &impl JudgeDb, identity: &str, games: &[String], bound: 
         Ok(None) => return,
         Err(e) => {
             db.counters(vec![(COUNTERS[2].into(), 1)]).await;
-            note_actor_fault(identity, db.event_at_ms());
+            note_actor_fault(identity, games, db.event_at_ms());
             db.log(&format!("[owed-actor] FAULT {identity}: {e}"));
             return;
         }
@@ -7725,7 +7834,7 @@ pub async fn actor_then_d1(
         Ok(a) => a,
         Err(e) => {
             db.counters(vec![(COUNTERS[2].into(), 1)]).await;
-            note_actor_fault(identity, db.event_at_ms());
+            note_actor_fault(identity, games, db.event_at_ms());
             db.log(&format!(
                 "[owed-actor] FAULT {identity}: {e}; Phase B hands the message back, its marks kept"
             ));
@@ -7983,7 +8092,7 @@ pub async fn as_the_judge(
         Ok(Some(a)) => a,
         Ok(None) => return Err("the D1 judge is off and no owed actor is bound".into()),
         Err(e) => {
-            note_actor_fault(&id, db.event_at_ms());
+            note_actor_fault(&id, games, db.event_at_ms());
             return Err(e);
         }
     };

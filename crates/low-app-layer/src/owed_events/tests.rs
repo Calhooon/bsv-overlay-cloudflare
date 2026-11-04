@@ -910,7 +910,11 @@ async fn fix1085_b_a_walled_direct_call_names_its_identity_for_the_backstop() {
         if named {
             assert_eq!(
                 report.unapplied,
-                vec![(ID.to_string(), Some(T0 as u64))],
+                vec![(
+                    ID.to_string(),
+                    vec!["g1".to_string(), "g2".to_string()],
+                    Some(T0 as u64)
+                )],
                 "{answer:?}"
             );
             assert_eq!(walled_identities(&report), vec![ID.to_ascii_lowercase()]);
@@ -923,7 +927,7 @@ async fn fix1085_b_a_walled_direct_call_names_its_identity_for_the_backstop() {
         .collect();
     let pass = &src[src.find("pubasyncfndirect_events_as(").unwrap()..];
     let pass = &pass[..pass.find("pubfnwalled_identities(").unwrap()];
-    assert!(pass.contains("crate::owed_actor::note_actor_fault(id,*at);"));
+    assert!(pass.contains("crate::owed_actor::note_actor_fault(id,games,*at);"));
     assert!(pass.contains("publish_pairs(env,&pairs).await;"));
     assert!(pass.contains("publish::take_direct_where("));
 }
