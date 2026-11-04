@@ -479,7 +479,9 @@ pub fn belt_evidence_targets(entries: &[OutpointStatus]) -> Vec<(String, u32)> {
 /// `false`: it is the INDEX's SPV-confirmed flag (`index_proven_spend` names an index proof on it), never a courier's word; and
 /// `spenderSeen` stays the index's own witness of its own pointer (none), so a monitor that trusts a pointer only on
 /// `spenderSeen` or `spentConfirmed` does not trust the belt's. The lock then reads the spender's tracker word
-/// (`locked`, or `spent` on a checked `mined` word), never `free`. An evidence row that records no spend (none is
+/// (`decorate_outpoints`' two arms for a belt spend, fold 1 ruling 4): `spent` at tier chain with its path on a
+/// CHECKED `mined` word (the chain's word over a spender the ladder verified consumes the outpoint), else `locked`
+/// (`suspended` on `stale`); never `free`. An evidence row that records no spend (none is
 /// written: an unspent look deletes it) or names no spender changes nothing. Additive: every other row is byte for
 /// byte as before.
 pub fn apply_belt_evidence(body: &str, evidence: &[crate::hops_view::ProbeMemo]) -> String {

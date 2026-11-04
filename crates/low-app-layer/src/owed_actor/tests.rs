@@ -24265,6 +24265,96 @@ mod fix1093 {
         assert!(out[2].get("spentSource").is_none());
     }
 
+    /// (e) FOLD 1 RULING 4 (the captain's ruling on the ensemble's A LOW-1): the lock on a belt spend has two arms. A
+    /// belt-found spender whose tracker word is a CHECKED `mined` (its `verifyPath` served) IS the chain's word: `lock:
+    /// spent` at tier chain with the path, as for an index-recorded spender (the client's `creditWord` reads a landing on
+    /// the expected txid, `lost` on another). A belt-found spender WITHOUT a checked word (none, `seen`, a `mined` with
+    /// no path) is `locked` by it (`suspended` on a `stale` word, as for an index pointer): never `spent` at tier chain,
+    /// never `free`; `spentConfirmed` is `false` on every arm. Green on 7954f855 (`decorate_outpoints` unchanged): a
+    /// guard of the ruled arms.
+    #[test]
+    fn fix1093f_the_lock_on_a_belt_spend_is_spent_only_on_a_checked_mined_word() {
+        let hop = "95".repeat(32);
+        let spender = "75".repeat(32);
+        let ops = crate::logic::parse_outpoints(&format!("{hop}.0")).unwrap();
+        let row = crate::logic::PotRecordRow {
+            txid: hop.clone(),
+            vout: 0,
+            spent: false,
+            spending_txid: None,
+            spent_confirmed: false,
+            spender_final: None,
+            spender_seen: None,
+            funding_seen: None,
+            funding_seen_by: None,
+        };
+        let entries = crate::logic::assemble_statuses(&ops, &[row]);
+        let body = crate::logic::apply_belt_evidence(
+            &crate::logic::utxo_status_body(&entries),
+            &[crate::hops_view::ProbeMemo {
+                outpoint: format!("{hop}:0"),
+                probed_at_ms: 7,
+                spent: true,
+                spending_txid: Some(spender.clone()),
+                spent_confirmed: Some(true),
+                tip_height: Some(972_776),
+            }],
+        );
+        let lock_under = |word: Option<Value>| {
+            let mut v: Value = serde_json::from_str(&body).unwrap();
+            let views: BTreeMap<String, Value> = word
+                .map(|w| BTreeMap::from([(spender.clone(), w)]))
+                .unwrap_or_default();
+            crate::tracker_host::runtime::decorate_outpoints(&mut v, &views, "free", "host");
+            assert_eq!(v[0]["spentConfirmed"], json!(false), "{v}");
+            assert_eq!(v[0]["spentSource"], json!("belt"), "{v}");
+            (
+                v[0]["lock"]["word"].clone(),
+                v[0]["lock"]["tier"].clone(),
+                v[0]["lock"]["txid"].clone(),
+                v[0]["lock"]["verifyPath"].clone(),
+            )
+        };
+        let path = json!("972776/root/path");
+        assert_eq!(
+            lock_under(Some(
+                json!({"word": "mined", "tier": "chain", "height": 972_776, "verifyPath": path})
+            )),
+            (json!("spent"), json!("chain"), json!(spender), path),
+            "a checked mined word over the belt's spender is the chain's word"
+        );
+        for (name, word, coin) in [
+            ("no word", None, "locked"),
+            (
+                "seen",
+                Some(json!({"word": "seen", "tier": "hint", "height": null, "verifyPath": null})),
+                "locked",
+            ),
+            (
+                "mined, unchecked",
+                Some(
+                    json!({"word": "mined", "tier": "hint", "height": 972_776, "verifyPath": null}),
+                ),
+                "locked",
+            ),
+            (
+                "stale",
+                Some(
+                    json!({"word": "stale", "tier": "chain", "height": 972_776, "verifyPath": null}),
+                ),
+                "suspended",
+            ),
+        ] {
+            let (w, tier, txid, verify) = lock_under(word);
+            assert_eq!(
+                (w, txid, verify.is_null()),
+                (json!(coin), json!(spender), true),
+                "{name}: never spent at chain, never free"
+            );
+            assert!(!(coin == "spent" && tier == "chain"), "{name}");
+        }
+    }
+
     /// (g) FOLD 1 RULING 3 (the ensemble's C LOW-2 and A LOW-3): 40 pending re-read games beside 32 carried counted
     /// games of an identity of 200 games: the shipped keyset pick judges at most half the window first, the pending
     /// ones before the carried, and the forward walk takes the other half from past the cursor; a first game left out
