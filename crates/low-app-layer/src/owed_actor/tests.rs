@@ -23844,3 +23844,162 @@ mod fix1085 {
         assert!(!stored.contains(X), "the flush evicted it: {stored}");
     }
 }
+
+/// FIX-COMPARE-TIPFACTS (bsv-low #1094; beta at c42128c9, three identities): the TIP-DATING FACTS
+/// ([`crate::owed_actor::TIP_FACTS`]: `snapshotTip`, `chainProbeTip`, `servedTip`, `tipMoved`, `tipUnknown`) are never a
+/// compare difference by themselves. The actor dates its stored courier-dependent rows (`facts.snapshotTip`, the tip a
+/// stored row was judged at) where the fresh D1 judgement has no snapshot to date; the pair differed in that field alone
+/// (`diff [ff97e17d..:0]`, `tipLag []`) and the fleet compare never read zero. RED on c42128c9: (a) `diff` names the
+/// outpoint, (c) the fleet reads every identity differing.
+mod fix1094 {
+    use super::*;
+
+    const O: &str = "ff97e17de0d1b17c78acad066726eaa9ddb4e771c69c28bbd96d1872d6f99784:0";
+
+    fn row(facts: Value, claimable: i64) -> Value {
+        json!({
+            "outpoint": O,
+            "family": "hop-stranded",
+            "gameId": "g1094",
+            "sats": 20190,
+            "opponentIdentity": "other",
+            "atHeight": Value::Null,
+            "reason": "the hop is index-unspent",
+            "facts": facts.to_string(),
+            "claimable": claimable,
+            "probeTip": 974_001,
+        })
+    }
+
+    fn base_facts() -> Value {
+        json!({
+            "claim": "sweep-hop",
+            "claimable": true,
+            "status": "unspent",
+            "chainProbe": "index-unspent",
+        })
+    }
+
+    fn dated(mut f: Value) -> Value {
+        f["snapshotTip"] = json!(973_998);
+        f
+    }
+
+    fn view(d1: &Value, actor: &Value) -> Value {
+        rows_view(
+            "0328e693",
+            Ok(json!({"rows": [actor], "bootstrapped": true})),
+            std::slice::from_ref(d1),
+            None,
+            None,
+        )
+    }
+
+    /// (a) and (b): the pure compare and the rows route's view.
+    #[test]
+    fn fix1094_a_a_pair_differing_only_in_its_tip_facts_is_equal() {
+        let d1 = row(base_facts(), 1);
+        let actor = row(dated(base_facts()), 1);
+        assert!(diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)).is_empty());
+        let v = view(&d1, &actor);
+        assert_eq!(v["diff"], json!([]), "{v}");
+        assert_eq!(v["tipLag"], json!([]), "{v}");
+        assert_eq!(v["tipFacts"], json!([O]), "counted apart: {v}");
+        assert_eq!(
+            v["digests"]["d1"], v["digests"]["actor"],
+            "one digest of one verdict"
+        );
+        // every tip fact, on either side, alone
+        for k in crate::owed_actor::TIP_FACTS {
+            let mut f = base_facts();
+            f[k] = json!(974_000);
+            assert!(
+                diff_rows(&[row(base_facts(), 1)], &[row(f, 1)]).is_empty(),
+                "{k} alone is no difference"
+            );
+        }
+        // the ring's compare row: no counted difference
+        let r = compare::compare_row_of("0328e693", NOW_MS as i64, Ok(&v));
+        assert_eq!(r.diff_count, Some(0), "{:?}", r.outpoints);
+    }
+
+    #[test]
+    fn fix1094_b_a_verdict_field_beside_a_tip_fact_still_differs() {
+        let d1 = row(base_facts(), 1);
+        let mut withdrawn = dated(base_facts());
+        withdrawn["claimable"] = json!(false);
+        let actor = row(withdrawn, 0);
+        assert_eq!(
+            diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)),
+            vec![O.to_string()]
+        );
+        let v = view(&d1, &actor);
+        assert_eq!(v["diff"], json!([O]), "{v}");
+        assert_eq!(v["tipFacts"], json!([]), "{v}");
+        // the claim alone, the sats alone, and the row's absence still differ beside a tip fact
+        let mut claim = dated(base_facts());
+        claim["claim"] = Value::Null;
+        assert_eq!(
+            diff_rows(std::slice::from_ref(&d1), &[row(claim, 1)]).len(),
+            1
+        );
+        let mut sats = row(dated(base_facts()), 1);
+        sats["sats"] = json!(20191);
+        assert_eq!(diff_rows(std::slice::from_ref(&d1), &[sats]).len(), 1);
+        assert_eq!(diff_rows(&[d1], &[]).len(), 1);
+    }
+
+    /// (c) the fleet figure through the shipped ring and the standing route: every actor row dated with a
+    /// `snapshotTip` the fresh D1 judgement lacks, two ticks a window apart, `identitiesDiffering` 0; and one of them
+    /// with its `sats` moved too is counted.
+    #[tokio::test]
+    async fn fix1094_c_a_fleet_of_tip_dated_pairs_reads_zero() {
+        let (d1, ids, actors) = fix986_fleet(3).await;
+        fix1046_served_p95(&d1, 1_492);
+        let port = Fix986 {
+            d1: &d1,
+            actors,
+            judges: false,
+            die_after: Cell::new(u32::MAX),
+        };
+        for a in port.actors.values() {
+            a.conn
+                .execute(
+                    "UPDATE owed_rows SET facts=json_set(facts,'$.snapshotTip',973998,'$.tipMoved',json('true'),'$.servedTip',974001)",
+                    [],
+                )
+                .unwrap();
+        }
+        // the rows route's fresh compare of one identity
+        let one = &ids[0];
+        let answer = compare::actor_answer(&port, one).await;
+        let v = compare::fresh_compare(&d1, one, answer).await.unwrap();
+        assert_eq!(v["diff"], json!([]), "{}", v["diffFields"]);
+        assert_eq!(v["tipFacts"].as_array().map(Vec::len), Some(1), "{v}");
+        let t = NOW_MS as i64;
+        for at in [t, t + 5_000, t + 10_000] {
+            let r = compare::ring_tick(&port, at, 0, 1, 16, || 0).await.unwrap();
+            assert_eq!((r.diffs, r.pending_reread), (0, 0), "{r:?}");
+        }
+        let got = compare::read_answer(&d1, "", "", t + 10_001, 1)
+            .await
+            .unwrap();
+        assert_eq!(got["identitiesDiffering"], json!(0), "{got}");
+        assert_eq!(got["identitiesPendingReread"], json!(0), "{got}");
+        // a verdict field beside the tip facts is counted at its re-read
+        port.actors[&ids[1]]
+            .conn
+            .execute("UPDATE owed_rows SET sats=sats+1", [])
+            .unwrap();
+        compare::compare_now(&port, &ids[1], t + 20_000)
+            .await
+            .unwrap();
+        compare::compare_now(&port, &ids[1], t + 30_000)
+            .await
+            .unwrap();
+        let got = compare::read_answer(&d1, "", "", t + 30_001, 1)
+            .await
+            .unwrap();
+        assert_eq!(got["identitiesDiffering"], json!(1), "{got}");
+    }
+}
