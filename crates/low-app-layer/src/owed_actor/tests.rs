@@ -24007,3 +24007,257 @@ mod fix1094 {
         assert_eq!(got["identitiesDiffering"], json!(1), "{got}");
     }
 }
+
+// ---- FIX-BELT-INDEX (bsv-low #1093): a belt find of a hop's spend is ONE evidence for both judges and /utxo-status ----
+
+mod fix1093 {
+    use super::fix1010::fresh_d1;
+    use super::*;
+
+    /// `/utxo-status` for one outpoint over the record, as the route answers it: the SHIPPED batch read
+    /// (`logic::batch_where_sql`), the assembly and body, the belt's evidence over the rows the index holds unspent (the
+    /// judges' own statement, `probe_evidence_read_chunks` and `probe_memo_read_sql`, then `apply_belt_evidence`), and the
+    /// lock (`decorate_outpoints`, no tracker word held: the index's `free`).
+    pub(super) fn utxo_status(db: &SqliteSql, txid: &str, vout: u32) -> Value {
+        let ops = crate::logic::parse_outpoints(&format!("{txid}.{vout}")).unwrap();
+        let mut stmt = db.conn.prepare(&crate::logic::batch_where_sql(1)).unwrap();
+        let rows: Vec<crate::logic::PotRecordRow> = stmt
+            .query_map(rusqlite::params![txid, vout], |r| {
+                Ok(crate::logic::PotRecordRow {
+                    txid: r.get(0)?,
+                    vout: r.get::<_, i64>(1)? as u32,
+                    spent: r.get::<_, i64>(2)? != 0,
+                    spending_txid: r.get(3)?,
+                    spent_confirmed: r.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0,
+                    spender_final: r.get::<_, Option<i64>>(5)?.map(|v| v != 0),
+                    spender_seen: r.get::<_, Option<i64>>(6)?.map(|v| v != 0),
+                    funding_seen: r.get::<_, Option<i64>>(7)?.map(|v| v != 0),
+                    funding_seen_by: None,
+                })
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let entries = crate::logic::assemble_statuses(&ops, &rows);
+        let mut body = crate::logic::utxo_status_body(&entries);
+        let targets = crate::logic::belt_evidence_targets(&entries);
+        if !targets.is_empty() {
+            let mut evidence = Vec::new();
+            for keys in crate::hops_view::probe_evidence_read_chunks(&targets) {
+                let mut q = db
+                    .conn
+                    .prepare(&crate::hops_view::probe_memo_read_sql(keys.len()))
+                    .unwrap();
+                let got: Vec<crate::hops_view::ProbeMemo> = q
+                    .query_map(rusqlite::params_from_iter(keys.iter()), |r| {
+                        Ok(crate::hops_view::ProbeMemo {
+                            outpoint: r.get(0)?,
+                            probed_at_ms: r.get(1)?,
+                            spent: r.get::<_, i64>(2)? != 0,
+                            spending_txid: r.get(3)?,
+                            spent_confirmed: r.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+                            tip_height: r.get::<_, Option<i64>>(5)?.map(|t| t as u64),
+                        })
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                evidence.extend(got);
+            }
+            body = crate::logic::apply_belt_evidence(&body, &evidence);
+        }
+        let mut value: Value = serde_json::from_str(&body).unwrap();
+        crate::tracker_host::runtime::decorate_outpoints(
+            &mut value,
+            &std::collections::BTreeMap::new(),
+            "free",
+            "host",
+        );
+        value[0].clone()
+    }
+
+    fn courier_for(spend: &bsv_rs::transaction::Transaction, spender: &str) -> Couriers {
+        Couriers {
+            answers: vec![
+                (
+                    format!("{FOLD9_HOP}/0/spent"),
+                    (
+                        200,
+                        json!({"txid": spender, "vin": 0, "status": "confirmed"})
+                            .to_string()
+                            .into_bytes(),
+                    ),
+                ),
+                (
+                    format!("tx/{spender}/hex"),
+                    (200, hex::encode(spend.to_binary()).into_bytes()),
+                ),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// (a) RULING 1, beta's shape (2026-11-04, `95bcf03a…:0`): the hop's index row unspent and naming no spender, the
+    /// belt's evidence of the stranger's sweep gone, Phase C. Before the find `/utxo-status` answers the index's word
+    /// (`spent: false`, lock `free`) and the fresh D1 judgement presses. The re-ask lever's find (`found 1, handedBack 1,
+    /// writeFaults 0`, as beta's) writes the evidence row; then the fresh D1 judgement and the actor agree on it (both
+    /// `unbound`, `chainProbe: "spent"`, digests equal: the judges' one evidence, already) AND `/utxo-status` serves the
+    /// same spend from the same row: `spent: true`, the spender, `spentSource: "belt"`, the courier's confirmation as
+    /// `beltSpentConfirmed`, `spentConfirmed` still the index's `false`, and the lock `locked` by that spender, never
+    /// `free`. RED with `apply_belt_evidence` inert (main's route: the pot_records row alone): `spent: false`, `free`.
+    #[tokio::test]
+    async fn fix1093_a_after_a_belt_find_utxo_status_serves_the_same_spend_both_judges_read() {
+        let hop = format!("{FOLD9_HOP}:0");
+        let (spend, spender) = fold9_spend(FOLD9_HOP);
+        let d1 = d1_judge(&fold9_fixture()).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        d1.conn
+            .execute(crate::hops_view::PROBE_EVIDENCE_CLEAR_SQL, [&hop])
+            .unwrap();
+        let before = utxo_status(&d1, FOLD9_HOP, 0);
+        assert_eq!(
+            (
+                before["spent"].clone(),
+                before["spendingTxid"].clone(),
+                before["lock"]["word"].clone()
+            ),
+            (json!(false), Value::Null, json!("free")),
+            "the premise: the index's word alone: {before}"
+        );
+        assert!(before.get("spentSource").is_none(), "{before}");
+        fresh_d1(&d1).await;
+        assert_eq!(
+            fold9_row(&d1, &hop).map(|r| (r.0, r.1)),
+            Some(("hop-stranded".to_string(), Some(1))),
+            "the premise: the fresh D1 judgement presses without the evidence"
+        );
+        let w = WithActor {
+            d1,
+            actor: local,
+            d1_judges: false,
+            event: None,
+            actor_reads: true,
+            actor_fails: Cell::new(false),
+        };
+        crate::owed_events_publish::drain();
+        let r = crate::owed_belt::reask(
+            &w,
+            &courier_for(&spend, &spender),
+            &[("owner".into(), hop.clone())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                r.tick.asked,
+                r.tick.found,
+                r.tick.handed_back,
+                r.tick.write_faults.len()
+            ),
+            (1, 1, 1, 0),
+            "beta's answer: {r:?}"
+        );
+        // the judges: one evidence (green on main; fix1027f_1b's rule)
+        fresh_d1(&w.d1).await;
+        let d1_row = fold9_row(&w.d1, &hop).unwrap();
+        assert_eq!(
+            (d1_row.0.as_str(), d1_row.2["chainProbe"].clone()),
+            ("unbound", json!("spent")),
+            "{d1_row:?}"
+        );
+        assert_eq!(
+            fold9_judgement(&fold9_row(&w.actor, &hop).unwrap()),
+            fold9_judgement(&d1_row),
+            "the actor's row is the fresh D1 judgement's"
+        );
+        // /utxo-status: the same row
+        let after = utxo_status(&w.d1, FOLD9_HOP, 0);
+        assert_eq!(
+            (
+                after["known"].clone(),
+                after["spent"].clone(),
+                after["spendingTxid"].clone(),
+                after["spentSource"].clone(),
+                after["beltSpentConfirmed"].clone(),
+                after["spentConfirmed"].clone(),
+                after["lock"]["word"].clone(),
+                after["lock"]["txid"].clone(),
+            ),
+            (
+                json!(true),
+                json!(true),
+                json!(spender),
+                json!("belt"),
+                json!(true),
+                json!(false),
+                json!("locked"),
+                json!(spender),
+            ),
+            "/utxo-status after the belt's find: {after}"
+        );
+    }
+
+    /// (b) What the evidence does not move: a row the index holds SPENT is the index's own word (its spender, no
+    /// `spentSource`); an unknown outpoint stays `known: false, spent: null`; an outpoint with no evidence row is the
+    /// body byte for byte; an evidence row naming no spender changes nothing.
+    #[test]
+    fn fix1093_b_the_evidence_moves_only_an_index_unspent_row_with_a_named_spender() {
+        let memo = |key: &str, spender: Option<&str>| crate::hops_view::ProbeMemo {
+            outpoint: key.into(),
+            probed_at_ms: 7,
+            spent: true,
+            spending_txid: spender.map(str::to_string),
+            spent_confirmed: Some(true),
+            tip_height: Some(9),
+        };
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        let c = "cc".repeat(32);
+        let ops = crate::logic::parse_outpoints(&format!("{a}.0,{b}.1,{c}.2")).unwrap();
+        let row = |txid: &str, vout: u32, spent: bool| crate::logic::PotRecordRow {
+            txid: txid.into(),
+            vout,
+            spent,
+            spending_txid: spent.then(|| "dd".repeat(32)),
+            spent_confirmed: spent,
+            spender_final: None,
+            spender_seen: None,
+            funding_seen: None,
+            funding_seen_by: None,
+        };
+        let entries = crate::logic::assemble_statuses(&ops, &[row(&a, 0, false), row(&b, 1, true)]);
+        assert_eq!(
+            crate::logic::belt_evidence_targets(&entries),
+            vec![(a.clone(), 0)],
+            "only the index-unspent row is read"
+        );
+        let body = crate::logic::utxo_status_body(&entries);
+        assert_eq!(crate::logic::apply_belt_evidence(&body, &[]), body);
+        assert_eq!(
+            crate::logic::apply_belt_evidence(&body, &[memo(&format!("{a}:0"), None)]),
+            body,
+            "no spender named"
+        );
+        let ee = "ee".repeat(32);
+        let all = [
+            memo(&format!("{a}:0"), Some(&ee)),
+            memo(&format!("{b}:1"), Some(&ee)),
+            memo(&format!("{c}:2"), Some(&ee)),
+        ];
+        let out: Value =
+            serde_json::from_str(&crate::logic::apply_belt_evidence(&body, &all)).unwrap();
+        assert_eq!(out[0]["spendingTxid"], json!(ee));
+        assert_eq!(out[0]["spentSource"], json!("belt"));
+        assert_eq!(
+            out[1]["spendingTxid"],
+            json!("dd".repeat(32)),
+            "the index's own spend"
+        );
+        assert!(out[1].get("spentSource").is_none());
+        assert_eq!(
+            (out[2]["known"].clone(), out[2]["spent"].clone()),
+            (json!(false), Value::Null)
+        );
+        assert!(out[2].get("spentSource").is_none());
+    }
+}

@@ -339,10 +339,65 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<AuthState>) -> Result<R
     if let Some(ledger) = read_eviction_ledger(&db, &distinct_db_txids(&outpoints)).await {
         attach_evictions(&mut entries, &ledger);
     }
+    // bsv-low #1093: the belt's evidence of a spend over the rows the index holds unspent (one statement per chunk,
+    // only when such a row was asked); a fault serves the index's answer alone, logged (never a fabricated spend).
+    let mut body = utxo_status_body(&entries);
+    let targets = crate::logic::belt_evidence_targets(&entries);
+    if !targets.is_empty() {
+        match read_belt_evidence(&db, &targets).await {
+            Ok(evidence) => body = crate::logic::apply_belt_evidence(&body, &evidence),
+            Err(e) => console_warn!(
+                "[utxo-status] belt evidence read failed (the index's answer is served alone): {e}"
+            ),
+        }
+    }
     json_response(
-        crate::tracker_host::runtime::outpoint_body(&ctx.env, &utxo_status_body(&entries)).await?,
+        crate::tracker_host::runtime::outpoint_body(&ctx.env, &body).await?,
         200,
     )
+}
+
+/// bsv-low #1093: the belt's evidence rows (`hop_chain_probes` `<txid>:<vout>`) for `targets`, by the judges' own
+/// statement and chunks (`hops_view::probe_evidence_read_chunks`, `probe_memo_read_sql`). `Err` on any fault.
+async fn read_belt_evidence(
+    db: &worker::D1Database,
+    targets: &[(String, u32)],
+) -> std::result::Result<Vec<crate::hops_view::ProbeMemo>, String> {
+    #[derive(Deserialize)]
+    struct EvidenceD1 {
+        outpoint: String,
+        #[serde(rename = "probedAtMs", default)]
+        probed_at_ms: Option<f64>,
+        #[serde(default)]
+        spent: Option<f64>,
+        #[serde(rename = "spendingTxid", default)]
+        spending_txid: Option<String>,
+        #[serde(rename = "spentConfirmed", default)]
+        spent_confirmed: Option<f64>,
+        #[serde(rename = "tipHeight", default)]
+        tip_height: Option<f64>,
+    }
+    let mut out = Vec::new();
+    for keys in crate::hops_view::probe_evidence_read_chunks(targets) {
+        let binds: Vec<JsValue> = keys.iter().map(|k| JsValue::from_str(k)).collect();
+        let rows = db
+            .prepare(crate::hops_view::probe_memo_read_sql(keys.len()))
+            .bind(&binds)
+            .map_err(|e| e.to_string())?
+            .counted_all()
+            .await
+            .and_then(|r| r.results::<EvidenceD1>())
+            .map_err(|e| e.to_string())?;
+        out.extend(rows.into_iter().map(|r| crate::hops_view::ProbeMemo {
+            outpoint: r.outpoint,
+            probed_at_ms: r.probed_at_ms.unwrap_or(0.0) as i64,
+            spent: r.spent.is_some_and(|v| v != 0.0),
+            spending_txid: r.spending_txid,
+            spent_confirmed: r.spent_confirmed.map(|v| v != 0.0),
+            tip_height: r.tip_height.filter(|t| *t >= 0.0).map(|t| t as u64),
+        }));
+    }
+    Ok(out)
 }
 
 /// bsv-low E649 L6: read `pot_evictions` for these lowercase txids. `None` on any fault (the caller omits the

@@ -452,6 +452,69 @@ pub fn utxo_status_body(entries: &[OutpointStatus]) -> String {
     serde_json::Value::Array(arr).to_string()
 }
 
+/// bsv-low #1093 (lane FIX-BELT-INDEX): the source `/utxo-status` names for a spend it serves from the belt's evidence
+/// (`spentSource`), absent on every row the index alone answers.
+pub const SPENT_SOURCE_BELT: &str = "belt";
+
+/// bsv-low #1093: the outpoints whose belt evidence `/utxo-status` reads: the known rows the index holds UNSPENT
+/// (lowercase txid, vout). A spent row is the index's own word and an unknown one stays unknown.
+pub fn belt_evidence_targets(entries: &[OutpointStatus]) -> Vec<(String, u32)> {
+    entries
+        .iter()
+        .filter(|e| e.known && e.spent == Some(false))
+        .map(|e| (e.txid.to_ascii_lowercase(), e.vout))
+        .collect()
+}
+
+/// PURE (bsv-low #1093, lane FIX-BELT-INDEX): ONE evidence of a hop's spend. The belt is the one asker of the chain
+/// explorers for the owed list, and its find of a spend is a durable row, `hop_chain_probes` `<txid>:<vout>`
+/// (`hops_view::probe_evidence_key`, #953), which the D1 judge (`owed_judge::hydrate`) and the actor (its closure's
+/// probe range) both read; `/utxo-status` read the index's `pot_records` row alone, so after a belt find it answered
+/// the hop `spent: false`, lock `free` (beta, 2026-11-04: `95bcf03a…:0`, swept in its own block, nine days on). Now an
+/// entry the index holds known and UNSPENT for which the belt's evidence records a spend is served spent by the
+/// evidence's spender: `spent: true`, `spendingTxid`, `spentSource: "belt"`, `beltSpentConfirmed` (the courier's own
+/// confirmation word, `null` once a reorg clear demoted it), `beltProbedAtMs`. `spentConfirmed` stays `false`: it is
+/// the INDEX's SPV-confirmed flag (`index_proven_spend` names an index proof on it), never a courier's word; and
+/// `spenderSeen` stays the index's own witness of its own pointer (none), so a monitor that trusts a pointer only on
+/// `spenderSeen` or `spentConfirmed` does not trust the belt's. The lock then reads the spender's tracker word
+/// (`locked`, or `spent` on a checked `mined` word), never `free`. An evidence row that records no spend (none is
+/// written: an unspent look deletes it) or names no spender changes nothing. Additive: every other row is byte for
+/// byte as before.
+pub fn apply_belt_evidence(body: &str, evidence: &[crate::hops_view::ProbeMemo]) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+    let mut moved = false;
+    for e in value.as_array_mut().into_iter().flatten() {
+        if e["known"] != true || e["spent"] != false {
+            continue;
+        }
+        let (Some(txid), Some(vout)) = (e["txid"].as_str(), e["vout"].as_u64()) else {
+            continue;
+        };
+        let key = crate::hops_view::probe_evidence_key(&txid.to_ascii_lowercase(), vout as u32);
+        let Some(m) = evidence.iter().find(|m| {
+            m.outpoint == key
+                && m.spent
+                && m.spending_txid.as_deref().is_some_and(|s| !s.is_empty())
+        }) else {
+            continue;
+        };
+        e["spent"] = json!(true);
+        e["spendingTxid"] = json!(m.spending_txid.as_deref().map(str::to_ascii_lowercase));
+        e["spentConfirmed"] = json!(false);
+        e["spentSource"] = json!(SPENT_SOURCE_BELT);
+        e["beltSpentConfirmed"] = json!(m.spent_confirmed);
+        e["beltProbedAtMs"] = json!(m.probed_at_ms);
+        moved = true;
+    }
+    if moved {
+        value.to_string()
+    } else {
+        body.to_string()
+    }
+}
+
 /// The single batched `/utxo-status` SQL: one `(txid = ? AND outputIndex = ?)`
 /// disjunct per requested outpoint (2 binds each, input order). ONE D1 query
 /// answers the whole batch — the query-collapse that replaces per-outpoint
