@@ -227,6 +227,13 @@ pub fn outpoint_ids(value: &Value) -> Vec<String> {
 ///   spender (`unspent_word`: the index's `free` on `/utxo-status`, the couriers' `unspentAsFarAsAsked` on
 ///   `/spent-any`, with `unspent_tier`), and `unknown` where the route could not say. `lost(c)` needs an intended
 ///   spender, which a public outpoint read does not have, so it is never served here.
+///
+///   A spend `/utxo-status` serves from the belt's evidence (`spentSource: "belt"`, bsv-low #1093, its fold 1 ruling
+///   4) takes the same arms by its spender's word, and only two of them: `spent` at tier chain with the path when the
+///   spender's tracker word is a CHECKED `mined` (the chain's word; the belt's spender is one the ladder verified
+///   consumes the outpoint, `results::spender_raw_verifies`), so `creditWord` reads a landing on the expected txid or
+///   `lost` on another, as for an index pointer; otherwise `locked` (`suspended` on `stale`). The index-proof arm never
+///   fires for it: its `spentConfirmed` is `false` (a courier's confirmation is never the index's proof).
 pub fn decorate_outpoints(
     value: &mut Value,
     views: &BTreeMap<String, Value>,
