@@ -4887,6 +4887,7 @@ pub fn tip_derived_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
                 m.remove(k);
             }
             probe_degrade_undone(m);
+            read_degrade_as_judged(m);
         }
         r["facts"] = json!(facts.to_string());
         r
@@ -4976,6 +4977,30 @@ fn probe_degrade_undone(m: &mut serde_json::Map<String, Value>) {
         m.insert("chainProbe".into(), json!("unspent"));
         m.remove("tipMoved");
         m.remove("servedTip");
+    }
+}
+
+/// PURE (APP-L59 fold 1): the `/owed` read's #669 degrade of a STORED courier-dependent press
+/// (`owed_read::project_stored_sweep` over `owed::degrade_stale_sweeps`: `chainProbe` kept as `unspent`, `tipMoved`,
+/// `snapshotTip` the judged tip, the filed `sweepSource` kept, the claim withdrawn, `chainWait: block`) compared as the
+/// judge's own spelling of the same verdict at the later tip (`owed::derive_owed_rows`' predates-tip arm:
+/// `chainProbe: "unspent-predates-tip"`, no `snapshotTip`, no `sweepSource`). The verdict facts (`claim`, `claimable`,
+/// `chainWait`, `chainProbeTip`, `servedTip`) and the row's family, reason and claimable must still be equal for
+/// [`tip_derived_rows`] to read the pair a tip lag.
+fn read_degrade_as_judged(m: &mut serde_json::Map<String, Value>) {
+    let n = |v: Option<&Value>| v.and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
+    let degraded = m.get("chainProbe").and_then(Value::as_str) == Some("unspent")
+        && m.get("tipMoved") == Some(&json!(true))
+        && m.get("chainWait").and_then(Value::as_str) == Some("block")
+        && m.get("claimable") == Some(&json!(false))
+        && matches!(
+            (n(m.get("snapshotTip")), n(m.get("servedTip"))),
+            (Some(judged), Some(served)) if judged < served
+        );
+    if degraded {
+        m.insert("chainProbe".into(), json!("unspent-predates-tip"));
+        m.remove("snapshotTip");
+        m.remove("sweepSource");
     }
 }
 

@@ -361,8 +361,6 @@ const OWED_893_PLANS: &[(&str, &str, &[&str])] = &[
     ("owed tip range", low_app_layer::owed_judge::MARK_TIP_SQL, &["idx_owed_rows_gate"]),
     ("owed tip sweeps", low_app_layer::owed_judge::DATE_SWEEPS_SQL, &["idx_owed_rows_sweep"]),
     ("owed tipless rows", low_app_layer::owed_judge::MARK_UNTIPPED_SQL, &["idx_owed_rows_untipped"]),
-    // bsv-low #1087: Phase C, the block re-judges the actors' courier-dependent sweeps judged below it
-    ("owed tip sweep asks", low_app_layer::owed_judge::MARK_SWEEP_ASKS_SQL, &["sqlite_autoindex_owed_belt_state_1"]),
     ("owed belt walk", low_app_layer::owed_belt::BELT_IDENTITIES_SQL, &["idx_owed_rows_belt_turn"]),
     ("owed belt due rows", low_app_layer::owed_belt::BELT_DUE_SQL, &["idx_owed_rows_belt_turn"]),
     // the second delta lens's D2-M1: the block-dated courier-only sweeps first, on the tip's own scoped index
