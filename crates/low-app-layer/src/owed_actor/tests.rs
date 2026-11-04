@@ -14480,8 +14480,9 @@ fn fix1009_a_the_captured_pair_is_a_tip_lag_held_by_lag() {
 
 /// (fix1009_b) THE RULE IS NARROW. At the same two tips, a pair whose verdict (family), press (`claimable`, the
 /// claim) or reason differs is still a diff; so is a probe-less `index-unspent` (no `tipMoved`) against a corroborated
-/// `unspent`, a degrade whose `chainProbeTip` differs from the other side's, and a degrade whose `servedTip` is not
-/// past its `chainProbeTip`. Green on 2a0de260 (the guard against a rule that reads every chainProbe move a lag).
+/// `unspent` and a degrade whose `servedTip` is not past its `chainProbeTip` (a degrade whose `chainProbeTip` alone
+/// differs is a tip lag since FIX-COMPARE-TIPFACTS, bsv-low #1094). Green on 2a0de260 (the guard against a rule that
+/// reads every chainProbe move a lag).
 #[test]
 fn fix1009_b_a_verdict_or_press_difference_at_two_tips_is_still_a_diff() {
     let op = "b89b0e34:0".to_string();
@@ -14522,10 +14523,6 @@ fn fix1009_b_a_verdict_or_press_difference_at_two_tips_is_still_a_diff() {
             }),
         ),
         (
-            "chainProbeTip",
-            edit(&|_, a| facts(a, "chainProbeTip", json!(973_421))),
-        ),
-        (
             "servedTip not past",
             edit(&|d, _| facts(d, "servedTip", json!(973_422))),
         ),
@@ -14545,6 +14542,13 @@ fn fix1009_b_a_verdict_or_press_difference_at_two_tips_is_still_a_diff() {
             "{name}: {row:?}"
         );
     }
+    // FIX-COMPARE-TIPFACTS (bsv-low #1094): a degrade whose `chainProbeTip` alone differs from the other side's was a
+    // diff here; `chainProbeTip` is a tip-dating fact ([`crate::owed_actor::TIP_FACTS`]), never a difference by
+    // itself, so the pair is the tip lag of the captured case.
+    let (d1, actor) = edit(&|_, a| facts(a, "chainProbeTip", json!(973_421)));
+    let view = fix1009_view(&d1, &actor);
+    assert_eq!(view["diff"], json!([]), "chainProbeTip: {view}");
+    assert_eq!(view["tipLag"], json!([op]), "chainProbeTip: {view}");
 }
 
 /// FIX-1018 (bsv-low #1018, L56's S4): A RE-JUDGE NEVER MOVES AN OVERDUE ROW'S BELT DATE FORWARD WITHOUT ITS ASK.
