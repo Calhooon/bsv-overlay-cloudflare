@@ -24260,4 +24260,107 @@ mod fix1093 {
         );
         assert!(out[2].get("spentSource").is_none());
     }
+
+    /// (c) RULING 2, through the shipped [`compare::fresh_compare`] over the frozen fleet's whale (past
+    /// [`compare::FRESH_COMPARE_GAMES_MAX`] games, partial): the stored compare holds a COUNTED difference (beta's row:
+    /// `held: false`, the D1 side `hop-stranded` claimable, `staleD1`) in a game this compare's window leaves out. The
+    /// compare judges that game FIRST, so the difference is read again over a fresh D1 judgement of the record as it
+    /// stands (after the belt's find, both judges' one evidence), never counted again unread. RED on main (no carried
+    /// game passed to the pick): the game is not among `judgedGames`, and the re-read carries the count as stored.
+    #[tokio::test]
+    async fn fix1093_c_a_carried_counted_difference_is_judged_first() {
+        use std::collections::BTreeSet;
+        let f = fixtures()
+            .into_iter()
+            .find(|f| f.name == "d1_fleet")
+            .unwrap();
+        let d1 = d1_judge(&f).await;
+        let port = Fix986 {
+            d1: &d1,
+            actors: BTreeMap::new(),
+            judges: true,
+            die_after: Cell::new(u32::MAX),
+        };
+        let mut whale = None;
+        for id in &f.identities {
+            let view = compare::fresh_compare(&port, id, Err("no actor (pin)".into()))
+                .await
+                .unwrap();
+            if view["d1"]["games"]["partial"] == true {
+                whale = Some((id.clone(), view));
+                break;
+            }
+        }
+        let (id, base) = whale.expect("a partial identity in the fleet");
+        let judged: BTreeSet<String> = base["d1"]["games"]["judgedGames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g.as_str().unwrap().to_string())
+            .collect();
+        let all: Vec<String> = d1
+            .conn
+            .prepare(compare::COMPARE_GAMES_SQL)
+            .unwrap()
+            .query_map(rusqlite::params![id, 4_096], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let left_out = all
+            .iter()
+            .map(|g| g.to_ascii_lowercase())
+            .find(|g| !judged.contains(g))
+            .expect("a game the partial compare left out");
+        let counted = json!([{"outpoint": format!("{}:0", "95".repeat(32)), "held": false,
+            "fields": {"row": {"actor": "absent", "d1": "present"}, "family": {"d1": "hop-stranded"}},
+            "gameId": left_out}]);
+        d1.conn
+            .execute(
+                "INSERT INTO owed_actor_compare(identity,comparedAtMs,diffCount,staleD1Count,outpoints,partial) VALUES (?1,?2,1,1,?3,1)",
+                rusqlite::params![id, NOW_MS as i64, counted.to_string()],
+            )
+            .unwrap();
+        let view = compare::fresh_compare(&port, &id, Err("no actor (pin)".into()))
+            .await
+            .unwrap();
+        let games = view["d1"]["games"]["judgedGames"].as_array().unwrap();
+        assert_eq!(
+            games.first(),
+            Some(&json!(left_out)),
+            "the carried counted difference's game is judged first"
+        );
+        assert_eq!(games.len(), compare::FRESH_COMPARE_GAMES_MAX);
+        let mut answered = view.clone();
+        answered["actor"] = json!({"rows": [], "bootstrapped": true});
+        let raw = compare::compare_row_of(&id, NOW_MS as i64, Ok(&answered));
+        assert!(raw.judged_games.unwrap().contains(&left_out));
+    }
+
+    /// (d) Ruling 2's bound: the carried counted games are the counted entries' (never a held, pending or cleared
+    /// one), distinct, in stored order, at most half a window, so the forward walk keeps the other half.
+    #[test]
+    fn fix1093_d_the_carried_games_are_the_counted_ones_bounded_to_half_a_window() {
+        let mut prior = vec![
+            json!({"outpoint": "a:0", "held": true, "gameId": "held"}),
+            json!({"outpoint": "b:0", "held": true, "pendingReread": true, "gameId": "pending"}),
+            json!({"outpoint": "c:0", "held": false, "heldByApply": true, "gameId": "cleared"}),
+            json!({"outpoint": "d:0", "held": false, "gameId": "G0"}),
+            json!({"outpoint": "e:0", "held": false, "gameId": "g0"}),
+        ];
+        for n in 1..100 {
+            prior.push(
+                json!({"outpoint": format!("x{n}:0"), "held": false, "gameId": format!("g{n}")}),
+            );
+        }
+        let games = compare::carried_counted_games(&Value::Array(prior));
+        assert_eq!(games.len(), compare::COMPARE_CARRIED_FIRST_MAX);
+        assert_eq!(
+            compare::COMPARE_CARRIED_FIRST_MAX,
+            compare::FRESH_COMPARE_GAMES_MAX / 2
+        );
+        assert_eq!(&games[..3], &["g0".to_string(), "g1".into(), "g2".into()]);
+        assert!(!games
+            .iter()
+            .any(|g| ["held", "pending", "cleared"].contains(&g.as_str())));
+    }
 }

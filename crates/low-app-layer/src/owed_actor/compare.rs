@@ -43,6 +43,48 @@ pub const PHASE_C_NAME: &str = "owed-actor:phase-c";
 pub const PHASE_C_READ_SQL: &str =
     "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:phase-c'";
 
+/// bsv-low #1093: is this stored compare entry a COUNTED difference (no hold, no pending re-read, no clear)? The one
+/// predicate [`classify_reread`] and [`carried_counted_games`] read.
+pub fn is_counted_entry(p: &Value) -> bool {
+    p["held"] == false
+        && p["pendingReread"] != true
+        && p["heldByApply"] != true
+        && p["judgeMoved"] != true
+        && p["bothMoved"] != true
+}
+
+/// bsv-low #1093 (lane FIX-BELT-INDEX, ruling 2): the most games of carried counted differences one compare judges
+/// first, half its window, so the forward walk keeps at least the other half and a lap always completes.
+pub const COMPARE_CARRIED_FIRST_MAX: usize = FRESH_COMPARE_GAMES_MAX / 2;
+
+/// PURE (bsv-low #1093, ruling 2): the games of the stored compare's COUNTED differences ([`is_counted_entry`]), in
+/// stored order, distinct, at most [`COMPARE_CARRIED_FIRST_MAX`]. A partial compare carries a counted difference whose
+/// game it did not judge (FIX-1056-FOLD-1's rule: a difference not judged is never a clear), so before this the
+/// difference was counted again, unread, on every compare until the lap's window reached its game (beta, 2026-11-04:
+/// `030d9e9f…`'s `95bcf03a…:0`, 177 games in windows of 64, the D1 side `hop-stranded` claimable judged BEFORE the
+/// belt's find, `staleD1 1`, counted on every compare of the lap after the find). Now [`fresh_compare`] judges these
+/// games first, beside the pending re-reads' (FIX-1056), so a counted difference is always the reading of a FRESH D1
+/// judgement over the evidence the record holds at that compare, never a stored or earlier one. Past the bound the
+/// rest are judged in their own window, as before.
+pub fn carried_counted_games(prior: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in prior.as_array().into_iter().flatten() {
+        if out.len() >= COMPARE_CARRIED_FIRST_MAX {
+            break;
+        }
+        if !is_counted_entry(p) {
+            continue;
+        }
+        if let Some(g) = p["gameId"].as_str().filter(|g| !g.is_empty()) {
+            let g = g.to_ascii_lowercase();
+            if !out.contains(&g) {
+                out.push(g);
+            }
+        }
+    }
+    out
+}
+
 /// The games one compare judges ([`pick_games_keyset`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GamePick {
@@ -377,13 +419,16 @@ pub async fn fresh_compare(
                 (Lap::default(), 0, 0)
             }
         });
-    let pending_games: Vec<String> = prior
+    let mut pending_games: Vec<String> = prior
         .as_array()
         .into_iter()
         .flatten()
         .filter(|p| p["pendingReread"] == true)
         .filter_map(|p| p["gameId"].as_str().map(str::to_string))
         .collect();
+    // bsv-low #1093 (ruling 2): a COUNTED difference carried from an earlier compare is re-judged before it is counted
+    // again: its game is judged first, beside the pending ones.
+    pending_games.extend(carried_counted_games(&prior));
     let actor_rows: Vec<Value> = actor
         .as_ref()
         .ok()
@@ -1087,13 +1132,7 @@ pub fn classify_reread(
             None => row.games.contains_key(key),
         }
     };
-    let counted_entry = |p: &Value| {
-        p["held"] == false
-            && p["pendingReread"] != true
-            && p["heldByApply"] != true
-            && p["judgeMoved"] != true
-            && p["bothMoved"] != true
-    };
+    let counted_entry = is_counted_entry;
     // Counted differences (standing, then the cleared ones a judge moved), pending ones, then the named-only ones.
     let mut counted: Vec<Value> = Vec::new();
     let mut moved: Vec<Value> = Vec::new();
