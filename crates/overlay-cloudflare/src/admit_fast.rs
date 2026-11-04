@@ -9474,7 +9474,7 @@ mod fix_d1_storm {
             "inside the window the door does not see it"
         );
         // the write-side guard after the write reads the subject's row unmemoised: it catches it
-        let guard = open.borrow().iter().any(|t| *t == late).then(ev);
+        let guard = open.borrow().contains(&late).then(ev);
         assert_eq!(guard, Some(ev()));
         // a memo read that faults: Err, nothing memoised, the next submit reads again
         let memo = RefCell::new(DoorOpenSetMemo::default());
