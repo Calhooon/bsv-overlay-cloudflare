@@ -9172,16 +9172,17 @@ async fn fold15_a_the_reconcile_compares_fresh_with_fresh_and_the_route_names_a_
     fold15_bootstrap(&d1, &old, &id, TIP).await;
     let (d1_rows, actor_rows) = (fold15_rows(&d1, &id, &game), fold15_rows(&old, &id, &game));
     let view = rows_view(&id, Ok(json!({ "rows": actor_rows })), &d1_rows, None, None);
+    // FIX-COMPARE-FACTS (bsv-low #1095): the gated row's `blocksToGate` is a fact; one verdict at two tips is no
+    // difference (`factsDiffer`), counted a tip lag apart by `tip_lag_rows`.
     assert!(
-        view["tipLag"]
+        view["factsDiffer"]
             .as_array()
             .is_some_and(|a| a.contains(&json!(outpoint))),
         "{}",
-        view["tipLag"]
+        view["factsDiffer"]
     );
-    assert_eq!(view["diff"], json!([]), "only a tip lag: {}", view["diff"]);
-    assert_eq!(view["tipLagTips"]["actor"], json!([TIP]));
-    assert_eq!(view["tipLagTips"]["d1"], json!([TIP + 3]));
+    assert_eq!(view["diff"], json!([]), "one verdict: {}", view["diff"]);
+    assert!(tip_lag_rows(&d1_rows, &actor_rows).contains(&outpoint));
     // A verdict difference beside the lag is still a diff.
     let mut moved = actor_rows.clone();
     for r in moved
@@ -9901,8 +9902,9 @@ fn fix963_a_rows_equal_save_the_presence_stamp_compare_equal() {
     assert!(STAMP_FACTS.contains(&("spenderPresence", "at")));
 }
 
-/// (fix963_b) bsv-low #963: the presence is still compared by `{word, tier, source}`: a change of any of them is a
-/// diff (the judgement), stamps equal or not.
+/// (fix963_b) bsv-low #963: the presence is read by `{word, tier, source}`. FIX-COMPARE-FACTS (bsv-low #1095): the
+/// presence is a fact, the judge's explanation, so a change of any of them with one verdict is never a diff: it is
+/// counted apart (`factsDiffer`); the press it moves (`claimable`) is the diff.
 #[test]
 fn fix963_b_the_presence_word_tier_and_source_still_differ() {
     let p = |word: &str, tier: &str, source: &str, at: i64| json!({"word": word, "tier": tier, "source": source, "at": at});
@@ -9912,7 +9914,18 @@ fn fix963_b_the_presence_word_tier_and_source_still_differ() {
         p("spent", "confirmed", "spent-any", 2),
         p("spent", "pending", "courier", 2),
     ] {
-        let actor = fix963_row(other.clone());
+        let mut actor = fix963_row(other.clone());
+        assert_eq!(
+            diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)),
+            Vec::<String>::new(),
+            "{other}"
+        );
+        assert_eq!(
+            facts_differ_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)),
+            vec!["b084427d:0".to_string()],
+            "{other}"
+        );
+        actor["claimable"] = json!(if actor["claimable"] == json!(1) { 0 } else { 1 });
         assert_eq!(
             diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)),
             vec!["b084427d:0".to_string()],
@@ -9923,13 +9936,13 @@ fn fix963_b_the_presence_word_tier_and_source_still_differ() {
             rows_digest(std::slice::from_ref(&actor))
         );
     }
-    // a presence on one side only is a diff (no stamp to drop makes it equal)
+    // a presence on one side only is a fact too (no stamp to drop makes it equal; counted apart)
     let mut none = fix963_row(Value::Null);
     let mut f: Value = serde_json::from_str(none["facts"].as_str().unwrap()).unwrap();
     f.as_object_mut().unwrap().remove("spenderPresence");
     none["facts"] = json!(f.to_string());
     assert_eq!(
-        diff_rows(std::slice::from_ref(&d1), &[none]),
+        facts_differ_rows(std::slice::from_ref(&d1), &[none]),
         vec!["b084427d:0".to_string()]
     );
 }
@@ -14424,65 +14437,43 @@ fn fix1009_view(d1: &Value, actor: &Value) -> Value {
     view
 }
 
-/// (fix1009_a) THE CAPTURED PAIR IS A TIP LAG. `tip_derived_rows` names it (both orders: the reconcile's stored and
-/// fresh actor rows meet the same shape), the route serves it under `tipLag` with both tips and no `diff`, and the
-/// fleet compare's row counts it held by lag (`identitiesHeldByLag`), never differing. RED on 2a0de260: the route's
-/// `diff` names `b89b0e34:0` and the stored row's `diffCount` is 1.
+/// (fix1009_a) THE CAPTURED PAIR IS ONE VERDICT. Since FIX-COMPARE-FACTS (bsv-low #1095) a fact's spelling is never a
+/// difference: the pair (one family, claim, claimable, sats and reason; `chainProbe`, `tipMoved`, `servedTip` spelled
+/// by each judge's path) reads equal on the pure compare, the route (`factsDiffer`, no `diff`, no `tipLag`) and the
+/// fleet compare's row (nothing counted, nothing held); its two judged tips are still counted apart
+/// ([`tip_lag_rows`]). RED on 2a0de260: the route's `diff` names `b89b0e34:0` and the stored row's `diffCount` is 1.
 #[test]
 fn fix1009_a_the_captured_pair_is_a_tip_lag_held_by_lag() {
     let (d1, actor) = (fix1009_row(true), fix1009_row(false));
     let op = "b89b0e34:0".to_string();
     assert_eq!(
         diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)),
+        Vec::<String>::new(),
+        "one verdict"
+    );
+    assert_eq!(
+        tip_lag_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)),
         vec![op.clone()],
-        "the pair differs before the rule"
-    );
-    assert_eq!(
-        tip_derived_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)),
-        vec![op.clone()]
-    );
-    assert_eq!(
-        tip_derived_rows(std::slice::from_ref(&actor), std::slice::from_ref(&d1)),
-        vec![op.clone()]
+        "its two tips counted apart"
     );
     let view = fix1009_view(&d1, &actor);
     assert_eq!(view["diff"], json!([]), "{}", view["diff"]);
-    assert_eq!(view["tipLag"], json!([op]));
-    assert_eq!(view["tipLagTips"]["d1"], json!([973_423]));
-    assert_eq!(view["tipLagTips"]["actor"], json!([973_422]));
+    assert_eq!(view["tipLag"], json!([]));
+    assert_eq!(view["factsDiffer"], json!([op]));
     let row = compare::compare_row_of("02a4b3a6", 1, Ok(&view));
     assert_eq!(
         (row.diff_count, row.held_by_lag_count, row.tip_lag_count),
-        (Some(0), Some(1), Some(1)),
+        (Some(0), Some(0), Some(0)),
         "{row:?}"
     );
-    assert_eq!(row.outpoints[0]["outpoint"], json!(op));
-    assert_eq!(row.outpoints[0]["held"], json!(true));
-    assert_eq!(row.outpoints[0]["tipLag"], json!(true));
-    // The fleet's answer: held by lag, not differing.
-    let page = vec![
-        json!({"identity": "02a4b3a6", "comparedAtMs": 1, "diffCount": 0, "heldByLagCount": 1,
-        "staleD1Count": 0, "tipLagCount": 1, "outpoints": row.outpoints.to_string(), "partial": 0}),
-    ];
-    let answer = compare::compare_answer(
-        &json!({"identities": 1, "diffs": 0, "heldByLag": 1, "staleD1": 0, "faults": 0, "oldest": 1, "newest": 1}),
-        &page,
-        &json!({}),
-        2,
-        false,
-    );
-    assert_eq!(answer["diffs"], json!([]));
-    assert_eq!(
-        answer["heldByLag"][0]["outpoints"][0]["outpoint"],
-        json!(op)
-    );
+    assert_eq!(row.outpoints, json!([]));
 }
 
 /// (fix1009_b) THE RULE IS NARROW. At the same two tips, a pair whose verdict (family), press (`claimable`, the
-/// claim) or reason differs is still a diff; so is a probe-less `index-unspent` (no `tipMoved`) against a corroborated
-/// `unspent` and a degrade whose `servedTip` is not past its `chainProbeTip` (a degrade whose `chainProbeTip` alone
-/// differs is a tip lag since FIX-COMPARE-TIPFACTS, bsv-low #1094). Green on 2a0de260 (the guard against a rule that
-/// reads every chainProbe move a lag).
+/// claim) or reason differs is still a diff. FIX-COMPARE-FACTS (bsv-low #1095): a pair whose facts alone differ (a
+/// probe-less `index-unspent` against a corroborated `unspent`, a degrade whose `servedTip` is not past its
+/// `chainProbeTip`, a `spent` probe word, a `chainProbeTip`) is one verdict, counted apart (`factsDiffer`). Green on
+/// 2a0de260 for its verdict cases (the guard against a rule that reads a verdict move a lag).
 #[test]
 fn fix1009_b_a_verdict_or_press_difference_at_two_tips_is_still_a_diff() {
     let op = "b89b0e34:0".to_string();
@@ -14515,6 +14506,19 @@ fn fix1009_b_a_verdict_or_press_difference_at_two_tips_is_still_a_diff() {
             "reason",
             edit(&|_, a| a["reason"] = json!("another reason")),
         ),
+    ];
+    for (name, (d1, actor)) in cases {
+        let view = fix1009_view(&d1, &actor);
+        assert_eq!(view["diff"], json!([op]), "{name}: {}", view["diff"]);
+        assert_eq!(view["tipLag"], json!([]), "{name}");
+        let row = compare::compare_row_of("02a4b3a6", 1, Ok(&view));
+        assert_eq!(
+            (row.diff_count, row.held_by_lag_count),
+            (Some(1), Some(0)),
+            "{name}: {row:?}"
+        );
+    }
+    let facts_only: Vec<(&str, (Value, Value))> = vec![
         (
             "probe-less",
             edit(&|d, _| {
@@ -14530,25 +14534,16 @@ fn fix1009_b_a_verdict_or_press_difference_at_two_tips_is_still_a_diff() {
             "spent probe",
             edit(&|_, a| facts(a, "chainProbe", json!("spent"))),
         ),
+        (
+            "chainProbeTip",
+            edit(&|_, a| facts(a, "chainProbeTip", json!(973_421))),
+        ),
     ];
-    for (name, (d1, actor)) in cases {
+    for (name, (d1, actor)) in facts_only {
         let view = fix1009_view(&d1, &actor);
-        assert_eq!(view["diff"], json!([op]), "{name}: {}", view["diff"]);
-        assert_eq!(view["tipLag"], json!([]), "{name}");
-        let row = compare::compare_row_of("02a4b3a6", 1, Ok(&view));
-        assert_eq!(
-            (row.diff_count, row.held_by_lag_count),
-            (Some(1), Some(0)),
-            "{name}: {row:?}"
-        );
+        assert_eq!(view["diff"], json!([]), "{name}: {view}");
+        assert_eq!(view["factsDiffer"], json!([op]), "{name}: {view}");
     }
-    // FIX-COMPARE-TIPFACTS (bsv-low #1094): a degrade whose `chainProbeTip` alone differs from the other side's was a
-    // diff here; `chainProbeTip` is a tip-dating fact ([`crate::owed_actor::TIP_FACTS`]), never a difference by
-    // itself, so the pair is the tip lag of the captured case.
-    let (d1, actor) = edit(&|_, a| facts(a, "chainProbeTip", json!(973_421)));
-    let view = fix1009_view(&d1, &actor);
-    assert_eq!(view["diff"], json!([]), "chainProbeTip: {view}");
-    assert_eq!(view["tipLag"], json!([op]), "chainProbeTip: {view}");
 }
 
 /// FIX-1018 (bsv-low #1018, L56's S4): A RE-JUDGE NEVER MOVES AN OVERDUE ROW'S BELT DATE FORWARD WITHOUT ITS ASK.
@@ -18631,12 +18626,22 @@ mod fix1041 {
             Vec::<String>::new(),
             "the suffix is the clock, not the judgement"
         );
-        // the base word is still compared: an `unspent` against a `spent` stays a diff
+        // FIX-COMPARE-FACTS (bsv-low #1095): the base word is a fact, never a difference by itself (an `unspent`
+        // against a `spent` with one verdict is counted apart); the press it moves is the difference
         let mut spent = actor.clone();
         for r in &mut spent {
             if r["outpoint"] == key.as_str() {
                 let mut f: Value = serde_json::from_str(r["facts"].as_str().unwrap()).unwrap();
                 f["chainProbe"] = json!("spent");
+                r["facts"] = json!(f.to_string());
+            }
+        }
+        assert_eq!(diff_rows(&d1, &spent), Vec::<String>::new());
+        assert_eq!(facts_differ_rows(&d1, &spent), vec![key.clone()]);
+        for r in &mut spent {
+            if r["outpoint"] == key.as_str() {
+                let mut f: Value = serde_json::from_str(r["facts"].as_str().unwrap()).unwrap();
+                f["claim"] = Value::Null;
                 r["facts"] = json!(f.to_string());
             }
         }
@@ -23672,8 +23677,10 @@ mod fix1087 {
             "the compare equal across the block: {}",
             view["diffFields"]
         );
-        // the two judged tips' spellings of one verdict: the tip-lag class, never a STOP
-        assert_eq!(view["tipLag"], json!([format!("{HOP}:0")]), "{view}");
+        // the two judged tips' spellings of one verdict: one verdict, its facts counted apart (FIX-COMPARE-FACTS, bsv-low
+        // #1095: a fact's spelling is never a difference, so no tip lag is needed to excuse it)
+        assert_eq!(view["tipLag"], json!([]), "{view}");
+        assert_eq!(view["factsDiffer"], json!([format!("{HOP}:0")]), "{view}");
         // RED with the projection off: the stored press against the fresh chain wait is a difference
         let unprojected = diff_rows(&project_compared_rows_off(&d1).await, &actor);
         assert_eq!(unprojected, vec![format!("{HOP}:0")]);
@@ -23850,7 +23857,7 @@ mod fix1085 {
 }
 
 /// FIX-COMPARE-TIPFACTS (bsv-low #1094; beta at c42128c9, three identities): the TIP-DATING FACTS
-/// ([`crate::owed_actor::TIP_FACTS`]: `snapshotTip`, `chainProbeTip`, `servedTip`, `tipMoved`, `tipUnknown`) are never a
+/// (`snapshotTip`, `chainProbeTip`, `servedTip`, `tipMoved`, `tipUnknown`) are never a
 /// compare difference by themselves. The actor dates its stored courier-dependent rows (`facts.snapshotTip`, the tip a
 /// stored row was judged at) where the fresh D1 judgement has no snapshot to date; the pair differed in that field alone
 /// (`diff [ff97e17d..:0]`, `tipLag []`) and the fleet compare never read zero. RED on c42128c9: (a) `diff` names the
@@ -23908,13 +23915,20 @@ mod fix1094 {
         let v = view(&d1, &actor);
         assert_eq!(v["diff"], json!([]), "{v}");
         assert_eq!(v["tipLag"], json!([]), "{v}");
-        assert_eq!(v["tipFacts"], json!([O]), "counted apart: {v}");
+        assert_eq!(v["factsDiffer"], json!([O]), "counted apart: {v}");
         assert_eq!(
             v["digests"]["d1"], v["digests"]["actor"],
             "one digest of one verdict"
         );
         // every tip fact, on either side, alone
-        for k in crate::owed_actor::TIP_FACTS {
+        // FIX-COMPARE-FACTS (bsv-low #1095; R277's LOW-1): each of the five, named, alone
+        for k in [
+            "snapshotTip",
+            "chainProbeTip",
+            "servedTip",
+            "tipMoved",
+            "tipUnknown",
+        ] {
             let mut f = base_facts();
             f[k] = json!(974_000);
             assert!(
@@ -23939,7 +23953,7 @@ mod fix1094 {
         );
         let v = view(&d1, &actor);
         assert_eq!(v["diff"], json!([O]), "{v}");
-        assert_eq!(v["tipFacts"], json!([]), "{v}");
+        assert_eq!(v["factsDiffer"], json!([]), "{v}");
         // the claim alone, the sats alone, and the row's absence still differ beside a tip fact
         let mut claim = dated(base_facts());
         claim["claim"] = Value::Null;
@@ -23979,7 +23993,7 @@ mod fix1094 {
         let answer = compare::actor_answer(&port, one).await;
         let v = compare::fresh_compare(&d1, one, answer).await.unwrap();
         assert_eq!(v["diff"], json!([]), "{}", v["diffFields"]);
-        assert_eq!(v["tipFacts"].as_array().map(Vec::len), Some(1), "{v}");
+        assert_eq!(v["factsDiffer"].as_array().map(Vec::len), Some(1), "{v}");
         let t = NOW_MS as i64;
         for at in [t, t + 5_000, t + 10_000] {
             let r = compare::ring_tick(&port, at, 0, 1, 16, || 0).await.unwrap();
@@ -24524,5 +24538,212 @@ mod fix1093 {
         assert!(!games
             .iter()
             .any(|g| ["held", "pending", "cleared"].contains(&g.as_str())));
+    }
+}
+
+/// FIX-COMPARE-FACTS (bsv-low #1095; beta at ad9100cf, four identities): THE COMPARE'S FIELDS ARE THE VERDICT FIELDS.
+/// The actor spells its probe `unspent` (the belt's word) where the fresh D1 judgement spells `index-unspent` or
+/// `unspent-predates-tip` (the index's), and the actor carries the filed sweep's facts (`sweepSource`, `sweepTxid`,
+/// `sweepRawHex`) the D1 judgement lacks; every verdict field (the row, `family`, `claim`, `claimable`, `sats`,
+/// `reason`) is equal, and the ring counted them. A fact is the judge's explanation, never a difference by itself;
+/// such pairs are counted apart (`factsDiffer`). RED on ad9100cf: (a) `diff` names the outpoint, (c) the fleet reads
+/// every identity differing.
+mod fix1095 {
+    use super::*;
+
+    const O: &str = "8655d53d00000000000000000000000000000000000000000000000000000000:0";
+
+    fn row(facts: Value, claimable: i64) -> Value {
+        json!({
+            "outpoint": O,
+            "family": "hop-stranded",
+            "gameId": "g1095",
+            "sats": 20190,
+            "opponentIdentity": "other",
+            "atHeight": Value::Null,
+            "reason": "the hop is index-unspent",
+            "facts": facts.to_string(),
+            "claimable": claimable,
+            "probeTip": 974_009,
+        })
+    }
+
+    fn d1_facts(probe: &str) -> Value {
+        json!({"claim": "sweep-hop", "claimable": true, "status": "unspent", "chainProbe": probe})
+    }
+
+    /// The actor's spelling of the same verdict: the belt's probe word, its snapshot tip and the filed sweep's facts.
+    fn actor_facts() -> Value {
+        json!({
+            "claim": "sweep-hop",
+            "claimable": true,
+            "status": "unspent",
+            "chainProbe": "unspent",
+            "snapshotTip": 974_009,
+            "sweepSource": "hopsweep-filing",
+            "sweepTxid": "f7fd5ba5",
+            "sweepRawHex": "0100",
+        })
+    }
+
+    fn view(d1: &Value, actor: &Value) -> Value {
+        rows_view(
+            "02f1fd09",
+            Ok(json!({"rows": [actor], "bootstrapped": true})),
+            std::slice::from_ref(d1),
+            None,
+            None,
+        )
+    }
+
+    /// (a) a pair equal in every verdict field and differing in its facts is EQUAL on the pure compare, the rows
+    /// route's view (no `diff`, one digest, counted `factsDiffer`) and the ring's compare row (no counted difference,
+    /// no outpoint printed with `fields`).
+    #[test]
+    fn fix1095_a_a_pair_differing_only_in_its_facts_is_equal() {
+        for probe in ["index-unspent", "unspent-predates-tip"] {
+            let d1 = row(d1_facts(probe), 1);
+            let actor = row(actor_facts(), 1);
+            assert!(
+                diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)).is_empty(),
+                "{probe}"
+            );
+            let mut v = view(&d1, &actor);
+            assert_eq!(v["diff"], json!([]), "{probe}: {v}");
+            assert_eq!(v["tipLag"], json!([]), "{probe}: {v}");
+            assert_eq!(v["factsDiffer"], json!([O]), "counted apart: {v}");
+            assert_eq!(
+                v["digests"]["d1"], v["digests"]["actor"],
+                "one digest of one verdict"
+            );
+            v["heldByLag"] = json!([]);
+            v["diffFields"] = json!([]);
+            let r = compare::compare_row_of("02f1fd09", NOW_MS as i64, Ok(&v));
+            assert_eq!(r.diff_count, Some(0), "{:?}", r.outpoints);
+            assert_eq!(r.outpoints, json!([]), "nothing printed");
+        }
+    }
+
+    /// (b) a verdict field beside the same facts still differs, and the printed fields are the verdict fields alone.
+    #[test]
+    fn fix1095_b_a_verdict_field_beside_the_facts_still_differs() {
+        let d1 = row(d1_facts("index-unspent"), 1);
+        let moved: Vec<(&str, Value)> = vec![
+            ("claimable", {
+                let mut a = row(actor_facts(), 0);
+                let mut f = actor_facts();
+                f["claimable"] = json!(false);
+                a["facts"] = json!(f.to_string());
+                a
+            }),
+            ("facts.claim", {
+                let mut f = actor_facts();
+                f["claim"] = Value::Null;
+                row(f, 1)
+            }),
+            ("family", {
+                let mut a = row(actor_facts(), 1);
+                a["family"] = json!("unbound");
+                a
+            }),
+            ("sats", {
+                let mut a = row(actor_facts(), 1);
+                a["sats"] = json!(20191);
+                a
+            }),
+            ("reason", {
+                let mut a = row(actor_facts(), 1);
+                a["reason"] = json!("another sentence");
+                a
+            }),
+        ];
+        for (field, actor) in moved {
+            assert_eq!(
+                diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)),
+                vec![O.to_string()],
+                "{field}"
+            );
+            let fields =
+                compare::diff_fields(std::slice::from_ref(&d1), std::slice::from_ref(&actor), O);
+            let keys: Vec<&String> = fields.as_object().unwrap().keys().collect();
+            let want: Vec<&str> = if field == "claimable" {
+                vec!["claimable", "facts.claimable"]
+            } else {
+                vec![field]
+            };
+            assert_eq!(
+                keys, want,
+                "{field}: only the verdict fields are printed: {fields}"
+            );
+            let line = diff_detail(
+                std::slice::from_ref(&d1),
+                std::slice::from_ref(&actor),
+                &[O.to_string()],
+            );
+            assert!(
+                !line.contains("chainProbe") && !line.contains("snapshotTip"),
+                "{line}"
+            );
+            let v = view(&d1, &actor);
+            assert_eq!(v["diff"], json!([O]), "{field}: {v}");
+            assert_eq!(v["factsDiffer"], json!([]), "{field}: {v}");
+        }
+        // the row's absence still differs
+        assert_eq!(diff_rows(std::slice::from_ref(&d1), &[]).len(), 1);
+    }
+
+    /// (c) the fleet figure through the rows route's fresh compare, three ring ticks and the standing route: every actor
+    /// row spelled as beta's (the belt's probe word, a snapshot tip, the filed sweep's facts) reads `identitiesDiffering`
+    /// 0; one seat's `sats` moved too is counted.
+    #[tokio::test]
+    async fn fix1095_c_a_fleet_of_fact_spelled_pairs_reads_zero() {
+        let (d1, ids, actors) = fix986_fleet(3).await;
+        fix1046_served_p95(&d1, 1_492);
+        let port = Fix986 {
+            d1: &d1,
+            actors,
+            judges: false,
+            die_after: Cell::new(u32::MAX),
+        };
+        for a in port.actors.values() {
+            a.conn
+                .execute(
+                    "UPDATE owed_rows SET facts=json_set(facts,'$.chainProbe','unspent','$.snapshotTip',974009,'$.sweepSource','hopsweep-filing','$.sweepTxid','f7fd5ba5','$.sweepRawHex','0100')",
+                    [],
+                )
+                .unwrap();
+        }
+        let one = &ids[0];
+        let answer = compare::actor_answer(&port, one).await;
+        let v = compare::fresh_compare(&d1, one, answer).await.unwrap();
+        assert_eq!(v["diff"], json!([]), "{}", v["diffFields"]);
+        assert!(
+            v["factsDiffer"].as_array().is_some_and(|a| !a.is_empty()),
+            "counted apart: {v}"
+        );
+        let t = NOW_MS as i64;
+        for at in [t, t + 5_000, t + 10_000] {
+            let r = compare::ring_tick(&port, at, 0, 1, 16, || 0).await.unwrap();
+            assert_eq!((r.diffs, r.pending_reread), (0, 0), "{r:?}");
+        }
+        let got = compare::read_answer(&d1, "", "", t + 10_001, 1)
+            .await
+            .unwrap();
+        assert_eq!(got["identitiesDiffering"], json!(0), "{got}");
+        assert_eq!(got["identitiesPendingReread"], json!(0), "{got}");
+        port.actors[&ids[1]]
+            .conn
+            .execute("UPDATE owed_rows SET sats=sats+1", [])
+            .unwrap();
+        compare::compare_now(&port, &ids[1], t + 20_000)
+            .await
+            .unwrap();
+        compare::compare_now(&port, &ids[1], t + 30_000)
+            .await
+            .unwrap();
+        let got = compare::read_answer(&d1, "", "", t + 30_001, 1)
+            .await
+            .unwrap();
+        assert_eq!(got["identitiesDiffering"], json!(1), "{got}");
     }
 }
