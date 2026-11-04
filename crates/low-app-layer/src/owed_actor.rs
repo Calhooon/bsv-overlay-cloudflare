@@ -4675,33 +4675,50 @@ pub const CLOCK_SUFFIXES: [(&str, &str); 1] = [("chainProbe", "-stale")];
 /// (`coinWord`, `spenderWord`, `fundingWord`, `tracker`) are stripped at storage and joined at the read, so their
 /// stamps never reach a compare.
 pub const STAMP_FACTS: [(&str, &str); 1] = [("spenderPresence", "at")];
-/// FIX-COMPARE-TIPFACTS (bsv-low #1094): the TIP-DATING FACTS, which state the tips a row was judged, probed and
-/// served at and whether that tip moved or could not be read. They are carried and served on both sides and are never
-/// a compare difference by themselves: the compare's verdict is the verdict fields (the row present or absent, its
-/// family, claim, claimable, sats and the projected sweep status). A stored row the read's projection dates
-/// (`snapshotTip`, the tip a stored press was judged at) and a fresh judgement of the same record (which has no
-/// snapshot to date) differ in these alone and compare EQUAL; a verdict field that differs beside them still differs.
-/// The pairs equal but for them are counted apart ([`tip_fact_rows`], the routes' `tipFacts`).
-pub const TIP_FACTS: [&str; 5] = [
-    "snapshotTip",
-    "chainProbeTip",
-    "servedTip",
-    "tipMoved",
-    "tipUnknown",
+/// FIX-COMPARE-FACTS (bsv-low #1095; it subsumes FIX-COMPARE-TIPFACTS, #1094): THE COMPARE'S FIELDS ARE THE VERDICT
+/// FIELDS. Every press a judge offers or withholds differently moves the row's presence, its `family`, its `claim`
+/// (`facts.claim`), its `claimable`, its `sats` or its `reason`; the row's other columns name its subject (`gameId`,
+/// `opponentIdentity`, `atHeight`: whose money, in which game, landed at which height) and are compared with it. Every
+/// other `facts.*` entry is the judge's EXPLANATION of its verdict, spelled by its own code path (the actor's
+/// `chainProbe: unspent` from the belt's probe against the D1 judge's `index-unspent` from the index; the tip-dating
+/// facts `snapshotTip`, `chainProbeTip`, `servedTip`, `tipMoved`, `tipUnknown`; the filed sweep's `sweepSource`,
+/// `sweepTxid`, `sweepRawHex`): carried and served on both sides, never a compare difference by itself. The pairs
+/// equal in the verdict whose facts differ are counted apart ([`facts_differ_rows`], the routes' `factsDiffer`).
+pub const VERDICT_COLUMNS: [&str; 7] = [
+    "family",
+    "gameId",
+    "sats",
+    "opponentIdentity",
+    "atHeight",
+    "reason",
+    "claimable",
 ];
-/// The facts of a stored row as the compares read them ([`compared_facts_keeping_tips`] less [`TIP_FACTS`]).
-pub fn compared_facts(row: &Value) -> Value {
-    let mut facts = compared_facts_keeping_tips(row);
-    if let Some(m) = facts.as_object_mut() {
-        for k in TIP_FACTS {
-            m.remove(k);
-        }
-    }
-    facts
+/// The verdict fields a stored row keeps in its facts: the press itself (`claim`) and its `claimable` (the column's
+/// source: the `/owed` read's projection moves both).
+pub const VERDICT_FACTS: [&str; 2] = ["claim", "claimable"];
+/// PURE: a stored row's VERDICT ([`VERDICT_COLUMNS`], then [`VERDICT_FACTS`] read from its facts): what every compare
+/// ([`diff_rows`], [`rows_digest`], the printed fields) reads.
+pub fn verdict_of(row: &Value) -> Value {
+    let facts: Value = row["facts"]
+        .as_str()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Null);
+    let mut v: Vec<Value> = VERDICT_COLUMNS.iter().map(|k| row[*k].clone()).collect();
+    v.extend(VERDICT_FACTS.iter().map(|k| facts[*k].clone()));
+    Value::Array(v)
 }
-/// The compared facts with the [`TIP_FACTS`] kept: the tip-lag reading ([`tip_derived_rows`]) undoes the read's and
-/// the judge's degrades by them before they are dropped.
-fn compared_facts_keeping_tips(row: &Value) -> Value {
+/// Is `field` (a printed compare field: a column, `facts.<key>`, or `row`) a verdict field?
+pub fn is_verdict_field(field: &str) -> bool {
+    field == "row"
+        || VERDICT_COLUMNS.contains(&field)
+        || field
+            .strip_prefix("facts.")
+            .is_some_and(|k| VERDICT_FACTS.contains(&k))
+}
+/// The facts of a stored row as the figure reads them ([`facts_differ_rows`]): the judgement, not its clock (the facts
+/// relative to the judge's `now` taken out, so two judges of one record at two instants read the same). Never a
+/// compare difference ([`verdict_of`] is).
+pub fn compared_facts(row: &Value) -> Value {
     let mut facts: Value = row["facts"]
         .as_str()
         .and_then(|s| serde_json::from_str(s).ok())
@@ -4778,8 +4795,8 @@ pub fn rows_view(
             diff_rows(d1, a).into_iter().filter(|o| !lag.contains(o)).collect::<Vec<_>>()
         }),
         "tipLag": actor_rows.as_deref().map(|a| tip_derived_rows(d1, a)),
-        // FIX-COMPARE-TIPFACTS (bsv-low #1094): the pairs equal but for their tip-dating facts, counted apart.
-        "tipFacts": actor_rows.as_deref().map(|a| tip_fact_rows(d1, a)),
+        // FIX-COMPARE-FACTS (bsv-low #1095): the pairs equal in the verdict whose facts differ, counted apart.
+        "factsDiffer": actor_rows.as_deref().map(|a| facts_differ_rows(d1, a)),
         "tipLagTips": actor_rows.as_deref().map(|a| {
             let lag = tip_derived_rows(d1, a);
             json!({"d1": tips_of(d1, &lag), "actor": tips_of(a, &lag)})
@@ -4822,23 +4839,7 @@ pub fn held_by_lag(view: &Value, pending: &[Value]) -> Vec<String> {
 pub fn diff_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
     fn keyed(rows: &[Value]) -> BTreeMap<String, Value> {
         rows.iter()
-            .filter_map(|r| {
-                let k = r["outpoint"].as_str()?.to_string();
-                let facts = compared_facts(r);
-                Some((
-                    k,
-                    json!([
-                        r["family"],
-                        r["gameId"],
-                        r["sats"],
-                        r["opponentIdentity"],
-                        r["atHeight"],
-                        r["reason"],
-                        facts,
-                        r["claimable"]
-                    ]),
-                ))
-            })
+            .filter_map(|r| Some((r["outpoint"].as_str()?.to_string(), verdict_of(r))))
             .collect()
     }
     let (a, b) = (keyed(d1), keyed(actor));
@@ -4884,14 +4885,11 @@ pub fn tip_lag_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
     out
 }
 
-/// PURE (FIX-COMPARE-TIPFACTS, bsv-low #1094): the outpoints on BOTH sides that [`diff_rows`] reads equal whose
-/// [`TIP_FACTS`] differ: the tip-dating facts alone, never a difference (the routes serve the figure as `tipFacts`).
-pub fn tip_fact_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
+/// PURE (FIX-COMPARE-FACTS, bsv-low #1095): the outpoints on BOTH sides that [`diff_rows`] reads equal (one verdict)
+/// whose [`compared_facts`] differ: a fact's spelling alone, never a difference (the routes serve the figure as
+/// `factsDiffer`). It subsumes #1094's `tipFacts` (the tip-dating facts are facts).
+pub fn facts_differ_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
     let differ: BTreeSet<String> = diff_rows(d1, actor).into_iter().collect();
-    let tips = |r: &Value| -> Vec<Value> {
-        let f = compared_facts_keeping_tips(r);
-        TIP_FACTS.iter().map(|k| f[*k].clone()).collect()
-    };
     let actor_by: BTreeMap<&str, &Value> = actor
         .iter()
         .filter_map(|r| Some((r["outpoint"].as_str()?, r)))
@@ -4901,18 +4899,13 @@ pub fn tip_fact_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
         .filter_map(|r| {
             let o = r["outpoint"].as_str()?;
             let a = actor_by.get(o)?;
-            (!differ.contains(o) && tips(r) != tips(a)).then(|| o.to_string())
+            (!differ.contains(o) && compared_facts(r) != compared_facts(a)).then(|| o.to_string())
         })
         .collect();
     out.sort();
     out.dedup();
     out
 }
-
-/// D2-ACTOR-B-FOLD-15 (the eighth delta lens's NEW8-M1): the facts a TIP moves with the record unchanged, beside
-/// `facts.tip` (a [`CLOCK_FACTS`] key) and the `probeTip` column (never compared): a gate's distance and the
-/// tip-unknown flag.
-pub const TIP_DERIVED_FACTS: [&str; 2] = ["blocksToGate", "tipUnknown"];
 
 /// The tip a stored row was judged at: `facts.tip`, else the `probeTip` column (`None`: neither).
 pub fn judged_tip(r: &Value) -> Option<i64> {
@@ -4926,28 +4919,14 @@ pub fn judged_tip(r: &Value) -> Option<i64> {
         .or_else(|| n(&facts["servedTip"]))
 }
 
-/// PURE (D2-ACTOR-B-FOLD-15, NEW8-M1): the outpoints [`diff_rows`] reads different whose difference is ONLY
-/// tip-derived: the row on both sides, equal once [`TIP_DERIVED_FACTS`] are taken out too, and judged at two
-/// different tips ([`judged_tip`]); or (FIX-1049-FOLD-2, fold 3) only the CLOCK's, a landing wait's end between the
-/// two judgements ([`landing_lag`]). A tip lag, never a verdict difference: the operator's route serves them apart
-/// (`tipLag`) and the reconcile counts an actor's own lag apart (`owed_actor_compare_tip_lag_total`).
+/// PURE (D2-ACTOR-B-FOLD-15, NEW8-M1; FIX-1049-FOLD-2, fold 3): the outpoints [`diff_rows`] reads different whose
+/// difference is only the CLOCK's, a landing wait's end between the two judgements ([`landing_lag`]). A tip lag, never
+/// a verdict difference: the operator's route serves them apart (`tipLag`) and the reconcile counts an actor's own lag
+/// apart (`owed_actor_compare_tip_lag_total`). FIX-COMPARE-FACTS (bsv-low #1095): the other arm (a pair judged at two
+/// tips, equal once the tip-derived facts were dropped and the read's and the judge's #669 degrades undone by the tip
+/// facts) is gone with the tip facts: those degrades move only facts, so such a pair is equal on the verdict
+/// ([`facts_differ_rows`]; [`tip_lag_rows`] counts it apart when its judged tips differ).
 pub fn tip_derived_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
-    let strip = |r: &Value| -> Value {
-        let mut r = r.clone();
-        let mut facts = compared_facts_keeping_tips(&r);
-        if let Some(m) = facts.as_object_mut() {
-            for k in TIP_DERIVED_FACTS {
-                m.remove(k);
-            }
-            probe_degrade_undone(m);
-            read_degrade_as_judged(m);
-            for k in TIP_FACTS {
-                m.remove(k);
-            }
-        }
-        r["facts"] = json!(facts.to_string());
-        r
-    };
     let by = |rows: &[Value]| -> BTreeMap<String, Value> {
         rows.iter()
             .filter_map(|r| Some((r["outpoint"].as_str()?.to_string(), r.clone())))
@@ -4957,10 +4936,7 @@ pub fn tip_derived_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
     diff_rows(d1, actor)
         .into_iter()
         .filter(|o| match (a.get(o), b.get(o)) {
-            (Some(x), Some(y)) => {
-                (judged_tip(x) != judged_tip(y) && diff_rows(&[strip(x)], &[strip(y)]).is_empty())
-                    || landing_lag(x, y)
-            }
+            (Some(x), Some(y)) => landing_lag(x, y),
             _ => false,
         })
         .collect()
@@ -5012,54 +4988,6 @@ fn landing_lag(x: &Value, y: &Value) -> bool {
     ended_between(x, y) || ended_between(y, x)
 }
 
-/// FIX-1009 (bsv-low #1009): PURE, the #669 / #808 (b) degrade of a hop's courier probe UNDONE in a row's compared
-/// facts. A courier `"unspent"` taken at `chainProbeTip` is served by a judge whose tip is past it as
-/// `chainProbe: "index-unspent"` with `tipMoved: true` and `servedTip` (`owed::derive_owed_rows`' index-unspent arm):
-/// nothing moved but the served tip. So a row carrying exactly that (`index-unspent`, `tipMoved` true, a
-/// `chainProbeTip` below its `servedTip`) compares as the probe's own word at its tip (`unspent`, the two tip facts
-/// taken out); a row of the other side that states the probe's word with no move compares the same, and the
-/// remaining facts (`chainProbeTip`, the claim, `claimable`, the filed sweep) and the row's family, reason and
-/// claimable must still be equal for [`tip_derived_rows`] to read the pair a tip lag. An `index-unspent` with no
-/// probe (the courier silent, no `tipMoved`) is never undone: against a corroborated `unspent` it stays a diff.
-fn probe_degrade_undone(m: &mut serde_json::Map<String, Value>) {
-    let n = |v: Option<&Value>| v.and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
-    let degraded = m.get("chainProbe").and_then(Value::as_str) == Some("index-unspent")
-        && m.get("tipMoved") == Some(&json!(true))
-        && matches!(
-            (n(m.get("chainProbeTip")), n(m.get("servedTip"))),
-            (Some(probe), Some(served)) if probe < served
-        );
-    if degraded {
-        m.insert("chainProbe".into(), json!("unspent"));
-        m.remove("tipMoved");
-        m.remove("servedTip");
-    }
-}
-
-/// PURE (APP-L59 fold 1): the `/owed` read's #669 degrade of a STORED courier-dependent press
-/// (`owed_read::project_stored_sweep` over `owed::degrade_stale_sweeps`: `chainProbe` kept as `unspent`, `tipMoved`,
-/// `snapshotTip` the judged tip, the filed `sweepSource` kept, the claim withdrawn, `chainWait: block`) compared as the
-/// judge's own spelling of the same verdict at the later tip (`owed::derive_owed_rows`' predates-tip arm:
-/// `chainProbe: "unspent-predates-tip"`, no `snapshotTip`, no `sweepSource`). The verdict facts (`claim`, `claimable`,
-/// `chainWait`, `chainProbeTip`, `servedTip`) and the row's family, reason and claimable must still be equal for
-/// [`tip_derived_rows`] to read the pair a tip lag.
-fn read_degrade_as_judged(m: &mut serde_json::Map<String, Value>) {
-    let n = |v: Option<&Value>| v.and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
-    let degraded = m.get("chainProbe").and_then(Value::as_str) == Some("unspent")
-        && m.get("tipMoved") == Some(&json!(true))
-        && m.get("chainWait").and_then(Value::as_str) == Some("block")
-        && m.get("claimable") == Some(&json!(false))
-        && matches!(
-            (n(m.get("snapshotTip")), n(m.get("servedTip"))),
-            (Some(judged), Some(served)) if judged < served
-        );
-    if degraded {
-        m.insert("chainProbe".into(), json!("unspent-predates-tip"));
-        m.remove("snapshotTip");
-        m.remove("sweepSource");
-    }
-}
-
 /// The distinct tips the rows of `outpoints` were judged at, on one side (the route's `tipLagTips`).
 fn tips_of(rows: &[Value], outpoints: &[String]) -> Vec<i64> {
     rows.iter()
@@ -5071,9 +4999,9 @@ fn tips_of(rows: &[Value], outpoints: &[String]) -> Vec<i64> {
 }
 
 /// THE DIFF LINES NAME WHAT DIFFERS (the captain's item 12, D2-ACTOR-B-FOLD-8): for the first [`DIFF_DETAIL_MAX`]
-/// differing outpoints, each compared field that differs with both values (`family d1=unbound actor=hop-stranded`,
-/// `claimable d1=null actor=1`, a facts key by name: `facts.claim d1=.. actor=..`), the fields [`diff_rows`] compares;
-/// a row on one side only is `absent`.
+/// differing outpoints, each VERDICT field that differs with both values (`family d1=unbound actor=hop-stranded`,
+/// `claimable d1=null actor=1`, `facts.claim d1=.. actor=..`), the fields [`diff_rows`] compares (FIX-COMPARE-FACTS,
+/// bsv-low #1095: no other fact); a row on one side only is `absent`.
 pub const DIFF_DETAIL_MAX: usize = 3;
 pub fn diff_detail(d1: &[Value], actor: &[Value], outpoints: &[String]) -> String {
     let find = |rows: &[Value], o: &str| rows.iter().find(|r| r["outpoint"] == o).cloned();
@@ -5094,32 +5022,18 @@ pub fn diff_detail(d1: &[Value], actor: &[Value], outpoints: &[String]) -> Strin
         let fields = match (&a, &b) {
             (Some(a), Some(b)) => {
                 let mut f = Vec::new();
-                for k in [
-                    "family",
-                    "gameId",
-                    "sats",
-                    "opponentIdentity",
-                    "atHeight",
-                    "reason",
-                    "claimable",
-                ] {
+                for k in VERDICT_COLUMNS {
                     if a[k] != b[k] {
                         f.push(format!("{k} d1={} actor={}", short(&a[k]), short(&b[k])));
                     }
                 }
                 let (fa, fb) = (compared_facts(a), compared_facts(b));
-                let keys: BTreeSet<String> = fa
-                    .as_object()
-                    .into_iter()
-                    .chain(fb.as_object())
-                    .flat_map(|m| m.keys().cloned())
-                    .collect();
-                for k in keys {
-                    if fa[&k] != fb[&k] {
+                for k in VERDICT_FACTS {
+                    if fa[k] != fb[k] {
                         f.push(format!(
                             "facts.{k} d1={} actor={}",
-                            short(&fa[&k]),
-                            short(&fb[&k])
+                            short(&fa[k]),
+                            short(&fb[k])
                         ));
                     }
                 }
@@ -6965,13 +6879,22 @@ async fn reconcile_fresh(
     report.actor_digest = Some(rows_digest(&b));
     report.diff = !disagree.is_empty() || !missed.is_empty();
     let tip = db.tip();
-    if !actor_lag.is_empty() || !tip_lag_rows(&a, &b).is_empty() {
+    // FIX-COMPARE-FACTS (bsv-low #1095): the actor's own lag is also a pair of one verdict judged at two tips
+    // ([`tip_lag_rows`]: its tip-dated facts, `blocksToGate`, are facts, never a difference).
+    let mut lagged: Vec<String> = actor_lag
+        .iter()
+        .cloned()
+        .chain(tip_lag_rows(&actor_stored, &actor_fresh))
+        .collect();
+    lagged.sort();
+    lagged.dedup();
+    if !lagged.is_empty() || !tip_lag_rows(&a, &b).is_empty() {
         deltas.push((COUNTERS[28].to_string(), 1));
         db.log(&format!(
             "[owed-actor] RECONCILE TIP LAG (not a STOP) {identity}: {} outpoints of the actor's stored rows judged at tip {:?} differ only by the tip from its re-apply at tip {tip:?}, first {}",
-            actor_lag.len(),
-            tips_of(&actor_stored, &actor_lag),
-            actor_lag.first().map_or("-", String::as_str)
+            lagged.len(),
+            tips_of(&actor_stored, &lagged),
+            lagged.first().map_or("-", String::as_str)
         ));
     }
     if report.stale_outpoints > 0 {
@@ -7520,25 +7443,12 @@ pub async fn d1_rejudge_step_after_drain(
     Ok(Some(report))
 }
 
-/// The digest of one identity's rows: the sorted outpoints with their compared fields, hashed.
+/// The digest of one identity's rows: the sorted outpoints with their VERDICTS ([`verdict_of`]; FIX-COMPARE-FACTS,
+/// bsv-low #1095: a fact's spelling moves no digest), hashed.
 pub fn rows_digest(rows: &[Value]) -> String {
     let mut keyed: Vec<String> = rows
         .iter()
-        .map(|r| {
-            let facts = compared_facts(r);
-            json!([
-                r["outpoint"],
-                r["family"],
-                r["gameId"],
-                r["sats"],
-                r["opponentIdentity"],
-                r["atHeight"],
-                r["reason"],
-                facts,
-                r["claimable"]
-            ])
-            .to_string()
-        })
+        .map(|r| json!([r["outpoint"], verdict_of(r)]).to_string())
         .collect();
     keyed.sort();
     hex::encode(bsv_rs::primitives::hash::sha256(

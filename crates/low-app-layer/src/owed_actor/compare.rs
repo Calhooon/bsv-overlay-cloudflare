@@ -284,8 +284,9 @@ pub fn stored_row_stale(row: &Value, d1_judges: bool, phase_c: &Value) -> bool {
     }
 }
 
-/// The compared fields that differ on one outpoint, both values (the fields [`diff_rows`] compares; a facts key by
-/// name, `facts.<key>`); a row on one side only is `row: {d1, actor}` with the present side's family, game, sats and
+/// The compared fields that differ on one outpoint, both values (the VERDICT fields [`diff_rows`] compares,
+/// [`super::VERDICT_COLUMNS`] and [`super::VERDICT_FACTS`] as `facts.<key>`; FIX-COMPARE-FACTS, bsv-low #1095: no other
+/// fact is printed); a row on one side only is `row: {d1, actor}` with the present side's family, game, sats and
 /// claim. Each value cut at 200 characters, so a stored row stays bounded.
 pub fn diff_fields(d1: &[Value], actor: &[Value], outpoint: &str) -> Value {
     let find = |rows: &[Value]| rows.iter().find(|r| r["outpoint"] == outpoint).cloned();
@@ -308,31 +309,17 @@ pub fn diff_fields(d1: &[Value], actor: &[Value], outpoint: &str) -> Value {
     let mut out = serde_json::Map::new();
     match (find(d1), find(actor)) {
         (Some(a), Some(b)) => {
-            for k in [
-                "family",
-                "gameId",
-                "sats",
-                "opponentIdentity",
-                "atHeight",
-                "reason",
-                "claimable",
-            ] {
+            for k in super::VERDICT_COLUMNS {
                 if a[k] != b[k] {
                     out.insert(k.into(), json!({"d1": short(&a[k]), "actor": short(&b[k])}));
                 }
             }
             let (fa, fb) = (super::compared_facts(&a), super::compared_facts(&b));
-            let keys: BTreeSet<String> = fa
-                .as_object()
-                .into_iter()
-                .chain(fb.as_object())
-                .flat_map(|m| m.keys().cloned())
-                .collect();
-            for k in keys {
-                if fa[&k] != fb[&k] {
+            for k in super::VERDICT_FACTS {
+                if fa[k] != fb[k] {
                     out.insert(
                         format!("facts.{k}"),
-                        json!({"d1": short(&fa[&k]), "actor": short(&fb[&k])}),
+                        json!({"d1": short(&fa[k]), "actor": short(&fb[k])}),
                     );
                 }
             }
