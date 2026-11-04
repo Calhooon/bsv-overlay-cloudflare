@@ -346,9 +346,11 @@ pub async fn utxo_status(req: Request, ctx: RouteContext<AuthState>) -> Result<R
     if !targets.is_empty() {
         match read_belt_evidence(&db, &targets).await {
             Ok(evidence) => body = crate::logic::apply_belt_evidence(&body, &evidence),
-            Err(e) => console_warn!(
-                "[utxo-status] belt evidence read failed (the index's answer is served alone): {e}"
-            ),
+            Err(e) => {
+                crate::logic::log_belt_evidence_fault(&e, worker::Date::now().as_millis(), |l| {
+                    console_warn!("{l}")
+                });
+            }
         }
     }
     json_response(
