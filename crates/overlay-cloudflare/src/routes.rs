@@ -6397,7 +6397,7 @@ mod tests {
         let src = code_only(include_str!("routes.rs"));
         let src = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
         let door_needle = [
-            "crate::admit_fast::open_",
+            "crate::admit_fast::door_open_",
             "eviction(&ledger_db, &subject_txid)",
         ]
         .concat();
@@ -6405,7 +6405,7 @@ mod tests {
         let write_needle = ["engine.submit_with_", "report(&tagged_beef, mode)"].concat();
         let after_needle = ["crate::admit_fast::open_", "eviction(&ledger_db, subject)"].concat();
         let ungated_needle =
-            ["crate::admit_fast::open_", "eviction(&ledger_db, &subject)"].concat();
+            ["crate::admit_fast::door_open_", "eviction(&ledger_db, &subject)"].concat();
         let readmit_needle = ["crate::admit_fast::readmit_", "if_evicted("].concat();
         let s2_needle = ["crate::queue::mutation_", "ack("].concat();
         let door = src.find(&door_needle).expect("the door's read");
