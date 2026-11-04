@@ -931,3 +931,58 @@ async fn fix1085_b_a_walled_direct_call_names_its_identity_for_the_backstop() {
     assert!(pass.contains("publish_pairs(env,&pairs).await;"));
     assert!(pass.contains("publish::take_direct_where("));
 }
+
+/// bsv-low #1098 (FIX-D1-STORM) ruling 2: a coalesced batch D1 refused as overloaded is handed back whole under a
+/// bounded back-off; no message is judged alone into the same overload. On f50d36dd every such batch fell to the
+/// one-message path: a batch of 40 events over 8 identities was 1 coalesced attempt and 40 one-message judgements.
+#[test]
+fn fix_d1_storm_an_overloaded_batch_is_handed_back_never_judged_alone() {
+    let overload = "D1: D1Error { cause: JsValue(Error: D1 DB is overloaded. Too many resources consumed within a 10 second window";
+    assert!(super::is_d1_overload(overload));
+    assert!(!super::is_d1_overload("no such table: owed_rows"));
+    // the back-off: 2, 4, 8, 8, 8 s jittered by a second, then the old rule
+    let delays: Vec<_> = (1..=6).map(|k| super::overload_backoff_s(k, 0)).collect();
+    assert_eq!(
+        delays,
+        vec![Some(2), Some(4), Some(8), Some(8), Some(8), None]
+    );
+    assert_eq!(super::overload_backoff_s(1, 1), Some(3));
+    // the batch of 40 events over 8 identities under five overloads: judgements made alone
+    let identities: Vec<String> = (0..8).map(|i| format!("{i:066x}")).collect();
+    let events: Vec<&String> = (0..40).map(|n| &identities[n % 8]).collect();
+    let mut alone = 0usize;
+    let mut handed_back = 0usize;
+    for streak in 1..=super::OVERLOAD_BACKOFF_TRIES {
+        match super::coalesced_fault(overload, streak, 0) {
+            super::CoalescedFault::HandBack(d) => {
+                assert!((2..=9).contains(&d));
+                handed_back += events.len();
+            }
+            super::CoalescedFault::Singles => alone += events.len(),
+        }
+    }
+    assert_eq!(
+        (alone, handed_back),
+        (0, 200),
+        "every event kept, none judged alone"
+    );
+    // a fault that is not the overload, or the sixth overload, is the one-message path as before
+    assert_eq!(
+        super::coalesced_fault("no such table", 1, 0),
+        super::CoalescedFault::Singles
+    );
+    assert_eq!(
+        super::coalesced_fault(overload, super::OVERLOAD_BACKOFF_TRIES + 1, 0),
+        super::CoalescedFault::Singles
+    );
+    // the wiring: the consumer's coalesced Err arm asks the decision and hands back without judging alone; an
+    // answered pass resets the streak
+    let src = include_str!("../owed_events.rs");
+    let arm = &src[src
+        .find("match coalesced_fault(&e, streak, jitter)")
+        .expect("the Err arm asks the decision")..];
+    let arm = &arm[..arm.find("CoalescedFault::Singles =>").expect("both arms")];
+    assert!(arm.contains("hand_back_msg(&raw[i], &requeue, delay, &mut deltas)"));
+    assert!(arm.contains("singles.drain(..)"));
+    assert!(src.contains("singles.clear();\n                OVERLOAD_STREAK.with(|c| c.set(0));"));
+}
