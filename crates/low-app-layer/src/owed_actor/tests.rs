@@ -24783,4 +24783,31 @@ mod fix1095 {
             .unwrap();
         assert_eq!(got["identitiesDiffering"], json!(1), "{got}");
     }
+
+    /// Ruling 2: `reason` is ONE spelling. Every reason a stored row carries is written by the one judgement
+    /// (`owed_judge::judged_rows`: `owed::derive_owed_rows`, `degrade_stale_sweeps`, the hydration's could-not-judge
+    /// rows), which the write's judge (`judge_subjects`, the D1 judge's and the actor's) and the compare's fresh
+    /// judgement (`judge_fresh_rows_ranked`) both call; and no reason carries data (`format!` only over literals).
+    #[test]
+    fn fix1095_d_reason_is_spelled_by_the_one_judgement() {
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let judge = squash(include_str!("../owed_judge.rs"));
+        let actor = squash(include_str!("../owed_actor.rs"));
+        assert_eq!(
+            judge.matches("judged_rows(db,").count(),
+            2,
+            "judge_subjects and judge_fresh_rows_ranked"
+        );
+        assert!(judge.contains("letmutrows=derive_owed_rows(&i.as_inputs());"));
+        assert!(actor.contains("crate::owed_judge::judge_subjects(&judge,"));
+        let owed = squash(include_str!("../owed.rs"));
+        let hydrate = squash(include_str!("../owed_judge/hydrate.rs"));
+        assert_eq!(owed.matches("reason:Some(format!").count(), 0);
+        assert_eq!(
+            hydrate.matches("reason:Some(format!").count(),
+            1,
+            "the could-not-judge row, over two literals"
+        );
+        assert!(hydrate.contains("reason:Some(format!(\"couldnotjudge:{reason}\"))"));
+    }
 }
