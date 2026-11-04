@@ -53,8 +53,9 @@ pub fn is_counted_entry(p: &Value) -> bool {
         && p["bothMoved"] != true
 }
 
-/// bsv-low #1093 (lane FIX-BELT-INDEX, ruling 2): the most games of carried counted differences one compare judges
-/// first, half its window, so the forward walk keeps at least the other half and a lap always completes.
+/// bsv-low #1093 (lane FIX-BELT-INDEX, ruling 2): the most games of carried counted differences one compare reads,
+/// half its window. The forward walk's half is kept by [`pick_games_keyset`], which takes at most half the window of
+/// the pending and carried games TOGETHER (fold 1), so a lap always completes.
 pub const COMPARE_CARRIED_FIRST_MAX: usize = FRESH_COMPARE_GAMES_MAX / 2;
 
 /// PURE (bsv-low #1093, ruling 2): the games of the stored compare's COUNTED differences ([`is_counted_entry`]), in
@@ -102,7 +103,8 @@ pub struct GamePick {
 }
 
 /// FIX-1056-FOLD-3 (review 3's LOW-1): the games a compare judges, at most `max`. The games of the identity's PENDING
-/// re-reads first (`first`, FIX-1056: a pending outpoint is re-read when its game is judged), then, when the rest does
+/// re-reads first (`first`, FIX-1056: a pending outpoint is re-read when its game is judged; then, bsv-low #1093, the
+/// carried counted differences'), at most `max / 2` of them (#1093's fold 1), then, when the rest does
 /// not fit, the rest walked by KEYSET over the game id from past `after` (the stored cursor), wrapping to the first
 /// game once it passes the last. The rest is the rows' games and the identity's games ([`COMPARE_GAMES_SQL`]'s `page`
 /// in its order, `count` the identity's game count); a pending game is skipped where it stands (judged already), so
@@ -126,7 +128,11 @@ pub fn pick_games_keyset(
             picked.push(g);
         }
     }
-    picked.truncate(max);
+    // bsv-low #1093 (fold 1, the ensemble's C LOW-2 and A LOW-3): the games judged first (the pending re-reads', then
+    // the carried counted differences') take at most HALF the window, so the forward walk keeps the other half and a
+    // lap always completes. A first game left out is not judged in this compare: its pending re-read stays pending and
+    // its counted difference stays counted as carried (FIX-1056's rule), never a clear.
+    picked.truncate(max / 2);
     let mut from_rows: BTreeSet<String> = BTreeSet::new();
     for side in rows {
         for r in side.iter() {
