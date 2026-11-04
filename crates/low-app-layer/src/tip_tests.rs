@@ -37,6 +37,7 @@ fn tip() -> VerifiedTip {
         last_seen_height: Some(VERIFIED_HEIGHT),
         live_lag_blocks: None,
         linked: None,
+        read_at: Some(AT),
     }
 }
 
@@ -642,7 +643,8 @@ async fn tip877_fold_pass_frames_and_their_timestamps_must_be_usable() {
 
 #[tokio::test]
 async fn tip877_fold_tip_is_bound_to_the_active_header_at_its_height() {
-    let mut frames = vec![(404, Value::Null), (503, header())];
+    // (status, frame, a disagreement of the active header with the tip)
+    let mut frames = vec![(404, Value::Null, false), (503, header(), false)];
     for (key, value) in [
         ("height", json!(VERIFIED_HEIGHT + 1)),
         ("hash", json!("03".repeat(32))),
@@ -651,27 +653,35 @@ async fn tip877_fold_tip_is_bound_to_the_active_header_at_its_height() {
     ] {
         let mut active = header();
         active["value"][key] = value;
-        frames.push((200, active));
+        frames.push((200, active, key != "height"));
     }
-    for (status, active) in frames {
-        let reply = tip_reply_with(
-            |route| {
-                ready(if route.starts_with("findHeaderHexForHeight?") {
-                    Ok((status, active.clone()))
-                } else {
-                    response(route, header())
-                })
-            },
-            || Some(tip()),
-            || AT + 123,
-        )
-        .await;
-        // bsv-low #1081: the store's 5xx is the fresh memo's case.
-        assert_eq!(
-            reply.status,
-            if status >= 500 { 200 } else { 503 },
-            "{status}: {active}"
-        );
+    for (status, active, disagrees) in frames {
+        for memo in [Some(tip()), None] {
+            let reply = tip_reply_with(
+                |route| {
+                    ready(if route.starts_with("findHeaderHexForHeight?") {
+                        Ok((status, active.clone()))
+                    } else {
+                        response(route, header())
+                    })
+                },
+                || memo.clone(),
+                || AT + 123,
+            )
+            .await;
+            // bsv-low #1081: the store's 5xx is the fresh memo's case. APP-L59 fold 1 (C MEDIUM-1): an active header
+            // that disagrees with the tip twice is a read fault too (a block moving mid-snapshot), the memo's case;
+            // the tip is never trusted over it, and with no memo it is the named 503.
+            let served = memo.is_some() && (status >= 500 || disagrees);
+            assert_eq!(
+                reply.status,
+                if served { 200 } else { 503 },
+                "{status}: {active}"
+            );
+            if served {
+                assert_eq!(reply.body["servedFrom"], "memo", "{}", reply.body);
+            }
+        }
     }
 }
 
@@ -724,9 +734,11 @@ async fn tip877_fold_a_pass_refresh_is_not_read_by_the_proof_snapshot() {
 
 // ── bsv-low #1081: a read fault serves the isolate's last fresh snapshot ──
 
+/// A memo whose pass and whose read are both `pass_age_ms` old at `AT`.
 fn memo_at(pass_age_ms: u64) -> VerifiedTip {
     VerifiedTip {
         last_pass_at: Some(AT - pass_age_ms),
+        read_at: Some(AT - pass_age_ms),
         ..tip()
     }
 }
@@ -831,7 +843,7 @@ async fn fix1081_d_every_503_names_its_reason_and_the_route_logs_it() {
                 }
             }),
             Some(memo_at(10)),
-            "did not check",
+            "disagreed twice",
         ),
         (
             "stale",
@@ -924,15 +936,27 @@ async fn fix1077_b_the_stores_own_lag_word_is_read_beside_its_seen_height() {
     assert_eq!(reply.body["lagBlocks"], 2);
 }
 
+/// APP-L59 fold 1 (C MEDIUM-2) inverted this pin: a broken link state (a hole five blocks below a right tip) is a
+/// diagnostic, served as `linked` and logged, never a stale clock.
 #[tokio::test]
-async fn fix1077_c_a_broken_link_state_is_stale() {
+async fn fix1077_c_a_broken_link_state_is_a_diagnostic_never_stale() {
     let reply = reply_over_info(info_with(|v| {
         v["linkState"] = json!({"from": VERIFIED_HEIGHT - 399, "to": VERIFIED_HEIGHT,
             "linked": false, "broken": [VERIFIED_HEIGHT - 5], "brokenCount": 1});
     }))
     .await;
-    assert_eq!(reply.status, 503, "{}", reply.body);
-    assert_eq!(reply.body["freshness"], "stale");
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["freshness"], "fresh");
+    assert_eq!(reply.body["linked"], false);
+    // the handler logs it
+    let log = include_str!("routes.rs")
+        .split("fn log_tip_reply(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(log.contains("reply.body[\"linked\"] == false"), "{log}");
     // A linked chain, one block of lag: fresh, the lag named.
     let reply = reply_over_info(info_with(|v| {
         v["lastSeenHeight"] = json!(VERIFIED_HEIGHT + 1);
@@ -981,4 +1005,110 @@ async fn fix1084_a_the_header_rechecks_of_one_read_run_at_once() {
         ms <= (2 + waves) * 300,
         "the step took {ms} ms of the read's wall: the heights are read one after another"
     );
+}
+
+// ── APP-L59 fold 1 (the ensemble's findings) ──
+
+/// A store whose tip moves on its first `moves` snapshot attempts: the tip read answers `VERIFIED_HEIGHT`, then
+/// `getInfo` answers one block on (a block landed between the reads); after them every read is at the new block.
+fn moving_store(
+    moves: usize,
+) -> impl Fn(String) -> std::future::Ready<Result<(u16, Value), HeaderError>> {
+    let tip_reads = Cell::new(0usize);
+    move |route: String| {
+        let next = {
+            let mut h = header();
+            h["value"]["height"] = json!(VERIFIED_HEIGHT + 1);
+            h["value"]["hash"] = json!("05".repeat(32));
+            h
+        };
+        if route == "findChainTipHeaderHex" {
+            tip_reads.set(tip_reads.get() + 1);
+        }
+        let attempt = tip_reads.get();
+        ready(if attempt <= moves {
+            if route == "findChainTipHeaderHex" {
+                Ok((200, header()))
+            } else {
+                response(route, next)
+            }
+        } else {
+            response(route, next)
+        })
+    }
+}
+
+/// fold1_m1 (C MEDIUM-1): a block landing between `/tip`'s three reads is a race, never the store's word. Once: the
+/// route reads the snapshot again and answers the new block live. Twice: a read fault, the fresh memo served with its
+/// age. RED on d9076aad: 503 ("tip and sync snapshot heights disagree") with a 10 s memo in hand.
+#[tokio::test]
+async fn fold1_m1_a_mid_snapshot_tip_move_serves_200_fresh() {
+    let reply = tip_reply_with(moving_store(1), || Some(memo_at(10_000)), || AT).await;
+    assert_eq!(reply.status, 200, "one move, read again: {}", reply.body);
+    assert_eq!(reply.body["freshness"], "fresh");
+    assert_eq!(
+        reply.body["height"],
+        VERIFIED_HEIGHT + 1,
+        "the new block, live"
+    );
+    assert!(reply.body.get("servedFrom").is_none(), "{}", reply.body);
+    let reply = tip_reply_with(moving_store(usize::MAX), || Some(memo_at(10_000)), || AT).await;
+    assert_eq!(reply.status, 200, "two moves, the memo: {}", reply.body);
+    assert_eq!(reply.body["freshness"], "fresh");
+    assert_eq!(reply.body["servedFrom"], "memo");
+    assert_eq!(reply.body["ageMs"], 10_000);
+    let fault = reply.body["readFault"].as_str().unwrap();
+    assert!(fault.contains("disagree"), "{fault}");
+    // No memo: the disagreement is the 503's named fault.
+    let reply = tip_reply_with(moving_store(usize::MAX), || None, || AT).await;
+    assert_eq!(reply.status, 503);
+    let reason = reply.reason.unwrap();
+    assert!(
+        reason.contains("disagree") && reason.contains("no memo"),
+        "{reason}"
+    );
+}
+
+/// fold1_m2 (C MEDIUM-2): the link state never marks the clock stale. A hole five blocks below a right tip is served
+/// fresh, the link state its own field (`linked` false) and logged; a store that names no link state changes nothing.
+/// RED on d9076aad: 503 stale.
+#[tokio::test]
+async fn fold1_m2_a_broken_link_below_a_right_tip_serves_fresh() {
+    let reply = reply_over_info(info_with(|v| {
+        v["linkState"] = json!({"from": VERIFIED_HEIGHT - 399, "to": VERIFIED_HEIGHT,
+            "linked": false, "broken": [VERIFIED_HEIGHT - 5], "brokenCount": 1});
+    }))
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["freshness"], "fresh");
+    assert_eq!(reply.body["linked"], false, "served as its own field");
+    // absent: null, nothing else moves
+    let reply = reply_over_info(info()).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["linked"], Value::Null);
+}
+
+/// fold1_l1 (B LOW-1, C LOW-2): the memo's own READ age bounds its freshness: one block's expectation (10 min) after
+/// its read the memo serves stale (its lag word is as of that read), the reason named. RED on d9076aad: a 29-minute
+/// memo on a read fault served 200 fresh.
+#[tokio::test]
+async fn fold1_l1_the_memos_read_age_bounds_its_freshness() {
+    let fault = |_| ready(Err(HeaderError("transport".into())));
+    let reply = tip_reply_with(fault, || Some(memo_at(29 * 60 * 1_000)), || AT).await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.body["freshness"], "stale");
+    let reason = reply.reason.unwrap();
+    assert!(reason.contains("read 1740000 ms ago"), "{reason}");
+    let reply = tip_reply_with(fault, || Some(memo_at(2 * 60 * 1_000)), || AT).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["freshness"], "fresh");
+    assert_eq!(reply.body["servedFrom"], "memo");
+    assert_eq!(reply.body["memoAgeMs"], 120_000);
+    // a memo with no read stamp has no age: never served
+    let unstamped = VerifiedTip {
+        read_at: None,
+        ..memo_at(10_000)
+    };
+    let reply = tip_reply_with(fault, move || Some(unstamped), || AT).await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
 }

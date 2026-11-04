@@ -670,9 +670,9 @@ pub async fn tip(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response
     Ok(response)
 }
 
-/// The one log line of a `/tip` answer that is not a plain live 200: a 503
-/// names its reason (the read's outcome, the deadline, the store's status, the
-/// freshness bar), and a 200 served from the memo names the read's fault.
+/// The log lines of a `/tip` answer that is not a plain live 200: a 503 names its reason (the read's outcome, the
+/// deadline, the store's status, the freshness bar), a 200 served from the memo names the read's fault; and a broken
+/// link state is logged as the diagnostic it is (the APP-L59 ensemble's C MEDIUM-2: never a stale clock).
 fn log_tip_reply(reply: &TipReply) {
     if let Some(reason) = &reply.reason {
         if reply.status == 503 {
@@ -680,6 +680,12 @@ fn log_tip_reply(reply: &TipReply) {
         } else {
             console_warn!("[tip] {} from the isolate's memo: {reason}", reply.status);
         }
+    }
+    if reply.body["linked"] == false {
+        console_warn!(
+            "[tip] linkState.linked false at height {}: a diagnostic, never a stale clock",
+            reply.body["height"]
+        );
     }
 }
 
@@ -694,7 +700,13 @@ async fn tip_reply_env(env: &worker::Env) -> TipReply {
 }
 
 const TIP_MAX_AGE_MS: u64 = 30 * 60 * 1_000;
-const TIP_REORG_MARGIN: u32 = 1;
+/// The blocks the verified tip may trail the store's own courier lag and still be served fresh (bsv-low #1077; it was
+/// `TIP_REORG_MARGIN`'s second use, named apart so the two meanings can move apart: the APP-L59 ensemble's C NOTE-1).
+const TIP_LAG_MAX_BLOCKS: u32 = 1;
+/// The APP-L59 ensemble's B LOW-1 and C LOW-2: one block's expectation. A memo READ longer ago than this is stale
+/// whatever its pass age (its lag word is as of that read, and the chain moves a block in this time); the client's
+/// stake bar is the same block.
+pub(crate) const TIP_MEMO_MAX_READ_AGE_MS: u64 = 10 * 60 * 1_000;
 const TIP_RETRY_AFTER_SECS: &str = "60";
 /// The whole snapshot's deadline (three reads in a row: the tip, `getInfo`,
 /// the active header at the tip's height). The store answers a read in about
@@ -729,8 +741,10 @@ fn tip_lag_blocks(tip: &crate::tracker_host::VerifiedTip) -> Option<u32> {
 
 /// The freshness bar of one snapshot: `Ok` when it may be served, `Err`
 /// naming why it may not. The pass age, then the store's own courier lag
-/// (bsv-low #1077: "the pass ran" AND "the stored tip is the chain's"), then
-/// its link state.
+/// (bsv-low #1077: "the pass ran" AND "the stored tip is the chain's"). The
+/// link state is NOT a bar (the APP-L59 ensemble's C MEDIUM-2: a hole in the
+/// store's linked window while the tip is right is served as `linked` and
+/// logged, never a stale clock).
 fn tip_verdict(
     tip: &crate::tracker_host::VerifiedTip,
     now: u64,
@@ -743,16 +757,34 @@ fn tip_verdict(
             ));
         }
     }
-    if let Some(lag) = tip_lag_blocks(tip).filter(|lag| *lag > TIP_REORG_MARGIN) {
+    if let Some(lag) = tip_lag_blocks(tip).filter(|lag| *lag > TIP_LAG_MAX_BLOCKS) {
         return Err(format!(
             "the verified tip {} trails the couriers by {lag} blocks (seen {:?}, liveLagBlocks {:?})",
             tip.height, tip.last_seen_height, tip.live_lag_blocks
         ));
     }
-    if tip.linked == Some(false) {
-        return Err("the store's link state is broken (linkState.linked false)".into());
-    }
     Ok(())
+}
+
+/// The memo's bar: [`tip_verdict`] at `now`, AND a read stamp no older than
+/// [`TIP_MEMO_MAX_READ_AGE_MS`] (a memo with no read stamp has no age).
+fn memo_verdict(
+    memo: &crate::tracker_host::VerifiedTip,
+    now: u64,
+) -> std::result::Result<(), String> {
+    if memo.last_pass_at.is_none() {
+        return Err("it carries no pass stamp".into());
+    }
+    let Some(read_at) = memo.read_at else {
+        return Err("it carries no read stamp".into());
+    };
+    let read_age = now.saturating_sub(read_at);
+    if read_age > TIP_MEMO_MAX_READ_AGE_MS {
+        return Err(format!(
+            "it was read {read_age} ms ago, past one block's {TIP_MEMO_MAX_READ_AGE_MS} ms"
+        ));
+    }
+    tip_verdict(memo, now)
 }
 
 async fn tip_reply_within<G, F, L, N, D>(get: G, last_known: L, now_ms: N, deadline: D) -> TipReply
@@ -787,7 +819,17 @@ where
             answer
         }
     };
-    let snapshot = crate::tracker_host::tip_snapshot_with(watched);
+    // The APP-L59 ensemble's C MEDIUM-1: a snapshot whose reads disagree (a block landing between them) is read
+    // again once, inside the same deadline; a second disagreement is a read FAULT below (the memo's case).
+    let snapshot = async {
+        let first = crate::tracker_host::tip_snapshot_with(&watched).await;
+        match first {
+            Err(e) if crate::tracker_host::is_snapshot_move(&e) => {
+                crate::tracker_host::tip_snapshot_with(&watched).await
+            }
+            other => other,
+        }
+    };
     futures_util::pin_mut!(snapshot, deadline);
     let read = match futures_util::future::select(snapshot, deadline).await {
         futures_util::future::Either::Left((read, _)) => Some(read),
@@ -797,8 +839,16 @@ where
     let now = now_ms();
     let (current, live_reason, read_fault) = match read {
         Some(Ok(tip)) => {
+            crate::tracker_host::note_tip_read(&tip, now);
             let verdict = tip_verdict(&tip, now).err();
             (Some(tip), verdict, None)
+        }
+        Some(Err(e)) if crate::tracker_host::is_snapshot_move(&e) => {
+            let reason = format!(
+                "the store's reads disagreed twice ({}): its tip moved mid-snapshot",
+                e.0
+            );
+            (None, Some(reason.clone()), Some(reason))
         }
         Some(Err(e)) => {
             let fault = fault.borrow().clone();
@@ -813,13 +863,16 @@ where
         }
     };
     // #1081: a read FAULT serves the last fresh snapshot with its true age,
-    // judged by the same bar; never one without a pass stamp (no age).
+    // judged by the same bar AND its own read age ([`memo_verdict`]); never
+    // one without a pass stamp (no age) or a read stamp.
     if let (Some(fault), Some(memo)) = (&read_fault, last_known.as_ref()) {
-        if memo.last_pass_at.is_some() && tip_verdict(memo, now).is_ok() {
+        if memo_verdict(memo, now).is_ok() {
             let mut body = tip_body(Some(memo), now);
             body["lagBlocks"] = serde_json::json!(tip_lag_blocks(memo));
+            body["linked"] = serde_json::json!(memo.linked);
             body["freshness"] = serde_json::json!("fresh");
             body["servedFrom"] = serde_json::json!("memo");
+            body["memoAgeMs"] = serde_json::json!(memo.read_at.map(|r| now.saturating_sub(r)));
             body["readFault"] = serde_json::json!(fault);
             return TipReply {
                 status: 200,
@@ -833,6 +886,7 @@ where
     let shown = current.as_ref().or(last_known.as_ref());
     let mut body = tip_body(shown, now);
     body["lagBlocks"] = serde_json::json!(shown.and_then(tip_lag_blocks));
+    body["linked"] = serde_json::json!(shown.and_then(|tip| tip.linked));
     body["freshness"] = serde_json::json!(if !available {
         "stale"
     } else if current.as_ref().and_then(|tip| tip.last_pass_at).is_some() {
@@ -844,9 +898,7 @@ where
         (Some(_), None) => format!("{reason}; no memo in this isolate"),
         (Some(_), Some(memo)) => format!(
             "{reason}; the memo is not fresh ({})",
-            tip_verdict(memo, now)
-                .err()
-                .unwrap_or_else(|| "it carries no pass stamp".into())
+            memo_verdict(memo, now).err().unwrap_or_default()
         ),
         (None, _) => reason,
     });

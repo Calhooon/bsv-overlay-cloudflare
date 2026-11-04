@@ -27,6 +27,9 @@ pub struct VerifiedTip {
     /// (chaintracks 0.7.2): `false` is a served chain with a hole the store's
     /// pass could not heal; absent from an older producer.
     pub linked: Option<bool>,
+    /// Route-only (the APP-L59 ensemble's B LOW-1, C LOW-2): when the `/tip` route last read this snapshot in full
+    /// (the clock after its read), stamped by [`note_tip_read`]; the memo's own age bounds what it may serve.
+    pub read_at: Option<u64>,
 }
 
 thread_local! {
@@ -66,7 +69,32 @@ where
         last_seen_height: None,
         live_lag_blocks: None,
         linked: None,
+        read_at: None,
     })
+}
+
+/// The APP-L59 ensemble's C MEDIUM-1: the snapshot's two disagreement errors, a block landing between its three reads
+/// (the tip, `getInfo`, the active header at the tip's height). The `/tip` route reads such a snapshot again once, and
+/// a second disagreement is a READ FAULT (the memo's case), never the store's word.
+pub(crate) const SNAPSHOT_HEIGHTS_DISAGREE: &str = "tip and sync snapshot heights disagree";
+pub(crate) const SNAPSHOT_HEADER_DISAGREE: &str = "tip and active header disagree";
+
+/// Is this snapshot error a move of the store's tip between its reads ([`SNAPSHOT_HEIGHTS_DISAGREE`],
+/// [`SNAPSHOT_HEADER_DISAGREE`])?
+pub(crate) fn is_snapshot_move(e: &HeaderError) -> bool {
+    e.0 == SNAPSHOT_HEIGHTS_DISAGREE || e.0 == SNAPSHOT_HEADER_DISAGREE
+}
+
+/// Stamp the isolate's memo with the time the `/tip` route finished reading it (`now`, read after the read), when the
+/// memo is still that snapshot (its height and hash).
+pub(crate) fn note_tip_read(tip: &VerifiedTip, now: u64) {
+    LAST_VERIFIED_TIP.with(|last| {
+        if let Some(memo) = last.borrow_mut().as_mut() {
+            if memo.height == tip.height && memo.hash == tip.hash {
+                memo.read_at = Some(now);
+            }
+        }
+    });
 }
 
 /// /tip alone pays for the pass diagnostic and independent active-header check.
@@ -85,7 +113,7 @@ where
         .and_then(|lag| u32::try_from(lag).ok());
     let linked = info["value"]["linkState"]["linked"].as_bool();
     if served_height != tip.height {
-        return Err(HeaderError("tip and sync snapshot heights disagree".into()));
+        return Err(HeaderError(SNAPSHOT_HEIGHTS_DISAGREE.into()));
     }
     let (status, active) = get(format!("findHeaderHexForHeight?height={}", tip.height)).await?;
     let active_header = header_response(tip.height, status, &active)?
@@ -94,7 +122,7 @@ where
         || active_header.merkle_root != tip.merkle_root
         || active["value"]["time"].as_u64() != Some(tip.at / 1_000)
     {
-        return Err(HeaderError("tip and active header disagree".into()));
+        return Err(HeaderError(SNAPSHOT_HEADER_DISAGREE.into()));
     }
     tip.last_pass_at = last_pass_at;
     tip.last_seen_height = Some(last_seen_height);
