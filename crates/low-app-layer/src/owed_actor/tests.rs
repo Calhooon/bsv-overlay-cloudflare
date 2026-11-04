@@ -24102,8 +24102,8 @@ mod fix1093 {
     /// (`spent: false`, lock `free`) and the fresh D1 judgement presses. The re-ask lever's find (`found 1, handedBack 1,
     /// writeFaults 0`, as beta's) writes the evidence row; then the fresh D1 judgement and the actor agree on it (both
     /// `unbound`, `chainProbe: "spent"`, digests equal: the judges' one evidence, already) AND `/utxo-status` serves the
-    /// same spend from the same row: `spent: true`, the spender, `spentSource: "belt"`, the courier's confirmation as
-    /// `beltSpentConfirmed`, `spentConfirmed` still the index's `false`, and the lock `locked` by that spender, never
+    /// same spend from the same row: `spent: true`, the spender, `spentSource: "belt"` (no raw `beltSpentConfirmed`
+    /// since fold 1), `spentConfirmed` still the index's `false`, and the lock `locked` by that spender, never
     /// `free`. RED with `apply_belt_evidence` inert (main's route: the pot_records row alone): `spent: false`, `free`.
     #[tokio::test]
     async fn fix1093_a_after_a_belt_find_utxo_status_serves_the_same_spend_both_judges_read() {
@@ -24178,7 +24178,6 @@ mod fix1093 {
                 after["spent"].clone(),
                 after["spendingTxid"].clone(),
                 after["spentSource"].clone(),
-                after["beltSpentConfirmed"].clone(),
                 after["spentConfirmed"].clone(),
                 after["lock"]["word"].clone(),
                 after["lock"]["txid"].clone(),
@@ -24188,12 +24187,17 @@ mod fix1093 {
                 json!(true),
                 json!(spender),
                 json!("belt"),
-                json!(true),
                 json!(false),
                 json!("locked"),
                 json!(spender),
             ),
             "/utxo-status after the belt's find: {after}"
+        );
+        // fold 1 (the ensemble's C LOW-1): one reading of the evidence's confirmation, the judges'; the route serves no
+        // raw copy of the column. RED on 7954f855: `beltSpentConfirmed: true` served.
+        assert!(
+            after.get("beltSpentConfirmed").is_none(),
+            "no raw courier confirmation on the entry: {after}"
         );
     }
 

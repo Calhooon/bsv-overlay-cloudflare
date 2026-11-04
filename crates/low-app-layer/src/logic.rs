@@ -472,9 +472,11 @@ pub fn belt_evidence_targets(entries: &[OutpointStatus]) -> Vec<(String, u32)> {
 /// probe range) both read; `/utxo-status` read the index's `pot_records` row alone, so after a belt find it answered
 /// the hop `spent: false`, lock `free` (beta, 2026-11-04: `95bcf03a…:0`, swept in its own block, nine days on). Now an
 /// entry the index holds known and UNSPENT for which the belt's evidence records a spend is served spent by the
-/// evidence's spender: `spent: true`, `spendingTxid`, `spentSource: "belt"`, `beltSpentConfirmed` (the courier's own
-/// confirmation word, `null` once a reorg clear demoted it), `beltProbedAtMs`. `spentConfirmed` stays `false`: it is
-/// the INDEX's SPV-confirmed flag (`index_proven_spend` names an index proof on it), never a courier's word; and
+/// evidence's spender: `spent: true`, `spendingTxid`, `spentSource: "belt"`, `beltProbedAtMs`. The evidence's own
+/// confirmation column is NOT served (fold 1, the ensemble's C LOW-1): the judges read it under the reorg tombstone's
+/// grace and reach (`hops_view::clear_unless_survived`, `confirmation_refused`), so a raw copy here would be a second
+/// reading of one column; a reader that needs the confirmation reads the judges' word. `spentConfirmed` stays
+/// `false`: it is the INDEX's SPV-confirmed flag (`index_proven_spend` names an index proof on it), never a courier's word; and
 /// `spenderSeen` stays the index's own witness of its own pointer (none), so a monitor that trusts a pointer only on
 /// `spenderSeen` or `spentConfirmed` does not trust the belt's. The lock then reads the spender's tracker word
 /// (`locked`, or `spent` on a checked `mined` word), never `free`. An evidence row that records no spend (none is
@@ -504,7 +506,6 @@ pub fn apply_belt_evidence(body: &str, evidence: &[crate::hops_view::ProbeMemo])
         e["spendingTxid"] = json!(m.spending_txid.as_deref().map(str::to_ascii_lowercase));
         e["spentConfirmed"] = json!(false);
         e["spentSource"] = json!(SPENT_SOURCE_BELT);
-        e["beltSpentConfirmed"] = json!(m.spent_confirmed);
         e["beltProbedAtMs"] = json!(m.probed_at_ms);
         moved = true;
     }
