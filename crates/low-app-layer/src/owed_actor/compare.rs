@@ -341,6 +341,28 @@ pub fn diff_fields(d1: &[Value], actor: &[Value], outpoint: &str) -> Value {
     Value::Object(out)
 }
 
+/// PURE (FIX-COMPARE-FACTS, bsv-low #1095, ruling 3): a stored compare entry read by this build's verdict rule. Its
+/// printed `fields` keep the verdict fields alone ([`super::is_verdict_field`]); an entry whose `fields` named fields
+/// and none of them a verdict field (printed under a rule that counted a fact's spelling: `facts.snapshotTip`,
+/// `facts.chainProbe`, the filed sweep's facts) is `None`, no difference by its own record. An entry with no printed
+/// fields (past the cut, held, a tip lag) is kept as it is.
+pub fn verdict_entry(p: &Value) -> Option<Value> {
+    let Some(fields) = p["fields"].as_object().filter(|f| !f.is_empty()) else {
+        return Some(p.clone());
+    };
+    let kept: serde_json::Map<String, Value> = fields
+        .iter()
+        .filter(|(k, _)| super::is_verdict_field(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let mut p = p.clone();
+    p["fields"] = Value::Object(kept);
+    Some(p)
+}
+
 /// The differing outpoints one stored compare row keeps, at most (each with its fields).
 pub const COMPARE_ROW_OUTPOINTS_MAX: usize = 32;
 
@@ -1105,7 +1127,15 @@ pub fn classify_reread(
     if row.fault.is_some() {
         return row;
     }
-    let prior: Vec<Value> = prior.and_then(Value::as_array).cloned().unwrap_or_default();
+    // FIX-COMPARE-FACTS (bsv-low #1095, ruling 3): the prior entries read by this build's verdict rule
+    // ([`verdict_entry`]): an entry printed under an older rule naming facts only is no verdict difference by its own
+    // record and is not carried (a carried counted entry kept its old `fields`: beta's `facts.snapshotTip` after #1094).
+    let prior: Vec<Value> = prior
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(verdict_entry)
+        .collect();
     let prior_of = |o: &str| prior.iter().find(|p| p["outpoint"] == o);
     let current: Vec<Value> = row.outpoints.as_array().cloned().unwrap_or_default();
     let absent = || (ABSENT_PRINT.to_string(), ABSENT_PRINT.to_string());

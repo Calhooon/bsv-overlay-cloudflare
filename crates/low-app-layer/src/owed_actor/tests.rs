@@ -24692,6 +24692,43 @@ mod fix1095 {
         assert_eq!(diff_rows(std::slice::from_ref(&d1), &[]).len(), 1);
     }
 
+    /// Ruling 3: a COUNTED entry a partial compare carries unread (its game not judged) whose stored `fields` name
+    /// facts only (printed under the rule before this one: beta's `facts.snapshotTip`, `facts.chainProbe`) is no verdict
+    /// difference by its own record and is not carried; one naming a verdict field is carried with its facts' fields
+    /// dropped.
+    #[test]
+    fn fix1095_c0_a_carried_fact_only_entry_is_not_counted() {
+        let t = NOW_MS as i64;
+        let mut v = view(&row(d1_facts("index-unspent"), 1), &row(actor_facts(), 1));
+        // A partial compare that judged another game: neither side of `O` read.
+        v["d1"]["rows"] = json!([]);
+        v["actor"]["rows"] = json!([]);
+        v["diff"] = json!([]);
+        v["heldByLag"] = json!([]);
+        v["diffFields"] = json!([]);
+        v["d1"]["games"] = json!({"partial": true, "judgedGames": ["gother"]});
+        let raw = compare::compare_row_of("02f1fd09", t, Ok(&v));
+        let p = |fields: Value| json!([{"outpoint": O, "held": false, "gameId": "g1095", "fields": fields}]);
+        let facts_only = p(json!({
+            "facts.snapshotTip": {"d1": null, "actor": 974_009},
+            "facts.chainProbe": {"d1": "index-unspent", "actor": "unspent"},
+        }));
+        let out = compare::classify_reread(raw.clone(), Some(&facts_only), t, 5_000);
+        assert_eq!(out.diff_count, Some(0), "{}", out.outpoints);
+        assert_eq!(out.outpoints, json!([]), "{}", out.outpoints);
+        let verdict = p(json!({
+            "claimable": {"d1": 1, "actor": 0},
+            "facts.snapshotTip": {"d1": null, "actor": 974_009},
+        }));
+        let out = compare::classify_reread(raw, Some(&verdict), t, 5_000);
+        assert_eq!(out.diff_count, Some(1), "{}", out.outpoints);
+        assert_eq!(
+            out.outpoints[0]["fields"],
+            json!({"claimable": {"d1": 1, "actor": 0}}),
+            "the facts' fields dropped"
+        );
+    }
+
     /// (c) the fleet figure through the rows route's fresh compare, three ring ticks and the standing route: every actor
     /// row spelled as beta's (the belt's probe word, a snapshot tip, the filed sweep's facts) reads `identitiesDiffering`
     /// 0; one seat's `sats` moved too is counted.
