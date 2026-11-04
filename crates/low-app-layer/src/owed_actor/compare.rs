@@ -453,8 +453,14 @@ pub async fn fresh_compare(
         )
     };
     let stored = within(&stored);
+    // APP-L59 fold 1 (the ensemble's C (1), B LOW-2, B LOW-3): both sides through THE READ'S sweep projection at the
+    // fresh judgement's tip ([`project_compared_rows`]), after the ceiling cut (it moves no key): a stored courier-
+    // dependent press judged below the block is compared as the `/owed` read serves it, #669's chain wait, so the
+    // served list and the compare agree with the D1 judge across blocks with no block re-judge and no bound.
+    let tip = db.tip();
+    let fresh = project_compared_rows(fresh, tip);
     let actor = actor.map(|mut a| {
-        a["rows"] = json!(within(&actor_rows));
+        a["rows"] = json!(project_compared_rows(within(&actor_rows), tip));
         a
     });
     let stamp = rejudge_state_of(Some(&json!({"cursor": under["stamp"]})));
@@ -510,6 +516,48 @@ pub async fn fresh_compare(
         .map(|o| json!({"outpoint": o, "fields": diff_fields(&fresh, &actor_now, o)}))
         .collect::<Vec<_>>());
     Ok(view)
+}
+
+/// PURE (APP-L59 fold 1): stored owed rows (`facts` a JSON string, the `claimable` and `probeTip` columns) as the
+/// `/owed` read serves them at `tip`: each through [`crate::owed_read::project_stored_sweep`], the read's one rule, its
+/// `claimable` column following its facts (the column's own type kept). A row the rule leaves is returned as it was.
+pub fn project_compared_rows(rows: Vec<Value>, tip: Option<u64>) -> Vec<Value> {
+    let n = |v: &Value| {
+        v.as_u64()
+            .or_else(|| v.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
+    };
+    rows.into_iter()
+        .map(|mut r| {
+            let Some(mut facts) = r["facts"]
+                .as_str()
+                .and_then(|f| serde_json::from_str::<Value>(f).ok())
+            else {
+                return r;
+            };
+            let before = facts.clone();
+            let mut reason = r["reason"].as_str().map(str::to_owned);
+            crate::owed_read::project_stored_sweep(
+                r["family"].as_str().unwrap_or_default(),
+                &mut facts,
+                &mut reason,
+                n(&r["probeTip"]),
+                tip,
+            );
+            if facts == before {
+                return r;
+            }
+            if facts["claimable"] == false {
+                r["claimable"] = match &r["claimable"] {
+                    Value::Bool(_) => json!(false),
+                    Value::Null => Value::Null,
+                    _ => json!(0),
+                };
+            }
+            r["facts"] = json!(facts.to_string());
+            r["reason"] = json!(reason);
+            r
+        })
+        .collect()
 }
 
 /// One identity's stored compare ([`compare_row_of`]): the counts, the differing outpoints (at most

@@ -78,6 +78,42 @@ pub struct Snapshot {
     pub read_at_ms: Option<u64>,
 }
 
+/// THE READ'S SWEEP PROJECTION, one function the `/owed` read and the fleet compare call (APP-L59 fold 1, the
+/// ensemble's C (1), B LOW-2, B LOW-3): a STORED `hop-stranded` row judged at `probe_tip` and served at `present_tip`.
+/// bsv-low #669 (the D2-OWED lens's HIGH-1): a claimable sweep rests on the tip it was judged at (NULL is unknown); a
+/// block since, or a present tip that cannot be read, degrades it to a pending chain-wait, never a dead sweep. The delta
+/// lens's D-H1: an index-UNSPENT sweep keeps its press, the move stated (`owed::state_index_unspent_sweep`); only a
+/// press resting on a courier probe alone is degraded. A row of any other family is untouched.
+pub fn project_stored_sweep(
+    family: &str,
+    facts: &mut Value,
+    reason: &mut Option<String>,
+    probe_tip: Option<u64>,
+    present_tip: Option<u64>,
+) {
+    if family != owed::OwedFamily::HopStranded.as_str()
+        || owed::state_index_unspent_sweep(facts, probe_tip, present_tip)
+        || facts["claimable"] != Value::Bool(true)
+    {
+        return;
+    }
+    let mut one = [owed::OwedRow {
+        identity: String::new(),
+        outpoint: String::new(),
+        family: owed::OwedFamily::HopStranded,
+        game_id: String::new(),
+        sats: None,
+        opponent_identity: None,
+        at_height: None,
+        facts: std::mem::take(facts),
+        reason: reason.take(),
+    }];
+    owed::degrade_stale_sweeps(&mut one, probe_tip, present_tip);
+    let [row] = one;
+    *facts = row.facts;
+    *reason = row.reason;
+}
+
 fn number(value: &Value) -> Option<u64> {
     value
         .as_f64()
@@ -378,31 +414,13 @@ impl Snapshot {
                 // The delta lens's D-H1: an index-UNSPENT sweep keeps its press, the move stated
                 // (`owed::state_index_unspent_sweep`); only a press resting on a courier probe alone is degraded.
                 let mut reason = joined["reason"].as_str().map(str::to_owned);
-                let is_sweep = joined["family"] == owed::OwedFamily::HopStranded.as_str();
-                if is_sweep
-                    && !owed::state_index_unspent_sweep(
-                        &mut facts,
-                        number(&joined["probeTip"]),
-                        present_tip,
-                    )
-                    && facts["claimable"] == Value::Bool(true)
-                {
-                    let mut one = [owed::OwedRow {
-                        identity: identity.into(),
-                        outpoint: outpoint.into(),
-                        family: owed::OwedFamily::HopStranded,
-                        game_id: String::new(),
-                        sats: None,
-                        opponent_identity: None,
-                        at_height: None,
-                        facts,
-                        reason,
-                    }];
-                    owed::degrade_stale_sweeps(&mut one, number(&joined["probeTip"]), present_tip);
-                    let [row] = one;
-                    facts = row.facts;
-                    reason = row.reason;
-                }
+                project_stored_sweep(
+                    joined["family"].as_str().unwrap_or_default(),
+                    &mut facts,
+                    &mut reason,
+                    number(&joined["probeTip"]),
+                    present_tip,
+                );
                 // The second delta lens's D2-L1 (the captain's ruling): a read never does work, but never serves a
                 // press over a pending downgrade. A game holding an undrained downgrade-class mark the served judge
                 // has not applied serves its press withheld as re-judging (THE GATE, `Snapshot::withholding_mark`,
