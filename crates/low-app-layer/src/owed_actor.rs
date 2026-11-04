@@ -4887,6 +4887,13 @@ pub fn rows_view(
             let lag = tip_derived_rows(d1, a);
             json!({"d1": tips_of(d1, &lag), "actor": tips_of(a, &lag)})
         }),
+        // FIX-COMPARE-FACTS-FOLD-1 (R279 LOW-1): the pairs of ONE verdict judged at two tips ([`tip_lag_rows`], the lag
+        // the delivery compare and the reconcile count `owed_actor_compare_tip_lag_total`), named with both sides'
+        // tips: an actor behind the tip with equal verdicts is visible on the route, never a difference or a hold.
+        "tipLagEqual": actor_rows.as_deref().map(|a| {
+            let lag = tip_lag_rows(d1, a);
+            json!({"outpoints": lag, "tips": {"d1": tips_of(d1, &lag), "actor": tips_of(a, &lag)}})
+        }),
         "digests": {"d1": rows_digest(d1), "actor": actor_rows.as_deref().map(rows_digest)},
     })
 }
