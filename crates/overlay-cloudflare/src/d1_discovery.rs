@@ -1699,46 +1699,27 @@ pub(crate) fn pot_beef_candidates_sql(limit: u64, min_age_secs: u64) -> String {
 /// rows standing in front of 99 real pots — the pass had chewed 08-14 change
 /// for a day while the pots waited. A hop row still drains, after the pots.
 ///
-/// bsv-low #1093 (lane FIX-BELT-INDEX; its fold, the ensemble's A MEDIUM-1 and C LOW-3): TWO SHARES in one statement.
-/// Ordered by the kind and `createdAt` alone, the examine stamp's hour backoff only lent each place out for an hour:
-/// the rows that won a pass were again the oldest eligible rows an hour later and took the same places back, so a pass
-/// of 20 (80 an hour at `*/15`) re-examined the same oldest rows for good and a row past them (beta's 9-day-old hop
-/// `95bcf03a…:0`, swept in its own block 972776, behind thousands of older unspent hop change outputs and every unspent
-/// pot) was never examined at all. Each share is LEAST RECENTLY TOUCHED first, the touch
-/// `COALESCE(spendDiscoveryAt, createdAt)` (a row never examined waits by its age, so an inflow of new rows never
-/// starves a row examined before them): the first half of the LIMIT ([`pot_unspent_stale_pot_places`]) goes to POTS,
-/// the rest to any kind. So the pots keep a share every pass (the 2026-09-04 rule's purpose: the discovery pass is the
-/// index's one road to a pot spend made outside the door) and the hop rows still rotate. The bounds, at `*/15` with
-/// a LIMIT of 20: a pot is re-examined within `max(1, ceil(P / 40))` hours of its last examination (P the eligible
-/// pots; beta's 99: three hours, every pot's turn in a ten-place share), and every eligible row is reached within
-/// `ceil(N / 40)` hours of its touch at most (N the eligible rows; beta's 3,670: about 92 hours), the hop rows taking
-/// at least the other 40 places an hour and any pot place the pots leave.
+/// bsv-low #1093 (lane FIX-BELT-INDEX): the order is the LEAST RECENTLY EXAMINED first (`spendDiscoveryAt`, a row
+/// never examined first of all), then pots before hop rows, then oldest first. Ordered by the kind and `createdAt`
+/// alone, the examine stamp's hour backoff only lent each place out for an hour: the rows that won a pass were again the
+/// oldest eligible rows an hour later and took the same places back, so a pass of 20 (80 an hour at `*/15`) re-examined
+/// the same oldest rows for good and a row past them (beta's 9-day-old hop `95bcf03a…:0`, swept in its own block
+/// 972776, behind thousands of older unspent hop change outputs and every unspent pot) was never examined at all. Now
+/// every eligible row is examined once per round of `ceil(N / 80)` hours (N the eligible rows) before any is examined
+/// twice; among rows never examined the pots still come first.
 /// bsv-low (2026-09-04): a row the discovery pass examined (any outcome) is
 /// not a candidate again for this long — a dead courier rung must never pin
 /// the pass on the same rows (beta: four ticks on the same 20 under Bitails'
 /// retired endpoint). Stamped by `note_spend_discovery_attempt`.
 pub(crate) const SPEND_DISCOVERY_BACKOFF_SECS: u64 = 3600;
 
-/// bsv-low #1093 (fold 1): the places of a pass of `limit` the POTS hold first, half of it.
-pub(crate) fn pot_unspent_stale_pot_places(limit: u64) -> u64 {
-    limit / 2
-}
-
 pub(crate) fn pot_unspent_stale_sql(limit: u64, min_age_secs: u64) -> String {
-    let pot_places = pot_unspent_stale_pot_places(limit);
     format!(
-        "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed, lockKind, createdAt FROM (\
-         SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed, lockKind, createdAt, \
-           COALESCE(spendDiscoveryAt, createdAt, 0) AS touchedAt, \
-           CASE WHEN lockKind = 'p2pkh' THEN 1 ELSE 0 END AS isHop, \
-           ROW_NUMBER() OVER (PARTITION BY CASE WHEN lockKind = 'p2pkh' THEN 1 ELSE 0 END \
-             ORDER BY COALESCE(spendDiscoveryAt, createdAt, 0) ASC, createdAt ASC) AS kindRank \
-         FROM pot_records \
+        "SELECT txid, outputIndex, spent, spendingTxid, spentConfirmed, lockKind, createdAt FROM pot_records \
          WHERE spent = 0 \
            AND (createdAt IS NULL OR createdAt <= unixepoch() - {min_age_secs}) \
-           AND (spendDiscoveryAt IS NULL OR spendDiscoveryAt <= unixepoch() - {SPEND_DISCOVERY_BACKOFF_SECS})) \
-         ORDER BY CASE WHEN isHop = 0 AND kindRank <= {pot_places} THEN 0 ELSE 1 END ASC, \
-           touchedAt ASC, isHop ASC, createdAt ASC LIMIT {limit}"
+           AND (spendDiscoveryAt IS NULL OR spendDiscoveryAt <= unixepoch() - {SPEND_DISCOVERY_BACKOFF_SECS}) \
+         ORDER BY COALESCE(spendDiscoveryAt, 0) ASC, CASE WHEN lockKind = 'p2pkh' THEN 1 ELSE 0 END ASC, createdAt ASC LIMIT {limit}"
     )
 }
 
@@ -8054,18 +8035,12 @@ mod tests {
         );
         // 2026-09-04: pots before hop rows (the tm_lowfund P2PKH index shares
         // the table and outnumbered the pots 36:1 on beta), then oldest first.
-        // bsv-low #1093 (fold 1): two shares, each least recently touched first: half the places to pots, the rest to
-        // any kind.
         assert!(
-            sql.contains("ORDER BY CASE WHEN isHop = 0 AND kindRank <= 10 THEN 0 ELSE 1 END ASC, touchedAt ASC, isHop ASC, createdAt ASC LIMIT 20"),
-            "the pots' share first, then least recently touched, bounded"
+            sql.contains("ORDER BY COALESCE(spendDiscoveryAt, 0) ASC, CASE WHEN lockKind = 'p2pkh' THEN 1 ELSE 0 END ASC, createdAt ASC LIMIT 20"),
+            "least recently examined first (bsv-low #1093), then pots first, then oldest first, bounded"
         );
         assert!(
-            sql.contains("COALESCE(spendDiscoveryAt, createdAt, 0) AS touchedAt"),
-            "the touch: the examine stamp, else the row's age"
-        );
-        assert!(
-            sql.contains("lockKind, createdAt FROM ("),
+            sql.contains("lockKind, createdAt FROM pot_records"),
             "the age-aware pass reads the stamp and the kind"
         );
         // 2026-09-04: a row examined within the backoff is not a candidate —
@@ -10600,120 +10575,6 @@ mod tests {
             examined_at_pass,
             Some(1),
             "the hop is examined on the second pass, behind the five pots never examined"
-        );
-    }
-
-    /// bsv-low #1093 (fold 1, the ensemble's A MEDIUM-1 and C LOW-3): THE POTS KEEP THEIR SHARE AND THE HOP ROWS
-    /// ROTATE, on beta's shape: 99 unspent pots and 3,600 unspent hop rows, a pass of 20 every 15 minutes (80 places
-    /// an hour), the SHIPPED candidate SQL and stamp under real SQLite, time moved by shifting every stamp and age back
-    /// 900 s a pass. After its first examination every pot is examined again within three hours (`ceil(99 / 40)`: ten
-    /// pot places a pass); every row is examined, hop rows included, within the round's bound (`ceil(3,699 / 40)`
-    /// hours plus one); a row added during the run (inflow, older than the floor) is examined in its turn and starves
-    /// no re-examination. RED on 7954f855 (the least-recently-examined order with every never-examined row first): a
-    /// pot's second examination waits the whole first round, 46 hours.
-    #[test]
-    fn fix1093f_the_pots_keep_their_share_and_the_hop_rows_rotate() {
-        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
-        for sql in crate::d1::OVERLAY_MIGRATIONS {
-            if let Err(e) = conn.execute_batch(sql) {
-                let msg = e.to_string().to_ascii_lowercase();
-                assert!(msg.contains("duplicate column"), "migration: {e}");
-            }
-        }
-        let now: i64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let key = |kind: u8, n: u32| format!("{kind:02x}{n:062x}");
-        for n in 0..99u32 {
-            insert_pot_with(
-                &conn,
-                &key(0xc0, n),
-                0,
-                now - 20 * 86_400 + i64::from(n) * 60,
-                false,
-                false,
-            );
-        }
-        for n in 0..3_600u32 {
-            insert_pot_with(
-                &conn,
-                &key(0xd0, n),
-                1,
-                now - 30 * 86_400 + i64::from(n) * 60,
-                false,
-                false,
-            );
-        }
-        conn.execute(
-            "UPDATE pot_records SET lockKind = CASE WHEN substr(txid,1,2) = 'd0' OR substr(txid,1,2) = 'e0' THEN 'p2pkh' ELSE 'covenant' END",
-            [],
-        )
-        .unwrap();
-        let mut seen: std::collections::BTreeMap<String, Vec<u32>> =
-            std::collections::BTreeMap::new();
-        let passes: u32 = 4 * 96;
-        for pass in 0..passes {
-            if pass == 8 {
-                // inflow: 40 new hop rows, each past the hour floor
-                for n in 0..40u32 {
-                    insert_pot_with(&conn, &key(0xe0, n), 1, now - 7_200, false, false);
-                }
-                conn.execute(
-                    "UPDATE pot_records SET lockKind = 'p2pkh' WHERE substr(txid,1,2) = 'e0'",
-                    [],
-                )
-                .unwrap();
-            }
-            let picked: Vec<(String, i64)> = conn
-                .prepare(&pot_unspent_stale_sql(20, 3600))
-                .unwrap()
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            assert_eq!(picked.len(), 20, "pass {pass}: the pass is full");
-            for (txid, vout) in &picked {
-                conn.execute(POT_SPEND_DISCOVERY_STAMP_SQL, rusqlite::params![txid, vout])
-                    .unwrap();
-                seen.entry(txid.clone()).or_default().push(pass);
-            }
-            conn.execute_batch(
-                "UPDATE pot_records SET spendDiscoveryAt = spendDiscoveryAt - 900 WHERE spendDiscoveryAt IS NOT NULL; \
-                 UPDATE pot_records SET createdAt = createdAt - 900",
-            )
-            .unwrap();
-        }
-        let pots: Vec<&Vec<u32>> = (0..99u32)
-            .map(|n| seen.get(&key(0xc0, n)).expect("every pot examined"))
-            .collect();
-        let worst_pot_gap = pots
-            .iter()
-            .flat_map(|p| p.windows(2).map(|w| w[1] - w[0]))
-            .max()
-            .unwrap();
-        assert!(
-            worst_pot_gap <= 4 * 3,
-            "a pot is re-examined within three hours (12 passes): the worst gap {worst_pot_gap} passes"
-        );
-        assert!(
-            pots.iter().all(|p| p.len() >= 30),
-            "every pot examined at least every three hours of 96"
-        );
-        let rows = 99 + 3_600 + 40;
-        let round_passes = 4 * (rows / 40 + 1);
-        let unexamined: Vec<String> = (0..3_600u32)
-            .map(|n| key(0xd0, n))
-            .chain((0..40u32).map(|n| key(0xe0, n)))
-            .filter(|k| {
-                seen.get(k)
-                    .is_none_or(|v| v.first().is_none_or(|f| *f > round_passes))
-            })
-            .collect();
-        assert!(
-            unexamined.is_empty(),
-            "every hop row reached within ceil(N / 40) hours plus one ({round_passes} passes): {} not",
-            unexamined.len()
         );
     }
 
