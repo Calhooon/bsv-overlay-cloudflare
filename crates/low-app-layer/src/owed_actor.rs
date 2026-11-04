@@ -4675,7 +4675,33 @@ pub const CLOCK_SUFFIXES: [(&str, &str); 1] = [("chainProbe", "-stale")];
 /// (`coinWord`, `spenderWord`, `fundingWord`, `tracker`) are stripped at storage and joined at the read, so their
 /// stamps never reach a compare.
 pub const STAMP_FACTS: [(&str, &str); 1] = [("spenderPresence", "at")];
+/// FIX-COMPARE-TIPFACTS (bsv-low #1094): the TIP-DATING FACTS, which state the tips a row was judged, probed and
+/// served at and whether that tip moved or could not be read. They are carried and served on both sides and are never
+/// a compare difference by themselves: the compare's verdict is the verdict fields (the row present or absent, its
+/// family, claim, claimable, sats and the projected sweep status). A stored row the read's projection dates
+/// (`snapshotTip`, the tip a stored press was judged at) and a fresh judgement of the same record (which has no
+/// snapshot to date) differ in these alone and compare EQUAL; a verdict field that differs beside them still differs.
+/// The pairs equal but for them are counted apart ([`tip_fact_rows`], the routes' `tipFacts`).
+pub const TIP_FACTS: [&str; 5] = [
+    "snapshotTip",
+    "chainProbeTip",
+    "servedTip",
+    "tipMoved",
+    "tipUnknown",
+];
+/// The facts of a stored row as the compares read them ([`compared_facts_keeping_tips`] less [`TIP_FACTS`]).
 pub fn compared_facts(row: &Value) -> Value {
+    let mut facts = compared_facts_keeping_tips(row);
+    if let Some(m) = facts.as_object_mut() {
+        for k in TIP_FACTS {
+            m.remove(k);
+        }
+    }
+    facts
+}
+/// The compared facts with the [`TIP_FACTS`] kept: the tip-lag reading ([`tip_derived_rows`]) undoes the read's and
+/// the judge's degrades by them before they are dropped.
+fn compared_facts_keeping_tips(row: &Value) -> Value {
     let mut facts: Value = row["facts"]
         .as_str()
         .and_then(|s| serde_json::from_str(s).ok())
@@ -4752,6 +4778,8 @@ pub fn rows_view(
             diff_rows(d1, a).into_iter().filter(|o| !lag.contains(o)).collect::<Vec<_>>()
         }),
         "tipLag": actor_rows.as_deref().map(|a| tip_derived_rows(d1, a)),
+        // FIX-COMPARE-TIPFACTS (bsv-low #1094): the pairs equal but for their tip-dating facts, counted apart.
+        "tipFacts": actor_rows.as_deref().map(|a| tip_fact_rows(d1, a)),
         "tipLagTips": actor_rows.as_deref().map(|a| {
             let lag = tip_derived_rows(d1, a);
             json!({"d1": tips_of(d1, &lag), "actor": tips_of(a, &lag)})
@@ -4856,6 +4884,31 @@ pub fn tip_lag_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
     out
 }
 
+/// PURE (FIX-COMPARE-TIPFACTS, bsv-low #1094): the outpoints on BOTH sides that [`diff_rows`] reads equal whose
+/// [`TIP_FACTS`] differ: the tip-dating facts alone, never a difference (the routes serve the figure as `tipFacts`).
+pub fn tip_fact_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
+    let differ: BTreeSet<String> = diff_rows(d1, actor).into_iter().collect();
+    let tips = |r: &Value| -> Vec<Value> {
+        let f = compared_facts_keeping_tips(r);
+        TIP_FACTS.iter().map(|k| f[*k].clone()).collect()
+    };
+    let actor_by: BTreeMap<&str, &Value> = actor
+        .iter()
+        .filter_map(|r| Some((r["outpoint"].as_str()?, r)))
+        .collect();
+    let mut out: Vec<String> = d1
+        .iter()
+        .filter_map(|r| {
+            let o = r["outpoint"].as_str()?;
+            let a = actor_by.get(o)?;
+            (!differ.contains(o) && tips(r) != tips(a)).then(|| o.to_string())
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// D2-ACTOR-B-FOLD-15 (the eighth delta lens's NEW8-M1): the facts a TIP moves with the record unchanged, beside
 /// `facts.tip` (a [`CLOCK_FACTS`] key) and the `probeTip` column (never compared): a gate's distance and the
 /// tip-unknown flag.
@@ -4881,13 +4934,16 @@ pub fn judged_tip(r: &Value) -> Option<i64> {
 pub fn tip_derived_rows(d1: &[Value], actor: &[Value]) -> Vec<String> {
     let strip = |r: &Value| -> Value {
         let mut r = r.clone();
-        let mut facts = compared_facts(&r);
+        let mut facts = compared_facts_keeping_tips(&r);
         if let Some(m) = facts.as_object_mut() {
             for k in TIP_DERIVED_FACTS {
                 m.remove(k);
             }
             probe_degrade_undone(m);
             read_degrade_as_judged(m);
+            for k in TIP_FACTS {
+                m.remove(k);
+            }
         }
         r["facts"] = json!(facts.to_string());
         r
