@@ -319,7 +319,11 @@ pub async fn note_fault(
 }
 
 /// One fault on the memo row `name` (a pair's, or a subject's: NEW-M1).
-pub async fn note_fault_named(db: &impl SqlPort, name: &str, fault: &str) -> Result<FaultMemo, String> {
+pub async fn note_fault_named(
+    db: &impl SqlPort,
+    name: &str,
+    fault: &str,
+) -> Result<FaultMemo, String> {
     let name = name.to_owned();
     let now = db.now_ms() as i64;
     let held = rows(
@@ -1392,10 +1396,7 @@ pub type Pair = (String, String);
 
 /// PURE: the sweep's choice over the rows read past its cursor: up to [`SWEEP_PAIRS_PER_TICK`] distinct pairs, oldest
 /// first, and the cursor to save (`None`: the walk reached the end of the backlog, start again next tick).
-pub fn sweep_choice(
-    rows: &[Value],
-    read_limit: usize,
-) -> (Vec<Pair>, Option<(i64, i64)>) {
+pub fn sweep_choice(rows: &[Value], read_limit: usize) -> (Vec<Pair>, Option<(i64, i64)>) {
     sweep_choice_up_to(rows, read_limit, SWEEP_PAIRS_PER_TICK)
 }
 
@@ -1530,7 +1531,9 @@ pub async fn sweep_tick(db: &impl SqlPort, now_ms: i64) -> Result<Swept, String>
             .and_then(|c| serde_json::from_str::<Value>(c).ok())
             .unwrap_or(Value::Null);
         match (c["source"].as_str(), c["sourceKey"].as_str()) {
-            (Some(src), Some(key)) => lost.push(((src.to_owned(), key.to_owned()), name.to_owned())),
+            (Some(src), Some(key)) => {
+                lost.push(((src.to_owned(), key.to_owned()), name.to_owned()))
+            }
             // a note that does not read is deleted (it names no pair)
             _ => lost.push((("".into(), "".into()), name.to_owned())),
         }
@@ -1571,7 +1574,11 @@ pub async fn sweep_tick(db: &impl SqlPort, now_ms: i64) -> Result<Swept, String>
         horizon_ms: horizon,
         ..Swept::default()
     };
-    let all: Vec<Pair> = lost_pairs.iter().chain(candidates.iter()).cloned().collect();
+    let all: Vec<Pair> = lost_pairs
+        .iter()
+        .chain(candidates.iter())
+        .cloned()
+        .collect();
     // MEDIUM-2: a pair whose judge faulted past the bound waits out its hold (its marks stay; the walk wraps to it);
     // FIX-956: a candidate re-published and not yet passed by the consumer waits (its swept stamp)
     let kept = if all.is_empty() {
@@ -1808,9 +1815,18 @@ pub async fn sweep_publish(env: &worker::Env) -> Result<usize, String> {
         env,
         &[
             ("owed_events_swept_total", report.sent.len() as u64),
-            (publish::COUNTER_SWEEP_PASSED, swept.count(SweepReason::Passed) as u64),
-            (publish::COUNTER_SWEEP_STALLED, swept.count(SweepReason::Stalled) as u64),
-            (publish::COUNTER_SWEEP_LOST, swept.count(SweepReason::Lost) as u64),
+            (
+                publish::COUNTER_SWEEP_PASSED,
+                swept.count(SweepReason::Passed) as u64,
+            ),
+            (
+                publish::COUNTER_SWEEP_STALLED,
+                swept.count(SweepReason::Stalled) as u64,
+            ),
+            (
+                publish::COUNTER_SWEEP_LOST,
+                swept.count(SweepReason::Lost) as u64,
+            ),
             (publish::COUNTER_LOST_NOTED, lost_noted),
             (publish::COUNTER_PUBLISHED, report.sent.len() as u64),
             (publish::COUNTER_SKIPPED, report.skipped as u64),
@@ -2020,7 +2036,9 @@ impl RequeuePort for WorkerRequeue {
         let msg = worker::RawMessageBuilder::new(worker::wasm_bindgen::JsValue::from_str(&body))
             .delay_seconds(delay_s)
             .build_with_content_type(worker::QueueContentType::Text);
-        q.send_raw_batch(vec![msg]).await.map_err(|e| e.to_string())?;
+        q.send_raw_batch(vec![msg])
+            .await
+            .map_err(|e| e.to_string())?;
         crate::d1_ledger::note_queue_ops(1);
         Ok(())
     }
@@ -2592,7 +2610,13 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                             oldest_age =
                                 oldest_age.max(now - raw[i].timestamp().as_millis() as i64);
                             if decoded[i].is_none() {
-                                raw[i].retry();
+                                // the normal path's rule for a message that does not read: a queue retry, then the
+                                // dead letter (never a wall's hand-back: #969 keeps those apart)
+                                let msg = &raw[i];
+                                worker::console_warn!(
+                                    "[owed-events] a message does not read: handed back, then dead-lettered"
+                                );
+                                msg.retry();
                             } else {
                                 hand_back_msg(&raw[i], &requeue, delay, &mut deltas).await;
                             }
@@ -2646,7 +2670,9 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                 ev.source_key,
                 ev.seq
             );
-            *deltas.entry("owed_events_consumer_wall_drops_total").or_default() += 1;
+            *deltas
+                .entry("owed_events_consumer_wall_drops_total")
+                .or_default() += 1;
             // LOW-1 (the second delta lens): the subjects in flight are noted, the pair only when none was
             let in_flight = take_in_flight();
             let mut delay = CONSUMER_WALL_RETRY_S;
@@ -2666,7 +2692,9 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                 }
                 *deltas.entry("owed_events_consumed_total").or_default() += 1;
                 *deltas.entry("owed_events_acked_marks_total").or_default() += routed.marks as u64;
-                *deltas.entry("owed_events_subject_faults_total").or_default() += routed.faults as u64;
+                *deltas
+                    .entry("owed_events_subject_faults_total")
+                    .or_default() += routed.faults as u64;
                 *deltas.entry("owed_events_subject_held_total").or_default() += routed.held as u64;
                 if continues(&routed) {
                     *deltas.entry("owed_events_continued_total").or_default() += 1;
@@ -2705,7 +2733,14 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
         }
     }
     finish_batch(
-        &env, now, oldest_age, messages, service_max, deltas, resolved, horizon,
+        &env,
+        now,
+        oldest_age,
+        messages,
+        service_max,
+        deltas,
+        resolved,
+        horizon,
     )
     .await
 }
@@ -3286,7 +3321,11 @@ pub trait DirectPort {
 
 /// FIX-956 item 3: the bound of [`DirectPort::bound`] over a [`SqlPort`] (`owed_judge::MARKS_SQL`, as the consumer's
 /// Phase C delivery reads it).
-pub async fn direct_bound(db: &impl SqlPort, identity: &str, games: &[String]) -> Result<i64, String> {
+pub async fn direct_bound(
+    db: &impl SqlPort,
+    identity: &str,
+    games: &[String],
+) -> Result<i64, String> {
     let marks = rows(
         db,
         owed_judge::MARKS_SQL,
@@ -3413,7 +3452,8 @@ pub async fn direct_with_class(
     };
     // the filings' bodies are coalesced after their closure (it rides each event's facts); their count, for the pass's
     // fan-out, does not depend on it (one body an identity and chunk)
-    let filing_events: Vec<(OwedEvent, Subjects)> = filings.iter().map(|(k, _)| k.clone()).collect();
+    let filing_events: Vec<(OwedEvent, Subjects)> =
+        filings.iter().map(|(k, _)| k.clone()).collect();
     let filing_bodies = coalesce_direct(ctx_of(&filing_events), tip).len();
     // The rest's events once the marks are read (a faulted read: that event is the queue's), and the pass's fan-out.
     let resolve = {
@@ -3447,13 +3487,18 @@ pub async fn direct_with_class(
         let resolve = resolve.clone();
         async move {
             let (bodies, fan_out, bounds, left) = resolve.await;
-            (call_bodies(port, bodies, class, fan_out, &bounds).await, left)
+            (
+                call_bodies(port, bodies, class, fan_out, &bounds).await,
+                left,
+            )
         }
     };
     let after_closure = async {
         let mut step = ClosureStep::default();
-        let union: std::collections::BTreeSet<String> =
-            filings.iter().flat_map(|(_, keys)| keys.iter().cloned()).collect();
+        let union: std::collections::BTreeSet<String> = filings
+            .iter()
+            .flat_map(|(_, keys)| keys.iter().cloned())
+            .collect();
         let n_filings = filings.len();
         if let Some((stmt, read)) = crate::owed_actor::pass_closure_statement(&union, n_filings) {
             let started = port.now_ms();
@@ -3519,7 +3564,10 @@ pub async fn direct_with_class(
         } else {
             resolve.clone().await.1
         };
-        (step, call_bodies(port, bodies, class, fan_out, &GameBounds::new()).await)
+        (
+            step,
+            call_bodies(port, bodies, class, fan_out, &GameBounds::new()).await,
+        )
     };
     let ((now, left), (step, later)) = futures_util::future::join(immediate, after_closure).await;
     report.left_to_queue += left;
@@ -3593,7 +3641,11 @@ async fn call_bodies(
         let id = b["identity"].as_str().unwrap_or_default().to_owned();
         let games: Vec<String> = b["games"]
             .as_array()
-            .map(|a| a.iter().filter_map(|g| g.as_str().map(str::to_owned)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|g| g.as_str().map(str::to_owned))
+                    .collect()
+            })
             .unwrap_or_default();
         // D2-ACTOR-F: a carried body acknowledges nothing (its apply covers nothing; the queue's delivery is the
         // narrowed read that covers the event and acknowledges it), so no bound is read for it.
@@ -3607,8 +3659,10 @@ async fn call_bodies(
         }
     }
     if !asks.is_empty() {
-        let pairs: Vec<(String, Vec<String>)> =
-            asks.iter().map(|(_, id, g)| (id.clone(), g.clone())).collect();
+        let pairs: Vec<(String, Vec<String>)> = asks
+            .iter()
+            .map(|(_, id, g)| (id.clone(), g.clone()))
+            .collect();
         let answers = port.bounds_many(&pairs).await;
         for ((i, id, games), seen) in asks.into_iter().zip(answers) {
             if let Ok(seen) = seen {
@@ -3638,7 +3692,9 @@ async fn call_bodies(
             let applied = applied_games(a, games);
             if !applied.is_empty()
                 && port
-                    .ack(crate::owed_actor::phase_c_ack_statements(id, &applied, *seen))
+                    .ack(crate::owed_actor::phase_c_ack_statements(
+                        id, &applied, *seen,
+                    ))
                     .await
                     .is_ok()
             {
