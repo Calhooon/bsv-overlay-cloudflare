@@ -24978,4 +24978,37 @@ mod fix1095 {
         ))
         .is_none());
     }
+
+    fn subject_column_differs(col: &str, value: Value) {
+        let d1 = row(d1_facts("index-unspent"), 1);
+        let mut actor = row(d1_facts("index-unspent"), 1);
+        actor[col] = value;
+        assert_eq!(
+            diff_rows(std::slice::from_ref(&d1), std::slice::from_ref(&actor)),
+            vec![O.to_string()],
+            "{col}"
+        );
+        let fields =
+            compare::diff_fields(std::slice::from_ref(&d1), std::slice::from_ref(&actor), O);
+        assert!(fields.get(col).is_some(), "{col}: {fields}");
+        assert_ne!(
+            rows_digest(std::slice::from_ref(&d1)),
+            rows_digest(std::slice::from_ref(&actor)),
+            "{col}"
+        );
+    }
+
+    /// FIX-COMPARE-FACTS-FOLD-1 (R279 LOW-2, its mutant M3): each subject column of the verdict held by its own pin.
+    #[test]
+    fn fix1095f1_c_game_id_is_a_verdict_column() {
+        subject_column_differs("gameId", json!("gother"));
+    }
+    #[test]
+    fn fix1095f1_d_opponent_identity_is_a_verdict_column() {
+        subject_column_differs("opponentIdentity", json!("someone-else"));
+    }
+    #[test]
+    fn fix1095f1_e_at_height_is_a_verdict_column() {
+        subject_column_differs("atHeight", json!(974_010));
+    }
 }
