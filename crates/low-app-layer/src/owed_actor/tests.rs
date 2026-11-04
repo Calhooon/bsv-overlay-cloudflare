@@ -2133,7 +2133,8 @@ async fn d2_actor_b_fold2_m7_the_bars_are_the_fleets() {
     // A later apply of the identity clears its unapplied age.
     let mut b = PendingBars::default();
     b.note_fault("owner", Some(3_000));
-    b.note_answer("queue", &json!({"identity": "owner", "applyMs": 1}));
+    // (APP-L59 fold 1: a landing names its judgement time and the games it applied)
+    b.note_answer("queue", &json!({"identity": "owner", "applyMs": 1, "judgedAtMs": 5_000, "appliedGames": ["g"]}));
     flush_bars_from(&d1, 6_000, &b).await.unwrap();
     let read = d1
         .run_batch(vec![Stmt::new(HEALTH_SQL, vec![])])
@@ -6793,14 +6794,17 @@ fn fold10_g_a_builds_replace_carries_the_oldest_unapplied() {
 /// only (the tip alarm notes nothing). RED on `e99472091`: the object's samples reach its local meter only.
 #[test]
 fn fold10_h_the_object_notes_its_own_first_apply() {
-    let answer = json!({"applied": true, "firstApply": true, "identity": "owner", "atMs": 1_000, "judgedAtMs": 1_300, "applyMs": 40});
+    // APP-L59 fold 1: an answer names the games it applied (a landing clears only those, or a whole-identity entry)
+    let answer = json!({"applied": true, "firstApply": true, "identity": "owner", "atMs": 1_000, "judgedAtMs": 1_300, "applyMs": 40, "appliedGames": ["g"]});
     let mut object = PendingBars::default();
     object.note_answer(bars_class(Some("direct"), None), &answer);
     assert_eq!(object.visible.get("direct").map(Vec::len), Some(1));
     let mut noted = answer.clone();
     noted["noted"] = json!(true);
     let mut caller = PendingBars::default();
-    caller.unapplied.insert("owner".into(), 5);
+    caller
+        .unapplied
+        .insert(("owner".into(), ANY_GAME.into()), 5);
     caller.note_answer("direct", &noted);
     assert!(
         caller.visible.is_empty() && caller.apply.is_empty(),
@@ -11380,7 +11384,8 @@ async fn fix982_a_the_unapplied_figure_is_the_oldest_held_or_faulted_event_in_ev
         .unwrap();
     let mut p = PendingBars::default();
     p.note_fault("owner", Some(now - 7_000));
-    p.note_answer("queue", &json!({"identity": "owner", "applyMs": 1, "applied": true}));
+    // (APP-L59 fold 1: a landing names its judgement time and the games it applied)
+    p.note_answer("queue", &json!({"identity": "owner", "applyMs": 1, "applied": true, "judgedAtMs": now, "appliedGames": ["g"]}));
     flush_bars_from(&d1, now, &p).await.unwrap();
     let body = health_body(Some(&snapshot(&d1, now).await), now, &mark);
     assert_eq!(
@@ -23771,7 +23776,7 @@ mod fix1085 {
     }
 
     fn landed(id: &str, judged: u64) -> Value {
-        json!({"identity": id, "applied": true, "firstApply": true, "applyMs": 40, "atMs": judged - 40, "judgedAtMs": judged})
+        json!({"identity": id, "applied": true, "firstApply": true, "applyMs": 40, "atMs": judged - 40, "judgedAtMs": judged, "appliedGames": ["g1"]})
     }
 
     #[tokio::test]
@@ -23811,5 +23816,99 @@ mod fix1085 {
         // and the served body names it
         let body = health_body(Some(&json!({"bars": [], "counters": {}})), t, &Value::Null);
         assert!(body.get("unappliedIdentities").is_some(), "{body}");
+    }
+
+    fn landed_games(id: &str, judged: u64, games: &[&str]) -> Value {
+        let mut a = landed(id, judged);
+        a["appliedGames"] = json!(games);
+        a
+    }
+
+    /// fold1_m3 (APP-L59 ensemble C MEDIUM-3): an apply of X that LANDED in isolate B after X's wall is recorded in
+    /// the row, so it clears the stall whichever flush comes first: isolate A's later flush of X's fault (event at t)
+    /// finds B's landing (judged t + 30 s) already in the row and writes no entry. RED on d9076aad: A's flush wrote
+    /// X's entry, and nothing cleared it.
+    #[tokio::test]
+    async fn fold1_m3_a_landing_flushed_before_the_fault_clears_it() {
+        let db = SqliteSql::migrated();
+        let t = 1_800_000_000_000u64;
+        let mut b = PendingBars::default();
+        b.note_answer("queue", &landed_games(X, t + 30_000, &["g1"]));
+        flush_bars_from(&db, t + 31_000, &b).await.unwrap();
+        let mut a = PendingBars::default();
+        a.note_fault(X, Some(t));
+        flush_bars_from(&db, t + 60_000, &a).await.unwrap();
+        let f = fleet(&db, t + 61_000);
+        assert_eq!(f["actorUnappliedIdentities"]["count"], 0, "{f}");
+        assert_eq!(f["actorOldestUnappliedEventAgeMs"], Value::Null, "{f}");
+    }
+
+    /// fold1_l4 (C LOW-4): a HELD answer (cold, nothing applied) never clears an identity's stall. RED on d9076aad:
+    /// the held answer cleared X.
+    #[tokio::test]
+    async fn fold1_l4_a_held_answer_never_clears_the_stall() {
+        let db = SqliteSql::migrated();
+        let t = 1_800_000_000_000u64;
+        let mut a = PendingBars::default();
+        a.note_fault(X, Some(t));
+        flush_bars_from(&db, t + 1_000, &a).await.unwrap();
+        let mut b = PendingBars::default();
+        b.note_answer(
+            "queue",
+            &json!({"identity": X, "held": true, "bootstrapArmed": true, "ackSeq": null, "heldGames": ["g1"]}),
+        );
+        b.note_answer("queue", &landed_games(Y, t + 5_000, &["g9"]));
+        flush_bars_from(&db, t + 6_000, &b).await.unwrap();
+        let f = fleet(&db, t + 7_000);
+        assert_eq!(f["actorUnappliedIdentities"]["count"], 1, "{f}");
+        assert_eq!(f["actorUnappliedIdentities"]["oldest"][0]["identity"], X);
+    }
+
+    /// fold1_l4b (B LOW-4): a sibling body's landing in the same flush does not hide the walled body: the stall is
+    /// keyed to the walled body's games, cleared only by an apply that applied them. New API (`note_fault_of`); RED
+    /// against the identity-keyed rule (a landing of any game of X clearing it).
+    #[tokio::test]
+    async fn fold1_l4b_a_sibling_landing_does_not_hide_the_walled_body() {
+        let db = SqliteSql::migrated();
+        let t = 1_800_000_000_000u64;
+        let mut a = PendingBars::default();
+        a.note_fault_of(X, &["g2".to_string()], Some(t));
+        a.note_answer("direct", &landed_games(X, t + 500, &["g1"]));
+        flush_bars_from(&db, t + 1_000, &a).await.unwrap();
+        let f = fleet(&db, t + 2_000);
+        assert_eq!(f["actorUnappliedIdentities"]["count"], 1, "the walled body stays: {f}");
+        // an apply of g2 after it clears it
+        let mut b = PendingBars::default();
+        b.note_answer("queue", &landed_games(X, t + 9_000, &["g1", "g2"]));
+        flush_bars_from(&db, t + 10_000, &b).await.unwrap();
+        assert_eq!(fleet(&db, t + 11_000)["actorUnappliedIdentities"]["count"], 0);
+    }
+
+    /// fold1_m3b (C MEDIUM-3): an entry older than the sweep's stalled bound (600 s, the queue's backstop
+    /// re-publishes past it) is evicted, never kept for good: not served past the bound, and dropped by the next
+    /// flush. RED on d9076aad: served at 601 s and kept by the flush.
+    #[tokio::test]
+    async fn fold1_m3b_an_entry_past_the_sweeps_bound_is_evicted() {
+        let db = SqliteSql::migrated();
+        let t = 1_800_000_000_000u64;
+        let mut a = PendingBars::default();
+        a.note_fault(X, Some(t));
+        flush_bars_from(&db, t + 1_000, &a).await.unwrap();
+        assert_eq!(fleet(&db, t + 599_000)["actorUnappliedIdentities"]["count"], 1);
+        let f = fleet(&db, t + 601_000);
+        assert_eq!(f["actorUnappliedIdentities"]["count"], 0, "{f}");
+        assert_eq!(f["actorOldestUnappliedEventAgeMs"], Value::Null, "{f}");
+        let mut b = PendingBars::default();
+        b.note_answer("queue", &landed_games(Y, t + 600_500, &["g9"]));
+        flush_bars_from(&db, t + 601_000, &b).await.unwrap();
+        let stored: String = db
+            .conn
+            .query_row(
+                "SELECT cursor FROM owed_belt_state WHERE name='owed-actor:bars:queue'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!stored.contains(X), "the flush evicted it: {stored}");
     }
 }

@@ -2935,10 +2935,10 @@ pub struct DirectReport {
     pub first_fault: Option<String>,
     /// FIX-956 item 3 (Phase C only): games whose marks the pass acknowledged after their apply landed.
     pub acked: u64,
-    /// bsv-low #1085 (L59 S-A): each call that walled or faulted, its identity and its event's write time (`atMs`):
-    /// noted unapplied for the fleet's per-identity row and re-published to the queue at once
-    /// ([`direct_events_as`]), so the backstop does not wait for the sweep.
-    pub unapplied: Vec<(String, Option<u64>)>,
+    /// bsv-low #1085 (L59 S-A): each call that walled or faulted, its identity, the body's games (APP-L59 fold 1:
+    /// the stall is keyed by them) and its event's write time (`atMs`): noted unapplied for the fleet's per-identity
+    /// row and re-published to the queue at once ([`direct_events_as`]), so the backstop does not wait for the sweep.
+    pub unapplied: Vec<(String, Vec<String>, Option<u64>)>,
     /// D2-ACTOR-F (bsv-low #959): events whose subjects and rows the publish carried (no marks read here).
     pub carried: u64,
     /// D2-ACTOR-F-FOLD-3: the carried filings this pass gave a closure ([`DirectPort::closure_read`], the pass's ONE
@@ -3492,7 +3492,7 @@ struct CallsDone {
     held: u64,
     acked: u64,
     first_fault: Option<String>,
-    unapplied: Vec<(String, Option<u64>)>,
+    unapplied: Vec<(String, Vec<String>, Option<u64>)>,
 }
 
 /// The direct calls of `bodies` at once (`join_all`), each body stamped with the pass's class and fan-out; in Phase C
@@ -3545,11 +3545,18 @@ async fn call_bodies(
             }
         }
     }
-    let keys: Vec<(String, Option<u64>)> = bodies
+    let keys: Vec<(String, Vec<String>, Option<u64>)> = bodies
         .iter()
         .map(|b| {
             (
                 b["identity"].as_str().unwrap_or_default().to_owned(),
+                b["games"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
                 b["atMs"].as_u64(),
             )
         })
@@ -3701,8 +3708,8 @@ pub async fn direct_events_as(
     // the queue's alone: taken back from this isolate's direct set (a held identity would be called directly again,
     // and wall again, at the next flush).
     let republish = walled_identities(&report);
-    for (id, at) in &report.unapplied {
-        crate::owed_actor::note_actor_fault(id, *at);
+    for (id, games, at) in &report.unapplied {
+        crate::owed_actor::note_actor_fault(id, games, *at);
     }
     if !republish.is_empty() {
         let pairs: Vec<(&str, String)> = republish
@@ -3725,7 +3732,7 @@ pub fn walled_identities(report: &DirectReport) -> Vec<String> {
     let mut out: Vec<String> = report
         .unapplied
         .iter()
-        .map(|(id, _)| id.to_ascii_lowercase())
+        .map(|(id, _, _)| id.to_ascii_lowercase())
         .filter(|id| !id.is_empty())
         .collect();
     out.sort();
