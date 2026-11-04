@@ -24261,6 +24261,42 @@ mod fix1093 {
         assert!(out[2].get("spentSource").is_none());
     }
 
+    /// (g) FOLD 1 RULING 3 (the ensemble's C LOW-2 and A LOW-3): 40 pending re-read games beside 32 carried counted
+    /// games of an identity of 200 games: the shipped keyset pick judges at most half the window first, the pending
+    /// ones before the carried, and the forward walk takes the other half from past the cursor; a first game left out
+    /// is not judged (its pending re-read stays pending, its counted difference counted, FIX-1056's rule). RED on
+    /// 7954f855 (`first` truncated to the whole window): the first games take the whole window (`left: 64 right: 32`).
+    #[test]
+    fn fix1093f_the_forward_walk_keeps_its_half_beside_pending_and_carried_games() {
+        let games: Vec<String> = (0..200).map(|n| format!("g{n:03}")).collect();
+        let pending: Vec<String> = (100..140).map(|n| format!("g{n:03}")).collect();
+        let carried: Vec<String> = (160..192).map(|n| format!("g{n:03}")).collect();
+        let mut first = pending.clone();
+        first.extend(carried.iter().cloned());
+        let first_refs: Vec<&str> = first.iter().map(String::as_str).collect();
+        let max = compare::FRESH_COMPARE_GAMES_MAX;
+        let pick = super::fix1056_pick(&first_refs, &games, max, "g010");
+        let walked: Vec<&String> = pick.picked.iter().filter(|g| !first.contains(g)).collect();
+        assert_eq!(
+            pick.picked.len() - walked.len(),
+            max / 2,
+            "the first games take half the window: {:?}",
+            pick.picked
+        );
+        assert_eq!(
+            &pick.picked[..max / 2],
+            &pending[..max / 2],
+            "pending first"
+        );
+        assert_eq!(walked.len(), max / 2, "the forward walk keeps its half");
+        assert_eq!(
+            walked.first().map(|g| g.as_str()),
+            Some("g011"),
+            "from past the cursor"
+        );
+        assert!(!pick.wrapped);
+    }
+
     /// (c) RULING 2, through the shipped [`compare::fresh_compare`] over the frozen fleet's whale (past
     /// [`compare::FRESH_COMPARE_GAMES_MAX`] games, partial): the stored compare holds a COUNTED difference (beta's row:
     /// `held: false`, the D1 side `hop-stranded` claimable, `staleD1`) in a game this compare's window leaves out. The
