@@ -2481,6 +2481,7 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
         match done {
             Ok(outcome) => {
                 singles.clear();
+                OVERLOAD_STREAK.with(|c| c.set(0));
                 service_max = service_max.max(service_ms);
                 for (i, msg) in raw.iter().enumerate() {
                     if decoded[i].is_none() {
@@ -2575,10 +2576,36 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
                     .or_default() += 1;
             }
             Err(e) => {
-                worker::console_warn!(
-                    "[owed-events] the coalesced batch of {} not judged ({e}): each message judged alone",
-                    evs.len()
-                );
+                let streak = OVERLOAD_STREAK.with(|c| {
+                    c.set(c.get().saturating_add(u32::from(is_d1_overload(&e))));
+                    c.get()
+                });
+                let jitter = (now.rem_euclid(2)) as u32;
+                match coalesced_fault(&e, streak, jitter) {
+                    CoalescedFault::HandBack(delay) => {
+                        worker::console_warn!(
+                            "[owed-events] the coalesced batch of {} not judged ({e}): D1 overloaded, the batch handed back in {delay} s (try {streak} of {OVERLOAD_BACKOFF_TRIES}; nothing judged alone)",
+                            evs.len()
+                        );
+                        for i in singles.drain(..) {
+                            messages += 1;
+                            oldest_age =
+                                oldest_age.max(now - raw[i].timestamp().as_millis() as i64);
+                            if decoded[i].is_none() {
+                                raw[i].retry();
+                            } else {
+                                hand_back_msg(&raw[i], &requeue, delay, &mut deltas).await;
+                            }
+                        }
+                    }
+                    CoalescedFault::Singles => {
+                        OVERLOAD_STREAK.with(|c| c.set(0));
+                        worker::console_warn!(
+                            "[owed-events] the coalesced batch of {} not judged ({e}): each message judged alone",
+                            evs.len()
+                        );
+                    }
+                }
             }
         }
     }
@@ -2681,6 +2708,50 @@ pub async fn queue(batch: worker::MessageBatch<Value>, env: worker::Env) -> work
         &env, now, oldest_age, messages, service_max, deltas, resolved, horizon,
     )
     .await
+}
+
+/// bsv-low #1098 (FIX-D1-STORM) ruling 2: D1's own word that it is overloaded. A batch that meets it is NOT NOW.
+pub fn is_d1_overload(e: &str) -> bool {
+    e.contains("D1 DB is overloaded")
+}
+
+/// The consecutive overload hand-backs of the coalesced batch [`overload_backoff_s`] paces (then the old rule).
+pub const OVERLOAD_BACKOFF_TRIES: u32 = 5;
+
+/// PURE: the delay of the `streak`-th consecutive overload hand-back (1-based): 2, 4, 8, 8, 8 s plus `jitter` (0 or
+/// 1 s); past [`OVERLOAD_BACKOFF_TRIES`] none (the batch goes to the one-message path, as before).
+pub fn overload_backoff_s(streak: u32, jitter: u32) -> Option<u32> {
+    (1..=OVERLOAD_BACKOFF_TRIES)
+        .contains(&streak)
+        .then(|| (1u32 << streak.min(3)) + jitter.min(1))
+}
+
+/// What the consumer does with a coalesced batch whose pass answered `Err(e)` (bsv-low #1098): on D1's overload
+/// inside the back-off, every message is handed back (re-queued, no retry spent, nothing dropped) after the delay,
+/// and NO message is judged alone; else each message is judged alone (the pre-#1098 rule). L60's block 974040: a
+/// coalesced batch of 16 refused by the overload was re-judged as 16 one-message judgements into the same overload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoalescedFault {
+    /// Hand the whole batch back after this many seconds.
+    HandBack(u32),
+    /// Judge each message alone.
+    Singles,
+}
+
+/// PURE: the decision above, `streak` the consecutive overloads INCLUDING this one.
+pub fn coalesced_fault(e: &str, streak: u32, jitter: u32) -> CoalescedFault {
+    match is_d1_overload(e)
+        .then(|| overload_backoff_s(streak, jitter))
+        .flatten()
+    {
+        Some(d) => CoalescedFault::HandBack(d),
+        None => CoalescedFault::Singles,
+    }
+}
+
+thread_local! {
+    /// The isolate's consecutive overload hand-backs (reset by a coalesced pass that answers).
+    static OVERLOAD_STREAK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// FIX-969: one walled message handed back by [`hand_back_walled`], counted by its carriage.
