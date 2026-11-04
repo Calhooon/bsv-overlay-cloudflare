@@ -1086,7 +1086,10 @@ struct OpenTxidRow {
 
 /// The worker's wiring of [`door_open_eviction_with`]: the isolate's memo, the clock, the two D1 reads. Called by the
 /// gated door and the ungated arms BEFORE their write; every post-write guard and the queue read `open_eviction`.
-pub async fn door_open_eviction(db: &D1Database, txid: &str) -> Result<Option<OpenEviction>, String> {
+pub async fn door_open_eviction(
+    db: &D1Database,
+    txid: &str,
+) -> Result<Option<OpenEviction>, String> {
     let now_ms = worker::js_sys::Date::now();
     let memo = DOOR_OPEN_SET.with(|m| m.clone());
     let out = door_open_eviction_with(
@@ -9399,16 +9402,40 @@ mod fix_d1_storm {
         let (sets, ones) = (Cell::new(0), Cell::new(0));
         for i in 0..100u32 {
             let txid = format!("{i:064x}");
-            let got = door(&memo, 1_000.0 + f64::from(i) * 40.0, &txid, &open, &sets, &ones).await;
+            let got = door(
+                &memo,
+                1_000.0 + f64::from(i) * 40.0,
+                &txid,
+                &open,
+                &sets,
+                &ones,
+            )
+            .await;
             assert_eq!(got, Ok(None));
         }
-        assert_eq!((sets.get(), ones.get()), (1, 0), "one memo read, no per-subject read");
+        assert_eq!(
+            (sets.get(), ones.get()),
+            (1, 0),
+            "one memo read, no per-subject read"
+        );
         // past the window the set is read again, once
-        let _ = door(&memo, 1_000.0 + DOOR_OPEN_SET_MEMO_MS + 1.0, &"ab".repeat(32), &open, &sets, &ones).await;
+        let _ = door(
+            &memo,
+            1_000.0 + DOOR_OPEN_SET_MEMO_MS + 1.0,
+            &"ab".repeat(32),
+            &open,
+            &sets,
+            &ones,
+        )
+        .await;
         assert_eq!(sets.get(), 2);
         // a set past its bound reads every subject (the old rule)
         let memo = RefCell::new(DoorOpenSetMemo::default());
-        let many = RefCell::new((0..=DOOR_OPEN_SET_MAX).map(|i| format!("{i:064x}")).collect::<Vec<_>>());
+        let many = RefCell::new(
+            (0..=DOOR_OPEN_SET_MAX)
+                .map(|i| format!("{i:064x}"))
+                .collect::<Vec<_>>(),
+        );
         let (sets, ones) = (Cell::new(0), Cell::new(0));
         let _ = door(&memo, 0.0, &"cd".repeat(32), &many, &sets, &ones).await;
         assert_eq!((sets.get(), ones.get()), (1, 1));
@@ -9426,14 +9453,26 @@ mod fix_d1_storm {
         let memo = RefCell::new(DoorOpenSetMemo::default());
         let open = RefCell::new(vec![subject.to_ascii_lowercase()]);
         let (sets, ones) = (Cell::new(0), Cell::new(0));
-        let got = door(&memo, 0.0, &subject.to_ascii_lowercase(), &open, &sets, &ones).await;
+        let got = door(
+            &memo,
+            0.0,
+            &subject.to_ascii_lowercase(),
+            &open,
+            &sets,
+            &ones,
+        )
+        .await;
         assert_eq!(got, Ok(Some(ev())));
         assert_eq!((sets.get(), ones.get()), (1, 1));
         // an eviction opened after the memo's read, inside its window
         let late = "aa".repeat(32);
         open.borrow_mut().push(late.clone());
         let at_door = door(&memo, 1_000.0, &late, &open, &sets, &ones).await;
-        assert_eq!(at_door, Ok(None), "inside the window the door does not see it");
+        assert_eq!(
+            at_door,
+            Ok(None),
+            "inside the window the door does not see it"
+        );
         // the write-side guard after the write reads the subject's row unmemoised: it catches it
         let guard = open.borrow().iter().any(|t| *t == late).then(ev);
         assert_eq!(guard, Some(ev()));
