@@ -1868,7 +1868,10 @@ async fn queue_entry(
         return parked;
     }
     let cost_env = env.clone();
-    let out = queue_handler(worker::MessageBatch::from(event), env, ctx).await;
+    // bsv-low #1098: each message's `attempts` by id (workers-rs's `Message` does not expose it), read off the
+    // platform's own objects, for the delayed hand-back of a replay D1 refused as overloaded
+    let attempts = crate::queue::attempts_by_id(&event);
+    let out = queue_handler(worker::MessageBatch::from(event), env, ctx, &attempts).await;
     // bsv-low #635: the batch's statements are in the cost window; written when due, one upsert per batch at most.
     flush_cost_if_due(&cost_env).await;
     out
@@ -1879,6 +1882,7 @@ async fn queue_handler(
     batch: worker::MessageBatch<crate::queue::MutationMessage>,
     env: Env,
     ctx: worker::Context,
+    attempts: &std::collections::HashMap<String, u32>,
 ) -> worker::Result<()> {
     use overlay_engine::types::{SubmitMode, TaggedBEEF};
     use worker::MessageExt;
@@ -1994,7 +1998,9 @@ async fn queue_handler(
                         .await;
                     }
                 }
-                msg.retry();
+                if !crate::queue::retry_if_overloaded(&msg, attempts, &fault) {
+                    msg.retry();
+                }
                 continue;
             }
         };
@@ -2052,7 +2058,9 @@ async fn queue_handler(
                         "Queue: the eviction ledger could not be read for {subject} ({e}) — retrying the replay later"
                     );
                     crate::dead_letters::note_failing(db, body, Some(&subject), &format!("the eviction ledger could not be read ({e})"), crate::dead_letters::LetterClass::Fault).await;
-                    msg.retry();
+                    if !crate::queue::retry_if_overloaded(&msg, attempts, &e.to_string()) {
+                        msg.retry();
+                    }
                     continue;
                 }
             }
@@ -2122,7 +2130,9 @@ async fn queue_handler(
                                 crate::dead_letters::LetterClass::Fault,
                             )
                             .await;
-                            msg.retry();
+                            if !crate::queue::retry_if_overloaded(&msg, attempts, &e.to_string()) {
+                                msg.retry();
+                            }
                             continue;
                         }
                     }
@@ -2171,7 +2181,9 @@ async fn queue_handler(
                     crate::dead_letters::note_failing(db, body, Some(&subject), &format!("not durable: {}", report.summary()), crate::dead_letters::LetterClass::of_sites(report.faults.iter().map(|f| f.site)))
                         .await;
                 }
-                msg.retry();
+                if !crate::queue::retry_if_overloaded(&msg, attempts, &report.summary()) {
+                    msg.retry();
+                }
             }
             Err(e) => {
                 worker::console_log!("Queue: mutation failed: {} — retrying", e);
@@ -2180,7 +2192,9 @@ async fn queue_handler(
                         .await;
                     crate::dead_letters::note_failing(db, body, Some(&subject), &format!("failed: {e}"), crate::queue::replay_error_class(&e)).await;
                 }
-                msg.retry();
+                if !crate::queue::retry_if_overloaded(&msg, attempts, &e.to_string()) {
+                    msg.retry();
+                }
             }
         }
     }

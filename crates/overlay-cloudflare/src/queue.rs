@@ -877,9 +877,125 @@ pub async fn enqueue_replay(
         .map_err(|e| format!("mutation queue send failed: {e}"))
 }
 
+/// bsv-low #1098 (FIX-D1-LAUNCH): is a replay's fault D1's overload? `D1 DB is overloaded` (any case) or `Too many
+/// resources consumed`.
+pub fn is_d1_overload(fault: &str) -> bool {
+    let f = fault.to_ascii_lowercase();
+    f.contains("overloaded") || f.contains("too many resources consumed")
+}
+
+/// The first delayed hand-back of an overloaded replay, in seconds.
+pub const OVERLOAD_RETRY_BASE_S: u32 = 5;
+/// The ceiling of the doubling delay, before the jitter.
+pub const OVERLOAD_RETRY_CAP_S: u32 = 60;
+
+/// PURE (bsv-low #1098): the delay of an overloaded replay's hand-back: 5 s on the first attempt, doubling to 60 s,
+/// plus a jitter of 0 to 25 percent (`jitter` in `[0, 1)`, clamped), so the batch's replays spread out instead of
+/// meeting the same overloaded window again. `attempts` is the platform's count (1 on the first delivery; 0 or
+/// unknown reads as 1).
+pub fn overload_retry_delay_s(attempts: u32, jitter: f64) -> u32 {
+    let n = attempts.clamp(1, 16) - 1;
+    let base = OVERLOAD_RETRY_BASE_S
+        .saturating_mul(1u32 << n)
+        .min(OVERLOAD_RETRY_CAP_S);
+    let j = if jitter.is_finite() {
+        jitter.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    base + (f64::from(base) * 0.25 * j).floor() as u32
+}
+
+/// Each message's `attempts` by its id, read off the platform's own objects (workers-rs's `Message` hides it).
+pub fn attempts_by_id(
+    batch: &worker::worker_sys::MessageBatch,
+) -> std::collections::HashMap<String, u32> {
+    use worker::wasm_bindgen::JsCast;
+    let mut out = std::collections::HashMap::new();
+    if let Ok(messages) = batch.messages() {
+        for el in messages.iter() {
+            let m: worker::worker_sys::Message = el.unchecked_into();
+            let attempts = worker::js_sys::Reflect::get(&m, &"attempts".into())
+                .ok()
+                .and_then(|v| v.as_f64())
+                .map(|a| a.max(0.0) as u32);
+            if let (Some(a), Ok(id)) = (attempts, m.id()) {
+                out.insert(String::from(id), a);
+            }
+        }
+    }
+    out
+}
+
+/// bsv-low #1098: hand an OVERLOADED replay back with [`overload_retry_delay_s`]'s delay and answer `true`; any
+/// other fault answers `false` and the caller keeps its immediate `retry()`. The counters, the dead-letter notes and
+/// the DLQ are the caller's, unchanged.
+pub fn retry_if_overloaded(
+    msg: &impl worker::MessageExt,
+    attempts: &std::collections::HashMap<String, u32>,
+    fault: &str,
+) -> bool {
+    if !is_d1_overload(fault) {
+        return false;
+    }
+    let n = attempts.get(&msg.id()).copied().unwrap_or(1);
+    let d = overload_retry_delay_s(n, worker::js_sys::Math::random());
+    worker::console_log!("Queue: attempt {n} - retrying in {d} s (D1 overloaded)");
+    msg.retry_with_options(
+        &worker::QueueRetryOptionsBuilder::new()
+            .with_delay_seconds(d)
+            .build(),
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bsv-low #1098 (FIX-D1-LAUNCH): an overloaded replay waits 5 s doubling to 60 s, plus 0 to 25 percent.
+    #[test]
+    fn fix_d1_launch_the_overload_delay_doubles_to_a_minute_with_jitter() {
+        let ladder: Vec<u32> = (1..=6).map(|a| overload_retry_delay_s(a, 0.0)).collect();
+        assert_eq!(ladder, [5, 10, 20, 40, 60, 60]);
+        assert_eq!(
+            overload_retry_delay_s(0, 0.0),
+            5,
+            "an unknown count reads as the first"
+        );
+        assert_eq!(overload_retry_delay_s(1, 0.999_999), 6);
+        assert_eq!(overload_retry_delay_s(6, 0.999_999), 74);
+        assert_eq!(overload_retry_delay_s(6, 1.0), 75, "at most 25 percent");
+        assert_eq!(overload_retry_delay_s(6, 7.0), 75, "clamped");
+        assert_eq!(overload_retry_delay_s(6, -1.0), 60);
+        assert_eq!(overload_retry_delay_s(u32::MAX, f64::NAN), 60);
+        assert!(is_d1_overload(
+            "D1_ERROR: D1 DB is overloaded. Requests queued for too long."
+        ));
+        assert!(is_d1_overload("D1_ERROR: Too many resources consumed"));
+        assert!(!is_d1_overload("predecessor_not_landed"));
+        assert!(!is_d1_overload("no such table: outputs"));
+    }
+
+    /// bsv-low #1098: the replay's fault arms (the R2 read, both ledger reads, not durable, an error) hand an
+    /// overload back with the delay; the bad body and the underivable subject keep their immediate retry.
+    #[test]
+    fn fix_d1_launch_the_fault_arms_delay_an_overload() {
+        let lib = include_str!("lib.rs");
+        let start = lib.find("async fn queue_handler(").unwrap();
+        let h = &lib[start..start + lib[start..].find("\n}\n").unwrap()];
+        assert_eq!(
+            h.matches("crate::queue::retry_if_overloaded(&msg, attempts,")
+                .count(),
+            5
+        );
+        let undecodable = h.find("failed to deserialize message").unwrap();
+        let first_retry = undecodable + h[undecodable..].find("msg.retry();").unwrap();
+        assert!(!h[undecodable..first_retry].contains("retry_if_overloaded"));
+        let subject = h.find("the replay's subject could not be derived").unwrap();
+        let next_retry = subject + h[subject..].find("msg.retry();").unwrap();
+        assert!(!h[subject..next_retry].contains("retry_if_overloaded"));
+    }
 
     #[test]
     fn replay_never_runs_under_current_tx() {
