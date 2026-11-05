@@ -350,6 +350,36 @@ static RETRY_NOT_BEFORE_MS: AtomicI64 = AtomicI64::new(0);
 /// not clear is answered by the route's own query, which says so).
 pub const CATCHUP_RETRY_BACKOFF_MS: i64 = 15_000;
 
+/// The current back-off of this isolate's catch-up, in ms (bsv-low #1098, FIX-D1-LAUNCH): 0 until an attempt is
+/// refused, then [`next_backoff_ms`] of the previous one per consecutive refused attempt, back to 0 once an attempt
+/// applied every statement.
+static BACKOFF_MS: AtomicI64 = AtomicI64::new(0);
+/// The ceiling of the doubling back-off: ten minutes.
+pub const CATCHUP_RETRY_BACKOFF_MAX_MS: i64 = 600_000;
+
+/// PURE (bsv-low #1098): the back-off after one more refused attempt. The first refusal waits
+/// [`CATCHUP_RETRY_BACKOFF_MS`] (15 s); each consecutive refusal doubles it, to [`CATCHUP_RETRY_BACKOFF_MAX_MS`].
+/// L62's launch storm: a flat 15 s per isolate for ever, every attempt the whole list, 7,609 deferred lines.
+pub fn next_backoff_ms(previous_ms: i64) -> i64 {
+    if previous_ms < CATCHUP_RETRY_BACKOFF_MS {
+        CATCHUP_RETRY_BACKOFF_MS
+    } else {
+        previous_ms
+            .saturating_mul(2)
+            .min(CATCHUP_RETRY_BACKOFF_MAX_MS)
+    }
+}
+
+/// The outcome of one catch-up attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Attempt {
+    /// Every statement applied (or answered `duplicate column`).
+    Applied,
+    /// The first refusal that is not `duplicate column`: the statement and D1's word. The statements after it were
+    /// NOT sent; the next attempt sends the whole list again.
+    Deferred { stmt: &'static str, error: String },
+}
+
 /// PURE: is a catch-up attempt due? Never once applied; otherwise only past the lease of the last attempt.
 pub fn catchup_due(applied: bool, retry_not_before_ms: i64, now_ms: i64) -> bool {
     !applied && now_ms >= retry_not_before_ms
@@ -407,9 +437,37 @@ pub async fn ensure_latch_columns(env: &worker::Env) -> LatchColumnsEnsured {
         now_ms,
     ) {
         // the lease is taken BEFORE the attempt: every other request on this isolate proceeds without one meanwhile
-        RETRY_NOT_BEFORE_MS.store(now_ms + CATCHUP_RETRY_BACKOFF_MS, Ordering::Release);
+        let previous = BACKOFF_MS.load(Ordering::Acquire);
+        RETRY_NOT_BEFORE_MS.store(
+            now_ms + previous.max(CATCHUP_RETRY_BACKOFF_MS),
+            Ordering::Release,
+        );
         if let Ok(db) = env.d1("OVERLAY_DB") {
-            apply(&db).await;
+            let attempt = apply_with(|stmt| {
+                let db = &db;
+                async move {
+                    db.prepare(stmt)
+                        .counted_run()
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+            })
+            .await;
+            match attempt {
+                Attempt::Applied => {
+                    BACKOFF_MS.store(0, Ordering::Release);
+                    APPLIED.store(true, Ordering::Release);
+                }
+                Attempt::Deferred { stmt, error } => {
+                    let backoff = next_backoff_ms(previous);
+                    BACKOFF_MS.store(backoff, Ordering::Release);
+                    let until = worker::Date::now().as_millis() as i64 + backoff;
+                    RETRY_NOT_BEFORE_MS.store(until, Ordering::Release);
+                    // ONE line per refused attempt, never one per statement (bsv-low #1098)
+                    worker::console_log!("[schema] deferred until {until}: {stmt} - {error}");
+                }
+            }
         }
     }
     LatchColumnsEnsured(())
@@ -425,42 +483,34 @@ pub async fn ensure_latch_columns(env: &worker::Env) -> LatchColumnsEnsured {
 /// (epoch Rule 24). The two crates still pin different `worker` majors (0.8
 /// here, 0.7.5 there), so the error TEXT can differ across versions — which
 /// is why the predicates are pinned to agree rather than assumed to.
-/// Issues the list; `APPLIED` is latched inside on full success (the lease the caller took at the attempt's start is
-/// the only backoff — nothing is keyed on the outcome).
-async fn apply(db: &worker::D1Database) {
-    let mut all_ok = true;
+/// Issues the list through `run` (D1's `prepare(..).counted_run()` in production, a counting double in the pins) and
+/// STOPS at the first refusal that is not `duplicate column` (bsv-low #1098: under an overload the first statement
+/// already answered, and the rest only fed the storm). The caller latches [`APPLIED`] on [`Attempt::Applied`] and
+/// sets the back-off on [`Attempt::Deferred`].
+pub async fn apply_with<F, Fut>(mut run: F) -> Attempt
+where
+    F: FnMut(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
     // CREATEs FIRST (gate F5): `ROW_VALID_ALTER` targets `hand_markers`,
-    // which `HAND_MARKERS_CREATE` may be the first to create on this D1 — an
-    // ALTER against a missing table fails not-benign ("no such table"), which
-    // self-heals on the next request but is one avoidable deferred cycle.
-    // This is the module's first in-list dependency; the per-statement
-    // idempotence claims below are per-statement, not cross-statement.
+    // which `HAND_MARKERS_CREATE` may be the first to create on this D1 (an
+    // ALTER against a missing table fails not-benign, "no such table").
     for stmt in CREATE_TABLE_CATCHUPS {
-        if let Err(e) = db.prepare(*stmt).counted_run().await {
-            all_ok = false;
-            worker::console_log!("[schema] CREATE deferred: {stmt} — {e}");
+        if let Err(error) = run(stmt).await {
+            return Attempt::Deferred { stmt, error };
         }
     }
     for stmt in LATCH_COLUMN_ALTERS {
-        match db.prepare(*stmt).counted_run().await {
-            Ok(_) => {}
-            Err(e) => {
-                let msg = e.to_string();
-                if !is_duplicate_column_error(&msg) {
-                    // Not benign: leave the flag unset so the NEXT request
-                    // retries the whole list. A recovery surface must degrade
-                    // toward working (epoch Rule 4b), and latching APPLIED on
-                    // a real failure would turn one transient error into a
-                    // permanent 500 for this isolate (Rule 6).
-                    all_ok = false;
-                    worker::console_log!("[schema] ALTER deferred: {stmt} — {msg}");
-                }
+        if let Err(error) = run(stmt).await {
+            // Not benign: the attempt stops, APPLIED stays unset, the next attempt retries the whole list (a
+            // recovery surface degrades toward working, epoch Rule 4b; latching on a real failure would be Rule 6's
+            // permanent 500).
+            if !is_duplicate_column_error(&error) {
+                return Attempt::Deferred { stmt, error };
             }
         }
     }
-    if all_ok {
-        APPLIED.store(true, Ordering::Release);
-    }
+    Attempt::Applied
 }
 
 #[cfg(test)]
@@ -480,6 +530,62 @@ mod tests {
         // applied: never again, whatever the clock says
         assert!(!catchup_due(true, 0, i64::MAX));
         assert!(!catchup_due(true, not_before, not_before + 1));
+    }
+
+    /// bsv-low #1098: the back-off doubles per refused attempt from 15 s to the 10-minute cap.
+    #[test]
+    fn fix_d1_launch_the_backoff_doubles_to_ten_minutes() {
+        let mut ladder = Vec::new();
+        let mut b = 0;
+        for _ in 0..8 {
+            b = next_backoff_ms(b);
+            ladder.push(b);
+        }
+        assert_eq!(
+            ladder,
+            [15_000, 30_000, 60_000, 120_000, 240_000, 480_000, 600_000, 600_000]
+        );
+    }
+
+    /// bsv-low #1098: an attempt stops at the first refusal that is not `duplicate column`; the statements after it
+    /// are not sent. A `duplicate column` answer is benign and the attempt goes on.
+    #[test]
+    fn fix_d1_launch_an_attempt_stops_at_the_first_refusal() {
+        let sent = std::cell::RefCell::new(Vec::<&'static str>::new());
+        let overloaded = futures_util::FutureExt::now_or_never(apply_with(|stmt| {
+            sent.borrow_mut().push(stmt);
+            async {
+                Err("D1_ERROR: D1 DB is overloaded. Requests queued for too long.".to_string())
+            }
+        }))
+        .expect("the double answers at once");
+        assert_eq!(
+            overloaded,
+            Attempt::Deferred {
+                stmt: CREATE_TABLE_CATCHUPS[0],
+                error: "D1_ERROR: D1 DB is overloaded. Requests queued for too long.".into()
+            }
+        );
+        assert_eq!(sent.borrow().len(), 1, "one statement sent, not the list");
+
+        sent.borrow_mut().clear();
+        let dup = futures_util::FutureExt::now_or_never(apply_with(|stmt| {
+            sent.borrow_mut().push(stmt);
+            let alter = LATCH_COLUMN_ALTERS.contains(&stmt);
+            async move {
+                if alter {
+                    Err("duplicate column name: sigValid".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }))
+        .expect("the double answers at once");
+        assert_eq!(dup, Attempt::Applied);
+        assert_eq!(
+            sent.borrow().len(),
+            CREATE_TABLE_CATCHUPS.len() + LATCH_COLUMN_ALTERS.len()
+        );
     }
 
     /// Each app-layer statement must be EXACTLY the overlay migration that
