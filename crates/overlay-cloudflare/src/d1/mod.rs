@@ -327,87 +327,226 @@ pub fn migration_statement_is_additive(sql: &str) -> bool {
         || trimmed.starts_with("DROP TRIGGER IF EXISTS")
 }
 
-/// Set once THIS isolate has applied [`OVERLAY_MIGRATIONS`] successfully.
+/// The certification state of THIS isolate: the latch, and the back-off of a read it could not make.
 ///
-/// Workers isolates are single-threaded, but the atomic keeps the guard sound
-/// under any future threading model. A fresh isolate starts `false`, so every
-/// cold start still applies the (idempotent) migrations.
-static OVERLAY_MIGRATIONS_APPLIED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Workers isolates are single-threaded, but the atomics keep the guard sound
+/// under any future threading model. A fresh isolate starts unlatched, so every
+/// cold start reads the certificate (and replays the list when it is stale).
+pub struct CertState {
+    applied: std::sync::atomic::AtomicBool,
+    not_before_ms: std::sync::atomic::AtomicI64,
+    backoff_ms: std::sync::atomic::AtomicI64,
+}
+
+impl CertState {
+    /// A fresh isolate's state: unlatched, no back-off.
+    pub const fn new() -> Self {
+        Self {
+            applied: std::sync::atomic::AtomicBool::new(false),
+            not_before_ms: std::sync::atomic::AtomicI64::new(0),
+            backoff_ms: std::sync::atomic::AtomicI64::new(0),
+        }
+    }
+}
+
+impl Default for CertState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static OVERLAY_CERT: CertState = CertState::new();
+
+/// The first wait after a certificate read that could not be made (bsv-low #1098): 15 s.
+pub const CERTIFY_RETRY_BACKOFF_MS: i64 = 15_000;
+/// The ceiling of the doubling wait: ten minutes.
+pub const CERTIFY_RETRY_BACKOFF_MAX_MS: i64 = 600_000;
+
+/// PURE (bsv-low #1098): the wait after one more read that could not be made, 15 s doubling to 10 minutes. The
+/// app layer's `schema::next_backoff_ms` is the same ladder (a copy: the two crates link no common module), each
+/// pinned at the same rungs.
+pub fn next_certify_backoff_ms(previous_ms: i64) -> i64 {
+    if previous_ms < CERTIFY_RETRY_BACKOFF_MS {
+        CERTIFY_RETRY_BACKOFF_MS
+    } else {
+        previous_ms
+            .saturating_mul(2)
+            .min(CERTIFY_RETRY_BACKOFF_MAX_MS)
+    }
+}
+
+/// The reading of the persisted certificate (bsv-low #1098).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MigrationState {
+    /// Both rows certify this build's list.
+    Current,
+    /// A row is absent or differs, or the table is not there yet (a first boot, a pre-gate database): replay.
+    Stale,
+    /// A read FAILED (D1 overloaded, a transport fault): never a replay.
+    CouldNotRead(String),
+}
+
+/// PURE (bsv-low #1098): the three-way reading of the two certificate reads. `fp` is `None` when the count read was
+/// not followed by the fingerprint read. A read error naming a missing table is `Stale` (the first boot: the
+/// certificate's table is created by the list itself, so only a replay can make it); every other read error is
+/// `CouldNotRead`.
+pub fn migration_state_of(
+    count: Result<Option<f64>, String>,
+    fp: Option<Result<Option<f64>, String>>,
+) -> MigrationState {
+    fn read(r: Result<Option<f64>, String>, ok: impl Fn(f64) -> bool) -> Option<MigrationState> {
+        match r {
+            Ok(Some(v)) if ok(v) => None,
+            Ok(_) => Some(MigrationState::Stale),
+            Err(e) if e.to_ascii_lowercase().contains("no such table") => {
+                Some(MigrationState::Stale)
+            }
+            Err(e) => Some(MigrationState::CouldNotRead(e)),
+        }
+    }
+    if let Some(s) = read(count, migration_count_matches) {
+        return s;
+    }
+    match fp {
+        None => MigrationState::Stale,
+        Some(fp) => read(fp, |v| v == migration_list_fingerprint() as f64)
+            .unwrap_or(MigrationState::Current),
+    }
+}
+
+/// What the certification needs of D1 and the isolate, so the rule runs natively over a double.
+#[allow(async_fn_in_trait)]
+pub trait CertPort {
+    /// Read one `ops_counters` value by name.
+    async fn read(&self, name: &str) -> Result<Option<f64>, String>;
+    /// Replay [`OVERLAY_MIGRATIONS`] ([`run_migrations`]).
+    async fn replay(&self) -> Result<(), String>;
+    /// Write the certificate ([`MIGRATION_CERTIFY_SQL`]).
+    async fn certify(&self) -> Result<(), String>;
+    /// Bump `overlay_migrations_deferred_total`, best effort (a fault is swallowed).
+    async fn note_deferred(&self);
+    /// The clock, unix ms.
+    fn now_ms(&self) -> i64;
+    /// One log line.
+    fn log(&self, line: &str);
+}
+
+struct D1Cert<'a>(&'a D1Database);
+
+impl CertPort for D1Cert<'_> {
+    async fn read(&self, name: &str) -> Result<Option<f64>, String> {
+        #[derive(serde::Deserialize)]
+        struct CountRow {
+            value: f64,
+        }
+        Query::new("SELECT value FROM ops_counters WHERE name = ?1")
+            .bind(name)
+            .fetch_optional::<CountRow>(self.0)
+            .await
+            .map(|r| r.map(|r| r.value))
+    }
+    async fn replay(&self) -> Result<(), String> {
+        run_migrations(self.0, OVERLAY_MIGRATIONS).await
+    }
+    async fn certify(&self) -> Result<(), String> {
+        Query::new(MIGRATION_CERTIFY_SQL)
+            .bind(OVERLAY_MIGRATION_COUNT as f64)
+            .bind(migration_list_fingerprint() as f64)
+            .execute(self.0)
+            .await
+            .map(|_| ())
+    }
+    async fn note_deferred(&self) {
+        crate::ops::bump_counter(self.0, "overlay_migrations_deferred_total", 1).await;
+    }
+    fn now_ms(&self) -> i64 {
+        worker::Date::now().as_millis() as i64
+    }
+    fn log(&self, line: &str) {
+        worker::console_log!("{line}");
+    }
+}
 
 /// Apply [`OVERLAY_MIGRATIONS`] at most once per isolate lifetime.
 ///
-/// The 63-statement migration list is 63 sequential D1 round-trips; running it
+/// The migration list is hundreds of sequential D1 round-trips; running it
 /// unguarded on EVERY request taxed every route ~2.5-3s under elevated D1 RTT
-/// (bsv-low #255). The flag is set ONLY after a fully successful pass, so a
-/// failed attempt propagates its error and the next request retries from the
-/// top (`run_migrations` is idempotent by construction). Two requests racing on
-/// a fresh isolate at worst both run the idempotent list — never a skip.
+/// (bsv-low #255). The latch is set ONLY after a fully successful pass or a
+/// certificate that matches, so a failed replay propagates its error and the
+/// next request retries from the top (`run_migrations` is idempotent).
+///
+/// # A read it could not make never replays (bsv-low #1098, FIX-D1-LAUNCH)
+///
+/// L62's launch storm: D1 answered `D1 DB is overloaded` 17,872 times in 19
+/// minutes, and every new isolate whose certificate read failed replayed the
+/// whole list into the overloaded database (`Migration failed` 138). Now the
+/// read is three-way ([`migration_state_of`]): `Stale` replays and certifies
+/// as before (the deploy case); `CouldNotRead` NEVER replays: the isolate
+/// records a not-before ([`next_certify_backoff_ms`], 15 s doubling to 10
+/// minutes), logs one line (`[migrations] certification deferred until <ms>:
+/// <error>`), bumps `overlay_migrations_deferred_total` best effort, and
+/// answers `Ok(())`, as does every request inside the window (no read). Why
+/// `Ok`: the request-path callers turn an `Err` into a failed request, which
+/// under a storm is a 500 on a schema the deploy already certified. So a
+/// request served on an uncertified isolate during a storm runs on the
+/// DEPLOYED schema; a statement that names a column the deploy did not add
+/// fails at prepare, as it does today. A replay that faults is still an
+/// `Err` (the admin routes answer 500 on it).
 pub async fn ensure_overlay_migrations(db: &D1Database) -> Result<(), String> {
-    use std::sync::atomic::Ordering;
-    if OVERLAY_MIGRATIONS_APPLIED.load(Ordering::Acquire) {
-        return Ok(());
-    }
-    // #411 (2026-08-26): VERSION GATE. The per-isolate atomic above only
-    // helps a WARM isolate — a 16-pair run's launch scales up many fresh
-    // isolates at once, and each replayed all 114 idempotent statements into
-    // ONE D1 (the #255 class as a per-scale-up burst; measured live: submits
-    // in that window answered "0 output(s) admitted" and lookups failed).
-    // Now a cold start costs ONE read: if the persisted count matches the
-    // built-in count, the list is current and the full replay is skipped.
-    // The counter row lives in ops_counters, which is itself CREATED by a
-    // migration — so any read failure (first boot, pre-gate database) falls
-    // through to the full run, exactly as before. Fail-open by construction:
-    // a wrong/missing counter can only cause the OLD behavior (full replay),
-    // never a skipped migration — the counter is written ONLY after
-    // run_migrations returns Ok.
-    if migration_state_current(db).await {
-        OVERLAY_MIGRATIONS_APPLIED.store(true, Ordering::Release);
-        return Ok(());
-    }
-    run_migrations(db, OVERLAY_MIGRATIONS).await?;
-    // Review MEDIUM-4: a swallowed certify-write leaves the gate permanently
-    // inert (the burst returns on every scale-up, invisibly) — log it.
-    if let Err(e) = Query::new(MIGRATION_CERTIFY_SQL)
-        .bind(OVERLAY_MIGRATION_COUNT as f64)
-        .bind(migration_list_fingerprint() as f64)
-        .execute(db)
-        .await
-    {
-        worker::console_log!(
-            "[#411] migration certify-write FAILED (gate inert until it lands): {e}"
-        );
-    }
-    OVERLAY_MIGRATIONS_APPLIED.store(true, Ordering::Release);
-    Ok(())
+    ensure_migrations_with(&D1Cert(db), &OVERLAY_CERT).await
 }
 
-/// True IFF the persisted `overlay_migration_count` equals
-/// [`OVERLAY_MIGRATION_COUNT`]. Any read error (missing table on first boot,
-/// D1 fault) or mismatch answers `false` — the caller then runs the full
-/// idempotent list, the pre-gate behavior. Extracted for the comparison test.
-async fn migration_state_current(db: &D1Database) -> bool {
-    #[derive(serde::Deserialize)]
-    struct CountRow {
-        value: f64,
+/// The rule of [`ensure_overlay_migrations`] over a port and a state.
+pub async fn ensure_migrations_with(port: &impl CertPort, st: &CertState) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    if st.applied.load(Ordering::Acquire) {
+        return Ok(());
     }
-    let count_ok =
-        match Query::new("SELECT value FROM ops_counters WHERE name = 'overlay_migration_count'")
-            .fetch_optional::<CountRow>(db)
-            .await
-        {
-            Ok(Some(row)) => migration_count_matches(row.value),
-            _ => false,
-        };
-    if !count_ok {
-        return false;
+    let now = port.now_ms();
+    if now < st.not_before_ms.load(Ordering::Acquire) {
+        return Ok(());
     }
-    match Query::new("SELECT value FROM ops_counters WHERE name = 'overlay_migration_fp'")
-        .fetch_optional::<CountRow>(db)
-        .await
-    {
-        Ok(Some(row)) => row.value == migration_list_fingerprint() as f64,
-        _ => false,
+    // #411 (2026-08-26): VERSION GATE. A cold start costs one or two reads:
+    // a certificate that matches skips the full replay. The counter row is
+    // written ONLY after run_migrations returns Ok, so a wrong or missing
+    // counter can only cause a replay, never a skipped migration.
+    let count = port.read("overlay_migration_count").await;
+    let count_ok = matches!(&count, Ok(Some(v)) if migration_count_matches(*v));
+    let fp = if count_ok {
+        Some(port.read("overlay_migration_fp").await)
+    } else {
+        None
+    };
+    match migration_state_of(count, fp) {
+        MigrationState::Current => {
+            st.backoff_ms.store(0, Ordering::Release);
+            st.applied.store(true, Ordering::Release);
+            Ok(())
+        }
+        MigrationState::CouldNotRead(e) => {
+            let backoff = next_certify_backoff_ms(st.backoff_ms.load(Ordering::Acquire));
+            st.backoff_ms.store(backoff, Ordering::Release);
+            let until = now + backoff;
+            st.not_before_ms.store(until, Ordering::Release);
+            port.log(&format!(
+                "[migrations] certification deferred until {until}: {e}"
+            ));
+            port.note_deferred().await;
+            Ok(())
+        }
+        MigrationState::Stale => {
+            port.replay().await?;
+            // Review MEDIUM-4: a swallowed certify-write leaves the gate permanently
+            // inert (the burst returns on every scale-up, invisibly): log it.
+            if let Err(e) = port.certify().await {
+                port.log(&format!(
+                    "[#411] migration certify-write FAILED (gate inert until it lands): {e}"
+                ));
+            }
+            st.backoff_ms.store(0, Ordering::Release);
+            st.applied.store(true, Ordering::Release);
+            Ok(())
+        }
     }
 }
 
@@ -2533,6 +2672,139 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bsv-low #1098 (FIX-D1-LAUNCH): the three-way reading of the two certificate reads.
+    #[test]
+    fn fix_d1_launch_the_certificate_reads_three_ways() {
+        let n = OVERLAY_MIGRATION_COUNT as f64;
+        let fp = migration_list_fingerprint() as f64;
+        assert_eq!(
+            migration_state_of(Ok(Some(n)), Some(Ok(Some(fp)))),
+            MigrationState::Current
+        );
+        assert_eq!(
+            migration_state_of(Ok(Some(n - 1.0)), None),
+            MigrationState::Stale
+        );
+        assert_eq!(migration_state_of(Ok(None), None), MigrationState::Stale);
+        assert_eq!(
+            migration_state_of(Ok(Some(n)), Some(Ok(Some(fp + 1.0)))),
+            MigrationState::Stale
+        );
+        assert_eq!(
+            migration_state_of(Err("D1_ERROR: no such table: ops_counters".into()), None),
+            MigrationState::Stale,
+            "a first boot replays"
+        );
+        assert_eq!(
+            migration_state_of(Err("D1 DB is overloaded".into()), None),
+            MigrationState::CouldNotRead("D1 DB is overloaded".into())
+        );
+        assert_eq!(
+            migration_state_of(Ok(Some(n)), Some(Err("D1 DB is overloaded".into()))),
+            MigrationState::CouldNotRead("D1 DB is overloaded".into())
+        );
+    }
+
+    /// bsv-low #1098: 15 s doubling to the 10-minute cap.
+    #[test]
+    fn fix_d1_launch_the_certify_backoff_doubles_to_ten_minutes() {
+        let mut b = 0;
+        let ladder: Vec<i64> = (0..8)
+            .map(|_| {
+                b = next_certify_backoff_ms(b);
+                b
+            })
+            .collect();
+        assert_eq!(
+            ladder,
+            [15_000, 30_000, 60_000, 120_000, 240_000, 480_000, 600_000, 600_000]
+        );
+    }
+
+    struct FakeCert {
+        count: std::cell::RefCell<Result<Option<f64>, String>>,
+        now: std::cell::Cell<i64>,
+        reads: std::cell::Cell<u32>,
+        replays: std::cell::Cell<u32>,
+        deferred: std::cell::Cell<u32>,
+        lines: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl CertPort for FakeCert {
+        async fn read(&self, name: &str) -> Result<Option<f64>, String> {
+            self.reads.set(self.reads.get() + 1);
+            if name == "overlay_migration_fp" {
+                return Ok(Some(migration_list_fingerprint() as f64));
+            }
+            self.count.borrow().clone()
+        }
+        async fn replay(&self) -> Result<(), String> {
+            self.replays.set(self.replays.get() + 1);
+            Ok(())
+        }
+        async fn certify(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn note_deferred(&self) {
+            self.deferred.set(self.deferred.get() + 1);
+        }
+        fn now_ms(&self) -> i64 {
+            self.now.get()
+        }
+        fn log(&self, line: &str) {
+            self.lines.borrow_mut().push(line.to_string());
+        }
+    }
+
+    fn run_cert(port: &FakeCert, st: &CertState) -> Result<(), String> {
+        futures_util::FutureExt::now_or_never(ensure_migrations_with(port, st))
+            .expect("the double answers at once")
+    }
+
+    /// bsv-low #1098: a certificate read that could not be made NEVER replays the list; the request is `Ok`, the
+    /// window holds the next reads off (15 s, then 30 s), and a read that answers `Stale` afterwards replays once.
+    #[test]
+    fn fix_d1_launch_a_read_it_could_not_make_never_replays() {
+        let port = FakeCert {
+            count: std::cell::RefCell::new(Err("D1_ERROR: D1 DB is overloaded.".into())),
+            now: std::cell::Cell::new(1_000),
+            reads: Default::default(),
+            replays: Default::default(),
+            deferred: Default::default(),
+            lines: Default::default(),
+        };
+        let st = CertState::new();
+        assert_eq!(run_cert(&port, &st), Ok(()));
+        assert_eq!(
+            (port.reads.get(), port.replays.get(), port.deferred.get()),
+            (1, 0, 1)
+        );
+        assert_eq!(
+            port.lines.borrow().as_slice(),
+            ["[migrations] certification deferred until 16000: D1_ERROR: D1 DB is overloaded."]
+        );
+        // inside the window: no read, no replay, no line
+        port.now.set(15_999);
+        assert_eq!(run_cert(&port, &st), Ok(()));
+        assert_eq!((port.reads.get(), port.replays.get()), (1, 0));
+        // past it, still overloaded: the window doubles
+        port.now.set(16_000);
+        assert_eq!(run_cert(&port, &st), Ok(()));
+        assert_eq!(
+            (port.reads.get(), port.replays.get(), port.deferred.get()),
+            (2, 0, 2)
+        );
+        assert!(port.lines.borrow()[1].contains("deferred until 46000"));
+        // the database answers: a stale certificate replays once and latches
+        *port.count.borrow_mut() = Ok(Some(OVERLAY_MIGRATION_COUNT as f64 - 1.0));
+        port.now.set(46_000);
+        assert_eq!(run_cert(&port, &st), Ok(()));
+        assert_eq!((port.reads.get(), port.replays.get()), (3, 1));
+        port.now.set(46_001);
+        assert_eq!(run_cert(&port, &st), Ok(()));
+        assert_eq!((port.reads.get(), port.replays.get()), (3, 1), "latched");
+    }
 
     /// bsv-low #585, the land delta lens E585-LAND-DELTA-L1 (Rule 10, one
     /// spelling): no production source of the Worker decodes a stored BEEF's
