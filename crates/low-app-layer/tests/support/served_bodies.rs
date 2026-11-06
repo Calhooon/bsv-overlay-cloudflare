@@ -180,6 +180,7 @@ fn fleet_served_bodies_are_byte_identical_before_and_after_derivation() {
                 proof_mined_spenders: &Default::default(),
                 funding_unheld: &Default::default(),
                 join_spent_hops: &Default::default(),
+                marker_pot_spends: &Default::default(),
             });
             let mut owed = owed;
             for row in &mut owed {

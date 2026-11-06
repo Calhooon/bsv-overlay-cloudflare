@@ -245,6 +245,7 @@ fn owed(pages: &[Vec<HopsViewRow>], views: &BTreeMap<String, Value>, l2: bool) -
         proof_mined_spenders: &none,
         funding_unheld: &none,
         join_spent_hops: &Default::default(),
+        marker_pot_spends: &Default::default(),
     };
     low_app_layer::owed_judge::assert_decomposition(&inputs);
     derive_owed_rows(&inputs)

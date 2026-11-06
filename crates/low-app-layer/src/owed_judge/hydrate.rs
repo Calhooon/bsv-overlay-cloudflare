@@ -890,10 +890,58 @@ async fn hydrate_evidence(
     i.proofs_set_aside =
         hops_view::set_aside_proofs_a_refused_word_contradicts(&mut i.hop_sweeps, &refused);
     i.refused_words = refused;
+    // OWED-1137: the pots a VERIFIED hop marker of this identity funded (the hop's recorded spender, or the #837 belt's
+    // held JOIN), each with the index's record of its spend; the spenders join the named set, so their stored bytes
+    // and words are read below with every other spender's.
+    let marker_pots: BTreeSet<String> = i
+        .hops
+        .iter()
+        .filter(|h| h.marker_verified == hops_view::MarkerVerification::Verified)
+        .filter_map(|h| {
+            h.spending_txid
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .or_else(|| {
+                    i.join_spent_hops
+                        .get(&owed::outpoint_key(&h.hop_txid, h.hop_vout))
+                        .cloned()
+                })
+        })
+        .collect();
+    if !marker_pots.is_empty() {
+        for r in read::<Value>(
+            db,
+            owed::MARKER_POT_SPENDS_SQL,
+            vec![json_bind(&marker_pots)],
+        )
+        .await?
+        {
+            let spender = r["spendingTxid"]
+                .as_str()
+                .filter(|_| flag(&r, "spent") == Some(true))
+                .map(str::to_ascii_lowercase);
+            i.marker_pot_spends.insert(
+                text(&r, "txid").to_ascii_lowercase(),
+                owed::MarkerPotSpend {
+                    pot_vout: num(&r, "outputIndex") as u32,
+                    spender,
+                    spent_confirmed: flag(&r, "spentConfirmed"),
+                    spent_height: crate::owed_judge::rank::number(&r, "spentHeight")
+                        .filter(|h| *h > 0)
+                        .map(|h| h as u64),
+                },
+            );
+        }
+    }
     let mut named: BTreeSet<String> = i
         .hops
         .iter()
         .filter_map(|h| h.spending_txid.clone())
+        .chain(
+            i.marker_pot_spends
+                .values()
+                .filter_map(|m| m.spender.clone()),
+        )
         .chain(i.hop_chain.values().filter_map(|w| w.spending_txid.clone()))
         .chain(i.hop_sweeps.values().map(|s| s.sweep_txid.clone()))
         .collect();

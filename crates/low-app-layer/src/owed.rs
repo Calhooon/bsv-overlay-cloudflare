@@ -781,6 +781,246 @@ pub struct OwedInputs<'a> {
     /// held the pot but never recorded the hop's spend (a JOIN admitted by a road with no `tm_lowfund` judgement, the
     /// overlay's `record_join_hop_spends` not yet run). Such a hop is no sweep: the chain spent it into the pot.
     pub join_spent_hops: &'a HashMap<String, String>,
+    /// OWED-1137 (bsv-low #1137): pot txid (lowercase) -> the index's spend of that pot's covenant output, for every
+    /// pot a VERIFIED hop marker of this identity funded (the hop's spender, or the #837 belt's held JOIN). The chain
+    /// marker's rule reads it ([`chain_marker_claims`]): a spend that pays hash160(the marker's settle key) is owed to
+    /// this identity, with or without its filings.
+    pub marker_pot_spends: &'a HashMap<String, MarkerPotSpend>,
+}
+
+/// OWED-1137: the index's spend of a pot a verified hop marker of this identity funded (`pot_records` at the
+/// covenant output, [`MARKER_POT_SPENDS_SQL`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MarkerPotSpend {
+    pub pot_vout: u32,
+    /// The spending transaction the index recorded (lowercase); `None` while the pot stands unspent.
+    pub spender: Option<String>,
+    /// The index's latch on the spend (`spentConfirmed`, written only by a verified proof).
+    pub spent_confirmed: Option<bool>,
+    /// The spend's verified height (`spentHeight`).
+    pub spent_height: Option<u64>,
+}
+
+/// OWED-1137: the pots a verified hop marker funded, as the index records each one's spend (`?1` a JSON array of pot
+/// txids, lowercase): a primary-key probe per pot.
+pub const MARKER_POT_SPENDS_SQL: &str = "SELECT txid,outputIndex,spent,spendingTxid,spentConfirmed,spentHeight FROM pot_records WHERE txid IN (SELECT value FROM json_each(?1)) AND outputIndex=0 AND lockKind='covenant'";
+
+/// OWED-1137: the fact a row the chain marker's rule made carries (`facts.source`), so a reader tells it from a row a
+/// filing made.
+pub const CHAIN_MARKER_SOURCE: &str = "chain-marker";
+/// OWED-1137: the sentence of a pot whose spend the index recorded but whose bytes it does not hold: whether the spend
+/// pays this seat's home cannot be read yet (never a courier's body), so nothing is pressed.
+pub const CHAIN_MARKER_BYTES_PENDING_REASON: &str =
+    "the pot's spend is recorded but the index does not hold its bytes yet: whether it pays this seat's home waits for them";
+
+/// OWED-1137: what the chain marker's rule concludes for one pot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainMarkerClaim {
+    /// The index's stored bytes of the spend pay hash160(K): `(vout, sats)` of each output to that home.
+    Pays {
+        spender: String,
+        home_pkh: String,
+        outputs: Vec<(u32, u64)>,
+        confirmed: bool,
+    },
+    /// The spend is recorded and its bytes are not the index's: pending.
+    BytesAbsent { spender: String },
+}
+
+/// One chain-marker claim with the hop that binds it.
+#[derive(Debug, Clone)]
+pub struct ChainMarker {
+    pub pot_txid: String,
+    pub pot_vout: u32,
+    pub game_id: String,
+    pub opponent_identity: String,
+    pub seat_settle_pubkey: String,
+    pub hop_outpoint: String,
+    pub at_height: Option<u64>,
+    pub claim: ChainMarkerClaim,
+}
+
+/// PURE (OWED-1137, bsv-low #1137): a pot spend that pays my home is mine. For every hop of this identity whose
+/// marker VERIFIED (N1: a planted or garbled marker binds nothing), with the settle key K the hop output pays, whose
+/// pot P the index holds spent: the spend's outputs as the INDEX's stored bytes decode them (never a courier body)
+/// paying hash160(K) make a claim keyed on P's outpoint; a spend paying another key makes none; a spend whose bytes
+/// the index does not hold is pending. An output the index holds spent since (collected and moved on) is no claim.
+/// The refund and settle templates are one case here: both pay hash160(K).
+pub fn chain_marker_claims(i: &OwedInputs) -> HashMap<String, ChainMarker> {
+    let mut out: HashMap<String, ChainMarker> = HashMap::new();
+    for h in i.hops {
+        if h.marker_verified != crate::hops_view::MarkerVerification::Verified
+            || h.seat_settle_pubkey.is_empty()
+        {
+            continue;
+        }
+        let hop_key = outpoint_key(&h.hop_txid, h.hop_vout);
+        let pot = h
+            .spending_txid
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .filter(|t| i.pot_spenders.contains(t))
+            .or_else(|| i.join_spent_hops.get(&hop_key).cloned());
+        let Some(pot) = pot else { continue };
+        if i.evicted_pots.contains(&pot) {
+            continue;
+        }
+        let Some(spend) = i.marker_pot_spends.get(&pot) else {
+            continue;
+        };
+        let Some(spender) = spend.spender.clone() else {
+            continue;
+        };
+        let Ok(key) = hex::decode(&h.seat_settle_pubkey) else {
+            continue;
+        };
+        let home = hex::encode(bsv_rs::primitives::hash::hash160(&key));
+        let pot_key = outpoint_key(&pot, spend.pot_vout);
+        if out.contains_key(&pot_key) {
+            continue;
+        }
+        let claim = match i.spender_outputs.get(&spender) {
+            Some(outputs) if !i.courier_spenders.contains(&spender) => {
+                let homes: Vec<&SpenderOutput> = outputs
+                    .iter()
+                    .filter(|o| {
+                        o.pkh_hex
+                            .as_deref()
+                            .is_some_and(|p| p.eq_ignore_ascii_case(&home))
+                    })
+                    .collect();
+                if homes.is_empty() || homes.iter().all(|o| o.spent == Some(true)) {
+                    continue;
+                }
+                let index_proven =
+                    spend.spent_confirmed == Some(true) || spend.spent_height.is_some();
+                ChainMarkerClaim::Pays {
+                    confirmed: index_proven_or_spender_mined(
+                        i,
+                        Some(&spender),
+                        index_proven,
+                        index_proven,
+                    ),
+                    spender,
+                    home_pkh: home,
+                    outputs: homes.iter().map(|o| (o.vout, o.sats)).collect(),
+                }
+            }
+            _ => ChainMarkerClaim::BytesAbsent { spender },
+        };
+        out.insert(
+            pot_key,
+            ChainMarker {
+                pot_txid: pot,
+                pot_vout: spend.pot_vout,
+                game_id: h.game_id.to_ascii_lowercase(),
+                opponent_identity: h.opponent_identity.to_ascii_lowercase(),
+                seat_settle_pubkey: h.seat_settle_pubkey.clone(),
+                hop_outpoint: hop_key,
+                at_height: spend.spent_height,
+                claim,
+            },
+        );
+    }
+    out
+}
+
+/// OWED-1137: the row a chain-marker claim makes (`None`: the identity's own word already retires it). The payout is
+/// the settle payout's shape (`claim: internalize`, the spend its paying transaction, the home its output), claimable
+/// by the settle's bar ([`settle_spend_confirmed`]'s: the index's latch or verified height first, then the spender's
+/// checked `mined` word); the pending one names the spend and presses nothing.
+fn chain_marker_row(
+    i: &OwedInputs,
+    me: &str,
+    m: &ChainMarker,
+    payout_candidates_by_game: &HashMap<String, usize>,
+) -> Option<OwedRow> {
+    let game = m.game_id.clone();
+    let mut facts = json!({
+        "potTxid": m.pot_txid,
+        "potVout": m.pot_vout,
+        "source": CHAIN_MARKER_SOURCE,
+        "hopOutpoint": m.hop_outpoint,
+        "seatSettlePubkey": m.seat_settle_pubkey,
+        "spent": true,
+    });
+    let outpoint = outpoint_key(&m.pot_txid, m.pot_vout);
+    match &m.claim {
+        ChainMarkerClaim::BytesAbsent { spender } => {
+            owed_words(
+                i,
+                &mut facts,
+                Some(spender.as_str()),
+                Some(spender.as_str()),
+            );
+            facts["settleTxid"] = json!(spender);
+            facts["claim"] = Value::Null;
+            facts["claimable"] = json!(false);
+            facts["claimReason"] = json!(CHAIN_MARKER_BYTES_PENDING_REASON);
+            Some(OwedRow {
+                identity: me.to_owned(),
+                outpoint,
+                family: OwedFamily::Unbound,
+                game_id: game,
+                sats: None,
+                opponent_identity: Some(m.opponent_identity.clone()),
+                at_height: m.at_height,
+                facts,
+                reason: Some(CHAIN_MARKER_BYTES_PENDING_REASON.to_string()),
+            })
+        }
+        ChainMarkerClaim::Pays {
+            spender,
+            home_pkh,
+            outputs,
+            confirmed,
+        } => {
+            if i.held_verified.contains(&held_key(&game, spender)) {
+                return None;
+            }
+            let verified_collected = i.collected_verified.contains(&game);
+            if verified_collected && payout_candidates_by_game.get(&game).copied().unwrap_or(0) <= 1
+            {
+                return None;
+            }
+            owed_words(
+                i,
+                &mut facts,
+                Some(spender.as_str()),
+                Some(spender.as_str()),
+            );
+            facts["claim"] = json!("internalize");
+            facts["claimable"] = json!(confirmed);
+            if !confirmed {
+                facts["claimReason"] = json!(UNCONFIRMED_PAYOUT_REASON);
+                facts["chainWait"] = json!("block");
+            }
+            facts["settleTxid"] = json!(spender);
+            facts["collectedMarkerPresent"] =
+                json!(i.collected_present.contains(&game) || verified_collected);
+            facts["collectedSigVerified"] = json!(verified_collected);
+            facts["creditBeef"] = json!(format!("/credit-beef/{spender}"));
+            facts["payTxid"] = json!(spender);
+            facts["heldFiling"] = json!(HELD_FILING_TAG);
+            facts["payPkh"] = json!(home_pkh);
+            facts["payPkhSource"] = json!(CHAIN_MARKER_SOURCE);
+            facts["payVout"] = match outputs.as_slice() {
+                [(v, _)] => json!(v),
+                _ => Value::Null,
+            };
+            Some(OwedRow {
+                identity: me.to_owned(),
+                outpoint,
+                family: OwedFamily::Payout,
+                game_id: game,
+                sats: Some(outputs.iter().map(|(_, s)| *s).sum()),
+                opponent_identity: Some(m.opponent_identity.clone()),
+                at_height: m.at_height,
+                facts,
+                reason: None,
+            })
+        }
+    }
 }
 
 /// bsv-low #837: the seat pots of one index-unspent hop of this identity (`?1` identity, `?2` hop txid, `?3` vout):
@@ -1998,6 +2238,24 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
         }
     }
 
+    // OWED-1137: the pots a verified hop marker of mine funded, judged by the chain marker's rule. A claim is a payout
+    // candidate of its game (N10) unless the results already count that pot.
+    let chain_markers = chain_marker_claims(i);
+    for (pot_key, m) in &chain_markers {
+        let counted = i.results.iter().any(|e| {
+            outpoint_key(&e.pot_txid, e.pot_vout) == *pot_key
+                && e.spent == Some(true)
+                && e.verdict.is_some()
+                && matches!(e.outcome, Outcome::Won | Outcome::Tie | Outcome::Refund)
+        });
+        if !counted && matches!(m.claim, ChainMarkerClaim::Pays { .. }) {
+            *payout_candidates_by_game
+                .entry(m.game_id.clone())
+                .or_insert(0) += 1;
+        }
+    }
+    let mut chain_marker_rows: HashSet<String> = HashSet::new();
+
     // The pots, by the results view (the identity's party window, era-filtered).
     for e in i.results {
         let outpoint = outpoint_key(&e.pot_txid, e.pot_vout);
@@ -2125,6 +2383,13 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                         facts,
                         reason: None,
                     });
+                } else if let Some(m) = chain_markers.get(&outpoint) {
+                    // OWED-1137: the results could not conclude a payout of mine (no verdict, or no seat of mine it
+                    // binds), and a verified hop marker of mine binds the pot: the spend's own outputs say whether it
+                    // pays my home (the row the filed path would serve, sourced `chain-marker`). A concluded filed
+                    // payout wins above; a decided loss is no row above.
+                    chain_marker_rows.insert(outpoint.clone());
+                    rows.extend(chain_marker_row(i, &me, m, &payout_candidates_by_game));
                 } else {
                     let mut facts = base_facts.clone();
                     // the gate's L1: a spend with a VERIFIED proof height is mined (the landing bar's third arm),
@@ -2922,6 +3187,28 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                 }
             }
         }
+    }
+    // OWED-1137: a pot no results row served (no filing of mine names it, no link derived it): the chain marker's row
+    // stands alone, and the hop's "joined, not linked" sentence gives way to it (one row for one money).
+    let mut marker_hops: HashSet<String> = HashSet::new();
+    let mut by_outpoint: Vec<_> = chain_markers.iter().collect();
+    by_outpoint.sort_by(|a, b| a.0.cmp(b.0));
+    for (pot_key, m) in by_outpoint {
+        if chain_marker_rows.contains(pot_key) {
+            marker_hops.insert(m.hop_outpoint.clone());
+            continue;
+        }
+        if !seen.insert(pot_key.clone()) {
+            continue;
+        }
+        marker_hops.insert(m.hop_outpoint.clone());
+        rows.extend(chain_marker_row(i, &me, m, &payout_candidates_by_game));
+    }
+    if !marker_hops.is_empty() {
+        rows.retain(|r| {
+            !(marker_hops.contains(&r.outpoint)
+                && r.reason.as_deref() == Some(JOINED_POT_UNLINKED_REASON))
+        });
     }
     if !contradicted_hops.is_empty() {
         for r in rows.iter_mut() {
@@ -4921,8 +5208,11 @@ pub(crate) mod tests {
             proof_mined_spenders: &NONE,
             funding_unheld: &NONE,
             join_spent_hops: &NO_PKHS,
+            marker_pot_spends: &NO_MARKER_POTS,
         }
     }
+    static NO_MARKER_POTS: std::sync::LazyLock<HashMap<String, MarkerPotSpend>> =
+        std::sync::LazyLock::new(HashMap::new);
     static NO_SPENDERS: std::sync::LazyLock<HashMap<String, Vec<SpenderOutput>>> =
         std::sync::LazyLock::new(HashMap::new);
     static NO_DOOR: std::sync::LazyLock<HashMap<String, DoorRefusal>> =
