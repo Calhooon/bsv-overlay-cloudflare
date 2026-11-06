@@ -668,6 +668,8 @@ pub struct JudgeInputs {
     pub proof_mined_spenders: HashSet<String>,
     pub funding_unheld: HashSet<String>,
     pub join_spent_hops: HashMap<String, String>,
+    /// OWED-1137: pot txid -> the index's spend of a pot a verified hop marker of this identity funded.
+    pub marker_pot_spends: HashMap<String, crate::owed::MarkerPotSpend>,
     pub spender_words: BTreeMap<String, Value>,
     /// Pot outpoints whose chosen party row verifies (`sigValid = 1`): the only pot rows the belt dates (HIGH-3).
     pub verified_pots: HashSet<String>,
@@ -715,6 +717,7 @@ impl JudgeInputs {
             proof_mined_spenders: &self.proof_mined_spenders,
             funding_unheld: &self.funding_unheld,
             join_spent_hops: &self.join_spent_hops,
+            marker_pot_spends: &self.marker_pot_spends,
             spender_words: Some(&self.spender_words),
         }
     }

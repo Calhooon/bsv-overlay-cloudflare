@@ -25031,3 +25031,129 @@ mod fix1095 {
         assert_eq!(same["tipLagEqual"]["outpoints"], json!([]));
     }
 }
+
+/// OWED-1137 (bsv-low #1137): the chain marker's payout on the ACTOR's side. A seat with only its verified hop
+/// marker (no potparty, potrefund or result row), the pot spent by a transaction paying hash160(the marker's key):
+/// the actor judges it over its mirror (the pot's spend and the spender's `txfacts` reached by its own closure) and
+/// stores the D1 judge's row byte for byte; recorded later, the spend's next apply produces the row.
+mod owed1137 {
+    use super::*;
+    use bsv_rs::primitives::hash::hash160;
+    use bsv_rs::script::LockingScript;
+    use bsv_rs::transaction::{Beef, Transaction, TransactionInput, TransactionOutput};
+
+    const K: &str = "021111111111111111111111111111111111111111111111111111111111111111";
+    const K2: &str = "032222222222222222222222222222222222222222222222222222222222222222";
+
+    fn pkh(key: &str) -> String {
+        hex::encode(hash160(&hex::decode(key).unwrap()))
+    }
+    fn out(sats: u64, pkh_hex: &str) -> TransactionOutput {
+        let pkh: [u8; 20] = hex::decode(pkh_hex).unwrap().try_into().unwrap();
+        TransactionOutput {
+            satoshis: Some(sats),
+            locking_script: LockingScript::from_binary(&overlay_discovery::pot::p2pkh_lock(&pkh))
+                .unwrap(),
+            change: false,
+        }
+    }
+
+    /// (the seed without the spend, the spend's statements, the pot txid, the spender txid)
+    fn hand() -> (Fixture, Vec<String>, String, String) {
+        let made = (NOW_MS / 1000) as i64 - 7_200;
+        let mut hop = Transaction::new();
+        hop.inputs.push(TransactionInput::new("41".repeat(32), 0));
+        hop.outputs.push(out(20_000, &pkh(K)));
+        let mut join = Transaction::new();
+        let mut input = TransactionInput::new(hop.id(), 0);
+        input.source_transaction = Some(Box::new(hop.clone()));
+        join.inputs.push(input);
+        join.outputs.push(TransactionOutput {
+            satoshis: Some(40_000),
+            locking_script: LockingScript::from_binary(&[0x51]).unwrap(),
+            change: false,
+        });
+        let mut spend = Transaction::new();
+        let mut input = TransactionInput::new(join.id(), 0);
+        input.source_transaction = Some(Box::new(join.clone()));
+        spend.inputs.push(input);
+        spend.outputs.push(out(19_800, &pkh(K)));
+        spend.outputs.push(out(19_800, &pkh(K2)));
+        let beef = Beef::from_binary(&spend.to_beef(true).unwrap())
+            .unwrap()
+            .to_binary_atomic(&spend.id())
+            .unwrap();
+        let (hop, pot, sp) = (hop.id(), join.id(), spend.id());
+        let seed = vec![
+            format!("INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,spentConfirmed,createdAt,lockKind) VALUES ('{hop}',0,1,'{pot}',1,{made},'p2pkh')"),
+            format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('owner','other','{}',0,20000,'{K}','00','00',2,'{hop}',1,{made},1)", h("11", 37)),
+            format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind,pubA,pubB,payPkhA,payPkhB,paramsDecoded,recoveryHeight,stakeA,stakeB,potSats) VALUES ('{pot}',0,0,{made},'covenant','{K}','{K2}','{}','{}',1,899000,20000,20000,40000)", pkh(K), pkh(K2)),
+        ];
+        let spend_stmts = vec![
+            format!("INSERT INTO pot_beefs(txid,beef,createdAt,has_proof,proof_verified) VALUES ('{sp}',x'{}',{made},0,0)", hex::encode(&beef)),
+            format!("UPDATE pot_records SET spent=1,spendingTxid='{sp}',spentConfirmed=1,spentHeight=899500 WHERE txid='{pot}' AND outputIndex=0"),
+        ];
+        (
+            Fixture {
+                name: "owed1137 marker-only seat",
+                seed,
+                identities: vec!["owner".into()],
+            },
+            spend_stmts,
+            pot,
+            sp,
+        )
+    }
+
+    fn row_of(db: &SqliteSql, outpoint: &str) -> Option<(String, Value)> {
+        db.conn
+            .query_row(
+                "SELECT family,facts FROM owed_rows WHERE identity='owner' AND outpoint=?1",
+                [outpoint],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok()
+            .map(|(f, facts)| (f, serde_json::from_str(&facts).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn owed1137_f_the_actor_owes_the_marker_seat_as_the_d1_judge_does() {
+        let (fixture, spend_stmts, pot, sp) = hand();
+        let d1 = d1_judge(&fixture).await;
+        let (local, _) = actor_judge(&d1, "owner").await;
+        let op = format!("{pot}:0");
+        assert!(
+            row_of(&local, &op).is_none_or(|(_, f)| f["claimable"] != json!(true)),
+            "no press before the spend"
+        );
+        // the spend recorded in the record, then the event's apply on the warm actor and the D1 judge alike
+        for s in &spend_stmts {
+            d1.conn.execute_batch(s).unwrap();
+        }
+        let games = games_of(&d1, "owner");
+        crate::owed_judge::judge_subjects(&d1, "owner", &games, "d1")
+            .await
+            .unwrap();
+        apply(
+            &d1,
+            &local,
+            &Fakes,
+            "owner",
+            &games,
+            Some(("pot", 2)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        let (family, facts) = row_of(&local, &op).expect("the actor's row for the pot");
+        assert_eq!(family, "payout", "{facts}");
+        assert_eq!(facts["source"], "chain-marker", "{facts}");
+        assert_eq!(facts["claimable"], true, "{facts}");
+        assert_eq!(facts["settleTxid"], json!(sp), "{facts}");
+        assert_eq!(stored(&local, "owner"), stored(&d1, "owner"));
+        // and a cold actor bootstrapped after the spend stores the same rows
+        let (cold, _) = actor_judge(&d1, "owner").await;
+        assert_eq!(stored(&cold, "owner"), stored(&d1, "owner"));
+    }
+}
