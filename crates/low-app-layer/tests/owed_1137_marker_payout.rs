@@ -261,3 +261,135 @@ async fn owed1137_f_recording_the_spend_marks_the_marker_seat_and_the_next_judge
     assert_eq!(rows[0]["facts"]["source"], "chain-marker", "{}", rows[0]);
     assert_eq!(rows[0]["facts"]["claimable"], true, "{}", rows[0]);
 }
+
+/// MARKER-LANDING (bsv-low #1137's residual): X's hop marker reaches the index from the hop body's OWN bytes when the
+/// hop is admitted under `tm_lowfund` (the engine landing the JOIN's carried hop), with no `tm_hopparty` submit and
+/// no potparty, potrefund, result or handfile row of X's. The hop body carries the frozen golden marker (real
+/// signatures) at vout 1 naming its P2PKH at vout 0; the hopparty lookup service writes the record from the
+/// `tm_lowfund` admission of vout 0 (and nothing for the change at vout 2), the overlay's writer lands it, and the
+/// pot spent by a refund paying hash160(K) 19,800 with the index's proof latched is owed to X: the claimable
+/// `internalize` row, `source` chain-marker. RED on main: the service read `tm_hopparty` alone, no record, no row.
+#[tokio::test]
+async fn owed1137_h_the_marker_the_hop_body_carries_under_tm_lowfund_owes_the_spend() {
+    use bsv_overlay_cloudflare::d1::QVal;
+    use overlay_discovery::hopparty::lookup_service::HoppartyLookupService;
+    use overlay_discovery::hopparty::storage::MemoryHoppartyStorage;
+    use overlay_engine::lookup_service::LookupService;
+    use overlay_engine::types::OutputAdmittedByTopic;
+    let golden = hex::decode(overlay_discovery::hopparty::GOLDEN_HOPPARTY_HEX).unwrap();
+    let g = overlay_discovery::hopparty::parse_hopparty_marker(&golden).unwrap();
+    let (x, k, game) = (
+        hex::encode(&g.identity),
+        hex::encode(&g.seat_settle_pubkey),
+        hex::encode(g.game_id),
+    );
+
+    // The hop body: the stake to hash160(K) at 0, the marker at 1, the change at 2.
+    let mut hop = Tx::new();
+    hop.add_input(TransactionInput::new("47".repeat(32), 0))
+        .unwrap();
+    hop.add_output(out(g.hop_sats, p2pkh(&pkh(&k)))).unwrap();
+    hop.add_output(out(0, LockingScript::from_binary(&golden).unwrap()))
+        .unwrap();
+    hop.add_output(out(1_234, p2pkh(&"77".repeat(20)))).unwrap();
+    let hop_beef = Beef::from_binary(&hop.to_beef(true).unwrap())
+        .unwrap()
+        .to_binary_atomic(&hop.id())
+        .unwrap();
+
+    // The lookup service told of tm_lowfund's two admitted outputs.
+    let store = std::rc::Rc::new(MemoryHoppartyStorage::new());
+    let svc = HoppartyLookupService::new(store.clone());
+    for index in [0, 2] {
+        svc.output_admitted_by_topic(&OutputAdmittedByTopic::WholeTx {
+            atomic_beef: hop_beef.clone(),
+            output_index: index,
+            topic: "tm_lowfund".into(),
+            off_chain_values: None,
+        })
+        .await
+        .unwrap();
+    }
+    let records = store.all_records();
+    assert_eq!(records.len(), 1, "the hop's own marker, once");
+
+    // The JOIN spending the stake into the pot, and the refund R paying both homes.
+    let mut join = Tx::new();
+    let mut input = TransactionInput::new(hop.id(), 0);
+    input.source_transaction = Some(Box::new(hop.clone()));
+    join.inputs.push(input);
+    join.outputs
+        .push(out(40_000, LockingScript::from_binary(&[0x51]).unwrap()));
+    let mut spend = Tx::new();
+    let mut input = TransactionInput::new(join.id(), 0);
+    input.source_transaction = Some(Box::new(join.clone()));
+    spend.inputs.push(input);
+    spend.outputs.push(out(19_800, p2pkh(&pkh(&k))));
+    spend.outputs.push(out(19_800, p2pkh(&pkh(K2))));
+    let spend_beef = Beef::from_binary(&spend.to_beef(true).unwrap())
+        .unwrap()
+        .to_binary_atomic(&spend.id())
+        .unwrap();
+    let (hop_txid, pot, sp) = (hop.id(), join.id(), spend.id());
+
+    let db = Db::new();
+    let made = (db.now.get() as i64 - 2 * HOUR) / 1000;
+    db.exec(&format!("INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,spentConfirmed,createdAt,lockKind) VALUES ('{hop_txid}',0,1,'{pot}',1,{made},'p2pkh');"));
+    // X's marker, through the overlay's own writer (its latch, its triggers): THIS path's record alone.
+    let q = bsv_overlay_cloudflare::d1_discovery::hopparty_insert_query(&records[0], made);
+    let vals: Vec<rusqlite::types::Value> = q
+        .query()
+        .params()
+        .iter()
+        .map(|p| match p {
+            QVal::Null => rusqlite::types::Value::Null,
+            QVal::Int(i) => rusqlite::types::Value::Integer(*i),
+            QVal::Text(s) => rusqlite::types::Value::Text(s.clone()),
+            QVal::Bool(b) => rusqlite::types::Value::Integer(i64::from(*b)),
+            QVal::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
+            QVal::Float(f) => rusqlite::types::Value::Real(*f),
+        })
+        .collect();
+    db.conn
+        .borrow()
+        .execute(q.query().sql(), rusqlite::params_from_iter(vals.iter()))
+        .unwrap();
+    assert_eq!(
+        db.int(&format!(
+            "SELECT markerValid FROM hopparty_records WHERE txid='{hop_txid}' AND outputIndex=1"
+        )),
+        1,
+        "the golden marker in a hop that pays it latches verified"
+    );
+    db.exec(&format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind,pubA,pubB,payPkhA,payPkhB,paramsDecoded,recoveryHeight,stakeA,stakeB,potSats) VALUES ('{pot}',0,0,{made},'covenant','{k}','{K2}','{a}','{b}',1,{RECOVERY},20000,20000,40000);", a = pkh(&k), b = pkh(K2)));
+    db.conn
+        .borrow()
+        .execute(
+            "INSERT INTO pot_beefs (txid, beef, createdAt, has_proof, proof_verified) VALUES (?1, ?2, ?3, 0, 0)",
+            rusqlite::params![sp, spend_beef, (db.now.get() / 1000) as i64],
+        )
+        .unwrap();
+    db.exec(&format!("UPDATE pot_records SET spent=1,spendingTxid='{sp}',spentConfirmed=1,spentHeight=899500 WHERE txid='{pot}' AND outputIndex=0;"));
+    for table in ["potparty_records", "potrefund_records"] {
+        assert_eq!(
+            db.int(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE identity='{x}'"
+            )),
+            0
+        );
+    }
+
+    drain_all(&db).await;
+    let body = served(&db, &x, Some(900_000)).await;
+    let rows = rows_of(&body, &format!("{pot}:0"));
+    assert_eq!(rows.len(), 1, "one row for the pot: {body}");
+    let r = rows[0];
+    assert_eq!(r["family"], "payout", "{r}");
+    assert_eq!(r["facts"]["claim"], "internalize", "{r}");
+    assert_eq!(r["facts"]["claimable"], true, "{r}");
+    assert_eq!(r["facts"]["source"], "chain-marker", "{r}");
+    assert_eq!(r["facts"]["payTxid"], sp, "{r}");
+    assert_eq!(r["facts"]["payPkh"], pkh(&k), "{r}");
+    assert_eq!(r["sats"], 19_800, "{r}");
+    assert_eq!(r["gameId"], game, "{r}");
+}

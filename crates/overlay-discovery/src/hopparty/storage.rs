@@ -246,6 +246,11 @@ impl MemoryHoppartyStorage {
     pub fn record_count(&self) -> usize {
         self.records.lock().unwrap().len()
     }
+
+    /// Every record the store holds, in insertion order.
+    pub fn all_records(&self) -> Vec<HoppartyRecord> {
+        self.records.lock().unwrap().clone()
+    }
 }
 
 #[async_trait(?Send)]

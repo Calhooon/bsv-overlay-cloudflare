@@ -20,6 +20,12 @@ client — decides). `byHop` returns markers oldest first.
 The marker rides the hop transaction, so `byHop`'s `hopTxid` is the
 marker's **containing** txid and the hop outpoint is `(txid, hopVout)`.
 
+A marker is indexed from two admissions: `tm_hopparty` admitting the marker
+output itself, or `tm_lowfund` admitting the hop output the marker names
+(`hopVout`), whether the hop is posted on its own or carried in a JOIN's
+BEEF. Both write the same row, keyed by the marker's own outpoint, so the
+second is a no-op.
+
 ## Answer
 
 A freeform JSON array, one entry per marker row. The marker's own bytes
