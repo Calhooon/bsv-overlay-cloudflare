@@ -12116,6 +12116,127 @@ async fn fix791c_f_a_join_whose_named_hop_is_evicted_waits_in_tm_lowfund_alone()
     );
 }
 
+// MARKER-LANDING (bsv-low #1137's residual): a JOIN under
+// ["tm_pot","tm_lowfund"] whose two hops carry their `LOW/hopparty/v1` marker
+// at vout 1 and were NEVER submitted to `tm_hopparty`. The engine lands each
+// carried hop under `tm_lowfund` (FIX-791-C) and tells every lookup service of
+// each admitted P2PKH output; the hopparty lookup service reads the hop
+// body's own marker at the admission of the output it names, so both seats'
+// markers reach the hopparty index from the JOIN's BEEF alone. Seat 1 carries
+// the frozen golden marker (real signatures); seat 2 the same bytes with the
+// two identities swapped (parseable, its signatures not its own: stored, the
+// writer latches it 0). RED on main: the service read `tm_hopparty` alone.
+fn marker_hop(marker: &[u8], salt: u32) -> Transaction {
+    let m = bsv_overlay_discovery::hopparty::parse_hopparty_marker(marker).unwrap();
+    let lock =
+        bsv_overlay_discovery::hopparty::validity::expected_hop_lock_hex(&m.seat_settle_pubkey)
+            .unwrap();
+    let mut hop = Transaction::new();
+    hop.inputs.push(absent_input(8000 + salt));
+    hop.outputs.push(TransactionOutput::new(
+        m.hop_sats,
+        LockingScript::from_hex(&lock).unwrap(),
+    ));
+    hop.outputs.push(TransactionOutput::new(
+        0,
+        LockingScript::from_binary(marker).unwrap(),
+    ));
+    hop.outputs
+        .push(TransactionOutput::new(700, p2pkh_of(0x90 + salt as u8)));
+    hop
+}
+
+#[tokio::test]
+async fn marker_landing_a_landed_joins_carried_hops_index_their_own_markers() {
+    use bsv_overlay_discovery::hopparty::lookup_service::HoppartyLookupService;
+    use bsv_overlay_discovery::hopparty::storage::MemoryHoppartyStorage;
+    let (_logs, _guard) = capture_logs();
+    let golden = hex::decode(bsv_overlay_discovery::hopparty::GOLDEN_HOPPARTY_HEX).unwrap();
+    let g = bsv_overlay_discovery::hopparty::parse_hopparty_marker(&golden).unwrap();
+    // Seat 2: identity and opponent swapped (both 33 bytes, at fixed places).
+    let id_at = golden
+        .windows(33)
+        .position(|w| w == g.identity.as_slice())
+        .unwrap();
+    let opp_at = golden
+        .windows(33)
+        .position(|w| w == g.opponent.as_slice())
+        .unwrap();
+    let mut seat2 = golden.clone();
+    seat2[id_at..id_at + 33].copy_from_slice(&g.opponent);
+    seat2[opp_at..opp_at + 33].copy_from_slice(&g.identity);
+    let hops = [marker_hop(&golden, 1), marker_hop(&seat2, 2)];
+    let join = join_over(&hops);
+
+    let store = Rc::new(MemoryStorage::new());
+    let hopparty = Rc::new(MemoryHoppartyStorage::new());
+    let engine = Engine::new(
+        HashMap::from([
+            (
+                "tm_pot".to_string(),
+                Box::new(bsv_overlay_discovery::pot::topic_manager::PotTopicManager::new())
+                    as Box<dyn TopicManager>,
+            ),
+            (
+                "tm_lowfund".to_string(),
+                Box::new(
+                    bsv_overlay_discovery::pot::lowfund_topic_manager::LowFundTopicManager::new(),
+                ) as Box<dyn TopicManager>,
+            ),
+        ]),
+        HashMap::from([(
+            "ls_hopparty".to_string(),
+            Box::new(HoppartyLookupService::new(hopparty.clone()))
+                as Box<dyn bsv_overlay_engine::lookup_service::LookupService>,
+        )]),
+        Box::new(ScriptedStore::plain(&store)),
+        None,
+        EngineConfig::default(),
+    );
+    let beef = TaggedBEEF::new(
+        join.to_beef(true).unwrap(),
+        vec!["tm_pot".to_string(), "tm_lowfund".to_string()],
+    );
+    let r = submitted(&engine, &beef).await;
+    println!(
+        "MARKER-LANDING: durable {} applied {:?} landed {:?} markers {} ({})",
+        r.is_durable(),
+        r.applied_topics,
+        r.landed_predecessors,
+        hopparty.record_count(),
+        r.summary()
+    );
+    assert!(r.is_durable(), "{}", r.summary());
+    assert_eq!(
+        r.landed_predecessors,
+        hops.iter()
+            .map(|h| (h.id(), "tm_lowfund".to_string()))
+            .collect::<Vec<_>>(),
+        "both carried hops landed under tm_lowfund"
+    );
+    let mut got: Vec<(String, u32, String, u32)> = hopparty
+        .all_records()
+        .into_iter()
+        .map(|r| (r.txid, r.output_index, r.identity, r.hop_vout))
+        .collect();
+    got.sort();
+    let mut want = vec![
+        (hops[0].id(), 1, hex::encode(&g.identity), 0),
+        (hops[1].id(), 1, hex::encode(&g.opponent), 0),
+    ];
+    want.sort();
+    assert_eq!(got, want, "each hop's own marker, at its own outpoint");
+    let golden_row = hopparty
+        .all_records()
+        .into_iter()
+        .find(|r| r.txid == hops[0].id())
+        .unwrap();
+    assert!(
+        bsv_overlay_discovery::hopparty::validity::record_marker_valid(&golden_row),
+        "seat 1's record verifies (N1): the hop pays its K"
+    );
+}
+
 // ============================================================================
 // bsv-low #657 (lane ENGINE-657; zanaadu-v2 #414): a lookup service's
 // notification that FAULTS is a fault BEFORE the transaction landed. The

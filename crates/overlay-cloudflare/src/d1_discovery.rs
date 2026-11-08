@@ -11423,6 +11423,160 @@ mod tests {
         assert_eq!(n, 3, "a 0-latched marker is STORED, never refused");
     }
 
+    /// The hop body as the client builds it (the hop P2PKH at vout 0, the
+    /// marker at vout 1, a change P2PKH at vout 2), as an atomic BEEF.
+    fn marker_landing_hop_body(marker_hex: &str, nonce: u8) -> (Vec<u8>, String) {
+        use bsv_rs::script::LockingScript;
+        use bsv_rs::transaction::{Transaction as Tx, TransactionInput, TransactionOutput};
+        let m =
+            overlay_discovery::hopparty::parse_hopparty_marker(&hex::decode(marker_hex).unwrap())
+                .expect("the marker parses");
+        let lock =
+            overlay_discovery::hopparty::validity::expected_hop_lock_hex(&m.seat_settle_pubkey)
+                .expect("a P2PKH for the settle key");
+        let mut tx = Tx::new();
+        tx.add_input(TransactionInput::new(format!("{nonce:02x}").repeat(32), 0))
+            .unwrap();
+        for (sats, script) in [
+            (m.hop_sats, lock),
+            (0, marker_hex.to_string()),
+            (
+                1_234,
+                "76a9146bfd5c7fbe21529d45803dbcf0c87dd3c71efbc288ac".to_string(),
+            ),
+        ] {
+            tx.add_output(TransactionOutput {
+                satoshis: Some(sats),
+                locking_script: LockingScript::from_hex(&script).unwrap(),
+                change: false,
+            })
+            .unwrap();
+        }
+        let beef = tx.to_beef(true).unwrap();
+        let txid = Tx::from_beef(&beef, None).unwrap().id();
+        (beef, txid)
+    }
+
+    /// MARKER-LANDING pin 4 (bsv-low #1137's residual): the record the hopparty
+    /// lookup service writes from a `tm_lowfund` admission of the hop body
+    /// lands through the REAL writer under the production schema: latched 1
+    /// for the golden marker, 0 for a forged seat signature; the client's
+    /// `tm_hopparty` replay of the same marker outpoint leaves one row; and with
+    /// the index holding the hop spent by a pot committing K, the hop-link
+    /// trigger writes the `hop_pot_links` row.
+    #[tokio::test]
+    async fn marker_landing_the_lowfund_record_lands_latched_and_links() {
+        use overlay_discovery::hopparty::lookup_service::HoppartyLookupService;
+        use overlay_discovery::hopparty::storage::MemoryHoppartyStorage;
+        use overlay_engine::lookup_service::LookupService;
+        use overlay_engine::types::OutputAdmittedByTopic;
+        let golden = overlay_discovery::hopparty::GOLDEN_HOPPARTY_HEX;
+        let m = overlay_discovery::hopparty::parse_hopparty_marker(&hex::decode(golden).unwrap())
+            .unwrap();
+        let seat_sig = hex::encode(&m.seat_sig);
+        // The seat signature's last byte flipped: a forged seat signature.
+        let mut forged_sig = seat_sig.clone();
+        let tail = forged_sig.split_off(forged_sig.len() - 2);
+        forged_sig.push_str(if tail == "00" { "01" } else { "00" });
+        let forged = golden.replacen(&seat_sig, &forged_sig, 1);
+        assert_ne!(forged, golden);
+
+        let records = |marker: &str, nonce: u8| {
+            let (beef, txid) = marker_landing_hop_body(marker, nonce);
+            async move {
+                let store = std::rc::Rc::new(MemoryHoppartyStorage::new());
+                let svc = HoppartyLookupService::new(store.clone());
+                // The hop output and its change, as tm_lowfund admits them.
+                for index in [0, 2] {
+                    svc.output_admitted_by_topic(&OutputAdmittedByTopic::WholeTx {
+                        atomic_beef: beef.clone(),
+                        output_index: index,
+                        topic: "tm_lowfund".into(),
+                        off_chain_values: None,
+                    })
+                    .await
+                    .unwrap();
+                }
+                (store.all_records(), beef, txid)
+            }
+        };
+        let (honest, beef, hop_txid) = records(golden, 0x41).await;
+        let (forged_rows, _, forged_txid) = records(&forged, 0x42).await;
+        assert_eq!((honest.len(), forged_rows.len()), (1, 1));
+
+        let conn = production_schema_db();
+        // The pot that spends the hop, committing K as seat A, and the hop
+        // coin the index holds spent by it.
+        let pot = "9a".repeat(32);
+        let settle = hex::encode(&m.seat_settle_pubkey);
+        conn.execute(
+            "INSERT INTO pot_records (txid, outputIndex, spent, createdAt, lockKind, \
+             paramsDecoded, recoveryHeight, pubA, pubB) \
+             VALUES (?1, 0, 0, 1700000000, 'covenant', 1, 900000, ?2, ?3)",
+            rusqlite::params![pot, settle, "02".to_string() + &"bb".repeat(32)],
+        )
+        .unwrap();
+        for txid in [&hop_txid, &forged_txid] {
+            conn.execute(
+                "INSERT INTO pot_records (txid, outputIndex, spent, spendingTxid, createdAt, \
+                 lockKind) VALUES (?1, 0, 1, ?2, 1700000000, 'p2pkh')",
+                rusqlite::params![txid, pot],
+            )
+            .unwrap();
+        }
+
+        exec_query(&conn, hopparty_insert_query(&honest[0], 50).query());
+        exec_query(&conn, hopparty_insert_query(&forged_rows[0], 51).query());
+        let read = |txid: &str| -> (i64, Option<i64>) {
+            conn.query_row(
+                "SELECT outputIndex, markerValid FROM hopparty_records WHERE txid = ?1",
+                [txid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(read(&hop_txid), (1, Some(1)), "the golden marker latches 1");
+        assert_eq!(
+            read(&forged_txid),
+            (1, Some(0)),
+            "a forged seat signature is stored and latched 0"
+        );
+
+        // The client's own tm_hopparty submit of the same marker outpoint.
+        let store = std::rc::Rc::new(MemoryHoppartyStorage::new());
+        let svc = HoppartyLookupService::new(store.clone());
+        svc.output_admitted_by_topic(&OutputAdmittedByTopic::WholeTx {
+            atomic_beef: beef,
+            output_index: 1,
+            topic: "tm_hopparty".into(),
+            off_chain_values: None,
+        })
+        .await
+        .unwrap();
+        let replay = store.all_records();
+        assert_eq!(replay, honest, "the tm_hopparty arm builds the same record");
+        exec_query(&conn, hopparty_insert_query(&replay[0], 52).query());
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM hopparty_records WHERE txid = ?1",
+                [&hop_txid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the replay of the same outpoint leaves one row");
+
+        // derive_hop_insert: the verified marker links its identity to the pot;
+        // the forged one links nothing.
+        let links: Vec<(String, String)> = conn
+            .prepare("SELECT identity, potTxid FROM hop_pot_links ORDER BY identity")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(links, vec![(hex::encode(&m.identity), pot)]);
+    }
+
     // ── #355 + #367 — the RE-LATCH pass, driven against real SQLite ──────
 
     /// Replay a production [`Query`] as a SELECT and hand each row back as a

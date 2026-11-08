@@ -25,6 +25,18 @@
 //! carrying the marker's bytes back VERBATIM. The overlay never verifies
 //! either signature — the record surface is bytes in, bytes out.
 //!
+//! The hop body carries its own marker (bsv-low #1137's residual, lane
+//! MARKER-LANDING): the same service also reads a `tm_lowfund` admission.
+//! `tm_lowfund` admits the hop's P2PKH outputs (the hop's own post, or the
+//! engine landing a JOIN's carried hop under `tm_lowfund`, FIX-791-C), and the
+//! marker at its vout 1 names the hop output it rides beside (`hopVout`). For
+//! each marker output of the admitted transaction whose `hopVout` is the
+//! admitted index, the service stores the record the `tm_hopparty` arm would
+//! store for that marker output (one builder, [`record_from_container`]):
+//! the index learns the marker at the hop's first admission under either
+//! topic, with no client submission of the marker. The hop's change output,
+//! also admitted, names no marker and writes nothing.
+//!
 //! Permanence: a hop-in-flight fact is permanent recovery history and the
 //! admitted output is a provably-unspendable OP_RETURN.
 //! `spend_notification_mode` is [`SpendNotificationMode::None`], and
@@ -92,8 +104,13 @@ impl LookupService for HoppartyLookupService {
             _ => return Err(LookupServiceError::Other("Expected whole-tx mode".into())),
         };
 
-        // Only index tm_hopparty outputs.
-        if !crate::name_matches(topic, "tm_hopparty") {
+        // Two topics carry a marker to this index (bsv-low #1137's residual,
+        // lane MARKER-LANDING): `tm_hopparty` admits the MARKER output itself;
+        // `tm_lowfund` admits the HOP output the marker rides beside (the
+        // hop's own post, or the engine landing a JOIN's carried hop). Any
+        // other topic is not this service's.
+        let hopparty = crate::name_matches(topic, "tm_hopparty");
+        if !hopparty && !crate::name_matches(topic, "tm_lowfund") {
             return Ok(());
         }
 
@@ -111,59 +128,42 @@ impl LookupService for HoppartyLookupService {
                 return Ok(());
             }
         };
-        let Some(marker_output) = tx.outputs.get(output_index as usize) else {
-            debug!("HOPPARTY: admitted output index out of range — skipped");
-            return Ok(());
-        };
 
-        // The topic manager already validated the marker; re-parse to
-        // recover the fields for the index (defensive — the TM should never
-        // admit anything this can't parse).
-        let Some(marker) = parse_hopparty_marker(&marker_output.locking_script.to_binary()) else {
-            debug!("HOPPARTY: admitted output is not a parseable marker — skipped");
-            return Ok(());
-        };
-
-        // The hop txid IS this tx (the marker rides the hop).
-        let txid = tx.id();
-
-        // #310 decode-at-write: the CONTAINER's own output at hopVout.
-        // Absent (hopVout >= |outputs|) stores NULLs, and `containerOutputs`
-        // makes that absence PROVEN rather than ambiguous. No refusal here —
-        // the reader labels.
-        let container_outputs = tx.outputs.len() as u32;
-        // P4 slice 2: the container's size + exact fee, from the same bytes.
-        let facts = crate::tx_facts::facts_from_atomic_beef(atomic_beef, &txid);
-        let hop_output = tx.outputs.get(marker.hop_vout as usize);
-        let hop_lock_hex = hop_output.map(|o| hex::encode(o.locking_script.to_binary()));
-        let hop_sats_on_chain = hop_output.and_then(|o| o.satoshis);
-
-        let record = HoppartyRecord {
-            identity: hex::encode(&marker.identity),
-            opponent_identity: hex::encode(&marker.opponent),
-            game_id: hex::encode(marker.game_id),
-            hop_vout: marker.hop_vout,
-            hop_sats: marker.hop_sats,
-            seat_settle_pubkey: hex::encode(&marker.seat_settle_pubkey),
-            seat_sig_hex: hex::encode(&marker.seat_sig),
-            identity_sig_hex: hex::encode(&marker.identity_sig),
-            hop_lock_hex,
-            hop_sats_on_chain,
-            container_outputs,
-            size_bytes: facts.map(|f| f.size_bytes),
-            fee_sats: facts.and_then(|f| f.fee_sats),
-            txid,
-            output_index,
-            created_at: 0, // assigned by the storage layer at insert
+        let records: Vec<HoppartyRecord> = if hopparty {
+            // The topic manager already validated the marker; re-parse to
+            // recover the fields for the index (defensive — the TM should
+            // never admit anything this can't parse).
+            let record = record_from_container(&tx, atomic_beef, output_index);
+            if record.is_none() {
+                debug!("HOPPARTY: admitted output is not a parseable marker — skipped");
+            }
+            record.into_iter().collect()
+        } else {
+            // `tm_lowfund`: the admitted output is a P2PKH of the hop body.
+            // The hop's marker NAMES the hop output it rides beside
+            // (`hop_vout`), so the record is written for each marker output
+            // of this transaction whose `hop_vout` is the ADMITTED index: the
+            // hop's wallet change (admitted too) and a body with no marker
+            // write nothing. The record is the one the `tm_hopparty` arm
+            // builds for the same marker output (one function), so a later or
+            // earlier `tm_hopparty` submit of the hop is a same-outpoint
+            // no-op.
+            (0..tx.outputs.len() as u32)
+                .filter(|&i| i != output_index)
+                .filter_map(|i| record_from_container(&tx, atomic_beef, i))
+                .filter(|r| r.hop_vout == output_index)
+                .collect()
         };
 
         // Keyed by the OUTPOINT: insert-if-absent makes a replayed submit
         // of the same output a harmless no-op, while markers from different
         // txs are ALL kept.
-        self.storage
-            .store_record(&record)
-            .await
-            .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
+        for record in &records {
+            self.storage
+                .store_record(record)
+                .await
+                .map_err(|e| LookupServiceError::StorageError(e.to_string()))?;
+        }
 
         Ok(())
     }
@@ -275,6 +275,52 @@ impl LookupService for HoppartyLookupService {
             ..Default::default()
         }
     }
+}
+
+/// The index record of the marker at `marker_index` of the container `tx`
+/// (`atomic_beef` its atomic BEEF), or `None` when that output is absent or
+/// is no parseable `LOW/hopparty/v1` marker. The ONE builder both admission
+/// arms call (`tm_hopparty` at the marker's own index, `tm_lowfund` at each
+/// marker naming the admitted hop output), so the two cannot drift.
+///
+/// #310 decode-at-write: the CONTAINER's own output at `hopVout`. Absent
+/// (hopVout >= |outputs|) stores NULLs, and `containerOutputs` makes that
+/// absence PROVEN rather than ambiguous. No refusal here — the reader labels.
+pub(crate) fn record_from_container(
+    tx: &bsv_rs::transaction::Transaction,
+    atomic_beef: &[u8],
+    marker_index: u32,
+) -> Option<HoppartyRecord> {
+    let marker_output = tx.outputs.get(marker_index as usize)?;
+    let marker = parse_hopparty_marker(&marker_output.locking_script.to_binary())?;
+
+    // The hop txid IS this tx (the marker rides the hop).
+    let txid = tx.id();
+    let container_outputs = tx.outputs.len() as u32;
+    // P4 slice 2: the container's size + exact fee, from the same bytes.
+    let facts = crate::tx_facts::facts_from_atomic_beef(atomic_beef, &txid);
+    let hop_output = tx.outputs.get(marker.hop_vout as usize);
+    let hop_lock_hex = hop_output.map(|o| hex::encode(o.locking_script.to_binary()));
+    let hop_sats_on_chain = hop_output.and_then(|o| o.satoshis);
+
+    Some(HoppartyRecord {
+        identity: hex::encode(&marker.identity),
+        opponent_identity: hex::encode(&marker.opponent),
+        game_id: hex::encode(marker.game_id),
+        hop_vout: marker.hop_vout,
+        hop_sats: marker.hop_sats,
+        seat_settle_pubkey: hex::encode(&marker.seat_settle_pubkey),
+        seat_sig_hex: hex::encode(&marker.seat_sig),
+        identity_sig_hex: hex::encode(&marker.identity_sig),
+        hop_lock_hex,
+        hop_sats_on_chain,
+        container_outputs,
+        size_bytes: facts.map(|f| f.size_bytes),
+        fee_sats: facts.and_then(|f| f.fee_sats),
+        txid,
+        output_index: marker_index,
+        created_at: 0, // assigned by the storage layer at insert
+    })
 }
 
 /// Clamp an optional query limit to `1..=MAX_LIMIT` (default
@@ -941,5 +987,173 @@ mod tests {
         // Loud-count guard: the pin must be comparing two real rows, not two
         // empty arrays agreeing with each other.
         assert_eq!(answer.as_array().map(|a| a.len()), Some(2));
+    }
+
+    // ── MARKER-LANDING: the hop body's own marker under tm_lowfund ───────
+
+    /// The hop body as the client builds it: the hop P2PKH at vout 0, the
+    /// marker OP_RETURN at vout 1, the wallet's change P2PKH at vout 2 (when
+    /// `change`). Returns (atomic BEEF, txid).
+    fn hop_body(
+        hop_lock_hex: &str,
+        hop_sats: u64,
+        marker: Option<&[u8]>,
+        change: bool,
+        nonce: u8,
+    ) -> (Vec<u8>, String) {
+        let mut tx = Tx::new();
+        tx.add_input(TransactionInput::new(format!("{nonce:02x}").repeat(32), 0))
+            .unwrap();
+        tx.add_output(TransactionOutput {
+            satoshis: Some(hop_sats),
+            locking_script: LockingScript::from_hex(hop_lock_hex).unwrap(),
+            change: false,
+        })
+        .unwrap();
+        if let Some(script) = marker {
+            tx.add_output(TransactionOutput {
+                satoshis: Some(0),
+                locking_script: LockingScript::from_binary(script).unwrap(),
+                change: false,
+            })
+            .unwrap();
+        }
+        if change {
+            tx.add_output(TransactionOutput {
+                satoshis: Some(1_234),
+                locking_script: LockingScript::from_hex(
+                    "76a9146bfd5c7fbe21529d45803dbcf0c87dd3c71efbc288ac",
+                )
+                .unwrap(),
+                change: false,
+            })
+            .unwrap();
+        }
+        let beef = tx.to_beef(true).expect("BEEF serialization");
+        let txid = Tx::from_beef(&beef, None).expect("engine-side parse").id();
+        (beef, txid)
+    }
+
+    fn admit_under(beef: Vec<u8>, output_index: u32, topic: &str) -> OutputAdmittedByTopic {
+        OutputAdmittedByTopic::WholeTx {
+            atomic_beef: beef,
+            output_index,
+            topic: topic.into(),
+            off_chain_values: None,
+        }
+    }
+
+    /// Pin 1: a `tm_lowfund` admission of the hop output stores the
+    /// marker's record, the marker's own outpoint, the container's facts.
+    #[tokio::test]
+    async fn marker_landing_a_lowfund_admission_of_the_hop_stores_its_marker() {
+        let (svc, storage) = make_service_with_storage();
+        let golden = build_golden_marker();
+        let m = parse_hopparty_marker(&golden).expect("golden parses");
+        let settle = hex::encode(&m.seat_settle_pubkey);
+        let (beef, txid) = hop_body(&p2pkh_for(&settle), m.hop_sats, Some(&golden), true, 0x31);
+        svc.output_admitted_by_topic(&admit_under(beef, 0, "tm_lowfund"))
+            .await
+            .unwrap();
+        let rows = storage.all_records();
+        assert_eq!(rows.len(), 1, "one record: the hop's marker");
+        let r = &rows[0];
+        assert_eq!(r.identity, hex::encode(&m.identity));
+        assert_eq!(r.opponent_identity, hex::encode(&m.opponent));
+        assert_eq!(r.game_id, hex::encode(m.game_id));
+        assert_eq!(r.hop_vout, 0);
+        assert_eq!(r.seat_settle_pubkey, settle);
+        assert_eq!(r.hop_lock_hex.as_deref(), Some(p2pkh_for(&settle).as_str()));
+        assert_eq!(r.hop_sats_on_chain, Some(m.hop_sats));
+        assert_eq!(r.container_outputs, 3);
+        assert_eq!(r.txid, txid);
+        assert_eq!(r.output_index, 1, "the MARKER's own vout");
+        assert!(
+            crate::hopparty::validity::record_marker_valid(r),
+            "the golden marker in a container that pays it verifies (N1)"
+        );
+    }
+
+    /// Pin 2: the change output, a body with no marker, a marker naming
+    /// another vout, and an unrelated topic write nothing.
+    #[tokio::test]
+    async fn marker_landing_writes_nothing_but_the_named_hop_output() {
+        let (svc, storage) = make_service_with_storage();
+        let golden = build_golden_marker();
+        let m = parse_hopparty_marker(&golden).expect("golden parses");
+        let lock = p2pkh_for(&hex::encode(&m.seat_settle_pubkey));
+
+        // The change output (vout 2) is admitted too: the marker names 0.
+        let (beef, _) = hop_body(&lock, m.hop_sats, Some(&golden), true, 0x32);
+        svc.output_admitted_by_topic(&admit_under(beef.clone(), 2, "tm_lowfund"))
+            .await
+            .unwrap();
+        assert_eq!(storage.record_count(), 0, "the change names no marker");
+
+        // No marker output at all.
+        let (beef2, _) = hop_body(&lock, m.hop_sats, None, true, 0x33);
+        svc.output_admitted_by_topic(&admit_under(beef2.clone(), 0, "tm_lowfund"))
+            .await
+            .unwrap();
+        svc.output_admitted_by_topic(&admit_under(beef2, 1, "tm_lowfund"))
+            .await
+            .unwrap();
+        assert_eq!(storage.record_count(), 0, "a body with no marker");
+
+        // A marker naming hop_vout 2, admitted at 0.
+        let other = golden_marker(&golden_game_id(), 2);
+        let (beef3, _) = hop_body(&lock, m.hop_sats, Some(&other), true, 0x34);
+        svc.output_admitted_by_topic(&admit_under(beef3, 0, "tm_lowfund"))
+            .await
+            .unwrap();
+        assert_eq!(storage.record_count(), 0, "a marker naming another vout");
+
+        // Another topic over the hop output writes nothing.
+        svc.output_admitted_by_topic(&admit_under(beef.clone(), 0, "tm_pot"))
+            .await
+            .unwrap();
+        assert_eq!(storage.record_count(), 0, "not this service's topic");
+
+        // Control: the same body at its hop output stores.
+        svc.output_admitted_by_topic(&admit_under(beef, 0, "tm_lowfund"))
+            .await
+            .unwrap();
+        assert_eq!(storage.record_count(), 1);
+    }
+
+    /// Pin 3: the record the `tm_lowfund` arm stores equals, field for
+    /// field, the one the `tm_hopparty` arm stores for the same body at the
+    /// marker's index; and the two admissions together are one row.
+    #[tokio::test]
+    async fn marker_landing_parity_with_the_tm_hopparty_arm() {
+        let golden = build_golden_marker();
+        let m = parse_hopparty_marker(&golden).expect("golden parses");
+        let lock = p2pkh_for(&hex::encode(&m.seat_settle_pubkey));
+        let (beef, _) = hop_body(&lock, m.hop_sats, Some(&golden), true, 0x35);
+
+        let (lf, lf_store) = make_service_with_storage();
+        lf.output_admitted_by_topic(&admit_under(beef.clone(), 0, "tm_lowfund"))
+            .await
+            .unwrap();
+        let (hp, hp_store) = make_service_with_storage();
+        hp.output_admitted_by_topic(&admit_under(beef.clone(), 1, "tm_hopparty"))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(lf_store.all_records()).unwrap(),
+            serde_json::to_value(hp_store.all_records()).unwrap(),
+            "one builder: the two arms store the same record"
+        );
+        assert_eq!(lf_store.record_count(), 1);
+
+        // Both admissions on one store, either order: one row.
+        let (both, both_store) = make_service_with_storage();
+        both.output_admitted_by_topic(&admit_under(beef.clone(), 0, "tm_lowfund"))
+            .await
+            .unwrap();
+        both.output_admitted_by_topic(&admit_under(beef, 1, "tm_hopparty"))
+            .await
+            .unwrap();
+        assert_eq!(both_store.record_count(), 1, "the same outpoint, one row");
     }
 }
