@@ -32,7 +32,7 @@
 //! marker at its vout 1 names the hop output it rides beside (`hopVout`). For
 //! each marker output of the admitted transaction whose `hopVout` is the
 //! admitted index, the service stores the record the `tm_hopparty` arm would
-//! store for that marker output (one builder, [`record_from_container`]):
+//! store for that marker output (one builder, `record_from_container`):
 //! the index learns the marker at the hop's first admission under either
 //! topic, with no client submission of the marker. The hop's change output,
 //! also admitted, names no marker and writes nothing.
