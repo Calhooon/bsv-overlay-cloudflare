@@ -51,6 +51,8 @@ mod gasp_route;
 mod gasp_speed;
 pub mod health_checker;
 pub mod hop_changes;
+// bsv-low #1146 (MARKER-BACKFILL): the one-time backfill of the hop markers the index holds, from their bodies.
+pub mod hop_marker_backfill;
 pub mod hop_probe_memos;
 pub mod janitor;
 pub mod lobby_changes;
@@ -1608,6 +1610,9 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
         crate::proof_fetcher::PARAMS_BACKFILL_LIMIT,
     )
     .await;
+    // 4'. bsv-low #1146 (MARKER-BACKFILL): the hop markers the index holds, from the hops' own stored bodies (see
+    //     the scheduled tick) — pokeable so the backfill converges on demand.
+    let hop_markers = crate::hop_marker_backfill::run_d1_pass(env, db.clone()).await;
     // 4a. bsv-low #406: settleSigners historic backfill (see the scheduled
     //     tick) — pokeable so the beta census can be converged on demand.
     let signers_bf = crate::proof_fetcher::backfill_settle_signers(
@@ -1795,6 +1800,7 @@ async fn admin_complete_proofs(env: &Env, ctx: &Context) -> worker::Result<Respo
     answer["spends_verdicts"] = serde_json::json!(ss.verdicts);
     answer["params_spent_unclassified"] = serde_json::json!(bf.spent_unclassified);
     answer["params_spent_classified"] = serde_json::json!(bf.spent_classified);
+    answer["hop_marker_backfill"] = crate::hop_marker_backfill::report_json(&hop_markers);
     // bsv-low #649 D3-H1: the shared parked drain's pass (`null`: no app layer configured, nothing read); set apart
     // from the literal above, which sits at `json!`'s recursion limit.
     answer["change_parked"] = change_parked.unwrap_or(serde_json::Value::Null);

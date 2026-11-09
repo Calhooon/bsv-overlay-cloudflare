@@ -1983,6 +1983,17 @@
    "why": "the completion stamp prevents a finished repair from ever scanning a later window; no deletion or reset is supported"
   },
   {
+   "name": "hop_marker_backfill_state",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": [],
+   "rebuild_class": "transient",
+   "never_wipe": false,
+   "holds": "the one-time hop marker backfill's cursor, done flag and totals (bsv-low #1146, one row)",
+   "why": "a cursor: a lost row re-runs the backfill, which skips every hop a hopparty row names and inserts by INSERT OR IGNORE"
+  },
+  {
    "name": "conflict_fault_memo",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",

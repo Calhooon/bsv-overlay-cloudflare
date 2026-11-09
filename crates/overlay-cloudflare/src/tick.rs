@@ -736,6 +736,11 @@ async fn run_steps(env: &Env, deadline: i64) -> Result<(), String> {
         backfill_summary.spent_classified,
     );
 
+    // 4'. bsv-low #1146 (MARKER-BACKFILL): the hop markers the index holds, read once from the hops' own stored
+    //     bodies through the one builder and the one store (`hop_marker_backfill`), one bounded page a tick behind
+    //     its state row's cursor; once done, one primary-key read a tick.
+    crate::hop_marker_backfill::run_d1_pass(env, ops_db.clone()).await;
+
     // 4a. bsv-low #406: settleSigners historic backfill ; attach WHO SIGNED
     //     to rows classified before #406 shipped, from the durable spender
     //     bytes. Pure local re-reads + ECDSA verifies; bounded, RANDOM-
@@ -1145,6 +1150,7 @@ mod tests {
             "crate::proof_fetcher::run_pot_maintenance(",
             "crate::proof_fetcher::discover_missing_spends(",
             "crate::proof_fetcher::backfill_decoded_params(",
+            "crate::hop_marker_backfill::run_d1_pass(",
             "crate::proof_fetcher::backfill_settle_signers(",
             "crate::proof_fetcher::backfill_spender_payouts(",
             "crate::relatch::run_relatch(",
