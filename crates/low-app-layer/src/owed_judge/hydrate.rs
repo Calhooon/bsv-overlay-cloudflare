@@ -906,6 +906,13 @@ async fn hydrate_evidence(
                         .get(&owed::outpoint_key(&h.hop_txid, h.hop_vout))
                         .cloned()
                 })
+                // OWED-1145: the chain arm's pot (a chain word naming the hop's spender, the index lagging)
+                .or_else(|| {
+                    i.hop_chain
+                        .get(&owed::outpoint_key(&h.hop_txid, h.hop_vout))
+                        .and_then(|w| w.spending_txid.as_deref())
+                        .map(str::to_ascii_lowercase)
+                })
         })
         .collect();
     if !marker_pots.is_empty() {
@@ -929,6 +936,8 @@ async fn hydrate_evidence(
                     spent_height: crate::owed_judge::rank::number(&r, "spentHeight")
                         .filter(|h| *h > 0)
                         .map(|h| h as u64),
+                    spent: flag(&r, "spent") == Some(true),
+                    params: marker_pot_params(&r),
                 },
             );
         }
@@ -1304,4 +1313,34 @@ fn era_stamped_before(r: &Value, era_ms: Option<i64>) -> bool {
         v["createdAt"] = json!(crate::owed_judge::rank::number(r, "evictedAt").map(|ms| ms / 1000));
     }
     crate::owed_judge::rank::before_era(&v, era_ms)
+}
+
+/// OWED-1145 (bsv-low #1145): a marker pot's decoded covenant params from its `MARKER_POT_SPENDS_SQL` row: `None`
+/// unless `paramsDecoded = 1` and the two committed settle keys and both stakes are present.
+fn marker_pot_params(r: &Value) -> Option<owed::MarkerPotParams> {
+    if flag(r, "paramsDecoded") != Some(true) {
+        return None;
+    }
+    let n = |k: &str| {
+        crate::owed_judge::rank::number(r, k)
+            .filter(|v| *v >= 0)
+            .map(|v| v as u64)
+    };
+    let key = |k: &str| {
+        r[k].as_str()
+            .filter(|v| !v.is_empty())
+            .map(str::to_ascii_lowercase)
+    };
+    Some(owed::MarkerPotParams {
+        recovery_height: n("recoveryHeight"),
+        stake_a: n("stakeA")?,
+        stake_b: n("stakeB")?,
+        fee_sats: n("feeSats").unwrap_or(0),
+        pub_a: key("pubA")?,
+        pub_b: key("pubB")?,
+        pay_pkh_a: key("payPkhA"),
+        pay_pkh_b: key("payPkhB"),
+        pot_sats: n("potSats"),
+        created_at: n("createdAt"),
+    })
 }
