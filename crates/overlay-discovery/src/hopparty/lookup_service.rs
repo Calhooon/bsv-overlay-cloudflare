@@ -277,7 +277,7 @@ impl LookupService for HoppartyLookupService {
 }
 
 /// Every marker record the hop body `tx` (`atomic_beef` its BEEF) carries:
-/// [`record_from_container`] over each of its outputs, in output order. The
+/// `record_from_container` over each of its outputs, in output order. The
 /// ONE reading of a hop body's own markers, called by the `tm_lowfund` arm
 /// (each record naming the admitted hop output) and by the overlay's one-time
 /// backfill of the hops the index already holds (bsv-low #1146: each record
