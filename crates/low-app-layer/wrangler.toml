@@ -102,7 +102,9 @@ IDENTITY_APP_ORIGINS = "https://bsvarcade.com,https://www.bsvarcade.com,https://
 # VISIT (bsv-low app/src/lib/storageEpoch.ts — live hands are guarded, the
 # cosmetic allowlist survives). Unset/empty serves {"storageEpoch": null},
 # which the client treats as "no wipe directive" (fail-safe).
-STORAGE_EPOCH = "2026-08-06-zero-world-1"
+# 2026-11-09 (the launch's wipe, with the era cutoff below; bsv-low record 1979, DECISION-470 option A): bumped so every
+# device clears its local records at its next idle home visit (the era write-off closes the old records' money guard).
+STORAGE_EPOCH = "2026-11-09-launch-1"
 
 # #375 pre-launch era write-off cutoff (owner-ruled 2026-08-07), ms since
 # epoch. When set, every money-listing view (/pots-view /recovery-view
