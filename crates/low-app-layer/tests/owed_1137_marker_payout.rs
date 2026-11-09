@@ -393,3 +393,161 @@ async fn owed1137_h_the_marker_the_hop_body_carries_under_tm_lowfund_owes_the_sp
     assert_eq!(r["sats"], 19_800, "{r}");
     assert_eq!(r["gameId"], game, "{r}");
 }
+
+/// MARKER-BACKFILL pin 4 (bsv-low #1146): a hop the index held before MARKER-LANDING, its marker in its stored body
+/// and no hopparty row, index-unspent, no filings: the overlay's one-time backfill pass (its shipped statements and
+/// the shipped hopparty write, over this database) stores the marker row, and the judge serves the seat's
+/// `hop-stranded` row OFFERING the sweep on the index's word (`chainProbe: index-unspent`, the #669 rule). Before the
+/// pass the seat has no row for the hop at all.
+#[tokio::test]
+async fn owed1146_a_the_backfilled_marker_alone_offers_the_index_unspent_hop_sweep() {
+    use bsv_overlay_cloudflare::d1::QVal;
+    use bsv_overlay_cloudflare::hop_marker_backfill as bf;
+    use overlay_discovery::hopparty::storage::HoppartyRecord;
+
+    fn vals(q: &bsv_overlay_cloudflare::d1::Query) -> Vec<rusqlite::types::Value> {
+        q.params()
+            .iter()
+            .map(|p| match p {
+                QVal::Null => rusqlite::types::Value::Null,
+                QVal::Int(i) => rusqlite::types::Value::Integer(*i),
+                QVal::Text(s) => rusqlite::types::Value::Text(s.clone()),
+                QVal::Bool(b) => rusqlite::types::Value::Integer(i64::from(*b)),
+                QVal::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
+                QVal::Float(f) => rusqlite::types::Value::Real(*f),
+            })
+            .collect()
+    }
+    /// The pass's port over this database: the overlay's shipped statements and write.
+    struct Port<'a>(&'a Db, i64);
+    #[async_trait::async_trait(?Send)]
+    impl bf::Port for Port<'_> {
+        async fn state(&self) -> Result<Option<bf::State>, String> {
+            let conn = self.0.conn.borrow();
+            let mut stmt = conn.prepare(bf::STATE_SQL).unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            Ok(rows.next().unwrap().map(|r| bf::State {
+                cursor: r.get(0).unwrap(),
+                done: r.get::<_, i64>(1).unwrap() != 0,
+                totals: bf::Counts::default(),
+            }))
+        }
+        async fn page(&self, after: i64, rows: u32) -> Result<Vec<bf::PageRow>, String> {
+            let conn = self.0.conn.borrow();
+            let mut stmt = conn.prepare(bf::PAGE_SQL).unwrap();
+            let out = stmt
+                .query_map(rusqlite::params![after, rows], |r| {
+                    let vouts: Option<String> = r.get(5)?;
+                    Ok(bf::PageRow {
+                        rowid: r.get(0)?,
+                        txid: r.get(1)?,
+                        first: r.get::<_, Option<i64>>(2)?.unwrap_or(0) != 0,
+                        marked: r.get::<_, i64>(3)? != 0,
+                        held: r.get::<_, i64>(4)? != 0,
+                        vouts: bf::parse_vouts(vouts.as_deref()),
+                    })
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            Ok(out)
+        }
+        async fn beef(&self, txid: &str) -> Result<Option<Vec<u8>>, String> {
+            let conn = self.0.conn.borrow();
+            let mut stmt = conn
+                .prepare("SELECT beef FROM pot_beefs WHERE txid = ?1")
+                .unwrap();
+            let mut rows = stmt.query([txid]).unwrap();
+            Ok(rows.next().unwrap().map(|r| r.get(0).unwrap()))
+        }
+        async fn store(&self, record: &HoppartyRecord) -> Result<(), String> {
+            let insert =
+                bsv_overlay_cloudflare::d1_discovery::hopparty_insert_query(record, self.1);
+            let q = insert.query();
+            self.0
+                .conn
+                .borrow()
+                .execute(q.sql(), rusqlite::params_from_iter(vals(q).iter()))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+        async fn save(&self, cursor: i64, done: bool, counts: &bf::Counts) -> Result<(), String> {
+            let q = bf::save_query(cursor, done, counts);
+            self.0
+                .conn
+                .borrow()
+                .execute(q.sql(), rusqlite::params_from_iter(vals(&q).iter()))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    let golden = hex::decode(overlay_discovery::hopparty::GOLDEN_HOPPARTY_HEX).unwrap();
+    let g = overlay_discovery::hopparty::parse_hopparty_marker(&golden).unwrap();
+    let (x, k, game) = (
+        hex::encode(&g.identity),
+        hex::encode(&g.seat_settle_pubkey),
+        hex::encode(g.game_id),
+    );
+    // The hop body: the stake to hash160(K) at 0, the marker at 1, the change at 2.
+    let mut hop = Tx::new();
+    hop.add_input(TransactionInput::new("48".repeat(32), 0))
+        .unwrap();
+    hop.add_output(out(g.hop_sats, p2pkh(&pkh(&k)))).unwrap();
+    hop.add_output(out(0, LockingScript::from_binary(&golden).unwrap()))
+        .unwrap();
+    hop.add_output(out(1_234, p2pkh(&"77".repeat(20)))).unwrap();
+    let hop_beef = Beef::from_binary(&hop.to_beef(true).unwrap())
+        .unwrap()
+        .to_binary_atomic(&hop.id())
+        .unwrap();
+    let t = hop.id();
+
+    // The index as tm_lowfund left it before MARKER-LANDING: both P2PKH outputs, unspent, and the body. No marker.
+    let db = Db::new();
+    let made = (db.now.get() as i64 - 2 * HOUR) / 1000;
+    db.exec(&format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{t}',0,0,{made},'p2pkh'),('{t}',2,0,{made},'p2pkh');"));
+    db.conn
+        .borrow()
+        .execute(
+            "INSERT INTO pot_beefs (txid, beef, createdAt) VALUES (?1, ?2, ?3)",
+            rusqlite::params![t, hop_beef, made],
+        )
+        .unwrap();
+    drain_all(&db).await;
+    let before = served(&db, &x, Some(900_000)).await;
+    assert!(
+        rows_of(&before, &format!("{t}:0")).is_empty(),
+        "no row before the backfill: {before}"
+    );
+
+    let r = bf::run_pass(&Port(&db, made), 256, 32).await;
+    assert_eq!(
+        (r.counts.stored, r.counts.invalid, r.done),
+        (1, 0, true),
+        "{r:?}"
+    );
+    for table in ["potparty_records", "potrefund_records"] {
+        assert_eq!(
+            db.int(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE identity='{x}'"
+            )),
+            0
+        );
+    }
+
+    drain_all(&db).await;
+    let body = served(&db, &x, Some(900_000)).await;
+    let rows = rows_of(&body, &format!("{t}:0"));
+    assert_eq!(rows.len(), 1, "one row for the hop: {body}");
+    let row = rows[0];
+    assert_eq!(row["family"], "hop-stranded", "{row}");
+    assert_eq!(row["gameId"], game, "{row}");
+    assert_eq!(row["facts"]["claim"], "sweep-hop", "{row}");
+    assert_eq!(row["facts"]["claimable"], true, "{row}");
+    assert_eq!(row["facts"]["chainProbe"], "index-unspent", "{row}");
+    assert!(
+        rows_of(&body, &format!("{t}:2")).is_empty(),
+        "the change names no marker: {body}"
+    );
+}
