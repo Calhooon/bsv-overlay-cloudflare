@@ -141,6 +141,14 @@ WRITTEN_OFF_BEFORE_HEIGHT = "974809"
 # and counts spend_depth_var_malformed_total once per isolate. The value at risk per R3(b) is the owner's later word.
 SPEND_DEPTH = "1"
 
+# bsv-low #1154 (lane PROOF-SEATS): the identities the PUBLIC leaderboard never lists (no board row, no hand they
+# won; `candidates`, `resultCount` and the paging count what is listed). They are the harness seats of the
+# promotion's prod hand leg (bsv-low scripts/prod-hand-leg.sh: pairs 20, 19 and 11), real wallets whose own views
+# (/results, /owed, /hops-view, /refund-view, /live-view, /proof) are unchanged. Comma separated compressed public
+# keys, trimmed and lowercased; a malformed entry is ignored and counted (/health.publicHiddenMalformed). Beta sets
+# none: its board is the fleet's and its cells assert on it.
+PUBLIC_HIDDEN_IDENTITIES = "03c2aec25a754849410c9d27b4ec50db5d8a4fe0bd57867071a2c1dbbdbb553f6a,03295e29accd6a25a9c1e14582e58bc149749b4f379c11cbe64068a29a925a40d2,03b01d10e77d6b16f49fd88a0f13149757bf22aa999d03b59a1bd6da460b7a6934,02b2f90e11a3af178c38f303f01dd93debfb2fc76e52401155eb735dde98eadacb,0247bf525bd5d14e4783b7f7c5517db56c46d1bec1cf665d90b32d7ecc412cf0bc,03369a6bf7f24b00bf49742e99b4204eb5a7ad5fc6602134bf70b2230f07afe5bf"
+
 # BRC-103/104 session store for the auth middleware (`process_auth`'s
 # `AUTH_SESSIONS` binding — same shape the low-watchtower uses). id is a
 # placeholder by repo convention — the real namespace id is injected at

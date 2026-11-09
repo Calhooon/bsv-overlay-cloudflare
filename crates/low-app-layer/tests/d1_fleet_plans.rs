@@ -804,6 +804,27 @@ fn the_board_table_read_and_its_triggers_never_scan() {
             l::BOARD_HANDS_SQL.to_string(),
             vec!["SCAN h USING INDEX idx_board_hands_rank"],
         ),
+        // bsv-low #1154: the same statements past the six hidden identities of the prod render keep their plans.
+        ("ready, six hidden", l::board_ready_sql(6), vec![]),
+        (
+            "owner page, six hidden",
+            l::board_owners_page_sql(6),
+            vec!["SEARCH board_owners USING COVERING INDEX idx_board_owners_rank (wins>?)"],
+        ),
+        (
+            "owner page after the cursor, six hidden",
+            l::board_owners_after_sql(6),
+            vec![
+                "SEARCH board_owners USING COVERING INDEX idx_board_owners_rank (wins=? AND owner>?)",
+                "SEARCH board_owners USING COVERING INDEX idx_board_owners_rank (wins<?)",
+            ],
+        ),
+        ("cursor rank, six hidden", l::board_cursor_rank_sql(6), vec![]),
+        (
+            "hands, six hidden",
+            l::board_hands_sql(6),
+            vec!["SCAN h USING INDEX idx_board_hands_rank"],
+        ),
     ] {
         let p = plan(&db, &sql);
         println!("{name}:\n  {}", p.join("\n  "));

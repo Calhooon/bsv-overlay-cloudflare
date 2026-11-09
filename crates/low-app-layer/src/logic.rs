@@ -2918,6 +2918,91 @@ pub fn board_wins_pots_sql(n: usize) -> String {
 /// BINDS: `?1` = the hands limit.
 pub const BOARD_HANDS_SQL: &str = "SELECT m.gameId, m.winner, m.loser, m.potTxid, m.settleTxid, m.winnerSigHex, m.loserSigHex, m.cardsHex, m.txid, m.createdAt, m.claimValid FROM board_hands h JOIN result_markers_v2 m ON m.rowid = h.markerRowid AND m.potTxid = h.potTxid ORDER BY h.score ASC, h.claimCreatedAt ASC, h.gameId ASC LIMIT ?1";
 
+/// bsv-low #1154: `n` hidden identities as the binds `?first..?first+n-1`, comma joined.
+fn hidden_binds(first: usize, n: usize) -> String {
+    (first..first + n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// bsv-low #1154: `col` is none of the `n` hidden identities `?first..`, as a chain of `<>`. Never `NOT IN (..)`:
+/// SQLite answers a bound list from an ephemeral table probed once per row the walk reads, and D1 counts every probe
+/// as a row read (measured on local D1: the limit-200 hands statement read 3 rows a hand for 2).
+fn none_hidden(col: &str, first: usize, n: usize) -> String {
+    (first..first + n)
+        .map(|i| format!("{col} <> ?{i}"))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// bsv-low #1154: [`BOARD_READY_SQL`] whose `total` leaves out the counted wins of `hidden` identities (the
+/// public board's `candidates`). BINDS: the hidden keys as `?1..`. With none, [`BOARD_READY_SQL`] itself.
+pub fn board_ready_sql(hidden: usize) -> String {
+    if hidden == 0 {
+        return BOARD_READY_SQL.to_string();
+    }
+    BOARD_READY_SQL.replace(
+        "(SELECT wins FROM board_total WHERE id = 1) AS total",
+        &format!(
+            "(SELECT wins FROM board_total WHERE id = 1) - (SELECT COALESCE(SUM(wins), 0) FROM board_owners WHERE owner IN ({})) AS total",
+            hidden_binds(1, hidden)
+        ),
+    )
+}
+
+/// bsv-low #1154: [`BOARD_OWNERS_PAGE_SQL`] past `hidden` owners, so the offset counts listed owners. BINDS:
+/// `?1` page + 1, `?2` the offset, the hidden keys as `?3..`. With none, the constant itself.
+pub fn board_owners_page_sql(hidden: usize) -> String {
+    if hidden == 0 {
+        return BOARD_OWNERS_PAGE_SQL.to_string();
+    }
+    BOARD_OWNERS_PAGE_SQL.replace(
+        "WHERE wins >= 1 ",
+        &format!("WHERE wins >= 1 AND {} ", none_hidden("owner", 3, hidden)),
+    )
+}
+
+/// bsv-low #1154: [`BOARD_OWNERS_AFTER_SQL`] past `hidden` owners in both arms. BINDS: `?1` wins, `?2` owner,
+/// `?3` page + 1, the hidden keys as `?4..`. With none, the constant itself.
+pub fn board_owners_after_sql(hidden: usize) -> String {
+    if hidden == 0 {
+        return BOARD_OWNERS_AFTER_SQL.to_string();
+    }
+    let not_in = format!(" AND {}", none_hidden("owner", 4, hidden));
+    BOARD_OWNERS_AFTER_SQL
+        .replace("AND owner > ?2 ", &format!("AND owner > ?2{not_in} "))
+        .replace("WHERE wins < ?1 ", &format!("WHERE wins < ?1{not_in} "))
+}
+
+/// bsv-low #1154: [`BOARD_CURSOR_RANK_SQL`] counting listed owners only. BINDS: `?1` wins, `?2` owner, the
+/// hidden keys as `?3..`. With none, the constant itself.
+pub fn board_cursor_rank_sql(hidden: usize) -> String {
+    if hidden == 0 {
+        return BOARD_CURSOR_RANK_SQL.to_string();
+    }
+    let not_in = format!(" AND {}", none_hidden("owner", 3, hidden));
+    BOARD_CURSOR_RANK_SQL
+        .replace("WHERE wins > ?1)", &format!("WHERE wins > ?1{not_in})"))
+        .replace("AND owner <= ?2)", &format!("AND owner <= ?2{not_in})"))
+}
+
+/// bsv-low #1154: [`BOARD_HANDS_SQL`] past the hands whose winner is hidden (a `board_hands` row is an
+/// identity-owned win, its marker's winner the owner). BINDS: `?1` the hands limit, the hidden keys as `?2..`.
+/// With none, the constant itself.
+pub fn board_hands_sql(hidden: usize) -> String {
+    if hidden == 0 {
+        return BOARD_HANDS_SQL.to_string();
+    }
+    BOARD_HANDS_SQL.replace(
+        " ORDER BY h.score",
+        &format!(
+            " WHERE {} ORDER BY h.score",
+            none_hidden("lower(m.winner)", 2, hidden)
+        ),
+    )
+}
+
 /// The ordering facts of a candidate's hand (the [`era_hands_sql`] order:
 /// SQL score, then the claim's `createdAt`, then `gameId`).
 #[derive(Debug, Clone, PartialEq, Eq)]
