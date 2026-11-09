@@ -517,3 +517,40 @@ fn marker_backfill_d_the_page_reads_in_proportion_to_its_rows() {
     let state = plan(STATE_SQL, 0);
     assert!(state.iter().all(|l| !l.starts_with("SCAN")), "{state:?}");
 }
+
+/// The lever (`POST /internal/hop-marker-backfill-pass`): the bearer before any read, no argument, the tick's own pass,
+/// its own flush, routed in `lib.rs` beside the other on-demand passes.
+#[test]
+fn marker_backfill_e_the_lever_is_bearer_gated_runs_the_ticks_pass_and_flushes_its_own_events() {
+    let me: String = include_str!("../hop_marker_backfill.rs")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let lever = &me[me.find("pubasyncfninternal_pass(").expect("the lever")..];
+    let bearer = lever
+        .find("crate::tip_pass::bearer_ok(authorization.as_deref(),secret.as_deref())")
+        .expect("the bearer check");
+    let body = lever.find("req.bytes().await").expect("the body read");
+    let db = lever.find("env.d1(\"OVERLAY_DB\")").expect("the database");
+    let pass = lever
+        .find("run_d1_pass(env,std::rc::Rc::new(db)).await")
+        .expect("the tick's pass");
+    let flush = lever
+        .find("crate::pot_changes::flush_inline(env.clone()).await")
+        .expect("the lever's own flush");
+    assert!(
+        bearer < body && body < db && db < pass && pass < flush,
+        "bearer, body, database, pass, flush, in this order"
+    );
+    assert!(
+        lever.contains("body.is_empty()||body==\"{}\""),
+        "a pass takes no argument"
+    );
+    let lib: String = include_str!("../lib.rs")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(lib.contains(
+        "(Method::Post,\"/internal/hop-marker-backfill-pass\")=>{crate::hop_marker_backfill::internal_pass(req,&env).await}"
+    ));
+}
