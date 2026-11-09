@@ -553,6 +553,11 @@ async fn dispatch(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
         (Method::Post, "/internal/missing-spend-pass") => {
             crate::proof_fetcher::internal_missing_spend_pass(req, &env).await
         }
+        // bsv-low #1146: ONE pass of the hop marker backfill on demand, the tick's own function (bearer INTERNAL_TOKEN;
+        // body empty or {}), so the backlog converges without waiting out the 15-minute tick; its events ride its own flush.
+        (Method::Post, "/internal/hop-marker-backfill-pass") => {
+            crate::hop_marker_backfill::internal_pass(req, &env).await
+        }
         (Method::Post, "/requestSyncResponse") => request_sync_response(&engine, req).await,
         (Method::Post, "/requestForeignGASPNode") => request_foreign_gasp_node(&engine, req).await,
         (Method::Post, "/requestForeignGASPNodes") => {

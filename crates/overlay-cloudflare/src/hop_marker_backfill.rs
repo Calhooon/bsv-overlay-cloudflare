@@ -486,5 +486,34 @@ pub fn state_json(s: &State) -> serde_json::Value {
     })
 }
 
+/// bsv-low #1146: ONE pass of the backfill on demand, the tick's own function (`POST /internal/hop-marker-backfill-pass`,
+/// bearer `INTERNAL_TOKEN` in fixed time before anything is read; body empty or `{}`), so an operator converges a
+/// backlog in minutes where the 15-minute tick takes one page a tick. The pass's inserts note their `hop` pairs, and
+/// the lever ends on its own flush (`pot_changes::flush_inline`, the stranded-note rule), so the owed events reach the
+/// identities' actors with the answer and never wait for another request on this isolate. Answers the pass's report.
+pub async fn internal_pass(
+    mut req: worker::Request,
+    env: &worker::Env,
+) -> worker::Result<worker::Response> {
+    let authorization = req.headers().get("authorization").ok().flatten();
+    let secret = env.secret("INTERNAL_TOKEN").ok().map(|s| s.to_string());
+    if !crate::tip_pass::bearer_ok(authorization.as_deref(), secret.as_deref()) {
+        worker::console_log!("POST /internal/hop-marker-backfill-pass -> 401");
+        return worker::Response::error("unauthorized", 401);
+    }
+    let raw = req.bytes().await?;
+    let body = std::str::from_utf8(&raw).unwrap_or("x").trim();
+    if !(body.is_empty() || body == "{}") {
+        return worker::Response::error("body must be empty or {}: a pass takes no argument", 400);
+    }
+    let db = env.d1("OVERLAY_DB")?;
+    crate::d1::ensure_overlay_migrations(&db)
+        .await
+        .map_err(worker::Error::from)?;
+    let report = run_d1_pass(env, std::rc::Rc::new(db)).await;
+    crate::pot_changes::flush_inline(env.clone()).await;
+    worker::Response::from_json(&report_json(&report))
+}
+
 #[cfg(test)]
 mod tests;
