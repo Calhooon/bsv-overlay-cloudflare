@@ -551,3 +551,110 @@ async fn owed1146_a_the_backfilled_marker_alone_offers_the_index_unspent_hop_swe
         "the change names no marker: {body}"
     );
 }
+
+/// OWED-1145 (bsv-low #1145) pin 6: a marker-bound seat BEFORE the pot's refund mines, through the shipped hydration,
+/// drain and read. X's verified hop marker, the hop's row index-UNSPENT (the JOIN's spend of it not recorded), the
+/// pot's covenant row decoded and unspent committing K as seat A (the derived `pot_hop_seats` link), the JOIN's own
+/// bytes stored (the #837 belt reads the spend of the hop from them), no filing of X's. The hop's row carries the
+/// pot's recovery height, X's stake and the refund's payout to X, never a press; at the gate, the unlocked sentence.
+/// Then the refund recorded with the index's proof paying hash160(K): the `internalize` row is the press, and the
+/// hop's row carries no "unlocks" words.
+/// RED on main: the hop's row is `unbound` with no height (`JOINED_POT_UNLINKED_REASON`).
+#[tokio::test]
+async fn owed1145_f_a_marker_bound_seat_before_the_refund_sees_the_height_and_its_share() {
+    let db = Db::new();
+    db.tip.set(Some(898_990));
+    let (hop, join, spend, spend_beef) = chain(&pkh(K));
+    let (hop_txid, pot) = (hop.id(), join.id());
+    let made = (db.now.get() as i64 - 2 * HOUR) / 1000;
+    db.exec(&format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{hop_txid}',0,0,{made},'p2pkh');"));
+    db.exec(&format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('{X}','{OTHER}','{GAME}',0,20000,'{K}','00','00',2,'{hop_txid}',1,{made},1);"));
+    db.exec(&format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind,pubA,pubB,payPkhA,payPkhB,paramsDecoded,recoveryHeight,stakeA,stakeB,feeSats,potSats) VALUES ('{pot}',0,0,{made},'covenant','{K}','{K2}','{a}','{b}',1,{RECOVERY},20000,20000,400,40000);", a = pkh(K), b = pkh(K2)));
+    let join_beef = Beef::from_binary(&join.to_beef(true).unwrap())
+        .unwrap()
+        .to_binary_atomic(&join.id())
+        .unwrap();
+    db.conn
+        .borrow()
+        .execute(
+            "INSERT INTO pot_beefs (txid, beef, createdAt, has_proof, proof_verified) VALUES (?1, ?2, ?3, 0, 0)",
+            rusqlite::params![pot, join_beef, made],
+        )
+        .unwrap();
+    drain_all(&db).await;
+    let body = served(&db, X, Some(898_990)).await;
+    let hop_op = format!("{hop_txid}:0");
+    let rows = rows_of(&body, &hop_op);
+    assert_eq!(rows.len(), 1, "the hop's row: {body}");
+    let r = rows[0];
+    assert_eq!(r["family"], "in-progress", "{r}");
+    assert!(r["facts"]["claim"].is_null(), "{r}");
+    assert_eq!(r["facts"]["claimable"], false, "{r}");
+    assert_eq!(r["facts"]["recoveryHeight"], RECOVERY, "{r}");
+    assert_eq!(r["facts"]["stakeSats"], 20_000, "{r}");
+    assert_eq!(r["facts"]["mySeat"], "A", "{r}");
+    assert_eq!(r["facts"]["potTxid"], pot, "{r}");
+    assert_eq!(r["facts"]["spent"], false, "{r}");
+    assert_eq!(r["facts"]["source"], "chain-marker", "{r}");
+    assert_eq!(r["facts"]["potAdmittedAtMs"], made * 1000, "{r}");
+    assert_eq!(r["facts"]["blocksToGate"], 10, "{r}");
+    assert_eq!(
+        r["sats"], 19_800,
+        "the refund template pays seat A its stake less its fee share: {r}"
+    );
+    assert_eq!(
+        r["reason"],
+        low_app_layer::owed::marker_seat_before_gate_reason(20_000, RECOVERY),
+        "{r}"
+    );
+    assert!(rows_of(&body, &format!("{pot}:0")).is_empty(), "{body}");
+    // the refund's real outputs: what the row says the seat gets is what the spend pays its key
+    assert_eq!(spend.outputs[0].satoshis, Some(19_800));
+
+    // the tip reaches the gate: the tip's gate mark re-judges the row (`gateHeight` is its `recoveryHeight`)
+    db.tip.set(Some(RECOVERY));
+    low_app_layer::owed_judge::mark_tip(&db, RECOVERY)
+        .await
+        .unwrap();
+    drain_all(&db).await;
+    let body = served(&db, X, Some(RECOVERY)).await;
+    let rows = rows_of(&body, &hop_op);
+    assert_eq!(rows.len(), 1, "{body}");
+    assert_eq!(rows[0]["family"], "unbound", "{}", rows[0]);
+    assert_eq!(rows[0]["facts"]["claimable"], false, "{}", rows[0]);
+    assert_eq!(
+        rows[0]["reason"],
+        low_app_layer::owed::marker_seat_gate_open_reason(RECOVERY),
+        "{}",
+        rows[0]
+    );
+
+    // the refund lands right after the gate, the index's proof latched; the next tip's gate mark re-judges the seat
+    // (stated: the spend's own write marks the pot's parties and the markers of hops the INDEX holds spent by it, so a
+    // seat bound by the belt alone is reached by the tip's gate mark or the age repair, OWED-1137's road)
+    let hand = Hand {
+        hop: hop_txid.clone(),
+        pot: pot.clone(),
+        spend: spend.id(),
+        beef: spend_beef,
+    };
+    record_spend(&db, &hand, true);
+    db.tip.set(Some(RECOVERY + 2));
+    low_app_layer::owed_judge::mark_tip(&db, RECOVERY + 2)
+        .await
+        .unwrap();
+    drain_all(&db).await;
+    let body = served(&db, X, Some(RECOVERY + 2)).await;
+    let pots = rows_of(&body, &format!("{pot}:0"));
+    assert_eq!(pots.len(), 1, "{body}");
+    assert_eq!(pots[0]["facts"]["claim"], "internalize", "{}", pots[0]);
+    assert_eq!(pots[0]["facts"]["claimable"], true, "{}", pots[0]);
+    assert_eq!(pots[0]["sats"], 19_800, "{}", pots[0]);
+    for row in rows_of(&body, &hop_op) {
+        assert!(
+            !row["reason"].as_str().unwrap_or("").contains("unlocks"),
+            "{row}"
+        );
+        assert_ne!(row["facts"]["claimable"], true, "{row}");
+    }
+}
