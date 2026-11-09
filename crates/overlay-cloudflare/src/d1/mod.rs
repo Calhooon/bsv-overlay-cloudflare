@@ -797,7 +797,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 494 to 495 for bsv-low #1056 (FIX-1056-FOLD-3): `owed_actor_compare.lap`, a partial identity's lap in the fleet
 /// compare (the keyset cursor over its game ids, the lap's zero and its overflow). Not a mirrored family: no actor
 /// digest moves. The app layer reads it: the overlay first.
-pub const OVERLAY_MIGRATION_COUNT: usize = 495;
+/// 495 to 496 for bsv-low #1146 (MARKER-BACKFILL): `hop_marker_backfill_state`, the one-row cursor, done flag and
+/// totals of the one-time backfill of the hop markers the index holds (`hop_marker_backfill`). Not a mirrored family:
+/// no actor digest moves.
+pub const OVERLAY_MIGRATION_COUNT: usize = 496;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2663,6 +2666,8 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "ALTER TABLE pot_evictions ADD COLUMN refusalClass TEXT",
     // 495: bsv-low #1056 (FIX-1056-FOLD-3), the fleet compare's lap of a partial identity (its keyset cursor).
     "ALTER TABLE owed_actor_compare ADD COLUMN lap TEXT",
+    // 496: bsv-low #1146 (MARKER-BACKFILL), the one-time hop marker backfill's state (`hop_marker_backfill`).
+    "CREATE TABLE IF NOT EXISTS hop_marker_backfill_state (id INTEGER PRIMARY KEY CHECK (id = 1), cursorRowid INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, scanned INTEGER NOT NULL DEFAULT 0, bodies INTEGER NOT NULL DEFAULT 0, stored INTEGER NOT NULL DEFAULT 0, invalid INTEGER NOT NULL DEFAULT 0, noMarker INTEGER NOT NULL DEFAULT 0, missingBeef INTEGER NOT NULL DEFAULT 0, unparseable INTEGER NOT NULL DEFAULT 0, faults INTEGER NOT NULL DEFAULT 0)",
 ];
 
 // =============================================================================

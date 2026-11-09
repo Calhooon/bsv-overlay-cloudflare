@@ -2066,6 +2066,7 @@ pub async fn health_invariants(
         applayer_pass = applayer_scheduled_pass_view(db),
         chain_feed = crate::chain_feed::health_json(db),
         owed_events_consumer = owed_events_consumer_view(db, now),
+        hop_marker_backfill = crate::hop_marker_backfill::health_json(db),
     }
 
     let hb: Option<HeartbeatRow> = hb.ok().flatten();
@@ -2238,6 +2239,8 @@ pub async fn health_invariants(
     });
 
     body["conflictPass"] = conflict_pass;
+    // bsv-low #1146 (MARKER-BACKFILL): the one-time backfill of the hop markers the index holds (its state row).
+    body["hopMarkerBackfill"] = hop_marker_backfill;
     // #906: frame age beside the existing counts; keep changeParked for readers of the original surface.
     body["changePark"] = body["changeParked"].clone();
     // bsv-low #893 section 5: the app layer's owed belt, the one place the owed list asks the chain explorers.

@@ -148,10 +148,9 @@ impl LookupService for HoppartyLookupService {
             // builds for the same marker output (one function), so a later or
             // earlier `tm_hopparty` submit of the hop is a same-outpoint
             // no-op.
-            (0..tx.outputs.len() as u32)
-                .filter(|&i| i != output_index)
-                .filter_map(|i| record_from_container(&tx, atomic_beef, i))
-                .filter(|r| r.hop_vout == output_index)
+            records_for_body(&tx, atomic_beef)
+                .into_iter()
+                .filter(|r| r.output_index != output_index && r.hop_vout == output_index)
                 .collect()
         };
 
@@ -275,6 +274,21 @@ impl LookupService for HoppartyLookupService {
             ..Default::default()
         }
     }
+}
+
+/// Every marker record the hop body `tx` (`atomic_beef` its BEEF) carries:
+/// [`record_from_container`] over each of its outputs, in output order. The
+/// ONE reading of a hop body's own markers, called by the `tm_lowfund` arm
+/// (each record naming the admitted hop output) and by the overlay's one-time
+/// backfill of the hops the index already holds (bsv-low #1146: each record
+/// naming an output the index holds), so the two cannot drift.
+pub fn records_for_body(
+    tx: &bsv_rs::transaction::Transaction,
+    atomic_beef: &[u8],
+) -> Vec<HoppartyRecord> {
+    (0..tx.outputs.len() as u32)
+        .filter_map(|i| record_from_container(tx, atomic_beef, i))
+        .collect()
 }
 
 /// The index record of the marker at `marker_index` of the container `tx`
