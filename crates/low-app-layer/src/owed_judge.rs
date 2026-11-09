@@ -1218,6 +1218,11 @@ fn belt_due(row: &OwedRow, stamp: i64, evidence: Option<&JudgeInputs>) -> Option
     if !verified {
         return None;
     }
+    // OWED-1145 (bsv-low #1145): a marker-bound seat's pre-spend row on its hop asks nothing of the chain (the pot is
+    // the index's, unspent; its spend reaches the judge as the index's write, a marked event): never dated
+    if row.facts["hopTxid"].is_string() && row.facts["source"] == crate::owed::CHAIN_MARKER_SOURCE {
+        return None;
+    }
     match row.family {
         // FIX-1049 (bsv-low #1049), as folded: a row waiting on a sweep the couriers named, inside its young window
         // (`owed_belt::young_miss`: the first sight of the sweep's bytes, never renewed), is looked at on the belt's

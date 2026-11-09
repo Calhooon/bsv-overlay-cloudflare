@@ -799,11 +799,37 @@ pub struct MarkerPotSpend {
     pub spent_confirmed: Option<bool>,
     /// The spend's verified height (`spentHeight`).
     pub spent_height: Option<u64>,
+    /// OWED-1145 (bsv-low #1145): the index's `spent` flag on the pot (a spend recorded with no spender named is
+    /// still spent: no pre-spend row is built over it).
+    pub spent: bool,
+    /// OWED-1145: the covenant's params as the index decoded them at the write (`paramsDecoded = 1`), `None` when
+    /// not decoded (the pre-spend row then stays the unlinked one).
+    pub params: Option<MarkerPotParams>,
+}
+
+/// OWED-1145 (bsv-low #1145): a marker pot's decoded covenant params (`pot_records`, written at the admission and
+/// by the janitor's params backfill from the stored bytes), what a marker-bound seat's pre-spend row is built from.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MarkerPotParams {
+    /// The committed recovery height (`recoveryHeight`), range-checked at the row by `served_recovery_height`.
+    pub recovery_height: Option<u64>,
+    pub stake_a: u64,
+    pub stake_b: u64,
+    pub fee_sats: u64,
+    /// The two committed settle keys (`pubA`, `pubB`), lowercase hex.
+    pub pub_a: String,
+    pub pub_b: String,
+    pub pay_pkh_a: Option<String>,
+    pub pay_pkh_b: Option<String>,
+    pub pot_sats: Option<u64>,
+    /// The pot row's admission, unix SECONDS (`pot_records.createdAt`).
+    pub created_at: Option<u64>,
 }
 
 /// OWED-1137: the pots a verified hop marker funded, as the index records each one's spend (`?1` a JSON array of pot
-/// txids, lowercase): a primary-key probe per pot.
-pub const MARKER_POT_SPENDS_SQL: &str = "SELECT txid,outputIndex,spent,spendingTxid,spentConfirmed,spentHeight FROM pot_records WHERE txid IN (SELECT value FROM json_each(?1)) AND outputIndex=0 AND lockKind='covenant'";
+/// txids, lowercase): a primary-key probe per pot. OWED-1145: with the covenant's decoded params (the same rows, more
+/// columns).
+pub const MARKER_POT_SPENDS_SQL: &str = "SELECT txid,outputIndex,spent,spendingTxid,spentConfirmed,spentHeight,paramsDecoded,recoveryHeight,stakeA,stakeB,feeSats,pubA,pubB,payPkhA,payPkhB,potSats,createdAt FROM pot_records WHERE txid IN (SELECT value FROM json_each(?1)) AND outputIndex=0 AND lockKind='covenant'";
 
 /// OWED-1137: the fact a row the chain marker's rule made carries (`facts.source`), so a reader tells it from a row a
 /// filing made.
@@ -1100,6 +1126,131 @@ fn joined_pot_unlinked_row(
         facts,
         reason: Some(JOINED_POT_UNLINKED_REASON.to_string()),
     }
+}
+
+/// OWED-1145 (bsv-low #1145): the sentence of a marker-bound seat's pre-spend row while the recovery gate is ahead
+/// (or the tip is unknown): the stake is in the pot, the refund unlocks at the committed height and pays the seat's
+/// key.
+pub fn marker_seat_before_gate_reason(stake_sats: u64, gate: u64) -> String {
+    format!(
+        "your {stake_sats} sats are in this game's pot: if the hand does not settle, the refund unlocks at block {gate} and pays your key; what the pot pays your key appears here"
+    )
+}
+
+/// OWED-1145: the sentence once the tip reached the committed recovery height.
+pub fn marker_seat_gate_open_reason(gate: u64) -> String {
+    format!(
+        "the pot's refund has been unlocked since block {gate}: when its spend lands, what it pays your key appears here"
+    )
+}
+
+/// PURE (OWED-1145, bsv-low #1145): a marker-bound seat's row for a hop a HELD, UNSPENT pot took, while the results
+/// carry no row for that pot (the seat filed nothing: its page died at the funding moment, or its device was wiped).
+/// The row a FILED seat of the same pot sees at the same moment (the unspent arm of the results above: `in-progress`
+/// before the gate, `unbound` at or past it with no filed refund, `unbound` with `tipUnknown` and no tip), built from
+/// the index's pot row (its decoded covenant params) and the hop's VERIFIED marker, minus the press: `claim` null,
+/// never claimable (a rejoin or a refund press needs bytes this device does not hold). `sats` is the covenant's
+/// height-gated refund to this seat (`covenant::refund_shares`, the template's own rule). `None` (the unlinked row
+/// stands): the marker not verified, the pot spent or not read, its params not decoded, the seat key K committed on
+/// neither seat, the gate not a block height, or the seat's refund share nothing (a fee share at or past its stake).
+#[allow(clippy::too_many_arguments)]
+fn marker_seat_row(
+    i: &OwedInputs,
+    me: &str,
+    outpoint: &str,
+    game: &str,
+    h: &HopEntry,
+    facts_base: &Value,
+    pot_txid: &str,
+    by: &str,
+) -> Option<OwedRow> {
+    if h.marker_verified != MarkerVerification::Verified || h.seat_settle_pubkey.is_empty() {
+        return None;
+    }
+    let pot = pot_txid.to_ascii_lowercase();
+    if i.evicted_pots.contains(&pot) {
+        return None;
+    }
+    let spend = i.marker_pot_spends.get(&pot)?;
+    if spend.spent || spend.spender.is_some() {
+        return None;
+    }
+    let p = spend.params.as_ref()?;
+    let k = h.seat_settle_pubkey.to_ascii_lowercase();
+    let seat = if k == p.pub_a {
+        SeatLetter::A
+    } else if k == p.pub_b {
+        SeatLetter::B
+    } else {
+        return None;
+    };
+    let gate = crate::refund_view::served_recovery_height(p.recovery_height, 0)?;
+    let (refund_a, refund_b) =
+        overlay_discovery::pot::covenant::refund_shares(p.stake_a, p.stake_b, p.fee_sats)?;
+    let (stake, sats) = match seat {
+        SeatLetter::A => (p.stake_a, refund_a),
+        SeatLetter::B => (p.stake_b, refund_b),
+    };
+    if sats == 0 {
+        return None;
+    }
+    let mut facts = facts_base.clone();
+    facts["claim"] = Value::Null;
+    facts["claimable"] = json!(false);
+    facts["joinSpent"] = json!(pot);
+    facts["joinSpentBy"] = json!(by);
+    facts["source"] = json!(CHAIN_MARKER_SOURCE);
+    facts["potTxid"] = json!(pot);
+    facts["potVout"] = json!(spend.pot_vout);
+    facts["recoveryHeight"] = json!(gate);
+    // N6: milliseconds in `facts`; `pot_records.createdAt` is unix SECONDS
+    facts["potAdmittedAtMs"] = json!(p.created_at.map(|s| s.saturating_mul(1000)));
+    facts["mySeat"] = json!(seat_str(Some(seat)));
+    facts["stakeSats"] = json!(stake);
+    facts["spent"] = json!(false);
+    facts["spentConfirmed"] = json!(spend.spent_confirmed);
+    facts["committedKeys"] = crate::results::CommittedKeys::to_json(
+        crate::results::CommittedKeys::from_columns(
+            Some(&p.pub_a),
+            Some(&p.pub_b),
+            p.pay_pkh_a.as_deref(),
+            p.pay_pkh_b.as_deref(),
+        )
+        .as_ref(),
+    );
+    facts["tip"] = json!(i.tip);
+    let (family, reason) = match i.tip {
+        None => {
+            facts["tipUnknown"] = json!(true);
+            facts["blocksToGate"] = Value::Null;
+            (
+                OwedFamily::Unbound,
+                marker_seat_before_gate_reason(stake, gate),
+            )
+        }
+        Some(t) if t < gate => {
+            facts["blocksToGate"] = json!(gate - t);
+            (
+                OwedFamily::InProgress,
+                marker_seat_before_gate_reason(stake, gate),
+            )
+        }
+        Some(_) => {
+            facts["blocksToGate"] = json!(0);
+            (OwedFamily::Unbound, marker_seat_gate_open_reason(gate))
+        }
+    };
+    Some(OwedRow {
+        identity: me.to_string(),
+        outpoint: outpoint.to_string(),
+        family,
+        game_id: game.to_string(),
+        sats: Some(sats),
+        opponent_identity: Some(h.opponent_identity.to_ascii_lowercase()),
+        at_height: None,
+        facts,
+        reason: Some(reason),
+    })
 }
 
 /// bsv-low #831: the hydration's `fundingHeld` value for an unspent pot whose funding has no SEEN latch and no index
@@ -2832,15 +2983,21 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
         // otherwise the game keeps this row (never a press, never no row).
         if let Some(pot) = i.join_spent_hops.get(&outpoint) {
             if !pot_row_served(i, pot) {
-                rows.push(joined_pot_unlinked_row(
-                    &me,
-                    outpoint,
-                    game,
-                    h,
-                    &facts_base,
-                    pot,
-                    "pot-bytes",
-                ));
+                // OWED-1145: a marker-bound seat of an unspent pot sees the filed seat's row
+                rows.push(
+                    marker_seat_row(i, &me, &outpoint, &game, h, &facts_base, pot, "pot-bytes")
+                        .unwrap_or_else(|| {
+                            joined_pot_unlinked_row(
+                                &me,
+                                outpoint,
+                                game,
+                                h,
+                                &facts_base,
+                                pot,
+                                "pot-bytes",
+                            )
+                        }),
+                );
             }
             continue;
         }
@@ -3087,9 +3244,17 @@ pub fn derive_owed_rows(i: &OwedInputs) -> Vec<OwedRow> {
                             // results carry that pot (#837: after a refused sweep of such a hop the game kept no row)
                             if let Some(pot) = spender.as_deref().filter(|p| !pot_row_served(i, p))
                             {
-                                rows.push(joined_pot_unlinked_row(
-                                    &me, outpoint, game, h, &facts, pot, "chain",
-                                ));
+                                // OWED-1145: a marker-bound seat of an unspent pot sees the filed seat's row
+                                rows.push(
+                                    marker_seat_row(
+                                        i, &me, &outpoint, &game, h, &facts, pot, "chain",
+                                    )
+                                    .unwrap_or_else(|| {
+                                        joined_pot_unlinked_row(
+                                            &me, outpoint, game, h, &facts, pot, "chain",
+                                        )
+                                    }),
+                                );
                             }
                             continue;
                         }
@@ -8797,7 +8962,9 @@ pub(crate) mod tests {
 
     #[test]
     fn ns2_filing_commits_before_the_detached_judge_and_push() {
-        let source: String = include_str!("record_post/owed_write.rs").split_whitespace().collect();
+        let source: String = include_str!("record_post/owed_write.rs")
+            .split_whitespace()
+            .collect();
         assert!(source.contains("db.run_batch(writes).await?"));
         assert!(!source.contains("judge_with_write"));
         let task = include_str!("record_post/detached.rs");
@@ -8805,7 +8972,10 @@ pub(crate) mod tests {
         assert!(task.contains("owed_judge::drain_identities"));
         assert!(task.contains("deadline.run_reserving(work).await"));
         assert!(source.contains("judge::refund_subjects"));
-        let door = include_str!("record_post.rs").split("#[cfg(test)]").next().unwrap();
+        let door = include_str!("record_post.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
         assert!(!door.contains("OWED_STALE_FOR_POT_SQL"));
         assert!(!door.contains("owed_recompute_and_push_coalesced"));
     }
@@ -8975,6 +9145,260 @@ pub(crate) mod tests {
         assert_eq!(rows[0].family, OwedFamily::Unbound);
         assert_ne!(rows[0].facts["claimable"], true);
         assert_eq!(rows[0].facts["chainProbe"], "spent");
+    }
+
+    /// OWED-1145 (bsv-low #1145): the marker-bound seat's fixtures. The seat key K committed as seat A, the pot's
+    /// decoded params (recovery height 900,000, stakes 20,000 each, fee 400: the refund pays each seat 19,800).
+    const K1145: &str = "021111111111111111111111111111111111111111111111111111111111111111";
+    const K1145_B: &str = "032222222222222222222222222222222222222222222222222222222222222222";
+    fn marker_hop_1145() -> HopEntry {
+        let mut h = hop(HopStatus::Unspent, None, Some(HOP_STRANDED_AFTER_MS + 1));
+        h.seat_settle_pubkey = K1145.into();
+        h
+    }
+    fn marker_pot_1145(pub_a: &str, decoded: bool) -> HashMap<String, MarkerPotSpend> {
+        let params = decoded.then(|| MarkerPotParams {
+            recovery_height: Some(900_000),
+            stake_a: 20_000,
+            stake_b: 20_000,
+            fee_sats: 400,
+            pub_a: pub_a.into(),
+            pub_b: K1145_B.into(),
+            pay_pkh_a: Some("aa".repeat(20)),
+            pay_pkh_b: Some("bb".repeat(20)),
+            pot_sats: Some(40_000),
+            created_at: Some(1_799_990_000),
+        });
+        HashMap::from([(
+            tx(0x02),
+            MarkerPotSpend {
+                pot_vout: 0,
+                spender: None,
+                spent_confirmed: Some(false),
+                spent_height: None,
+                spent: false,
+                params,
+            },
+        )])
+    }
+    fn assert_marker_seat_row(r: &OwedRow, family: OwedFamily, tip: Option<u64>) {
+        assert_eq!(r.family, family, "{r:?}");
+        assert!(r.facts["claim"].is_null(), "{r:?}");
+        assert_eq!(r.facts["claimable"], false, "{r:?}");
+        assert_eq!(r.sats, Some(19_800), "the refund's payout to seat A: {r:?}");
+        assert_eq!(r.at_height, None, "{r:?}");
+        assert_eq!(r.facts["recoveryHeight"], 900_000, "{r:?}");
+        assert_eq!(r.facts["stakeSats"], 20_000, "{r:?}");
+        assert_eq!(r.facts["potTxid"], tx(0x02), "{r:?}");
+        assert_eq!(r.facts["potVout"], 0, "{r:?}");
+        assert_eq!(r.facts["potAdmittedAtMs"], 1_799_990_000_000_u64, "{r:?}");
+        assert_eq!(r.facts["mySeat"], "A", "{r:?}");
+        assert_eq!(r.facts["spent"], false, "{r:?}");
+        assert_eq!(r.facts["spentConfirmed"], false, "{r:?}");
+        assert_eq!(r.facts["source"], CHAIN_MARKER_SOURCE, "{r:?}");
+        assert_eq!(r.facts["joinSpent"], tx(0x02), "{r:?}");
+        assert_eq!(r.facts["tip"], json!(tip), "{r:?}");
+        assert!(
+            !r.reason.as_deref().unwrap_or("").contains('\u{2014}'),
+            "no em dash in served copy"
+        );
+    }
+
+    /// OWED-1145 pins 1 and 2, the #837 belt's site (`pot-bytes`): an index-unspent hop of mine whose verified marker
+    /// binds it, the pot's JOIN bytes spending it, the pot unspent with its params decoded and K committed as seat A,
+    /// no filing of mine. Before the gate: `in-progress` (the filed seat's family there), the height, the stake, the
+    /// refund's payout, the before-the-gate sentence; at the gate: `unbound` and the unlocked sentence; no tip:
+    /// `unbound` with `tipUnknown`, the height and the before-the-gate sentence. Never a press. RED on main: `unbound`
+    /// with no height (`JOINED_POT_UNLINKED_REASON`).
+    #[test]
+    fn owed1145_a_the_belt_site_serves_the_filed_seats_pre_spend_row() {
+        let (v, c, none) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let hops = [marker_hop_1145()];
+        let joined: HashMap<String, String> = [(key.clone(), tx(0x02))].into_iter().collect();
+        let pots = marker_pot_1145(K1145, true);
+        let before = marker_seat_before_gate_reason(20_000, 900_000);
+        for (tip, family, reason) in [
+            (Some(899_990), OwedFamily::InProgress, before.clone()),
+            (
+                Some(900_000),
+                OwedFamily::Unbound,
+                marker_seat_gate_open_reason(900_000),
+            ),
+            (
+                Some(900_050),
+                OwedFamily::Unbound,
+                marker_seat_gate_open_reason(900_000),
+            ),
+            (None, OwedFamily::Unbound, before.clone()),
+        ] {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &none, tip);
+            i.join_spent_hops = &joined;
+            i.marker_pot_spends = &pots;
+            let rows = derive_and_pin(&i);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            let r = &rows[0];
+            assert_eq!(r.outpoint, key);
+            assert_marker_seat_row(r, family, tip);
+            assert_eq!(r.facts["joinSpentBy"], "pot-bytes");
+            assert_eq!(r.reason.as_deref(), Some(reason.as_str()), "tip {tip:?}");
+            match tip {
+                Some(t) => assert_eq!(r.facts["blocksToGate"], 900_000_u64.saturating_sub(t)),
+                None => assert_eq!(r.facts["tipUnknown"], true),
+            }
+        }
+        assert_eq!(
+            before,
+            "your 20000 sats are in this game's pot: if the hand does not settle, the refund unlocks at block 900000 and pays your key; what the pot pays your key appears here"
+        );
+        // seat B: the same pot with K committed as B pays B's share
+        let pots_b = marker_pot_1145(K1145_B, true);
+        let mut pots_b = pots_b;
+        if let Some(p) = pots_b.get_mut(&tx(0x02)).and_then(|s| s.params.as_mut()) {
+            p.pub_b = K1145.into();
+            p.stake_b = 30_001;
+        }
+        let mut i = inputs(&[], &[], &hops, &v, &c, &none, Some(899_990));
+        i.join_spent_hops = &joined;
+        i.marker_pot_spends = &pots_b;
+        let rows = derive_and_pin(&i);
+        assert_eq!(rows[0].facts["mySeat"], "B", "{rows:?}");
+        assert_eq!(rows[0].facts["stakeSats"], 30_001);
+        assert_eq!(
+            rows[0].sats,
+            Some(29_801),
+            "B's stake less B's fee share (fee/2)"
+        );
+    }
+
+    /// OWED-1145 pin 3, the chain arm's site (`chain`): the chain word names a held pot spending the index-unspent hop;
+    /// the same row as the belt's.
+    #[test]
+    fn owed1145_c_the_chain_site_serves_the_same_row() {
+        let (v, c) = (HashMap::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let hops = [marker_hop_1145()];
+        let pots: HashSet<String> = [tx(0x02)].into_iter().collect();
+        let word = chain_confirmed(&key, true, Some(true), Some(&tx(0x02)), Some(true));
+        let spends = marker_pot_1145(K1145, true);
+        let mut i = inputs(&[], &[], &hops, &v, &c, &pots, Some(899_990));
+        i.hop_chain = &word;
+        i.marker_pot_spends = &spends;
+        let rows = derive_and_pin(&i);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_marker_seat_row(&rows[0], OwedFamily::InProgress, Some(899_990));
+        assert_eq!(rows[0].facts["joinSpentBy"], "chain");
+        assert_eq!(
+            rows[0].reason.as_deref(),
+            Some(marker_seat_before_gate_reason(20_000, 900_000).as_str())
+        );
+    }
+
+    /// OWED-1145 pin 4: K committed on neither seat (a planted or foreign marker), a pot whose params are not decoded,
+    /// an unverified marker, or a spent pot: the unlinked row exactly as today (its facts and reason byte-equal to the
+    /// row with no marker pot read).
+    #[test]
+    fn owed1145_d_a_foreign_key_or_undecoded_pot_keeps_the_unlinked_row() {
+        let (v, c, none) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let key = format!("{}:0", tx(0x07));
+        let joined: HashMap<String, String> = [(key.clone(), tx(0x02))].into_iter().collect();
+        let hops = [marker_hop_1145()];
+        let today = {
+            let mut i = inputs(&[], &[], &hops, &v, &c, &none, Some(899_990));
+            i.join_spent_hops = &joined;
+            derive_and_pin(&i)
+        };
+        assert_eq!(today[0].reason.as_deref(), Some(JOINED_POT_UNLINKED_REASON));
+        let mut spent = marker_pot_1145(K1145, true);
+        if let Some(s) = spent.get_mut(&tx(0x02)) {
+            s.spent = true;
+        }
+        let mut unverified = marker_hop_1145();
+        unverified.marker_verified = MarkerVerification::Unverified;
+        for (label, pots, h) in [
+            (
+                "foreign key",
+                marker_pot_1145(&"09".repeat(33), true),
+                marker_hop_1145(),
+            ),
+            (
+                "not decoded",
+                marker_pot_1145(K1145, false),
+                marker_hop_1145(),
+            ),
+            ("spent", spent, marker_hop_1145()),
+            ("unverified", marker_pot_1145(K1145, true), unverified),
+        ] {
+            let hops = [h];
+            let base = {
+                let mut i = inputs(&[], &[], &hops, &v, &c, &none, Some(899_990));
+                i.join_spent_hops = &joined;
+                derive_and_pin(&i)
+            };
+            let mut i = inputs(&[], &[], &hops, &v, &c, &none, Some(899_990));
+            i.join_spent_hops = &joined;
+            i.marker_pot_spends = &pots;
+            let rows = derive_and_pin(&i);
+            assert_eq!(rows, base, "{label}: the row with no marker pot read");
+            if label != "unverified" {
+                assert_eq!(rows, today, "{label}: byte-equal to today's row");
+            }
+        }
+    }
+
+    /// OWED-1145 pin 5, parity: the marker-bound seat's facts carry every key of a FILED seat's pre-spend row for the
+    /// same pot at the same moment, save the filing-only ones (`firstPartyMarkerAtMs`, the party marker's stamp;
+    /// `verdict`, `settleSigners`, `outcome`, `outcomeSource`, `settleTxid`, the results' classification of a spend),
+    /// with the same `recoveryHeight`, `stakeSats`, `mySeat`, `potTxid`, the same family and the same `blocksToGate`.
+    #[test]
+    fn owed1145_e_the_row_carries_the_filed_seats_pre_spend_keys() {
+        let (v, c, none) = (HashMap::new(), HashSet::new(), HashSet::new());
+        let mut filed = entry(Some(false), None, Outcome::Unresolved, Some(SeatLetter::A));
+        filed.spent_confirmed = Some(false);
+        let filed_rows = derive_and_pin(&inputs(&[filed], &[], &[], &v, &c, &none, Some(899_990)));
+        let f = &filed_rows[0];
+        let key = format!("{}:0", tx(0x07));
+        let hops = [marker_hop_1145()];
+        let joined: HashMap<String, String> = [(key, tx(0x02))].into_iter().collect();
+        let pots = marker_pot_1145(K1145, true);
+        let mut i = inputs(&[], &[], &hops, &v, &c, &none, Some(899_990));
+        i.join_spent_hops = &joined;
+        i.marker_pot_spends = &pots;
+        let rows = derive_and_pin(&i);
+        let m = &rows[0];
+        const FILING_ONLY: &[&str] = &[
+            "firstPartyMarkerAtMs",
+            "verdict",
+            "settleSigners",
+            "outcome",
+            "outcomeSource",
+            "settleTxid",
+        ];
+        for k in f.facts.as_object().unwrap().keys() {
+            if FILING_ONLY.contains(&k.as_str()) {
+                continue;
+            }
+            assert!(
+                m.facts.get(k).is_some(),
+                "the marker row lacks the filed row's `{k}`: {m:?}"
+            );
+        }
+        assert_eq!(
+            m.family, f.family,
+            "the filed seat's family before the gate"
+        );
+        for k in [
+            "recoveryHeight",
+            "stakeSats",
+            "mySeat",
+            "potTxid",
+            "potVout",
+            "blocksToGate",
+            "tip",
+            "spent",
+        ] {
+            assert_eq!(m.facts[k], f.facts[k], "`{k}` equal on both rows");
+        }
     }
 
     /// bsv-low #837 (FIX-837) pin (e), the wiring of (a2): the judge's hydration reads the belt before it derives

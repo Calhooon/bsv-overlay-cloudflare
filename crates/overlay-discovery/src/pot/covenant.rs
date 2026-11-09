@@ -468,15 +468,24 @@ fn settle_templates(p: &CovenantParams) -> Option<[OutputSet; 3]> {
 /// (`feeA = fee − fee/2`, `feeB = fee/2`). `None` if a fee share exceeds its
 /// stake (an unbuildable lock).
 fn refund_template(p: &CovenantParams) -> Option<OutputSet> {
-    let fee_b = p.fee_sats / 2;
-    let fee_a = p.fee_sats - fee_b;
-    if fee_a > p.stake_a || fee_b > p.stake_b {
+    let (a, b) = refund_shares(p.stake_a, p.stake_b, p.fee_sats)?;
+    Some(vec![
+        (a, p2pkh_lock(&p.pay_pkh_a)),
+        (b, p2pkh_lock(&p.pay_pkh_b)),
+    ])
+}
+
+/// The refund template's two payouts `(seat A, seat B)` from the committed stakes and fee: each stake less its
+/// fee share, seat A absorbing the odd sat (`feeA = fee - fee/2`, `feeB = fee/2`). `None` if a fee share exceeds
+/// its stake (an unbuildable lock). The ONE rule `refund_template` builds its outputs from, so a reader that
+/// names a seat's refund share (bsv-low #1145, the owed list's marker-bound seat) never re-spells it.
+pub fn refund_shares(stake_a: u64, stake_b: u64, fee_sats: u64) -> Option<(u64, u64)> {
+    let fee_b = fee_sats / 2;
+    let fee_a = fee_sats - fee_b;
+    if fee_a > stake_a || fee_b > stake_b {
         return None;
     }
-    Some(vec![
-        (p.stake_a - fee_a, p2pkh_lock(&p.pay_pkh_a)),
-        (p.stake_b - fee_b, p2pkh_lock(&p.pay_pkh_b)),
-    ])
+    Some((stake_a - fee_a, stake_b - fee_b))
 }
 
 // ── classification ──────────────────────────────────────────────────────────
@@ -920,6 +929,14 @@ mod money_vector_tests {
                 expected(case, "refund")
             };
             assert_eq!(refund_template(&p), want_refund, "{name}/refund drifted");
+            // OWED-1145 (bsv-low #1145): the seat shares the owed list serves are the template's own outputs
+            assert_eq!(
+                refund_shares(p.stake_a, p.stake_b, p.fee_sats).map(|(a, b)| vec![a, b]),
+                want_refund
+                    .as_ref()
+                    .map(|w| w.iter().map(|(sats, _)| *sats).collect::<Vec<_>>()),
+                "{name}/refund shares drifted from the template"
+            );
             asserted += 4;
         }
         assert!(asserted >= 24 * 4, "vector file unexpectedly small");
