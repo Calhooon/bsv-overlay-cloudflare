@@ -742,6 +742,69 @@ fn lb642_emit_the_d1_cell() {
                 "statements": log.iter().map(|(sql, rows)| serde_json::json!({"sql": sql, "rows": rows})).collect::<Vec<_>>(),
             }));
         }
+        // bsv-low #1154: the shipped read with six hidden identities (the prod render hides six), held to the same
+        // ceilings: the six owners ranked 47 to 52, astride the first page's end, so the offset and the cursor step
+        // over them. Stated: the hands statement reads two rows (its rank entry and its marker) per hidden HAND
+        // ranked ahead of the hands page (no owner column on `board_hands`), so the statement grows with the hidden
+        // identities' hands; a proof seat plays one hand a promotion.
+        let six: Vec<String> =
+            served(&served_body(&db, 60, &crate::logic::PageStart::Offset(46)).0)["board"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .take(6)
+                .map(|r| r["identity"].as_str().unwrap().to_string())
+                .collect();
+        assert_eq!(six.len(), 6);
+        let served_hidden = |page: usize, start: &crate::logic::PageStart| {
+            let board = SqliteBoard::new(&db);
+            let (status, body) = run(leaderboard_page_body_hidden(
+                &board,
+                page,
+                start,
+                era,
+                crate::logic::LEADERBOARD_CANDIDATE_WINS,
+                NOW as i64,
+                &six,
+            ));
+            assert_eq!(status, 200, "{body}");
+            (body, board.log.into_inner())
+        };
+        let first_hidden = served_hidden(50, &crate::logic::PageStart::Offset(0));
+        let cursor_hidden = served(&first_hidden.0)["nextCursor"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let start_hidden = crate::logic::parse_leaderboard_cursor(&cursor_hidden).unwrap();
+        for (name, ceiling, (_, log)) in [
+            (
+                "page 1, limit 50, six hidden",
+                crate::logic::LEADERBOARD_VIEW_MAX_READS,
+                first_hidden,
+            ),
+            (
+                "page 1, limit 200, six hidden",
+                crate::logic::LEADERBOARD_VIEW_MAX_READS_PAGE_MAX,
+                served_hidden(max, &crate::logic::PageStart::Offset(0)),
+            ),
+            (
+                "page 2 by cursor, limit 50, six hidden",
+                crate::logic::LEADERBOARD_VIEW_MAX_READS,
+                served_hidden(50, &start_hidden),
+            ),
+        ] {
+            assert!(
+                log.iter().any(|(sql, _)| sql.contains("owner <> '")),
+                "{name}{under}: the filtered table read"
+            );
+            requests.push(serde_json::json!({
+                "name": format!("{name}{under}"),
+                "ceiling": ceiling,
+                "statementCeiling": crate::logic::LEADERBOARD_STATEMENT_MAX_READS,
+                "flat": false,
+                "statements": log.iter().map(|(sql, rows)| serde_json::json!({"sql": sql, "rows": rows})).collect::<Vec<_>>(),
+            }));
+        }
         // #642's candidate read on the same board, for the record.
         let board = SqliteBoard::new(&db);
         let (status, _) = run(leaderboard_candidate_body(

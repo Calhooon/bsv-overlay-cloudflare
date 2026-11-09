@@ -1533,7 +1533,7 @@ pub async fn leaderboard(req: Request, ctx: RouteContext<AuthState>) -> Result<R
 /// write (`board_owners` by its rank index, `board_wins` by owner, `board_hands`
 /// by its rank index) once its backfill stamped `board-v1` and its `board_era`
 /// stamp is this era cutoff; otherwise #642's bounded candidate read
-/// ([`leaderboard_page_body`]).
+/// ([`leaderboard_page_body_hidden`]).
 ///
 /// FAIL-SAFE, as before: a spine / pots / statuses D1 fault is the SAME 503
 /// the client handles — NEVER a fabricated empty board; the marker, hands
@@ -1563,13 +1563,16 @@ pub async fn compute_leaderboard_body_string(
     };
     let era = written_off_before_ms_env(env);
     let computed_at = (worker::Date::now().as_millis() / 1000) as i64;
-    Ok(leaderboard_page_body(
+    // bsv-low #1154: the harness seats the public board never lists (`PUBLIC_HIDDEN_IDENTITIES`).
+    let hidden = crate::public_hidden::from_env(env).keys;
+    Ok(leaderboard_page_body_hidden(
         &crate::board_db::D1Board(&db),
         page,
         &start,
         era,
         crate::logic::LEADERBOARD_CANDIDATE_WINS,
         computed_at,
+        &hidden,
     )
     .await)
 }
@@ -1581,7 +1584,8 @@ pub async fn compute_leaderboard_body_string(
 /// [`sync_board_era`]), the page is the indexed read of the tables the overlay
 /// derives at the write ([`leaderboard_table_body`]); otherwise (an unmigrated
 /// database, a stamp that is not this cutoff yet) the #642 candidate read
-/// ([`leaderboard_candidate_body`]).
+/// ([`leaderboard_candidate_body_hidden`]).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
     db: &B,
     page: usize,
@@ -1590,10 +1594,32 @@ pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
     candidate_cap: usize,
     computed_at: i64,
 ) -> (u16, String) {
-    if let Some(total) = board_tables_ready(db, era).await {
-        return leaderboard_table_body(db, page, start, total, computed_at).await;
+    leaderboard_page_body_hidden(db, page, start, era, candidate_cap, computed_at, &[]).await
+}
+
+/// The `leaderboard_page_body` pipeline for the PUBLIC board, never listing the `hidden` identities (bsv-low #1154: the
+/// promotion's proof seats, lowercase compressed keys, [`crate::public_hidden`]): no board row for one, no hand
+/// whose winner is one, and `candidates`, `resultCount`, `truncated` and the cursors count what is listed. WHERE:
+/// on the #674 table read, in each statement (the owner page by offset or cursor, the cursor's rank, the hands, the
+/// `candidates` total), so the offset and the keyset walk step over a hidden owner inside SQLite and every listed
+/// owner is served exactly once; on the #642 candidate read, on the candidates in Rust before the page is cut (the
+/// statement keeps its index walk and its bound: an owner is known only past the window's LIMIT, so a filter in
+/// the statement would leave the window short of its cap and its `candidatesBounded` probe wrong). With none
+/// hidden every statement is the unfiltered one and the body is today's, byte for byte.
+pub(crate) async fn leaderboard_page_body_hidden<B: crate::board_db::BoardDb>(
+    db: &B,
+    page: usize,
+    start: &crate::logic::PageStart,
+    era: Option<i64>,
+    candidate_cap: usize,
+    computed_at: i64,
+    hidden: &[String],
+) -> (u16, String) {
+    if let Some(total) = board_tables_ready(db, era, hidden).await {
+        return leaderboard_table_body(db, page, start, total, computed_at, hidden).await;
     }
-    leaderboard_candidate_body(db, page, start, era, candidate_cap, computed_at).await
+    leaderboard_candidate_body_hidden(db, page, start, era, candidate_cap, computed_at, hidden)
+        .await
 }
 
 /// The count of every counted win when the board tables are derived (the
@@ -1603,6 +1629,7 @@ pub(crate) async fn leaderboard_page_body<B: crate::board_db::BoardDb>(
 pub(crate) async fn board_tables_ready<B: crate::board_db::BoardDb>(
     db: &B,
     era: Option<i64>,
+    hidden: &[String],
 ) -> Option<usize> {
     #[derive(Deserialize)]
     struct ReadyRowD1 {
@@ -1616,7 +1643,13 @@ pub(crate) async fn board_tables_ready<B: crate::board_db::BoardDb>(
         cutoff_ms: Option<f64>,
     }
     match db
-        .all::<ReadyRowD1>(crate::logic::BOARD_READY_SQL.to_string(), Vec::new())
+        .all::<ReadyRowD1>(
+            crate::logic::board_ready_sql(hidden.len()),
+            hidden
+                .iter()
+                .map(|k| crate::board_db::Bind::Text(k.clone()))
+                .collect(),
+        )
         .await
     {
         Ok(rows) => rows
@@ -1680,6 +1713,7 @@ pub async fn sync_board_era_env(env: &worker::Env) {
 /// counted wins), the page, the hands board and the hands pots' attribution
 /// cut from it in Rust ([`crate::logic::leaderboard_candidate_page`]), then
 /// steps 3 to 6 of [`compute_leaderboard_body_string`] unchanged.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn leaderboard_candidate_body<B: crate::board_db::BoardDb>(
     db: &B,
     page: usize,
@@ -1687,6 +1721,21 @@ pub(crate) async fn leaderboard_candidate_body<B: crate::board_db::BoardDb>(
     era: Option<i64>,
     candidate_cap: usize,
     computed_at: i64,
+) -> (u16, String) {
+    leaderboard_candidate_body_hidden(db, page, start, era, candidate_cap, computed_at, &[]).await
+}
+
+/// The `leaderboard_candidate_body` read never listing the `hidden` identities (bsv-low #1154): their candidate wins are
+/// dropped before the page is cut, so the ranking, the page, the hands and `candidates` count what is listed;
+/// `candidatesBounded` still says whether the era held more counted wins than the window read.
+pub(crate) async fn leaderboard_candidate_body_hidden<B: crate::board_db::BoardDb>(
+    db: &B,
+    page: usize,
+    start: &crate::logic::PageStart,
+    era: Option<i64>,
+    candidate_cap: usize,
+    computed_at: i64,
+    hidden: &[String],
 ) -> (u16, String) {
     use crate::board_db::{warn, Bind};
 
@@ -1712,6 +1761,10 @@ pub(crate) async fn leaderboard_candidate_body<B: crate::board_db::BoardDb>(
     let mut hand_markers: Vec<Option<ResultMarkerRow>> = Vec::with_capacity(rows.len());
     for r in rows.into_iter().take(candidate_cap) {
         let (c, m) = r.into_candidate();
+        // bsv-low #1154: a hidden owner's win is no candidate (its hand goes with it).
+        if hidden.iter().any(|h| h.eq_ignore_ascii_case(&c.row.owner)) {
+            continue;
+        }
         cands.push(c);
         hand_markers.push(m);
     }
@@ -1727,7 +1780,7 @@ pub(crate) async fn leaderboard_candidate_body<B: crate::board_db::BoardDb>(
         next_after: sel.next_after,
         extras: crate::logic::LeaderboardPageExtras {
             next_cursor: sel.next_cursor,
-            candidates_bounded: bounded.then_some(candidate_cap),
+            candidates_bounded: bounded.then_some(cands.len()),
             candidates_whole: None,
         },
         pot_rows: sel.pot_rows,
@@ -1753,8 +1806,10 @@ pub(crate) async fn leaderboard_table_body<B: crate::board_db::BoardDb>(
     start: &crate::logic::PageStart,
     total: usize,
     computed_at: i64,
+    hidden: &[String],
 ) -> (u16, String) {
     use crate::board_db::{warn, Bind};
+    let hidden_binds = || -> Vec<Bind> { hidden.iter().map(|k| Bind::Text(k.clone())).collect() };
     #[derive(Deserialize)]
     struct OwnerRowD1 {
         owner: String,
@@ -1775,8 +1830,8 @@ pub(crate) async fn leaderboard_table_body<B: crate::board_db::BoardDb>(
         crate::logic::PageStart::Offset(after) => {
             match db
                 .all::<OwnerRowD1>(
-                    crate::logic::BOARD_OWNERS_PAGE_SQL.to_string(),
-                    vec![probe, Bind::Num(*after as f64)],
+                    crate::logic::board_owners_page_sql(hidden.len()),
+                    [vec![probe, Bind::Num(*after as f64)], hidden_binds()].concat(),
                 )
                 .await
             {
@@ -1792,7 +1847,10 @@ pub(crate) async fn leaderboard_table_body<B: crate::board_db::BoardDb>(
         crate::logic::PageStart::After { wins, owner } => {
             let key = || vec![Bind::Num(*wins as f64), Bind::Text(owner.clone())];
             let rank = match db
-                .all::<RankRowD1>(crate::logic::BOARD_CURSOR_RANK_SQL.to_string(), key())
+                .all::<RankRowD1>(
+                    crate::logic::board_cursor_rank_sql(hidden.len()),
+                    [key(), hidden_binds()].concat(),
+                )
                 .await
             {
                 Ok(rows) => rows.first().map_or(0, |r| r.rank.max(0.0) as usize),
@@ -1800,8 +1858,9 @@ pub(crate) async fn leaderboard_table_body<B: crate::board_db::BoardDb>(
             };
             let mut b = key();
             b.push(probe);
+            b.extend(hidden_binds());
             match db
-                .all::<OwnerRowD1>(crate::logic::BOARD_OWNERS_AFTER_SQL.to_string(), b)
+                .all::<OwnerRowD1>(crate::logic::board_owners_after_sql(hidden.len()), b)
                 .await
             {
                 Ok(rows) => (
@@ -1888,8 +1947,8 @@ pub(crate) async fn leaderboard_table_body<B: crate::board_db::BoardDb>(
     // The era hands, BEST-EFFORT (a fault omits the hands board, never a count).
     let hands: Vec<ResultMarkerRow> = match db
         .all::<ResultRowD1>(
-            crate::logic::BOARD_HANDS_SQL.to_string(),
-            vec![Bind::Num(page as f64)],
+            crate::logic::board_hands_sql(hidden.len()),
+            [vec![Bind::Num(page as f64)], hidden_binds()].concat(),
         )
         .await
     {
@@ -7373,6 +7432,11 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     // the gate object at most every 10 s an isolate, never D1 (FIX-1017-FOLD, the tier's `health-dirty-snapshot`).
     body["push"]["gate"] = crate::push_coalesce::gate_hold_health(&ctx.env).await;
     body["trackerReask"] = crate::tracker_host::pacing::health_json();
+    // bsv-low #1154: how many identities the public leaderboard never lists (the promotion's proof seats), and the
+    // entries of the var refused; the keys themselves are not served.
+    let hidden = crate::public_hidden::from_env(&ctx.env);
+    body["publicHidden"] = serde_json::json!(hidden.keys.len());
+    body["publicHiddenMalformed"] = serde_json::json!(hidden.malformed);
     // bsv-low #862 (L7-DEPTH): the spend depth the served words carry (`spendDepth`), its source and the var as set.
     body["spendDepth"] = crate::tracker_host::runtime::spend_depth_health_json(
         ctx.env
@@ -9765,6 +9829,9 @@ mod leaderboard_642;
 #[cfg(test)]
 #[path = "../tests/support/leaderboard_674.rs"]
 mod leaderboard_674;
+#[cfg(test)]
+#[path = "../tests/support/proof_seats.rs"]
+mod proof_seats;
 
 #[cfg(test)]
 #[path = "tip_tests.rs"]

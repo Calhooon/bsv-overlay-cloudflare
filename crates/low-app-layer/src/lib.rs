@@ -164,6 +164,7 @@ pub mod owed_read;
 pub mod pass_meter;
 pub mod pot_hook;
 pub mod proof_post;
+pub mod public_hidden;
 pub mod push_coalesce;
 pub mod rate;
 pub mod record_post;
