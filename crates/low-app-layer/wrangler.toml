@@ -119,7 +119,9 @@ STORAGE_EPOCH = "2026-08-06-zero-world-1"
 # echoes the ACTIVE (post-belt) value — check it after every change.
 # 2026-09-21 (the M21 promotion, step 8): the prod era cutoff bumped to the activation instant 2026-09-21T13:44:27Z / tip 967732
 # (every pre-promotion hand written off from every view; prod held zero unspent pots in any era, the two stranded hops were our e2e wallet's).
-WRITTEN_OFF_BEFORE_MS = "1789998267000"
+# 2026-11-09 (the launch's wipe, the owner's word of that day; bsv-low record 1979): the prod era cutoff bumped to the activation
+# instant 2026-11-09T20:50:00Z / tip 974809 (every hand to date written off from every view; prod held zero unspent pots).
+WRITTEN_OFF_BEFORE_MS = "1794257400000"
 
 # #375 companion (review H1): the write-off cutoff as a BLOCK HEIGHT — served
 # verbatim on /epoch as {"writtenOffBeforeHeight": <n>}, never used in SQL
@@ -129,7 +131,7 @@ WRITTEN_OFF_BEFORE_MS = "1789998267000"
 # tip-sanes its seeding gate against it. Set it TOGETHER with the ms cutoff:
 # the chain tip at (or just before) the same activation instant. Empty/unset
 # = no rescue belt (stamps alone decide — the pre-#375 posture).
-WRITTEN_OFF_BEFORE_HEIGHT = "967732"
+WRITTEN_OFF_BEFORE_HEIGHT = "974809"
 
 # bsv-low #862 (L7-DEPTH): the host's SPEND DEPTH, the confirmations a wallet needs before it credits a coin on a
 # served chain word (R3 of the wallet charter), served as `spendDepth` beside `tracker` on /tx-any and beside `lock`
