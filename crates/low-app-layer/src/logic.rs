@@ -1470,6 +1470,112 @@ pub fn clamp_future_cutoff(cutoff_ms: Option<i64>, now_ms: i64) -> Option<i64> {
     cutoff_ms.filter(|&ms| ms < now_ms)
 }
 
+// ── bsv-low #1159: the launch floor (the launch runbook's section 9 step 4) ──
+//
+// The era cutoff went live on prod on 2026-11-09 (bsv-low record 1984) and
+// real players exist from the launch on. After it the cutoff may never move
+// FORWARD: a later bump would drop real players' games from every money view
+// and re-key the owed actors' era. The floor is CODE, never a var: on the
+// prod stack the effective cutoff is the lower of the configured value and
+// the launch instant (and the launch height). The clamp can only LOWER a
+// cutoff (a lower cutoff serves more history, never fewer rows); an unset
+// var stays unset (the floor never invents a cutoff). Beta carries no floor.
+
+/// The launch instant (2026-11-09T20:50:00Z), ms since epoch.
+pub const LAUNCH_FLOOR_MS: i64 = 1_794_257_400_000;
+/// The launch height.
+pub const LAUNCH_FLOOR_HEIGHT: i64 = 974_809;
+/// The counter a clamped cutoff limb bumps, once per isolate per limb.
+pub const COUNTER_ERA_CUTOFF_CLAMPED: &str = "applayer_era_cutoff_clamped_total";
+
+/// The era's names this worker writes on the overlay's `ops_counters` (the overlay seeds each at 0).
+pub fn era_mirrored_counter_names() -> Vec<String> {
+    vec![COUNTER_ERA_CUTOFF_CLAMPED.to_string()]
+}
+
+/// Whether the render is the beta stack: the beta marker (`LOW_BETA_MARKER`,
+/// `[env.beta.vars]` alone carries it) is set and not blank, the rule
+/// `auth::test_knob_n` reads. Absent or blank is prod, so a render that does
+/// not say beta has the floor.
+pub fn is_beta_stack(beta_marker: Option<&str>) -> bool {
+    beta_marker.is_some_and(|m| !m.trim().is_empty())
+}
+
+/// The launch floor of the stack, `(ms, height)`: none on beta.
+pub fn launch_floor(is_beta: bool) -> Option<(i64, i64)> {
+    if is_beta {
+        None
+    } else {
+        Some((LAUNCH_FLOOR_MS, LAUNCH_FLOOR_HEIGHT))
+    }
+}
+
+/// The lower of the value and the floor; the value with no floor; `None`
+/// stays `None` (the floor never invents a cutoff).
+pub fn clamp_launch_floor(value: Option<i64>, floor: Option<i64>) -> Option<i64> {
+    match (value, floor) {
+        (Some(v), Some(f)) => Some(v.min(f)),
+        (v, _) => v,
+    }
+}
+
+/// One limb of the era cutoff as served: the effective value and, when the
+/// launch floor lowered it, the configured value it replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EraLimb {
+    pub value: Option<i64>,
+    /// `Some(configured)` when the floor lowered a configured value.
+    pub clamped_from: Option<i64>,
+}
+
+fn floored(value: Option<i64>, floor: Option<i64>) -> EraLimb {
+    let effective = clamp_launch_floor(value, floor);
+    EraLimb {
+        value: effective,
+        clamped_from: value.filter(|_| effective != value),
+    }
+}
+
+/// The ms limb from the raw var: normalised, the future-cutoff belt
+/// ([`clamp_future_cutoff`]), then the launch floor.
+pub fn era_cutoff_ms(raw: Option<String>, now_ms: i64, beta_marker: Option<&str>) -> EraLimb {
+    let belted = clamp_future_cutoff(normalize_written_off_before_ms(raw), now_ms);
+    floored(
+        belted,
+        launch_floor(is_beta_stack(beta_marker)).map(|(ms, _)| ms),
+    )
+}
+
+/// The height limb from the raw var: normalised, then the launch floor.
+pub fn era_cutoff_height(raw: Option<String>, beta_marker: Option<&str>) -> EraLimb {
+    floored(
+        normalize_written_off_before_height(raw),
+        launch_floor(is_beta_stack(beta_marker)).map(|(_, h)| h),
+    )
+}
+
+/// The clamp's warning line for one limb.
+pub fn era_clamp_warning(var: &str, configured: i64, floor: i64) -> String {
+    format!(
+        "[era] {var}={configured} is above the launch floor {floor}: serving the floor; \
+         the cutoff may never move forward after the launch"
+    )
+}
+
+/// `/health`'s era fields: the effective pair, and `cutoffClamped: true`
+/// only when a limb was clamped (absent otherwise, so an unclamped body is
+/// byte for byte what it was).
+pub fn era_health_fields(ms: EraLimb, height: EraLimb) -> Vec<(&'static str, serde_json::Value)> {
+    let mut v = vec![
+        ("writtenOffBeforeMs", json!(ms.value)),
+        ("writtenOffBeforeHeight", json!(height.value)),
+    ];
+    if ms.clamped_from.is_some() || height.clamped_from.is_some() {
+        v.push(("cutoffClamped", json!(true)));
+    }
+    v
+}
+
 pub fn era_filter_sql(anchor_expr_secs: &str, placeholder: &str, cutoff_ms: Option<i64>) -> String {
     match cutoff_ms {
         Some(_) => format!(" AND ({anchor_expr_secs} * 1000 >= {placeholder})"),
@@ -4256,6 +4362,195 @@ mod tests {
         // The extra-digit (microseconds-looking) paste is a FUTURE instant.
         assert_eq!(clamp_future_cutoff(Some(NOW * 10), NOW), None);
         assert_eq!(clamp_future_cutoff(None, NOW), None);
+    }
+
+    // ── bsv-low #1159: the launch floor ──
+    const LF_NOW: i64 = LAUNCH_FLOOR_MS + 10 * 86_400_000;
+    const LF_HOUR: i64 = 3_600_000;
+    const PROD: Option<&str> = None;
+    const BETA: Option<&str> = Some("_beta");
+
+    #[test]
+    fn launch_floor_1159_the_stack_and_its_floor() {
+        assert!(!is_beta_stack(None));
+        assert!(!is_beta_stack(Some("  ")));
+        assert!(is_beta_stack(Some("_beta")));
+        assert_eq!(launch_floor(false), Some((1_794_257_400_000, 974_809)));
+        assert_eq!(launch_floor(true), None);
+    }
+
+    /// (a) prod, configured an hour above the floor: the floor is served, clamped.
+    #[test]
+    fn launch_floor_1159_a_prod_above_the_floor_serves_the_floor() {
+        let l = era_cutoff_ms(Some((LAUNCH_FLOOR_MS + LF_HOUR).to_string()), LF_NOW, PROD);
+        assert_eq!(l.value, Some(LAUNCH_FLOOR_MS));
+        assert_eq!(l.clamped_from, Some(LAUNCH_FLOOR_MS + LF_HOUR));
+    }
+
+    /// (b) prod, configured below the floor: unchanged.
+    #[test]
+    fn launch_floor_1159_b_prod_below_the_floor_is_unchanged() {
+        let l = era_cutoff_ms(Some((LAUNCH_FLOOR_MS - LF_HOUR).to_string()), LF_NOW, PROD);
+        assert_eq!(l.value, Some(LAUNCH_FLOOR_MS - LF_HOUR));
+        assert_eq!(l.clamped_from, None);
+    }
+
+    /// (c) prod, configured equal to the floor: unchanged, not clamped.
+    #[test]
+    fn launch_floor_1159_c_prod_equal_is_unchanged_and_not_clamped() {
+        let l = era_cutoff_ms(Some(LAUNCH_FLOOR_MS.to_string()), LF_NOW, PROD);
+        assert_eq!(
+            l,
+            EraLimb {
+                value: Some(LAUNCH_FLOOR_MS),
+                clamped_from: None
+            }
+        );
+    }
+
+    /// (d) beta, configured above the floor: unchanged.
+    #[test]
+    fn launch_floor_1159_d_beta_above_the_floor_is_unchanged() {
+        let l = era_cutoff_ms(Some((LAUNCH_FLOOR_MS + LF_HOUR).to_string()), LF_NOW, BETA);
+        assert_eq!(
+            l,
+            EraLimb {
+                value: Some(LAUNCH_FLOOR_MS + LF_HOUR),
+                clamped_from: None
+            }
+        );
+    }
+
+    /// (e) unset stays unset on both stacks (and a future-belted value stays refused).
+    #[test]
+    fn launch_floor_1159_e_unset_stays_unset() {
+        for stack in [PROD, BETA] {
+            for raw in [
+                None,
+                Some(String::new()),
+                Some("junk".into()),
+                Some("0".into()),
+            ] {
+                assert_eq!(era_cutoff_ms(raw.clone(), LF_NOW, stack).value, None);
+                assert_eq!(era_cutoff_height(raw, stack).value, None);
+            }
+            assert_eq!(
+                era_cutoff_ms(Some((LF_NOW + 1).to_string()), LF_NOW, stack).value,
+                None
+            );
+        }
+        assert_eq!(clamp_launch_floor(None, Some(5)), None);
+        assert_eq!(clamp_launch_floor(Some(7), None), Some(7));
+    }
+
+    /// (f) the height limb, the same five ways.
+    #[test]
+    fn launch_floor_1159_f_the_height_limb() {
+        let h = |v: i64, s| era_cutoff_height(Some(v.to_string()), s);
+        let f = LAUNCH_FLOOR_HEIGHT;
+        assert_eq!(
+            h(f + 6, PROD),
+            EraLimb {
+                value: Some(f),
+                clamped_from: Some(f + 6)
+            }
+        );
+        assert_eq!(
+            h(f - 6, PROD),
+            EraLimb {
+                value: Some(f - 6),
+                clamped_from: None
+            }
+        );
+        assert_eq!(
+            h(f, PROD),
+            EraLimb {
+                value: Some(f),
+                clamped_from: None
+            }
+        );
+        assert_eq!(
+            h(f + 6, BETA),
+            EraLimb {
+                value: Some(f + 6),
+                clamped_from: None
+            }
+        );
+        assert_eq!(era_cutoff_height(None, PROD).value, None);
+        assert_eq!(era_cutoff_height(None, BETA).value, None);
+    }
+
+    /// (g) the direction: the effective value is never above the configured one.
+    #[test]
+    fn launch_floor_1159_g_the_clamp_only_lowers() {
+        let values = [
+            None,
+            Some(1),
+            Some(974_808),
+            Some(974_809),
+            Some(974_810),
+            Some(LAUNCH_FLOOR_MS - 1),
+            Some(LAUNCH_FLOOR_MS),
+            Some(LAUNCH_FLOOR_MS + 1),
+            Some(i64::MAX),
+        ];
+        let floors = [
+            None,
+            Some(0),
+            Some(974_809),
+            Some(LAUNCH_FLOOR_MS),
+            Some(i64::MAX),
+        ];
+        for v in values {
+            for f in floors {
+                let e = clamp_launch_floor(v, f);
+                assert_eq!(
+                    e.is_some(),
+                    v.is_some(),
+                    "{v:?} {f:?}: never invents, never erases"
+                );
+                if let (Some(e), Some(v)) = (e, v) {
+                    assert!(
+                        e <= v,
+                        "{v} under {f:?} served {e}: above the configured value"
+                    );
+                }
+            }
+        }
+        // and every limb a configured var produces, on either stack
+        for stack in [PROD, BETA] {
+            for v in [
+                1,
+                LAUNCH_FLOOR_MS - 1,
+                LAUNCH_FLOOR_MS,
+                LAUNCH_FLOOR_MS + LF_HOUR,
+            ] {
+                assert!(
+                    era_cutoff_ms(Some(v.to_string()), LF_NOW, stack)
+                        .value
+                        .unwrap()
+                        <= v
+                );
+                assert!(era_cutoff_height(Some(v.to_string()), stack).value.unwrap() <= v);
+            }
+        }
+    }
+
+    /// `/health`'s fields: `cutoffClamped` only when clamped; absent at the floor.
+    #[test]
+    fn launch_floor_1159_the_health_fields() {
+        let at = era_health_fields(
+            era_cutoff_ms(Some(LAUNCH_FLOOR_MS.to_string()), LF_NOW, PROD),
+            era_cutoff_height(Some(LAUNCH_FLOOR_HEIGHT.to_string()), PROD),
+        );
+        assert!(at.iter().all(|(k, _)| *k != "cutoffClamped"));
+        let above = era_health_fields(
+            era_cutoff_ms(Some((LAUNCH_FLOOR_MS + LF_HOUR).to_string()), LF_NOW, PROD),
+            era_cutoff_height(Some(LAUNCH_FLOOR_HEIGHT.to_string()), PROD),
+        );
+        assert!(above.contains(&("cutoffClamped", json!(true))));
+        assert!(above.contains(&("writtenOffBeforeMs", json!(LAUNCH_FLOOR_MS))));
+        assert!(era_clamp_warning("WRITTEN_OFF_BEFORE_MS", 2, 1).contains("may never move forward"));
     }
 
     /// #375 — the ONE era predicate: `None` emits NOTHING (the byte-identity
