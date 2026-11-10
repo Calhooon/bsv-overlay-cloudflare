@@ -175,35 +175,83 @@ fn written_off_before_ms(ctx: &RouteContext<AuthState>) -> Option<i64> {
 }
 
 /// Env-taking twin (S3a): the BoardView actor computes outside any route ctx.
+/// Every reader of the ms limb (the money views, `/epoch`, `/health`, the
+/// BoardView actor, the owed actor's era, the D1 judge) takes this value: the
+/// launch floor (bsv-low #1159) is applied here, once, for all of them.
 pub(crate) fn written_off_before_ms_env(env: &worker::Env) -> Option<i64> {
-    let raw = crate::logic::normalize_written_off_before_ms(
-        env.var("WRITTEN_OFF_BEFORE_MS").ok().map(|v| v.to_string()),
-    );
+    era_cutoff_ms_env(env).value
+}
+
+/// The beta marker as the render carries it (`[env.beta.vars]` alone).
+fn beta_marker_env(env: &worker::Env) -> Option<String> {
+    env.var(crate::auth::BETA_MARKER_VAR)
+        .ok()
+        .map(|v| v.to_string())
+}
+
+thread_local! {
+    /// Whether this isolate already warned and counted a clamped limb (ms, height).
+    static ERA_CLAMP_NOTED: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
+}
+
+/// Warn and count a clamped limb, once per isolate per limb (whatever the read rate).
+pub(crate) fn note_era_clamp(var: &str, limb: crate::logic::EraLimb, height: bool) {
+    let (Some(configured), Some(floor)) = (limb.clamped_from, limb.value) else {
+        return;
+    };
+    let first = ERA_CLAMP_NOTED.with(|n| {
+        let (ms, h) = n.get();
+        let seen = if height { h } else { ms };
+        n.set(if height { (ms, true) } else { (true, h) });
+        !seen
+    });
+    if first {
+        console_warn!(
+            "{}",
+            crate::logic::era_clamp_warning(var, configured, floor)
+        );
+        crate::courier::note_presence(crate::logic::COUNTER_ERA_CUTOFF_CLAMPED);
+    }
+}
+
+/// The ms limb as served: normalised, the future-cutoff belt, the launch floor.
+pub(crate) fn era_cutoff_ms_env(env: &worker::Env) -> crate::logic::EraLimb {
+    let raw_var = env.var("WRITTEN_OFF_BEFORE_MS").ok().map(|v| v.to_string());
+    let raw = crate::logic::normalize_written_off_before_ms(raw_var.clone());
     // Review MED-2 — the future-cutoff belt (`clamp_future_cutoff` docs): a
     // well-formed WRONG value (extra digit, pasted future instant) must
     // never blank every money view; refuse it LOUDLY, never silently.
     let now_ms = worker::Date::now().as_millis() as i64;
-    let clamped = crate::logic::clamp_future_cutoff(raw, now_ms);
-    if let (Some(raw_ms), None) = (raw, clamped) {
+    if let (Some(raw_ms), None) = (raw, crate::logic::clamp_future_cutoff(raw, now_ms)) {
         console_warn!(
             "[era] WRITTEN_OFF_BEFORE_MS={raw_ms} is at/after now={now_ms} — MISCONFIGURED \
              (the #375 cutoff must pre-date launch); treating as unset"
         );
     }
-    clamped
+    let limb = crate::logic::era_cutoff_ms(raw_var, now_ms, beta_marker_env(env).as_deref());
+    note_era_clamp("WRITTEN_OFF_BEFORE_MS", limb, false);
+    limb
+}
+
+/// The height limb as served: normalised, the launch floor.
+pub(crate) fn era_cutoff_height_env(env: &worker::Env) -> crate::logic::EraLimb {
+    let limb = crate::logic::era_cutoff_height(
+        env.var("WRITTEN_OFF_BEFORE_HEIGHT")
+            .ok()
+            .map(|v| v.to_string()),
+        beta_marker_env(env).as_deref(),
+    );
+    note_era_clamp("WRITTEN_OFF_BEFORE_HEIGHT", limb, true);
+    limb
 }
 
 /// The #375 cutoff as a D1 bind value. Ms-since-epoch fits f64 exactly
 /// (`2^53` headroom) — the crate's number-bind convention.
 /// The #375 HEIGHT cutoff (client-protective only — never SQL; see the
-/// normalizer's doc). Served verbatim on `/epoch` + echoed on `/health`.
+/// normalizer's doc). Served verbatim on `/epoch` + echoed on `/health`,
+/// under the launch floor (bsv-low #1159).
 fn written_off_before_height(ctx: &RouteContext<AuthState>) -> Option<i64> {
-    crate::logic::normalize_written_off_before_height(
-        ctx.env
-            .var("WRITTEN_OFF_BEFORE_HEIGHT")
-            .ok()
-            .map(|v| v.to_string()),
-    )
+    era_cutoff_height_env(&ctx.env).value
 }
 
 fn era_bind(ms: i64) -> JsValue {
@@ -7463,14 +7511,14 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     // what /epoch serves. `null` = write-off inert. One glance answers
     // "did my var take effect", so a refused misconfiguration is visible
     // here rather than only in a per-request warn log.
-    body["writtenOffBeforeMs"] = match written_off_before_ms(&ctx) {
-        Some(ms) => serde_json::json!(ms),
-        None => serde_json::Value::Null,
-    };
-    body["writtenOffBeforeHeight"] = match written_off_before_height(&ctx) {
-        Some(h) => serde_json::json!(h),
-        None => serde_json::Value::Null,
-    };
+    // bsv-low #1159: the pair under the launch floor, and `cutoffClamped: true`
+    // when the floor lowered a configured limb (absent otherwise).
+    for (k, v) in crate::logic::era_health_fields(
+        era_cutoff_ms_env(&ctx.env),
+        era_cutoff_height_env(&ctx.env),
+    ) {
+        body[k] = v;
+    }
     json_response(body.to_string(), 200)
 }
 

@@ -396,6 +396,8 @@ pub fn names() -> Vec<String> {
     v.push("tracker_detached_judge_runs_total".to_string());
     v.push("tracker_detached_judge_rerun_total".to_string());
     v.push("tracker_detached_judge_skipped_total".to_string());
+    // bsv-low #1159: an era cutoff limb the launch floor lowered, once per isolate per limb
+    v.push("applayer_era_cutoff_clamped_total".to_string());
     v
 }
 

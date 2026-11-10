@@ -2805,3 +2805,45 @@ mod door_refusals {
         assert_eq!(ledger_rows(&conn), 0);
     }
 }
+
+/// bsv-low #1159 (h), the money view: on the prod render with its cutoff configured an hour above the launch floor,
+/// a hop stamped between the floor and the configured value IS served by `/hops-view`'s shipped SQL under the
+/// effective cutoff the one reader serves (`logic::era_cutoff_ms`, the launch floor); main's rule (the configured
+/// value, no floor) dropped it.
+#[test]
+fn launch_floor_1159_h_a_hop_between_the_floor_and_the_configured_cutoff_is_served() {
+    use low_app_layer::logic::{era_cutoff_ms, LAUNCH_FLOOR_MS};
+    const NOW_MS: i64 = LAUNCH_FLOOR_MS + 10 * 86_400_000;
+    let configured = LAUNCH_FLOOR_MS + 3_600_000;
+    let stamp_secs = (LAUNCH_FLOOR_MS + 1_800_000) / 1000; // half an hour after the launch
+    let conn = production_schema_db();
+    let m = build_marker(0xa1, GAME, 0, 80_800, true);
+    let txid = admit_marker(&conn, &m, 80_800, 0x59, stamp_secs);
+    admit_hop(&conn, &txid, 80_800, stamp_secs);
+    let served = |cutoff_ms: i64| {
+        query_rows_inner(
+            &conn,
+            hops_view_sql(false, Some(cutoff_ms), 0),
+            params![m.identity_hex, cutoff_ms],
+        )
+        .len()
+    };
+    let effective = era_cutoff_ms(Some(configured.to_string()), NOW_MS, None)
+        .value
+        .expect("a cutoff");
+    assert_eq!(
+        effective, LAUNCH_FLOOR_MS,
+        "the prod render serves the floor"
+    );
+    assert_eq!(served(effective), 1, "the hop after the launch is served");
+    assert_eq!(
+        served(configured),
+        0,
+        "main's rule (the configured cutoff) drops it"
+    );
+    // beta has no floor: the configured cutoff stands there
+    assert_eq!(
+        era_cutoff_ms(Some(configured.to_string()), NOW_MS, Some("_beta")).value,
+        Some(configured)
+    );
+}
