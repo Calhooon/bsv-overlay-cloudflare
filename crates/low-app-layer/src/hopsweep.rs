@@ -303,13 +303,15 @@ pub struct FiledHopSweep {
     pub raw_hex: String,
     /// What the sweep pays out in all (the seat's one output: its home), when the raw parses.
     pub pays_sats: Option<u64>,
-    /// bsv-low #517 (loop 19, pair 11, 2026-09-21): the INDEX holds this sweep with a chaintracks-VERIFIED proof
-    /// (`transactions.has_proof`, the latch only the verified stitch sets; the word `/tx-any` serves and
-    /// `/credit-beef` assembles the credit from). The owed walk confirms the swept payout on it before any hop row
+    /// bsv-low #517 (loop 19, pair 11, 2026-09-21): the INDEX holds this sweep with a chaintracks-VERIFIED proof:
+    /// `transactions.has_proof` (the latch only the verified stitch sets; the word `/tx-any` serves and `/credit-beef`
+    /// assembles the credit from), or since bsv-low #1173 `pot_beefs.proof_verified` (the completion pass's latch of
+    /// the sweep's own bump; a sweep admits no output, so it has no `transactions` row), read by
+    /// `owed_judge::hydrate`'s `sweep_index_proof`. The owed walk confirms the swept payout on it before any hop row
     /// (never attributed to a sweep once the JOIN's eviction released its pointer) or courier word (an indexer lagging
     /// a big block, memoised five minutes) — false when the read faulted or skipped this pass.
     pub index_proven: bool,
-    /// The block the verified bump names (`transactions.proofHeight`), when recorded.
+    /// The block the verified bump names (`transactions.proofHeight`, else `pot_beefs.proofHeight`), when recorded.
     pub index_proof_height: Option<u64>,
     /// FIX-1057 (bsv-low #1057 item 8): when the door took the filing (`hopsweep_records.createdAt`, seconds, in ms):
     /// the fixed origin of the landing wait's ABSOLUTE bound (`owed::SWEEP_LANDING_MAX_MS`). Written once by the

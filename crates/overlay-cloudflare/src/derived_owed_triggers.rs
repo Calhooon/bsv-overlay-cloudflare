@@ -687,3 +687,44 @@ pub const SPENDER_BYTES_DELETE: &str = trigger!(
         word_rows!("OLD.txid")
     )
 );
+
+// OWED-1173 (bsv-low #1173; the OWED-1173 lens's MEDIUM-1): a filed sweep's verified proof in `pot_beefs` is the
+// index's proof of the hop's spend (`owed_judge::hydrate`'s `sweep_index_proof`), so a flip of that latch moves the
+// filer's judgement. `BEEF_INSERT` / `BEEF_UPDATE` mark a pot's parties only; these mark the filed sweeps' seats, as
+// `TX_PROOF_INSERT` / `TX_PROOF_UPDATE` do for the `transactions` proof. Appended (never an edit of a shipped
+// trigger). The pair is the writers' own `("beef", txid)` (every `pot_beefs` writer notes it), so the event the
+// write publishes routes to the seat.
+macro_rules! beef_sweep_subjects {
+    () => {
+        "SELECT s.identity,s.gameId FROM hopsweep_records s INDEXED BY idx_hopsweep_sweep WHERE s.sweepTxid=NEW.txid"
+    };
+}
+/// A verified proof stored for a filed sweep (`compact_pot_beef`'s `POT_BEEF_VERIFIED_WRITE_SQL`, an `INSERT OR
+/// REPLACE`, fires INSERT). The admit path writes `proof_verified = 0` and marks nothing here.
+pub const BEEF_SWEEP_INSERT: &str = trigger!(
+    "pot_beefs",
+    sweep_insert,
+    INSERT,
+    mark!(
+        "beef",
+        "NEW.txid",
+        created_at!("NEW"),
+        beef_sweep_subjects!(),
+        " WHERE NEW.proof_verified=1"
+    )
+);
+/// The latch flipped or re-anchored in place (the completion pass's `POT_BEEF_MARK_PROVEN(_AT)_SQL`, the reorg
+/// sweep's `unlatch_pot_beef_sql`): a withdrawal is a downgrade (the filer's no-press rested on it).
+pub const BEEF_SWEEP_UPDATE: &str = trigger!(
+    "pot_beefs",
+    sweep_update,
+    "UPDATE OF proof_verified,proofHeight",
+    mark!(
+        class "(OLD.proof_verified=1 AND NEW.proof_verified IS NOT 1)",
+        "beef",
+        "NEW.txid",
+        created_at!("NEW"),
+        beef_sweep_subjects!(),
+        " WHERE OLD.proof_verified IS NOT NEW.proof_verified OR OLD.proofHeight IS NOT NEW.proofHeight"
+    )
+);

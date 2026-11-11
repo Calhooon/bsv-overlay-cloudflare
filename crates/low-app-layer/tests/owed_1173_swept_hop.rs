@@ -222,3 +222,128 @@ async fn owed1173_d_an_honest_stranded_hop_with_no_filed_sweep_still_presses() {
     assert_eq!(p.len(), 1, "the honest press: {body}");
     assert_eq!(p[0]["facts"]["claim"], "sweep-hop", "{}", p[0]);
 }
+
+/// The marks the seat X holds.
+fn marks_for_x(db: &Db) -> Vec<(String, String, i64)> {
+    let conn = db.conn.borrow();
+    let mut stmt = conn
+        .prepare("SELECT source,sourceKey,downgrade FROM owed_dirty WHERE identity=?1 ORDER BY source,sourceKey")
+        .unwrap();
+    let rows = stmt
+        .query_map([X], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows
+}
+
+/// LENS-1 (the OWED-1173 lens's MEDIUM-1, the dangerous direction): the sweep's `pot_beefs` proof is the one thing
+/// keeping the press away (its word swept), then the overlay's SHIPPED reorg unlatch (`unlatch_pot_beef_sql`, which
+/// `reorg_sweep` reaches for any verified `pot_beefs` row whose bump chaintracks refutes) withdraws it. The write marks
+/// the filer's seat under the writer's own pair `("beef", sweep)`, a DOWNGRADE, and after the drain the STORED list is
+/// the fresh judgement's: the press is back. RED on 7574d00c: no mark, the stored list kept the no-press while a fresh
+/// judgement pressed (`marks after unlatch: 0; stored presses 0; fresh presses 1`).
+#[tokio::test]
+async fn lens_f_a_pot_beefs_unlatch_of_the_sweep_marks_the_seat() {
+    let db = Db::new();
+    let g = seed(&db, Proof::Verified);
+    assert_eq!(sweep_words(&db), vec![g.sweep.clone()]);
+    let before = rejudged(&db).await;
+    assert!(presses(&before, &g.hop).is_empty(), "{before}");
+    assert!(marks_for_x(&db).is_empty());
+    db.conn
+        .borrow()
+        .execute(
+            bsv_overlay_cloudflare::d1_discovery::unlatch_pot_beef_sql(),
+            [&g.sweep],
+        )
+        .unwrap();
+    assert_eq!(
+        marks_for_x(&db),
+        vec![("beef".to_string(), g.sweep.clone(), 1)],
+        "the unlatch marks the seat as a downgrade (as TX_PROOF_UPDATE does for transactions)"
+    );
+    drain_all(&db).await;
+    let stored = served(&db, X, Some(900_000)).await;
+    let fresh = rejudged(&db).await;
+    assert_eq!(presses(&fresh, &g.hop).len(), 1, "{fresh}");
+    assert_eq!(
+        presses(&stored, &g.hop),
+        presses(&fresh, &g.hop),
+        "the stored list is the fresh judgement's"
+    );
+}
+
+/// LENS-2 (the latch-on direction): the sweep's word swept and its `pot_beefs` row unverified (the press served), then
+/// the completion pass's SHIPPED latch (`POT_BEEF_MARK_PROVEN_AT_SQL`): the write marks the seat (plain), and after
+/// the drain the stored list holds no press, the fresh judgement's. RED on 7574d00c: no mark, a stale stored press for
+/// money already home (`marks after latch: 0; stored presses 1; fresh presses 0`).
+#[tokio::test]
+async fn lens_f_b_pot_beefs_latch_of_the_sweep_marks_the_seat() {
+    let db = Db::new();
+    let g = seed(&db, Proof::Unverified);
+    assert_eq!(sweep_words(&db), vec![g.sweep.clone()]);
+    let before = rejudged(&db).await;
+    assert_eq!(presses(&before, &g.hop).len(), 1, "{before}");
+    db.conn
+        .borrow()
+        .execute(
+            bsv_overlay_cloudflare::d1_discovery::POT_BEEF_MARK_PROVEN_AT_SQL,
+            rusqlite::params![899_400.0_f64, &g.sweep],
+        )
+        .unwrap();
+    assert_eq!(
+        marks_for_x(&db),
+        vec![("beef".to_string(), g.sweep.clone(), 0)],
+        "the latch marks the seat"
+    );
+    drain_all(&db).await;
+    let stored = served(&db, X, Some(900_000)).await;
+    let fresh = rejudged(&db).await;
+    assert!(presses(&fresh, &g.hop).is_empty(), "{fresh}");
+    assert!(
+        presses(&stored, &g.hop).is_empty(),
+        "no stale press: {stored}"
+    );
+}
+
+/// LENS-3 (the control): the same flip on a `transactions` row marks the seat (FIX-1001's `TX_PROOF_UPDATE`).
+#[tokio::test]
+async fn lens_f_c_transactions_unlatch_marks_the_seat() {
+    let db = Db::new();
+    let g = seed(&db, Proof::Unverified);
+    let _ = rejudged(&db).await;
+    db.exec(&format!("INSERT INTO transactions(txid,beef,has_proof,created_at) VALUES ('{}',x'00',1,1); DELETE FROM owed_dirty;", g.sweep));
+    db.exec(&format!(
+        "UPDATE transactions SET has_proof = 0 WHERE txid = '{}'",
+        g.sweep
+    ));
+    assert_eq!(marks_for_x(&db).len(), 1);
+}
+
+/// The two new triggers' subject reads are a SEARCH of `idx_hopsweep_sweep`, never a scan of `hopsweep_records`.
+#[test]
+fn owed1173f_m1_the_sweep_triggers_seek_the_sweep_index() {
+    let db = Db::new();
+    for name in [
+        "owed_dirty_pot_beefs_sweep_insert",
+        "owed_dirty_pot_beefs_sweep_update",
+    ] {
+        let sql = db
+            .text(&format!(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='{name}'"
+            ))
+            .unwrap_or_else(|| panic!("{name} is migrated"));
+        assert!(sql.contains("INDEXED BY idx_hopsweep_sweep"), "{sql}");
+        let plan = db.plan(
+            "SELECT s.identity,s.gameId FROM hopsweep_records s INDEXED BY idx_hopsweep_sweep WHERE s.sweepTxid=?1",
+            &[rusqlite::types::Value::Text("s".into())],
+        );
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("SEARCH s USING INDEX idx_hopsweep_sweep")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|l| l.contains("SCAN")), "{plan:?}");
+    }
+}

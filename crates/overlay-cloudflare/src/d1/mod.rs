@@ -800,7 +800,10 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 495 to 496 for bsv-low #1146 (MARKER-BACKFILL): `hop_marker_backfill_state`, the one-row cursor, done flag and
 /// totals of the one-time backfill of the hop markers the index holds (`hop_marker_backfill`). Not a mirrored family:
 /// no actor digest moves.
-pub const OVERLAY_MIGRATION_COUNT: usize = 496;
+/// 496 to 498 for bsv-low #1173 (OWED-1173): two appended `owed_dirty` triggers on `pot_beefs`
+/// (`owed_dirty_pot_beefs_sweep_insert`, `_sweep_update`): a filed sweep's verified proof latched or withdrawn marks
+/// the filers' seats (`hopsweep_records` by `idx_hopsweep_sweep`). Triggers only: no actor digest moves.
+pub const OVERLAY_MIGRATION_COUNT: usize = 498;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2668,6 +2671,10 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     "ALTER TABLE owed_actor_compare ADD COLUMN lap TEXT",
     // 496: bsv-low #1146 (MARKER-BACKFILL), the one-time hop marker backfill's state (`hop_marker_backfill`).
     "CREATE TABLE IF NOT EXISTS hop_marker_backfill_state (id INTEGER PRIMARY KEY CHECK (id = 1), cursorRowid INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, scanned INTEGER NOT NULL DEFAULT 0, bodies INTEGER NOT NULL DEFAULT 0, stored INTEGER NOT NULL DEFAULT 0, invalid INTEGER NOT NULL DEFAULT 0, noMarker INTEGER NOT NULL DEFAULT 0, missingBeef INTEGER NOT NULL DEFAULT 0, unparseable INTEGER NOT NULL DEFAULT 0, faults INTEGER NOT NULL DEFAULT 0)",
+    // 497..498: bsv-low #1173 (OWED-1173), a filed sweep's verified proof in `pot_beefs` flipped marks the filers'
+    // seats (`owed_dirty_pot_beefs_sweep_insert`, `_sweep_update`). New triggers, none edited.
+    crate::derived_owed::write_time::BEEF_SWEEP_INSERT,
+    crate::derived_owed::write_time::BEEF_SWEEP_UPDATE,
 ];
 
 // =============================================================================
