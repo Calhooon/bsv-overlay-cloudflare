@@ -2494,8 +2494,8 @@ pub fn verified_pot_beefs_same_height_sql(limit: u64) -> String {
 
 /// The verified-latch flip WITH the anchor height (review M4): `proofHeight
 /// = COALESCE(?, proofHeight)` keeps a held anchor when the caller has none.
-/// Bind order: proofHeight (or NULL), txid.
-pub(crate) const POT_BEEF_MARK_PROVEN_AT_SQL: &str =
+/// Bind order: proofHeight (or NULL), txid. Pub for the REAL-SQLite harnesses (OWED-1173's pins).
+pub const POT_BEEF_MARK_PROVEN_AT_SQL: &str =
     "UPDATE pot_beefs SET proof_verified = 1, has_proof = 1, structurally_unprovable = NULL, \
          proofHeight = COALESCE(?, proofHeight) \
      WHERE txid = ?";

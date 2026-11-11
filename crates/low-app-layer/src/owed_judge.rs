@@ -104,7 +104,7 @@ pub fn assert_decomposition(inputs: &OwedInputs<'_>) {
 use crate::pot_hook::{Bind, SqlPort, Stmt, StmtOut};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-mod hydrate;
+pub(crate) mod hydrate;
 pub use hydrate::{facts_of_beefs, FactsFrom, TxFacts, STORED_BEEFS_SQL};
 pub mod rank;
 mod writers;

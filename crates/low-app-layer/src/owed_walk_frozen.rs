@@ -487,6 +487,96 @@ pub(crate) mod pins {
         );
     }
 
+    /// OWED-1173 (the lens's LOW-1): a seat RE-FILES (a second device) its pre-signed sweep of its own index-unspent
+    /// hop, the sweep already mined and its verified proof stored ONLY in `pot_beefs` (no `transactions` row, no word).
+    /// (1) The filing in hand: `hydrate_filings` over the verified filing before it is written reads the sweep's proof
+    /// by `FILED_SWEEP_PROOF_SQL` (its `pot_beefs` arm): `index_proven`, the proof's height. No production caller
+    /// hands a filing in (the door's judgement drains the durable marks), so this arm is pinned here directly; with the
+    /// arm's `pot_beefs` reads made NULL (the lens's mutant M2) it is RED. (2) The door's road: the filing through
+    /// `record_post` (`verify_record_post`, `file_verified`) and its detached judgement store NO claimable
+    /// `hop-stranded` press for the hop. The control is `d2delta2_n2` above: the same hop and filing with no proof press.
+    #[tokio::test]
+    async fn owed1173f_l1_a_refiled_sweep_proven_only_in_pot_beefs_is_no_press() {
+        use crate::hopsweep::tests as hs;
+        use crate::record_post::{self, tests as rp, DoorOutcome, RecordKind};
+        let judge = SqliteSql::migrated();
+        judge.now.set(NOW_MS);
+        judge.tip.set(Some(TIP));
+        let w = hs::wallet(0x47);
+        let identity = hs::identity(&w);
+        let id = hex::encode(&identity);
+        let seat = hs::skey(16);
+        let hop = hex::encode(hs::HOP);
+        let game = hex::encode(hs::GID);
+        let made = (NOW_MS as i64 - 2 * 3_600_000) / 1000;
+        judge
+            .conn
+            .execute_batch(&format!(
+                "INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{hop}',0,0,{made},'p2pkh')"
+            ))
+            .unwrap();
+        rp::md_index_the_hop(&judge, &hs::hop_ctx(&w, &seat, true), Some(1));
+        let raw = hs::sweep_raw(&seat, &seat, 0, hs::HOP_SATS, &hs::DEST);
+        let sweep = bsv_rs::transaction::Transaction::from_binary(&raw).unwrap();
+        let s = sweep.id();
+        let mut beef = bsv_rs::transaction::Beef::new();
+        beef.merge_raw_tx(raw.clone(), None);
+        let proof_height = TIP - 3;
+        judge
+            .conn
+            .execute(
+                "INSERT INTO pot_beefs (txid, beef, createdAt, has_proof, proof_verified, proofHeight) VALUES (?1, ?2, ?3, 1, 1, ?4)",
+                rusqlite::params![s, beef.to_binary(), made, proof_height as i64],
+            )
+            .unwrap();
+        judge.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        let script = rp::md_sweep_script(&identity, &hs::GID, &raw);
+        let mut filing =
+            record_post::verify_record_post(RecordKind::Hopsweep, &script, &id).unwrap();
+        // (1) the filing in hand, before it is written
+        let inputs = crate::owed_judge::hydrate::hydrate_filings(
+            &judge,
+            &id,
+            std::slice::from_ref(&game),
+            std::slice::from_ref(&filing),
+            &[],
+            (NOW_MS / 1000) as i64,
+        )
+        .await
+        .unwrap();
+        let filed = inputs
+            .hop_sweeps
+            .get(&crate::owed::outpoint_key(&hop, 0))
+            .unwrap_or_else(|| panic!("the filing in hand names the hop: {:?}", inputs.hop_sweeps));
+        assert_eq!(filed.sweep_txid, s);
+        assert_eq!(
+            (filed.index_proven, filed.index_proof_height),
+            (true, Some(proof_height)),
+            "the filing in hand reads the sweep's pot_beefs proof"
+        );
+        // (2) the door's road
+        let out = record_post::file_verified(&judge, &mut filing, &id, (NOW_MS / 1000) as i64)
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, DoorOutcome::Written { row_written: true }),
+            "{out:?}"
+        );
+        record_post::detached::judge(&judge, std::slice::from_ref(&filing), "test")
+            .await
+            .unwrap();
+        let rows = stored(&judge.conn, &id);
+        let presses: Vec<_> = rows
+            .values()
+            .map(|row| serde_json::from_str::<serde_json::Value>(row).unwrap())
+            .filter(|row| row[0] == "hop-stranded" && row[6]["claimable"] == true)
+            .collect();
+        assert!(
+            presses.is_empty(),
+            "no press for a hop already swept: {rows:#?}"
+        );
+    }
+
     /// The third delta lens's D3-N1: the press above does not rest on its filing (the hop's index-unspent press stands
     /// without the sweep), so dropping the filing's facts from `judge_with_write` left it green. Here a press that
     /// RESTS on the filed fact: the seat of an indexed pot whose funding the network holds (`network_seen`) and whose

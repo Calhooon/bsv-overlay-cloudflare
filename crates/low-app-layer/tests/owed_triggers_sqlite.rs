@@ -794,7 +794,7 @@ fn paths(f: &Fixture) -> Result<(), String> {
         vec!["pot".to_string().into(); bound],
         marks("beef", "pot", &["alice", "bob"]),
     )?;
-    let anchored = literal(DISCOVERY, "pub(crate) const POT_BEEF_MARK_PROVEN_AT_SQL:");
+    let anchored = literal(DISCOVERY, "pub const POT_BEEF_MARK_PROVEN_AT_SQL:");
     f.check(
         "beef anchored latch",
         &anchored,
@@ -887,6 +887,7 @@ fn paths(f: &Fixture) -> Result<(), String> {
     word_paths(f)?;
     fix1001_paths(f)?;
     fix1010_paths(f, &b, &result)?;
+    owed1173_paths(f)?;
     Ok(())
 }
 
@@ -1165,6 +1166,69 @@ fn fix1001_paths(f: &Fixture) -> Result<(), String> {
             "sweep2".to_string().into(),
         ],
         marks("pot", "hop2:0", &["dave"]),
+    )?;
+    Ok(())
+}
+
+/// OWED-1173 (bsv-low #1173; the lens's MEDIUM-1): a filed sweep's verified proof in `pot_beefs` reaches its filer
+/// (the exclusive subject `erin`: no pot party, no seat, no marker names it), through each shipped `pot_beefs` writer.
+/// The admit path forces `proof_verified = 0` and marks no filer.
+fn owed1173_paths(f: &Fixture) -> Result<(), String> {
+    use low_app_layer::hopsweep;
+    f.check(
+        "a filer's sweep (OWED-1173)",
+        hopsweep::HOPSWEEP_FILE_SQL,
+        vec![
+            "erin".to_string().into(),
+            "game".to_string().into(),
+            "hop3".to_string().into(),
+            0.into(),
+            "sweep3".to_string().into(),
+            "00".to_string().into(),
+            "filed:sweep3".to_string().into(),
+            0.into(),
+            1.into(),
+        ],
+        marks("sweep", "filed:sweep3", &["erin"]),
+    )?;
+    let beef_admit = literal(DISCOVERY, "pub(crate) const POT_BEEF_ADMIT_WRITE_SQL:");
+    f.check(
+        "the sweep's unverified bytes admitted mark no filer",
+        &beef_admit,
+        vec![
+            "sweep3".to_string().into(),
+            Value::Blob(vec![0]),
+            "sweep3".to_string().into(),
+            1.into(),
+            1.into(),
+            "sweep3".to_string().into(),
+        ],
+        vec![],
+    )?;
+    let anchored = literal(DISCOVERY, "pub const POT_BEEF_MARK_PROVEN_AT_SQL:");
+    f.check(
+        "the sweep's pot_beefs proof latched",
+        &anchored,
+        vec![10.into(), "sweep3".to_string().into()],
+        marks("beef", "sweep3", &["erin"]),
+    )?;
+    f.check(
+        "the sweep's pot_beefs proof unlatched by the reorg sweep",
+        discovery::unlatch_pot_beef_sql(),
+        vec!["sweep3".to_string().into()],
+        marks("beef", "sweep3", &["erin"]),
+    )?;
+    let verified = literal(DISCOVERY, "pub(crate) const POT_BEEF_VERIFIED_WRITE_SQL:");
+    f.check(
+        "the sweep's verified bytes stored",
+        &verified,
+        vec![
+            "sweep3".to_string().into(),
+            Value::Blob(vec![0]),
+            1.into(),
+            10.into(),
+        ],
+        marks("beef", "sweep3", &["erin"]),
     )?;
     Ok(())
 }
@@ -1736,8 +1800,8 @@ fn owed893_each_source_trigger_removed_or_not_advanced_alone_turns_the_productio
         .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
     assert_eq!(
         names.len(),
-        46,
-        "fifteen source tables (released_hop_evidence_missing, D2-OWED-FOLD-8's, the fifteenth), refusal UPSERT's UPDATE and two word triggers per verb; FIX-1001's three (transactions' proof insert and update, a hop row's markerless filers); FIX-1010's fourteen (hand markers insert and update, proof markers, proof posts, the result re-latch, a transaction deleted, a party's other seats on insert and update, the seat derivation's pot insert, update and delete and its bytes, the word and spender-bytes sweeps)"
+        48,
+        "fifteen source tables (released_hop_evidence_missing, D2-OWED-FOLD-8's, the fifteenth), refusal UPSERT's UPDATE and two word triggers per verb; FIX-1001's three (transactions' proof insert and update, a hop row's markerless filers); FIX-1010's fourteen (hand markers insert and update, proof markers, proof posts, the result re-latch, a transaction deleted, a party's other seats on insert and update, the seat derivation's pot insert, update and delete and its bytes, the word and spender-bytes sweeps); OWED-1173's two (a filed sweep's pot_beefs proof stored verified, and latched or withdrawn)"
     );
     for name in names {
         let err = paths(&Fixture::new(Some(&name)))

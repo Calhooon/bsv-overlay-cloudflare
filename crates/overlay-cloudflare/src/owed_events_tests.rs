@@ -190,11 +190,14 @@ mod pins {
             "owed_dirty_pot_beefs_insert_seats" => (format!("UPDATE pot_records SET pubA='k',pubB='z' WHERE txid='{POT}'; DELETE FROM owed_dirty; INSERT INTO pot_beefs(txid,beef,createdAt) VALUES('{POT}',x'00',1)"), "beef", POT.into()),
             "owed_dirty_tx_words_delete" => (format!("INSERT INTO tx_words(txid,word,tier,updated_at) VALUES('{SPENDER}','mined','chain',1); DELETE FROM owed_dirty; DELETE FROM tx_words WHERE txid='{SPENDER}'"), "word", SPENDER.into()),
             "owed_dirty_owed_spender_bytes_delete" => (format!("INSERT INTO owed_spender_bytes(txid,bytesJson,createdAtMs) VALUES('{SPENDER}','{{}}',1); DELETE FROM owed_dirty; DELETE FROM owed_spender_bytes WHERE txid='{SPENDER}'"), "bytes", SPENDER.into()),
+            // OWED-1173 (bsv-low #1173): a filed sweep's verified proof in pot_beefs, stored and flipped in place
+            "owed_dirty_pot_beefs_sweep_insert" => (format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES('{ID}','{GAME}','{HOP}',1,'{SPENDER}','00','sweep0',0,1); DELETE FROM owed_dirty; INSERT OR REPLACE INTO pot_beefs(txid,beef,createdAt,has_proof,proof_verified,proofHeight) VALUES('{SPENDER}',x'00',1,1,1,5)"), "beef", SPENDER.into()),
+            "owed_dirty_pot_beefs_sweep_update" => (format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES('{ID}','{GAME}','{HOP}',1,'{SPENDER}','00','sweep0',0,1); INSERT INTO pot_beefs(txid,beef,createdAt,has_proof,proof_verified,proofHeight) VALUES('{SPENDER}',x'00',1,1,1,5); DELETE FROM owed_dirty; UPDATE pot_beefs SET proof_verified=0 WHERE txid='{SPENDER}'"), "beef", SPENDER.into()),
             _ => return None,
         })
     }
 
-    /// The 46 triggers, read from the shipped source at test time (never a hand-fed list): each trigger's name.
+    /// The 48 triggers, read from the shipped source at test time (never a hand-fed list): each trigger's name.
     fn shipped_triggers() -> Vec<String> {
         let src = include_str!("derived_owed_triggers.rs");
         let mut out = Vec::new();
@@ -221,7 +224,7 @@ mod pins {
     #[test]
     fn d2_actor_a_a_each_trigger_pair_noted_publishes_one_event_with_its_rows_facts() {
         let triggers = shipped_triggers();
-        assert_eq!(triggers.len(), 46, "the trigger list: {triggers:?}");
+        assert_eq!(triggers.len(), 48, "the trigger list: {triggers:?}");
         for trigger in &triggers {
             let (sql, source, key) = write_of(trigger)
                 .unwrap_or_else(|| panic!("{trigger}: no writer's note is pinned for it"));

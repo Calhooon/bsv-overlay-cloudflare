@@ -14137,12 +14137,17 @@ mod fix1001 {
         backfill_to_the_stamp, fix1001_seed, FOLD8_TIP, HOME_MARKER_HOP, HOME_MARKER_SEAT,
     };
 
-    const PROOF_HEIGHT: u64 = FOLD8_TIP - 2;
+    pub(super) const PROOF_HEIGHT: u64 = FOLD8_TIP - 2;
+
+    async fn phase_c() -> (SqliteSql, SqliteSql, String) {
+        phase_c_from(fix1001_seed()).await
+    }
 
     /// The record after the backfill and the drain, then Phase C (no D1 row, no pending mark), and the seat's actor
     /// bootstrapped over it.
-    async fn phase_c() -> (SqliteSql, SqliteSql, String) {
-        let (seed, s) = fix1001_seed();
+    pub(super) async fn phase_c_from(
+        (seed, s): (Vec<String>, String),
+    ) -> (SqliteSql, SqliteSql, String) {
         let d1 = seeded(&Fixture {
             name: "fix1001",
             seed,
@@ -14174,7 +14179,7 @@ mod fix1001 {
     }
 
     /// The actor's row of the hop: family, the stored `claimable`, `atHeight`, facts.
-    fn row(db: &SqliteSql) -> (String, Option<i64>, Option<i64>, Value) {
+    pub(super) fn row(db: &SqliteSql) -> (String, Option<i64>, Option<i64>, Value) {
         db.conn
             .query_row(
                 "SELECT family,claimable,atHeight,facts FROM owed_rows WHERE identity=?1 AND outpoint=?2",
@@ -14192,7 +14197,7 @@ mod fix1001 {
     }
 
     /// The writer's pair through the shipped publish (one batch: the seq, the marks and the row's facts).
-    async fn publish(
+    pub(super) async fn publish(
         d1: &SqliteSql,
         source: &str,
         key: &str,
@@ -14214,10 +14219,10 @@ mod fix1001 {
 
     /// The direct pass's port over the REAL actor: each event's subjects from its marks (`plan_with`, as
     /// `WorkerDirect`), each call the actor's apply of the body's identity and games under the event's key.
-    struct ActorDirect<'a> {
-        record: &'a SqliteSql,
-        local: &'a SqliteSql,
-        fails: bool,
+    pub(super) struct ActorDirect<'a> {
+        pub(super) record: &'a SqliteSql,
+        pub(super) local: &'a SqliteSql,
+        pub(super) fails: bool,
     }
     impl crate::owed_events::DirectPort for ActorDirect<'_> {
         async fn subjects(
@@ -14254,7 +14259,7 @@ mod fix1001 {
         }
     }
 
-    fn assert_seen_not_mined(local: &SqliteSql) {
+    pub(super) fn assert_seen_not_mined(local: &SqliteSql) {
         let (family, claimable, at, facts) = row(local);
         assert_eq!(
             (family.as_str(), claimable, at, facts["claimReason"].as_str()),
@@ -25290,5 +25295,80 @@ mod owed1173 {
             stored(&cold, HOME_MARKER_SEAT),
             stored(&d1, HOME_MARKER_SEAT)
         );
+    }
+
+    /// OWED-1173 (the lens's MEDIUM-1, Phase C): FIX-1001's road with the sweep's proof in `pot_beefs` (no
+    /// `transactions` row). The completion pass's SHIPPED latch (`POT_BEEF_MARK_PROVEN_AT_SQL`, its writer's `("beef",
+    /// sweep)` note) marks the filer's seat by `owed_dirty_pot_beefs_sweep_update`; the shipped publish sends the
+    /// event and the direct pass (`plan_with` reads the marks, the REAL actor applies) turns the seat's payout
+    /// `index-proof` claimable. The reorg's SHIPPED unlatch (`unlatch_pot_beef_sql`) withdraws it the same road. RED on
+    /// 7574d00c: the publish skips the pair (`sent 0, skipped 1`), the actor keeps "seen but not mined".
+    #[tokio::test]
+    async fn owed1173f_m1_the_pot_beefs_flip_reaches_the_actor_by_the_direct_call() {
+        use super::fix1001::{
+            assert_seen_not_mined, phase_c_from, publish, row, ActorDirect, PROOF_HEIGHT,
+        };
+        let (mut seed, s) = crate::owed_walk_frozen::pins::fix1001_seed();
+        seed.push(format!("DELETE FROM transactions WHERE txid='{s}'"));
+        let mut beef = bsv_rs::transaction::Beef::new();
+        beef.merge_raw_tx(
+            crate::owed_walk_frozen::pins::home_marker_sweep().to_binary(),
+            None,
+        );
+        seed.push(format!(
+            "INSERT INTO pot_beefs(txid,beef,createdAt,has_proof,proof_verified) VALUES ('{s}',x'{}',{},1,0)",
+            hex::encode(beef.to_binary()),
+            NOW_MS / 1000 - 3_600
+        ));
+        let (d1, local, s) = phase_c_from((seed, s)).await;
+        assert_seen_not_mined(&local);
+        let n = d1
+            .conn
+            .execute(
+                bsv_overlay_cloudflare::d1_discovery::POT_BEEF_MARK_PROVEN_AT_SQL,
+                rusqlite::params![PROOF_HEIGHT as f64, &s],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        let report = publish(&d1, "beef", &s).await;
+        assert_eq!(
+            (report.sent.len(), report.skipped),
+            (1, 0),
+            "the sweep's pot_beefs proof is an owed event: {report:?}"
+        );
+        let direct = ActorDirect {
+            record: &d1,
+            local: &local,
+            fails: false,
+        };
+        let d =
+            crate::owed_events::direct_with(&direct, report.sent.clone(), Some(FOLD8_TIP)).await;
+        assert_eq!((d.calls, d.faults), (1, 0), "{d:?}");
+        let (family, claimable, at, facts) = row(&local);
+        assert_eq!(
+            (
+                family.as_str(),
+                claimable,
+                at,
+                facts["confirmedSource"].as_str()
+            ),
+            (
+                "payout",
+                Some(1),
+                Some(PROOF_HEIGHT as i64),
+                Some("index-proof")
+            ),
+            "the index-proven payout: {facts}"
+        );
+        d1.conn
+            .execute(
+                bsv_overlay_cloudflare::d1_discovery::unlatch_pot_beef_sql(),
+                [&s],
+            )
+            .unwrap();
+        let report = publish(&d1, "beef", &s).await;
+        assert_eq!(report.sent.len(), 1, "{report:?}");
+        crate::owed_events::direct_with(&direct, report.sent.clone(), Some(FOLD8_TIP)).await;
+        assert_seen_not_mined(&local);
     }
 }
