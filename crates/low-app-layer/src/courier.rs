@@ -22,12 +22,14 @@ pub const PROVIDERS: [&str; 5] = ["woc", "bananablocks", "bitails", "arcade", "o
 /// The outcome classes, in the tally's index order.
 pub const OUTCOMES: [&str; 4] = ["ok", "notfound", "ratelimited", "fault"];
 /// The routes that ask, in the tally's index order (`"other"` catches a label this list does not know).
-pub const CALLERS: [&str; 6] = [
+pub const CALLERS: [&str; 7] = [
     "spent_any",
     "hops_view",
     "tx_any",
     "tx_any_unconfirmable",
     "owed",
+    // bsv-low #1165 (the TIP-SECOND-OPINION fold's F5): `/tip`'s second opinion
+    "tip",
     "other",
 ];
 
@@ -199,7 +201,7 @@ static TALLY: [[AtomicU64; 4]; 5] = [
     [z(), z(), z(), z()],
 ];
 /// The isolate's calls by caller.
-static BY_CALLER: [AtomicU64; 6] = [z(), z(), z(), z(), z(), z()];
+static BY_CALLER: [AtomicU64; 7] = [z(), z(), z(), z(), z(), z(), z()];
 
 /// Semantic outcomes share the existing batched durable counter flush.
 pub fn note_presence(name: &str) {

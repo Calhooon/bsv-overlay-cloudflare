@@ -812,12 +812,15 @@ async fn tip_reply_env(env: &worker::Env) -> TipReply {
 const TIP_MAX_AGE_MS: u64 = 30 * 60 * 1_000;
 /// The blocks the verified tip may trail the store's own courier lag and still be served fresh (bsv-low #1077; it was
 /// `TIP_REORG_MARGIN`'s second use, named apart so the two meanings can move apart: the APP-L59 ensemble's C NOTE-1).
-const TIP_LAG_MAX_BLOCKS: u32 = 1;
+pub(crate) const TIP_LAG_MAX_BLOCKS: u32 = 1;
 /// The APP-L59 ensemble's B LOW-1 and C LOW-2: one block's expectation. A memo READ longer ago than this is stale
 /// whatever its pass age (its lag word is as of that read, and the chain moves a block in this time); the client's
 /// stake bar is the same block.
 pub(crate) const TIP_MEMO_MAX_READ_AGE_MS: u64 = 10 * 60 * 1_000;
 const TIP_RETRY_AFTER_SECS: &str = "60";
+/// bsv-low #1165 (the fold's F3): a 503 `asking` (another request of this isolate is asking the couriers) is read
+/// again in two seconds, when the asking request's verdict is memoised.
+const TIP_ASKING_RETRY_AFTER_SECS: &str = "2";
 /// The whole snapshot's deadline (three reads in a row: the tip, `getInfo`,
 /// the active header at the tip's height). The store answers a read in about
 /// 100 to 325 ms at its p95 under the loop's load (bsv-low #1081, the keeper's
@@ -907,7 +910,7 @@ fn memo_verdict(
 /// bsv-low #1165: `ask` is the second opinion's fetch (every source at once, under its own deadline), called only when
 /// the live snapshot is verified, its lag bar passes and its pass is older than
 /// [`crate::tip_second_opinion::SECOND_OPINION_AFTER_MS`], and no memo for its hash is young; `knobs` are R6's
-/// (beta only, all off on prod).
+/// (beta only, all off on prod). The fold's F4: `now_ms` is read once before the ask and once after it.
 async fn tip_reply_within<G, F, L, N, D, A, AF>(
     get: G,
     last_known: L,
@@ -922,7 +925,7 @@ where
         Output = std::result::Result<(u16, serde_json::Value), bsv_tracker::HeaderError>,
     >,
     L: FnOnce() -> Option<crate::tracker_host::VerifiedTip>,
-    N: FnOnce() -> u64,
+    N: Fn() -> u64,
     D: std::future::Future<Output = ()>,
     A: FnOnce() -> AF,
     AF: std::future::Future<Output = Vec<crate::tip_second_opinion::SourceAnswer>>,
@@ -997,11 +1000,23 @@ where
             (None, Some(reason.clone()), Some(reason))
         }
     };
-    // bsv-low #1165 (R2 to R4): past R1's five minutes, a verified snapshot whose lag bar passes asks the couriers'
-    // best block. Corroborated: 200 fresh, the verified height and hash, `ageMs` the age of the check. Refused:
-    // `behind` and `contested` are the 503 whatever the pass age (a source says the chain is not the store's); `short`
-    // is the 503 only past the 30-minute bar, and today's answer under it.
-    let (live_reason, opinion, opinion_log) = match current.as_ref() {
+    // bsv-low #1165 (R2 to R4, and the fold): past R1's five minutes, a verified snapshot whose lag bar passes asks
+    // the couriers' best block. Corroborated: 200 fresh, the verified height and hash, `ageMs` the age of the check
+    // at the clock read after the ask (F4). Refused: `behind` (more than the lag bar's one block above, F1) and
+    // `contested` are the 503 whatever the pass age; `short` and `within-lag` are the 503 only past the 30-minute bar,
+    // and today's answer under it. An ask already in flight in this isolate (F3) is never joined: today's answer
+    // while the pass is at most the client's own 10-minute bar, else the 503 `asking`, read again in 2 s.
+    type Opinion = (
+        &'static str,
+        Option<serde_json::Value>,
+        Option<&'static str>,
+    );
+    let (live_reason, opinion, opinion_log, retry_override): (
+        Option<String>,
+        Option<Opinion>,
+        Option<String>,
+        Option<&'static str>,
+    ) = match current.as_ref() {
         Some(tip) => {
             let pass_age = tip.last_pass_at.map(|at| now.saturating_sub(at));
             match pass_age {
@@ -1010,62 +1025,106 @@ where
                         && tip_lag_verdict(tip).is_ok() =>
                 {
                     use crate::tip_second_opinion as so;
-                    let (verdict, live) = match so::memo_for(&tip.hash, now) {
-                        Some(memo) => (memo, false),
+                    let asked = match so::memo_for(&tip.hash, now) {
+                        Some(memo) => Some((memo, false, now)),
+                        None if so::asking_for(&tip.hash, now) => None,
                         None => {
+                            // F3: the marker is written BEFORE the ask's first await
+                            let asking = so::begin_asking(&tip.hash, now);
                             let mut sources = ask().await;
                             if knobs.source_ahead {
                                 so::apply_source_ahead(&mut sources);
                             }
-                            let verdict = so::verdict(tip.height, &tip.hash, sources);
-                            so::note_live(tip, &verdict, now);
-                            (verdict, true)
+                            // F4: the clock read again after the ask
+                            let after = now_ms().max(now);
+                            let verdict = so::verdict(
+                                tip.height,
+                                &tip.hash,
+                                tip_lag_blocks(tip),
+                                TIP_LAG_MAX_BLOCKS,
+                                sources,
+                                after,
+                            );
+                            so::note_live(tip, &verdict, after);
+                            drop(asking);
+                            Some((verdict, true, after))
                         }
                     };
-                    let described = so::describe(tip, &verdict);
-                    let log = live.then(|| described.clone());
-                    let from = if live { "live" } else { "memo" };
-                    match &verdict {
-                        so::Verdict::Corroborated { checked_at, .. } => {
-                            let mut body = tip_body(Some(tip), now);
-                            body["lagBlocks"] = serde_json::json!(tip_lag_blocks(tip));
-                            body["linked"] = serde_json::json!(tip.linked);
-                            body["freshness"] = serde_json::json!("fresh");
-                            body["ageMs"] = serde_json::json!(now.saturating_sub(*checked_at));
-                            body["freshBy"] = serde_json::json!("couriers");
-                            body["passAgeMs"] = serde_json::json!(pass_age);
-                            body["corroboration"] = so::corroboration_json(tip, &verdict);
-                            body["corroborationFrom"] = serde_json::json!(from);
-                            if knobs.pass_age_ms > 0 {
-                                body["testPassAgeMs"] = serde_json::json!(knobs.pass_age_ms);
-                            }
-                            return TipReply {
-                                status: 200,
-                                body,
-                                retry_after: None,
-                                reason: None,
-                                second_opinion: log,
-                            };
+                    match asked {
+                        None if pass_age <= TIP_MEMO_MAX_READ_AGE_MS => {
+                            (live_reason, None, None, None)
                         }
-                        so::Verdict::Refused { reason, .. } => {
-                            let refuses = live_reason.is_some()
-                                || matches!(reason, so::Refusal::Behind | so::Refusal::Contested);
+                        None => {
                             let base = live_reason.clone().unwrap_or_else(|| {
                                 format!("the store's last pass is {pass_age} ms old")
                             });
-                            let live_reason =
-                                refuses.then(|| format!("{base}; {described} ({from})"));
-                            let extra = refuses.then(|| {
-                                (reason.word(), so::corroboration_json(tip, &verdict), from)
-                            });
-                            (live_reason, extra, log)
+                            (
+                                Some(format!(
+                                    "{base}; the second opinion on {} is being asked by another request of this \
+                                     isolate (asking)",
+                                    tip.height
+                                )),
+                                Some(("asking", None, None)),
+                                None,
+                                Some(TIP_ASKING_RETRY_AFTER_SECS),
+                            )
+                        }
+                        Some((verdict, live, after)) => {
+                            let described = so::describe(tip, &verdict);
+                            let log = live.then(|| described.clone());
+                            let from = if live { "live" } else { "memo" };
+                            match &verdict {
+                                so::Verdict::Corroborated { checked_at, .. } => {
+                                    let mut body = tip_body(Some(tip), now);
+                                    body["lagBlocks"] = serde_json::json!(tip_lag_blocks(tip));
+                                    body["linked"] = serde_json::json!(tip.linked);
+                                    body["freshness"] = serde_json::json!("fresh");
+                                    body["ageMs"] =
+                                        serde_json::json!(after.saturating_sub(*checked_at));
+                                    body["freshBy"] = serde_json::json!("couriers");
+                                    body["passAgeMs"] = serde_json::json!(pass_age);
+                                    body["corroboration"] = so::corroboration_json(tip, &verdict);
+                                    body["corroborationFrom"] = serde_json::json!(from);
+                                    if knobs.pass_age_ms > 0 {
+                                        body["testPassAgeMs"] =
+                                            serde_json::json!(knobs.pass_age_ms);
+                                    }
+                                    return TipReply {
+                                        status: 200,
+                                        body,
+                                        retry_after: None,
+                                        reason: None,
+                                        second_opinion: log,
+                                    };
+                                }
+                                so::Verdict::Refused { reason, .. } => {
+                                    let refuses = live_reason.is_some()
+                                        || matches!(
+                                            reason,
+                                            so::Refusal::Behind | so::Refusal::Contested
+                                        );
+                                    let base = live_reason.clone().unwrap_or_else(|| {
+                                        format!("the store's last pass is {pass_age} ms old")
+                                    });
+                                    let live_reason =
+                                        refuses.then(|| format!("{base}; {described} ({from})"));
+                                    let extra = refuses.then(|| {
+                                        (
+                                            reason.word(),
+                                            Some(so::corroboration_json(tip, &verdict)),
+                                            Some(from),
+                                        )
+                                    });
+                                    (live_reason, extra, log, None)
+                                }
+                            }
                         }
                     }
                 }
-                _ => (live_reason, None, None),
+                _ => (live_reason, None, None, None),
             }
         }
-        None => (live_reason, None, None),
+        None => (live_reason, None, None, None),
     };
     // #1081: a read FAULT serves the last fresh snapshot with its true age,
     // judged by the same bar AND its own read age ([`memo_verdict`]); never
@@ -1108,21 +1167,41 @@ where
         ),
         (None, _) => reason,
     });
+    // bsv-low #1165 (the fold's F6): every 503 names its class in one machine word, for the monitor: `read` (no
+    // snapshot, and no fresh memo stood in), `stale` (the 30-minute bar), `lag` (the lag bar), or the second
+    // opinion's word (`behind`, `contested`, `short`, `within-lag`, `asking`). No 200 carries it.
+    let refusal = match (&opinion, current.as_ref()) {
+        (Some((word, _, _)), _) => *word,
+        (None, None) => "read",
+        (None, Some(tip))
+            if tip
+                .last_pass_at
+                .is_some_and(|at| now.saturating_sub(at) > TIP_MAX_AGE_MS) =>
+        {
+            "stale"
+        }
+        (None, Some(_)) => "lag",
+    };
     if let Some(reason) = &reason {
         body["code"] = serde_json::json!("ERR_TIP_UNAVAILABLE");
         body["error"] = serde_json::json!("verified header tip unavailable");
         body["stale"] = serde_json::json!(true);
         body["reason"] = serde_json::json!(reason);
+        body["refusal"] = serde_json::json!(refusal);
     }
     if let Some((word, corroboration, from)) = opinion {
         body["secondOpinion"] = serde_json::json!(word);
-        body["corroboration"] = corroboration;
-        body["corroborationFrom"] = serde_json::json!(from);
+        if let Some(corroboration) = corroboration {
+            body["corroboration"] = corroboration;
+        }
+        if let Some(from) = from {
+            body["corroborationFrom"] = serde_json::json!(from);
+        }
     }
     TipReply {
         status: if available { 200 } else { 503 },
         body,
-        retry_after: (!available).then_some(TIP_RETRY_AFTER_SECS),
+        retry_after: (!available).then_some(retry_override.unwrap_or(TIP_RETRY_AFTER_SECS)),
         reason,
         second_opinion: opinion_log,
     }

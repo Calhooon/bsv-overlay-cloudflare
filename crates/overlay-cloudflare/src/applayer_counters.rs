@@ -399,9 +399,18 @@ pub fn names() -> Vec<String> {
     // bsv-low #1159: an era cutoff limb the launch floor lowered, once per isolate per limb
     v.push("applayer_era_cutoff_clamped_total".to_string());
     // bsv-low #1165: /tip's second opinion, each live verdict asked and its outcome
-    for outcome in ["asked", "corroborated", "behind", "contested", "short"] {
+    for outcome in [
+        "asked",
+        "corroborated",
+        "behind",
+        "contested",
+        "short",
+        "within_lag",
+    ] {
         v.push(format!("tip_second_opinion_{outcome}_total"));
     }
+    // bsv-low #1165 (the fold's F5): the courier census's per-caller counter of those asks
+    v.push("applayer_courier_calls_tip_total".to_string());
     v
 }
 
