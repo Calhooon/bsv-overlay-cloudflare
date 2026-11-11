@@ -17,7 +17,7 @@ where
         Output = std::result::Result<(u16, serde_json::Value), bsv_tracker::HeaderError>,
     >,
     L: FnOnce() -> Option<crate::tracker_host::VerifiedTip>,
-    N: FnOnce() -> u64,
+    N: Fn() -> u64,
 {
     super::tip_reply_within(
         get,
@@ -1153,20 +1153,24 @@ fn src_fault(name: &str, at: u64) -> SourceAnswer {
 }
 
 /// The reply over a healthy store (its pass at `AT`) read at `AT + pass_age`, the sources scripted; answers the
-/// reply and how many times the sources were asked.
+/// reply and how many times the sources were asked. The clock moves as production's does (the fold's F4): the ask
+/// answers at the latest source's `at`, so the clock read after the ask is that time.
 async fn reply_with_sources(
     pass_age: u64,
     sources: Vec<SourceAnswer>,
     knobs: TipKnobs,
 ) -> (super::TipReply, usize) {
     let asked = Cell::new(0usize);
+    let clock = Cell::new(AT + pass_age);
     let reply = super::tip_reply_within(
         |route| ready(response(route, header())),
         || None,
-        || AT + pass_age,
+        || clock.get(),
         std::future::pending::<()>(),
         || {
             asked.set(asked.get() + 1);
+            let answered = sources.iter().map(|s| s.at).max().unwrap_or(0);
+            clock.set(clock.get().max(answered));
             ready(sources)
         },
         knobs,
@@ -1212,19 +1216,21 @@ fn tower_accepts(status: u16, body: &Value) -> bool {
 }
 
 /// tip1165_a: a pass six minutes old, two sources naming the stored tip: 200 fresh by the couriers, `ageMs` the
-/// older corroboration's age, `passAgeMs` the true pass age. RED on main: `ageMs` 360000, no `freshBy`.
+/// older corroboration's age at the clock read after the ask, `passAgeMs` the true pass age. RED on main: `ageMs`
+/// 360000, no `freshBy`. The fold's F4: the answers come AFTER the request's first clock, as in production (each
+/// stamped on arrival); the clock after the ask is the later one, so the age is 600 - 100.
 #[tokio::test]
 async fn tip1165_a_a_six_minute_pass_corroborated_by_two_sources_is_fresh_by_the_couriers() {
     let now = AT + 6 * MIN;
     let (reply, asked) =
-        reply_with_sources(6 * MIN, matching(now - 900, now - 400), TipKnobs::default()).await;
+        reply_with_sources(6 * MIN, matching(now + 100, now + 600), TipKnobs::default()).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert_eq!(asked, 1);
     assert_eq!(reply.body["freshBy"], "couriers", "{}", reply.body);
     assert_eq!(reply.body["freshness"], "fresh");
     assert_eq!(
-        reply.body["ageMs"], 900,
-        "the older of the two corroborations"
+        reply.body["ageMs"], 500,
+        "the older of the two corroborations, at the clock after the ask"
     );
     assert_eq!(reply.body["passAgeMs"], 360_000);
     assert_eq!(reply.body["lastPassAt"], AT, "the true stamp");
@@ -1253,7 +1259,7 @@ async fn tip1165_b_a_forty_five_minute_pass_corroborated_is_200() {
     let now = AT + 45 * MIN;
     let (reply, asked) = reply_with_sources(
         45 * MIN,
-        matching(now - 900, now - 400),
+        matching(now + 100, now + 1_000),
         TipKnobs::default(),
     )
     .await;
@@ -1264,7 +1270,9 @@ async fn tip1165_b_a_forty_five_minute_pass_corroborated_is_200() {
     assert_eq!(reply.body["passAgeMs"], 45 * MIN);
 }
 
-/// tip1165_c: one source one block above, two matching: the 503, reason `behind`, at 45 and at 6 minutes.
+/// tip1165_c: one source two blocks above (past the lag bar's one block, the fold's F1), two matching: the 503,
+/// reason `behind`, at 45 and at 6 minutes. One block above is `within-lag`: today's answer under the 30-minute bar
+/// (byte for byte main's), the 503 past it, never a corroboration.
 #[tokio::test]
 async fn tip1165_c_a_source_above_is_behind_and_the_503() {
     for pass_age in [45 * MIN, 6 * MIN] {
@@ -1273,7 +1281,7 @@ async fn tip1165_c_a_source_above_is_behind_and_the_503() {
         let sources = vec![
             src("woc", VERIFIED_HEIGHT, &h, now),
             src("bitails", VERIFIED_HEIGHT, &h, now),
-            src("bananablocks", VERIFIED_HEIGHT + 1, &"cd".repeat(32), now),
+            src("bananablocks", VERIFIED_HEIGHT + 2, &"cd".repeat(32), now),
         ];
         crate::tip_second_opinion::clear_memo();
         let (reply, asked) = reply_with_sources(pass_age, sources, TipKnobs::default()).await;
@@ -1288,6 +1296,27 @@ async fn tip1165_c_a_source_above_is_behind_and_the_503() {
             assert!(reason.contains("past the 1800000 ms bar"), "{reason}");
         }
         assert!(reply.body.get("freshBy").is_none());
+        // one block above: within the lag bar's tolerance
+        let one_above = vec![
+            src("woc", VERIFIED_HEIGHT, &h, now),
+            src("bitails", VERIFIED_HEIGHT, &h, now),
+            src("bananablocks", VERIFIED_HEIGHT + 1, &"cd".repeat(32), now),
+        ];
+        crate::tip_second_opinion::clear_memo();
+        let (reply, asked) = reply_with_sources(pass_age, one_above, TipKnobs::default()).await;
+        assert_eq!(asked, 1);
+        assert!(reply.body.get("freshBy").is_none(), "{}", reply.body);
+        if pass_age > FRESHNESS_MS {
+            assert_eq!(reply.status, 503, "{}", reply.body);
+            assert_eq!(reply.body["secondOpinion"], "within-lag");
+            assert_eq!(reply.body["refusal"], "within-lag");
+        } else {
+            let (status, body) = main_body(pass_age).await;
+            assert_eq!(
+                (reply.status, reply.body.to_string()),
+                (status, body.to_string())
+            );
+        }
     }
 }
 
@@ -1485,8 +1514,8 @@ async fn tip1165_i_the_memo_is_per_tip_hash_and_bounded() {
         || {
             asked.set(asked.get() + 1);
             ready(vec![
-                src("woc", VERIFIED_HEIGHT, &h3, AT),
-                src("bitails", VERIFIED_HEIGHT, &h3, AT),
+                src("woc", VERIFIED_HEIGHT, &h3, AT + 45 * MIN + 31_000),
+                src("bitails", VERIFIED_HEIGHT, &h3, AT + 45 * MIN + 31_000),
             ])
         },
         TipKnobs::default(),
@@ -1506,8 +1535,9 @@ async fn tip1165_i_a_refusal_is_memoised_ten_seconds() {
         reply_with_sources(45 * MIN + 9_999, matching(AT, AT), TipKnobs::default()).await;
     assert_eq!((r.status, asked), (503, 0));
     assert_eq!(r.body["corroborationFrom"], "memo");
+    let now = AT + 45 * MIN + 10_000;
     let (r, asked) =
-        reply_with_sources(45 * MIN + 10_000, matching(AT, AT), TipKnobs::default()).await;
+        reply_with_sources(45 * MIN + 10_000, matching(now, now), TipKnobs::default()).await;
     assert_eq!((r.status, asked), (200, 1));
 }
 
@@ -1524,12 +1554,13 @@ async fn tip1165_j_the_drill_knobs_need_the_beta_marker() {
     assert_eq!(reply.body["freshBy"], "couriers");
     assert_eq!(reply.body["passAgeMs"], 2_700_000);
     assert_eq!(reply.body["testPassAgeMs"], 2_700_000);
-    // the source-ahead knob: behind
+    // the source-ahead knob: one block above, `within-lag` since the fold's F1 (it was `behind`); past the
+    // 30-minute bar (the pass-age knob's 45 minutes) the 503 all the same
     let both = TipKnobs::of(Some("beta"), Some("2700000"), Some("1"));
     crate::tip_second_opinion::clear_memo();
     let (reply, _) = reply_with_sources(21_000, matching(now, now), both).await;
     assert_eq!(reply.status, 503, "{}", reply.body);
-    assert_eq!(reply.body["secondOpinion"], "behind");
+    assert_eq!(reply.body["secondOpinion"], "within-lag");
     // without the marker: inert, today's body, nobody asked
     let off = TipKnobs::of(None, Some("2700000"), Some("1"));
     assert_eq!(off, TipKnobs::default());
@@ -1590,4 +1621,702 @@ async fn tip1165_k_the_pinned_readers_take_a_and_b_and_refuse_c_to_e() {
     // the 45-minute body on main is refused by both (the outage's shape)
     let (status, body) = main_body(45 * MIN).await;
     assert!(!client_accepts(status, &body) && !tower_accepts(status, &body));
+}
+
+// ── the TIP-SECOND-OPINION ensemble's pins (lenses A, B and C), adopted by the fold; where a fold changed the
+// behaviour a pin demonstrated, its expectation is the folded one and its comment says so ──
+
+/// The reply over a store whose `getInfo` names `seen` as its last seen height, read at `AT + pass_age` (lens A).
+async fn lensa_reply(
+    pass_age: u64,
+    seen: u32,
+    sources: Vec<SourceAnswer>,
+) -> (super::TipReply, usize) {
+    crate::tip_second_opinion::clear_memo();
+    let asked = Cell::new(0usize);
+    let get = move |route: String| {
+        ready(if route == "getInfo" {
+            let mut sync = info();
+            sync["value"]["lastSeenHeight"] = json!(seen);
+            Ok((200, sync))
+        } else {
+            response(route, header())
+        })
+    };
+    let reply = super::tip_reply_within(
+        get,
+        || None,
+        || AT + pass_age,
+        std::future::pending::<()>(),
+        || {
+            asked.set(asked.get() + 1);
+            ready(sources)
+        },
+        TipKnobs::default(),
+    )
+    .await;
+    (reply, asked.get())
+}
+
+/// Main's answer for the snapshot (lens A): the branch with NO source answering is main's body under the 30-minute
+/// bar and main's 503 past it (fields added), so both readers judge it as main's; the memo is cleared first.
+async fn lensa_main(pass_age: u64, seen: u32) -> (u16, Value) {
+    crate::tip_second_opinion::clear_memo();
+    let get = move |route: String| {
+        ready(if route == "getInfo" {
+            let mut sync = info();
+            sync["value"]["lastSeenHeight"] = json!(seen);
+            Ok((200, sync))
+        } else {
+            response(route, header())
+        })
+    };
+    let r = tip_reply_with(get, || None, || AT + pass_age).await;
+    (r.status, r.body)
+}
+
+/// lens A M1: the store one block behind by its own word (`lastSeenHeight` = tip + 1, inside `TIP_LAG_MAX_BLOCKS`),
+/// its pass 7 minutes old, the couriers on that same block. FOLDED (F1): it demonstrated a new 503 `behind`; one
+/// block is now `within-lag`, served as main serves it (byte for byte), which both pinned readers take. Second leg:
+/// lag 0, two couriers matching, one at tip + 1: the same, main's body.
+#[tokio::test]
+async fn lensa_m1_a_one_block_lag_main_serves_is_a_new_503_between_five_and_ten_minutes() {
+    let pass_age = 7 * MIN;
+    let now = AT + pass_age;
+    let h = tip().hash;
+    let other = "cd".repeat(32);
+    let (main_status, main_body) = lensa_main(pass_age, VERIFIED_HEIGHT + 1).await;
+    assert!(client_accepts(main_status, &main_body), "{main_body}");
+    assert!(tower_accepts(main_status, &main_body), "{main_body}");
+    let (reply, asked) = lensa_reply(
+        pass_age,
+        VERIFIED_HEIGHT + 1,
+        vec![
+            src("woc", VERIFIED_HEIGHT + 1, &other, now),
+            src("bitails", VERIFIED_HEIGHT + 1, &other, now),
+            src("bananablocks", VERIFIED_HEIGHT + 1, &other, now),
+        ],
+    )
+    .await;
+    assert_eq!(asked, 1);
+    assert_eq!(
+        (reply.status, reply.body.to_string()),
+        (main_status, main_body.to_string()),
+        "the fold's F1: main's answer"
+    );
+    assert!(client_accepts(reply.status, &reply.body));
+    assert!(tower_accepts(reply.status, &reply.body));
+    let (main_status, main_body) = lensa_main(pass_age, VERIFIED_HEIGHT).await;
+    assert!(client_accepts(main_status, &main_body));
+    let (reply, _) = lensa_reply(
+        pass_age,
+        VERIFIED_HEIGHT,
+        vec![
+            src("woc", VERIFIED_HEIGHT, &h, now),
+            src("bitails", VERIFIED_HEIGHT, &h, now),
+            src("bananablocks", VERIFIED_HEIGHT + 1, &other, now),
+        ],
+    )
+    .await;
+    assert_eq!(
+        (reply.status, reply.body.to_string()),
+        (main_status, main_body.to_string())
+    );
+}
+
+/// lens A L1: the store's own word one block above its verified tip, its pass 45 minutes old, two couriers naming
+/// the verified tip. FOLDED (F2): it demonstrated a 200 corroborated over the store's own word; the store's word is
+/// now a voice, so the verdict is `within-lag`, the 503 past the 30-minute bar, as main.
+#[tokio::test]
+async fn lensa_l1_corroboration_overrides_the_stores_own_seen_height() {
+    let pass_age = 45 * MIN;
+    let now = AT + pass_age;
+    let (main_status, _) = lensa_main(pass_age, VERIFIED_HEIGHT + 1).await;
+    assert_eq!(main_status, 503);
+    let (reply, _) = lensa_reply(pass_age, VERIFIED_HEIGHT + 1, matching(now, now)).await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.body["secondOpinion"], "within-lag");
+    assert_eq!(reply.body["refusal"], "within-lag");
+    assert!(reply.body.get("freshBy").is_none());
+    assert!(!client_accepts(reply.status, &reply.body));
+    assert!(!tower_accepts(reply.status, &reply.body));
+}
+
+/// lens A N1 (unchanged): a corroboration memo serves for up to 30 s without asking, whatever lands meanwhile; the
+/// served `ageMs` stays under the client's bar.
+#[tokio::test]
+async fn lensa_n1_the_corroboration_memo_serves_across_a_block() {
+    let first = AT + 6 * MIN;
+    crate::tip_second_opinion::clear_memo();
+    let (r, asked) = reply_with_sources(6 * MIN, matching(first, first), TipKnobs::default()).await;
+    assert_eq!((r.status, asked), (200, 1));
+    let other = "cd".repeat(32);
+    let (r, asked) = reply_with_sources(
+        6 * MIN + 29_999,
+        vec![
+            src("woc", VERIFIED_HEIGHT + 1, &other, first + 29_999),
+            src("bitails", VERIFIED_HEIGHT + 1, &other, first + 29_999),
+        ],
+        TipKnobs::default(),
+    )
+    .await;
+    assert_eq!(asked, 0);
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body["ageMs"], 29_999);
+    assert!(client_accepts(r.status, &r.body));
+}
+
+/// lens A N2: two answers stamped 11 minutes back. FOLDED (F4): it demonstrated a 200 with `ageMs` 660000 that the
+/// tower took and the client refused; such answers are now `short`, never a corroboration: at a 6-minute pass
+/// today's answer (both readers judge it as main's), and at 45 minutes the 503.
+#[tokio::test]
+async fn lensa_n2_an_old_checked_at_splits_the_readers() {
+    let pass_age = 6 * MIN;
+    let now = AT + pass_age;
+    let (r, _) = lensa_reply(
+        pass_age,
+        VERIFIED_HEIGHT,
+        matching(now - 11 * MIN, now - 11 * MIN),
+    )
+    .await;
+    assert!(r.body.get("freshBy").is_none(), "{}", r.body);
+    let (ms, mb) = lensa_main(pass_age, VERIFIED_HEIGHT).await;
+    assert_eq!((r.status, r.body.to_string()), (ms, mb.to_string()));
+    let now = AT + 45 * MIN;
+    let (r, _) = lensa_reply(
+        45 * MIN,
+        VERIFIED_HEIGHT,
+        matching(now - 11 * MIN, now - 11 * MIN),
+    )
+    .await;
+    assert_eq!(r.status, 503, "{}", r.body);
+    assert_eq!(r.body["secondOpinion"], "short");
+    assert!(!tower_accepts(r.status, &r.body) && !client_accepts(r.status, &r.body));
+}
+
+/// lens A K (unchanged expectation): the two pinned readers over every body shape the route emits, on a grid of
+/// pass ages, lag words, source sets and the read-fault memo path. A body the readers split on must ALSO be split on
+/// main for the same snapshot; the client never accepts a body the tower refuses.
+#[tokio::test]
+async fn lensa_k_the_readers_agree_wherever_main_agreed() {
+    let h = tip().hash;
+    let other = "cd".repeat(32);
+    let ages = [0, 4, 5, 6, 9, 10, 11, 29, 30, 31, 45, 600]
+        .map(|m| m * MIN)
+        .into_iter()
+        .chain([5 * MIN + 1, 10 * MIN + 1, 30 * MIN + 1]);
+    let mut divergent_new = Vec::new();
+    let mut shapes = 0;
+    for pass_age in ages {
+        let now = AT + pass_age;
+        let sets: Vec<(&str, Vec<SourceAnswer>)> = vec![
+            ("none", vec![]),
+            ("match2", matching(now, now)),
+            (
+                "match3",
+                vec![
+                    src("woc", VERIFIED_HEIGHT, &h, now),
+                    src("bitails", VERIFIED_HEIGHT, &h, now),
+                    src("bananablocks", VERIFIED_HEIGHT, &h, now),
+                ],
+            ),
+            (
+                "above",
+                vec![
+                    src("woc", VERIFIED_HEIGHT, &h, now),
+                    src("bitails", VERIFIED_HEIGHT, &h, now),
+                    src("bananablocks", VERIFIED_HEIGHT + 1, &other, now),
+                ],
+            ),
+            (
+                "above2",
+                vec![
+                    src("woc", VERIFIED_HEIGHT, &h, now),
+                    src("bitails", VERIFIED_HEIGHT, &h, now),
+                    src("bananablocks", VERIFIED_HEIGHT + 2, &other, now),
+                ],
+            ),
+            (
+                "contested",
+                vec![
+                    src("woc", VERIFIED_HEIGHT, &h, now),
+                    src("bitails", VERIFIED_HEIGHT, &h, now),
+                    src("bananablocks", VERIFIED_HEIGHT, &other, now),
+                ],
+            ),
+            (
+                "short",
+                vec![
+                    src("woc", VERIFIED_HEIGHT, &h, now),
+                    src_fault("bitails", now),
+                ],
+            ),
+            (
+                "below",
+                vec![
+                    src("woc", VERIFIED_HEIGHT, &h, now),
+                    src("bitails", VERIFIED_HEIGHT - 1, &other, now),
+                ],
+            ),
+        ];
+        for seen in [VERIFIED_HEIGHT, VERIFIED_HEIGHT + 1, VERIFIED_HEIGHT + 2] {
+            let (ms, mb) = lensa_main(pass_age, seen).await;
+            let main_disagrees = client_accepts(ms, &mb) != tower_accepts(ms, &mb);
+            for (name, sources) in sets.clone() {
+                let (r, _) = lensa_reply(pass_age, seen, sources).await;
+                shapes += 1;
+                let (c, t) = (
+                    client_accepts(r.status, &r.body),
+                    tower_accepts(r.status, &r.body),
+                );
+                assert!(
+                    !c || t,
+                    "the client accepts what the tower refuses: {name} {pass_age} {}",
+                    r.body
+                );
+                if c != t && !main_disagrees {
+                    divergent_new.push(format!("{name} pass {pass_age} seen {seen}: {}", r.body));
+                }
+            }
+        }
+    }
+    for memo_age in [4 * MIN, 9 * MIN, 11 * MIN, 29 * MIN] {
+        let mut memo = tip();
+        memo.read_at = Some(AT + memo_age - 1_000);
+        let fault = |_| ready(Err(HeaderError("transport".into())));
+        let asked = Cell::new(0usize);
+        let r = super::tip_reply_within(
+            fault,
+            move || Some(memo),
+            || AT + memo_age,
+            std::future::pending::<()>(),
+            || {
+                asked.set(asked.get() + 1);
+                ready(Vec::new())
+            },
+            TipKnobs::default(),
+        )
+        .await;
+        assert_eq!(asked.get(), 0);
+        shapes += 1;
+        let (c, t) = (
+            client_accepts(r.status, &r.body),
+            tower_accepts(r.status, &r.body),
+        );
+        assert!(!c || t);
+        if memo_age > 10 * MIN {
+            assert!(t && !c, "main's own disagreement, unchanged: {}", r.body);
+        }
+    }
+    assert!(
+        divergent_new.is_empty(),
+        "{shapes} shapes; new disagreements: {divergent_new:#?}"
+    );
+}
+
+/// One request through `tip_reply_within` over a healthy store at `now`, its ask counted in `asked` and pending one
+/// poll before it answers `sources` (lenses B and C's herd shape).
+async fn herd_one(now: u64, asked: &Cell<usize>, sources: Vec<SourceAnswer>) -> super::TipReply {
+    super::tip_reply_within(
+        |route| ready(response(route, header())),
+        || None,
+        || now,
+        std::future::pending::<()>(),
+        || {
+            asked.set(asked.get() + 1);
+            async move {
+                tokio::task::yield_now().await;
+                sources
+            }
+        },
+        TipKnobs::default(),
+    )
+    .await
+}
+
+/// lens B herd: 100 concurrent `/tip` requests over a stale pass with no memo. FOLDED (F3): it demonstrated 100
+/// asks; the in-flight marker makes it ONE. At 6 minutes the 99 get main's body byte for byte; at 12 and at 45
+/// minutes the 99 get the 503 `asking` with `Retry-After: 2`. After the memo lands, the 101st asks nobody.
+#[tokio::test]
+async fn lensb_herd_concurrent_requests_each_ask() {
+    for pass_age in [6 * MIN, 12 * MIN, 45 * MIN] {
+        crate::tip_second_opinion::clear_memo();
+        let (ms, mb) = main_body(pass_age).await;
+        crate::tip_second_opinion::clear_memo();
+        let asked = Cell::new(0usize);
+        let now = AT + pass_age;
+        let replies = futures_util::future::join_all(
+            (0..100).map(|_| herd_one(now, &asked, matching(now, now))),
+        )
+        .await;
+        assert_eq!(asked.get(), 1, "{pass_age}: one ask for the herd");
+        assert_eq!(replies[0].status, 200, "{}", replies[0].body);
+        assert_eq!(replies[0].body["freshBy"], "couriers");
+        for r in &replies[1..] {
+            if pass_age <= 10 * MIN {
+                assert_eq!((r.status, r.body.to_string()), (ms, mb.to_string()));
+                assert_eq!(r.retry_after, None);
+            } else {
+                assert_eq!(r.status, 503, "{}", r.body);
+                assert_eq!(r.body["refusal"], "asking");
+                assert_eq!(r.body["secondOpinion"], "asking");
+                assert_eq!(r.retry_after, Some("2"));
+                assert!(r.reason.as_deref().unwrap().contains("asking"));
+            }
+        }
+        let r = herd_one(now, &asked, matching(now, now)).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(asked.get(), 1, "the memo answers the 101st");
+    }
+}
+
+/// The fold's F3: a marker the asking request left when it died (older than the deadline plus 500 ms) is dead and
+/// the next request asks; one younger than that is live and the request does not ask.
+#[tokio::test]
+async fn tip1165_fold_f3_a_dead_marker_lets_the_next_request_ask() {
+    use crate::tip_second_opinion::{plant_asking, ASKING_DEAD_AFTER_MS};
+    let now = AT + 12 * MIN;
+    crate::tip_second_opinion::clear_memo();
+    plant_asking(&tip().hash, now - ASKING_DEAD_AFTER_MS);
+    let asked = Cell::new(0usize);
+    let r = herd_one(now, &asked, matching(now, now)).await;
+    assert_eq!(asked.get(), 0, "a live marker: not asked");
+    assert_eq!(r.body["refusal"], "asking");
+    plant_asking(&tip().hash, now - ASKING_DEAD_AFTER_MS - 1);
+    let r = herd_one(now, &asked, matching(now, now)).await;
+    assert_eq!(asked.get(), 1, "a dead marker: asked");
+    assert_eq!(r.status, 200, "{}", r.body);
+    // a marker for another tip's hash never holds this one
+    crate::tip_second_opinion::clear_memo();
+    plant_asking(&"03".repeat(32), now);
+    let r = herd_one(now, &asked, matching(now, now)).await;
+    assert_eq!(asked.get(), 2);
+    assert_eq!(r.status, 200);
+    // a request dropped mid-ask clears its own marker
+    crate::tip_second_opinion::clear_memo();
+    {
+        let dropped = herd_one(now, &asked, matching(now, now));
+        futures_util::pin_mut!(dropped);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(std::future::Future::poll(dropped.as_mut(), &mut cx).is_pending());
+        assert!(crate::tip_second_opinion::asking_for(&tip().hash, now));
+    }
+    assert!(!crate::tip_second_opinion::asking_for(&tip().hash, now));
+}
+
+/// lens B: one source alone one block above, the other two faulted, at 6 and 25 minutes. FOLDED (F1): it
+/// demonstrated the 503 closing the 5 to 30 minute window; one block is `within-lag`, main's answer, which the tower
+/// takes (and the client, at 6 minutes). Two blocks above still close it.
+#[tokio::test]
+async fn lensb_one_source_alone_closes_the_5_to_30_minute_window() {
+    for pass_age in [6 * MIN, 25 * MIN] {
+        let now = AT + pass_age;
+        crate::tip_second_opinion::clear_memo();
+        let (main_like, _) = reply_with_sources(pass_age, vec![], TipKnobs::default()).await;
+        assert_eq!(main_like.status, 200, "{}", main_like.body);
+        assert!(tower_accepts(main_like.status, &main_like.body));
+        crate::tip_second_opinion::clear_memo();
+        let liar = vec![
+            src("woc", VERIFIED_HEIGHT + 1, &"cd".repeat(32), now),
+            src_fault("bitails", now),
+            src_fault("bananablocks", now),
+        ];
+        let (reply, _) = reply_with_sources(pass_age, liar, TipKnobs::default()).await;
+        assert_eq!(
+            (reply.status, reply.body.to_string()),
+            (main_like.status, main_like.body.to_string())
+        );
+        assert!(tower_accepts(reply.status, &reply.body));
+        assert_eq!(
+            client_accepts(reply.status, &reply.body),
+            pass_age <= 10 * MIN
+        );
+        crate::tip_second_opinion::clear_memo();
+        let liar = vec![src("woc", VERIFIED_HEIGHT + 2, &"cd".repeat(32), now)];
+        let (reply, _) = reply_with_sources(pass_age, liar, TipKnobs::default()).await;
+        assert_eq!(reply.status, 503, "{}", reply.body);
+        assert_eq!(reply.body["refusal"], "behind");
+        assert!(!tower_accepts(reply.status, &reply.body));
+    }
+}
+
+/// lens B (unchanged; the residual F7 states): a source that would dissent but faults counts for nothing, so two
+/// agreeing sources corroborate.
+#[tokio::test]
+async fn lensb_a_faulted_dissenter_counts_for_nothing() {
+    crate::tip_second_opinion::clear_memo();
+    let now = AT + 45 * MIN;
+    let h = tip().hash;
+    let sources = vec![
+        src("woc", VERIFIED_HEIGHT, &h, now),
+        src("bananablocks", VERIFIED_HEIGHT, &h, now),
+        SourceAnswer {
+            name: "bitails".into(),
+            read: Err("HTTP 429".into()),
+            at: now,
+        },
+    ];
+    let (reply, _) = reply_with_sources(45 * MIN, sources, TipKnobs::default()).await;
+    assert_eq!(reply.status, 200);
+    assert!(tower_accepts(reply.status, &reply.body));
+    assert!(client_accepts(reply.status, &reply.body));
+}
+
+/// lens B age zero: answers stamped after the request's first clock. FOLDED (F4): it demonstrated `ageMs` 0; the
+/// clock read after the ask makes it the true age of the older of the two newest answers (1500 - 400).
+#[tokio::test]
+async fn lensb_live_age_is_zero_when_answers_come_after_now() {
+    crate::tip_second_opinion::clear_memo();
+    let now = AT + 6 * MIN;
+    let (reply, _) = reply_with_sources(
+        6 * MIN,
+        matching(now + 1_500, now + 400),
+        TipKnobs::default(),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body["ageMs"], 1_100);
+}
+
+/// lens B (unchanged): a prod render (no beta marker) with both knob vars set behaves as with no knobs.
+#[tokio::test]
+async fn lensb_knobs_are_inert_through_the_route_without_the_marker() {
+    crate::tip_second_opinion::clear_memo();
+    let knobs = TipKnobs::of(None, Some("2700000"), Some("1"));
+    assert!(knobs.listed().is_empty());
+    let (reply, asked) = reply_with_sources(20_000, matching(AT, AT), knobs).await;
+    assert_eq!(asked, 0, "{}", reply.body);
+    assert_eq!(reply.status, 200);
+    assert!(reply.body.get("freshBy").is_none());
+    assert!(reply.body.get("testPassAgeMs").is_none());
+}
+
+fn lensc_lag1(route: String) -> std::future::Ready<std::result::Result<(u16, Value), HeaderError>> {
+    ready(if route == "getInfo" {
+        let mut s = info();
+        s["value"]["lastSeenHeight"] = json!(VERIFIED_HEIGHT + 1);
+        Ok((200, s))
+    } else {
+        response(route, header())
+    })
+}
+
+/// lens C P1: the store has seen one block it has not verified (lag 1), pass 7 minutes old, two couriers naming
+/// that block. FOLDED (F1): it demonstrated a 503 `behind`; it is now `within-lag`, today's body byte for byte.
+#[tokio::test]
+async fn lensc_p1_a_one_block_lag_the_bar_tolerates_is_refused_behind() {
+    crate::tip_second_opinion::clear_memo();
+    let now = AT + 7 * MIN;
+    let today = tip_reply_with(lensc_lag1, || None, || now).await;
+    assert_eq!(today.status, 200, "{}", today.body);
+    assert!(client_accepts(today.status, &today.body), "{}", today.body);
+    assert!(tower_accepts(today.status, &today.body));
+    crate::tip_second_opinion::clear_memo();
+    let next = "0f".repeat(32);
+    let reply = super::tip_reply_within(
+        lensc_lag1,
+        || None,
+        || now,
+        std::future::pending::<()>(),
+        || {
+            ready(vec![
+                src("woc", VERIFIED_HEIGHT + 1, &next, now + 300),
+                src("bitails", VERIFIED_HEIGHT + 1, &next, now + 400),
+                src_fault("bananablocks", now + 2_000),
+            ])
+        },
+        TipKnobs::default(),
+    )
+    .await;
+    assert_eq!(
+        (reply.status, reply.body.to_string()),
+        (today.status, today.body.to_string())
+    );
+    assert!(client_accepts(reply.status, &reply.body));
+    assert!(tower_accepts(reply.status, &reply.body));
+}
+
+/// lens C P2: answers after the request's first clock. FOLDED (F4): it demonstrated `ageMs` 0; now 1900 - 1200.
+#[tokio::test]
+async fn lensc_p2_a_live_corroboration_serves_age_zero() {
+    crate::tip_second_opinion::clear_memo();
+    let now = AT + 7 * MIN;
+    let (reply, _) = reply_with_sources(
+        7 * MIN,
+        matching(now + 1_200, now + 1_900),
+        TipKnobs::default(),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["ageMs"], 700, "{}", reply.body);
+}
+
+/// lens C P3: two concurrent `/tip` in one isolate with no memo. FOLDED (F3): it demonstrated two asks; one now.
+#[tokio::test]
+async fn lensc_p3_concurrent_requests_each_ask() {
+    crate::tip_second_opinion::clear_memo();
+    let now = AT + 7 * MIN;
+    let asked = Cell::new(0usize);
+    let (a, b) = futures_util::future::join(
+        herd_one(now, &asked, matching(now, now)),
+        herd_one(now, &asked, matching(now, now)),
+    )
+    .await;
+    assert_eq!((a.status, b.status), (200, 200));
+    assert_eq!(
+        asked.get(),
+        1,
+        "one ask: the second request finds the marker"
+    );
+}
+
+/// The fold's F6: every 503 arm of `/tip` carries `refusal`, one machine word; no 200 carries it; and both pinned
+/// readers refuse every 503 and read the same with the field removed (they ignore it).
+#[tokio::test]
+async fn tip1165_fold_f6_every_503_names_its_refusal() {
+    let h = tip().hash;
+    let other = "cd".repeat(32);
+    let mut arms: Vec<(&str, super::TipReply)> = Vec::new();
+    // read: a transport fault, no memo
+    let fault = |_| ready(Err(HeaderError("transport".into())));
+    arms.push(("read", tip_reply_with(fault, || None, || AT).await));
+    // read: the deadline, no memo (a store that never answers)
+    let r = super::tip_reply_within(
+        |_route: String| std::future::pending::<Result<(u16, Value), HeaderError>>(),
+        || None,
+        || AT,
+        ready(()),
+        || ready(Vec::new()),
+        TipKnobs::default(),
+    )
+    .await;
+    arms.push(("read", r));
+    // read: the store's 5xx
+    let five = |_| ready(Ok((503, json!({}))));
+    arms.push(("read", tip_reply_with(five, || None, || AT).await));
+    // read: the snapshot disagreeing twice
+    arms.push((
+        "read",
+        tip_reply_with(moving_store(usize::MAX), || None, || AT).await,
+    ));
+    // lag: a young pass two behind its own seen tip
+    crate::tip_second_opinion::clear_memo();
+    let (r, _) = lensa_reply(MIN, VERIFIED_HEIGHT + 2, vec![]).await;
+    arms.push(("lag", r));
+    // stale: the 30-minute bar on a live read (the lag bar failing too, so no second opinion is asked)
+    let (r, _) = lensa_reply(45 * MIN, VERIFIED_HEIGHT + 2, vec![]).await;
+    arms.push(("stale", r));
+    // the second opinion's words
+    let at45 = AT + 45 * MIN;
+    for (word, pass_age, sources) in [
+        (
+            "behind",
+            6 * MIN,
+            vec![
+                src("woc", VERIFIED_HEIGHT, &h, AT + 6 * MIN),
+                src("bitails", VERIFIED_HEIGHT + 2, &other, AT + 6 * MIN),
+            ],
+        ),
+        (
+            "contested",
+            6 * MIN,
+            vec![
+                src("woc", VERIFIED_HEIGHT, &h, AT + 6 * MIN),
+                src("bitails", VERIFIED_HEIGHT, &other, AT + 6 * MIN),
+            ],
+        ),
+        (
+            "short",
+            45 * MIN,
+            vec![
+                src("woc", VERIFIED_HEIGHT, &h, at45),
+                src_fault("bitails", at45),
+            ],
+        ),
+        (
+            "within-lag",
+            45 * MIN,
+            vec![
+                src("woc", VERIFIED_HEIGHT, &h, at45),
+                src("bitails", VERIFIED_HEIGHT, &h, at45),
+                src("bananablocks", VERIFIED_HEIGHT + 1, &other, at45),
+            ],
+        ),
+    ] {
+        crate::tip_second_opinion::clear_memo();
+        let (r, _) = reply_with_sources(pass_age, sources, TipKnobs::default()).await;
+        arms.push((word, r));
+    }
+    // asking: another request of this isolate is asking, past the client's 10-minute bar
+    crate::tip_second_opinion::clear_memo();
+    crate::tip_second_opinion::plant_asking(&h, AT + 12 * MIN);
+    let (r, asked) = reply_with_sources(12 * MIN, matching(AT, AT), TipKnobs::default()).await;
+    assert_eq!(asked, 0);
+    arms.push(("asking", r));
+    crate::tip_second_opinion::clear_memo();
+    for (word, r) in &arms {
+        assert_eq!(r.status, 503, "{word}: {}", r.body);
+        assert_eq!(r.body["refusal"], *word, "{}", r.body);
+        let mut without = r.body.clone();
+        without.as_object_mut().unwrap().remove("refusal");
+        for body in [&r.body, &without] {
+            assert!(!client_accepts(r.status, body), "{word}");
+            assert!(!tower_accepts(r.status, body), "{word}");
+        }
+    }
+    // no 200 carries it: the fresh path, a corroboration, a read-fault memo, `short` and `within-lag` under the bar
+    let mut oks = vec![main_body(4 * MIN).await.1];
+    let now = AT + 6 * MIN;
+    oks.push(
+        reply_with_sources(6 * MIN, matching(now, now), TipKnobs::default())
+            .await
+            .0
+            .body,
+    );
+    oks.push(
+        tip_reply_with(fault, || Some(memo_at(10_000)), || AT)
+            .await
+            .body,
+    );
+    crate::tip_second_opinion::clear_memo();
+    oks.push(
+        reply_with_sources(6 * MIN, vec![src_fault("woc", now)], TipKnobs::default())
+            .await
+            .0
+            .body,
+    );
+    let (r, _) = lensa_reply(
+        6 * MIN,
+        VERIFIED_HEIGHT + 1,
+        vec![src("woc", VERIFIED_HEIGHT + 1, &other, now)],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    oks.push(r.body);
+    for body in oks {
+        assert!(body.get("refusal").is_none(), "{body}");
+        assert_eq!(body["freshness"], "fresh", "{body}");
+    }
+}
+
+/// The fold's F4 and F2 together: a corroboration needs the store's own lag to be 0 or absent (the store one block
+/// ahead of its verified tip and two couriers at the verified height is `within-lag`, never `freshBy: couriers`); and
+/// an answer stamped 11 minutes back cannot corroborate.
+#[tokio::test]
+async fn tip1165_fold_f2_f4_no_corroboration_over_the_stores_word_or_an_old_answer() {
+    for pass_age in [6 * MIN, 45 * MIN] {
+        let now = AT + pass_age;
+        let (r, _) = lensa_reply(pass_age, VERIFIED_HEIGHT + 1, matching(now, now)).await;
+        assert!(r.body.get("freshBy").is_none(), "{}", r.body);
+        let (r, _) = lensa_reply(
+            pass_age,
+            VERIFIED_HEIGHT,
+            matching(now - 11 * MIN, now - 11 * MIN),
+        )
+        .await;
+        assert!(r.body.get("freshBy").is_none(), "{}", r.body);
+        let (r, _) = lensa_reply(pass_age, VERIFIED_HEIGHT, matching(now, now)).await;
+        assert_eq!(r.body["freshBy"], "couriers", "the control: {}", r.body);
+    }
 }
