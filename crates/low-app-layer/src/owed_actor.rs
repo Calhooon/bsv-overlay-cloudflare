@@ -5832,8 +5832,11 @@ pub fn lib_rev() -> &'static str {
 /// The fleet bars stay keyed by [`lib_rev`] (a build's own samples). Moved by FIX-997 (bsv-low #997): the mirror's
 /// `txfacts` carry the classifier's input and the bump's height, so a spend with no stored verdict is judged from them
 /// (it was `unresolved` in the actor); every actor re-judges once under the bootstrap pace, and D1's fleet re-judge
-/// (FOLD-13) runs once with the D1 judge on.
-pub const JUDGE_VERSION: &str = "fix997-2026-10-30";
+/// (FOLD-13) runs once with the D1 judge on. Moved by OWED-1173 (bsv-low #1173): a filed hop sweep's verified proof
+/// in `pot_beefs` is the index's proof of the hop's spend (`owed_judge::hydrate`), so a join-refused seat's hop whose
+/// filed sweep mined no longer reads index-unspent once the sweep's tracker word ages out; every actor re-judges once
+/// under the bootstrap pace and D1's fleet re-judge (FOLD-13) runs once with the D1 judge on.
+pub const JUDGE_VERSION: &str = "owed1173-2026-11-11";
 
 /// One class row after this isolate's samples: the stored rings with the new samples appended, the last
 /// [`METER_SAMPLES`] kept; `unapplied` (the queue row only) the oldest unapplied write time, `Some(None)` cleared. A
