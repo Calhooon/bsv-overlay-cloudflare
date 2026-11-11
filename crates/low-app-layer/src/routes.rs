@@ -779,6 +779,9 @@ pub async fn tip(_req: Request, ctx: RouteContext<AuthState>) -> Result<Response
 /// deadline, the store's status, the freshness bar), a 200 served from the memo names the read's fault; and a broken
 /// link state is logged as the diagnostic it is (the APP-L59 ensemble's C MEDIUM-2: never a stale clock).
 fn log_tip_reply(reply: &TipReply) {
+    if let Some(opinion) = &reply.second_opinion {
+        worker::console_log!("[tip] {opinion}");
+    }
     if let Some(reason) = &reply.reason {
         if reply.status == 503 {
             console_warn!("[tip] 503 ERR_TIP_UNAVAILABLE: {reason}");
@@ -800,6 +803,8 @@ async fn tip_reply_env(env: &worker::Env) -> TipReply {
         crate::tracker_host::last_verified_tip,
         || worker::Date::now().as_millis(),
         worker::Delay::from(core::time::Duration::from_millis(TIP_READ_DEADLINE_MS)),
+        crate::tip_second_opinion::ask_env,
+        crate::tip_second_opinion::knobs_env(env),
     )
     .await
 }
@@ -828,6 +833,8 @@ struct TipReply {
     /// Why the answer is not a plain live 200 (every 503, and a 200 served
     /// from the memo); logged by [`log_tip_reply`].
     reason: Option<String>,
+    /// bsv-low #1165: a LIVE second opinion's verdict, one log line each (a memo's serving logs none).
+    second_opinion: Option<String>,
 }
 
 /// The blocks the verified tip trails the couriers by, in the store's own words
@@ -862,6 +869,11 @@ fn tip_verdict(
             ));
         }
     }
+    tip_lag_verdict(tip)
+}
+
+/// The lag half of [`tip_verdict`]: the store's own courier lag within [`TIP_LAG_MAX_BLOCKS`].
+fn tip_lag_verdict(tip: &crate::tracker_host::VerifiedTip) -> std::result::Result<(), String> {
     if let Some(lag) = tip_lag_blocks(tip).filter(|lag| *lag > TIP_LAG_MAX_BLOCKS) {
         return Err(format!(
             "the verified tip {} trails the couriers by {lag} blocks (seen {:?}, liveLagBlocks {:?})",
@@ -892,7 +904,18 @@ fn memo_verdict(
     tip_verdict(memo, now)
 }
 
-async fn tip_reply_within<G, F, L, N, D>(get: G, last_known: L, now_ms: N, deadline: D) -> TipReply
+/// bsv-low #1165: `ask` is the second opinion's fetch (every source at once, under its own deadline), called only when
+/// the live snapshot is verified, its lag bar passes and its pass is older than
+/// [`crate::tip_second_opinion::SECOND_OPINION_AFTER_MS`], and no memo for its hash is young; `knobs` are R6's
+/// (beta only, all off on prod).
+async fn tip_reply_within<G, F, L, N, D, A, AF>(
+    get: G,
+    last_known: L,
+    now_ms: N,
+    deadline: D,
+    ask: A,
+    knobs: crate::tip_second_opinion::TipKnobs,
+) -> TipReply
 where
     G: Fn(String) -> F,
     F: std::future::Future<
@@ -901,6 +924,8 @@ where
     L: FnOnce() -> Option<crate::tracker_host::VerifiedTip>,
     N: FnOnce() -> u64,
     D: std::future::Future<Output = ()>,
+    A: FnOnce() -> AF,
+    AF: std::future::Future<Output = Vec<crate::tip_second_opinion::SourceAnswer>>,
 {
     // A FAULT of the read (a transport error, the store's 5xx, the deadline)
     // is the memo's case; an answer the store gave that does not check (a
@@ -945,6 +970,11 @@ where
     let (current, live_reason, read_fault) = match read {
         Some(Ok(tip)) => {
             crate::tracker_host::note_tip_read(&tip, now);
+            // R6 (beta only): the drill reads the pass as the knob's age; the memo above keeps the true stamp.
+            let mut tip = tip;
+            if knobs.pass_age_ms > 0 {
+                tip.last_pass_at = Some(now.saturating_sub(knobs.pass_age_ms));
+            }
             let verdict = tip_verdict(&tip, now).err();
             (Some(tip), verdict, None)
         }
@@ -967,6 +997,76 @@ where
             (None, Some(reason.clone()), Some(reason))
         }
     };
+    // bsv-low #1165 (R2 to R4): past R1's five minutes, a verified snapshot whose lag bar passes asks the couriers'
+    // best block. Corroborated: 200 fresh, the verified height and hash, `ageMs` the age of the check. Refused:
+    // `behind` and `contested` are the 503 whatever the pass age (a source says the chain is not the store's); `short`
+    // is the 503 only past the 30-minute bar, and today's answer under it.
+    let (live_reason, opinion, opinion_log) = match current.as_ref() {
+        Some(tip) => {
+            let pass_age = tip.last_pass_at.map(|at| now.saturating_sub(at));
+            match pass_age {
+                Some(pass_age)
+                    if pass_age > crate::tip_second_opinion::SECOND_OPINION_AFTER_MS
+                        && tip_lag_verdict(tip).is_ok() =>
+                {
+                    use crate::tip_second_opinion as so;
+                    let (verdict, live) = match so::memo_for(&tip.hash, now) {
+                        Some(memo) => (memo, false),
+                        None => {
+                            let mut sources = ask().await;
+                            if knobs.source_ahead {
+                                so::apply_source_ahead(&mut sources);
+                            }
+                            let verdict = so::verdict(tip.height, &tip.hash, sources);
+                            so::note_live(tip, &verdict, now);
+                            (verdict, true)
+                        }
+                    };
+                    let described = so::describe(tip, &verdict);
+                    let log = live.then(|| described.clone());
+                    let from = if live { "live" } else { "memo" };
+                    match &verdict {
+                        so::Verdict::Corroborated { checked_at, .. } => {
+                            let mut body = tip_body(Some(tip), now);
+                            body["lagBlocks"] = serde_json::json!(tip_lag_blocks(tip));
+                            body["linked"] = serde_json::json!(tip.linked);
+                            body["freshness"] = serde_json::json!("fresh");
+                            body["ageMs"] = serde_json::json!(now.saturating_sub(*checked_at));
+                            body["freshBy"] = serde_json::json!("couriers");
+                            body["passAgeMs"] = serde_json::json!(pass_age);
+                            body["corroboration"] = so::corroboration_json(tip, &verdict);
+                            body["corroborationFrom"] = serde_json::json!(from);
+                            if knobs.pass_age_ms > 0 {
+                                body["testPassAgeMs"] = serde_json::json!(knobs.pass_age_ms);
+                            }
+                            return TipReply {
+                                status: 200,
+                                body,
+                                retry_after: None,
+                                reason: None,
+                                second_opinion: log,
+                            };
+                        }
+                        so::Verdict::Refused { reason, .. } => {
+                            let refuses = live_reason.is_some()
+                                || matches!(reason, so::Refusal::Behind | so::Refusal::Contested);
+                            let base = live_reason.clone().unwrap_or_else(|| {
+                                format!("the store's last pass is {pass_age} ms old")
+                            });
+                            let live_reason =
+                                refuses.then(|| format!("{base}; {described} ({from})"));
+                            let extra = refuses.then(|| {
+                                (reason.word(), so::corroboration_json(tip, &verdict), from)
+                            });
+                            (live_reason, extra, log)
+                        }
+                    }
+                }
+                _ => (live_reason, None, None),
+            }
+        }
+        None => (live_reason, None, None),
+    };
     // #1081: a read FAULT serves the last fresh snapshot with its true age,
     // judged by the same bar AND its own read age ([`memo_verdict`]); never
     // one without a pass stamp (no age) or a read stamp.
@@ -984,6 +1084,7 @@ where
                 body,
                 retry_after: None,
                 reason: Some(format!("the live read faulted ({fault})")),
+                second_opinion: None,
             };
         }
     }
@@ -1013,11 +1114,17 @@ where
         body["stale"] = serde_json::json!(true);
         body["reason"] = serde_json::json!(reason);
     }
+    if let Some((word, corroboration, from)) = opinion {
+        body["secondOpinion"] = serde_json::json!(word);
+        body["corroboration"] = corroboration;
+        body["corroborationFrom"] = serde_json::json!(from);
+    }
     TipReply {
         status: if available { 200 } else { 503 },
         body,
         retry_after: (!available).then_some(TIP_RETRY_AFTER_SECS),
         reason,
+        second_opinion: opinion_log,
     }
 }
 
@@ -7505,7 +7612,18 @@ pub async fn health(_req: Request, ctx: RouteContext<AuthState>) -> Result<Respo
     // bsv-low #532: the identity views' outcomes per route and the budget (this isolate's).
     body["identity"] = crate::identity::health_json();
     // bsv-low #670 (round 2, question 6): the TEST-ONLY knobs this deploy honours (empty on prod: no beta marker).
+    // bsv-low #1165 (R6): the second opinion's drill knobs beside them (empty without the beta marker).
     body["testKnobs"] = serde_json::json!(crate::auth::test_knobs_honored(&ctx.env));
+    if let Some(knobs) = body["testKnobs"].as_array_mut() {
+        knobs.extend(
+            crate::tip_second_opinion::knobs_env(&ctx.env)
+                .listed()
+                .into_iter()
+                .map(serde_json::Value::from),
+        );
+    }
+    // bsv-low #1165 (R5): this isolate's last live second opinion on `/tip`.
+    body["tipSecondOpinion"] = crate::tip_second_opinion::health_json();
     // #375 (review MED-2's surface half): the ACTIVE era cutoff — post the
     // future-cutoff belt, i.e. exactly what the views are filtering by and
     // what /epoch serves. `null` = write-off inert. One glance answers

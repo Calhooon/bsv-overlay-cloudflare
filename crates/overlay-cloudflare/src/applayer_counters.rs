@@ -398,6 +398,10 @@ pub fn names() -> Vec<String> {
     v.push("tracker_detached_judge_skipped_total".to_string());
     // bsv-low #1159: an era cutoff limb the launch floor lowered, once per isolate per limb
     v.push("applayer_era_cutoff_clamped_total".to_string());
+    // bsv-low #1165: /tip's second opinion, each live verdict asked and its outcome
+    for outcome in ["asked", "corroborated", "behind", "contested", "short"] {
+        v.push(format!("tip_second_opinion_{outcome}_total"));
+    }
     v
 }
 

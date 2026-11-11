@@ -173,6 +173,7 @@ pub mod refund_view;
 pub mod results;
 mod routes;
 pub mod schema;
+pub mod tip_second_opinion;
 pub mod tracker_host;
 pub mod txany;
 
