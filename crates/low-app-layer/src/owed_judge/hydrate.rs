@@ -74,6 +74,27 @@ fn num(v: &Value, k: &str) -> u64 {
 fn flag(v: &Value, k: &str) -> Option<bool> {
     crate::owed_judge::rank::number(v, k).map(|n| n != 0)
 }
+/// OWED-1173 (bsv-low #1173): the INDEX'S proof of a filed sweep. A sweep admits no output, so it never has a
+/// `transactions` row: its verified proof lives in `pot_beefs` (`proof_verified`, the chaintracks-verified latch, and
+/// its `proofHeight`). Either latch is the index's proof of the spend (#770, #736: index proof first, never a
+/// courier); an unverified `pot_beefs` row (`proof_verified` 0, whatever its `has_proof`) proves nothing. Read once a
+/// filing by its own txid (the filed-sweep read below carries the same four columns through its two LEFT JOINs).
+/// Before it the judge read `transactions` alone, so once the tracker's eight-day sweep deleted the sweep's `mined`
+/// word a hop already swept home read index-unspent and was offered the sweep press again.
+const FILED_SWEEP_PROOF_SQL: &str = "SELECT (SELECT has_proof FROM transactions WHERE txid=?1) AS has_proof,(SELECT proofHeight FROM transactions WHERE txid=?1) AS proofHeight,(SELECT proof_verified FROM pot_beefs WHERE txid=?1) AS pbVerified,(SELECT proofHeight FROM pot_beefs WHERE txid=?1) AS pbHeight";
+/// The filed sweep's index proof and its height out of one row of either read: `transactions.has_proof` first (its
+/// height as before), else `pot_beefs.proof_verified` with the proof row's height.
+fn sweep_index_proof(r: &Value) -> (bool, Option<u64>) {
+    let height =
+        |k: &str| crate::owed_judge::rank::number(r, k).and_then(|h| u64::try_from(h).ok());
+    if flag(r, "has_proof") == Some(true) {
+        (true, height("proofHeight"))
+    } else if flag(r, "pbVerified") == Some(true) {
+        (true, height("pbHeight"))
+    } else {
+        (false, height("proofHeight"))
+    }
+}
 fn pair_binds(pairs: &[(String, u32)]) -> Vec<Bind> {
     pairs
         .iter()
@@ -794,9 +815,9 @@ async fn hydrate_evidence(
             Bind::Int(i64::from(*vout)),
             Bind::Text(i.identity.clone()),
         ];
-        for r in read::<Value>(db,"SELECT s.sweepTxid,s.sweepRawHex,s.createdAt,t.has_proof,t.proofHeight FROM hopsweep_records s INDEXED BY idx_hopsweep_hop LEFT JOIN transactions t ON t.txid=s.sweepTxid WHERE s.hopTxid=?1 AND s.hopVout=?2 AND s.identity=?3 ORDER BY s.createdAt DESC,s.rowid DESC",binds).await? {
+        for r in read::<Value>(db,"SELECT s.sweepTxid,s.sweepRawHex,s.createdAt,t.has_proof,t.proofHeight,b.proof_verified AS pbVerified,b.proofHeight AS pbHeight FROM hopsweep_records s INDEXED BY idx_hopsweep_hop LEFT JOIN transactions t ON t.txid=s.sweepTxid LEFT JOIN pot_beefs b ON b.txid=s.sweepTxid WHERE s.hopTxid=?1 AND s.hopVout=?2 AND s.identity=?3 ORDER BY s.createdAt DESC,s.rowid DESC",binds).await? {
             let raw=text(&r,"sweepRawHex");
-            all_sweeps.entry(owed::outpoint_key(hop,*vout)).or_default().push(crate::hopsweep::FiledHopSweep{sweep_txid:text(&r,"sweepTxid"),pays_sats:crate::hopsweep::sweep_output_sats(&raw),raw_hex:raw,index_proven:flag(&r,"has_proof")==Some(true),index_proof_height:r["proofHeight"].as_u64(),filed_at_ms:r["createdAt"].as_i64().or_else(|| r["createdAt"].as_f64().map(|t| t as i64)).filter(|t| *t>0).map(|t| t.saturating_mul(1000))});
+            all_sweeps.entry(owed::outpoint_key(hop,*vout)).or_default().push(crate::hopsweep::FiledHopSweep{sweep_txid:text(&r,"sweepTxid"),pays_sats:crate::hopsweep::sweep_output_sats(&raw),raw_hex:raw,index_proven:sweep_index_proof(&r).0,index_proof_height:sweep_index_proof(&r).1,filed_at_ms:r["createdAt"].as_i64().or_else(|| r["createdAt"].as_f64().map(|t| t as i64)).filter(|t| *t>0).map(|t| t.saturating_mul(1000))});
         }
         // Both the refusal and the JOIN-seat fallback start at the selected hop's key.
         for r in read::<Value>(
@@ -859,19 +880,20 @@ async fn hydrate_evidence(
             }
             let proof: Vec<Value> = read(
                 db,
-                "SELECT has_proof,proofHeight FROM transactions WHERE txid=?1",
+                FILED_SWEEP_PROOF_SQL,
                 vec![Bind::Text(r.sweep_txid.clone())],
             )
             .await?;
-            let proof = proof.first();
+            let (index_proven, index_proof_height) =
+                proof.first().map_or((false, None), sweep_index_proof);
             sweeps.insert(
                 0,
                 crate::hopsweep::FiledHopSweep {
                     sweep_txid: r.sweep_txid.clone(),
                     raw_hex: r.sweep_raw_hex.clone(),
                     pays_sats: crate::hopsweep::sweep_output_sats(&r.sweep_raw_hex),
-                    index_proven: proof.is_some_and(|p| flag(p, "has_proof") == Some(true)),
-                    index_proof_height: proof.and_then(|p| p["proofHeight"].as_u64()),
+                    index_proven,
+                    index_proof_height,
                     // FIX-1057 (item 8): the filing being written now. FIX-1057-FOLD-1 (the ensemble's C LOW-1):
                     // its stamp is the caller's `stamp` (the seconds the door binds into `createdAt`, the one clock
                     // the parties and results of this hydration carry too), never re-derived from the judge's clock.

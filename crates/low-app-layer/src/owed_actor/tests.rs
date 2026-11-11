@@ -13999,7 +13999,7 @@ mod fix986 {
                 crate::owed_judge::TxFacts::from_json(&old).expect("pre-move facts still parse");
             assert_eq!((old.raw, old.bump_height), (None, None));
             assert_eq!(old.inputs, f.inputs);
-            assert_eq!(JUDGE_VERSION, "fix997-2026-10-30", "moved once by FIX-997");
+            assert_eq!(JUDGE_VERSION, "owed1173-2026-11-11", "moved by OWED-1173");
             assert_eq!(ACTOR_TABLES_VERSION, "applied-per-game-1", "no table moves");
         }
     }
@@ -25155,5 +25155,140 @@ mod owed1137 {
         // and a cold actor bootstrapped after the spend stores the same rows
         let (cold, _) = actor_judge(&d1, "owner").await;
         assert_eq!(stored(&cold, "owner"), stored(&d1, "owner"));
+    }
+}
+
+/// OWED-1173 (bsv-low #1173): the actor's path through the issue's shape, over the captured pair 13 (beta's own seat
+/// 030d9e9f..., its JOIN evicted, its hop released, its VERIFIED marker): the seat FILES its sweep of the hop to its
+/// committed home, the sweep is SEEN and mined (`tx_words` `mined`) and its verified proof is in `pot_beefs`; no
+/// `transactions` row, no belt evidence, no pointer on the hop. Before and after the tracker's shipped eight-day sweep
+/// deletes the word, neither the D1 judge nor the actor (warm, and cold after the delete) offers the hop's sweep
+/// press, and the actor stores the D1 judge's rows. RED on f278b4bc: after the delete both judges serve the claimable
+/// `hop-stranded` `sweep-hop` row (the sweep's proof read from `transactions` alone).
+mod owed1173 {
+    use super::*;
+    use crate::owed_walk_frozen::pins::{
+        backfill_to_the_stamp, home_marker_seed, home_marker_sweep, FOLD8_TIP, HOME_MARKER_GAME,
+        HOME_MARKER_HOP, HOME_MARKER_SEAT,
+    };
+
+    fn presses(db: &SqliteSql) -> Vec<String> {
+        db.conn
+            .prepare("SELECT outpoint FROM owed_rows WHERE identity=?1 AND family='hop-stranded' AND json_extract(facts,'$.claimable')=1")
+            .unwrap()
+            .query_map([HOME_MARKER_SEAT], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    async fn judge_d1(d1: &SqliteSql) {
+        for chunk in games_of(d1, HOME_MARKER_SEAT).chunks(16) {
+            crate::owed_judge::judge_subjects(d1, HOME_MARKER_SEAT, chunk, "d1")
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn apply_all(d1: &SqliteSql, local: &SqliteSql, seq: i64) {
+        for chunk in games_of(d1, HOME_MARKER_SEAT).chunks(GAMES_PER_APPLY) {
+            apply(
+                d1,
+                local,
+                &Fakes,
+                HOME_MARKER_SEAT,
+                chunk,
+                Some(("word", seq)),
+                Some(FOLD8_TIP),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn owed1173_e_the_actor_and_the_d1_judge_hold_no_press_for_a_hop_already_swept() {
+        let (mut seed, courier_sweep) = home_marker_seed();
+        let sweep = home_marker_sweep();
+        let s = sweep.id();
+        assert_eq!(s, courier_sweep);
+        // the courier's find of the sweep is not the evidence here: no belt evidence, no spender bytes
+        seed.push("DELETE FROM hop_chain_probes".into());
+        seed.push("DELETE FROM owed_spender_bytes".into());
+        let filed = (NOW_MS / 1000) as i64 - 3_600;
+        let mut beef = bsv_rs::transaction::Beef::new();
+        beef.merge_raw_tx(sweep.to_binary(), None);
+        seed.push(format!("INSERT INTO hopsweep_records(identity,gameId,hopTxid,hopVout,sweepTxid,sweepRawHex,txid,outputIndex,createdAt) VALUES ('{HOME_MARKER_SEAT}','{HOME_MARKER_GAME}','{HOME_MARKER_HOP}',0,'{s}','{}','{}',0,{filed})", hex::encode(sweep.to_binary()), "f1".repeat(32)));
+        seed.push(format!("INSERT INTO pot_beefs(txid,beef,createdAt,has_proof,proof_verified,proofHeight) VALUES ('{s}',x'{}',{filed},1,1,{})", hex::encode(beef.to_binary()), FOLD8_TIP - 4));
+        seed.push(format!(
+            "INSERT INTO network_seen(txid,seenAt,seenSource) VALUES ('{s}',{filed},'taal')"
+        ));
+        seed.push(format!("INSERT INTO tx_words(txid,word,tier,height,updated_at) VALUES ('{s}','mined','chain',{},{filed})", FOLD8_TIP - 4));
+        let d1 = seeded(&Fixture {
+            name: "owed1173 a filed sweep mined, proven in pot_beefs",
+            seed,
+            identities: vec![HOME_MARKER_SEAT.into()],
+        });
+        d1.tip.set(Some(FOLD8_TIP));
+        let held = |sql: &str| -> i64 { d1.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            held(&format!(
+                "SELECT COUNT(*) FROM transactions WHERE txid='{s}'"
+            )),
+            0
+        );
+        assert_eq!(
+            held(&format!(
+                "SELECT spent FROM pot_records WHERE txid='{HOME_MARKER_HOP}' AND outputIndex=0"
+            )),
+            0,
+            "the released hop: no pointer"
+        );
+        d1.conn.execute_batch("DELETE FROM owed_dirty").unwrap();
+        backfill_to_the_stamp(&d1).await;
+        judge_d1(&d1).await;
+        let warm = mirror();
+        warm.now.set(d1.now.get());
+        apply_all(&d1, &warm, 1).await;
+        assert_eq!(
+            (presses(&d1), presses(&warm)),
+            (vec![], vec![]),
+            "(a) no press while the word stands"
+        );
+        assert_eq!(
+            stored(&warm, HOME_MARKER_SEAT),
+            stored(&d1, HOME_MARKER_SEAT)
+        );
+
+        // the tracker's eight-day sweep, the shipped statement at now plus eight days
+        let cutoff = (NOW_MS / 1000) as f64;
+        let gone: Vec<String> = d1
+            .conn
+            .prepare(crate::tracker_host::stored::SWEEP_FRAMED)
+            .unwrap()
+            .query_map([cutoff], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(gone, vec![s.clone()], "the word swept");
+        judge_d1(&d1).await;
+        apply_all(&d1, &warm, 2).await;
+        let cold = mirror();
+        cold.now.set(d1.now.get());
+        apply_all(&d1, &cold, 3).await;
+        assert_eq!(
+            (presses(&d1), presses(&warm), presses(&cold)),
+            (vec![], vec![], vec![]),
+            "(b) no press after the word's delete"
+        );
+        assert_eq!(
+            stored(&warm, HOME_MARKER_SEAT),
+            stored(&d1, HOME_MARKER_SEAT)
+        );
+        assert_eq!(
+            stored(&cold, HOME_MARKER_SEAT),
+            stored(&d1, HOME_MARKER_SEAT)
+        );
     }
 }
