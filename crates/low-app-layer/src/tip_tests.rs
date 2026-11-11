@@ -19,7 +19,15 @@ where
     L: FnOnce() -> Option<crate::tracker_host::VerifiedTip>,
     N: FnOnce() -> u64,
 {
-    super::tip_reply_within(get, last_known, now_ms, std::future::pending::<()>()).await
+    super::tip_reply_within(
+        get,
+        last_known,
+        now_ms,
+        std::future::pending::<()>(),
+        || ready(Vec::new()),
+        Default::default(),
+    )
+    .await
 }
 
 const AT: u64 = 1_790_000_000_000;
@@ -788,6 +796,8 @@ async fn fix1081_b_a_read_past_the_deadline_serves_the_memo_and_names_it() {
         || Some(memo_at(10_000)),
         || AT,
         ready(()),
+        || ready(Vec::new()),
+        Default::default(),
     )
     .await;
     assert_eq!(reply.status, 200, "{}", reply.body);
@@ -797,8 +807,15 @@ async fn fix1081_b_a_read_past_the_deadline_serves_the_memo_and_names_it() {
     assert!(fault.contains("3000 ms deadline"), "{fault}");
     assert!(reply.reason.as_deref().unwrap().contains("deadline"));
     // No memo: the deadline is the 503's reason.
-    let reply =
-        super::tip_reply_within(|_| std::future::pending(), || None, || AT, ready(())).await;
+    let reply = super::tip_reply_within(
+        |_| std::future::pending(),
+        || None,
+        || AT,
+        ready(()),
+        || ready(Vec::new()),
+        Default::default(),
+    )
+    .await;
     assert_eq!(reply.status, 503);
     let reason = reply.reason.unwrap();
     assert!(
@@ -1111,4 +1128,466 @@ async fn fold1_l1_the_memos_read_age_bounds_its_freshness() {
     };
     let reply = tip_reply_with(fault, move || Some(unstamped), || AT).await;
     assert_eq!(reply.status, 503, "{}", reply.body);
+}
+
+// ── bsv-low #1165: the chain clock's second opinion (the design's R1 to R6) ──
+
+use crate::tip_second_opinion::{SourceAnswer, TipKnobs};
+
+const MIN: u64 = 60 * 1_000;
+
+fn src(name: &str, height: u32, hash: &str, at: u64) -> SourceAnswer {
+    SourceAnswer {
+        name: name.into(),
+        read: Ok((height, hash.into())),
+        at,
+    }
+}
+
+fn src_fault(name: &str, at: u64) -> SourceAnswer {
+    SourceAnswer {
+        name: name.into(),
+        read: Err("HTTP 503".into()),
+        at,
+    }
+}
+
+/// The reply over a healthy store (its pass at `AT`) read at `AT + pass_age`, the sources scripted; answers the
+/// reply and how many times the sources were asked.
+async fn reply_with_sources(
+    pass_age: u64,
+    sources: Vec<SourceAnswer>,
+    knobs: TipKnobs,
+) -> (super::TipReply, usize) {
+    let asked = Cell::new(0usize);
+    let reply = super::tip_reply_within(
+        |route| ready(response(route, header())),
+        || None,
+        || AT + pass_age,
+        std::future::pending::<()>(),
+        || {
+            asked.set(asked.get() + 1);
+            ready(sources)
+        },
+        knobs,
+    )
+    .await;
+    (reply, asked.get())
+}
+
+/// Two sources naming the stored tip at `at`, the third faulted.
+fn matching(at_a: u64, at_b: u64) -> Vec<SourceAnswer> {
+    let h = tip().hash;
+    vec![
+        src("woc", VERIFIED_HEIGHT, &h, at_a),
+        src("bitails", VERIFIED_HEIGHT, &h.to_uppercase(), at_b),
+        src_fault("bananablocks", at_b),
+    ]
+}
+
+/// The client's stake rule (bsv-low `app/src/lib/chainReads.ts stakeTipReadOnce`, as pinned on prod): fresh only on
+/// 200, no `code`, `stale` not true, `freshness: "fresh"`, a finite `ageMs` at most 10 minutes, a positive height.
+fn client_accepts(status: u16, body: &Value) -> bool {
+    if body["code"].is_string() || !(200..300).contains(&status) || body["stale"] == true {
+        return false;
+    }
+    if body["freshness"] != "fresh" {
+        return false;
+    }
+    match body["ageMs"].as_f64() {
+        Some(age) if age.is_finite() && (0.0..=600_000.0).contains(&age) => {}
+        _ => return false,
+    }
+    body["height"].as_u64().is_some_and(|h| h > 0)
+}
+
+/// The tower's arm clock (bsv-low `workers/low-watchtower/src/chain_oracle.rs parse_arm_clock`): no `code`, 200,
+/// `stale` not true, `freshness: "fresh"`, a height.
+fn tower_accepts(status: u16, body: &Value) -> bool {
+    body.get("code").and_then(Value::as_str).is_none()
+        && status == 200
+        && body.get("stale").and_then(Value::as_bool) != Some(true)
+        && body["freshness"] == "fresh"
+        && body["height"].as_u64().is_some()
+}
+
+/// tip1165_a: a pass six minutes old, two sources naming the stored tip: 200 fresh by the couriers, `ageMs` the
+/// older corroboration's age, `passAgeMs` the true pass age. RED on main: `ageMs` 360000, no `freshBy`.
+#[tokio::test]
+async fn tip1165_a_a_six_minute_pass_corroborated_by_two_sources_is_fresh_by_the_couriers() {
+    let now = AT + 6 * MIN;
+    let (reply, asked) =
+        reply_with_sources(6 * MIN, matching(now - 900, now - 400), TipKnobs::default()).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(asked, 1);
+    assert_eq!(reply.body["freshBy"], "couriers", "{}", reply.body);
+    assert_eq!(reply.body["freshness"], "fresh");
+    assert_eq!(
+        reply.body["ageMs"], 900,
+        "the older of the two corroborations"
+    );
+    assert_eq!(reply.body["passAgeMs"], 360_000);
+    assert_eq!(reply.body["lastPassAt"], AT, "the true stamp");
+    assert_eq!(reply.body["height"], VERIFIED_HEIGHT);
+    assert_eq!(reply.body["hash"], tip().hash);
+    assert_eq!(reply.body["source"], "verified-header");
+    assert_eq!(reply.body["corroborationFrom"], "live");
+    let c = reply.body["corroboration"].as_array().unwrap();
+    assert_eq!(c.len(), 3);
+    assert_eq!(c[0]["source"], "woc");
+    assert_eq!(c[0]["matched"], true);
+    assert_eq!(c[1]["matched"], true, "compared as lowercase hex");
+    assert_eq!(c[2]["matched"], false);
+    assert!(c[2]["fault"].is_string());
+    assert!(reply.body.get("code").is_none());
+    assert_eq!(reply.retry_after, None);
+    assert!(reply
+        .second_opinion
+        .as_deref()
+        .is_some_and(|l| l.contains("corroborated")));
+}
+
+/// tip1165_b: a pass 45 minutes old (past the 30-minute bar), the same sources: the same 200. RED on main: the 503.
+#[tokio::test]
+async fn tip1165_b_a_forty_five_minute_pass_corroborated_is_200() {
+    let now = AT + 45 * MIN;
+    let (reply, asked) = reply_with_sources(
+        45 * MIN,
+        matching(now - 900, now - 400),
+        TipKnobs::default(),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(asked, 1);
+    assert_eq!(reply.body["freshBy"], "couriers");
+    assert_eq!(reply.body["ageMs"], 900);
+    assert_eq!(reply.body["passAgeMs"], 45 * MIN);
+}
+
+/// tip1165_c: one source one block above, two matching: the 503, reason `behind`, at 45 and at 6 minutes.
+#[tokio::test]
+async fn tip1165_c_a_source_above_is_behind_and_the_503() {
+    for pass_age in [45 * MIN, 6 * MIN] {
+        let now = AT + pass_age;
+        let h = tip().hash;
+        let sources = vec![
+            src("woc", VERIFIED_HEIGHT, &h, now),
+            src("bitails", VERIFIED_HEIGHT, &h, now),
+            src("bananablocks", VERIFIED_HEIGHT + 1, &"cd".repeat(32), now),
+        ];
+        crate::tip_second_opinion::clear_memo();
+        let (reply, asked) = reply_with_sources(pass_age, sources, TipKnobs::default()).await;
+        assert_eq!(reply.status, 503, "{}", reply.body);
+        assert_eq!(asked, 1);
+        assert_eq!(reply.body["code"], "ERR_TIP_UNAVAILABLE");
+        assert_eq!(reply.body["secondOpinion"], "behind");
+        assert_eq!(reply.body["freshness"], "stale");
+        let reason = reply.reason.unwrap();
+        assert!(reason.contains("behind"), "{reason}");
+        if pass_age > FRESHNESS_MS {
+            assert!(reason.contains("past the 1800000 ms bar"), "{reason}");
+        }
+        assert!(reply.body.get("freshBy").is_none());
+    }
+}
+
+/// tip1165_d: another hash at the stored height, two matching: the 503, reason `contested`.
+#[tokio::test]
+async fn tip1165_d_another_hash_at_the_stored_height_is_contested() {
+    for pass_age in [45 * MIN, 6 * MIN] {
+        let now = AT + pass_age;
+        let h = tip().hash;
+        let sources = vec![
+            src("woc", VERIFIED_HEIGHT, &h, now),
+            src("bitails", VERIFIED_HEIGHT, &h, now),
+            src("bananablocks", VERIFIED_HEIGHT, &"cd".repeat(32), now),
+        ];
+        crate::tip_second_opinion::clear_memo();
+        let (reply, _) = reply_with_sources(pass_age, sources, TipKnobs::default()).await;
+        assert_eq!(reply.status, 503, "{}", reply.body);
+        assert_eq!(reply.body["secondOpinion"], "contested");
+        assert!(reply.reason.unwrap().contains("contested"));
+    }
+}
+
+/// tip1165_e: one matching, two faulted: past the bar the 503, reason `short`; one matching, one below, one faulted:
+/// the 503. Under the 30-minute bar a `short` verdict is today's answer (a design departure, stated in the PR).
+#[tokio::test]
+async fn tip1165_e_fewer_than_two_corroborations_are_short() {
+    let now = AT + 45 * MIN;
+    let h = tip().hash;
+    let (reply, _) = reply_with_sources(
+        45 * MIN,
+        vec![
+            src("woc", VERIFIED_HEIGHT, &h, now),
+            src_fault("bitails", now),
+            src_fault("bananablocks", now),
+        ],
+        TipKnobs::default(),
+    )
+    .await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.body["secondOpinion"], "short");
+    assert!(reply.reason.unwrap().contains("short"));
+    crate::tip_second_opinion::clear_memo();
+    let (reply, _) = reply_with_sources(
+        45 * MIN,
+        vec![
+            src("woc", VERIFIED_HEIGHT, &h, now),
+            src("bitails", VERIFIED_HEIGHT - 1, &"cd".repeat(32), now),
+            src_fault("bananablocks", now),
+        ],
+        TipKnobs::default(),
+    )
+    .await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.body["secondOpinion"], "short");
+    // under the bar: today's 200, its true age, no additive field
+    crate::tip_second_opinion::clear_memo();
+    let now = AT + 6 * MIN;
+    let (reply, asked) = reply_with_sources(
+        6 * MIN,
+        vec![
+            src("woc", VERIFIED_HEIGHT, &h, now),
+            src_fault("bitails", now),
+        ],
+        TipKnobs::default(),
+    )
+    .await;
+    assert_eq!(asked, 1);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["ageMs"], 6 * MIN);
+    assert!(reply.body.get("freshBy").is_none());
+    assert!(reply.body.get("corroboration").is_none());
+}
+
+/// The body of main's route for the same snapshot (no source asked), for the byte-identity pins.
+async fn main_body(pass_age: u64) -> (u16, Value) {
+    let reply = tip_reply_with(
+        |route| ready(response(route, header())),
+        || None,
+        || AT + pass_age,
+    )
+    .await;
+    (reply.status, reply.body)
+}
+
+/// tip1165_f: a pass four minutes old: no source asked, the body byte for byte today's.
+#[tokio::test]
+async fn tip1165_f_the_fresh_path_asks_nobody_and_is_todays_body() {
+    let (reply, asked) = reply_with_sources(4 * MIN, matching(AT, AT), TipKnobs::default()).await;
+    assert_eq!(asked, 0, "R1: no courier on the fresh path");
+    let (status, body) = main_body(4 * MIN).await;
+    assert_eq!(reply.status, status);
+    assert_eq!(reply.body.to_string(), body.to_string());
+    assert_eq!(reply.body["ageMs"], 4 * MIN);
+    assert!(reply.second_opinion.is_none());
+    // and at exactly five minutes too
+    let (_, asked) = reply_with_sources(5 * MIN, matching(AT, AT), TipKnobs::default()).await;
+    assert_eq!(asked, 0);
+}
+
+/// tip1165_g: the lag bar failing: today's 503, no source asked.
+#[tokio::test]
+async fn tip1165_g_a_failing_lag_bar_asks_nobody() {
+    let asked = Cell::new(0usize);
+    let lagging = |route: String| {
+        ready(if route == "getInfo" {
+            let mut sync = info();
+            sync["value"]["lastSeenHeight"] = json!(VERIFIED_HEIGHT + 2);
+            Ok((200, sync))
+        } else {
+            response(route, header())
+        })
+    };
+    let reply = super::tip_reply_within(
+        lagging,
+        || None,
+        || AT + 45 * MIN,
+        std::future::pending::<()>(),
+        || {
+            asked.set(asked.get() + 1);
+            ready(matching(AT, AT))
+        },
+        TipKnobs::default(),
+    )
+    .await;
+    assert_eq!(asked.get(), 0);
+    assert_eq!(reply.status, 503);
+    assert!(reply.body.get("secondOpinion").is_none());
+    let main = tip_reply_with(lagging, || None, || AT + 45 * MIN).await;
+    assert_eq!(reply.body.to_string(), main.body.to_string());
+}
+
+/// tip1165_h: no verified snapshot (the read faulted, no memo): today's 503, no source asked.
+#[tokio::test]
+async fn tip1165_h_no_verified_snapshot_asks_nobody() {
+    let asked = Cell::new(0usize);
+    let fault = |_| ready(Err(HeaderError("transport".into())));
+    let reply = super::tip_reply_within(
+        fault,
+        || None,
+        || AT + 45 * MIN,
+        std::future::pending::<()>(),
+        || {
+            asked.set(asked.get() + 1);
+            ready(matching(AT, AT))
+        },
+        TipKnobs::default(),
+    )
+    .await;
+    assert_eq!(asked.get(), 0);
+    assert_eq!(reply.status, 503);
+    let main = tip_reply_with(fault, || None, || AT + 45 * MIN).await;
+    assert_eq!(reply.body.to_string(), main.body.to_string());
+}
+
+/// tip1165_i: the memo. A second call inside 30 s asks nobody and serves the memo's sources with a grown `ageMs`; a
+/// new tip hash asks again; a refusal is memoised 10 s.
+#[tokio::test]
+async fn tip1165_i_the_memo_is_per_tip_hash_and_bounded() {
+    let first = AT + 45 * MIN;
+    let (reply, asked) = reply_with_sources(
+        45 * MIN,
+        matching(first - 900, first - 400),
+        TipKnobs::default(),
+    )
+    .await;
+    assert_eq!((reply.status, asked), (200, 1));
+    let (reply, asked) =
+        reply_with_sources(45 * MIN + 20_000, matching(AT, AT), TipKnobs::default()).await;
+    assert_eq!(asked, 0, "inside 30 s the memo answers");
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body["ageMs"], 20_900, "the memo's age grows");
+    assert_eq!(reply.body["corroborationFrom"], "memo");
+    assert!(reply.second_opinion.is_none(), "a memo logs no verdict");
+    // past 30 s: asked again
+    let (_, asked) = reply_with_sources(
+        45 * MIN + 30_000,
+        matching(first + 30_000, first + 30_000),
+        TipKnobs::default(),
+    )
+    .await;
+    assert_eq!(asked, 1);
+    // a new tip hash asks again inside 30 s
+    let moved = |route: String| {
+        let mut frame = header();
+        frame["value"]["hash"] = json!("03".repeat(32));
+        ready(response(route, frame))
+    };
+    let asked = Cell::new(0usize);
+    let h3 = "03".repeat(32);
+    let reply = super::tip_reply_within(
+        moved,
+        || None,
+        || AT + 45 * MIN + 31_000,
+        std::future::pending::<()>(),
+        || {
+            asked.set(asked.get() + 1);
+            ready(vec![
+                src("woc", VERIFIED_HEIGHT, &h3, AT),
+                src("bitails", VERIFIED_HEIGHT, &h3, AT),
+            ])
+        },
+        TipKnobs::default(),
+    )
+    .await;
+    assert_eq!(asked.get(), 1, "a memo for another tip is never served");
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["hash"], h3);
+}
+
+#[tokio::test]
+async fn tip1165_i_a_refusal_is_memoised_ten_seconds() {
+    let short = || vec![src_fault("woc", AT)];
+    let (r, asked) = reply_with_sources(45 * MIN, short(), TipKnobs::default()).await;
+    assert_eq!((r.status, asked), (503, 1));
+    let (r, asked) =
+        reply_with_sources(45 * MIN + 9_999, matching(AT, AT), TipKnobs::default()).await;
+    assert_eq!((r.status, asked), (503, 0));
+    assert_eq!(r.body["corroborationFrom"], "memo");
+    let (r, asked) =
+        reply_with_sources(45 * MIN + 10_000, matching(AT, AT), TipKnobs::default()).await;
+    assert_eq!((r.status, asked), (200, 1));
+}
+
+/// tip1165_j: the knobs: honoured with the beta marker (the pass read as the knob's age, the first source one above),
+/// inert without it.
+#[tokio::test]
+async fn tip1165_j_the_drill_knobs_need_the_beta_marker() {
+    let on = TipKnobs::of(Some("beta"), Some("2700000"), None);
+    // a healthy 20 s pass under the pass-age knob: the second opinion asked, corroborated
+    let now = AT + 20_000;
+    let (reply, asked) = reply_with_sources(20_000, matching(now, now), on).await;
+    assert_eq!(asked, 1);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["freshBy"], "couriers");
+    assert_eq!(reply.body["passAgeMs"], 2_700_000);
+    assert_eq!(reply.body["testPassAgeMs"], 2_700_000);
+    // the source-ahead knob: behind
+    let both = TipKnobs::of(Some("beta"), Some("2700000"), Some("1"));
+    crate::tip_second_opinion::clear_memo();
+    let (reply, _) = reply_with_sources(21_000, matching(now, now), both).await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.body["secondOpinion"], "behind");
+    // without the marker: inert, today's body, nobody asked
+    let off = TipKnobs::of(None, Some("2700000"), Some("1"));
+    assert_eq!(off, TipKnobs::default());
+    let (reply, asked) = reply_with_sources(20_000, matching(now, now), off).await;
+    assert_eq!(asked, 0);
+    assert_eq!(
+        reply.body.to_string(),
+        main_body(20_000).await.1.to_string()
+    );
+    // listed on /health.testKnobs by the route's own lines
+    let src: String = include_str!("routes.rs").split_whitespace().collect();
+    assert!(src.contains(
+        "ifletSome(knobs)=body[\"testKnobs\"].as_array_mut(){knobs.extend(crate::tip_second_opinion::knobs_env(&ctx.env).listed()"
+    ));
+}
+
+/// tip1165_k: the two pinned readers. Bodies (a) and (b) pass the client's stake rule and the tower's arm clock;
+/// bodies (c) to (e) fail both.
+#[tokio::test]
+async fn tip1165_k_the_pinned_readers_take_a_and_b_and_refuse_c_to_e() {
+    let h = tip().hash;
+    for pass_age in [6 * MIN, 45 * MIN] {
+        let now = AT + pass_age;
+        crate::tip_second_opinion::clear_memo();
+        let (r, _) = reply_with_sources(
+            pass_age,
+            matching(now - 900, now - 400),
+            TipKnobs::default(),
+        )
+        .await;
+        assert!(client_accepts(r.status, &r.body), "{}", r.body);
+        assert!(tower_accepts(r.status, &r.body), "{}", r.body);
+    }
+    let now = AT + 45 * MIN;
+    let refused = [
+        vec![
+            src("woc", VERIFIED_HEIGHT, &h, now),
+            src("bitails", VERIFIED_HEIGHT, &h, now),
+            src("bananablocks", VERIFIED_HEIGHT + 1, &h, now),
+        ],
+        vec![
+            src("woc", VERIFIED_HEIGHT, &h, now),
+            src("bitails", VERIFIED_HEIGHT, &h, now),
+            src("bananablocks", VERIFIED_HEIGHT, &"cd".repeat(32), now),
+        ],
+        vec![
+            src("woc", VERIFIED_HEIGHT, &h, now),
+            src_fault("bitails", now),
+        ],
+    ];
+    for (i, sources) in refused.into_iter().enumerate() {
+        crate::tip_second_opinion::clear_memo();
+        let (r, _) =
+            reply_with_sources(45 * MIN + 11_000 * i as u64, sources, TipKnobs::default()).await;
+        assert!(!client_accepts(r.status, &r.body), "{}", r.body);
+        assert!(!tower_accepts(r.status, &r.body), "{}", r.body);
+    }
+    // the 45-minute body on main is refused by both (the outage's shape)
+    let (status, body) = main_body(45 * MIN).await;
+    assert!(!client_accepts(status, &body) && !tower_accepts(status, &body));
 }
