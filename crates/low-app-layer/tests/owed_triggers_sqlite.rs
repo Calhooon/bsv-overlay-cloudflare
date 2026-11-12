@@ -1103,10 +1103,19 @@ fn fix1010_paths(f: &Fixture, b: &PotpartyRecord, result: &ResultRecord) -> Resu
         vec![i64::MAX.into()],
         want,
     )?;
+    // OWED-1184-FOLD: the age sweep's cursor first (one D1 batch with the delete), then its window's delete.
+    f.execute(
+        owed::OWED_SPENDER_BYTES_AGE_CURSOR_SQL,
+        vec![
+            i64::MAX.into(),
+            owed::OWED_SPENDER_BYTES_SWEEP_WINDOW.into(),
+            1.into(),
+        ],
+    );
     f.check(
         "spender bytes sweep",
         owed::OWED_SPENDER_BYTES_SWEEP_SQL,
-        vec![i64::MAX.into(), 256.into()],
+        vec![i64::MAX.into()],
         marks("bytes", "pay", &["alice"]),
     )?;
     Ok(())
@@ -1263,10 +1272,18 @@ fn owed1184_paths(f: &Fixture) -> Result<(), String> {
         "INSERT INTO tx_words(txid,word,tier,updated_at) VALUES ('sp1184','mined','chain',1)",
         vec![],
     );
+    f.execute(
+        owed::OWED_SPENDER_BYTES_AGE_CURSOR_SQL,
+        vec![
+            i64::MAX.into(),
+            owed::OWED_SPENDER_BYTES_SWEEP_WINDOW.into(),
+            1.into(),
+        ],
+    );
     f.check(
         "a pointer-named spender's bytes outlive the age sweep (OWED-1184)",
         owed::OWED_SPENDER_BYTES_SWEEP_SQL,
-        vec![i64::MAX.into(), 256.into()],
+        vec![i64::MAX.into()],
         vec![],
     )?;
     f.check(
@@ -1275,12 +1292,53 @@ fn owed1184_paths(f: &Fixture) -> Result<(), String> {
         vec![],
         marks("bytes", "sp1184", &["frank"]),
     )?;
+    // OWED-1184-FOLD (the lens's NOTE-4): the CLASS of each pointer arm is pinned here too, not by the actor pin
+    // alone: a spender's bytes deleted is a downgrade; a MINED word deleted is one, an unmined word's is not.
+    let class = |source: &str, key: &str| -> i64 {
+        f.db.query_row(
+            "SELECT downgrade FROM owed_dirty WHERE identity='frank' AND source=?1 AND sourceKey=?2",
+            [source, key],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1)
+    };
+    if class("bytes", "sp1184") != 1 {
+        return Err("a pointer-named spender's bytes deleted: not a downgrade (OWED-1184)".into());
+    }
     f.check(
         "a pointer-named spender's mined word swept (OWED-1184)",
         stored::SWEEP_FRAMED,
         vec![i64::MAX.into()],
         marks("word", "sp1184", &["frank"]),
     )?;
+    if class("word", "sp1184") != 1 {
+        return Err(
+            "a pointer-named spender's MINED word swept: not a downgrade (OWED-1184)".into(),
+        );
+    }
+    f.execute(
+        "INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,createdAt,lockKind) VALUES ('hop1184b',0,1,'sp1184b',1,'p2pkh')",
+        vec![],
+    );
+    f.execute(
+        "INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('frank','bob','game',0,1000,'k','s','i',2,'hop1184b',1,1,1)",
+        vec![],
+    );
+    f.execute(
+        "INSERT INTO tx_words(txid,word,tier,updated_at) VALUES ('sp1184b','seen','hint',1)",
+        vec![],
+    );
+    f.check(
+        "a pointer-named spender's unmined word deleted (OWED-1184)",
+        "DELETE FROM tx_words WHERE txid='sp1184b'",
+        vec![],
+        marks("word", "sp1184b", &["frank"]),
+    )?;
+    if class("word", "sp1184b") != 0 {
+        return Err(
+            "a pointer-named spender's UNMINED word deleted: a downgrade (OWED-1184)".into(),
+        );
+    }
     Ok(())
 }
 

@@ -6468,37 +6468,75 @@ async fn spent_any_index_proven(
 /// One cached `/tx-any` answer.
 type TxAnyCached = crate::txany::TxAnyAnswer;
 
-/// bsv-low #672 (RC-L30): the durable spender-bytes store's age + row-cap sweep, the tracker janitor's shape
-/// (`tracker_host::stored::SWEEP`): two bounded DELETEs per scheduled pass. The age sweep (older than the retention)
-/// is the primary; the row-cap sweep (oldest beyond the ceiling) is the belt against an adversarial write-rate.
-/// Fail-soft: a fault is logged and the next pass retries. Returns nothing.
+/// bsv-low #672 (RC-L30): the durable spender-bytes store's age sweep and its ceiling, once a scheduled pass, as
+/// `owed::spender_bytes_sweep_pass` lists them. OWED-1184-FOLD (bsv-low #1184): the age sweep's cursor and delete are
+/// ONE batch (the window walked by the age index, never the whole table); the ceiling reads one count row under it.
+/// A named row the ceiling took is counted (`owed_spender_bytes_named_swept_total`, durable, and the isolate's
+/// `/health.owed.spenderStoreNamedSwept`). Fail-soft: a fault is logged and the next pass retries. Returns nothing.
 pub async fn sweep_owed_spender_bytes(env: &worker::Env) {
     let Ok(db) = env.d1("OVERLAY_DB") else {
         return;
     };
     let now_ms = worker::Date::now().as_millis() as i64;
-    let cutoff = now_ms.saturating_sub(crate::owed::OWED_SPENDER_BYTES_RETENTION_MS);
-    let limit = crate::owed::OWED_SPENDER_BYTES_SWEEP_LIMIT as f64;
-    // the age sweep (primary): rows older than the retention, bounded this pass
-    match db
-        .prepare(crate::owed::OWED_SPENDER_BYTES_SWEEP_SQL)
-        .bind(&[JsValue::from_f64(cutoff as f64), JsValue::from_f64(limit)])
-    {
-        Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<Swept>()) {
-            Ok(gone) => note_swept_bytes(&gone),
-            Err(e) => console_warn!("[owed] spender-bytes age sweep failed: {e}"),
-        },
-        Err(e) => console_warn!("[owed] spender-bytes age sweep bind failed: {e}"),
+    let pass = crate::owed::spender_bytes_sweep_pass(now_ms);
+    let prepare = |(sql, binds): &(&str, Vec<i64>)| {
+        let binds: Vec<JsValue> = binds.iter().map(|n| JsValue::from_f64(*n as f64)).collect();
+        db.prepare(*sql).bind(&binds)
+    };
+    // the age sweep: its cursor, then its window's delete, in one batch
+    match (prepare(&pass[0]), prepare(&pass[1])) {
+        (Ok(cursor), Ok(delete)) => {
+            match crate::d1_ledger::counted_batch(&db, vec![cursor, delete]).await {
+                Ok(results) => {
+                    if let Some(r) = results.first() {
+                        if let Ok(rows) = r.results::<AgeCursor>() {
+                            if let Some(c) = rows.first() {
+                                crate::owed::note_spender_store_age_window(&c.cursor);
+                            }
+                        }
+                    }
+                    match results.get(1).map(|r| r.results::<Swept>()) {
+                        Some(Ok(gone)) => note_swept_bytes(&gone),
+                        Some(Err(e)) => {
+                            console_warn!("[owed] spender-bytes age sweep read failed: {e}")
+                        }
+                        None => console_warn!("[owed] spender-bytes age sweep answered no delete"),
+                    }
+                }
+                Err(e) => console_warn!("[owed] spender-bytes age sweep failed: {e}"),
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            console_warn!("[owed] spender-bytes age sweep bind failed: {e}")
+        }
     }
-    // the row-cap sweep (belt): the oldest rows beyond the ceiling, bounded this pass
-    match db
-        .prepare(crate::owed::OWED_SPENDER_BYTES_CAP_SWEEP_SQL)
-        .bind(&[
-            JsValue::from_f64(crate::owed::OWED_SPENDER_BYTES_ROW_CAP as f64),
-            JsValue::from_f64(limit),
-        ]) {
-        Ok(stmt) => match stmt.counted_all().await.and_then(|r| r.results::<Swept>()) {
-            Ok(gone) => note_swept_bytes(&gone),
+    // the ceiling (belt): the oldest rows past it, unreferenced first
+    match prepare(&pass[2]) {
+        Ok(stmt) => match stmt
+            .counted_all()
+            .await
+            .and_then(|r| r.results::<SweptNamed>())
+        {
+            Ok(gone) => {
+                let named = gone.iter().filter(|g| g.named == 1).count() as u64;
+                for g in &gone {
+                    crate::owed_events_publish::note(crate::owed::SPENDER_BYTES_SOURCE, &g.txid);
+                }
+                if named > 0 {
+                    crate::owed::note_spender_store_named_swept(named);
+                    console_warn!(
+                        "[owed] the spender-bytes store is past its ceiling: {named} named row(s) swept (OWED-1184)"
+                    );
+                    if let Ok(stmt) = db.prepare(crate::beef_guard::BUMP_COUNTER_SQL).bind(&[
+                        JsValue::from_str(crate::owed::OWED_SPENDER_BYTES_NAMED_SWEPT_COUNTER),
+                        JsValue::from_f64(named as f64),
+                    ]) {
+                        if let Err(e) = stmt.counted_run().await {
+                            console_warn!("[owed] the named-swept count failed: {e}");
+                        }
+                    }
+                }
+            }
             Err(e) => console_warn!("[owed] spender-bytes cap sweep failed: {e}"),
         },
         Err(e) => console_warn!("[owed] spender-bytes cap sweep bind failed: {e}"),
@@ -6509,6 +6547,20 @@ pub async fn sweep_owed_spender_bytes(env: &worker::Env) {
         crate::owed_events::publish_noted(env).await;
         crate::owed_events::direct_held(env).await;
     }
+}
+
+/// The age sweep's cursor as its first statement answers it.
+#[derive(serde::Deserialize)]
+struct AgeCursor {
+    cursor: String,
+}
+
+/// A row the ceiling deleted, and whether it was named.
+#[derive(serde::Deserialize)]
+struct SweptNamed {
+    txid: String,
+    #[serde(default)]
+    named: i64,
 }
 
 /// A row the spender-bytes sweeps deleted (their `RETURNING txid`).

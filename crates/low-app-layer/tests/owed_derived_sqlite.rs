@@ -101,10 +101,13 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     // bsv-low #1184 (OWED-1184) appends two `owed_dirty` triggers (a word and a spender's bytes deleted mark the seats
     // the index pointer names); the 498 before them are untouched.
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..498]), 3_646_027_862);
-    const COUNT: usize = 500;
+    // bsv-low #1184 (OWED-1184-FOLD) appends the spender-bytes store's bound: three indexes, the row count, its two
+    // triggers and its backfill; the 500 before them are untouched.
+    assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..500]), 1_703_856_683);
+    const COUNT: usize = 507;
     assert_eq!(OVERLAY_MIGRATIONS.len(), COUNT);
     assert_eq!(d1::OVERLAY_MIGRATION_COUNT, COUNT);
-    const FINGERPRINT: u32 = 1_703_856_683;
+    const FINGERPRINT: u32 = 2_835_210_098;
     assert_eq!(
         d1::migration_list_fingerprint(),
         FINGERPRINT,

@@ -17701,15 +17701,42 @@ mod fix1010 {
             .unwrap();
         fresh_d1(&d1).await;
         let (local, _) = actor_judge(&d1, "owner").await;
-        let gone: Vec<String> = d1
+        // OWED-1184-FOLD: the age sweep's cursor, then its window's delete (one D1 batch)
+        let age_sweep = || -> Vec<String> {
+            d1.conn
+                .query_row(
+                    crate::owed::OWED_SPENDER_BYTES_AGE_CURSOR_SQL,
+                    rusqlite::params![i64::MAX, crate::owed::OWED_SPENDER_BYTES_SWEEP_WINDOW, 1],
+                    |_| Ok(()),
+                )
+                .unwrap();
+            d1.conn
+                .prepare(crate::owed::OWED_SPENDER_BYTES_SWEEP_SQL)
+                .unwrap()
+                .query_map(rusqlite::params![i64::MAX], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        // the belt's evidence names the spender: its bytes are kept (OWED-1184-FOLD, the lens's LOW-2)
+        assert_eq!(age_sweep(), Vec::<String>::new());
+        // the store's ceiling (here 0) takes the oldest named row: the named share's trip, answered `named`
+        let capped: Vec<(String, i64)> = d1
             .conn
-            .prepare(crate::owed::OWED_SPENDER_BYTES_SWEEP_SQL)
+            .prepare(crate::owed::OWED_SPENDER_BYTES_CAP_SWEEP_SQL)
             .unwrap()
-            .query_map(rusqlite::params![i64::MAX, 256], |r| r.get(0))
+            .query_map(
+                rusqlite::params![
+                    0,
+                    crate::owed::OWED_SPENDER_BYTES_SWEEP_LIMIT,
+                    crate::owed::OWED_SPENDER_BYTES_SWEEP_WINDOW
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(gone, vec![s.clone()]);
+        assert_eq!(capped, vec![(s.clone(), 1)]);
         reaches_the_actor(
             &d1,
             &local,
@@ -25429,6 +25456,25 @@ mod owed1184 {
             .unwrap_or_else(|e| panic!("no row for the hop: {e}"))
     }
 
+    /// OWED-1184-FOLD: one pass of the SHIPPED sweeps as `routes::sweep_owed_spender_bytes` binds them
+    /// (`owed::spender_bytes_sweep_pass`): the age sweep's deleted txids and the ceiling's.
+    pub(super) fn sweep_pass(d1: &SqliteSql, now_ms: i64) -> (Vec<String>, Vec<String>) {
+        let mut out = Vec::new();
+        for (sql, binds) in crate::owed::spender_bytes_sweep_pass(now_ms) {
+            let gone: Vec<String> = d1
+                .conn
+                .prepare(sql)
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(binds), |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            out.push(gone);
+        }
+        let capped = out.pop().unwrap();
+        (out.pop().unwrap(), capped)
+    }
+
     /// The story the seat is told, as both judges store it: its family, reason and spend kind.
     fn story(db: &SqliteSql) -> Value {
         let (family, reason, facts) = reason(db);
@@ -25442,8 +25488,8 @@ mod owed1184 {
     }
 
     /// (a) THE ISSUE'S PIN: the story is "spent outside this game" from the held bytes; at now plus eight days the
-    /// SHIPPED age sweep (and the row cap at a ceiling of 0) keeps the bytes the pointer names, and a fresh D1
-    /// judgement, a cold actor (the `JUDGE_VERSION` re-judge's road) and the warm actor's narrowed apply each serve the
+    /// SHIPPED pass (the age sweep and the store's ceiling, `owed::spender_bytes_sweep_pass`) keeps the bytes the
+    /// pointer names, and a fresh D1 judgement, a cold actor (the `JUDGE_VERSION` re-judge's road) and the warm actor's narrowed apply each serve the
     /// same story. RED on main: the sweep takes the bytes and the fresh D1 judgement regresses to "could not judge".
     #[tokio::test]
     async fn owed1184_a_a_pointer_named_spenders_bytes_outlive_the_sweep_and_the_story_stands() {
@@ -25465,25 +25511,7 @@ mod owed1184 {
         let later = d1.now.get() as i64 + crate::owed::OWED_SPENDER_BYTES_RETENTION_MS + 1_000;
         d1.now.set(later as u64);
         warm.now.set(later as u64);
-        let run = |sql: &str, a: i64, b: i64| -> Vec<String> {
-            d1.conn
-                .prepare(sql)
-                .unwrap()
-                .query_map(rusqlite::params![a, b], |r| r.get(0))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
-        };
-        let aged = run(
-            crate::owed::OWED_SPENDER_BYTES_SWEEP_SQL,
-            later - crate::owed::OWED_SPENDER_BYTES_RETENTION_MS,
-            crate::owed::OWED_SPENDER_BYTES_SWEEP_LIMIT,
-        );
-        let capped = run(
-            crate::owed::OWED_SPENDER_BYTES_CAP_SWEEP_SQL,
-            0,
-            crate::owed::OWED_SPENDER_BYTES_SWEEP_LIMIT,
-        );
+        let (aged, capped) = sweep_pass(&d1, later);
         let held: i64 = d1
             .conn
             .query_row(
@@ -25552,6 +25580,64 @@ mod owed1184 {
             stored_rows_no_clock(local),
             stored_rows_no_clock(d1),
             "the actor is the fresh D1 judgement"
+        );
+    }
+
+    /// OWED-1184-FOLD (the lens's LOW-2): the belt FOUND the spend (its evidence `<hop>:0` naming the spender, the
+    /// bytes written) and the index holds the hop UNSPENT, no pointer; at now plus eight days the shipped pass keeps the
+    /// bytes (the evidence names them) and a fresh D1 judgement tells the story it told. RED with the
+    /// `hop_chain_probes` arm of `spender_named!` removed: the bytes swept, the story back to "could not judge".
+    #[tokio::test]
+    async fn owed1184f_l2_a_belt_found_spend_keeps_its_story_before_the_index_points() {
+        let (mut f, s) = fixture(false);
+        let made = (NOW_MS / 1000) as i64 - 4 * 3_600;
+        let found = NOW_MS as i64 - 3 * 3_600_000;
+        f.seed[0] = format!("INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES ('{HOP}',0,0,{made},'p2pkh')");
+        f.seed.push(format!("INSERT INTO hop_chain_probes(outpoint,probedAtMs,spent,spendingTxid,spentConfirmed,tipHeight) VALUES ('{HOP}:0',{found},1,'{s}',1,{})", TIP - 20));
+        let d1 = d1_judge(&f).await;
+        let before = story(&d1);
+        eprintln!("owed1184f_l2: the story before the sweep: {before}");
+        assert!(
+            before[3].is_array(),
+            "the premise: the held bytes tell the story: {before}"
+        );
+        let later = d1.now.get() as i64 + crate::owed::OWED_SPENDER_BYTES_RETENTION_MS + 1_000;
+        d1.now.set(later as u64);
+        let (aged, capped) = sweep_pass(&d1, later);
+        assert_eq!((aged, capped), (vec![], vec![]), "the belt's find is kept");
+        fresh_d1(&d1).await;
+        assert_eq!(
+            story(&d1),
+            before,
+            "the fresh D1 judgement tells the same story"
+        );
+    }
+
+    /// OWED-1184-FOLD (the lens's LOW-3): the hop's row EVICTED across the eight-day mark (the shadow move to
+    /// `pot_records_evicted`), then readmitted: the bytes were kept by the evicted pointer and the fresh D1 judgement
+    /// tells the story it told. RED with the `pot_records_evicted` arm removed.
+    #[tokio::test]
+    async fn owed1184f_l3_an_eviction_across_the_mark_keeps_the_story() {
+        let (f, s) = fixture(false);
+        let d1 = d1_judge(&f).await;
+        let before = story(&d1);
+        let cols =
+            "txid,outputIndex,spent,spendingTxid,spentConfirmed,spentHeight,createdAt,lockKind";
+        d1.conn
+            .execute_batch(&format!("INSERT INTO pot_records_evicted(af_evictedAt,af_reason,{cols}) SELECT 1,'fixture',{cols} FROM pot_records WHERE txid='{HOP}'; DELETE FROM pot_records WHERE txid='{HOP}'"))
+            .unwrap();
+        let later = d1.now.get() as i64 + crate::owed::OWED_SPENDER_BYTES_RETENTION_MS + 1_000;
+        d1.now.set(later as u64);
+        let (aged, _) = sweep_pass(&d1, later);
+        assert!(aged.is_empty(), "the evicted pointer keeps {s}: {aged:?}");
+        d1.conn
+            .execute_batch(&format!("INSERT INTO pot_records({cols}) SELECT {cols} FROM pot_records_evicted WHERE txid='{HOP}'; DELETE FROM pot_records_evicted WHERE txid='{HOP}'"))
+            .unwrap();
+        fresh_d1(&d1).await;
+        assert_eq!(
+            story(&d1),
+            before,
+            "the readmitted hop tells the same story"
         );
     }
 

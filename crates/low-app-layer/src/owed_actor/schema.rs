@@ -225,17 +225,20 @@ pub const MIRROR_DDL: &[&str] = &[
   spenderPayASats INT,
   spenderPayBSats INT
 , blockTime INTEGER)"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_evicted_pot_spending ON pot_records_evicted(spendingTxid) WHERE spendingTxid IS NOT NULL"#,
     r#"CREATE INDEX IF NOT EXISTS idx_evicted_pot_txid ON pot_records_evicted(txid)"#,
     r#"CREATE TABLE IF NOT EXISTS pot_evictions (txid TEXT PRIMARY KEY, reason TEXT NOT NULL, evictedAt INTEGER NOT NULL, readmittedAt INTEGER, rowsMoved INTEGER NOT NULL DEFAULT 0, releasedSpends TEXT, refusalClass TEXT)"#,
     r#"CREATE TABLE IF NOT EXISTS submit_refusals (hopTxid TEXT NOT NULL, hopVout INTEGER NOT NULL, refusedTxid TEXT NOT NULL, reason TEXT NOT NULL, refusedAt INTEGER NOT NULL, PRIMARY KEY (hopTxid, hopVout))"#,
     r#"CREATE INDEX IF NOT EXISTS idx_submit_refusals_at ON submit_refusals(refusedAt)"#,
     r#"CREATE TABLE IF NOT EXISTS network_seen (txid TEXT PRIMARY KEY, seenAt INTEGER, seenSource TEXT, sourceAtMs INTEGER)"#,
     r#"CREATE TABLE IF NOT EXISTS owed_spender_bytes (txid TEXT PRIMARY KEY, bytesJson TEXT NOT NULL, createdAtMs INTEGER NOT NULL)"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_owed_spender_bytes_age ON owed_spender_bytes(createdAtMs, txid)"#,
     r#"CREATE TABLE IF NOT EXISTS tx_words (txid TEXT PRIMARY KEY, word TEXT NOT NULL, tier TEXT NOT NULL, height INTEGER, proof_root TEXT, proof_height INTEGER, proof_hex TEXT, header_hash TEXT, hint_source TEXT, hint_at INTEGER, updated_at INTEGER NOT NULL, legacy_body TEXT)"#,
     r#"CREATE INDEX IF NOT EXISTS tx_words_age ON tx_words(updated_at,txid)"#,
     r#"CREATE INDEX IF NOT EXISTS tx_words_mined_header ON tx_words(header_hash, txid) WHERE word = 'mined'"#,
     r#"CREATE INDEX IF NOT EXISTS tx_words_mined_height ON tx_words(height, txid) WHERE word = 'mined'"#,
     r#"CREATE TABLE IF NOT EXISTS hop_chain_probes (outpoint TEXT PRIMARY KEY, probedAtMs INTEGER NOT NULL, spent INTEGER NOT NULL, spendingTxid TEXT, spentConfirmed INTEGER, tipHeight INTEGER)"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_hop_chain_probes_spender ON hop_chain_probes(spendingTxid) WHERE spendingTxid IS NOT NULL"#,
     r#"CREATE TABLE IF NOT EXISTS pot_beefs (
         txid TEXT PRIMARY KEY,
         beef BLOB NOT NULL,
@@ -309,7 +312,7 @@ pub const BLOBS: &[(&str, &str)] = &[
     ("transactions", "beef"),
 ];
 /// The schema's digest, held in the actor's `meta` (`schema`): a mirror built under another is dropped and rebuilt.
-pub const DIGEST: &str = "23d18b191498d166103fd2b78e05039cdc214b5b74c489ee4826d29558af3ac2";
+pub const DIGEST: &str = "e7cabc8785c978c48094a839a09e6bbcd82b021699d1a9fd0681cb8e1613bed9";
 
 pub fn columns(table: &str) -> &'static [&'static str] {
     COLUMNS
