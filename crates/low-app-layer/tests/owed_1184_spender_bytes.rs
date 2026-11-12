@@ -680,3 +680,47 @@ fn owed1184f2_e_the_named_count_rides_the_deletes_batch() {
     assert_eq!((all.len(), named.len()), (14, 10));
     assert_eq!(named_swept(&db), 10);
 }
+
+/// (f3) THE SECOND DELTA LENS'S LOW-1 (`OWED-1184-DELTA-LENS-2-2026-11-12.md`): a lap is clean only when the WHOLE lap
+/// found no unreferenced row, its count carried window to window to the wrap (`lapUnref`), never the last window's
+/// alone. 2,000 named rows and 20 unreferenced ones at the store's middle (outside the 512 oldest and the 512 newest),
+/// the ceiling 5 under the count and 5 named rows written a pass: the window that meets them takes as many as the
+/// excess allows, the lap that met them ends NOT clean, and no named row goes while any of them stands. Through the
+/// shipped statements (`spender_bytes_sweep_pass_under`). RED under the lens's mutant M2 (the wrap's `clean` from the
+/// last window only, `a.u = 0`): a named row taken at pass 3 while 10 unreferenced rows stood.
+#[test]
+fn owed1184f3_a_lap_that_met_unreferenced_rows_mid_store_is_not_clean() {
+    let db = migrated();
+    let named_at = |db: &Connection, i: i64| {
+        let s = txid("5e", i);
+        pointer(db, &txid("b1", i), &s);
+        bytes(db, &s, 10 * i);
+    };
+    for i in 0..2000 {
+        named_at(&db, i);
+    }
+    let unref: Vec<String> = (0..20).map(|j| txid("5f", j)).collect();
+    for (j, s) in unref.iter().enumerate() {
+        bytes(&db, s, 10 * 700 + 1 + j as i64);
+    }
+    let ceiling = 2015;
+    let mut next = 2000;
+    let (mut unref_taken, mut named_taken) = (Vec::new(), Vec::new());
+    for pass in 0..12 {
+        let (all, named) = cap(&db, ceiling);
+        unref_taken.extend(all.iter().filter(|t| !named.contains(t)).cloned());
+        named_taken.extend(named);
+        let standing = unref.len() - unref_taken.len();
+        assert!(
+            named_taken.is_empty() || standing == 0,
+            "pass {pass}: a named row went while {standing} unreferenced rows stood"
+        );
+        for _ in 0..5 {
+            named_at(&db, next);
+            next += 1;
+        }
+    }
+    unref_taken.sort();
+    assert_eq!(unref_taken, unref, "every unreferenced row was taken");
+    assert_eq!(named_swept(&db), named_taken.len() as i64);
+}
