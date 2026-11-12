@@ -757,9 +757,27 @@ pub const WORD_DELETE_POINTER: &str = trigger!(
         pointer_seats!("OLD.txid")
     )
 );
-/// A pointer-named spender's bytes deleted (the sweeps no longer take one; a hand delete, or a row whose pointer
-/// moved between the sweep's read and its delete): the seats whose hop it spent. A downgrade, as
-/// `SPENDER_BYTES_DELETE`'s.
+/// OWED-1184 fold 2 (the delta lens's LOW-B): the seats of every reason the app layer's sweeps KEEP a spender's bytes
+/// (`owed::spender_named!`): the index pointer (`pointer_seats!`), the belt's evidence row `<hop>:<vout>` naming the
+/// spender (`idx_hop_chain_probes_spender`, then the hop's markers), and an evicted pointer
+/// (`idx_evicted_pot_spending`, then the hop's markers). Three seeks, each by a partial index; a compound of three
+/// terms (D1 allows five).
+macro_rules! kept_spender_seats {
+    ($txid:literal) => {
+        concat!(
+            pointer_seats!($txid),
+            " UNION ALL SELECT hp.identity,hp.gameId FROM hop_chain_probes h INDEXED BY idx_hop_chain_probes_spender CROSS JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=substr(h.outpoint,1,64) AND hp.hopVout=CAST(substr(h.outpoint,66) AS INTEGER) WHERE h.spendingTxid=",
+            $txid,
+            " AND substr(h.outpoint,65,1)=':'",
+            " UNION ALL SELECT hp.identity,hp.gameId FROM pot_records_evicted e INDEXED BY idx_evicted_pot_spending CROSS JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=e.txid AND hp.hopVout=e.outputIndex WHERE e.spendingTxid=",
+            $txid
+        )
+    };
+}
+/// A KEPT spender's bytes deleted (the age sweep never takes one; the store's ceiling, a hand delete, or a row whose
+/// name went between the sweep's read and its delete): the seats whose hop it spent, by every reason it was kept
+/// ([`kept_spender_seats!`]). A downgrade, as `SPENDER_BYTES_DELETE`'s. Edited in place by fold 2 (migration 500
+/// has shipped on no D1: `main`'s list and the certified counts on record end at 498).
 pub const SPENDER_BYTES_DELETE_POINTER: &str = trigger!(
     "owed_spender_bytes",
     delete_pointer,
@@ -769,6 +787,6 @@ pub const SPENDER_BYTES_DELETE_POINTER: &str = trigger!(
         "bytes",
         "OLD.txid",
         "OLD.createdAtMs",
-        pointer_seats!("OLD.txid")
+        kept_spender_seats!("OLD.txid")
     )
 );

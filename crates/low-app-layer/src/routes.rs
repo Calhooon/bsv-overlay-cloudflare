@@ -6470,8 +6470,9 @@ type TxAnyCached = crate::txany::TxAnyAnswer;
 
 /// bsv-low #672 (RC-L30): the durable spender-bytes store's age sweep and its ceiling, once a scheduled pass, as
 /// `owed::spender_bytes_sweep_pass` lists them. OWED-1184-FOLD (bsv-low #1184): the age sweep's cursor and delete are
-/// ONE batch (the window walked by the age index, never the whole table); the ceiling reads one count row under it.
-/// A named row the ceiling took is counted (`owed_spender_bytes_named_swept_total`, durable, and the isolate's
+/// ONE batch (the window walked by the age index, never the whole table); the ceiling's cursor, count and delete are a
+/// second (under the ceiling it reads the count row and its cursor row). A named row the ceiling took is counted
+/// (`owed_spender_bytes_named_swept_total`, durable, in the delete's own batch; and the isolate's
 /// `/health.owed.spenderStoreNamedSwept`). Fail-soft: a fault is logged and the next pass retries. Returns nothing.
 pub async fn sweep_owed_spender_bytes(env: &worker::Env) {
     let Ok(db) = env.d1("OVERLAY_DB") else {
@@ -6510,36 +6511,38 @@ pub async fn sweep_owed_spender_bytes(env: &worker::Env) {
             console_warn!("[owed] spender-bytes age sweep bind failed: {e}")
         }
     }
-    // the ceiling (belt): the oldest rows past it, unreferenced first
-    match prepare(&pass[2]) {
-        Ok(stmt) => match stmt
-            .counted_all()
-            .await
-            .and_then(|r| r.results::<SweptNamed>())
-        {
-            Ok(gone) => {
-                let named = gone.iter().filter(|g| g.named == 1).count() as u64;
-                for g in &gone {
-                    crate::owed_events_publish::note(crate::owed::SPENDER_BYTES_SOURCE, &g.txid);
-                }
-                if named > 0 {
-                    crate::owed::note_spender_store_named_swept(named);
-                    console_warn!(
-                        "[owed] the spender-bytes store is past its ceiling: {named} named row(s) swept (OWED-1184)"
-                    );
-                    if let Ok(stmt) = db.prepare(crate::beef_guard::BUMP_COUNTER_SQL).bind(&[
-                        JsValue::from_str(crate::owed::OWED_SPENDER_BYTES_NAMED_SWEPT_COUNTER),
-                        JsValue::from_f64(named as f64),
-                    ]) {
-                        if let Err(e) = stmt.counted_run().await {
-                            console_warn!("[owed] the named-swept count failed: {e}");
+    // the ceiling (OWED-1184 fold 2): its cursor over the whole store, the named rows it takes counted, and its
+    // delete, in one batch (the count lands with the delete or not at all); unreferenced rows anywhere go first
+    match (prepare(&pass[2]), prepare(&pass[3]), prepare(&pass[4])) {
+        (Ok(cursor), Ok(count), Ok(delete)) => {
+            match crate::d1_ledger::counted_batch(&db, vec![cursor, count, delete]).await {
+                Ok(results) => match results.get(2).map(|r| r.results::<SweptNamed>()) {
+                    Some(Ok(gone)) => {
+                        let named = gone.iter().filter(|g| g.named == 1).count() as u64;
+                        for g in &gone {
+                            crate::owed_events_publish::note(
+                                crate::owed::SPENDER_BYTES_SOURCE,
+                                &g.txid,
+                            );
+                        }
+                        if named > 0 {
+                            crate::owed::note_spender_store_named_swept(named);
+                            console_warn!(
+                                "[owed] the spender-bytes store is past its ceiling: {named} named row(s) swept (OWED-1184)"
+                            );
                         }
                     }
-                }
+                    Some(Err(e)) => {
+                        console_warn!("[owed] spender-bytes cap sweep read failed: {e}")
+                    }
+                    None => console_warn!("[owed] spender-bytes cap sweep answered no delete"),
+                },
+                Err(e) => console_warn!("[owed] spender-bytes cap sweep failed: {e}"),
             }
-            Err(e) => console_warn!("[owed] spender-bytes cap sweep failed: {e}"),
-        },
-        Err(e) => console_warn!("[owed] spender-bytes cap sweep bind failed: {e}"),
+        }
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            console_warn!("[owed] spender-bytes cap sweep bind failed: {e}")
+        }
     }
     crate::owed::note_spender_store_sweep_pass();
     // FIX-1010 (bsv-low #1010): the swept bytes' pairs, published and their actors called (the queue behind them)

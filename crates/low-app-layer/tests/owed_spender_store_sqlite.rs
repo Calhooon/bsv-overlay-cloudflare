@@ -6,9 +6,8 @@
 
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use low_app_layer::owed::{
-    StoredSpenderBytes, StoredSpenderOutput, OWED_SPENDER_BYTES_CAP_SWEEP_SQL,
-    OWED_SPENDER_BYTES_MAX_JSON, OWED_SPENDER_BYTES_SELECT_SQL, OWED_SPENDER_BYTES_SWEEP_SQL,
-    OWED_SPENDER_BYTES_UPSERT_SQL,
+    StoredSpenderBytes, StoredSpenderOutput, OWED_SPENDER_BYTES_MAX_JSON,
+    OWED_SPENDER_BYTES_SELECT_SQL, OWED_SPENDER_BYTES_SWEEP_SQL, OWED_SPENDER_BYTES_UPSERT_SQL,
 };
 use rusqlite::{params, Connection};
 
@@ -239,16 +238,11 @@ fn age_sweep(db: &rusqlite::Connection, cutoff: i64) -> Vec<String> {
     swept(db, OWED_SPENDER_BYTES_SWEEP_SQL, &[cutoff])
 }
 
-/// OWED-1184-FOLD: the shipped ceiling sweep at a ceiling of `ceiling` rows.
+/// OWED-1184-FOLD: the shipped ceiling sweep at a ceiling of `ceiling` rows (since fold 2 its three statements, the
+/// cursor, the named count and the delete, one D1 batch on the Worker): the txids the delete answers.
 fn cap_sweep(db: &rusqlite::Connection, ceiling: i64) -> Vec<String> {
-    use low_app_layer::owed::{OWED_SPENDER_BYTES_SWEEP_LIMIT, OWED_SPENDER_BYTES_SWEEP_WINDOW};
-    swept(
-        db,
-        OWED_SPENDER_BYTES_CAP_SWEEP_SQL,
-        &[
-            ceiling,
-            OWED_SPENDER_BYTES_SWEEP_LIMIT,
-            OWED_SPENDER_BYTES_SWEEP_WINDOW,
-        ],
-    )
+    let pass = low_app_layer::owed::spender_bytes_sweep_pass_under(0, ceiling);
+    swept(db, pass[2].0, &pass[2].1);
+    swept(db, pass[3].0, &pass[3].1);
+    swept(db, pass[4].0, &pass[4].1)
 }

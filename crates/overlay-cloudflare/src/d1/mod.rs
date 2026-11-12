@@ -2686,7 +2686,10 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     crate::derived_owed::write_time::BEEF_SWEEP_UPDATE,
     // 499..500: bsv-low #1184 (OWED-1184), a word or spender's bytes deleted marks the seats whose hop the index says
     // that txid spent (`owed_dirty_tx_words_delete_pointer`, `owed_dirty_owed_spender_bytes_delete_pointer`). New
-    // triggers, none edited.
+    // triggers, none edited. OWED-1184 fold 2 edited 500 IN PLACE (the bytes delete's seats gained the belt's evidence
+    // and the evicted pointer, the keep rule's other two reasons): 499..507 have shipped on no D1 (`main`'s list ends
+    // at 498, beta's and prod's certified count). Its body names 501's and 502's indexes; a trigger body is resolved
+    // when a DELETE fires it, after the whole list ran.
     crate::derived_owed::write_time::WORD_DELETE_POINTER,
     crate::derived_owed::write_time::SPENDER_BYTES_DELETE_POINTER,
     // 501..507: bsv-low #1184 (OWED-1184-FOLD), the spender-bytes store bounded again. The age sweep walks a window of

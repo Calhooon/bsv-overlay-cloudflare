@@ -1496,48 +1496,116 @@ pub const OWED_SPENDER_BYTES_SWEEP_SQL: &str = concat!(
     spender_named!("b.txid"),
     ") RETURNING txid"
 );
-/// The store's ceiling (OWED-1184-FOLD): while the row count (`count_owed_spender_bytes`, kept by the overlay's
-/// triggers) is past `?1`, delete at most `?2` rows, and never more than the excess, from the `?3` OLDEST rows
-/// (`idx_owed_spender_bytes_age`): the unreferenced first, then the oldest NAMED rows (the named ceiling's trip). It
-/// answers each txid with `named` (1 for a named row), so the trip is counted. Under the ceiling it reads the one
-/// count row and nothing else.
+/// The store's ceiling's cursor in the belt's ledger (`owed_belt_state`, OWED-1184 fold 2): `{fromMs, fromTx, toMs,
+/// toTx, scanned, wrap, lapUnref, clean, laps}`, the window of the WHOLE age index this pass read, `(from, to]`, the
+/// unreferenced rows seen in the lap so far, and `clean`: the last complete lap of the store found no unreferenced
+/// row, and no window since has found one.
+pub const OWED_SPENDER_BYTES_CEILING_CURSOR: &str = "owed-spender-bytes:ceiling";
+/// The store's ceiling, FIRST of its three statements (one D1 batch; OWED-1184 fold 2, the delta lens's LOW-A). Past
+/// the ceiling `?1` (the row count `count_owed_spender_bytes`, kept by the overlay's triggers) it advances its cursor
+/// over the next `?2` rows of the WHOLE age index (`idx_owed_spender_bytes_age`, every age; a range seek past the last
+/// window's end) and counts the unreferenced ones (three seeks a row, [`spender_named!`]); a window shorter than `?2`
+/// ends the lap (`wrap`), which is `clean` when the whole lap found no unreferenced row. Under the ceiling it reads
+/// the count row and the cursor row, and writes only to reset a cursor a trip left (`wrap` 1, `clean` 0), so the next
+/// trip's lap starts at the store's oldest row and is judged whole. `?3` the pass's time. It answers the cursor it
+/// wrote.
+pub const OWED_SPENDER_BYTES_CEILING_CURSOR_SQL: &str = concat!(
+    "WITH sc_o AS MATERIALIZED (SELECT json_extract(cursor,'$.toMs') AS ms, json_extract(cursor,'$.toTx') AS tx, json_extract(cursor,'$.wrap') AS wr, json_extract(cursor,'$.lapUnref') AS lu, json_extract(cursor,'$.clean') AS cl, json_extract(cursor,'$.laps') AS laps FROM owed_belt_state WHERE name='owed-spender-bytes:ceiling'), ",
+    "sc_s AS MATERIALIZED (SELECT COALESCE((SELECT n FROM count_owed_spender_bytes WHERE id=1),0) > ?1 AS tripped, CASE WHEN sc_o.wr IS NOT 0 THEN -1 ELSE sc_o.ms END AS ms, CASE WHEN sc_o.wr IS NOT 0 THEN '' ELSE sc_o.tx END AS tx, CASE WHEN sc_o.wr IS NOT 0 THEN 0 ELSE COALESCE(sc_o.lu,0) END AS lu, COALESCE(sc_o.cl,0) AS cl, COALESCE(sc_o.laps,0) AS laps, sc_o.wr AS owr, sc_o.cl AS ocl FROM (SELECT 1 AS one) AS sc_one LEFT JOIN sc_o ON 1), ",
+    "sc_w AS MATERIALIZED (SELECT b.createdAtMs AS ms, b.txid AS tx, NOT ",
+    spender_named!("b.txid"),
+    " AS un FROM sc_s CROSS JOIN owed_spender_bytes b INDEXED BY idx_owed_spender_bytes_age WHERE sc_s.tripped AND (b.createdAtMs,b.txid) > (sc_s.ms,sc_s.tx) ORDER BY b.createdAtMs, b.txid LIMIT ?2), ",
+    "sc_a AS MATERIALIZED (SELECT COUNT(*) AS c, COALESCE(SUM(un),0) AS u FROM sc_w), ",
+    "sc_l AS MATERIALIZED (SELECT ms, tx FROM sc_w ORDER BY ms DESC, tx DESC LIMIT 1) ",
+    "INSERT INTO owed_belt_state(name,cursor,tickedAtMs) SELECT 'owed-spender-bytes:ceiling', CASE WHEN s.tripped THEN json_object('fromMs',s.ms,'fromTx',s.tx,'toMs',COALESCE(l.ms,s.ms),'toTx',COALESCE(l.tx,s.tx),'scanned',a.c,'wrap',a.c < ?2,'lapUnref',s.lu + a.u,'clean',CASE WHEN a.c < ?2 THEN (s.lu + a.u) = 0 ELSE (s.cl IS 1 AND a.u = 0) END,'laps',s.laps + (a.c < ?2)) ELSE json_object('fromMs',-1,'fromTx','','toMs',-1,'toTx','','scanned',0,'wrap',1,'lapUnref',0,'clean',0,'laps',s.laps) END, CAST(?3 AS INTEGER) FROM sc_s AS s CROSS JOIN sc_a AS a LEFT JOIN sc_l AS l ON 1 WHERE s.tripped OR s.ocl IS 1 OR s.owr IS 0 ON CONFLICT(name) DO UPDATE SET cursor=excluded.cursor, tickedAtMs=excluded.tickedAtMs RETURNING cursor"
+);
+/// The rows the ceiling takes this pass, a CTE both its later statements read (the same snapshot inside the batch,
+/// so the same rows): only past the ceiling `?1`; the UNREFERENCED rows of the cursor's window (wherever in the age
+/// index the cursor stands), and, only when the cursor is `clean`, the unreferenced rows among the `?3` NEWEST (a row
+/// written after the clean lap passed its place is among them: the one writer stamps its write time) and the `?3`
+/// oldest rows; ordered unreferenced first, then by age; at most `?2` and never more than the excess. `nm` is 1 for a
+/// named row. Three terms of one compound (D1 allows five).
+macro_rules! ceiling_take {
+    () => {
+        concat!(
+            "WITH sd_s AS MATERIALIZED (SELECT json_extract(cursor,'$.fromMs') AS fm, json_extract(cursor,'$.fromTx') AS ft, json_extract(cursor,'$.toMs') AS tm, json_extract(cursor,'$.toTx') AS tt, json_extract(cursor,'$.clean') AS cl FROM owed_belt_state WHERE name='owed-spender-bytes:ceiling' AND COALESCE((SELECT n FROM count_owed_spender_bytes WHERE id=1),0) > ?1), ",
+            "sd_o AS MATERIALIZED (SELECT b.txid AS txid, b.createdAtMs AS ms FROM sd_s CROSS JOIN owed_spender_bytes b INDEXED BY idx_owed_spender_bytes_age WHERE sd_s.cl IS 1 ORDER BY b.createdAtMs, b.txid LIMIT ?3), ",
+            "sd_n AS MATERIALIZED (SELECT b.txid AS txid, b.createdAtMs AS ms FROM sd_s CROSS JOIN owed_spender_bytes b INDEXED BY idx_owed_spender_bytes_age WHERE sd_s.cl IS 1 ORDER BY b.createdAtMs DESC, b.txid DESC LIMIT ?3), ",
+            "sd_t AS MATERIALIZED (SELECT sd_c.txid AS txid, sd_c.nm AS nm FROM (SELECT b.txid AS txid, 0 AS nm, b.createdAtMs AS ms FROM sd_s CROSS JOIN owed_spender_bytes b INDEXED BY idx_owed_spender_bytes_age WHERE (b.createdAtMs,b.txid) > (sd_s.fm,sd_s.ft) AND (b.createdAtMs,b.txid) <= (sd_s.tm,sd_s.tt) AND NOT ",
+            spender_named!("b.txid"),
+            " UNION SELECT sd_o.txid, ",
+            spender_named!("sd_o.txid"),
+            ", sd_o.ms FROM sd_o UNION SELECT sd_n.txid, 0, sd_n.ms FROM sd_n WHERE NOT ",
+            spender_named!("sd_n.txid"),
+            ") AS sd_c ORDER BY sd_c.nm, sd_c.ms, sd_c.txid LIMIT max(0, min(?2, COALESCE((SELECT n FROM count_owed_spender_bytes WHERE id=1),0) - ?1))) "
+        )
+    };
+}
+/// The store's ceiling, SECOND statement (OWED-1184 fold 2, the delta lens's NOTE-3): the named rows the delete below
+/// takes, counted into `owed_spender_bytes_named_swept_total` ([`OWED_SPENDER_BYTES_NAMED_SWEPT_COUNTER`]) in the
+/// SAME batch, so the count lands with the delete or not at all. No write when it takes none.
+pub const OWED_SPENDER_BYTES_CEILING_COUNT_SQL: &str = concat!(
+    ceiling_take!(),
+    "INSERT INTO ops_counters(name,value) SELECT 'owed_spender_bytes_named_swept_total', sd_k.c FROM (SELECT COUNT(*) AS c FROM sd_t WHERE nm=1) AS sd_k WHERE sd_k.c > 0 ON CONFLICT(name) DO UPDATE SET value=ops_counters.value+excluded.value"
+);
+/// The store's ceiling, THIRD statement: delete the rows [`ceiling_take!`] names. It answers each txid with `named`
+/// (1 for a named row: the trip, counted by the statement before it).
+///
+/// THE RULE (OWED-1184 fold 2, the delta lens's LOW-A): past the ceiling an unreferenced row anywhere in the store
+/// goes before any named row. A named row goes only once the cursor has walked a WHOLE lap of the store (begun in the
+/// trip, at its oldest row) that found no unreferenced row, and no window since has found one; then the oldest named
+/// rows go, after the unreferenced among the newest. The ceiling is ONE total (250,000 rows), never two shares
+/// enforced apart: whether a row is named is read from three other tables at the read, so no count of the named rows
+/// can be kept. A pass reads at most 512 rows of the age index for the cursor's window and, when clean, the 512
+/// newest and the 512 oldest: bounded whatever the store holds. What it costs: a lap is `ceil(rows / 512)` passes
+/// (about 490 at the ceiling, about five days at the app layer's scheduled `*/15`), so a store over its ceiling by
+/// named rows alone keeps growing at the find rate for one lap before a named row goes. What it leaves, stated: while
+/// the cursor is clean, an unreferenced row the cursor already passed in this lap and that is not among the 512
+/// newest (its name cleared after the cursor passed it, or more than 512 rows written since it) may stand while a
+/// named row goes; the cursor meets it on its next lap, and its finding ends `clean`.
 pub const OWED_SPENDER_BYTES_CAP_SWEEP_SQL: &str = concat!(
-    "DELETE FROM owed_spender_bytes WHERE txid IN (SELECT sb_w.txid FROM (SELECT b.txid, b.createdAtMs FROM owed_spender_bytes b INDEXED BY idx_owed_spender_bytes_age WHERE (SELECT n FROM count_owed_spender_bytes WHERE id=1) > ?1 ORDER BY b.createdAtMs, b.txid LIMIT ?3) AS sb_w ORDER BY ",
-    spender_named!("sb_w.txid"),
-    ", sb_w.createdAtMs, sb_w.txid LIMIT max(0, min(?2, COALESCE((SELECT n FROM count_owed_spender_bytes WHERE id=1),0) - ?1))) RETURNING txid, ",
+    ceiling_take!(),
+    "DELETE FROM owed_spender_bytes WHERE txid IN (SELECT txid FROM sd_t) RETURNING txid, ",
     spender_named!("owed_spender_bytes.txid"),
     " AS named"
 );
 /// Eight days, as the tracker's stranger-projection sweep (`tracker_host::stored::SWEEP`). A spender's bytes outlive
 /// every honest recompute window of its hop many times over; past it an un-revisited row is dead weight.
 pub const OWED_SPENDER_BYTES_RETENTION_MS: i64 = 8 * 86_400_000;
-/// The UNREFERENCED rows' share of the store's ceiling. The one writer is the belt's find (at most 8 a 120 s tick,
-/// 5,760 a day), so the rows the age sweep has not yet taken stay under 8 x 5,760 = 46,080: this share is never
-/// spent by the unreferenced rows alone, and the ceiling's trip lands on the named rows past their share.
-pub const OWED_SPENDER_BYTES_ROW_CAP: i64 = 50_000;
-/// The NAMED rows' share of the store's ceiling (OWED-1184-FOLD, the lens's LOW-1). A named row is one kept spender a
-/// spent row of the index (or a belt find, or an evicted spent row); the fleet-shaped fixture (`d1_fleet`, beta's
-/// shape) holds 7,549 index pointers at all, so 200,000 is about 26 times the whole fleet's pointer count. Past it
-/// the oldest named rows go (a regression in WORDS for that hop, "could not judge", never a press; the belt re-asks
-/// it when its row is dated), counted `owed_spender_bytes_named_swept_total`.
-pub const OWED_SPENDER_BYTES_NAMED_CAP: i64 = 200_000;
-/// The store's ceiling: the two shares together (250,000 rows; at the 64 KiB per-row bound a worst case of 16 GB is
-/// not the honest case, a spender's facts are well under a KiB, about 250 MB).
-pub const OWED_SPENDER_BYTES_STORE_CAP: i64 =
-    OWED_SPENDER_BYTES_ROW_CAP + OWED_SPENDER_BYTES_NAMED_CAP;
+/// The store's ceiling: ONE total (OWED-1184 fold 2). Sized as the unreferenced rows' most (the one writer, the belt's
+/// find, at most 8 a 120 s tick, puts at most 8 x 5,760 = 46,080 rows in eight days, so about 50,000) plus 200,000
+/// named rows (the fleet-shaped fixture, `d1_fleet`, beta's shape, holds 7,549 index pointers at all: about 26 times
+/// its whole pointer count). The two figures are its derivation, not shares the ceiling enforces apart (see
+/// [`OWED_SPENDER_BYTES_CAP_SWEEP_SQL`]). Past it the unreferenced rows go first, then, after a whole clean lap, the
+/// oldest named rows (a regression in WORDS for that hop, "could not judge", never a press; the belt re-asks it when
+/// its row is dated), counted `owed_spender_bytes_named_swept_total`. At the 64 KiB per-row bound a worst case of
+/// 16 GB is not the honest case: a spender's facts are well under a KiB, about 250 MB.
+pub const OWED_SPENDER_BYTES_STORE_CAP: i64 = 250_000;
 /// How many rows one ceiling pass may delete (the tracker's `LIMIT 64` shape, larger because this table has no read
 /// cost per row). Each sweep statement is bounded; a backlog drains over passes.
 pub const OWED_SPENDER_BYTES_SWEEP_LIMIT: i64 = 256;
-/// The rows of the age index one pass reads (the age sweep's window, the ceiling's oldest window): the bound of a
-/// pass whatever the store holds.
+/// The rows of the age index one statement reads (the age sweep's window, the ceiling's cursor window, the ceiling's
+/// oldest window): the bound of a pass whatever the store holds.
 pub const OWED_SPENDER_BYTES_SWEEP_WINDOW: i64 = 512;
-/// The name of the durable count of the named rows the ceiling took (seeded by the overlay).
+/// The name of the durable count of the named rows the ceiling took (seeded by the overlay). Written literally in
+/// [`OWED_SPENDER_BYTES_CEILING_COUNT_SQL`] (pinned equal).
 pub const OWED_SPENDER_BYTES_NAMED_SWEPT_COUNTER: &str = "owed_spender_bytes_named_swept_total";
 
 /// One pass of the spender-bytes sweeps, in order, each with its binds: the age sweep's cursor and its delete (one D1
-/// batch), then the ceiling. The route binds these and the pins run these: one rule.
-pub fn spender_bytes_sweep_pass(now_ms: i64) -> [(&'static str, Vec<i64>); 3] {
+/// batch), then the ceiling's cursor, its named count and its delete (a second batch). The route binds these and the
+/// pins run these: one rule.
+pub fn spender_bytes_sweep_pass(now_ms: i64) -> [(&'static str, Vec<i64>); 5] {
+    spender_bytes_sweep_pass_under(now_ms, OWED_SPENDER_BYTES_STORE_CAP)
+}
+
+/// [`spender_bytes_sweep_pass`] under a ceiling of `ceiling` rows (the pins run a small store over a small ceiling).
+pub fn spender_bytes_sweep_pass_under(now_ms: i64, ceiling: i64) -> [(&'static str, Vec<i64>); 5] {
     let cutoff = now_ms.saturating_sub(OWED_SPENDER_BYTES_RETENTION_MS);
+    let take = vec![
+        ceiling,
+        OWED_SPENDER_BYTES_SWEEP_LIMIT,
+        OWED_SPENDER_BYTES_SWEEP_WINDOW,
+    ];
     [
         (
             OWED_SPENDER_BYTES_AGE_CURSOR_SQL,
@@ -1545,13 +1613,11 @@ pub fn spender_bytes_sweep_pass(now_ms: i64) -> [(&'static str, Vec<i64>); 3] {
         ),
         (OWED_SPENDER_BYTES_SWEEP_SQL, vec![cutoff]),
         (
-            OWED_SPENDER_BYTES_CAP_SWEEP_SQL,
-            vec![
-                OWED_SPENDER_BYTES_STORE_CAP,
-                OWED_SPENDER_BYTES_SWEEP_LIMIT,
-                OWED_SPENDER_BYTES_SWEEP_WINDOW,
-            ],
+            OWED_SPENDER_BYTES_CEILING_CURSOR_SQL,
+            vec![ceiling, OWED_SPENDER_BYTES_SWEEP_WINDOW, now_ms],
         ),
+        (OWED_SPENDER_BYTES_CEILING_COUNT_SQL, take.clone()),
+        (OWED_SPENDER_BYTES_CAP_SWEEP_SQL, take),
     ]
 }
 /// The per-ROW size cap: a spender whose serialized bytes exceed this is not persisted (it is re-read if asked

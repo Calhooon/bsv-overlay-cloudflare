@@ -17720,19 +17720,21 @@ mod fix1010 {
         };
         // the belt's evidence names the spender: its bytes are kept (OWED-1184-FOLD, the lens's LOW-2)
         assert_eq!(age_sweep(), Vec::<String>::new());
-        // the store's ceiling (here 0) takes the oldest named row: the named share's trip, answered `named`
+        // the store's ceiling (here 0) takes the oldest named row after a clean lap (one pass: the store is one
+        // window), answered `named`; its three statements as the route batches them (OWED-1184 fold 2)
+        let ceiling = crate::owed::spender_bytes_sweep_pass_under(1, 0);
+        for (sql, binds) in &ceiling[2..4] {
+            let mut stmt = d1.conn.prepare(sql).unwrap();
+            let mut rows = stmt.query(rusqlite::params_from_iter(binds)).unwrap();
+            while rows.next().unwrap().is_some() {}
+        }
         let capped: Vec<(String, i64)> = d1
             .conn
-            .prepare(crate::owed::OWED_SPENDER_BYTES_CAP_SWEEP_SQL)
+            .prepare(ceiling[4].0)
             .unwrap()
-            .query_map(
-                rusqlite::params![
-                    0,
-                    crate::owed::OWED_SPENDER_BYTES_SWEEP_LIMIT,
-                    crate::owed::OWED_SPENDER_BYTES_SWEEP_WINDOW
-                ],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_map(rusqlite::params_from_iter(&ceiling[4].1), |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap()
             .map(Result::unwrap)
             .collect();
