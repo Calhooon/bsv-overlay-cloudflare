@@ -25372,3 +25372,258 @@ mod owed1173 {
         assert_seen_not_mined(&local);
     }
 }
+
+/// OWED-1184 (bsv-low #1184): a spender's stored bytes that an INDEX POINTER names are never swept, and a delete of
+/// such a spender's bytes or word reaches a Phase C actor. The record (real SQLite, the overlay's migrations): the
+/// seat's hop spent and CONFIRMED by a stranger (the hop row's `spendingTxid`), its verified marker, the spender's
+/// bytes held (`owed_spender_bytes`, three hours old): the story the bytes tell (here the pay-to addresses, the game
+/// naming no committed home; beta's 02f9f80a... told "spent outside this game", the same class: a story read from the
+/// bytes alone). Diagnosis `OWED-COMPARE-REASON-DIAGNOSIS-2026-11-11.md`.
+mod owed1184 {
+    use super::fix1010::{direct, fresh_d1, published};
+    use super::*;
+
+    const HOP: &str = "b184000000000000000000000000000000000000000000000000000000000000";
+
+    fn fixture(word: bool) -> (Fixture, String) {
+        let made = (NOW_MS / 1000) as i64 - 4 * 3_600;
+        let found = NOW_MS as i64 - 3 * 3_600_000;
+        let (spend, s) = fold9_spend(HOP);
+        let bytes = crate::owed::StoredSpenderBytes::from_parts(
+            &crate::routes::spender_inputs_of(&spend),
+            &crate::routes::spender_outputs_of(&spend),
+        )
+        .to_json_capped()
+        .unwrap();
+        let mut seed = vec![
+            format!("INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,spentConfirmed,spentHeight,createdAt,lockKind) VALUES ('{HOP}',0,1,'{s}',1,{},{made},'p2pkh')", TIP - 20),
+            format!("INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('owner','other','{}',0,20190,'seat','00','00',2,'{HOP}',1,{made},1)", h("84", 1)),
+            format!("INSERT INTO owed_spender_bytes(txid,bytesJson,createdAtMs) VALUES ('{s}','{bytes}',{found})"),
+        ];
+        if word {
+            seed.push(format!("INSERT INTO tx_words(txid,word,tier,height,updated_at) VALUES ('{s}','mined','chain',{},{})", TIP - 20, found / 1000));
+        }
+        (
+            Fixture {
+                name: "owed1184 a hop spent elsewhere, the pointer confirmed, the spender's bytes held",
+                seed,
+                identities: vec!["owner".into()],
+            },
+            s,
+        )
+    }
+
+    fn reason(db: &SqliteSql) -> (String, Option<String>, Value) {
+        db.conn
+            .query_row(
+                "SELECT family,reason,facts FROM owed_rows WHERE identity='owner' AND outpoint=?1",
+                [format!("{HOP}:0")],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        serde_json::from_str::<Value>(&r.get::<_, String>(2)?).unwrap(),
+                    ))
+                },
+            )
+            .unwrap_or_else(|e| panic!("no row for the hop: {e}"))
+    }
+
+    /// The story the seat is told, as both judges store it: its family, reason and spend kind.
+    fn story(db: &SqliteSql) -> Value {
+        let (family, reason, facts) = reason(db);
+        json!([
+            family,
+            reason,
+            facts["spendKind"],
+            facts["spenderPkhs"],
+            facts["claimable"]
+        ])
+    }
+
+    /// (a) THE ISSUE'S PIN: the story is "spent outside this game" from the held bytes; at now plus eight days the
+    /// SHIPPED age sweep (and the row cap at a ceiling of 0) keeps the bytes the pointer names, and a fresh D1
+    /// judgement, a cold actor (the `JUDGE_VERSION` re-judge's road) and the warm actor's narrowed apply each serve the
+    /// same story. RED on main: the sweep takes the bytes and the fresh D1 judgement regresses to "could not judge".
+    #[tokio::test]
+    async fn owed1184_a_a_pointer_named_spenders_bytes_outlive_the_sweep_and_the_story_stands() {
+        let (f, s) = fixture(false);
+        let d1 = d1_judge(&f).await;
+        let before = story(&d1);
+        eprintln!("owed1184_a: the story before the sweep: {before}");
+        // the premise: the held bytes tell the story (this record names no committed home of the game, so the
+        // bytes' story is the pay-to addresses; with a known home it is "spent outside this game": both are read
+        // from the bytes alone, and both went back to "could not judge" once the bytes were swept)
+        assert_eq!(
+            (before[1].clone(), before[3].is_array()),
+            (json!(crate::owed::HOME_UNKNOWN_REASON), true),
+            "the premise: the held bytes tell the story"
+        );
+        let (warm, _) = actor_judge(&d1, "owner").await;
+        assert_eq!(story(&warm), before, "the actor tells it too");
+        // eight days and a second later, the shipped sweeps as `routes::sweep_owed_spender_bytes` binds them
+        let later = d1.now.get() as i64 + crate::owed::OWED_SPENDER_BYTES_RETENTION_MS + 1_000;
+        d1.now.set(later as u64);
+        warm.now.set(later as u64);
+        let run = |sql: &str, a: i64, b: i64| -> Vec<String> {
+            d1.conn
+                .prepare(sql)
+                .unwrap()
+                .query_map(rusqlite::params![a, b], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let aged = run(
+            crate::owed::OWED_SPENDER_BYTES_SWEEP_SQL,
+            later - crate::owed::OWED_SPENDER_BYTES_RETENTION_MS,
+            crate::owed::OWED_SPENDER_BYTES_SWEEP_LIMIT,
+        );
+        let capped = run(
+            crate::owed::OWED_SPENDER_BYTES_CAP_SWEEP_SQL,
+            0,
+            crate::owed::OWED_SPENDER_BYTES_SWEEP_LIMIT,
+        );
+        let held: i64 = d1
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM owed_spender_bytes WHERE txid=?1",
+                [&s],
+                |r| r.get(0),
+            )
+            .unwrap();
+        fresh_d1(&d1).await;
+        assert_eq!(
+            (aged, capped, held, story(&d1)),
+            (vec![], vec![], 1, before.clone()),
+            "the pointer-named spender's bytes are held through both sweeps and the fresh D1 judgement tells the same story"
+        );
+        let (cold, _) = actor_judge(&d1, "owner").await;
+        assert_eq!(story(&cold), before, "a cold actor tells the same story");
+        apply(
+            &d1,
+            &warm,
+            &Fakes,
+            "owner",
+            &games_of(&d1, "owner"),
+            Some(("age", 2)),
+            Some(TIP),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            story(&warm),
+            before,
+            "the warm actor's apply tells the same story"
+        );
+        assert_eq!(stored_rows_no_clock(&warm), stored_rows_no_clock(&d1));
+    }
+
+    /// Phase C's record: D1's `owed_rows` (and their word references and marks) are never written after the flip, so
+    /// the shipped `word_rows!` arm of a delete trigger finds nothing.
+    fn phase_c(d1: &SqliteSql) {
+        d1.conn
+            .execute_batch(
+                "DELETE FROM owed_rows; DELETE FROM owed_row_words; DELETE FROM owed_dirty;",
+            )
+            .unwrap();
+    }
+
+    /// The delete's pair published, applied to the warm actor by its direct call (the narrowed read), then the actor
+    /// equals a fresh D1 judgement. RED on main: the publish sent nothing (no mark), so no actor was told.
+    async fn reaches(d1: &SqliteSql, local: &SqliteSql, source: &str, key: &str) {
+        let ev = published(d1, source, key).await.unwrap_or_else(|| {
+            panic!("({source}, {key}): the publish sent nothing: the delete marked no subject (the Phase C gap)")
+        });
+        let downgrade: i64 = d1
+            .conn
+            .query_row(
+                "SELECT downgrade FROM owed_dirty WHERE identity='owner' AND source=?1 AND sourceKey=?2",
+                [source, key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(downgrade, 1, "({source}, {key}): the existing arm's class");
+        let report = direct(d1, local, &ev, false).await;
+        assert!(report.narrowed, "{report:?}");
+        fresh_d1(d1).await;
+        assert_eq!(
+            stored_rows_no_clock(local),
+            stored_rows_no_clock(d1),
+            "the actor is the fresh D1 judgement"
+        );
+    }
+
+    /// (b) PHASE C, THE SPENDER'S BYTES: a delete of a pointer-named spender's bytes (forced by hand: the sweeps no
+    /// longer take one) marks the seat by its marker, under the existing pair (`bytes`, the txid), and the mark reaches
+    /// the actor: both judges then tell the same (regressed) story.
+    #[tokio::test]
+    async fn owed1184_b_phase_c_a_pointer_named_spenders_bytes_deleted_reach_the_actor() {
+        let (f, s) = fixture(false);
+        let d1 = d1_judge(&f).await;
+        let (warm, _) = actor_judge(&d1, "owner").await;
+        phase_c(&d1);
+        d1.conn
+            .execute("DELETE FROM owed_spender_bytes WHERE txid=?1", [&s])
+            .unwrap();
+        reaches(&d1, &warm, crate::owed::SPENDER_BYTES_SOURCE, &s).await;
+        assert_ne!(
+            story(&warm)[1],
+            json!(crate::owed::HOME_UNKNOWN_REASON),
+            "the actor read the delete"
+        );
+        // a row whose bytes went (beta's, swept before the fix) owes the chain a question: dated for the belt, which
+        // asks the spender it names; the find re-writes the bytes, which the sweeps then keep
+        let due: Option<i64> = warm
+            .conn
+            .query_row(
+                "SELECT beltDueAtMs FROM owed_rows WHERE identity='owner' AND outpoint=?1",
+                [format!("{HOP}:0")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            due.is_some(),
+            "the regressed row is dated for the belt's look"
+        );
+        let candidate = crate::owed_belt::Candidate {
+            identity: "owner".into(),
+            game_id: h("84", 1),
+            outpoint: format!("{HOP}:0"),
+            family: story(&warm)[0].as_str().unwrap().into(),
+            facts: reason(&warm).2,
+            claimable: Some(false),
+            reason: None,
+            probe_tip: None,
+            due_at_ms: due,
+            judged_at_ms: None,
+        };
+        assert_eq!(
+            crate::owed_belt::ask_of(&candidate),
+            Some(crate::owed_belt::Ask::Spender { txid: s.clone() }),
+            "the belt asks the spender the row names"
+        );
+    }
+
+    /// (c) PHASE C, THE WORD: the tracker's shipped eight-day sweep deletes the spender's MINED word (a pointer spares
+    /// only an unmined one), which marks the seat by its marker (a downgrade, the existing arm's class), and the mark
+    /// reaches the actor.
+    #[tokio::test]
+    async fn owed1184_c_phase_c_the_spenders_mined_word_swept_reaches_the_actor() {
+        let (f, s) = fixture(true);
+        let d1 = d1_judge(&f).await;
+        let (warm, _) = actor_judge(&d1, "owner").await;
+        phase_c(&d1);
+        let gone: Vec<String> = d1
+            .conn
+            .prepare(crate::tracker_host::stored::SWEEP_FRAMED)
+            .unwrap()
+            .query_map([i64::MAX], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(gone, vec![s.clone()], "the mined word is swept");
+        reaches(&d1, &warm, "word", &s).await;
+    }
+}

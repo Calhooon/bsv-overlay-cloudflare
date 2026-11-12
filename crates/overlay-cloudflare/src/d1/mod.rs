@@ -803,7 +803,11 @@ pub fn migration_list_fingerprint() -> u32 {
 /// 496 to 498 for bsv-low #1173 (OWED-1173): two appended `owed_dirty` triggers on `pot_beefs`
 /// (`owed_dirty_pot_beefs_sweep_insert`, `_sweep_update`): a filed sweep's verified proof latched or withdrawn marks
 /// the filers' seats (`hopsweep_records` by `idx_hopsweep_sweep`). Triggers only: no actor digest moves.
-pub const OVERLAY_MIGRATION_COUNT: usize = 498;
+/// 498 to 500 for bsv-low #1184 (OWED-1184): two appended `owed_dirty` triggers (`owed_dirty_tx_words_delete_pointer`,
+/// `owed_dirty_owed_spender_bytes_delete_pointer`): a word or spender's bytes deleted marks the seats whose hop the
+/// index says that txid spent (`pot_records` by `idx_pot_spending`, the markers by `idx_hopparty_hop`), so the delete
+/// reaches a Phase C actor. Triggers only: no actor digest moves.
+pub const OVERLAY_MIGRATION_COUNT: usize = 500;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2675,6 +2679,11 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // seats (`owed_dirty_pot_beefs_sweep_insert`, `_sweep_update`). New triggers, none edited.
     crate::derived_owed::write_time::BEEF_SWEEP_INSERT,
     crate::derived_owed::write_time::BEEF_SWEEP_UPDATE,
+    // 499..500: bsv-low #1184 (OWED-1184), a word or spender's bytes deleted marks the seats whose hop the index says
+    // that txid spent (`owed_dirty_tx_words_delete_pointer`, `owed_dirty_owed_spender_bytes_delete_pointer`). New
+    // triggers, none edited.
+    crate::derived_owed::write_time::WORD_DELETE_POINTER,
+    crate::derived_owed::write_time::SPENDER_BYTES_DELETE_POINTER,
 ];
 
 // =============================================================================

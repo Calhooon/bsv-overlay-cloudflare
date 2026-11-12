@@ -728,3 +728,47 @@ pub const BEEF_SWEEP_UPDATE: &str = trigger!(
         " WHERE OLD.proof_verified IS NOT NEW.proof_verified OR OLD.proofHeight IS NOT NEW.proofHeight"
     )
 );
+
+// OWED-1184 (bsv-low #1184): the spender-bytes and word deletes reach a Phase C actor. `SPENDER_BYTES_DELETE` and
+// `WORD_DELETE` mark only `word_rows!`, D1's `owed_rows` joined to `owed_row_words`, which nothing writes in Phase C:
+// a delete there marked nobody and the identity's actor was never told. These mark the seats whose hop the INDEX says
+// that txid spent (`pot_records` by `idx_pot_spending`, then the hop's markers by `idx_hopparty_hop`), under the
+// existing arms' pairs and classes, so the delete's event routes to the seat as `pot_beefs`' sweep triggers do
+// (OWED-1173). Appended (never an edit of a shipped trigger).
+macro_rules! pointer_seats {
+    ($txid:literal) => {
+        concat!(
+            "SELECT hp.identity,hp.gameId FROM pot_records p INDEXED BY idx_pot_spending CROSS JOIN hopparty_records hp INDEXED BY idx_hopparty_hop ON hp.txid=p.txid AND hp.hopVout=p.outputIndex WHERE p.spendingTxid=",
+            $txid
+        )
+    };
+}
+/// The tracker's eight-day word sweep (a pointer spares only an UNMINED word): the seats whose hop the word's txid
+/// spent. A mined word deleted is a downgrade, as `WORD_DELETE`'s.
+pub const WORD_DELETE_POINTER: &str = trigger!(
+    "tx_words",
+    delete_pointer,
+    DELETE,
+    mark!(
+        class "(OLD.word IS 'mined')",
+        "word",
+        "OLD.txid",
+        "OLD.updated_at",
+        pointer_seats!("OLD.txid")
+    )
+);
+/// A pointer-named spender's bytes deleted (the sweeps no longer take one; a hand delete, or a row whose pointer
+/// moved between the sweep's read and its delete): the seats whose hop it spent. A downgrade, as
+/// `SPENDER_BYTES_DELETE`'s.
+pub const SPENDER_BYTES_DELETE_POINTER: &str = trigger!(
+    "owed_spender_bytes",
+    delete_pointer,
+    DELETE,
+    mark!(
+        class "1",
+        "bytes",
+        "OLD.txid",
+        "OLD.createdAtMs",
+        pointer_seats!("OLD.txid")
+    )
+);

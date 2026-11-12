@@ -98,10 +98,13 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     // bsv-low #1173 (OWED-1173) appends two `owed_dirty` triggers on `pot_beefs` (a filed sweep's verified proof
     // stored, and latched or withdrawn, marks its filers); the 496 before them are untouched.
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..496]), 696_658_100);
-    const COUNT: usize = 498;
+    // bsv-low #1184 (OWED-1184) appends two `owed_dirty` triggers (a word and a spender's bytes deleted mark the seats
+    // the index pointer names); the 498 before them are untouched.
+    assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..498]), 3_646_027_862);
+    const COUNT: usize = 500;
     assert_eq!(OVERLAY_MIGRATIONS.len(), COUNT);
     assert_eq!(d1::OVERLAY_MIGRATION_COUNT, COUNT);
-    const FINGERPRINT: u32 = 3_646_027_862;
+    const FINGERPRINT: u32 = 1_703_856_683;
     assert_eq!(
         d1::migration_list_fingerprint(),
         FINGERPRINT,
