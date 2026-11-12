@@ -90,6 +90,9 @@ fn obs_628_the_owed_health_keys_are_the_judges() {
         "markerlessIgnoredMarkers",
         "probeMemoReadFaults",
         "spenderStoreSweepPasses",
+        "spenderStoreAgeScanned",
+        "spenderStoreAgeLaps",
+        "spenderStoreNamedSwept",
         "hopStrandedAfterMs",
     ];
     keys.sort_unstable();

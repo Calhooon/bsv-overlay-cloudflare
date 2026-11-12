@@ -1750,6 +1750,17 @@
    "why": "rebuild from network_seen: its guarded backfill recounts a missing row at the next version's migration run; until then the field reads -1"
    },
    {
+   "name": "count_owed_spender_bytes",
+   "database": "low-overlay-db",
+   "owner": "overlay-cloudflare",
+   "writers": {},
+   "readers": ["low-app-layer"],
+   "rebuild_class": "derived",
+   "never_wipe": false,
+   "holds": "one row: the count of owed_spender_bytes (bsv-low #1184, OWED-1184-FOLD), kept by that table's insert and delete triggers inside each write and read by the app layer's ceiling sweep",
+   "why": "rebuild from owed_spender_bytes: its guarded backfill recounts a missing row at the next migration run; until then the ceiling sweep takes nothing"
+   },
+   {
    "name": "pot_beefs_unprovable_set",
    "database": "low-overlay-db",
    "owner": "overlay-cloudflare",

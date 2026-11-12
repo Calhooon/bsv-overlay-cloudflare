@@ -364,6 +364,8 @@ pub fn names() -> Vec<String> {
     v.extend(OWED_JUDGE.iter().map(|n| n.to_string()));
     // bsv-low #608 (the B-OWED-2 lens's LOW-1): the reads whose recompute only the unread-spender rule asked for
     v.push("owed_spender_rejudge_total".to_string());
+    // bsv-low #1184 (OWED-1184-FOLD): the named spender-bytes rows the store's ceiling took
+    v.push("owed_spender_bytes_named_swept_total".to_string());
     v.push("applayer_owed_read_faults_total".to_string());
     v.extend(
         OWED_READ_FAULT_KINDS

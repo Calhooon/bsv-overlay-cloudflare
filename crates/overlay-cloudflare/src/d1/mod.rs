@@ -807,7 +807,12 @@ pub fn migration_list_fingerprint() -> u32 {
 /// `owed_dirty_owed_spender_bytes_delete_pointer`): a word or spender's bytes deleted marks the seats whose hop the
 /// index says that txid spent (`pot_records` by `idx_pot_spending`, the markers by `idx_hopparty_hop`), so the delete
 /// reaches a Phase C actor. Triggers only: no actor digest moves.
-pub const OVERLAY_MIGRATION_COUNT: usize = 500;
+/// 500 to 507 for bsv-low #1184 (OWED-1184-FOLD): the spender-bytes store bounded again: three indexes
+/// (`idx_owed_spender_bytes_age`, `idx_hop_chain_probes_spender`, `idx_evicted_pot_spending`), the row count
+/// `count_owed_spender_bytes`, its two triggers and its stamped backfill. Indexes of mirrored families: an INDEX-ONLY
+/// actor digest move (`schema_plan_kept`: rows kept, no re-bootstrap, no re-judge). The app layer's sweeps name them:
+/// the overlay first.
+pub const OVERLAY_MIGRATION_COUNT: usize = 507;
 
 /// bsv-low #848 (FAST-C): the filed handfile batches (`low-app-layer` `handfile::HANDFILE_BATCHES_CREATE`).
 pub const HANDFILE_BATCHES_CREATE: &str = "CREATE TABLE IF NOT EXISTS handfile_batches (batchKey TEXT PRIMARY KEY, identity TEXT NOT NULL, gameId TEXT NOT NULL, hopTxid TEXT NOT NULL, payloadsHex TEXT NOT NULL, identitySigHex TEXT NOT NULL, settleSigHex TEXT NOT NULL, createdAt INTEGER)";
@@ -2684,7 +2689,23 @@ pub const OVERLAY_MIGRATIONS: &[&str] = &[
     // triggers, none edited.
     crate::derived_owed::write_time::WORD_DELETE_POINTER,
     crate::derived_owed::write_time::SPENDER_BYTES_DELETE_POINTER,
+    // 501..507: bsv-low #1184 (OWED-1184-FOLD), the spender-bytes store bounded again. The age sweep walks a window of
+    // `owed_spender_bytes` by age past its cursor (`idx_owed_spender_bytes_age`); a spender the belt's evidence or an
+    // evicted pointer names is kept (`idx_hop_chain_probes_spender`, `idx_evicted_pot_spending`, each partial on a
+    // named spender); the store's ceiling reads its row count (`count_owed_spender_bytes`, kept by two triggers and
+    // a stamped backfill, #645's shape). Indexes of three mirrored families: an index-only actor digest move.
+    "CREATE INDEX IF NOT EXISTS idx_owed_spender_bytes_age ON owed_spender_bytes(createdAtMs, txid)",
+    "CREATE INDEX IF NOT EXISTS idx_hop_chain_probes_spender ON hop_chain_probes(spendingTxid) WHERE spendingTxid IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_evicted_pot_spending ON pot_records_evicted(spendingTxid) WHERE spendingTxid IS NOT NULL",
+    "CREATE TABLE IF NOT EXISTS count_owed_spender_bytes (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS count_owed_spender_bytes_insert AFTER INSERT ON owed_spender_bytes BEGIN UPDATE count_owed_spender_bytes SET n = n + 1 WHERE id = 1; END",
+    "CREATE TRIGGER IF NOT EXISTS count_owed_spender_bytes_delete AFTER DELETE ON owed_spender_bytes BEGIN UPDATE count_owed_spender_bytes SET n = n - 1 WHERE id = 1; END",
+    SPENDER_BYTES_COUNT_BACKFILL,
 ];
+
+/// bsv-low #1184 (OWED-1184-FOLD): the spender-bytes row count, filled once (#645's stamped shape): the guard makes a
+/// re-run of the list one primary-key probe; the triggers keep it after.
+pub const SPENDER_BYTES_COUNT_BACKFILL: &str = "INSERT OR IGNORE INTO count_owed_spender_bytes (id, n) SELECT 1, c.n FROM (SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM count_owed_spender_bytes WHERE id = 1)) g CROSS JOIN (SELECT COUNT(*) AS n FROM owed_spender_bytes) c";
 
 // =============================================================================
 // Tests (these test the builder logic without D1 — SQL string generation)
@@ -3494,6 +3515,9 @@ mod tests {
                         crate::ops::RETIRED_SET_BACKFILL,
                         crate::ops::RETIRED_COUNT_BACKFILL,
                         crate::ops::UNSPENT_KIND_BACKFILL,
+                        // bsv-low #1184 (OWED-1184-FOLD): the spender-bytes count's stamped backfill, pinned by
+                        // `low-app-layer --test owed_1184_spender_bytes` (the count follows the store).
+                        super::SPENDER_BYTES_COUNT_BACKFILL,
                     ]
                     .contains(sql)
             })

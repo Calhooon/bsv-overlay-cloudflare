@@ -1074,7 +1074,9 @@ mod pins {
             ("probe", include_str!("hop_probe_memos.rs"), "pub async fn expire(", "HOP_PROBE_MEMO_EXPIRE_MARK_SQL,&[HOP_PROBE_MEMO_EXPIRE_FRAMED_SQL],"),
             ("word", app("runtime"), "pub async fn tick(", r#"note("word", &gone.txid);"#),
             ("bytes", app("routes"), "fn note_swept_bytes(", "note(crate::owed::SPENDER_BYTES_SOURCE,&g.txid);"),
-            ("bytes", app("routes"), "pub async fn sweep_owed_spender_bytes(", "Ok(gone)=>note_swept_bytes(&gone),"),
+            ("bytes", app("routes"), "pub async fn sweep_owed_spender_bytes(", "Some(Ok(gone))=>note_swept_bytes(&gone),"),
+            // OWED-1184-FOLD: the store's ceiling notes each row it took
+            ("bytes", app("routes"), "pub async fn sweep_owed_spender_bytes(", "crate::owed_events_publish::note(crate::owed::SPENDER_BYTES_SOURCE,&g.txid);"),
         ];
         for (source, src, sig, note) in writers {
             let body = fn_body(src, sig);
