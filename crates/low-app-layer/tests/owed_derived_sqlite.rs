@@ -102,12 +102,14 @@ fn owed893_migrations_preserve_the_shipped_prefix_and_pin_the_new_count() {
     // the index pointer names); the 498 before them are untouched.
     assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..498]), 3_646_027_862);
     // bsv-low #1184 (OWED-1184-FOLD) appends the spender-bytes store's bound: three indexes, the row count, its two
-    // triggers and its backfill; the 500 before them are untouched.
-    assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..500]), 1_703_856_683);
+    // triggers and its backfill; the 500 before them are untouched. OWED-1184 fold 2 edited 500 in place (the bytes
+    // delete's seats gained the belt's evidence and the evicted pointer; 499..507 shipped on no D1, `main` ends at
+    // 498): 1,703,856,683 then 455,313,374.
+    assert_eq!(fingerprint(&OVERLAY_MIGRATIONS[..500]), 455_313_374);
     const COUNT: usize = 507;
     assert_eq!(OVERLAY_MIGRATIONS.len(), COUNT);
     assert_eq!(d1::OVERLAY_MIGRATION_COUNT, COUNT);
-    const FINGERPRINT: u32 = 2_835_210_098;
+    const FINGERPRINT: u32 = 1_586_666_789;
     assert_eq!(
         d1::migration_list_fingerprint(),
         FINGERPRINT,

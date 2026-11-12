@@ -1339,6 +1339,72 @@ fn owed1184_paths(f: &Fixture) -> Result<(), String> {
             "a pointer-named spender's UNMINED word deleted: a downgrade (OWED-1184)".into(),
         );
     }
+    // OWED-1184 fold 2 (the delta lens's LOW-B): the bytes delete reaches the seats of EVERY reason the sweeps keep a
+    // spender (`owed::spender_named!`), each through its own arm with an exclusive subject, so either arm removed alone
+    // loses its mark here. The belt's evidence `<hop>:<vout>` names `sp1184e` (no pointer: `grace`'s hop is index
+    // unspent); an evicted pointer names `sp1184v` (`heidi`'s hop row moved to `pot_records_evicted`).
+    let hop_e = "e".repeat(64);
+    f.execute(
+        "INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES (?1,0,0,1,'p2pkh')",
+        vec![hop_e.clone().into()],
+    );
+    f.execute(
+        "INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('grace','bob','game',0,1000,'k','s','i',2,?1,1,1,1)",
+        vec![hop_e.clone().into()],
+    );
+    f.execute(
+        low_app_layer::hops_view::PROBE_MEMO_UPSERT_SQL,
+        vec![
+            format!("{hop_e}:0").into(),
+            1.into(),
+            1.into(),
+            "sp1184e".to_string().into(),
+            1.into(),
+            899_000.into(),
+        ],
+    );
+    f.execute(
+        "INSERT INTO owed_spender_bytes(txid,bytesJson,createdAtMs) VALUES ('sp1184e','{}',1)",
+        vec![],
+    );
+    f.check(
+        "a spender the belt's evidence names: its bytes deleted (OWED-1184 fold 2)",
+        "DELETE FROM owed_spender_bytes WHERE txid='sp1184e'",
+        vec![],
+        marks("bytes", "sp1184e", &["grace"]),
+    )?;
+    f.execute(
+        "INSERT INTO pot_records_evicted(af_evictedAt,af_reason,txid,outputIndex,spent,spendingTxid,spentConfirmed,createdAt,lockKind) VALUES (1,'fixture','hop1184v',0,1,'sp1184v',1,1,'p2pkh')",
+        vec![],
+    );
+    f.execute(
+        "INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('heidi','bob','game',0,1000,'k','s','i',2,'hop1184v',1,1,1)",
+        vec![],
+    );
+    f.execute(
+        "INSERT INTO owed_spender_bytes(txid,bytesJson,createdAtMs) VALUES ('sp1184v','{}',1)",
+        vec![],
+    );
+    f.check(
+        "a spender an evicted pointer names: its bytes deleted (OWED-1184 fold 2)",
+        "DELETE FROM owed_spender_bytes WHERE txid='sp1184v'",
+        vec![],
+        marks("bytes", "sp1184v", &["heidi"]),
+    )?;
+    // the marks the last check left: the evicted arm's class (`class` reads `frank`'s)
+    let downgrade: i64 = f
+        .db
+        .query_row(
+            "SELECT downgrade FROM owed_dirty WHERE identity='heidi' AND source='bytes' AND sourceKey='sp1184v'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1);
+    if downgrade != 1 {
+        return Err(
+            "an evicted-named spender's bytes deleted: not a downgrade (OWED-1184 fold 2)".into(),
+        );
+    }
     Ok(())
 }
 
@@ -1910,7 +1976,7 @@ fn owed893_each_source_trigger_removed_or_not_advanced_alone_turns_the_productio
     assert_eq!(
         names.len(),
         50,
-        "fifteen source tables (released_hop_evidence_missing, D2-OWED-FOLD-8's, the fifteenth), refusal UPSERT's UPDATE and two word triggers per verb; FIX-1001's three (transactions' proof insert and update, a hop row's markerless filers); FIX-1010's fourteen (hand markers insert and update, proof markers, proof posts, the result re-latch, a transaction deleted, a party's other seats on insert and update, the seat derivation's pot insert, update and delete and its bytes, the word and spender-bytes sweeps); OWED-1173's two (a filed sweep's pot_beefs proof stored verified, and latched or withdrawn); OWED-1184's two (a word and a spender's bytes deleted reach the seats the index pointer names)"
+        "fifteen source tables (released_hop_evidence_missing, D2-OWED-FOLD-8's, the fifteenth), refusal UPSERT's UPDATE and two word triggers per verb; FIX-1001's three (transactions' proof insert and update, a hop row's markerless filers); FIX-1010's fourteen (hand markers insert and update, proof markers, proof posts, the result re-latch, a transaction deleted, a party's other seats on insert and update, the seat derivation's pot insert, update and delete and its bytes, the word and spender-bytes sweeps); OWED-1173's two (a filed sweep's pot_beefs proof stored verified, and latched or withdrawn); OWED-1184's two (a word and a spender's bytes deleted reach the seats the index pointer names; the bytes' trigger, since fold 2, also the belt's evidence and an evicted pointer)"
     );
     for name in names {
         let err = paths(&Fixture::new(Some(&name)))

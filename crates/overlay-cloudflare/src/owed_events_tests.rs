@@ -1075,8 +1075,8 @@ mod pins {
             ("word", app("runtime"), "pub async fn tick(", r#"note("word", &gone.txid);"#),
             ("bytes", app("routes"), "fn note_swept_bytes(", "note(crate::owed::SPENDER_BYTES_SOURCE,&g.txid);"),
             ("bytes", app("routes"), "pub async fn sweep_owed_spender_bytes(", "Some(Ok(gone))=>note_swept_bytes(&gone),"),
-            // OWED-1184-FOLD: the store's ceiling notes each row it took
-            ("bytes", app("routes"), "pub async fn sweep_owed_spender_bytes(", "crate::owed_events_publish::note(crate::owed::SPENDER_BYTES_SOURCE,&g.txid);"),
+            // OWED-1184-FOLD: the store's ceiling notes each row it took (fold 2: inside its batch's answer, wrapped)
+            ("bytes", app("routes"), "pub async fn sweep_owed_spender_bytes(", "crate::owed_events_publish::note(crate::owed::SPENDER_BYTES_SOURCE,&g.txid,);"),
         ];
         for (source, src, sig, note) in writers {
             let body = fn_body(src, sig);

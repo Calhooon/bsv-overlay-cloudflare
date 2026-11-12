@@ -11,9 +11,11 @@
 mod d1_fleet;
 use bsv_overlay_cloudflare::d1::OVERLAY_MIGRATIONS;
 use low_app_layer::owed::{
-    spender_bytes_sweep_pass, OWED_SPENDER_BYTES_AGE_CURSOR_SQL, OWED_SPENDER_BYTES_CAP_SWEEP_SQL,
-    OWED_SPENDER_BYTES_RETENTION_MS, OWED_SPENDER_BYTES_STORE_CAP, OWED_SPENDER_BYTES_SWEEP_LIMIT,
-    OWED_SPENDER_BYTES_SWEEP_SQL, OWED_SPENDER_BYTES_SWEEP_WINDOW, OWED_SPENDER_BYTES_UPSERT_SQL,
+    spender_bytes_sweep_pass, spender_bytes_sweep_pass_under, OWED_SPENDER_BYTES_AGE_CURSOR_SQL,
+    OWED_SPENDER_BYTES_CAP_SWEEP_SQL, OWED_SPENDER_BYTES_CEILING_COUNT_SQL,
+    OWED_SPENDER_BYTES_CEILING_CURSOR_SQL, OWED_SPENDER_BYTES_NAMED_SWEPT_COUNTER,
+    OWED_SPENDER_BYTES_RETENTION_MS, OWED_SPENDER_BYTES_STORE_CAP, OWED_SPENDER_BYTES_SWEEP_SQL,
+    OWED_SPENDER_BYTES_SWEEP_WINDOW, OWED_SPENDER_BYTES_UPSERT_SQL,
 };
 use rusqlite::{params, params_from_iter, Connection};
 
@@ -73,26 +75,26 @@ fn pass(db: &Connection, now_ms: i64) -> (Vec<String>, Vec<String>, i64) {
         gone.push(out);
         steps += s;
     }
-    let capped = gone.pop().unwrap();
-    let aged = gone.pop().unwrap();
-    (aged, capped, steps)
+    (gone[1].clone(), gone[4].clone(), steps)
 }
 
-/// The ceiling at `ceiling` rows: the txids it took and, of them, the named ones.
+/// One pass of the store's ceiling at `ceiling` rows, its three shipped statements in order (one D1 batch on the
+/// Worker): the txids it took and, of them, the named ones.
 fn cap(db: &Connection, ceiling: i64) -> (Vec<String>, Vec<String>) {
-    let mut stmt = db.prepare(OWED_SPENDER_BYTES_CAP_SWEEP_SQL).unwrap();
+    cap_steps(db, ceiling).0
+}
+
+/// [`cap`] with the three statements' VM steps.
+fn cap_steps(db: &Connection, ceiling: i64) -> ((Vec<String>, Vec<String>), i64) {
+    let pass = spender_bytes_sweep_pass_under(NOW, ceiling);
+    let mut steps = run(db, pass[2].0, &pass[2].1).1 + run(db, pass[3].0, &pass[3].1).1;
+    let mut stmt = db.prepare(pass[4].0).unwrap();
     let rows: Vec<(String, i64)> = stmt
-        .query_map(
-            params![
-                ceiling,
-                OWED_SPENDER_BYTES_SWEEP_LIMIT,
-                OWED_SPENDER_BYTES_SWEEP_WINDOW
-            ],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        .query_map(params_from_iter(&pass[4].1), |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
         .map(Result::unwrap)
         .collect();
+    steps += stmt.get_status(rusqlite::StatementStatus::VmStep) as i64;
     let mut all: Vec<String> = rows.iter().map(|(t, _)| t.clone()).collect();
     let mut named: Vec<String> = rows
         .iter()
@@ -101,7 +103,17 @@ fn cap(db: &Connection, ceiling: i64) -> (Vec<String>, Vec<String>) {
         .collect();
     all.sort();
     named.sort();
-    (all, named)
+    ((all, named), steps)
+}
+
+/// The durable count of the named rows the ceiling took.
+fn named_swept(db: &Connection) -> i64 {
+    db.query_row(
+        "SELECT COALESCE((SELECT value FROM ops_counters WHERE name=?1),0)",
+        [OWED_SPENDER_BYTES_NAMED_SWEPT_COUNTER],
+        |r| r.get(0),
+    )
+    .unwrap()
 }
 
 fn held(db: &Connection) -> Vec<String> {
@@ -157,9 +169,10 @@ fn owed1184_a_the_age_sweep_keeps_a_pointer_named_spender_and_sweeps_the_rest() 
     assert_eq!(counted(&db), 0);
 }
 
-/// (b) THE STORE'S CEILING (OWED-1184-FOLD, LOW-1): past it, the oldest rows go, the unreferenced first, then the
-/// oldest NAMED rows, never more than the excess; each named row taken is answered `named` (the trip, counted). Under
-/// the production ceiling nothing is taken. RED with the ceiling made inert (`max(0, ..)` taken as 0).
+/// (b) THE STORE'S CEILING (OWED-1184-FOLD, LOW-1; the rule since fold 2): past it the unreferenced rows go, never
+/// more than the excess; a named row goes only after a whole lap of the store found no unreferenced row, and each
+/// named row taken is answered `named` and counted durably. Under the production ceiling nothing is taken. RED with
+/// the ceiling made inert (`max(0, ..)` taken as 0).
 #[test]
 fn owed1184_b_the_ceiling_takes_the_unreferenced_first_then_the_oldest_named() {
     let db = migrated();
@@ -167,7 +180,7 @@ fn owed1184_b_the_ceiling_takes_the_unreferenced_first_then_the_oldest_named() {
     for i in 0..3 {
         let s = txid("5e", i);
         pointer(&db, &txid("b1", i), &s);
-        // the named rows are the OLDEST: the ceiling's window is read oldest first
+        // the named rows are the OLDEST
         bytes(&db, &s, 1_000 + i);
         named.push(s);
     }
@@ -187,20 +200,20 @@ fn owed1184_b_the_ceiling_takes_the_unreferenced_first_then_the_oldest_named() {
         "the excess, unreferenced first"
     );
     assert_eq!(counted(&db), 6);
-    // a ceiling of 2: four over, the three strangers left, then the OLDEST named row (the trip, answered named)
+    // a ceiling of 2: four over; this lap found unreferenced rows, so only they go (three), no named row
     assert_eq!(
         cap(&db, 2),
-        (
-            vec![
-                named[0].clone(),
-                txid("5f", 2),
-                txid("5f", 3),
-                txid("5f", 4)
-            ],
-            vec![named[0].clone()]
-        ),
-        "the named share's trip takes the oldest named row"
+        (vec![txid("5f", 2), txid("5f", 3), txid("5f", 4)], vec![]),
+        "no named row while the lap found an unreferenced one"
     );
+    assert_eq!(named_swept(&db), 0);
+    // the next lap finds none: then the OLDEST named row (the trip, answered named, counted)
+    assert_eq!(
+        cap(&db, 2),
+        (vec![named[0].clone()], vec![named[0].clone()]),
+        "a clean lap: the oldest named row"
+    );
+    assert_eq!(named_swept(&db), 1);
     assert_eq!(held(&db), vec![named[1].clone(), named[2].clone()]);
     assert_eq!(counted(&db), 2);
     assert_eq!(cap(&db, 2), (vec![], vec![]));
@@ -241,11 +254,14 @@ fn fleet_with(kept: i64) -> Connection {
 #[test]
 fn owed1184_c_a_pass_is_bounded_by_the_window_never_the_store() {
     let mut steps_at = Vec::new();
+    let mut tripped_at = Vec::new();
     for kept in [5_000i64, 50_000] {
         let db = fleet_with(kept);
         for sql in [
             OWED_SPENDER_BYTES_AGE_CURSOR_SQL,
             OWED_SPENDER_BYTES_SWEEP_SQL,
+            OWED_SPENDER_BYTES_CEILING_CURSOR_SQL,
+            OWED_SPENDER_BYTES_CEILING_COUNT_SQL,
             OWED_SPENDER_BYTES_CAP_SWEEP_SQL,
         ] {
             let p = plan(&db, sql);
@@ -296,12 +312,39 @@ fn owed1184_c_a_pass_is_bounded_by_the_window_never_the_store() {
             "owed1184_c: the unreferenced row taken at pass {} of a lap of {laps}",
             n + 1
         );
+        // OWED-1184 fold 2: the ceiling TRIPPED is bounded too, its cursor's window and, clean, its newest and oldest
+        // windows: the steps at 50,000 kept rows are those at 5,000
+        let over = counted(&db) - 1;
+        let ((took, _), walk) = cap_steps(&db, over);
+        assert!(took.is_empty(), "a lap not yet clean takes no named row");
+        db.execute(
+            "UPDATE owed_belt_state SET cursor=json_set(cursor,'$.clean',1) WHERE name='owed-spender-bytes:ceiling'",
+            [],
+        )
+        .unwrap();
+        let ((took, named), clean) = cap_steps(&db, over);
+        assert_eq!(
+            (took.len(), named.len()),
+            (1, 1),
+            "clean: the oldest named row"
+        );
+        eprintln!("owed1184_c: the ceiling tripped over {kept} kept rows: {walk} VM steps walking, {clean} clean");
+        tripped_at.push((walk, clean));
     }
     assert!(
         steps_at[1] <= steps_at[0] + steps_at[0] / 20,
         "the pass's steps grow with the store: {steps_at:?}"
     );
     assert!(steps_at[1] < 120_000, "{steps_at:?}");
+    for (a, b) in [
+        (tripped_at[0].0, tripped_at[1].0),
+        (tripped_at[0].1, tripped_at[1].1),
+    ] {
+        assert!(
+            b <= a + a / 20,
+            "the tripped ceiling's steps grow with the store: {tripped_at:?}"
+        );
+    }
 }
 
 /// (d) LOW-2: a spender the belt FOUND (its evidence `<hop>:<vout>` naming it, its bytes written) is kept before the
@@ -376,4 +419,264 @@ fn owed1184_e_an_evicted_pointer_keeps_the_bytes() {
     .unwrap();
     assert_eq!(pass(&db, LATER).0, Vec::<String>::new());
     assert_eq!(held(&db), vec![s]);
+}
+
+// =============================================================================
+// OWED-1184 fold 2 (the delta lens `OWED-1184-DELTA-LENS-2026-11-12.md`): LOW-A, LOW-B, NOTE-2, NOTE-3.
+// =============================================================================
+
+/// The rows the ceiling takes, pass after pass at `ceiling`, until a pass takes nothing: every txid taken and, of
+/// them, the named ones.
+fn cap_until_quiet(db: &Connection, ceiling: i64) -> (Vec<String>, Vec<String>) {
+    let (mut all, mut named) = (Vec::new(), Vec::new());
+    for _ in 0..16 {
+        let (a, n) = cap(db, ceiling);
+        if a.is_empty() && counted(db) <= ceiling {
+            break;
+        }
+        all.extend(a);
+        named.extend(n);
+    }
+    all.sort();
+    named.sort();
+    (all, named)
+}
+
+/// (f2_a) LOW-A, THE LENS'S CASE: 600 old pointer-named rows and 10 young unreferenced ones, the ceiling 5 over. The 5
+/// taken are UNREFERENCED (the oldest five of them); no named row goes, none is counted. RED under bbcb9e79's rule
+/// (unreferenced first within the 512 oldest only): the 5 oldest NAMED rows taken, answered named.
+#[test]
+fn owed1184f2_a_the_ceiling_takes_unreferenced_rows_anywhere_before_a_named_one() {
+    let db = migrated();
+    for i in 0..600 {
+        let s = txid("5e", i);
+        pointer(&db, &txid("b1", i), &s);
+        bytes(&db, &s, 1_000 + i);
+    }
+    for i in 0..10 {
+        bytes(&db, &txid("5f", i), 10_000 + i);
+    }
+    assert_eq!(counted(&db), 610);
+    let (all, named) = cap_until_quiet(&db, 605);
+    assert_eq!(
+        (all, named),
+        ((0..5).map(|i| txid("5f", i)).collect::<Vec<_>>(), vec![]),
+        "the five taken are unreferenced"
+    );
+    assert_eq!(counted(&db), 605);
+    assert_eq!(named_swept(&db), 0);
+    let left: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM owed_spender_bytes WHERE txid LIKE '5e%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 600, "every named row stands");
+}
+
+/// (f2_b) The rule's other edges: a store of named rows only gives up its OLDEST named rows only after a whole lap
+/// found no unreferenced row (the first pass, a window of 512 of 600, takes nothing); once clean, an unreferenced row
+/// written since (the newest) goes before a named one; under the ceiling the cursor is reset, so the next trip judges
+/// a whole lap again. Each named row is counted durably.
+#[test]
+fn owed1184f2_b_named_rows_go_only_after_a_clean_lap_and_after_the_newest_unreferenced() {
+    let db = migrated();
+    let named: Vec<String> = (0..600).map(|i| txid("5e", i)).collect();
+    for (i, s) in named.iter().enumerate() {
+        pointer(&db, &txid("b1", i as i64), s);
+        bytes(&db, s, 1_000 + i as i64);
+    }
+    // the first window: 512 rows, all named, the lap not over: nothing taken
+    assert_eq!(cap(&db, 595), (vec![], vec![]));
+    // the lap ends clean: the five oldest named rows, counted
+    let five: Vec<String> = named[..5].to_vec();
+    assert_eq!(cap(&db, 595), (five.clone(), five));
+    assert_eq!(named_swept(&db), 5);
+    // a young unreferenced row written after the clean lap: it goes first, no named row
+    let young = txid("5f", 1);
+    bytes(&db, &young, 50_000);
+    assert_eq!(cap(&db, 595), (vec![young], vec![]));
+    assert_eq!(named_swept(&db), 5);
+    // under the ceiling: nothing taken and the cursor reset (wrap 1, clean 0)
+    assert_eq!(cap(&db, 595), (vec![], vec![]));
+    let (wrap, clean): (i64, i64) = db
+        .query_row(
+            "SELECT json_extract(cursor,'$.wrap'), json_extract(cursor,'$.clean') FROM owed_belt_state WHERE name='owed-spender-bytes:ceiling'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (wrap, clean),
+        (1, 0),
+        "the trip's cursor reset under the ceiling"
+    );
+    // the next trip walks a whole lap again before a named row goes
+    assert_eq!(cap(&db, 590), (vec![], vec![]));
+    let next: Vec<String> = named[5..10].to_vec();
+    assert_eq!(cap(&db, 590), (next.clone(), next));
+    assert_eq!(named_swept(&db), 10);
+}
+
+/// (f2_c) LOW-B: in Phase C (no `owed_rows`, no marks) the ceiling's delete of a spender kept for EACH reason marks
+/// its seat: the belt's evidence (alice's index-unspent hop), an evicted pointer (dave's hop moved to
+/// `pot_records_evicted`) and an index pointer (carol's). RED with either new lookup of
+/// `owed_dirty_owed_spender_bytes_delete_pointer` removed: alice (or dave) gets no mark.
+#[test]
+fn owed1184f2_c_every_ceiling_delete_of_a_kept_row_marks_its_seat_in_phase_c() {
+    let db = migrated();
+    let marker = |hop: &str, id: &str| {
+        db.execute(
+            "INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES (?1,'bob','game',0,1000,'k','s','i',2,?2,1,1,1)",
+            params![id, hop],
+        )
+        .unwrap();
+    };
+    let (ev, ptr, evicted) = (txid("5a", 1), txid("5a", 2), txid("5a", 3));
+    let (hop_e, hop_p, hop_v) = (txid("b2", 1), txid("b2", 2), txid("b2", 3));
+    db.execute(
+        "INSERT INTO pot_records(txid,outputIndex,spent,createdAt,lockKind) VALUES (?1,0,0,1,'p2pkh')",
+        [&hop_e],
+    )
+    .unwrap();
+    pointer(&db, &hop_p, &ptr);
+    db.execute(
+        "INSERT INTO pot_records_evicted(af_evictedAt,af_reason,txid,outputIndex,spent,spendingTxid,spentConfirmed,createdAt,lockKind) VALUES (1,'fixture',?1,0,1,?2,1,1,'p2pkh')",
+        params![hop_v, evicted],
+    )
+    .unwrap();
+    marker(&hop_e, "alice");
+    marker(&hop_p, "carol");
+    marker(&hop_v, "dave");
+    db.execute(
+        low_app_layer::hops_view::PROBE_MEMO_UPSERT_SQL,
+        params![format!("{hop_e}:0"), 1, 1, &ev, 1, 899_000],
+    )
+    .unwrap();
+    bytes(&db, &ev, 1);
+    bytes(&db, &ptr, 2);
+    bytes(&db, &evicted, 3);
+    db.execute("DELETE FROM owed_dirty", []).unwrap();
+    let rows: i64 = db
+        .query_row("SELECT COUNT(*) FROM owed_rows", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "the premise: Phase C, D1 holds no owed row");
+    let (all, named) = cap(&db, 0);
+    assert_eq!(all.len(), 3);
+    assert_eq!(named.len(), 3, "each is a kept row");
+    let marks: Vec<(String, String, String, i64)> = db
+        .prepare("SELECT identity, source, sourceKey, downgrade FROM owed_dirty ORDER BY identity")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        marks,
+        vec![
+            ("alice".into(), "bytes".into(), ev, 1),
+            ("carol".into(), "bytes".into(), ptr, 1),
+            ("dave".into(), "bytes".into(), evicted, 1),
+        ],
+        "each seat marked, a downgrade"
+    );
+}
+
+/// (f2_d) NOTE-2: the count's backfill over a POPULATED store (the path prod takes: `owed_spender_bytes` holds rows
+/// before migration 504). The list up to 503, rows written, then the rest: the count is the rows; a re-run of the
+/// whole list keeps it (the guard: one probe, no recount, even over a count planted wrong); the triggers keep it.
+#[test]
+fn owed1184f2_d_the_count_backfill_over_a_populated_store() {
+    let db = Connection::open_in_memory().unwrap();
+    let apply = |list: &[&str]| {
+        for sql in list {
+            if let Err(e) = db.execute_batch(sql) {
+                assert!(e.to_string().contains("duplicate column"), "{e}: {sql}");
+            }
+        }
+    };
+    apply(&OVERLAY_MIGRATIONS[..503]);
+    let present: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='count_owed_spender_bytes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(present, 0, "the premise: the count is migration 504's");
+    for i in 0..37 {
+        bytes(&db, &txid("5c", i), NOW + i);
+    }
+    apply(&OVERLAY_MIGRATIONS[503..]);
+    assert_eq!(counted(&db), 37, "the backfill counted the populated store");
+    // the guard: a re-run of the whole list does not recount, even a count planted wrong
+    db.execute("UPDATE count_owed_spender_bytes SET n=999 WHERE id=1", [])
+        .unwrap();
+    apply(OVERLAY_MIGRATIONS);
+    assert_eq!(counted(&db), 999, "the re-run's guard holds");
+    db.execute("UPDATE count_owed_spender_bytes SET n=37 WHERE id=1", [])
+        .unwrap();
+    bytes(&db, &txid("5c", 99), NOW);
+    assert_eq!(counted(&db), 38);
+    db.execute(
+        "DELETE FROM owed_spender_bytes WHERE txid=?1",
+        [txid("5c", 0)],
+    )
+    .unwrap();
+    assert_eq!(counted(&db), 37);
+}
+
+/// (f2_e) NOTE-3: the named count rides the delete's batch: the ceiling is three statements in one pass's order
+/// (cursor, count, delete), the count's statement names the durable counter and reads the same take as the delete,
+/// and over a run of trips the counter equals the named rows answered. The route runs them in one D1 batch
+/// (`routes::sweep_owed_spender_bytes`, `counted_batch(&db, vec![cursor, count, delete])`).
+#[test]
+fn owed1184f2_e_the_named_count_rides_the_deletes_batch() {
+    let pass = spender_bytes_sweep_pass(NOW);
+    assert_eq!(
+        [pass[2].0, pass[3].0, pass[4].0],
+        [
+            OWED_SPENDER_BYTES_CEILING_CURSOR_SQL,
+            OWED_SPENDER_BYTES_CEILING_COUNT_SQL,
+            OWED_SPENDER_BYTES_CAP_SWEEP_SQL
+        ]
+    );
+    assert!(OWED_SPENDER_BYTES_CEILING_COUNT_SQL
+        .contains(&format!("'{OWED_SPENDER_BYTES_NAMED_SWEPT_COUNTER}'")));
+    let take = |sql: &str| sql[..sql.find("INSERT").or(sql.find("DELETE")).unwrap()].to_string();
+    assert_eq!(
+        take(OWED_SPENDER_BYTES_CEILING_COUNT_SQL),
+        take(OWED_SPENDER_BYTES_CAP_SWEEP_SQL),
+        "the count and the delete read one take"
+    );
+    let routes = include_str!("../src/routes.rs");
+    let body = &routes[routes
+        .find("pub async fn sweep_owed_spender_bytes(")
+        .unwrap()..];
+    let body: String = body[..body.find("\n}\n").unwrap()]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        body.contains("counted_batch(&db,vec![cursor,count,delete])"),
+        "the route batches the ceiling's three statements"
+    );
+    assert!(
+        !body.contains("BUMP_COUNTER_SQL"),
+        "no count outside the batch"
+    );
+    // a run of trips: the counter is the named rows answered
+    let db = migrated();
+    for i in 0..20 {
+        let s = txid("5e", i);
+        pointer(&db, &txid("b1", i), &s);
+        bytes(&db, &s, 1_000 + i);
+    }
+    for i in 0..4 {
+        bytes(&db, &txid("5f", i), 5_000 + i);
+    }
+    let (all, named) = cap_until_quiet(&db, 10);
+    assert_eq!((all.len(), named.len()), (14, 10));
+    assert_eq!(named_swept(&db), 10);
 }
