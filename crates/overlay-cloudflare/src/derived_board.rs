@@ -666,8 +666,9 @@ mod tests {
         // The 29 shipped triggers plus their 29 appended write-time replacements, and FIX-1001's three appended
         // triggers (bsv-low #1001: the transactions proof insert and update, the hop row's markerless filers), and
         // FIX-1010's fourteen (bsv-low #1010: the families no trigger marked), and OWED-1173's two (bsv-low #1173: a
-        // filed sweep's pot_beefs proof stored verified, and latched or withdrawn).
-        assert_eq!(dirty.len(), 77);
+        // filed sweep's pot_beefs proof stored verified, and latched or withdrawn), and OWED-1184's two (bsv-low #1184: a
+        // word and a spender's bytes deleted reach the seats the index pointer names).
+        assert_eq!(dirty.len(), 79);
         for sql in dirty {
             let file = crate::migration_emitter::part_body(&[sql]);
             assert_eq!(split_wrangler_454(&file), [sql], "{sql}");

@@ -888,6 +888,7 @@ fn paths(f: &Fixture) -> Result<(), String> {
     fix1001_paths(f)?;
     fix1010_paths(f, &b, &result)?;
     owed1173_paths(f)?;
+    owed1184_paths(f)?;
     Ok(())
 }
 
@@ -1086,8 +1087,15 @@ fn fix1010_paths(f: &Fixture, b: &PotpartyRecord, result: &ResultRecord) -> Resu
     // The age sweeps of the words and the spender bytes the stored rows read.
     // `settle` is a recorded pot spender whose word is still live, so the sweep spares it (bsv-low #757); `pay` and
     // `word_paths`' funding row's word go, each marking the stored rows that read it.
+    // OWED-1184 (bsv-low #1184): `word_paths`' spender word of the hop arm (`word-spender-hop-spender`, which the
+    // index pointer names as the hop's spender) goes too, and now marks the hop's seat by its marker.
     let mut want = marks("word", "pay", &["alice"]);
     want.extend(marks("word", "word-funding-row", &["word-arm-row"]));
+    want.extend(marks(
+        "word",
+        "word-spender-hop-spender",
+        &["word-arm-hop-spender"],
+    ));
     want.sort();
     f.check(
         "word sweep",
@@ -1233,6 +1241,49 @@ fn owed1173_paths(f: &Fixture) -> Result<(), String> {
     Ok(())
 }
 
+/// OWED-1184 (bsv-low #1184): a word and a spender's bytes deleted reach the seats whose hop the INDEX says the txid
+/// spent (the exclusive subject `frank`: no stored owed row names the txid, D1's Phase C record, so only the pointer's
+/// arm marks). The shipped age sweep never takes a pointer-named spender's bytes; their delete is forced by hand. The
+/// shipped word sweep takes the spender's MINED word (a pointer spares only an unmined one).
+fn owed1184_paths(f: &Fixture) -> Result<(), String> {
+    use low_app_layer::{owed, tracker_host::stored};
+    f.execute(
+        "INSERT INTO pot_records(txid,outputIndex,spent,spendingTxid,spentConfirmed,createdAt,lockKind) VALUES ('hop1184',0,1,'sp1184',1,1,'p2pkh')",
+        vec![],
+    );
+    f.execute(
+        "INSERT INTO hopparty_records(identity,opponentIdentity,gameId,hopVout,hopSats,seatSettlePubkey,seatSigHex,identitySigHex,containerOutputs,txid,outputIndex,createdAt,markerValid) VALUES ('frank','bob','game',0,1000,'k','s','i',2,'hop1184',1,1,1)",
+        vec![],
+    );
+    f.execute(
+        "INSERT INTO owed_spender_bytes(txid,bytesJson,createdAtMs) VALUES ('sp1184','{}',1)",
+        vec![],
+    );
+    f.execute(
+        "INSERT INTO tx_words(txid,word,tier,updated_at) VALUES ('sp1184','mined','chain',1)",
+        vec![],
+    );
+    f.check(
+        "a pointer-named spender's bytes outlive the age sweep (OWED-1184)",
+        owed::OWED_SPENDER_BYTES_SWEEP_SQL,
+        vec![i64::MAX.into(), 256.into()],
+        vec![],
+    )?;
+    f.check(
+        "a pointer-named spender's bytes deleted (OWED-1184)",
+        "DELETE FROM owed_spender_bytes WHERE txid='sp1184'",
+        vec![],
+        marks("bytes", "sp1184", &["frank"]),
+    )?;
+    f.check(
+        "a pointer-named spender's mined word swept (OWED-1184)",
+        stored::SWEEP_FRAMED,
+        vec![i64::MAX.into()],
+        marks("word", "sp1184", &["frank"]),
+    )?;
+    Ok(())
+}
+
 /// Each word arm has an exclusive subject, so another arm cannot hide its loss.
 /// Both UPSERT verbs run with empty and pending marks through `paths`.
 fn word_paths(f: &Fixture) -> Result<(), String> {
@@ -1350,7 +1401,7 @@ fn owed893_word_compound_selects_fit_d1s_five_term_limit() {
 fn owed893_each_word_arm_removed_alone_turns_its_source_write_red() {
     let schema = Fixture::new(None);
     let triggers: Vec<(String, String)> = schema.db.prepare(
-        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'owed_dirty_tx_words_%' AND name <> 'owed_dirty_tx_words_delete' ORDER BY name"
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'owed_dirty_tx_words_%' AND name NOT LIKE 'owed_dirty_tx_words_delete%' ORDER BY name"
     ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect();
     assert_eq!(triggers.len(), 4);
     for (name, sql) in triggers {
@@ -1800,8 +1851,8 @@ fn owed893_each_source_trigger_removed_or_not_advanced_alone_turns_the_productio
         .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
     assert_eq!(
         names.len(),
-        48,
-        "fifteen source tables (released_hop_evidence_missing, D2-OWED-FOLD-8's, the fifteenth), refusal UPSERT's UPDATE and two word triggers per verb; FIX-1001's three (transactions' proof insert and update, a hop row's markerless filers); FIX-1010's fourteen (hand markers insert and update, proof markers, proof posts, the result re-latch, a transaction deleted, a party's other seats on insert and update, the seat derivation's pot insert, update and delete and its bytes, the word and spender-bytes sweeps); OWED-1173's two (a filed sweep's pot_beefs proof stored verified, and latched or withdrawn)"
+        50,
+        "fifteen source tables (released_hop_evidence_missing, D2-OWED-FOLD-8's, the fifteenth), refusal UPSERT's UPDATE and two word triggers per verb; FIX-1001's three (transactions' proof insert and update, a hop row's markerless filers); FIX-1010's fourteen (hand markers insert and update, proof markers, proof posts, the result re-latch, a transaction deleted, a party's other seats on insert and update, the seat derivation's pot insert, update and delete and its bytes, the word and spender-bytes sweeps); OWED-1173's two (a filed sweep's pot_beefs proof stored verified, and latched or withdrawn); OWED-1184's two (a word and a spender's bytes deleted reach the seats the index pointer names)"
     );
     for name in names {
         let err = paths(&Fixture::new(Some(&name)))
