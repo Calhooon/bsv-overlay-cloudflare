@@ -36,12 +36,14 @@ fn build_object_shape() {
     // the middleware to its release on 0.7.0 (adapter 0.7.0, core 0.4.0).
     // Amended for REPIN-080-OVERLAY (2026-10-21): bsv-rs 0.7.2, the adapter
     // 0.7.1, core unchanged at 0.4.0.
+    // Amended for the move to the 0.8 stable line (2026-11-13): bsv-rs 0.8.9,
+    // the adapter 0.7.2 and core 0.4.1, their releases on bsv-rs 0.8.
     assert_eq!(
         b["crates"],
         serde_json::json!({
-            "bsv-rs": "0.7.2",
-            "bsv-middleware-cloudflare": "0.7.1",
-            "bsv-middleware-core": "0.4.0",
+            "bsv-rs": "0.8.9",
+            "bsv-middleware-cloudflare": "0.7.2",
+            "bsv-middleware-core": "0.4.1",
         })
     );
 }

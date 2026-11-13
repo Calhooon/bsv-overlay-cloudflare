@@ -1393,7 +1393,10 @@ mod tests {
         let lib = strip(&lib[..lib.find("#[cfg(test)]").unwrap_or(lib.len())]);
         let reply = &lib[lib.find("auth::FrontDoor::Reply(mutresp)=>{").unwrap()..];
         let reply = &reply[..reply.find("returnOk(resp);").unwrap()];
-        assert!(reply.contains("flush_counters_if_due(&ctx,&env);"), "{reply}");
+        assert!(
+            reply.contains("flush_counters_if_due(&ctx,&env);"),
+            "{reply}"
+        );
         assert!(lib.contains("courier::take_pending_if_due("));
     }
 
@@ -1446,7 +1449,10 @@ mod tests {
             // byte-identical. The adapter diff is the payment door (not linked here) and `Retry-After` appended to
             // the expose list of `add_cors_headers` / `add_lane_cors_headers`, which the middleware calls on its OWN
             // answers (handshake, refusals): additive, and this crate's `cors::expose_list` already names it.
-            include_str!("../Cargo.toml").contains("bsv-middleware-cloudflare = \"=0.7.1\""),
+            // The move to the 0.8 stable line (2026-11-13): 0.7.1 to 0.7.2 re-read; the adapter's `src/` and core
+            // 0.4.0 to 0.4.1's `src/` are byte-identical (`diff -r` of the two crates.io sources, empty): the
+            // release moves the bsv-rs floor to `^0.8` alone, so `AuthCloudflareError` and its `KvError` sites stand.
+            include_str!("../Cargo.toml").contains("bsv-middleware-cloudflare = \"=0.7.2\""),
             "the middleware pin moved: re-read AuthCloudflareError and its KvError sites first"
         );
     }

@@ -138,7 +138,23 @@ mod tests {
             Some(parent.id().as_str()),
             "the name wins"
         );
-        let mut stray_named = Beef::from_binary(&atomic).unwrap();
+        // Since bsv-rs 0.8.1 the atomic writer emits the subject's closure
+        // alone (BRC-95): the child, outside the parent's graph, is dropped.
+        assert_eq!(
+            named.txs.len(),
+            1,
+            "the atomic body is the parent's closure"
+        );
+        // A body holding both, named for the parent (the tip is the child):
+        // the name still wins over the tip.
+        let mut both = Beef::from_binary(&beef.to_binary()).unwrap();
+        both.atomic_txid = Some(parent.id());
+        assert_eq!(
+            subject_txid_of(&mut both).as_deref(),
+            Some(parent.id().as_str()),
+            "the name wins over the tip"
+        );
+        let mut stray_named = Beef::from_binary(&beef.to_binary()).unwrap();
         stray_named.atomic_txid = Some("00".repeat(32));
         assert_eq!(
             subject_txid_of(&mut stray_named).as_deref(),

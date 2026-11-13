@@ -237,7 +237,11 @@ struct AssemblyNode {
 /// instead, then the SDK's own `Beef` (`merge_bump`, `merge_transaction`,
 /// `to_binary`, whose sort is the SDK's). The bytes are the ones the tree
 /// gave, for every graph: the frozen digests of `tests/gasp_topic_manager.rs`
-/// and of the witness hold.
+/// and of the witness hold. Since bsv-rs 0.8.8 `Transaction::to_beef` itself
+/// no longer sorts (it writes the walk's order, the subject last;
+/// GHSA-gg5p-wgff-v3hr): these bytes are the SORTED ones `to_beef` wrote
+/// through 0.8.7, unchanged by the move, and on a partial graph holding a
+/// proven branch their last entry need not be the node's transaction.
 ///
 /// Both walks keep their work on the heap (the recursion they replace used
 /// the stack, once per unproven link), and neither follows a link back into
@@ -2424,6 +2428,16 @@ mod tests {
         let beef = tx.to_beef(allow_partial).map_err(|e| {
             GASPError::Other(format!("Failed to serialize BEEF for {node_key}: {e}"))
         })?;
+        // bsv-rs 0.8.8 (GHSA-gg5p-wgff-v3hr): `to_beef` writes the order its
+        // walk collected, the subject last, where through 0.8.7 it handed the
+        // walk to `Beef::to_binary`'s dependency sort. The assembly under test
+        // still writes through `Beef::to_binary` (the Beef-level door keeps
+        // its sort), so the oracle re-sorts the same entries the way `fbb7fa8`'s
+        // `to_beef` did: the same bytes as before the move, for every graph.
+        let beef = match Beef::from_binary(&beef) {
+            Ok(mut sorted) => sorted.to_binary(),
+            Err(_) => beef,
+        };
 
         Ok((tx, beef))
     }

@@ -55,7 +55,9 @@ worker = { version = "0.8", features = ["d1", "queue"] }
 # Exactly 0.7.1 (REPIN-080-OVERLAY, 2026-10-21): core stays 0.4.0, the floor bsv-rs `^0.7.0` takes the
 # workspace's 0.7.2. 0.7.1 is the payment door's fail-closed posture (`FaultPosture::Closed`, 503
 # `ERR_PAYMENT_UNAVAILABLE`, `PrefixGate::Refuse` gains `headers`); this crate links no payment door, unchanged.
-bsv-middleware-cloudflare = "=0.7.1"
+# Exactly 0.7.2 (the move to the 0.8 stable line, 2026-11-13): adapter 0.7.2 and core 0.4.1, their
+# release on bsv-rs `^0.8`; their changelog: no behaviour change. One bsv-rs (0.8.x) in the lock.
+bsv-middleware-cloudflare = "=0.7.2"
 serde.workspace = true
 # bsv-low #532: `raw_value` so the identity views pass the resolver's JSON through byte for byte.
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -71,7 +73,9 @@ bsv-rs.workspace = true
 # Exactly 0.7.0 (REPIN-080-OVERLAY, 2026-10-21): the reorg rule BY THE ROOT (a `mined` word is `stale` iff its
 # root is not the active header's root at its height; `Reask::Reorg` means the root moved) and
 # `MempoolPresent` over `built` moves the word to `announced`. No public type changes.
-bsv-tracker = "=0.7.0"
+# Exactly 0.8.0 (the move to the 0.8 stable line, 2026-11-13): the tracker's release on bsv-rs 0.8 (its
+# public types carry bsv-rs's; its changelog names no behaviour change). One copy in the lock.
+bsv-tracker = "=0.8.0"
 # Shared parser policies for client-derived BEEF read from the overlay's store.
 overlay-engine = { package = "bsv-overlay-engine", version = "0.3.1", path = "../overlay-engine" }
 # The `Poc5TemplatePot` covenant recognizer + param-region accessor (the SAME
