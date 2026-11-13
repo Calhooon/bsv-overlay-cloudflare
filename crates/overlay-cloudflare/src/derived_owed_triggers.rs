@@ -776,7 +776,7 @@ macro_rules! kept_spender_seats {
 }
 /// A KEPT spender's bytes deleted (the age sweep never takes one; the store's ceiling, a hand delete, or a row whose
 /// name went between the sweep's read and its delete): the seats whose hop it spent, by every reason it was kept
-/// ([`kept_spender_seats!`]). A downgrade, as `SPENDER_BYTES_DELETE`'s. Edited in place by fold 2 (migration 500
+/// (`kept_spender_seats!`). A downgrade, as `SPENDER_BYTES_DELETE`'s. Edited in place by fold 2 (migration 500
 /// has shipped on no D1: `main`'s list and the certified counts on record end at 498).
 pub const SPENDER_BYTES_DELETE_POINTER: &str = trigger!(
     "owed_spender_bytes",
