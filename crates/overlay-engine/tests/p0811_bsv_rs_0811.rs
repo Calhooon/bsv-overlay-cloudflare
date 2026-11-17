@@ -1,13 +1,14 @@
 //! PORT-0811: what bsv-rs 0.8.10 and 0.8.11 ask of this engine as a caller.
 //!
 //! - The BEEF link bound (0.8.11, GHSA-gvmh-f5gf-5vjj): linking a subject's
-//!   ancestry re-materializes a shared parent once per spending input; bsv-rs
-//!   now refuses past 16 MiB of such repeats with `Error::BeefResourceLimit`.
+//!   ancestry re-materializes a shared parent once per spending input; the
+//!   engine bounds a link in heap (`beef_limits::LINK_HEAP_MAX_BYTES`, bsv-rs's
+//!   wire meter its belt), a trip `Error::BeefResourceLimit`.
 //!   The engine's linking door names a trip apart from an invalid BEEF and an
 //!   absent txid (`beef_limits::is_link_bound`), reads the subject alone where
 //!   it needs no ancestry (`beef_limits::subject_from_beef`), and at the submit
 //!   a trip is the submit's `WalkCouldNotRun` (limb `over_link`): "not now"
-//!   under `NotNow`, never a refusal. LOW's real shapes link under the default.
+//!   under `NotNow`, never a refusal. LOW's real shapes link under the bound.
 //! - The coin's era (0.8.10, GHSA-fr33-7jw7-mwwh and GHSA-h4m7-c6p8-725m, the
 //!   migration's steps 7 and 8 for a direct caller of `Spend`): the script door
 //!   declines (the network judges; the submit's "not now") a lock of the
@@ -126,8 +127,7 @@ fn beef_of(parent: &Transaction, child: &Transaction) -> Vec<u8> {
 /// The link bound's shape (GHSA-gvmh-f5gf-5vjj): one proven parent of `n`
 /// `OP_1` outputs of 1 sat, and one child spending every one of them. Each
 /// input after the first re-materializes the whole parent (about 10 bytes an
-/// output), so 1,400 of each is about 19.6 MB of repeats, past the 16 MiB
-/// default; the body itself is about 72 KB. Every script runs (`OP_1` under an
+/// output), so 1,400 of each is past the engine's link bound; the body itself is about 72 KB. Every script runs (`OP_1` under an
 /// empty unlock), so the walk passes and only the link trips.
 fn shared_parent(n: u32) -> (Vec<u8>, String) {
     let outputs = (0..n)
@@ -145,7 +145,7 @@ fn p0811_b_a_a_link_trip_is_named_apart_and_the_subject_reads_alone() {
     let (beef, child) = shared_parent(1_400);
     let linked =
         beef_limits::transaction_from_beef(&beef, Some(&child), &beef_limits::ENGINE_BEEF_LIMITS);
-    let err = linked.expect_err("the default link bound refuses the shared-parent shape");
+    let err = linked.expect_err("the engine's link bound declines the shared-parent shape");
     assert!(
         beef_limits::is_link_bound(&err),
         "a link trip is the link bound's class: {err}"
@@ -410,6 +410,60 @@ async fn p0811_n1_a_stored_body_ending_with_a_proven_ancestor_reads_its_own_txid
         node.proof.is_none(),
         "the unproven subject carries no proof"
     );
+
+    // A stored body of TWO tips, asked for the tip the subject rule does not
+    // pick: only the name selects it, at both of the node read's lookups (the
+    // output held under the read's topic, and under another).
+    let parent = proven_funding(
+        vec![
+            TransactionOutput::new(1_000, LockingScript::from_script(script(&[0x51]))),
+            TransactionOutput::new(1_000, LockingScript::from_script(script(&[0x51]))),
+        ],
+        800_000,
+    );
+    let tips = [
+        spend_of(&parent, &[0], &[], 900),
+        spend_of(&parent, &[1], &[], 900),
+    ];
+    let mut beef = Beef::new();
+    let bump = beef.merge_bump(parent.merkle_path.clone().unwrap());
+    beef.merge_raw_tx(parent.to_binary(), Some(bump));
+    for tip in &tips {
+        beef.merge_raw_tx(tip.to_binary(), None);
+    }
+    let stored = beef.to_binary();
+    let mut parsed = beef_limits::parse_beef(&stored, &beef_limits::STORED_BEEF_LIMITS).unwrap();
+    let by_rule = bsv_overlay_engine::subject::subject_txid_of(&mut parsed).unwrap();
+    let asked = tips.iter().find(|t| t.id() != by_rule).unwrap();
+    for held_under in [TOPIC, "tm_other"] {
+        let storage = MemoryStorage::new();
+        storage
+            .insert_output(&Output {
+                txid: asked.id(),
+                output_index: 0,
+                output_script: vec![0x51],
+                satoshis: 900,
+                topic: held_under.into(),
+                spent: false,
+                outputs_consumed: vec![],
+                consumed_by: vec![],
+                beef: Some(stored.clone()),
+                block_height: None,
+                score: Some(1.0),
+            })
+            .await
+            .unwrap();
+        let gasp = OverlayGASPStorage::new(&storage, TOPIC, new_finalized_graph_sink());
+        let node = gasp
+            .hydrate_gasp_node(&format!("{}.0", asked.id()), &asked.id(), 0, false)
+            .await
+            .expect("the stored node");
+        assert_eq!(
+            Transaction::from_hex(&node.raw_tx).unwrap().id(),
+            asked.id(),
+            "held under {held_under}: the node is the txid asked for, not the subject rule's {by_rule}"
+        );
+    }
 }
 
 /// A body that ENDS with its subject's proven ancestor, written by hand
@@ -488,5 +542,330 @@ fn p0811_f3_a_read_naming_no_txid_takes_the_subject_rule() {
             .unwrap()
             .id(),
         rule
+    );
+}
+
+/// One spend of a coin proven at 600,000 (below Genesis): the door's verdict,
+/// and bsv-rs's own verifier under the coin's era (`Transaction::verify`, the
+/// source's BUMP at its height). `None` when the door declines it (the
+/// network judges); `Some((door judged it valid, bsv-rs judged it valid))`.
+async fn door_and_sdk(parent: &Transaction, child: &Transaction) -> Option<(bool, bool)> {
+    let beef = beef_of(parent, child);
+    let txid = child.id();
+    let door = engine().verify_scripts_only(&beef, &txid).await;
+    if let Err(EngineError::ScriptWalkOverBudget { limb, what, .. }) = &door {
+        assert_eq!(
+            *limb,
+            bsv_overlay_engine::engine::DoorLimb::Era,
+            "only the era's decline here: {what}"
+        );
+        return None;
+    }
+    let door_valid = match &door {
+        Ok(stats) => {
+            assert!(stats.subject_judged, "{stats:?}");
+            true
+        }
+        Err(EngineError::ScriptVerificationFailed { .. }) => false,
+        Err(other) => panic!("the door answers a verdict or the era's decline: {other}"),
+    };
+    let tracker = bsv_rs::transaction::MockChainTracker::always_valid(900_000);
+    let sdk = Transaction::from_beef(&beef, Some(&txid))
+        .unwrap()
+        .verify(&tracker, None)
+        .await;
+    Some((door_valid, matches!(sdk, Ok(true))))
+}
+
+/// The signed spend of `lock` (output 0 of a coin proven at 600,000) by
+/// `template`, at `version`, with `junk` prepended to the signed unlock.
+async fn signed_spend(
+    lock: LockingScript,
+    template: bsv_rs::script::ScriptTemplateUnlock,
+    version: u32,
+    junk: &[u8],
+) -> (Transaction, Transaction) {
+    let parent = proven_funding(vec![TransactionOutput::new(10_000, lock)], 600_000);
+    let mut child = spend_of(&parent, &[0], &[], 9_000);
+    child.version = version;
+    child.inputs[0].source_transaction = Some(Box::new(parent.clone()));
+    child.inputs[0].unlocking_script = None;
+    child.inputs[0].unlocking_script_template = Some(Box::new(template));
+    child.sign().await.unwrap();
+    let signed = child.inputs[0]
+        .unlocking_script
+        .clone()
+        .unwrap()
+        .to_binary();
+    let mut unlock = junk.to_vec();
+    unlock.extend_from_slice(&signed);
+    child.inputs[0].unlocking_script = Some(UnlockingScript::from_script(script(&unlock)));
+    child.inputs[0].source_transaction = None;
+    (parent, child)
+}
+
+/// `n` one-byte pushes (`OP_1`).
+fn ones(n: usize) -> Vec<u8> {
+    vec![0x51; n]
+}
+
+/// A minimal push of `len` bytes.
+fn push_of(len: usize) -> Vec<u8> {
+    let mut out = match len {
+        0 => vec![0x00],
+        1..=75 => vec![len as u8],
+        76..=255 => vec![0x4c, len as u8],
+        _ => vec![0x4d, (len & 0xff) as u8, (len >> 8) as u8],
+    };
+    out.extend(std::iter::repeat_n(0x42u8, len));
+    out
+}
+
+/// THE PIN (c), the differential: for every generated spend of a coin proven
+/// below the Genesis height that the door does not decline, the door's verdict
+/// equals bsv-rs's own verifier under the coin's era. The shapes: P2PKH, P2PK,
+/// 1-of-1, 2-of-3, 1-of-10 and 1-of-16 multisig, and push-only locks; the
+/// stack's peak at and around 1,000 elements; an unlock and a lock at and
+/// around 10,000 bytes; a push of 520 and 521 bytes; versions 1 and 2. The
+/// lens's row (1-of-16, version 2, 987 pushes before the signature) is one of
+/// them: on `1af62adf` the door walked it `Ok` where bsv-rs refuses it.
+#[tokio::test]
+async fn p0811_c_c_the_eras_exemption_is_held_to_the_sdks_own_verdict() {
+    use bsv_rs::primitives::ec::PrivateKey;
+    use bsv_rs::script::templates::{Multisig, P2PK, P2PKH};
+    use bsv_rs::script::{ScriptTemplate, SignOutputs};
+
+    let mut compared = 0usize;
+    let mut declined = 0usize;
+    let mut valid = 0usize;
+    let mut differ = Vec::new();
+    let mut check = |label: String, answer: Option<(bool, bool)>| match answer {
+        None => declined += 1,
+        Some((door, sdk)) => {
+            compared += 1;
+            valid += usize::from(sdk);
+            if door != sdk {
+                differ.push(format!("{label}: door {door}, bsv-rs {sdk}"));
+            }
+        }
+    };
+
+    // The lens's row.
+    let keys: Vec<PrivateKey> = (0..16).map(|_| PrivateKey::random()).collect();
+    let pubs: Vec<_> = keys.iter().map(PrivateKey::public_key).collect();
+    let (p, c) = signed_spend(
+        Multisig::new(1).lock_from_keys(&pubs).unwrap(),
+        Multisig::unlock(&keys[..1], SignOutputs::All, false),
+        2,
+        &ones(987),
+    )
+    .await;
+    let lens_row = door_and_sdk(&p, &c).await;
+    assert!(
+        !matches!(lens_row, Some((true, _))),
+        "the lens's row is not walked valid: {lens_row:?}"
+    );
+    check("the lens's row".into(), lens_row);
+
+    for version in [1u32, 2] {
+        // Signed locks: (label, lock, template, the signed unlock's pushes,
+        // the lock's own growth).
+        type Template = bsv_rs::script::ScriptTemplateUnlock;
+        type Signed = (
+            String,
+            LockingScript,
+            Box<dyn Fn() -> Template>,
+            usize,
+            usize,
+        );
+        let mut signed: Vec<Signed> = Vec::new();
+        let key = PrivateKey::random();
+        let k1 = key.clone();
+        signed.push((
+            "P2PKH".into(),
+            P2PKH::new().lock(&key.public_key().hash160()).unwrap(),
+            Box::new(move || P2PKH::unlock(&k1, SignOutputs::All, false)),
+            2,
+            2,
+        ));
+        let k2 = key.clone();
+        signed.push((
+            "P2PK".into(),
+            P2PK::new().lock(&key.public_key().to_compressed()).unwrap(),
+            Box::new(move || P2PK::unlock(&k2, SignOutputs::All, false)),
+            1,
+            1,
+        ));
+        for (m, n) in [(1usize, 1usize), (2, 3), (1, 10), (1, 16)] {
+            let keys: Vec<PrivateKey> = (0..n).map(|_| PrivateKey::random()).collect();
+            let pubs: Vec<_> = keys.iter().map(PrivateKey::public_key).collect();
+            let signers = keys[..m].to_vec();
+            signed.push((
+                format!("{m}-of-{n}"),
+                Multisig::new(m as u8).lock_from_keys(&pubs).unwrap(),
+                Box::new(move || Multisig::unlock(&signers, SignOutputs::All, false)),
+                1 + m,
+                n + 2,
+            ));
+        }
+        for (label, lock, template, signed_pushes, growth) in &signed {
+            // The stack's peak at 0 and around 1,000.
+            let mut peaks = vec![0usize];
+            peaks.extend(998..=1_002);
+            for peak in peaks {
+                let junk = if peak == 0 {
+                    0
+                } else {
+                    peak - signed_pushes - growth
+                };
+                let (p, c) = signed_spend(lock.clone(), template(), version, &ones(junk)).await;
+                check(
+                    format!("{label} v{version} peak {}", junk + signed_pushes + growth),
+                    door_and_sdk(&p, &c).await,
+                );
+            }
+            // The unlock at and around 10,000 bytes; a push of 520 and 521.
+            for total in [9_999usize, 10_000, 10_001] {
+                let (_, probe) = signed_spend(lock.clone(), template(), version, &[]).await;
+                let signed_len = probe.inputs[0]
+                    .unlocking_script
+                    .as_ref()
+                    .unwrap()
+                    .to_binary()
+                    .len();
+                let mut junk = Vec::new();
+                for _ in 0..18 {
+                    junk.extend(push_of(520));
+                }
+                let rest = total - junk.len() - signed_len;
+                junk.extend(push_of(rest - 3));
+                let (p, c) = signed_spend(lock.clone(), template(), version, &junk).await;
+                assert_eq!(
+                    c.inputs[0]
+                        .unlocking_script
+                        .as_ref()
+                        .unwrap()
+                        .to_binary()
+                        .len(),
+                    total
+                );
+                check(
+                    format!("{label} v{version} unlock {total} bytes"),
+                    door_and_sdk(&p, &c).await,
+                );
+            }
+            for size in [520usize, 521] {
+                let (p, c) = signed_spend(lock.clone(), template(), version, &push_of(size)).await;
+                check(
+                    format!("{label} v{version} a push of {size}"),
+                    door_and_sdk(&p, &c).await,
+                );
+            }
+        }
+        // Push-only locks: `lock_pushes` of OP_1 under `unlock_pushes` of OP_1.
+        for (lock_pushes, unlock_pushes) in [
+            (1usize, 0usize),
+            (500, 498),
+            (500, 500),
+            (500, 501),
+            (1, 999),
+            (1, 1_000),
+        ] {
+            let parent = proven_funding(
+                vec![TransactionOutput::new(
+                    1_000,
+                    LockingScript::from_script(script(&ones(lock_pushes))),
+                )],
+                600_000,
+            );
+            let mut child = spend_of(&parent, &[0], &ones(unlock_pushes), 900);
+            child.version = version;
+            check(
+                format!("push-only v{version} {lock_pushes} + {unlock_pushes}"),
+                door_and_sdk(&parent, &child).await,
+            );
+        }
+        // A push-only lock at and around 10,000 bytes, under an empty unlock.
+        for total in [9_999usize, 10_000, 10_001] {
+            let mut lock = Vec::new();
+            for _ in 0..18 {
+                lock.extend(push_of(520));
+            }
+            let rest = total - lock.len();
+            lock.extend(push_of(rest - 3));
+            assert_eq!(lock.len(), total);
+            let parent = proven_funding(
+                vec![TransactionOutput::new(
+                    1_000,
+                    LockingScript::from_script(script(&lock)),
+                )],
+                600_000,
+            );
+            let mut child = spend_of(&parent, &[0], &[], 900);
+            child.version = version;
+            check(
+                format!("push-only lock v{version} {total} bytes"),
+                door_and_sdk(&parent, &child).await,
+            );
+        }
+    }
+    println!(
+        "p0811_c_c: {compared} spends compared ({valid} valid), {declined} declined, {} differ",
+        differ.len()
+    );
+    assert!(
+        differ.is_empty(),
+        "the door and bsv-rs differ:\n{}",
+        differ.join("\n")
+    );
+    assert!(compared >= 80 && valid >= 40 && declined >= 40);
+}
+
+/// The era is read per source (the lens's LOW): a BEEF holding a BUMP below
+/// the Genesis height and one above it. A push of 521 bytes (refused by the
+/// rules of a coin from before Genesis) spending the coin proven above Genesis
+/// is judged; the same push spending the coin proven below it is declined.
+/// On `1af62adf` the first was declined too (the era was the BEEF's).
+#[tokio::test]
+async fn p0811_c_d_the_era_is_read_per_source() {
+    let lock = |bytes: &[u8]| LockingScript::from_script(script(bytes));
+    let old = proven_funding(vec![TransactionOutput::new(1_000, lock(&[0x51]))], 600_000);
+    let new = proven_funding(
+        vec![TransactionOutput::new(1_000, lock(&[0x75, 0x51]))],
+        800_000,
+    );
+    let big = push_of(521);
+    let spend = |old_unlock: &[u8], new_unlock: &[u8]| {
+        let mut child = Transaction::new();
+        for (parent, unlock) in [(&old, old_unlock), (&new, new_unlock)] {
+            child.inputs.push(TransactionInput {
+                source_txid: Some(parent.id()),
+                source_output_index: 0,
+                unlocking_script: Some(UnlockingScript::from_script(script(unlock))),
+                ..Default::default()
+            });
+        }
+        child.outputs.push(TransactionOutput::new(
+            1_500,
+            LockingScript::from_script(script(&[0x51])),
+        ));
+        let mut beef = Beef::new();
+        for parent in [&old, &new] {
+            let bump = beef.merge_bump(parent.merkle_path.clone().unwrap());
+            beef.merge_raw_tx(parent.to_binary(), Some(bump));
+        }
+        beef.merge_raw_tx(child.to_binary(), None);
+        (beef.to_binary(), child.id())
+    };
+    let (beef, txid) = spend(&[], &big);
+    engine()
+        .verify_scripts_only(&beef, &txid)
+        .await
+        .expect("the post-Genesis coin's spend is judged beside an old BUMP");
+    let (beef, txid) = spend(&big, &[0x01, 0x42]);
+    let why = declined(engine().verify_scripts_only(&beef, &txid).await);
+    assert!(
+        why.contains("input 0") && why.contains("below the Genesis height"),
+        "{why}"
     );
 }
