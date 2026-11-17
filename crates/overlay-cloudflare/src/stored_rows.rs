@@ -287,16 +287,19 @@ impl Summary {
             if !self.read_linked(table, key, bytes, Some(txid)) {
                 return false;
             }
-            // The read a 0.7.2 build's GASP node made of this row: no txid.
-            if let Ok(unnamed) =
-                beef_limits::subject_from_beef(bytes, None, &beef_limits::STORED_BEEF_LIMITS)
+            // The read a 0.7.2 build's unnamed readers made of this row: the
+            // wire-last entry (every read now names its txid or takes the
+            // subject rule; this names a row such a reader would misread).
+            if let Some(last) = beef_limits::parse_beef(bytes, &beef_limits::STORED_BEEF_LIMITS)
+                .ok()
+                .and_then(|b| b.txs.last().map(bsv_rs::transaction::BeefTx::txid))
             {
-                if !unnamed.id().eq_ignore_ascii_case(txid) {
+                if !last.eq_ignore_ascii_case(txid) {
                     self.differs(
                         table,
                         key,
                         "unnamed_subject",
-                        &format!("a read naming no txid answers {}", unnamed.id()),
+                        &format!("a read naming no txid answered {last} (the wire-last entry)"),
                     );
                 }
             }

@@ -2356,11 +2356,10 @@ async fn submit_parts(
         .iter()
         .any(|t| overlay_discovery::name_matches(t, "tm_pot"))
     {
-        if let (Ok(tx), Ok(db)) = (
-            beef_limits::subject_from_beef(&tagged_beef.beef, None, &beef_limits::EF_BEEF_LIMITS),
+        if let (Some(txid), Ok(db)) = (
+            re_presented_join_txid(&tagged_beef.beef),
             env.d1("OVERLAY_DB"),
         ) {
-            let txid = tx.id();
             ctx.wait_until(async move {
                 crate::admit_fast::record_join_hop_spends_on(&db, &txid, "POST /submit re-present")
                     .await;
@@ -2940,6 +2939,16 @@ pub(crate) fn lookup_error_body(e: &EngineError) -> (serde_json::Value, u16) {
             status,
         ),
     }
+}
+
+/// bsv-low #837: the JOIN a re-present names, the submitted BEEF's subject by the house's one rule
+/// (`subject::subject_txid_of` through `beef_limits::subject_from_beef`'s unnamed read: the atomic name, the unique
+/// tip, then the reference's sorted-last), never the wire-last entry, so a body whose last entry is an ancestor
+/// records the JOIN's hop spends and not the ancestor's.
+fn re_presented_join_txid(beef: &[u8]) -> Option<String> {
+    beef_limits::subject_from_beef(beef, None, &beef_limits::EF_BEEF_LIMITS)
+        .ok()
+        .map(|tx| tx.id())
 }
 
 /// Serialize an OutputList into the aggregated binary lookup format.
@@ -5026,6 +5035,72 @@ pub fn not_found() -> worker::Result<Response> {
 
 #[cfg(test)]
 mod tests {
+    /// PORT-0811 fold: the two route reads that name no txid, #837's re-present and the aggregated lookup's
+    /// fallback (an output whose txid the engine did not hand over), read the subject by the house's rule over a
+    /// body whose wire-last entry is the subject's proven ancestor. On the base both answered the ancestor.
+    #[test]
+    fn p0811_f3_the_route_reads_naming_no_txid_take_the_subject_rule() {
+        use bsv_rs::script::{LockingScript, UnlockingScript};
+        use bsv_rs::transaction::{
+            MerklePath, MerklePathLeaf, Transaction, TransactionInput, TransactionOutput,
+        };
+        let mut parent = Transaction::new();
+        parent.inputs.push(TransactionInput {
+            source_txid: Some("aa".repeat(32)),
+            unlocking_script: Some(UnlockingScript::from_binary(&[]).unwrap()),
+            ..Default::default()
+        });
+        parent.outputs.push(TransactionOutput::new(
+            1_000,
+            LockingScript::from_binary(&[0x51]).unwrap(),
+        ));
+        let bump = MerklePath::new(
+            800_000,
+            vec![vec![MerklePathLeaf::new_txid(0, parent.id())]],
+        )
+        .unwrap();
+        let mut child = Transaction::new();
+        child.inputs.push(TransactionInput {
+            source_txid: Some(parent.id()),
+            unlocking_script: Some(UnlockingScript::from_binary(&[]).unwrap()),
+            ..Default::default()
+        });
+        child.outputs.push(TransactionOutput::new(
+            900,
+            LockingScript::from_binary(&[0x51]).unwrap(),
+        ));
+        // BEEF V1 by hand: one BUMP, the child, then its proven parent last.
+        let mut body = vec![0x01, 0x00, 0xbe, 0xef, 0x01];
+        body.extend(bump.to_binary());
+        body.push(0x02);
+        body.extend(child.to_binary());
+        body.push(0x00);
+        body.extend(parent.to_binary());
+        body.extend([0x01, 0x00]);
+        assert_eq!(
+            beef_limits::read_beef(&body).unwrap().last_txid.as_deref(),
+            Some(parent.id().as_str()),
+            "the premise: the wire-last entry is the ancestor"
+        );
+        assert_eq!(
+            re_presented_join_txid(&body),
+            Some(child.id()),
+            "#837's re-present"
+        );
+        let output = overlay_engine::types::OutputListItem {
+            beef: body,
+            output_index: 0,
+            context: None,
+        };
+        let served = serialize_aggregated_lookup(std::slice::from_ref(&output), &[]).unwrap();
+        assert_eq!(served[0], 1, "one output");
+        assert_eq!(
+            hex::encode(&served[1..33]),
+            child.id(),
+            "the aggregated lookup's fallback names the subject"
+        );
+    }
+
     /// bsv-low #819: a refused lookup query is the coded 400, the service's
     /// sentence its `description`; any other fault keeps its body.
     #[test]

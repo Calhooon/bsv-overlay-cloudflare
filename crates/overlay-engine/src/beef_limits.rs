@@ -266,17 +266,25 @@ pub fn parse_beef(bytes: &[u8], _door: &BeefLimits) -> bsv_rs::Result<Beef> {
     Beef::from_binary(bytes)
 }
 
-/// The subject a read names: the explicit txid, then the atomic txid, then
-/// the wire-last entry (the SDK's target selection, `Transaction::from_beef`).
-fn target_of(parsed: &Beef, txid: Option<&str>) -> bsv_rs::Result<String> {
-    txid.map(str::to_string)
-        .or_else(|| parsed.atomic_txid.clone())
-        .or_else(|| parsed.txs.last().map(bsv_rs::transaction::BeefTx::txid))
+/// The subject a read names: the explicit txid, then the atomic txid, then,
+/// for a read that names none, the house's ONE subject rule
+/// ([`crate::subject::subject_txid_of`]: the unique tip, else the reference's
+/// sorted-last), never the wire-last entry (a BEEF whose last entry is an
+/// ancestor, a 0.7.2 build's stored order among them, names its subject by
+/// its graph, not by its order).
+fn target_of(parsed: &mut Beef, txid: Option<&str>) -> bsv_rs::Result<String> {
+    if let Some(txid) = txid {
+        return Ok(txid.to_string());
+    }
+    if let Some(atomic) = parsed.atomic_txid.clone() {
+        return Ok(atomic);
+    }
+    crate::subject::subject_txid_of(parsed)
         .ok_or_else(|| bsv_rs::Error::TransactionError("No transactions in BEEF".into()))
 }
 
-/// Link from the door's parse, keeping the SDK's exact target selection:
-/// explicit txid, then atomic txid, then wire-last.
+/// Link from the door's parse: the explicit txid, then the atomic txid, then
+/// the subject rule (`target_of`).
 ///
 /// The link runs under bsv-rs 0.8.11's default link bound
 /// ([`BeefLinkLimits::default`], 16 MiB of re-materialized shared-parent
@@ -301,8 +309,8 @@ pub fn transaction_from_beef_with(
     door: &BeefLimits,
     limits: &BeefLinkLimits,
 ) -> bsv_rs::Result<Transaction> {
-    let parsed = parse_beef(bytes, door)?;
-    let target = target_of(&parsed, txid)?;
+    let mut parsed = parse_beef(bytes, door)?;
+    let target = target_of(&mut parsed, txid)?;
     parsed
         .find_atomic_transaction_limited(&target, limits)?
         .ok_or_else(|| {
@@ -322,8 +330,8 @@ pub fn subject_from_beef(
     txid: Option<&str>,
     door: &BeefLimits,
 ) -> bsv_rs::Result<Transaction> {
-    let parsed = parse_beef(bytes, door)?;
-    let target = target_of(&parsed, txid)?;
+    let mut parsed = parse_beef(bytes, door)?;
+    let target = target_of(&mut parsed, txid)?;
     let mut tx = parsed
         .find_txid(&target)
         .and_then(|entry| entry.tx().cloned())
