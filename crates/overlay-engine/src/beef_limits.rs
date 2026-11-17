@@ -391,8 +391,7 @@ pub fn link_heap_estimate(beef: &Beef, txid: &str, stop_at: u64) -> LinkHeap {
             .saturating_add(LINK_CHARGE_WIRE_BYTE.saturating_mul(tx.to_binary().len() as u64))
     };
     let bump_weight = |bump: &MerklePath| -> u64 {
-        LINK_CHARGE_BUMP_LEAF
-            .saturating_mul(bump.path.iter().map(|l| l.len() as u64).sum::<u64>())
+        LINK_CHARGE_BUMP_LEAF.saturating_mul(bump.path.iter().map(|l| l.len() as u64).sum::<u64>())
     };
     let mut heap = LinkHeap {
         linear: LINK_CHARGE_INDEX_LEAF.saturating_mul(index_leaves),
@@ -475,7 +474,7 @@ fn link_bounded(beef: &Beef, txid: &str) -> bsv_rs::Result<Option<Transaction>> 
 /// the subject rule (`target_of`).
 ///
 /// The link runs under the engine's link bound ([`LINK_HEAP_MAX_BYTES`] of
-/// heap, [`link_bounded`]). A bound's trip is
+/// heap, `link_bounded`). A bound's trip is
 /// `Err(bsv_rs::Error::BeefResourceLimit)` ([`is_link_bound`]), never an
 /// invalid BEEF and never an absent txid: each caller classifies it by the
 /// rule of its own door. A caller that reads the subject's own fields alone
@@ -519,7 +518,7 @@ pub fn subject_from_beef(
 }
 
 /// `txid` linked out of a parsed BEEF under the engine's link bound
-/// ([`link_bounded`]): `Ok(None)` when the BEEF does not carry its body,
+/// (`link_bounded`): `Ok(None)` when the BEEF does not carry its body,
 /// `Err` when the bound declines ([`is_link_bound`]).
 /// `Beef::find_atomic_transaction` answers `None` for both, so no reader of
 /// this crate calls it.
