@@ -20,42 +20,77 @@ so a JSON file that parses gives only the string values whose KEY names a secret
 that does not parse is read as text.
 
 THE EXTRACTION RULE (a candidate is a value that can grant authority, with or without a name beside it). A TOKEN is
-a maximal run of credential characters [A-Za-z0-9_+/=-].
+a maximal run of credential characters [A-Za-z0-9_+/-] with up to two trailing `=` (Base64 padding). A vault is
+written by a person: most of its lines are prose, headings and command lines, and a name, a word or a date in them
+is no value. Every rule below is derived from what a value IS, never from a list of strings.
 
   TAKEN:
-  (a) NAMED values: the value of `NAME=value`, `NAME: value` or a table row's Value cell (by its header) whose name
-      says secret (SECRET_NAME: key, token, secret, password, passphrase, wif, seed, mnemonic, credential, bearer,
-      auth, xprv, private): the whole value, quotes and backticks stripped, at least 8 characters, whatever its
-      characters (a password may hold punctuation).
-  (b) MARKED values: the rest of a line after `Enter:`, `Paste:`, `Value:`, `Secret:` or `Password:` (a leading `#`
-      or `>` allowed), at least 8 characters: the value a `wrangler secret put` prompt was given.
-  (c) Values AFTER A SECRET-SETTING COMMAND (`secret put`, `secret set`, `secrets set`, `secret bulk`, `set-secret`):
-      on each of the next three non-blank lines, every token of at least 12 characters that is not a NAME (below):
-      a value pasted bare into a code block under the command.
-  (d) UNNAMED tokens anywhere: hex of at least 32 digits (keys, tokens, account ids, seeds); a UUID (database and
-      namespace ids, which this repository's config check already forbids in public text: chosen to be taken); a
-      token of at least 20 characters holding an upper-case letter, a lower-case letter and a digit (Base64 and
-      Base58 secrets: API tokens, WIFs, extended keys); a token of at least 24 characters holding letters and
-      digits with no `-` or `_` (lower-case API keys).
+  (a) NAMED values: what `NAME=value`, `NAME: value`, a table row's Value cell (by its header) or a URL's query
+      parameter (`?key=value`) records, where the name says secret (SECRET_NAME: key, token, secret, password,
+      passphrase, wif, seed, mnemonic, credential, bearer, auth, xprv, private). What is recorded is read by THE
+      FIELD RULE: the text after the separator, cut at a comment (` #`), a table cell's end (` |`), a shell operator
+      (` &&`, `; `) or the next `NAME=` of the line. ONE token, or ONE quoted string, is the value (at least 8
+      characters, whatever its characters: a password may hold punctuation). Text holding whitespace that is not
+      one quoted string is PROSE (`key: the one we rotated`, `KEY: (generate fresh ...)`): it gives only the quoted
+      single tokens inside it, and a passphrase by the passphrase rule; rule (d) still reads its line. A URL's
+      query value is taken whatever its shape (the parameter's name is the record), never the URL's host or path.
+  (b) MARKED values: what follows `Enter:`, `Paste:`, `Value:`, `Secret:` or `Password:` at a line's start (a
+      leading `#` or `>` allowed), read by the field rule: the value a `wrangler secret put` prompt was given.
+  (c) A SECRET-SETTING COMMAND (`secret put`, `secret set`, `secrets set`, `secret bulk`, `set-secret`): its own
+      arguments are names, flags and file names, never values; what its line gives is the value FED to it (the
+      quoted strings and bare words after `echo`/`printf` before the `|` that pipes into it, or a `<<<` here-string).
+      On each of the next three non-blank lines, every token of at least 12 characters that is not a name, a date,
+      a placeholder or letters only: a value pasted bare into a code block under the command. A heading that names
+      such a command opens the window too (it gives nothing itself).
+  (d) UNNAMED tokens anywhere (headings included): hex of at least 32 digits (keys, tokens, account ids, seeds); a
+      UUID (database and namespace ids, which this repository's config check already forbids in public text:
+      chosen to be taken); a token of at least 20 characters holding an upper-case letter, a lower-case letter and a
+      digit (Base64 and Base58 secrets: API tokens, WIFs, extended keys); a token of at least 24 characters holding
+      letters and digits with no `-` or `_` (lower-case API keys).
+
+  THE PASSPHRASE RULE (a secret recorded as words, under a secret's name): a QUOTED string of at least three words
+  and 12 characters is taken whole; UNQUOTED, at least six words of 3 to 8 lower-case letters each, single-spaced
+  (a BIP39 mnemonic is 12 to 24 such words). Its cost both ways: a passphrase of fewer than six unquoted words, or
+  with a capital, a digit or punctuation, recorded unquoted, is NOT taken (quote it in the vault, or rule (d) takes
+  it when it is credential-shaped); words joined by `-` or `_` are a NAME (below), so a hyphenated diceware phrase
+  is not taken; and prose of six or more short lower-case words with no punctuation after a secret's name IS taken,
+  which costs a false refusal only if that exact phrase is in the tree.
 
   NOT TAKEN (each is public by construction, or names a thing rather than granting authority):
+  - THE NAME RULE, under every rule: an UPPER_CASE_NAME (an environment variable's name, `TAAL_API_KEY`, with or
+    without a trailing `=`; or one upper-case word); one word of letters (lower case, capitalised or upper case);
+    lower-case words and digits joined by `-`, `_` or `.` (a Worker, bucket, queue, host or file name: each part
+    letters only, digits only, or at most 15 characters, so a long mixed run inside is a key, not a name); a file
+    name (`name.ext`); a path of names; a flag (`--config`). The exceptions: a UUID; a URL query value under a
+    secret name; the house's CI placeholder recorded under a secret's name (below). Its cost: a weak password of
+    letters only, or of words joined by `-` (`hunter-two`), recorded under a secret's name is not taken; one word
+    WITH digits (`sunshine2024`) is;
+  - a date, a time or a number (digits with `-`, `:`, `.`, `T`, `Z`, `+`, `/`): an ISO timestamp, a height;
+  - a HEADING of a Markdown vault file (`.md` or no suffix; `#` to `######` outside a fenced block): a title, never a record, so rules (a) to
+    (c) give nothing from it; unless the whole heading is one record (`# NAME=value`, `# Enter: value`);
   - a compressed public key (66 hex, `02`/`03`) or an uncompressed one (130 hex, `04`): public by definition;
   - a Base58 address (25 to 35 Base58 characters starting `1`, `3`, `m`, `n` or `2` whose Base58Check checksum
     verifies over 21 bytes of a P2PKH or P2SH version): public (an unverified token of that look is taken);
-  - a NAME: a hostname or URL (they hold `.` or `://`, which no token holds; a URL's query value whose parameter
-    name says secret is taken by (a)), a Worker, database, bucket or queue name (lower-case words joined by `-` or
-    `_`, which (d) never takes);
+  - a hostname or URL (they hold `.` or `://`, which no token holds);
   - an unnamed token on a line that LABELS it public: txid, transaction, hash, sha, digest, commit, block, merkle,
     root, outpoint, address, public key, pubkey, identity key; unless the same line also says secret
     (SECRET_NAME), when the label does not apply;
-  - a value shorter than its rule's minimum, or one of fewer than 6 distinct characters (a placeholder: `xxxx...`,
-    `000...`, `<your-token>`).
+  - a value shorter than its rule's minimum, or one of fewer than 6 distinct characters, or one starting `<`, `$`
+    or `%` (a placeholder or a variable: `xxxx...`, `<your-token>`, `$TOKEN`, `%s`).
   Hex values are compared in lower and upper case. Every comparison is a fixed-string search of the scanned bytes,
   so a value is found inside a longer line, a quoted list, a URL or a JSON string.
 
   A COLLISION (a public value the vault records unlabelled, then found in the repository) is fixed in the VAULT
   (label its line as a txid, a hash, an address...) or by a derived exclusion above, never by a list of strings in
-  this repository: such a list would itself be secret-shaped strings in a public place.
+  this repository: such a list would itself be secret-shaped strings in a public place. `--vault-report` shows the
+  operator what is taken without showing a value.
+
+THE CI PLACEHOLDER: the route tiers seed their Workers with `--var NAME:ci-...` (a fixed word the tier reads back).
+A value that is `ci-` followed by lower-case letters and digits joined by `-` (CI_PLACEHOLDER, the whole run the
+shape captured) is not a credential by its SHAPE: the same expression as `.gitleaks.toml`'s allowlist
+`^ci-[a-z0-9-]+$` (pinned equal), each applied to the value its own rule captures. It is still refused when the
+VAULT holds that exact string: recorded under a secret's name the vault says it is a value, so the name rule does
+not drop it there.
 
 NO VAULT (the hosted CI; a host whose vault is a stub; `--no-vault`): the shapes are still judged, and ONE line says
 the vault's values were not compared and why (on stderr, as a WARNING, in the pre-push door). It never fails a scan.
@@ -68,6 +103,9 @@ MODES:
   --commits REVSPEC...   every blob the commits of `git rev-list REVSPEC...` add or modify (a hosted job scanning a
                          pull request's commits: `--commits BASE..HEAD`);
   --no-vault             with any of the above: shapes only, the vault not read;
+  --vault-report         the vault's extraction, audited without a value: per vault file, how many values each rule
+                         took, and for each its line, rule, length and character class (hex, one lower-case word,
+                         words joined, UPPER_CASE_NAME, mixed, holds punctuation); never a value nor any part of one;
   --self-test            synthetic vault folders and synthetic repositories only, never the real vault.
 
 Exit status: 0 clean, 1 a finding (or an unreadable tracked path), 2 a usage error.
@@ -95,7 +133,7 @@ SHAPES = (
     ("an AWS access key id", re.compile(rb"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])")),
     ("a PEM private key", re.compile(rb"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE" rb" KEY(?: BLOCK)?-----")),
     ("a secret-named assignment", re.compile(
-        rb"\b[A-Z0-9_]*(?:API_TOKEN|API_KEY|AUTH_TOKEN|PASSWORD)[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9_+/=-]{16,}", re.I)),
+        rb"\b[A-Z0-9_]*(?:API_TOKEN|API_KEY|AUTH_TOKEN|PASSWORD)[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_+/=-]{16,})", re.I)),
     ("a Slack token", re.compile(rb"xox[abeprs]-[0-9A-Za-z-]{10,}")),
     ("a Stripe live secret key", re.compile(rb"(?:sk|rk)_live_[0-9A-Za-z]{24,}")),
     ("a Google API key", re.compile(rb"AIza[0-9A-Za-z_-]{35}")),
@@ -144,13 +182,27 @@ SECRET_NAME = re.compile(
 PUBLIC_LABEL = re.compile(
     r"txid|tx[ _-]?id|transaction|hash|\bsha|digest|commit|block|merkle|\broot\b|outpoint|address"
     r"|public[ _-]?key|pubkey|identity[ _-]?key", re.I)
-MARKED = re.compile(r"^\s*(?:[#>]\s*)?(?:enter|paste|value|secret|password)\s*:\s*(\S.*?)\s*$", re.I)
+MARKED = re.compile(r"^\s*(?:[#>]\s*)?(?:enter|paste|value|secret|password)\s*:\s*(.*?)\s*$", re.I)
 SETTER = re.compile(r"secrets?[ :-](?:put|set|bulk)|set-secret", re.I)
 TOKEN = re.compile(r"[A-Za-z0-9_+/-]+={0,2}")  # `=` only as Base64 padding: `NAME=value` is two tokens
-NAME_LIKE = re.compile(r"[a-z0-9]+(?:[-_][a-z0-9]+)+")
+NAMED = re.compile(r"([A-Za-z][A-Za-z0-9_.-]*)[\"'`]?\s*(?:=|:\s)\s*")  # a record's name and its separator
+NEXT_RECORD = re.compile(r"\s[A-Za-z][A-Za-z0-9_.-]*[\"'`]?\s*(?:=|:\s)")
+URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'`<>|]+")
+QUERY = re.compile(r"[?&]([A-Za-z0-9_.-]+)=([^&#\s\"'`]+)")
+QUOTED = re.compile(r"([\"'`])(.*?)\1")
+FENCE = re.compile(r"^\s*(?:```|~~~)")
+HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(\S.*?)\s*$")
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 B58_ADDRESS = re.compile(r"[13mn2][1-9A-HJ-NP-Za-km-z]{24,34}")
 HEX = re.compile(r"[0-9a-fA-F]+")
+# THE HOUSE'S CI PLACEHOLDER: `ci-` then lower-case words and digits joined by `-` (the route tiers' `--var NAME:ci-...`).
+# The same expression as `.gitleaks.toml`'s allowlist (`^ci-[a-z0-9-]+$`, over the value its rule captures).
+CI_PLACEHOLDER = re.compile(r"ci-[a-z0-9-]+")
+CI_PLACEHOLDER_BYTES = re.compile(CI_PLACEHOLDER.pattern.encode())
+WORD = re.compile(r"[a-z]+|[A-Z][a-z]+|[A-Z]+")
+FILE_NAME = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.[a-z][a-z0-9]{0,4}")
+DATE_OR_NUMBER = re.compile(r"[0-9][0-9TZ:.+/-]*")
+MNEMONIC_WORD = re.compile(r"[a-z]{3,8}")
 
 
 def is_public(value):
@@ -167,12 +219,102 @@ def is_public(value):
 
 
 def placeholder(value):
-    return len(set(value)) < 6 or value.startswith("<") or value.lower().startswith(("your-", "your_"))
+    return (len(set(value)) < 6 or value.startswith(("<", "$", "%"))
+            or value.lower().startswith(("your-", "your_")))
+
+
+def is_upper_name(value):
+    """An environment variable's name (`TAAL_API_KEY`, `TAAL_API_KEY=`), or one upper-case word."""
+    bare = value[:-1] if value.endswith("=") else value
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9_]*", bare)) and ("_" in bare or bare.isalpha())
+
+
+def is_name(value):
+    """THE NAME RULE: a value of one of these shapes names a thing and grants nothing, under every rule."""
+    if UUID.fullmatch(value):
+        return False  # a database or namespace id: taken (rule d)
+    if is_upper_name(value) or WORD.fullmatch(value) or value.startswith("-"):
+        return True
+    if FILE_NAME.fullmatch(value):
+        return True
+    parts = re.split(r"[-_.]", value)
+    if len(parts) > 1 and all(re.fullmatch(r"[a-z0-9]+", part) for part in parts) and re.search(r"[a-z]", value) \
+            and all(part.isalpha() or part.isdigit() or len(part) <= 15 for part in parts):
+        return True  # lower-case words joined by `-`, `_` or `.`: a Worker, bucket, queue, host or file name
+    if "/" in value and all(not seg or is_name(seg) or seg.isdigit() for seg in value.split("/")):
+        return True  # a path of names
+    return False
+
+
+def value_of(value, minimum=8, named=False, name_exempt=False):
+    """One recorded token as a value, or None. `named`: recorded under a secret name (rules a, b, json)."""
+    value = value.strip().strip("`\"'").rstrip(",;").strip()
+    if len(value) < minimum or re.search(r"\s", value) or "://" in value:
+        return None
+    if placeholder(value) or is_public(value):
+        return None
+    if DATE_OR_NUMBER.fullmatch(value) or re.fullmatch(r"true|false|yes|no|null|none", value, re.I):
+        return None
+    if named and CI_PLACEHOLDER.fullmatch(value):
+        return value  # the CI placeholder's shape recorded AS a secret's value: the vault says it is one
+    if not name_exempt and is_name(value):
+        return None
+    return value
+
+
+def passphrase(text, quoted):
+    """THE PASSPHRASE RULE: words a secret's name records, taken whole (the exact text recorded)."""
+    words = text.split()
+    if quoted:
+        return text if len(words) >= 3 and len(text) >= 12 and not placeholder(text) else None
+    if len(words) >= 6 and all(MNEMONIC_WORD.fullmatch(word) for word in words) and " ".join(words) == text:
+        return text
+    return None
+
+
+def cut_field(field):
+    """The recorded value's own text: up to a comment, a table cell's end, a shell operator or the next record."""
+    for pattern in (r"\s#", r"\s\|", r"\s&&", r";\s", NEXT_RECORD.pattern):
+        match = re.search(pattern, field)
+        if match:
+            field = field[:match.start()]
+    return field.rstrip(" \\").strip()
+
+
+def field_values(field, minimum=8):
+    """THE FIELD RULE: what a secret's name (rules a and b) records. One token, or one quoted string, is a value;
+    text holding whitespace that is not one quoted string is PROSE, which gives only its quoted single tokens (and
+    a passphrase by the passphrase rule)."""
+    field = field.strip()
+    quoted = QUOTED.match(field)
+    if quoted:
+        content = quoted.group(2)
+        if re.search(r"\s", content.strip()):
+            found = passphrase(content.strip(), quoted=True)
+            return [found] if found else []
+        found = value_of(content, minimum, named=True)
+        return [found] if found else []
+    field = cut_field(field)
+    if not field:
+        return []
+    if not re.search(r"\s", field):
+        found = value_of(field, minimum, named=True)
+        return [found] if found else []
+    found = passphrase(field, quoted=False)
+    if found:
+        return [found]
+    out = []
+    for match in QUOTED.finditer(field):
+        if not re.search(r"\s", match.group(2)):
+            found = value_of(match.group(2), minimum, named=True)
+            if found:
+                out.append(found)
+    return out
 
 
 def unnamed_candidate(token):
     """Rule (d): an unnamed token that can grant authority."""
-    if is_public(token) or placeholder(token):
+    if is_public(token) or placeholder(token) or is_upper_name(token):
         return False
     if UUID.fullmatch(token):
         return True
@@ -185,67 +327,99 @@ def unnamed_candidate(token):
     return len(token) >= 24 and (upper or lower) and digit and "-" not in token and "_" not in token
 
 
-def named_candidate(value, minimum=8):
-    """Rules (a) and (b): an explicitly recorded value."""
-    value = value.strip().strip("`\"' ")
-    if len(value) < minimum or placeholder(value) or is_public(value):
-        return None
-    if "://" in value or " " in value or (TOKEN.fullmatch(value) and NAME_LIKE.fullmatch(value)):
-        return None
-    if re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", value):  # a hostname
-        return None
-    if re.fullmatch(r"[0-9]+|true|false|yes|no|null|none", value, re.I):
-        return None
-    return value
+def piped_values(line, setter_at):
+    """Rule (c) on the setter's own line: the value piped (or here-string fed) into the command, never its arguments."""
+    out = []
+    left = line[:setter_at]
+    if "|" in left:
+        source = left[:left.rindex("|")]
+        feeder = re.search(r"\b(?:echo|printf)\b(.*)$", source)
+        if feeder:
+            rest = feeder.group(1)
+            for match in QUOTED.finditer(rest):
+                out.append(match.group(2))
+            for token in QUOTED.sub(" ", rest).split():
+                out.append(token)
+    here = re.search(r"<<<\s*(?:([\"'`])(.*?)\1|(\S+))", line)
+    if here:
+        out.append(here.group(2) if here.group(2) is not None else here.group(3))
+    return [found for found in (value_of(value) for value in out) if found]
 
 
-def text_values(text):
-    """Yield (line number, value) for every value the extraction rule takes from a text file."""
+def text_values(text, markdown=True):
+    """Yield (line number, value, rule) for every value the extraction rule takes from a text file."""
     columns = None
     after_setter = 0
+    fenced = False
     for number, line in enumerate(text.splitlines(), 1):
         stripped = line.strip()
+        if markdown and FENCE.match(line):
+            fenced = not fenced
+        heading = markdown and not fenced and HEADING.match(line)
+        if heading and not re.fullmatch(r"(?:[A-Za-z][A-Za-z0-9_.-]*\s*(?:=|:\s)|(?:enter|paste|value|secret|"
+                                        r"password)\s*:)\s*\S+", heading.group(1), re.I):
+            # a heading is a title, never a record (unless the whole heading IS one record): rule (d) alone reads
+            # it; a heading naming a secret-setting command still opens rule (c)'s window over the lines below
+            if SETTER.search(line):
+                after_setter = 3
+            yield from _unnamed(number, line)
+            continue
+        masked = URL.sub(lambda m: " " * len(m.group()), line)
+        # a URL's query parameter whose name says secret: its value, whatever its shape
+        for url in URL.finditer(line):
+            for match in QUERY.finditer(url.group()):
+                if SECRET_NAME.search(match.group(1)):
+                    found = value_of(match.group(2), name_exempt=True)
+                    if found:
+                        yield number, found, "(a) url query"
         # (a) a table's Value cell, named by its header
         if stripped.startswith("|"):
-            cells = [cell.strip().strip("`\"' ") for cell in stripped.strip("|").split("|")]
-            headers = [cell.lower() for cell in cells]
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            headers = [cell.strip("`\"' ").lower() for cell in cells]
             value_column = next((i for i, cell in enumerate(headers) if cell.startswith("value")), None)
             if value_column is not None:
                 name_column = next((i for i, cell in enumerate(headers)
                                     if cell in ("secret", "name", "key", "variable", "field", "item")), None)
                 columns = (name_column, value_column) if name_column is not None else None
             elif columns and max(columns) < len(cells) and SECRET_NAME.search(cells[columns[0]]):
-                value = named_candidate(cells[columns[1]])
-                if value:
-                    yield number, value
+                for found in field_values(cells[columns[1]]):
+                    yield number, found, "(a) table"
         else:
             columns = None
-        # (a) NAME=value, NAME: value (and a URL's secret-named query parameter)
-        for match in re.finditer(r"([A-Za-z][A-Za-z0-9_.-]*)[\"'`]?\s*(?:=|:\s)\s*[\"'`]?([^\s\"'`|&]+)", line):
+        # (a) NAME=value, NAME: value
+        for match in NAMED.finditer(masked):
             if SECRET_NAME.search(match.group(1)):
-                value = named_candidate(match.group(2))
-                if value:
-                    yield number, value
+                for found in field_values(masked[match.end():]):
+                    yield number, found, "(a) named"
         # (b) a marked value
-        marked = MARKED.match(line)
+        marked = MARKED.match(masked)
         if marked:
-            value = named_candidate(marked.group(1))
-            if value:
-                yield number, value
-        # (c) the lines after a secret-setting command
-        if after_setter and stripped:
-            after_setter -= 1
-            for token in TOKEN.findall(line):
-                if len(token) >= 12 and not NAME_LIKE.fullmatch(token) and not placeholder(token) \
-                        and not is_public(token) and not token.isalpha():
-                    yield number, token
-        if SETTER.search(line):
+            for found in field_values(marked.group(1)):
+                yield number, found, "(b) marked"
+        # (c) a secret-setting command: on its own line only the value piped into it; on the next three non-blank
+        # lines every token of 12 or more characters that is not a name, a date or a placeholder
+        setter = SETTER.search(masked)
+        if setter:
+            for found in piped_values(masked, setter.start()):
+                yield number, found, "(c) piped"
             after_setter = 3
-        # (d) unnamed tokens, unless the line labels them public and says nothing secret
-        labelled = PUBLIC_LABEL.search(line) and not SECRET_NAME.search(PUBLIC_LABEL.sub("", line))
-        for token in TOKEN.findall(line):
-            if unnamed_candidate(token) and not labelled:
-                yield number, token
+        elif after_setter and stripped:
+            after_setter -= 1
+            for token in TOKEN.findall(masked):
+                found = value_of(token, minimum=12)
+                if found and not found.isalpha():
+                    yield number, found, "(c) after a command"
+        yield from _unnamed(number, line)
+
+
+def _unnamed(number, line):
+    """(d) unnamed tokens, unless the line labels them public and says nothing secret."""
+    labelled = PUBLIC_LABEL.search(line) and not SECRET_NAME.search(PUBLIC_LABEL.sub("", line))
+    if labelled:
+        return
+    for token in TOKEN.findall(line):
+        if unnamed_candidate(token):
+            yield number, token, "(d) unnamed"
 
 
 def json_values(document):
@@ -258,9 +432,23 @@ def json_values(document):
         elif isinstance(node, list):
             stack.extend((key, item) for item in node)
         elif isinstance(node, str) and key is not None and SECRET_NAME.search(str(key)):
-            value = named_candidate(node)
-            if value:
-                yield value
+            for found in field_values(json.dumps(node) if re.search(r"\s", node) else node):
+                yield found
+
+
+def char_class(value):
+    """The character class `--vault-report` prints for a taken value (never the value)."""
+    if HEX.fullmatch(value):
+        return "hex"
+    if re.fullmatch(r"[a-z]+", value):
+        return "one lower-case word"
+    if is_upper_name(value):
+        return "UPPER_CASE_NAME"
+    if re.fullmatch(r"[A-Za-z0-9]+(?:[-_ ][A-Za-z0-9]+)+", value):
+        return "words joined"
+    if re.fullmatch(r"[A-Za-z0-9+/=]+", value):
+        return "mixed"
+    return "holds punctuation"
 
 
 class Vault:
@@ -269,6 +457,8 @@ class Vault:
     def __init__(self, folder=None, disabled=None):
         self.values = {}  # bytes -> (file name, line number or None)
         self.skipped = []
+        self.read = []
+        self.report = []  # (file, line, rule, length, character class): what `--vault-report` prints, never a value
         self.reason = disabled
         if disabled:
             return
@@ -293,12 +483,20 @@ class Vault:
             found = None
             if path.suffix.lower() == ".json":
                 try:
-                    found = [(None, value) for value in json_values(json.loads(text))]
+                    found = [(None, value, "json named") for value in json_values(json.loads(text))]
                 except ValueError:
                     found = None
-            for number, value in found if found is not None else text_values(text):
+            if found is None:
+                found = text_values(text, markdown=path.suffix.lower() in (".md", ""))
+            self.read.append(str(relative))
+            rows = {}  # (line, value) -> its row: one row per taken value, naming every rule that took it
+            for number, value, rule in found:
+                row = rows.setdefault((number, value), [str(relative), number, [], len(value), char_class(value)])
+                if rule not in row[2]:
+                    row[2].append(rule)
                 for variant in ({value.lower(), value.upper()} if HEX.fullmatch(value) else {value}):
                     self.values.setdefault(variant.encode(), (str(relative), number))
+            self.report += [(row[0], row[1], " + ".join(row[2]), row[3], row[4]) for row in rows.values()]
         if not self.values:
             self.reason = f"the vault folder {self.shown(folder)} holds no value this rule takes (a stub?)"
 
@@ -314,6 +512,27 @@ class Vault:
             return None
         return (f"check-secrets: WARNING: the vault's values were NOT compared ({self.reason}); "
                 "only credential shapes were judged")
+
+    def report_lines(self):
+        """`--vault-report`: per vault file, how many values each rule took, and for each taken value its line, rule,
+        length and character class. Never a value, nor any part of one."""
+        lines = [f"check-secrets: vault report: {len(self.read)} file(s) read, {len(self.skipped)} not read"]
+        if self.reason:
+            lines.append(f"check-secrets: {self.reason}")
+        for name in self.read:
+            rows = [row for row in self.report if row[0] == name]
+            counts = {}
+            for row in rows:
+                for rule in row[2].split(" + "):
+                    counts[rule] = counts.get(rule, 0) + 1
+            lines.append(f"{name}: {len(rows)} value(s) taken"
+                         + "".join(f"; {rule} {count}" for rule, count in sorted(counts.items())))
+            for _, number, rule, length, klass in rows:
+                where = f"line {number}" if number else "(json)"
+                lines.append(f"  {where}: {rule}, length {length}, {klass}")
+        for name in self.skipped:
+            lines.append(f"{name}: not read (binary, too large or not text)")
+        return lines
 
     def skipped_notice(self):
         if not self.skipped:
@@ -372,6 +591,8 @@ def findings(data, vault, matcher):
     hits = set()
     for name, pattern in SHAPES:
         for match in pattern.finditer(data):
+            if pattern.groups and CI_PLACEHOLDER_BYTES.fullmatch(match.group(1)):
+                continue  # the house's CI placeholder: not a credential by its shape (a vault value still is)
             hits.add((match.start(), name))
     hits.update(bitcoin_key_hits(data))
     for offset, value in matcher.find(data):
@@ -563,6 +784,109 @@ def self_test():
         assert hit(f'"{wif}"', no_vault) == [(1, "a Bitcoin WIF private key")]
         assert not hit(wif[:-1] + ("2" if wif[-1] != "2" else "3"), no_vault), "a bad-checksum WIF shape is GREEN"
 
+        # THE TEN SHAPES a real vault's prose and command lines take (synthetic words, the shapes exact): each wrong
+        # token is NOT taken; where the shape holds a real value it IS taken
+        wr = random.Random(23)
+
+        def w(n, letters="abcdefghijklmnopqrstuvwxyz"):
+            return "".join(wr.choice(letters) for _ in range(n))
+
+        def W(n):
+            return w(n).upper()
+
+        def h(n):
+            return w(n, "0123456789abcdef")
+
+        def x(n, letters="abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"):
+            return w(n - 3, letters) + "aZ7" if n >= 3 else w(n, letters)
+
+        def took(text, markdown=True):
+            return {value for _, value, _ in text_values(text, markdown)}
+
+        shape = {}
+        w11 = w(11)
+        title = w(6) + "2026)"
+        shape[1] = (f"## {x(3)} {w(8)} {w(8)} ({w(4)} app-{w(5)} {W(8)}_TOKEN = {w11} TIP_{W(7)}_{W(5)})\n"
+                    f"## {w(5)} ({W(4)}_TOKEN: {title}\n", [w11, title, title[:-1]], [])
+        w12 = w(12)
+        shape[2] = ("```sh\n# " + x(4) + "'s dev key: " + w12 + " NOT " + w(6) + " " + w(4) + " (old)\n```\n"
+                    "# " + x(4) + "'s dev key: " + w12 + " NOT " + w(6) + " " + w(4) + " (old)\n", [w12], [])
+        name3, hex3 = W(6) + "_" + W(7) + "_KEY", plant(h(64))
+        shape[3] = ("## Deploy (`wrangler secret put`)\n- " + name3 + ": " + hex3 + "\n", [name3], [hex3])
+        name4 = W(4) + "_" + W(8)
+        shape[4] = ("wrangler secret put " + W(5) + "_KEY\n" + 'wrangler kv:namespace create "' + name4 + '"\n',
+                    [name4], [])
+        name5, env5 = W(4) + "_API_KEY", w(12) + "2"
+        shape[5] = ("wrangler secret put " + W(4) + "_KEY\n" + "wrangler secret put " + name5
+                    + " --config wrangler." + w(10) + ".toml --env " + env5 + "\n", [name5, "--config", env5], [])
+        name6, hex6 = W(5) + "_" + W(6) + "_" + W(7) + "_KEY", plant(h(64))
+        piped6 = plant(w(6) + "#" + w(4) + "!9")
+        shape[6] = ("wrangler secret put " + W(4) + "_KEY\n" + 'echo "' + hex6 + '" | npx wrangler secret put '
+                    + name6 + "\n" + "printf '%s' '" + piped6 + "' | wrangler secret put " + name6 + "\n",
+                    [name6, "%s"], [hex6, piped6])
+        shape[7] = ("wrangler secret put " + W(4) + "_KEY\n" + "## " + w(6) + " (synced 2026-10-14T09:31Z by "
+                    + w(3) + "; " + w(4) + " id " + h(32) + "; ok)\n- synced 2026-10-14T09:31Z by " + w(3) + "\n",
+                    ["2026-10-14T09", "2026-10-14T09:31Z"], [])
+        shape[8] = ("- " + W(6) + "_" + W(7) + "_KEY: (generate fresh via `openssl rand -hex 32` before first "
+                    "deploy)\n", ["(generate", "openssl", "(generate fresh via"], [])
+        name9a, name9b = W(10) + "_API_" + W(5), W(10) + "_" + W(7) + "_ID"
+        value9a, value9b = plant(w(4) + "_" + x(48)), plant(h(32))
+        shape[9] = ("wrangler secret put " + W(4) + "_KEY\n```sh\nexport " + name9a + '="' + value9a + '"\nexport '
+                    + name9b + '="' + value9b + '"\n```\n', [name9a + "=", name9b + "="], [value9a, value9b])
+        host10, key10 = w(6) + "-" + w(5) + "." + w(10, "abcdefghijkmnopqrstuvwxyz0123456789") + ".com", \
+            plant(w(5) + "-1234-5678-xyz")
+        shape[10] = ("| Step | Command |\n|---|---|\n| " + x(5) + ' | `curl -X POST "https://' + host10 + "/" + w(7)
+                     + "/run?key=" + key10 + '"` |\n| ' + x(5) + ' | `curl "https://' + host10 + "/run?key=" + key10
+                     + '&v=2"` |\n' + "- " + W(5) + "_TOKEN_HOST: " + host10 + "/" + "run" + "\n",
+                     [host10, host10.split(".", 1)[1], host10.split(".")[0], key10 + "&v=2", host10 + "/run"],
+                     [key10])
+        for n, (text, wrong, right) in shape.items():
+            got = took(text)
+            for value in wrong:
+                assert value not in got, f"shape {n}: a name, prose, a date or a host is NOT taken"
+            for value in right:
+                assert value in got, f"shape {n}: the value the shape holds IS taken"
+            if n in (1, 2, 4, 5, 8):
+                assert not got, f"shape {n}: nothing is taken from it"
+            if n == 10:
+                assert got == {key10}, "shape 10: only the key= value is taken"
+        # the recall the precision keeps: a weak password, a passphrase, a mnemonic; prose is not a passphrase
+        weak = plant(w(8) + "2024")
+        phrase = plant(" ".join(w(5) for _ in range(4)))
+        mnemonic = plant(" ".join(w(4 + i % 4) for i in range(12)))
+        recall = (f"ADMIN_PASSWORD={weak}\n" + 'WALLET_PASSPHRASE="' + phrase + '"\n' + "mnemonic: " + mnemonic
+                  + "\nkey: the old one is gone now\nkey: " + w(4) + " " + w(5) + " " + w(6) + " " + w(7) + "\n")
+        got = took(recall)
+        assert weak in got, "a weak password of one word and digits under a secret name IS taken"
+        assert phrase in got, "a quoted passphrase of words under a secret name IS taken"
+        assert mnemonic in got, "a mnemonic of twelve words under a secret name IS taken"
+        assert got == {weak, phrase, mnemonic}, "prose (short words, or under six words unquoted) is not a passphrase"
+        (folder / "shapes.md").write_text("".join(text for text, _, _ in shape.values()) + recall)
+        vault = Vault(folder)
+        for value in (hex3, hex6, value9a, value9b, key10, weak, phrase, mnemonic):
+            assert hit(f"x {value} y", vault), "a value the shapes' vault file records is RED in the tree"
+
+        # THE CI PLACEHOLDER: not a credential by its shape; still refused when the vault holds that very string
+        var = "--var SYNTH" + "_API_KEY:"
+        held = "ci-" + w(6) + "-" + w(5) + "-9"
+        assert not hit(var + "ci-" + w(7) + "-" + w(6) + "-2", no_vault), "a ci- placeholder is GREEN by shape"
+        assert hit(var + "ci-" + W(8) + w(8), no_vault), "an upper-case ci- value is RED by shape"
+        assert hit(var + "ci-" + w(8) + "_" + w(8), no_vault), "a ci- value holding _ is RED by shape"
+        assert hit(var + w(8) + "-" + w(9), no_vault), "a secret-named assignment without ci- is RED by shape"
+        placeholder_vault = scratch / "placeholder-vault"
+        placeholder_vault.mkdir()
+        (placeholder_vault / "ci.md").write_text("SYNTH" + "_API_KEY=" + held + "\n")
+        assert hit(var + held, Vault(placeholder_vault)), "a ci- value the vault holds is RED"
+        gitleaks = ROOT / ".gitleaks.toml"
+        if gitleaks.is_file():
+            assert "'''^" + CI_PLACEHOLDER.pattern + "$'''" in gitleaks.read_text(), \
+                "the placeholder is the same expression as .gitleaks.toml's allowlist"
+
+        # --vault-report: counts by rule and each value's line, rule, length and class; never a value
+        report = "\n".join(vault.report_lines())
+        assert "shapes.md: " in report and "(a) url query" in report and "(c) piped" in report, report[:200]
+        captured.append(report)
+
         # the tree scan, in a synthetic repository
         repo = scratch / "repo"
         repo.mkdir()
@@ -612,6 +936,9 @@ def self_test():
                 assert value[i:i + 8] not in text, "a diagnostic carries a planted value"
     print("check-secrets self-test: a bare, an Enter-recorded, a second-file, an after-command, a JSON and a "
           "punctuated vault value RED; public keys, addresses, hosts, names, a labelled txid GREEN")
+    print("check-secrets self-test: the ten prose and command-line shapes take no name, prose, date or host, and "
+          "take the values they hold; a weak password, a passphrase, a mnemonic RED; a ci- placeholder GREEN by "
+          "shape and RED when the vault holds it; --vault-report carries no value")
     print("check-secrets self-test: shapes RED without a vault (one line printed), a bad-checksum WIF GREEN; an "
           "add-then-remove history RED; 1,000 values: the lane's files clean; no diagnostic carries a value")
 
@@ -637,6 +964,13 @@ def main():
     if args == ["--self-test"]:
         self_test()
         return 0
+    if args == ["--vault-report"]:
+        if no_vault:
+            print("check-secrets: --vault-report reads the vault; it does not take --no-vault", file=sys.stderr)
+            return 2
+        for line in Vault().report_lines():
+            print(line)
+        return 0
     vault = Vault(disabled="--no-vault: shapes only" if no_vault else None)
     pushing = bool(args) and args[0] == "--pre-push"
     notice = vault.notice()
@@ -653,7 +987,8 @@ def main():
     elif args[0] == "--commits" and len(args) > 1:
         failed = scan_commits(git("rev-list", *args[1:]).decode().split(), vault, out)
     else:
-        print("usage: check-secrets.py [--no-vault] [--self-test | --pre-push [REMOTE [URL]] | --commits REVSPEC...]",
+        print("usage: check-secrets.py [--no-vault] [--self-test | --vault-report | --pre-push [REMOTE [URL]] | "
+              "--commits REVSPEC...]",
               file=sys.stderr)
         return 2
     if os.environ.get("CHECK_SECRETS_TIMING"):
