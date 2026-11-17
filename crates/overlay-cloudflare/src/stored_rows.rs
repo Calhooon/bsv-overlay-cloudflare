@@ -56,6 +56,25 @@
 //!   (GHSA-j8hr-pjhm-6h27, GHSA-67vc-6c8g-7x48): such a row is
 //!   `REFUSED .. kind=raw_tx` (or `kind=sighash_parse`); a sweep whose bytes
 //!   name another txid than its `sweepTxid` is a `DIFFERS` line.
+//! - PORT-0811 fold: the deferred EF jobs' bytes at rest
+//!   (`ef_deferred_jobs`, the stream in `ef_deferred_chunks` or the R2 object
+//!   `ef-deferred/<reference>` in `STORED_ROWS_R2_DIR`), through the job
+//!   run's own read (`ef_deferred::stream_of_chunks`, `checked_at_rest`,
+//!   `job_submission`: the length, then the reference over the topics, the
+//!   BEEF and the off-chain values; either failing is `REFUSED ..
+//!   kind=ef_job`), then the BEEF as every stored BEEF above (by the job's
+//!   subject txid) and the gated arm's conversion (`ef::beef_to_ef_batch`,
+//!   `REFUSED .. kind=ef_batch`). An R2 job whose object is not in the
+//!   directory is `UNREAD`.
+//! - PORT-0811 fold: `handfile_batches.payloadsHex`, read back by both
+//!   Workers through `HandfileBatch::of_stored` (`REFUSED .. kind=payloads`
+//!   when it does not read: the Worker then serves the row without its batch)
+//!   and served verbatim; no Worker parses a payload back. The potrefund
+//!   payload carries the refund's raw transaction after its fixed head, read
+//!   as the exploded row's `refundRawHex` is (`kind=raw_tx`, `sighash_parse`).
+//!
+//! Not in a D1 export, so not read: the owed actors' own stores (each
+//! identity's Durable Object SQLite, its `txfacts`, and the `OWED_COPY` KV).
 //!
 //! Each BEEF goes through the door (`beef_limits::read_beef`: a refusal
 //! names its offset and kind), the sizing read (`stream_sizing::estimate`
@@ -306,6 +325,42 @@ impl Summary {
         }
         true
     }
+}
+
+/// A deferred EF job's row by the Worker's own statement (`JOB_READ_SQL`),
+/// each column as D1 hands it to the job's deserialization.
+fn export_job(db: &Connection, reference: &str) -> Option<crate::ef_deferred::Job> {
+    let row = rows(db, crate::ef_deferred::JOB_READ_SQL, &[&reference])?
+        .into_iter()
+        .next()?;
+    let num = |i: usize| -> Option<f64> {
+        match &row[i] {
+            Value::Integer(v) => Some(*v as f64),
+            Value::Real(v) => Some(*v),
+            _ => None,
+        }
+    };
+    let txt = |i: usize| text(&row[i]);
+    Some(crate::ef_deferred::Job {
+        reference: txt(0)?,
+        subject_txid: txt(1)?,
+        topics: txt(2)?,
+        submit_mode: txt(3)?,
+        has_off_chain: num(4)?,
+        beef_len: num(5)?,
+        bytes: num(6)?,
+        at_rest: txt(7)?,
+        chunks: num(8)?,
+        subject_ef_bytes: num(9)?,
+        batch_ef_bytes: num(10)?,
+        state: txt(11)?,
+        attempts: num(12)?,
+        status: num(13),
+        answer: txt(14),
+        created_at: num(15)?,
+        updated_at: num(16)?,
+        legs_from: num(17).unwrap_or(0.0),
+    })
 }
 
 fn text(value: &Value) -> Option<String> {
@@ -682,6 +737,139 @@ pub(crate) fn read_export(inputs: &[PathBuf], r2_dir: Option<&Path>) -> Result<S
             text(&row[1]).unwrap_or_default()
         );
         s.read_raw_tx("potrefund_records", &key, text(&row[2]), None);
+    }
+
+    // PORT-0811 fold: the deferred EF jobs' bytes at rest (`ef_deferred_jobs`,
+    // their stream in `ef_deferred_chunks` or the R2 object
+    // `ef-deferred/<reference>`), read back as the job's run reads them
+    // (`ef_deferred::stream_of_chunks`, `checked_at_rest`, `job_submission`:
+    // the length and the reference), then by the gated arm's readers.
+    if rows(&db, "SELECT 1 FROM ef_deferred_jobs LIMIT 0", &[]).is_some() {
+        if let Err(e) = db.execute_batch(crate::ef_deferred::JOBS_ADD_LEGS_FROM) {
+            if !crate::d1::migration_error_is_benign(
+                crate::ef_deferred::JOBS_ADD_LEGS_FROM,
+                &e.to_string(),
+            ) {
+                return Err(format!("the deferred jobs' migration: {e}"));
+            }
+        }
+    }
+    let table = "ef_deferred_jobs";
+    for row in rows(&db, "SELECT reference FROM ef_deferred_jobs", &[]).unwrap_or_default() {
+        s.rows += 1;
+        let reference = text(&row[0]).unwrap_or_default();
+        let Some(job) = export_job(&db, &reference) else {
+            s.refused(
+                table,
+                &reference,
+                None,
+                "job",
+                "the job row does not read (JOB_READ_SQL)",
+            );
+            continue;
+        };
+        let at_rest = if job.at_rest == "r2" {
+            let key = format!("{}{reference}", crate::ef_deferred::R2_PREFIX);
+            match r2_dir.and_then(|dir| {
+                std::fs::read(dir.join(&key))
+                    .or_else(|_| std::fs::read(dir.join(key.replace('/', "_"))))
+                    .ok()
+            }) {
+                Some(bytes) => Ok(bytes),
+                None => {
+                    s.unread += 1;
+                    s.line(format!(
+                        "UNREAD table={table} key={reference} why={key} not in the directory"
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            let mut hexes = Vec::new();
+            for idx in 0..job.chunks as i64 {
+                let hex_chunk = rows(&db, crate::ef_deferred::CHUNK_READ_SQL, &[&reference, &idx])
+                    .and_then(|r| r.into_iter().next())
+                    .and_then(|r| text(&r[0]));
+                let gone = hex_chunk.is_none();
+                hexes.push(hex_chunk);
+                if gone {
+                    break;
+                }
+            }
+            crate::ef_deferred::stream_of_chunks(&job, hexes)
+        };
+        let submission = match at_rest
+            .and_then(|bytes| crate::ef_deferred::checked_at_rest(&job, bytes))
+            .and_then(|bytes| crate::ef_deferred::job_submission(&job, bytes))
+        {
+            Ok(submission) => submission,
+            Err(e) => {
+                s.refused(table, &reference, None, "ef_job", &e);
+                continue;
+            }
+        };
+        let subject = Some(job.subject_txid.as_str()).filter(|t| !t.is_empty());
+        if s.read_beef(table, &reference, &submission.beef, subject) {
+            // The gated arm's own conversion: the run's EF batch.
+            if let Err(e) = crate::ef::beef_to_ef_batch(&submission.beef) {
+                s.refused(table, &reference, None, "ef_batch", &e.to_string());
+            }
+        }
+    }
+
+    // PORT-0811 fold: the handfile batches' payloads (`handfile_batches.payloadsHex`), read back by both Workers
+    // through `HandfileBatch::of_stored` and served verbatim (no Worker parses a payload back; a client re-verifies
+    // the batch). The potrefund payload carries the refund's raw transaction after its fixed head (the tag, the
+    // identity, the game, the pot outpoint): it is read as the exploded row's `refundRawHex` is.
+    let table = "handfile_batches";
+    for row in rows(
+        &db,
+        "SELECT batchKey, hopTxid, payloadsHex, identitySigHex, settleSigHex FROM handfile_batches",
+        &[],
+    )
+    .unwrap_or_default()
+    {
+        s.rows += 1;
+        let col = |i: usize| text(&row[i]).unwrap_or_default();
+        let key = col(0);
+        let Some(batch) = overlay_discovery::handfile::HandfileBatch::of_stored(
+            &key,
+            &col(1),
+            &col(2),
+            &col(3),
+            &col(4),
+            0,
+        ) else {
+            s.refused(
+                table,
+                &key,
+                None,
+                "payloads",
+                "the column does not read (HandfileBatch::of_stored)",
+            );
+            continue;
+        };
+        let head = overlay_discovery::potrefund::POTREFUND_TAG.len() + 33 + 32 + 32 + 4;
+        match batch.payloads.get(3).and_then(|p| hex::decode(p).ok()) {
+            Some(refund)
+                if refund.len() > head
+                    && refund.starts_with(overlay_discovery::potrefund::POTREFUND_TAG) =>
+            {
+                s.read_raw_tx(
+                    table,
+                    &format!("{key}#refund"),
+                    Some(hex::encode(&refund[head..])),
+                    None,
+                );
+            }
+            _ => s.refused(
+                table,
+                &key,
+                None,
+                "payloads",
+                "the potrefund payload does not read",
+            ),
+        }
     }
 
     let table = "gasp_deferred_graphs";
@@ -1452,5 +1640,185 @@ mod self_test {
         let whole = include_str!("stored_rows.rs");
         let run = &whole[whole.find("fn read_the_export()").unwrap()..];
         assert!(run[..run.find("\n}\n").unwrap()].contains("s.verdict().unwrap();"));
+    }
+
+    /// PORT-0811 fold: the deferred EF jobs' bytes at rest and the handfile
+    /// payloads. A job held in two D1 chunks and one held in R2 read clean; a
+    /// torn job (its chunks short of its length), a job whose bytes are not its
+    /// reference's and a job whose BEEF the gated arm's conversion refuses are
+    /// each named; an R2 job whose object is not in the directory is `UNREAD`.
+    /// An honest handfile batch reads clean; one whose refund payload carries a
+    /// byte after the transaction is `kind=raw_tx`; a payloads column that does
+    /// not read is `kind=payloads`. On the base the reader read neither table.
+    #[test]
+    fn p0811_r_the_reader_reads_the_deferred_jobs_and_the_handfile_payloads() {
+        use crate::ef_deferred::{job_reference, CHUNKS_CREATE, JOBS_ADD_LEGS_FROM, JOBS_CREATE};
+        let beef = fixture("tests/fixtures/ef/loop2_join_f9e85aab_represent.beef");
+        let (_, subject) = crate::ef::beef_to_ef_batch(&beef).unwrap();
+        let mut sql = schema_sql();
+        sql.push_str(&format!(
+            "{JOBS_CREATE};\n{JOBS_ADD_LEGS_FROM};\n{CHUNKS_CREATE};\n"
+        ));
+        sql.push_str(crate::d1::HANDFILE_BATCHES_CREATE);
+        sql.push_str(";\n");
+        let job_row = |reference: &str,
+                       topics: &str,
+                       subject: &str,
+                       beef_len: usize,
+                       bytes: usize,
+                       at_rest: &str,
+                       chunks: usize| {
+            format!(
+                "INSERT INTO ef_deferred_jobs VALUES({},{},{},'broadcast-gated',0,{beef_len},{bytes},{},{chunks},1,1,'queued',0,NULL,NULL,1,1,0);\n",
+                sql_text(reference),
+                sql_text(subject),
+                sql_text(topics),
+                sql_text(at_rest)
+            )
+        };
+        let chunk_row = |reference: &str, idx: usize, part: &[u8]| {
+            format!(
+                "INSERT INTO ef_deferred_chunks VALUES({},{idx},{});\n",
+                sql_text(reference),
+                sql_blob(part)
+            )
+        };
+        // d1, clean: two chunks
+        let t1 = r#"["tm_one"]"#;
+        let r1 = job_reference(t1, &beef, None);
+        sql.push_str(&job_row(&r1, t1, &subject, beef.len(), beef.len(), "d1", 2));
+        let half = beef.len() / 2;
+        sql.push_str(&chunk_row(&r1, 0, &beef[..half]));
+        sql.push_str(&chunk_row(&r1, 1, &beef[half..]));
+        // d1, torn: the second chunk is gone
+        let t2 = r#"["tm_two"]"#;
+        let r2 = job_reference(t2, &beef, None);
+        sql.push_str(&job_row(&r2, t2, &subject, beef.len(), beef.len(), "d1", 2));
+        sql.push_str(&chunk_row(&r2, 0, &beef[..half]));
+        // d1, foreign: whole bytes under another submission's reference
+        let t3 = r#"["tm_three"]"#;
+        let r3 = job_reference(t3, b"other bytes", None);
+        sql.push_str(&job_row(&r3, t3, &subject, beef.len(), beef.len(), "d1", 1));
+        sql.push_str(&chunk_row(&r3, 0, &beef));
+        // d1, the conversion refuses: a subject whose source the BEEF lacks
+        let lone = {
+            let mut tx = bsv_rs::transaction::Transaction::new();
+            tx.inputs.push(bsv_rs::transaction::TransactionInput {
+                source_txid: Some("ab".repeat(32)),
+                unlocking_script: Some(bsv_rs::script::UnlockingScript::from_binary(&[]).unwrap()),
+                ..Default::default()
+            });
+            tx.outputs.push(bsv_rs::transaction::TransactionOutput::new(
+                1,
+                bsv_rs::script::LockingScript::from_binary(&[0x51]).unwrap(),
+            ));
+            let mut b = bsv_rs::transaction::Beef::new();
+            b.merge_transaction(tx.clone());
+            (b.to_binary(), tx.id())
+        };
+        let t4 = r#"["tm_four"]"#;
+        let r4 = job_reference(t4, &lone.0, None);
+        sql.push_str(&job_row(
+            &r4,
+            t4,
+            &lone.1,
+            lone.0.len(),
+            lone.0.len(),
+            "d1",
+            1,
+        ));
+        sql.push_str(&chunk_row(&r4, 0, &lone.0));
+        // r2, clean, and r2, its object not in the directory
+        let t5 = r#"["tm_five"]"#;
+        let r5 = job_reference(t5, &beef, None);
+        sql.push_str(&job_row(&r5, t5, &subject, beef.len(), beef.len(), "r2", 1));
+        let t6 = r#"["tm_six"]"#;
+        let r6 = job_reference(t6, &beef, None);
+        sql.push_str(&job_row(&r6, t6, &subject, beef.len(), beef.len(), "r2", 1));
+        // the handfile batches
+        let parsed = beef_limits::parse_beef(&beef, &beef_limits::STORED_BEEF_LIMITS).unwrap();
+        let raw = parsed
+            .txs
+            .iter()
+            .find_map(|e| e.tx().cloned())
+            .unwrap()
+            .to_binary();
+        let refund_payload = |raw: &[u8]| {
+            let mut p = overlay_discovery::potrefund::POTREFUND_TAG.to_vec();
+            p.extend([0x02; 33]);
+            p.extend([0x11; 32]);
+            p.extend([0x22; 32]);
+            p.extend(0u32.to_le_bytes());
+            p.extend_from_slice(raw);
+            hex::encode(p)
+        };
+        let batch = |key: &str, payloads: &str| {
+            format!(
+                "INSERT INTO handfile_batches VALUES({},'i','g','h',{},'30','30',1);\n",
+                sql_text(key),
+                sql_text(payloads)
+            )
+        };
+        let mut trailing = raw.clone();
+        trailing.push(0x00);
+        sql.push_str(&batch(
+            "handfile:honest",
+            &serde_json::json!(["00", "00", "00", refund_payload(&raw)]).to_string(),
+        ));
+        sql.push_str(&batch(
+            "handfile:trailing",
+            &serde_json::json!(["00", "00", "00", refund_payload(&trailing)]).to_string(),
+        ));
+        sql.push_str(&batch("handfile:unread", r#"["00"]"#));
+
+        let dir = std::env::temp_dir().join(format!("p0811-fold-r2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("ef-deferred_{r5}")), &beef).unwrap();
+        let s = read_sql("p0811-fold-r", &sql, Some(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        let named = |prefix: &str| s.lines.iter().any(|l| l.starts_with(prefix));
+        for clean in [&r1, &r5] {
+            assert!(
+                !s.lines
+                    .iter()
+                    .any(|l| (l.starts_with("REFUSED") || l.starts_with("UNREAD"))
+                        && l.contains(&format!("key={clean} "))),
+                "{clean} reads clean: {:?}",
+                s.lines
+            );
+        }
+        assert!(named(&format!("REFUSED table=ef_deferred_jobs key={r2} offset=- kind=ef_job detail=chunk 1 is gone")), "{:?}", s.lines);
+        assert!(named(&format!("REFUSED table=ef_deferred_jobs key={r3} offset=- kind=ef_job detail=the bytes at rest are not the job's")), "{:?}", s.lines);
+        assert!(
+            named(&format!(
+                "REFUSED table=ef_deferred_jobs key={r4} offset=- kind=ef_batch"
+            )),
+            "{:?}",
+            s.lines
+        );
+        assert!(
+            named(&format!("UNREAD table=ef_deferred_jobs key={r6} ")),
+            "{:?}",
+            s.lines
+        );
+        assert!(
+            !named("REFUSED table=handfile_batches key=handfile:honest"),
+            "{:?}",
+            s.lines
+        );
+        assert!(
+            named(
+                "REFUSED table=handfile_batches key=handfile:trailing#refund offset=- kind=raw_tx"
+            ),
+            "{:?}",
+            s.lines
+        );
+        assert!(
+            named("REFUSED table=handfile_batches key=handfile:unread offset=- kind=payloads"),
+            "{:?}",
+            s.lines
+        );
+        assert_eq!((s.refusals, s.unread), (5, 1), "{:?}", s.lines);
+        assert!(s.verdict().is_err());
     }
 }
