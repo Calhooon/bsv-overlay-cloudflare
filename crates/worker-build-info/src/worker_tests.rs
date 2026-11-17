@@ -40,10 +40,12 @@ fn build_object_shape() {
     // the adapter 0.7.2 and core 0.4.1, their releases on bsv-rs 0.8.
     // Amended for PORT-0811 (2026-11-16): bsv-rs 0.8.11; the adapter and core
     // have no later stable release, unchanged.
+    // Amended for LOCK-0812 (2026-11-17): bsv-rs 0.8.12; the adapter and core
+    // unchanged.
     assert_eq!(
         b["crates"],
         serde_json::json!({
-            "bsv-rs": "0.8.11",
+            "bsv-rs": "0.8.12",
             "bsv-middleware-cloudflare": "0.7.2",
             "bsv-middleware-core": "0.4.1",
         })
