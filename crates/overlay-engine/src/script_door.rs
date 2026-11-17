@@ -233,6 +233,139 @@ pub(crate) fn push_only(script: &[u8]) -> bool {
     true
 }
 
+/// The mainnet Genesis height (bsv-rs's `ProtocolEra::MAINNET_GENESIS_HEIGHT`,
+/// 620,538): a coin a BUMP proves below it is from before Genesis.
+pub(crate) const GENESIS_HEIGHT: u64 = bsv_rs::script::ProtocolEra::MAINNET_GENESIS_HEIGHT as u64;
+
+/// Whether `lock` is exactly the pay-to-script-hash shape `a9 14 <20 bytes> 87`
+/// (GHSA-fr33-7jw7-mwwh): the node spends such a coin only after running the
+/// unlocking script's last push as a script, a step `Spend` does not run; and
+/// once Genesis is active the node refuses a transaction that creates one, so
+/// the shape stands for a coin from before Genesis whatever proves it.
+pub(crate) fn is_p2sh_shape(lock: &[u8]) -> bool {
+    lock.len() == 23 && lock[0] == 0xa9 && lock[1] == 0x14 && lock[22] == 0x87
+}
+
+/// The pushes of a push-only `script` as `(count, largest)`, with no
+/// allocation; `None` for a script that is not push-only or whose push runs
+/// past its end (bsv-rs refuses that at parse).
+fn pushes(script: &[u8]) -> Option<(usize, usize)> {
+    use bsv_rs::script::op::{OP_16, OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4};
+    let (len, mut at, mut count, mut largest) = (script.len(), 0usize, 0usize, 0usize);
+    while at < len {
+        let op = script[at];
+        at += 1;
+        if op > OP_16 {
+            return None;
+        }
+        let header = match op {
+            OP_PUSHDATA1 => 1,
+            OP_PUSHDATA2 => 2,
+            OP_PUSHDATA4 => 4,
+            _ => 0,
+        };
+        let pushed = if op > 0 && op < OP_PUSHDATA1 {
+            usize::from(op)
+        } else if header > 0 {
+            let bytes = script.get(at..at.checked_add(header)?)?;
+            at += header;
+            bytes
+                .iter()
+                .rev()
+                .fold(0usize, |acc, b| (acc << 8) | usize::from(*b))
+        } else {
+            0
+        };
+        at = at.checked_add(pushed).filter(|end| *end <= len)?;
+        count += 1;
+        largest = largest.max(pushed);
+    }
+    Some((count, largest))
+}
+
+/// Whether a spend of `lock` by the push-only `unlock` is one the rules of a
+/// coin from before Genesis judge exactly as the post-Genesis rules `Spend`
+/// runs (bsv-rs 0.8.10, GHSA-h4m7-c6p8-725m: those rules add refusals of
+/// sizes, counts and opcodes). True only where no added refusal can apply:
+/// each script at most 10,000 bytes, every push at most 520 bytes, fewer than
+/// 990 pushes in all (the 1,000 stack elements), and a lock that is push-only,
+/// pay-to-public-key-hash, pay-to-public-key or bare multisig: none executes an
+/// opcode those rules disable or bound (the multisig's keys are at most 16).
+pub(crate) fn era_neutral(unlock: &[u8], lock: &[u8]) -> bool {
+    const MAX_SCRIPT: usize = 10_000;
+    const MAX_PUSH: usize = 520;
+    const MAX_PUSHES: usize = 990;
+    if unlock.len() > MAX_SCRIPT || lock.len() > MAX_SCRIPT {
+        return false;
+    }
+    let Some((unlock_pushes, unlock_largest)) = pushes(unlock) else {
+        return false;
+    };
+    if unlock_largest > MAX_PUSH {
+        return false;
+    }
+    let p2pkh = lock.len() == 25 && lock[..3] == [0x76, 0xa9, 0x14] && lock[23..] == [0x88, 0xac];
+    let p2pk = (lock.len() == 35 && lock[0] == 0x21 || lock.len() == 67 && lock[0] == 0x41)
+        && lock[lock.len() - 1] == 0xac;
+    let multisig = || {
+        // OP_m <33 or 65 byte keys> OP_n OP_CHECKMULTISIG, 1 <= m <= n <= 16.
+        let (&first, &last) = (lock.first()?, lock.last()?);
+        let n_op = *lock.get(lock.len().checked_sub(2)?)?;
+        if last != 0xae || !(0x51..=0x60).contains(&first) || !(0x51..=0x60).contains(&n_op) {
+            return None;
+        }
+        let (m, n) = (first - 0x50, n_op - 0x50);
+        let keys = &lock[1..lock.len() - 2];
+        let (mut at, mut found) = (0usize, 0u8);
+        while at < keys.len() {
+            let width = usize::from(keys[at]);
+            if width != 33 && width != 65 {
+                return None;
+            }
+            at = at.checked_add(1 + width).filter(|end| *end <= keys.len())?;
+            found += 1;
+        }
+        (m <= n && found == n).then_some(())
+    };
+    let lock_pushes = if p2pkh || p2pk || multisig().is_some() {
+        Some(0)
+    } else {
+        pushes(lock)
+            .filter(|(_, largest)| *largest <= MAX_PUSH)
+            .map(|(n, _)| n)
+    };
+    lock_pushes.is_some_and(|lock_pushes| unlock_pushes + lock_pushes < MAX_PUSHES)
+}
+
+/// The door's screen of an input by its coin's era (bsv-rs 0.8.10, its
+/// migration steps 7 and 8 for a direct caller of `Spend`): `Some(why)` when
+/// the walk declines the input, the network judging. A lock of the
+/// pay-to-script-hash shape is declined always ([`is_p2sh_shape`]); a coin a
+/// BEEF holding a BUMP below the Genesis height proves (`pre_genesis`: the
+/// door does not keep which BUMP proves which txid, so every proven source of
+/// such a BEEF is taken as one) is declined unless its spend is
+/// [`era_neutral`]. A coin whose creating transaction is unproven carries no
+/// era: it is judged by the post-Genesis rules, as bsv-rs's own doors judge it
+/// until its 0.9.0 cut.
+pub(crate) fn era_decline(
+    unlock: &[u8],
+    lock: &[u8],
+    source_proven: bool,
+    pre_genesis: bool,
+) -> Option<&'static str> {
+    if is_p2sh_shape(lock) {
+        return Some(
+            "the coin is locked by the pay-to-script-hash shape, whose redeem step the door's interpreter does not run",
+        );
+    }
+    if source_proven && pre_genesis && !era_neutral(unlock, lock) {
+        return Some(
+            "the coin is proven below the Genesis height and its spend is not one both eras judge alike",
+        );
+    }
+    None
+}
+
 /// What one input's scripts hold once parsed and run, beside the frame's
 /// estimate: [`SCRIPT_CHARGE_PER_CHUNK`] a chunk and
 /// [`SCRIPT_CHARGE_PER_BYTE`] a byte of both scripts.
@@ -258,6 +391,8 @@ struct Place {
 struct DoorIndex {
     txs: HashMap<Hash32, Place>,
     proven: HashSet<Hash32>,
+    /// Whether a BUMP of the BEEF is below the Genesis height ([`era_decline`]).
+    pre_genesis: bool,
 }
 
 impl DoorIndex {
@@ -269,7 +404,10 @@ impl DoorIndex {
             .map_err(|e| EngineError::BeefParseError(e.to_string()))?
         {
             match element {
-                Element::Bump(bump) => index.proven.extend(bump.proven().copied()),
+                Element::Bump(bump) => {
+                    index.pre_genesis |= bump.block_height < GENESIS_HEIGHT;
+                    index.proven.extend(bump.proven().copied());
+                }
                 Element::Tx {
                     offset, txid, body, ..
                 } => {
@@ -651,6 +789,28 @@ pub(crate) fn walk_trusting(
                     subject_txid: txid.clone(),
                     input_index: vin as u32,
                     reason: NOT_PUSH_ONLY.into(),
+                });
+            }
+            // The coin's era (bsv-rs 0.8.10, GHSA-fr33-7jw7-mwwh and
+            // GHSA-h4m7-c6p8-725m): `Spend` judges every coin by the
+            // post-Genesis rules and runs no pay-to-script-hash step, so an
+            // input it cannot judge as the node does is declined before any
+            // charge: never a refusal, the network judges.
+            if let Some(why) = era_decline(
+                unlocking_bytes,
+                locking_bytes,
+                index.proven.contains(&input.prev),
+                index.pre_genesis,
+            ) {
+                return Err(EngineError::ScriptWalkOverBudget {
+                    at_txid: txid.clone(),
+                    subject_judged: judged,
+                    limb: DoorLimb::Era,
+                    what: format!(
+                        "input {vin} of {txid} spends output {} of {}: {why}",
+                        input.vout,
+                        display_hex(&input.prev)
+                    ),
                 });
             }
             // The memory of this input's scripts once parsed and run, beside

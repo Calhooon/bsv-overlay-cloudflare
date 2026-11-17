@@ -2357,11 +2357,7 @@ async fn submit_parts(
         .any(|t| overlay_discovery::name_matches(t, "tm_pot"))
     {
         if let (Ok(tx), Ok(db)) = (
-            beef_limits::transaction_from_beef(
-                &tagged_beef.beef,
-                None,
-                &beef_limits::EF_BEEF_LIMITS,
-            ),
+            beef_limits::subject_from_beef(&tagged_beef.beef, None, &beef_limits::EF_BEEF_LIMITS),
             env.d1("OVERLAY_DB"),
         ) {
             let txid = tx.id();
@@ -2600,7 +2596,7 @@ async fn submit_parts(
         // `tracing::debug!` calls inside `identify_admissible_outputs` are
         // silent under the CF worker's default log config).
         if steak.contains_key("tm_uhrp") {
-            if let Ok(tx) = beef_limits::transaction_from_beef(
+            if let Ok(tx) = beef_limits::subject_from_beef(
                 &tagged_beef.beef,
                 None,
                 &beef_limits::EF_BEEF_LIMITS,
@@ -2633,7 +2629,7 @@ async fn submit_parts(
             if !steak.contains_key(topic) {
                 continue;
             }
-            let Ok(tx) = beef_limits::transaction_from_beef(
+            let Ok(tx) = beef_limits::subject_from_beef(
                 &tagged_beef.beef,
                 None,
                 &beef_limits::EF_BEEF_LIMITS,
@@ -2741,7 +2737,7 @@ async fn submit_parts(
                 let named = beef_limits::parse_beef(&beef_for_seen, &beef_limits::EF_BEEF_LIMITS)
                     .ok()
                     .and_then(|mut b| crate::ef::subject_txid_of(&mut b));
-                let subject = beef_limits::transaction_from_beef(
+                let subject = beef_limits::subject_from_beef(
                     &beef_for_seen,
                     named.as_deref(),
                     &beef_limits::EF_BEEF_LIMITS,
@@ -2983,7 +2979,7 @@ fn serialize_aggregated_lookup(
             Some(bytes) if bytes.len() == 32 => bytes,
             _ => {
                 // Fallback: parse the BEEF and hash — the pre-#289 path.
-                let tx = beef_limits::transaction_from_beef(
+                let tx = beef_limits::subject_from_beef(
                     &output.beef,
                     None,
                     &beef_limits::STORED_BEEF_LIMITS,

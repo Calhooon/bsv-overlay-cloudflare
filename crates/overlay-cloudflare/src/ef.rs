@@ -222,21 +222,41 @@ pub fn merge_raw_sources(beef_bytes: &[u8], raws: &[(String, String)]) -> Vec<u8
 /// the caller REFUSES admission (fail-closed: never store an unverified
 /// mined-claim verbatim).
 pub fn strip_subject_bump(beef_bytes: &[u8], subject_txid: &str) -> Option<Vec<u8>> {
-    let mut tx = beef_limits::transaction_from_beef(
+    // Linked, so the rebuilt BEEF keeps the subject's ancestry. A link-bound
+    // trip (bsv-rs 0.8.11) is no refusal: the subject is read alone and takes
+    // the minimal single-transaction BEEF below (the same fallback as a
+    // partial graph that does not serialize).
+    let (mut tx, linked) = match beef_limits::transaction_from_beef(
         beef_bytes,
         Some(subject_txid),
         &beef_limits::EF_BEEF_LIMITS,
-    )
-    .ok()?;
+    ) {
+        Ok(tx) => (tx, true),
+        Err(e) if beef_limits::is_link_bound(&e) => (
+            beef_limits::subject_from_beef(
+                beef_bytes,
+                Some(subject_txid),
+                &beef_limits::EF_BEEF_LIMITS,
+            )
+            .ok()?,
+            false,
+        ),
+        Err(_) => return None,
+    };
     if !tx.id().eq_ignore_ascii_case(subject_txid) {
         return None; // content-addressing belt — never rebuild the wrong tx
     }
     tx.merkle_path = None;
     // allow_partial: a mined-claim BEEF may carry bump-only parents with no
     // raws — the subject's own raw is what admission stores.
-    let rebuilt = match tx.to_beef(true) {
+    let serialized = if linked {
+        tx.to_beef(true).map_err(|_| ())
+    } else {
+        Err(())
+    };
+    let rebuilt = match serialized {
         Ok(b) => b,
-        Err(_) => {
+        Err(()) => {
             // Fallback: a minimal single-tx BEEF (parents dropped — they
             // were claim-context only; the completion pass re-anchors the
             // subject against chaintracks directly).

@@ -289,16 +289,24 @@ impl SubjectLock {
             SubjectLock::Time(tx.lock_time)
         }
     }
-    /// The lock of the raw bytes, or of the extended format (`None`: neither parses).
+    /// The lock of the raw bytes, or of the extended format (`None`: neither parses, or the extended format asks
+    /// for more source outputs than [`EF_SOURCE_OUTPUTS_MAX`](overlay_engine::beef_limits::EF_SOURCE_OUTPUTS_MAX)
+    /// allows: GHSA-82g9-h6jw-r99f, refused by bsv-rs before it builds them; the text's lock height then bounds the
+    /// hold, as for bytes not held).
     pub fn of_bytes(bytes: &[u8]) -> Option<Self> {
         bsv_rs::transaction::Transaction::from_binary(bytes)
-            .or_else(|_| bsv_rs::transaction::Transaction::from_ef(bytes))
+            .or_else(|_| {
+                bsv_rs::transaction::Transaction::from_ef_bounded(
+                    bytes,
+                    overlay_engine::beef_limits::EF_SOURCE_OUTPUTS_MAX,
+                )
+            })
             .ok()
             .map(|tx| Self::of_tx(&tx))
     }
     /// The lock of `txid`'s own entry in a stored BEEF (`None`: the BEEF does not read or carries no such body).
     pub fn of_beef(beef: &[u8], txid: &str) -> Option<Self> {
-        overlay_engine::beef_limits::transaction_from_beef(
+        overlay_engine::beef_limits::subject_from_beef(
             beef,
             Some(txid),
             &overlay_engine::beef_limits::STORED_BEEF_LIMITS,
@@ -706,6 +714,52 @@ mod tests {
         raw.extend([1u8, 0x51]);
         raw.extend(lock.to_le_bytes());
         raw
+    }
+
+    /// PORT-0811 (bsv-rs 0.8.10, GHSA-82g9-h6jw-r99f): the subject's lock read from Extended Format bytes goes
+    /// through `from_ef_bounded` under the door's figure. The advisory's shape (eight inputs spending output
+    /// 100,000 of their sources, 425 bytes, 800,008 source outputs asked for) is refused before it is built, so no
+    /// lock is read from it (the text bounds the hold, as for bytes not held); an honest EF of a locked subject reads.
+    /// On the base `from_ef` built the 800,008 outputs and answered `Some(Final)`.
+    #[test]
+    fn p0811_a_the_lock_of_an_ef_read_is_bounded() {
+        let mut ef = 1u32.to_le_bytes().to_vec();
+        ef.extend([0, 0, 0, 0, 0, 0xef, 8]);
+        for i in 0..8u8 {
+            ef.extend([i + 1; 32]);
+            ef.extend(100_000u32.to_le_bytes());
+            ef.push(0);
+            ef.extend(u32::MAX.to_le_bytes());
+            ef.extend(1_000u64.to_le_bytes());
+            ef.push(0);
+        }
+        ef.push(1);
+        ef.extend(900u64.to_le_bytes());
+        ef.push(0);
+        ef.extend(0u32.to_le_bytes());
+        assert_eq!(ef.len(), 425);
+        assert_eq!(
+            SubjectLock::of_bytes(&ef),
+            None,
+            "the advisory's EF is refused before it is built"
+        );
+        // An honest EF (one input spending output 0, its source's value and lock carried) reads its lock.
+        let mut honest = 1u32.to_le_bytes().to_vec();
+        honest.extend([0, 0, 0, 0, 0, 0xef, 1]);
+        honest.extend([1u8; 32]);
+        honest.extend(0u32.to_le_bytes());
+        honest.push(0);
+        honest.extend(0xffff_fffeu32.to_le_bytes());
+        honest.extend(1_000u64.to_le_bytes());
+        honest.extend([1, 0x51]);
+        honest.push(1);
+        honest.extend(900u64.to_le_bytes());
+        honest.extend([1, 0x51]);
+        honest.extend(972_185u32.to_le_bytes());
+        assert_eq!(
+            SubjectLock::of_bytes(&honest),
+            Some(SubjectLock::Height(972_185))
+        );
     }
 
     /// bsv-low #836 fold (the lens's M1, parts 1 and 2): the hold ENDS by the chain. The lock is the subject's own

@@ -706,6 +706,13 @@ pub enum DoorLimb {
     Work,
     /// The estimate of what the door holds beside the body.
     Memory,
+    /// The coin's era (bsv-rs 0.8.10, GHSA-h4m7-c6p8-725m and
+    /// GHSA-fr33-7jw7-mwwh): the input spends a coin of an era the door's
+    /// interpreter (`Spend`, the post-Genesis rules alone) does not judge
+    /// exactly as the node does: a lock of the pay-to-script-hash shape, or a
+    /// coin proven below the Genesis height whose spend is not one both eras
+    /// judge alike. A decline, never a refusal: the network judges.
+    Era,
 }
 
 /// What [`Engine::run_validation`] answers: the topics' validations, the
@@ -731,6 +738,14 @@ pub enum WalkLimb {
     /// The interpreter's own memory limit (the budget's element limit)
     /// tripping inside one input.
     InterpreterMemory,
+    /// The coin's era ([`DoorLimb::Era`]): a spend the door's interpreter
+    /// does not judge as the node does, declined by the walk.
+    CoinEra,
+    /// bsv-rs 0.8.11's link bound (GHSA-gvmh-f5gf-5vjj): linking the subject's
+    /// ancestry would re-materialize more shared-parent stub bytes than
+    /// `BeefLinkLimits::default()` allows (16 MiB). A memory limb: the
+    /// submit's own parse could not run within it, never a verdict.
+    OverLink,
 }
 
 impl WalkLimb {
@@ -740,7 +755,8 @@ impl WalkLimb {
     pub fn door_limb(self) -> DoorLimb {
         match self {
             WalkLimb::OverWork | WalkLimb::InterpreterMemory => DoorLimb::Work,
-            WalkLimb::OverMemory => DoorLimb::Memory,
+            WalkLimb::OverMemory | WalkLimb::OverLink => DoorLimb::Memory,
+            WalkLimb::CoinEra => DoorLimb::Era,
         }
     }
 
@@ -751,6 +767,8 @@ impl WalkLimb {
             WalkLimb::OverWork => "over_work",
             WalkLimb::OverMemory => "over_memory",
             WalkLimb::InterpreterMemory => "interpreter_memory",
+            WalkLimb::OverLink => "over_link",
+            WalkLimb::CoinEra => "coin_era",
         }
     }
 }
@@ -2626,8 +2644,12 @@ impl Engine {
         let mut stack = vec![predecessor.to_string()];
         let mut guarded: HashSet<String> = HashSet::new();
         while let Some(next) = stack.last().cloned() {
-            let body = beef
-                .find_atomic_transaction(&next)
+            // A link-bound trip (bsv-rs 0.8.11) is the landing's "not now",
+            // in its own words: never "not in the BEEF".
+            let body = beef_limits::linked(&beef, &next)
+                .map_err(|e| {
+                    format!("{next}: its body could not be linked within the link bound ({e})")
+                })?
                 .ok_or_else(|| format!("{next}: its body is not in the BEEF"))?;
             // The caller's admission predicate, before anything of this body
             // is submitted (the delta-2 fold, L2).
@@ -3064,8 +3086,18 @@ impl Engine {
                     subject_names.as_ref()
                 } else {
                     if !names_over.contains_key(&spender) {
-                        let names = match beef
-                            .find_atomic_transaction(&spender)
+                        // A link-bound trip (bsv-rs 0.8.11) names nothing
+                        // KNOWN: the question waits, it never reads as "names
+                        // nothing" (which would record the successor).
+                        let linked_spender = match beef_limits::linked(&beef, &spender) {
+                            Ok(linked_spender) => linked_spender,
+                            Err(e) => {
+                                return wait(format!(
+                                    "{candidate} is not known to have landed: its spender {spender} could not be linked within the link bound ({e})"
+                                ))
+                            }
+                        };
+                        let names = match linked_spender
                             .and_then(|spender| spender.to_atomic_beef(true).ok())
                         {
                             Some(spender_beef) => {
@@ -3087,9 +3119,16 @@ impl Engine {
                 // (E1D, the opener)? A dry run over the candidate built out
                 // of the BEEF parsed above (its proof and, unproven, its
                 // sources linked): no store read, nothing counted.
-                let judged = beef
-                    .find_atomic_transaction(&candidate)
-                    .unwrap_or_else(|| body.clone());
+                let judged = match beef_limits::linked(&beef, &candidate) {
+                    Ok(linked) => linked.unwrap_or_else(|| body.clone()),
+                    // A link-bound trip is not the candidate's body unlinked:
+                    // the question waits (bsv-rs 0.8.11).
+                    Err(e) => {
+                        return wait(format!(
+                            "{candidate} is not known to have landed: it could not be linked within the link bound ({e})"
+                        ))
+                    }
+                };
                 let verdict = bounded(
                     bound,
                     manager.identify_admissible_outputs(
@@ -3233,6 +3272,7 @@ impl Engine {
             }) => {
                 let limb = match limb {
                     DoorLimb::Memory => WalkLimb::OverMemory,
+                    DoorLimb::Era => WalkLimb::CoinEra,
                     DoorLimb::Work if trace.interpreter_tripped => WalkLimb::InterpreterMemory,
                     DoorLimb::Work => WalkLimb::OverWork,
                 };
@@ -3598,12 +3638,37 @@ impl Engine {
                     .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
             crate::subject::subject_txid_of(&mut b)
         };
-        let tx = beef_limits::transaction_from_beef(
+        // The subject LINKED (its sources, for a manager that reads them),
+        // under bsv-rs 0.8.11's link bound. A trip is no verdict on the bytes:
+        // the subject is read alone, and the trip is this submit's
+        // `WalkCouldNotRun` (limb `OverLink`), judged by the caller's policy
+        // below exactly as a walk's breach is: "not now" under `NotNow`, the
+        // submit goes on (its subject unlinked) under `NetworkAccepted`.
+        let (tx, link_stop) = match beef_limits::transaction_from_beef(
             &tagged_beef.beef,
             subject.as_deref(),
             &beef_limits::ENGINE_BEEF_LIMITS,
-        )
-        .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
+        ) {
+            Ok(tx) => (tx, None),
+            Err(e) if beef_limits::is_link_bound(&e) => {
+                let tx = beef_limits::subject_from_beef(
+                    &tagged_beef.beef,
+                    subject.as_deref(),
+                    &beef_limits::ENGINE_BEEF_LIMITS,
+                )
+                .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
+                let txid = tx.id();
+                let stop = WalkCouldNotRun {
+                    subject_txid: txid.clone(),
+                    at_txid: txid,
+                    subject_judged: false,
+                    limb: WalkLimb::OverLink,
+                    what: e.to_string(),
+                };
+                (tx, Some(stop))
+            }
+            Err(e) => return Err(EngineError::BeefParseError(e.to_string())),
+        };
         let txid = tx.id();
 
         // SPV verification, skipped ONLY for HistoricalTxNoSpv, exactly the
@@ -3644,6 +3709,11 @@ impl Engine {
                     .await?;
                 }
             }
+        }
+        // A refusal of the walk has returned above; a breach of the walk is
+        // named before the link's (the walk reached further).
+        if could_not_run.is_none() {
+            could_not_run = link_stop;
         }
         if let Some(stop) = could_not_run.take() {
             match policy {
@@ -4220,15 +4290,24 @@ impl Engine {
             let root = beef_limits::parse_beef(beef_data, &beef_limits::STORED_BEEF_LIMITS)
                 .ok()
                 .and_then(|mut b| crate::subject::subject_txid_of(&mut b));
-            let root_tx = beef_limits::transaction_from_beef(
+            // Linked under bsv-rs 0.8.11's link bound. A trip is no parse
+            // error: the tree is not searched and the direct read below (one
+            // txid, nothing linked) answers.
+            let root_tx = match beef_limits::transaction_from_beef(
                 beef_data,
                 root.as_deref(),
                 &beef_limits::STORED_BEEF_LIMITS,
-            )
-            .map_err(|e| EngineError::BeefParseError(e.to_string()))?;
+            ) {
+                Ok(root_tx) => Some(root_tx),
+                Err(e) if beef_limits::is_link_bound(&e) => None,
+                Err(e) => return Err(EngineError::BeefParseError(e.to_string())),
+            };
 
             // Search the transaction tree for the requested txid
-            if let Some(node) = Self::search_tx_tree(&root_tx, graph_id, txid, output_index) {
+            if let Some(node) = root_tx
+                .as_ref()
+                .and_then(|root_tx| Self::search_tx_tree(root_tx, graph_id, txid, output_index))
+            {
                 return Ok(node);
             }
 
@@ -4316,7 +4395,7 @@ impl Engine {
         output_index: u32,
     ) -> Option<GASPNode> {
         // Try parsing BEEF with the specific txid
-        if let Ok(tx) = beef_limits::transaction_from_beef(
+        if let Ok(tx) = beef_limits::subject_from_beef(
             beef_data,
             Some(target_txid),
             &beef_limits::STORED_BEEF_LIMITS,
@@ -6901,8 +6980,8 @@ fn parse_lookup_advertisement(
     protocol: &[u8],
     scope: &str,
 ) -> Option<String> {
-    let tx = beef_limits::transaction_from_beef(&output.beef, None, &beef_limits::PEER_BEEF_LIMITS)
-        .ok()?;
+    let tx =
+        beef_limits::subject_from_beef(&output.beef, None, &beef_limits::PEER_BEEF_LIMITS).ok()?;
     let script = tx
         .outputs
         .get(output.output_index as usize)?

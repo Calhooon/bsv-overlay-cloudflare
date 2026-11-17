@@ -112,7 +112,10 @@ pub const COUNTER_SUBMIT_ENGINE_WALK_OVER_MEMORY: &str = "submit_engine_walk_ove
 /// The counter of an engine walk that could not run, by the limb it passed.
 pub fn engine_walk_over_counter(limb: overlay_engine::engine::WalkLimb) -> &'static str {
     match limb.door_limb() {
-        overlay_engine::engine::DoorLimb::Work => COUNTER_SUBMIT_ENGINE_WALK_OVER_BUDGET,
+        // The coin's era (bsv-rs 0.8.10) is counted with the work limb: a walk the door's interpreter could not make.
+        overlay_engine::engine::DoorLimb::Work | overlay_engine::engine::DoorLimb::Era => {
+            COUNTER_SUBMIT_ENGINE_WALK_OVER_BUDGET
+        }
         overlay_engine::engine::DoorLimb::Memory => COUNTER_SUBMIT_ENGINE_WALK_OVER_MEMORY,
     }
 }
@@ -177,7 +180,10 @@ pub fn engine_walk_not_now_line(
 /// The counter of a door walk past its own bound, by the limb it passed.
 pub fn script_walk_over_counter(limb: overlay_engine::engine::DoorLimb) -> &'static str {
     match limb {
-        overlay_engine::engine::DoorLimb::Work => COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET,
+        // The coin's era (bsv-rs 0.8.10) is counted with the work limb: the network judges.
+        overlay_engine::engine::DoorLimb::Work | overlay_engine::engine::DoorLimb::Era => {
+            COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET
+        }
         overlay_engine::engine::DoorLimb::Memory => COUNTER_SUBMIT_SCRIPT_WALK_OVER_MEMORY,
     }
 }

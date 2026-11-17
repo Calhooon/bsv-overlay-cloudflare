@@ -220,7 +220,7 @@ impl LookupService for PotLookupService {
         // Parse the funding tx out of the BEEF (same subject-tx selection the
         // topic manager used to admit it). Unparseable → no-op, never a
         // spurious record.
-        let tx = match beef_limits::transaction_from_beef(
+        let tx = match beef_limits::subject_from_beef(
             atomic_beef,
             None,
             &beef_limits::DISCOVERY_BEEF_LIMITS,
@@ -354,11 +354,29 @@ impl LookupService for PotLookupService {
         // Derive the SPENDING txid from the beef's subject tx. Unparseable →
         // no-op (the engine parsed this beef to process the submission, so a
         // delivered payload always parses in practice).
+        // Linked: `held_output_bytes` reads the spent output's CARRIED source.
+        // A link-bound trip (bsv-rs 0.8.11) is no unparseable payload: the
+        // spender is read alone, and the source's bytes come from the
+        // engine's stored copy instead (bsv-low #936's second source).
         let spending_tx = match beef_limits::transaction_from_beef(
             spending_atomic_beef,
             None,
             &beef_limits::DISCOVERY_BEEF_LIMITS,
-        ) {
+        )
+        .or_else(|e| {
+            if beef_limits::is_link_bound(&e) {
+                debug!(
+                    "POT: the spending beef did not link within the link bound ({e}); read alone"
+                );
+                beef_limits::subject_from_beef(
+                    spending_atomic_beef,
+                    None,
+                    &beef_limits::DISCOVERY_BEEF_LIMITS,
+                )
+            } else {
+                Err(e)
+            }
+        }) {
             Ok(tx) => tx,
             Err(e) => {
                 debug!("POT: spending beef did not parse — skipped: {e}");
@@ -775,8 +793,13 @@ impl PotLookupService {
                 return Ok(None);
             }
         };
-        match beef_limits::transaction_from_beef(&atomic, None, &beef_limits::DISCOVERY_BEEF_LIMITS)
-        {
+        // Named by its txid (hash-bound: the entry's txid is computed from its
+        // raw bytes), nothing linked.
+        match beef_limits::subject_from_beef(
+            &atomic,
+            Some(txid),
+            &beef_limits::DISCOVERY_BEEF_LIMITS,
+        ) {
             Ok(tx) if tx.id().eq_ignore_ascii_case(txid) => Ok(Some(atomic)),
             Ok(tx) => {
                 debug!(

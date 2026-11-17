@@ -154,7 +154,7 @@ pub fn records_of_body(
     txid: &str,
     vouts: &[u32],
 ) -> Result<Vec<HoppartyRecord>, String> {
-    let tx = beef_limits::transaction_from_beef(beef, Some(txid), &beef_limits::STORED_BEEF_LIMITS)
+    let tx = beef_limits::subject_from_beef(beef, Some(txid), &beef_limits::STORED_BEEF_LIMITS)
         .map_err(|e| e.to_string())?;
     Ok(
         overlay_discovery::hopparty::lookup_service::records_for_body(&tx, beef)

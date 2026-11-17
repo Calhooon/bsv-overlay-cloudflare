@@ -470,6 +470,26 @@ mod tests {
         assert_eq!(classify_spend_signers(&p, LOCK, POT_SATS, &beyond, 0), None);
     }
 
+    /// PORT-0811 (bsv-rs 0.8.11, GHSA-67vc-6c8g-7x48): the spender's raw bytes with one byte after the
+    /// transaction name no signers: `parse_transaction` refuses the suffix. On the base it read the prefix and
+    /// named the pair the prefix's signatures verify.
+    #[test]
+    fn p0811_g_a_spender_with_a_byte_after_it_names_no_signers() {
+        let keys = [key(1), key(2), key(3)];
+        let p = params_with(&keys);
+        let real = spend_signed_by(&keys[0], &keys[1]);
+        assert!(
+            classify_spend_signers(&p, LOCK, POT_SATS, &real, 0).is_some(),
+            "the control"
+        );
+        let mut trailing = real.clone();
+        trailing.push(0x00);
+        assert_eq!(
+            classify_spend_signers(&p, LOCK, POT_SATS, &trailing, 0),
+            None
+        );
+    }
+
     #[test]
     fn foreign_signers_single_sig_and_wrong_digest_are_none_never_a_guess() {
         let keys = [key(1), key(2), key(3)];

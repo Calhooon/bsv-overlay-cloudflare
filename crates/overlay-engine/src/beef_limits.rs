@@ -42,6 +42,8 @@ use bsv_rs::transaction::{
     Transaction, Verdict,
 };
 
+pub use bsv_rs::transaction::BeefLinkLimits;
+
 pub use bsv_rs::transaction::beef_stream::StreamError as DoorError;
 pub use bsv_rs::transaction::{Kind, Reason, Refusal};
 
@@ -264,22 +266,105 @@ pub fn parse_beef(bytes: &[u8], _door: &BeefLimits) -> bsv_rs::Result<Beef> {
     Beef::from_binary(bytes)
 }
 
+/// The subject a read names: the explicit txid, then the atomic txid, then
+/// the wire-last entry (the SDK's target selection, `Transaction::from_beef`).
+fn target_of(parsed: &Beef, txid: Option<&str>) -> bsv_rs::Result<String> {
+    txid.map(str::to_string)
+        .or_else(|| parsed.atomic_txid.clone())
+        .or_else(|| parsed.txs.last().map(bsv_rs::transaction::BeefTx::txid))
+        .ok_or_else(|| bsv_rs::Error::TransactionError("No transactions in BEEF".into()))
+}
+
 /// Link from the door's parse, keeping the SDK's exact target selection:
 /// explicit txid, then atomic txid, then wire-last.
+///
+/// The link runs under bsv-rs 0.8.11's default link bound
+/// ([`BeefLinkLimits::default`], 16 MiB of re-materialized shared-parent
+/// stubs, GHSA-gvmh-f5gf-5vjj). A bound's trip is
+/// `Err(bsv_rs::Error::BeefResourceLimit)` ([`is_link_bound`]), never an
+/// invalid BEEF and never an absent txid: each caller classifies it by the
+/// rule of its own door. A caller that reads the subject's own fields alone
+/// reads it through [`subject_from_beef`], which links nothing.
 pub fn transaction_from_beef(
     bytes: &[u8],
     txid: Option<&str>,
     door: &BeefLimits,
 ) -> bsv_rs::Result<Transaction> {
+    transaction_from_beef_with(bytes, txid, door, &BeefLinkLimits::default())
+}
+
+/// [`transaction_from_beef`] under explicit link limits. `BeefLinkLimits::unbounded`
+/// is for bytes this service built itself; no production caller passes it today.
+pub fn transaction_from_beef_with(
+    bytes: &[u8],
+    txid: Option<&str>,
+    door: &BeefLimits,
+    limits: &BeefLinkLimits,
+) -> bsv_rs::Result<Transaction> {
     let parsed = parse_beef(bytes, door)?;
-    let target = txid
-        .map(str::to_string)
-        .or_else(|| parsed.atomic_txid.clone())
-        .or_else(|| parsed.txs.last().map(bsv_rs::transaction::BeefTx::txid))
-        .ok_or_else(|| bsv_rs::Error::TransactionError("No transactions in BEEF".into()))?;
-    parsed.find_atomic_transaction(&target).ok_or_else(|| {
-        bsv_rs::Error::TransactionError(format!("Transaction {target} not found in BEEF"))
-    })
+    let target = target_of(&parsed, txid)?;
+    parsed
+        .find_atomic_transaction_limited(&target, limits)?
+        .ok_or_else(|| {
+            bsv_rs::Error::TransactionError(format!("Transaction {target} not found in BEEF"))
+        })
+}
+
+/// The SUBJECT alone, its input ancestry NOT linked (bsv-rs 0.8.11's
+/// `Transaction::from_beef_subject`, through this module's door): the same
+/// target selection as [`transaction_from_beef`], the subject's own fields
+/// (txid, inputs' outpoints and sequences, outputs, lock time) and its own
+/// proof, attached as the link attaches it (`Beef::find_bump` of its txid).
+/// Each input's `source_transaction` is `None`. No link bound applies: there
+/// is nothing to re-materialize, so no size of an honest BEEF is refused here.
+pub fn subject_from_beef(
+    bytes: &[u8],
+    txid: Option<&str>,
+    door: &BeefLimits,
+) -> bsv_rs::Result<Transaction> {
+    let parsed = parse_beef(bytes, door)?;
+    let target = target_of(&parsed, txid)?;
+    let mut tx = parsed
+        .find_txid(&target)
+        .and_then(|entry| entry.tx().cloned())
+        .ok_or_else(|| {
+            bsv_rs::Error::TransactionError(format!("Transaction {target} not found in BEEF"))
+        })?;
+    if tx.merkle_path.is_none() {
+        tx.merkle_path = parsed.find_bump(&tx.id()).cloned();
+    }
+    Ok(tx)
+}
+
+/// `txid` linked out of a parsed BEEF under the default link bound:
+/// `Ok(None)` when the BEEF does not carry its body, `Err` when the link
+/// bound trips ([`is_link_bound`]). `Beef::find_atomic_transaction` answers
+/// `None` for both, so no reader of this crate calls it.
+pub fn linked(beef: &Beef, txid: &str) -> bsv_rs::Result<Option<Transaction>> {
+    beef.find_atomic_transaction_limited(txid, &BeefLinkLimits::default())
+}
+
+/// The figure every Extended Format read of bytes this service did not write
+/// itself passes to bsv-rs 0.8.10's `Transaction::from_ef_bounded`
+/// (GHSA-82g9-h6jw-r99f): the source outputs an EF read may build for its
+/// inputs together. `from_ef` gives an input spending output `n` a source of
+/// `n + 1` outputs, so eight inputs naming output 100,000 (425 bytes of EF) ask
+/// for 800,008 of them. The figure is the door's memory limb
+/// ([`DoorBudget::DEFAULT`](crate::engine::DoorBudget::DEFAULT)
+/// `max_memory_bytes`, 48 MiB, three eighths of a 128 MB isolate) divided by
+/// one output's size, `size_of::<TransactionOutput>()` on the target the code
+/// is built for: a read never builds more source outputs than the limb holds.
+/// An honest EF names each input's own vout, so it asks for the sum of
+/// (vout + 1); 48 MiB of outputs is far past any honest transaction's.
+pub const EF_SOURCE_OUTPUTS_MAX: usize = (crate::engine::DoorBudget::DEFAULT.max_memory_bytes
+    as usize)
+    / core::mem::size_of::<bsv_rs::transaction::TransactionOutput>();
+
+/// Whether `e` is the link bound's trip (bsv-rs 0.8.11, GHSA-gvmh-f5gf-5vjj): a
+/// resource decline, never a verdict on the bytes.
+#[must_use]
+pub fn is_link_bound(e: &bsv_rs::Error) -> bool {
+    matches!(e, bsv_rs::Error::BeefResourceLimit(_))
 }
 
 /// The BUMP index the BEEF gives `txid`'s own entry (the last entry of that

@@ -540,7 +540,7 @@ pub async fn repoint_arcade_named(
     }
     let evicted = evicted.to_ascii_lowercase();
     let Some(subject) = beef.and_then(|b| {
-        beef_limits::transaction_from_beef(b, Some(&evicted), &beef_limits::STORED_BEEF_LIMITS).ok()
+        beef_limits::subject_from_beef(b, Some(&evicted), &beef_limits::STORED_BEEF_LIMITS).ok()
     }) else {
         crate::proof_fetcher::push_log(&format!(
             "[admit-fast] evict {evicted}: Arcade names {} spent input(s) but the subject's bytes are not held; nothing re-pointed",
