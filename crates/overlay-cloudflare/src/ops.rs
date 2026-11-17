@@ -120,9 +120,22 @@ pub fn engine_walk_over_counter(limb: overlay_engine::engine::WalkLimb) -> &'sta
     }
 }
 
-/// Count and log the engine walks of a submit that could not run (bsv-low #592) and WENT ON (the gated replay,
-/// `WalkBreachPolicy::NetworkAccepted`), and those of its carried predecessors' landings (the E592 lens fold, L3),
-/// at `door` (`POST /submit`, `Queue`, `POST /admin/readmit`, `peer-crawl`). Nothing when every walk ran.
+/// The words of the log line for a submit that went on past a walk or a link that could not run: the network's
+/// accept is named only where the engine's caller held it (`WalkBreachPolicy::NetworkAccepted`); in
+/// `historical-tx-no-spv` under the default policy the line says the subject is read unlinked and nothing more.
+pub fn engine_walk_went_on_words(report: &overlay_engine::engine::MutationReport) -> &'static str {
+    match report.walk_went_on {
+        Some(overlay_engine::engine::WalkWentOn::NetworkAccepted) => {
+            "the network accepted these bytes, admitted as historical-tx-no-spv"
+        }
+        _ => "no-spv: the subject is read unlinked (this mode walks nothing)",
+    }
+}
+
+/// Count and log the engine walks of a submit that could not run (bsv-low #592) and WENT ON (the gated replay
+/// under `WalkBreachPolicy::NetworkAccepted`, or a link past its bound in `historical-tx-no-spv`), and those of its
+/// carried predecessors' landings (the E592 lens fold, L3), at `door` (`POST /submit`, `Queue`,
+/// `POST /admin/readmit`, `peer-crawl`). Nothing when every walk ran.
 pub async fn note_engine_walk(
     db: &D1Database,
     report: &overlay_engine::engine::MutationReport,
@@ -130,12 +143,13 @@ pub async fn note_engine_walk(
 ) {
     if let Some(stop) = &report.walk_could_not_run {
         worker::console_log!(
-            "{door}: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): the network accepted these bytes, admitted as historical-tx-no-spv",
+            "{door}: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): {}",
             stop.subject_txid,
             stop.limb.as_str(),
             stop.at_txid,
             stop.subject_judged,
-            stop.what
+            stop.what,
+            engine_walk_went_on_words(report)
         );
         bump_counter(db, engine_walk_over_counter(stop.limb), 1).await;
     }
