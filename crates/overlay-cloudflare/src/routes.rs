@@ -5815,22 +5815,26 @@ mod tests {
         let mut efs: Vec<EfTx> = (0..20)
             .map(|i| EfTx {
                 txid: format!("anc{i}"),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![0u8; 1024],
             })
             .collect();
         efs.push(EfTx {
             txid: "subj".into(),
+            lock: crate::door_words::SubjectLock::Final,
             ef: vec![0u8; 4096],
         });
         assert!(EfWork::of(&efs, "subj").fits_request());
         // one byte over the subject budget is deferred; at it, done in the request
         let over = vec![EfTx {
             txid: "subj".into(),
+            lock: crate::door_words::SubjectLock::Final,
             ef: vec![0u8; IN_REQUEST_SUBJECT_EF_BYTES + 1],
         }];
         assert!(!EfWork::of(&over, "subj").fits_request());
         let at = vec![EfTx {
             txid: "subj".into(),
+            lock: crate::door_words::SubjectLock::Final,
             ef: vec![0u8; IN_REQUEST_SUBJECT_EF_BYTES],
         }];
         assert!(EfWork::of(&at, "subj").fits_request());
@@ -5846,10 +5850,12 @@ mod tests {
         let at = vec![
             EfTx {
                 txid: "subj".into(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![0u8; 4096],
             },
             EfTx {
                 txid: "anc".into(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![0u8; IN_REQUEST_BATCH_EF_BYTES - 4096],
             },
         ];
@@ -5860,10 +5866,12 @@ mod tests {
         let over = vec![
             EfTx {
                 txid: "subj".into(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![0u8; 4096],
             },
             EfTx {
                 txid: "anc".into(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![0u8; IN_REQUEST_BATCH_EF_BYTES - 4096 + 1],
             },
         ];

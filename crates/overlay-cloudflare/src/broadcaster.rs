@@ -1098,6 +1098,18 @@ impl ArcBroadcaster for WorkerArcBroadcaster {
 
 use crate::ef::{beef_to_ef_batch, EfTx};
 
+/// PURE (bsv-low #836 fold, the lens's M1): the lock the gated door holds for its subject: the subject's EF entry's
+/// own lock (read from the parsed transaction `beef_to_ef_batch` converted), else, on the #268 mined-claim path
+/// (no EF entry), the lock of the claim's raw. `None`: neither is held (the text's lock height bounds the hold).
+pub fn gated_subject_lock(
+    subject_ef: Option<&EfTx>,
+    mined_subject_raw: Option<&[u8]>,
+) -> Option<crate::door_words::SubjectLock> {
+    subject_ef
+        .map(|e| e.lock)
+        .or_else(|| mined_subject_raw.and_then(crate::door_words::SubjectLock::of_raw))
+}
+
 /// Default live Arcade V2 mainnet endpoint (overridable via `ARCADE_URL`).
 pub const ARCADE_DEFAULT_URL: &str = "https://arcade-v2-us-1.bsvblockchain.tech";
 
@@ -3216,13 +3228,9 @@ impl ArcadeBroadcaster {
         if !efs.is_empty() && subject_ef.is_none() {
             return Err(format!("subject {subject_txid} not present in EF batch"));
         }
-        // bsv-low #836 fold (the lens's M1): the subject's own lock, from the bytes this door broadcasts
-        self.subject_lock.set(
-            subject_ef
-                .map(|e| e.ef.as_slice())
-                .or(mined_subject_raw)
-                .and_then(crate::door_words::SubjectLock::of_bytes),
-        );
+        // bsv-low #836 fold (the lens's M1): the subject's own lock, read from the parsed subject the EF batch
+        // converted (no Extended Format bytes are parsed back), or from the mined claim's raw
+        self.subject_lock.set(gated_subject_lock(subject_ef, mined_subject_raw));
 
         // INCIDENT D1-CALLBACK-FLOOD 2026-09-01 — pre-flight status probe: a
         // RE-PRESENT of a subject Arcade already witnessed ≥SEEN skips the
@@ -4359,10 +4367,12 @@ mod tests {
             vec![
                 EfTx {
                     txid: "parent".into(),
+                    lock: crate::door_words::SubjectLock::Final,
                     ef: vec![1, 2, 3],
                 },
                 EfTx {
                     txid: "subject".into(),
+                    lock: crate::door_words::SubjectLock::Final,
                     ef: vec![4, 5],
                 },
             ],
@@ -4521,14 +4531,17 @@ mod tests {
         let efs = vec![
             EfTx {
                 txid: "g".into(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![0xaa],
             }, // grandparent
             EfTx {
                 txid: "p".into(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![0xbb],
             }, // parent
             EfTx {
                 txid: "subject".into(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![0xcc],
             }, // subject last
         ];
@@ -4557,14 +4570,17 @@ mod tests {
         let efs = vec![
             EfTx {
                 txid: "g".into(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![0xaa],
             }, // grandparent
             EfTx {
                 txid: "p".into(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![0xbb],
             }, // parent
             EfTx {
                 txid: "subject".into(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![0xcc],
             }, // subject last
         ];
@@ -4607,6 +4623,7 @@ mod tests {
     async fn batch_missing_subject_in_efs_is_an_error() {
         let efs = vec![EfTx {
             txid: "parent".into(),
+            lock: crate::door_words::SubjectLock::Final,
             ef: vec![1, 2, 3],
         }];
         let out = whole_batch(&efs, "subject", |_tx_hex| async {
@@ -4642,11 +4659,13 @@ mod tests {
         let mut efs: Vec<EfTx> = (0..count)
             .map(|i| EfTx {
                 txid: format!("p{i}"),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![(i % 250) as u8, (i / 250) as u8],
             })
             .collect();
         efs.push(EfTx {
             txid: "subject".into(),
+            lock: crate::door_words::SubjectLock::Final,
             ef: vec![0xff, 0xff, 0xff],
         });
         (efs, "subject".to_string())
@@ -5275,22 +5294,27 @@ mod tests {
         let efs = vec![
             EfTx {
                 txid: ids[0].clone(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: arcreg_ef(&[]),
             },
             EfTx {
                 txid: ids[1].clone(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: arcreg_ef(&ids[0..1]),
             },
             EfTx {
                 txid: ids[2].clone(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: arcreg_ef(&ids[1..2]),
             },
             EfTx {
                 txid: ids[3].clone(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: arcreg_ef(&[]),
             },
             EfTx {
                 txid: ids[4].clone(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: arcreg_ef(&[ids[2].clone(), ids[3].clone()]),
             },
         ];
@@ -5305,6 +5329,7 @@ mod tests {
         (0..=n)
             .map(|i| EfTx {
                 txid: format!("{i:064x}"),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: arcreg_ef(&if i == 0 {
                     vec![]
                 } else {
@@ -5633,6 +5658,7 @@ mod tests {
             let mut efs: Vec<_> = (0..n)
                 .map(|i| EfTx {
                     txid: format!("{i:064x}"),
+                    lock: crate::door_words::SubjectLock::Final,
                     ef: arcreg_ef(&if i == 0 || (n == 80 && i == 40) {
                         vec![]
                     } else {
@@ -5642,6 +5668,7 @@ mod tests {
                 .collect();
             efs.push(EfTx {
                 txid: "subject".into(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: arcreg_ef(&if n == 80 {
                     vec![format!("{:064x}", 39), format!("{:064x}", 79)]
                 } else {
@@ -5695,11 +5722,13 @@ mod tests {
             .iter()
             .map(|id| EfTx {
                 txid: id.clone(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: arcreg_ef(&[]),
             })
             .collect();
         efs.push(EfTx {
             txid: "subject".into(),
+            lock: crate::door_words::SubjectLock::Final,
             ef: arcreg_ef(&ids),
         });
         let ancestor_posts = std::cell::Cell::new(0);
@@ -5754,11 +5783,13 @@ mod tests {
             .iter()
             .map(|id| EfTx {
                 txid: id.clone(),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: arcreg_ef(&[]),
             })
             .collect();
         efs.push(EfTx {
             txid: "subject".into(),
+            lock: crate::door_words::SubjectLock::Final,
             ef: arcreg_ef(&ids),
         });
         let posts = std::cell::RefCell::new(Vec::new());
@@ -6938,14 +6969,17 @@ mod tests {
         let efs = vec![
             EfTx {
                 txid: "a".repeat(64),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![3],
             },
             EfTx {
                 txid: "b".repeat(64),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![1],
             },
             EfTx {
                 txid: "c".repeat(64),
+                lock: crate::door_words::SubjectLock::Final,
                 ef: vec![2],
             },
         ];

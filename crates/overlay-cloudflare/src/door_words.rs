@@ -289,18 +289,11 @@ impl SubjectLock {
             SubjectLock::Time(tx.lock_time)
         }
     }
-    /// The lock of the raw bytes, or of the extended format (`None`: neither parses, or the extended format asks
-    /// for more source outputs than [`EF_SOURCE_OUTPUTS_MAX`](overlay_engine::beef_limits::EF_SOURCE_OUTPUTS_MAX)
-    /// allows: GHSA-82g9-h6jw-r99f, refused by bsv-rs before it builds them; the text's lock height then bounds the
-    /// hold, as for bytes not held).
-    pub fn of_bytes(bytes: &[u8]) -> Option<Self> {
+    /// The lock of a raw transaction's bytes (`None`: they do not parse as exactly one transaction). The gated
+    /// door's subject is read from the parsed transaction its EF batch converted (`ef::EfTx::lock`); this reads
+    /// the mined claim's raw, which `ef::proven_subject_raw` serialized.
+    pub fn of_raw(bytes: &[u8]) -> Option<Self> {
         bsv_rs::transaction::Transaction::from_binary(bytes)
-            .or_else(|_| {
-                bsv_rs::transaction::Transaction::from_ef_bounded(
-                    bytes,
-                    overlay_engine::beef_limits::EF_SOURCE_OUTPUTS_MAX,
-                )
-            })
             .ok()
             .map(|tx| Self::of_tx(&tx))
     }
@@ -716,52 +709,6 @@ mod tests {
         raw
     }
 
-    /// PORT-0811 (bsv-rs 0.8.10, GHSA-82g9-h6jw-r99f): the subject's lock read from Extended Format bytes goes
-    /// through `from_ef_bounded` under the door's figure. The advisory's shape (eight inputs spending output
-    /// 100,000 of their sources, 425 bytes, 800,008 source outputs asked for) is refused before it is built, so no
-    /// lock is read from it (the text bounds the hold, as for bytes not held); an honest EF of a locked subject reads.
-    /// On the base `from_ef` built the 800,008 outputs and answered `Some(Final)`.
-    #[test]
-    fn p0811_a_the_lock_of_an_ef_read_is_bounded() {
-        let mut ef = 1u32.to_le_bytes().to_vec();
-        ef.extend([0, 0, 0, 0, 0, 0xef, 8]);
-        for i in 0..8u8 {
-            ef.extend([i + 1; 32]);
-            ef.extend(100_000u32.to_le_bytes());
-            ef.push(0);
-            ef.extend(u32::MAX.to_le_bytes());
-            ef.extend(1_000u64.to_le_bytes());
-            ef.push(0);
-        }
-        ef.push(1);
-        ef.extend(900u64.to_le_bytes());
-        ef.push(0);
-        ef.extend(0u32.to_le_bytes());
-        assert_eq!(ef.len(), 425);
-        assert_eq!(
-            SubjectLock::of_bytes(&ef),
-            None,
-            "the advisory's EF is refused before it is built"
-        );
-        // An honest EF (one input spending output 0, its source's value and lock carried) reads its lock.
-        let mut honest = 1u32.to_le_bytes().to_vec();
-        honest.extend([0, 0, 0, 0, 0, 0xef, 1]);
-        honest.extend([1u8; 32]);
-        honest.extend(0u32.to_le_bytes());
-        honest.push(0);
-        honest.extend(0xffff_fffeu32.to_le_bytes());
-        honest.extend(1_000u64.to_le_bytes());
-        honest.extend([1, 0x51]);
-        honest.push(1);
-        honest.extend(900u64.to_le_bytes());
-        honest.extend([1, 0x51]);
-        honest.extend(972_185u32.to_le_bytes());
-        assert_eq!(
-            SubjectLock::of_bytes(&honest),
-            Some(SubjectLock::Height(972_185))
-        );
-    }
-
     /// bsv-low #836 fold (the lens's M1, parts 1 and 2): the hold ENDS by the chain. The lock is the subject's own
     /// bytes (Arcade's finality rule); the word is "not now" only while `tip + 1 <= lock + NOT_FINAL_LAG_BLOCKS`
     /// (24), or a time lock plus `NOT_FINAL_LAG_SECS`; a subject final by its bytes is never held; no tip holds; only
@@ -770,16 +717,16 @@ mod tests {
     fn fix836f_m1_the_hold_ends_by_the_chain() {
         assert_eq!(NOT_FINAL_LAG_BLOCKS, 24);
         assert_eq!(
-            SubjectLock::of_bytes(&raw_tx(972_185, 0xffff_fffe)),
+            SubjectLock::of_raw(&raw_tx(972_185, 0xffff_fffe)),
             Some(SubjectLock::Height(972_185))
         );
-        assert_eq!(SubjectLock::of_bytes(&raw_tx(972_185, u32::MAX)), Some(SubjectLock::Final));
-        assert_eq!(SubjectLock::of_bytes(&raw_tx(0, 0)), Some(SubjectLock::Final));
+        assert_eq!(SubjectLock::of_raw(&raw_tx(972_185, u32::MAX)), Some(SubjectLock::Final));
+        assert_eq!(SubjectLock::of_raw(&raw_tx(0, 0)), Some(SubjectLock::Final));
         assert_eq!(
-            SubjectLock::of_bytes(&raw_tx(1_761_000_000, 0)),
+            SubjectLock::of_raw(&raw_tx(1_761_000_000, 0)),
             Some(SubjectLock::Time(1_761_000_000))
         );
-        assert_eq!(SubjectLock::of_bytes(b"not a transaction"), None);
+        assert_eq!(SubjectLock::of_raw(b"not a transaction"), None);
         let loop44 = "TX_LOCK_TIME (35): lock time (972185) as block height is not less than block height (972172)";
         let nf = lock_time_not_final("REJECTED", loop44).unwrap();
         let height = |tip: Option<u64>| LockBound {

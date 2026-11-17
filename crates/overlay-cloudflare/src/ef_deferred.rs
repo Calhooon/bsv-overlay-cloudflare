@@ -1576,6 +1576,7 @@ mod tests {
     fn leg(txid: &str, n: usize) -> EfTx {
         EfTx {
             txid: txid.to_string(),
+            lock: crate::door_words::SubjectLock::Final,
             ef: vec![0u8; n],
         }
     }
