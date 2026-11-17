@@ -628,7 +628,7 @@ fn push_of(len: usize) -> Vec<u8> {
 /// stack's peak at and around 1,000 elements; an unlock and a lock at and
 /// around 10,000 bytes; a push of 520 and 521 bytes; versions 1 and 2. The
 /// lens's row (1-of-16, version 2, 987 pushes before the signature) is one of
-/// them: on `1af62adf` the door walked it `Ok` where bsv-rs refuses it.
+/// them: bsv-rs refuses it, and the door does not walk it valid.
 #[tokio::test]
 async fn p0811_c_c_the_eras_exemption_is_held_to_the_sdks_own_verdict() {
     use bsv_rs::primitives::ec::PrivateKey;
@@ -825,7 +825,6 @@ async fn p0811_c_c_the_eras_exemption_is_held_to_the_sdks_own_verdict() {
 /// the Genesis height and one above it. A push of 521 bytes (refused by the
 /// rules of a coin from before Genesis) spending the coin proven above Genesis
 /// is judged; the same push spending the coin proven below it is declined.
-/// On `1af62adf` the first was declined too (the era was the BEEF's).
 #[tokio::test]
 async fn p0811_c_d_the_era_is_read_per_source() {
     let lock = |bytes: &[u8]| LockingScript::from_script(script(bytes));
