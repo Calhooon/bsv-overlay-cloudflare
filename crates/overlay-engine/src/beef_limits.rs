@@ -342,7 +342,9 @@ pub const LINK_CHARGE_INDEX_LEAF: u64 = 64;
 
 /// The heap figure handed to bsv-rs's own heap meter ([`engine_link_limits`];
 /// bsv-rs 0.8.12, GHSA-33fm-jcm5-4m3m: `BeefLinkLimits::max_link_heap_bytes`),
-/// 56 MiB, named here so a later bsv-rs default does not move it.
+/// 56 MiB, named here so the figure is the engine's own and never whatever
+/// bsv-rs's default holds. On bsv-rs 0.8.12 it equals what
+/// `BeefLinkLimits::default()` holds for `max_link_heap_bytes`.
 ///
 /// bsv-rs charges, per clone, the stub's wire bytes plus `size_of` of its
 /// transaction (248 bytes natively), inputs (168) and outputs (136), and 104
