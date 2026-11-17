@@ -404,8 +404,8 @@ const PAST_LEVEL0: u64 = 564_610;
 /// (56 MiB), and every per-clone charge of bsv-rs's heap meter is at most the
 /// estimate's charge for the same thing, so on the ancestry bsv-rs counts
 /// under the estimate, which `LINK_HEAP_MAX_BYTES` bounds. RED against a figure
-/// under the estimate's bound, against bsv-rs's default handed instead once
-/// that default moves, and against a later bsv-rs whose structs outgrow the
+/// under the estimate's bound, against bsv-rs's default handed instead where
+/// that default differs, and against bsv-rs structs that outgrow the
 /// estimate's charges.
 #[test]
 fn p0812_the_engine_names_its_heap_figure() {
@@ -423,10 +423,10 @@ fn p0812_the_engine_names_its_heap_figure() {
     // bsv-rs's BUMP leaf: its struct and its 64-character hex hash.
     assert!(size(std::mem::size_of::<MerklePathLeaf>()) + 64 <= beef_limits::LINK_CHARGE_BUMP_LEAF);
     println!(
-        "FIGURE wire {:?}, heap {:?} (bsv-rs's default {}); sizes: Transaction {}, input {}, output {}, BUMP leaf {} + 64",
+        "FIGURE wire {:?}, heap {:?} (bsv-rs's default {:?}); sizes: Transaction {}, input {}, output {}, BUMP leaf {} + 64",
         limits.max_link_bytes,
         limits.max_link_heap_bytes,
-        BeefLinkLimits::DEFAULT_MAX_LINK_HEAP_BYTES,
+        BeefLinkLimits::default().max_link_heap_bytes,
         std::mem::size_of::<Transaction>(),
         std::mem::size_of::<TransactionInput>(),
         std::mem::size_of::<TransactionOutput>(),
