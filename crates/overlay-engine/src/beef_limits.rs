@@ -344,22 +344,6 @@ pub fn linked(beef: &Beef, txid: &str) -> bsv_rs::Result<Option<Transaction>> {
     beef.find_atomic_transaction_limited(txid, &BeefLinkLimits::default())
 }
 
-/// The figure every Extended Format read of bytes this service did not write
-/// itself passes to bsv-rs 0.8.10's `Transaction::from_ef_bounded`
-/// (GHSA-82g9-h6jw-r99f): the source outputs an EF read may build for its
-/// inputs together. `from_ef` gives an input spending output `n` a source of
-/// `n + 1` outputs, so eight inputs naming output 100,000 (425 bytes of EF) ask
-/// for 800,008 of them. The figure is the door's memory limb
-/// ([`DoorBudget::DEFAULT`](crate::engine::DoorBudget::DEFAULT)
-/// `max_memory_bytes`, 48 MiB, three eighths of a 128 MB isolate) divided by
-/// one output's size, `size_of::<TransactionOutput>()` on the target the code
-/// is built for: a read never builds more source outputs than the limb holds.
-/// An honest EF names each input's own vout, so it asks for the sum of
-/// (vout + 1); 48 MiB of outputs is far past any honest transaction's.
-pub const EF_SOURCE_OUTPUTS_MAX: usize = (crate::engine::DoorBudget::DEFAULT.max_memory_bytes
-    as usize)
-    / core::mem::size_of::<bsv_rs::transaction::TransactionOutput>();
-
 /// Whether `e` is the link bound's trip (bsv-rs 0.8.11, GHSA-gvmh-f5gf-5vjj): a
 /// resource decline, never a verdict on the bytes.
 #[must_use]

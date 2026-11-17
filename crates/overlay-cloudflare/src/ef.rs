@@ -9,17 +9,24 @@
 //! ancestors for free).
 //!
 //! Source satoshis + locking scripts come from the BEEF's own ancestry:
-//! `Transaction::to_ef()` requires each input's `source_transaction` to be
-//! linked, and the bsv-rs BEEF parser does NOT link them, so we build a
-//! txid→tx map from the BEEF and wire the sources one level deep ourselves
-//! (the map's transactions are themselves flat/unlinked, so the clones stay
-//! shallow — exactly enough for `to_ef`).
+//! each input's Extended Format entry carries the satoshis and the locking
+//! script of the ONE output it spends, read in place from the source
+//! transaction the BEEF holds (bsv-rs's parser does not link sources, and
+//! this module links none: no source is cloned). The bytes written are the
+//! bytes `Transaction::to_ef` writes over a linked transaction (pinned), and
+//! the conversion's memory follows the body: each source output's lock is
+//! written once in a batch, since an outpoint the batch already spent is a
+//! conversion failure of the transaction that spends it again (a double
+//! spend inside one BEEF, which no network admits).
 
 use overlay_engine::beef_limits;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use bsv_rs::primitives::Writer;
 use bsv_rs::transaction::{Beef, Transaction};
 use thiserror::Error;
+
+use crate::door_words::SubjectLock;
 
 /// Error converting a BEEF into Extended-Format binaries.
 #[derive(Debug, Error)]
@@ -39,6 +46,10 @@ pub struct EfTx {
     pub txid: String,
     /// The transaction in Extended Format (BRC-30).
     pub ef: Vec<u8>,
+    /// The transaction's own lock, read from the parsed transaction the batch
+    /// converted (bsv-low #836: the door's not-final hold reads it; no
+    /// Extended Format bytes are parsed back to find it).
+    pub lock: SubjectLock,
 }
 
 /// Convert BEEF bytes into Extended Format (BRC-30) binaries for ARC.
@@ -72,53 +83,42 @@ pub fn beef_to_ef_batch(beef_bytes: &[u8]) -> Result<(Vec<EfTx>, String), EfErro
     let subject_txid = subject_txid_of(&mut beef).unwrap_or_default();
     beef.sort_txs();
 
-    // txid → parsed transaction, for linking input sources one level deep.
-    let mut tx_map: HashMap<String, Transaction> = HashMap::with_capacity(beef.txs.len());
-    for btx in &beef.txs {
+    // txid → the BEEF's own parsed transaction, borrowed (nothing cloned):
+    // an input's source output is read in place.
+    let txids: Vec<String> = beef.txs.iter().map(|b| b.txid()).collect();
+    let mut sources: HashMap<&str, &Transaction> = HashMap::with_capacity(beef.txs.len());
+    for (btx, txid) in beef.txs.iter().zip(&txids) {
         if let Some(tx) = btx.tx() {
-            tx_map.insert(btx.txid(), tx.clone());
+            sources.insert(txid.as_str(), tx);
         }
     }
+    // Every outpoint a converted input of this batch spends: one written lock each.
+    let mut spent: HashSet<(&str, u32)> = HashSet::new();
 
     let mut efs = Vec::new();
 
-    for btx in &beef.txs {
-        let txid = btx.txid();
-
+    for (btx, txid) in beef.txs.iter().zip(&txids) {
         if btx.has_proof() {
             // Already mined — provides source data for children, nothing to broadcast.
             continue;
         }
 
-        let convert = || -> Result<Vec<u8>, EfError> {
-            let tx = btx.tx().ok_or_else(|| {
+        let converted = btx
+            .tx()
+            .ok_or_else(|| {
                 EfError::EfConversion(format!("txid-only entry {txid} has no transaction data"))
-            })?;
-            let mut tx = tx.clone();
-            for input in &mut tx.inputs {
-                if input.source_transaction.is_some() {
-                    continue;
-                }
-                let src_txid = input.source_txid.clone().ok_or_else(|| {
-                    EfError::EfConversion(format!("input in {txid} has no source txid"))
-                })?;
-                let src = tx_map.get(&src_txid).ok_or_else(|| {
-                    EfError::EfConversion(format!(
-                        "source tx {src_txid} for {txid} not present in BEEF"
-                    ))
-                })?;
-                input.source_transaction = Some(Box::new(src.clone()));
-            }
-            tx.to_ef()
-                .map_err(|e| EfError::EfConversion(format!("{txid}: {e}")))
-        };
+            })
+            .and_then(|tx| {
+                write_ef(tx, txid, &sources, &mut spent).map(|ef| (ef, SubjectLock::of_tx(tx)))
+            });
 
-        match convert() {
-            Ok(ef) => efs.push(EfTx {
+        match converted {
+            Ok((ef, lock)) => efs.push(EfTx {
                 txid: txid.clone(),
                 ef,
+                lock,
             }),
-            Err(e) if txid == subject_txid => return Err(e),
+            Err(e) if *txid == subject_txid => return Err(e),
             Err(e) => {
                 // Ancestor without its own sources — broadcast long ago by
                 // construction; the subject's verdict is the arbiter.
@@ -128,6 +128,98 @@ pub fn beef_to_ef_batch(beef_bytes: &[u8]) -> Result<(Vec<EfTx>, String), EfErro
     }
 
     Ok((efs, subject_txid))
+}
+
+/// One transaction in Extended Format (BRC-30), written from its own fields
+/// and, per input, the satoshis and locking script of the one output it
+/// spends, read in place from `sources` (the field order and encoding of
+/// `Transaction::to_ef`, whose bytes these are). The outpoints are recorded
+/// in `spent` only once the whole transaction converted, so a transaction
+/// that fails leaves the batch's record as it was.
+fn write_ef<'a>(
+    tx: &Transaction,
+    txid: &str,
+    sources: &HashMap<&'a str, &'a Transaction>,
+    spent: &mut HashSet<(&'a str, u32)>,
+) -> Result<Vec<u8>, EfError> {
+    let mut mine: Vec<(&'a str, u32)> = Vec::with_capacity(tx.inputs.len());
+    let written = write_ef_recording(tx, txid, sources, spent, &mut mine);
+    if written.is_err() {
+        for outpoint in &mine {
+            spent.remove(outpoint);
+        }
+    }
+    written
+}
+
+/// [`write_ef`]'s body: each outpoint it spends is added to `spent` (and to
+/// `mine`, so a failure can take them out again) as its input is written.
+fn write_ef_recording<'a>(
+    tx: &Transaction,
+    txid: &str,
+    sources: &HashMap<&'a str, &'a Transaction>,
+    spent: &mut HashSet<(&'a str, u32)>,
+    mine: &mut Vec<(&'a str, u32)>,
+) -> Result<Vec<u8>, EfError> {
+    let sdk = |e: bsv_rs::Error| EfError::EfConversion(format!("{txid}: {e}"));
+    let mut writer = Writer::new();
+    writer.write_u32_le(tx.version);
+    writer.write_bytes(&[0x00, 0x00, 0x00, 0x00, 0x00, 0xEF]);
+    writer.write_var_int(tx.inputs.len() as u64);
+    for input in &tx.inputs {
+        let src_txid = input
+            .source_txid
+            .as_deref()
+            .ok_or_else(|| EfError::EfConversion(format!("input in {txid} has no source txid")))?;
+        let (&src_key, src) = sources.get_key_value(src_txid).ok_or_else(|| {
+            EfError::EfConversion(format!(
+                "source tx {src_txid} for {txid} not present in BEEF"
+            ))
+        })?;
+        let outpoint = (src_key, input.source_output_index);
+        if !spent.insert(outpoint) {
+            return Err(EfError::EfConversion(format!(
+                "{txid}: spends {src_txid}:{} which the batch already spends",
+                input.source_output_index
+            )));
+        }
+        mine.push(outpoint);
+        writer.write_bytes(&input.get_source_txid_bytes().map_err(sdk)?);
+        writer.write_u32_le(input.source_output_index);
+        let unlocking = input
+            .unlocking_script
+            .as_ref()
+            .ok_or_else(|| {
+                sdk(bsv_rs::Error::TransactionError(
+                    "unlockingScript is undefined".to_string(),
+                ))
+            })?
+            .to_binary();
+        writer.write_var_int(unlocking.len() as u64);
+        writer.write_bytes(&unlocking);
+        writer.write_u32_le(input.sequence);
+        let output = src
+            .outputs
+            .get(input.source_output_index as usize)
+            .ok_or_else(|| {
+                sdk(bsv_rs::Error::TransactionError(
+                    "Source output index out of bounds".to_string(),
+                ))
+            })?;
+        writer.write_u64_le(output.satoshis.unwrap_or(0));
+        let lock = output.locking_script.to_binary();
+        writer.write_var_int(lock.len() as u64);
+        writer.write_bytes(&lock);
+    }
+    writer.write_var_int(tx.outputs.len() as u64);
+    for output in &tx.outputs {
+        writer.write_u64_le(output.satoshis.unwrap_or(0));
+        let script = output.locking_script.to_binary();
+        writer.write_var_int(script.len() as u64);
+        writer.write_bytes(&script);
+    }
+    writer.write_u32_le(tx.lock_time);
+    Ok(writer.into_bytes())
 }
 
 /// PURE (loop-2 hardening, 2026-09-05 — F-D): the SUBJECT's input source
@@ -309,6 +401,8 @@ pub fn proven_subject_raw(beef_bytes: &[u8]) -> Option<Vec<u8>> {
 )]
 mod tests {
     use super::*;
+    use bsv_rs::script::{LockingScript, UnlockingScript};
+    use bsv_rs::transaction::{TransactionInput, TransactionOutput};
 
     /// F-D (2026-09-05): a subject whose parents are only NAMED in the BEEF
     /// lists them as missing; merging a parent's courier-served raw (hash-
@@ -681,6 +775,417 @@ mod tests {
             subject_txid_of(&mut two),
             expect,
             "no unique tip → the reference's sorted-last"
+        );
+    }
+
+    /// Each converted leg's txid and EF bytes.
+    type Legs = Vec<(String, Vec<u8>)>;
+
+    /// The conversion as it stood before PORT-0811's fold, kept only as the
+    /// byte reference: every input given a linked clone of its whole source,
+    /// then the SDK's own `Transaction::to_ef`. (The shipped path writes the
+    /// same bytes from the one spent output, in place.)
+    fn sdk_reference_batch(beef_bytes: &[u8]) -> Result<(Legs, String), EfError> {
+        let mut beef = beef_limits::parse_beef(beef_bytes, &beef_limits::EF_BEEF_LIMITS)
+            .map_err(|e| EfError::Parse(e.to_string()))?;
+        let subject_txid = subject_txid_of(&mut beef).unwrap_or_default();
+        beef.sort_txs();
+        let mut tx_map: HashMap<String, Transaction> = HashMap::new();
+        for btx in &beef.txs {
+            if let Some(tx) = btx.tx() {
+                tx_map.insert(btx.txid(), tx.clone());
+            }
+        }
+        let mut out = Vec::new();
+        for btx in &beef.txs {
+            let txid = btx.txid();
+            if btx.has_proof() {
+                continue;
+            }
+            let convert = || -> Result<Vec<u8>, EfError> {
+                let mut tx = btx
+                    .tx()
+                    .ok_or_else(|| EfError::EfConversion("txid-only".into()))?
+                    .clone();
+                for input in &mut tx.inputs {
+                    let src_txid = input
+                        .source_txid
+                        .clone()
+                        .ok_or_else(|| EfError::EfConversion("no source txid".into()))?;
+                    let src = tx_map
+                        .get(&src_txid)
+                        .ok_or_else(|| EfError::EfConversion("absent".into()))?;
+                    input.source_transaction = Some(Box::new(src.clone()));
+                }
+                tx.to_ef().map_err(|e| EfError::EfConversion(e.to_string()))
+            };
+            match convert() {
+                Ok(ef) => out.push((txid, ef)),
+                Err(e) if txid == subject_txid => return Err(e),
+                Err(_) => {}
+            }
+        }
+        Ok((out, subject_txid))
+    }
+
+    /// Every BEEF fixture this repository holds (the covenant legs' parent and
+    /// subject, both loop-2 JOIN captures, the census's client bodies,
+    /// Zanaadu's proven head, the lane-script valid body, and a BEEF of the
+    /// engine's four real raws).
+    fn real_beefs() -> Vec<(String, Vec<u8>)> {
+        let mut out = vec![
+            ("covenant legs".to_string(), build_unmined_beef()),
+            (
+                "loop2 incomplete JOIN".to_string(),
+                LOOP2_INCOMPLETE_JOIN_BEEF.to_vec(),
+            ),
+            ("loop2 represent".to_string(), LOOP2_REPRESENT_BEEF.to_vec()),
+            (
+                "zanaadu head".to_string(),
+                include_bytes!("../../overlay-engine/tests/fixtures/zanaadu-pf-head-dc4ca9ea.beef")
+                    .to_vec(),
+            ),
+            (
+                "lane-script valid".to_string(),
+                hex::decode(
+                    include_str!("../../../tools/lane-script/fixtures/valid.beef.hex").trim(),
+                )
+                .unwrap(),
+            ),
+        ];
+        let census: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/census/client_parity.fixture.json"
+        ))
+        .unwrap();
+        for case in census["cases"].as_array().unwrap() {
+            if let Ok(bytes) = hex::decode(case["beefHex"].as_str().unwrap_or_default()) {
+                out.push((format!("census {}", case["label"]), bytes));
+            }
+        }
+        let mut raws = Beef::new();
+        for raw in [
+            include_str!("../../overlay-engine/tests/fixtures/3ca368b0ca4dcb31ba87977d7aaf3a4671eafa2c980864c880f96080c68cee36.hex"),
+            include_str!("../../overlay-engine/tests/fixtures/5533ca32a296c58778a240cd7649392bf2e6b11ef63e1c71765913ebba093c59.hex"),
+            include_str!("../../overlay-engine/tests/fixtures/91309122f5630052f7e57f7db843d26d32ae4426a9dd9b2fc2955f2fab8cf9a6.hex"),
+            include_str!("../../overlay-engine/tests/fixtures/c571d433b8234e225af0c631f076b137b7c164cfa72f86b3e713f9ba67e3b563.hex"),
+        ] {
+            raws.merge_raw_tx(hex::decode(raw.trim()).unwrap(), None);
+        }
+        out.push(("engine raws".to_string(), raws.to_binary()));
+        out
+    }
+
+    /// A generated graph: `parents` unproven parents (each of its own funding
+    /// txid, `outs` outputs of varied locks and values), `children` unproven
+    /// transactions each spending a disjoint run of those outputs, and a
+    /// subject spending one output of every child. No outpoint is spent twice.
+    fn generated(seed: u64, parents: u32, outs: u32, children: u32) -> Vec<u8> {
+        let mut rng = seed;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let lock = |n: u64| -> LockingScript {
+            let len = (n % 40) as usize;
+            let mut bytes = vec![0x51u8];
+            bytes.extend(std::iter::repeat_n(0x61u8, len)); // OP_NOPs
+            LockingScript::from_binary(&bytes).unwrap()
+        };
+        let mut beef = Beef::new();
+        let mut spendable: Vec<(String, u32)> = Vec::new();
+        for p in 0..parents {
+            let mut tx = Transaction::new();
+            tx.version = 1 + (next() % 2) as u32;
+            tx.inputs.push(TransactionInput {
+                source_txid: Some(format!("{:064x}", u64::from(p) + 7)),
+                source_output_index: p,
+                unlocking_script: Some(UnlockingScript::from_binary(&[0x01, p as u8]).unwrap()),
+                sequence: 0xffff_fffe,
+                ..Default::default()
+            });
+            for _ in 0..outs {
+                tx.outputs
+                    .push(TransactionOutput::new(next() % 100_000, lock(next())));
+            }
+            let id = tx.id();
+            for v in 0..outs {
+                spendable.push((id.clone(), v));
+            }
+            beef.merge_transaction(tx);
+        }
+        let per = (spendable.len() as u32 / children.max(1)).max(1) as usize;
+        let mut child_ids = Vec::new();
+        for c in 0..children as usize {
+            let run = spendable.iter().skip(c * per).take(per);
+            let mut tx = Transaction::new();
+            for (k, (src, v)) in run.enumerate() {
+                let unlock_len = (next() % 80) as usize;
+                tx.inputs.push(TransactionInput {
+                    source_txid: Some(src.clone()),
+                    source_output_index: *v,
+                    unlocking_script: Some(
+                        UnlockingScript::from_binary(&push(unlock_len, k as u8)).unwrap(),
+                    ),
+                    sequence: if next() % 3 == 0 {
+                        u32::MAX
+                    } else {
+                        next() as u32
+                    },
+                    ..Default::default()
+                });
+            }
+            if tx.inputs.is_empty() {
+                continue;
+            }
+            tx.outputs.push(TransactionOutput::new(1, lock(next())));
+            tx.lock_time = (next() % 1_000_000) as u32;
+            child_ids.push(tx.id());
+            beef.merge_transaction(tx);
+        }
+        let mut subject = Transaction::new();
+        for id in &child_ids {
+            subject.inputs.push(TransactionInput {
+                source_txid: Some(id.clone()),
+                source_output_index: 0,
+                unlocking_script: Some(UnlockingScript::from_binary(&[]).unwrap()),
+                sequence: u32::MAX,
+                ..Default::default()
+            });
+        }
+        subject.outputs.push(TransactionOutput::new(1, lock(3)));
+        beef.merge_transaction(subject);
+        beef.to_binary()
+    }
+
+    /// One data push of `len` bytes (push-only, as any unlocking script here).
+    fn push(len: usize, fill: u8) -> Vec<u8> {
+        if len == 0 {
+            return vec![0x00];
+        }
+        let mut out = if len < 0x4c {
+            vec![len as u8]
+        } else {
+            vec![0x4c, len as u8]
+        };
+        out.extend(std::iter::repeat_n(fill, len));
+        out
+    }
+
+    /// PORT-0811 fold: the Extended Format batch is written from each input's
+    /// own fields and the one output it spends, with no source linked; its
+    /// bytes are the SDK's `Transaction::to_ef` over the linked transaction,
+    /// leg for leg, over every BEEF fixture of the repository and 60 generated
+    /// graphs (proven-free fan-ins, wide parents, mixed versions, sequences and
+    /// lock times); the subject and the refusal of a subject that does not
+    /// convert are the same too.
+    #[test]
+    fn p0811_f1_the_ef_batch_writes_the_sdks_bytes() {
+        let mut bodies = real_beefs();
+        let real = bodies.len();
+        for seed in 1..=60u64 {
+            let (p, o, c) = (
+                1 + (seed % 4) as u32,
+                1 + (seed * 7 % 37) as u32,
+                1 + (seed % 9) as u32,
+            );
+            bodies.push((
+                format!("generated {seed} ({p}x{o} -> {c})"),
+                generated(seed, p, o, c),
+            ));
+        }
+        let mut legs = 0usize;
+        for (name, body) in &bodies {
+            let shipped = beef_to_ef_batch(body);
+            let reference = sdk_reference_batch(body);
+            match (shipped, reference) {
+                (Ok((efs, subject)), Ok((ref_efs, ref_subject))) => {
+                    assert_eq!(subject, ref_subject, "{name}: the subject");
+                    let got: Vec<(String, Vec<u8>)> =
+                        efs.iter().map(|e| (e.txid.clone(), e.ef.clone())).collect();
+                    assert_eq!(got, ref_efs, "{name}: the bytes are the SDK's");
+                    legs += got.len();
+                }
+                (Err(_), Err(_)) => {}
+                (a, b) => panic!(
+                    "{name}: the shipped path answered {:?}, the SDK's {:?}",
+                    a.map(|(e, s)| (e.len(), s)).map_err(|e| e.to_string()),
+                    b.map(|(e, s)| (e.len(), s)).map_err(|e| e.to_string())
+                ),
+            }
+        }
+        assert!(real >= 10, "the real fixtures read: {real}");
+        assert!(legs > 200, "legs compared: {legs}");
+    }
+
+    /// PORT-0811 fold: each EF leg carries its transaction's own lock, read
+    /// from the parsed transaction (bsv-low #836: the gated door's hold reads
+    /// it; no EF bytes are parsed back). A non-final subject reads its height,
+    /// a time-locked one its time, a final one `Final`, through the gated
+    /// door's own choice (`broadcaster::gated_subject_lock`); the mined claim's
+    /// raw reads as it did.
+    #[test]
+    fn p0811_f2_the_gated_subject_lock_is_the_parsed_subjects() {
+        let subject_beef = |lock_time: u32, sequence: u32| -> (Vec<u8>, String) {
+            let mut parent = Transaction::new();
+            parent.inputs.push(TransactionInput {
+                source_txid: Some("ab".repeat(32)),
+                unlocking_script: Some(UnlockingScript::from_binary(&[]).unwrap()),
+                ..Default::default()
+            });
+            parent.outputs.push(TransactionOutput::new(
+                5,
+                LockingScript::from_binary(&[0x51]).unwrap(),
+            ));
+            let mut child = Transaction::new();
+            child.inputs.push(TransactionInput {
+                source_txid: Some(parent.id()),
+                unlocking_script: Some(UnlockingScript::from_binary(&[]).unwrap()),
+                sequence,
+                ..Default::default()
+            });
+            child.outputs.push(TransactionOutput::new(
+                4,
+                LockingScript::from_binary(&[0x51]).unwrap(),
+            ));
+            child.lock_time = lock_time;
+            let id = child.id();
+            let mut beef = Beef::new();
+            beef.merge_transaction(parent);
+            beef.merge_transaction(child);
+            (beef.to_binary(), id)
+        };
+        let gated = |lock_time: u32, sequence: u32| {
+            let (beef, subject) = subject_beef(lock_time, sequence);
+            let (efs, named) = beef_to_ef_batch(&beef).unwrap();
+            assert_eq!(named, subject);
+            let ef = efs.iter().find(|e| e.txid == subject);
+            crate::broadcaster::gated_subject_lock(ef, None)
+        };
+        assert_eq!(
+            gated(900_000, 0xffff_fffe),
+            Some(SubjectLock::Height(900_000))
+        );
+        assert_eq!(
+            gated(1_761_000_000, 0),
+            Some(SubjectLock::Time(1_761_000_000))
+        );
+        assert_eq!(gated(900_000, u32::MAX), Some(SubjectLock::Final));
+        assert_eq!(gated(0, 0), Some(SubjectLock::Final));
+        // The mined claim's raw (no EF leg): the raw's own lock.
+        let mut raw = Transaction::new();
+        raw.inputs.push(TransactionInput {
+            source_txid: Some("cd".repeat(32)),
+            unlocking_script: Some(UnlockingScript::from_binary(&[]).unwrap()),
+            sequence: 0,
+            ..Default::default()
+        });
+        raw.outputs.push(TransactionOutput::new(
+            1,
+            LockingScript::from_binary(&[0x51]).unwrap(),
+        ));
+        raw.lock_time = 972_185;
+        assert_eq!(
+            crate::broadcaster::gated_subject_lock(None, Some(&raw.to_binary())),
+            Some(SubjectLock::Height(972_185))
+        );
+        assert_eq!(crate::broadcaster::gated_subject_lock(None, None), None);
+    }
+
+    /// PORT-0811 fold: an outpoint is written once in a batch. A transaction
+    /// that spends an outpoint another converted transaction of the batch
+    /// spends does not convert (one that spends an outpoint twice is refused
+    /// by bsv-rs's parse first) (a double spend
+    /// inside one BEEF; no network admits it): a subject is the batch's error,
+    /// an ancestor is skipped as any unconvertible ancestor. The outpoints of
+    /// a transaction that does not convert are not counted spent.
+    #[test]
+    fn p0811_f1_an_outpoint_is_written_once_in_a_batch() {
+        let mut parent = Transaction::new();
+        parent.inputs.push(TransactionInput {
+            source_txid: Some("ab".repeat(32)),
+            unlocking_script: Some(UnlockingScript::from_binary(&[]).unwrap()),
+            ..Default::default()
+        });
+        for _ in 0..3 {
+            parent.outputs.push(TransactionOutput::new(
+                5,
+                LockingScript::from_binary(&[0x51]).unwrap(),
+            ));
+        }
+        let pid = parent.id();
+        let spend = |vouts: &[u32], tag: u8| {
+            let mut tx = Transaction::new();
+            for v in vouts {
+                tx.inputs.push(TransactionInput {
+                    source_txid: Some(pid.clone()),
+                    source_output_index: *v,
+                    unlocking_script: Some(UnlockingScript::from_binary(&[0x01, tag]).unwrap()),
+                    ..Default::default()
+                });
+            }
+            tx.outputs.push(TransactionOutput::new(
+                1,
+                LockingScript::from_binary(&[0x51]).unwrap(),
+            ));
+            tx
+        };
+        // one transaction spending vout 0 twice: bsv-rs's parse refuses it first
+        let mut b = Beef::new();
+        b.merge_transaction(parent.clone());
+        b.merge_transaction(spend(&[0, 0], 1));
+        assert!(matches!(
+            beef_to_ef_batch(&b.to_binary()),
+            Err(EfError::Parse(_))
+        ));
+        // an ancestor and the subject spending vout 1: the subject's error
+        let ancestor = spend(&[1, 2], 2);
+        let mut subject = spend(&[1], 3);
+        subject.inputs.push(TransactionInput {
+            source_txid: Some(ancestor.id()),
+            source_output_index: 0,
+            unlocking_script: Some(UnlockingScript::from_binary(&[]).unwrap()),
+            ..Default::default()
+        });
+        let mut b = Beef::new();
+        b.merge_transaction(parent.clone());
+        b.merge_transaction(ancestor.clone());
+        b.merge_transaction(subject.clone());
+        let err = beef_to_ef_batch(&b.to_binary())
+            .err()
+            .expect("a double spend in the batch");
+        assert!(
+            err.to_string().contains("which the batch already spends"),
+            "{err}"
+        );
+        // an ancestor that does not convert leaves its outpoints unspent: the
+        // subject spending one of them converts.
+        let mut broken = spend(&[2], 4);
+        broken.inputs.push(TransactionInput {
+            source_txid: Some("ef".repeat(32)), // not in the BEEF
+            unlocking_script: Some(UnlockingScript::from_binary(&[]).unwrap()),
+            ..Default::default()
+        });
+        let mut subject = spend(&[2], 5);
+        subject.inputs.push(TransactionInput {
+            source_txid: Some(broken.id()),
+            source_output_index: 0,
+            unlocking_script: Some(UnlockingScript::from_binary(&[]).unwrap()),
+            ..Default::default()
+        });
+        let sid = subject.id();
+        let mut b = Beef::new();
+        b.merge_transaction(parent);
+        b.merge_transaction(broken);
+        b.merge_transaction(subject);
+        let (efs, named) = beef_to_ef_batch(&b.to_binary()).expect("the subject converts");
+        assert_eq!(named, sid);
+        let names: Vec<&str> = efs.iter().map(|e| e.txid.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![sid.as_str()],
+            "the subject; the unsourced ancestors skipped"
         );
     }
 }
