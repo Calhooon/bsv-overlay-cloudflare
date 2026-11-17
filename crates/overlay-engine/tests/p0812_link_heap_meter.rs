@@ -197,7 +197,7 @@ fn fifty_byte_locks(spent: u32) -> (Vec<u8>, String) {
 /// higher level whose width is odd, so the path computes a root. Answers the
 /// BEEF, the subject's txid and the BUMP's leaves over every level.
 fn proven_subject_with(level0: u64) -> (Vec<u8>, String, u64) {
-    assert!(level0 >= 2 && level0 % 2 == 0);
+    assert!(level0 >= 2 && level0.is_multiple_of(2));
     let mut tx = Transaction::new();
     tx.inputs.push(input(&format!("{:064x}", 0x5b_u64), 0, &[]));
     tx.outputs.push(TransactionOutput::new(1, lock(vec![0x51])));
@@ -416,7 +416,6 @@ fn p0812_the_engine_names_its_heap_figure() {
         limits.max_link_heap_bytes,
         Some(beef_limits::LINK_METER_HEAP_MAX_BYTES)
     );
-    assert!(beef_limits::LINK_METER_HEAP_MAX_BYTES >= beef_limits::LINK_HEAP_MAX_BYTES);
     let size = |n: usize| n as u64;
     assert!(size(std::mem::size_of::<Transaction>()) <= beef_limits::LINK_CHARGE_TX);
     assert!(size(std::mem::size_of::<TransactionInput>()) <= beef_limits::LINK_CHARGE_INPUT);
@@ -435,9 +434,15 @@ fn p0812_the_engine_names_its_heap_figure() {
     );
 }
 
+/// The heap figure is at least the estimate's bound, which bounds the ancestry.
+const _: () = assert!(beef_limits::LINK_METER_HEAP_MAX_BYTES >= beef_limits::LINK_HEAP_MAX_BYTES);
+
 const ESTIMATE: &str = "declined: the engine's estimate";
 const WIRE: &str = "declined: bsv-rs's wire meter";
 const LINKED: &str = "linked";
+
+/// A shape's name, its BEEF and subject, and the bound expected to answer it.
+type Case = (&'static str, (Vec<u8>, String), &'static str);
 
 /// Every shape the PORT-0811 pins build: the bound that answers it (linked, or
 /// declined by the estimate or by the wire meter, as before the heap meter),
@@ -449,7 +454,7 @@ const LINKED: &str = "linked";
 #[test]
 fn p0812_every_shape_keeps_its_bound() {
     let _one = ONE_AT_A_TIME.lock().unwrap();
-    let shapes: Vec<(&str, (Vec<u8>, String), &str)> = vec![
+    let shapes: Vec<Case> = vec![
         (
             "one-byte locks, 4,000 outputs, 420 spent",
             spend_all(&[parent(1, 1, 4_000, &one, Some(1))], 420),
