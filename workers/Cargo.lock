@@ -267,9 +267,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-rs"
-version = "0.8.9"
+version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88631a40efe0f9d9da22be0a5da5e075fd4981fb37c23401abdd35c84cd0a8e1"
+checksum = "7641f339ea4b6e3a084d7649a641be8d05775d3c2d98cd17f348b4a4019ecef3"
 dependencies = [
  "aes",
  "aes-gcm",
