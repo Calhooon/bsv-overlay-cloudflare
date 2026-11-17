@@ -2321,6 +2321,12 @@ impl NotFinalHold {
         GateStep::AsyncRejected(arcade_fatal_reason(subject_txid, arcade_status, extra_info))
     }
 
+    /// A re-present re-fed inside the hold whose fresh look is no longer Arcade's terminal word: the ladder runs
+    /// as on a first presentation, and the stored word's retryable answer is noted for its end.
+    fn note(&self, not_final: String) {
+        *self.0.borrow_mut() = Some(not_final);
+    }
+
     /// The ladder's END ([`ladder_end_under_hold`] over the noted word, taken): the answer, and whether the hold
     /// replaced it (the request's terminal judgement is then `NotFinal`).
     fn end(&self, answer: Result<ArcOutcome, String>) -> (Result<ArcOutcome, String>, bool) {
@@ -2457,13 +2463,96 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
-/// bsv-low #836 fold (the lens's M1, part 3): `true` the first time this isolate re-feeds `txid` past its lock bound,
-/// `false` after (and once [`REFEED_MEMO_CAP`] txids are held: no re-feed, the judgement stands).
+/// bsv-low #836 fold (the lens's M1, part 3): `true` the first time this isolate re-feeds `txid` (inside the hold
+/// with its lock reached, or past the bound: one memo, one re-feed a txid an isolate), `false` after (and once
+/// [`REFEED_MEMO_CAP`] txids are held: no re-feed, the judgement stands).
 pub fn refeed_once(txid: &str) -> bool {
     REFED.with(|r| {
         let mut r = r.borrow_mut();
         r.len() < REFEED_MEMO_CAP && r.insert(txid.to_ascii_lowercase())
     })
+}
+
+/// Why the door re-feeds a re-presented subject Arcade holds terminal with its non-final word (bsv-low #836).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refeed {
+    /// Inside the hold, and the chain the door reads has reached the subject's own lock
+    /// (`door_words::lock_reached`): the network can take it now. Every end stays the hold's.
+    LockReached,
+    /// Past the hold's bound: the word is Arcade's refusal again and the fresh look is judged as any terminal word.
+    PastBound,
+}
+
+/// PURE (bsv-low #836): whether a re-present whose stored word at Arcade is `tx_status` / `extra_info` is re-fed,
+/// by the subject's own lock and the verified tip (`bound`) alone. No lock-time word: never. Past the hold's bound
+/// (`door_words::not_final_holds` false): yes, as since #836's fold. Inside the hold: only once the lock is reached
+/// (`door_words::lock_reached`); before that the network would refuse the same bytes again, and with no tip nothing
+/// is fed. Arcade's peer's height (in the text) is not an input.
+pub fn refeed_decision(
+    tx_status: &str,
+    extra_info: &str,
+    bound: &crate::door_words::LockBound,
+) -> Option<Refeed> {
+    let nf = crate::door_words::lock_time_not_final(tx_status, extra_info)?;
+    if !crate::door_words::not_final_holds(&nf, bound) {
+        Some(Refeed::PastBound)
+    } else if crate::door_words::lock_reached(bound) {
+        Some(Refeed::LockReached)
+    } else {
+        None
+    }
+}
+
+/// [`refeed_decision`] for a request that holds the subject's own leg (`has_leg`), once a txid an isolate
+/// ([`refeed_once`], asked last so a re-present that is not re-fed spends nothing).
+pub fn refeed_now(
+    tx_status: &str,
+    extra_info: &str,
+    bound: &crate::door_words::LockBound,
+    has_leg: bool,
+    subject_txid: &str,
+) -> Option<Refeed> {
+    let why = refeed_decision(tx_status, extra_info, bound)?;
+    (has_leg && refeed_once(subject_txid)).then_some(why)
+}
+
+/// PURE (bsv-low #836): what the request goes on with after a re-feed: the look that replaces the probe (`None`:
+/// the stored word stays) and, for the ladder's end, the stored word's retryable answer to note (`None`: nothing).
+///
+/// [`Refeed::PastBound`]: the fresh look replaces the probe and is judged as any word (unchanged).
+/// [`Refeed::LockReached`] (inside the hold), by the fresh look:
+/// - none, or about another txid: the stored word stays (the hold's judgement of it: mined admits, else the
+///   retryable not-final answer);
+/// - Arcade's terminal word again: its non-final word replaces the stored one (the same judgement, its text
+///   current); any other terminal word leaves the stored one in place, so the end is still the hold's;
+/// - SEEN or better: it replaces the probe and the pre-flight arm admits it pending;
+/// - anything else (Arcade holds it below SEEN, or as an orphan): it replaces the probe, the ladder runs with no
+///   callback registration as for any known subject, and the stored word's answer is noted so a refusal or an
+///   inconclusive end is the retryable not-final answer, as on a first presentation inside the hold.
+pub(crate) fn probe_after_refeed(
+    why: Refeed,
+    subject_txid: &str,
+    stored: &ArcadeStatusResponse,
+    fresh: Option<ArcadeStatusResponse>,
+) -> (Option<ArcadeStatusResponse>, Option<String>) {
+    if why == Refeed::PastBound {
+        return (fresh, None);
+    }
+    let Some(fresh) = fresh.filter(|r| r.txid.eq_ignore_ascii_case(subject_txid)) else {
+        return (None, None);
+    };
+    match classify_arcade_status(&fresh.tx_status) {
+        GateVerdict::Fatal => {
+            let again = crate::door_words::lock_time_not_final(&fresh.tx_status, &fresh.extra_info);
+            (again.is_some().then_some(fresh), None)
+        }
+        GateVerdict::Reached => (Some(fresh), None),
+        _ => {
+            let note = crate::door_words::lock_time_not_final(&stored.tx_status, &stored.extra_info)
+                .map(|nf| lock_time_not_final_answer(subject_txid, &stored.tx_status, &nf));
+            (Some(fresh), note)
+        }
+    }
 }
 
 thread_local! {
@@ -3298,12 +3387,22 @@ impl ArcadeBroadcaster {
         // weaker one. A probe miss (unknown/orphan/fatal/transport) changes
         // nothing — the ladder runs exactly as before.
         let mut probe = self.tx_status(subject_txid).await;
-        // bsv-low #836 fold (the lens's M1, part 3): Arcade stores its peer's TX_LOCK_TIME line as a terminal
-        // REJECTED and never re-validates it ("resubmit after the locktime expires"); past the chain's bound the
-        // door re-feeds the subject ONCE an isolate, subject only, never registering a callback, and reads Arcade
-        // again: a SEEN then takes the pre-flight accept below, anything else is judged as every terminal word
-        if let Some(fresh) = self.refeed_past_lock_bound(&probe, subject_txid, subject_ef).await {
-            probe = Some(fresh);
+        // bsv-low #836: Arcade stores its peer's TX_LOCK_TIME line as a terminal REJECTED and never re-validates it
+        // ("resubmit after the locktime expires"). The door re-feeds the subject ONCE an isolate, subject only,
+        // never registering a callback, and reads Arcade again: inside the hold as soon as the verified tip has
+        // reached the subject's own lock (a SEEN then takes the pre-flight accept below; every other end stays
+        // the hold's retryable answer), and past the bound (the fresh look judged as every terminal word)
+        if let Some((why, fresh)) = self.refeed_non_final(&probe, subject_txid, subject_ef).await {
+            let (look, note) = match probe.as_ref() {
+                Some(stored) => probe_after_refeed(why, subject_txid, stored, fresh),
+                None => (None, None),
+            };
+            if let Some(note) = note {
+                self.not_final_seen.note(note);
+            }
+            if look.is_some() {
+                probe = look;
+            }
         }
         let probe_is_subject = probe
             .as_ref()
@@ -3827,43 +3926,44 @@ impl ArcadeBroadcaster {
         }
     }
 
-    /// admit-fast: ONE `GET /tx/{txid}` classified for the pending watch (the
-    /// background job behind a fast admission). The echoed txid must match
-    /// the asked one (gate L4), else `Unknown` — an upstream answering about
-    /// something else never witnesses, never condemns, OUR subject.
-    /// bsv-low #836 fold (the lens's M1, part 3): a probe that reads Arcade's non-final word PAST the chain's bound
-    /// re-feeds the subject once ([`refeed_once`]: one per txid an isolate), subject only and with NO callback
-    /// registration (the D1-CALLBACK-FLOOD rule stands for every other terminal word), bounded at 2 s, then asks
-    /// Arcade again. `Some(look)`: the fresh look, which replaces the probe; `None`: no re-feed (inside the bound, no
-    /// lock-time word, no subject leg, already re-fed here).
-    async fn refeed_past_lock_bound(
+    /// bsv-low #836: a probe that reads Arcade's non-final word for the subject, re-fed when [`refeed_now`] says so
+    /// (inside the hold once the verified tip has reached the subject's own lock; past the bound; one per txid an
+    /// isolate): subject only, with NO callback registration (the D1-CALLBACK-FLOOD rule stands for every other
+    /// terminal word), bounded at 2 s, then Arcade asked again. `Some((why, look))`: re-fed, and the fresh look
+    /// ([`probe_after_refeed`] says what replaces the probe); `None`: no re-feed (no lock-time word, the lock not
+    /// reached, no tip, no subject leg, already re-fed here).
+    async fn refeed_non_final(
         &self,
         probe: &Option<ArcadeStatusResponse>,
         subject_txid: &str,
         subject_ef: Option<&EfTx>,
-    ) -> Option<ArcadeStatusResponse> {
+    ) -> Option<(Refeed, Option<ArcadeStatusResponse>)> {
         let p = probe.as_ref().filter(|r| r.txid.eq_ignore_ascii_case(subject_txid))?;
         crate::door_words::lock_time_not_final(&p.tx_status, &p.extra_info)?;
-        if self.not_final_now(&p.tx_status, &p.extra_info).await.is_some() {
-            return None;
-        }
+        let bound = self.lock_bound().await;
+        let why = refeed_now(&p.tx_status, &p.extra_info, &bound, subject_ef.is_some(), subject_txid)?;
         let leg = subject_ef?;
-        if !refeed_once(subject_txid) {
-            return None;
-        }
         gate_log(&format!(
-            "[arcade] {subject_txid} {} TX_LOCK_TIME past the chain's bound (tip {:?}): re-fed once, subject only, no callback (#836)",
+            "[arcade] {subject_txid} {} TX_LOCK_TIME, {} (tip {:?}): re-fed once, subject only, no callback (#836)",
             p.tx_status,
-            self.lock_tip.get().flatten()
+            match why {
+                Refeed::LockReached => "inside the hold with its lock reached",
+                Refeed::PastBound => "past the chain's bound",
+            },
+            bound.tip
         ));
         let _ = overlay_engine::gasp::race_or_deadline(
             self.submit_ef(&self.tx_endpoint(), subject_txid, &leg.ef, false),
             sleep_ms(2_000),
         )
         .await;
-        self.tx_status(subject_txid).await
+        Some((why, self.tx_status(subject_txid).await))
     }
 
+    /// admit-fast: ONE `GET /tx/{txid}` classified for the pending watch (the
+    /// background job behind a fast admission). The echoed txid must match
+    /// the asked one (gate L4), else `Unknown` — an upstream answering about
+    /// something else never witnesses, never condemns, OUR subject.
     pub(crate) async fn witness_look(&self, txid: &str) -> WitnessLook {
         match self.tx_status(txid).await {
             Some(r) if r.txid.eq_ignore_ascii_case(txid) => {
@@ -7899,6 +7999,210 @@ mod tests {
                 "{name}, past the bound"
             );
         }
+    }
+
+    /// PORT-0811 (bsv-low #836 on the gated arm): a re-present Arcade holds terminal with its non-final word is
+    /// re-fed as soon as the verified tip has reached the subject's own lock, once a txid an isolate; before that,
+    /// or with no tip, it is not. The decision's inputs are the subject's lock and the tip (the clock for a time
+    /// lock): the height Arcade's text names for its peer changes nothing.
+    #[test]
+    fn p0811_h_a_re_present_is_re_fed_once_its_lock_is_reached() {
+        use crate::door_words::{LockBound, SubjectLock, NOT_FINAL_LAG_SECS, NOT_FINAL_MTP_SECS};
+        let text = |peer: u64| {
+            format!("TX_LOCK_TIME (35): lock time (972185) as block height is not less than block height ({peer})")
+        };
+        let extra = text(972_172);
+        let height = |tip: Option<u64>| LockBound {
+            lock: Some(SubjectLock::Height(972_185)),
+            tip,
+            now_secs: 0,
+        };
+        let decide = |bound: &LockBound| refeed_decision("REJECTED", &extra, bound);
+        // a height lock: not reached a block below it, reached at its own height (final for the next block)
+        assert_eq!(decide(&height(Some(972_184))), None, "the lock is not reached: nothing is fed");
+        assert_eq!(decide(&height(Some(972_185))), Some(Refeed::LockReached));
+        assert_eq!(decide(&height(Some(972_208))), Some(Refeed::LockReached), "the hold's last tip");
+        assert_eq!(decide(&height(Some(972_209))), Some(Refeed::PastBound));
+        assert_eq!(decide(&height(None)), None, "no tip: nothing is fed");
+        // a time lock: the clock past the lock by the median time's hour, and a tip in hand
+        let t = 1_761_000_000u32;
+        let time = |tip: Option<u64>, now_secs: u64| LockBound {
+            lock: Some(SubjectLock::Time(t)),
+            tip,
+            now_secs,
+        };
+        let at = u64::from(t) + NOT_FINAL_MTP_SECS;
+        assert_eq!(decide(&time(Some(1), at)), None);
+        assert_eq!(decide(&time(Some(1), at + 1)), Some(Refeed::LockReached));
+        assert_eq!(decide(&time(None, at + 1)), None, "no tip: nothing is fed");
+        assert_eq!(
+            decide(&time(Some(1), u64::from(t) + NOT_FINAL_LAG_SECS + 1)),
+            Some(Refeed::PastBound)
+        );
+        // the bytes' lock not held: nothing is fed inside the hold
+        let absent = LockBound { lock: None, tip: Some(972_190), now_secs: 0 };
+        assert_eq!(decide(&absent), None);
+        // a terminal word that names no lock time: never
+        assert_eq!(
+            refeed_decision("REJECTED", "TX_INVALID (31): script failed", &height(Some(972_190))),
+            None
+        );
+        assert_eq!(refeed_decision("DOUBLE_SPEND_ATTEMPTED", &extra, &height(Some(972_190))), None);
+        // Arcade's peer's height is no input: behind our tip, level with it or ahead, the decision is the same
+        for peer in [972_100, 972_172, 972_185, 972_300] {
+            assert_eq!(
+                refeed_decision("REJECTED", &text(peer), &height(Some(972_185))),
+                Some(Refeed::LockReached)
+            );
+            assert_eq!(refeed_decision("REJECTED", &text(peer), &height(Some(972_184))), None);
+        }
+        // once a txid an isolate; a re-present that is not re-fed spends nothing
+        let txid = "5a".repeat(32);
+        let now = |tip, leg| refeed_now("REJECTED", &extra, &height(Some(tip)), leg, &txid);
+        assert_eq!(now(972_184, true), None, "the lock not reached");
+        assert_eq!(now(972_185, false), None, "no subject leg");
+        assert_eq!(now(972_185, true), Some(Refeed::LockReached), "re-fed");
+        assert_eq!(now(972_185, true), None, "only once an isolate");
+        assert_eq!(
+            refeed_now("REJECTED", &extra, &height(Some(972_190)), true, &txid.to_ascii_uppercase()),
+            None
+        );
+        assert_eq!(now(972_300, true), None, "one memo: not again past the bound here");
+        // the wiring: the door's re-feed asks this decision, and what it goes on with is `probe_after_refeed`'s
+        let src = include_str!("broadcaster.rs");
+        let src = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert!(src.contains(
+            "refeed_now(&p.tx_status, &p.extra_info, &bound, subject_ef.is_some(), subject_txid)?"
+        ));
+        assert!(src.contains("probe_after_refeed(why, subject_txid, stored, fresh)"));
+        assert!(src.contains(&["self.not_final_seen", ".note(note)"].concat()));
+    }
+
+    /// PORT-0811 (bsv-low #836 on the gated arm): after a re-feed inside the hold, a SEEN admits as the pre-flight
+    /// probe admits any stored SEEN; every other end is the hold's: Arcade's non-final word again (its peer behind
+    /// our tip), another terminal word, no look, or a look below SEEN whose ladder ends in a refusal or
+    /// inconclusive, each the retryable not-final answer, never a refusal. Past the bound the fresh look stands.
+    #[tokio::test]
+    async fn p0811_h_a_re_feed_inside_the_hold_keeps_the_holds_end() {
+        use crate::door_words::{LockBound, SubjectLock};
+        use crate::proof_fetcher::NetworkPresence;
+        const LOCK_TIME: &str =
+            "TX_LOCK_TIME (35): lock time (972185) as block height is not less than block height (972172)";
+        let look = |status: &str, extra: &str| ArcadeStatusResponse {
+            txid: "ab".into(),
+            tx_status: status.into(),
+            timestamp: None,
+            extra_info: extra.into(),
+        };
+        let stored = look("REJECTED", LOCK_TIME);
+        let bound = LockBound {
+            lock: Some(SubjectLock::Height(972_185)),
+            tip: Some(972_185),
+            now_secs: 0,
+        };
+        assert_eq!(
+            refeed_decision(&stored.tx_status, &stored.extra_info, &bound),
+            Some(Refeed::LockReached)
+        );
+        let not_final = |end: &Result<ArcOutcome, String>| matches!(end, Err(e) if e.contains("TX_LOCK_TIME") && e.contains("#836") && e.contains("retryable"));
+        // what the door judges when the probe is Arcade's terminal word: every row short of mined
+        let judged = |probe: &ArcadeStatusResponse| {
+            for (presence, young) in [
+                (NetworkPresence::Absent, true),
+                (NetworkPresence::Absent, false),
+                (NetworkPresence::Present { height: None }, true),
+                (NetworkPresence::Present { height: None }, false),
+                (NetworkPresence::Inconclusive, false),
+            ] {
+                let end = terminal_at_arcade_by_presence(
+                    presence,
+                    young,
+                    "ab",
+                    &probe.tx_status,
+                    &probe.extra_info,
+                    &bound,
+                );
+                assert!(not_final(&end), "{presence:?} young {young}: {end:?}");
+                assert_eq!(
+                    TerminalJudgement::of_word(
+                        presence,
+                        young,
+                        false,
+                        &probe.tx_status,
+                        &probe.extra_info,
+                        &bound
+                    ),
+                    TerminalJudgement::NotFinal
+                );
+            }
+        };
+        let after = |fresh| probe_after_refeed(Refeed::LockReached, "ab", &stored, fresh);
+        // a SEEN after the re-feed: the pre-flight arm admits it pending
+        let (probe, note) = after(Some(look("SEEN_ON_NETWORK", LOCK_TIME)));
+        assert!(note.is_none());
+        assert_eq!(
+            probe_answer(probe.as_ref(), "ab", 0, None),
+            Some(Ok(ArcOutcome::AcceptedPending("ab".into()))),
+            "a SEEN the re-feed earns admits"
+        );
+        // Arcade's peer still behind our tip: the same non-final word, the same retryable answer
+        let behind = "TX_LOCK_TIME (35): lock time (972185) as block height is not less than block height (972180)";
+        let (probe, note) = after(Some(look("REJECTED", behind)));
+        assert!(note.is_none());
+        let probe = probe.expect("the fresh non-final word replaces the stored one");
+        assert_eq!(probe.extra_info, behind);
+        assert_eq!(probe_answer(Some(&probe), "ab", 0, None), None);
+        judged(&probe);
+        // another terminal word after the re-feed, no look, a look about another txid: the stored word stays
+        for fresh in [
+            Some(look("DOUBLE_SPEND_ATTEMPTED", "")),
+            Some(look("REJECTED", "TX_INVALID (31): script failed")),
+            None,
+            Some(ArcadeStatusResponse { txid: "cd".into(), ..look("SEEN_ON_NETWORK", "") }),
+        ] {
+            let (probe, note) = after(fresh);
+            assert!(probe.is_none() && note.is_none(), "the stored word stays: {probe:?}");
+        }
+        judged(&stored);
+        // a look below SEEN: the ladder runs, and its end is the hold's
+        for status in ["RECEIVED", "SENT_TO_NETWORK", "ACCEPTED_BY_NETWORK", "SEEN_IN_ORPHAN_MEMPOOL"] {
+            let (probe, note) = after(Some(look(status, "")));
+            let probe = probe.expect("the fresh look replaces the probe");
+            assert!(
+                !matches!(classify_arcade_status(&probe.tx_status), GateVerdict::Fatal),
+                "{status}: the ladder runs"
+            );
+            let note = note.expect("the stored word's answer is noted for the ladder's end");
+            for (corroborator, admits) in [
+                (Ok(ArcOutcome::Rejected("TAAL refused".into())), false),
+                (Err("corroborator inconclusive".to_string()), false),
+                (Ok(ArcOutcome::Accepted("ab".into())), true),
+            ] {
+                let hold = NotFinalHold::default();
+                hold.note(note.clone());
+                let answer = broadcast_efs_gated_with(
+                    1,
+                    "ab",
+                    |_| async { Ok(GateStep::AsyncRejected("Arcade REJECTED ab".into())) },
+                    |_| {
+                        let answer = corroborator.clone();
+                        async move { answer }
+                    },
+                )
+                .await;
+                let (end, held) = hold.end(answer);
+                if admits {
+                    assert!(matches!(end, Ok(ArcOutcome::Accepted(_))) && !held, "{status}: {end:?}");
+                } else {
+                    assert!(not_final(&end) && held, "{status}: a refusal is the retryable answer: {end:?}");
+                }
+            }
+        }
+        // past the bound the fresh look stands, whatever it is, and nothing is noted
+        let (probe, note) =
+            probe_after_refeed(Refeed::PastBound, "ab", &stored, Some(look("DOUBLE_SPEND_ATTEMPTED", "")));
+        assert_eq!(probe.map(|p| p.tx_status), Some("DOUBLE_SPEND_ATTEMPTED".to_string()));
+        assert!(note.is_none());
     }
 }
 

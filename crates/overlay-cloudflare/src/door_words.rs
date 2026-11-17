@@ -258,9 +258,15 @@ pub fn lock_time_not_final(tx_status: &str, extra_info: &str) -> Option<NotFinal
 /// two-source path, #513's age floor, the retire pass's 1 h arm).
 pub const NOT_FINAL_LAG_BLOCKS: u64 = 24;
 
+/// How far the median time past is taken to trail the clock (seconds): a time
+/// lock is compared with the median of the last eleven blocks' times, about
+/// six blocks behind the tip's. The door holds no median time; this hour
+/// stands for it, in the hold's bound and in [`lock_reached`].
+pub const NOT_FINAL_MTP_SECS: u64 = 3_600;
+
 /// The same bound for a time lock (`nLockTime >= 500,000,000`, seconds): the
 /// lag's 24 blocks at 600 s and the median time past's hour behind the clock.
-pub const NOT_FINAL_LAG_SECS: u64 = NOT_FINAL_LAG_BLOCKS * 600 + 3_600;
+pub const NOT_FINAL_LAG_SECS: u64 = NOT_FINAL_LAG_BLOCKS * 600 + NOT_FINAL_MTP_SECS;
 
 /// The first nLockTime read as a time, not a height (the consensus rule).
 const LOCK_TIME_THRESHOLD: u32 = 500_000_000;
@@ -334,6 +340,24 @@ pub fn not_final_holds(nf: &NotFinal, bound: &LockBound) -> bool {
         Some(SubjectLock::Height(h)) => by_height(u64::from(h)),
         Some(SubjectLock::Time(t)) => bound.now_secs <= u64::from(t) + NOT_FINAL_LAG_SECS,
         None => nf.lock_height.is_none_or(by_height),
+    }
+}
+
+/// PURE (bsv-low #836 on the gated arm): whether the chain the door reads has REACHED the subject's own lock, so the
+/// subject is final for the next block. The inputs are the subject's bytes' lock and the verified tip (and, for a
+/// time lock, the clock); Arcade's text and its peer's height are not inputs. A height lock: `lock < tip + 1`, the
+/// chain's finality rule (a transaction locked to height `L` is final in a block of height `H` when `L < H`, and
+/// the next block's height is `tip + 1`), so a lock at the tip's own height is reached and one a block above it is
+/// not. A time lock: `now > lock + NOT_FINAL_MTP_SECS` (the rule compares the lock with the median time past, which
+/// the door does not hold; the hour the hold's bound already allows for it stands in), and only with a tip in hand.
+/// No tip, or a lock the bytes do not give: not reached (the hold's fail-safe: nothing is fed on a guess). A
+/// subject final by its bytes has no lock to reach and is never held; it answers `true`.
+pub fn lock_reached(bound: &LockBound) -> bool {
+    match (bound.lock, bound.tip) {
+        (Some(SubjectLock::Final), _) => true,
+        (Some(SubjectLock::Height(h)), Some(tip)) => u64::from(h) < tip + 1,
+        (Some(SubjectLock::Time(t)), Some(_)) => bound.now_secs > u64::from(t) + NOT_FINAL_MTP_SECS,
+        _ => false,
     }
 }
 
@@ -780,6 +804,26 @@ mod tests {
         assert_eq!(bound_look(ArcadeLook::Missing, &final_), ArcadeLook::Missing);
     }
 
+    /// PORT-0811 (bsv-low #836): the subject's lock is reached by the chain's own rule: a height lock is final for
+    /// the next block when `lock < tip + 1`; a time lock once the clock is past it by the median time's hour, with
+    /// a tip in hand; no tip, or no lock read from the bytes, is not reached.
+    #[test]
+    fn p0811_h_the_lock_is_reached_by_the_chains_rule() {
+        let b = |lock, tip, now_secs| LockBound { lock, tip, now_secs };
+        let h = Some(SubjectLock::Height(972_185));
+        assert!(!lock_reached(&b(h, Some(972_184), 0)));
+        assert!(lock_reached(&b(h, Some(972_185), 0)));
+        assert!(lock_reached(&b(h, Some(972_186), 0)));
+        assert!(!lock_reached(&b(h, None, u64::MAX)));
+        let t = Some(SubjectLock::Time(1_761_000_000));
+        assert_eq!(NOT_FINAL_LAG_SECS, NOT_FINAL_LAG_BLOCKS * 600 + NOT_FINAL_MTP_SECS);
+        assert!(!lock_reached(&b(t, Some(1), 1_761_000_000 + NOT_FINAL_MTP_SECS)));
+        assert!(lock_reached(&b(t, Some(1), 1_761_000_000 + NOT_FINAL_MTP_SECS + 1)));
+        assert!(!lock_reached(&b(t, None, 1_761_000_000 + NOT_FINAL_MTP_SECS + 1)));
+        assert!(!lock_reached(&b(None, Some(2_000_000), u64::MAX)));
+        assert!(lock_reached(&b(Some(SubjectLock::Final), None, 0)));
+    }
+
     /// bsv-low #836 fold (the lens's M1, part 3): the door re-feeds a subject past its bound once an isolate.
     #[test]
     fn fix836f_m1_the_refeed_is_once_a_txid() {
@@ -806,7 +850,7 @@ mod tests {
             "crate::door_words::lock_time_not_final_under(arcade_status,extra_info,bound).is_some()",
             "self.not_final_now(&parsed.tx_status,&parsed.extra_info).await",
             "self.not_final_now(&resp.tx_status,&resp.extra_info).await",
-            "ifletSome(fresh)=self.refeed_past_lock_bound(&probe,subject_txid,subject_ef).await",
+            "self.refeed_non_final(&probe,subject_txid,subject_ef).await",
             "self.submit_ef(&self.tx_endpoint(),subject_txid,&leg.ef,false)",
         ] {
             assert!(broadcaster.contains(needle), "broadcaster: {needle}");
