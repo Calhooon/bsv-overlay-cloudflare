@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `tools/e2e_bsv_storage.sh` (`make e2e-bsv-storage`) names the record under test: `TEST_UHRP_URL` (the advert's UHRP URL) and `TEST_DOWNLOAD_URL` are required. It sent `ls_uhrp` the string `"findAll"`, which the lookup door refuses since 0.4.0, and a default `uhrpUrl` that was no UHRP URL; a refusal by the door is now printed with its status and body. No crate changes.
+
 ## [0.4.0] - 2026-11-17
 
 For a consumer: every crate requires bsv-rs `"0.8.11"` by caret (the 0.7 line receives no fixes), so a dependent builds on bsv-rs 0.8. Three things break at compile time: `DoorLimb` and `WalkLimb` have new variants (`DoorLimb::Era`, `WalkLimb::CoinEra`, `WalkLimb::OverLink`), so an exhaustive match adds them; `ShipAdvert` is `#[non_exhaustive]`, so it is neither built by a struct literal nor matched without `..` outside its crate; `MutationReport` has the field `walk_went_on`, and `StreamCharges` and `ef::EfTx` each have a new field, so a struct literal of any of the three adds it. The contract a topic manager or lookup service holds to: a submit past the link bound in `historical-tx-no-spv`, or under `WalkBreachPolicy::NetworkAccepted`, goes on with its subject read unlinked and says so on `MutationReport::walk_went_on`, so an input's `source_transaction` is absent there (the atomic BEEF handed to a lookup service is whole); on every other path such a submit is `WalkCouldNotRun`, "not now". A BEEF read that names no txid takes the subject rule (the atomic name, then `subject::subject_txid_of`), never the wire-last entry.

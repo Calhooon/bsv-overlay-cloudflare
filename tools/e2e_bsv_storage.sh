@@ -15,14 +15,22 @@
 #
 # What we assert:
 #   1. Both workers are live (/health returns 200).
-#   2. rust-overlay's D1 `uhrp_records` table contains at least one row
-#      whose downloadUrl points at bsv-storage's R2 bucket — i.e. some
-#      real client has already completed the full upload→advertise→admit
-#      chain in prod.
-#   3. /lookup ls_uhrp with that record's uhrpUrl returns a non-empty
-#      output-list with a valid BEEF.
-#   4. Fetching the R2 downloadUrl returns the actual file bytes (the
+#   2. /lookup ls_uhrp with the record's uhrpUrl returns a non-empty
+#      output-list with a BEEF: the advert a client uploaded through
+#      bsv-storage was admitted and indexed by the overlay.
+#   3. Fetching the record's downloadUrl returns the file bytes (the
 #      upload really ended up in R2 and is publicly retrievable).
+#
+# The caller names the record. `ls_uhrp` has no find-all: a lookup names an
+# outpoint, or at least one of uhrpUrl, expiryTime, hostIdentityKey (the
+# reference's door), so this script cannot pick a record for itself.
+#
+#   OVERLAY_URL        the overlay Worker
+#   STORAGE_URL        the UHRP storage Worker
+#   TEST_UHRP_URL      the advert's UHRP URL: Base58Check of the file's
+#                      SHA-256 under the prefix ce00, with or without a
+#                      leading "uhrp://"
+#   TEST_DOWNLOAD_URL  the downloadUrl that advert carries
 #
 # Idempotent: reads-only. Safe to run repeatedly.
 
@@ -30,11 +38,12 @@ set -euo pipefail
 
 STORAGE_URL="${STORAGE_URL:-https://<your-storage>.workers.dev}"
 OVERLAY_URL="${OVERLAY_URL:-https://<your-overlay>.workers.dev}"
+TEST_UHRP_URL="${TEST_UHRP_URL:-}"
+TEST_DOWNLOAD_URL="${TEST_DOWNLOAD_URL:-}"
 
-# bsv-storage's PUBLIC_URL_BASE (from its wrangler.toml). The canonical
-# host prefix of downloadUrl for records that originated from
-# bsv-storage's /advertise flow.
-STORAGE_R2_PREFIX="https://<your-r2-public-bucket>.r2.dev"
+LOOKUP_BODY=""
+TMP=""
+trap 'rm -f "$LOOKUP_BODY" "$TMP"' EXIT
 
 fail() {
     echo "❌ FAIL: $*" >&2
@@ -44,6 +53,10 @@ fail() {
 pass() {
     echo "✅ $*"
 }
+
+if [ -z "$TEST_UHRP_URL" ] || [ -z "$TEST_DOWNLOAD_URL" ]; then
+    fail "set TEST_UHRP_URL and TEST_DOWNLOAD_URL to a record your storage worker advertised (see this script's header)"
+fi
 
 echo "────── Step 1: preflight ──────"
 for url in "$STORAGE_URL" "$OVERLAY_URL"; do
@@ -55,51 +68,31 @@ for url in "$STORAGE_URL" "$OVERLAY_URL"; do
 done
 
 echo
-echo "────── Step 2: find a bsv-storage-origin record on rust-overlay ──────"
-# Pull findAll from /lookup ls_uhrp, filter to records whose BEEF fields
-# advertise a downloadUrl under bsv-storage's R2 prefix.
-LOOKUP_JSON=$(curl -sS -X POST -H "Content-Type: application/json" \
-    -d '{"service":"ls_uhrp","query":"findAll"}' \
-    "$OVERLAY_URL/lookup")
-
-OUTPUT_COUNT=$(echo "$LOOKUP_JSON" | jq '.outputs | length')
-if [ "$OUTPUT_COUNT" -lt 1 ]; then
-    fail "/lookup ls_uhrp findAll returned $OUTPUT_COUNT outputs (need ≥1)"
+echo "────── Step 2: /lookup ls_uhrp for the record's uhrpUrl ──────"
+LOOKUP_BODY=$(mktemp)
+LOOKUP_QUERY=$(jq -cn --arg u "$TEST_UHRP_URL" '{service: "ls_uhrp", query: {uhrpUrl: $u}}')
+LOOKUP_CODE=$(curl -sS -o "$LOOKUP_BODY" -w "%{http_code}" --max-time 10 -X POST \
+    -H "Content-Type: application/json" -d "$LOOKUP_QUERY" "$OVERLAY_URL/lookup" || true)
+if [ "$LOOKUP_CODE" != "200" ]; then
+    # The door's refusal is a 400 whose body says why (an invalid uhrpUrl,
+    # an unexpected field): show it, never a bare "0 outputs".
+    fail "/lookup ls_uhrp for uhrpUrl=$TEST_UHRP_URL answered $LOOKUP_CODE: $(head -c 300 "$LOOKUP_BODY")"
 fi
-pass "/lookup ls_uhrp findAll returned $OUTPUT_COUNT outputs"
 
-# Find one bound to bsv-storage's R2 bucket. The BEEF's PushDrop fields
-# include the downloadUrl. The /lookup response includes per-output
-# atomicBEEF bytes; we pull one downloadUrl from any record by going
-# through /admin and filtering in D1 via the public /lookup with a
-# uhrpUrl we already know is ours. The simplest robust path: issue a
-# D1-style query via /admin is gated. Skip that — pick from findAll and
-# probe each downloadUrl by decoding the BEEF. Instead, since we don't
-# want to ship a BEEF parser in bash, we query /admin/ship-records for
-# a known-good uhrpUrl fingerprint. Here we just use an inline prod
-# fingerprint that we've already verified matches bsv-storage's R2
-# bucket (see docs/plans/E2E_REPORT.md for how it was obtained).
-TEST_UHRP_URL="${TEST_UHRP_URL:-2ddf327139986ef9fb8f60644056f1cc6ef3f8bb8755b0ad5a258b95f959e38d}"
-TEST_DOWNLOAD_URL="${TEST_DOWNLOAD_URL:-$STORAGE_R2_PREFIX/cdn/9gyMiXjddyh6hAhm5xgtdM}"
-pass "targeting uhrpUrl=$TEST_UHRP_URL"
-
-echo
-echo "────── Step 3: /lookup ls_uhrp for that uhrpUrl ──────"
-UHRP_LOOKUP=$(curl -sS -X POST -H "Content-Type: application/json" \
-    -d "{\"service\":\"ls_uhrp\",\"query\":{\"uhrpUrl\":\"$TEST_UHRP_URL\"}}" \
-    "$OVERLAY_URL/lookup")
-
-SPECIFIC_COUNT=$(echo "$UHRP_LOOKUP" | jq '.outputs | length')
+SPECIFIC_COUNT=$(jq '.outputs | length' "$LOOKUP_BODY")
 if [ "$SPECIFIC_COUNT" -lt 1 ]; then
     fail "/lookup ls_uhrp for uhrpUrl=$TEST_UHRP_URL returned $SPECIFIC_COUNT outputs"
 fi
-BEEF_LEN=$(echo "$UHRP_LOOKUP" | jq '.outputs[0].beef | length')
+BEEF_LEN=$(jq '.outputs[0].beef | length' "$LOOKUP_BODY")
+if [ "$BEEF_LEN" -lt 1 ]; then
+    fail "/lookup ls_uhrp for uhrpUrl=$TEST_UHRP_URL returned an output with no BEEF"
+fi
 pass "/lookup returned $SPECIFIC_COUNT output; BEEF = $BEEF_LEN bytes"
 
 echo
-echo "────── Step 4: fetch the file bytes from R2 ──────"
+echo "────── Step 3: fetch the file bytes from R2 ──────"
 TMP=$(mktemp)
-R2_CODE=$(curl -sS -o "$TMP" -w "%{http_code}" --max-time 10 "$TEST_DOWNLOAD_URL")
+R2_CODE=$(curl -sS -o "$TMP" -w "%{http_code}" --max-time 10 "$TEST_DOWNLOAD_URL" || true)
 if [ "$R2_CODE" != "200" ]; then
     fail "R2 fetch $TEST_DOWNLOAD_URL returned $R2_CODE"
 fi
@@ -109,9 +102,8 @@ if [ "$BYTES" -lt 1 ]; then
 fi
 pass "R2 fetch $TEST_DOWNLOAD_URL = $BYTES bytes"
 echo "    content preview: $(head -c 80 "$TMP")"
-rm -f "$TMP"
 
 echo
 echo "✅✅✅ E2E ROUND-TRIP PASSED"
 echo "    bsv-storage → rust-overlay /submit → D1 → /lookup → R2 download"
-echo "    all ${OUTPUT_COUNT} UHRP records in rust-overlay's ls_uhrp are retrievable"
+echo "    the record $TEST_UHRP_URL is indexed by ls_uhrp and its file is retrievable"

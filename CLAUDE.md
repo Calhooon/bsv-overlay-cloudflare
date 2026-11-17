@@ -3362,9 +3362,13 @@ make parity-clean      # wipe state + restart for a deterministic run
 
 ## End-to-end
 
-`tools/e2e_bsv_storage.sh` (`make e2e-bsv-storage`) — round-trip smoke
-against a deployed overlay + sibling UHRP storage worker. Defaults to
-your prod URLs; override with `OVERLAY_URL` and `STORAGE_URL` env vars.
+`tools/e2e_bsv_storage.sh` (`make e2e-bsv-storage`): a read-only round
+trip against a deployed overlay and its sibling UHRP storage worker. Set
+`OVERLAY_URL` and `STORAGE_URL` to the two Workers, and `TEST_UHRP_URL`
+and `TEST_DOWNLOAD_URL` to a record the storage worker advertised (its
+UHRP URL and the downloadUrl it carries): `ls_uhrp` has no find-all
+(bsv-low #819), so the caller names the record. A refusal by the lookup
+door is printed with its status and body.
 
 ## Deployment
 
