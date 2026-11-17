@@ -500,7 +500,10 @@ impl AncestryShape {
 /// the tests iterate THIS table, so a name cannot drift between write and read.
 ///
 /// `population`: `client` = the unauthenticated lenient-window population (the
-/// exact population the #347 flip criterion is about); `operator` = submits
+/// exact population the #347 flip criterion is about; since the lenient window
+/// serves no header-selected unbarred path, only `current-tx` rows of this
+/// population move, and the `historical-tx*` client rows keep the totals
+/// counted before); `operator` = submits
 /// carrying the `SUBMIT_OPERATOR_TOKEN` (the tower/peer/migration population,
 /// which #351 receipts also cover from the producer side).
 pub const CENSUS_STATE_COUNTERS: [(&str, &str, &str, &str); 18] = [

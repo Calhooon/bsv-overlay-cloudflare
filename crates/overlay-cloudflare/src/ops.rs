@@ -312,7 +312,7 @@ pub const COUNTER_SUBMIT_PENDING_ORPHAN: &str = "submit_pending_orphan_total";
 /// witness): Arcade's rank can sit at ACCEPTED_BY_NETWORK for 30 min after the network said SEEN. Never silent.
 pub const COUNTER_SUBMIT_PENDING_LATCHED_ELSEWHERE: &str = "submit_pending_latched_elsewhere_total";
 /// bsv-low loop 18 (2026-09-21, pair 11): an UNGATED write (the operator's historical modes; the lenient
-/// window) refused under an OPEN eviction (nothing written; a MINED proof or the operator's readmit opens it).
+/// window's no-header default) refused under an OPEN eviction (nothing written; a MINED proof or the operator's readmit opens it).
 pub const COUNTER_SUBMIT_REFUSED_EVICTED: &str = "submit_refused_evicted_total";
 /// loop 18 (the gate's HIGH-2): a gated subject under an open eviction that the network ACCEPTED again —
 /// readmitted at the door (the fresh word overrules the ledger's stale one; a wrong eviction heals on the next
@@ -2236,9 +2236,10 @@ pub async fn health_invariants(
         "txRetiredTotal": tx_retired_total,
         // #371: lifetime network_seen latch count (-1 = table unreadable).
         "networkSeenTotal": network_seen_total,
-        // #347 soak signal (Rule 6c closure criterion 3): `unauthenticatedUngated`
-        // must reach ~0 before SUBMIT_ENFORCE is flipped to true. Per-isolate and
-        // therefore lossy — a soak signal, never an audit log.
+        // #347: `unauthenticatedUngated` counts the lenient window's served
+        // no-header submits; `strictRefused` every refusal for want of the
+        // operator credential, in either mode. Per-isolate and therefore
+        // lossy — a soak signal, never an audit log.
         "submitAdmission": crate::submit_gate::counters_json(),
         "trackerEvents": crate::tracker_events::health_json(),
         // #366: would every honest CLIENT submit survive `broadcast-gated`?

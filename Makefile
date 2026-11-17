@@ -187,9 +187,10 @@ ownership:
 # ENABLE_EXTENSIONS=false (the kill switch, which was itself a HIGH defect —
 # it used to route callers OFF the network gate), :8793 LENIENT
 # (SUBMIT_ENFORCE unset) for the #366 census's CLIENT-population leg — the
-# unauthenticated-ungated submit that strict :8791 rightly refuses is exactly
+# unauthenticated no-header submit that strict :8791 rightly refuses is exactly
 # the population the census (and the #347 flip criterion) measures, so it can
-# only be driven where it is SERVED — and :8794 with TAAL_API_KEY set, the ONLY
+# only be driven where it is SERVED (the lenient window serves the no-header
+# default alone; a header-selected unbarred mode is 401 there too) — and :8794 with TAAL_API_KEY set, the ONLY
 # place `/arc-ingest` is mounted at all (`lib.rs` mirrors mainline and 404s the
 # route without it). No network is required by any leg: the /submit public-path
 # expectation asserts "never admitted, never 401", which holds as 422 online and

@@ -1141,8 +1141,9 @@ async fn submit_parts(
         crate::submit_gate::SubmitAction::RefuseUnauthenticated(path) => {
             counters.reason(SubmitReason::OperatorAuthRequired);
             worker::console_log!(
-                "POST /submit -> 401 (unbarred path {} requires operator auth; SUBMIT_ENFORCE=true)",
-                path.as_str()
+                "POST /submit -> 401 (unbarred path {} requires operator auth under {:?})",
+                path.as_str(),
+                gate_mode
             );
             return json_error(
                 &format!(
@@ -2020,7 +2021,7 @@ async fn submit_parts(
     }
 
     // ── bsv-low LOOP 18 (the gate's MEDIUM-4): the UNGATED arms never see the ladder (the operator's historical
-    // modes; on the lenient window any caller): an open eviction REFUSES their write — the openers are a MINED
+    // modes; on the lenient window any caller, on the no-header default): an open eviction REFUSES their write — the openers are a MINED
     // push (`readmit_if_evicted`) and the operator's `/admin/readmit`. The subject by the ONE rule (D5). ──
     let mut ungated_subject: Option<String> = None;
     if gated_subject.is_none() {
@@ -5357,6 +5358,31 @@ mod tests {
             src.matches(&legacy).count(),
             0,
             "the route must not re-derive the plan beside the action"
+        );
+    }
+
+    /// Lane SUBMIT-MODE-OPERATOR: the route answers the gate's refusal (the
+    /// 401 an unauthenticated header-selected mode now gets in every
+    /// configuration) before any engine call of `submit_parts`. A source pin:
+    /// the crate has no native harness for `/submit`, so the behaviour is
+    /// pinned on the plan (`submit_gate::tests::smo_*`) and the route by this.
+    #[test]
+    fn smo_the_refusal_is_answered_before_any_engine_call() {
+        let src = code_only(include_str!("routes.rs"));
+        let parts = &src[src.find("async fn submit_parts(").expect("submit_parts")..];
+        let arm = ["SubmitAction::RefuseUnauthen", "ticated(path) =>"].concat();
+        let at = parts.find(&arm).expect("the refusal arm");
+        let ret = at + parts[at..].find("return json_error(").expect("its answer");
+        assert!(
+            parts[at..ret].contains("401") || parts[ret..ret + 600].contains("401"),
+            "the refusal answers 401"
+        );
+        let first_engine = parts
+            .find("engine.")
+            .expect("submit_parts calls the engine");
+        assert!(
+            ret < first_engine,
+            "the refusal must answer before the first engine call (refusal at {ret}, engine at {first_engine})"
         );
     }
 

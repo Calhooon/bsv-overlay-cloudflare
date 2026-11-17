@@ -42,6 +42,10 @@
  *   AFTER, SUBMIT_ENFORCE=false (rollout default):
  *     historical-tx-no-spv, no token   → 200 + unauthenticatedUngated=1 on
  *                                        /health/invariants (the soak signal)
+ *   SINCE lane SUBMIT-MODE-OPERATOR (2026-11-17), SUBMIT_ENFORCE unset:
+ *     historical-tx-no-spv, no token   → 401, as under SUBMIT_ENFORCE=true
+ *     historical-tx, no token          → 401
+ *     no header, no token              → served, unauthenticatedUngated+1
  *   AFTER, ENABLE_EXTENSIONS=false (kill switch), lenient:
  *     historical-tx-no-spv             → 400 SPV, present:false — the header
  *                                        is ignored entirely
