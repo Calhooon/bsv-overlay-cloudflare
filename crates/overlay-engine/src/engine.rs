@@ -485,13 +485,19 @@ pub struct MutationReport {
     /// caller asked for: a caller that guards its admission writes (the
     /// worker's eviction ledger, bsv-low #513) guards these too.
     pub landed_predecessors: Vec<(String, String)>,
-    /// The submit's own script walk could not run within the engine's
-    /// budget (bsv-low #592) and the submit went on as under
-    /// `HistoricalTxNoSpv` ([`WalkBreachPolicy::NetworkAccepted`] only; under
-    /// `NotNow` a breach is [`EngineError::WalkCouldNotRun`]). `None` when it
-    /// ran (or the mode does not walk). A caller counts it; it never makes a
-    /// report undurable.
+    /// The submit's own script walk, or the link of its subject, could not
+    /// run within the engine's bounds and the submit WENT ON; why it went on
+    /// is [`MutationReport::walk_went_on`]. Under
+    /// [`WalkBreachPolicy::NetworkAccepted`] that is a walk past the budget
+    /// (bsv-low #592) or a link past its bound; in `HistoricalTxNoSpv` under
+    /// the default policy it is the link alone (that mode walks nothing).
+    /// Under `NotNow` in a mode that walks a stop is
+    /// [`EngineError::WalkCouldNotRun`]. `None` when every read ran. A
+    /// caller counts it; it never makes a report undurable.
     pub walk_could_not_run: Option<WalkCouldNotRun>,
+    /// Why the submit went on past `walk_could_not_run` (`None` beside a
+    /// `None` there): the caller's policy, or the mode alone.
+    pub walk_went_on: Option<WalkWentOn>,
     /// The walks of the carried predecessors this submit tried to land
     /// (`Engine::land_carried`) that could not run within the budget (the
     /// E592 lens fold, L3): under `NotNow` each one's landing did not happen
@@ -723,7 +729,7 @@ type Validated = (
     Steak,
     Transaction,
     String,
-    Option<WalkCouldNotRun>,
+    Option<(WalkCouldNotRun, WalkWentOn)>,
 );
 
 /// Which limb of the [`DoorBudget`] a submit's own walk went past (bsv-low
@@ -745,9 +751,10 @@ pub enum WalkLimb {
     /// heap; bsv-rs 0.8.11's meter as its belt): linking the subject's
     /// ancestry would hold more than that. A memory limb: the submit's own
     /// parse could not run within it, never a verdict. In
-    /// `historical-tx-no-spv` (the network's word on these bytes, or a GASP
-    /// graph the anchor passed) and under `WalkBreachPolicy::NetworkAccepted`
-    /// the submit goes on with its subject unlinked and reports it.
+    /// `historical-tx-no-spv` (a mode that walks nothing, with or without the
+    /// link: [`WalkWentOn::NoSpvMode`]) and under
+    /// `WalkBreachPolicy::NetworkAccepted` the submit goes on with its subject
+    /// unlinked and reports it.
     OverLink,
 }
 
@@ -800,6 +807,35 @@ pub enum WalkBreachPolicy {
     /// reported on [`MutationReport::walk_could_not_run`]. The roots the walk
     /// reached are still checked, and a bad one is still the `SpvError` it is.
     NetworkAccepted,
+}
+
+/// Why a submit went on past a walk or a link that could not run
+/// ([`MutationReport::walk_went_on`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkWentOn {
+    /// The caller's [`WalkBreachPolicy::NetworkAccepted`]: the network's
+    /// accept of these bytes is on record with the caller.
+    NetworkAccepted,
+    /// The mode alone (`historical-tx-no-spv` under the default policy): no
+    /// word of the network is claimed. That mode walks nothing and checks no
+    /// proof, linked or not, so the subject read unlinked is judged exactly
+    /// as a linked one is there: by the topic managers alone.
+    NoSpvMode,
+}
+
+impl WalkWentOn {
+    /// The words a log line gives the reason.
+    #[must_use]
+    pub fn words(self) -> &'static str {
+        match self {
+            WalkWentOn::NetworkAccepted => {
+                "the network accepted these bytes, the submit goes on as historical-tx-no-spv"
+            }
+            WalkWentOn::NoSpvMode => {
+                "no-spv: the subject is read unlinked, the submit goes on (this mode walks nothing)"
+            }
+        }
+    }
 }
 
 /// A submit whose own script walk COULD NOT RUN within the engine's
@@ -1659,7 +1695,8 @@ impl Engine {
             }
         }
         let mut report = MutationReport {
-            walk_could_not_run: could_not_run,
+            walk_went_on: could_not_run.as_ref().map(|(_, why)| *why),
+            walk_could_not_run: could_not_run.map(|(stop, _)| stop),
             ..MutationReport::default()
         };
         // The body every LOOKUP SERVICE receives NAMES the subject (BRC-95
@@ -3719,18 +3756,24 @@ impl Engine {
             could_not_run = link_stop;
         }
         // A link trip in `historical-tx-no-spv` is never "not now": that mode
-        // walks nothing and carries the network's word on these bytes (the
-        // gated arm's admission after its broadcast) or a graph the anchor
-        // check passed (a GASP finalize), so the submit goes on with its
-        // subject unlinked, reported, exactly as under `NetworkAccepted`.
-        let policy = if mode == SubmitMode::HistoricalTxNoSpv {
-            WalkBreachPolicy::NetworkAccepted
-        } else {
-            policy
+        // walks nothing and checks no proof, with the subject linked or not,
+        // so reading the subject unlinked extends no trust: the submit goes
+        // on, reported. The mode says nothing about the network: its callers
+        // are the gated arm's admission after its broadcast, a GASP finalize
+        // over a graph the anchor check passed, and any caller that names the
+        // mode itself. Only the caller's `NetworkAccepted` says the network
+        // accepted these bytes.
+        let went_on = match (policy, mode) {
+            (WalkBreachPolicy::NetworkAccepted, _) => Some(WalkWentOn::NetworkAccepted),
+            (WalkBreachPolicy::NotNow, SubmitMode::HistoricalTxNoSpv) => {
+                Some(WalkWentOn::NoSpvMode)
+            }
+            (WalkBreachPolicy::NotNow, _) => None,
         };
+        let mut walk_went_on = None;
         if let Some(stop) = could_not_run.take() {
-            match policy {
-                WalkBreachPolicy::NotNow => {
+            match went_on {
+                None => {
                     warn!(
                         "submit: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): not now, nothing judged or written; present it proven (bsv-low #592, E592 fold)",
                         stop.subject_txid,
@@ -3741,16 +3784,18 @@ impl Engine {
                     );
                     return Err(EngineError::WalkCouldNotRun(stop));
                 }
-                WalkBreachPolicy::NetworkAccepted => {
+                Some(why) => {
                     warn!(
-                        "submit: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): the network accepted these bytes, the submit goes on as historical-tx-no-spv (bsv-low #592)",
+                        "submit: the engine's script walk could not run for {} ({}: at {}, subject judged: {}; {}): {} (bsv-low #592)",
                         stop.subject_txid,
                         stop.limb.as_str(),
                         stop.at_txid,
                         stop.subject_judged,
-                        stop.what
+                        stop.what,
+                        why.words()
                     );
                     could_not_run = Some(stop);
+                    walk_went_on = Some(why);
                 }
             }
         }
@@ -3898,7 +3943,13 @@ impl Engine {
             }
         }
 
-        Ok((validations, steak, tx, txid, could_not_run))
+        Ok((
+            validations,
+            steak,
+            tx,
+            txid,
+            could_not_run.zip(walk_went_on),
+        ))
     }
 
     // ========================================================================

@@ -1746,9 +1746,10 @@ mod p0811 {
     /// `historical-tx-no-spv`, through `Engine::submit_with_report`, the
     /// route's call) of a body past the link bound: admitted, the trip on the
     /// report (which the route counts, `ops::note_engine_walk`), never the
-    /// route's 503. Its S2 replay, under the message's mode, likewise. On
-    /// `1af62adf` the admission was `WalkCouldNotRun` (limb `over_link`): the
-    /// 503 with nothing written and nothing queued.
+    /// route's 503. Its S2 replay, under the message's mode, likewise. The
+    /// mode alone claims no word of the network: the report's reason is
+    /// `WalkWentOn::NoSpvMode` and the door's line says the subject is read
+    /// unlinked; the gated mark's replay is `WalkWentOn::NetworkAccepted`.
     #[test]
     fn p0811_m2_the_gated_admission_goes_on_over_a_link_bound_body() {
         let (beef, subject) = link_bound_body();
@@ -1765,14 +1766,26 @@ mod p0811 {
                 .unwrap()
                 .block_on(future)
         }
-        let (steak, report) = run(engine.submit_with_report(&tagged, mode))
-            .expect("the network's accept goes on over a link trip");
+        let (steak, report) =
+            run(engine.submit_with_report(&tagged, mode)).expect("no-spv goes on over a link trip");
+        // The mode alone names no word of the network: the door's line says the subject is read unlinked.
+        assert_eq!(
+            report.walk_went_on,
+            Some(overlay_engine::engine::WalkWentOn::NoSpvMode)
+        );
+        let words = crate::ops::engine_walk_went_on_words(&report);
+        assert!(
+            words.starts_with("no-spv: the subject is read unlinked")
+                && !words.contains("network accepted"),
+            "the mode's line claims no accept: {words}"
+        );
         assert!(steak
             .get("tm_test")
             .is_some_and(|a| a.outputs_to_admit == vec![0]));
         assert_eq!(report.applied_topics, vec!["tm_test".to_string()]);
         let stop = report
             .walk_could_not_run
+            .clone()
             .expect("the trip is on the report");
         assert_eq!(stop.limb, WalkLimb::OverLink);
         assert_eq!(stop.subject_txid, subject);
@@ -1805,5 +1818,34 @@ mod p0811 {
         ))
         .expect("the replay goes on");
         assert_eq!(replayed.applied_topics, vec!["tm_test".to_string()]);
+        // The gated mark is the network's accept on record: there, and only there, the line names it.
+        assert_eq!(
+            replayed.walk_went_on,
+            Some(overlay_engine::engine::WalkWentOn::NetworkAccepted)
+        );
+        assert!(crate::ops::engine_walk_went_on_words(&replayed)
+            .contains("the network accepted these bytes"));
+        // The same message without the mark (an ungated submit that named the mode): no accept is claimed.
+        let queue::Carriage::Inline(unmarked) = queue::plan_replay_gated(
+            &beef,
+            &["tm_test".to_string()],
+            mode,
+            queue::REPLAY_REASON_PHASE3_FAULT,
+            queue::QUEUE_MESSAGE_ROOM,
+            false,
+        ) else {
+            panic!("the body rides inline")
+        };
+        let fresh = EngineBuilder::new(Box::new(MemoryStorage::new()))
+            .with_topic("tm_test", Box::new(AdmitOutputZero))
+            .with_walk_budget(crate::WORKER_WALK_BUDGET)
+            .build();
+        let (_, replayed) = run(fresh.submit_with_report_under(
+            &tagged,
+            queue::replay_submit_mode(&unmarked.mode),
+            queue::replay_breach_policy(&unmarked),
+        ))
+        .expect("no-spv goes on");
+        assert!(!crate::ops::engine_walk_went_on_words(&replayed).contains("network accepted"));
     }
 }

@@ -12,7 +12,7 @@
 
 use async_trait::async_trait;
 use bsv_overlay_engine::builder::EngineBuilder;
-use bsv_overlay_engine::engine::{Engine, EngineError, WalkBreachPolicy, WalkLimb};
+use bsv_overlay_engine::engine::{Engine, EngineError, WalkBreachPolicy, WalkLimb, WalkWentOn};
 use bsv_overlay_engine::gasp::{GASPError, GASPStorage};
 use bsv_overlay_engine::gasp_overlay::{new_finalized_graph_sink, OverlayGASPStorage};
 use bsv_overlay_engine::storage::memory::MemoryStorage;
@@ -301,9 +301,38 @@ async fn p0811_t_the_no_spv_submit_goes_on_over_a_link_trip() {
         .is_some_and(|a| a.outputs_to_admit == vec![0]));
     assert_eq!(report.applied_topics, vec![TOPIC.to_string()]);
     assert_eq!(
-        report.walk_could_not_run.map(|s| s.limb),
+        report.walk_could_not_run.as_ref().map(|s| s.limb),
         Some(WalkLimb::OverLink)
     );
+    // The mode alone claims no word of the network: the report says the
+    // subject was read unlinked in no-spv, and the line's words say so.
+    assert_eq!(report.walk_went_on, Some(WalkWentOn::NoSpvMode));
+    assert!(!WalkWentOn::NoSpvMode.words().contains("network accepted"));
+    assert!(WalkWentOn::NoSpvMode
+        .words()
+        .starts_with("no-spv: the subject is read unlinked"));
+    // The caller's policy is what names the network's accept, in any mode.
+    for mode in [SubmitMode::HistoricalTxNoSpv, SubmitMode::HistoricalTx] {
+        let (_, report) = engine_with(
+            Naming {
+                deep: false,
+                admits: true,
+                names: false,
+            },
+            MemoryStorage::new(),
+        )
+        .submit_with_report_under(&tagged, mode, WalkBreachPolicy::NetworkAccepted)
+        .await
+        .expect("the caller's policy goes on");
+        assert_eq!(
+            report.walk_could_not_run.as_ref().map(|s| s.limb),
+            Some(WalkLimb::OverLink)
+        );
+        assert_eq!(report.walk_went_on, Some(WalkWentOn::NetworkAccepted));
+    }
+    assert!(WalkWentOn::NetworkAccepted
+        .words()
+        .contains("the network accepted these bytes"));
     // Any other mode under the default policy is "not now".
     match engine_with(
         Naming {
