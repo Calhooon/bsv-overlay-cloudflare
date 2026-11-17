@@ -2295,6 +2295,41 @@ pub fn ladder_end_under_hold(
     }
 }
 
+/// The not-final hold of ONE gated request (bsv-low #836): Arcade's non-final word on the subject inside the
+/// chain's bound, noted by the gate's fatal step (the submit echo and the SEEN poll) and read once by the ladder's
+/// end. Pure: the gate's two sites and the ladder's end call these and nothing else touches the word, so the pin
+/// that drives them drives the hold's wiring.
+#[derive(Debug, Default)]
+struct NotFinalHold(std::cell::RefCell<Option<String>>);
+
+impl NotFinalHold {
+    /// The gate's step for Arcade's FATAL word on the subject: the step every terminal word gives the ladder
+    /// ([`GateStep::AsyncRejected`], so the resubmit and the corroborator run). With `not_final` (the word read
+    /// non-final inside the chain's bound, `door_words::lock_time_not_final_under`) the retryable answer is noted
+    /// for the ladder's end.
+    fn fatal_step(
+        &self,
+        subject_txid: &str,
+        arcade_status: &str,
+        extra_info: &str,
+        not_final: Option<&crate::door_words::NotFinal>,
+    ) -> GateStep {
+        if let Some(nf) = not_final {
+            *self.0.borrow_mut() =
+                Some(lock_time_not_final_answer(subject_txid, arcade_status, nf));
+        }
+        GateStep::AsyncRejected(arcade_fatal_reason(subject_txid, arcade_status, extra_info))
+    }
+
+    /// The ladder's END ([`ladder_end_under_hold`] over the noted word, taken): the answer, and whether the hold
+    /// replaced it (the request's terminal judgement is then `NotFinal`).
+    fn end(&self, answer: Result<ArcOutcome, String>) -> (Result<ArcOutcome, String>, bool) {
+        let not_final = self.0.borrow_mut().take();
+        let held = not_final.is_some() && matches!(&answer, Ok(ArcOutcome::Rejected(_)) | Err(_));
+        (ladder_end_under_hold(answer, not_final), held)
+    }
+}
+
 /// PURE (the delta-verify's LOW, 2026-09-21): a definitive refusal must rest on a FRESH courier read. A memoised
 /// `Absent` taken while the subject was young (and answered retryable then) must not carry it across the age floor
 /// into a 422: when the memo would decide a refusal, the couriers are asked again (the cap still bounds it).
@@ -2706,8 +2741,8 @@ pub struct ArcadeBroadcaster {
     /// #519: how the last Arcade-terminal subject of this request was judged (the route counts it).
     terminal_judged: std::cell::Cell<Option<TerminalJudgement>>,
     /// bsv-low #836: Arcade's non-final word on this request's subject inside the chain's bound, as the door's
-    /// retryable answer; the ladder's end reads it ([`ladder_end_under_hold`]).
-    not_final_seen: std::cell::RefCell<Option<String>>,
+    /// retryable answer; the ladder's end reads it ([`NotFinalHold`]).
+    not_final_seen: NotFinalHold,
     /// #519: the WoC key the presence read carries (the same one `evidence_check` reads; none installed today).
     woc_api_key: Option<String>,
     proof_sources: crate::proof_fetcher::ProofSources,
@@ -2840,7 +2875,7 @@ impl ArcadeBroadcaster {
             evicted_at_ms: None,
             terminal_ms: std::cell::Cell::new(0.0),
             terminal_judged: std::cell::Cell::new(None),
-            not_final_seen: std::cell::RefCell::new(None),
+            not_final_seen: NotFinalHold::default(),
             woc_api_key: None,
             proof_sources: crate::proof_fetcher::ProofSources::default(),
             corroborator_url: None,
@@ -3461,11 +3496,11 @@ impl ArcadeBroadcaster {
             },
         ).await;
         self.legs_paused.set(paused);
-        let not_final = self.not_final_seen.borrow_mut().take();
-        if not_final.is_some() && matches!(&answer, Ok(ArcOutcome::Rejected(_)) | Err(_)) {
+        let (answer, held) = self.not_final_seen.end(answer);
+        if held {
             self.terminal_judged.set(Some(TerminalJudgement::NotFinal));
         }
-        ladder_end_under_hold(answer, not_final)
+        answer
     }
 
     /// Submit one EF body and SEEN-gate the subject: submit → (echoed-status
@@ -3528,21 +3563,16 @@ impl ArcadeBroadcaster {
                     GateVerdict::Fatal => {
                         // bsv-low #836: a non-final word inside the chain's bound is noted, and the ladder runs
                         // on (the resubmit, the corroborator: an accept admits); its END is the retryable answer
-                        // in place of a refusal or an inconclusive word ([`ladder_end_under_hold`])
-                        if let Some(nf) =
-                            self.not_final_now(&parsed.tx_status, &parsed.extra_info).await
-                        {
-                            *self.not_final_seen.borrow_mut() = Some(lock_time_not_final_answer(
-                                subject_txid,
-                                &parsed.tx_status,
-                                &nf,
-                            ));
-                        }
-                        return Ok(GateStep::AsyncRejected(arcade_fatal_reason(
+                        // in place of a refusal or an inconclusive word ([`NotFinalHold`])
+                        let nf = self
+                            .not_final_now(&parsed.tx_status, &parsed.extra_info)
+                            .await;
+                        return Ok(self.not_final_seen.fatal_step(
                             subject_txid,
                             &parsed.tx_status,
                             &parsed.extra_info,
-                        )));
+                            nf.as_ref(),
+                        ));
                     }
                     // #267: an echoed ORPHAN view stops the gate here — no
                     // poll (waiting cannot conjure the missing parents).
@@ -3720,7 +3750,9 @@ impl ArcadeBroadcaster {
                         // bsv-low #621: Arcade's polled SEEN names the latch, at its own stamp
                         self.note_witness(
                             Some(crate::ops::SeenSource::Arcade),
-                            resp.timestamp.as_deref().and_then(crate::proof_fetcher::rfc3339_utc_ms),
+                            resp.timestamp
+                                .as_deref()
+                                .and_then(crate::proof_fetcher::rfc3339_utc_ms),
                         );
                         return Ok(GateStep::Accepted);
                     }
@@ -3729,17 +3761,14 @@ impl ArcadeBroadcaster {
                         // (reason ONLY — the gate above already decided on status).
                         stamp(&self.poll_ms);
                         // bsv-low #836: a non-final word inside the chain's bound is noted for the ladder's end
-                        // ([`ladder_end_under_hold`]); the ladder runs on
-                        if let Some(nf) = self.not_final_now(&resp.tx_status, &resp.extra_info).await
-                        {
-                            *self.not_final_seen.borrow_mut() =
-                                Some(lock_time_not_final_answer(txid, &resp.tx_status, &nf));
-                        }
-                        return Ok(GateStep::AsyncRejected(arcade_fatal_reason(
+                        // ([`NotFinalHold`]); the ladder runs on
+                        let nf = self.not_final_now(&resp.tx_status, &resp.extra_info).await;
+                        return Ok(self.not_final_seen.fatal_step(
                             txid,
                             &resp.tx_status,
                             &resp.extra_info,
-                        )));
+                            nf.as_ref(),
+                        ));
                     }
                     // #267: an ORPHAN view ends the poll immediately —
                     // `SEEN_IN_ORPHAN_MEMPOOL` used to rank 0 → Pending →
@@ -7688,11 +7717,117 @@ mod tests {
         // The wiring: the echo and the poll note the word and return the base's step; the ladder's end reads it.
         let src = include_str!("broadcaster.rs");
         let noted = src
-            .matches(&["*self.not_final_seen", ".borrow_mut() ="].concat())
+            .matches(&["self.not_final_seen", ".fatal_step("].concat())
             .count();
         assert_eq!(noted, 2, "the echo and the poll note the non-final word");
         assert!(!src.contains(&["return Err(lock_time_not_final_answer(", "txid, &resp"].concat()));
-        assert!(src.contains(&["ladder_end_under_hold(answer", ", not_final)"].concat()));
+        assert!(src.contains(&["self.not_final_seen", ".end(answer)"].concat()));
+    }
+
+    /// PORT-0811 (bsv-low #836 on the gated arm), the hold's WIRING run, not read: the gate's fatal step
+    /// (`NotFinalHold::fatal_step`, what the submit echo and the SEEN poll call) with Arcade's words in hand and
+    /// the subject's own lock bound, the shipped ladder over it, and the ladder's end (`NotFinalHold::end`, what
+    /// `broadcast_efs_gated` returns). Inside the bound the word noted by the step reaches the end: a
+    /// corroborator's refusal and an inconclusive answer are the retryable not-final answer and the request is
+    /// judged not-final; an accept stands. Past the bound, and for a fatal word that names no lock time, nothing
+    /// is noted and the ladder's own answer stands.
+    #[tokio::test]
+    async fn p0811_h_the_noted_word_reaches_the_ladders_end() {
+        use crate::door_words::{lock_time_not_final_under, LockBound, SubjectLock};
+        const LOCK_TIME: &str =
+            "TX_LOCK_TIME (35): lock time (972185) as block height is not less than block height (972172)";
+        let bound = |tip: u64| LockBound {
+            lock: Some(SubjectLock::Height(972_185)),
+            tip: Some(tip),
+            now_secs: 0,
+        };
+        let run =
+            |extra: &'static str, bound: LockBound, corroborator: Result<ArcOutcome, String>| {
+                let hold = NotFinalHold::default();
+                let asked = std::cell::Cell::new(0usize);
+                async move {
+                    let answer = broadcast_efs_gated_with(
+                        1,
+                        "ab",
+                        |_| {
+                            // the gate's fatal arm: the word judged under the subject's bound, then the step
+                            let nf = lock_time_not_final_under("REJECTED", extra, &bound);
+                            let step = hold.fatal_step("ab", "REJECTED", extra, nf.as_ref());
+                            async move { Ok(step) }
+                        },
+                        |_| {
+                            asked.set(asked.get() + 1);
+                            let answer = corroborator.clone();
+                            async move { answer }
+                        },
+                    )
+                    .await;
+                    let (end, held) = hold.end(answer);
+                    // the word is read once: a second end changes nothing
+                    let again = hold.end(Err("x".into()));
+                    assert_eq!(
+                        again,
+                        (Err("x".to_string()), false),
+                        "the noted word is taken once"
+                    );
+                    (end, held, asked.get())
+                }
+            };
+        let not_final = |end: &Result<ArcOutcome, String>| matches!(end, Err(e) if e.contains("TX_LOCK_TIME") && e.contains("#836") && e.contains("retryable"));
+        // Inside the bound (tip 972185, lock 972185).
+        let (end, held, asked) = run(
+            LOCK_TIME,
+            bound(972_185),
+            Ok(ArcOutcome::Rejected("TAAL refused".into())),
+        )
+        .await;
+        assert!(asked >= 1, "the corroborator is asked inside the hold");
+        assert!(
+            not_final(&end) && held,
+            "a refusal inside the hold ends as the retryable not-final answer: {end:?} (held {held})"
+        );
+        let (end, held, _) = run(
+            LOCK_TIME,
+            bound(972_185),
+            Err("corroborator inconclusive".into()),
+        )
+        .await;
+        assert!(
+            not_final(&end) && held,
+            "an inconclusive end inside the hold is the not-final answer: {end:?} (held {held})"
+        );
+        let (end, held, _) = run(
+            LOCK_TIME,
+            bound(972_185),
+            Ok(ArcOutcome::Accepted("ab".into())),
+        )
+        .await;
+        assert!(
+            matches!(end, Ok(ArcOutcome::Accepted(_))) && !held,
+            "a corroborator's accept admits and is not judged not-final: {end:?}"
+        );
+        // Past the bound (tip + 1 > lock + 24): the word is Arcade's refusal again.
+        let (end, held, _) = run(
+            LOCK_TIME,
+            bound(972_185 + 30),
+            Ok(ArcOutcome::Rejected("TAAL refused".into())),
+        )
+        .await;
+        assert!(
+            matches!(end, Ok(ArcOutcome::Rejected(_))) && !held,
+            "past the bound the two broadcasters' refusal stands: {end:?}"
+        );
+        // A fatal word that names no lock time: never held.
+        let (end, held, _) = run(
+            "TX_INVALID (31): script failed",
+            bound(972_185),
+            Err("corroborator inconclusive".into()),
+        )
+        .await;
+        assert!(
+            matches!(&end, Err(e) if !e.contains("TX_LOCK_TIME")) && !held,
+            "another fatal word keeps the ladder's own end: {end:?}"
+        );
     }
 
     /// PORT-0811 (bsv-low #836): a RE-PRESENT Arcade holds terminal with its non-final word, inside the chain's
