@@ -47,9 +47,14 @@
 //! | Path | Bar | Public? |
 //! |---|---|---|
 //! | [`NetworkGated`](AdmissionPath::NetworkGated) (`broadcast-gated`) | overlay broadcasts, admits only on `SEEN_ON_NETWORK` | **yes — the ONLY public path** |
-//! | [`CurrentTx`](AdmissionPath::CurrentTx) (no header) | none (SPV is not a bar — see [`AdmissionPath::has_bar`]) | operator only |
-//! | [`HistoricalSpv`](AdmissionPath::HistoricalSpv) (`historical-tx`) | none (same) | operator only |
-//! | [`HistoricalUngated`](AdmissionPath::HistoricalUngated) (`historical-tx-no-spv`) | none | operator only |
+//! | [`CurrentTx`](AdmissionPath::CurrentTx) (no header) | none (SPV is not a bar — see [`AdmissionPath::has_bar`]) | operator only under `SUBMIT_ENFORCE=true`; the lenient window serves it to any caller, counted (the reference's public path) |
+//! | [`HistoricalSpv`](AdmissionPath::HistoricalSpv) (`historical-tx`) | none (same) | operator only, in every configuration |
+//! | [`HistoricalUngated`](AdmissionPath::HistoricalUngated) (`historical-tx-no-spv`) | none | operator only, in every configuration |
+//!
+//! A caller with no operator credential therefore reaches no path it selects
+//! by the `x-submit-mode` header other than `broadcast-gated`, in either mode
+//! ([`AdmissionPath::lenient_serves_unauthenticated`], an exhaustive match,
+//! pinned by `smo_no_credential_reaches_no_header_selected_path_but_broadcast_gated`).
 //!
 //! The load-bearing invariant, pinned exhaustively by
 //! `every_path_has_a_bar_or_requires_operator_auth`: **every path either has a
@@ -103,17 +108,26 @@
 //!
 //! ## Rule 6c — the lenient window, and how it closes
 //!
-//! The deployed bsv-low client and watchtower both send `historical-tx-no-spv`
-//! for marker submits today, so enforcing immediately is an outage. Therefore:
+//! The window was opened for one client's migration off
+//! `historical-tx-no-spv`; that migration is complete (both of LOW's renders
+//! are strict). What the window serves now is the no-header default alone:
 //!
 //! * **Lenient ([`GateMode::Lenient`], the default — `SUBMIT_ENFORCE` unset):**
-//!   an unauthenticated ungated submit is SERVED exactly as before, but
+//!   an unauthenticated submit on the no-header default path is SERVED, but
 //!   **counted** and logged (Rule 13: surface the signal, don't consume it).
-//!   Nothing changes for any caller.
+//!   An unauthenticated submit on a path the `x-submit-mode` header selected
+//!   other than `broadcast-gated` (`historical-tx`, `historical-tx-no-spv`) is
+//!   refused `401`, as under strict: the gate's own rule (a check the caller
+//!   can choose is not a check) holds in every configuration.
 //! * **Strict (`SUBMIT_ENFORCE=true`):** an unauthenticated submit on ANY
 //!   unbarred path — which is every path except `broadcast-gated`, including
 //!   the no-header default — is refused `401` with an honest body naming both
 //!   remedies. `broadcast-gated` is never refused, in any configuration.
+//!
+//! The criteria below governed the flip of LOW's renders to strict; they were
+//! met, and they are kept as the record of why the flip waited. Since the
+//! window serves no header-selected unbarred path, what remains between the
+//! two modes is the no-header default alone.
 //!
 //! **Closure criteria — gated on PRODUCER-SIDE facts we control, NOT on the
 //! counter.** The soak metric is attacker-writable (`/health/invariants` is
@@ -323,6 +337,28 @@ impl AdmissionPath {
         !self.has_bar()
     }
 
+    /// Does the lenient window ([`GateMode::Lenient`]) serve this path to a
+    /// caller with NO operator credential?
+    ///
+    /// The gate's own rule applied to the window: a check the caller can
+    /// choose is not a check, so the window serves no path the caller selects
+    /// by `x-submit-mode` other than `broadcast-gated`. It serves the
+    /// no-header default (the reference's public path, counted) and the
+    /// network-gated path (which needs no credential in any configuration).
+    /// Every header-selected unbarred path needs the credential in EVERY
+    /// configuration.
+    ///
+    /// An exhaustive match, so a fifth path cannot be added without deciding
+    /// what the window does with it (pinned by
+    /// `smo_no_credential_reaches_no_header_selected_path_but_broadcast_gated`).
+    pub fn lenient_serves_unauthenticated(self) -> bool {
+        match self {
+            Self::NetworkGated => true,
+            Self::CurrentTx => true,
+            Self::HistoricalSpv | Self::HistoricalUngated => false,
+        }
+    }
+
     /// Stable name for logs, counters and refusal bodies.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -338,9 +374,11 @@ impl AdmissionPath {
 /// so a missing var can never cause a surprise outage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateMode {
-    /// Serve unauthenticated ungated submits, but count them.
+    /// Serve an unauthenticated submit on the no-header default path, but
+    /// count it; refuse one on a header-selected unbarred path (as strict).
     Lenient,
-    /// Refuse unauthenticated ungated submits with an honest 401.
+    /// Refuse an unauthenticated submit on every unbarred path with an honest
+    /// 401, the no-header default included.
     Strict,
 }
 
@@ -419,7 +457,9 @@ impl AdmitPolicy {
 pub enum GateDecision {
     /// Run the submit (the gate, if any, still applies).
     Proceed,
-    /// Strict mode, an unbarred path, and no operator credential → 401.
+    /// An unbarred path and no operator credential, where the mode does not
+    /// serve it (strict: every unbarred path; lenient: a header-selected one)
+    /// → 401.
     RefuseUnauthenticated,
 }
 
@@ -438,8 +478,8 @@ pub fn decide(path: AdmissionPath, operator_authed: bool, mode: GateMode) -> Gat
         return GateDecision::Proceed;
     }
     match mode {
-        GateMode::Lenient => GateDecision::Proceed,
-        GateMode::Strict => GateDecision::RefuseUnauthenticated,
+        GateMode::Lenient if path.lenient_serves_unauthenticated() => GateDecision::Proceed,
+        GateMode::Lenient | GateMode::Strict => GateDecision::RefuseUnauthenticated,
     }
 }
 
@@ -495,7 +535,7 @@ pub struct SubmitPlan {
 /// block compiled and stayed green. An enum arm is not optional.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitAction {
-    /// Unbarred path + unauthenticated + strict → honest 401.
+    /// Unbarred path + unauthenticated, not served by the mode → honest 401.
     RefuseUnauthenticated(AdmissionPath),
     /// The one public path: run the broadcast + SEEN gate, then admit —
     /// executing the spend's scripts at the door first when `scripts` says so.
@@ -507,7 +547,8 @@ pub enum SubmitAction {
         /// How to admit once the gate passes.
         admit: AdmitPolicy,
     },
-    /// An operator on an unbarred path, or the lenient window → admit
+    /// An operator on an unbarred path, or the lenient window's no-header
+    /// default → admit
     /// without the gate. `lenient_unbarred` marks the counted soak case.
     ProceedWithoutGate {
         /// The admission path.
@@ -626,12 +667,14 @@ pub fn plan_submit(
 
 // ── Counters (Rule 13: surface the signal; the soak metric that gates the flip)
 
-/// Unauthenticated submits on an unbarred path — the number that must reach ~0
-/// before `SUBMIT_ENFORCE=true`.
+/// Unauthenticated submits SERVED on an unbarred path: under the lenient window,
+/// the no-header default path only (a header-selected unbarred path is refused
+/// and counted in `STRICT_REFUSED`).
 static UNAUTHENTICATED_UNGATED: AtomicU64 = AtomicU64::new(0);
 /// Operator-authenticated submits on an unbarred path (legitimate peer/migration).
 static OPERATOR_UNGATED: AtomicU64 = AtomicU64::new(0);
-/// Submits refused by strict mode.
+/// Submits refused for want of the operator credential, in either mode (the
+/// served key keeps its name, `strictRefused`).
 static STRICT_REFUSED: AtomicU64 = AtomicU64::new(0);
 /// Submits that took a barred path (the honest majority).
 static BARRED: AtomicU64 = AtomicU64::new(0);
@@ -1020,7 +1063,25 @@ mod tests {
                 lenient_unbarred: false,
             },
         );
-        // The lenient window proceeds ungated and IS counted.
+        // The lenient window proceeds ungated on the no-header default and IS
+        // counted (lane SUBMIT-MODE-OPERATOR: it was asserted on
+        // `historical-tx-no-spv`, which the window no longer serves).
+        assert_eq!(
+            action_for(
+                None,
+                true,
+                false,
+                GateMode::Lenient,
+                ScriptPolicy::Skip,
+                AdmitPolicy::Witnessed
+            ),
+            SubmitAction::ProceedWithoutGate {
+                path: AdmissionPath::CurrentTx,
+                lenient_unbarred: true,
+            },
+        );
+        // A header-selected unbarred path is refused under the lenient window
+        // too (it was `ProceedWithoutGate { lenient_unbarred: true }`).
         assert_eq!(
             action_for(
                 Some("historical-tx-no-spv"),
@@ -1030,10 +1091,7 @@ mod tests {
                 ScriptPolicy::Skip,
                 AdmitPolicy::Witnessed
             ),
-            SubmitAction::ProceedWithoutGate {
-                path: AdmissionPath::HistoricalUngated,
-                lenient_unbarred: true,
-            },
+            SubmitAction::RefuseUnauthenticated(AdmissionPath::HistoricalUngated),
         );
     }
 
@@ -1123,7 +1181,20 @@ mod tests {
                         if plan.decision == GateDecision::RefuseUnauthenticated {
                             assert!(!plan.run_network_gate, "a refusal never broadcasts");
                             assert!(!authed && plan.path.requires_operator_auth());
-                            assert_eq!(mode, GateMode::Strict);
+                            // Strict refuses every unbarred path; the lenient
+                            // window refuses only a header-selected one (it
+                            // asserted strict alone before lane
+                            // SUBMIT-MODE-OPERATOR).
+                            assert!(
+                                mode == GateMode::Strict
+                                    || matches!(
+                                        plan.path,
+                                        AdmissionPath::HistoricalSpv
+                                            | AdmissionPath::HistoricalUngated
+                                    ),
+                                "{header:?} {mode:?} refused on {}",
+                                plan.path.as_str()
+                            );
                         }
                         // The honest public path is NEVER refused, in any
                         // configuration whatsoever (Rule 20).
@@ -1145,7 +1216,17 @@ mod tests {
             for authed in [false, true] {
                 for mode in [GateMode::Lenient, GateMode::Strict] {
                     let got = decide(path, authed, mode);
-                    let want = if path.has_bar() || authed || mode == GateMode::Lenient {
+                    // The lenient window serves the no-header default only
+                    // (it served every unbarred path before lane
+                    // SUBMIT-MODE-OPERATOR).
+                    let lenient_serves = mode == GateMode::Lenient
+                        && match path {
+                            AdmissionPath::CurrentTx | AdmissionPath::NetworkGated => true,
+                            AdmissionPath::HistoricalSpv | AdmissionPath::HistoricalUngated => {
+                                false
+                            }
+                        };
+                    let want = if path.has_bar() || authed || lenient_serves {
                         GateDecision::Proceed
                     } else {
                         GateDecision::RefuseUnauthenticated
@@ -1354,5 +1435,242 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── lane SUBMIT-MODE-OPERATOR (the owner's ruling of 2026-11-17): a caller
+    // with no operator credential selects no submit mode but `broadcast-gated`.
+
+    use AdmissionPath::{CurrentTx, HistoricalSpv, HistoricalUngated, NetworkGated};
+    use GateDecision::{Proceed, RefuseUnauthenticated as Refuse};
+
+    /// The whole decision table, written out as a table (never read off the
+    /// implementation): every path, both credential states, both modes.
+    #[test]
+    fn smo_the_whole_decision_table() {
+        #[rustfmt::skip]
+        let table: [(AdmissionPath, bool, GateMode, GateDecision); 16] = [
+            // lenient, no credential: the default and the gated path only.
+            (NetworkGated,      false, GateMode::Lenient, Proceed),
+            (CurrentTx,         false, GateMode::Lenient, Proceed),
+            (HistoricalSpv,     false, GateMode::Lenient, Refuse),
+            (HistoricalUngated, false, GateMode::Lenient, Refuse),
+            // lenient, the credential: every path.
+            (NetworkGated,      true,  GateMode::Lenient, Proceed),
+            (CurrentTx,         true,  GateMode::Lenient, Proceed),
+            (HistoricalSpv,     true,  GateMode::Lenient, Proceed),
+            (HistoricalUngated, true,  GateMode::Lenient, Proceed),
+            // strict, no credential: the gated path only.
+            (NetworkGated,      false, GateMode::Strict,  Proceed),
+            (CurrentTx,         false, GateMode::Strict,  Refuse),
+            (HistoricalSpv,     false, GateMode::Strict,  Refuse),
+            (HistoricalUngated, false, GateMode::Strict,  Refuse),
+            // strict, the credential: every path.
+            (NetworkGated,      true,  GateMode::Strict,  Proceed),
+            (CurrentTx,         true,  GateMode::Strict,  Proceed),
+            (HistoricalSpv,     true,  GateMode::Strict,  Proceed),
+            (HistoricalUngated, true,  GateMode::Strict,  Proceed),
+        ];
+        for (path, authed, mode, want) in table {
+            assert_eq!(
+                decide(path, authed, mode),
+                want,
+                "{} authed={authed} {mode:?}",
+                path.as_str()
+            );
+        }
+        // The table covers every (path, credential, mode) once.
+        for path in ALL_ADMISSION_PATHS {
+            for authed in [false, true] {
+                for mode in [GateMode::Lenient, GateMode::Strict] {
+                    assert_eq!(
+                        table
+                            .iter()
+                            .filter(|(p, a, m, _)| *p == path && *a == authed && *m == mode)
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE invariant, positive over an exhaustive match: a caller with no
+    /// credential reaches no path selected by the `x-submit-mode` header other
+    /// than `broadcast-gated`, in either mode. Driven through the real header
+    /// mapping, every spelling of each literal.
+    #[test]
+    fn smo_no_credential_reaches_no_header_selected_path_but_broadcast_gated() {
+        for header in [
+            None,
+            Some("broadcast-gated"),
+            Some("historical-tx"),
+            Some("historical-tx-no-spv"),
+            Some("HISTORICAL-TX-NO-SPV"),
+            Some("  historical-tx  "),
+            Some("wat"),
+        ] {
+            for mode in [GateMode::Lenient, GateMode::Strict] {
+                let path = AdmissionPath::from_header(header, true);
+                let got = decide(path, false, mode);
+                // Exhaustive: a fifth path does not compile until decided here.
+                let reachable_unauthenticated = match path {
+                    NetworkGated => true,
+                    CurrentTx => mode == GateMode::Lenient,
+                    HistoricalSpv | HistoricalUngated => false,
+                };
+                assert_eq!(
+                    got == Proceed,
+                    reachable_unauthenticated,
+                    "header {header:?} {mode:?} -> {}",
+                    path.as_str()
+                );
+                if got == Proceed && header.is_some() && path != CurrentTx {
+                    assert_eq!(path, NetworkGated, "header {header:?} {mode:?}");
+                }
+            }
+        }
+    }
+
+    /// The window's rule is said on the path, by an exhaustive match, and is
+    /// what `decide` reads.
+    #[test]
+    fn smo_the_window_is_named_on_the_path() {
+        for path in ALL_ADMISSION_PATHS {
+            let want = match path {
+                NetworkGated | CurrentTx => true,
+                HistoricalSpv | HistoricalUngated => false,
+            };
+            assert_eq!(
+                path.lenient_serves_unauthenticated(),
+                want,
+                "{}",
+                path.as_str()
+            );
+            if path.requires_operator_auth() {
+                assert_eq!(
+                    decide(path, false, GateMode::Lenient) == Proceed,
+                    path.lenient_serves_unauthenticated(),
+                    "{}",
+                    path.as_str()
+                );
+            }
+        }
+    }
+
+    /// The wiring: the shipped plan and action for an unauthenticated
+    /// header-selected unbarred submit under the lenient window are the
+    /// refusal, which runs no gate and executes nothing.
+    #[test]
+    fn smo_the_plan_and_action_refuse_a_header_selected_mode_under_lenient() {
+        for (header, path) in [
+            ("historical-tx-no-spv", HistoricalUngated),
+            ("historical-tx", HistoricalSpv),
+        ] {
+            let plan = plan_submit(
+                Some(header),
+                true,
+                false,
+                GateMode::Lenient,
+                ScriptPolicy::Execute,
+                AdmitPolicy::Fast,
+            );
+            assert_eq!(plan.path, path);
+            assert_eq!(plan.decision, Refuse, "{header}");
+            assert!(!plan.run_network_gate);
+            assert_eq!(plan.script_policy, ScriptPolicy::Skip);
+            assert_eq!(plan.admit_policy, AdmitPolicy::Witnessed);
+            assert_eq!(
+                action_for(
+                    Some(header),
+                    true,
+                    false,
+                    GateMode::Lenient,
+                    ScriptPolicy::Execute,
+                    AdmitPolicy::Fast,
+                ),
+                SubmitAction::RefuseUnauthenticated(path),
+                "{header}"
+            );
+        }
+    }
+
+    /// Strict is unchanged: the base's table for `GateMode::Strict`,
+    /// reproduced, through `decide` and through the shipped action.
+    #[test]
+    fn smo_strict_is_unchanged() {
+        for header in [
+            None,
+            Some("broadcast-gated"),
+            Some("historical-tx"),
+            Some("historical-tx-no-spv"),
+            Some("wat"),
+        ] {
+            for extensions in [true, false] {
+                for authed in [false, true] {
+                    let path = AdmissionPath::from_header(header, extensions);
+                    // The base's rule, verbatim.
+                    let base = if !path.requires_operator_auth() || authed {
+                        Proceed
+                    } else {
+                        Refuse
+                    };
+                    assert_eq!(decide(path, authed, GateMode::Strict), base);
+                    let action = action_for(
+                        header,
+                        extensions,
+                        authed,
+                        GateMode::Strict,
+                        ScriptPolicy::Skip,
+                        AdmitPolicy::Witnessed,
+                    );
+                    let want = match base {
+                        Refuse => SubmitAction::RefuseUnauthenticated(path),
+                        Proceed if path == NetworkGated => SubmitAction::ProceedWithNetworkGate {
+                            path,
+                            scripts: ScriptPolicy::Skip,
+                            admit: AdmitPolicy::Witnessed,
+                        },
+                        Proceed => SubmitAction::ProceedWithoutGate {
+                            path,
+                            lenient_unbarred: false,
+                        },
+                    };
+                    assert_eq!(action, want, "{header:?} ext={extensions} authed={authed}");
+                }
+            }
+        }
+    }
+
+    /// Extensions off: every header but `broadcast-gated` maps to the default
+    /// path, as on the base, and the lenient window serves it (counted).
+    #[test]
+    fn smo_extensions_off_maps_every_header_as_before() {
+        for header in [
+            None,
+            Some("historical-tx"),
+            Some("historical-tx-no-spv"),
+            Some("wat"),
+        ] {
+            assert_eq!(AdmissionPath::from_header(header, false), CurrentTx);
+            assert_eq!(
+                action_for(
+                    header,
+                    false,
+                    false,
+                    GateMode::Lenient,
+                    ScriptPolicy::Skip,
+                    AdmitPolicy::Witnessed,
+                ),
+                SubmitAction::ProceedWithoutGate {
+                    path: CurrentTx,
+                    lenient_unbarred: true,
+                },
+                "{header:?}"
+            );
+        }
+        assert_eq!(
+            AdmissionPath::from_header(Some("broadcast-gated"), false),
+            NetworkGated
+        );
     }
 }

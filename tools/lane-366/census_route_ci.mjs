@@ -23,7 +23,8 @@
  *
  * Expects the ci-route strict worker on argv[2] (:8791) and, when
  * CENSUS_LENIENT_BASE is set, a LENIENT worker (SUBMIT_ENFORCE unset) for the
- * CLIENT-population leg — the exact population the #347 flip criterion reads.
+ * CLIENT-population leg — the exact population the #347 flip criterion reads,
+ * which the window serves on the no-header default alone.
  *
  * Exit 0 = every expectation held.
  */
@@ -298,29 +299,45 @@ await expectCensus({
 }
 
 // 4. CLIENT population (the #347 flip criterion's population) — needs the
-//    lenient worker, where an unauthenticated ungated submit is SERVED.
+//    lenient worker, the one place an unauthenticated unbarred submit is
+//    SERVED. Since lane SUBMIT-MODE-OPERATOR the window serves the no-header
+//    default alone: the client legs ride `current-tx` (the engine may refuse
+//    these bodies, 400; the census counts an arrival either way), and a
+//    header-selected unbarred mode with no credential is 401 there too,
+//    classified by no census cell.
 if (LENIENT_BASE) {
   await expectCensus({
     base: LENIENT_BASE,
-    label: 'client (lenient, unauth) no-ancestry → client.would-fail — the flip-criterion number',
+    label: 'client (lenient, unauth, no header) no-ancestry → client.would-fail — the flip-criterion number',
     body: noAncestryBody,
-    mode: 'historical-tx-no-spv',
-    wantStatus: (s) => s === 200,
-    cellMode: 'historical-tx-no-spv',
+    wantStatus: (s) => s === 200 || s === 400,
+    cellMode: 'current-tx',
     pop: 'client',
     state: 'wouldHaveFailed',
     reason: 'subjectEf',
   })
   await expectCensus({
     base: LENIENT_BASE,
-    label: 'client (lenient, unauth) ancestry-carrying → client.gated-ready',
+    label: 'client (lenient, unauth, no header) ancestry-carrying → client.gated-ready',
     body: ancestryBody,
-    mode: 'historical-tx-no-spv',
-    wantStatus: (s) => s === 200,
-    cellMode: 'historical-tx-no-spv',
+    wantStatus: (s) => s === 200 || s === 400,
+    cellMode: 'current-tx',
     pop: 'client',
     state: 'gatedReady',
   })
+  for (const mode of ['historical-tx-no-spv', 'historical-tx']) {
+    const label = `client (lenient, unauth) ${mode} → 401, no census cell moved`
+    const before = await censusOf(LENIENT_BASE)
+    const res = await postSubmit(LENIENT_BASE, ancestryBody, { mode })
+    const after = await censusOf(LENIENT_BASE)
+    if (res.status !== 401) {
+      fail(label, `status=${res.status} body=${res.text.slice(0, 200)}`)
+    } else if (JSON.stringify(after.byMode) !== JSON.stringify(before.byMode)) {
+      fail(label, 'a census cell moved for a refused submit')
+    } else {
+      pass(label)
+    }
+  }
 } else {
   results.push('SKIP  client-population legs (set CENSUS_LENIENT_BASE)')
 }

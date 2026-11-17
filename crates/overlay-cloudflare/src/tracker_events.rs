@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn ns3d_m3_ungated_stranger_submit_leaves_no_word_event() {
         drain();
-        // historical-tx-no-spv under the lenient window, even if its marker was admitted.
+        // An ungated stranger submit (the no-header default under the lenient window), even if its marker was admitted.
         note_submit(&"01".repeat(32), false, true);
         assert!(
             drain().is_empty(),
