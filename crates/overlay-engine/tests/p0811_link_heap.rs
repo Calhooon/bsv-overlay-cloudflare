@@ -458,3 +458,103 @@ fn parent_proven(mut tx: Transaction) -> Transaction {
         Some(MerklePath::new(900_000, vec![vec![MerklePathLeaf::new_txid(0, id)]]).unwrap());
     tx
 }
+
+/// The wire figure handed to bsv-rs's meter is 16 MiB / 17 = 986,895 bytes,
+/// and for a lock longer than a byte it declines BEFORE the heap estimate
+/// does: a child spending outputs of one proven parent of 300 outputs with
+/// 50-byte locks. The estimate of the declined link is under the heap bound
+/// (so the decline is the meter's), and the largest such sweep that links is
+/// the one whose repeated stubs' wire bytes fit the figure.
+#[test]
+fn p0811_l_the_wire_figure_declines_before_the_heap_estimate() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    assert_eq!(beef_limits::LINK_WIRE_MAX_BYTES, 986_895);
+    let nops = |_: u32| vec![0x61u8; 50];
+    let wide = parent(1, 1, 300, &nops, Some(1));
+    let stub = wide.to_binary().len() as u64;
+    let read = |spent: u32| {
+        let (beef, child) = spend_all(std::slice::from_ref(&wide), spent);
+        let estimate = {
+            let parsed =
+                beef_limits::parse_beef(&beef, &beef_limits::ENGINE_BEEF_LIMITS).expect("parses");
+            beef_limits::link_heap_estimate(&parsed, &child, beef_limits::LINK_HEAP_MAX_BYTES)
+        };
+        let answer = beef_limits::transaction_from_beef(
+            &beef,
+            Some(&child),
+            &beef_limits::ENGINE_BEEF_LIMITS,
+        );
+        (estimate.beyond, answer)
+    };
+    let (beyond, answer) = read(60);
+    assert!(
+        beyond <= beef_limits::LINK_HEAP_MAX_BYTES,
+        "the heap estimate admits 60 spent of 300 ({beyond} bytes)"
+    );
+    assert!(
+        matches!(&answer, Err(e) if beef_limits::is_link_bound(e)),
+        "the wire figure declines 60 spent of 300 50-byte locks (estimate {beyond}): {:?}",
+        answer.map(|tx| tx.id())
+    );
+    // The largest that links: bsv-rs charges each input past the first that
+    // spends the parent the parent's wire bytes.
+    let (mut lo, mut hi) = (1u32, 60u32);
+    assert!(read(lo).1.is_ok());
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if read(mid).1.is_ok() {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let by_wire = (beef_limits::LINK_WIRE_MAX_BYTES / stub) as u32;
+    println!(
+        "WIRE 50-byte locks, 300 outputs: the parent is {stub} wire bytes; {lo} spent links, {hi} declines (the figure holds {by_wire} repeats); the estimate at {hi} is {}",
+        read(hi).0
+    );
+    assert!(
+        lo.abs_diff(by_wire) <= 1,
+        "the largest sweep that links ({lo}) is the wire figure's ({by_wire} repeated stubs of {stub} bytes)"
+    );
+    assert!(read(hi).0 <= beef_limits::LINK_HEAP_MAX_BYTES);
+}
+
+/// A consolidation: one output from each of many DISTINCT proven parents (no
+/// repeated stub, so bsv-rs's meter charges nothing). The estimate charges
+/// each distinct source its full link and its memo stub with its BUMP, so the
+/// link is declined past a few thousand parents: for light parents (two P2PKH
+/// outputs, an empty unlock, a two-leaf BUMP) 4,378 link and 4,379 do not.
+/// Run in the release profile (building 4,378 BUMPs takes minutes unoptimized).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release --test p0811_link_heap"
+)]
+fn p0811_l_a_consolidation_of_distinct_parents_links_to_a_few_thousand() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let links = |n: u32| {
+        let parents: Vec<Transaction> = (0..n)
+            .map(|k| parent(k, 1, 2, &|_| p2pkh(), Some(2)))
+            .collect();
+        let (beef, child) = spend_all(&parents, 1);
+        let answer = beef_limits::transaction_from_beef(
+            &beef,
+            Some(&child),
+            &beef_limits::ENGINE_BEEF_LIMITS,
+        )
+        .map(|_| ())
+        .map_err(|e| beef_limits::is_link_bound(&e));
+        println!(
+            "CONSOLIDATION {n} distinct proven light parents, a body of {} bytes: {answer:?}",
+            beef.len()
+        );
+        answer
+    };
+    assert_eq!(links(4_378), Ok(()), "4,378 light parents link");
+    assert_eq!(
+        links(4_379),
+        Err(true),
+        "4,379 are declined by the link bound"
+    );
+}

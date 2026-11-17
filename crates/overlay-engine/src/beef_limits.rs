@@ -316,7 +316,11 @@ pub const LINK_HEAP_PER_WIRE_BYTE: u64 = 17;
 
 /// The wire figure handed to bsv-rs's meter ([`engine_link_limits`]):
 /// `LINK_HEAP_MAX_BYTES / LINK_HEAP_PER_WIRE_BYTE`, 986,895 bytes of repeated
-/// stubs: the belt; [`link_heap_estimate`] is the bound.
+/// stubs. It declines before [`link_heap_estimate`] does for every lock
+/// longer than a byte (a parent of 300 outputs with 50-byte locks: 56 spent
+/// link, 57 do not, the estimate there 7.2 MB); the estimate is what bounds
+/// empty and one-byte locks and the BUMPs the stubs carry, which this meter
+/// does not charge.
 pub const LINK_WIRE_MAX_BYTES: u64 = LINK_HEAP_MAX_BYTES / LINK_HEAP_PER_WIRE_BYTE;
 
 /// The estimate's charges, native upper bounds, each pinned above the measured
@@ -371,6 +375,11 @@ impl LinkHeap {
 /// leaves. The count stops once `beyond` is past `stop_at`. Each source's wire
 /// form is read once (one transient copy of one transaction); no script is
 /// parsed.
+///
+/// Its premise: the BEEF's scripts are not chunk-parsed before the link. A
+/// script parsed in place is cloned with its chunks (about 32 bytes a
+/// one-byte opcode natively, against the 4 a wire byte is charged here); no
+/// production caller parses an entry of a BEEF before linking it.
 #[must_use]
 pub fn link_heap_estimate(beef: &Beef, txid: &str, stop_at: u64) -> LinkHeap {
     use std::collections::{HashMap, HashSet};
