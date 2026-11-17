@@ -14,7 +14,10 @@ A value is known two ways, and the check needs both:
 THE VAULT FOLDER: `$OVERLAY_VAULT_DIR` if set, else `~/vault`. Every regular file under it (recursively, dot-files
 and dot-directories skipped) whose suffix is one of TEXT_SUFFIXES (or none) and whose size is at most
 VAULT_FILE_MAX_BYTES (1 MiB); a larger file, a file holding a NUL byte in its first 8 KiB (binary), or any other
-suffix (an encrypted store, an image) is not read and is NAMED on one line. JSON files (`.json`): a vault's JSON is
+suffix (an encrypted store, an image) is not read. Every mode but `--vault-report` COUNTS the files not read on
+one line and names none of them (the vault's listing is the operator's: an ordinary run's output lands in CI logs
+and transcripts); `--vault-report` names them. A vault file's name and line are printed by an ordinary run in one
+place only: a refusal's diagnostic, which is the operator's to read. JSON files (`.json`): a vault's JSON is
 mostly STATE (wallet and run state: txids, outpoints, hashes, heights), whose hex would otherwise be read as keys,
 so a JSON file that parses gives only the string values whose KEY names a secret (SECRET_NAME), at any depth; one
 that does not parse is read as text.
@@ -472,10 +475,14 @@ class Vault:
             relative = path.relative_to(folder)
             if any(part.startswith(".") for part in relative.parts) or not path.is_file() or path.is_symlink():
                 continue
-            if path.suffix.lower() not in TEXT_SUFFIXES or path.stat().st_size > VAULT_FILE_MAX_BYTES:
+            try:  # an unreadable file is not read, never a traceback naming its path
+                if path.suffix.lower() not in TEXT_SUFFIXES or path.stat().st_size > VAULT_FILE_MAX_BYTES:
+                    self.skipped.append(str(relative))
+                    continue
+                raw = path.read_bytes()
+            except OSError:
                 self.skipped.append(str(relative))
                 continue
-            raw = path.read_bytes()
             if b"\0" in raw[:8192]:
                 self.skipped.append(str(relative))
                 continue
@@ -535,10 +542,12 @@ class Vault:
         return lines
 
     def skipped_notice(self):
+        """Every mode but `--vault-report`: the COUNT of vault files not read and why, never a name (the listing is
+        the operator's; `--vault-report` names them)."""
         if not self.skipped:
             return None
-        return (f"check-secrets: {len(self.skipped)} vault file(s) not read (binary, too large or not text): "
-                + ", ".join(self.skipped))
+        return (f"check-secrets: {len(self.skipped)} vault file(s) not read (binary, too large or not text); "
+                "--vault-report names them")
 
 
 class Matcher:
@@ -909,6 +918,57 @@ def self_test():
         history = git("rev-list", "HEAD~2..HEAD", cwd=repo).decode().split()
         assert scan_commits(history, vault, out, cwd=repo), "a value added then removed in one push is RED"
 
+        # the ordinary modes name no vault file they did not read: the script run as a command (main()) over a
+        # vault holding a binary file, an over-size file and a file of an unread suffix, each a planted NAME
+        quiet = scratch / "quiet"
+        quiet.mkdir()
+        stems = synthetic(5, 20)
+        unread = [stems[0] + ".md", stems[1] + ".txt", stems[2] + ".kdbx", stems[4] + ".md"]
+        (quiet / unread[0]).write_bytes(b"binary\0" + b"x" * 64)
+        (quiet / unread[1]).write_text("y" * (VAULT_FILE_MAX_BYTES + 1))
+        (quiet / unread[2]).write_text("an unread suffix\n")
+        (quiet / unread[3]).write_text("unreadable\n")  # a file the process may not read: counted, never a traceback
+        (quiet / unread[3]).chmod(0)
+        if os.access(quiet / unread[3], os.R_OK):  # root reads it: it is read, and holds no value
+            unread.pop()
+        holder, held_value = stems[3] + ".md", plant(synthetic(1)[0])
+        (quiet / holder).write_text(f"notes\n{held_value}\n")
+        clean = scratch / "quietrepo"
+        clean.mkdir()
+        git("init", "-q", "-b", "main", cwd=clean)
+        (clean / "clean.rs").write_text("// clean\n")
+        git("add", "-A", cwd=clean)
+        git(*env_git, "commit", "-qm", "clean", cwd=clean)
+        tip = git("rev-parse", "HEAD", cwd=clean).decode().strip()
+        env = dict(os.environ, OVERLAY_VAULT_DIR=str(quiet), HOME=str(scratch))
+
+        def run(*args, stdin="", cwd=clean):
+            done = subprocess.run([sys.executable, str(pathlib.Path(__file__).resolve()), *args], cwd=cwd, env=env,
+                                  input=stdin, text=True, capture_output=True)
+            return done.returncode, done.stdout + done.stderr
+
+        ordinary = {
+            "the tree scan": run(),
+            "the commit scan": run("--commits", tip),
+            "the pre-push door": run("--pre-push", stdin=f"refs/heads/main {tip} refs/heads/main {'0' * 40}\n"),
+        }
+        for mode, (code, text) in ordinary.items():
+            assert code == 0, f"{mode} over a clean repository exits 0: {code}"
+            assert f"{len(unread)} vault file(s) not read" in text, f"{mode} counts the vault files it did not read"
+            for name in unread + [holder]:
+                for i in range(len(name) - 7):
+                    assert name[i:i + 8] not in text, f"{mode} names no vault file it did not read"
+        code, report = run("--vault-report")
+        assert code == 0 and all(f"{name}: not read" in report for name in unread), \
+            "--vault-report names every vault file it did not read"
+        (clean / "leak.rs").write_text(f'static S: &[&str] = &["{held_value}"];\n')
+        git("add", "-A", cwd=clean)
+        code, text = run()
+        assert code == 1 and f":leak.rs:1 (a value the vault holds ({holder} line 2); value withheld)" in text, \
+            "a refusal names the vault file and line of the value"
+        captured += [text, report] + [text for _, text in ordinary.values()]
+        (quiet / (stems[4] + ".md")).chmod(0o600)
+
         # 1,000 synthetic values: this file and every file of the lane pass
         thousand = scratch / "thousand"
         thousand.mkdir()
@@ -941,6 +1001,8 @@ def self_test():
           "shape and RED when the vault holds it; --vault-report carries no value")
     print("check-secrets self-test: shapes RED without a vault (one line printed), a bad-checksum WIF GREEN; an "
           "add-then-remove history RED; 1,000 values: the lane's files clean; no diagnostic carries a value")
+    print("check-secrets self-test: the tree scan, the commit scan and the push door count the vault files they did "
+          "not read and name none; --vault-report names them; a refusal names the vault file and line")
 
 
 def to_wif(secret):
