@@ -340,11 +340,34 @@ pub const LINK_CHARGE_BUMP_LEAF: u64 = 128;
 /// A level-0 leaf's charge in the link's BUMP index ([`LINK_CHARGE_TX`]).
 pub const LINK_CHARGE_INDEX_LEAF: u64 = 64;
 
+/// The heap figure handed to bsv-rs's own heap meter ([`engine_link_limits`];
+/// bsv-rs 0.8.12, GHSA-33fm-jcm5-4m3m: `BeefLinkLimits::max_link_heap_bytes`),
+/// 56 MiB, named here so a later bsv-rs default does not move it.
+///
+/// bsv-rs charges, per clone, the stub's wire bytes plus `size_of` of its
+/// transaction (248 bytes natively), inputs (168) and outputs (136), and 104
+/// bytes a BUMP leaf; [`link_heap_estimate`] charges each of those at least as
+/// much ([`LINK_CHARGE_TX`] 512, [`LINK_CHARGE_INPUT`] 320,
+/// [`LINK_CHARGE_OUTPUT`] 176, 4 a wire byte, [`LINK_CHARGE_BUMP_LEAF`] 128)
+/// and charges the full links bsv-rs does not. So on the ancestry bsv-rs's
+/// count is under the estimate's `beyond`, which [`LINK_HEAP_MAX_BYTES`]
+/// bounds: this figure is 3.5 times the most an admitted ancestry counts (the
+/// largest measured, 7.5 MB, five unproven parents, `tests/p0812_link_heap_meter.rs`).
+/// What it alone bounds is the clone of a PROVEN subject's own BUMP, which the
+/// estimate counts as linear: such a link is declined past 564,617 leaves
+/// (104 bytes a leaf; a body of about 21 MB), where the clone alone would hold
+/// the figure beside the body's own parse.
+pub const LINK_METER_HEAP_MAX_BYTES: u64 = 56 * 1024 * 1024;
+
 /// The link limits handed to bsv-rs at every linking read: its wire meter at
-/// [`LINK_WIRE_MAX_BYTES`].
+/// [`LINK_WIRE_MAX_BYTES`] and its heap meter at [`LINK_METER_HEAP_MAX_BYTES`].
+/// A trip of either is `Err(bsv_rs::Error::BeefResourceLimit)`
+/// ([`is_link_bound`]).
 #[must_use]
 pub fn engine_link_limits() -> BeefLinkLimits {
-    BeefLinkLimits::default().with_max_link_bytes(Some(LINK_WIRE_MAX_BYTES))
+    BeefLinkLimits::default()
+        .with_max_link_bytes(Some(LINK_WIRE_MAX_BYTES))
+        .with_max_link_heap_bytes(Some(LINK_METER_HEAP_MAX_BYTES))
 }
 
 /// An upper bound on the heap bsv-rs's link of a transaction holds, in two
@@ -465,8 +488,8 @@ pub fn link_heap_estimate(beef: &Beef, txid: &str, stop_at: u64) -> LinkHeap {
 /// THE one linking read of this repository: [`link_heap_estimate`]'s
 /// `beyond` against [`LINK_HEAP_MAX_BYTES`], then bsv-rs's link under
 /// [`engine_link_limits`]. `Ok(None)` when the BEEF does not carry `txid`'s
-/// body; `Err` with `BeefResourceLimit` ([`is_link_bound`]) when either bound
-/// declines.
+/// body; `Err` with `BeefResourceLimit` ([`is_link_bound`]) when any bound
+/// declines (the estimate, bsv-rs's wire meter or its heap meter).
 fn link_bounded(beef: &Beef, txid: &str) -> bsv_rs::Result<Option<Transaction>> {
     let heap = link_heap_estimate(beef, txid, LINK_HEAP_MAX_BYTES);
     if heap.beyond > LINK_HEAP_MAX_BYTES {
@@ -535,8 +558,10 @@ pub fn linked(beef: &Beef, txid: &str) -> bsv_rs::Result<Option<Transaction>> {
     link_bounded(beef, txid)
 }
 
-/// Whether `e` is the link bound's trip (bsv-rs 0.8.11, GHSA-gvmh-f5gf-5vjj): a
-/// resource decline, never a verdict on the bytes.
+/// Whether `e` is the link bound's trip: the engine's estimate, bsv-rs's wire
+/// meter (GHSA-gvmh-f5gf-5vjj) or its heap meter (bsv-rs 0.8.12,
+/// GHSA-33fm-jcm5-4m3m), all one class: a resource decline, never a verdict on
+/// the bytes.
 #[must_use]
 pub fn is_link_bound(e: &bsv_rs::Error) -> bool {
     matches!(e, bsv_rs::Error::BeefResourceLimit(_))

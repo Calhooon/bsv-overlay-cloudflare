@@ -38,11 +38,13 @@ repository = "https://github.com/Calhooon/bsv-overlay-cloudflare"
 # BSV SDK — crates.io. `overlay` feature = types + transaction + script +
 # wallet. `auth`/`http` deliberately left off; they pull reqwest/tokio-net
 # which fail on wasm32.
-# The 0.8 stable line by caret (PORT-0811, 2026-11-16): "0.8.11" is the floor (the link bound,
-# GHSA-gvmh-f5gf-5vjj; the bounded EF reader 0.8.10 added) and takes every later 0.8 patch by
-# `cargo update -p bsv-rs`; it was `=0.7.2`, a line no 0.8 patch reaches. Re-run the pins
-# CLAUDE.md names under "bsv-rs 0.8.11" at every such update.
-bsv-rs = { version = "0.8.11", features = ["overlay"] }
+# The 0.8 stable line by caret (PORT-0811, 2026-11-16): "0.8.12" is the floor (LOCK-0812,
+# 2026-11-17: the engine names the link's heap figure, `BeefLinkLimits::with_max_link_heap_bytes`,
+# which 0.8.12 adds, GHSA-33fm-jcm5-4m3m; 0.8.11 brought the link bound, GHSA-gvmh-f5gf-5vjj, and
+# 0.8.10 the bounded EF reader) and takes every later 0.8 patch by `cargo update -p bsv-rs`; it
+# was `=0.7.2`, a line no 0.8 patch reaches. Re-run the pins CLAUDE.md names under "bsv-rs
+# 0.8.11" at every such update.
+bsv-rs = { version = "0.8.12", features = ["overlay"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
