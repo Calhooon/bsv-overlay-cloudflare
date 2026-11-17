@@ -117,7 +117,7 @@ impl LookupService for HoppartyLookupService {
         // Parse the CONTAINING tx out of the BEEF (the same subject-tx
         // selection the topic manager used). Unparseable → no-op, never a
         // spurious record (the `ls_pot` posture).
-        let tx = match beef_limits::transaction_from_beef(
+        let tx = match beef_limits::subject_from_beef(
             atomic_beef,
             None,
             &beef_limits::DISCOVERY_BEEF_LIMITS,

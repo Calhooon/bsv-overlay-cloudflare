@@ -145,7 +145,8 @@ pub fn expected_hop_lock_hex(seat_settle_pubkey: &[u8]) -> Option<String> {
 /// (the container's own lock pays exactly it).
 ///
 /// Signature encoding goes through the SHARED [`canonical_der`] gate (epoch
-/// Rule 4c): `from_der` tolerates trailing bytes and non-minimal INTEGERs,
+/// Rule 4c): `from_der` tolerated trailing bytes and non-minimal INTEGERs until
+/// bsv-rs 0.8.6 (GHSA-9c8r-76f3-m426),
 /// both of which were MEASURED verifying on a real row, so the encoding is
 /// re-derived and byte-compared. Without it an observer can mint unlimited
 /// distinct byte strings that all latch `1` from ONE honest marker, which is

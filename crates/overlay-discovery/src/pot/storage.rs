@@ -1696,11 +1696,9 @@ impl MemoryPotStorage {
             }
             // Hash-bound parse: the stored key must be the subject txid, so
             // a garbled row can never latch some other tx's identity.
-            let Ok(tx) = beef_limits::transaction_from_beef(
-                bytes,
-                Some(txid),
-                &beef_limits::STORED_BEEF_LIMITS,
-            ) else {
+            let Ok(tx) =
+                beef_limits::subject_from_beef(bytes, Some(txid), &beef_limits::STORED_BEEF_LIMITS)
+            else {
                 continue;
             };
             let conflicts = tx.inputs.iter().any(|i| {

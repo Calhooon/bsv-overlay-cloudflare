@@ -2248,7 +2248,7 @@ pub fn classify_stored_spend(
     beef: &[u8],
 ) -> Option<overlay_discovery::pot::SpendVerdict> {
     let spending_tx =
-        beef_limits::transaction_from_beef(beef, Some(spender), &beef_limits::STORED_BEEF_LIMITS)
+        beef_limits::subject_from_beef(beef, Some(spender), &beef_limits::STORED_BEEF_LIMITS)
             .ok()?;
     overlay_discovery::pot::classify_record_spend(rec, &spending_tx)
 }
@@ -2545,12 +2545,24 @@ pub(crate) fn stitch_and_trim_pot_beef(
     // Rebuild the subject tx (with its ancestry) from the stored BEEF and set
     // its own merkle path — mirrors the engine's `update_input_proofs` for the
     // subject-is-txid case.
-    let mut tx = beef_limits::transaction_from_beef(
+    // Linked (`to_beef` below writes the ancestry). A link-bound trip (bsv-rs
+    // 0.8.11) writes nothing and is logged as such, never as unparseable
+    // bytes: the row stays proofless and a candidate, as on any `None`.
+    let mut tx = match beef_limits::transaction_from_beef(
         stored_beef,
         Some(txid),
         &beef_limits::STORED_BEEF_LIMITS,
-    )
-    .ok()?;
+    ) {
+        Ok(tx) => tx,
+        Err(e) => {
+            if beef_limits::is_link_bound(&e) {
+                push_log(&format!(
+                    "[proof] {txid}: the stored BEEF did not link within the link bound ({e}); its proof is not attached this pass"
+                ));
+            }
+            return None;
+        }
+    };
     tx.merkle_path = Some(
         beef_limits::merkle_path_from_hex(bump_hex, beef_limits::COURIER_PROOF_MAX_BYTES).ok()?,
     );
@@ -2842,10 +2854,9 @@ pub fn is_p2pkh_script(script: &[u8]) -> bool {
 /// txid's; `None` when the bytes do not parse, name another tx, or lack the
 /// output.
 pub fn funding_output_script(bytes: &[u8], txid: &str, vout: u32) -> Option<Vec<u8>> {
-    let tx =
-        beef_limits::transaction_from_beef(bytes, Some(txid), &beef_limits::STORED_BEEF_LIMITS)
-            .or_else(|_| Transaction::from_binary(bytes))
-            .ok()?;
+    let tx = beef_limits::subject_from_beef(bytes, Some(txid), &beef_limits::STORED_BEEF_LIMITS)
+        .or_else(|_| Transaction::from_binary(bytes))
+        .ok()?;
     if !tx.id().eq_ignore_ascii_case(txid) {
         return None;
     }
@@ -3676,7 +3687,7 @@ pub async fn backfill_decoded_params(
         };
         // 2. Hash-bound parse: select the subject by the row's own txid
         //    (BEEF txids are computed from the raw bytes at parse time).
-        let Ok(tx) = beef_limits::transaction_from_beef(
+        let Ok(tx) = beef_limits::subject_from_beef(
             &beef,
             Some(&row.txid),
             &beef_limits::STORED_BEEF_LIMITS,
@@ -3897,7 +3908,7 @@ pub async fn backfill_spender_payouts(
             summary.missing_beef += 1;
             continue; // stays a candidate — the bytes can still arrive
         };
-        let Ok(spending_tx) = beef_limits::transaction_from_beef(
+        let Ok(spending_tx) = beef_limits::subject_from_beef(
             &spender_beef,
             Some(spending_txid),
             &beef_limits::STORED_BEEF_LIMITS,
@@ -4053,7 +4064,7 @@ pub async fn backfill_settle_signers(
             summary.missing_beef += 1;
             continue; // stays a candidate — the bytes can still arrive
         };
-        let Ok(spending_tx) = beef_limits::transaction_from_beef(
+        let Ok(spending_tx) = beef_limits::subject_from_beef(
             &spender_beef,
             Some(spending_txid),
             &beef_limits::STORED_BEEF_LIMITS,

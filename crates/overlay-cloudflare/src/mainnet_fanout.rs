@@ -384,13 +384,13 @@ pub struct Advert {
 /// still needs [`SHIPTopicManager::admissible_advert`] ([`advert_is_admitted`])
 /// before it names a host.
 pub fn read_advert(beef: &[u8], output_index: u32, topic: &str) -> Option<Advert> {
-    let mut parsed = beef_limits::parse_beef(beef, &beef_limits::PEER_BEEF_LIMITS).ok()?;
-    let subject = overlay_engine::subject::subject_txid_of(&mut parsed)?;
-    let tx = parsed
-        .txs
-        .iter()
-        .find(|b| b.txid().eq_ignore_ascii_case(&subject))
-        .and_then(|b| b.tx())?;
+    let subject = {
+        let mut parsed = beef_limits::parse_beef(beef, &beef_limits::PEER_BEEF_LIMITS).ok()?;
+        overlay_engine::subject::subject_txid_of(&mut parsed)?
+    };
+    // The subject alone, nothing linked: the subject-only read under the same door.
+    let tx = beef_limits::subject_from_beef(beef, Some(&subject), &beef_limits::PEER_BEEF_LIMITS)
+        .ok()?;
     let output = tx.outputs.get(usize::try_from(output_index).ok()?)?;
     let fields = PushDrop::decode(&output.locking_script).ok()?.fields;
     if fields.len() != 5 || fields[0] != b"SHIP" || fields[3] != topic.as_bytes() {
@@ -1721,6 +1721,10 @@ mod tests {
         );
         let reader = body_of(src, "pub fn read_advert(");
         assert!(reader.contains("subject::subject_txid_of(&mut parsed)"));
+        assert!(
+            reader.contains("beef_limits::subject_from_beef(beef, Some(&subject)"),
+            "the advert is the subject read alone, nothing linked"
+        );
         assert!(
             !reader.contains("transaction_from_beef"),
             "never the wire-last reader"

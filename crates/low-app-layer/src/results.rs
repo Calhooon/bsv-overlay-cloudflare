@@ -447,7 +447,8 @@ pub fn seatsig_preimage(
 /// its own identity binding, and lock membership is checked separately by
 /// [`attribute_seats`]. Any malformed key/sig/field is `false` (refused).
 /// CANONICAL STRICT DER (Rule 4c) is enforced inside the shared rule:
-/// `from_der` tolerates trailing bytes, so the encoding is re-derived and
+/// `from_der` tolerated trailing bytes until bsv-rs 0.8.6 (GHSA-9c8r-76f3-m426),
+/// and the encoding is still re-derived and
 /// byte-compared. Without it an observer mints unlimited distinct "valid"
 /// rows from one honest marker by padding it — which since #283 would be a
 /// way to fill a window with `sigValid = 1` rows.

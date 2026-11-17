@@ -431,7 +431,7 @@ pub const HELD_PROOF_READS: [&str; 2] = [
 /// PURE: the subject's own proof out of its held BEEF, if the bytes carry one.
 pub fn proof_of_held_beef(txid: &str, beef: Option<Vec<u8>>) -> Option<Proof> {
     beef.and_then(|bytes| {
-        overlay_engine::beef_limits::transaction_from_beef(
+        overlay_engine::beef_limits::subject_from_beef(
             &bytes,
             Some(txid),
             &overlay_engine::beef_limits::STORED_BEEF_LIMITS,
@@ -1094,7 +1094,7 @@ where
         let proof = subject
             .beef
             .and_then(|bytes| {
-                overlay_engine::beef_limits::transaction_from_beef(
+                overlay_engine::beef_limits::subject_from_beef(
                     &bytes,
                     Some(&subject.txid),
                     &overlay_engine::beef_limits::STORED_BEEF_LIMITS,

@@ -891,10 +891,13 @@ impl GASPStorage for OverlayGASPStorage<'_> {
 
         if let Some(output) = output {
             if let Some(ref beef) = output.beef {
-                // Parse the BEEF to extract raw transaction hex
-                match beef_limits::transaction_from_beef(
+                // The stored body of `txid` itself, by its txid (a BEEF a
+                // 0.7.2 build stored can end with a proven ancestor,
+                // GHSA-gg5p-wgff-v3hr): its raw transaction and its own
+                // proof, nothing linked.
+                match beef_limits::subject_from_beef(
                     beef,
-                    None,
+                    Some(txid),
                     &beef_limits::STORED_BEEF_LIMITS,
                 ) {
                     Ok(tx) => {
@@ -933,7 +936,9 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             GASPError::NodeNotFound(format!("No BEEF data for {txid}.{output_index}"))
         })?;
 
-        let tx = beef_limits::transaction_from_beef(beef, None, &beef_limits::STORED_BEEF_LIMITS)
+        // By its txid (GHSA-gg5p-wgff-v3hr: a body a 0.7.2 build stored can
+        // end with a proven ancestor), nothing linked.
+        let tx = beef_limits::subject_from_beef(beef, Some(txid), &beef_limits::STORED_BEEF_LIMITS)
             .map_err(|e| GASPError::Other(format!("BEEF parse error: {e}")))?;
 
         let mut node = GASPNode {
@@ -1435,12 +1440,22 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             let subject = beef_limits::parse_beef(beef, &beef_limits::PEER_BEEF_LIMITS)
                 .map(|mut b| crate::subject::subject_txid_of(&mut b))
                 .map_err(|e| refused(format!("a graph BEEF does not parse: {e}")))?;
-            let tx = beef_limits::transaction_from_beef(
+            // Linked (the manager may read the sources), under bsv-rs
+            // 0.8.11's link bound: a trip is no refusal of the graph, it is
+            // HELD as a walk past the budget is (the cursor stays below it).
+            let tx = match beef_limits::transaction_from_beef(
                 beef,
                 subject.as_deref(),
                 &beef_limits::PEER_BEEF_LIMITS,
-            )
-            .map_err(|e| refused(format!("a graph BEEF does not parse: {e}")))?;
+            ) {
+                Ok(tx) => tx,
+                Err(e) if beef_limits::is_link_bound(&e) => {
+                    return Err(GASPError::AnchorWalkHeld(format!(
+                        "graph {graph_id}: a node could not be linked within the link bound ({e})"
+                    )))
+                }
+                Err(e) => return Err(refused(format!("a graph BEEF does not parse: {e}"))),
+            };
             let txid = tx.id();
             // Two outputs of one transaction are two nodes with one BEEF.
             if !replayed.insert(txid.clone()) {

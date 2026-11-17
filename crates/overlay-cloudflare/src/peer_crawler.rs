@@ -176,7 +176,7 @@ fn expired_answer(entry: &OutputEntry, topic: &str, now: u64) -> Result<u64, Str
         return Ok(0);
     }
     use overlay_engine::topic_manager::TopicManager;
-    let tx = overlay_engine::beef_limits::transaction_from_beef(
+    let tx = overlay_engine::beef_limits::subject_from_beef(
         &entry.beef,
         None,
         &overlay_engine::beef_limits::PEER_BEEF_LIMITS,

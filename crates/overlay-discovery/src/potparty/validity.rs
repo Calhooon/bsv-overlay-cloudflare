@@ -244,7 +244,8 @@ pub fn seatsig_preimage(
 /// CANONICAL STRICT DER + LOW-S (epoch Rule 4c), the ONE gate both signature
 /// bars go through.
 ///
-/// `from_der` tolerates trailing bytes, so the encoding is re-derived and
+/// `from_der` tolerated trailing bytes until bsv-rs 0.8.6 (GHSA-9c8r-76f3-m426),
+/// and the encoding is still re-derived and
 /// byte-compared; `is_low_s` is asserted here rather than inherited from
 /// whatever the verifier happens to do, because "the verifier enforces it"
 /// is a claim about a dependency and this is the layer that must not drift.
