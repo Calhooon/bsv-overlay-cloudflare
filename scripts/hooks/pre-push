@@ -1,0 +1,7 @@
+#!/bin/sh
+# The secrets door before a push (scripts/check-secrets.py): every blob a pushed commit adds or modifies is judged
+# for credential shapes and for the values the operator's vault folder holds ($OVERLAY_VAULT_DIR, else ~/vault),
+# read at run time. A finding refuses the push, named by commit, path, line and rule, the value withheld.
+# Installed by `make hooks` (git config core.hooksPath scripts/hooks).
+root=$(git rev-parse --show-toplevel) || exit 1
+exec python3 "$root/scripts/check-secrets.py" --pre-push "$@"
