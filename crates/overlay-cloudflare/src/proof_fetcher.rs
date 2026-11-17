@@ -2542,27 +2542,15 @@ pub(crate) fn stitch_and_trim_pot_beef(
 ) -> Option<Vec<u8>> {
     use bsv_rs::transaction::Beef;
 
-    // Rebuild the subject tx (with its ancestry) from the stored BEEF and set
-    // its own merkle path — mirrors the engine's `update_input_proofs` for the
-    // subject-is-txid case.
-    // Linked (`to_beef` below writes the ancestry). A link-bound trip (bsv-rs
-    // 0.8.11) writes nothing and is logged as such, never as unparseable
-    // bytes: the row stays proofless and a candidate, as on any `None`.
-    let mut tx = match beef_limits::transaction_from_beef(
-        stored_beef,
-        Some(txid),
-        &beef_limits::STORED_BEEF_LIMITS,
-    ) {
-        Ok(tx) => tx,
-        Err(e) => {
-            if beef_limits::is_link_bound(&e) {
-                push_log(&format!(
-                    "[proof] {txid}: the stored BEEF did not link within the link bound ({e}); its proof is not attached this pass"
-                ));
-            }
-            return None;
-        }
-    };
+    // The subject ALONE (`subject_from_beef`, nothing linked): a proven
+    // subject needs no ancestry, and `to_beef` below writes the subject with
+    // its new BUMP and nothing under it (what the trim would leave of a linked
+    // read). A stored row that reads at all stitches; one whose bytes do not
+    // read is `None`, logged by the caller (the stored-rows reader names such
+    // a row before a deploy).
+    let mut tx =
+        beef_limits::subject_from_beef(stored_beef, Some(txid), &beef_limits::STORED_BEEF_LIMITS)
+            .ok()?;
     tx.merkle_path = Some(
         beef_limits::merkle_path_from_hex(bump_hex, beef_limits::COURIER_PROOF_MAX_BYTES).ok()?,
     );
@@ -12264,5 +12252,69 @@ pub(crate) mod tests {
                 "another spend's bytes"
             );
         }
+    }
+
+    /// PORT-0811: the proof completion's stitch reads the stored subject
+    /// alone. A stored pot BEEF whose subject spends 420 of one unproven
+    /// parent's 4,000 one-byte outputs stitches its verified proof (the
+    /// subject and its BUMP, nothing under it), and the result is what a
+    /// linked read and its trim leave of an ancestry that links.
+    #[test]
+    fn p0811_l_the_stitch_reads_the_stored_subject_alone() {
+        use bsv_rs::script::{LockingScript, Script, UnlockingScript};
+        use bsv_rs::transaction::{Beef, Transaction, TransactionInput, TransactionOutput};
+        let one = || LockingScript::from_script(Script::from_binary(&[0x51]).unwrap());
+        let shaped = |outputs: u32, spent: u32| {
+            let mut parent = Transaction::new();
+            parent.inputs.push(TransactionInput {
+                source_txid: Some("aa".repeat(32)),
+                unlocking_script: Some(UnlockingScript::from_script(Script::new())),
+                ..Default::default()
+            });
+            for _ in 0..outputs {
+                parent.outputs.push(TransactionOutput::new(1, one()));
+            }
+            let parent_txid = parent.id();
+            let mut child = Transaction::new();
+            for vout in 0..spent {
+                child.inputs.push(TransactionInput {
+                    source_txid: Some(parent_txid.clone()),
+                    source_output_index: vout,
+                    unlocking_script: Some(UnlockingScript::from_script(Script::new())),
+                    ..Default::default()
+                });
+            }
+            child.outputs.push(TransactionOutput::new(1, one()));
+            let mut beef = Beef::new();
+            beef.merge_raw_tx(parent.to_binary(), None);
+            beef.merge_raw_tx(child.to_binary(), None);
+            (beef.to_binary(), child)
+        };
+        let (stored, child) = shaped(4_000, 420);
+        let txid = child.id();
+        let bump_hex = single_tx_bump(&txid, 900_000).to_hex();
+        let compacted = stitch_and_trim_pot_beef(&txid, &stored, &bump_hex)
+            .expect("a stored row that reads stitches its verified proof");
+        let parsed = Beef::from_binary(&compacted).unwrap();
+        assert_eq!(parsed.txs.len(), 1, "the subject alone, nothing under it");
+        assert!(parsed.find_txid(&txid).is_some_and(|e| e.has_proof()));
+        assert_eq!(
+            Transaction::from_beef(&compacted, Some(&txid))
+                .unwrap()
+                .to_binary(),
+            child.to_binary()
+        );
+        // An ancestry that links leaves the same bytes after the trim.
+        let (small, small_child) = shaped(3, 3);
+        let small_txid = small_child.id();
+        let small_bump = single_tx_bump(&small_txid, 900_000);
+        let mut linked = Transaction::from_beef(&small, Some(&small_txid)).unwrap();
+        linked.merkle_path = Some(small_bump.clone());
+        let mut trimmed = Beef::from_binary(&linked.to_beef(true).unwrap()).unwrap();
+        trimmed.trim_known_proven();
+        assert_eq!(
+            stitch_and_trim_pot_beef(&small_txid, &small, &small_bump.to_hex()),
+            Some(trimmed.to_binary())
+        );
     }
 }

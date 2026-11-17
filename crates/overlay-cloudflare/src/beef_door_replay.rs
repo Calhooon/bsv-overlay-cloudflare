@@ -1661,3 +1661,149 @@ mod e592 {
         );
     }
 }
+
+/// PORT-0811: a link trip never stops a submit the network already accepted.
+mod p0811 {
+    use super::*;
+    use async_trait::async_trait;
+    use overlay_engine::builder::EngineBuilder;
+    use overlay_engine::engine::WalkLimb;
+    use overlay_engine::storage::memory::MemoryStorage;
+    use overlay_engine::topic_manager::{TopicManager, TopicManagerError};
+    use overlay_engine::types::*;
+
+    struct AdmitOutputZero;
+
+    #[async_trait(?Send)]
+    impl TopicManager for AdmitOutputZero {
+        async fn identify_admissible_outputs(
+            &self,
+            _: &bsv_rs::transaction::Transaction,
+            _: &[u8],
+            _: Option<&[u8]>,
+            _: SubmitMode,
+            _context: &TopicAdmittanceContext,
+        ) -> Result<AdmittanceInstructions, TopicManagerError> {
+            Ok(AdmittanceInstructions {
+                outputs_to_admit: vec![0],
+                coins_to_retain: vec![],
+                coins_removed: None,
+            })
+        }
+        async fn get_documentation(&self) -> String {
+            "admits output 0".into()
+        }
+        async fn get_metadata(&self) -> ServiceMetadata {
+            ServiceMetadata {
+                name: "admit-zero".into(),
+                ..Default::default()
+            }
+        }
+    }
+
+    /// One proven parent of 1,400 `OP_1` outputs and one child spending every
+    /// one of them: past the engine's link bound, valid in every script.
+    fn link_bound_body() -> (Vec<u8>, String) {
+        use bsv_rs::script::{LockingScript, Script, UnlockingScript};
+        use bsv_rs::transaction::{
+            Beef, MerklePath, MerklePathLeaf, Transaction, TransactionInput, TransactionOutput,
+        };
+        let one = || LockingScript::from_script(Script::from_binary(&[0x51]).unwrap());
+        let mut parent = Transaction::new();
+        parent.inputs.push(TransactionInput {
+            source_txid: Some("aa".repeat(32)),
+            unlocking_script: Some(UnlockingScript::from_script(Script::new())),
+            ..Default::default()
+        });
+        for _ in 0..1_400 {
+            parent.outputs.push(TransactionOutput::new(1, one()));
+        }
+        let parent_txid = parent.id();
+        let mut child = Transaction::new();
+        for vout in 0..1_400 {
+            child.inputs.push(TransactionInput {
+                source_txid: Some(parent_txid.clone()),
+                source_output_index: vout,
+                unlocking_script: Some(UnlockingScript::from_script(Script::new())),
+                ..Default::default()
+            });
+        }
+        child.outputs.push(TransactionOutput::new(1, one()));
+        let mut beef = Beef::new();
+        let bump = beef.merge_bump(
+            MerklePath::new(
+                900_000,
+                vec![vec![MerklePathLeaf::new_txid(0, parent_txid)]],
+            )
+            .unwrap(),
+        );
+        beef.merge_raw_tx(parent.to_binary(), Some(bump));
+        beef.merge_raw_tx(child.to_binary(), None);
+        (beef.to_binary(), child.id())
+    }
+
+    /// The gated arm's admission (its mode is `AdmissionPath::NetworkGated`'s,
+    /// `historical-tx-no-spv`, through `Engine::submit_with_report`, the
+    /// route's call) of a body past the link bound: admitted, the trip on the
+    /// report (which the route counts, `ops::note_engine_walk`), never the
+    /// route's 503. Its S2 replay, under the message's mode, likewise. On
+    /// `1af62adf` the admission was `WalkCouldNotRun` (limb `over_link`): the
+    /// 503 with nothing written and nothing queued.
+    #[test]
+    fn p0811_m2_the_gated_admission_goes_on_over_a_link_bound_body() {
+        let (beef, subject) = link_bound_body();
+        let engine = EngineBuilder::new(Box::new(MemoryStorage::new()))
+            .with_topic("tm_test", Box::new(AdmitOutputZero))
+            .with_walk_budget(crate::WORKER_WALK_BUDGET)
+            .build();
+        let mode = crate::submit_gate::AdmissionPath::NetworkGated.engine_mode();
+        assert_eq!(mode, SubmitMode::HistoricalTxNoSpv);
+        let tagged = TaggedBEEF::new(beef.clone(), vec!["tm_test".into()]);
+        fn run<T>(future: impl std::future::Future<Output = T>) -> T {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(future)
+        }
+        let (steak, report) = run(engine.submit_with_report(&tagged, mode))
+            .expect("the network's accept goes on over a link trip");
+        assert!(steak
+            .get("tm_test")
+            .is_some_and(|a| a.outputs_to_admit == vec![0]));
+        assert_eq!(report.applied_topics, vec!["tm_test".to_string()]);
+        let stop = report
+            .walk_could_not_run
+            .expect("the trip is on the report");
+        assert_eq!(stop.limb, WalkLimb::OverLink);
+        assert_eq!(stop.subject_txid, subject);
+        // The route counts what the report carries, and answers 503 only on
+        // the engine's `WalkCouldNotRun` (the source, as the route runs it).
+        let routes = include_str!("routes.rs");
+        assert!(routes.contains("let mode = action.engine_mode();"));
+        assert!(routes.contains("_ => engine.submit_with_report(&tagged_beef, mode).await,"));
+        assert!(routes
+            .contains("crate::ops::note_engine_walk(&db, &mutation_report, \"POST /submit\")"));
+        // The S2 replay of the gated write carries its mode and goes on too.
+        let queue::Carriage::Inline(message) = queue::plan_replay_gated(
+            &beef,
+            &["tm_test".to_string()],
+            mode,
+            queue::REPLAY_REASON_PHASE3_FAULT,
+            queue::QUEUE_MESSAGE_ROOM,
+            true,
+        ) else {
+            panic!("the body rides inline")
+        };
+        let fresh = EngineBuilder::new(Box::new(MemoryStorage::new()))
+            .with_topic("tm_test", Box::new(AdmitOutputZero))
+            .with_walk_budget(crate::WORKER_WALK_BUDGET)
+            .build();
+        let (_, replayed) = run(fresh.submit_with_report_under(
+            &tagged,
+            queue::replay_submit_mode(&message.mode),
+            queue::replay_breach_policy(&message),
+        ))
+        .expect("the replay goes on");
+        assert_eq!(replayed.applied_topics, vec!["tm_test".to_string()]);
+    }
+}

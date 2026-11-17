@@ -741,10 +741,13 @@ pub enum WalkLimb {
     /// The coin's era ([`DoorLimb::Era`]): a spend the door's interpreter
     /// does not judge as the node does, declined by the walk.
     CoinEra,
-    /// bsv-rs 0.8.11's link bound (GHSA-gvmh-f5gf-5vjj): linking the subject's
-    /// ancestry would re-materialize more shared-parent stub bytes than
-    /// `BeefLinkLimits::default()` allows (16 MiB). A memory limb: the
-    /// submit's own parse could not run within it, never a verdict.
+    /// The engine's link bound (`beef_limits::LINK_HEAP_MAX_BYTES`, 16 MiB of
+    /// heap; bsv-rs 0.8.11's meter as its belt): linking the subject's
+    /// ancestry would hold more than that. A memory limb: the submit's own
+    /// parse could not run within it, never a verdict. In
+    /// `historical-tx-no-spv` (the network's word on these bytes, or a GASP
+    /// graph the anchor passed) and under `WalkBreachPolicy::NetworkAccepted`
+    /// the submit goes on with its subject unlinked and reports it.
     OverLink,
 }
 
@@ -3715,6 +3718,16 @@ impl Engine {
         if could_not_run.is_none() {
             could_not_run = link_stop;
         }
+        // A link trip in `historical-tx-no-spv` is never "not now": that mode
+        // walks nothing and carries the network's word on these bytes (the
+        // gated arm's admission after its broadcast) or a graph the anchor
+        // check passed (a GASP finalize), so the submit goes on with its
+        // subject unlinked, reported, exactly as under `NetworkAccepted`.
+        let policy = if mode == SubmitMode::HistoricalTxNoSpv {
+            WalkBreachPolicy::NetworkAccepted
+        } else {
+            policy
+        };
         if let Some(stop) = could_not_run.take() {
             match policy {
                 WalkBreachPolicy::NotNow => {
