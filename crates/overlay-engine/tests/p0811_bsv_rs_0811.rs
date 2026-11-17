@@ -411,3 +411,82 @@ async fn p0811_n1_a_stored_body_ending_with_a_proven_ancestor_reads_its_own_txid
         "the unproven subject carries no proof"
     );
 }
+
+/// A body that ENDS with its subject's proven ancestor, written by hand
+/// (`Beef::to_binary` sorts a source before its spender): the order a 0.7.2
+/// `to_beef` could store, and any order a stranger may send.
+fn ending_with_its_ancestor() -> (Vec<u8>, Transaction, Transaction) {
+    let parent = proven_funding(
+        vec![TransactionOutput::new(
+            1_000,
+            LockingScript::from_script(script(&[0x51])),
+        )],
+        800_000,
+    );
+    let child = spend_of(&parent, &[0], &[], 900);
+    let mut body = vec![0x01, 0x00, 0xbe, 0xef, 0x01];
+    body.extend(parent.merkle_path.clone().unwrap().to_binary());
+    body.push(0x02);
+    body.extend(child.to_binary());
+    body.push(0x00);
+    body.extend(parent.to_binary());
+    body.extend([0x01, 0x00]);
+    (body, parent, child)
+}
+
+/// PORT-0811 fold: a read that names no txid takes the house's ONE subject
+/// rule (`subject::subject_txid_of`: the atomic name, then the unique tip,
+/// then the reference's sorted-last), never the wire-last entry. Over a body
+/// that ends with its subject's proven ancestor, both the linked read and the
+/// subject-alone read answer the subject; an atomic body answers its name;
+/// a body of two tips answers the subject rule's sorted-last. On the base both
+/// reads answered the ancestor (`txs.last()`).
+#[test]
+fn p0811_f3_a_read_naming_no_txid_takes_the_subject_rule() {
+    let (body, parent, child) = ending_with_its_ancestor();
+    let wire = beef_limits::read_beef(&body).unwrap();
+    assert_eq!(
+        wire.last_txid.as_deref(),
+        Some(parent.id().as_str()),
+        "the premise"
+    );
+    let alone = beef_limits::subject_from_beef(&body, None, &beef_limits::STORED_BEEF_LIMITS)
+        .expect("reads");
+    assert_eq!(
+        alone.id(),
+        child.id(),
+        "the subject, not the wire-last ancestor"
+    );
+    let linked = beef_limits::transaction_from_beef(&body, None, &beef_limits::STORED_BEEF_LIMITS)
+        .expect("links");
+    assert_eq!(linked.id(), child.id());
+    // An atomic body is read by its name, whatever its graph.
+    let mut atomic = Beef::new();
+    let bump = atomic.merge_bump(parent.merkle_path.clone().unwrap());
+    atomic.merge_raw_tx(parent.to_binary(), Some(bump));
+    atomic.merge_raw_tx(child.to_binary(), None);
+    let atomic_bytes = atomic.to_binary_atomic(&child.id()).unwrap();
+    assert_eq!(
+        beef_limits::subject_from_beef(&atomic_bytes, None, &beef_limits::STORED_BEEF_LIMITS)
+            .unwrap()
+            .id(),
+        child.id()
+    );
+    // Two unrelated tips: the subject rule's sorted-last, the same txid the
+    // engine's admission names.
+    let other = spend_of(&parent, &[0], &[0x51], 800);
+    let mut two = Beef::new();
+    let bump = two.merge_bump(parent.merkle_path.clone().unwrap());
+    two.merge_raw_tx(parent.to_binary(), Some(bump));
+    two.merge_raw_tx(child.to_binary(), None);
+    two.merge_raw_tx(other.to_binary(), None);
+    let two_bytes = two.to_binary();
+    let mut parsed = Beef::from_binary(&two_bytes).unwrap();
+    let rule = bsv_overlay_engine::subject::subject_txid_of(&mut parsed).unwrap();
+    assert_eq!(
+        beef_limits::subject_from_beef(&two_bytes, None, &beef_limits::STORED_BEEF_LIMITS)
+            .unwrap()
+            .id(),
+        rule
+    );
+}

@@ -1163,9 +1163,10 @@ mod tests {
     /// PLAIN body it judged the hop, failed the pot shape check and wrote NO
     /// record (the engine had admitted the pot: `known:false` for a mined
     /// pot). The engine now hands lookup services a body that NAMES the
-    /// subject (BRC-95 atomic prefix over the whole body) — both halves
-    /// pinned here: the named body records the pot; the same bytes un-named
-    /// still skip (the trap, documented at the service's own door).
+    /// subject (BRC-95 atomic prefix over the whole body). Since PORT-0811's
+    /// fold a read that names no txid takes the subject rule (the unique tip,
+    /// here the JOIN), never the wire-last entry, so the same bytes un-named
+    /// record the pot too (on `5dc6a82f` they were skipped: the trap).
     const LOOP2_INCOMPLETE_JOIN_BEEF: &[u8] = include_bytes!(
         "../../../overlay-cloudflare/tests/fixtures/ef/loop2_join_5ad2764c_incomplete.beef"
     );
@@ -1175,15 +1176,16 @@ mod tests {
     #[tokio::test]
     async fn loop2_named_body_records_the_pot_the_plain_body_missed() {
         use bsv_rs::transaction::Beef;
-        // the trap: un-named, the hook sees the wire-last hop → no record
+        // un-named: the subject rule reads the JOIN (the unique tip), not the
+        // wire-last hop, so the pot is recorded
         let (svc, storage) = make_service_with_storage();
         svc.output_admitted_by_topic(&admit(LOOP2_INCOMPLETE_JOIN_BEEF.to_vec(), 0))
             .await
             .unwrap();
         assert_eq!(
             storage.record_count(),
-            0,
-            "the plain body's wire-last is a hop — skipped"
+            1,
+            "the plain body's subject is the JOIN, not its wire-last hop"
         );
 
         // the fix: the engine names the subject; the hook records the pot
