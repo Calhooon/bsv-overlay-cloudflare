@@ -41,6 +41,9 @@ pub struct StreamCharges {
     pub kept_output: u64,
     /// Kept for the whole read, per txid a BUMP carries at level 0.
     pub kept_proven: u64,
+    /// Kept for the whole read, per txid a BUMP below the Genesis height
+    /// carries at level 0, beside `kept_proven` (the door's era screen).
+    pub kept_pre_genesis_proven: u64,
     /// In hand, one element at a time: per byte of a raw transaction.
     pub tx_byte: u64,
     /// In hand: per input of the raw transaction.
@@ -66,6 +69,7 @@ impl StreamCharges {
         kept_input: 0,
         kept_output: 0,
         kept_proven: 0,
+        kept_pre_genesis_proven: 0,
         tx_byte: 3,
         tx_input: 192,
         tx_output: 96,
@@ -207,7 +211,7 @@ impl Sizer<'_> {
     /// whole one would be.
     fn bump(&mut self) -> Option<()> {
         let at = self.f.at;
-        self.f.varint()?;
+        let old = self.f.varint()? < crate::script_door::GENESIS_HEIGHT;
         let levels = *self.f.take(1)?.first()?;
         let mut leaves = 0u64;
         for level in 0..levels {
@@ -224,6 +228,11 @@ impl Sizer<'_> {
                 leaves += 1;
                 if level == 0 && hashed {
                     self.kept = self.kept.saturating_add(self.charges.kept_proven);
+                    if old {
+                        self.kept = self
+                            .kept
+                            .saturating_add(self.charges.kept_pre_genesis_proven);
+                    }
                 }
                 self.in_hand(at, leaves.saturating_mul(self.charges.bump_leaf))?;
             }

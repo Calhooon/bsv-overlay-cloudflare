@@ -78,7 +78,9 @@ use crate::stream_sizing::{self, Admission, StreamCharges};
 /// in the walk's `seen` (114) and its entry in the walk's `sources` (168):
 /// 450. Per input: the walk's queue (32 bytes, a growing buffer: 96). Per
 /// output: a source's output offsets (a word, a growing buffer: 24). Per txid
-/// a BUMP proves: its bucket in the proven set (33 bytes, as the index: 114).
+/// a BUMP proves: its bucket in the proven set (33 bytes, as the index: 114),
+/// and a second such bucket in the set of txids proven below the Genesis
+/// height when its BUMP is below it (114).
 ///
 /// IN HAND, a raw transaction: the heavier of the stream's element (3 bytes a
 /// byte, 192 an input, 96 an output) and the walk's own view of it, which is
@@ -95,6 +97,7 @@ pub(crate) const DOOR_CHARGES: StreamCharges = StreamCharges {
     kept_input: 96,
     kept_output: 24,
     kept_proven: 114,
+    kept_pre_genesis_proven: 114,
     tx_byte: 4,
     tx_input: 360,
     tx_output: 168,
@@ -287,14 +290,18 @@ fn pushes(script: &[u8]) -> Option<(usize, usize)> {
 /// coin from before Genesis judge exactly as the post-Genesis rules `Spend`
 /// runs (bsv-rs 0.8.10, GHSA-h4m7-c6p8-725m: those rules add refusals of
 /// sizes, counts and opcodes). True only where no added refusal can apply:
-/// each script at most 10,000 bytes, every push at most 520 bytes, fewer than
-/// 990 pushes in all (the 1,000 stack elements), and a lock that is push-only,
-/// pay-to-public-key-hash, pay-to-public-key or bare multisig: none executes an
-/// opcode those rules disable or bound (the multisig's keys are at most 16).
+/// each script at most 10,000 bytes, every push at most 520 bytes, a lock that
+/// is push-only, pay-to-public-key-hash, pay-to-public-key or bare multisig
+/// (none executes an opcode those rules disable or bound; the multisig's keys
+/// are at most 16), and the stack's peak at most 1,000 elements: the unlock's
+/// pushes plus the lock's own growth (a push-only lock its pushes, P2PKH 2,
+/// P2PK 1, an `n`-key multisig `n + 2`: `OP_m`, the keys and `OP_n` are on
+/// the stack together before `OP_CHECKMULTISIG`). Held against bsv-rs's own
+/// verifier under the coin's era by `p0811_c_c` (`tests/p0811_bsv_rs_0811.rs`).
 pub(crate) fn era_neutral(unlock: &[u8], lock: &[u8]) -> bool {
     const MAX_SCRIPT: usize = 10_000;
     const MAX_PUSH: usize = 520;
-    const MAX_PUSHES: usize = 990;
+    const MAX_STACK: usize = 1_000;
     if unlock.len() > MAX_SCRIPT || lock.len() > MAX_SCRIPT {
         return false;
     }
@@ -325,26 +332,29 @@ pub(crate) fn era_neutral(unlock: &[u8], lock: &[u8]) -> bool {
             at = at.checked_add(1 + width).filter(|end| *end <= keys.len())?;
             found += 1;
         }
-        (m <= n && found == n).then_some(())
+        (m <= n && found == n).then_some(usize::from(n) + 2)
     };
-    let lock_pushes = if p2pkh || p2pk || multisig().is_some() {
-        Some(0)
+    let lock_peak = if p2pkh {
+        Some(2)
+    } else if p2pk {
+        Some(1)
+    } else if let Some(peak) = multisig() {
+        Some(peak)
     } else {
         pushes(lock)
             .filter(|(_, largest)| *largest <= MAX_PUSH)
             .map(|(n, _)| n)
     };
-    lock_pushes.is_some_and(|lock_pushes| unlock_pushes + lock_pushes < MAX_PUSHES)
+    lock_peak.is_some_and(|lock_peak| unlock_pushes + lock_peak <= MAX_STACK)
 }
 
 /// The door's screen of an input by its coin's era (bsv-rs 0.8.10, its
 /// migration steps 7 and 8 for a direct caller of `Spend`): `Some(why)` when
 /// the walk declines the input, the network judging. A lock of the
-/// pay-to-script-hash shape is declined always ([`is_p2sh_shape`]); a coin a
-/// BEEF holding a BUMP below the Genesis height proves (`pre_genesis`: the
-/// door does not keep which BUMP proves which txid, so every proven source of
-/// such a BEEF is taken as one) is declined unless its spend is
-/// [`era_neutral`]. A coin whose creating transaction is unproven carries no
+/// pay-to-script-hash shape is declined always ([`is_p2sh_shape`]); a coin
+/// proven by a BUMP below the Genesis height (`pre_genesis`: the first BUMP of
+/// the BEEF that carries its txid at level 0, the one bsv-rs's link attaches)
+/// is declined unless its spend is [`era_neutral`]. A coin whose creating transaction is unproven carries no
 /// era: it is judged by the post-Genesis rules, as bsv-rs's own doors judge it
 /// until its 0.9.0 cut.
 pub(crate) fn era_decline(
@@ -391,8 +401,10 @@ struct Place {
 struct DoorIndex {
     txs: HashMap<Hash32, Place>,
     proven: HashSet<Hash32>,
-    /// Whether a BUMP of the BEEF is below the Genesis height ([`era_decline`]).
-    pre_genesis: bool,
+    /// The txids whose first BUMP in the BEEF is below the Genesis height
+    /// ([`era_decline`]); charged by the sizing read as
+    /// `kept_pre_genesis_proven`.
+    pre_genesis: HashSet<Hash32>,
 }
 
 impl DoorIndex {
@@ -405,8 +417,12 @@ impl DoorIndex {
         {
             match element {
                 Element::Bump(bump) => {
-                    index.pre_genesis |= bump.block_height < GENESIS_HEIGHT;
-                    index.proven.extend(bump.proven().copied());
+                    let old = bump.block_height < GENESIS_HEIGHT;
+                    for txid in bump.proven() {
+                        if index.proven.insert(*txid) && old {
+                            index.pre_genesis.insert(*txid);
+                        }
+                    }
                 }
                 Element::Tx {
                     offset, txid, body, ..
@@ -800,7 +816,7 @@ pub(crate) fn walk_trusting(
                 unlocking_bytes,
                 locking_bytes,
                 index.proven.contains(&input.prev),
-                index.pre_genesis,
+                index.pre_genesis.contains(&input.prev),
             ) {
                 return Err(EngineError::ScriptWalkOverBudget {
                     at_txid: txid.clone(),
@@ -1425,6 +1441,7 @@ mod tests {
         assert_eq!(table(size_of::<(Hash32, Box<[usize]>)>()), 168);
         assert_eq!(DOOR_CHARGES.kept_tx, 168 + 114 + 168);
         assert_eq!(DOOR_CHARGES.kept_proven, 114);
+        assert_eq!(DOOR_CHARGES.kept_pre_genesis_proven, 114);
         assert_eq!(DOOR_CHARGES.kept_input, grown(size_of::<Hash32>()));
         assert_eq!(DOOR_CHARGES.kept_output, grown(size_of::<usize>()));
         assert_eq!(
