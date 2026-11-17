@@ -38,10 +38,12 @@ fn build_object_shape() {
     // 0.7.1, core unchanged at 0.4.0.
     // Amended for the move to the 0.8 stable line (2026-11-13): bsv-rs 0.8.9,
     // the adapter 0.7.2 and core 0.4.1, their releases on bsv-rs 0.8.
+    // Amended for PORT-0811 (2026-11-16): bsv-rs 0.8.11; the adapter and core
+    // have no later stable release, unchanged.
     assert_eq!(
         b["crates"],
         serde_json::json!({
-            "bsv-rs": "0.8.9",
+            "bsv-rs": "0.8.11",
             "bsv-middleware-cloudflare": "0.7.2",
             "bsv-middleware-core": "0.4.1",
         })
