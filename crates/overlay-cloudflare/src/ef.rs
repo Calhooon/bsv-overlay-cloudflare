@@ -781,10 +781,9 @@ mod tests {
     /// Each converted leg's txid and EF bytes.
     type Legs = Vec<(String, Vec<u8>)>;
 
-    /// The conversion as it stood before PORT-0811's fold, kept only as the
-    /// byte reference: every input given a linked clone of its whole source,
-    /// then the SDK's own `Transaction::to_ef`. (The shipped path writes the
-    /// same bytes from the one spent output, in place.)
+    /// The byte reference: each input given its source transaction, then the
+    /// SDK's own `Transaction::to_ef`. The shipped path writes the same bytes
+    /// from the one spent output, in place; this one is test-only.
     fn sdk_reference_batch(beef_bytes: &[u8]) -> Result<(Legs, String), EfError> {
         let mut beef = beef_limits::parse_beef(beef_bytes, &beef_limits::EF_BEEF_LIMITS)
             .map_err(|e| EfError::Parse(e.to_string()))?;
