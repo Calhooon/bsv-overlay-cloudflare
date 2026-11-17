@@ -463,7 +463,7 @@ pub const CHUNKS_CREATE: &str = "CREATE TABLE IF NOT EXISTS ef_deferred_chunks (
 pub const JOBS_ADD_LEGS_FROM: &str =
     "ALTER TABLE ef_deferred_jobs ADD COLUMN legs_from INTEGER NOT NULL DEFAULT 0";
 
-const JOB_READ_SQL: &str = "SELECT reference, subject_txid, topics, submit_mode, has_off_chain, beef_len, bytes, \
+pub(crate) const JOB_READ_SQL: &str = "SELECT reference, subject_txid, topics, submit_mode, has_off_chain, beef_len, bytes, \
      at_rest, chunks, subject_ef_bytes, batch_ef_bytes, state, attempts, status, answer, created_at, updated_at, \
      legs_from FROM ef_deferred_jobs WHERE reference = ?1";
 
@@ -518,7 +518,7 @@ const JOB_DELETE_SQL: &str = "DELETE FROM ef_deferred_jobs WHERE reference = ?1 
 const CHUNK_INSERT_SQL: &str =
     "INSERT OR REPLACE INTO ef_deferred_chunks (reference, idx, bytes) VALUES (?1, ?2, ?3)";
 
-const CHUNK_READ_SQL: &str =
+pub(crate) const CHUNK_READ_SQL: &str =
     "SELECT hex(bytes) AS hex FROM ef_deferred_chunks WHERE reference = ?1 AND idx = ?2";
 
 const CHUNKS_DELETE_SQL: &str = "DELETE FROM ef_deferred_chunks WHERE reference = ?1";
@@ -943,7 +943,6 @@ pub async fn poll(env: &Env, path: &str) -> worker::Result<Response> {
 // ── the consumer's side ──────────────────────────────────────────────────────
 
 async fn load(env: &Env, db: &D1Database, job: &Job) -> Result<Vec<u8>, String> {
-    let total = job.bytes as usize;
     let bytes = if job.at_rest == "r2" {
         let bucket = env
             .bucket(BEEF_BLOBS_BINDING)
@@ -965,18 +964,38 @@ async fn load(env: &Env, db: &D1Database, job: &Job) -> Result<Vec<u8>, String> 
         struct Chunk {
             hex: String,
         }
-        let mut out = Vec::with_capacity(total);
+        let mut hexes = Vec::with_capacity(job.chunks as usize);
         for idx in 0..job.chunks as i64 {
             let chunk = Query::new(CHUNK_READ_SQL)
                 .bind(job.reference.as_str())
                 .bind(idx)
                 .fetch_optional::<Chunk>(db)
-                .await?
-                .ok_or_else(|| format!("chunk {idx} is gone"))?;
-            out.extend_from_slice(&hex::decode(&chunk.hex).map_err(|e| e.to_string())?);
+                .await?;
+            let gone = chunk.is_none();
+            hexes.push(chunk.map(|c| c.hex));
+            if gone {
+                break;
+            }
         }
-        out
+        stream_of_chunks(job, hexes)?
     };
+    checked_at_rest(job, bytes)
+}
+
+/// PURE. A D1-held job's stream from its chunks' `hex(bytes)` read back in
+/// order by [`CHUNK_READ_SQL`] (`None`: that chunk is gone).
+pub(crate) fn stream_of_chunks(job: &Job, hexes: Vec<Option<String>>) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(job.bytes as usize);
+    for (idx, hex_chunk) in hexes.into_iter().enumerate() {
+        let hex_chunk = hex_chunk.ok_or_else(|| format!("chunk {idx} is gone"))?;
+        out.extend_from_slice(&hex::decode(&hex_chunk).map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+/// PURE. The bytes at rest are the job's length, else the job cannot run.
+pub(crate) fn checked_at_rest(job: &Job, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    let total = job.bytes as usize;
     if bytes.len() != total {
         return Err(format!(
             "{} bytes at rest, the job names {total}",
@@ -984,6 +1003,37 @@ async fn load(env: &Env, db: &D1Database, job: &Job) -> Result<Vec<u8>, String> 
         ));
     }
     Ok(bytes)
+}
+
+/// The submission a job's stream holds: its topics, its BEEF and its
+/// off-chain values.
+pub(crate) struct JobSubmission {
+    /// The topics the submission named.
+    pub topics: Vec<String>,
+    /// The BEEF.
+    pub beef: Vec<u8>,
+    /// The off-chain values, when the job carries them.
+    pub off_chain: Option<Vec<u8>>,
+}
+
+/// PURE. The job's stream cut at its BEEF's length, then checked against the
+/// job's reference (the sha256 of the topics, the BEEF and the off-chain
+/// values framed by length, [`job_reference`]): `Err` when the bytes at rest
+/// are not the job's.
+pub(crate) fn job_submission(job: &Job, stream: Vec<u8>) -> Result<JobSubmission, String> {
+    let topics: Vec<String> = serde_json::from_str(&job.topics).unwrap_or_default();
+    let split = (job.beef_len as usize).min(stream.len());
+    let off_chain = (job.has_off_chain != 0.0).then(|| stream[split..].to_vec());
+    let mut beef = stream;
+    beef.truncate(split);
+    if job_reference(&job.topics, &beef, off_chain.as_deref()) != job.reference {
+        return Err("the bytes at rest are not the job's".to_string());
+    }
+    Ok(JobSubmission {
+        topics,
+        beef,
+        off_chain,
+    })
 }
 
 async fn release(env: &Env, db: &D1Database, reference: &str, at_rest: &str) {
@@ -1120,12 +1170,12 @@ pub async fn run_job(
             return;
         }
     };
-    let topics: Vec<String> = serde_json::from_str(&job.topics).unwrap_or_default();
-    let split = (job.beef_len as usize).min(stream.len());
-    let off_chain = (job.has_off_chain != 0.0).then(|| stream[split..].to_vec());
-    let mut beef = stream;
-    beef.truncate(split);
-    if job_reference(&job.topics, &beef, off_chain.as_deref()) != reference {
+    let Ok(JobSubmission {
+        topics,
+        beef,
+        off_chain,
+    }) = job_submission(&job, stream)
+    else {
         worker::console_log!("NL-6c: job {reference} FAILED: the bytes at rest are not the job's");
         settle_job(
             &db,
@@ -1137,7 +1187,7 @@ pub async fn run_job(
         .await;
         release(env, &db, reference, &job.at_rest).await;
         return;
-    }
+    };
     let parts = crate::routes::SubmitParts {
         topics,
         beef,
