@@ -283,12 +283,199 @@ fn target_of(parsed: &mut Beef, txid: Option<&str>) -> bsv_rs::Result<String> {
         .ok_or_else(|| bsv_rs::Error::TransactionError("No transactions in BEEF".into()))
 }
 
+/// The engine's link bound IN HEAP: the most heap one link of a BEEF's input
+/// ANCESTRY may hold (16 MiB, native): every copy the link makes of a source
+/// (its full link and its memo stub), every repeated stub (one per input past
+/// the first that spends a source), and every BUMP those copies carry. Not
+/// counted: the subject's own clone and its own BUMP, and the link's index of
+/// the BEEF's level-0 leaves, one copy of what the body holds (as
+/// [`subject_from_beef`] makes), linear in the body as the door's own parse
+/// is. Every linking read of this
+/// repository ([`transaction_from_beef`], [`linked`]) checks
+/// [`link_heap_estimate`] against it before bsv-rs links anything, and passes
+/// [`engine_link_limits`] as the belt. A link past it is
+/// `Err(bsv_rs::Error::BeefResourceLimit)` ([`is_link_bound`]), which each
+/// door classifies by its own rule.
+///
+/// Where it sits in the isolate's arithmetic (CLAUDE.md, "The default's
+/// arithmetic"): on an ungated submit the link is held while the engine's walk
+/// runs, so 24 MB of request copies, the walk's 48 MiB and this 16 MiB are 88
+/// MB of the 128 MB isolate beside the linear copies; on the gated arm the
+/// door's walk has returned before the engine's submit links. wasm32 holds
+/// less than native for each charge (its pointers and `usize` are 4 bytes; an
+/// output is 80 bytes there against 136 natively), so the native figure bounds
+/// it there too.
+pub const LINK_HEAP_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The heap a linked transaction holds per byte of its wire form, at most, on
+/// the shapes measured (native, release, `tests/p0811_link_heap.rs`): empty
+/// locks 16.2, one-byte locks 14.8, P2PKH 5.8, an input-heavy parent 7.1,
+/// large locks 2.3. bsv-rs's own meter charges each repeated stub its wire
+/// bytes, so [`LINK_WIRE_MAX_BYTES`] is the heap bound divided by this.
+pub const LINK_HEAP_PER_WIRE_BYTE: u64 = 17;
+
+/// The wire figure handed to bsv-rs's meter ([`engine_link_limits`]):
+/// `LINK_HEAP_MAX_BYTES / LINK_HEAP_PER_WIRE_BYTE`, 986,895 bytes of repeated
+/// stubs: the belt; [`link_heap_estimate`] is the bound.
+pub const LINK_WIRE_MAX_BYTES: u64 = LINK_HEAP_MAX_BYTES / LINK_HEAP_PER_WIRE_BYTE;
+
+/// The estimate's charges, native upper bounds, each pinned above the measured
+/// heap by `tests/p0811_link_heap.rs`: a transaction's struct and its tables,
+/// an input, an output, a byte of the transaction's wire form (its scripts'
+/// raw bytes and their copies), a leaf of an attached BUMP, and a level-0 leaf
+/// of the link's index of the BEEF's BUMPs.
+pub const LINK_CHARGE_TX: u64 = 512;
+/// An input's charge ([`LINK_CHARGE_TX`]).
+pub const LINK_CHARGE_INPUT: u64 = 320;
+/// An output's charge ([`LINK_CHARGE_TX`]).
+pub const LINK_CHARGE_OUTPUT: u64 = 176;
+/// A wire byte's charge ([`LINK_CHARGE_TX`]).
+pub const LINK_CHARGE_WIRE_BYTE: u64 = 4;
+/// A BUMP leaf's charge ([`LINK_CHARGE_TX`]).
+pub const LINK_CHARGE_BUMP_LEAF: u64 = 128;
+/// A level-0 leaf's charge in the link's BUMP index ([`LINK_CHARGE_TX`]).
+pub const LINK_CHARGE_INDEX_LEAF: u64 = 64;
+
+/// The link limits handed to bsv-rs at every linking read: its wire meter at
+/// [`LINK_WIRE_MAX_BYTES`].
+#[must_use]
+pub fn engine_link_limits() -> BeefLinkLimits {
+    BeefLinkLimits::default().with_max_link_bytes(Some(LINK_WIRE_MAX_BYTES))
+}
+
+/// An upper bound on the heap bsv-rs's link of a transaction holds, in two
+/// parts ([`link_heap_estimate`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinkHeap {
+    /// One copy of what the body holds: the subject's clone and its own BUMP,
+    /// and the link's index of the BEEF's level-0 leaves.
+    pub linear: u64,
+    /// The ancestry: every copy of a source and of its BUMP, every repeated
+    /// stub. [`LINK_HEAP_MAX_BYTES`] bounds this part.
+    pub beyond: u64,
+}
+
+impl LinkHeap {
+    /// Both parts: the estimate of the whole link.
+    #[must_use]
+    pub fn total(self) -> u64 {
+        self.linear.saturating_add(self.beyond)
+    }
+}
+
+/// An upper bound on the heap bsv-rs's link of `txid` out of `beef` holds,
+/// computed before anything is linked (its walk is bsv-rs's own,
+/// `Beef::add_input_proof`: a transaction a BUMP proves is not descended, a
+/// source the BEEF does not carry is not linked). Each copy of a transaction
+/// is charged its inputs, outputs and wire bytes, each copy of a BUMP its
+/// leaves. The count stops once `beyond` is past `stop_at`. Each source's wire
+/// form is read once (one transient copy of one transaction); no script is
+/// parsed.
+#[must_use]
+pub fn link_heap_estimate(beef: &Beef, txid: &str, stop_at: u64) -> LinkHeap {
+    use std::collections::{HashMap, HashSet};
+    let mut bump_of: HashMap<&str, &MerklePath> = HashMap::new();
+    let mut index_leaves: u64 = 0;
+    for bump in &beef.bumps {
+        for leaf in bump.path.first().into_iter().flatten() {
+            if let Some(hash) = leaf.hash.as_deref() {
+                index_leaves += 1;
+                bump_of.entry(hash).or_insert(bump);
+            }
+        }
+    }
+    let tx_weight = |tx: &Transaction| -> u64 {
+        LINK_CHARGE_TX
+            .saturating_add(LINK_CHARGE_INPUT.saturating_mul(tx.inputs.len() as u64))
+            .saturating_add(LINK_CHARGE_OUTPUT.saturating_mul(tx.outputs.len() as u64))
+            .saturating_add(LINK_CHARGE_WIRE_BYTE.saturating_mul(tx.to_binary().len() as u64))
+    };
+    let bump_weight = |bump: &MerklePath| -> u64 {
+        LINK_CHARGE_BUMP_LEAF
+            .saturating_mul(bump.path.iter().map(|l| l.len() as u64).sum::<u64>())
+    };
+    let mut heap = LinkHeap {
+        linear: LINK_CHARGE_INDEX_LEAF.saturating_mul(index_leaves),
+        beyond: 0,
+    };
+    let copy_bump = |heap: &mut LinkHeap, bump: Option<&MerklePath>| {
+        heap.beyond = heap.beyond.saturating_add(bump.map_or(0, bump_weight));
+    };
+    let Some(subject) = beef.find_txid(txid).and_then(|e| e.tx()) else {
+        return heap;
+    };
+    let subject_bump = subject
+        .merkle_path
+        .as_ref()
+        .or_else(|| bump_of.get(txid).copied());
+    heap.linear = heap
+        .linear
+        .saturating_add(tx_weight(subject))
+        .saturating_add(subject_bump.map_or(0, bump_weight));
+    if subject_bump.is_some() {
+        return heap;
+    }
+    let mut stubs: HashMap<&str, (u64, Option<&MerklePath>)> = HashMap::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut stack: Vec<&Transaction> = vec![subject];
+    while let Some(tx) = stack.pop() {
+        for input in &tx.inputs {
+            if heap.beyond > stop_at {
+                return heap;
+            }
+            let Some(src) = input.source_txid.as_deref() else {
+                continue;
+            };
+            if let Some((weight, bump)) = stubs.get(src).copied() {
+                heap.beyond = heap.beyond.saturating_add(weight);
+                copy_bump(&mut heap, bump);
+                continue;
+            }
+            if !seen.insert(src) {
+                continue;
+            }
+            let Some(source) = beef.find_txid(src).and_then(|e| e.tx()) else {
+                continue;
+            };
+            let bump = source
+                .merkle_path
+                .as_ref()
+                .or_else(|| bump_of.get(src).copied());
+            let weight = tx_weight(source);
+            stubs.insert(src, (weight, bump));
+            heap.beyond = heap.beyond.saturating_add(weight.saturating_mul(2));
+            copy_bump(&mut heap, bump);
+            copy_bump(&mut heap, bump);
+            if bump.is_none() {
+                stack.push(source);
+            }
+        }
+    }
+    heap
+}
+
+/// THE one linking read of this repository: [`link_heap_estimate`]'s
+/// `beyond` against [`LINK_HEAP_MAX_BYTES`], then bsv-rs's link under
+/// [`engine_link_limits`]. `Ok(None)` when the BEEF does not carry `txid`'s
+/// body; `Err` with `BeefResourceLimit` ([`is_link_bound`]) when either bound
+/// declines.
+fn link_bounded(beef: &Beef, txid: &str) -> bsv_rs::Result<Option<Transaction>> {
+    let heap = link_heap_estimate(beef, txid, LINK_HEAP_MAX_BYTES);
+    if heap.beyond > LINK_HEAP_MAX_BYTES {
+        return Err(bsv_rs::Error::BeefResourceLimit(format!(
+            "linking {txid}'s ancestry would hold more than {LINK_HEAP_MAX_BYTES} bytes of heap \
+             (estimated past {}); the engine's link bound",
+            heap.beyond
+        )));
+    }
+    beef.find_atomic_transaction_limited(txid, &engine_link_limits())
+}
+
 /// Link from the door's parse: the explicit txid, then the atomic txid, then
 /// the subject rule (`target_of`).
 ///
-/// The link runs under bsv-rs 0.8.11's default link bound
-/// ([`BeefLinkLimits::default`], 16 MiB of re-materialized shared-parent
-/// stubs, GHSA-gvmh-f5gf-5vjj). A bound's trip is
+/// The link runs under the engine's link bound ([`LINK_HEAP_MAX_BYTES`] of
+/// heap, [`link_bounded`]). A bound's trip is
 /// `Err(bsv_rs::Error::BeefResourceLimit)` ([`is_link_bound`]), never an
 /// invalid BEEF and never an absent txid: each caller classifies it by the
 /// rule of its own door. A caller that reads the subject's own fields alone
@@ -298,24 +485,11 @@ pub fn transaction_from_beef(
     txid: Option<&str>,
     door: &BeefLimits,
 ) -> bsv_rs::Result<Transaction> {
-    transaction_from_beef_with(bytes, txid, door, &BeefLinkLimits::default())
-}
-
-/// [`transaction_from_beef`] under explicit link limits. `BeefLinkLimits::unbounded`
-/// is for bytes this service built itself; no production caller passes it today.
-pub fn transaction_from_beef_with(
-    bytes: &[u8],
-    txid: Option<&str>,
-    door: &BeefLimits,
-    limits: &BeefLinkLimits,
-) -> bsv_rs::Result<Transaction> {
     let mut parsed = parse_beef(bytes, door)?;
     let target = target_of(&mut parsed, txid)?;
-    parsed
-        .find_atomic_transaction_limited(&target, limits)?
-        .ok_or_else(|| {
-            bsv_rs::Error::TransactionError(format!("Transaction {target} not found in BEEF"))
-        })
+    link_bounded(&parsed, &target)?.ok_or_else(|| {
+        bsv_rs::Error::TransactionError(format!("Transaction {target} not found in BEEF"))
+    })
 }
 
 /// The SUBJECT alone, its input ancestry NOT linked (bsv-rs 0.8.11's
@@ -344,12 +518,13 @@ pub fn subject_from_beef(
     Ok(tx)
 }
 
-/// `txid` linked out of a parsed BEEF under the default link bound:
-/// `Ok(None)` when the BEEF does not carry its body, `Err` when the link
-/// bound trips ([`is_link_bound`]). `Beef::find_atomic_transaction` answers
-/// `None` for both, so no reader of this crate calls it.
+/// `txid` linked out of a parsed BEEF under the engine's link bound
+/// ([`link_bounded`]): `Ok(None)` when the BEEF does not carry its body,
+/// `Err` when the bound declines ([`is_link_bound`]).
+/// `Beef::find_atomic_transaction` answers `None` for both, so no reader of
+/// this crate calls it.
 pub fn linked(beef: &Beef, txid: &str) -> bsv_rs::Result<Option<Transaction>> {
-    beef.find_atomic_transaction_limited(txid, &BeefLinkLimits::default())
+    link_bounded(beef, txid)
 }
 
 /// Whether `e` is the link bound's trip (bsv-rs 0.8.11, GHSA-gvmh-f5gf-5vjj): a

@@ -25,12 +25,17 @@ pub trait TopicManager {
     ///
     /// # Arguments
     /// - `tx` — The submitted transaction, parsed ONCE by the engine from
-    ///   the BEEF (`Transaction::from_beef(beef, None)`) and shared across
-    ///   every topic manager on the submit. Before bsv-low #289 each manager
-    ///   re-parsed the same bytes independently (T+1 parses per `/submit`).
-    ///   Admission stays byte-format-only: managers still validate the
-    ///   OUTPUT SCRIPTS themselves; only the redundant container parse
-    ///   moved.
+    ///   the BEEF (its subject, by `subject::subject_txid_of`) and shared
+    ///   across every topic manager on the submit. Before bsv-low #289 each
+    ///   manager re-parsed the same bytes independently (T+1 parses per
+    ///   `/submit`). Admission stays byte-format-only: managers still
+    ///   validate the OUTPUT SCRIPTS themselves; only the redundant container
+    ///   parse moved. Its inputs' `source_transaction` are linked from the
+    ///   BEEF under the engine's link bound
+    ///   (`beef_limits::LINK_HEAP_MAX_BYTES`); on a submit whose link the
+    ///   bound declined and that goes on (`historical-tx-no-spv`, or
+    ///   `WalkBreachPolicy::NetworkAccepted`) they are `None`: a manager that
+    ///   reads a source must answer for that case.
     /// - `previous_coins` — BEEF data for previously-admitted outputs that this
     ///   transaction spends (inputs from the same topic). May be empty if no
     ///   inputs come from this topic.
