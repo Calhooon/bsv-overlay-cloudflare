@@ -37,6 +37,26 @@
 //!   (`ADD COLUMN` re-runs tolerated by the Worker's own
 //!   `d1::migration_error_is_benign`), as the Worker's first request would.
 //!
+//! - PORT-0811 (bsv-rs 0.8.11): every stored BEEF is also linked as the
+//!   engine links it, under bsv-rs's default link bound
+//!   (`beef_limits::transaction_from_beef`, GHSA-gvmh-f5gf-5vjj): a trip is
+//!   `REFUSED .. kind=link_bound` (the stored rows by their txid, a parked
+//!   letter by the engine's subject rule, `subject::subject_txid_of`). A
+//!   stored row whose UNNAMED read (`from_beef(_, None)`, the read a 0.7.2
+//!   build's GASP node made) answers another transaction than its txid
+//!   (GHSA-gg5p-wgff-v3hr: the body ends with an ancestor) is a `DIFFERS`
+//!   line: it reads the same now that every reader names the txid, and is
+//!   counted apart, never a refusal.
+//! - PORT-0811: the D1 columns holding a raw transaction a Worker parses back
+//!   (`hopsweep_records.sweepRawHex`, the owed judge's filed sweep and its
+//!   `sweep_output_sats`; `potrefund_records.refundRawHex`, the records
+//!   door's chain no-op and the owed judge's refunds), each through
+//!   `Transaction::from_binary` and `sighash::parse_transaction`, the readers
+//!   bsv-rs 0.8.5 and 0.8.11 made refuse a byte after the transaction
+//!   (GHSA-j8hr-pjhm-6h27, GHSA-67vc-6c8g-7x48): such a row is
+//!   `REFUSED .. kind=raw_tx` (or `kind=sighash_parse`); a sweep whose bytes
+//!   name another txid than its `sweepTxid` is a `DIFFERS` line.
+//!
 //! Each BEEF goes through the door (`beef_limits::read_beef`: a refusal
 //! names its offset and kind), the sizing read (`stream_sizing::estimate`
 //! under the census's charges, flagged past the census's memory budget, a
@@ -90,6 +110,12 @@ pub(crate) struct Summary {
     pub largest_estimate: (u64, String),
     pub deferred_records: u64,
     pub deferred_nodes: u64,
+    /// PORT-0811: the rows read the same by every named reader but otherwise
+    /// than a 0.7.2 build read them (`DIFFERS` lines). Counted apart: not a
+    /// refusal, never the run's failure.
+    pub differs: u64,
+    /// PORT-0811: the raw-transaction columns read.
+    pub raw_txs: u64,
     pub census: std::collections::BTreeMap<&'static str, u64>,
     /// Every line printed, in order.
     pub lines: Vec<String>,
@@ -109,18 +135,82 @@ impl Summary {
         ));
     }
 
+    fn differs(&mut self, table: &str, key: &str, kind: &str, detail: &str) {
+        self.differs += 1;
+        self.line(format!(
+            "DIFFERS table={table} key={key} kind={kind} detail={detail}"
+        ));
+    }
+
+    /// PORT-0811: the link as the engine makes it (bsv-rs 0.8.11's default
+    /// bound); `false` when it trips (`REFUSED .. kind=link_bound`) or fails.
+    fn read_linked(&mut self, table: &str, key: &str, bytes: &[u8], txid: Option<&str>) -> bool {
+        match beef_limits::transaction_from_beef(bytes, txid, &beef_limits::STORED_BEEF_LIMITS) {
+            Ok(_) => true,
+            Err(e) if beef_limits::is_link_bound(&e) => {
+                self.refused(table, key, None, "link_bound", &e.to_string());
+                false
+            }
+            Err(e) => {
+                self.refused(table, key, None, "transaction_from_beef", &e.to_string());
+                false
+            }
+        }
+    }
+
+    /// PORT-0811: a raw transaction a Worker parses back, by the two readers
+    /// that refuse a byte after it (bsv-rs 0.8.5 and 0.8.11). `Some(txid)` when
+    /// both read it; `named` is the txid the row stores beside it.
+    fn read_raw_tx(
+        &mut self,
+        table: &str,
+        key: &str,
+        hex_column: Option<String>,
+        named: Option<&str>,
+    ) {
+        self.raw_txs += 1;
+        let Some(raw) = hex_column.as_deref().and_then(|h| hex::decode(h).ok()) else {
+            self.refused(table, key, None, "hex", "the column is no hex");
+            return;
+        };
+        self.bytes += raw.len() as u64;
+        let tx = match bsv_rs::transaction::Transaction::from_binary(&raw) {
+            Ok(tx) => tx,
+            Err(e) => {
+                self.refused(table, key, None, "raw_tx", &e.to_string());
+                return;
+            }
+        };
+        if let Err(e) = bsv_rs::primitives::bsv::sighash::parse_transaction(&raw) {
+            self.refused(table, key, None, "sighash_parse", &e.to_string());
+            return;
+        }
+        if let Some(named) = named {
+            if !tx.id().eq_ignore_ascii_case(named) {
+                self.differs(
+                    table,
+                    key,
+                    "raw_tx_txid",
+                    &format!("the bytes are {}, the row names {named}", tx.id()),
+                );
+            }
+        }
+    }
+
     fn summary_line(&self) -> String {
         let mut census = String::new();
         for (verdict, n) in &self.census {
             let _ = write!(census, " {verdict}:{n}");
         }
         format!(
-            "SUMMARY rows={} beefs={} bytes={} refusals={} unread={} over_memory={} largest_body={} ({}) largest_estimate={} ({}) deferred_records={} deferred_nodes={} census=[{}]",
+            "SUMMARY rows={} beefs={} raw_txs={} bytes={} refusals={} unread={} differs={} over_memory={} largest_body={} ({}) largest_estimate={} ({}) deferred_records={} deferred_nodes={} census=[{}]",
             self.rows,
             self.beefs,
+            self.raw_txs,
             self.bytes,
             self.refusals,
             self.unread,
+            self.differs,
             self.over_memory,
             self.largest_body.0,
             self.largest_body.1,
@@ -194,13 +284,21 @@ impl Summary {
                 return false;
             }
             let _ = crate::d1_storage::D1Storage::beef_has_proof(txid, bytes);
-            if let Err(e) = beef_limits::transaction_from_beef(
-                bytes,
-                Some(txid),
-                &beef_limits::STORED_BEEF_LIMITS,
-            ) {
-                self.refused(table, key, None, "transaction_from_beef", &e.to_string());
+            if !self.read_linked(table, key, bytes, Some(txid)) {
                 return false;
+            }
+            // The read a 0.7.2 build's GASP node made of this row: no txid.
+            if let Ok(unnamed) =
+                beef_limits::subject_from_beef(bytes, None, &beef_limits::STORED_BEEF_LIMITS)
+            {
+                if !unnamed.id().eq_ignore_ascii_case(txid) {
+                    self.differs(
+                        table,
+                        key,
+                        "unnamed_subject",
+                        &format!("a read naming no txid answers {}", unnamed.id()),
+                    );
+                }
             }
         }
         true
@@ -542,7 +640,45 @@ pub(crate) fn read_export(inputs: &[PathBuf], r2_dir: Option<&Path>) -> Result<S
         if s.read_beef(table, &key, &bytes, None) {
             let verdict = submit_census::census_verdict(&bytes).as_str();
             *s.census.entry(verdict).or_default() += 1;
+            // The replay's link, by the engine's subject rule (PORT-0811).
+            let subject = beef_limits::parse_beef(&bytes, &beef_limits::ENGINE_BEEF_LIMITS)
+                .ok()
+                .and_then(|mut b| overlay_engine::subject::subject_txid_of(&mut b));
+            s.read_linked(table, &key, &bytes, subject.as_deref());
         }
+    }
+
+    // PORT-0811: the raw transactions a Worker parses back from D1.
+    for row in rows(
+        &db,
+        "SELECT txid, outputIndex, sweepTxid, sweepRawHex FROM hopsweep_records",
+        &[],
+    )
+    .unwrap_or_default()
+    {
+        s.rows += 1;
+        let key = format!(
+            "{}:{}",
+            text(&row[0]).unwrap_or_default(),
+            text(&row[1]).unwrap_or_default()
+        );
+        let named = text(&row[2]);
+        s.read_raw_tx("hopsweep_records", &key, text(&row[3]), named.as_deref());
+    }
+    for row in rows(
+        &db,
+        "SELECT txid, outputIndex, refundRawHex FROM potrefund_records WHERE refundRawHex IS NOT NULL",
+        &[],
+    )
+    .unwrap_or_default()
+    {
+        s.rows += 1;
+        let key = format!(
+            "{}:{}",
+            text(&row[0]).unwrap_or_default(),
+            text(&row[1]).unwrap_or_default()
+        );
+        s.read_raw_tx("potrefund_records", &key, text(&row[2]), None);
     }
 
     let table = "gasp_deferred_graphs";
@@ -1080,6 +1216,164 @@ mod self_test {
     /// as the Worker reads it (`hex(beef)`, `d1::beef_of_hex_column`): the
     /// hex of its ASCII bytes, which the door refuses. RED on `e2c561c`: the
     /// reader hex-decoded the TEXT and read it clean (`refusals` 0, not 1).
+    /// The link bound's shape (bsv-rs 0.8.11, GHSA-gvmh-f5gf-5vjj): a proven
+    /// parent of `n` `OP_1` outputs, every one spent by one child; 1,400 of
+    /// each re-materialize about 19.6 MB of repeats, past the 16 MiB default.
+    fn shared_parent_beef(n: u32) -> (Vec<u8>, String) {
+        use bsv_rs::script::{LockingScript, Script, UnlockingScript};
+        use bsv_rs::transaction::{
+            Beef, MerklePath, MerklePathLeaf, Transaction, TransactionInput, TransactionOutput,
+        };
+        let op_1 = || LockingScript::from_script(Script::from_binary(&[0x51]).unwrap());
+        let mut parent = Transaction::new();
+        parent.inputs.push(TransactionInput {
+            source_txid: Some("aa".repeat(32)),
+            source_output_index: 0,
+            unlocking_script: Some(UnlockingScript::from_script(Script::new())),
+            ..Default::default()
+        });
+        parent.outputs = (0..n).map(|_| TransactionOutput::new(1, op_1())).collect();
+        let parent_txid = parent.id();
+        let mut child = Transaction::new();
+        for vout in 0..n {
+            child.inputs.push(TransactionInput {
+                source_txid: Some(parent_txid.clone()),
+                source_output_index: vout,
+                unlocking_script: Some(UnlockingScript::from_script(Script::new())),
+                ..Default::default()
+            });
+        }
+        child.outputs.push(TransactionOutput::new(1, op_1()));
+        let mut beef = Beef::new();
+        let bump = beef.merge_bump(
+            MerklePath::new(
+                900_000,
+                vec![vec![MerklePathLeaf::new_txid(0, parent_txid)]],
+            )
+            .unwrap(),
+        );
+        beef.merge_raw_tx(parent.to_binary(), Some(bump));
+        beef.merge_raw_tx(child.to_binary(), None);
+        (beef.to_binary(), child.id())
+    }
+
+    /// PORT-0811, the reader's extension: one run names every stored row the
+    /// 0.8.11 readers refuse or read differently. A raw transaction column
+    /// holding a byte after the transaction (`hopsweep_records.sweepRawHex`,
+    /// `potrefund_records.refundRawHex`) is `REFUSED .. kind=raw_tx`; a stored
+    /// BEEF the engine's link refuses for its re-materialization is `REFUSED ..
+    /// kind=link_bound`; a stored body that ends with its proven ancestor (the
+    /// order a 0.7.2 build could write) is a `DIFFERS` line, never a refusal;
+    /// the honest rows read clean. On the base the reader read no raw-tx
+    /// column, linked without a bound and named neither class.
+    #[test]
+    fn p0811_r_the_reader_names_the_rows_0811_refuses_or_reads_otherwise() {
+        let honest_beef = fixture("tests/fixtures/ef/loop2_join_f9e85aab_represent.beef");
+        let parsed =
+            beef_limits::parse_beef(&honest_beef, &beef_limits::STORED_BEEF_LIMITS).unwrap();
+        let honest_tx = parsed.txs.iter().find_map(|e| e.tx().cloned()).unwrap();
+        let (honest_raw, honest_txid) = (honest_tx.to_binary(), honest_tx.id());
+        let mut trailing = honest_raw.clone();
+        trailing.push(0x00);
+        let (bound_beef, bound_txid) = shared_parent_beef(1_400);
+        // A stored body ending with its proven ancestor, written by hand
+        // (`Beef::to_binary` sorts a source first).
+        let parent_entry = parsed
+            .txs
+            .iter()
+            .find(|e| e.bump_index().is_some() && e.tx().is_some())
+            .expect("the fixture carries a proven parent");
+        let parent_tx = parent_entry.tx().unwrap().clone();
+        let parent_bump = parsed.bumps[parent_entry.bump_index().unwrap()].clone();
+        let spender = parsed
+            .txs
+            .iter()
+            .filter_map(|e| e.tx())
+            .find(|t| {
+                t.inputs
+                    .iter()
+                    .any(|i| i.source_txid.as_deref() == Some(parent_tx.id().as_str()))
+            })
+            .expect("the fixture spends its proven parent")
+            .clone();
+        let mut reversed = vec![0x01, 0x00, 0xbe, 0xef, 0x01];
+        reversed.extend(parent_bump.to_binary());
+        reversed.push(0x02);
+        reversed.extend(spender.to_binary());
+        reversed.push(0x00);
+        reversed.extend(parent_tx.to_binary());
+        reversed.extend([0x01, 0x00]);
+
+        let mut sql = schema_sql();
+        sql.push_str(
+            "CREATE TABLE hopsweep_records (identity TEXT, gameId TEXT, hopTxid TEXT, hopVout INTEGER, sweepTxid TEXT, sweepRawHex TEXT, txid TEXT, outputIndex INTEGER, createdAt INTEGER);\n\
+             CREATE TABLE potrefund_records (txid TEXT, outputIndex INTEGER, refundRawHex TEXT);\n",
+        );
+        let sweep = |key: &str, raw: &[u8]| {
+            format!(
+                "INSERT INTO hopsweep_records VALUES('i','g','h',0,{},{},{},0,1);\n",
+                sql_text(&honest_txid),
+                sql_text(&hex::encode(raw)),
+                sql_text(key)
+            )
+        };
+        sql.push_str(&sweep("sweep-honest", &honest_raw));
+        sql.push_str(&sweep("sweep-trailing", &trailing));
+        sql.push_str(&format!(
+            "INSERT INTO potrefund_records VALUES('refund-trailing',0,{});\n",
+            sql_text(&hex::encode(&trailing))
+        ));
+        sql.push_str(&format!(
+            "INSERT INTO pot_beefs VALUES({},{},1);\n",
+            sql_text(&bound_txid),
+            sql_blob(&bound_beef)
+        ));
+        sql.push_str(&format!(
+            "INSERT INTO \"transactions\" VALUES({},{},0);\n",
+            sql_text(&spender.id()),
+            sql_blob(&reversed)
+        ));
+        let s = read_sql("p0811-r", &sql, None);
+        let named = |prefix: &str| s.lines.iter().any(|l| l.starts_with(prefix));
+        assert!(
+            named("REFUSED table=hopsweep_records key=sweep-trailing:0 offset=- kind=raw_tx"),
+            "{:?}",
+            s.lines
+        );
+        assert!(
+            !named("REFUSED table=hopsweep_records key=sweep-honest"),
+            "{:?}",
+            s.lines
+        );
+        assert!(
+            named("REFUSED table=potrefund_records key=refund-trailing:0 offset=- kind=raw_tx"),
+            "{:?}",
+            s.lines
+        );
+        assert!(
+            named(&format!(
+                "REFUSED table=pot_beefs key={bound_txid} offset=- kind=link_bound"
+            )),
+            "{:?}",
+            s.lines
+        );
+        assert!(
+            named(&format!(
+                "DIFFERS table=transactions key={} kind=unnamed_subject",
+                spender.id()
+            )),
+            "{:?}",
+            s.lines
+        );
+        assert!(
+            !named(&format!("REFUSED table=transactions key={}", spender.id())),
+            "the reversed body is read by its txid: {:?}",
+            s.lines
+        );
+        assert_eq!(s.refusals, 3, "{:?}", s.lines);
+        assert!(s.verdict().is_err());
+    }
+
     #[test]
     fn e585_land_f6_l3_a_beef_stored_as_hex_text_is_refused_as_at_the_worker() {
         let honest = fixture("tests/fixtures/ef/loop2_join_f9e85aab_represent.beef");
