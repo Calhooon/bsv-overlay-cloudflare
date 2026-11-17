@@ -1804,6 +1804,10 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
     for name in crate::conflict_repair::COUNTERS {
         obj[name] = json!(0);
     }
+    // FANOUT-0811: what the mainnet fan-out dropped (refused adverts, outputs and hosts past its bounds).
+    for name in crate::mainnet_fanout::COUNTERS {
+        obj[name] = json!(0);
+    }
     // bsv-low #625, #626, #628: the app layer's observability families and this worker's memo writes read 0
     // until they fire (the app layer writes the `applayer_*` and `courier_applayer_*` rows).
     for name in crate::applayer_counters::seeded_names() {

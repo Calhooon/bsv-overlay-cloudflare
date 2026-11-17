@@ -2767,8 +2767,14 @@ async fn submit_parts(
     );
     if total_admitted > 0 && fanout_on {
         let owned_host = hosting_url.map(str::to_string);
+        // FANOUT-0811: the drops are counted in one D1 batch after the POSTs.
+        let fanout_db = env.d1("OVERLAY_DB");
         ctx.wait_until(async move {
-            crate::mainnet_fanout::fan_out(&tagged_beef, owned_host.as_deref()).await;
+            let host = owned_host.as_deref();
+            match fanout_db {
+                Ok(db) => crate::mainnet_fanout::fan_out_counted(&tagged_beef, host, db).await,
+                Err(_) => crate::mainnet_fanout::fan_out(&tagged_beef, host).await,
+            }
         });
     }
     // Only the SCHEDULING cost (near-zero) — the fan-out itself runs after the
