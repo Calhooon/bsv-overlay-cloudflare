@@ -66,6 +66,20 @@ jobs:
         (cd "$RUNNER_TEMP/gitleaks-${GITLEAKS_VERSION}" && go build -o "$RUNNER_TEMP/gitleaks" .)
         "$RUNNER_TEMP/gitleaks" git --redact --no-banner --exit-code 1 .
         "$RUNNER_TEMP/gitleaks" dir --redact --no-banner --exit-code 1 .
+    # The house's secrets check (scripts/check-secrets.py): its self-test, the pre-push door's test, the tree
+    # and, on a pull request, every blob its commits add or modify, by credential shape. The hosted runner holds
+    # no vault, so the operator's own values are compared only by the pre-push door (`make hooks`); the one
+    # WARNING line saying so is expected here.
+    - name: secrets (house)
+      if: ${{ !cancelled() }}
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -euo pipefail
+        python3 scripts/check-secrets.py --self-test
+        TMPDIR="$RUNNER_TEMP" bash scripts/tests/pre-push-secrets.sh
+        python3 scripts/check-secrets.py --no-vault
+        if [ -n "$BASE_SHA" ]; then python3 scripts/check-secrets.py --no-vault --commits "$BASE_SHA..HEAD"; fi
     - id: toolchain
       uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
       with:

@@ -16,7 +16,7 @@ export CARGO_TARGET_DIR
 ADMIN_TOKEN ?= parity-harness-token
 export ADMIN_TOKEN
 
-.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ci-d1-board ownership app-layer-door \
+.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ci-d1-board ownership app-layer-door secrets hooks \
         wrangler-dev harness test e2e-bsv-storage clean help
 
 help:
@@ -29,6 +29,8 @@ help:
 	@echo "  harness          Run parity-harness once (assumes services are up)"
 	@echo "  test             cargo test of BOTH workspaces (root: engine crates + harness; workers/: the LOW workers)"
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
+	@echo "  secrets          The secrets check: its self-test, the push door's test, then every tracked file for credential shapes and the vault's values (part of ci)"
+	@echo "  hooks            Install the pre-push secrets door for this clone (git config core.hooksPath scripts/hooks)"
 	@echo "  ownership        The storage ownership check (bsv-low #474): every SQL statement against storage-ownership.json (part of ci)"
 	@echo "  ci-route         Route-level /submit + /arc-ingest + /requestForeignGASPNodes cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799, and :LANE_BASE+11, +12 for NL-6c and NL-6d)"
 	@echo "  ci-d1-budget     D1 rows-read/write ceilings per hot route on a fixture D1 (part of ci-route; ports: :LANE_BASE+9 app layer, +10 overlay, +11 the e649 delivering overlay, +12 its mock app layer, +13 to +15 their inspectors, +16 the #831 retire overlay (also the #837 discovery-pass cell's), +17 its inspector, +18 its courier stand-in)"
@@ -137,6 +139,7 @@ gate-output-dirs:
 
 ci: gate-output-dirs
 	@set -e; \
+	$(MAKE) secrets; \
 	bash scripts/check-config-ids.sh --self-test; \
 	bash scripts/check-config-ids.sh; \
 	python3 scripts/check-storage-ownership.py --self-test; \
@@ -161,6 +164,21 @@ ci: gate-output-dirs
 WASM_BINDGEN_TEST_RUNNER ?= $(firstword $(wildcard $(HOME)/bsv/targets/wbg-0.2.129/bin/wasm-bindgen-test-runner) wasm-bindgen-test-runner)
 app-layer-door:
 	CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=$(WASM_BINDGEN_TEST_RUNNER) cargo test $(WORKERS) -p low-app-layer --target wasm32-unknown-unknown --test door_wasm
+
+# The secrets check (scripts/check-secrets.py, Python 3 stdlib only): credential SHAPES, and the values the operator's
+# vault folder holds ($OVERLAY_VAULT_DIR, else ~/vault), read at run time and never written or printed. With no vault
+# the shapes are still judged and one WARNING line says the values were not compared. Part of `ci`, first.
+secrets:
+	@python3 scripts/check-secrets.py --self-test
+	@bash scripts/tests/pre-push-secrets.sh
+	@python3 scripts/check-secrets.py
+
+# The pre-push door for this clone: every push is judged by scripts/hooks/pre-push before a byte leaves. The setting
+# is the clone's (.git/config), so every lane worktree of the clone shares it; while it is set git reads hooks from
+# scripts/hooks ONLY, so any hook installed in the clone's .git/hooks stops running (move it to scripts/hooks first).
+hooks:
+	git config core.hooksPath scripts/hooks
+	@echo "pre-push secrets door installed: core.hooksPath = scripts/hooks"
 
 # bsv-low #474: the shared D1's ownership manifest. Every SQL statement of the
 # overlay, discovery and app-layer crates against storage-ownership.json (prose:
