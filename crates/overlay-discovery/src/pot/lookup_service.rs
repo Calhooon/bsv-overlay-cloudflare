@@ -1166,7 +1166,7 @@ mod tests {
     /// subject (BRC-95 atomic prefix over the whole body). Since PORT-0811's
     /// fold a read that names no txid takes the subject rule (the unique tip,
     /// here the JOIN), never the wire-last entry, so the same bytes un-named
-    /// record the pot too (on `5dc6a82f` they were skipped: the trap).
+    /// record the pot too.
     const LOOP2_INCOMPLETE_JOIN_BEEF: &[u8] = include_bytes!(
         "../../../overlay-cloudflare/tests/fixtures/ef/loop2_join_5ad2764c_incomplete.beef"
     );
@@ -3521,6 +3521,117 @@ mod tests {
                     .is_none(),
                 "nothing healed while the readmission is incomplete (lens 3 LOW-1)"
             );
+        }
+
+        /// PORT-0811: a spender whose link trips the engine's link bound is
+        /// no unparseable payload. The spend hook reads the spender ALONE
+        /// (its own fields, nothing linked) and goes on: (1) a recorded pot
+        /// gets its pointer; (2) a held pot with no record is recorded from
+        /// the ENGINE's stored copy (the spender read alone carries no
+        /// source) and spent by the spender; (3) with no stored copy nothing
+        /// is recorded and the hook answers `Ok`.
+        #[tokio::test]
+        async fn p0811_t_the_spend_hook_reads_a_link_bound_spender_alone() {
+            use bsv_rs::transaction::{Beef, MerklePath, MerklePathLeaf};
+            let p = real_params();
+            // A proven parent of 4,000 one-byte outputs; the spender takes
+            // 420 of them beside the pot: its link is past the bound.
+            let mut wide = Tx::new();
+            wide.add_input(TransactionInput::new(hex::encode([0x77; 32]), 0))
+                .unwrap();
+            for _ in 0..4_000 {
+                wide.add_output(TransactionOutput {
+                    satoshis: Some(1),
+                    locking_script: LockingScript::from_binary(&[0x51]).unwrap(),
+                    change: false,
+                })
+                .unwrap();
+            }
+            let wide_id = wide.id();
+            let path = MerklePath::new(
+                900_000,
+                vec![vec![MerklePathLeaf::new_txid(0, wide_id.clone())]],
+            )
+            .unwrap();
+            let link_bound_spend = |pot: &Tx| {
+                let mut spender = spender_paying(&pot.id(), 0, &[(2400, p2pkh_lock(&p.pay_pkh_a))]);
+                for vout in 0..420 {
+                    spender
+                        .add_input(TransactionInput::new(wide_id.clone(), vout))
+                        .unwrap();
+                }
+                let mut beef = Beef::new();
+                let bump = beef.merge_bump(path.clone());
+                beef.merge_raw_tx(wide.to_binary(), Some(bump));
+                beef.merge_raw_tx(pot.to_binary(), None);
+                beef.merge_raw_tx(spender.to_binary(), None);
+                let id = spender.id();
+                let bytes = beef.to_binary_atomic(&id).unwrap();
+                let linked = beef_limits::transaction_from_beef(
+                    &bytes,
+                    None,
+                    &beef_limits::DISCOVERY_BEEF_LIMITS,
+                );
+                assert!(
+                    matches!(&linked, Err(e) if beef_limits::is_link_bound(e)),
+                    "the spender's link is past the bound"
+                );
+                (id, bytes)
+            };
+
+            // (1) A recorded pot: the pointer is written.
+            let (svc, pots) = make_service_with_storage();
+            let known = real_funding_tx(0x61, &p);
+            svc.output_admitted_by_topic(&admit(beef_of(&known), 0))
+                .await
+                .unwrap();
+            let (spender, bytes) = link_bound_spend(&known);
+            svc.output_spent(&spent(&known.id(), 0, bytes))
+                .await
+                .unwrap();
+            let rec = pots
+                .get_spent_status(&known.id(), 0)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(rec.spent, "a link-bound spender still spends the pot");
+            assert_eq!(rec.spending_txid.as_deref(), Some(spender.as_str()));
+
+            // (2) A held pot with no record: the engine's stored copy.
+            let cut = real_funding_tx(0x62, &p);
+            pots.hold_transaction_beef(&cut.id(), &beef_of(&cut));
+            let (spender, bytes) = link_bound_spend(&cut);
+            svc.output_spent(&spent(&cut.id(), 0, bytes)).await.unwrap();
+            let rec = pots
+                .get_spent_status(&cut.id(), 0)
+                .await
+                .unwrap()
+                .expect("recorded from the engine's stored copy");
+            assert_eq!(rec.spending_txid.as_deref(), Some(spender.as_str()));
+            assert_eq!(rec.decoded_covenant_params(), Some(p.clone()));
+            let stored = pots
+                .get_beef(&cut.id())
+                .await
+                .unwrap()
+                .expect("the pot's bytes under its own txid");
+            assert_eq!(
+                beef_limits::subject_from_beef(&stored, None, &beef_limits::DISCOVERY_BEEF_LIMITS)
+                    .unwrap()
+                    .id(),
+                cut.id()
+            );
+
+            // (3) No stored copy: the spender read alone carries no source.
+            let absent = real_funding_tx(0x63, &p);
+            let (_, bytes) = link_bound_spend(&absent);
+            svc.output_spent(&spent(&absent.id(), 0, bytes))
+                .await
+                .unwrap();
+            assert!(pots
+                .get_spent_status(&absent.id(), 0)
+                .await
+                .unwrap()
+                .is_none());
         }
 
         /// The fold's edges: (1) a READMITTED ledger row (`readmittedAt`
