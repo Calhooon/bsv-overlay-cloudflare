@@ -128,9 +128,12 @@ fn fan_in(n: u32, m: u32, lock: fn(u32) -> LockingScript, minimal: bool) -> (Vec
 }
 
 /// The bound: the batch's peak growth is at most this many times the body's
-/// bytes, plus a constant floor for a small body. Measured on this fold's
-/// tip at 6.6 to 14.8 times, at or under the gated arm's own earlier parse
-/// (`missing_source_txids`, 7.2 to 15.1 times on the same shapes).
+/// bytes, plus a constant floor for a small body, on FAN-IN shapes (one
+/// parent, one child spending many of its outputs) and spenders of one
+/// output: measured at 6.6 to 14.8 times, at or under the gated arm's own
+/// earlier parse (`missing_source_txids`, 7.2 to 15.1 times on the same
+/// shapes). Bodies of many small transactions (a chain, strays) are linear
+/// too, at 33 to 47 times, and are not held to this bound.
 const PEAK_PER_BODY_BYTE: usize = 24;
 const PEAK_FLOOR: usize = 64 * 1024;
 
@@ -203,6 +206,61 @@ fn p0811_f1_the_ef_batch_memory_follows_the_body() {
             );
         }
     }
+}
+
+/// PORT-0811 fold-2: an outpoint is written once a batch, so K spenders of ONE
+/// output whose lock is 100 KB (2,000 of them, each its own unproven
+/// transaction; a double spend inside one BEEF, which the batch refuses) hold
+/// the same bound as the fan-in ladders: the lock is written at most once.
+/// RED with the outpoint-once rule removed (each spender's EF entry carries
+/// the 100 KB lock again).
+#[test]
+fn p0811_f1_spenders_of_one_outpoint_hold_the_bound() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut parent = Transaction::new();
+    parent.inputs.push(TransactionInput {
+        source_txid: Some("ab".repeat(32)),
+        unlocking_script: Some(unlock(0, true)),
+        sequence: u32::MAX,
+        ..Default::default()
+    });
+    let mut big = vec![0x51u8];
+    big.extend(std::iter::repeat_n(0x61u8, 100_000 - 1));
+    parent.outputs.push(TransactionOutput::new(
+        1,
+        LockingScript::from_binary(&big).unwrap(),
+    ));
+    let parent_id = parent.id();
+    let mut beef = Beef::new();
+    beef.merge_raw_tx(parent.to_binary(), None);
+    for k in 0..2_000u32 {
+        let mut spender = Transaction::new();
+        spender.inputs.push(TransactionInput {
+            source_txid: Some(parent_id.clone()),
+            source_output_index: 0,
+            unlocking_script: Some(unlock(k, true)),
+            sequence: u32::MAX,
+            ..Default::default()
+        });
+        spender.outputs.push(TransactionOutput::new(1, one_byte(k)));
+        spender.lock_time = k;
+        beef.merge_raw_tx(spender.to_binary(), None);
+    }
+    let beef = beef.to_binary();
+    let (_, peak) = peak_of(|| ef::beef_to_ef_batch(&beef));
+    println!(
+        "EF same-outpoint K=2000 lock=100000 body={} batch_peak={peak} ({:.2}x)",
+        beef.len(),
+        peak as f64 / beef.len() as f64
+    );
+    assert!(
+        peak <= bound(beef.len()),
+        "2,000 spenders of one 100 KB output: the batch held {peak} bytes for a body of {} (bound {})",
+        beef.len(),
+        bound(beef.len())
+    );
 }
 
 /// PORT-0811 fold: the census (every ungated submit's classification, which

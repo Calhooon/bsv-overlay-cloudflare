@@ -8,10 +8,16 @@
 //! What is read (the readers NL-6 moved onto the stream, `fc019c8`). Each
 //! path CALLS the Worker's own read, never a second spelling of it (the land
 //! lens E585-LAND-L3), so the reader can neither accept a row the Worker
-//! refuses nor refuse one it accepts:
+//! refuses nor refuse one it accepts, with ONE exception, the raw-transaction
+//! columns (below): their Workers' readers are the app layer's
+//! (`hopsweep::sweep_output_sats`, `owed::refund_output_sats`,
+//! `record_post::potrefund_chain_row_is_own`), which this crate does not link,
+//! so those columns are read with bsv-rs's own readers the app layer's call
+//! (`Transaction::from_binary`, `sighash::parse_transaction`): the verdict on
+//! the bytes is the same, the spelling is not the app layer's.
 //! - `transactions.beef` and `transactions_evicted.beef` (the engine's store:
 //!   `D1Storage::beef_has_proof`, `reorg_sweep`'s own BUMP,
-//!   `proof_fetcher`'s `transaction_from_beef`), keyed by `txid`, and
+//!   `proof_fetcher`'s `subject_from_beef`), keyed by `txid`, and
 //!   `pot_beefs.beef` (`pot_beef_has_proof`, the pot lookup's
 //!   `transaction_from_beef`): read back as the Worker reads them, `hex(beef)
 //!   AS beef` decoded by `d1::beef_of_hex_column`. A BEEF stored as hex TEXT
@@ -38,8 +44,8 @@
 //!   `d1::migration_error_is_benign`), as the Worker's first request would.
 //!
 //! - PORT-0811 (bsv-rs 0.8.11): every stored BEEF is also linked as the
-//!   engine links it, under bsv-rs's default link bound
-//!   (`beef_limits::transaction_from_beef`, GHSA-gvmh-f5gf-5vjj): a trip is
+//!   engine links it, under the engine's link bound (16 MiB of heap,
+//!   `beef_limits::transaction_from_beef`): a trip is
 //!   `REFUSED .. kind=link_bound` (the stored rows by their txid, a parked
 //!   letter by the engine's subject rule, `subject::subject_txid_of`). A
 //!   stored row whose UNNAMED read (`from_beef(_, None)`, the read a 0.7.2
@@ -1407,9 +1413,9 @@ mod self_test {
     /// as the Worker reads it (`hex(beef)`, `d1::beef_of_hex_column`): the
     /// hex of its ASCII bytes, which the door refuses. RED on `e2c561c`: the
     /// reader hex-decoded the TEXT and read it clean (`refusals` 0, not 1).
-    /// The link bound's shape (bsv-rs 0.8.11, GHSA-gvmh-f5gf-5vjj): a proven
-    /// parent of `n` `OP_1` outputs, every one spent by one child; 1,400 of
-    /// each re-materialize about 19.6 MB of repeats, past the 16 MiB default.
+    /// The link bound's shape: a proven parent of `n` `OP_1` outputs, every
+    /// one spent by one child; 1,400 of each are past the engine's link bound
+    /// (`beef_limits::LINK_HEAP_MAX_BYTES`).
     fn shared_parent_beef(n: u32) -> (Vec<u8>, String) {
         use bsv_rs::script::{LockingScript, Script, UnlockingScript};
         use bsv_rs::transaction::{
