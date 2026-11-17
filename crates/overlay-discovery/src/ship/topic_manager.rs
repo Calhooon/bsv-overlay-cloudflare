@@ -97,23 +97,51 @@ impl TopicManager for SHIPTopicManager {
     }
 }
 
+/// The fields of a SHIP advertisement [`SHIPTopicManager`] admits: the token's
+/// identity key, its advertised URI and its topic, each as the token carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ShipAdvert {
+    /// field\[1\]: the 33-byte compressed identity key.
+    pub identity_key: Vec<u8>,
+    /// field\[2\]: the advertised URI (it passed [`is_advertisable_uri`]).
+    pub uri: Vec<u8>,
+    /// field\[3\]: the topic (BRC-87, `tm_` prefix).
+    pub topic: Vec<u8>,
+}
+
 impl SHIPTopicManager {
     /// Validate a single output as a SHIP advertisement.
     /// Returns Ok(true) if valid SHIP, Ok(false) if not a SHIP output, Err if malformed.
     fn validate_ship_output(
         output: &bsv_rs::transaction::TransactionOutput,
     ) -> Result<bool, String> {
+        Self::admissible_advert(output).map(|advert| advert.is_some())
+    }
+
+    /// THE SHIP admission rule, for one output: `Ok(Some(advert))` exactly where
+    /// this manager admits the output (five PushDrop fields, `SHIP`, a 33-byte
+    /// identity key, an advertisable URI, a BRC-87 `tm_` topic, and a signature
+    /// by the identity key's linked key over the data fields with the output
+    /// locked by that key: [`is_token_signature_correctly_linked`]);
+    /// `Ok(None)` for an output that is not a SHIP advertisement or whose
+    /// signature or key link fails; `Err` for a malformed one. Every reader that
+    /// takes a host from a SHIP advertisement (the mainnet fan-out) calls this,
+    /// so there is one spelling of the rule.
+    pub fn admissible_advert(
+        output: &bsv_rs::transaction::TransactionOutput,
+    ) -> Result<Option<ShipAdvert>, String> {
         // Decode PushDrop
         let pushdrop =
             PushDrop::decode(&output.locking_script).map_err(|e| format!("not a PushDrop: {e}"))?;
 
         if pushdrop.fields.len() != 5 {
-            return Ok(false);
+            return Ok(None);
         }
 
         let protocol = String::from_utf8_lossy(&pushdrop.fields[0]);
         if protocol != "SHIP" {
-            return Ok(false);
+            return Ok(None);
         }
 
         // Field[1]: identity key (33-byte compressed pubkey)
@@ -149,14 +177,18 @@ impl SHIPTopicManager {
             &pushdrop.fields,
             "SHIP",
         ) {
-            Ok(true) => Ok(true),
+            Ok(true) => Ok(Some(ShipAdvert {
+                identity_key: pushdrop.fields[1].clone(),
+                uri: pushdrop.fields[2].clone(),
+                topic: pushdrop.fields[3].clone(),
+            })),
             Ok(false) => {
                 warn!("output skipped: signature/key linkage failed");
-                Ok(false)
+                Ok(None)
             }
             Err(e) => {
                 warn!("output skipped: signature verification error: {e}");
-                Ok(false)
+                Ok(None)
             }
         }
     }
