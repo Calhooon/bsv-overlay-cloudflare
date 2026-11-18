@@ -303,7 +303,14 @@ impl GraphAssembly {
                 .and_then(|pending| pending.node.proof.as_ref())
             {
                 Some(proof_hex) => Some(beef_limits::proof_from_hex(proof_hex).map_err(|e| {
-                    GASPError::Other(format!("Failed to parse proof for {key}: {e}"))
+                    // lane INTAKE-BOUND: a path past the proof limb is not read; the anchor HOLDS the graph.
+                    if beef_limits::is_proof_limb(&e) {
+                        GASPError::AnchorWalkHeld(format!(
+                            "the proof of {key} could not be read within the budget (over_proof: {e})"
+                        ))
+                    } else {
+                        GASPError::Other(format!("Failed to parse proof for {key}: {e}"))
+                    }
                 })?),
                 None => None,
             };
@@ -699,8 +706,12 @@ impl<'a> OverlayGASPStorage<'a> {
         refs: &HashMap<String, PendingNode>,
         strict_beef: bool,
     ) -> Result<AnchorInput, GASPError> {
-        let unassembled = |e: GASPError| {
-            GASPError::AnchorUnavailable(format!("graph {graph_id} cannot be assembled: {e}"))
+        let unassembled = |e: GASPError| match e {
+            // lane INTAKE-BOUND: a node's proof past the proof limb is a HOLD, never "unavailable".
+            GASPError::AnchorWalkHeld(why) => {
+                GASPError::AnchorWalkHeld(format!("graph {graph_id}: {why}"))
+            }
+            e => GASPError::AnchorUnavailable(format!("graph {graph_id} cannot be assembled: {e}")),
         };
         if !refs.contains_key(graph_id) {
             return Err(GASPError::ValidationFailed(format!(
@@ -1356,6 +1367,18 @@ impl GASPStorage for OverlayGASPStorage<'_> {
 
         // ── 1. Bitcoin ──────────────────────────────────────────────────
         let mut root_beef = anchor.root_beef;
+        // The proof limb before the root BEEF is parsed (lane INTAKE-BOUND):
+        // HELD, as a walk past the budget is (the cursor stays below it).
+        // Each node's own proof was already read under the limb's default
+        // (`beef_limits::proof_from_hex`); the root BEEF holds them all.
+        if let Err(stop) = self.walk_budget.proof_limb(&root_beef) {
+            warn!(
+                "GASP anchor: graph {graph_id}'s root BEEF is past the proof limb: held ({stop})"
+            );
+            return Err(GASPError::AnchorWalkHeld(format!(
+                "graph {graph_id}: the root BEEF could not be read within the budget (over_proof: {stop})"
+            )));
+        }
         if !anchor.absent_sources.is_empty() {
             let mut merged = beef_limits::parse_beef(&root_beef, &beef_limits::PEER_BEEF_LIMITS)
                 .map_err(|e| refused(format!("root BEEF does not parse: {e}")))?;

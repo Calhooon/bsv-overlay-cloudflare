@@ -266,6 +266,7 @@ pub fn parse_beef(bytes: &[u8], _door: &BeefLimits) -> bsv_rs::Result<Beef> {
     Beef::from_binary(bytes)
 }
 
+
 /// The subject a read names: the explicit txid, then the atomic txid, then,
 /// for a read that names none, the house's ONE subject rule
 /// ([`crate::subject::subject_txid_of`]: the unique tip, else the reference's
@@ -339,6 +340,28 @@ pub const LINK_CHARGE_WIRE_BYTE: u64 = 4;
 pub const LINK_CHARGE_BUMP_LEAF: u64 = 128;
 /// A level-0 leaf's charge in the link's BUMP index ([`LINK_CHARGE_TX`]).
 pub const LINK_CHARGE_INDEX_LEAF: u64 = 64;
+
+/// The most BUMP nodes an ancestry [`link_heap_estimate`] admits can carry,
+/// and the default of the door's PROOF limb
+/// (`DoorBudget::max_proof_nodes`, lane INTAKE-BOUND).
+///
+/// The derivation, from the estimate as it stands: every BUMP a source of the
+/// subject's ancestry carries is charged in `beyond` at
+/// [`LINK_CHARGE_BUMP_LEAF`] a node (every level) TWICE, once for the
+/// source's full link and once for its memo stub (a shared BUMP once more for
+/// each further source it proves, and each repeated stub once more), beside
+/// the sources' own weight; `beyond` is bounded by [`LINK_HEAP_MAX_BYTES`]. So
+/// an ancestry the estimate admits carries fewer than
+/// `LINK_HEAP_MAX_BYTES / (2 * LINK_CHARGE_BUMP_LEAF)` nodes in all (65,536):
+/// a body carrying more in its ancestry is declined at the link today, after
+/// it was parsed. The level-0 index charge ([`LINK_CHARGE_INDEX_LEAF`]) is
+/// the estimate's `linear` part, which no bound reads, so it does not enter.
+///
+/// What the figure does NOT cover, stated: a PROVEN subject's own BUMP (its
+/// link walks no ancestry; the estimate counts it as linear and bsv-rs's heap
+/// meter bounds its clone), and BUMPs no source of the ancestry uses. Both
+/// are now bounded by the proof limb at the frame.
+pub const LINK_ANCESTRY_PROOF_NODES_MAX: u64 = LINK_HEAP_MAX_BYTES / (2 * LINK_CHARGE_BUMP_LEAF);
 
 /// The heap figure handed to bsv-rs's own heap meter ([`engine_link_limits`];
 /// bsv-rs 0.8.12, GHSA-33fm-jcm5-4m3m: `BeefLinkLimits::max_link_heap_bytes`),
@@ -628,11 +651,24 @@ pub fn merkle_path_from_hex(hex: &str, max_bytes: usize) -> bsv_rs::Result<Merkl
     proof_from_hex(hex)
 }
 
-/// A proof read back from a store or handed by a GASP peer: read whatever its
-/// length, refused only if the bytes do not parse.
+/// A proof read back from a store, handed by a GASP peer, or fetched from a
+/// courier or pushed (through [`merkle_path_from_hex`]): read whatever its
+/// length, refused if the bytes do not parse, and NOT parsed when its nodes
+/// are past the proof limb's default
+/// ([`LINK_ANCESTRY_PROOF_NODES_MAX`], counted from the path's frame by
+/// `stream_sizing::path_proof_limb` before its root is computed; lane
+/// INTAKE-BOUND): `Err(BeefResourceLimit)` with the stop's words.
 pub fn proof_from_hex(hex: &str) -> bsv_rs::Result<MerklePath> {
     let bytes = bsv_rs::primitives::from_hex(hex)?;
+    crate::stream_sizing::path_proof_limb(&bytes, LINK_ANCESTRY_PROOF_NODES_MAX)
+        .map_err(|stop| bsv_rs::Error::BeefResourceLimit(stop.to_string()))?;
     MerklePath::from_binary(&bytes)
+}
+
+/// Whether `e` is the proof limb's stop of [`proof_from_hex`] (a path past
+/// [`LINK_ANCESTRY_PROOF_NODES_MAX`], not parsed), never a parse fault.
+pub fn is_proof_limb(e: &bsv_rs::Error) -> bool {
+    matches!(e, bsv_rs::Error::BeefResourceLimit(why) if why.contains(crate::stream_sizing::PROOF_LIMB_WORDS))
 }
 
 /// Always `false` since NL-6: no door of this module refuses by a limit, so

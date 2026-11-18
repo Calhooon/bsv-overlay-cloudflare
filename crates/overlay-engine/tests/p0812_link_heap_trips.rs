@@ -18,6 +18,18 @@
 //! parent is declined first by the engine's estimate (its `p0811_link_trips`
 //! pin). Every door reads one function (`beef_limits::link_bounded`), whose
 //! heap-meter trip is pinned here by its class and its words.
+//!
+//! Lane INTAKE-BOUND: the wide body carries 564,622 BUMP nodes, past the
+//! door's proof limb (`DoorBudget::max_proof_nodes`, 65,536 by default), so
+//! under the engine's DEFAULT budget every door that reads a body now stops it
+//! at the frame, before anything is parsed: each submit pin asserts that
+//! first (`WalkCouldNotRun`, limb `OverProof`), then drives the same door with
+//! the proof limb lifted (`lifted`) to keep the heap meter's trip pinned at
+//! the door. The anchor reads a node's proof under the limb's default
+//! (`beef_limits::proof_from_hex`, not a budget), so it holds the graph at
+//! that read (`over_proof`) and no longer reaches its walk. The meter's trip
+//! at the link function itself (`p0812_t_the_wide_parent_is_the_heap_meters_alone`,
+//! and every pin of `p0812_link_heap_meter`) is unchanged.
 // bsv-stack-lean #134: test code
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -25,7 +37,9 @@ use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use bsv_overlay_engine::builder::EngineBuilder;
-use bsv_overlay_engine::engine::{Engine, WalkBreachPolicy, WalkLimb, WalkWentOn};
+use bsv_overlay_engine::engine::{
+    DoorBudget, Engine, EngineError, WalkBreachPolicy, WalkLimb, WalkWentOn,
+};
 use bsv_overlay_engine::gasp::{GASPError, GASPStorage};
 use bsv_overlay_engine::gasp_overlay::{new_finalized_graph_sink, OverlayGASPStorage};
 use bsv_overlay_engine::storage::memory::MemoryStorage;
@@ -209,6 +223,40 @@ fn engine_with(manager: Naming, storage: MemoryStorage) -> Engine {
         .build()
 }
 
+/// The engine with the proof limb lifted (lane INTAKE-BOUND), so the door
+/// reads the wide body and the heap meter's trip is reached.
+fn lifted(manager: Naming, storage: MemoryStorage) -> Engine {
+    EngineBuilder::new(Box::new(storage))
+        .with_topic(TOPIC, Box::new(manager))
+        .with_walk_budget(DoorBudget {
+            max_proof_nodes: u64::MAX,
+            ..DoorBudget::DEFAULT
+        })
+        .build()
+}
+
+/// Under the DEFAULT budget the door stops the wide body at the frame, before
+/// any parse, under both policies (lane INTAKE-BOUND).
+async fn stopped_at_intake(beef: &[u8], mode: SubmitMode) {
+    let engine = engine_with(
+        Naming {
+            deep: false,
+            admits: true,
+            names: true,
+        },
+        MemoryStorage::new(),
+    );
+    for policy in [WalkBreachPolicy::NotNow, WalkBreachPolicy::NetworkAccepted] {
+        let tagged = TaggedBEEF::new(beef.to_vec(), vec![TOPIC.into()]);
+        match engine.submit_with_report_under(&tagged, mode, policy).await {
+            Err(EngineError::WalkCouldNotRun(stop)) => {
+                assert_eq!(stop.limb, WalkLimb::OverProof, "{policy:?}: {}", stop.what);
+            }
+            other => panic!("{policy:?}: the proof limb stops it first: {other:?}"),
+        }
+    }
+}
+
 /// Submits `beef` under the network's accept (the subject's own walk or link
 /// stop goes on) and returns the predecessor question's fault text.
 async fn question(engine: &Engine, beef: Vec<u8>) -> String {
@@ -262,7 +310,8 @@ fn p0812_t_the_wide_parent_is_the_heap_meters_alone() {
 async fn p0812_t_the_dry_run_waits_on_a_heap_meter_trip() {
     let (g, p) = &wide_parent();
     let s = spend(&[(p.id(), 0)], 2);
-    let engine = engine_with(
+    stopped_at_intake(&beef_of(&[g, p, &s]), SubmitMode::CurrentTx).await;
+    let engine = lifted(
         Naming {
             deep: false,
             admits: true,
@@ -290,6 +339,7 @@ async fn p0812_t_the_dry_run_waits_on_a_heap_meter_trip() {
 async fn p0812_t_the_landing_waits_on_a_heap_meter_trip() {
     let (g, p) = &wide_parent();
     let s = spend(&[(p.id(), 0)], 2);
+    stopped_at_intake(&beef_of(&[g, p, &s]), SubmitMode::CurrentTx).await;
     let storage = MemoryStorage::new();
     storage
         .insert_output(&Output {
@@ -307,7 +357,7 @@ async fn p0812_t_the_landing_waits_on_a_heap_meter_trip() {
         })
         .await
         .unwrap();
-    let engine = engine_with(
+    let engine = lifted(
         Naming {
             deep: false,
             admits: true,
@@ -334,8 +384,9 @@ async fn p0812_t_the_landing_waits_on_a_heap_meter_trip() {
 )]
 async fn p0812_t_the_no_spv_submit_goes_on_over_a_heap_meter_trip() {
     let (_, p) = &wide_parent();
+    stopped_at_intake(&beef_of(&[p]), SubmitMode::HistoricalTxNoSpv).await;
     let tagged = TaggedBEEF::new(beef_of(&[p]), vec![TOPIC.into()]);
-    let engine = engine_with(
+    let engine = lifted(
         Naming {
             deep: false,
             admits: true,
@@ -401,11 +452,13 @@ async fn p0812_t_the_foreign_node_read_answers_over_a_heap_meter_trip() {
     assert_eq!(Transaction::from_hex(&node.raw_tx).unwrap().id(), p.id());
 }
 
-/// The GASP anchor does not reach its link on such a graph: the root's own
-/// walk runs first and its memory limb (48 MiB, the door's) holds the graph
-/// on the wide BUMP before any link, so the anchor answers by its walk's hold
-/// (`AnchorWalkHeld`, the cursor below it), as on bsv-rs 0.8.11. Stated: no
-/// shape trips the heap meter at the anchor's link with the walk run first.
+/// The GASP anchor does not reach its link on such a graph. Since lane
+/// INTAKE-BOUND it does not reach its walk either: the root node's proof is
+/// read under the proof limb's default (`beef_limits::proof_from_hex`), which
+/// stops the wide path at its frame, and the graph is HELD there
+/// (`AnchorWalkHeld`, `over_proof`, the cursor below it). Before the lane the
+/// root's walk held it at its memory limb (48 MiB) after the path was parsed.
+/// Stated: no shape trips the heap meter at the anchor's link.
 #[tokio::test]
 #[cfg_attr(
     debug_assertions,
@@ -435,8 +488,8 @@ async fn p0812_t_the_anchor_holds_such_a_graph_at_its_walk_first() {
     match gasp.validate_graph_anchor(&root).await {
         Err(GASPError::AnchorWalkHeld(why)) => {
             assert!(
-                why.contains("could not run within the budget (over_memory"),
-                "the walk's memory limb holds it first: {why}"
+                why.contains("could not be read within the budget (over_proof"),
+                "the proof limb holds it at the node's proof, before the walk: {why}"
             );
         }
         other => panic!("the graph is held: {other:?}"),
