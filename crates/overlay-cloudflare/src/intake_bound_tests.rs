@@ -277,3 +277,13 @@ fn ib_w_the_fanout_reads_no_advert_past_the_limb() {
     let parse = src[f..].find("parse_beef(beef").unwrap();
     assert!(limb < parse);
 }
+
+/// The peer crawler's expiry read of a peer's answer reads the limb before its parse.
+#[test]
+fn ib_w_the_crawlers_expiry_read_takes_the_limb_first() {
+    let src = source("peer_crawler.rs");
+    let f = src.find("fn expired_answer(").unwrap();
+    let limb = src[f..].find("WORKER_WALK_BUDGET.proof_limb(&entry.beef)").unwrap();
+    let parse = src[f..].find("subject_from_beef(").unwrap();
+    assert!(limb < parse);
+}
