@@ -1404,7 +1404,7 @@ mod tests {
     /// The fold's M2: a STORED own bump past the proof limb's default is read
     /// as on `main` (`stored_proof_from_hex`): verified against its height's
     /// canonical root, never refuted for its width, so the sweep demotes
-    /// nothing for it. RED on `69cee436` (`Ok(false)`: the limb's stop read as
+    /// nothing for it. RED with `69cee436`'s rule grafted (`Ok(false)`: the limb's stop read as
     /// refuted, the row re-anchored and, with no courier, demoted).
     #[test]
     fn ibf_m2_a_stored_bump_past_the_limb_is_verified_as_on_main() {

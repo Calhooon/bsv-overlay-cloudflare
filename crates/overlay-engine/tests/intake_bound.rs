@@ -723,7 +723,7 @@ impl Xorshift {
 /// node under its count; whenever the house's stream-first parse
 /// (`parse_beef`) or bsv-rs's `Beef::from_binary` parses a BEEF, the frame
 /// read counted at least its nodes and the limb one under them stops it.
-/// RED on `69cee436` (a flag byte outside 0, 1 and 2 ended the frame read
+/// RED with `69cee436`'s rule grafted (a flag byte outside 0, 1 and 2 ended the frame read
 /// with the nodes before it, and bsv-rs read on).
 #[test]
 fn ibf_h1_the_frame_read_never_counts_fewer_nodes_than_the_sdk() {
@@ -848,7 +848,7 @@ fn path_by_hand(n: u64, flag: u8) -> Vec<u8> {
 /// hash: bit 0 is clear) is stopped at the limb unparsed: the read holds a
 /// few hundred bytes, `proof_from_hex` no more than its own hex decode (under
 /// twice the path's bytes). RED
-/// on `69cee436` (`Ok(0)`, then every node parsed).
+/// with `69cee436`'s rule grafted (`Ok(0)`, then every node parsed).
 #[test]
 fn ibf_h1_a_flag_0x06_path_of_200000_nodes_is_stopped_unparsed() {
     let _g = one_at_a_time();
@@ -924,7 +924,7 @@ fn ibf_h1_a_path_the_read_does_not_follow_is_refused_unparsed() {
 /// on as past every other limb, in every mode: admitted, the trip reported
 /// (`walk_could_not_run`, limb `OverProof`, `walk_went_on`
 /// `NetworkAccepted`, the subject named). Under `NotNow` it stops in every
-/// mode, `historical-tx-no-spv` included. RED on `69cee436` (stopped under
+/// mode, `historical-tx-no-spv` included. RED with `69cee436`'s rule grafted (stopped under
 /// both policies).
 #[test]
 fn ibf_m1_the_networks_accept_goes_on_past_the_proof_limb() {
