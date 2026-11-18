@@ -1,0 +1,22 @@
+#!/bin/sh
+# bsv-overlay-cloudflare: the secrets door for EVERY worktree of this clone (installed by `make hooks`).
+# `make hooks` copies this file to the clone's COMMON hooks folder ($(git rev-parse --git-common-dir)/hooks/pre-push),
+# which git runs for every worktree of the clone while core.hooksPath is unset, whatever commit the worktree has
+# checked out. It never runs the worktree's own copy of the check (a branch cut from an old base would bring an old
+# door, or none): it runs the copy on the remote's DEFAULT BRANCH as this clone knows it, refs/remotes/origin/HEAD
+# when that is set (`git remote set-head origin -a`), else refs/remotes/origin/main, so the door is the newest merged
+# one the clone has fetched. It reads `origin` whichever remote the push goes to (a push to a fork is judged by this
+# repository's door); a clone with no remote named `origin`, or whose default branch holds no
+# scripts/check-secrets.py, has every push REFUSED with one line saying how to fix it. Fails closed.
+ref=$(git symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null) || ref=refs/remotes/origin/main
+if ! git cat-file -e "$ref:scripts/check-secrets.py" 2>/dev/null; then
+  echo "pre-push: $ref holds no scripts/check-secrets.py in this clone (run \`git fetch origin\`; a clone whose remote is not named origin: \`git remote rename <name> origin\`); push refused" >&2
+  exit 1
+fi
+tmp=$(mktemp "${TMPDIR:-/tmp}/check-secrets.XXXXXX") || { echo "pre-push: cannot make a temp file; push refused" >&2; exit 1; }
+trap 'rm -f "$tmp"' EXIT
+git show "$ref:scripts/check-secrets.py" > "$tmp" 2>/dev/null && [ -s "$tmp" ] || {
+  echo "pre-push: cannot read $ref:scripts/check-secrets.py; push refused" >&2
+  exit 1
+}
+python3 "$tmp" --pre-push "$@"

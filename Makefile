@@ -173,12 +173,12 @@ secrets:
 	@bash scripts/tests/pre-push-secrets.sh
 	@python3 scripts/check-secrets.py
 
-# The pre-push door for this clone: every push is judged by scripts/hooks/pre-push before a byte leaves. The setting
-# is the clone's (.git/config), so every lane worktree of the clone shares it; while it is set git reads hooks from
-# scripts/hooks ONLY, so any hook installed in the clone's .git/hooks stops running (move it to scripts/hooks first).
+# The pre-push door for EVERY worktree of this clone (scripts/install-hooks.sh): scripts/hooks/pre-push.common is copied
+# to the clone's common hooks folder, which git runs for every worktree whatever it has checked out, and runs the remote
+# default branch's scripts/check-secrets.py. core.hooksPath must be unset (the old value scripts/hooks is unset here;
+# any other value stops). A foreign pre-push already there is never overwritten: FORCE=1 replaces it.
 hooks:
-	git config core.hooksPath scripts/hooks
-	@echo "pre-push secrets door installed: core.hooksPath = scripts/hooks"
+	@FORCE=$(FORCE) sh scripts/install-hooks.sh
 
 # bsv-low #474: the shared D1's ownership manifest. Every SQL statement of the
 # overlay, discovery and app-layer crates against storage-ownership.json (prose:
