@@ -297,23 +297,22 @@ impl GraphAssembly {
             return Ok(node.clone());
         }
         let parsed = self.parsed_tx(key, refs)?;
-        let proof =
-            match refs
-                .get(key)
-                .and_then(|pending| pending.node.proof.as_ref())
-            {
-                Some(proof_hex) => Some(beef_limits::proof_from_hex(proof_hex).map_err(|e| {
-                    // lane INTAKE-BOUND: a path past the proof limb is not read; the anchor HOLDS the graph.
-                    if beef_limits::is_proof_limb(&e) {
-                        GASPError::AnchorWalkHeld(format!(
-                            "the proof of {key} could not be read within the budget (over_proof: {e})"
-                        ))
-                    } else {
-                        GASPError::Other(format!("Failed to parse proof for {key}: {e}"))
-                    }
-                })?),
-                None => None,
-            };
+        let proof = match refs
+            .get(key)
+            .and_then(|pending| pending.node.proof.as_ref())
+        {
+            Some(proof_hex) => Some(beef_limits::proof_from_hex(proof_hex).map_err(|e| {
+                // lane INTAKE-BOUND: a path past the proof limb is not read; the anchor HOLDS the graph.
+                if beef_limits::is_proof_limb(&e) {
+                    GASPError::AnchorWalkHeld(format!(
+                        "the proof of {key} could not be read within the budget (over_proof: {e})"
+                    ))
+                } else {
+                    GASPError::Other(format!("Failed to parse proof for {key}: {e}"))
+                }
+            })?),
+            None => None,
+        };
         // A proven node is a leaf. An unproven one takes each input's source
         // from the node filed under that outpoint, when the graph has it.
         let sources = if proof.is_some() {

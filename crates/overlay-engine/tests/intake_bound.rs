@@ -11,12 +11,7 @@
 //! the default's 65,536; the default itself is pinned by a body one node past
 //! it, which the stop never parses.
 // bsv-stack-lean #134: test code
-#![allow(
-    unsafe_code,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic
-)]
+#![allow(unsafe_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,7 +22,9 @@ use bsv_overlay_engine::beef_limits::{
     LINK_HEAP_MAX_BYTES,
 };
 use bsv_overlay_engine::builder::EngineBuilder;
-use bsv_overlay_engine::engine::{DoorBudget, DoorLimb, Engine, EngineError, WalkBreachPolicy, WalkLimb};
+use bsv_overlay_engine::engine::{
+    DoorBudget, DoorLimb, Engine, EngineError, WalkBreachPolicy, WalkLimb,
+};
 use bsv_overlay_engine::gasp::{GASPError, GASPStorage};
 use bsv_overlay_engine::gasp_overlay::{new_finalized_graph_sink, OverlayGASPStorage};
 use bsv_overlay_engine::storage::memory::MemoryStorage;
@@ -94,7 +91,8 @@ static HEAP: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Every test of this binary takes the lock: the counting allocator is the
 /// process's, so a test allocating beside a measured one would be counted.
 fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-    HEAP.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    HEAP.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// What a stopped door call may hold beside the body: its error and its
@@ -353,7 +351,10 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 #[test]
 fn ib_the_default_is_the_link_estimates_own_figure() {
     let _g = one_at_a_time();
-    assert_eq!(DoorBudget::DEFAULT.max_proof_nodes, LINK_ANCESTRY_PROOF_NODES_MAX);
+    assert_eq!(
+        DoorBudget::DEFAULT.max_proof_nodes,
+        LINK_ANCESTRY_PROOF_NODES_MAX
+    );
     assert_eq!(
         LINK_ANCESTRY_PROOF_NODES_MAX,
         LINK_HEAP_MAX_BYTES / (2 * LINK_CHARGE_BUMP_LEAF)
@@ -386,6 +387,11 @@ fn ib_the_default_is_the_link_estimates_own_figure() {
     assert!(
         beyond <= LINK_HEAP_MAX_BYTES,
         "{nodes} nodes are admitted by the estimate: {beyond}"
+    );
+    println!(
+        "ib derivation: the widest ancestry the estimate admits for this shape carries {nodes} \
+         nodes (beyond {beyond}); the estimate's own figure {admitted_max}; the default {}",
+        DoorBudget::DEFAULT.max_proof_nodes
     );
     assert!(
         proof_limb(&body, DoorBudget::DEFAULT.max_proof_nodes).is_ok(),
@@ -445,7 +451,8 @@ fn ib_b_every_submit_stops_one_past_the_limb_and_admits_at_it() {
             Err(e) => {
                 assert!(over_proof(&e), "{door}: {e}");
                 assert!(
-                    e.to_string().contains("the same bytes are stopped at any time"),
+                    e.to_string()
+                        .contains("the same bytes are stopped at any time"),
                     "{door}: {e}"
                 );
             }
@@ -473,7 +480,10 @@ fn ib_b_the_default_stops_the_submit_before_its_parse() {
             rt.block_on(engine.submit_with_report_under(&t, SubmitMode::HistoricalTxNoSpv, policy))
         });
         let e = r.expect_err("stopped");
-        assert!(held <= STOP_HELD_MAX, "{policy:?}: the submit held {held} bytes: {e}");
+        assert!(
+            held <= STOP_HELD_MAX,
+            "{policy:?}: the submit held {held} bytes: {e}"
+        );
         assert!(over_proof(&e), "{policy:?}: {e}");
         let EngineError::WalkCouldNotRun(stop) = e else {
             unreachable!()
@@ -519,7 +529,13 @@ fn ib_c_the_script_door_stops_one_past_the_limb() {
     let (r, held) = held_by(|| block_on(default.verify_scripts_only(&body, &"00".repeat(32))));
     assert!(held <= STOP_HELD_MAX, "the door held {held} bytes");
     assert!(
-        matches!(r, Err(EngineError::ScriptWalkOverBudget { limb: DoorLimb::Proof, .. })),
+        matches!(
+            r,
+            Err(EngineError::ScriptWalkOverBudget {
+                limb: DoorLimb::Proof,
+                ..
+            })
+        ),
         "{r:?}"
     );
 }
@@ -552,7 +568,10 @@ fn ib_d_the_anchor_holds_a_root_past_the_limb() {
         };
         let gasp = held(small_budget());
         gasp.append_to_graph(&node(&root_tx), None).await.unwrap();
-        match gasp.validate_graph_anchor(&format!("{}.0", root_tx.id())).await {
+        match gasp
+            .validate_graph_anchor(&format!("{}.0", root_tx.id()))
+            .await
+        {
             Err(GASPError::AnchorWalkHeld(why)) => assert!(why.contains("over_proof"), "{why}"),
             other => panic!("held at the root BEEF: {other:?}"),
         }
@@ -592,9 +611,8 @@ fn ib_e_the_limb_is_configuration() {
         ..DoorBudget::DEFAULT
     });
     let body = one_past_the_default_frame(None);
-    match block_on(lifted.submit(&tagged(&body), SubmitMode::HistoricalTxNoSpv)) {
-        Err(e) => assert!(!over_proof(&e), "lifted, the limb does not stop it: {e}"),
-        Ok(_) => {}
+    if let Err(e) = block_on(lifted.submit(&tagged(&body), SubmitMode::HistoricalTxNoSpv)) {
+        assert!(!over_proof(&e), "lifted, the limb does not stop it: {e}");
     }
 }
 
@@ -616,7 +634,10 @@ fn ib_f_no_body_linked_today_is_stopped() {
     let p = prove_wide(p, 16_384);
     let spent: Vec<(String, u32)> = (0..200).map(|i| (p.id(), i)).collect();
     let s = spend(&spent, 8);
-    shapes.push(("p0811 a BUMP of 16,384 leaves, 200 outputs spent", beef_of(&[&p, &s])));
+    shapes.push((
+        "p0811 a BUMP of 16,384 leaves, 200 outputs spent",
+        beef_of(&[&p, &s]),
+    ));
     // `p0811_link_heap`'s 4,096-leaf parent.
     let p = prove_wide(coin(9), 4_096);
     let s = spend(&[(p.id(), 0)], 10);
@@ -641,7 +662,11 @@ fn ib_f_no_body_linked_today_is_stopped() {
             shapes.push((Box::leak(name.into_boxed_str()), body));
         }
     }
-    assert!(shapes.len() >= 8, "the fixtures were found: {}", shapes.len());
+    assert!(
+        shapes.len() >= 8,
+        "the fixtures were found: {}",
+        shapes.len()
+    );
     for (name, body) in &shapes {
         let frame = proof_limb(body, u64::MAX).unwrap();
         assert!(
@@ -652,4 +677,3 @@ fn ib_f_no_body_linked_today_is_stopped() {
         assert!(proof_limb(body, default).is_ok(), "{name}");
     }
 }
-
