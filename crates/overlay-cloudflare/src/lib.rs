@@ -2017,19 +2017,12 @@ async fn queue_handler(
             crate::queue::ReadStep::OverProof { fault } => {
                 // lane INTAKE-BOUND: the body was not parsed; classed by the engine's rule for a walk that could not
                 // run (`replay_error_class`: not now), retried, then parked under #576's bounds.
-                let e = crate::queue::over_proof_error(&fault);
-                worker::console_log!("Queue: the body was not read ({e}) — retrying; it parks by the engine's class");
+                let (note, class) = crate::queue::over_proof_failing(&fault);
+                worker::console_log!("Queue: the body was not read ({note}) — retrying; it parks by the engine's class");
                 if let Some(db) = &counters {
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_REPLAY_OVER_PROOF, 1).await;
                     crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1).await;
-                    crate::dead_letters::note_failing(
-                        db,
-                        body,
-                        None,
-                        &format!("failed: {e}"),
-                        crate::queue::replay_error_class(&e),
-                    )
-                    .await;
+                    crate::dead_letters::note_failing(db, body, None, &note, class).await;
                 }
                 msg.retry();
                 continue;

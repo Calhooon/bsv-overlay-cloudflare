@@ -786,6 +786,9 @@ async fn put_at_rest(
     legs_from: usize,
     delay_secs: Option<u32>,
 ) -> Result<String, String> {
+    // The gated arm never puts at rest bytes past the Worker's proof limb (the fold's M1): the route's entry stops
+    // such a body before this arm runs, so this is a belt, unreachable from the route.
+    crate::queue::gated_bytes_within_the_limb(&tagged.beef)?;
     let db = env
         .d1("OVERLAY_DB")
         .map_err(|e| format!("OVERLAY_DB: {e}"))?;
