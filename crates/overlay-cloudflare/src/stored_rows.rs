@@ -1646,7 +1646,7 @@ mod self_test {
     /// without the gated mark carrying it are NAMED (`OVER-PROOF ..
     /// kind=over_proof`), counted apart (`over_proof` 2), never a refusal: the
     /// verdict stays clean. A letter WITH the gated mark is read through (the
-    /// consumer takes it to the engine) and named too. RED on `69cee436` (no
+    /// consumer takes it to the engine) and named too. RED with `69cee436`'s rule grafted (no
     /// such count; the letter a refusal).
     #[test]
     fn ibf_m5_the_reader_names_bytes_past_the_proof_limb_apart() {

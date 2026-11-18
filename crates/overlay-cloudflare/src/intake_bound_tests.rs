@@ -293,7 +293,7 @@ impl crate::queue::ReplayBytes for Port {
 /// mark whose body (inline, or a keyed object) is past the limb is `OverProof`
 /// before its parse, and the consumer notes it `not_now` (`over_proof_failing`,
 /// the one function its arm calls); a message WITH the mark is read through to
-/// the engine (which goes on under `NetworkAccepted`). RED on `69cee436` (the
+/// the engine (which goes on under `NetworkAccepted`). RED with `69cee436`'s rule grafted (the
 /// marked message stopped), with the mark not read, and with the arm's class
 /// `Fault`.
 #[test]
