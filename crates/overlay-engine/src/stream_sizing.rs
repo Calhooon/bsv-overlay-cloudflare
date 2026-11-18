@@ -374,7 +374,7 @@ impl std::fmt::Display for ProofLimbStop {
         write!(
             f,
             "the body's merkle paths carry more than {} nodes (the proof limb; counted {} by the \
-             BUMP at byte {}): nothing of it was read; present the same transactions with merkle \
+             BUMP at byte {}): nothing of the body past the count was read; present the same transactions with merkle \
              paths that carry only the nodes they need, or, where every node is needed, the subject \
              proven after its block (it then carries one path) or fewer proven parents spent by one \
              transaction",

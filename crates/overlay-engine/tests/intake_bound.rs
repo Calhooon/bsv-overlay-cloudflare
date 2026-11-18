@@ -463,6 +463,16 @@ fn ib_b_every_submit_stops_one_past_the_limb_and_admits_at_it() {
                         .contains("the same bytes are stopped at any time"),
                     "{door}: {e}"
                 );
+                // INTAKE-BOUND-FOLD-2 (the delta review's L6): the engine's
+                // words say what this submit did, never what happened to the
+                // bytes elsewhere.
+                let words = e.to_string();
+                assert!(
+                    words.contains("this submit read nothing of the body past the count"),
+                    "{door}: {e}"
+                );
+                assert!(!words.contains("nothing was broadcast"), "{door}: {e}");
+                assert!(!words.contains("broadcaster"), "{door}: {e}");
             }
             Err(e) => panic!("{door}: the network's accept goes on past the limb: {e}"),
             Ok(()) if door.contains("NetworkAccepted") => {}
@@ -1170,4 +1180,58 @@ fn ibf_h1_every_caller_of_the_limb_reads_the_stream_next() {
         let calls = prod.matches(".proof_limb(").count();
         assert_eq!(calls, listed, "{file}: every call of the limb is listed");
     }
+}
+
+/// INTAKE-BOUND-FOLD-2 (the delta review's L4): a FINALIZE with no graph kept
+/// by the anchor check (`compute_ordered_beefs` builds its own assembly)
+/// reads node proofs under the engine's CONFIGURED limb. Under a limb raised
+/// to twice the default, a root proven by a path two nodes past the default
+/// is finalized (one BEEF in the sink), never held; under the default the
+/// same finalize holds it. RED with `GraphAssembly::default()` at the
+/// finalize's assembly (the delta review's D11).
+#[test]
+fn ibf2_l4_the_finalize_without_the_anchor_reads_the_configured_limb() {
+    let _g = one_at_a_time();
+    block_on(async {
+        let store = MemoryStorage::new();
+        let manager = AdmitZero;
+        let raised = DoorBudget {
+            max_proof_nodes: 2 * LINK_ANCESTRY_PROOF_NODES_MAX,
+            ..DoorBudget::DEFAULT
+        };
+        let root_tx = prove_wide(coin(31), LINK_ANCESTRY_PROOF_NODES_MAX + 2);
+        assert!(nodes_of(&root_tx) > LINK_ANCESTRY_PROOF_NODES_MAX);
+        assert!(nodes_of(&root_tx) <= raised.max_proof_nodes);
+        let graph = format!("{}.0", root_tx.id());
+        let node = GASPNode {
+            graph_id: graph.clone(),
+            raw_tx: root_tx.to_hex(),
+            output_index: 0,
+            proof: root_tx.merkle_path.as_ref().map(MerklePath::to_hex),
+            tx_metadata: None,
+            output_metadata: None,
+            inputs: None,
+        };
+        for (budget, finalized) in [(raised, true), (DoorBudget::DEFAULT, false)] {
+            let sink = new_finalized_graph_sink();
+            let g = OverlayGASPStorage::new(&store, TOPIC, sink.clone())
+                .with_topic_manager(&manager)
+                .with_walk_budget(budget);
+            g.append_to_graph(&node, None).await.unwrap();
+            let r = g.finalize_graph(&graph).await;
+            if finalized {
+                r.unwrap_or_else(|e| panic!("finalized under the raised limb, not held: {e:?}"));
+                assert_eq!(sink.lock().unwrap().len(), 1);
+                assert_eq!(sink.lock().unwrap()[0].beefs.len(), 1);
+            } else {
+                match r {
+                    Err(GASPError::AnchorWalkHeld(why)) => {
+                        assert!(why.contains("over_proof"), "{why}");
+                    }
+                    other => panic!("held under the default: {other:?}"),
+                }
+                assert!(sink.lock().unwrap().is_empty());
+            }
+        }
+    });
 }
