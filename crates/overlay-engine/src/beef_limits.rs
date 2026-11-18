@@ -266,7 +266,6 @@ pub fn parse_beef(bytes: &[u8], _door: &BeefLimits) -> bsv_rs::Result<Beef> {
     Beef::from_binary(bytes)
 }
 
-
 /// The subject a read names: the explicit txid, then the atomic txid, then,
 /// for a read that names none, the house's ONE subject rule
 /// ([`crate::subject::subject_txid_of`]: the unique tip, else the reference's
