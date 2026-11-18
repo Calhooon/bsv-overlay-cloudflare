@@ -2,6 +2,9 @@
 # The secrets door before a push (scripts/check-secrets.py): every blob a pushed commit adds or modifies is judged
 # for credential shapes and for the values the operator's vault folder holds ($OVERLAY_VAULT_DIR, else ~/vault),
 # read at run time. A finding refuses the push, named by commit, path, line and rule, the value withheld.
-# Installed by `make hooks` (git config core.hooksPath scripts/hooks).
+# `make hooks` NO LONGER points at this file: it installs scripts/hooks/pre-push.common in the clone's common hooks
+# folder and unsets core.hooksPath. This file stays so a clone that still has core.hooksPath = scripts/hooks (what
+# `make hooks` once set) keeps a door until its operator runs the new `make hooks`; in a worktree whose tree predates
+# this file that old setting runs no hook at all.
 root=$(git rev-parse --show-toplevel) || exit 1
 exec python3 "$root/scripts/check-secrets.py" --pre-push "$@"
