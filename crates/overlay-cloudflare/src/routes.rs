@@ -50,10 +50,24 @@ pub(crate) fn engine_error_status(e: &EngineError) -> u16 {
         EngineError::ScriptWalkOverBudget { .. } => 400,
         // The submit's own walk could not run within the budget and nothing on
         // record stands in for it (bsv-low #592, the E592 lens fold): not now,
-        // never a refusal. The doors answer it with `walk_not_now`.
+        // never a refusal. The doors answer it with `walk_not_now`. The PROOF
+        // limb's stop is no "not now" (the same bytes are stopped at any
+        // time): 413 (the fold's ruling 4, [`PROOF_LIMB_STATUS`]).
+        EngineError::WalkCouldNotRun(stop) if stop.limb.same_bytes_will_fail() => {
+            PROOF_LIMB_STATUS
+        }
         EngineError::WalkCouldNotRun(_) => 503,
     }
 }
+
+/// The status of the PROOF LIMB's stop at every Worker door (the route's entry on both arms, `/admin/readmit`, the
+/// ungated engine stop; lane INTAKE-BOUND-FOLD, ruling 4): 413, never 503. The same bytes are stopped at any time.
+/// A reader of the status alone that follows HTTP's classes reads it as final ([`crate::ef_deferred::settle`]:
+/// `Done`, so a deferred job settles). The house's client today classes every status but 400 and 422 as "retry"
+/// (bsv-low `app/src/lib/overlay.ts:637-641`, `classifySubmitStatus`, read at `9504d448`), so it re-presents the same bytes on its ladder, each
+/// costing this host one frame read up to the stop and nothing parsed, and fires its own direct broadcast once; the
+/// final word for a client is the body's `sameBytesWillFail` (INTAKE-BOUND-FOLD-2, the delta review's L2).
+pub const PROOF_LIMB_STATUS: u16 = 413;
 
 /// The word of a "not now" for a walk past the engine's budget (the E592 lens fold).
 pub const WALK_NOT_NOW_CODE: &str = "walk-could-not-run";
@@ -65,6 +79,9 @@ pub const WALK_NOT_NOW_RETRY_AFTER_S: u32 = 600;
 /// the transaction. The way out: present the subject PROVEN (a proven transaction is not walked), so an honest body
 /// too big to walk unmined lands after its block. A client retries after the block, not at once.
 pub fn walk_not_now_body(stop: &overlay_engine::engine::WalkCouldNotRun) -> serde_json::Value {
+    if stop.limb.same_bytes_will_fail() {
+        return proof_limb_body(stop);
+    }
     serde_json::json!({
         "status": "error",
         "code": WALK_NOT_NOW_CODE,
@@ -80,8 +97,90 @@ pub fn walk_not_now_body(stop: &overlay_engine::engine::WalkCouldNotRun) -> serd
     })
 }
 
+/// PURE: the body of the PROOF LIMB's stop (lane INTAKE-BOUND): the body's merkle paths carry more nodes than the
+/// budget's proof limb, counted from the frame before anything was parsed. The same code as every walk that could
+/// not run, but NOT retryable: no block lifts it, so the same bytes are stopped at any time (`sameBytesWillFail`),
+/// answered [`PROOF_LIMB_STATUS`] with no `Retry-After`. The remedy in `stop.what` (the stop's own words) holds for
+/// every body that reaches it: the same transactions with merkle paths that carry only the nodes they need; where
+/// every node is needed, the subject proven after its block (it then carries one path) or fewer proven parents
+/// spent by one transaction. The message says what THIS request did (it broadcast, admitted and queued nothing),
+/// never what happened to the same bytes elsewhere, then the Worker's own advice (INTAKE-BOUND-FOLD-2, the delta
+/// review's L1 and L6).
+pub fn proof_limb_body(stop: &overlay_engine::engine::WalkCouldNotRun) -> serde_json::Value {
+    proof_limb_body_of(stop, false)
+}
+
+/// The sentence a deferred job's RESUMED run adds when an earlier run of the same job already posted its subject
+/// ([`crate::ef_deferred::WorkBudget::resumed_mid_walk`]: NL-6d's corroboration runs after the arm's first POST):
+/// such a job was put at rest before the proof limb was in force, and its next run meets the entry's stop.
+pub const PROOF_LIMB_EARLIER_RUN_WORDS: &str =
+    "an earlier run of this job posted its subject before this bound was in force; this host has not admitted it";
+
+/// PURE: [`proof_limb_body`], and for a deferred job's resumed run whose earlier run already posted its subject
+/// (`earlier_run_posted`), the sentence [`PROOF_LIMB_EARLIER_RUN_WORDS`] before the Worker's advice.
+pub fn proof_limb_body_of(
+    stop: &overlay_engine::engine::WalkCouldNotRun,
+    earlier_run_posted: bool,
+) -> serde_json::Value {
+    let earlier = if earlier_run_posted {
+        format!("; {PROOF_LIMB_EARLIER_RUN_WORDS}")
+    } else {
+        String::new()
+    };
+    serde_json::json!({
+        "status": "error",
+        "code": WALK_NOT_NOW_CODE,
+        "limb": stop.limb.as_str(),
+        "retryable": false,
+        "sameBytesWillFail": true,
+        "message": format!(
+            "the body was not read: {}; this request broadcast, admitted and queued nothing{earlier}; a sender who \
+             needs this body broadcast takes it to a broadcaster",
+            stop.what
+        ),
+    })
+}
+
+/// The `/submit` route's own proof-limb stop, at its entry on BOTH arms, before the census, the gated arm's first
+/// parse (`ef::missing_source_txids`), the EF conversion, the door and the engine (lane INTAKE-BOUND). `None` when
+/// the limb holds the body. The deferred EF job's run passes the same entry.
+pub(crate) fn intake_proof_stop(beef: &[u8]) -> Option<overlay_engine::engine::WalkCouldNotRun> {
+    crate::WORKER_WALK_BUDGET
+        .proof_limb(beef)
+        .err()
+        .map(|stop| overlay_engine::engine::WalkCouldNotRun::over_proof(&stop))
+}
+
+/// PURE: the route's entry decision (the fold's M3, the one function `submit_parts` calls): a caller the operator
+/// check refuses is answered by that refusal first (it reads no body), so this reads no limb for it; every other
+/// action reads the proof limb over the body ([`intake_proof_stop`]).
+pub(crate) fn intake_proof_answer(
+    action: &crate::submit_gate::SubmitAction,
+    beef: &[u8],
+) -> Option<overlay_engine::engine::WalkCouldNotRun> {
+    if matches!(
+        action,
+        crate::submit_gate::SubmitAction::RefuseUnauthenticated(_)
+    ) {
+        return None;
+    }
+    intake_proof_stop(beef)
+}
+
+/// PURE: the status a walk that could not run is answered: [`PROOF_LIMB_STATUS`] for the proof limb, 503 (with
+/// `Retry-After`) for every limb a block lifts.
+#[must_use]
+pub fn walk_could_not_run_status(stop: &overlay_engine::engine::WalkCouldNotRun) -> u16 {
+    if stop.limb.same_bytes_will_fail() {
+        PROOF_LIMB_STATUS
+    } else {
+        503
+    }
+}
+
 /// The door's answer for [`walk_not_now_body`] at `door`: counted (into the request's batch when `counters` is
-/// given, else `ops::note_engine_walk_not_now`), its detail line logged on both arms, 503 with `Retry-After`.
+/// given, else `ops::note_engine_walk_not_now`), its detail line logged on both arms, 503 with `Retry-After` (the
+/// proof limb: [`PROOF_LIMB_STATUS`], no `Retry-After`).
 /// Nothing was written and nothing is queued: the same unproven bytes would breach again.
 async fn walk_not_now(
     env: &worker::Env,
@@ -95,14 +194,17 @@ async fn walk_not_now(
     } else if let Ok(db) = env.d1("OVERLAY_DB") {
         crate::ops::note_engine_walk_not_now(&db, stop, door).await;
     }
+    let status = walk_could_not_run_status(stop);
     worker::console_log!(
-        "{door} -> 503 (walk-could-not-run, {}; not now)",
+        "{door} -> {status} (walk-could-not-run, {})",
         stop.limb.as_str()
     );
-    let mut resp = json_response(&walk_not_now_body(stop), 503)?;
-    let _ = resp
-        .headers_mut()
-        .set("Retry-After", &WALK_NOT_NOW_RETRY_AFTER_S.to_string());
+    let mut resp = json_response(&walk_not_now_body(stop), status)?;
+    if !stop.limb.same_bytes_will_fail() {
+        let _ = resp
+            .headers_mut()
+            .set("Retry-After", &WALK_NOT_NOW_RETRY_AFTER_S.to_string());
+    }
     Ok(resp)
 }
 
@@ -1117,6 +1219,25 @@ async fn submit_parts(
         admit_policy,
     );
     let mode = action.engine_mode();
+    // ── THE PROOF LIMB at the route's entry (lane INTAKE-BOUND) ──
+    // Before ANY parse of the body on either arm: the ungated census, the gated arm's
+    // `ef::missing_source_txids`, the subject's log line, the EF conversion, the door's stream and the engine's
+    // own parses each compute every merkle path's root again. Read from the frame alone; this request broadcasts,
+    // admits and queues nothing (a deferred job's resumed run past its first leg says an earlier run posted its
+    // subject: `budget.resumed_mid_walk()`). NEW on the gated arm: for its two other limbs it goes on and the network judges; for this
+    // limb going on IS the cost. A refusal of the operator check above answers first (it reads no body).
+    if let Some(stop) = intake_proof_answer(&action, &tagged_beef.beef) {
+        counters.reason(SubmitReason::WalkOverProof);
+        counters.bump(crate::ops::COUNTER_SUBMIT_INTAKE_OVER_PROOF, 1);
+        worker::console_log!(
+            "POST /submit -> {PROOF_LIMB_STATUS} (walk-could-not-run, over_proof at intake; the body was not read): {}",
+            stop.what
+        );
+        return json_response(
+            &proof_limb_body_of(&stop, budget.resumed_mid_walk()),
+            PROOF_LIMB_STATUS,
+        );
+    }
     // ── #371 SEEN corroboration flag — the UNGATED arm's latch feed. ──
     // Read from the SAME `action` value the exhaustive match below consumes
     // (no second derivation, no local a later edit can shadow into a gate —
@@ -2165,7 +2286,7 @@ async fn submit_parts(
         Ok(v) => v,
         // E592 fold: a walk past the budget is NOT NOW (nothing written or queued), counted
         Err(EngineError::WalkCouldNotRun(stop)) => {
-            counters.reason(SubmitReason::WalkCouldNotRun);
+            counters.reason(SubmitReason::engine(&EngineError::WalkCouldNotRun(stop.clone())));
             return walk_not_now(env, &stop, "POST /submit", Some(counters)).await;
         }
         Err(e) => {

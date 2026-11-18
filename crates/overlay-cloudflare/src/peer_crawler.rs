@@ -171,11 +171,15 @@ async fn crawl_one(
 
 pub(crate) const COUNTER_CRAWL_EXPIRED_REFUSED: &str = "crawl_expired_refused_total";
 
-fn expired_answer(entry: &OutputEntry, topic: &str, now: u64) -> Result<u64, String> {
+pub(crate) fn expired_answer(entry: &OutputEntry, topic: &str, now: u64) -> Result<u64, String> {
     if topic != "tm_uhrp" {
         return Ok(0);
     }
     use overlay_engine::topic_manager::TopicManager;
+    // A peer's answer past the proof limb is not read (lane INTAKE-BOUND): the engine's submit stops it after.
+    if let Err(stop) = crate::WORKER_WALK_BUDGET.proof_limb(&entry.beef) {
+        return Err(format!("crawl BEEF not read: {stop}"));
+    }
     let tx = overlay_engine::beef_limits::subject_from_beef(
         &entry.beef,
         None,

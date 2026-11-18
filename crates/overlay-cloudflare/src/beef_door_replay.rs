@@ -289,7 +289,11 @@ mod twin {
     }
 
     impl queue::ReplayBytes for Ports<'_> {
-        async fn read_beef(&self, r: &queue::BeefRef) -> Result<Vec<u8>, queue::BlobFault> {
+        async fn read_beef(
+            &self,
+            r: &queue::BeefRef,
+            _limbed: bool,
+        ) -> Result<Vec<u8>, queue::BlobFault> {
             let bytes = self
                 .bucket
                 .get(&r.key)
@@ -379,6 +383,10 @@ mod twin {
             let bytes = match step {
                 queue::ReadStep::Bytes(b) => b,
                 queue::ReadStep::Acked(v) => return Delivered::Acked(v),
+                queue::ReadStep::OverProof { fault } => {
+                    self.note(m, None, &fault, Some(dead_letters::LetterClass::NotNow));
+                    return Delivered::Fault(fault);
+                }
                 queue::ReadStep::Fault { fault, missing } => {
                     let class = (!missing).then_some(dead_letters::LetterClass::Fault);
                     self.note(m, None, &fault, class);
@@ -672,9 +680,13 @@ mod twin {
         let q = code(include_str!("queue.rs"));
         let start = q.find("pub async fn enqueue_replay(").unwrap();
         let f = &q[start..start + q[start..].find("\n}\n").unwrap()];
-        // the E592 fold: the producer plans the marked or unmarked message (`plan_replay` is the unmarked one)
-        assert!(f.contains(
-            "plan_replay_gated(beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room, gated)"
+        // the E592 fold: the producer plans the marked or unmarked message (`plan_replay` is the unmarked one);
+        // INTAKE-BOUND-FOLD-2: through the pure `plan_enqueue`, which reads the proof limb for a marked one.
+        assert!(f.contains("let carriage = plan_enqueue(beef, topics, mode, room, gated)?;"));
+        let plan = &q[q.find("pub(crate) fn plan_enqueue(").unwrap()..start];
+        let plan: String = plan.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(plan.contains(
+            "plan_replay_gated( beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room, gated, ))"
         ));
         assert!(!f.contains("max_bytes") && !q.contains("too large for the mutation queue"));
         assert!(include_str!("routes.rs").contains(r#"h.set("X-Overlay-Mutation", "queued")"#));
@@ -961,7 +973,11 @@ mod twin {
     fn e585_d3f2_l3_an_unlanded_missing_object_is_a_fault_never_an_ack() {
         struct Fixed(Result<Vec<u8>, queue::BlobFault>, queue::MissingVerdict);
         impl queue::ReplayBytes for Fixed {
-            async fn read_beef(&self, _: &queue::BeefRef) -> Result<Vec<u8>, queue::BlobFault> {
+            async fn read_beef(
+                &self,
+                _: &queue::BeefRef,
+                _: bool,
+            ) -> Result<Vec<u8>, queue::BlobFault> {
                 self.0.clone()
             }
             async fn judge_missing(
@@ -1393,7 +1409,11 @@ mod e592 {
         assert!(tail.contains(
             "return walk_not_now(env, &stop, \"POST /submit\", Some(counters)).await;"
         ));
-        assert!(tail.contains("counters.reason(SubmitReason::WalkCouldNotRun);"));
+        // lane INTAKE-BOUND-FOLD: the reason is the engine's error's (`walk_could_not_run`, or `walk_over_proof` for
+        // the proof limb)
+        assert!(tail.contains(
+            "counters.reason(SubmitReason::engine(&EngineError::WalkCouldNotRun(stop.clone())));"
+        ));
         assert!(
             tail.contains("crate::ops::note_engine_walk(&db, &mutation_report, \"POST /submit\")")
         );

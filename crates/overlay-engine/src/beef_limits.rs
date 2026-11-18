@@ -116,10 +116,10 @@ pub const COURIER_PROOF_MAX_BYTES: usize = (8 * 1024 - 2) / 2;
 /// the same wire bound, and it stays.
 pub const PUSH_PROOF_MAX_BYTES: usize = COURIER_PROOF_MAX_BYTES;
 /// A name only since NL-6: a proof read back from a store is read whatever
-/// its length ([`proof_from_hex`]).
+/// its length ([`stored_proof_from_hex`]).
 pub const STORED_PROOF_MAX_BYTES: usize = COURIER_PROOF_MAX_BYTES;
 /// A name only since NL-6: a GASP peer's proof field is read whatever its
-/// length ([`proof_from_hex`]).
+/// length, under the proof limb ([`proof_from_hex_under`]).
 pub const PEER_PROOF_MAX_BYTES: usize = COURIER_PROOF_MAX_BYTES;
 
 /// What one pass of the door learned of a BEEF it accepted.
@@ -339,6 +339,28 @@ pub const LINK_CHARGE_WIRE_BYTE: u64 = 4;
 pub const LINK_CHARGE_BUMP_LEAF: u64 = 128;
 /// A level-0 leaf's charge in the link's BUMP index ([`LINK_CHARGE_TX`]).
 pub const LINK_CHARGE_INDEX_LEAF: u64 = 64;
+
+/// The most BUMP nodes an ancestry [`link_heap_estimate`] admits can carry,
+/// and the default of the door's PROOF limb
+/// (`DoorBudget::max_proof_nodes`, lane INTAKE-BOUND).
+///
+/// The derivation, from the estimate as it stands: every BUMP a source of the
+/// subject's ancestry carries is charged in `beyond` at
+/// [`LINK_CHARGE_BUMP_LEAF`] a node (every level) TWICE, once for the
+/// source's full link and once for its memo stub (a shared BUMP once more for
+/// each further source it proves, and each repeated stub once more), beside
+/// the sources' own weight; `beyond` is bounded by [`LINK_HEAP_MAX_BYTES`]. So
+/// an ancestry the estimate admits carries fewer than
+/// `LINK_HEAP_MAX_BYTES / (2 * LINK_CHARGE_BUMP_LEAF)` nodes in all (65,536):
+/// a body carrying more in its ancestry is declined at the link today, after
+/// it was parsed. The level-0 index charge ([`LINK_CHARGE_INDEX_LEAF`]) is
+/// the estimate's `linear` part, which no bound reads, so it does not enter.
+///
+/// What the figure does NOT cover, stated: a PROVEN subject's own BUMP (its
+/// link walks no ancestry; the estimate counts it as linear and bsv-rs's heap
+/// meter bounds its clone), and BUMPs no source of the ancestry uses. Both
+/// are now bounded by the proof limb at the frame.
+pub const LINK_ANCESTRY_PROOF_NODES_MAX: u64 = LINK_HEAP_MAX_BYTES / (2 * LINK_CHARGE_BUMP_LEAF);
 
 /// The heap figure handed to bsv-rs's own heap meter ([`engine_link_limits`];
 /// bsv-rs 0.8.12, GHSA-33fm-jcm5-4m3m: `BeefLinkLimits::max_link_heap_bytes`),
@@ -621,18 +643,70 @@ pub fn own_bump(bytes: &[u8], txid: &str) -> Option<MerklePath> {
 }
 
 /// A courier's or a push's proof field: the wire bound is checked on the hex
-/// before the decode, then the proof is parsed. The bound is the field's
-/// (see [`COURIER_PROOF_MAX_BYTES`]), not a verdict on a BEEF.
+/// before the decode, then the proof is read as a stranger's
+/// ([`proof_from_hex`]). The bound is the field's (see
+/// [`COURIER_PROOF_MAX_BYTES`]), not a verdict on a BEEF. Under that bound a
+/// path holds fewer than 2,048 nodes (two bytes a node at the least), far
+/// under the proof limb, and the frame read refuses only bytes bsv-rs refuses:
+/// so for every field under the bound the answer is `main`'s (the reads of
+/// stored fields through this function included).
 pub fn merkle_path_from_hex(hex: &str, max_bytes: usize) -> bsv_rs::Result<MerklePath> {
     check_size(hex.len(), max_bytes.saturating_mul(2), "merkle proof hex")?;
     proof_from_hex(hex)
 }
 
-/// A proof read back from a store or handed by a GASP peer: read whatever its
-/// length, refused only if the bytes do not parse.
+/// A proof a STRANGER supplied (a GASP peer's node proof, a deferred graph's
+/// record of one, a courier's or a push's field through
+/// [`merkle_path_from_hex`]), read under the proof limb's default
+/// ([`LINK_ANCESTRY_PROOF_NODES_MAX`]): [`proof_from_hex_under`].
 pub fn proof_from_hex(hex: &str) -> bsv_rs::Result<MerklePath> {
+    proof_from_hex_under(hex, LINK_ANCESTRY_PROOF_NODES_MAX)
+}
+
+/// The words of a path the frame read does not follow ([`proof_from_hex_under`]).
+pub const PROOF_NOT_FOLLOWED_WORDS: &str =
+    "not read: not a merkle path this host's frame read follows";
+
+/// A stranger's proof field under a proof limb of `max_proof_nodes` (lane
+/// INTAKE-BOUND; the fold's H1). Its nodes are counted from the path's frame
+/// before its root is computed (`stream_sizing::path_proof_limb`, which reads
+/// a leaf's flag byte as bsv-rs's `MerklePath::from_reader` reads it):
+///
+/// - past the limb: `Err(BeefResourceLimit)` with the stop's words
+///   ([`is_proof_limb`]), nothing parsed;
+/// - bytes the frame read does not follow to the path's end: refused
+///   unparsed, `Err(BeefError)` ([`PROOF_NOT_FOLLOWED_WORDS`]), a parse
+///   refusal and never the limb's stop. bsv-rs refuses every such byte
+///   string too (the frame read follows its path grammar; the pin
+///   `ibf_h1_the_frame_read_never_counts_fewer_nodes_than_the_sdk`), so no
+///   bytes bsv-rs would parse are refused here: only the words differ;
+/// - otherwise bsv-rs's parse, as on `main`.
+pub fn proof_from_hex_under(hex: &str, max_proof_nodes: u64) -> bsv_rs::Result<MerklePath> {
+    let bytes = bsv_rs::primitives::from_hex(hex)?;
+    match crate::stream_sizing::path_proof_limb(&bytes, max_proof_nodes) {
+        Err(stop) => Err(bsv_rs::Error::BeefResourceLimit(stop.to_string())),
+        Ok(frame) if !frame.read => Err(bsv_rs::Error::BeefError(
+            PROOF_NOT_FOLLOWED_WORDS.to_string(),
+        )),
+        Ok(_) => MerklePath::from_binary(&bytes),
+    }
+}
+
+/// A proof THIS SERVICE stored (the reorg sweep's reads of a stored own bump,
+/// a verified proof the ladder handed back, the stored-rows reader's stored
+/// bodies): read whatever its length, refused only if the bytes do not parse,
+/// exactly as on `main`. The proof limb is for bytes a stranger supplied
+/// (the fold's M2): a limb stop here would turn "could not read" into a
+/// verdict on this service's own row.
+pub fn stored_proof_from_hex(hex: &str) -> bsv_rs::Result<MerklePath> {
     let bytes = bsv_rs::primitives::from_hex(hex)?;
     MerklePath::from_binary(&bytes)
+}
+
+/// Whether `e` is the proof limb's stop of [`proof_from_hex`] (a path past
+/// [`LINK_ANCESTRY_PROOF_NODES_MAX`], not parsed), never a parse fault.
+pub fn is_proof_limb(e: &bsv_rs::Error) -> bool {
+    matches!(e, bsv_rs::Error::BeefResourceLimit(why) if why.contains(crate::stream_sizing::PROOF_LIMB_WORDS))
 }
 
 /// Always `false` since NL-6: no door of this module refuses by a limit, so

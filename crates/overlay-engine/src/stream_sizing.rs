@@ -55,6 +55,19 @@ pub struct StreamCharges {
 }
 
 impl StreamCharges {
+    /// Nothing charged: the proof limb's read counts nodes alone.
+    pub const NOTHING: StreamCharges = StreamCharges {
+        kept_tx: 0,
+        kept_input: 0,
+        kept_output: 0,
+        kept_proven: 0,
+        kept_pre_genesis_proven: 0,
+        tx_byte: 0,
+        tx_input: 0,
+        tx_output: 0,
+        bump_leaf: 0,
+    };
+
     /// The stream's own element and nothing kept: what `BeefStream` holds
     /// while it builds and hands out one element.
     ///
@@ -135,6 +148,10 @@ pub fn estimate(body: &[u8], charges: &StreamCharges, limit: u64) -> StreamEstim
         kept: 0,
         largest: 0,
         over_at: None,
+        proof_nodes: 0,
+        proof_limit: u64::MAX,
+        proof_over_at: None,
+        sdk_flags: false,
     };
     let followed = sizer.frame().is_some();
     StreamEstimate {
@@ -152,6 +169,22 @@ struct Sizer<'a> {
     /// The heaviest element in hand so far.
     largest: u64,
     over_at: Option<usize>,
+    /// The BUMP nodes counted so far, every BUMP, every level (the proof
+    /// limb, [`proof_limb`]).
+    proof_nodes: u64,
+    /// The most nodes the reader may count before it stops.
+    proof_limit: u64,
+    /// The BUMP whose node took the count past `proof_limit`.
+    proof_over_at: Option<usize>,
+    /// Read a BUMP leaf's flag byte as bsv-rs's path reader reads it
+    /// (`MerklePath::from_reader`: bit 0 a duplicate with no hash, any other
+    /// byte a 32-byte hash, the other bits ignored), not as the streaming
+    /// reader does (0, 1 or 2, every other byte refused). The proof limb's
+    /// reads ([`proof_limb`], [`path_proof_limb`]) take it, so they count
+    /// every node any bsv-rs reader of the bytes would parse (lane
+    /// INTAKE-BOUND-FOLD, H1); the memory estimate keeps the stream's rule
+    /// (its frame is the stream's).
+    sdk_flags: bool,
 }
 
 impl Sizer<'_> {
@@ -217,15 +250,32 @@ impl Sizer<'_> {
         for level in 0..levels {
             for _ in 0..self.f.varint()? {
                 self.f.varint()?;
-                let hashed = match *self.f.take(1)?.first()? {
-                    1 => false,
-                    0 | 2 => {
+                let flag = *self.f.take(1)?.first()?;
+                let hashed = if self.sdk_flags {
+                    // bsv-rs 0.8.13 `merkle_path.rs:278-296`: `flags & 1` a
+                    // duplicate, else a hash, whatever the other bits.
+                    if flag & 1 != 0 {
+                        false
+                    } else {
                         self.f.take(32)?;
                         true
                     }
-                    _ => return None,
+                } else {
+                    match flag {
+                        1 => false,
+                        0 | 2 => {
+                            self.f.take(32)?;
+                            true
+                        }
+                        _ => return None,
+                    }
                 };
                 leaves += 1;
+                self.proof_nodes += 1;
+                if self.proof_nodes > self.proof_limit {
+                    self.proof_over_at = Some(at);
+                    return None;
+                }
                 if level == 0 && hashed {
                     self.kept = self.kept.saturating_add(self.charges.kept_proven);
                     if old {
@@ -276,4 +326,154 @@ impl Sizer<'_> {
             .saturating_add(outputs.saturating_mul(c.tx_output));
         self.in_hand(at, bytes)
     }
+}
+
+/// What the proof limb read of a frame ([`proof_limb`]): how many BUMPs and
+/// BUMP nodes it carries, every BUMP and every level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProofFrame {
+    /// The BUMP nodes the frame carries (a leaf at any level, hashed or
+    /// not), all of them when `read`.
+    pub nodes: u64,
+    /// The frame was followed to its end. `false`: the bytes are not a frame
+    /// this read follows, and `nodes` is what came before. For a BEEF every
+    /// BUMP precedes the first transaction and the BUMPs are read by bsv-rs's
+    /// own path grammar here, so `nodes` already counts every node any bsv-rs
+    /// reader of the bytes (the stream, `Beef::from_binary`,
+    /// `Transaction::from_beef`) parses before it reaches the transactions:
+    /// `false` there only says the transactions' frame was not followed, and
+    /// every production caller's next read is the house's stream-first parse,
+    /// which refuses such bytes (the pin
+    /// `e585f_l3_the_sizing_follows_every_frame_the_stream_reads`; the
+    /// callers' pin `ibf_h1_every_caller_of_the_limb_reads_the_stream_next`).
+    /// For one path ([`path_proof_limb`]) `false` is a refusal.
+    pub read: bool,
+}
+
+/// A body whose merkle paths carry more nodes than the proof limb allows
+/// ([`proof_limb`]): nothing of it was parsed, hashed or allocated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofLimbStop {
+    /// The nodes counted when the read stopped: one past `bound`.
+    pub nodes: u64,
+    /// The limb (`DoorBudget::max_proof_nodes`).
+    pub bound: u64,
+    /// The offset in the body of the BUMP whose node took the count past
+    /// the limb.
+    pub at: usize,
+    /// The BRC-95 subject the frame's atomic prefix names, display hex, when
+    /// it has one (read from the prefix's 32 bytes, nothing parsed).
+    pub subject: Option<String>,
+}
+
+/// The words every proof-limb stop carries ([`ProofLimbStop`]'s display).
+pub const PROOF_LIMB_WORDS: &str = "nodes (the proof limb;";
+
+impl std::fmt::Display for ProofLimbStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the body's merkle paths carry more than {} nodes (the proof limb; counted {} by the \
+             BUMP at byte {}): nothing of the body past the count was read; present the same transactions with merkle \
+             paths that carry only the nodes they need, or, where every node is needed, the subject \
+             proven after its block (it then carries one path) or fewer proven parents spent by one \
+             transaction",
+            self.bound, self.nodes, self.at
+        )
+    }
+}
+
+/// THE PROOF LIMB, read from the frame (lane INTAKE-BOUND): the BUMP nodes a
+/// BEEF carries, every BUMP and every level, counted by the same hash-free
+/// walk of the frame [`estimate`] makes, against `max_proof_nodes`.
+///
+/// A merkle path proves that one transaction is in one block with about one
+/// node a level of the block's tree; a compound path (BRC-74) for several
+/// transactions of a block needs at most that for each. A node beyond what
+/// the body's transactions need proves nothing in the body, and the SDK's
+/// parse of a path computes its root (a hash a node), so the cost of reading
+/// a body follows its node count. This read stops at the node that takes the
+/// count past the limb: no varint past it is read, nothing is hashed, nothing
+/// is allocated (the pin `ib_a_the_stop_holds_nothing`), and it is O(the frame
+/// bytes up to there).
+///
+/// `Ok` with the frame's count when the limb holds it (and for bytes the
+/// sizing read does not follow as a frame: the caller's parse refuses those);
+/// `Err` when it does not. One function for every door that reads a body
+/// (`DoorBudget::proof_limb`); what a door answers on the stop is its own.
+pub fn proof_limb(body: &[u8], max_proof_nodes: u64) -> Result<ProofFrame, ProofLimbStop> {
+    let mut sizer = Sizer {
+        f: Fields { raw: body, at: 0 },
+        charges: &StreamCharges::NOTHING,
+        limit: u64::MAX,
+        kept: 0,
+        largest: 0,
+        over_at: None,
+        proof_nodes: 0,
+        proof_limit: max_proof_nodes,
+        proof_over_at: None,
+        sdk_flags: true,
+    };
+    let followed = sizer.frame().is_some();
+    match sizer.proof_over_at {
+        Some(at) => Err(ProofLimbStop {
+            nodes: sizer.proof_nodes,
+            bound: max_proof_nodes,
+            at,
+            subject: atomic_subject(body),
+        }),
+        None => Ok(ProofFrame {
+            nodes: sizer.proof_nodes,
+            read: followed,
+        }),
+    }
+}
+
+/// [`proof_limb`] over ONE merkle path's bytes (BRC-74, a proof field of a
+/// courier, a push or a GASP peer): its node count, or the stop. `read`:
+/// the path was followed to its end, its leaves' flag bytes read as bsv-rs's
+/// path reader reads them, its varints canonical (as bsv-rs reads them). Bytes
+/// it does NOT follow are not a merkle path this host reads: the caller
+/// refuses them unparsed (`beef_limits::proof_from_hex_under`), never hands
+/// them to bsv-rs (lane INTAKE-BOUND-FOLD, H1: a reader that pays must never
+/// count more nodes than this one did). Trailing bytes after a whole path are
+/// not read here, nor by bsv-rs's `MerklePath::from_binary`.
+pub fn path_proof_limb(path: &[u8], max_proof_nodes: u64) -> Result<ProofFrame, ProofLimbStop> {
+    let mut sizer = Sizer {
+        f: Fields { raw: path, at: 0 },
+        charges: &StreamCharges::NOTHING,
+        limit: u64::MAX,
+        kept: 0,
+        largest: 0,
+        over_at: None,
+        proof_nodes: 0,
+        proof_limit: max_proof_nodes,
+        proof_over_at: None,
+        sdk_flags: true,
+    };
+    let followed = sizer.bump().is_some();
+    match sizer.proof_over_at {
+        Some(at) => Err(ProofLimbStop {
+            nodes: sizer.proof_nodes,
+            bound: max_proof_nodes,
+            at,
+            subject: None,
+        }),
+        None => Ok(ProofFrame {
+            nodes: sizer.proof_nodes,
+            read: followed,
+        }),
+    }
+}
+
+/// The subject a BRC-95 atomic prefix names, display hex, read from its 32
+/// bytes without a parse.
+fn atomic_subject(body: &[u8]) -> Option<String> {
+    let word = u32::from_le_bytes(body.get(..4)?.try_into().ok()?);
+    if word != ATOMIC_BEEF {
+        return None;
+    }
+    let mut id = body.get(4..36)?.to_vec();
+    id.reverse();
+    Some(bsv_rs::primitives::to_hex(&id))
 }

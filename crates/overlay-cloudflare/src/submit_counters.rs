@@ -22,6 +22,7 @@ reasons! {
     Evicted => "evicted",
     ScriptRefused => "script_refused",
     WalkCouldNotRun => "walk_could_not_run",
+    WalkOverProof => "walk_over_proof",
     TerminalAbsent => "terminal_judged_absent",
     TerminalPresent => "terminal_judged_present",
     TerminalRace => "terminal_judged_race",
@@ -58,6 +59,9 @@ impl Reason {
         use overlay_engine::engine::EngineError;
         match error {
             EngineError::ScriptVerificationFailed { .. } => Self::ScriptRefused,
+            EngineError::WalkCouldNotRun(stop) if stop.limb.same_bytes_will_fail() => {
+                Self::WalkOverProof
+            }
             EngineError::WalkCouldNotRun(_) => Self::WalkCouldNotRun,
             EngineError::BeefParseError(_) => Self::InvalidBeef,
             EngineError::SpvError(_) => Self::InvalidProof,
@@ -103,7 +107,7 @@ pub(crate) fn counter_names(status: u16, reason: Reason) -> [String; 2] {
 }
 
 pub(crate) fn all_names() -> Vec<String> {
-    [200, 202, 400, 401, 422, 500, 502, 503]
+    [200, 202, 400, 401, 413, 422, 500, 502, 503]
         .into_iter()
         .map(|status| format!("submit_answer_{status}_total"))
         .chain(

@@ -617,6 +617,16 @@ pub struct DoorBudget {
     /// that input runs and released after it. An input is run only while the
     /// frame's estimate plus its own charge is within this limb.
     pub max_memory_bytes: u64,
+    /// THE PROOF LIMB (lane INTAKE-BOUND): the most BUMP nodes, every BUMP
+    /// and every level, a body's frame may carry before anything of it is
+    /// parsed, hashed or allocated ([`crate::stream_sizing::proof_limb`],
+    /// [`DoorBudget::proof_limb`]). The SDK's parse of a merkle path computes
+    /// its root, a hash a node, so a body's parse costs CPU in its node count;
+    /// every door that reads a body reads this limb first. Default:
+    /// [`crate::beef_limits::LINK_ANCESTRY_PROOF_NODES_MAX`], the most nodes
+    /// an ancestry the engine's link estimate admits can carry, so no ancestry
+    /// linked today is stopped by it.
+    pub max_proof_nodes: u64,
 }
 
 impl DoorBudget {
@@ -701,7 +711,24 @@ impl DoorBudget {
         max_work_bytes: 64 * 1024 * 1024,
         sig_check_floor: 64 * 1024,
         max_memory_bytes: 48 * 1024 * 1024,
+        max_proof_nodes: crate::beef_limits::LINK_ANCESTRY_PROOF_NODES_MAX,
     };
+
+    /// The proof limb over `body` ([`crate::stream_sizing::proof_limb`] at
+    /// [`DoorBudget::max_proof_nodes`]): the frame's count, or the stop.
+    pub fn proof_limb(
+        &self,
+        body: &[u8],
+    ) -> Result<crate::stream_sizing::ProofFrame, crate::stream_sizing::ProofLimbStop> {
+        crate::stream_sizing::proof_limb(body, self.max_proof_nodes)
+    }
+
+    /// A stranger's merkle path field read under this budget's proof limb
+    /// ([`crate::beef_limits::proof_from_hex_under`]): the GASP walk's and
+    /// the anchor assembly's read of a peer's node proof (the fold's N1).
+    pub fn proof_from_hex(&self, hex: &str) -> bsv_rs::Result<bsv_rs::transaction::MerklePath> {
+        crate::beef_limits::proof_from_hex_under(hex, self.max_proof_nodes)
+    }
 }
 
 /// Which limb of the [`DoorBudget`] a walk went past.
@@ -719,6 +746,10 @@ pub enum DoorLimb {
     /// coin proven below the Genesis height whose spend is not one both eras
     /// judge alike. A decline, never a refusal: the network judges.
     Era,
+    /// The proof limb ([`DoorBudget::max_proof_nodes`], lane INTAKE-BOUND):
+    /// the body's merkle paths carry more nodes than the limb, read from the
+    /// frame before anything was parsed. Nothing was read.
+    Proof,
 }
 
 /// What [`Engine::run_validation`] answers: the topics' validations, the
@@ -756,6 +787,25 @@ pub enum WalkLimb {
     /// `WalkBreachPolicy::NetworkAccepted` the submit goes on with its subject
     /// unlinked and reports it.
     OverLink,
+    /// The proof limb ([`DoorBudget::max_proof_nodes`], lane INTAKE-BOUND):
+    /// the body's merkle paths carry more nodes than the limb, counted from
+    /// the frame before anything was parsed. Under `WalkBreachPolicy::NotNow`
+    /// the submit stops in EVERY mode, `historical-tx-no-spv` included: the
+    /// engine cannot know its caller, and going on would pay exactly what the
+    /// limb bounds (every read of the body computes each path's root). The
+    /// limb is configuration: a consumer that trusts its caller raises
+    /// `max_proof_nodes`, or names `WalkBreachPolicy::NetworkAccepted`, under
+    /// which the submit goes on past this limb as past every other one,
+    /// reported (`MutationReport::walk_could_not_run`, its walk not run).
+    /// Unlike the other limbs the same bytes are stopped at any time: the
+    /// sender's remedy is the same transactions with merkle paths that carry
+    /// only the nodes they need, or, for a body all of whose nodes are
+    /// needed, the subject presented proven after its block (it then carries
+    /// one path) or fewer proven parents spent by one transaction. The
+    /// stop's words say what this submit did (it read nothing of the body
+    /// past the count, asked no manager, wrote nothing), never what happened
+    /// to the same bytes elsewhere, which the engine does not know.
+    OverProof,
 }
 
 impl WalkLimb {
@@ -767,6 +817,7 @@ impl WalkLimb {
             WalkLimb::OverWork | WalkLimb::InterpreterMemory => DoorLimb::Work,
             WalkLimb::OverMemory | WalkLimb::OverLink => DoorLimb::Memory,
             WalkLimb::CoinEra => DoorLimb::Era,
+            WalkLimb::OverProof => DoorLimb::Proof,
         }
     }
 
@@ -779,6 +830,31 @@ impl WalkLimb {
             WalkLimb::InterpreterMemory => "interpreter_memory",
             WalkLimb::OverLink => "over_link",
             WalkLimb::CoinEra => "coin_era",
+            WalkLimb::OverProof => "over_proof",
+        }
+    }
+
+    /// Whether the same bytes are stopped at any later time (the proof limb
+    /// alone): no block makes them pass, so a client must not retry them.
+    #[must_use]
+    pub fn same_bytes_will_fail(self) -> bool {
+        matches!(self, WalkLimb::OverProof)
+    }
+}
+
+impl WalkCouldNotRun {
+    /// The proof limb's stop as a submit's "could not run" (lane
+    /// INTAKE-BOUND): the subject the atomic prefix names, else empty
+    /// (nothing of the body was parsed to find it).
+    #[must_use]
+    pub fn over_proof(stop: &crate::stream_sizing::ProofLimbStop) -> Self {
+        let txid = stop.subject.clone().unwrap_or_default();
+        WalkCouldNotRun {
+            subject_txid: txid.clone(),
+            at_txid: txid,
+            subject_judged: false,
+            limb: WalkLimb::OverProof,
+            what: stop.to_string(),
         }
     }
 }
@@ -3315,7 +3391,19 @@ impl Engine {
                     DoorLimb::Era => WalkLimb::CoinEra,
                     DoorLimb::Work if trace.interpreter_tripped => WalkLimb::InterpreterMemory,
                     DoorLimb::Work => WalkLimb::OverWork,
+                    DoorLimb::Proof => WalkLimb::OverProof,
                 };
+                if limb == WalkLimb::OverProof {
+                    // Nothing was read: no root to check (its check parses
+                    // the body the limb kept unread).
+                    return Ok(Some(WalkCouldNotRun {
+                        subject_txid: subject_txid.to_string(),
+                        at_txid,
+                        subject_judged,
+                        limb,
+                        what,
+                    }));
+                }
                 // THE ROOTS OF A BREACHED WALK (the E592 lens fold, H1): every
                 // proven transaction it reached, and every proven source an
                 // input read, whatever the scripts' verdict. A bad root is
@@ -3667,6 +3755,23 @@ impl Engine {
             }
         }
 
+        // THE PROOF LIMB, from the frame, before anything of the body is
+        // parsed (lane INTAKE-BOUND): every parse below (this one, the link,
+        // the predecessor question's, a landing's, the walk's stream) computes
+        // each merkle path's root again. Under `NotNow` the submit stops here
+        // in every mode (`WalkLimb::OverProof`). Under `NetworkAccepted` (the
+        // network's accept of these very bytes is on record) the trip is
+        // reported and the submit goes on as past every other limb (the
+        // fold's M1), its walk not run.
+        let mut proof_stop = None;
+        if let Err(stop) = self.walk_budget.proof_limb(&tagged_beef.beef) {
+            let stop = WalkCouldNotRun::over_proof(&stop);
+            match policy {
+                WalkBreachPolicy::NotNow => return Err(EngineError::WalkCouldNotRun(stop)),
+                WalkBreachPolicy::NetworkAccepted => proof_stop = Some(stop),
+            }
+        }
+
         // Parse the SUBJECT from the BEEF — order-independent (`subject.rs`,
         // loop-2 hardening 2026-09-05): `from_beef(_, None)` takes the last
         // tx in wire order, which an SDK-sorted INCOMPLETE ancestry fills
@@ -3733,8 +3838,18 @@ impl Engine {
         // E592 lens fold, H1, [`WalkBreachPolicy`]): "not now" before any
         // manager is asked, or, under `NetworkAccepted`, this submit goes on
         // as under `HistoricalTxNoSpv` and the report says so.
-        let mut could_not_run = None;
-        if mode != SubmitMode::HistoricalTxNoSpv {
+        // A proof trip names the subject the parse found (the atomic prefix
+        // may name none) and is the submit's stop: the walk is not run. The
+        // `could_not_run.is_none()` guard below is not pinned alone: the
+        // walk's own first read (`verify_spv_trusting`) is the same limb under
+        // the same budget, so removing the guard answers the same stop (the
+        // delta review's N1, an equivalent mutant).
+        let mut could_not_run = proof_stop.map(|mut stop| {
+            stop.subject_txid.clone_from(&txid);
+            stop.at_txid.clone_from(&txid);
+            stop
+        });
+        if could_not_run.is_none() && mode != SubmitMode::HistoricalTxNoSpv {
             match walked {
                 Some(walked) if walked.contains(&txid) => {}
                 trusted => {
@@ -6708,6 +6823,21 @@ async fn verify_spv_trusting(
     trusted: &HashSet<String>,
     budget: DoorBudget,
 ) -> Result<Option<WalkCouldNotRun>, EngineError> {
+    // The proof limb before either check parses the body (lane INTAKE-BOUND).
+    // Reached past the limb by the GASP anchor's MERGED root (its root BEEF
+    // passed the limb, then the sources this service holds were merged into
+    // it) and by a direct call; the structural check (`verify_scripts`
+    // false) parses the body when a tracker is held, the walk reads the limb
+    // itself. Pinned by
+    // `ibf_m3_the_spv_check_reads_the_limb_before_its_structural_parse`.
+    if let Err(stop) = budget.proof_limb(beef_bytes) {
+        let mut stop = WalkCouldNotRun::over_proof(&stop);
+        if stop.subject_txid.is_empty() {
+            stop.subject_txid = subject_txid.to_string();
+            stop.at_txid = subject_txid.to_string();
+        }
+        return Ok(Some(stop));
+    }
     if verify_scripts {
         Engine::verify_beef_linear(chain_tracker, beef_bytes, subject_txid, trusted, budget).await
     } else {
@@ -7044,6 +7174,8 @@ fn parse_lookup_advertisement(
     protocol: &[u8],
     scope: &str,
 ) -> Option<String> {
+    // A tracker's answer past the proof limb's default is not read (lane INTAKE-BOUND).
+    DoorBudget::DEFAULT.proof_limb(&output.beef).ok()?;
     let tx =
         beef_limits::subject_from_beef(&output.beef, None, &beef_limits::PEER_BEEF_LIMITS).ok()?;
     let script = tx
@@ -7202,16 +7334,37 @@ pub enum EngineError {
     /// PROVEN: a proven transaction is not walked, so an honest body too
     /// big to walk unmined lands once its block is mined (a client retries
     /// after the block, not at once).
-    #[error(
-        "the script walk could not run within the budget ({}: {}); not now: present the subject proven, after its block",
-        .0.limb.as_str(),
-        .0.what
-    )]
+    #[error("{}", walk_could_not_run_words(.0))]
     WalkCouldNotRun(WalkCouldNotRun),
 
     /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
+}
+
+/// The words of [`EngineError::WalkCouldNotRun`]: "not now, after the block"
+/// for every limb a block lifts, and for the proof limb (which no block
+/// lifts) what THIS submit did and the remedy true for every body (the
+/// stop's own words, `stop.what`). They say nothing of what happened to the
+/// bytes elsewhere (whether they were broadcast, queued or written by
+/// another call): the engine does not know, and every caller reads them, the
+/// queue consumer's note of a message that WAS queued and a library caller
+/// that broadcast first included (INTAKE-BOUND-FOLD-2, the delta review's
+/// L6).
+fn walk_could_not_run_words(stop: &WalkCouldNotRun) -> String {
+    if stop.limb.same_bytes_will_fail() {
+        format!(
+            "the body could not be read within the budget ({}: {}); this submit read nothing of the body past the count, asked no topic manager and wrote nothing; the same bytes are stopped at any time",
+            stop.limb.as_str(),
+            stop.what
+        )
+    } else {
+        format!(
+            "the script walk could not run within the budget ({}: {}); not now: present the subject proven, after its block",
+            stop.limb.as_str(),
+            stop.what
+        )
+    }
 }
 
 impl From<StorageError> for EngineError {
@@ -14295,6 +14448,136 @@ mod tests {
             );
             assert_eq!(verdict, Ok(()), "{what}");
         }
+    }
+    /// M3 (the fold's ruling 6): the SPV check's own read of the proof limb
+    /// is reached by a body past the budget (in production the GASP anchor's
+    /// root after the sources this service holds were merged into it; here a
+    /// direct call), and neither check is run: `Ok(Some(OverProof))`, the
+    /// structural one (`verify_scripts` false, which parses the body when a
+    /// tracker is held) included. RED with the read removed (`Ok(None)`).
+    #[test]
+    fn ibf_m3_the_spv_check_reads_the_limb_before_its_structural_parse() {
+        use bsv_rs::transaction::{Beef, MerklePath, MerklePathLeaf, TransactionInput};
+        let mut tx = Transaction::new();
+        tx.inputs
+            .push(TransactionInput::new(format!("{:064x}", 1), 0));
+        tx.outputs.push(bsv_rs::transaction::TransactionOutput::new(
+            1,
+            bsv_rs::script::LockingScript::from_script(
+                bsv_rs::script::Script::from_binary(&[0x51]).unwrap(),
+            ),
+        ));
+        let mut level = vec![MerklePathLeaf::new_txid(0, tx.id())];
+        for offset in 1..64u64 {
+            level.push(MerklePathLeaf::new(offset, format!("{offset:064x}")));
+        }
+        let mut path = vec![level];
+        for _ in 0..5 {
+            path.push(Vec::new());
+        }
+        let mp = MerklePath::new(900_000, path).unwrap();
+        let mut beef = Beef::new();
+        let bi = beef.merge_bump(mp);
+        beef.merge_raw_tx(tx.to_binary(), Some(bi));
+        let body = beef.to_binary();
+        let small = DoorBudget {
+            max_proof_nodes: 32,
+            ..DoorBudget::DEFAULT
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for scripts in [false, true] {
+            let verdict = rt
+                .block_on(verify_spv_like_the_reference(
+                    None,
+                    scripts,
+                    &body,
+                    &tx.id(),
+                    small,
+                ))
+                .unwrap_or_else(|e| panic!("scripts {scripts}: {e}"));
+            assert_eq!(
+                verdict.map(|stop| stop.limb),
+                Some(WalkLimb::OverProof),
+                "scripts {scripts}"
+            );
+        }
+        // Under the default the same body is checked as before.
+        let verdict = rt
+            .block_on(verify_spv_like_the_reference(
+                None,
+                false,
+                &body,
+                &tx.id(),
+                DoorBudget::DEFAULT,
+            ))
+            .unwrap();
+        assert_eq!(verdict, None);
+    }
+    /// M3: the engine's SHIP/SLAP discovery read of a tracker's answer
+    /// (`parse_lookup_advertisement`, the fixed default: it holds no budget)
+    /// reads no answer past the proof limb: a VALID advert whose subject is
+    /// proven by a BUMP of 65,538 nodes names no host; proven by one of two
+    /// nodes it names its host. RED with the read made inert (the host named).
+    #[test]
+    fn ibf_m3_the_ship_discovery_reads_no_answer_past_the_limb() {
+        use bsv_rs::transaction::{Beef, MerklePath, MerklePathLeaf, TransactionInput};
+        let advert = |level0: u64| {
+            let mut tx = Transaction::new();
+            tx.inputs
+                .push(TransactionInput::new(format!("{:064x}", 2), 0));
+            tx.outputs.push(bsv_rs::transaction::TransactionOutput::new(
+                1,
+                bsv_rs::script::LockingScript::from_script(
+                    bsv_rs::script::Script::from_binary(&build_ship_pushdrop_script(
+                        "https://past.example",
+                        "tm_intake",
+                    ))
+                    .unwrap(),
+                ),
+            ));
+            let mut level = vec![MerklePathLeaf::new_txid(0, tx.id())];
+            for offset in 1..level0 {
+                level.push(MerklePathLeaf::new(offset, format!("{offset:064x}")));
+            }
+            let mut path = vec![level];
+            let mut width = level0;
+            while width > 1 {
+                width = width.div_ceil(2);
+                let mut row = Vec::new();
+                if width > 1 && width % 2 == 1 {
+                    row.push(MerklePathLeaf {
+                        offset: width,
+                        hash: None,
+                        txid: false,
+                        duplicate: true,
+                    });
+                }
+                path.push(row);
+            }
+            if path.len() > 1 {
+                path.pop();
+            }
+            let mut beef = Beef::new();
+            let bi = beef.merge_bump(MerklePath::new(900_000, path).unwrap());
+            beef.merge_raw_tx(tx.to_binary(), Some(bi));
+            OutputListItem {
+                beef: beef.to_binary(),
+                output_index: 0,
+                context: None,
+            }
+        };
+        let past = advert(crate::beef_limits::LINK_ANCESTRY_PROOF_NODES_MAX + 2);
+        assert!(DoorBudget::DEFAULT.proof_limb(&past.beef).is_err());
+        assert_eq!(
+            parse_lookup_advertisement(&past, b"SHIP", "tm_intake"),
+            None
+        );
+        assert_eq!(
+            parse_lookup_advertisement(&advert(2), b"SHIP", "tm_intake").as_deref(),
+            Some("https://past.example")
+        );
     }
     include!("minutes_tests.rs");
     include!("memo_tests.rs");

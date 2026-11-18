@@ -3912,8 +3912,8 @@ mod tests {
             .collect();
         assert_eq!(
             calls.len(),
-            6,
-            "bad base64, no subject, two ledger faults, not durable, failed"
+            7,
+            "bad base64, over the proof limb (lane INTAKE-BOUND), no subject, two ledger faults, not durable, failed"
         );
         let of_report =
             "crate::dead_letters::LetterClass::of_sites(report.faults.iter().map(|f| f.site))";
@@ -3922,6 +3922,10 @@ mod tests {
             if c.contains(of_report) {
                 assert!(c.contains("\"not durable: {}\""), "{c}");
                 by_report += 1;
+            } else if c.trim() == "db, body, None, &note, class)" {
+                // lane INTAKE-BOUND-FOLD: the proof limb's arm notes by the one function (`over_proof_failing`: the
+                // engine's class, `not_now`), run by `intake_bound_tests`
+                assert!(src.contains("let (note, class) = crate::queue::over_proof_failing(&fault);"));
             } else if c.contains("crate::queue::replay_error_class(&e)") {
                 // the E592 lens fold: an engine error is classed by `replay_error_class` (a walk past the budget is
                 // `not_now`, any other a `fault`)

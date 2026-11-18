@@ -90,7 +90,15 @@
 //! could not be read at all (`UNREAD`: an R2 object not in the directory, a
 //! record's part missing), then a `SUMMARY` line and a `VERDICT` line. THE RUN
 //! FAILS on any refusal AND on any `UNREAD` row ([`Summary::verdict`]): a row
-//! the reader could not read is not a row it read clean.
+//! the reader could not read is not a row it read clean. It FAILS too on the
+//! two classes a first deploy of the proof limb (or a lower one) would strand
+//! (INTAKE-BOUND-FOLD-2, the delta review's L1): a deferred EF job past the
+//! limb whose earlier run already posted its subject (`legs_from` past 0;
+//! `OVER-PROOF .. legs_from=N`), and a parked letter past the limb WITHOUT
+//! the gated mark (`OVER-PROOF .. letter=unmarked`); each is settled,
+//! re-driven or discarded on the build that still reads it before such a
+//! deploy. Every other `kind=over_proof` row is counted apart and never the
+//! run's failure.
 //!
 //! Inputs, named by `STORED_ROWS_INPUT` (comma-separated paths):
 //! - `*.sql`: `wrangler d1 export <db> --remote --output <file>.sql`, loaded
@@ -141,6 +149,19 @@ pub(crate) struct Summary {
     pub differs: u64,
     /// PORT-0811: the raw-transaction columns read.
     pub raw_txs: u64,
+    /// Lane INTAKE-BOUND-FOLD (M5): the stored BEEFs (a stored own bump with
+    /// them), parked letters, keyed objects, deferred EF jobs and deferred
+    /// graph node proofs whose bytes are past the Worker's proof limb
+    /// (`OVER-PROOF .. kind=over_proof` lines). Counted apart: never a
+    /// refusal, never the run's failure; a count before a deploy.
+    pub over_proof: u64,
+    /// INTAKE-BOUND-FOLD-2 (L1): deferred EF jobs past the proof limb whose
+    /// earlier run already posted their subject (`legs_from` past 0). The run
+    /// FAILS on any.
+    pub over_proof_posted_jobs: u64,
+    /// INTAKE-BOUND-FOLD-2 (L1): parked letters past the proof limb WITHOUT
+    /// the gated mark. The run FAILS on any.
+    pub over_proof_unmarked_letters: u64,
     pub census: std::collections::BTreeMap<&'static str, u64>,
     /// Every line printed, in order.
     pub lines: Vec<String>,
@@ -157,6 +178,21 @@ impl Summary {
         let offset = offset.map_or_else(|| "-".to_string(), |o| o.to_string());
         self.line(format!(
             "REFUSED table={table} key={key} offset={offset} kind={kind} detail={detail}"
+        ));
+    }
+
+    /// Bytes past the Worker's proof limb, named (lane INTAKE-BOUND-FOLD, M5).
+    fn over_proof(&mut self, table: &str, key: &str, detail: &str) {
+        self.over_proof_noted(table, key, "", detail);
+    }
+
+    /// [`Self::over_proof`] with what the row's class needs beside it (`note`:
+    /// ` legs_from=N` for a deferred job, ` letter=marked|unmarked` for a
+    /// parked letter; INTAKE-BOUND-FOLD-2, L1).
+    fn over_proof_noted(&mut self, table: &str, key: &str, note: &str, detail: &str) {
+        self.over_proof += 1;
+        self.line(format!(
+            "OVER-PROOF table={table} key={key} kind=over_proof{note} detail={detail}"
         ));
     }
 
@@ -228,7 +264,7 @@ impl Summary {
             let _ = write!(census, " {verdict}:{n}");
         }
         format!(
-            "SUMMARY rows={} beefs={} raw_txs={} bytes={} refusals={} unread={} differs={} over_memory={} largest_body={} ({}) largest_estimate={} ({}) deferred_records={} deferred_nodes={} census=[{}]",
+            "SUMMARY rows={} beefs={} raw_txs={} bytes={} refusals={} unread={} differs={} over_memory={} over_proof={} over_proof_posted_jobs={} over_proof_unmarked_letters={} largest_body={} ({}) largest_estimate={} ({}) deferred_records={} deferred_nodes={} census=[{}]",
             self.rows,
             self.beefs,
             self.raw_txs,
@@ -237,6 +273,9 @@ impl Summary {
             self.unread,
             self.differs,
             self.over_memory,
+            self.over_proof,
+            self.over_proof_posted_jobs,
+            self.over_proof_unmarked_letters,
             self.largest_body.0,
             self.largest_body.1,
             self.largest_estimate.0,
@@ -247,15 +286,25 @@ impl Summary {
         )
     }
 
-    /// THE RUN'S VERDICT: clean only with no refusal AND no unread row.
+    /// THE RUN'S VERDICT: clean only with no refusal, no unread row, and
+    /// neither class a deploy of the proof limb would strand (a deferred job
+    /// past it whose earlier run posted its subject, an unmarked letter past
+    /// it; INTAKE-BOUND-FOLD-2, L1).
     pub(crate) fn verdict(&self) -> Result<(), String> {
-        if self.refusals == 0 && self.unread == 0 {
+        if self.refusals == 0
+            && self.unread == 0
+            && self.over_proof_posted_jobs == 0
+            && self.over_proof_unmarked_letters == 0
+        {
             Ok(())
         } else {
             Err(format!(
-                "{} refused and {} unread rows: {}",
+                "{} refused and {} unread rows, {} deferred jobs past the proof limb whose earlier run posted their \
+                 subject, {} unmarked letters past the proof limb: {}",
                 self.refusals,
                 self.unread,
+                self.over_proof_posted_jobs,
+                self.over_proof_unmarked_letters,
                 self.summary_line()
             ))
         }
@@ -264,6 +313,18 @@ impl Summary {
     /// One BEEF through the door, the sizing read and, for a stored row, the
     /// table's own reader of its txid. `false` when the door refused it.
     fn read_beef(&mut self, table: &str, key: &str, bytes: &[u8], txid: Option<&str>) -> bool {
+        self.read_beef_noted(table, key, bytes, txid, "")
+    }
+
+    /// [`Self::read_beef`], its `OVER-PROOF` line carrying `note`.
+    fn read_beef_noted(
+        &mut self,
+        table: &str,
+        key: &str,
+        bytes: &[u8],
+        txid: Option<&str>,
+        note: &str,
+    ) -> bool {
         self.beefs += 1;
         let len = bytes.len() as u64;
         self.bytes += len;
@@ -286,6 +347,11 @@ impl Summary {
                 est.bytes,
                 submit_census::CENSUS_MEMORY_BYTES
             ));
+        }
+        // The Worker's proof limb, named apart (the fold's M5): the stored
+        // readers read such a row as on `main`, so the read goes on.
+        if let Err(stop) = crate::WORKER_WALK_BUDGET.proof_limb(bytes) {
+            self.over_proof_noted(table, key, note, &stop.to_string());
         }
         if let Err(refusal) = beef_limits::read_beef(bytes) {
             self.refused(
@@ -474,13 +540,13 @@ fn load_json(db: &Connection, table: &str, json: &str) -> Result<(), String> {
 struct DirBytes<'a>(Option<&'a Path>);
 
 impl ReplayBytes for DirBytes<'_> {
-    async fn read_beef(&self, r: &BeefRef) -> Result<Vec<u8>, BlobFault> {
+    async fn read_beef(&self, r: &BeefRef, limbed: bool) -> Result<Vec<u8>, BlobFault> {
         let got = self.0.and_then(|dir| {
             std::fs::read(dir.join(&r.key))
                 .or_else(|_| std::fs::read(dir.join(r.key.replace('/', "_"))))
                 .ok()
         });
-        queue::replay_object(r, got)
+        queue::replay_object(r, got, limbed)
     }
 
     async fn judge_missing(&self, _topics: &[String], _r: &BeefRef) -> MissingVerdict {
@@ -694,6 +760,14 @@ pub(crate) fn read_export(inputs: &[PathBuf], r2_dir: Option<&Path>) -> Result<S
                 s.refused(table, &key, None, "read_for_replay", &fault);
                 continue;
             }
+            ReadStep::OverProof { fault } => {
+                // lane INTAKE-BOUND: a parked letter (without the gated mark) the consumer would not read: named.
+                // INTAKE-BOUND-FOLD-2 (L1): a class a deploy of the limb strands (its replay, which may finish a
+                // partly written first submit, is stopped at every re-drive): counted by name, and the run fails.
+                s.over_proof_noted(table, &key, " letter=unmarked", &fault);
+                s.over_proof_unmarked_letters += 1;
+                continue;
+            }
             ReadStep::Acked(verdict) => {
                 // `DirBytes` judges no missing object: never reached.
                 s.unread += 1;
@@ -701,7 +775,14 @@ pub(crate) fn read_export(inputs: &[PathBuf], r2_dir: Option<&Path>) -> Result<S
                 continue;
             }
         };
-        if s.read_beef(table, &key, &bytes, None) {
+        // A marked letter is read through (the consumer goes on under `NetworkAccepted`): named, never the run's
+        // failure.
+        let note = if body.gated {
+            " letter=marked"
+        } else {
+            " letter=unmarked"
+        };
+        if s.read_beef_noted(table, &key, &bytes, None, note) {
             let verdict = submit_census::census_verdict(&bytes).as_str();
             *s.census.entry(verdict).or_default() += 1;
             // The replay's link, by the engine's subject rule (PORT-0811).
@@ -815,7 +896,17 @@ pub(crate) fn read_export(inputs: &[PathBuf], r2_dir: Option<&Path>) -> Result<S
             }
         };
         let subject = Some(job.subject_txid.as_str()).filter(|t| !t.is_empty());
-        if s.read_beef(table, &reference, &submission.beef, subject) {
+        // INTAKE-BOUND-FOLD-2 (L1): a job past the limb prints its `legs_from`; one past 0 (an earlier run posted its
+        // subject) is a class a deploy of the limb strands: counted by name, and the run fails.
+        // The read's own limb names it (`over_proof` moves): the reader makes one call of the limb per body.
+        let legs_from = job.legs_from as u64;
+        let note = format!(" legs_from={legs_from}");
+        let named_before = s.over_proof;
+        let read = s.read_beef_noted(table, &reference, &submission.beef, subject, &note);
+        if legs_from > 0 && s.over_proof > named_before {
+            s.over_proof_posted_jobs += 1;
+        }
+        if read {
             // The gated arm's own conversion: the run's EF batch.
             if let Err(e) = crate::ef::beef_to_ef_batch(&submission.beef) {
                 s.refused(table, &reference, None, "ef_batch", &e.to_string());
@@ -930,8 +1021,14 @@ pub(crate) fn read_export(inputs: &[PathBuf], r2_dir: Option<&Path>) -> Result<S
                 s.refused(table, &node_key, None, "rawTx", &e.to_string());
             }
             if let Some(proof) = &walked.node.proof {
-                if let Err(e) = beef_limits::proof_from_hex(proof) {
-                    s.refused(table, &node_key, None, "proof", &e.to_string());
+                // A peer's proof at rest: read as the resume reads it (under the
+                // Worker's limb); past it, named apart (the fold's M5).
+                match crate::WORKER_WALK_BUDGET.proof_from_hex(proof) {
+                    Err(e) if beef_limits::is_proof_limb(&e) => {
+                        s.over_proof(table, &node_key, &e.to_string());
+                    }
+                    Err(e) => s.refused(table, &node_key, None, "proof", &e.to_string()),
+                    Ok(_) => {}
                 }
             }
         }
@@ -1606,6 +1703,205 @@ mod self_test {
         assert!(
             !reader_source().contains("fn blob("),
             "no reader of its own typing"
+        );
+    }
+
+    /// A VALID BEEF past the Worker's proof limb (a proven transaction whose
+    /// own BUMP carries 65,538 nodes) and its txid.
+    fn wide_beef() -> (Vec<u8>, String) {
+        use bsv_rs::transaction::{MerklePath, MerklePathLeaf, Transaction};
+        let mut tx = Transaction::new();
+        tx.inputs.push(bsv_rs::transaction::TransactionInput::new(
+            "aa".repeat(32),
+            0,
+        ));
+        tx.outputs.push(bsv_rs::transaction::TransactionOutput::new(
+            1,
+            bsv_rs::script::LockingScript::from_script(
+                bsv_rs::script::Script::from_binary(&[0x51]).unwrap(),
+            ),
+        ));
+        let level0 = beef_limits::LINK_ANCESTRY_PROOF_NODES_MAX + 2;
+        let mut level = vec![MerklePathLeaf::new_txid(0, tx.id())];
+        for offset in 1..level0 {
+            level.push(MerklePathLeaf::new(offset, format!("{offset:064x}")));
+        }
+        let mut path = vec![level];
+        let mut width = level0;
+        while width > 1 {
+            width = width.div_ceil(2);
+            let mut row = Vec::new();
+            if width > 1 && width % 2 == 1 {
+                row.push(MerklePathLeaf {
+                    offset: width,
+                    hash: None,
+                    txid: false,
+                    duplicate: true,
+                });
+            }
+            path.push(row);
+        }
+        path.pop();
+        tx.merkle_path = Some(MerklePath::new(900_000, path).unwrap());
+        let wide = tx.to_beef(false).unwrap();
+        assert!(crate::WORKER_WALK_BUDGET.proof_limb(&wide).is_err());
+        (wide, tx.id())
+    }
+
+    /// A parked letter of `bytes`, marked or not.
+    fn letter_row(key: &str, bytes: &[u8], gated: bool) -> String {
+        let b64 = {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            STANDARD.encode(bytes)
+        };
+        let mut m = serde_json::json!({"topics": ["tm_test"], "mode": "historical-tx",
+            "reason": queue::REPLAY_REASON_PHASE3_FAULT, "beef_b64": b64});
+        if gated {
+            m["gated"] = true.into();
+        }
+        format!(
+            "INSERT INTO \"mutation_dead_letters\" (txid, topics, message, status, first_seen_at, r2_key) VALUES({},'tm_test',{},'parked',1,NULL);\n",
+            sql_text(key),
+            sql_text(&m.to_string()),
+        )
+    }
+
+    /// The fold's M5: a stored BEEF past the Worker's proof limb (a proven
+    /// transaction whose own BUMP carries 65,538 nodes) and a parked letter
+    /// without the gated mark carrying it are NAMED (`OVER-PROOF ..
+    /// kind=over_proof`), counted apart, never a refusal. A letter WITH the
+    /// gated mark is read through (the consumer takes it to the engine) and
+    /// named too. RED with `69cee436`'s rule grafted (no such count; the
+    /// letter a refusal). Amended by INTAKE-BOUND-FOLD-2 (L1): the unmarked
+    /// letter is a class a deploy of the limb strands, so the verdict now
+    /// FAILS on it (it was clean); the stored BEEF and the marked letter stay
+    /// counted apart.
+    #[test]
+    fn ibf_m5_the_reader_names_bytes_past_the_proof_limb_apart() {
+        let (wide, txid) = wide_beef();
+        let sql = schema_sql()
+            + &format!(
+                "INSERT INTO \"transactions\" VALUES({},{},1);\n",
+                sql_text(&txid),
+                sql_blob(&wide)
+            )
+            + &letter_row("aa", &wide, false)
+            + &letter_row("bb", &wide, true);
+        let s = read_sql("over-proof", &sql, None);
+        assert_eq!(
+            (s.over_proof, s.refusals, s.unread),
+            (3, 0, 0),
+            "{:?}",
+            s.lines
+        );
+        assert_eq!(
+            (s.over_proof_posted_jobs, s.over_proof_unmarked_letters),
+            (0, 1),
+            "{:?}",
+            s.lines
+        );
+        assert!(s.verdict().is_err(), "{:?}", s.lines);
+        let named: Vec<&String> = s
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("OVER-PROOF"))
+            .collect();
+        assert!(named.iter().any(|l| l.contains(&format!(
+            "table=transactions key={txid} kind=over_proof detail="
+        ))));
+        assert!(named.iter().any(|l| l.contains(
+            "table=mutation_dead_letters key=aa[tm_test] kind=over_proof letter=unmarked"
+        )));
+        assert!(named.iter().any(|l| l.contains(
+            "table=mutation_dead_letters key=bb[tm_test] kind=over_proof letter=marked"
+        )));
+        assert!(
+            s.summary_line().contains(" over_proof=3 "),
+            "{}",
+            s.summary_line()
+        );
+    }
+
+    /// INTAKE-BOUND-FOLD-2 (the delta review's L1, the deploy rule): the two
+    /// classes a deploy of the proof limb strands make the run FAIL, each
+    /// counted by name in the `SUMMARY`; every other row past the limb is
+    /// counted apart and the run stays clean. Four rows, each a VALID BEEF
+    /// past the limb: a deferred job at `legs_from` 0 (clean), one at
+    /// `legs_from` 2 (fails), a marked letter (clean), an unmarked letter
+    /// (fails). RED with the verdict ignoring either class.
+    #[test]
+    fn ibf2_l1_the_reader_fails_on_the_two_classes_a_deploy_strands() {
+        use crate::ef_deferred::{job_reference, CHUNKS_CREATE, JOBS_ADD_LEGS_FROM, JOBS_CREATE};
+        let (wide, txid) = wide_beef();
+        let job = |topics: &str, legs_from: u64| {
+            let reference = job_reference(topics, &wide, None);
+            format!(
+                "INSERT INTO ef_deferred_jobs VALUES({},{},{},'broadcast-gated',0,{len},{len},'d1',1,1,1,'queued',0,NULL,NULL,1,1,{legs_from});\n\
+                 INSERT INTO ef_deferred_chunks VALUES({},0,{});\n",
+                sql_text(&reference),
+                sql_text(&txid),
+                sql_text(topics),
+                sql_text(&reference),
+                sql_blob(&wide),
+                len = wide.len(),
+            )
+        };
+        let base =
+            schema_sql() + &format!("{JOBS_CREATE};\n{JOBS_ADD_LEGS_FROM};\n{CHUNKS_CREATE};\n");
+        let run = |rows: &str| read_sql("strand", &(base.clone() + rows), None);
+        // Each class alone: (rows, posted jobs, unmarked letters, verdict clean)
+        let cases = [
+            (job(r#"["tm_a"]"#, 0), 0, 0, true),
+            (job(r#"["tm_b"]"#, 2), 1, 0, false),
+            (letter_row("bb", &wide, true), 0, 0, true),
+            (letter_row("aa", &wide, false), 0, 1, false),
+        ];
+        for (rows, jobs, letters, clean) in &cases {
+            let s = run(rows);
+            assert_eq!(s.over_proof, 1, "{:?}", s.lines);
+            assert_eq!((s.refusals, s.unread), (0, 0), "{:?}", s.lines);
+            assert_eq!(
+                (s.over_proof_posted_jobs, s.over_proof_unmarked_letters),
+                (*jobs, *letters),
+                "{:?}",
+                s.lines
+            );
+            assert_eq!(s.verdict().is_ok(), *clean, "{:?}", s.lines);
+        }
+        // All four: the job's line prints its `legs_from`, a letter its mark,
+        // the summary counts the two classes by name, the verdict says why.
+        let s = run(&cases.iter().map(|c| c.0.as_str()).collect::<String>());
+        let over: Vec<&String> = s
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("OVER-PROOF"))
+            .collect();
+        assert_eq!(over.len(), 4, "{over:?}");
+        for needle in [
+            "table=ef_deferred_jobs",
+            "kind=over_proof legs_from=0 ",
+            "kind=over_proof legs_from=2 ",
+            "kind=over_proof letter=marked ",
+            "kind=over_proof letter=unmarked ",
+        ] {
+            assert!(
+                over.iter().any(|l| l.contains(needle)),
+                "{needle}: {over:?}"
+            );
+        }
+        let summary = s.summary_line();
+        assert!(
+            summary
+                .contains(" over_proof=4 over_proof_posted_jobs=1 over_proof_unmarked_letters=1 "),
+            "{summary}"
+        );
+        let verdict = s.verdict().unwrap_err();
+        assert!(
+            verdict.starts_with(
+                "0 refused and 0 unread rows, 1 deferred jobs past the proof limb whose earlier run posted their \
+                 subject, 1 unmarked letters past the proof limb"
+            ),
+            "{verdict}"
         );
     }
 
