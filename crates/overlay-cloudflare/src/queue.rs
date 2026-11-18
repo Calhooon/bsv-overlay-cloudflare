@@ -121,8 +121,33 @@ pub(crate) fn decode_beef_b64(
 ) -> Result<Vec<u8>, String> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let bytes = STANDARD.decode(encoded).map_err(|e| e.to_string())?;
+    if let Some(what) = replay_proof_stop(&bytes) {
+        return Err(what);
+    }
     beef_limits::read_beef(&bytes).map_err(|refusal| refusal.to_string())?;
     Ok(bytes)
+}
+
+/// The engine's word for a replay's bytes the proof limb stopped (`WalkCouldNotRun`, limb `OverProof`), so the
+/// consumer classes it by the engine's one rule ([`replay_error_class`]).
+pub(crate) fn over_proof_error(what: &str) -> overlay_engine::engine::EngineError {
+    overlay_engine::engine::EngineError::WalkCouldNotRun(overlay_engine::engine::WalkCouldNotRun {
+        subject_txid: String::new(),
+        at_txid: String::new(),
+        subject_judged: false,
+        limb: overlay_engine::engine::WalkLimb::OverProof,
+        what: what.to_string(),
+    })
+}
+
+/// The proof limb over a replay's bytes (lane INTAKE-BOUND), before the consumer's first parse of them: the stop's
+/// words, or `None` when the limb holds them. The limb is the Worker's (`WORKER_WALK_BUDGET`), the one the route's
+/// entry read before it enqueued them, so it stops only a message written under another budget or before it.
+pub(crate) fn replay_proof_stop(bytes: &[u8]) -> Option<String> {
+    crate::WORKER_WALK_BUDGET
+        .proof_limb(bytes)
+        .err()
+        .map(|stop| stop.to_string())
 }
 
 pub(crate) fn decode_replay_beef(encoded: &str) -> Result<Vec<u8>, String> {
@@ -487,6 +512,8 @@ pub enum BlobFault {
     Read(String),
     /// The object is not the bytes the message names ([`check_blob`]), or the replay's policy refuses them.
     Refused(String),
+    /// The object's merkle paths carry more nodes than the proof limb (lane INTAKE-BOUND): not parsed.
+    OverProof(String),
 }
 
 impl BlobFault {
@@ -499,6 +526,7 @@ impl BlobFault {
             }
             Self::Read(e) => format!("the R2 read faulted ({e})"),
             Self::Refused(e) => format!("the R2 object was refused ({e})"),
+            Self::OverProof(what) => format!("the R2 object was not read ({what})"),
         }
     }
 }
@@ -631,6 +659,13 @@ pub enum ReadStep {
     /// The object is MISSING and the verdict ACKS it ([`MissingVerdict::Twin`] or [`MissingVerdict::Evicted`]):
     /// no replay, no note, nothing of the message's to delete.
     Acked(MissingVerdict),
+    /// The bytes' merkle paths carry more nodes than the proof limb (lane INTAKE-BOUND): nothing of them was
+    /// parsed. Noted as a `not_now` fault (the engine's own class for a walk that could not run) and handed back,
+    /// so it parks under #576's bounds; never an admission.
+    OverProof {
+        /// The stop's words.
+        fault: String,
+    },
     /// The replay's fault: noted and handed back. `missing`: the object was MISSING and the verdict did not show it
     /// landed; that note KEEPS the letter's class (E585-D3-L4: a missing object never promotes a "not now" letter).
     Fault {
@@ -646,6 +681,12 @@ pub enum ReadStep {
 /// object). `queue_handler` runs exactly this.
 pub(crate) async fn read_for_replay<P: ReplayBytes>(p: &P, body: &MutationMessage) -> ReadStep {
     let Some(r) = &body.r2 else {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        // The base64 first, then the proof limb, then the parse (lane INTAKE-BOUND).
+        let decoded = STANDARD.decode(&body.beef_b64);
+        if let Some(what) = decoded.as_deref().ok().and_then(replay_proof_stop) {
+            return ReadStep::OverProof { fault: what };
+        }
         return match decode_replay_beef(&body.beef_b64) {
             Ok(b) => ReadStep::Bytes(b),
             Err(e) => ReadStep::Fault {
@@ -656,6 +697,7 @@ pub(crate) async fn read_for_replay<P: ReplayBytes>(p: &P, body: &MutationMessag
     };
     match p.read_beef(r).await {
         Ok(b) => ReadStep::Bytes(b),
+        Err(BlobFault::OverProof(what)) => ReadStep::OverProof { fault: what },
         Err(f @ BlobFault::Missing(_)) => match p.judge_missing(&body.topics, r).await {
             MissingVerdict::Fault(e) => ReadStep::Fault {
                 fault: format!("{}; {e}", f.says()),
@@ -755,6 +797,11 @@ pub async fn read_beef(env: &worker::Env, r: &BeefRef) -> Result<Vec<u8>, BlobFa
 /// the replay refuses nor refuse one it accepts.
 pub(crate) fn replay_object(r: &BeefRef, got: Option<Vec<u8>>) -> Result<Vec<u8>, BlobFault> {
     let bytes = got.ok_or_else(|| BlobFault::Missing(r.key.clone()))?;
+    // The object's own check first (no parse), then the proof limb, then the parse (lane INTAKE-BOUND).
+    check_blob(r, &bytes).map_err(BlobFault::Refused)?;
+    if let Some(what) = replay_proof_stop(&bytes) {
+        return Err(BlobFault::OverProof(what));
+    }
     check_replay_blob(r, &bytes).map_err(BlobFault::Refused)?;
     Ok(bytes)
 }

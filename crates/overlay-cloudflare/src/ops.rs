@@ -108,6 +108,25 @@ pub const COUNTER_SUBMIT_ENGINE_WALK_OVER_BUDGET: &str = "submit_engine_walk_ove
 /// the budget's limb beside the body (the 1.9 MB push-only unproven parent
 /// that killed the consumer's isolate on every redelivery before #592).
 pub const COUNTER_SUBMIT_ENGINE_WALK_OVER_MEMORY: &str = "submit_engine_walk_over_memory_total";
+/// …whose body the engine did not read because its merkle paths carry more
+/// nodes than the budget's PROOF limb (`DoorBudget::max_proof_nodes`, lane
+/// INTAKE-BOUND), counted from the frame before any parse: the ungated
+/// submit, `/admin/readmit`, the queue's replay, the peer crawl. The same
+/// bytes are stopped at any time.
+pub const COUNTER_SUBMIT_ENGINE_WALK_OVER_PROOF: &str = "submit_engine_walk_over_proof_total";
+/// …whose door walk stopped at the proof limb (the gated door's own belt: the
+/// route stops such a body first, [`COUNTER_SUBMIT_INTAKE_OVER_PROOF`]).
+pub const COUNTER_SUBMIT_SCRIPT_WALK_OVER_PROOF: &str = "submit_script_walk_over_proof_total";
+/// `/submit` bodies stopped at the route's entry, on either arm, before
+/// anything of the body was parsed, because their merkle paths carry more
+/// nodes than the proof limb (lane INTAKE-BOUND): answered 503
+/// `walk-could-not-run`, limb `over_proof`, not retryable, nothing broadcast,
+/// admitted or queued. The deferred EF job's run passes the same entry.
+pub const COUNTER_SUBMIT_INTAKE_OVER_PROOF: &str = "submit_intake_over_proof_total";
+/// Queue messages whose body (inline or keyed) the consumer did not parse
+/// because its merkle paths carry more nodes than the proof limb (lane
+/// INTAKE-BOUND): the replay's `not_now` fault, never an admission.
+pub const COUNTER_QUEUE_REPLAY_OVER_PROOF: &str = "queue_replay_over_proof_total";
 
 /// The counter of an engine walk that could not run, by the limb it passed.
 pub fn engine_walk_over_counter(limb: overlay_engine::engine::WalkLimb) -> &'static str {
@@ -117,6 +136,7 @@ pub fn engine_walk_over_counter(limb: overlay_engine::engine::WalkLimb) -> &'sta
             COUNTER_SUBMIT_ENGINE_WALK_OVER_BUDGET
         }
         overlay_engine::engine::DoorLimb::Memory => COUNTER_SUBMIT_ENGINE_WALK_OVER_MEMORY,
+        overlay_engine::engine::DoorLimb::Proof => COUNTER_SUBMIT_ENGINE_WALK_OVER_PROOF,
     }
 }
 
@@ -199,6 +219,7 @@ pub fn script_walk_over_counter(limb: overlay_engine::engine::DoorLimb) -> &'sta
             COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET
         }
         overlay_engine::engine::DoorLimb::Memory => COUNTER_SUBMIT_SCRIPT_WALK_OVER_MEMORY,
+        overlay_engine::engine::DoorLimb::Proof => COUNTER_SUBMIT_SCRIPT_WALK_OVER_PROOF,
     }
 }
 /// Non-MINED `/arc-ingest` status callbacks (X-FullStatusUpdates bodies with
@@ -1696,6 +1717,11 @@ async fn read_counters(db: &D1Database) -> serde_json::Value {
     // unknown, never as fine) — added here rather than in the literal above,
     // which is at serde_json's `json!` recursion limit.
     for name in [
+        // lane INTAKE-BOUND: the proof limb at each door, served from 0
+        COUNTER_SUBMIT_ENGINE_WALK_OVER_PROOF,
+        COUNTER_SUBMIT_SCRIPT_WALK_OVER_PROOF,
+        COUNTER_SUBMIT_INTAKE_OVER_PROOF,
+        COUNTER_QUEUE_REPLAY_OVER_PROOF,
         // bsv-low #620: the chain-event feed, served from 0
         "overlay_chain_events_pass_total",
         "overlay_chain_events_total",

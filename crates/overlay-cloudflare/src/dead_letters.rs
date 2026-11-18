@@ -3912,8 +3912,8 @@ mod tests {
             .collect();
         assert_eq!(
             calls.len(),
-            6,
-            "bad base64, no subject, two ledger faults, not durable, failed"
+            7,
+            "bad base64, over the proof limb (lane INTAKE-BOUND), no subject, two ledger faults, not durable, failed"
         );
         let of_report =
             "crate::dead_letters::LetterClass::of_sites(report.faults.iter().map(|f| f.site))";

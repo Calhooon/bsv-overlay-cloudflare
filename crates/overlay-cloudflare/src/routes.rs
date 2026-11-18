@@ -65,6 +65,9 @@ pub const WALK_NOT_NOW_RETRY_AFTER_S: u32 = 600;
 /// the transaction. The way out: present the subject PROVEN (a proven transaction is not walked), so an honest body
 /// too big to walk unmined lands after its block. A client retries after the block, not at once.
 pub fn walk_not_now_body(stop: &overlay_engine::engine::WalkCouldNotRun) -> serde_json::Value {
+    if stop.limb.same_bytes_will_fail() {
+        return proof_limb_body(stop);
+    }
     serde_json::json!({
         "status": "error",
         "code": WALK_NOT_NOW_CODE,
@@ -78,6 +81,35 @@ pub fn walk_not_now_body(stop: &overlay_engine::engine::WalkCouldNotRun) -> serd
             stop.what
         ),
     })
+}
+
+/// PURE: the body of the PROOF LIMB's stop (lane INTAKE-BOUND): the body's merkle paths carry more nodes than the
+/// budget's proof limb, counted from the frame before anything was parsed. The same code as every walk that could
+/// not run, but NOT retryable: no block lifts it (a proof does not get narrower), so the same bytes are stopped at
+/// any time (`sameBytesWillFail`). The sender's remedy is immediate: the same transactions with merkle paths that
+/// carry only the nodes they need. Nothing was broadcast, admitted or queued.
+pub fn proof_limb_body(stop: &overlay_engine::engine::WalkCouldNotRun) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "code": WALK_NOT_NOW_CODE,
+        "limb": stop.limb.as_str(),
+        "retryable": false,
+        "sameBytesWillFail": true,
+        "message": format!(
+            "the body was not read: {}; nothing was broadcast, admitted or queued",
+            stop.what
+        ),
+    })
+}
+
+/// The `/submit` route's own proof-limb stop, at its entry on BOTH arms, before the census, the gated arm's first
+/// parse (`ef::missing_source_txids`), the EF conversion, the door and the engine (lane INTAKE-BOUND). `None` when
+/// the limb holds the body. The deferred EF job's run passes the same entry.
+pub(crate) fn intake_proof_stop(beef: &[u8]) -> Option<overlay_engine::engine::WalkCouldNotRun> {
+    crate::WORKER_WALK_BUDGET
+        .proof_limb(beef)
+        .err()
+        .map(|stop| overlay_engine::engine::WalkCouldNotRun::over_proof(&stop))
 }
 
 /// The door's answer for [`walk_not_now_body`] at `door`: counted (into the request's batch when `counters` is
@@ -100,9 +132,11 @@ async fn walk_not_now(
         stop.limb.as_str()
     );
     let mut resp = json_response(&walk_not_now_body(stop), 503)?;
-    let _ = resp
-        .headers_mut()
-        .set("Retry-After", &WALK_NOT_NOW_RETRY_AFTER_S.to_string());
+    if !stop.limb.same_bytes_will_fail() {
+        let _ = resp
+            .headers_mut()
+            .set("Retry-After", &WALK_NOT_NOW_RETRY_AFTER_S.to_string());
+    }
     Ok(resp)
 }
 
@@ -1117,6 +1151,26 @@ async fn submit_parts(
         admit_policy,
     );
     let mode = action.engine_mode();
+    // ── THE PROOF LIMB at the route's entry (lane INTAKE-BOUND) ──
+    // Before ANY parse of the body on either arm: the ungated census, the gated arm's
+    // `ef::missing_source_txids`, the subject's log line, the EF conversion, the door's stream and the engine's
+    // own parses each compute every merkle path's root again. Read from the frame alone; nothing broadcast,
+    // admitted or queued. NEW on the gated arm: for its two other limbs it goes on and the network judges; for this
+    // limb going on IS the cost. A refusal of the operator check above answers first (it reads no body).
+    if !matches!(
+        action,
+        crate::submit_gate::SubmitAction::RefuseUnauthenticated(_)
+    ) {
+        if let Some(stop) = intake_proof_stop(&tagged_beef.beef) {
+            counters.reason(SubmitReason::WalkOverProof);
+            counters.bump(crate::ops::COUNTER_SUBMIT_INTAKE_OVER_PROOF, 1);
+            worker::console_log!(
+                "POST /submit -> 503 (walk-could-not-run, over_proof at intake; the body was not read): {}",
+                stop.what
+            );
+            return json_response(&proof_limb_body(&stop), 503);
+        }
+    }
     // ── #371 SEEN corroboration flag — the UNGATED arm's latch feed. ──
     // Read from the SAME `action` value the exhaustive match below consumes
     // (no second derivation, no local a later edit can shadow into a gate —

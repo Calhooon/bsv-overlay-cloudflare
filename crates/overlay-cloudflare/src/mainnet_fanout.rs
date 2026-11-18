@@ -384,6 +384,8 @@ pub struct Advert {
 /// still needs [`SHIPTopicManager::admissible_advert`] ([`advert_is_admitted`])
 /// before it names a host.
 pub fn read_advert(beef: &[u8], output_index: u32, topic: &str) -> Option<Advert> {
+    // A tracker's answer past the proof limb is not read (lane INTAKE-BOUND): an advert's BEEF needs one path.
+    crate::WORKER_WALK_BUDGET.proof_limb(beef).ok()?;
     let subject = {
         let mut parsed = beef_limits::parse_beef(beef, &beef_limits::PEER_BEEF_LIMITS).ok()?;
         overlay_engine::subject::subject_txid_of(&mut parsed)?
